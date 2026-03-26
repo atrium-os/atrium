@@ -3,6 +3,7 @@ use std::thread;
 use std::time::Duration;
 use memmap2::MmapMut;
 use sha2::{Sha256, Digest};
+use ttf_parser;
 
 const CTRL_OFFSET: usize = 0x0000;
 const CTRL_CMD_READ: usize = 4;
@@ -96,6 +97,43 @@ fn main() {
         &make_rounded_rect_path(-0.6, 0.15, 1.2, 0.65, 0.03),
         0xFF444444, &identity_hash);
     nodes.push(content);
+
+    // text rendered from font outlines
+    let font_bytes = std::fs::read("/System/Library/Fonts/Supplemental/Arial Bold.ttf")
+        .expect("failed to load font");
+    let face = ttf_parser::Face::parse(&font_bytes, 0).expect("failed to parse font");
+    let units_per_em = face.units_per_em() as f32;
+
+    let text = "KarythraGPU";
+    let text_size = 0.08;
+    let mut text_x: f32 = -0.45;
+    let text_y: f32 = 0.62;
+    let text_scale = text_size / units_per_em;
+
+    for ch in text.chars() {
+        if let Some(glyph_id) = face.glyph_index(ch) {
+            let mut builder = GlyphOutlineBuilder::new(text_scale, text_x, text_y);
+            if face.outline_glyph(glyph_id, &mut builder).is_some() && !builder.segments.is_empty() {
+                let path_data = builder.to_path_data();
+                let seg_count = builder.segments.len() as u32;
+                let pd_hash = upload(&mut mmap, &path_data);
+                let ph = make_path_header(0x01, 0.0005, seg_count, &pd_hash);
+                let ph_hash = upload(&mut mmap, &ph);
+                let mat = make_material(0xFFFFFFFF); // white text
+                let mat_hash = upload(&mut mmap, &mat);
+                let rend = make_renderable(&ph_hash, &mat_hash);
+                let rend_hash = upload(&mut mmap, &rend);
+                let node = make_scene_node(0x01, &identity_hash, &rend_hash);
+                let node_hash = upload(&mut mmap, &node);
+                nodes.push(node_hash);
+            }
+            if let Some(adv) = face.glyph_hor_advance(glyph_id) {
+                text_x += adv as f32 * text_scale;
+            }
+        } else if ch == ' ' {
+            text_x += text_size * 0.3;
+        }
+    }
 
     // 3D triangle (rendered in perspective, will rotate)
     let tri_verts: Vec<u8> = [
@@ -433,4 +471,44 @@ fn make_circle_path(cx: f32, cy: f32, r: f32) -> Vec<Vec<u8>> {
         path_seg(3, &[cx + k, cy - r, cx + r, cy - k, cx + r, cy]),
         path_seg(5, &[]),
     ]
+}
+
+// ── Font glyph outline builder ──────────────────────────────────
+
+struct GlyphOutlineBuilder {
+    segments: Vec<Vec<u8>>,
+    scale: f32,
+    ox: f32,
+    oy: f32,
+}
+
+impl GlyphOutlineBuilder {
+    fn new(scale: f32, ox: f32, oy: f32) -> Self {
+        Self { segments: Vec::new(), scale, ox, oy }
+    }
+    fn tx(&self, x: f32) -> f32 { x * self.scale + self.ox }
+    fn ty(&self, y: f32) -> f32 { y * self.scale + self.oy }
+    fn to_path_data(&self) -> Vec<u8> {
+        make_path_data(&self.segments)
+    }
+}
+
+impl ttf_parser::OutlineBuilder for GlyphOutlineBuilder {
+    fn move_to(&mut self, x: f32, y: f32) {
+        self.segments.push(path_seg(0, &[self.tx(x), self.ty(y)]));
+    }
+    fn line_to(&mut self, x: f32, y: f32) {
+        self.segments.push(path_seg(1, &[self.tx(x), self.ty(y)]));
+    }
+    fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
+        self.segments.push(path_seg(2, &[self.tx(x1), self.ty(y1), self.tx(x), self.ty(y)]));
+    }
+    fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
+        self.segments.push(path_seg(3, &[
+            self.tx(x1), self.ty(y1), self.tx(x2), self.ty(y2), self.tx(x), self.ty(y),
+        ]));
+    }
+    fn close(&mut self) {
+        self.segments.push(path_seg(5, &[]));
+    }
 }

@@ -17,6 +17,10 @@ pub struct MetalRenderer {
     queue: CommandQueue,
     layer: MetalLayer,
     pipeline: RenderPipelineState,
+    stencil_fill_pipeline: RenderPipelineState,
+    stencil_fill_ds: DepthStencilState,
+    stencil_cover_ds: DepthStencilState,
+    stencil_texture: Option<Texture>,
     depth_state: DepthStencilState,
     tess_pipeline: ComputePipelineState,
     tess_vertex_buf: Buffer,
@@ -71,6 +75,40 @@ impl GpuBackend for MetalRenderer {
         depth_desc.set_depth_write_enabled(true);
         let depth_state = device.new_depth_stencil_state(&depth_desc);
 
+        // stencil fill pipeline: no color write, stencil INVERT
+        let stencil_fill_desc = RenderPipelineDescriptor::new();
+        stencil_fill_desc.set_vertex_function(Some(&vert));
+        stencil_fill_desc.set_fragment_function(Some(&frag));
+        stencil_fill_desc.color_attachments().object_at(0).unwrap()
+            .set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        stencil_fill_desc.color_attachments().object_at(0).unwrap()
+            .set_write_mask(MTLColorWriteMask::empty());
+        stencil_fill_desc.set_stencil_attachment_pixel_format(MTLPixelFormat::Stencil8);
+        let stencil_fill_pipeline = device.new_render_pipeline_state(&stencil_fill_desc)
+            .expect("failed to create stencil fill pipeline");
+
+        // stencil fill depth-stencil state: invert stencil on every fragment
+        let sf_ds_desc = DepthStencilDescriptor::new();
+        let sf_stencil = StencilDescriptor::new();
+        sf_stencil.set_stencil_compare_function(MTLCompareFunction::Always);
+        sf_stencil.set_depth_stencil_pass_operation(MTLStencilOperation::Invert);
+        sf_stencil.set_read_mask(0xFF);
+        sf_stencil.set_write_mask(0xFF);
+        sf_ds_desc.set_front_face_stencil(Some(&sf_stencil));
+        sf_ds_desc.set_back_face_stencil(Some(&sf_stencil));
+        let stencil_fill_ds = device.new_depth_stencil_state(&sf_ds_desc);
+
+        // stencil cover depth-stencil state: pass where stencil != 0, then zero it
+        let sc_ds_desc = DepthStencilDescriptor::new();
+        let sc_stencil = StencilDescriptor::new();
+        sc_stencil.set_stencil_compare_function(MTLCompareFunction::NotEqual);
+        sc_stencil.set_depth_stencil_pass_operation(MTLStencilOperation::Zero);
+        sc_stencil.set_read_mask(0xFF);
+        sc_stencil.set_write_mask(0xFF);
+        sc_ds_desc.set_front_face_stencil(Some(&sc_stencil));
+        sc_ds_desc.set_back_face_stencil(Some(&sc_stencil));
+        let stencil_cover_ds = device.new_depth_stencil_state(&sc_ds_desc);
+
         let tess_library = device.new_library_with_source(TESS_SHADER_SRC, &CompileOptions::new())
             .expect("failed to compile tessellation shaders");
         let tess_fn = tess_library.get_function("tessellate_fill", None).unwrap();
@@ -99,6 +137,10 @@ impl GpuBackend for MetalRenderer {
             queue,
             layer,
             pipeline,
+            stencil_fill_pipeline,
+            stencil_fill_ds,
+            stencil_cover_ds,
+            stencil_texture: None,
             depth_state,
             tess_pipeline,
             tess_vertex_buf,
@@ -119,6 +161,10 @@ impl GpuBackend for MetalRenderer {
     fn tessellate_path(&mut self, segments_data: &[u8], tolerance: f32, _fill: bool) -> Option<(Vec<f32>, Vec<u16>)> {
         let seg_count = segments_data.len() / 28;
         if seg_count == 0 { return None; }
+
+        // GPU fan triangulation only correct for convex/simple shapes
+        // complex glyphs (many segments, multiple subpaths) need CPU ear-clipping
+        if seg_count > 12 { return None; }
 
         let seg_buf = self.device.new_buffer_with_data(
             segments_data.as_ptr() as *const _,
@@ -187,6 +233,19 @@ impl GpuBackend for MetalRenderer {
     }
 
     fn render_frame(&mut self, scene: &SceneGraph, cas: &CasStore, _frame: u64) {
+        // ensure stencil texture exists at correct size
+        let need_stencil = self.stencil_texture.is_none()
+            || self.stencil_texture.as_ref().map(|t| (t.width(), t.height())) != Some((self.width as u64, self.height as u64));
+        if need_stencil {
+            let st_desc = TextureDescriptor::new();
+            st_desc.set_pixel_format(MTLPixelFormat::Stencil8);
+            st_desc.set_width(self.width as u64);
+            st_desc.set_height(self.height as u64);
+            st_desc.set_storage_mode(MTLStorageMode::Private);
+            st_desc.set_usage(MTLTextureUsage::RenderTarget);
+            self.stencil_texture = Some(self.device.new_texture(&st_desc));
+        }
+
         objc2_autorelease(|_| {
             let drawable = match self.layer.next_drawable() {
                 Some(d) => d,
@@ -197,10 +256,15 @@ impl GpuBackend for MetalRenderer {
             let color = desc.color_attachments().object_at(0).unwrap();
             color.set_texture(Some(drawable.texture()));
             color.set_load_action(MTLLoadAction::Clear);
-
-            // dark background
             color.set_clear_color(MTLClearColor::new(0.05, 0.05, 0.08, 1.0));
             color.set_store_action(MTLStoreAction::Store);
+
+            // attach stencil
+            let stencil_att = desc.stencil_attachment().unwrap();
+            stencil_att.set_texture(self.stencil_texture.as_deref());
+            stencil_att.set_load_action(MTLLoadAction::Clear);
+            stencil_att.set_clear_stencil(0);
+            stencil_att.set_store_action(MTLStoreAction::DontCare);
 
             let cmd_buf = self.queue.new_command_buffer();
             let encoder = cmd_buf.new_render_command_encoder(desc);
@@ -265,32 +329,64 @@ impl GpuBackend for MetalRenderer {
 
                                 encoder.set_vertex_buffer(0, Some(&vb), 0);
 
-                                if mesh.index_count > 0 && mesh.index_data != NULL_HASH {
-                                    if let Some(indices) = cas.load(&mesh.index_data) {
-                                        let ib = self.device.new_buffer_with_data(
+                                let has_indices = mesh.index_count > 0 && mesh.index_data != NULL_HASH;
+                                let ib = if has_indices {
+                                    cas.load(&mesh.index_data).map(|indices| {
+                                        self.device.new_buffer_with_data(
                                             indices.as_ptr() as *const _,
                                             indices.len() as u64,
                                             MTLResourceOptions::CPUCacheModeDefaultCache,
-                                        );
-                                        let idx_type = if mesh.index_format == 1 {
-                                            MTLIndexType::UInt32
-                                        } else {
-                                            MTLIndexType::UInt16
-                                        };
+                                        )
+                                    })
+                                } else { None };
+                                let idx_type = if mesh.index_format == 1 {
+                                    MTLIndexType::UInt32
+                                } else {
+                                    MTLIndexType::UInt16
+                                };
+
+                                if item.stencil_fill {
+                                    // pass 1: fill stencil with even-odd winding
+                                    encoder.set_render_pipeline_state(&self.stencil_fill_pipeline);
+                                    encoder.set_depth_stencil_state(&self.stencil_fill_ds);
+                                    encoder.set_stencil_reference_value(0);
+                                    if let Some(ref ib) = ib {
                                         encoder.draw_indexed_primitives(
                                             MTLPrimitiveType::Triangle,
-                                            mesh.index_count as u64,
-                                            idx_type,
-                                            &ib,
-                                            0,
-                                        );
+                                            mesh.index_count as u64, idx_type, ib, 0);
+                                    } else {
+                                        encoder.draw_primitives(
+                                            MTLPrimitiveType::Triangle, 0, mesh.vertex_count as u64);
                                     }
+
+                                    // pass 2: cover — draw same geometry, stencil test non-zero, output color
+                                    encoder.set_render_pipeline_state(&self.pipeline);
+                                    encoder.set_depth_stencil_state(&self.stencil_cover_ds);
+                                    encoder.set_stencil_reference_value(0);
+                                    encoder.set_fragment_bytes(
+                                        0, std::mem::size_of::<[f32; 4]>() as u64,
+                                        color.as_ptr() as *const _);
+                                    if let Some(ref ib) = ib {
+                                        encoder.draw_indexed_primitives(
+                                            MTLPrimitiveType::Triangle,
+                                            mesh.index_count as u64, idx_type, ib, 0);
+                                    } else {
+                                        encoder.draw_primitives(
+                                            MTLPrimitiveType::Triangle, 0, mesh.vertex_count as u64);
+                                    }
+
+                                    // restore normal pipeline state
+                                    encoder.set_depth_stencil_state(&self.depth_state);
                                 } else {
-                                    encoder.draw_primitives(
-                                        MTLPrimitiveType::Triangle,
-                                        0,
-                                        mesh.vertex_count as u64,
-                                    );
+                                    // normal draw — no stencil
+                                    if let Some(ref ib) = ib {
+                                        encoder.draw_indexed_primitives(
+                                            MTLPrimitiveType::Triangle,
+                                            mesh.index_count as u64, idx_type, ib, 0);
+                                    } else {
+                                        encoder.draw_primitives(
+                                            MTLPrimitiveType::Triangle, 0, mesh.vertex_count as u64);
+                                    }
                                 }
                             } else {
                                 log::warn!("render[{}]: vertex_data {:02x}{:02x}.. not in CAS", idx, mesh.vertex_data[0], mesh.vertex_data[1]);

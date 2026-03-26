@@ -664,6 +664,7 @@ dependencies = [
  "objc2-quartz-core",
  "raw-window-handle",
  "sha2",
+ "ttf-parser",
  "winit",
 ]
 

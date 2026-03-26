@@ -10,6 +10,7 @@ pub struct RenderItem {
     pub material: Hash256,
     pub render_order: u16,
     pub flags: u8,
+    pub stencil_fill: bool,
 }
 
 pub struct LightItem {
@@ -227,48 +228,50 @@ impl SceneGraph {
         };
 
         if let Some(NodeData::Renderable(r)) = NodeData::parse(&rend_data) {
-            let mesh_hash = self.resolve_mesh(cas, &r.mesh);
+            let (mesh_hash, stencil) = self.resolve_mesh(cas, &r.mesh);
             self.render_list.push(RenderItem {
                 world_matrix: *world_matrix,
                 mesh: mesh_hash,
                 material: r.material,
                 render_order: r.render_order,
                 flags: r.flags,
+                stencil_fill: stencil,
             });
         }
     }
 
-    fn resolve_mesh(&mut self, cas: &CasStore, mesh_hash: &Hash256) -> Hash256 {
-        if *mesh_hash == NULL_HASH { return NULL_HASH; }
+    fn resolve_mesh(&mut self, cas: &CasStore, mesh_hash: &Hash256) -> (Hash256, bool) {
+        if *mesh_hash == NULL_HASH { return (NULL_HASH, false); }
 
-        // check if this is a PathHeader (type 0x0D) — needs tessellation
         let mesh_data = match cas.load(mesh_hash) {
             Some(d) => d,
-            None => return *mesh_hash,
+            None => return (*mesh_hash, false),
         };
 
         if mesh_data.len() < 128 || mesh_data[0] != 0x0D {
-            return *mesh_hash; // regular MeshHeader, use as-is
+            return (*mesh_hash, false);
         }
 
-        // PathHeader — check tessellation cache
         let path_header = match NodeData::parse(mesh_data) {
             Some(NodeData::Path(p)) => p,
-            _ => return *mesh_hash,
+            _ => return (*mesh_hash, false),
         };
 
-        // check cache: path_data hash → tessellated mesh hash
+        // detect if path has holes (multiple subpaths)
+        let has_holes = if let Some(pd) = cas.load(&path_header.path_data) {
+            let segs = PathSegment::parse_segments(pd);
+            tessellate::has_holes(&segs)
+        } else {
+            false
+        };
+
         if let Some(&cached) = self.tess_cache.get(&path_header.path_data) {
             if cas.exists(&cached) {
-                return cached;
+                return (cached, has_holes);
             }
         }
 
-        // need to tessellate — but CAS is immutable here
-        // store the path_data hash so render_frame can tessellate with mutable CAS
-        // for now, return NULL_HASH to signal "needs tessellation"
-        // the render will skip items with NULL mesh
-        *mesh_hash // return the PathHeader hash; renderer will detect and tessellate
+        (*mesh_hash, has_holes)
     }
 
     pub fn tessellate_paths(

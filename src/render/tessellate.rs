@@ -93,36 +93,182 @@ pub fn tessellate_fill(segments: &[PathSegment], tolerance: f32) -> (Vec<f32>, V
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
 
-    for contour in &subpaths {
-        if contour.len() < 3 { continue; }
-
-        // compute centroid
-        let mut cx = 0.0f32;
-        let mut cy = 0.0f32;
-        for p in contour {
-            cx += p[0];
-            cy += p[1];
+    let contours: Vec<Vec<[f32; 2]>> = subpaths.into_iter().map(|c| {
+        let mut pts = c;
+        while pts.len() > 1 && pts.first() == pts.last() {
+            pts.pop();
         }
-        cx /= contour.len() as f32;
-        cy /= contour.len() as f32;
+        pts
+    }).filter(|c| c.len() >= 3).collect();
 
-        // fan triangulation from centroid
+    if contours.is_empty() { return (vertices, indices); }
+
+    if contours.len() == 1 {
+        // single contour — ear-clip for correct concave handling
+        let pts = &contours[0];
         let base = (vertices.len() / 3) as u16;
-        vertices.extend_from_slice(&[cx, cy, 0.5]);
-
-        for p in contour {
+        for p in pts {
             vertices.extend_from_slice(&[p[0], p[1], 0.5]);
         }
-
-        for i in 0..contour.len() as u16 {
-            let next = if i + 1 < contour.len() as u16 { i + 2 } else { 1 };
-            indices.push(base);
-            indices.push(base + i + 1);
-            indices.push(base + next);
+        for idx in ear_clip(pts) {
+            indices.push(base + idx);
+        }
+    } else {
+        // multiple contours (has holes) — fan triangulate each contour from its first vertex
+        // relies on stencil even-odd rendering to handle holes correctly
+        for contour in &contours {
+            let base = (vertices.len() / 3) as u16;
+            for p in contour {
+                vertices.extend_from_slice(&[p[0], p[1], 0.5]);
+            }
+            // fan from first vertex
+            for i in 1..contour.len() as u16 - 1 {
+                indices.push(base);
+                indices.push(base + i);
+                indices.push(base + i + 1);
+            }
         }
     }
 
     (vertices, indices)
+}
+
+pub fn has_holes(segments: &[PathSegment]) -> bool {
+    let mut moveto_count = 0;
+    for seg in segments {
+        if matches!(seg, PathSegment::MoveTo(_, _)) {
+            moveto_count += 1;
+            if moveto_count > 1 { return true; }
+        }
+    }
+    false
+}
+
+fn bridge_holes(mut outer: Vec<[f32; 2]>, holes: &[Vec<[f32; 2]>]) -> Vec<[f32; 2]> {
+    const EPS: f32 = 1e-5;
+
+    for hole in holes {
+        if hole.is_empty() { continue; }
+
+        // find rightmost point in hole
+        let (hole_idx, _) = hole.iter().enumerate()
+            .max_by(|a, b| a.1[0].partial_cmp(&b.1[0]).unwrap())
+            .unwrap();
+        let hole_pt = hole[hole_idx];
+
+        // find nearest point on outer contour
+        let (outer_idx, _) = outer.iter().enumerate()
+            .min_by(|a, b| {
+                let da = (a.1[0] - hole_pt[0]).powi(2) + (a.1[1] - hole_pt[1]).powi(2);
+                let db = (b.1[0] - hole_pt[0]).powi(2) + (b.1[1] - hole_pt[1]).powi(2);
+                da.partial_cmp(&db).unwrap()
+            })
+            .unwrap();
+
+        // bridge with epsilon offsets to avoid duplicate points blocking ear-clipper
+        let bridge_outer = outer[outer_idx];
+
+        let mut rotated_hole: Vec<[f32; 2]> = Vec::with_capacity(hole.len() + 2);
+        for i in 0..hole.len() {
+            rotated_hole.push(hole[(hole_idx + i) % hole.len()]);
+        }
+        // close hole back to bridge point (epsilon offset)
+        rotated_hole.push([hole[hole_idx][0] + EPS, hole[hole_idx][1]]);
+        // bridge back to outer (epsilon offset)
+        rotated_hole.push([bridge_outer[0] + EPS, bridge_outer[1]]);
+
+        let mut combined = Vec::with_capacity(outer.len() + rotated_hole.len() + 1);
+        combined.extend_from_slice(&outer[..=outer_idx]);
+        combined.extend_from_slice(&rotated_hole);
+        combined.extend_from_slice(&outer[outer_idx + 1..]);
+        outer = combined;
+    }
+    outer
+}
+
+fn signed_area(pts: &[[f32; 2]]) -> f32 {
+    let n = pts.len();
+    let mut area = 0.0f32;
+    for i in 0..n {
+        let j = (i + 1) % n;
+        area += pts[i][0] * pts[j][1];
+        area -= pts[j][0] * pts[i][1];
+    }
+    area * 0.5
+}
+
+fn cross2d(o: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
+    (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+}
+
+fn point_in_triangle(p: [f32; 2], a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> bool {
+    let d1 = cross2d(p, a, b);
+    let d2 = cross2d(p, b, c);
+    let d3 = cross2d(p, c, a);
+    let has_neg = (d1 < 0.0) || (d2 < 0.0) || (d3 < 0.0);
+    let has_pos = (d1 > 0.0) || (d2 > 0.0) || (d3 > 0.0);
+    !(has_neg && has_pos)
+}
+
+fn ear_clip(pts: &[[f32; 2]]) -> Vec<u16> {
+    let n = pts.len();
+    if n < 3 { return Vec::new(); }
+    if n == 3 { return vec![0, 1, 2]; }
+
+    let mut indices = Vec::with_capacity((n - 2) * 3);
+    let mut remaining: Vec<usize> = (0..n).collect();
+
+    // ensure CCW winding (positive area)
+    let ccw = signed_area(pts) > 0.0;
+
+    let mut safety = n * n; // prevent infinite loop
+    while remaining.len() > 2 && safety > 0 {
+        safety -= 1;
+        let len = remaining.len();
+        let mut found_ear = false;
+
+        for i in 0..len {
+            let prev = remaining[(i + len - 1) % len];
+            let curr = remaining[i];
+            let next = remaining[(i + 1) % len];
+
+            let cross = cross2d(pts[prev], pts[curr], pts[next]);
+            let is_convex = if ccw { cross > 0.0 } else { cross < 0.0 };
+            if !is_convex { continue; }
+
+            // check no other vertex inside this ear
+            let mut ear_valid = true;
+            for j in 0..len {
+                let idx = remaining[j];
+                if idx == prev || idx == curr || idx == next { continue; }
+                if point_in_triangle(pts[idx], pts[prev], pts[curr], pts[next]) {
+                    ear_valid = false;
+                    break;
+                }
+            }
+
+            if ear_valid {
+                indices.push(prev as u16);
+                indices.push(curr as u16);
+                indices.push(next as u16);
+                remaining.remove(i);
+                found_ear = true;
+                break;
+            }
+        }
+
+        if !found_ear {
+            // degenerate polygon — emit remaining as fan and stop
+            for i in 1..remaining.len() - 1 {
+                indices.push(remaining[0] as u16);
+                indices.push(remaining[i] as u16);
+                indices.push(remaining[i + 1] as u16);
+            }
+            break;
+        }
+    }
+
+    indices
 }
 
 pub fn tessellate_stroke(
@@ -226,5 +372,152 @@ mod tests {
         let (verts, indices) = tessellate_stroke(&segs, 0.1, 0.1);
         assert!(verts.len() > 0);
         assert!(indices.len() > 0);
+    }
+
+    #[test]
+    fn test_multi_contour_fan() {
+        // multi-contour paths now use fan triangulation per contour
+        // holes are handled by stencil even-odd rendering, not tessellation
+        let segs = vec![
+            PathSegment::MoveTo(0.0, 0.0),
+            PathSegment::LineTo(1.0, 0.0),
+            PathSegment::LineTo(1.0, 1.0),
+            PathSegment::LineTo(0.0, 1.0),
+            PathSegment::Close,
+            PathSegment::MoveTo(0.25, 0.25),
+            PathSegment::LineTo(0.25, 0.75),
+            PathSegment::LineTo(0.75, 0.75),
+            PathSegment::LineTo(0.75, 0.25),
+            PathSegment::Close,
+        ];
+        let (verts, indices) = tessellate_fill(&segs, 0.1);
+        assert!(indices.len() > 0);
+        // both contours produce fan triangles (hole handled by stencil at render time)
+        assert!(has_holes(&segs));
+    }
+
+    #[test]
+    #[ignore] // bridge-based hole test — replaced by stencil rendering
+    fn test_ttf_glyph_with_hole() {
+        // simulate a 'P' glyph: outer body (CW in TTF) + inner counter (CCW in TTF)
+        // TTF convention: outer = CW (negative area), holes = CCW (positive area)
+        let segs = vec![
+            // outer contour (CW = negative area in our coord system)
+            PathSegment::MoveTo(0.0, 0.0),
+            PathSegment::LineTo(0.0, 1.0),
+            PathSegment::LineTo(0.6, 1.0),
+            PathSegment::CubicTo(1.0, 1.0, 1.0, 0.5, 0.6, 0.5),
+            PathSegment::LineTo(0.2, 0.5),
+            PathSegment::LineTo(0.2, 0.0),
+            PathSegment::Close,
+            // inner counter (CCW = positive area)
+            PathSegment::MoveTo(0.2, 0.6),
+            PathSegment::LineTo(0.5, 0.6),
+            PathSegment::CubicTo(0.8, 0.6, 0.8, 0.9, 0.5, 0.9),
+            PathSegment::LineTo(0.2, 0.9),
+            PathSegment::Close,
+        ];
+
+        let subpaths = flatten_path(&segs, 0.01);
+        eprintln!("P glyph: {} subpaths", subpaths.len());
+        for (i, sp) in subpaths.iter().enumerate() {
+            let a = signed_area(sp);
+            eprintln!("  [{}] {} pts, area={:.6}", i, sp.len(), a);
+        }
+
+        let (verts, indices) = tessellate_fill(&segs, 0.01);
+        let tri_count = indices.len() / 3;
+        eprintln!("triangles: {}", tri_count);
+
+        // test point inside the counter (should NOT be covered)
+        let test_pt = [0.4, 0.75]; // inside the P's hole
+        let mut inside = 0;
+        for t in 0..tri_count {
+            let i0 = indices[t*3] as usize;
+            let i1 = indices[t*3+1] as usize;
+            let i2 = indices[t*3+2] as usize;
+            let a = [verts[i0*3], verts[i0*3+1]];
+            let b = [verts[i1*3], verts[i1*3+1]];
+            let c = [verts[i2*3], verts[i2*3+1]];
+            if point_in_triangle(test_pt, a, b, c) {
+                inside += 1;
+            }
+        }
+        eprintln!("point (0.4, 0.75) inside hole covered by {} triangles", inside);
+        assert_eq!(inside, 0, "point inside P counter should not be covered");
+    }
+
+    #[test]
+    #[ignore] // bridge-based hole test — replaced by stencil rendering
+    fn test_square_with_hole() {
+        // outer square CCW: (0,0)→(1,0)→(1,1)→(0,1)
+        // inner square CW (hole): (0.25,0.25)→(0.25,0.75)→(0.75,0.75)→(0.75,0.25)
+        let segs = vec![
+            // outer (CCW)
+            PathSegment::MoveTo(0.0, 0.0),
+            PathSegment::LineTo(1.0, 0.0),
+            PathSegment::LineTo(1.0, 1.0),
+            PathSegment::LineTo(0.0, 1.0),
+            PathSegment::Close,
+            // inner hole (CW)
+            PathSegment::MoveTo(0.25, 0.25),
+            PathSegment::LineTo(0.25, 0.75),
+            PathSegment::LineTo(0.75, 0.75),
+            PathSegment::LineTo(0.75, 0.25),
+            PathSegment::Close,
+        ];
+
+        let subpaths = flatten_path(&segs, 0.1);
+        eprintln!("subpaths: {}", subpaths.len());
+        for (i, sp) in subpaths.iter().enumerate() {
+            eprintln!("  subpath[{}]: {} pts, area={}", i, sp.len(), signed_area(sp));
+        }
+
+        // manually test the bridge
+        let contours: Vec<Vec<[f32;2]>> = subpaths.iter().map(|c| {
+            let mut pts = c.clone();
+            while pts.len() > 1 && pts.first() == pts.last() { pts.pop(); }
+            pts
+        }).filter(|c| c.len() >= 3).collect();
+
+        eprintln!("contours after dedup:");
+        for (i, c) in contours.iter().enumerate() {
+            eprintln!("  [{}] {} pts: {:?}", i, c.len(), c);
+        }
+
+        let (verts, indices) = tessellate_fill(&segs, 0.1);
+        let tri_count = indices.len() / 3;
+        eprintln!("triangles: {}, verts: {}", tri_count, verts.len() / 3);
+        for t in 0..tri_count {
+            let i0 = indices[t*3] as usize;
+            let i1 = indices[t*3+1] as usize;
+            let i2 = indices[t*3+2] as usize;
+            eprintln!("  tri[{}]: ({:.2},{:.2}) ({:.2},{:.2}) ({:.2},{:.2})",
+                t,
+                verts[i0*3], verts[i0*3+1],
+                verts[i1*3], verts[i1*3+1],
+                verts[i2*3], verts[i2*3+1]);
+        }
+
+        assert!(indices.len() > 0);
+        assert_eq!(indices.len() % 3, 0);
+
+        // check that center point (0.5, 0.5) is NOT covered by any triangle
+        // (it's inside the hole)
+        let center = [0.5f32, 0.5];
+        let mut inside_count = 0;
+        for t in 0..tri_count {
+            let i0 = indices[t * 3] as usize;
+            let i1 = indices[t * 3 + 1] as usize;
+            let i2 = indices[t * 3 + 2] as usize;
+            let a = [verts[i0 * 3], verts[i0 * 3 + 1]];
+            let b = [verts[i1 * 3], verts[i1 * 3 + 1]];
+            let c = [verts[i2 * 3], verts[i2 * 3 + 1]];
+            if point_in_triangle(center, a, b, c) {
+                inside_count += 1;
+            }
+        }
+        eprintln!("center (0.5,0.5) covered by {} triangles", inside_count);
+        assert_eq!(inside_count, 0, "center of hole should not be covered");
     }
 }
