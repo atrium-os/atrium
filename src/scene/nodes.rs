@@ -102,6 +102,51 @@ pub struct TextureHeader {
 }
 
 #[derive(Clone, Debug)]
+pub struct PathHeader {
+    pub flags: u8,
+    pub fill_rule: u8,
+    pub stroke_join: u8,
+    pub stroke_width: f32,
+    pub stroke_miter: f32,
+    pub tolerance: f32,
+    pub segment_count: u32,
+    pub subpath_count: u16,
+    pub path_data: Hash256,
+    pub cached_mesh: Hash256,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum PathSegment {
+    MoveTo(f32, f32),
+    LineTo(f32, f32),
+    QuadTo(f32, f32, f32, f32),
+    CubicTo(f32, f32, f32, f32, f32, f32),
+    Close,
+}
+
+impl PathSegment {
+    pub fn parse_segments(data: &[u8]) -> Vec<Self> {
+        let mut segs = Vec::new();
+        let mut i = 0;
+        while i + 28 <= data.len() {
+            let seg_type = data[i];
+            let f = |off: usize| read_f32(data, i + 4 + off * 4);
+            let seg = match seg_type {
+                0 => PathSegment::MoveTo(f(0), f(1)),
+                1 => PathSegment::LineTo(f(0), f(1)),
+                2 => PathSegment::QuadTo(f(0), f(1), f(2), f(3)),
+                3 => PathSegment::CubicTo(f(0), f(1), f(2), f(3), f(4), f(5)),
+                5 => PathSegment::Close,
+                _ => { i += 28; continue; }
+            };
+            segs.push(seg);
+            i += 28;
+        }
+        segs
+    }
+}
+
+#[derive(Clone, Debug)]
 pub enum NodeData {
     Root(SceneRoot),
     Node(SceneNode),
@@ -112,6 +157,7 @@ pub enum NodeData {
     Light(Light),
     Mesh(MeshHeader),
     Texture(TextureHeader),
+    Path(PathHeader),
     Bulk(Vec<u8>),
 }
 
@@ -129,6 +175,7 @@ impl NodeData {
             0x07 if data.len() >= 128 => Some(Self::Light(parse_light(data))),
             0x08 if data.len() >= 128 => Some(Self::Mesh(parse_mesh_header(data))),
             0x09 if data.len() >= 128 => Some(Self::Texture(parse_texture_header(data))),
+            0x0D if data.len() >= 128 => Some(Self::Path(parse_path_header(data))),
             _ => Some(Self::Bulk(data.to_vec())),
         }
     }
@@ -252,6 +299,21 @@ fn parse_mesh_header(d: &[u8]) -> MeshHeader {
         aabb,
         vertex_data: read_hash(d, 32),
         index_data: read_hash(d, 64),
+    }
+}
+
+fn parse_path_header(d: &[u8]) -> PathHeader {
+    PathHeader {
+        flags: d[1],
+        fill_rule: d[2],
+        stroke_join: d[3],
+        stroke_width: read_f32(d, 4),
+        stroke_miter: read_f32(d, 8),
+        tolerance: read_f32(d, 12),
+        segment_count: read_u32(d, 16),
+        subpath_count: read_u16(d, 20),
+        path_data: read_hash(d, 32),
+        cached_mesh: read_hash(d, 64),
     }
 }
 

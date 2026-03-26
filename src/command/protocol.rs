@@ -75,6 +75,7 @@ pub const NODE_TEXTURE_HEADER: u8 = 0x09;
 pub const NODE_AUTONOMOUS_TASK: u8 = 0x0A;
 pub const NODE_COLLIDER: u8 = 0x0B;
 pub const NODE_SHAPE_DATA: u8 = 0x0C;
+pub const NODE_PATH_HEADER: u8 = 0x0D;
 pub const NODE_NODE_LIST: u8 = 0x10;
 pub const NODE_PHYSICS_CONFIG: u8 = 0x10; // 4KB blob
 pub const NODE_PHYSICS_BODY_REG: u8 = 0x11;

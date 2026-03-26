@@ -9,7 +9,7 @@ use platform::ivshmem::IvshmemLink;
 use command::frontend::CommandFrontend;
 use scene::graph::SceneGraph;
 use cas::store::CasStore;
-use render::metal_backend::MetalRenderer;
+use render::backend::GpuBackend;
 use render::metrics::FrameMetrics;
 use input::capture::InputCapture;
 
@@ -21,9 +21,9 @@ use winit::window::{Window, WindowId};
 use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
 
-struct GpuServer {
+struct GpuServer<B: GpuBackend> {
     window: Option<Arc<Window>>,
-    renderer: Option<MetalRenderer>,
+    renderer: Option<B>,
     cas: Arc<Mutex<CasStore>>,
     scene: Arc<Mutex<SceneGraph>>,
     frontend: CommandFrontend,
@@ -32,7 +32,7 @@ struct GpuServer {
     metrics: FrameMetrics,
 }
 
-impl GpuServer {
+impl<B: GpuBackend> GpuServer<B> {
     fn new(shmem_path: PathBuf, shmem_size: usize) -> Self {
         let link = IvshmemLink::open(&shmem_path, shmem_size)
             .expect("failed to open ivshmem region");
@@ -87,7 +87,7 @@ impl GpuServer {
     }
 }
 
-impl ApplicationHandler for GpuServer {
+impl<B: GpuBackend> ApplicationHandler for GpuServer<B> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
             let attrs = Window::default_attributes()
@@ -97,7 +97,7 @@ impl ApplicationHandler for GpuServer {
             let window = Arc::new(event_loop.create_window(attrs).unwrap());
             let size = window.inner_size();
 
-            let renderer = MetalRenderer::new(
+            let renderer = B::new(
                 window.clone(),
                 size.width,
                 size.height,
@@ -134,6 +134,23 @@ impl ApplicationHandler for GpuServer {
             WindowEvent::RedrawRequested => {
                 self.metrics.begin_frame();
                 self.process_commands();
+
+                // tessellate any vector paths before rendering
+                {
+                    let (dw, dh) = self.window.as_ref()
+                        .map(|w| { let s = w.inner_size(); (s.width, s.height) })
+                        .unwrap_or((1024, 768));
+                    let mut scene = self.scene.lock().unwrap();
+                    let mut cas = self.cas.lock().unwrap();
+                    if let Some(renderer) = &mut self.renderer {
+                        let mut gpu_tess = |data: &[u8], tol: f32, fill: bool| {
+                            renderer.tessellate_path(data, tol, fill)
+                        };
+                        scene.tessellate_paths(&mut cas, dw, dh, Some(&mut gpu_tess));
+                    } else {
+                        scene.tessellate_paths(&mut cas, dw, dh, None);
+                    }
+                }
 
                 let render_items = if let Some(renderer) = &mut self.renderer {
                     let scene = self.scene.lock().unwrap();
@@ -192,6 +209,6 @@ fn main() {
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut server = GpuServer::new(shmem_path, shmem_size);
+    let mut server = GpuServer::<render::metal_backend::MetalRenderer>::new(shmem_path, shmem_size);
     event_loop.run_app(&mut server).unwrap();
 }

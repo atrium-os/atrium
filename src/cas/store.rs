@@ -187,6 +187,11 @@ impl CasStore {
                 refs.push(read_hash(data, 64));
                 refs.push(read_hash(data, 96));
             }
+            0x0D if data.len() >= 128 => {
+                // PathHeader: path_data[32], cached_mesh[64]
+                refs.push(read_hash(data, 32));
+                refs.push(read_hash(data, 64));
+            }
             0x10 if data.len() >= 36 => {
                 // NodeList (4KB): next[4], entries[36..]
                 refs.push(read_hash(data, 4)); // next list

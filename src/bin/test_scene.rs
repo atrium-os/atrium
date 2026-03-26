@@ -33,13 +33,9 @@ fn main() {
     let display_h = read_u32(&mmap, CTRL_OFFSET + 32);
     println!("server status={} display={}x{}", status, display_w, display_h);
 
-    // ── Build scene: 2D UI elements + 3D rotating triangle ─────
+    // ── Build scene: vector 2D UI elements + 3D rotating triangle ─
 
-    // shared quad geometry (reused by all rectangles — CAS dedup)
-    let quad_indices = make_quad_indices();
-    let quad_idx_hash = upload(&mut mmap, &quad_indices);
-
-    // identity transform (for ortho UI elements)
+    // identity transform
     let identity = make_transform(&[
         1.0, 0.0, 0.0, 0.0,
         0.0, 1.0, 0.0, 0.0,
@@ -48,39 +44,57 @@ fn main() {
     ]);
     let identity_hash = upload(&mut mmap, &identity);
 
-    // helper: create a quad scene node
     let mut nodes: Vec<[u8; 32]> = Vec::new();
-    let mut make_quad_node = |mmap: &mut MmapMut, x: f32, y: f32, w: f32, h: f32, rgba: u32| -> [u8; 32] {
-        let verts = make_quad_verts(x, y, w, h);
-        let vert_hash = upload(mmap, &verts);
-        let mesh = make_indexed_mesh(4, 6, 12, 0, &vert_hash, &quad_idx_hash);
-        let mesh_hash = upload(mmap, &mesh);
+
+    // helper: create a vector path scene node
+    let make_path_node = |mmap: &mut MmapMut, segs: &[Vec<u8>], rgba: u32, identity_hash: &[u8; 32]| -> [u8; 32] {
+        let path_data = make_path_data(segs);
+        let seg_count = segs.len() as u32;
+        let pd_hash = upload(mmap, &path_data);
+        let ph = make_path_header(0x01, 0.0005, seg_count, &pd_hash); // FILL, fine tolerance
+        let ph_hash = upload(mmap, &ph);
         let mat = make_material(rgba);
         let mat_hash = upload(mmap, &mat);
-        let rend = make_renderable(&mesh_hash, &mat_hash);
+        let rend = make_renderable(&ph_hash, &mat_hash);
         let rend_hash = upload(mmap, &rend);
-        let node = make_scene_node(0x01, &identity_hash, &rend_hash);
+        let node = make_scene_node(0x01, identity_hash, &rend_hash);
         upload(mmap, &node)
     };
 
-    // window background (dark gray)
-    let win_bg = make_quad_node(&mut mmap, -0.7, 0.7, 1.4, 1.2, 0xFF333333);
+    // window background (dark gray, rounded rect)
+    let win_bg = make_path_node(&mut mmap,
+        &make_rounded_rect_path(-0.7, 0.7, 1.4, 1.2, 0.05),
+        0xFF333333, &identity_hash);
     nodes.push(win_bg);
 
-    // title bar (blue)
-    let title_bar = make_quad_node(&mut mmap, -0.7, 0.7, 1.4, 0.12, 0xFFCC6622);
+    // title bar (orange, rounded rect)
+    let title_bar = make_path_node(&mut mmap,
+        &make_rounded_rect_path(-0.7, 0.7, 1.4, 0.12, 0.03),
+        0xFFCC6622, &identity_hash);
     nodes.push(title_bar);
 
-    // button 1 (green)
-    let btn1 = make_quad_node(&mut mmap, -0.5, 0.4, 0.4, 0.15, 0xFF00AA44);
+    // button 1 (green, rounded rect)
+    let btn1 = make_path_node(&mut mmap,
+        &make_rounded_rect_path(-0.5, 0.4, 0.4, 0.15, 0.04),
+        0xFF00AA44, &identity_hash);
     nodes.push(btn1);
 
-    // button 2 (red)
-    let btn2 = make_quad_node(&mut mmap, 0.1, 0.4, 0.4, 0.15, 0xFF4444DD);
+    // button 2 (blue, rounded rect)
+    let btn2 = make_path_node(&mut mmap,
+        &make_rounded_rect_path(0.1, 0.4, 0.4, 0.15, 0.04),
+        0xFF4444DD, &identity_hash);
     nodes.push(btn2);
 
-    // content area (lighter gray)
-    let content = make_quad_node(&mut mmap, -0.6, 0.15, 1.2, 0.65, 0xFF444444);
+    // circular decoration (yellow circle)
+    let circle = make_path_node(&mut mmap,
+        &make_circle_path(0.0, -0.15, 0.15),
+        0xFF00CCFF, &identity_hash);
+    nodes.push(circle);
+
+    // content area (lighter gray, rounded rect)
+    let content = make_path_node(&mut mmap,
+        &make_rounded_rect_path(-0.6, 0.15, 1.2, 0.65, 0.03),
+        0xFF444444, &identity_hash);
     nodes.push(content);
 
     // 3D triangle (rendered in perspective, will rotate)
@@ -126,8 +140,10 @@ fn main() {
     send_cmd(&mut mmap, 0x0100, &root_hash, &[0u8; 32]);
     send_cmd(&mut mmap, 0x0300, &[0u8; 32], &[0u8; 32]);
 
-    println!("\nscene submitted — UI rectangles + rotating triangle");
+    println!("\nscene submitted — vector UI + rotating triangle");
     println!("ctrl-c to exit");
+
+    let tri_idx = nodes.len() - 1; // triangle is the last node
 
     // animate: rotate the yellow triangle inside the "window"
     let mut angle: f32 = 0.0;
@@ -141,14 +157,13 @@ fn main() {
              cos, sin, 0.0, 0.0,
             -sin, cos, 0.0, 0.0,
              0.0, 0.0, 1.0, 0.0,
-             0.0, -0.15, 0.0, 1.0, // center in content area
+             0.0, -0.15, 0.0, 1.0,
         ]);
         let rot_xform_hash = upload(&mut mmap, &rot_xform);
         let rot_tri = make_scene_node(0x01, &rot_xform_hash, &tri_rend_hash);
         let rot_tri_hash = upload(&mut mmap, &rot_tri);
 
-        // rebuild node list: 5 UI quads (unchanged — dedup) + rotated triangle
-        nodes[5] = rot_tri_hash;
+        nodes[tri_idx] = rot_tri_hash;
         let new_list = make_node_list(&nodes);
         let new_list_hash = upload(&mut mmap, &new_list);
         let new_root = make_scene_root(&new_list_hash, &cam_hash);
@@ -355,4 +370,67 @@ fn make_scene_root(list: &[u8; 32], cam: &[u8; 32]) -> Vec<u8> {
     b[32..64].copy_from_slice(list);
     b[64..96].copy_from_slice(cam);
     b
+}
+
+// ── Vector path helpers ─────────────────────────────────────────
+
+fn path_seg(seg_type: u8, points: &[f32]) -> Vec<u8> {
+    let mut b = vec![0u8; 28];
+    b[0] = seg_type;
+    for (i, &f) in points.iter().enumerate() {
+        b[4 + i * 4..8 + i * 4].copy_from_slice(&f.to_le_bytes());
+    }
+    b
+}
+
+fn make_path_data(segments: &[Vec<u8>]) -> Vec<u8> {
+    let mut data = Vec::new();
+    for seg in segments {
+        data.extend_from_slice(seg);
+    }
+    data
+}
+
+fn make_path_header(flags: u8, tolerance: f32, seg_count: u32, path_data_hash: &[u8; 32]) -> Vec<u8> {
+    let mut b = vec![0u8; 128];
+    b[0] = 0x0D; // PATH_HEADER
+    b[1] = flags;
+    b[12..16].copy_from_slice(&tolerance.to_le_bytes());
+    b[16..20].copy_from_slice(&seg_count.to_le_bytes());
+    b[32..64].copy_from_slice(path_data_hash);
+    b
+}
+
+fn make_rounded_rect_path(x: f32, y: f32, w: f32, h: f32, r: f32) -> Vec<Vec<u8>> {
+    // approximate quarter-circle with cubic bezier: control point offset = r * 0.5522847498
+    let k = r * 0.5522847498;
+    let x1 = x;
+    let x2 = x + w;
+    let y1 = y;
+    let y2 = y - h; // y goes down
+
+    vec![
+        path_seg(0, &[x1 + r, y1]),                                          // MoveTo top-left + r
+        path_seg(1, &[x2 - r, y1]),                                          // LineTo top-right - r
+        path_seg(3, &[x2 - r + k, y1, x2, y1 - k, x2, y1 - r]),            // CubicTo top-right corner
+        path_seg(1, &[x2, y2 + r]),                                          // LineTo bottom-right + r
+        path_seg(3, &[x2, y2 + r - k, x2 - r + k, y2, x2 - r, y2]),        // CubicTo bottom-right corner
+        path_seg(1, &[x1 + r, y2]),                                          // LineTo bottom-left + r
+        path_seg(3, &[x1 + r - k, y2, x1, y2 + r - k, x1, y2 + r]),        // CubicTo bottom-left corner
+        path_seg(1, &[x1, y1 - r]),                                          // LineTo top-left + r (up)
+        path_seg(3, &[x1, y1 - r + k, x1 + r - k, y1, x1 + r, y1]),        // CubicTo top-left corner
+        path_seg(5, &[]),                                                    // Close
+    ]
+}
+
+fn make_circle_path(cx: f32, cy: f32, r: f32) -> Vec<Vec<u8>> {
+    let k = r * 0.5522847498;
+    vec![
+        path_seg(0, &[cx + r, cy]),
+        path_seg(3, &[cx + r, cy + k, cx + k, cy + r, cx, cy + r]),
+        path_seg(3, &[cx - k, cy + r, cx - r, cy + k, cx - r, cy]),
+        path_seg(3, &[cx - r, cy - k, cx - k, cy - r, cx, cy - r]),
+        path_seg(3, &[cx + k, cy - r, cx + r, cy - k, cx + r, cy]),
+        path_seg(5, &[]),
+    ]
 }

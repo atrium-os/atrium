@@ -1,6 +1,8 @@
 use crate::command::protocol::{Hash256, NULL_HASH};
 use crate::cas::store::CasStore;
 use crate::scene::nodes::*;
+use crate::render::tessellate;
+use std::collections::HashMap;
 
 pub struct RenderItem {
     pub world_matrix: [f32; 16],
@@ -22,6 +24,7 @@ pub struct SceneGraph {
     render_list: Vec<RenderItem>,
     light_list: Vec<LightItem>,
     dirty: bool,
+    tess_cache: HashMap<Hash256, Hash256>,
 }
 
 impl SceneGraph {
@@ -33,6 +36,7 @@ impl SceneGraph {
             render_list: Vec::new(),
             light_list: Vec::new(),
             dirty: true,
+            tess_cache: HashMap::new(),
         }
     }
 
@@ -223,13 +227,139 @@ impl SceneGraph {
         };
 
         if let Some(NodeData::Renderable(r)) = NodeData::parse(&rend_data) {
+            let mesh_hash = self.resolve_mesh(cas, &r.mesh);
             self.render_list.push(RenderItem {
                 world_matrix: *world_matrix,
-                mesh: r.mesh,
+                mesh: mesh_hash,
                 material: r.material,
                 render_order: r.render_order,
                 flags: r.flags,
             });
+        }
+    }
+
+    fn resolve_mesh(&mut self, cas: &CasStore, mesh_hash: &Hash256) -> Hash256 {
+        if *mesh_hash == NULL_HASH { return NULL_HASH; }
+
+        // check if this is a PathHeader (type 0x0D) — needs tessellation
+        let mesh_data = match cas.load(mesh_hash) {
+            Some(d) => d,
+            None => return *mesh_hash,
+        };
+
+        if mesh_data.len() < 128 || mesh_data[0] != 0x0D {
+            return *mesh_hash; // regular MeshHeader, use as-is
+        }
+
+        // PathHeader — check tessellation cache
+        let path_header = match NodeData::parse(mesh_data) {
+            Some(NodeData::Path(p)) => p,
+            _ => return *mesh_hash,
+        };
+
+        // check cache: path_data hash → tessellated mesh hash
+        if let Some(&cached) = self.tess_cache.get(&path_header.path_data) {
+            if cas.exists(&cached) {
+                return cached;
+            }
+        }
+
+        // need to tessellate — but CAS is immutable here
+        // store the path_data hash so render_frame can tessellate with mutable CAS
+        // for now, return NULL_HASH to signal "needs tessellation"
+        // the render will skip items with NULL mesh
+        *mesh_hash // return the PathHeader hash; renderer will detect and tessellate
+    }
+
+    pub fn tessellate_paths(
+        &mut self,
+        cas: &mut CasStore,
+        display_w: u32,
+        display_h: u32,
+        mut gpu_tess: Option<&mut dyn FnMut(&[u8], f32, bool) -> Option<(Vec<f32>, Vec<u16>)>>,
+    ) {
+        // half pixel in NDC space — sub-pixel accuracy, resolution independent
+        let pixel_tolerance = 2.0 / display_w.max(display_h).max(1) as f32 * 0.5;
+        for item in &mut self.render_list {
+            if item.mesh == NULL_HASH { continue; }
+
+            let mesh_data = match cas.load(&item.mesh) {
+                Some(d) => d.to_vec(),
+                None => continue,
+            };
+
+            if mesh_data.len() < 128 || mesh_data[0] != 0x0D { continue; }
+
+            let path_header = match NodeData::parse(&mesh_data) {
+                Some(NodeData::Path(p)) => p,
+                _ => continue,
+            };
+
+            // check cache
+            if let Some(&cached) = self.tess_cache.get(&path_header.path_data) {
+                if cas.exists(&cached) {
+                    item.mesh = cached;
+                    continue;
+                }
+            }
+
+            // load path data and tessellate
+            let path_data = match cas.load(&path_header.path_data) {
+                Some(d) => d.to_vec(),
+                None => continue,
+            };
+
+            let tolerance = if path_header.tolerance > 0.0 {
+                path_header.tolerance.min(pixel_tolerance)
+            } else {
+                pixel_tolerance
+            };
+            let is_fill = path_header.flags & 0x02 == 0;
+
+            // try GPU tessellation first, fall back to CPU
+            let result = if let Some(ref mut gpu) = gpu_tess {
+                gpu(&path_data, tolerance, is_fill)
+            } else {
+                None
+            };
+
+            let (verts, indices) = if let Some(r) = result {
+                r
+            } else {
+                let segments = PathSegment::parse_segments(&path_data);
+                if !is_fill {
+                    tessellate::tessellate_stroke(&segments, path_header.stroke_width, tolerance)
+                } else {
+                    tessellate::tessellate_fill(&segments, tolerance)
+                }
+            };
+
+            if verts.is_empty() { continue; }
+
+            // store vertex data
+            let vert_bytes: Vec<u8> = verts.iter().flat_map(|f| f.to_le_bytes()).collect();
+            let vert_hash = cas.store(&vert_bytes);
+
+            // store index data
+            let idx_bytes: Vec<u8> = indices.iter().flat_map(|i| i.to_le_bytes()).collect();
+            let idx_hash = cas.store(&idx_bytes);
+
+            // create MeshHeader
+            let vertex_count = (verts.len() / 3) as u32;
+            let index_count = indices.len() as u32;
+            let mut mesh_blob = [0u8; 128];
+            mesh_blob[0] = 0x08; // MeshHeader
+            mesh_blob[1] = 0x01; // INDEXED
+            mesh_blob[2..6].copy_from_slice(&vertex_count.to_le_bytes());
+            mesh_blob[6..10].copy_from_slice(&index_count.to_le_bytes());
+            mesh_blob[10..12].copy_from_slice(&12u16.to_le_bytes()); // stride = 12 (float3)
+            mesh_blob[32..64].copy_from_slice(&vert_hash);
+            mesh_blob[64..96].copy_from_slice(&idx_hash);
+            let mesh_hash = cas.store(&mesh_blob);
+
+            // cache and update render item
+            self.tess_cache.insert(path_header.path_data, mesh_hash);
+            item.mesh = mesh_hash;
         }
     }
 
