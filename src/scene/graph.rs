@@ -326,6 +326,7 @@ impl SceneGraph {
             let (verts, indices) = if let Some(r) = result {
                 r
             } else {
+                log::trace!("CPU tessellation fallback for path {:02x}{:02x}..", path_header.path_data[0], path_header.path_data[1]);
                 let segments = PathSegment::parse_segments(&path_data);
                 if !is_fill {
                     tessellate::tessellate_stroke(&segments, path_header.stroke_width, tolerance)

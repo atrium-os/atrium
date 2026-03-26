@@ -116,12 +116,74 @@ impl GpuBackend for MetalRenderer {
         self.layer.set_drawable_size(CGSize::new(width as f64, height as f64));
     }
 
-    fn tessellate_path(&mut self, _segments_data: &[u8], _tolerance: f32, _fill: bool) -> Option<(Vec<f32>, Vec<u16>)> {
-        // GPU compute tessellation requires iterative bezier flattening
-        // (Metal doesn't support recursive functions in shaders)
-        // Returns None to use CPU tessellation fallback — results are CAS-cached
-        // TODO: implement iterative de Casteljau with explicit stack in compute shader
-        None
+    fn tessellate_path(&mut self, segments_data: &[u8], tolerance: f32, _fill: bool) -> Option<(Vec<f32>, Vec<u16>)> {
+        let seg_count = segments_data.len() / 28;
+        if seg_count == 0 { return None; }
+
+        let seg_buf = self.device.new_buffer_with_data(
+            segments_data.as_ptr() as *const _,
+            segments_data.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        let max_verts: u32 = 65536;
+        let params: [u32; 4] = [
+            seg_count as u32,
+            tolerance.to_bits(),
+            1, // fill
+            max_verts,
+        ];
+        let params_buf = self.device.new_buffer_with_data(
+            params.as_ptr() as *const _,
+            16,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        unsafe {
+            let ptr = self.tess_counter_buf.contents() as *mut u32;
+            *ptr = 0;
+            *ptr.add(1) = 0;
+        }
+
+        let cmd_buf = self.queue.new_command_buffer();
+        let encoder = cmd_buf.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.tess_pipeline);
+        encoder.set_buffer(0, Some(&seg_buf), 0);
+        encoder.set_buffer(1, Some(&params_buf), 0);
+        encoder.set_buffer(2, Some(&self.tess_vertex_buf), 0);
+        encoder.set_buffer(3, Some(&self.tess_index_buf), 0);
+        encoder.set_buffer(4, Some(&self.tess_counter_buf), 0);
+        encoder.set_buffer(5, Some(&self.tess_contour_buf), 0);
+
+        encoder.dispatch_threads(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
+        encoder.end_encoding();
+
+        cmd_buf.commit();
+        cmd_buf.wait_until_completed();
+
+        let (vert_count, idx_count) = unsafe {
+            let ptr = self.tess_counter_buf.contents() as *const u32;
+            (*ptr as usize, *ptr.add(1) as usize)
+        };
+
+        if vert_count == 0 || idx_count == 0 { return None; }
+
+        log::trace!("GPU tessellated: {} verts, {} indices ({} segments)", vert_count, idx_count, seg_count);
+
+        let vert_floats = vert_count * 3;
+        let mut verts = vec![0.0f32; vert_floats];
+        unsafe {
+            let src = self.tess_vertex_buf.contents() as *const f32;
+            std::ptr::copy_nonoverlapping(src, verts.as_mut_ptr(), vert_floats);
+        }
+
+        let mut indices = vec![0u16; idx_count];
+        unsafe {
+            let src = self.tess_index_buf.contents() as *const u16;
+            std::ptr::copy_nonoverlapping(src, indices.as_mut_ptr(), idx_count);
+        }
+
+        Some((verts, indices))
     }
 
     fn render_frame(&mut self, scene: &SceneGraph, cas: &CasStore, _frame: u64) {
@@ -282,70 +344,24 @@ const TESS_SHADER_SRC: &str = r#"
 using namespace metal;
 
 struct PathSegment {
-    uint type_and_pad;  // byte 0 = type, bytes 1-3 = pad  (4 bytes)
-    float x0, y0;       // first point                     (8 bytes)
-    float x1, y1;       // second point (quad/cubic)        (8 bytes)
-    float x2, y2;       // third point (cubic)              (8 bytes)
-};                      // total: 28 bytes, no alignment padding
+    uint type_and_pad;
+    float x0, y0;
+    float x1, y1;
+    float x2, y2;
+};
 
 struct TessParams {
     uint segment_count;
     float tolerance;
-    uint flags;         // bit0=fill, bit1=stroke
+    uint flags;
     uint max_vertices;
 };
 
-// de Casteljau subdivision for cubic bezier
-// writes flattened points to contour buffer, returns count added
-static int flatten_cubic(
-    float2 p0, float2 p1, float2 p2, float2 p3,
-    float tol_sq,
-    device float2* contour, int offset, int max_pts
-) {
-    if (offset >= max_pts - 1) return 0;
-
-    float2 d1 = p1 - (p0 * 2.0 + p3) / 3.0;
-    float2 d2 = p2 - (p0 + p3 * 2.0) / 3.0;
-    float d = max(dot(d1, d1), dot(d2, d2));
-
-    if (d <= tol_sq) {
-        contour[offset] = p3;
-        return 1;
-    }
-
-    float2 m01 = (p0 + p1) * 0.5;
-    float2 m12 = (p1 + p2) * 0.5;
-    float2 m23 = (p2 + p3) * 0.5;
-    float2 m012 = (m01 + m12) * 0.5;
-    float2 m123 = (m12 + m23) * 0.5;
-    float2 mid = (m012 + m123) * 0.5;
-
-    int n = flatten_cubic(p0, m01, m012, mid, tol_sq, contour, offset, max_pts);
-    n += flatten_cubic(mid, m123, m23, p3, tol_sq, contour, offset + n, max_pts);
-    return n;
-}
-
-static int flatten_quadratic(
-    float2 p0, float2 p1, float2 p2,
-    float tol_sq,
-    device float2* contour, int offset, int max_pts
-) {
-    if (offset >= max_pts - 1) return 0;
-
-    float2 mid_dev = p0 * 0.25 - p1 * 0.5 + p2 * 0.25;
-    if (dot(mid_dev, mid_dev) <= tol_sq) {
-        contour[offset] = p2;
-        return 1;
-    }
-
-    float2 m01 = (p0 + p1) * 0.5;
-    float2 m12 = (p1 + p2) * 0.5;
-    float2 mid = (m01 + m12) * 0.5;
-
-    int n = flatten_quadratic(p0, m01, mid, tol_sq, contour, offset, max_pts);
-    n += flatten_quadratic(mid, m12, p2, tol_sq, contour, offset + n, max_pts);
-    return n;
-}
+// iterative cubic bezier flattening with explicit stack (no recursion)
+// stack entry: 4 control points (p0, p1, p2, p3)
+struct CubicEntry {
+    float2 p0, p1, p2, p3;
+};
 
 kernel void tessellate_fill(
     const device PathSegment* segments [[buffer(0)]],
@@ -364,6 +380,9 @@ kernel void tessellate_fill(
     int contour_count = 0;
     float2 cursor = float2(0.0);
 
+    // explicit stack for iterative subdivision (max depth ~16 = 64K segments)
+    CubicEntry stack[16];
+
     for (uint i = 0; i < seg_count && contour_count < max_pts; i++) {
         uint seg_type = segments[i].type_and_pad & 0xFF;
         float2 sp0 = float2(segments[i].x0, segments[i].y0);
@@ -375,20 +394,80 @@ kernel void tessellate_fill(
                 cursor = sp0;
                 contour[contour_count++] = cursor;
                 break;
+
             case 1: // LineTo
                 cursor = sp0;
                 contour[contour_count++] = cursor;
                 break;
-            case 2: // QuadTo
-                contour_count += flatten_quadratic(cursor, sp0, sp1, tol_sq,
-                    contour, contour_count, max_pts);
+
+            case 2: { // QuadTo — convert to cubic, then flatten
+                // quad (p0,p1,p2) → cubic (p0, p0+2/3*(p1-p0), p2+2/3*(p1-p2), p2)
+                float2 cp0 = cursor;
+                float2 cp1 = cursor + (sp0 - cursor) * (2.0f / 3.0f);
+                float2 cp2 = sp1 + (sp0 - sp1) * (2.0f / 3.0f);
+                float2 cp3 = sp1;
+
+                int top = 0;
+                stack[top++] = {cp0, cp1, cp2, cp3};
+
+                while (top > 0 && contour_count < max_pts) {
+                    CubicEntry e = stack[--top];
+
+                    float2 d1 = e.p1 - (e.p0 * 2.0 + e.p3) / 3.0;
+                    float2 d2 = e.p2 - (e.p0 + e.p3 * 2.0) / 3.0;
+                    float d = max(dot(d1, d1), dot(d2, d2));
+
+                    if (d <= tol_sq) {
+                        contour[contour_count++] = e.p3;
+                    } else if (top < 15) {
+                        float2 m01 = (e.p0 + e.p1) * 0.5;
+                        float2 m12 = (e.p1 + e.p2) * 0.5;
+                        float2 m23 = (e.p2 + e.p3) * 0.5;
+                        float2 m012 = (m01 + m12) * 0.5;
+                        float2 m123 = (m12 + m23) * 0.5;
+                        float2 mid = (m012 + m123) * 0.5;
+                        // push right half first (processed second)
+                        stack[top++] = {mid, m123, m23, e.p3};
+                        // push left half (processed first)
+                        stack[top++] = {e.p0, m01, m012, mid};
+                    } else {
+                        contour[contour_count++] = e.p3;
+                    }
+                }
                 cursor = sp1;
                 break;
-            case 3: // CubicTo
-                contour_count += flatten_cubic(cursor, sp0, sp1, sp2, tol_sq,
-                    contour, contour_count, max_pts);
+            }
+
+            case 3: { // CubicTo — iterative de Casteljau
+                int top = 0;
+                stack[top++] = {cursor, sp0, sp1, sp2};
+
+                while (top > 0 && contour_count < max_pts) {
+                    CubicEntry e = stack[--top];
+
+                    float2 d1 = e.p1 - (e.p0 * 2.0 + e.p3) / 3.0;
+                    float2 d2 = e.p2 - (e.p0 + e.p3 * 2.0) / 3.0;
+                    float d = max(dot(d1, d1), dot(d2, d2));
+
+                    if (d <= tol_sq) {
+                        contour[contour_count++] = e.p3;
+                    } else if (top < 15) {
+                        float2 m01 = (e.p0 + e.p1) * 0.5;
+                        float2 m12 = (e.p1 + e.p2) * 0.5;
+                        float2 m23 = (e.p2 + e.p3) * 0.5;
+                        float2 m012 = (m01 + m12) * 0.5;
+                        float2 m123 = (m12 + m23) * 0.5;
+                        float2 mid = (m012 + m123) * 0.5;
+                        stack[top++] = {mid, m123, m23, e.p3};
+                        stack[top++] = {e.p0, m01, m012, mid};
+                    } else {
+                        contour[contour_count++] = e.p3;
+                    }
+                }
                 cursor = sp2;
                 break;
+            }
+
             case 5: // Close
                 if (contour_count > 0) {
                     contour[contour_count++] = contour[0];
