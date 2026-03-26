@@ -103,30 +103,17 @@ pub fn tessellate_fill(segments: &[PathSegment], tolerance: f32) -> (Vec<f32>, V
 
     if contours.is_empty() { return (vertices, indices); }
 
-    if contours.len() == 1 {
-        // single contour — ear-clip for correct concave handling
-        let pts = &contours[0];
+    // fan triangulate each contour from its first vertex
+    // stencil even-odd rendering handles concavity and holes correctly
+    for contour in &contours {
         let base = (vertices.len() / 3) as u16;
-        for p in pts {
+        for p in contour {
             vertices.extend_from_slice(&[p[0], p[1], 0.5]);
         }
-        for idx in ear_clip(pts) {
-            indices.push(base + idx);
-        }
-    } else {
-        // multiple contours (has holes) — fan triangulate each contour from its first vertex
-        // relies on stencil even-odd rendering to handle holes correctly
-        for contour in &contours {
-            let base = (vertices.len() / 3) as u16;
-            for p in contour {
-                vertices.extend_from_slice(&[p[0], p[1], 0.5]);
-            }
-            // fan from first vertex
-            for i in 1..contour.len() as u16 - 1 {
-                indices.push(base);
-                indices.push(base + i);
-                indices.push(base + i + 1);
-            }
+        for i in 1..contour.len() as u16 - 1 {
+            indices.push(base);
+            indices.push(base + i);
+            indices.push(base + i + 1);
         }
     }
 

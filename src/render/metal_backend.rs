@@ -162,10 +162,6 @@ impl GpuBackend for MetalRenderer {
         let seg_count = segments_data.len() / 28;
         if seg_count == 0 { return None; }
 
-        // GPU fan triangulation only correct for convex/simple shapes
-        // complex glyphs (many segments, multiple subpaths) need CPU ear-clipping
-        if seg_count > 12 { return None; }
-
         let seg_buf = self.device.new_buffer_with_data(
             segments_data.as_ptr() as *const _,
             segments_data.len() as u64,
@@ -475,9 +471,11 @@ kernel void tessellate_fill(
     int max_pts = 16384;
     int contour_count = 0;
     float2 cursor = float2(0.0);
-
-    // explicit stack for iterative subdivision (max depth ~16 = 64K segments)
     CubicEntry stack[16];
+
+    // phase 1: flatten all curves into contour buffer, record subpath starts
+    int subpath_starts[64];  // max 64 subpaths per path
+    int num_subpaths = 0;
 
     for (uint i = 0; i < seg_count && contour_count < max_pts; i++) {
         uint seg_type = segments[i].type_and_pad & 0xFF;
@@ -486,115 +484,84 @@ kernel void tessellate_fill(
         float2 sp2 = float2(segments[i].x2, segments[i].y2);
 
         switch (seg_type) {
-            case 0: // MoveTo
+            case 0: // MoveTo — start new subpath
+                if (num_subpaths < 64) {
+                    subpath_starts[num_subpaths++] = contour_count;
+                }
                 cursor = sp0;
                 contour[contour_count++] = cursor;
                 break;
-
-            case 1: // LineTo
+            case 1:
                 cursor = sp0;
                 contour[contour_count++] = cursor;
                 break;
-
-            case 2: { // QuadTo — convert to cubic, then flatten
-                // quad (p0,p1,p2) → cubic (p0, p0+2/3*(p1-p0), p2+2/3*(p1-p2), p2)
-                float2 cp0 = cursor;
+            case 2: {
                 float2 cp1 = cursor + (sp0 - cursor) * (2.0f / 3.0f);
                 float2 cp2 = sp1 + (sp0 - sp1) * (2.0f / 3.0f);
-                float2 cp3 = sp1;
-
                 int top = 0;
-                stack[top++] = {cp0, cp1, cp2, cp3};
-
+                stack[top++] = {cursor, cp1, cp2, sp1};
                 while (top > 0 && contour_count < max_pts) {
                     CubicEntry e = stack[--top];
-
                     float2 d1 = e.p1 - (e.p0 * 2.0 + e.p3) / 3.0;
                     float2 d2 = e.p2 - (e.p0 + e.p3 * 2.0) / 3.0;
-                    float d = max(dot(d1, d1), dot(d2, d2));
-
-                    if (d <= tol_sq) {
+                    if (max(dot(d1,d1), dot(d2,d2)) <= tol_sq) {
                         contour[contour_count++] = e.p3;
                     } else if (top < 15) {
-                        float2 m01 = (e.p0 + e.p1) * 0.5;
-                        float2 m12 = (e.p1 + e.p2) * 0.5;
-                        float2 m23 = (e.p2 + e.p3) * 0.5;
-                        float2 m012 = (m01 + m12) * 0.5;
-                        float2 m123 = (m12 + m23) * 0.5;
-                        float2 mid = (m012 + m123) * 0.5;
-                        // push right half first (processed second)
+                        float2 m01=(e.p0+e.p1)*0.5, m12=(e.p1+e.p2)*0.5, m23=(e.p2+e.p3)*0.5;
+                        float2 m012=(m01+m12)*0.5, m123=(m12+m23)*0.5, mid=(m012+m123)*0.5;
                         stack[top++] = {mid, m123, m23, e.p3};
-                        // push left half (processed first)
                         stack[top++] = {e.p0, m01, m012, mid};
-                    } else {
-                        contour[contour_count++] = e.p3;
-                    }
+                    } else { contour[contour_count++] = e.p3; }
                 }
-                cursor = sp1;
-                break;
+                cursor = sp1; break;
             }
-
-            case 3: { // CubicTo — iterative de Casteljau
+            case 3: {
                 int top = 0;
                 stack[top++] = {cursor, sp0, sp1, sp2};
-
                 while (top > 0 && contour_count < max_pts) {
                     CubicEntry e = stack[--top];
-
                     float2 d1 = e.p1 - (e.p0 * 2.0 + e.p3) / 3.0;
                     float2 d2 = e.p2 - (e.p0 + e.p3 * 2.0) / 3.0;
-                    float d = max(dot(d1, d1), dot(d2, d2));
-
-                    if (d <= tol_sq) {
+                    if (max(dot(d1,d1), dot(d2,d2)) <= tol_sq) {
                         contour[contour_count++] = e.p3;
                     } else if (top < 15) {
-                        float2 m01 = (e.p0 + e.p1) * 0.5;
-                        float2 m12 = (e.p1 + e.p2) * 0.5;
-                        float2 m23 = (e.p2 + e.p3) * 0.5;
-                        float2 m012 = (m01 + m12) * 0.5;
-                        float2 m123 = (m12 + m23) * 0.5;
-                        float2 mid = (m012 + m123) * 0.5;
+                        float2 m01=(e.p0+e.p1)*0.5, m12=(e.p1+e.p2)*0.5, m23=(e.p2+e.p3)*0.5;
+                        float2 m012=(m01+m12)*0.5, m123=(m12+m23)*0.5, mid=(m012+m123)*0.5;
                         stack[top++] = {mid, m123, m23, e.p3};
                         stack[top++] = {e.p0, m01, m012, mid};
-                    } else {
-                        contour[contour_count++] = e.p3;
-                    }
+                    } else { contour[contour_count++] = e.p3; }
                 }
-                cursor = sp2;
-                break;
+                cursor = sp2; break;
             }
-
             case 5: // Close
-                if (contour_count > 0) {
-                    contour[contour_count++] = contour[0];
+                if (num_subpaths > 0 && contour_count > subpath_starts[num_subpaths-1]) {
+                    contour[contour_count++] = contour[subpath_starts[num_subpaths-1]];
                 }
                 break;
         }
     }
 
-    if (contour_count < 3) return;
+    if (contour_count < 3 || num_subpaths == 0) return;
 
-    // compute centroid
-    float2 centroid = float2(0.0);
-    for (int i = 0; i < contour_count; i++) {
-        centroid += contour[i];
-    }
-    centroid /= float(contour_count);
-
-    // fan triangulation from centroid
+    // phase 2: fan triangulate each subpath independently
     uint vc = 0;
     uint ic = 0;
 
-    out_vertices[vc++] = packed_float3{centroid.x, centroid.y, 0.5};
-    for (int i = 0; i < contour_count; i++) {
-        out_vertices[vc++] = packed_float3{contour[i].x, contour[i].y, 0.5};
-    }
+    for (int s = 0; s < num_subpaths; s++) {
+        int start = subpath_starts[s];
+        int end = (s + 1 < num_subpaths) ? subpath_starts[s + 1] : contour_count;
+        int n = end - start;
+        if (n < 3) continue;
 
-    for (int i = 0; i < contour_count; i++) {
-        int next = (i + 1 < contour_count) ? i + 2 : 1;
-        out_indices[ic++] = 0;
-        out_indices[ic++] = ushort(i + 1);
-        out_indices[ic++] = ushort(next);
+        ushort base = ushort(vc);
+        for (int j = start; j < end; j++) {
+            out_vertices[vc++] = packed_float3{contour[j].x, contour[j].y, 0.5};
+        }
+        for (int j = 1; j < n - 1; j++) {
+            out_indices[ic++] = base;
+            out_indices[ic++] = ushort(base + j);
+            out_indices[ic++] = ushort(base + j + 1);
+        }
     }
 
     atomic_store_explicit(&counters[0], vc, memory_order_relaxed);

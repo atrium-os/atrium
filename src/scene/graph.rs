@@ -257,21 +257,13 @@ impl SceneGraph {
             _ => return (*mesh_hash, false),
         };
 
-        // detect if path has holes (multiple subpaths)
-        let has_holes = if let Some(pd) = cas.load(&path_header.path_data) {
-            let segs = PathSegment::parse_segments(pd);
-            tessellate::has_holes(&segs)
-        } else {
-            false
-        };
-
         if let Some(&cached) = self.tess_cache.get(&path_header.path_data) {
             if cas.exists(&cached) {
-                return (cached, has_holes);
+                return (cached, true); // all paths use stencil even-odd
             }
         }
 
-        (*mesh_hash, has_holes)
+        (*mesh_hash, true) // all paths use stencil even-odd
     }
 
     pub fn tessellate_paths(
