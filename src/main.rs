@@ -6,6 +6,7 @@ mod input;
 mod platform;
 
 use platform::ivshmem::IvshmemLink;
+use platform::network::NetworkLink;
 use command::frontend::CommandFrontend;
 use scene::graph::SceneGraph;
 use cas::store::CasStore;
@@ -29,13 +30,18 @@ struct GpuServer<B: GpuBackend> {
     frontend: CommandFrontend,
     input_capture: InputCapture,
     link: IvshmemLink,
+    net_link: Option<NetworkLink>,
     metrics: FrameMetrics,
 }
 
 impl<B: GpuBackend> GpuServer<B> {
-    fn new(shmem_path: PathBuf, shmem_size: usize) -> Self {
+    fn new(shmem_path: PathBuf, shmem_size: usize, net_port: Option<u16>) -> Self {
         let link = IvshmemLink::open(&shmem_path, shmem_size)
             .expect("failed to open ivshmem region");
+
+        let net_link = net_port.and_then(|port| {
+            NetworkLink::bind(port).ok()
+        });
 
         let cas = Arc::new(Mutex::new(CasStore::new()));
         let scene = Arc::new(Mutex::new(SceneGraph::new()));
@@ -50,11 +56,13 @@ impl<B: GpuBackend> GpuServer<B> {
             frontend,
             input_capture,
             link,
+            net_link,
             metrics: FrameMetrics::new(),
         }
     }
 
     fn process_commands(&mut self) {
+        // shared memory transport
         loop {
             let cmd = {
                 let mut ring = self.link.command_ring();
@@ -76,13 +84,38 @@ impl<B: GpuBackend> GpuServer<B> {
                 None => break,
             }
         }
+
+        // network transport
+        if let Some(ref mut net) = self.net_link {
+            for _ in 0..256 {
+                match net.recv_command() {
+                    Some(cmd) => {
+                        self.metrics.record_cmd();
+                        let completion = self.frontend.dispatch(&cmd);
+                        if cmd.opcode == 0x0003 && self.frontend.last_upload_size > 0 {
+                            self.metrics.record_upload(self.frontend.last_upload_size);
+                            self.frontend.last_upload_size = 0;
+                        }
+                        if let Some(comp) = completion {
+                            net.send_completion(&comp);
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
     }
 
     fn write_input_events(&mut self) {
         let events = self.input_capture.drain();
-        for evt in events {
+        for evt in &events {
             let mut ring = self.link.input_ring();
-            ring.enqueue(&evt);
+            ring.enqueue(evt);
+        }
+        if let Some(ref mut net) = self.net_link {
+            for evt in &events {
+                net.send_input_event(evt);
+            }
         }
     }
 }
@@ -104,6 +137,9 @@ impl<B: GpuBackend> ApplicationHandler for GpuServer<B> {
             );
 
             self.link.set_display_info(size.width, size.height, 60);
+            if let Some(ref mut net) = self.net_link {
+                net.set_display_info(size.width, size.height, 60);
+            }
 
             window.request_redraw();
             self.window = Some(window);
@@ -193,22 +229,29 @@ impl<B: GpuBackend> ApplicationHandler for GpuServer<B> {
 fn main() {
     env_logger::init();
 
-    let shmem_path = std::env::args()
-        .nth(1)
+    let args: Vec<String> = std::env::args().collect();
+
+    let shmem_path = args.get(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp/karythra-gpu-shmem"));
 
-    let shmem_size: usize = std::env::args()
-        .nth(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(16 * 1024 * 1024);
+    let shmem_size: usize = 16 * 1024 * 1024;
+
+    // --port 9090 enables network transport (for QEMU without ivshmem)
+    let net_port: Option<u16> = args.iter()
+        .position(|a| a == "--port")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok());
 
     log::info!("KarythraGPU server starting");
-    log::info!("  shmem: {:?} ({}MB)", shmem_path, shmem_size / (1024 * 1024));
+    log::info!("  shmem: {:?}", shmem_path);
+    if let Some(port) = net_port {
+        log::info!("  network: TCP port {}", port);
+    }
 
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut server = GpuServer::<render::metal_backend::MetalRenderer>::new(shmem_path, shmem_size);
+    let mut server = GpuServer::<render::metal_backend::MetalRenderer>::new(shmem_path, shmem_size, net_port);
     event_loop.run_app(&mut server).unwrap();
 }
