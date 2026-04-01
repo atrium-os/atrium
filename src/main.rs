@@ -6,6 +6,7 @@ mod input;
 mod platform;
 
 use platform::ivshmem::IvshmemLink;
+use platform::ivshmem_server::IvshmemServer;
 use platform::network::NetworkLink;
 use command::frontend::CommandFrontend;
 use scene::graph::SceneGraph;
@@ -30,6 +31,7 @@ struct GpuServer<B: GpuBackend> {
     frontend: CommandFrontend,
     input_capture: InputCapture,
     link: IvshmemLink,
+    doorbell: Option<IvshmemServer>,
     net_link: Option<NetworkLink>,
     metrics: FrameMetrics,
     qemu_cmd: Option<Vec<String>>,
@@ -40,6 +42,16 @@ impl<B: GpuBackend> GpuServer<B> {
     fn new(shmem_path: PathBuf, shmem_size: usize, net_port: Option<u16>) -> Self {
         let link = IvshmemLink::open(&shmem_path, shmem_size)
             .expect("failed to open ivshmem region");
+
+        // Start doorbell server for MSI-X interrupt notification
+        let sock_path = shmem_path.with_extension("sock");
+        let doorbell = match IvshmemServer::new(&sock_path, &shmem_path, shmem_size) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                log::warn!("doorbell server failed: {}, falling back to polling", e);
+                None
+            }
+        };
 
         let net_link = net_port.and_then(|port| {
             NetworkLink::bind(port).ok()
@@ -58,6 +70,7 @@ impl<B: GpuBackend> GpuServer<B> {
             frontend,
             input_capture,
             link,
+            doorbell,
             net_link,
             metrics: FrameMetrics::new(),
             qemu_cmd: None,
@@ -89,6 +102,9 @@ impl<B: GpuBackend> GpuServer<B> {
             self.link.set_display_info(size.width, size.height, 60);
         }
         self.link.set_status(1);
+        if let Some(ref mut db) = self.doorbell {
+            db.reset();
+        }
         log::info!("Guest reconnected — ready");
     }
 
@@ -96,7 +112,13 @@ impl<B: GpuBackend> GpuServer<B> {
         // check for guest reboot
         self.check_guest_reset();
 
+        // accept QEMU doorbell connection
+        if let Some(ref mut db) = self.doorbell {
+            db.try_accept();
+        }
+
         // shared memory transport
+        let mut had_completions = false;
         loop {
             let cmd = {
                 let mut ring = self.link.command_ring();
@@ -113,9 +135,19 @@ impl<B: GpuBackend> GpuServer<B> {
                     if let Some(comp) = completion {
                         let mut ring = self.link.completion_ring();
                         ring.enqueue(&comp);
+                        had_completions = true;
                     }
                 }
                 None => break,
+            }
+        }
+
+        // signal guest via doorbell interrupt (MSI-X)
+        if had_completions {
+            if let Some(ref db) = self.doorbell {
+                if db.has_peer() {
+                    db.notify_peer();
+                }
             }
         }
 
