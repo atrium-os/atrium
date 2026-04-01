@@ -88,19 +88,19 @@ impl FrameMetrics {
             0.0
         };
 
-        log::info!("── metrics ──────────────────────────────────");
-        log::info!("  scene fps: {:.1}  |  scene frames: {}",
+        log::debug!("── metrics ──────────────────────────────────");
+        log::debug!("  scene fps: {:.1}  |  scene frames: {}",
             fps, self.total_scene_frames);
-        log::info!("  cmds: {}  |  uploads: {}  |  upload data: {:.1} KB",
+        log::debug!("  cmds: {}  |  uploads: {}  |  upload data: {:.1} KB",
             self.total_cmds, self.total_uploads, self.total_upload_bytes as f64 / 1024.0);
-        log::info!("  CAS: {} live blobs ({:.1} KB)  |  dedup: {} hits ({:.1}%)",
+        log::debug!("  CAS: {} live blobs ({:.1} KB)  |  dedup: {} hits ({:.1}%)",
             cas_blobs, cas_bytes as f64 / 1024.0,
             self.total_dedup_hits, dedup_pct);
         let share_pct = if tree_size > 0 {
             tree_shared as f64 / tree_size as f64 * 100.0
         } else { 0.0 };
-        log::info!("  tree: {} nodes, {} shared ({:.0}%)  |  GC: {} freed ({:.1} KB)",
+        log::debug!("  tree: {} nodes, {} shared ({:.0}%)  |  GC: {} freed ({:.1} KB)",
             tree_size, tree_shared, share_pct, gc_freed, gc_bytes as f64 / 1024.0);
-        log::info!("─────────────────────────────────────────────");
+        log::debug!("─────────────────────────────────────────────");
     }
 }
