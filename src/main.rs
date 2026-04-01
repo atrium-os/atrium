@@ -175,6 +175,7 @@ impl<B: GpuBackend> ApplicationHandler for GpuServer<B> {
                 net.set_display_info(size.width, size.height, 60);
             }
 
+            window.set_cursor_visible(false);
             window.request_redraw();
             self.window = Some(window);
             self.renderer = Some(renderer);
