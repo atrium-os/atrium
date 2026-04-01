@@ -17,6 +17,7 @@ pub struct MetalRenderer {
     queue: CommandQueue,
     layer: MetalLayer,
     pipeline: RenderPipelineState,
+    gradient_pipeline: RenderPipelineState,
     stencil_fill_pipeline: RenderPipelineState,
     stencil_fill_ds: DepthStencilState,
     stencil_cover_ds: DepthStencilState,
@@ -69,6 +70,15 @@ impl GpuBackend for MetalRenderer {
 
         let pipeline = device.new_render_pipeline_state(&desc)
             .expect("failed to create pipeline");
+
+        let frag_grad = library.get_function("fragment_gradient", None).unwrap();
+        let grad_desc = RenderPipelineDescriptor::new();
+        grad_desc.set_vertex_function(Some(&vert));
+        grad_desc.set_fragment_function(Some(&frag_grad));
+        grad_desc.color_attachments().object_at(0).unwrap()
+            .set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        let gradient_pipeline = device.new_render_pipeline_state(&grad_desc)
+            .expect("failed to create gradient pipeline");
 
         let depth_desc = DepthStencilDescriptor::new();
         depth_desc.set_depth_compare_function(MTLCompareFunction::Less);
@@ -137,6 +147,7 @@ impl GpuBackend for MetalRenderer {
             queue,
             layer,
             pipeline,
+            gradient_pipeline,
             stencil_fill_pipeline,
             stencil_fill_ds,
             stencil_cover_ds,
@@ -283,21 +294,20 @@ impl GpuBackend for MetalRenderer {
             for (idx, item) in scene.render_list().iter().enumerate() {
                 let mvp = mat4_mul(&item.world_matrix, &vp);
 
-                // extract color from material
-                let color = if item.material != NULL_HASH {
+                // extract material (color or gradient)
+                let parsed_mat = if item.material != NULL_HASH {
                     if let Some(data) = cas.load(&item.material) {
                         if let Some(NodeData::Material(mat)) = NodeData::parse(data) {
-                            rgba8_to_float(mat.base_color)
-                        } else {
-                            [0.8, 0.8, 0.8, 1.0]
-                        }
+                            Some(mat)
+                        } else { None }
                     } else {
                         log::warn!("render[{}]: material {:02x}{:02x}.. not in CAS", idx, item.material[0], item.material[1]);
-                        [0.8, 0.8, 0.8, 1.0]
+                        None
                     }
-                } else {
-                    [0.8, 0.8, 0.8, 1.0]
-                };
+                } else { None };
+
+                let use_gradient = parsed_mat.as_ref().map_or(false, |m| m.has_gradient() && m.gradient_stop_count >= 2);
+                let color = parsed_mat.as_ref().map_or([0.8f32, 0.8, 0.8, 1.0], |m| rgba8_to_float(m.base_color));
 
                 // load mesh vertex data from CAS
                 if item.mesh != NULL_HASH {
@@ -317,11 +327,38 @@ impl GpuBackend for MetalRenderer {
                                     std::mem::size_of::<[f32; 16]>() as u64,
                                     mvp_t.as_ptr() as *const _,
                                 );
-                                encoder.set_fragment_bytes(
-                                    0,
-                                    std::mem::size_of::<[f32; 4]>() as u64,
-                                    color.as_ptr() as *const _,
-                                );
+                                if use_gradient {
+                                    let mat = parsed_mat.as_ref().unwrap();
+                                    let mut grad_buf = [0.0f32; 48];
+                                    grad_buf[0] = mat.gradient_type as f32;
+                                    grad_buf[1] = mat.gradient_stop_count as f32;
+                                    grad_buf[2] = mat.gradient_x0;
+                                    grad_buf[3] = mat.gradient_y0;
+                                    grad_buf[4] = mat.gradient_x1;
+                                    grad_buf[5] = mat.gradient_y1;
+                                    for i in 0..mat.gradient_stop_count as usize {
+                                        let (off, rgba) = mat.gradient_stops[i];
+                                        let c = rgba8_to_float(rgba);
+                                        grad_buf[8 + i * 5] = off;
+                                        grad_buf[8 + i * 5 + 1] = c[0];
+                                        grad_buf[8 + i * 5 + 2] = c[1];
+                                        grad_buf[8 + i * 5 + 3] = c[2];
+                                        grad_buf[8 + i * 5 + 4] = c[3];
+                                    }
+                                    encoder.set_render_pipeline_state(&self.gradient_pipeline);
+                                    encoder.set_fragment_bytes(
+                                        0,
+                                        std::mem::size_of::<[f32; 48]>() as u64,
+                                        grad_buf.as_ptr() as *const _,
+                                    );
+                                } else {
+                                    encoder.set_render_pipeline_state(&self.pipeline);
+                                    encoder.set_fragment_bytes(
+                                        0,
+                                        std::mem::size_of::<[f32; 4]>() as u64,
+                                        color.as_ptr() as *const _,
+                                    );
+                                }
 
                                 encoder.set_vertex_buffer(0, Some(&vb), 0);
 
@@ -356,12 +393,14 @@ impl GpuBackend for MetalRenderer {
                                     }
 
                                     // pass 2: cover — draw same geometry, stencil test non-zero, output color
-                                    encoder.set_render_pipeline_state(&self.pipeline);
+                                    if use_gradient {
+                                        encoder.set_render_pipeline_state(&self.gradient_pipeline);
+                                    } else {
+                                        encoder.set_render_pipeline_state(&self.pipeline);
+                                    }
                                     encoder.set_depth_stencil_state(&self.stencil_cover_ds);
                                     encoder.set_stencil_reference_value(0);
-                                    encoder.set_fragment_bytes(
-                                        0, std::mem::size_of::<[f32; 4]>() as u64,
-                                        color.as_ptr() as *const _);
+                                    // fragment bytes already set above (color or gradient)
                                     if let Some(ref ib) = ib {
                                         encoder.draw_indexed_primitives(
                                             MTLPrimitiveType::Triangle,
@@ -409,6 +448,17 @@ using namespace metal;
 
 struct VertexOut {
     float4 position [[position]];
+    float3 obj_pos;
+};
+
+// Gradient params: [type, stop_count, x0, y0, x1, y1, pad, pad,
+//                   stop0_offset, stop0_r, stop0_g, stop0_b, stop0_a, ...]
+// Total: 8 + 5*8 = 48 floats max
+struct GradientParams {
+    float type_and_count[2]; // [0]=type, [1]=stop_count
+    float line[4];           // x0, y0, x1, y1
+    float pad[2];
+    float stops[40];         // 8 stops * 5 floats (offset, r, g, b, a)
 };
 
 vertex VertexOut vertex_main(
@@ -418,8 +468,8 @@ vertex VertexOut vertex_main(
 ) {
     VertexOut out;
     float3 pos = positions[vid];
-    // mvp is row-major from Rust, so multiply pos * mvp
     out.position = float4(pos, 1.0) * mvp;
+    out.obj_pos = pos;
     return out;
 }
 
@@ -428,6 +478,48 @@ fragment float4 fragment_main(
     constant float4& color [[buffer(0)]]
 ) {
     return color;
+}
+
+fragment float4 fragment_gradient(
+    VertexOut in [[stage_in]],
+    constant GradientParams& grad [[buffer(0)]]
+) {
+    int stop_count = int(grad.type_and_count[1]);
+    if (stop_count < 2) return float4(1.0);
+
+    float2 p0 = float2(grad.line[0], grad.line[1]);
+    float2 p1 = float2(grad.line[2], grad.line[3]);
+    float2 d = p1 - p0;
+    float len2 = dot(d, d);
+    float t = 0.0;
+    if (len2 > 0.0001) {
+        t = dot(float2(in.obj_pos.x, in.obj_pos.y) - p0, d) / len2;
+    }
+    t = clamp(t, 0.0, 1.0);
+
+    // find surrounding stops and interpolate
+    float4 result = float4(1.0);
+    for (int i = 0; i < stop_count - 1; i++) {
+        float off0 = grad.stops[i * 5];
+        float off1 = grad.stops[(i + 1) * 5];
+        if (t >= off0 && t <= off1) {
+            float f = (off1 > off0) ? (t - off0) / (off1 - off0) : 0.0;
+            float4 c0 = float4(grad.stops[i*5+1], grad.stops[i*5+2], grad.stops[i*5+3], grad.stops[i*5+4]);
+            float4 c1 = float4(grad.stops[(i+1)*5+1], grad.stops[(i+1)*5+2], grad.stops[(i+1)*5+3], grad.stops[(i+1)*5+4]);
+            result = mix(c0, c1, f);
+            break;
+        }
+    }
+    // before first stop
+    if (t < grad.stops[0]) {
+        result = float4(grad.stops[1], grad.stops[2], grad.stops[3], grad.stops[4]);
+    }
+    // after last stop
+    if (t > grad.stops[(stop_count-1)*5]) {
+        int last = (stop_count-1)*5;
+        result = float4(grad.stops[last+1], grad.stops[last+2], grad.stops[last+3], grad.stops[last+4]);
+    }
+    return result;
 }
 "#;
 

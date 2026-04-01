@@ -1,4 +1,4 @@
-use crate::command::protocol::Hash256;
+use crate::command::protocol::{Hash256, NULL_HASH};
 
 #[derive(Clone, Debug)]
 pub struct SceneRoot {
@@ -43,9 +43,20 @@ pub struct Material {
     pub base_color: u32,
     pub metallic_roughness: u32,
     pub emissive: u32,
+    pub gradient_type: u8,
+    pub gradient_stop_count: u8,
+    pub gradient_x0: f32,
+    pub gradient_y0: f32,
+    pub gradient_x1: f32,
+    pub gradient_y1: f32,
+    pub gradient_stops: [(f32, u32); 8],
     pub shader: Hash256,
     pub albedo_tex: Hash256,
     pub normal_tex: Hash256,
+}
+
+impl Material {
+    pub fn has_gradient(&self) -> bool { self.flags & 0x02 != 0 }
 }
 
 #[derive(Clone, Debug)]
@@ -245,12 +256,38 @@ fn parse_renderable(d: &[u8]) -> Renderable {
 }
 
 fn parse_material(d: &[u8]) -> Material {
+    let flags = d[1];
+    let mut gradient_type = 0u8;
+    let mut gradient_stop_count = 0u8;
+    let mut gradient_x0 = 0.0f32;
+    let mut gradient_y0 = 0.0f32;
+    let mut gradient_x1 = 0.0f32;
+    let mut gradient_y1 = 0.0f32;
+    let mut gradient_stops = [(0.0f32, 0u32); 8];
+
+    if flags & 0x02 != 0 {
+        gradient_type = d[14];
+        gradient_stop_count = d[15].min(8);
+        gradient_x0 = read_f32(d, 16);
+        gradient_y0 = read_f32(d, 20);
+        gradient_x1 = read_f32(d, 24);
+        gradient_y1 = read_f32(d, 28);
+        for i in 0..gradient_stop_count as usize {
+            let off = 32 + i * 8;
+            gradient_stops[i] = (read_f32(d, off), read_u32(d, off + 4));
+        }
+    }
+
     Material {
-        flags: d[1],
+        flags,
         base_color: read_u32(d, 2),
         metallic_roughness: read_u32(d, 6),
         emissive: read_u32(d, 10),
-        shader: read_hash(d, 32),
+        gradient_type,
+        gradient_stop_count,
+        gradient_x0, gradient_y0, gradient_x1, gradient_y1,
+        gradient_stops,
+        shader: if flags & 0x02 != 0 { NULL_HASH } else { read_hash(d, 32) },
         albedo_tex: read_hash(d, 64),
         normal_tex: read_hash(d, 96),
     }
