@@ -37,6 +37,17 @@ impl CasStore {
         }
     }
 
+    pub fn clear(&mut self) {
+        self.blobs.clear();
+        self.upload_staging.clear();
+        self.dedup_hits = 0;
+        self.dedup_bytes_saved = 0;
+        self.gc_freed_blobs = 0;
+        self.gc_freed_bytes = 0;
+        self.last_tree_size = 0;
+        self.last_tree_shared = 0;
+    }
+
     pub fn hash(data: &[u8]) -> Hash256 {
         let mut hasher = Sha256::new();
         hasher.update(data);

@@ -67,6 +67,23 @@ impl IvshmemLink {
         Ok(link)
     }
 
+    pub fn status(&self) -> u32 {
+        self.read_ctrl_u32(CTRL_STATUS)
+    }
+
+    pub fn set_status(&mut self, val: u32) {
+        self.write_ctrl_u32(CTRL_STATUS, val);
+    }
+
+    pub fn reset_rings(&mut self) {
+        self.write_ctrl_u32(CTRL_CMD_WRITE, 0);
+        self.write_ctrl_u32(CTRL_CMD_READ, 0);
+        self.write_ctrl_u32(CTRL_COMP_WRITE, 0);
+        self.write_ctrl_u32(CTRL_COMP_READ, 0);
+        self.write_ctrl_u32(CTRL_INPUT_WRITE, 0);
+        self.write_ctrl_u32(CTRL_INPUT_READ, 0);
+    }
+
     pub fn set_display_info(&mut self, width: u32, height: u32, hz: u32) {
         self.write_ctrl_u32(CTRL_DISPLAY_W, width);
         self.write_ctrl_u32(CTRL_DISPLAY_H, height);
@@ -87,13 +104,19 @@ impl IvshmemLink {
 
     fn read_ctrl_u32(&self, offset: usize) -> u32 {
         let base = CTRL_OFFSET + offset;
-        let bytes = &self.mmap[base..base + 4];
-        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+        unsafe {
+            let ptr = self.mmap.as_ptr().add(base) as *const u32;
+            core::ptr::read_volatile(ptr)
+        }
     }
 
     fn write_ctrl_u32(&mut self, offset: usize, val: u32) {
         let base = CTRL_OFFSET + offset;
-        self.mmap[base..base + 4].copy_from_slice(&val.to_le_bytes());
+        unsafe {
+            let ptr = self.mmap.as_mut_ptr().add(base) as *mut u32;
+            core::ptr::write_volatile(ptr, val);
+        }
+        let _ = self.mmap.flush();
     }
 
     fn read_bytes(&self, offset: usize, len: usize) -> Vec<u8> {
@@ -101,7 +124,13 @@ impl IvshmemLink {
     }
 
     fn write_bytes(&mut self, offset: usize, data: &[u8]) {
-        self.mmap[offset..offset + data.len()].copy_from_slice(data);
+        unsafe {
+            let ptr = self.mmap.as_mut_ptr().add(offset);
+            for (i, &b) in data.iter().enumerate() {
+                core::ptr::write_volatile(ptr.add(i), b);
+            }
+        }
+        let _ = self.mmap.flush();
     }
 }
 

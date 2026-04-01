@@ -30,6 +30,11 @@ impl CommandFrontend {
         }
     }
 
+    pub fn reset(&mut self) {
+        self.pending_tasks.clear();
+        self.last_upload_size = 0;
+    }
+
     pub fn dispatch(&mut self, cmd: &Command) -> Option<Completion> {
         match cmd.opcode {
             CMD_UPLOAD_BEGIN => self.handle_upload_begin(cmd),

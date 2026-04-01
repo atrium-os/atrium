@@ -32,6 +32,8 @@ struct GpuServer<B: GpuBackend> {
     link: IvshmemLink,
     net_link: Option<NetworkLink>,
     metrics: FrameMetrics,
+    qemu_cmd: Option<Vec<String>>,
+    qemu_launched: bool,
 }
 
 impl<B: GpuBackend> GpuServer<B> {
@@ -58,10 +60,42 @@ impl<B: GpuBackend> GpuServer<B> {
             link,
             net_link,
             metrics: FrameMetrics::new(),
+            qemu_cmd: None,
+            qemu_launched: false,
         }
     }
 
+    fn check_guest_reset(&mut self) {
+        if self.link.status() != 0 { return; }
+
+        log::info!("Guest reset detected — reinitializing");
+        self.link.reset_rings();
+
+        // clear scene and CAS
+        {
+            let mut scene = self.scene.lock().unwrap();
+            scene.clear();
+        }
+        {
+            let mut cas = self.cas.lock().unwrap();
+            cas.clear();
+        }
+        self.frontend.reset();
+        self.metrics = FrameMetrics::new();
+
+        // re-publish display info and set READY
+        if let Some(window) = &self.window {
+            let size = window.inner_size();
+            self.link.set_display_info(size.width, size.height, 60);
+        }
+        self.link.set_status(1);
+        log::info!("Guest reconnected — ready");
+    }
+
     fn process_commands(&mut self) {
+        // check for guest reboot
+        self.check_guest_reset();
+
         // shared memory transport
         loop {
             let cmd = {
@@ -146,6 +180,29 @@ impl<B: GpuBackend> ApplicationHandler for GpuServer<B> {
             self.renderer = Some(renderer);
 
             log::info!("KarythraGPU server ready ({}x{})", size.width, size.height);
+
+            if !self.qemu_launched {
+                if let Some(ref cmd) = self.qemu_cmd {
+                    if !cmd.is_empty() {
+                        log::info!("Launching QEMU: {} ...", &cmd[0]);
+                        match std::process::Command::new(&cmd[0])
+                            .args(&cmd[1..])
+                            .stdin(std::process::Stdio::inherit())
+                            .stdout(std::process::Stdio::inherit())
+                            .stderr(std::process::Stdio::inherit())
+                            .spawn()
+                        {
+                            Ok(child) => {
+                                log::info!("QEMU launched (pid={})", child.id());
+                            }
+                            Err(e) => {
+                                log::error!("Failed to launch QEMU: {}", e);
+                            }
+                        }
+                        self.qemu_launched = true;
+                    }
+                }
+            }
         }
     }
 
@@ -243,15 +300,24 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .and_then(|s| s.parse().ok());
 
+    // --qemu <args...> launches QEMU as child after window opens
+    let qemu_cmd: Option<Vec<String>> = args.iter()
+        .position(|a| a == "--qemu")
+        .map(|i| args[i + 1..].to_vec());
+
     log::info!("KarythraGPU server starting");
     log::info!("  shmem: {:?}", shmem_path);
     if let Some(port) = net_port {
         log::info!("  network: TCP port {}", port);
+    }
+    if qemu_cmd.is_some() {
+        log::info!("  will launch QEMU after window init");
     }
 
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Poll);
 
     let mut server = GpuServer::<render::metal_backend::MetalRenderer>::new(shmem_path, shmem_size, net_port);
+    server.qemu_cmd = qemu_cmd;
     event_loop.run_app(&mut server).unwrap();
 }

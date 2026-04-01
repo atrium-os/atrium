@@ -41,6 +41,16 @@ impl SceneGraph {
         }
     }
 
+    pub fn clear(&mut self) {
+        self.root_hash = NULL_HASH;
+        self.camera_hash = NULL_HASH;
+        self.prev_root = NULL_HASH;
+        self.render_list.clear();
+        self.light_list.clear();
+        self.dirty = true;
+        self.tess_cache.clear();
+    }
+
     pub fn set_root(&mut self, hash: Hash256) {
         self.prev_root = self.root_hash;
         self.root_hash = hash;
