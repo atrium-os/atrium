@@ -239,7 +239,7 @@ impl GpuBackend for MetalRenderer {
         Some((verts, indices))
     }
 
-    fn render_frame(&mut self, scene: &SceneGraph, cas: &CasStore, _frame: u64) {
+    fn render_frame(&mut self, scene: &SceneGraph, cas: &CasStore, _frame: u64, cursor: Option<(f32, f32)>) {
         // ensure stencil texture exists at correct size
         let need_stencil = self.stencil_texture.is_none()
             || self.stencil_texture.as_ref().map(|t| (t.width(), t.height())) != Some((self.width as u64, self.height as u64));
@@ -433,6 +433,80 @@ impl GpuBackend for MetalRenderer {
                         log::warn!("render[{}]: mesh {:02x}{:02x}.. not in CAS", idx, item.mesh[0], item.mesh[1]);
                     }
                 }
+            }
+
+            // cursor overlay (screen-space, no scene graph involvement)
+            if let Some((cx, cy)) = cursor {
+                let w = self.width as f32;
+                let h = self.height as f32;
+                let s = h * 0.03; // 3% of screen height
+                let k = s / 23.0;
+                // NDC: (0,0)=center, (-1,-1)=bottom-left, (1,1)=top-right
+                let to_ndc_x = |px: f32| px / w * 2.0 - 1.0;
+                let to_ndc_y = |py: f32| 1.0 - py / h * 2.0;
+                // classic arrow cursor shape in screen pixels, then to NDC
+                let pts: [(f32, f32); 7] = [
+                    (cx, cy),
+                    (cx, cy + 20.0 * k),
+                    (cx + 5.0 * k, cy + 16.0 * k),
+                    (cx + 8.5 * k, cy + 23.0 * k),
+                    (cx + 11.5 * k, cy + 21.0 * k),
+                    (cx + 8.0 * k, cy + 14.0 * k),
+                    (cx + 14.0 * k, cy + 14.0 * k),
+                ];
+                // fan triangulation: 5 triangles from 7 vertices
+                let mut cursor_verts = [0.0f32; 5 * 3 * 3]; // 5 tris * 3 verts * 3 floats
+                for i in 0..5 {
+                    let (ax, ay) = pts[0];
+                    let (bx, by) = pts[i + 1];
+                    let (ccx, ccy) = pts[i + 2];
+                    let base = i * 9;
+                    cursor_verts[base]     = to_ndc_x(ax);
+                    cursor_verts[base + 1] = to_ndc_y(ay);
+                    cursor_verts[base + 2] = 0.0;
+                    cursor_verts[base + 3] = to_ndc_x(bx);
+                    cursor_verts[base + 4] = to_ndc_y(by);
+                    cursor_verts[base + 5] = 0.0;
+                    cursor_verts[base + 6] = to_ndc_x(ccx);
+                    cursor_verts[base + 7] = to_ndc_y(ccy);
+                    cursor_verts[base + 8] = 0.0;
+                }
+                let cursor_vb = self.device.new_buffer_with_data(
+                    cursor_verts.as_ptr() as *const _,
+                    (cursor_verts.len() * 4) as u64,
+                    MTLResourceOptions::CPUCacheModeDefaultCache,
+                );
+                let identity: [f32; 16] = [
+                    1.0, 0.0, 0.0, 0.0,
+                    0.0, 1.0, 0.0, 0.0,
+                    0.0, 0.0, 1.0, 0.0,
+                    0.0, 0.0, 0.0, 1.0,
+                ];
+                // dark outline (offset by 1px)
+                let outline_color: [f32; 4] = [0.12, 0.12, 0.12, 1.0];
+                let mut outline_verts = cursor_verts;
+                let ox = 1.0 / w * 2.0;
+                let oy = 1.0 / h * 2.0;
+                for i in 0..15 {
+                    outline_verts[i * 3] += ox;
+                    outline_verts[i * 3 + 1] -= oy;
+                }
+                let outline_vb = self.device.new_buffer_with_data(
+                    outline_verts.as_ptr() as *const _,
+                    (outline_verts.len() * 4) as u64,
+                    MTLResourceOptions::CPUCacheModeDefaultCache,
+                );
+                encoder.set_render_pipeline_state(&self.pipeline);
+                encoder.set_depth_stencil_state(&self.depth_state);
+                encoder.set_vertex_bytes(1, 64, identity.as_ptr() as *const _);
+                encoder.set_fragment_bytes(0, 16, outline_color.as_ptr() as *const _);
+                encoder.set_vertex_buffer(0, Some(&outline_vb), 0);
+                encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, 15);
+                // white body
+                let body_color: [f32; 4] = [0.94, 0.94, 0.96, 1.0];
+                encoder.set_fragment_bytes(0, 16, body_color.as_ptr() as *const _);
+                encoder.set_vertex_buffer(0, Some(&cursor_vb), 0);
+                encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, 15);
             }
 
             encoder.end_encoding();

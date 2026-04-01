@@ -245,11 +245,12 @@ impl<B: GpuBackend> ApplicationHandler for GpuServer<B> {
                     }
                 }
 
+                let cursor_pos = Some((self.input_capture.cursor_x, self.input_capture.cursor_y));
                 let render_items = if let Some(renderer) = &mut self.renderer {
                     let scene = self.scene.lock().unwrap();
                     let cas = self.cas.lock().unwrap();
                     let items = scene.render_list().len() as u32;
-                    renderer.render_frame(&scene, &cas, self.metrics.frame_count);
+                    renderer.render_frame(&scene, &cas, self.metrics.frame_count, cursor_pos);
                     items
                 } else {
                     0

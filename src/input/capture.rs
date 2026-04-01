@@ -19,11 +19,13 @@ pub const INPUT_RESIZE: u16 = 5;
 
 pub struct InputCapture {
     events: Vec<InputEvent>,
+    pub cursor_x: f32,
+    pub cursor_y: f32,
 }
 
 impl InputCapture {
     pub fn new() -> Self {
-        Self { events: Vec::new() }
+        Self { events: Vec::new(), cursor_x: 0.0, cursor_y: 0.0 }
     }
 
     pub fn drain(&mut self) -> Vec<InputEvent> {
@@ -49,6 +51,8 @@ impl InputCapture {
             }
 
             WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_x = position.x as f32;
+                self.cursor_y = position.y as f32;
                 self.events.push(InputEvent {
                     event_type: INPUT_MOUSE_MOVE,
                     code: 0,
