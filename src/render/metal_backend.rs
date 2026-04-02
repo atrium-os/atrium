@@ -42,6 +42,11 @@ impl GpuBackend for MetalRenderer {
         layer.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
         layer.set_presents_with_transaction(false);
         layer.set_drawable_size(CGSize::new(width as f64, height as f64));
+        layer.set_maximum_drawable_count(3);
+        unsafe {
+            let layer_ptr: *mut AnyObject = std::mem::transmute::<&MetalLayerRef, *mut AnyObject>(layer.as_ref());
+            let _: () = objc2::msg_send![&*layer_ptr, setDisplaySyncEnabled: true];
+        }
 
         unsafe {
             let raw_window = window.window_handle().unwrap().as_raw();

@@ -18,6 +18,7 @@ use input::capture::InputCapture;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use std::time::{Duration, Instant};
 use winit::window::{Window, WindowId};
 
 use std::sync::{Arc, Mutex};
@@ -328,8 +329,13 @@ impl<B: GpuBackend> ApplicationHandler for GpuServer<B> {
 
                 self.write_input_events();
 
+                // Frame pacing: schedule next redraw ~16ms from now (60fps)
+                // Reliable across all displays regardless of vsync support
                 if let Some(window) = &self.window {
                     window.request_redraw();
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(
+                        Instant::now() + Duration::from_millis(16)
+                    ));
                 }
             }
 
@@ -372,7 +378,7 @@ fn main() {
     }
 
     let event_loop = EventLoop::new().unwrap();
-    event_loop.set_control_flow(ControlFlow::Poll);
+    event_loop.set_control_flow(ControlFlow::Wait);
 
     let mut server = GpuServer::<render::metal_backend::MetalRenderer>::new(shmem_path, shmem_size, net_port);
     server.qemu_cmd = qemu_cmd;
