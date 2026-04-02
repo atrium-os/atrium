@@ -124,7 +124,8 @@ impl<B: GpuBackend> GpuServer<B> {
         log::info!("Guest reconnected — ready");
     }
 
-    fn process_commands(&mut self) {
+    fn process_commands(&mut self) -> bool {
+        let mut needs_render = false;
         // check for guest reboot
         self.check_guest_reset();
 
@@ -144,6 +145,7 @@ impl<B: GpuBackend> GpuServer<B> {
                 Some(cmd) => {
                     self.metrics.record_cmd();
                     let completion = self.frontend.dispatch(&cmd);
+                    if cmd.opcode == 0x0300 { needs_render = true; }
                     if cmd.opcode == 0x0003 && self.frontend.last_upload_size > 0 {
                         self.metrics.record_upload(self.frontend.last_upload_size);
                         self.frontend.last_upload_size = 0;
@@ -194,6 +196,7 @@ impl<B: GpuBackend> GpuServer<B> {
                 }
             }
         }
+        needs_render
     }
 
     fn write_input_events(&mut self) {
@@ -276,42 +279,45 @@ impl<B: GpuBackend> ApplicationHandler for GpuServer<B> {
 
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = &mut self.renderer {
+                    let scale = self.window.as_ref().map(|w| w.scale_factor()).unwrap_or(1.0);
                     renderer.resize(size.width, size.height);
+                    renderer.set_scale(scale);
                     self.link.set_display_info(size.width, size.height, 60);
+                    log::info!("Resized: {}x{} scale={}", size.width, size.height, scale);
                 }
             }
 
             WindowEvent::RedrawRequested => {
                 self.metrics.begin_frame();
-                self.process_commands();
+                let needs_render = self.process_commands();
 
-                // tessellate any vector paths before rendering
-                {
-                    let (dw, dh) = self.window.as_ref()
-                        .map(|w| { let s = w.inner_size(); (s.width, s.height) })
-                        .unwrap_or((1024, 768));
-                    let mut scene = self.scene.lock().unwrap();
-                    let mut cas = self.cas.lock().unwrap();
-                    if let Some(renderer) = &mut self.renderer {
-                        let mut gpu_tess = |data: &[u8], tol: f32, fill: bool| {
-                            renderer.tessellate_path(data, tol, fill)
-                        };
-                        scene.tessellate_paths(&mut cas, dw, dh, Some(&mut gpu_tess));
-                    } else {
-                        scene.tessellate_paths(&mut cas, dw, dh, None);
+                let render_items = if needs_render {
+                    // tessellate any vector paths before rendering
+                    {
+                        let (dw, dh) = self.window.as_ref()
+                            .map(|w| { let s = w.inner_size(); (s.width, s.height) })
+                            .unwrap_or((1024, 768));
+                        let mut scene = self.scene.lock().unwrap();
+                        let mut cas = self.cas.lock().unwrap();
+                        if let Some(renderer) = &mut self.renderer {
+                            let mut gpu_tess = |data: &[u8], tol: f32, fill: bool| {
+                                renderer.tessellate_path(data, tol, fill)
+                            };
+                            scene.tessellate_paths(&mut cas, dw, dh, Some(&mut gpu_tess));
+                        } else {
+                            scene.tessellate_paths(&mut cas, dw, dh, None);
+                        }
                     }
-                }
 
-                let cursor_pos = Some((self.input_capture.cursor_x, self.input_capture.cursor_y));
-                let render_items = if let Some(renderer) = &mut self.renderer {
-                    let scene = self.scene.lock().unwrap();
-                    let cas = self.cas.lock().unwrap();
-                    let items = scene.render_list().len() as u32;
-                    renderer.render_frame(&scene, &cas, self.metrics.frame_count, cursor_pos);
-                    items
-                } else {
-                    0
-                };
+                    let cursor_pos = Some((self.input_capture.cursor_x, self.input_capture.cursor_y));
+                    if let Some(renderer) = &mut self.renderer {
+                        let scene = self.scene.lock().unwrap();
+                        let cas = self.cas.lock().unwrap();
+                        let items = scene.render_list().len() as u32;
+                        renderer.render_frame(&scene, &cas, self.metrics.frame_count, cursor_pos);
+                        items
+                    } else { 0 }
+                } else { 0 };
 
                 self.metrics.end_frame(render_items);
 
@@ -329,13 +335,8 @@ impl<B: GpuBackend> ApplicationHandler for GpuServer<B> {
 
                 self.write_input_events();
 
-                // Frame pacing: schedule next redraw ~16ms from now (60fps)
-                // Reliable across all displays regardless of vsync support
                 if let Some(window) = &self.window {
                     window.request_redraw();
-                    event_loop.set_control_flow(ControlFlow::WaitUntil(
-                        Instant::now() + Duration::from_millis(16)
-                    ));
                 }
             }
 
@@ -378,7 +379,7 @@ fn main() {
     }
 
     let event_loop = EventLoop::new().unwrap();
-    event_loop.set_control_flow(ControlFlow::Wait);
+    event_loop.set_control_flow(ControlFlow::Poll);
 
     let mut server = GpuServer::<render::metal_backend::MetalRenderer>::new(shmem_path, shmem_size, net_port);
     server.qemu_cmd = qemu_cmd;

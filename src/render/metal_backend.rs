@@ -43,10 +43,15 @@ impl GpuBackend for MetalRenderer {
         layer.set_presents_with_transaction(false);
         layer.set_drawable_size(CGSize::new(width as f64, height as f64));
         layer.set_maximum_drawable_count(3);
+        let scale_factor = window.scale_factor();
         unsafe {
             let layer_ptr: *mut AnyObject = std::mem::transmute::<&MetalLayerRef, *mut AnyObject>(layer.as_ref());
             let _: () = objc2::msg_send![&*layer_ptr, setDisplaySyncEnabled: true];
+            let _: () = objc2::msg_send![&*layer_ptr, setContentsScale: scale_factor];
+            let enabled: bool = objc2::msg_send![&*layer_ptr, displaySyncEnabled];
+            log::info!("CAMetalLayer: displaySyncEnabled={} maxDrawables=3 scale={}", enabled, scale_factor);
         }
+        layer.set_framebuffer_only(true);
 
         unsafe {
             let raw_window = window.window_handle().unwrap().as_raw();
@@ -174,6 +179,13 @@ impl GpuBackend for MetalRenderer {
         self.layer.set_drawable_size(CGSize::new(width as f64, height as f64));
     }
 
+    fn set_scale(&mut self, scale: f64) {
+        unsafe {
+            let layer_ptr: *mut AnyObject = std::mem::transmute::<&MetalLayerRef, *mut AnyObject>(self.layer.as_ref());
+            let _: () = objc2::msg_send![&*layer_ptr, setContentsScale: scale];
+        }
+    }
+
     fn tessellate_path(&mut self, segments_data: &[u8], tolerance: f32, _fill: bool) -> Option<(Vec<f32>, Vec<u16>)> {
         let seg_count = segments_data.len() / 28;
         if seg_count == 0 { return None; }
@@ -261,7 +273,10 @@ impl GpuBackend for MetalRenderer {
         objc2_autorelease(|_| {
             let drawable = match self.layer.next_drawable() {
                 Some(d) => d,
-                None => return,
+                None => {
+                    log::debug!("next_drawable returned None (all drawables in-flight)");
+                    return;
+                }
             };
 
             let desc = RenderPassDescriptor::new();
@@ -517,6 +532,7 @@ impl GpuBackend for MetalRenderer {
             encoder.end_encoding();
             cmd_buf.present_drawable(drawable);
             cmd_buf.commit();
+            cmd_buf.wait_until_completed();
         });
     }
 }
