@@ -43,10 +43,25 @@ impl<B: GpuBackend> GpuServer<B> {
         let link = IvshmemLink::open(&shmem_path, shmem_size)
             .expect("failed to open ivshmem region");
 
-        // Start doorbell server for MSI-X interrupt notification
+        // Start doorbell server and wait for QEMU to connect.
+        // QEMU's -chardev socket needs the connection accepted and init
+        // messages sent before the machine can boot.
         let sock_path = shmem_path.with_extension("sock");
         let doorbell = match IvshmemServer::new(&sock_path, &shmem_path, shmem_size) {
-            Ok(s) => Some(s),
+            Ok(mut s) => {
+                log::info!("Waiting for QEMU to connect to {:?}...", sock_path);
+                // Block until QEMU connects (up to 60s)
+                for _ in 0..600 {
+                    if s.try_accept() { break; }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                if s.has_peer() {
+                    log::info!("QEMU connected to ivshmem-server");
+                } else {
+                    log::warn!("QEMU did not connect within timeout");
+                }
+                Some(s)
+            }
             Err(e) => {
                 log::warn!("doorbell server failed: {}, falling back to polling", e);
                 None

@@ -86,7 +86,20 @@ impl IvshmemServer {
     }
 
     pub fn try_accept(&mut self) -> bool {
-        if self.qemu_connected { return true; }
+        if self.qemu_connected {
+            // Check for new connections (QEMU restarted)
+            match self.listener.accept() {
+                Ok((stream, _)) => {
+                    log::info!("ivshmem-server: new QEMU connection (reconnect)");
+                    if let Err(e) = self.send_init(&stream) {
+                        log::error!("ivshmem-server: reconnect init failed: {}", e);
+                    }
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                _ => {}
+            }
+            return true;
+        }
         match self.listener.accept() {
             Ok((stream, _)) => {
                 log::info!("ivshmem-server: QEMU connected");
@@ -101,15 +114,21 @@ impl IvshmemServer {
     }
 
     fn send_init(&self, stream: &UnixStream) -> io::Result<()> {
-        // 1. Protocol version (no fd)
+        // Protocol order (must match QEMU's ivshmem_recv_setup expectations):
+        // 1. Version (no fd)
+        // 2. Peer ID (no fd)
+        // 3. Peer connect messages (other peers' write fds)
+        // 4. Shmem fd (msg=-1, terminates sync recv_setup loop)
+        // 5. Own interrupt setup (own ID + read fds) — processed by async handler
+        //    AFTER ivshmem_setup_interrupts allocates msi_vectors
         send_i64(stream, PROTOCOL_VERSION)?;
-        // 2. Peer ID = 1 for QEMU (no fd)
         send_i64(stream, 1)?;
-        // 3. Shmem fd (peer_id = -1)
-        send_i64_with_fd(stream, -1, self.shmem_fd)?;
-        // 4. Peer 0 (us) notification: send our write fd so QEMU can interrupt us
+        // Peer 0 (GPU server) connect: QEMU can write to this to send us doorbells
         send_i64_with_fd(stream, 0, self.server_write_fd)?;
-        // 5. Peer 1 (QEMU) interrupt setup: send QEMU's read fd
+        // Shmem (terminates sync loop)
+        send_i64_with_fd(stream, -1, self.shmem_fd)?;
+        // Own interrupt setup (QEMU receives notifications on this fd)
+        // Sent AFTER shmem so it arrives via async handler, after msi_vectors exists
         send_i64_with_fd(stream, 1, self.qemu_read_fd)?;
         Ok(())
     }
