@@ -165,6 +165,14 @@ impl<B: GpuBackend> GpuServer<B> {
                 }
             }
         }
+        // One-time log for first completion
+        {
+            static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if had_completions && !LOGGED.load(std::sync::atomic::Ordering::Relaxed) {
+                LOGGED.store(true, std::sync::atomic::Ordering::Relaxed);
+                log::info!("First completion batch processed, doorbell fired");
+            }
+        }
 
         // network transport
         if let Some(ref mut net) = self.net_link {

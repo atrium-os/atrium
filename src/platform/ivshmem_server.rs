@@ -10,6 +10,7 @@ extern "C" {
     fn pipe(fds: *mut i32) -> i32;
     fn close(fd: i32) -> i32;
     fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+    fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
     fn sendmsg(sockfd: i32, msg: *const Msghdr, flags: i32) -> isize;
 }
@@ -127,9 +128,14 @@ impl IvshmemServer {
         send_i64_with_fd(stream, 0, self.server_write_fd)?;
         // Shmem (terminates sync loop)
         send_i64_with_fd(stream, -1, self.shmem_fd)?;
+        // Delay to let QEMU set up async chardev handler after recv_setup returns
+        std::thread::sleep(std::time::Duration::from_millis(100));
         // Own interrupt setup (QEMU receives notifications on this fd)
-        // Sent AFTER shmem so it arrives via async handler, after msi_vectors exists
         send_i64_with_fd(stream, 1, self.qemu_read_fd)?;
+        // Close our local copy of the read end — QEMU has its own fd via SCM_RIGHTS.
+        // Keeping it open could prevent QEMU's poll from detecting readability.
+        unsafe { close(self.qemu_read_fd); }
+        log::info!("closed local qemu_read_fd={}", self.qemu_read_fd);
         Ok(())
     }
 
@@ -139,10 +145,15 @@ impl IvshmemServer {
         unsafe { write(self.qemu_write_fd, &val as *const u64 as *const u8, 8); }
     }
 
+    pub fn notify_count_debug(&self) -> (i32, i32) {
+        (self.qemu_write_fd, self.qemu_read_fd)
+    }
+
     pub fn has_peer(&self) -> bool { self.qemu_connected }
 
     pub fn reset(&mut self) {
-        self.qemu_connected = false;
+        // Don't reset qemu_connected — QEMU doesn't reconnect on guest reboot,
+        // it uses the same chardev socket. The pipe fds stay valid.
     }
 }
 
