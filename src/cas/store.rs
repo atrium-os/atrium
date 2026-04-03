@@ -154,83 +154,68 @@ impl CasStore {
             None => return Vec::new(),
         };
 
-        if data.is_empty() { return Vec::new(); }
+        if data.len() < 8 { return Vec::new(); }
+
+        let type_id = u16::from_le_bytes([data[0], data[1]]);
+        let p = &data[8..]; // payload after v1 header
 
         let mut refs = Vec::new();
-        match data[0] {
-            0x01 if data.len() >= 128 => {
-                // SceneRoot: child_list[32], camera[64], environment[96]
-                refs.push(read_hash(data, 32));
-                refs.push(read_hash(data, 64));
-                refs.push(read_hash(data, 96));
+        match type_id {
+            0x0001 if p.len() >= 64 => {
+                // SceneRoot: children[0], camera[32]
+                refs.push(read_hash(p, 0));
+                refs.push(read_hash(p, 32));
             }
-            0x02 if data.len() >= 128 => {
-                // SceneNode: transform[32], renderable[64], children[96]
-                refs.push(read_hash(data, 32));
-                refs.push(read_hash(data, 64));
-                refs.push(read_hash(data, 96));
+            0x0002 if p.len() >= 96 => {
+                // SceneNode: transform[0], renderable[32], children[64]
+                refs.push(read_hash(p, 0));
+                refs.push(read_hash(p, 32));
+                refs.push(read_hash(p, 64));
             }
-            0x03 => {
-                // Transform: no hash references (leaf node)
+            0x0004 => {
+                // Transform: no refs
             }
-            0x04 if data.len() >= 128 => {
-                // Renderable: mesh[32], material[64]
-                refs.push(read_hash(data, 32));
-                refs.push(read_hash(data, 64));
+            0x0005 if p.len() >= 64 => {
+                // Renderable: geometry[0], material[32]
+                refs.push(read_hash(p, 0));
+                refs.push(read_hash(p, 32));
             }
-            0x05 if data.len() >= 128 => {
-                // Material: shader[32], albedo_tex[64], normal_tex[96]
-                refs.push(read_hash(data, 32));
-                refs.push(read_hash(data, 64));
-                refs.push(read_hash(data, 96));
-            }
-            0x06 if data.len() >= 128 => {
-                // Camera: view_transform[32]
-                refs.push(read_hash(data, 32));
-            }
-            0x07 if data.len() >= 128 => {
-                // Light: transform[32], shadow_config[64]
-                refs.push(read_hash(data, 32));
-                refs.push(read_hash(data, 64));
-            }
-            0x08 if data.len() >= 128 => {
-                // MeshHeader: vertex_data[32], index_data[64]
-                refs.push(read_hash(data, 32));
-                refs.push(read_hash(data, 64));
-            }
-            0x09 if data.len() >= 128 => {
-                // TextureHeader: pixel_data[32], mipchain[64]
-                refs.push(read_hash(data, 32));
-                refs.push(read_hash(data, 64));
-            }
-            0x0A if data.len() >= 128 => {
-                // AutonomousTask: config[32], state[64], target_node[96]
-                refs.push(read_hash(data, 32));
-                refs.push(read_hash(data, 64));
-                refs.push(read_hash(data, 96));
-            }
-            0x0D if data.len() >= 128 => {
-                // PathHeader: path_data[32], cached_mesh[64]
-                refs.push(read_hash(data, 32));
-                refs.push(read_hash(data, 64));
-            }
-            0x10 if data.len() >= 36 => {
-                // NodeList (4KB): next[4], entries[36..]
-                refs.push(read_hash(data, 4)); // next list
-                let count = data[1] as usize;
-                for i in 0..count {
-                    let offset = 36 + i * 32;
-                    if offset + 32 > data.len() { break; }
-                    refs.push(read_hash(data, offset));
+            0x0200 | 0x0201 | 0x0202 => {
+                // Materials: no hash refs in v1 solid/gradient (PBR has texture hashes)
+                if type_id == 0x0202 && p.len() >= 148 {
+                    refs.push(read_hash(p, 16));  // base color texture
+                    refs.push(read_hash(p, 48));  // normal map
+                    refs.push(read_hash(p, 80));  // metallic-roughness
+                    refs.push(read_hash(p, 112)); // emissive
                 }
             }
-            0x11 if data.len() >= 128 => {
-                // TextNode: font_hash[12]
-                refs.push(read_hash(data, 12));
+            0x0003 if p.len() >= 48 => {
+                // Camera: view_transform[16]
+                refs.push(read_hash(p, 16));
             }
-            _ => {
-                // Unknown type or bulk data — no hash references
+            0x0100 if p.len() >= 72 => {
+                // Mesh: vertex_data[8], index_data[40]
+                refs.push(read_hash(p, 8));
+                refs.push(read_hash(p, 40));
             }
+            0x0101 if p.len() >= 40 => {
+                // Path: segment_data[8]
+                refs.push(read_hash(p, 8));
+            }
+            0x0009 if p.len() >= 4 => {
+                // NodeList: count[0], then N×hash[4..]
+                let count = u32::from_le_bytes([p[0], p[1], p[2], p[3]]) as usize;
+                for i in 0..count {
+                    let offset = 4 + i * 32;
+                    if offset + 32 > p.len() { break; }
+                    refs.push(read_hash(p, offset));
+                }
+            }
+            0x0300 if p.len() >= 40 => {
+                // TextNode: font_hash[8]
+                refs.push(read_hash(p, 8));
+            }
+            _ => {}
         }
 
         refs.retain(|h| *h != NULL_HASH);

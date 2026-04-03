@@ -62,26 +62,24 @@ pub const STATUS_INVALID_HASH: u16 = 0x02;
 pub const STATUS_EXISTS: u16 = 0x03;
 pub const STATUS_NOT_FOUND: u16 = 0x04;
 
-// Scene node types — matches KarythraGPU SCENE_GRAPH.md
-pub const NODE_SCENE_ROOT: u8 = 0x01;
-pub const NODE_SCENE_NODE: u8 = 0x02;
-pub const NODE_TRANSFORM: u8 = 0x03;
-pub const NODE_RENDERABLE: u8 = 0x04;
-pub const NODE_MATERIAL: u8 = 0x05;
-pub const NODE_CAMERA: u8 = 0x06;
-pub const NODE_LIGHT: u8 = 0x07;
-pub const NODE_MESH_HEADER: u8 = 0x08;
-pub const NODE_TEXTURE_HEADER: u8 = 0x09;
-pub const NODE_AUTONOMOUS_TASK: u8 = 0x0A;
-pub const NODE_COLLIDER: u8 = 0x0B;
-pub const NODE_SHAPE_DATA: u8 = 0x0C;
-pub const NODE_PATH_HEADER: u8 = 0x0D;
-pub const NODE_NODE_LIST: u8 = 0x10;
-pub const NODE_PHYSICS_CONFIG: u8 = 0x10; // 4KB blob
-pub const NODE_PHYSICS_BODY_REG: u8 = 0x11;
-pub const NODE_PHYSICS_STATE: u8 = 0x12;
-pub const NODE_JOINT: u8 = 0x13;
-pub const NODE_CONTACT_LIST: u8 = 0x15;
+// Blob Format v1 — type IDs (u16 LE at bytes 0-1)
+// Header: type(u16) + version(u16) + flags(u32) = 8 bytes, payload follows
+pub const NODE_SCENE_ROOT: u16 = 0x0001;
+pub const NODE_SCENE_NODE: u16 = 0x0002;
+pub const NODE_CAMERA: u16 = 0x0003;
+pub const NODE_TRANSFORM: u16 = 0x0004;
+pub const NODE_RENDERABLE: u16 = 0x0005;
+pub const NODE_NODE_LIST: u16 = 0x0009;
+pub const NODE_MESH: u16 = 0x0100;
+pub const NODE_PATH: u16 = 0x0101;
+pub const NODE_PATH_SEGMENTS: u16 = 0x0102;
+pub const NODE_VERTEX_DATA: u16 = 0x0110;
+pub const NODE_INDEX_DATA: u16 = 0x0111;
+pub const NODE_MATERIAL_SOLID: u16 = 0x0200;
+pub const NODE_MATERIAL_GRADIENT: u16 = 0x0201;
+pub const NODE_MATERIAL_PBR: u16 = 0x0202;
+pub const NODE_TEXT: u16 = 0x0300;
+pub const NODE_FONT: u16 = 0x0301;
 
 // Command priority classification
 pub enum CommandPriority {

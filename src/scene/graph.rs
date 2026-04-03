@@ -150,18 +150,18 @@ impl SceneGraph {
             }
         };
 
-        if list_data.len() < 36 {
+        if list_data.len() < 12 { // 8 header + 4 count minimum
             log::warn!("traverse_node_list: blob too short ({})", list_data.len());
             return;
         }
-        let count = list_data[1] as usize;
-        let next_hash = read_hash_from(&list_data, 4);
-        log::trace!("traverse_node_list: type=0x{:02x} count={} len={}", list_data[0], count, list_data.len());
+        let p = &list_data[8..]; // skip v1 header
+        let count = u32::from_le_bytes([p[0], p[1], p[2], p[3]]) as usize;
+        log::trace!("traverse_node_list: v1 count={} len={}", count, list_data.len());
 
         for i in 0..count {
-            let offset = 36 + i * 32;
-            if offset + 32 > list_data.len() { break; }
-            let node_hash = read_hash_from(&list_data, offset);
+            let offset = 4 + i * 32;
+            if offset + 32 > p.len() { break; }
+            let node_hash = read_hash_from(p, offset);
             let exists = cas.exists(&node_hash);
             log::trace!("  node[{}]: {:02x}{:02x}.. exists={}", i, node_hash[0], node_hash[1], exists);
             if exists {
@@ -169,6 +169,7 @@ impl SceneGraph {
             }
         }
 
+        let next_hash = NULL_HASH; // v1 node lists don't chain
         if next_hash != NULL_HASH {
             self.traverse_node_list(cas, &next_hash, parent_matrix);
         }
@@ -241,9 +242,11 @@ impl SceneGraph {
                 if let Some(font) = self.font_cache.get_mut(&font_hash) {
                     let glyphs = font.layout_text(cas, &text_node.text, text_node.size, 0.0, 0.0);
                     let color = text_node.color;
-                    let mut mat_blob = [0u8; 128];
-                    mat_blob[0] = 0x05;
-                    mat_blob[2..6].copy_from_slice(&color.to_le_bytes());
+                    let mut mat_blob = [0u8; 16];
+                    mat_blob[0..2].copy_from_slice(&0x0200u16.to_le_bytes()); // v1 solid material
+                    mat_blob[2..4].copy_from_slice(&1u16.to_le_bytes()); // version
+                    // flags at 4..8 = 0 (opaque)
+                    mat_blob[8..12].copy_from_slice(&color.to_le_bytes());
                     let mat_hash = cas.store(&mat_blob);
 
                     for (glyph_hash, gx, gy) in &glyphs {
@@ -302,7 +305,7 @@ impl SceneGraph {
             None => return (*mesh_hash, false),
         };
 
-        if mesh_data.len() < 128 || mesh_data[0] != 0x0D {
+        if mesh_data.len() < 128 || u16::from_le_bytes([mesh_data[0], mesh_data[1]]) != 0x0101 {
             return (*mesh_hash, false);
         }
 
@@ -336,7 +339,7 @@ impl SceneGraph {
                 None => continue,
             };
 
-            if mesh_data.len() < 128 || mesh_data[0] != 0x0D { continue; }
+            if mesh_data.len() < 128 || u16::from_le_bytes([mesh_data[0], mesh_data[1]]) != 0x0101 { continue; }
 
             let path_header = match NodeData::parse(&mesh_data) {
                 Some(NodeData::Path(p)) => p,
@@ -351,10 +354,10 @@ impl SceneGraph {
                 }
             }
 
-            // load path data and tessellate
+            // load path segment data (skip v1 header)
             let path_data = match cas.load(&path_header.path_data) {
-                Some(d) => d.to_vec(),
-                None => continue,
+                Some(d) if d.len() > 8 => d[8..].to_vec(),
+                _ => continue,
             };
 
             let tolerance = if path_header.tolerance > 0.0 {
@@ -387,25 +390,36 @@ impl SceneGraph {
                 continue;
             }
 
-            // store vertex data
-            let vert_bytes: Vec<u8> = verts.iter().flat_map(|f| f.to_le_bytes()).collect();
-            let vert_hash = cas.store(&vert_bytes);
+            // store vertex data (v1 0x0110)
+            let raw_verts: Vec<u8> = verts.iter().flat_map(|f| f.to_le_bytes()).collect();
+            let mut vert_blob = Vec::with_capacity(8 + raw_verts.len());
+            vert_blob.extend_from_slice(&0x0110u16.to_le_bytes());
+            vert_blob.extend_from_slice(&1u16.to_le_bytes());
+            vert_blob.extend_from_slice(&0u32.to_le_bytes());
+            vert_blob.extend_from_slice(&raw_verts);
+            let vert_hash = cas.store(&vert_blob);
 
-            // store index data
-            let idx_bytes: Vec<u8> = indices.iter().flat_map(|i| i.to_le_bytes()).collect();
-            let idx_hash = cas.store(&idx_bytes);
+            // store index data (v1 0x0111)
+            let raw_idx: Vec<u8> = indices.iter().flat_map(|i| i.to_le_bytes()).collect();
+            let mut idx_blob = Vec::with_capacity(8 + raw_idx.len());
+            idx_blob.extend_from_slice(&0x0111u16.to_le_bytes());
+            idx_blob.extend_from_slice(&1u16.to_le_bytes());
+            idx_blob.extend_from_slice(&0u32.to_le_bytes());
+            idx_blob.extend_from_slice(&raw_idx);
+            let idx_hash = cas.store(&idx_blob);
 
-            // create MeshHeader
+            // create v1 Mesh blob (0x0100)
             let vertex_count = (verts.len() / 3) as u32;
             let index_count = indices.len() as u32;
-            let mut mesh_blob = [0u8; 128];
-            mesh_blob[0] = 0x08; // MeshHeader
-            mesh_blob[1] = 0x01; // INDEXED
-            mesh_blob[2..6].copy_from_slice(&vertex_count.to_le_bytes());
-            mesh_blob[6..10].copy_from_slice(&index_count.to_le_bytes());
-            mesh_blob[10..12].copy_from_slice(&12u16.to_le_bytes()); // stride = 12 (float3)
-            mesh_blob[32..64].copy_from_slice(&vert_hash);
-            mesh_blob[64..96].copy_from_slice(&idx_hash);
+            let mut mesh_blob = [0u8; 80]; // 8 header + 72 payload
+            mesh_blob[0..2].copy_from_slice(&0x0100u16.to_le_bytes()); // Mesh type
+            mesh_blob[2..4].copy_from_slice(&1u16.to_le_bytes()); // version
+            // flags: triangles(0) | u16 indices(0) | POSITION bit(0x0100)
+            mesh_blob[4..8].copy_from_slice(&0x0100u32.to_le_bytes());
+            mesh_blob[8..12].copy_from_slice(&vertex_count.to_le_bytes());
+            mesh_blob[12..16].copy_from_slice(&index_count.to_le_bytes());
+            mesh_blob[16..48].copy_from_slice(&vert_hash);
+            mesh_blob[48..80].copy_from_slice(&idx_hash);
             let mesh_hash = cas.store(&mesh_blob);
 
             // cache and update render item

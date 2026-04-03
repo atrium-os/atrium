@@ -330,7 +330,8 @@ impl GpuBackend for MetalRenderer {
                 if item.mesh != NULL_HASH {
                     if let Some(mesh_data) = cas.load(&item.mesh) {
                         if let Some(NodeData::Mesh(mesh)) = NodeData::parse(mesh_data) {
-                            if let Some(verts) = cas.load(&mesh.vertex_data) {
+                            if let Some(verts_raw) = cas.load(&mesh.vertex_data) {
+                                let verts = if verts_raw.len() > 8 { &verts_raw[8..] } else { verts_raw };
                                 let vb = self.device.new_buffer_with_data(
                                     verts.as_ptr() as *const _,
                                     verts.len() as u64,
@@ -381,7 +382,8 @@ impl GpuBackend for MetalRenderer {
 
                                 let has_indices = mesh.index_count > 0 && mesh.index_data != NULL_HASH;
                                 let ib = if has_indices {
-                                    cas.load(&mesh.index_data).map(|indices| {
+                                    cas.load(&mesh.index_data).map(|idx_raw| {
+                                        let indices = if idx_raw.len() > 8 { &idx_raw[8..] } else { idx_raw };
                                         self.device.new_buffer_with_data(
                                             indices.as_ptr() as *const _,
                                             indices.len() as u64,

@@ -181,22 +181,35 @@ pub enum NodeData {
     Bulk(Vec<u8>),
 }
 
+pub struct BlobHeader {
+    pub type_id: u16,
+    pub version: u16,
+    pub flags: u32,
+}
+
+pub fn parse_header(data: &[u8]) -> Option<(BlobHeader, &[u8])> {
+    if data.len() < 8 { return None; }
+    let type_id = read_u16(data, 0);
+    let version = read_u16(data, 2);
+    let flags = read_u32(data, 4);
+    Some((BlobHeader { type_id, version, flags }, &data[8..]))
+}
+
 impl NodeData {
     pub fn parse(data: &[u8]) -> Option<Self> {
-        if data.is_empty() { return None; }
-        let node_type = data[0];
-        match node_type {
-            0x01 if data.len() >= 128 => Some(Self::Root(parse_root(data))),
-            0x02 if data.len() >= 128 => Some(Self::Node(parse_scene_node(data))),
-            0x03 if data.len() >= 128 => Some(Self::Transform(parse_transform(data))),
-            0x04 if data.len() >= 128 => Some(Self::Renderable(parse_renderable(data))),
-            0x05 if data.len() >= 128 => Some(Self::Material(parse_material(data))),
-            0x06 if data.len() >= 128 => Some(Self::Camera(parse_camera(data))),
-            0x07 if data.len() >= 128 => Some(Self::Light(parse_light(data))),
-            0x08 if data.len() >= 128 => Some(Self::Mesh(parse_mesh_header(data))),
-            0x09 if data.len() >= 128 => Some(Self::Texture(parse_texture_header(data))),
-            0x0D if data.len() >= 128 => Some(Self::Path(parse_path_header(data))),
-            0x11 if data.len() >= 128 => Some(Self::Text(parse_text_node(data))),
+        let (hdr, p) = parse_header(data)?;
+        match hdr.type_id {
+            0x0001 if p.len() >= 64 => Some(Self::Root(parse_root(&hdr, p))),
+            0x0002 if p.len() >= 96 => Some(Self::Node(parse_scene_node(&hdr, p))),
+            0x0003 if p.len() >= 48 => Some(Self::Camera(parse_camera(&hdr, p))),
+            0x0004 if p.len() >= 64 => Some(Self::Transform(parse_transform(p))),
+            0x0005 if p.len() >= 64 => Some(Self::Renderable(parse_renderable(p))),
+            0x0009 if p.len() >= 4 => Some(Self::Bulk(data.to_vec())), // NodeList handled separately
+            0x0100 if p.len() >= 72 => Some(Self::Mesh(parse_mesh_header(&hdr, p))),
+            0x0101 if p.len() >= 40 => Some(Self::Path(parse_path_header(&hdr, p))),
+            0x0200 if p.len() >= 8 => Some(Self::Material(parse_material_solid(&hdr, p))),
+            0x0201 if p.len() >= 20 => Some(Self::Material(parse_material_gradient(&hdr, p))),
+            0x0300 if p.len() >= 40 => Some(Self::Text(parse_text_node(p))),
             _ => Some(Self::Bulk(data.to_vec())),
         }
     }
@@ -220,173 +233,163 @@ fn read_f32(data: &[u8], offset: usize) -> f32 {
     f32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]])
 }
 
-fn parse_root(d: &[u8]) -> SceneRoot {
+// v1 parsers — all take payload slice (after 8-byte header)
+
+fn parse_root(hdr: &BlobHeader, p: &[u8]) -> SceneRoot {
     SceneRoot {
-        flags: d[1],
-        frame_number: read_u32(d, 2),
-        node_count: read_u32(d, 6),
-        ambient_rgba: read_u32(d, 10),
-        child_list: read_hash(d, 32),
-        camera: read_hash(d, 64),
-        environment: read_hash(d, 96),
+        flags: hdr.flags as u8,
+        frame_number: 0,
+        node_count: 0,
+        ambient_rgba: 0,
+        child_list: read_hash(p, 0),
+        camera: read_hash(p, 32),
+        environment: NULL_HASH,
     }
 }
 
-fn parse_scene_node(d: &[u8]) -> SceneNode {
+fn parse_scene_node(hdr: &BlobHeader, p: &[u8]) -> SceneNode {
     SceneNode {
-        flags: d[1],
-        layer_mask: read_u16(d, 2),
-        bound_radius: read_f32(d, 8),
-        transform: read_hash(d, 32),
-        renderable: read_hash(d, 64),
-        children: read_hash(d, 96),
+        flags: hdr.flags as u8,
+        layer_mask: 0xFFFF,
+        bound_radius: 0.0,
+        transform: read_hash(p, 0),
+        renderable: read_hash(p, 32),
+        children: read_hash(p, 64),
     }
 }
 
-fn parse_transform(d: &[u8]) -> Transform {
+fn parse_transform(p: &[u8]) -> Transform {
     let mut matrix = [0f32; 16];
     for i in 0..16 {
-        matrix[i] = read_f32(d, 64 + i * 4);
+        matrix[i] = read_f32(p, i * 4);
     }
     Transform {
-        flags: d[1],
-        scale_hint: read_f32(d, 4),
+        flags: 0,
+        scale_hint: 1.0,
         matrix,
     }
 }
 
-fn parse_renderable(d: &[u8]) -> Renderable {
+fn parse_renderable(p: &[u8]) -> Renderable {
     Renderable {
-        flags: d[1],
-        render_order: read_u16(d, 2),
-        lod_bias: read_f32(d, 8),
-        mesh: read_hash(d, 32),
-        material: read_hash(d, 64),
+        flags: 0,
+        render_order: 0,
+        lod_bias: 0.0,
+        mesh: read_hash(p, 0),
+        material: read_hash(p, 32),
     }
 }
 
-fn parse_material(d: &[u8]) -> Material {
-    let flags = d[1];
-    let mut gradient_type = 0u8;
-    let mut gradient_stop_count = 0u8;
-    let mut gradient_x0 = 0.0f32;
-    let mut gradient_y0 = 0.0f32;
-    let mut gradient_x1 = 0.0f32;
-    let mut gradient_y1 = 0.0f32;
-    let mut gradient_stops = [(0.0f32, 0u32); 8];
+fn parse_material_solid(hdr: &BlobHeader, p: &[u8]) -> Material {
+    Material {
+        flags: 0,
+        base_color: read_u32(p, 0),
+        metallic_roughness: 0,
+        emissive: 0,
+        gradient_type: 0,
+        gradient_stop_count: 0,
+        gradient_x0: 0.0, gradient_y0: 0.0, gradient_x1: 0.0, gradient_y1: 0.0,
+        gradient_stops: [(0.0, 0); 8],
+        shader: NULL_HASH,
+        albedo_tex: NULL_HASH,
+        normal_tex: NULL_HASH,
+    }
+}
 
-    if flags & 0x02 != 0 {
-        gradient_type = d[14];
-        gradient_stop_count = d[15].min(8);
-        gradient_x0 = read_f32(d, 16);
-        gradient_y0 = read_f32(d, 20);
-        gradient_x1 = read_f32(d, 24);
-        gradient_y1 = read_f32(d, 28);
-        for i in 0..gradient_stop_count as usize {
-            let off = 32 + i * 8;
-            gradient_stops[i] = (read_f32(d, off), read_u32(d, off + 4));
+fn parse_material_gradient(hdr: &BlobHeader, p: &[u8]) -> Material {
+    let gradient_type = ((hdr.flags >> 2) & 0x03) as u8;
+    let x0 = read_f32(p, 0);
+    let y0 = read_f32(p, 4);
+    let x1 = read_f32(p, 8);
+    let y1 = read_f32(p, 12);
+    let stop_count = read_u32(p, 16).min(8) as u8;
+    let mut stops = [(0.0f32, 0u32); 8];
+    for i in 0..stop_count as usize {
+        let off = 20 + i * 8;
+        if off + 8 <= p.len() {
+            stops[i] = (read_f32(p, off), read_u32(p, off + 4));
         }
     }
-
     Material {
-        flags,
-        base_color: read_u32(d, 2),
-        metallic_roughness: read_u32(d, 6),
-        emissive: read_u32(d, 10),
+        flags: 0x02, // gradient flag for renderer
+        base_color: if stop_count > 0 { stops[0].1 } else { 0 },
+        metallic_roughness: 0,
+        emissive: 0,
         gradient_type,
-        gradient_stop_count,
-        gradient_x0, gradient_y0, gradient_x1, gradient_y1,
-        gradient_stops,
-        shader: if flags & 0x02 != 0 { NULL_HASH } else { read_hash(d, 32) },
-        albedo_tex: read_hash(d, 64),
-        normal_tex: read_hash(d, 96),
+        gradient_stop_count: stop_count,
+        gradient_x0: x0, gradient_y0: y0, gradient_x1: x1, gradient_y1: y1,
+        gradient_stops: stops,
+        shader: NULL_HASH,
+        albedo_tex: NULL_HASH,
+        normal_tex: NULL_HASH,
     }
 }
 
-fn parse_camera(d: &[u8]) -> Camera {
+fn parse_camera(hdr: &BlobHeader, p: &[u8]) -> Camera {
     Camera {
-        flags: d[1],
-        fov_y: read_f32(d, 4),
-        aspect_ratio: read_f32(d, 8),
-        near_plane: read_f32(d, 12),
-        far_plane: read_f32(d, 16),
-        view_transform: read_hash(d, 32),
+        flags: hdr.flags as u8,
+        fov_y: read_f32(p, 0),
+        aspect_ratio: read_f32(p, 4),
+        near_plane: read_f32(p, 8),
+        far_plane: read_f32(p, 12),
+        view_transform: read_hash(p, 16),
     }
 }
 
-fn parse_light(d: &[u8]) -> Light {
-    let lt = match d[1] {
-        1 => LightType::Directional,
-        2 => LightType::Spot,
-        _ => LightType::Point,
-    };
-    Light {
-        light_type: lt,
-        intensity: read_f32(d, 4),
-        color: [read_f32(d, 8), read_f32(d, 12), read_f32(d, 16)],
-        range: read_f32(d, 20),
-        spot_angle: read_f32(d, 24),
-        spot_outer: read_f32(d, 28),
-        transform: read_hash(d, 32),
-        shadow_config: read_hash(d, 64),
-    }
-}
-
-fn parse_mesh_header(d: &[u8]) -> MeshHeader {
-    let mut aabb = [0f32; 6];
-    for i in 0..6 {
-        aabb[i] = read_f32(d, 14 + i * 4);
-    }
+fn parse_mesh_header(hdr: &BlobHeader, p: &[u8]) -> MeshHeader {
+    let flags = hdr.flags;
+    let stride = compute_vertex_stride(flags);
     MeshHeader {
-        flags: d[1],
-        vertex_count: read_u32(d, 2),
-        index_count: read_u32(d, 6),
-        vertex_stride: read_u16(d, 10),
-        index_format: read_u16(d, 12),
-        aabb,
-        vertex_data: read_hash(d, 32),
-        index_data: read_hash(d, 64),
+        flags: (flags & 0xFF) as u8,
+        vertex_count: read_u32(p, 0),
+        index_count: read_u32(p, 4),
+        vertex_stride: stride,
+        index_format: if flags & 0x08 != 0 { 4 } else { 2 },
+        aabb: [0.0; 6],
+        vertex_data: read_hash(p, 8),
+        index_data: read_hash(p, 40),
     }
 }
 
-fn parse_path_header(d: &[u8]) -> PathHeader {
+fn compute_vertex_stride(flags: u32) -> u16 {
+    let mut stride = 0u16;
+    if flags & 0x0100 != 0 { stride += 12; } // POSITION f32x3
+    if flags & 0x0200 != 0 { stride += 12; } // NORMAL f32x3
+    if flags & 0x0400 != 0 { stride += 8; }  // UV0 f32x2
+    if flags & 0x0800 != 0 { stride += 8; }  // UV1 f32x2
+    if flags & 0x1000 != 0 { stride += 4; }  // COLOR u8x4
+    if flags & 0x2000 != 0 { stride += 16; } // TANGENT f32x4
+    if flags & 0x4000 != 0 { stride += 8; }  // JOINTS u16x4
+    if flags & 0x8000 != 0 { stride += 16; } // WEIGHTS f32x4
+    stride
+}
+
+fn parse_path_header(hdr: &BlobHeader, p: &[u8]) -> PathHeader {
+    let flags = hdr.flags;
+    let draw_mode = (flags & 0x03) as u8;
+    let fill_rule = ((flags >> 2) & 0x03) as u8;
     PathHeader {
-        flags: d[1],
-        fill_rule: d[2],
-        stroke_join: d[3],
-        stroke_width: read_f32(d, 4),
-        stroke_miter: read_f32(d, 8),
-        tolerance: read_f32(d, 12),
-        segment_count: read_u32(d, 16),
-        subpath_count: read_u16(d, 20),
-        path_data: read_hash(d, 32),
-        cached_mesh: read_hash(d, 64),
+        flags: draw_mode,
+        fill_rule,
+        stroke_join: 0,
+        stroke_width: read_f32(p, 4),
+        stroke_miter: 0.0,
+        tolerance: 0.0005,
+        segment_count: read_u32(p, 0),
+        subpath_count: 0,
+        path_data: read_hash(p, 8),
+        cached_mesh: NULL_HASH,
     }
 }
 
-fn parse_texture_header(d: &[u8]) -> TextureHeader {
-    TextureHeader {
-        format: d[1],
-        filter_mode: read_u16(d, 2),
-        width: read_u32(d, 4),
-        height: read_u32(d, 8),
-        mip_levels: read_u16(d, 12),
-        wrap_mode: read_u16(d, 14),
-        pixel_data: read_hash(d, 32),
-        mipchain: read_hash(d, 64),
-    }
-}
-
-fn parse_text_node(d: &[u8]) -> TextNode {
-    let text_len = d[1] as usize;
-    let n = text_len.min(84);
-    let text = String::from_utf8_lossy(&d[44..44 + n]).into_owned();
-    TextNode {
-        size: read_f32(d, 2),
-        color: read_u32(d, 6),
-        font_hash: read_hash(d, 12),
-        text,
-    }
+fn parse_text_node(p: &[u8]) -> TextNode {
+    let size = read_f32(p, 0);
+    let color = read_u32(p, 4);
+    let font_hash = read_hash(p, 8);
+    let text_bytes = &p[40..];
+    let text_len = text_bytes.iter().position(|&b| b == 0).unwrap_or(text_bytes.len());
+    let text = String::from_utf8_lossy(&text_bytes[..text_len]).into_owned();
+    TextNode { size, color, font_hash, text }
 }
 
 impl Transform {

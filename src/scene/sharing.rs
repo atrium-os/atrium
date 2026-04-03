@@ -38,45 +38,39 @@ pub fn serialize_scene_root(
     child_list: &Hash256,
     camera: &Hash256,
     environment: &Hash256,
-) -> [u8; 128] {
-    let mut buf = [0u8; 128];
-    buf[0] = 0x01;
-    buf[1] = flags;
-    write_u32_le(&mut buf, 2, frame_number);
-    write_u32_le(&mut buf, 6, node_count);
-    write_u32_le(&mut buf, 10, ambient_rgba);
-    write_hash(&mut buf, 32, child_list);
-    write_hash(&mut buf, 64, camera);
-    write_hash(&mut buf, 96, environment);
+) -> Vec<u8> {
+    let mut buf = vec![0u8; 72]; // 8 header + 64 payload
+    buf[0..2].copy_from_slice(&0x0001u16.to_le_bytes());
+    buf[2..4].copy_from_slice(&1u16.to_le_bytes());
+    write_hash(&mut buf, 8, child_list);
+    write_hash(&mut buf, 40, camera);
     buf
 }
 
 pub fn serialize_scene_node(
     flags: u8,
-    layer_mask: u16,
-    bound_radius: f32,
+    _layer_mask: u16,
+    _bound_radius: f32,
     transform: &Hash256,
     renderable: &Hash256,
     children: &Hash256,
-) -> [u8; 128] {
-    let mut buf = [0u8; 128];
-    buf[0] = 0x02;
-    buf[1] = flags;
-    buf[2..4].copy_from_slice(&layer_mask.to_le_bytes());
-    write_f32_le(&mut buf, 8, bound_radius);
-    write_hash(&mut buf, 32, transform);
-    write_hash(&mut buf, 64, renderable);
-    write_hash(&mut buf, 96, children);
+) -> Vec<u8> {
+    let mut buf = vec![0u8; 104]; // 8 header + 96 payload
+    buf[0..2].copy_from_slice(&0x0002u16.to_le_bytes());
+    buf[2..4].copy_from_slice(&1u16.to_le_bytes());
+    buf[4..8].copy_from_slice(&(flags as u32).to_le_bytes());
+    write_hash(&mut buf, 8, transform);
+    write_hash(&mut buf, 40, renderable);
+    write_hash(&mut buf, 72, children);
     buf
 }
 
-pub fn serialize_transform(flags: u8, scale_hint: f32, matrix: &[f32; 16]) -> [u8; 128] {
-    let mut buf = [0u8; 128];
-    buf[0] = 0x03;
-    buf[1] = flags;
-    write_f32_le(&mut buf, 4, scale_hint);
+pub fn serialize_transform(_flags: u8, _scale_hint: f32, matrix: &[f32; 16]) -> Vec<u8> {
+    let mut buf = vec![0u8; 72]; // 8 header + 64 payload
+    buf[0..2].copy_from_slice(&0x0004u16.to_le_bytes());
+    buf[2..4].copy_from_slice(&1u16.to_le_bytes());
     for i in 0..16 {
-        write_f32_le(&mut buf, 64 + i * 4, matrix[i]);
+        write_f32_le(&mut buf, 8 + i * 4, matrix[i]);
     }
     buf
 }
@@ -84,24 +78,26 @@ pub fn serialize_transform(flags: u8, scale_hint: f32, matrix: &[f32; 16]) -> [u
 // ── NodeList operations ─────────────────────────────────────────
 
 fn parse_node_list(data: &[u8]) -> (u8, Hash256, Vec<Hash256>) {
-    let count = data[1];
-    let next = read_hash(data, 4);
+    if data.len() < 12 { return (0, NULL_HASH, Vec::new()); }
+    let p = &data[8..]; // skip v1 header
+    let count = u32::from_le_bytes([p[0], p[1], p[2], p[3]]) as u8;
     let mut entries = Vec::with_capacity(count as usize);
     for i in 0..count as usize {
-        let offset = NODE_LIST_HEADER + i * HASH_SIZE;
-        if offset + HASH_SIZE > data.len() { break; }
-        entries.push(read_hash(data, offset));
+        let offset = 4 + i * HASH_SIZE;
+        if offset + HASH_SIZE > p.len() { break; }
+        entries.push(read_hash(p, offset));
     }
-    (count, next, entries)
+    (count, NULL_HASH, entries)
 }
 
-fn serialize_node_list(entries: &[Hash256], next: &Hash256) -> Vec<u8> {
-    let mut buf = vec![0u8; NODE_LIST_SIZE];
-    buf[0] = 0x10;
-    buf[1] = entries.len() as u8;
-    write_hash(&mut buf, 4, next);
+fn serialize_node_list(entries: &[Hash256], _next: &Hash256) -> Vec<u8> {
+    let payload_size = 4 + entries.len() * HASH_SIZE;
+    let mut buf = vec![0u8; 8 + payload_size];
+    buf[0..2].copy_from_slice(&0x0009u16.to_le_bytes());
+    buf[2..4].copy_from_slice(&1u16.to_le_bytes());
+    buf[8..12].copy_from_slice(&(entries.len() as u32).to_le_bytes());
     for (i, hash) in entries.iter().enumerate() {
-        write_hash(&mut buf, NODE_LIST_HEADER + i * HASH_SIZE, hash);
+        write_hash(&mut buf, 12 + i * HASH_SIZE, hash);
     }
     buf
 }
@@ -211,11 +207,11 @@ pub fn update_node_field(
         None => return None,
     };
 
-    if root_data[0] != 0x01 { return None; }
+    if root_data.len() < 8 || u16::from_le_bytes([root_data[0], root_data[1]]) != 0x0001 { return None; }
 
-    let child_list = read_hash(&root_data, 32);
-    let camera = read_hash(&root_data, 64);
-    let environment = read_hash(&root_data, 96);
+    let child_list = read_hash(&root_data, 8);
+    let camera = read_hash(&root_data, 40);
+    let environment = read_hash(&root_data, 72);
 
     let new_child_list = replace_in_tree(cas, &child_list, target_node_hash, new_node_hash)?;
 
@@ -258,8 +254,8 @@ fn replace_in_tree(
             None => continue,
         };
 
-        if node_data.len() < 128 || node_data[0] != 0x02 { continue; }
-        let children = read_hash(&node_data, 96);
+        if node_data.len() < 8 || u16::from_le_bytes([node_data[0], node_data[1]]) != 0x0002 { continue; }
+        let children = read_hash(&node_data, 72);
         if children == NULL_HASH { continue; }
 
         if let Some(new_children) = replace_in_tree(cas, &children, target_hash, new_hash) {
@@ -268,8 +264,8 @@ fn replace_in_tree(
                 node_data[1],
                 u16::from_le_bytes([node_data[2], node_data[3]]),
                 f32::from_le_bytes([node_data[8], node_data[9], node_data[10], node_data[11]]),
-                &read_hash(&node_data, 32),
-                &read_hash(&node_data, 64),
+                &read_hash(&node_data, 8),
+                &read_hash(&node_data, 40),
                 &new_children,
             );
             let new_node_hash = cas.store(&new_node);
@@ -306,11 +302,11 @@ pub fn add_node_to_parent(
         None => return None,
     };
 
-    if root_data[0] != 0x01 { return None; }
+    if root_data.len() < 8 || u16::from_le_bytes([root_data[0], root_data[1]]) != 0x0001 { return None; }
 
     // adding to root's child list
     if *parent_hash == *root_hash {
-        let old_child_list = read_hash(&root_data, 32);
+        let old_child_list = read_hash(&root_data, 8);
         let new_child_list = add_to_node_list(cas, &old_child_list, node_hash);
         let new_root = serialize_scene_root(
             root_data[1],
@@ -318,8 +314,8 @@ pub fn add_node_to_parent(
             read_u32_le(&root_data, 6) + 1,
             read_u32_le(&root_data, 10),
             &new_child_list,
-            &read_hash(&root_data, 64),
-            &read_hash(&root_data, 96),
+            &read_hash(&root_data, 40),
+            &read_hash(&root_data, 72),
         );
         return Some(cas.store(&new_root));
     }
@@ -330,17 +326,17 @@ pub fn add_node_to_parent(
         None => return None,
     };
 
-    if parent_data.len() < 128 || parent_data[0] != 0x02 { return None; }
+    if parent_data.len() < 8 || u16::from_le_bytes([parent_data[0], parent_data[1]]) != 0x0002 { return None; }
 
-    let old_children = read_hash(&parent_data, 96);
+    let old_children = read_hash(&parent_data, 72);
     let new_children = add_to_node_list(cas, &old_children, node_hash);
 
     let new_parent = serialize_scene_node(
-        parent_data[1],
-        u16::from_le_bytes([parent_data[2], parent_data[3]]),
-        f32::from_le_bytes([parent_data[8], parent_data[9], parent_data[10], parent_data[11]]),
-        &read_hash(&parent_data, 32),
-        &read_hash(&parent_data, 64),
+        parent_data.get(4).copied().unwrap_or(0),
+        0,
+        0.0,
+        &read_hash(&parent_data, 8),
+        &read_hash(&parent_data, 40),
         &new_children,
     );
     let new_parent_hash = cas.store(&new_parent);
@@ -361,10 +357,10 @@ pub fn remove_node_from_parent(
         None => return None,
     };
 
-    if root_data[0] != 0x01 { return None; }
+    if root_data.len() < 8 || u16::from_le_bytes([root_data[0], root_data[1]]) != 0x0001 { return None; }
 
     if *parent_hash == *root_hash {
-        let old_child_list = read_hash(&root_data, 32);
+        let old_child_list = read_hash(&root_data, 8);
         let new_child_list = remove_from_node_list(cas, &old_child_list, node_hash);
         let count = read_u32_le(&root_data, 6).saturating_sub(1);
         let new_root = serialize_scene_root(
@@ -373,8 +369,8 @@ pub fn remove_node_from_parent(
             count,
             read_u32_le(&root_data, 10),
             &new_child_list,
-            &read_hash(&root_data, 64),
-            &read_hash(&root_data, 96),
+            &read_hash(&root_data, 40),
+            &read_hash(&root_data, 72),
         );
         return Some(cas.store(&new_root));
     }
@@ -384,17 +380,17 @@ pub fn remove_node_from_parent(
         None => return None,
     };
 
-    if parent_data.len() < 128 || parent_data[0] != 0x02 { return None; }
+    if parent_data.len() < 8 || u16::from_le_bytes([parent_data[0], parent_data[1]]) != 0x0002 { return None; }
 
-    let old_children = read_hash(&parent_data, 96);
+    let old_children = read_hash(&parent_data, 72);
     let new_children = remove_from_node_list(cas, &old_children, node_hash);
 
     let new_parent = serialize_scene_node(
-        parent_data[1],
-        u16::from_le_bytes([parent_data[2], parent_data[3]]),
-        f32::from_le_bytes([parent_data[8], parent_data[9], parent_data[10], parent_data[11]]),
-        &read_hash(&parent_data, 32),
-        &read_hash(&parent_data, 64),
+        parent_data.get(4).copied().unwrap_or(0),
+        0,
+        0.0,
+        &read_hash(&parent_data, 8),
+        &read_hash(&parent_data, 40),
         &new_children,
     );
     let new_parent_hash = cas.store(&new_parent);
@@ -413,15 +409,15 @@ pub fn update_scene_node_transform(
         None => return None,
     };
 
-    if node_data.len() < 128 || node_data[0] != 0x02 { return None; }
+    if node_data.len() < 8 || u16::from_le_bytes([node_data[0], node_data[1]]) != 0x0002 { return None; }
 
     let new_node = serialize_scene_node(
-        node_data[1],
-        u16::from_le_bytes([node_data[2], node_data[3]]),
-        f32::from_le_bytes([node_data[8], node_data[9], node_data[10], node_data[11]]),
+        node_data.get(4).copied().unwrap_or(0),
+        0,
+        0.0,
         new_xform_hash,
-        &read_hash(&node_data, 64),
-        &read_hash(&node_data, 96),
+        &read_hash(&node_data, 40),
+        &read_hash(&node_data, 72),
     );
     let new_node_hash = cas.store(&new_node);
 
@@ -443,10 +439,10 @@ pub fn update_scene_node_material(
         None => return None,
     };
 
-    if node_data.len() < 128 || node_data[0] != 0x02 { return None; }
+    if node_data.len() < 8 || u16::from_le_bytes([node_data[0], node_data[1]]) != 0x0002 { return None; }
 
     // node's renderable needs updating — load it, swap material
-    let renderable_hash = read_hash(&node_data, 64);
+    let renderable_hash = read_hash(&node_data, 40); // v1 SceneNode: renderable at offset 40
     if renderable_hash == NULL_HASH { return None; }
 
     let rend_data = match cas.load(&renderable_hash) {
@@ -454,20 +450,19 @@ pub fn update_scene_node_material(
         None => return None,
     };
 
-    if rend_data.len() < 128 || rend_data[0] != 0x04 { return None; }
+    if rend_data.len() < 8 || u16::from_le_bytes([rend_data[0], rend_data[1]]) != 0x0005 { return None; }
 
-    let mut new_rend = [0u8; 128];
-    new_rend.copy_from_slice(&rend_data);
-    write_hash(&mut new_rend, 64, new_material_hash);
+    let mut new_rend = rend_data.clone();
+    write_hash(&mut new_rend, 40, new_material_hash);
     let new_rend_hash = cas.store(&new_rend);
 
     let new_node = serialize_scene_node(
-        node_data[1],
-        u16::from_le_bytes([node_data[2], node_data[3]]),
-        f32::from_le_bytes([node_data[8], node_data[9], node_data[10], node_data[11]]),
-        &read_hash(&node_data, 32),
+        node_data.get(4).copied().unwrap_or(0),
+        0,
+        0.0,
+        &read_hash(&node_data, 8),
         &new_rend_hash,
-        &read_hash(&node_data, 96),
+        &read_hash(&node_data, 72),
     );
     let new_node_hash = cas.store(&new_node);
 

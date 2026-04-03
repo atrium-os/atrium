@@ -132,10 +132,8 @@ impl IvshmemServer {
         std::thread::sleep(std::time::Duration::from_millis(100));
         // Own interrupt setup (QEMU receives notifications on this fd)
         send_i64_with_fd(stream, 1, self.qemu_read_fd)?;
-        // Close our local copy of the read end — QEMU has its own fd via SCM_RIGHTS.
-        // Keeping it open could prevent QEMU's poll from detecting readability.
-        unsafe { close(self.qemu_read_fd); }
-        log::info!("closed local qemu_read_fd={}", self.qemu_read_fd);
+        // Keep qemu_read_fd open — closing it doesn't help and
+        // we might need it for debugging.
         Ok(())
     }
 

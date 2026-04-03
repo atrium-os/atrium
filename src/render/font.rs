@@ -100,21 +100,24 @@ impl FontData {
 
         if builder.segments.is_empty() { return None; }
 
-        // build path data blob
-        let mut path_data = Vec::with_capacity(builder.segments.len() * SEG_SIZE);
+        // build v1 path segments blob (0x0102)
+        let mut path_data = Vec::with_capacity(8 + builder.segments.len() * SEG_SIZE);
+        path_data.extend_from_slice(&0x0102u16.to_le_bytes()); // PathSegments type
+        path_data.extend_from_slice(&1u16.to_le_bytes()); // version
+        path_data.extend_from_slice(&0u32.to_le_bytes()); // flags
         for s in &builder.segments {
             path_data.extend_from_slice(s);
         }
         let pd_hash = cas.store(&path_data);
 
-        // build PathHeader (0x0D)
-        let mut ph = [0u8; 128];
-        ph[0] = 0x0D;
-        ph[1] = 0x01; // FILL
-        ph[12..16].copy_from_slice(&0.0005f32.to_le_bytes()); // tolerance
-        ph[16..20].copy_from_slice(&(builder.segments.len() as u32).to_le_bytes());
-        ph[20..22].copy_from_slice(&1u16.to_le_bytes()); // 1 subpath
-        ph[32..64].copy_from_slice(&pd_hash);
+        // build v1 Path blob (0x0101)
+        let mut ph = [0u8; 48]; // 8 header + 40 payload
+        ph[0..2].copy_from_slice(&0x0101u16.to_le_bytes()); // Path type
+        ph[2..4].copy_from_slice(&1u16.to_le_bytes()); // version
+        // flags: fill(0) | non-zero(0)
+        ph[8..12].copy_from_slice(&(builder.segments.len() as u32).to_le_bytes()); // seg count
+        ph[12..16].copy_from_slice(&0.0f32.to_le_bytes()); // stroke width (fill only)
+        ph[16..48].copy_from_slice(&pd_hash); // segment data hash
         let ph_hash = cas.store(&ph);
 
         self.glyph_cache.insert(cache_key, (pd_hash, ph_hash));
