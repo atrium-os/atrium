@@ -305,7 +305,7 @@ impl SceneGraph {
             None => return (*mesh_hash, false),
         };
 
-        if mesh_data.len() < 128 || u16::from_le_bytes([mesh_data[0], mesh_data[1]]) != 0x0101 {
+        if mesh_data.len() < 48 || u16::from_le_bytes([mesh_data[0], mesh_data[1]]) != 0x0101 {
             return (*mesh_hash, false);
         }
 
@@ -339,7 +339,7 @@ impl SceneGraph {
                 None => continue,
             };
 
-            if mesh_data.len() < 128 || u16::from_le_bytes([mesh_data[0], mesh_data[1]]) != 0x0101 { continue; }
+            if mesh_data.len() < 48 || u16::from_le_bytes([mesh_data[0], mesh_data[1]]) != 0x0101 { continue; }
 
             let path_header = match NodeData::parse(&mesh_data) {
                 Some(NodeData::Path(p)) => p,
