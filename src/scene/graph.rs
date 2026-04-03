@@ -365,7 +365,7 @@ impl SceneGraph {
             } else {
                 pixel_tolerance
             };
-            let is_fill = path_header.flags & 0x02 == 0;
+            let is_fill = path_header.flags & 0x03 == 0; // draw_mode: 0=fill, 1=stroke, 2=both
 
             // try GPU tessellation first, fall back to CPU
             let result = if let Some(ref mut gpu) = gpu_tess {
