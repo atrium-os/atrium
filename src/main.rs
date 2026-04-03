@@ -121,9 +121,10 @@ impl<B: GpuBackend> GpuServer<B> {
             self.link.set_system_font_hash(&font_hash);
         }
 
-        // re-publish display info and set READY
+        // re-publish display info (logical size, not physical) and set READY
         if let Some(window) = &self.window {
-            let size = window.inner_size();
+            let scale = window.scale_factor();
+            let size = window.inner_size().to_logical::<u32>(scale);
             self.link.set_display_info(size.width, size.height, 60);
         }
         self.link.set_status(1);
@@ -230,17 +231,19 @@ impl<B: GpuBackend> ApplicationHandler for GpuServer<B> {
                 .with_inner_size(winit::dpi::LogicalSize::new(1024u32, 768u32));
 
             let window = Arc::new(event_loop.create_window(attrs).unwrap());
-            let size = window.inner_size();
+            let phys = window.inner_size();
+            let scale = window.scale_factor();
+            let logical = phys.to_logical::<u32>(scale);
 
             let renderer = B::new(
                 window.clone(),
-                size.width,
-                size.height,
+                phys.width,
+                phys.height,
             );
 
-            self.link.set_display_info(size.width, size.height, 60);
+            self.link.set_display_info(logical.width, logical.height, 60);
             if let Some(ref mut net) = self.net_link {
-                net.set_display_info(size.width, size.height, 60);
+                net.set_display_info(logical.width, logical.height, 60);
             }
 
             window.set_cursor_visible(false);
@@ -264,7 +267,7 @@ impl<B: GpuBackend> ApplicationHandler for GpuServer<B> {
                 log::warn!("System font not found at {:?}", font_path);
             }
 
-            log::info!("KarythraGPU server ready ({}x{})", size.width, size.height);
+            log::info!("KarythraGPU server ready ({}x{} logical, {}x{} physical)", logical.width, logical.height, phys.width, phys.height);
 
             if !self.qemu_launched {
                 if let Some(ref cmd) = self.qemu_cmd {
