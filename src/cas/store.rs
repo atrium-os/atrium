@@ -71,6 +71,17 @@ impl CasStore {
         hash
     }
 
+    pub fn store_pinned(&mut self, data: &[u8]) -> Hash256 {
+        let hash = Self::hash(data);
+        if !self.blobs.contains_key(&hash) {
+            self.blobs.insert(hash, Blob {
+                data: data.to_vec(),
+                ref_count: u32::MAX / 2,
+            });
+        }
+        hash
+    }
+
     pub fn load(&self, hash: &Hash256) -> Option<&[u8]> {
         self.blobs.get(hash).map(|b| b.data.as_slice())
     }
@@ -212,6 +223,10 @@ impl CasStore {
                     if offset + 32 > data.len() { break; }
                     refs.push(read_hash(data, offset));
                 }
+            }
+            0x11 if data.len() >= 128 => {
+                // TextNode: font_hash[12]
+                refs.push(read_hash(data, 12));
             }
             _ => {
                 // Unknown type or bulk data — no hash references

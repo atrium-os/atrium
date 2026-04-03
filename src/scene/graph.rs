@@ -2,6 +2,7 @@ use crate::command::protocol::{Hash256, NULL_HASH};
 use crate::cas::store::CasStore;
 use crate::scene::nodes::*;
 use crate::render::tessellate;
+use crate::render::font::FontData;
 use std::collections::HashMap;
 
 pub struct RenderItem {
@@ -26,6 +27,7 @@ pub struct SceneGraph {
     light_list: Vec<LightItem>,
     dirty: bool,
     tess_cache: HashMap<Hash256, Hash256>,
+    font_cache: HashMap<Hash256, FontData>,
 }
 
 impl SceneGraph {
@@ -38,6 +40,7 @@ impl SceneGraph {
             light_list: Vec::new(),
             dirty: true,
             tess_cache: HashMap::new(),
+            font_cache: HashMap::new(),
         }
     }
 
@@ -82,7 +85,7 @@ impl SceneGraph {
         &self.light_list
     }
 
-    pub fn traverse(&mut self, cas: &CasStore) {
+    pub fn traverse(&mut self, cas: &mut CasStore) {
         self.render_list.clear();
         self.light_list.clear();
 
@@ -135,7 +138,7 @@ impl SceneGraph {
 
     fn traverse_node_list(
         &mut self,
-        cas: &CasStore,
+        cas: &mut CasStore,
         list_hash: &Hash256,
         parent_matrix: &[f32; 16],
     ) {
@@ -173,7 +176,7 @@ impl SceneGraph {
 
     fn traverse_node(
         &mut self,
-        cas: &CasStore,
+        cas: &mut CasStore,
         node_hash: &Hash256,
         parent_matrix: &[f32; 16],
     ) {
@@ -222,13 +225,54 @@ impl SceneGraph {
                 self.light_list.push(LightItem { world_matrix, light });
             }
 
+            NodeData::Text(text_node) => {
+                let font_hash = text_node.font_hash;
+                if !self.font_cache.contains_key(&font_hash) {
+                    if let Some(font_data) = cas.load(&font_hash) {
+                        if let Some(fd) = FontData::load(font_data) {
+                            self.font_cache.insert(font_hash, fd);
+                        } else {
+                            log::warn!("traverse: font {:02x}{:02x}.. failed to parse", font_hash[0], font_hash[1]);
+                        }
+                    } else {
+                        log::warn!("traverse: font {:02x}{:02x}.. not in CAS", font_hash[0], font_hash[1]);
+                    }
+                }
+                if let Some(font) = self.font_cache.get_mut(&font_hash) {
+                    let glyphs = font.layout_text(cas, &text_node.text, text_node.size, 0.0, 0.0);
+                    let color = text_node.color;
+                    let mut mat_blob = [0u8; 128];
+                    mat_blob[0] = 0x05;
+                    mat_blob[2..6].copy_from_slice(&color.to_le_bytes());
+                    let mat_hash = cas.store(&mat_blob);
+
+                    for (glyph_hash, gx, gy) in &glyphs {
+                        let (mesh_hash, _stencil) = self.resolve_mesh(cas, glyph_hash);
+                        if mesh_hash != NULL_HASH {
+                            let mut glyph_matrix = *parent_matrix;
+                            glyph_matrix[12] += parent_matrix[0] * gx + parent_matrix[4] * gy;
+                            glyph_matrix[13] += parent_matrix[1] * gx + parent_matrix[5] * gy;
+                            glyph_matrix[14] += parent_matrix[2] * gx + parent_matrix[6] * gy;
+                            self.render_list.push(RenderItem {
+                                world_matrix: glyph_matrix,
+                                mesh: mesh_hash,
+                                material: mat_hash,
+                                render_order: 0,
+                                flags: 0x01,
+                                stencil_fill: true,
+                            });
+                        }
+                    }
+                }
+            }
+
             _ => {}
         }
     }
 
     fn add_renderable(
         &mut self,
-        cas: &CasStore,
+        cas: &mut CasStore,
         renderable_hash: &Hash256,
         world_matrix: &[f32; 16],
     ) {
@@ -250,7 +294,7 @@ impl SceneGraph {
         }
     }
 
-    fn resolve_mesh(&mut self, cas: &CasStore, mesh_hash: &Hash256) -> (Hash256, bool) {
+    fn resolve_mesh(&mut self, cas: &mut CasStore, mesh_hash: &Hash256) -> (Hash256, bool) {
         if *mesh_hash == NULL_HASH { return (NULL_HASH, false); }
 
         let mesh_data = match cas.load(mesh_hash) {
@@ -283,7 +327,6 @@ impl SceneGraph {
         display_h: u32,
         mut gpu_tess: Option<&mut dyn FnMut(&[u8], f32, bool) -> Option<(Vec<f32>, Vec<u16>)>>,
     ) {
-        // half pixel in NDC space — sub-pixel accuracy, resolution independent
         let pixel_tolerance = 2.0 / display_w.max(display_h).max(1) as f32 * 0.5;
         for item in &mut self.render_list {
             if item.mesh == NULL_HASH { continue; }
@@ -340,7 +383,9 @@ impl SceneGraph {
                 }
             };
 
-            if verts.is_empty() { continue; }
+            if verts.is_empty() {
+                continue;
+            }
 
             // store vertex data
             let vert_bytes: Vec<u8> = verts.iter().flat_map(|f| f.to_le_bytes()).collect();

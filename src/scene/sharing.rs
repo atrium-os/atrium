@@ -664,7 +664,7 @@ mod tests {
         // now traverse
         let mut scene = SceneGraph::new();
         scene.set_root(root_hash);
-        scene.traverse(&cas);
+        scene.traverse(&mut cas);
 
         eprintln!("render_list len = {}", scene.render_list().len());
         eprintln!("root_hash = {:02x}{:02x}", root_hash[0], root_hash[1]);

@@ -38,6 +38,7 @@ const CTRL_STATUS: usize = 24;
 const CTRL_DISPLAY_W: usize = 28;
 const CTRL_DISPLAY_H: usize = 32;
 const CTRL_REFRESH_HZ: usize = 36;
+const CTRL_SYSTEM_FONT: usize = 40; // 32 bytes: SHA256 of system font blob
 
 pub struct IvshmemLink {
     mmap: MmapMut,
@@ -88,6 +89,10 @@ impl IvshmemLink {
         self.write_ctrl_u32(CTRL_DISPLAY_W, width);
         self.write_ctrl_u32(CTRL_DISPLAY_H, height);
         self.write_ctrl_u32(CTRL_REFRESH_HZ, hz);
+    }
+
+    pub fn set_system_font_hash(&mut self, hash: &[u8; 32]) {
+        self.write_bytes(CTRL_SYSTEM_FONT, hash);
     }
 
     pub fn command_ring(&mut self) -> CommandRing<'_> {

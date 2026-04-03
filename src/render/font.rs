@@ -95,7 +95,7 @@ impl FontData {
         let units_per_em = face.units_per_em() as f32;
         let scale = size / units_per_em;
 
-        let mut builder = GlyphBuilder::new(scale, x, y);
+        let mut builder = GlyphBuilder::new(scale, 0.0, 0.0);
         face.outline_glyph(glyph_id, &mut builder)?;
 
         if builder.segments.is_empty() { return None; }
@@ -144,9 +144,9 @@ impl FontData {
         size: f32,
         start_x: f32,
         start_y: f32,
-    ) -> Vec<Hash256> {
+    ) -> Vec<(Hash256, f32, f32)> {
         let mut x = start_x;
-        let mut hashes = Vec::new();
+        let mut glyphs = Vec::new();
 
         for ch in text.chars() {
             if ch == ' ' {
@@ -154,11 +154,11 @@ impl FontData {
                 continue;
             }
             if let Some(ph_hash) = self.glyph_path(cas, ch, size, x, start_y) {
-                hashes.push(ph_hash);
+                glyphs.push((ph_hash, x, start_y));
             }
             x += self.advance_width(ch, size);
         }
 
-        hashes
+        glyphs
     }
 }

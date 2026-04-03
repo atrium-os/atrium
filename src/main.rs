@@ -37,6 +37,7 @@ struct GpuServer<B: GpuBackend> {
     metrics: FrameMetrics,
     qemu_cmd: Option<Vec<String>>,
     qemu_launched: bool,
+    system_font: Option<Vec<u8>>,
 }
 
 impl<B: GpuBackend> GpuServer<B> {
@@ -91,6 +92,7 @@ impl<B: GpuBackend> GpuServer<B> {
             metrics: FrameMetrics::new(),
             qemu_cmd: None,
             qemu_launched: false,
+            system_font: None,
         }
     }
 
@@ -111,6 +113,13 @@ impl<B: GpuBackend> GpuServer<B> {
         }
         self.frontend.reset();
         self.metrics = FrameMetrics::new();
+
+        // re-load system font into fresh CAS
+        if let Some(ref font_bytes) = self.system_font {
+            let mut cas = self.cas.lock().unwrap();
+            let font_hash = cas.store_pinned(font_bytes);
+            self.link.set_system_font_hash(&font_hash);
+        }
 
         // re-publish display info and set READY
         if let Some(window) = &self.window {
@@ -238,6 +247,22 @@ impl<B: GpuBackend> ApplicationHandler for GpuServer<B> {
             window.request_redraw();
             self.window = Some(window);
             self.renderer = Some(renderer);
+
+            // Load system font into CAS
+            let font_path = std::path::Path::new("/System/Library/Fonts/Geneva.ttf");
+            if font_path.exists() {
+                let font_bytes = std::fs::read(font_path).unwrap();
+                let font_hash = {
+                    let mut cas = self.cas.lock().unwrap();
+                    cas.store_pinned(&font_bytes)
+                };
+                self.link.set_system_font_hash(&font_hash);
+                self.system_font = Some(font_bytes);
+                log::info!("System font loaded: {:02x}{:02x}.. ({} bytes)",
+                    font_hash[0], font_hash[1], self.system_font.as_ref().unwrap().len());
+            } else {
+                log::warn!("System font not found at {:?}", font_path);
+            }
 
             log::info!("KarythraGPU server ready ({}x{})", size.width, size.height);
 

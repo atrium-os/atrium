@@ -284,10 +284,10 @@ impl CommandFrontend {
 
     fn handle_render(&mut self, _cmd: &Command) -> Option<Completion> {
         let mut scene = self.scene.lock().unwrap();
-        let cas = self.cas.lock().unwrap();
+        let mut cas = self.cas.lock().unwrap();
         log::trace!("CMD_RENDER: traversing root {:02x}{:02x}.. (CAS blobs: {})",
             scene.root_hash[0], scene.root_hash[1], cas.blob_count());
-        scene.traverse(&cas);
+        scene.traverse(&mut cas);
         log::trace!("CMD_RENDER: render_list={} lights={}",
             scene.render_list().len(), scene.light_list().len());
         None

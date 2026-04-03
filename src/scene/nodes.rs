@@ -158,6 +158,14 @@ impl PathSegment {
 }
 
 #[derive(Clone, Debug)]
+pub struct TextNode {
+    pub size: f32,
+    pub color: u32,
+    pub font_hash: Hash256,
+    pub text: String,
+}
+
+#[derive(Clone, Debug)]
 pub enum NodeData {
     Root(SceneRoot),
     Node(SceneNode),
@@ -169,6 +177,7 @@ pub enum NodeData {
     Mesh(MeshHeader),
     Texture(TextureHeader),
     Path(PathHeader),
+    Text(TextNode),
     Bulk(Vec<u8>),
 }
 
@@ -187,6 +196,7 @@ impl NodeData {
             0x08 if data.len() >= 128 => Some(Self::Mesh(parse_mesh_header(data))),
             0x09 if data.len() >= 128 => Some(Self::Texture(parse_texture_header(data))),
             0x0D if data.len() >= 128 => Some(Self::Path(parse_path_header(data))),
+            0x11 if data.len() >= 128 => Some(Self::Text(parse_text_node(data))),
             _ => Some(Self::Bulk(data.to_vec())),
         }
     }
@@ -364,6 +374,18 @@ fn parse_texture_header(d: &[u8]) -> TextureHeader {
         wrap_mode: read_u16(d, 14),
         pixel_data: read_hash(d, 32),
         mipchain: read_hash(d, 64),
+    }
+}
+
+fn parse_text_node(d: &[u8]) -> TextNode {
+    let text_len = d[1] as usize;
+    let n = text_len.min(84);
+    let text = String::from_utf8_lossy(&d[44..44 + n]).into_owned();
+    TextNode {
+        size: read_f32(d, 2),
+        color: read_u32(d, 6),
+        font_hash: read_hash(d, 12),
+        text,
     }
 }
 

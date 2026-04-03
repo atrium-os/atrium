@@ -273,10 +273,7 @@ impl GpuBackend for MetalRenderer {
         objc2_autorelease(|_| {
             let drawable = match self.layer.next_drawable() {
                 Some(d) => d,
-                None => {
-                    log::debug!("next_drawable returned None (all drawables in-flight)");
-                    return;
-                }
+                None => return,
             };
 
             let desc = RenderPassDescriptor::new();
