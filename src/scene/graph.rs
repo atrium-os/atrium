@@ -341,9 +341,11 @@ impl SceneGraph {
             _ => return (*mesh_hash, false),
         };
 
+        cas.mark_alive(&path_header.path_data);
         if let Some(&cached) = self.tess_cache.get(&path_header.path_data) {
             if cas.exists(&cached) {
-                return (cached, true); // all paths use stencil even-odd
+                cas.mark_alive(&cached);
+                return (cached, true);
             }
         }
 
@@ -373,9 +375,19 @@ impl SceneGraph {
                 _ => continue,
             };
 
-            // check cache
+            // check cache — mark mesh + sub-blobs alive
             if let Some(&cached) = self.tess_cache.get(&path_header.path_data) {
                 if cas.exists(&cached) {
+                    cas.mark_alive(&cached);
+                    // mark vertex/index sub-blobs via extract_refs
+                    if let Some(mesh_data) = cas.load(&cached) {
+                        if mesh_data.len() >= 80 {
+                            let vh = read_hash_from(mesh_data, 16);
+                            let ih = read_hash_from(mesh_data, 48);
+                            cas.mark_alive(&vh);
+                            cas.mark_alive(&ih);
+                        }
+                    }
                     item.mesh = cached;
                     continue;
                 }
