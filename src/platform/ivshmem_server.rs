@@ -88,12 +88,32 @@ impl IvshmemServer {
 
     pub fn try_accept(&mut self) -> bool {
         if self.qemu_connected {
-            // Check for new connections (QEMU restarted)
             match self.listener.accept() {
                 Ok((stream, _)) => {
-                    log::info!("ivshmem-server: new QEMU connection (reconnect)");
-                    if let Err(e) = self.send_init(&stream) {
-                        log::error!("ivshmem-server: reconnect init failed: {}", e);
+                    log::info!("ivshmem-server: QEMU reconnected — recreating pipes");
+                    unsafe {
+                        close(self._server_read_fd);
+                        close(self.server_write_fd);
+                        close(self.qemu_read_fd);
+                        close(self.qemu_write_fd);
+                    }
+                    match make_pipe().and_then(|(sr, sw)| {
+                        make_pipe().map(|(qr, qw)| (sr, sw, qr, qw))
+                    }) {
+                        Ok((sr, sw, qr, qw)) => {
+                            self._server_read_fd = sr;
+                            self.server_write_fd = sw;
+                            self.qemu_read_fd = qr;
+                            self.qemu_write_fd = qw;
+                            if let Err(e) = self.send_init(&stream) {
+                                log::error!("ivshmem-server: reconnect init failed: {}", e);
+                                self.qemu_connected = false;
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("ivshmem-server: pipe creation failed: {}", e);
+                            self.qemu_connected = false;
+                        }
                     }
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
@@ -140,7 +160,10 @@ impl IvshmemServer {
     /// Signal QEMU → triggers MSI-X interrupt in guest
     pub fn notify_peer(&self) {
         let val: u64 = 1;
-        unsafe { write(self.qemu_write_fd, &val as *const u64 as *const u8, 8); }
+        let ret = unsafe { write(self.qemu_write_fd, &val as *const u64 as *const u8, 8) };
+        if ret < 0 {
+            log::warn!("ivshmem-server: notify_peer write failed (fd={})", self.qemu_write_fd);
+        }
     }
 
     pub fn notify_count_debug(&self) -> (i32, i32) {
@@ -150,8 +173,8 @@ impl IvshmemServer {
     pub fn has_peer(&self) -> bool { self.qemu_connected }
 
     pub fn reset(&mut self) {
-        // Don't reset qemu_connected — QEMU doesn't reconnect on guest reboot,
-        // it uses the same chardev socket. The pipe fds stay valid.
+        // Pipes are recreated in try_accept() when QEMU reconnects.
+        // Nothing to do here — guest reset is handled by check_guest_reset() in main.
     }
 }
 

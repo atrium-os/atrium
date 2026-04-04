@@ -53,6 +53,7 @@ impl SceneGraph {
         self.light_list.clear();
         self.dirty = true;
         self.tess_cache.clear();
+        self.font_cache.clear();
     }
 
     pub fn set_root(&mut self, hash: Hash256) {
