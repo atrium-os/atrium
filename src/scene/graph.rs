@@ -345,6 +345,15 @@ impl SceneGraph {
         if let Some(&cached) = self.tess_cache.get(&path_header.path_data) {
             if cas.exists(&cached) {
                 cas.mark_alive(&cached);
+                // mark vertex/index sub-blobs inside the tessellated mesh
+                if let Some(md) = cas.load(&cached) {
+                    if md.len() >= 80 {
+                        let vh = read_hash_from(md, 16);
+                        let ih = read_hash_from(md, 48);
+                        cas.mark_alive(&vh);
+                        cas.mark_alive(&ih);
+                    }
+                }
                 return (cached, true);
             }
         }
