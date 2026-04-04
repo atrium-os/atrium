@@ -38,6 +38,8 @@ struct GpuServer<B: GpuBackend> {
     qemu_cmd: Option<Vec<String>>,
     qemu_launched: bool,
     system_font: Option<Vec<u8>>,
+    last_cursor_x: f32,
+    last_cursor_y: f32,
 }
 
 impl<B: GpuBackend> GpuServer<B> {
@@ -93,6 +95,8 @@ impl<B: GpuBackend> GpuServer<B> {
             qemu_cmd: None,
             qemu_launched: false,
             system_font: None,
+            last_cursor_x: 0.0,
+            last_cursor_y: 0.0,
         }
     }
 
@@ -349,13 +353,23 @@ impl<B: GpuBackend> ApplicationHandler for GpuServer<B> {
                     }
                 }
 
-                let cursor_pos = Some((self.input_capture.cursor_x, self.input_capture.cursor_y));
-                let render_items = if let Some(renderer) = &mut self.renderer {
-                    let scene = self.scene.lock().unwrap();
-                    let cas = self.cas.lock().unwrap();
-                    let items = scene.render_list().len() as u32;
-                    renderer.render_frame(&scene, &cas, self.metrics.frame_count, cursor_pos);
-                    items
+                let cx = self.input_capture.cursor_x;
+                let cy = self.input_capture.cursor_y;
+                let cursor_moved = cx != self.last_cursor_x || cy != self.last_cursor_y;
+                if cursor_moved {
+                    self.last_cursor_x = cx;
+                    self.last_cursor_y = cy;
+                }
+
+                let render_items = if needs_render || cursor_moved {
+                    let cursor_pos = Some((cx, cy));
+                    if let Some(renderer) = &mut self.renderer {
+                        let scene = self.scene.lock().unwrap();
+                        let cas = self.cas.lock().unwrap();
+                        let items = scene.render_list().len() as u32;
+                        renderer.render_frame(&scene, &cas, self.metrics.frame_count, cursor_pos);
+                        items
+                    } else { 0 }
                 } else { 0 };
 
                 self.metrics.end_frame(render_items);
