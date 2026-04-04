@@ -202,19 +202,15 @@ impl SceneGraph {
                     *parent_matrix
                 };
 
-                // Check clip flag (bit 3) — clip children to rect
+                // Check clip flag (bit 3) — clip children to screen-pixel rect
                 let clip = if node.flags & 0x08 != 0 {
-                    // Read clip rect from extended payload (bytes 104-119 of raw blob)
                     if node_data.len() >= 8 + 112 {
-                        let p = &node_data[8..]; // skip v1 header
+                        let p = &node_data[8..];
                         let cx = f32::from_le_bytes([p[96], p[97], p[98], p[99]]);
                         let cy = f32::from_le_bytes([p[100], p[101], p[102], p[103]]);
                         let cw = f32::from_le_bytes([p[104], p[105], p[106], p[107]]);
                         let ch = f32::from_le_bytes([p[108], p[109], p[110], p[111]]);
-                        // Transform clip origin to world space
-                        let wx = world_matrix[12];
-                        let wy = world_matrix[13];
-                        Some([wx, wy, cw, ch])
+                        Some([cx, cy, cw, ch]) // screen pixels from WM
                     } else {
                         parent_clip
                     }

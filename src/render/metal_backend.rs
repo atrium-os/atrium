@@ -30,6 +30,7 @@ pub struct MetalRenderer {
     tess_contour_buf: Buffer,
     width: u32,
     height: u32,
+    scale_factor: f64,
 }
 
 impl GpuBackend for MetalRenderer {
@@ -170,6 +171,7 @@ impl GpuBackend for MetalRenderer {
             tess_contour_buf,
             width,
             height,
+            scale_factor,
         }
     }
 
@@ -315,9 +317,17 @@ impl GpuBackend for MetalRenderer {
             for (idx, item) in scene.render_list().iter().enumerate() {
                 let mvp = mat4_mul(&item.world_matrix, &vp);
 
-                // Scissor rect: disabled for now, needs correct world-to-screen projection
-                let _ = &item.clip_rect;
-                encoder.set_scissor_rect(full_scissor);
+                // Apply scissor rect (logical pixels from WM, scale to physical)
+                if let Some(clip) = &item.clip_rect {
+                    let scale = self.scale_factor as f32;
+                    let sx = ((clip[0] * scale).max(0.0) as u64).min(self.width as u64);
+                    let sy = ((clip[1] * scale).max(0.0) as u64).min(self.height as u64);
+                    let sw = ((clip[2] * scale).max(1.0) as u64).min(self.width as u64 - sx);
+                    let sh = ((clip[3] * scale).max(1.0) as u64).min(self.height as u64 - sy);
+                    encoder.set_scissor_rect(MTLScissorRect { x: sx, y: sy, width: sw, height: sh });
+                } else {
+                    encoder.set_scissor_rect(full_scissor);
+                }
 
                 // extract material (color or gradient)
                 let parsed_mat = if item.material != NULL_HASH {
