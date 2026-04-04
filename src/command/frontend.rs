@@ -119,15 +119,13 @@ impl CommandFrontend {
         let old_root = scene.root_hash;
         scene.set_root(root_hash);
 
-        // Arc-style ref management: inc new tree, dec old tree
-        cas.inc_ref_tree(&root_hash);
-        if old_root != NULL_HASH {
-            cas.dec_ref_tree(&old_root);
-        }
-
-        log::trace!("set root: {:02x}{:02x}.. (freed {} blobs, {} KB)",
-            root_hash[0], root_hash[1],
-            cas.gc_freed_blobs, cas.gc_freed_bytes / 1024);
+        // No GC on set_root — blobs are retained until guest reset.
+        // GC was freeing shared blobs due to async SET_ROOT/upload ordering:
+        // the WM's SET_ROOT arrives interleaved with the next frame's uploads,
+        // so inc_ref_tree can't walk children that haven't been uploaded yet,
+        // leaving them unprotected when dec_ref_tree runs.
+        log::trace!("set root: {:02x}{:02x}.. (CAS: {} blobs)",
+            root_hash[0], root_hash[1], cas.blob_count());
         None
     }
 

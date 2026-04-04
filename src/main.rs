@@ -248,6 +248,20 @@ impl<B: GpuBackend> ApplicationHandler for GpuServer<B> {
 
             window.set_cursor_visible(false);
             window.request_redraw();
+
+            // macOS: activate app so it receives input events when launched from terminal
+            #[cfg(target_os = "macos")]
+            {
+                use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
+                use objc2_foundation::MainThreadMarker;
+                let mtm = MainThreadMarker::new().unwrap();
+                let app = NSApplication::sharedApplication(mtm);
+                app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+                #[allow(deprecated)]
+                app.activateIgnoringOtherApps(true);
+                log::info!("macOS: activated app (isActive={})", unsafe { app.isActive() });
+            }
+
             self.window = Some(window);
             self.renderer = Some(renderer);
 
@@ -319,32 +333,29 @@ impl<B: GpuBackend> ApplicationHandler for GpuServer<B> {
                 self.metrics.begin_frame();
                 let needs_render = self.process_commands();
 
-                let render_items = if needs_render {
-                    // tessellate any vector paths before rendering
-                    {
-                        let (dw, dh) = self.window.as_ref()
-                            .map(|w| { let s = w.inner_size(); (s.width, s.height) })
-                            .unwrap_or((1024, 768));
-                        let mut scene = self.scene.lock().unwrap();
-                        let mut cas = self.cas.lock().unwrap();
-                        if let Some(renderer) = &mut self.renderer {
-                            let mut gpu_tess = |data: &[u8], tol: f32, fill: bool| {
-                                renderer.tessellate_path(data, tol, fill)
-                            };
-                            scene.tessellate_paths(&mut cas, dw, dh, Some(&mut gpu_tess));
-                        } else {
-                            scene.tessellate_paths(&mut cas, dw, dh, None);
-                        }
-                    }
-
-                    let cursor_pos = Some((self.input_capture.cursor_x, self.input_capture.cursor_y));
+                if needs_render {
+                    let (dw, dh) = self.window.as_ref()
+                        .map(|w| { let s = w.inner_size(); (s.width, s.height) })
+                        .unwrap_or((1024, 768));
+                    let mut scene = self.scene.lock().unwrap();
+                    let mut cas = self.cas.lock().unwrap();
                     if let Some(renderer) = &mut self.renderer {
-                        let scene = self.scene.lock().unwrap();
-                        let cas = self.cas.lock().unwrap();
-                        let items = scene.render_list().len() as u32;
-                        renderer.render_frame(&scene, &cas, self.metrics.frame_count, cursor_pos);
-                        items
-                    } else { 0 }
+                        let mut gpu_tess = |data: &[u8], tol: f32, fill: bool| {
+                            renderer.tessellate_path(data, tol, fill)
+                        };
+                        scene.tessellate_paths(&mut cas, dw, dh, Some(&mut gpu_tess));
+                    } else {
+                        scene.tessellate_paths(&mut cas, dw, dh, None);
+                    }
+                }
+
+                let cursor_pos = Some((self.input_capture.cursor_x, self.input_capture.cursor_y));
+                let render_items = if let Some(renderer) = &mut self.renderer {
+                    let scene = self.scene.lock().unwrap();
+                    let cas = self.cas.lock().unwrap();
+                    let items = scene.render_list().len() as u32;
+                    renderer.render_frame(&scene, &cas, self.metrics.frame_count, cursor_pos);
+                    items
                 } else { 0 };
 
                 self.metrics.end_frame(render_items);
