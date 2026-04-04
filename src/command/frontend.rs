@@ -3,14 +3,18 @@ use crate::cas::store::CasStore;
 use crate::scene::graph::SceneGraph;
 use crate::scene::nodes::Transform;
 use crate::scene::sharing;
+use crate::scene::slots::{SlotTable, TextData};
 
 use std::sync::{Arc, Mutex};
 
 pub struct CommandFrontend {
     cas: Arc<Mutex<CasStore>>,
     scene: Arc<Mutex<SceneGraph>>,
+    pub slot_table: Arc<Mutex<SlotTable>>,
     pending_tasks: Vec<PendingTask>,
     pub last_upload_size: u64,
+    frame_number: u32,
+    in_frame: bool,
 }
 
 struct PendingTask {
@@ -22,17 +26,24 @@ struct PendingTask {
 
 impl CommandFrontend {
     pub fn new(cas: Arc<Mutex<CasStore>>, scene: Arc<Mutex<SceneGraph>>) -> Self {
+        let slot_table = Arc::new(Mutex::new(SlotTable::new()));
         Self {
             cas,
             scene,
+            slot_table,
             pending_tasks: Vec::new(),
             last_upload_size: 0,
+            frame_number: 0,
+            in_frame: false,
         }
     }
 
     pub fn reset(&mut self) {
         self.pending_tasks.clear();
         self.last_upload_size = 0;
+        self.slot_table.lock().unwrap().clear();
+        self.frame_number = 0;
+        self.in_frame = false;
     }
 
     pub fn dispatch(&mut self, cmd: &Command) -> Option<Completion> {
@@ -56,9 +67,20 @@ impl CommandFrontend {
             CMD_SPAWN_TASK_TARGET => self.handle_spawn_task_target(cmd),
             CMD_STOP_TASK => self.handle_stop_task(cmd),
 
+            CMD_SLOT_ALLOC => self.handle_slot_alloc(cmd),
+            CMD_SLOT_FREE => self.handle_slot_free(cmd),
+            CMD_SLOT_SET_XFORM => self.handle_slot_set_xform(cmd),
+            CMD_SLOT_SET_CONTENT => self.handle_slot_set_content(cmd),
+            CMD_SLOT_SET_CHILDREN => self.handle_slot_set_children(cmd),
+            CMD_SLOT_SET_FLAGS => self.handle_slot_set_flags(cmd),
+            CMD_SLOT_SET_ROOT => self.handle_slot_set_root(cmd),
+            CMD_SLOT_SET_TEXT => self.handle_slot_set_text(cmd),
+
             CMD_RENDER => self.handle_render(cmd),
             CMD_FENCE => self.handle_fence(cmd),
             CMD_QUERY_HASH => self.handle_query_hash(cmd),
+            CMD_FRAME_BEGIN => self.handle_frame_begin(cmd),
+            CMD_FRAME_END => self.handle_frame_end(cmd),
 
             _ => {
                 log::warn!("unknown command opcode: 0x{:04x}", cmd.opcode);
@@ -309,5 +331,189 @@ impl CommandFrontend {
         let cas = self.cas.lock().unwrap();
         let exists = cas.exists(&query_hash);
         Some(Completion::query_result(query_id, exists))
+    }
+
+    // ── Slot-based scene graph (v2) ────────────────────────────
+
+    fn handle_slot_alloc(&mut self, cmd: &Command) -> Option<Completion> {
+        let bytes = cmd.payload_bytes();
+        let slot_id = u16::from_le_bytes([bytes[0], bytes[1]]);
+        let node_type = u16::from_le_bytes([bytes[2], bytes[3]]);
+        let flags = cmd.u32_at(12);
+        let xform_hash = cmd.hash_at(16);
+        let rend_hash = cmd.hash_at(48);
+        let child_count = u16::from_le_bytes([bytes[72], bytes[73]]) as usize;
+
+        let mut st = self.slot_table.lock().unwrap();
+        st.alloc(slot_id, node_type, flags);
+
+        if xform_hash != NULL_HASH {
+            let cas = self.cas.lock().unwrap();
+            if let Some(data) = cas.load(&xform_hash) {
+                if let Some(crate::scene::nodes::NodeData::Transform(t)) = crate::scene::nodes::NodeData::parse(data) {
+                    st.set_transform_inline(slot_id, t.matrix);
+                }
+            }
+        }
+        if rend_hash != NULL_HASH {
+            st.set_content(slot_id, rend_hash);
+        }
+        if child_count > 0 {
+            let max = child_count.min(22); // (120 - 76) / 2 = 22 u16 slots
+            let mut children = Vec::with_capacity(max);
+            for i in 0..max {
+                let off = 76 + i * 2;
+                if off + 2 > bytes.len() { break; }
+                children.push(u16::from_le_bytes([bytes[off], bytes[off + 1]]));
+            }
+            st.set_children(slot_id, children);
+        }
+
+        log::trace!("SLOT_ALLOC: id={} type={} flags=0x{:x} children={}",
+            slot_id, node_type, flags, child_count);
+        None
+    }
+
+    fn handle_slot_free(&mut self, cmd: &Command) -> Option<Completion> {
+        let slot_id = cmd.u16_at(8);
+        self.slot_table.lock().unwrap().free(slot_id);
+        log::trace!("SLOT_FREE: id={}", slot_id);
+        None
+    }
+
+    fn handle_slot_set_xform(&mut self, cmd: &Command) -> Option<Completion> {
+        let slot_id = cmd.u16_at(8);
+        let mode = cmd.u16_at(10);
+        let mut st = self.slot_table.lock().unwrap();
+
+        match mode {
+            0 => {
+                // hash reference
+                let hash = cmd.hash_at(12);
+                let cas = self.cas.lock().unwrap();
+                if let Some(data) = cas.load(&hash) {
+                    if let Some(crate::scene::nodes::NodeData::Transform(t)) = crate::scene::nodes::NodeData::parse(data) {
+                        st.set_transform_inline(slot_id, t.matrix);
+                    }
+                }
+            }
+            1 => {
+                // inline 4x4 matrix (64 bytes at offset 12)
+                let bytes = cmd.payload_bytes();
+                let mut matrix = [0.0f32; 16];
+                for i in 0..16 {
+                    let off = 4 + i * 4; // payload offset (12 - 8 = 4)
+                    matrix[i] = f32::from_le_bytes([
+                        bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3],
+                    ]);
+                }
+                st.set_transform_inline(slot_id, matrix);
+            }
+            2 => {
+                // translate only (12 bytes: x, y, z)
+                let x = cmd.f32_at(12);
+                let y = cmd.f32_at(16);
+                let z = cmd.f32_at(20);
+                st.set_transform_translate(slot_id, x, y, z);
+            }
+            _ => {}
+        }
+        None
+    }
+
+    fn handle_slot_set_content(&mut self, cmd: &Command) -> Option<Completion> {
+        let slot_id = cmd.u16_at(8);
+        let hash = cmd.hash_at(10);
+        self.slot_table.lock().unwrap().set_content(slot_id, hash);
+        None
+    }
+
+    fn handle_slot_set_children(&mut self, cmd: &Command) -> Option<Completion> {
+        let bytes = cmd.payload_bytes();
+        let slot_id = u16::from_le_bytes([bytes[0], bytes[1]]);
+        let count = u16::from_le_bytes([bytes[2], bytes[3]]) as usize;
+        let _flags = u16::from_le_bytes([bytes[4], bytes[5]]);
+
+        let max = count.min(56); // (120 - 8) / 2 = 56 u16 slots
+        let mut children = Vec::with_capacity(max);
+        for i in 0..max {
+            let off = 6 + i * 2;
+            if off + 2 > bytes.len() { break; }
+            children.push(u16::from_le_bytes([bytes[off], bytes[off + 1]]));
+        }
+
+        self.slot_table.lock().unwrap().set_children(slot_id, children);
+        None
+    }
+
+    fn handle_slot_set_flags(&mut self, cmd: &Command) -> Option<Completion> {
+        let slot_id = cmd.u16_at(8);
+        let flags = cmd.u32_at(10);
+        let clip = [
+            cmd.f32_at(14),
+            cmd.f32_at(18),
+            cmd.f32_at(22),
+            cmd.f32_at(26),
+        ];
+        self.slot_table.lock().unwrap().set_flags(slot_id, flags, clip);
+        None
+    }
+
+    fn handle_slot_set_root(&mut self, cmd: &Command) -> Option<Completion> {
+        let slot_id = cmd.u16_at(8);
+        self.slot_table.lock().unwrap().set_root(slot_id);
+        log::trace!("SLOT_SET_ROOT: slot={}", slot_id);
+        None
+    }
+
+    fn handle_slot_set_text(&mut self, cmd: &Command) -> Option<Completion> {
+        let slot_id = cmd.u16_at(8);
+        let size = cmd.f32_at(10);
+        let color = cmd.u32_at(14);
+        let font_hash = cmd.hash_at(18);
+        let bytes = cmd.payload_bytes();
+        let text_start = 50 - 8; // offset 50 in command = 42 in payload
+        let text_end = bytes.len().min(text_start + 74);
+        let mut text = [0u8; 80];
+        let text_len = text_end - text_start;
+        text[..text_len].copy_from_slice(&bytes[text_start..text_end]);
+
+        self.slot_table.lock().unwrap().set_text(slot_id, TextData {
+            size, color, font_hash, text, text_len,
+        });
+        None
+    }
+
+    // ── Frame control ──────────────────────────────────────────
+
+    fn handle_frame_begin(&mut self, cmd: &Command) -> Option<Completion> {
+        self.frame_number = cmd.u32_at(8);
+        self.in_frame = true;
+        log::trace!("FRAME_BEGIN: frame={}", self.frame_number);
+        None
+    }
+
+    fn handle_frame_end(&mut self, _cmd: &Command) -> Option<Completion> {
+        self.in_frame = false;
+        let st = self.slot_table.lock().unwrap();
+        if st.is_active() {
+            let mut cas = self.cas.lock().unwrap();
+            cas.advance_generation();
+            let (render_list, camera_hash) = st.traverse(&mut cas);
+            let mut scene = self.scene.lock().unwrap();
+            scene.set_slot_render_list(render_list, camera_hash);
+            log::trace!("FRAME_END: frame={} slots={} render_items={}",
+                self.frame_number, st.slot_count(),
+                scene.render_list().len());
+        } else {
+            // No slots active — fall back to CAS traversal (backward compat)
+            let mut scene = self.scene.lock().unwrap();
+            let mut cas = self.cas.lock().unwrap();
+            cas.advance_generation();
+            scene.traverse(&mut cas);
+            log::trace!("FRAME_END: frame={} (CAS mode) render_items={}",
+                self.frame_number, scene.render_list().len());
+        }
+        None
     }
 }

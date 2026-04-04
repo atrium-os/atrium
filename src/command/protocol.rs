@@ -44,10 +44,22 @@ pub const CMD_SPAWN_TASK: u16 = 0x0200;
 pub const CMD_SPAWN_TASK_TARGET: u16 = 0x0201;
 pub const CMD_STOP_TASK: u16 = 0x0202;
 
+// Slot-based scene graph (v2)
+pub const CMD_SLOT_ALLOC: u16 = 0x0110;
+pub const CMD_SLOT_FREE: u16 = 0x0111;
+pub const CMD_SLOT_SET_XFORM: u16 = 0x0112;
+pub const CMD_SLOT_SET_CONTENT: u16 = 0x0113;
+pub const CMD_SLOT_SET_CHILDREN: u16 = 0x0114;
+pub const CMD_SLOT_SET_FLAGS: u16 = 0x0115;
+pub const CMD_SLOT_SET_ROOT: u16 = 0x0116;
+pub const CMD_SLOT_SET_TEXT: u16 = 0x0117;
+
 // Control
 pub const CMD_RENDER: u16 = 0x0300;
 pub const CMD_FENCE: u16 = 0x0301;
 pub const CMD_QUERY_HASH: u16 = 0x0302;
+pub const CMD_FRAME_BEGIN: u16 = 0x0303;
+pub const CMD_FRAME_END: u16 = 0x0304;
 
 // Completion types
 pub const COMP_UPLOAD_COMPLETE: u16 = 0x01;
@@ -118,6 +130,12 @@ impl Command {
 
     pub fn f32_at(&self, offset: usize) -> f32 {
         f32::from_le_bytes(self.u32_at(offset).to_le_bytes())
+    }
+
+    pub fn u16_at(&self, offset: usize) -> u16 {
+        let bytes = self.payload_bytes();
+        let start = offset - 8;
+        u16::from_le_bytes([bytes[start], bytes[start + 1]])
     }
 }
 

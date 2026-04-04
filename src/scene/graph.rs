@@ -83,6 +83,12 @@ impl SceneGraph {
         &self.render_list
     }
 
+    pub fn set_slot_render_list(&mut self, render_list: Vec<RenderItem>, camera_hash: Hash256) {
+        self.render_list = render_list;
+        self.camera_hash = camera_hash;
+        self.dirty = true;
+    }
+
     pub fn light_list(&self) -> &[LightItem] {
         &self.light_list
     }
