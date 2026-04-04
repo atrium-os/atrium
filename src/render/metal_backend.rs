@@ -307,9 +307,17 @@ impl GpuBackend for MetalRenderer {
                 mat4_mul(&view, &proj)
             };
 
+            let full_scissor = MTLScissorRect {
+                x: 0, y: 0, width: self.width as u64, height: self.height as u64,
+            };
+
             // render each item in the render list
             for (idx, item) in scene.render_list().iter().enumerate() {
                 let mvp = mat4_mul(&item.world_matrix, &vp);
+
+                // Scissor rect: disabled for now, needs correct world-to-screen projection
+                let _ = &item.clip_rect;
+                encoder.set_scissor_rect(full_scissor);
 
                 // extract material (color or gradient)
                 let parsed_mat = if item.material != NULL_HASH {

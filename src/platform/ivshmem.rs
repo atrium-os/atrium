@@ -6,12 +6,12 @@ use std::fs::OpenOptions;
 use std::path::Path;
 
 const CTRL_OFFSET: usize = 0x0000;
-const CMD_RING_OFFSET: usize = 0x1000;       // 1024 × 128 = 128KB
-const COMP_RING_OFFSET: usize = 0x21000;     // after cmd ring
-const INPUT_RING_OFFSET: usize = 0x41000;    // after comp ring
-const STAGING_OFFSET: usize = 0x42000;
+const CMD_RING_OFFSET: usize = 0x1000;       // 256 × 128 = 32KB
+const COMP_RING_OFFSET: usize = 0x9000;      // after cmd ring
+const INPUT_RING_OFFSET: usize = 0x11000;    // after comp ring
+const STAGING_OFFSET: usize = 0x12000;
 
-const CMD_RING_ENTRIES: usize = 1024;
+const CMD_RING_ENTRIES: usize = 256;
 const CMD_ENTRY_SIZE: usize = 128;
 const INPUT_RING_ENTRIES: usize = 64;
 const INPUT_ENTRY_SIZE: usize = 64;

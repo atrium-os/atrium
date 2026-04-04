@@ -12,6 +12,7 @@ pub struct RenderItem {
     pub render_order: u16,
     pub flags: u8,
     pub stencil_fill: bool,
+    pub clip_rect: Option<[f32; 4]>, // world-space [x, y, w, h] if clipped
 }
 
 pub struct LightItem {
@@ -128,7 +129,7 @@ impl SceneGraph {
                 0.0, 0.0, 1.0, 0.0,
                 0.0, 0.0, 0.0, 1.0f32,
             ];
-            self.traverse_node_list(cas, &root.child_list, &identity);
+            self.traverse_node_list(cas, &root.child_list, &identity, None);
         } else {
             log::trace!("traverse: root has NULL child_list");
         }
@@ -141,6 +142,7 @@ impl SceneGraph {
         cas: &mut CasStore,
         list_hash: &Hash256,
         parent_matrix: &[f32; 16],
+        clip: Option<[f32; 4]>,
     ) {
         let list_data = match cas.load(list_hash) {
             Some(d) => d.to_vec(),
@@ -150,11 +152,11 @@ impl SceneGraph {
             }
         };
 
-        if list_data.len() < 12 { // 8 header + 4 count minimum
+        if list_data.len() < 12 {
             log::warn!("traverse_node_list: blob too short ({})", list_data.len());
             return;
         }
-        let p = &list_data[8..]; // skip v1 header
+        let p = &list_data[8..];
         let count = u32::from_le_bytes([p[0], p[1], p[2], p[3]]) as usize;
         log::trace!("traverse_node_list: v1 count={} len={}", count, list_data.len());
 
@@ -165,13 +167,8 @@ impl SceneGraph {
             let exists = cas.exists(&node_hash);
             log::trace!("  node[{}]: {:02x}{:02x}.. exists={}", i, node_hash[0], node_hash[1], exists);
             if exists {
-                self.traverse_node(cas, &node_hash, parent_matrix);
+                self.traverse_node(cas, &node_hash, parent_matrix, clip);
             }
-        }
-
-        let next_hash = NULL_HASH; // v1 node lists don't chain
-        if next_hash != NULL_HASH {
-            self.traverse_node_list(cas, &next_hash, parent_matrix);
         }
     }
 
@@ -180,6 +177,7 @@ impl SceneGraph {
         cas: &mut CasStore,
         node_hash: &Hash256,
         parent_matrix: &[f32; 16],
+        parent_clip: Option<[f32; 4]>,
     ) {
         let node_data = match cas.load(node_hash) {
             Some(d) => d.to_vec(),
@@ -204,12 +202,32 @@ impl SceneGraph {
                     *parent_matrix
                 };
 
+                // Check clip flag (bit 3) — clip children to rect
+                let clip = if node.flags & 0x08 != 0 {
+                    // Read clip rect from extended payload (bytes 104-119 of raw blob)
+                    if node_data.len() >= 8 + 112 {
+                        let p = &node_data[8..]; // skip v1 header
+                        let cx = f32::from_le_bytes([p[96], p[97], p[98], p[99]]);
+                        let cy = f32::from_le_bytes([p[100], p[101], p[102], p[103]]);
+                        let cw = f32::from_le_bytes([p[104], p[105], p[106], p[107]]);
+                        let ch = f32::from_le_bytes([p[108], p[109], p[110], p[111]]);
+                        // Transform clip origin to world space
+                        let wx = world_matrix[12];
+                        let wy = world_matrix[13];
+                        Some([wx, wy, cw, ch])
+                    } else {
+                        parent_clip
+                    }
+                } else {
+                    parent_clip
+                };
+
                 if node.renderable != NULL_HASH {
-                    self.add_renderable(cas, &node.renderable, &world_matrix);
+                    self.add_renderable(cas, &node.renderable, &world_matrix, clip);
                 }
 
                 if node.children != NULL_HASH {
-                    self.traverse_node_list(cas, &node.children, &world_matrix);
+                    self.traverse_node_list(cas, &node.children, &world_matrix, clip);
                 }
             }
 
@@ -243,9 +261,8 @@ impl SceneGraph {
                     let glyphs = font.layout_text(cas, &text_node.text, text_node.size, 0.0, 0.0);
                     let color = text_node.color;
                     let mut mat_blob = [0u8; 16];
-                    mat_blob[0..2].copy_from_slice(&0x0200u16.to_le_bytes()); // v1 solid material
-                    mat_blob[2..4].copy_from_slice(&1u16.to_le_bytes()); // version
-                    // flags at 4..8 = 0 (opaque)
+                    mat_blob[0..2].copy_from_slice(&0x0200u16.to_le_bytes());
+                    mat_blob[2..4].copy_from_slice(&1u16.to_le_bytes());
                     mat_blob[8..12].copy_from_slice(&color.to_le_bytes());
                     let mat_hash = cas.store(&mat_blob);
 
@@ -263,6 +280,7 @@ impl SceneGraph {
                                 render_order: 0,
                                 flags: 0x01,
                                 stencil_fill: true,
+                                clip_rect: parent_clip,
                             });
                         }
                     }
@@ -278,6 +296,7 @@ impl SceneGraph {
         cas: &mut CasStore,
         renderable_hash: &Hash256,
         world_matrix: &[f32; 16],
+        clip_rect: Option<[f32; 4]>,
     ) {
         let rend_data = match cas.load(renderable_hash) {
             Some(d) => d.to_vec(),
@@ -293,6 +312,7 @@ impl SceneGraph {
                 render_order: r.render_order,
                 flags: r.flags,
                 stencil_fill: stencil,
+                clip_rect,
             });
         }
     }
