@@ -5,6 +5,7 @@ use std::collections::HashMap;
 struct Blob {
     data: Vec<u8>,
     ref_count: u32,
+    last_seen: u64,
 }
 
 struct StagedUpload {
@@ -21,6 +22,7 @@ pub struct CasStore {
     pub gc_freed_bytes: u64,
     pub last_tree_size: u32,
     pub last_tree_shared: u32,
+    pub generation: u64,
 }
 
 impl CasStore {
@@ -34,6 +36,7 @@ impl CasStore {
             gc_freed_bytes: 0,
             last_tree_size: 0,
             last_tree_shared: 0,
+            generation: 0,
         }
     }
 
@@ -59,13 +62,16 @@ impl CasStore {
 
     pub fn store(&mut self, data: &[u8]) -> Hash256 {
         let hash = Self::hash(data);
-        if self.blobs.contains_key(&hash) {
+        let gen = self.generation;
+        if let Some(blob) = self.blobs.get_mut(&hash) {
+            blob.last_seen = gen;
             self.dedup_hits += 1;
             self.dedup_bytes_saved += data.len() as u64;
         } else {
             self.blobs.insert(hash, Blob {
                 data: data.to_vec(),
-                ref_count: 0, // no owner yet — inc_ref_tree from SET_ROOT claims it
+                ref_count: 0,
+                last_seen: gen,
             });
         }
         hash
@@ -77,6 +83,7 @@ impl CasStore {
             self.blobs.insert(hash, Blob {
                 data: data.to_vec(),
                 ref_count: u32::MAX / 2,
+                last_seen: u64::MAX,
             });
         }
         hash
@@ -88,6 +95,27 @@ impl CasStore {
 
     pub fn exists(&self, hash: &Hash256) -> bool {
         self.blobs.contains_key(hash)
+    }
+
+    pub fn mark_alive(&mut self, hash: &Hash256) {
+        if let Some(blob) = self.blobs.get_mut(hash) {
+            blob.last_seen = self.generation;
+        }
+    }
+
+    pub fn sweep(&mut self, keep_generations: u64) {
+        let threshold = self.generation.saturating_sub(keep_generations);
+        let before = self.blobs.len();
+        self.blobs.retain(|_, blob| blob.last_seen >= threshold);
+        let freed = before - self.blobs.len();
+        if freed > 0 {
+            self.gc_freed_blobs += freed as u64;
+            log::debug!("GC sweep: freed {} blobs (kept gen >= {})", freed, threshold);
+        }
+    }
+
+    pub fn advance_generation(&mut self) {
+        self.generation += 1;
     }
 
     pub fn ref_count(&self, hash: &Hash256) -> u32 {

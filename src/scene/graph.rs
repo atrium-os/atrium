@@ -93,6 +93,7 @@ impl SceneGraph {
 
         if self.root_hash == NULL_HASH { return; }
 
+        cas.mark_alive(&self.root_hash);
         let root_data = match cas.load(&self.root_hash) {
             Some(d) => d.to_vec(),
             None => {
@@ -117,6 +118,7 @@ impl SceneGraph {
             root_data[0], root_data.len());
 
         if root.camera != NULL_HASH {
+            cas.mark_alive(&root.camera);
             self.camera_hash = root.camera;
         }
 
@@ -145,6 +147,7 @@ impl SceneGraph {
         parent_matrix: &[f32; 16],
         clip: Option<[f32; 4]>,
     ) {
+        cas.mark_alive(list_hash);
         let list_data = match cas.load(list_hash) {
             Some(d) => d.to_vec(),
             None => {
@@ -180,6 +183,7 @@ impl SceneGraph {
         parent_matrix: &[f32; 16],
         parent_clip: Option<[f32; 4]>,
     ) {
+        cas.mark_alive(node_hash);
         let node_data = match cas.load(node_hash) {
             Some(d) => d.to_vec(),
             None => return,
@@ -195,6 +199,7 @@ impl SceneGraph {
                 if node.flags & 0x01 == 0 { return; } // !VISIBLE
 
                 let world_matrix = if node.transform != NULL_HASH {
+                    cas.mark_alive(&node.transform);
                     match load_transform(cas, &node.transform) {
                         Some(t) => mat4_mul(parent_matrix, &t.matrix),
                         None => *parent_matrix,
@@ -230,6 +235,7 @@ impl SceneGraph {
 
             NodeData::Light(light) => {
                 let world_matrix = if light.transform != NULL_HASH {
+                    cas.mark_alive(&light.transform);
                     match load_transform(cas, &light.transform) {
                         Some(t) => mat4_mul(parent_matrix, &t.matrix),
                         None => *parent_matrix,
@@ -243,6 +249,7 @@ impl SceneGraph {
 
             NodeData::Text(text_node) => {
                 let font_hash = text_node.font_hash;
+                cas.mark_alive(&font_hash);
                 if !self.font_cache.contains_key(&font_hash) {
                     if let Some(font_data) = cas.load(&font_hash) {
                         if let Some(fd) = FontData::load(font_data) {
@@ -295,12 +302,14 @@ impl SceneGraph {
         world_matrix: &[f32; 16],
         clip_rect: Option<[f32; 4]>,
     ) {
+        cas.mark_alive(renderable_hash);
         let rend_data = match cas.load(renderable_hash) {
             Some(d) => d.to_vec(),
             None => return,
         };
 
         if let Some(NodeData::Renderable(r)) = NodeData::parse(&rend_data) {
+            cas.mark_alive(&r.material);
             let (mesh_hash, stencil) = self.resolve_mesh(cas, &r.mesh);
             self.render_list.push(RenderItem {
                 world_matrix: *world_matrix,
@@ -317,6 +326,7 @@ impl SceneGraph {
     fn resolve_mesh(&mut self, cas: &mut CasStore, mesh_hash: &Hash256) -> (Hash256, bool) {
         if *mesh_hash == NULL_HASH { return (NULL_HASH, false); }
 
+        cas.mark_alive(mesh_hash);
         let mesh_data = match cas.load(mesh_hash) {
             Some(d) => d,
             None => return (*mesh_hash, false),
