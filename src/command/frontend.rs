@@ -287,13 +287,16 @@ impl CommandFrontend {
         log::trace!("CMD_RENDER: traversing root {:02x}{:02x}.. (CAS blobs: {} gen={})",
             scene.root_hash[0], scene.root_hash[1], cas.blob_count(), cas.generation);
         scene.traverse(&mut cas);
-        // Sweep blobs not seen in last 4 generations (~4 frames)
-        if cas.generation % 4 == 0 {
-            cas.sweep(8);
-        }
         log::trace!("CMD_RENDER: render_list={} lights={}",
             scene.render_list().len(), scene.light_list().len());
         None
+    }
+
+    pub fn maybe_sweep(&self) {
+        let mut cas = self.cas.lock().unwrap();
+        if cas.generation > 0 && cas.generation % 16 == 0 {
+            cas.sweep(32);
+        }
     }
 
     fn handle_fence(&mut self, cmd: &Command) -> Option<Completion> {

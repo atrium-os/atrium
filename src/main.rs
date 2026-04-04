@@ -374,6 +374,10 @@ impl<B: GpuBackend> ApplicationHandler for GpuServer<B> {
 
                 self.metrics.end_frame(render_items);
 
+                // GC sweep after render — all reachable blobs are marked during
+                // traverse + tessellate, and render has finished reading them
+                self.frontend.maybe_sweep();
+
                 if self.metrics.should_report() {
                     let cas = self.cas.lock().unwrap();
                     self.metrics.total_dedup_hits = cas.dedup_hits;
