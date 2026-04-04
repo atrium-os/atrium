@@ -53,6 +53,7 @@ pub const CMD_SLOT_SET_CHILDREN: u16 = 0x0114;
 pub const CMD_SLOT_SET_FLAGS: u16 = 0x0115;
 pub const CMD_SLOT_SET_ROOT: u16 = 0x0116;
 pub const CMD_SLOT_SET_TEXT: u16 = 0x0117;
+pub const CMD_SLOT_SET_CAS_CHILDREN: u16 = 0x0118;
 
 // Control
 pub const CMD_RENDER: u16 = 0x0300;

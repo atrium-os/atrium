@@ -482,6 +482,96 @@ impl SceneGraph {
         }
     }
 
+    /// Traverse a CAS node list subtree, appending to an external render_list.
+    /// Used by slot-based traversal to bridge into CAS content.
+    pub fn traverse_cas_subtree(
+        cas: &mut CasStore,
+        list_hash: &Hash256,
+        parent_matrix: &[f32; 16],
+        clip: Option<[f32; 4]>,
+        render_list: &mut Vec<RenderItem>,
+    ) {
+        cas.mark_alive(list_hash);
+        let list_data = match cas.load(list_hash) {
+            Some(d) => d.to_vec(),
+            None => return,
+        };
+        if list_data.len() < 12 { return; }
+        let p = &list_data[8..];
+        let count = u32::from_le_bytes([p[0], p[1], p[2], p[3]]) as usize;
+        for i in 0..count {
+            let offset = 4 + i * 32;
+            if offset + 32 > p.len() { break; }
+            let node_hash = read_hash_from(p, offset);
+            if cas.exists(&node_hash) {
+                Self::traverse_cas_node(cas, &node_hash, parent_matrix, clip, render_list);
+            }
+        }
+    }
+
+    fn traverse_cas_node(
+        cas: &mut CasStore,
+        node_hash: &Hash256,
+        parent_matrix: &[f32; 16],
+        parent_clip: Option<[f32; 4]>,
+        render_list: &mut Vec<RenderItem>,
+    ) {
+        cas.mark_alive(node_hash);
+        let node_data = match cas.load(node_hash) {
+            Some(d) => d.to_vec(),
+            None => return,
+        };
+        let parsed = match NodeData::parse(&node_data) {
+            Some(p) => p,
+            None => return,
+        };
+        match parsed {
+            NodeData::Node(node) => {
+                if node.flags & 0x01 == 0 { return; }
+                let world_matrix = if node.transform != NULL_HASH {
+                    cas.mark_alive(&node.transform);
+                    match load_transform(cas, &node.transform) {
+                        Some(t) => mat4_mul(parent_matrix, &t.matrix),
+                        None => *parent_matrix,
+                    }
+                } else { *parent_matrix };
+
+                let clip = if node.flags & 0x08 != 0 && node_data.len() >= 8 + 112 {
+                    let p = &node_data[8..];
+                    Some([
+                        f32::from_le_bytes([p[96], p[97], p[98], p[99]]),
+                        f32::from_le_bytes([p[100], p[101], p[102], p[103]]),
+                        f32::from_le_bytes([p[104], p[105], p[106], p[107]]),
+                        f32::from_le_bytes([p[108], p[109], p[110], p[111]]),
+                    ])
+                } else { parent_clip };
+
+                if node.renderable != NULL_HASH {
+                    cas.mark_alive(&node.renderable);
+                    if let Some(rend_data) = cas.load(&node.renderable).map(|d| d.to_vec()) {
+                        if let Some(NodeData::Renderable(r)) = NodeData::parse(&rend_data) {
+                            cas.mark_alive(&r.material);
+                            cas.mark_alive(&r.mesh);
+                            render_list.push(RenderItem {
+                                world_matrix,
+                                mesh: r.mesh,
+                                material: r.material,
+                                render_order: r.render_order,
+                                flags: r.flags,
+                                stencil_fill: false,
+                                clip_rect: clip,
+                            });
+                        }
+                    }
+                }
+                if node.children != NULL_HASH {
+                    Self::traverse_cas_subtree(cas, &node.children, &world_matrix, clip, render_list);
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub fn camera(&self, cas: &CasStore) -> Option<(Camera, Transform)> {
         if self.camera_hash == NULL_HASH { return None; }
         let cam_data = cas.load(&self.camera_hash)?.to_vec();

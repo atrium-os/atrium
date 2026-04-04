@@ -28,6 +28,7 @@ pub struct Slot {
     pub children: Vec<u16>,
     pub clip_rect: [f32; 4],
     pub text: Option<TextData>,
+    pub cas_subtree: Hash256,  // if not NULL, traverse this CAS node list as children
 }
 
 impl Slot {
@@ -41,9 +42,13 @@ impl Slot {
             children: Vec::new(),
             clip_rect: [0.0; 4],
             text: None,
+            cas_subtree: NULL_HASH,
         }
     }
 }
+
+// Opcode for setting CAS subtree on a slot
+pub const CMD_SLOT_SET_CAS_CHILDREN: u16 = 0x0118;
 
 const IDENTITY: [f32; 16] = [
     1.0, 0.0, 0.0, 0.0,
@@ -142,6 +147,13 @@ impl SlotTable {
         self.dirty = true;
     }
 
+    pub fn set_cas_subtree(&mut self, slot_id: u16, hash: Hash256) {
+        if let Some(slot) = self.slots.get_mut(&slot_id) {
+            slot.cas_subtree = hash;
+            self.dirty = true;
+        }
+    }
+
     pub fn set_text(&mut self, slot_id: u16, text_data: TextData) {
         if let Some(slot) = self.slots.get_mut(&slot_id) {
             slot.text = Some(text_data);
@@ -200,6 +212,12 @@ impl SlotTable {
 
         for &child_id in &slot.children {
             self.traverse_slot(cas, child_id, &world_matrix, clip, render_list);
+        }
+
+        // Follow CAS subtree if set (hybrid bridge: slot structure → CAS content)
+        if slot.cas_subtree != NULL_HASH {
+            use crate::scene::graph::SceneGraph;
+            SceneGraph::traverse_cas_subtree(cas, &slot.cas_subtree, &world_matrix, clip, render_list);
         }
     }
 

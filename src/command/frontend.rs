@@ -75,6 +75,7 @@ impl CommandFrontend {
             CMD_SLOT_SET_FLAGS => self.handle_slot_set_flags(cmd),
             CMD_SLOT_SET_ROOT => self.handle_slot_set_root(cmd),
             CMD_SLOT_SET_TEXT => self.handle_slot_set_text(cmd),
+            CMD_SLOT_SET_CAS_CHILDREN => self.handle_slot_set_cas_children(cmd),
 
             CMD_RENDER => self.handle_render(cmd),
             CMD_FENCE => self.handle_fence(cmd),
@@ -481,6 +482,15 @@ impl CommandFrontend {
         self.slot_table.lock().unwrap().set_text(slot_id, TextData {
             size, color, font_hash, text, text_len,
         });
+        None
+    }
+
+    fn handle_slot_set_cas_children(&mut self, cmd: &Command) -> Option<Completion> {
+        let slot_id = cmd.u16_at(8);
+        let hash = cmd.hash_at(10);
+        self.slot_table.lock().unwrap().set_cas_subtree(slot_id, hash);
+        log::trace!("SLOT_SET_CAS_CHILDREN: slot={} hash={:02x}{:02x}..",
+            slot_id, hash[0], hash[1]);
         None
     }
 
