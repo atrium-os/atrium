@@ -482,8 +482,123 @@ impl SceneGraph {
         }
     }
 
-    /// Traverse a CAS node list subtree, appending to an external render_list.
-    /// Used by slot-based traversal to bridge into CAS content.
+    /// Traverse a CAS node list subtree into an external render_list.
+    /// Uses SceneGraph's font_cache and tess_cache for text + mesh resolution.
+    pub fn traverse_cas_into(
+        &mut self,
+        cas: &mut CasStore,
+        list_hash: &Hash256,
+        parent_matrix: &[f32; 16],
+        clip: Option<[f32; 4]>,
+        render_list: &mut Vec<RenderItem>,
+    ) {
+        cas.mark_alive(list_hash);
+        let list_data = match cas.load(list_hash) {
+            Some(d) => d.to_vec(),
+            None => return,
+        };
+        if list_data.len() < 12 { return; }
+        let p = &list_data[8..];
+        let count = u32::from_le_bytes([p[0], p[1], p[2], p[3]]) as usize;
+        for i in 0..count {
+            let offset = 4 + i * 32;
+            if offset + 32 > p.len() { break; }
+            let node_hash = read_hash_from(p, offset);
+            if cas.exists(&node_hash) {
+                self.traverse_node_into(cas, &node_hash, parent_matrix, clip, render_list);
+            }
+        }
+    }
+
+    fn traverse_node_into(
+        &mut self,
+        cas: &mut CasStore,
+        node_hash: &Hash256,
+        parent_matrix: &[f32; 16],
+        parent_clip: Option<[f32; 4]>,
+        render_list: &mut Vec<RenderItem>,
+    ) {
+        cas.mark_alive(node_hash);
+        let node_data = match cas.load(node_hash) {
+            Some(d) => d.to_vec(),
+            None => return,
+        };
+        let parsed = match NodeData::parse(&node_data) {
+            Some(p) => p,
+            None => return,
+        };
+        match parsed {
+            NodeData::Node(node) => {
+                if node.flags & 0x01 == 0 { return; }
+                let world_matrix = if node.transform != NULL_HASH {
+                    cas.mark_alive(&node.transform);
+                    match load_transform(cas, &node.transform) {
+                        Some(t) => mat4_mul(parent_matrix, &t.matrix),
+                        None => *parent_matrix,
+                    }
+                } else { *parent_matrix };
+                let clip = if node.flags & 0x08 != 0 && node_data.len() >= 8 + 112 {
+                    let p = &node_data[8..];
+                    Some([
+                        f32::from_le_bytes([p[96], p[97], p[98], p[99]]),
+                        f32::from_le_bytes([p[100], p[101], p[102], p[103]]),
+                        f32::from_le_bytes([p[104], p[105], p[106], p[107]]),
+                        f32::from_le_bytes([p[108], p[109], p[110], p[111]]),
+                    ])
+                } else { parent_clip };
+                if node.renderable != NULL_HASH {
+                    self.add_renderable(cas, &node.renderable, &world_matrix, clip);
+                    // Move renderable to external list
+                    if let Some(item) = self.render_list.pop() {
+                        render_list.push(item);
+                    }
+                }
+                if node.children != NULL_HASH {
+                    self.traverse_cas_into(cas, &node.children, &world_matrix, clip, render_list);
+                }
+            }
+            NodeData::Text(text_node) => {
+                let font_hash = text_node.font_hash;
+                cas.mark_alive(&font_hash);
+                if !self.font_cache.contains_key(&font_hash) {
+                    if let Some(font_data) = cas.load(&font_hash) {
+                        if let Some(fd) = FontData::load(font_data) {
+                            self.font_cache.insert(font_hash, fd);
+                        }
+                    }
+                }
+                if let Some(font) = self.font_cache.get_mut(&font_hash) {
+                    let glyphs = font.layout_text(cas, &text_node.text, text_node.size, 0.0, 0.0);
+                    let mut mat_blob = [0u8; 16];
+                    mat_blob[0..2].copy_from_slice(&0x0200u16.to_le_bytes());
+                    mat_blob[2..4].copy_from_slice(&1u16.to_le_bytes());
+                    mat_blob[8..12].copy_from_slice(&text_node.color.to_le_bytes());
+                    let mat_hash = cas.store(&mat_blob);
+                    for (glyph_hash, gx, gy) in &glyphs {
+                        let (mesh_hash, _) = self.resolve_mesh(cas, glyph_hash);
+                        if mesh_hash != NULL_HASH {
+                            let mut gm = *parent_matrix;
+                            gm[12] += parent_matrix[0] * gx + parent_matrix[4] * gy;
+                            gm[13] += parent_matrix[1] * gx + parent_matrix[5] * gy;
+                            gm[14] += parent_matrix[2] * gx + parent_matrix[6] * gy;
+                            render_list.push(RenderItem {
+                                world_matrix: gm,
+                                mesh: mesh_hash,
+                                material: mat_hash,
+                                render_order: 0,
+                                flags: 0x01,
+                                stencil_fill: true,
+                                clip_rect: parent_clip,
+                            });
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Old static version — kept for backward compat but unused now.
     pub fn traverse_cas_subtree(
         cas: &mut CasStore,
         list_hash: &Hash256,

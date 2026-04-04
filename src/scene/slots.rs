@@ -165,16 +165,19 @@ impl SlotTable {
         self.slots.len()
     }
 
-    pub fn traverse(&self, cas: &mut CasStore) -> (Vec<RenderItem>, Hash256) {
+    /// Returns (render_list, camera_hash, cas_subtrees).
+    /// cas_subtrees: Vec of (list_hash, world_matrix, clip) for CAS bridge nodes.
+    pub fn traverse(&self, cas: &mut CasStore) -> (Vec<RenderItem>, Hash256, Vec<(Hash256, [f32; 16], Option<[f32; 4]>)>) {
         let mut render_list = Vec::new();
+        let mut cas_subtrees = Vec::new();
 
         let root_id = match self.root_slot {
             Some(id) => id,
-            None => return (render_list, self.camera_hash),
+            None => return (render_list, self.camera_hash, cas_subtrees),
         };
 
-        self.traverse_slot(cas, root_id, &IDENTITY, None, &mut render_list);
-        (render_list, self.camera_hash)
+        self.traverse_slot(cas, root_id, &IDENTITY, None, &mut render_list, &mut cas_subtrees);
+        (render_list, self.camera_hash, cas_subtrees)
     }
 
     fn traverse_slot(
@@ -184,6 +187,7 @@ impl SlotTable {
         parent_matrix: &[f32; 16],
         parent_clip: Option<[f32; 4]>,
         render_list: &mut Vec<RenderItem>,
+        cas_subtrees: &mut Vec<(Hash256, [f32; 16], Option<[f32; 4]>)>,
     ) {
         let slot = match self.slots.get(&slot_id) {
             Some(s) if s.active => s,
@@ -211,13 +215,12 @@ impl SlotTable {
         }
 
         for &child_id in &slot.children {
-            self.traverse_slot(cas, child_id, &world_matrix, clip, render_list);
+            self.traverse_slot(cas, child_id, &world_matrix, clip, render_list, cas_subtrees);
         }
 
-        // Follow CAS subtree if set (hybrid bridge: slot structure → CAS content)
+        // Collect CAS subtree for later processing by SceneGraph (with font_cache)
         if slot.cas_subtree != NULL_HASH {
-            use crate::scene::graph::SceneGraph;
-            SceneGraph::traverse_cas_subtree(cas, &slot.cas_subtree, &world_matrix, clip, render_list);
+            cas_subtrees.push((slot.cas_subtree, world_matrix, clip));
         }
     }
 

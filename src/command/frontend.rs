@@ -509,11 +509,20 @@ impl CommandFrontend {
         if st.is_active() {
             let mut cas = self.cas.lock().unwrap();
             cas.advance_generation();
-            let (render_list, camera_hash) = st.traverse(&mut cas);
+            let (mut render_list, mut camera_hash, cas_subtrees) = st.traverse(&mut cas);
             let mut scene = self.scene.lock().unwrap();
+            if camera_hash == NULL_HASH {
+                camera_hash = scene.camera_hash;
+            }
+            // Process CAS subtrees with SceneGraph's font_cache + resolve_mesh
+            for (list_hash, matrix, clip) in &cas_subtrees {
+                scene.traverse_cas_into(
+                    &mut cas, list_hash, matrix, *clip, &mut render_list,
+                );
+            }
             scene.set_slot_render_list(render_list, camera_hash);
-            log::trace!("FRAME_END: frame={} slots={} render_items={}",
-                self.frame_number, st.slot_count(),
+            log::trace!("FRAME_END: frame={} slots={} cas_subtrees={} render_items={}",
+                self.frame_number, st.slot_count(), cas_subtrees.len(),
                 scene.render_list().len());
         } else {
             // No slots active — fall back to CAS traversal (backward compat)

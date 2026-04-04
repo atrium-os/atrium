@@ -159,7 +159,7 @@ impl<B: GpuBackend> GpuServer<B> {
                 Some(cmd) => {
                     self.metrics.record_cmd();
                     let completion = self.frontend.dispatch(&cmd);
-                    if cmd.opcode == 0x0300 { needs_render = true; }
+                    if cmd.opcode == 0x0300 || cmd.opcode == 0x0304 { needs_render = true; }
                     if cmd.opcode == 0x0003 && self.frontend.last_upload_size > 0 {
                         self.metrics.record_upload(self.frontend.last_upload_size);
                         self.frontend.last_upload_size = 0;
