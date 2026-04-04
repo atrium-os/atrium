@@ -293,10 +293,9 @@ impl CommandFrontend {
     }
 
     pub fn maybe_sweep(&self) {
-        let mut cas = self.cas.lock().unwrap();
-        if cas.generation > 0 && cas.generation % 16 == 0 {
-            cas.sweep(32);
-        }
+        // Sweep disabled: guest upload cache has no way to know the GPU server
+        // freed a blob, so it skips re-uploading. CAS grows until guest reset.
+        // Proper fix: blob existence query protocol or server→guest invalidation.
     }
 
     fn handle_fence(&mut self, cmd: &Command) -> Option<Completion> {
