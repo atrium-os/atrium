@@ -124,9 +124,14 @@ impl IvshmemServer {
         match self.listener.accept() {
             Ok((stream, _)) => {
                 log::info!("ivshmem-server: QEMU connected");
+                // Brief delay to let QEMU's chardev fully initialize
+                std::thread::sleep(std::time::Duration::from_millis(50));
                 match self.send_init(&stream) {
                     Ok(()) => { self.qemu_connected = true; true }
-                    Err(e) => { log::error!("ivshmem-server: init failed: {}", e); false }
+                    Err(e) => {
+                        log::warn!("ivshmem-server: init failed: {} (will retry)", e);
+                        false
+                    }
                 }
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => false,
