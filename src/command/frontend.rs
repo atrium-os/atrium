@@ -521,9 +521,9 @@ impl CommandFrontend {
                 );
             }
             scene.set_slot_render_list(render_list, camera_hash);
-            log::trace!("FRAME_END: frame={} slots={} cas_subtrees={} render_items={}",
+            log::info!("FRAME_END: frame={} slots={} cas_subtrees={} render_items={} cas_blobs={}",
                 self.frame_number, st.slot_count(), cas_subtrees.len(),
-                scene.render_list().len());
+                scene.render_list().len(), cas.blob_count());
         } else {
             // No slots active — fall back to CAS traversal (backward compat)
             let mut scene = self.scene.lock().unwrap();
