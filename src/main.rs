@@ -214,13 +214,33 @@ impl<B: GpuBackend> GpuServer<B> {
     }
 
     fn write_input_events(&mut self) {
+        use input::capture::{INPUT_MOUSE_MOVE, InputEvent};
+
         let events = self.input_capture.drain();
+        // Coalesce mouse moves — only send the last position per frame
+        let mut last_mouse_move: Option<InputEvent> = None;
+        let mut coalesced = Vec::new();
         for evt in &events {
+            if evt.event_type == INPUT_MOUSE_MOVE {
+                last_mouse_move = Some(*evt);
+            } else {
+                // Flush pending mouse move before any other event
+                if let Some(mm) = last_mouse_move.take() {
+                    coalesced.push(mm);
+                }
+                coalesced.push(*evt);
+            }
+        }
+        if let Some(mm) = last_mouse_move {
+            coalesced.push(mm);
+        }
+
+        for evt in &coalesced {
             let mut ring = self.link.input_ring();
             ring.enqueue(evt);
         }
         if let Some(ref mut net) = self.net_link {
-            for evt in &events {
+            for evt in &coalesced {
                 net.send_input_event(evt);
             }
         }
