@@ -290,6 +290,7 @@ impl<B: GpuBackend> ApplicationHandler for GpuServer<B> {
             }
 
             window.set_cursor_visible(false);
+            self.input_capture.scale = scale;
             window.request_redraw();
 
             // macOS: activate app so it receives input events when launched from terminal
@@ -367,8 +368,11 @@ impl<B: GpuBackend> ApplicationHandler for GpuServer<B> {
                     let scale = self.window.as_ref().map(|w| w.scale_factor()).unwrap_or(1.0);
                     renderer.resize(size.width, size.height);
                     renderer.set_scale(scale);
-                    self.link.set_display_info(size.width, size.height, 60);
-                    log::info!("Resized: {}x{} scale={}", size.width, size.height, scale);
+                    self.input_capture.scale = scale;
+                    let logical = size.to_logical::<u32>(scale);
+                    self.link.set_display_info(logical.width, logical.height, 60);
+                    log::info!("Resized: {}x{} physical, {}x{} logical, scale={}",
+                        size.width, size.height, logical.width, logical.height, scale);
                 }
             }
 

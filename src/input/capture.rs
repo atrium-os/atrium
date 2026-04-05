@@ -21,11 +21,12 @@ pub struct InputCapture {
     events: Vec<InputEvent>,
     pub cursor_x: f32,
     pub cursor_y: f32,
+    pub scale: f64,
 }
 
 impl InputCapture {
     pub fn new() -> Self {
-        Self { events: Vec::new(), cursor_x: 0.0, cursor_y: 0.0 }
+        Self { events: Vec::new(), cursor_x: 0.0, cursor_y: 0.0, scale: 1.0 }
     }
 
     pub fn drain(&mut self) -> Vec<InputEvent> {
@@ -53,11 +54,14 @@ impl InputCapture {
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_x = position.x as f32;
                 self.cursor_y = position.y as f32;
+                // Send logical coordinates to guest (divide by scale)
+                let lx = (position.x / self.scale) as i32;
+                let ly = (position.y / self.scale) as i32;
                 self.events.push(InputEvent {
                     event_type: INPUT_MOUSE_MOVE,
                     code: 0,
-                    value_a: position.x as i32,
-                    value_b: position.y as i32,
+                    value_a: lx,
+                    value_b: ly,
                     _pad0: [0; 13],
                 });
             }
