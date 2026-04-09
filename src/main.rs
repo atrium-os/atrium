@@ -214,10 +214,55 @@ impl<B: GpuBackend> GpuServer<B> {
     }
 
     fn write_input_events(&mut self) {
-        // Input comes from USB HID on the guest side, not from the GPU server window.
-        // GPU server only renders — the cursor position is set by the WM.
-        // Drain events to keep input_capture from growing, but don't forward.
-        let _ = self.input_capture.drain();
+        use input::capture::{INPUT_MOUSE_MOVE, INPUT_MOUSE_BUTTON, InputEvent};
+
+        let events = self.input_capture.drain();
+        // Coalesce: one mouse move per frame, one press+release per button per frame
+        let mut last_mouse_move: Option<InputEvent> = None;
+        let mut saw_press: [bool; 4] = [false; 4]; // per button (left, right, middle, other)
+        let mut saw_release: [bool; 4] = [false; 4];
+        let mut coalesced = Vec::new();
+        for evt in &events {
+            if evt.event_type == INPUT_MOUSE_MOVE {
+                last_mouse_move = Some(*evt);
+            } else if evt.event_type == INPUT_MOUSE_BUTTON {
+                let btn = (evt.code as usize).min(3);
+                if evt.value_a != 0 {
+                    // press — only keep first press per button
+                    if !saw_press[btn] {
+                        if let Some(mm) = last_mouse_move.take() {
+                            coalesced.push(mm);
+                        }
+                        coalesced.push(*evt);
+                        saw_press[btn] = true;
+                    }
+                } else {
+                    // release — only keep first release per button
+                    if !saw_release[btn] {
+                        coalesced.push(*evt);
+                        saw_release[btn] = true;
+                    }
+                }
+            } else {
+                if let Some(mm) = last_mouse_move.take() {
+                    coalesced.push(mm);
+                }
+                coalesced.push(*evt);
+            }
+        }
+        if let Some(mm) = last_mouse_move {
+            coalesced.push(mm);
+        }
+
+        for evt in &coalesced {
+            let mut ring = self.link.input_ring();
+            ring.enqueue(evt);
+        }
+        if let Some(ref mut net) = self.net_link {
+            for evt in &coalesced {
+                net.send_input_event(evt);
+            }
+        }
     }
 }
 
