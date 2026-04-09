@@ -217,32 +217,12 @@ impl<B: GpuBackend> GpuServer<B> {
         use input::capture::{INPUT_MOUSE_MOVE, INPUT_MOUSE_BUTTON, InputEvent};
 
         let events = self.input_capture.drain();
-        // Coalesce: one mouse move per frame, one press+release per button per frame
+        // Coalesce mouse moves (one per frame), pass all other events through
         let mut last_mouse_move: Option<InputEvent> = None;
-        let mut saw_press: [bool; 4] = [false; 4]; // per button (left, right, middle, other)
-        let mut saw_release: [bool; 4] = [false; 4];
         let mut coalesced = Vec::new();
         for evt in &events {
             if evt.event_type == INPUT_MOUSE_MOVE {
                 last_mouse_move = Some(*evt);
-            } else if evt.event_type == INPUT_MOUSE_BUTTON {
-                let btn = (evt.code as usize).min(3);
-                if evt.value_a != 0 {
-                    // press — only keep first press per button
-                    if !saw_press[btn] {
-                        if let Some(mm) = last_mouse_move.take() {
-                            coalesced.push(mm);
-                        }
-                        coalesced.push(*evt);
-                        saw_press[btn] = true;
-                    }
-                } else {
-                    // release — only keep first release per button
-                    if !saw_release[btn] {
-                        coalesced.push(*evt);
-                        saw_release[btn] = true;
-                    }
-                }
             } else {
                 if let Some(mm) = last_mouse_move.take() {
                     coalesced.push(mm);
