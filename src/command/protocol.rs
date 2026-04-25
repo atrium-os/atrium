@@ -91,6 +91,9 @@ pub const NODE_INDEX_DATA: u16 = 0x0111;
 pub const NODE_MATERIAL_SOLID: u16 = 0x0200;
 pub const NODE_MATERIAL_GRADIENT: u16 = 0x0201;
 pub const NODE_MATERIAL_PBR: u16 = 0x0202;
+pub const NODE_MATERIAL_TEXTURED: u16 = 0x0203;
+pub const NODE_TEXTURE: u16 = 0x0400;
+pub const NODE_PIXEL_DATA: u16 = 0x0401;
 pub const NODE_TEXT: u16 = 0x0300;
 pub const NODE_FONT: u16 = 0x0301;
 

@@ -209,7 +209,9 @@ impl NodeData {
             0x0101 if p.len() >= 40 => Some(Self::Path(parse_path_header(&hdr, p))),
             0x0200 if p.len() >= 8 => Some(Self::Material(parse_material_solid(&hdr, p))),
             0x0201 if p.len() >= 20 => Some(Self::Material(parse_material_gradient(&hdr, p))),
+            0x0203 if p.len() >= 36 => Some(Self::Material(parse_material_textured(p))),
             0x0300 if p.len() >= 40 => Some(Self::Text(parse_text_node(p))),
+            0x0400 if p.len() >= 48 => Some(Self::Texture(parse_texture_header(p))),
             _ => Some(Self::Bulk(data.to_vec())),
         }
     }
@@ -293,6 +295,45 @@ fn parse_material_solid(hdr: &BlobHeader, p: &[u8]) -> Material {
         shader: NULL_HASH,
         albedo_tex: NULL_HASH,
         normal_tex: NULL_HASH,
+    }
+}
+
+/// NODE_MATERIAL_TEXTURED (0x0203) — payload layout:
+///   [0..32]   albedo texture hash (NODE_TEXTURE blob)
+///   [32..36]  tint color (RGBA8, 0xFFFFFFFF = no tint)
+fn parse_material_textured(p: &[u8]) -> Material {
+    Material {
+        flags: 0,
+        base_color: read_u32(p, 32),       // tint
+        metallic_roughness: 0,
+        emissive: 0,
+        gradient_type: 0,
+        gradient_stop_count: 0,
+        gradient_x0: 0.0, gradient_y0: 0.0, gradient_x1: 0.0, gradient_y1: 0.0,
+        gradient_stops: [(0.0, 0); 8],
+        shader: NULL_HASH,
+        albedo_tex: read_hash(p, 0),
+        normal_tex: NULL_HASH,
+    }
+}
+
+/// NODE_TEXTURE (0x0400) — payload layout (48 bytes minimum):
+///   [0..4]    format         (u32, 0 = RGBA8)
+///   [4..8]    width          (u32)
+///   [8..12]   height         (u32)
+///   [12..16]  filter+wrap    (low byte filter, next byte wrap, rest reserved)
+///   [16..48]  pixel_data hash (NODE_PIXEL_DATA blob with raw bytes)
+fn parse_texture_header(p: &[u8]) -> TextureHeader {
+    let filter_wrap = read_u32(p, 12);
+    TextureHeader {
+        format: (read_u32(p, 0) & 0xff) as u8,
+        filter_mode: (filter_wrap & 0xff) as u16,
+        width:  read_u32(p, 4),
+        height: read_u32(p, 8),
+        mip_levels: 1,
+        wrap_mode:  ((filter_wrap >> 8) & 0xff) as u16,
+        pixel_data: read_hash(p, 16),
+        mipchain:   NULL_HASH,
     }
 }
 

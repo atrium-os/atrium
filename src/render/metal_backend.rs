@@ -9,6 +9,7 @@ use core_graphics_types::geometry::CGSize;
 use objc2::rc::autoreleasepool as objc2_autorelease;
 use objc2::runtime::AnyObject;
 use raw_window_handle::HasWindowHandle;
+use std::collections::HashMap;
 use std::sync::Arc;
 use winit::window::Window;
 
@@ -18,6 +19,7 @@ pub struct MetalRenderer {
     layer: MetalLayer,
     pipeline: RenderPipelineState,
     gradient_pipeline: RenderPipelineState,
+    textured_pipeline: RenderPipelineState,
     stencil_fill_pipeline: RenderPipelineState,
     stencil_fill_ds: DepthStencilState,
     stencil_cover_ds: DepthStencilState,
@@ -28,6 +30,9 @@ pub struct MetalRenderer {
     tess_index_buf: Buffer,
     tess_counter_buf: Buffer,
     tess_contour_buf: Buffer,
+    /// CAS hash of NODE_TEXTURE blob → MTLTexture. Lazily populated
+    /// on first sight of a texture; never evicted (GC story TBD).
+    texture_cache: HashMap<[u8; 32], Texture>,
     width: u32,
     height: u32,
     scale_factor: f64,
@@ -90,6 +95,18 @@ impl GpuBackend for MetalRenderer {
             .set_pixel_format(MTLPixelFormat::BGRA8Unorm);
         let gradient_pipeline = device.new_render_pipeline_state(&grad_desc)
             .expect("failed to create gradient pipeline");
+
+        // Textured material pipeline: separate vertex shader because
+        // textured meshes have stride 20 (POSITION+UV) vs. solid 12.
+        let vert_tex = library.get_function("vertex_textured", None).unwrap();
+        let frag_tex = library.get_function("fragment_textured", None).unwrap();
+        let tex_desc = RenderPipelineDescriptor::new();
+        tex_desc.set_vertex_function(Some(&vert_tex));
+        tex_desc.set_fragment_function(Some(&frag_tex));
+        tex_desc.color_attachments().object_at(0).unwrap()
+            .set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        let textured_pipeline = device.new_render_pipeline_state(&tex_desc)
+            .expect("failed to create textured pipeline");
 
         let depth_desc = DepthStencilDescriptor::new();
         depth_desc.set_depth_compare_function(MTLCompareFunction::Less);
@@ -159,6 +176,7 @@ impl GpuBackend for MetalRenderer {
             layer,
             pipeline,
             gradient_pipeline,
+            textured_pipeline,
             stencil_fill_pipeline,
             stencil_fill_ds,
             stencil_cover_ds,
@@ -169,6 +187,7 @@ impl GpuBackend for MetalRenderer {
             tess_index_buf,
             tess_counter_buf,
             tess_contour_buf,
+            texture_cache: HashMap::new(),
             width,
             height,
             scale_factor,
@@ -259,6 +278,52 @@ impl GpuBackend for MetalRenderer {
     }
 
     fn render_frame(&mut self, scene: &SceneGraph, cas: &CasStore, _frame: u64, cursor: Option<(f32, f32)>) {
+        self._render_frame_impl(scene, cas, _frame, cursor);
+    }
+}
+
+impl MetalRenderer {
+    /// Ensure an MTLTexture exists for the given NODE_TEXTURE blob hash.
+    /// Returns None if the blob is missing, malformed, or its pixel
+    /// data isn't in CAS yet.
+    fn ensure_texture(&mut self, cas: &CasStore, hash: &[u8; 32]) -> Option<&Texture> {
+        if !self.texture_cache.contains_key(hash) {
+            let blob = cas.load(hash)?;
+            let parsed = NodeData::parse(blob)?;
+            let hdr = match parsed { NodeData::Texture(h) => h, _ => return None };
+            if hdr.format != 0 || hdr.width == 0 || hdr.height == 0 {
+                log::warn!("texture {:02x}{:02x}: unsupported format/size", hash[0], hash[1]);
+                return None;
+            }
+            let pixel_blob = cas.load(&hdr.pixel_data)?;
+            // strip the 8-byte blob header from pixel data
+            let pixels = if pixel_blob.len() > 8 { &pixel_blob[8..] } else { pixel_blob };
+            let need = (hdr.width as usize) * (hdr.height as usize) * 4;
+            if pixels.len() < need {
+                log::warn!("texture {:02x}{:02x}: pixel blob too small ({} < {})",
+                    hash[0], hash[1], pixels.len(), need);
+                return None;
+            }
+            let desc = TextureDescriptor::new();
+            desc.set_pixel_format(MTLPixelFormat::RGBA8Unorm);
+            desc.set_width(hdr.width as u64);
+            desc.set_height(hdr.height as u64);
+            desc.set_storage_mode(MTLStorageMode::Managed);
+            desc.set_usage(MTLTextureUsage::ShaderRead);
+            let tex = self.device.new_texture(&desc);
+            let region = MTLRegion {
+                origin: MTLOrigin { x: 0, y: 0, z: 0 },
+                size: MTLSize { width: hdr.width as u64, height: hdr.height as u64, depth: 1 },
+            };
+            tex.replace_region(region, 0, pixels.as_ptr() as *const _, (hdr.width * 4) as u64);
+            log::info!("texture {:02x}{:02x}.. created: {}x{} ({} bytes)",
+                hash[0], hash[1], hdr.width, hdr.height, need);
+            self.texture_cache.insert(*hash, tex);
+        }
+        self.texture_cache.get(hash)
+    }
+
+    fn _render_frame_impl(&mut self, scene: &SceneGraph, cas: &CasStore, _frame: u64, cursor: Option<(f32, f32)>) {
         // ensure stencil texture exists at correct size
         let need_stencil = self.stencil_texture.is_none()
             || self.stencil_texture.as_ref().map(|t| (t.width(), t.height())) != Some((self.width as u64, self.height as u64));
@@ -270,6 +335,20 @@ impl GpuBackend for MetalRenderer {
             st_desc.set_storage_mode(MTLStorageMode::Private);
             st_desc.set_usage(MTLTextureUsage::RenderTarget);
             self.stencil_texture = Some(self.device.new_texture(&st_desc));
+        }
+
+        // Pre-pass: ensure every textured material's MTLTexture exists.
+        // We can't do this inside the render pass because next_drawable()
+        // holds &self.layer and ensure_texture wants &mut self.
+        for item in scene.render_list().iter() {
+            if item.material == NULL_HASH { continue; }
+            if let Some(data) = cas.load(&item.material) {
+                if let Some(NodeData::Material(m)) = NodeData::parse(data) {
+                    if m.albedo_tex != NULL_HASH {
+                        let _ = self.ensure_texture(cas, &m.albedo_tex);
+                    }
+                }
+            }
         }
 
         objc2_autorelease(|_| {
@@ -344,6 +423,13 @@ impl GpuBackend for MetalRenderer {
                 let use_gradient = parsed_mat.as_ref().map_or(false, |m| m.has_gradient() && m.gradient_stop_count >= 2);
                 let color = parsed_mat.as_ref().map_or([0.8f32, 0.8, 0.8, 1.0], |m| rgba8_to_float(m.base_color));
 
+                // Read-only lookup in the texture cache (populated by
+                // the pre-pass before the drawable was acquired).
+                let textured_tex: Option<Texture> = parsed_mat.as_ref()
+                    .filter(|m| m.albedo_tex != NULL_HASH)
+                    .and_then(|m| self.texture_cache.get(&m.albedo_tex).cloned());
+                let use_textured = textured_tex.is_some();
+
                 // load mesh vertex data from CAS
                 if item.mesh != NULL_HASH {
                     if let Some(mesh_data) = cas.load(&item.mesh) {
@@ -363,7 +449,16 @@ impl GpuBackend for MetalRenderer {
                                     std::mem::size_of::<[f32; 16]>() as u64,
                                     mvp_t.as_ptr() as *const _,
                                 );
-                                if use_gradient {
+                                if use_textured {
+                                    encoder.set_render_pipeline_state(&self.textured_pipeline);
+                                    encoder.set_fragment_texture(0, Some(textured_tex.as_ref().unwrap()));
+                                    // tint = base_color (interpreted as RGBA mul). Pass as float4.
+                                    encoder.set_fragment_bytes(
+                                        0,
+                                        std::mem::size_of::<[f32; 4]>() as u64,
+                                        color.as_ptr() as *const _,
+                                    );
+                                } else if use_gradient {
                                     let mat = parsed_mat.as_ref().unwrap();
                                     let mut grad_buf = [0.0f32; 48];
                                     grad_buf[0] = mat.gradient_type as f32;
@@ -590,6 +685,35 @@ fragment float4 fragment_main(
     constant float4& color [[buffer(0)]]
 ) {
     return color;
+}
+
+// ─── Textured material path ─────────────────────────────────────
+// Vertex layout: POSITION f32x3 + UV f32x2 (stride 20).
+struct TexturedVertexOut {
+    float4 position [[position]];
+    float2 uv;
+};
+
+vertex TexturedVertexOut vertex_textured(
+    const device float* verts [[buffer(0)]],
+    constant float4x4& mvp [[buffer(1)]],
+    uint vid [[vertex_id]]
+) {
+    TexturedVertexOut out;
+    uint base = vid * 5;
+    float3 pos = float3(verts[base+0], verts[base+1], verts[base+2]);
+    out.position = float4(pos, 1.0) * mvp;
+    out.uv = float2(verts[base+3], verts[base+4]);
+    return out;
+}
+
+fragment float4 fragment_textured(
+    TexturedVertexOut in [[stage_in]],
+    texture2d<float> albedo [[texture(0)]],
+    constant float4& tint [[buffer(0)]]
+) {
+    constexpr sampler s(filter::linear, address::clamp_to_edge);
+    return albedo.sample(s, in.uv) * tint;
 }
 
 fragment float4 fragment_gradient(
