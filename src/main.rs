@@ -17,12 +17,28 @@ use input::capture::InputCapture;
 
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use std::time::{Duration, Instant};
 use winit::window::{Window, WindowId};
 
 use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
+
+extern "C" {
+    /// Direct libc read — used by the doorbell-pipe wakeup thread.
+    /// Std's File::read would also work but goes through buffered I/O
+    /// machinery we don't need here.
+    #[link_name = "read"]
+    fn libc_read(fd: i32, buf: *mut u8, count: usize) -> isize;
+}
+
+/// Wake the winit event loop from outside (the doorbell-pipe reader
+/// thread). One variant suffices — any wake means "check command
+/// ring and redraw if needed".
+#[derive(Debug, Clone, Copy)]
+enum WakeEvent {
+    Doorbell,
+}
 
 struct GpuServer<B: GpuBackend> {
     window: Option<Arc<Window>>,
@@ -40,6 +56,8 @@ struct GpuServer<B: GpuBackend> {
     system_font: Option<Vec<u8>>,
     last_cursor_x: f32,
     last_cursor_y: f32,
+    proxy: Option<EventLoopProxy<WakeEvent>>,
+    wakeup_thread_started: bool,
 }
 
 impl<B: GpuBackend> GpuServer<B> {
@@ -97,7 +115,41 @@ impl<B: GpuBackend> GpuServer<B> {
             system_font: None,
             last_cursor_x: 0.0,
             last_cursor_y: 0.0,
+            proxy: None,
+            wakeup_thread_started: false,
         }
+    }
+
+    /// Spawn a thread that blocks on the doorbell pipe and wakes the
+    /// winit event loop when the guest fires the doorbell. Lets the
+    /// loop run on `ControlFlow::Wait` instead of vsync polling, so
+    /// the GPU can drop to idle DVFS state when the scene is static.
+    fn start_wakeup_thread(&mut self) {
+        if self.wakeup_thread_started { return; }
+        let (Some(db), Some(proxy)) = (self.doorbell.as_ref(), self.proxy.clone())
+        else { return; };
+        let fd = db.doorbell_read_fd();
+        std::thread::Builder::new()
+            .name("fresco-doorbell".into())
+            .spawn(move || {
+                let mut buf = [0u8; 64];
+                loop {
+                    let n = unsafe {
+                        libc_read(fd, buf.as_mut_ptr(), buf.len())
+                    };
+                    if n <= 0 {
+                        // pipe closed or error — retry briefly then bail
+                        std::thread::sleep(Duration::from_millis(100));
+                        continue;
+                    }
+                    if proxy.send_event(WakeEvent::Doorbell).is_err() {
+                        return;  // event loop gone
+                    }
+                }
+            })
+            .expect("spawn wakeup thread");
+        self.wakeup_thread_started = true;
+        log::info!("doorbell wakeup thread started (fd={})", fd);
     }
 
     fn check_guest_reset(&mut self) {
@@ -246,7 +298,16 @@ impl<B: GpuBackend> GpuServer<B> {
     }
 }
 
-impl<B: GpuBackend> ApplicationHandler for GpuServer<B> {
+impl<B: GpuBackend> ApplicationHandler<WakeEvent> for GpuServer<B> {
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _ev: WakeEvent) {
+        // Doorbell fired — guest pushed something. Schedule a redraw;
+        // RedrawRequested will process_commands and decide whether
+        // GPU work is actually needed.
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
             let attrs = Window::default_attributes()
@@ -288,6 +349,10 @@ impl<B: GpuBackend> ApplicationHandler for GpuServer<B> {
 
             self.window = Some(window);
             self.renderer = Some(renderer);
+
+            // Start the doorbell wakeup thread now that the window
+            // (and proxy) are alive.
+            self.start_wakeup_thread();
 
             // Load system font into CAS
             let font_path = std::path::Path::new("/System/Library/Fonts/Geneva.ttf");
@@ -415,13 +480,19 @@ impl<B: GpuBackend> ApplicationHandler for GpuServer<B> {
 
                 self.write_input_events();
 
-                if let Some(window) = &self.window {
-                    window.request_redraw();
-                }
+                // No unconditional request_redraw here — we wake on
+                // doorbell or macOS input events instead. GPU stays
+                // idle when the scene is static.
             }
 
             ref evt => {
                 self.input_capture.handle_winit_event(evt);
+                // macOS input events (mouse move, click, key, resize) need
+                // a redraw to update cursor visualization and forward
+                // events to the guest.
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
             }
         }
     }
@@ -458,10 +529,16 @@ fn main() {
         log::info!("  will launch QEMU after window init");
     }
 
-    let event_loop = EventLoop::new().unwrap();
-    event_loop.set_control_flow(ControlFlow::Poll);
+    let event_loop = EventLoop::<WakeEvent>::with_user_event().build().unwrap();
+    // Sleep when there's nothing to do. Wake on:
+    //   - winit window events (input, resize, focus, ...)
+    //   - WakeEvent::Doorbell from the doorbell-pipe reader thread
+    // GPU enters DVFS idle when the scene is static, dropping baseline
+    // power use. Replaces the previous vsync-driven polling loop.
+    event_loop.set_control_flow(ControlFlow::Wait);
 
     let mut server = GpuServer::<render::metal_backend::MetalRenderer>::new(shmem_path, shmem_size, net_port);
     server.qemu_cmd = qemu_cmd;
+    server.proxy = Some(event_loop.create_proxy());
     event_loop.run_app(&mut server).unwrap();
 }

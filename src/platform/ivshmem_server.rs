@@ -177,6 +177,11 @@ impl IvshmemServer {
 
     pub fn has_peer(&self) -> bool { self.qemu_connected }
 
+    /// Read end of the pipe QEMU writes to when the guest fires its
+    /// doorbell. blocking-read'able from a thread that wakes the
+    /// event loop, so the loop can sleep instead of polling at vsync.
+    pub fn doorbell_read_fd(&self) -> RawFd { self._server_read_fd }
+
     pub fn reset(&mut self) {
         // Pipes are recreated in try_accept() when QEMU reconnects.
         // Nothing to do here — guest reset is handled by check_guest_reset() in main.
