@@ -98,13 +98,25 @@ impl GpuBackend for MetalRenderer {
 
         // Textured material pipeline: separate vertex shader because
         // textured meshes have stride 20 (POSITION+UV) vs. solid 12.
+        // Alpha blending enabled — glyph atlases (text) carry coverage
+        // in A; sampled images use A=255 so blending is a no-op for
+        // them. Standard "premultiplied source over" form, but we
+        // multiply src.rgb by src.a in the blend equation since our
+        // glyph atlas isn't premultiplied (R=G=B=255, A=coverage).
         let vert_tex = library.get_function("vertex_textured", None).unwrap();
         let frag_tex = library.get_function("fragment_textured", None).unwrap();
         let tex_desc = RenderPipelineDescriptor::new();
         tex_desc.set_vertex_function(Some(&vert_tex));
         tex_desc.set_fragment_function(Some(&frag_tex));
-        tex_desc.color_attachments().object_at(0).unwrap()
-            .set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        let tex_color = tex_desc.color_attachments().object_at(0).unwrap();
+        tex_color.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        tex_color.set_blending_enabled(true);
+        tex_color.set_rgb_blend_operation(MTLBlendOperation::Add);
+        tex_color.set_alpha_blend_operation(MTLBlendOperation::Add);
+        tex_color.set_source_rgb_blend_factor(MTLBlendFactor::SourceAlpha);
+        tex_color.set_destination_rgb_blend_factor(MTLBlendFactor::OneMinusSourceAlpha);
+        tex_color.set_source_alpha_blend_factor(MTLBlendFactor::One);
+        tex_color.set_destination_alpha_blend_factor(MTLBlendFactor::OneMinusSourceAlpha);
         let textured_pipeline = device.new_render_pipeline_state(&tex_desc)
             .expect("failed to create textured pipeline");
 
