@@ -104,7 +104,7 @@ fn main() {
     let face = ttf_parser::Face::parse(&font_bytes, 0).expect("failed to parse font");
     let units_per_em = face.units_per_em() as f32;
 
-    let text = "KarythraGPU";
+    let text = "Fresco";
     let text_size = 0.08;
     let mut text_x: f32 = -0.45;
     let text_y: f32 = 0.62;

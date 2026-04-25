@@ -20,7 +20,7 @@ pub struct Completion {
     pub _pad: [u32; 22], // pad to 128 bytes total
 }
 
-// Command opcodes — matches KarythraGPU SCENE_GRAPH.md exactly
+// Command opcodes — Fresco wire protocol (single source of truth)
 
 // Resource upload
 pub const CMD_UPLOAD_BEGIN: u16 = 0x0001;

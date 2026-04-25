@@ -1,5 +1,5 @@
 [package]
-name = "karythra-gpu-server"
+name = "fresco-server"
 version = "0.1.0"
 edition = "2021"
 

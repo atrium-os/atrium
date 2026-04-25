@@ -250,7 +250,7 @@ impl<B: GpuBackend> ApplicationHandler for GpuServer<B> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
             let attrs = Window::default_attributes()
-                .with_title("KarythraGPU")
+                .with_title("Fresco")
                 .with_inner_size(winit::dpi::LogicalSize::new(1024u32, 768u32));
 
             let window = Arc::new(event_loop.create_window(attrs).unwrap());
@@ -305,7 +305,7 @@ impl<B: GpuBackend> ApplicationHandler for GpuServer<B> {
                 log::warn!("System font not found at {:?}", font_path);
             }
 
-            log::info!("KarythraGPU server ready ({}x{} logical, {}x{} physical)", logical.width, logical.height, phys.width, phys.height);
+            log::info!("Fresco server ready ({}x{} logical, {}x{} physical)", logical.width, logical.height, phys.width, phys.height);
 
             if !self.qemu_launched {
                 if let Some(ref cmd) = self.qemu_cmd {
@@ -449,7 +449,7 @@ fn main() {
         .position(|a| a == "--qemu")
         .map(|i| args[i + 1..].to_vec());
 
-    log::info!("KarythraGPU server starting");
+    log::info!("Fresco server starting");
     log::info!("  shmem: {:?}", shmem_path);
     if let Some(port) = net_port {
         log::info!("  network: TCP port {}", port);
