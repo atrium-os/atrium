@@ -23,7 +23,11 @@ use crate::scene::slots::SlotTable;
 /// Server-assigned window identifier. Stable for the window's
 /// lifetime, opaque to clients (they only know the ones the server
 /// gave them).
-pub type WindowId = u32;
+///
+/// u16 (max 65535 windows) so it fits in `Command::flags` — slot
+/// and frame opcodes reuse that field as a window selector. If we
+/// ever blow past 65k concurrent windows we'll widen the field.
+pub type WindowId = u16;
 
 /// Client identifier — assigned by the kernel module on cdev open()
 /// in phase B2. In phase B1 there's only one client (the existing
@@ -87,12 +91,28 @@ impl Compositor {
 
     pub fn create(&mut self, owner: ClientId, size: (u32, u32)) -> WindowId {
         let id = self.next_id;
-        self.next_id += 1;
+        self.next_id = self.next_id.saturating_add(1);
         let mut w = Window::new(id, owner, size);
         w.z = self.z_order.len() as u32;
         self.windows.insert(id, w);
         self.z_order.push(id);
         id
+    }
+
+    /// Get a mutable reference to a window, auto-creating it if it
+    /// doesn't exist. Used during the B1a transition: legacy single-
+    /// window apps emit `flags = 0` on every slot/frame op and we
+    /// transparently route into an implicit window 0.
+    pub fn window_mut(&mut self, id: WindowId, owner: ClientId,
+                       default_size: (u32, u32)) -> &mut Window {
+        if !self.windows.contains_key(&id) {
+            let mut w = Window::new(id, owner, default_size);
+            w.z = self.z_order.len() as u32;
+            self.windows.insert(id, w);
+            self.z_order.push(id);
+            if id >= self.next_id { self.next_id = id.saturating_add(1); }
+        }
+        self.windows.get_mut(&id).unwrap()
     }
 
     pub fn destroy(&mut self, id: WindowId, by: ClientId) -> bool {

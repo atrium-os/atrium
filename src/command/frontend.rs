@@ -4,6 +4,7 @@ use crate::scene::graph::SceneGraph;
 use crate::scene::nodes::Transform;
 use crate::scene::sharing;
 use crate::scene::slots::{SlotTable, TextData};
+use crate::window::Compositor;
 
 use std::sync::{Arc, Mutex};
 
@@ -11,6 +12,12 @@ pub struct CommandFrontend {
     cas: Arc<Mutex<CasStore>>,
     scene: Arc<Mutex<SceneGraph>>,
     pub slot_table: Arc<Mutex<SlotTable>>,
+    /// Multi-window compositor — phase B1. Today only the lifecycle
+    /// handlers (CREATE/DESTROY/SET_TITLE) wire through here. Slot
+    /// and frame ops still run against the legacy global state above
+    /// (= "implicit window 0"). Per-window slot/frame dispatch is
+    /// the next refactor.
+    pub compositor: Arc<Mutex<Compositor>>,
     pending_tasks: Vec<PendingTask>,
     pub last_upload_size: u64,
     frame_number: u32,
@@ -25,12 +32,15 @@ struct PendingTask {
 }
 
 impl CommandFrontend {
-    pub fn new(cas: Arc<Mutex<CasStore>>, scene: Arc<Mutex<SceneGraph>>) -> Self {
+    pub fn new(cas: Arc<Mutex<CasStore>>,
+               scene: Arc<Mutex<SceneGraph>>,
+               compositor: Arc<Mutex<Compositor>>) -> Self {
         let slot_table = Arc::new(Mutex::new(SlotTable::new()));
         Self {
             cas,
             scene,
             slot_table,
+            compositor,
             pending_tasks: Vec::new(),
             last_upload_size: 0,
             frame_number: 0,
@@ -83,28 +93,17 @@ impl CommandFrontend {
             CMD_FRAME_BEGIN => self.handle_frame_begin(cmd),
             CMD_FRAME_END => self.handle_frame_end(cmd),
 
-            // Multi-window protocol — phase B1 stubs. The opcodes are
-            // wire-reserved; full handlers land when the per-window
-            // refactor of scene/slot dispatch goes in.
-            CMD_CREATE_WINDOW => {
-                let w = cmd.u32_at(8);
-                let h = cmd.u32_at(12);
-                log::info!("CREATE_WINDOW (stub): {}x{}, seq={}", w, h, cmd.sequence_id);
-                // Echo a synthetic completion so callers can pretend
-                // we work — they get window_id = sequence_id, no
-                // actual scene routed there yet.
-                Some(Completion {
-                    comp_type: COMP_WINDOW_CREATED,
-                    status:    STATUS_OK,
-                    id:        cmd.sequence_id,
-                    result_hash: NULL_HASH,
-                    _pad:      [0; 22],
-                })
-            }
-            CMD_DESTROY_WINDOW   => { log::info!("DESTROY_WINDOW (stub): id={}",   cmd.u32_at(8)); None }
-            CMD_WINDOW_SET_ROOT  => { log::info!("WINDOW_SET_ROOT (stub): id={}",  cmd.u32_at(8)); None }
-            CMD_WINDOW_SET_TITLE => { log::info!("WINDOW_SET_TITLE (stub): id={}", cmd.u32_at(8)); None }
-            CMD_WINDOW_PRESENT   => { log::info!("WINDOW_PRESENT (stub): id={}",   cmd.u32_at(8)); None }
+            // ── Multi-window protocol — phase B1 ───────────────
+            // Lifecycle handlers (CREATE/DESTROY/SET_TITLE) are now
+            // real — windows live in the Compositor. Slot/frame
+            // routing still uses the legacy global state for window 0;
+            // SET_ROOT/PRESENT continue to log only until the per-
+            // window slot dispatch refactor lands.
+            CMD_CREATE_WINDOW    => self.handle_create_window(cmd),
+            CMD_DESTROY_WINDOW   => self.handle_destroy_window(cmd),
+            CMD_WINDOW_SET_TITLE => self.handle_window_set_title(cmd),
+            CMD_WINDOW_SET_ROOT  => { log::info!("WINDOW_SET_ROOT (stub): win={}", cmd.u32_at(8)); None }
+            CMD_WINDOW_PRESENT   => { log::info!("WINDOW_PRESENT (stub): win={}", cmd.u32_at(8)); None }
 
             _ => {
                 log::warn!("unknown command opcode: 0x{:04x}", cmd.opcode);
@@ -555,6 +554,75 @@ impl CommandFrontend {
             scene.traverse(&mut cas);
             log::trace!("FRAME_END: frame={} (CAS mode) render_items={}",
                 self.frame_number, scene.render_list().len());
+        }
+        None
+    }
+
+    // ── Multi-window lifecycle handlers ─────────────────────────────
+    //
+    // CREATE_WINDOW payload (post-cmd-header at offset 8):
+    //   [0..4]   width  (u32)
+    //   [4..8]   height (u32)
+    //   [8..12]  flags  (u32, reserved, must be 0)
+    //   [12..28] short title bytes (utf-8, NUL-terminated, optional)
+
+    fn handle_create_window(&mut self, cmd: &Command) -> Option<Completion> {
+        let w = cmd.u32_at(8);
+        let h = cmd.u32_at(12);
+        let _flags = cmd.u32_at(16);
+        let bytes = cmd.payload_bytes();
+        // Short title: 16 bytes at payload offset 12 (cmd offset 20). NUL-terminated.
+        let title_buf = &bytes[12..28.min(bytes.len())];
+        let title_end = title_buf.iter().position(|&b| b == 0).unwrap_or(title_buf.len());
+        let title = String::from_utf8_lossy(&title_buf[..title_end]).into_owned();
+
+        let mut comp = self.compositor.lock().unwrap();
+        // Phase B1: single client (id 0).
+        let win_id = comp.create(0, (w.max(1), h.max(1)));
+        if !title.is_empty() {
+            if let Some(win) = comp.windows.get_mut(&win_id) {
+                win.title = title.clone();
+            }
+        }
+        log::info!("CREATE_WINDOW: id={} {}x{} title={:?}", win_id, w, h, title);
+
+        // Echo the request's sequence_id in result_hash[0..4] so the
+        // client can correlate this completion with its request even
+        // if multiple CREATE_WINDOWs are in flight. comp.id is the
+        // server-assigned window_id.
+        let mut result_hash = [0u8; 32];
+        result_hash[..4].copy_from_slice(&cmd.sequence_id.to_le_bytes());
+        Some(Completion {
+            comp_type:   COMP_WINDOW_CREATED,
+            status:      STATUS_OK,
+            id:          win_id as u32,
+            result_hash,
+            _pad:        [0; 22],
+        })
+    }
+
+    fn handle_destroy_window(&mut self, cmd: &Command) -> Option<Completion> {
+        let win_id = cmd.u32_at(8) as u16;
+        let mut comp = self.compositor.lock().unwrap();
+        let ok = comp.destroy(win_id, /*by_client=*/ 0);
+        log::info!("DESTROY_WINDOW: id={} ok={}", win_id, ok);
+        None
+    }
+
+    fn handle_window_set_title(&mut self, cmd: &Command) -> Option<Completion> {
+        let win_id = cmd.u32_at(8) as u16;
+        let bytes = cmd.payload_bytes();
+        // Title bytes begin at payload offset 4 (cmd offset 12), up to remaining payload.
+        let title_buf = &bytes[4..];
+        let end = title_buf.iter().position(|&b| b == 0).unwrap_or(title_buf.len());
+        let title = String::from_utf8_lossy(&title_buf[..end]).into_owned();
+
+        let mut comp = self.compositor.lock().unwrap();
+        if let Some(win) = comp.windows.get_mut(&win_id) {
+            win.title = title.clone();
+            log::info!("WINDOW_SET_TITLE: id={} title={:?}", win_id, title);
+        } else {
+            log::warn!("WINDOW_SET_TITLE: unknown window id={}", win_id);
         }
         None
     }

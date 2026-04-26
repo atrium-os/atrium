@@ -97,7 +97,8 @@ impl<B: GpuBackend> GpuServer<B> {
 
         let cas = Arc::new(Mutex::new(CasStore::new()));
         let scene = Arc::new(Mutex::new(SceneGraph::new()));
-        let frontend = CommandFrontend::new(cas.clone(), scene.clone());
+        let compositor = Arc::new(Mutex::new(window::Compositor::new()));
+        let frontend = CommandFrontend::new(cas.clone(), scene.clone(), compositor.clone());
         let input_capture = InputCapture::new();
 
         Self {
