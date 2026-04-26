@@ -62,11 +62,32 @@ pub const CMD_QUERY_HASH: u16 = 0x0302;
 pub const CMD_FRAME_BEGIN: u16 = 0x0303;
 pub const CMD_FRAME_END: u16 = 0x0304;
 
+// ── Multi-window protocol (phase B1) ───────────────────────────
+// These commands let one client own multiple windows. Existing
+// single-window apps continue to work via an implicit window 0
+// auto-created on first slot/frame command. New apps create windows
+// explicitly and route slot ops through `CTRL_CURRENT_WINDOW`.
+//
+// Window IDs are u32, server-assigned, returned in the COMP_WINDOW_CREATED
+// completion's `id` field (matched against the CREATE_WINDOW's
+// sequence_id by the client).
+pub const CMD_CREATE_WINDOW:   u16 = 0x0500;  // payload: u32 w, u32 h, u32 flags, [u8;16] short title
+pub const CMD_DESTROY_WINDOW:  u16 = 0x0501;  // payload: u32 window_id
+pub const CMD_WINDOW_SET_ROOT: u16 = 0x0502;  // payload: u32 window_id, u16 slot_id
+pub const CMD_WINDOW_SET_TITLE:u16 = 0x0503;  // payload: u32 window_id, utf8 bytes (≤ 116)
+pub const CMD_WINDOW_PRESENT:  u16 = 0x0504;  // payload: u32 window_id (replaces FRAME_END for that window)
+
 // Completion types
 pub const COMP_UPLOAD_COMPLETE: u16 = 0x01;
 pub const COMP_FENCE: u16 = 0x02;
 pub const COMP_QUERY_RESULT: u16 = 0x03;
 pub const COMP_ERROR: u16 = 0xFF;
+
+// Multi-window completions / events
+pub const COMP_WINDOW_CREATED:         u16 = 0x10;  // id = server-assigned window_id
+pub const COMP_WINDOW_RESIZED:         u16 = 0x11;  // id = window_id; payload carries new w/h
+pub const COMP_WINDOW_CLOSE_REQUESTED: u16 = 0x12;  // user clicked the close button
+pub const COMP_WINDOW_FOCUS:           u16 = 0x13;  // status: 1=focused, 0=blurred
 
 // Status codes
 pub const STATUS_OK: u16 = 0x00;

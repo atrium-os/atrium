@@ -16,7 +16,7 @@ const CMD_ENTRY_SIZE: usize = 128;
 const INPUT_RING_ENTRIES: usize = 64;
 const INPUT_ENTRY_SIZE: usize = 64;
 
-// Control register layout (64 bytes)
+// Control register layout (64 bytes — phase B1 reserves up to 128)
 // [0:3]   cmd_write_ptr   (guest writes)
 // [4:7]   cmd_read_ptr    (server writes)
 // [8:11]  comp_write_ptr  (server writes)
@@ -27,6 +27,8 @@ const INPUT_ENTRY_SIZE: usize = 64;
 // [28:31] display_width   (server writes)
 // [32:35] display_height  (server writes)
 // [36:39] refresh_hz      (server writes)
+// [40:71] system font hash (server writes, 32 bytes)
+// [72:75] current_window  (guest writes — slot/frame ops apply to this window)
 
 const CTRL_CMD_WRITE: usize = 0;
 const CTRL_CMD_READ: usize = 4;
@@ -39,6 +41,8 @@ const CTRL_DISPLAY_W: usize = 28;
 const CTRL_DISPLAY_H: usize = 32;
 const CTRL_REFRESH_HZ: usize = 36;
 const CTRL_SYSTEM_FONT: usize = 40; // 32 bytes: SHA256 of system font blob
+#[allow(dead_code)]
+const CTRL_CURRENT_WINDOW: usize = 72; // u32 — phase B1, used only when present
 
 pub struct IvshmemLink {
     mmap: MmapMut,

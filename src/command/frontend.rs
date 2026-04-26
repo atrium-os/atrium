@@ -83,6 +83,29 @@ impl CommandFrontend {
             CMD_FRAME_BEGIN => self.handle_frame_begin(cmd),
             CMD_FRAME_END => self.handle_frame_end(cmd),
 
+            // Multi-window protocol — phase B1 stubs. The opcodes are
+            // wire-reserved; full handlers land when the per-window
+            // refactor of scene/slot dispatch goes in.
+            CMD_CREATE_WINDOW => {
+                let w = cmd.u32_at(8);
+                let h = cmd.u32_at(12);
+                log::info!("CREATE_WINDOW (stub): {}x{}, seq={}", w, h, cmd.sequence_id);
+                // Echo a synthetic completion so callers can pretend
+                // we work — they get window_id = sequence_id, no
+                // actual scene routed there yet.
+                Some(Completion {
+                    comp_type: COMP_WINDOW_CREATED,
+                    status:    STATUS_OK,
+                    id:        cmd.sequence_id,
+                    result_hash: NULL_HASH,
+                    _pad:      [0; 22],
+                })
+            }
+            CMD_DESTROY_WINDOW   => { log::info!("DESTROY_WINDOW (stub): id={}",   cmd.u32_at(8)); None }
+            CMD_WINDOW_SET_ROOT  => { log::info!("WINDOW_SET_ROOT (stub): id={}",  cmd.u32_at(8)); None }
+            CMD_WINDOW_SET_TITLE => { log::info!("WINDOW_SET_TITLE (stub): id={}", cmd.u32_at(8)); None }
+            CMD_WINDOW_PRESENT   => { log::info!("WINDOW_PRESENT (stub): id={}",   cmd.u32_at(8)); None }
+
             _ => {
                 log::warn!("unknown command opcode: 0x{:04x}", cmd.opcode);
                 Some(Completion::error(cmd.sequence_id, STATUS_INVALID_HASH))

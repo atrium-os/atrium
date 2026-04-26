@@ -4,6 +4,7 @@ mod command;
 mod render;
 mod input;
 mod platform;
+mod window;
 
 use platform::ivshmem::IvshmemLink;
 use platform::ivshmem_server::IvshmemServer;
