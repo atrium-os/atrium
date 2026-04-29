@@ -1,0 +1,20 @@
+[package]
+name        = "tessera-tools"
+version.workspace     = true
+edition.workspace     = true
+license.workspace     = true
+repository.workspace  = true
+description = "CLI tools for Tessera volumes (mkfs-tessera, tessera-debug)."
+publish     = false
+
+[[bin]]
+name = "mkfs-tessera"
+path = "src/bin/mkfs.rs"
+
+[[bin]]
+name = "tessera-debug"
+path = "src/bin/debug.rs"
+
+[dependencies]
+tessera-sys = { path = "../tessera-sys" }
+libc        = "0.2"

@@ -20,6 +20,7 @@
 #include "tessera/journal.h"
 #include "tessera/extent.h"
 #include "tessera/gc.h"
+#include "tessera/volume.h"
 
 #define TESSERA_VERSION_MAJOR  1
 #define TESSERA_VERSION_MINOR  0

@@ -5,11 +5,17 @@
 #   make check      build + run the full Phase-1 test suite
 #   make bench-sha  run the SHA-256 hardware-dispatch microbench
 
+# Build in-tree (not under /usr/obj). The 9p share that exposes this
+# tree to the macOS host is one-way (host → VM), so keeping the .a
+# file inside the source tree is what lets the host's cross-compiled
+# Rust crates find it via TESSERA_CORE_LIB.
+MK_AUTO_OBJ=no
+
 LIB=        tessera_core
 SHLIB_MAJOR= 1
 
 SRCS=       error.c hash.c crc.c codec.c cdc.c btree.c \
-            manifest.c pack.c journal.c extent.c gc.c
+            manifest.c pack.c journal.c extent.c gc.c volume.c
 INCS=       include/tessera/tessera.h \
             include/tessera/error.h \
             include/tessera/format.h \
@@ -22,7 +28,8 @@ INCS=       include/tessera/tessera.h \
             include/tessera/pack.h \
             include/tessera/journal.h \
             include/tessera/extent.h \
-            include/tessera/gc.h
+            include/tessera/gc.h \
+            include/tessera/volume.h
 INCSDIR=    /usr/local/include
 
 WARNS?=     6
@@ -46,7 +53,8 @@ TEST_NAMES= \
     test_btree \
     test_manifest \
     test_pack \
-    test_journal
+    test_journal \
+    test_volume
 
 TEST_BINS= ${TEST_NAMES:S,^,${.OBJDIR}/,}
 

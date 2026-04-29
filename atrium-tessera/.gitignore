@@ -9,4 +9,12 @@ core/test_btree
 core/test_manifest
 core/test_pack
 core/test_journal
+core/test_volume
 core/bench_sha256
+
+# In-tree library + per-file artifacts produced when MK_AUTO_OBJ=no.
+core/libtessera_core.a
+core/libtessera_core.so
+core/libtessera_core.so.*
+core/*.pico
+core/*.o
