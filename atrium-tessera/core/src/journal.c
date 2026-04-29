@@ -39,9 +39,7 @@
 #include "tessera/crc.h"
 #include "tessera/error.h"
 #include "tessera/format.h"
-
-#include <stdlib.h>
-#include <string.h>
+#include "tessera_compat.h"
 
 #define BLK 4096u
 
@@ -114,7 +112,7 @@ tessera_journal_open(const tessera_block_io_t *io, uint64_t start,
 	if (io == NULL || length < 4) return NULL;
 	tessera_journal_header_t h;
 	if (read_journal_header(io, start, &h) != TESSERA_OK) return NULL;
-	tessera_journal_t *j = calloc(1, sizeof *j);
+	tessera_journal_t *j = tessera_zalloc(sizeof *j);
 	if (j == NULL) return NULL;
 	j->io         = *io;
 	j->start      = start;
@@ -130,7 +128,7 @@ tessera_journal_open(const tessera_block_io_t *io, uint64_t start,
 void
 tessera_journal_close(tessera_journal_t *j)
 {
-	free(j);
+	tessera_free(j);
 }
 
 /* ── append helpers ──────────────────────────────────────────────── */
@@ -278,7 +276,7 @@ read_record(tessera_journal_t *j, uint64_t *block,
 	const uint32_t bl = out_hdr->body_length;
 	uint8_t *body = NULL;
 	if (bl > 0) {
-		body = malloc(bl);
+		body = tessera_malloc(bl);
 		if (body == NULL) return TESSERA_ENOMEM;
 		const uint32_t in_first =
 		    (bl > BLK - 32) ? (BLK - 32) : bl;
@@ -291,7 +289,7 @@ read_record(tessera_journal_t *j, uint64_t *block,
 			uint8_t cont[BLK];
 			if (j->io.read_block(j->io.ctx, j->start + b, cont)
 			    != 0) {
-				free(body);
+				tessera_free(body);
 				return TESSERA_EIO;
 			}
 			uint32_t take = remaining > BLK ? BLK : remaining;
@@ -301,7 +299,7 @@ read_record(tessera_journal_t *j, uint64_t *block,
 	}
 	uint32_t body_crc = (bl > 0) ? tessera_crc32(body, bl) : 0u;
 	if (out_hdr->crc32_body != body_crc) {
-		free(body);
+		tessera_free(body);
 		return TESSERA_EBADCRC;
 	}
 
@@ -337,9 +335,9 @@ tessera_journal_replay(tessera_journal_t *j,
 
 		if (hdr.record_type == (uint32_t)TESSERA_TX_BEGIN) {
 			for (size_t i = 0; i < buf_count; i++)
-				free(buf[i].body);
+				tessera_free(buf[i].body);
 			buf_count = 0;
-			free(body);
+			tessera_free(body);
 			in_tx = 1;
 			continue;
 		}
@@ -349,29 +347,29 @@ tessera_journal_replay(tessera_journal_t *j,
 				for (size_t i = 0; i < buf_count; i++) {
 					int cr = cb(ctx, &buf[i].hdr,
 					    buf[i].body);
-					free(buf[i].body);
+					tessera_free(buf[i].body);
 					if (cr != 0) {
 						rc = cr;
 						/* free the rest */
 						for (size_t k = i + 1;
 						     k < buf_count; k++)
-							free(buf[k].body);
+							tessera_free(buf[k].body);
 						buf_count = 0;
 						goto cleanup;
 					}
 				}
 				buf_count = 0;
 			}
-			free(body);
+			tessera_free(body);
 			in_tx = 0;
 			continue;
 		}
 
 		if (hdr.record_type == (uint32_t)TESSERA_TX_ABORT) {
 			for (size_t i = 0; i < buf_count; i++)
-				free(buf[i].body);
+				tessera_free(buf[i].body);
 			buf_count = 0;
-			free(body);
+			tessera_free(body);
 			in_tx = 0;
 			continue;
 		}
@@ -380,9 +378,9 @@ tessera_journal_replay(tessera_journal_t *j,
 			if (buf_count == buf_cap) {
 				size_t nc = buf_cap ? buf_cap * 2 : 16;
 				struct buffered_rec *nb =
-				    realloc(buf, nc * sizeof *nb);
+				    tessera_realloc(buf, nc * sizeof *nb);
 				if (nb == NULL) {
-					free(body);
+					tessera_free(body);
 					rc = TESSERA_ENOMEM;
 					goto cleanup;
 				}
@@ -392,11 +390,11 @@ tessera_journal_replay(tessera_journal_t *j,
 			buf[buf_count].body = body;
 			buf_count++;
 		} else {
-			free(body);
+			tessera_free(body);
 		}
 	}
 cleanup:
-	for (size_t i = 0; i < buf_count; i++) free(buf[i].body);
-	free(buf);
+	for (size_t i = 0; i < buf_count; i++) tessera_free(buf[i].body);
+	tessera_free(buf);
 	return rc;
 }

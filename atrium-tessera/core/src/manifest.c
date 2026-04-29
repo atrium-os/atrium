@@ -29,8 +29,7 @@
 #include "tessera/format.h"
 #include "tessera/hash.h"
 
-#include <stdlib.h>
-#include <string.h>
+#include "tessera_compat.h"
 
 #define HEADER_SIZE 32u
 
@@ -51,7 +50,7 @@ body_reserve(tessera_manifest_builder_t *b, size_t need)
 	if (b->body_cap >= need) return 0;
 	size_t cap = b->body_cap ? b->body_cap : 256;
 	while (cap < need) cap *= 2;
-	uint8_t *p = realloc(b->body, cap);
+	uint8_t *p = tessera_realloc(b->body, cap);
 	if (p == NULL) return -1;
 	b->body = p;
 	b->body_cap = cap;
@@ -70,7 +69,7 @@ body_append(tessera_manifest_builder_t *b, const void *data, size_t n)
 tessera_manifest_builder_t *
 tessera_manifest_begin(tessera_manifest_kind_t kind)
 {
-	tessera_manifest_builder_t *b = calloc(1, sizeof *b);
+	tessera_manifest_builder_t *b = tessera_zalloc(sizeof *b);
 	if (b == NULL) return NULL;
 	b->kind = kind;
 	return b;
@@ -80,8 +79,8 @@ void
 tessera_manifest_free(tessera_manifest_builder_t *b)
 {
 	if (b == NULL) return;
-	free(b->body);
-	free(b);
+	tessera_free(b->body);
+	tessera_free(b);
 }
 
 int
@@ -240,10 +239,10 @@ tessera_manifest_parser_t *
 tessera_manifest_parse(const uint8_t *data, size_t len)
 {
 	if (data == NULL || len < HEADER_SIZE) return NULL;
-	tessera_manifest_parser_t *p = calloc(1, sizeof *p);
+	tessera_manifest_parser_t *p = tessera_zalloc(sizeof *p);
 	if (p == NULL) return NULL;
 	if (tessera_decode_manifest_header(data, &p->header) != TESSERA_OK) {
-		free(p);
+		tessera_free(p);
 		return NULL;
 	}
 	p->body     = data + HEADER_SIZE;
@@ -314,5 +313,5 @@ tessera_manifest_inline_data(const tessera_manifest_parser_t *p,
 void
 tessera_manifest_parser_free(tessera_manifest_parser_t *p)
 {
-	free(p);
+	tessera_free(p);
 }

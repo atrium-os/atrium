@@ -31,9 +31,7 @@
 #include "tessera/extent.h"
 #include "tessera/btree.h"
 #include "tessera/error.h"
-
-#include <stdlib.h>
-#include <string.h>
+#include "tessera_compat.h"
 
 #define EXTENT_TREE_KIND  2u
 #define EXTENT_KEY_SIZE   8u    /* start_sector */
@@ -54,7 +52,7 @@ ensure_capacity(tessera_extent_alloc_t *a, size_t need)
 	if (a->capacity >= need) return 0;
 	size_t newcap = a->capacity ? a->capacity : 16;
 	while (newcap < need) newcap *= 2;
-	tessera_free_extent_t *p = realloc(a->extents,
+	tessera_free_extent_t *p = tessera_realloc(a->extents,
 	    newcap * sizeof *a->extents);
 	if (p == NULL) return -1;
 	a->extents = p;
@@ -81,7 +79,7 @@ lower_bound(const tessera_extent_alloc_t *a, uint64_t s)
 tessera_extent_alloc_t *
 tessera_extent_open(const tessera_block_io_t *io, uint64_t free_root_sector)
 {
-	tessera_extent_alloc_t *a = calloc(1, sizeof *a);
+	tessera_extent_alloc_t *a = tessera_zalloc(sizeof *a);
 	if (a == NULL) return NULL;
 	if (io != NULL) {
 		a->io = *io;
@@ -117,8 +115,8 @@ tessera_extent_open(const tessera_block_io_t *io, uint64_t free_root_sector)
 	return a;
 
 fail:
-	free(a->extents);
-	free(a);
+	tessera_free(a->extents);
+	tessera_free(a);
 	return NULL;
 }
 
@@ -151,8 +149,8 @@ void
 tessera_extent_close(tessera_extent_alloc_t *a)
 {
 	if (a == NULL) return;
-	free(a->extents);
-	free(a);
+	tessera_free(a->extents);
+	tessera_free(a);
 }
 
 uint64_t

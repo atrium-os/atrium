@@ -36,8 +36,7 @@
 #include "tessera/error.h"
 #include "tessera/format.h"
 
-#include <stdlib.h>
-#include <string.h>
+#include "tessera_compat.h"
 
 #define BLOCK_SIZE     TESSERA_SECTOR_SIZE
 #define HEADER_SIZE    32u                 /* sizeof(tessera_btree_node_header_t) */
@@ -192,7 +191,7 @@ static tessera_btree_t *
 make_handle(const tessera_block_io_t *io, uint8_t tree_kind,
             uint32_t key_size, uint32_t value_size)
 {
-	tessera_btree_t *t = calloc(1, sizeof *t);
+	tessera_btree_t *t = tessera_zalloc(sizeof *t);
 	if (t == NULL) return NULL;
 	t->io           = *io;
 	t->tree_kind    = tree_kind;
@@ -201,7 +200,7 @@ make_handle(const tessera_block_io_t *io, uint8_t tree_kind,
 	t->leaf_fanout  = (BLOCK_SIZE - HEADER_SIZE) / (key_size + value_size);
 	t->inner_fanout = (BLOCK_SIZE - HEADER_SIZE) / (key_size + 8u);
 	if (t->leaf_fanout < 4 || t->inner_fanout < 4) {
-		free(t);
+		tessera_free(t);
 		return NULL;
 	}
 	return t;
@@ -227,8 +226,8 @@ tessera_btree_create(const tessera_block_io_t *io, uint8_t tree_kind,
 	tessera_btree_t *t = make_handle(io, tree_kind, key_size, value_size);
 	if (t == NULL) return NULL;
 
-	uint8_t *block = calloc(1, BLOCK_SIZE);
-	if (block == NULL) { free(t); return NULL; }
+	uint8_t *block = tessera_zalloc(BLOCK_SIZE);
+	if (block == NULL) { tessera_free(t); return NULL; }
 
 	uint64_t s;
 	if (alloc_node(t, &s) != TESSERA_OK) goto fail;
@@ -237,20 +236,20 @@ tessera_btree_create(const tessera_block_io_t *io, uint8_t tree_kind,
 		(void)free_node(t, s);
 		goto fail;
 	}
-	free(block);
+	tessera_free(block);
 	t->root = s;
 	*out_root_sector = s;
 	return t;
 fail:
-	free(block);
-	free(t);
+	tessera_free(block);
+	tessera_free(t);
 	return NULL;
 }
 
 void
 tessera_btree_close(tessera_btree_t *t)
 {
-	free(t);
+	tessera_free(t);
 }
 
 /* ── get ─────────────────────────────────────────────────────────── */
@@ -354,7 +353,7 @@ put_into_leaf(tessera_btree_t *t, uint64_t old_sector,
 	/* Split. Build a flat array of (entry_count+1) entries including
 	 * the new one, then split halfway. */
 	const uint32_t total = h.entry_count + 1;
-	uint8_t *flat = malloc((size_t)total * es);
+	uint8_t *flat = tessera_malloc((size_t)total * es);
 	if (flat == NULL) return TESSERA_ENOMEM;
 	const uint8_t *base = leaf_entries_const(block);
 	memcpy(flat, base, (size_t)ins * es);
@@ -378,7 +377,7 @@ put_into_leaf(tessera_btree_t *t, uint64_t old_sector,
 	/* Split key for parent = first key of right half. */
 	memcpy(res->split_key, flat + (size_t)left_n * es, t->key_size);
 
-	free(flat);
+	tessera_free(flat);
 
 	uint64_t sl, sr;
 	if (alloc_node(t, &sl) != TESSERA_OK) return TESSERA_ENOSPC;
@@ -462,7 +461,7 @@ put_into_internal(tessera_btree_t *t, uint64_t old_sector,
 
 	/* Internal split. */
 	const uint32_t total = h.entry_count + 1;
-	uint8_t *flat = malloc((size_t)total * es);
+	uint8_t *flat = tessera_malloc((size_t)total * es);
 	if (flat == NULL) return TESSERA_ENOMEM;
 	const uint8_t *base = leaf_entries_const(block);
 	memcpy(flat, base, (size_t)ins * es);
@@ -486,7 +485,7 @@ put_into_internal(tessera_btree_t *t, uint64_t old_sector,
 
 	memcpy(res->split_key, flat + (size_t)left_n * es, t->key_size);
 
-	free(flat);
+	tessera_free(flat);
 
 	uint64_t sl, sr;
 	if (alloc_node(t, &sl) != TESSERA_OK) return TESSERA_ENOSPC;
@@ -740,12 +739,12 @@ tessera_btree_cursor_t *
 tessera_btree_seek_first(tessera_btree_t *t)
 {
 	if (t == NULL) return NULL;
-	tessera_btree_cursor_t *c = calloc(1, sizeof *c);
+	tessera_btree_cursor_t *c = tessera_zalloc(sizeof *c);
 	if (c == NULL) return NULL;
 	c->t = t;
 	c->depth = 0;
 	if (descend_to_leftmost(c, t->root) != TESSERA_OK) {
-		free(c);
+		tessera_free(c);
 		return NULL;
 	}
 	return c;
@@ -755,16 +754,16 @@ tessera_btree_cursor_t *
 tessera_btree_seek_at(tessera_btree_t *t, const void *key)
 {
 	if (t == NULL || key == NULL) return NULL;
-	tessera_btree_cursor_t *c = calloc(1, sizeof *c);
+	tessera_btree_cursor_t *c = tessera_zalloc(sizeof *c);
 	if (c == NULL) return NULL;
 	c->t = t;
 	uint64_t cur = t->root;
 	c->depth = 0;
 	for (;;) {
-		if (c->depth >= (int)MAX_DEPTH) { free(c); return NULL; }
+		if (c->depth >= (int)MAX_DEPTH) { tessera_free(c); return NULL; }
 		c->path_sectors[c->depth] = cur;
 		if (load_node(t, cur, c->path_blocks[c->depth]) != TESSERA_OK) {
-			free(c); return NULL;
+			tessera_free(c); return NULL;
 		}
 		tessera_btree_node_header_t h;
 		(void)read_header(c->path_blocks[c->depth], &h);
@@ -847,5 +846,5 @@ tessera_btree_cursor_next(tessera_btree_cursor_t *c)
 void
 tessera_btree_cursor_free(tessera_btree_cursor_t *c)
 {
-	free(c);
+	tessera_free(c);
 }

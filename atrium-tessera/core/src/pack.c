@@ -34,9 +34,7 @@
 #include "tessera/crc.h"
 #include "tessera/error.h"
 #include "tessera/format.h"
-
-#include <stdlib.h>
-#include <string.h>
+#include "tessera_compat.h"
 
 #define BLOB_DATA_ALIGN  64u
 #define BLOOM_BITS_PER_BLOB 10u
@@ -107,7 +105,7 @@ tessera_pack_builder_t *
 tessera_pack_begin(uint32_t pack_kind, const uint8_t pack_id[16],
                    uint64_t creator_tx_id)
 {
-	tessera_pack_builder_t *b = calloc(1, sizeof *b);
+	tessera_pack_builder_t *b = tessera_zalloc(sizeof *b);
 	if (b == NULL) return NULL;
 	b->pack_kind     = pack_kind;
 	b->creator_tx_id = creator_tx_id;
@@ -119,9 +117,9 @@ void
 tessera_pack_free(tessera_pack_builder_t *b)
 {
 	if (b == NULL) return;
-	for (size_t i = 0; i < b->count; i++) free(b->blobs[i].bytes);
-	free(b->blobs);
-	free(b);
+	for (size_t i = 0; i < b->count; i++) tessera_free(b->blobs[i].bytes);
+	tessera_free(b->blobs);
+	tessera_free(b);
 }
 
 int
@@ -134,7 +132,7 @@ tessera_pack_add_blob(tessera_pack_builder_t *b,
 		return TESSERA_EINVAL;
 	if (b->count + 1 > b->cap) {
 		size_t cap = b->cap ? b->cap * 2 : 16;
-		struct staging_blob *p = realloc(b->blobs, cap * sizeof *p);
+		struct staging_blob *p = tessera_realloc(b->blobs, cap * sizeof *p);
 		if (p == NULL) return TESSERA_ENOMEM;
 		b->blobs = p;
 		b->cap = cap;
@@ -145,7 +143,7 @@ tessera_pack_add_blob(tessera_pack_builder_t *b,
 	s->flags = flags;
 	s->bytes = NULL;
 	if (len > 0) {
-		s->bytes = malloc(len);
+		s->bytes = tessera_malloc(len);
 		if (s->bytes == NULL) return TESSERA_ENOMEM;
 		memcpy(s->bytes, bytes, len);
 	}
@@ -302,7 +300,7 @@ tessera_pack_open(const uint8_t *data, size_t len)
 {
 	if (data == NULL || len < TESSERA_SECTOR_SIZE * 2) return NULL;
 
-	tessera_pack_reader_t *r = calloc(1, sizeof *r);
+	tessera_pack_reader_t *r = tessera_zalloc(sizeof *r);
 	if (r == NULL) return NULL;
 	r->data = data;
 	r->len  = len;
@@ -329,7 +327,7 @@ tessera_pack_open(const uint8_t *data, size_t len)
 
 	return r;
 fail:
-	free(r);
+	tessera_free(r);
 	return NULL;
 }
 
@@ -386,5 +384,5 @@ tessera_pack_lookup(const tessera_pack_reader_t *r,
 void
 tessera_pack_close(tessera_pack_reader_t *r)
 {
-	free(r);
+	tessera_free(r);
 }

@@ -28,8 +28,7 @@
 #include "tessera/format.h"
 #include "tessera/journal.h"
 
-#include <stdlib.h>
-#include <string.h>
+#include "tessera_compat.h"
 
 #define DEFAULT_JOURNAL_SECTORS 256u
 
@@ -209,7 +208,7 @@ tessera_volume_open(const tessera_block_io_t *io, tessera_volume_t **out)
 	if (active->sector_size != TESSERA_SECTOR_SIZE) return TESSERA_EBADVERSION;
 	if (active->incompat_flags != 0)           return TESSERA_EINCOMPAT;
 
-	tessera_volume_t *v = calloc(1, sizeof *v);
+	tessera_volume_t *v = tessera_zalloc(sizeof *v);
 	if (v == NULL) return TESSERA_ENOMEM;
 	v->io = *io;
 	v->sb = *active;
@@ -220,7 +219,7 @@ tessera_volume_open(const tessera_block_io_t *io, tessera_volume_t **out)
 void
 tessera_volume_close(tessera_volume_t *v)
 {
-	free(v);
+	tessera_free(v);
 }
 
 /* ── accessors ───────────────────────────────────────────────────── */
