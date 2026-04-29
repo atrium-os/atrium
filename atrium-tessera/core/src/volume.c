@@ -140,35 +140,88 @@ seed_root_dirent(const tessera_block_io_t *shim,
 	tessera_manifest_free(mb);
 	if (r != TESSERA_OK) { tessera_free(mft_bytes); return r; }
 
-	/* 2. Build a one-blob pack containing the manifest. */
+	/* 1b. Optional INLINE manifest for the file's content. */
+	const int has_content = (opts->seed_content_data != NULL &&
+	                         opts->seed_content_len  > 0);
+	uint8_t *inl_bytes = NULL;
+	size_t   inl_size  = 0;
+	tessera_hash_t inl_hash;
+	memset(inl_hash, 0, sizeof inl_hash);
+	if (has_content) {
+		tessera_manifest_builder_t *ib =
+		    tessera_manifest_begin(TESSERA_MFT_INLINE);
+		if (ib == NULL) {
+			tessera_free(mft_bytes);
+			return TESSERA_ENOMEM;
+		}
+		r = tessera_manifest_set_inline(ib, opts->seed_content_data,
+		    opts->seed_content_len);
+		if (r != TESSERA_OK) {
+			tessera_manifest_free(ib);
+			tessera_free(mft_bytes);
+			return r;
+		}
+		(void)tessera_manifest_finalize(ib, NULL, 0, &inl_size, inl_hash);
+		inl_bytes = tessera_malloc(inl_size);
+		if (inl_bytes == NULL) {
+			tessera_manifest_free(ib);
+			tessera_free(mft_bytes);
+			return TESSERA_ENOMEM;
+		}
+		r = tessera_manifest_finalize(ib, inl_bytes, inl_size,
+		    &inl_size, inl_hash);
+		tessera_manifest_free(ib);
+		if (r != TESSERA_OK) {
+			tessera_free(inl_bytes);
+			tessera_free(mft_bytes);
+			return r;
+		}
+	}
+
+	/* 2. Build a pack containing the directory manifest (and the
+	 *    INLINE file-content manifest if seeded). */
 	uint8_t pack_id[16] = { 'T','S','D','0', /* recognisable in dumps */
 	                        0,0,0,0, 0,0,0,0, 0,0,0,1 };
 	tessera_pack_builder_t *pb =
 	    tessera_pack_begin(/*kind*/ 0, pack_id, /*creator_tx*/ 0);
-	if (pb == NULL) { tessera_free(mft_bytes); return TESSERA_ENOMEM; }
+	if (pb == NULL) {
+		tessera_free(inl_bytes); tessera_free(mft_bytes);
+		return TESSERA_ENOMEM;
+	}
 	r = tessera_pack_add_blob(pb, mft_hash, mft_bytes,
 	    (uint32_t)mft_size, TESSERA_BLOB_FLAG_MANIFEST);
 	if (r != TESSERA_OK) {
 		tessera_pack_free(pb);
-		tessera_free(mft_bytes);
+		tessera_free(inl_bytes); tessera_free(mft_bytes);
 		return r;
+	}
+	if (has_content) {
+		r = tessera_pack_add_blob(pb, inl_hash, inl_bytes,
+		    (uint32_t)inl_size, TESSERA_BLOB_FLAG_MANIFEST);
+		if (r != TESSERA_OK) {
+			tessera_pack_free(pb);
+			tessera_free(inl_bytes); tessera_free(mft_bytes);
+			return r;
+		}
 	}
 	size_t pack_size = 0;
 	(void)tessera_pack_finalize(pb, NULL, 0, &pack_size);
 	uint8_t *pack_bytes = tessera_malloc(pack_size);
 	if (pack_bytes == NULL) {
 		tessera_pack_free(pb);
-		tessera_free(mft_bytes);
+		tessera_free(inl_bytes); tessera_free(mft_bytes);
 		return TESSERA_ENOMEM;
 	}
 	r = tessera_pack_finalize(pb, pack_bytes, pack_size, &pack_size);
 	tessera_pack_free(pb);
 	if (r != TESSERA_OK) {
-		tessera_free(pack_bytes); tessera_free(mft_bytes);
+		tessera_free(pack_bytes);
+		tessera_free(inl_bytes); tessera_free(mft_bytes);
 		return r;
 	}
 	if ((pack_size % TESSERA_SECTOR_SIZE) != 0) {
-		tessera_free(pack_bytes); tessera_free(mft_bytes);
+		tessera_free(pack_bytes);
+		tessera_free(inl_bytes); tessera_free(mft_bytes);
 		return TESSERA_ECORRUPT;
 	}
 
@@ -177,7 +230,8 @@ seed_root_dirent(const tessera_block_io_t *shim,
 	uint64_t pack_start = 0;
 	r = tessera_extent_alloc(ea, n_sectors, &pack_start);
 	if (r != TESSERA_OK) {
-		tessera_free(pack_bytes); tessera_free(mft_bytes);
+		tessera_free(pack_bytes);
+		tessera_free(inl_bytes); tessera_free(mft_bytes);
 		return r;
 	}
 
@@ -185,7 +239,8 @@ seed_root_dirent(const tessera_block_io_t *shim,
 	for (uint64_t i = 0; i < n_sectors; i++) {
 		if (shim->write_block(shim->ctx, pack_start + i,
 		    pack_bytes + i * TESSERA_SECTOR_SIZE) != 0) {
-			tessera_free(pack_bytes); tessera_free(mft_bytes);
+			tessera_free(pack_bytes);
+			tessera_free(inl_bytes); tessera_free(mft_bytes);
 			return TESSERA_EIO;
 		}
 	}
@@ -198,20 +253,28 @@ seed_root_dirent(const tessera_block_io_t *shim,
 		memcpy(re.pack_id, pack_id, 16);
 		re.start_sector    = pack_start;
 		re.length_sectors  = n_sectors;
-		re.blob_count      = 1;
+		re.blob_count      = has_content ? 2 : 1;
 		re.pack_kind       = 0;
 		re.total_bytes     = pack_size;
 		re.create_time     = 0;
-		re.reachable_blobs = 1;
+		re.reachable_blobs = re.blob_count;
 		re.flags           = TESSERA_REGISTRY_FLAG_SEALED;
 		uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
 		r = tessera_encode_registry_entry(&re, reg_value);
-		if (r != TESSERA_OK) { tessera_free(mft_bytes); return r; }
+		if (r != TESSERA_OK) {
+			tessera_free(inl_bytes); tessera_free(mft_bytes);
+			return r;
+		}
 		r = tessera_btree_put(pack_tree, pack_id, reg_value, pack_root);
-		if (r != TESSERA_OK) { tessera_free(mft_bytes); return r; }
+		if (r != TESSERA_OK) {
+			tessera_free(inl_bytes); tessera_free(mft_bytes);
+			return r;
+		}
 	}
 
-	/* 6. Insert child inode (regular file, empty). */
+	/* 6. Insert child inode (regular file). manifest_hash + size are
+	 *    set if seed_content was provided; otherwise the file is
+	 *    empty (manifest_hash all-zero sentinel). */
 	{
 		tessera_inode_record_t ino;
 		memset(&ino, 0, sizeof ino);
@@ -219,13 +282,23 @@ seed_root_dirent(const tessera_block_io_t *shim,
 		ino.gen      = 1;
 		ino.mode     = 0100644;       /* S_IFREG | 0644 */
 		ino.nlink    = 1;
+		if (has_content) {
+			ino.size = opts->seed_content_len;
+			memcpy(ino.manifest_hash, inl_hash, 32);
+		}
 		uint8_t key[4];
 		encode_inode_key_be((uint32_t)opts->seed_dirent_inode, key);
 		uint8_t value[TESSERA_INODE_RECORD_SIZE];
 		r = tessera_encode_inode(&ino, value);
-		if (r != TESSERA_OK) { tessera_free(mft_bytes); return r; }
+		if (r != TESSERA_OK) {
+			tessera_free(inl_bytes); tessera_free(mft_bytes);
+			return r;
+		}
 		r = tessera_btree_put(inode_tree, key, value, inode_root);
-		if (r != TESSERA_OK) { tessera_free(mft_bytes); return r; }
+		if (r != TESSERA_OK) {
+			tessera_free(inl_bytes); tessera_free(mft_bytes);
+			return r;
+		}
 	}
 
 	/* 7. Re-put inode 2 with manifest_hash now pointing at the new dir. */
@@ -246,6 +319,7 @@ seed_root_dirent(const tessera_block_io_t *shim,
 		if (r != TESSERA_OK) { tessera_free(mft_bytes); return r; }
 	}
 
+	tessera_free(inl_bytes);
 	tessera_free(mft_bytes);
 	return TESSERA_OK;
 }

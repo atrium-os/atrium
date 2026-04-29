@@ -43,6 +43,7 @@ fn scenario_volume_round_trip() -> Result<(), String> {
             journal_sectors: journal_sectors as u64,
             volume_uuid:     random_uuid(&rng),
             seed_dirent_name: std::ptr::null(), seed_dirent_name_len: 0, seed_dirent_inode: 0,
+            seed_content_data: std::ptr::null(), seed_content_len: 0,
         };
         let r = unsafe { tessera_volume_format(&io, &opts) };
         if r != 0 {
@@ -526,6 +527,7 @@ fn scenario_format_crash_partial() -> Result<(), String> {
         journal_sectors: 64,
         volume_uuid:     random_uuid(&rng),
             seed_dirent_name: std::ptr::null(), seed_dirent_name_len: 0, seed_dirent_inode: 0,
+            seed_content_data: std::ptr::null(), seed_content_len: 0,
     };
     let r = unsafe { tessera_volume_format(&io, &opts) };
     if r != 0 { return Err(format!("baseline format → {r}")); }
@@ -996,6 +998,7 @@ fn scenario_format_size_boundary() -> Result<(), String> {
             journal_sectors: journal,
             volume_uuid: [0; 16],
             seed_dirent_name: std::ptr::null(), seed_dirent_name_len: 0, seed_dirent_inode: 0,
+            seed_content_data: std::ptr::null(), seed_content_len: 0,
         };
         unsafe { tessera_volume_format(&io, &opts) }
     };

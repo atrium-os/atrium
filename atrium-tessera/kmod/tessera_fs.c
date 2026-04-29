@@ -797,6 +797,75 @@ done:
 }
 
 static int
+tessera_vop_read(struct vop_read_args *ap)
+{
+	struct vnode *vp = ap->a_vp;
+	struct uio   *uio = ap->a_uio;
+	struct tessera_node *tn = VTOTNODE(vp);
+	struct tessera_mount *tmp_ = VFSTOTESSERA(vp->v_mount);
+	int err = 0;
+
+	if (vp->v_type == VDIR) return (EISDIR);
+	if (vp->v_type != VREG && vp->v_type != VNON) return (EINVAL);
+	if (uio->uio_offset < 0) return (EINVAL);
+	if (uio->uio_resid == 0) return (0);
+	if (tmp_->inode_tree == NULL) return (EIO);
+
+	/* Read the inode record. */
+	uint8_t key[4];
+	tessera_inode_record_t ino;
+	encode_inode_key((uint32_t)tn->inode_no, key);
+	if (tessera_btree_get(tmp_->inode_tree, key, &ino) != TESSERA_OK)
+		return (EIO);
+
+	/* Empty file or read past EOF. */
+	if ((uint64_t)uio->uio_offset >= ino.size) return (0);
+	if (tessera_hash_is_null(ino.manifest_hash)) return (0);
+
+	/* Fetch + parse the manifest. */
+	uint8_t *blob = NULL;
+	uint32_t blob_len = 0;
+	if (tessera_fs_fetch_blob(tmp_, ino.manifest_hash, &blob, &blob_len)
+	    != 0)
+		return (EIO);
+	tessera_manifest_parser_t *p = tessera_manifest_parse(blob, blob_len);
+	if (p == NULL) {
+		free(blob, M_TESSERA);
+		return (EIO);
+	}
+
+	const tessera_manifest_kind_t kind =
+	    tessera_manifest_parser_kind(p);
+	if (kind == TESSERA_MFT_INLINE) {
+		const uint8_t *data = NULL;
+		size_t data_len = 0;
+		if (tessera_manifest_inline_data(p, &data, &data_len)
+		    != TESSERA_OK || data == NULL) {
+			err = EIO;
+			goto out;
+		}
+		/* Clamp to inode.size in case the manifest is longer. */
+		if (data_len > ino.size) data_len = (size_t)ino.size;
+		if ((uint64_t)uio->uio_offset >= data_len) goto out;
+
+		size_t remaining = data_len - (size_t)uio->uio_offset;
+		size_t n = (uio->uio_resid < (ssize_t)remaining)
+		    ? (size_t)uio->uio_resid : remaining;
+		err = uiomove(__DECONST(void *, data + uio->uio_offset),
+		    n, uio);
+	} else if (kind == TESSERA_MFT_CHUNK_LIST ||
+	           kind == TESSERA_MFT_CHUNK_TREE) {
+		err = EOPNOTSUPP;     /* round 5b */
+	} else {
+		err = EIO;
+	}
+out:
+	tessera_manifest_parser_free(p);
+	free(blob, M_TESSERA);
+	return (err);
+}
+
+static int
 tessera_vop_open(struct vop_open_args *ap)
 { (void)ap; return (0); }
 
@@ -926,6 +995,7 @@ struct vop_vector tessera_vnodeops = {
 	.vop_getattr = tessera_vop_getattr,
 	.vop_lookup  = tessera_vop_lookup,
 	.vop_readdir = tessera_vop_readdir,
+	.vop_read    = tessera_vop_read,
 	.vop_open    = tessera_vop_open,
 	.vop_close   = tessera_vop_close,
 	.vop_reclaim = tessera_vop_reclaim,

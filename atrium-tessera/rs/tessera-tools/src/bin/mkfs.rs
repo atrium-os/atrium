@@ -31,12 +31,13 @@ struct Args {
     create: Option<u64>, /* size in MiB if --create */
     seed_name: Option<String>,
     seed_inode: u64,
+    seed_content: Option<String>,
 }
 
 fn parse_args() -> Args {
     let mut a = Args {
         path: String::new(), journal_sectors: 256, create: None,
-        seed_name: None, seed_inode: 1000,
+        seed_name: None, seed_inode: 1000, seed_content: None,
     };
     let argv: Vec<_> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -63,6 +64,11 @@ fn parse_args() -> Args {
                 i += 1;
                 if i >= argv.len() { usage(); }
                 a.seed_inode = argv[i].parse().unwrap_or_else(|_| usage());
+            }
+            "--seed-content" => {
+                i += 1;
+                if i >= argv.len() { usage(); }
+                a.seed_content = Some(argv[i].clone());
             }
             "-h" | "--help" => usage(),
             arg if !arg.starts_with('-') => a.path = arg.to_string(),
@@ -104,12 +110,18 @@ fn run() -> Result<(), String> {
     let mut ctx = DiskCtx { fd: fd_of(&f) };
     let io = make_io(&mut ctx);
 
-    /* Seed-name bytes must outlive the format call. */
+    /* Seed-name and seed-content bytes must outlive the format call. */
     let seed_bytes: Option<Vec<u8>> = args.seed_name.as_ref()
         .map(|s| s.as_bytes().to_vec());
     let (seed_ptr, seed_len) = match &seed_bytes {
         Some(b) => (b.as_ptr(), b.len() as u16),
         None    => (std::ptr::null(), 0u16),
+    };
+    let content_bytes: Option<Vec<u8>> = args.seed_content.as_ref()
+        .map(|s| s.as_bytes().to_vec());
+    let (content_ptr, content_len) = match &content_bytes {
+        Some(b) => (b.as_ptr(), b.len()),
+        None    => (std::ptr::null(), 0usize),
     };
 
     let opts = tessera_format_opts_t {
@@ -119,6 +131,8 @@ fn run() -> Result<(), String> {
         seed_dirent_name:     seed_ptr,
         seed_dirent_name_len: seed_len,
         seed_dirent_inode:    args.seed_inode,
+        seed_content_data:    content_ptr,
+        seed_content_len:     content_len,
     };
     let r = unsafe { tessera_volume_format(&io, &opts) };
     if r != 0 {
@@ -131,7 +145,8 @@ fn run() -> Result<(), String> {
     println!("  journal_sectors: {}", args.journal_sectors);
     println!("  uuid:            {}", format_uuid(&uuid));
     if let Some(ref name) = args.seed_name {
-        println!("  seeded:          /{} -> inode {}", name, args.seed_inode);
+        println!("  seeded:          /{} -> inode {} ({} bytes content)",
+            name, args.seed_inode, content_len);
     }
     Ok(())
 }

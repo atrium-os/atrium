@@ -64,6 +64,8 @@ pub struct tessera_format_opts_t {
     pub seed_dirent_name:     *const u8,    /* NULL = no seed */
     pub seed_dirent_name_len: u16,
     pub seed_dirent_inode:    u64,
+    pub seed_content_data:    *const u8,    /* NULL = empty file */
+    pub seed_content_len:     usize,
 }
 
 /* ── B+tree ──────────────────────────────────────────────────── */

@@ -48,6 +48,14 @@ typedef struct {
 	const char *seed_dirent_name;
 	uint16_t    seed_dirent_name_len;
 	uint64_t    seed_dirent_inode;     /* must be >= TESSERA_INODE_FIRST_USER */
+
+	/* Optional: pre-populate the seeded file's content. If
+	 * seed_content_len is 0 (default) the file is empty
+	 * (manifest_hash all zero). If non-zero, an INLINE manifest is
+	 * published in the same initial pack and the seeded file's
+	 * inode points at it with size = seed_content_len. */
+	const uint8_t *seed_content_data;
+	size_t         seed_content_len;
 } tessera_format_opts_t;
 
 /* Reserved metadata-zone size, in sectors, immediately after the
