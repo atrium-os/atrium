@@ -41,6 +41,7 @@
 #include <geom/geom.h>
 #include <geom/geom_vfs.h>
 
+#include "tessera/btree.h"
 #include "tessera/codec.h"
 #include "tessera/error.h"
 #include "tessera/format.h"
@@ -48,13 +49,62 @@
 
 MALLOC_DEFINE(M_TESSERA, "tessera", "Tessera filesystem");
 
+/* ── kmod block_io shim ──────────────────────────────────────── */
+
+/* tessera-core's primitives talk to "disk" via tessera_block_io_t.
+ * In kernel mode we back it with bread/bwrite via the GEOM consumer.
+ * For round-3 read-only use the alloc/free callbacks are stubs;
+ * round-4 will wire alloc to tessera_extent_alloc against the
+ * volume's free-extent tree. */
+
+struct tessera_kbio_ctx {
+	struct vnode *devvp;
+	struct ucred *cred;
+};
+
+static int
+tessera_kbio_read(void *ctx, uint64_t sector, uint8_t *out)
+{
+	struct tessera_kbio_ctx *k = ctx;
+	struct buf *bp = NULL;
+	int err = bread(k->devvp, sector * btodb(TESSERA_SECTOR_SIZE),
+	    TESSERA_SECTOR_SIZE, k->cred ? k->cred : NOCRED, &bp);
+	if (err != 0) { if (bp != NULL) brelse(bp); return (-1); }
+	memcpy(out, bp->b_data, TESSERA_SECTOR_SIZE);
+	brelse(bp);
+	return (0);
+}
+
+static int
+tessera_kbio_write(void *ctx, uint64_t sector, const uint8_t *buf)
+{
+	struct tessera_kbio_ctx *k = ctx;
+	struct buf *bp = getblk(k->devvp, sector * btodb(TESSERA_SECTOR_SIZE),
+	    TESSERA_SECTOR_SIZE, 0, 0, 0);
+	if (bp == NULL) return (-1);
+	bzero(bp->b_data, TESSERA_SECTOR_SIZE);
+	memcpy(bp->b_data, buf, TESSERA_SECTOR_SIZE);
+	return (bwrite(bp));
+}
+
+static int
+tessera_kbio_alloc(void *ctx, uint64_t n, uint64_t *out_sector)
+{ (void)ctx; (void)n; (void)out_sector; return (-1); }
+
+static int
+tessera_kbio_free(void *ctx, uint64_t s, uint64_t n)
+{ (void)ctx; (void)s; (void)n; return (0); }
+
 /* ── per-mount state ─────────────────────────────────────────── */
 
 struct tessera_mount {
-	struct vnode         *devvp;     /* the block-device vnode */
-	struct g_consumer    *cp;        /* GEOM consumer for I/O */
-	struct cdev          *dev;
-	tessera_superblock_t  sb;
+	struct vnode             *devvp;     /* the block-device vnode */
+	struct g_consumer        *cp;        /* GEOM consumer for I/O */
+	struct cdev              *dev;
+	tessera_superblock_t      sb;
+	struct tessera_kbio_ctx   bio_ctx;
+	tessera_block_io_t        bio;
+	tessera_btree_t          *inode_tree;
 };
 
 #define VFSTOTESSERA(mp) ((struct tessera_mount *)((mp)->mnt_data))
@@ -199,6 +249,25 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp)
 	tmp_->dev   = dev;
 	tmp_->sb    = *active;
 
+	/* Wire the kmod block_io shim and open the inode tree against it.
+	 * If the tree open fails (e.g. corrupted root sector) we still
+	 * mount — the synthesized root vnode lets `df` / `umount` work
+	 * for diagnostic purposes. */
+	tmp_->bio_ctx.devvp = devvp;
+	tmp_->bio_ctx.cred  = curthread->td_ucred;
+	tmp_->bio.read_block  = tessera_kbio_read;
+	tmp_->bio.write_block = tessera_kbio_write;
+	tmp_->bio.alloc       = tessera_kbio_alloc;
+	tmp_->bio.free        = tessera_kbio_free;
+	tmp_->bio.ctx         = &tmp_->bio_ctx;
+	tmp_->inode_tree = tessera_btree_open(&tmp_->bio,
+	    tmp_->sb.inode_root, /*tree_kind*/ 0,
+	    /*key*/ 4, /*value*/ TESSERA_INODE_RECORD_SIZE);
+	if (tmp_->inode_tree == NULL)
+		printf("tessera_fs: warning — inode tree open at sector %lu "
+		    "failed; root will be synthesized\n",
+		    (unsigned long)tmp_->sb.inode_root);
+
 	mp->mnt_data = tmp_;
 	mp->mnt_stat.f_namemax = TESSERA_PATH_NAME_MAX;
 	mp->mnt_flag |= MNT_LOCAL | MNT_RDONLY;
@@ -283,6 +352,8 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 	if (err != 0) return (err);
 
 	if (tmp_ != NULL) {
+		if (tmp_->inode_tree != NULL)
+			tessera_btree_close(tmp_->inode_tree);
 		if (tmp_->cp != NULL) {
 			g_topology_lock();
 			g_vfs_close(tmp_->cp);
@@ -386,26 +457,72 @@ tessera_vop_access(struct vop_access_args *ap)
 	return (0);
 }
 
+static void
+encode_inode_key(uint32_t inode_no, uint8_t out[4])
+{
+	/* Big-endian — makes the B+tree's memcmp ordering match numeric
+	 * ordering of inode numbers. */
+	out[0] = (uint8_t)(inode_no >> 24);
+	out[1] = (uint8_t)(inode_no >> 16);
+	out[2] = (uint8_t)(inode_no >>  8);
+	out[3] = (uint8_t)(inode_no      );
+}
+
 static int
 tessera_vop_getattr(struct vop_getattr_args *ap)
 {
 	struct vnode *vp = ap->a_vp;
 	struct vattr *vap = ap->a_vap;
 	struct tessera_node *tn = VTOTNODE(vp);
+	struct tessera_mount *tmp_ = VFSTOTESSERA(vp->v_mount);
 
 	VATTR_NULL(vap);
-	vap->va_type      = VDIR;
-	vap->va_mode      = 0755;
-	vap->va_nlink     = 2;
-	vap->va_uid       = 0;
-	vap->va_gid       = 0;
 	vap->va_fsid      = vp->v_mount->mnt_stat.f_fsid.val[0];
 	vap->va_fileid    = tn->inode_no;
-	vap->va_size      = 0;
 	vap->va_blocksize = TESSERA_SECTOR_SIZE;
-	vap->va_bytes     = 0;
-	vap->va_gen       = 1;
-	vap->va_flags     = 0;
+
+	/* Try to read the on-disk inode record. ENOENT fall-through means
+	 * the volume hasn't had inode 2 populated yet (mkfs work pending
+	 * for round 3c) — return synthesized empty-root attrs so the
+	 * mount stays usable for diagnostic stat/df. */
+	int read_real = 0;
+	if (tmp_->inode_tree != NULL) {
+		uint8_t key[4];
+		tessera_inode_record_t ino;
+		encode_inode_key((uint32_t)tn->inode_no, key);
+		int rc = tessera_btree_get(tmp_->inode_tree, key, &ino);
+		if (rc == TESSERA_OK) {
+			vap->va_type  = VDIR;          /* round 3c: from mode */
+			vap->va_mode  = ino.mode & 07777;
+			vap->va_nlink = ino.nlink ? ino.nlink : 2;
+			vap->va_uid   = ino.uid;
+			vap->va_gid   = ino.gid;
+			vap->va_size  = ino.size;
+			vap->va_atime.tv_sec  =  ino.atime_ns / 1000000000ULL;
+			vap->va_atime.tv_nsec = ino.atime_ns % 1000000000ULL;
+			vap->va_mtime.tv_sec  =  ino.mtime_ns / 1000000000ULL;
+			vap->va_mtime.tv_nsec = ino.mtime_ns % 1000000000ULL;
+			vap->va_ctime.tv_sec  =  ino.ctime_ns / 1000000000ULL;
+			vap->va_ctime.tv_nsec = ino.ctime_ns % 1000000000ULL;
+			vap->va_birthtime.tv_sec  = ino.btime_ns / 1000000000ULL;
+			vap->va_birthtime.tv_nsec = ino.btime_ns % 1000000000ULL;
+			vap->va_gen   = ino.gen ? ino.gen : 1;
+			vap->va_flags = ino.flags;
+			vap->va_bytes = 0;
+			read_real = 1;
+		}
+	}
+	if (!read_real) {
+		vap->va_type  = VDIR;
+		vap->va_mode  = 0755;
+		vap->va_nlink = 2;
+		vap->va_uid   = 0;
+		vap->va_gid   = 0;
+		vap->va_size  = 0;
+		vap->va_bytes = 0;
+		vap->va_gen   = 1;
+		vap->va_flags = 0;
+	}
 	return (0);
 }
 
