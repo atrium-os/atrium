@@ -2,14 +2,22 @@
  * tessera_fs: FreeBSD VFS module for the Tessera content-addressed
  * filesystem.
  *
- * Phase 4 round 1: VFS-plumbing skeleton — registers the "tessera" VFS,
- * supports `mount -t tessera dummy /mnt/x` with no backing store, and
- * exposes a synthesized empty root directory. Round 2 adds the real
- * file-backed mount via the canonical FreeBSD mdconfig + g_vfs_open
- * path.
+ * Phase 4 round 2: real backing-block-device mount.
  *
- * Spec: docs/spec/tessera-fs.md (on-disk format)
- *       docs/spec/tessera-vfs.md (POSIX mapping)
+ *   Mount accepts a "from" path naming a block device (typically a
+ *   /dev/mdN created by mdconfig(8) wrapping a Tessera image file
+ *   produced by mkfs-tessera(1)). We resolve it via namei, verify it
+ *   IS a block device, attach via g_vfs_open, then read sector 0
+ *   (and 1 as fallback) via bread() and decode the superblock with
+ *   tessera_decode_superblock. Subsequent rounds use the same
+ *   bread() path for tree walks.
+ *
+ *   Synthesized empty root directory is unchanged from round 1; the
+ *   tree-walk code that fills it in lands once the inode B+tree path
+ *   is wired up.
+ *
+ *   Spec: docs/spec/tessera-fs.md (on-disk format)
+ *         docs/spec/tessera-vfs.md (POSIX mapping)
  */
 
 #include <sys/param.h>
@@ -26,7 +34,15 @@
 #include <sys/malloc.h>
 #include <sys/uio.h>
 #include <sys/types.h>
+#include <sys/buf.h>
+#include <sys/conf.h>
+#include <sys/priv.h>
+#include <sys/fcntl.h>
+#include <geom/geom.h>
+#include <geom/geom_vfs.h>
 
+#include "tessera/codec.h"
+#include "tessera/error.h"
 #include "tessera/format.h"
 #include "tessera/volume.h"
 
@@ -35,9 +51,10 @@ MALLOC_DEFINE(M_TESSERA, "tessera", "Tessera filesystem");
 /* ── per-mount state ─────────────────────────────────────────── */
 
 struct tessera_mount {
-	uint64_t  total_sectors;
-	uint64_t  pack_zone_length;
-	uint64_t  generation;
+	struct vnode         *devvp;     /* the block-device vnode */
+	struct g_consumer    *cp;        /* GEOM consumer for I/O */
+	struct cdev          *dev;
+	tessera_superblock_t  sb;
 };
 
 #define VFSTOTESSERA(mp) ((struct tessera_mount *)((mp)->mnt_data))
@@ -52,34 +69,152 @@ struct tessera_node {
 
 extern struct vop_vector tessera_vnodeops;
 
-/* ── vfs_mount ───────────────────────────────────────────────── */
+/* ── superblock loader ───────────────────────────────────────── */
+
+/* Read the superblock at sector `which` (0 for SB-A, 1 for SB-B).
+ * Decodes into out_sb on success; returns 0 + valid SB, or non-zero. */
+static int
+tessera_load_sb(struct vnode *devvp, uint64_t which,
+                tessera_superblock_t *out_sb)
+{
+	struct buf *bp = NULL;
+	int err;
+
+	err = bread(devvp, which * btodb(TESSERA_SECTOR_SIZE),
+	    TESSERA_SECTOR_SIZE, NOCRED, &bp);
+	if (err != 0) {
+		if (bp != NULL) brelse(bp);
+		return (err);
+	}
+	int rc = tessera_decode_superblock((const uint8_t *)bp->b_data, out_sb);
+	brelse(bp);
+	if (rc != TESSERA_OK) return (EIO);
+	return (0);
+}
+
+/* ── core mount: open device + decode SB ─────────────────────── */
 
 static int
-tessera_mount_impl(struct mount *mp)
+tessera_mountfs(struct vnode *devvp, struct mount *mp)
 {
 	struct tessera_mount *tmp_;
+	struct g_consumer    *cp = NULL;
+	struct cdev          *dev = devvp->v_rdev;
+	struct bufobj        *bo;
+	tessera_superblock_t  sb_a, sb_b, *active = NULL;
+	int err;
 
-	if (mp->mnt_flag & MNT_UPDATE)
-		return (EOPNOTSUPP);
+	dev_ref(dev);
+	g_topology_lock();
+	err = g_vfs_open(devvp, &cp, "tessera", 0);
+	g_topology_unlock();
+	VOP_UNLOCK(devvp);
+	if (err != 0) {
+		dev_rel(dev);
+		return (err);
+	}
+
+	if (cp->provider->sectorsize > TESSERA_SECTOR_SIZE ||
+	    (TESSERA_SECTOR_SIZE % cp->provider->sectorsize) != 0) {
+		err = EINVAL;
+		goto fail_close;
+	}
+
+	bo = &devvp->v_bufobj;
+
+	int valid_a = (tessera_load_sb(devvp, 0, &sb_a) == 0);
+	int valid_b = (tessera_load_sb(devvp, 1, &sb_b) == 0);
+	if (!valid_a && !valid_b) {
+		printf("tessera_fs: neither superblock decoded; refusing to mount\n");
+		err = EINVAL;
+		goto fail_close;
+	}
+	if (valid_a && valid_b)
+		active = (sb_a.generation >= sb_b.generation) ? &sb_a : &sb_b;
+	else
+		active = valid_a ? &sb_a : &sb_b;
+
+	if (active->version_major != 1 ||
+	    active->sector_size  != TESSERA_SECTOR_SIZE) {
+		printf("tessera_fs: unsupported version/sector_size\n");
+		err = EINVAL;
+		goto fail_close;
+	}
 
 	tmp_ = malloc(sizeof(*tmp_), M_TESSERA, M_WAITOK | M_ZERO);
-	/* Round 1: hardcode plausible volume parameters. Round 2 reads
-	 * these from the on-disk superblock of a backing image. */
-	tmp_->total_sectors    = 4096;
-	tmp_->pack_zone_length = 4096 - (4 + 256 + TESSERA_METADATA_ZONE_SECTORS);
-	tmp_->generation       = 1;
+	tmp_->devvp = devvp;
+	tmp_->cp    = cp;
+	tmp_->dev   = dev;
+	tmp_->sb    = *active;
 
 	mp->mnt_data = tmp_;
+	mp->mnt_stat.f_namemax = TESSERA_PATH_NAME_MAX;
 	mp->mnt_flag |= MNT_LOCAL | MNT_RDONLY;
 	MNT_ILOCK(mp);
 	mp->mnt_kern_flag |= MNTK_LOOKUP_SHARED | MNTK_EXTENDED_SHARED;
 	MNT_IUNLOCK(mp);
 
-	vfs_getnewfsid(mp);
-	vfs_mountedfrom(mp, "tessera");
+	if (devvp->v_rdev->si_iosize_max != 0)
+		mp->mnt_iosize_max = devvp->v_rdev->si_iosize_max;
+	if (mp->mnt_iosize_max > maxphys)
+		mp->mnt_iosize_max = maxphys;
 
-	printf("tessera_fs: mounted (placeholder volume) on %s\n",
-	    mp->mnt_stat.f_mntonname);
+	(void)bo;
+	printf("tessera_fs: mounted gen=%lu, %lu sectors\n",
+	    (unsigned long)tmp_->sb.generation,
+	    (unsigned long)tmp_->sb.total_sectors);
+	return (0);
+
+fail_close:
+	g_topology_lock();
+	g_vfs_close(cp);
+	g_topology_unlock();
+	dev_rel(dev);
+	return (err);
+}
+
+/* ── vfs_mount ───────────────────────────────────────────────── */
+
+static int
+tessera_mount_impl(struct mount *mp)
+{
+	struct vnode *devvp;
+	struct nameidata ndp;
+	struct thread *td = curthread;
+	char *fspec;
+	int err;
+
+	if (mp->mnt_flag & MNT_UPDATE)
+		return (EOPNOTSUPP);
+
+	fspec = vfs_getopts(mp->mnt_optnew, "from", &err);
+	if (err != 0) return (err);
+
+	NDINIT(&ndp, LOOKUP, FOLLOW | LOCKLEAF, UIO_SYSSPACE, fspec);
+	err = namei(&ndp);
+	if (err != 0) return (err);
+	NDFREE_PNBUF(&ndp);
+	devvp = ndp.ni_vp;
+
+	if (!vn_isdisk_error(devvp, &err)) {
+		vput(devvp);
+		return (err);
+	}
+
+	err = VOP_ACCESS(devvp, VREAD, td->td_ucred, td);
+	if (err != 0)
+		err = priv_check(td, PRIV_VFS_MOUNT_PERM);
+	if (err != 0) {
+		vput(devvp);
+		return (err);
+	}
+
+	err = tessera_mountfs(devvp, mp);
+	if (err != 0) {
+		vrele(devvp);
+		return (err);
+	}
+	vfs_mountedfrom(mp, fspec);
 	return (0);
 }
 
@@ -92,13 +227,17 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 	int flags = 0, err;
 
 	if (mntflags & MNT_FORCE) flags |= FORCECLOSE;
-	/* rootrefs=0: VFS_ROOT allocates the root vnode lazily on each
-	 * call rather than holding one for the lifetime of the mount, so
-	 * vflush has no extra refs to drop. */
 	err = vflush(mp, 0, flags, curthread);
 	if (err != 0) return (err);
 
 	if (tmp_ != NULL) {
+		if (tmp_->cp != NULL) {
+			g_topology_lock();
+			g_vfs_close(tmp_->cp);
+			g_topology_unlock();
+		}
+		if (tmp_->devvp != NULL) vrele(tmp_->devvp);
+		if (tmp_->dev != NULL)   dev_rel(tmp_->dev);
 		free(tmp_, M_TESSERA);
 		mp->mnt_data = NULL;
 	}
@@ -122,8 +261,8 @@ tessera_root_impl(struct mount *mp, int flags, struct vnode **vpp)
 	tn = malloc(sizeof(*tn), M_TESSERA, M_WAITOK | M_ZERO);
 	tn->inode_no = TESSERA_INODE_ROOT_DIR;
 
-	vp->v_data = tn;
-	vp->v_type = VDIR;
+	vp->v_data  = tn;
+	vp->v_type  = VDIR;
 	vp->v_vflag |= VV_ROOT;
 	VN_LOCK_ASHARE(vp);
 
@@ -137,7 +276,6 @@ tessera_root_impl(struct mount *mp, int flags, struct vnode **vpp)
 		return (err);
 	}
 	vn_set_state(vp, VSTATE_CONSTRUCTED);
-
 	*vpp = vp;
 	return (0);
 }
@@ -151,9 +289,9 @@ tessera_statfs_impl(struct mount *mp, struct statfs *sbp)
 
 	sbp->f_bsize  = TESSERA_SECTOR_SIZE;
 	sbp->f_iosize = TESSERA_SECTOR_SIZE;
-	sbp->f_blocks = tmp_->total_sectors;
-	sbp->f_bfree  = tmp_->pack_zone_length;
-	sbp->f_bavail = tmp_->pack_zone_length;
+	sbp->f_blocks = tmp_->sb.total_sectors;
+	sbp->f_bfree  = tmp_->sb.pack_zone_length;
+	sbp->f_bavail = tmp_->sb.pack_zone_length;
 	sbp->f_files  = 0;
 	sbp->f_ffree  = 0;
 	return (0);
@@ -204,18 +342,18 @@ tessera_vop_getattr(struct vop_getattr_args *ap)
 	struct tessera_node *tn = VTOTNODE(vp);
 
 	VATTR_NULL(vap);
-	vap->va_type    = VDIR;
-	vap->va_mode    = 0755;
-	vap->va_nlink   = 2;
-	vap->va_uid     = 0;
-	vap->va_gid     = 0;
-	vap->va_fsid    = vp->v_mount->mnt_stat.f_fsid.val[0];
-	vap->va_fileid  = tn->inode_no;
-	vap->va_size    = 0;
+	vap->va_type      = VDIR;
+	vap->va_mode      = 0755;
+	vap->va_nlink     = 2;
+	vap->va_uid       = 0;
+	vap->va_gid       = 0;
+	vap->va_fsid      = vp->v_mount->mnt_stat.f_fsid.val[0];
+	vap->va_fileid    = tn->inode_no;
+	vap->va_size      = 0;
 	vap->va_blocksize = TESSERA_SECTOR_SIZE;
-	vap->va_bytes   = 0;
-	vap->va_gen     = 1;
-	vap->va_flags   = 0;
+	vap->va_bytes     = 0;
+	vap->va_gen       = 1;
+	vap->va_flags     = 0;
 	return (0);
 }
 
@@ -240,20 +378,13 @@ tessera_vop_lookup(struct vop_lookup_args *ap)
 	return (ENOENT);
 }
 
-/*
- * dirent record sizing — both "." and ".." encode into the smallest
- * valid record that fits the GENERIC_DIRSIZ alignment (8). The bytes
- * after the name (within the d_reclen window) must be zeroed; we use
- * a stack buffer at the maximum supported reclen and fill the right
- * prefix.
- */
 #define DIRENT_HDR  offsetof(struct dirent, d_name)
 
 static size_t
 tessera_dirent_reclen(uint16_t namlen)
 {
-	size_t need = DIRENT_HDR + namlen + 1;     /* name + NUL */
-	return ((need + 7) & ~7);                   /* 8-byte align */
+	size_t need = DIRENT_HDR + namlen + 1;
+	return ((need + 7) & ~7);
 }
 
 static int
@@ -282,8 +413,8 @@ tessera_vop_readdir(struct vop_readdir_args *ap)
 	struct tessera_node *tn = VTOTNODE(ap->a_vp);
 	int err;
 
-	const size_t r1 = tessera_dirent_reclen(1);   /* "." */
-	const size_t r2 = tessera_dirent_reclen(2);   /* ".." */
+	const size_t r1 = tessera_dirent_reclen(1);
+	const size_t r2 = tessera_dirent_reclen(2);
 
 	if (uio->uio_offset == 0 && uio->uio_resid >= r1) {
 		err = tessera_emit_dirent(uio, tn->inode_no, DT_DIR, ".", 1);
@@ -319,14 +450,14 @@ tessera_vop_reclaim(struct vop_reclaim_args *ap)
 }
 
 struct vop_vector tessera_vnodeops = {
-	.vop_default     = &default_vnodeops,
-	.vop_access      = tessera_vop_access,
-	.vop_getattr     = tessera_vop_getattr,
-	.vop_lookup      = tessera_vop_lookup,
-	.vop_readdir     = tessera_vop_readdir,
-	.vop_open        = tessera_vop_open,
-	.vop_close       = tessera_vop_close,
-	.vop_reclaim     = tessera_vop_reclaim,
+	.vop_default = &default_vnodeops,
+	.vop_access  = tessera_vop_access,
+	.vop_getattr = tessera_vop_getattr,
+	.vop_lookup  = tessera_vop_lookup,
+	.vop_readdir = tessera_vop_readdir,
+	.vop_open    = tessera_vop_open,
+	.vop_close   = tessera_vop_close,
+	.vop_reclaim = tessera_vop_reclaim,
 };
 VFS_VOP_VECTOR_REGISTER(tessera_vnodeops);
 
