@@ -45,6 +45,8 @@
 #include "tessera/codec.h"
 #include "tessera/error.h"
 #include "tessera/format.h"
+#include "tessera/manifest.h"
+#include "tessera/pack.h"
 #include "tessera/volume.h"
 
 MALLOC_DEFINE(M_TESSERA, "tessera", "Tessera filesystem");
@@ -105,6 +107,7 @@ struct tessera_mount {
 	struct tessera_kbio_ctx   bio_ctx;
 	tessera_block_io_t        bio;
 	tessera_btree_t          *inode_tree;
+	tessera_btree_t          *pack_registry_tree;
 };
 
 #define VFSTOTESSERA(mp) ((struct tessera_mount *)((mp)->mnt_data))
@@ -268,6 +271,14 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp)
 		    "failed; root will be synthesized\n",
 		    (unsigned long)tmp_->sb.inode_root);
 
+	tmp_->pack_registry_tree = tessera_btree_open(&tmp_->bio,
+	    tmp_->sb.pack_registry_root, /*tree_kind*/ 1,
+	    /*key*/ 16, /*value*/ TESSERA_REGISTRY_ENTRY_SIZE);
+	if (tmp_->pack_registry_tree == NULL)
+		printf("tessera_fs: warning — pack registry open at sector %lu "
+		    "failed; blob lookups will fail\n",
+		    (unsigned long)tmp_->sb.pack_registry_root);
+
 	mp->mnt_data = tmp_;
 	mp->mnt_stat.f_namemax = TESSERA_PATH_NAME_MAX;
 	mp->mnt_flag |= MNT_LOCAL | MNT_RDONLY;
@@ -352,6 +363,8 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 	if (err != 0) return (err);
 
 	if (tmp_ != NULL) {
+		if (tmp_->pack_registry_tree != NULL)
+			tessera_btree_close(tmp_->pack_registry_tree);
 		if (tmp_->inode_tree != NULL)
 			tessera_btree_close(tmp_->inode_tree);
 		if (tmp_->cp != NULL) {
