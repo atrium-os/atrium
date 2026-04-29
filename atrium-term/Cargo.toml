@@ -1,0 +1,19 @@
+[package]
+name = "atrium-term"
+version = "0.1.0"
+edition = "2021"
+description = "Terminal emulator on the Fresco scenegraph protocol — first vertical app, no toolkit"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "atrium-term"
+path = "src/main.rs"
+
+[dependencies]
+fresco-rs = { path = "../fresco-rs" }
+fresco-text = { path = "../fresco-text" }
+libc = "0.2"
+vte = "0.13"
+swash = "0.1"
+ttf-parser = "0.25"

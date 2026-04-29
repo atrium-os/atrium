@@ -1,0 +1,17 @@
+[package]
+name = "atrium-edit"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal text editor on Fresco — second vertical app"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "atrium-edit"
+path = "src/main.rs"
+
+[dependencies]
+fresco-rs = { path = "../fresco-rs" }
+libc = "0.2"
+swash = "0.1"
+ttf-parser = "0.25"

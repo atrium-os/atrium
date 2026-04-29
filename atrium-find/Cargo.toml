@@ -1,0 +1,17 @@
+[package]
+name = "atrium-find"
+version = "0.1.0"
+edition = "2021"
+description = "Two-pane file browser on Fresco — third vertical app"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "atrium-find"
+path = "src/main.rs"
+
+[dependencies]
+fresco-rs = { path = "../fresco-rs" }
+libc = "0.2"
+swash = "0.1"
+ttf-parser = "0.25"

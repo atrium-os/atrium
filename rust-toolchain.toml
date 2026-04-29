@@ -1,0 +1,7 @@
+# Pin nightly + rust-src for build-std support across all crates in this
+# tree. rust-src is needed because aarch64-unknown-freebsd is a Tier-3
+# target — rustup doesn't ship prebuilt std for it, so we rebuild std
+# from source on first cross-compile.
+[toolchain]
+channel = "nightly"
+components = ["rust-src"]

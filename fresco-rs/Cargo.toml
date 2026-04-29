@@ -1,0 +1,53 @@
+[package]
+name = "fresco-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Safe Rust bindings for libfresco — the Fresco scenegraph protocol"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "fresco_rs"
+path = "src/lib.rs"
+
+[[example]]
+name = "hello_rect"
+path = "examples/hello_rect.rs"
+
+[[example]]
+name = "textured_quad"
+path = "examples/textured_quad.rs"
+
+[[example]]
+name = "image_viewer"
+path = "examples/image_viewer.rs"
+required-features = ["image-decode"]
+
+[[example]]
+name = "hello_text"
+path = "examples/hello_text.rs"
+
+[[example]]
+name = "window_lifecycle"
+path = "examples/window_lifecycle.rs"
+
+[[example]]
+name = "window_slot_routing"
+path = "examples/window_slot_routing.rs"
+
+[[example]]
+name = "two_windows"
+path = "examples/two_windows.rs"
+
+[[example]]
+name = "event_target"
+path = "examples/event_target.rs"
+
+[dependencies]
+image = { version = "0.25", optional = true, default-features = false, features = ["png", "jpeg"] }
+fresco-text = { path = "../fresco-text" }
+
+[features]
+image-decode = ["dep:image"]
+
+[build-dependencies]

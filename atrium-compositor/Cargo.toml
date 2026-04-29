@@ -1,0 +1,19 @@
+[package]
+name = "atrium-compositor"
+version = "0.1.0"
+edition = "2021"
+description = "First-light native FreeBSD compositor demo for D1 — tiny-skia rendering, atrium-gpu-rs scanout, animated clock"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "atrium-compositor"
+path = "src/main.rs"
+
+[dependencies]
+atrium-gpu-rs = { path = "../atrium-gpu-rs" }
+fresco-server = { path = "../../fresco-server", features = ["tiny-skia-backend"] }
+tiny-skia = "0.11"
+libc = "0.2"
+bytemuck = "1"
+env_logger = "0.11"

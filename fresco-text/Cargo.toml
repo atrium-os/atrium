@@ -1,0 +1,20 @@
+[package]
+name = "fresco-text"
+version = "0.1.0"
+edition = "2021"
+description = "Text shaping + rasterization for the Fresco scenegraph protocol"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "fresco_text"
+path = "src/lib.rs"
+
+# Pure-Rust shaping (rustybuzz, a HarfBuzz reimpl) + pure-Rust
+# rasterization (swash). Both depend on ttf-parser only — no
+# system text libraries (fontconfig, freetype, etc.). That's the
+# "BSD-native, no Linux/GNU baggage" stance.
+[dependencies]
+rustybuzz = "0.20"
+swash = "0.1"
+ttf-parser = "0.25"

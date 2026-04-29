@@ -1,0 +1,49 @@
+#!/usr/bin/expect -f
+# Recovery: stop autoboot at loader, unset hint.acpi.0.disabled, boot, log in,
+# remove the offending line from /boot/loader.conf, halt.
+
+set timeout 120
+log_user 1
+spawn /Users/girivs/src/bsd/scripts/run-vm.sh
+
+# Stop the autoboot at FreeBSD loader menu — press Space, then 3 (escape to loader prompt).
+expect {
+    timeout { puts "no loader menu"; exit 1 }
+    "Autoboot in"
+}
+sleep 1
+send " "
+sleep 1
+send "3"
+
+# Wait for "OK " prompt — but ANSI escape codes may obscure it.
+# Just sleep and assume prompt is ready.
+sleep 2
+
+# Unset the bad hint and boot.
+send "unset hint.acpi.0.disabled\r"
+expect -re {OK $}
+send "boot\r"
+
+# Wait for login prompt
+expect {
+    timeout { puts "no login"; exit 1 }
+    "login:"
+}
+send "root\r"
+expect -re {Password:|password:}
+send "fresco\r"
+expect -re {# $}
+
+# Remove the bad config line, sync, halt.
+send "sed -i '' '/acpi.0.disabled/d' /boot/loader.conf\r"
+expect -re {# $}
+send "cat /boot/loader.conf\r"
+expect -re {# $}
+send "shutdown -p now\r"
+expect {
+    timeout { puts "shutdown stuck"; exit 1 }
+    eof
+    "Uptime"
+}
+puts "\n== ACPI recovery complete =="

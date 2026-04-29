@@ -1,0 +1,21 @@
+fresco-edit — first text editor on Fresco
+==========================================
+
+Try editing me!
+
+Commands:
+  arrow keys        move cursor
+  Backspace         delete prev char
+  Enter             new line
+
+this is a test
+
+  Ctrl+S            save
+  Ctrl+Q or Esc     quit
+
+Lines below are dummy content for scrolling.
+
+this is me writing in the editor
+
+The quick brown fox jumps over the lazy dog.
+ lazy dog.The quick brown fox jumps over the

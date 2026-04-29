@@ -1,0 +1,27 @@
+[package]
+name = "atrium-gpu-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Safe Rust bindings for the Atrium GPU ABI (/dev/atrium-gpu0, /dev/atrium-display0)"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "atrium_gpu"
+path = "src/lib.rs"
+
+[[example]]
+name = "gradient"
+path = "examples/gradient.rs"
+
+[[example]]
+name = "hello_rect"
+path = "examples/hello_rect.rs"
+required-features = ["raster"]
+
+[features]
+raster = ["dep:tiny-skia"]
+
+[dependencies]
+libc = "0.2"
+tiny-skia = { version = "0.11", optional = true }

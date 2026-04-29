@@ -1,0 +1,16 @@
+[package]
+name = "fresco-socket-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Fresco protocol client over Unix domain sockets — alternative transport to /dev/fresco0 for FreeBSD-native apps"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "fresco_socket"
+path = "src/lib.rs"
+
+[dependencies]
+fresco-server = { path = "../../fresco-server" }
+sha2 = "0.10"
+bytemuck = "1"

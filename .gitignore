@@ -1,0 +1,50 @@
+# Cargo build artifacts — across every Rust crate in the tree.
+**/target/
+**/Cargo.lock.bak
+
+# Rust analyzer caches.
+**/.rustc_info.json
+
+# Kernel-module build artifacts (atrium-kmod and any future kmod).
+**/*.kld
+**/*.ko
+**/*.o
+**/.depend.*
+**/export_syms
+**/opt_global.h
+**/bus_if.h
+**/device_if.h
+**/pci_if.h
+**/vnode_if.h
+**/vnode_if_newproto.h
+**/vnode_if_typedef.h
+# `machine` symlink the kmod build creates pointing at /usr/src/sys/<arch>/include.
+atrium-kmod/machine
+fresco-kmod/machine
+
+# In-VM-built test programs.
+atrium-kmod/test_caps
+atrium-kmod/test_scanout
+fresco-kmod/test_roundtrip
+
+# FreeBSD sysroot, kernel src, qcow2 disk image, downloads — too large
+# and/or licensing-sensitive to ship in-repo. Contributors recreate
+# these from FreeBSD's own distfiles per RUNBOOK.
+sysroot/
+freebsd-src/
+vm/*.qcow2
+vm/*.qcow2.xz
+vm/*.fd
+tarballs/
+
+# Local IDE / OS junk.
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Ad-hoc local logs.
+*.log
+
+# Settings local to one machine.
+.claude/settings.local.json

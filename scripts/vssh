@@ -1,0 +1,7 @@
+#!/bin/sh
+# Convenience: ssh into the running FreeBSD VM.
+exec ssh -i /Users/girivs/.ssh/fresco_bsd_ed25519 \
+    -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null \
+    -o LogLevel=ERROR \
+    -p 2222 root@localhost "$@"

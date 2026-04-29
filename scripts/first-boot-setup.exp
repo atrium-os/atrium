@@ -1,0 +1,68 @@
+#!/usr/bin/expect -f
+# First-boot setup: log in as root (no password), set root password,
+# enable sshd, install authorized_keys, then reboot cleanly.
+
+set timeout 180
+set bsd_dir [lindex $argv 0]
+set ssh_pubkey [lindex $argv 1]
+set root_pw "fresco"
+
+log_user 1
+spawn $bsd_dir/scripts/run-vm.sh
+
+# Wait for login prompt. FreeBSD prints "login:" on serial console.
+expect {
+    timeout { puts "\n!! timeout waiting for login prompt"; exit 1 }
+    "login:"
+}
+send "root\r"
+
+# Default has no root password — should land at shell prompt directly.
+expect {
+    timeout { puts "\n!! timeout waiting for shell prompt"; exit 1 }
+    -re {Password:|password:} {
+        send "\r"
+        exp_continue
+    }
+    -re {root@\S+:~ #|# $}
+}
+
+# Set root password non-interactively.
+send "echo '$root_pw' | pw usermod root -h 0\r"
+expect -re {# $}
+
+# Enable sshd, allow root login over ssh.
+send "sysrc sshd_enable=YES\r"
+expect -re {# $}
+send "sed -i '' -e 's/^#PermitRootLogin.*/PermitRootLogin yes/' -e 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config\r"
+expect -re {# $}
+
+# Install authorized_keys so we can ssh in passwordless.
+send "mkdir -p /root/.ssh && chmod 700 /root/.ssh\r"
+expect -re {# $}
+send "cat > /root/.ssh/authorized_keys <<'EOF'\r"
+send "$ssh_pubkey\r"
+send "EOF\r"
+expect -re {# $}
+send "chmod 600 /root/.ssh/authorized_keys\r"
+expect -re {# $}
+
+# Mount the host share via 9p so cross-built binaries are reachable later.
+send "mkdir -p /mnt/host\r"
+expect -re {# $}
+send "echo 'bsd_share /mnt/host virtiofs rw,late 0 0' >> /etc/fstab.tmp\r"
+expect -re {# $}
+# Note: arm64 FreeBSD may not have virtiofs in GENERIC; we'll mount manually post-boot if needed.
+
+# Verify network: get DHCP lease info.
+send "ifconfig vtnet0 | grep inet\r"
+expect -re {# $}
+
+# Power off cleanly.
+send "shutdown -p now\r"
+expect {
+    timeout { puts "\n!! timeout waiting for poweroff"; exit 1 }
+    "Uptime:" { }
+    eof { }
+}
+puts "\n== first-boot setup complete =="

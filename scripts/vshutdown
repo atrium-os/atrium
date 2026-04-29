@@ -1,0 +1,38 @@
+#!/bin/sh
+# Shut the Fresco VM down cleanly.
+#
+# Issues `shutdown -p now` over SSH and waits for QEMU to exit on
+# its own. Only escalates to SIGKILL if QEMU is genuinely stuck
+# after a generous deadline (60 s — covers the worst-case syncer
+# drain + softdep flush). The previous "sleep 5 && pkill -9" pattern
+# corrupted UFS softdep state mid-flush more than once.
+
+set -eu
+
+QEMU_PID=$(pgrep -f 'qemu-system-aarch64.*fresco-shmem' | head -1 || true)
+if [ -z "${QEMU_PID:-}" ]; then
+    echo "vshutdown: no Fresco qemu running"
+    exit 0
+fi
+
+# Politely ask the guest to halt.
+"$(dirname "$0")/vssh" 'shutdown -p now' >/dev/null 2>&1 || true
+
+# Wait for QEMU's process to exit on its own (it does so when the
+# guest powers off cleanly).
+deadline=$(( $(date +%s) + 60 ))
+while kill -0 "$QEMU_PID" 2>/dev/null; do
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+        echo "vshutdown: qemu pid $QEMU_PID didn't exit in 60s, sending SIGTERM" >&2
+        kill -TERM "$QEMU_PID" 2>/dev/null || true
+        sleep 5
+        if kill -0 "$QEMU_PID" 2>/dev/null; then
+            echo "vshutdown: still alive, SIGKILL" >&2
+            kill -KILL "$QEMU_PID" 2>/dev/null || true
+        fi
+        break
+    fi
+    sleep 1
+done
+
+echo "vshutdown: clean exit"
