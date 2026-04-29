@@ -17,6 +17,7 @@
  */
 
 #include "tessera/extent.h"
+#include "tessera/btree.h"
 #include "tessera/error.h"
 #include "tessera/format.h"
 
@@ -245,10 +246,118 @@ test_random_stress(void)
 	tessera_extent_close(a);
 }
 
+/* ── B+tree-backed round-trip ────────────────────────────────────── */
+
+#define MAX_SECTORS 256
+
+struct mem_disk {
+	uint8_t  blocks[MAX_SECTORS][4096];
+	uint8_t  used[MAX_SECTORS];
+	uint64_t next_sector;
+};
+
+static int md_read(void *ctx, uint64_t s, uint8_t *o) {
+	struct mem_disk *d = ctx;
+	if (s >= MAX_SECTORS || !d->used[s]) return -1;
+	memcpy(o, d->blocks[s], 4096); return 0;
+}
+static int md_write(void *ctx, uint64_t s, const uint8_t *b) {
+	struct mem_disk *d = ctx;
+	if (s >= MAX_SECTORS) return -1;
+	memcpy(d->blocks[s], b, 4096); return 0;
+}
+static int md_alloc(void *ctx, uint64_t n, uint64_t *o) {
+	struct mem_disk *d = ctx;
+	if (n != 1) return -1;
+	for (uint64_t i = d->next_sector; i < MAX_SECTORS; i++) {
+		if (!d->used[i]) { d->used[i] = 1; d->next_sector = i + 1;
+		    *o = i; return 0; }
+	}
+	for (uint64_t i = 1; i < d->next_sector; i++) {
+		if (!d->used[i]) { d->used[i] = 1; *o = i; return 0; }
+	}
+	return -1;
+}
+static int md_free(void *ctx, uint64_t s, uint64_t n) {
+	struct mem_disk *d = ctx;
+	if (n != 1 || s >= MAX_SECTORS) return -1;
+	d->used[s] = 0;
+	if (s < d->next_sector) d->next_sector = s;
+	return 0;
+}
+
+static void
+test_btree_round_trip(void)
+{
+	/* Build an allocator state, flush to a B+tree on a memory-backed
+	 * disk, close, reopen at the published root, and verify the
+	 * reloaded state is byte-identical to what was flushed. */
+	struct mem_disk *d = calloc(1, sizeof *d);
+	d->next_sector = 1;
+	tessera_block_io_t io = {
+		.read_block = md_read, .write_block = md_write,
+		.alloc      = md_alloc, .free       = md_free,
+		.ctx        = d,
+	};
+
+	tessera_extent_alloc_t *a = tessera_extent_open(&io, 0);
+	CHECK(a != NULL);
+
+	const struct { uint64_t s, n; } seed[] = {
+		{ 100,    50 },
+		{ 200,   100 },
+		{ 5000, 1000 },
+		{ 8000,    7 },
+		{ 12000, 200 },
+	};
+	for (size_t i = 0; i < sizeof seed / sizeof seed[0]; i++)
+		CHECK(tessera_extent_free(a, seed[i].s, seed[i].n) == TESSERA_OK);
+
+	uint64_t expect_total = 0;
+	for (size_t i = 0; i < sizeof seed / sizeof seed[0]; i++)
+		expect_total += seed[i].n;
+	CHECK(tessera_extent_free_blocks(a) == expect_total);
+
+	uint64_t root = 0;
+	CHECK(tessera_extent_flush(a, &root) == TESSERA_OK);
+	CHECK(root != 0);
+	tessera_extent_close(a);
+
+	/* Reopen and verify state matches. */
+	tessera_extent_alloc_t *a2 = tessera_extent_open(&io, root);
+	CHECK(a2 != NULL);
+	CHECK(tessera_extent_free_blocks(a2) == expect_total);
+
+	/* Allocate one block from each seeded extent's start; verifies
+	 * the reloaded boundaries round-tripped exactly. */
+	for (size_t i = 0; i < sizeof seed / sizeof seed[0]; i++) {
+		uint64_t s = 0;
+		CHECK(tessera_extent_alloc(a2, seed[i].n, &s) == TESSERA_OK);
+		/* s could match any of the remaining extents whose length
+		 * equals seed[i].n (best-fit on equal pick walks left).
+		 * Just assert it lies within one of the seed ranges. */
+		int found = 0;
+		for (size_t j = 0; j < sizeof seed / sizeof seed[0]; j++) {
+			if (s == seed[j].s) { found = 1; break; }
+		}
+		CHECK(found);
+	}
+	CHECK(tessera_extent_free_blocks(a2) == 0);
+
+	/* flush() with no io must EINVAL. */
+	tessera_extent_alloc_t *no_io = tessera_extent_open(NULL, 0);
+	uint64_t dummy = 0;
+	CHECK(tessera_extent_flush(no_io, &dummy) == TESSERA_EINVAL);
+	tessera_extent_close(no_io);
+
+	tessera_extent_close(a2);
+	free(d);
+}
+
 int
 main(void)
 {
-	printf("test_extent: in-memory free-extent allocator\n");
+	printf("test_extent: in-memory free-extent allocator + B+tree backing\n");
 	test_empty();
 	test_seeded_alloc_split();
 	test_best_fit();
@@ -257,6 +366,7 @@ main(void)
 	test_overlap_rejected();
 	test_einval_zero();
 	test_random_stress();
+	test_btree_round_trip();
 	if (failures > 0) {
 		fprintf(stderr, "%d failure(s)\n", failures);
 		return 1;

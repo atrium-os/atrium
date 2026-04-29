@@ -35,6 +35,17 @@ int tessera_extent_free(tessera_extent_alloc_t *,
 uint64_t tessera_extent_free_blocks(const tessera_extent_alloc_t *);
 uint64_t tessera_extent_largest_free_run(const tessera_extent_alloc_t *);
 
+/* COW-publish the current free-extent set as a fresh B+tree. Allocates
+ * a new tree via the io passed to open(); the returned root_sector is
+ * what the caller writes into the superblock's free_extent_root.
+ *
+ * Returns TESSERA_EINVAL if the allocator was opened without io
+ * (root_sector == 0 + NULL io). The previous tree (if any) is NOT
+ * freed — the caller is responsible for retiring it as part of its
+ * commit protocol. */
+int tessera_extent_flush(tessera_extent_alloc_t *,
+                         uint64_t *out_new_root_sector);
+
 void tessera_extent_close(tessera_extent_alloc_t *);
 
 #ifdef __cplusplus
