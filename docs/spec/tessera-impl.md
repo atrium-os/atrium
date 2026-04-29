@@ -469,10 +469,13 @@ Phase 3 deliverable: a shaking-out test suite catches our own bugs before Phase 
 
 Depends on Phase 1 (core primitives) and benefits from Phase 3 (test harness for shared algorithm bugs).
 
-| Component | Estimate | Test |
-|---|---|---|
-| Mount/unmount lifecycle, journal replay, dual-SB self-heal (tessera-fs.md §3.3) | 1.5 weeks | mount/unmount cycles via ATF; corrupt-SB-A heal via dd + remount |
-| `vop_lookup`, `vop_getattr`, `vop_open`, `vop_close` | 1 week | basic stat/open of static volume |
+| Component | Estimate | State | Test |
+|---|---|---|---|
+| Mount/unmount lifecycle, journal replay, dual-SB self-heal (tessera-fs.md §3.3) | 1.5 weeks | **done** (rounds 1–2.5) | mount/unmount cycles via ATF; corrupt-SB-A heal via dd + remount |
+| In-kernel allocator shim (`tessera_compat.h`) + link tessera-core read path into `tessera_fs.ko` | — | **done** (rounds 3a, 3b, 4a) | mount opens both inode and pack-registry trees off real backing dev |
+| `vop_getattr` (real on-disk inode) | 0.5 weeks | **done** (round 3c) | mkfs seeds inode 2; stat shows on-disk mode/timestamps |
+| `vop_lookup` over populated `DIRECTORY` manifest | 1 week | partial — empty-dir done; populated needs in-kernel blob fetcher (round 4b) | basic stat/open of static volume |
+| `vop_open`, `vop_close` | 0.25 weeks | **done** (no-op stubs) | n/a |
 | `vop_read` (manifest tree walk + chunk fetch) | 1 week | read of inline + chunked + tree manifests |
 | `vop_readdir` (synthesized "."/"..") | 1 week | readdir/readdir_r conformance |
 | `vop_write` (per-fd buffer, flush at fsync/close) | 2 weeks | crash-injection with sync writes |

@@ -99,6 +99,8 @@ Two channels:
 
 Force-kill (only when guest is truly hung): `pkill -f qemu-system-aarch64` — accept that the qcow2 may need fsck or restore from `vm.qcow2.xz` next boot.
 
+> **Never run `cargo build --release` (or any --release-profile cargo) inside the VM.** It hangs the guest hard every single time — SSH dies, only `kill -9 qemu` recovers, and that corrupts the qcow2. The 12 GB VM RAM is exhausted by rustc + LTO under HVF before swap reaches steady state. Even small crates trip this. Always cross-compile from the macOS host (§4); the host config in `~/src/bsd/.cargo/config.toml` already targets `aarch64-unknown-freebsd`. C builds in the VM are fine and stay there.
+
 ---
 
 ## 3. QEMU command-line cheat-sheet
@@ -173,6 +175,57 @@ vssh "kldload /mnt/host/fresco-kmod/fresco.ko"
 ```
 
 Output `fresco.ko` lands in `~/src/bsd/fresco-kmod/` on the host (visible to VM via 9p). Module Makefile uses `bsd.kmod.mk` and picks up `SYSDIR=/usr/src/sys` automatically.
+
+### Tessera kmod (`tessera_fs.ko`) — Phase-4 file-system driver
+
+Source: `~/src/bsd/atrium-tessera/kmod/` and the linked subset of `~/src/bsd/atrium-tessera/core/src/` (compiled with `-DTESSERA_KERNEL=1` so the `tessera_compat.h` allocator macros expand to the kernel `M_TESSERA / M_WAITOK / M_ZERO` form).
+
+```sh
+# One-time per fresh qcow2: extract kernel source + ensure 9p is mounted.
+vssh "kldload p9fs 2>/dev/null; mount | grep -q /mnt/host || \
+      mount -t p9fs -o trans=virtio bsd_share /mnt/host"
+vssh "[ -d /usr/src/sys ] || tar -xJf /mnt/host/tarballs/src.txz -C /"
+
+# C library (in-tree because the .a must live under the 9p share so the
+# host's cross-compiled Rust crates can link it; MK_AUTO_OBJ=no in the
+# Makefile keeps it out of /usr/obj).
+vssh "cd /mnt/host/atrium-tessera/core && make"
+
+# Kernel module.
+vssh "cd /mnt/host/atrium-tessera/kmod && make"
+vssh "kldload /mnt/host/atrium-tessera/kmod/tessera_fs.ko"
+```
+
+Userspace tools (`mkfs-tessera`, `tessera-debug`, `tessera-property-tests`) cross-compile on the host; the binaries land in `~/src/bsd/atrium-tessera/rs/target/aarch64-unknown-freebsd/release/` and run in the VM via 9p.
+
+```sh
+# Host:
+cd ~/src/bsd/atrium-tessera/rs && \
+    TESSERA_CORE_LIB=$HOME/src/bsd/atrium-tessera/core \
+    cargo build --release --target aarch64-unknown-freebsd
+```
+
+End-to-end mount cycle:
+
+```sh
+BIN=/mnt/host/atrium-tessera/rs/target/aarch64-unknown-freebsd/release
+vssh "$BIN/mkfs-tessera --create -s 16 /tmp/test.img"
+vssh "MD=\$(mdconfig -a -t vnode -f /tmp/test.img); \
+      mkdir -p /mnt/tessera; mount -t tessera /dev/\$MD /mnt/tessera"
+vssh "df -k /mnt/tessera; ls -la /mnt/tessera; stat /mnt/tessera"
+vssh "umount /mnt/tessera; mdconfig -d -u md0; kldunload tessera_fs"
+```
+
+Gotchas (each one cost a kernel panic + qcow2 restore — preserved here so the next round doesn't repeat them):
+
+- **`vflush(mp, rootrefs, …)` rootrefs MUST be 0** — vfs_root allocates the root vnode lazily on every call; rootrefs=1 is for filesystems that hold one for the lifetime of the mount, and tessera_fs panics at umount with `vflush: not busy`.
+- **vfs_root vnode-construction order is strict**: getnewvnode → vn_lock(LK_EXCLUSIVE) → set v_data + v_type + v_vflag → VN_LOCK_ASHARE → insmntque1 → vn_set_state(VSTATE_CONSTRUCTED). Mirror tmpfs_alloc_vp verbatim.
+- **dirent d_reclen** must be 8-byte aligned to `offsetof(struct dirent, d_name) + namlen + 1` (rounded up). Using `sizeof(struct dirent)` hangs `ls`.
+- **`MODULE_DEPEND(geom_vfs, …)`** is wrong — geom_vfs is built into the kernel, not a separately loadable module; it makes kldload fail with "depends on geom_vfs - not available".
+- **`g_vfs_open(devvp, &cp, "tessera", wr)`** — pass `wr=1` even for a logically read-only mount, so the kmod can issue maintenance writes (e.g. dual-SB self-heal). User writes are blocked at the VFS layer via MNT_RDONLY + vop_access EROFS, not at the GEOM layer.
+- **B+tree key encoding**: inode_no is 4 bytes, encoded **big-endian** so the tree's memcmp ordering matches numeric ordering. Both mkfs (`tessera_volume_format`) and the kmod (`encode_inode_key`) use the same convention.
+
+If the kernel panics during a kmod experiment: `pkill -9 qemu-system-aarch64`, `xz -dk vm.qcow2.xz` (the post-first-boot baseline), boot, re-extract `src.txz`, rebuild. Don't `cargo build --release` in the VM — see `~/.claude/projects/.../memory/feedback_no_vm_cargo_release.md`.
 
 ### Atrium virtio-gpu kmod (`atrium_virtio_gpu.ko`) — D0 bring-up
 
