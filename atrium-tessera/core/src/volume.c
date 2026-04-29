@@ -140,31 +140,69 @@ seed_root_dirent(const tessera_block_io_t *shim,
 	tessera_manifest_free(mb);
 	if (r != TESSERA_OK) { tessera_free(mft_bytes); return r; }
 
-	/* 1b. Optional INLINE manifest for the file's content. */
+	/* 1b. Optional file-content manifest. INLINE if chunk_size == 0,
+	 * CHUNK_LIST otherwise. For CHUNK_LIST the chunk bytes are added
+	 * to the pack as separate CHUNK blobs further down. */
 	const int has_content = (opts->seed_content_data != NULL &&
 	                         opts->seed_content_len  > 0);
+	const int chunked = has_content && opts->seed_chunk_size > 0;
+	const size_t n_chunks = chunked
+	    ? (opts->seed_content_len + opts->seed_chunk_size - 1u)
+	      / opts->seed_chunk_size
+	    : 0;
 	uint8_t *inl_bytes = NULL;
 	size_t   inl_size  = 0;
 	tessera_hash_t inl_hash;
+	tessera_hash_t *chunk_hashes = NULL;
 	memset(inl_hash, 0, sizeof inl_hash);
 	if (has_content) {
-		tessera_manifest_builder_t *ib =
-		    tessera_manifest_begin(TESSERA_MFT_INLINE);
+		tessera_manifest_kind_t kind = chunked
+		    ? TESSERA_MFT_CHUNK_LIST
+		    : TESSERA_MFT_INLINE;
+		tessera_manifest_builder_t *ib = tessera_manifest_begin(kind);
 		if (ib == NULL) {
 			tessera_free(mft_bytes);
 			return TESSERA_ENOMEM;
 		}
-		r = tessera_manifest_set_inline(ib, opts->seed_content_data,
-		    opts->seed_content_len);
-		if (r != TESSERA_OK) {
-			tessera_manifest_free(ib);
-			tessera_free(mft_bytes);
-			return r;
+		if (chunked) {
+			chunk_hashes = tessera_calloc(n_chunks, sizeof *chunk_hashes);
+			if (chunk_hashes == NULL) {
+				tessera_manifest_free(ib);
+				tessera_free(mft_bytes);
+				return TESSERA_ENOMEM;
+			}
+			size_t off = 0;
+			for (size_t i = 0; i < n_chunks; i++) {
+				size_t cs = (off + opts->seed_chunk_size >
+				             opts->seed_content_len)
+				    ? opts->seed_content_len - off
+				    : opts->seed_chunk_size;
+				tessera_sha256(opts->seed_content_data + off,
+				    cs, chunk_hashes[i]);
+				r = tessera_manifest_add_chunk(ib,
+				    chunk_hashes[i], off, (uint32_t)cs, 0);
+				if (r != TESSERA_OK) {
+					tessera_manifest_free(ib);
+					tessera_free(chunk_hashes);
+					tessera_free(mft_bytes);
+					return r;
+				}
+				off += cs;
+			}
+		} else {
+			r = tessera_manifest_set_inline(ib,
+			    opts->seed_content_data, opts->seed_content_len);
+			if (r != TESSERA_OK) {
+				tessera_manifest_free(ib);
+				tessera_free(mft_bytes);
+				return r;
+			}
 		}
 		(void)tessera_manifest_finalize(ib, NULL, 0, &inl_size, inl_hash);
 		inl_bytes = tessera_malloc(inl_size);
 		if (inl_bytes == NULL) {
 			tessera_manifest_free(ib);
+			tessera_free(chunk_hashes);
 			tessera_free(mft_bytes);
 			return TESSERA_ENOMEM;
 		}
@@ -173,6 +211,7 @@ seed_root_dirent(const tessera_block_io_t *shim,
 		tessera_manifest_free(ib);
 		if (r != TESSERA_OK) {
 			tessera_free(inl_bytes);
+			tessera_free(chunk_hashes);
 			tessera_free(mft_bytes);
 			return r;
 		}
@@ -185,14 +224,14 @@ seed_root_dirent(const tessera_block_io_t *shim,
 	tessera_pack_builder_t *pb =
 	    tessera_pack_begin(/*kind*/ 0, pack_id, /*creator_tx*/ 0);
 	if (pb == NULL) {
-		tessera_free(inl_bytes); tessera_free(mft_bytes);
+		tessera_free(inl_bytes); tessera_free(chunk_hashes); tessera_free(mft_bytes);
 		return TESSERA_ENOMEM;
 	}
 	r = tessera_pack_add_blob(pb, mft_hash, mft_bytes,
 	    (uint32_t)mft_size, TESSERA_BLOB_FLAG_MANIFEST);
 	if (r != TESSERA_OK) {
 		tessera_pack_free(pb);
-		tessera_free(inl_bytes); tessera_free(mft_bytes);
+		tessera_free(inl_bytes); tessera_free(chunk_hashes); tessera_free(mft_bytes);
 		return r;
 	}
 	if (has_content) {
@@ -200,8 +239,31 @@ seed_root_dirent(const tessera_block_io_t *shim,
 		    (uint32_t)inl_size, TESSERA_BLOB_FLAG_MANIFEST);
 		if (r != TESSERA_OK) {
 			tessera_pack_free(pb);
-			tessera_free(inl_bytes); tessera_free(mft_bytes);
+			tessera_free(inl_bytes); tessera_free(chunk_hashes);
+			tessera_free(mft_bytes);
 			return r;
+		}
+	}
+	if (chunked) {
+		size_t off = 0;
+		for (size_t i = 0; i < n_chunks; i++) {
+			size_t cs = (off + opts->seed_chunk_size >
+			             opts->seed_content_len)
+			    ? opts->seed_content_len - off
+			    : opts->seed_chunk_size;
+			r = tessera_pack_add_blob(pb, chunk_hashes[i],
+			    opts->seed_content_data + off, (uint32_t)cs,
+			    TESSERA_BLOB_FLAG_CHUNK);
+			if (r != TESSERA_OK) {
+				/* Test images use simple unique-chunk content;
+				 * production callers de-dup before adding. */
+				tessera_pack_free(pb);
+				tessera_free(inl_bytes);
+				tessera_free(chunk_hashes);
+				tessera_free(mft_bytes);
+				return r;
+			}
+			off += cs;
 		}
 	}
 	size_t pack_size = 0;
@@ -209,19 +271,20 @@ seed_root_dirent(const tessera_block_io_t *shim,
 	uint8_t *pack_bytes = tessera_malloc(pack_size);
 	if (pack_bytes == NULL) {
 		tessera_pack_free(pb);
-		tessera_free(inl_bytes); tessera_free(mft_bytes);
+		tessera_free(inl_bytes); tessera_free(chunk_hashes);
+		tessera_free(mft_bytes);
 		return TESSERA_ENOMEM;
 	}
 	r = tessera_pack_finalize(pb, pack_bytes, pack_size, &pack_size);
 	tessera_pack_free(pb);
 	if (r != TESSERA_OK) {
 		tessera_free(pack_bytes);
-		tessera_free(inl_bytes); tessera_free(mft_bytes);
+		tessera_free(inl_bytes); tessera_free(chunk_hashes); tessera_free(mft_bytes);
 		return r;
 	}
 	if ((pack_size % TESSERA_SECTOR_SIZE) != 0) {
 		tessera_free(pack_bytes);
-		tessera_free(inl_bytes); tessera_free(mft_bytes);
+		tessera_free(inl_bytes); tessera_free(chunk_hashes); tessera_free(mft_bytes);
 		return TESSERA_ECORRUPT;
 	}
 
@@ -231,7 +294,7 @@ seed_root_dirent(const tessera_block_io_t *shim,
 	r = tessera_extent_alloc(ea, n_sectors, &pack_start);
 	if (r != TESSERA_OK) {
 		tessera_free(pack_bytes);
-		tessera_free(inl_bytes); tessera_free(mft_bytes);
+		tessera_free(inl_bytes); tessera_free(chunk_hashes); tessera_free(mft_bytes);
 		return r;
 	}
 
@@ -240,7 +303,7 @@ seed_root_dirent(const tessera_block_io_t *shim,
 		if (shim->write_block(shim->ctx, pack_start + i,
 		    pack_bytes + i * TESSERA_SECTOR_SIZE) != 0) {
 			tessera_free(pack_bytes);
-			tessera_free(inl_bytes); tessera_free(mft_bytes);
+			tessera_free(inl_bytes); tessera_free(chunk_hashes); tessera_free(mft_bytes);
 			return TESSERA_EIO;
 		}
 	}
@@ -253,7 +316,8 @@ seed_root_dirent(const tessera_block_io_t *shim,
 		memcpy(re.pack_id, pack_id, 16);
 		re.start_sector    = pack_start;
 		re.length_sectors  = n_sectors;
-		re.blob_count      = has_content ? 2 : 1;
+		re.blob_count      = (uint32_t)(1 + (has_content ? 1u : 0u)
+		                                + n_chunks);
 		re.pack_kind       = 0;
 		re.total_bytes     = pack_size;
 		re.create_time     = 0;
@@ -262,12 +326,12 @@ seed_root_dirent(const tessera_block_io_t *shim,
 		uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
 		r = tessera_encode_registry_entry(&re, reg_value);
 		if (r != TESSERA_OK) {
-			tessera_free(inl_bytes); tessera_free(mft_bytes);
+			tessera_free(inl_bytes); tessera_free(chunk_hashes); tessera_free(mft_bytes);
 			return r;
 		}
 		r = tessera_btree_put(pack_tree, pack_id, reg_value, pack_root);
 		if (r != TESSERA_OK) {
-			tessera_free(inl_bytes); tessera_free(mft_bytes);
+			tessera_free(inl_bytes); tessera_free(chunk_hashes); tessera_free(mft_bytes);
 			return r;
 		}
 	}
@@ -291,12 +355,12 @@ seed_root_dirent(const tessera_block_io_t *shim,
 		uint8_t value[TESSERA_INODE_RECORD_SIZE];
 		r = tessera_encode_inode(&ino, value);
 		if (r != TESSERA_OK) {
-			tessera_free(inl_bytes); tessera_free(mft_bytes);
+			tessera_free(inl_bytes); tessera_free(chunk_hashes); tessera_free(mft_bytes);
 			return r;
 		}
 		r = tessera_btree_put(inode_tree, key, value, inode_root);
 		if (r != TESSERA_OK) {
-			tessera_free(inl_bytes); tessera_free(mft_bytes);
+			tessera_free(inl_bytes); tessera_free(chunk_hashes); tessera_free(mft_bytes);
 			return r;
 		}
 	}

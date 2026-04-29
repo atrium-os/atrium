@@ -51,11 +51,15 @@ typedef struct {
 
 	/* Optional: pre-populate the seeded file's content. If
 	 * seed_content_len is 0 (default) the file is empty
-	 * (manifest_hash all zero). If non-zero, an INLINE manifest is
-	 * published in the same initial pack and the seeded file's
-	 * inode points at it with size = seed_content_len. */
+	 * (manifest_hash all zero). If non-zero and seed_chunk_size is
+	 * 0, an INLINE manifest is published. If seed_chunk_size > 0,
+	 * the content is split into chunks of that size (last chunk
+	 * may be shorter) and a CHUNK_LIST manifest is published with
+	 * each chunk stored as a separate blob in the same initial
+	 * pack. */
 	const uint8_t *seed_content_data;
 	size_t         seed_content_len;
+	uint32_t       seed_chunk_size;     /* 0 = INLINE, >0 = CHUNK_LIST */
 } tessera_format_opts_t;
 
 /* Reserved metadata-zone size, in sectors, immediately after the

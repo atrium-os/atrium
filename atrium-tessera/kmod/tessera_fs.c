@@ -853,9 +853,53 @@ tessera_vop_read(struct vop_read_args *ap)
 		    ? (size_t)uio->uio_resid : remaining;
 		err = uiomove(__DECONST(void *, data + uio->uio_offset),
 		    n, uio);
-	} else if (kind == TESSERA_MFT_CHUNK_LIST ||
-	           kind == TESSERA_MFT_CHUNK_TREE) {
-		err = EOPNOTSUPP;     /* round 5b */
+	} else if (kind == TESSERA_MFT_CHUNK_LIST) {
+		const uint32_t n = tessera_manifest_parser_count(p);
+		for (uint32_t i = 0; i < n && uio->uio_resid > 0; i++) {
+			tessera_chunk_record_t cr;
+			if (tessera_manifest_chunk_at(p, i, &cr)
+			    != TESSERA_OK) {
+				err = EIO;
+				break;
+			}
+			const uint64_t cstart = cr.logical_offset;
+			const uint64_t cend   = cstart + cr.uncompressed_size;
+
+			/* Skip chunks entirely below the read window. */
+			if (cend <= (uint64_t)uio->uio_offset) continue;
+			/* Stop when we've passed the read window. */
+			if (cstart >= (uint64_t)uio->uio_offset
+			    + (uint64_t)uio->uio_resid) break;
+
+			uint8_t *cb = NULL;
+			uint32_t cb_len = 0;
+			if (tessera_fs_fetch_blob(tmp_, cr.chunk_hash,
+			    &cb, &cb_len) != 0) {
+				err = EIO;
+				break;
+			}
+			if (cb_len < cr.uncompressed_size) {
+				free(cb, M_TESSERA);
+				err = EIO;
+				break;
+			}
+
+			/* Slice intersection of [cstart, cend) and
+			 * [uio_offset, uio_offset + resid). */
+			const uint64_t lo = ((uint64_t)uio->uio_offset > cstart)
+			    ? (uint64_t)uio->uio_offset - cstart : 0;
+			const uint64_t hi_off =
+			    (uint64_t)uio->uio_offset + (uint64_t)uio->uio_resid;
+			const uint64_t hi = (hi_off < cend
+			    ? hi_off - cstart : cr.uncompressed_size);
+			const size_t   n_copy = (size_t)(hi - lo);
+
+			err = uiomove(cb + lo, n_copy, uio);
+			free(cb, M_TESSERA);
+			if (err != 0) break;
+		}
+	} else if (kind == TESSERA_MFT_CHUNK_TREE) {
+		err = EOPNOTSUPP;     /* round 5c */
 	} else {
 		err = EIO;
 	}
