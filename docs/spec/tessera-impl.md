@@ -476,7 +476,7 @@ Depends on Phase 1 (core primitives) and benefits from Phase 3 (test harness for
 | `vop_getattr` (real on-disk inode) | 0.5 weeks | **done** (round 3c) | mkfs seeds inode 2; stat shows on-disk mode/timestamps |
 | `vop_lookup` over populated `DIRECTORY` manifest | 1 week | **done** (rounds 4b + 4c) | mkfs `--seed-file` + `stat /mnt/x/foo` returns real on-disk inode |
 | `vop_readdir` over real DIRECTORY manifest | 0.5 weeks | **done** (round 4d) | `ls -la /mnt/x` returns ./.. + entries with real d_type |
-| `vop_read` (manifest tree walk + chunk fetch) | 1 week | partial — INLINE done (round 5a); CHUNK_LIST/CHUNK_TREE pending (round 5b) | `cat /mnt/x/hello` returns real bytes |
+| `vop_read` (manifest tree walk + chunk fetch) | 1 week | INLINE + CHUNK_LIST done (rounds 5a + 5b); CHUNK_TREE pending (round 5c) | `cat`, `wc -c`, `dd skip=N count=M` over chunked content all return correct bytes |
 | `vop_open`, `vop_close` | 0.25 weeks | **done** (no-op stubs) | n/a |
 | `vop_read` (manifest tree walk + chunk fetch) | 1 week | read of inline + chunked + tree manifests |
 | `vop_readdir` (synthesized "."/"..") | 1 week | readdir/readdir_r conformance |

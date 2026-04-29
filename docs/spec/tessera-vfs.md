@@ -2,6 +2,8 @@
 
 > **Status:** v1 normative draft.
 > **Scope:** how POSIX file-system semantics map onto the Tessera-FS on-disk format. The on-disk format itself is in [tessera-fs.md](tessera-fs.md).
+>
+> **Implementation status as of commit `782bfea`:** the read path is feature-complete for empty / `INLINE` / `CHUNK_LIST` files — `mount`, `umount`, `df`, `stat`, `ls -la`, `cat`, `dd skip=N count=M` all work end-to-end against a real on-disk volume. `CHUNK_TREE` (files >~16 MiB) and every mutation path (`vop_create`, `vop_mkdir`, `vop_write`, `vop_remove`, `vop_rename`, `vop_setattr`, journal-append, …) are not yet implemented; mounts are forced `MNT_RDONLY` until they are. See [tessera-impl.md §5](tessera-impl.md#5-implementation-phases) for the per-op status.
 
 ## 0. Conventions
 
