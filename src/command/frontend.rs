@@ -4,24 +4,53 @@ use crate::scene::graph::SceneGraph;
 use crate::scene::nodes::Transform;
 use crate::scene::sharing;
 use crate::scene::slots::{SlotTable, TextData};
-use crate::window::Compositor;
+use crate::window::{Compositor, FocusChange};
+
+/// Append FOCUS completions for a focus shift: blurred for `prev`,
+/// focused for `new`. Caller is the destination ring/queue.
+pub fn push_focus_completions(out: &mut Vec<Completion>, shift: Option<FocusChange>) {
+    let Some(fc) = shift else { return; };
+    if let Some(prev) = fc.prev {
+        out.push(Completion {
+            comp_type:   COMP_WINDOW_FOCUS,
+            status:      0, // blurred
+            id:          prev as u32,
+            result_hash: [0u8; 32],
+            _pad:        [0; 22],
+        });
+    }
+    out.push(Completion {
+        comp_type:   COMP_WINDOW_FOCUS,
+        status:      1, // focused
+        id:          fc.new as u32,
+        result_hash: [0u8; 32],
+        _pad:        [0; 22],
+    });
+}
 
 use std::sync::{Arc, Mutex};
 
 pub struct CommandFrontend {
     cas: Arc<Mutex<CasStore>>,
     scene: Arc<Mutex<SceneGraph>>,
+    /// Currently-bound window's slot table. dispatch() rebinds this
+    /// to the target window's Arc for the duration of each routable
+    /// handler call, so handlers operate on per-window state without
+    /// having to thread a window_id through every call site.
     pub slot_table: Arc<Mutex<SlotTable>>,
-    /// Multi-window compositor — phase B1. Today only the lifecycle
-    /// handlers (CREATE/DESTROY/SET_TITLE) wire through here. Slot
-    /// and frame ops still run against the legacy global state above
-    /// (= "implicit window 0"). Per-window slot/frame dispatch is
-    /// the next refactor.
     pub compositor: Arc<Mutex<Compositor>>,
     pending_tasks: Vec<PendingTask>,
+    /// Extra completions that handlers need to emit beyond the single
+    /// dispatch() return value (e.g. FOCUS shifts caused by a
+    /// DESTROY_WINDOW). Drained by the caller after each command.
+    pub pending_completions: Vec<Completion>,
     pub last_upload_size: u64,
     frame_number: u32,
     in_frame: bool,
+    /// Slot id of the client whose command is currently being
+    /// dispatched. Used by handlers (e.g. handle_destroy_window) to
+    /// enforce window ownership. Set by dispatch(), cleared after.
+    current_client: u8,
 }
 
 struct PendingTask {
@@ -34,29 +63,100 @@ struct PendingTask {
 impl CommandFrontend {
     pub fn new(cas: Arc<Mutex<CasStore>>,
                scene: Arc<Mutex<SceneGraph>>,
+               slot_table: Arc<Mutex<SlotTable>>,
                compositor: Arc<Mutex<Compositor>>) -> Self {
-        let slot_table = Arc::new(Mutex::new(SlotTable::new()));
         Self {
             cas,
             scene,
             slot_table,
             compositor,
             pending_tasks: Vec::new(),
+            pending_completions: Vec::new(),
             last_upload_size: 0,
             frame_number: 0,
             in_frame: false,
+            current_client: 0,
         }
     }
+
 
     pub fn reset(&mut self) {
         self.pending_tasks.clear();
         self.last_upload_size = 0;
+        // Clear all windows' slot tables — guest reset means fresh
+        // start, including any auxiliary windows the previous client
+        // had open.
         self.slot_table.lock().unwrap().clear();
+        let comp = self.compositor.lock().unwrap();
+        for win in comp.windows.values() {
+            win.slots.lock().unwrap().clear();
+        }
+        drop(comp);
         self.frame_number = 0;
         self.in_frame = false;
     }
 
-    pub fn dispatch(&mut self, cmd: &Command) -> Option<Completion> {
+    pub fn dispatch(&mut self, cmd: &Command, client_id: u8) -> Option<Completion> {
+        self.current_client = client_id;
+        // Routable opcodes (slot/frame/scene ops) carry the target
+        // window_id in cmd.flags. We bind self.slot_table / self.scene
+        // to that window's Arcs for the duration of the handler, then
+        // restore. Window 0 is the default "screen" window created at
+        // startup; clients target other windows via CREATE_WINDOW.
+        let restore = if self.is_routable(cmd.opcode) {
+            let saved = (self.slot_table.clone(), self.scene.clone());
+            let comp = self.compositor.lock().unwrap();
+            let Some(win) = comp.windows.get(&cmd.flags) else {
+                log::warn!("dispatch op 0x{:04x}: window {} doesn't exist; dropping",
+                    cmd.opcode, cmd.flags);
+                return None;
+            };
+            // Reject routable ops on windows the requester doesn't
+            // own. Window 0 (the screen) is special-cased: clients
+            // can render into the screen scene from any slot — the
+            // OS-style isolation only applies to client-created
+            // windows.
+            if cmd.flags != 0 && win.owner != client_id as u32 {
+                log::warn!("dispatch op 0x{:04x}: window {} owner={} but requester={}; dropping",
+                    cmd.opcode, cmd.flags, win.owner, client_id);
+                return None;
+            }
+            let win_slots = win.slots.clone();
+            let win_scene = win.scene.clone();
+            drop(comp);
+            log::trace!("dispatch op 0x{:04x} routed to window {}", cmd.opcode, cmd.flags);
+            self.slot_table = win_slots;
+            self.scene = win_scene;
+            Some(saved)
+        } else {
+            None
+        };
+
+        let result = self.dispatch_inner(cmd);
+
+        if let Some((slots, scene)) = restore {
+            self.slot_table = slots;
+            self.scene = scene;
+        }
+        result
+    }
+
+    /// Opcodes whose handlers operate on per-window scene/slot state.
+    /// Other opcodes (CAS uploads, query, fence, window lifecycle) are
+    /// global and don't get routed.
+    fn is_routable(&self, opcode: u16) -> bool {
+        matches!(opcode,
+            CMD_SET_ROOT | CMD_SET_CAMERA | CMD_ADD_NODE | CMD_REMOVE_NODE
+            | CMD_UPDATE_TRANSFORM | CMD_UPDATE_TRANSFORM_INLINE
+            | CMD_UPDATE_MATERIAL | CMD_ADD_LIGHT | CMD_UPDATE_LIGHT
+            | CMD_SLOT_ALLOC | CMD_SLOT_FREE | CMD_SLOT_SET_XFORM
+            | CMD_SLOT_SET_CONTENT | CMD_SLOT_SET_CHILDREN | CMD_SLOT_SET_FLAGS
+            | CMD_SLOT_SET_ROOT | CMD_SLOT_SET_TEXT | CMD_SLOT_SET_CAS_CHILDREN
+            | CMD_RENDER | CMD_FRAME_BEGIN | CMD_FRAME_END
+        )
+    }
+
+    fn dispatch_inner(&mut self, cmd: &Command) -> Option<Completion> {
         match cmd.opcode {
             CMD_UPLOAD_BEGIN => self.handle_upload_begin(cmd),
             CMD_UPLOAD_DATA => self.handle_upload_data(cmd),
@@ -93,15 +193,12 @@ impl CommandFrontend {
             CMD_FRAME_BEGIN => self.handle_frame_begin(cmd),
             CMD_FRAME_END => self.handle_frame_end(cmd),
 
-            // ── Multi-window protocol — phase B1 ───────────────
-            // Lifecycle handlers (CREATE/DESTROY/SET_TITLE) are now
-            // real — windows live in the Compositor. Slot/frame
-            // routing still uses the legacy global state for window 0;
-            // SET_ROOT/PRESENT continue to log only until the per-
-            // window slot dispatch refactor lands.
+            // ── Multi-window lifecycle ─────────────────────────
             CMD_CREATE_WINDOW    => self.handle_create_window(cmd),
             CMD_DESTROY_WINDOW   => self.handle_destroy_window(cmd),
             CMD_WINDOW_SET_TITLE => self.handle_window_set_title(cmd),
+            CMD_WINDOW_SET_POS   => self.handle_window_set_pos(cmd),
+            CMD_WINDOW_SET_SIZE  => self.handle_window_set_size(cmd),
             CMD_WINDOW_SET_ROOT  => { log::info!("WINDOW_SET_ROOT (stub): win={}", cmd.u32_at(8)); None }
             CMD_WINDOW_PRESENT   => { log::info!("WINDOW_PRESENT (stub): win={}", cmd.u32_at(8)); None }
 
@@ -149,7 +246,7 @@ impl CommandFrontend {
         }
     }
 
-    fn handle_upload_dma(&mut self, _cmd: &Command) -> Option<Completion> {
+    fn handle_upload_dma(&mut self, cmd: &Command) -> Option<Completion> {
         // staging area upload — read from ivshmem staging region
         // TODO: implement when staging area is mapped
         log::warn!("CMD_UPLOAD_DMA not yet implemented");
@@ -283,7 +380,7 @@ impl CommandFrontend {
         None
     }
 
-    fn handle_update_light(&mut self, _cmd: &Command) -> Option<Completion> {
+    fn handle_update_light(&mut self, cmd: &Command) -> Option<Completion> {
         let mut scene = self.scene.lock().unwrap();
         scene.mark_dirty();
         None
@@ -325,7 +422,7 @@ impl CommandFrontend {
         None
     }
 
-    fn handle_render(&mut self, _cmd: &Command) -> Option<Completion> {
+    fn handle_render(&mut self, cmd: &Command) -> Option<Completion> {
         let mut scene = self.scene.lock().unwrap();
         let mut cas = self.cas.lock().unwrap();
         cas.advance_generation();
@@ -525,7 +622,7 @@ impl CommandFrontend {
         None
     }
 
-    fn handle_frame_end(&mut self, _cmd: &Command) -> Option<Completion> {
+    fn handle_frame_end(&mut self, cmd: &Command) -> Option<Completion> {
         self.in_frame = false;
         let st = self.slot_table.lock().unwrap();
         if st.is_active() {
@@ -577,12 +674,13 @@ impl CommandFrontend {
         let title = String::from_utf8_lossy(&title_buf[..title_end]).into_owned();
 
         let mut comp = self.compositor.lock().unwrap();
-        // Phase B1: single client (id 0).
-        let win_id = comp.create(0, (w.max(1), h.max(1)));
+        let win_id = comp.create(self.current_client as u32, (w.max(1), h.max(1)));
         if !title.is_empty() {
             if let Some(win) = comp.windows.get_mut(&win_id) {
                 win.title = title.clone();
             }
+            let mut cas = self.cas.lock().unwrap();
+            comp.rebuild_window_title(win_id, &mut cas);
         }
         log::info!("CREATE_WINDOW: id={} {}x{} title={:?}", win_id, w, h, title);
 
@@ -604,26 +702,88 @@ impl CommandFrontend {
     fn handle_destroy_window(&mut self, cmd: &Command) -> Option<Completion> {
         let win_id = cmd.u32_at(8) as u16;
         let mut comp = self.compositor.lock().unwrap();
-        let ok = comp.destroy(win_id, /*by_client=*/ 0);
+        let (ok, shift) = comp.destroy_with_focus_shift(win_id, self.current_client as u32);
+        drop(comp);
         log::info!("DESTROY_WINDOW: id={} ok={}", win_id, ok);
+        if let Some(fc) = shift {
+            push_focus_completions(&mut self.pending_completions, Some(fc));
+        }
+        None
+    }
+
+    fn handle_window_set_size(&mut self, cmd: &Command) -> Option<Completion> {
+        let win_id = cmd.u32_at(8) as u16;
+        let w = cmd.u32_at(12);
+        let h = cmd.u32_at(16);
+        if w == 0 || h == 0 {
+            log::warn!("WINDOW_SET_SIZE: id={} ignored zero dimension {}x{}", win_id, w, h);
+            return None;
+        }
+        let mut comp = self.compositor.lock().unwrap();
+        let owner = comp.windows.get(&win_id).map(|w| w.owner);
+        if owner != Some(self.current_client as u32) {
+            log::warn!("WINDOW_SET_SIZE: id={} rejected (owner={:?}, requester={})",
+                win_id, owner, self.current_client);
+            return None;
+        }
+        comp.windows.get_mut(&win_id).unwrap().size = (w as f32, h as f32);
+        // Re-layout title for the new width — ellipsis tracks size.
+        let mut cas = self.cas.lock().unwrap();
+        comp.rebuild_window_title(win_id, &mut cas);
+        drop(cas);
+        drop(comp);
+        log::info!("WINDOW_SET_SIZE: id={} {}x{}", win_id, w, h);
+
+        // Emit RESIZED completion. Width/height packed into
+        // result_hash[0..8] little-endian — mirrors libfresco's
+        // fresco_winevt_try_enqueue decoding.
+        let mut rh = [0u8; 32];
+        rh[0..4].copy_from_slice(&w.to_le_bytes());
+        rh[4..8].copy_from_slice(&h.to_le_bytes());
+        self.pending_completions.push(Completion {
+            comp_type:   COMP_WINDOW_RESIZED,
+            status:      0,
+            id:          win_id as u32,
+            result_hash: rh,
+            _pad:        [0; 22],
+        });
+        None
+    }
+
+    fn handle_window_set_pos(&mut self, cmd: &Command) -> Option<Completion> {
+        let win_id = cmd.u32_at(8) as u16;
+        let x = cmd.f32_at(12);
+        let y = cmd.f32_at(16);
+        let mut comp = self.compositor.lock().unwrap();
+        let owner = comp.windows.get(&win_id).map(|w| w.owner);
+        if owner != Some(self.current_client as u32) {
+            log::warn!("WINDOW_SET_POS: id={} rejected (owner={:?}, requester={})",
+                win_id, owner, self.current_client);
+            return None;
+        }
+        comp.windows.get_mut(&win_id).unwrap().pos = (x, y);
+        log::info!("WINDOW_SET_POS: id={} ({}, {})", win_id, x, y);
         None
     }
 
     fn handle_window_set_title(&mut self, cmd: &Command) -> Option<Completion> {
         let win_id = cmd.u32_at(8) as u16;
         let bytes = cmd.payload_bytes();
-        // Title bytes begin at payload offset 4 (cmd offset 12), up to remaining payload.
         let title_buf = &bytes[4..];
         let end = title_buf.iter().position(|&b| b == 0).unwrap_or(title_buf.len());
         let title = String::from_utf8_lossy(&title_buf[..end]).into_owned();
 
         let mut comp = self.compositor.lock().unwrap();
-        if let Some(win) = comp.windows.get_mut(&win_id) {
-            win.title = title.clone();
-            log::info!("WINDOW_SET_TITLE: id={} title={:?}", win_id, title);
-        } else {
-            log::warn!("WINDOW_SET_TITLE: unknown window id={}", win_id);
+        let owner = comp.windows.get(&win_id).map(|w| w.owner);
+        if owner != Some(self.current_client as u32) {
+            log::warn!("WINDOW_SET_TITLE: id={} rejected (owner={:?}, requester={})",
+                win_id, owner, self.current_client);
+            return None;
         }
+        comp.windows.get_mut(&win_id).unwrap().title = title.clone();
+        let mut cas = self.cas.lock().unwrap();
+        comp.rebuild_window_title(win_id, &mut cas);
+        log::info!("WINDOW_SET_TITLE: id={} title={:?}", win_id, title);
         None
     }
 }

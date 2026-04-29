@@ -76,6 +76,8 @@ pub const CMD_DESTROY_WINDOW:  u16 = 0x0501;  // payload: u32 window_id
 pub const CMD_WINDOW_SET_ROOT: u16 = 0x0502;  // payload: u32 window_id, u16 slot_id
 pub const CMD_WINDOW_SET_TITLE:u16 = 0x0503;  // payload: u32 window_id, utf8 bytes (≤ 116)
 pub const CMD_WINDOW_PRESENT:  u16 = 0x0504;  // payload: u32 window_id (replaces FRAME_END for that window)
+pub const CMD_WINDOW_SET_POS:  u16 = 0x0505;  // payload: u32 window_id, f32 x, f32 y (world units)
+pub const CMD_WINDOW_SET_SIZE: u16 = 0x0506;  // payload: u32 window_id, u32 width, u32 height (logical px)
 
 // Completion types
 pub const COMP_UPLOAD_COMPLETE: u16 = 0x01;
@@ -88,6 +90,26 @@ pub const COMP_WINDOW_CREATED:         u16 = 0x10;  // id = server-assigned wind
 pub const COMP_WINDOW_RESIZED:         u16 = 0x11;  // id = window_id; payload carries new w/h
 pub const COMP_WINDOW_CLOSE_REQUESTED: u16 = 0x12;  // user clicked the close button
 pub const COMP_WINDOW_FOCUS:           u16 = 0x13;  // status: 1=focused, 0=blurred
+
+// Input events (server → client). Routed by `id = target_window`.
+// Payload layout in `result_hash`:
+//   COMP_INPUT_KEY:        [0..2] HID Usage code, [2] modifiers
+//   COMP_INPUT_MOUSE_MOVE: [0..4] f32 x, [4..8] f32 y
+//   COMP_INPUT_MOUSE_BUTTON: [0..2] button, [2] modifiers
+// `status` carries the pressed/released bit for KEY and MOUSE_BUTTON.
+pub const COMP_INPUT_KEY:          u16 = 0x14;
+pub const COMP_INPUT_MOUSE_MOVE:   u16 = 0x15;
+pub const COMP_INPUT_MOUSE_BUTTON: u16 = 0x16;
+pub const COMP_INPUT_SCROLL:       u16 = 0x17;
+
+// Vendor-extension opcode space for clients to inject input events
+// for testing/automation. Real input flows from native devices
+// (/dev/usbhid in step 2c.14+) and never via INJECT.
+//   payload[0..2] = HID Usage code u16
+//   payload[2]    = pressed (0/1)
+//   payload[3]    = modifiers
+//   payload[4..8] = target window_id u32 (0 = broadcast)
+pub const CMD_INJECT_KEY:    u16 = 0xF000;
 
 // Status codes
 pub const STATUS_OK: u16 = 0x00;

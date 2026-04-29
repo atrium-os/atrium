@@ -5,6 +5,7 @@ use crate::render::tessellate;
 use crate::render::font::FontData;
 use std::collections::HashMap;
 
+#[derive(Clone)]
 pub struct RenderItem {
     pub world_matrix: [f32; 16],
     pub mesh: Hash256,
@@ -87,6 +88,18 @@ impl SceneGraph {
         self.render_list = render_list;
         self.camera_hash = camera_hash;
         self.dirty = true;
+    }
+
+    /// Append composed items from other windows. Returns the prior
+    /// list length so the caller can truncate after rendering.
+    pub fn compose_append(&mut self, items: impl IntoIterator<Item = RenderItem>) -> usize {
+        let prior = self.render_list.len();
+        self.render_list.extend(items);
+        prior
+    }
+
+    pub fn truncate_render_list(&mut self, len: usize) {
+        self.render_list.truncate(len);
     }
 
     pub fn light_list(&self) -> &[LightItem] {

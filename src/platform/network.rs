@@ -1,5 +1,5 @@
 use crate::command::protocol::{Command, Completion};
-use crate::input::capture::InputEvent;
+use crate::input::InputEvent;
 
 use std::net::{TcpListener, TcpStream};
 use std::io::{self, Read, Write};

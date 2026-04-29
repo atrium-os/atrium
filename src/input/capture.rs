@@ -1,21 +1,10 @@
 use winit::event::{WindowEvent, ElementState, MouseButton};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct InputEvent {
-    pub event_type: u16,
-    pub code: u16,
-    pub value_a: i32,
-    pub value_b: i32,
-    pub _pad0: [u32; 13],
-}
-
-pub const INPUT_KEY: u16 = 1;
-pub const INPUT_MOUSE_MOVE: u16 = 2;
-pub const INPUT_MOUSE_BUTTON: u16 = 3;
-pub const INPUT_SCROLL: u16 = 4;
-pub const INPUT_RESIZE: u16 = 5;
+pub use crate::input::{
+    InputEvent,
+    INPUT_KEY, INPUT_MOUSE_MOVE, INPUT_MOUSE_BUTTON, INPUT_SCROLL, INPUT_RESIZE,
+};
 
 pub struct InputCapture {
     events: Vec<InputEvent>,
@@ -33,7 +22,7 @@ impl InputCapture {
         std::mem::take(&mut self.events)
     }
 
-    pub fn handle_winit_event(&mut self, event: &WindowEvent) {
+    pub fn handle_winit_event(&mut self, event: &WindowEvent, target: u32) {
         match event {
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(key) = event.physical_key {
@@ -46,7 +35,8 @@ impl InputCapture {
                         code: winit_key_to_code(key),
                         value_a: pressed,
                         value_b: 0,
-                        _pad0: [0; 13],
+                        target_window: target,
+                        _pad0: [0; 12],
                     });
                 }
             }
@@ -62,7 +52,8 @@ impl InputCapture {
                     code: 0,
                     value_a: lx,
                     value_b: ly,
-                    _pad0: [0; 13],
+                    target_window: target,
+                    _pad0: [0; 12],
                 });
             }
 
@@ -82,7 +73,8 @@ impl InputCapture {
                     code: btn,
                     value_a: pressed,
                     value_b: 0,
-                    _pad0: [0; 13],
+                    target_window: target,
+                    _pad0: [0; 12],
                 });
             }
 
@@ -96,7 +88,8 @@ impl InputCapture {
                     code: 0,
                     value_a: dx,
                     value_b: dy,
-                    _pad0: [0; 13],
+                    target_window: target,
+                    _pad0: [0; 12],
                 });
             }
 

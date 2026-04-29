@@ -33,13 +33,30 @@ pub struct MetalRenderer {
     /// CAS hash of NODE_TEXTURE blob → MTLTexture. Lazily populated
     /// on first sight of a texture; never evicted (GC story TBD).
     texture_cache: HashMap<[u8; 32], Texture>,
+    /// Per-window framebuffers (B2). Each non-screen window renders
+    /// its scene into its own offscreen color+stencil texture; the
+    /// screen pass then composites these as textured quads.
+    window_fbos: HashMap<u16, WindowFbo>,
     width: u32,
     height: u32,
     scale_factor: f64,
 }
 
-impl GpuBackend for MetalRenderer {
-    fn new(window: Arc<Window>, width: u32, height: u32) -> Self {
+/// Offscreen framebuffer for one window. Lives until the window is
+/// destroyed or resized (resize re-allocates). Holds a `last_resized`
+/// timestamp so a cursor-driven drag-resize can be throttled to a
+/// sane reallocation rate instead of churning Metal textures on
+/// every move event.
+pub struct WindowFbo {
+    pub color:    Texture,
+    pub stencil:  Texture,
+    pub width:    u32,    // physical pixels
+    pub height:   u32,
+    pub last_resized: std::time::Instant,
+}
+
+impl MetalRenderer {
+    pub fn new(window: Arc<Window>, width: u32, height: u32) -> Self {
         let device = Device::system_default().expect("no Metal device");
         let queue = device.new_command_queue();
 
@@ -83,6 +100,13 @@ impl GpuBackend for MetalRenderer {
         desc.set_fragment_function(Some(&frag));
         desc.color_attachments().object_at(0).unwrap()
             .set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        // Stencil attachment is present in the screen render pass
+        // (used by text-glyph fill+cover). Pipelines that draw into
+        // that pass MUST declare the stencil format or Metal's
+        // behavior becomes undefined once the stencil has been
+        // touched — that's what was making decoration draws after
+        // the first window's text glyphs silently no-op.
+        desc.set_stencil_attachment_pixel_format(MTLPixelFormat::Stencil8);
 
         let pipeline = device.new_render_pipeline_state(&desc)
             .expect("failed to create pipeline");
@@ -93,6 +117,7 @@ impl GpuBackend for MetalRenderer {
         grad_desc.set_fragment_function(Some(&frag_grad));
         grad_desc.color_attachments().object_at(0).unwrap()
             .set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        grad_desc.set_stencil_attachment_pixel_format(MTLPixelFormat::Stencil8);
         let gradient_pipeline = device.new_render_pipeline_state(&grad_desc)
             .expect("failed to create gradient pipeline");
 
@@ -117,12 +142,37 @@ impl GpuBackend for MetalRenderer {
         tex_color.set_destination_rgb_blend_factor(MTLBlendFactor::OneMinusSourceAlpha);
         tex_color.set_source_alpha_blend_factor(MTLBlendFactor::One);
         tex_color.set_destination_alpha_blend_factor(MTLBlendFactor::OneMinusSourceAlpha);
+        tex_desc.set_stencil_attachment_pixel_format(MTLPixelFormat::Stencil8);
         let textured_pipeline = device.new_render_pipeline_state(&tex_desc)
             .expect("failed to create textured pipeline");
 
         let depth_desc = DepthStencilDescriptor::new();
-        depth_desc.set_depth_compare_function(MTLCompareFunction::Less);
-        depth_desc.set_depth_write_enabled(true);
+        // No depth attachment exists in the screen pass (color + stencil
+        // only). With compare=Less and no depth attachment, behavior is
+        // driver-dependent; the macOS Metal driver fails the test for
+        // some draws after a stencil_fill cover pass has set this state,
+        // making decorations of windows past the first invisible. Use
+        // Always — depth ordering is enforced by render-list order.
+        depth_desc.set_depth_compare_function(MTLCompareFunction::Always);
+        depth_desc.set_depth_write_enabled(false);
+        // Explicit no-op stencil descriptor: always-pass, never write.
+        // Required because the regular/textured/gradient pipelines
+        // declare a stencil_attachment_pixel_format (so they can
+        // coexist in the screen pass with text-glyph stencil ops),
+        // and Metal's behavior with a stencil-aware pipeline + a
+        // depth-stencil state lacking a stencil descriptor is
+        // implementation-defined — on this driver it ends up failing
+        // the stencil test where text was previously drawn, masking
+        // out the second window's decorations.
+        let noop_stencil = StencilDescriptor::new();
+        noop_stencil.set_stencil_compare_function(MTLCompareFunction::Always);
+        noop_stencil.set_stencil_failure_operation(MTLStencilOperation::Keep);
+        noop_stencil.set_depth_failure_operation(MTLStencilOperation::Keep);
+        noop_stencil.set_depth_stencil_pass_operation(MTLStencilOperation::Keep);
+        noop_stencil.set_read_mask(0xFF);
+        noop_stencil.set_write_mask(0x00);
+        depth_desc.set_front_face_stencil(Some(&noop_stencil));
+        depth_desc.set_back_face_stencil(Some(&noop_stencil));
         let depth_state = device.new_depth_stencil_state(&depth_desc);
 
         // stencil fill pipeline: no color write, stencil INVERT
@@ -200,12 +250,15 @@ impl GpuBackend for MetalRenderer {
             tess_counter_buf,
             tess_contour_buf,
             texture_cache: HashMap::new(),
+            window_fbos: HashMap::new(),
             width,
             height,
             scale_factor,
         }
     }
+}
 
+impl GpuBackend for MetalRenderer {
     fn resize(&mut self, width: u32, height: u32) {
         self.width = width;
         self.height = height;
@@ -290,7 +343,31 @@ impl GpuBackend for MetalRenderer {
     }
 
     fn render_frame(&mut self, scene: &SceneGraph, cas: &CasStore, _frame: u64, cursor: Option<(f32, f32)>) {
-        self._render_frame_impl(scene, cas, _frame, cursor);
+        self._render_frame_impl(scene, cas, _frame, cursor, &[]);
+    }
+
+    fn render_frame_with_overlays(&mut self,
+                                  scene: &SceneGraph, cas: &CasStore,
+                                  frame: u64, cursor: Option<(f32, f32)>,
+                                  overlays: &[crate::render::backend::WindowOverlay]) {
+        self._render_frame_impl(scene, cas, frame, cursor, overlays);
+    }
+
+    fn sync_fbos(&mut self, live: &HashMap<u16, (u32, u32)>) {
+        for (&id, &(w, h)) in live.iter() {
+            self.ensure_window_fbo(id, w, h);
+        }
+        let stale: Vec<u16> = self.window_fbos.keys().copied()
+            .filter(|id| !live.contains_key(id)).collect();
+        for id in stale {
+            log::info!("FBO: window {} freed", id);
+            self.window_fbos.remove(&id);
+        }
+    }
+
+    fn render_window_to_fbo(&mut self, id: u16, scene: &SceneGraph, cas: &CasStore) {
+        // Forward to the inherent method (defined in the FBO impl block).
+        MetalRenderer::render_window_to_fbo(self, id, scene, cas);
     }
 }
 
@@ -335,7 +412,7 @@ impl MetalRenderer {
         self.texture_cache.get(hash)
     }
 
-    fn _render_frame_impl(&mut self, scene: &SceneGraph, cas: &CasStore, _frame: u64, cursor: Option<(f32, f32)>) {
+    fn _render_frame_impl(&mut self, scene: &SceneGraph, cas: &CasStore, _frame: u64, cursor: Option<(f32, f32)>, overlays: &[crate::render::backend::WindowOverlay]) {
         // ensure stencil texture exists at correct size
         let need_stencil = self.stencil_texture.is_none()
             || self.stencil_texture.as_ref().map(|t| (t.width(), t.height())) != Some((self.width as u64, self.height as u64));
@@ -400,184 +477,58 @@ impl MetalRenderer {
                 mat4_mul(&view, &proj)
             };
 
-            let full_scissor = MTLScissorRect {
-                x: 0, y: 0, width: self.width as u64, height: self.height as u64,
-            };
+            // Ortho-pixel VP for overlay items (decorations, WM chrome).
+            // Width/height in logical pixels — scale from physical.
+            let logical_w = self.width as f32 / self.scale_factor as f32;
+            let logical_h = self.height as f32 / self.scale_factor as f32;
+            let ortho_vp = ortho_pixel_to_clip(logical_w, logical_h);
 
-            // render each item in the render list
-            for (idx, item) in scene.render_list().iter().enumerate() {
-                let mvp = mat4_mul(&item.world_matrix, &vp);
+            self.draw_items(encoder, scene, cas, &vp, &ortho_vp,
+                self.width, self.height, self.scale_factor as f32);
 
-                // Apply scissor rect (logical pixels from WM, scale to physical)
-                if let Some(clip) = &item.clip_rect {
-                    let scale = self.scale_factor as f32;
-                    let sx = ((clip[0] * scale).max(0.0) as u64).min(self.width as u64);
-                    let sy = ((clip[1] * scale).max(0.0) as u64).min(self.height as u64);
-                    let sw = ((clip[2] * scale).max(1.0) as u64).min(self.width as u64 - sx);
-                    let sh = ((clip[3] * scale).max(1.0) as u64).min(self.height as u64 - sy);
-                    encoder.set_scissor_rect(MTLScissorRect { x: sx, y: sy, width: sw, height: sh });
-                } else {
-                    encoder.set_scissor_rect(full_scissor);
-                }
-
-                // extract material (color or gradient)
-                let parsed_mat = if item.material != NULL_HASH {
-                    if let Some(data) = cas.load(&item.material) {
-                        if let Some(NodeData::Material(mat)) = NodeData::parse(data) {
-                            Some(mat)
-                        } else { None }
-                    } else {
-                        log::warn!("render[{}]: material {:02x}{:02x}.. not in CAS", idx, item.material[0], item.material[1]);
-                        None
-                    }
-                } else { None };
-
-                let use_gradient = parsed_mat.as_ref().map_or(false, |m| m.has_gradient() && m.gradient_stop_count >= 2);
-                let color = parsed_mat.as_ref().map_or([0.8f32, 0.8, 0.8, 1.0], |m| rgba8_to_float(m.base_color));
-
-                // Read-only lookup in the texture cache (populated by
-                // the pre-pass before the drawable was acquired).
-                let textured_tex: Option<Texture> = parsed_mat.as_ref()
-                    .filter(|m| m.albedo_tex != NULL_HASH)
-                    .and_then(|m| self.texture_cache.get(&m.albedo_tex).cloned());
-                let use_textured = textured_tex.is_some();
-
-                // load mesh vertex data from CAS
-                if item.mesh != NULL_HASH {
-                    if let Some(mesh_data) = cas.load(&item.mesh) {
-                        if let Some(NodeData::Mesh(mesh)) = NodeData::parse(mesh_data) {
-                            if let Some(verts_raw) = cas.load(&mesh.vertex_data) {
-                                let verts = if verts_raw.len() > 8 { &verts_raw[8..] } else { verts_raw };
-                                let vb = self.device.new_buffer_with_data(
-                                    verts.as_ptr() as *const _,
-                                    verts.len() as u64,
-                                    MTLResourceOptions::CPUCacheModeDefaultCache,
-                                );
-
-                                // transpose row-major → column-major for Metal's float4x4
-                                let mvp_t = transpose(&mvp);
-                                encoder.set_vertex_bytes(
-                                    1,
-                                    std::mem::size_of::<[f32; 16]>() as u64,
-                                    mvp_t.as_ptr() as *const _,
-                                );
-                                if use_textured {
-                                    encoder.set_render_pipeline_state(&self.textured_pipeline);
-                                    encoder.set_fragment_texture(0, Some(textured_tex.as_ref().unwrap()));
-                                    // tint = base_color (interpreted as RGBA mul). Pass as float4.
-                                    encoder.set_fragment_bytes(
-                                        0,
-                                        std::mem::size_of::<[f32; 4]>() as u64,
-                                        color.as_ptr() as *const _,
-                                    );
-                                } else if use_gradient {
-                                    let mat = parsed_mat.as_ref().unwrap();
-                                    let mut grad_buf = [0.0f32; 48];
-                                    grad_buf[0] = mat.gradient_type as f32;
-                                    grad_buf[1] = mat.gradient_stop_count as f32;
-                                    grad_buf[2] = mat.gradient_x0;
-                                    grad_buf[3] = mat.gradient_y0;
-                                    grad_buf[4] = mat.gradient_x1;
-                                    grad_buf[5] = mat.gradient_y1;
-                                    for i in 0..mat.gradient_stop_count as usize {
-                                        let (off, rgba) = mat.gradient_stops[i];
-                                        let c = rgba8_to_float(rgba);
-                                        grad_buf[8 + i * 5] = off;
-                                        grad_buf[8 + i * 5 + 1] = c[0];
-                                        grad_buf[8 + i * 5 + 2] = c[1];
-                                        grad_buf[8 + i * 5 + 3] = c[2];
-                                        grad_buf[8 + i * 5 + 4] = c[3];
-                                    }
-                                    encoder.set_render_pipeline_state(&self.gradient_pipeline);
-                                    encoder.set_fragment_bytes(
-                                        0,
-                                        std::mem::size_of::<[f32; 48]>() as u64,
-                                        grad_buf.as_ptr() as *const _,
-                                    );
-                                } else {
-                                    encoder.set_render_pipeline_state(&self.pipeline);
-                                    encoder.set_fragment_bytes(
-                                        0,
-                                        std::mem::size_of::<[f32; 4]>() as u64,
-                                        color.as_ptr() as *const _,
-                                    );
-                                }
-
-                                encoder.set_vertex_buffer(0, Some(&vb), 0);
-
-                                let has_indices = mesh.index_count > 0 && mesh.index_data != NULL_HASH;
-                                let ib = if has_indices {
-                                    cas.load(&mesh.index_data).map(|idx_raw| {
-                                        let indices = if idx_raw.len() > 8 { &idx_raw[8..] } else { idx_raw };
-                                        self.device.new_buffer_with_data(
-                                            indices.as_ptr() as *const _,
-                                            indices.len() as u64,
-                                            MTLResourceOptions::CPUCacheModeDefaultCache,
-                                        )
-                                    })
-                                } else { None };
-                                let idx_type = if mesh.index_format == 1 {
-                                    MTLIndexType::UInt32
-                                } else {
-                                    MTLIndexType::UInt16
-                                };
-
-                                if item.stencil_fill {
-                                    // pass 1: fill stencil with even-odd winding
-                                    encoder.set_render_pipeline_state(&self.stencil_fill_pipeline);
-                                    encoder.set_depth_stencil_state(&self.stencil_fill_ds);
-                                    encoder.set_stencil_reference_value(0);
-                                    if let Some(ref ib) = ib {
-                                        encoder.draw_indexed_primitives(
-                                            MTLPrimitiveType::Triangle,
-                                            mesh.index_count as u64, idx_type, ib, 0);
-                                    } else {
-                                        encoder.draw_primitives(
-                                            MTLPrimitiveType::Triangle, 0, mesh.vertex_count as u64);
-                                    }
-
-                                    // pass 2: cover — draw same geometry, stencil test non-zero, output color
-                                    if use_gradient {
-                                        encoder.set_render_pipeline_state(&self.gradient_pipeline);
-                                    } else {
-                                        encoder.set_render_pipeline_state(&self.pipeline);
-                                    }
-                                    encoder.set_depth_stencil_state(&self.stencil_cover_ds);
-                                    encoder.set_stencil_reference_value(0);
-                                    // fragment bytes already set above (color or gradient)
-                                    if let Some(ref ib) = ib {
-                                        encoder.draw_indexed_primitives(
-                                            MTLPrimitiveType::Triangle,
-                                            mesh.index_count as u64, idx_type, ib, 0);
-                                    } else {
-                                        encoder.draw_primitives(
-                                            MTLPrimitiveType::Triangle, 0, mesh.vertex_count as u64);
-                                    }
-
-                                    // restore normal pipeline state
-                                    encoder.set_depth_stencil_state(&self.depth_state);
-                                } else {
-                                    // normal draw — no stencil
-                                    if let Some(ref ib) = ib {
-                                        encoder.draw_indexed_primitives(
-                                            MTLPrimitiveType::Triangle,
-                                            mesh.index_count as u64, idx_type, ib, 0);
-                                    } else {
-                                        encoder.draw_primitives(
-                                            MTLPrimitiveType::Triangle, 0, mesh.vertex_count as u64);
-                                    }
-                                }
-                            } else {
-                                log::warn!("render[{}]: vertex_data {:02x}{:02x}.. not in CAS", idx, mesh.vertex_data[0], mesh.vertex_data[1]);
-                            }
-                        } else {
-                            log::warn!("render[{}]: mesh blob didn't parse as Mesh", idx);
-                        }
-                    } else {
-                        log::warn!("render[{}]: mesh {:02x}{:02x}.. not in CAS", idx, item.mesh[0], item.mesh[1]);
-                    }
-                }
+            // ── B2: composite per-window FBO textures ──────────────
+            // Each overlay is a logical-pixel rect identifying which
+            // window FBO to sample. Drawn as a textured quad through
+            // ortho_pixel_to_clip, mapping (ov.x..ov.x+ov.w) →
+            // (ov.y..ov.y+ov.h) in screen pixels.
+            for ov in overlays {
+                let Some(fbo) = self.window_fbos.get(&ov.id) else { continue; };
+                let fbo_color = fbo.color.clone();
+                // pos f32x3 + uv f32x2; 6 vertices for 2 triangles.
+                let x0 = ov.x;
+                let y0 = ov.y;
+                let x1 = ov.x + ov.w;
+                let y1 = ov.y + ov.h;
+                #[rustfmt::skip]
+                let verts: [f32; 30] = [
+                    x0, y0, 0.0,  0.0, 0.0,
+                    x1, y0, 0.0,  1.0, 0.0,
+                    x1, y1, 0.0,  1.0, 1.0,
+                    x0, y0, 0.0,  0.0, 0.0,
+                    x1, y1, 0.0,  1.0, 1.0,
+                    x0, y1, 0.0,  0.0, 1.0,
+                ];
+                let vb = self.device.new_buffer_with_data(
+                    verts.as_ptr() as *const _,
+                    (verts.len() * 4) as u64,
+                    MTLResourceOptions::CPUCacheModeDefaultCache,
+                );
+                let mvp_t = transpose(&ortho_vp);
+                let tint: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+                encoder.set_render_pipeline_state(&self.textured_pipeline);
+                encoder.set_depth_stencil_state(&self.depth_state);
+                encoder.set_scissor_rect(MTLScissorRect {
+                    x: 0, y: 0, width: self.width as u64, height: self.height as u64,
+                });
+                encoder.set_vertex_buffer(0, Some(&vb), 0);
+                encoder.set_vertex_bytes(1, std::mem::size_of::<[f32; 16]>() as u64,
+                    mvp_t.as_ptr() as *const _);
+                encoder.set_fragment_texture(0, Some(&fbo_color));
+                encoder.set_fragment_bytes(0, std::mem::size_of::<[f32; 4]>() as u64,
+                    tint.as_ptr() as *const _);
+                encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, 6);
             }
+
 
             // cursor overlay (screen-space, no scene graph involvement)
             if let Some((cx, cy)) = cursor {
@@ -909,6 +860,18 @@ kernel void tessellate_fill(
 }
 "#;
 
+/// Ortho projection: top-left origin in logical pixels, Y down,
+/// maps (0..w, 0..h, *) into Metal clip space with z = 0.5 (overlay
+/// always passes depth). Used for FLAG_OVERLAY render items.
+fn ortho_pixel_to_clip(w: f32, h: f32) -> [f32; 16] {
+    [
+         2.0 / w,  0.0,      0.0, 0.0,
+         0.0,     -2.0 / h,  0.0, 0.0,
+         0.0,      0.0,      1.0, 0.0,
+        -1.0,      1.0,      0.5, 1.0,
+    ]
+}
+
 fn perspective(fov_y: f32, aspect: f32, near: f32, far: f32) -> [f32; 16] {
     // Metal clip space: z in [0,1], row-major, row-vector (pos * M)
     // View space: camera looks down -Z, objects in front have negative z
@@ -995,3 +958,259 @@ fn normalize(v: [f32; 3]) -> [f32; 3] {
 }
 
 unsafe impl Send for MetalRenderer {}
+
+// ── B2: per-window framebuffer management ───────────────────────────
+impl MetalRenderer {
+    /// Draw each render item in the scene onto `encoder`. Used by both
+    /// the screen pass and (later) per-window FBO passes; the encoder
+    /// must already be configured with color + stencil attachments.
+    /// `target_w/h` are physical pixels; `scale` is the device-pixel
+    /// ratio used to convert clip rects from logical to physical.
+    fn draw_items(&self,
+                  encoder: &RenderCommandEncoderRef,
+                  scene: &SceneGraph,
+                  cas: &CasStore,
+                  vp: &[f32; 16],
+                  ortho_vp: &[f32; 16],
+                  target_w: u32,
+                  target_h: u32,
+                  scale: f32) {
+        encoder.set_render_pipeline_state(&self.pipeline);
+        let full_scissor = MTLScissorRect {
+            x: 0, y: 0, width: target_w as u64, height: target_h as u64,
+        };
+        for (idx, item) in scene.render_list().iter().enumerate() {
+            let item_vp = if item.flags & 0x01 != 0 { ortho_vp } else { vp };
+            let mvp = mat4_mul(&item.world_matrix, item_vp);
+
+            if let Some(clip) = &item.clip_rect {
+                let sx = ((clip[0] * scale).max(0.0) as u64).min(target_w as u64);
+                let sy = ((clip[1] * scale).max(0.0) as u64).min(target_h as u64);
+                let sw = ((clip[2] * scale).max(1.0) as u64).min(target_w as u64 - sx);
+                let sh = ((clip[3] * scale).max(1.0) as u64).min(target_h as u64 - sy);
+                encoder.set_scissor_rect(MTLScissorRect { x: sx, y: sy, width: sw, height: sh });
+            } else {
+                encoder.set_scissor_rect(full_scissor);
+            }
+
+            let parsed_mat = if item.material != NULL_HASH {
+                if let Some(data) = cas.load(&item.material) {
+                    if let Some(NodeData::Material(mat)) = NodeData::parse(data) {
+                        Some(mat)
+                    } else { None }
+                } else {
+                    log::warn!("render[{}]: material {:02x}{:02x}.. not in CAS", idx, item.material[0], item.material[1]);
+                    None
+                }
+            } else { None };
+
+            let use_gradient = parsed_mat.as_ref().map_or(false, |m| m.has_gradient() && m.gradient_stop_count >= 2);
+            let color = parsed_mat.as_ref().map_or([0.8f32, 0.8, 0.8, 1.0], |m| rgba8_to_float(m.base_color));
+
+            let textured_tex: Option<Texture> = parsed_mat.as_ref()
+                .filter(|m| m.albedo_tex != NULL_HASH)
+                .and_then(|m| self.texture_cache.get(&m.albedo_tex).cloned());
+            let use_textured = textured_tex.is_some();
+
+            if item.mesh == NULL_HASH { continue; }
+            let mesh_data = match cas.load(&item.mesh) {
+                Some(d) => d,
+                None => { log::warn!("render[{}]: mesh {:02x}{:02x}.. not in CAS", idx, item.mesh[0], item.mesh[1]); continue; }
+            };
+            let mesh = match NodeData::parse(mesh_data) {
+                Some(NodeData::Mesh(m)) => m,
+                _ => { log::warn!("render[{}]: mesh blob didn't parse as Mesh", idx); continue; }
+            };
+            let verts_raw = match cas.load(&mesh.vertex_data) {
+                Some(d) => d,
+                None => { log::warn!("render[{}]: vertex_data {:02x}{:02x}.. not in CAS", idx, mesh.vertex_data[0], mesh.vertex_data[1]); continue; }
+            };
+            let verts = if verts_raw.len() > 8 { &verts_raw[8..] } else { verts_raw };
+            let vb = self.device.new_buffer_with_data(
+                verts.as_ptr() as *const _,
+                verts.len() as u64,
+                MTLResourceOptions::CPUCacheModeDefaultCache,
+            );
+
+            let mvp_t = transpose(&mvp);
+            encoder.set_vertex_bytes(1, std::mem::size_of::<[f32; 16]>() as u64, mvp_t.as_ptr() as *const _);
+            if use_textured {
+                encoder.set_render_pipeline_state(&self.textured_pipeline);
+                encoder.set_fragment_texture(0, Some(textured_tex.as_ref().unwrap()));
+                encoder.set_fragment_bytes(0, std::mem::size_of::<[f32; 4]>() as u64, color.as_ptr() as *const _);
+            } else if use_gradient {
+                let mat = parsed_mat.as_ref().unwrap();
+                let mut grad_buf = [0.0f32; 48];
+                grad_buf[0] = mat.gradient_type as f32;
+                grad_buf[1] = mat.gradient_stop_count as f32;
+                grad_buf[2] = mat.gradient_x0;
+                grad_buf[3] = mat.gradient_y0;
+                grad_buf[4] = mat.gradient_x1;
+                grad_buf[5] = mat.gradient_y1;
+                for i in 0..mat.gradient_stop_count as usize {
+                    let (off, rgba) = mat.gradient_stops[i];
+                    let c = rgba8_to_float(rgba);
+                    grad_buf[8 + i * 5]     = off;
+                    grad_buf[8 + i * 5 + 1] = c[0];
+                    grad_buf[8 + i * 5 + 2] = c[1];
+                    grad_buf[8 + i * 5 + 3] = c[2];
+                    grad_buf[8 + i * 5 + 4] = c[3];
+                }
+                encoder.set_render_pipeline_state(&self.gradient_pipeline);
+                encoder.set_fragment_bytes(0, std::mem::size_of::<[f32; 48]>() as u64, grad_buf.as_ptr() as *const _);
+            } else {
+                encoder.set_render_pipeline_state(&self.pipeline);
+                encoder.set_fragment_bytes(0, std::mem::size_of::<[f32; 4]>() as u64, color.as_ptr() as *const _);
+            }
+
+            encoder.set_vertex_buffer(0, Some(&vb), 0);
+
+            let has_indices = mesh.index_count > 0 && mesh.index_data != NULL_HASH;
+            let ib = if has_indices {
+                cas.load(&mesh.index_data).map(|idx_raw| {
+                    let indices = if idx_raw.len() > 8 { &idx_raw[8..] } else { idx_raw };
+                    self.device.new_buffer_with_data(
+                        indices.as_ptr() as *const _,
+                        indices.len() as u64,
+                        MTLResourceOptions::CPUCacheModeDefaultCache,
+                    )
+                })
+            } else { None };
+            let idx_type = if mesh.index_format == 1 { MTLIndexType::UInt32 } else { MTLIndexType::UInt16 };
+
+            if item.stencil_fill {
+                encoder.set_render_pipeline_state(&self.stencil_fill_pipeline);
+                encoder.set_depth_stencil_state(&self.stencil_fill_ds);
+                encoder.set_stencil_reference_value(0);
+                if let Some(ref ib) = ib {
+                    encoder.draw_indexed_primitives(MTLPrimitiveType::Triangle, mesh.index_count as u64, idx_type, ib, 0);
+                } else {
+                    encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, mesh.vertex_count as u64);
+                }
+                if use_gradient {
+                    encoder.set_render_pipeline_state(&self.gradient_pipeline);
+                } else {
+                    encoder.set_render_pipeline_state(&self.pipeline);
+                }
+                encoder.set_depth_stencil_state(&self.stencil_cover_ds);
+                encoder.set_stencil_reference_value(0);
+                if let Some(ref ib) = ib {
+                    encoder.draw_indexed_primitives(MTLPrimitiveType::Triangle, mesh.index_count as u64, idx_type, ib, 0);
+                } else {
+                    encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, mesh.vertex_count as u64);
+                }
+                encoder.set_depth_stencil_state(&self.depth_state);
+            } else {
+                if let Some(ref ib) = ib {
+                    encoder.draw_indexed_primitives(MTLPrimitiveType::Triangle, mesh.index_count as u64, idx_type, ib, 0);
+                } else {
+                    encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, mesh.vertex_count as u64);
+                }
+            }
+        }
+    }
+
+    /// Ensure the FBO for this window exists at the given physical
+    /// pixel size. Re-allocates color+stencil textures if the size
+    /// changed and the previous reallocation was at least
+    /// `RESIZE_DEBOUNCE_MS` ago — otherwise leaves the FBO at its
+    /// last size (the next sync pass will pick up the now-stable
+    /// final size). This keeps a cursor-driven drag from burning
+    /// Metal textures at the input event rate.
+    pub fn ensure_window_fbo(&mut self, id: u16, width: u32, height: u32) {
+        const RESIZE_DEBOUNCE_MS: u128 = 33; // ~30 Hz
+        if let Some(fbo) = self.window_fbos.get(&id) {
+            if fbo.width == width && fbo.height == height { return; }
+            if fbo.last_resized.elapsed().as_millis() < RESIZE_DEBOUNCE_MS {
+                return;
+            }
+        }
+        let color_desc = TextureDescriptor::new();
+        color_desc.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        color_desc.set_width(width as u64);
+        color_desc.set_height(height as u64);
+        color_desc.set_storage_mode(MTLStorageMode::Private);
+        color_desc.set_usage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
+        let color = self.device.new_texture(&color_desc);
+
+        let stencil_desc = TextureDescriptor::new();
+        stencil_desc.set_pixel_format(MTLPixelFormat::Stencil8);
+        stencil_desc.set_width(width as u64);
+        stencil_desc.set_height(height as u64);
+        stencil_desc.set_storage_mode(MTLStorageMode::Private);
+        stencil_desc.set_usage(MTLTextureUsage::RenderTarget);
+        let stencil = self.device.new_texture(&stencil_desc);
+
+        self.window_fbos.insert(id, WindowFbo {
+            color, stencil, width, height,
+            last_resized: std::time::Instant::now(),
+        });
+        log::info!("FBO: window {} allocated {}x{}", id, width, height);
+    }
+
+    /// Drop a window's FBO (called when the window is destroyed).
+    pub fn drop_window_fbo(&mut self, id: u16) {
+        self.window_fbos.remove(&id);
+    }
+
+    /// Render one window's scene into its offscreen FBO. Uses the
+    /// window's own camera (perspective if scene.camera() is set,
+    /// otherwise a sensible default). Runs in its own command buffer
+    /// so the call is self-contained.
+    pub fn render_window_to_fbo(&mut self, id: u16, scene: &SceneGraph, cas: &CasStore) {
+        // Texture-cache pre-pass for this window's materials.
+        for item in scene.render_list().iter() {
+            if item.material == NULL_HASH { continue; }
+            if let Some(data) = cas.load(&item.material) {
+                if let Some(NodeData::Material(m)) = NodeData::parse(data) {
+                    if m.albedo_tex != NULL_HASH {
+                        let _ = self.ensure_texture(cas, &m.albedo_tex);
+                    }
+                }
+            }
+        }
+
+        let Some(fbo) = self.window_fbos.get(&id) else { return; };
+        let color_tex = fbo.color.clone();
+        let stencil_tex = fbo.stencil.clone();
+        let fbo_w = fbo.width;
+        let fbo_h = fbo.height;
+
+        objc2_autorelease(|_| {
+            let desc = RenderPassDescriptor::new();
+            let color = desc.color_attachments().object_at(0).unwrap();
+            color.set_texture(Some(&color_tex));
+            color.set_load_action(MTLLoadAction::Clear);
+            color.set_clear_color(MTLClearColor::new(0.0, 0.0, 0.0, 0.0));
+            color.set_store_action(MTLStoreAction::Store);
+
+            let stencil_att = desc.stencil_attachment().unwrap();
+            stencil_att.set_texture(Some(&stencil_tex));
+            stencil_att.set_load_action(MTLLoadAction::Clear);
+            stencil_att.set_clear_stencil(0);
+            stencil_att.set_store_action(MTLStoreAction::DontCare);
+
+            let cmd_buf = self.queue.new_command_buffer();
+            let encoder = cmd_buf.new_render_command_encoder(desc);
+
+            let aspect = fbo_w as f32 / fbo_h.max(1) as f32;
+            let vp = if let Some((cam, xform)) = scene.camera(cas) {
+                let view = invert_rigid(&xform.matrix);
+                let proj = perspective(cam.fov_y, cam.aspect_ratio, cam.near_plane, cam.far_plane);
+                mat4_mul(&view, &proj)
+            } else {
+                let view = look_at([0.0, 2.0, 5.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+                let proj = perspective(std::f32::consts::FRAC_PI_4, aspect, 0.1, 100.0);
+                mat4_mul(&view, &proj)
+            };
+            let ortho_vp = ortho_pixel_to_clip(fbo_w as f32, fbo_h as f32);
+
+            self.draw_items(encoder, scene, cas, &vp, &ortho_vp,
+                fbo_w, fbo_h, self.scale_factor as f32);
+
+            encoder.end_encoding();
+            cmd_buf.commit();
+            cmd_buf.wait_until_completed();
+        });
+    }
+}

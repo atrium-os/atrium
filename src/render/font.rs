@@ -140,6 +140,17 @@ impl FontData {
             .unwrap_or(size * 0.5)
     }
 
+    /// Total advance width of `text` at `size`, matching layout_text's
+    /// per-character advance (spaces use 'n' advance).
+    pub fn text_width(&self, text: &str, size: f32) -> f32 {
+        let mut w = 0.0;
+        for ch in text.chars() {
+            let c = if ch == ' ' { 'n' } else { ch };
+            w += self.advance_width(c, size);
+        }
+        w
+    }
+
     pub fn layout_text(
         &mut self,
         cas: &mut CasStore,
