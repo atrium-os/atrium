@@ -11,8 +11,7 @@
  */
 
 #include "tessera/crc.h"
-
-#include <string.h>
+#include "tessera_compat.h"
 
 /* Compile-time endian gate: v1 targets little-endian only (aarch64 +
  * x86_64). Adding a big-endian path is a v2 portability item. */

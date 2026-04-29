@@ -14,8 +14,12 @@
 #ifndef TESSERA_FORMAT_H_
 #define TESSERA_FORMAT_H_
 
-#include <stdint.h>
-#include <stddef.h>
+#ifdef _KERNEL
+#  include <sys/types.h>
+#else
+#  include <stdint.h>
+#  include <stddef.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {

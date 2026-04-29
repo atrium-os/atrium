@@ -27,9 +27,11 @@
 #include "tessera/error.h"
 #include "tessera/crc.h"
 #include "tessera/format.h"
+#include "tessera_compat.h"
 
-#include <stddef.h>
-#include <string.h>
+#ifndef _KERNEL
+#  include <stddef.h>
+#endif
 
 /* ── helpers ─────────────────────────────────────────────────────── */
 

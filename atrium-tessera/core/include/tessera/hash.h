@@ -14,8 +14,12 @@
 #ifndef TESSERA_HASH_H_
 #define TESSERA_HASH_H_
 
-#include <stdint.h>
-#include <stddef.h>
+#ifdef _KERNEL
+#  include <sys/types.h>
+#else
+#  include <stdint.h>
+#  include <stddef.h>
+#endif
 #include "tessera/format.h"
 
 #ifdef __cplusplus
