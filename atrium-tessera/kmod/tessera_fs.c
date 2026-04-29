@@ -684,9 +684,11 @@ static int
 tessera_emit_dirent(struct uio *uio, ino_t fileno, uint8_t type,
                     const char *name, uint16_t namlen)
 {
-	uint8_t buf[64];
+	/* 280 covers any TESSERA_PATH_NAME_MAX (255) plus header + NUL +
+	 * 8-byte alignment slack. */
+	uint8_t buf[288];
 	size_t reclen = tessera_dirent_reclen(namlen);
-	if (reclen > sizeof(buf)) return (EINVAL);
+	if (reclen > sizeof(buf)) return (ENAMETOOLONG);
 
 	struct dirent *de = (struct dirent *)buf;
 	bzero(buf, reclen);
@@ -699,24 +701,97 @@ tessera_emit_dirent(struct uio *uio, ino_t fileno, uint8_t type,
 	return (uiomove(buf, reclen, uio));
 }
 
+static uint8_t
+tessera_dt_from_mode(uint32_t mode)
+{
+	switch (mode & 0170000) {
+	case 040000:  return (DT_DIR);
+	case 0100000: return (DT_REG);
+	case 0120000: return (DT_LNK);
+	default:      return (DT_UNKNOWN);
+	}
+}
+
 static int
 tessera_vop_readdir(struct vop_readdir_args *ap)
 {
 	struct uio   *uio = ap->a_uio;
 	struct tessera_node *tn = VTOTNODE(ap->a_vp);
-	int err;
+	struct tessera_mount *tmp_ = VFSTOTESSERA(ap->a_vp->v_mount);
+	int err = 0;
 
-	const size_t r1 = tessera_dirent_reclen(1);
-	const size_t r2 = tessera_dirent_reclen(2);
+	/* Round 4d strategy: emit the entire directory in the first
+	 * call. Subsequent calls (uio_offset > 0) return EOF. Correct
+	 * for ls(1)-shape consumers with a 4 KiB buffer; large
+	 * directories will need an offset-cookie scheme in round 5+. */
+	if (uio->uio_offset > 0) {
+		if (ap->a_eofflag != NULL) *ap->a_eofflag = 1;
+		return (0);
+	}
 
-	if (uio->uio_offset == 0 && uio->uio_resid >= r1) {
-		err = tessera_emit_dirent(uio, tn->inode_no, DT_DIR, ".", 1);
-		if (err != 0) return (err);
+	/* Always emit "." and "..". */
+	err = tessera_emit_dirent(uio, tn->inode_no, DT_DIR, ".", 1);
+	if (err != 0) return (err);
+	err = tessera_emit_dirent(uio, tn->inode_no, DT_DIR, "..", 2);
+	if (err != 0) return (err);
+
+	/* Walk the directory's manifest, if any. */
+	if (tmp_->inode_tree == NULL) goto done;
+
+	uint8_t key[4];
+	tessera_inode_record_t dino;
+	encode_inode_key((uint32_t)tn->inode_no, key);
+	if (tessera_btree_get(tmp_->inode_tree, key, &dino) != TESSERA_OK)
+		goto done;
+	if (tessera_hash_is_null(dino.manifest_hash))
+		goto done;
+
+	uint8_t *blob = NULL;
+	uint32_t blob_len = 0;
+	if (tessera_fs_fetch_blob(tmp_, dino.manifest_hash, &blob, &blob_len)
+	    != 0)
+		goto done;
+
+	tessera_manifest_parser_t *p = tessera_manifest_parse(blob, blob_len);
+	if (p == NULL) {
+		free(blob, M_TESSERA);
+		goto done;
 	}
-	if (uio->uio_offset == (off_t)r1 && uio->uio_resid >= r2) {
-		err = tessera_emit_dirent(uio, tn->inode_no, DT_DIR, "..", 2);
-		if (err != 0) return (err);
+	if (tessera_manifest_parser_kind(p) != TESSERA_MFT_DIRECTORY) {
+		tessera_manifest_parser_free(p);
+		free(blob, M_TESSERA);
+		goto done;
 	}
+	const uint8_t *body = blob + 32;
+	const size_t   blen = blob_len - 32;
+
+	for (size_t off = 0; off + 10 <= blen; ) {
+		uint64_t child;
+		uint16_t name_len;
+		memcpy(&child,    body + off,     8);
+		memcpy(&name_len, body + off + 8, 2);
+		if (off + 10 + name_len > blen) break;
+		const char *name = (const char *)(body + off + 10);
+
+		uint8_t dt = DT_UNKNOWN;
+		uint8_t k2[4];
+		tessera_inode_record_t cino;
+		encode_inode_key((uint32_t)child, k2);
+		if (tessera_btree_get(tmp_->inode_tree, k2, &cino) == TESSERA_OK)
+			dt = tessera_dt_from_mode(cino.mode);
+
+		err = tessera_emit_dirent(uio, child, dt, name, name_len);
+		if (err != 0) {
+			tessera_manifest_parser_free(p);
+			free(blob, M_TESSERA);
+			return (err);
+		}
+		off += 10 + name_len;
+	}
+	tessera_manifest_parser_free(p);
+	free(blob, M_TESSERA);
+
+done:
 	if (ap->a_eofflag != NULL) *ap->a_eofflag = 1;
 	return (0);
 }
