@@ -44,6 +44,7 @@
 #include "tessera/btree.h"
 #include "tessera/codec.h"
 #include "tessera/error.h"
+#include "tessera/extent.h"
 #include "tessera/format.h"
 #include "tessera/hash.h"
 #include "tessera/manifest.h"
@@ -60,9 +61,14 @@ MALLOC_DEFINE(M_TESSERA, "tessera", "Tessera filesystem");
  * round-4 will wire alloc to tessera_extent_alloc against the
  * volume's free-extent tree. */
 
+/* Forward decl — bio_ctx points back at the mount so the alloc/free
+ * callbacks can route through the volume's extent allocator. */
+struct tessera_mount;
+
 struct tessera_kbio_ctx {
-	struct vnode *devvp;
-	struct ucred *cred;
+	struct vnode         *devvp;
+	struct ucred         *cred;
+	struct tessera_mount *mount;
 };
 
 static int
@@ -90,13 +96,10 @@ tessera_kbio_write(void *ctx, uint64_t sector, const uint8_t *buf)
 	return (bwrite(bp));
 }
 
-static int
-tessera_kbio_alloc(void *ctx, uint64_t n, uint64_t *out_sector)
-{ (void)ctx; (void)n; (void)out_sector; return (-1); }
-
-static int
-tessera_kbio_free(void *ctx, uint64_t s, uint64_t n)
-{ (void)ctx; (void)s; (void)n; return (0); }
+/* Forward decl — defined inline below so we can take the mount's
+ * extent_alloc field. */
+static int tessera_kbio_alloc(void *ctx, uint64_t n, uint64_t *out_sector);
+static int tessera_kbio_free (void *ctx, uint64_t s, uint64_t n);
 
 /* ── forward decl for fetch_blob (uses tessera_mount) ────────── */
 struct tessera_mount;
@@ -115,7 +118,28 @@ struct tessera_mount {
 	tessera_block_io_t        bio;
 	tessera_btree_t          *inode_tree;
 	tessera_btree_t          *pack_registry_tree;
+	tessera_extent_alloc_t   *extent_alloc;
 };
+
+static int
+tessera_kbio_alloc(void *ctx, uint64_t n, uint64_t *out_sector)
+{
+	struct tessera_kbio_ctx *k = ctx;
+	if (k->mount == NULL || k->mount->extent_alloc == NULL)
+		return (-1);
+	return (tessera_extent_alloc(k->mount->extent_alloc, n, out_sector)
+	    == TESSERA_OK ? 0 : -1);
+}
+
+static int
+tessera_kbio_free(void *ctx, uint64_t s, uint64_t n)
+{
+	struct tessera_kbio_ctx *k = ctx;
+	if (k->mount == NULL || k->mount->extent_alloc == NULL)
+		return (-1);
+	return (tessera_extent_free(k->mount->extent_alloc, s, n)
+	    == TESSERA_OK ? 0 : -1);
+}
 
 #define VFSTOTESSERA(mp) ((struct tessera_mount *)((mp)->mnt_data))
 
@@ -265,6 +289,7 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp)
 	 * for diagnostic purposes. */
 	tmp_->bio_ctx.devvp = devvp;
 	tmp_->bio_ctx.cred  = curthread->td_ucred;
+	tmp_->bio_ctx.mount = tmp_;
 	tmp_->bio.read_block  = tessera_kbio_read;
 	tmp_->bio.write_block = tessera_kbio_write;
 	tmp_->bio.alloc       = tessera_kbio_alloc;
@@ -285,6 +310,21 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp)
 		printf("tessera_fs: warning — pack registry open at sector %lu "
 		    "failed; blob lookups will fail\n",
 		    (unsigned long)tmp_->sb.pack_registry_root);
+
+	/* Open the free-extent allocator off the on-disk tree. Powers
+	 * future kbio_alloc / _free calls (round 6+ mutation paths).
+	 * For round 6a it's loaded but unused. */
+	tmp_->extent_alloc = tessera_extent_open(&tmp_->bio,
+	    tmp_->sb.free_extent_root);
+	if (tmp_->extent_alloc == NULL)
+		printf("tessera_fs: warning — free-extent open at sector %lu "
+		    "failed; mutation paths will fail to allocate\n",
+		    (unsigned long)tmp_->sb.free_extent_root);
+	else
+		printf("tessera_fs: extent allocator loaded — %lu free sectors, "
+		    "largest run %lu\n",
+		    (unsigned long)tessera_extent_free_blocks(tmp_->extent_alloc),
+		    (unsigned long)tessera_extent_largest_free_run(tmp_->extent_alloc));
 
 	mp->mnt_data = tmp_;
 	mp->mnt_stat.f_namemax = TESSERA_PATH_NAME_MAX;
@@ -370,6 +410,8 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 	if (err != 0) return (err);
 
 	if (tmp_ != NULL) {
+		if (tmp_->extent_alloc != NULL)
+			tessera_extent_close(tmp_->extent_alloc);
 		if (tmp_->pack_registry_tree != NULL)
 			tessera_btree_close(tmp_->pack_registry_tree);
 		if (tmp_->inode_tree != NULL)
