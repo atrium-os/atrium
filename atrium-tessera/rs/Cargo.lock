@@ -23,7 +23,7 @@ version = "0.1.0"
 name = "tessera-test-harness"
 version = "0.1.0"
 dependencies = [
- "tessera",
+ "tessera-sys",
 ]
 
 [[package]]

@@ -4,12 +4,15 @@ version.workspace     = true
 edition.workspace     = true
 license.workspace     = true
 repository.workspace  = true
-description = "Cross-language test harness for tessera (property + differential)."
+description = "In-memory block device + property-test scaffolding for tessera-core."
 publish     = false
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
-name = "tessera-test-harness"
-path = "src/main.rs"
+name = "tessera-property-tests"
+path = "src/bin/property_tests.rs"
 
 [dependencies]
-tessera = { path = "../tessera" }
+tessera-sys = { path = "../tessera-sys" }
