@@ -95,9 +95,12 @@ typedef struct TESSERA_PACKED {
 	uint64_t  total_pack_count;
 	uint64_t  format_time;
 	uint64_t  last_mount_time;
+	uint64_t  meta_reserve_start;        /* sector of metadata reserve   */
+	uint64_t  meta_reserve_length;       /* sectors                       */
+	uint64_t  meta_reserve_bump;         /* next free sector in reserve  */
 	uint32_t  last_unmount_clean;
-	uint32_t  crc32;                     /* CRC over bytes 0..188 */
-	uint8_t   reserved[3904];
+	uint32_t  crc32;                     /* CRC over bytes 0..212 */
+	uint8_t   reserved[3880];
 } tessera_superblock_t;
 
 /* Superblock feature flags */

@@ -534,6 +534,9 @@ tessera_volume_format(const tessera_block_io_t *io,
 	sb.free_extent_gen        = 1;
 	sb.pack_zone_start        = free_zone_start;
 	sb.pack_zone_length       = opts->total_sectors - free_zone_start;
+	sb.meta_reserve_start     = metadata_zone_start;
+	sb.meta_reserve_length    = TESSERA_METADATA_ZONE_SECTORS;
+	sb.meta_reserve_bump      = fc.bump;       /* runtime starts here */
 	sb.next_inode_no          =
 	    (opts->seed_dirent_name != NULL && opts->seed_dirent_name_len > 0)
 	        ? (uint64_t)opts->seed_dirent_inode + 1

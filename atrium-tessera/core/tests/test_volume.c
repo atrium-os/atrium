@@ -238,6 +238,7 @@ test_inode_and_pack_roots_reachable(void)
 	tessera_volume_t *v = NULL;
 	tessera_volume_open(&io, &v);
 
+	/* mkfs seeds inode 2 (root dir); the inode tree is non-empty. */
 	tessera_btree_t *inode_tree = tessera_btree_open(&io,
 	    tessera_volume_inode_root(v),
 	    /*kind*/ 0, /*key*/ 4, /*value*/ TESSERA_INODE_RECORD_SIZE);
@@ -245,7 +246,10 @@ test_inode_and_pack_roots_reachable(void)
 	tessera_btree_cursor_t *c = tessera_btree_seek_first(inode_tree);
 	CHECK(c != NULL);
 	uint8_t k[4]; uint8_t val[TESSERA_INODE_RECORD_SIZE];
-	CHECK(tessera_btree_cursor_get(c, k, val) == TESSERA_ENOENT);
+	CHECK(tessera_btree_cursor_get(c, k, val) == TESSERA_OK);
+	/* First entry is inode 2 (TESSERA_INODE_ROOT_DIR), big-endian key. */
+	CHECK(k[0] == 0 && k[1] == 0 && k[2] == 0 && k[3] == 2);
+	CHECK(tessera_btree_cursor_next(c) == TESSERA_ENOENT);
 	tessera_btree_cursor_free(c);
 	tessera_btree_close(inode_tree);
 

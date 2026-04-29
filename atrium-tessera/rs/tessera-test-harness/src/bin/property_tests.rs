@@ -1016,15 +1016,15 @@ fn scenario_format_size_boundary() -> Result<(), String> {
         return Err("journal=0 (default) rejected".into());
     }
 
-    /* Just-below-minimum: journal+metadata+1 = 4 + 32 + 16 + 1 = 53.
+    /* Just-below-minimum: journal+metadata+1 = 4 + 32 + 128 + 1 = 165.
      * Anything <= journal+metadata fails. */
-    let too_small = 4 + 32 + 16 + 1;
+    let too_small = 4 + 32 + 128 + 1;
     if try_format(too_small, 32) == 0 {
         return Err(format!("size={too_small} unexpectedly accepted"));
     }
 
     /* Just-above-minimum: must succeed. */
-    let just_enough = 4 + 32 + 16 + 8;
+    let just_enough = 4 + 32 + 128 + 8;
     if try_format(just_enough, 32) != 0 {
         return Err(format!("size={just_enough} unexpectedly rejected"));
     }

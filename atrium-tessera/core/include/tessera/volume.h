@@ -63,10 +63,13 @@ typedef struct {
 } tessera_format_opts_t;
 
 /* Reserved metadata-zone size, in sectors, immediately after the
- * journal. Holds the empty inode/pack-registry/free-extent root nodes
- * and a small overprovisioning headroom. Volume-runtime allocations
- * come from after this zone. */
-#define TESSERA_METADATA_ZONE_SECTORS 16
+ * journal. The reserve serves both format-time and runtime: format
+ * consumes the empty inode/pack-registry/free-extent root nodes
+ * (~5 sectors); runtime mutation paths allocate inode/pack/free
+ * tree updates from the rest via the SB-tracked bump pointer
+ * (tessera-fs.md §3.3). Sized large enough to cover many commits
+ * before a `tessera repack` is needed. */
+#define TESSERA_METADATA_ZONE_SECTORS 128
 
 /* mkfs. The block_io's alloc/free callbacks may be NULL — format()
  * never invokes them; it bumps sectors itself out of the metadata

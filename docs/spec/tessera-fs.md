@@ -82,9 +82,12 @@ offset  size  field                  description
  160      8   total_pack_count        live packs (advisory, repaired by GC)
  168      8   format_time             Unix nanos, set at mkfs.tessera
  176      8   last_mount_time         Unix nanos
- 184      4   last_unmount_clean      0 = clean, 1 = unclean (replay needed)
- 188      4   crc32                   CRC over bytes 0..188
- 192   3904   reserved                zero
+ 184      8   meta_reserve_start      sector of metadata reserve (§3.3)
+ 192      8   meta_reserve_length     sectors
+ 200      8   meta_reserve_bump       next free sector in the reserve
+ 208      4   last_unmount_clean      0 = clean, 1 = unclean (replay needed)
+ 212      4   crc32                   CRC over bytes 0..212
+ 216   3880   reserved                zero
 4096
 ```
 
