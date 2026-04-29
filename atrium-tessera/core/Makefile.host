@@ -32,7 +32,7 @@ PORTABLE_OBJS = \
     extent.host.o \
     gc.host.o
 
-TESTS = test_crc test_codec test_cdc
+TESTS = test_crc test_codec test_cdc test_extent test_btree
 
 .PATH: ${.CURDIR}/src ${.CURDIR}/tests
 
@@ -50,6 +50,12 @@ test_codec: test_codec.c ${PORTABLE_OBJS}
 
 test_cdc: test_cdc.c ${PORTABLE_OBJS}
 	${CC} ${CFLAGS} -o ${.TARGET} ${.CURDIR}/tests/test_cdc.c ${PORTABLE_OBJS}
+
+test_extent: test_extent.c ${PORTABLE_OBJS}
+	${CC} ${CFLAGS} -o ${.TARGET} ${.CURDIR}/tests/test_extent.c ${PORTABLE_OBJS}
+
+test_btree: test_btree.c ${PORTABLE_OBJS}
+	${CC} ${CFLAGS} -o ${.TARGET} ${.CURDIR}/tests/test_btree.c ${PORTABLE_OBJS}
 
 check: ${TESTS}
 	@for t in ${TESTS}; do \

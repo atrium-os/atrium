@@ -3,6 +3,11 @@ core/*.host.o
 core/test_crc
 core/test_codec
 core/test_cdc
+core/test_extent
+core/test_btree
+core/test_manifest
+core/test_pack
+core/test_journal
 
 # macOS debug bundles produced by clang when building host tests.
 **/*.dSYM/
