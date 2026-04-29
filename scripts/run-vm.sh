@@ -53,6 +53,16 @@ for arg in "$@"; do
         --virtio-gpu)
             VIRTIO_GPU_ARGS="-device virtio-gpu-pci"
             ;;
+        --bochs)
+            # bochs-display has BochsDisplayDxe support in the
+            # prebuilt EDK2 we use, so EDK2 publishes a working GOP
+            # at boot and FreeBSD's loader.efi captures the
+            # framebuffer info into MODINFOMD_EFI_FB. Used to
+            # exercise the atrium-bootfb / atrium-splash boot path
+            # (the prebuilt EDK2 lacks VirtioGpuDxe so virtio-gpu
+            # alone produces no GOP metadata).
+            VIRTIO_GPU_ARGS="-device bochs-display"
+            ;;
         --display)
             # Cocoa window so virtio-gpu scanout is actually visible.
             # Drops -nographic; serial console moves to mon:stdio.

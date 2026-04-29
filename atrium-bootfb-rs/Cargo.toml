@@ -1,0 +1,14 @@
+[package]
+name = "atrium-bootfb-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Safe Rust binding for the Atrium pre-GPU framebuffer cdev (/dev/atrium-bootfb0)"
+license = "BSD-2-Clause"
+publish = false
+
+[lib]
+name = "atrium_bootfb"
+path = "src/lib.rs"
+
+[dependencies]
+libc = "0.2"

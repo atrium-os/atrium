@@ -1,0 +1,48 @@
+#!/bin/sh
+#
+# PROVIDE: atrium_splash
+# REQUIRE: mountcritlocal
+# BEFORE: FILESYSTEMS netif
+# KEYWORD: nojail
+#
+# Atrium boot splash. Runs as early as possible after the root
+# filesystem is mounted, paints over /dev/atrium-bootfb0 (the EFI
+# GOP framebuffer the kernel inherited from the bootloader), and
+# exits when /dev/atrium-display0 appears (i.e. atrium-virtio-gpu
+# or another native GPU driver has taken over the scanout).
+#
+# Requires `atrium_bootfb_load="YES"` in /boot/loader.conf so the
+# kmod is preloaded with the kernel — by the time this script
+# runs, /dev/atrium-bootfb0 must already exist. A post-boot kldload
+# is too late: vt_efifb and atrium_bootfb both want the EFI GOP
+# framebuffer, and we want our cdev present before any userspace
+# tries to paint into it.
+
+. /etc/rc.subr
+
+name="atrium_splash"
+desc="Atrium boot splash"
+rcvar="atrium_splash_enable"
+
+command="/usr/local/libexec/atrium-splash"
+command_args="&"
+pidfile="/var/run/atrium-splash.pid"
+
+start_precmd="atrium_splash_precmd"
+
+atrium_splash_precmd()
+{
+    if [ ! -c /dev/atrium-bootfb0 ]; then
+        warn "/dev/atrium-bootfb0 missing — atrium_bootfb_load=YES in /boot/loader.conf?"
+        return 1
+    fi
+    if [ ! -x "$command" ]; then
+        warn "$command not installed"
+        return 1
+    fi
+    return 0
+}
+
+load_rc_config $name
+: ${atrium_splash_enable:=NO}
+run_rc_command "$1"

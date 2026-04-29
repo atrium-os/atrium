@@ -48,3 +48,4 @@ tarballs/
 
 # Settings local to one machine.
 .claude/settings.local.json
+atrium-kmod/bootfb/machine

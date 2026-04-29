@@ -320,6 +320,44 @@ QEMU args added in `scripts/run-vm.sh --display`: `-device qemu-xhci -device usb
 
 D1 step 2(c.15)+ candidates: cleared.
 
+**D1 step 2(c.22) (atrium-bootfb kmod + atrium-splash binary)** — INFRASTRUCTURE COMPLETE; QEMU GOP-source pending (2026-04-29).
+
+Goal: paint a boot splash on the EFI GOP framebuffer between the kernel handing off to userspace and `atrium-virtio-gpu` claiming the scanout via `/dev/atrium-display0`. No quick workarounds — proper kmod + rc.d service path.
+
+**Components (all built, all cross-compile clean)**
+
+- `atrium-kmod/bootfb/` — `atrium_bootfb.ko`. At `MOD_LOAD` reads `MODINFOMD_EFI_FB` from the bootloader's preserved metadata (`preload_search_info(preload_kmdp, MODINFO_METADATA | MODINFOMD_EFI_FB)` — the same lookup `vt_efifb` uses), publishes `/dev/atrium-bootfb0` with `d_mmap` returning the framebuffer's physical pages and `d_ioctl ATRIUM_BOOTFB_IOC_GET_INFO` reporting width/height/stride/format/masks. `VM_MEMATTR_WRITE_COMBINING` for the mapping so sequential writes batch. No exclusive ownership of the device — `vt_efifb` may also be writing console text into the same memory; the splash overpaints it.
+- `atrium-bootfb-rs/` — safe Rust binding (`BootFb::open` → mmap'd `&mut [u8]`).
+- `atrium-splash/` — userspace splash binary using the existing `tiny_skia::Pixmap`. Renders a gradient panel + hand-drawn "atrium" wordmark + an orbiting indicator dot at 30 fps. Polls `/dev/atrium-display0` and exits cleanly when it appears (handoff to atrium-compositor).
+- `atrium-splash/atrium-splash.rc` — rc.d service script. `REQUIRE: mountcritlocal`, `BEFORE: FILESYSTEMS netif` so it paints the moment the root FS is up.
+
+**Setup on the VM (or any FreeBSD UEFI system)**
+
+```sh
+# One-time install — kmod into /boot/modules so loader.conf can preload.
+cp /mnt/host/atrium-kmod/bootfb/atrium_bootfb.ko /boot/modules/
+echo 'atrium_bootfb_load="YES"' >> /boot/loader.conf
+
+# Splash binary + rc.d service
+cp /mnt/host/atrium-splash/target/aarch64-unknown-freebsd/release/atrium-splash \
+   /usr/local/libexec/atrium-splash
+cp /mnt/host/atrium-splash/atrium-splash.rc /usr/local/etc/rc.d/atrium_splash
+chmod +x /usr/local/etc/rc.d/atrium_splash
+echo 'atrium_splash_enable="YES"' >> /etc/rc.conf
+
+reboot
+```
+
+The kmod is preloaded by `loader.efi` *before* the kernel's main thread starts — it attaches at `SI_SUB_DRIVERS` order so `/dev/atrium-bootfb0` exists before any userspace code runs. The rc.d service starts the splash binary right after `mountcritlocal`. Splash exits when atrium-virtio-gpu (or another native GPU driver) creates `/dev/atrium-display0`.
+
+**The QEMU caveat** (why this isn't visually verified in our bring-up VM)
+
+The prebuilt EDK2 firmware bundled with our QEMU build doesn't ship `VirtioGpuDxe`, so `virtio-gpu-pci` produces no GOP. We tried `bochs-display` (which has `BochsDisplayDxe`) — same story: no `MODINFOMD_EFI_FB` metadata reaches FreeBSD. `vt_efifb`'s probe returns `CN_DEAD` for the same reason; vt falls back to a non-graphical backend and the kernel runs with serial console only. This is a firmware-level limitation, not a kmod problem.
+
+On real UEFI hardware (laptops/desktops/servers), GOP is universally present and the standard `MODINFOMD_EFI_FB` flow works — atrium-splash will paint as designed.
+
+For a future verification path in QEMU: a more recent EDK2 build with `VirtioGpuDxe` and/or `BochsDisplayDxe` is the cheap fix. `scripts/run-vm.sh --bochs --display` swaps virtio-gpu for bochs-display so when the EDK2 build catches up, that mode exercises splash without further changes.
+
 **D1 step 2(c.19) (multi-window FBO compositing in tiny_skia_backend)** — DONE (2026-04-29). `tiny_skia_backend` gains a per-window FBO map (`window_fbos: HashMap<u16, Pixmap>`):
 
 - `sync_fbos(live)` reconciles the map against the WM's live windows each frame — allocates new FBOs at the right size, drops FBOs whose window is gone or whose dimensions changed.

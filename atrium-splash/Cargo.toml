@@ -1,0 +1,17 @@
+[package]
+name = "atrium-splash"
+version = "0.1.0"
+edition = "2021"
+description = "Atrium boot splash — renders to /dev/atrium-bootfb0 (EFI GOP) before the native GPU driver claims the display"
+license = "BSD-2-Clause"
+publish = false
+
+[[bin]]
+name = "atrium-splash"
+path = "src/main.rs"
+
+[dependencies]
+atrium-bootfb-rs = { path = "../atrium-bootfb-rs" }
+fresco-server = { path = "../../fresco", features = ["tiny-skia-backend"] }
+tiny-skia = "0.11"
+libc = "0.2"
