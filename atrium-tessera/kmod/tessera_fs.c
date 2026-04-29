@@ -101,11 +101,13 @@ tessera_kbio_write(void *ctx, uint64_t sector, const uint8_t *buf)
 static int tessera_kbio_alloc(void *ctx, uint64_t n, uint64_t *out_sector);
 static int tessera_kbio_free (void *ctx, uint64_t s, uint64_t n);
 
-/* ── forward decl for fetch_blob (uses tessera_mount) ────────── */
+/* ── forward decls (uses tessera_mount) ──────────────────────── */
 struct tessera_mount;
 static int tessera_fs_fetch_blob(struct tessera_mount *tmp_,
                                   const tessera_hash_t hash,
                                   uint8_t **out_buf, uint32_t *out_len);
+static int tessera_commit_sb    (struct tessera_mount *tmp_);
+static int tessera_commit_extent(struct tessera_mount *tmp_);
 
 /* ── per-mount state ─────────────────────────────────────────── */
 
@@ -115,7 +117,8 @@ struct tessera_mount {
 	struct cdev              *dev;
 	tessera_superblock_t      sb;
 	struct tessera_kbio_ctx   bio_ctx;
-	tessera_block_io_t        bio;
+	tessera_block_io_t        bio;          /* data zone */
+	tessera_block_io_t        meta_bio;     /* metadata reserve */
 	tessera_btree_t          *inode_tree;
 	tessera_btree_t          *pack_registry_tree;
 	tessera_extent_alloc_t   *extent_alloc;
@@ -139,6 +142,34 @@ tessera_kbio_free(void *ctx, uint64_t s, uint64_t n)
 		return (-1);
 	return (tessera_extent_free(k->mount->extent_alloc, s, n)
 	    == TESSERA_OK ? 0 : -1);
+}
+
+/* Metadata-reserve bump allocator. Used for inode-tree / pack-
+ * registry / free-extent tree updates. NOT recursing into the data
+ * extent allocator avoids the iterating-while-mutating problem
+ * (tessera-fs.md §3.3). */
+static int
+tessera_kbio_meta_alloc(void *ctx, uint64_t n, uint64_t *out_sector)
+{
+	struct tessera_kbio_ctx *k = ctx;
+	struct tessera_mount   *tmp_ = k->mount;
+	if (tmp_ == NULL) return (-1);
+	if (n != 1) return (-1);
+	const uint64_t used = tmp_->sb.meta_reserve_bump
+	    - tmp_->sb.meta_reserve_start;
+	if (used + n > tmp_->sb.meta_reserve_length) return (-1);
+	*out_sector = tmp_->sb.meta_reserve_bump;
+	tmp_->sb.meta_reserve_bump += n;
+	return (0);
+}
+
+static int
+tessera_kbio_meta_free(void *ctx, uint64_t s, uint64_t n)
+{
+	/* Bump-only — sectors freed during COW commits are wasted in the
+	 * reserve until a future tessera-repack pass compacts. */
+	(void)ctx; (void)s; (void)n;
+	return (0);
 }
 
 #define VFSTOTESSERA(mp) ((struct tessera_mount *)((mp)->mnt_data))
@@ -290,12 +321,20 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp)
 	tmp_->bio_ctx.devvp = devvp;
 	tmp_->bio_ctx.cred  = curthread->td_ucred;
 	tmp_->bio_ctx.mount = tmp_;
+	/* Data-zone io: alloc/free route through the extent allocator. */
 	tmp_->bio.read_block  = tessera_kbio_read;
 	tmp_->bio.write_block = tessera_kbio_write;
 	tmp_->bio.alloc       = tessera_kbio_alloc;
 	tmp_->bio.free        = tessera_kbio_free;
 	tmp_->bio.ctx         = &tmp_->bio_ctx;
-	tmp_->inode_tree = tessera_btree_open(&tmp_->bio,
+	/* Metadata-reserve io: alloc bumps sb.meta_reserve_bump. Used by
+	 * inode_tree / pack_registry_tree COW puts and by extent_flush. */
+	tmp_->meta_bio.read_block  = tessera_kbio_read;
+	tmp_->meta_bio.write_block = tessera_kbio_write;
+	tmp_->meta_bio.alloc       = tessera_kbio_meta_alloc;
+	tmp_->meta_bio.free        = tessera_kbio_meta_free;
+	tmp_->meta_bio.ctx         = &tmp_->bio_ctx;
+	tmp_->inode_tree = tessera_btree_open(&tmp_->meta_bio,
 	    tmp_->sb.inode_root, /*tree_kind*/ 0,
 	    /*key*/ 4, /*value*/ TESSERA_INODE_RECORD_SIZE);
 	if (tmp_->inode_tree == NULL)
@@ -303,7 +342,7 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp)
 		    "failed; root will be synthesized\n",
 		    (unsigned long)tmp_->sb.inode_root);
 
-	tmp_->pack_registry_tree = tessera_btree_open(&tmp_->bio,
+	tmp_->pack_registry_tree = tessera_btree_open(&tmp_->meta_bio,
 	    tmp_->sb.pack_registry_root, /*tree_kind*/ 1,
 	    /*key*/ 16, /*value*/ TESSERA_REGISTRY_ENTRY_SIZE);
 	if (tmp_->pack_registry_tree == NULL)
@@ -328,7 +367,10 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp)
 
 	mp->mnt_data = tmp_;
 	mp->mnt_stat.f_namemax = TESSERA_PATH_NAME_MAX;
-	mp->mnt_flag |= MNT_LOCAL | MNT_RDONLY;
+	mp->mnt_flag |= MNT_LOCAL;
+	/* MNT_RDONLY removed in round 6c — vop_setattr (utimes) is the
+	 * first mutation. Other vop write-class ops still EOPNOTSUPP via
+	 * default_vnodeops fallthrough. */
 	MNT_ILOCK(mp);
 	mp->mnt_kern_flag |= MNTK_LOOKUP_SHARED | MNTK_EXTENDED_SHARED;
 	MNT_IUNLOCK(mp);
@@ -515,7 +557,11 @@ static struct vfsops tessera_vfsops = {
 static int
 tessera_vop_access(struct vop_access_args *ap)
 {
-	if (ap->a_accmode & VWRITE) return (EROFS);
+	/* Round 6c: writes are now allowed in principle (vop_setattr is
+	 * the first wired-up mutation). Permission-bit checks against
+	 * the on-disk inode mode land alongside vop_create / vop_write
+	 * in round 6d+. */
+	(void)ap;
 	return (0);
 }
 
@@ -951,6 +997,29 @@ out:
 	return (err);
 }
 
+/* ── vop_setattr (utimes / chmod / chown / chflags) ─────────── */
+
+/*
+ * Round 6c attempt:
+ *   tessera_vop_setattr did btree_put for inode + extent_flush_via
+ *   meta_bio + tessera_commit_sb. The first `touch` from userspace
+ *   hung the VM (no panic, kernel deadlock) — likely a lock-order
+ *   issue calling bread/bwrite via getblk on devvp while holding
+ *   the file vnode's lock.
+ *
+ * For now setattr returns EOPNOTSUPP so reads stay healthy. The
+ * commit_sb / commit_extent helpers stay above (used by no caller
+ * for the moment); next iteration debugs the locking with sysctl
+ * KERN_PROC_KSTACK on the hung process and probably moves the
+ * commit to a deferred bdwrite path.
+ */
+static int
+tessera_vop_setattr(struct vop_setattr_args *ap)
+{
+	(void)ap;
+	return (EOPNOTSUPP);
+}
+
 static int
 tessera_vop_open(struct vop_open_args *ap)
 { (void)ap; return (0); }
@@ -969,6 +1038,43 @@ tessera_vop_reclaim(struct vop_reclaim_args *ap)
 		free(tn, M_TESSERA);
 		vp->v_data = NULL;
 	}
+	return (0);
+}
+
+/* ── transaction commit (Round 6c, MVP) ──────────────────────── */
+
+/*
+ * Write the in-memory superblock back to sectors 0 and 1 with the
+ * generation bumped. Caller is expected to have updated tmp_->sb's
+ * roots (inode_root, pack_registry_root, free_extent_root) and
+ * meta_reserve_bump beforehand. Synchronous; no journal yet —
+ * round 6+ adds the journal-append-then-fsync-then-SB-write
+ * protocol.
+ */
+static int
+tessera_commit_sb(struct tessera_mount *tmp_)
+{
+	tmp_->sb.generation++;
+	uint8_t buf[TESSERA_SECTOR_SIZE];
+	if (tessera_encode_superblock(&tmp_->sb, buf) != TESSERA_OK)
+		return (EIO);
+	if (tessera_kbio_write(&tmp_->bio_ctx, 0, buf) != 0) return (EIO);
+	if (tessera_kbio_write(&tmp_->bio_ctx, 1, buf) != 0) return (EIO);
+	return (0);
+}
+
+/* Flush the in-memory free-extent allocator back to a fresh on-disk
+ * tree (allocated from the metadata reserve, NOT recursively from
+ * the data zone) and return the new root sector via tmp_->sb. */
+static int
+tessera_commit_extent(struct tessera_mount *tmp_)
+{
+	uint64_t new_root = 0;
+	if (tessera_extent_flush_via(tmp_->extent_alloc, &tmp_->meta_bio,
+	    &new_root) != TESSERA_OK)
+		return (EIO);
+	tmp_->sb.free_extent_root = new_root;
+	tmp_->sb.free_extent_gen  = tmp_->sb.generation + 1;
 	return (0);
 }
 
@@ -1079,6 +1185,7 @@ struct vop_vector tessera_vnodeops = {
 	.vop_default = &default_vnodeops,
 	.vop_access  = tessera_vop_access,
 	.vop_getattr = tessera_vop_getattr,
+	.vop_setattr = tessera_vop_setattr,
 	.vop_lookup  = tessera_vop_lookup,
 	.vop_readdir = tessera_vop_readdir,
 	.vop_read    = tessera_vop_read,

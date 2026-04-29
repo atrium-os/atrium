@@ -46,6 +46,15 @@ uint64_t tessera_extent_largest_free_run(const tessera_extent_alloc_t *);
 int tessera_extent_flush(tessera_extent_alloc_t *,
                          uint64_t *out_new_root_sector);
 
+/* Same as tessera_extent_flush, but the new tree's nodes are
+ * allocated via `alt_io` instead of the allocator's own io. Required
+ * for in-kernel commits — using the data-zone allocator (which is
+ * the same set we're iterating) recurses unsafely. The caller passes
+ * a metadata-reserve bump-allocator-backed io. */
+int tessera_extent_flush_via(tessera_extent_alloc_t *,
+                             const tessera_block_io_t *alt_io,
+                             uint64_t *out_new_root_sector);
+
 void tessera_extent_close(tessera_extent_alloc_t *);
 
 #ifdef __cplusplus

@@ -123,11 +123,25 @@ fail:
 int
 tessera_extent_flush(tessera_extent_alloc_t *a, uint64_t *out_new_root)
 {
+	return tessera_extent_flush_via(a, NULL, out_new_root);
+}
+
+int
+tessera_extent_flush_via(tessera_extent_alloc_t *a,
+                         const tessera_block_io_t *alt_io,
+                         uint64_t *out_new_root)
+{
 	if (a == NULL || out_new_root == NULL) return TESSERA_EINVAL;
-	if (!a->has_io) return TESSERA_EINVAL;
+	const tessera_block_io_t *use_io;
+	if (alt_io != NULL) {
+		use_io = alt_io;
+	} else {
+		if (!a->has_io) return TESSERA_EINVAL;
+		use_io = &a->io;
+	}
 
 	uint64_t root = 0;
-	tessera_btree_t *t = tessera_btree_create(&a->io, EXTENT_TREE_KIND,
+	tessera_btree_t *t = tessera_btree_create(use_io, EXTENT_TREE_KIND,
 	    EXTENT_KEY_SIZE, EXTENT_VALUE_SIZE, &root);
 	if (t == NULL) return TESSERA_ENOSPC;
 
