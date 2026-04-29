@@ -107,6 +107,21 @@ Constants:
 
 The last two blocks of the volume are SB_A_backup and SB_B_backup, written every commit alongside the primary pair. fsck consults the backup pair if both primary blocks are corrupt.
 
+### 3.3 Self-heal at mount
+
+The dual superblock only earns its keep if the two copies stay in sync. At mount time, after picking the authoritative SB (highest generation with valid magic + CRC), the implementation MUST:
+
+| Observed state                                       | Action                                                |
+| ---------------------------------------------------- | ----------------------------------------------------- |
+| Both SBs valid, generations equal                    | nothing                                               |
+| Both SBs valid, generations differ                   | rewrite the older copy from the active one            |
+| One SB valid, the other fails magic / CRC            | rewrite the corrupt copy from the active one         |
+| Both SBs invalid                                     | refuse to mount (consult §3.2 backup pair via fsck)   |
+
+The rewrite is a single 4 KiB synchronous block write and runs even on read-only mounts — it's a maintenance action against the volume's redundancy invariant, not a user-data mutation. A self-heal failure (e.g. write-protected media) is logged and does not block the mount; the volume continues running off the surviving good SB.
+
+Without self-heal, a single bit-flip on either copy silently degrades the volume to single-copy durability until the next commit cycle, at which point a power loss between the two SB writes can lose the volume entirely.
+
 ## 4. Journal
 
 The journal is a circular log of transactions that update the mutable inode-table or pack-registry roots. Pack-file writes do *not* go through the journal (they are immutable; the journal merely records "pack `<hash>` exists"). Blob writes do *not* go through the journal (they are immutable; the pack file records them durably before the journal references them).

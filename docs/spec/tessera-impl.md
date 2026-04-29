@@ -471,7 +471,7 @@ Depends on Phase 1 (core primitives) and benefits from Phase 3 (test harness for
 
 | Component | Estimate | Test |
 |---|---|---|
-| Mount/unmount lifecycle, journal replay | 1.5 weeks | mount/unmount cycles via ATF |
+| Mount/unmount lifecycle, journal replay, dual-SB self-heal (tessera-fs.md §3.3) | 1.5 weeks | mount/unmount cycles via ATF; corrupt-SB-A heal via dd + remount |
 | `vop_lookup`, `vop_getattr`, `vop_open`, `vop_close` | 1 week | basic stat/open of static volume |
 | `vop_read` (manifest tree walk + chunk fetch) | 1 week | read of inline + chunked + tree manifests |
 | `vop_readdir` (synthesized "."/"..") | 1 week | readdir/readdir_r conformance |

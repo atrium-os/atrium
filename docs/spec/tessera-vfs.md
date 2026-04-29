@@ -42,13 +42,14 @@ The adapter implements the FreeBSD `vop_*` interface and translates each POSIX c
 1. Opens the block device read-write.
 2. Reads SB_A and SB_B from blocks 0 and 1.
 3. Selects the higher-generation valid superblock as the active superblock.
-4. If `last_unmount_clean = 0`, runs journal replay (tessera-fs.md §4.5). On failure to replay (corrupted journal beyond repair), mount fails with `EIO`.
-5. Writes `last_unmount_clean = 0` and `last_mount_time = now` into both superblocks; bumps generation.
-6. Loads the inode-table root, pack-registry root, free-extent root, and the bloom-of-blooms cache into memory.
-7. Constructs a root vnode for inode 2.
-8. Returns success; the mountpoint is now live.
+4. **Self-heals the dual SB pair** per tessera-fs.md §3.3 — rewrites any copy that failed to decode or is at a stale generation, so the volume leaves mount with two consistent SBs. Self-heal runs even on read-only mounts; failures are logged but do not block the mount.
+5. If `last_unmount_clean = 0`, runs journal replay (tessera-fs.md §4.5). On failure to replay (corrupted journal beyond repair), mount fails with `EIO`.
+6. Writes `last_unmount_clean = 0` and `last_mount_time = now` into both superblocks; bumps generation.
+7. Loads the inode-table root, pack-registry root, free-extent root, and the bloom-of-blooms cache into memory.
+8. Constructs a root vnode for inode 2.
+9. Returns success; the mountpoint is now live.
 
-Read-only mount (`mount -r`) skips step 5 and refuses any operation that would issue a journal record.
+Read-only mount (`mount -r`) skips step 6 and refuses any operation that would issue a journal record. Step 4 (self-heal) still runs — it is a maintenance action against the volume's redundancy invariant, not a user-data mutation.
 
 ### 2.2 Unmount
 
