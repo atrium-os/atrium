@@ -813,6 +813,221 @@ fn scenario_cdc_determinism() -> Result<(), String> {
     Ok(())
 }
 
+/* ── scenario 10: journal multi-block-body torn replay ───────── */
+
+fn scenario_journal_multi_block_torn() -> Result<(), String> {
+    let rng = Xorshift64::new(0xc0ffee_000a);
+    let total = 256usize;
+    let j_start: u64 = 0;
+    let j_len: u64 = total as u64;
+
+    let mut rec = Box::new(WriteRecorder::new(total));
+    let io = WriteRecorder::block_io(&mut *rec as *mut _);
+    let r = unsafe { tessera_journal_format(&io, j_start, j_len) };
+    if r != 0 { return Err(format!("format → {r}")); }
+    rec.rebaseline();
+
+    /* tx-1: small committed record (must survive). */
+    let j = unsafe { tessera_journal_open(&io, j_start, j_len) };
+    let tag = b"surv-tx-1xxxxxxx";
+    let mut tx1 = 0u64;
+    let _ = unsafe { tessera_journal_tx_begin(j, &mut tx1, tag.as_ptr()) };
+    let body1 = vec![0xa1u8; 64];
+    let _ = unsafe { tessera_journal_append(j, tx1, TESSERA_INODE_WRITE,
+        body1.as_ptr(), body1.len() as u32) };
+    let _ = unsafe { tessera_journal_tx_commit(j, tx1) };
+
+    /* writes-after-tx1 boundary */
+    let after_tx1 = rec.write_count();
+
+    /* tx-2: multi-block body (>4064 B). Without commit yet — we'll
+     * crash mid-body to simulate torn write. */
+    let mut tx2 = 0u64;
+    let tag2 = b"big-body-tornxxx";
+    let _ = unsafe { tessera_journal_tx_begin(j, &mut tx2, tag2.as_ptr()) };
+    let big_len = 12_000usize;
+    let mut big = vec![0u8; big_len];
+    for i in 0..big_len { big[i] = (rng.next() & 0xff) as u8; }
+    let r = unsafe { tessera_journal_append(j, tx2, TESSERA_PACK_PUBLISH,
+        big.as_ptr(), big_len as u32) };
+    if r != 0 { return Err(format!("big append → {r}")); }
+    let after_big = rec.write_count();
+    /* The big append spans multiple sectors. Find the per-sector
+     * boundaries and pick a torn point inside it. */
+    let big_writes = after_big - after_tx1 - 1; /* tx_begin tx2 was 1 write */
+    if big_writes < 2 {
+        return Err(format!("expected >=2 sectors for big body, got {big_writes}"));
+    }
+    let _ = unsafe { tessera_journal_tx_commit(j, tx2) };
+
+    /* tx-3: another small committed record AFTER tx-2's commit. */
+    let mut tx3 = 0u64;
+    let _ = unsafe { tessera_journal_tx_begin(j, &mut tx3, tag.as_ptr()) };
+    let body3 = vec![0xc3u8; 32];
+    let _ = unsafe { tessera_journal_append(j, tx3, TESSERA_DIR_INSERT,
+        body3.as_ptr(), body3.len() as u32) };
+    let _ = unsafe { tessera_journal_tx_commit(j, tx3) };
+    unsafe { tessera_journal_close(j); }
+
+    /* Materialise the disk WITH tx-1's writes applied but with one of
+     * tx-2's body-continuation sectors zeroed out. We do this by
+     * replaying through the prefix that includes tx-1 fully + tx-2's
+     * begin + the first body sector, but NOT the rest of tx-2's body
+     * → simulates the body torn mid-write. */
+    let torn_point = after_tx1 + 1 /* tx_begin */ + 1 /* first body sector */;
+    let mut partial = rec.replay_through(torn_point);
+    let p_io = MemDisk::block_io(&mut partial);
+
+    let j2 = unsafe { tessera_journal_open(&p_io, j_start, j_len) };
+    if j2.is_null() { return Err("torn replay: open failed".into()); }
+    let mut cap = ReplayCapture { types: Vec::new(), bodies: Vec::new() };
+    let _ = unsafe { tessera_journal_replay(j2, replay_cb,
+        &mut cap as *mut _ as *mut c_void) };
+    unsafe { tessera_journal_close(j2); }
+
+    /* tx-1 fully committed before torn → must be replayed. tx-2's
+     * body is incomplete + no COMMIT seen → must be dropped. tx-3
+     * never written → not in this prefix. */
+    if cap.types.len() != 1 {
+        return Err(format!("expected 1 record (tx-1 only), got {}",
+            cap.types.len()));
+    }
+    if cap.types[0] != TESSERA_INODE_WRITE as u32 {
+        return Err(format!("wrong record type {} (want INODE_WRITE)",
+            cap.types[0]));
+    }
+    if cap.bodies[0] != body1 {
+        return Err("tx-1 body bytes wrong".into());
+    }
+
+    println!("  journal_multi_block_torn: tx-1 survived, tx-2 (torn body) dropped");
+    Ok(())
+}
+
+/* ── scenario 11: B+tree close + reopen across sessions ───────── */
+
+fn scenario_btree_persistence() -> Result<(), String> {
+    let rng = Xorshift64::new(0xc0ffee_000b);
+    let mut disk = MemDisk::new(4096);
+    let io = MemDisk::block_io(&mut disk);
+
+    const KEY: u32 = 4;
+    const VAL: u32 = 32;
+
+    let mut root = 0u64;
+    let t = unsafe { tessera_btree_create(&io, 0, KEY, VAL, &mut root) };
+    if t.is_null() { return Err("create null".into()); }
+    unsafe { tessera_btree_close(t); }
+
+    let mut oracle: HashMap<[u8; 4], [u8; 32]> = HashMap::new();
+
+    /* Three sessions: open, do random ops, close, save root. Verify
+     * each session sees what the previous one wrote. */
+    for session in 0..3 {
+        let t = unsafe { tessera_btree_open(&io, root, 0, KEY, VAL) };
+        if t.is_null() { return Err(format!("session {session}: open null")); }
+
+        /* Verify all oracle entries are visible at the start of the
+         * session. */
+        for (k, v) in &oracle {
+            let mut got = [0u8; 32];
+            let r = unsafe { tessera_btree_get(t, k.as_ptr(), got.as_mut_ptr()) };
+            if r != 0 { return Err(format!("session {session}: get → {r}")); }
+            if &got != v { return Err(format!("session {session}: value drifted")); }
+        }
+
+        /* Mutate. */
+        for _ in 0..400 {
+            let key32 = (rng.next() & 0xffff) as u32;
+            let mut k = [0u8; 4];
+            k[0] = (key32 >> 24) as u8; k[1] = (key32 >> 16) as u8;
+            k[2] = (key32 >>  8) as u8; k[3] =  key32        as u8;
+            let mut v = [0u8; 32];
+            for i in 0..32 { v[i] = (rng.next() & 0xff) as u8; }
+            let _ = unsafe { tessera_btree_put(t, k.as_ptr(), v.as_ptr(),
+                &mut root) };
+            oracle.insert(k, v);
+        }
+        unsafe { tessera_btree_close(t); }
+    }
+
+    /* Final verification: open one more time, walk via cursor, oracle
+     * matches. */
+    let t = unsafe { tessera_btree_open(&io, root, 0, KEY, VAL) };
+    let c = unsafe { tessera_btree_seek_first(t) };
+    let mut walked = 0usize;
+    if !c.is_null() {
+        loop {
+            let mut k = [0u8; 4]; let mut v = [0u8; 32];
+            if unsafe { tessera_btree_cursor_get(c, k.as_mut_ptr(), v.as_mut_ptr()) } != 0 {
+                break;
+            }
+            walked += 1;
+            match oracle.get(&k) {
+                Some(ev) if ev == &v => {}
+                _ => return Err("cursor saw key not in oracle or wrong value".into()),
+            }
+            if unsafe { tessera_btree_cursor_next(c) } != 0 { break; }
+        }
+        unsafe { tessera_btree_cursor_free(c); }
+    }
+    unsafe { tessera_btree_close(t); }
+    if walked != oracle.len() {
+        return Err(format!("walked {walked} != oracle {}", oracle.len()));
+    }
+
+    println!("  btree_persistence: 3 sessions × 400 ops, oracle = {} keys, \
+        cursor walk matches across reopen", oracle.len());
+    Ok(())
+}
+
+/* ── scenario 12: format size-boundary checking ──────────────── */
+
+fn scenario_format_size_boundary() -> Result<(), String> {
+    /* Below the minimum needed → EINVAL, no writes leaked. Just-above
+     * minimum → OK. Far above → OK. */
+    let try_format = |total: u64, journal: u64| -> i32 {
+        let mut disk = MemDisk::new(total as usize + 1);
+        let io = MemDisk::block_io(&mut disk);
+        let opts = tessera_format_opts_t {
+            total_sectors: total,
+            journal_sectors: journal,
+            volume_uuid: [0; 16],
+        };
+        unsafe { tessera_volume_format(&io, &opts) }
+    };
+
+    /* total_sectors = 0 : EINVAL (or some non-zero error). */
+    if try_format(0, 32) >= 0 { return Err("zero size accepted".into()); }
+    /* journal too small: tessera_journal_format requires length >= 4. */
+    if try_format(2048, 1) >= 0 { return Err("journal=1 accepted".into()); }
+    if try_format(2048, 0) == 0 {
+        /* journal=0 means default — should succeed. */
+    } else {
+        return Err("journal=0 (default) rejected".into());
+    }
+
+    /* Just-below-minimum: journal+metadata+1 = 4 + 32 + 16 + 1 = 53.
+     * Anything <= journal+metadata fails. */
+    let too_small = 4 + 32 + 16 + 1;
+    if try_format(too_small, 32) == 0 {
+        return Err(format!("size={too_small} unexpectedly accepted"));
+    }
+
+    /* Just-above-minimum: must succeed. */
+    let just_enough = 4 + 32 + 16 + 8;
+    if try_format(just_enough, 32) != 0 {
+        return Err(format!("size={just_enough} unexpectedly rejected"));
+    }
+
+    /* Big: must succeed. */
+    if try_format(8192, 256) != 0 { return Err("8192-sector format failed".into()); }
+
+    println!("  format_size_boundary: rejects too-small/zero, accepts \
+        minimum + above");
+    Ok(())
+}
+
 /* ── runner ─────────────────────────────────────────────────── */
 
 fn main() -> std::process::ExitCode {
@@ -826,6 +1041,9 @@ fn main() -> std::process::ExitCode {
         ("manifest_round_trip",    scenario_manifest_round_trip),
         ("manifest_parser_fuzz",   scenario_manifest_parser_fuzz),
         ("cdc_determinism",        scenario_cdc_determinism),
+        ("journal_multi_block_torn",  scenario_journal_multi_block_torn),
+        ("btree_persistence",         scenario_btree_persistence),
+        ("format_size_boundary",      scenario_format_size_boundary),
     ];
 
     let argv: Vec<_> = std::env::args().skip(1).collect();
