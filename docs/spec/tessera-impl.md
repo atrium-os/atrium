@@ -557,7 +557,112 @@ Five tiers, covering different regression risks. All run in CI; long-running tie
 - 24-hour mixed-workload runs with random crash injection. Multiple VMs, different seeds.
 - Reports filed against `docs/implementation-notes.md`.
 
-## 7. Risk register
+## 7. Hardware acceleration strategy
+
+SHA-256 dominates the write path of a CAS-FS, so throughput here is the single biggest performance lever. This section codifies how Tessera exploits hardware acceleration without committing to brittle complexity in v1.
+
+### 7.1 What hardware SHA-256 actually is
+
+A common misconception is that hardware SHA-256 is "SIMD." It isn't:
+
+- **ARMv8 SHA-2 extensions** (`SHA256H`, `SHA256H2`, `SHA256SU0`, `SHA256SU1`) and **Intel SHA-NI** (`SHA256RNDS2`, `SHA256MSG1`, `SHA256MSG2`) are **single-stream accelerators**. They use NEON / XMM registers as wide-register storage, but each instruction advances *one* SHA-256 state by one round. Single-core throughput: ~2–4 GB/s for one hash, sequential.
+- **Multi-buffer SHA-256** is a separate technique using *general-purpose* SIMD (NEON 128-bit, AVX-512 512-bit) to compute N independent SHA-256 hashes in lockstep across SIMD lanes. AVX-512 = 16 lanes; NEON = 4 lanes. Aggregate throughput scales with lane count, not single-stream speed. Implementations live in Intel's ISA-L, OpenSSL EVP, and the `sha2-asm` Rust crate.
+
+The hardware extensions accelerate the inherently-sequential SHA-256 computation. Multi-buffer is a *parallelism* trick at the algorithm level, orthogonal to whether HW extensions are present.
+
+### 7.2 v1 strategy: single-stream HW + thread-pool parallelism
+
+For v1, Tessera commits to:
+
+- **`tessera-core` exposes only single-stream HW SHA-256.** The C API has one hashing function:
+  ```c
+  void tessera_sha256(const uint8_t *data, size_t len, uint8_t out[32]);
+  ```
+  Implementation calls `<sys/sha256.h>` (FreeBSD libmd / in-kernel sha256), which auto-dispatches to ARMv8 SHA-2 / Intel SHA-NI on hosts that support them. No multi-buffer paths.
+- **Bulk parallelism happens in Rust userspace via thread pools.** When a tool needs to hash many blobs in parallel (chunking a large file's CDC output, scrub-walking every blob in every pack, repack-time blob copies), it uses `rayon::par_iter`:
+  ```rust
+  use rayon::prelude::*;
+  let hashes: Vec<[u8;32]> = chunks
+      .par_iter()
+      .map(|c| tessera::sha256(c))   // FFI → HW-accelerated single-stream
+      .collect();
+  ```
+  Each worker thread runs HW SHA on its own core. Aggregate throughput = `N_cores × ~3 GB/s`. On a 16-core box, ~50 GB/s without any SIMD-lane plumbing.
+- **`vop_write`'s in-kernel flush** uses single-stream HW SHA in the per-fd buffer flush path. No thread fan-out from the kmod (we don't run the kernel as a parallel hash farm; that's a userspace responsibility for bulk operations).
+
+This captures ~95% of the achievable speedup at ~10% of the complexity of a multi-buffer implementation.
+
+### 7.3 Where the workload actually lives
+
+Per-blob hashing cost in Tessera, ranked by frequency:
+
+| Operation | Hash count | Per-hash size | Where it runs | Strategy |
+|---|---|---|---|---|
+| `vop_write` flush of small file | 1 | KB-MB | kmod | single-stream HW |
+| `vop_write` flush of large file | 1 manifest + N chunks | KB-MB each | kmod | single-stream HW per blob, sequential |
+| CDC of multi-GB file (`mkfs`-time import, or `tessera-receive`) | thousands | ~64 KB each | userspace | thread-pool (rayon) |
+| `tessera scrub` (full volume) | millions | KB-GB each | userspace | thread-pool across packs |
+| `tessera repack` (consolidation) | thousands | KB-GB each | userspace | thread-pool, copy-and-verify per worker |
+| Manifest hash on every commit | 1 | ~KB | kmod | single-stream HW |
+
+The kmod path is always single-stream-per-call; the kernel doesn't fan out. Userspace bulk operations parallelize across cores.
+
+### 7.4 Reserved for v2: multi-buffer SIMD
+
+Multi-buffer SIMD is the right answer when:
+
+- The workload is "hash these N independent blobs," all available simultaneously.
+- N is large (≥ 4 for NEON, ≥ 16 for AVX-512).
+- The blobs are size-bucketed so SIMD lanes don't stall on tail ends.
+
+This describes `tessera scrub` precisely. v1 scrub will use thread-pool parallelism (B); v2 may grow a multi-buffer fast path:
+
+```c
+// tessera-core/hash_mb.c (v2)
+void tessera_sha256_multi(const uint8_t **bufs, const size_t *lens,
+                          size_t n_streams, uint8_t (*hashes_out)[32]);
+```
+
+Targets: aggregate ~5-8 GB/s per core on AVX-512 (vs ~3 GB/s single-stream); ~2-3 GB/s per core on NEON (similar to single-stream but parallel-friendly).
+
+The trigger for v2 work is profiling: if scrub of a >TB volume hits CPU-time limits despite full thread-pool saturation, multi-buffer earns its complexity. Below that bar, v1's simpler model wins.
+
+### 7.5 Other hardware-accelerated primitives
+
+The same architecture applies to the other crypto primitives in the spec:
+
+- **CRC32** (journal record CRCs, pack footer CRCs, superblock CRCs): use FreeBSD's hw-accelerated CRC functions (`crc32c_sse42` on x86, dedicated `CRC32X/CRC32B` on ARMv8 base ISA). Available everywhere we care about. Single-stream is fine; no batching benefit; CRC32 is fast enough that it's never the bottleneck.
+- **AES-GCM** (v2 at-rest encryption): hardware acceleration is universally present (Intel AES-NI + PCLMULQDQ, ARMv8 AES + PMULL). The `aes-gcm` Rust crate auto-dispatches. v1 reserves the format flags but doesn't implement encryption; v2 will.
+- **XXH3** (bloom filter mixing inside packs): SIMD-friendly software algorithm; no dedicated HW. The `xxhash-rust` crate is plenty fast (~10 GB/s) on its own.
+- **FastCDC gear hash** (CDC chunking): software-only, no dedicated HW. Tuned implementations get 1-2 GB/s. This is the next bottleneck after SHA-256 in import workloads; v2 may explore SIMD-aware variants if profiling justifies.
+
+### 7.6 Hypervisor passthrough verification
+
+Build-time and CI checks for the hardware path. The Rust harness in `tests/property/` includes a microbench that:
+
+1. Hashes a 1 GiB random buffer using `tessera::sha256` in a tight loop.
+2. Reports throughput.
+3. Fails the test if throughput < 1 GB/s (proxy for "we hit the software fallback").
+
+This test runs on every CI execution, including the cross-compile-and-execute leg in the FreeBSD VM. Catches:
+- Build regressions where `sha2 = { features = ["asm"] }` fell off.
+- Hypervisor configurations where the guest doesn't see ARMv8 SHA-2 / Intel SHA-NI in its CPU feature register.
+- Missed dispatch in `<sys/sha256.h>` on FreeBSD versions we test against.
+
+Per [tessera-vfs.md §12.2](tessera-vfs.md), a deployment is *not* compliant if its host masks crypto from the guest. The CI test is a tripwire for that.
+
+### 7.7 Fallback paths
+
+If hardware SHA-2 isn't present (ARMv8.0-A without crypto extensions, x86 pre-Goldmont/Zen):
+
+- The C library still works (libmd software fallback ~500-700 MB/s).
+- Tessera mounts and runs. POSIX semantics are preserved.
+- Throughput targets in [tessera-vfs.md §12](tessera-vfs.md) are missed by 5-10×.
+- We log `kernel: tessera-fs: no hardware SHA-2; performance reduced` at mount time.
+
+This is correctness-but-not-performance-compliant. We don't refuse to mount. Embedded / very-old hardware can use Tessera; production deployments target hosts with HW crypto.
+
+## 8. Risk register
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
@@ -572,7 +677,7 @@ Five tiers, covering different regression risks. All run in CI; long-running tie
 | Cross-compile + kmod-build environment | medium | low | already proven for atrium-virtio-gpu / atrium-bootfb |
 | In-kernel SHA-256 API differences across FreeBSD versions | low | low | wrapper macro in `core/src/hash.c` |
 
-## 8. Tooling
+## 9. Tooling
 
 Beyond the userspace tools shipped with Tessera itself:
 
@@ -586,7 +691,7 @@ Beyond the userspace tools shipped with Tessera itself:
 - **valgrind** in userspace for tool memory checks.
 - **CI**: GitHub Actions on the atrium-os/atrium repo. Matrix: amd64 + aarch64 build; userspace tests; cross-compile kmod (build only); ATF in nightly mfsBSD VM.
 
-## 9. Time estimate
+## 10. Time estimate
 
 | Phase | Duration | Critical path |
 |---|---|---|
@@ -604,7 +709,7 @@ Beyond the userspace tools shipped with Tessera itself:
 
 This matches the earlier 6-7 month estimate I gave, with phases now scoped explicitly.
 
-## 10. Out-of-band integration work (not in Tessera itself)
+## 11. Out-of-band integration work (not in Tessera itself)
 
 These touch other Atrium components and should be tracked separately, not blocked on Tessera v1.0:
 
@@ -616,7 +721,7 @@ These touch other Atrium components and should be tracked separately, not blocke
 
 Each is its own project; D1.5 scope is "Tessera works as a mountable, POSIX-correct, performance-acceptable filesystem." The above are D2/D3+ work that builds on it.
 
-## 11. Decision points open during implementation
+## 12. Decision points open during implementation
 
 These are tracked in `docs/implementation-notes.md` as they come up; this section enumerates known ones at plan-time:
 
