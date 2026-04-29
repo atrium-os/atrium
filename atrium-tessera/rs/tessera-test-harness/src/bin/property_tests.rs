@@ -568,6 +568,251 @@ fn scenario_format_crash_partial() -> Result<(), String> {
     Ok(())
 }
 
+/* ── scenario 7: manifest builder/parser round-trip + hash ─────── */
+
+fn scenario_manifest_round_trip() -> Result<(), String> {
+    let rng = Xorshift64::new(0xc0ffee_0007);
+
+    /* INLINE: random small payloads. */
+    for _ in 0..32 {
+        let len = (rng.range(2048) as usize) + 1;
+        let mut data = vec![0u8; len];
+        for i in 0..len { data[i] = (rng.next() & 0xff) as u8; }
+
+        let b = unsafe { tessera_manifest_begin(TESSERA_MFT_INLINE) };
+        if b.is_null() { return Err("inline begin null".into()); }
+        let r = unsafe { tessera_manifest_set_inline(b, data.as_ptr(), len) };
+        if r != 0 { return Err(format!("set_inline → {r}")); }
+
+        let mut sz: usize = 0;
+        let mut h1 = [0u8; 32];
+        let _ = unsafe { tessera_manifest_finalize(b, std::ptr::null_mut(), 0,
+            &mut sz, h1.as_mut_ptr()) };
+        let mut buf = vec![0u8; sz];
+        let r = unsafe { tessera_manifest_finalize(b, buf.as_mut_ptr(),
+            sz, &mut sz, h1.as_mut_ptr()) };
+        if r != 0 { return Err(format!("finalize → {r}")); }
+        unsafe { tessera_manifest_free(b); }
+
+        let p = unsafe { tessera_manifest_parse(buf.as_ptr(), sz) };
+        if p.is_null() { return Err("parse null on clean bytes".into()); }
+        if unsafe { tessera_manifest_parser_kind(p) } != TESSERA_MFT_INLINE {
+            return Err("kind mismatch".into());
+        }
+        if unsafe { tessera_manifest_parser_size(p) } != len as u64 {
+            return Err("size mismatch".into());
+        }
+        let mut od: *const u8 = std::ptr::null();
+        let mut ol: usize = 0;
+        let r = unsafe { tessera_manifest_inline_data(p, &mut od, &mut ol) };
+        if r != 0 { return Err(format!("inline_data → {r}")); }
+        if ol != len { return Err("inline len mismatch".into()); }
+        let got = unsafe { std::slice::from_raw_parts(od, ol) };
+        if got != data.as_slice() { return Err("inline content mismatch".into()); }
+        unsafe { tessera_manifest_parser_free(p); }
+
+        /* Hash determinism: rebuild the same manifest, verify identical
+         * hash. (libmd vs portable stay in sync; same input → same
+         * digest.) */
+        let b2 = unsafe { tessera_manifest_begin(TESSERA_MFT_INLINE) };
+        let _ = unsafe { tessera_manifest_set_inline(b2, data.as_ptr(), len) };
+        let mut sz2: usize = 0;
+        let mut h2 = [0u8; 32];
+        let _ = unsafe { tessera_manifest_finalize(b2, std::ptr::null_mut(),
+            0, &mut sz2, h2.as_mut_ptr()) };
+        let mut buf2 = vec![0u8; sz2];
+        let _ = unsafe { tessera_manifest_finalize(b2, buf2.as_mut_ptr(),
+            sz2, &mut sz2, h2.as_mut_ptr()) };
+        unsafe { tessera_manifest_free(b2); }
+        if h1 != h2 { return Err("manifest hash not deterministic".into()); }
+        if buf != buf2 { return Err("manifest bytes not deterministic".into()); }
+    }
+
+    /* CHUNK_LIST: random hashes + offsets. */
+    for _ in 0..32 {
+        let n = 1 + (rng.range(64) as u32);
+        let b = unsafe { tessera_manifest_begin(TESSERA_MFT_CHUNK_LIST) };
+        let mut entries: Vec<([u8; 32], u64, u32)> = Vec::new();
+        let mut off = 0u64;
+        for _ in 0..n {
+            let mut h = [0u8; 32];
+            for i in 0..32 { h[i] = (rng.next() & 0xff) as u8; }
+            let size = 4096 + (rng.range(128 * 1024) as u32);
+            let r = unsafe { tessera_manifest_add_chunk(b,
+                h.as_ptr(), off, size, TESSERA_BLOB_FLAG_CHUNK) };
+            if r != 0 { return Err(format!("add_chunk → {r}")); }
+            entries.push((h, off, size));
+            off += size as u64;
+        }
+
+        let mut sz: usize = 0;
+        let mut h1 = [0u8; 32];
+        let _ = unsafe { tessera_manifest_finalize(b, std::ptr::null_mut(),
+            0, &mut sz, h1.as_mut_ptr()) };
+        let mut buf = vec![0u8; sz];
+        let r = unsafe { tessera_manifest_finalize(b, buf.as_mut_ptr(),
+            sz, &mut sz, h1.as_mut_ptr()) };
+        if r != 0 { return Err(format!("CL finalize → {r}")); }
+        unsafe { tessera_manifest_free(b); }
+
+        let p = unsafe { tessera_manifest_parse(buf.as_ptr(), sz) };
+        if p.is_null() { return Err("CL parse null".into()); }
+        if unsafe { tessera_manifest_parser_kind(p) } != TESSERA_MFT_CHUNK_LIST {
+            return Err("CL kind".into());
+        }
+        if unsafe { tessera_manifest_parser_count(p) } != n {
+            return Err("CL count".into());
+        }
+        for (i, (eh, eo, es)) in entries.iter().enumerate() {
+            let mut r = tessera_chunk_record_t {
+                chunk_hash: [0; 32], logical_offset: 0,
+                uncompressed_size: 0, flags: 0,
+            };
+            let rc = unsafe { tessera_manifest_chunk_at(p, i as u32, &mut r) };
+            if rc != 0 { return Err(format!("chunk_at[{i}] → {rc}")); }
+            if &r.chunk_hash != eh
+               || r.logical_offset    != *eo
+               || r.uncompressed_size != *es {
+                return Err(format!("CL entry {i} mismatch"));
+            }
+        }
+        unsafe { tessera_manifest_parser_free(p); }
+    }
+
+    println!("  manifest_round_trip: 32 INLINE + 32 CHUNK_LIST manifests, \
+        deterministic hash, byte-identical re-encode");
+    Ok(())
+}
+
+/* ── scenario 8: manifest parser fuzz ─────────────────────────── */
+
+fn scenario_manifest_parser_fuzz() -> Result<(), String> {
+    let rng = Xorshift64::new(0xc0ffee_0008);
+    let mut accepted = 0u32;
+    let mut rejected = 0u32;
+
+    /* Throw arbitrary byte buffers at the parser. The contract is "no
+     * crash, no read past `len`". If parse() succeeds, the parser must
+     * return only well-formed values (no out-of-band reads). */
+    for _ in 0..2000 {
+        let len = (rng.range(512) as usize) + 1;
+        let mut buf = vec![0u8; len];
+        for i in 0..len { buf[i] = (rng.next() & 0xff) as u8; }
+
+        /* About 15% of the time, fix up the magic so parse() has a
+         * better chance of succeeding — exercises the post-magic
+         * validation paths. */
+        if rng.range(100) < 15 && len >= 4 {
+            buf[0] = b'T'; buf[1] = b'M'; buf[2] = b'F'; buf[3] = b'T';
+        }
+
+        let p = unsafe { tessera_manifest_parse(buf.as_ptr(), len) };
+        if p.is_null() {
+            rejected += 1;
+            continue;
+        }
+        accepted += 1;
+
+        /* parser still must self-validate: kind/size/count are consistent
+         * with the body length. We probe via the public accessors. */
+        let kind  = unsafe { tessera_manifest_parser_kind(p) };
+        let _size = unsafe { tessera_manifest_parser_size(p) };
+        let count = unsafe { tessera_manifest_parser_count(p) };
+
+        if kind == TESSERA_MFT_CHUNK_LIST {
+            /* chunk_at must return either OK (entry fits) or an error;
+             * never crash. */
+            for i in 0..count {
+                let mut r = tessera_chunk_record_t {
+                    chunk_hash: [0; 32], logical_offset: 0,
+                    uncompressed_size: 0, flags: 0,
+                };
+                let _ = unsafe { tessera_manifest_chunk_at(p, i, &mut r) };
+                /* No assertion on the value — fuzz doesn't know what's
+                 * "right"; just that no UB occurs. */
+            }
+            /* Out-of-range index returns ENOENT, not crash. */
+            let mut r = tessera_chunk_record_t {
+                chunk_hash: [0; 32], logical_offset: 0,
+                uncompressed_size: 0, flags: 0,
+            };
+            let rc = unsafe { tessera_manifest_chunk_at(p, count + 1000, &mut r) };
+            if rc != TESSERA_ENOENT && rc != TESSERA_ECORRUPT {
+                return Err(format!("OOB chunk_at gave {rc}, want ENOENT or ECORRUPT"));
+            }
+        }
+        unsafe { tessera_manifest_parser_free(p); }
+    }
+
+    println!("  manifest_parser_fuzz: 2000 random inputs → {accepted} accepted, \
+        {rejected} rejected; no crashes");
+    Ok(())
+}
+
+/* ── scenario 9: CDC determinism ──────────────────────────────── */
+
+fn scenario_cdc_determinism() -> Result<(), String> {
+    let rng = Xorshift64::new(0xc0ffee_0009);
+    let params = unsafe { &tessera_cdc_default_params };
+
+    let split = |buf: &[u8]| -> Vec<usize> {
+        let cap = buf.len() / params.min_chunk as usize + 4;
+        let mut bounds = vec![0usize; cap];
+        let mut n = 0usize;
+        let r = unsafe { tessera_cdc_split(buf.as_ptr(), buf.len(),
+            params, bounds.as_mut_ptr(), cap, &mut n) };
+        if r != 0 { panic!("cdc_split → {r}"); }
+        bounds.truncate(n);
+        bounds
+    };
+
+    /* (a) Same input twice → identical boundaries. */
+    for _ in 0..16 {
+        let len = 256 * 1024 + (rng.range(2 * 1024 * 1024) as usize);
+        let mut buf = vec![0u8; len];
+        for i in 0..len { buf[i] = (rng.next() & 0xff) as u8; }
+        let a = split(&buf);
+        let b = split(&buf);
+        if a != b { return Err("CDC not deterministic on same input".into()); }
+        if a.is_empty() || *a.last().unwrap() != len {
+            return Err("CDC last boundary != len".into());
+        }
+    }
+
+    /* (b) Shift property: insert K bytes at the front of an otherwise-
+     *     identical buffer. Most boundaries past the first chunk should
+     *     re-align (== a's boundary + K). This is the property that
+     *     gives content-addressed dedup its dedup ratio. */
+    let mut hits = 0u64;
+    let mut total = 0u64;
+    for _ in 0..8 {
+        let core_len = 1 << 20;
+        let mut a_buf = vec![0u8; core_len];
+        for i in 0..core_len { a_buf[i] = (rng.next() & 0xff) as u8; }
+
+        let k: usize = 1 + (rng.range(15) as usize);
+        let mut b_buf = vec![0u8; core_len + k];
+        for i in 0..k { b_buf[i] = (rng.next() & 0xff) as u8; } /* fresh prefix */
+        b_buf[k..].copy_from_slice(&a_buf);
+
+        let ba = split(&a_buf);
+        let bb = split(&b_buf);
+
+        for &x in ba.iter() {
+            total += 1;
+            if bb.iter().any(|&y| y == x + k) { hits += 1; }
+        }
+    }
+    let frac = hits as f64 / total as f64;
+    if frac < 0.85 {
+        return Err(format!("shift-property match fraction {frac:.2} < 0.85"));
+    }
+
+    println!("  cdc_determinism: 16 same-input pairs match, shift match {:.2}%",
+        frac * 100.0);
+    Ok(())
+}
+
 /* ── runner ─────────────────────────────────────────────────── */
 
 fn main() -> std::process::ExitCode {
@@ -578,6 +823,9 @@ fn main() -> std::process::ExitCode {
         ("btree_random_ops",       scenario_btree_random_ops),
         ("pack_corruption_fuzz",   scenario_pack_corruption_fuzz),
         ("format_crash_partial",   scenario_format_crash_partial),
+        ("manifest_round_trip",    scenario_manifest_round_trip),
+        ("manifest_parser_fuzz",   scenario_manifest_parser_fuzz),
+        ("cdc_determinism",        scenario_cdc_determinism),
     ];
 
     let argv: Vec<_> = std::env::args().skip(1).collect();

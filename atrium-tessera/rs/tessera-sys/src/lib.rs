@@ -135,6 +135,76 @@ extern "C" {
     pub fn tessera_pack_close(r: *mut tessera_pack_reader_t);
 }
 
+/* ── content-defined chunking ────────────────────────────────── */
+
+#[repr(C)]
+pub struct tessera_cdc_params_t {
+    pub avg_chunk: u32,
+    pub min_chunk: u32,
+    pub max_chunk: u32,
+}
+
+extern "C" {
+    pub static tessera_cdc_default_params: tessera_cdc_params_t;
+
+    pub fn tessera_cdc_split(data: *const u8, len: usize,
+                              params: *const tessera_cdc_params_t,
+                              out_boundaries: *mut usize,
+                              cap: usize, n_out: *mut usize) -> c_int;
+}
+
+/* ── manifests ───────────────────────────────────────────────── */
+
+pub type tessera_manifest_kind_t = c_int;
+pub const TESSERA_MFT_INLINE:        tessera_manifest_kind_t = 1;
+pub const TESSERA_MFT_CHUNK_LIST:    tessera_manifest_kind_t = 2;
+pub const TESSERA_MFT_CHUNK_TREE:    tessera_manifest_kind_t = 3;
+pub const TESSERA_MFT_DIRECTORY:     tessera_manifest_kind_t = 4;
+pub const TESSERA_MFT_SYMLINK:       tessera_manifest_kind_t = 5;
+
+#[repr(C)]
+pub struct tessera_manifest_builder_t { _opaque: [u8; 0] }
+#[repr(C)]
+pub struct tessera_manifest_parser_t  { _opaque: [u8; 0] }
+
+#[repr(C)]
+pub struct tessera_chunk_record_t {
+    pub chunk_hash:        [u8; 32],
+    pub logical_offset:    u64,
+    pub uncompressed_size: u32,
+    pub flags:             u32,
+}
+
+extern "C" {
+    pub fn tessera_manifest_begin(kind: tessera_manifest_kind_t)
+                                   -> *mut tessera_manifest_builder_t;
+    pub fn tessera_manifest_add_chunk(b: *mut tessera_manifest_builder_t,
+                                       chunk_hash: *const u8,
+                                       logical_offset: u64,
+                                       size: u32, flags: u32) -> c_int;
+    pub fn tessera_manifest_set_inline(b: *mut tessera_manifest_builder_t,
+                                        data: *const u8, len: usize) -> c_int;
+    pub fn tessera_manifest_finalize(b: *mut tessera_manifest_builder_t,
+                                      out_buf: *mut u8, buf_len: usize,
+                                      out_size: *mut usize,
+                                      out_hash: *mut u8) -> c_int;
+    pub fn tessera_manifest_free(b: *mut tessera_manifest_builder_t);
+
+    pub fn tessera_manifest_parse(data: *const u8, len: usize)
+                                   -> *mut tessera_manifest_parser_t;
+    pub fn tessera_manifest_parser_kind (p: *const tessera_manifest_parser_t)
+                                          -> tessera_manifest_kind_t;
+    pub fn tessera_manifest_parser_size (p: *const tessera_manifest_parser_t) -> u64;
+    pub fn tessera_manifest_parser_count(p: *const tessera_manifest_parser_t) -> u32;
+    pub fn tessera_manifest_chunk_at(p: *const tessera_manifest_parser_t,
+                                      index: u32,
+                                      out: *mut tessera_chunk_record_t) -> c_int;
+    pub fn tessera_manifest_inline_data(p: *const tessera_manifest_parser_t,
+                                         out_data: *mut *const u8,
+                                         out_len: *mut usize) -> c_int;
+    pub fn tessera_manifest_parser_free(p: *mut tessera_manifest_parser_t);
+}
+
 /* ── extent allocator ────────────────────────────────────────── */
 
 #[repr(C)]
