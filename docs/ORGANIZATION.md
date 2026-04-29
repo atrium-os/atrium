@@ -219,7 +219,39 @@ Current state:
 └── docs/
 ```
 
-Migration plan (to be done when github layout is decided, NOT now):
+## Source layout vs distribution
+
+Two orthogonal axes, easy to conflate:
+
+- **Source layout** — monorepo vs per-component repos. About how we develop.
+- **Distribution** — ports, Opifex/Tessera jail trees, tarballs. About how users install.
+
+A port is a Makefile in `freebsd-ports` pointing at *some* source URL. The source can be a subdirectory of a monorepo or a standalone repo — ports doesn't care. So "apps should be ports" (true) does not force "apps must be per-repo" (not necessarily true yet).
+
+**Distribution endgame:** apps ship as jail trees in Tessera, delivered by Opifex. Ports is the bridge during bring-up so `pkg install atrium-edit` works on stock FreeBSD.
+
+## Current stance: monorepo through D3
+
+The tiered split above is the long-term north star, **not the v0 plan**. Until ~D3 we keep `atrium-os/atrium` as a working monorepo (kmod, apps, gpu binding, socket lib, compositor) plus `atrium-os/fresco` as the protocol tree. Reasons:
+
+- Wire protocol is unstable — single opcode changes touch 4+ components in one PR; cross-repo coordination is pure friction.
+- One contributor. The "different contributor pools" argument is hypothetical until those people exist.
+- Apps are small (atrium-edit-socket is a few hundred lines). Per-app CI + release is more ceremony than code.
+- Atomic refactors are still common. Splits would convert each one into a multi-repo dance.
+
+**Split triggers** (revisit when any become true):
+
+- Wire format stabilizes — minor versions add opcodes, majors are rare.
+- A real second contributor appears who only cares about one component.
+- An app grows past ~5k LOC with its own release cadence.
+- A vendor wants `fresco-spec` without cloning the platform.
+- `freebsd-ports` upstreaming starts (forces per-component release tarballs).
+
+Likely milestone: right before the first external release. By then real seams will be visible vs imagined.
+
+## Migration plan (deferred)
+
+To be executed when the split triggers above fire — NOT now:
 
 1. **Move `fresco-server` into `~/src/bsd/server/`**, then push the relevant subset (server, libfresco, fresco-rs, fresco-text, examples) as `atrium-os/fresco`.
 2. **Push `fresco-kmod/`** as `atrium-os/atrium-kmod`. Add a top-level Makefile that builds all kmod targets.

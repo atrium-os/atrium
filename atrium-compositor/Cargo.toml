@@ -10,6 +10,16 @@ publish = false
 name = "atrium-compositor"
 path = "src/main.rs"
 
+[features]
+default = []
+# Accept the vendor-extension `CMD_INJECT_KEY` opcode which lets a
+# socket client push synthetic keyboard events into the compositor's
+# event broadcast. Real input (D1 step 2c.16+) flows from native HID
+# devices, NOT from clients — INJECT exists purely for automation
+# harnesses like `atrium-keyboard`. Production builds disable it so
+# untrusted clients can't spoof keystrokes.
+inject-input = []
+
 [dependencies]
 atrium-gpu-rs = { path = "../atrium-gpu-rs" }
 fresco-server = { path = "../../fresco", features = ["tiny-skia-backend"] }

@@ -1,4 +1,4 @@
-//! Atlas-based glyph cache for atrium-edit-socket.
+//! Atlas-based glyph cache for atrium-find-socket.
 //!
 //! Shapes each printable-ASCII character *individually* and shelf-
 //! packs every glyph's coverage bitmap into one shared atlas. Each

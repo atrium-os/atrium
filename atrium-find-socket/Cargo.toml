@@ -1,0 +1,17 @@
+[package]
+name = "atrium-find-socket"
+version = "0.1.0"
+edition = "2021"
+description = "Two-pane file browser on the Atrium FreeBSD-native stack via fresco-socket-rs"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "atrium-find-socket"
+path = "src/main.rs"
+
+[dependencies]
+fresco-server = { path = "../../fresco" }
+fresco-socket-rs = { path = "../fresco-socket-rs" }
+fresco-text = { path = "../fresco-text" }
+libc = "0.2"

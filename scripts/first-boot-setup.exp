@@ -58,6 +58,13 @@ expect -re {# $}
 send "ifconfig vtnet0 | grep inet\r"
 expect -re {# $}
 
+# Auto-load hidraw(4) at boot so /dev/hidraw* cdevs exist when atrium-
+# compositor starts. hidraw attaches in parallel to hms(4)/hkbd(4) via
+# hidbus — no driver detach needed; it gives the compositor raw HID
+# report access without disturbing the dedicated drivers.
+send "sysrc kld_list+=hidraw\r"
+expect -re {# $}
+
 # Power off cleanly.
 send "shutdown -p now\r"
 expect {

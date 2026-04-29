@@ -1,223 +1,232 @@
 //! Native FreeBSD keyboard input reader.
 //!
-//! Opens `/dev/input/event0` (FreeBSD evdev — kbdmux0 multiplexer) and
-//! decodes each 24-byte `struct input_event` record. EV_KEY events are
-//! translated from Linux keycodes to USB HID Usage Page 0x07 codes
-//! (so the wire stays HID-shaped per the protocol contract) and fanned
-//! out as `COMP_INPUT_KEY` Completions through `event_subs`.
+//! Reads raw HID reports directly from the keyboard's `/dev/hidraw*`
+//! cdev — `hidraw(4)` is the modern FreeBSD HID-bus interface
+//! (`sys/dev/hid/hidraw.c`), pure FreeBSD, no Linux library shape.
+//! USB HID Keyboard input reports use the boot-protocol layout:
 //!
-//! Why evdev as the source despite the project's "no Linux-shape
-//! input" rule: evdev is the path of least resistance on FreeBSD-virt
-//! today (kbdmux0 already plumbs into it), and the wire stays HID.
-//! A future iteration replaces this with a direct `/dev/kbd0` K_RAW
-//! reader translating AT scan codes — same output, no Linux library
-//! shape touched.
+//!   byte 0:    modifiers bitmap (LCtrl=1, LShift=2, LAlt=4, LGui=8,
+//!                                RCtrl=16, RShift=32, RAlt=64, RGui=128)
+//!   byte 1:    reserved
+//!   bytes 2-7: up to 6 simultaneously-pressed HID Usage Page 0x07 codes
+//!
+//! Crucially, **the report bytes are already in the wire format we
+//! want** — no AT-scan-code translation, no Linux keycode mapping.
+//! We diff successive reports to derive press/release events and route
+//! them by `wm.focus` to the focused window's owning client.
+//!
+//! Why not `/dev/kbd0` K_RAW? On modern hidbus systems `/dev/kbd0` is
+//! the `kbdmux(4)` multiplexer's interface, which doesn't accept
+//! `KDSKBMODE(K_RAW)` (returns `ENOTTY`). The underlying physical
+//! keyboard `/dev/kbd1` is held exclusively by kbdmux, so we'd need
+//! to detach it first. `/dev/hidraw*` works in parallel without
+//! disturbing kbdmux/hkbd, identical philosophy to the pointer path.
 
 use fresco_server::command::protocol::{Completion, COMP_INPUT_KEY};
+use fresco_server::window::Compositor as WmCompositor;
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::Read;
+use std::os::unix::io::AsRawFd;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
-const EV_KEY: u16 = 0x01;
+/// Shared modifier bitmap (Page 0x07 modifier subset, mapped to the
+/// 3-bit bitmap the wire uses: bit 0 = shift, bit 1 = ctrl, bit 2 = alt).
+/// Updated by this thread on every HID report; read by `pointer_reader`
+/// so mouse-button events carry the right modifier byte.
+pub type SharedModifiers = Arc<Mutex<u8>>;
+
+const HID_MAX_DESCRIPTOR_SIZE: usize = 4096;
+const HIDIOCGRDESCSIZE: libc::c_ulong = 0x4004551E;
+const HIDIOCGRDESC:     libc::c_ulong = 0x2000551F;
 
 #[repr(C)]
-#[derive(Default, Copy, Clone)]
-struct InputEvent {
-    tv_sec:  i64,
-    tv_usec: i64,
-    type_:   u16,
-    code:    u16,
-    value:   i32,
+struct HidrawReportDescriptor {
+    size:  u32,
+    value: [u8; HID_MAX_DESCRIPTOR_SIZE],
 }
 
-/// Linux keycode → USB HID Usage Page 0x07 code. Returns None for
-/// keys we don't translate yet. Modifier keys are mapped to their
-/// HID modifier bits (returned via [`MODIFIER_MASK`]) instead, so the
-/// regular hid-usage path doesn't see them.
-fn linux_to_hid(linux_code: u16) -> Option<u16> {
-    Some(match linux_code {
-        // Letters: KEY_A..KEY_Z go in scattered Linux order. Use direct map.
-        30 => 0x04, // A
-        48 => 0x05, // B
-        46 => 0x06, // C
-        32 => 0x07, // D
-        18 => 0x08, // E
-        33 => 0x09, // F
-        34 => 0x0a, // G
-        35 => 0x0b, // H
-        23 => 0x0c, // I
-        36 => 0x0d, // J
-        37 => 0x0e, // K
-        38 => 0x0f, // L
-        50 => 0x10, // M
-        49 => 0x11, // N
-        24 => 0x12, // O
-        25 => 0x13, // P
-        16 => 0x14, // Q
-        19 => 0x15, // R
-        31 => 0x16, // S
-        20 => 0x17, // T
-        22 => 0x18, // U
-        47 => 0x19, // V
-        17 => 0x1a, // W
-        45 => 0x1b, // X
-        21 => 0x1c, // Y
-        44 => 0x1d, // Z
-
-        // Digits.
-        2  => 0x1e, // 1
-        3  => 0x1f, // 2
-        4  => 0x20, // 3
-        5  => 0x21, // 4
-        6  => 0x22, // 5
-        7  => 0x23, // 6
-        8  => 0x24, // 7
-        9  => 0x25, // 8
-        10 => 0x26, // 9
-        11 => 0x27, // 0
-
-        28 => 0x28, // Enter
-        1  => 0x29, // Escape
-        14 => 0x2a, // Backspace
-        15 => 0x2b, // Tab
-        57 => 0x2c, // Space
-
-        12 => 0x2d, // -
-        13 => 0x2e, // =
-        26 => 0x2f, // [
-        27 => 0x30, // ]
-        43 => 0x31, // backslash
-        39 => 0x33, // ;
-        40 => 0x34, // '
-        41 => 0x35, // `
-        51 => 0x36, // ,
-        52 => 0x37, // .
-        53 => 0x38, // /
-
-        58 => 0x39, // CapsLock
-
-        // Arrows.
-        106 => 0x4f, // Right
-        105 => 0x50, // Left
-        108 => 0x51, // Down
-        103 => 0x52, // Up
-
-        _ => return None,
-    })
-}
-
-/// Update the modifier bitmap in response to a modifier key event.
-/// Returns true if the key was consumed (i.e. don't emit a regular
-/// HID Usage event for it).
-fn update_modifiers(linux_code: u16, pressed: bool, mods: &mut u8) -> bool {
-    const SHIFT: u8 = 0x01;
-    const CTRL:  u8 = 0x02;
-    const ALT:   u8 = 0x04;
-    let bit = match linux_code {
-        42 | 54 => SHIFT, // L/R Shift
-        29 | 97 => CTRL,  // L/R Ctrl
-        56 | 100 => ALT,  // L/R Alt
-        _ => return false,
+/// True if `path`'s HID descriptor starts with USAGE_PAGE(Generic
+/// Desktop) ; USAGE(Keyboard).
+fn hidraw_is_keyboard(path: &str) -> bool {
+    let file = match OpenOptions::new().read(true).open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
     };
-    if pressed { *mods |= bit; } else { *mods &= !bit; }
-    true
+    let fd = file.as_raw_fd();
+    let mut size: i32 = 0;
+    if unsafe { libc::ioctl(fd, HIDIOCGRDESCSIZE, &mut size) } < 0 {
+        return false;
+    }
+    if size < 4 || (size as usize) > HID_MAX_DESCRIPTOR_SIZE {
+        return false;
+    }
+    let mut desc = HidrawReportDescriptor {
+        size: size as u32,
+        value: [0; HID_MAX_DESCRIPTOR_SIZE],
+    };
+    if unsafe {
+        libc::ioctl(fd, HIDIOCGRDESC, &mut desc as *mut _ as *mut libc::c_void)
+    } < 0 {
+        return false;
+    }
+    // USAGE_PAGE(Generic Desktop) = 0x05 0x01
+    // USAGE(Keyboard)             = 0x09 0x06
+    desc.value[0] == 0x05
+        && desc.value[1] == 0x01
+        && desc.value[2] == 0x09
+        && desc.value[3] == 0x06
 }
 
-pub fn spawn(event_subs: Arc<Mutex<Vec<Sender<Completion>>>>) {
+fn find_keyboard_path() -> Option<String> {
+    for n in 0..16 {
+        let path = format!("/dev/hidraw{n}");
+        if std::path::Path::new(&path).exists() && hidraw_is_keyboard(&path) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+pub fn spawn(
+    event_subs: Arc<Mutex<Vec<(u8, Sender<Completion>)>>>,
+    modifiers: SharedModifiers,
+    wm: Arc<Mutex<WmCompositor>>,
+) {
     std::thread::Builder::new()
-        .name("atrium-input-evdev".into())
-        .spawn(move || run(event_subs))
+        .name("atrium-input-kbd".into())
+        .spawn(move || run(event_subs, modifiers, wm))
         .expect("spawn input reader");
 }
 
-fn run(event_subs: Arc<Mutex<Vec<Sender<Completion>>>>) {
-    // Find a keyboard event device. On `-machine virt` with usb-kbd,
-    // hkbd0 lands on its own /dev/input/eventN (typically event3),
-    // separate from kbdmux0's event0 which sees only console-style
-    // input (none on a headless arm64 virt). Probe the first ~16
-    // event devices and pick one whose evdev name contains "kbd"
-    // or "keyboard".
-    let mut path = String::new();
-    for n in 0..16 {
-        let p = format!("/dev/input/event{n}");
-        if !std::path::Path::new(&p).exists() { continue; }
-        // Read sysctl-style metadata: kern.evdev.input.N.name
-        let key = format!("kern.evdev.input.{n}.name");
-        let out = std::process::Command::new("sysctl")
-            .args(["-n", &key])
-            .output();
-        let name = out.ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if name.contains("kbd") || name.contains("keyboard") {
-            // Skip kbdmux on bare virt (no underlying keyboards
-            // feed it; we want the actual hkbd device).
-            if name.contains("multiplexer") { continue; }
-            path = p;
-            eprintln!("input: matched event{n} = {name:?}");
-            break;
-        }
-    }
-    if path.is_empty() {
-        // Fallback to event0; better to attach there than not at all.
-        path = "/dev/input/event0".to_string();
-        eprintln!("input: no keyboard device matched by name; falling back to {path}");
-    }
+/// Map the HID Keyboard 8-bit modifier byte to the 3-bit wire bitmap.
+/// HID layout (LSB→MSB): LCtrl, LShift, LAlt, LGui, RCtrl, RShift, RAlt, RGui.
+/// Wire layout: bit 0 = shift, bit 1 = ctrl, bit 2 = alt. Gui is dropped.
+fn hid_mod_to_wire(hid: u8) -> u8 {
+    let mut out = 0u8;
+    if hid & 0b0010_0010 != 0 { out |= 0x01; } // shift
+    if hid & 0b0001_0001 != 0 { out |= 0x02; } // ctrl
+    if hid & 0b0100_0100 != 0 { out |= 0x04; } // alt
+    out
+}
 
-    let mut file = match File::open(&path) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("input: cannot open {path}: {e}");
+fn run(
+    event_subs: Arc<Mutex<Vec<(u8, Sender<Completion>)>>>,
+    shared_mods: SharedModifiers,
+    wm: Arc<Mutex<WmCompositor>>,
+) {
+    let path = match find_keyboard_path() {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "kbd: no keyboard /dev/hidraw* found — keyboard input \
+                 disabled. `kldload hidraw` and retry."
+            );
             return;
         }
     };
-    eprintln!("input: reading {path}");
-
-    let mut buf = [0u8; std::mem::size_of::<InputEvent>()];
-    let mut modifiers: u8 = 0;
-
-    loop {
-        if file.read_exact(&mut buf).is_err() {
-            eprintln!("input: read error / EOF — input thread exiting");
+    let mut file = match File::open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("kbd: cannot open {path}: {e}");
             return;
         }
-        // SAFETY: InputEvent is repr(C) over plain integers; `buf` is
-        // 24 bytes (verified via sizeof) so the transmute is sound.
-        let ev: InputEvent = unsafe { std::mem::transmute(buf) };
+    };
+    eprintln!("kbd: reading {path}");
 
-        if ev.type_ != EV_KEY {
-            continue;
-        }
-        // value: 0=release, 1=press, 2=repeat. Treat repeat as press.
-        let pressed = ev.value != 0;
+    // 8-byte HID keyboard reports. Some keyboards emit longer reports
+    // when LEDs / report-IDs are in use; we read the first 8 bytes
+    // and ignore extras for now.
+    let mut report = [0u8; 32];
+    let mut prev = [0u8; 8];
 
-        if update_modifiers(ev.code, pressed, &mut modifiers) {
-            continue;
-        }
-        // Skip auto-repeat — we want one event per logical keystroke.
-        // Apps that want repeat can implement it on the client side
-        // from the timing of repeated press events.
-        if ev.value == 2 {
-            continue;
-        }
-
-        let Some(hid) = linux_to_hid(ev.code) else { continue; };
-
-        let mut result_hash = [0u8; 32];
-        result_hash[0..2].copy_from_slice(&hid.to_le_bytes());
-        result_hash[2] = modifiers;
-        let comp = Completion {
-            comp_type:   COMP_INPUT_KEY,
-            status:      if pressed { 1 } else { 0 },
-            id:          0, // broadcast for v0.1; per-window-focus routing later
-            result_hash,
-            _pad:        [0u32; 22],
+    loop {
+        let n = match file.read(&mut report) {
+            Ok(0)  => { eprintln!("kbd: EOF on {path} — exiting"); return; }
+            Ok(n)  => n,
+            Err(e) => { eprintln!("kbd: read error: {e}"); return; }
         };
+        if n < 8 { continue; }
+        let cur: &[u8; 8] = (&report[..8]).try_into().unwrap();
 
-        let mut subs = event_subs.lock().unwrap();
-        subs.retain(|tx| tx.send(comp).is_ok());
+        // ── Modifier diff ────────────────────────────────────────
+        if cur[0] != prev[0] {
+            *shared_mods.lock().unwrap() = hid_mod_to_wire(cur[0]);
+        }
+
+        // ── Key diff: bytes 2..8 are the currently-pressed key set.
+        // Anything in `cur` but not in `prev` → press; anything in
+        // `prev` but not in `cur` → release.
+        let cur_keys = &cur[2..8];
+        let prev_keys = &prev[2..8];
+
+        // Resolve focus once per report so a burst of changes
+        // (chord) goes to the same window. If the WM still has the
+        // screen window (id 0) focused but real client windows
+        // exist, fall through to the topmost client window — apps
+        // don't currently raise themselves on CREATE_WINDOW, so the
+        // initial state would otherwise broadcast every keystroke
+        // to every client, bypassing per-window routing entirely.
+        let (target_window, owner) = {
+            let g = wm.lock().unwrap();
+            let focus_id = g.focus.unwrap_or(0);
+            let effective = if focus_id == 0 {
+                g.z_order.iter().rev().find(|&&id| id != 0).copied().unwrap_or(0)
+            } else {
+                focus_id
+            };
+            if effective == 0 {
+                (0, 0)
+            } else {
+                let owner = g.windows.get(&effective)
+                    .map(|w| w.owner as u8).unwrap_or(0);
+                (effective as u32, owner)
+            }
+        };
+        let mods = *shared_mods.lock().unwrap();
+
+        for &k in cur_keys {
+            if k == 0 { continue; }
+            if !prev_keys.contains(&k) {
+                emit(&event_subs, target_window, owner, k as u16, true, mods);
+            }
+        }
+        for &k in prev_keys {
+            if k == 0 { continue; }
+            if !cur_keys.contains(&k) {
+                emit(&event_subs, target_window, owner, k as u16, false, mods);
+            }
+        }
+
+        prev.copy_from_slice(cur);
+    }
+}
+
+fn emit(
+    event_subs: &Arc<Mutex<Vec<(u8, Sender<Completion>)>>>,
+    target_window: u32,
+    owner: u8,
+    hid_usage: u16,
+    pressed: bool,
+    modifiers: u8,
+) {
+    let mut result_hash = [0u8; 32];
+    result_hash[0..2].copy_from_slice(&hid_usage.to_le_bytes());
+    result_hash[2] = modifiers;
+    let comp = Completion {
+        comp_type:   COMP_INPUT_KEY,
+        status:      if pressed { 1 } else { 0 },
+        id:          target_window,
+        result_hash,
+        _pad:        [0u32; 22],
+    };
+    let mut subs = event_subs.lock().unwrap();
+    if target_window == 0 {
+        subs.retain(|(_, tx)| tx.send(comp).is_ok());
+    } else {
+        subs.retain(|(client_id, tx)| {
+            if *client_id == owner { tx.send(comp).is_ok() } else { true }
+        });
     }
 }

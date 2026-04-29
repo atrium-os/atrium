@@ -318,13 +318,131 @@ QEMU args added in `scripts/run-vm.sh --display`: `-device qemu-xhci -device usb
 
 **Visually verified**: typing in the QEMU Cocoa window appears in atrium-edit-socket in real time. `[*]` modified flag confirms each keystroke mutates the buffer. Screenshot shows two lines of typed text with cursor at end.
 
-D1 step 2(c.15)+ candidates:
-- Mouse routing — virtio-tablet → cursor coords → WM hit-test → `Event::MouseMove`/`MouseBtn`.
-- Per-window-focus routing on the server side (instead of broadcast).
-- Drop CMD_INJECT_KEY in production builds (left in for tests / automation).
-- Native `/dev/kbd0` K_RAW reader to fully drop the evdev dependency.
-- Per-vertex UV support in tiny_skia_backend — single shared glyph atlas.
-- Drop the in-process clock fallback when a socket client's scene is live.
+D1 step 2(c.15)+ candidates: cleared.
+
+**D1 step 2(c.19) (multi-window FBO compositing in tiny_skia_backend)** — DONE (2026-04-29). `tiny_skia_backend` gains a per-window FBO map (`window_fbos: HashMap<u16, Pixmap>`):
+
+- `sync_fbos(live)` reconciles the map against the WM's live windows each frame — allocates new FBOs at the right size, drops FBOs whose window is gone or whose dimensions changed.
+- `render_window_to_fbo(id, scene, cas)` clears the FBO and rasterizes that window's render_list into it. Each window has its own `Arc<Mutex<SceneGraph>>` from `WmCompositor`; routable client commands (CMD_SET_ROOT, CMD_SLOT_*, CMD_FRAME_*) carry `cmd.flags = window_id` to dispatch to the right scene.
+- `render_screen_with_windows(scene, cas, layered)` clears the screen, rasterizes the screen scene, then for each window in z-order: blits its FBO, strokes a 1-px border, rasterizes that window's decorations (titlebar / close button / title text). The interleave is critical: a higher-z window's FBO blit covers a lower-z window's titlebar in the overlap region.
+
+Wire support:
+- `fresco-socket-rs::Connection` gains `default_window: u16` + `set_default_window(id)`. `write_cmd` stamps `cmd.flags = self.default_window` on routable opcodes (CMD_SET_ROOT, CMD_SLOT_*, CMD_FRAME_*) so apps can route their commands to their own window without hand-stuffing flags. `window_set_pos(id, x, y)` issues CMD_WINDOW_SET_POS.
+- `WmCompositor::compose_overlay_for(id)` returns one window's decorations (extracted from the all-windows `compose_overlay`).
+
+App side: `atrium-edit-socket` and `atrium-term-socket` now `create_window` + `window_set_pos` + `set_default_window` at startup.
+
+**Quirks fixed during bring-up (in this slice)**
+
+1. **Initial focus = window 0 broadcast every keystroke to every client.** WM init sets `focus = Some(0)` and apps don't auto-raise on CREATE_WINDOW. `input_reader` now resolves the effective focus: if the WM still has window 0 focused but real client windows exist, route to the topmost non-zero window in `z_order`. Click-to-focus continues to work normally; this is just a sane default for the "no clicks yet" state.
+2. **Lower-z titlebar drawn over higher-z content.** `compose_overlay` returned all decorations as one slice and the backend rasterized them after all FBO blits — so a lower-z window's titlebar appeared on top of a higher-z window's content area. Fixed by interleaving per-window: for each window in z-order, blit its FBO then rasterize *that window's* decorations, so higher-z FBOs cover lower-z titlebars in the overlap.
+3. **Close button "did nothing".** Click was hitting the close button correctly and the app was exiting cleanly, but the WM still had the window registered and the FBO continued to render — so the visible window stayed on screen even though the process was gone. `socket_server::reader_loop` now calls `cleanup_client_windows` on disconnect, walking the WM and `destroy_with_focus_shift` on every window owned by the leaving client. `tiny_skia_backend::sync_fbos` then drops the orphaned FBO on the next frame.
+4. **Two clients launched simultaneously hit a CAS hash mismatch.** Sequential launch (one app, sleep, next app) avoids it. Root cause is in the upload path under contention; not yet fixed for parallel launch — workaround documented.
+
+Window background uses alpha `0xE0` (~88% opaque) so faint show-through hints at the layering. Apps can fill themselves opaque if they want full opacity.
+
+**D1 step 2(c.20) (parallel-launch CAS race + atrium-clock-socket)** — DONE (2026-04-29).
+
+Race fix: `CasStore::upload_staging` was keyed by `cmd.sequence_id` (u32). Each client allocates sequence ids from its own `next_seq` counter starting at 1, so two clients' uploads collided on the same key — bytes interleaved, hashes mismatched, the second app errored out with "server hash does not match local hash". Key changed to `u64`; the frontend composes it as `(client_id as u64) << 32 | sequence_id` so the namespace is per-client. Two apps now upload concurrently without contention.
+
+New crate `atrium-clock-socket` (`~/src/bsd/atrium-clock-socket/`): a simple analog clock — 12 hour ticks (with quarter-hour ticks twice as thick) + hour/minute/second hands + a small red center hub + a 1 Hz `EVFILT_TIMER`-driven re-render. Pure-geometry app (no glyph atlas, no pty, no buffer); validates that the multi-window FBO pipeline works for non-text content. Each tick/hand uses one shared centered-unit-rect mesh `(-0.5..0.5)²` and a per-frame `oriented_rect` 4×4 matrix encoding `T(cx,cy) · R(θ) · S(length, thickness)`.
+
+Three-app verification: editor + terminal + clock launched in parallel via a single `vssh` command, all three created their windows, uploaded glyph atlases / clock geometry, and rendered onto the screen scene with z-ordered FBO compositing. Visually verified.
+
+**D1 step 2(c.21) (final candidate cleanup)** — DONE (2026-04-29).
+
+- **`CMD_INJECT_KEY` cfg-gated.** The vendor-extension opcode that lets a client push synthetic key events is now behind the `inject-input` Cargo feature on `atrium-compositor`, default off. Production builds reject the opcode with a logged warning; test/automation builds (`cargo build --features inject-input`) keep working. `atrium-keyboard` test client still depends on this opcode being accepted, so it requires the feature.
+
+- **Real HID descriptor parsing.** `pointer_reader` no longer hardcodes the QEMU `usb-tablet` 6-byte report layout. It runs `HIDIOCGRDESC` at startup, walks the descriptor (Main / Global / Local items), and builds a `PointerLayout` recording bit offsets + sizes for buttons / X / Y / wheel plus an absolute-vs-relative flag for the X/Y axes. `decode_report` then walks any pointer's reports against the layout. Verified against the QEMU usb-tablet (5-button absolute). Real USB mice with relative axes + wheel decode through the same code path; cursor advances by the report's signed deltas instead of being scaled from absolute axes.
+
+- **atrium-find-socket** (`~/src/bsd/atrium-find-socket/`): two-pane file browser ported to fresco-socket-rs. `dir.rs` and `keymap.rs` copied unchanged from atrium-find (already HID-shape and protocol-agnostic); new `glyph_cache.rs` mirrors atrium-edit-socket's atlas mode; new `render.rs` emits per-glyph render items in screen-pixel space across header / left list / right preview / footer layout. Selection highlight is a translucent indigo bar under the selected row.
+
+Four-app multi-window demo: `atrium-edit-socket` + `atrium-term-socket` + `atrium-clock-socket` + `atrium-find-socket` launched in parallel via a single `vssh` command, each in its own window, FBO-composited together. Validates the full multi-window pipeline with four very different content types (text editor, pty-driven terminal, animated geometry, list-driven file browser).
+
+**D1 step 2(c.15) (mouse routing + drag/resize/close-button)** — DONE (2026-04-29). New `pointer_dispatch` module owns WM intercepts (close button → resize edge → titlebar → content+raise+focus) and per-window event routing; both readers feed it cooked events. Software cursor overlay drawn directly into the tiny-skia pixmap each frame. Click auto-raises and focuses; drag/resize match the existing macOS-path semantics (emits `COMP_WINDOW_RESIZED` to the owner on release).
+
+**D1 step 2(c.16) (native keyboard + pointer via /dev/hidraw*)** — DONE (2026-04-29). Both readers open the kernel's hidraw cdev directly; no AT-scancode translation, no Linux-shape evdev. Identification is by HID report descriptor (`HIDIOCGRDESC` ioctl):
+
+- `input_reader` finds the first hidraw whose descriptor starts with USAGE_PAGE(Generic Desktop) ; USAGE(Keyboard) (`05 01 09 06`). Reads 8-byte USB HID Keyboard boot reports. Bytes are *already in the wire format we want* — bytes 2..7 carry HID Usage Page 0x07 codes verbatim. Press/release derived by diffing successive reports' key sets; modifier byte at offset 0 maps to the wire's 3-bit shift/ctrl/alt bitmap.
+- `pointer_reader` finds the first hidraw whose descriptor starts with `05 01 09 02` (Mouse). Hardcodes the QEMU usb-tablet's 6-byte report layout (1 byte buttons + 2× 16-bit absolute axes + signed wheel). HID button bits map to Usage Page 0x09 numbers (1=primary, 2=secondary, 3=middle); Linux `BTN_*` doesn't appear anywhere.
+
+Tried first: `/dev/kbd0` `KDSKBMODE(K_RAW)`. On modern hidbus FreeBSD `/dev/kbd0` is the `kbdmux(4)` multiplexer view and rejects `K_RAW` (`ENOTTY`); the underlying physical keyboard `/dev/kbd1` is held exclusively by kbdmux. Hidraw works in parallel — no driver detach, no exclusive-claim juggling.
+
+Tried first: `/dev/uhid*`. On modern systems with `hms(4)`/`hkbd(4)` claiming the HID interfaces via hidbus, `/dev/uhid*` doesn't get created. Detaching `ums0` and reattaching as `uhid` only works on systems that still have the legacy `ums(4)` driver — modern is `hms(4)` on hidbus, which uses `hidraw(4)` as the parallel-access path.
+
+Setup: load `hidraw.ko` at boot. `scripts/first-boot-setup.exp` runs `sysrc kld_list+=hidraw` so it's persistent. To apply to an already-set-up VM:
+
+```sh
+vssh "kldload hidraw && sysrc kld_list+=hidraw"
+```
+
+`pointer_reader` falls back to legacy `/dev/uhid*` if no hidraw descriptor matches — keeps the legacy path alive for any system that ships uhid instead of hidraw.
+
+**Quirk fixed during bring-up:** hidraw enforces exclusive open. Spawning the keyboard and pointer reader threads in parallel races: both probe `/dev/hidraw*` looking for their device, and one gets EBUSY for the device the other just opened (probe-and-close happens fast but the kernel's exclusive-lock release lags). Fix is in `main.rs`: spawn pointer first, sleep 200 ms, then spawn keyboard. The probes are now sequential.
+
+**D1 step 2(c.18) (per-vertex-UV / atlas-mode glyphs + atrium-term-socket)** — DONE (2026-04-29). `Material.uv_region: [f32; 4]` extends `NODE_MATERIAL_TEXTURED` with an optional `[36..52]` block carrying `u0, v0, u1, v1`. `tiny_skia_backend` builds the `Pattern.transform` from the material's UV region — full-texture default `[0, 0, 1, 1]` reduces to the old `scale(1/tex_w, 1/tex_h)`; sub-rect UVs slice a shared atlas. fresco-socket-rs gains `wire::material_textured_uv` and `Connection: AsRawFd` (lets apps register the socket fd in their own kqueue alongside the pty fd).
+
+`atrium-edit-socket/glyph_cache.rs` rewritten to atlas mode: shapes printable ASCII as one `GlyphAtlas`, uploads pixels as a single CAS texture, builds 94 `material_textured_uv` blobs each pointing at one glyph's UV cell. Storage is now 1 atlas + 94 thin materials instead of 94 separate textures. Deduplication wins double: the atlas is the only large blob, and the unit-rect mesh is shared across every glyph in every visible character.
+
+`atrium-term-socket` (new crate at `~/src/bsd/atrium-term-socket/`) ports atrium-term to fresco-socket-rs. `grid.rs` / `keymap.rs` / `pty.rs` copied unchanged from atrium-term (already protocol-agnostic). New `glyph_cache.rs` mirrors the editor's atlas mode. `main.rs` uses `kqueue` to multiplex the pty master fd and `Connection::as_raw_fd()` so a single `kevent()` wakes on either pty output or a server event.
+
+### Verification (multi-window: editor + terminal side by side)
+
+Cross-compile everything (host, ~3 s):
+```sh
+cd ~/src/bsd/atrium-compositor && cargo build --release --target aarch64-unknown-freebsd
+cd ~/src/bsd/atrium-edit-socket && cargo build --release --target aarch64-unknown-freebsd
+cd ~/src/bsd/atrium-term-socket && cargo build --release --target aarch64-unknown-freebsd
+```
+
+Boot + setup (one terminal):
+```sh
+~/src/bsd/scripts/run-vm.sh --virtio-gpu --display
+```
+
+In the VM (via `vssh`):
+```sh
+# Mount the host share + load the kmod (same as previous steps)
+vssh "kldload p9fs; mount -t p9fs -o trans=virtio bsd_share /mnt/host"
+vssh "kldload /mnt/host/atrium-kmod/atrium_virtio_gpu.ko"
+vssh "devctl set driver -f vtgpu0 atrium_virtio_gpu" || true
+vssh "devctl enable atrium_virtio_gpu0"
+
+# First-time only — load hidraw + persist it across boots. Hidraw
+# attaches in parallel to hkbd(4) and hms(4) via hidbus, giving the
+# compositor raw HID access without disturbing the dedicated drivers.
+vssh "kldload hidraw && sysrc kld_list+=hidraw"
+vssh "ls /dev/hidraw*"   # expect /dev/hidraw0 (kbd) and /dev/hidraw1 (mouse)
+```
+
+Launch the compositor + two clients (each via its own `vssh`):
+```sh
+vssh "nohup /mnt/host/atrium-compositor/target/aarch64-unknown-freebsd/release/atrium-compositor > /tmp/comp.log 2>&1 < /dev/null &"
+sleep 1
+vssh "nohup /mnt/host/atrium-edit-socket/target/aarch64-unknown-freebsd/release/atrium-edit-socket /mnt/host/test-assets/scratch.txt > /tmp/edit.log 2>&1 < /dev/null &"
+vssh "nohup /mnt/host/atrium-term-socket/target/aarch64-unknown-freebsd/release/atrium-term-socket > /tmp/term.log 2>&1 < /dev/null &"
+```
+
+Verification points (visual, in the QEMU window):
+- **Cursor**: a small black-on-white arrow tracks pointer movement across the screen. (uhid → cursor overlay)
+- **Both windows visible**: editor showing scratch.txt, terminal showing a `$` prompt.
+- **Click-to-focus**: click on either window's content area; that window comes to the top of the z-order, the other one's cursor block (if the focused-cursor blink is enabled) goes dim.
+- **Per-window keyboard**: type — characters appear only in the focused window. Click the other window, type — characters appear there now, never in both.
+- **Drag**: press-and-hold on a window's titlebar, drag — window follows cursor 1:1.
+- **Resize**: press-and-hold near a window's edge (any of L/R/T/B), drag — window resizes; on release the editor receives `COMP_WINDOW_RESIZED` (logged) and the terminal's grid + pty re-layout to the new cell count via `SIGWINCH`.
+- **Close**: click the close button on a window's titlebar; the app exits cleanly (the editor's `atrium-edit-socket` quits, the terminal's `atrium-term-socket` shuts down its pty + exits).
+- **Atlas check** in `tail -f /tmp/edit.log`:
+  ```
+  glyph atlas: 512x512 px, 94 glyphs uploaded as 1 CAS texture
+  ```
+  (vs. the previous 94 individual `upload_texture` calls)
+
+`/tmp/comp.log` should show:
+```
+pointer: reading /dev/hidraw1
+kbd: reading /dev/hidraw0
+```
+not `no /dev/hidraw*` or `KDSKBMODE(K_RAW) failed`.
 
 ---
 

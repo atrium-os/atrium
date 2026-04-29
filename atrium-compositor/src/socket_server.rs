@@ -36,10 +36,13 @@ pub struct Shared {
 }
 
 /// Producer side of the async event fan-out: every accepted
-/// connection's writer-thread sender is registered here. Async
-/// producers (input reader, future WM events) iterate this list to
-/// broadcast.
-pub type EventSubs = Arc<Mutex<Vec<Sender<Completion>>>>;
+/// connection's writer-thread sender is registered here, paired
+/// with the connection's `client_id` so producers can route a
+/// completion to the *one* client that owns its target window
+/// (by consulting `WmCompositor::windows[id].owner`). A producer
+/// that doesn't care about routing (e.g. keyboard broadcast in
+/// the absence of focus) iterates and sends to every subscriber.
+pub type EventSubs = Arc<Mutex<Vec<(u8, Sender<Completion>)>>>;
 
 pub fn spawn(shared: Shared, sock_path: &Path) -> std::io::Result<EventSubs> {
     if sock_path.exists() {
@@ -71,7 +74,7 @@ fn accept_loop(listener: UnixListener, shared: Shared, event_subs: EventSubs) {
                 // can broadcast to it. We only register the clone the
                 // reader will hold; that way when the reader drops its
                 // tx, broadcasters' sends start failing (clean shutdown).
-                event_subs.lock().unwrap().push(tx.clone());
+                event_subs.lock().unwrap().push((client_id, tx.clone()));
 
                 // Writer thread.
                 let writer_stream = match stream.try_clone() {
@@ -92,9 +95,16 @@ fn accept_loop(listener: UnixListener, shared: Shared, event_subs: EventSubs) {
                 std::thread::Builder::new()
                     .name(format!("atrium-socket-reader-{client_id}"))
                     .spawn(move || {
-                        if let Err(e) = reader_loop(stream, frontend, client_id, tx, subs_for_reader) {
+                        if let Err(e) = reader_loop(stream, frontend.clone(), client_id, tx, subs_for_reader) {
                             eprintln!("reader {client_id}: {e}");
                         }
+                        // On disconnect, tear down all windows owned
+                        // by this client. Apps may exit without
+                        // calling destroy_window; without this step
+                        // the WM keeps the window registered, the
+                        // compositor keeps rendering its (stale) FBO,
+                        // and the visible window never goes away.
+                        cleanup_client_windows(&frontend, client_id);
                     })
                     .ok();
             }
@@ -124,10 +134,11 @@ fn reader_loop(
         let cmd: Command = bytemuck::pod_read_unaligned(&buf);
 
         // Vendor-extension opcode: client-injected input event for
-        // testing. Builds a COMP_INPUT_KEY and broadcasts. Real input
-        // (step 2c.14+) flows from a kernel reader thread, NOT from
-        // clients — INJECT is purely for automation harnesses like
-        // `atrium-keyboard`.
+        // testing. Real input flows from native HID devices (D1 step
+        // 2c.16+), NOT from clients. Gated behind the `inject-input`
+        // feature so production builds reject the opcode and refuse
+        // to let untrusted clients spoof keystrokes.
+        #[cfg(feature = "inject-input")]
         if cmd.opcode == CMD_INJECT_KEY {
             let pb = cmd.payload_bytes();
             let hid_usage = u16::from_le_bytes([pb[0], pb[1]]);
@@ -145,7 +156,12 @@ fn reader_loop(
                 _pad:        [0u32; 22],
             };
             let mut subs = event_subs.lock().unwrap();
-            subs.retain(|tx| tx.send(comp).is_ok());
+            subs.retain(|(_, tx)| tx.send(comp).is_ok());
+            continue;
+        }
+        #[cfg(not(feature = "inject-input"))]
+        if cmd.opcode == CMD_INJECT_KEY {
+            eprintln!("CMD_INJECT_KEY rejected: compositor built without `inject-input` feature");
             continue;
         }
 
@@ -155,6 +171,28 @@ fn reader_loop(
                 return Ok(());
             }
         }
+    }
+}
+
+/// Destroy every window whose `owner` matches the disconnecting
+/// client. Goes through `WmCompositor::destroy_with_focus_shift` so
+/// focus shifts properly (the next-most-recent window in z-order
+/// gains focus). The CommandFrontend exposes the WM via its public
+/// `compositor` Arc.
+fn cleanup_client_windows(
+    frontend: &Arc<Mutex<CommandFrontend>>,
+    client_id: u8,
+) {
+    let fe = frontend.lock().unwrap();
+    let wm_arc = fe.compositor.clone();
+    drop(fe);
+    let mut wm = wm_arc.lock().unwrap();
+    let owned: Vec<u16> = wm.windows.iter()
+        .filter(|(_, w)| w.owner as u8 == client_id)
+        .map(|(&id, _)| id)
+        .collect();
+    for id in owned {
+        let _ = wm.destroy_with_focus_shift(id, client_id as u32);
     }
 }
 

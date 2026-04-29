@@ -34,6 +34,10 @@ path = "src/window_demo.rs"
 name = "atrium-keyboard"
 path = "src/keyboard.rs"
 
+[[bin]]
+name = "atrium-mouse-demo"
+path = "src/mouse_demo.rs"
+
 [dependencies]
 fresco-server = { path = "../../fresco" }
 fresco-socket-rs = { path = "../fresco-socket-rs" }

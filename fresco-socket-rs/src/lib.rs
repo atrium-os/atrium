@@ -14,6 +14,7 @@
 pub mod wire;
 
 use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
@@ -26,7 +27,8 @@ use fresco_server::command::protocol::{
     CMD_SET_ROOT, CMD_SLOT_ALLOC, CMD_SLOT_FREE, CMD_SLOT_SET_CONTENT,
     CMD_SLOT_SET_ROOT, CMD_SLOT_SET_XFORM,
     CMD_UPLOAD_BEGIN, CMD_UPLOAD_DATA, CMD_UPLOAD_FINISH,
-    COMP_INPUT_KEY, COMP_UPLOAD_COMPLETE, COMP_WINDOW_CLOSE_REQUESTED,
+    COMP_INPUT_KEY, COMP_INPUT_MOUSE_BUTTON, COMP_INPUT_MOUSE_MOVE, COMP_INPUT_SCROLL,
+    COMP_UPLOAD_COMPLETE, COMP_WINDOW_CLOSE_REQUESTED,
     COMP_WINDOW_CREATED, COMP_WINDOW_FOCUS, COMP_WINDOW_RESIZED,
 };
 use sha2::{Digest, Sha256};
@@ -55,6 +57,24 @@ pub enum Event {
     /// 0x04 = 'a'). `modifiers` is a bitmap: bit 0 = shift, bit 1 = ctrl,
     /// bit 2 = alt.
     Key { window_id: u32, hid_usage: u16, pressed: bool, modifiers: u8 },
+    /// Cursor moved. `x` / `y` are in screen pixels (compositor space).
+    /// Hit-testing into a window is the WM's job; for now `window_id`
+    /// is 0 (broadcast) until per-window focus routing lands.
+    MouseMove { window_id: u32, x: f32, y: f32 },
+    /// Mouse button pressed/released. `button` mirrors Linux `BTN_*`
+    /// (0x110=left, 0x111=right, 0x112=middle). Cursor position at the
+    /// click is included so apps don't need to track it themselves.
+    MouseButton {
+        window_id: u32,
+        button: u16,
+        pressed: bool,
+        modifiers: u8,
+        x: f32,
+        y: f32,
+    },
+    /// Scroll wheel. `dx` / `dy` are in lines; horizontal is rare on
+    /// most hardware so most events have `dx == 0.0`.
+    Scroll { window_id: u32, dx: f32, dy: f32 },
     /// Anything else — fall-through so unknown event types don't get
     /// silently dropped while we evolve the protocol.
     Other { comp_type: u16, status: u16, id: u32 },
@@ -90,6 +110,24 @@ fn decode_event(c: Completion) -> Event {
             pressed:   c.status != 0,
             modifiers: c.result_hash[2],
         },
+        COMP_INPUT_MOUSE_MOVE => Event::MouseMove {
+            window_id: c.id,
+            x: f32::from_le_bytes([c.result_hash[0], c.result_hash[1], c.result_hash[2], c.result_hash[3]]),
+            y: f32::from_le_bytes([c.result_hash[4], c.result_hash[5], c.result_hash[6], c.result_hash[7]]),
+        },
+        COMP_INPUT_MOUSE_BUTTON => Event::MouseButton {
+            window_id: c.id,
+            button:    u16::from_le_bytes([c.result_hash[0], c.result_hash[1]]),
+            pressed:   c.status != 0,
+            modifiers: c.result_hash[2],
+            x: f32::from_le_bytes([c.result_hash[4], c.result_hash[5], c.result_hash[6], c.result_hash[7]]),
+            y: f32::from_le_bytes([c.result_hash[8], c.result_hash[9], c.result_hash[10], c.result_hash[11]]),
+        },
+        COMP_INPUT_SCROLL => Event::Scroll {
+            window_id: c.id,
+            dx: f32::from_le_bytes([c.result_hash[0], c.result_hash[1], c.result_hash[2], c.result_hash[3]]),
+            dy: f32::from_le_bytes([c.result_hash[4], c.result_hash[5], c.result_hash[6], c.result_hash[7]]),
+        },
         _ => Event::Other {
             comp_type: c.comp_type,
             status: c.status,
@@ -111,6 +149,19 @@ pub struct Connection {
     /// Events received while waiting for a command response — buffered
     /// until the app drains them via `poll_event` / `wait_event`.
     pending_events: VecDeque<Event>,
+    /// Routable opcodes (SET_ROOT, SLOT_*, FRAME_*, etc.) get their
+    /// `cmd.flags` stamped with this window id so the server's
+    /// `CommandFrontend::dispatch` routes them to the right per-
+    /// window scene/slot pair. Default 0 (the screen scene).
+    default_window: u16,
+}
+
+impl AsRawFd for Connection {
+    /// Underlying socket fd, for kqueue/EVFILT_READ registration when
+    /// the app multiplexes server events with another fd (pty, timer,
+    /// etc.). Don't `read()` it directly — use `poll_event` /
+    /// `wait_event` so the framing stays sane.
+    fn as_raw_fd(&self) -> RawFd { self.stream.as_raw_fd() }
 }
 
 impl Connection {
@@ -119,7 +170,29 @@ impl Connection {
             stream: UnixStream::connect(path)?,
             next_seq: 1,
             pending_events: VecDeque::new(),
+            default_window: 0,
         })
+    }
+
+    /// Stamp routable commands (SET_ROOT, SLOT_*, FRAME_*) with this
+    /// window id so the server routes them to the per-window scene
+    /// instead of the global screen scene. Set this right after
+    /// `create_window` so subsequent renders fill that window's FBO.
+    pub fn set_default_window(&mut self, id: u16) {
+        self.default_window = id;
+    }
+
+    /// Move the window to (x, y) in screen-pixel coordinates. The WM
+    /// uses this to lay out windows; clients may also call it to
+    /// stagger their initial position so two instances don't overlap.
+    pub fn window_set_pos(&mut self, id: u16, x: f32, y: f32) -> std::io::Result<()> {
+        const CMD_WINDOW_SET_POS: u16 = 0x0505;
+        let mut payload = vec![0u8; 12];
+        payload[0..4].copy_from_slice(&(id as u32).to_le_bytes());
+        payload[4..8].copy_from_slice(&x.to_le_bytes());
+        payload[8..12].copy_from_slice(&y.to_le_bytes());
+        let seq = self.alloc_seq();
+        self.write_cmd(&build_command(CMD_WINDOW_SET_POS, seq, &payload))
     }
 
     fn alloc_seq(&mut self) -> u32 {
@@ -129,7 +202,15 @@ impl Connection {
     }
 
     fn write_cmd(&mut self, cmd: &Command) -> std::io::Result<()> {
-        let bytes: [u8; std::mem::size_of::<Command>()] = bytemuck::cast(*cmd);
+        let mut cmd = *cmd;
+        // Routable opcodes carry the target window id in `flags`; the
+        // server's `CommandFrontend::dispatch` rebinds slot_table /
+        // scene to that window. Stamp here so call sites don't have
+        // to thread it through every helper.
+        if cmd.flags == 0 && is_routable_opcode(cmd.opcode) {
+            cmd.flags = self.default_window;
+        }
+        let bytes: [u8; std::mem::size_of::<Command>()] = bytemuck::cast(cmd);
         self.stream.write_all(&bytes)
     }
 
@@ -463,6 +544,20 @@ impl Connection {
         let seq = self.alloc_seq();
         self.write_cmd(&build_command(CMD_SLOT_FREE, seq, &payload))
     }
+}
+
+/// Mirror of `CommandFrontend::is_routable` on the server side.
+/// Kept narrow on purpose: only opcodes that mutate per-window
+/// scene/slot state get window-stamped.
+fn is_routable_opcode(opcode: u16) -> bool {
+    use fresco_server::command::protocol::*;
+    matches!(opcode,
+        CMD_SET_ROOT | CMD_SET_CAMERA
+        | CMD_SLOT_ALLOC | CMD_SLOT_FREE
+        | CMD_SLOT_SET_XFORM | CMD_SLOT_SET_CONTENT
+        | CMD_SLOT_SET_ROOT
+        | CMD_FRAME_BEGIN | CMD_FRAME_END
+    )
 }
 
 fn sha256(data: &[u8]) -> Hash256 {

@@ -16,6 +16,7 @@ this is a test
 Lines below are dummy content for scrolling.
 
 this is me writing in the editor
+this is me writing another line
 
 The quick brown fox jumps over the lazy dog.
  lazy dog.The quick brown fox jumps over the

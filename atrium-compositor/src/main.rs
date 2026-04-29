@@ -20,7 +20,10 @@
 //! Targets ~30 fps via fixed-cadence sleep. virtio-gpu doesn't expose vblank
 //! events (D0 step 3.5), so we don't pace to vsync.
 
+mod cursor;
 mod input_reader;
+mod pointer_dispatch;
+mod pointer_reader;
 mod scene_build;
 mod socket_server;
 
@@ -29,12 +32,13 @@ use atrium_gpu::{Bo, Display, Gpu, Mode};
 use fresco_server::cas::store::CasStore;
 use fresco_server::command::frontend::CommandFrontend;
 use fresco_server::command::protocol::{Hash256, NULL_HASH};
-use fresco_server::render::backend::GpuBackend;
+use fresco_server::render::backend::{GpuBackend, WindowOverlay};
 use fresco_server::render::tiny_skia_backend::TinySkiaBackend;
 use fresco_server::scene::graph::SceneGraph;
 use fresco_server::scene::slots::SlotTable;
 use fresco_server::window::Compositor as WmCompositor;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -56,6 +60,11 @@ struct Compositor<'g> {
     /// client can drive the scene from outside.
     cas: Arc<Mutex<CasStore>>,
     scene: Arc<Mutex<SceneGraph>>,
+    /// Window manager state — windows + z-order + drag/resize state.
+    /// Per-window FBOs in the backend are reconciled from this each
+    /// frame.
+    wm: Arc<Mutex<WmCompositor>>,
+    cursor: Arc<Mutex<cursor::CursorState>>,
     /// Cached primitive meshes — built once at startup, referenced by
     /// hash from every per-frame RenderItem. CAS dedups identical
     /// content so this also matches what the dedup-on-upload protocol
@@ -73,29 +82,74 @@ impl<'g> Compositor<'g> {
         let h = self.mode.height;
         let now = self.started.elapsed().as_secs_f32();
 
+        // ── Phase 1: enumerate floating windows + sync FBOs ─────
+        // Snapshot to a Vec so we don't hold the WM lock across
+        // per-window scene rendering (that would deadlock against
+        // socket threads issuing routable commands which take WM
+        // for routing).
+        let window_info: Vec<(u16, Arc<Mutex<SceneGraph>>)> = {
+            let g = self.wm.lock().unwrap();
+            g.windows.iter()
+                .filter(|(&id, _)| id != 0)
+                .map(|(&id, w)| (id, w.scene.clone()))
+                .collect()
+        };
+        let live: HashMap<u16, (u32, u32)> = {
+            let g = self.wm.lock().unwrap();
+            g.windows.iter()
+                .filter(|(&id, _)| id != 0)
+                .map(|(&id, w)| (id, (w.size.0 as u32, w.size.1 as u32)))
+                .collect()
+        };
+        self.backend.sync_fbos(&live);
+
+        // ── Phase 2: render each window's scene into its FBO ─────
+        for (id, scene_arc) in &window_info {
+            let mut cas = self.cas.lock().unwrap();
+            let mut scene = scene_arc.lock().unwrap();
+            if scene.root_hash != NULL_HASH && scene.is_dirty() {
+                scene.traverse(&mut cas);
+            }
+            if !scene.render_list().is_empty() {
+                self.backend.render_window_to_fbo(*id, &scene, &cas);
+            }
+        }
+
+        // ── Phase 3: build (overlay, decorations) per window in z-
+        // order. Lowest-z first so the backend interleaves blit +
+        // decorations correctly: each window's chrome goes above its
+        // own content, and below higher-z windows.
+        let layered: Vec<(WindowOverlay, Vec<fresco_server::scene::graph::RenderItem>)> = {
+            let g = self.wm.lock().unwrap();
+            g.z_order.iter()
+                .filter_map(|&id| {
+                    if id == 0 { return None; }
+                    let win = g.windows.get(&id)?;
+                    let ov = WindowOverlay {
+                        id, x: win.pos.0, y: win.pos.1,
+                        w: win.size.0, h: win.size.1,
+                    };
+                    Some((ov, g.compose_overlay_for(id)))
+                })
+                .collect()
+        };
+
+        // ── Phase 4: screen scene + composite ────────────────────
         // Lock order must match CommandFrontend::handle_set_root:
         // cas first, scene second. Otherwise a socket thread holding
         // cas-then-waiting-on-scene + render loop holding scene-then-
         // waiting-on-cas → deadlock.
         let mut cas = self.cas.lock().unwrap();
         let mut scene = self.scene.lock().unwrap();
-        // Two paths populate scene.render_list:
-        //   - CMD_SET_ROOT + scene.traverse (CAS-tree apps)
-        //   - CMD_FRAME_END + slot_table.traverse (slot-graph apps)
-        // The render loop renders whatever's there; only if both are
-        // empty do we fall back to the in-process clock demo.
         let socket_driven = scene.root_hash != NULL_HASH
                          || !scene.render_list().is_empty();
+        let has_windows = !layered.is_empty();
 
-        if socket_driven {
-            // Only call traverse() when there's a CAS root to walk;
-            // traverse() unconditionally CLEARS render_list, so calling
-            // it with root_hash=NULL would wipe a slot-built render_list
-            // populated by CMD_FRAME_END.
+        if socket_driven || has_windows {
             if scene.root_hash != NULL_HASH && scene.is_dirty() {
                 scene.traverse(&mut cas);
             }
-            self.backend.render_frame(&scene, &cas, self.frame, None);
+            self.backend.render_screen_with_windows(&scene, &cas, &layered);
         } else {
             // Fallback: in-process clock demo.
             scene.clear();
@@ -192,6 +246,15 @@ impl<'g> Compositor<'g> {
 
         // Frame heartbeat — small imperative overlay.
         draw_frame_indicator(&mut self.backend.pixmap_mut(), self.frame);
+
+        // Software cursor overlay — last so it sits above scene + WM
+        // decorations. Cheap; no HW cursor plane on virtio-gpu yet.
+        {
+            let c = *self.cursor.lock().unwrap();
+            if c.visible {
+                cursor::draw(&mut self.backend.pixmap_mut(), c.x, c.y);
+            }
+        }
 
         self.backend.copy_to_bgra(self.bo.as_mut_slice());
         self.frame = self.frame.wrapping_add(1);
@@ -435,10 +498,39 @@ fn main() -> std::io::Result<()> {
         }
     };
 
-    // Native FreeBSD input. Reads /dev/input/event0 (kbdmux0), translates
-    // Linux keycodes to USB HID Usage Page 0x07, broadcasts COMP_INPUT_KEY.
+    // Native FreeBSD input. Keyboard via /dev/kbd0 K_RAW (AT scan
+    // codes → HID Usage Page 0x07); pointer via /dev/uhid0 (raw HID
+    // reports). No evdev anywhere in the pipeline.
+    let cursor_state = cursor::CursorState::new(
+        (mode.width as f32) / 2.0,
+        (mode.height as f32) / 2.0,
+    );
+    let modifiers: input_reader::SharedModifiers = Arc::new(Mutex::new(0));
     if let Some(subs) = event_subs.clone() {
-        input_reader::spawn(subs);
+        // Stagger spawn: keyboard and pointer probes both open
+        // /dev/hidraw* devices and FreeBSD's hidraw enforces exclusive
+        // open. Probing in parallel from two threads races and one
+        // gets EBUSY for a device the other was just probing.
+        // Pointer first (cursor goes silent first if it's missing),
+        // keyboard 200 ms later.
+
+        // Native pointer via /dev/hidraw* (or /dev/uhid* fallback).
+        // The compositor does not fall
+        // back to evdev — the bring-up VM is expected to have ums
+        // detached so /dev/uhid0 exists. See RUNBOOK.md for the one-
+        // time setup. If /dev/uhid* is missing the compositor logs
+        // and continues without pointer input (keyboard still works).
+        let disp = pointer_dispatch::Dispatcher {
+            event_subs: subs.clone(),
+            cursor:     cursor_state.clone(),
+            wm:         wm.clone(),
+            modifiers:  modifiers.clone(),
+            screen_w:   mode.width,
+            screen_h:   mode.height,
+        };
+        pointer_reader::spawn(disp);
+        std::thread::sleep(Duration::from_millis(200));
+        input_reader::spawn(subs, modifiers, wm.clone());
     }
     let _ = event_subs;
 
@@ -448,6 +540,8 @@ fn main() -> std::io::Result<()> {
         backend,
         cas,
         scene,
+        wm: wm.clone(),
+        cursor: cursor_state,
         rect_mesh,
         disk_mesh,
         ring_mesh,

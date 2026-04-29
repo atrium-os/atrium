@@ -41,6 +41,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut conn = Connection::connect(&sock)?;
     eprintln!("connected to {sock}");
 
+    // Create our own window so the compositor's per-window FBO
+    // pipeline can composite us alongside other apps. Without this
+    // we'd render into the screen scene (window 0) and the last
+    // SET_ROOT writer would win.
+    const WIN_W: u32 = 720;
+    const WIN_H: u32 = 540;
+    let win = conn.create_window(WIN_W, WIN_H, Some("edit"))?;
+    let _ = conn.window_set_pos(win as u16, 60.0, 60.0);
+    conn.set_default_window(win as u16);
+    eprintln!("window {win} created — {WIN_W}x{WIN_H}");
+
     let cache    = glyph_cache::GlyphCache::build(&mut conn, &font, FONT_SIZE_PX)?;
     let renderer = render::Renderer::new(&cache, &mut conn)?;
     let mut keymap = keymap::Keymap::new();

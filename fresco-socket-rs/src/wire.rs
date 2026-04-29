@@ -161,6 +161,29 @@ pub fn material_textured(texture_hash: Hash256, tint: [u8; 4]) -> Vec<u8> {
     blob(0x0203, 0, &body)
 }
 
+/// NODE_MATERIAL_TEXTURED with explicit UV sub-region. Body (52 bytes):
+///   [0..32]   albedo texture hash
+///   [32..36]  tint color
+///   [36..52]  uv region: u0, v0, u1, v1 (4 × f32 LE)
+///
+/// Use this to slice a shared atlas: one CAS-stored texture, many
+/// cheap materials each pointing at a different cell. Glyph atlases
+/// are the motivating case (94 ASCII materials, one atlas).
+pub fn material_textured_uv(
+    texture_hash: Hash256,
+    tint: [u8; 4],
+    uv_region: [f32; 4],
+) -> Vec<u8> {
+    let packed = u32::from_le_bytes(tint);
+    let mut body = Vec::with_capacity(52);
+    body.extend_from_slice(&texture_hash);
+    body.extend_from_slice(&packed.to_le_bytes());
+    for v in uv_region {
+        body.extend_from_slice(&v.to_le_bytes());
+    }
+    blob(0x0203, 0, &body)
+}
+
 /// 2D affine in 4x4 column-major form (z = identity). Used as
 /// `RenderItem.world_matrix` / `Transform.matrix` — fresco-server's
 /// MVP composition expects column-major.
