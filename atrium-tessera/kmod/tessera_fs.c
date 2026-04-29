@@ -92,6 +92,27 @@ tessera_load_sb(struct vnode *devvp, uint64_t which,
 	return (0);
 }
 
+/* Write `sb` (encoded fresh — including a recomputed CRC) to sector
+ * `which`. Used at mount time to self-heal a corrupt or stale
+ * superblock from the surviving good copy. Synchronous bwrite — the
+ * heal is a one-sector best-effort and the volume's already mounted
+ * fine off the other SB if it fails. */
+static int
+tessera_heal_sb(struct vnode *devvp, uint64_t which,
+                const tessera_superblock_t *sb)
+{
+	struct buf *bp = getblk(devvp, which * btodb(TESSERA_SECTOR_SIZE),
+	    TESSERA_SECTOR_SIZE, 0, 0, 0);
+	if (bp == NULL) return (ENOMEM);
+	bzero(bp->b_data, TESSERA_SECTOR_SIZE);
+	int rc = tessera_encode_superblock(sb, (uint8_t *)bp->b_data);
+	if (rc != TESSERA_OK) {
+		brelse(bp);
+		return (EIO);
+	}
+	return (bwrite(bp));
+}
+
 /* ── core mount: open device + decode SB ─────────────────────── */
 
 static int
@@ -105,8 +126,11 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp)
 	int err;
 
 	dev_ref(dev);
+	/* Open the device read-write at the GEOM layer so we can issue
+	 * the SB self-heal write below; user-facing writes are still
+	 * blocked by MNT_RDONLY in this round. */
 	g_topology_lock();
-	err = g_vfs_open(devvp, &cp, "tessera", 0);
+	err = g_vfs_open(devvp, &cp, "tessera", 1);
 	g_topology_unlock();
 	VOP_UNLOCK(devvp);
 	if (err != 0) {
@@ -139,6 +163,34 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp)
 		printf("tessera_fs: unsupported version/sector_size\n");
 		err = EINVAL;
 		goto fail_close;
+	}
+
+	/* Self-heal: if either SB failed to decode, or both decoded but
+	 * generations differ, rewrite the stale/corrupt copy from the
+	 * active one. The dual-SB scheme only earns its keep if we keep
+	 * both copies in sync — leaving a corrupt SB-A turns the volume
+	 * into a single-copy gambit. Best-effort; failures are logged
+	 * but don't block the mount. */
+	if (!valid_a) {
+		if (tessera_heal_sb(devvp, 0, active) == 0)
+			printf("tessera_fs: SB-A healed from SB-B (gen=%lu)\n",
+			    (unsigned long)active->generation);
+		else
+			printf("tessera_fs: SB-A heal failed; volume mounted "
+			    "off SB-B alone\n");
+	} else if (!valid_b) {
+		if (tessera_heal_sb(devvp, 1, active) == 0)
+			printf("tessera_fs: SB-B healed from SB-A (gen=%lu)\n",
+			    (unsigned long)active->generation);
+		else
+			printf("tessera_fs: SB-B heal failed; volume mounted "
+			    "off SB-A alone\n");
+	} else if (sb_a.generation != sb_b.generation) {
+		uint64_t which = (active == &sb_a) ? 1 : 0;
+		if (tessera_heal_sb(devvp, which, active) == 0)
+			printf("tessera_fs: SB-%c re-synced to gen=%lu\n",
+			    which == 0 ? 'A' : 'B',
+			    (unsigned long)active->generation);
 	}
 
 	tmp_ = malloc(sizeof(*tmp_), M_TESSERA, M_WAITOK | M_ZERO);
