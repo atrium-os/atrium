@@ -1,0 +1,13 @@
+[package]
+name        = "tessera"
+version.workspace     = true
+edition.workspace     = true
+license.workspace     = true
+repository.workspace  = true
+description = "Safe Rust wrapper over tessera-sys (the libtessera_core FFI)."
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+tessera-sys = { path = "../tessera-sys" }

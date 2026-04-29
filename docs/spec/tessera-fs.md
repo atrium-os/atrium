@@ -398,7 +398,7 @@ Given the same file content and the same CDC parameters, a Tessera-FS implementa
 
 ## 7. Inodes
 
-The inode is the only on-disk POSIX-shaped object that mutates. An inode record is exactly 128 bytes. Inode-table B+tree leaves use the standard B+tree node format (§10) with `key_size = 8` (inode_no), `value_size = 128` (inode record). Subtracting the 32-byte node header, each leaf holds at most ⌊(4096 − 32) / (8 + 128)⌋ = 29 inodes.
+The inode is the only on-disk POSIX-shaped object that mutates. An inode record is exactly 144 bytes. Inode-table B+tree leaves use the standard B+tree node format (§10) with `key_size = 8` (inode_no), `value_size = 144` (inode record). Subtracting the 32-byte node header, each leaf holds at most ⌊(4096 − 32) / (8 + 144)⌋ = 26 inodes.
 
 ### 7.1 Inode record
 
@@ -407,7 +407,7 @@ offset  size  field
    0      4   inode_no               (denormalized; matches the table key)
    4      4   gen                    increments on every write of this inode
    8      4   mode                   POSIX mode bits (incl. type)
-  12      4   reserved
+  12      4   reserved_a
   16      4   uid
   20      4   gid
   24      8   atime_ns               nanos since Unix epoch
@@ -419,7 +419,8 @@ offset  size  field
   68      4   flags                  see §7.2
   72     32   manifest_hash          current content (zero if empty/special)
  104     32   xattr_hash             hash of XATTR_STORE manifest (zero if none)
-128
+ 136      8   reserved_b             zero in v1; reserved for per-inode key id, etc.
+144
 ```
 
 `mode` follows the POSIX `S_IFMT` convention (regular, directory, symlink, etc.). Special files (FIFOs, sockets, device nodes) are not supported in v1; their `mode` values are reserved and rejected at create time.
@@ -437,7 +438,7 @@ offset  size  field
 
 ### 7.3 Inode table
 
-The inode table is a B+tree (see §10) keyed by `inode_no` (u64). Leaves are 4 KiB blocks holding up to 29 (inode_no, inode_record) entries each. Internal nodes are 4 KiB blocks holding (key, child_block) pairs.
+The inode table is a B+tree (see §10) keyed by `inode_no` (u64). Leaves are 4 KiB blocks holding up to 26 (inode_no, inode_record) entries each. Internal nodes are 4 KiB blocks holding (key, child_block) pairs.
 
 Inode `0` is reserved (null/invalid). Inode `1` is reserved for fsck/system internal use. Inode `2` is the root directory. Inode allocation begins at 3.
 

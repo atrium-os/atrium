@@ -1,0 +1,17 @@
+[package]
+name        = "tessera-sys"
+version.workspace     = true
+edition.workspace     = true
+license.workspace     = true
+repository.workspace  = true
+description = "Raw FFI bindings to libtessera_core (the canonical C codec)."
+links       = "tessera_core"
+
+[lib]
+crate-type = ["rlib"]
+
+[build-dependencies]
+# bindgen is added in Phase 1 once the C surface stabilises; for Phase 0
+# we hand-write a minimal subset to keep the toolchain dependency light.
+
+[dependencies]
