@@ -45,6 +45,7 @@
 #include "tessera/codec.h"
 #include "tessera/error.h"
 #include "tessera/format.h"
+#include "tessera/hash.h"
 #include "tessera/manifest.h"
 #include "tessera/pack.h"
 #include "tessera/volume.h"
@@ -96,6 +97,12 @@ tessera_kbio_alloc(void *ctx, uint64_t n, uint64_t *out_sector)
 static int
 tessera_kbio_free(void *ctx, uint64_t s, uint64_t n)
 { (void)ctx; (void)s; (void)n; return (0); }
+
+/* ── forward decl for fetch_blob (uses tessera_mount) ────────── */
+struct tessera_mount;
+static int tessera_fs_fetch_blob(struct tessera_mount *tmp_,
+                                  const tessera_hash_t hash,
+                                  uint8_t **out_buf, uint32_t *out_len);
 
 /* ── per-mount state ─────────────────────────────────────────── */
 
@@ -544,12 +551,45 @@ tessera_vop_getattr(struct vop_getattr_args *ap)
 	return (0);
 }
 
+/*
+ * Walk a parsed DIRECTORY manifest looking for `name` (length nlen).
+ * On hit, *out_inode is the child inode_no. The body is the encoded
+ * dirent stream from manifest.c: for each entry,
+ *   uint64 child_inode | uint16 name_len | name[name_len]
+ * Sorted by name (memcmp) so a binary search would work; for this
+ * round we linear-scan since directories are small in our test
+ * images.
+ */
+static int
+tessera_dir_lookup_name(const uint8_t *body, size_t body_len,
+                        const char *name, uint16_t nlen,
+                        uint64_t *out_inode)
+{
+	size_t off = 0;
+	while (off + 10 <= body_len) {
+		uint64_t child;
+		uint16_t entry_nlen;
+		memcpy(&child,       body + off,     8);
+		memcpy(&entry_nlen,  body + off + 8, 2);
+		if (off + 10 + entry_nlen > body_len) return (EIO);
+		if (entry_nlen == nlen &&
+		    memcmp(body + off + 10, name, nlen) == 0) {
+			*out_inode = child;
+			return (0);
+		}
+		off += 10 + entry_nlen;
+	}
+	return (ENOENT);
+}
+
 static int
 tessera_vop_lookup(struct vop_lookup_args *ap)
 {
 	struct vnode *dvp = ap->a_dvp;
 	struct vnode **vpp = ap->a_vpp;
 	struct componentname *cnp = ap->a_cnp;
+	struct tessera_mount *tmp_ = VFSTOTESSERA(dvp->v_mount);
+	struct tessera_node *dn = VTOTNODE(dvp);
 
 	*vpp = NULL;
 	if (cnp->cn_namelen == 1 && cnp->cn_nameptr[0] == '.') {
@@ -562,7 +602,73 @@ tessera_vop_lookup(struct vop_lookup_args *ap)
 		*vpp = dvp;
 		return (0);
 	}
-	return (ENOENT);
+
+	/* Real on-disk lookup: read the directory inode, fetch its
+	 * DIRECTORY manifest blob, walk it for `cnp`. */
+	if (tmp_->inode_tree == NULL) return (ENOENT);
+
+	uint8_t key[4];
+	tessera_inode_record_t dino;
+	encode_inode_key((uint32_t)dn->inode_no, key);
+	if (tessera_btree_get(tmp_->inode_tree, key, &dino) != TESSERA_OK)
+		return (ENOENT);
+	if (tessera_hash_is_null(dino.manifest_hash))
+		return (ENOENT);                  /* empty directory */
+
+	uint8_t *blob = NULL;
+	uint32_t blob_len = 0;
+	int err = tessera_fs_fetch_blob(tmp_, dino.manifest_hash,
+	    &blob, &blob_len);
+	if (err != 0) return (ENOENT);
+
+	tessera_manifest_parser_t *p = tessera_manifest_parse(blob, blob_len);
+	if (p == NULL) {
+		free(blob, M_TESSERA);
+		return (EIO);
+	}
+	if (tessera_manifest_parser_kind(p) != TESSERA_MFT_DIRECTORY) {
+		tessera_manifest_parser_free(p);
+		free(blob, M_TESSERA);
+		return (ENOTDIR);
+	}
+
+	/* manifest body is the parser's internal slice — recover it via
+	 * inline_data accessor (works for INLINE / SYMLINK; for DIRECTORY
+	 * we cheat and walk the buffer past the 32-byte header directly). */
+	const uint8_t *body = blob + 32;
+	const size_t   blen = blob_len - 32;
+	uint64_t child_no = 0;
+	int rc = tessera_dir_lookup_name(body, blen,
+	    cnp->cn_nameptr, (uint16_t)cnp->cn_namelen, &child_no);
+	tessera_manifest_parser_free(p);
+	free(blob, M_TESSERA);
+	if (rc != 0) return (rc);
+
+	/* Found: build a child vnode. (vop_getattr will read the child's
+	 * record on demand when the caller stats the result.) */
+	struct vnode *cvp;
+	int e = getnewvnode("tessera", dvp->v_mount, &tessera_vnodeops, &cvp);
+	if (e != 0) return (e);
+	(void)vn_lock(cvp, LK_EXCLUSIVE | LK_RETRY);
+	struct tessera_node *cn = malloc(sizeof(*cn), M_TESSERA,
+	    M_WAITOK | M_ZERO);
+	cn->inode_no = child_no;
+	cvp->v_data = cn;
+	/* Type filled in by vop_getattr from the on-disk record; leave
+	 * VNON for now and let the kernel re-resolve. */
+	cvp->v_type = VNON;
+	VN_LOCK_ASHARE(cvp);
+	if (insmntque1(cvp, dvp->v_mount) != 0) {
+		cvp->v_data = NULL;
+		cvp->v_op = &dead_vnodeops;
+		vgone(cvp);
+		vput(cvp);
+		free(cn, M_TESSERA);
+		return (EIO);
+	}
+	vn_set_state(cvp, VSTATE_CONSTRUCTED);
+	*vpp = cvp;
+	return (0);
 }
 
 #define DIRENT_HDR  offsetof(struct dirent, d_name)
@@ -634,6 +740,109 @@ tessera_vop_reclaim(struct vop_reclaim_args *ap)
 		vp->v_data = NULL;
 	}
 	return (0);
+}
+
+/* ── in-kernel blob fetcher ──────────────────────────────────── */
+
+/*
+ * Fetch a blob from the pack zone by its SHA-256 hash.
+ *
+ * Strategy: walk the pack-registry B+tree; for each registered pack,
+ * bread its sectors into a malloc'd buffer, hand that to the
+ * userspace-style tessera_pack_reader, lookup by hash, copy the
+ * matching bytes out before freeing the pack buffer.
+ *
+ * On success: *out_buf points at a freshly-allocated copy (caller
+ * frees with M_TESSERA), *out_len is the byte length, return 0.
+ * Returns ENOENT if no pack contains the blob.
+ *
+ * Round-4b note: this whole-pack-into-RAM strategy is wasteful for
+ * large packs but correct and small. Round-5+ replaces it with a
+ * sector-on-demand reader that walks the on-disk header → index →
+ * data layout via bread, never materialising the whole pack.
+ */
+#define TESSERA_FETCH_PACK_MAX_SECTORS  4096u   /* 16 MiB cap */
+
+static int
+tessera_fs_fetch_blob(struct tessera_mount *tmp_,
+                      const tessera_hash_t hash,
+                      uint8_t **out_buf, uint32_t *out_len)
+{
+	if (tmp_->pack_registry_tree == NULL) return (ENOENT);
+	tessera_btree_cursor_t *c =
+	    tessera_btree_seek_first(tmp_->pack_registry_tree);
+	if (c == NULL) return (ENOENT);
+
+	int rc = ENOENT;
+	for (;;) {
+		uint8_t key[16];
+		uint8_t value[TESSERA_REGISTRY_ENTRY_SIZE];
+		if (tessera_btree_cursor_get(c, key, value) != 0) break;
+
+		tessera_registry_entry_t re;
+		if (tessera_decode_registry_entry(value, &re) != TESSERA_OK)
+			goto next_pack;
+		if (re.length_sectors == 0 ||
+		    re.length_sectors > TESSERA_FETCH_PACK_MAX_SECTORS) {
+			printf("tessera_fs: skipping pack with length=%lu sectors "
+			    "(zero or > %u-sector cap)\n",
+			    (unsigned long)re.length_sectors,
+			    TESSERA_FETCH_PACK_MAX_SECTORS);
+			goto next_pack;
+		}
+
+		const size_t pack_len =
+		    (size_t)re.length_sectors * TESSERA_SECTOR_SIZE;
+		uint8_t *packbuf = malloc(pack_len, M_TESSERA, M_NOWAIT);
+		if (packbuf == NULL) goto next_pack;
+
+		int read_ok = 1;
+		for (uint64_t i = 0; i < re.length_sectors; i++) {
+			struct buf *bp = NULL;
+			int err = bread(tmp_->devvp,
+			    (re.start_sector + i) *
+			        btodb(TESSERA_SECTOR_SIZE),
+			    TESSERA_SECTOR_SIZE,
+			    tmp_->bio_ctx.cred ? tmp_->bio_ctx.cred : NOCRED,
+			    &bp);
+			if (err != 0) {
+				if (bp != NULL) brelse(bp);
+				read_ok = 0;
+				break;
+			}
+			memcpy(packbuf + i * TESSERA_SECTOR_SIZE,
+			    bp->b_data, TESSERA_SECTOR_SIZE);
+			brelse(bp);
+		}
+		if (!read_ok) {
+			free(packbuf, M_TESSERA);
+			goto next_pack;
+		}
+
+		tessera_pack_reader_t *pr = tessera_pack_open(packbuf, pack_len);
+		if (pr != NULL) {
+			const uint8_t *bytes = NULL;
+			uint32_t blen = 0;
+			if (tessera_pack_lookup(pr, hash, &bytes, &blen)
+			    == TESSERA_OK) {
+				uint8_t *copy = malloc(blen, M_TESSERA, M_WAITOK);
+				memcpy(copy, bytes, blen);
+				*out_buf = copy;
+				*out_len = blen;
+				tessera_pack_close(pr);
+				free(packbuf, M_TESSERA);
+				rc = 0;
+				break;
+			}
+			tessera_pack_close(pr);
+		}
+		free(packbuf, M_TESSERA);
+
+next_pack:
+		if (tessera_btree_cursor_next(c) != 0) break;
+	}
+	tessera_btree_cursor_free(c);
+	return (rc);
 }
 
 struct vop_vector tessera_vnodeops = {
