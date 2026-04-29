@@ -63,6 +63,78 @@ pub struct tessera_format_opts_t {
     pub volume_uuid:     [u8; 16],
 }
 
+/* ── B+tree ──────────────────────────────────────────────────── */
+
+#[repr(C)]
+pub struct tessera_btree_t        { _opaque: [u8; 0] }
+#[repr(C)]
+pub struct tessera_btree_cursor_t { _opaque: [u8; 0] }
+
+extern "C" {
+    pub fn tessera_btree_create(io: *const tessera_block_io_t,
+                                 tree_kind:  u8,
+                                 key_size:   u32,
+                                 value_size: u32,
+                                 out_root_sector: *mut u64)
+                                 -> *mut tessera_btree_t;
+    pub fn tessera_btree_open  (io: *const tessera_block_io_t,
+                                 root_sector: u64,
+                                 tree_kind:   u8,
+                                 key_size:    u32,
+                                 value_size:  u32) -> *mut tessera_btree_t;
+    pub fn tessera_btree_close (t: *mut tessera_btree_t);
+
+    pub fn tessera_btree_get   (t: *mut tessera_btree_t,
+                                 key: *const u8, out_value: *mut u8) -> c_int;
+    pub fn tessera_btree_put   (t: *mut tessera_btree_t,
+                                 key: *const u8, value: *const u8,
+                                 out_new_root: *mut u64) -> c_int;
+    pub fn tessera_btree_delete(t: *mut tessera_btree_t,
+                                 key: *const u8,
+                                 out_new_root: *mut u64) -> c_int;
+
+    pub fn tessera_btree_seek_first(t: *mut tessera_btree_t)
+                                     -> *mut tessera_btree_cursor_t;
+    pub fn tessera_btree_cursor_get (c: *mut tessera_btree_cursor_t,
+                                      out_key: *mut u8,
+                                      out_value: *mut u8) -> c_int;
+    pub fn tessera_btree_cursor_next(c: *mut tessera_btree_cursor_t) -> c_int;
+    pub fn tessera_btree_cursor_free(c: *mut tessera_btree_cursor_t);
+}
+
+/* ── pack files ──────────────────────────────────────────────── */
+
+pub const TESSERA_BLOB_FLAG_MANIFEST: u32 = 1 << 0;
+pub const TESSERA_BLOB_FLAG_CHUNK:    u32 = 1 << 1;
+
+#[repr(C)]
+pub struct tessera_pack_builder_t { _opaque: [u8; 0] }
+#[repr(C)]
+pub struct tessera_pack_reader_t  { _opaque: [u8; 0] }
+
+extern "C" {
+    pub fn tessera_pack_begin(pack_kind: u32,
+                               pack_id: *const u8,
+                               creator_tx_id: u64) -> *mut tessera_pack_builder_t;
+    pub fn tessera_pack_add_blob(b: *mut tessera_pack_builder_t,
+                                  blob_hash: *const u8,
+                                  bytes: *const u8, len: u32,
+                                  flags: u32) -> c_int;
+    pub fn tessera_pack_finalize(b: *mut tessera_pack_builder_t,
+                                  out_buf: *mut u8, buf_len: usize,
+                                  out_size: *mut usize) -> c_int;
+    pub fn tessera_pack_free(b: *mut tessera_pack_builder_t);
+
+    pub fn tessera_pack_open(data: *const u8, len: usize)
+                              -> *mut tessera_pack_reader_t;
+    pub fn tessera_pack_blob_count(r: *const tessera_pack_reader_t) -> u32;
+    pub fn tessera_pack_lookup(r: *const tessera_pack_reader_t,
+                                blob_hash: *const u8,
+                                out_bytes: *mut *const u8,
+                                out_len: *mut u32) -> c_int;
+    pub fn tessera_pack_close(r: *mut tessera_pack_reader_t);
+}
+
 /* ── extent allocator ────────────────────────────────────────── */
 
 #[repr(C)]
