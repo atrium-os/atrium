@@ -44,6 +44,16 @@ ${TEST_BIN}: lib${LIB}.a ${.CURDIR}/tests/test_smoke.c
 	${CC} ${CFLAGS} -o ${.TARGET} ${.CURDIR}/tests/test_smoke.c \
 	    ${.OBJDIR}/libtessera_core.a -lmd
 
-CLEANFILES+= ${TEST_BIN}
+# ── SHA-256 hardware-dispatch bench ─────────────────────────────
+BENCH_SHA_BIN= ${.OBJDIR}/bench_sha256
+
+bench-sha: ${BENCH_SHA_BIN}
+	${BENCH_SHA_BIN}
+
+${BENCH_SHA_BIN}: lib${LIB}.a ${.CURDIR}/tests/bench_sha256.c
+	${CC} ${CFLAGS} -o ${.TARGET} ${.CURDIR}/tests/bench_sha256.c \
+	    ${.OBJDIR}/libtessera_core.a -lmd
+
+CLEANFILES+= ${TEST_BIN} ${BENCH_SHA_BIN}
 
 .include <bsd.lib.mk>
