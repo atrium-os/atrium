@@ -492,7 +492,12 @@ tessera_vop_getattr(struct vop_getattr_args *ap)
 		encode_inode_key((uint32_t)tn->inode_no, key);
 		int rc = tessera_btree_get(tmp_->inode_tree, key, &ino);
 		if (rc == TESSERA_OK) {
-			vap->va_type  = VDIR;          /* round 3c: from mode */
+			switch (ino.mode & 0170000) {
+			case 040000:  vap->va_type = VDIR; break;
+			case 0100000: vap->va_type = VREG; break;
+			case 0120000: vap->va_type = VLNK; break;
+			default:      vap->va_type = VBAD; break;
+			}
 			vap->va_mode  = ino.mode & 07777;
 			vap->va_nlink = ino.nlink ? ino.nlink : 2;
 			vap->va_uid   = ino.uid;

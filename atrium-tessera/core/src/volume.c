@@ -116,12 +116,46 @@ tessera_volume_format(const tessera_block_io_t *io,
 		.ctx         = &fc,
 	};
 
-	/* 3. Create empty inode B+tree (key = u32 inode_no, value = inode
-	 * record). */
+	/* 3. Create empty inode B+tree (key = u32 inode_no big-endian so
+	 * memcmp ordering matches numeric ordering, value = 144-byte
+	 * inode record). */
 	uint64_t inode_root = 0;
 	tessera_btree_t *t1 = tessera_btree_create(&shim, /*kind*/ 0,
 	    /*key*/ 4, /*value*/ TESSERA_INODE_RECORD_SIZE, &inode_root);
 	if (t1 == NULL) return TESSERA_ENOSPC;
+
+	/* 3a. Seed inode 2 (the root directory). manifest_hash + xattr_hash
+	 * are left all-zero — sentinel for "empty directory" until the
+	 * VFS layer publishes a real DIRECTORY manifest blob. */
+	{
+		tessera_inode_record_t ino;
+		memset(&ino, 0, sizeof ino);
+		ino.inode_no = TESSERA_INODE_ROOT_DIR;
+		ino.gen      = 1;
+		ino.mode     = 040755;        /* S_IFDIR | 0755 */
+		ino.uid      = 0;
+		ino.gid      = 0;
+		ino.nlink    = 2;
+		ino.size     = 0;
+
+		uint8_t key[4] = {
+			(uint8_t)(TESSERA_INODE_ROOT_DIR >> 24),
+			(uint8_t)(TESSERA_INODE_ROOT_DIR >> 16),
+			(uint8_t)(TESSERA_INODE_ROOT_DIR >>  8),
+			(uint8_t)(TESSERA_INODE_ROOT_DIR      ),
+		};
+		uint8_t value[TESSERA_INODE_RECORD_SIZE];
+		r = tessera_encode_inode(&ino, value);
+		if (r != TESSERA_OK) {
+			tessera_btree_close(t1);
+			return r;
+		}
+		r = tessera_btree_put(t1, key, value, &inode_root);
+		if (r != TESSERA_OK) {
+			tessera_btree_close(t1);
+			return r;
+		}
+	}
 	tessera_btree_close(t1);
 
 	/* 4. Create empty pack-registry B+tree (key = 16-byte pack_id,
