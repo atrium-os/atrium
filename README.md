@@ -50,7 +50,12 @@ atrium/
 └── test-assets/             sample files used by demos
 ```
 
-The companion `fresco-server` repo (currently `girivs82/fresco-server`, planned move to `atrium-os/fresco`) holds the original macOS-host server reference implementation; this tree's `atrium-compositor` links it as a path dependency at `../../fresco-server`. Clone both at the same parent directory.
+The companion [`atrium-os/fresco`](https://github.com/atrium-os/fresco) repo holds the Fresco protocol server (and `fresco-server` Rust crate, kept as the historical crate name). This tree's `atrium-compositor` and the socket-side libraries link it as a path dependency at `../../fresco`. Clone both at the same parent directory:
+
+```sh
+git clone https://github.com/atrium-os/atrium
+git clone https://github.com/atrium-os/fresco
+```
 
 ## Quick start
 

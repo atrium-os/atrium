@@ -35,6 +35,6 @@ name = "atrium-keyboard"
 path = "src/keyboard.rs"
 
 [dependencies]
-fresco-server = { path = "../../fresco-server" }
+fresco-server = { path = "../../fresco" }
 fresco-socket-rs = { path = "../fresco-socket-rs" }
 fresco-text = { path = "../fresco-text" }
