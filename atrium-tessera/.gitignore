@@ -1,0 +1,12 @@
+# Host-build artifacts (Makefile.host).
+core/*.host.o
+core/test_crc
+core/test_codec
+core/test_cdc
+
+# macOS debug bundles produced by clang when building host tests.
+**/*.dSYM/
+
+# In-tree test_smoke artefacts (when not using bsd.lib.mk's OBJDIR).
+core/test_smoke
+core/bench_sha256

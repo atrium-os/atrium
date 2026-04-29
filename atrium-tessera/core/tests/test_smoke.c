@@ -11,6 +11,7 @@
 
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int failures = 0;
@@ -62,18 +63,44 @@ test_hash_basic(void)
 }
 
 static void
-test_stubs_return_enotimpl(void)
+test_phase1_primitives(void)
 {
+	/* Phase 1: codec round-trip on superblock (the broadest CRC-bearing
+	 * struct). Detailed coverage lives in test_codec/test_crc/test_cdc;
+	 * this is just a tripwire to ensure the in-VM build of the same
+	 * primitives behaves identically. */
 	uint8_t buf[4096];
-	tessera_superblock_t sb;
+	tessera_superblock_t sb, sb2;
 	memset(&sb, 0, sizeof(sb));
-	CHECK(tessera_encode_superblock(&sb, buf) == TESSERA_ENOTIMPL);
-	CHECK(tessera_decode_superblock(buf, &sb) == TESSERA_ENOTIMPL);
+	memset(&sb2, 0, sizeof(sb2));
+	memcpy(sb.magic, TESSERA_MAGIC_SUPERBLOCK, 8);
+	sb.version_major = 1;
+	sb.sector_size = TESSERA_SECTOR_SIZE;
+	sb.total_sectors = 1024;
 
-	size_t bounds[16];
+	CHECK(tessera_encode_superblock(&sb, buf) == TESSERA_OK);
+	CHECK(tessera_decode_superblock(buf, &sb2) == TESSERA_OK);
+	CHECK(sb2.version_major == 1);
+	CHECK(sb2.total_sectors == 1024);
+
+	/* Corruption is detected. */
+	buf[20] ^= 0x10;
+	CHECK(tessera_decode_superblock(buf, &sb2) == TESSERA_ECORRUPT);
+
+	/* CDC: 1 MiB pseudo-random buffer splits into multiple chunks. */
+	uint8_t *big = malloc(1u << 20);
+	uint64_t s = 1;
+	for (size_t i = 0; i < (1u << 20); i++) {
+		s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+		big[i] = (uint8_t)s;
+	}
+	size_t bounds[64];
 	size_t n = 0;
-	CHECK(tessera_cdc_split(buf, sizeof(buf), &tessera_cdc_default_params,
-	                         bounds, 16, &n) == TESSERA_ENOTIMPL);
+	CHECK(tessera_cdc_split(big, 1u << 20, &tessera_cdc_default_params,
+	                         bounds, 64, &n) == TESSERA_OK);
+	CHECK(n >= 2);
+	CHECK(bounds[n - 1] == (1u << 20));
+	free(big);
 }
 
 static void
@@ -92,7 +119,7 @@ main(void)
 
 	test_struct_sizes();
 	test_hash_basic();
-	test_stubs_return_enotimpl();
+	test_phase1_primitives();
 	test_strerror_nonnull();
 
 	if (failures > 0) {

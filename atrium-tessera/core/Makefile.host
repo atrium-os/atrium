@@ -1,0 +1,65 @@
+# Host-side (portable) test build for tessera-core.
+#
+# Compiles every .c that is *not* FreeBSD-specific into per-test
+# binaries that don't need libmd. Use this for fast iteration on the
+# portable algorithm code (CRC32, codec, FastCDC, B+tree, manifest,
+# pack, journal, extent allocator). The libmd-backed SHA-256 path is
+# in src/hash.c and is exercised only by the smoke + bench targets in
+# the main Makefile (which uses bsd.lib.mk in the VM).
+#
+# bmake syntax — runs identically under FreeBSD's /usr/bin/make and
+# macOS bmake (homebrew). Use:
+#   bmake -f Makefile.host check     # macOS
+#   make  -f Makefile.host check     # FreeBSD VM
+#
+# (The two `make`s are siblings; both descend from NetBSD bmake.)
+
+CC      ?= cc
+CFLAGS  =  -O2 -g -Wall -Wextra -Wno-unused-parameter \
+           -fno-strict-aliasing -std=c11 \
+           -I${.CURDIR}/include -I${.CURDIR}/src
+
+# Every src/*.c except hash.c (FreeBSD libmd-only).
+PORTABLE_OBJS = \
+    error.host.o \
+    crc.host.o \
+    codec.host.o \
+    cdc.host.o \
+    btree.host.o \
+    manifest.host.o \
+    pack.host.o \
+    journal.host.o \
+    extent.host.o \
+    gc.host.o
+
+TESTS = test_crc test_codec test_cdc
+
+.PATH: ${.CURDIR}/src ${.CURDIR}/tests
+
+.SUFFIXES: .c .host.o
+.c.host.o:
+	${CC} ${CFLAGS} -c ${.IMPSRC} -o ${.TARGET}
+
+all: ${TESTS}
+
+test_crc: test_crc.c ${PORTABLE_OBJS}
+	${CC} ${CFLAGS} -o ${.TARGET} ${.CURDIR}/tests/test_crc.c ${PORTABLE_OBJS}
+
+test_codec: test_codec.c ${PORTABLE_OBJS}
+	${CC} ${CFLAGS} -o ${.TARGET} ${.CURDIR}/tests/test_codec.c ${PORTABLE_OBJS}
+
+test_cdc: test_cdc.c ${PORTABLE_OBJS}
+	${CC} ${CFLAGS} -o ${.TARGET} ${.CURDIR}/tests/test_cdc.c ${PORTABLE_OBJS}
+
+check: ${TESTS}
+	@for t in ${TESTS}; do \
+	    printf '\n== %s ==\n' $$t ; \
+	    ./$$t || exit 1 ; \
+	done ; \
+	echo ; \
+	echo "all host tests passed"
+
+clean:
+	rm -f ${PORTABLE_OBJS} ${TESTS}
+
+.PHONY: all check clean
