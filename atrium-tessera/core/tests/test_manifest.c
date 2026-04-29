@@ -10,9 +10,7 @@
  *   6. EEXIST         duplicate dirent name rejected.
  *   7. ETOOBIG        finalize with insufficient buffer reports the
  *                     required size.
- *   8. Cross-impl hash determinism (via the in-VM run): same bytes
- *                     produce same hash on both libmd and the portable
- *                     fallback.
+ *   8. Hash determinism: same bytes produce same hash across calls.
  */
 
 #include "tessera/manifest.h"

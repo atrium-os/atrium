@@ -13,7 +13,8 @@
  *   7. Randomised stress: invariants hold across thousands of ops
  *      (sorted, non-touching, free_blocks accurate, no overlaps).
  *
- * No SHA-256 dependency; pure in-memory. Runs on host and VM.
+ * No SHA-256 dependency; pure in-memory + B+tree round-trip via a
+ * memory-backed block_io.
  */
 
 #include "tessera/extent.h"

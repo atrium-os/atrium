@@ -10,7 +10,7 @@
  *   5. Flip a byte in the encoded buffer; assert decode() returns
  *      TESSERA_ECORRUPT for structs that carry a CRC or magic.
  *
- * No SHA-256 dependency, so this builds + runs on macOS host.
+ * No SHA-256 dependency.
  */
 
 #include "tessera/codec.h"

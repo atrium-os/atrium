@@ -17,7 +17,7 @@
  *                                64 KiB target, mean must land in
  *                                [40 KiB, 100 KiB] (loose bounds).
  *
- * No SHA-256 dependency; runs on macOS host.
+ * No SHA-256 dependency.
  */
 
 #include "tessera/cdc.h"
