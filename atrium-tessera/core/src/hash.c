@@ -28,7 +28,7 @@
 #  define SHA_UPDATE(ctx,d,n)  SHA256_Update((ctx), (d), (n))
 #  define SHA_FINAL(d,ctx)  SHA256_Final((d), (ctx))
 #else
-#  include <sha256.h>      /* libmd, FreeBSD base */
+#  include <sha256.h>      /* libmd, FreeBSD base — HW-accelerated */
    typedef SHA256_CTX tessera_sha_state;
 #  define tessera_alloc(n)  malloc(n)
 #  define tessera_free_(p)  free(p)

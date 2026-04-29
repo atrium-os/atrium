@@ -1,7 +1,9 @@
-# tessera-core Makefile (BSD make).
+# tessera-core Makefile (FreeBSD make).
 #
 # Builds libtessera_core.a (static) and libtessera_core.so.1 (shared).
-# Run `make check` to build and run the smoke test.
+#   make            build the library
+#   make check      build + run the full Phase-1 test suite
+#   make bench-sha  run the SHA-256 hardware-dispatch microbench
 
 LIB=        tessera_core
 SHLIB_MAJOR= 1
@@ -33,16 +35,35 @@ LIBADD=     md
 
 .PATH: ${.CURDIR}/src
 
-# ── Test target ──────────────────────────────────────────────────
-TEST_SRCS=  tests/test_smoke.c
-TEST_BIN=   ${.OBJDIR}/test_smoke
+# ── Test suite ──────────────────────────────────────────────────
+# Each test is a self-contained binary linking against libtessera_core.a.
+TEST_NAMES= \
+    test_smoke \
+    test_crc \
+    test_codec \
+    test_cdc \
+    test_extent \
+    test_btree \
+    test_manifest \
+    test_pack \
+    test_journal
 
-check: ${TEST_BIN}
-	${TEST_BIN}
+TEST_BINS= ${TEST_NAMES:S,^,${.OBJDIR}/,}
 
-${TEST_BIN}: lib${LIB}.a ${.CURDIR}/tests/test_smoke.c
-	${CC} ${CFLAGS} -o ${.TARGET} ${.CURDIR}/tests/test_smoke.c \
+# Pattern: ${.OBJDIR}/test_X depends on tests/test_X.c + libtessera_core.a.
+.for t in ${TEST_NAMES}
+${.OBJDIR}/${t}: lib${LIB}.a ${.CURDIR}/tests/${t}.c
+	${CC} ${CFLAGS} -o ${.TARGET} ${.CURDIR}/tests/${t}.c \
 	    ${.OBJDIR}/libtessera_core.a -lmd
+.endfor
+
+check: ${TEST_BINS}
+	@for t in ${TEST_BINS}; do \
+	    printf '\n== %s ==\n' $$(basename $$t) ; \
+	    $$t || exit 1 ; \
+	done ; \
+	echo ; \
+	echo "all tests passed"
 
 # ── SHA-256 hardware-dispatch bench ─────────────────────────────
 BENCH_SHA_BIN= ${.OBJDIR}/bench_sha256
@@ -54,6 +75,6 @@ ${BENCH_SHA_BIN}: lib${LIB}.a ${.CURDIR}/tests/bench_sha256.c
 	${CC} ${CFLAGS} -o ${.TARGET} ${.CURDIR}/tests/bench_sha256.c \
 	    ${.OBJDIR}/libtessera_core.a -lmd
 
-CLEANFILES+= ${TEST_BIN} ${BENCH_SHA_BIN}
+CLEANFILES+= ${TEST_BINS} ${BENCH_SHA_BIN}
 
 .include <bsd.lib.mk>

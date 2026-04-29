@@ -1,5 +1,6 @@
-# Host-build artifacts (Makefile.host).
-core/*.host.o
+# bsd.lib.mk OBJDIR test binaries (built in /usr/obj/...; usually not in tree,
+# but list here for completeness in case someone overrides MAKEOBJDIR=.).
+core/test_smoke
 core/test_crc
 core/test_codec
 core/test_cdc
@@ -8,10 +9,4 @@ core/test_btree
 core/test_manifest
 core/test_pack
 core/test_journal
-
-# macOS debug bundles produced by clang when building host tests.
-**/*.dSYM/
-
-# In-tree test_smoke artefacts (when not using bsd.lib.mk's OBJDIR).
-core/test_smoke
 core/bench_sha256
