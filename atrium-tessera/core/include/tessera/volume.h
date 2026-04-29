@@ -39,6 +39,15 @@ typedef struct {
 	uint64_t total_sectors;     /* required, > journal + metadata zone */
 	uint64_t journal_sectors;   /* default 256 (= 1 MiB) when 0 */
 	uint8_t  volume_uuid[16];   /* caller-supplied; not generated here */
+
+	/* Optional: pre-populate the root directory with a single dirent
+	 * pointing at a fresh regular-file inode. Used by tests and the
+	 * Phase-4 kmod bring-up to produce a non-empty volume without
+	 * implementing the runtime mutation paths. NULL or name_len==0
+	 * disables seeding; the volume mounts as an empty directory. */
+	const char *seed_dirent_name;
+	uint16_t    seed_dirent_name_len;
+	uint64_t    seed_dirent_inode;     /* must be >= TESSERA_INODE_FIRST_USER */
 } tessera_format_opts_t;
 
 /* Reserved metadata-zone size, in sectors, immediately after the

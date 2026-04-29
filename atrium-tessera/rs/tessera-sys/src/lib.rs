@@ -58,9 +58,12 @@ pub struct tessera_volume_t {
 
 #[repr(C)]
 pub struct tessera_format_opts_t {
-    pub total_sectors:   u64,
-    pub journal_sectors: u64,
-    pub volume_uuid:     [u8; 16],
+    pub total_sectors:        u64,
+    pub journal_sectors:      u64,
+    pub volume_uuid:          [u8; 16],
+    pub seed_dirent_name:     *const u8,    /* NULL = no seed */
+    pub seed_dirent_name_len: u16,
+    pub seed_dirent_inode:    u64,
 }
 
 /* ── B+tree ──────────────────────────────────────────────────── */

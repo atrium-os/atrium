@@ -19,7 +19,8 @@ use tessera_tools::{
 
 fn usage() -> ! {
     eprintln!(
-        "usage: mkfs-tessera [-j JOURNAL_SECTORS] [--create -s SIZE_MIB] PATH"
+        "usage: mkfs-tessera [-j JOURNAL_SECTORS] [--create -s SIZE_MIB] \\\n\
+         \x20             [--seed-file NAME [--seed-inode N]] PATH"
     );
     std::process::exit(2);
 }
@@ -28,10 +29,15 @@ struct Args {
     path: String,
     journal_sectors: u64,
     create: Option<u64>, /* size in MiB if --create */
+    seed_name: Option<String>,
+    seed_inode: u64,
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { path: String::new(), journal_sectors: 256, create: None };
+    let mut a = Args {
+        path: String::new(), journal_sectors: 256, create: None,
+        seed_name: None, seed_inode: 1000,
+    };
     let argv: Vec<_> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < argv.len() {
@@ -47,6 +53,16 @@ fn parse_args() -> Args {
                 if i >= argv.len() { usage(); }
                 let mib: u64 = argv[i].parse().unwrap_or_else(|_| usage());
                 a.create = Some(mib);
+            }
+            "--seed-file" => {
+                i += 1;
+                if i >= argv.len() { usage(); }
+                a.seed_name = Some(argv[i].clone());
+            }
+            "--seed-inode" => {
+                i += 1;
+                if i >= argv.len() { usage(); }
+                a.seed_inode = argv[i].parse().unwrap_or_else(|_| usage());
             }
             "-h" | "--help" => usage(),
             arg if !arg.starts_with('-') => a.path = arg.to_string(),
@@ -87,10 +103,22 @@ fn run() -> Result<(), String> {
     let uuid = random_uuid_v4().map_err(|e| format!("uuid: {e}"))?;
     let mut ctx = DiskCtx { fd: fd_of(&f) };
     let io = make_io(&mut ctx);
+
+    /* Seed-name bytes must outlive the format call. */
+    let seed_bytes: Option<Vec<u8>> = args.seed_name.as_ref()
+        .map(|s| s.as_bytes().to_vec());
+    let (seed_ptr, seed_len) = match &seed_bytes {
+        Some(b) => (b.as_ptr(), b.len() as u16),
+        None    => (std::ptr::null(), 0u16),
+    };
+
     let opts = tessera_format_opts_t {
         total_sectors,
         journal_sectors: args.journal_sectors,
         volume_uuid: uuid,
+        seed_dirent_name:     seed_ptr,
+        seed_dirent_name_len: seed_len,
+        seed_dirent_inode:    args.seed_inode,
     };
     let r = unsafe { tessera_volume_format(&io, &opts) };
     if r != 0 {
@@ -102,6 +130,9 @@ fn run() -> Result<(), String> {
     println!("  total_sectors:   {total_sectors}");
     println!("  journal_sectors: {}", args.journal_sectors);
     println!("  uuid:            {}", format_uuid(&uuid));
+    if let Some(ref name) = args.seed_name {
+        println!("  seeded:          /{} -> inode {}", name, args.seed_inode);
+    }
     Ok(())
 }
 
