@@ -476,113 +476,132 @@ impl Compositor {
     /// in z-order, translating each item's world matrix by the
     /// window's screen position. The screen window (id 0) is rendered
     /// from its own scene; this returns just the floating overlay.
+    /// Decoration items for a single window. Used by backends that
+    /// interleave decorations with per-window FBO blits so a
+    /// lower-z window's titlebar doesn't end up on top of a higher-z
+    /// window's content.
+    pub fn compose_overlay_for(&self, id: u16) -> Vec<crate::scene::graph::RenderItem> {
+        let mut out = Vec::new();
+        if id == 0 { return out; }
+        if let Some(win) = self.windows.get(&id) {
+            self.append_decorations(win, &mut out);
+        }
+        out
+    }
+
     pub fn compose_overlay(&self) -> Vec<crate::scene::graph::RenderItem> {
         let mut out = Vec::new();
         for &id in &self.z_order {
             if id == 0 { continue; }
             let Some(win) = self.windows.get(&id) else { continue; };
-
-            // Window content lives in the per-window FBO (B2) and is
-            // composited via WindowOverlay in the renderer — not into
-            // the screen scene. Compose_overlay produces only the
-            // server-drawn decorations.
-            //
-            // Decorations: drawn in screen-pixel space via FLAG_OVERLAY
-            // (renderer uses ortho-pixel projection for these). The
-            // titlebar sits just above the window's content rect.
-            let bar_h = self.theme.titlebar_height;
-            let bar_w = win.size.0;
-            let bar_x = win.pos.0;
-            let bar_y = win.pos.1 - bar_h;
-
-            // Titlebar.
-            if self.titlebar_mesh != NULL_HASH {
-                let cx = bar_x + bar_w * 0.5;
-                let cy = bar_y + bar_h * 0.5;
-                let mut m = [0.0f32; 16];
-                m[0]  = bar_w;
-                m[5]  = bar_h;
-                m[10] = 1.0;
-                m[15] = 1.0;
-                m[12] = cx;
-                m[13] = cy;
-                out.push(crate::scene::graph::RenderItem {
-                    world_matrix: m,
-                    mesh:         self.titlebar_mesh,
-                    material:     self.titlebar_material,
-                    render_order: 0,
-                    flags:        0x01,
-                    stencil_fill: false,
-                    clip_rect:    None,
-                });
-            }
-
-            // Close button drawn BEFORE text so subsequent stencil
-            // ops can't corrupt its render.
-            let (cbx, cby) = close_button_center(&self.theme, win);
-            let cs = self.theme.close_button_size;
-            if self.close_button_material != NULL_HASH
-               && self.solid_quad_mesh != NULL_HASH
-            {
-                let mut bm = [0.0f32; 16];
-                bm[0]  = cs;
-                bm[5]  = cs;
-                bm[10] = 1.0;
-                bm[15] = 1.0;
-                bm[12] = cbx;
-                bm[13] = cby;
-                out.push(crate::scene::graph::RenderItem {
-                    world_matrix: bm,
-                    mesh:         self.solid_quad_mesh,
-                    material:     self.close_button_material,
-                    render_order: 2,
-                    flags:        0x01,
-                    stencil_fill: false,
-                    clip_rect:    None,
-                });
-            }
-
-            // Title text. Clipped so glyphs can't bleed into the
-            // close-button column on long titles.
-            if !win.title_glyphs.is_empty()
-               && self.title_text_material != NULL_HASH
-            {
-                let baseline_y = bar_y + bar_h * 0.7;
-                let origin_x = bar_x + self.theme.title_padding_x;
-                let gap = self.theme.close_button_gutter;
-                let (clip_x, clip_w) = match self.theme.close_button_side {
-                    ButtonSide::Right => {
-                        let right = (cbx - cs * 0.5 - gap).max(origin_x);
-                        (origin_x, right - origin_x)
-                    }
-                    ButtonSide::Left => {
-                        let left = (cbx + cs * 0.5 + gap).max(origin_x);
-                        let right = bar_x + bar_w - self.theme.title_padding_x;
-                        (left, (right - left).max(0.0))
-                    }
-                };
-                let title_clip = Some([clip_x, bar_y, clip_w, bar_h]);
-                for (ph_hash, gx, gy) in &win.title_glyphs {
-                    let mut tm = [0.0f32; 16];
-                    tm[0]  =  1.0;
-                    tm[5]  = -1.0;
-                    tm[10] =  1.0;
-                    tm[15] =  1.0;
-                    tm[12] = origin_x + *gx;
-                    tm[13] = baseline_y + *gy;
-                    out.push(crate::scene::graph::RenderItem {
-                        world_matrix: tm,
-                        mesh:         *ph_hash,
-                        material:     self.title_text_material,
-                        render_order: 1,
-                        flags:        0x01,
-                        stencil_fill: true,
-                        clip_rect:    title_clip,
-                    });
-                }
-            }
+            self.append_decorations(win, &mut out);
         }
         out
+    }
+
+    /// Emit titlebar + close-button + title-text RenderItems for one
+    /// window into `out`. Shared by `compose_overlay` (all windows in
+    /// z-order) and `compose_overlay_for` (single window).
+    fn append_decorations(
+        &self,
+        win: &Window,
+        out: &mut Vec<crate::scene::graph::RenderItem>,
+    ) {
+        // Decorations are drawn in screen-pixel space via
+        // FLAG_OVERLAY (renderer uses ortho-pixel projection for
+        // these). The titlebar sits just above the window's content
+        // rect.
+        let bar_h = self.theme.titlebar_height;
+        let bar_w = win.size.0;
+        let bar_x = win.pos.0;
+        let bar_y = win.pos.1 - bar_h;
+
+        // Titlebar.
+        if self.titlebar_mesh != NULL_HASH {
+            let cx = bar_x + bar_w * 0.5;
+            let cy = bar_y + bar_h * 0.5;
+            let mut m = [0.0f32; 16];
+            m[0]  = bar_w;
+            m[5]  = bar_h;
+            m[10] = 1.0;
+            m[15] = 1.0;
+            m[12] = cx;
+            m[13] = cy;
+            out.push(crate::scene::graph::RenderItem {
+                world_matrix: m,
+                mesh:         self.titlebar_mesh,
+                material:     self.titlebar_material,
+                render_order: 0,
+                flags:        0x01,
+                stencil_fill: false,
+                clip_rect:    None,
+            });
+        }
+
+        // Close button drawn BEFORE text so subsequent stencil ops
+        // can't corrupt its render.
+        let (cbx, cby) = close_button_center(&self.theme, win);
+        let cs = self.theme.close_button_size;
+        if self.close_button_material != NULL_HASH
+           && self.solid_quad_mesh != NULL_HASH
+        {
+            let mut bm = [0.0f32; 16];
+            bm[0]  = cs;
+            bm[5]  = cs;
+            bm[10] = 1.0;
+            bm[15] = 1.0;
+            bm[12] = cbx;
+            bm[13] = cby;
+            out.push(crate::scene::graph::RenderItem {
+                world_matrix: bm,
+                mesh:         self.solid_quad_mesh,
+                material:     self.close_button_material,
+                render_order: 2,
+                flags:        0x01,
+                stencil_fill: false,
+                clip_rect:    None,
+            });
+        }
+
+        // Title text. Clipped so glyphs can't bleed into the
+        // close-button column on long titles.
+        if !win.title_glyphs.is_empty()
+           && self.title_text_material != NULL_HASH
+        {
+            let baseline_y = bar_y + bar_h * 0.7;
+            let origin_x = bar_x + self.theme.title_padding_x;
+            let gap = self.theme.close_button_gutter;
+            let (clip_x, clip_w) = match self.theme.close_button_side {
+                ButtonSide::Right => {
+                    let right = (cbx - cs * 0.5 - gap).max(origin_x);
+                    (origin_x, right - origin_x)
+                }
+                ButtonSide::Left => {
+                    let left = (cbx + cs * 0.5 + gap).max(origin_x);
+                    let right = bar_x + bar_w - self.theme.title_padding_x;
+                    (left, (right - left).max(0.0))
+                }
+            };
+            let title_clip = Some([clip_x, bar_y, clip_w, bar_h]);
+            for (ph_hash, gx, gy) in &win.title_glyphs {
+                let mut tm = [0.0f32; 16];
+                tm[0]  =  1.0;
+                tm[5]  = -1.0;
+                tm[10] =  1.0;
+                tm[15] =  1.0;
+                tm[12] = origin_x + *gx;
+                tm[13] = baseline_y + *gy;
+                out.push(crate::scene::graph::RenderItem {
+                    world_matrix: tm,
+                    mesh:         *ph_hash,
+                    material:     self.title_text_material,
+                    render_order: 1,
+                    flags:        0x01,
+                    stencil_fill: true,
+                    clip_rect:    title_clip,
+                });
+            }
+        }
     }
 
     /// Cursor (logical pixels) hits the titlebar of which window?

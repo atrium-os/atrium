@@ -209,14 +209,24 @@ impl CommandFrontend {
         }
     }
 
+    /// Compose a CAS upload-staging key from the current client's
+    /// id and the command's sequence_id. Each client has its own seq
+    /// space, so namespacing with client_id makes the key unique
+    /// across clients — no more interleave when two apps upload at
+    /// the same time.
+    fn upload_key(&self, seq: u32) -> u64 {
+        ((self.current_client as u64) << 32) | (seq as u64)
+    }
+
     fn handle_upload_begin(&mut self, cmd: &Command) -> Option<Completion> {
         let total_size = cmd.u32_at(8) as usize;
         let bytes = cmd.payload_bytes();
         let available = bytes.len() - 8;
         let data = &bytes[8..8 + available.min(total_size)];
 
+        let key = self.upload_key(cmd.sequence_id);
         let mut cas = self.cas.lock().unwrap();
-        cas.begin_upload(cmd.sequence_id, total_size, data);
+        cas.begin_upload(key, total_size, data);
         None
     }
 
@@ -225,16 +235,18 @@ impl CommandFrontend {
         let bytes = cmd.payload_bytes();
         let data = &bytes[4..bytes.len().min(120)]; // up to 116 bytes of data
 
+        let key = self.upload_key(cmd.sequence_id);
         let mut cas = self.cas.lock().unwrap();
-        cas.append_upload(cmd.sequence_id, data);
+        cas.append_upload(key, data);
         None
     }
 
     fn handle_upload_finish(&mut self, cmd: &Command) -> Option<Completion> {
         let upload_id = cmd.u32_at(40);
 
+        let key = self.upload_key(cmd.sequence_id);
         let mut cas = self.cas.lock().unwrap();
-        match cas.finish_upload(cmd.sequence_id) {
+        match cas.finish_upload(key) {
             Some(hash) => {
                 let size = cas.load(&hash).map(|d| d.len()).unwrap_or(0);
                 log::trace!("upload complete: id={} hash={:02x}{:02x}.. size={}",

@@ -53,6 +53,11 @@ pub struct Material {
     pub shader: Hash256,
     pub albedo_tex: Hash256,
     pub normal_tex: Hash256,
+    /// UV sub-rectangle of `albedo_tex` to sample, in normalized
+    /// texture coords. Default is the full texture `[0.0, 0.0, 1.0,
+    /// 1.0]`. Used to slice a shared atlas — one texture, many
+    /// materials each pointing at a different glyph cell.
+    pub uv_region: [f32; 4],
 }
 
 impl Material {
@@ -295,13 +300,25 @@ fn parse_material_solid(hdr: &BlobHeader, p: &[u8]) -> Material {
         shader: NULL_HASH,
         albedo_tex: NULL_HASH,
         normal_tex: NULL_HASH,
+        uv_region: [0.0, 0.0, 1.0, 1.0],
     }
 }
 
 /// NODE_MATERIAL_TEXTURED (0x0203) — payload layout:
 ///   [0..32]   albedo texture hash (NODE_TEXTURE blob)
 ///   [32..36]  tint color (RGBA8, 0xFFFFFFFF = no tint)
+///   [36..52]  optional UV region: u0, v0, u1, v1 (4 × f32 LE)
+///             present when payload length ≥ 52; otherwise defaults
+///             to the full texture (0, 0, 1, 1).
 fn parse_material_textured(p: &[u8]) -> Material {
+    let uv_region = if p.len() >= 52 {
+        [
+            read_f32(p, 36), read_f32(p, 40),
+            read_f32(p, 44), read_f32(p, 48),
+        ]
+    } else {
+        [0.0, 0.0, 1.0, 1.0]
+    };
     Material {
         flags: 0,
         base_color: read_u32(p, 32),       // tint
@@ -314,6 +331,7 @@ fn parse_material_textured(p: &[u8]) -> Material {
         shader: NULL_HASH,
         albedo_tex: read_hash(p, 0),
         normal_tex: NULL_HASH,
+        uv_region,
     }
 }
 
@@ -363,6 +381,7 @@ fn parse_material_gradient(hdr: &BlobHeader, p: &[u8]) -> Material {
         shader: NULL_HASH,
         albedo_tex: NULL_HASH,
         normal_tex: NULL_HASH,
+        uv_region: [0.0, 0.0, 1.0, 1.0],
     }
 }
 

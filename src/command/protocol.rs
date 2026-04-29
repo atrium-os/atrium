@@ -93,10 +93,17 @@ pub const COMP_WINDOW_FOCUS:           u16 = 0x13;  // status: 1=focused, 0=blur
 
 // Input events (server → client). Routed by `id = target_window`.
 // Payload layout in `result_hash`:
-//   COMP_INPUT_KEY:        [0..2] HID Usage code, [2] modifiers
-//   COMP_INPUT_MOUSE_MOVE: [0..4] f32 x, [4..8] f32 y
-//   COMP_INPUT_MOUSE_BUTTON: [0..2] button, [2] modifiers
+//   COMP_INPUT_KEY:          [0..2] HID Usage Page 0x07 code u16, [2] modifiers u8
+//   COMP_INPUT_MOUSE_MOVE:   [0..4] f32 x, [4..8] f32 y  (screen pixels)
+//   COMP_INPUT_MOUSE_BUTTON: [0..2] button u16, [2] modifiers u8,
+//                            [4..8] f32 x, [8..12] f32 y (cursor at click)
+//   COMP_INPUT_SCROLL:       [0..4] f32 dx, [4..8] f32 dy (lines)
 // `status` carries the pressed/released bit for KEY and MOUSE_BUTTON.
+// Button codes are USB HID Usage Page 0x09 button numbers:
+//   1 = primary (left), 2 = secondary (right), 3 = middle / wheel-press,
+//   4 = back, 5 = forward. The wire is HID-shape; OS-specific button
+//   codes (Linux BTN_*, evdev, etc.) get translated at the compositor
+//   boundary, never flow on the wire.
 pub const COMP_INPUT_KEY:          u16 = 0x14;
 pub const COMP_INPUT_MOUSE_MOVE:   u16 = 0x15;
 pub const COMP_INPUT_MOUSE_BUTTON: u16 = 0x16;

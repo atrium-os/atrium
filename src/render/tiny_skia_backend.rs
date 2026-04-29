@@ -26,8 +26,9 @@ use crate::scene::nodes::{Material, NodeData};
 use std::collections::HashMap;
 
 use tiny_skia::{
-    Color, FillRule, FilterQuality, GradientStop, LinearGradient, Paint, Pattern, PathBuilder,
-    Pixmap, PixmapMut, Point, Shader, SpreadMode, Transform,
+    Color, FillRule, FilterQuality, GradientStop, IntRect, LinearGradient, Paint, Pattern,
+    PathBuilder, Pixmap, PixmapMut, PixmapPaint, PixmapRef, Point, Rect, Shader, SpreadMode,
+    Transform,
 };
 
 pub struct TinySkiaBackend {
@@ -40,20 +41,116 @@ pub struct TinySkiaBackend {
     /// the backend; cleared on `resize` only because the textures
     /// themselves are dimension-independent.
     tex_cache: HashMap<crate::command::protocol::Hash256, Pixmap>,
+    /// Per-window offscreen pixmap (FBO). Each window's scene
+    /// rasterizes into its own pixmap via `render_window_to_fbo`,
+    /// then `render_screen_with_windows` blits them onto the screen
+    /// pixmap at the WM's reported window rects.
+    window_fbos: HashMap<u16, Pixmap>,
 }
 
 impl TinySkiaBackend {
     pub fn new(width: u32, height: u32) -> Self {
         let pixmap = Pixmap::new(width, height)
             .expect("tiny-skia Pixmap allocation");
-        Self { pixmap, width, height, scale: 1.0, tex_cache: HashMap::new() }
+        Self {
+            pixmap, width, height, scale: 1.0,
+            tex_cache:   HashMap::new(),
+            window_fbos: HashMap::new(),
+        }
+    }
+
+    /// Reconcile the per-window FBO map against `live`: ensure a
+    /// pixmap exists at the right size for each (id, w, h), drop any
+    /// FBO whose window is gone or whose dimensions changed past
+    /// recovery. Called once per frame from the compositor.
+    pub fn sync_fbos(&mut self, live: &HashMap<u16, (u32, u32)>) {
+        // Drop stale (window destroyed or resized).
+        let stale: Vec<u16> = self.window_fbos.iter()
+            .filter_map(|(id, pm)| match live.get(id) {
+                Some(&(w, h)) if pm.width() == w && pm.height() == h => None,
+                _ => Some(*id),
+            })
+            .collect();
+        for id in stale {
+            self.window_fbos.remove(&id);
+        }
+        // Allocate any missing.
+        for (&id, &(w, h)) in live {
+            if self.window_fbos.contains_key(&id) { continue; }
+            if w == 0 || h == 0 { continue; }
+            if let Some(pm) = Pixmap::new(w, h) {
+                self.window_fbos.insert(id, pm);
+            }
+        }
+    }
+
+    /// Rasterize one window's scene into its FBO. Caller must have
+    /// already invoked `sync_fbos` so the pixmap exists.
+    pub fn render_window_to_fbo(&mut self, id: u16, scene: &SceneGraph, cas: &CasStore) {
+        let Some(fbo) = self.window_fbos.get_mut(&id) else { return; };
+        let (fw, fh) = (fbo.width(), fbo.height());
+        // Window background — slightly translucent dark so the screen
+        // bg / lower-z windows tint through faintly. Apps draw their
+        // content on top (glyph alpha composes correctly over this).
+        // Use 0xE0 alpha (~88% opaque): mostly solid, hint of show-
+        // through. Apps that want full opacity can fill themselves.
+        fbo.fill(Color::from_rgba8(0x14, 0x18, 0x22, 0xE0));
+        Self::rasterize_items_into(
+            fbo, &mut self.tex_cache,
+            scene.render_list(), cas,
+            fw, fh,
+        );
+    }
+
+    /// Full-screen render: clear, rasterize the screen scene, then
+    /// for each window in z-order (lowest first): blit its FBO,
+    /// stroke its border, rasterize *that window's* decorations
+    /// (titlebar/close-button/title text). Per-window interleave so
+    /// a higher-z window's content covers lower-z windows' titlebars
+    /// in the overlap region.
+    pub fn render_screen_with_windows(
+        &mut self,
+        scene: &SceneGraph,
+        cas: &CasStore,
+        layered: &[(crate::render::backend::WindowOverlay, Vec<crate::scene::graph::RenderItem>)],
+    ) {
+        self.clear_to(Color::from_rgba8(0x14, 0x18, 0x22, 0xff));
+        // Screen scene (window 0). Apps that don't create their own
+        // window draw here too — backwards-compatible with single-
+        // window mode.
+        Self::rasterize_items_into(
+            &mut self.pixmap, &mut self.tex_cache,
+            scene.render_list(), cas,
+            self.width, self.height,
+        );
+        for (ov, deco) in layered {
+            if let Some(fbo) = self.window_fbos.get(&ov.id) {
+                blit_pixmap(&mut self.pixmap, fbo, ov.x, ov.y, ov.w, ov.h);
+            }
+            stroke_window_border(&mut self.pixmap, ov.x, ov.y, ov.w, ov.h);
+            if !deco.is_empty() {
+                Self::rasterize_items_into(
+                    &mut self.pixmap, &mut self.tex_cache,
+                    deco, cas,
+                    self.width, self.height,
+                );
+            }
+        }
     }
 
     /// Decode a CAS-stored NODE_TEXTURE blob into a tiny-skia Pixmap
     /// and stash it in the cache. No-op if already cached, or if the
     /// blob can't be parsed / pixel data isn't loaded.
     fn ensure_texture(&mut self, cas: &CasStore, hash: &crate::command::protocol::Hash256) {
-        if self.tex_cache.contains_key(hash) {
+        Self::ensure_texture_into(&mut self.tex_cache, cas, hash);
+    }
+
+    fn ensure_texture_into(
+        tex_cache: &mut HashMap<crate::command::protocol::Hash256, Pixmap>,
+        cas: &CasStore,
+        hash: &crate::command::protocol::Hash256,
+    ) {
+        if tex_cache.contains_key(hash) {
             return;
         }
         let Some(tex_data) = cas.load(hash) else { return; };
@@ -68,7 +165,7 @@ impl TinySkiaBackend {
         }
         let Some(mut pm) = Pixmap::new(th.width, th.height) else { return; };
         pm.data_mut()[..need].copy_from_slice(&pixels[..need]);
-        self.tex_cache.insert(*hash, pm);
+        tex_cache.insert(*hash, pm);
     }
 
     /// Raw RGBA pixels, top-down, premultiplied. Length = w*h*4.
@@ -111,24 +208,42 @@ impl TinySkiaBackend {
 
     /// Walk the scene's render_list and rasterize each item via tiny-skia.
     fn rasterize_scene(&mut self, scene: &SceneGraph, cas: &CasStore) {
-        let vp_w = self.width as f32;
-        let vp_h = self.height as f32;
+        Self::rasterize_items_into(
+            &mut self.pixmap, &mut self.tex_cache,
+            scene.render_list(), cas,
+            self.width, self.height,
+        );
+    }
 
-        // Texture pre-pass: ensure_texture borrows &mut self, while the
-        // render loop wants to hold &self.tex_cache while &mut self.pixmap.
+    /// Rasterize a slice of `RenderItem`s into `pixmap`. Pulled out
+    /// so the caller can render the screen scene, per-window FBOs,
+    /// and WM decoration overlays through the same path.
+    fn rasterize_items_into(
+        pixmap: &mut Pixmap,
+        tex_cache: &mut HashMap<crate::command::protocol::Hash256, Pixmap>,
+        items: &[crate::scene::graph::RenderItem],
+        cas: &CasStore,
+        width: u32,
+        height: u32,
+    ) {
+        let vp_w = width as f32;
+        let vp_h = height as f32;
+
+        // Texture pre-pass: ensure_texture borrows &mut, while the
+        // render loop wants to hold &tex_cache while &mut pixmap.
         // Decoding upfront keeps the borrow split clean.
-        for item in scene.render_list().iter() {
+        for item in items.iter() {
             if item.material == NULL_HASH { continue; }
             if let Some(data) = cas.load(&item.material) {
                 if let Some(NodeData::Material(m)) = NodeData::parse(data) {
                     if m.albedo_tex != NULL_HASH {
-                        self.ensure_texture(cas, &m.albedo_tex);
+                        Self::ensure_texture_into(tex_cache, cas, &m.albedo_tex);
                     }
                 }
             }
         }
 
-        for (idx, item) in scene.render_list().iter().enumerate() {
+        for (idx, item) in items.iter().enumerate() {
             if item.mesh == NULL_HASH {
                 continue;
             }
@@ -215,10 +330,7 @@ impl TinySkiaBackend {
             let _ = (vp_w, vp_h);  // keep params for future viewport use.
             let _ = item.clip_rect; // clip-rect → tiny-skia Mask, deferred
 
-            // Build paint, possibly textured. Textured paint borrows from
-            // self.tex_cache, so we must NOT call &mut self methods while
-            // the borrow is alive — split the field borrows.
-            let TinySkiaBackend { pixmap, tex_cache, .. } = self;
+            // Build paint, possibly textured.
             let textured_pixmap = mat.as_ref()
                 .filter(|m| m.albedo_tex != NULL_HASH)
                 .and_then(|m| tex_cache.get(&m.albedo_tex));
@@ -226,19 +338,40 @@ impl TinySkiaBackend {
             let mut paint = Paint::default();
             paint.anti_alias = true;
             if let Some(tex) = textured_pixmap {
-                // Pattern.transform maps pattern-pixel-space to
-                // path-local space (NOT pixmap-pixel space). `fill_path`
-                // post-concats its `transform` argument onto the
-                // shader's transform via `Shader::transform`. So if
-                // the path is in unit-rect coords (0..1)² and we want
-                // the texture to fill that unit rect 1:1, the
-                // pattern-to-path map is simply scale(1/tex_w, 1/tex_h).
-                // The fill_path `xform` then carries pattern→path→pixmap
-                // through `post_concat`.
-                let pat_t = Transform::from_scale(
-                    1.0 / tex.width() as f32,
-                    1.0 / tex.height() as f32,
-                );
+                // Pattern.transform maps pattern-pixel-space (texture
+                // pixels) to path-local space (the unit-rect 0..1 the
+                // mesh is built in). `fill_path` post-concats its
+                // own xform onto the shader transform.
+                //
+                // No UV region (full texture, default 0,0,1,1):
+                //   scale(1/tex_w, 1/tex_h) → texture fills unit rect.
+                //
+                // With UV region (u0,v0,u1,v1) — used to sub-rect a
+                // shared atlas (e.g. one cell of a glyph atlas):
+                //   path (0,0)             ↔ tex (u0*W, v0*H)
+                //   path (1,1)             ↔ tex (u1*W, v1*H)
+                // → scale(1/((u1-u0)*W), 1/((v1-v0)*H)),
+                //   translate(-u0/(u1-u0), -v0/(v1-v0)).
+                // tiny-skia's Pattern.transform is the mapping from
+                // pattern-source (texture pixel) to user-space (path-
+                // local). painter.rs post-concats fill_path's xform
+                // onto it, so the effective transform inside the
+                // shader pipeline is texel → pixmap, then inverted
+                // to sample. For a unit-rect path with sub-region
+                // (u0..u1, v0..v1) intended to fill it:
+                //   src texel (px, py) → path ((px/W − u0)/du, (py/H − v0)/dv)
+                // With uv = (0, 0, 1, 1) this reduces to
+                // scale(1/W, 1/H), matching the pre-atlas baseline.
+                let uv = mat.as_ref().map(|m| m.uv_region).unwrap_or([0.0, 0.0, 1.0, 1.0]);
+                let tex_w = tex.width()  as f32;
+                let tex_h = tex.height() as f32;
+                let du = (uv[2] - uv[0]).max(1e-6);
+                let dv = (uv[3] - uv[1]).max(1e-6);
+                let sx = 1.0 / (du * tex_w);
+                let sy = 1.0 / (dv * tex_h);
+                let tx = -uv[0] / du;
+                let ty = -uv[1] / dv;
+                let pat_t = Transform::from_row(sx, 0.0, 0.0, sy, tx, ty);
                 paint.shader = Pattern::new(
                     tex.as_ref(),
                     SpreadMode::Pad,
@@ -254,6 +387,61 @@ impl TinySkiaBackend {
 
             pixmap.fill_path(&path, &paint, FillRule::Winding, xform, None);
         }
+    }
+}
+
+/// Draw a 1-pixel border around the rect (x, y, w, h). Uses a pale
+/// grey so it's visible against any window content.
+fn stroke_window_border(dst: &mut Pixmap, x: f32, y: f32, w: f32, h: f32) {
+    let Some(rect) = Rect::from_xywh(x, y, w, h) else { return; };
+    let path = PathBuilder::from_rect(rect);
+    let mut paint = Paint::default();
+    paint.shader = Shader::SolidColor(Color::from_rgba8(0xa0, 0xa0, 0xa8, 0xff));
+    paint.anti_alias = false;
+    let mut stroke = tiny_skia::Stroke::default();
+    stroke.width = 1.0;
+    dst.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+}
+
+/// Blit `src` into `dst` at the screen rect (x, y, w, h). If the
+/// FBO's native size matches (w, h), a fast `draw_pixmap` does an
+/// integer-pixel copy. If the rects differ, we fall back to a
+/// scaled draw via `Pattern` shader so windows stay correct after
+/// resize before the FBO has been reallocated.
+fn blit_pixmap(dst: &mut Pixmap, src: &Pixmap, x: f32, y: f32, w: f32, h: f32) {
+    let src_ref: PixmapRef<'_> = src.as_ref();
+    let same_size = (src.width() as f32 - w).abs() < 0.5
+                  && (src.height() as f32 - h).abs() < 0.5;
+    if same_size {
+        let mut paint = PixmapPaint::default();
+        paint.quality = FilterQuality::Nearest;
+        dst.draw_pixmap(
+            x.round() as i32,
+            y.round() as i32,
+            src_ref,
+            &paint,
+            Transform::identity(),
+            None,
+        );
+    } else {
+        // Stretched: build a unit-rect path covering (x..x+w, y..y+h)
+        // and fill it with a Pattern that maps src texels into that
+        // rect. Pattern.transform is "src texel → user (path-local)";
+        // post-concat with fill_path xform makes the effective
+        // transform texel → pixmap.
+        let Some(rect) = Rect::from_xywh(x, y, w, h) else { return; };
+        let path = PathBuilder::from_rect(rect);
+        let pat_t = Transform::from_row(
+            w / src.width() as f32, 0.0,
+            0.0, h / src.height() as f32,
+            x, y,
+        );
+        let mut paint = Paint::default();
+        paint.shader = Pattern::new(
+            src_ref, SpreadMode::Pad, FilterQuality::Bilinear, 1.0,
+            pat_t,
+        );
+        dst.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
     }
 }
 

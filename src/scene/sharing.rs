@@ -692,16 +692,16 @@ mod tests {
         // simulate upload: BEGIN with first 112 bytes, DATA with remaining 16
         let total_size = xform.len();
         let first_chunk = total_size.min(112);
-        cas.begin_upload(1, total_size, &xform[..first_chunk]);
+        cas.begin_upload(1u64, total_size, &xform[..first_chunk]);
 
         let mut pos = first_chunk;
         while pos < total_size {
             let chunk = (total_size - pos).min(116);
-            cas.append_upload(1, &xform[pos..pos+chunk]);
+            cas.append_upload(1u64, &xform[pos..pos+chunk]);
             pos += chunk;
         }
 
-        let server_hash = cas.finish_upload(1).unwrap();
+        let server_hash = cas.finish_upload(1u64).unwrap();
 
         eprintln!("client hash: {:02x}{:02x}...", client_hash[0], client_hash[1]);
         eprintln!("server hash: {:02x}{:02x}...", server_hash[0], server_hash[1]);
@@ -714,14 +714,14 @@ mod tests {
         let client_list_hash = CasStore::hash(&list);
 
         let first = list.len().min(112);
-        cas.begin_upload(2, list.len(), &list[..first]);
+        cas.begin_upload(2u64, list.len(), &list[..first]);
         let mut pos = first;
         while pos < list.len() {
             let chunk = (list.len() - pos).min(116);
-            cas.append_upload(2, &list[pos..pos+chunk]);
+            cas.append_upload(2u64, &list[pos..pos+chunk]);
             pos += chunk;
         }
-        let server_list_hash = cas.finish_upload(2).unwrap();
+        let server_list_hash = cas.finish_upload(2u64).unwrap();
         eprintln!("list client: {:02x}{:02x}...", client_list_hash[0], client_list_hash[1]);
         eprintln!("list server: {:02x}{:02x}...", server_list_hash[0], server_list_hash[1]);
         assert_eq!(client_list_hash, server_list_hash, "4KB upload must preserve hash");

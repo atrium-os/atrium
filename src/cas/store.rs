@@ -15,7 +15,10 @@ struct StagedUpload {
 
 pub struct CasStore {
     blobs: HashMap<Hash256, Blob>,
-    upload_staging: HashMap<u32, StagedUpload>,
+    /// Pending uploads keyed by `(client_id as u64) << 32 | seq` so
+    /// concurrent uploads from different clients can't trample each
+    /// other. Each client owns its own sequence-id space.
+    upload_staging: HashMap<u64, StagedUpload>,
     pub dedup_hits: u64,
     pub dedup_bytes_saved: u64,
     pub gc_freed_blobs: u64,
@@ -252,16 +255,16 @@ impl CasStore {
 
     // ── Upload protocol ─────────────────────────────────────────
 
-    pub fn begin_upload(&mut self, upload_id: u32, total_size: usize, initial_data: &[u8]) {
+    pub fn begin_upload(&mut self, upload_key: u64, total_size: usize, initial_data: &[u8]) {
         let take = initial_data.len().min(total_size);
-        self.upload_staging.insert(upload_id, StagedUpload {
+        self.upload_staging.insert(upload_key, StagedUpload {
             data: initial_data[..take].to_vec(),
             total_size,
         });
     }
 
-    pub fn append_upload(&mut self, upload_id: u32, data: &[u8]) {
-        if let Some(staged) = self.upload_staging.get_mut(&upload_id) {
+    pub fn append_upload(&mut self, upload_key: u64, data: &[u8]) {
+        if let Some(staged) = self.upload_staging.get_mut(&upload_key) {
             let remaining = staged.total_size.saturating_sub(staged.data.len());
             let take = data.len().min(remaining);
             if take > 0 {
@@ -270,8 +273,8 @@ impl CasStore {
         }
     }
 
-    pub fn finish_upload(&mut self, upload_id: u32) -> Option<Hash256> {
-        if let Some(staged) = self.upload_staging.remove(&upload_id) {
+    pub fn finish_upload(&mut self, upload_key: u64) -> Option<Hash256> {
+        if let Some(staged) = self.upload_staging.remove(&upload_key) {
             Some(self.store(&staged.data))
         } else {
             None
