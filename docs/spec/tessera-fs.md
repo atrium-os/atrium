@@ -107,7 +107,24 @@ Constants:
 
 The last two blocks of the volume are SB_A_backup and SB_B_backup, written every commit alongside the primary pair. fsck consults the backup pair if both primary blocks are corrupt.
 
-### 3.3 Self-heal at mount
+### 3.3 Metadata allocator (open issue)
+
+The free-extent map (§9) is itself a B+tree whose nodes are allocated from the very pool it tracks. A naive commit therefore recurses: `tessera_extent_flush` walks the in-memory free-extent set and `tessera_btree_put`s each entry; each put consumes a sector via `io.alloc`, which mutates the same set we're iterating.
+
+v1 resolves this by reserving a fixed-size **metadata reserve** at format time, immediately after `pack_zone_start`:
+
+```
+0          1         2..3        4..4+J         metadata reserve         pack zone
+SB-A       SB-B      reserved    journal        (M sectors, fixed)       (rest)
+```
+
+Mutations allocate metadata-tree nodes (inode, pack-registry, and free-extent B+trees) out of the metadata reserve via a dedicated bump pointer that is *not* tracked by the free-extent allocator. The reserve is sized to ≥ ceil(W·log_F(N)) blocks where W is the maximum number of concurrent metadata writes per commit, F is the B+tree fanout, and N is the maximum live entry count — for v1 a 256-sector reserve is sufficient.
+
+A `tessera repack` pass periodically compacts the metadata reserve and shifts unused tail back into the pack zone.
+
+**Implementation status (round 6a):** the reserve is *not* yet carved out. Format-time metadata zone (`TESSERA_METADATA_ZONE_SECTORS = 16`) only covers the empty-tree roots; mutation paths therefore can't be implemented yet. Round 6 starts with the reserve format-time change before any vop-write code lands.
+
+### 3.4 Self-heal at mount
 
 The dual superblock only earns its keep if the two copies stay in sync. At mount time, after picking the authoritative SB (highest generation with valid magic + CRC), the implementation MUST:
 

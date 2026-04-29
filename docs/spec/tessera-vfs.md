@@ -44,7 +44,7 @@ The adapter implements the FreeBSD `vop_*` interface and translates each POSIX c
 1. Opens the block device read-write.
 2. Reads SB_A and SB_B from blocks 0 and 1.
 3. Selects the higher-generation valid superblock as the active superblock.
-4. **Self-heals the dual SB pair** per tessera-fs.md §3.3 — rewrites any copy that failed to decode or is at a stale generation, so the volume leaves mount with two consistent SBs. Self-heal runs even on read-only mounts; failures are logged but do not block the mount.
+4. **Self-heals the dual SB pair** per tessera-fs.md §3.4 — rewrites any copy that failed to decode or is at a stale generation, so the volume leaves mount with two consistent SBs. Self-heal runs even on read-only mounts; failures are logged but do not block the mount.
 5. If `last_unmount_clean = 0`, runs journal replay (tessera-fs.md §4.5). On failure to replay (corrupted journal beyond repair), mount fails with `EIO`.
 6. Writes `last_unmount_clean = 0` and `last_mount_time = now` into both superblocks; bumps generation.
 7. Loads the inode-table root, pack-registry root, free-extent root, and the bloom-of-blooms cache into memory.
