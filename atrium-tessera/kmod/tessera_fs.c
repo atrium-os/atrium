@@ -464,6 +464,10 @@ static int tessera_fs_inode_get(struct tessera_mount *tmp_,
 static int tessera_fs_inode_get_byk(struct tessera_mount *tmp_,
                                     const uint8_t key[4],
                                     tessera_inode_record_t *out);
+static int tessera_fs_inode_get_at_gen(struct tessera_mount *tmp_,
+                                       uint32_t inode_no,
+                                       uint64_t snapshot_gen,
+                                       tessera_inode_record_t *out);
 static int tessera_fs_inode_put_byk(struct tessera_mount *tmp_,
                                     const uint8_t key[4],
                                     const tessera_inode_record_t *rec,
@@ -728,12 +732,50 @@ tessera_kbio_meta_free(void *ctx, uint64_t s, uint64_t n)
 
 /* ── per-vnode private ──────────────────────────────────────── */
 
+/*
+ * v2 snapshots slice 3: magic dir at /.tessera/snapshots/<N>/.
+ *
+ * Most vnodes are TESSERA_NODE_REGULAR — backed by an actual inode
+ * record in the inode_tree. The slice-3 magic-dir hierarchy uses
+ * synthesized vnodes:
+ *
+ *   /.tessera                       — TESSERA_NODE_MAGIC_TESSERA
+ *   /.tessera/snapshots             — TESSERA_NODE_MAGIC_SNAPSHOTS
+ *   /.tessera/snapshots/<gen>       — TESSERA_NODE_REGULAR, snapshot_gen=N,
+ *                                     inode_no=1 (snapshot's root inode)
+ *   /.tessera/snapshots/<gen>/...   — TESSERA_NODE_REGULAR, snapshot_gen=N,
+ *                                     inode_no=child looked up via the
+ *                                     snapshot's inode_tree
+ *
+ * REGULAR with snapshot_gen != 0 is read-only — every mutation vop
+ * checks for it and returns EROFS. Reads use the snapshot's
+ * inode_tree (opened on demand from `srec.inode_root`); the live
+ * pack_registry is fine for blob fetches because GC unionization
+ * (slice 1) keeps the snapshot-referenced packs registered there.
+ */
+enum tessera_node_kind {
+	TESSERA_NODE_REGULAR        = 0,
+	TESSERA_NODE_MAGIC_TESSERA  = 1,
+	TESSERA_NODE_MAGIC_SNAPSHOTS= 2,
+};
+
+/* Synthetic d_fileno values for magic-dir vnodes. Real tessera
+ * inodes are uint32_t and allocated sequentially from low values,
+ * so the high-bit range is safe to reserve. d_fileno=0 must be
+ * avoided — getdirentries(2) treats it as a tombstone and ls skips
+ * the entry. */
+#define TESSERA_MAGIC_INO_TESSERA    0xFFFFFFF0u
+#define TESSERA_MAGIC_INO_SNAPSHOTS  0xFFFFFFF1u
+
 struct tessera_node {
 	uint64_t inode_no;
 	/* Parent inode_no, tracked at descent time so vop_lookup of ".."
 	 * can return the right vnode. The root vnode loops back to
 	 * itself per the standard FS convention. */
 	uint64_t parent_inode_no;
+	/* v2 slice-3: magic dir kind + per-vnode snapshot context. */
+	uint8_t  kind;          /* enum tessera_node_kind */
+	uint64_t snapshot_gen;  /* 0 = live; non-zero = read from gen N */
 };
 
 #define VTOTNODE(vp) ((struct tessera_node *)(vp)->v_data)
@@ -1458,7 +1500,34 @@ tessera_inode_cmp(struct vnode *vp, void *arg)
 	uint64_t target = *(uint64_t *)arg;
 	struct tessera_node *tn = VTOTNODE(vp);
 	if (tn == NULL) return (1);
+	/* Live regular vnodes: kind=REGULAR, snapshot_gen=0. Match on
+	 * inode_no alone (existing semantics). For magic-dir / snapshot
+	 * vnodes (created via tessera_vget_synth), the cmp is done via
+	 * tessera_inode_cmp_ex which checks all three fields. */
+	if (tn->kind != TESSERA_NODE_REGULAR || tn->snapshot_gen != 0)
+		return (1); /* never match; force fresh creation */
 	return (tn->inode_no == target) ? 0 : 1;
+}
+
+/* v2 slice-3 composite-key cmp for magic-dir and snapshot vnodes.
+ * vfs_hash uses a u_int hash but the cmp can dedup on whatever
+ * fields we want. Using vfs_hash for synth vnodes (instead of
+ * minting fresh ones every lookup) lets unmount's vflush properly
+ * track + reclaim them. */
+struct tessera_vget_key {
+	uint64_t inode_no;
+	uint64_t snapshot_gen;
+	uint8_t  kind;
+};
+static int
+tessera_inode_cmp_ex(struct vnode *vp, void *arg)
+{
+	struct tessera_vget_key *k = (struct tessera_vget_key *)arg;
+	struct tessera_node *tn = VTOTNODE(vp);
+	if (tn == NULL) return (1);
+	return (tn->inode_no == k->inode_no &&
+	    tn->snapshot_gen == k->snapshot_gen &&
+	    tn->kind == k->kind) ? 0 : 1;
 }
 
 static int
@@ -1547,6 +1616,111 @@ tessera_root_impl(struct mount *mp, int flags, struct vnode **vpp)
 	    /* "/.." == "/" */ TESSERA_INODE_ROOT_DIR, vpp));
 }
 
+/*
+ * v2 slice-3: vnodes for the magic-dir tree and snapshot views.
+ *
+ * Goes through vfs_hash like regular vnodes — this is what makes
+ * unmount's vflush correctly drain them. The hash key mixes
+ * inode_no with snapshot_gen + kind so two inode-2 vnodes from
+ * different snapshot gens are distinct. The hash bucket may hold
+ * multiple vnodes with the same inode_no (one per gen + kind);
+ * tessera_inode_cmp_ex picks the right one.
+ *
+ * For TESSERA_NODE_REGULAR with snapshot_gen != 0, reads the
+ * snapshot's inode record to set v_type correctly (VDIR / VREG /
+ * VLNK).
+ */
+static int
+tessera_vget_synth(struct mount *mp, uint64_t inode_no,
+                   uint64_t parent_inode_no, uint8_t kind,
+                   uint64_t snapshot_gen, struct vnode **vpp)
+{
+	struct vnode *vp = NULL;
+	struct thread *td = curthread;
+	struct tessera_vget_key key;
+	int error;
+
+	key.inode_no     = inode_no;
+	key.snapshot_gen = snapshot_gen;
+	key.kind         = kind;
+
+	/* Mix snapshot_gen + kind into the bucket hash so multiple
+	 * gens spread across buckets. inode_no still dominates. */
+	u_int h = (u_int)inode_no
+	    ^ (u_int)(snapshot_gen * 2654435761ULL)
+	    ^ ((u_int)kind * 11u);
+
+	error = vfs_hash_get(mp, h, LK_EXCLUSIVE, td, &vp,
+	    tessera_inode_cmp_ex, &key);
+	if (error != 0) return (error);
+	if (vp != NULL) {
+		*vpp = vp;
+		return (0);
+	}
+
+	error = getnewvnode("tessera", mp, &tessera_vnodeops, &vp);
+	if (error != 0) return (error);
+	vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
+
+	struct tessera_node *tn = malloc(sizeof(*tn), M_TESSERA,
+	    M_WAITOK | M_ZERO);
+	tn->inode_no        = inode_no;
+	tn->parent_inode_no = parent_inode_no;
+	tn->kind            = kind;
+	tn->snapshot_gen    = snapshot_gen;
+	vp->v_data = tn;
+
+	if (kind == TESSERA_NODE_MAGIC_TESSERA ||
+	    kind == TESSERA_NODE_MAGIC_SNAPSHOTS) {
+		vp->v_type = VDIR;
+	} else if (snapshot_gen != 0) {
+		struct tessera_mount *tmp_ = VFSTOTESSERA(mp);
+		tessera_inode_record_t cino;
+		if (tessera_fs_inode_get_at_gen(tmp_, (uint32_t)inode_no,
+		    snapshot_gen, &cino) == TESSERA_OK) {
+			switch (cino.mode & 0170000) {
+			case 0040000: vp->v_type = VDIR; break;
+			case 0100000: vp->v_type = VREG; break;
+			case 0120000: vp->v_type = VLNK; break;
+			default:      vp->v_type = VBAD; break;
+			}
+		} else {
+			vp->v_type = VBAD;
+		}
+	} else {
+		vp->v_type = VNON;
+	}
+
+	VN_LOCK_ASHARE(vp);
+	if (insmntque1(vp, mp) != 0) {
+		vp->v_data = NULL;
+		vp->v_op = &dead_vnodeops;
+		vgone(vp);
+		vput(vp);
+		free(tn, M_TESSERA);
+		return (EIO);
+	}
+
+	struct vnode *other = NULL;
+	error = vfs_hash_insert(vp, h, LK_EXCLUSIVE, td, &other,
+	    tessera_inode_cmp_ex, &key);
+	if (error != 0) {
+		vput(vp);
+		return (error);
+	}
+	if (other != NULL) {
+		/* Another thread won the slot. Discard ours. */
+		vgone(vp);
+		vput(vp);
+		*vpp = other;
+		return (0);
+	}
+
+	vn_set_state(vp, VSTATE_CONSTRUCTED);
+	*vpp = vp;
+	return (0);
+}
+
 /* ── vfs_statfs ──────────────────────────────────────────────── */
 
 static int
@@ -1611,6 +1785,27 @@ tessera_vop_access(struct vop_access_args *ap)
 		/* Pre-tree-open synthesized root: permissive. */
 		return (0);
 	}
+
+	/* v2 slice-3: magic dirs are read-only; reject write access. */
+	if (tn->kind != TESSERA_NODE_REGULAR) {
+		if (ap->a_accmode & VWRITE) return (EROFS);
+		return (0);
+	}
+	/* Snapshot vnodes are also read-only. */
+	if (tn->snapshot_gen != 0) {
+		if (ap->a_accmode & VWRITE) return (EROFS);
+		/* Fall through to ordinary mode check using snapshot's
+		 * inode record so r-x / r-- semantics are preserved. */
+		uint8_t key[4];
+		tessera_inode_record_t ino;
+		encode_inode_key((uint32_t)tn->inode_no, key);
+		if (tessera_fs_inode_get_at_gen(tmp_, (uint32_t)tn->inode_no,
+		    tn->snapshot_gen, &ino) != TESSERA_OK)
+			return (EIO);
+		return (vaccess(vp->v_type, ino.mode & 07777, ino.uid,
+		    ino.gid, ap->a_accmode, ap->a_cred));
+	}
+
 	uint8_t key[4];
 	tessera_inode_record_t ino;
 	encode_inode_key((uint32_t)tn->inode_no, key);
@@ -1646,6 +1841,21 @@ tessera_vop_getattr(struct vop_getattr_args *ap)
 	vap->va_fileid    = tn->inode_no;
 	vap->va_blocksize = TESSERA_SECTOR_SIZE;
 
+	/* v2 slice-3: magic-dir vnodes (`.tessera`, `.tessera/snapshots`)
+	 * have no on-disk inode. Synthesize stable read-only-dir attrs. */
+	if (tn->kind != TESSERA_NODE_REGULAR) {
+		vap->va_type  = VDIR;
+		vap->va_mode  = 0555;
+		vap->va_nlink = 2;
+		vap->va_uid   = 0;
+		vap->va_gid   = 0;
+		vap->va_size  = 0;
+		vap->va_bytes = 0;
+		vap->va_gen   = 1;
+		vap->va_flags = 0;
+		return (0);
+	}
+
 	/* Try to read the on-disk inode record. ENOENT fall-through means
 	 * the volume hasn't had inode 2 populated yet (mkfs work pending
 	 * for round 3c) — return synthesized empty-root attrs so the
@@ -1655,7 +1865,10 @@ tessera_vop_getattr(struct vop_getattr_args *ap)
 		uint8_t key[4];
 		tessera_inode_record_t ino;
 		encode_inode_key((uint32_t)tn->inode_no, key);
-		int rc = tessera_fs_inode_get_byk(tmp_, key, &ino);
+		int rc = (tn->snapshot_gen != 0)
+		    ? tessera_fs_inode_get_at_gen(tmp_, (uint32_t)tn->inode_no,
+		          tn->snapshot_gen, &ino)
+		    : tessera_fs_inode_get_byk(tmp_, key, &ino);
 		if (rc == TESSERA_OK) {
 			switch (ino.mode & 0170000) {
 			case 040000:  vap->va_type = VDIR; break;
@@ -1808,14 +2021,86 @@ tessera_vop_lookup(struct vop_lookup_args *ap)
 		return (0);
 	}
 
-	/* Real on-disk lookup: read the directory inode, fetch its
-	 * DIRECTORY manifest blob, walk it for `cnp`. */
-	if (tmp_->inode_tree == NULL) return (ENOENT);
+	/* v2 slice-3: magic dir hierarchy at /.tessera/snapshots/<gen>/.
+	 * Three layers of synthesized vnodes; the third (snapshot root)
+	 * descends into REGULAR vnodes tagged with snapshot_gen so reads
+	 * use the historical inode_tree. */
+	if (dn->kind == TESSERA_NODE_REGULAR && dn->snapshot_gen == 0 &&
+	    dn->inode_no == TESSERA_INODE_ROOT_DIR &&
+	    cnp->cn_namelen == 8 &&
+	    memcmp(cnp->cn_nameptr, ".tessera", 8) == 0) {
+		struct vnode *mvp;
+		int e = tessera_vget_synth(dvp->v_mount,
+		    TESSERA_MAGIC_INO_TESSERA,
+		    dn->inode_no, TESSERA_NODE_MAGIC_TESSERA, 0, &mvp);
+		if (e != 0) return (e);
+		*vpp = mvp;
+		return (0);
+	}
+	if (dn->kind == TESSERA_NODE_MAGIC_TESSERA &&
+	    cnp->cn_namelen == 9 &&
+	    memcmp(cnp->cn_nameptr, "snapshots", 9) == 0) {
+		struct vnode *mvp;
+		int e = tessera_vget_synth(dvp->v_mount,
+		    TESSERA_MAGIC_INO_SNAPSHOTS,
+		    TESSERA_MAGIC_INO_TESSERA,
+		    TESSERA_NODE_MAGIC_SNAPSHOTS, 0, &mvp);
+		if (e != 0) return (e);
+		*vpp = mvp;
+		return (0);
+	}
+	if (dn->kind == TESSERA_NODE_MAGIC_SNAPSHOTS) {
+		/* Parse name as decimal gen; look up in snapshots_tree. */
+		uint64_t g = 0;
+		if (cnp->cn_namelen == 0) return (ENOENT);
+		for (int i = 0; i < cnp->cn_namelen; i++) {
+			char c = cnp->cn_nameptr[i];
+			if (c < '0' || c > '9') return (ENOENT);
+			g = g * 10ull + (uint64_t)(c - '0');
+			if (g > 0xffffffffffffull) return (ENOENT);
+		}
+		if (tmp_->snapshots_tree == NULL) return (ENOENT);
+		uint8_t skey[8];
+		for (int i = 0; i < 8; i++)
+			skey[i] = (uint8_t)(g >> ((7 - i) * 8));
+		tessera_snapshot_record_t srec;
+		if (tessera_btree_get(tmp_->snapshots_tree, skey, &srec)
+		    != TESSERA_OK)
+			return (ENOENT);
+		struct vnode *mvp;
+		int e = tessera_vget_synth(dvp->v_mount,
+		    TESSERA_INODE_ROOT_DIR, /*parent*/ 0,
+		    TESSERA_NODE_REGULAR, g, &mvp);
+		if (e != 0) return (e);
+		*vpp = mvp;
+		return (0);
+	}
+	if (cnp->cn_flags & ISDOTDOT) {
+		/* (already handled above for normal vnodes; falling through
+		 * here only for magic vnodes with no real parent. Return
+		 * self.) */
+		if (dn->kind != TESSERA_NODE_REGULAR) {
+			vref(dvp);
+			*vpp = dvp;
+			return (0);
+		}
+	}
 
+	/* Magic dirs above this point have no further children. */
+	if (dn->kind != TESSERA_NODE_REGULAR) return (ENOENT);
+
+	/* Real on-disk lookup: read the directory inode, fetch its
+	 * DIRECTORY manifest blob, walk it for `cnp`. Snapshot-tagged
+	 * vnodes (snapshot_gen != 0) read the inode + manifest from
+	 * the historical inode_tree. */
 	uint8_t key[4];
 	tessera_inode_record_t dino;
 	encode_inode_key((uint32_t)dn->inode_no, key);
-	if (tessera_fs_inode_get_byk(tmp_, key, &dino) != TESSERA_OK)
+	int igrc = (dn->snapshot_gen != 0)
+	    ? tessera_fs_inode_get_at_gen(tmp_, (uint32_t)dn->inode_no,
+	          dn->snapshot_gen, &dino)
+	    : tessera_fs_inode_get_byk(tmp_, key, &dino);
+	if (igrc != TESSERA_OK)
 		return (ENOENT);
 	if (tessera_hash_is_null(dino.manifest_hash))
 		return (ENOENT);                  /* empty directory */
@@ -1867,11 +2152,16 @@ tessera_vop_lookup(struct vop_lookup_args *ap)
 		return (rc);
 	}
 
-	/* Found — return a deduped vnode. tessera_vget reads the on-disk
-	 * inode record and sets v_type; if the vnode already exists in
-	 * the kernel's vfs_hash, the cached one is returned (avoids the
-	 * fts_read warning that came from minting fresh vnodes per
-	 * lookup). */
+	/* Found — return a vnode. Live mounts use the deduping
+	 * tessera_vget (vfs_hash keyed on inode_no). Snapshot vnodes
+	 * skip the hash because the same inode_no maps to different
+	 * content across gens — vget_synth mints a fresh vnode and
+	 * propagates snapshot_gen. */
+	if (dn->snapshot_gen != 0) {
+		return (tessera_vget_synth(dvp->v_mount, child_no,
+		    dn->inode_no, TESSERA_NODE_REGULAR,
+		    dn->snapshot_gen, vpp));
+	}
 	return (tessera_vget(dvp->v_mount, child_no, dn->inode_no, vpp));
 }
 
@@ -1967,16 +2257,71 @@ tessera_vop_readdir(struct vop_readdir_args *ap)
 	_EMIT(tn->inode_no, DT_DIR, ".", 1);
 	_EMIT(tn->inode_no, DT_DIR, "..", 2);
 
+	/* v2 slice-3: synthesized magic-dir contents. d_fileno must be
+	 * non-zero (zero is a "deleted entry" tombstone for ls). */
+	if (tn->kind == TESSERA_NODE_MAGIC_TESSERA) {
+		_EMIT(TESSERA_MAGIC_INO_SNAPSHOTS, DT_DIR, "snapshots", 9);
+		goto stop_walk;
+	}
+	if (tn->kind == TESSERA_NODE_MAGIC_SNAPSHOTS) {
+		/* Iterate snapshots_tree, emit one entry per retained gen.
+		 *
+		 * IMPORTANT: _EMIT's EAGAIN path does `goto stop_walk` —
+		 * which would jump OUT of this block while the btree cursor
+		 * is still allocated. Leaked cursor → leaked btree handle →
+		 * leaked mount reference → unmount hangs.
+		 *
+		 * Defence: snapshot the gens to a local array first (cursor
+		 * scope strictly bounded), then loop emit. snapshots are
+		 * naturally bounded by retention, so the array is small. */
+		if (tmp_->snapshots_tree == NULL) goto stop_walk;
+		uint64_t gens[64];
+		uint32_t ngens = 0;
+		tessera_btree_cursor_t *sc =
+		    tessera_btree_seek_first(tmp_->snapshots_tree);
+		while (sc != NULL && ngens < 64) {
+			uint8_t skey[8];
+			tessera_snapshot_record_t srec;
+			if (tessera_btree_cursor_get(sc, skey, &srec)
+			    != TESSERA_OK)
+				break;
+			gens[ngens++] = srec.generation;
+			if (tessera_btree_cursor_next(sc) != TESSERA_OK) break;
+		}
+		if (sc != NULL) tessera_btree_cursor_free(sc);
+		for (uint32_t gi = 0; gi < ngens && !stopped; gi++) {
+			char buf[24];
+			int n = snprintf(buf, sizeof buf, "%lu",
+			    (unsigned long)gens[gi]);
+			if (n > 0 && n < (int)sizeof buf) {
+				_EMIT((ino_t)gens[gi], DT_DIR, buf,
+				    (uint16_t)n);
+			}
+		}
+		goto stop_walk;
+	}
+
 	/* Walk the directory's manifest, if any. */
 	if (tmp_->inode_tree == NULL) goto stop_walk;
 
 	uint8_t key[4];
 	tessera_inode_record_t dino;
 	encode_inode_key((uint32_t)tn->inode_no, key);
-	if (tessera_fs_inode_get_byk(tmp_, key, &dino) != TESSERA_OK)
-		goto stop_walk;
+	int igrc2 = (tn->snapshot_gen != 0)
+	    ? tessera_fs_inode_get_at_gen(tmp_, (uint32_t)tn->inode_no,
+	          tn->snapshot_gen, &dino)
+	    : tessera_fs_inode_get_byk(tmp_, key, &dino);
+	if (igrc2 != TESSERA_OK) goto stop_walk;
 	if (tessera_hash_is_null(dino.manifest_hash))
 		goto stop_walk;
+
+	/* For DT_UNKNOWN inode lookups inside the body walker, use the
+	 * same gen-aware path so child d_type is correct. We override
+	 * the macro's inner inode_get to consult snapshot_gen too —
+	 * achieved by passing tn->snapshot_gen into the body walker
+	 * via a local. */
+	const uint64_t _rd_gen = tn->snapshot_gen;
+	(void)_rd_gen;  /* used inside _RD_EMIT_BODY below if non-zero */
 
 	uint8_t *blob = NULL;
 	uint32_t blob_len = 0;
@@ -2010,8 +2355,11 @@ tessera_vop_readdir(struct vop_readdir_args *ap)
 		uint8_t _k2[4];                                           \
 		tessera_inode_record_t _cino;                             \
 		encode_inode_key((uint32_t)_ch, _k2);                     \
-		if (tessera_fs_inode_get_byk(tmp_, _k2, &_cino)      \
-		    == TESSERA_OK)                                        \
+		int _crc = (_rd_gen != 0)                                 \
+		    ? tessera_fs_inode_get_at_gen(tmp_, (uint32_t)_ch,    \
+		          _rd_gen, &_cino)                                \
+		    : tessera_fs_inode_get_byk(tmp_, _k2, &_cino);        \
+		if (_crc == TESSERA_OK)                                   \
 			_dt = tessera_dt_from_mode(_cino.mode);           \
 		_EMIT(_ch, _dt, _nm, _nl);                                \
 		_off += 10 + _nl;                                         \
@@ -2180,11 +2528,16 @@ tessera_vop_read(struct vop_read_args *ap)
 	if (uio->uio_resid == 0) return (0);
 	if (tmp_->inode_tree == NULL) return (EIO);
 
-	/* Read the inode record. */
+	/* Read the inode record. v2 slice-3: snapshot vnodes consult
+	 * the historical inode_tree. */
 	uint8_t key[4];
 	tessera_inode_record_t ino;
 	encode_inode_key((uint32_t)tn->inode_no, key);
-	if (tessera_fs_inode_get_byk(tmp_, key, &ino) != TESSERA_OK)
+	int igrc3 = (tn->snapshot_gen != 0)
+	    ? tessera_fs_inode_get_at_gen(tmp_, (uint32_t)tn->inode_no,
+	          tn->snapshot_gen, &ino)
+	    : tessera_fs_inode_get_byk(tmp_, key, &ino);
+	if (igrc3 != TESSERA_OK)
 		return (EIO);
 
 	/* Empty file or read past EOF. */
@@ -2727,6 +3080,63 @@ tessera_fs_inode_get_byk(struct tessera_mount *tmp_, const uint8_t key[4],
                          tessera_inode_record_t *out)
 {
 	return (tessera_fs_inode_get(tmp_, _inode_key_decode(key), out));
+}
+
+/*
+ * v2 slice-3: helper to reject mutations targeting magic-dir or
+ * snapshot vnodes. Returns EROFS when the vnode is read-only by
+ * virtue of being inside `/.tessera/snapshots/...`.
+ */
+static inline int
+tessera_node_is_readonly(struct tessera_node *tn)
+{
+	return (tn->kind != TESSERA_NODE_REGULAR || tn->snapshot_gen != 0);
+}
+
+/*
+ * v2 slice-3: read an inode record from a specific snapshot's
+ * inode_tree (instead of the live one). Used by the magic-dir
+ * read paths so vnodes inside `/.tessera/snapshots/<gen>/...`
+ * see the historical state.
+ *
+ * Strategy: look up the snapshot record for `gen` to learn its
+ * inode_root, then open a fresh btree handle against that root
+ * for this single get. Open/close per access is cheap relative
+ * to the actual sector reads; a per-mount cache could be added
+ * later if profiling shows it matters.
+ *
+ * Returns TESSERA_OK on success, TESSERA_ENOENT if the snapshot
+ * doesn't exist or the inode isn't in it.
+ */
+static int
+tessera_fs_inode_get_at_gen(struct tessera_mount *tmp_, uint32_t inode_no,
+                            uint64_t snapshot_gen,
+                            tessera_inode_record_t *out)
+{
+	if (snapshot_gen == 0)
+		return (tessera_fs_inode_get(tmp_, inode_no, out));
+	if (tmp_->snapshots_tree == NULL)
+		return (TESSERA_ENOENT);
+
+	uint8_t skey[8];
+	for (int i = 0; i < 8; i++)
+		skey[i] = (uint8_t)(snapshot_gen >> ((7 - i) * 8));
+	tessera_snapshot_record_t srec;
+	if (tessera_btree_get(tmp_->snapshots_tree, skey, &srec) != TESSERA_OK)
+		return (TESSERA_ENOENT);
+	if (srec.inode_root == 0)
+		return (TESSERA_ENOENT);
+
+	tessera_btree_t *t = tessera_btree_open(&tmp_->meta_bio,
+	    srec.inode_root, /*tree_kind*/ 0,
+	    /*key*/ 4, /*value*/ TESSERA_INODE_RECORD_SIZE);
+	if (t == NULL) return (TESSERA_ENOENT);
+
+	uint8_t key[4];
+	encode_inode_key(inode_no, key);
+	int rc = tessera_btree_get(t, key, out);
+	tessera_btree_close(t);
+	return (rc);
 }
 
 static int
