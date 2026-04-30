@@ -141,6 +141,7 @@ static unsigned long tessera_stat_vop_write_inline    = 0;
 static unsigned long tessera_stat_vop_write_chunked   = 0;
 static unsigned long tessera_stat_chunk_dedup_skip    = 0;
 static unsigned long tessera_stat_chunk_zero_hole     = 0;
+static unsigned long tessera_stat_chunk_tree_publish  = 0;
 static unsigned long tessera_stat_append_fast_ok      = 0;
 static unsigned long tessera_stat_append_fast_fallback = 0;
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, vop_write_inline,
@@ -155,6 +156,9 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, chunk_dedup_skip,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, chunk_zero_hole,
     CTLFLAG_RD, &tessera_stat_chunk_zero_hole, 0,
     "ZERO_HOLE chunks emitted (sparse-file detection)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, chunk_tree_publish,
+    CTLFLAG_RD, &tessera_stat_chunk_tree_publish, 0,
+    "CHUNK_TREE outer-manifest publishes (write-side promotion)");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, append_fast_ok,
     CTLFLAG_RD, &tessera_stat_append_fast_ok, 0,
     "Append fast-path successes");
@@ -3773,6 +3777,195 @@ tessera_chunk_size_for(struct tessera_mount *tmp_, uint64_t file_size)
 	return (  4u * 1024u * 1024u);                        /* ≥ 4 GiB */
 }
 
+/*
+ * v2 step-3c: CHUNK_TREE write-side promotion.
+ *
+ * Once a file has more than TESSERA_CHUNK_TREE_FANOUT chunks at the
+ * current chunk size, a flat CHUNK_LIST manifest becomes prohibitive:
+ * a 1 GiB file at 4 KiB chunks would emit ~262144 chunk_records, a
+ * ~12 MiB manifest body that's rewritten in full on every modifying
+ * write.
+ *
+ * CHUNK_TREE partitions the chunks into K groups of at most FANOUT,
+ * publishes each group as its own CHUNK_LIST sub-manifest pack, and
+ * emits a single outer CHUNK_TREE manifest pointing at the K group
+ * hashes. Read-side recursion is already in place (read_into_uio).
+ *
+ * Manifest cost amortizes to O(K + N/K) bytes per write — for FANOUT
+ * = 256, that's ~50 KiB outer + ~50 KiB per dirty group instead of
+ * ~12 MiB monolithic. Combined with per-group dedup against the old
+ * tree (TODO follow-up), unchanged groups skip republish entirely.
+ *
+ * v1 scope: rebuild every group on every write (no inter-tree
+ * dedup yet). Sub-CHUNK_LIST chunks use *global* logical offsets so
+ * the existing read path doesn't need to know it's inside a subtree.
+ */
+#define TESSERA_CHUNK_TREE_FANOUT  256u
+
+static int
+tessera_fs_replace_content_chunk_tree(struct tessera_mount *tmp_,
+    uint32_t inode_no, const uint8_t *new_bytes, size_t new_len,
+    uint32_t cs)
+{
+	const uint32_t n_chunks = (uint32_t)((new_len + cs - 1) / cs);
+	const uint32_t fanout   = TESSERA_CHUNK_TREE_FANOUT;
+	const uint32_t n_groups = (n_chunks + fanout - 1) / fanout;
+
+	tessera_manifest_builder_t *outer =
+	    tessera_manifest_begin(TESSERA_MFT_CHUNK_TREE);
+	if (outer == NULL) return (ENOMEM);
+
+	/* Publish each group as a CHUNK_LIST sub-manifest pack, then add
+	 * a tree_record entry to the outer manifest. */
+	for (uint32_t g = 0; g < n_groups; g++) {
+		const uint32_t chunk_first = g * fanout;
+		const uint32_t chunk_last  = (chunk_first + fanout > n_chunks)
+		    ? n_chunks : (chunk_first + fanout);
+		const uint64_t group_off   = (uint64_t)chunk_first * cs;
+
+		struct tessera_chunk_in *dirty = malloc(
+		    (chunk_last - chunk_first) * sizeof(*dirty),
+		    M_TESSERA, M_WAITOK | M_ZERO);
+		uint32_t n_dirty = 0;
+
+		tessera_manifest_builder_t *mb =
+		    tessera_manifest_begin(TESSERA_MFT_CHUNK_LIST);
+		if (mb == NULL) {
+			free(dirty, M_TESSERA);
+			tessera_manifest_free(outer);
+			return (ENOMEM);
+		}
+
+		for (uint32_t i = chunk_first; i < chunk_last; i++) {
+			const uint64_t off = (uint64_t)i * cs;
+			const uint32_t len = (off + cs <= new_len) ? cs
+			    : (uint32_t)(new_len - off);
+
+			int all_zero = 1;
+			for (uint32_t j = 0; j < len; j++) {
+				if (new_bytes[off + j] != 0) {
+					all_zero = 0;
+					break;
+				}
+			}
+			if (all_zero) {
+				tessera_hash_t zh;
+				memset(zh, 0, sizeof zh);
+				if (tessera_manifest_add_chunk(mb, zh, off, len,
+				    TESSERA_CHUNK_FLAG_ZERO_HOLE)
+				    != TESSERA_OK) {
+					tessera_manifest_free(mb);
+					free(dirty, M_TESSERA);
+					tessera_manifest_free(outer);
+					return (ENOMEM);
+				}
+				tessera_stat_chunk_zero_hole++;
+				continue;
+			}
+
+			tessera_hash_t h;
+			tessera_sha256(new_bytes + off, len, h);
+
+			if (tessera_manifest_add_chunk(mb, h, off, len, 0)
+			    != TESSERA_OK) {
+				tessera_manifest_free(mb);
+				free(dirty, M_TESSERA);
+				tessera_manifest_free(outer);
+				return (ENOMEM);
+			}
+
+			dirty[n_dirty].bytes = new_bytes + off;
+			dirty[n_dirty].len   = len;
+			memcpy(dirty[n_dirty].hash, h, sizeof h);
+			n_dirty++;
+		}
+
+		size_t mlen = 0;
+		tessera_hash_t mhash;
+		(void)tessera_manifest_finalize(mb, NULL, 0, &mlen, mhash);
+		uint8_t *mft = malloc(mlen, M_TESSERA, M_WAITOK);
+		if (tessera_manifest_finalize(mb, mft, mlen, &mlen, mhash)
+		    != TESSERA_OK) {
+			tessera_manifest_free(mb);
+			free(mft, M_TESSERA);
+			free(dirty, M_TESSERA);
+			tessera_manifest_free(outer);
+			return (EIO);
+		}
+		tessera_manifest_free(mb);
+
+		tessera_hash_t pub_hash;
+		if (tessera_fs_publish_chunked(tmp_, dirty, n_dirty, mft,
+		    mlen, pub_hash) != 0) {
+			free(mft, M_TESSERA);
+			free(dirty, M_TESSERA);
+			tessera_manifest_free(outer);
+			return (EIO);
+		}
+		free(mft, M_TESSERA);
+		free(dirty, M_TESSERA);
+
+		if (tessera_manifest_add_tree_child(outer, pub_hash,
+		    group_off) != TESSERA_OK) {
+			tessera_manifest_free(outer);
+			return (ENOMEM);
+		}
+	}
+
+	/* CHUNK_TREE total logical_size must equal the file size — the
+	 * read path uses it to compute the last child's exclusive upper
+	 * bound. add_tree_child only advances logical_size to the last
+	 * entry's start_offset, so we must set it explicitly here. */
+	(void)tessera_manifest_set_logical_size(outer, new_len);
+
+	size_t olen = 0;
+	tessera_hash_t ohash;
+	(void)tessera_manifest_finalize(outer, NULL, 0, &olen, ohash);
+	uint8_t *obuf = malloc(olen, M_TESSERA, M_WAITOK);
+	if (tessera_manifest_finalize(outer, obuf, olen, &olen, ohash)
+	    != TESSERA_OK) {
+		tessera_manifest_free(outer);
+		free(obuf, M_TESSERA);
+		return (EIO);
+	}
+	tessera_manifest_free(outer);
+
+	/* Outer manifest is metadata-only — publish via the regular
+	 * manifest path (with supersession-tagging by inode_no so a
+	 * subsequent rewrite of the same file in the same flush window
+	 * supersedes this entry rather than stacking). */
+	if (tessera_fs_publish_manifest_owned(tmp_, obuf, olen, ohash,
+	    inode_no) != 0) {
+		free(obuf, M_TESSERA);
+		return (EIO);
+	}
+	free(obuf, M_TESSERA);
+
+	/* Update inode to point at the outer CHUNK_TREE manifest. */
+	uint8_t key[4];
+	encode_inode_key(inode_no, key);
+	tessera_inode_record_t ino;
+	if (tessera_fs_inode_get_byk(tmp_, key, &ino) != TESSERA_OK)
+		return (EIO);
+	memcpy(ino.manifest_hash, ohash, sizeof ohash);
+	ino.size = new_len;
+	ino.gen++;
+	struct timeval tv;
+	getmicrotime(&tv);
+	uint64_t now_ns = (uint64_t)tv.tv_sec * 1000000000ULL +
+	    (uint64_t)tv.tv_usec * 1000ULL;
+	ino.mtime_ns = ino.ctime_ns = now_ns;
+
+	uint64_t new_inode_root = tmp_->sb.inode_root;
+	if (tessera_fs_inode_put_byk(tmp_, key, &ino,
+	    &new_inode_root) != TESSERA_OK)
+		return (EIO);
+	tmp_->sb.inode_root = new_inode_root;
+
+	tessera_stat_chunk_tree_publish++;
+	return (0);
+}
+
 static int
 tessera_fs_replace_content_chunked(struct tessera_mount *tmp_,
     uint32_t inode_no, const uint8_t *new_bytes, size_t new_len)
@@ -3780,6 +3973,16 @@ tessera_fs_replace_content_chunked(struct tessera_mount *tmp_,
 	if (new_len == 0) {
 		/* Empty file = empty INLINE manifest, no chunks. */
 		return tessera_fs_replace_content(tmp_, inode_no, new_bytes, 0);
+	}
+
+	/* Step-3c promotion: when the chunk count exceeds the fanout,
+	 * spill into a CHUNK_TREE rather than a flat CHUNK_LIST. */
+	{
+		const uint32_t cs0 = tessera_chunk_size_for(tmp_, new_len);
+		const uint32_t n0  = (uint32_t)((new_len + cs0 - 1) / cs0);
+		if (n0 > TESSERA_CHUNK_TREE_FANOUT)
+			return (tessera_fs_replace_content_chunk_tree(tmp_,
+			    inode_no, new_bytes, new_len, cs0));
 	}
 
 	/* Step-3b: chunk-level dedup vs the old manifest. Read the old
@@ -3985,6 +4188,19 @@ tessera_fs_append_chunked(struct tessera_mount *tmp_, uint32_t inode_no,
 	const uint64_t old_size = old_ino.size;
 	if (old_size == 0) return (ENOTSUP);   /* nothing to retain */
 	const uint64_t new_size = old_size + (uint64_t)append_len;
+
+	/* Step-3c: if the resulting chunk count would overflow the
+	 * CHUNK_TREE fanout, bail to the slow path. The slow path
+	 * routes through replace_content_chunked, which already knows
+	 * how to promote to CHUNK_TREE. Append fast-path stays
+	 * CHUNK_LIST-only — fast for the common case (logs, monotonic
+	 * append into bounded-size files), correct for the rare
+	 * crossover (file growing past the fanout boundary). */
+	{
+		const uint64_t projected_chunks = (new_size + cs - 1) / cs;
+		if (projected_chunks > (uint64_t)TESSERA_CHUNK_TREE_FANOUT)
+			return (ENOTSUP);
+	}
 
 	int has_old = 0;
 	for (size_t i = 0; i < TESSERA_HASH_SIZE; i++)

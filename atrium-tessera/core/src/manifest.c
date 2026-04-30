@@ -127,6 +127,18 @@ tessera_manifest_add_tree_child(tessera_manifest_builder_t *b,
 }
 
 int
+tessera_manifest_set_logical_size(tessera_manifest_builder_t *b,
+                                  uint64_t logical_size)
+{
+	if (b == NULL) return TESSERA_EINVAL;
+	/* Only meaningful for CHUNK_TREE — other kinds derive size
+	 * from their entry contents. Silently ignore for those. */
+	if (b->kind != TESSERA_MFT_CHUNK_TREE) return TESSERA_OK;
+	b->logical_size = logical_size;
+	return TESSERA_OK;
+}
+
+int
 tessera_manifest_set_inline(tessera_manifest_builder_t *b,
                             const uint8_t *data, size_t len)
 {

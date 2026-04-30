@@ -30,6 +30,15 @@ int tessera_manifest_add_tree_child(tessera_manifest_builder_t *,
                                     const tessera_hash_t child_hash,
                                     uint64_t logical_offset);
 
+/* Override the builder's logical_size. Required for CHUNK_TREE so the
+ * read path can compute the last child's exclusive upper bound — the
+ * builder otherwise advances logical_size only to the last child's
+ * offset (it has no inherent knowledge of the child's own extent).
+ * No-op for kinds that derive logical_size from contents (INLINE,
+ * SYMLINK, CHUNK_LIST). */
+int tessera_manifest_set_logical_size(tessera_manifest_builder_t *,
+                                      uint64_t logical_size);
+
 /* INLINE body. */
 int tessera_manifest_set_inline(tessera_manifest_builder_t *,
                                 const uint8_t *data, size_t len);
