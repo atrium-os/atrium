@@ -3348,13 +3348,30 @@ tessera_fs_dirty_inodes_drain(struct tessera_mount *tmp_)
 				err = EIO;
 			}
 		}
-		free(e, M_TESSERA);
-		if (err != 0) break;
+		if (err == 0) {
+			free(e, M_TESSERA);
+		} else {
+			/* Restore the failed entry to the cache so the next
+			 * flush can retry. Bug #3: prior code freed it,
+			 * losing the inode update — subsequent ops saw the
+			 * pre-update inode record from on-disk btree. */
+			mtx_lock(&tmp_->flush_mtx);
+			uint32_t b = e->inode_no &
+			    (TESSERA_DIRTY_INODE_BUCKETS - 1u);
+			LIST_INSERT_HEAD(&tmp_->dirty_inodes[b], e, link);
+			tmp_->dirty_count++;
+			mtx_unlock(&tmp_->flush_mtx);
+			break;
+		}
 	}
-	/* Free any leftover (only on error). */
+	/* Restore any leftover entries (only on error) to the cache. */
 	while ((e = LIST_FIRST(&snap)) != NULL) {
 		LIST_REMOVE(e, link);
-		free(e, M_TESSERA);
+		mtx_lock(&tmp_->flush_mtx);
+		uint32_t b = e->inode_no & (TESSERA_DIRTY_INODE_BUCKETS - 1u);
+		LIST_INSERT_HEAD(&tmp_->dirty_inodes[b], e, link);
+		tmp_->dirty_count++;
+		mtx_unlock(&tmp_->flush_mtx);
 	}
 	if (err == 0) tmp_->sb.inode_root = root;
 	return (err);
@@ -3501,10 +3518,28 @@ tessera_fs_pending_manifests_drain(struct tessera_mount *tmp_)
 		if (err == 0) {
 			int r = tessera_fs_publish_manifest_to_disk(tmp_,
 			    e->bytes, e->len, e->hash);
-			if (r != 0) err = r;
+			if (r != 0) {
+				err = r;
+			}
 		}
-		free(e->bytes, M_TESSERA);
-		free(e, M_TESSERA);
+		if (err == 0) {
+			free(e->bytes, M_TESSERA);
+			free(e, M_TESSERA);
+		} else {
+			/* Restore unprocessed entries (including the one
+			 * that just failed if it wasn't retried) to the
+			 * cache so the next flush can retry. Bug #3: prior
+			 * code freed them, losing the manifest bytes —
+			 * subsequent ops referencing those hashes saw
+			 * "blob not found" and the directory containing
+			 * them appeared empty. */
+			mtx_lock(&tmp_->flush_mtx);
+			uint32_t b = e->hash[0];
+			LIST_INSERT_HEAD(&tmp_->pending_manifests[b], e, link);
+			tmp_->pending_manifest_count++;
+			tmp_->pending_manifest_bytes += e->len;
+			mtx_unlock(&tmp_->flush_mtx);
+		}
 	}
 	return (err);
 }
@@ -4458,7 +4493,16 @@ tessera_fs_publish_directory(struct tessera_mount *tmp_,
 		}
 		const char *nm = (const char *)(body + off + 10);
 		uint64_t h = tessera_dir_name_hash(nm, nl);
-		uint32_t bi = (uint32_t)((h >> 32) % K);
+		/* Bucket selection MUST be monotonic on h: tessera_fs_dir_2l_lookup
+		 * binary-searches the outer manifest by first_name_hash, which
+		 * only works if hashes partition the bucket space in order. The
+		 * old (h >> 32) %% K mapping scrambled hashes across buckets
+		 * non-monotonically — lookups for entries that weren't a
+		 * bucket's smallest-hashed entry would land in the wrong bucket
+		 * and return ENOENT (bug #3). With K = 16 = 2^4, the top 4 bits
+		 * of h give a uniform monotonic placement. */
+		uint32_t bi = (uint32_t)(h >> 60);
+		(void)K; /* still used for sizing arrays / iteration below */
 		if (tessera_manifest_add_dirent(bucket_mb[bi], ch, nm, nl)
 		    != TESSERA_OK) {
 			for (uint32_t i = 0; i < K; i++)
@@ -4490,12 +4534,32 @@ tessera_fs_publish_directory(struct tessera_mount *tmp_,
 		return (ENOMEM);
 	}
 
-	int err = 0;
-	for (uint32_t i = 0; i < K; i++) {
-		if (bucket_count[i] == 0) {
-			tessera_manifest_free(bucket_mb[i]);
-			continue;
+	/* tessera_fs_dir_2l_lookup binary-searches the outer manifest's
+	 * bucket records by first_name_hash, so they MUST be emitted in
+	 * ascending first_name_hash order. Bucket index (h>>32 % K)
+	 * doesn't correlate with first_name_hash, so build a sorted
+	 * traversal order over non-empty buckets. K=16 → insertion sort
+	 * is fine. (Bug #3: prior code emitted in i-order; binary search
+	 * picked the wrong bucket → lookup ENOENT for entries readdir
+	 * could see.) */
+	uint32_t order[TESSERA_DIR_BUCKET_COUNT];
+	uint32_t n_order = 0;
+	for (uint32_t i = 0; i < K; i++)
+		if (bucket_count[i] > 0) order[n_order++] = i;
+	for (uint32_t a = 1; a < n_order; a++) {
+		uint32_t cur = order[a];
+		uint64_t curh = bucket_first[cur];
+		int32_t b = (int32_t)a - 1;
+		while (b >= 0 && bucket_first[order[b]] > curh) {
+			order[b + 1] = order[b];
+			b--;
 		}
+		order[b + 1] = cur;
+	}
+
+	int err = 0;
+	for (uint32_t k = 0; k < n_order; k++) {
+		uint32_t i = order[k];
 		size_t bmlen = 0;
 		tessera_hash_t bmhash;
 		(void)tessera_manifest_finalize(bucket_mb[i], NULL, 0,
@@ -4516,6 +4580,14 @@ tessera_fs_publish_directory(struct tessera_mount *tmp_,
 		if (tessera_manifest_add_dir_bucket(outer,
 		    bucket_first[i], bpub) != TESSERA_OK) {
 			err = ENOMEM; break;
+		}
+	}
+	/* Empty buckets aren't traversed in the loop above; free them now.
+	 * NULL the slot so the catch-all cleanup below doesn't double-free. */
+	for (uint32_t i = 0; i < K; i++) {
+		if (bucket_count[i] == 0) {
+			tessera_manifest_free(bucket_mb[i]);
+			bucket_mb[i] = NULL;
 		}
 	}
 	for (uint32_t i = 0; i < K; i++) {
