@@ -295,6 +295,23 @@ struct tessera_dirty_inode {
 static int tessera_fs_inode_get(struct tessera_mount *tmp_,
                                 uint32_t inode_no,
                                 tessera_inode_record_t *out);
+/* Drop-in wrappers that match the existing tessera_btree_{get,put,
+ * delete}(tmp_->inode_tree, ...) signatures — each decodes inode_no
+ * from the 4-byte key, then routes through the dirty_inodes cache.
+ * Lets us batch-refactor with replace_all without touching the
+ * surrounding new_root dance. The put/delete wrappers also write
+ * the current sb.inode_root back into *out_root so existing
+ * `tmp_->sb.inode_root = new_root;` lines remain harmless no-ops. */
+static int tessera_fs_inode_get_byk(struct tessera_mount *tmp_,
+                                    const uint8_t key[4],
+                                    tessera_inode_record_t *out);
+static int tessera_fs_inode_put_byk(struct tessera_mount *tmp_,
+                                    const uint8_t key[4],
+                                    const tessera_inode_record_t *rec,
+                                    uint64_t *out_root);
+static int tessera_fs_inode_delete_byk(struct tessera_mount *tmp_,
+                                       const uint8_t key[4],
+                                       uint64_t *out_root);
 static int tessera_fs_inode_put(struct tessera_mount *tmp_,
                                 uint32_t inode_no,
                                 const tessera_inode_record_t *rec);
@@ -1184,7 +1201,7 @@ tessera_vget(struct mount *mp, uint64_t inode_no, uint64_t parent_inode_no,
 		uint8_t k4[4];
 		tessera_inode_record_t cino;
 		encode_inode_key((uint32_t)inode_no, k4);
-		if (tessera_btree_get(tmp_->inode_tree, k4, &cino)
+		if (tessera_fs_inode_get_byk(tmp_, k4, &cino)
 		    == TESSERA_OK) {
 			switch (cino.mode & 0170000) {
 			case 0040000: vp->v_type = VDIR; break;
@@ -1304,7 +1321,7 @@ tessera_vop_access(struct vop_access_args *ap)
 	uint8_t key[4];
 	tessera_inode_record_t ino;
 	encode_inode_key((uint32_t)tn->inode_no, key);
-	if (tessera_btree_get(tmp_->inode_tree, key, &ino) != TESSERA_OK)
+	if (tessera_fs_inode_get_byk(tmp_, key, &ino) != TESSERA_OK)
 		return (EIO);
 	/* vaccess() does the standard POSIX permission-bit check against
 	 * cred (root override, owner/group/other). */
@@ -1345,7 +1362,7 @@ tessera_vop_getattr(struct vop_getattr_args *ap)
 		uint8_t key[4];
 		tessera_inode_record_t ino;
 		encode_inode_key((uint32_t)tn->inode_no, key);
-		int rc = tessera_btree_get(tmp_->inode_tree, key, &ino);
+		int rc = tessera_fs_inode_get_byk(tmp_, key, &ino);
 		if (rc == TESSERA_OK) {
 			switch (ino.mode & 0170000) {
 			case 040000:  vap->va_type = VDIR; break;
@@ -1505,7 +1522,7 @@ tessera_vop_lookup(struct vop_lookup_args *ap)
 	uint8_t key[4];
 	tessera_inode_record_t dino;
 	encode_inode_key((uint32_t)dn->inode_no, key);
-	if (tessera_btree_get(tmp_->inode_tree, key, &dino) != TESSERA_OK)
+	if (tessera_fs_inode_get_byk(tmp_, key, &dino) != TESSERA_OK)
 		return (ENOENT);
 	if (tessera_hash_is_null(dino.manifest_hash))
 		return (ENOENT);                  /* empty directory */
@@ -1663,7 +1680,7 @@ tessera_vop_readdir(struct vop_readdir_args *ap)
 	uint8_t key[4];
 	tessera_inode_record_t dino;
 	encode_inode_key((uint32_t)tn->inode_no, key);
-	if (tessera_btree_get(tmp_->inode_tree, key, &dino) != TESSERA_OK)
+	if (tessera_fs_inode_get_byk(tmp_, key, &dino) != TESSERA_OK)
 		goto stop_walk;
 	if (tessera_hash_is_null(dino.manifest_hash))
 		goto stop_walk;
@@ -1700,7 +1717,7 @@ tessera_vop_readdir(struct vop_readdir_args *ap)
 		uint8_t _k2[4];                                           \
 		tessera_inode_record_t _cino;                             \
 		encode_inode_key((uint32_t)_ch, _k2);                     \
-		if (tessera_btree_get(tmp_->inode_tree, _k2, &_cino)      \
+		if (tessera_fs_inode_get_byk(tmp_, _k2, &_cino)      \
 		    == TESSERA_OK)                                        \
 			_dt = tessera_dt_from_mode(_cino.mode);           \
 		_EMIT(_ch, _dt, _nm, _nl);                                \
@@ -1874,7 +1891,7 @@ tessera_vop_read(struct vop_read_args *ap)
 	uint8_t key[4];
 	tessera_inode_record_t ino;
 	encode_inode_key((uint32_t)tn->inode_no, key);
-	if (tessera_btree_get(tmp_->inode_tree, key, &ino) != TESSERA_OK)
+	if (tessera_fs_inode_get_byk(tmp_, key, &ino) != TESSERA_OK)
 		return (EIO);
 
 	/* Empty file or read past EOF. */
@@ -1960,10 +1977,9 @@ tessera_vop_setattr(struct vop_setattr_args *ap)
 		return (0);
 	if (tmp_->inode_tree == NULL) return (EROFS);
 
-	uint8_t key[4];
 	tessera_inode_record_t ino;
-	encode_inode_key((uint32_t)tn->inode_no, key);
-	if (tessera_btree_get(tmp_->inode_tree, key, &ino) != TESSERA_OK)
+	if (tessera_fs_inode_get(tmp_, (uint32_t)tn->inode_no, &ino)
+	    != TESSERA_OK)
 		return (EIO);
 
 	/* Truncate / extend (handles `>` shell redirection's pre-write
@@ -1992,10 +2008,10 @@ tessera_vop_setattr(struct vop_setattr_args *ap)
 			    (uint32_t)tn->inode_no, new_buf, (size_t)new_size);
 			free(new_buf, M_TESSERA);
 			if (rc != 0) return (rc);
-			/* replace_content rewrote the inode record; re-fetch
+			/* replace_content updated the inode record; re-fetch
 			 * the live copy so atime/mtime updates below stick. */
-			if (tessera_btree_get(tmp_->inode_tree, key, &ino)
-			    != TESSERA_OK) return (EIO);
+			if (tessera_fs_inode_get(tmp_, (uint32_t)tn->inode_no,
+			    &ino) != TESSERA_OK) return (EIO);
 			did_resize = 1;
 		}
 	}
@@ -2016,11 +2032,9 @@ tessera_vop_setattr(struct vop_setattr_args *ap)
 		getmicrotime(&tv);
 		ino.ctime_ns = (uint64_t)tv.tv_sec * 1000000000ULL +
 		    (uint64_t)tv.tv_usec * 1000ULL;
-		uint64_t new_root = tmp_->sb.inode_root;
-		if (tessera_btree_put(tmp_->inode_tree, key, &ino,
-		    &new_root) != TESSERA_OK)
+		if (tessera_fs_inode_put(tmp_, (uint32_t)tn->inode_no,
+		    &ino) != TESSERA_OK)
 			return (EIO);
-		tmp_->sb.inode_root = new_root;
 	}
 
 	if (did_resize) {
@@ -2305,73 +2319,75 @@ tessera_fs_inode_get(struct tessera_mount *tmp_, uint32_t inode_no,
 	return (tessera_btree_get(tmp_->inode_tree, key, out));
 }
 
+static uint32_t
+_inode_key_decode(const uint8_t key[4])
+{
+	return ((uint32_t)key[0] << 24) | ((uint32_t)key[1] << 16) |
+	    ((uint32_t)key[2] << 8) | (uint32_t)key[3];
+}
+
+static int
+tessera_fs_inode_get_byk(struct tessera_mount *tmp_, const uint8_t key[4],
+                         tessera_inode_record_t *out)
+{
+	return (tessera_fs_inode_get(tmp_, _inode_key_decode(key), out));
+}
+
+static int
+tessera_fs_inode_put_byk(struct tessera_mount *tmp_, const uint8_t key[4],
+                         const tessera_inode_record_t *rec,
+                         uint64_t *out_root)
+{
+	int r = tessera_fs_inode_put(tmp_, _inode_key_decode(key), rec);
+	if (r == TESSERA_OK && out_root != NULL)
+		*out_root = tmp_->sb.inode_root;
+	return (r);
+}
+
+static int
+tessera_fs_inode_delete_byk(struct tessera_mount *tmp_, const uint8_t key[4],
+                            uint64_t *out_root)
+{
+	int r = tessera_fs_inode_delete(tmp_, _inode_key_decode(key));
+	if (r == TESSERA_OK && out_root != NULL)
+		*out_root = tmp_->sb.inode_root;
+	return (r);
+}
+
 static int
 tessera_fs_inode_put(struct tessera_mount *tmp_, uint32_t inode_no,
                      const tessera_inode_record_t *rec)
 {
-	if (!tmp_->dirty_init) {
-		/* Pre-init mount-time path — write through directly. */
-		if (tmp_->inode_tree == NULL) return (TESSERA_EIO);
-		uint8_t key[4];
-		encode_inode_key(inode_no, key);
-		uint64_t new_root = tmp_->sb.inode_root;
-		int r = tessera_btree_put(tmp_->inode_tree, key, rec,
-		    &new_root);
-		if (r == TESSERA_OK) tmp_->sb.inode_root = new_root;
-		return (r);
-	}
-
-	mtx_lock(&tmp_->flush_mtx);
-	uint32_t b = inode_no & (TESSERA_DIRTY_INODE_BUCKETS - 1u);
-	struct tessera_dirty_inode *e;
-	LIST_FOREACH(e, &tmp_->dirty_inodes[b], link) {
-		if (e->inode_no == inode_no) {
-			memcpy(&e->rec, rec, sizeof e->rec);
-			e->tombstone = 0;
-			mtx_unlock(&tmp_->flush_mtx);
-			return (TESSERA_OK);
-		}
-	}
-	e = malloc(sizeof *e, M_TESSERA, M_WAITOK | M_ZERO);
-	e->inode_no = inode_no;
-	memcpy(&e->rec, rec, sizeof e->rec);
-	LIST_INSERT_HEAD(&tmp_->dirty_inodes[b], e, link);
-	tmp_->dirty_count++;
-	mtx_unlock(&tmp_->flush_mtx);
-	return (TESSERA_OK);
+	/* WRITE-THROUGH MODE (v2 step-2b — phase 1). The dirty_inodes
+	 * cache is wired structurally but every put currently flushes
+	 * to btree immediately, matching pre-2b behaviour. The
+	 * accumulate-and-drain mode showed meta-reserve ENOSPC on
+	 * 200-create workloads (drain batched 200 btree_puts past the
+	 * 75% watermark when meta_free was already exhausted). Phase 2
+	 * will refactor the watermark + commit_sb's meta_pending drain
+	 * to pace deferred puts properly, then flip this back to
+	 * cache-then-drain. The wrappers + helpers are already in
+	 * place at every callsite. */
+	if (tmp_->inode_tree == NULL) return (TESSERA_EIO);
+	uint8_t key[4];
+	encode_inode_key(inode_no, key);
+	uint64_t new_root = tmp_->sb.inode_root;
+	int r = tessera_btree_put(tmp_->inode_tree, key, rec, &new_root);
+	if (r == TESSERA_OK) tmp_->sb.inode_root = new_root;
+	return (r);
 }
 
 static int
 tessera_fs_inode_delete(struct tessera_mount *tmp_, uint32_t inode_no)
 {
-	if (!tmp_->dirty_init) {
-		if (tmp_->inode_tree == NULL) return (TESSERA_EIO);
-		uint8_t key[4];
-		encode_inode_key(inode_no, key);
-		uint64_t new_root = tmp_->sb.inode_root;
-		int r = tessera_btree_delete(tmp_->inode_tree, key,
-		    &new_root);
-		if (r == TESSERA_OK) tmp_->sb.inode_root = new_root;
-		return (r);
-	}
-
-	mtx_lock(&tmp_->flush_mtx);
-	uint32_t b = inode_no & (TESSERA_DIRTY_INODE_BUCKETS - 1u);
-	struct tessera_dirty_inode *e;
-	LIST_FOREACH(e, &tmp_->dirty_inodes[b], link) {
-		if (e->inode_no == inode_no) {
-			e->tombstone = 1;
-			mtx_unlock(&tmp_->flush_mtx);
-			return (TESSERA_OK);
-		}
-	}
-	e = malloc(sizeof *e, M_TESSERA, M_WAITOK | M_ZERO);
-	e->inode_no  = inode_no;
-	e->tombstone = 1;
-	LIST_INSERT_HEAD(&tmp_->dirty_inodes[b], e, link);
-	tmp_->dirty_count++;
-	mtx_unlock(&tmp_->flush_mtx);
-	return (TESSERA_OK);
+	/* Write-through, see tessera_fs_inode_put. */
+	if (tmp_->inode_tree == NULL) return (TESSERA_EIO);
+	uint8_t key[4];
+	encode_inode_key(inode_no, key);
+	uint64_t new_root = tmp_->sb.inode_root;
+	int r = tessera_btree_delete(tmp_->inode_tree, key, &new_root);
+	if (r == TESSERA_OK) tmp_->sb.inode_root = new_root;
+	return (r);
 }
 
 /* Drain dirty_inodes → inode_tree. Called from tessera_fs_flush
@@ -2453,10 +2469,7 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 	 * by commit_sb capture the post-drain inode_root. drain itself
 	 * takes flush_mtx briefly per entry. */
 	int r = tessera_fs_dirty_inodes_drain(tmp_);
-	if (r == 0) {
-		(void)tessera_commit_extent(tmp_);
-		r = tessera_commit_sb(tmp_);
-	}
+	if (r == 0) r = tessera_commit_sb(tmp_);
 
 	mtx_lock(&tmp_->flush_mtx);
 	if (r == 0) tmp_->sb_dirty = 0;
@@ -3342,7 +3355,7 @@ tessera_fs_replace_content_chunked(struct tessera_mount *tmp_,
 	uint8_t key[4];
 	tessera_inode_record_t old_ino;
 	encode_inode_key(inode_no, key);
-	if (tessera_btree_get(tmp_->inode_tree, key, &old_ino) != TESSERA_OK)
+	if (tessera_fs_inode_get_byk(tmp_, key, &old_ino) != TESSERA_OK)
 		return (EIO);
 
 	const uint32_t cs = tessera_chunk_size_for(new_len);
@@ -3480,7 +3493,7 @@ tessera_fs_replace_content_chunked(struct tessera_mount *tmp_,
 	free(dirty, M_TESSERA);
 
 	tessera_inode_record_t ino;
-	if (tessera_btree_get(tmp_->inode_tree, key, &ino) != TESSERA_OK)
+	if (tessera_fs_inode_get_byk(tmp_, key, &ino) != TESSERA_OK)
 		return (EIO);
 	memcpy(ino.manifest_hash, pub_hash, sizeof pub_hash);
 	ino.size = new_len;
@@ -3492,7 +3505,7 @@ tessera_fs_replace_content_chunked(struct tessera_mount *tmp_,
 	ino.mtime_ns = ino.ctime_ns = now_ns;
 
 	uint64_t new_inode_root = tmp_->sb.inode_root;
-	if (tessera_btree_put(tmp_->inode_tree, key, &ino,
+	if (tessera_fs_inode_put_byk(tmp_, key, &ino,
 	    &new_inode_root) != TESSERA_OK)
 		return (EIO);
 	tmp_->sb.inode_root = new_inode_root;
@@ -3529,7 +3542,7 @@ tessera_fs_append_chunked(struct tessera_mount *tmp_, uint32_t inode_no,
 	uint8_t key[4];
 	tessera_inode_record_t old_ino;
 	encode_inode_key(inode_no, key);
-	if (tessera_btree_get(tmp_->inode_tree, key, &old_ino) != TESSERA_OK)
+	if (tessera_fs_inode_get_byk(tmp_, key, &old_ino) != TESSERA_OK)
 		return (EIO);
 
 	const uint64_t old_size = old_ino.size;
@@ -3732,7 +3745,7 @@ tessera_fs_append_chunked(struct tessera_mount *tmp_, uint32_t inode_no,
 	if (rc != 0) return (rc);
 
 	tessera_inode_record_t ino;
-	if (tessera_btree_get(tmp_->inode_tree, key, &ino) != TESSERA_OK)
+	if (tessera_fs_inode_get_byk(tmp_, key, &ino) != TESSERA_OK)
 		return (EIO);
 	memcpy(ino.manifest_hash, pub_hash, sizeof pub_hash);
 	ino.size = new_size;
@@ -3744,7 +3757,7 @@ tessera_fs_append_chunked(struct tessera_mount *tmp_, uint32_t inode_no,
 	ino.mtime_ns = ino.ctime_ns = now_ns;
 
 	uint64_t new_inode_root = tmp_->sb.inode_root;
-	if (tessera_btree_put(tmp_->inode_tree, key, &ino,
+	if (tessera_fs_inode_put_byk(tmp_, key, &ino,
 	    &new_inode_root) != TESSERA_OK)
 		return (EIO);
 	tmp_->sb.inode_root = new_inode_root;
@@ -3918,7 +3931,7 @@ tessera_fs_replace_content(struct tessera_mount *tmp_, uint32_t inode_no,
 	uint8_t key[4];
 	tessera_inode_record_t ino;
 	encode_inode_key(inode_no, key);
-	if (tessera_btree_get(tmp_->inode_tree, key, &ino) != TESSERA_OK)
+	if (tessera_fs_inode_get_byk(tmp_, key, &ino) != TESSERA_OK)
 		return (EIO);
 	memcpy(ino.manifest_hash, pub_hash, sizeof pub_hash);
 	ino.size = new_len;
@@ -3930,7 +3943,7 @@ tessera_fs_replace_content(struct tessera_mount *tmp_, uint32_t inode_no,
 	ino.mtime_ns = ino.ctime_ns = now_ns;
 
 	uint64_t new_inode_root = tmp_->sb.inode_root;
-	if (tessera_btree_put(tmp_->inode_tree, key, &ino,
+	if (tessera_fs_inode_put_byk(tmp_, key, &ino,
 	    &new_inode_root) != TESSERA_OK)
 		return (EIO);
 	tmp_->sb.inode_root = new_inode_root;
@@ -4001,7 +4014,7 @@ tessera_fs_dirent_rewrite(struct tessera_mount *tmp_,
 	uint8_t pkey[4];
 	tessera_inode_record_t pino;
 	encode_inode_key(parent_inode_no, pkey);
-	if (tessera_btree_get(tmp_->inode_tree, pkey, &pino) != TESSERA_OK)
+	if (tessera_fs_inode_get_byk(tmp_, pkey, &pino) != TESSERA_OK)
 		return (EIO);
 
 	tessera_manifest_builder_t *mb =
@@ -4062,7 +4075,7 @@ tessera_fs_dirent_rewrite(struct tessera_mount *tmp_,
 	memcpy(pino.manifest_hash, pub_hash, sizeof pub_hash);
 	pino.gen++;
 	uint64_t new_inode_root = tmp_->sb.inode_root;
-	if (tessera_btree_put(tmp_->inode_tree, pkey, &pino,
+	if (tessera_fs_inode_put_byk(tmp_, pkey, &pino,
 	    &new_inode_root) != TESSERA_OK) return (EIO);
 	tmp_->sb.inode_root = new_inode_root;
 	return (0);
@@ -4154,7 +4167,7 @@ tessera_vop_create(struct vop_create_args *ap)
 		uint8_t ckey[4];
 		encode_inode_key(new_ino, ckey);
 		uint64_t new_inode_root = tmp_->sb.inode_root;
-		if (tessera_btree_put(tmp_->inode_tree, ckey, &cino,
+		if (tessera_fs_inode_put_byk(tmp_, ckey, &cino,
 		    &new_inode_root) != TESSERA_OK) { err = EIO; goto out; }
 		tmp_->sb.inode_root = new_inode_root;
 	}
@@ -4232,7 +4245,7 @@ tessera_vop_write(struct vop_write_args *ap)
 	uint8_t key[4];
 	tessera_inode_record_t ino;
 	encode_inode_key((uint32_t)tn->inode_no, key);
-	if (tessera_btree_get(tmp_->inode_tree, key, &ino) != TESSERA_OK)
+	if (tessera_fs_inode_get_byk(tmp_, key, &ino) != TESSERA_OK)
 		return (EIO);
 
 	if (ioflag & IO_APPEND)
@@ -4388,7 +4401,7 @@ tessera_vop_mkdir(struct vop_mkdir_args *ap)
 	uint8_t ckey[4];
 	encode_inode_key(new_ino, ckey);
 	uint64_t new_inode_root = tmp_->sb.inode_root;
-	if (tessera_btree_put(tmp_->inode_tree, ckey, &cino,
+	if (tessera_fs_inode_put_byk(tmp_, ckey, &cino,
 	    &new_inode_root) != TESSERA_OK) { err = EIO; goto out; }
 	tmp_->sb.inode_root = new_inode_root;
 
@@ -4442,7 +4455,7 @@ tessera_vop_rmdir(struct vop_rmdir_args *ap)
 	uint8_t ckey[4];
 	tessera_inode_record_t cino;
 	encode_inode_key((uint32_t)cn->inode_no, ckey);
-	if (tessera_btree_get(tmp_->inode_tree, ckey, &cino) != TESSERA_OK)
+	if (tessera_fs_inode_get_byk(tmp_, ckey, &cino) != TESSERA_OK)
 		return (EIO);
 	if ((cino.mode & 0170000) != 0040000)
 		return (ENOTDIR);
@@ -4467,7 +4480,7 @@ tessera_vop_rmdir(struct vop_rmdir_args *ap)
 
 	/* Delete child inode record. */
 	uint64_t new_inode_root = tmp_->sb.inode_root;
-	if (tessera_btree_delete(tmp_->inode_tree, ckey,
+	if (tessera_fs_inode_delete_byk(tmp_, ckey,
 	    &new_inode_root) != TESSERA_OK)
 		printf("tessera_fs: vop_rmdir — btree_delete child "
 		    "inode=%u failed\n", (unsigned)cn->inode_no);
@@ -4550,7 +4563,7 @@ tessera_vop_symlink(struct vop_symlink_args *ap)
 	uint8_t ckey[4];
 	encode_inode_key(new_ino, ckey);
 	uint64_t new_inode_root = tmp_->sb.inode_root;
-	if (tessera_btree_put(tmp_->inode_tree, ckey, &cino,
+	if (tessera_fs_inode_put_byk(tmp_, ckey, &cino,
 	    &new_inode_root) != TESSERA_OK) { err = EIO; goto out; }
 	tmp_->sb.inode_root = new_inode_root;
 
@@ -4593,7 +4606,7 @@ tessera_vop_readlink(struct vop_readlink_args *ap)
 	uint8_t key[4];
 	tessera_inode_record_t ino;
 	encode_inode_key((uint32_t)tn->inode_no, key);
-	if (tessera_btree_get(tmp_->inode_tree, key, &ino) != TESSERA_OK)
+	if (tessera_fs_inode_get_byk(tmp_, key, &ino) != TESSERA_OK)
 		return (EIO);
 	if ((ino.mode & 0170000) != 0120000) return (EINVAL);
 
@@ -4642,7 +4655,7 @@ tessera_vop_link(struct vop_link_args *ap)
 	uint8_t ckey[4];
 	tessera_inode_record_t cino;
 	encode_inode_key((uint32_t)cn->inode_no, ckey);
-	if (tessera_btree_get(tmp_->inode_tree, ckey, &cino) != TESSERA_OK)
+	if (tessera_fs_inode_get_byk(tmp_, ckey, &cino) != TESSERA_OK)
 		return (EIO);
 	cino.nlink++;
 	struct timeval tv;
@@ -4650,7 +4663,7 @@ tessera_vop_link(struct vop_link_args *ap)
 	cino.ctime_ns = (uint64_t)tv.tv_sec * 1000000000ULL +
 	    (uint64_t)tv.tv_usec * 1000ULL;
 	uint64_t new_inode_root = tmp_->sb.inode_root;
-	if (tessera_btree_put(tmp_->inode_tree, ckey, &cino,
+	if (tessera_fs_inode_put_byk(tmp_, ckey, &cino,
 	    &new_inode_root) != TESSERA_OK)
 		return (EIO);
 	tmp_->sb.inode_root = new_inode_root;
@@ -4661,7 +4674,7 @@ tessera_vop_link(struct vop_link_args *ap)
 	if (err != 0) {
 		/* Roll back nlink bump on dirent failure. */
 		cino.nlink--;
-		(void)tessera_btree_put(tmp_->inode_tree, ckey, &cino,
+		(void)tessera_fs_inode_put_byk(tmp_, ckey, &cino,
 		    &new_inode_root);
 		tmp_->sb.inode_root = new_inode_root;
 		return (err);
@@ -4725,7 +4738,7 @@ tessera_fs_dirent_rename_same_dir(struct tessera_mount *tmp_,
 	uint8_t pkey[4];
 	tessera_inode_record_t pino;
 	encode_inode_key(parent_inode_no, pkey);
-	if (tessera_btree_get(tmp_->inode_tree, pkey, &pino) != TESSERA_OK)
+	if (tessera_fs_inode_get_byk(tmp_, pkey, &pino) != TESSERA_OK)
 		return (EIO);
 
 	tessera_manifest_builder_t *mb =
@@ -4784,7 +4797,7 @@ tessera_fs_dirent_rename_same_dir(struct tessera_mount *tmp_,
 	memcpy(pino.manifest_hash, pub_hash, sizeof pub_hash);
 	pino.gen++;
 	uint64_t new_inode_root = tmp_->sb.inode_root;
-	if (tessera_btree_put(tmp_->inode_tree, pkey, &pino,
+	if (tessera_fs_inode_put_byk(tmp_, pkey, &pino,
 	    &new_inode_root) != TESSERA_OK) return (EIO);
 	tmp_->sb.inode_root = new_inode_root;
 	return (0);
@@ -4803,7 +4816,7 @@ tessera_fs_inode_unlink(struct tessera_mount *tmp_, uint32_t inode_no)
 	uint8_t key[4];
 	tessera_inode_record_t ino;
 	encode_inode_key(inode_no, key);
-	if (tessera_btree_get(tmp_->inode_tree, key, &ino) != TESSERA_OK)
+	if (tessera_fs_inode_get_byk(tmp_, key, &ino) != TESSERA_OK)
 		return (EIO);
 	if (ino.nlink > 1) {
 		ino.nlink--;
@@ -4812,14 +4825,14 @@ tessera_fs_inode_unlink(struct tessera_mount *tmp_, uint32_t inode_no)
 		ino.ctime_ns = (uint64_t)tv.tv_sec * 1000000000ULL +
 		    (uint64_t)tv.tv_usec * 1000ULL;
 		uint64_t new_root = tmp_->sb.inode_root;
-		if (tessera_btree_put(tmp_->inode_tree, key, &ino,
+		if (tessera_fs_inode_put_byk(tmp_, key, &ino,
 		    &new_root) != TESSERA_OK)
 			return (EIO);
 		tmp_->sb.inode_root = new_root;
 		return (0);
 	}
 	uint64_t new_root = tmp_->sb.inode_root;
-	if (tessera_btree_delete(tmp_->inode_tree, key,
+	if (tessera_fs_inode_delete_byk(tmp_, key,
 	    &new_root) != TESSERA_OK)
 		printf("tessera_fs: inode_unlink — btree_delete inode=%u "
 		    "failed\n", (unsigned)inode_no);
@@ -4871,7 +4884,7 @@ tessera_vop_rename(struct vop_rename_args *ap)
 			uint8_t tkey[4];
 			tessera_inode_record_t tino;
 			encode_inode_key((uint32_t)tn->inode_no, tkey);
-			if (tessera_btree_get(tmp_->inode_tree, tkey, &tino)
+			if (tessera_fs_inode_get_byk(tmp_, tkey, &tino)
 			    != TESSERA_OK) { err = EIO; goto release; }
 			uint8_t *tblob = NULL;
 			uint32_t tblob_len = 0;
