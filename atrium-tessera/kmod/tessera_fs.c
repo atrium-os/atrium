@@ -320,6 +320,11 @@ struct tessera_pending_manifest {
 	tessera_hash_t  hash;
 	uint8_t        *bytes;
 	uint32_t        len;
+	/* Logical owner: the inode whose manifest_hash currently
+	 * references this manifest. Future publish_manifest calls with
+	 * the same owner drop this entry (its bytes are unreferenced
+	 * once the inode's manifest_hash is updated). 0 = untagged. */
+	uint32_t        owner_inode_no;
 };
 static int tessera_fs_inode_get(struct tessera_mount *tmp_,
                                 uint32_t inode_no,
@@ -352,7 +357,8 @@ static int tessera_fs_dirty_inodes_drain(struct tessera_mount *tmp_);
 static int tessera_fs_pending_manifest_put(struct tessera_mount *tmp_,
                                            const tessera_hash_t hash,
                                            const uint8_t *bytes,
-                                           uint32_t len);
+                                           uint32_t len,
+                                           uint32_t owner_inode_no);
 static int tessera_fs_pending_manifest_lookup(struct tessera_mount *tmp_,
                                               const tessera_hash_t hash,
                                               uint8_t **out_bytes,
@@ -365,6 +371,11 @@ static int tessera_fs_publish_manifest_to_disk(struct tessera_mount *tmp_,
                                                const uint8_t *manifest_bytes,
                                                size_t mlen,
                                                const tessera_hash_t hash);
+static int tessera_fs_publish_manifest_owned(struct tessera_mount *tmp_,
+                                             const uint8_t *manifest_bytes,
+                                             size_t mlen,
+                                             tessera_hash_t out_hash,
+                                             uint32_t owner_inode_no);
 /* Threshold for forcing a drain: cap RAM held in pending. ~1 MiB
  * default. Past this, mark_dirty triggers a flush. */
 #define TESSERA_PENDING_MANIFEST_BYTES_MAX  (1u * 1024u * 1024u)
@@ -385,6 +396,7 @@ static int tessera_fs_read_into_uio(struct tessera_mount *tmp_,
                                     tessera_manifest_parser_t *p,
                                     struct uio *uio);
 static int tessera_fs_publish_directory(struct tessera_mount *tmp_,
+                                         uint32_t owner_inode_no,
                                          const uint8_t *flat_mft,
                                          size_t flat_mlen,
                                          tessera_hash_t out_hash);
@@ -2610,7 +2622,8 @@ tessera_fs_dirty_inodes_drain(struct tessera_mount *tmp_)
 static int
 tessera_fs_pending_manifest_put(struct tessera_mount *tmp_,
                                 const tessera_hash_t hash,
-                                const uint8_t *bytes, uint32_t len)
+                                const uint8_t *bytes, uint32_t len,
+                                uint32_t owner_inode_no)
 {
 	if (!tmp_->dirty_init) return (TESSERA_EIO);
 
@@ -2620,8 +2633,9 @@ tessera_fs_pending_manifest_put(struct tessera_mount *tmp_,
 	struct tessera_pending_manifest *e =
 	    malloc(sizeof *e, M_TESSERA, M_WAITOK | M_ZERO);
 	memcpy(e->hash, hash, sizeof e->hash);
-	e->bytes = buf;
-	e->len   = len;
+	e->bytes          = buf;
+	e->len            = len;
+	e->owner_inode_no = owner_inode_no;
 
 	mtx_lock(&tmp_->flush_mtx);
 	uint32_t b = hash[0];
@@ -2637,6 +2651,31 @@ tessera_fs_pending_manifest_put(struct tessera_mount *tmp_,
 			return (TESSERA_OK);
 		}
 	}
+
+	/* Supersession: if the new manifest is tagged with an
+	 * owner_inode_no, drop any older pending entry that was tagged
+	 * for the same owner. Its bytes are unreferenced now that the
+	 * inode's manifest_hash will point at our new hash. Walk every
+	 * bucket — owner_inode_no doesn't determine bucket placement
+	 * (hash[0] does). */
+	if (owner_inode_no != 0) {
+		for (uint32_t bb = 0;
+		    bb < TESSERA_PENDING_MANIFEST_BUCKETS; bb++) {
+			struct tessera_pending_manifest *prev, *tmp_e;
+			LIST_FOREACH_SAFE(prev,
+			    &tmp_->pending_manifests[bb], link, tmp_e) {
+				if (prev->owner_inode_no == owner_inode_no) {
+					LIST_REMOVE(prev, link);
+					tmp_->pending_manifest_count--;
+					tmp_->pending_manifest_bytes -=
+					    prev->len;
+					free(prev->bytes, M_TESSERA);
+					free(prev, M_TESSERA);
+				}
+			}
+		}
+	}
+
 	LIST_INSERT_HEAD(&tmp_->pending_manifests[b], e, link);
 	tmp_->pending_manifest_count++;
 	tmp_->pending_manifest_bytes += len;
@@ -2759,9 +2798,16 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 	 * takes flush_mtx briefly per entry. */
 	/* Drain pending manifests FIRST — inode_tree records reference
 	 * their hashes, so the packs must hit disk before drain →
-	 * btree_put runs. Then drain dirty inodes. Then commit_sb. */
+	 * btree_put runs. Then drain dirty inodes. Each drain consumes
+	 * extent allocations (publish_manifest_to_disk → extent_alloc;
+	 * btree_put → meta-reserve). commit_extent flushes the
+	 * in-memory free-extent allocator's deltas to a fresh on-disk
+	 * tree BEFORE commit_sb writes the SB sectors — without it,
+	 * sb.free_extent_root would point at a stale view that misses
+	 * sectors allocated during this drain. */
 	int r = tessera_fs_pending_manifests_drain(tmp_);
 	if (r == 0) r = tessera_fs_dirty_inodes_drain(tmp_);
+	if (r == 0) (void)tessera_commit_extent(tmp_);
 	if (r == 0) r = tessera_commit_sb(tmp_);
 
 	mtx_lock(&tmp_->flush_mtx);
@@ -3179,9 +3225,10 @@ next_p:
  * (since we allocated data-zone sectors), and tessera_commit_sb.
  */
 static int
-tessera_fs_publish_manifest(struct tessera_mount *tmp_,
-                            const uint8_t *manifest_bytes, size_t mlen,
-                            tessera_hash_t out_hash)
+tessera_fs_publish_manifest_owned(struct tessera_mount *tmp_,
+                                  const uint8_t *manifest_bytes, size_t mlen,
+                                  tessera_hash_t out_hash,
+                                  uint32_t owner_inode_no)
 {
 	if (tmp_->pack_registry_tree == NULL || tmp_->extent_alloc == NULL)
 		return (EROFS);
@@ -3191,9 +3238,7 @@ tessera_fs_publish_manifest(struct tessera_mount *tmp_,
 	/* Publish-cache shortcut (publish_dedup): pack_id is derived
 	 * from the manifest hash, so identical content lands at the same
 	 * pack_id. If the registry already contains an entry, the pack
-	 * is on disk; nothing to do. Catches repeated cp + chmod-revert
-	 * patterns for free. Also short-circuits if the manifest is
-	 * already in the in-memory pending cache from this flush window. */
+	 * is on disk; nothing to do. */
 	{
 		uint8_t pack_id_local[16];
 		memcpy(pack_id_local, out_hash, 16);
@@ -3208,15 +3253,29 @@ tessera_fs_publish_manifest(struct tessera_mount *tmp_,
 	/* v2 step-2b extension: defer the disk write. Cache the bytes
 	 * keyed by hash; fetch_blob consults the cache before scanning
 	 * the registry. Drained at flush time. Skipped (write-through)
-	 * when the cache isn't initialised — mount-time GC etc. */
+	 * when the cache isn't initialised — mount-time GC etc.
+	 * owner_inode_no enables supersession: subsequent publishes for
+	 * the same owner drop the older pending bytes. */
 	if (tmp_->dirty_init &&
 	    tmp_->pending_manifest_bytes <
 	        TESSERA_PENDING_MANIFEST_BYTES_MAX) {
 		return (tessera_fs_pending_manifest_put(tmp_, out_hash,
-		    manifest_bytes, (uint32_t)mlen));
+		    manifest_bytes, (uint32_t)mlen, owner_inode_no));
 	}
 	return (tessera_fs_publish_manifest_to_disk(tmp_, manifest_bytes,
 	    mlen, out_hash));
+}
+
+/* Original signature — caller has no logical-owner context (e.g.
+ * bucket manifests, internal helpers). Equivalent to
+ * publish_manifest_owned(..., 0). */
+static int
+tessera_fs_publish_manifest(struct tessera_mount *tmp_,
+                            const uint8_t *manifest_bytes, size_t mlen,
+                            tessera_hash_t out_hash)
+{
+	return (tessera_fs_publish_manifest_owned(tmp_, manifest_bytes,
+	    mlen, out_hash, /*owner_inode_no=*/0));
 }
 
 static int
@@ -3477,12 +3536,13 @@ tessera_fs_dir_walk(struct tessera_mount *tmp_,
  * hash via out_hash. */
 static int
 tessera_fs_publish_directory(struct tessera_mount *tmp_,
+                             uint32_t owner_inode_no,
                              const uint8_t *flat_mft, size_t flat_mlen,
                              tessera_hash_t out_hash)
 {
 	if (flat_mlen <= TESSERA_DIR_PROMOTE_THRESHOLD) {
-		return (tessera_fs_publish_manifest(tmp_, flat_mft,
-		    flat_mlen, out_hash));
+		return (tessera_fs_publish_manifest_owned(tmp_, flat_mft,
+		    flat_mlen, out_hash, owner_inode_no));
 	}
 
 	/* Promote. Walk the flat body once, compute each entry's hash
@@ -3612,7 +3672,11 @@ tessera_fs_publish_directory(struct tessera_mount *tmp_,
 		return (EIO);
 	}
 	tessera_manifest_free(outer);
-	int rc = tessera_fs_publish_manifest(tmp_, obuf, omlen, out_hash);
+	/* Outer DIRECTORY_2L is owned by the parent inode; supersession
+	 * fires when the next dir mutation rewrites it. Inner buckets
+	 * stay untagged (multiple buckets per dir). */
+	int rc = tessera_fs_publish_manifest_owned(tmp_, obuf, omlen,
+	    out_hash, owner_inode_no);
 	free(obuf, M_TESSERA);
 	return (rc);
 }
@@ -4387,10 +4451,12 @@ tessera_fs_dirent_rewrite(struct tessera_mount *tmp_,
 	}
 	tessera_manifest_free(mb);
 
-	/* Auto-promotes to DIRECTORY_2L if mlen exceeds the threshold. */
+	/* Auto-promotes to DIRECTORY_2L if mlen exceeds the threshold.
+	 * parent_inode_no tags the cached entry so subsequent dirent
+	 * mutations on the same parent supersede the old bytes. */
 	tessera_hash_t pub_hash;
-	if (tessera_fs_publish_directory(tmp_, new_mft, mlen,
-	    pub_hash) != 0) {
+	if (tessera_fs_publish_directory(tmp_, parent_inode_no,
+	    new_mft, mlen, pub_hash) != 0) {
 		free(new_mft, M_TESSERA);
 		return (EIO);
 	}
@@ -5111,8 +5177,8 @@ tessera_fs_dirent_rename_same_dir(struct tessera_mount *tmp_,
 	tessera_manifest_free(mb);
 
 	tessera_hash_t pub_hash;
-	if (tessera_fs_publish_directory(tmp_, new_mft, mlen,
-	    pub_hash) != 0) {
+	if (tessera_fs_publish_directory(tmp_, parent_inode_no,
+	    new_mft, mlen, pub_hash) != 0) {
 		free(new_mft, M_TESSERA);
 		return (EIO);
 	}
