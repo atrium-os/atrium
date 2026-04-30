@@ -40,6 +40,8 @@
 #include <sys/priv.h>
 #include <sys/fcntl.h>
 #include <sys/callout.h>
+#include <sys/lock.h>
+#include <sys/mutex.h>
 #include <sys/taskqueue.h>
 #include <geom/geom.h>
 #include <geom/geom_vfs.h>
@@ -159,6 +161,14 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, append_fast_ok,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, append_fast_fallback,
     CTLFLAG_RD, &tessera_stat_append_fast_fallback, 0,
     "Append fast-path fallbacks to slow rewrite path");
+
+/* fsync group commit (v2 polish): how many times a flush caller
+ * waited on an already-in-flight commit instead of triggering a new
+ * one. Each wait avoids one full commit_sb (5 sector writes). */
+static unsigned long tessera_stat_fsync_group_wait = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, fsync_group_wait,
+    CTLFLAG_RD, &tessera_stat_fsync_group_wait, 0,
+    "fsync calls coalesced onto an already-in-flight commit");
 
 /* ── kmod block_io shim ──────────────────────────────────────── */
 
@@ -315,6 +325,16 @@ struct tessera_mount {
 	int                       flush_unmounting;  /* don't rearm callout */
 	struct callout            flush_co;
 	struct task               flush_task;
+
+	/* v2 polish: fsync group-commit. Multiple processes calling
+	 * fsync (or vop_fsync via the deferred-flush callout) coalesce
+	 * onto a single in-flight commit_sb instead of each triggering
+	 * its own. flush_mtx protects flush_in_progress + sb_dirty
+	 * coordination; latecomers msleep on &flush_in_progress and
+	 * wakeup when the active commit clears it. */
+	struct mtx                flush_mtx;
+	int                       flush_mtx_init;
+	int                       flush_in_progress;
 
 	/* v2 snapshots slice 2: read-only historical mount via
 	 * `tessera.gen=N`. When 1, mountfs overrode sb roots from a
@@ -595,6 +615,8 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen)
 	 * to be cancelled by unmount even if the FS never sees a write. */
 	callout_init(&tmp_->flush_co, 1);
 	TASK_INIT(&tmp_->flush_task, 0, tessera_fs_flush_task, tmp_);
+	mtx_init(&tmp_->flush_mtx, "tess_flush", NULL, MTX_DEF);
+	tmp_->flush_mtx_init = 1;
 	tmp_->flush_co_init = 1;
 
 	/* Open the journal and run replay BEFORE we open the trees, so a
@@ -995,6 +1017,10 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 			callout_drain(&tmp_->flush_co);
 			taskqueue_drain(taskqueue_thread, &tmp_->flush_task);
 			(void)tessera_fs_flush(tmp_);
+		}
+		if (tmp_->flush_mtx_init) {
+			mtx_destroy(&tmp_->flush_mtx);
+			tmp_->flush_mtx_init = 0;
 		}
 		if (tmp_->journal != NULL)
 			tessera_journal_close(tmp_->journal);
@@ -2007,9 +2033,46 @@ tessera_fs_mark_dirty(struct tessera_mount *tmp_)
 static int
 tessera_fs_flush(struct tessera_mount *tmp_)
 {
-	if (!tmp_->sb_dirty) return (0);
+	/* Pre-mtx-init paths (mount-time GC during mountfs) get the
+	 * unsynchronised behaviour. */
+	if (!tmp_->flush_mtx_init) {
+		if (!tmp_->sb_dirty) return (0);
+		int r = tessera_commit_sb(tmp_);
+		if (r == 0) tmp_->sb_dirty = 0;
+		return (r);
+	}
+
+	mtx_lock(&tmp_->flush_mtx);
+	for (;;) {
+		if (!tmp_->sb_dirty) {
+			mtx_unlock(&tmp_->flush_mtx);
+			return (0);
+		}
+		if (tmp_->flush_in_progress) {
+			/* Another thread is already committing; wait for
+			 * it. When we wake we re-check sb_dirty: if it's
+			 * cleared the active commit covered our changes
+			 * (any vop that set sb_dirty completed before we
+			 * called fsync), so we're done. If sb_dirty is
+			 * still 1 our writes happened post-flush — loop
+			 * to start our own commit. */
+			tessera_stat_fsync_group_wait++;
+			(void)msleep(&tmp_->flush_in_progress,
+			    &tmp_->flush_mtx, PRIBIO, "tessflsh", 0);
+			continue;
+		}
+		tmp_->flush_in_progress = 1;
+		break;
+	}
+	mtx_unlock(&tmp_->flush_mtx);
+
 	int r = tessera_commit_sb(tmp_);
+
+	mtx_lock(&tmp_->flush_mtx);
 	if (r == 0) tmp_->sb_dirty = 0;
+	tmp_->flush_in_progress = 0;
+	wakeup(&tmp_->flush_in_progress);
+	mtx_unlock(&tmp_->flush_mtx);
 	return (r);
 }
 
