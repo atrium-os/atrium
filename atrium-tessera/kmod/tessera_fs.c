@@ -170,6 +170,13 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, fsync_group_wait,
     CTLFLAG_RD, &tessera_stat_fsync_group_wait, 0,
     "fsync calls coalesced onto an already-in-flight commit");
 
+/* v2 step-2b: total dirty inodes drained since module load.
+ * High value vs sb_commits = effective batching. */
+static unsigned long tessera_stat_dirty_drained = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, dirty_drained,
+    CTLFLAG_RD, &tessera_stat_dirty_drained, 0,
+    "Cumulative dirty inodes drained across all flushes");
+
 /* ── kmod block_io shim ──────────────────────────────────────── */
 
 /* tessera-core's primitives talk to "disk" via tessera_block_io_t.
@@ -2270,20 +2277,25 @@ tessera_fs_mark_dirty(struct tessera_mount *tmp_)
 	}
 
 	/*
-	 * Meta-reserve pressure trigger. Each per-op btree COW consumes
-	 * meta-reserve sectors; meta_pending only drains to meta_free
-	 * inside commit_sb's success path (round 7-step3). Deferring SB
-	 * commits indefinitely would walk the bump pointer to ENOSPC in
-	 * a few hundred touches. When usage crosses 75%, flush
-	 * synchronously to drain pending. The flush itself COWs one
-	 * more level so we leave headroom below 100% for that.
+	 * Pressure triggers — force flush when:
+	 *   1. meta-reserve usage > 50% (was 75% before step-2b's
+	 *      dirty-inode batching; tightened so drain has headroom
+	 *      for its own btree_puts).
+	 *   2. dirty_count > 64 — bounds per-flush drain work and
+	 *      meta-reserve burst at drain time. Keeps the
+	 *      200-create-into-one-dir workload from accumulating
+	 *      a full meta-reserve's worth of deferred btree_puts.
 	 */
+	if (tmp_->dirty_init && tmp_->dirty_count > 64u) {
+		(void)tessera_fs_flush(tmp_);
+		return;
+	}
 	const uint64_t used = tmp_->sb.meta_reserve_bump
 	    - tmp_->sb.meta_reserve_start;
 	const uint64_t cap  = tmp_->sb.meta_reserve_length;
 	const uint64_t free = (uint64_t)tmp_->meta_free_count;
 	if (cap > 0 && (used > free) &&
-	    (used - free) * 4 >= cap * 3) {
+	    (used - free) * 2 >= cap) {
 		(void)tessera_fs_flush(tmp_);
 	}
 }
@@ -2358,74 +2370,159 @@ static int
 tessera_fs_inode_put(struct tessera_mount *tmp_, uint32_t inode_no,
                      const tessera_inode_record_t *rec)
 {
-	/* WRITE-THROUGH MODE (v2 step-2b — phase 1). The dirty_inodes
-	 * cache is wired structurally but every put currently flushes
-	 * to btree immediately, matching pre-2b behaviour. The
-	 * accumulate-and-drain mode showed meta-reserve ENOSPC on
-	 * 200-create workloads (drain batched 200 btree_puts past the
-	 * 75% watermark when meta_free was already exhausted). Phase 2
-	 * will refactor the watermark + commit_sb's meta_pending drain
-	 * to pace deferred puts properly, then flip this back to
-	 * cache-then-drain. The wrappers + helpers are already in
-	 * place at every callsite. */
-	if (tmp_->inode_tree == NULL) return (TESSERA_EIO);
-	uint8_t key[4];
-	encode_inode_key(inode_no, key);
-	uint64_t new_root = tmp_->sb.inode_root;
-	int r = tessera_btree_put(tmp_->inode_tree, key, rec, &new_root);
-	if (r == TESSERA_OK) tmp_->sb.inode_root = new_root;
-	return (r);
+	if (!tmp_->dirty_init) {
+		/* Pre-init mount-time path — write through directly. */
+		if (tmp_->inode_tree == NULL) return (TESSERA_EIO);
+		uint8_t key[4];
+		encode_inode_key(inode_no, key);
+		uint64_t new_root = tmp_->sb.inode_root;
+		int r = tessera_btree_put(tmp_->inode_tree, key, rec,
+		    &new_root);
+		if (r == TESSERA_OK) tmp_->sb.inode_root = new_root;
+		return (r);
+	}
+
+	mtx_lock(&tmp_->flush_mtx);
+	uint32_t b = inode_no & (TESSERA_DIRTY_INODE_BUCKETS - 1u);
+	struct tessera_dirty_inode *e;
+	LIST_FOREACH(e, &tmp_->dirty_inodes[b], link) {
+		if (e->inode_no == inode_no) {
+			memcpy(&e->rec, rec, sizeof e->rec);
+			e->tombstone = 0;
+			mtx_unlock(&tmp_->flush_mtx);
+			return (TESSERA_OK);
+		}
+	}
+	mtx_unlock(&tmp_->flush_mtx);
+
+	/* malloc(M_WAITOK) outside the mutex — never sleep with mtx held. */
+	e = malloc(sizeof *e, M_TESSERA, M_WAITOK | M_ZERO);
+	e->inode_no = inode_no;
+	memcpy(&e->rec, rec, sizeof e->rec);
+
+	mtx_lock(&tmp_->flush_mtx);
+	/* Re-check: another thread might have raced and inserted while
+	 * we were allocating. Merge if so. */
+	struct tessera_dirty_inode *existing;
+	LIST_FOREACH(existing, &tmp_->dirty_inodes[b], link) {
+		if (existing->inode_no == inode_no) {
+			memcpy(&existing->rec, rec, sizeof existing->rec);
+			existing->tombstone = 0;
+			mtx_unlock(&tmp_->flush_mtx);
+			free(e, M_TESSERA);
+			return (TESSERA_OK);
+		}
+	}
+	LIST_INSERT_HEAD(&tmp_->dirty_inodes[b], e, link);
+	tmp_->dirty_count++;
+	mtx_unlock(&tmp_->flush_mtx);
+	return (TESSERA_OK);
 }
 
 static int
 tessera_fs_inode_delete(struct tessera_mount *tmp_, uint32_t inode_no)
 {
-	/* Write-through, see tessera_fs_inode_put. */
-	if (tmp_->inode_tree == NULL) return (TESSERA_EIO);
-	uint8_t key[4];
-	encode_inode_key(inode_no, key);
-	uint64_t new_root = tmp_->sb.inode_root;
-	int r = tessera_btree_delete(tmp_->inode_tree, key, &new_root);
-	if (r == TESSERA_OK) tmp_->sb.inode_root = new_root;
-	return (r);
+	if (!tmp_->dirty_init) {
+		if (tmp_->inode_tree == NULL) return (TESSERA_EIO);
+		uint8_t key[4];
+		encode_inode_key(inode_no, key);
+		uint64_t new_root = tmp_->sb.inode_root;
+		int r = tessera_btree_delete(tmp_->inode_tree, key,
+		    &new_root);
+		if (r == TESSERA_OK) tmp_->sb.inode_root = new_root;
+		return (r);
+	}
+
+	mtx_lock(&tmp_->flush_mtx);
+	uint32_t b = inode_no & (TESSERA_DIRTY_INODE_BUCKETS - 1u);
+	struct tessera_dirty_inode *e;
+	LIST_FOREACH(e, &tmp_->dirty_inodes[b], link) {
+		if (e->inode_no == inode_no) {
+			e->tombstone = 1;
+			mtx_unlock(&tmp_->flush_mtx);
+			return (TESSERA_OK);
+		}
+	}
+	mtx_unlock(&tmp_->flush_mtx);
+
+	e = malloc(sizeof *e, M_TESSERA, M_WAITOK | M_ZERO);
+	e->inode_no  = inode_no;
+	e->tombstone = 1;
+
+	mtx_lock(&tmp_->flush_mtx);
+	struct tessera_dirty_inode *existing;
+	LIST_FOREACH(existing, &tmp_->dirty_inodes[b], link) {
+		if (existing->inode_no == inode_no) {
+			existing->tombstone = 1;
+			mtx_unlock(&tmp_->flush_mtx);
+			free(e, M_TESSERA);
+			return (TESSERA_OK);
+		}
+	}
+	LIST_INSERT_HEAD(&tmp_->dirty_inodes[b], e, link);
+	tmp_->dirty_count++;
+	mtx_unlock(&tmp_->flush_mtx);
+	return (TESSERA_OK);
 }
 
-/* Drain dirty_inodes → inode_tree. Called from tessera_fs_flush
- * before commit_sb, so the SB write captures the final tree root. */
+/* Drain dirty_inodes → inode_tree. Two-phase: snapshot the entire
+ * dirty set into a local list under the mutex, then process without
+ * holding it (btree_put may sleep on memory alloc; witness will
+ * complain if we hold an mtx across that). New mutations that race
+ * with the drain land in a fresh dirty_inodes — they're safe and
+ * picked up by the next flush. */
 static int
 tessera_fs_dirty_inodes_drain(struct tessera_mount *tmp_)
 {
 	if (!tmp_->dirty_init) return (0);
 	if (tmp_->inode_tree == NULL) return (TESSERA_EIO);
 
+	LIST_HEAD(, tessera_dirty_inode) snap;
+	LIST_INIT(&snap);
+
 	mtx_lock(&tmp_->flush_mtx);
-	int err = 0;
-	uint64_t root = tmp_->sb.inode_root;
-	for (uint32_t b = 0;
-	    b < TESSERA_DIRTY_INODE_BUCKETS && err == 0; b++) {
+	uint32_t snap_count = 0;
+	for (uint32_t b = 0; b < TESSERA_DIRTY_INODE_BUCKETS; b++) {
 		struct tessera_dirty_inode *e;
 		while ((e = LIST_FIRST(&tmp_->dirty_inodes[b])) != NULL) {
 			LIST_REMOVE(e, link);
-			tmp_->dirty_count--;
-			uint8_t key[4];
-			encode_inode_key(e->inode_no, key);
-			int r;
-			if (e->tombstone) {
-				r = tessera_btree_delete(tmp_->inode_tree,
-				    key, &root);
-				if (r != TESSERA_OK && r != TESSERA_ENOENT)
-					err = EIO;
-			} else {
-				r = tessera_btree_put(tmp_->inode_tree, key,
-				    &e->rec, &root);
-				if (r != TESSERA_OK) err = EIO;
-			}
-			free(e, M_TESSERA);
-			if (err != 0) break;
+			LIST_INSERT_HEAD(&snap, e, link);
+			snap_count++;
 		}
 	}
-	if (err == 0) tmp_->sb.inode_root = root;
+	tmp_->dirty_count = 0;
 	mtx_unlock(&tmp_->flush_mtx);
+	if (snap_count == 0) return (0);
+	tessera_stat_dirty_drained += snap_count;
+
+	/* Process without the lock. Failures partway leave residual
+	 * entries leaked — better than corrupting the cache state.
+	 * Successful path frees every entry. */
+	int err = 0;
+	uint64_t root = tmp_->sb.inode_root;
+	struct tessera_dirty_inode *e;
+	while ((e = LIST_FIRST(&snap)) != NULL) {
+		LIST_REMOVE(e, link);
+		uint8_t key[4];
+		encode_inode_key(e->inode_no, key);
+		int r;
+		if (e->tombstone) {
+			r = tessera_btree_delete(tmp_->inode_tree, key, &root);
+			if (r != TESSERA_OK && r != TESSERA_ENOENT) err = EIO;
+		} else {
+			r = tessera_btree_put(tmp_->inode_tree, key,
+			    &e->rec, &root);
+			if (r != TESSERA_OK) err = EIO;
+		}
+		free(e, M_TESSERA);
+		if (err != 0) break;
+	}
+	/* Free any leftover (only on error). */
+	while ((e = LIST_FIRST(&snap)) != NULL) {
+		LIST_REMOVE(e, link);
+		free(e, M_TESSERA);
+	}
+	if (err == 0) tmp_->sb.inode_root = root;
 	return (err);
 }
 
