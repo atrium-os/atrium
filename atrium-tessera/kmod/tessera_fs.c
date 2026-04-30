@@ -285,6 +285,23 @@ static int tessera_fs_append_chunked(struct tessera_mount *tmp_,
     uint32_t cs);
 static void encode_inode_key(uint32_t inode_no, uint8_t out[4]);
 
+/* v2 step-2b: dirty inode entry — element of the per-mount hash. */
+struct tessera_dirty_inode {
+	LIST_ENTRY(tessera_dirty_inode) link;
+	uint32_t                inode_no;
+	int                     tombstone;   /* 1 = drain calls btree_delete */
+	tessera_inode_record_t  rec;
+};
+static int tessera_fs_inode_get(struct tessera_mount *tmp_,
+                                uint32_t inode_no,
+                                tessera_inode_record_t *out);
+static int tessera_fs_inode_put(struct tessera_mount *tmp_,
+                                uint32_t inode_no,
+                                const tessera_inode_record_t *rec);
+static int tessera_fs_inode_delete(struct tessera_mount *tmp_,
+                                   uint32_t inode_no);
+static int tessera_fs_dirty_inodes_drain(struct tessera_mount *tmp_);
+
 /* v2 multi-level directory helpers. */
 typedef int (*tessera_dirent_cb_t)(void *ctx, uint64_t child_inode,
                                    const char *name, uint16_t name_len);
@@ -365,6 +382,19 @@ struct tessera_mount {
 	struct mtx                flush_mtx;
 	int                       flush_mtx_init;
 	int                       flush_in_progress;
+
+	/* v2-step-2b: dirty-inode write-back cache. Mutations stage
+	 * the new inode record here instead of immediately btree_put-
+	 * ting it; a flush drains everything via the normal btree_put
+	 * + commit_sb path. Read sites consult dirty_inodes first,
+	 * fall back to btree_get. Tombstones mark inodes that were
+	 * unlinked while dirty (drain calls btree_delete). All accesses
+	 * take flush_mtx — same lock that protects the commit-coordi-
+	 * nation flag, so a flush sees a coherent snapshot. */
+#define TESSERA_DIRTY_INODE_BUCKETS  128u
+	LIST_HEAD(, tessera_dirty_inode) dirty_inodes[TESSERA_DIRTY_INODE_BUCKETS];
+	uint32_t                  dirty_count;
+	int                       dirty_init;
 
 	/* v2 snapshots slice 2: read-only historical mount via
 	 * `tessera.gen=N`. When 1, mountfs overrode sb roots from a
@@ -648,6 +678,9 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen)
 	mtx_init(&tmp_->flush_mtx, "tess_flush", NULL, MTX_DEF);
 	tmp_->flush_mtx_init = 1;
 	tmp_->flush_co_init = 1;
+	for (uint32_t _b = 0; _b < TESSERA_DIRTY_INODE_BUCKETS; _b++)
+		LIST_INIT(&tmp_->dirty_inodes[_b]);
+	tmp_->dirty_init = 1;
 
 	/* Open the journal and run replay BEFORE we open the trees, so a
 	 * rolled-forward generation lifts sb.inode_root / pack_registry_
@@ -1047,6 +1080,22 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 			callout_drain(&tmp_->flush_co);
 			taskqueue_drain(taskqueue_thread, &tmp_->flush_task);
 			(void)tessera_fs_flush(tmp_);
+		}
+		/* Drain any leftover dirty inodes (best-effort) — the
+		 * final flush above should have cleared them, but if
+		 * inode_tree was NULL the writes accumulated and we now
+		 * just leak them. */
+		if (tmp_->dirty_init) {
+			for (uint32_t _b = 0;
+			    _b < TESSERA_DIRTY_INODE_BUCKETS; _b++) {
+				struct tessera_dirty_inode *_e;
+				while ((_e = LIST_FIRST(&tmp_->dirty_inodes[_b]))
+				    != NULL) {
+					LIST_REMOVE(_e, link);
+					free(_e, M_TESSERA);
+				}
+			}
+			tmp_->dirty_init = 0;
 		}
 		if (tmp_->flush_mtx_init) {
 			mtx_destroy(&tmp_->flush_mtx);
@@ -2225,6 +2274,145 @@ tessera_fs_mark_dirty(struct tessera_mount *tmp_)
 	}
 }
 
+/* v2 step-2b: dirty-inode write-back. inode_get/put/delete go through
+ * the in-memory cache; reads consult dirty_inodes first, falling back
+ * to btree_get; writes stage there until flush. */
+static int
+tessera_fs_inode_get(struct tessera_mount *tmp_, uint32_t inode_no,
+                     tessera_inode_record_t *out)
+{
+	if (tmp_->dirty_init) {
+		mtx_lock(&tmp_->flush_mtx);
+		uint32_t b = inode_no & (TESSERA_DIRTY_INODE_BUCKETS - 1u);
+		struct tessera_dirty_inode *e;
+		LIST_FOREACH(e, &tmp_->dirty_inodes[b], link) {
+			if (e->inode_no == inode_no) {
+				if (e->tombstone) {
+					mtx_unlock(&tmp_->flush_mtx);
+					return (TESSERA_ENOENT);
+				}
+				memcpy(out, &e->rec, sizeof *out);
+				mtx_unlock(&tmp_->flush_mtx);
+				return (TESSERA_OK);
+			}
+		}
+		mtx_unlock(&tmp_->flush_mtx);
+	}
+
+	if (tmp_->inode_tree == NULL) return (TESSERA_ENOENT);
+	uint8_t key[4];
+	encode_inode_key(inode_no, key);
+	return (tessera_btree_get(tmp_->inode_tree, key, out));
+}
+
+static int
+tessera_fs_inode_put(struct tessera_mount *tmp_, uint32_t inode_no,
+                     const tessera_inode_record_t *rec)
+{
+	if (!tmp_->dirty_init) {
+		/* Pre-init mount-time path — write through directly. */
+		if (tmp_->inode_tree == NULL) return (TESSERA_EIO);
+		uint8_t key[4];
+		encode_inode_key(inode_no, key);
+		uint64_t new_root = tmp_->sb.inode_root;
+		int r = tessera_btree_put(tmp_->inode_tree, key, rec,
+		    &new_root);
+		if (r == TESSERA_OK) tmp_->sb.inode_root = new_root;
+		return (r);
+	}
+
+	mtx_lock(&tmp_->flush_mtx);
+	uint32_t b = inode_no & (TESSERA_DIRTY_INODE_BUCKETS - 1u);
+	struct tessera_dirty_inode *e;
+	LIST_FOREACH(e, &tmp_->dirty_inodes[b], link) {
+		if (e->inode_no == inode_no) {
+			memcpy(&e->rec, rec, sizeof e->rec);
+			e->tombstone = 0;
+			mtx_unlock(&tmp_->flush_mtx);
+			return (TESSERA_OK);
+		}
+	}
+	e = malloc(sizeof *e, M_TESSERA, M_WAITOK | M_ZERO);
+	e->inode_no = inode_no;
+	memcpy(&e->rec, rec, sizeof e->rec);
+	LIST_INSERT_HEAD(&tmp_->dirty_inodes[b], e, link);
+	tmp_->dirty_count++;
+	mtx_unlock(&tmp_->flush_mtx);
+	return (TESSERA_OK);
+}
+
+static int
+tessera_fs_inode_delete(struct tessera_mount *tmp_, uint32_t inode_no)
+{
+	if (!tmp_->dirty_init) {
+		if (tmp_->inode_tree == NULL) return (TESSERA_EIO);
+		uint8_t key[4];
+		encode_inode_key(inode_no, key);
+		uint64_t new_root = tmp_->sb.inode_root;
+		int r = tessera_btree_delete(tmp_->inode_tree, key,
+		    &new_root);
+		if (r == TESSERA_OK) tmp_->sb.inode_root = new_root;
+		return (r);
+	}
+
+	mtx_lock(&tmp_->flush_mtx);
+	uint32_t b = inode_no & (TESSERA_DIRTY_INODE_BUCKETS - 1u);
+	struct tessera_dirty_inode *e;
+	LIST_FOREACH(e, &tmp_->dirty_inodes[b], link) {
+		if (e->inode_no == inode_no) {
+			e->tombstone = 1;
+			mtx_unlock(&tmp_->flush_mtx);
+			return (TESSERA_OK);
+		}
+	}
+	e = malloc(sizeof *e, M_TESSERA, M_WAITOK | M_ZERO);
+	e->inode_no  = inode_no;
+	e->tombstone = 1;
+	LIST_INSERT_HEAD(&tmp_->dirty_inodes[b], e, link);
+	tmp_->dirty_count++;
+	mtx_unlock(&tmp_->flush_mtx);
+	return (TESSERA_OK);
+}
+
+/* Drain dirty_inodes → inode_tree. Called from tessera_fs_flush
+ * before commit_sb, so the SB write captures the final tree root. */
+static int
+tessera_fs_dirty_inodes_drain(struct tessera_mount *tmp_)
+{
+	if (!tmp_->dirty_init) return (0);
+	if (tmp_->inode_tree == NULL) return (TESSERA_EIO);
+
+	mtx_lock(&tmp_->flush_mtx);
+	int err = 0;
+	uint64_t root = tmp_->sb.inode_root;
+	for (uint32_t b = 0;
+	    b < TESSERA_DIRTY_INODE_BUCKETS && err == 0; b++) {
+		struct tessera_dirty_inode *e;
+		while ((e = LIST_FIRST(&tmp_->dirty_inodes[b])) != NULL) {
+			LIST_REMOVE(e, link);
+			tmp_->dirty_count--;
+			uint8_t key[4];
+			encode_inode_key(e->inode_no, key);
+			int r;
+			if (e->tombstone) {
+				r = tessera_btree_delete(tmp_->inode_tree,
+				    key, &root);
+				if (r != TESSERA_OK && r != TESSERA_ENOENT)
+					err = EIO;
+			} else {
+				r = tessera_btree_put(tmp_->inode_tree, key,
+				    &e->rec, &root);
+				if (r != TESSERA_OK) err = EIO;
+			}
+			free(e, M_TESSERA);
+			if (err != 0) break;
+		}
+	}
+	if (err == 0) tmp_->sb.inode_root = root;
+	mtx_unlock(&tmp_->flush_mtx);
+	return (err);
+}
+
 static int
 tessera_fs_flush(struct tessera_mount *tmp_)
 {
@@ -2261,7 +2449,14 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 	}
 	mtx_unlock(&tmp_->flush_mtx);
 
-	int r = tessera_commit_sb(tmp_);
+	/* Drain dirty inodes BEFORE commit_sb so the SB sectors written
+	 * by commit_sb capture the post-drain inode_root. drain itself
+	 * takes flush_mtx briefly per entry. */
+	int r = tessera_fs_dirty_inodes_drain(tmp_);
+	if (r == 0) {
+		(void)tessera_commit_extent(tmp_);
+		r = tessera_commit_sb(tmp_);
+	}
 
 	mtx_lock(&tmp_->flush_mtx);
 	if (r == 0) tmp_->sb_dirty = 0;
