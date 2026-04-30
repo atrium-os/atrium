@@ -313,6 +313,41 @@ tessera_decode_registry_entry(const uint8_t in[TESSERA_REGISTRY_ENTRY_SIZE],
 }
 
 int
+tessera_encode_pack_extent_list(const tessera_pack_extent_list_t *in,
+                                uint8_t out[TESSERA_SECTOR_SIZE])
+{
+	if (in == NULL || out == NULL) return TESSERA_EINVAL;
+	memcpy(out, in, sizeof(*in));
+	const size_t crc_off = offsetof(tessera_pack_extent_list_t, crc32);
+	write_u32_at(out, crc_off, tessera_crc32(out, crc_off));
+	return TESSERA_OK;
+}
+
+int
+tessera_decode_pack_extent_list(const uint8_t in[TESSERA_SECTOR_SIZE],
+                                tessera_pack_extent_list_t *out)
+{
+	if (in == NULL || out == NULL) return TESSERA_EINVAL;
+	tessera_pack_extent_list_t pel;
+	memcpy(&pel, in, sizeof pel);
+	if (pel.magic != TESSERA_PEL_MAGIC) return TESSERA_EBADMAGIC;
+	const size_t crc_off = offsetof(tessera_pack_extent_list_t, crc32);
+	if (read_u32_at(in, crc_off) != tessera_crc32(in, crc_off))
+		return TESSERA_EBADCRC;
+	if (pel.extent_count == 0 ||
+	    pel.extent_count > TESSERA_PEL_MAX_EXTENTS)
+		return TESSERA_ECORRUPT;
+	uint64_t sum = 0;
+	for (uint32_t i = 0; i < pel.extent_count; i++) {
+		if (pel.extents[i].length_sectors == 0) return TESSERA_ECORRUPT;
+		sum += pel.extents[i].length_sectors;
+	}
+	if (sum != pel.total_length) return TESSERA_ECORRUPT;
+	*out = pel;
+	return TESSERA_OK;
+}
+
+int
 tessera_encode_free_extent(const tessera_free_extent_t *in,
                            uint8_t out[TESSERA_EXTENT_ENTRY_SIZE])
 {

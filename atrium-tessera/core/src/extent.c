@@ -220,6 +220,84 @@ tessera_extent_alloc(tessera_extent_alloc_t *a, uint64_t n_sectors,
 }
 
 int
+tessera_extent_alloc_multi(tessera_extent_alloc_t *a,
+                            uint64_t n_sectors,
+                            uint32_t max_count,
+                            uint64_t *out_starts,
+                            uint64_t *out_lengths,
+                            uint32_t *out_count)
+{
+	if (a == NULL || out_starts == NULL || out_lengths == NULL ||
+	    out_count == NULL) return TESSERA_EINVAL;
+	if (n_sectors == 0 || max_count == 0) return TESSERA_EINVAL;
+	if (a->free_blocks < n_sectors) return TESSERA_ENOSPC;
+
+	/* Plan first; allocate only after we know it'll fit. Sort indices
+	 * by descending length, then walk taking whole extents until we
+	 * reach n_sectors (last run may be a partial split). */
+	const size_t n = a->count;
+	if (n == 0) return TESSERA_ENOSPC;
+
+	size_t *order = tessera_malloc(n * sizeof *order);
+	if (order == NULL) return TESSERA_ENOMEM;
+	for (size_t i = 0; i < n; i++) order[i] = i;
+	/* Insertion sort (n is bounded by extent_count which is small in
+	 * practice; even ~1k entries this is fine). */
+	for (size_t i = 1; i < n; i++) {
+		size_t cur = order[i];
+		uint64_t curL = a->extents[cur].length_sectors;
+		size_t j = i;
+		while (j > 0 &&
+		    a->extents[order[j - 1]].length_sectors < curL) {
+			order[j] = order[j - 1];
+			j--;
+		}
+		order[j] = cur;
+	}
+
+	/* Walk in descending length, accumulate until n_sectors covered. */
+	uint64_t need  = n_sectors;
+	uint32_t count = 0;
+	for (size_t k = 0; k < n && need > 0; k++) {
+		size_t idx = order[k];
+		uint64_t L = a->extents[idx].length_sectors;
+		if (count >= max_count) {
+			tessera_free(order);
+			return TESSERA_ENOSPC;
+		}
+		uint64_t take = (L <= need) ? L : need;
+		out_starts[count]  = a->extents[idx].start_sector;
+		out_lengths[count] = take;
+		count++;
+		need -= take;
+	}
+	if (need > 0) {
+		tessera_free(order);
+		return TESSERA_ENOSPC;
+	}
+
+	/* Plan succeeded — apply by allocating each contiguous request. */
+	for (uint32_t i = 0; i < count; i++) {
+		uint64_t got;
+		int r = tessera_extent_alloc(a, out_lengths[i], &got);
+		if (r != TESSERA_OK) {
+			/* Roll back already-allocated runs to keep state
+			 * coherent with caller. */
+			for (uint32_t j = 0; j < i; j++)
+				(void)tessera_extent_free(a,
+				    out_starts[j], out_lengths[j]);
+			tessera_free(order);
+			return r;
+		}
+		out_starts[i] = got;
+	}
+
+	tessera_free(order);
+	*out_count = count;
+	return TESSERA_OK;
+}
+
+int
 tessera_extent_free(tessera_extent_alloc_t *a, uint64_t start,
                     uint64_t n_sectors)
 {

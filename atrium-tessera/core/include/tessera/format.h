@@ -398,8 +398,51 @@ typedef struct TESSERA_PACKED {
 	uint32_t  flags;                     /* SEALED, RETIRING */
 } tessera_registry_entry_t;
 
-#define TESSERA_REGISTRY_FLAG_SEALED    (1u << 0)
-#define TESSERA_REGISTRY_FLAG_RETIRING  (1u << 1)
+#define TESSERA_REGISTRY_FLAG_SEALED        (1u << 0)
+#define TESSERA_REGISTRY_FLAG_RETIRING      (1u << 1)
+/* MULTI_EXTENT — pack body spans multiple non-contiguous data-zone
+ * extents (ZFS-style "gang" fallback when the data zone is too
+ * fragmented to allocate the pack contiguously).
+ *
+ *   set:    start_sector points at a 1-sector "pack extent list"
+ *           (PEL, see tessera_pack_extent_list_t below) that holds
+ *           the actual extent vector. length_sectors is the sum of
+ *           the extents' lengths (= the logical pack body length).
+ *   clear:  (start_sector, length_sectors) describe one contiguous
+ *           extent containing the whole pack — fast path, identical
+ *           to the v1/v2 layout. */
+#define TESSERA_REGISTRY_FLAG_MULTI_EXTENT  (1u << 2)
+
+/* Pack extent list (PEL) — one sector. Lives in the data zone,
+ * allocated whenever a pack publish falls back to multi-extent.
+ * Reader path reads this sector first to discover the extent vector,
+ * then issues bread per extent.
+ *
+ * Layout: 4096 bytes. 32-byte header + extents[N] + crc32 at the
+ * end. With 16-byte extent records, N_MAX = (4096 - 32 - 4) / 16
+ *                                         = 254 extents.
+ *
+ * Per pack overhead: one extra sector (4 KiB) when multi-extent is
+ * triggered. Fast path (single contiguous extent) pays nothing —
+ * the flag bit drives the lookup and PEL is never allocated. */
+typedef struct TESSERA_PACKED {
+	uint64_t  start_sector;
+	uint64_t  length_sectors;
+} tessera_pack_extent_t;
+
+#define TESSERA_PEL_MAGIC                   ((uint64_t)0x315056454C455054ULL) /* "TPELEV01" */
+#define TESSERA_PEL_MAX_EXTENTS             253u
+
+typedef struct TESSERA_PACKED {
+	uint64_t              magic;        /* TESSERA_PEL_MAGIC */
+	uint32_t              version;      /* 1 */
+	uint32_t              extent_count;
+	uint64_t              total_length; /* sum of extents[].length_sectors */
+	uint64_t              reserved;
+	tessera_pack_extent_t extents[TESSERA_PEL_MAX_EXTENTS];
+	uint8_t               pad[12];
+	uint32_t              crc32;        /* CRC over bytes 0..(crc32 offset) */
+} tessera_pack_extent_list_t;
 
 /* ── Snapshot record (64 bytes) ─────────────────────────────────────
  *
@@ -453,6 +496,8 @@ TESSERA_STATIC_ASSERT(sizeof(tessera_registry_entry_t)    == 64,   registry_entr
 TESSERA_STATIC_ASSERT(sizeof(tessera_free_extent_t)       == 16,   free_extent_size);
 TESSERA_STATIC_ASSERT(sizeof(tessera_snapshot_record_t)   == 64,   snapshot_record_size);
 TESSERA_STATIC_ASSERT(sizeof(tessera_dir_bucket_record_t) == 40,   dir_bucket_record_size);
+TESSERA_STATIC_ASSERT(sizeof(tessera_pack_extent_t)       == 16,   pack_extent_size);
+TESSERA_STATIC_ASSERT(sizeof(tessera_pack_extent_list_t)  == 4096, pack_extent_list_size);
 
 #ifdef __cplusplus
 }

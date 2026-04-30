@@ -26,6 +26,25 @@ int tessera_extent_alloc(tessera_extent_alloc_t *,
                          uint64_t n_sectors,
                          uint64_t *out_start);
 
+/* Allocate `n_sectors` total, possibly across multiple non-contiguous
+ * runs (gang/multi-extent fallback for fragmented data zones). Fills
+ * out_extents[] starting at index 0, returns the count via *out_count.
+ *
+ * Strategy: take whole runs starting from the largest, until the
+ * requested total is reached; the last run may be partial (split).
+ * That keeps fragmentation from getting worse when we don't need all
+ * of it.
+ *
+ * Returns 0 on success, ENOSPC if total free < n_sectors or the
+ * extent count would exceed max_count. The allocator's free state is
+ * unchanged on error. */
+int tessera_extent_alloc_multi(tessera_extent_alloc_t *,
+                               uint64_t n_sectors,
+                               uint32_t max_count,
+                               uint64_t *out_starts,
+                               uint64_t *out_lengths,
+                               uint32_t *out_count);
+
 /* Free a previously-allocated extent. Adjacent free extents are
  * coalesced. */
 int tessera_extent_free(tessera_extent_alloc_t *,

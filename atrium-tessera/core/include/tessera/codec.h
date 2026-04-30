@@ -79,6 +79,13 @@ int tessera_encode_registry_entry(const tessera_registry_entry_t *in,
 int tessera_decode_registry_entry(const uint8_t in[TESSERA_REGISTRY_ENTRY_SIZE],
                                   tessera_registry_entry_t *out);
 
+/* Pack extent list (PEL) — one sector. Used by registry entries with
+ * the MULTI_EXTENT flag set. */
+int tessera_encode_pack_extent_list(const tessera_pack_extent_list_t *in,
+                                    uint8_t out[TESSERA_SECTOR_SIZE]);
+int tessera_decode_pack_extent_list(const uint8_t in[TESSERA_SECTOR_SIZE],
+                                    tessera_pack_extent_list_t *out);
+
 /* Free-extent record. */
 int tessera_encode_free_extent(const tessera_free_extent_t *in,
                                uint8_t out[TESSERA_EXTENT_ENTRY_SIZE]);
