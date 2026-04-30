@@ -490,6 +490,19 @@ struct tessera_mount {
 	 * fire (sb_dirty never gets set since mark_dirty isn't called). */
 	int                       readonly_snapshot;
 	uint64_t                  snapshot_gen;
+
+	/* v2 step-3c prereq: per-mount chunk-size override. When 0 (the
+	 * default), tessera_chunk_size_for() returns the auto-tier size
+	 * keyed off file_size (64 KiB / 1 MiB / 4 MiB). When non-zero,
+	 * every chunked write on this mount uses this size verbatim.
+	 *
+	 * Set via `mount -o tessera.chunk_size=<bytes>`. Validated at
+	 * parse time to be a power-of-two in [4096, 4194304]. The
+	 * intended use is VM-image directories that benefit from 4 KiB
+	 * chunks (matching guest fs block size for fine-grained dedup);
+	 * CHUNK_TREE write-side promotion will lift the resulting
+	 * manifest-size cost via log(N) amplification. */
+	uint32_t                  chunk_size_override;
 };
 
 static int
@@ -623,7 +636,8 @@ tessera_heal_sb(struct vnode *devvp, uint64_t which,
 /* ── core mount: open device + decode SB ─────────────────────── */
 
 static int
-tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen)
+tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
+    uint32_t chunk_size_override)
 {
 	struct tessera_mount *tmp_;
 	struct g_consumer    *cp = NULL;
@@ -721,6 +735,7 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen)
 	tmp_->cp    = cp;
 	tmp_->dev   = dev;
 	tmp_->sb    = *active;
+	tmp_->chunk_size_override = chunk_size_override;
 	/* `active` aliases sb_a or sb_b — copy completed, free the
 	 * heap-alloc'd staging copies. */
 	free(sb_a, M_TESSERA);
@@ -1119,6 +1134,35 @@ tessera_mount_impl(struct mount *mp)
 		}
 	}
 
+	/* v2 step-3c prereq: optional `tessera.chunk_size=<bytes>` mount
+	 * option pins the chunk granularity for every chunked write on
+	 * this mount. Must be a power-of-two in [4096, 4194304]; reject
+	 * the mount with EINVAL otherwise so misconfigurations are loud
+	 * rather than silently auto-tiered. */
+	uint32_t chunk_size_override = 0;
+	{
+		int cs_err;
+		char *cs_str = vfs_getopts(mp->mnt_optnew, "tessera.chunk_size",
+		    &cs_err);
+		if (cs_err == 0 && cs_str != NULL) {
+			uint64_t v = 0;
+			int bad = 0;
+			for (const char *p = cs_str; *p; p++) {
+				if (*p < '0' || *p > '9') { bad = 1; break; }
+				v = v * 10u + (uint64_t)(*p - '0');
+				if (v > (uint64_t)0xffffffffu) { bad = 1; break; }
+			}
+			if (bad || v < 4096u || v > (4u * 1024u * 1024u) ||
+			    (v & (v - 1)) != 0) {
+				printf("tessera_fs: tessera.chunk_size=%s rejected "
+				    "(want power-of-2 in [4096, 4194304])\n",
+				    cs_str);
+				return (EINVAL);
+			}
+			chunk_size_override = (uint32_t)v;
+		}
+	}
+
 	NDINIT(&ndp, LOOKUP, FOLLOW | LOCKLEAF, UIO_SYSSPACE, fspec);
 	err = namei(&ndp);
 	if (err != 0) return (err);
@@ -1138,7 +1182,7 @@ tessera_mount_impl(struct mount *mp)
 		return (err);
 	}
 
-	err = tessera_mountfs(devvp, mp, requested_gen);
+	err = tessera_mountfs(devvp, mp, requested_gen, chunk_size_override);
 	if (err != 0) {
 		vrele(devvp);
 		return (err);
@@ -3715,8 +3759,13 @@ tessera_fs_publish_directory(struct tessera_mount *tmp_,
  * files where small chunks are required.
  */
 static inline uint32_t
-tessera_chunk_size_for(uint64_t file_size)
+tessera_chunk_size_for(struct tessera_mount *tmp_, uint64_t file_size)
 {
+	/* Per-mount override (v2 step-3c prereq). Validated power-of-2
+	 * at mount time; we trust it here. */
+	if (tmp_ != NULL && tmp_->chunk_size_override != 0)
+		return (tmp_->chunk_size_override);
+
 	if (file_size <  (64ULL * 1024ULL * 1024ULL))         /* < 64 MiB */
 		return ( 64u * 1024u);
 	if (file_size <  ( 4ULL * 1024ULL * 1024ULL * 1024ULL))/* < 4 GiB */
@@ -3746,7 +3795,7 @@ tessera_fs_replace_content_chunked(struct tessera_mount *tmp_,
 	if (tessera_fs_inode_get_byk(tmp_, key, &old_ino) != TESSERA_OK)
 		return (EIO);
 
-	const uint32_t cs = tessera_chunk_size_for(new_len);
+	const uint32_t cs = tessera_chunk_size_for(tmp_, new_len);
 
 	/* Slot-by-slot dedup only works when the prior write used the
 	 * same chunk size we're about to use. If the file crossed a
@@ -4664,7 +4713,7 @@ tessera_vop_write(struct vop_write_args *ap)
 	 * through to the slow read-modify-write path below. */
 	if (write_off == ino.size &&
 	    final_size > TESSERA_INLINE_THRESHOLD) {
-		const uint32_t cs = tessera_chunk_size_for(final_size);
+		const uint32_t cs = tessera_chunk_size_for(tmp_, final_size);
 		int frc = tessera_fs_append_chunked(tmp_,
 		    (uint32_t)tn->inode_no, new_bytes,
 		    (size_t)write_resid, cs);
