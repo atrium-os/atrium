@@ -222,6 +222,24 @@ SYSCTL_PROC(_kern_tessera, OID_AUTO, metatrace_dump,
     NULL, 0, tessera_sysctl_metatrace_dump, "LU",
     "Read to print the meta-reserve trace ring to dmesg");
 
+/* v2 slice-4 retention: cap on number of snapshot records retained
+ * in the snapshots_tree. At every commit_sb, if the count exceeds
+ * this horizon, the oldest (lowest-gen) record is btree_delete'd.
+ *
+ * Default chosen to keep meta-reserve growth bounded under typical
+ * workloads while still giving useful time-machine depth. Users can
+ * tune at runtime. Setting to 0 disables retention (snapshots
+ * accumulate indefinitely — only fine for small/short-lived volumes
+ * or testing). */
+static int tessera_snapshot_retention = 16;
+SYSCTL_INT(_kern_tessera, OID_AUTO, snapshot_retention,
+    CTLFLAG_RW, &tessera_snapshot_retention, 0,
+    "Cap on retained snapshot records (oldest dropped at next commit; 0 = unlimited)");
+static unsigned long tessera_stat_snapshots_retired = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, snapshots_retired,
+    CTLFLAG_RD, &tessera_stat_snapshots_retired, 0,
+    "Cumulative snapshot records dropped by retention horizon");
+
 /* v2 publish-cache observability — increments on every short-circuit
  * via existing pack_registry hit (no extent_alloc / no bwrite). */
 static unsigned long tessera_stat_publish_dedup_manifest = 0;
@@ -2425,10 +2443,68 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 		    &new_sroot) == TESSERA_OK) {
 			tmp_->sb.snapshots_root = new_sroot;
 			tmp_->sb.snapshots_gen++;
+			tessera_metatrace(TM_OP_SNAPSHOT_REC, 0,
+			    srec.generation, 1);
 		}
 		/* btree_put failure is non-fatal — losing one snapshot
 		 * record doesn't break the live mount; future commits
 		 * will retry. */
+
+		/* Slice-4 retention: drop the oldest snapshot record once
+		 * the retained count exceeds the configured horizon. The
+		 * snapshots tree is keyed by 8-byte big-endian gen, so
+		 * `seek_first` returns the lowest gen — that's the oldest.
+		 *
+		 * We do at most ONE drop per commit_sb. Over many commits,
+		 * the count converges to the horizon. Doing more than one
+		 * per commit would cascade COWs through the snapshots_tree
+		 * and burn through meta-reserve.
+		 *
+		 * Mid-session un-pinning of the dropped snapshot's tree
+		 * sectors is NOT done here — those sectors stay pinned in
+		 * meta_pending until next mount's orphan-reclaim rebuilds
+		 * the bitmap from the surviving snapshot set. Documented
+		 * trade-off: meta_pending doesn't shrink mid-session, but
+		 * the algorithm avoids a per-retirement multi-tree walk
+		 * (which is exactly the failure mode that hung the VM in
+		 * earlier slice-4 attempts).
+		 *
+		 * Skipped while flush_unmounting=1 — at unmount we just
+		 * want the SB durable, not a structural rewrite of the
+		 * snapshots tree.
+		 */
+		if (!tmp_->flush_unmounting &&
+		    tessera_snapshot_retention > 0 &&
+		    tmp_->sb.snapshots_gen >
+		        (uint64_t)tessera_snapshot_retention) {
+			tessera_btree_cursor_t *sc =
+			    tessera_btree_seek_first(tmp_->snapshots_tree);
+			if (sc != NULL) {
+				uint8_t okey[8];
+				tessera_snapshot_record_t orec;
+				if (tessera_btree_cursor_get(sc, okey, &orec)
+				    == TESSERA_OK) {
+					tessera_btree_cursor_free(sc);
+					sc = NULL;
+					uint64_t after_root =
+					    tmp_->sb.snapshots_root;
+					if (tessera_btree_delete(
+					    tmp_->snapshots_tree, okey,
+					    &after_root) == TESSERA_OK) {
+						tmp_->sb.snapshots_root =
+						    after_root;
+						tmp_->sb.snapshots_gen--;
+						tessera_stat_snapshots_retired++;
+						tessera_metatrace(
+						    TM_OP_SNAPSHOT_REC,
+						    1 /* retire marker */,
+						    orec.generation, 0);
+					}
+				} else {
+					tessera_btree_cursor_free(sc);
+				}
+			}
+		}
 	}
 
 	if (tmp_->journal != NULL) {
