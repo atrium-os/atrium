@@ -617,3 +617,24 @@ uint64_t tessera_volume_journal_length(const tessera_volume_t *v)
 
 const uint8_t *tessera_volume_uuid(const tessera_volume_t *v)
 { return v ? v->sb.volume_uuid : NULL; }
+
+uint64_t tessera_volume_snapshots_root(const tessera_volume_t *v)
+{ return v ? v->sb.snapshots_root : 0; }
+
+uint64_t tessera_volume_snapshots_gen(const tessera_volume_t *v)
+{ return v ? v->sb.snapshots_gen : 0; }
+
+uint64_t tessera_volume_meta_reserve_start(const tessera_volume_t *v)
+{ return v ? v->sb.meta_reserve_start : 0; }
+
+uint64_t tessera_volume_meta_reserve_length(const tessera_volume_t *v)
+{ return v ? v->sb.meta_reserve_length : 0; }
+
+uint64_t tessera_volume_meta_reserve_bump(const tessera_volume_t *v)
+{ return v ? v->sb.meta_reserve_bump : 0; }
+
+uint16_t tessera_volume_encryption_flags(const tessera_volume_t *v)
+{ return v ? v->sb.encryption_flags : 0; }
+
+uint8_t tessera_volume_active_slot_count(const tessera_volume_t *v)
+{ return v ? v->sb.active_slot_count : 0; }

@@ -96,6 +96,14 @@ uint64_t        tessera_volume_free_extent_root (const tessera_volume_t *);
 uint64_t        tessera_volume_journal_start    (const tessera_volume_t *);
 uint64_t        tessera_volume_journal_length   (const tessera_volume_t *);
 const uint8_t  *tessera_volume_uuid             (const tessera_volume_t *);
+/* v2 snapshots / metadata-reserve / encryption fields (added 2026-04-30). */
+uint64_t        tessera_volume_snapshots_root   (const tessera_volume_t *);
+uint64_t        tessera_volume_snapshots_gen    (const tessera_volume_t *);
+uint64_t        tessera_volume_meta_reserve_start (const tessera_volume_t *);
+uint64_t        tessera_volume_meta_reserve_length(const tessera_volume_t *);
+uint64_t        tessera_volume_meta_reserve_bump  (const tessera_volume_t *);
+uint16_t        tessera_volume_encryption_flags   (const tessera_volume_t *);
+uint8_t         tessera_volume_active_slot_count  (const tessera_volume_t *);
 
 #ifdef __cplusplus
 }
