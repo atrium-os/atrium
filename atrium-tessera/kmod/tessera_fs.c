@@ -122,6 +122,106 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, mark_dirty,
     CTLFLAG_RD, &tessera_stat_mark_dirty, 0,
     "Cumulative tessera_fs_mark_dirty invocations");
 
+/* v2 slice-4 debug tooling: meta-reserve trace ring. Records every
+ * meta_alloc / meta_free / drain-* event with (op, sector, gen, count)
+ * so a hung VM's dmesg-via-sysctl can show what the meta-reserve was
+ * doing right before the hang. Pure memory writes — no locks, single
+ * monotonic write index. Reads from sysctl are racy by design (best-
+ * effort post-mortem inspection). Static (kmod-lifetime) so traces
+ * survive umount; useful when slice-4-related corruption only
+ * manifests on a re-mount cycles later.
+ *
+ * Disabled by default (`metatrace_enabled = 0`) so production paths
+ * don't pay the write cost. Set via `sysctl kern.tessera.metatrace_enabled=1`. */
+enum tessera_metatrace_op {
+	TM_OP_ALLOC_BUMP   = 1,  /* meta_alloc satisfied by bump pointer */
+	TM_OP_ALLOC_REUSE  = 2,  /* meta_alloc satisfied from meta_free */
+	TM_OP_FREE_PUSH    = 3,  /* sector pushed onto meta_pending */
+	TM_OP_DRAIN_BEGIN  = 4,  /* commit_sb drain step begins */
+	TM_OP_DRAIN_KEEP   = 5,  /* drain kept a sector (pinned by snapshot) */
+	TM_OP_DRAIN_RELEASE= 6,  /* drain released a sector to meta_free */
+	TM_OP_DRAIN_END    = 7,  /* commit_sb drain step ends */
+	TM_OP_SNAPSHOT_REC = 8,  /* commit_sb appended a snapshot record */
+	TM_OP_BITMAP_BUILT = 9,  /* mount-time meta-mark walk completed */
+	TM_OP_BITMAP_HIT   = 10, /* drain checked bitmap, bit was SET */
+	TM_OP_BITMAP_MISS  = 11, /* drain checked bitmap, bit was CLEAR */
+};
+struct tessera_metatrace_entry {
+	uint64_t seq;          /* monotonic; 0 means unused slot */
+	uint64_t sector;
+	uint64_t gen;
+	uint32_t count;        /* meta_pending_count or meta_free_count, op-specific */
+	uint8_t  op;
+	uint8_t  _pad[3];
+};
+#define TESSERA_METATRACE_LEN  1024u
+static struct tessera_metatrace_entry tessera_metatrace_ring[TESSERA_METATRACE_LEN];
+static unsigned long tessera_metatrace_widx = 0;     /* monotonic write index */
+static int           tessera_metatrace_enabled = 0;
+SYSCTL_INT(_kern_tessera, OID_AUTO, metatrace_enabled,
+    CTLFLAG_RW, &tessera_metatrace_enabled, 0,
+    "Enable meta-reserve event tracing (1=on, 0=off)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, metatrace_widx,
+    CTLFLAG_RD, &tessera_metatrace_widx, 0,
+    "Total meta-reserve trace events recorded since kmod load");
+
+static inline void
+tessera_metatrace(uint8_t op, uint64_t sector, uint64_t gen, uint32_t count)
+{
+	if (!tessera_metatrace_enabled) return;
+	unsigned long i = atomic_fetchadd_long(&tessera_metatrace_widx, 1);
+	struct tessera_metatrace_entry *e =
+	    &tessera_metatrace_ring[i % TESSERA_METATRACE_LEN];
+	e->seq    = i + 1;  /* seq=0 means "never written" */
+	e->sector = sector;
+	e->gen    = gen;
+	e->count  = count;
+	e->op     = op;
+}
+
+/* sysctl handler that prints the last N events to dmesg. Reading the
+ * sysctl from userspace triggers the print; the value returned is just
+ * the current write index. Awkward but minimal — avoids variable-length
+ * sysctl plumbing. Print order is oldest-to-newest within the ring. */
+static int
+tessera_sysctl_metatrace_dump(SYSCTL_HANDLER_ARGS)
+{
+	unsigned long widx = tessera_metatrace_widx;
+	const unsigned long start = (widx > TESSERA_METATRACE_LEN)
+	    ? (widx - TESSERA_METATRACE_LEN) : 0;
+	printf("tessera_fs: metatrace dump (widx=%lu, %lu entries):\n",
+	    widx, widx - start);
+	for (unsigned long i = start; i < widx; i++) {
+		const struct tessera_metatrace_entry *e =
+		    &tessera_metatrace_ring[i % TESSERA_METATRACE_LEN];
+		if (e->seq == 0) continue;
+		const char *opn;
+		switch (e->op) {
+		case TM_OP_ALLOC_BUMP:    opn = "alloc-bump";    break;
+		case TM_OP_ALLOC_REUSE:   opn = "alloc-reuse";   break;
+		case TM_OP_FREE_PUSH:     opn = "free-push";     break;
+		case TM_OP_DRAIN_BEGIN:   opn = "drain-begin";   break;
+		case TM_OP_DRAIN_KEEP:    opn = "drain-keep";    break;
+		case TM_OP_DRAIN_RELEASE: opn = "drain-release"; break;
+		case TM_OP_DRAIN_END:     opn = "drain-end";     break;
+		case TM_OP_SNAPSHOT_REC:  opn = "snapshot-rec";  break;
+		case TM_OP_BITMAP_BUILT:  opn = "bitmap-built";  break;
+		case TM_OP_BITMAP_HIT:    opn = "bitmap-hit";    break;
+		case TM_OP_BITMAP_MISS:   opn = "bitmap-miss";   break;
+		default:                  opn = "?";             break;
+		}
+		printf("  [%lu] %-14s sector=%lu gen=%lu count=%u\n",
+		    (unsigned long)e->seq, opn,
+		    (unsigned long)e->sector, (unsigned long)e->gen,
+		    e->count);
+	}
+	return (sysctl_handle_long(oidp, &widx, 0, req));
+}
+SYSCTL_PROC(_kern_tessera, OID_AUTO, metatrace_dump,
+    CTLTYPE_ULONG | CTLFLAG_RD | CTLFLAG_MPSAFE,
+    NULL, 0, tessera_sysctl_metatrace_dump, "LU",
+    "Read to print the meta-reserve trace ring to dmesg");
+
 /* v2 publish-cache observability — increments on every short-circuit
  * via existing pack_registry hit (no extent_alloc / no bwrite). */
 static unsigned long tessera_stat_publish_dedup_manifest = 0;
@@ -452,6 +552,26 @@ struct tessera_mount {
 	uint32_t                  meta_pending_count;
 	uint32_t                  meta_pending_cap;
 
+	/* v2 slice-4: snapshot meta-reserve pin bitmap. One bit per
+	 * sector in [meta_reserve_start, meta_reserve_start + meta_reserve_length).
+	 * Bit SET ⇔ that sector is referenced by some retained snapshot's
+	 * btree. Built at mount time by walking every retained snapshot's
+	 * tree node sectors (same logic that the orphan-reclaimer already
+	 * used at lines 939-1045 — now persisted on the mount struct).
+	 *
+	 * commit_sb's drain filters meta_pending against this bitmap:
+	 * sectors with their bit SET stay pinned (would corrupt a forensic
+	 * mount of the older gen if recycled); sectors with their bit
+	 * CLEAR are released to meta_free for reuse.
+	 *
+	 * NOT updated mid-session — once a sector is in the bitmap, it
+	 * stays there until unmount. Retention (clearing bits when an old
+	 * snapshot is dropped) is the next step, currently not implemented;
+	 * with no retention the bitmap monotonically grows but is bounded
+	 * by meta_reserve_length bits = ~32 KB for a 64 MiB reserve. */
+	uint8_t                  *meta_pin_bitmap;
+	size_t                    meta_pin_bitmap_bytes;
+
 	/* v2-step-2a: deferred-commit state. See sysctl block above. */
 	int                       sb_dirty;
 	int                       flush_co_init;     /* callout initialised */
@@ -547,6 +667,8 @@ tessera_kbio_meta_alloc(void *ctx, uint64_t n, uint64_t *out_sector)
 	 * post-success drain) before pushing the bump pointer forward. */
 	if (tmp_->meta_free_count > 0) {
 		*out_sector = tmp_->meta_free[--tmp_->meta_free_count];
+		tessera_metatrace(TM_OP_ALLOC_REUSE, *out_sector,
+		    tmp_->sb.generation, tmp_->meta_free_count);
 		return (0);
 	}
 	const uint64_t used = tmp_->sb.meta_reserve_bump
@@ -561,6 +683,8 @@ tessera_kbio_meta_alloc(void *ctx, uint64_t n, uint64_t *out_sector)
 	}
 	*out_sector = tmp_->sb.meta_reserve_bump;
 	tmp_->sb.meta_reserve_bump += n;
+	tessera_metatrace(TM_OP_ALLOC_BUMP, *out_sector,
+	    tmp_->sb.generation, (uint32_t)used + 1);
 	return (0);
 }
 
@@ -577,6 +701,8 @@ tessera_kbio_meta_free(void *ctx, uint64_t s, uint64_t n)
 	if (tmp_->meta_pending_count >= tmp_->meta_pending_cap)
 		return (-1);
 	tmp_->meta_pending[tmp_->meta_pending_count++] = s;
+	tessera_metatrace(TM_OP_FREE_PUSH, s, tmp_->sb.generation,
+	    tmp_->meta_pending_count);
 	return (0);
 }
 
@@ -744,9 +870,14 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	tmp_->sb    = *active;
 	tmp_->chunk_size_override = chunk_size_override;
 	/* `active` aliases sb_a or sb_b — copy completed, free the
-	 * heap-alloc'd staging copies. */
-	free(sb_a, M_TESSERA);
-	free(sb_b, M_TESSERA);
+	 * heap-alloc'd staging copies. NULL them out so the fail_close
+	 * cleanup at the bottom (which does `if (sb_a) free(sb_a)`) doesn't
+	 * double-free if a later step (e.g. bogus tessera.gen=N) jumps to
+	 * fail_close. Double-free of sector-sized blocks corrupts the
+	 * malloc allocator in a way that manifests as a kernel spin on
+	 * the next allocation — exactly the gen=999 hang signature. */
+	free(sb_a, M_TESSERA); sb_a = NULL;
+	free(sb_b, M_TESSERA); sb_b = NULL;
 
 	/* Wire the kmod block_io shim and open the inode tree against it.
 	 * If the tree open fails (e.g. corrupted root sector) we still
@@ -943,8 +1074,14 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 		const uint64_t mlen   = tmp_->sb.meta_reserve_length;
 		const uint64_t mbump  = tmp_->sb.meta_reserve_bump;
 		size_t bitmap_bytes = (size_t)((mlen + 7) / 8);
+		/* v2 slice-4: this bitmap is also consulted at every
+		 * commit_sb drain to filter snapshot-pinned sectors out of
+		 * meta_pending → meta_free reuse. So instead of allocating
+		 * locally and free()ing at scope exit, persist on the mount. */
 		uint8_t *bitmap = malloc(bitmap_bytes, M_TESSERA,
 		    M_WAITOK | M_ZERO);
+		tmp_->meta_pin_bitmap       = bitmap;
+		tmp_->meta_pin_bitmap_bytes = bitmap_bytes;
 		struct meta_mark_ctx mctx = { bitmap, mstart, mstart + mlen };
 		if (tmp_->inode_tree != NULL)
 			(void)tessera_btree_walk_nodes(tmp_->inode_tree,
@@ -1038,7 +1175,11 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 				freed++;
 			}
 		}
-		free(bitmap, M_TESSERA);
+		/* Bitmap persists on tmp_->meta_pin_bitmap — used by
+		 * commit_sb drain. Freed at unmount. */
+		tessera_metatrace(TM_OP_BITMAP_BUILT, 0,
+		    tmp_->sb.generation,
+		    (uint32_t)tmp_->meta_pin_bitmap_bytes);
 		if (freed > 0)
 			printf("tessera_fs: meta-reserve reclaimed %u orphaned "
 			    "sector(s) from prior session(s)\n", freed);
@@ -1261,8 +1402,9 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 			tessera_btree_close(tmp_->pack_registry_tree);
 		if (tmp_->inode_tree != NULL)
 			tessera_btree_close(tmp_->inode_tree);
-		if (tmp_->meta_free    != NULL) free(tmp_->meta_free, M_TESSERA);
-		if (tmp_->meta_pending != NULL) free(tmp_->meta_pending, M_TESSERA);
+		if (tmp_->meta_free       != NULL) free(tmp_->meta_free, M_TESSERA);
+		if (tmp_->meta_pending    != NULL) free(tmp_->meta_pending, M_TESSERA);
+		if (tmp_->meta_pin_bitmap != NULL) free(tmp_->meta_pin_bitmap, M_TESSERA);
 		if (tmp_->cp != NULL) {
 			g_topology_lock();
 			g_vfs_close(tmp_->cp);
@@ -2344,35 +2486,56 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 		(void)tessera_journal_checkpoint(tmp_->journal);
 
 	/* The new SB is durable, so the OLD SB no longer references any
-	 * of the meta-reserve sectors freed during this commit cycle. Move
-	 * them from the pending list to the reusable free list. The next
-	 * meta_alloc will pop from there before pushing the bump pointer.
+	 * of the meta-reserve sectors freed during this commit cycle.
+	 * Decide what to do with each pending sector:
 	 *
-	 * KNOWN ISSUE (v2 snapshots): retained-snapshot sector pinning is
-	 * NOT enforced here. If a sector freed during this commit is still
-	 * reachable from a retained snapshot's tree, this drain hands it
-	 * back for reuse, eventually corrupting time-machine reads of
-	 * older generations. The mount-time meta-mark recycler does walk
-	 * snapshot trees, so freshly-mounted sessions stay consistent for
-	 * one cycle — but mid-mount mutations break older snapshots. The
-	 * proper fix needs a way to filter the drain by snapshot
-	 * reachability without performing a full multi-tree walk per
-	 * commit (too slow + stack-heavy in callout context). Slice 4
-	 * (retention) will likely sidestep this by capping snapshot
-	 * lifetime so the bug's impact is bounded. */
+	 *   - If meta_pin_bitmap[s] is SET → some retained snapshot still
+	 *     references it. KEEP pinned in meta_pending so it doesn't
+	 *     get reused (would corrupt forensic mounts of that snapshot).
+	 *   - Otherwise → push to meta_free for reuse on the next
+	 *     meta_alloc.
+	 *
+	 * v2 slice-4 fix: this is the gate that stops snapshot corruption.
+	 * The bitmap was built once at mount time by walking every retained
+	 * snapshot's btree (mountfs ~line 1067 below the kbio init). Pinned
+	 * sectors NEVER leave meta_pending until unmount; the next mount's
+	 * orphan-recycler will rebuild the bitmap and decide afresh — at
+	 * which point any newly-aged-out snapshots' sectors get released.
+	 * That's the contract: retention happens at mount, not mid-session.
+	 */
+	tessera_metatrace(TM_OP_DRAIN_BEGIN, 0, tmp_->sb.generation,
+	    tmp_->meta_pending_count);
 	if (tmp_->meta_pending_count > 0 && tmp_->meta_free != NULL) {
-		uint32_t need = tmp_->meta_free_count + tmp_->meta_pending_count;
-		if (need <= tmp_->meta_free_cap) {
-			memcpy(tmp_->meta_free + tmp_->meta_free_count,
-			    tmp_->meta_pending,
-			    tmp_->meta_pending_count * sizeof(uint64_t));
-			tmp_->meta_free_count = need;
+		const uint64_t mstart = tmp_->sb.meta_reserve_start;
+		const uint64_t mlen   = tmp_->sb.meta_reserve_length;
+		uint32_t kept = 0;
+		for (uint32_t i = 0; i < tmp_->meta_pending_count; i++) {
+			uint64_t s = tmp_->meta_pending[i];
+			int pinned = 0;
+			if (tmp_->meta_pin_bitmap != NULL &&
+			    s >= mstart && s < mstart + mlen) {
+				uint64_t bit = s - mstart;
+				if (tmp_->meta_pin_bitmap[bit / 8]
+				    & (1u << (bit % 8))) {
+					pinned = 1;
+				}
+			}
+			if (pinned) {
+				tmp_->meta_pending[kept++] = s;
+				tessera_metatrace(TM_OP_DRAIN_KEEP, s,
+				    tmp_->sb.generation, kept);
+			} else if (tmp_->meta_free_count
+			    < tmp_->meta_free_cap) {
+				tmp_->meta_free[tmp_->meta_free_count++] = s;
+				tessera_metatrace(TM_OP_DRAIN_RELEASE, s,
+				    tmp_->sb.generation,
+				    tmp_->meta_free_count);
+			}
 		}
-		/* If overflow (shouldn't happen — caps are sized to the
-		 * reserve length), drop the pending list — those sectors
-		 * just leak this session, same as the old bump-only path. */
-		tmp_->meta_pending_count = 0;
+		tmp_->meta_pending_count = kept;
 	}
+	tessera_metatrace(TM_OP_DRAIN_END, 0, tmp_->sb.generation,
+	    tmp_->meta_pending_count);
 	return (0);
 }
 
