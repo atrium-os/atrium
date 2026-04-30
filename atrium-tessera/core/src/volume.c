@@ -633,6 +633,12 @@ uint64_t tessera_volume_meta_reserve_length(const tessera_volume_t *v)
 uint64_t tessera_volume_meta_reserve_bump(const tessera_volume_t *v)
 { return v ? v->sb.meta_reserve_bump : 0; }
 
+uint64_t tessera_volume_pack_zone_start(const tessera_volume_t *v)
+{ return v ? v->sb.pack_zone_start : 0; }
+
+uint64_t tessera_volume_pack_zone_length(const tessera_volume_t *v)
+{ return v ? v->sb.pack_zone_length : 0; }
+
 uint16_t tessera_volume_encryption_flags(const tessera_volume_t *v)
 { return v ? v->sb.encryption_flags : 0; }
 

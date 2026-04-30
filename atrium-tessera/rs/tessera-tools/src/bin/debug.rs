@@ -14,7 +14,8 @@ use tessera_sys::{
     tessera_volume_journal_length, tessera_volume_journal_start,
     tessera_volume_meta_reserve_bump, tessera_volume_meta_reserve_length,
     tessera_volume_meta_reserve_start, tessera_volume_open,
-    tessera_volume_pack_registry_root, tessera_volume_snapshots_gen,
+    tessera_volume_pack_registry_root, tessera_volume_pack_zone_length,
+    tessera_volume_pack_zone_start, tessera_volume_snapshots_gen,
     tessera_volume_snapshots_root, tessera_volume_total_sectors,
     tessera_volume_uuid,
 };
@@ -84,6 +85,12 @@ fn run(path: &str) -> Result<(), String> {
     println!("  range:            sectors {mr_start}..{}",
         mr_start + mr_len);
     println!("  bump pointer:     sector {mr_bump} ({mr_used}/{mr_len} used, {mr_pct}%)");
+
+    let pz_start = unsafe { tessera_volume_pack_zone_start(v) };
+    let pz_len   = unsafe { tessera_volume_pack_zone_length(v) };
+    println!("  ── pack zone ───────────────────────────────────────");
+    println!("  range:            sectors {pz_start}..{} ({} sectors / {} MiB)",
+        pz_start + pz_len, pz_len, pz_len / 256);
 
     println!("  ── v3 encryption ───────────────────────────────────");
     if enc_flags == 0 {
