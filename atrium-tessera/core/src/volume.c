@@ -112,20 +112,28 @@ seed_root_dirent(const tessera_block_io_t *shim,
                  uint64_t *pack_root,
                  const tessera_format_opts_t *opts)
 {
-	if (opts->seed_dirent_name == NULL || opts->seed_dirent_name_len == 0)
-		return TESSERA_OK;
-	if (opts->seed_dirent_inode < TESSERA_INODE_FIRST_USER)
+	const int has_seed = (opts->seed_dirent_name != NULL &&
+	                      opts->seed_dirent_name_len > 0);
+	if (has_seed && opts->seed_dirent_inode < TESSERA_INODE_FIRST_USER)
 		return TESSERA_EINVAL;
 
 	int r;
 
-	/* 1. Build the DIRECTORY manifest. */
+	/* 1. Build the DIRECTORY manifest. Always run — even with no
+	 * seed file, we need an empty DIRECTORY blob so inode 2's
+	 * manifest_hash points at a valid (zero-entry) directory.
+	 * Without this, the kmod's vop_create / vop_lookup hit the
+	 * `manifest_hash all zero` branch and return ENOENT for any
+	 * name lookup, breaking the canonical "fresh mkfs + touch
+	 * file" workflow. */
 	tessera_manifest_builder_t *mb =
 	    tessera_manifest_begin(TESSERA_MFT_DIRECTORY);
 	if (mb == NULL) return TESSERA_ENOMEM;
-	r = tessera_manifest_add_dirent(mb, opts->seed_dirent_inode,
-	    opts->seed_dirent_name, opts->seed_dirent_name_len);
-	if (r != TESSERA_OK) { tessera_manifest_free(mb); return r; }
+	if (has_seed) {
+		r = tessera_manifest_add_dirent(mb, opts->seed_dirent_inode,
+		    opts->seed_dirent_name, opts->seed_dirent_name_len);
+		if (r != TESSERA_OK) { tessera_manifest_free(mb); return r; }
+	}
 
 	size_t mft_size = 0;
 	tessera_hash_t mft_hash;
@@ -336,10 +344,10 @@ seed_root_dirent(const tessera_block_io_t *shim,
 		}
 	}
 
-	/* 6. Insert child inode (regular file). manifest_hash + size are
-	 *    set if seed_content was provided; otherwise the file is
-	 *    empty (manifest_hash all-zero sentinel). */
-	{
+	/* 6. Insert child inode (regular file) — only if a seed dirent
+	 *    was requested. The empty-DIRECTORY-manifest path runs above
+	 *    unconditionally so inode 2 always has a valid manifest_hash. */
+	if (has_seed) {
 		tessera_inode_record_t ino;
 		memset(&ino, 0, sizeof ino);
 		ino.inode_no = (uint32_t)opts->seed_dirent_inode;
@@ -490,10 +498,15 @@ tessera_volume_format(const tessera_block_io_t *io,
 		return r;
 	}
 
-	/* 5a. Optional: seed a single dirent in the root directory. Builds
-	 * a manifest, packages it, allocates pack-zone sectors, registers
-	 * the pack, inserts the child inode, re-puts inode 2 with the
-	 * directory's manifest_hash. */
+	/* 5a. Publish the root directory's manifest. Always runs — even
+	 * with no seed file, we emit an empty DIRECTORY manifest pack
+	 * and re-put inode 2 with that hash. Without this, freshly-
+	 * formatted volumes left inode 2.manifest_hash all-zero, which
+	 * the kmod's vop_lookup / vop_create paths treat as "no such
+	 * directory" — so `touch /mnt/tessera/foo` immediately after
+	 * mkfs returned ENOENT. The optional seed dirent + child inode
+	 * are added inside seed_root_dirent when seed_dirent_name is
+	 * non-NULL. */
 	r = seed_root_dirent(&shim, ea, t1, t2,
 	    &inode_root, &pack_registry_root, opts);
 	if (r != TESSERA_OK) {
