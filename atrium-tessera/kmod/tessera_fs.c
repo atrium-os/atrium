@@ -390,6 +390,7 @@ static int tessera_replay_handler(void *ctx,
     const tessera_record_header_t *hdr, const uint8_t *body);
 struct meta_mark_ctx { uint8_t *bitmap; uint64_t lo; uint64_t hi; };
 static int meta_mark_visitor(void *ctx, uint64_t sector);
+static void tessera_meta_pin_bitmap_rebuild(struct tessera_mount *tmp_);
 static int tessera_fs_gc_data_zone(struct tessera_mount *tmp_);
 static int tessera_fs_read_full_content(struct tessera_mount *tmp_,
     const tessera_inode_record_t *ino,
@@ -2695,10 +2696,7 @@ tessera_vop_setattr(struct vop_setattr_args *ap)
 			return (EIO);
 	}
 
-	if (did_resize) {
-		if (tessera_commit_extent(tmp_) != 0)
-			return (EIO);
-	}
+	(void)did_resize;
 	tessera_fs_mark_dirty(tmp_);
 	return (0);
 }
@@ -2826,12 +2824,12 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 		 * (which is exactly the failure mode that hung the VM in
 		 * earlier slice-4 attempts).
 		 *
-		 * Skipped while flush_unmounting=1 — at unmount we just
-		 * want the SB durable, not a structural rewrite of the
-		 * snapshots tree.
+		 * Runs at every commit, including unmount-flush — workloads
+		 * that only commit at umount (the deferred-commit common
+		 * case) need retention to fire there too, otherwise
+		 * snapshots_gen grows unboundedly mount-to-mount.
 		 */
-		if (!tmp_->flush_unmounting &&
-		    tessera_snapshot_retention > 0 &&
+		if (tessera_snapshot_retention > 0 &&
 		    tmp_->sb.snapshots_gen >
 		        (uint64_t)tessera_snapshot_retention) {
 			tessera_btree_cursor_t *sc =
@@ -2856,6 +2854,22 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 						    TM_OP_SNAPSHOT_REC,
 						    1 /* retire marker */,
 						    orec.generation, 0);
+						/* The retired snapshot's
+						 * tree sectors are no longer
+						 * pinned by anything (unless
+						 * shared via COW with a
+						 * surviving snapshot). Rebuild
+						 * the bitmap from the new
+						 * retained set so the next
+						 * meta_pending drain releases
+						 * sectors that just lost
+						 * their last referent.
+						 * Without this rebuild,
+						 * sustained-write workloads
+						 * exhaust meta-reserve in a
+						 * few hundred commits (bug #2). */
+						tessera_meta_pin_bitmap_rebuild(
+						    tmp_);
 					}
 				} else {
 					tessera_btree_cursor_free(sc);
@@ -3589,6 +3603,98 @@ meta_mark_visitor(void *ctx, uint64_t sector)
 		m->bitmap[bit / 8] |= (uint8_t)(1u << (bit % 8));
 	}
 	return (0);
+}
+
+/*
+ * Rebuild meta_pin_bitmap from scratch by walking every meta-reserve
+ * sector that's reachable from a root the SB still cares about: the
+ * four live trees + every retained snapshot's three trees. Used at
+ * mount time and at retention time (commit_sb drops oldest snapshot).
+ *
+ * Without a mid-session rebuild, sectors pinned by a now-retired
+ * snapshot stay pinned in meta_pending until the next mount — meaning
+ * sustained-write workloads exhaust the meta-reserve in a few hundred
+ * commits even with a small retention horizon (bug #2).
+ *
+ * Caller must hold flush_in_progress (so live trees aren't being COW'd
+ * underfoot). Mount-time caller is single-threaded; commit_sb caller
+ * is serialised by flush_in_progress.
+ */
+static void
+tessera_meta_pin_bitmap_rebuild(struct tessera_mount *tmp_)
+{
+	if (tmp_->meta_pin_bitmap == NULL) return;
+	memset(tmp_->meta_pin_bitmap, 0, tmp_->meta_pin_bitmap_bytes);
+
+	struct meta_mark_ctx mctx = {
+		tmp_->meta_pin_bitmap,
+		tmp_->sb.meta_reserve_start,
+		tmp_->sb.meta_reserve_start + tmp_->sb.meta_reserve_length,
+	};
+
+	if (tmp_->inode_tree != NULL)
+		(void)tessera_btree_walk_nodes(tmp_->inode_tree,
+		    meta_mark_visitor, &mctx);
+	if (tmp_->pack_registry_tree != NULL)
+		(void)tessera_btree_walk_nodes(tmp_->pack_registry_tree,
+		    meta_mark_visitor, &mctx);
+	if (tmp_->sb.free_extent_root != 0) {
+		tessera_btree_t *fet = tessera_btree_open(&tmp_->meta_bio,
+		    tmp_->sb.free_extent_root, /*tree_kind*/ 2,
+		    /*key*/ 8, /*value*/ 8);
+		if (fet != NULL) {
+			(void)tessera_btree_walk_nodes(fet,
+			    meta_mark_visitor, &mctx);
+			tessera_btree_close(fet);
+		}
+	}
+	if (tmp_->snapshots_tree == NULL) return;
+
+	(void)tessera_btree_walk_nodes(tmp_->snapshots_tree,
+	    meta_mark_visitor, &mctx);
+	tessera_btree_cursor_t *sc =
+	    tessera_btree_seek_first(tmp_->snapshots_tree);
+	while (sc != NULL) {
+		uint8_t sk[8];
+		tessera_snapshot_record_t srec;
+		if (tessera_btree_cursor_get(sc, sk, &srec) != TESSERA_OK)
+			break;
+		if (srec.inode_root != 0 &&
+		    srec.inode_root != tmp_->sb.inode_root) {
+			tessera_btree_t *t = tessera_btree_open(&tmp_->meta_bio,
+			    srec.inode_root, /*tree_kind*/ 0, /*key*/ 4,
+			    /*value*/ TESSERA_INODE_RECORD_SIZE);
+			if (t != NULL) {
+				(void)tessera_btree_walk_nodes(t,
+				    meta_mark_visitor, &mctx);
+				tessera_btree_close(t);
+			}
+		}
+		if (srec.pack_registry_root != 0 &&
+		    srec.pack_registry_root != tmp_->sb.pack_registry_root) {
+			tessera_btree_t *t = tessera_btree_open(&tmp_->meta_bio,
+			    srec.pack_registry_root, /*tree_kind*/ 1,
+			    /*key*/ 16, /*value*/ TESSERA_REGISTRY_ENTRY_SIZE);
+			if (t != NULL) {
+				(void)tessera_btree_walk_nodes(t,
+				    meta_mark_visitor, &mctx);
+				tessera_btree_close(t);
+			}
+		}
+		if (srec.free_extent_root != 0 &&
+		    srec.free_extent_root != tmp_->sb.free_extent_root) {
+			tessera_btree_t *t = tessera_btree_open(&tmp_->meta_bio,
+			    srec.free_extent_root, /*tree_kind*/ 2,
+			    /*key*/ 8, /*value*/ 8);
+			if (t != NULL) {
+				(void)tessera_btree_walk_nodes(t,
+				    meta_mark_visitor, &mctx);
+				tessera_btree_close(t);
+			}
+		}
+		if (tessera_btree_cursor_next(sc) != TESSERA_OK) break;
+	}
+	if (sc != NULL) tessera_btree_cursor_free(sc);
 }
 
 /*
@@ -5637,7 +5743,6 @@ tessera_vop_remove(struct vop_remove_args *ap)
 	 * hardlinks survive. */
 	(void)tessera_fs_inode_unlink(tmp_, (uint32_t)cn->inode_no);
 
-	if (tessera_commit_extent(tmp_) != 0) return (EIO);
 	tessera_fs_mark_dirty(tmp_);
 	return (0);
 }
@@ -5741,7 +5846,8 @@ tessera_fs_replace_content(struct tessera_mount *tmp_, uint32_t inode_no,
 	tessera_manifest_free(mb);
 
 	tessera_hash_t pub_hash;
-	if (tessera_fs_publish_manifest(tmp_, mft, mlen, pub_hash) != 0) {
+	if (tessera_fs_publish_manifest_owned(tmp_, mft, mlen, pub_hash,
+	    inode_no) != 0) {
 		free(mft, M_TESSERA);
 		return (EIO);
 	}
@@ -6016,13 +6122,11 @@ tessera_vop_create(struct vop_create_args *ap)
 	*vpp = cvp;
 
 	/* 6. Commit. */
-	/* v2-step-2a: SB write is deferred; mark_dirty arms the flush
-	 * callout. commit_extent stays synchronous because it advances
-	 * tmp_->sb.free_extent_root in lockstep with on-disk btree node
-	 * writes that cannot be replayed from the journal. */
-	if (tessera_commit_extent(tmp_) != 0) {
-		err = EIO; goto out;
-	}
+	/* v2-step-2a: SB write + commit_extent are both deferred to
+	 * tessera_fs_flush. extent_flush_via builds a fresh tree from
+	 * the in-memory state on each call without freeing the old
+	 * one's sectors — calling it per-vop leaks meta-reserve at
+	 * ~3 sectors per call (bug #2). */
 	tessera_fs_mark_dirty(tmp_);
 
 out:
@@ -6103,7 +6207,6 @@ tessera_vop_write(struct vop_write_args *ap)
 			tessera_stat_append_fast_ok++;
 			tessera_stat_vop_write_chunked++;
 			free(new_bytes, M_TESSERA);
-			if (tessera_commit_extent(tmp_) != 0) return (EIO);
 			tessera_fs_mark_dirty(tmp_);
 			return (0);
 		}
@@ -6148,8 +6251,6 @@ tessera_vop_write(struct vop_write_args *ap)
 	free(full, M_TESSERA);
 	if (rc != 0) return (rc);
 
-	if (tessera_commit_extent(tmp_) != 0)
-		return (EIO);
 	tessera_fs_mark_dirty(tmp_);
 	return (0);
 }
@@ -6239,13 +6340,11 @@ tessera_vop_mkdir(struct vop_mkdir_args *ap)
 	}
 	*vpp = cvp;
 
-	/* v2-step-2a: SB write is deferred; mark_dirty arms the flush
-	 * callout. commit_extent stays synchronous because it advances
-	 * tmp_->sb.free_extent_root in lockstep with on-disk btree node
-	 * writes that cannot be replayed from the journal. */
-	if (tessera_commit_extent(tmp_) != 0) {
-		err = EIO; goto out;
-	}
+	/* v2-step-2a: SB write + commit_extent are both deferred to
+	 * tessera_fs_flush. extent_flush_via builds a fresh tree from
+	 * the in-memory state on each call without freeing the old
+	 * one's sectors — calling it per-vop leaks meta-reserve at
+	 * ~3 sectors per call (bug #2). */
 	tessera_fs_mark_dirty(tmp_);
 
 out:
@@ -6308,8 +6407,6 @@ tessera_vop_rmdir(struct vop_rmdir_args *ap)
 	else
 		tmp_->sb.inode_root = new_inode_root;
 
-	if (tessera_commit_extent(tmp_) != 0)
-		return (EIO);
 	tessera_fs_mark_dirty(tmp_);
 	return (0);
 }
@@ -6399,13 +6496,11 @@ tessera_vop_symlink(struct vop_symlink_args *ap)
 	}
 	*vpp = cvp;
 
-	/* v2-step-2a: SB write is deferred; mark_dirty arms the flush
-	 * callout. commit_extent stays synchronous because it advances
-	 * tmp_->sb.free_extent_root in lockstep with on-disk btree node
-	 * writes that cannot be replayed from the journal. */
-	if (tessera_commit_extent(tmp_) != 0) {
-		err = EIO; goto out;
-	}
+	/* v2-step-2a: SB write + commit_extent are both deferred to
+	 * tessera_fs_flush. extent_flush_via builds a fresh tree from
+	 * the in-memory state on each call without freeing the old
+	 * one's sectors — calling it per-vop leaks meta-reserve at
+	 * ~3 sectors per call (bug #2). */
 	tessera_fs_mark_dirty(tmp_);
 
 out:
@@ -6501,8 +6596,6 @@ tessera_vop_link(struct vop_link_args *ap)
 		return (err);
 	}
 
-	if (tessera_commit_extent(tmp_) != 0)
-		return (EIO);
 	tessera_fs_mark_dirty(tmp_);
 	return (0);
 }
@@ -6768,10 +6861,7 @@ tessera_vop_rename(struct vop_rename_args *ap)
 	}
 	if (err != 0) goto release;
 
-	if (tessera_commit_extent(tmp_) != 0)
-		err = EIO;
-	else
-		tessera_fs_mark_dirty(tmp_);
+	tessera_fs_mark_dirty(tmp_);
 
 release:
 	/* fdvp + fvp came UNLOCKED → vrele only */
