@@ -4,7 +4,13 @@
 
 set timeout 180
 set bsd_dir [lindex $argv 0]
-set ssh_pubkey [lindex $argv 1]
+# argv[1] is the pubkey FILE PATH. Earlier versions of this script used
+# the value verbatim, which silently produced useless authorized_keys
+# (the path string itself was stored as the key). Now we read the file.
+set pubkey_path [lindex $argv 1]
+set f [open $pubkey_path r]
+set ssh_pubkey [string trim [read $f]]
+close $f
 set root_pw "fresco"
 
 log_user 1

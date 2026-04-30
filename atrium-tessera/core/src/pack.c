@@ -381,6 +381,18 @@ tessera_pack_lookup(const tessera_pack_reader_t *r,
 	return TESSERA_ENOENT;
 }
 
+int
+tessera_pack_blob_hash_at(const tessera_pack_reader_t *r, uint32_t index,
+                          tessera_hash_t out)
+{
+	if (r == NULL || out == NULL) return TESSERA_EINVAL;
+	if (index >= r->header.blob_count) return TESSERA_EINVAL;
+	const uint8_t *e = r->index_base +
+	    (size_t)index * TESSERA_PACK_INDEX_ENTRY_SIZE;
+	memcpy(out, e, 32);
+	return TESSERA_OK;
+}
+
 void
 tessera_pack_close(tessera_pack_reader_t *r)
 {

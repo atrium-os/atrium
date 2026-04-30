@@ -51,6 +51,11 @@ int      tessera_pack_lookup(const tessera_pack_reader_t *,
                              const uint8_t **out_bytes,
                              uint32_t *out_len);
 
+/* Read the i-th blob's hash from the index. Used by GC to enumerate
+ * what each pack contains without an O(N) full scan. */
+int      tessera_pack_blob_hash_at(const tessera_pack_reader_t *,
+                                   uint32_t index, tessera_hash_t out);
+
 /* Bloom filter quick check. Returns 1 if hash *might* be present,
  * 0 if definitely absent. Lookup still required to confirm. */
 int tessera_pack_bloom_might_contain(const tessera_pack_reader_t *,

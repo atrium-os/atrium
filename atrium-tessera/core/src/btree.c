@@ -39,7 +39,7 @@
 #include "tessera_compat.h"
 
 #define BLOCK_SIZE     TESSERA_SECTOR_SIZE
-#define HEADER_SIZE    32u                 /* sizeof(tessera_btree_node_header_t) */
+#define HEADER_SIZE    64u                 /* sizeof(tessera_btree_node_header_t) */
 #define MAX_DEPTH      16u                 /* >> 4096^16 keys */
 
 /* ── tessera_btree_t — open handle ───────────────────────────────── */
@@ -303,9 +303,16 @@ put_into_leaf(tessera_btree_t *t, uint64_t old_sector,
               const void *key, const void *value,
               struct put_result *res)
 {
-	uint8_t block[BLOCK_SIZE];
-	int r = load_node(t, old_sector, block);
-	if (r != TESSERA_OK) return r;
+	/* All BLOCK_SIZE buffers heap-allocated: stack budget in the
+	 * FreeBSD kmod context (4-page kstack) cannot afford 4 KiB stack
+	 * arrays at every recursion level. */
+	uint8_t *block = tessera_zalloc(BLOCK_SIZE);
+	uint8_t *left_block = NULL, *right_block = NULL;
+	uint8_t *flat = NULL;
+	int rc;
+	if (block == NULL) { rc = TESSERA_ENOMEM; goto out; }
+	rc = load_node(t, old_sector, block);
+	if (rc != TESSERA_OK) goto out;
 
 	tessera_btree_node_header_t h;
 	(void)read_header(block, &h);
@@ -316,23 +323,21 @@ put_into_leaf(tessera_btree_t *t, uint64_t old_sector,
 	    &exact);
 
 	if (exact) {
-		/* Update in place — same number of entries. */
 		uint8_t *e = leaf_entries(block) + (size_t)idx * es;
 		memcpy(e + t->key_size, value, t->value_size);
 
 		uint64_t s;
-		if (alloc_node(t, &s) != TESSERA_OK) return TESSERA_ENOSPC;
-		if (flush_node(t, s, block, 0, h.entry_count) != TESSERA_OK)
-			return TESSERA_EIO;
+		if (alloc_node(t, &s) != TESSERA_OK) { rc = TESSERA_ENOSPC; goto out; }
+		if (flush_node(t, s, block, 0, h.entry_count) != TESSERA_OK) {
+			rc = TESSERA_EIO; goto out;
+		}
 		(void)free_node(t, old_sector);
 		res->split = 0; res->new_left = s;
-		return TESSERA_OK;
+		rc = TESSERA_OK; goto out;
 	}
 
-	/* Insert new entry at position (idx + 1). */
 	int ins = idx + 1;
 	if (h.entry_count + 1 <= t->leaf_fanout) {
-		/* Fits — copy with shift. */
 		uint8_t *base = leaf_entries(block);
 		memmove(base + (size_t)(ins + 1) * es,
 		        base + (size_t)ins * es,
@@ -342,19 +347,18 @@ put_into_leaf(tessera_btree_t *t, uint64_t old_sector,
 		    t->value_size);
 
 		uint64_t s;
-		if (alloc_node(t, &s) != TESSERA_OK) return TESSERA_ENOSPC;
-		if (flush_node(t, s, block, 0, h.entry_count + 1) != TESSERA_OK)
-			return TESSERA_EIO;
+		if (alloc_node(t, &s) != TESSERA_OK) { rc = TESSERA_ENOSPC; goto out; }
+		if (flush_node(t, s, block, 0, h.entry_count + 1) != TESSERA_OK) {
+			rc = TESSERA_EIO; goto out;
+		}
 		(void)free_node(t, old_sector);
 		res->split = 0; res->new_left = s;
-		return TESSERA_OK;
+		rc = TESSERA_OK; goto out;
 	}
 
-	/* Split. Build a flat array of (entry_count+1) entries including
-	 * the new one, then split halfway. */
 	const uint32_t total = h.entry_count + 1;
-	uint8_t *flat = tessera_malloc((size_t)total * es);
-	if (flat == NULL) return TESSERA_ENOMEM;
+	flat = tessera_malloc((size_t)total * es);
+	if (flat == NULL) { rc = TESSERA_ENOMEM; goto out; }
 	const uint8_t *base = leaf_entries_const(block);
 	memcpy(flat, base, (size_t)ins * es);
 	memcpy(flat + (size_t)ins * es, key, t->key_size);
@@ -366,7 +370,9 @@ put_into_leaf(tessera_btree_t *t, uint64_t old_sector,
 	const uint32_t left_n  = total / 2;
 	const uint32_t right_n = total - left_n;
 
-	uint8_t left_block[BLOCK_SIZE], right_block[BLOCK_SIZE];
+	left_block  = tessera_zalloc(BLOCK_SIZE);
+	right_block = tessera_zalloc(BLOCK_SIZE);
+	if (left_block == NULL || right_block == NULL) { rc = TESSERA_ENOMEM; goto out; }
 	write_header(left_block,  t, 0, left_n);
 	write_header(right_block, t, 0, right_n);
 	memcpy(leaf_entries(left_block),  flat,
@@ -374,24 +380,28 @@ put_into_leaf(tessera_btree_t *t, uint64_t old_sector,
 	memcpy(leaf_entries(right_block), flat + (size_t)left_n * es,
 	    (size_t)right_n * es);
 
-	/* Split key for parent = first key of right half. */
 	memcpy(res->split_key, flat + (size_t)left_n * es, t->key_size);
 
-	tessera_free(flat);
-
 	uint64_t sl, sr;
-	if (alloc_node(t, &sl) != TESSERA_OK) return TESSERA_ENOSPC;
+	if (alloc_node(t, &sl) != TESSERA_OK) { rc = TESSERA_ENOSPC; goto out; }
 	if (alloc_node(t, &sr) != TESSERA_OK) {
 		(void)free_node(t, sl);
-		return TESSERA_ENOSPC;
+		rc = TESSERA_ENOSPC; goto out;
 	}
 	if (flush_node(t, sl, left_block,  0, left_n)  != TESSERA_OK ||
-	    flush_node(t, sr, right_block, 0, right_n) != TESSERA_OK)
-		return TESSERA_EIO;
+	    flush_node(t, sr, right_block, 0, right_n) != TESSERA_OK) {
+		rc = TESSERA_EIO; goto out;
+	}
 	(void)free_node(t, old_sector);
 
 	res->split = 1; res->new_left = sl; res->new_right = sr;
-	return TESSERA_OK;
+	rc = TESSERA_OK;
+out:
+	if (block)       tessera_free(block);
+	if (left_block)  tessera_free(left_block);
+	if (right_block) tessera_free(right_block);
+	if (flat)        tessera_free(flat);
+	return rc;
 }
 
 static int
@@ -399,9 +409,13 @@ put_into_internal(tessera_btree_t *t, uint64_t old_sector,
                   const void *key, const void *value,
                   struct put_result *res)
 {
-	uint8_t block[BLOCK_SIZE];
-	int r = load_node(t, old_sector, block);
-	if (r != TESSERA_OK) return r;
+	uint8_t *block = tessera_zalloc(BLOCK_SIZE);
+	uint8_t *cblk = NULL, *left_block = NULL, *right_block = NULL;
+	uint8_t *flat = NULL;
+	int rc;
+	if (block == NULL) { rc = TESSERA_ENOMEM; goto out; }
+	rc = load_node(t, old_sector, block);
+	if (rc != TESSERA_OK) goto out;
 
 	tessera_btree_node_header_t h;
 	(void)read_header(block, &h);
@@ -413,33 +427,32 @@ put_into_internal(tessera_btree_t *t, uint64_t old_sector,
 	memcpy(&child_sector, child_entry + t->key_size, 8);
 
 	struct put_result child_res;
-	{
-		uint8_t cblk[BLOCK_SIZE];
-		r = load_node(t, child_sector, cblk);
-		if (r != TESSERA_OK) return r;
-		tessera_btree_node_header_t ch;
-		(void)read_header(cblk, &ch);
-		if (ch.node_kind == 0)
-			r = put_into_leaf(t, child_sector, key, value, &child_res);
-		else
-			r = put_into_internal(t, child_sector, key, value, &child_res);
-		if (r != TESSERA_OK) return r;
-	}
+	cblk = tessera_zalloc(BLOCK_SIZE);
+	if (cblk == NULL) { rc = TESSERA_ENOMEM; goto out; }
+	rc = load_node(t, child_sector, cblk);
+	if (rc != TESSERA_OK) goto out;
+	tessera_btree_node_header_t ch;
+	(void)read_header(cblk, &ch);
+	tessera_free(cblk); cblk = NULL;  /* free before recursion to keep heap pressure low */
+	if (ch.node_kind == 0)
+		rc = put_into_leaf(t, child_sector, key, value, &child_res);
+	else
+		rc = put_into_internal(t, child_sector, key, value, &child_res);
+	if (rc != TESSERA_OK) goto out;
 
-	/* Update the child pointer. */
 	memcpy(child_entry + t->key_size, &child_res.new_left, 8);
 
 	if (!child_res.split) {
 		uint64_t s;
-		if (alloc_node(t, &s) != TESSERA_OK) return TESSERA_ENOSPC;
-		if (flush_node(t, s, block, 1, h.entry_count) != TESSERA_OK)
-			return TESSERA_EIO;
+		if (alloc_node(t, &s) != TESSERA_OK) { rc = TESSERA_ENOSPC; goto out; }
+		if (flush_node(t, s, block, 1, h.entry_count) != TESSERA_OK) {
+			rc = TESSERA_EIO; goto out;
+		}
 		(void)free_node(t, old_sector);
 		res->split = 0; res->new_left = s;
-		return TESSERA_OK;
+		rc = TESSERA_OK; goto out;
 	}
 
-	/* Insert (split_key, new_right) at position idx+1. */
 	int ins = idx + 1;
 	if (h.entry_count + 1 <= t->inner_fanout) {
 		uint8_t *base = leaf_entries(block);
@@ -451,18 +464,18 @@ put_into_internal(tessera_btree_t *t, uint64_t old_sector,
 		       &child_res.new_right, 8);
 
 		uint64_t s;
-		if (alloc_node(t, &s) != TESSERA_OK) return TESSERA_ENOSPC;
-		if (flush_node(t, s, block, 1, h.entry_count + 1) != TESSERA_OK)
-			return TESSERA_EIO;
+		if (alloc_node(t, &s) != TESSERA_OK) { rc = TESSERA_ENOSPC; goto out; }
+		if (flush_node(t, s, block, 1, h.entry_count + 1) != TESSERA_OK) {
+			rc = TESSERA_EIO; goto out;
+		}
 		(void)free_node(t, old_sector);
 		res->split = 0; res->new_left = s;
-		return TESSERA_OK;
+		rc = TESSERA_OK; goto out;
 	}
 
-	/* Internal split. */
 	const uint32_t total = h.entry_count + 1;
-	uint8_t *flat = tessera_malloc((size_t)total * es);
-	if (flat == NULL) return TESSERA_ENOMEM;
+	flat = tessera_malloc((size_t)total * es);
+	if (flat == NULL) { rc = TESSERA_ENOMEM; goto out; }
 	const uint8_t *base = leaf_entries_const(block);
 	memcpy(flat, base, (size_t)ins * es);
 	memcpy(flat + (size_t)ins * es, child_res.split_key, t->key_size);
@@ -475,7 +488,9 @@ put_into_internal(tessera_btree_t *t, uint64_t old_sector,
 	const uint32_t left_n  = total / 2;
 	const uint32_t right_n = total - left_n;
 
-	uint8_t left_block[BLOCK_SIZE], right_block[BLOCK_SIZE];
+	left_block  = tessera_zalloc(BLOCK_SIZE);
+	right_block = tessera_zalloc(BLOCK_SIZE);
+	if (left_block == NULL || right_block == NULL) { rc = TESSERA_ENOMEM; goto out; }
 	write_header(left_block,  t, 1, left_n);
 	write_header(right_block, t, 1, right_n);
 	memcpy(leaf_entries(left_block),  flat,
@@ -485,21 +500,27 @@ put_into_internal(tessera_btree_t *t, uint64_t old_sector,
 
 	memcpy(res->split_key, flat + (size_t)left_n * es, t->key_size);
 
-	tessera_free(flat);
-
 	uint64_t sl, sr;
-	if (alloc_node(t, &sl) != TESSERA_OK) return TESSERA_ENOSPC;
+	if (alloc_node(t, &sl) != TESSERA_OK) { rc = TESSERA_ENOSPC; goto out; }
 	if (alloc_node(t, &sr) != TESSERA_OK) {
 		(void)free_node(t, sl);
-		return TESSERA_ENOSPC;
+		rc = TESSERA_ENOSPC; goto out;
 	}
 	if (flush_node(t, sl, left_block,  1, left_n)  != TESSERA_OK ||
-	    flush_node(t, sr, right_block, 1, right_n) != TESSERA_OK)
-		return TESSERA_EIO;
+	    flush_node(t, sr, right_block, 1, right_n) != TESSERA_OK) {
+		rc = TESSERA_EIO; goto out;
+	}
 	(void)free_node(t, old_sector);
 
 	res->split = 1; res->new_left = sl; res->new_right = sr;
-	return TESSERA_OK;
+	rc = TESSERA_OK;
+out:
+	if (block)       tessera_free(block);
+	if (cblk)        tessera_free(cblk);
+	if (left_block)  tessera_free(left_block);
+	if (right_block) tessera_free(right_block);
+	if (flat)        tessera_free(flat);
+	return rc;
 }
 
 int
@@ -512,39 +533,39 @@ tessera_btree_put(tessera_btree_t *t, const void *key, const void *value,
 	struct put_result res;
 	memset(&res, 0, sizeof res);
 
-	/* Decide whether root is leaf or internal. */
-	uint8_t block[BLOCK_SIZE];
-	int r = load_node(t, t->root, block);
-	if (r != TESSERA_OK) return r;
+	uint8_t *block = tessera_zalloc(BLOCK_SIZE);
+	uint8_t *lb = NULL, *newroot = NULL;
+	int rc;
+	if (block == NULL) { rc = TESSERA_ENOMEM; goto out; }
+	rc = load_node(t, t->root, block);
+	if (rc != TESSERA_OK) goto out;
 	tessera_btree_node_header_t h;
 	(void)read_header(block, &h);
+	tessera_free(block); block = NULL;  /* free before recursing */
 
 	if (h.node_kind == 0)
-		r = put_into_leaf(t, t->root, key, value, &res);
+		rc = put_into_leaf(t, t->root, key, value, &res);
 	else
-		r = put_into_internal(t, t->root, key, value, &res);
-	if (r != TESSERA_OK) return r;
+		rc = put_into_internal(t, t->root, key, value, &res);
+	if (rc != TESSERA_OK) goto out;
 
 	if (!res.split) {
 		t->root = res.new_left;
 		*out_new_root = t->root;
-		return TESSERA_OK;
+		rc = TESSERA_OK; goto out;
 	}
 
-	/* Root split: build a new internal root with two entries. The
-	 * leftmost entry's key is the smallest key of new_left's subtree;
-	 * we recover it by reading new_left's first key. */
-	uint8_t lb[BLOCK_SIZE];
-	r = load_node(t, res.new_left, lb);
-	if (r != TESSERA_OK) return r;
+	/* Root split: build a new internal root with two entries. */
+	lb = tessera_zalloc(BLOCK_SIZE);
+	if (lb == NULL) { rc = TESSERA_ENOMEM; goto out; }
+	rc = load_node(t, res.new_left, lb);
+	if (rc != TESSERA_OK) goto out;
 	uint8_t left_min_key[64];
-	const uint8_t *first =
-	    leaf_entries_const(lb) +
-	    /* leaf entry size if leaf, inner entry size otherwise */
-	    0;
+	const uint8_t *first = leaf_entries_const(lb);
 	memcpy(left_min_key, first, t->key_size);
 
-	uint8_t newroot[BLOCK_SIZE];
+	newroot = tessera_zalloc(BLOCK_SIZE);
+	if (newroot == NULL) { rc = TESSERA_ENOMEM; goto out; }
 	const uint32_t es = inner_entry_size(t);
 	write_header(newroot, t, 1, 2);
 	uint8_t *base = leaf_entries(newroot);
@@ -554,12 +575,18 @@ tessera_btree_put(tessera_btree_t *t, const void *key, const void *value,
 	memcpy(base + es + t->key_size, &res.new_right, 8);
 
 	uint64_t rs;
-	if (alloc_node(t, &rs) != TESSERA_OK) return TESSERA_ENOSPC;
-	if (flush_node(t, rs, newroot, 1, 2) != TESSERA_OK)
-		return TESSERA_EIO;
+	if (alloc_node(t, &rs) != TESSERA_OK) { rc = TESSERA_ENOSPC; goto out; }
+	if (flush_node(t, rs, newroot, 1, 2) != TESSERA_OK) {
+		rc = TESSERA_EIO; goto out;
+	}
 	t->root = rs;
 	*out_new_root = rs;
-	return TESSERA_OK;
+	rc = TESSERA_OK;
+out:
+	if (block)   tessera_free(block);
+	if (lb)      tessera_free(lb);
+	if (newroot) tessera_free(newroot);
+	return rc;
 }
 
 /* ── delete — leaf-only deletion + opportunistic root collapse ───── */
@@ -575,9 +602,11 @@ static int
 delete_recurse(tessera_btree_t *t, uint64_t cur, const void *key,
                uint64_t *out_new, int *out_dropped)
 {
-	uint8_t block[BLOCK_SIZE];
-	int r = load_node(t, cur, block);
-	if (r != TESSERA_OK) return r;
+	uint8_t *block = tessera_zalloc(BLOCK_SIZE);
+	int rc;
+	if (block == NULL) { rc = TESSERA_ENOMEM; goto out; }
+	rc = load_node(t, cur, block);
+	if (rc != TESSERA_OK) goto out;
 	tessera_btree_node_header_t h;
 	(void)read_header(block, &h);
 	*out_dropped = 0;
@@ -587,12 +616,12 @@ delete_recurse(tessera_btree_t *t, uint64_t cur, const void *key,
 		int exact;
 		int idx = search_leaf(block, h.entry_count, t->key_size, es,
 		    key, &exact);
-		if (!exact) return TESSERA_ENOENT;
+		if (!exact) { rc = TESSERA_ENOENT; goto out; }
 
 		if (h.entry_count == 1) {
 			(void)free_node(t, cur);
 			*out_dropped = 1;
-			return TESSERA_OK;
+			rc = TESSERA_OK; goto out;
 		}
 
 		uint8_t *base = leaf_entries(block);
@@ -601,53 +630,77 @@ delete_recurse(tessera_btree_t *t, uint64_t cur, const void *key,
 		        (size_t)(h.entry_count - idx - 1) * es);
 
 		uint64_t s;
-		if (alloc_node(t, &s) != TESSERA_OK) return TESSERA_ENOSPC;
-		if (flush_node(t, s, block, 0, h.entry_count - 1) != TESSERA_OK)
-			return TESSERA_EIO;
+		if (alloc_node(t, &s) != TESSERA_OK) { rc = TESSERA_ENOSPC; goto out; }
+		if (flush_node(t, s, block, 0, h.entry_count - 1) != TESSERA_OK) {
+			rc = TESSERA_EIO; goto out;
+		}
 		(void)free_node(t, cur);
 		*out_new = s;
-		return TESSERA_OK;
+		rc = TESSERA_OK; goto out;
 	}
 
-	/* Internal. */
+	/* Internal — recurse, but free `block` first to keep heap usage flat. */
 	const uint32_t es = inner_entry_size(t);
 	int idx = search_internal(block, h.entry_count, t->key_size, es, key);
 	uint8_t *child_entry = leaf_entries(block) + (size_t)idx * es;
 	uint64_t child_sector;
 	memcpy(&child_sector, child_entry + t->key_size, 8);
+	uint32_t saved_entry_count = h.entry_count;
+	int saved_idx = idx;
+	/* Stash a private copy of `block` before recursing — recursion may
+	 * need its own heap budget. */
+	uint8_t *parent = block;
+	block = NULL;
 
 	uint64_t new_child = 0;
 	int dropped = 0;
-	r = delete_recurse(t, child_sector, key, &new_child, &dropped);
-	if (r != TESSERA_OK) return r;
+	rc = delete_recurse(t, child_sector, key, &new_child, &dropped);
+	if (rc != TESSERA_OK) { tessera_free(parent); goto out; }
 
 	if (dropped) {
-		if (h.entry_count == 1) {
+		if (saved_entry_count == 1) {
 			(void)free_node(t, cur);
 			*out_dropped = 1;
-			return TESSERA_OK;
+			tessera_free(parent);
+			rc = TESSERA_OK; goto out;
 		}
-		uint8_t *base = leaf_entries(block);
-		memmove(base + (size_t)idx * es,
-		        base + (size_t)(idx + 1) * es,
-		        (size_t)(h.entry_count - idx - 1) * es);
+		uint8_t *base = leaf_entries(parent);
+		memmove(base + (size_t)saved_idx * es,
+		        base + (size_t)(saved_idx + 1) * es,
+		        (size_t)(saved_entry_count - saved_idx - 1) * es);
 		uint64_t s;
-		if (alloc_node(t, &s) != TESSERA_OK) return TESSERA_ENOSPC;
-		if (flush_node(t, s, block, 1, h.entry_count - 1) != TESSERA_OK)
-			return TESSERA_EIO;
+		if (alloc_node(t, &s) != TESSERA_OK) {
+			tessera_free(parent);
+			rc = TESSERA_ENOSPC; goto out;
+		}
+		if (flush_node(t, s, parent, 1, saved_entry_count - 1) != TESSERA_OK) {
+			tessera_free(parent);
+			rc = TESSERA_EIO; goto out;
+		}
 		(void)free_node(t, cur);
 		*out_new = s;
-		return TESSERA_OK;
+		tessera_free(parent);
+		rc = TESSERA_OK; goto out;
 	}
 
-	memcpy(child_entry + t->key_size, &new_child, 8);
+	uint8_t *new_child_entry = leaf_entries(parent) + (size_t)saved_idx * es;
+	memcpy(new_child_entry + t->key_size, &new_child, 8);
 	uint64_t s;
-	if (alloc_node(t, &s) != TESSERA_OK) return TESSERA_ENOSPC;
-	if (flush_node(t, s, block, 1, h.entry_count) != TESSERA_OK)
-		return TESSERA_EIO;
+	if (alloc_node(t, &s) != TESSERA_OK) {
+		tessera_free(parent);
+		rc = TESSERA_ENOSPC; goto out;
+	}
+	if (flush_node(t, s, parent, 1, saved_entry_count) != TESSERA_OK) {
+		tessera_free(parent);
+		rc = TESSERA_EIO; goto out;
+	}
 	(void)free_node(t, cur);
 	*out_new = s;
-	return TESSERA_OK;
+	tessera_free(parent);
+	rc = TESSERA_OK;
+out:
+	if (block) tessera_free(block);
+	return rc;
 }
 
 int
@@ -662,19 +715,25 @@ tessera_btree_delete(tessera_btree_t *t, const void *key,
 	if (r != TESSERA_OK) return r;
 	if (dropped) {
 		/* Tree empty — re-create an empty leaf root. */
-		uint8_t block[BLOCK_SIZE];
+		uint8_t *block = tessera_zalloc(BLOCK_SIZE);
+		if (block == NULL) return TESSERA_ENOMEM;
 		write_header(block, t, 0, 0);
 		uint64_t s;
-		if (alloc_node(t, &s) != TESSERA_OK) return TESSERA_ENOSPC;
-		if (flush_node(t, s, block, 0, 0) != TESSERA_OK)
-			return TESSERA_EIO;
+		if (alloc_node(t, &s) != TESSERA_OK) {
+			tessera_free(block); return TESSERA_ENOSPC;
+		}
+		if (flush_node(t, s, block, 0, 0) != TESSERA_OK) {
+			tessera_free(block); return TESSERA_EIO;
+		}
+		tessera_free(block);
 		t->root = s;
 	} else {
 		/* Root collapse: if root is internal with a single child,
 		 * promote that child as the new root. */
-		uint8_t block[BLOCK_SIZE];
+		uint8_t *block = tessera_zalloc(BLOCK_SIZE);
+		if (block == NULL) return TESSERA_ENOMEM;
 		r = load_node(t, new_root, block);
-		if (r != TESSERA_OK) return r;
+		if (r != TESSERA_OK) { tessera_free(block); return r; }
 		tessera_btree_node_header_t h;
 		(void)read_header(block, &h);
 		while (h.node_kind == 1 && h.entry_count == 1) {
@@ -684,13 +743,56 @@ tessera_btree_delete(tessera_btree_t *t, const void *key,
 			(void)free_node(t, new_root);
 			new_root = only_child;
 			r = load_node(t, new_root, block);
-			if (r != TESSERA_OK) return r;
+			if (r != TESSERA_OK) { tessera_free(block); return r; }
 			(void)read_header(block, &h);
 		}
+		tessera_free(block);
 		t->root = new_root;
 	}
 	*out_new_root = t->root;
 	return TESSERA_OK;
+}
+
+/* ── walk-nodes (mount-time meta-reserve liveness reconstruction) ── */
+
+static int
+walk_recursive(tessera_btree_t *t, uint64_t sector,
+               tessera_btree_node_visitor_t cb, void *ctx)
+{
+	int rc = cb(ctx, sector);
+	if (rc != 0) return rc;
+	uint8_t *block = tessera_zalloc(BLOCK_SIZE);
+	if (block == NULL) return TESSERA_ENOMEM;
+	rc = load_node(t, sector, block);
+	if (rc != TESSERA_OK) { tessera_free(block); return rc; }
+	tessera_btree_node_header_t h;
+	(void)read_header(block, &h);
+	if (h.node_kind == 0) { tessera_free(block); return TESSERA_OK; }
+	/* Internal node — copy out child sectors, free the parent buffer
+	 * before recursing to keep heap pressure low across MAX_DEPTH. */
+	const uint32_t es = inner_entry_size(t);
+	const uint32_t n = h.entry_count;
+	uint64_t *children = tessera_malloc((size_t)n * sizeof(uint64_t));
+	if (children == NULL) { tessera_free(block); return TESSERA_ENOMEM; }
+	for (uint32_t i = 0; i < n; i++) {
+		memcpy(&children[i],
+		    leaf_entries_const(block) + (size_t)i * es + t->key_size, 8);
+	}
+	tessera_free(block);
+	for (uint32_t i = 0; i < n; i++) {
+		rc = walk_recursive(t, children[i], cb, ctx);
+		if (rc != TESSERA_OK) break;
+	}
+	tessera_free(children);
+	return rc;
+}
+
+int
+tessera_btree_walk_nodes(tessera_btree_t *t,
+                         tessera_btree_node_visitor_t cb, void *ctx)
+{
+	if (t == NULL || cb == NULL) return TESSERA_EINVAL;
+	return walk_recursive(t, t->root, cb, ctx);
 }
 
 /* ── cursor: forward in-order iteration ──────────────────────────── */

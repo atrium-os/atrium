@@ -31,7 +31,7 @@ test_struct_sizes(void)
 	 * if these were wrong; this is just runtime sanity checking. */
 	CHECK(sizeof(tessera_superblock_t)        == 4096);
 	CHECK(sizeof(tessera_journal_header_t)    == 4096);
-	CHECK(sizeof(tessera_record_header_t)     == 32);
+	CHECK(sizeof(tessera_record_header_t)     == 64);
 	CHECK(sizeof(tessera_pack_header_t)       == 4096);
 	CHECK(sizeof(tessera_pack_index_entry_t)  == 48);
 	CHECK(sizeof(tessera_blob_descriptor_t)   == 16);
@@ -40,7 +40,7 @@ test_struct_sizes(void)
 	CHECK(sizeof(tessera_chunk_record_t)      == 48);
 	CHECK(sizeof(tessera_tree_record_t)       == 40);
 	CHECK(sizeof(tessera_inode_record_t)      == 144);
-	CHECK(sizeof(tessera_btree_node_header_t) == 32);
+	CHECK(sizeof(tessera_btree_node_header_t) == 64);
 	CHECK(sizeof(tessera_registry_entry_t)    == 64);
 	CHECK(sizeof(tessera_free_extent_t)       == 16);
 }

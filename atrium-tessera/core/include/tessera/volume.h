@@ -69,7 +69,9 @@ typedef struct {
  * tree updates from the rest via the SB-tracked bump pointer
  * (tessera-fs.md §3.3). Sized large enough to cover many commits
  * before a `tessera repack` is needed. */
-#define TESSERA_METADATA_ZONE_SECTORS 128
+#define TESSERA_METADATA_ZONE_SECTORS 1024   /* 4 MiB headroom; v1
+                                                accepts the leak,
+                                                round 7+ adds GC */
 
 /* mkfs. The block_io's alloc/free callbacks may be NULL — format()
  * never invokes them; it bumps sectors itself out of the metadata

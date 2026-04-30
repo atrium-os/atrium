@@ -67,6 +67,41 @@ typedef uint8_t tessera_hash_t[TESSERA_HASH_SIZE];
 #define TESSERA_MAGIC_DIFF         "TESSDIFF"
 #define TESSERA_MAGIC_DIFF_END     "TDIFFEND"
 
+/* ── Encryption key slot (256 bytes, embedded in SB) ──────────────
+ *
+ * Each slot is one independent way to recover the volume key. The
+ * SB holds 8 slots; any unlock method that succeeds yields the
+ * same 32-byte volume key, which then drives AES-XTS encryption of
+ * every on-disk sector.
+ *
+ * Slot types (parallel to LUKS2 / FileVault / BitLocker):
+ *   1 = passphrase  (KDF over user passphrase → KEK → unwrap)
+ *   2 = TPM2        (TPM unseals an object with policy_digest →
+ *                    KEK → unwrap; PCR-bound for measured boot)
+ *   3 = recovery    (KDF over a long random string printed at
+ *                    format time; for "I lost my password")
+ *   4 = FIDO2       (hmac-secret extension on a registered
+ *                    credential → KEK → unwrap)
+ *   5 = PKCS#11     (smart-card / HSM)
+ *   6 = keyfile     (raw bytes from a file on disk / USB stick)
+ *
+ * All slots share the same wrap format: XChaCha20-Poly1305 over
+ * the 32-byte volume key, layout = nonce(24) + ct(32) + tag(16) +
+ * reserved(8) = 80 bytes.
+ */
+typedef struct TESSERA_PACKED {
+	uint8_t   slot_type;                 /* see enum above; 0 = unused */
+	uint8_t   kdf_algorithm;             /* 0=none, 1=Argon2id, 2=PBKDF2-SHA256 */
+	uint16_t  flags;                     /* bit 0 = primary slot */
+	uint32_t  kdf_iterations;
+	uint8_t   kdf_salt[16];
+	uint8_t   wrapped_key[80];           /* XChaCha20-Poly1305 wrapped vol key */
+	uint8_t   tpm_pcr_mask[8];           /* TPM2 slots: which PCRs to bind */
+	uint8_t   tpm_policy_digest[32];     /* TPM2 slots: expected policy hash */
+	uint8_t   credential_id[16];         /* FIDO2 / PKCS#11 ref */
+	uint8_t   reserved[96];              /* future slot types */
+} tessera_key_slot_t;
+
 /* ── Superblock (4096 bytes) ─────────────────────────────────────── */
 
 typedef struct TESSERA_PACKED {
@@ -98,9 +133,39 @@ typedef struct TESSERA_PACKED {
 	uint64_t  meta_reserve_start;        /* sector of metadata reserve   */
 	uint64_t  meta_reserve_length;       /* sectors                       */
 	uint64_t  meta_reserve_bump;         /* next free sector in reserve  */
+	/* Snapshots tree — reserved by v1 for v2's time-machine feature.
+	 * v1 mkfs initialises snapshots_root=0 (uninitialised); v1 kmod
+	 * never writes either field. v2 will allocate the tree and
+	 * have commit_sb append a snapshot record per commit. Wiring
+	 * the format slot now avoids an on-disk migration when v2 lands. */
+	uint64_t  snapshots_root;
+	uint64_t  snapshots_gen;
+	/* Encryption — reserved by v1 for v3's at-rest encryption.
+	 * v1 mkfs zeros all of these; v1 kmod never reads them.
+	 * v3 will populate `key_slots` with active unlock methods
+	 * (passphrase, TPM2-sealed, recovery key, FIDO2, etc.) and
+	 * use the volume key — recovered by unwrapping any one slot —
+	 * to AES-XTS-encrypt all on-disk sectors. Wiring the format
+	 * slots now avoids an on-disk migration when v3 lands. */
+	uint16_t  encryption_flags;          /* bit 0 = AES-XTS active
+	                                        bit 1 = convergent (opt-in) */
+	uint8_t   active_slot_count;         /* number of populated slots */
+	uint8_t   reserved_e0;
+	uint32_t  reserved_e1;
+	uint8_t   master_key_id[16];         /* unique per-volume; key-rotation
+	                                        tooling uses this to detect a
+	                                        re-encryption */
+	tessera_key_slot_t  key_slots[8];    /* 8 × 256 = 2 KiB */
 	uint32_t  last_unmount_clean;
-	uint32_t  crc32;                     /* CRC over bytes 0..212 */
-	uint8_t   reserved[3880];
+	uint32_t  crc32;                     /* CRC over bytes 0..(crc32 offset) */
+	/* Keyed integrity — reserved by v1 for v3's authenticated metadata.
+	 * v1 mkfs zeros this; v1/v2 kmod ignore it. v3 derives a separate
+	 * mac_key = HKDF(volume_key, "tessera-mac") and writes
+	 * HMAC-SHA256(mac_key, sb_bytes_with_hmac_zeroed) here on every
+	 * commit_sb, verifying on mount. CRC32 stays for non-authenticated
+	 * (encryption-off) volumes; HMAC supersedes it when present. */
+	uint8_t   hmac[32];
+	uint8_t   reserved[1760];
 } tessera_superblock_t;
 
 /* Superblock feature flags */
@@ -122,8 +187,14 @@ typedef struct TESSERA_PACKED {
 	uint8_t   reserved[4044];
 } tessera_journal_header_t;
 
-/* ── Journal record header (32 bytes) ────────────────────────────── */
-
+/* ── Journal record header (64 bytes) ──────────────────────────────
+ *
+ * Bytes 0..28 are the original header content (CRC covers them).
+ * Bytes 32..63 are the v3-reserved HMAC slot — v1/v2 zero it; v3
+ * fills with HMAC-SHA256(mac_key, header_bytes_with_hmac_zeroed)
+ * (covers the same bytes as crc32_header plus the body bytes via
+ * crc32_body). reserved_pad keeps the HMAC field 8-byte-aligned and
+ * leaves room for a future per-record key-id. */
 typedef struct TESSERA_PACKED {
 	uint8_t   magic[4];                  /* "TXR\0" */
 	uint32_t  record_type;
@@ -132,6 +203,7 @@ typedef struct TESSERA_PACKED {
 	uint32_t  block_count;
 	uint32_t  crc32_body;
 	uint32_t  crc32_header;
+	uint8_t   hmac[32];
 } tessera_record_header_t;
 
 /* Journal record types (tessera-fs §4.4) */
@@ -169,7 +241,10 @@ typedef struct TESSERA_PACKED {
 	uint64_t  data_length;
 	uint64_t  total_pack_bytes;
 	uint32_t  crc32_header;
-	uint8_t   reserved[4004];
+	/* Keyed integrity — see SB hmac comment. v3 fills with
+	 * HMAC-SHA256(mac_key, pack_header_bytes_with_hmac_zeroed). */
+	uint8_t   hmac[32];
+	uint8_t   reserved[3972];
 } tessera_pack_header_t;
 
 /* ── Pack index entry (48 bytes) ─────────────────────────────────── */
@@ -272,8 +347,15 @@ typedef struct TESSERA_PACKED {
 #define TESSERA_INODE_FLAG_OPAQUE      (1u << 3)
 #define TESSERA_INODE_FLAG_SUBVOL_ROOT (1u << 4)
 
-/* ── B+tree node header (32 bytes) ───────────────────────────────── */
-
+/* ── B+tree node header (64 bytes) ─────────────────────────────────
+ *
+ * Bytes 0..24 are the original CRC-covered header. Bytes 32..63
+ * are the v3-reserved HMAC slot (zeroed by v1/v2). Adding the slot
+ * inline keeps the auth tag co-located with the bytes it
+ * authenticates and avoids a sidecar tree on the metadata hot path.
+ * Cost is negligible: only the free-extent tree loses 2 entries
+ * per 4 KiB block (254→252); inode and pack-registry trees keep
+ * the same fanout. */
 typedef struct TESSERA_PACKED {
 	uint8_t   magic[4];                  /* "TBTR" */
 	uint16_t  version;
@@ -285,6 +367,7 @@ typedef struct TESSERA_PACKED {
 	uint32_t  reserved_a;
 	uint32_t  crc32;
 	uint32_t  reserved_b;
+	uint8_t   hmac[32];
 } tessera_btree_node_header_t;
 
 /* ── Pack registry entry (64 bytes) ──────────────────────────────── */
@@ -304,6 +387,29 @@ typedef struct TESSERA_PACKED {
 #define TESSERA_REGISTRY_FLAG_SEALED    (1u << 0)
 #define TESSERA_REGISTRY_FLAG_RETIRING  (1u << 1)
 
+/* ── Snapshot record (64 bytes) ─────────────────────────────────────
+ *
+ * One per commit_sb when the snapshots feature is active (v2). The
+ * b+tree key is the 8-byte big-endian generation; the value is this
+ * record. Every commit appends one. Retention pruning (log-decay,
+ * pressure-based) runs from a separate v2 helper. Held-snapshots
+ * provide GC anchoring (their roots' manifest hashes union into the
+ * live set) so older history isn't reclaimed.
+ *
+ * `reason_tag` is human-readable: "auto", "user", "rollback", etc.
+ */
+typedef struct TESSERA_PACKED {
+	uint64_t  generation;
+	uint64_t  timestamp_ns;
+	uint64_t  inode_root;
+	uint64_t  pack_registry_root;
+	uint64_t  free_extent_root;
+	uint8_t   reason_tag[16];
+	uint8_t   reserved[8];
+} tessera_snapshot_record_t;
+
+#define TESSERA_SNAPSHOT_RECORD_SIZE  64u
+
 /* ── Free-extent record (16 bytes) ───────────────────────────────── */
 
 typedef struct TESSERA_PACKED {
@@ -316,9 +422,10 @@ typedef struct TESSERA_PACKED {
 #define TESSERA_STATIC_ASSERT(expr, name) \
 	typedef char tessera_static_assert_##name[(expr) ? 1 : -1]
 
+TESSERA_STATIC_ASSERT(sizeof(tessera_key_slot_t)          == 256,  key_slot_size);
 TESSERA_STATIC_ASSERT(sizeof(tessera_superblock_t)        == 4096, superblock_size);
 TESSERA_STATIC_ASSERT(sizeof(tessera_journal_header_t)    == 4096, journal_header_size);
-TESSERA_STATIC_ASSERT(sizeof(tessera_record_header_t)     == 32,   record_header_size);
+TESSERA_STATIC_ASSERT(sizeof(tessera_record_header_t)     == 64,   record_header_size);
 TESSERA_STATIC_ASSERT(sizeof(tessera_pack_header_t)       == 4096, pack_header_size);
 TESSERA_STATIC_ASSERT(sizeof(tessera_pack_index_entry_t)  == 48,   pack_index_entry_size);
 TESSERA_STATIC_ASSERT(sizeof(tessera_blob_descriptor_t)   == 16,   blob_descriptor_size);
@@ -327,9 +434,10 @@ TESSERA_STATIC_ASSERT(sizeof(tessera_manifest_header_t)   == 32,   manifest_head
 TESSERA_STATIC_ASSERT(sizeof(tessera_chunk_record_t)      == 48,   chunk_record_size);
 TESSERA_STATIC_ASSERT(sizeof(tessera_tree_record_t)       == 40,   tree_record_size);
 TESSERA_STATIC_ASSERT(sizeof(tessera_inode_record_t)      == 144,  inode_record_size);
-TESSERA_STATIC_ASSERT(sizeof(tessera_btree_node_header_t) == 32,   btree_node_header_size);
+TESSERA_STATIC_ASSERT(sizeof(tessera_btree_node_header_t) == 64,   btree_node_header_size);
 TESSERA_STATIC_ASSERT(sizeof(tessera_registry_entry_t)    == 64,   registry_entry_size);
 TESSERA_STATIC_ASSERT(sizeof(tessera_free_extent_t)       == 16,   free_extent_size);
+TESSERA_STATIC_ASSERT(sizeof(tessera_snapshot_record_t)   == 64,   snapshot_record_size);
 
 #ifdef __cplusplus
 }

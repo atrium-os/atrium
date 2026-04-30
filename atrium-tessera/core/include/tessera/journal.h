@@ -57,6 +57,14 @@ int tessera_journal_append(tessera_journal_t *, uint64_t tx_id,
 /* Commit a transaction. Writes TX_COMMIT, fsyncs, advances head. */
 int tessera_journal_tx_commit(tessera_journal_t *, uint64_t tx_id);
 
+/* Checkpoint: reset head/tail to the start of the log, freeing all
+ * sectors. Caller must guarantee that every committed record up to
+ * the current head is durably applied (i.e., reflected in the
+ * superblock or its dependents). After return the journal is empty
+ * and ready for the next transaction. v1 phase: callers checkpoint
+ * after every successful commit_sb. */
+int tessera_journal_checkpoint(tessera_journal_t *);
+
 /* Abort a transaction. Writes TX_ABORT (advisory). */
 int tessera_journal_tx_abort(tessera_journal_t *, uint64_t tx_id,
                               uint32_t reason_code);

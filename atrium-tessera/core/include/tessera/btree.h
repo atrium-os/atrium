@@ -73,6 +73,16 @@ void                     tessera_btree_cursor_free(tessera_btree_cursor_t *);
 
 void tessera_btree_close(tessera_btree_t *);
 
+/* Visitor: called once per on-disk node sector (root + every internal
+ * + every leaf), pre-order. Return non-zero to abort the walk. */
+typedef int (*tessera_btree_node_visitor_t)(void *ctx, uint64_t sector);
+
+/* Walk every node sector in the tree. Used at mount time to
+ * reconstruct which sectors of the metadata-reserve are still
+ * referenced (and therefore which are free to recycle). */
+int tessera_btree_walk_nodes(tessera_btree_t *,
+                             tessera_btree_node_visitor_t cb, void *ctx);
+
 #ifdef __cplusplus
 }
 #endif

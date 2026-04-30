@@ -30,3 +30,8 @@ core/libtessera_core.so
 core/libtessera_core.so.*
 core/*.pico
 core/*.o
+core/*.d
+core/*.full
+core/*.debug
+core/*.core
+.depend.*

@@ -13,7 +13,7 @@
  *     deterministic — encode does not zero on the caller's behalf.
  *
  * CRC ownership:
- *   - encode_superblock        fills .crc32           (over bytes 0..188)
+ *   - encode_superblock        fills .crc32           (over bytes 0..offsetof(crc32))
  *   - encode_journal_header    fills .crc32           (over bytes 0..48)
  *   - encode_record_header     fills .crc32_header    (over bytes 0..28)
  *   - encode_pack_header       fills .crc32_header    (over bytes 0..92)

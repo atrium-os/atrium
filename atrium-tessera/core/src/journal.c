@@ -42,6 +42,7 @@
 #include "tessera_compat.h"
 
 #define BLK 4096u
+#define HDR 64u                /* sizeof(tessera_record_header_t) */
 
 struct tessera_journal {
 	tessera_block_io_t io;
@@ -67,10 +68,18 @@ write_journal_header(tessera_journal_t *j)
 	h.tail_seq   = j->tail_seq;
 	h.head_block = j->head_block;
 	h.tail_block = j->tail_block;
-	uint8_t buf[BLK];
+	/* Heap-alloc'd to avoid 4 KiB on the kernel stack (FreeBSD aarch64
+	 * KSTACK_PAGES=4 → 16 KiB; mountfs frame chain leaves ~6 KiB
+	 * usable here). */
+	uint8_t *buf = tessera_zalloc(BLK);
+	if (buf == NULL) return TESSERA_ENOMEM;
 	int r = tessera_encode_journal_header(&h, buf);
-	if (r != TESSERA_OK) return r;
-	if (j->io.write_block(j->io.ctx, j->start, buf) != 0) return TESSERA_EIO;
+	if (r != TESSERA_OK) { tessera_free(buf); return r; }
+	if (j->io.write_block(j->io.ctx, j->start, buf) != 0) {
+		tessera_free(buf);
+		return TESSERA_EIO;
+	}
+	tessera_free(buf);
 	return TESSERA_OK;
 }
 
@@ -78,9 +87,16 @@ static int
 read_journal_header(const tessera_block_io_t *io, uint64_t start,
                     tessera_journal_header_t *out)
 {
-	uint8_t buf[BLK];
-	if (io->read_block(io->ctx, start, buf) != 0) return TESSERA_EIO;
-	return tessera_decode_journal_header(buf, out);
+	uint8_t *buf = tessera_zalloc(BLK);
+	if (buf == NULL) return TESSERA_ENOMEM;
+	int rc = io->read_block(io->ctx, start, buf);
+	if (rc != 0) {
+		tessera_free(buf);
+		return TESSERA_EIO;
+	}
+	int r = tessera_decode_journal_header(buf, out);
+	tessera_free(buf);
+	return r;
 }
 
 /* ── format / open / close ───────────────────────────────────────── */
@@ -90,18 +106,28 @@ tessera_journal_format(const tessera_block_io_t *io, uint64_t start,
                        uint64_t length)
 {
 	if (io == NULL || length < 4) return TESSERA_EINVAL;
-	tessera_journal_header_t h;
-	memset(&h, 0, sizeof h);
-	memcpy(h.magic, TESSERA_MAGIC_JOURNAL, 8);
-	h.version    = 1;
-	h.head_seq   = 1;
-	h.tail_seq   = 1;
-	h.head_block = 1;
-	h.tail_block = 1;
-	uint8_t buf[BLK];
-	int r = tessera_encode_journal_header(&h, buf);
-	if (r != TESSERA_OK) return r;
-	if (io->write_block(io->ctx, start, buf) != 0) return TESSERA_EIO;
+	/* sizeof(tessera_journal_header_t) == 4096; never on the stack
+	 * in kernel mode — it overflows the 16 KiB FreeBSD aarch64
+	 * kstack right at the prologue and the resulting fault is
+	 * unrecoverable enough to hang the VM silently. */
+	tessera_journal_header_t *h = tessera_zalloc(sizeof *h);
+	if (h == NULL) return TESSERA_ENOMEM;
+	memcpy(h->magic, TESSERA_MAGIC_JOURNAL, 8);
+	h->version    = 1;
+	h->head_seq   = 1;
+	h->tail_seq   = 1;
+	h->head_block = 1;
+	h->tail_block = 1;
+	uint8_t *buf = tessera_zalloc(BLK);
+	if (buf == NULL) { tessera_free(h); return TESSERA_ENOMEM; }
+	int r = tessera_encode_journal_header(h, buf);
+	tessera_free(h);
+	if (r != TESSERA_OK) { tessera_free(buf); return r; }
+	if (io->write_block(io->ctx, start, buf) != 0) {
+		tessera_free(buf);
+		return TESSERA_EIO;
+	}
+	tessera_free(buf);
 	return TESSERA_OK;
 }
 
@@ -110,18 +136,23 @@ tessera_journal_open(const tessera_block_io_t *io, uint64_t start,
                      uint64_t length)
 {
 	if (io == NULL || length < 4) return NULL;
-	tessera_journal_header_t h;
-	if (read_journal_header(io, start, &h) != TESSERA_OK) return NULL;
+	tessera_journal_header_t *h = tessera_zalloc(sizeof *h);
+	if (h == NULL) return NULL;
+	if (read_journal_header(io, start, h) != TESSERA_OK) {
+		tessera_free(h);
+		return NULL;
+	}
 	tessera_journal_t *j = tessera_zalloc(sizeof *j);
-	if (j == NULL) return NULL;
+	if (j == NULL) { tessera_free(h); return NULL; }
 	j->io         = *io;
 	j->start      = start;
 	j->length     = length;
-	j->head_seq   = h.head_seq;
-	j->tail_seq   = h.tail_seq;
-	j->head_block = h.head_block;
-	j->tail_block = h.tail_block;
+	j->head_seq   = h->head_seq;
+	j->tail_seq   = h->tail_seq;
+	j->head_block = h->head_block;
+	j->tail_block = h->tail_block;
 	j->next_tx_id = 1;
+	tessera_free(h);
 	return j;
 }
 
@@ -136,7 +167,7 @@ tessera_journal_close(tessera_journal_t *j)
 static uint32_t
 sectors_for(uint32_t body_len)
 {
-	return (32u + body_len + (BLK - 1u)) / BLK;
+	return (HDR + body_len + (BLK - 1u)) / BLK;
 }
 
 static uint64_t
@@ -169,32 +200,41 @@ write_record(tessera_journal_t *j, tessera_record_type_t type,
 	rh.crc32_body  = (body_len > 0)
 	    ? tessera_crc32(body, body_len) : 0u;
 
-	uint8_t blk[BLK];
-	memset(blk, 0, sizeof blk);
+	uint8_t *blk = tessera_zalloc(BLK);
+	if (blk == NULL) return TESSERA_ENOMEM;
 	int r = tessera_encode_record_header(&rh, blk);
-	if (r != TESSERA_OK) return r;
+	if (r != TESSERA_OK) { tessera_free(blk); return r; }
 
-	const uint32_t in_first = (body_len > BLK - 32) ? (BLK - 32) : body_len;
+	const uint32_t in_first = (body_len > BLK - HDR) ? (BLK - HDR) : body_len;
 	if (in_first > 0)
-		memcpy(blk + 32, body, in_first);
+		memcpy(blk + HDR, body, in_first);
 
 	uint64_t cap = j->length - 1;
 	uint64_t b = j->head_block;
-	if (j->io.write_block(j->io.ctx, j->start + b, blk) != 0)
+	if (j->io.write_block(j->io.ctx, j->start + b, blk) != 0) {
+		tessera_free(blk);
 		return TESSERA_EIO;
+	}
+	tessera_free(blk);
 	uint32_t remaining = body_len - in_first;
 	const uint8_t *src = (const uint8_t *)body + in_first;
-	for (uint32_t k = 1; k < need; k++) {
-		b++;
-		if (b > cap) b = 1;
-		uint8_t cont[BLK];
-		memset(cont, 0, sizeof cont);
-		uint32_t take = remaining > BLK ? BLK : remaining;
-		if (take > 0) memcpy(cont, src, take);
-		if (j->io.write_block(j->io.ctx, j->start + b, cont) != 0)
-			return TESSERA_EIO;
-		src += take;
-		remaining -= take;
+	if (remaining > 0) {
+		uint8_t *cont = tessera_zalloc(BLK);
+		if (cont == NULL) return TESSERA_ENOMEM;
+		for (uint32_t k = 1; k < need; k++) {
+			b++;
+			if (b > cap) b = 1;
+			memset(cont, 0, BLK);
+			uint32_t take = remaining > BLK ? BLK : remaining;
+			if (take > 0) memcpy(cont, src, take);
+			if (j->io.write_block(j->io.ctx, j->start + b, cont) != 0) {
+				tessera_free(cont);
+				return TESSERA_EIO;
+			}
+			src += take;
+			remaining -= take;
+		}
+		tessera_free(cont);
 	}
 	b++;
 	if (b > cap) b = 1;
@@ -254,6 +294,18 @@ tessera_journal_tx_abort(tessera_journal_t *j, uint64_t tx_id,
 	    j->head_seq);
 }
 
+int
+tessera_journal_checkpoint(tessera_journal_t *j)
+{
+	if (j == NULL) return TESSERA_EINVAL;
+	j->head_seq   = 1;
+	j->tail_seq   = 1;
+	j->head_block = 1;
+	j->tail_block = 1;
+	j->next_tx_id = 1;
+	return write_journal_header(j);
+}
+
 /* ── replay ──────────────────────────────────────────────────────── */
 
 struct buffered_rec {
@@ -266,36 +318,47 @@ read_record(tessera_journal_t *j, uint64_t *block,
             tessera_record_header_t *out_hdr, uint8_t **out_body)
 {
 	const uint64_t cap = j->length - 1;
-	uint8_t blk[BLK];
-	if (j->io.read_block(j->io.ctx, j->start + *block, blk) != 0)
+	uint8_t *blk = tessera_zalloc(BLK);
+	if (blk == NULL) return TESSERA_ENOMEM;
+	if (j->io.read_block(j->io.ctx, j->start + *block, blk) != 0) {
+		tessera_free(blk);
 		return TESSERA_EIO;
+	}
 
 	int r = tessera_decode_record_header(blk, out_hdr);
-	if (r != TESSERA_OK) return r;
+	if (r != TESSERA_OK) { tessera_free(blk); return r; }
 
 	const uint32_t bl = out_hdr->body_length;
 	uint8_t *body = NULL;
 	if (bl > 0) {
 		body = tessera_malloc(bl);
-		if (body == NULL) return TESSERA_ENOMEM;
+		if (body == NULL) { tessera_free(blk); return TESSERA_ENOMEM; }
 		const uint32_t in_first =
-		    (bl > BLK - 32) ? (BLK - 32) : bl;
-		memcpy(body, blk + 32, in_first);
+		    (bl > BLK - HDR) ? (BLK - HDR) : bl;
+		memcpy(body, blk + HDR, in_first);
+		tessera_free(blk); blk = NULL;
 		uint32_t remaining = bl - in_first;
 		uint64_t b = *block;
-		for (uint32_t k = 1; k < out_hdr->block_count; k++) {
-			b++;
-			if (b > cap) b = 1;
-			uint8_t cont[BLK];
-			if (j->io.read_block(j->io.ctx, j->start + b, cont)
-			    != 0) {
-				tessera_free(body);
-				return TESSERA_EIO;
+		if (remaining > 0) {
+			uint8_t *cont = tessera_zalloc(BLK);
+			if (cont == NULL) { tessera_free(body); return TESSERA_ENOMEM; }
+			for (uint32_t k = 1; k < out_hdr->block_count; k++) {
+				b++;
+				if (b > cap) b = 1;
+				if (j->io.read_block(j->io.ctx, j->start + b, cont)
+				    != 0) {
+					tessera_free(body);
+					tessera_free(cont);
+					return TESSERA_EIO;
+				}
+				uint32_t take = remaining > BLK ? BLK : remaining;
+				memcpy(body + bl - remaining, cont, take);
+				remaining -= take;
 			}
-			uint32_t take = remaining > BLK ? BLK : remaining;
-			memcpy(body + bl - remaining, cont, take);
-			remaining -= take;
+			tessera_free(cont);
 		}
+	} else {
+		tessera_free(blk);
 	}
 	uint32_t body_crc = (bl > 0) ? tessera_crc32(body, bl) : 0u;
 	if (out_hdr->crc32_body != body_crc) {
