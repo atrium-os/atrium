@@ -227,6 +227,96 @@ Gotchas (each one cost a kernel panic + qcow2 restore — preserved here so the 
 
 If the kernel panics during a kmod experiment: `pkill -9 qemu-system-aarch64`, `xz -dk vm.qcow2.xz` (the post-first-boot baseline), boot, re-extract `src.txz`, rebuild. Don't `cargo build --release` in the VM — see `~/.claude/projects/.../memory/feedback_no_vm_cargo_release.md`.
 
+#### Debugging tessera_fs hangs (lessons from slice 4)
+
+When the kmod hangs the VM (qemu pinned at 400% CPU, ssh blocked, no panic), the FreeBSD kernel debugger isn't reachable through HVF/serial in this setup. You're flying blind unless you've **built visibility into the kmod beforehand**.
+
+**Pattern: trace ring + sysctl dump.** For the slice-4 work, two prior attempts hung the VM with no usable post-mortem. The third attempt added a 1024-entry static trace ring as the FIRST commit, before any of the actual fix code. Every meta-reserve event (`alloc-bump`, `alloc-reuse`, `free-push`, `drain-{begin,keep,release,end}`, `bitmap-built`) gets one entry with `(op, sector, gen, count)`. Static = kmod-lifetime, survives unmount. Reads via sysctl (no syscall plumbing into the hung VM).
+
+Recipe:
+
+```c
+// Toggle (off by default in production builds).
+SYSCTL_INT(_kern_tessera, OID_AUTO, metatrace_enabled, ...);
+
+// Atomic-bump write index (only allocates a slot, no lock).
+unsigned long i = atomic_fetchadd_long(&widx, 1);
+ring[i % LEN] = (struct entry){ .seq = i + 1, .op = ..., ... };
+
+// Dump-on-read sysctl. Reading the value triggers a printf
+// of the ring's contents to dmesg. Awkward but minimal — no
+// variable-length sysctl plumbing needed.
+SYSCTL_PROC(_kern_tessera, OID_AUTO, metatrace_dump,
+    CTLTYPE_ULONG | CTLFLAG_RD | CTLFLAG_MPSAFE,
+    NULL, 0, sysctl_handler_that_printfs, "LU", "...");
+```
+
+Use:
+
+```sh
+vssh "sysctl kern.tessera.metatrace_enabled=1"
+# ... reproduce the bug ...
+vssh "sysctl kern.tessera.metatrace_dump"  # triggers the dmesg dump
+vssh "dmesg | tail -200"                    # read the trace
+```
+
+If the VM hung BEFORE you could run `sysctl ... metatrace_dump`: the trace is still in memory, but you can't extract it without a working VM. Lesson: **dump the trace at known checkpoints during the test**, not just at the end. Pattern:
+
+```sh
+# Repro script that uses timeouts to bound any single operation,
+# so a hang in step N can't take down the test for step N-1.
+vssh "...preamble..."
+vssh "sysctl kern.tessera.metatrace_dump"   # dump after preamble
+vssh "...next operation..."
+vssh "sysctl kern.tessera.metatrace_dump"   # dump again
+```
+
+**Pattern: bounded testing of forensic mounts.** Forensic-mount paths (`mount -o tessera.gen=N`) had pre-existing hangs from a double-free corrupting the malloc heap. Wrapping the user-space `mount` in `timeout 10 mount -t tessera ...` doesn't actually save you from a kernel-side hang — `timeout` only kills the user process; the kernel work continues. To distinguish "kmod hung" from "test misbehaved":
+
+```sh
+# Watch qemu CPU. If pinned at ~400% (== smp_cpus * 100), kernel
+# is spinning in some loop that isn't yielding. Almost always the
+# malloc allocator after heap corruption (double-free of a
+# sector-sized block).
+ps aux | grep qemu-system | awk '{print $3 "%"}'
+```
+
+If you see this pattern, the candidate causes are:
+- Double-free or use-after-free of a heap-allocated buffer (most common).
+- Infinite loop in a btree/manifest parser caused by corrupt on-disk data.
+- Spinlock that never yields (rare in this codebase — we use mutexes).
+
+For double-free specifically: search for any `free(p, M_TESSERA)` followed by a later `if (p) free(p, M_TESSERA)` where `p` isn't NULLed in between. The `if (p)` test is non-NULL because the local pointer wasn't cleared, even though the pointed-to memory was already returned to malloc. **Always NULL pointers after free if there are any error paths that might re-free them.**
+
+**Pattern: diff the bug against baseline.** Before assuming a bug is caused by your in-progress changes, stash them and reproduce:
+
+```sh
+git stash
+# rebuild kmod, re-run the failing test
+git stash pop  # if your changes weren't to blame
+```
+
+For slice 4, this isolated the gen=999 hang as pre-existing (the sb_a/sb_b double-free) — independent of the slice-4 work itself. Without this check I would've spent hours hunting in the wrong place.
+
+**Pattern: VM reboot recipe.** When the VM hangs:
+
+```sh
+pkill -f qemu-system 2>/dev/null
+pkill -f "ssh.*2222" 2>/dev/null   # also kill stuck ssh sessions
+sleep 3
+~/src/bsd/scripts/run-vm.sh > /tmp/vm.log 2>&1 &
+
+# Wait for boot:
+until vssh "uname -r" 2>/dev/null | grep -qE "16\.0"; do sleep 5; done
+
+# 9p mount doesn't auto-mount on every boot; check + reattach:
+vssh "kldload virtio_p9fs 2>/dev/null; \
+      mount | grep -q /mnt/host || \
+      mount -t p9fs -o trans=virtio bsd_share /mnt/host"
+```
+
+The qcow2 is durable across hangs (qemu uses `cache=writeback` but the qcow2 metadata is robust to mid-write SIGKILL). No need to restore from `vm.qcow2.xz` unless you panicked AND the on-disk fs in the qcow2 is corrupted (rare; would manifest as boot failure).
+
 ### Atrium virtio-gpu kmod (`atrium_virtio_gpu.ko`) — D0 bring-up
 
 Native FreeBSD driver for virtio-gpu, exposing the Atrium GPU ABI cdevs (`/dev/atrium-gpu0`, `/dev/atrium-display0`). Source: `~/src/bsd/atrium-kmod/`. Built in-VM, same as `fresco.ko`. Attaches to `virtio_pci`, not raw PCI — `VIRTIO_DRIVER_MODULE` + `virtio_get_device_type() == VIRTIO_ID_GPU(16)`.
