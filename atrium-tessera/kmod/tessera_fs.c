@@ -177,6 +177,11 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, dirty_drained,
     CTLFLAG_RD, &tessera_stat_dirty_drained, 0,
     "Cumulative dirty inodes drained across all flushes");
 
+static unsigned long tessera_stat_pending_drained = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, pending_drained,
+    CTLFLAG_RD, &tessera_stat_pending_drained, 0,
+    "Cumulative pending manifests drained across all flushes");
+
 /* ── kmod block_io shim ──────────────────────────────────────── */
 
 /* tessera-core's primitives talk to "disk" via tessera_block_io_t.
@@ -299,6 +304,23 @@ struct tessera_dirty_inode {
 	int                     tombstone;   /* 1 = drain calls btree_delete */
 	tessera_inode_record_t  rec;
 };
+
+/* v2 step-2b: pending-manifest cache entry. Manifest bytes that have
+ * had their hash computed and returned to the caller, but haven't
+ * been written to a pack on disk yet. fetch_blob consults this cache
+ * before scanning pack_registry, so subsequent reads of the manifest
+ * during the same flush window come straight from RAM.
+ *
+ * Only manifests are cached, not chunk blobs — keeps the cache
+ * size bounded by manifest churn rather than file content size.
+ * The publish_chunked path still writes chunk bytes to disk
+ * synchronously; only the CHUNK_LIST manifest itself is deferred. */
+struct tessera_pending_manifest {
+	LIST_ENTRY(tessera_pending_manifest) link;
+	tessera_hash_t  hash;
+	uint8_t        *bytes;
+	uint32_t        len;
+};
 static int tessera_fs_inode_get(struct tessera_mount *tmp_,
                                 uint32_t inode_no,
                                 tessera_inode_record_t *out);
@@ -325,6 +347,27 @@ static int tessera_fs_inode_put(struct tessera_mount *tmp_,
 static int tessera_fs_inode_delete(struct tessera_mount *tmp_,
                                    uint32_t inode_no);
 static int tessera_fs_dirty_inodes_drain(struct tessera_mount *tmp_);
+
+/* v2 step-2b: pending-manifest cache helpers. */
+static int tessera_fs_pending_manifest_put(struct tessera_mount *tmp_,
+                                           const tessera_hash_t hash,
+                                           const uint8_t *bytes,
+                                           uint32_t len);
+static int tessera_fs_pending_manifest_lookup(struct tessera_mount *tmp_,
+                                              const tessera_hash_t hash,
+                                              uint8_t **out_bytes,
+                                              uint32_t *out_len);
+static int tessera_fs_pending_manifests_drain(struct tessera_mount *tmp_);
+/* The actual disk-publish path used both by direct callers AND by
+ * the drain. Splits out the bytes-to-pack-on-disk work from the
+ * cache-or-disk decision. */
+static int tessera_fs_publish_manifest_to_disk(struct tessera_mount *tmp_,
+                                               const uint8_t *manifest_bytes,
+                                               size_t mlen,
+                                               const tessera_hash_t hash);
+/* Threshold for forcing a drain: cap RAM held in pending. ~1 MiB
+ * default. Past this, mark_dirty triggers a flush. */
+#define TESSERA_PENDING_MANIFEST_BYTES_MAX  (1u * 1024u * 1024u)
 
 /* v2 multi-level directory helpers. */
 typedef int (*tessera_dirent_cb_t)(void *ctx, uint64_t child_inode,
@@ -419,6 +462,14 @@ struct tessera_mount {
 	LIST_HEAD(, tessera_dirty_inode) dirty_inodes[TESSERA_DIRTY_INODE_BUCKETS];
 	uint32_t                  dirty_count;
 	int                       dirty_init;
+
+	/* v2 step-2b: pending-manifest cache. Same flush_mtx covers
+	 * both. */
+#define TESSERA_PENDING_MANIFEST_BUCKETS  256u
+	LIST_HEAD(, tessera_pending_manifest)
+	    pending_manifests[TESSERA_PENDING_MANIFEST_BUCKETS];
+	uint32_t                  pending_manifest_count;
+	uint64_t                  pending_manifest_bytes;
 
 	/* v2 snapshots slice 2: read-only historical mount via
 	 * `tessera.gen=N`. When 1, mountfs overrode sb roots from a
@@ -704,6 +755,8 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen)
 	tmp_->flush_co_init = 1;
 	for (uint32_t _b = 0; _b < TESSERA_DIRTY_INODE_BUCKETS; _b++)
 		LIST_INIT(&tmp_->dirty_inodes[_b]);
+	for (uint32_t _b = 0; _b < TESSERA_PENDING_MANIFEST_BUCKETS; _b++)
+		LIST_INIT(&tmp_->pending_manifests[_b]);
 	tmp_->dirty_init = 1;
 
 	/* Open the journal and run replay BEFORE we open the trees, so a
@@ -1117,6 +1170,16 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 				    != NULL) {
 					LIST_REMOVE(_e, link);
 					free(_e, M_TESSERA);
+				}
+			}
+			for (uint32_t _b = 0;
+			    _b < TESSERA_PENDING_MANIFEST_BUCKETS; _b++) {
+				struct tessera_pending_manifest *_pm;
+				while ((_pm = LIST_FIRST(
+				    &tmp_->pending_manifests[_b])) != NULL) {
+					LIST_REMOVE(_pm, link);
+					free(_pm->bytes, M_TESSERA);
+					free(_pm, M_TESSERA);
 				}
 			}
 			tmp_->dirty_init = 0;
@@ -2290,6 +2353,13 @@ tessera_fs_mark_dirty(struct tessera_mount *tmp_)
 		(void)tessera_fs_flush(tmp_);
 		return;
 	}
+	/* Cap pending-manifest cache size — past 1 MiB held in RAM,
+	 * force a drain. */
+	if (tmp_->dirty_init && tmp_->pending_manifest_bytes >=
+	    TESSERA_PENDING_MANIFEST_BYTES_MAX) {
+		(void)tessera_fs_flush(tmp_);
+		return;
+	}
 	const uint64_t used = tmp_->sb.meta_reserve_bump
 	    - tmp_->sb.meta_reserve_start;
 	const uint64_t cap  = tmp_->sb.meta_reserve_length;
@@ -2526,6 +2596,128 @@ tessera_fs_dirty_inodes_drain(struct tessera_mount *tmp_)
 	return (err);
 }
 
+/* v2 step-2b: pending-manifest cache.
+ *
+ * Each entry holds (hash, bytes) for a manifest that was emitted by
+ * publish_manifest but not yet packed onto disk. fetch_blob consults
+ * the cache before scanning pack_registry, so subsequent reads of
+ * the manifest during the same flush window come straight from RAM.
+ *
+ * Bucketing: hash[0] selects 1 of 256 buckets. Roughly uniform.
+ *
+ * Lock: flush_mtx (same one that protects dirty_inodes).
+ */
+static int
+tessera_fs_pending_manifest_put(struct tessera_mount *tmp_,
+                                const tessera_hash_t hash,
+                                const uint8_t *bytes, uint32_t len)
+{
+	if (!tmp_->dirty_init) return (TESSERA_EIO);
+
+	/* malloc outside the mtx (M_WAITOK can sleep). */
+	uint8_t *buf = malloc(len, M_TESSERA, M_WAITOK);
+	memcpy(buf, bytes, len);
+	struct tessera_pending_manifest *e =
+	    malloc(sizeof *e, M_TESSERA, M_WAITOK | M_ZERO);
+	memcpy(e->hash, hash, sizeof e->hash);
+	e->bytes = buf;
+	e->len   = len;
+
+	mtx_lock(&tmp_->flush_mtx);
+	uint32_t b = hash[0];
+	struct tessera_pending_manifest *existing;
+	LIST_FOREACH(existing, &tmp_->pending_manifests[b], link) {
+		if (memcmp(existing->hash, hash, TESSERA_HASH_SIZE) == 0) {
+			/* Same hash already cached; identical bytes by
+			 * construction (manifest hash is deterministic).
+			 * Drop the new copy. */
+			mtx_unlock(&tmp_->flush_mtx);
+			free(buf, M_TESSERA);
+			free(e, M_TESSERA);
+			return (TESSERA_OK);
+		}
+	}
+	LIST_INSERT_HEAD(&tmp_->pending_manifests[b], e, link);
+	tmp_->pending_manifest_count++;
+	tmp_->pending_manifest_bytes += len;
+	mtx_unlock(&tmp_->flush_mtx);
+	return (TESSERA_OK);
+}
+
+/* Returns 1 (and copies bytes into a freshly malloc'd buffer) on hit;
+ * 0 on miss. Caller is responsible for freeing *out_bytes on hit. */
+static int
+tessera_fs_pending_manifest_lookup(struct tessera_mount *tmp_,
+                                   const tessera_hash_t hash,
+                                   uint8_t **out_bytes, uint32_t *out_len)
+{
+	if (!tmp_->dirty_init) return (0);
+	mtx_lock(&tmp_->flush_mtx);
+	uint32_t b = hash[0];
+	struct tessera_pending_manifest *e;
+	LIST_FOREACH(e, &tmp_->pending_manifests[b], link) {
+		if (memcmp(e->hash, hash, TESSERA_HASH_SIZE) == 0) {
+			uint32_t len = e->len;
+			uint8_t *buf = malloc(len, M_TESSERA, M_NOWAIT);
+			if (buf == NULL) {
+				mtx_unlock(&tmp_->flush_mtx);
+				return (0);
+			}
+			memcpy(buf, e->bytes, len);
+			mtx_unlock(&tmp_->flush_mtx);
+			*out_bytes = buf;
+			*out_len   = len;
+			return (1);
+		}
+	}
+	mtx_unlock(&tmp_->flush_mtx);
+	return (0);
+}
+
+/* Drain the pending-manifest cache: snapshot under lock, publish
+ * each to disk without the lock, free the bytes. Identical structure
+ * to dirty_inodes_drain. Called by tessera_fs_flush BEFORE
+ * dirty_inodes_drain so by the time inode records hit btree their
+ * manifest_hash references are real packs. */
+static int
+tessera_fs_pending_manifests_drain(struct tessera_mount *tmp_)
+{
+	if (!tmp_->dirty_init) return (0);
+
+	LIST_HEAD(, tessera_pending_manifest) snap;
+	LIST_INIT(&snap);
+
+	mtx_lock(&tmp_->flush_mtx);
+	uint32_t snap_count = 0;
+	for (uint32_t b = 0; b < TESSERA_PENDING_MANIFEST_BUCKETS; b++) {
+		struct tessera_pending_manifest *e;
+		while ((e = LIST_FIRST(&tmp_->pending_manifests[b])) != NULL) {
+			LIST_REMOVE(e, link);
+			LIST_INSERT_HEAD(&snap, e, link);
+			snap_count++;
+		}
+	}
+	tmp_->pending_manifest_count = 0;
+	tmp_->pending_manifest_bytes = 0;
+	mtx_unlock(&tmp_->flush_mtx);
+	if (snap_count == 0) return (0);
+	tessera_stat_pending_drained += snap_count;
+
+	int err = 0;
+	struct tessera_pending_manifest *e;
+	while ((e = LIST_FIRST(&snap)) != NULL) {
+		LIST_REMOVE(e, link);
+		if (err == 0) {
+			int r = tessera_fs_publish_manifest_to_disk(tmp_,
+			    e->bytes, e->len, e->hash);
+			if (r != 0) err = r;
+		}
+		free(e->bytes, M_TESSERA);
+		free(e, M_TESSERA);
+	}
+	return (err);
+}
+
 static int
 tessera_fs_flush(struct tessera_mount *tmp_)
 {
@@ -2565,7 +2757,11 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 	/* Drain dirty inodes BEFORE commit_sb so the SB sectors written
 	 * by commit_sb capture the post-drain inode_root. drain itself
 	 * takes flush_mtx briefly per entry. */
-	int r = tessera_fs_dirty_inodes_drain(tmp_);
+	/* Drain pending manifests FIRST — inode_tree records reference
+	 * their hashes, so the packs must hit disk before drain →
+	 * btree_put runs. Then drain dirty inodes. Then commit_sb. */
+	int r = tessera_fs_pending_manifests_drain(tmp_);
+	if (r == 0) r = tessera_fs_dirty_inodes_drain(tmp_);
 	if (r == 0) r = tessera_commit_sb(tmp_);
 
 	mtx_lock(&tmp_->flush_mtx);
@@ -2661,6 +2857,14 @@ tessera_fs_fetch_blob(struct tessera_mount *tmp_,
                       const tessera_hash_t hash,
                       uint8_t **out_buf, uint32_t *out_len)
 {
+	/* v2 step-2b: check the in-memory pending-manifest cache first.
+	 * Manifests written via publish_manifest land here without
+	 * touching disk until flush; readers in the same flush window
+	 * pick them up from RAM. Returns a freshly malloc'd copy of the
+	 * cached bytes — caller frees as if from the disk path. */
+	if (tessera_fs_pending_manifest_lookup(tmp_, hash,
+	    out_buf, out_len) != 0)
+		return (0);
 	if (tmp_->pack_registry_tree == NULL) return (ENOENT);
 	tessera_btree_cursor_t *c =
 	    tessera_btree_seek_first(tmp_->pack_registry_tree);
@@ -2984,26 +3188,49 @@ tessera_fs_publish_manifest(struct tessera_mount *tmp_,
 
 	tessera_sha256(manifest_bytes, mlen, out_hash);
 
-	uint8_t pack_id[16];
-	memcpy(pack_id, out_hash, 16);
-
-	/* Publish-cache shortcut (v2 polish): pack_id is derived from the
-	 * manifest hash, so identical content lands at the same pack_id.
-	 * If the registry already contains an entry, the pack body is on
-	 * disk and no work is needed. Catches cp(1)'s repeated whole-file
-	 * republish and chmod-then-revert dirent churn for free. */
+	/* Publish-cache shortcut (publish_dedup): pack_id is derived
+	 * from the manifest hash, so identical content lands at the same
+	 * pack_id. If the registry already contains an entry, the pack
+	 * is on disk; nothing to do. Catches repeated cp + chmod-revert
+	 * patterns for free. Also short-circuits if the manifest is
+	 * already in the in-memory pending cache from this flush window. */
 	{
+		uint8_t pack_id_local[16];
+		memcpy(pack_id_local, out_hash, 16);
 		uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
 		if (tessera_btree_get(tmp_->pack_registry_tree,
-		    pack_id, reg_value) == TESSERA_OK) {
+		    pack_id_local, reg_value) == TESSERA_OK) {
 			tessera_stat_publish_dedup_manifest++;
 			return (0);
 		}
 	}
 
+	/* v2 step-2b extension: defer the disk write. Cache the bytes
+	 * keyed by hash; fetch_blob consults the cache before scanning
+	 * the registry. Drained at flush time. Skipped (write-through)
+	 * when the cache isn't initialised — mount-time GC etc. */
+	if (tmp_->dirty_init &&
+	    tmp_->pending_manifest_bytes <
+	        TESSERA_PENDING_MANIFEST_BYTES_MAX) {
+		return (tessera_fs_pending_manifest_put(tmp_, out_hash,
+		    manifest_bytes, (uint32_t)mlen));
+	}
+	return (tessera_fs_publish_manifest_to_disk(tmp_, manifest_bytes,
+	    mlen, out_hash));
+}
+
+static int
+tessera_fs_publish_manifest_to_disk(struct tessera_mount *tmp_,
+                                    const uint8_t *manifest_bytes,
+                                    size_t mlen,
+                                    const tessera_hash_t hash)
+{
+	uint8_t pack_id[16];
+	memcpy(pack_id, hash, 16);
+
 	tessera_pack_builder_t *pb = tessera_pack_begin(0, pack_id, 0);
 	if (pb == NULL) return (ENOMEM);
-	if (tessera_pack_add_blob(pb, out_hash, manifest_bytes,
+	if (tessera_pack_add_blob(pb, hash, manifest_bytes,
 	    (uint32_t)mlen, TESSERA_BLOB_FLAG_MANIFEST) != TESSERA_OK) {
 		tessera_pack_free(pb);
 		return (EIO);
