@@ -299,6 +299,9 @@ static int tessera_fs_replace_content_chunked(struct tessera_mount *tmp_,
 static int tessera_fs_append_chunked(struct tessera_mount *tmp_,
     uint32_t inode_no, const uint8_t *append_bytes, size_t append_len,
     uint32_t cs);
+static int tessera_fs_append_chunk_tree(struct tessera_mount *tmp_,
+    uint32_t inode_no, const uint8_t *append_bytes, size_t append_len,
+    uint32_t cs);
 static void encode_inode_key(uint32_t inode_no, uint8_t out[4]);
 
 /* v2 step-2b: dirty inode entry — element of the per-mount hash. */
@@ -4189,19 +4192,6 @@ tessera_fs_append_chunked(struct tessera_mount *tmp_, uint32_t inode_no,
 	if (old_size == 0) return (ENOTSUP);   /* nothing to retain */
 	const uint64_t new_size = old_size + (uint64_t)append_len;
 
-	/* Step-3c: if the resulting chunk count would overflow the
-	 * CHUNK_TREE fanout, bail to the slow path. The slow path
-	 * routes through replace_content_chunked, which already knows
-	 * how to promote to CHUNK_TREE. Append fast-path stays
-	 * CHUNK_LIST-only — fast for the common case (logs, monotonic
-	 * append into bounded-size files), correct for the rare
-	 * crossover (file growing past the fanout boundary). */
-	{
-		const uint64_t projected_chunks = (new_size + cs - 1) / cs;
-		if (projected_chunks > (uint64_t)TESSERA_CHUNK_TREE_FANOUT)
-			return (ENOTSUP);
-	}
-
 	int has_old = 0;
 	for (size_t i = 0; i < TESSERA_HASH_SIZE; i++)
 		if (old_ino.manifest_hash[i] != 0) { has_old = 1; break; }
@@ -4217,10 +4207,35 @@ tessera_fs_append_chunked(struct tessera_mount *tmp_, uint32_t inode_no,
 		free(old_mft, M_TESSERA);
 		return (ENOTSUP);
 	}
-	if (tessera_manifest_parser_kind(p) != TESSERA_MFT_CHUNK_LIST) {
+	const tessera_manifest_kind_t old_kind = tessera_manifest_parser_kind(p);
+
+	/* CHUNK_TREE files have their own suffix-only fast-path (rebuilds
+	 * just the last group + any spillover, keeps K-1 prefix tree
+	 * records verbatim). The helper re-fetches the outer manifest. */
+	if (old_kind == TESSERA_MFT_CHUNK_TREE) {
+		tessera_manifest_parser_free(p);
+		free(old_mft, M_TESSERA);
+		return (tessera_fs_append_chunk_tree(tmp_, inode_no,
+		    append_bytes, append_len, cs));
+	}
+
+	if (old_kind != TESSERA_MFT_CHUNK_LIST) {
 		tessera_manifest_parser_free(p);
 		free(old_mft, M_TESSERA);
 		return (ENOTSUP);
+	}
+
+	/* Step-3c: a CHUNK_LIST file whose append would push it past the
+	 * fanout must be promoted to CHUNK_TREE — bail to the slow path,
+	 * which routes through replace_content_chunked and handles the
+	 * promotion. Append fast-path stays flat-only here. */
+	{
+		const uint64_t projected_chunks = (new_size + cs - 1) / cs;
+		if (projected_chunks > (uint64_t)TESSERA_CHUNK_TREE_FANOUT) {
+			tessera_manifest_parser_free(p);
+			free(old_mft, M_TESSERA);
+			return (ENOTSUP);
+		}
 	}
 
 	const uint32_t old_n = tessera_manifest_parser_count(p);
@@ -4422,6 +4437,445 @@ enomem:
 	free(dirty, M_TESSERA);
 	free(old, M_TESSERA);
 	return (ENOMEM);
+}
+
+/*
+ * Append fast-path for CHUNK_TREE files (v2 step-3c follow-up).
+ *
+ * The flat-CHUNK_LIST append fast-path doesn't apply once a file has
+ * been promoted to CHUNK_TREE. Without this helper, every append to a
+ * CHUNK_TREE file would route through the slow whole-file rewrite —
+ * which for a multi-GiB-at-4-KiB-cs file (e.g. a VM-image journal)
+ * means materialising and re-hashing GiBs to add a few KiB. Defeats
+ * the entire purpose of CHUNK_TREE.
+ *
+ * Suffix-only rewrite strategy:
+ *
+ *   - Outer CHUNK_TREE has K tree records pointing at K group
+ *     sub-CHUNK_LISTs. The first K-1 groups (chunks 0..(K-1)*FANOUT-1)
+ *     are unaffected by the append; their tree_records carry over
+ *     verbatim into the new outer.
+ *   - The last (tail) group is fetched and parsed. Its chunks
+ *     0..M-2 keep their hashes verbatim. Its last chunk is
+ *     materialised iff partial; merged with the head of the append.
+ *   - Remaining append bytes are split into chunks and packed into
+ *     the tail group up to FANOUT, then spill into newly-published
+ *     groups until consumed.
+ *   - New outer points at K-1 prefix records + 1 modified tail +
+ *     0..M-1 spillover groups.
+ *
+ * Cost: O(append_len) bytes of chunking + O(K-1) tree_record copies
+ * + O(spillover_groups + 1) sub-manifest republishes. The K-1
+ * unmodified groups are free — their packs already exist on disk.
+ *
+ * 1 KiB log-line append to a 1 GiB-at-4-KiB-cs CHUNK_TREE file:
+ * touches 1 chunk + the tail sub-manifest + the outer manifest.
+ * ~50 KiB of write rather than ~1 GiB.
+ *
+ * Returns ENOTSUP for any malformed/mismatched input; caller falls
+ * back to slow path (replace_content_chunked, which can rebuild from
+ * raw bytes correctly even if structurally novel).
+ */
+static int
+tessera_fs_append_chunk_tree(struct tessera_mount *tmp_, uint32_t inode_no,
+    const uint8_t *append_bytes, size_t append_len, uint32_t cs)
+{
+	if (append_len == 0) return (ENOTSUP);
+
+	uint8_t key[4];
+	tessera_inode_record_t old_ino;
+	encode_inode_key(inode_no, key);
+	if (tessera_fs_inode_get_byk(tmp_, key, &old_ino) != TESSERA_OK)
+		return (EIO);
+
+	const uint64_t old_size = old_ino.size;
+	if (old_size == 0) return (ENOTSUP);
+	const uint64_t new_size = old_size + (uint64_t)append_len;
+
+	/* Fetch + parse outer CHUNK_TREE manifest. */
+	uint8_t  *outer_mft = NULL;
+	uint32_t  outer_mlen = 0;
+	if (tessera_fs_fetch_blob(tmp_, old_ino.manifest_hash,
+	    &outer_mft, &outer_mlen) != 0)
+		return (ENOTSUP);
+	tessera_manifest_parser_t *op =
+	    tessera_manifest_parse(outer_mft, outer_mlen);
+	if (op == NULL ||
+	    tessera_manifest_parser_kind(op) != TESSERA_MFT_CHUNK_TREE) {
+		if (op) tessera_manifest_parser_free(op);
+		free(outer_mft, M_TESSERA);
+		return (ENOTSUP);
+	}
+
+	const uint32_t K = tessera_manifest_parser_count(op);
+	if (K == 0) {
+		tessera_manifest_parser_free(op);
+		free(outer_mft, M_TESSERA);
+		return (ENOTSUP);
+	}
+
+	/* Snapshot all K tree records. */
+	struct tree_rec {
+		tessera_hash_t hash;
+		uint64_t       off;
+	};
+	struct tree_rec *otr = malloc(K * sizeof *otr, M_TESSERA,
+	    M_WAITOK | M_ZERO);
+	for (uint32_t i = 0; i < K; i++) {
+		tessera_tree_record_t tr;
+		if (tessera_manifest_tree_at(op, i, &tr) != TESSERA_OK) {
+			tessera_manifest_parser_free(op);
+			free(outer_mft, M_TESSERA);
+			free(otr, M_TESSERA);
+			return (ENOTSUP);
+		}
+		memcpy(otr[i].hash, tr.child_manifest_hash, sizeof tr.child_manifest_hash);
+		otr[i].off = tr.logical_offset;
+	}
+	tessera_manifest_parser_free(op);
+	free(outer_mft, M_TESSERA);
+
+	const uint64_t tail_off = otr[K - 1].off;
+	const uint64_t tail_byte_count = old_size - tail_off;
+	if (tail_byte_count == 0) {
+		free(otr, M_TESSERA);
+		return (ENOTSUP);
+	}
+
+	/* Fetch + parse tail group's sub-CHUNK_LIST. */
+	uint8_t  *tail_mft = NULL;
+	uint32_t  tail_mlen = 0;
+	if (tessera_fs_fetch_blob(tmp_, otr[K - 1].hash,
+	    &tail_mft, &tail_mlen) != 0) {
+		free(otr, M_TESSERA);
+		return (ENOTSUP);
+	}
+	tessera_manifest_parser_t *tp =
+	    tessera_manifest_parse(tail_mft, tail_mlen);
+	if (tp == NULL ||
+	    tessera_manifest_parser_kind(tp) != TESSERA_MFT_CHUNK_LIST) {
+		if (tp) tessera_manifest_parser_free(tp);
+		free(tail_mft, M_TESSERA);
+		free(otr, M_TESSERA);
+		return (ENOTSUP);
+	}
+
+	const uint32_t M = tessera_manifest_parser_count(tp);
+	if (M == 0 || M > TESSERA_CHUNK_TREE_FANOUT) {
+		tessera_manifest_parser_free(tp);
+		free(tail_mft, M_TESSERA);
+		free(otr, M_TESSERA);
+		return (ENOTSUP);
+	}
+
+	/* Snapshot tail-group chunks. Validate offsets are global +
+	 * full-cs sized except the last, which may be partial. */
+	struct old_rec_t {
+		tessera_hash_t hash;
+		uint64_t       off;
+		uint32_t       sz;
+		uint32_t       flags;
+	};
+	struct old_rec_t *told = malloc(M * sizeof *told, M_TESSERA,
+	    M_WAITOK | M_ZERO);
+	int eligible = 1;
+	for (uint32_t i = 0; i < M; i++) {
+		tessera_chunk_record_t cr;
+		if (tessera_manifest_chunk_at(tp, i, &cr) != TESSERA_OK ||
+		    cr.logical_offset != tail_off + (uint64_t)i * cs ||
+		    (i < M - 1 && cr.uncompressed_size != cs)) {
+			eligible = 0;
+			break;
+		}
+		memcpy(told[i].hash, cr.chunk_hash, sizeof cr.chunk_hash);
+		told[i].off   = cr.logical_offset;
+		told[i].sz    = cr.uncompressed_size;
+		told[i].flags = cr.flags;
+	}
+	tessera_manifest_parser_free(tp);
+	free(tail_mft, M_TESSERA);
+	if (!eligible) {
+		free(told, M_TESSERA);
+		free(otr, M_TESSERA);
+		return (ENOTSUP);
+	}
+
+	const uint32_t last_old_sz = told[M - 1].sz;
+	const int last_partial = (last_old_sz < cs);
+
+	/* Materialise old last chunk if partial (need it for merging
+	 * with the head of the append). */
+	uint8_t *merge_buf = NULL;
+	if (last_partial) {
+		merge_buf = malloc(cs, M_TESSERA, M_WAITOK | M_ZERO);
+		if (!(told[M - 1].flags & TESSERA_CHUNK_FLAG_ZERO_HOLE)) {
+			uint8_t *cb = NULL;
+			uint32_t cb_len = 0;
+			if (tessera_fs_fetch_blob(tmp_, told[M - 1].hash,
+			    &cb, &cb_len) != 0) {
+				free(merge_buf, M_TESSERA);
+				free(told, M_TESSERA);
+				free(otr, M_TESSERA);
+				return (ENOTSUP);
+			}
+			memcpy(merge_buf, cb,
+			    (last_old_sz < cb_len) ? last_old_sz : cb_len);
+			free(cb, M_TESSERA);
+		}
+	}
+
+	/* Build the new outer manifest. K-1 prefix tree records carry
+	 * over verbatim. We then publish modified tail + spillover
+	 * groups, adding tree records as we go. */
+	tessera_manifest_builder_t *outer =
+	    tessera_manifest_begin(TESSERA_MFT_CHUNK_TREE);
+	if (outer == NULL) {
+		if (merge_buf) free(merge_buf, M_TESSERA);
+		free(told, M_TESSERA);
+		free(otr, M_TESSERA);
+		return (ENOMEM);
+	}
+	for (uint32_t i = 0; i + 1 < K; i++) {
+		if (tessera_manifest_add_tree_child(outer, otr[i].hash,
+		    otr[i].off) != TESSERA_OK) {
+			tessera_manifest_free(outer);
+			if (merge_buf) free(merge_buf, M_TESSERA);
+			free(told, M_TESSERA);
+			free(otr, M_TESSERA);
+			return (ENOMEM);
+		}
+	}
+
+	/* Walk new bytes group-by-group. Each group is a CHUNK_LIST
+	 * pack publish; outer references its hash. */
+	size_t append_pos = 0;
+	uint64_t cur_group_off = tail_off;
+	const uint32_t SOFT_CAP = TESSERA_CHUNK_TREE_FANOUT;
+
+	/* For the first iteration the group seeds with tail_old chunks
+	 * (0..M-2 verbatim + modified last). Subsequent spillover groups
+	 * start empty. */
+	int seeded_with_tail = 1;
+
+	while (append_pos < append_len ||
+	    (seeded_with_tail && M > 0)) {
+		struct tessera_chunk_in *dirty = malloc(
+		    SOFT_CAP * sizeof *dirty, M_TESSERA, M_WAITOK | M_ZERO);
+		uint32_t n_dirty = 0;
+
+		tessera_manifest_builder_t *mb =
+		    tessera_manifest_begin(TESSERA_MFT_CHUNK_LIST);
+		if (mb == NULL) {
+			free(dirty, M_TESSERA);
+			tessera_manifest_free(outer);
+			if (merge_buf) free(merge_buf, M_TESSERA);
+			free(told, M_TESSERA);
+			free(otr, M_TESSERA);
+			return (ENOMEM);
+		}
+
+		uint32_t group_chunks = 0;
+		uint64_t cur_off = cur_group_off;
+
+		if (seeded_with_tail) {
+			/* Carry chunks 0..M-2 verbatim. */
+			for (uint32_t i = 0; i + 1 < M; i++) {
+				if (tessera_manifest_add_chunk(mb,
+				    told[i].hash, told[i].off, told[i].sz,
+				    told[i].flags) != TESSERA_OK)
+					goto et_enomem;
+				group_chunks++;
+				cur_off = told[i].off + told[i].sz;
+			}
+			/* Modified last chunk: if partial, merge with append
+			 * head; else if aligned, the "old last chunk" was
+			 * already full and gets carried verbatim too. */
+			if (last_partial) {
+				const uint32_t fill =
+				    (uint32_t)(cs - last_old_sz);
+				const uint32_t take = (append_len - append_pos
+				    < (size_t)fill) ?
+				    (uint32_t)(append_len - append_pos) : fill;
+				memcpy(merge_buf + last_old_sz,
+				    append_bytes + append_pos, take);
+				const uint32_t merged_sz = last_old_sz + take;
+
+				int all_zero = 1;
+				for (uint32_t j = 0; j < merged_sz; j++)
+					if (merge_buf[j] != 0) {
+						all_zero = 0;
+						break;
+					}
+				if (all_zero) {
+					tessera_hash_t zh;
+					memset(zh, 0, sizeof zh);
+					if (tessera_manifest_add_chunk(mb, zh,
+					    told[M - 1].off, merged_sz,
+					    TESSERA_CHUNK_FLAG_ZERO_HOLE)
+					    != TESSERA_OK) goto et_enomem;
+					tessera_stat_chunk_zero_hole++;
+				} else {
+					tessera_hash_t h;
+					tessera_sha256(merge_buf, merged_sz, h);
+					if (tessera_manifest_add_chunk(mb, h,
+					    told[M - 1].off, merged_sz, 0)
+					    != TESSERA_OK) goto et_enomem;
+					dirty[n_dirty].bytes = merge_buf;
+					dirty[n_dirty].len   = merged_sz;
+					memcpy(dirty[n_dirty].hash, h, sizeof h);
+					n_dirty++;
+				}
+				group_chunks++;
+				cur_off = told[M - 1].off + merged_sz;
+				append_pos += take;
+			} else {
+				/* Aligned EOF: old last chunk is full-cs and
+				 * untouched. Carry verbatim. */
+				if (tessera_manifest_add_chunk(mb,
+				    told[M - 1].hash, told[M - 1].off,
+				    told[M - 1].sz, told[M - 1].flags)
+				    != TESSERA_OK) goto et_enomem;
+				group_chunks++;
+				cur_off = told[M - 1].off + told[M - 1].sz;
+			}
+			seeded_with_tail = 0;
+		}
+
+		/* Fill remainder of this group with new appended chunks. */
+		while (group_chunks < SOFT_CAP && append_pos < append_len) {
+			const size_t remain = append_len - append_pos;
+			const uint32_t this_len = (remain >= (size_t)cs)
+			    ? cs : (uint32_t)remain;
+
+			int all_zero = 1;
+			for (uint32_t j = 0; j < this_len; j++) {
+				if (append_bytes[append_pos + j] != 0) {
+					all_zero = 0;
+					break;
+				}
+			}
+			if (all_zero) {
+				tessera_hash_t zh;
+				memset(zh, 0, sizeof zh);
+				if (tessera_manifest_add_chunk(mb, zh, cur_off,
+				    this_len, TESSERA_CHUNK_FLAG_ZERO_HOLE)
+				    != TESSERA_OK) goto et_enomem;
+				tessera_stat_chunk_zero_hole++;
+			} else {
+				tessera_hash_t h;
+				tessera_sha256(append_bytes + append_pos,
+				    this_len, h);
+				if (tessera_manifest_add_chunk(mb, h, cur_off,
+				    this_len, 0) != TESSERA_OK)
+					goto et_enomem;
+				dirty[n_dirty].bytes =
+				    append_bytes + append_pos;
+				dirty[n_dirty].len   = this_len;
+				memcpy(dirty[n_dirty].hash, h, sizeof h);
+				n_dirty++;
+			}
+			group_chunks++;
+			append_pos += this_len;
+			cur_off    += this_len;
+		}
+
+		/* Finalize + publish this group. */
+		size_t mlen = 0;
+		tessera_hash_t mhash;
+		(void)tessera_manifest_finalize(mb, NULL, 0, &mlen, mhash);
+		uint8_t *mft = malloc(mlen, M_TESSERA, M_WAITOK);
+		if (tessera_manifest_finalize(mb, mft, mlen, &mlen, mhash)
+		    != TESSERA_OK) {
+			free(mft, M_TESSERA);
+			goto et_enomem;
+		}
+		tessera_manifest_free(mb);
+		mb = NULL;
+
+		tessera_hash_t pub_hash;
+		if (tessera_fs_publish_chunked(tmp_, dirty, n_dirty, mft,
+		    mlen, pub_hash) != 0) {
+			free(mft, M_TESSERA);
+			free(dirty, M_TESSERA);
+			tessera_manifest_free(outer);
+			if (merge_buf) free(merge_buf, M_TESSERA);
+			free(told, M_TESSERA);
+			free(otr, M_TESSERA);
+			return (EIO);
+		}
+		free(mft, M_TESSERA);
+		free(dirty, M_TESSERA);
+
+		if (tessera_manifest_add_tree_child(outer, pub_hash,
+		    cur_group_off) != TESSERA_OK) {
+			tessera_manifest_free(outer);
+			if (merge_buf) free(merge_buf, M_TESSERA);
+			free(told, M_TESSERA);
+			free(otr, M_TESSERA);
+			return (ENOMEM);
+		}
+
+		/* Next group starts at cur_off (the byte position we've
+		 * advanced to). */
+		cur_group_off = cur_off;
+		continue;
+et_enomem:
+		if (mb) tessera_manifest_free(mb);
+		free(dirty, M_TESSERA);
+		tessera_manifest_free(outer);
+		if (merge_buf) free(merge_buf, M_TESSERA);
+		free(told, M_TESSERA);
+		free(otr, M_TESSERA);
+		return (ENOMEM);
+	}
+
+	if (merge_buf) free(merge_buf, M_TESSERA);
+	free(told, M_TESSERA);
+	free(otr, M_TESSERA);
+
+	/* Outer's logical_size must equal new file size (read path uses
+	 * it as the last subtree's exclusive upper bound). */
+	(void)tessera_manifest_set_logical_size(outer, new_size);
+
+	size_t olen = 0;
+	tessera_hash_t ohash;
+	(void)tessera_manifest_finalize(outer, NULL, 0, &olen, ohash);
+	uint8_t *obuf = malloc(olen, M_TESSERA, M_WAITOK);
+	if (tessera_manifest_finalize(outer, obuf, olen, &olen, ohash)
+	    != TESSERA_OK) {
+		tessera_manifest_free(outer);
+		free(obuf, M_TESSERA);
+		return (EIO);
+	}
+	tessera_manifest_free(outer);
+
+	if (tessera_fs_publish_manifest_owned(tmp_, obuf, olen, ohash,
+	    inode_no) != 0) {
+		free(obuf, M_TESSERA);
+		return (EIO);
+	}
+	free(obuf, M_TESSERA);
+
+	tessera_inode_record_t ino;
+	if (tessera_fs_inode_get_byk(tmp_, key, &ino) != TESSERA_OK)
+		return (EIO);
+	memcpy(ino.manifest_hash, ohash, sizeof ohash);
+	ino.size = new_size;
+	ino.gen++;
+	struct timeval tv;
+	getmicrotime(&tv);
+	uint64_t now_ns = (uint64_t)tv.tv_sec * 1000000000ULL +
+	    (uint64_t)tv.tv_usec * 1000ULL;
+	ino.mtime_ns = ino.ctime_ns = now_ns;
+
+	uint64_t new_inode_root = tmp_->sb.inode_root;
+	if (tessera_fs_inode_put_byk(tmp_, key, &ino,
+	    &new_inode_root) != TESSERA_OK)
+		return (EIO);
+	tmp_->sb.inode_root = new_inode_root;
+
+	tessera_stat_chunk_tree_publish++;
+	return (0);
 }
 
 /*
