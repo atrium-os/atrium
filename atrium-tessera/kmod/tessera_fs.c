@@ -2751,6 +2751,10 @@ struct tessera_jrec_sb_commit {
 	uint64_t inode_root;
 	uint64_t pack_registry_root;
 	uint64_t free_extent_root;
+	uint64_t snapshots_root;
+	uint64_t snapshots_gen;
+	uint64_t next_inode_no;
+	uint64_t meta_reserve_bump;
 };
 
 /*
@@ -2869,6 +2873,10 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 			body.inode_root         = tmp_->sb.inode_root;
 			body.pack_registry_root = tmp_->sb.pack_registry_root;
 			body.free_extent_root   = tmp_->sb.free_extent_root;
+			body.snapshots_root     = tmp_->sb.snapshots_root;
+			body.snapshots_gen      = tmp_->sb.snapshots_gen;
+			body.next_inode_no      = tmp_->sb.next_inode_no;
+			body.meta_reserve_bump  = tmp_->sb.meta_reserve_bump;
 			(void)tessera_journal_append(tmp_->journal, tx,
 			    TESSERA_ROOT_UPDATE, &body, sizeof body);
 			(void)tessera_journal_tx_commit(tmp_->journal, tx);
@@ -3302,11 +3310,29 @@ tessera_fs_dirty_inodes_drain(struct tessera_mount *tmp_)
 		int r;
 		if (e->tombstone) {
 			r = tessera_btree_delete(tmp_->inode_tree, key, &root);
-			if (r != TESSERA_OK && r != TESSERA_ENOENT) err = EIO;
+			if (r != TESSERA_OK && r != TESSERA_ENOENT) {
+				printf("tessera_fs: dirty_inodes_drain — "
+				    "btree_delete inode_no=%u failed: r=%d "
+				    "root=%llu (drained %u/%u)\n",
+				    (unsigned)e->inode_no, r,
+				    (unsigned long long)root,
+				    (unsigned)tessera_stat_dirty_drained,
+				    (unsigned)snap_count);
+				err = EIO;
+			}
 		} else {
 			r = tessera_btree_put(tmp_->inode_tree, key,
 			    &e->rec, &root);
-			if (r != TESSERA_OK) err = EIO;
+			if (r != TESSERA_OK) {
+				printf("tessera_fs: dirty_inodes_drain — "
+				    "btree_put inode_no=%u failed: r=%d "
+				    "root=%llu (drained %u/%u)\n",
+				    (unsigned)e->inode_no, r,
+				    (unsigned long long)root,
+				    (unsigned)tessera_stat_dirty_drained,
+				    (unsigned)snap_count);
+				err = EIO;
+			}
 		}
 		free(e, M_TESSERA);
 		if (err != 0) break;
@@ -3518,9 +3544,30 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 	 * sb.free_extent_root would point at a stale view that misses
 	 * sectors allocated during this drain. */
 	int r = tessera_fs_pending_manifests_drain(tmp_);
-	if (r == 0) r = tessera_fs_dirty_inodes_drain(tmp_);
-	if (r == 0) (void)tessera_commit_extent(tmp_);
-	if (r == 0) r = tessera_commit_sb(tmp_);
+	if (r != 0)
+		printf("tessera_fs: flush — pending_manifests_drain failed: %d "
+		    "(unmounting=%d sb_dirty=%d)\n",
+		    r, tmp_->flush_unmounting, tmp_->sb_dirty);
+	if (r == 0) {
+		r = tessera_fs_dirty_inodes_drain(tmp_);
+		if (r != 0)
+			printf("tessera_fs: flush — dirty_inodes_drain failed: "
+			    "%d (unmounting=%d sb_dirty=%d)\n",
+			    r, tmp_->flush_unmounting, tmp_->sb_dirty);
+	}
+	if (r == 0) {
+		int rce = tessera_commit_extent(tmp_);
+		if (rce != 0)
+			printf("tessera_fs: flush — commit_extent failed: %d "
+			    "(unmounting=%d sb_dirty=%d)\n",
+			    rce, tmp_->flush_unmounting, tmp_->sb_dirty);
+	}
+	if (r == 0) {
+		r = tessera_commit_sb(tmp_);
+		if (r != 0)
+			printf("tessera_fs: flush — commit_sb failed: %d "
+			    "(unmounting=%d)\n", r, tmp_->flush_unmounting);
+	}
 
 	mtx_lock(&tmp_->flush_mtx);
 	if (r == 0) tmp_->sb_dirty = 0;
@@ -3570,6 +3617,10 @@ tessera_replay_handler(void *ctx, const tessera_record_header_t *hdr,
 	rc->tmp_->sb.inode_root         = rec.inode_root;
 	rc->tmp_->sb.pack_registry_root = rec.pack_registry_root;
 	rc->tmp_->sb.free_extent_root   = rec.free_extent_root;
+	rc->tmp_->sb.snapshots_root     = rec.snapshots_root;
+	rc->tmp_->sb.snapshots_gen      = rec.snapshots_gen;
+	rc->tmp_->sb.next_inode_no      = rec.next_inode_no;
+	rc->tmp_->sb.meta_reserve_bump  = rec.meta_reserve_bump;
 	rc->applied++;
 	return (0);
 }
