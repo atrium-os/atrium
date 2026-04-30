@@ -478,18 +478,16 @@ Depends on Phase 1 (core primitives) and benefits from Phase 3 (test harness for
 | `vop_readdir` over real DIRECTORY manifest | 0.5 weeks | **done** (round 4d) | `ls -la /mnt/x` returns ./.. + entries with real d_type |
 | `vop_read` (manifest tree walk + chunk fetch) | 1 week | **done** — INLINE + CHUNK_LIST (rounds 5a + 5b) + CHUNK_TREE recursive read (v2 step 3c, commit b638b46) + CHUNK_TREE write-side promotion at fanout=256 (v2 step 3c, commit ec302ca). Per-mount `mount -o tessera.chunk_size=<bytes>` chunk-size override (commit 32538d3) tunes granularity for VM-image dedup; grouping itself is automatic. | `cat`, `wc -c`, `dd skip=N count=M` over chunked content all return correct bytes; 2 MiB at cs=4 KiB exercises CHUNK_TREE end-to-end |
 | `vop_open`, `vop_close` | 0.25 weeks | **done** (no-op stubs) | n/a |
-| **Metadata reserve** (tessera-fs.md §3.3) — carved out at format time, used by the in-kernel allocator for inode/pack-registry/free-extent B+tree updates so commits don't recurse into the data extent allocator | 0.5 weeks | pending — blocker for every write path | unit test: `tessera_extent_flush` against a populated allocator never gets ENOSPC even when the data zone is full |
-| `vop_read` (manifest tree walk + chunk fetch) | 1 week | read of inline + chunked + tree manifests |
-| `vop_readdir` (synthesized "."/"..") | 1 week | readdir/readdir_r conformance |
-| `vop_write` (per-fd buffer, flush at fsync/close) | 2 weeks | crash-injection with sync writes |
-| `vop_create`, `vop_mkdir`, `vop_rmdir`, `vop_remove` | 1.5 weeks | full directory mutation tests |
-| `vop_rename` (single-tx atomicity) | 1.5 weeks | atomic-rename torture |
-| `vop_link`, `vop_symlink`, `vop_readlink` | 1 week | hardlink + symlink semantics |
-| `vop_setattr` (chmod/chown/chflags/utimes/truncate) | 1 week | metadata-only mutation tests |
-| `vop_getxattr / setxattr / listxattr / removexattr` | 1 week | xattr roundtrip + Atrium tag prefix |
-| `vop_copy_file_range` (reflink) | 1 week | hash-only-copy; whole-file and partial |
-| `vop_getpages / vop_putpages` (mmap) | 2 weeks | MAP_PRIVATE + MAP_SHARED workloads |
-| Subvolume + GC-root ioctls | 1 week | tessera subvol + tessera-pin from CLI |
+| **Metadata reserve** (tessera-fs.md §3.3) — carved out at format time, used by the in-kernel allocator for inode/pack-registry/free-extent B+tree updates so commits don't recurse into the data extent allocator | 0.5 weeks | **done** (round 7) + meta-recycler + 50% watermark + dirty_count > 64 trigger landed with v2 step 2b | `tessera_extent_flush` against a populated allocator never gets ENOSPC even when the data zone is full |
+| `vop_write` (per-fd buffer, flush at fsync/close) | 2 weeks | **done** (rounds 6c+) — INLINE + flat CHUNK_LIST + CHUNK_TREE write-side promotion + chunk dedup + sparse files (ZERO_HOLE) + adaptive chunk sizing + append fast-path (flat + CHUNK_TREE suffix-only) | crash-injection with sync writes; `chunked_write_test`, `sparse_test`, `append_test`, `chunk_tree_write_test`, `chunk_tree_append_test` all green |
+| `vop_create`, `vop_mkdir`, `vop_rmdir`, `vop_remove` | 1.5 weeks | **done** (round 6c) | `workload_test`, `multilevel_dir_test`, `crash_inject_test` |
+| `vop_rename` (single-tx atomicity) | 1.5 weeks | **done in-dir** (round 6c); cross-dir still EOPNOTSUPP | atomic-rename torture for in-dir; cross-dir is a v2 follow-up |
+| `vop_link`, `vop_symlink`, `vop_readlink` | 1 week | **done** (round 6) | `hardlink_test` |
+| `vop_setattr` (chmod/chown/chflags/utimes/truncate) | 1 week | **done** — handles utimes / chmod / chown / truncate. `chflags` not yet wired (no consumer exercises it). | `workload_test` chmod/chown sequence; truncate via `>` shell redirect is the canonical test |
+| `vop_getxattr / setxattr / listxattr / removexattr` | 1 week | pending — XATTR_STORE manifest kind format-reserved, kmod path not wired | xattr roundtrip + Atrium tag prefix |
+| `vop_copy_file_range` (reflink) | 1 week | pending — hash-only-copy via inode COW + manifest_hash share | hash-only-copy; whole-file and partial |
+| `vop_getpages / vop_putpages` (mmap) | 2 weeks | pending | MAP_PRIVATE + MAP_SHARED workloads |
+| Subvolume + GC-root ioctls | 1 week | partial — GC-root manifest format-reserved (`TESSERA_MFT_GC_ROOT_LIST`); `/.tessera/snapshots/` magic dir is v2 slice 3 (deferred) | tessera subvol + tessera-pin from CLI |
 
 Each VFS-op lands incrementally. The `tessera-fs.ko` evolves from "mounts but everything returns ENOTSUP" to fully POSIX-conformant.
 

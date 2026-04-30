@@ -2077,18 +2077,30 @@ out:
 /* ── vop_setattr (utimes / chmod / chown / chflags) ─────────── */
 
 /*
- * vop_setattr — utimes only (chmod/chown/truncate still EOPNOTSUPP).
+ * vop_setattr — utimes / chmod / chown / truncate.
  *
- * Path: btree_get (current inode record) → patch atime/mtime/ctime →
- * btree_put (COW path through meta_bio, allocates a new node sector
- * from the metadata reserve, returns the new tree root) → commit_sb
- * (synchronous SB write to sectors 0+1 with the new inode_root and
- * bumped generation, so the change persists across umount/remount).
+ * (`chflags` is not yet wired — no consumer exercises it; the field
+ * isn't represented in `tessera_inode_record_t` and would need a
+ * format-version bump.)
  *
- * The "deadlock during touch" investigated through round 6c-redux
- * was actually a kernel stack overflow in btree_put (4 KiB stack
- * arrays per recursion level vs FreeBSD aarch64's 16 KiB kstack).
- * Fix: btree.c put-path now heap-allocates its node buffers.
+ * Path: tessera_fs_inode_get (live record) → optionally rebuild
+ * content via replace_content* if va_size changed → patch
+ * atime/mtime/ctime/mode/uid/gid → tessera_fs_inode_put (COW through
+ * meta_bio; v2 step-2b stages into dirty_inodes, drained on flush) →
+ * mark_dirty (deferred SB commit). Any change persists across
+ * umount/remount via the normal commit_sb path.
+ *
+ * Truncate to a smaller size: read-truncate-republish (via
+ * replace_content / replace_content_chunked depending on file size).
+ * Truncate to a larger size: zero-pad in RAM and republish. Both
+ * use the same chunked-vs-INLINE dispatch logic as vop_write, so
+ * truncating a 2 GiB file to 1 GiB at cs=4 KiB does the right
+ * thing (CHUNK_TREE re-emit, group-level dedup at the pack registry).
+ *
+ * Historical note: the "deadlock during touch" investigated through
+ * round 6c-redux was a kernel stack overflow in btree_put (4 KiB
+ * stack arrays per recursion level vs FreeBSD aarch64's 16 KiB
+ * kstack). Fix: btree.c put-path now heap-allocates its node buffers.
  */
 static int
 tessera_vop_setattr(struct vop_setattr_args *ap)
