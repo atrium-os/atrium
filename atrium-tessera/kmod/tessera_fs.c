@@ -285,6 +285,32 @@ static int tessera_fs_append_chunked(struct tessera_mount *tmp_,
     uint32_t cs);
 static void encode_inode_key(uint32_t inode_no, uint8_t out[4]);
 
+/* v2 multi-level directory helpers. */
+typedef int (*tessera_dirent_cb_t)(void *ctx, uint64_t child_inode,
+                                   const char *name, uint16_t name_len);
+static int tessera_fs_dir_walk(struct tessera_mount *tmp_,
+                               const tessera_hash_t dir_manifest_hash,
+                               tessera_dirent_cb_t cb, void *ctx);
+static int tessera_fs_dirent_rewrite(struct tessera_mount *tmp_,
+                                     uint32_t parent_inode_no,
+                                     int op, uint64_t verify_inode,
+                                     uint64_t add_inode,
+                                     const char *name, size_t namelen);
+static int tessera_fs_publish_directory(struct tessera_mount *tmp_,
+                                         const uint8_t *flat_mft,
+                                         size_t flat_mlen,
+                                         tessera_hash_t out_hash);
+/* Promotion threshold: when a flat-DIRECTORY manifest body exceeds
+ * this size, publish_directory splits entries into hash buckets and
+ * emits DIRECTORY_2L instead. ~4 KiB matches the v2 design; small
+ * enough that mutation cost stays bounded, large enough that typical
+ * small dirs stay flat. */
+#define TESSERA_DIR_PROMOTE_THRESHOLD  (4u * 1024u)
+/* Bucket count when promoting. K=16 keeps each bucket ~100 entries
+ * for dir sizes around the promote threshold. Larger dirs (>1k
+ * entries) will eventually want 3 levels — deferred. */
+#define TESSERA_DIR_BUCKET_COUNT       16u
+
 /* ── per-mount state ─────────────────────────────────────────── */
 
 struct tessera_mount {
@@ -1338,6 +1364,51 @@ tessera_dir_lookup_name(const uint8_t *body, size_t body_len,
 	return (ENOENT);
 }
 
+/* DIRECTORY_2L lookup: hash the name, binary-search the outer
+ * manifest's bucket list for the bucket whose first_name_hash is
+ * the largest value ≤ hash(name), then fetch that bucket's flat
+ * DIRECTORY manifest and do a normal lookup. */
+static int
+tessera_fs_dir_2l_lookup(struct tessera_mount *tmp_,
+                         const tessera_manifest_parser_t *outer,
+                         const char *name, uint16_t nlen,
+                         uint64_t *out_inode)
+{
+	const uint64_t name_h = tessera_dir_name_hash(name, nlen);
+	const uint32_t n = tessera_manifest_parser_count(outer);
+	if (n == 0) return (ENOENT);
+
+	int lo = 0, hi = (int)n - 1, best = 0;
+	while (lo <= hi) {
+		int mid = lo + (hi - lo) / 2;
+		tessera_dir_bucket_record_t br;
+		if (tessera_manifest_dir_bucket_at(outer,
+		    (uint32_t)mid, &br) != TESSERA_OK)
+			return (EIO);
+		if (br.first_name_hash <= name_h) {
+			best = mid;
+			lo = mid + 1;
+		} else {
+			hi = mid - 1;
+		}
+	}
+
+	tessera_dir_bucket_record_t target;
+	if (tessera_manifest_dir_bucket_at(outer, (uint32_t)best, &target)
+	    != TESSERA_OK)
+		return (EIO);
+
+	uint8_t *bbuf = NULL;
+	uint32_t blen = 0;
+	if (tessera_fs_fetch_blob(tmp_, target.bucket_manifest_hash,
+	    &bbuf, &blen) != 0) return (EIO);
+	if (blen < 32) { free(bbuf, M_TESSERA); return (EIO); }
+	int rc = tessera_dir_lookup_name(bbuf + 32, blen - 32,
+	    name, nlen, out_inode);
+	free(bbuf, M_TESSERA);
+	return (rc);
+}
+
 static int
 tessera_vop_lookup(struct vop_lookup_args *ap)
 {
@@ -1397,20 +1468,29 @@ tessera_vop_lookup(struct vop_lookup_args *ap)
 		free(blob, M_TESSERA);
 		return (EIO);
 	}
-	if (tessera_manifest_parser_kind(p) != TESSERA_MFT_DIRECTORY) {
+	const tessera_manifest_kind_t dkind = tessera_manifest_parser_kind(p);
+	if (dkind != TESSERA_MFT_DIRECTORY &&
+	    dkind != TESSERA_MFT_DIRECTORY_2L) {
 		tessera_manifest_parser_free(p);
 		free(blob, M_TESSERA);
 		return (ENOTDIR);
 	}
 
-	/* manifest body is the parser's internal slice — recover it via
-	 * inline_data accessor (works for INLINE / SYMLINK; for DIRECTORY
-	 * we cheat and walk the buffer past the 32-byte header directly). */
-	const uint8_t *body = blob + 32;
-	const size_t   blen = blob_len - 32;
 	uint64_t child_no = 0;
-	int rc = tessera_dir_lookup_name(body, blen,
-	    cnp->cn_nameptr, (uint16_t)cnp->cn_namelen, &child_no);
+	int rc;
+	if (dkind == TESSERA_MFT_DIRECTORY) {
+		/* Flat dir: walk body past the 32-byte manifest header. */
+		const uint8_t *body = blob + 32;
+		const size_t   blen = blob_len - 32;
+		rc = tessera_dir_lookup_name(body, blen,
+		    cnp->cn_nameptr, (uint16_t)cnp->cn_namelen,
+		    &child_no);
+	} else {
+		/* Two-level dir: hash → bucket → fetch bucket → flat lookup. */
+		rc = tessera_fs_dir_2l_lookup(tmp_, p,
+		    cnp->cn_nameptr, (uint16_t)cnp->cn_namelen,
+		    &child_no);
+	}
 	tessera_manifest_parser_free(p);
 	free(blob, M_TESSERA);
 	if (rc != 0) {
@@ -1441,6 +1521,16 @@ tessera_dirent_reclen(uint16_t namlen)
 	return ((need + 7) & ~7);
 }
 
+/* Emit a dirent into uio. Returns:
+ *   0      success.
+ *   EAGAIN remaining uio->uio_resid is too small for this entry; the
+ *          caller should stop the readdir walk WITHOUT advancing past
+ *          this dirent. uio is left unchanged so the next readdir(2)
+ *          call resumes here. (This is the v1-of-multi-buffer-readdir
+ *          fix that big-directory workloads need.)
+ *   ENAMETOOLONG the name itself is bigger than our static buffer.
+ *   any  uiomove error (rare).
+ */
 static int
 tessera_emit_dirent(struct uio *uio, ino_t fileno, uint8_t type,
                     const char *name, uint16_t namlen)
@@ -1450,6 +1540,9 @@ tessera_emit_dirent(struct uio *uio, ino_t fileno, uint8_t type,
 	uint8_t buf[288];
 	size_t reclen = tessera_dirent_reclen(namlen);
 	if (reclen > sizeof(buf)) return (ENAMETOOLONG);
+
+	if ((size_t)uio->uio_resid < reclen)
+		return (EAGAIN);
 
 	struct dirent *de = (struct dirent *)buf;
 	bzero(buf, reclen);
@@ -1481,79 +1574,124 @@ tessera_vop_readdir(struct vop_readdir_args *ap)
 	struct tessera_mount *tmp_ = VFSTOTESSERA(ap->a_vp->v_mount);
 	int err = 0;
 
-	/* Round 4d strategy: emit the entire directory in the first
-	 * call. Subsequent calls (uio_offset > 0) return EOF. Correct
-	 * for ls(1)-shape consumers with a 4 KiB buffer; large
-	 * directories will need an offset-cookie scheme in round 5+. */
-	if (uio->uio_offset > 0) {
-		if (ap->a_eofflag != NULL) *ap->a_eofflag = 1;
-		return (0);
-	}
+	/* Multi-call readdir support. uio_offset is treated as a logical
+	 * directory cookie: total bytes returned by all prior readdir
+	 * calls on this stream. We re-walk every call, skipping dirents
+	 * whose end-position falls at or below uio_offset, and emit the
+	 * rest until the user buffer is full (tessera_emit_dirent returns
+	 * EAGAIN). This is enough for ls(1) / find(1) / fts(3) with
+	 * arbitrary directory size; sequential walks are O(N) per call
+	 * but acceptable for typical dir sizes. */
+	const off_t resume_at = uio->uio_offset;
+	off_t walked = 0;
+	int   stopped = 0;
 
-	/* Always emit "." and "..". */
-	err = tessera_emit_dirent(uio, tn->inode_no, DT_DIR, ".", 1);
-	if (err != 0) return (err);
-	err = tessera_emit_dirent(uio, tn->inode_no, DT_DIR, "..", 2);
-	if (err != 0) return (err);
+	/* Skip-or-emit one (fileno, dt, name, nlen) entry. EAGAIN from
+	 * the emitter signals end-of-buffer; we stop the walk WITHOUT
+	 * setting eofflag so the next readdir(2) call resumes here. */
+#define _EMIT(_fno, _dt, _name, _nlen) do {                               \
+	size_t _rl = tessera_dirent_reclen(_nlen);                        \
+	if (walked + (off_t)_rl <= resume_at) {                           \
+		walked += (off_t)_rl;                                     \
+		break;                                                    \
+	}                                                                 \
+	err = tessera_emit_dirent(uio, _fno, _dt, _name, _nlen);          \
+	if (err == EAGAIN) { err = 0; stopped = 1; goto stop_walk; }      \
+	if (err != 0) goto stop_walk;                                     \
+	walked += (off_t)_rl;                                             \
+} while (0)
+
+	_EMIT(tn->inode_no, DT_DIR, ".", 1);
+	_EMIT(tn->inode_no, DT_DIR, "..", 2);
 
 	/* Walk the directory's manifest, if any. */
-	if (tmp_->inode_tree == NULL) goto done;
+	if (tmp_->inode_tree == NULL) goto stop_walk;
 
 	uint8_t key[4];
 	tessera_inode_record_t dino;
 	encode_inode_key((uint32_t)tn->inode_no, key);
 	if (tessera_btree_get(tmp_->inode_tree, key, &dino) != TESSERA_OK)
-		goto done;
+		goto stop_walk;
 	if (tessera_hash_is_null(dino.manifest_hash))
-		goto done;
+		goto stop_walk;
 
 	uint8_t *blob = NULL;
 	uint32_t blob_len = 0;
 	if (tessera_fs_fetch_blob(tmp_, dino.manifest_hash, &blob, &blob_len)
 	    != 0)
-		goto done;
+		goto stop_walk;
 
 	tessera_manifest_parser_t *p = tessera_manifest_parse(blob, blob_len);
 	if (p == NULL) {
 		free(blob, M_TESSERA);
-		goto done;
+		goto stop_walk;
 	}
-	if (tessera_manifest_parser_kind(p) != TESSERA_MFT_DIRECTORY) {
+	const tessera_manifest_kind_t rkind = tessera_manifest_parser_kind(p);
+	if (rkind != TESSERA_MFT_DIRECTORY &&
+	    rkind != TESSERA_MFT_DIRECTORY_2L) {
 		tessera_manifest_parser_free(p);
 		free(blob, M_TESSERA);
-		goto done;
+		goto stop_walk;
 	}
-	const uint8_t *body = blob + 32;
-	const size_t   blen = blob_len - 32;
 
-	for (size_t off = 0; off + 10 <= blen; ) {
-		uint64_t child;
-		uint16_t name_len;
-		memcpy(&child,    body + off,     8);
-		memcpy(&name_len, body + off + 8, 2);
-		if (off + 10 + name_len > blen) break;
-		const char *name = (const char *)(body + off + 10);
+	/* Inline body walker: skip-or-emit each (child, name, kind). */
+#define _RD_EMIT_BODY(_body, _blen) do {                                  \
+	for (size_t _off = 0; _off + 10 <= (_blen); ) {                   \
+		uint64_t _ch;                                             \
+		uint16_t _nl;                                             \
+		memcpy(&_ch, (_body) + _off,     8);                      \
+		memcpy(&_nl, (_body) + _off + 8, 2);                      \
+		if (_off + 10 + _nl > (_blen)) break;                     \
+		const char *_nm = (const char *)((_body) + _off + 10);    \
+		uint8_t _dt = DT_UNKNOWN;                                 \
+		uint8_t _k2[4];                                           \
+		tessera_inode_record_t _cino;                             \
+		encode_inode_key((uint32_t)_ch, _k2);                     \
+		if (tessera_btree_get(tmp_->inode_tree, _k2, &_cino)      \
+		    == TESSERA_OK)                                        \
+			_dt = tessera_dt_from_mode(_cino.mode);           \
+		_EMIT(_ch, _dt, _nm, _nl);                                \
+		_off += 10 + _nl;                                         \
+	}                                                                 \
+} while (0)
 
-		uint8_t dt = DT_UNKNOWN;
-		uint8_t k2[4];
-		tessera_inode_record_t cino;
-		encode_inode_key((uint32_t)child, k2);
-		if (tessera_btree_get(tmp_->inode_tree, k2, &cino) == TESSERA_OK)
-			dt = tessera_dt_from_mode(cino.mode);
-
-		err = tessera_emit_dirent(uio, child, dt, name, name_len);
-		if (err != 0) {
-			tessera_manifest_parser_free(p);
-			free(blob, M_TESSERA);
-			return (err);
+	if (rkind == TESSERA_MFT_DIRECTORY) {
+		const uint8_t *body = blob + 32;
+		const size_t   blen = blob_len - 32;
+		_RD_EMIT_BODY(body, blen);
+	} else {
+		/* DIRECTORY_2L: iterate buckets, fetch each, walk it. */
+		const uint32_t nbk = tessera_manifest_parser_count(p);
+		for (uint32_t bi = 0; bi < nbk && !stopped; bi++) {
+			tessera_dir_bucket_record_t br;
+			if (tessera_manifest_dir_bucket_at(p, bi, &br)
+			    != TESSERA_OK) { err = EIO; goto out_free; }
+			uint8_t *bbuf = NULL;
+			uint32_t blen2 = 0;
+			if (tessera_fs_fetch_blob(tmp_,
+			    br.bucket_manifest_hash, &bbuf, &blen2) != 0) {
+				err = EIO; goto out_free;
+			}
+			if (blen2 < 32) {
+				free(bbuf, M_TESSERA);
+				err = EIO; goto out_free;
+			}
+			const uint8_t *body = bbuf + 32;
+			const size_t   blen = blen2 - 32;
+			_RD_EMIT_BODY(body, blen);
+			free(bbuf, M_TESSERA);
 		}
-		off += 10 + name_len;
 	}
+#undef _RD_EMIT_BODY
+#undef _EMIT
+
+out_free:
 	tessera_manifest_parser_free(p);
 	free(blob, M_TESSERA);
 
-done:
-	if (ap->a_eofflag != NULL) *ap->a_eofflag = 1;
+stop_walk:
+	if (err != 0) return (err);
+	if (!stopped && ap->a_eofflag != NULL) *ap->a_eofflag = 1;
 	return (0);
 }
 
@@ -2661,6 +2799,235 @@ tessera_fs_publish_chunked(struct tessera_mount *tmp_,
 	return (0);
 }
 
+/* ── v2 multi-level directory helpers ───────────────────────────── */
+
+/* Iterate every dirent of a directory, transparently handling both
+ * flat DIRECTORY and two-level DIRECTORY_2L manifests. Callback
+ * returns 0 to continue, non-zero to abort the walk (returned by
+ * dir_walk verbatim). */
+static int
+tessera_fs_dir_walk(struct tessera_mount *tmp_,
+                    const tessera_hash_t dir_manifest_hash,
+                    tessera_dirent_cb_t cb, void *ctx)
+{
+	if (cb == NULL) return (EINVAL);
+
+	uint8_t  *blob = NULL;
+	uint32_t  blob_len = 0;
+	if (tessera_fs_fetch_blob(tmp_, dir_manifest_hash,
+	    &blob, &blob_len) != 0) return (EIO);
+	if (blob_len < 32) { free(blob, M_TESSERA); return (EIO); }
+
+	tessera_manifest_parser_t *p = tessera_manifest_parse(blob, blob_len);
+	if (p == NULL) { free(blob, M_TESSERA); return (EIO); }
+
+	const tessera_manifest_kind_t k = tessera_manifest_parser_kind(p);
+	int rc = 0;
+
+	if (k == TESSERA_MFT_DIRECTORY) {
+		const uint8_t *body = blob + 32;
+		const size_t   blen = blob_len - 32;
+		for (size_t off = 0; off + 10 <= blen; ) {
+			uint64_t ch;
+			uint16_t nl;
+			memcpy(&ch, body + off,     8);
+			memcpy(&nl, body + off + 8, 2);
+			if (off + 10 + nl > blen) { rc = EIO; break; }
+			rc = cb(ctx, ch,
+			    (const char *)(body + off + 10), nl);
+			if (rc != 0) break;
+			off += 10 + nl;
+		}
+	} else if (k == TESSERA_MFT_DIRECTORY_2L) {
+		const uint32_t nbk = tessera_manifest_parser_count(p);
+		for (uint32_t bi = 0; bi < nbk && rc == 0; bi++) {
+			tessera_dir_bucket_record_t br;
+			if (tessera_manifest_dir_bucket_at(p, bi, &br)
+			    != TESSERA_OK) { rc = EIO; break; }
+			uint8_t *bbuf = NULL;
+			uint32_t blen2 = 0;
+			if (tessera_fs_fetch_blob(tmp_,
+			    br.bucket_manifest_hash, &bbuf, &blen2) != 0) {
+				rc = EIO; break;
+			}
+			if (blen2 < 32) {
+				free(bbuf, M_TESSERA);
+				rc = EIO; break;
+			}
+			const uint8_t *body = bbuf + 32;
+			const size_t   blen = blen2 - 32;
+			for (size_t off = 0; off + 10 <= blen; ) {
+				uint64_t ch;
+				uint16_t nl;
+				memcpy(&ch, body + off,     8);
+				memcpy(&nl, body + off + 8, 2);
+				if (off + 10 + nl > blen) {
+					rc = EIO; break;
+				}
+				rc = cb(ctx, ch,
+				    (const char *)(body + off + 10), nl);
+				if (rc != 0) break;
+				off += 10 + nl;
+			}
+			free(bbuf, M_TESSERA);
+		}
+	} else {
+		rc = ENOTDIR;
+	}
+
+	tessera_manifest_parser_free(p);
+	free(blob, M_TESSERA);
+	return (rc);
+}
+
+/* Auto-promoting publish: takes a fully-built flat DIRECTORY manifest.
+ * If under the threshold, publishes as-is. Otherwise re-parses the
+ * flat body, splits dirents into TESSERA_DIR_BUCKET_COUNT hash
+ * buckets, publishes each bucket as a flat DIRECTORY, and emits a
+ * DIRECTORY_2L outer manifest pointing at them. Returns the outer's
+ * hash via out_hash. */
+static int
+tessera_fs_publish_directory(struct tessera_mount *tmp_,
+                             const uint8_t *flat_mft, size_t flat_mlen,
+                             tessera_hash_t out_hash)
+{
+	if (flat_mlen <= TESSERA_DIR_PROMOTE_THRESHOLD) {
+		return (tessera_fs_publish_manifest(tmp_, flat_mft,
+		    flat_mlen, out_hash));
+	}
+
+	/* Promote. Walk the flat body once, compute each entry's hash
+	 * and bucket index, append to per-bucket builders. */
+	if (flat_mlen < 32) return (EIO);
+	const uint8_t *body = flat_mft + 32;
+	const size_t   blen = flat_mlen - 32;
+
+	const uint32_t K = TESSERA_DIR_BUCKET_COUNT;
+	tessera_manifest_builder_t **bucket_mb =
+	    malloc(K * sizeof *bucket_mb, M_TESSERA, M_WAITOK | M_ZERO);
+	uint64_t *bucket_first = malloc(K * sizeof *bucket_first,
+	    M_TESSERA, M_WAITOK);
+	int *bucket_first_set = malloc(K * sizeof *bucket_first_set,
+	    M_TESSERA, M_WAITOK | M_ZERO);
+	uint32_t *bucket_count = malloc(K * sizeof *bucket_count,
+	    M_TESSERA, M_WAITOK | M_ZERO);
+
+	for (uint32_t i = 0; i < K; i++) {
+		bucket_mb[i] = tessera_manifest_begin(TESSERA_MFT_DIRECTORY);
+		if (bucket_mb[i] == NULL) {
+			while (i-- > 0) tessera_manifest_free(bucket_mb[i]);
+			free(bucket_mb,        M_TESSERA);
+			free(bucket_first,     M_TESSERA);
+			free(bucket_first_set, M_TESSERA);
+			free(bucket_count,     M_TESSERA);
+			return (ENOMEM);
+		}
+	}
+
+	for (size_t off = 0; off + 10 <= blen; ) {
+		uint64_t ch;
+		uint16_t nl;
+		memcpy(&ch, body + off,     8);
+		memcpy(&nl, body + off + 8, 2);
+		if (off + 10 + nl > blen) {
+			for (uint32_t i = 0; i < K; i++)
+				tessera_manifest_free(bucket_mb[i]);
+			free(bucket_mb,        M_TESSERA);
+			free(bucket_first,     M_TESSERA);
+			free(bucket_first_set, M_TESSERA);
+			free(bucket_count,     M_TESSERA);
+			return (EIO);
+		}
+		const char *nm = (const char *)(body + off + 10);
+		uint64_t h = tessera_dir_name_hash(nm, nl);
+		uint32_t bi = (uint32_t)((h >> 32) % K);
+		if (tessera_manifest_add_dirent(bucket_mb[bi], ch, nm, nl)
+		    != TESSERA_OK) {
+			for (uint32_t i = 0; i < K; i++)
+				tessera_manifest_free(bucket_mb[i]);
+			free(bucket_mb,        M_TESSERA);
+			free(bucket_first,     M_TESSERA);
+			free(bucket_first_set, M_TESSERA);
+			free(bucket_count,     M_TESSERA);
+			return (ENOMEM);
+		}
+		if (!bucket_first_set[bi] || h < bucket_first[bi]) {
+			bucket_first[bi]     = h;
+			bucket_first_set[bi] = 1;
+		}
+		bucket_count[bi]++;
+		off += 10 + nl;
+	}
+
+	/* Publish each non-empty bucket; collect (first_hash, hash) pairs. */
+	tessera_manifest_builder_t *outer =
+	    tessera_manifest_begin(TESSERA_MFT_DIRECTORY_2L);
+	if (outer == NULL) {
+		for (uint32_t i = 0; i < K; i++)
+			tessera_manifest_free(bucket_mb[i]);
+		free(bucket_mb,        M_TESSERA);
+		free(bucket_first,     M_TESSERA);
+		free(bucket_first_set, M_TESSERA);
+		free(bucket_count,     M_TESSERA);
+		return (ENOMEM);
+	}
+
+	int err = 0;
+	for (uint32_t i = 0; i < K; i++) {
+		if (bucket_count[i] == 0) {
+			tessera_manifest_free(bucket_mb[i]);
+			continue;
+		}
+		size_t bmlen = 0;
+		tessera_hash_t bmhash;
+		(void)tessera_manifest_finalize(bucket_mb[i], NULL, 0,
+		    &bmlen, bmhash);
+		uint8_t *bbuf = malloc(bmlen, M_TESSERA, M_WAITOK);
+		if (tessera_manifest_finalize(bucket_mb[i], bbuf, bmlen,
+		    &bmlen, bmhash) != TESSERA_OK) {
+			free(bbuf, M_TESSERA);
+			err = EIO; break;
+		}
+		tessera_hash_t bpub;
+		if (tessera_fs_publish_manifest(tmp_, bbuf, bmlen, bpub)
+		    != 0) {
+			free(bbuf, M_TESSERA);
+			err = EIO; break;
+		}
+		free(bbuf, M_TESSERA);
+		if (tessera_manifest_add_dir_bucket(outer,
+		    bucket_first[i], bpub) != TESSERA_OK) {
+			err = ENOMEM; break;
+		}
+	}
+	for (uint32_t i = 0; i < K; i++) {
+		if (bucket_mb[i] != NULL) tessera_manifest_free(bucket_mb[i]);
+	}
+	free(bucket_mb,        M_TESSERA);
+	free(bucket_first,     M_TESSERA);
+	free(bucket_first_set, M_TESSERA);
+	free(bucket_count,     M_TESSERA);
+	if (err != 0) {
+		tessera_manifest_free(outer);
+		return (err);
+	}
+
+	size_t omlen = 0;
+	tessera_hash_t omhash;
+	(void)tessera_manifest_finalize(outer, NULL, 0, &omlen, omhash);
+	uint8_t *obuf = malloc(omlen, M_TESSERA, M_WAITOK);
+	if (tessera_manifest_finalize(outer, obuf, omlen, &omlen, omhash)
+	    != TESSERA_OK) {
+		tessera_manifest_free(outer);
+		free(obuf, M_TESSERA);
+		return (EIO);
+	}
+	tessera_manifest_free(outer);
+	int rc = tessera_fs_publish_manifest(tmp_, obuf, omlen, out_hash);
+	free(obuf, M_TESSERA);
+	return (rc);
+}
+
 /* v2-step-3a: chunked replacement. Splits `new_bytes` into fixed-size
  * chunks (TESSERA_CHUNK_SIZE), hashes each, builds a CHUNK_LIST
  * manifest pointing at them, and publishes everything in one pack.
@@ -3172,109 +3539,23 @@ tessera_vop_remove(struct vop_remove_args *ap)
 	 * synthetic VOP_GETATTR there); VFS only routes VOP_REMOVE for
 	 * non-directory targets, so trust the caller. */
 
-	int err = 0;
-	uint8_t  *blob = NULL;
-	uint32_t  blob_len = 0;
-	uint8_t  *new_mft = NULL;
+	/* dirent_rewrite handles flat DIRECTORY and DIRECTORY_2L parents
+	 * uniformly via dir_walk + auto-promoting publish_directory. */
+	int err = tessera_fs_dirent_rewrite(tmp_,
+	    (uint32_t)dn->inode_no,
+	    /*op=REMOVE*/ 1, /*verify*/ cn->inode_no,
+	    /*add_inode*/ 0,
+	    cnp->cn_nameptr, cnp->cn_namelen);
+	if (err != 0) return (err);
 
-	/* 1. Fetch parent's current DIRECTORY manifest. */
-	uint8_t pkey[4];
-	tessera_inode_record_t pino;
-	encode_inode_key((uint32_t)dn->inode_no, pkey);
-	if (tessera_btree_get(tmp_->inode_tree, pkey, &pino) != TESSERA_OK)
-		return (EIO);
-	if (tessera_fs_fetch_blob(tmp_, pino.manifest_hash,
-	    &blob, &blob_len) != 0)
-		return (EIO);
-	if (blob_len < 32) { err = EIO; goto out; }
-	const uint8_t *body = blob + 32;
-	const size_t   blen = blob_len - 32;
-
-	/* 2/3. Walk dirents; build new DIRECTORY manifest with all entries
-	 *      EXCEPT the one whose name matches cnp. */
-	tessera_manifest_builder_t *mb =
-	    tessera_manifest_begin(TESSERA_MFT_DIRECTORY);
-	if (mb == NULL) { err = ENOMEM; goto out; }
-	int found = 0;
-	for (size_t off = 0; off + 10 <= blen;) {
-		uint64_t entry_inode;
-		uint16_t entry_nlen;
-		memcpy(&entry_inode, body + off,     8);
-		memcpy(&entry_nlen,  body + off + 8, 2);
-		if (off + 10 + entry_nlen > blen) {
-			tessera_manifest_free(mb);
-			err = EIO; goto out;
-		}
-		const char *ename = (const char *)(body + off + 10);
-		int match = (entry_nlen == cnp->cn_namelen) &&
-		    (memcmp(ename, cnp->cn_nameptr, entry_nlen) == 0);
-		if (match) {
-			found = 1;
-			if (entry_inode != cn->inode_no) {
-				/* Stale vnode: dirent says some other inode. Bail
-				 * rather than risk inconsistency. */
-				tessera_manifest_free(mb);
-				err = EIO; goto out;
-			}
-		} else {
-			if (tessera_manifest_add_dirent(mb, entry_inode,
-			    ename, entry_nlen) != TESSERA_OK) {
-				tessera_manifest_free(mb);
-				err = ENOMEM; goto out;
-			}
-		}
-		off += 10 + entry_nlen;
-	}
-	if (!found) {
-		tessera_manifest_free(mb);
-		err = ENOENT; goto out;
-	}
-
-	size_t new_mlen = 0;
-	tessera_hash_t new_mhash;
-	(void)tessera_manifest_finalize(mb, NULL, 0, &new_mlen, new_mhash);
-	new_mft = malloc(new_mlen, M_TESSERA, M_WAITOK);
-	if (tessera_manifest_finalize(mb, new_mft, new_mlen, &new_mlen,
-	    new_mhash) != TESSERA_OK) {
-		tessera_manifest_free(mb);
-		err = EIO; goto out;
-	}
-	tessera_manifest_free(mb);
-
-	/* 4. Publish the new directory manifest as a single-blob pack. */
-	tessera_hash_t pub_hash;
-	if (tessera_fs_publish_manifest(tmp_, new_mft, new_mlen,
-	    pub_hash) != 0) { err = EIO; goto out; }
-	/* sanity: pub_hash must equal the manifest's own hash. */
-
-	/* 5. Update parent inode record's manifest_hash. */
-	memcpy(pino.manifest_hash, pub_hash, sizeof pub_hash);
-	pino.gen++;
-	pino.mtime_ns = pino.ctime_ns = pino.atime_ns;  /* leave timestamps; userspace can touch */
-	uint64_t new_inode_root = tmp_->sb.inode_root;
-	if (tessera_btree_put(tmp_->inode_tree, pkey, &pino,
-	    &new_inode_root) != TESSERA_OK) { err = EIO; goto out; }
-	tmp_->sb.inode_root = new_inode_root;
-
-	/* 6. Drop a link on the child. tessera_fs_inode_unlink decrements
+	/* Drop a link on the child. tessera_fs_inode_unlink decrements
 	 * nlink; only btree_deletes the record when it hits 0, so
 	 * hardlinks survive. */
 	(void)tessera_fs_inode_unlink(tmp_, (uint32_t)cn->inode_no);
 
-	/* 7. commit_extent + commit_sb so it persists across remount. */
-	/* v2-step-2a: SB write is deferred; mark_dirty arms the flush
-	 * callout. commit_extent stays synchronous because it advances
-	 * tmp_->sb.free_extent_root in lockstep with on-disk btree node
-	 * writes that cannot be replayed from the journal. */
-	if (tessera_commit_extent(tmp_) != 0) {
-		err = EIO; goto out;
-	}
+	if (tessera_commit_extent(tmp_) != 0) return (EIO);
 	tessera_fs_mark_dirty(tmp_);
-
-out:
-	if (blob)    free(blob,    M_TESSERA);
-	if (new_mft) free(new_mft, M_TESSERA);
-	return (err);
+	return (0);
 }
 
 /*
@@ -3425,6 +3706,40 @@ tessera_fs_replace_content(struct tessera_mount *tmp_, uint32_t inode_no,
  * Returns 0 on success, ENOENT if op==REMOVE and the name isn't
  * found, EEXIST if op==ADD and the name already exists.
  */
+/* Per-iteration ctx for the dir_walk callback used by dirent_rewrite. */
+struct dirent_rewrite_ctx {
+	tessera_manifest_builder_t *mb;
+	int       op;                /* 0=ADD, 1=REMOVE */
+	uint64_t  verify_inode;
+	const char *skip_name;
+	size_t    skip_namelen;
+	int       matched;
+	int       err;
+};
+
+static int
+dirent_rewrite_visit(void *vctx, uint64_t child_inode,
+                     const char *name, uint16_t name_len)
+{
+	struct dirent_rewrite_ctx *c = vctx;
+	int match = (name_len == c->skip_namelen) &&
+	    (memcmp(name, c->skip_name, c->skip_namelen) == 0);
+	if (match) {
+		c->matched = 1;
+		if (c->op == 0) { c->err = EEXIST; return (EEXIST); }
+		if (c->verify_inode != 0 &&
+		    child_inode != c->verify_inode) {
+			c->err = EIO; return (EIO);
+		}
+		return (0);  /* skip — REMOVE */
+	}
+	if (tessera_manifest_add_dirent(c->mb, child_inode, name,
+	    name_len) != TESSERA_OK) {
+		c->err = ENOMEM; return (ENOMEM);
+	}
+	return (0);
+}
+
 static int
 tessera_fs_dirent_rewrite(struct tessera_mount *tmp_,
                           uint32_t parent_inode_no,
@@ -3433,68 +3748,45 @@ tessera_fs_dirent_rewrite(struct tessera_mount *tmp_,
                           const char *name, size_t namelen)
 {
 	int err = 0;
-	uint8_t  *blob = NULL;
-	uint32_t  blob_len = 0;
-	uint8_t  *new_mft = NULL;
+	uint8_t *new_mft = NULL;
 
 	uint8_t pkey[4];
 	tessera_inode_record_t pino;
 	encode_inode_key(parent_inode_no, pkey);
 	if (tessera_btree_get(tmp_->inode_tree, pkey, &pino) != TESSERA_OK)
 		return (EIO);
-	if (tessera_fs_fetch_blob(tmp_, pino.manifest_hash,
-	    &blob, &blob_len) != 0)
-		return (EIO);
-	if (blob_len < 32) { err = EIO; goto out; }
-	const uint8_t *body = blob + 32;
-	const size_t   blen = blob_len - 32;
 
 	tessera_manifest_builder_t *mb =
 	    tessera_manifest_begin(TESSERA_MFT_DIRECTORY);
-	if (mb == NULL) { err = ENOMEM; goto out; }
-	int matched = 0;
-	for (size_t off = 0; off + 10 <= blen;) {
-		uint64_t entry_inode;
-		uint16_t entry_nlen;
-		memcpy(&entry_inode, body + off,     8);
-		memcpy(&entry_nlen,  body + off + 8, 2);
-		if (off + 10 + entry_nlen > blen) {
-			tessera_manifest_free(mb);
-			err = EIO; goto out;
-		}
-		const char *ename = (const char *)(body + off + 10);
-		int match = (entry_nlen == namelen) &&
-		    (memcmp(ename, name, namelen) == 0);
-		if (match) {
-			matched = 1;
-			if (op == 0) {
-				/* ADD: name already exists — caller's bug. */
-				tessera_manifest_free(mb);
-				err = EEXIST; goto out;
-			}
-			/* REMOVE — skip this entry. */
-			if (verify_inode != 0 && entry_inode != verify_inode) {
-				tessera_manifest_free(mb);
-				err = EIO; goto out;
-			}
-		} else {
-			if (tessera_manifest_add_dirent(mb, entry_inode,
-			    ename, entry_nlen) != TESSERA_OK) {
-				tessera_manifest_free(mb);
-				err = ENOMEM; goto out;
-			}
-		}
-		off += 10 + entry_nlen;
-	}
-	if (op == 1 && !matched) {
+	if (mb == NULL) return (ENOMEM);
+
+	struct dirent_rewrite_ctx ctx = {
+		.mb            = mb,
+		.op            = op,
+		.verify_inode  = verify_inode,
+		.skip_name     = name,
+		.skip_namelen  = namelen,
+		.matched       = 0,
+		.err           = 0,
+	};
+
+	/* Walk handles flat DIRECTORY and DIRECTORY_2L transparently. */
+	int rc = tessera_fs_dir_walk(tmp_, pino.manifest_hash,
+	    dirent_rewrite_visit, &ctx);
+	if (rc != 0) {
+		err = (ctx.err != 0) ? ctx.err : rc;
 		tessera_manifest_free(mb);
-		err = ENOENT; goto out;
+		return (err);
+	}
+	if (op == 1 && !ctx.matched) {
+		tessera_manifest_free(mb);
+		return (ENOENT);
 	}
 	if (op == 0) {
 		if (tessera_manifest_add_dirent(mb, add_inode, name,
 		    namelen) != TESSERA_OK) {
 			tessera_manifest_free(mb);
-			err = ENOMEM; goto out;
+			return (ENOMEM);
 		}
 	}
 
@@ -3505,25 +3797,27 @@ tessera_fs_dirent_rewrite(struct tessera_mount *tmp_,
 	if (tessera_manifest_finalize(mb, new_mft, mlen, &mlen,
 	    mhash) != TESSERA_OK) {
 		tessera_manifest_free(mb);
-		err = EIO; goto out;
+		free(new_mft, M_TESSERA);
+		return (EIO);
 	}
 	tessera_manifest_free(mb);
 
+	/* Auto-promotes to DIRECTORY_2L if mlen exceeds the threshold. */
 	tessera_hash_t pub_hash;
-	if (tessera_fs_publish_manifest(tmp_, new_mft, mlen,
-	    pub_hash) != 0) { err = EIO; goto out; }
+	if (tessera_fs_publish_directory(tmp_, new_mft, mlen,
+	    pub_hash) != 0) {
+		free(new_mft, M_TESSERA);
+		return (EIO);
+	}
+	free(new_mft, M_TESSERA);
 
 	memcpy(pino.manifest_hash, pub_hash, sizeof pub_hash);
 	pino.gen++;
 	uint64_t new_inode_root = tmp_->sb.inode_root;
 	if (tessera_btree_put(tmp_->inode_tree, pkey, &pino,
-	    &new_inode_root) != TESSERA_OK) { err = EIO; goto out; }
+	    &new_inode_root) != TESSERA_OK) return (EIO);
 	tmp_->sb.inode_root = new_inode_root;
-
-out:
-	if (blob)    free(blob,    M_TESSERA);
-	if (new_mft) free(new_mft, M_TESSERA);
-	return (err);
+	return (0);
 }
 
 /*
@@ -3560,10 +3854,7 @@ tessera_vop_create(struct vop_create_args *ap)
 	if (cnp->cn_namelen == 0 || cnp->cn_namelen > 0xffff) return (EINVAL);
 
 	int err = 0;
-	uint8_t  *blob = NULL;
-	uint32_t  blob_len = 0;
 	uint8_t  *child_mft = NULL;
-	uint8_t  *new_pmft  = NULL;
 
 	/* 1. Allocate inode_no. */
 	uint32_t new_ino = (uint32_t)tmp_->sb.next_inode_no;
@@ -3620,66 +3911,19 @@ tessera_vop_create(struct vop_create_args *ap)
 		tmp_->sb.inode_root = new_inode_root;
 	}
 
-	/* 4. Rewrite parent DIRECTORY manifest with the new entry. */
-	uint8_t pkey[4];
-	tessera_inode_record_t pino;
-	encode_inode_key((uint32_t)dn->inode_no, pkey);
-	if (tessera_btree_get(tmp_->inode_tree, pkey, &pino) != TESSERA_OK) {
-		err = EIO; goto out;
+	/* 4. Rewrite parent DIRECTORY manifest with the new entry.
+	 * dirent_rewrite handles flat + DIRECTORY_2L parents and auto-
+	 * promotes the published manifest if it crosses the threshold.
+	 * It also btree_puts the updated parent inode internally, so
+	 * tmp_->sb.inode_root is already advanced on return. */
+	{
+		int drc = tessera_fs_dirent_rewrite(tmp_,
+		    (uint32_t)dn->inode_no,
+		    /*op=ADD*/ 0, /*verify*/ 0,
+		    /*add_inode*/ new_ino,
+		    cnp->cn_nameptr, cnp->cn_namelen);
+		if (drc != 0) { err = drc; goto out; }
 	}
-	if (tessera_fs_fetch_blob(tmp_, pino.manifest_hash,
-	    &blob, &blob_len) != 0) { err = EIO; goto out; }
-	if (blob_len < 32) { err = EIO; goto out; }
-	const uint8_t *body = blob + 32;
-	const size_t   blen = blob_len - 32;
-
-	tessera_manifest_builder_t *mb =
-	    tessera_manifest_begin(TESSERA_MFT_DIRECTORY);
-	if (mb == NULL) { err = ENOMEM; goto out; }
-	for (size_t off = 0; off + 10 <= blen;) {
-		uint64_t entry_inode;
-		uint16_t entry_nlen;
-		memcpy(&entry_inode, body + off,     8);
-		memcpy(&entry_nlen,  body + off + 8, 2);
-		if (off + 10 + entry_nlen > blen) {
-			tessera_manifest_free(mb);
-			err = EIO; goto out;
-		}
-		if (tessera_manifest_add_dirent(mb, entry_inode,
-		    (const char *)(body + off + 10),
-		    entry_nlen) != TESSERA_OK) {
-			tessera_manifest_free(mb);
-			err = ENOMEM; goto out;
-		}
-		off += 10 + entry_nlen;
-	}
-	if (tessera_manifest_add_dirent(mb, new_ino, cnp->cn_nameptr,
-	    cnp->cn_namelen) != TESSERA_OK) {
-		tessera_manifest_free(mb);
-		err = ENOMEM; goto out;
-	}
-
-	size_t pmlen = 0;
-	tessera_hash_t pmhash;
-	(void)tessera_manifest_finalize(mb, NULL, 0, &pmlen, pmhash);
-	new_pmft = malloc(pmlen, M_TESSERA, M_WAITOK);
-	if (tessera_manifest_finalize(mb, new_pmft, pmlen, &pmlen,
-	    pmhash) != TESSERA_OK) {
-		tessera_manifest_free(mb);
-		err = EIO; goto out;
-	}
-	tessera_manifest_free(mb);
-
-	tessera_hash_t pub_phash;
-	if (tessera_fs_publish_manifest(tmp_, new_pmft, pmlen,
-	    pub_phash) != 0) { err = EIO; goto out; }
-
-	memcpy(pino.manifest_hash, pub_phash, sizeof pub_phash);
-	pino.gen++;
-	uint64_t new_inode_root = tmp_->sb.inode_root;
-	if (tessera_btree_put(tmp_->inode_tree, pkey, &pino,
-	    &new_inode_root) != TESSERA_OK) { err = EIO; goto out; }
-	tmp_->sb.inode_root = new_inode_root;
 
 	/* 5. Get a deduped vnode for the new inode. tessera_vget reads
 	 * the just-written inode record, sets v_type=VREG. */
@@ -3700,9 +3944,7 @@ tessera_vop_create(struct vop_create_args *ap)
 	tessera_fs_mark_dirty(tmp_);
 
 out:
-	if (blob)      free(blob,      M_TESSERA);
 	if (child_mft) free(child_mft, M_TESSERA);
-	if (new_pmft)  free(new_pmft,  M_TESSERA);
 	return (err);
 }
 
@@ -4190,6 +4432,41 @@ tessera_vop_link(struct vop_link_args *ap)
  * single rewrite avoids any in-between state with two-or-zero copies
  * of the entry. Caller does commit_extent + commit_sb.
  */
+struct rename_ctx {
+	tessera_manifest_builder_t *mb;
+	uint64_t target_inode;
+	const char *old_name; size_t old_namelen;
+	const char *new_name; size_t new_namelen;
+	int matched;
+	int conflict;
+	int err;
+};
+
+static int
+rename_visit(void *vctx, uint64_t ch, const char *nm, uint16_t nl)
+{
+	struct rename_ctx *c = vctx;
+	int is_old = ((size_t)nl == c->old_namelen) &&
+	    (memcmp(nm, c->old_name, c->old_namelen) == 0);
+	int is_new = ((size_t)nl == c->new_namelen) &&
+	    (memcmp(nm, c->new_name, c->new_namelen) == 0);
+	if (is_old) {
+		c->matched = 1;
+		if (ch != c->target_inode) {
+			c->err = EIO;
+			return (EIO);
+		}
+		return (0);  /* drop the old entry */
+	}
+	if (is_new) c->conflict = 1;
+	if (tessera_manifest_add_dirent(c->mb, ch, nm, nl)
+	    != TESSERA_OK) {
+		c->err = ENOMEM;
+		return (ENOMEM);
+	}
+	return (0);
+}
+
 static int
 tessera_fs_dirent_rename_same_dir(struct tessera_mount *tmp_,
     uint32_t parent_inode_no,
@@ -4197,106 +4474,72 @@ tessera_fs_dirent_rename_same_dir(struct tessera_mount *tmp_,
     const char *old_name, size_t old_namelen,
     const char *new_name, size_t new_namelen)
 {
-	int err = 0;
-	uint8_t  *blob = NULL;
-	uint32_t  blob_len = 0;
-	uint8_t  *new_mft = NULL;
-
 	uint8_t pkey[4];
 	tessera_inode_record_t pino;
 	encode_inode_key(parent_inode_no, pkey);
 	if (tessera_btree_get(tmp_->inode_tree, pkey, &pino) != TESSERA_OK)
 		return (EIO);
-	if (tessera_fs_fetch_blob(tmp_, pino.manifest_hash, &blob,
-	    &blob_len) != 0)
-		return (EIO);
-	if (blob_len < 32) { err = EIO; goto out; }
-	const uint8_t *body = blob + 32;
-	const size_t   blen = blob_len - 32;
 
 	tessera_manifest_builder_t *mb =
 	    tessera_manifest_begin(TESSERA_MFT_DIRECTORY);
-	if (mb == NULL) { err = ENOMEM; goto out; }
-	int matched = 0, conflict = 0;
-	for (size_t off = 0; off + 10 <= blen;) {
-		uint64_t entry_inode;
-		uint16_t entry_nlen;
-		memcpy(&entry_inode, body + off,     8);
-		memcpy(&entry_nlen,  body + off + 8, 2);
-		if (off + 10 + entry_nlen > blen) {
-			tessera_manifest_free(mb);
-			err = EIO; goto out;
-		}
-		const char *ename = (const char *)(body + off + 10);
-		int is_old = (entry_nlen == old_namelen) &&
-		    (memcmp(ename, old_name, old_namelen) == 0);
-		int is_new = (entry_nlen == new_namelen) &&
-		    (memcmp(ename, new_name, new_namelen) == 0);
-		if (is_old) {
-			matched = 1;
-			if (entry_inode != target_inode) {
-				tessera_manifest_free(mb);
-				err = EIO; goto out;
-			}
-			/* drop */
-		} else if (is_new) {
-			conflict = 1;
-			/* keep walking so the loop terminates cleanly, but
-			 * we'll bail below */
-			if (tessera_manifest_add_dirent(mb, entry_inode,
-			    ename, entry_nlen) != TESSERA_OK) {
-				tessera_manifest_free(mb);
-				err = ENOMEM; goto out;
-			}
-		} else {
-			if (tessera_manifest_add_dirent(mb, entry_inode,
-			    ename, entry_nlen) != TESSERA_OK) {
-				tessera_manifest_free(mb);
-				err = ENOMEM; goto out;
-			}
-		}
-		off += 10 + entry_nlen;
-	}
-	if (!matched) {
+	if (mb == NULL) return (ENOMEM);
+
+	struct rename_ctx ctx = {
+		.mb = mb,
+		.target_inode = target_inode,
+		.old_name = old_name, .old_namelen = old_namelen,
+		.new_name = new_name, .new_namelen = new_namelen,
+		.matched = 0, .conflict = 0, .err = 0,
+	};
+
+	int rc = tessera_fs_dir_walk(tmp_, pino.manifest_hash,
+	    rename_visit, &ctx);
+
+	if (rc != 0) {
 		tessera_manifest_free(mb);
-		err = ENOENT; goto out;
+		return (ctx.err != 0 ? ctx.err : rc);
 	}
-	if (conflict) {
+	if (!ctx.matched) {
 		tessera_manifest_free(mb);
-		err = EEXIST; goto out;
+		return (ENOENT);
+	}
+	if (ctx.conflict) {
+		tessera_manifest_free(mb);
+		return (EEXIST);
 	}
 	if (tessera_manifest_add_dirent(mb, target_inode, new_name,
 	    new_namelen) != TESSERA_OK) {
 		tessera_manifest_free(mb);
-		err = ENOMEM; goto out;
+		return (ENOMEM);
 	}
 
 	size_t mlen = 0;
 	tessera_hash_t mhash;
 	(void)tessera_manifest_finalize(mb, NULL, 0, &mlen, mhash);
-	new_mft = malloc(mlen, M_TESSERA, M_WAITOK);
+	uint8_t *new_mft = malloc(mlen, M_TESSERA, M_WAITOK);
 	if (tessera_manifest_finalize(mb, new_mft, mlen, &mlen,
 	    mhash) != TESSERA_OK) {
 		tessera_manifest_free(mb);
-		err = EIO; goto out;
+		free(new_mft, M_TESSERA);
+		return (EIO);
 	}
 	tessera_manifest_free(mb);
 
 	tessera_hash_t pub_hash;
-	if (tessera_fs_publish_manifest(tmp_, new_mft, mlen,
-	    pub_hash) != 0) { err = EIO; goto out; }
+	if (tessera_fs_publish_directory(tmp_, new_mft, mlen,
+	    pub_hash) != 0) {
+		free(new_mft, M_TESSERA);
+		return (EIO);
+	}
+	free(new_mft, M_TESSERA);
 
 	memcpy(pino.manifest_hash, pub_hash, sizeof pub_hash);
 	pino.gen++;
 	uint64_t new_inode_root = tmp_->sb.inode_root;
 	if (tessera_btree_put(tmp_->inode_tree, pkey, &pino,
-	    &new_inode_root) != TESSERA_OK) { err = EIO; goto out; }
+	    &new_inode_root) != TESSERA_OK) return (EIO);
 	tmp_->sb.inode_root = new_inode_root;
-
-out:
-	if (blob)    free(blob,    M_TESSERA);
-	if (new_mft) free(new_mft, M_TESSERA);
-	return (err);
+	return (0);
 }
 
 /*

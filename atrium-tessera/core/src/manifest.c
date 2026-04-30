@@ -152,6 +152,57 @@ tessera_manifest_set_symlink(tessera_manifest_builder_t *b, const char *target)
 	return TESSERA_OK;
 }
 
+/* DIRECTORY_2L bucket entries — kept sorted by first_name_hash.
+ * Builder API that the kmod's dir-promotion path emits. */
+int
+tessera_manifest_add_dir_bucket(tessera_manifest_builder_t *b,
+                                uint64_t first_name_hash,
+                                const tessera_hash_t bucket_manifest_hash)
+{
+	if (b == NULL || bucket_manifest_hash == NULL)
+		return TESSERA_EINVAL;
+	if (b->kind != TESSERA_MFT_DIRECTORY_2L) return TESSERA_EINVAL;
+
+	tessera_dir_bucket_record_t r;
+	memset(&r, 0, sizeof r);
+	r.first_name_hash = first_name_hash;
+	memcpy(r.bucket_manifest_hash, bucket_manifest_hash,
+	    sizeof r.bucket_manifest_hash);
+
+	/* Insertion-sort by first_name_hash. Bucket counts are bounded
+	 * (~few thousand for the dir sizes that justify promotion), so
+	 * O(N) per insert is fine here too. */
+	size_t pos = 0;
+	while (pos < b->body_len) {
+		tessera_dir_bucket_record_t cur;
+		memcpy(&cur, b->body + pos, sizeof cur);
+		if (cur.first_name_hash == first_name_hash)
+			return TESSERA_EEXIST;
+		if (cur.first_name_hash > first_name_hash) break;
+		pos += sizeof cur;
+	}
+	if (body_reserve(b, b->body_len + sizeof r) != 0)
+		return TESSERA_ENOMEM;
+	memmove(b->body + pos + sizeof r, b->body + pos,
+	    b->body_len - pos);
+	memcpy(b->body + pos, &r, sizeof r);
+	b->body_len += sizeof r;
+	b->entry_count++;
+	return TESSERA_OK;
+}
+
+uint64_t
+tessera_dir_name_hash(const char *name, size_t name_len)
+{
+	if (name == NULL || name_len == 0) return 0;
+	tessera_hash_t h;
+	tessera_sha256((const uint8_t *)name, name_len, h);
+	uint64_t v = 0;
+	for (int i = 0; i < 8; i++)
+		v = (v << 8) | h[i];
+	return v;
+}
+
 /* Directory entries kept sorted by name (memcmp) — enables future
  * binary-search lookup at the parser. Insertion sort here is O(N) per
  * add; fine for typical directory sizes (median sub-100 entries). For
@@ -288,6 +339,21 @@ tessera_manifest_tree_at(const tessera_manifest_parser_t *p,
 {
 	if (p == NULL || out == NULL) return TESSERA_EINVAL;
 	if (p->header.manifest_kind != TESSERA_MFT_CHUNK_TREE)
+		return TESSERA_EINVAL;
+	if (index >= p->header.entry_count) return TESSERA_ENOENT;
+	const size_t off = (size_t)index * sizeof *out;
+	if (off + sizeof *out > p->body_len) return TESSERA_ECORRUPT;
+	memcpy(out, p->body + off, sizeof *out);
+	return TESSERA_OK;
+}
+
+int
+tessera_manifest_dir_bucket_at(const tessera_manifest_parser_t *p,
+                               uint32_t index,
+                               tessera_dir_bucket_record_t *out)
+{
+	if (p == NULL || out == NULL) return TESSERA_EINVAL;
+	if (p->header.manifest_kind != TESSERA_MFT_DIRECTORY_2L)
 		return TESSERA_EINVAL;
 	if (index >= p->header.entry_count) return TESSERA_ENOENT;
 	const size_t off = (size_t)index * sizeof *out;

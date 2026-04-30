@@ -43,6 +43,16 @@ int tessera_manifest_add_dirent(tessera_manifest_builder_t *,
                                 uint64_t child_inode,
                                 const char *name, size_t name_len);
 
+/* DIRECTORY_2L entries — outer-manifest bucket descriptors. */
+int tessera_manifest_add_dir_bucket(tessera_manifest_builder_t *,
+                                    uint64_t first_name_hash,
+                                    const tessera_hash_t bucket_manifest_hash);
+
+/* SHA-256 over `name`, return first 8 bytes as a u64 — the hash key
+ * used by DIRECTORY_2L bucket selection. Stable + uniformly
+ * distributed; cost is microseconds even for long names. */
+uint64_t tessera_dir_name_hash(const char *name, size_t name_len);
+
 /*
  * Encode + hash. Caller provides `out_buffer`; returns the encoded
  * size in *out_size and the manifest hash in `out_hash`.
@@ -74,6 +84,11 @@ int tessera_manifest_chunk_at(const tessera_manifest_parser_t *,
 int tessera_manifest_tree_at(const tessera_manifest_parser_t *,
                              uint32_t index,
                              tessera_tree_record_t *out);
+
+/* Iterate bucket records from a DIRECTORY_2L manifest. */
+int tessera_manifest_dir_bucket_at(const tessera_manifest_parser_t *,
+                                   uint32_t index,
+                                   tessera_dir_bucket_record_t *out);
 
 /* Read inline content from an INLINE manifest. */
 int tessera_manifest_inline_data(const tessera_manifest_parser_t *,

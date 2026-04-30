@@ -292,14 +292,28 @@ typedef struct TESSERA_PACKED {
 } tessera_manifest_header_t;
 
 typedef enum {
-	TESSERA_MFT_INLINE       = 1,
-	TESSERA_MFT_CHUNK_LIST   = 2,
-	TESSERA_MFT_CHUNK_TREE   = 3,
-	TESSERA_MFT_DIRECTORY    = 4,
-	TESSERA_MFT_SYMLINK      = 5,
-	TESSERA_MFT_XATTR_STORE  = 6,
-	TESSERA_MFT_GC_ROOT_LIST = 7,
+	TESSERA_MFT_INLINE        = 1,
+	TESSERA_MFT_CHUNK_LIST    = 2,
+	TESSERA_MFT_CHUNK_TREE    = 3,
+	TESSERA_MFT_DIRECTORY     = 4,
+	TESSERA_MFT_SYMLINK       = 5,
+	TESSERA_MFT_XATTR_STORE   = 6,
+	TESSERA_MFT_GC_ROOT_LIST  = 7,
+	/* v2 (added 2026-04-30): two-level DIRECTORY for huge dirs.
+	 * Body holds tessera_dir_bucket_record_t entries pointing at
+	 * inner DIRECTORY manifests, each holding a hash-range slice of
+	 * the entries. Promoted from flat DIRECTORY when body crosses
+	 * a threshold (~4 KiB). Lookup: hash(name) → binary-search
+	 * outer for largest first_hash ≤ hash → descend into bucket. */
+	TESSERA_MFT_DIRECTORY_2L  = 8,
 } tessera_manifest_kind_t;
+
+/* ── Directory bucket record (40 bytes/entry, kind=DIRECTORY_2L) ── */
+
+typedef struct TESSERA_PACKED {
+	uint64_t        first_name_hash;     /* smallest dir_name_hash in bucket */
+	tessera_hash_t  bucket_manifest_hash;/* inner flat DIRECTORY manifest */
+} tessera_dir_bucket_record_t;
 
 /* ── Chunk record (kind = CHUNK_LIST, 48 bytes/entry) ───────────── */
 
@@ -438,6 +452,7 @@ TESSERA_STATIC_ASSERT(sizeof(tessera_btree_node_header_t) == 64,   btree_node_he
 TESSERA_STATIC_ASSERT(sizeof(tessera_registry_entry_t)    == 64,   registry_entry_size);
 TESSERA_STATIC_ASSERT(sizeof(tessera_free_extent_t)       == 16,   free_extent_size);
 TESSERA_STATIC_ASSERT(sizeof(tessera_snapshot_record_t)   == 64,   snapshot_record_size);
+TESSERA_STATIC_ASSERT(sizeof(tessera_dir_bucket_record_t) == 40,   dir_bucket_record_size);
 
 #ifdef __cplusplus
 }
