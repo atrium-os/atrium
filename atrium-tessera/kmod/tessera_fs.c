@@ -296,6 +296,10 @@ static int tessera_fs_dirent_rewrite(struct tessera_mount *tmp_,
                                      int op, uint64_t verify_inode,
                                      uint64_t add_inode,
                                      const char *name, size_t namelen);
+/* CHUNK_LIST / CHUNK_TREE recursive reader (v2 step-3c). */
+static int tessera_fs_read_into_uio(struct tessera_mount *tmp_,
+                                    tessera_manifest_parser_t *p,
+                                    struct uio *uio);
 static int tessera_fs_publish_directory(struct tessera_mount *tmp_,
                                          const uint8_t *flat_mft,
                                          size_t flat_mlen,
@@ -1695,6 +1699,113 @@ stop_walk:
 	return (0);
 }
 
+/* v2 step-3c: read recursively into uio for CHUNK_LIST and CHUNK_TREE
+ * manifests. CHUNK_LIST does the actual chunk-by-chunk uiomove (the
+ * logic that used to live inline in vop_read). CHUNK_TREE walks
+ * tree_records and recurses into each child; sub-children may
+ * themselves be CHUNK_LIST or another CHUNK_TREE level. */
+static int
+tessera_fs_read_into_uio(struct tessera_mount *tmp_,
+                        tessera_manifest_parser_t *p,
+                        struct uio *uio)
+{
+	const tessera_manifest_kind_t k = tessera_manifest_parser_kind(p);
+
+	if (k == TESSERA_MFT_CHUNK_LIST) {
+		const uint32_t n = tessera_manifest_parser_count(p);
+		for (uint32_t i = 0; i < n && uio->uio_resid > 0; i++) {
+			tessera_chunk_record_t cr;
+			if (tessera_manifest_chunk_at(p, i, &cr)
+			    != TESSERA_OK)
+				return (EIO);
+			const uint64_t cstart = cr.logical_offset;
+			const uint64_t cend   = cstart + cr.uncompressed_size;
+
+			if (cend <= (uint64_t)uio->uio_offset) continue;
+			if (cstart >= (uint64_t)uio->uio_offset
+			    + (uint64_t)uio->uio_resid) break;
+
+			const uint64_t lo = ((uint64_t)uio->uio_offset > cstart)
+			    ? (uint64_t)uio->uio_offset - cstart : 0;
+			const uint64_t hi_off =
+			    (uint64_t)uio->uio_offset + (uint64_t)uio->uio_resid;
+			const uint64_t hi = (hi_off < cend
+			    ? hi_off - cstart : cr.uncompressed_size);
+			const size_t   n_copy = (size_t)(hi - lo);
+
+			if (cr.flags & TESSERA_CHUNK_FLAG_ZERO_HOLE) {
+				uint8_t *zb = malloc(n_copy, M_TESSERA,
+				    M_WAITOK | M_ZERO);
+				int err = uiomove(zb, n_copy, uio);
+				free(zb, M_TESSERA);
+				if (err != 0) return (err);
+				continue;
+			}
+
+			uint8_t *cb = NULL;
+			uint32_t cb_len = 0;
+			if (tessera_fs_fetch_blob(tmp_, cr.chunk_hash,
+			    &cb, &cb_len) != 0) return (EIO);
+			if (cb_len < cr.uncompressed_size) {
+				free(cb, M_TESSERA);
+				return (EIO);
+			}
+			int err = uiomove(cb + lo, n_copy, uio);
+			free(cb, M_TESSERA);
+			if (err != 0) return (err);
+		}
+		return (0);
+	}
+
+	if (k == TESSERA_MFT_CHUNK_TREE) {
+		const uint32_t n = tessera_manifest_parser_count(p);
+		const uint64_t total = tessera_manifest_parser_size(p);
+		for (uint32_t i = 0; i < n && uio->uio_resid > 0; i++) {
+			tessera_tree_record_t tr;
+			if (tessera_manifest_tree_at(p, i, &tr) != TESSERA_OK)
+				return (EIO);
+			const uint64_t cstart = tr.logical_offset;
+			/* Use the next sibling's offset (or the parent's
+			 * total logical_size for the last child) as this
+			 * subtree's exclusive upper bound. Sub-manifests
+			 * whose own headers state a smaller logical_size
+			 * reported by themselves are still bounded; this
+			 * is just for early-out pruning of the read window. */
+			uint64_t cend;
+			if (i + 1 < n) {
+				tessera_tree_record_t next;
+				if (tessera_manifest_tree_at(p, i + 1, &next)
+				    != TESSERA_OK) return (EIO);
+				cend = next.logical_offset;
+			} else {
+				cend = (total > cstart) ? total : cstart;
+			}
+
+			if (cend <= (uint64_t)uio->uio_offset) continue;
+			if (cstart >= (uint64_t)uio->uio_offset
+			    + (uint64_t)uio->uio_resid) break;
+
+			uint8_t *cblob = NULL;
+			uint32_t cblob_len = 0;
+			if (tessera_fs_fetch_blob(tmp_, tr.child_manifest_hash,
+			    &cblob, &cblob_len) != 0) return (EIO);
+			tessera_manifest_parser_t *cp =
+			    tessera_manifest_parse(cblob, cblob_len);
+			if (cp == NULL) {
+				free(cblob, M_TESSERA);
+				return (EIO);
+			}
+			int err = tessera_fs_read_into_uio(tmp_, cp, uio);
+			tessera_manifest_parser_free(cp);
+			free(cblob, M_TESSERA);
+			if (err != 0) return (err);
+		}
+		return (0);
+	}
+
+	return (EIO);
+}
+
 static int
 tessera_vop_read(struct vop_read_args *ap)
 {
@@ -1752,63 +1863,9 @@ tessera_vop_read(struct vop_read_args *ap)
 		    ? (size_t)uio->uio_resid : remaining;
 		err = uiomove(__DECONST(void *, data + uio->uio_offset),
 		    n, uio);
-	} else if (kind == TESSERA_MFT_CHUNK_LIST) {
-		const uint32_t n = tessera_manifest_parser_count(p);
-		for (uint32_t i = 0; i < n && uio->uio_resid > 0; i++) {
-			tessera_chunk_record_t cr;
-			if (tessera_manifest_chunk_at(p, i, &cr)
-			    != TESSERA_OK) {
-				err = EIO;
-				break;
-			}
-			const uint64_t cstart = cr.logical_offset;
-			const uint64_t cend   = cstart + cr.uncompressed_size;
-
-			/* Skip chunks entirely below the read window. */
-			if (cend <= (uint64_t)uio->uio_offset) continue;
-			/* Stop when we've passed the read window. */
-			if (cstart >= (uint64_t)uio->uio_offset
-			    + (uint64_t)uio->uio_resid) break;
-
-			/* Slice intersection of [cstart, cend) and
-			 * [uio_offset, uio_offset + resid). */
-			const uint64_t lo = ((uint64_t)uio->uio_offset > cstart)
-			    ? (uint64_t)uio->uio_offset - cstart : 0;
-			const uint64_t hi_off =
-			    (uint64_t)uio->uio_offset + (uint64_t)uio->uio_resid;
-			const uint64_t hi = (hi_off < cend
-			    ? hi_off - cstart : cr.uncompressed_size);
-			const size_t   n_copy = (size_t)(hi - lo);
-
-			if (cr.flags & TESSERA_CHUNK_FLAG_ZERO_HOLE) {
-				/* Sparse hole: synthesize zeros, no fetch. */
-				uint8_t *zb = malloc(n_copy, M_TESSERA,
-				    M_WAITOK | M_ZERO);
-				err = uiomove(zb, n_copy, uio);
-				free(zb, M_TESSERA);
-				if (err != 0) break;
-				continue;
-			}
-
-			uint8_t *cb = NULL;
-			uint32_t cb_len = 0;
-			if (tessera_fs_fetch_blob(tmp_, cr.chunk_hash,
-			    &cb, &cb_len) != 0) {
-				err = EIO;
-				break;
-			}
-			if (cb_len < cr.uncompressed_size) {
-				free(cb, M_TESSERA);
-				err = EIO;
-				break;
-			}
-
-			err = uiomove(cb + lo, n_copy, uio);
-			free(cb, M_TESSERA);
-			if (err != 0) break;
-		}
-	} else if (kind == TESSERA_MFT_CHUNK_TREE) {
-		err = EOPNOTSUPP;     /* round 5c */
+	} else if (kind == TESSERA_MFT_CHUNK_LIST ||
+	           kind == TESSERA_MFT_CHUNK_TREE) {
+		err = tessera_fs_read_into_uio(tmp_, p, uio);
 	} else {
 		err = EIO;
 	}
@@ -3597,30 +3654,26 @@ tessera_fs_read_full_content(struct tessera_mount *tmp_,
 			if (data_len > (size_t)ino->size) data_len = (size_t)ino->size;
 			memcpy(buf, data, data_len);
 		}
-	} else if (kind == TESSERA_MFT_CHUNK_LIST) {
-		const uint32_t n = tessera_manifest_parser_count(p);
-		for (uint32_t i = 0; i < n && err == 0; i++) {
-			tessera_chunk_record_t cr;
-			if (tessera_manifest_chunk_at(p, i, &cr) != TESSERA_OK) {
-				err = EIO; break;
-			}
-			size_t want = cr.uncompressed_size;
-			if (cr.logical_offset + want > (uint64_t)ino->size)
-				want = (size_t)((uint64_t)ino->size - cr.logical_offset);
-			if (cr.flags & TESSERA_CHUNK_FLAG_ZERO_HOLE) {
-				/* buf was M_ZERO-allocated — nothing to do. */
-				continue;
-			}
-			uint8_t  *cb = NULL;
-			uint32_t  cb_len = 0;
-			if (tessera_fs_fetch_blob(tmp_, cr.chunk_hash,
-			    &cb, &cb_len) != 0) { err = EIO; break; }
-			if (cb_len < want) { free(cb, M_TESSERA); err = EIO; break; }
-			memcpy(buf + cr.logical_offset, cb, want);
-			free(cb, M_TESSERA);
-		}
+	} else if (kind == TESSERA_MFT_CHUNK_LIST ||
+	           kind == TESSERA_MFT_CHUNK_TREE) {
+		/* Synthesize a kernel-space uio over the destination buffer
+		 * and reuse the recursive read helper that vop_read uses.
+		 * Handles flat CHUNK_LIST and recursive CHUNK_TREE
+		 * uniformly, including ZERO_HOLE chunks. */
+		struct uio _uio;
+		struct iovec _iov;
+		_iov.iov_base   = buf;
+		_iov.iov_len    = (size_t)ino->size;
+		_uio.uio_iov    = &_iov;
+		_uio.uio_iovcnt = 1;
+		_uio.uio_offset = 0;
+		_uio.uio_resid  = (ssize_t)ino->size;
+		_uio.uio_segflg = UIO_SYSSPACE;
+		_uio.uio_rw     = UIO_READ;
+		_uio.uio_td     = curthread;
+		err = tessera_fs_read_into_uio(tmp_, p, &_uio);
 	} else {
-		err = EIO;  /* SYMLINK / DIRECTORY / CHUNK_TREE not handled here */
+		err = EIO;  /* SYMLINK / DIRECTORY not handled here */
 	}
 	tessera_manifest_parser_free(p);
 	free(blob, M_TESSERA);
