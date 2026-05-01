@@ -407,6 +407,7 @@ static int tessera_fs_pack_alloc_and_write(struct tessera_mount *tmp_,
 static int tessera_fs_pack_extents_resolve(struct tessera_mount *tmp_,
     const tessera_registry_entry_t *re,
     tessera_pack_extent_t *extents_out, uint32_t *out_count);
+static int tessera_vop_write(struct vop_write_args *ap);
 static int tessera_fs_read_full_content(struct tessera_mount *tmp_,
     const tessera_inode_record_t *ino,
     uint8_t **out_buf, size_t *out_size);
@@ -2806,6 +2807,31 @@ tessera_vop_getpages(struct vop_getpages_args *ap)
 	if (ap->a_rbehind != NULL) *ap->a_rbehind = 0;
 	if (ap->a_rahead  != NULL) *ap->a_rahead  = 0;
 	return (rv);
+}
+
+/*
+ * vop_putpages — placeholder. The default vop_stdputpages routes
+ * through the buffer-cache strategy path and corrupts tessera data
+ * (uninitialised pbuf pattern leaks into the manifest publish — the
+ * 0xdeadc0de poison pattern shows up as file content). Returning
+ * VM_PAGER_FAIL marks the pages as unflushable so the VM keeps the
+ * dirty state in memory and msync/munmap surface EIO to userspace,
+ * which is at least loud rather than silently corrupting the file.
+ *
+ * A real putpages implementation needs to drop VM_OBJECT_WLOCK before
+ * invoking tessera's write path (which acquires vnode + flush_mtx +
+ * does btree work) and re-acquire it before setting rtvals[] —
+ * non-trivial. MAP_PRIVATE mappings (the exec/cp common case) don't
+ * call here at all; only MAP_SHARED + msync / writeable munmap do.
+ *
+ * v2 polish ticket: implement a proper writeback that aggregates
+ * adjacent dirty pages into one tessera_fs_replace_content call.
+ */
+static int
+tessera_vop_putpages(struct vop_putpages_args *ap)
+{
+	(void)ap;
+	return (VM_PAGER_ERROR);
 }
 
 static int
@@ -7308,6 +7334,7 @@ struct vop_vector tessera_vnodeops = {
 	.vop_open     = tessera_vop_open,
 	.vop_close    = tessera_vop_close,
 	.vop_getpages = tessera_vop_getpages,
+	.vop_putpages = tessera_vop_putpages,
 	.vop_fsync    = tessera_vop_fsync,
 	.vop_reclaim  = tessera_vop_reclaim,
 };
