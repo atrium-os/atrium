@@ -1610,6 +1610,21 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 		if (tmp_->meta_free       != NULL) free(tmp_->meta_free, M_TESSERA);
 		if (tmp_->meta_pending    != NULL) free(tmp_->meta_pending, M_TESSERA);
 		if (tmp_->meta_pin_bitmap != NULL) free(tmp_->meta_pin_bitmap, M_TESSERA);
+		/* Drain any still-dirty buffers on devvp BEFORE detaching
+		 * the GEOM consumer. tessera_kbio_write_delayed uses
+		 * bdwrite — buffers stay on devvp's bufobj.bo_dirty list
+		 * until sched_sync (or our own VOP_FSYNC) writes them out.
+		 * If we tear down the consumer first, sched_sync later
+		 * panics in g_vfs_strategy on the dangling buffer. The
+		 * panic was reproducible under stress2's heavy meta-zone
+		 * mutation followed by umount; not seen in light
+		 * workloads because bdwrite cadence stayed low enough
+		 * that sched_sync always drained before unmount. */
+		if (tmp_->devvp != NULL) {
+			vn_lock(tmp_->devvp, LK_EXCLUSIVE | LK_RETRY);
+			(void)VOP_FSYNC(tmp_->devvp, MNT_WAIT, curthread);
+			VOP_UNLOCK(tmp_->devvp);
+		}
 		if (tmp_->cp != NULL) {
 			g_topology_lock();
 			g_vfs_close(tmp_->cp);
@@ -4764,10 +4779,11 @@ next_p:
  * (since we allocated data-zone sectors), and tessera_commit_sb.
  */
 static int
-tessera_fs_publish_manifest_owned(struct tessera_mount *tmp_,
+tessera_fs_publish_manifest_owned_ex(struct tessera_mount *tmp_,
                                   const uint8_t *manifest_bytes, size_t mlen,
                                   tessera_hash_t out_hash,
-                                  uint32_t owner_inode_no)
+                                  uint32_t owner_inode_no,
+                                  int known_new)
 {
 	if (tmp_->pack_registry_tree == NULL || tmp_->extent_alloc == NULL)
 		return (EROFS);
@@ -4777,8 +4793,21 @@ tessera_fs_publish_manifest_owned(struct tessera_mount *tmp_,
 	/* Publish-cache shortcut (publish_dedup): pack_id is derived
 	 * from the manifest hash, so identical content lands at the same
 	 * pack_id. If the registry already contains an entry, the pack
-	 * is on disk; nothing to do. */
-	{
+	 * is on disk; nothing to do.
+	 *
+	 * Callers that just built this content from scratch (BTREE leaf
+	 * + inner publishes during dirent ops) pass known_new=1 to skip
+	 * this pre-check entirely. The pending-manifest cache below
+	 * already dedups by hash, and pack_registry's btree_put on
+	 * commit_sb is idempotent for identical pack_id; the only thing
+	 * the pre-check saves is a cache entry on a true content
+	 * collision, which doesn't happen for fresh-built content.
+	 *
+	 * The pre-check ran a btree_get on pack_registry per publish,
+	 * which descends a disk-backed tree (multiple kbio_reads). With
+	 * the BTREE directory landing 2-3 publishes per dirent op, that
+	 * was the dominant per-op cost. */
+	if (!known_new) {
 		uint8_t pack_id_local[16];
 		memcpy(pack_id_local, out_hash, 16);
 		uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
@@ -4813,8 +4842,37 @@ tessera_fs_publish_manifest(struct tessera_mount *tmp_,
                             const uint8_t *manifest_bytes, size_t mlen,
                             tessera_hash_t out_hash)
 {
-	return (tessera_fs_publish_manifest_owned(tmp_, manifest_bytes,
-	    mlen, out_hash, /*owner_inode_no=*/0));
+	return (tessera_fs_publish_manifest_owned_ex(tmp_, manifest_bytes,
+	    mlen, out_hash, /*owner_inode_no=*/0, /*known_new=*/0));
+}
+
+/* Default-arity wrapper — preserves "old" callers' behaviour
+ * (pack_registry pre-check enabled). */
+static int
+tessera_fs_publish_manifest_owned(struct tessera_mount *tmp_,
+                                  const uint8_t *manifest_bytes, size_t mlen,
+                                  tessera_hash_t out_hash,
+                                  uint32_t owner_inode_no)
+{
+	return (tessera_fs_publish_manifest_owned_ex(tmp_, manifest_bytes,
+	    mlen, out_hash, owner_inode_no, /*known_new=*/0));
+}
+
+/* Fast-path variant for callers that just built `manifest_bytes`
+ * from scratch and KNOW the content is unique (hash collisions are
+ * cryptographically negligible at our scale). Skips the
+ * pack_registry btree_get pre-check that dominated per-op cost in
+ * the BTREE directory hot path. See the comment in
+ * tessera_fs_publish_manifest_owned_ex for the safety argument. */
+static int
+tessera_fs_publish_manifest_owned_known_new(struct tessera_mount *tmp_,
+                                            const uint8_t *manifest_bytes,
+                                            size_t mlen,
+                                            tessera_hash_t out_hash,
+                                            uint32_t owner_inode_no)
+{
+	return (tessera_fs_publish_manifest_owned_ex(tmp_, manifest_bytes,
+	    mlen, out_hash, owner_inode_no, /*known_new=*/1));
 }
 
 /* Result of tessera_fs_pack_alloc_and_write — the bits the caller
@@ -6092,7 +6150,10 @@ tessera_fs_dir_btree_publish_leaf(struct tessera_mount *tmp_,
 	int rc = tessera_manifest_finalize(mb, buf, mlen, &mlen, mhash);
 	tessera_manifest_free(mb);
 	if (rc != TESSERA_OK) { free(buf, M_TESSERA); return (EIO); }
-	rc = tessera_fs_publish_manifest(tmp_, buf, mlen, out_hash);
+	/* known_new: leaf bytes were just synthesised from the just-
+	 * mutated in-memory record list, so by construction unique. */
+	rc = tessera_fs_publish_manifest_owned_known_new(tmp_, buf, mlen,
+	    out_hash, /*owner_inode_no=*/0);
 	free(buf, M_TESSERA);
 	return (rc == 0 ? 0 : EIO);
 }
@@ -6124,7 +6185,8 @@ tessera_fs_dir_btree_publish_inner(struct tessera_mount *tmp_,
 	int rc = tessera_manifest_finalize(mb, buf, mlen, &mlen, mhash);
 	tessera_manifest_free(mb);
 	if (rc != TESSERA_OK) { free(buf, M_TESSERA); return (EIO); }
-	rc = tessera_fs_publish_manifest(tmp_, buf, mlen, out_hash);
+	rc = tessera_fs_publish_manifest_owned_known_new(tmp_, buf, mlen,
+	    out_hash, /*owner_inode_no=*/0);
 	free(buf, M_TESSERA);
 	return (rc == 0 ? 0 : EIO);
 }
