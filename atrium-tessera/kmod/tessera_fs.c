@@ -501,6 +501,21 @@ struct tessera_pending_manifest {
 	 * once the inode's manifest_hash is updated). 0 = untagged. */
 	uint32_t        owner_inode_no;
 };
+
+/* v2.6 dirent log entry. Variable-length: name bytes follow the
+ * struct (flexible array). seq is monotonic — most-recent entries
+ * have the highest seq, used for read-side ordering when multiple
+ * ops touch the same name (ADD-then-REMOVE-then-ADD etc.). */
+struct tessera_dirent_log_entry {
+	LIST_ENTRY(tessera_dirent_log_entry) link;
+	uint32_t parent_inode_no;
+	uint32_t inode_no;
+	uint64_t name_hash;
+	uint64_t seq;
+	uint8_t  op;             /* 0 = ADD, 1 = REMOVE */
+	uint16_t name_len;
+	char     name[];
+};
 static int tessera_fs_inode_get(struct tessera_mount *tmp_,
                                 uint32_t inode_no,
                                 tessera_inode_record_t *out);
@@ -732,6 +747,28 @@ struct tessera_mount {
 	    pending_manifests[TESSERA_PENDING_MANIFEST_BUCKETS];
 	uint32_t                  pending_manifest_count;
 	uint64_t                  pending_manifest_bytes;
+
+	/* v2.6 dirent log: in-memory delta log of pending dirent
+	 * mutations. Each dirent_rewrite call appends a record here
+	 * instead of immediately rewriting the parent's BTREE.
+	 * Checkpoint (called from flush + readdir + cap-trigger) does
+	 * one bulk merge of the log into each affected parent's
+	 * BTREE, producing a single new root per parent regardless of
+	 * how many ops were buffered. Per-op cost drops to "list
+	 * append"; per-checkpoint cost is one BTREE rebuild per dirty
+	 * parent.
+	 *
+	 * Lookups consult the log first (most-recent op for a name
+	 * wins; ADD → return inode, REMOVE → ENOENT, no entry → fall
+	 * through to BTREE).
+	 *
+	 * Crash safety: log is RAM-only. fsync triggers checkpoint
+	 * → BTREE update → commit_sb. Same durability as today's
+	 * dirty_inodes cache. */
+#define TESSERA_DIRENT_LOG_BUCKETS  64u
+	LIST_HEAD(, tessera_dirent_log_entry)
+	    dirent_log[TESSERA_DIRENT_LOG_BUCKETS];
+	uint32_t                  dirent_log_count;
 
 	/* v2 snapshots slice 2: read-only historical mount via
 	 * `tessera.gen=N`. When 1, mountfs overrode sb roots from a
@@ -1086,6 +1123,8 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 		LIST_INIT(&tmp_->dirty_inodes[_b]);
 	for (uint32_t _b = 0; _b < TESSERA_PENDING_MANIFEST_BUCKETS; _b++)
 		LIST_INIT(&tmp_->pending_manifests[_b]);
+	for (uint32_t _b = 0; _b < TESSERA_DIRENT_LOG_BUCKETS; _b++)
+		LIST_INIT(&tmp_->dirent_log[_b]);
 	tmp_->dirty_init = 1;
 
 	/* Open the journal and run replay BEFORE we open the trees, so a
@@ -1589,6 +1628,15 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 					LIST_REMOVE(_pm, link);
 					free(_pm->bytes, M_TESSERA);
 					free(_pm, M_TESSERA);
+				}
+			}
+			for (uint32_t _b = 0;
+			    _b < TESSERA_DIRENT_LOG_BUCKETS; _b++) {
+				struct tessera_dirent_log_entry *_de;
+				while ((_de = LIST_FIRST(
+				    &tmp_->dirent_log[_b])) != NULL) {
+					LIST_REMOVE(_de, link);
+					free(_de, M_TESSERA);
 				}
 			}
 			tmp_->dirty_init = 0;
