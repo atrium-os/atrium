@@ -4917,6 +4917,121 @@ SYSCTL_PROC(_kern_tessera, OID_AUTO, repack_one,
     NULL, 0, tessera_sysctl_repack_one, "I",
     "Write 1 to repack one MULTI_EXTENT pack on the active tessera mount");
 
+/*
+ * Bounded repack pass — B2 driver. Walks the pack_registry in tree
+ * order; for each MULTI_EXTENT pack found, applies the B1 helper.
+ * Bounded by both a pack-count cap and a wallclock-time cap.
+ *
+ * After each successful repack the cursor would be invalidated (B1
+ * does a btree_put on the same key, plus may trigger meta-reserve
+ * activity). We restart the walk via seek_first each time. That's
+ * O(packs * MULTI_EXTENT_count) in the worst case, but
+ * MULTI_EXTENT_count drops with every iteration — totals stay linear
+ * in the work to do.
+ *
+ * We deliberately don't sort by extent_count (descending) here — that
+ * would require reading the PEL sector for every multi-extent pack
+ * just to choose ordering, which costs more I/O than the marginal
+ * benefit of repacking the most fragmented first. Tree order suffices.
+ */
+static unsigned long tessera_repack_total_packs = 0;
+static unsigned long tessera_repack_last_packs = 0;
+static unsigned long tessera_repack_last_time_ms = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, repack_total_packs,
+    CTLFLAG_RD, &tessera_repack_total_packs, 0,
+    "Cumulative count of packs repacked since module load");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, repack_last_packs,
+    CTLFLAG_RD, &tessera_repack_last_packs, 0,
+    "Packs repacked in the most recent pass");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, repack_last_time_ms,
+    CTLFLAG_RD, &tessera_repack_last_time_ms, 0,
+    "Wallclock duration (ms) of the most recent repack pass");
+
+static int
+tessera_fs_repack_pass(struct tessera_mount *tmp_,
+                       uint32_t max_packs, uint32_t max_time_ms,
+                       uint32_t *out_repacked)
+{
+	if (tmp_->pack_registry_tree == NULL) return (EROFS);
+
+	struct timeval tv0, tv1;
+	getmicrotime(&tv0);
+	uint32_t repacked = 0;
+
+	while (repacked < max_packs) {
+		getmicrotime(&tv1);
+		uint64_t elapsed_ms = (uint64_t)(tv1.tv_sec - tv0.tv_sec) * 1000ULL +
+		    ((uint64_t)tv1.tv_usec - (uint64_t)tv0.tv_usec) / 1000ULL;
+		if (elapsed_ms >= max_time_ms) break;
+
+		tessera_btree_cursor_t *c =
+		    tessera_btree_seek_first(tmp_->pack_registry_tree);
+		if (c == NULL) break;
+		uint8_t found_key[16];
+		int found = 0;
+		for (;;) {
+			uint8_t key[16];
+			uint8_t value[TESSERA_REGISTRY_ENTRY_SIZE];
+			if (tessera_btree_cursor_get(c, key, value) != TESSERA_OK)
+				break;
+			tessera_registry_entry_t re;
+			if (tessera_decode_registry_entry(value, &re) == TESSERA_OK &&
+			    (re.flags & TESSERA_REGISTRY_FLAG_MULTI_EXTENT) != 0) {
+				memcpy(found_key, key, 16);
+				found = 1;
+				break;
+			}
+			if (tessera_btree_cursor_next(c) != TESSERA_OK) break;
+		}
+		tessera_btree_cursor_free(c);
+		if (!found) break;
+
+		int was = 0;
+		int err = tessera_fs_repack_one_pack(tmp_, found_key, &was);
+		if (err != 0) {
+			if (out_repacked != NULL) *out_repacked = repacked;
+			tessera_repack_last_packs = repacked;
+			return (err);
+		}
+		if (was) repacked++;
+	}
+
+	getmicrotime(&tv1);
+	uint64_t elapsed_ms = (uint64_t)(tv1.tv_sec - tv0.tv_sec) * 1000ULL +
+	    ((uint64_t)tv1.tv_usec - (uint64_t)tv0.tv_usec) / 1000ULL;
+	tessera_repack_last_time_ms = (unsigned long)elapsed_ms;
+	tessera_repack_last_packs = repacked;
+	tessera_repack_total_packs += repacked;
+	if (out_repacked != NULL) *out_repacked = repacked;
+	printf("tessera_fs: repack pass — %u packs repacked in %lu ms\n",
+	    repacked, (unsigned long)elapsed_ms);
+	return (0);
+}
+
+/*
+ * sysctl kern.tessera.repack_now — write a non-zero value (interpreted
+ * as a max-packs budget; 0 → default 1000) to run a bounded repack
+ * pass synchronously on the active mount. 30s wallclock cap. The
+ * stats sysctls above expose the result.
+ */
+static int
+tessera_sysctl_repack_now(SYSCTL_HANDLER_ARGS)
+{
+	int budget = 0;
+	int err = sysctl_handle_int(oidp, &budget, 0, req);
+	if (err != 0 || req->newptr == NULL) return (err);
+	if (budget == 0) return (0);
+	if (tessera_singleton_mount == NULL) return (ENXIO);
+	uint32_t max_packs = (budget > 0) ? (uint32_t)budget : 1000u;
+	uint32_t repacked = 0;
+	return (tessera_fs_repack_pass(tessera_singleton_mount,
+	    max_packs, 30000u, &repacked));
+}
+SYSCTL_PROC(_kern_tessera, OID_AUTO, repack_now,
+    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+    NULL, 0, tessera_sysctl_repack_now, "I",
+    "Write N to run a bounded repack pass (max N packs, 30s) on the active mount");
+
 static int
 tessera_fs_repack_first_multi(struct tessera_mount *tmp_)
 {
