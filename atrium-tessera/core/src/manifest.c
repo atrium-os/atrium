@@ -258,6 +258,62 @@ tessera_manifest_add_dirent(tessera_manifest_builder_t *b,
 	return TESSERA_OK;
 }
 
+/* DIRECTORY_BTREE — body layout is [u8 leaf_flag][u8 reserved×3]
+ * [u32 reserved] then a stream of records. Builder appends bytes
+ * verbatim; caller is responsible for adding records in ascending
+ * key order (split / migration paths already iterate sorted, so
+ * this is cheap). */
+int
+tessera_manifest_dir_btree_set_leaf(tessera_manifest_builder_t *b, int leaf_flag)
+{
+	if (b == NULL) return TESSERA_EINVAL;
+	if (b->kind != TESSERA_MFT_DIRECTORY_BTREE) return TESSERA_EINVAL;
+	if (b->body_len > 0) return TESSERA_EINVAL;  /* must be first call */
+	uint8_t hdr[8] = { (uint8_t)(leaf_flag ? 1 : 0), 0, 0, 0, 0, 0, 0, 0 };
+	if (body_append(b, hdr, sizeof hdr) != 0) return TESSERA_ENOMEM;
+	return TESSERA_OK;
+}
+
+int
+tessera_manifest_dir_btree_add_leaf(tessera_manifest_builder_t *b,
+                                    uint64_t name_hash, uint64_t inode_no,
+                                    const char *name, size_t name_len)
+{
+	if (b == NULL || name == NULL) return TESSERA_EINVAL;
+	if (b->kind != TESSERA_MFT_DIRECTORY_BTREE) return TESSERA_EINVAL;
+	if (b->body_len < 8) return TESSERA_EINVAL;  /* set_leaf first */
+	if (b->body[0] != 1) return TESSERA_EINVAL;
+	if (name_len == 0 || name_len > TESSERA_PATH_NAME_MAX)
+		return TESSERA_EINVAL;
+	if (body_reserve(b, b->body_len + 8 + 8 + 2 + name_len) != 0)
+		return TESSERA_ENOMEM;
+	memcpy(b->body + b->body_len, &name_hash, 8); b->body_len += 8;
+	memcpy(b->body + b->body_len, &inode_no, 8);  b->body_len += 8;
+	uint16_t nl = (uint16_t)name_len;
+	memcpy(b->body + b->body_len, &nl, 2);        b->body_len += 2;
+	memcpy(b->body + b->body_len, name, name_len); b->body_len += name_len;
+	b->entry_count++;
+	return TESSERA_OK;
+}
+
+int
+tessera_manifest_dir_btree_add_inner(tessera_manifest_builder_t *b,
+                                     uint64_t max_name_hash,
+                                     const tessera_hash_t child_hash)
+{
+	if (b == NULL || child_hash == NULL) return TESSERA_EINVAL;
+	if (b->kind != TESSERA_MFT_DIRECTORY_BTREE) return TESSERA_EINVAL;
+	if (b->body_len < 8) return TESSERA_EINVAL;
+	if (b->body[0] != 0) return TESSERA_EINVAL;
+	if (body_reserve(b, b->body_len + 8 + TESSERA_HASH_SIZE) != 0)
+		return TESSERA_ENOMEM;
+	memcpy(b->body + b->body_len, &max_name_hash, 8); b->body_len += 8;
+	memcpy(b->body + b->body_len, child_hash, TESSERA_HASH_SIZE);
+	b->body_len += TESSERA_HASH_SIZE;
+	b->entry_count++;
+	return TESSERA_OK;
+}
+
 int
 tessera_manifest_finalize(tessera_manifest_builder_t *b,
                           uint8_t *out_buffer, size_t buffer_len,

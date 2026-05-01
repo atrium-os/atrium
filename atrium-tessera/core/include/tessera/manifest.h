@@ -57,6 +57,21 @@ int tessera_manifest_add_dir_bucket(tessera_manifest_builder_t *,
                                     uint64_t first_name_hash,
                                     const tessera_hash_t bucket_manifest_hash);
 
+/* DIRECTORY_BTREE — append-the-prefix to set the leaf flag, then
+ * append records. Records MUST be added in ascending key order; the
+ * caller is expected to have sorted entries by name_hash before
+ * calling these. (Builder doesn't sort to keep the per-op cost low
+ * for the common-case bulk-build during migration / split.) */
+int tessera_manifest_dir_btree_set_leaf(tessera_manifest_builder_t *,
+                                        int leaf_flag);
+int tessera_manifest_dir_btree_add_leaf(tessera_manifest_builder_t *,
+                                        uint64_t name_hash,
+                                        uint64_t inode_no,
+                                        const char *name, size_t name_len);
+int tessera_manifest_dir_btree_add_inner(tessera_manifest_builder_t *,
+                                         uint64_t max_name_hash,
+                                         const tessera_hash_t child_hash);
+
 /* SHA-256 over `name`, return first 8 bytes as a u64 — the hash key
  * used by DIRECTORY_2L bucket selection. Stable + uniformly
  * distributed; cost is microseconds even for long names. */

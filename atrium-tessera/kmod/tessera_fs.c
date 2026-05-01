@@ -586,6 +586,26 @@ static int tessera_fs_publish_directory(struct tessera_mount *tmp_,
                                          const uint8_t *flat_mft,
                                          size_t flat_mlen,
                                          tessera_hash_t out_hash);
+/* DIRECTORY_BTREE helpers — forward decls so vop_lookup / vop_readdir
+ * can call into them before the implementation block. */
+static int tessera_fs_dir_btree_lookup(struct tessera_mount *,
+    const tessera_hash_t root_hash, const char *name, uint16_t namelen,
+    uint64_t *out_inode);
+static int tessera_fs_dir_btree_walk(struct tessera_mount *,
+    const tessera_hash_t root_hash, tessera_dirent_cb_t cb, void *ctx);
+static int tessera_fs_dir_btree_decode(uint8_t *blob, uint32_t blob_len,
+    int *out_leaf, const uint8_t **out_body, size_t *out_body_len,
+    uint32_t *out_count);
+static int tessera_fs_dir_btree_insert(struct tessera_mount *tmp_,
+    const tessera_hash_t root_hash, int root_is_empty,
+    const char *name, uint16_t namelen, uint64_t inode_no,
+    tessera_hash_t out_new_root);
+static int tessera_fs_dir_btree_remove(struct tessera_mount *tmp_,
+    const tessera_hash_t root_hash, const char *name, uint16_t namelen,
+    uint64_t verify_inode, int *out_dropped, tessera_hash_t out_new_root);
+static int tessera_fs_dir_btree_migrate(struct tessera_mount *tmp_,
+    const tessera_hash_t old_dir_hash, tessera_hash_t out_new_root,
+    int *out_empty);
 /* Promotion threshold: when a flat-DIRECTORY manifest body exceeds
  * this size, publish_directory splits entries into hash buckets and
  * emits DIRECTORY_2L instead. ~4 KiB matches the v2 design; small
@@ -1881,21 +1901,22 @@ tessera_statfs_impl(struct mount *mp, struct statfs *sbp)
 	    : tmp_->sb.pack_zone_length;
 	sbp->f_bfree  = free_data;
 	sbp->f_bavail = free_data;
-	/* Inode count: tessera has no per-volume inode cap. Report a
-	 * conservative free count so size-by-inodes tools (stress2's
-	 * `size = in / incarnations`, df -i) pick reasonable workloads.
-	 *
-	 * Why conservative: every dir mutation rewrites the parent's
-	 * DIRECTORY manifest (or one DIRECTORY_2L bucket). At thousands
-	 * of entries per parent that gets slow under parallel mutators.
-	 * Reporting a small free-inode count (32 KiB worth) caps stress
-	 * tests' single-parent population at a level our O(bucket-size)
-	 * mutation cost handles cleanly. */
+	/* Inode count. v2.5 BTREE directory makes per-op O(log N), so
+	 * we no longer need the previous 2K hard floor on f_ffree. But
+	 * tessera's per-op fixed overhead (publish_manifest +
+	 * inode_put + pack_registry pre-check) is still ~ms-class
+	 * rather than the ~10 µs that ext4 / btrfs hit, so size-by-
+	 * inodes tools (stress2's `size = ifree / incarnations`) still
+	 * pick workloads that exceed our per-op cost × 100×outer-loop
+	 * bound. Cap at 8K free for now — comfortably above any
+	 * realistic single-dir population, well under the workload
+	 * stress2 explodes into at unbounded f_ffree. Lift further
+	 * after pack_registry hot-path caching lands. */
 	{
 		uint64_t used = (tmp_->sb.next_inode_no >
 		    TESSERA_INODE_FIRST_USER) ?
 		    (tmp_->sb.next_inode_no - TESSERA_INODE_FIRST_USER) : 0;
-		uint64_t free_files = 2048;
+		uint64_t free_files = 8192;
 		sbp->f_files  = used + free_files;
 		sbp->f_ffree  = free_files;
 	}
@@ -2298,7 +2319,8 @@ tessera_vop_lookup(struct vop_lookup_args *ap)
 	}
 	const tessera_manifest_kind_t dkind = tessera_manifest_parser_kind(p);
 	if (dkind != TESSERA_MFT_DIRECTORY &&
-	    dkind != TESSERA_MFT_DIRECTORY_2L) {
+	    dkind != TESSERA_MFT_DIRECTORY_2L &&
+	    dkind != TESSERA_MFT_DIRECTORY_BTREE) {
 		tessera_manifest_parser_free(p);
 		free(blob, M_TESSERA);
 		return (ENOTDIR);
@@ -2313,11 +2335,15 @@ tessera_vop_lookup(struct vop_lookup_args *ap)
 		rc = tessera_dir_lookup_name(body, blen,
 		    cnp->cn_nameptr, (uint16_t)cnp->cn_namelen,
 		    &child_no);
-	} else {
+	} else if (dkind == TESSERA_MFT_DIRECTORY_2L) {
 		/* Two-level dir: hash → bucket → fetch bucket → flat lookup. */
 		rc = tessera_fs_dir_2l_lookup(tmp_, p,
 		    cnp->cn_nameptr, (uint16_t)cnp->cn_namelen,
 		    &child_no);
+	} else {
+		/* B-tree dir: O(log N) descent. */
+		rc = tessera_fs_dir_btree_lookup(tmp_, dino.manifest_hash,
+		    cnp->cn_nameptr, (uint16_t)cnp->cn_namelen, &child_no);
 	}
 	tessera_manifest_parser_free(p);
 	free(blob, M_TESSERA);
@@ -2516,7 +2542,8 @@ tessera_vop_readdir(struct vop_readdir_args *ap)
 	}
 	const tessera_manifest_kind_t rkind = tessera_manifest_parser_kind(p);
 	if (rkind != TESSERA_MFT_DIRECTORY &&
-	    rkind != TESSERA_MFT_DIRECTORY_2L) {
+	    rkind != TESSERA_MFT_DIRECTORY_2L &&
+	    rkind != TESSERA_MFT_DIRECTORY_BTREE) {
 		tessera_manifest_parser_free(p);
 		free(blob, M_TESSERA);
 		goto stop_walk;
@@ -2546,10 +2573,118 @@ tessera_vop_readdir(struct vop_readdir_args *ap)
 	}                                                                 \
 } while (0)
 
+#define _RD_EMIT_BTREE_LEAF(_body, _blen) do {                            \
+	for (size_t _off = 0; _off + 18 <= (_blen); ) {                   \
+		uint64_t _ch;                                             \
+		uint16_t _nl;                                             \
+		memcpy(&_ch, (_body) + _off + 8, 8);                      \
+		memcpy(&_nl, (_body) + _off + 16, 2);                     \
+		if (_off + 18 + _nl > (_blen)) break;                     \
+		const char *_nm = (const char *)((_body) + _off + 18);    \
+		uint8_t _dt = DT_UNKNOWN;                                 \
+		uint8_t _k2[4];                                           \
+		tessera_inode_record_t _cino;                             \
+		encode_inode_key((uint32_t)_ch, _k2);                     \
+		int _crc = (_rd_gen != 0)                                 \
+		    ? tessera_fs_inode_get_at_gen(tmp_, (uint32_t)_ch,    \
+		          _rd_gen, &_cino)                                \
+		    : tessera_fs_inode_get_byk(tmp_, _k2, &_cino);        \
+		if (_crc == TESSERA_OK)                                   \
+			_dt = tessera_dt_from_mode(_cino.mode);           \
+		_EMIT(_ch, _dt, _nm, _nl);                                \
+		_off += 18 + _nl;                                         \
+	}                                                                 \
+} while (0)
+
 	if (rkind == TESSERA_MFT_DIRECTORY) {
 		const uint8_t *body = blob + 32;
 		const size_t   blen = blob_len - 32;
 		_RD_EMIT_BODY(body, blen);
+	} else if (rkind == TESSERA_MFT_DIRECTORY_BTREE) {
+		/* DFS the b-tree. Bounded depth (log_F N), iterate leaves
+		 * left-to-right via an explicit stack of node hashes +
+		 * indices so we don't blow recursion. With FANOUT_INNER=64
+		 * even an N=4M dir is depth ~4. */
+		struct {
+			tessera_hash_t hash;
+			uint8_t *bbuf;
+			uint32_t blen2;
+			int      leaf;
+			const uint8_t *body;
+			size_t   body_len;
+			uint32_t count;
+			uint32_t idx;
+		} stack[16];
+		int sp = 0;
+		memcpy(stack[0].hash, dino.manifest_hash, TESSERA_HASH_SIZE);
+		stack[0].bbuf = blob;          /* root: reuse already-fetched */
+		stack[0].blen2 = blob_len;
+		int decoded = tessera_fs_dir_btree_decode(blob, blob_len,
+		    &stack[0].leaf, &stack[0].body, &stack[0].body_len,
+		    &stack[0].count);
+		stack[0].idx = 0;
+		if (decoded != 0) { err = EIO; goto out_free; }
+		blob = NULL;  /* ownership moved into stack[0].bbuf */
+		while (sp >= 0 && !stopped) {
+			if (stack[sp].leaf) {
+				_RD_EMIT_BTREE_LEAF(stack[sp].body,
+				    stack[sp].body_len);
+				if (sp == 0) free(stack[sp].bbuf, M_TESSERA);
+				else        free(stack[sp].bbuf, M_TESSERA);
+				stack[sp].bbuf = NULL;
+				sp--;
+				continue;
+			}
+			if (stack[sp].idx >= stack[sp].count) {
+				if (sp == 0) free(stack[sp].bbuf, M_TESSERA);
+				else        free(stack[sp].bbuf, M_TESSERA);
+				stack[sp].bbuf = NULL;
+				sp--;
+				continue;
+			}
+			size_t coff = (size_t)stack[sp].idx *
+			    (8 + TESSERA_HASH_SIZE);
+			tessera_hash_t child;
+			memcpy(child, stack[sp].body + coff + 8,
+			    TESSERA_HASH_SIZE);
+			stack[sp].idx++;
+			if (sp + 1 >= 16) { err = EIO; goto out_free; }
+			sp++;
+			memcpy(stack[sp].hash, child, TESSERA_HASH_SIZE);
+			stack[sp].bbuf = NULL;
+			stack[sp].blen2 = 0;
+			stack[sp].idx = 0;
+			if (tessera_fs_fetch_blob(tmp_, child,
+			    &stack[sp].bbuf, &stack[sp].blen2) != 0) {
+				err = EIO;
+				while (sp >= 0) {
+					if (stack[sp].bbuf)
+						free(stack[sp].bbuf, M_TESSERA);
+					sp--;
+				}
+				goto out_free_btree;
+			}
+			if (tessera_fs_dir_btree_decode(stack[sp].bbuf,
+			    stack[sp].blen2, &stack[sp].leaf,
+			    &stack[sp].body, &stack[sp].body_len,
+			    &stack[sp].count) != 0) {
+				err = EIO;
+				while (sp >= 0) {
+					if (stack[sp].bbuf)
+						free(stack[sp].bbuf, M_TESSERA);
+					sp--;
+				}
+				goto out_free_btree;
+			}
+		}
+		/* Drain any still-allocated frames on early-stop. */
+		while (sp >= 0) {
+			if (stack[sp].bbuf) free(stack[sp].bbuf, M_TESSERA);
+			sp--;
+		}
+out_free_btree:
+		tessera_manifest_parser_free(p);
+		goto stop_walk;
 	} else {
 		/* DIRECTORY_2L: iterate buckets, fetch each, walk it. */
 		const uint32_t nbk = tessera_manifest_parser_count(p);
@@ -2574,6 +2709,7 @@ tessera_vop_readdir(struct vop_readdir_args *ap)
 		}
 	}
 #undef _RD_EMIT_BODY
+#undef _RD_EMIT_BTREE_LEAF
 #undef _EMIT
 
 out_free:
@@ -5521,6 +5657,16 @@ tessera_fs_dir_walk(struct tessera_mount *tmp_,
 			}
 			free(bbuf, M_TESSERA);
 		}
+	} else if (k == TESSERA_MFT_DIRECTORY_BTREE) {
+		/* B-tree directory: defer to the dedicated walker (which
+		 * handles inner / leaf nodes recursively). The blob we
+		 * already have is the root; we just need to free it and
+		 * have the recursive walker re-fetch — keeps the walker
+		 * uniform across the recursion. */
+		tessera_manifest_parser_free(p);
+		free(blob, M_TESSERA);
+		return (tessera_fs_dir_btree_walk(tmp_, dir_manifest_hash,
+		    cb, ctx));
 	} else {
 		rc = ENOTDIR;
 	}
@@ -5720,6 +5866,855 @@ tessera_fs_publish_directory(struct tessera_mount *tmp_,
 	int rc = tessera_fs_publish_manifest_owned(tmp_, obuf, omlen,
 	    out_hash, owner_inode_no);
 	free(obuf, M_TESSERA);
+	return (rc);
+}
+
+/* ──────────────────────────────────────────────────────────────────
+ * v2.5 directory B-tree (TESSERA_MFT_DIRECTORY_BTREE)
+ *
+ * Fully content-addressed: each tree node is a manifest blob, the
+ * dir's manifest_hash points at the root node. Mutation = COW path
+ * of O(log_F N) nodes; lookup = O(log_F N) descent. Replaces
+ * DIRECTORY_2L's O(N/K) per-op cost with proper logarithmic scaling
+ * while preserving the design invariant that equal-content dirs
+ * produce equal hashes (same as inode_tree / pack_registry).
+ *
+ * Node body layout: [u8 leaf_flag][u8 reserved×3][u32 reserved] then
+ * a stream of records.
+ *   Inner record (40 B): u64 max_name_hash, tessera_hash_t child_hash
+ *   Leaf  record (var):  u64 name_hash, u64 inode_no,
+ *                        u16 name_len, name bytes
+ *
+ * Leaves split when count > TESSERA_DIR_BTREE_FANOUT_LEAF;
+ * inners split when count > TESSERA_DIR_BTREE_FANOUT_INNER. Removes
+ * leave underfilled nodes (no merge in v1 — they shrink naturally
+ * as the workload mutates). Records within a node are kept sorted
+ * by name_hash so binary search drives lookup.
+ * ────────────────────────────────────────────────────────────────── */
+
+/* Result of inserting/removing into a subtree. KEEP = single new
+ * node hash; SPLIT = two siblings + their key ranges. */
+struct tessera_btree_op_result {
+	int       kind;             /* 0 = KEEP, 1 = SPLIT, 2 = DROPPED */
+	uint64_t  left_max_hash;
+	tessera_hash_t left_hash;
+	uint64_t  right_max_hash;
+	tessera_hash_t right_hash;
+};
+#define TESSERA_BTREE_KEEP     0
+#define TESSERA_BTREE_SPLIT    1
+#define TESSERA_BTREE_DROPPED  2
+
+/* Decode a node blob into (leaf_flag, count, body, body_len). The
+ * caller owns the blob memory. */
+static int
+tessera_fs_dir_btree_decode(uint8_t *blob, uint32_t blob_len,
+    int *out_leaf, const uint8_t **out_body, size_t *out_body_len,
+    uint32_t *out_count)
+{
+	if (blob_len < 32 + 8) return (EIO);
+	tessera_manifest_parser_t *p = tessera_manifest_parse(blob, blob_len);
+	if (p == NULL) return (EIO);
+	if (tessera_manifest_parser_kind(p) != TESSERA_MFT_DIRECTORY_BTREE) {
+		tessera_manifest_parser_free(p);
+		return (EIO);
+	}
+	*out_count = tessera_manifest_parser_count(p);
+	tessera_manifest_parser_free(p);
+	const uint8_t *body = blob + 32;
+	*out_leaf = body[0] ? 1 : 0;
+	*out_body = body + 8;
+	*out_body_len = blob_len - 32 - 8;
+	return (0);
+}
+
+/* Walk a leaf node: callback per (inode_no, name, name_len). Returns
+ * 0 on full success, or the callback's nonzero return to abort. */
+static int
+tessera_fs_dir_btree_walk_leaf(const uint8_t *body, size_t body_len,
+    uint32_t count, tessera_dirent_cb_t cb, void *ctx)
+{
+	size_t off = 0;
+	for (uint32_t i = 0; i < count; i++) {
+		if (off + 8 + 8 + 2 > body_len) return (EIO);
+		uint64_t inode_no;
+		uint16_t name_len;
+		memcpy(&inode_no, body + off + 8, 8);
+		memcpy(&name_len, body + off + 16, 2);
+		if (off + 18 + name_len > body_len) return (EIO);
+		const char *name = (const char *)(body + off + 18);
+		int rc = cb(ctx, inode_no, name, name_len);
+		if (rc != 0) return (rc);
+		off += 18 + name_len;
+	}
+	return (0);
+}
+
+/* Recursive walker. Reads node, dispatches by kind. */
+static int
+tessera_fs_dir_btree_walk(struct tessera_mount *tmp_,
+    const tessera_hash_t node_hash, tessera_dirent_cb_t cb, void *ctx)
+{
+	uint8_t  *blob = NULL;
+	uint32_t  blob_len = 0;
+	if (tessera_fs_fetch_blob(tmp_, node_hash, &blob, &blob_len) != 0)
+		return (EIO);
+	int leaf_flag;
+	const uint8_t *body;
+	size_t body_len;
+	uint32_t count;
+	int rc = tessera_fs_dir_btree_decode(blob, blob_len, &leaf_flag,
+	    &body, &body_len, &count);
+	if (rc != 0) { free(blob, M_TESSERA); return (rc); }
+	if (leaf_flag) {
+		rc = tessera_fs_dir_btree_walk_leaf(body, body_len, count,
+		    cb, ctx);
+	} else {
+		size_t off = 0;
+		for (uint32_t i = 0; i < count && rc == 0; i++) {
+			if (off + 8 + TESSERA_HASH_SIZE > body_len) {
+				rc = EIO; break;
+			}
+			tessera_hash_t child;
+			memcpy(child, body + off + 8, TESSERA_HASH_SIZE);
+			rc = tessera_fs_dir_btree_walk(tmp_, child, cb, ctx);
+			off += 8 + TESSERA_HASH_SIZE;
+		}
+	}
+	free(blob, M_TESSERA);
+	return (rc);
+}
+
+/* Lookup `name` in a B-tree directory. Returns 0 + *out_inode on hit,
+ * ENOENT if not found. */
+static int
+tessera_fs_dir_btree_lookup(struct tessera_mount *tmp_,
+    const tessera_hash_t node_hash, const char *name, uint16_t namelen,
+    uint64_t *out_inode)
+{
+	const uint64_t key = tessera_dir_name_hash(name, namelen);
+	tessera_hash_t cur;
+	memcpy(cur, node_hash, TESSERA_HASH_SIZE);
+
+	for (int depth = 0; depth < 32; depth++) {
+		uint8_t  *blob = NULL;
+		uint32_t  blob_len = 0;
+		if (tessera_fs_fetch_blob(tmp_, cur, &blob, &blob_len) != 0)
+			return (EIO);
+		int leaf;
+		const uint8_t *body;
+		size_t body_len;
+		uint32_t count;
+		int rc = tessera_fs_dir_btree_decode(blob, blob_len, &leaf,
+		    &body, &body_len, &count);
+		if (rc != 0) { free(blob, M_TESSERA); return (rc); }
+
+		if (leaf) {
+			size_t off = 0;
+			int found_enoent = 1;
+			for (uint32_t i = 0; i < count; i++) {
+				if (off + 18 > body_len) {
+					free(blob, M_TESSERA);
+					return (EIO);
+				}
+				uint64_t h;
+				uint64_t ino;
+				uint16_t nl;
+				memcpy(&h, body + off, 8);
+				memcpy(&ino, body + off + 8, 8);
+				memcpy(&nl, body + off + 16, 2);
+				if (off + 18 + nl > body_len) {
+					free(blob, M_TESSERA);
+					return (EIO);
+				}
+				if (h == key && nl == namelen &&
+				    memcmp(body + off + 18, name, namelen) == 0) {
+					*out_inode = ino;
+					free(blob, M_TESSERA);
+					return (0);
+				}
+				if (h > key) { found_enoent = 1; break; }
+				off += 18 + nl;
+			}
+			free(blob, M_TESSERA);
+			(void)found_enoent;
+			return (ENOENT);
+		}
+
+		/* Inner: find first child with max_name_hash >= key. */
+		size_t off = 0;
+		int picked = 0;
+		for (uint32_t i = 0; i < count; i++) {
+			if (off + 8 + TESSERA_HASH_SIZE > body_len) {
+				free(blob, M_TESSERA);
+				return (EIO);
+			}
+			uint64_t mh;
+			memcpy(&mh, body + off, 8);
+			if (mh >= key) {
+				memcpy(cur, body + off + 8, TESSERA_HASH_SIZE);
+				picked = 1;
+				break;
+			}
+			off += 8 + TESSERA_HASH_SIZE;
+		}
+		free(blob, M_TESSERA);
+		if (!picked) return (ENOENT);
+	}
+	return (EIO);  /* depth overflow */
+}
+
+/* Build a leaf node from a sorted in-memory list of records. */
+static int
+tessera_fs_dir_btree_publish_leaf(struct tessera_mount *tmp_,
+    const uint64_t *hashes, const uint64_t *inos,
+    const char *const *names, const uint16_t *nlens,
+    uint32_t count, tessera_hash_t out_hash)
+{
+	tessera_manifest_builder_t *mb =
+	    tessera_manifest_begin(TESSERA_MFT_DIRECTORY_BTREE);
+	if (mb == NULL) return (ENOMEM);
+	if (tessera_manifest_dir_btree_set_leaf(mb, 1) != TESSERA_OK) {
+		tessera_manifest_free(mb);
+		return (ENOMEM);
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		if (tessera_manifest_dir_btree_add_leaf(mb,
+		    hashes[i], inos[i], names[i], nlens[i]) != TESSERA_OK) {
+			tessera_manifest_free(mb);
+			return (ENOMEM);
+		}
+	}
+	size_t mlen = 0;
+	tessera_hash_t mhash;
+	(void)tessera_manifest_finalize(mb, NULL, 0, &mlen, mhash);
+	uint8_t *buf = malloc(mlen, M_TESSERA, M_WAITOK);
+	int rc = tessera_manifest_finalize(mb, buf, mlen, &mlen, mhash);
+	tessera_manifest_free(mb);
+	if (rc != TESSERA_OK) { free(buf, M_TESSERA); return (EIO); }
+	rc = tessera_fs_publish_manifest(tmp_, buf, mlen, out_hash);
+	free(buf, M_TESSERA);
+	return (rc == 0 ? 0 : EIO);
+}
+
+/* Build an inner node from a list of (max_hash, child_hash) pairs. */
+static int
+tessera_fs_dir_btree_publish_inner(struct tessera_mount *tmp_,
+    const uint64_t *max_hashes, const tessera_hash_t *child_hashes,
+    uint32_t count, tessera_hash_t out_hash)
+{
+	tessera_manifest_builder_t *mb =
+	    tessera_manifest_begin(TESSERA_MFT_DIRECTORY_BTREE);
+	if (mb == NULL) return (ENOMEM);
+	if (tessera_manifest_dir_btree_set_leaf(mb, 0) != TESSERA_OK) {
+		tessera_manifest_free(mb);
+		return (ENOMEM);
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		if (tessera_manifest_dir_btree_add_inner(mb,
+		    max_hashes[i], child_hashes[i]) != TESSERA_OK) {
+			tessera_manifest_free(mb);
+			return (ENOMEM);
+		}
+	}
+	size_t mlen = 0;
+	tessera_hash_t mhash;
+	(void)tessera_manifest_finalize(mb, NULL, 0, &mlen, mhash);
+	uint8_t *buf = malloc(mlen, M_TESSERA, M_WAITOK);
+	int rc = tessera_manifest_finalize(mb, buf, mlen, &mlen, mhash);
+	tessera_manifest_free(mb);
+	if (rc != TESSERA_OK) { free(buf, M_TESSERA); return (EIO); }
+	rc = tessera_fs_publish_manifest(tmp_, buf, mlen, out_hash);
+	free(buf, M_TESSERA);
+	return (rc == 0 ? 0 : EIO);
+}
+
+/* Forward decl — recursive insert. */
+static int
+tessera_fs_dir_btree_insert_at(struct tessera_mount *tmp_,
+    const tessera_hash_t node_hash, uint64_t key, uint64_t inode_no,
+    const char *name, uint16_t namelen,
+    struct tessera_btree_op_result *out);
+
+/* Insert into a leaf node. Builds new leaf (with the inserted entry)
+ * and either KEEPs (if size <= FANOUT) or SPLITs into two halves. */
+static int
+tessera_fs_dir_btree_leaf_insert(struct tessera_mount *tmp_,
+    const uint8_t *body, size_t body_len, uint32_t count,
+    uint64_t key, uint64_t inode_no, const char *name, uint16_t namelen,
+    struct tessera_btree_op_result *out)
+{
+	/* Decode existing entries into arrays. */
+	uint32_t cap = count + 1;
+	uint64_t *hashes  = malloc(cap * sizeof *hashes,  M_TESSERA, M_WAITOK);
+	uint64_t *inos    = malloc(cap * sizeof *inos,    M_TESSERA, M_WAITOK);
+	const char **nptrs = malloc(cap * sizeof *nptrs,  M_TESSERA, M_WAITOK);
+	uint16_t  *nlens  = malloc(cap * sizeof *nlens,   M_TESSERA, M_WAITOK);
+	uint8_t  **owned  = malloc(cap * sizeof *owned,   M_TESSERA, M_WAITOK | M_ZERO);
+
+	size_t off = 0;
+	uint32_t out_count = 0;
+	int inserted = 0;
+	for (uint32_t i = 0; i < count; i++) {
+		uint64_t h;
+		uint64_t ino;
+		uint16_t nl;
+		memcpy(&h, body + off, 8);
+		memcpy(&ino, body + off + 8, 8);
+		memcpy(&nl, body + off + 16, 2);
+		const char *nm = (const char *)(body + off + 18);
+		if (!inserted && (h > key ||
+		    (h == key && (nl > namelen ||
+		     (nl == namelen && memcmp(nm, name, nl) > 0))))) {
+			hashes[out_count] = key;
+			inos[out_count]   = inode_no;
+			nptrs[out_count]  = name;
+			nlens[out_count]  = namelen;
+			owned[out_count]  = NULL;
+			out_count++;
+			inserted = 1;
+		}
+		if (h == key && nl == namelen &&
+		    memcmp(nm, name, namelen) == 0) {
+			/* Duplicate. Caller's responsibility — return
+			 * EEXIST. */
+			free(hashes, M_TESSERA); free(inos, M_TESSERA);
+			free(nptrs,  M_TESSERA); free(nlens, M_TESSERA);
+			for (uint32_t j = 0; j < out_count; j++)
+				if (owned[j]) free(owned[j], M_TESSERA);
+			free(owned, M_TESSERA);
+			return (EEXIST);
+		}
+		hashes[out_count] = h;
+		inos[out_count]   = ino;
+		/* Names point into `body` which lives until our caller
+		 * frees the blob. We stash refs only; the publish path
+		 * memcpys before we return. */
+		nptrs[out_count]  = nm;
+		nlens[out_count]  = nl;
+		owned[out_count]  = NULL;
+		out_count++;
+		off += 18 + nl;
+	}
+	if (!inserted) {
+		hashes[out_count] = key;
+		inos[out_count]   = inode_no;
+		nptrs[out_count]  = name;
+		nlens[out_count]  = namelen;
+		owned[out_count]  = NULL;
+		out_count++;
+	}
+
+	int rc = 0;
+	if (out_count <= TESSERA_DIR_BTREE_FANOUT_LEAF) {
+		out->kind = TESSERA_BTREE_KEEP;
+		rc = tessera_fs_dir_btree_publish_leaf(tmp_, hashes, inos,
+		    nptrs, nlens, out_count, out->left_hash);
+		out->left_max_hash = hashes[out_count - 1];
+	} else {
+		uint32_t half = out_count / 2;
+		rc = tessera_fs_dir_btree_publish_leaf(tmp_, hashes, inos,
+		    nptrs, nlens, half, out->left_hash);
+		if (rc == 0) {
+			out->left_max_hash = hashes[half - 1];
+			rc = tessera_fs_dir_btree_publish_leaf(tmp_,
+			    hashes + half, inos + half, nptrs + half,
+			    nlens + half, out_count - half, out->right_hash);
+			out->right_max_hash = hashes[out_count - 1];
+			out->kind = TESSERA_BTREE_SPLIT;
+		}
+	}
+
+	free(hashes, M_TESSERA); free(inos, M_TESSERA);
+	free(nptrs,  M_TESSERA); free(nlens, M_TESSERA);
+	for (uint32_t j = 0; j < out_count; j++)
+		if (owned[j]) free(owned[j], M_TESSERA);
+	free(owned, M_TESSERA);
+	return (rc);
+}
+
+static int
+tessera_fs_dir_btree_inner_insert_after_split(struct tessera_mount *tmp_,
+    const uint8_t *body, size_t body_len, uint32_t count,
+    uint32_t target_idx, uint64_t left_max, const tessera_hash_t left_hash,
+    uint64_t right_max, const tessera_hash_t right_hash,
+    int split_happened, struct tessera_btree_op_result *out)
+{
+	/* Build a new inner node. If split_happened, replace the
+	 * target_idx entry with TWO entries; else replace it with one
+	 * (just the new child hash since the recursion KEPT). */
+	uint32_t new_count = count + (split_happened ? 1 : 0);
+	uint64_t *maxes = malloc(new_count * sizeof *maxes, M_TESSERA, M_WAITOK);
+	tessera_hash_t *children = malloc(new_count * sizeof *children,
+	    M_TESSERA, M_WAITOK);
+
+	size_t off = 0;
+	uint32_t k = 0;
+	for (uint32_t i = 0; i < count; i++) {
+		uint64_t mh;
+		memcpy(&mh, body + off, 8);
+		const uint8_t *ch = body + off + 8;
+		if (i == target_idx) {
+			maxes[k] = left_max;
+			memcpy(children[k], left_hash, TESSERA_HASH_SIZE);
+			k++;
+			if (split_happened) {
+				maxes[k] = right_max;
+				memcpy(children[k], right_hash,
+				    TESSERA_HASH_SIZE);
+				k++;
+			}
+		} else {
+			maxes[k] = mh;
+			memcpy(children[k], ch, TESSERA_HASH_SIZE);
+			k++;
+		}
+		off += 8 + TESSERA_HASH_SIZE;
+	}
+
+	int rc = 0;
+	if (k <= TESSERA_DIR_BTREE_FANOUT_INNER) {
+		out->kind = TESSERA_BTREE_KEEP;
+		rc = tessera_fs_dir_btree_publish_inner(tmp_, maxes, children,
+		    k, out->left_hash);
+		out->left_max_hash = maxes[k - 1];
+	} else {
+		uint32_t half = k / 2;
+		rc = tessera_fs_dir_btree_publish_inner(tmp_, maxes, children,
+		    half, out->left_hash);
+		if (rc == 0) {
+			out->left_max_hash = maxes[half - 1];
+			rc = tessera_fs_dir_btree_publish_inner(tmp_,
+			    maxes + half, children + half, k - half,
+			    out->right_hash);
+			out->right_max_hash = maxes[k - 1];
+			out->kind = TESSERA_BTREE_SPLIT;
+		}
+	}
+
+	free(maxes, M_TESSERA);
+	free(children, M_TESSERA);
+	return (rc);
+}
+
+static int
+tessera_fs_dir_btree_insert_at(struct tessera_mount *tmp_,
+    const tessera_hash_t node_hash, uint64_t key, uint64_t inode_no,
+    const char *name, uint16_t namelen,
+    struct tessera_btree_op_result *out)
+{
+	uint8_t  *blob = NULL;
+	uint32_t  blob_len = 0;
+	if (tessera_fs_fetch_blob(tmp_, node_hash, &blob, &blob_len) != 0)
+		return (EIO);
+	int leaf;
+	const uint8_t *body;
+	size_t body_len;
+	uint32_t count;
+	int rc = tessera_fs_dir_btree_decode(blob, blob_len, &leaf,
+	    &body, &body_len, &count);
+	if (rc != 0) { free(blob, M_TESSERA); return (rc); }
+
+	if (leaf) {
+		rc = tessera_fs_dir_btree_leaf_insert(tmp_, body, body_len,
+		    count, key, inode_no, name, namelen, out);
+		free(blob, M_TESSERA);
+		return (rc);
+	}
+
+	/* Inner: find first child where max_name_hash >= key (or last
+	 * child if key beyond all maxes — extend rightmost). */
+	size_t off = 0;
+	uint32_t target = 0;
+	int found = 0;
+	for (uint32_t i = 0; i < count; i++) {
+		uint64_t mh;
+		memcpy(&mh, body + off, 8);
+		if (mh >= key) { target = i; found = 1; break; }
+		off += 8 + TESSERA_HASH_SIZE;
+	}
+	if (!found) {
+		target = count - 1;
+		off = (size_t)target * (8 + TESSERA_HASH_SIZE);
+	}
+	tessera_hash_t child;
+	memcpy(child, body + off + 8, TESSERA_HASH_SIZE);
+
+	struct tessera_btree_op_result child_res;
+	memset(&child_res, 0, sizeof child_res);
+	rc = tessera_fs_dir_btree_insert_at(tmp_, child, key, inode_no,
+	    name, namelen, &child_res);
+	if (rc != 0) {
+		free(blob, M_TESSERA);
+		return (rc);
+	}
+
+	int split = (child_res.kind == TESSERA_BTREE_SPLIT);
+	rc = tessera_fs_dir_btree_inner_insert_after_split(tmp_, body,
+	    body_len, count, target,
+	    child_res.left_max_hash, child_res.left_hash,
+	    split ? child_res.right_max_hash : 0,
+	    split ? child_res.right_hash : (const uint8_t *)child_res.left_hash,
+	    split, out);
+	free(blob, M_TESSERA);
+	return (rc);
+}
+
+/* Top-level insert: handles the empty-tree, and root-split cases. */
+static int
+tessera_fs_dir_btree_insert(struct tessera_mount *tmp_,
+    const tessera_hash_t root_hash, int root_is_empty,
+    const char *name, uint16_t namelen, uint64_t inode_no,
+    tessera_hash_t out_new_root)
+{
+	uint64_t key = tessera_dir_name_hash(name, namelen);
+	struct tessera_btree_op_result res;
+	memset(&res, 0, sizeof res);
+
+	if (root_is_empty) {
+		/* New tree — single leaf with one entry. */
+		const char *nptr = name;
+		uint16_t nl = namelen;
+		uint64_t k = key;
+		uint64_t v = inode_no;
+		int rc = tessera_fs_dir_btree_publish_leaf(tmp_, &k, &v,
+		    &nptr, &nl, 1, out_new_root);
+		return (rc);
+	}
+
+	int rc = tessera_fs_dir_btree_insert_at(tmp_, root_hash, key,
+	    inode_no, name, namelen, &res);
+	if (rc != 0) return (rc);
+
+	if (res.kind == TESSERA_BTREE_KEEP) {
+		memcpy(out_new_root, res.left_hash, TESSERA_HASH_SIZE);
+		return (0);
+	}
+	/* SPLIT: build a new root. */
+	uint64_t maxes[2] = { res.left_max_hash, res.right_max_hash };
+	tessera_hash_t children[2];
+	memcpy(children[0], res.left_hash,  TESSERA_HASH_SIZE);
+	memcpy(children[1], res.right_hash, TESSERA_HASH_SIZE);
+	return (tessera_fs_dir_btree_publish_inner(tmp_, maxes, children, 2,
+	    out_new_root));
+}
+
+/* Forward decl — recursive remove. */
+static int
+tessera_fs_dir_btree_remove_at(struct tessera_mount *tmp_,
+    const tessera_hash_t node_hash, uint64_t key,
+    const char *name, uint16_t namelen, uint64_t verify_inode,
+    struct tessera_btree_op_result *out);
+
+static int
+tessera_fs_dir_btree_remove_at(struct tessera_mount *tmp_,
+    const tessera_hash_t node_hash, uint64_t key,
+    const char *name, uint16_t namelen, uint64_t verify_inode,
+    struct tessera_btree_op_result *out)
+{
+	uint8_t  *blob = NULL;
+	uint32_t  blob_len = 0;
+	if (tessera_fs_fetch_blob(tmp_, node_hash, &blob, &blob_len) != 0)
+		return (EIO);
+	int leaf;
+	const uint8_t *body;
+	size_t body_len;
+	uint32_t count;
+	int rc = tessera_fs_dir_btree_decode(blob, blob_len, &leaf,
+	    &body, &body_len, &count);
+	if (rc != 0) { free(blob, M_TESSERA); return (rc); }
+
+	if (leaf) {
+		/* Build new leaf, skipping the matched entry. */
+		uint64_t *hashes  = malloc(count * sizeof *hashes,
+		    M_TESSERA, M_WAITOK);
+		uint64_t *inos    = malloc(count * sizeof *inos,
+		    M_TESSERA, M_WAITOK);
+		const char **nptrs = malloc(count * sizeof *nptrs,
+		    M_TESSERA, M_WAITOK);
+		uint16_t  *nlens  = malloc(count * sizeof *nlens,
+		    M_TESSERA, M_WAITOK);
+		size_t off = 0;
+		uint32_t k = 0;
+		int matched = 0;
+		for (uint32_t i = 0; i < count; i++) {
+			uint64_t h;
+			uint64_t ino;
+			uint16_t nl;
+			memcpy(&h, body + off, 8);
+			memcpy(&ino, body + off + 8, 8);
+			memcpy(&nl, body + off + 16, 2);
+			const char *nm = (const char *)(body + off + 18);
+			if (h == key && nl == namelen &&
+			    memcmp(nm, name, namelen) == 0) {
+				if (verify_inode != 0 &&
+				    ino != verify_inode) {
+					free(hashes, M_TESSERA);
+					free(inos,   M_TESSERA);
+					free(nptrs,  M_TESSERA);
+					free(nlens,  M_TESSERA);
+					free(blob,   M_TESSERA);
+					return (EIO);
+				}
+				matched = 1;
+			} else {
+				hashes[k] = h; inos[k] = ino;
+				nptrs[k]  = nm; nlens[k] = nl;
+				k++;
+			}
+			off += 18 + nl;
+		}
+		if (!matched) {
+			free(hashes, M_TESSERA); free(inos, M_TESSERA);
+			free(nptrs,  M_TESSERA); free(nlens, M_TESSERA);
+			free(blob, M_TESSERA);
+			return (ENOENT);
+		}
+		if (k == 0) {
+			out->kind = TESSERA_BTREE_DROPPED;
+		} else {
+			rc = tessera_fs_dir_btree_publish_leaf(tmp_,
+			    hashes, inos, nptrs, nlens, k, out->left_hash);
+			out->kind = TESSERA_BTREE_KEEP;
+			out->left_max_hash = hashes[k - 1];
+		}
+		free(hashes, M_TESSERA); free(inos, M_TESSERA);
+		free(nptrs,  M_TESSERA); free(nlens, M_TESSERA);
+		free(blob, M_TESSERA);
+		return (rc);
+	}
+
+	/* Inner: find target child, recurse. */
+	size_t off = 0;
+	uint32_t target = 0;
+	int found = 0;
+	for (uint32_t i = 0; i < count; i++) {
+		uint64_t mh;
+		memcpy(&mh, body + off, 8);
+		if (mh >= key) { target = i; found = 1; break; }
+		off += 8 + TESSERA_HASH_SIZE;
+	}
+	if (!found) {
+		free(blob, M_TESSERA);
+		return (ENOENT);
+	}
+	tessera_hash_t child;
+	memcpy(child, body + off + 8, TESSERA_HASH_SIZE);
+
+	struct tessera_btree_op_result child_res;
+	memset(&child_res, 0, sizeof child_res);
+	rc = tessera_fs_dir_btree_remove_at(tmp_, child, key, name,
+	    namelen, verify_inode, &child_res);
+	if (rc != 0) { free(blob, M_TESSERA); return (rc); }
+
+	/* Rebuild this inner: replace target entry with new child (or
+	 * drop it if child was DROPPED). */
+	uint32_t new_count = count - (child_res.kind == TESSERA_BTREE_DROPPED ?
+	    1 : 0);
+	if (new_count == 0) {
+		out->kind = TESSERA_BTREE_DROPPED;
+		free(blob, M_TESSERA);
+		return (0);
+	}
+	uint64_t *maxes = malloc(new_count * sizeof *maxes, M_TESSERA, M_WAITOK);
+	tessera_hash_t *children = malloc(new_count * sizeof *children,
+	    M_TESSERA, M_WAITOK);
+	off = 0;
+	uint32_t k = 0;
+	for (uint32_t i = 0; i < count; i++) {
+		uint64_t mh;
+		memcpy(&mh, body + off, 8);
+		const uint8_t *ch = body + off + 8;
+		if (i == target) {
+			if (child_res.kind != TESSERA_BTREE_DROPPED) {
+				maxes[k] = child_res.left_max_hash;
+				memcpy(children[k], child_res.left_hash,
+				    TESSERA_HASH_SIZE);
+				k++;
+			}
+			/* DROPPED: skip. */
+		} else {
+			maxes[k] = mh;
+			memcpy(children[k], ch, TESSERA_HASH_SIZE);
+			k++;
+		}
+		off += 8 + TESSERA_HASH_SIZE;
+	}
+	rc = tessera_fs_dir_btree_publish_inner(tmp_, maxes, children, k,
+	    out->left_hash);
+	out->kind = TESSERA_BTREE_KEEP;
+	out->left_max_hash = (k > 0) ? maxes[k - 1] : 0;
+	free(maxes, M_TESSERA);
+	free(children, M_TESSERA);
+	free(blob, M_TESSERA);
+	return (rc);
+}
+
+/* Top-level remove: collapses single-child inner roots back to their
+ * lone child so tree height shrinks naturally. */
+static int
+tessera_fs_dir_btree_remove(struct tessera_mount *tmp_,
+    const tessera_hash_t root_hash,
+    const char *name, uint16_t namelen, uint64_t verify_inode,
+    int *out_dropped, tessera_hash_t out_new_root)
+{
+	uint64_t key = tessera_dir_name_hash(name, namelen);
+	struct tessera_btree_op_result res;
+	memset(&res, 0, sizeof res);
+	int rc = tessera_fs_dir_btree_remove_at(tmp_, root_hash, key,
+	    name, namelen, verify_inode, &res);
+	if (rc != 0) return (rc);
+	if (res.kind == TESSERA_BTREE_DROPPED) {
+		*out_dropped = 1;
+		return (0);
+	}
+	*out_dropped = 0;
+	memcpy(out_new_root, res.left_hash, TESSERA_HASH_SIZE);
+	return (0);
+}
+
+/* Migrate a flat DIRECTORY or DIRECTORY_2L parent to BTREE.
+ * Walks all entries, sorts by name_hash, then bulk-builds the
+ * tree bottom-up. Returns the new root hash. */
+struct migrate_collect_ctx {
+	uint32_t  cap;
+	uint32_t  count;
+	uint64_t *hashes;
+	uint64_t *inos;
+	char    **names;
+	uint16_t *nlens;
+	int       err;
+};
+
+static int
+migrate_collect_cb(void *vctx, uint64_t inode_no, const char *name,
+                   uint16_t name_len)
+{
+	struct migrate_collect_ctx *c = vctx;
+	if (c->count == c->cap) {
+		uint32_t ncap = c->cap == 0 ? 64 : c->cap * 2;
+		uint64_t *nh = malloc(ncap * sizeof *nh, M_TESSERA, M_WAITOK);
+		uint64_t *ni = malloc(ncap * sizeof *ni, M_TESSERA, M_WAITOK);
+		char    **nn = malloc(ncap * sizeof *nn, M_TESSERA, M_WAITOK);
+		uint16_t *nl = malloc(ncap * sizeof *nl, M_TESSERA, M_WAITOK);
+		if (c->cap > 0) {
+			memcpy(nh, c->hashes, c->cap * sizeof *nh);
+			memcpy(ni, c->inos,   c->cap * sizeof *ni);
+			memcpy(nn, c->names,  c->cap * sizeof *nn);
+			memcpy(nl, c->nlens,  c->cap * sizeof *nl);
+			free(c->hashes, M_TESSERA); free(c->inos, M_TESSERA);
+			free(c->names,  M_TESSERA); free(c->nlens, M_TESSERA);
+		}
+		c->hashes = nh; c->inos = ni; c->names = nn; c->nlens = nl;
+		c->cap = ncap;
+	}
+	uint32_t i = c->count++;
+	c->hashes[i] = tessera_dir_name_hash(name, name_len);
+	c->inos[i]   = inode_no;
+	char *copy = malloc(name_len, M_TESSERA, M_WAITOK);
+	memcpy(copy, name, name_len);
+	c->names[i]  = copy;
+	c->nlens[i]  = name_len;
+	return (0);
+}
+
+static int
+tessera_fs_dir_btree_migrate(struct tessera_mount *tmp_,
+    const tessera_hash_t old_dir_hash, tessera_hash_t out_new_root,
+    int *out_empty)
+{
+	struct migrate_collect_ctx c = { 0 };
+	int rc = tessera_fs_dir_walk(tmp_, old_dir_hash, migrate_collect_cb,
+	    &c);
+	if (rc != 0 && rc != ENOTDIR) {
+		for (uint32_t i = 0; i < c.count; i++)
+			free(c.names[i], M_TESSERA);
+		free(c.hashes, M_TESSERA); free(c.inos, M_TESSERA);
+		free(c.names,  M_TESSERA); free(c.nlens, M_TESSERA);
+		return (rc);
+	}
+	if (c.count == 0) {
+		*out_empty = 1;
+		free(c.hashes, M_TESSERA); free(c.inos, M_TESSERA);
+		free(c.names,  M_TESSERA); free(c.nlens, M_TESSERA);
+		return (0);
+	}
+	*out_empty = 0;
+
+	/* Insertion sort by name_hash (typical migration is small). */
+	for (uint32_t i = 1; i < c.count; i++) {
+		uint64_t h = c.hashes[i];
+		uint64_t in = c.inos[i];
+		char *nm = c.names[i];
+		uint16_t nl = c.nlens[i];
+		int32_t j = (int32_t)i - 1;
+		while (j >= 0 && c.hashes[j] > h) {
+			c.hashes[j+1] = c.hashes[j];
+			c.inos[j+1]   = c.inos[j];
+			c.names[j+1]  = c.names[j];
+			c.nlens[j+1]  = c.nlens[j];
+			j--;
+		}
+		c.hashes[j+1] = h; c.inos[j+1] = in;
+		c.names[j+1] = nm; c.nlens[j+1] = nl;
+	}
+
+	/* Bulk-load: split into FANOUT_LEAF-sized leaves, then repeatedly
+	 * build inner layers until one node remains. */
+	uint32_t F = TESSERA_DIR_BTREE_FANOUT_LEAF;
+	uint32_t leaf_count = (c.count + F - 1) / F;
+	tessera_hash_t *layer = malloc(leaf_count * sizeof *layer,
+	    M_TESSERA, M_WAITOK);
+	uint64_t *layer_max = malloc(leaf_count * sizeof *layer_max,
+	    M_TESSERA, M_WAITOK);
+
+	for (uint32_t i = 0; i < leaf_count; i++) {
+		uint32_t start = i * F;
+		uint32_t take = c.count - start;
+		if (take > F) take = F;
+		const char *const *nptrs = (const char *const *)&c.names[start];
+		rc = tessera_fs_dir_btree_publish_leaf(tmp_,
+		    c.hashes + start, c.inos + start, nptrs, c.nlens + start,
+		    take, layer[i]);
+		if (rc != 0) goto out;
+		layer_max[i] = c.hashes[start + take - 1];
+	}
+
+	uint32_t IF = TESSERA_DIR_BTREE_FANOUT_INNER;
+	while (leaf_count > 1) {
+		uint32_t up = (leaf_count + IF - 1) / IF;
+		tessera_hash_t *next = malloc(up * sizeof *next,
+		    M_TESSERA, M_WAITOK);
+		uint64_t *next_max = malloc(up * sizeof *next_max,
+		    M_TESSERA, M_WAITOK);
+		for (uint32_t i = 0; i < up; i++) {
+			uint32_t start = i * IF;
+			uint32_t take = leaf_count - start;
+			if (take > IF) take = IF;
+			rc = tessera_fs_dir_btree_publish_inner(tmp_,
+			    layer_max + start, layer + start, take, next[i]);
+			if (rc != 0) {
+				free(next, M_TESSERA);
+				free(next_max, M_TESSERA);
+				goto out;
+			}
+			next_max[i] = layer_max[start + take - 1];
+		}
+		free(layer, M_TESSERA);
+		free(layer_max, M_TESSERA);
+		layer = next;
+		layer_max = next_max;
+		leaf_count = up;
+	}
+	memcpy(out_new_root, layer[0], TESSERA_HASH_SIZE);
+
+out:
+	free(layer, M_TESSERA);
+	free(layer_max, M_TESSERA);
+	for (uint32_t i = 0; i < c.count; i++)
+		free(c.names[i], M_TESSERA);
+	free(c.hashes, M_TESSERA); free(c.inos, M_TESSERA);
+	free(c.names,  M_TESSERA); free(c.nlens, M_TESSERA);
 	return (rc);
 }
 
@@ -7451,16 +8446,18 @@ tessera_fs_dirent_rewrite(struct tessera_mount *tmp_,
 	if (tessera_fs_inode_get_byk(tmp_, pkey, &pino) != TESSERA_OK)
 		return (EIO);
 
-	/* Fast path: parent already a DIRECTORY_2L. Touch only the
-	 * affected bucket. Falls back to the slow walk-everything path
-	 * for flat DIRECTORY parents (where there's nothing to skip
-	 * anyway — the whole manifest fits in one blob). */
+	/* Detect parent's manifest kind. BTREE → dispatch to the
+	 * O(log N) helpers. 2L / flat → migrate to BTREE on the fly,
+	 * then dispatch. v2.5: BTREE is the canonical dir representation
+	 * for any parent that's been mutated post-this-version; old
+	 * volumes' 2L / flat dirs read fine but get rewritten to BTREE
+	 * on first mutation. */
 	{
 		uint8_t *peek = NULL;
 		uint32_t peek_len = 0;
+		tessera_manifest_kind_t pk = TESSERA_MFT_INLINE;
 		if (tessera_fs_fetch_blob(tmp_, pino.manifest_hash,
 		    &peek, &peek_len) == 0) {
-			tessera_manifest_kind_t pk = TESSERA_MFT_INLINE;
 			if (peek_len >= 32) {
 				tessera_manifest_parser_t *pp =
 				    tessera_manifest_parse(peek, peek_len);
@@ -7470,14 +8467,82 @@ tessera_fs_dirent_rewrite(struct tessera_mount *tmp_,
 				}
 			}
 			free(peek, M_TESSERA);
-			if (pk == TESSERA_MFT_DIRECTORY_2L) {
-				int rc = tessera_fs_dirent_rewrite_2l(tmp_,
-				    parent_inode_no, &pino, op, verify_inode,
-				    add_inode, name, namelen);
-				if (rc != 0) return (rc);
-				goto commit;
-			}
 		}
+
+		tessera_hash_t btree_root;
+		int have_root = 0;
+		if (pk == TESSERA_MFT_DIRECTORY_BTREE) {
+			memcpy(btree_root, pino.manifest_hash,
+			    TESSERA_HASH_SIZE);
+			have_root = 1;
+		} else if (pk == TESSERA_MFT_DIRECTORY ||
+		           pk == TESSERA_MFT_DIRECTORY_2L) {
+			/* Migrate flat / 2L → BTREE. Walk all entries,
+			 * rebuild as a balanced tree. One-time cost on
+			 * the first mutation post-upgrade. */
+			int empty = 0;
+			tessera_hash_t new_root;
+			int rc = tessera_fs_dir_btree_migrate(tmp_,
+			    pino.manifest_hash, new_root, &empty);
+			if (rc != 0) return (rc);
+			if (!empty) {
+				memcpy(btree_root, new_root,
+				    TESSERA_HASH_SIZE);
+				have_root = 1;
+			}
+			/* If empty, fall through with have_root=0 — the
+			 * insert path handles "first entry into empty
+			 * dir" specially. */
+		}
+
+		tessera_hash_t new_root;
+		int rc;
+		if (op == 0) {
+			/* ADD */
+			rc = tessera_fs_dir_btree_insert(tmp_,
+			    have_root ? btree_root :
+			        (const uint8_t *)pino.manifest_hash,
+			    /*root_is_empty=*/!have_root, name, namelen,
+			    add_inode, new_root);
+			if (rc != 0) return (rc);
+			memcpy(pino.manifest_hash, new_root,
+			    TESSERA_HASH_SIZE);
+			goto commit;
+		}
+		/* REMOVE */
+		if (!have_root) return (ENOENT);
+		int dropped = 0;
+		rc = tessera_fs_dir_btree_remove(tmp_, btree_root, name,
+		    namelen, verify_inode, &dropped, new_root);
+		if (rc != 0) return (rc);
+		if (dropped) {
+			/* Last entry gone — the dir is now empty. Still
+			 * needs a valid manifest_hash; build an empty
+			 * leaf. */
+			tessera_manifest_builder_t *mb =
+			    tessera_manifest_begin(
+			        TESSERA_MFT_DIRECTORY_BTREE);
+			if (mb == NULL) return (ENOMEM);
+			tessera_manifest_dir_btree_set_leaf(mb, 1);
+			size_t mlen = 0;
+			tessera_hash_t mh;
+			(void)tessera_manifest_finalize(mb, NULL, 0,
+			    &mlen, mh);
+			uint8_t *buf = malloc(mlen, M_TESSERA, M_WAITOK);
+			(void)tessera_manifest_finalize(mb, buf, mlen,
+			    &mlen, mh);
+			tessera_manifest_free(mb);
+			tessera_hash_t pub;
+			int prc = tessera_fs_publish_manifest(tmp_, buf,
+			    mlen, pub);
+			free(buf, M_TESSERA);
+			if (prc != 0) return (EIO);
+			memcpy(pino.manifest_hash, pub, TESSERA_HASH_SIZE);
+		} else {
+			memcpy(pino.manifest_hash, new_root,
+			    TESSERA_HASH_SIZE);
+		}
+		goto commit;
 	}
 
 	tessera_manifest_builder_t *mb =

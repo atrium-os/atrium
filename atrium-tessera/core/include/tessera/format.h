@@ -306,7 +306,37 @@ typedef enum {
 	 * a threshold (~4 KiB). Lookup: hash(name) → binary-search
 	 * outer for largest first_hash ≤ hash → descend into bucket. */
 	TESSERA_MFT_DIRECTORY_2L  = 8,
+	/* v2.5 (added 2026-05-02): content-addressed B+tree directory.
+	 * Each node is its own manifest blob. Inner nodes hold sorted
+	 * (max_name_hash, child_node_hash) records; leaf nodes hold
+	 * sorted (name_hash, name, inode_no) records. The dir's
+	 * manifest_hash points at the root node. Mutation = COW path
+	 * of O(log_F N) nodes; lookup = O(log_F N) descent. F = fanout
+	 * (~32 leaf entries / ~64 inner entries per node).
+	 *
+	 * Replaces DIRECTORY_2L for new mutations. The 2L code paths
+	 * stay for read compatibility with older volumes; the first
+	 * mutation on a 2L parent walks all entries and rebuilds as
+	 * BTREE. */
+	TESSERA_MFT_DIRECTORY_BTREE = 9,
 } tessera_manifest_kind_t;
+
+/* DIRECTORY_BTREE node header — first 8 bytes after the manifest's
+ * 32-byte common header. Body is `count` records following the
+ * header. Records are 40 B each for inner, variable for leaf:
+ *
+ *   inner record (40 B): u64 max_name_hash, tessera_hash_t child_hash
+ *   leaf  record (var):  u64 name_hash, u16 name_len, name bytes,
+ *                        u64 inode_no
+ */
+typedef struct TESSERA_PACKED {
+	uint8_t   leaf_flag;     /* 0 = inner, 1 = leaf */
+	uint8_t   reserved[3];
+	uint32_t  count;
+} tessera_dir_btree_node_header_t;
+
+#define TESSERA_DIR_BTREE_FANOUT_LEAF   32u   /* split when leaf > this */
+#define TESSERA_DIR_BTREE_FANOUT_INNER  64u   /* split when inner > this */
 
 /* ── Directory bucket record (40 bytes/entry, kind=DIRECTORY_2L) ── */
 
