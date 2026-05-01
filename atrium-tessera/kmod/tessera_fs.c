@@ -94,6 +94,16 @@ static struct tessera_mount *tessera_singleton_mount = NULL;
  * Used to deterministically create MULTI_EXTENT packs for repack tests
  * without having to organically fragment the data zone first. */
 static int tessera_force_multi_extent = 0;
+/* C2/C3 — background trigger + mount-time safety net thresholds.
+ * Declared early so mark_dirty (line ~3400) and mountfs (line ~1350)
+ * can see them; the SYSCTL_INT macros that expose them are deeper in
+ * the file. */
+static int tessera_repack_threshold = 50;
+static int tessera_repack_severe_threshold = 500;
+static int tessera_repack_bg_max_packs = 5;
+static int tessera_repack_bg_max_time_ms = 100;
+static int tessera_repack_mount_max_packs = 100;
+static int tessera_repack_mount_max_time_ms = 1000;
 SYSCTL_INT(_kern_tessera, OID_AUTO, force_multi_extent,
     CTLFLAG_RW, &tessera_force_multi_extent, 0,
     "Force pack allocator to take the multi-extent fallback path (debug)");
@@ -433,6 +443,12 @@ static int tessera_fs_inode_unlink(struct tessera_mount *tmp_,
 static int  tessera_fs_flush     (struct tessera_mount *tmp_);
 static void tessera_fs_mark_dirty(struct tessera_mount *tmp_);
 static void tessera_fs_flush_task(void *ctx, int pending);
+static void tessera_fs_repack_task(void *ctx, int pending);
+static int  tessera_fs_repack_pass(struct tessera_mount *tmp_,
+                                   uint32_t max_packs, uint32_t max_time_ms,
+                                   uint32_t *out_repacked);
+static int  tessera_fs_count_multi_extent(struct tessera_mount *tmp_,
+                                          uint32_t *out_count);
 
 /* v2-step-3a: chunked-write helpers. */
 struct tessera_chunk_in {
@@ -632,6 +648,20 @@ struct tessera_mount {
 	int                       flush_unmounting;  /* don't rearm callout */
 	struct callout            flush_co;
 	struct task               flush_task;
+
+	/* v2 repack engine slice 3: background trigger.
+	 * multi_extent_pack_count tracks how many MULTI_EXTENT-flagged
+	 * packs live in the registry. Maintained as a delta:
+	 * pack_alloc_and_write's multi path increments on success,
+	 * tessera_fs_repack_one_pack decrements on success. Initial
+	 * value is set at mount time by walking the registry once.
+	 *
+	 * mark_dirty arms `repack_task` (background taskqueue) when the
+	 * count exceeds tessera_repack_threshold. The handler runs a
+	 * bounded repack pass and re-arms if more work remains. */
+	uint32_t                  multi_extent_pack_count;
+	struct task               repack_task;
+	int                       repack_task_init;
 
 	/* v2 polish: fsync group-commit. Multiple processes calling
 	 * fsync (or vop_fsync via the deferred-flush callout) coalesce
@@ -1007,6 +1037,9 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	 * to be cancelled by unmount even if the FS never sees a write. */
 	callout_init(&tmp_->flush_co, 1);
 	TASK_INIT(&tmp_->flush_task, 0, tessera_fs_flush_task, tmp_);
+	TASK_INIT(&tmp_->repack_task, 0, tessera_fs_repack_task, tmp_);
+	tmp_->repack_task_init = 1;
+	tmp_->multi_extent_pack_count = 0;
 	mtx_init(&tmp_->flush_mtx, "tess_flush", NULL, MTX_DEF);
 	tmp_->flush_mtx_init = 1;
 	tmp_->flush_co_init = 1;
@@ -1313,6 +1346,34 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	 * the test reality; multi-mount support if needed later iterates
 	 * via vfs_busyfs. */
 	tessera_singleton_mount = tmp_;
+
+	/* C2/C3 — seed multi_extent_pack_count from the registry, then
+	 * if it's above the severe threshold, run a bounded synchronous
+	 * repack pass before mount returns. Caps at 100 packs / 1 s by
+	 * default; extra work happens in the background after first
+	 * writes. Skipped on read-only forensic mounts. */
+	if (!tmp_->readonly_snapshot) {
+		uint32_t mc = 0;
+		(void)tessera_fs_count_multi_extent(tmp_, &mc);
+		tmp_->multi_extent_pack_count = mc;
+		if (mc > 0)
+			printf("tessera_fs: %u MULTI_EXTENT pack(s) at mount\n", mc);
+		if ((int)mc > tessera_repack_severe_threshold) {
+			uint32_t budget_packs =
+			    (uint32_t)tessera_repack_mount_max_packs;
+			uint32_t budget_ms =
+			    (uint32_t)tessera_repack_mount_max_time_ms;
+			if (budget_packs == 0) budget_packs = 100;
+			if (budget_ms == 0) budget_ms = 1000;
+			uint32_t repacked = 0;
+			printf("tessera_fs: mount-time repack — %u packs over "
+			    "threshold %d, running bounded pass (%u/%u)\n",
+			    mc, tessera_repack_severe_threshold,
+			    budget_packs, budget_ms);
+			(void)tessera_fs_repack_pass(tmp_, budget_packs,
+			    budget_ms, &repacked);
+		}
+	}
 	mp->mnt_stat.f_namemax = TESSERA_PATH_NAME_MAX;
 	mp->mnt_flag |= MNT_LOCAL;
 	if (tmp_->readonly_snapshot)
@@ -1462,6 +1523,10 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 			callout_drain(&tmp_->flush_co);
 			taskqueue_drain(taskqueue_thread, &tmp_->flush_task);
 			(void)tessera_fs_flush(tmp_);
+		}
+		if (tmp_->repack_task_init) {
+			taskqueue_drain(taskqueue_thread, &tmp_->repack_task);
+			tmp_->repack_task_init = 0;
 		}
 		/* Drain any leftover dirty inodes (best-effort) — the
 		 * final flush above should have cleared them, but if
@@ -3344,6 +3409,17 @@ tessera_fs_mark_dirty(struct tessera_mount *tmp_)
 	    (used - free) * 2 >= cap) {
 		(void)tessera_fs_flush(tmp_);
 	}
+
+	/* C2 — background repack trigger. Cheap check on every dirty
+	 * mutation: if MULTI_EXTENT-flagged pack count crosses the
+	 * threshold, arm the background task. taskqueue_enqueue is a
+	 * no-op when the task is already pending or running, so
+	 * spamming it on every mutation is fine. */
+	if (tmp_->repack_task_init && !tmp_->flush_unmounting &&
+	    tmp_->multi_extent_pack_count >
+	        (uint32_t)tessera_repack_threshold) {
+		(void)taskqueue_enqueue(taskqueue_thread, &tmp_->repack_task);
+	}
 }
 
 /* v2 step-2b: dirty-inode write-back. inode_get/put/delete go through
@@ -4681,6 +4757,7 @@ tessera_fs_pack_alloc_and_write(struct tessera_mount *tmp_,
 	out->length_sectors = n_sectors;
 	out->flags = TESSERA_REGISTRY_FLAG_SEALED |
 	             TESSERA_REGISTRY_FLAG_MULTI_EXTENT;
+	tmp_->multi_extent_pack_count++;
 	free(pel_buf, M_TESSERA);
 	free(pel, M_TESSERA);
 	free(lengths, M_TESSERA);
@@ -4877,6 +4954,15 @@ tessera_fs_repack_one_pack(struct tessera_mount *tmp_,
 	    re.start_sector, 1);   /* old PEL was 1 sector */
 	free(old_exts, M_TESSERA);
 
+	/* Counter delta: this pack was MULTI_EXTENT before (we wouldn't
+	 * have entered this helper otherwise). Decrement once for the
+	 * OLD entry; pack_alloc_and_write already incremented for the
+	 * NEW entry if it took the multi path. Net effect:
+	 *   contig new → -1 (the desired drop)
+	 *   multi  new → -1 + +1 = 0 (still fragmented, count unchanged) */
+	if (tmp_->multi_extent_pack_count > 0)
+		tmp_->multi_extent_pack_count--;
+
 	printf("tessera_fs: repacked pack — was %u extents, now %s "
 	    "(new start %llu, len %llu sectors)\n",
 	    old_nexts,
@@ -5031,6 +5117,85 @@ SYSCTL_PROC(_kern_tessera, OID_AUTO, repack_now,
     CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
     NULL, 0, tessera_sysctl_repack_now, "I",
     "Write N to run a bounded repack pass (max N packs, 30s) on the active mount");
+
+SYSCTL_INT(_kern_tessera, OID_AUTO, repack_threshold,
+    CTLFLAG_RW, &tessera_repack_threshold, 0,
+    "Background repack arms when MULTI_EXTENT pack count exceeds this");
+SYSCTL_INT(_kern_tessera, OID_AUTO, repack_severe_threshold,
+    CTLFLAG_RW, &tessera_repack_severe_threshold, 0,
+    "Mount-time synchronous repack pass runs when count exceeds this");
+SYSCTL_INT(_kern_tessera, OID_AUTO, repack_bg_max_packs,
+    CTLFLAG_RW, &tessera_repack_bg_max_packs, 0,
+    "Max packs per background repack invocation");
+SYSCTL_INT(_kern_tessera, OID_AUTO, repack_bg_max_time_ms,
+    CTLFLAG_RW, &tessera_repack_bg_max_time_ms, 0,
+    "Max wallclock ms per background repack invocation");
+SYSCTL_INT(_kern_tessera, OID_AUTO, repack_mount_max_packs,
+    CTLFLAG_RW, &tessera_repack_mount_max_packs, 0,
+    "Max packs in mount-time synchronous safety-net pass");
+SYSCTL_INT(_kern_tessera, OID_AUTO, repack_mount_max_time_ms,
+    CTLFLAG_RW, &tessera_repack_mount_max_time_ms, 0,
+    "Max wallclock ms in mount-time synchronous safety-net pass");
+
+/*
+ * Background repack handler — runs on the kernel taskqueue when
+ * mark_dirty observes multi_extent_pack_count > threshold. Bounded
+ * (default 5 packs / 100 ms). If more work remains after the pass,
+ * re-arms itself; the next mark_dirty would also re-arm regardless.
+ * Bails out if the FS is unmounting.
+ */
+static void
+tessera_fs_repack_task(void *ctx, int pending)
+{
+	(void)pending;
+	struct tessera_mount *tmp_ = ctx;
+	if (tmp_ == NULL || tmp_->flush_unmounting) return;
+	if (tmp_->pack_registry_tree == NULL) return;
+
+	uint32_t budget_packs = (uint32_t)tessera_repack_bg_max_packs;
+	uint32_t budget_ms = (uint32_t)tessera_repack_bg_max_time_ms;
+	if (budget_packs == 0) budget_packs = 5;
+	if (budget_ms == 0) budget_ms = 100;
+	uint32_t repacked = 0;
+	(void)tessera_fs_repack_pass(tmp_, budget_packs, budget_ms,
+	    &repacked);
+
+	if (!tmp_->flush_unmounting &&
+	    tmp_->multi_extent_pack_count >
+	        (uint32_t)tessera_repack_threshold) {
+		(void)taskqueue_enqueue(taskqueue_thread, &tmp_->repack_task);
+	}
+}
+
+/*
+ * Walk pack_registry once and count MULTI_EXTENT-flagged entries.
+ * Used at mount time to seed multi_extent_pack_count and decide
+ * whether to run the safety-net pass.
+ */
+static int
+tessera_fs_count_multi_extent(struct tessera_mount *tmp_, uint32_t *out_count)
+{
+	*out_count = 0;
+	if (tmp_->pack_registry_tree == NULL) return (0);
+	tessera_btree_cursor_t *c =
+	    tessera_btree_seek_first(tmp_->pack_registry_tree);
+	if (c == NULL) return (0);
+	uint32_t n = 0;
+	for (;;) {
+		uint8_t key[16];
+		uint8_t value[TESSERA_REGISTRY_ENTRY_SIZE];
+		if (tessera_btree_cursor_get(c, key, value) != TESSERA_OK)
+			break;
+		tessera_registry_entry_t re;
+		if (tessera_decode_registry_entry(value, &re) == TESSERA_OK &&
+		    (re.flags & TESSERA_REGISTRY_FLAG_MULTI_EXTENT) != 0)
+			n++;
+		if (tessera_btree_cursor_next(c) != TESSERA_OK) break;
+	}
+	tessera_btree_cursor_free(c);
+	*out_count = n;
+	return (0);
+}
 
 static int
 tessera_fs_repack_first_multi(struct tessera_mount *tmp_)
