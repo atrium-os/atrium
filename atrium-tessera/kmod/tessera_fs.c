@@ -84,6 +84,20 @@ MALLOC_DEFINE(M_TESSERA, "tessera", "Tessera filesystem");
  */
 static SYSCTL_NODE(_kern, OID_AUTO, tessera,
     CTLFLAG_RW | CTLFLAG_MPSAFE, NULL, "Tessera filesystem");
+/* Singleton ref to the most-recently-mounted tessera. Used by debug /
+ * test sysctls (kern.tessera.repack_one) that need to reach the live
+ * mount without iterating mountlist. NULL when nothing's mounted. */
+static struct tessera_mount *tessera_singleton_mount = NULL;
+
+/* Debug knob: when non-zero, tessera_fs_pack_alloc_and_write skips the
+ * contig fast path and goes straight to the multi-extent allocator.
+ * Used to deterministically create MULTI_EXTENT packs for repack tests
+ * without having to organically fragment the data zone first. */
+static int tessera_force_multi_extent = 0;
+SYSCTL_INT(_kern_tessera, OID_AUTO, force_multi_extent,
+    CTLFLAG_RW, &tessera_force_multi_extent, 0,
+    "Force pack allocator to take the multi-extent fallback path (debug)");
+
 static int tessera_skip_next_sb = 0;
 SYSCTL_INT(_kern_tessera, OID_AUTO, skip_next_sb,
     CTLFLAG_RW, &tessera_skip_next_sb, 0,
@@ -1293,6 +1307,12 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	}
 
 	mp->mnt_data = tmp_;
+	/* B1 test hook: stash the most-recently-mounted tessera in a
+	 * file-static so the kern.tessera.repack_one sysctl can reach
+	 * it without walking the mount list. Single-tessera per host is
+	 * the test reality; multi-mount support if needed later iterates
+	 * via vfs_busyfs. */
+	tessera_singleton_mount = tmp_;
 	mp->mnt_stat.f_namemax = TESSERA_PATH_NAME_MAX;
 	mp->mnt_flag |= MNT_LOCAL;
 	if (tmp_->readonly_snapshot)
@@ -1428,6 +1448,9 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 	if (mntflags & MNT_FORCE) flags |= FORCECLOSE;
 	err = vflush(mp, 0, flags, curthread);
 	if (err != 0) return (err);
+
+	if (tessera_singleton_mount == tmp_)
+		tessera_singleton_mount = NULL;
 
 	if (tmp_ != NULL) {
 		/* v2-step-2a: stop accepting new flushes, drain any in-flight
@@ -4538,9 +4561,12 @@ tessera_fs_pack_alloc_and_write(struct tessera_mount *tmp_,
 {
 	if (tmp_->extent_alloc == NULL) return (EROFS);
 
-	/* Fast path — single contiguous allocation. */
+	/* Fast path — single contiguous allocation. Skipped when the
+	 * force_multi_extent debug knob is set, so tests can
+	 * deterministically create MULTI_EXTENT packs. */
 	uint64_t contig_start = 0;
-	int r = tessera_extent_alloc(tmp_->extent_alloc, n_sectors,
+	int r = tessera_force_multi_extent ? TESSERA_ENOSPC :
+	    tessera_extent_alloc(tmp_->extent_alloc, n_sectors,
 	    &contig_start);
 	if (r == TESSERA_OK) {
 		for (uint64_t i = 0; i < n_sectors; i++) {
@@ -4700,6 +4726,222 @@ tessera_fs_pack_extents_resolve(struct tessera_mount *tmp_,
 		extents_out[i] = pel.extents[i];
 	*out_count = pel.extent_count;
 	return (0);
+}
+
+/*
+ * Repack a single multi-extent pack into a (preferably contiguous)
+ * fresh allocation. Same `pack_id` — the registry update is a single
+ * btree_put on the same key. Crash anywhere is safe: old extents +
+ * old PEL stay on disk and registered until step 4 (the btree_put)
+ * commits; if we crash before, the new copy is orphan that mount-
+ * time GC will reclaim. After step 4, the old extents are
+ * unreferenced; we free them in step 5.
+ *
+ *   1. Look up registry entry by pack_id.
+ *   2. If not MULTI_EXTENT — no-op success.
+ *   3. Resolve current extents, read pack body into a kernel buf.
+ *   4. tessera_fs_pack_alloc_and_write writes the body to a fresh
+ *      location and returns the new (start, length, flags). The
+ *      contig-first fallback in that helper means a successful
+ *      repack will be single-extent if any contig run fits, or a
+ *      smaller-extent-count multi otherwise. Either way an
+ *      improvement.
+ *   5. btree_put the updated registry entry. **Commit point.**
+ *   6. Free old extents (each entry from the old PEL) and the old
+ *      PEL sector.
+ *
+ * Returns 0 on success or no-op-needed, errno otherwise. Sets
+ * *out_was_repacked to 1 if a real repack happened (caller's stats).
+ */
+static int
+tessera_fs_repack_one_pack(struct tessera_mount *tmp_,
+                           const uint8_t pack_id[16],
+                           int *out_was_repacked)
+{
+	if (out_was_repacked != NULL) *out_was_repacked = 0;
+	if (tmp_->pack_registry_tree == NULL) return (EROFS);
+
+	uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
+	if (tessera_btree_get(tmp_->pack_registry_tree, pack_id, reg_value)
+	    != TESSERA_OK)
+		return (ENOENT);
+	tessera_registry_entry_t re;
+	if (tessera_decode_registry_entry(reg_value, &re) != TESSERA_OK)
+		return (EIO);
+
+	/* Only multi-extent packs are repack candidates. */
+	if ((re.flags & TESSERA_REGISTRY_FLAG_MULTI_EXTENT) == 0)
+		return (0);
+
+	/* Resolve the current extents — we'll need them for both reading
+	 * the old body and freeing them at the end. */
+	tessera_pack_extent_t *old_exts = malloc(
+	    TESSERA_PEL_MAX_EXTENTS * sizeof(*old_exts),
+	    M_TESSERA, M_WAITOK);
+	uint32_t old_nexts = 0;
+	if (tessera_fs_pack_extents_resolve(tmp_, &re, old_exts, &old_nexts)
+	    != 0) {
+		free(old_exts, M_TESSERA);
+		return (EIO);
+	}
+
+	/* Materialise the pack body. */
+	const size_t body_len =
+	    (size_t)re.length_sectors * TESSERA_SECTOR_SIZE;
+	uint8_t *body = malloc(body_len, M_TESSERA, M_WAITOK);
+	int read_ok = 1;
+	uint64_t cursor = 0;
+	for (uint32_t e = 0; e < old_nexts && read_ok; e++) {
+		for (uint64_t i = 0; i < old_exts[e].length_sectors; i++) {
+			struct buf *bp = NULL;
+			int err = bread(tmp_->devvp,
+			    (old_exts[e].start_sector + i) *
+			        btodb(TESSERA_SECTOR_SIZE),
+			    TESSERA_SECTOR_SIZE,
+			    tmp_->bio_ctx.cred ?
+			        tmp_->bio_ctx.cred : NOCRED, &bp);
+			if (err != 0) {
+				if (bp != NULL) brelse(bp);
+				read_ok = 0;
+				break;
+			}
+			memcpy(body + (cursor + i) * TESSERA_SECTOR_SIZE,
+			    bp->b_data, TESSERA_SECTOR_SIZE);
+			brelse(bp);
+		}
+		cursor += old_exts[e].length_sectors;
+	}
+	if (!read_ok) {
+		free(body, M_TESSERA);
+		free(old_exts, M_TESSERA);
+		return (EIO);
+	}
+
+	/* Allocate + write a fresh location. The helper prefers contig
+	 * and falls back to multi only if contig fails — for repack this
+	 * is exactly what we want. */
+	struct tessera_pack_alloc_result pa;
+	int wrt = tessera_fs_pack_alloc_and_write(tmp_, body,
+	    re.length_sectors, &pa);
+	free(body, M_TESSERA);
+	if (wrt != 0) {
+		/* Couldn't allocate space — leave old layout intact. */
+		free(old_exts, M_TESSERA);
+		return (wrt);
+	}
+
+	/* Commit point: same pack_id, new layout, preserved metadata. */
+	tessera_registry_entry_t new_re = re;
+	new_re.start_sector   = pa.start_sector;
+	new_re.length_sectors = pa.length_sectors;
+	new_re.flags          = pa.flags;
+	uint8_t new_value[TESSERA_REGISTRY_ENTRY_SIZE];
+	if (tessera_encode_registry_entry(&new_re, new_value) != TESSERA_OK) {
+		/* Should not fail; defensive cleanup of the new copy. */
+		if ((pa.flags & TESSERA_REGISTRY_FLAG_MULTI_EXTENT) == 0) {
+			(void)tessera_extent_free(tmp_->extent_alloc,
+			    pa.start_sector, pa.length_sectors);
+		} else {
+			tessera_pack_extent_t *neexts = malloc(
+			    TESSERA_PEL_MAX_EXTENTS * sizeof(*neexts),
+			    M_TESSERA, M_WAITOK);
+			uint32_t nnexts = 0;
+			if (tessera_fs_pack_extents_resolve(tmp_, &new_re,
+			    neexts, &nnexts) == 0) {
+				for (uint32_t i = 0; i < nnexts; i++)
+					(void)tessera_extent_free(
+					    tmp_->extent_alloc,
+					    neexts[i].start_sector,
+					    neexts[i].length_sectors);
+			}
+			free(neexts, M_TESSERA);
+			(void)tessera_extent_free(tmp_->extent_alloc,
+			    pa.start_sector, 1);
+		}
+		free(old_exts, M_TESSERA);
+		return (EIO);
+	}
+	uint64_t new_pack_root = tmp_->sb.pack_registry_root;
+	if (tessera_btree_put(tmp_->pack_registry_tree, pack_id,
+	    new_value, &new_pack_root) != TESSERA_OK) {
+		free(old_exts, M_TESSERA);
+		return (EIO);
+	}
+	tmp_->sb.pack_registry_root = new_pack_root;
+
+	/* Past the commit point — free the OLD extents + old PEL. */
+	for (uint32_t e = 0; e < old_nexts; e++)
+		(void)tessera_extent_free(tmp_->extent_alloc,
+		    old_exts[e].start_sector, old_exts[e].length_sectors);
+	(void)tessera_extent_free(tmp_->extent_alloc,
+	    re.start_sector, 1);   /* old PEL was 1 sector */
+	free(old_exts, M_TESSERA);
+
+	printf("tessera_fs: repacked pack — was %u extents, now %s "
+	    "(new start %llu, len %llu sectors)\n",
+	    old_nexts,
+	    (pa.flags & TESSERA_REGISTRY_FLAG_MULTI_EXTENT) ? "multi" : "contig",
+	    (unsigned long long)pa.start_sector,
+	    (unsigned long long)pa.length_sectors);
+	if (out_was_repacked != NULL) *out_was_repacked = 1;
+	tessera_fs_mark_dirty(tmp_);
+	return (0);
+}
+
+/*
+ * Repack the first MULTI_EXTENT pack we find. Used by the
+ * `kern.tessera.repack_one` sysctl for B1 testing — picks any
+ * multi-extent pack rather than a specific id.
+ */
+static int tessera_fs_repack_first_multi(struct tessera_mount *tmp_);
+
+/*
+ * sysctl handler — write any non-zero value to trigger one repack.
+ * Reads back as 0. Returns the errno from the repack attempt as the
+ * sysctl write result so userspace can see it (`sysctl ... = 1` works,
+ * a failure shows up as e.g. `sysctl: ...: No such file or directory`
+ * for ENOENT).
+ */
+static int
+tessera_sysctl_repack_one(SYSCTL_HANDLER_ARGS)
+{
+	int trigger = 0;
+	int err = sysctl_handle_int(oidp, &trigger, 0, req);
+	if (err != 0 || req->newptr == NULL) return (err);
+	if (trigger == 0) return (0);
+	if (tessera_singleton_mount == NULL) return (ENXIO);
+	return (tessera_fs_repack_first_multi(tessera_singleton_mount));
+}
+SYSCTL_PROC(_kern_tessera, OID_AUTO, repack_one,
+    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+    NULL, 0, tessera_sysctl_repack_one, "I",
+    "Write 1 to repack one MULTI_EXTENT pack on the active tessera mount");
+
+static int
+tessera_fs_repack_first_multi(struct tessera_mount *tmp_)
+{
+	if (tmp_->pack_registry_tree == NULL) return (EROFS);
+	tessera_btree_cursor_t *c =
+	    tessera_btree_seek_first(tmp_->pack_registry_tree);
+	if (c == NULL) return (ENOENT);
+	int err = ENOENT;
+	for (;;) {
+		uint8_t key[16];
+		uint8_t value[TESSERA_REGISTRY_ENTRY_SIZE];
+		if (tessera_btree_cursor_get(c, key, value) != TESSERA_OK)
+			break;
+		tessera_registry_entry_t re;
+		if (tessera_decode_registry_entry(value, &re) == TESSERA_OK &&
+		    (re.flags & TESSERA_REGISTRY_FLAG_MULTI_EXTENT) != 0) {
+			tessera_btree_cursor_free(c);
+			int was = 0;
+			err = tessera_fs_repack_one_pack(tmp_, key, &was);
+			return (err);
+		}
+		if (tessera_btree_cursor_next(c) != TESSERA_OK) break;
+	}
+	tessera_btree_cursor_free(c);
+	return (err);
 }
 
 static int
