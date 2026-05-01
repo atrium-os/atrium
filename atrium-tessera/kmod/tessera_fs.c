@@ -2810,28 +2810,109 @@ tessera_vop_getpages(struct vop_getpages_args *ap)
 }
 
 /*
- * vop_putpages — placeholder. The default vop_stdputpages routes
- * through the buffer-cache strategy path and corrupts tessera data
- * (uninitialised pbuf pattern leaks into the manifest publish — the
- * 0xdeadc0de poison pattern shows up as file content). Returning
- * VM_PAGER_FAIL marks the pages as unflushable so the VM keeps the
- * dirty state in memory and msync/munmap surface EIO to userspace,
- * which is at least loud rather than silently corrupting the file.
+ * vop_putpages — write dirty VM pages back to the file.
  *
- * A real putpages implementation needs to drop VM_OBJECT_WLOCK before
- * invoking tessera's write path (which acquires vnode + flush_mtx +
- * does btree work) and re-acquire it before setting rtvals[] —
- * non-trivial. MAP_PRIVATE mappings (the exec/cp common case) don't
- * call here at all; only MAP_SHARED + msync / writeable munmap do.
+ * Don't go through VOP_WRITE: it calls vnode_pager_setsize on every
+ * write, which mutates the same VM object whose lock vnode_pager_putpages
+ * is holding around our call. Recursing through that path corrupts the
+ * VM object's page list and the next sf_buf_free/page-touch faults.
+ * NFS's vop_putpages takes the same shape — they call ncl_writerpc
+ * directly rather than VOP_WRITE.
  *
- * v2 polish ticket: implement a proper writeback that aggregates
- * adjacent dirty pages into one tessera_fs_replace_content call.
+ * Approach: read the existing file content into a kernel buffer, splice
+ * in the dirty pages at their respective offsets, route the result
+ * through tessera_fs_replace_content / replace_content_chunked
+ * directly. One republish per putpages call regardless of page count
+ * — tessera's content-addressed model rewrites the whole file anyway,
+ * so per-page granularity wouldn't save anything.
+ *
+ * Lock dance: vnode_pager_putpages drops VM_OBJECT_WLOCK before calling
+ * us and re-acquires after, so we don't touch it. Vnode lock is held
+ * by the caller in some paths and not in others; replace_content
+ * doesn't require it.
  */
 static int
 tessera_vop_putpages(struct vop_putpages_args *ap)
 {
-	(void)ap;
-	return (VM_PAGER_ERROR);
+	struct vnode *vp     = ap->a_vp;
+	vm_page_t   *ma      = ap->a_m;
+	/* a_count is in BYTES (vnode_pager_putpages passes bytes; this
+	 * differs from a_count in vop_getpages which passes pages). */
+	int          npages  = ap->a_count / PAGE_SIZE;
+	int         *rtvals  = ap->a_rtvals;
+
+	if (vp->v_type != VREG || npages <= 0) {
+		for (int i = 0; i < npages; i++) rtvals[i] = VM_PAGER_FAIL;
+		return (VM_PAGER_FAIL);
+	}
+
+	struct tessera_node *tn = VTOTNODE(vp);
+	struct tessera_mount *tmp_ = VFSTOTESSERA(vp->v_mount);
+	if (tmp_->inode_tree == NULL) {
+		for (int i = 0; i < npages; i++) rtvals[i] = VM_PAGER_FAIL;
+		return (VM_PAGER_FAIL);
+	}
+
+	tessera_inode_record_t ino;
+	if (tessera_fs_inode_get(tmp_, (uint32_t)tn->inode_no, &ino)
+	    != TESSERA_OK) {
+		for (int i = 0; i < npages; i++) rtvals[i] = VM_PAGER_FAIL;
+		return (VM_PAGER_FAIL);
+	}
+
+	off_t  base_off  = (off_t)ma[0]->pindex << PAGE_SHIFT;
+	size_t pages_len = (size_t)npages * PAGE_SIZE;
+	size_t new_size  = (size_t)base_off + pages_len;
+	if ((uint64_t)new_size < ino.size) new_size = (size_t)ino.size;
+
+	if (new_size > (64u * 1024u * 1024u)) {
+		/* Match TESSERA_WRITE_MAX_BYTES — defined later in file. */
+		for (int i = 0; i < npages; i++) rtvals[i] = VM_PAGER_FAIL;
+		return (VM_PAGER_FAIL);
+	}
+
+	uint8_t *full = malloc(new_size, M_TESSERA, M_WAITOK | M_ZERO);
+
+	if (ino.size > 0) {
+		uint8_t *old_buf = NULL;
+		size_t   old_len = 0;
+		if (tessera_fs_read_full_content(tmp_, &ino, &old_buf,
+		    &old_len) == 0 && old_buf != NULL) {
+			size_t n = old_len < new_size ? old_len : new_size;
+			memcpy(full, old_buf, n);
+			free(old_buf, M_TESSERA);
+		}
+	}
+
+	for (int i = 0; i < npages; i++) {
+		struct sf_buf *sf = sf_buf_alloc(ma[i], 0);
+		if (sf == NULL) {
+			rtvals[i] = VM_PAGER_FAIL;
+			continue;
+		}
+		size_t poff = (size_t)base_off + (size_t)i * PAGE_SIZE;
+		memcpy(full + poff, (void *)sf_buf_kva(sf), PAGE_SIZE);
+		sf_buf_free(sf);
+		rtvals[i] = VM_PAGER_OK;
+	}
+
+	int rc;
+	if (new_size <= (256u * 1024u))
+		/* TESSERA_INLINE_THRESHOLD; defined later in file. */
+		rc = tessera_fs_replace_content(tmp_,
+		    (uint32_t)tn->inode_no, full, new_size);
+	else
+		rc = tessera_fs_replace_content_chunked(tmp_,
+		    (uint32_t)tn->inode_no, full, new_size);
+
+	free(full, M_TESSERA);
+
+	if (rc != 0) {
+		for (int i = 0; i < npages; i++) rtvals[i] = VM_PAGER_FAIL;
+		return (VM_PAGER_FAIL);
+	}
+	tessera_fs_mark_dirty(tmp_);
+	return (VM_PAGER_OK);
 }
 
 static int
