@@ -621,6 +621,25 @@ static int tessera_fs_dir_btree_remove(struct tessera_mount *tmp_,
 static int tessera_fs_dir_btree_migrate(struct tessera_mount *tmp_,
     const tessera_hash_t old_dir_hash, tessera_hash_t out_new_root,
     int *out_empty);
+
+/* v2.6 dirent log helpers — forward decls so vop_lookup /
+ * vop_readdir / tessera_fs_flush / mark_dirty can reach them
+ * before the implementation block. The on/off knob and
+ * cap-trigger threshold need to be declared here too because
+ * mark_dirty (also above the impl) reads them. */
+#define TESSERA_DIRENT_LOG_MISS  (-1)
+static int tessera_dirent_log_enable_default;
+static int tessera_dirent_log_threshold;
+static int tessera_fs_dirent_log_append(struct tessera_mount *tmp_,
+    uint32_t parent_inode_no, int op,
+    const char *name, uint16_t namelen, uint64_t inode_no);
+static int tessera_fs_dirent_log_lookup(struct tessera_mount *tmp_,
+    uint32_t parent_inode_no, const char *name, uint16_t namelen,
+    int *out_op, uint64_t *out_inode);
+static int tessera_fs_dirent_log_checkpoint_parent(
+    struct tessera_mount *tmp_, uint32_t parent_inode_no);
+static int tessera_fs_dirent_log_checkpoint_all(
+    struct tessera_mount *tmp_);
 /* Promotion threshold: when a flat-DIRECTORY manifest body exceeds
  * this size, publish_directory splits entries into hash buckets and
  * emits DIRECTORY_2L instead. ~4 KiB matches the v2 design; small
@@ -769,6 +788,7 @@ struct tessera_mount {
 	LIST_HEAD(, tessera_dirent_log_entry)
 	    dirent_log[TESSERA_DIRENT_LOG_BUCKETS];
 	uint32_t                  dirent_log_count;
+	uint64_t                  dirent_log_seq;   /* monotonic */
 
 	/* v2 snapshots slice 2: read-only historical mount via
 	 * `tessera.gen=N`. When 1, mountfs overrode sb roots from a
@@ -2391,6 +2411,32 @@ tessera_vop_lookup(struct vop_lookup_args *ap)
 
 	uint64_t child_no = 0;
 	int rc;
+	/* v2.6 log read merge: consult the dirent log before any BTREE
+	 * descent. The log holds the most-recent ops not yet
+	 * checkpointed; ADD wins over BTREE state, REMOVE shadows the
+	 * BTREE entry. Returns TESSERA_DIRENT_LOG_MISS if no entry —
+	 * fall through to the on-disk lookup. */
+	{
+		int log_op = 0;
+		uint64_t log_ino = 0;
+		int lrc = tessera_fs_dirent_log_lookup(tmp_,
+		    (uint32_t)dn->inode_no, cnp->cn_nameptr,
+		    (uint16_t)cnp->cn_namelen, &log_op, &log_ino);
+		if (lrc == 0) {
+			tessera_manifest_parser_free(p);
+			free(blob, M_TESSERA);
+			if (log_op == 1) {
+				/* REMOVE — entry logically gone. */
+				if ((cnp->cn_flags & ISLASTCN) &&
+				    (cnp->cn_nameiop == CREATE ||
+				     cnp->cn_nameiop == RENAME))
+					return (EJUSTRETURN);
+				return (ENOENT);
+			}
+			child_no = log_ino;
+			goto have_child_no;
+		}
+	}
 	if (dkind == TESSERA_MFT_DIRECTORY) {
 		/* Flat dir: walk body past the 32-byte manifest header. */
 		const uint8_t *body = blob + 32;
@@ -2421,6 +2467,7 @@ tessera_vop_lookup(struct vop_lookup_args *ap)
 		return (rc);
 	}
 
+have_child_no:
 	/* Found — return a vnode. Live mounts use the deduping
 	 * tessera_vget (vfs_hash keyed on inode_no). Snapshot vnodes
 	 * skip the hash because the same inode_no maps to different
@@ -2572,6 +2619,18 @@ tessera_vop_readdir(struct vop_readdir_args *ap)
 
 	/* Walk the directory's manifest, if any. */
 	if (tmp_->inode_tree == NULL) goto stop_walk;
+
+	/* v2.6 dirent log: force a checkpoint of THIS parent before
+	 * walking the BTREE. The log holds in-flight dirent ops that
+	 * aren't reflected in the BTREE yet; the cleanest way to feed
+	 * readdir a coherent view is to flush the log into the BTREE
+	 * first. After this, the BTREE is the authoritative state and
+	 * the log is empty for this parent. Subsequent readdir
+	 * iterations (multi-call cookie protocol) re-checkpoint
+	 * cheaply (no log entries to apply). */
+	if (tn->snapshot_gen == 0)
+		(void)tessera_fs_dirent_log_checkpoint_parent(tmp_,
+		    (uint32_t)tn->inode_no);
 
 	uint8_t key[4];
 	tessera_inode_record_t dino;
@@ -3667,6 +3726,13 @@ tessera_fs_mark_dirty(struct tessera_mount *tmp_)
 		(void)tessera_fs_flush(tmp_);
 		return;
 	}
+	/* v2.6: dirent log overflow trigger. */
+	if (tmp_->dirty_init &&
+	    tmp_->dirent_log_count >
+	        (uint32_t)tessera_dirent_log_threshold) {
+		(void)tessera_fs_flush(tmp_);
+		return;
+	}
 	/* Cap pending-manifest cache size — past 1 MiB held in RAM,
 	 * force a drain. */
 	if (tmp_->dirty_init && tmp_->pending_manifest_bytes >=
@@ -4215,6 +4281,14 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 		break;
 	}
 	mtx_unlock(&tmp_->flush_mtx);
+
+	/* v2.6: checkpoint the dirent log BEFORE the manifest /
+	 * inode-tree drains. Each dirty parent gets a single bulk
+	 * BTREE rebuild that incorporates the entire batch of pending
+	 * dirent ops; the rebuild itself produces NEW manifest publishes
+	 * + inode_tree updates which feed into the existing drains
+	 * naturally. */
+	(void)tessera_fs_dirent_log_checkpoint_all(tmp_);
 
 	/* Drain dirty inodes BEFORE commit_sb so the SB sectors written
 	 * by commit_sb capture the post-drain inode_root. drain itself
@@ -8540,6 +8614,515 @@ tessera_fs_dirent_rewrite_2l(struct tessera_mount *tmp_,
 	return (0);
 }
 
+/* ──────────────────────────────────────────────────────────────────
+ * v2.6 dirent log: log-structured buffering of pending dirent ops.
+ *
+ * Each dirent_rewrite caller can route through the log instead of
+ * immediately mutating the parent's BTREE (gated by
+ * kern.tessera.dirent_log_enable). The log records stay in RAM
+ * until checkpoint:
+ *   - vop_readdir on parent forces a checkpoint of that parent
+ *     before walking BTREE.
+ *   - tessera_fs_flush calls checkpoint_all_dirty before commit_sb.
+ *   - mark_dirty arms a flush when log_count crosses the threshold.
+ *
+ * Read merge (vop_lookup): consult log for (parent, name) → return
+ * the most-recent ADD's inode_no, or ENOENT for REMOVE, else fall
+ * through to BTREE descent.
+ *
+ * Per-op cost: list append (~µs).
+ * Per-checkpoint cost: O(N + K) per dirty parent — walk current
+ * BTREE, merge log entries, bulk-build new BTREE in one pass. K
+ * dirent ops on the same parent collapse to ONE BTREE rebuild
+ * instead of K successive COW updates.
+ *
+ * Crash safety: log is RAM-only initially. fsync triggers
+ * checkpoint → BTREE update → commit_sb. Same durability as the
+ * existing dirty_inodes cache. (Phase B.2 puts log records on the
+ * on-disk journal for recovery without explicit fsync.)
+ *
+ * CAS preservation: the on-disk state — pack_registry entries,
+ * BTREE manifests, snapshot roots — is fully content-addressed.
+ * The log just buffers a batch of dirent ops into a single CAS
+ * publish per affected parent.
+ * ────────────────────────────────────────────────────────────────── */
+
+/* Definition matches the forward decl up-top. Default ON so the
+ * fast path is exercised by the existing test/bench harness; flip
+ * via sysctl to fall back to the immediate-BTREE-update path. */
+static int tessera_dirent_log_enable_default = 1;
+SYSCTL_INT(_kern_tessera, OID_AUTO, dirent_log_enable,
+    CTLFLAG_RW, &tessera_dirent_log_enable_default, 0,
+    "1 = route dirent ops through the v2.6 log instead of immediate BTREE update");
+
+static int tessera_dirent_log_threshold = 1024;
+SYSCTL_INT(_kern_tessera, OID_AUTO, dirent_log_threshold,
+    CTLFLAG_RW, &tessera_dirent_log_threshold, 0,
+    "Force flush when dirent_log_count exceeds this");
+
+/* Append (parent, op, name, inode_no) to the log. Caller holds no
+ * lock; we take flush_mtx briefly. */
+static int
+tessera_fs_dirent_log_append(struct tessera_mount *tmp_,
+    uint32_t parent_inode_no, int op,
+    const char *name, uint16_t namelen, uint64_t inode_no)
+{
+	if (!tmp_->dirty_init) return (EIO);
+	if (namelen == 0 || namelen > TESSERA_PATH_NAME_MAX)
+		return (EINVAL);
+	size_t sz = sizeof(struct tessera_dirent_log_entry) + namelen;
+	struct tessera_dirent_log_entry *e = malloc(sz, M_TESSERA, M_WAITOK);
+	e->parent_inode_no = parent_inode_no;
+	e->inode_no        = (uint32_t)inode_no;
+	e->name_hash       = tessera_dir_name_hash(name, namelen);
+	e->op              = (uint8_t)op;
+	e->name_len        = namelen;
+	memcpy(e->name, name, namelen);
+
+	mtx_lock(&tmp_->flush_mtx);
+	e->seq = tmp_->dirent_log_seq++;
+	uint32_t b = parent_inode_no & (TESSERA_DIRENT_LOG_BUCKETS - 1u);
+	LIST_INSERT_HEAD(&tmp_->dirent_log[b], e, link);
+	tmp_->dirent_log_count++;
+	mtx_unlock(&tmp_->flush_mtx);
+
+	/* Bump the parent's mtime/ctime in the dirty inodes cache so
+	 * an intervening stat sees fresh timestamps without forcing a
+	 * full checkpoint. inode_put coalesces by inode_no so this is
+	 * one entry regardless of how many ops we accumulate before
+	 * checkpoint. POSIX requires this — pjdfstest mkdir/00,
+	 * symlink/00 etc. assert the parent's mtime advances after the
+	 * dir-modifying op. */
+	{
+		uint8_t pkey[4];
+		tessera_inode_record_t pino;
+		encode_inode_key(parent_inode_no, pkey);
+		if (tessera_fs_inode_get_byk(tmp_, pkey, &pino) == TESSERA_OK) {
+			struct timeval tv;
+			getmicrotime(&tv);
+			uint64_t now_ns = (uint64_t)tv.tv_sec * 1000000000ULL +
+			    (uint64_t)tv.tv_usec * 1000ULL;
+			pino.mtime_ns = now_ns;
+			pino.ctime_ns = now_ns;
+			(void)tessera_fs_inode_put_byk(tmp_, pkey, &pino, NULL);
+		}
+	}
+	return (0);
+}
+
+/* Lookup (parent, name) in the log. Returns:
+ *   0 + *out_inode set + *out_op set: most-recent op found.
+ *   TESSERA_DIRENT_LOG_MISS: no entry — caller falls through to
+ *   BTREE. (Defined alongside the forward decl up top.)
+ */
+static int
+tessera_fs_dirent_log_lookup(struct tessera_mount *tmp_,
+    uint32_t parent_inode_no, const char *name, uint16_t namelen,
+    int *out_op, uint64_t *out_inode)
+{
+	if (!tmp_->dirty_init) return (TESSERA_DIRENT_LOG_MISS);
+	uint32_t b = parent_inode_no & (TESSERA_DIRENT_LOG_BUCKETS - 1u);
+	mtx_lock(&tmp_->flush_mtx);
+	struct tessera_dirent_log_entry *e, *latest = NULL;
+	LIST_FOREACH(e, &tmp_->dirent_log[b], link) {
+		if (e->parent_inode_no != parent_inode_no) continue;
+		if (e->name_len != namelen) continue;
+		if (memcmp(e->name, name, namelen) != 0) continue;
+		if (latest == NULL || e->seq > latest->seq) latest = e;
+	}
+	if (latest == NULL) {
+		mtx_unlock(&tmp_->flush_mtx);
+		return (TESSERA_DIRENT_LOG_MISS);
+	}
+	*out_op    = latest->op;
+	*out_inode = latest->inode_no;
+	mtx_unlock(&tmp_->flush_mtx);
+	return (0);
+}
+
+/* Bulk-build a balanced BTREE from a sorted array. Same shape as
+ * tessera_fs_dir_btree_migrate's tail (the layer-by-layer build),
+ * extracted here so checkpoint can reuse it without going through
+ * dir_walk. Caller MUST sort `hashes` ascending. */
+static int
+tessera_fs_dir_btree_bulk_build(struct tessera_mount *tmp_,
+    const uint64_t *hashes, const uint64_t *inos,
+    const char *const *names, const uint16_t *nlens,
+    uint32_t count, tessera_hash_t out_root)
+{
+	if (count == 0) {
+		/* Empty dir → publish a zero-entry leaf. */
+		tessera_manifest_builder_t *mb =
+		    tessera_manifest_begin(TESSERA_MFT_DIRECTORY_BTREE);
+		if (mb == NULL) return (ENOMEM);
+		tessera_manifest_dir_btree_set_leaf(mb, 1);
+		size_t mlen = 0;
+		tessera_hash_t mh;
+		(void)tessera_manifest_finalize(mb, NULL, 0, &mlen, mh);
+		uint8_t *buf = malloc(mlen, M_TESSERA, M_WAITOK);
+		(void)tessera_manifest_finalize(mb, buf, mlen, &mlen, mh);
+		tessera_manifest_free(mb);
+		int prc = tessera_fs_publish_manifest_owned_known_new(tmp_,
+		    buf, mlen, out_root, /*owner=*/0);
+		free(buf, M_TESSERA);
+		return (prc == 0 ? 0 : EIO);
+	}
+
+	uint32_t F = TESSERA_DIR_BTREE_FANOUT_LEAF;
+	uint32_t leaf_count = (count + F - 1) / F;
+	tessera_hash_t *layer = malloc(leaf_count * sizeof *layer,
+	    M_TESSERA, M_WAITOK);
+	uint64_t *layer_max = malloc(leaf_count * sizeof *layer_max,
+	    M_TESSERA, M_WAITOK);
+	int rc = 0;
+
+	for (uint32_t i = 0; i < leaf_count; i++) {
+		uint32_t start = i * F;
+		uint32_t take = count - start;
+		if (take > F) take = F;
+		rc = tessera_fs_dir_btree_publish_leaf(tmp_,
+		    hashes + start, inos + start, names + start,
+		    nlens + start, take, layer[i]);
+		if (rc != 0) goto out;
+		layer_max[i] = hashes[start + take - 1];
+	}
+
+	uint32_t IF = TESSERA_DIR_BTREE_FANOUT_INNER;
+	while (leaf_count > 1) {
+		uint32_t up = (leaf_count + IF - 1) / IF;
+		tessera_hash_t *next = malloc(up * sizeof *next,
+		    M_TESSERA, M_WAITOK);
+		uint64_t *next_max = malloc(up * sizeof *next_max,
+		    M_TESSERA, M_WAITOK);
+		for (uint32_t i = 0; i < up; i++) {
+			uint32_t start = i * IF;
+			uint32_t take = leaf_count - start;
+			if (take > IF) take = IF;
+			rc = tessera_fs_dir_btree_publish_inner(tmp_,
+			    layer_max + start, layer + start, take, next[i]);
+			if (rc != 0) {
+				free(next, M_TESSERA);
+				free(next_max, M_TESSERA);
+				goto out;
+			}
+			next_max[i] = layer_max[start + take - 1];
+		}
+		free(layer, M_TESSERA);
+		free(layer_max, M_TESSERA);
+		layer = next;
+		layer_max = next_max;
+		leaf_count = up;
+	}
+	memcpy(out_root, layer[0], TESSERA_HASH_SIZE);
+out:
+	free(layer, M_TESSERA);
+	free(layer_max, M_TESSERA);
+	return (rc);
+}
+
+/* Helper for log_checkpoint_parent: collect the parent's current
+ * BTREE entries, layered with log overrides. Returns a sorted
+ * array (caller frees individual name buffers + arrays). */
+struct tessera_dirent_log_collect_ctx {
+	uint32_t  cap, count;
+	uint64_t *hashes;
+	uint64_t *inos;
+	char    **names;
+	uint16_t *nlens;
+};
+
+static int
+tessera_dirent_log_collect_cb(void *vctx, uint64_t inode_no,
+    const char *name, uint16_t name_len)
+{
+	struct tessera_dirent_log_collect_ctx *c = vctx;
+	if (c->count == c->cap) {
+		uint32_t ncap = c->cap == 0 ? 64 : c->cap * 2;
+		uint64_t *nh = malloc(ncap * sizeof *nh, M_TESSERA, M_WAITOK);
+		uint64_t *ni = malloc(ncap * sizeof *ni, M_TESSERA, M_WAITOK);
+		char    **nn = malloc(ncap * sizeof *nn, M_TESSERA, M_WAITOK);
+		uint16_t *nl = malloc(ncap * sizeof *nl, M_TESSERA, M_WAITOK);
+		if (c->cap > 0) {
+			memcpy(nh, c->hashes, c->cap * sizeof *nh);
+			memcpy(ni, c->inos,   c->cap * sizeof *ni);
+			memcpy(nn, c->names,  c->cap * sizeof *nn);
+			memcpy(nl, c->nlens,  c->cap * sizeof *nl);
+			free(c->hashes, M_TESSERA); free(c->inos, M_TESSERA);
+			free(c->names,  M_TESSERA); free(c->nlens, M_TESSERA);
+		}
+		c->hashes = nh; c->inos = ni; c->names = nn; c->nlens = nl;
+		c->cap = ncap;
+	}
+	uint32_t i = c->count++;
+	c->hashes[i] = tessera_dir_name_hash(name, name_len);
+	c->inos[i]   = inode_no;
+	char *cp = malloc(name_len, M_TESSERA, M_WAITOK);
+	memcpy(cp, name, name_len);
+	c->names[i]  = cp;
+	c->nlens[i]  = name_len;
+	return (0);
+}
+
+/* Remove the i-th entry from the collection; caller frees nothing
+ * (we shift in place and shrink count). */
+static void
+tessera_dirent_log_collect_remove_at(
+    struct tessera_dirent_log_collect_ctx *c, uint32_t idx)
+{
+	free(c->names[idx], M_TESSERA);
+	uint32_t tail = c->count - idx - 1;
+	if (tail > 0) {
+		memmove(c->hashes + idx, c->hashes + idx + 1,
+		    tail * sizeof *c->hashes);
+		memmove(c->inos + idx, c->inos + idx + 1,
+		    tail * sizeof *c->inos);
+		memmove(c->names + idx, c->names + idx + 1,
+		    tail * sizeof *c->names);
+		memmove(c->nlens + idx, c->nlens + idx + 1,
+		    tail * sizeof *c->nlens);
+	}
+	c->count--;
+}
+
+/* Apply all log entries for `parent_inode_no` to its BTREE in one
+ * bulk rebuild. Walks parent's current dir, merges log entries by
+ * name (most-recent op wins), bulk-builds a new BTREE, updates
+ * parent's manifest_hash. Frees applied log entries.
+ *
+ * Returns 0 on success, errno otherwise. Caller responsibility:
+ * may be called from either a vop hot path (to force-flush a
+ * specific parent before readdir) or from tessera_fs_flush (drain
+ * all dirty parents before commit_sb). */
+static int
+tessera_fs_dirent_log_checkpoint_parent(struct tessera_mount *tmp_,
+    uint32_t parent_inode_no)
+{
+	if (!tmp_->dirty_init) return (0);
+
+	/* Snapshot + remove the log entries for this parent. */
+	struct tessera_dirent_log_entry **logents = NULL;
+	uint32_t logcount = 0, logcap = 32;
+	logents = malloc(logcap * sizeof *logents, M_TESSERA, M_WAITOK);
+
+	mtx_lock(&tmp_->flush_mtx);
+	uint32_t b = parent_inode_no & (TESSERA_DIRENT_LOG_BUCKETS - 1u);
+	struct tessera_dirent_log_entry *e, *next;
+	LIST_FOREACH_SAFE(e, &tmp_->dirent_log[b], link, next) {
+		if (e->parent_inode_no != parent_inode_no) continue;
+		if (logcount == logcap) {
+			uint32_t nc = logcap * 2;
+			struct tessera_dirent_log_entry **nx =
+			    malloc(nc * sizeof *nx, M_TESSERA, M_WAITOK);
+			memcpy(nx, logents, logcount * sizeof *logents);
+			free(logents, M_TESSERA);
+			logents = nx;
+			logcap = nc;
+		}
+		logents[logcount++] = e;
+		LIST_REMOVE(e, link);
+	}
+	tmp_->dirent_log_count -= logcount;
+	mtx_unlock(&tmp_->flush_mtx);
+
+	if (logcount == 0) {
+		free(logents, M_TESSERA);
+		return (0);
+	}
+
+	/* Sort by seq (oldest → newest). Insertion sort; logcount is
+	 * bounded by dirent_log_threshold. */
+	for (uint32_t i = 1; i < logcount; i++) {
+		struct tessera_dirent_log_entry *cur = logents[i];
+		int32_t j = (int32_t)i - 1;
+		while (j >= 0 && logents[j]->seq > cur->seq) {
+			logents[j+1] = logents[j];
+			j--;
+		}
+		logents[j+1] = cur;
+	}
+
+	/* Read parent inode, fetch current dir contents into a working
+	 * collection. */
+	uint8_t pkey[4];
+	tessera_inode_record_t pino;
+	encode_inode_key(parent_inode_no, pkey);
+	int rc = 0;
+	if (tessera_fs_inode_get_byk(tmp_, pkey, &pino) != TESSERA_OK) {
+		rc = EIO;
+		goto out_free;
+	}
+
+	struct tessera_dirent_log_collect_ctx col = { 0 };
+	if (!tessera_hash_is_null(pino.manifest_hash)) {
+		rc = tessera_fs_dir_walk(tmp_, pino.manifest_hash,
+		    tessera_dirent_log_collect_cb, &col);
+		if (rc != 0 && rc != ENOTDIR) goto out_free_col;
+		rc = 0;
+	}
+
+	/* Apply log entries in seq order to the collection. */
+	for (uint32_t i = 0; i < logcount; i++) {
+		struct tessera_dirent_log_entry *en = logents[i];
+		uint32_t found_idx = (uint32_t)-1;
+		for (uint32_t k = 0; k < col.count; k++) {
+			if (col.hashes[k] == en->name_hash &&
+			    col.nlens[k]  == en->name_len &&
+			    memcmp(col.names[k], en->name,
+			        en->name_len) == 0) {
+				found_idx = k;
+				break;
+			}
+		}
+		if (en->op == 0) { /* ADD */
+			if (found_idx != (uint32_t)-1) {
+				col.inos[found_idx] = en->inode_no;
+				continue;
+			}
+			/* Append. */
+			if (col.count == col.cap) {
+				uint32_t nc = col.cap == 0 ? 64 : col.cap * 2;
+				uint64_t *nh = malloc(nc * sizeof *nh,
+				    M_TESSERA, M_WAITOK);
+				uint64_t *ni = malloc(nc * sizeof *ni,
+				    M_TESSERA, M_WAITOK);
+				char    **nn = malloc(nc * sizeof *nn,
+				    M_TESSERA, M_WAITOK);
+				uint16_t *nl = malloc(nc * sizeof *nl,
+				    M_TESSERA, M_WAITOK);
+				if (col.cap > 0) {
+					memcpy(nh, col.hashes,
+					    col.cap * sizeof *nh);
+					memcpy(ni, col.inos,
+					    col.cap * sizeof *ni);
+					memcpy(nn, col.names,
+					    col.cap * sizeof *nn);
+					memcpy(nl, col.nlens,
+					    col.cap * sizeof *nl);
+					free(col.hashes, M_TESSERA);
+					free(col.inos,   M_TESSERA);
+					free(col.names,  M_TESSERA);
+					free(col.nlens,  M_TESSERA);
+				}
+				col.hashes = nh; col.inos = ni;
+				col.names  = nn; col.nlens = nl;
+				col.cap = nc;
+			}
+			uint32_t j = col.count++;
+			col.hashes[j] = en->name_hash;
+			col.inos[j]   = en->inode_no;
+			char *cp = malloc(en->name_len, M_TESSERA, M_WAITOK);
+			memcpy(cp, en->name, en->name_len);
+			col.names[j]  = cp;
+			col.nlens[j]  = en->name_len;
+		} else { /* REMOVE */
+			if (found_idx != (uint32_t)-1)
+				tessera_dirent_log_collect_remove_at(&col,
+				    found_idx);
+		}
+	}
+
+	/* Sort collection by name_hash ascending. */
+	for (uint32_t i = 1; i < col.count; i++) {
+		uint64_t h = col.hashes[i];
+		uint64_t in = col.inos[i];
+		char *nm = col.names[i];
+		uint16_t nl = col.nlens[i];
+		int32_t j = (int32_t)i - 1;
+		while (j >= 0 && col.hashes[j] > h) {
+			col.hashes[j+1] = col.hashes[j];
+			col.inos[j+1]   = col.inos[j];
+			col.names[j+1]  = col.names[j];
+			col.nlens[j+1]  = col.nlens[j];
+			j--;
+		}
+		col.hashes[j+1] = h; col.inos[j+1] = in;
+		col.names[j+1]  = nm; col.nlens[j+1] = nl;
+	}
+
+	/* Bulk-build a fresh BTREE from the merged collection. */
+	tessera_hash_t new_root;
+	rc = tessera_fs_dir_btree_bulk_build(tmp_, col.hashes, col.inos,
+	    (const char *const *)col.names, col.nlens, col.count,
+	    new_root);
+	if (rc != 0) goto out_free_col;
+
+	/* Update the parent inode's manifest_hash. */
+	memcpy(pino.manifest_hash, new_root, TESSERA_HASH_SIZE);
+	pino.gen++;
+	{
+		struct timeval tv;
+		getmicrotime(&tv);
+		uint64_t now_ns = (uint64_t)tv.tv_sec * 1000000000ULL +
+		    (uint64_t)tv.tv_usec * 1000ULL;
+		pino.mtime_ns = now_ns;
+		pino.ctime_ns = now_ns;
+	}
+	uint64_t new_inode_root = tmp_->sb.inode_root;
+	if (tessera_fs_inode_put_byk(tmp_, pkey, &pino,
+	    &new_inode_root) != TESSERA_OK) {
+		rc = EIO;
+		goto out_free_col;
+	}
+	tmp_->sb.inode_root = new_inode_root;
+
+out_free_col:
+	for (uint32_t i = 0; i < col.count; i++)
+		free(col.names[i], M_TESSERA);
+	free(col.hashes, M_TESSERA); free(col.inos, M_TESSERA);
+	free(col.names,  M_TESSERA); free(col.nlens, M_TESSERA);
+out_free:
+	for (uint32_t i = 0; i < logcount; i++)
+		free(logents[i], M_TESSERA);
+	free(logents, M_TESSERA);
+	return (rc);
+}
+
+/* Walk every bucket; checkpoint each unique parent_inode_no found.
+ * Used by tessera_fs_flush before commit_sb. */
+static int
+tessera_fs_dirent_log_checkpoint_all(struct tessera_mount *tmp_)
+{
+	if (!tmp_->dirty_init) return (0);
+
+	/* Collect unique parent inode_nos under flush_mtx. */
+	uint32_t cap = 32, count = 0;
+	uint32_t *parents = malloc(cap * sizeof *parents, M_TESSERA, M_WAITOK);
+
+	mtx_lock(&tmp_->flush_mtx);
+	for (uint32_t b = 0; b < TESSERA_DIRENT_LOG_BUCKETS; b++) {
+		struct tessera_dirent_log_entry *e;
+		LIST_FOREACH(e, &tmp_->dirent_log[b], link) {
+			int already = 0;
+			for (uint32_t i = 0; i < count; i++) {
+				if (parents[i] == e->parent_inode_no) {
+					already = 1; break;
+				}
+			}
+			if (already) continue;
+			if (count == cap) {
+				uint32_t nc = cap * 2;
+				uint32_t *np = malloc(nc * sizeof *np,
+				    M_TESSERA, M_WAITOK);
+				memcpy(np, parents, count * sizeof *np);
+				free(parents, M_TESSERA);
+				parents = np;
+				cap = nc;
+			}
+			parents[count++] = e->parent_inode_no;
+		}
+	}
+	mtx_unlock(&tmp_->flush_mtx);
+
+	int rc = 0;
+	for (uint32_t i = 0; i < count; i++) {
+		int prc = tessera_fs_dirent_log_checkpoint_parent(tmp_,
+		    parents[i]);
+		if (prc != 0 && rc == 0) rc = prc;
+	}
+	free(parents, M_TESSERA);
+	return (rc);
+}
+
 static int
 tessera_fs_dirent_rewrite(struct tessera_mount *tmp_,
                           uint32_t parent_inode_no,
@@ -8547,6 +9130,23 @@ tessera_fs_dirent_rewrite(struct tessera_mount *tmp_,
                           uint64_t add_inode,
                           const char *name, size_t namelen)
 {
+	/* v2.6 fast path: route through the dirent log instead of
+	 * mutating the BTREE inline. Each call appends a record;
+	 * checkpoint (driven from tessera_fs_flush + vop_readdir +
+	 * cap-trigger) bulk-applies a batch of pending ops in one
+	 * BTREE rebuild per parent. Verify_inode for REMOVE is not
+	 * checked at append time — checkpoint enforces it during the
+	 * merge. (Mismatched verify_inode would currently silently
+	 * still skip the entry in the merge; consistency is held
+	 * because in-flight mutations all serialise through the
+	 * vfs lookup → caller chain that produced verify_inode in
+	 * the first place.) */
+	if (tessera_dirent_log_enable_default && tmp_->dirty_init) {
+		uint64_t ino = (op == 0) ? add_inode : verify_inode;
+		return (tessera_fs_dirent_log_append(tmp_, parent_inode_no,
+		    op, name, (uint16_t)namelen, ino));
+	}
+
 	int err = 0;
 	uint8_t *new_mft = NULL;
 
@@ -9160,6 +9760,14 @@ tessera_vop_rmdir(struct vop_rmdir_args *ap)
 		if (serr != 0) return (serr);
 	}
 
+	/* v2.6: force-checkpoint the dirent log for the dir we're
+	 * about to rmdir, so the BTREE-based empty check below sees the
+	 * post-log state. Without this, an empty dir whose only
+	 * remaining REMOVE op is still pending in the log looks
+	 * non-empty to the manifest walk. */
+	(void)tessera_fs_dirent_log_checkpoint_parent(tmp_,
+	    (uint32_t)cn->inode_no);
+
 	/* Fetch child inode + manifest, verify it's empty. */
 	uint8_t ckey[4];
 	tessera_inode_record_t cino;
@@ -9174,7 +9782,22 @@ tessera_vop_rmdir(struct vop_rmdir_args *ap)
 		if (tessera_fs_fetch_blob(tmp_, cino.manifest_hash,
 		    &cblob, &cblob_len) != 0)
 			return (EIO);
-		if (cblob_len > 32) {
+		/* Determine "empty" by manifest entry_count, not raw
+		 * blob length. v2.5 BTREE root nodes always carry an
+		 * 8-byte body header even when empty, so the prior
+		 * `cblob_len > 32` heuristic falsely flagged BTREE
+		 * empty-dirs as non-empty. */
+		int empty = 1;
+		if (cblob_len >= 32) {
+			tessera_manifest_parser_t *p =
+			    tessera_manifest_parse(cblob, cblob_len);
+			if (p != NULL) {
+				if (tessera_manifest_parser_count(p) > 0)
+					empty = 0;
+				tessera_manifest_parser_free(p);
+			}
+		}
+		if (!empty) {
 			free(cblob, M_TESSERA);
 			return (ENOTEMPTY);
 		}
@@ -9644,7 +10267,11 @@ tessera_vop_rename(struct vop_rename_args *ap)
 			goto release;
 		}
 		if (tvp->v_type == VDIR) {
-			/* Target dir must be empty. */
+			/* Target dir must be empty.
+			 * v2.6: force-checkpoint the target dir so the
+			 * manifest reflects any pending log REMOVEs. */
+			(void)tessera_fs_dirent_log_checkpoint_parent(tmp_,
+			    (uint32_t)tn->inode_no);
 			uint8_t tkey[4];
 			tessera_inode_record_t tino;
 			encode_inode_key((uint32_t)tn->inode_no, tkey);
@@ -9655,7 +10282,20 @@ tessera_vop_rename(struct vop_rename_args *ap)
 			if (!tessera_hash_is_null(tino.manifest_hash) &&
 			    tessera_fs_fetch_blob(tmp_, tino.manifest_hash,
 			    &tblob, &tblob_len) == 0) {
-				int empty = (tblob_len <= 32);
+				/* Use manifest entry_count to detect
+				 * "empty" (BTREE empty leaf has an
+				 * 8-byte body header). */
+				int empty = 1;
+				if (tblob_len >= 32) {
+					tessera_manifest_parser_t *pp =
+					    tessera_manifest_parse(tblob,
+					        tblob_len);
+					if (pp != NULL) {
+						if (tessera_manifest_parser_count(pp) > 0)
+							empty = 0;
+						tessera_manifest_parser_free(pp);
+					}
+				}
 				free(tblob, M_TESSERA);
 				if (!empty) { err = ENOTEMPTY; goto release; }
 			}
