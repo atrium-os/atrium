@@ -1674,10 +1674,14 @@ tessera_vget(struct mount *mp, uint64_t inode_no, uint64_t parent_inode_no,
 		if (tessera_fs_inode_get_byk(tmp_, k4, &cino)
 		    == TESSERA_OK) {
 			switch (cino.mode & 0170000) {
-			case 0040000: vp->v_type = VDIR; break;
-			case 0100000: vp->v_type = VREG; break;
-			case 0120000: vp->v_type = VLNK; break;
-			default:      vp->v_type = VBAD; break;
+			case 0040000: vp->v_type = VDIR;  break;
+			case 0100000: vp->v_type = VREG;  break;
+			case 0120000: vp->v_type = VLNK;  break;
+			case 0140000: vp->v_type = VSOCK; break;
+			case 0010000: vp->v_type = VFIFO; break;
+			case 0020000: vp->v_type = VCHR;  break;
+			case 0060000: vp->v_type = VBLK;  break;
+			default:      vp->v_type = VBAD;  break;
 			}
 		}
 	}
@@ -1787,10 +1791,14 @@ tessera_vget_synth(struct mount *mp, uint64_t inode_no,
 		if (tessera_fs_inode_get_at_gen(tmp_, (uint32_t)inode_no,
 		    snapshot_gen, &cino) == TESSERA_OK) {
 			switch (cino.mode & 0170000) {
-			case 0040000: vp->v_type = VDIR; break;
-			case 0100000: vp->v_type = VREG; break;
-			case 0120000: vp->v_type = VLNK; break;
-			default:      vp->v_type = VBAD; break;
+			case 0040000: vp->v_type = VDIR;  break;
+			case 0100000: vp->v_type = VREG;  break;
+			case 0120000: vp->v_type = VLNK;  break;
+			case 0140000: vp->v_type = VSOCK; break;
+			case 0010000: vp->v_type = VFIFO; break;
+			case 0020000: vp->v_type = VCHR;  break;
+			case 0060000: vp->v_type = VBLK;  break;
+			default:      vp->v_type = VBAD;  break;
 			}
 		} else {
 			vp->v_type = VBAD;
@@ -1979,10 +1987,14 @@ tessera_vop_getattr(struct vop_getattr_args *ap)
 		    : tessera_fs_inode_get_byk(tmp_, key, &ino);
 		if (rc == TESSERA_OK) {
 			switch (ino.mode & 0170000) {
-			case 040000:  vap->va_type = VDIR; break;
-			case 0100000: vap->va_type = VREG; break;
-			case 0120000: vap->va_type = VLNK; break;
-			default:      vap->va_type = VBAD; break;
+			case 040000:  vap->va_type = VDIR;  break;
+			case 0100000: vap->va_type = VREG;  break;
+			case 0120000: vap->va_type = VLNK;  break;
+			case 0140000: vap->va_type = VSOCK; break;
+			case 0010000: vap->va_type = VFIFO; break;
+			case 0020000: vap->va_type = VCHR;  break;
+			case 0060000: vap->va_type = VBLK;  break;
+			default:      vap->va_type = VBAD;  break;
 			}
 			vap->va_mode  = ino.mode & 07777;
 			vap->va_nlink = ino.nlink ? ino.nlink : 2;
@@ -2196,6 +2208,14 @@ tessera_vop_lookup(struct vop_lookup_args *ap)
 
 	/* Magic dirs above this point have no further children. */
 	if (dn->kind != TESSERA_NODE_REGULAR) return (ENOENT);
+
+	/* Path-component descent into a non-directory must return ENOTDIR
+	 * (POSIX). Has to come BEFORE the VOP_ACCESS(VEXEC) check below —
+	 * otherwise a regular file with mode 0644 surfaces as EACCES when
+	 * the lookup tries to enforce search permission. UFS handles this
+	 * implicitly via dp->v_type guards in ufs_lookup; we do it
+	 * explicitly. */
+	if (dvp->v_type != VDIR) return (ENOTDIR);
 
 	/* POSIX: search permission on the parent directory required.
 	 * Some FreeBSD lookup paths reach VOP_LOOKUP without first
@@ -2855,6 +2875,16 @@ tessera_vop_setattr(struct vop_setattr_args *ap)
 		ino.mode = (ino.mode & 0170000) | (vap->va_mode & 07777);
 	if (seen_uid) ino.uid = vap->va_uid;
 	if (seen_gid) ino.gid = vap->va_gid;
+	/* POSIX: chown by a non-privileged process clears S_ISUID and
+	 * S_ISGID. Symlinks are exempt (they have no executable
+	 * payload); UFS guards similarly. PRIV_VFS_RETAINSUGID lets a
+	 * privileged caller keep them. */
+	if ((seen_uid || seen_gid) && (ino.mode & 06000) != 0 &&
+	    vp->v_type != VLNK &&
+	    cred != NULL &&
+	    priv_check_cred(cred, PRIV_VFS_RETAINSUGID) != 0) {
+		ino.mode &= ~06000;
+	}
 	if (seen_atime || seen_mtime || seen_mode || seen_uid || seen_gid) {
 		struct timeval tv;
 		getmicrotime(&tv);
@@ -6812,6 +6842,37 @@ et_enomem:
  * the data zone — those leak until offline GC reclaims them. v1
  * accepts that (per tessera-fs §3.3 design notes).
  */
+
+/*
+ * Sticky-bit check (POSIX): in a directory whose mode includes
+ * S_ISVTX, a file may be unlinked or renamed only by:
+ *   - root (PRIV_VFS_ADMIN)
+ *   - the owner of the directory
+ *   - the owner of the file
+ * Returns 0 if allowed, EPERM otherwise. UFS does this in
+ * ufs_dir_check_path / sticky checks scattered through unlink/rename.
+ */
+static int
+tessera_fs_sticky_check(struct tessera_mount *tmp_,
+                        struct tessera_node *dn, struct tessera_node *cn,
+                        struct ucred *cred)
+{
+	uint8_t k[4];
+	tessera_inode_record_t dino, cino;
+	encode_inode_key((uint32_t)dn->inode_no, k);
+	if (tessera_fs_inode_get_byk(tmp_, k, &dino) != TESSERA_OK)
+		return (0);
+	if ((dino.mode & S_ISVTX) == 0) return (0);
+	encode_inode_key((uint32_t)cn->inode_no, k);
+	if (tessera_fs_inode_get_byk(tmp_, k, &cino) != TESSERA_OK)
+		return (0);
+	if (cred->cr_uid == 0) return (0);
+	if (cred->cr_uid == dino.uid) return (0);
+	if (cred->cr_uid == cino.uid) return (0);
+	if (priv_check_cred(cred, PRIV_VFS_ADMIN) == 0) return (0);
+	return (EPERM);
+}
+
 static int
 tessera_vop_remove(struct vop_remove_args *ap)
 {
@@ -6829,6 +6890,10 @@ tessera_vop_remove(struct vop_remove_args *ap)
 	{
 		int aerr = VOP_ACCESS(dvp, VWRITE, cnp->cn_cred, curthread);
 		if (aerr != 0) return (aerr);
+	}
+	{
+		int serr = tessera_fs_sticky_check(tmp_, dn, cn, cnp->cn_cred);
+		if (serr != 0) return (serr);
 	}
 
 	/* dirent_rewrite handles flat DIRECTORY and DIRECTORY_2L parents
@@ -7184,7 +7249,15 @@ tessera_vop_create(struct vop_create_args *ap)
 		memset(&cino, 0, sizeof cino);
 		cino.inode_no = new_ino;
 		cino.gen      = 1;
-		cino.mode     = ((vap->va_mode & 07777) | 0100000);  /* S_IFREG */
+		{
+			uint32_t ifmt;
+			switch (vap->va_type) {
+			case VSOCK: ifmt = 0140000; break;
+			case VFIFO: ifmt = 0010000; break;
+			default:    ifmt = 0100000; break;  /* S_IFREG */
+			}
+			cino.mode = (vap->va_mode & 07777) | ifmt;
+		}
 		/* va_uid/va_gid normally come in as VNOVAL — the FS is
 		 * responsible for setting the new file's owner to the
 		 * calling process. UFS/FFS use cnp->cn_cred. */
@@ -7520,6 +7593,10 @@ tessera_vop_rmdir(struct vop_rmdir_args *ap)
 	{
 		int aerr = VOP_ACCESS(dvp, VWRITE, cnp->cn_cred, curthread);
 		if (aerr != 0) return (aerr);
+	}
+	{
+		int serr = tessera_fs_sticky_check(tmp_, dn, cn, cnp->cn_cred);
+		if (serr != 0) return (serr);
 	}
 
 	/* Fetch child inode + manifest, verify it's empty. */
@@ -7962,6 +8039,35 @@ tessera_vop_rename(struct vop_rename_args *ap)
 	struct tessera_node  *tdn  = VTOTNODE(tdvp);
 	struct tessera_node  *fn   = VTOTNODE(fvp);
 	struct tessera_node  *tn   = (tvp != NULL) ? VTOTNODE(tvp) : NULL;
+	/* Sticky-bit checks (POSIX): in a directory with S_ISVTX, only
+	 * root, the dir owner, or the file owner may unlink/rename a
+	 * file. Apply on source (we're "removing" fn from fdvp) and on
+	 * target (if overwriting, we're effectively unlinking tn from
+	 * tdvp). */
+	{
+		int serr = tessera_fs_sticky_check(tmp_, fdn, fn, fcnp->cn_cred);
+		if (serr != 0) { err = serr; goto release; }
+		if (tn != NULL) {
+			serr = tessera_fs_sticky_check(tmp_, tdn, tn,
+			    tcnp->cn_cred);
+			if (serr != 0) { err = serr; goto release; }
+		}
+	}
+	/* POSIX: rename of a directory into itself or a subdirectory of
+	 * itself must fail with EINVAL. Tessera's on-disk inode record
+	 * doesn't store parent_inode_no, so we do the one-level check
+	 * that's reachable via the in-memory node: target dir == source,
+	 * or target dir's direct parent == source. This catches the
+	 * pjdfstest rename/18 case (rename A A/B/C) and any
+	 * one-level-deep variant. UFS does an unbounded walk via
+	 * ufs_checkpath; deeper cases here would need an in-memory
+	 * ancestor chain or an on-disk parent pointer (deferred). */
+	if (fvp->v_type == VDIR &&
+	    (tdn->inode_no == fn->inode_no ||
+	     tdn->parent_inode_no == fn->inode_no)) {
+		err = EINVAL;
+		goto release;
+	}
 	if (tvp != NULL) {
 		/* POSIX type matching: regular ↔ regular, dir ↔ empty-dir. */
 		if ((fvp->v_type == VDIR) != (tvp->v_type == VDIR)) {
