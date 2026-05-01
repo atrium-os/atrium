@@ -32,6 +32,7 @@
 #include <sys/namei.h>
 #include <sys/proc.h>
 #include <sys/sysctl.h>
+#include <sys/priv.h>
 #include <sys/malloc.h>
 #include <sys/uio.h>
 #include <sys/types.h>
@@ -2666,6 +2667,38 @@ tessera_vop_setattr(struct vop_setattr_args *ap)
 	    != TESSERA_OK)
 		return (EIO);
 
+	/* POSIX permission gate — match UFS's behaviour. The kernel calls
+	 * VOP_ACCESS(VWRITE) before VOP_SETATTR for the truncate path, so
+	 * we don't need an explicit check there. chmod/chown have their
+	 * own ownership rules: */
+	struct ucred *cred = ap->a_cred;
+
+	if (seen_uid || seen_gid) {
+		uid_t new_uid = seen_uid ? vap->va_uid : ino.uid;
+		gid_t new_gid = seen_gid ? vap->va_gid : ino.gid;
+		/* Non-owner OR changing uid OR changing-gid-not-in-cred-groups
+		 * requires PRIV_VFS_CHOWN. Mirror ufs_chown(). */
+		if (cred->cr_uid != ino.uid || new_uid != ino.uid ||
+		    (new_gid != ino.gid && !groupmember(new_gid, cred))) {
+			int err = priv_check_cred(cred, PRIV_VFS_CHOWN);
+			if (err != 0) return (err);
+		}
+	}
+	if (seen_mode) {
+		/* Non-owner needs PRIV_VFS_ADMIN to chmod. */
+		if (cred->cr_uid != ino.uid) {
+			int err = priv_check_cred(cred, PRIV_VFS_ADMIN);
+			if (err != 0) return (err);
+		}
+		/* Non-root user can't set setgid on a group they aren't in
+		 * (POSIX). Setuid/setgid on symlinks is allowed by FreeBSD
+		 * UFS (and required by some pjdfstest cases) — we don't
+		 * have FIFO/BLK/CHR types to refuse, so no EFTYPE check. */
+		if (cred->cr_uid != 0 && (vap->va_mode & 02000) &&
+		    !groupmember(ino.gid, cred))
+			return (EPERM);
+	}
+
 	/* Truncate / extend (handles `>` shell redirection's pre-write
 	 * VOP_SETATTR(va_size = 0)). The new content is built in RAM by
 	 * reading the existing one (capped at min(old_size, new_size))
@@ -2675,6 +2708,11 @@ tessera_vop_setattr(struct vop_setattr_args *ap)
 	int did_resize = 0;
 	if (seen_size) {
 		uint64_t new_size = (uint64_t)vap->va_size;
+		/* Reject impossibly-large truncates before they reach the
+		 * malloc — vop_write has the same cap. Without this, a
+		 * truncate(file, 1<<48) sleeps forever in M_WAITOK. */
+		if (new_size > (uint64_t)(64u * 1024u * 1024u))
+			return (EFBIG);
 		if (new_size != ino.size) {
 			uint8_t *old_buf = NULL;
 			size_t   old_len = 0;
@@ -6599,8 +6637,13 @@ tessera_vop_create(struct vop_create_args *ap)
 		cino.inode_no = new_ino;
 		cino.gen      = 1;
 		cino.mode     = ((vap->va_mode & 07777) | 0100000);  /* S_IFREG */
-		cino.uid      = (vap->va_uid != (uid_t)VNOVAL) ? vap->va_uid : 0;
-		cino.gid      = (vap->va_gid != (gid_t)VNOVAL) ? vap->va_gid : 0;
+		/* va_uid/va_gid normally come in as VNOVAL — the FS is
+		 * responsible for setting the new file's owner to the
+		 * calling process. UFS/FFS use cnp->cn_cred. */
+		cino.uid = (vap->va_uid != (uid_t)VNOVAL)
+		    ? vap->va_uid : cnp->cn_cred->cr_uid;
+		cino.gid = (vap->va_gid != (gid_t)VNOVAL)
+		    ? vap->va_gid : cnp->cn_cred->cr_groups[0];
 		struct timeval tv;
 		getmicrotime(&tv);
 		uint64_t now_ns = (uint64_t)tv.tv_sec * 1000000000ULL +
@@ -6831,8 +6874,10 @@ tessera_vop_mkdir(struct vop_mkdir_args *ap)
 	cino.inode_no = new_ino;
 	cino.gen      = 1;
 	cino.mode     = ((vap->va_mode & 07777) | 0040000);  /* S_IFDIR */
-	cino.uid      = (vap->va_uid != (uid_t)VNOVAL) ? vap->va_uid : 0;
-	cino.gid      = (vap->va_gid != (gid_t)VNOVAL) ? vap->va_gid : 0;
+	cino.uid      = (vap->va_uid != (uid_t)VNOVAL)
+	    ? vap->va_uid : cnp->cn_cred->cr_uid;
+	cino.gid      = (vap->va_gid != (gid_t)VNOVAL)
+	    ? vap->va_gid : cnp->cn_cred->cr_groups[0];
 	struct timeval tv;
 	getmicrotime(&tv);
 	uint64_t now_ns = (uint64_t)tv.tv_sec * 1000000000ULL +
@@ -6992,6 +7037,8 @@ tessera_vop_symlink(struct vop_symlink_args *ap)
 	cino.inode_no = new_ino;
 	cino.gen      = 1;
 	cino.mode     = 0120777;     /* S_IFLNK | 0777 */
+	cino.uid      = cnp->cn_cred->cr_uid;
+	cino.gid      = cnp->cn_cred->cr_groups[0];
 	struct timeval tv;
 	getmicrotime(&tv);
 	uint64_t now_ns = (uint64_t)tv.tv_sec * 1000000000ULL +
