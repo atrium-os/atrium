@@ -45,6 +45,8 @@
 #include <sys/mutex.h>
 #include <sys/rwlock.h>
 #include <sys/taskqueue.h>
+#include <sys/unistd.h>
+#include <sys/limits.h>
 #include <geom/geom.h>
 #include <geom/geom_vfs.h>
 #include <vm/vm.h>
@@ -8045,8 +8047,70 @@ release:
 	return (err);
 }
 
+/*
+ * vop_pathconf — POSIX runtime tunables. pjdfstest's namegen_max
+ * relies on _PC_NAME_MAX returning a sane value: without this vop the
+ * default returns -1/EINVAL on subdirectories (only the mount root
+ * picks up f_namemax via vfs_stdpathconf), and every rename test that
+ * builds a max-length name from pathconf produces empty arguments.
+ *
+ * Mirrors UFS structure but with tessera's own constants. _PC_LINK_MAX
+ * uses a generous default (UFS uses 32767 — same here). _PC_PATH_MAX
+ * is left to the vfs_stdpathconf default.
+ */
+static int
+tessera_vop_pathconf(struct vop_pathconf_args *ap)
+{
+	int err = 0;
+	switch (ap->a_name) {
+	case _PC_LINK_MAX:
+		*ap->a_retval = 32767;
+		break;
+	case _PC_NAME_MAX:
+		*ap->a_retval = TESSERA_PATH_NAME_MAX;
+		break;
+	case _PC_PIPE_BUF:
+		if (ap->a_vp->v_type == VDIR || ap->a_vp->v_type == VFIFO)
+			*ap->a_retval = PIPE_BUF;
+		else
+			err = EINVAL;
+		break;
+	case _PC_CHOWN_RESTRICTED:
+		*ap->a_retval = 1;
+		break;
+	case _PC_NO_TRUNC:
+		*ap->a_retval = 1;
+		break;
+	case _PC_FILESIZEBITS:
+		*ap->a_retval = 64;
+		break;
+	case _PC_MIN_HOLE_SIZE:
+		*ap->a_retval = ap->a_vp->v_mount->mnt_stat.f_iosize;
+		break;
+	case _PC_ALLOC_SIZE_MIN:
+		*ap->a_retval = ap->a_vp->v_mount->mnt_stat.f_bsize;
+		break;
+	case _PC_REC_INCR_XFER_SIZE:
+	case _PC_REC_XFER_ALIGN:
+		*ap->a_retval = ap->a_vp->v_mount->mnt_stat.f_iosize;
+		break;
+	case _PC_REC_MAX_XFER_SIZE:
+	case _PC_REC_MIN_XFER_SIZE:
+		*ap->a_retval = -1;
+		break;
+	case _PC_SYMLINK_MAX:
+		*ap->a_retval = MAXPATHLEN;
+		break;
+	default:
+		err = vop_stdpathconf(ap);
+		break;
+	}
+	return (err);
+}
+
 struct vop_vector tessera_vnodeops = {
 	.vop_default  = &default_vnodeops,
+	.vop_pathconf = tessera_vop_pathconf,
 	.vop_access   = tessera_vop_access,
 	.vop_getattr  = tessera_vop_getattr,
 	.vop_setattr  = tessera_vop_setattr,
