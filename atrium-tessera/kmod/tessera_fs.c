@@ -2107,6 +2107,16 @@ tessera_vop_lookup(struct vop_lookup_args *ap)
 	/* Magic dirs above this point have no further children. */
 	if (dn->kind != TESSERA_NODE_REGULAR) return (ENOENT);
 
+	/* POSIX: search permission on the parent directory required.
+	 * Some FreeBSD lookup paths reach VOP_LOOKUP without first
+	 * calling VOP_ACCESS(VEXEC) on the parent (vfs name cache,
+	 * shared-lookup paths). UFS adds the check explicitly in
+	 * ufs_lookup; tessera does the same. */
+	{
+		int aerr = VOP_ACCESS(dvp, VEXEC, cnp->cn_cred, curthread);
+		if (aerr != 0) return (aerr);
+	}
+
 	/* Real on-disk lookup: read the directory inode, fetch its
 	 * DIRECTORY manifest blob, walk it for `cnp`. Snapshot-tagged
 	 * vnodes (snapshot_gen != 0) read the inode + manifest from
