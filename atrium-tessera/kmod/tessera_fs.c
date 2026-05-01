@@ -6794,6 +6794,18 @@ tessera_vop_write(struct vop_write_args *ap)
 			tessera_stat_append_fast_ok++;
 			tessera_stat_vop_write_chunked++;
 			free(new_bytes, M_TESSERA);
+			if ((ino.mode & 06000) != 0 && ap->a_cred != NULL &&
+			    priv_check_cred(ap->a_cred,
+			        PRIV_VFS_RETAINSUGID) != 0) {
+				tessera_inode_record_t ino2;
+				if (tessera_fs_inode_get(tmp_,
+				    (uint32_t)tn->inode_no, &ino2)
+				    == TESSERA_OK) {
+					ino2.mode &= ~06000;
+					(void)tessera_fs_inode_put(tmp_,
+					    (uint32_t)tn->inode_no, &ino2);
+				}
+			}
 			vnode_pager_setsize(vp, final_size);
 			tessera_fs_mark_dirty(tmp_);
 			return (0);
@@ -6838,6 +6850,21 @@ tessera_vop_write(struct vop_write_args *ap)
 	}
 	free(full, M_TESSERA);
 	if (rc != 0) return (rc);
+
+	/* POSIX: after a successful write, S_ISUID and S_ISGID are
+	 * cleared unless the caller has appropriate privilege. Refetch
+	 * the inode (replace_content advanced the cache copy), clear
+	 * the bits, and stash the result back. */
+	if ((ino.mode & 06000) != 0 && ap->a_cred != NULL &&
+	    priv_check_cred(ap->a_cred, PRIV_VFS_RETAINSUGID) != 0) {
+		tessera_inode_record_t ino2;
+		if (tessera_fs_inode_get(tmp_, (uint32_t)tn->inode_no,
+		    &ino2) == TESSERA_OK) {
+			ino2.mode &= ~06000;  /* strip S_ISUID | S_ISGID */
+			(void)tessera_fs_inode_put(tmp_,
+			    (uint32_t)tn->inode_no, &ino2);
+		}
+	}
 
 	if (final_size != ino.size)
 		vnode_pager_setsize(vp, final_size);
