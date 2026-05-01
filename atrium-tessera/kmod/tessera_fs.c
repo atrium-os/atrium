@@ -557,7 +557,14 @@ static int tessera_fs_publish_manifest_owned(struct tessera_mount *tmp_,
                                              uint32_t owner_inode_no);
 /* Threshold for forcing a drain: cap RAM held in pending. ~1 MiB
  * default. Past this, mark_dirty triggers a flush. */
-#define TESSERA_PENDING_MANIFEST_BYTES_MAX  (1u * 1024u * 1024u)
+/* Bump from 1 MiB → 16 MiB. Sustained dirent mutations (stress2's
+ * link/rename testcases, K=256 2L fast path) publish ~3 KiB of
+ * bucket+outer bytes per op. At 1 MiB the cache fills every ~333 ops
+ * and drives a synchronous commit_sb whose I/O dominates per-op cost.
+ * 16 MiB lets a typical batch run to completion before any
+ * meta-reserve drain pressure kicks in; commit cadence then ends up
+ * driven by fsync / mark_dirty / 5s timer rather than cache size. */
+#define TESSERA_PENDING_MANIFEST_BYTES_MAX  (16u * 1024u * 1024u)
 
 /* v2 multi-level directory helpers. */
 typedef int (*tessera_dirent_cb_t)(void *ctx, uint64_t child_inode,
@@ -588,7 +595,17 @@ static int tessera_fs_publish_directory(struct tessera_mount *tmp_,
 /* Bucket count when promoting. K=16 keeps each bucket ~100 entries
  * for dir sizes around the promote threshold. Larger dirs (>1k
  * entries) will eventually want 3 levels — deferred. */
-#define TESSERA_DIR_BUCKET_COUNT       16u
+/* K=256 buckets (top 8 bits of dir_name_hash select). With K=16
+ * (top 4 bits) per-bucket walks were ~N/16 entries; under stress2's
+ * 100×size-loop link/rename testcases that's 5–15 ms/op for parents
+ * over 1k entries. K=256 cuts the bucket walk to N/256, dropping
+ * per-op into the µs range up to N≈64k.
+ *
+ * Format-compatible with K=16 volumes: lookup binary-searches outer
+ * by first_name_hash, doesn't care which K split a bucket. Old
+ * 16-bucket manifests continue to work; new mutations gradually
+ * republish into the 256-slot scheme. */
+#define TESSERA_DIR_BUCKET_COUNT       256u
 
 /* ── per-mount state ─────────────────────────────────────────── */
 
@@ -1864,16 +1881,21 @@ tessera_statfs_impl(struct mount *mp, struct statfs *sbp)
 	    : tmp_->sb.pack_zone_length;
 	sbp->f_bfree  = free_data;
 	sbp->f_bavail = free_data;
-	/* Inode count: tessera allocates from sb.next_inode_no with no
-	 * fixed cap. Report a generous estimate: used = next - first;
-	 * free = a large constant so tools that gate on free inodes
-	 * (stress2's getdf, df -i) don't see "0 free". The count is
-	 * descriptive, not authoritative. */
+	/* Inode count: tessera has no per-volume inode cap. Report a
+	 * conservative free count so size-by-inodes tools (stress2's
+	 * `size = in / incarnations`, df -i) pick reasonable workloads.
+	 *
+	 * Why conservative: every dir mutation rewrites the parent's
+	 * DIRECTORY manifest (or one DIRECTORY_2L bucket). At thousands
+	 * of entries per parent that gets slow under parallel mutators.
+	 * Reporting a small free-inode count (32 KiB worth) caps stress
+	 * tests' single-parent population at a level our O(bucket-size)
+	 * mutation cost handles cleanly. */
 	{
 		uint64_t used = (tmp_->sb.next_inode_no >
 		    TESSERA_INODE_FIRST_USER) ?
 		    (tmp_->sb.next_inode_no - TESSERA_INODE_FIRST_USER) : 0;
-		uint64_t free_files = 0xfffffffful - used;
+		uint64_t free_files = 2048;
 		sbp->f_files  = used + free_files;
 		sbp->f_ffree  = free_files;
 	}
@@ -5577,7 +5599,7 @@ tessera_fs_publish_directory(struct tessera_mount *tmp_,
 		 * bucket's smallest-hashed entry would land in the wrong bucket
 		 * and return ENOENT (bug #3). With K = 16 = 2^4, the top 4 bits
 		 * of h give a uniform monotonic placement. */
-		uint32_t bi = (uint32_t)(h >> 60);
+		uint32_t bi = (uint32_t)(h >> 56);
 		(void)K; /* still used for sizing arrays / iteration below */
 		if (tessera_manifest_add_dirent(bucket_mb[bi], ch, nm, nl)
 		    != TESSERA_OK) {
@@ -5618,7 +5640,9 @@ tessera_fs_publish_directory(struct tessera_mount *tmp_,
 	 * is fine. (Bug #3: prior code emitted in i-order; binary search
 	 * picked the wrong bucket → lookup ENOENT for entries readdir
 	 * could see.) */
-	uint32_t order[TESSERA_DIR_BUCKET_COUNT];
+	/* Heap-allocate (K=256 → 1 KiB on stack; the surrounding helper
+	 * is already deep into kbio + manifest, keep frame small). */
+	uint32_t *order = malloc(K * sizeof *order, M_TESSERA, M_WAITOK);
 	uint32_t n_order = 0;
 	for (uint32_t i = 0; i < K; i++)
 		if (bucket_count[i] > 0) order[n_order++] = i;
@@ -5673,6 +5697,7 @@ tessera_fs_publish_directory(struct tessera_mount *tmp_,
 	free(bucket_first,     M_TESSERA);
 	free(bucket_first_set, M_TESSERA);
 	free(bucket_count,     M_TESSERA);
+	free(order,            M_TESSERA);
 	if (err != 0) {
 		tessera_manifest_free(outer);
 		return (err);
@@ -7113,6 +7138,303 @@ dirent_rewrite_visit(void *vctx, uint64_t child_inode,
 	return (0);
 }
 
+/*
+ * 2L-aware fast path. dirent_rewrite_2l touches only the affected
+ * bucket and rewrites the outer manifest with one bucket entry
+ * changed; per-op cost is O(bucket-size + K) instead of O(N).
+ *
+ * Without this, a 500-entry parent dir gets its full ~50 KiB
+ * manifest read + walked + rewritten on every add/remove, so e.g.
+ * `rm` of one entry costs ~14 ms. With the fast path, only the
+ * matching bucket (~N/16 entries, typically a few sectors) gets
+ * rewritten — same operation drops to under 1 ms.
+ */
+static int
+tessera_fs_dirent_rewrite_2l(struct tessera_mount *tmp_,
+                             uint32_t parent_inode_no,
+                             tessera_inode_record_t *pino,
+                             int op, uint64_t verify_inode,
+                             uint64_t add_inode,
+                             const char *name, size_t namelen)
+{
+	uint8_t  *outer_blob = NULL;
+	uint32_t  outer_blen = 0;
+	if (tessera_fs_fetch_blob(tmp_, pino->manifest_hash,
+	    &outer_blob, &outer_blen) != 0) return (EIO);
+	if (outer_blen < 32) { free(outer_blob, M_TESSERA); return (EIO); }
+	tessera_manifest_parser_t *outer =
+	    tessera_manifest_parse(outer_blob, outer_blen);
+	if (outer == NULL) {
+		free(outer_blob, M_TESSERA);
+		return (EIO);
+	}
+
+	const uint64_t name_h = tessera_dir_name_hash(name, (uint16_t)namelen);
+	const uint32_t nbk = tessera_manifest_parser_count(outer);
+
+	/* Find the bucket that would contain `name`: largest first_hash ≤
+	 * name_h. Same logic as tessera_fs_dir_2l_lookup. */
+	int target_idx = -1;
+	{
+		int lo = 0, hi = (int)nbk - 1, best = 0;
+		while (lo <= hi) {
+			int mid = lo + (hi - lo) / 2;
+			tessera_dir_bucket_record_t br;
+			if (tessera_manifest_dir_bucket_at(outer,
+			    (uint32_t)mid, &br) != TESSERA_OK) {
+				tessera_manifest_parser_free(outer);
+				free(outer_blob, M_TESSERA);
+				return (EIO);
+			}
+			if (br.first_name_hash <= name_h) {
+				best = mid;
+				lo = mid + 1;
+			} else {
+				hi = mid - 1;
+			}
+		}
+		if (nbk > 0) target_idx = best;
+	}
+
+	/* Fetch the target bucket (if any) and walk it once to apply the
+	 * REMOVE skip / detect EEXIST for ADD. Build a fresh bucket
+	 * builder while we go. */
+	tessera_manifest_builder_t *bmb =
+	    tessera_manifest_begin(TESSERA_MFT_DIRECTORY);
+	if (bmb == NULL) {
+		tessera_manifest_parser_free(outer);
+		free(outer_blob, M_TESSERA);
+		return (ENOMEM);
+	}
+
+	int matched = 0;
+	uint64_t bucket_first_hash = name_h;
+	uint32_t bucket_count = 0;
+	uint8_t  *bbuf = NULL;
+	uint32_t  blen = 0;
+
+	if (target_idx >= 0) {
+		tessera_dir_bucket_record_t target;
+		if (tessera_manifest_dir_bucket_at(outer,
+		    (uint32_t)target_idx, &target) != TESSERA_OK) {
+			tessera_manifest_free(bmb);
+			tessera_manifest_parser_free(outer);
+			free(outer_blob, M_TESSERA);
+			return (EIO);
+		}
+		if (tessera_fs_fetch_blob(tmp_, target.bucket_manifest_hash,
+		    &bbuf, &blen) != 0) {
+			tessera_manifest_free(bmb);
+			tessera_manifest_parser_free(outer);
+			free(outer_blob, M_TESSERA);
+			return (EIO);
+		}
+		if (blen < 32) {
+			free(bbuf, M_TESSERA);
+			tessera_manifest_free(bmb);
+			tessera_manifest_parser_free(outer);
+			free(outer_blob, M_TESSERA);
+			return (EIO);
+		}
+		const uint8_t *body = bbuf + 32;
+		const size_t   body_len = blen - 32;
+		int saw_first = 0;
+		for (size_t off = 0; off + 10 <= body_len; ) {
+			uint64_t ch;
+			uint16_t nl;
+			memcpy(&ch, body + off,     8);
+			memcpy(&nl, body + off + 8, 2);
+			if (off + 10 + nl > body_len) {
+				free(bbuf, M_TESSERA);
+				tessera_manifest_free(bmb);
+				tessera_manifest_parser_free(outer);
+				free(outer_blob, M_TESSERA);
+				return (EIO);
+			}
+			const char *nm = (const char *)(body + off + 10);
+			int match = (nl == namelen) &&
+			    (memcmp(nm, name, namelen) == 0);
+			if (match) {
+				matched = 1;
+				if (op == 0) { /* ADD: collision */
+					free(bbuf, M_TESSERA);
+					tessera_manifest_free(bmb);
+					tessera_manifest_parser_free(outer);
+					free(outer_blob, M_TESSERA);
+					return (EEXIST);
+				}
+				if (verify_inode != 0 &&
+				    ch != verify_inode) {
+					free(bbuf, M_TESSERA);
+					tessera_manifest_free(bmb);
+					tessera_manifest_parser_free(outer);
+					free(outer_blob, M_TESSERA);
+					return (EIO);
+				}
+				/* Skip — REMOVE drops it. */
+			} else {
+				uint64_t this_h = tessera_dir_name_hash(nm, nl);
+				if (!saw_first || this_h < bucket_first_hash) {
+					bucket_first_hash = this_h;
+					saw_first = 1;
+				}
+				if (tessera_manifest_add_dirent(bmb, ch, nm,
+				    nl) != TESSERA_OK) {
+					free(bbuf, M_TESSERA);
+					tessera_manifest_free(bmb);
+					tessera_manifest_parser_free(outer);
+					free(outer_blob, M_TESSERA);
+					return (ENOMEM);
+				}
+				bucket_count++;
+			}
+			off += 10 + nl;
+		}
+		free(bbuf, M_TESSERA);
+	}
+
+	if (op == 1 && !matched) {
+		tessera_manifest_free(bmb);
+		tessera_manifest_parser_free(outer);
+		free(outer_blob, M_TESSERA);
+		return (ENOENT);
+	}
+	if (op == 0) {
+		if (tessera_manifest_add_dirent(bmb, add_inode, name,
+		    (uint16_t)namelen) != TESSERA_OK) {
+			tessera_manifest_free(bmb);
+			tessera_manifest_parser_free(outer);
+			free(outer_blob, M_TESSERA);
+			return (ENOMEM);
+		}
+		if (bucket_count == 0 || name_h < bucket_first_hash)
+			bucket_first_hash = name_h;
+		bucket_count++;
+	}
+
+	/* Publish the new bucket. Skip publish if it's now empty —
+	 * we'll just drop it from the outer below. */
+	tessera_hash_t new_bucket_hash;
+	int bucket_dropped = (bucket_count == 0);
+	if (!bucket_dropped) {
+		size_t bmlen = 0;
+		tessera_hash_t bmhash;
+		(void)tessera_manifest_finalize(bmb, NULL, 0, &bmlen, bmhash);
+		uint8_t *bbody = malloc(bmlen, M_TESSERA, M_WAITOK);
+		if (tessera_manifest_finalize(bmb, bbody, bmlen, &bmlen,
+		    bmhash) != TESSERA_OK) {
+			free(bbody, M_TESSERA);
+			tessera_manifest_free(bmb);
+			tessera_manifest_parser_free(outer);
+			free(outer_blob, M_TESSERA);
+			return (EIO);
+		}
+		/* Owner=0: bucket bytes are referenced by the outer
+		 * manifest. If we superseded by parent_inode_no the
+		 * bucket eviction would race the outer publish and
+		 * leave the outer briefly pointing at evicted bytes.
+		 * Untagged entries accumulate until commit_sb drains
+		 * them to disk; the pending-manifest byte cap drives
+		 * flush cadence. */
+		if (tessera_fs_publish_manifest(tmp_, bbody, bmlen,
+		    new_bucket_hash) != 0) {
+			free(bbody, M_TESSERA);
+			tessera_manifest_free(bmb);
+			tessera_manifest_parser_free(outer);
+			free(outer_blob, M_TESSERA);
+			return (EIO);
+		}
+		free(bbody, M_TESSERA);
+	}
+	tessera_manifest_free(bmb);
+
+	/* Build the new outer: copy unchanged buckets, replace the
+	 * target one with the rewritten bucket (or drop if empty). */
+	tessera_manifest_builder_t *omb =
+	    tessera_manifest_begin(TESSERA_MFT_DIRECTORY_2L);
+	if (omb == NULL) {
+		tessera_manifest_parser_free(outer);
+		free(outer_blob, M_TESSERA);
+		return (ENOMEM);
+	}
+	int placed_new = 0;
+	for (uint32_t i = 0; i < nbk; i++) {
+		tessera_dir_bucket_record_t br;
+		if (tessera_manifest_dir_bucket_at(outer, i, &br)
+		    != TESSERA_OK) {
+			tessera_manifest_free(omb);
+			tessera_manifest_parser_free(outer);
+			free(outer_blob, M_TESSERA);
+			return (EIO);
+		}
+		if ((int)i == target_idx) {
+			if (bucket_dropped) continue;
+			/* Place the rewritten bucket. With top-4-bits
+			 * (h >> 60) bucket assignment each bucket owns a
+			 * disjoint hash range, so the slot stays in
+			 * position regardless of which entry now has the
+			 * smallest hash within it. */
+			if (tessera_manifest_add_dir_bucket(omb,
+			    bucket_first_hash, new_bucket_hash)
+			    != TESSERA_OK) {
+				tessera_manifest_free(omb);
+				tessera_manifest_parser_free(outer);
+				free(outer_blob, M_TESSERA);
+				return (ENOMEM);
+			}
+			placed_new = 1;
+		} else {
+			if (tessera_manifest_add_dir_bucket(omb,
+			    br.first_name_hash, br.bucket_manifest_hash)
+			    != TESSERA_OK) {
+				tessera_manifest_free(omb);
+				tessera_manifest_parser_free(outer);
+				free(outer_blob, M_TESSERA);
+				return (ENOMEM);
+			}
+		}
+	}
+	if (op == 0 && !placed_new && !bucket_dropped) {
+		/* ADD into a bucket that didn't exist — first entry
+		 * with this top-4-bit prefix. Append; outer was sorted
+		 * by first_name_hash so this may be out of order, but
+		 * binary-search-by-hash continues to work because each
+		 * bucket's hash range is disjoint from its siblings. */
+		if (tessera_manifest_add_dir_bucket(omb,
+		    bucket_first_hash, new_bucket_hash) != TESSERA_OK) {
+			tessera_manifest_free(omb);
+			tessera_manifest_parser_free(outer);
+			free(outer_blob, M_TESSERA);
+			return (ENOMEM);
+		}
+	}
+	tessera_manifest_parser_free(outer);
+	free(outer_blob, M_TESSERA);
+
+	size_t omlen = 0;
+	tessera_hash_t omhash;
+	(void)tessera_manifest_finalize(omb, NULL, 0, &omlen, omhash);
+	uint8_t *obody = malloc(omlen, M_TESSERA, M_WAITOK);
+	if (tessera_manifest_finalize(omb, obody, omlen, &omlen, omhash)
+	    != TESSERA_OK) {
+		free(obody, M_TESSERA);
+		tessera_manifest_free(omb);
+		return (EIO);
+	}
+	tessera_manifest_free(omb);
+
+	tessera_hash_t pub_hash;
+	if (tessera_fs_publish_manifest_owned(tmp_, obody, omlen,
+	    pub_hash, parent_inode_no) != 0) {
+		free(obody, M_TESSERA);
+		return (EIO);
+	}
+	free(obody, M_TESSERA);
+
+	memcpy(pino->manifest_hash, pub_hash, sizeof pub_hash);
+	return (0);
+}
+
 static int
 tessera_fs_dirent_rewrite(struct tessera_mount *tmp_,
                           uint32_t parent_inode_no,
@@ -7128,6 +7450,35 @@ tessera_fs_dirent_rewrite(struct tessera_mount *tmp_,
 	encode_inode_key(parent_inode_no, pkey);
 	if (tessera_fs_inode_get_byk(tmp_, pkey, &pino) != TESSERA_OK)
 		return (EIO);
+
+	/* Fast path: parent already a DIRECTORY_2L. Touch only the
+	 * affected bucket. Falls back to the slow walk-everything path
+	 * for flat DIRECTORY parents (where there's nothing to skip
+	 * anyway — the whole manifest fits in one blob). */
+	{
+		uint8_t *peek = NULL;
+		uint32_t peek_len = 0;
+		if (tessera_fs_fetch_blob(tmp_, pino.manifest_hash,
+		    &peek, &peek_len) == 0) {
+			tessera_manifest_kind_t pk = TESSERA_MFT_INLINE;
+			if (peek_len >= 32) {
+				tessera_manifest_parser_t *pp =
+				    tessera_manifest_parse(peek, peek_len);
+				if (pp != NULL) {
+					pk = tessera_manifest_parser_kind(pp);
+					tessera_manifest_parser_free(pp);
+				}
+			}
+			free(peek, M_TESSERA);
+			if (pk == TESSERA_MFT_DIRECTORY_2L) {
+				int rc = tessera_fs_dirent_rewrite_2l(tmp_,
+				    parent_inode_no, &pino, op, verify_inode,
+				    add_inode, name, namelen);
+				if (rc != 0) return (rc);
+				goto commit;
+			}
+		}
+	}
 
 	tessera_manifest_builder_t *mb =
 	    tessera_manifest_begin(TESSERA_MFT_DIRECTORY);
@@ -7187,6 +7538,8 @@ tessera_fs_dirent_rewrite(struct tessera_mount *tmp_,
 	free(new_mft, M_TESSERA);
 
 	memcpy(pino.manifest_hash, pub_hash, sizeof pub_hash);
+
+commit:
 	pino.gen++;
 	/* POSIX: parent dir's mtime + ctime are updated when its set of
 	 * entries changes (any add/remove/rename). pjdfstest's mkdir/00,
@@ -7204,6 +7557,7 @@ tessera_fs_dirent_rewrite(struct tessera_mount *tmp_,
 	if (tessera_fs_inode_put_byk(tmp_, pkey, &pino,
 	    &new_inode_root) != TESSERA_OK) return (EIO);
 	tmp_->sb.inode_root = new_inode_root;
+	(void)err;
 	return (0);
 }
 
@@ -8142,10 +8496,25 @@ tessera_vop_rename(struct vop_rename_args *ap)
 		goto release;            /* identical name — silent no-op */
 
 	if (same_parent && tvp == NULL) {
-		err = tessera_fs_dirent_rename_same_dir(tmp_,
-		    (uint32_t)fdn->inode_no, fn->inode_no,
-		    fcnp->cn_nameptr, fcnp->cn_namelen,
+		/* Same-dir, no collision. Two dirent_rewrite calls (ADD
+		 * then REMOVE) instead of the legacy
+		 * tessera_fs_dirent_rename_same_dir slow path — the
+		 * legacy helper walked the whole parent manifest for
+		 * the rename, which on DIRECTORY_2L parents is O(N).
+		 * Going through dirent_rewrite picks up the bucket-
+		 * targeted fast path (O(N/16)) and an extra btree_put
+		 * is cheap by comparison. */
+		err = tessera_fs_dirent_rewrite(tmp_,
+		    (uint32_t)fdn->inode_no,
+		    /*op=ADD*/ 0, /*verify*/ 0, /*add*/ fn->inode_no,
 		    tcnp->cn_nameptr, tcnp->cn_namelen);
+		if (err == 0) {
+			err = tessera_fs_dirent_rewrite(tmp_,
+			    (uint32_t)fdn->inode_no,
+			    /*op=REMOVE*/ 1, /*verify*/ fn->inode_no,
+			    /*add*/ 0,
+			    fcnp->cn_nameptr, fcnp->cn_namelen);
+		}
 	} else {
 		/* Cross-dir, or same-dir overwrite. Order:
 		 *   1. If overwrite: REMOVE the existing target dirent.

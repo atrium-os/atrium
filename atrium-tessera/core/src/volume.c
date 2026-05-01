@@ -414,7 +414,7 @@ tessera_volume_format(const tessera_block_io_t *io,
 	 * stress2's 4-incarnation parallel mkdir/creat — pending
 	 * sectors filled up faster than commit_sb could drain them. */
 	uint64_t meta_zone_sectors = TESSERA_METADATA_ZONE_SECTORS;
-	uint64_t meta_scaled = opts->total_sectors / 64;  /* ~1.5% */
+	uint64_t meta_scaled = opts->total_sectors / 16;  /* ~6% */
 	if (meta_scaled > meta_zone_sectors) meta_zone_sectors = meta_scaled;
 	const uint64_t free_zone_start =
 	    metadata_zone_start + meta_zone_sectors;
