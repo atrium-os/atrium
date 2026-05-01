@@ -7422,6 +7422,17 @@ tessera_vop_rename(struct vop_rename_args *ap)
 		err = EXDEV;
 		goto release;
 	}
+	/* Rename needs VWRITE on both parent dirs (source's for the
+	 * unlink, target's for the new dirent). UFS does the same. */
+	{
+		int aerr = VOP_ACCESS(fdvp, VWRITE, fcnp->cn_cred, curthread);
+		if (aerr != 0) { err = aerr; goto release; }
+		if (tdvp != fdvp) {
+			aerr = VOP_ACCESS(tdvp, VWRITE, tcnp->cn_cred,
+			    curthread);
+			if (aerr != 0) { err = aerr; goto release; }
+		}
+	}
 	struct tessera_mount *tmp_ = VFSTOTESSERA(fdvp->v_mount);
 	struct tessera_node  *fdn  = VTOTNODE(fdvp);
 	struct tessera_node  *tdn  = VTOTNODE(tdvp);
