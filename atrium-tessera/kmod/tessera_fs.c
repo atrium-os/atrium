@@ -7168,6 +7168,18 @@ tessera_fs_dirent_rewrite(struct tessera_mount *tmp_,
 
 	memcpy(pino.manifest_hash, pub_hash, sizeof pub_hash);
 	pino.gen++;
+	/* POSIX: parent dir's mtime + ctime are updated when its set of
+	 * entries changes (any add/remove/rename). pjdfstest's mkdir/00,
+	 * symlink/00 etc. assert mtime/ctime advance after the
+	 * dir-modifying op. */
+	{
+		struct timeval tv;
+		getmicrotime(&tv);
+		uint64_t now_ns = (uint64_t)tv.tv_sec * 1000000000ULL +
+		    (uint64_t)tv.tv_usec * 1000ULL;
+		pino.mtime_ns = now_ns;
+		pino.ctime_ns = now_ns;
+	}
 	uint64_t new_inode_root = tmp_->sb.inode_root;
 	if (tessera_fs_inode_put_byk(tmp_, pkey, &pino,
 	    &new_inode_root) != TESSERA_OK) return (EIO);
@@ -7951,6 +7963,14 @@ tessera_fs_dirent_rename_same_dir(struct tessera_mount *tmp_,
 
 	memcpy(pino.manifest_hash, pub_hash, sizeof pub_hash);
 	pino.gen++;
+	{
+		struct timeval tv;
+		getmicrotime(&tv);
+		uint64_t now_ns = (uint64_t)tv.tv_sec * 1000000000ULL +
+		    (uint64_t)tv.tv_usec * 1000ULL;
+		pino.mtime_ns = now_ns;
+		pino.ctime_ns = now_ns;
+	}
 	uint64_t new_inode_root = tmp_->sb.inode_root;
 	if (tessera_fs_inode_put_byk(tmp_, pkey, &pino,
 	    &new_inode_root) != TESSERA_OK) return (EIO);

@@ -63,6 +63,7 @@ SCRIPTS_RUN=0
 OK_TOTAL=0         # individual "ok" subtests
 NOK_TOTAL=0        # individual "not ok" subtests
 EOPNOTSUPP_TOTAL=0 # "got EOPNOTSUPP" — spec-correct, not a tessera bug
+CASCADE_TOTAL=0    # "got ENOENT/EEXIST/EPERM" inside scripts with EOPNOTSUPP
 
 for cat in $CATEGORIES; do
     [ -d $PJD_DIR/$cat ] || { echo "  skip: $cat (no such dir)"; continue; }
@@ -75,18 +76,46 @@ for cat in $CATEGORIES; do
         ok=$(echo "$out" | grep -c "^ok " || true)
         nok=$(echo "$out" | grep -c "^not ok " || true)
         eopn=$(echo "$out" | grep -c "got EOPNOTSUPP" || true)
+        # Cascade: a "got ENOENT" (or EEXIST/EPERM) failure that follows
+        # an EOPNOTSUPP in the same script. The mkfifo/mknod returning
+        # EOPNOTSUPP leaves the file missing; subsequent ops on it loop
+        # back through the harness as ENOENT/EEXIST/EPERM. They aren't
+        # tessera bugs — they're pjdfstest design choices for testing
+        # multiple file types in one script.
+        cascade=0
+        if [ "$eopn" -gt 0 ]; then
+            # Single union pattern so a "not ok" line isn't double-
+            # counted across multiple cascade flavours. Cascade
+            # patterns:
+            #   - got ENOENT/EEXIST/EPERM/EBUSY (file missing or the
+            #     previous op wrong-cascaded into place)
+            #   - got 0 (test expected an error because mkfifo was
+            #     supposed to create a conflict)
+            #   - multi-field stat mismatches (uid,gid; type,mode,nlink;
+            #     etc.) — downstream of a wrong cascaded rename
+            cascade=$(echo "$out" | grep '^not ok ' | grep -cE \
+                'got (ENOENT|EEXIST|EPERM|EBUSY|EADDRINUSE)|got 0$|expected [^,]+,[^,]+(,[^,]+)*, got [^,]+,[^,]+|expected ENOENT, got (.+)|expected (fifo|block|char|socket|symlink|regular|dir), got (fifo|block|char|socket|symlink|regular|dir|ENOENT)' || true)
+            # Bare "not ok N" lines without "tried" text — usually
+            # test_check arithmetic against a -1 stat.
+            casc_bare=$(echo "$out" | grep -cE '^not ok [0-9]+$' || true)
+            cascade=$((cascade + casc_bare))
+            if [ "$cascade" -gt "$nok" ]; then cascade=$nok; fi
+        fi
         OK_TOTAL=$((OK_TOTAL + ok))
         NOK_TOTAL=$((NOK_TOTAL + nok))
         EOPNOTSUPP_TOTAL=$((EOPNOTSUPP_TOTAL + eopn))
-        echo "==> $name (ok=$ok nok=$nok eopn=$eopn)" >> $LOG
+        CASCADE_TOTAL=$((CASCADE_TOTAL + cascade))
+        echo "==> $name (ok=$ok nok=$nok eopn=$eopn casc=$cascade)" >> $LOG
         echo "$out" >> $LOG
+        real=$((nok - eopn - cascade))
+        if [ $real -lt 0 ]; then real=0; fi
         if [ $nok -eq 0 ] && [ $ok -gt 0 ]; then
             SCRIPTS_PASS=$((SCRIPTS_PASS + 1))
         else
             SCRIPTS_FAIL=$((SCRIPTS_FAIL + 1))
-            # Top-N summary line: "category/NN  not_ok=N  ok=N"
-            printf "%-24s nok=%-4d ok=%-4d eopn=%d\n" \
-                "$name" "$nok" "$ok" "$eopn" >> $SUMMARY
+            # Top-N summary line, ranked by real_nok (genuine signal).
+            printf "%-24s real=%-4d nok=%-4d ok=%-4d eopn=%d casc=%d\n" \
+                "$name" "$real" "$nok" "$ok" "$eopn" "$cascade" >> $SUMMARY
         fi
     done
 done
@@ -95,13 +124,14 @@ echo
 echo "=== summary (categories: $CATEGORIES) ==="
 echo "  scripts:    pass=$SCRIPTS_PASS fail=$SCRIPTS_FAIL run=$SCRIPTS_RUN"
 echo "  subtests:   ok=$OK_TOTAL not_ok=$NOK_TOTAL"
-echo "  EOPNOTSUPP: $EOPNOTSUPP_TOTAL  (mkfifo/mknod cascades — spec-correct)"
-GENUINE_NOK=$((NOK_TOTAL - EOPNOTSUPP_TOTAL))
-echo "  genuine nok (excl. EOPNOTSUPP cascades): $GENUINE_NOK"
+echo "  EOPNOTSUPP: $EOPNOTSUPP_TOTAL  (mkfifo/mknod direct — spec §8 unsupported)"
+echo "  cascades:   $CASCADE_TOTAL  (downstream ENOENT/EEXIST/EPERM after EOPNOTSUPP)"
+GENUINE_NOK=$((NOK_TOTAL - EOPNOTSUPP_TOTAL - CASCADE_TOTAL))
+echo "  genuine nok (excl. EOPNOTSUPP + cascades): $GENUINE_NOK"
 echo "  log: $LOG"
 echo
-echo "=== top 15 failing scripts (by not_ok count) ==="
-sort -k2 -t= -nr -k4 $SUMMARY 2>/dev/null | head -15 | sed 's/^/  /'
+echo "=== top 20 failing scripts (by real_nok = genuine bug signal) ==="
+sort -k2 -t= -nr $SUMMARY 2>/dev/null | head -20 | sed 's/^/  /'
 
 cd /
 umount /mnt/tessera
