@@ -38,7 +38,12 @@ truncate -s 67108864 "$EFI_VARS"
 GPU_ARGS=""
 VIRTIO_GPU_ARGS=""
 DISPLAY_FRONTEND=""
-NOGRAPHIC="-nographic"
+# Serial on TCP + qemu monitor on a unix socket. Keeps the VM detachable
+# (no stdio coupling) while still letting us reach the FreeBSD serial
+# console — `nc 127.0.0.1 4444` and send `~^B` to drop into ddb when
+# debug.kdb.alt_break_to_debugger=1, or `~B` to send a break when
+# debug.kdb.break_to_debugger=1. Use `nc -U /tmp/qmp.sock` for QMP.
+NOGRAPHIC="-display none -serial tcp:127.0.0.1:4444,server=on,wait=off -monitor unix:/tmp/qmp.sock,server=on,wait=off"
 for arg in "$@"; do
     case "$arg" in
         --gpu)

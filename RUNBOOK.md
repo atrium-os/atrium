@@ -227,9 +227,53 @@ Gotchas (each one cost a kernel panic + qcow2 restore — preserved here so the 
 
 If the kernel panics during a kmod experiment: `pkill -9 qemu-system-aarch64`, `xz -dk vm.qcow2.xz` (the post-first-boot baseline), boot, re-extract `src.txz`, rebuild. Don't `cargo build --release` in the VM — see `~/.claude/projects/.../memory/feedback_no_vm_cargo_release.md`.
 
+#### ddb over QEMU TCP serial (added 2026-05-01)
+
+The historical claim "kdb isn't reachable" no longer holds. `scripts/run-vm.sh` now exposes the serial console on `tcp:127.0.0.1:4444` and the QEMU monitor on `unix:/tmp/qmp.sock`. The stock GENERIC kernel running in the VM has `KDB`, `DDB`, `INVARIANTS`, `WITNESS`, `GDB`, and `KDB_TRACE` compiled in — no rebuild needed.
+
+```sh
+# enable break-into-debugger via serial (also persists if set in /etc/sysctl.conf)
+vssh "sysctl debug.kdb.break_to_debugger=1"
+```
+
+Two ways to enter ddb:
+
+1. **From the running guest** (good for "force a known-state probe"): `vssh "sysctl debug.kdb.enter=1"`. The sysctl drops the kernel into ddb immediately; the SSH session that issued it stays blocked until you `c` out.
+
+2. **When the VM is hung** (the actual reason this exists): `python3 scripts/ddb_session.py break`. Sends `\r~\x02` (the alt-break-to-debugger sequence) over the TCP serial. Requires `debug.kdb.alt_break_to_debugger=1` (the default).
+
+Once in ddb, drive the debugger over the same TCP serial:
+
+```sh
+# read backtrace + lock state of the offending thread
+python3 scripts/ddb_session.py "tr; show alllocks; show lockedvnods"
+
+# pick a process and trace its kernel stack
+python3 scripts/ddb_session.py "ps; tr 12345"
+
+# resume execution
+python3 scripts/ddb_session.py continue
+```
+
+`ddb_session.py` auto-responds to ddb's `--More--` paginator by sending space, so multi-page output (like `ps`) doesn't block. Pass a per-command timeout as the second argument if a command takes long (default 3 seconds).
+
+Useful ddb commands for kmod hangs:
+
+- `tr` — backtrace of the current thread.
+- `tr <pid>` — backtrace of a specific process's kernel stack.
+- `ps` — process table with wmesg (sleep channel) for each blocked thread.
+- `show alllocks` — all currently-held locks across all threads. The thread spinning at 100% will be the one with no waiters but holding things others wait on.
+- `show lockedvnods` — vnodes with someone holding their lock.
+- `show pcpu` — per-CPU state, useful when several CPUs are pinned.
+- `bt` — alternate spelling of trace.
+- `c` — continue execution.
+- `panic` — force a panic with stack trace; clean exit when you're done diagnosing.
+
+Read the FreeBSD `ddb(4)` man page for the full vocabulary; the above covers ~95% of kmod-hang triage.
+
 #### Debugging tessera_fs hangs (lessons from slice 4)
 
-When the kmod hangs the VM (qemu pinned at 400% CPU, ssh blocked, no panic), the FreeBSD kernel debugger isn't reachable through HVF/serial in this setup. You're flying blind unless you've **built visibility into the kmod beforehand**.
+This section captures patterns that are still useful even now that ddb is reachable — proactive instrumentation lets you read state without first having to enter ddb.
 
 **Pattern: trace ring + sysctl dump.** For the slice-4 work, two prior attempts hung the VM with no usable post-mortem. The third attempt added a 1024-entry static trace ring as the FIRST commit, before any of the actual fix code. Every meta-reserve event (`alloc-bump`, `alloc-reuse`, `free-push`, `drain-{begin,keep,release,end}`, `bitmap-built`) gets one entry with `(op, sector, gen, count)`. Static = kmod-lifetime, survives unmount. Reads via sysctl (no syscall plumbing into the hung VM).
 
