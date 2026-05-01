@@ -409,8 +409,15 @@ tessera_volume_format(const tessera_block_io_t *io,
 	const uint64_t J = opts->journal_sectors ? opts->journal_sectors
 	                                          : DEFAULT_JOURNAL_SECTORS;
 	const uint64_t metadata_zone_start = 4 + J;
+	/* Scale meta-reserve with volume size (max of the historical
+	 * 1024-sector floor and 1.5% of total). 4 MiB was tight under
+	 * stress2's 4-incarnation parallel mkdir/creat — pending
+	 * sectors filled up faster than commit_sb could drain them. */
+	uint64_t meta_zone_sectors = TESSERA_METADATA_ZONE_SECTORS;
+	uint64_t meta_scaled = opts->total_sectors / 64;  /* ~1.5% */
+	if (meta_scaled > meta_zone_sectors) meta_zone_sectors = meta_scaled;
 	const uint64_t free_zone_start =
-	    metadata_zone_start + TESSERA_METADATA_ZONE_SECTORS;
+	    metadata_zone_start + meta_zone_sectors;
 
 	if (J < 4) return TESSERA_EINVAL;
 	if (opts->total_sectors <= free_zone_start + 1)
@@ -548,7 +555,7 @@ tessera_volume_format(const tessera_block_io_t *io,
 	sb.pack_zone_start        = free_zone_start;
 	sb.pack_zone_length       = opts->total_sectors - free_zone_start;
 	sb.meta_reserve_start     = metadata_zone_start;
-	sb.meta_reserve_length    = TESSERA_METADATA_ZONE_SECTORS;
+	sb.meta_reserve_length    = meta_zone_sectors;
 	sb.meta_reserve_bump      = fc.bump;       /* runtime starts here */
 	sb.next_inode_no          =
 	    (opts->seed_dirent_name != NULL && opts->seed_dirent_name_len > 0)

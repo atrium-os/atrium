@@ -1691,11 +1691,14 @@ tessera_vget(struct mount *mp, uint64_t inode_no, uint64_t parent_inode_no,
 	}
 
 	VN_LOCK_ASHARE(vp);
-	if (insmntque1(vp, mp) != 0) {
-		vp->v_data = NULL;
-		vp->v_op = &dead_vnodeops;
-		vgone(vp);
-		vput(vp);
+	/* insmntque (dtr=true) handles its own vgone+vput on failure;
+	 * insmntque1 (dtr=false) needs manual cleanup by the caller, but
+	 * doing it under heavy parallel load races with the EXCLUSIVE
+	 * lock acquired at vn_lock above and panics vgonel with "vnode
+	 * is not exclusive locked but should be" (stress2's parallel
+	 * mkdir testcase). Using insmntque side-steps the manual
+	 * cleanup entirely. */
+	if (insmntque(vp, mp) != 0) {
 		free(tn, M_TESSERA);
 		return (EIO);
 	}
@@ -1708,9 +1711,12 @@ tessera_vget(struct mount *mp, uint64_t inode_no, uint64_t parent_inode_no,
 		return (error);
 	}
 	if (other != NULL) {
-		/* Race: another thread won the slot. Discard ours. */
-		vgone(vp);
-		vput(vp);
+		/* Race: another thread won the slot. vfs_hash_insert already
+		 * called vgone(vp) + vput(vp) on our losing vnode (see
+		 * sys/kern/vfs_hash.c — the LIST_INSERT_HEAD-then-vgone-vput
+		 * branch). Calling them again here was a double-free that
+		 * panicked vgonel with "vnode is not exclusive locked but
+		 * should be" under stress2's parallel mkdir testcase. */
 		*vpp = other;
 		return (0);
 	}
@@ -1808,11 +1814,14 @@ tessera_vget_synth(struct mount *mp, uint64_t inode_no,
 	}
 
 	VN_LOCK_ASHARE(vp);
-	if (insmntque1(vp, mp) != 0) {
-		vp->v_data = NULL;
-		vp->v_op = &dead_vnodeops;
-		vgone(vp);
-		vput(vp);
+	/* insmntque (dtr=true) handles its own vgone+vput on failure;
+	 * insmntque1 (dtr=false) needs manual cleanup by the caller, but
+	 * doing it under heavy parallel load races with the EXCLUSIVE
+	 * lock acquired at vn_lock above and panics vgonel with "vnode
+	 * is not exclusive locked but should be" (stress2's parallel
+	 * mkdir testcase). Using insmntque side-steps the manual
+	 * cleanup entirely. */
+	if (insmntque(vp, mp) != 0) {
 		free(tn, M_TESSERA);
 		return (EIO);
 	}
@@ -1825,9 +1834,9 @@ tessera_vget_synth(struct mount *mp, uint64_t inode_no,
 		return (error);
 	}
 	if (other != NULL) {
-		/* Another thread won the slot. Discard ours. */
-		vgone(vp);
-		vput(vp);
+		/* Another thread won the slot. vfs_hash_insert already did
+		 * vgone+vput on our losing vnode — see tessera_vget for the
+		 * detailed comment. */
 		*vpp = other;
 		return (0);
 	}
@@ -1855,8 +1864,19 @@ tessera_statfs_impl(struct mount *mp, struct statfs *sbp)
 	    : tmp_->sb.pack_zone_length;
 	sbp->f_bfree  = free_data;
 	sbp->f_bavail = free_data;
-	sbp->f_files  = 0;
-	sbp->f_ffree  = 0;
+	/* Inode count: tessera allocates from sb.next_inode_no with no
+	 * fixed cap. Report a generous estimate: used = next - first;
+	 * free = a large constant so tools that gate on free inodes
+	 * (stress2's getdf, df -i) don't see "0 free". The count is
+	 * descriptive, not authoritative. */
+	{
+		uint64_t used = (tmp_->sb.next_inode_no >
+		    TESSERA_INODE_FIRST_USER) ?
+		    (tmp_->sb.next_inode_no - TESSERA_INODE_FIRST_USER) : 0;
+		uint64_t free_files = 0xfffffffful - used;
+		sbp->f_files  = used + free_files;
+		sbp->f_ffree  = free_files;
+	}
 	return (0);
 }
 
