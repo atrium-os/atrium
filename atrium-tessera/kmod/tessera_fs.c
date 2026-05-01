@@ -2697,6 +2697,12 @@ tessera_vop_setattr(struct vop_setattr_args *ap)
 		if (cred->cr_uid != 0 && (vap->va_mode & 02000) &&
 		    !groupmember(ino.gid, cred))
 			return (EPERM);
+		/* Non-root user can't set the sticky bit (S_ISVTX) on a
+		 * non-directory (POSIX, FreeBSD UFS — pjdfstest expects
+		 * EFTYPE). */
+		if (cred->cr_uid != 0 && (vap->va_mode & 01000) &&
+		    vp->v_type != VDIR)
+			return (EFTYPE);
 	}
 
 	/* Truncate / extend (handles `>` shell redirection's pre-write
