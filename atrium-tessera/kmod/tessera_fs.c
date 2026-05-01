@@ -6302,6 +6302,10 @@ tessera_vop_remove(struct vop_remove_args *ap)
 	/* The kmod leaves vp->v_type == VNON in lookup (we never run a
 	 * synthetic VOP_GETATTR there); VFS only routes VOP_REMOVE for
 	 * non-directory targets, so trust the caller. */
+	{
+		int aerr = VOP_ACCESS(dvp, VWRITE, cnp->cn_cred, curthread);
+		if (aerr != 0) return (aerr);
+	}
 
 	/* dirent_rewrite handles flat DIRECTORY and DIRECTORY_2L parents
 	 * uniformly via dir_walk + auto-promoting publish_directory. */
@@ -6614,6 +6618,10 @@ tessera_vop_create(struct vop_create_args *ap)
 
 	if (tmp_->inode_tree == NULL) return (EROFS);
 	if (cnp->cn_namelen == 0 || cnp->cn_namelen > 0xffff) return (EINVAL);
+	{
+		int aerr = VOP_ACCESS(dvp, VWRITE, cnp->cn_cred, curthread);
+		if (aerr != 0) return (aerr);
+	}
 
 	int err = 0;
 	uint8_t  *child_mft = NULL;
@@ -6858,6 +6866,10 @@ tessera_vop_mkdir(struct vop_mkdir_args *ap)
 
 	if (tmp_->inode_tree == NULL) return (EROFS);
 	if (cnp->cn_namelen == 0 || cnp->cn_namelen > 0xffff) return (EINVAL);
+	{
+		int aerr = VOP_ACCESS(dvp, VWRITE, cnp->cn_cred, curthread);
+		if (aerr != 0) return (aerr);
+	}
 
 	int err = 0;
 	uint8_t *child_mft = NULL;
@@ -6954,6 +6966,10 @@ tessera_vop_rmdir(struct vop_rmdir_args *ap)
 	struct tessera_node  *cn = VTOTNODE(vp);
 
 	if (tmp_->inode_tree == NULL) return (EROFS);
+	{
+		int aerr = VOP_ACCESS(dvp, VWRITE, cnp->cn_cred, curthread);
+		if (aerr != 0) return (aerr);
+	}
 
 	/* Fetch child inode + manifest, verify it's empty. */
 	uint8_t ckey[4];
@@ -7017,6 +7033,10 @@ tessera_vop_symlink(struct vop_symlink_args *ap)
 	if (target == NULL) return (EINVAL);
 	size_t tlen = strlen(target);
 	if (tlen == 0 || tlen > 4096) return (ENAMETOOLONG);
+	{
+		int aerr = VOP_ACCESS(dvp, VWRITE, cnp->cn_cred, curthread);
+		if (aerr != 0) return (aerr);
+	}
 
 	int err = 0;
 	uint8_t *child_mft = NULL;
@@ -7153,6 +7173,13 @@ tessera_vop_link(struct vop_link_args *ap)
 	if (tmp_->inode_tree == NULL) return (EROFS);
 	if (vp->v_type == VDIR) return (EPERM);
 	if (tdvp->v_mount != vp->v_mount) return (EXDEV);
+
+	/* POSIX: linking a name into a directory requires write permission
+	 * on that directory. */
+	{
+		int aerr = VOP_ACCESS(tdvp, VWRITE, cnp->cn_cred, curthread);
+		if (aerr != 0) return (aerr);
+	}
 
 	uint8_t ckey[4];
 	tessera_inode_record_t cino;
