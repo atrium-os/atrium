@@ -42,9 +42,17 @@
 #include <sys/callout.h>
 #include <sys/lock.h>
 #include <sys/mutex.h>
+#include <sys/rwlock.h>
 #include <sys/taskqueue.h>
 #include <geom/geom.h>
 #include <geom/geom_vfs.h>
+#include <vm/vm.h>
+#include <vm/vm_extern.h>
+#include <vm/vm_object.h>
+#include <vm/vm_page.h>
+#include <vm/vm_pager.h>
+#include <vm/vnode_pager.h>
+#include <sys/sf_buf.h>
 
 #include "tessera/btree.h"
 #include "tessera/codec.h"
@@ -2521,42 +2529,25 @@ tessera_fs_read_into_uio(struct tessera_mount *tmp_,
 	return (EIO);
 }
 
+/*
+ * Read content from an inode into a uio. Same body that backs
+ * tessera_vop_read; also used by tessera_vop_getpages to fill VM pages
+ * directly without going through the buffer-cache strategy path.
+ */
 static int
-tessera_vop_read(struct vop_read_args *ap)
+tessera_fs_read_inode_uio(struct tessera_mount *tmp_,
+                          const tessera_inode_record_t *ino,
+                          struct uio *uio)
 {
-	struct vnode *vp = ap->a_vp;
-	struct uio   *uio = ap->a_uio;
-	struct tessera_node *tn = VTOTNODE(vp);
-	struct tessera_mount *tmp_ = VFSTOTESSERA(vp->v_mount);
 	int err = 0;
 
-	if (vp->v_type == VDIR) return (EISDIR);
-	if (vp->v_type != VREG && vp->v_type != VNON) return (EINVAL);
-	if (uio->uio_offset < 0) return (EINVAL);
-	if (uio->uio_resid == 0) return (0);
-	if (tmp_->inode_tree == NULL) return (EIO);
+	if ((uint64_t)uio->uio_offset >= ino->size) return (0);
+	if (tessera_hash_is_null(ino->manifest_hash)) return (0);
 
-	/* Read the inode record. v2 slice-3: snapshot vnodes consult
-	 * the historical inode_tree. */
-	uint8_t key[4];
-	tessera_inode_record_t ino;
-	encode_inode_key((uint32_t)tn->inode_no, key);
-	int igrc3 = (tn->snapshot_gen != 0)
-	    ? tessera_fs_inode_get_at_gen(tmp_, (uint32_t)tn->inode_no,
-	          tn->snapshot_gen, &ino)
-	    : tessera_fs_inode_get_byk(tmp_, key, &ino);
-	if (igrc3 != TESSERA_OK)
-		return (EIO);
-
-	/* Empty file or read past EOF. */
-	if ((uint64_t)uio->uio_offset >= ino.size) return (0);
-	if (tessera_hash_is_null(ino.manifest_hash)) return (0);
-
-	/* Fetch + parse the manifest. */
 	uint8_t *blob = NULL;
 	uint32_t blob_len = 0;
-	if (tessera_fs_fetch_blob(tmp_, ino.manifest_hash, &blob, &blob_len)
-	    != 0)
+	if (tessera_fs_fetch_blob(tmp_, ino->manifest_hash,
+	    &blob, &blob_len) != 0)
 		return (EIO);
 	tessera_manifest_parser_t *p = tessera_manifest_parse(blob, blob_len);
 	if (p == NULL) {
@@ -2574,8 +2565,7 @@ tessera_vop_read(struct vop_read_args *ap)
 			err = EIO;
 			goto out;
 		}
-		/* Clamp to inode.size in case the manifest is longer. */
-		if (data_len > ino.size) data_len = (size_t)ino.size;
+		if (data_len > ino->size) data_len = (size_t)ino->size;
 		if ((uint64_t)uio->uio_offset >= data_len) goto out;
 
 		size_t remaining = data_len - (size_t)uio->uio_offset;
@@ -2593,6 +2583,33 @@ out:
 	tessera_manifest_parser_free(p);
 	free(blob, M_TESSERA);
 	return (err);
+}
+
+static int
+tessera_vop_read(struct vop_read_args *ap)
+{
+	struct vnode *vp = ap->a_vp;
+	struct uio   *uio = ap->a_uio;
+	struct tessera_node *tn = VTOTNODE(vp);
+	struct tessera_mount *tmp_ = VFSTOTESSERA(vp->v_mount);
+
+	if (vp->v_type == VDIR) return (EISDIR);
+	if (vp->v_type != VREG && vp->v_type != VNON) return (EINVAL);
+	if (uio->uio_offset < 0) return (EINVAL);
+	if (uio->uio_resid == 0) return (0);
+	if (tmp_->inode_tree == NULL) return (EIO);
+
+	uint8_t key[4];
+	tessera_inode_record_t ino;
+	encode_inode_key((uint32_t)tn->inode_no, key);
+	int igrc3 = (tn->snapshot_gen != 0)
+	    ? tessera_fs_inode_get_at_gen(tmp_, (uint32_t)tn->inode_no,
+	          tn->snapshot_gen, &ino)
+	    : tessera_fs_inode_get_byk(tmp_, key, &ino);
+	if (igrc3 != TESSERA_OK)
+		return (EIO);
+
+	return (tessera_fs_read_inode_uio(tmp_, &ino, uio));
 }
 
 /* ── vop_setattr (utimes / chmod / chown / chflags) ─────────── */
@@ -2703,14 +2720,93 @@ tessera_vop_setattr(struct vop_setattr_args *ap)
 			return (EIO);
 	}
 
-	(void)did_resize;
+	if (did_resize)
+		vnode_pager_setsize(ap->a_vp, ino.size);
 	tessera_fs_mark_dirty(tmp_);
 	return (0);
 }
 
 static int
 tessera_vop_open(struct vop_open_args *ap)
-{ (void)ap; return (0); }
+{
+	struct vnode *vp = ap->a_vp;
+	if (vp->v_type == VREG)
+		(void)vnode_create_vobject(vp, 0, ap->a_td);
+	return (0);
+}
+
+/*
+ * vop_getpages — fill VM pages from file content for mmap / exec.
+ *
+ * The default vop_stdgetpages routes through vnode_pager_generic_getpages
+ * which uses the buffer cache + VOP_STRATEGY. Tessera's pack model
+ * doesn't fit a "logical block → physical block" mapping (chunks live in
+ * content-addressed packs reached via two btrees), so we fill pages
+ * directly via tessera_fs_read_inode_uio. One sf_buf-mapped page at a
+ * time — short-term mappings, sleepable allocator, no recursion through
+ * the strategy path that panics in bufstrategy().
+ */
+static int
+tessera_vop_getpages(struct vop_getpages_args *ap)
+{
+	struct vnode *vp = ap->a_vp;
+	vm_page_t   *ma  = ap->a_m;
+	int          count = ap->a_count;
+
+	if (vp->v_type != VREG) return (VM_PAGER_FAIL);
+
+	struct tessera_node  *tn   = VTOTNODE(vp);
+	struct tessera_mount *tmp_ = VFSTOTESSERA(vp->v_mount);
+	if (tmp_->inode_tree == NULL) return (VM_PAGER_FAIL);
+
+	tessera_inode_record_t ino;
+	int igrc = (tn->snapshot_gen != 0)
+	    ? tessera_fs_inode_get_at_gen(tmp_, (uint32_t)tn->inode_no,
+	          tn->snapshot_gen, &ino)
+	    : tessera_fs_inode_get(tmp_, (uint32_t)tn->inode_no, &ino);
+	if (igrc != TESSERA_OK) return (VM_PAGER_FAIL);
+
+	int rv = VM_PAGER_OK;
+	for (int i = 0; i < count; i++) {
+		vm_page_t pg = ma[i];
+		off_t     off = (off_t)pg->pindex << PAGE_SHIFT;
+
+		struct sf_buf *sf = sf_buf_alloc(pg, 0);
+		if (sf == NULL) { rv = VM_PAGER_FAIL; break; }
+		void *kva = (void *)sf_buf_kva(sf);
+		bzero(kva, PAGE_SIZE);
+
+		if ((uint64_t)off < ino.size) {
+			size_t to_read = (off + PAGE_SIZE > (off_t)ino.size)
+			    ? (size_t)(ino.size - off)
+			    : PAGE_SIZE;
+
+			struct iovec iov = { .iov_base = kva,
+			                     .iov_len  = to_read };
+			struct uio uio;
+			uio.uio_iov     = &iov;
+			uio.uio_iovcnt  = 1;
+			uio.uio_offset  = off;
+			uio.uio_resid   = (ssize_t)to_read;
+			uio.uio_segflg  = UIO_SYSSPACE;
+			uio.uio_rw      = UIO_READ;
+			uio.uio_td      = curthread;
+
+			int err = tessera_fs_read_inode_uio(tmp_, &ino, &uio);
+			if (err != 0) {
+				sf_buf_free(sf);
+				rv = VM_PAGER_FAIL;
+				break;
+			}
+		}
+		vm_page_valid(pg);
+		sf_buf_free(sf);
+	}
+
+	if (ap->a_rbehind != NULL) *ap->a_rbehind = 0;
+	if (ap->a_rahead  != NULL) *ap->a_rahead  = 0;
+	return (rv);
+}
 
 static int
 tessera_vop_close(struct vop_close_args *ap)
@@ -6524,6 +6620,7 @@ tessera_vop_write(struct vop_write_args *ap)
 			tessera_stat_append_fast_ok++;
 			tessera_stat_vop_write_chunked++;
 			free(new_bytes, M_TESSERA);
+			vnode_pager_setsize(vp, final_size);
 			tessera_fs_mark_dirty(tmp_);
 			return (0);
 		}
@@ -6568,6 +6665,8 @@ tessera_vop_write(struct vop_write_args *ap)
 	free(full, M_TESSERA);
 	if (rc != 0) return (rc);
 
+	if (final_size != ino.size)
+		vnode_pager_setsize(vp, final_size);
 	tessera_fs_mark_dirty(tmp_);
 	return (0);
 }
@@ -7208,6 +7307,7 @@ struct vop_vector tessera_vnodeops = {
 	.vop_rename   = tessera_vop_rename,
 	.vop_open     = tessera_vop_open,
 	.vop_close    = tessera_vop_close,
+	.vop_getpages = tessera_vop_getpages,
 	.vop_fsync    = tessera_vop_fsync,
 	.vop_reclaim  = tessera_vop_reclaim,
 };
