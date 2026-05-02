@@ -379,6 +379,25 @@ tessera_kbio_read(void *ctx, uint64_t sector, uint8_t *out)
 	return (0);
 }
 
+/* Per-sector BIO_FLUSH knob. Default 0 — commit_sb's two barrier
+ * flushes (one before the SB write, one after) are sufficient for
+ * crash recovery: the first ensures all prior pack/btree/journal-
+ * record writes are durable BEFORE the SB sector that names them
+ * is committed; the second ensures the SB is durable BEFORE
+ * journal_checkpoint retires the records that would let replay
+ * recover from a torn SB. Per-write FLUSH was a debugging
+ * conservatism while bringing up Phase B.2; it costs ~2-2.6× on
+ * medium-block writes (measured) and adds nothing the barrier
+ * flushes don't already cover.
+ *
+ * Set to 1 if you want belt-and-suspenders or to bisect crash
+ * issues that suspect the barrier model. */
+static int tessera_flush_per_write = 0;
+SYSCTL_INT(_kern_tessera, OID_AUTO, flush_per_write,
+    CTLFLAG_RW, &tessera_flush_per_write, 0,
+    "1 = BIO_FLUSH after every kbio_write (slower, paranoid); "
+    "0 = rely on commit_sb's barrier flushes (default, faster)");
+
 static int
 tessera_kbio_write(void *ctx, uint64_t sector, const uint8_t *buf)
 {
@@ -390,6 +409,7 @@ tessera_kbio_write(void *ctx, uint64_t sector, const uint8_t *buf)
 	memcpy(bp->b_data, buf, TESSERA_SECTOR_SIZE);
 	int rc = bwrite(bp);
 	if (rc != 0) return rc;
+	if (!tessera_flush_per_write) return 0;
 
 	/* Issue an explicit BIO_FLUSH to force the underlying device
 	 * (and, when running under qemu on macOS, the host backing
@@ -412,6 +432,26 @@ tessera_kbio_write(void *ctx, uint64_t sector, const uint8_t *buf)
 		g_destroy_bio(flush);
 	}
 	return 0;
+}
+
+/* Crash-durability barrier. Issue a single BIO_FLUSH on the
+ * mount's GEOM consumer; on macOS+qemu this triggers an fsync()
+ * of the backing host file. Callers use this at commit_sb's two
+ * ordering points to keep durability semantics correct without
+ * paying per-write FLUSH cost. */
+static void
+tessera_kbio_barrier(struct tessera_kbio_ctx *k)
+{
+	if (k == NULL || k->cp == NULL) return;
+	struct bio *flush = g_alloc_bio();
+	flush->bio_cmd = BIO_FLUSH;
+	flush->bio_done = NULL;
+	flush->bio_offset = 0;
+	flush->bio_length = 0;
+	flush->bio_data = NULL;
+	g_io_request(flush, k->cp);
+	(void)biowait(flush, "tbarr");
+	g_destroy_bio(flush);
 }
 
 /*
@@ -3751,6 +3791,15 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 		}
 	}
 
+	/* Barrier #1: ensure all prior pack/btree/manifest writes are
+	 * durable on the host file BEFORE we write the journal record
+	 * that names them as committed. Without this, a crash with the
+	 * journal record on disk but the data sectors still in qemu RAM
+	 * would have replay re-applying a record whose payload references
+	 * sectors that don't have the right contents. (No-op fast path
+	 * if cp is NULL.) */
+	tessera_kbio_barrier(&tmp_->bio_ctx);
+
 	if (tmp_->journal != NULL) {
 		uint64_t tx;
 		if (tessera_journal_tx_begin(tmp_->journal, &tx,
@@ -3800,6 +3849,15 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 		return (EIO);
 	}
 	free(buf, M_TESSERA);
+
+	/* Barrier #2: ensure SB-A and SB-B are both durable on the host
+	 * file BEFORE journal_checkpoint advances head=tail=1, retiring
+	 * the records that would let replay roll forward across a torn
+	 * SB write. Without this, a crash between the SB write (in qemu
+	 * RAM) and the checkpoint write (also in qemu RAM, but it's the
+	 * later sector so qemu may flush it first) leaves disk with an
+	 * empty journal AND a stale on-disk SB — unrecoverable state. */
+	tessera_kbio_barrier(&tmp_->bio_ctx);
 
 	/* SB durably advanced. The journal record we just appended is now
 	 * applied; checkpoint frees its sectors so the next commit doesn't
