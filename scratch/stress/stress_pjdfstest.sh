@@ -89,6 +89,15 @@ for cat in $CATEGORIES; do
         # scratch dirs; the FS gets unmounted at the end anyway.
         ok=$(echo "$out" | grep -c "^ok " || true)
         nok=$(echo "$out" | grep -c "^not ok " || true)
+        # TAP `# TODO` directive: pjdfstest's misc.sh `todo` helper
+        # marks the next expect as expected-fail (e.g. rmdir/12's
+        # `rmdir x/..` which FreeBSD intentionally returns EINVAL
+        # for, while strict POSIX wants ENOTEMPTY/EEXIST). A proper
+        # TAP harness reports these as `not ok N # TODO` and does
+        # NOT count them against the suite. Subtract here so they
+        # don't show up as real bugs.
+        todo=$(echo "$out" | grep -c "^not ok .* # TODO" || true)
+        nok=$((nok - todo))
         eopn=$(echo "$out" | grep -c "got EOPNOTSUPP" || true)
         # Cascade: a "got ENOENT" (or EEXIST/EPERM) failure that follows
         # an EOPNOTSUPP in the same script. The mkfifo/mknod returning
