@@ -4220,6 +4220,77 @@ tessera_fs_inode_delete(struct tessera_mount *tmp_, uint32_t inode_no)
 	return (TESSERA_OK);
 }
 
+/* Drain just the tombstone entries from dirty_inodes. Done as a
+ * pre-pass in tessera_fs_flush so that subsequent gc_data_zone()
+ * sees the to-be-deleted inodes as gone — their content packs
+ * (CHUNK_LIST blobs etc.) become reclaimable orphans BEFORE the
+ * pending_manifests_drain that needs the freed sectors.
+ *
+ * Without this pre-pass, an rm-heavy workload churns dir-manifest
+ * packs while the just-deleted files' content packs sit in registry
+ * waiting for next mount-time GC. The data zone fills to 100% and
+ * subsequent publishes ENOSPC even though megabytes are logically
+ * free. Surfaced via stress_exhaustion.sh.
+ *
+ * Tombstones only need meta-reserve space (btree_delete on inode_tree),
+ * not data-zone space, so they can drain even when the data zone is
+ * tight. Non-tombstone entries stay in dirty_inodes for the regular
+ * drain. */
+static int
+tessera_fs_dirty_inodes_drain_tombstones(struct tessera_mount *tmp_)
+{
+	if (!tmp_->dirty_init || tmp_->inode_tree == NULL) return (0);
+
+	LIST_HEAD(, tessera_dirty_inode) snap;
+	LIST_INIT(&snap);
+	mtx_lock(&tmp_->flush_mtx);
+	uint32_t snap_count = 0;
+	for (uint32_t b = 0; b < TESSERA_DIRTY_INODE_BUCKETS; b++) {
+		struct tessera_dirty_inode *e, *next;
+		LIST_FOREACH_SAFE(e, &tmp_->dirty_inodes[b], link, next) {
+			if (!e->tombstone) continue;
+			LIST_REMOVE(e, link);
+			LIST_INSERT_HEAD(&snap, e, link);
+			snap_count++;
+			tmp_->dirty_count--;
+		}
+	}
+	mtx_unlock(&tmp_->flush_mtx);
+	if (snap_count == 0) return (0);
+
+	int err = 0;
+	uint64_t root = tmp_->sb.inode_root;
+	struct tessera_dirty_inode *e;
+	while ((e = LIST_FIRST(&snap)) != NULL) {
+		LIST_REMOVE(e, link);
+		uint8_t key[4];
+		encode_inode_key(e->inode_no, key);
+		int r = tessera_btree_delete(tmp_->inode_tree, key, &root);
+		if (r != TESSERA_OK && r != TESSERA_ENOENT) {
+			err = EIO;
+			/* Restore on failure so the regular drain retries. */
+			mtx_lock(&tmp_->flush_mtx);
+			uint32_t b = e->inode_no &
+			    (TESSERA_DIRTY_INODE_BUCKETS - 1u);
+			LIST_INSERT_HEAD(&tmp_->dirty_inodes[b], e, link);
+			tmp_->dirty_count++;
+			mtx_unlock(&tmp_->flush_mtx);
+			break;
+		}
+		free(e, M_TESSERA);
+	}
+	while ((e = LIST_FIRST(&snap)) != NULL) {
+		LIST_REMOVE(e, link);
+		mtx_lock(&tmp_->flush_mtx);
+		uint32_t b = e->inode_no & (TESSERA_DIRTY_INODE_BUCKETS - 1u);
+		LIST_INSERT_HEAD(&tmp_->dirty_inodes[b], e, link);
+		tmp_->dirty_count++;
+		mtx_unlock(&tmp_->flush_mtx);
+	}
+	if (err == 0) tmp_->sb.inode_root = root;
+	return (err);
+}
+
 /* Drain dirty_inodes → inode_tree. Two-phase: snapshot the entire
  * dirty set into a local list under the mutex, then process without
  * holding it (btree_put may sleep on memory alloc; witness will
@@ -4596,6 +4667,32 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 	 * tree BEFORE commit_sb writes the SB sectors — without it,
 	 * sb.free_extent_root would point at a stale view that misses
 	 * sectors allocated during this drain. */
+	/* Pre-pass: drain inode tombstones and run GC so the just-deleted
+	 * files' content packs become reclaimable BEFORE pending_manifests_
+	 * drain tries to allocate fresh sectors. Critical for rm-heavy
+	 * workloads where the data zone would otherwise fill to 100%
+	 * (each rm publishes a new dir manifest pack while the unlinked
+	 * files' content packs sit in registry until next mount-time GC).
+	 *
+	 * Skip in the snapshot-readonly path (no inode mutations to drain)
+	 * and when there are no tombstones (gc_data_zone is O(N inodes ×
+	 * N packs), don't pay the cost on the steady-state read-mostly
+	 * flush). */
+	int has_tombstones = 0;
+	mtx_lock(&tmp_->flush_mtx);
+	for (uint32_t b = 0; b < TESSERA_DIRTY_INODE_BUCKETS &&
+	    !has_tombstones; b++) {
+		struct tessera_dirty_inode *e;
+		LIST_FOREACH(e, &tmp_->dirty_inodes[b], link) {
+			if (e->tombstone) { has_tombstones = 1; break; }
+		}
+	}
+	mtx_unlock(&tmp_->flush_mtx);
+	if (has_tombstones && !tmp_->readonly_snapshot) {
+		(void)tessera_fs_dirty_inodes_drain_tombstones(tmp_);
+		(void)tessera_fs_gc_data_zone(tmp_);
+	}
+
 	int r = tessera_fs_pending_manifests_drain(tmp_);
 	if (r != 0)
 		printf("tessera_fs: flush — pending_manifests_drain failed: %d "
