@@ -19,6 +19,10 @@ path = "src/bin/debug.rs"
 name = "tessera-import"
 path = "src/bin/import.rs"
 
+[[bin]]
+name = "tessera-stat"
+path = "src/bin/stat.rs"
+
 [dependencies]
 tessera-sys = { path = "../tessera-sys" }
 libc        = "0.2"
