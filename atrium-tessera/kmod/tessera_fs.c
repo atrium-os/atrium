@@ -877,6 +877,13 @@ struct tessera_mount {
 	struct callout            journal_log_co;
 	struct task               journal_log_task;
 	int                       journal_log_co_init;
+	/* Set during the mount-time tessera_journal_replay walk so the
+	 * inode_put / inode_delete / dirent_log_append paths SKIP the
+	 * journal-pending enqueue. Without this, replay re-journals
+	 * every record it just read; the next commit_sb's
+	 * journal_checkpoint cleans them up so it's net-benign, but
+	 * pure waste on every mount. */
+	int                       in_replay;
 
 	/* v2 snapshots slice 2: read-only historical mount via
 	 * `tessera.gen=N`. When 1, mountfs overrode sb roots from a
@@ -899,6 +906,25 @@ struct tessera_mount {
 	 * manifest-size cost via log(N) amplification. */
 	uint32_t                  chunk_size_override;
 };
+
+/* Allocate the next inode_no atomically. The bare
+ * `new = sb.next_inode_no; sb.next_inode_no = new+1;` pattern was
+ * latently racy — three callers (vop_create, vop_mkdir, vop_symlink)
+ * shared the field. VFS happens to serialize same-parent creates via
+ * the parent's exclusive vnode lock so the bug never fires today,
+ * but it'd start losing inode numbers (collisions, then panic) the
+ * moment that invariant changes. flush_mtx is the obvious shared
+ * mutex; we already use it for sb.inode_root coordination. */
+static inline uint32_t
+tessera_fs_alloc_inode_no(struct tessera_mount *tmp_)
+{
+	mtx_lock(&tmp_->flush_mtx);
+	uint32_t n = (uint32_t)tmp_->sb.next_inode_no;
+	if (n < TESSERA_INODE_FIRST_USER) n = TESSERA_INODE_FIRST_USER;
+	tmp_->sb.next_inode_no = n + 1;
+	mtx_unlock(&tmp_->flush_mtx);
+	return n;
+}
 
 static int
 tessera_kbio_alloc(void *ctx, uint64_t n, uint64_t *out_sector)
@@ -1262,8 +1288,10 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 		    "starting replay\n",
 		    (unsigned long)tmp_->sb.journal_start,
 		    (unsigned long)tmp_->sb.journal_length);
+		tmp_->in_replay = 1;
 		(void)tessera_journal_replay(tmp_->journal,
 		    tessera_replay_handler, &rctx);
+		tmp_->in_replay = 0;
 		printf("tessera_fs: replay applied %d ROOT_UPDATE record(s); "
 		    "%lu DIR records re-applied\n",
 		    rctx.applied,
@@ -4052,7 +4080,7 @@ tessera_fs_inode_put(struct tessera_mount *tmp_, uint32_t inode_no,
 	/* B.2 — clone for the journal pending queue BEFORE we take
 	 * flush_mtx; malloc(M_WAITOK) is forbidden under it. */
 	struct tessera_pending_inode *jc = NULL;
-	if (tessera_journal_log_enable_default && tmp_->journal != NULL) {
+	if (tessera_journal_log_enable_default && tmp_->journal != NULL && !tmp_->in_replay) {
 		jc = malloc(sizeof *jc, M_TESSERA, M_WAITOK | M_ZERO);
 		jc->inode_no  = inode_no;
 		jc->tombstone = 0;
@@ -4135,7 +4163,7 @@ tessera_fs_inode_delete(struct tessera_mount *tmp_, uint32_t inode_no)
 	}
 
 	struct tessera_pending_inode *jc = NULL;
-	if (tessera_journal_log_enable_default && tmp_->journal != NULL) {
+	if (tessera_journal_log_enable_default && tmp_->journal != NULL && !tmp_->in_replay) {
 		jc = malloc(sizeof *jc, M_TESSERA, M_WAITOK | M_ZERO);
 		jc->inode_no  = inode_no;
 		jc->tombstone = 1;
@@ -9039,7 +9067,7 @@ tessera_fs_dirent_log_append(struct tessera_mount *tmp_,
 	 * INVARIANTS the kernel panics with "malloc(M_WAITOK) with
 	 * sleeping prohibited"). */
 	struct tessera_dirent_log_entry *jc = NULL;
-	if (tessera_journal_log_enable_default && tmp_->journal != NULL)
+	if (tessera_journal_log_enable_default && tmp_->journal != NULL && !tmp_->in_replay)
 		jc = tessera_dirent_log_entry_clone(e);
 
 	mtx_lock(&tmp_->flush_mtx);
@@ -10008,9 +10036,7 @@ tessera_vop_create(struct vop_create_args *ap)
 	uint8_t  *child_mft = NULL;
 
 	/* 1. Allocate inode_no. */
-	uint32_t new_ino = (uint32_t)tmp_->sb.next_inode_no;
-	if (new_ino < TESSERA_INODE_FIRST_USER) new_ino = TESSERA_INODE_FIRST_USER;
-	tmp_->sb.next_inode_no = new_ino + 1;
+	uint32_t new_ino = tessera_fs_alloc_inode_no(tmp_);
 
 	/* 2. Build & publish the child's empty INLINE manifest. */
 	{
@@ -10290,9 +10316,7 @@ tessera_vop_mkdir(struct vop_mkdir_args *ap)
 	int err = 0;
 	uint8_t *child_mft = NULL;
 
-	uint32_t new_ino = (uint32_t)tmp_->sb.next_inode_no;
-	if (new_ino < TESSERA_INODE_FIRST_USER) new_ino = TESSERA_INODE_FIRST_USER;
-	tmp_->sb.next_inode_no = new_ino + 1;
+	uint32_t new_ino = tessera_fs_alloc_inode_no(tmp_);
 
 	/* Empty DIRECTORY manifest. */
 	tessera_manifest_builder_t *mb =
@@ -10484,9 +10508,7 @@ tessera_vop_symlink(struct vop_symlink_args *ap)
 	int err = 0;
 	uint8_t *child_mft = NULL;
 
-	uint32_t new_ino = (uint32_t)tmp_->sb.next_inode_no;
-	if (new_ino < TESSERA_INODE_FIRST_USER) new_ino = TESSERA_INODE_FIRST_USER;
-	tmp_->sb.next_inode_no = new_ino + 1;
+	uint32_t new_ino = tessera_fs_alloc_inode_no(tmp_);
 
 	/* Build SYMLINK manifest. */
 	tessera_manifest_builder_t *mb =
