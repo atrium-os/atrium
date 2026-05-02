@@ -298,6 +298,72 @@ tessera_extent_alloc_multi(tessera_extent_alloc_t *a,
 }
 
 int
+tessera_extent_alloc_multi_partial(tessera_extent_alloc_t *a,
+                                    uint64_t n_sectors,
+                                    uint32_t max_count,
+                                    uint64_t *out_starts,
+                                    uint64_t *out_lengths,
+                                    uint32_t *out_count,
+                                    uint64_t *out_filled)
+{
+	if (a == NULL || out_starts == NULL || out_lengths == NULL ||
+	    out_count == NULL || out_filled == NULL) return TESSERA_EINVAL;
+	if (n_sectors == 0 || max_count == 0) return TESSERA_EINVAL;
+	if (a->free_blocks == 0) return TESSERA_ENOSPC;
+
+	const size_t n = a->count;
+	if (n == 0) return TESSERA_ENOSPC;
+
+	size_t *order = tessera_malloc(n * sizeof *order);
+	if (order == NULL) return TESSERA_ENOMEM;
+	for (size_t i = 0; i < n; i++) order[i] = i;
+	for (size_t i = 1; i < n; i++) {
+		size_t cur = order[i];
+		uint64_t curL = a->extents[cur].length_sectors;
+		size_t j = i;
+		while (j > 0 &&
+		    a->extents[order[j - 1]].length_sectors < curL) {
+			order[j] = order[j - 1];
+			j--;
+		}
+		order[j] = cur;
+	}
+
+	uint64_t need   = n_sectors;
+	uint64_t filled = 0;
+	uint32_t count  = 0;
+	for (size_t k = 0; k < n && need > 0 && count < max_count; k++) {
+		size_t idx = order[k];
+		uint64_t L = a->extents[idx].length_sectors;
+		uint64_t take = (L <= need) ? L : need;
+		out_starts[count]  = a->extents[idx].start_sector;
+		out_lengths[count] = take;
+		filled += take;
+		need   -= take;
+		count++;
+	}
+	tessera_free(order);
+
+	if (filled == 0) return TESSERA_ENOSPC;
+
+	for (uint32_t i = 0; i < count; i++) {
+		uint64_t got;
+		int r = tessera_extent_alloc(a, out_lengths[i], &got);
+		if (r != TESSERA_OK) {
+			for (uint32_t j = 0; j < i; j++)
+				(void)tessera_extent_free(a,
+				    out_starts[j], out_lengths[j]);
+			return r;
+		}
+		out_starts[i] = got;
+	}
+
+	*out_count  = count;
+	*out_filled = filled;
+	return TESSERA_OK;
+}
+
+int
 tessera_extent_free(tessera_extent_alloc_t *a, uint64_t start,
                     uint64_t n_sectors)
 {

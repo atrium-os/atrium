@@ -464,7 +464,7 @@ static int tessera_fs_pack_alloc_and_write(struct tessera_mount *tmp_,
     struct tessera_pack_alloc_result *out);
 static int tessera_fs_pack_extents_resolve(struct tessera_mount *tmp_,
     const tessera_registry_entry_t *re,
-    tessera_pack_extent_t *extents_out, uint32_t *out_count);
+    tessera_pack_extent_t **out_extents, uint32_t *out_count);
 static int tessera_vop_write(struct vop_write_args *ap);
 static int tessera_fs_read_full_content(struct tessera_mount *tmp_,
     const tessera_inode_record_t *ino,
@@ -4853,13 +4853,10 @@ tessera_fs_fetch_blob(struct tessera_mount *tmp_,
 		uint8_t *packbuf = malloc(pack_len, M_TESSERA, M_NOWAIT);
 		if (packbuf == NULL) goto next_pack;
 
-		tessera_pack_extent_t *exts = malloc(
-		    TESSERA_PEL_MAX_EXTENTS * sizeof(*exts),
-		    M_TESSERA, M_WAITOK);
+		tessera_pack_extent_t *exts = NULL;
 		uint32_t nexts = 0;
-		if (tessera_fs_pack_extents_resolve(tmp_, &re, exts, &nexts)
+		if (tessera_fs_pack_extents_resolve(tmp_, &re, &exts, &nexts)
 		    != 0) {
-			free(exts, M_TESSERA);
 			free(packbuf, M_TESSERA);
 			goto next_pack;
 		}
@@ -5145,12 +5142,10 @@ tessera_fs_gc_data_zone(struct tessera_mount *tmp_)
 			const size_t pack_len = (size_t)re.length_sectors *
 			    TESSERA_SECTOR_SIZE;
 			uint8_t *packbuf = malloc(pack_len, M_TESSERA, M_WAITOK);
-			tessera_pack_extent_t *exts = malloc(
-			    TESSERA_PEL_MAX_EXTENTS * sizeof(*exts),
-			    M_TESSERA, M_WAITOK);
+			tessera_pack_extent_t *exts = NULL;
 			uint32_t nexts = 0;
 			int ok = (tessera_fs_pack_extents_resolve(tmp_, &re,
-			    exts, &nexts) == 0);
+			    &exts, &nexts) == 0);
 			uint64_t cursor = 0;
 			for (uint32_t e = 0; e < nexts && ok; e++) {
 				for (uint64_t i = 0; i < exts[e].length_sectors;
@@ -5236,12 +5231,10 @@ next_p:
 			fake.start_sector   = deads[i].start;
 			fake.length_sectors = deads[i].len;
 			fake.flags          = deads[i].flags;
-			tessera_pack_extent_t *exts = malloc(
-			    TESSERA_PEL_MAX_EXTENTS * sizeof(*exts),
-			    M_TESSERA, M_WAITOK);
+			tessera_pack_extent_t *exts = NULL;
 			uint32_t nexts = 0;
 			if (tessera_fs_pack_extents_resolve(tmp_, &fake,
-			    exts, &nexts) == 0) {
+			    &exts, &nexts) == 0) {
 				for (uint32_t e = 0; e < nexts; e++)
 					(void)tessera_extent_free(
 					    tmp_->extent_alloc,
@@ -5249,8 +5242,28 @@ next_p:
 					    exts[e].length_sectors);
 			}
 			free(exts, M_TESSERA);
-			(void)tessera_extent_free(tmp_->extent_alloc,
-			    deads[i].start, 1);
+			/* Walk + free the PEL chain (one or more sectors). */
+			uint64_t pel_s = deads[i].start;
+			for (int d = 0; d < 64 && pel_s != 0; d++) {
+				struct buf *bp = NULL;
+				uint64_t next = 0;
+				if (bread(tmp_->devvp,
+				    pel_s * btodb(TESSERA_SECTOR_SIZE),
+				    TESSERA_SECTOR_SIZE,
+				    tmp_->bio_ctx.cred ?
+				        tmp_->bio_ctx.cred : NOCRED,
+				    &bp) == 0) {
+					tessera_pack_extent_list_t pel;
+					if (tessera_decode_pack_extent_list(
+					    (const uint8_t *)bp->b_data, &pel)
+					    == TESSERA_OK)
+						next = pel.next_pel_sector;
+					brelse(bp);
+				}
+				(void)tessera_extent_free(tmp_->extent_alloc,
+				    pel_s, 1);
+				pel_s = next;
+			}
 		}
 	}
 	free(deads, M_TESSERA);
@@ -5433,7 +5446,13 @@ tessera_fs_pack_alloc_and_write(struct tessera_mount *tmp_,
 	}
 	if (r != TESSERA_ENOSPC) return (EIO);
 
-	/* Gang fallback. Heap-allocate the extent vectors + PEL buffer —
+	/* Gang fallback with PEL chaining. When dust fragmentation makes
+	 * a single PEL's 253-extent cap insufficient, allocate multiple
+	 * PELs linked via next_pel_sector. Each iteration of the outer
+	 * loop fills one PEL with up to PEL_MAX_EXTENTS extents covering
+	 * as much of the remaining n_sectors as possible.
+	 *
+	 * Heap-alloc the per-iteration scratch (starts/lengths/pel/buf) —
 	 * keeping them on the stack would push the helper's frame to ~12
 	 * KiB even on the fast path, blowing FreeBSD's 16 KiB kernel
 	 * stack from any deep call chain. */
@@ -5445,96 +5464,161 @@ tessera_fs_pack_alloc_and_write(struct tessera_mount *tmp_,
 	    M_WAITOK);
 	uint8_t *pel_buf  = malloc(TESSERA_SECTOR_SIZE, M_TESSERA, M_WAITOK);
 
-	uint32_t count = 0;
-	r = tessera_extent_alloc_multi(tmp_->extent_alloc, n_sectors,
-	    TESSERA_PEL_MAX_EXTENTS, starts, lengths, &count);
-	if (r != TESSERA_OK) {
-		printf("tessera_fs: pack alloc — %llu sectors: contig "
-		    "ENOSPC, multi-extent fallback also failed (r=%d)\n",
-		    (unsigned long long)n_sectors, r);
-		free(pel_buf, M_TESSERA);
-		free(pel, M_TESSERA);
-		free(lengths, M_TESSERA);
-		free(starts, M_TESSERA);
-		return (ENOSPC);
-	}
+	/* Track every allocation we've made so we can roll back cleanly
+	 * on any mid-stream failure. all_starts/all_lengths grows by
+	 * doubling. */
+	uint32_t all_cap = TESSERA_PEL_MAX_EXTENTS;
+	uint32_t all_cnt = 0;
+	uint64_t *all_starts  = malloc(all_cap * sizeof *all_starts,
+	    M_TESSERA, M_WAITOK);
+	uint64_t *all_lengths = malloc(all_cap * sizeof *all_lengths,
+	    M_TESSERA, M_WAITOK);
+	uint32_t pel_chain_cap = 16;
+	uint32_t pel_chain_cnt = 0;
+	uint64_t *pel_chain = malloc(pel_chain_cap * sizeof *pel_chain,
+	    M_TESSERA, M_WAITOK);
 
-	uint64_t pel_sector = 0;
-	if (tessera_extent_alloc(tmp_->extent_alloc, 1, &pel_sector)
-	    != TESSERA_OK) {
-		for (uint32_t i = 0; i < count; i++)
-			(void)tessera_extent_free(tmp_->extent_alloc,
-			    starts[i], lengths[i]);
-		free(pel_buf, M_TESSERA);
-		free(pel, M_TESSERA);
-		free(lengths, M_TESSERA);
-		free(starts, M_TESSERA);
-		return (ENOSPC);
-	}
+#define _ROLLBACK_AND_RETURN(_rc) do {                                       \
+	for (uint32_t _i = 0; _i < all_cnt; _i++)                            \
+		(void)tessera_extent_free(tmp_->extent_alloc,                \
+		    all_starts[_i], all_lengths[_i]);                        \
+	for (uint32_t _i = 0; _i < pel_chain_cnt; _i++)                      \
+		(void)tessera_extent_free(tmp_->extent_alloc,                \
+		    pel_chain[_i], 1);                                       \
+	free(pel_buf, M_TESSERA); free(pel, M_TESSERA);                      \
+	free(lengths, M_TESSERA); free(starts, M_TESSERA);                   \
+	free(all_starts, M_TESSERA); free(all_lengths, M_TESSERA);           \
+	free(pel_chain, M_TESSERA);                                          \
+	return (_rc);                                                        \
+} while (0)
 
-	uint64_t cursor = 0;
-	int wrote_ok = 1;
-	for (uint32_t i = 0; i < count && wrote_ok; i++) {
-		for (uint64_t j = 0; j < lengths[i]; j++) {
-			if (tessera_kbio_write(&tmp_->bio_ctx,
-			    starts[i] + j,
-			    pack_bytes + (cursor + j) *
-			        TESSERA_SECTOR_SIZE) != 0) {
-				wrote_ok = 0;
-				break;
-			}
+	uint64_t remaining = n_sectors;
+	uint64_t data_cursor = 0;     /* offset in pack_bytes of next byte to write */
+	uint64_t head_pel = 0;
+	uint64_t prev_pel = 0;
+
+	while (remaining > 0) {
+		uint32_t count = 0;
+		uint64_t filled = 0;
+		r = tessera_extent_alloc_multi_partial(tmp_->extent_alloc,
+		    remaining, TESSERA_PEL_MAX_EXTENTS,
+		    starts, lengths, &count, &filled);
+		if (r != TESSERA_OK) {
+			printf("tessera_fs: pack alloc — %llu of %llu sectors "
+			    "remaining: extent allocator exhausted (r=%d)\n",
+			    (unsigned long long)remaining,
+			    (unsigned long long)n_sectors, r);
+			_ROLLBACK_AND_RETURN(ENOSPC);
 		}
-		cursor += lengths[i];
-	}
-	if (!wrote_ok) {
-		(void)tessera_extent_free(tmp_->extent_alloc, pel_sector, 1);
-		for (uint32_t k = 0; k < count; k++)
-			(void)tessera_extent_free(tmp_->extent_alloc,
-			    starts[k], lengths[k]);
-		free(pel_buf, M_TESSERA);
-		free(pel, M_TESSERA);
-		free(lengths, M_TESSERA);
-		free(starts, M_TESSERA);
-		return (EIO);
-	}
 
-	memset(pel, 0, sizeof *pel);
-	pel->magic        = TESSERA_PEL_MAGIC;
-	pel->version      = 1;
-	pel->extent_count = count;
-	pel->total_length = n_sectors;
-	for (uint32_t i = 0; i < count; i++) {
-		pel->extents[i].start_sector   = starts[i];
-		pel->extents[i].length_sectors = lengths[i];
-	}
-	int pel_ok = (tessera_encode_pack_extent_list(pel, pel_buf) == TESSERA_OK
-	    && tessera_kbio_write(&tmp_->bio_ctx, pel_sector, pel_buf) == 0);
-	if (!pel_ok) {
-		(void)tessera_extent_free(tmp_->extent_alloc, pel_sector, 1);
-		for (uint32_t i = 0; i < count; i++)
-			(void)tessera_extent_free(tmp_->extent_alloc,
-			    starts[i], lengths[i]);
-		free(pel_buf, M_TESSERA);
-		free(pel, M_TESSERA);
-		free(lengths, M_TESSERA);
-		free(starts, M_TESSERA);
-		return (EIO);
+		/* Record allocations for rollback. */
+		while (all_cnt + count > all_cap) {
+			all_cap *= 2;
+			uint64_t *gs = malloc(all_cap * sizeof *gs,
+			    M_TESSERA, M_WAITOK);
+			uint64_t *gl = malloc(all_cap * sizeof *gl,
+			    M_TESSERA, M_WAITOK);
+			memcpy(gs, all_starts,  all_cnt * sizeof *gs);
+			memcpy(gl, all_lengths, all_cnt * sizeof *gl);
+			free(all_starts, M_TESSERA);
+			free(all_lengths, M_TESSERA);
+			all_starts  = gs;
+			all_lengths = gl;
+		}
+		for (uint32_t i = 0; i < count; i++) {
+			all_starts[all_cnt]  = starts[i];
+			all_lengths[all_cnt] = lengths[i];
+			all_cnt++;
+		}
+
+		/* Allocate this PEL's sector. */
+		uint64_t pel_sector = 0;
+		if (tessera_extent_alloc(tmp_->extent_alloc, 1, &pel_sector)
+		    != TESSERA_OK)
+			_ROLLBACK_AND_RETURN(ENOSPC);
+		if (pel_chain_cnt == pel_chain_cap) {
+			pel_chain_cap *= 2;
+			uint64_t *gp = malloc(pel_chain_cap * sizeof *gp,
+			    M_TESSERA, M_WAITOK);
+			memcpy(gp, pel_chain, pel_chain_cnt * sizeof *gp);
+			free(pel_chain, M_TESSERA);
+			pel_chain = gp;
+		}
+		pel_chain[pel_chain_cnt++] = pel_sector;
+		if (head_pel == 0) head_pel = pel_sector;
+
+		/* Write data extents for this PEL. */
+		for (uint32_t i = 0; i < count; i++) {
+			for (uint64_t j = 0; j < lengths[i]; j++) {
+				if (tessera_kbio_write(&tmp_->bio_ctx,
+				    starts[i] + j,
+				    pack_bytes + (data_cursor + j) *
+				        TESSERA_SECTOR_SIZE) != 0)
+					_ROLLBACK_AND_RETURN(EIO);
+			}
+			data_cursor += lengths[i];
+		}
+
+		/* Build + write this PEL (next_pel_sector starts as 0; if a
+		 * later iteration needs a continuation we'll rewrite). */
+		memset(pel, 0, sizeof *pel);
+		pel->magic           = TESSERA_PEL_MAGIC;
+		pel->version         = 1;
+		pel->extent_count    = count;
+		/* total_length only meaningful in head PEL; set there. */
+		pel->total_length    = (head_pel == pel_sector) ? n_sectors : 0;
+		pel->next_pel_sector = 0;
+		for (uint32_t i = 0; i < count; i++) {
+			pel->extents[i].start_sector   = starts[i];
+			pel->extents[i].length_sectors = lengths[i];
+		}
+		if (tessera_encode_pack_extent_list(pel, pel_buf) != TESSERA_OK
+		    || tessera_kbio_write(&tmp_->bio_ctx, pel_sector, pel_buf)
+		        != 0)
+			_ROLLBACK_AND_RETURN(EIO);
+
+		/* If this isn't the first PEL, link prev → this. */
+		if (prev_pel != 0) {
+			struct buf *bp = NULL;
+			if (bread(tmp_->devvp,
+			    prev_pel * btodb(TESSERA_SECTOR_SIZE),
+			    TESSERA_SECTOR_SIZE,
+			    tmp_->bio_ctx.cred ?
+			        tmp_->bio_ctx.cred : NOCRED, &bp) != 0)
+				_ROLLBACK_AND_RETURN(EIO);
+			tessera_pack_extent_list_t prev;
+			if (tessera_decode_pack_extent_list(
+			    (const uint8_t *)bp->b_data, &prev) != TESSERA_OK) {
+				brelse(bp);
+				_ROLLBACK_AND_RETURN(EIO);
+			}
+			brelse(bp);
+			prev.next_pel_sector = pel_sector;
+			if (tessera_encode_pack_extent_list(&prev, pel_buf)
+			    != TESSERA_OK ||
+			    tessera_kbio_write(&tmp_->bio_ctx, prev_pel,
+			    pel_buf) != 0)
+				_ROLLBACK_AND_RETURN(EIO);
+		}
+		prev_pel = pel_sector;
+		remaining -= filled;
 	}
 
 	printf("tessera_fs: pack — %llu sectors written across %u extents "
-	    "(contig was unavailable; PEL at sector %llu)\n",
-	    (unsigned long long)n_sectors, count,
-	    (unsigned long long)pel_sector);
-	out->start_sector   = pel_sector;
+	    "in %u-PEL chain (head at sector %llu)\n",
+	    (unsigned long long)n_sectors, all_cnt, pel_chain_cnt,
+	    (unsigned long long)head_pel);
+	out->start_sector   = head_pel;
 	out->length_sectors = n_sectors;
 	out->flags = TESSERA_REGISTRY_FLAG_SEALED |
 	             TESSERA_REGISTRY_FLAG_MULTI_EXTENT;
 	tmp_->multi_extent_pack_count++;
-	free(pel_buf, M_TESSERA);
-	free(pel, M_TESSERA);
-	free(lengths, M_TESSERA);
-	free(starts, M_TESSERA);
+	free(pel_buf, M_TESSERA); free(pel, M_TESSERA);
+	free(lengths, M_TESSERA); free(starts, M_TESSERA);
+	free(all_starts, M_TESSERA); free(all_lengths, M_TESSERA);
+	free(pel_chain, M_TESSERA);
 	return (0);
+#undef _ROLLBACK_AND_RETURN
 }
 
 /*
@@ -5546,34 +5630,67 @@ tessera_fs_pack_alloc_and_write(struct tessera_mount *tmp_,
 static int
 tessera_fs_pack_extents_resolve(struct tessera_mount *tmp_,
                                 const tessera_registry_entry_t *re,
-                                tessera_pack_extent_t *extents_out,
+                                tessera_pack_extent_t **out_extents,
                                 uint32_t *out_count)
 {
 	if ((re->flags & TESSERA_REGISTRY_FLAG_MULTI_EXTENT) == 0) {
-		extents_out[0].start_sector   = re->start_sector;
-		extents_out[0].length_sectors = re->length_sectors;
-		*out_count = 1;
+		tessera_pack_extent_t *single = malloc(sizeof *single,
+		    M_TESSERA, M_WAITOK);
+		single[0].start_sector   = re->start_sector;
+		single[0].length_sectors = re->length_sectors;
+		*out_extents = single;
+		*out_count   = 1;
 		return (0);
 	}
-	struct buf *bp = NULL;
-	int err = bread(tmp_->devvp,
-	    re->start_sector * btodb(TESSERA_SECTOR_SIZE),
-	    TESSERA_SECTOR_SIZE,
-	    tmp_->bio_ctx.cred ? tmp_->bio_ctx.cred : NOCRED, &bp);
-	if (err != 0) { if (bp != NULL) brelse(bp); return (EIO); }
-	tessera_pack_extent_list_t pel;
-	int r = tessera_decode_pack_extent_list((const uint8_t *)bp->b_data,
-	    &pel);
-	brelse(bp);
-	if (r != TESSERA_OK) {
-		printf("tessera_fs: pack extent list at sector %llu — "
-		    "decode failed: r=%d\n",
-		    (unsigned long long)re->start_sector, r);
-		return (EIO);
+
+	/* PEL chain walk. Each PEL holds up to TESSERA_PEL_MAX_EXTENTS;
+	 * `next_pel_sector` (0 = end of chain) lets a single pack span
+	 * arbitrarily many extents when the data zone is dust-fragmented.
+	 * Grow `result` by doubling so we don't N×realloc on long chains. */
+	uint32_t cap = TESSERA_PEL_MAX_EXTENTS;
+	uint32_t cnt = 0;
+	tessera_pack_extent_t *result = malloc(cap * sizeof *result,
+	    M_TESSERA, M_WAITOK);
+
+	uint64_t cur_sector = re->start_sector;
+	for (int depth = 0; depth < 64; depth++) {  /* depth cap */
+		struct buf *bp = NULL;
+		int err = bread(tmp_->devvp,
+		    cur_sector * btodb(TESSERA_SECTOR_SIZE),
+		    TESSERA_SECTOR_SIZE,
+		    tmp_->bio_ctx.cred ? tmp_->bio_ctx.cred : NOCRED, &bp);
+		if (err != 0) {
+			if (bp != NULL) brelse(bp);
+			free(result, M_TESSERA);
+			return (EIO);
+		}
+		tessera_pack_extent_list_t pel;
+		int r = tessera_decode_pack_extent_list(
+		    (const uint8_t *)bp->b_data, &pel);
+		brelse(bp);
+		if (r != TESSERA_OK) {
+			printf("tessera_fs: pack extent list at sector %llu — "
+			    "decode failed: r=%d (chain depth=%d)\n",
+			    (unsigned long long)cur_sector, r, depth);
+			free(result, M_TESSERA);
+			return (EIO);
+		}
+		if (cnt + pel.extent_count > cap) {
+			while (cap < cnt + pel.extent_count) cap *= 2;
+			tessera_pack_extent_t *grown = malloc(
+			    cap * sizeof *grown, M_TESSERA, M_WAITOK);
+			memcpy(grown, result, cnt * sizeof *result);
+			free(result, M_TESSERA);
+			result = grown;
+		}
+		for (uint32_t i = 0; i < pel.extent_count; i++)
+			result[cnt++] = pel.extents[i];
+		if (pel.next_pel_sector == 0) break;
+		cur_sector = pel.next_pel_sector;
 	}
-	for (uint32_t i = 0; i < pel.extent_count; i++)
-		extents_out[i] = pel.extents[i];
-	*out_count = pel.extent_count;
+
+	*out_extents = result;
+	*out_count   = cnt;
 	return (0);
 }
 
@@ -5624,15 +5741,11 @@ tessera_fs_repack_one_pack(struct tessera_mount *tmp_,
 
 	/* Resolve the current extents — we'll need them for both reading
 	 * the old body and freeing them at the end. */
-	tessera_pack_extent_t *old_exts = malloc(
-	    TESSERA_PEL_MAX_EXTENTS * sizeof(*old_exts),
-	    M_TESSERA, M_WAITOK);
+	tessera_pack_extent_t *old_exts = NULL;
 	uint32_t old_nexts = 0;
-	if (tessera_fs_pack_extents_resolve(tmp_, &re, old_exts, &old_nexts)
-	    != 0) {
-		free(old_exts, M_TESSERA);
+	if (tessera_fs_pack_extents_resolve(tmp_, &re, &old_exts, &old_nexts)
+	    != 0)
 		return (EIO);
-	}
 
 	/* Materialise the pack body. */
 	const size_t body_len =
@@ -5691,12 +5804,10 @@ tessera_fs_repack_one_pack(struct tessera_mount *tmp_,
 			(void)tessera_extent_free(tmp_->extent_alloc,
 			    pa.start_sector, pa.length_sectors);
 		} else {
-			tessera_pack_extent_t *neexts = malloc(
-			    TESSERA_PEL_MAX_EXTENTS * sizeof(*neexts),
-			    M_TESSERA, M_WAITOK);
+			tessera_pack_extent_t *neexts = NULL;
 			uint32_t nnexts = 0;
 			if (tessera_fs_pack_extents_resolve(tmp_, &new_re,
-			    neexts, &nnexts) == 0) {
+			    &neexts, &nnexts) == 0) {
 				for (uint32_t i = 0; i < nnexts; i++)
 					(void)tessera_extent_free(
 					    tmp_->extent_alloc,
@@ -5722,8 +5833,33 @@ tessera_fs_repack_one_pack(struct tessera_mount *tmp_,
 	for (uint32_t e = 0; e < old_nexts; e++)
 		(void)tessera_extent_free(tmp_->extent_alloc,
 		    old_exts[e].start_sector, old_exts[e].length_sectors);
-	(void)tessera_extent_free(tmp_->extent_alloc,
-	    re.start_sector, 1);   /* old PEL was 1 sector */
+	/* Walk the OLD PEL chain and free each PEL sector. With chaining
+	 * a single multi-extent pack can have multiple PELs linked via
+	 * next_pel_sector; the original "1 sector" assumption was true
+	 * only before chaining landed. */
+	{
+		uint64_t pel_s = re.start_sector;
+		for (int d = 0; d < 64 && pel_s != 0; d++) {
+			struct buf *bp = NULL;
+			uint64_t next = 0;
+			if (bread(tmp_->devvp,
+			    pel_s * btodb(TESSERA_SECTOR_SIZE),
+			    TESSERA_SECTOR_SIZE,
+			    tmp_->bio_ctx.cred ?
+			        tmp_->bio_ctx.cred : NOCRED,
+			    &bp) == 0) {
+				tessera_pack_extent_list_t pel;
+				if (tessera_decode_pack_extent_list(
+				    (const uint8_t *)bp->b_data, &pel)
+				    == TESSERA_OK)
+					next = pel.next_pel_sector;
+				brelse(bp);
+			}
+			(void)tessera_extent_free(tmp_->extent_alloc,
+			    pel_s, 1);
+			pel_s = next;
+		}
+	}
 	free(old_exts, M_TESSERA);
 
 	/* Counter delta: this pack was MULTI_EXTENT before (we wouldn't

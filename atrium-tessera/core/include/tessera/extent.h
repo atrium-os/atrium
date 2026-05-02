@@ -45,6 +45,20 @@ int tessera_extent_alloc_multi(tessera_extent_alloc_t *,
                                uint64_t *out_lengths,
                                uint32_t *out_count);
 
+/* Like alloc_multi, but on partial-fill (ran out of max_count slots
+ * before satisfying n_sectors) returns 0 with what was allocated
+ * AND sets *out_filled to the actual sector total. ENOSPC only when
+ * 0 sectors could be allocated. The caller (tessera-fs PEL writer)
+ * uses this to chain PELs: each call fills one PEL, then a new PEL
+ * is allocated for the remainder. */
+int tessera_extent_alloc_multi_partial(tessera_extent_alloc_t *,
+                                       uint64_t n_sectors,
+                                       uint32_t max_count,
+                                       uint64_t *out_starts,
+                                       uint64_t *out_lengths,
+                                       uint32_t *out_count,
+                                       uint64_t *out_filled);
+
 /* Free a previously-allocated extent. Adjacent free extents are
  * coalesced. */
 int tessera_extent_free(tessera_extent_alloc_t *,

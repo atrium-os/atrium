@@ -491,9 +491,23 @@ typedef struct TESSERA_PACKED {
 typedef struct TESSERA_PACKED {
 	uint64_t              magic;        /* TESSERA_PEL_MAGIC */
 	uint32_t              version;      /* 1 */
-	uint32_t              extent_count;
-	uint64_t              total_length; /* sum of extents[].length_sectors */
-	uint64_t              reserved;
+	uint32_t              extent_count; /* extents in THIS PEL only */
+	uint64_t              total_length; /* sum across the entire CHAIN
+	                                     * (only meaningful in the head
+	                                     * PEL — continuation PELs may
+	                                     * leave it 0). */
+	/* PEL chaining: when one PEL can't hold all the extents for a
+	 * pack (severe data-zone fragmentation; the cap is 253 extents
+	 * per sector), the writer allocates a continuation PEL and links
+	 * it here. Reader walks the chain until next_pel_sector == 0.
+	 *
+	 * Format-compat: pre-chaining writers always wrote 0 here (the
+	 * field was named `reserved`); pre-chaining readers always
+	 * ignored it. So old volumes mounted by new readers see 0 and
+	 * stop after one PEL — same behaviour as before. New volumes
+	 * mounted by old readers would be silently truncated, which is
+	 * why we never wrote a non-zero value historically. */
+	uint64_t              next_pel_sector;
 	tessera_pack_extent_t extents[TESSERA_PEL_MAX_EXTENTS];
 	uint8_t               pad[12];
 	uint32_t              crc32;        /* CRC over bytes 0..(crc32 offset) */
