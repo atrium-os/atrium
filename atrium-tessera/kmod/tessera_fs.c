@@ -2385,6 +2385,24 @@ tessera_statfs_impl(struct mount *mp, struct statfs *sbp)
 	return (0);
 }
 
+/* sync(2) handler. vfs_stdsync iterates dirty vnodes and calls
+ * VOP_FSYNC on each, but tessera doesn't dirty vnodes through the
+ * standard buffer cache (its content lives in dirty_content + the
+ * pending-manifest cache, both invisible to the kernel). So we drain
+ * those caches explicitly and run our normal flush, which commits
+ * the SB. Without this, `sync` is silently a no-op for any tessera
+ * write that's still buffered. */
+static int
+tessera_sync_impl(struct mount *mp, int waitfor)
+{
+	struct tessera_mount *tmp_ = VFSTOTESSERA(mp);
+	if (tmp_ == NULL) return (0);
+	(void)tessera_fs_dirty_content_drain_all(tmp_);
+	(void)tessera_fs_flush(tmp_);
+	(void)waitfor;  /* drain + flush are synchronous either way */
+	return (0);
+}
+
 /* ── vfs_init / uninit ───────────────────────────────────────── */
 
 static int
@@ -2410,7 +2428,7 @@ static struct vfsops tessera_vfsops = {
 	.vfs_statfs  = tessera_statfs_impl,
 	.vfs_init    = tessera_init_impl,
 	.vfs_uninit  = tessera_uninit_impl,
-	.vfs_sync    = vfs_stdsync,
+	.vfs_sync    = tessera_sync_impl,
 };
 
 /* ── vop ops on the synthesized root ─────────────────────────── */
@@ -4907,6 +4925,16 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, dirty_content_cap, CTLFLAG_RW,
     &tessera_dirty_content_cap, 0,
     "Per-mount cap on RAM held in vop_write coalescing buffers (bytes)");
 
+/* Per-file ceiling — files larger than this take the chunked-write
+ * path directly without coalescing (the buffer would have to hold
+ * the whole file in RAM). 4 MiB covers typical small-write bursts
+ * (build outputs, logs, scratch files) while keeping the per-inode
+ * malloc bounded. */
+static unsigned long tessera_dirty_content_file_max = 4u * 1024u * 1024u;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, dirty_content_file_max, CTLFLAG_RW,
+    &tessera_dirty_content_file_max, 0,
+    "Max per-file size eligible for the dirty-content buffer (bytes)");
+
 static unsigned long tessera_stat_dirty_content_hits     = 0;
 static unsigned long tessera_stat_dirty_content_creates  = 0;
 static unsigned long tessera_stat_dirty_content_flushes  = 0;
@@ -5326,14 +5354,23 @@ tessera_fs_dirty_content_free(struct tessera_dirty_content *dc)
 	free(dc, M_TESSERA);
 }
 
-/* Publish a detached buffer to disk via the existing INLINE path. */
+/* Publish a detached buffer to disk. Routes to the INLINE or chunked
+ * publish path based on size — the caller's vop_write doesn't have
+ * to choose, the buffer just remembers the contents. */
 static int
 tessera_fs_dirty_content_publish(struct tessera_mount *tmp_,
                                  struct tessera_dirty_content *dc)
 {
 	if (!dc->dirty) return (0);
-	int rc = tessera_fs_replace_content(tmp_, dc->inode_no,
-	    dc->bytes, dc->size);
+	int rc;
+	/* TESSERA_INLINE_THRESHOLD = 256 KiB; defined later in file. */
+	if (dc->size <= (256u * 1024u)) {
+		rc = tessera_fs_replace_content(tmp_, dc->inode_no,
+		    dc->bytes, dc->size);
+	} else {
+		rc = tessera_fs_replace_content_chunked(tmp_, dc->inode_no,
+		    dc->bytes, dc->size);
+	}
 	if (rc == 0) tessera_stat_dirty_content_flushes++;
 	return (rc);
 }
@@ -5402,7 +5439,8 @@ tessera_fs_dirty_content_drop(struct tessera_mount *tmp_, uint32_t inode_no)
 
 /* Apply a write into the per-inode buffer. Buffer is created on
  * first touch by reading the existing content. final_size is the
- * post-write file size; must be ≤ TESSERA_INLINE_THRESHOLD.
+ * post-write file size; must be ≤ tessera_dirty_content_file_max
+ * (4 MiB by default). Larger files take the chunked path directly.
  *
  * Caller does NOT hold flush_mtx. Returns 0 on success.
  */
@@ -5411,8 +5449,6 @@ tessera_fs_dirty_content_write(struct tessera_mount *tmp_, uint32_t inode_no,
                                uint64_t write_off, const uint8_t *new_bytes,
                                size_t write_len, size_t final_size)
 {
-	KASSERT(final_size <= TESSERA_INLINE_THRESHOLD,
-	    ("dirty_content_write final_size > INLINE"));
 
 	/* Memory cap: if this write would push us past the cap, drain
 	 * everything first. Coarse but correct; refine later. */
@@ -11589,10 +11625,12 @@ tessera_vop_write(struct vop_write_args *ap)
 		return (err);
 	}
 
-	/* Coalesce INLINE-sized writes into a per-inode RAM buffer so
+	/* Coalesce small/medium writes into a per-inode RAM buffer so
 	 * the manifest is published once at fsync / flush, not once per
-	 * vop_write. Closes the 4 KiB-write throughput gap with UFS. */
-	if (final_size <= TESSERA_INLINE_THRESHOLD) {
+	 * vop_write. Files up to tessera_dirty_content_file_max
+	 * (default 4 MiB) qualify; the buffer publishes through INLINE
+	 * or chunked depending on its size at flush time. */
+	if (final_size <= (uint64_t)tessera_dirty_content_file_max) {
 		int wr = tessera_fs_dirty_content_write(tmp_,
 		    (uint32_t)tn->inode_no, write_off, new_bytes,
 		    (size_t)write_resid, (size_t)final_size);
@@ -11623,9 +11661,10 @@ tessera_vop_write(struct vop_write_args *ap)
 		return (0);
 	}
 
-	/* If we have a coalesced INLINE buffer but the write spills it
-	 * past the INLINE threshold, drain to disk first so the chunked
-	 * path below sees the latest content. */
+	/* If we have a coalesced buffer but the write spills past
+	 * dirty_content_file_max, drain it to disk first so the chunked
+	 * path below sees the latest content (and so we stop holding the
+	 * old size's bytes in RAM). */
 	(void)tessera_fs_dirty_content_drain_one(tmp_, (uint32_t)tn->inode_no);
 	/* Re-fetch ino; the drain may have grown it. */
 	if (tessera_fs_inode_get_byk(tmp_, key, &ino) != TESSERA_OK) {
