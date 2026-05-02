@@ -11636,25 +11636,26 @@ tessera_vop_write(struct vop_write_args *ap)
 		    (size_t)write_resid, (size_t)final_size);
 		free(new_bytes, M_TESSERA);
 		if (wr != 0) return (wr);
-		/* Patch the live inode size now (cheap inode_put);
-		 * full manifest publish deferred. Mirrors the size
-		 * update that replace_content does internally. */
-		tessera_inode_record_t ino2;
-		if (tessera_fs_inode_get(tmp_, (uint32_t)tn->inode_no,
-		    &ino2) == TESSERA_OK) {
-			if (ino2.size != final_size) {
-				ino2.size = final_size;
-				(void)tessera_fs_inode_put(tmp_,
-				    (uint32_t)tn->inode_no, &ino2);
-			}
-			if ((ino2.mode & 06000) != 0 && ap->a_cred != NULL &&
-			    priv_check_cred(ap->a_cred,
-			        PRIV_VFS_RETAINSUGID) != 0) {
-				ino2.mode &= ~06000;
-				(void)tessera_fs_inode_put(tmp_,
-				    (uint32_t)tn->inode_no, &ino2);
-			}
+		/* Patch the live inode record only when something actually
+		 * changed. Reuses `ino` from the inode_get_byk above —
+		 * inode_put coalesces in the dirty_inodes cache, so a
+		 * single inode_put per vop_write is the minimum. Pure
+		 * overwrites (no size change, no setuid strip) skip the
+		 * put entirely. */
+		int needs_put = 0;
+		if (ino.size != final_size) {
+			ino.size = final_size;
+			needs_put = 1;
 		}
+		if ((ino.mode & 06000) != 0 && ap->a_cred != NULL &&
+		    priv_check_cred(ap->a_cred,
+		        PRIV_VFS_RETAINSUGID) != 0) {
+			ino.mode &= ~06000;
+			needs_put = 1;
+		}
+		if (needs_put)
+			(void)tessera_fs_inode_put(tmp_,
+			    (uint32_t)tn->inode_no, &ino);
 		vnode_pager_setsize(vp, final_size);
 		tessera_stat_vop_write_inline++;
 		tessera_fs_mark_dirty(tmp_);
