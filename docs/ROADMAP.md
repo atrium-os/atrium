@@ -153,25 +153,33 @@ Spec + Phase 1 results: [`spec/tessera-binsplit.md`](spec/tessera-binsplit.md).
 
 ## D2.5 — Portcullis (jail launcher + capability manifest)
 
-**Deliverable:** `portcullis launch <app>` reads the app's `atrium.toml` manifest, builds a jail with the declared capabilities, execs the app inside. Forum (the dock, D3) calls Portcullis to launch apps.
+**Deliverable:** `portcullis launch <app-id>` reads the app's `atrium.toml` manifest, builds a jail with exactly the declared capabilities, execs the app inside. Forum (the dock, D3) calls Portcullis to launch apps. Two parallel instances of the same app: isolated overlays, shared (Tessera-dedup'd) rootfs.
 
-**Prerequisites:** D1.5 (Tessera for jail trees) + D1.6 (atrium-rpc — defines the per-service-socket convention that capability mounts target).
+Spec: [`spec/portcullis.md`](spec/portcullis.md).
 
-**Scope:**
-1. `atrium.toml` schema: graphics/filesystem/network/devices/audio/IPC capabilities.
-2. Jail builder: takes manifest + app's tree path; constructs a `jail.conf` invocation.
-3. devfs.rules wiring: `/dev/fresco0` (and other selected cdevs) into the jail.
-4. **Per-capability nullfs of `/atrium/sockets/<service>.sock`** — the kernel-enforced IPC capability boundary defined by atrium-rpc.
-5. Optional `tessera-cas-read` capability: nullfs of `/var/lib/tessera/cas` for trusted system services (clipboard, notifier, thumbnailer) so they can answer hash lookups without going through the wire.
-6. Capability prompt UI: "first launch, this app wants network — allow?". Subsequent launches: silent unless manifest changed.
-7. Filesystem mounts: nullfs from CAS-FS into the jail; per-app writable overlay.
-8. Resource limits (rctl).
+**Prerequisites:** D1.5 (Tessera for jail trees + per-app overlays) + D1.6 (atrium-rpc — defines the per-service-socket convention that capability mounts target).
+
+**Scope** (5 phases, ordered by risk; see spec §10):
+
+1. **Phase 1 — schema + parser.** `portcullis-toml` crate. Validation rules per spec §3.3. CLI `portcullis validate`. ~1 wk.
+2. **Phase 2 — jail builder.** `portcullis-jail` crate: capability → jail.conf translation per spec §5. CLI `portcullis launch --no-prompt` (dev mode). Integration: launch atrium-rpc-echo-{server,client} in separate jails and verify socket mount path. ~1 wk.
+3. **Phase 3 — overlay + rootfs unionfs.** Tessera read-only rootfs over Tessera read-write overlay; tested with two parallel instances of the same app. ~1 wk.
+4. **Phase 4 — `portcullisd` + capability policy.** Long-running daemon. atrium-rpc service. Policy file at `/var/db/atrium/<user>/policy.toml`. Implements end-to-end lifecycle. ~1 wk.
+5. **Phase 5 — capability prompt UI.** Atrium-prompt service (CLI fallback for headless dev; wired into Forum once D3 lands). ~½ wk.
 
 **Risks:**
-- Capability UX is hostile if there are too many prompts. Group and default-grant the obvious ones.
-- A misconfigured manifest could trap the app in an unworkable state. Need a "permissive mode" for development.
+- Capability UX is hostile if there are too many prompts. Mitigation: default-grant obvious ones (graphics, notify); always-prompt scary ones (network=full, broad filesystem grants).
+- A misconfigured manifest could trap the app. Mitigation: `--permissive` dev flag bypasses prompts and grants all declared.
+- Hot-reload of capabilities is tricky (jail mounts are set at creation). Document as "takes effect on next launch."
+- Per-launch vs per-app-singleton jail policy is per-manifest (`[supervision].instances`).
 
-**Estimate:** 1 month focused.
+**Estimate:** ~4–5 weeks focused. Phases are independent enough to parallelize if multiple hands.
+
+**Integrates with:**
+- Tessera CAS-FS (rootfs + overlay; cross-jail dedup)
+- `tessera-import` (app installation into managed location)
+- atrium-rpc (service sockets are the capability boundary)
+- D1.7 binsplit (function-level dedup; transparent to Portcullis — apps still look like normal ELF at exec time)
 
 ## D3 — Forum (shell) + Praeco (notifications)
 
