@@ -288,6 +288,42 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, publish_dedup_chunked,
     CTLFLAG_RD, &tessera_stat_publish_dedup_chunked, 0,
     "publish_chunked calls satisfied by existing pack_registry entry");
 
+/* Aggregation packs: small INLINE manifests batched together at
+ * pending_manifests_drain time so we don't pay per-pack header/index
+ * overhead per tiny file. ~1.5 KiB amortized overhead per manifest
+ * vs ~16 KiB for single-blob packs. */
+static unsigned long tessera_stat_aggregation_packs    = 0;
+static unsigned long tessera_stat_aggregation_blobs    = 0;
+static unsigned long tessera_stat_aggregation_dedups   = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, aggregation_packs, CTLFLAG_RD,
+    &tessera_stat_aggregation_packs, 0,
+    "Multi-blob aggregation packs emitted at drain");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, aggregation_blobs, CTLFLAG_RD,
+    &tessera_stat_aggregation_blobs, 0,
+    "Total blobs packed via aggregation (across all packs)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, aggregation_dedups, CTLFLAG_RD,
+    &tessera_stat_aggregation_dedups, 0,
+    "Per-blob dedups skipped before aggregation (CAS-cache hits)");
+
+/* Aggregation pack tunables. Cap each pack so individual writes
+ * stay manageable and so a single pack's loss doesn't take out a
+ * huge cluster of files. */
+static unsigned long tessera_aggregation_max_blobs = 64;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, aggregation_max_blobs, CTLFLAG_RW,
+    &tessera_aggregation_max_blobs, 0,
+    "Max blobs per aggregation pack");
+static unsigned long tessera_aggregation_max_bytes = 256u * 1024u;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, aggregation_max_bytes, CTLFLAG_RW,
+    &tessera_aggregation_max_bytes, 0,
+    "Max body bytes (sum of blob lengths) per aggregation pack");
+/* Threshold: only batch if a manifest body is below this. Larger
+ * manifests get their own single-blob pack like before — they don't
+ * benefit much from amortizing pack overhead. */
+static unsigned long tessera_aggregation_blob_max = 16u * 1024u;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, aggregation_blob_max, CTLFLAG_RW,
+    &tessera_aggregation_blob_max, 0,
+    "Max blob size eligible for aggregation (larger goes to a single-blob pack)");
+
 /* v2 step-3 chunked-write observability — per-write-path counters
  * so future perf work can tell whether a workload is hitting the fast
  * paths or thrashing the slow rebuild path. RD-only; cumulative
@@ -794,6 +830,13 @@ static int tessera_fs_publish_manifest_to_disk(struct tessera_mount *tmp_,
                                                const uint8_t *manifest_bytes,
                                                size_t mlen,
                                                const tessera_hash_t hash);
+struct tessera_aggr_entry {
+	const uint8_t  *bytes;
+	uint32_t        len;
+	tessera_hash_t  hash;
+};
+static int tessera_fs_publish_manifests_batch(struct tessera_mount *tmp_,
+    const struct tessera_aggr_entry *entries, uint32_t n);
 static int tessera_fs_publish_manifest_owned(struct tessera_mount *tmp_,
                                              const uint8_t *manifest_bytes,
                                              size_t mlen,
@@ -4904,17 +4947,72 @@ tessera_fs_pending_manifests_drain(struct tessera_mount *tmp_)
 	tessera_stat_pending_drained += snap_count;
 
 	int err = 0;
+
+	/* Two-tier publishing: small eligible manifests get aggregated
+	 * into multi-blob packs; large manifests fall back to the
+	 * single-blob path so they don't get bloated by neighbours.
+	 *
+	 * The aggregation cuts per-pack header/index overhead from
+	 * ~16 KiB per tiny file to ~1 KiB amortized. Critical for
+	 * tessera-import workloads (3000-file app installs).
+	 *
+	 * Per-blob dedup: before adding to a batch we check the CAS
+	 * cache; warm hashes mean the content is already on disk and
+	 * we can skip publishing entirely (the existing pending entry
+	 * is removed and freed without writing).
+	 */
 	struct tessera_pending_manifest *e;
+	struct tessera_aggr_entry *batch =
+	    malloc((size_t)tessera_aggregation_max_blobs *
+	        sizeof *batch, M_TESSERA, M_WAITOK);
+	struct tessera_pending_manifest **batch_owners =
+	    malloc((size_t)tessera_aggregation_max_blobs *
+	        sizeof *batch_owners, M_TESSERA, M_WAITOK);
+	uint32_t bn = 0;
+	size_t bbytes = 0;
+
+	/* Helper: flush the current batch (publish + free its owners).
+	 * Defined inline to share state. */
+#define FLUSH_BATCH() do { \
+	if (bn > 0 && err == 0) { \
+		int _r = tessera_fs_publish_manifests_batch(tmp_, \
+		    batch, bn); \
+		if (_r != 0) err = _r; \
+	} \
+	for (uint32_t _i = 0; _i < bn; _i++) { \
+		struct tessera_pending_manifest *_pm = batch_owners[_i]; \
+		if (err == 0) { \
+			struct tessera_pending_owner *_po; \
+			while ((_po = LIST_FIRST(&_pm->owners)) != NULL) { \
+				LIST_REMOVE(_po, link); \
+				free(_po, M_TESSERA); \
+			} \
+			free(_pm->bytes, M_TESSERA); \
+			free(_pm, M_TESSERA); \
+		} else { \
+			mtx_lock(&tmp_->flush_mtx); \
+			uint32_t _bk = _pm->hash[0]; \
+			LIST_INSERT_HEAD(&tmp_->pending_manifests[_bk], \
+			    _pm, link); \
+			tmp_->pending_manifest_count++; \
+			tmp_->pending_manifest_bytes += _pm->len; \
+			mtx_unlock(&tmp_->flush_mtx); \
+		} \
+	} \
+	bn = 0; \
+	bbytes = 0; \
+} while (0)
+
 	while ((e = LIST_FIRST(&snap)) != NULL) {
 		LIST_REMOVE(e, link);
-		if (err == 0) {
-			int r = tessera_fs_publish_manifest_to_disk(tmp_,
-			    e->bytes, e->len, e->hash);
-			if (r != 0) {
-				err = r;
-			}
-		}
-		if (err == 0) {
+
+		/* Per-blob dedup: if we've already got a pack containing
+		 * this blob hash on disk (or in the warm CAS cache),
+		 * skip publishing — the existing copy is canonical. */
+		struct tessera_cas_loc_snap snap_dummy;
+		if (tessera_cas_loc_lookup(&tmp_->cas_cache, e->hash,
+		    &snap_dummy)) {
+			tessera_stat_aggregation_dedups++;
 			struct tessera_pending_owner *po;
 			while ((po = LIST_FIRST(&e->owners)) != NULL) {
 				LIST_REMOVE(po, link);
@@ -4922,22 +5020,55 @@ tessera_fs_pending_manifests_drain(struct tessera_mount *tmp_)
 			}
 			free(e->bytes, M_TESSERA);
 			free(e, M_TESSERA);
-		} else {
-			/* Restore unprocessed entries (including the one
-			 * that just failed if it wasn't retried) to the
-			 * cache so the next flush can retry. Bug #3: prior
-			 * code freed them, losing the manifest bytes —
-			 * subsequent ops referencing those hashes saw
-			 * "blob not found" and the directory containing
-			 * them appeared empty. */
-			mtx_lock(&tmp_->flush_mtx);
-			uint32_t b = e->hash[0];
-			LIST_INSERT_HEAD(&tmp_->pending_manifests[b], e, link);
-			tmp_->pending_manifest_count++;
-			tmp_->pending_manifest_bytes += e->len;
-			mtx_unlock(&tmp_->flush_mtx);
+			continue;
 		}
+
+		/* Eligibility: only batch small manifests. Larger ones
+		 * publish as single-blob packs (their pack overhead is
+		 * already amortized over the body bytes). */
+		if (e->len > (uint32_t)tessera_aggregation_blob_max) {
+			if (err == 0) {
+				int r = tessera_fs_publish_manifest_to_disk(
+				    tmp_, e->bytes, e->len, e->hash);
+				if (r != 0) err = r;
+			}
+			if (err == 0) {
+				struct tessera_pending_owner *po;
+				while ((po = LIST_FIRST(&e->owners)) != NULL) {
+					LIST_REMOVE(po, link);
+					free(po, M_TESSERA);
+				}
+				free(e->bytes, M_TESSERA);
+				free(e, M_TESSERA);
+			} else {
+				mtx_lock(&tmp_->flush_mtx);
+				uint32_t b = e->hash[0];
+				LIST_INSERT_HEAD(&tmp_->pending_manifests[b],
+				    e, link);
+				tmp_->pending_manifest_count++;
+				tmp_->pending_manifest_bytes += e->len;
+				mtx_unlock(&tmp_->flush_mtx);
+			}
+			continue;
+		}
+
+		/* Add to current batch; flush if full. */
+		if (bn == (uint32_t)tessera_aggregation_max_blobs ||
+		    bbytes + e->len > (size_t)tessera_aggregation_max_bytes) {
+			FLUSH_BATCH();
+		}
+		batch[bn].bytes = e->bytes;
+		batch[bn].len   = e->len;
+		memcpy(batch[bn].hash, e->hash, sizeof e->hash);
+		batch_owners[bn] = e;
+		bn++;
+		bbytes += e->len;
 	}
+	FLUSH_BATCH();
+#undef FLUSH_BATCH
+
+	free(batch, M_TESSERA);
+	free(batch_owners, M_TESSERA);
 	return (err);
 }
 
@@ -7600,6 +7731,144 @@ tessera_fs_publish_manifest_to_disk(struct tessera_mount *tmp_,
 		tessera_cas_loc_insert(&tmp_->cas_cache, hash, pack_id,
 		    NULL, 0xFFu, pa.length_sectors);
 	}
+	return (0);
+}
+
+/* Multi-blob aggregation: bundle N small INLINE manifests into
+ * ONE pack at drain time. Each tiny file would otherwise pay
+ * ~16 KiB pack overhead (header + bloom + index + body alignment);
+ * batching N together amortizes the overhead.
+ *
+ * pack_id is derived from the SHA256 of (sorted member hashes) so
+ * republishing the same set lands at the same pack_id (rare but
+ * free dedup). Per-blob dedup is checked by the caller before
+ * adding to the batch.
+ *
+ * `entries` and `n` describe the batch. Each entry's bytes/len/hash
+ * must be valid; ownership stays with the caller. Returns 0 on
+ * success or an errno on failure (extents NOT freed by caller —
+ * publish either commits or rolls back atomically).
+ */
+static int
+tessera_fs_publish_manifests_batch(struct tessera_mount *tmp_,
+                                   const struct tessera_aggr_entry *entries,
+                                   uint32_t n)
+{
+	if (tmp_->pack_registry_tree == NULL || tmp_->extent_alloc == NULL)
+		return (EROFS);
+	if (n == 0) return (0);
+
+	/* Derive pack_id = SHA256(concat of sorted member hashes).
+	 * Sorting is required because pack_finalize sorts blobs by
+	 * hash internally — a stable pack_id requires the same input
+	 * order. */
+	const size_t hashes_buf_len = (size_t)n * sizeof(tessera_hash_t);
+	uint8_t *hashes_buf = malloc(hashes_buf_len, M_TESSERA, M_WAITOK);
+	for (uint32_t i = 0; i < n; i++)
+		memcpy(hashes_buf + i * sizeof(tessera_hash_t),
+		    entries[i].hash, sizeof(tessera_hash_t));
+	/* Insertion sort — n is bounded by aggregation_max_blobs (~64). */
+	for (uint32_t i = 1; i < n; i++) {
+		uint8_t key[32];
+		memcpy(key, hashes_buf + i * 32, 32);
+		uint32_t j = i;
+		while (j > 0 && memcmp(hashes_buf + (j - 1) * 32, key, 32) > 0) {
+			memcpy(hashes_buf + j * 32,
+			    hashes_buf + (j - 1) * 32, 32);
+			j--;
+		}
+		memcpy(hashes_buf + j * 32, key, 32);
+	}
+	tessera_hash_t agg_hash;
+	tessera_sha256(hashes_buf, hashes_buf_len, agg_hash);
+	free(hashes_buf, M_TESSERA);
+	uint8_t pack_id[16];
+	memcpy(pack_id, agg_hash, 16);
+
+	/* If a pack with this same set already exists, skip the
+	 * republish. */
+	{
+		uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
+		if (tessera_btree_get(tmp_->pack_registry_tree, pack_id,
+		    reg_value) == TESSERA_OK) {
+			tessera_stat_publish_dedup_manifest++;
+			return (0);
+		}
+	}
+
+	tessera_pack_builder_t *pb = tessera_pack_begin(0 /* manifest pack */,
+	    pack_id, 0);
+	if (pb == NULL) return (ENOMEM);
+	for (uint32_t i = 0; i < n; i++) {
+		int ar = tessera_pack_add_blob(pb, entries[i].hash,
+		    entries[i].bytes, entries[i].len,
+		    TESSERA_BLOB_FLAG_MANIFEST);
+		if (ar != TESSERA_OK) {
+			/* TESSERA_EEXIST means the caller's batch had two
+			 * entries with the same hash — caller must dedup
+			 * before calling. Defensive: skip the dup. */
+			if (ar == TESSERA_EEXIST) continue;
+			tessera_pack_free(pb);
+			return (EIO);
+		}
+	}
+
+	size_t pack_size = 0;
+	(void)tessera_pack_finalize(pb, NULL, 0, &pack_size);
+	if (pack_size == 0 || (pack_size % TESSERA_SECTOR_SIZE) != 0) {
+		tessera_pack_free(pb);
+		return (EIO);
+	}
+	uint8_t *pack_bytes = malloc(pack_size, M_TESSERA, M_WAITOK);
+	int r = tessera_pack_finalize(pb, pack_bytes, pack_size, &pack_size);
+	tessera_pack_free(pb);
+	if (r != TESSERA_OK) { free(pack_bytes, M_TESSERA); return (EIO); }
+
+	const uint64_t n_sectors = pack_size / TESSERA_SECTOR_SIZE;
+	struct tessera_pack_alloc_result pa;
+	int wrt = tessera_fs_pack_alloc_and_write(tmp_, pack_bytes,
+	    n_sectors, &pa);
+	free(pack_bytes, M_TESSERA);
+	if (wrt != 0) return (wrt);
+
+	tessera_registry_entry_t re;
+	memset(&re, 0, sizeof re);
+	memcpy(re.pack_id, pack_id, 16);
+	re.start_sector    = pa.start_sector;
+	re.length_sectors  = pa.length_sectors;
+	re.blob_count      = n;
+	re.pack_kind       = 0;
+	re.total_bytes     = pack_size;
+	re.create_time     = 0;
+	re.reachable_blobs = n;
+	re.flags           = pa.flags;
+	uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
+	if (tessera_encode_registry_entry(&re, reg_value) != TESSERA_OK)
+		return (EIO);
+
+	uint64_t new_pack_root = tmp_->sb.pack_registry_root;
+	if (tessera_btree_put(tmp_->pack_registry_tree, pack_id, reg_value,
+	    &new_pack_root) != TESSERA_OK)
+		return (EIO);
+	tmp_->sb.pack_registry_root = new_pack_root;
+
+	/* Per-blob CAS-cache inserts. All blobs share the same physical
+	 * extents — different hash keys, same location. */
+	tessera_pack_extent_t cas_extents[4];
+	uint8_t cas_n = 1;
+	if ((pa.flags & TESSERA_REGISTRY_FLAG_MULTI_EXTENT) == 0) {
+		cas_extents[0].start_sector   = pa.start_sector;
+		cas_extents[0].length_sectors = pa.length_sectors;
+	} else {
+		cas_n = 0xFFu;
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		tessera_cas_loc_insert(&tmp_->cas_cache, entries[i].hash,
+		    pack_id, cas_extents, cas_n, pa.length_sectors);
+	}
+
+	tessera_stat_aggregation_packs++;
+	tessera_stat_aggregation_blobs += n;
 	return (0);
 }
 
