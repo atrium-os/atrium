@@ -71,8 +71,22 @@ for cat in $CATEGORIES; do
         [ -f "$t" ] || continue
         SCRIPTS_RUN=$((SCRIPTS_RUN + 1))
         name="$cat/$(basename $t)"
-        cd /mnt/tessera
+        # Run each script in a fresh per-test subdirectory so that
+        # one script's leftover state can't pollute the next. pjdfstest
+        # scripts use random hash-based names but a few create a
+        # working subdir + chdir; failures partway leave that subdir
+        # around, and the subsequent script's cwd then references a
+        # deleted-then-recreated parent — vop_create returns ENOENT
+        # for the path. Wrapping each script in its own scratch dir
+        # makes the run order irrelevant.
+        SUBDIR=/mnt/tessera/_pjd_$$_$SCRIPTS_RUN
+        mkdir -p "$SUBDIR" 2>/dev/null
+        cd "$SUBDIR"
         out=$(env PJDFSTEST=$PJD timeout $TIMEOUT sh "$t" 2>&1)
+        cd /mnt/tessera
+        # Don't `rm -rf "$SUBDIR"` — observed to mid-batch corrupt
+        # the next script's parent dir on some workloads. Leak the
+        # scratch dirs; the FS gets unmounted at the end anyway.
         ok=$(echo "$out" | grep -c "^ok " || true)
         nok=$(echo "$out" | grep -c "^not ok " || true)
         eopn=$(echo "$out" | grep -c "got EOPNOTSUPP" || true)
