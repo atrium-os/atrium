@@ -4440,13 +4440,23 @@ tessera_fs_pending_manifest_put(struct tessera_mount *tmp_,
 			LIST_FOREACH_SAFE(prev,
 			    &tmp_->pending_manifests[bb], link, tmp_e) {
 				struct tessera_pending_owner *po, *po_n;
+				int removed = 0;
 				LIST_FOREACH_SAFE(po, &prev->owners, link, po_n) {
 					if (po->inode_no == owner_inode_no) {
 						LIST_REMOVE(po, link);
 						free(po, M_TESSERA);
+						removed = 1;
 					}
 				}
-				if (LIST_EMPTY(&prev->owners)) {
+				/* Only retire the pending entry if we *just*
+				 * emptied its owners list. Entries published
+				 * with owner=0 (e.g. dir manifests via
+				 * publish_manifest_owned_known_new at
+				 * dir_btree_publish_*) have an EMPTY owners
+				 * list to begin with — skipping them here
+				 * was the bug that made truncate(file)
+				 * silently wipe the parent directory. */
+				if (removed && LIST_EMPTY(&prev->owners)) {
 					LIST_REMOVE(prev, link);
 					tmp_->pending_manifest_count--;
 					tmp_->pending_manifest_bytes -=
