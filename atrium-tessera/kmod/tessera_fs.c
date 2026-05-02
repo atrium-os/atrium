@@ -532,16 +532,24 @@ struct tessera_pending_inode {
  * size bounded by manifest churn rather than file content size.
  * The publish_chunked path still writes chunk bytes to disk
  * synchronously; only the CHUNK_LIST manifest itself is deferred. */
+/* List of owners — every inode whose manifest_hash currently points
+ * at this pending manifest. Multiple inodes can share the same hash
+ * via CAS dedup (e.g. four files all containing "x\n"); supersession
+ * must only delete the entry when the LAST owner has moved on. */
+struct tessera_pending_owner {
+	LIST_ENTRY(tessera_pending_owner) link;
+	uint32_t inode_no;
+};
+
 struct tessera_pending_manifest {
 	LIST_ENTRY(tessera_pending_manifest) link;
 	tessera_hash_t  hash;
 	uint8_t        *bytes;
 	uint32_t        len;
-	/* Logical owner: the inode whose manifest_hash currently
-	 * references this manifest. Future publish_manifest calls with
-	 * the same owner drop this entry (its bytes are unreferenced
-	 * once the inode's manifest_hash is updated). 0 = untagged. */
-	uint32_t        owner_inode_no;
+	/* Owners that currently reference this manifest hash. Empty list
+	 * + insertion via the "untagged" path (owner_inode_no=0 at put
+	 * time) means "anyone may reference this; never supersede". */
+	LIST_HEAD(, tessera_pending_owner) owners;
 };
 
 /* v2.6 dirent log entry. Variable-length: name bytes follow the
@@ -1768,6 +1776,12 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 				while ((_pm = LIST_FIRST(
 				    &tmp_->pending_manifests[_b])) != NULL) {
 					LIST_REMOVE(_pm, link);
+					struct tessera_pending_owner *_po;
+					while ((_po = LIST_FIRST(&_pm->owners))
+					    != NULL) {
+						LIST_REMOVE(_po, link);
+						free(_po, M_TESSERA);
+					}
 					free(_pm->bytes, M_TESSERA);
 					free(_pm, M_TESSERA);
 				}
@@ -4299,38 +4313,41 @@ tessera_fs_pending_manifest_put(struct tessera_mount *tmp_,
 	struct tessera_pending_manifest *e =
 	    malloc(sizeof *e, M_TESSERA, M_WAITOK | M_ZERO);
 	memcpy(e->hash, hash, sizeof e->hash);
-	e->bytes          = buf;
-	e->len            = len;
-	e->owner_inode_no = owner_inode_no;
+	e->bytes = buf;
+	e->len   = len;
+	LIST_INIT(&e->owners);
 
-	mtx_lock(&tmp_->flush_mtx);
-	uint32_t b = hash[0];
-	struct tessera_pending_manifest *existing;
-	LIST_FOREACH(existing, &tmp_->pending_manifests[b], link) {
-		if (memcmp(existing->hash, hash, TESSERA_HASH_SIZE) == 0) {
-			/* Same hash already cached; identical bytes by
-			 * construction (manifest hash is deterministic).
-			 * Drop the new copy. */
-			mtx_unlock(&tmp_->flush_mtx);
-			free(buf, M_TESSERA);
-			free(e, M_TESSERA);
-			return (TESSERA_OK);
-		}
+	struct tessera_pending_owner *new_own = NULL;
+	if (owner_inode_no != 0) {
+		new_own = malloc(sizeof *new_own, M_TESSERA, M_WAITOK | M_ZERO);
+		new_own->inode_no = owner_inode_no;
 	}
 
-	/* Supersession: if the new manifest is tagged with an
-	 * owner_inode_no, drop any older pending entry that was tagged
-	 * for the same owner. Its bytes are unreferenced now that the
-	 * inode's manifest_hash will point at our new hash. Walk every
-	 * bucket — owner_inode_no doesn't determine bucket placement
-	 * (hash[0] does). */
+	mtx_lock(&tmp_->flush_mtx);
+
+	/* Supersession FIRST: if the new manifest is tagged with an
+	 * owner_inode_no, walk every bucket and remove this owner from
+	 * any older pending entry that listed it. An entry whose owner
+	 * list becomes empty is unreferenced and gets freed. The shared-
+	 * dedup case (four files with content "x\n" all owning the same
+	 * pending manifest) used to fail here: the old code deleted the
+	 * entry on the first owner's supersession, leaving the other
+	 * three inodes pointing at a hash that fetch_blob couldn't find
+	 * (not yet on disk, and no longer in the pending cache). */
 	if (owner_inode_no != 0) {
 		for (uint32_t bb = 0;
 		    bb < TESSERA_PENDING_MANIFEST_BUCKETS; bb++) {
 			struct tessera_pending_manifest *prev, *tmp_e;
 			LIST_FOREACH_SAFE(prev,
 			    &tmp_->pending_manifests[bb], link, tmp_e) {
-				if (prev->owner_inode_no == owner_inode_no) {
+				struct tessera_pending_owner *po, *po_n;
+				LIST_FOREACH_SAFE(po, &prev->owners, link, po_n) {
+					if (po->inode_no == owner_inode_no) {
+						LIST_REMOVE(po, link);
+						free(po, M_TESSERA);
+					}
+				}
+				if (LIST_EMPTY(&prev->owners)) {
 					LIST_REMOVE(prev, link);
 					tmp_->pending_manifest_count--;
 					tmp_->pending_manifest_bytes -=
@@ -4342,6 +4359,40 @@ tessera_fs_pending_manifest_put(struct tessera_mount *tmp_,
 		}
 	}
 
+	uint32_t b = hash[0];
+	struct tessera_pending_manifest *existing;
+	LIST_FOREACH(existing, &tmp_->pending_manifests[b], link) {
+		if (memcmp(existing->hash, hash, TESSERA_HASH_SIZE) == 0) {
+			/* Same hash already cached; identical bytes by
+			 * construction. Drop the new copy but ADD the new
+			 * owner to the existing entry so a later supersede
+			 * by some OTHER owner doesn't yank the bytes out
+			 * from under us. */
+			if (new_own != NULL) {
+				int already = 0;
+				struct tessera_pending_owner *po;
+				LIST_FOREACH(po, &existing->owners, link) {
+					if (po->inode_no ==
+					    new_own->inode_no) {
+						already = 1; break;
+					}
+				}
+				if (already) {
+					free(new_own, M_TESSERA);
+				} else {
+					LIST_INSERT_HEAD(&existing->owners,
+					    new_own, link);
+				}
+			}
+			mtx_unlock(&tmp_->flush_mtx);
+			free(buf, M_TESSERA);
+			free(e, M_TESSERA);
+			return (TESSERA_OK);
+		}
+	}
+
+	if (new_own != NULL)
+		LIST_INSERT_HEAD(&e->owners, new_own, link);
 	LIST_INSERT_HEAD(&tmp_->pending_manifests[b], e, link);
 	tmp_->pending_manifest_count++;
 	tmp_->pending_manifest_bytes += len;
@@ -4420,6 +4471,11 @@ tessera_fs_pending_manifests_drain(struct tessera_mount *tmp_)
 			}
 		}
 		if (err == 0) {
+			struct tessera_pending_owner *po;
+			while ((po = LIST_FIRST(&e->owners)) != NULL) {
+				LIST_REMOVE(po, link);
+				free(po, M_TESSERA);
+			}
 			free(e->bytes, M_TESSERA);
 			free(e, M_TESSERA);
 		} else {
