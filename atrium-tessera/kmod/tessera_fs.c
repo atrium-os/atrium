@@ -5410,9 +5410,11 @@ tessera_fs_dirty_content_publish(struct tessera_mount *tmp_,
 	if (dc->size <= (256u * 1024u)) {
 		rc = tessera_fs_replace_content(tmp_, dc->inode_no,
 		    dc->bytes, dc->size);
+		if (rc == 0) tessera_stat_vop_write_inline++;
 	} else {
 		rc = tessera_fs_replace_content_chunked(tmp_, dc->inode_no,
 		    dc->bytes, dc->size);
+		if (rc == 0) tessera_stat_vop_write_chunked++;
 	}
 	if (rc == 0) tessera_stat_dirty_content_flushes++;
 	return (rc);
@@ -11799,7 +11801,10 @@ tessera_vop_write(struct vop_write_args *ap)
 			    (uint32_t)tn->inode_no, &ino);
 		}
 		vnode_pager_setsize(vp, final_size);
-		tessera_stat_vop_write_inline++;
+		/* Note: vop_write_inline / vop_write_chunked counters are
+		 * incremented at publish time (in dirty_content_publish or
+		 * the slow path below), not here — buffered writes don't
+		 * yet know which manifest kind they'll publish as. */
 		tessera_fs_mark_dirty(tmp_);
 		return (0);
 	}
