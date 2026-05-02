@@ -4235,10 +4235,12 @@ static int
 tessera_fs_inode_get(struct tessera_mount *tmp_, uint32_t inode_no,
                      tessera_inode_record_t *out)
 {
+	int rc;
 	if (tmp_->dirty_init) {
 		mtx_lock(&tmp_->flush_mtx);
 		uint32_t b = inode_no & (TESSERA_DIRTY_INODE_BUCKETS - 1u);
 		struct tessera_dirty_inode *e;
+		int found = 0;
 		LIST_FOREACH(e, &tmp_->dirty_inodes[b], link) {
 			if (e->inode_no == inode_no) {
 				if (e->tombstone) {
@@ -4246,9 +4248,29 @@ tessera_fs_inode_get(struct tessera_mount *tmp_, uint32_t inode_no,
 					return (TESSERA_ENOENT);
 				}
 				memcpy(out, &e->rec, sizeof *out);
-				mtx_unlock(&tmp_->flush_mtx);
-				return (TESSERA_OK);
+				found = 1;
+				break;
 			}
+		}
+		if (found) {
+			/* While the lock is held, also overlay the live size
+			 * from any dirty_content buffer. vop_write doesn't
+			 * patch ino.size on every call (would be a btree
+			 * write per write); instead, the buffer's `size`
+			 * field is the live file size until the buffer
+			 * publishes. */
+			uint32_t cb = inode_no &
+			    (TESSERA_DIRTY_CONTENT_BUCKETS - 1u);
+			struct tessera_dirty_content *dc;
+			LIST_FOREACH(dc, &tmp_->dirty_content[cb], link) {
+				if (dc->inode_no == inode_no) {
+					if ((uint64_t)dc->size > out->size)
+						out->size = dc->size;
+					break;
+				}
+			}
+			mtx_unlock(&tmp_->flush_mtx);
+			return (TESSERA_OK);
 		}
 		mtx_unlock(&tmp_->flush_mtx);
 	}
@@ -4256,7 +4278,25 @@ tessera_fs_inode_get(struct tessera_mount *tmp_, uint32_t inode_no,
 	if (tmp_->inode_tree == NULL) return (TESSERA_ENOENT);
 	uint8_t key[4];
 	encode_inode_key(inode_no, key);
-	return (tessera_btree_get(tmp_->inode_tree, key, out));
+	rc = tessera_btree_get(tmp_->inode_tree, key, out);
+	if (rc != TESSERA_OK) return (rc);
+
+	/* Overlay live size from dirty_content for the (rarer) case
+	 * where the inode wasn't in the dirty_inodes cache. */
+	if (tmp_->dirty_init) {
+		mtx_lock(&tmp_->flush_mtx);
+		uint32_t cb = inode_no & (TESSERA_DIRTY_CONTENT_BUCKETS - 1u);
+		struct tessera_dirty_content *dc;
+		LIST_FOREACH(dc, &tmp_->dirty_content[cb], link) {
+			if (dc->inode_no == inode_no) {
+				if ((uint64_t)dc->size > out->size)
+					out->size = dc->size;
+				break;
+			}
+		}
+		mtx_unlock(&tmp_->flush_mtx);
+	}
+	return (TESSERA_OK);
 }
 
 static uint32_t
@@ -5467,9 +5507,17 @@ tessera_fs_dirty_content_write(struct tessera_mount *tmp_, uint32_t inode_no,
 	struct tessera_dirty_content *dc =
 	    tessera_fs_dirty_content_lookup(tmp_, inode_no);
 	if (dc != NULL) {
-		/* Grow buffer if needed. */
+		/* Grow buffer geometrically when needed. Without doubling,
+		 * a sequential dd of N writes triggers N reallocs and
+		 * O(N²) memcpy total — for 256 4-KiB writes that's ~131
+		 * MiB of memcpy on a 1 MiB file. With doubling it's
+		 * O(log N) reallocs and O(N) total memcpy. */
 		if (final_size > dc->capacity) {
-			size_t new_cap = final_size;
+			size_t new_cap = dc->capacity ? dc->capacity * 2 : 4096;
+			while (new_cap < final_size) new_cap *= 2;
+			if (new_cap > (size_t)tessera_dirty_content_file_max)
+				new_cap = (size_t)tessera_dirty_content_file_max;
+			if (new_cap < final_size) new_cap = final_size;
 			uint8_t *nb = malloc(new_cap, M_TESSERA,
 			    M_NOWAIT | M_ZERO);
 			if (nb == NULL) {
@@ -5515,8 +5563,19 @@ tessera_fs_dirty_content_write(struct tessera_mount *tmp_, uint32_t inode_no,
 	struct tessera_dirty_content *ndc =
 	    malloc(sizeof *ndc, M_TESSERA, M_WAITOK | M_ZERO);
 	ndc->inode_no = inode_no;
-	ndc->capacity = final_size;
-	ndc->bytes    = malloc(final_size, M_TESSERA, M_WAITOK | M_ZERO);
+	/* Start with at least 64 KiB so a typical sequential dd doesn't
+	 * pay log2(file_size / 4 KiB) ≈ 6 reallocs to climb out of the
+	 * tiny range. Cap at file_max so we never over-allocate beyond
+	 * the threshold that routes through this buffer at all. */
+	{
+		size_t cap = final_size;
+		if (cap < 64u * 1024u) cap = 64u * 1024u;
+		if (cap > (size_t)tessera_dirty_content_file_max)
+			cap = (size_t)tessera_dirty_content_file_max;
+		if (cap < final_size) cap = final_size;
+		ndc->capacity = cap;
+	}
+	ndc->bytes    = malloc(ndc->capacity, M_TESSERA, M_WAITOK | M_ZERO);
 	if (old_buf != NULL) {
 		size_t n = old_len < final_size ? old_len : final_size;
 		memcpy(ndc->bytes, old_buf, n);
@@ -11636,26 +11695,17 @@ tessera_vop_write(struct vop_write_args *ap)
 		    (size_t)write_resid, (size_t)final_size);
 		free(new_bytes, M_TESSERA);
 		if (wr != 0) return (wr);
-		/* Patch the live inode record only when something actually
-		 * changed. Reuses `ino` from the inode_get_byk above —
-		 * inode_put coalesces in the dirty_inodes cache, so a
-		 * single inode_put per vop_write is the minimum. Pure
-		 * overwrites (no size change, no setuid strip) skip the
-		 * put entirely. */
-		int needs_put = 0;
-		if (ino.size != final_size) {
-			ino.size = final_size;
-			needs_put = 1;
-		}
+		/* Size update is implicit: inode_get overlays the live
+		 * size from dirty_content, so no inode_put needed for
+		 * size. Setuid strip is the only mode change that
+		 * requires an inode record update. */
 		if ((ino.mode & 06000) != 0 && ap->a_cred != NULL &&
 		    priv_check_cred(ap->a_cred,
 		        PRIV_VFS_RETAINSUGID) != 0) {
 			ino.mode &= ~06000;
-			needs_put = 1;
-		}
-		if (needs_put)
 			(void)tessera_fs_inode_put(tmp_,
 			    (uint32_t)tn->inode_no, &ino);
+		}
 		vnode_pager_setsize(vp, final_size);
 		tessera_stat_vop_write_inline++;
 		tessera_fs_mark_dirty(tmp_);
