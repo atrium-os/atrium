@@ -559,6 +559,8 @@ struct tessera_cas_loc_snap {
 };
 static int  tessera_cas_loc_lookup (struct tessera_cas_cache *c,
     const tessera_hash_t hash, struct tessera_cas_loc_snap *out);
+static void tessera_cas_invalidate_pack(struct tessera_cas_cache *c,
+    const uint8_t pack_id[16]);
 static void tessera_fs_mark_dirty(struct tessera_mount *tmp_);
 static void tessera_fs_flush_task(void *ctx, int pending);
 static void tessera_fs_repack_task(void *ctx, int pending);
@@ -5089,6 +5091,28 @@ tessera_cas_loc_insert(struct tessera_cas_cache *c,
 	mtx_unlock(&c->mtx);
 }
 
+/* Drop every cache entry pointing at the given pack_id. Called when
+ * a pack is deleted (gc_data_zone) or relocated (repack). O(loc_count)
+ * but invalidations are rare relative to lookups. */
+static void
+tessera_cas_invalidate_pack(struct tessera_cas_cache *c,
+                            const uint8_t pack_id[16])
+{
+	if (!c->mtx_init) return;
+	mtx_lock(&c->mtx);
+	struct tessera_cas_loc_entry *e, *next;
+	TAILQ_FOREACH_SAFE(e, &c->loc_lru, lru_link, next) {
+		if (memcmp(e->pack_id, pack_id, 16) == 0) {
+			TAILQ_REMOVE(&c->loc_lru, e, lru_link);
+			LIST_REMOVE(e, hash_link);
+			c->loc_count--;
+			tessera_stat_cas_invalidations++;
+			free(e, M_TESSERA);
+		}
+	}
+	mtx_unlock(&c->mtx);
+}
+
 /* Look up a hash. Returns 1 on hit (snapshot filled in), 0 on miss.
  * Updates LRU position on hit. Caller does NOT hold cache mtx. */
 static int
@@ -6227,6 +6251,8 @@ next_p:
 		if (tessera_btree_delete(tmp_->pack_registry_tree,
 		    deads[i].pack_id, &new_pack_root) == TESSERA_OK) {
 			tmp_->sb.pack_registry_root = new_pack_root;
+			tessera_cas_invalidate_pack(&tmp_->cas_cache,
+			    deads[i].pack_id);
 		}
 		if ((deads[i].flags & TESSERA_REGISTRY_FLAG_MULTI_EXTENT) == 0) {
 			(void)tessera_extent_free(tmp_->extent_alloc,
@@ -6842,6 +6868,10 @@ tessera_fs_repack_one_pack(struct tessera_mount *tmp_,
 		return (EIO);
 	}
 	tmp_->sb.pack_registry_root = new_pack_root;
+
+	/* Same pack_id, new layout — invalidate any cache entries that
+	 * still point at the OLD extents. They'd bread freed sectors. */
+	tessera_cas_invalidate_pack(&tmp_->cas_cache, pack_id);
 
 	/* Past the commit point — free the OLD extents + old PEL. */
 	for (uint32_t e = 0; e < old_nexts; e++)
