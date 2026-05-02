@@ -94,6 +94,8 @@ exec "$QEMU" \
     -drive if=pflash,format=raw,unit=0,file="$EFI_PAD",readonly=on \
     -drive if=pflash,format=raw,unit=1,file="$EFI_VARS" \
     -drive if=virtio,file="$DISK",format=qcow2,cache=writeback \
+    -drive file="$BSD_DIR/vm/crash-test.img",format=raw,cache=writeback,if=none,id=crashdrv \
+    -device virtio-blk-pci,drive=crashdrv,serial=tessera-crashtest,config-wce=on \
     -device virtio-net-pci,netdev=net0 \
     -netdev user,id=net0,hostfwd=tcp::2222-:22 \
     -fsdev local,id=share,path="$SHARE_DIR",security_model=none \
