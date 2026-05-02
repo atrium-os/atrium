@@ -364,6 +364,12 @@ struct tessera_kbio_ctx {
 	                             * bwrites on a g_vfs-opened devvp
 	                             * (only the first reaches disk;
 	                             * confirmed on virtio-blk + 9p both). */
+	int                   flush_unsupported; /* set on first BIO_FLUSH that
+	                                          * returns EOPNOTSUPP — disk
+	                                          * advertises no volatile cache,
+	                                          * so further barriers are no-ops
+	                                          * (mirrors UFS's
+	                                          * DISKFLAG_CANFLUSHCACHE gate). */
 };
 
 static int
@@ -443,6 +449,7 @@ static void
 tessera_kbio_barrier(struct tessera_kbio_ctx *k)
 {
 	if (k == NULL || k->cp == NULL) return;
+	if (k->flush_unsupported) return;
 	struct bio *flush = g_alloc_bio();
 	flush->bio_cmd = BIO_FLUSH;
 	flush->bio_done = NULL;
@@ -450,8 +457,17 @@ tessera_kbio_barrier(struct tessera_kbio_ctx *k)
 	flush->bio_length = 0;
 	flush->bio_data = NULL;
 	g_io_request(flush, k->cp);
-	(void)biowait(flush, "tbarr");
+	int err = biowait(flush, "tbarr");
 	g_destroy_bio(flush);
+	/* Disk advertises no volatile write cache (e.g. virtio-blk
+	 * without config-wce, ramdisk, write-cache-disabled HDD).
+	 * Cache the result so we stop paying the failed-flush round-trip;
+	 * mirrors UFS's DISKFLAG_CANFLUSHCACHE check. */
+	if (err == EOPNOTSUPP) {
+		k->flush_unsupported = 1;
+		printf("tessera_fs: device does not support BIO_FLUSH, "
+		    "barriers will be skipped (durability depends on host)\n");
+	}
 }
 
 /*
