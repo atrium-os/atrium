@@ -541,6 +541,9 @@ static int  tessera_fs_dirty_content_drain_one(struct tessera_mount *tmp_,
 static int  tessera_fs_dirty_content_drain_all(struct tessera_mount *tmp_);
 static void tessera_fs_dirty_content_drop(struct tessera_mount *tmp_,
     uint32_t inode_no);
+struct tessera_cas_cache;
+static void tessera_cas_cache_init (struct tessera_cas_cache *c);
+static void tessera_cas_cache_drain(struct tessera_cas_cache *c);
 static void tessera_fs_mark_dirty(struct tessera_mount *tmp_);
 static void tessera_fs_flush_task(void *ctx, int pending);
 static void tessera_fs_repack_task(void *ctx, int pending);
@@ -603,6 +606,59 @@ struct tessera_dirty_content {
 	size_t    size;         /* logical file size (≤ capacity) */
 	size_t    capacity;     /* allocated buffer size */
 	int       dirty;        /* 1 = differs from on-disk manifest */
+};
+
+/* CAS read cache — see docs/cas_cache_plan.md.
+ *
+ * tessera_fs_fetch_blob() previously linearly scanned pack_registry
+ * to find which pack contains a given blob hash, then bread the pack
+ * and parsed it. O(N_packs) per fetch — the dominant cost in the
+ * 4KB×256-fsync benchmark.
+ *
+ * Tier A — location entries: blob_hash → (pack_id, extents, offset
+ * inside pack, length). Lookup is O(1); on hit we skip the linear
+ * scan, bread the cached extents directly, and parse one pack.
+ *
+ * Tier B (stage 5) — bytes entries: blob_hash → bytes copy. For
+ * small hot blobs (manifests, dirents). On hit we skip even the
+ * bread/parse and return immediately.
+ *
+ * Both tiers: LRU eviction, single mutex, M_NOWAIT inserts so the
+ * cache never blocks fetch_blob's slow path under memory pressure.
+ */
+struct tessera_cas_loc_entry {
+	LIST_ENTRY(tessera_cas_loc_entry) hash_link;
+	TAILQ_ENTRY(tessera_cas_loc_entry) lru_link;
+	tessera_hash_t   hash;
+	uint64_t         pack_id;        /* registry key (pack-manifest hash low64) */
+	uint32_t         offset_in_pack; /* byte offset of blob within pack image */
+	uint32_t         length;         /* blob length in bytes */
+	uint8_t          n_extents;      /* 1..4 inline; 0xFF = use resolver */
+	tessera_pack_extent_t extents[4];
+};
+
+struct tessera_cas_byte_entry {
+	LIST_ENTRY(tessera_cas_byte_entry) hash_link;
+	TAILQ_ENTRY(tessera_cas_byte_entry) lru_link;
+	tessera_hash_t   hash;
+	uint32_t         length;
+	uint8_t         *bytes;          /* malloc'd, length bytes */
+};
+
+#define TESSERA_CAS_LOC_BUCKETS    1024u
+#define TESSERA_CAS_BYTE_BUCKETS    256u
+
+struct tessera_cas_cache {
+	struct mtx      mtx;
+	int             mtx_init;
+	/* Tier A — location */
+	LIST_HEAD(, tessera_cas_loc_entry)  loc_buckets[TESSERA_CAS_LOC_BUCKETS];
+	TAILQ_HEAD(, tessera_cas_loc_entry) loc_lru;
+	size_t          loc_count;
+	/* Tier B — bytes (stage 5) */
+	LIST_HEAD(, tessera_cas_byte_entry)  byte_buckets[TESSERA_CAS_BYTE_BUCKETS];
+	TAILQ_HEAD(, tessera_cas_byte_entry) byte_lru;
+	size_t          byte_bytes;
 };
 
 /* v2.6 Phase B.2 — pending inode-body record awaiting journal
@@ -924,6 +980,9 @@ struct tessera_mount {
 #define TESSERA_DIRTY_CONTENT_BUCKETS  128u
 	LIST_HEAD(, tessera_dirty_content) dirty_content[TESSERA_DIRTY_CONTENT_BUCKETS];
 	size_t                    dirty_content_bytes; /* sum of size across all */
+
+	/* CAS read cache (see struct tessera_cas_cache + cas_cache_plan.md). */
+	struct tessera_cas_cache cas_cache;
 
 	/* v2 step-2b: pending-manifest cache. Same flush_mtx covers
 	 * both. */
@@ -1363,6 +1422,7 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	for (uint32_t _b = 0; _b < TESSERA_DIRTY_CONTENT_BUCKETS; _b++)
 		LIST_INIT(&tmp_->dirty_content[_b]);
 	tmp_->dirty_content_bytes = 0;
+	tessera_cas_cache_init(&tmp_->cas_cache);
 	LIST_INIT(&tmp_->journal_pending);
 	tmp_->journal_pending_count = 0;
 	LIST_INIT(&tmp_->journal_pending_inodes);
@@ -1938,6 +1998,7 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 				}
 			}
 			tmp_->dirty_content_bytes = 0;
+			tessera_cas_cache_drain(&tmp_->cas_cache);
 			/* Drain any still-queued journal-pending entries.
 			 * The synchronous drain above should have cleared
 			 * them, but flush_unmounting / closed-journal paths
@@ -4836,6 +4897,110 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, dirty_content_flushes, CTLFLAG_RD,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, dirty_content_drops, CTLFLAG_RD,
     &tessera_stat_dirty_content_drops, 0,
     "Dirty-content buffers dropped (unlink)");
+
+/* ── CAS read cache (see docs/cas_cache_plan.md) ─────────────── */
+
+/* Master enable. Setting to 0 disables both insertion and lookup —
+ * the cache becomes a no-op. Lets us A/B without rebuilding the
+ * kmod. */
+static int tessera_cas_enable = 1;
+SYSCTL_INT(_kern_tessera, OID_AUTO, cas_enable, CTLFLAG_RW,
+    &tessera_cas_enable, 0,
+    "Enable the CAS read cache (1=on, 0=off — disables both insert and lookup)");
+
+/* Tier A — location entries. Default 16384 entries (~1 MiB). */
+static unsigned long tessera_cas_loc_max = 16384;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, cas_loc_max, CTLFLAG_RW,
+    &tessera_cas_loc_max, 0,
+    "Max number of CAS location entries (LRU-evicted past this)");
+
+/* Tier B — bytes cache. Default 8 MiB (stage 5). */
+static unsigned long tessera_cas_byte_max_bytes = 8u * 1024u * 1024u;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, cas_byte_max_bytes, CTLFLAG_RW,
+    &tessera_cas_byte_max_bytes, 0,
+    "Max bytes held in the CAS bytes cache (LRU-evicted past this)");
+
+/* Bytes cache eligibility — only blobs ≤ this size get cached as
+ * bytes. Default 4 KiB matches the typical manifest / dirent-leaf
+ * size. */
+static unsigned long tessera_cas_small_blob_cap = 4096;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, cas_small_blob_cap, CTLFLAG_RW,
+    &tessera_cas_small_blob_cap, 0,
+    "Max blob size eligible for the CAS bytes cache");
+
+/* Stats — read-only, sum across all mounts via static globals.
+ * Sufficient for single-mount workloads (the common case during
+ * dev) and matches the convention used elsewhere in this file. */
+static unsigned long tessera_stat_cas_loc_hits     = 0;
+static unsigned long tessera_stat_cas_loc_misses   = 0;
+static unsigned long tessera_stat_cas_loc_inserts  = 0;
+static unsigned long tessera_stat_cas_loc_evicts   = 0;
+static unsigned long tessera_stat_cas_byte_hits    = 0;
+static unsigned long tessera_stat_cas_byte_misses  = 0;
+static unsigned long tessera_stat_cas_byte_inserts = 0;
+static unsigned long tessera_stat_cas_byte_evicts  = 0;
+static unsigned long tessera_stat_cas_invalidations = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, cas_loc_hits, CTLFLAG_RD,
+    &tessera_stat_cas_loc_hits, 0, "CAS location-cache hits");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, cas_loc_misses, CTLFLAG_RD,
+    &tessera_stat_cas_loc_misses, 0, "CAS location-cache misses");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, cas_loc_inserts, CTLFLAG_RD,
+    &tessera_stat_cas_loc_inserts, 0, "CAS location-cache inserts");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, cas_loc_evicts, CTLFLAG_RD,
+    &tessera_stat_cas_loc_evicts, 0, "CAS location-cache LRU evictions");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, cas_byte_hits, CTLFLAG_RD,
+    &tessera_stat_cas_byte_hits, 0, "CAS bytes-cache hits");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, cas_byte_misses, CTLFLAG_RD,
+    &tessera_stat_cas_byte_misses, 0, "CAS bytes-cache misses");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, cas_byte_inserts, CTLFLAG_RD,
+    &tessera_stat_cas_byte_inserts, 0, "CAS bytes-cache inserts");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, cas_byte_evicts, CTLFLAG_RD,
+    &tessera_stat_cas_byte_evicts, 0, "CAS bytes-cache LRU evictions");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, cas_invalidations, CTLFLAG_RD,
+    &tessera_stat_cas_invalidations, 0,
+    "CAS-cache invalidations (pack delete / repack)");
+
+/* Init / teardown. Init runs from mountfs once flush-time
+ * structures exist; teardown runs from unmount before mount struct
+ * is freed. Both are no-ops if mtx_init was never set. */
+static void
+tessera_cas_cache_init(struct tessera_cas_cache *c)
+{
+	memset(c, 0, sizeof *c);
+	mtx_init(&c->mtx, "tess_cas", NULL, MTX_DEF);
+	c->mtx_init = 1;
+	for (uint32_t b = 0; b < TESSERA_CAS_LOC_BUCKETS; b++)
+		LIST_INIT(&c->loc_buckets[b]);
+	TAILQ_INIT(&c->loc_lru);
+	for (uint32_t b = 0; b < TESSERA_CAS_BYTE_BUCKETS; b++)
+		LIST_INIT(&c->byte_buckets[b]);
+	TAILQ_INIT(&c->byte_lru);
+}
+
+static void
+tessera_cas_cache_drain(struct tessera_cas_cache *c)
+{
+	if (!c->mtx_init) return;
+	mtx_lock(&c->mtx);
+	struct tessera_cas_loc_entry *le;
+	while ((le = TAILQ_FIRST(&c->loc_lru)) != NULL) {
+		TAILQ_REMOVE(&c->loc_lru, le, lru_link);
+		LIST_REMOVE(le, hash_link);
+		free(le, M_TESSERA);
+	}
+	c->loc_count = 0;
+	struct tessera_cas_byte_entry *be;
+	while ((be = TAILQ_FIRST(&c->byte_lru)) != NULL) {
+		TAILQ_REMOVE(&c->byte_lru, be, lru_link);
+		LIST_REMOVE(be, hash_link);
+		if (be->bytes != NULL) free(be->bytes, M_TESSERA);
+		free(be, M_TESSERA);
+	}
+	c->byte_bytes = 0;
+	mtx_unlock(&c->mtx);
+	mtx_destroy(&c->mtx);
+	c->mtx_init = 0;
+}
 
 /* Caller holds flush_mtx. */
 static struct tessera_dirty_content *
