@@ -83,6 +83,28 @@ Documented in [ARCHITECTURE.md](ARCHITECTURE.md), runtime details in [RUNBOOK.md
 
 **Estimate:** 1.5–2 months focused.
 
+## D1.6 — Atrium-RPC (unified IPC substrate)
+
+**Deliverable:** every Atrium service (Fresco today; clipboard, notify, broker, audio control plane tomorrow) speaks the same wire envelope. CAS-keyed payloads share a hash space with Tessera so the same image referenced via clipboard, notification, and editor preview is one allocation. fd-passed shm handles high-bandwidth payloads. Capability is filesystem-enforced by Portcullis (D2.5) — apps see only the service sockets their manifest declares.
+
+Spec: [`spec/atrium-rpc.md`](spec/atrium-rpc.md).
+
+**Prerequisites:** D1 software thesis (Fresco running natively on FreeBSD). D1.5 Tessera (for the optional zero-copy hash-via-CAS path).
+
+**Scope:**
+1. Spec freeze. `docs/spec/atrium-rpc.md` reviewed and committed; `atrium-rpc-core/src/classes.rs` enumerates `opcode_class` constants.
+2. `atrium-rpc-core` crate scaffold. Envelope codec, `Connection` type, CAS upload/fetch state machines, async event channel, fd-pass helper.
+3. Extract reusable layers from fresco-socket-rs into atrium-rpc-core. Keep fresco-socket-rs as a thin layer over atrium-rpc-core that adds the display opcode dictionary (class 1).
+4. Verify all existing demos (rect-bouncer, slot-demo, edit-socket, textured, window-demo, keyboard) work unchanged on top of the refactored stack.
+5. Document patterns for downstream services (`docs/spec/atrium-rpc-services.md`).
+
+**Risks:**
+- Refactor of the Fresco wire-format code. Existing demos + atrium-edit-socket must keep working.
+- The "CAS hashes are advisory pointers" semantic must be enforced rigorously (verify-on-use, sender-must-serve).
+- Opcode_class allocation needs a single source of truth — both this doc and `atrium-rpc-core/src/classes.rs`.
+
+**Estimate:** 2–3 weeks focused.
+
 ## D2 — Vestibulum (display manager + auth)
 
 **Deliverable:** boot FreeBSD → see a Fresco-rendered login screen → enter credentials via PAM → start a user session.
@@ -105,15 +127,17 @@ Documented in [ARCHITECTURE.md](ARCHITECTURE.md), runtime details in [RUNBOOK.md
 
 **Deliverable:** `portcullis launch <app>` reads the app's `atrium.toml` manifest, builds a jail with the declared capabilities, execs the app inside. Forum (the dock, D3) calls Portcullis to launch apps.
 
-**Prerequisites:** D1.5 (Tessera for jail trees).
+**Prerequisites:** D1.5 (Tessera for jail trees) + D1.6 (atrium-rpc — defines the per-service-socket convention that capability mounts target).
 
 **Scope:**
-1. `atrium.toml` schema: graphics/filesystem/network/devices/audio capabilities.
+1. `atrium.toml` schema: graphics/filesystem/network/devices/audio/IPC capabilities.
 2. Jail builder: takes manifest + app's tree path; constructs a `jail.conf` invocation.
 3. devfs.rules wiring: `/dev/fresco0` (and other selected cdevs) into the jail.
-4. Capability prompt UI: "first launch, this app wants network — allow?". Subsequent launches: silent unless manifest changed.
-5. Filesystem mounts: nullfs from CAS-FS into the jail; per-app writable overlay.
-6. Resource limits (rctl).
+4. **Per-capability nullfs of `/atrium/sockets/<service>.sock`** — the kernel-enforced IPC capability boundary defined by atrium-rpc.
+5. Optional `tessera-cas-read` capability: nullfs of `/var/lib/tessera/cas` for trusted system services (clipboard, notifier, thumbnailer) so they can answer hash lookups without going through the wire.
+6. Capability prompt UI: "first launch, this app wants network — allow?". Subsequent launches: silent unless manifest changed.
+7. Filesystem mounts: nullfs from CAS-FS into the jail; per-app writable overlay.
+8. Resource limits (rctl).
 
 **Risks:**
 - Capability UX is hostile if there are too many prompts. Group and default-grant the obvious ones.
