@@ -4670,7 +4670,16 @@ tessera_fs_gc_data_zone(struct tessera_mount *tmp_)
 	live_count++;                                                     \
 } while (0)
 
-	/* Helper: walk one opened inode_tree, append all manifest hashes. */
+	/* Helper: walk one opened inode_tree, append all manifest hashes
+	 * AND every transitively reachable child manifest / blob hash.
+	 * Without the recursion, multi-level structures (DIRECTORY_BTREE
+	 * inner→leaf, DIRECTORY_2L outer→buckets, CHUNK_TREE outer→inner)
+	 * would have only their ROOT manifest in the live set; pass-2
+	 * would then reclaim every interior single-blob pack and the
+	 * parent would dangle. Reproduces with 33+ entries in one dir
+	 * (TESSERA_DIR_BTREE_FANOUT_LEAF=32 → split → 1 inner + 2 leaves
+	 * → leaves GC'd → "ls" returns 0 / Input/output error). Stack-
+	 * bounded at depth 64 so a corrupt cycle can't loop forever. */
 #define _GC_WALK_INODE_TREE(_tree) do {                                   \
 	if ((_tree) == NULL) break;                                       \
 	tessera_btree_cursor_t *_c = tessera_btree_seek_first(_tree);     \
@@ -4680,7 +4689,81 @@ tessera_fs_gc_data_zone(struct tessera_mount *tmp_)
 		tessera_inode_record_t _ino;                              \
 		if (tessera_btree_cursor_get(_c, _k, &_ino) != TESSERA_OK)\
 			break;                                            \
-		_GC_PUSH_HASH(_ino.manifest_hash);                        \
+		tessera_hash_t _stack[64];                                \
+		int _sp = 0;                                              \
+		if (!tessera_hash_is_null(_ino.manifest_hash)) {          \
+			memcpy(_stack[_sp++], _ino.manifest_hash,         \
+			    TESSERA_HASH_SIZE);                           \
+		}                                                         \
+		while (_sp > 0 && _sp < 64) {                             \
+			tessera_hash_t _h;                                \
+			memcpy(_h, _stack[--_sp], TESSERA_HASH_SIZE);     \
+			_GC_PUSH_HASH(_h);                                \
+			uint8_t  *_blob = NULL;                           \
+			uint32_t _blen = 0;                               \
+			if (tessera_fs_fetch_blob(tmp_, _h, &_blob,       \
+			    &_blen) != 0) continue;                       \
+			tessera_manifest_parser_t *_p =                   \
+			    tessera_manifest_parse(_blob, _blen);         \
+			if (_p == NULL) { free(_blob, M_TESSERA);         \
+			    continue; }                                   \
+			tessera_manifest_kind_t _k2 =                     \
+			    tessera_manifest_parser_kind(_p);             \
+			uint32_t _cnt =                                   \
+			    tessera_manifest_parser_count(_p);            \
+			if (_k2 == TESSERA_MFT_CHUNK_LIST) {              \
+				for (uint32_t _i = 0; _i < _cnt; _i++) {  \
+					tessera_chunk_record_t _cr;       \
+					if (tessera_manifest_chunk_at(_p, \
+					    _i, &_cr) == TESSERA_OK)      \
+						_GC_PUSH_HASH(_cr.chunk_hash); \
+				}                                         \
+			} else if (_k2 == TESSERA_MFT_CHUNK_TREE) {       \
+				for (uint32_t _i = 0;                     \
+				    _i < _cnt && _sp < 63; _i++) {        \
+					tessera_tree_record_t _tr;        \
+					if (tessera_manifest_tree_at(_p,  \
+					    _i, &_tr) == TESSERA_OK)      \
+						memcpy(_stack[_sp++],     \
+						    _tr.child_manifest_hash, \
+						    TESSERA_HASH_SIZE);   \
+				}                                         \
+			} else if (_k2 == TESSERA_MFT_DIRECTORY_2L) {     \
+				for (uint32_t _i = 0;                     \
+				    _i < _cnt && _sp < 63; _i++) {        \
+					tessera_dir_bucket_record_t _br;  \
+					if (tessera_manifest_dir_bucket_at(\
+					    _p, _i, &_br) == TESSERA_OK)  \
+						memcpy(_stack[_sp++],     \
+						    _br.bucket_manifest_hash, \
+						    TESSERA_HASH_SIZE);   \
+				}                                         \
+			} else if (_k2 == TESSERA_MFT_DIRECTORY_BTREE) {  \
+				int _lf;                                  \
+				const uint8_t *_body;                     \
+				size_t _bblen;                            \
+				uint32_t _bcnt;                           \
+				if (tessera_fs_dir_btree_decode(_blob,    \
+				    _blen, &_lf, &_body, &_bblen, &_bcnt) \
+				    == 0 && !_lf) {                       \
+					size_t _off = 0;                  \
+					for (uint32_t _i = 0;             \
+					    _i < _bcnt && _sp < 63;       \
+					    _i++) {                       \
+						if (_off + 8 +            \
+						    TESSERA_HASH_SIZE >   \
+						    _bblen) break;        \
+						memcpy(_stack[_sp++],     \
+						    _body + _off + 8,     \
+						    TESSERA_HASH_SIZE);   \
+						_off += 8 +               \
+						    TESSERA_HASH_SIZE;    \
+					}                                 \
+				}                                         \
+			}                                                 \
+			tessera_manifest_parser_free(_p);                 \
+			free(_blob, M_TESSERA);                           \
+		}                                                         \
 		if (tessera_btree_cursor_next(_c) != TESSERA_OK) break;   \
 	}                                                                 \
 	tessera_btree_cursor_free(_c);                                    \
