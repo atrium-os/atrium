@@ -297,6 +297,38 @@ build flags, in the same workspace context. Cross-version /
 cross-toolchain dedup will be lower; reproducible-builds discipline
 is required to capture full value.
 
+### 5.2 N-way aggregate (all 9 Atrium binaries)
+
+`tessera-binsplit --multi <bin>...` over the full set of currently-
+built Atrium app binaries:
+
+```
+                      flat sum   function-deduped   saved
+                      4.28 MiB         2.26 MiB     2.02 MiB (1.89×)
+```
+
+Marginal install cost (cumulative, in argv order):
+
+| Binary | Flat | Marginal | % Saved |
+|---|---|---|---|
+| atrium-rect-bouncer | 280 KiB |  266 KiB |  5% |
+| atrium-keyboard     | 250 KiB |   70 KiB | 72% |
+| atrium-window-demo  | 269 KiB |   76 KiB | 72% |
+| atrium-textured     | 267 KiB |   74 KiB | 72% |
+| atrium-mouse-demo   | 267 KiB |   74 KiB | 72% |
+| atrium-slot-demo    | 281 KiB |   77 KiB | 73% |
+| atrium-test-client  | 265 KiB |   72 KiB | 73% |
+| atrium-text-demo    | 1.21 MiB | 1.01 MiB | 17% |
+| atrium-edit-socket  | 1.24 MiB |  573 KiB | 55% |
+
+**The per-app marginal cost converges to ~70-75 KiB** for apps
+in the same workspace using overlapping dep sets. The text-rendering
+binaries (text-demo, edit-socket) add a one-time ~1 MiB chunk for
+swash/skrifa/etc., then subsequent text apps share most of that.
+
+This is the actual user-visible value: installing N Atrium apps
+costs ~1.5–2× one app, not Nx.
+
 ## 6. Non-goals
 
 - Not a JIT. Reconstitution produces ordinary native code that

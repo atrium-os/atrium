@@ -412,8 +412,91 @@ fn short_name(s: &str) -> &str {
     s.rsplit("::").next().unwrap_or(s)
 }
 
+fn multi(paths: &[String]) -> Result<(), String> {
+    let mut analyses: Vec<AnalysisResult> = Vec::with_capacity(paths.len());
+    for p in paths {
+        let a = analyze(p)?;
+        analyses.push(a);
+    }
+
+    /* For aggregate: treat each unique blob hash as one entry,
+     * sized by max(any binary's view of its size — should always
+     * match since the bytes hash determines size, but defensively). */
+    let mut union: HashMap<[u8; 32], u64> = HashMap::new();
+    let mut per_bin: Vec<HashSet<[u8; 32]>> = Vec::with_capacity(analyses.len());
+    let mut flat_total: u64 = 0;
+    for a in &analyses {
+        let mut s: HashSet<[u8; 32]> = HashSet::new();
+        let mut bin_total: u64 = 0;
+        for f in &a.functions {
+            s.insert(f.blob_hash);
+            bin_total += f.size;
+            union.entry(f.blob_hash).or_insert(f.size);
+        }
+        per_bin.push(s);
+        flat_total += bin_total;
+    }
+    let union_bytes: u64 = union.values().sum();
+
+    println!("\n=== N-way aggregate (n={}) ===", analyses.len());
+    println!("  per-binary function bytes:");
+    for (a, set) in analyses.iter().zip(per_bin.iter()) {
+        let bytes: u64 = a.functions.iter().map(|f| f.size).sum();
+        println!("    {:>30}  {:>10}  ({} blobs)",
+            short_path(&a.binary_path),
+            human(bytes),
+            set.len());
+    }
+    println!();
+    println!("  flat sum (Σ binaries) : {} ({})",
+        human(flat_total), flat_total);
+    println!("  function-deduped union: {} ({})",
+        human(union_bytes), union_bytes);
+    let saved = flat_total.saturating_sub(union_bytes);
+    let ratio = flat_total as f64 / union_bytes.max(1) as f64;
+    println!("  saved                 : {} ({:.2}× compression vs flat)",
+        human(saved), ratio);
+
+    /* Marginal cost: if I install binary i+1 having already
+     * installed binaries 0..=i, how many NEW bytes does it add? */
+    println!();
+    println!("  marginal install cost (bytes added per binary, in argv order):");
+    let mut seen: HashSet<[u8; 32]> = HashSet::new();
+    let mut cumulative: u64 = 0;
+    for a in &analyses {
+        let mut new_bytes: u64 = 0;
+        for f in &a.functions {
+            if seen.insert(f.blob_hash) {
+                new_bytes += f.size;
+            }
+        }
+        cumulative += new_bytes;
+        let bin_total: u64 = a.functions.iter().map(|f| f.size).sum();
+        let savings = if bin_total > 0 {
+            100.0 * (1.0 - new_bytes as f64 / bin_total as f64)
+        } else { 0.0 };
+        println!("    {:>30}  flat {:>10}  marginal {:>10}  ({:.0}% saved)  cum {}",
+            short_path(&a.binary_path),
+            human(bin_total),
+            human(new_bytes),
+            savings,
+            human(cumulative));
+    }
+
+    Ok(())
+}
+
+fn short_path(p: &str) -> String {
+    p.rsplit('/').next().unwrap_or(p).to_string()
+}
+
 fn usage() -> ! {
-    eprintln!("usage:\n  tessera-binsplit --analyze <BINARY>\n  tessera-binsplit --compare <BINARY_A> <BINARY_B>");
+    eprintln!(
+        "usage:\n  \
+         tessera-binsplit --analyze <BINARY>\n  \
+         tessera-binsplit --compare <BINARY_A> <BINARY_B>\n  \
+         tessera-binsplit --multi <BIN1> [<BIN2> ...]"
+    );
     std::process::exit(2);
 }
 
@@ -432,7 +515,6 @@ fn main() -> ExitCode {
                     print_analysis(&a);
                     print_analysis(&b);
                     compare(&a, &b);
-                    /* Suppress unused warning */
                     let _ = (BTreeMap::<u8, u8>::new(),);
                     ExitCode::SUCCESS
                 }
@@ -440,6 +522,12 @@ fn main() -> ExitCode {
                     eprintln!("error: {e}");
                     ExitCode::from(1)
                 }
+            }
+        }
+        Some("--multi") if args.len() >= 3 => {
+            match multi(&args[2..]) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => { eprintln!("error: {e}"); ExitCode::from(1) }
             }
         }
         _ => usage(),
