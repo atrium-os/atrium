@@ -534,6 +534,9 @@ static int  tessera_fs_flush     (struct tessera_mount *tmp_);
 static int  tessera_fs_dirty_content_write(struct tessera_mount *tmp_,
     uint32_t inode_no, uint64_t write_off, const uint8_t *new_bytes,
     size_t write_len, size_t final_size);
+static int  tessera_fs_dirty_content_write_uio(struct tessera_mount *tmp_,
+    uint32_t inode_no, uint64_t write_off, struct uio *uio,
+    size_t final_size);
 static int  tessera_fs_dirty_content_read(struct tessera_mount *tmp_,
     uint32_t inode_no, struct uio *uio);
 static int  tessera_fs_dirty_content_drain_one(struct tessera_mount *tmp_,
@@ -5475,6 +5478,102 @@ tessera_fs_dirty_content_drop(struct tessera_mount *tmp_, uint32_t inode_no)
 	}
 	mtx_unlock(&tmp_->flush_mtx);
 	tessera_fs_dirty_content_free(dc);
+}
+
+/* uio variant — copy directly from userspace into the per-inode
+ * buffer. Avoids the kbuf malloc + extra memcpy on the vop_write
+ * fast path. The vnode lock (held EXCLUSIVE by VFS during vop_write)
+ * guarantees no concurrent drain_one on this inode, so the bytes
+ * pointer we sample under flush_mtx stays valid across the unlocked
+ * uiomove.
+ *
+ * Returns 0 on success; on uiomove failure, returns the error and
+ * the buffer's size/dirty are NOT advanced (the partially-written
+ * region is overwritten by the next successful write or zeroed at
+ * grow time). */
+static int
+tessera_fs_dirty_content_write_uio(struct tessera_mount *tmp_,
+                                   uint32_t inode_no, uint64_t write_off,
+                                   struct uio *uio, size_t final_size)
+{
+	const size_t write_len = (size_t)uio->uio_resid;
+
+	mtx_lock(&tmp_->flush_mtx);
+	int over_cap = (tmp_->dirty_content_bytes + final_size >
+	    (size_t)tessera_dirty_content_cap);
+	mtx_unlock(&tmp_->flush_mtx);
+	if (over_cap)
+		(void)tessera_fs_dirty_content_drain_all(tmp_);
+
+	/* Get or create the buffer; grow if needed. Same logic as the
+	 * non-uio variant, but stops short of the memcpy and instead
+	 * hands back a pointer for the caller-side uiomove. */
+	uint8_t *target_bytes = NULL;
+	mtx_lock(&tmp_->flush_mtx);
+	struct tessera_dirty_content *dc =
+	    tessera_fs_dirty_content_lookup(tmp_, inode_no);
+	if (dc == NULL) {
+		mtx_unlock(&tmp_->flush_mtx);
+		/* Slow path — fall back to the kbuf variant which
+		 * handles read_full_content. (First-touch is uncommon
+		 * relative to subsequent writes.) */
+		uint8_t *kbuf = malloc(write_len, M_TESSERA, M_WAITOK);
+		int err = uiomove(kbuf, (int)write_len, uio);
+		if (err != 0) { free(kbuf, M_TESSERA); return (err); }
+		err = tessera_fs_dirty_content_write(tmp_, inode_no,
+		    write_off, kbuf, write_len, final_size);
+		free(kbuf, M_TESSERA);
+		return (err);
+	}
+
+	if (final_size > dc->capacity) {
+		size_t new_cap = dc->capacity ? dc->capacity * 2 : 4096;
+		while (new_cap < final_size) new_cap *= 2;
+		if (new_cap > (size_t)tessera_dirty_content_file_max)
+			new_cap = (size_t)tessera_dirty_content_file_max;
+		if (new_cap < final_size) new_cap = final_size;
+		uint8_t *nb = malloc(new_cap, M_TESSERA, M_NOWAIT | M_ZERO);
+		if (nb == NULL) {
+			mtx_unlock(&tmp_->flush_mtx);
+			return (ENOMEM);
+		}
+		if (dc->size > 0)
+			memcpy(nb, dc->bytes, dc->size);
+		free(dc->bytes, M_TESSERA);
+		dc->bytes    = nb;
+		dc->capacity = new_cap;
+	}
+	if (write_off > dc->size)
+		memset(dc->bytes + dc->size, 0,
+		    (size_t)(write_off - dc->size));
+	target_bytes = dc->bytes + write_off;
+	mtx_unlock(&tmp_->flush_mtx);
+
+	/* Direct copy from user — vnode is held exclusive so dc->bytes
+	 * cannot be freed under us. */
+	int err = uiomove(target_bytes, (int)write_len, uio);
+	if (err != 0) return (err);
+
+	mtx_lock(&tmp_->flush_mtx);
+	/* Re-lookup defensively; in normal operation dc is still the
+	 * same entry, but a concurrent invalidate-by-inode could have
+	 * dropped it (we don't have that path today, but keep the
+	 * structure honest). */
+	dc = tessera_fs_dirty_content_lookup(tmp_, inode_no);
+	if (dc == NULL) {
+		mtx_unlock(&tmp_->flush_mtx);
+		return (0);
+	}
+	size_t new_size = (size_t)(write_off + write_len) > dc->size
+	    ? (size_t)(write_off + write_len) : dc->size;
+	if (new_size > final_size) new_size = final_size;
+	if (new_size > dc->size)
+		tmp_->dirty_content_bytes += (new_size - dc->size);
+	dc->size  = new_size;
+	dc->dirty = 1;
+	tessera_stat_dirty_content_hits++;
+	mtx_unlock(&tmp_->flush_mtx);
+	return (0);
 }
 
 /* Apply a write into the per-inode buffer. Buffer is created on
@@ -11674,26 +11773,19 @@ tessera_vop_write(struct vop_write_args *ap)
 	if (final_size > TESSERA_WRITE_MAX_BYTES)
 		return (EFBIG);
 
-	/* Drain the uio into a kernel buffer of just the new bytes (not
-	 * the whole file). Both fast and slow paths reuse this; it
-	 * separates "consume userspace" from "decide which path". */
-	uint8_t *new_bytes = malloc((size_t)write_resid, M_TESSERA, M_WAITOK);
-	int err = uiomove(new_bytes, (int)write_resid, uio);
-	if (err != 0) {
-		free(new_bytes, M_TESSERA);
-		return (err);
-	}
-
 	/* Coalesce small/medium writes into a per-inode RAM buffer so
 	 * the manifest is published once at fsync / flush, not once per
 	 * vop_write. Files up to tessera_dirty_content_file_max
 	 * (default 4 MiB) qualify; the buffer publishes through INLINE
-	 * or chunked depending on its size at flush time. */
+	 * or chunked depending on its size at flush time.
+	 *
+	 * Hot path: copy directly from user into the dirty_content
+	 * buffer — no kbuf malloc, no extra memcpy. The vnode lock held
+	 * by VFS guarantees no concurrent drain. */
 	if (final_size <= (uint64_t)tessera_dirty_content_file_max) {
-		int wr = tessera_fs_dirty_content_write(tmp_,
-		    (uint32_t)tn->inode_no, write_off, new_bytes,
-		    (size_t)write_resid, (size_t)final_size);
-		free(new_bytes, M_TESSERA);
+		int wr = tessera_fs_dirty_content_write_uio(tmp_,
+		    (uint32_t)tn->inode_no, write_off, uio,
+		    (size_t)final_size);
 		if (wr != 0) return (wr);
 		/* Size update is implicit: inode_get overlays the live
 		 * size from dirty_content, so no inode_put needed for
@@ -11710,6 +11802,16 @@ tessera_vop_write(struct vop_write_args *ap)
 		tessera_stat_vop_write_inline++;
 		tessera_fs_mark_dirty(tmp_);
 		return (0);
+	}
+
+	/* Slow paths beyond this point materialise new_bytes from the
+	 * uio first; they need the bytes in kernel memory anyway for
+	 * read_full_content / hash. */
+	uint8_t *new_bytes = malloc((size_t)write_resid, M_TESSERA, M_WAITOK);
+	int err = uiomove(new_bytes, (int)write_resid, uio);
+	if (err != 0) {
+		free(new_bytes, M_TESSERA);
+		return (err);
 	}
 
 	/* If we have a coalesced buffer but the write spills past
