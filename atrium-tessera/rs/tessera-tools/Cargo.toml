@@ -23,6 +23,12 @@ path = "src/bin/import.rs"
 name = "tessera-stat"
 path = "src/bin/stat.rs"
 
+[[bin]]
+name = "tessera-binsplit"
+path = "src/bin/binsplit.rs"
+
 [dependencies]
 tessera-sys = { path = "../tessera-sys" }
 libc        = "0.2"
+sha2        = "0.10"
+object      = { version = "0.36", default-features = false, features = ["read", "elf", "std"] }
