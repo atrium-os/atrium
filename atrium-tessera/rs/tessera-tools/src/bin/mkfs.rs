@@ -95,12 +95,26 @@ fn run() -> Result<(), String> {
     let args = parse_args();
 
     if let Some(mib) = args.create {
-        let f = std::fs::OpenOptions::new()
-            .read(true).write(true).create(true).truncate(true)
-            .open(&args.path)
-            .map_err(|e| format!("create {}: {e}", args.path))?;
-        f.set_len(mib * 1024 * 1024)
-            .map_err(|e| format!("set_len: {e}"))?;
+        // Block / character devices: skip truncate + set_len; the
+        // kernel rejects both. Detect by trying to stat the path —
+        // if it exists and its st_mode is BLK/CHR, skip allocation
+        // and let the existing device geometry drive total_sectors
+        // below (file_size uses DIOCGMEDIASIZE on FreeBSD).
+        let is_dev = std::fs::metadata(&args.path)
+            .map(|m| {
+                use std::os::unix::fs::FileTypeExt;
+                m.file_type().is_block_device() ||
+                m.file_type().is_char_device()
+            })
+            .unwrap_or(false);
+        if !is_dev {
+            let f = std::fs::OpenOptions::new()
+                .read(true).write(true).create(true).truncate(true)
+                .open(&args.path)
+                .map_err(|e| format!("create {}: {e}", args.path))?;
+            f.set_len(mib * 1024 * 1024)
+                .map_err(|e| format!("set_len: {e}"))?;
+        }
     }
 
     let f = open_file_rw(&args.path)

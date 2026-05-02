@@ -101,5 +101,25 @@ pub fn fd_of(f: &File) -> i32 {
 }
 
 pub fn file_size(f: &File) -> io::Result<u64> {
-    Ok(f.metadata()?.len())
+    let m = f.metadata()?;
+    let len = m.len();
+    if len > 0 {
+        return Ok(len);
+    }
+    // Block / character device: stat reports st_size==0. Use the
+    // FreeBSD DIOCGMEDIASIZE ioctl to get the actual extent.
+    #[cfg(target_os = "freebsd")]
+    {
+        use std::os::unix::io::AsRawFd;
+        // _IOR('d', 129, off_t) — see <sys/disk.h>.
+        const DIOCGMEDIASIZE: libc::c_ulong = 0x40086481;
+        let mut sz: i64 = 0;
+        let r = unsafe {
+            libc::ioctl(f.as_raw_fd(), DIOCGMEDIASIZE, &mut sz as *mut i64)
+        };
+        if r == 0 && sz > 0 {
+            return Ok(sz as u64);
+        }
+    }
+    Ok(len)
 }
