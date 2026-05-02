@@ -561,6 +561,13 @@ static int  tessera_cas_loc_lookup (struct tessera_cas_cache *c,
     const tessera_hash_t hash, struct tessera_cas_loc_snap *out);
 static void tessera_cas_invalidate_pack(struct tessera_cas_cache *c,
     const uint8_t pack_id[16]);
+/* Tier B: cache small hot blob *bytes*. Lookup returns a freshly
+ * malloc'd copy (caller frees, just like fetch_blob's normal
+ * return). Insert silently drops blobs > cas_small_blob_cap. */
+static int  tessera_cas_byte_lookup(struct tessera_cas_cache *c,
+    const tessera_hash_t hash, uint8_t **out_buf, uint32_t *out_len);
+static void tessera_cas_byte_insert(struct tessera_cas_cache *c,
+    const tessera_hash_t hash, const uint8_t *bytes, uint32_t length);
 static void tessera_fs_mark_dirty(struct tessera_mount *tmp_);
 static void tessera_fs_flush_task(void *ctx, int pending);
 static void tessera_fs_repack_task(void *ctx, int pending);
@@ -5093,7 +5100,11 @@ tessera_cas_loc_insert(struct tessera_cas_cache *c,
 
 /* Drop every cache entry pointing at the given pack_id. Called when
  * a pack is deleted (gc_data_zone) or relocated (repack). O(loc_count)
- * but invalidations are rare relative to lookups. */
+ * but invalidations are rare relative to lookups.
+ *
+ * Also drops bytes-cache entries with matching hashes — we walk the
+ * loc entries we're dropping and look each one up in bytes (cheap:
+ * O(1) per loc entry). */
 static void
 tessera_cas_invalidate_pack(struct tessera_cas_cache *c,
                             const uint8_t pack_id[16])
@@ -5103,12 +5114,148 @@ tessera_cas_invalidate_pack(struct tessera_cas_cache *c,
 	struct tessera_cas_loc_entry *e, *next;
 	TAILQ_FOREACH_SAFE(e, &c->loc_lru, lru_link, next) {
 		if (memcmp(e->pack_id, pack_id, 16) == 0) {
+			/* Also drop the bytes-cache entry for this hash, if
+			 * any — same hash → same bytes, but the on-disk
+			 * source is gone or moved. (Bytes are still
+			 * correct, but invalidation gives a uniform
+			 * "post-invalidate, both tiers are clean" rule.) */
+			uint32_t bb;
+			memcpy(&bb, e->hash, sizeof bb);
+			bb &= (TESSERA_CAS_BYTE_BUCKETS - 1u);
+			struct tessera_cas_byte_entry *be, *bnext;
+			LIST_FOREACH_SAFE(be, &c->byte_buckets[bb],
+			                   hash_link, bnext) {
+				if (memcmp(be->hash, e->hash,
+				    sizeof be->hash) == 0) {
+					TAILQ_REMOVE(&c->byte_lru, be,
+					    lru_link);
+					LIST_REMOVE(be, hash_link);
+					if (c->byte_bytes >= be->length)
+						c->byte_bytes -= be->length;
+					else
+						c->byte_bytes = 0;
+					if (be->bytes != NULL)
+						free(be->bytes, M_TESSERA);
+					free(be, M_TESSERA);
+					tessera_stat_cas_byte_evicts++;
+					break;
+				}
+			}
 			TAILQ_REMOVE(&c->loc_lru, e, lru_link);
 			LIST_REMOVE(e, hash_link);
 			c->loc_count--;
 			tessera_stat_cas_invalidations++;
 			free(e, M_TESSERA);
 		}
+	}
+	mtx_unlock(&c->mtx);
+}
+
+static inline uint32_t
+tessera_cas_byte_bucket(const tessera_hash_t h)
+{
+	uint32_t v;
+	memcpy(&v, h, sizeof v);
+	return (v & (TESSERA_CAS_BYTE_BUCKETS - 1u));
+}
+
+static int
+tessera_cas_byte_lookup(struct tessera_cas_cache *c,
+                        const tessera_hash_t hash,
+                        uint8_t **out_buf, uint32_t *out_len)
+{
+	if (!tessera_cas_enable || !c->mtx_init ||
+	    tessera_cas_byte_max_bytes == 0) {
+		tessera_stat_cas_byte_misses++;
+		return (0);
+	}
+	uint32_t b = tessera_cas_byte_bucket(hash);
+	mtx_lock(&c->mtx);
+	struct tessera_cas_byte_entry *e;
+	LIST_FOREACH(e, &c->byte_buckets[b], hash_link) {
+		if (memcmp(e->hash, hash, sizeof e->hash) == 0) {
+			/* Copy bytes under the lock — uiomove-style copy
+			 * out happens at the caller. */
+			uint8_t *copy = malloc(e->length, M_TESSERA, M_NOWAIT);
+			if (copy == NULL) {
+				/* Treat as miss; caller will fetch + reinsert. */
+				mtx_unlock(&c->mtx);
+				tessera_stat_cas_byte_misses++;
+				return (0);
+			}
+			memcpy(copy, e->bytes, e->length);
+			*out_buf = copy;
+			*out_len = e->length;
+			TAILQ_REMOVE(&c->byte_lru, e, lru_link);
+			TAILQ_INSERT_HEAD(&c->byte_lru, e, lru_link);
+			tessera_stat_cas_byte_hits++;
+			mtx_unlock(&c->mtx);
+			return (1);
+		}
+	}
+	tessera_stat_cas_byte_misses++;
+	mtx_unlock(&c->mtx);
+	return (0);
+}
+
+static void
+tessera_cas_byte_insert(struct tessera_cas_cache *c,
+                        const tessera_hash_t hash,
+                        const uint8_t *bytes, uint32_t length)
+{
+	if (!tessera_cas_enable || !c->mtx_init ||
+	    tessera_cas_byte_max_bytes == 0)
+		return;
+	if (length == 0 || length > (uint32_t)tessera_cas_small_blob_cap)
+		return;
+
+	uint8_t *copy = malloc(length, M_TESSERA, M_NOWAIT);
+	if (copy == NULL) return;
+	memcpy(copy, bytes, length);
+
+	struct tessera_cas_byte_entry *e =
+	    malloc(sizeof *e, M_TESSERA, M_NOWAIT | M_ZERO);
+	if (e == NULL) { free(copy, M_TESSERA); return; }
+	memcpy(e->hash, hash, sizeof e->hash);
+	e->length = length;
+	e->bytes  = copy;
+
+	uint32_t b = tessera_cas_byte_bucket(hash);
+	mtx_lock(&c->mtx);
+	/* Replace existing entry for this hash. */
+	struct tessera_cas_byte_entry *existing;
+	LIST_FOREACH(existing, &c->byte_buckets[b], hash_link) {
+		if (memcmp(existing->hash, hash, sizeof existing->hash) == 0) {
+			TAILQ_REMOVE(&c->byte_lru, existing, lru_link);
+			LIST_REMOVE(existing, hash_link);
+			if (c->byte_bytes >= existing->length)
+				c->byte_bytes -= existing->length;
+			else
+				c->byte_bytes = 0;
+			if (existing->bytes != NULL)
+				free(existing->bytes, M_TESSERA);
+			free(existing, M_TESSERA);
+			break;
+		}
+	}
+	LIST_INSERT_HEAD(&c->byte_buckets[b], e, hash_link);
+	TAILQ_INSERT_HEAD(&c->byte_lru, e, lru_link);
+	c->byte_bytes += length;
+	tessera_stat_cas_byte_inserts++;
+	/* Evict LRU until under the byte cap. */
+	while (c->byte_bytes > (size_t)tessera_cas_byte_max_bytes) {
+		struct tessera_cas_byte_entry *victim =
+		    TAILQ_LAST(&c->byte_lru, tessera_cas_byte_lru);
+		if (victim == NULL || victim == e) break;
+		TAILQ_REMOVE(&c->byte_lru, victim, lru_link);
+		LIST_REMOVE(victim, hash_link);
+		if (c->byte_bytes >= victim->length)
+			c->byte_bytes -= victim->length;
+		else
+			c->byte_bytes = 0;
+		if (victim->bytes != NULL) free(victim->bytes, M_TESSERA);
+		free(victim, M_TESSERA);
+		tessera_stat_cas_byte_evicts++;
 	}
 	mtx_unlock(&c->mtx);
 }
@@ -5737,9 +5884,13 @@ tessera_fs_fetch_blob(struct tessera_mount *tmp_,
 		return (0);
 	if (tmp_->pack_registry_tree == NULL) return (ENOENT);
 
-	/* CAS-cache fast path. On hit we know which pack contains the
-	 * blob (by pack_id) and the extent list — skip the O(N) linear
-	 * scan of the pack registry, jump straight to bread + parse. */
+	/* Tier B: bytes cache hit returns the blob with no disk I/O. */
+	if (tessera_cas_byte_lookup(&tmp_->cas_cache, hash,
+	    out_buf, out_len))
+		return (0);
+
+	/* Tier A: location cache hit — skip the O(N) linear scan of the
+	 * pack registry, jump straight to bread + parse. */
 	{
 		struct tessera_cas_loc_snap snap;
 		if (tessera_cas_loc_lookup(&tmp_->cas_cache, hash, &snap)) {
@@ -5829,6 +5980,10 @@ tessera_fs_fetch_blob(struct tessera_mount *tmp_,
 				memcpy(copy, bytes, blen);
 				*out_buf = copy;
 				*out_len = blen;
+				/* Stash bytes for next time (eligibility
+				 * checked in cas_byte_insert). */
+				tessera_cas_byte_insert(&tmp_->cas_cache,
+				    hash, bytes, blen);
 				tessera_pack_close(pr);
 				free(packbuf, M_TESSERA);
 				return (0);
@@ -5928,6 +6083,9 @@ cas_fast_miss:
 				memcpy(copy, bytes, blen);
 				*out_buf = copy;
 				*out_len = blen;
+				/* Stash bytes for next time. */
+				tessera_cas_byte_insert(&tmp_->cas_cache,
+				    hash, bytes, blen);
 				tessera_pack_close(pr);
 				free(packbuf, M_TESSERA);
 				/* Cache this hit so future fetches skip the
