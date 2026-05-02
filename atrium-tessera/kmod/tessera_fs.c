@@ -5498,6 +5498,28 @@ tessera_fs_pack_alloc_and_write(struct tessera_mount *tmp_,
 	uint64_t prev_pel = 0;
 
 	while (remaining > 0) {
+		/* Allocate this PEL's sector FIRST. If we did this AFTER the
+		 * data extents, alloc_multi_partial would happily grab every
+		 * last free sector for data and leave zero for the PEL —
+		 * which then ENOSPC's a workload that has plenty of contig
+		 * space for data but ran the allocator down to the last
+		 * sector. Reserving the 1-sector PEL up-front is symmetric
+		 * with the contig fast-path's "allocate then write" order. */
+		uint64_t pel_sector = 0;
+		if (tessera_extent_alloc(tmp_->extent_alloc, 1, &pel_sector)
+		    != TESSERA_OK)
+			_ROLLBACK_AND_RETURN(ENOSPC);
+		if (pel_chain_cnt == pel_chain_cap) {
+			pel_chain_cap *= 2;
+			uint64_t *gp = malloc(pel_chain_cap * sizeof *gp,
+			    M_TESSERA, M_WAITOK);
+			memcpy(gp, pel_chain, pel_chain_cnt * sizeof *gp);
+			free(pel_chain, M_TESSERA);
+			pel_chain = gp;
+		}
+		pel_chain[pel_chain_cnt++] = pel_sector;
+		if (head_pel == 0) head_pel = pel_sector;
+
 		uint32_t count = 0;
 		uint64_t filled = 0;
 		r = tessera_extent_alloc_multi_partial(tmp_->extent_alloc,
@@ -5511,7 +5533,7 @@ tessera_fs_pack_alloc_and_write(struct tessera_mount *tmp_,
 			_ROLLBACK_AND_RETURN(ENOSPC);
 		}
 
-		/* Record allocations for rollback. */
+		/* Record data allocations for rollback. */
 		while (all_cnt + count > all_cap) {
 			all_cap *= 2;
 			uint64_t *gs = malloc(all_cap * sizeof *gs,
@@ -5530,22 +5552,6 @@ tessera_fs_pack_alloc_and_write(struct tessera_mount *tmp_,
 			all_lengths[all_cnt] = lengths[i];
 			all_cnt++;
 		}
-
-		/* Allocate this PEL's sector. */
-		uint64_t pel_sector = 0;
-		if (tessera_extent_alloc(tmp_->extent_alloc, 1, &pel_sector)
-		    != TESSERA_OK)
-			_ROLLBACK_AND_RETURN(ENOSPC);
-		if (pel_chain_cnt == pel_chain_cap) {
-			pel_chain_cap *= 2;
-			uint64_t *gp = malloc(pel_chain_cap * sizeof *gp,
-			    M_TESSERA, M_WAITOK);
-			memcpy(gp, pel_chain, pel_chain_cnt * sizeof *gp);
-			free(pel_chain, M_TESSERA);
-			pel_chain = gp;
-		}
-		pel_chain[pel_chain_cnt++] = pel_sector;
-		if (head_pel == 0) head_pel = pel_sector;
 
 		/* Write data extents for this PEL. */
 		for (uint32_t i = 0; i < count; i++) {
