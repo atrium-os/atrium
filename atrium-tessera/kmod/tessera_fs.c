@@ -544,6 +544,10 @@ static void tessera_fs_dirty_content_drop(struct tessera_mount *tmp_,
 struct tessera_cas_cache;
 static void tessera_cas_cache_init (struct tessera_cas_cache *c);
 static void tessera_cas_cache_drain(struct tessera_cas_cache *c);
+static void tessera_cas_loc_insert (struct tessera_cas_cache *c,
+    const tessera_hash_t hash, const uint8_t pack_id[16],
+    const tessera_pack_extent_t *exts, uint32_t nexts,
+    uint64_t total_sectors);
 static void tessera_fs_mark_dirty(struct tessera_mount *tmp_);
 static void tessera_fs_flush_task(void *ctx, int pending);
 static void tessera_fs_repack_task(void *ctx, int pending);
@@ -629,11 +633,10 @@ struct tessera_dirty_content {
 struct tessera_cas_loc_entry {
 	LIST_ENTRY(tessera_cas_loc_entry) hash_link;
 	TAILQ_ENTRY(tessera_cas_loc_entry) lru_link;
-	tessera_hash_t   hash;
-	uint64_t         pack_id;        /* registry key (pack-manifest hash low64) */
-	uint32_t         offset_in_pack; /* byte offset of blob within pack image */
-	uint32_t         length;         /* blob length in bytes */
-	uint8_t          n_extents;      /* 1..4 inline; 0xFF = use resolver */
+	tessera_hash_t   hash;            /* the blob hash we cache by */
+	uint8_t          pack_id[16];     /* registry key — for invalidation by pack */
+	uint64_t         total_sectors;   /* sum of extents[i].length_sectors */
+	uint8_t          n_extents;       /* 1..4 inline; 0xFF = fall back to resolver */
 	tessera_pack_extent_t extents[4];
 };
 
@@ -648,16 +651,19 @@ struct tessera_cas_byte_entry {
 #define TESSERA_CAS_LOC_BUCKETS    1024u
 #define TESSERA_CAS_BYTE_BUCKETS    256u
 
+TAILQ_HEAD(tessera_cas_loc_lru,  tessera_cas_loc_entry);
+TAILQ_HEAD(tessera_cas_byte_lru, tessera_cas_byte_entry);
+
 struct tessera_cas_cache {
 	struct mtx      mtx;
 	int             mtx_init;
 	/* Tier A — location */
-	LIST_HEAD(, tessera_cas_loc_entry)  loc_buckets[TESSERA_CAS_LOC_BUCKETS];
-	TAILQ_HEAD(, tessera_cas_loc_entry) loc_lru;
+	LIST_HEAD(, tessera_cas_loc_entry)   loc_buckets[TESSERA_CAS_LOC_BUCKETS];
+	struct tessera_cas_loc_lru           loc_lru;
 	size_t          loc_count;
 	/* Tier B — bytes (stage 5) */
 	LIST_HEAD(, tessera_cas_byte_entry)  byte_buckets[TESSERA_CAS_BYTE_BUCKETS];
-	TAILQ_HEAD(, tessera_cas_byte_entry) byte_lru;
+	struct tessera_cas_byte_lru          byte_lru;
 	size_t          byte_bytes;
 };
 
@@ -5002,6 +5008,76 @@ tessera_cas_cache_drain(struct tessera_cas_cache *c)
 	c->mtx_init = 0;
 }
 
+/* Bucket selector — the hash is already cryptographic, so the low
+ * 32 bits are uniform. */
+static inline uint32_t
+tessera_cas_loc_bucket(const tessera_hash_t h)
+{
+	uint32_t v;
+	memcpy(&v, h, sizeof v);
+	return (v & (TESSERA_CAS_LOC_BUCKETS - 1u));
+}
+
+/* Insert a location entry. No-op if the cache is disabled or low
+ * memory. Caller does NOT hold the cache mtx.
+ *
+ * Stage 2: called from publish_*_to_disk after a successful
+ * btree_put. We know exactly where the pack landed and how many
+ * sectors it occupies — the cheapest possible source of truth. */
+static void
+tessera_cas_loc_insert(struct tessera_cas_cache *c,
+                       const tessera_hash_t hash,
+                       const uint8_t pack_id[16],
+                       const tessera_pack_extent_t *exts, uint32_t nexts,
+                       uint64_t total_sectors)
+{
+	if (!tessera_cas_enable || !c->mtx_init) return;
+
+	struct tessera_cas_loc_entry *e =
+	    malloc(sizeof *e, M_TESSERA, M_NOWAIT | M_ZERO);
+	if (e == NULL) return;
+	memcpy(e->hash, hash, sizeof e->hash);
+	memcpy(e->pack_id, pack_id, sizeof e->pack_id);
+	e->total_sectors = total_sectors;
+	if (nexts <= 4) {
+		e->n_extents = (uint8_t)nexts;
+		for (uint32_t i = 0; i < nexts; i++) e->extents[i] = exts[i];
+	} else {
+		e->n_extents = 0xFF; /* signal: use resolver on read */
+	}
+
+	uint32_t b = tessera_cas_loc_bucket(hash);
+	mtx_lock(&c->mtx);
+	/* Replace any existing entry for this hash (re-publish updates
+	 * the location). */
+	struct tessera_cas_loc_entry *existing;
+	LIST_FOREACH(existing, &c->loc_buckets[b], hash_link) {
+		if (memcmp(existing->hash, hash, sizeof existing->hash) == 0) {
+			TAILQ_REMOVE(&c->loc_lru, existing, lru_link);
+			LIST_REMOVE(existing, hash_link);
+			c->loc_count--;
+			free(existing, M_TESSERA);
+			break;
+		}
+	}
+	LIST_INSERT_HEAD(&c->loc_buckets[b], e, hash_link);
+	TAILQ_INSERT_HEAD(&c->loc_lru, e, lru_link);
+	c->loc_count++;
+	tessera_stat_cas_loc_inserts++;
+	/* Strict LRU eviction past the cap. */
+	while (c->loc_count > (size_t)tessera_cas_loc_max) {
+		struct tessera_cas_loc_entry *victim =
+		    TAILQ_LAST(&c->loc_lru, tessera_cas_loc_lru);
+		if (victim == NULL) break;
+		TAILQ_REMOVE(&c->loc_lru, victim, lru_link);
+		LIST_REMOVE(victim, hash_link);
+		c->loc_count--;
+		tessera_stat_cas_loc_evicts++;
+		free(victim, M_TESSERA);
+	}
+	mtx_unlock(&c->mtx);
+}
+
 /* Caller holds flush_mtx. */
 static struct tessera_dirty_content *
 tessera_fs_dirty_content_lookup(struct tessera_mount *tmp_, uint32_t inode_no)
@@ -6957,6 +7033,21 @@ tessera_fs_publish_manifest_to_disk(struct tessera_mount *tmp_,
 	    &new_pack_root) != TESSERA_OK)
 		return (EIO);
 	tmp_->sb.pack_registry_root = new_pack_root;
+
+	/* CAS-cache insert for the manifest blob. Single-blob pack ⇒ one
+	 * extent. Multi-extent layout (PEL) defers extent resolution to
+	 * read time. */
+	if ((pa.flags & TESSERA_REGISTRY_FLAG_MULTI_EXTENT) == 0) {
+		tessera_pack_extent_t one = {
+			.start_sector   = pa.start_sector,
+			.length_sectors = pa.length_sectors,
+		};
+		tessera_cas_loc_insert(&tmp_->cas_cache, hash, pack_id,
+		    &one, 1, pa.length_sectors);
+	} else {
+		tessera_cas_loc_insert(&tmp_->cas_cache, hash, pack_id,
+		    NULL, 0xFFu, pa.length_sectors);
+	}
 	return (0);
 }
 
@@ -7070,6 +7161,21 @@ tessera_fs_publish_chunked(struct tessera_mount *tmp_,
 	    &new_pack_root) != TESSERA_OK)
 		return (EIO);
 	tmp_->sb.pack_registry_root = new_pack_root;
+
+	/* CAS-cache insert for the manifest of this chunked file. The
+	 * manifest is the entry point for every read; chunk blobs in the
+	 * same pack get inserted lazily on first miss in fetch_blob. */
+	if ((pa.flags & TESSERA_REGISTRY_FLAG_MULTI_EXTENT) == 0) {
+		tessera_pack_extent_t one = {
+			.start_sector   = pa.start_sector,
+			.length_sectors = pa.length_sectors,
+		};
+		tessera_cas_loc_insert(&tmp_->cas_cache, out_manifest_hash,
+		    pack_id, &one, 1, pa.length_sectors);
+	} else {
+		tessera_cas_loc_insert(&tmp_->cas_cache, out_manifest_hash,
+		    pack_id, NULL, 0xFFu, pa.length_sectors);
+	}
 	return (0);
 }
 
