@@ -1,0 +1,18 @@
+[package]
+name        = "atrium-rpc"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+description = "Unified IPC substrate for Atrium services. Versioned opcode-tagged envelope, content-addressed payloads, async events, fd-passed shm rendezvous, capability boundary via filesystem (Portcullis-mounted UDS sockets)."
+publish     = false
+
+[lib]
+name = "atrium_rpc"
+path = "src/lib.rs"
+
+[dependencies]
+sha2  = "0.10"
+libc  = "0.2"
+
+[dev-dependencies]
+# unit tests use the std stuff that's already in the library

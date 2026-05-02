@@ -353,37 +353,62 @@ workloads.
 
 ## 9. Implementation plan (D1.6)
 
+Strategy: **build greenfield, grandfather Fresco.** The Fresco
+wire format (128-byte fixed `Command`/`Completion` frames from
+fresco-server) is incompatible with the variable-length envelope
+specified in §3.2. Migrating Fresco is a substantial refactor
+across 7+ binaries (fresco-server dispatcher, fresco-socket-rs,
+all client demos, atrium-edit-socket). That migration happens
+later (D1.7+), gated on proving the new envelope on at least one
+real non-Fresco service.
+
+For D1.6 we build the substrate fresh and validate with a smoke-
+test service. Fresco continues to use its 128-byte format until
+the migration phase.
+
 Order of work:
 
 1. **Spec freeze.** This document, plus
    `atrium-rpc-core/src/classes.rs` enumerating opcode_class
    constants. Reviewed and committed.
-2. **Crate scaffold.** `atrium-rpc-core` (no_std-friendly where
-   reasonable; std for the transport). Defines: envelope codec,
-   `Connection` type, CAS upload/fetch state machines, async
-   event channel, fd-pass helper.
-3. **Extract from fresco-socket-rs.** Identify the parts that
-   become atrium-rpc-core; move them. Keep fresco-socket-rs as
-   a thin layer over atrium-rpc-core that adds the display
-   opcode dictionary (class 1).
-4. **Verify all existing demos.**
-   - atrium-test-client
-   - atrium-rect-bouncer
-   - atrium-textured
-   - atrium-edit-socket
-   - atrium-window-demo
-   - atrium-keyboard
-   - atrium-slot-demo
-   They use fresco-socket-rs; should keep working with no
-   API changes (or trivial ones).
-5. **Write atrium-rpc-display crate** — opcodes for class 1,
-   re-exports the relevant Fresco types. fresco-socket-rs
-   becomes an alias.
-6. **Document patterns** for downstream services in
+2. **Crate scaffold.** `atrium-rpc-core` (std for transport;
+   keeps the option open for no_std bits later). Defines:
+   envelope codec, `Connection` type, CAS upload/fetch state
+   machines, async event channel, fd-pass helper.
+3. **Smoke-test service.** A minimal `atrium-rpc-echo` server +
+   client that exercises the envelope, CAS upload, async events,
+   and fd-passing. Validates the substrate end-to-end without
+   pulling in display complexity.
+4. **Document patterns** for downstream services in
    `docs/spec/atrium-rpc-services.md` (template + examples).
 
-D1.6 is complete when the existing demos work unchanged on top of
-the refactored stack and the spec is published.
+D1.6 is complete when:
+- The spec is published.
+- atrium-rpc-core builds, has unit tests, and the echo
+  smoke-test server+client cross-build for FreeBSD and exchange
+  CAS-keyed messages successfully under stress.
+- Existing Fresco demos remain untouched and continue to work.
+
+### 9.1 Fresco migration (deferred — D1.7 or later)
+
+Once D2.5 Portcullis ships and a few real services
+(`atrium-broker`, clipboard, notify) are running on
+atrium-rpc-core, migrate Fresco onto the same envelope. Plan:
+
+- New `atrium-rpc-display` crate publishes the display opcode
+  dictionary (class 1) over the shared envelope.
+- fresco-server's dispatcher rewritten to parse the envelope
+  instead of fixed 128-byte frames.
+- fresco-socket-rs becomes a thin layer (or alias) over
+  atrium-rpc-core + atrium-rpc-display.
+- All clients trivially update (the dispatch surface barely
+  changes; the wire format underneath does).
+- Wire-format compatibility window: fresco-server briefly
+  accepts both envelopes, advertised via NEGOTIATE_CAPS, until
+  all clients are rebuilt. Then drop the legacy path.
+
+Estimated effort: ~1 week focused. Lower risk than doing it now
+because the new envelope is already proven on real services.
 
 ## 10. Open questions
 
