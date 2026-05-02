@@ -6353,10 +6353,30 @@ tessera_fs_publish_chunked(struct tessera_mount *tmp_,
 	    pack_id, 0);
 	if (pb == NULL) return (ENOMEM);
 
+	/* Dedup chunks before adding to the pack: pack_finalize rejects
+	 * duplicate hashes in the same pack (TESSERA_EEXIST), so a write
+	 * with repeating content (e.g. all-zero file, or stress2's `rw`
+	 * which writes uninitialized stack-buf data → all chunks have
+	 * the same hash) would fail the publish entirely.
+	 *
+	 * The manifest's chunk_records can still repeat the hash —
+	 * that's how multiple logical offsets map to a single shared
+	 * blob. The pack body just stores each unique blob once. Use
+	 * a small linear scan since n_chunks is bounded by the file's
+	 * chunk fan-out (≤256). */
 	for (uint32_t i = 0; i < n_chunks; i++) {
-		if (tessera_pack_add_blob(pb, chunks[i].hash,
+		int dup = 0;
+		for (uint32_t j = 0; j < i; j++) {
+			if (memcmp(chunks[j].hash, chunks[i].hash,
+			    sizeof(tessera_hash_t)) == 0) {
+				dup = 1; break;
+			}
+		}
+		if (dup) continue;
+		int ar = tessera_pack_add_blob(pb, chunks[i].hash,
 		    chunks[i].bytes, chunks[i].len,
-		    TESSERA_BLOB_FLAG_CHUNK) != TESSERA_OK) {
+		    TESSERA_BLOB_FLAG_CHUNK);
+		if (ar != TESSERA_OK) {
 			tessera_pack_free(pb);
 			return (EIO);
 		}
