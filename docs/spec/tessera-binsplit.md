@@ -329,6 +329,53 @@ swash/skrifa/etc., then subsequent text apps share most of that.
 This is the actual user-visible value: installing N Atrium apps
 costs ~1.5–2× one app, not Nx.
 
+### 5.3 x86_64 cross-arch validation
+
+To answer "is this approach aarch64-specific?", we extended
+binsplit with x86_64 PC-rel masking via the `iced-x86` decoder.
+On x86_64 the masker handles:
+
+- CALL/JMP near targets (rel32, rel8)
+- Jcc near targets (rel32, rel8)
+- RIP-relative memory operands (`mov rax, [rip+disp]`)
+
+Validated on a controlled pair of x86_64 ELF object files
+(two Rust crates differing only in one function name):
+
+```
+  shared blobs       : 5 (5 unique-blob hashes)
+  shared bytes (A)   : 720 B / 731 B = 98.5% of A
+  shared bytes (B)   : 720 B / 731 B = 98.5% of B
+  saved              : 720 B (1.97× compression vs flat)
+```
+
+5 of 6 functions deduped exactly. The 6th is the function whose
+name (and thus body, since it returns a name-derived constant)
+intentionally differs.
+
+**Conclusion: the technique is not aarch64-specific.** Per-arch
+PC-rel masking is needed (different instruction encodings) but the
+*architecture* of split-on-symbols → mask-context → hash works
+identically. Production extractor (Phase 2+) will need both arches
+plus their respective relocation handling, but the design isn't
+in question.
+
+### 5.4 What's still uncovered
+
+- **Cross-toolchain dedup** (rustc 1.78 vs 1.82 of the same
+  source): expected to be near-zero — instruction selection,
+  register allocation, calling convention details all change.
+  Mitigated by reproducible-builds discipline (Atrium's package
+  system can pin toolchain version per build).
+- **Cross-feature-set dedup** (same crate built with vs without a
+  feature flag): some functions identical, some not. Will dedup
+  partially.
+- **Functions with embedded data** (jump tables, switch tables,
+  inline constants in .text): the masker treats these as code and
+  may zero things it shouldn't, hurting precision but not
+  correctness. Phase 2's extractor needs DWARF or compiler hints
+  to identify embedded data spans.
+
 ## 6. Non-goals
 
 - Not a JIT. Reconstitution produces ordinary native code that

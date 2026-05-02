@@ -32,3 +32,4 @@ tessera-sys = { path = "../tessera-sys" }
 libc        = "0.2"
 sha2        = "0.10"
 object      = { version = "0.36", default-features = false, features = ["read", "elf", "std"] }
+iced-x86    = { version = "1.21", default-features = false, features = ["std", "decoder", "intel"] }

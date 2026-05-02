@@ -132,6 +132,73 @@ fn mask_pc_rel_aarch64(bytes: &mut [u8]) {
     }
 }
 
+/// Mask the immediate fields of x86_64 PC-relative instructions.
+/// Walks the function bytes via iced-x86, decodes each instruction,
+/// and zeroes out:
+///   - branch displacements (CALL/JMP/Jcc near targets)
+///   - RIP-relative memory displacements (`mov rax, [rip+disp]`)
+/// Returns the number of bytes zeroed.
+///
+/// On decode failure we leave the remaining bytes alone — better to
+/// undermask (lose dedup precision) than over-mask (eat real opcodes).
+fn mask_pc_rel_x86_64(bytes: &mut [u8]) -> usize {
+    use iced_x86::{Decoder, DecoderOptions, OpKind};
+    /* Decode at a synthetic RIP=0; absolute addresses don't matter for
+     * masking, only the offsets of immediate fields within each
+     * instruction's encoding do. */
+    let mut total_zeroed = 0;
+    /* iced takes &[u8] but we need to mutate; decode from a clone of
+     * the slice (immutable view), then patch the mutable original. */
+    let snap = bytes.to_vec();
+    let mut decoder = Decoder::with_ip(64, &snap, 0, DecoderOptions::NONE);
+    while decoder.can_decode() {
+        let pos_before = decoder.position();
+        let insn = decoder.decode();
+        let pos_after = decoder.position();
+        if insn.is_invalid() {
+            /* Skip 1 byte and resync — same as a disassembler would. */
+            continue;
+        }
+        let insn_start = pos_before;
+        let insn_len = pos_after - pos_before;
+
+        /* Branches: CALL/JMP/Jcc with near rel32 (or short rel8).
+         * iced flags these via op_kind==NearBranch* on op0. */
+        let mut needs_mask = false;
+        for op_i in 0..insn.op_count() {
+            match insn.op_kind(op_i) {
+                OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
+                    needs_mask = true;
+                    break;
+                }
+                OpKind::Memory if insn.is_ip_rel_memory_operand() => {
+                    needs_mask = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if !needs_mask { continue; }
+
+        /* Conservative whole-displacement zero. The displacement
+         * is at the END of the instruction encoding for branches
+         * (after opcode + ModR/M + SIB) and similarly for RIP-rel
+         * memory operands. Without parsing each opcode form
+         * exactly, zero the trailing 4 bytes of the instruction
+         * (matches CALL rel32, JMP rel32, Jcc rel32, RIP-rel disp32);
+         * for short jumps / Jcc rel8 we'd over-mask by 3 bytes
+         * which is fine for normalization. */
+        let n = insn_len.min(4);
+        if n == 0 { continue; }
+        let zeros = insn_start + insn_len - n;
+        for b in &mut bytes[zeros..insn_start + insn_len] {
+            *b = 0;
+        }
+        total_zeroed += n;
+    }
+    total_zeroed
+}
+
 /// Width in bytes of the field a relocation type rewrites. Conservative
 /// per-arch table; unknown types fall back to 8 bytes (the safe upper
 /// bound for any reasonable reloc).
@@ -171,52 +238,87 @@ fn analyze(path: &str) -> Result<AnalysisResult, String> {
         .map_err(|e| format!("parse {path}: {e}"))?;
     let arch = obj.architecture();
 
-    /* Find .text — that's where executable code lives in a normal
-     * Rust ELF release build. */
-    let text = obj.section_by_name(".text")
-        .ok_or_else(|| format!("{path}: no .text section"))?;
-    let text_index = text.index();
-    let text_addr  = text.address();
-    let text_size  = text.size();
-    let text_data  = text.data().map_err(|e| format!("text data: {e}"))?;
+    /* Collect every section that holds executable code. For
+     * fully-linked executables this is just `.text`. For Rust
+     * release object files (each function in its own section for
+     * dead-code-elim) we also pick up `.text.<symbol>`. Per-section
+     * data + relocations + base address get tracked together. */
+    struct CodeSection {
+        index:  SectionIndex,
+        addr:   u64,
+        size:   u64,
+        data:   Vec<u8>,
+        relocs: Vec<(u64, u32)>, /* (vaddr, reloc_type) */
+    }
+    let mut code_sections: Vec<CodeSection> = Vec::new();
+    let mut total_text_bytes: u64 = 0;
+    for sec in obj.sections() {
+        let Ok(name) = sec.name() else { continue };
+        let is_text = name == ".text" || name.starts_with(".text.");
+        if !is_text { continue; }
+        let data = sec.data().map_err(|e| format!("read {name}: {e}"))?;
+        if data.is_empty() { continue; }
+        let mut relocs: Vec<(u64, u32)> = Vec::new();
+        for (off, rel) in sec.relocations() {
+            let _ = rel.target();
+            let rtype = match rel.flags() {
+                object::RelocationFlags::Elf { r_type } => r_type,
+                _ => 0,
+            };
+            relocs.push((sec.address() + off, rtype));
+        }
+        total_text_bytes += sec.size();
+        code_sections.push(CodeSection {
+            index: sec.index(),
+            addr:  sec.address(),
+            size:  sec.size(),
+            data:  data.to_vec(),
+            relocs,
+        });
+    }
+    if code_sections.is_empty() {
+        return Err(format!("{path}: no .text* sections"));
+    }
+    /* Index by SectionIndex.0 for quick symbol → section lookup. */
+    let by_idx: std::collections::HashMap<usize, &CodeSection> =
+        code_sections.iter().map(|s| (s.index.0, s)).collect();
 
-    /* Index relocations by section + offset for quick lookup. ELF
-     * relocations target a section + offset; for .text we want a map
-     * from offset-within-text → reloc info. */
-    let text_relocs: Vec<(u64, u32)> = collect_text_relocs(&obj, text_index)?;
-
-    /* Collect function symbols within .text. */
-    let mut funcs: Vec<(String, u64, u64)> = Vec::new();
+    /* Collect function symbols across all code sections. */
+    let mut funcs: Vec<(String, u64, u64, usize)> = Vec::new();
     for sym in obj.symbols() {
         if sym.kind() != SymbolKind::Text { continue; }
         let Some(SectionIndex(idx)) = sym.section_index() else { continue };
-        if idx != text_index.0 { continue; }
+        if !by_idx.contains_key(&idx) { continue; }
         let size = sym.size();
-        if size == 0 { continue; } /* aliases / weak fwd-decls */
+        if size == 0 { continue; }
         let name = sym.name().unwrap_or("<anon>").to_string();
-        funcs.push((name, sym.address(), size));
+        funcs.push((name, sym.address(), size, idx));
     }
-    /* Sort by virtual address; helps unaccounted-bytes calc. */
-    funcs.sort_by_key(|t| t.1);
+    /* For object files, every function symbol may have address 0
+     * because each lives in its own section. We still want to emit
+     * one entry per symbol; the (idx, addr) pair disambiguates. */
+    funcs.sort_by_key(|t| (t.3, t.1));
 
-    /* Extract + hash each function. */
     let mut accounted: u64 = 0;
     let mut out = Vec::with_capacity(funcs.len());
-    for (name, vaddr, size) in funcs {
-        let off = (vaddr - text_addr) as usize;
+    for (name, vaddr, size, sec_idx) in funcs {
+        let cs = by_idx[&sec_idx];
+        let off = vaddr.checked_sub(cs.addr)
+            .map(|o| o as usize)
+            .unwrap_or(0);
         let end = off + size as usize;
-        if end > text_data.len() {
-            /* Symbol table claims a function past .text end —
-             * skip with a note. */
+        if end > cs.data.len() {
             continue;
         }
-        let mut bytes = text_data[off..end].to_vec();
+        let mut bytes = cs.data[off..end].to_vec();
 
-        /* Zero bytes covered by any link-time relocation. (For
-         * fully-linked executables this is usually empty.) */
+        /* Zero bytes covered by any link-time relocation in this
+         * code section. For fully-linked executables this list is
+         * usually empty; for object files (.text.<symbol>) it
+         * contains the inter-function references. */
         let mut reloc_count = 0;
         let mut reloc_bytes = 0;
-        for &(roff, rtype) in &text_relocs {
+        for &(roff, rtype) in &cs.relocs {
             if roff >= vaddr && roff < vaddr + size {
                 let rstart = (roff - vaddr) as usize;
                 let w = reloc_width(arch, rtype);
@@ -234,7 +336,8 @@ fn analyze(path: &str) -> Result<AnalysisResult, String> {
          * placed it next to different neighbours. */
         match arch {
             object::Architecture::Aarch64 => mask_pc_rel_aarch64(&mut bytes),
-            _ => {} /* x86_64 PC-rel masking deferred — see binsplit.md §5 */
+            object::Architecture::X86_64  => { let _ = mask_pc_rel_x86_64(&mut bytes); }
+            _ => {}
         }
 
         let mut h = Sha256::new();
@@ -253,44 +356,10 @@ fn analyze(path: &str) -> Result<AnalysisResult, String> {
 
     Ok(AnalysisResult {
         binary_path: path.to_string(),
-        text_bytes:  text_size,
+        text_bytes:  total_text_bytes,
         functions:   out,
-        unaccounted: text_size.saturating_sub(accounted),
+        unaccounted: total_text_bytes.saturating_sub(accounted),
     })
-}
-
-/// Walk all relocation sections that target the .text section and
-/// return (relocation_offset_virtual, relocation_type). Object's API
-/// gives us per-section reloc iterators that already reference the
-/// target section.
-fn collect_text_relocs(
-    obj: &object::File,
-    text_index: SectionIndex,
-) -> Result<Vec<(u64, u32)>, String> {
-    let text_addr = obj.section_by_index(text_index)
-        .map_err(|e| format!("text section: {e}"))?
-        .address();
-    let mut out = Vec::new();
-    /* `Section::relocations()` yields all relocations applied to this
-     * section. The offset returned is the offset within the section. */
-    let text = obj.section_by_index(text_index)
-        .map_err(|e| format!("text section: {e}"))?;
-    for (off, rel) in text.relocations() {
-        let _ = rel.target(); /* target lookup unused in Phase 1; we
-                               * only need type+location to normalize */
-        let rtype = match rel.flags() {
-            object::RelocationFlags::Elf { r_type } => r_type,
-            _ => 0,
-        };
-        out.push((text_addr + off, rtype));
-    }
-    /* Some relocations live in dynamic sections (.rela.dyn / .rela.plt)
-     * for executables — those describe runtime fixups. Object's
-     * section.relocations() iterates link-time relocs; for stripped
-     * dynamic-linked binaries we'd also need dynamic relocs. Keep this
-     * Phase 1 simple — note any binary where reloc count seems too
-     * low. */
-    Ok(out)
 }
 
 fn print_analysis(a: &AnalysisResult) {
