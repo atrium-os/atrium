@@ -105,6 +105,34 @@ Spec: [`spec/atrium-rpc.md`](spec/atrium-rpc.md).
 
 **Estimate:** 2–3 weeks focused.
 
+## D1.7 — Function-level dedup of native binaries (Phase 2+)
+
+**Deliverable:** Tessera-stored binaries are dedup'd at function granularity, not just at file or chunk granularity. Installing N Atrium apps that share dependency code costs ~1.5–2× one app's storage, not Nx.
+
+Spec + Phase 1 results: [`spec/tessera-binsplit.md`](spec/tessera-binsplit.md).
+
+**Architecture (validated 2026-05-03):** no FreeBSD ABI change required, no Rust ABI dependency. Pure userspace tooling that walks ELF symbol tables, masks PC-relative offset fields in instructions (per-arch: aarch64 hand-rolled, x86_64 via iced-x86), hashes the normalized bytes, stores function blobs in Tessera CAS. Per-binary "recipe" describes how to reassemble at install or first-launch time.
+
+**Phase 1 done** (commits `b3a5693`, `a3329b7`, `715dc43`):
+- `tessera-binsplit --analyze | --compare | --multi`
+- aarch64 PC-rel masker + x86_64 PC-rel masker
+- Validated: 50–71% pairwise dedup on real Atrium aarch64 binaries; 1.89× aggregate compression across 9 apps; 1.97× on a controlled x86_64 pair.
+
+**Prerequisites for Phase 2+:** D2.5 Portcullis (we want a real install pipeline to integrate with rather than building this in isolation).
+
+**Scope (Phase 2+):**
+1. Phase 2: extractor + recipe builder (`tessera-binsplit --extract <bin> <out>` writes per-function blobs + a CBOR recipe).
+2. Phase 3: reconstitutor (`tessera-binsplit --reconstitute <recipe> <out>` produces a byte-identical or functionally-identical executable). Round-trip verification covers all binaries we ship.
+3. Phase 4: `tessera-import --binsplit` integration — recognise ELF binaries, route through extract → store. Recipes go where the binary used to live.
+4. Phase 5: exec-time materialisation — either a small shim loader that mmap-reconstitutes-fexecves, or an imgact hook in the FreeBSD kernel for transparency. Materialised binaries cached per-app.
+
+**Risks:**
+- Embedded data in `.text` (jump tables, switch tables) the masker may corrupt. Phase 2 needs DWARF or compiler hints to identify these spans.
+- Cross-toolchain dedup is near-zero — different rustc versions emit different code. Mitigated by per-package toolchain pinning.
+- Reconstitution must be byte-identical for security-sensitive cases (signature verification of the original binary). Either accept "functionally identical" or design the extractor to preserve everything that affects the original signature.
+
+**Estimate:** 3–5 weeks focused. Lower if we skip Phase 5 (rely on shim loader, postpone kernel imgact hook).
+
 ## D2 — Vestibulum (display manager + auth)
 
 **Deliverable:** boot FreeBSD → see a Fresco-rendered login screen → enter credentials via PAM → start a user session.
