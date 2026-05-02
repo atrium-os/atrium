@@ -30,6 +30,7 @@
 #include <sys/stat.h>
 #include <sys/lockmgr.h>
 #include <sys/namei.h>
+#include <sys/jail.h>
 #include <sys/proc.h>
 #include <sys/sysctl.h>
 #include <sys/priv.h>
@@ -2467,11 +2468,22 @@ tessera_vop_lookup(struct vop_lookup_args *ap)
 	/* v2 slice-3: magic dir hierarchy at /.tessera/snapshots/<gen>/.
 	 * Three layers of synthesized vnodes; the third (snapshot root)
 	 * descends into REGULAR vnodes tagged with snapshot_gen so reads
-	 * use the historical inode_tree. */
+	 * use the historical inode_tree.
+	 *
+	 * JAIL ISOLATION: hide the entire magic-dir tree from jailed
+	 * callers. Without this, any jail with `/` access could
+	 * `cd /.tessera/snapshots/<N>/` and read the WHOLE volume's
+	 * historical state — including subtrees belonging to other
+	 * jails or the host. Gating at the `.tessera` entry suffices:
+	 * the descent paths (`snapshots`, `<gen>`) require the parent
+	 * vnode (NODE_MAGIC_TESSERA) which can only be obtained via
+	 * this lookup. */
 	if (dn->kind == TESSERA_NODE_REGULAR && dn->snapshot_gen == 0 &&
 	    dn->inode_no == TESSERA_INODE_ROOT_DIR &&
 	    cnp->cn_namelen == 8 &&
 	    memcmp(cnp->cn_nameptr, ".tessera", 8) == 0) {
+		if (cnp->cn_cred != NULL && jailed(cnp->cn_cred))
+			return (ENOENT);
 		struct vnode *mvp;
 		int e = tessera_vget_synth(dvp->v_mount,
 		    TESSERA_MAGIC_INO_TESSERA,
