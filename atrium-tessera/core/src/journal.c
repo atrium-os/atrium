@@ -306,6 +306,17 @@ tessera_journal_checkpoint(tessera_journal_t *j)
 	return write_journal_header(j);
 }
 
+#ifdef _KERNEL
+void
+tessera_journal_peek_pos(const tessera_journal_t *j,
+    uint64_t *head_block, uint64_t *tail_block)
+{
+	if (j == NULL) return;
+	if (head_block) *head_block = j->head_block;
+	if (tail_block) *tail_block = j->tail_block;
+}
+#endif
+
 /* ── replay ──────────────────────────────────────────────────────── */
 
 struct buffered_rec {

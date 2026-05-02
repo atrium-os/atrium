@@ -71,6 +71,12 @@ int tessera_journal_tx_abort(tessera_journal_t *, uint64_t tx_id,
 
 void tessera_journal_close(tessera_journal_t *);
 
+/* Debug accessor: read the current in-memory head_block / tail_block.
+ * Either out pointer may be NULL. Used to compare against on-disk
+ * state when diagnosing crash-recovery divergence. */
+void tessera_journal_peek_pos(const tessera_journal_t *,
+    uint64_t *head_block, uint64_t *tail_block);
+
 #ifdef __cplusplus
 }
 #endif

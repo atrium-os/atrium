@@ -47,6 +47,7 @@
 #include <sys/taskqueue.h>
 #include <sys/unistd.h>
 #include <sys/limits.h>
+#include <sys/bio.h>
 #include <geom/geom.h>
 #include <geom/geom_vfs.h>
 #include <vm/vm.h>
@@ -355,6 +356,13 @@ struct tessera_kbio_ctx {
 	struct vnode         *devvp;
 	struct ucred         *cred;
 	struct tessera_mount *mount;
+	struct g_consumer    *cp;   /* used by tessera_kbio_write to bypass
+	                             * the buf cache for sectors that get
+	                             * rewritten frequently — the buf cache
+	                             * silently coalesces same-offset
+	                             * bwrites on a g_vfs-opened devvp
+	                             * (only the first reaches disk;
+	                             * confirmed on virtio-blk + 9p both). */
 };
 
 static int
@@ -379,7 +387,30 @@ tessera_kbio_write(void *ctx, uint64_t sector, const uint8_t *buf)
 	if (bp == NULL) return (-1);
 	bzero(bp->b_data, TESSERA_SECTOR_SIZE);
 	memcpy(bp->b_data, buf, TESSERA_SECTOR_SIZE);
-	return (bwrite(bp));
+	int rc = bwrite(bp);
+	if (rc != 0) return rc;
+
+	/* Issue an explicit BIO_FLUSH to force the underlying device
+	 * (and, when running under qemu on macOS, the host backing
+	 * file) to commit the data. macOS doesn't honor O_DIRECT, so
+	 * even cache=none silently buffers writes in qemu's RAM until
+	 * the guest sends a FLUSH command. Without this, sector writes
+	 * are lost across qemu system_reset / quit even though bwrite
+	 * returned success. virtio-blk must be configured with
+	 * `config-wce=on` so VIRTIO_BLK_F_FLUSH is negotiated; otherwise
+	 * the FLUSH is silently dropped by the host. */
+	if (k->cp != NULL) {
+		struct bio *flush = g_alloc_bio();
+		flush->bio_cmd = BIO_FLUSH;
+		flush->bio_done = NULL;
+		flush->bio_offset = 0;
+		flush->bio_length = 0;
+		flush->bio_data = NULL;
+		g_io_request(flush, k->cp);
+		(void)biowait(flush, "tflush");
+		g_destroy_bio(flush);
+	}
+	return 0;
 }
 
 /*
@@ -477,6 +508,17 @@ struct tessera_dirty_inode {
 	LIST_ENTRY(tessera_dirty_inode) link;
 	uint32_t                inode_no;
 	int                     tombstone;   /* 1 = drain calls btree_delete */
+	tessera_inode_record_t  rec;
+};
+
+/* v2.6 Phase B.2 — pending inode-body record awaiting journal
+ * commit. Cloned by inode_put / inode_delete onto the
+ * journal_pending_inodes list under flush_mtx; drained by the
+ * group-commit callout into INODE_WRITE journal records. */
+struct tessera_pending_inode {
+	LIST_ENTRY(tessera_pending_inode) link;
+	uint32_t                inode_no;
+	int                     tombstone;
 	tessera_inode_record_t  rec;
 };
 
@@ -640,6 +682,22 @@ static int tessera_fs_dirent_log_checkpoint_parent(
     struct tessera_mount *tmp_, uint32_t parent_inode_no);
 static int tessera_fs_dirent_log_checkpoint_all(
     struct tessera_mount *tmp_);
+
+/* v2.6 Phase B.2 — journal-resident dirent records. Forward decls
+ * so mountfs / tessera_fs_flush / tessera_replay_handler reach
+ * them before the implementation block. The on/off + interval
+ * sysctls also need declaration here because mountfs (also above
+ * the impl) reads them when arming the callout. */
+static int tessera_journal_log_enable_default;
+static int tessera_journal_log_interval_ms;
+static unsigned long tessera_stat_journal_log_replays = 0;
+static int tessera_fs_journal_log_drain(struct tessera_mount *tmp_);
+static void tessera_fs_journal_log_callout(void *ctx);
+static void tessera_fs_journal_log_task(void *ctx, int pending);
+static int tessera_replay_dirent_record(struct tessera_mount *tmp_,
+    const tessera_record_header_t *hdr, const uint8_t *body);
+static struct tessera_dirent_log_entry *tessera_dirent_log_entry_clone(
+    const struct tessera_dirent_log_entry *src);
 /* Promotion threshold: when a flat-DIRECTORY manifest body exceeds
  * this size, publish_directory splits entries into hash buckets and
  * emits DIRECTORY_2L instead. ~4 KiB matches the v2 design; small
@@ -789,6 +847,28 @@ struct tessera_mount {
 	    dirent_log[TESSERA_DIRENT_LOG_BUCKETS];
 	uint32_t                  dirent_log_count;
 	uint64_t                  dirent_log_seq;   /* monotonic */
+
+	/* v2.6 Phase B.2 — journal-resident dirent records.
+	 * Each log_append clones an entry onto journal_pending; a
+	 * group-commit callout (journal_log_co) drains the queue into
+	 * the journal as one tx every TESSERA_JOURNAL_LOG_INTERVAL_MS.
+	 * After a successful drain the entries are freed; the durable
+	 * journal records get superseded when commit_sb's
+	 * journal_checkpoint advances the log past them.
+	 *
+	 * On crash + remount, replay re-creates entries in the
+	 * in-memory log; the first post-mount flush applies them. */
+	LIST_HEAD(, tessera_dirent_log_entry) journal_pending;
+	uint32_t                  journal_pending_count;
+	/* Inode-body counterpart: enqueued by tessera_fs_inode_put /
+	 * tessera_fs_inode_delete and drained alongside the dirent
+	 * pending list. Without these records, replayed dirents
+	 * reference inode_nos whose body never made it to disk. */
+	LIST_HEAD(, tessera_pending_inode) journal_pending_inodes;
+	uint32_t                  journal_pending_inode_count;
+	struct callout            journal_log_co;
+	struct task               journal_log_task;
+	int                       journal_log_co_init;
 
 	/* v2 snapshots slice 2: read-only historical mount via
 	 * `tessera.gen=N`. When 1, mountfs overrode sb roots from a
@@ -1104,6 +1184,7 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	tmp_->bio_ctx.devvp = devvp;
 	tmp_->bio_ctx.cred  = curthread->td_ucred;
 	tmp_->bio_ctx.mount = tmp_;
+	tmp_->bio_ctx.cp    = cp;
 	/* Data-zone io: alloc/free route through the extent allocator. */
 	tmp_->bio.read_block  = tessera_kbio_read;
 	tmp_->bio.write_block = tessera_kbio_write;
@@ -1145,6 +1226,14 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 		LIST_INIT(&tmp_->pending_manifests[_b]);
 	for (uint32_t _b = 0; _b < TESSERA_DIRENT_LOG_BUCKETS; _b++)
 		LIST_INIT(&tmp_->dirent_log[_b]);
+	LIST_INIT(&tmp_->journal_pending);
+	tmp_->journal_pending_count = 0;
+	LIST_INIT(&tmp_->journal_pending_inodes);
+	tmp_->journal_pending_inode_count = 0;
+	callout_init(&tmp_->journal_log_co, 1);
+	TASK_INIT(&tmp_->journal_log_task, 0, tessera_fs_journal_log_task,
+	    tmp_);
+	tmp_->journal_log_co_init = 1;
 	tmp_->dirty_init = 1;
 
 	/* Open the journal and run replay BEFORE we open the trees, so a
@@ -1161,8 +1250,16 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	    tmp_->sb.journal_start, tmp_->sb.journal_length);
 	if (tmp_->journal != NULL) {
 		struct tessera_replay_ctx rctx = { .tmp_ = tmp_, .applied = 0 };
+		printf("tessera_fs: journal_open OK at sector %lu len %lu; "
+		    "starting replay\n",
+		    (unsigned long)tmp_->sb.journal_start,
+		    (unsigned long)tmp_->sb.journal_length);
 		(void)tessera_journal_replay(tmp_->journal,
 		    tessera_replay_handler, &rctx);
+		printf("tessera_fs: replay applied %d ROOT_UPDATE record(s); "
+		    "%lu DIR records re-applied\n",
+		    rctx.applied,
+		    tessera_stat_journal_log_replays);
 		if (rctx.applied > 0) {
 			/* Persist the rolled-forward SB so subsequent crashes
 			 * see the recovered state without needing replay. */
@@ -1445,6 +1542,20 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	 * via vfs_busyfs. */
 	tessera_singleton_mount = tmp_;
 
+	/* v2.6 Phase B.2: arm the journal-log group-commit callout once
+	 * mount is ready. Replay above may have populated the in-memory
+	 * log + journal_pending; the first callout drains them so even
+	 * if the user never fsyncs, those records become durable on the
+	 * journal again (idempotent). */
+	{
+		int t_ms = tessera_journal_log_interval_ms;
+		if (t_ms < 10) t_ms = 10;
+		if (tmp_->journal_log_co_init && tmp_->journal != NULL)
+			callout_reset(&tmp_->journal_log_co,
+			    (hz * t_ms) / 1000,
+			    tessera_fs_journal_log_callout, tmp_);
+	}
+
 	/* C2/C3 — seed multi_extent_pack_count from the registry, then
 	 * if it's above the severe threshold, run a bounded synchronous
 	 * repack pass before mount returns. Caps at 100 packs / 1 s by
@@ -1620,6 +1731,17 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 			tmp_->flush_unmounting = 1;
 			callout_drain(&tmp_->flush_co);
 			taskqueue_drain(taskqueue_thread, &tmp_->flush_task);
+			/* v2.6 B.2: stop the journal-log callout + drain its
+			 * task, then force a final synchronous drain so any
+			 * unjournaled ops become durable before we close
+			 * the journal. */
+			if (tmp_->journal_log_co_init) {
+				callout_drain(&tmp_->journal_log_co);
+				taskqueue_drain(taskqueue_thread,
+				    &tmp_->journal_log_task);
+				(void)tessera_fs_journal_log_drain(tmp_);
+				tmp_->journal_log_co_init = 0;
+			}
 			(void)tessera_fs_flush(tmp_);
 		}
 		if (tmp_->repack_task_init) {
@@ -1658,6 +1780,19 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 					LIST_REMOVE(_de, link);
 					free(_de, M_TESSERA);
 				}
+			}
+			/* Drain any still-queued journal-pending entries.
+			 * The synchronous drain above should have cleared
+			 * them, but flush_unmounting / closed-journal paths
+			 * leave them hanging — free here. */
+			{
+				struct tessera_dirent_log_entry *_jp;
+				while ((_jp = LIST_FIRST(
+				    &tmp_->journal_pending)) != NULL) {
+					LIST_REMOVE(_jp, link);
+					free(_jp, M_TESSERA);
+				}
+				tmp_->journal_pending_count = 0;
 			}
 			tmp_->dirty_init = 0;
 		}
@@ -3900,40 +4035,74 @@ tessera_fs_inode_put(struct tessera_mount *tmp_, uint32_t inode_no,
 		return (r);
 	}
 
+	/* B.2 — clone for the journal pending queue BEFORE we take
+	 * flush_mtx; malloc(M_WAITOK) is forbidden under it. */
+	struct tessera_pending_inode *jc = NULL;
+	if (tessera_journal_log_enable_default && tmp_->journal != NULL) {
+		jc = malloc(sizeof *jc, M_TESSERA, M_WAITOK | M_ZERO);
+		jc->inode_no  = inode_no;
+		jc->tombstone = 0;
+		memcpy(&jc->rec, rec, sizeof jc->rec);
+	}
+
+	/* Coalescing: enqueue the pre-built jc; if a pending entry
+	 * already exists for this inode_no, supersede its body
+	 * in-place and free jc. Caller holds flush_mtx. */
+	int dropped_jc = 0;
+
 	mtx_lock(&tmp_->flush_mtx);
 	uint32_t b = inode_no & (TESSERA_DIRTY_INODE_BUCKETS - 1u);
 	struct tessera_dirty_inode *e;
+	int found = 0;
 	LIST_FOREACH(e, &tmp_->dirty_inodes[b], link) {
 		if (e->inode_no == inode_no) {
 			memcpy(&e->rec, rec, sizeof e->rec);
 			e->tombstone = 0;
-			mtx_unlock(&tmp_->flush_mtx);
-			return (TESSERA_OK);
+			found = 1;
+			break;
 		}
 	}
-	mtx_unlock(&tmp_->flush_mtx);
-
-	/* malloc(M_WAITOK) outside the mutex — never sleep with mtx held. */
-	e = malloc(sizeof *e, M_TESSERA, M_WAITOK | M_ZERO);
-	e->inode_no = inode_no;
-	memcpy(&e->rec, rec, sizeof e->rec);
-
-	mtx_lock(&tmp_->flush_mtx);
-	/* Re-check: another thread might have raced and inserted while
-	 * we were allocating. Merge if so. */
-	struct tessera_dirty_inode *existing;
-	LIST_FOREACH(existing, &tmp_->dirty_inodes[b], link) {
-		if (existing->inode_no == inode_no) {
-			memcpy(&existing->rec, rec, sizeof existing->rec);
-			existing->tombstone = 0;
-			mtx_unlock(&tmp_->flush_mtx);
+	if (!found) {
+		mtx_unlock(&tmp_->flush_mtx);
+		/* malloc(M_WAITOK) outside the mutex. */
+		e = malloc(sizeof *e, M_TESSERA, M_WAITOK | M_ZERO);
+		e->inode_no = inode_no;
+		memcpy(&e->rec, rec, sizeof e->rec);
+		mtx_lock(&tmp_->flush_mtx);
+		struct tessera_dirty_inode *existing;
+		int raced = 0;
+		LIST_FOREACH(existing, &tmp_->dirty_inodes[b], link) {
+			if (existing->inode_no == inode_no) {
+				memcpy(&existing->rec, rec, sizeof existing->rec);
+				existing->tombstone = 0;
+				raced = 1; break;
+			}
+		}
+		if (raced) {
 			free(e, M_TESSERA);
-			return (TESSERA_OK);
+		} else {
+			LIST_INSERT_HEAD(&tmp_->dirty_inodes[b], e, link);
+			tmp_->dirty_count++;
 		}
 	}
-	LIST_INSERT_HEAD(&tmp_->dirty_inodes[b], e, link);
-	tmp_->dirty_count++;
+	if (jc != NULL) {
+		struct tessera_pending_inode *pi;
+		LIST_FOREACH(pi, &tmp_->journal_pending_inodes, link) {
+			if (pi->inode_no == jc->inode_no) {
+				pi->tombstone = jc->tombstone;
+				memcpy(&pi->rec, &jc->rec, sizeof pi->rec);
+				dropped_jc = 1;
+				break;
+			}
+		}
+		if (!dropped_jc) {
+			LIST_INSERT_HEAD(&tmp_->journal_pending_inodes, jc,
+			    link);
+			tmp_->journal_pending_inode_count++;
+		}
+	}
 	mtx_unlock(&tmp_->flush_mtx);
+	if (jc != NULL && dropped_jc) free(jc, M_TESSERA);
 	return (TESSERA_OK);
 }
 
@@ -3951,35 +4120,61 @@ tessera_fs_inode_delete(struct tessera_mount *tmp_, uint32_t inode_no)
 		return (r);
 	}
 
+	struct tessera_pending_inode *jc = NULL;
+	if (tessera_journal_log_enable_default && tmp_->journal != NULL) {
+		jc = malloc(sizeof *jc, M_TESSERA, M_WAITOK | M_ZERO);
+		jc->inode_no  = inode_no;
+		jc->tombstone = 1;
+	}
+
+	int dropped_jc = 0;
 	mtx_lock(&tmp_->flush_mtx);
 	uint32_t b = inode_no & (TESSERA_DIRTY_INODE_BUCKETS - 1u);
 	struct tessera_dirty_inode *e;
+	int found = 0;
 	LIST_FOREACH(e, &tmp_->dirty_inodes[b], link) {
 		if (e->inode_no == inode_no) {
 			e->tombstone = 1;
-			mtx_unlock(&tmp_->flush_mtx);
-			return (TESSERA_OK);
+			found = 1; break;
 		}
 	}
-	mtx_unlock(&tmp_->flush_mtx);
-
-	e = malloc(sizeof *e, M_TESSERA, M_WAITOK | M_ZERO);
-	e->inode_no  = inode_no;
-	e->tombstone = 1;
-
-	mtx_lock(&tmp_->flush_mtx);
-	struct tessera_dirty_inode *existing;
-	LIST_FOREACH(existing, &tmp_->dirty_inodes[b], link) {
-		if (existing->inode_no == inode_no) {
-			existing->tombstone = 1;
-			mtx_unlock(&tmp_->flush_mtx);
+	if (!found) {
+		mtx_unlock(&tmp_->flush_mtx);
+		e = malloc(sizeof *e, M_TESSERA, M_WAITOK | M_ZERO);
+		e->inode_no  = inode_no;
+		e->tombstone = 1;
+		mtx_lock(&tmp_->flush_mtx);
+		struct tessera_dirty_inode *existing;
+		int raced = 0;
+		LIST_FOREACH(existing, &tmp_->dirty_inodes[b], link) {
+			if (existing->inode_no == inode_no) {
+				existing->tombstone = 1;
+				raced = 1; break;
+			}
+		}
+		if (raced) {
 			free(e, M_TESSERA);
-			return (TESSERA_OK);
+		} else {
+			LIST_INSERT_HEAD(&tmp_->dirty_inodes[b], e, link);
+			tmp_->dirty_count++;
 		}
 	}
-	LIST_INSERT_HEAD(&tmp_->dirty_inodes[b], e, link);
-	tmp_->dirty_count++;
+	if (jc != NULL) {
+		struct tessera_pending_inode *pi;
+		LIST_FOREACH(pi, &tmp_->journal_pending_inodes, link) {
+			if (pi->inode_no == jc->inode_no) {
+				pi->tombstone = 1;
+				dropped_jc = 1; break;
+			}
+		}
+		if (!dropped_jc) {
+			LIST_INSERT_HEAD(&tmp_->journal_pending_inodes, jc,
+			    link);
+			tmp_->journal_pending_inode_count++;
+		}
+	}
 	mtx_unlock(&tmp_->flush_mtx);
+	if (jc != NULL && dropped_jc) free(jc, M_TESSERA);
 	return (TESSERA_OK);
 }
 
@@ -4282,6 +4477,21 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 	}
 	mtx_unlock(&tmp_->flush_mtx);
 
+	/* v2.6 B.2: force a synchronous group commit of the
+	 * journal-pending list before checkpoint. Two reasons: (a) any
+	 * still-pending records become durable as part of THIS flush,
+	 * tightening the post-fsync durability window; (b) records
+	 * that made it to the journal but whose checkpoint applied
+	 * them to BTREE are about to be subsumed by commit_sb's
+	 * journal_checkpoint, so writing them again now is harmless.
+	 *
+	 * After this call, the journal-pending list is empty. After
+	 * commit_sb's journal_checkpoint at the end of this flush,
+	 * the just-written DIR_INSERT/REMOVE records are also gone
+	 * from the journal — they're already reflected in the new
+	 * SB roots. */
+	(void)tessera_fs_journal_log_drain(tmp_);
+
 	/* v2.6: checkpoint the dirent log BEFORE the manifest /
 	 * inode-tree drains. Each dirty parent gets a single bulk
 	 * BTREE rebuild that incorporates the entire batch of pending
@@ -4458,6 +4668,12 @@ tessera_replay_handler(void *ctx, const tessera_record_header_t *hdr,
                        const uint8_t *body)
 {
 	struct tessera_replay_ctx *rc = ctx;
+	/* v2.6 B.2: dirent log records re-create the in-memory log
+	 * for replay. They live alongside ROOT_UPDATE records in the
+	 * journal; the dirent record handler returns 1 on hit so the
+	 * SB-commit path below is skipped. */
+	if (tessera_replay_dirent_record(rc->tmp_, hdr, body))
+		return (0);
 	if (hdr->record_type != (uint32_t)TESSERA_ROOT_UPDATE) return (0);
 	if (hdr->body_length < sizeof(struct tessera_jrec_sb_commit))
 		return (0);
@@ -4670,16 +4886,15 @@ tessera_fs_gc_data_zone(struct tessera_mount *tmp_)
 	live_count++;                                                     \
 } while (0)
 
-	/* Helper: walk one opened inode_tree, append all manifest hashes
-	 * AND every transitively reachable child manifest / blob hash.
-	 * Without the recursion, multi-level structures (DIRECTORY_BTREE
-	 * inner→leaf, DIRECTORY_2L outer→buckets, CHUNK_TREE outer→inner)
-	 * would have only their ROOT manifest in the live set; pass-2
-	 * would then reclaim every interior single-blob pack and the
-	 * parent would dangle. Reproduces with 33+ entries in one dir
-	 * (TESSERA_DIR_BTREE_FANOUT_LEAF=32 → split → 1 inner + 2 leaves
-	 * → leaves GC'd → "ls" returns 0 / Input/output error). Stack-
-	 * bounded at depth 64 so a corrupt cycle can't loop forever. */
+	/* Recursively walk a manifest tree starting from `root`,
+	 * pushing every transitively reachable manifest/blob hash
+	 * onto the live set. Without this, a multi-level directory's
+	 * leaf manifests, a DIRECTORY_2L outer's bucket manifests, or
+	 * a CHUNK_TREE file's inner-tier manifests would be reclaimed
+	 * as orphans on the next GC pass — the inode.manifest_hash
+	 * keeps only the ROOT alive. depth caps recursion so a corrupt
+	 * cycle can't loop forever. Inline lambda via nested macro for
+	 * conciseness — pure C function follows. */
 #define _GC_WALK_INODE_TREE(_tree) do {                                   \
 	if ((_tree) == NULL) break;                                       \
 	tessera_btree_cursor_t *_c = tessera_btree_seek_first(_tree);     \
@@ -8762,11 +8977,29 @@ tessera_fs_dirent_log_append(struct tessera_mount *tmp_,
 	e->name_len        = namelen;
 	memcpy(e->name, name, namelen);
 
+	/* Pre-allocate the journal-pending clone OUTSIDE the lock —
+	 * tessera_dirent_log_entry_clone uses M_WAITOK, which is
+	 * disallowed while holding flush_mtx (a sleep mutex; under
+	 * INVARIANTS the kernel panics with "malloc(M_WAITOK) with
+	 * sleeping prohibited"). */
+	struct tessera_dirent_log_entry *jc = NULL;
+	if (tessera_journal_log_enable_default && tmp_->journal != NULL)
+		jc = tessera_dirent_log_entry_clone(e);
+
 	mtx_lock(&tmp_->flush_mtx);
 	e->seq = tmp_->dirent_log_seq++;
 	uint32_t b = parent_inode_no & (TESSERA_DIRENT_LOG_BUCKETS - 1u);
 	LIST_INSERT_HEAD(&tmp_->dirent_log[b], e, link);
 	tmp_->dirent_log_count++;
+	/* v2.6 Phase B.2: enqueue the pre-built clone onto the
+	 * journal-pending list. The group-commit callout drains it
+	 * into a single tx every journal_log_interval_ms; on crash +
+	 * remount the journaled records re-create the in-memory log. */
+	if (jc != NULL) {
+		jc->seq = e->seq;
+		LIST_INSERT_HEAD(&tmp_->journal_pending, jc, link);
+		tmp_->journal_pending_count++;
+	}
 	mtx_unlock(&tmp_->flush_mtx);
 
 	/* Bump the parent's mtime/ctime in the dirty inodes cache so
@@ -9204,6 +9437,265 @@ tessera_fs_dirent_log_checkpoint_all(struct tessera_mount *tmp_)
 	}
 	free(parents, M_TESSERA);
 	return (rc);
+}
+
+/* ── v2.6 Phase B.2: journal-resident dirent records ───────────── */
+
+static int tessera_journal_log_enable_default = 1;
+SYSCTL_INT(_kern_tessera, OID_AUTO, journal_log_enable,
+    CTLFLAG_RW, &tessera_journal_log_enable_default, 0,
+    "1 = journal each dirent log entry (group-committed) for crash recovery without explicit fsync");
+
+static int tessera_journal_log_interval_ms = 50;
+SYSCTL_INT(_kern_tessera, OID_AUTO, journal_log_interval_ms,
+    CTLFLAG_RW, &tessera_journal_log_interval_ms, 0,
+    "Group-commit interval for the dirent journal log (ms)");
+
+static unsigned long tessera_stat_journal_log_records = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, journal_log_records,
+    CTLFLAG_RD, &tessera_stat_journal_log_records, 0,
+    "Cumulative dirent log records appended to the journal");
+
+/* Definition of the replay counter (forward-declared above so the
+ * mountfs replay diagnostic can read it). */
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, journal_log_replays,
+    CTLFLAG_RD, &tessera_stat_journal_log_replays, 0,
+    "Cumulative dirent log records re-applied during mount-time replay");
+
+/* B.2 debug — live in-memory journal head/tail of the *most-recently-
+ * touched* mount. Updated on every callout drain. Lets a userspace
+ * test print these *just before* simulating a crash, then compare
+ * against the on-disk header to find divergence. */
+static unsigned long tessera_stat_journal_head = 0;
+static unsigned long tessera_stat_journal_tail = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, journal_head,
+    CTLFLAG_RD, &tessera_stat_journal_head, 0,
+    "Last-observed in-memory journal head_block (debug)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, journal_tail,
+    CTLFLAG_RD, &tessera_stat_journal_tail, 0,
+    "Last-observed in-memory journal tail_block (debug)");
+
+/* Allocate + clone an entry for the journal-pending queue. Same
+ * shape as the in-memory log entry; we duplicate so the per-parent
+ * read-side log and the journal-pending list have independent
+ * lifetimes (checkpoint frees the read-side; group commit frees
+ * the journal-pending). */
+static struct tessera_dirent_log_entry *
+tessera_dirent_log_entry_clone(
+    const struct tessera_dirent_log_entry *src)
+{
+	size_t sz = sizeof(*src) + src->name_len;
+	struct tessera_dirent_log_entry *e = malloc(sz, M_TESSERA, M_WAITOK);
+	memcpy(e, src, sizeof(*src));
+	memcpy(e->name, src->name, src->name_len);
+	return (e);
+}
+
+/* Group-commit drain. Snapshot pending records under flush_mtx,
+ * release the lock, then do the journal IO without holding it
+ * (write_record can sleep / kbio_write). On success: free the
+ * snapshot. On failure (journal full, etc.): re-queue at head so
+ * the next callout retries. */
+static int
+tessera_fs_journal_log_drain(struct tessera_mount *tmp_)
+{
+	if (!tmp_->dirty_init || tmp_->journal == NULL ||
+	    tmp_->flush_unmounting)
+		return (0);
+
+	/* Snapshot: move pending into a local list head under flush_mtx,
+	 * then release before doing the (potentially slow) journal IO. */
+	LIST_HEAD(, tessera_dirent_log_entry) snap;
+	LIST_INIT(&snap);
+	LIST_HEAD(, tessera_pending_inode) isnap;
+	LIST_INIT(&isnap);
+	uint32_t count = 0;
+	uint32_t icount = 0;
+	mtx_lock(&tmp_->flush_mtx);
+	while (!LIST_EMPTY(&tmp_->journal_pending)) {
+		struct tessera_dirent_log_entry *e =
+		    LIST_FIRST(&tmp_->journal_pending);
+		LIST_REMOVE(e, link);
+		LIST_INSERT_HEAD(&snap, e, link);
+		count++;
+	}
+	tmp_->journal_pending_count = 0;
+	while (!LIST_EMPTY(&tmp_->journal_pending_inodes)) {
+		struct tessera_pending_inode *p =
+		    LIST_FIRST(&tmp_->journal_pending_inodes);
+		LIST_REMOVE(p, link);
+		LIST_INSERT_HEAD(&isnap, p, link);
+		icount++;
+	}
+	tmp_->journal_pending_inode_count = 0;
+	mtx_unlock(&tmp_->flush_mtx);
+
+	if (count == 0 && icount == 0) return (0);
+
+	/* Open a tx, append every record, commit. INODE_WRITE records
+	 * go in first so a replay applying them in walk order populates
+	 * dirty_inodes before the dirent records that reference them. */
+	uint64_t tx;
+	if (tessera_journal_tx_begin(tmp_->journal, &tx,
+	    "log_drain") != TESSERA_OK) {
+		/* Re-queue. */
+		mtx_lock(&tmp_->flush_mtx);
+		while (!LIST_EMPTY(&snap)) {
+			struct tessera_dirent_log_entry *e =
+			    LIST_FIRST(&snap);
+			LIST_REMOVE(e, link);
+			LIST_INSERT_HEAD(&tmp_->journal_pending, e, link);
+			tmp_->journal_pending_count++;
+		}
+		while (!LIST_EMPTY(&isnap)) {
+			struct tessera_pending_inode *p =
+			    LIST_FIRST(&isnap);
+			LIST_REMOVE(p, link);
+			LIST_INSERT_HEAD(&tmp_->journal_pending_inodes, p, link);
+			tmp_->journal_pending_inode_count++;
+		}
+		mtx_unlock(&tmp_->flush_mtx);
+		return (EIO);
+	}
+
+	int rc = 0;
+
+	/* Inodes first. */
+	while (!LIST_EMPTY(&isnap)) {
+		struct tessera_pending_inode *p = LIST_FIRST(&isnap);
+		LIST_REMOVE(p, link);
+
+		uint8_t body[sizeof(tessera_jrec_inode_t) +
+		    sizeof(tessera_inode_record_t)];
+		tessera_jrec_inode_t *ih = (tessera_jrec_inode_t *)body;
+		ih->inode_no  = p->inode_no;
+		ih->tombstone = (uint8_t)(p->tombstone ? 1 : 0);
+		ih->reserved[0] = ih->reserved[1] = ih->reserved[2] = 0;
+		memcpy(body + sizeof *ih, &p->rec, sizeof p->rec);
+
+		int ar = tessera_journal_append(tmp_->journal, tx,
+		    TESSERA_INODE_WRITE, body, (uint32_t)sizeof body);
+		free(p, M_TESSERA);
+		if (ar != TESSERA_OK && rc == 0) rc = EIO;
+		tessera_stat_journal_log_records++;
+	}
+
+	/* Then dirents. */
+	while (!LIST_EMPTY(&snap)) {
+		struct tessera_dirent_log_entry *e = LIST_FIRST(&snap);
+		LIST_REMOVE(e, link);
+
+		size_t blen = sizeof(tessera_jrec_dirent_t) + e->name_len;
+		uint8_t *body = malloc(blen, M_TESSERA, M_WAITOK);
+		tessera_jrec_dirent_t *hdr = (tessera_jrec_dirent_t *)body;
+		hdr->parent_inode_no = e->parent_inode_no;
+		hdr->inode_no        = e->inode_no;
+		hdr->name_len        = e->name_len;
+		hdr->reserved[0] = hdr->reserved[1] = 0;
+		memcpy(body + sizeof *hdr, e->name, e->name_len);
+
+		tessera_record_type_t rt = (e->op == 0) ?
+		    TESSERA_DIR_INSERT : TESSERA_DIR_REMOVE;
+		int ar = tessera_journal_append(tmp_->journal, tx, rt,
+		    body, (uint32_t)blen);
+		free(body, M_TESSERA);
+		free(e, M_TESSERA);
+		if (ar != TESSERA_OK && rc == 0) rc = EIO;
+		tessera_stat_journal_log_records++;
+	}
+
+	if (tessera_journal_tx_commit(tmp_->journal, tx) != TESSERA_OK
+	    && rc == 0)
+		rc = EIO;
+
+	/* Publish the in-memory journal head/tail so userspace tests
+	 * can compare against on-disk state. */
+	{
+		uint64_t h = 0, t = 0;
+		tessera_journal_peek_pos(
+		    (const struct tessera_journal *)tmp_->journal, &h, &t);
+		tessera_stat_journal_head = (unsigned long)h;
+		tessera_stat_journal_tail = (unsigned long)t;
+	}
+	return (rc);
+}
+
+/* Taskqueue handler — runs the actual drain in a sleep-able
+ * context. Called via taskqueue_enqueue from the callout below. */
+static void
+tessera_fs_journal_log_task(void *ctx, int pending)
+{
+	(void)pending;
+	struct tessera_mount *tmp_ = ctx;
+	if (tmp_ == NULL || tmp_->flush_unmounting) return;
+	(void)tessera_fs_journal_log_drain(tmp_);
+}
+
+/* Callout handler — fires every journal_log_interval_ms. Callout
+ * runs in interrupt context where sleeping is prohibited, so we
+ * just enqueue the actual drain on the kernel taskqueue and re-arm
+ * ourselves. The drain does malloc(M_WAITOK) + journal IO which
+ * both sleep. */
+static void
+tessera_fs_journal_log_callout(void *ctx)
+{
+	struct tessera_mount *tmp_ = ctx;
+	if (tmp_ == NULL || tmp_->flush_unmounting) return;
+	(void)taskqueue_enqueue(taskqueue_thread, &tmp_->journal_log_task);
+	int t_ms = tessera_journal_log_interval_ms;
+	if (t_ms < 10) t_ms = 10;
+	if (tmp_->journal_log_co_init && !tmp_->flush_unmounting)
+		callout_reset(&tmp_->journal_log_co,
+		    (hz * t_ms) / 1000,
+		    tessera_fs_journal_log_callout, tmp_);
+}
+
+/* Replay handler shim — extends the existing replay handler to
+ * recognise DIR_INSERT / DIR_REMOVE records and rebuild the
+ * in-memory log. Called from tessera_replay_handler. Returns 1 if
+ * the record was a dirent op, 0 if not (caller continues with
+ * other record types). */
+static int
+tessera_replay_dirent_record(struct tessera_mount *tmp_,
+                             const tessera_record_header_t *hdr,
+                             const uint8_t *body)
+{
+	/* INODE_WRITE — restore dirty_inodes (or tombstone). The
+	 * subsequent first-flush drains it to the inode_tree as part
+	 * of the same recovery pass that processes DIR records. */
+	if (hdr->record_type == (uint32_t)TESSERA_INODE_WRITE) {
+		if (hdr->body_length < sizeof(tessera_jrec_inode_t) +
+		    sizeof(tessera_inode_record_t))
+			return (1);
+		tessera_jrec_inode_t ih;
+		memcpy(&ih, body, sizeof ih);
+		if (ih.tombstone) {
+			(void)tessera_fs_inode_delete(tmp_, ih.inode_no);
+		} else {
+			tessera_inode_record_t rec;
+			memcpy(&rec, body + sizeof ih, sizeof rec);
+			(void)tessera_fs_inode_put(tmp_, ih.inode_no, &rec);
+		}
+		tessera_stat_journal_log_replays++;
+		return (1);
+	}
+	if (hdr->record_type != (uint32_t)TESSERA_DIR_INSERT &&
+	    hdr->record_type != (uint32_t)TESSERA_DIR_REMOVE)
+		return (0);
+	if (hdr->body_length < sizeof(tessera_jrec_dirent_t))
+		return (1);
+	tessera_jrec_dirent_t r;
+	memcpy(&r, body, sizeof r);
+	if (r.name_len == 0 || r.name_len > TESSERA_PATH_NAME_MAX)
+		return (1);
+	if (sizeof(tessera_jrec_dirent_t) + r.name_len > hdr->body_length)
+		return (1);
+	const char *name = (const char *)(body + sizeof r);
+	int op = (hdr->record_type == TESSERA_DIR_INSERT) ? 0 : 1;
+	(void)tessera_fs_dirent_log_append(tmp_, r.parent_inode_no, op,
+	    name, r.name_len, r.inode_no);
+	tessera_stat_journal_log_replays++;
+	return (1);
 }
 
 static int

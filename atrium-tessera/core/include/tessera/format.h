@@ -224,6 +224,31 @@ typedef enum {
 	TESSERA_GC_TOMBSTONE      = 14,
 } tessera_record_type_t;
 
+/* DIR_INSERT / DIR_REMOVE body — variable-length, name bytes follow.
+ * Used by the v2.6 dirent log to persist pending dirent ops to the
+ * journal between commit_sb flushes. On replay, records re-create
+ * the in-memory log so the first post-mount flush re-applies them
+ * to the BTREE. */
+typedef struct TESSERA_PACKED {
+	uint32_t  parent_inode_no;
+	uint32_t  inode_no;
+	uint16_t  name_len;
+	uint8_t   reserved[2];
+	/* name_len bytes of name follow inline */
+} tessera_jrec_dirent_t;
+
+/* INODE_WRITE body — fixed 8-byte header + 144-byte inode_record.
+ * Phase B.2 part 2: journals the inode body itself so a crash
+ * before commit_sb leaves a complete (dirent + inode) replay set.
+ * Without this, replayed dirents would reference inode_nos whose
+ * body lives only in dirty_inodes and is lost on power-cut. */
+typedef struct TESSERA_PACKED {
+	uint32_t  inode_no;
+	uint8_t   tombstone;       /* 1 = delete, 0 = put */
+	uint8_t   reserved[3];
+	/* tessera_inode_record_t body follows (144 bytes). Total = 152. */
+} tessera_jrec_inode_t;
+
 /* ── Pack header (4096 bytes) ────────────────────────────────────── */
 
 typedef struct TESSERA_PACKED {
