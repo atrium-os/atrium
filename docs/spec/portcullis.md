@@ -550,6 +550,26 @@ launches skip the setup phase entirely.
 
 ## 4. Jail filesystem layout
 
+### 4.0 Apps directory
+
+Installed apps live at `/var/lib/atrium/apps/<app.id>/`. This is
+the convention `tessera-import` writes to and `portcullis launch
+<app-id>` resolves against.
+
+```
+$ tessera-import some-source-tree /var/lib/atrium/apps/org.atrium.edit
+$ portcullis launch org.atrium.edit
+```
+
+The directory tree itself lives on the shared Tessera volume
+(see §4.1 below), so cross-app file dedup is automatic.
+
+`portcullis launch <arg>` heuristic: if `<arg>` contains `/`,
+starts with `.`, or doesn't match `^[a-z][a-z0-9.-]*$`, it's
+treated as a filesystem path; otherwise it's resolved against
+`/var/lib/atrium/apps/`. This lets development workflows pass a
+local tree path while production launches use ids.
+
 ### 4.1 Single shared Tessera volume
 
 **All Atrium jails are subtrees of one underlying Tessera volume,

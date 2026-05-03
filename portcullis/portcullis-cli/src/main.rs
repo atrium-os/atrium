@@ -19,10 +19,18 @@ usage:
     portcullis validate <atrium.toml>
         Parses and validates a manifest. Exits 0 on success.
 
-    portcullis launch [--dry-run | --no-prompt] <app-tree>
-        Reads <app-tree>/atrium.toml, builds a jail.conf section,
-        and either prints it (--dry-run) or runs `jail -c` (--no-prompt).
-        Phase 2 dev mode — no policy/prompt mediation yet.
+    portcullis launch [--dry-run | --no-prompt] <app-id|app-tree>
+        Reads <tree>/atrium.toml, builds a jail.conf section, and
+        either prints it (--dry-run) or runs `jail -c` (--no-prompt).
+
+        <app-id|app-tree> is resolved heuristically:
+            - If it contains '/' or starts with '.', it's a path.
+            - If it looks like an app id (lowercase + dots/hyphens),
+              resolved to /var/lib/atrium/apps/<id>/.
+            - Otherwise treated as a path.
+
+        Phase 2/3a dev mode — no policy/prompt mediation, no
+        per-instance overlay yet (single instance per app).
 ");
     std::process::exit(2);
 }
@@ -101,8 +109,46 @@ fn cmd_validate(path: &str) -> ExitCode {
     }
 }
 
-fn cmd_launch(tree_path: &str, dry_run: bool) -> ExitCode {
-    let tree = PathBuf::from(tree_path);
+/// Default location where `tessera-import` lands installed apps.
+/// `portcullis launch <app-id>` resolves the id by joining this prefix.
+const APPS_DIR: &str = "/var/lib/atrium/apps";
+
+/// Decide whether `arg` is an app-id (resolve via APPS_DIR) or a
+/// filesystem path (use directly). Heuristic:
+///   - contains '/' → path
+///   - starts with '.' → path
+///   - matches `^[a-z][a-z0-9.-]*$` → app-id
+///   - anything else → path (let fs::read_to_string emit the error)
+fn looks_like_app_id(arg: &str) -> bool {
+    if arg.contains('/') || arg.starts_with('.') {
+        return false;
+    }
+    let mut chars = arg.chars();
+    let Some(first) = chars.next() else { return false };
+    if !first.is_ascii_lowercase() { return false; }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-')
+}
+
+fn resolve_app_tree(arg: &str) -> PathBuf {
+    if looks_like_app_id(arg) {
+        PathBuf::from(APPS_DIR).join(arg)
+    } else {
+        PathBuf::from(arg)
+    }
+}
+
+fn cmd_launch(tree_arg: &str, dry_run: bool) -> ExitCode {
+    let tree = resolve_app_tree(tree_arg);
+    if !tree.exists() {
+        if looks_like_app_id(tree_arg) {
+            eprintln!("portcullis launch: app id {tree_arg:?} not found at {}",
+                tree.display());
+            eprintln!("    install with: tessera-import <src> {}", tree.display());
+        } else {
+            eprintln!("portcullis launch: {} does not exist", tree.display());
+        }
+        return ExitCode::from(1);
+    }
     let manifest_path = tree.join("atrium.toml");
     let text = match fs::read_to_string(&manifest_path) {
         Ok(s) => s,

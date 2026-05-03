@@ -65,6 +65,17 @@ pub fn build(manifest: &Manifest, opts: &BuildOpts) -> Result<JailConfig, BuildE
     jc.set("mount.devfs",   Value::Bool(true));
     jc.set("devfs_ruleset", Value::Number(opts.devfs_ruleset as i64));
     jc.set("exec.clean",    Value::Bool(true));
+    /* Atrium apps run as the calling user (host-managed identity),
+     * not as a user with a passwd entry inside the jail. Tell jail(8)
+     * to look up exec.jail_user from the host's /etc/passwd, not the
+     * jail's. Without this, jails with no /etc/passwd in their tree
+     * fail at jail-create time with "getpwnam: No such file or
+     * directory".
+     *
+     * Polarity per jail.conf(5): exec.system_jail_user = true
+     * looks in the SYSTEM passwd (host); false looks in the JAIL's
+     * passwd (default for back-compat). We want the host lookup. */
+    jc.set("exec.system_jail_user", Value::Bool(true));
     /* exec.start runs the app's entry. Inside the jail, rootfs is
      * mounted at /, so the manifest's relative entry path becomes
      * /<entry> in the jail's namespace.
