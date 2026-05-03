@@ -21,7 +21,18 @@ usage:
 
     portcullis launch [--dry-run | --no-prompt] <app-id|app-tree>
         Reads <tree>/atrium.toml, builds a jail.conf section, and
-        either prints it (--dry-run) or runs `jail -c` (--no-prompt).
+        launches the jail.
+
+        Default mode: consults the per-user policy file. Refuses if
+        the manifest asks for capabilities the user hasn't granted
+        (run `portcullis policy diff <id>` to see what's missing,
+        then `portcullis policy grant <id>` to approve).
+
+        --dry-run    Render jail.conf + devfs.rules and exit; no
+                     mounts, no jail, no policy check.
+        --no-prompt  Bypass the policy check (dev mode). All
+                     manifest-declared capabilities are granted
+                     for this launch only — nothing persisted.
 
         <app-id|app-tree> is resolved heuristically:
             - If it contains '/' or starts with '.', it's a path.
@@ -83,11 +94,7 @@ fn main() -> ExitCode {
                 }
             }
             let Some(t) = tree else { usage() };
-            if !dry_run && !no_prompt {
-                eprintln!("must pass --dry-run or --no-prompt (Phase 2 has no prompt mediation yet)");
-                return ExitCode::from(2);
-            }
-            cmd_launch(t, dry_run)
+            cmd_launch(t, dry_run, no_prompt)
         }
         "status" => {
             if args.len() != 2 { usage(); }
@@ -190,7 +197,7 @@ fn resolve_app_tree(arg: &str) -> PathBuf {
     }
 }
 
-fn cmd_launch(tree_arg: &str, dry_run: bool) -> ExitCode {
+fn cmd_launch(tree_arg: &str, dry_run: bool, no_prompt: bool) -> ExitCode {
     let tree = resolve_app_tree(tree_arg);
     if !tree.exists() {
         if looks_like_app_id(tree_arg) {
@@ -252,7 +259,40 @@ fn cmd_launch(tree_arg: &str, dry_run: bool) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    /* --no-prompt: set up overlay mounts, run jail, tear down. */
+    /* Default mode: consult the per-user policy file. --no-prompt
+     * is the dev-mode bypass (Phase 5 will replace the "refuse and
+     * suggest grant" behaviour with an actual interactive prompt). */
+    if !no_prompt {
+        let policy_path = portcullis_policy::Policy::user_path(&current_user());
+        let policy = match portcullis_policy::Policy::load(&policy_path) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("portcullis launch: {}: {e}", policy_path.display());
+                return ExitCode::from(1);
+            }
+        };
+        let current_hash = portcullis_policy::hash_manifest(text.as_bytes());
+        let prior        = policy.grants.get(&manifest.app.id);
+        let delta = portcullis_policy::compute_delta(
+            &manifest.capabilities,
+            prior.map(|g| &g.capabilities),
+            prior.map(|g| g.manifest_hash.as_str()),
+            &current_hash,
+        );
+        if !delta.is_empty() {
+            eprintln!("portcullis launch: {} needs capabilities not yet granted:",
+                manifest.app.id);
+            for line in delta.describe() {
+                eprintln!("    - {line}");
+            }
+            eprintln!();
+            eprintln!("    grant with: portcullis policy grant {}", manifest.app.id);
+            eprintln!("    or bypass:  portcullis launch --no-prompt {tree_arg}");
+            return ExitCode::from(1);
+        }
+    }
+
+    /* Approved (or bypassed): set up overlay mounts, run jail, tear down. */
     let app_id = manifest.app.id.clone();
     let overlay_dir = PathBuf::from(OVERLAYS_DIR).join(&app_id);
     let jail_path   = PathBuf::from(JAILS_DIR).join(&app_id);

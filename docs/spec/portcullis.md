@@ -966,6 +966,24 @@ Order matches risk (smallest blast radius first):
 - Implements the lifecycle in §6 end-to-end.
 - ~1 week.
 
+  *Step 1 (landed):* `portcullis-policy` crate — Policy/Grant
+  data model, atomic load/save, manifest-hash tamper detection,
+  capability-delta computation. CLI subcommands `policy show`,
+  `policy diff`, `policy grant`, `policy revoke` for managing
+  the policy file by hand.
+
+  *Step 2 (landed):* Default `portcullis launch` mode now
+  consults the per-user policy file. Refuses if the manifest
+  asks for capabilities the user hasn't granted, with a
+  diff-style message and a hint to `policy grant`. `--no-prompt`
+  becomes the explicit dev-mode bypass; `--dry-run` skips the
+  check (no execution → no policy needed).
+
+  *Step 3 (pending):* `portcullisd` daemon + IPC crate. Moves
+  the policy oracle out of the CLI and into a long-running
+  process so Forum / the prompt UI / multiple concurrent
+  launches all share one source of truth.
+
 **Phase 4.5 — first-run setup phase.**
 - Per-app overlay sentinel (`.atrium-firstrun-done`) detection.
 - jail.conf `exec.created` invocation when sentinel absent
