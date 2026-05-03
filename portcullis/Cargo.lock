@@ -116,6 +116,7 @@ dependencies = [
 name = "portcullis-ipc"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "portcullis-policy",
  "portcullis-toml",
  "serde",

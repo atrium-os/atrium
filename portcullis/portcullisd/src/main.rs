@@ -170,9 +170,113 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<DaemonState>>) -> std::io::Result
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e),
         };
+        /* Launch is the one op that needs out-of-band fd handoff;
+         * handle it inline so we can interleave the ReadyForFds
+         * round-trip with recv_fds. Everything else goes through
+         * the pure handle() function. */
+        if let Request::Launch { app_id, bypass_policy } = req {
+            handle_launch(app_id, bypass_policy, &shared, &mut writer, &reader)?;
+            continue;
+        }
         let resp = handle(req, &shared);
         write_response(&mut writer, &resp)?;
     }
+}
+
+/// Launch handler with SCM_RIGHTS fd handoff. Sequence:
+///   1. policy check (returns LaunchFailed{stage:"policy"} if not approved)
+///   2. send Response::ReadyForFds (this also drains the client's
+///      send buffer and gives BufReader nothing to swallow)
+///   3. recv_fds expects 3 OwnedFds (stdin/stdout/stderr)
+///   4. run launch_with_stdio
+///   5. send LaunchExit / LaunchFailed
+fn handle_launch(
+    app_id: String,
+    bypass_policy: bool,
+    shared: &Mutex<DaemonState>,
+    writer: &mut UnixStream,
+    reader: &BufReader<UnixStream>,
+) -> std::io::Result<()> {
+    /* 1. policy gate (mirrors the in-process CLI path). */
+    if !bypass_policy {
+        let tree = std::path::PathBuf::from("/var/lib/atrium/apps").join(&app_id);
+        let manifest_path = tree.join("atrium.toml");
+        let text = match std::fs::read_to_string(&manifest_path) {
+            Ok(t) => t,
+            Err(e) => {
+                return write_response(writer, &Response::LaunchFailed {
+                    stage: "manifest".into(),
+                    message: format!("{}: {e}", manifest_path.display()),
+                });
+            }
+        };
+        let manifest = match portcullis_toml::Manifest::from_str(&text) {
+            Ok(m) => m,
+            Err(e) => {
+                return write_response(writer, &Response::LaunchFailed {
+                    stage: "manifest".into(),
+                    message: format!("parse error: {e}"),
+                });
+            }
+        };
+        let current_hash = hash_manifest(text.as_bytes());
+        let s = shared.lock().unwrap();
+        let prior = s.policy.grants.get(&app_id);
+        let delta = compute_delta(
+            &manifest.capabilities,
+            prior.map(|g| &g.capabilities),
+            prior.map(|g| g.manifest_hash.as_str()),
+            &current_hash,
+        );
+        drop(s);
+        if !delta.is_empty() {
+            return write_response(writer, &Response::LaunchFailed {
+                stage: "policy".into(),
+                message: format!("needs approval: {}",
+                                 delta.describe().join("; ")),
+            });
+        }
+    }
+
+    /* 2. Tell the client we're ready for the fds. */
+    write_response(writer, &Response::ReadyForFds)?;
+
+    /* 3. recv_fds on the underlying socket. BufReader's buffer must
+     * be empty here — the client is blocking on its read of
+     * ReadyForFds and won't have sent anything else yet. */
+    if !reader.buffer().is_empty() {
+        return write_response(writer, &Response::LaunchFailed {
+            stage: "fdpass".into(),
+            message: "protocol violation: data buffered before fd handoff".into(),
+        });
+    }
+    let fds = match portcullis_ipc::recv_fds(reader.get_ref(), 3) {
+        Ok(v) => v,
+        Err(e) => {
+            return write_response(writer, &Response::LaunchFailed {
+                stage: "fdpass".into(),
+                message: format!("recv_fds: {e}"),
+            });
+        }
+    };
+    if fds.len() != 3 {
+        return write_response(writer, &Response::LaunchFailed {
+            stage: "fdpass".into(),
+            message: format!("expected 3 fds, got {}", fds.len()),
+        });
+    }
+    let mut iter = fds.into_iter();
+    let stdio = [iter.next().unwrap(), iter.next().unwrap(), iter.next().unwrap()];
+
+    /* 4. launch with the client's stdio. */
+    let resp = match launch::launch_with_stdio(&app_id, Some(stdio)) {
+        Ok(o) => Response::LaunchExit { code: o.exit_code },
+        Err(e) => Response::LaunchFailed {
+            stage: e.stage().into(),
+            message: e.message(),
+        },
+    };
+    write_response(writer, &resp)
 }
 
 fn handle(req: Request, shared: &Mutex<DaemonState>) -> Response {
@@ -221,56 +325,11 @@ fn handle(req: Request, shared: &Mutex<DaemonState>) -> Response {
                 Err(e) => Response::Error { message: format!("save: {e}") },
             }
         }
-        Request::Launch { app_id, bypass_policy } => {
-            /* Policy gate first (unless explicit dev bypass).
-             * Re-reads the manifest from disk so the hash check
-             * sees current bytes, matching what `policy diff` does. */
-            if !bypass_policy {
-                let tree = std::path::PathBuf::from("/var/lib/atrium/apps").join(&app_id);
-                let manifest_path = tree.join("atrium.toml");
-                let text = match std::fs::read_to_string(&manifest_path) {
-                    Ok(t) => t,
-                    Err(e) => return Response::LaunchFailed {
-                        stage: "manifest".into(),
-                        message: format!("{}: {e}", manifest_path.display()),
-                    },
-                };
-                let manifest = match portcullis_toml::Manifest::from_str(&text) {
-                    Ok(m) => m,
-                    Err(e) => return Response::LaunchFailed {
-                        stage: "manifest".into(),
-                        message: format!("parse error: {e}"),
-                    },
-                };
-                let current_hash = hash_manifest(text.as_bytes());
-                let s = shared.lock().unwrap();
-                let prior = s.policy.grants.get(&app_id);
-                let delta = compute_delta(
-                    &manifest.capabilities,
-                    prior.map(|g| &g.capabilities),
-                    prior.map(|g| g.manifest_hash.as_str()),
-                    &current_hash,
-                );
-                drop(s);
-                if !delta.is_empty() {
-                    /* "approval needed" fits LaunchFailed semantics for
-                     * step 1 — clearer to the client than reusing
-                     * NeedsApproval, which is an Authorize-shape reply. */
-                    return Response::LaunchFailed {
-                        stage: "policy".into(),
-                        message: format!("needs approval: {}",
-                                         delta.describe().join("; ")),
-                    };
-                }
-            }
-            match launch::launch(&app_id) {
-                Ok(o) => Response::LaunchExit { code: o.exit_code },
-                Err(e) => Response::LaunchFailed {
-                    stage: e.stage().into(),
-                    message: e.message(),
-                },
-            }
-        }
+        Request::Launch { .. } => Response::Error {
+            /* Caught by serve() before reaching here; unreachable
+             * unless the dispatch in serve() is changed. */
+            message: "internal: Launch must go through handle_launch".into(),
+        },
         Request::Reload => {
             let mut s = shared.lock().unwrap();
             let path = s.policy_path.clone();

@@ -1025,10 +1025,17 @@ Order matches risk (smallest blast radius first):
   otherwise. Stdio inherits the daemon (app output → daemon
   log) for now — SCM_RIGHTS pty passing in step 2.
 
-  *Step 2 (pending):* Pass the requesting client's pty fd via
-  SCM_RIGHTS so the launched app's stdin/stdout/stderr is the
-  user's terminal. Verified with a stub launching `cat` from
-  the CLI, output appearing on the CLI's tty.
+  *Step 2 (landed):* SCM_RIGHTS fd handoff. Wire dance:
+    CLI → Launch{app_id, bypass_policy}
+    daemon ← parses, runs policy gate, replies ReadyForFds
+    CLI → sendmsg([1 byte 'F'], cmsg=SCM_RIGHTS[stdin,stdout,stderr])
+    daemon ← recvmsg picks up the 3 OwnedFds, runs jail(8) with
+            them as 0/1/2, returns LaunchExit{code}
+  The ReadyForFds round-trip drains the daemon's BufReader so
+  its plain-read can't silently swallow the cmsg's data byte.
+  fdpass.rs uses libc directly (~80 lines of unsafe vs.
+  pulling in nix/passfd as a dep). Verified with a 3-fd
+  pipe-pair round-trip test.
 
   *Step 3 (pending):* Build the session jail composer:
   read-only nullfs of the host base + per-user overlay for

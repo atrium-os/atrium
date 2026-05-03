@@ -8,8 +8,9 @@
 //! step 2 and replaces stdio inheritance with proper terminal handoff.
 
 use std::fs;
+use std::os::unix::io::OwnedFd;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use portcullis_jail::{build, jail_name_from_app_id, BuildOpts};
 use portcullis_toml::Manifest;
@@ -45,10 +46,18 @@ pub struct LaunchOutcome {
 /// Run an app inside its per-app jail. Synchronous: returns when
 /// the jail has exited and been torn down.
 ///
+/// `stdio = None` → jail(8) inherits the daemon's stdio (output
+/// goes to the daemon log). `stdio = Some([in, out, err])` →
+/// jail(8) runs with those three fds as 0/1/2, so a launching
+/// client's terminal becomes the app's terminal.
+///
 /// Caller is responsible for the policy check — by the time we get
 /// here, the launch is already approved (or the caller passed
 /// bypass_policy and accepts dev-mode semantics).
-pub fn launch(app_id: &str) -> Result<LaunchOutcome, LaunchError> {
+pub fn launch_with_stdio(
+    app_id: &str,
+    stdio: Option<[OwnedFd; 3]>,
+) -> Result<LaunchOutcome, LaunchError> {
     let tree = PathBuf::from(APPS_DIR).join(app_id);
     if !tree.exists() {
         return Err(LaunchError::Failed("manifest",
@@ -115,13 +124,19 @@ pub fn launch(app_id: &str) -> Result<LaunchOutcome, LaunchError> {
                    format!("write {}: {e}", conf_path.display())));
     }
 
-    /* Phase 4.4 step 1: stdio is inherited from the daemon. App
-     * output goes to the daemon's stdout/stderr (the log). Step 2
-     * adds SCM_RIGHTS pty passing so the requesting client's tty
-     * is handed to the app. */
-    let status = Command::new("jail")
-        .arg("-c").arg("-f").arg(&conf_path).arg(&jail_name_from_app_id(app_id))
-        .status();
+    /* Stdio: if the caller passed three fds (the requesting
+     * client's stdin/stdout/stderr, handed over via SCM_RIGHTS),
+     * point jail(8) at them so the launched app talks to the
+     * client's terminal. Otherwise inherit the daemon's stdio
+     * (app output → daemon log). */
+    let mut cmd = Command::new("jail");
+    cmd.arg("-c").arg("-f").arg(&conf_path).arg(&jail_name_from_app_id(app_id));
+    if let Some([sin, sout, serr]) = stdio {
+        cmd.stdin (Stdio::from(sin));
+        cmd.stdout(Stdio::from(sout));
+        cmd.stderr(Stdio::from(serr));
+    }
+    let status = cmd.status();
     let _ = fs::remove_file(&conf_path);
 
     teardown(&jail_path, &jc.name);

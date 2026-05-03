@@ -13,11 +13,13 @@
 //! canonical writer.
 
 use std::io;
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
 use portcullis_ipc::{
-    round_trip, Request, Response, PROTO_VERSION, SOCKET_PATH,
+    read_response, round_trip, send_fds, write_request,
+    Request, Response, PROTO_VERSION, SOCKET_PATH,
 };
 use portcullis_toml::Capabilities;
 
@@ -146,17 +148,42 @@ pub enum LaunchReply {
 /// Forward a launch to portcullisd. Synchronous: returns when the
 /// jail has exited and been torn down. `Ok(None)` means daemon
 /// offline — caller should fall back to running the launch in-process.
+///
+/// Wire dance: send Launch → expect ReadyForFds (or terminal
+/// LaunchFailed for policy / manifest errors) → send our stdio fds
+/// via SCM_RIGHTS → expect LaunchExit / LaunchFailed.
 pub fn launch(app_id: &str, bypass_policy: bool) -> DaemonResult<LaunchReply> {
     let Some(mut s) = opened()? else { return Ok(None) };
-    let resp = round_trip(&mut s, &Request::Launch {
+
+    write_request(&mut s, &Request::Launch {
         app_id:        app_id.into(),
         bypass_policy,
     })?;
-    match resp {
-        Response::LaunchExit { code }            => Ok(Some(LaunchReply::Exited { code })),
+
+    /* Daemon either replies ReadyForFds (we proceed to the fd
+     * handoff) or LaunchFailed (policy refused, manifest missing,
+     * etc. — terminal). Anything else is a protocol bug. */
+    match read_response(&mut s)? {
+        Response::ReadyForFds                     => { /* fall through */ }
+        Response::LaunchFailed { stage, message } => return Ok(Some(LaunchReply::Failed { stage, message })),
+        Response::Error{message}                  => return Err(io::Error::other(message)),
+        other => return Err(io::Error::other(format!("unexpected pre-launch reply: {other:?}"))),
+    }
+
+    /* Hand over our stdio. The launched app reads/writes our tty
+     * (or whatever 0/1/2 are bound to in this process). */
+    let stdio_fds = [
+        std::io::stdin().as_raw_fd(),
+        std::io::stdout().as_raw_fd(),
+        std::io::stderr().as_raw_fd(),
+    ];
+    send_fds(&s, &stdio_fds)?;
+
+    match read_response(&mut s)? {
+        Response::LaunchExit { code }             => Ok(Some(LaunchReply::Exited { code })),
         Response::LaunchFailed { stage, message } => Ok(Some(LaunchReply::Failed { stage, message })),
         Response::Error{message}                  => Err(io::Error::other(message)),
-        other => Err(io::Error::other(format!("unexpected launch reply: {other:?}"))),
+        other => Err(io::Error::other(format!("unexpected post-launch reply: {other:?}"))),
     }
 }
 

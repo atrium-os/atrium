@@ -19,6 +19,9 @@ use serde::{Deserialize, Serialize};
 
 use portcullis_toml::Capabilities;
 
+pub mod fdpass;
+pub use fdpass::{recv_fds, send_fds};
+
 /// Default socket path. Created by portcullisd at startup; mode 0600
 /// so only the owning user can connect (per-user policy oracle).
 pub const SOCKET_PATH: &str = "/var/run/portcullisd.sock";
@@ -98,6 +101,13 @@ pub enum Response {
     LaunchExit { code: Option<i32> },
     /// Launch → setup or teardown failed before/after the app ran.
     LaunchFailed { stage: String, message: String },
+    /// Launch handshake: daemon has read+parsed the Launch request,
+    /// passed the policy gate, and is now blocked in `recv_fds`
+    /// waiting for the client's stdio. The CLI replies by sending
+    /// the SCM_RIGHTS sendmsg with the three fds. This round-trip
+    /// drains the daemon's BufReader so the cmsg's 1-byte payload
+    /// can't be silently swallowed by a buffered read.
+    ReadyForFds,
 }
 
 /// Send one request and read one response over a connected stream.
