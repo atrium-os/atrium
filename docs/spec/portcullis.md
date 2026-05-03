@@ -588,30 +588,56 @@ The shared volume lives at `/var/lib/atrium/store.tessera`
 overlay + (per-app pkg-installed files) are subtrees inside
 this single volume.
 
-### 4.2 Per-jail subtree
+### 4.2 Per-jail layout (split across three trees)
 
-Per-app jail at `/var/lib/atrium/jails/<app.id>/` (a subtree of
-the shared Tessera volume, NOT a separate Tessera image):
+Per-app state is split across three sibling trees under
+`/var/lib/atrium/`, all subtrees of the same Tessera volume:
 
 ```
-/var/lib/atrium/jails/org.atrium.edit/
-├── rootfs/                    ← lower layer: dedup'd app tree (Tessera)
-│   ├── bin/atrium-edit
-│   ├── lib/...
-│   ├── share/...
+/var/lib/atrium/
+├── apps/<app.id>/             ← lower layer: dedup'd app tree (Tessera)
+│   ├── bin/atrium-edit            (read-only at launch; never mutated
+│   ├── lib/...                     by the jail — preserves cross-jail
+│   ├── share/...                   CAS dedup of binaries + libs)
 │   └── atrium.toml
-├── overlay/                   ← upper layer: per-app writable (Tessera)
-│   ├── home/                  ← what the app sees as $HOME inside the jail
-│   ├── tmp/                   ← scratch (cleared on launch? configurable)
-│   └── state/                 ← persisted app state (settings, cache)
-└── runtime.conf               ← generated jail.conf section
+├── overlays/<app.id>/         ← upper layer: per-app writable (Tessera)
+│   ├── home/                  ← what the app sees as $HOME
+│   ├── tmp/                   ← scratch
+│   ├── var/                   ← persisted app state
+│   └── etc/                   ← per-instance config tweaks
+└── jails/<app.id>/            ← unionfs mountpoint = jail.path
+                                 (recreated each launch, torn down
+                                 on jail exit; no persistent content
+                                 of its own)
 ```
 
-The jail's `path` is a unionfs (or nullfs+overlay) of `rootfs`
-(read-only Tessera-mounted) over `overlay` (read-write Tessera-
-backed). Rootfs is shared across all instances of the same app
-(content-addressed → one copy on disk regardless of how many
-times "installed"). Overlay is per-(app, user-session).
+At launch, `portcullis launch --no-prompt`:
+
+1. Mounts `apps/<id>/` read-only via nullfs at `jails/<id>/`.
+2. Mounts `overlays/<id>/` writable via unionfs over the same
+   `jails/<id>/`. Writes inside the jail land in the overlay;
+   reads see the union.
+3. Sets `jail.path = /var/lib/atrium/jails/<id>/` and runs
+   `jail -c`.
+
+On jail exit (or `jail -r`): tear down in reverse order — devfs,
+unionfs, nullfs.
+
+Rationale for the three-tree split (vs. nesting `rootfs/` and
+`overlay/` under one per-app dir as earlier drafts suggested):
+
+- `apps/` is what `tessera-import` writes; keeping it a flat
+  tree of installed apps lets `portcullis launch <app-id>`
+  resolve directly without knowing about overlay siblings.
+- `overlays/` survives uninstall/reinstall cycles independently
+  (state persists if the user reinstalls the same app id) and
+  can be wiped per-app without touching the dedup'd rootfs.
+- `jails/` is pure scratch — safe to `rm -rf` at any time when
+  no jails are running.
+
+Single-instance for now (one overlay per app id). Multi-instance
+would key the overlay + jail dirs by an additional UUID; deferred
+until there's a concrete app that needs it.
 
 Inside the jail, the app sees a normal-looking root with:
 

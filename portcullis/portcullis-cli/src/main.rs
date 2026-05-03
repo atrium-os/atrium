@@ -111,7 +111,13 @@ fn cmd_validate(path: &str) -> ExitCode {
 
 /// Default location where `tessera-import` lands installed apps.
 /// `portcullis launch <app-id>` resolves the id by joining this prefix.
-const APPS_DIR: &str = "/var/lib/atrium/apps";
+const APPS_DIR:     &str = "/var/lib/atrium/apps";
+/// Per-app persistent overlay directory. Single-instance for now;
+/// multi-instance UUIDs deferred to a future iteration.
+const OVERLAYS_DIR: &str = "/var/lib/atrium/overlays";
+/// Per-app jail mount target — the unionfs mountpoint that becomes
+/// jail.path. Recreated each launch; destroyed on jail teardown.
+const JAILS_DIR:    &str = "/var/lib/atrium/jails";
 
 /// Decide whether `arg` is an app-id (resolve via APPS_DIR) or a
 /// filesystem path (use directly). Heuristic:
@@ -199,24 +205,67 @@ fn cmd_launch(tree_arg: &str, dry_run: bool) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    /* --no-prompt: actually invoke jail -c. Requires root + FreeBSD. */
+    /* --no-prompt: set up overlay mounts, run jail, tear down. */
+    let app_id = manifest.app.id.clone();
+    let overlay_dir = PathBuf::from(OVERLAYS_DIR).join(&app_id);
+    let jail_path   = PathBuf::from(JAILS_DIR).join(&app_id);
+
+    /* Rebuild the JailConfig with the unionfs path as jail.path
+     * (overrides BuildOpts.root_path which we set to tree above). */
+    let opts2 = BuildOpts { root_path: jail_path.clone(), ..opts };
+    let jc = match build(&manifest, &opts2) {
+        Ok(j) => j,
+        Err(e) => { eprintln!("build error: {e}"); return ExitCode::from(1); }
+    };
+
+    /* Pre-launch: ensure dirs exist, set up the union mount. */
+    if let Err(e) = ensure_dir(&overlay_dir) { eprintln!("{e}"); return ExitCode::from(1); }
+    if let Err(e) = ensure_dir(&jail_path)   { eprintln!("{e}"); return ExitCode::from(1); }
+
+    /* Defensive: unmount any stale layers from a previous crash.
+     * Use silent=true so the common case (nothing to unmount) is
+     * quiet. */
+    let _ = umount_silent(&jail_path);
+    let _ = umount_silent(&jail_path);
+
+    if let Err(e) = run("mount", &["-t", "nullfs", "-o", "ro",
+                                     tree.to_str().unwrap(),
+                                     jail_path.to_str().unwrap()]) {
+        eprintln!("nullfs mount: {e}"); return ExitCode::from(1);
+    }
+    if let Err(e) = run("mount", &["-t", "unionfs",
+                                     overlay_dir.to_str().unwrap(),
+                                     jail_path.to_str().unwrap()]) {
+        eprintln!("unionfs mount: {e}");
+        let _ = umount(&jail_path);
+        return ExitCode::from(1);
+    }
+
+    /* Write jail.conf, run jail -c. */
     let conf_path = std::env::temp_dir().join(format!("portcullis-{}.conf",
         std::process::id()));
     if let Err(e) = fs::write(&conf_path, jc.render_jail_conf()) {
         eprintln!("write {}: {e}", conf_path.display());
+        teardown(&jail_path);
         return ExitCode::from(1);
     }
     let status = Command::new("jail")
         .arg("-c").arg("-f").arg(&conf_path).arg(&jc.name)
         .status();
     let _ = fs::remove_file(&conf_path);
+
+    /* Teardown: jail -r (idempotent if already removed by exec.start
+     * exit), then umount in reverse order. */
+    let _ = Command::new("jail").arg("-r").arg(&jc.name).status();
+    teardown(&jail_path);
+
     match status {
         Ok(s) if s.success() => {
-            println!("portcullis: jail '{}' running", jc.name);
+            println!("portcullis: jail '{}' completed cleanly", jc.name);
             ExitCode::SUCCESS
         }
         Ok(s) => {
-            eprintln!("jail -c failed: {s}");
+            eprintln!("jail -c exited {s}");
             ExitCode::from(1)
         }
         Err(e) => {
@@ -224,6 +273,47 @@ fn cmd_launch(tree_arg: &str, dry_run: bool) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+fn ensure_dir(p: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(p)
+}
+
+fn umount(p: &Path) -> std::io::Result<()> {
+    let st = Command::new("umount").arg(p).status()?;
+    if !st.success() {
+        return Err(std::io::Error::other(format!("umount {} failed: {st}", p.display())));
+    }
+    Ok(())
+}
+
+/// Like `umount`, but suppresses umount(8)'s stderr. Used for the
+/// defensive pre-launch unmount where "not mounted" is the common case
+/// and the warning is just noise.
+fn umount_silent(p: &Path) -> std::io::Result<()> {
+    let _ = Command::new("umount")
+        .arg(p)
+        .stderr(std::process::Stdio::null())
+        .status()?;
+    Ok(())
+}
+
+fn run(cmd: &str, args: &[&str]) -> std::io::Result<()> {
+    let st = Command::new(cmd).args(args).status()?;
+    if !st.success() {
+        return Err(std::io::Error::other(format!("{cmd} {args:?} failed: {st}")));
+    }
+    Ok(())
+}
+
+/// Tear down a jail's union mount. Order matters: unionfs first
+/// (upper layer), then nullfs (lower). Also unmount devfs if jail
+/// still has it mounted at <jail-path>/dev.
+fn teardown(jail_path: &Path) {
+    let dev = jail_path.join("dev");
+    let _ = umount(&dev);   /* devfs from mount.devfs in jail.conf */
+    let _ = umount(jail_path);  /* unionfs */
+    let _ = umount(jail_path);  /* nullfs */
 }
 
 #[allow(dead_code)]
