@@ -1,0 +1,10 @@
+# network must be one of "none" | "loopback" | "full".
+# EXPECT_ERROR: unknown variant
+[app]
+id      = "org.example.x"
+name    = "X"
+version = "1.0.0"
+entry   = "bin/x"
+
+[capabilities]
+network = "wifi"

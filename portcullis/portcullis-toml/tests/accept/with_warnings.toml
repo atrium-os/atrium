@@ -1,0 +1,15 @@
+# Valid manifest that should generate WARNINGS but no errors.
+# - tessera-cas-read = true (restricted)
+# - camera = true (requires user prompt)
+# - unknown capability key (forward-compat warning)
+[app]
+id      = "com.system.thumbnailer"
+name    = "Thumbnailer"
+version = "1.0.0"
+entry   = "bin/thumbnailer"
+
+[capabilities]
+graphics         = "fresco"
+camera           = true
+tessera-cas-read = true
+future-cap-key   = "some-value"

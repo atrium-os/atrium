@@ -1,0 +1,6 @@
+# Smallest possible valid manifest.
+[app]
+id      = "org.example.minimal"
+name    = "Minimal"
+version = "0.1.0"
+entry   = "bin/minimal"

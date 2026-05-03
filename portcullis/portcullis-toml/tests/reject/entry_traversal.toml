@@ -1,0 +1,7 @@
+# app.entry must not contain `..` components (path-traversal sandbox escape).
+# EXPECT_ERROR: must not contain `..`
+[app]
+id      = "org.example.x"
+name    = "X"
+version = "1.0.0"
+entry   = "../../bin/x"

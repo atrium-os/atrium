@@ -1,0 +1,7 @@
+# app.entry must be relative within the tree.
+# EXPECT_ERROR: must be a relative path
+[app]
+id      = "org.example.x"
+name    = "X"
+version = "1.0.0"
+entry   = "/usr/local/bin/x"

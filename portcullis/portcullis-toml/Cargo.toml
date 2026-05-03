@@ -1,0 +1,15 @@
+[package]
+name        = "portcullis-toml"
+version.workspace     = true
+edition.workspace     = true
+license.workspace     = true
+repository.workspace  = true
+description = "Parser and validator for atrium.toml manifests. Pure Rust + serde; no jail interaction. Implements docs/spec/portcullis.md §3.3."
+
+[dependencies]
+serde      = { version = "1", features = ["derive"] }
+toml       = "0.8"
+thiserror  = "1"
+
+[dev-dependencies]
+# Golden-file tests use the standard fs APIs, no extra deps needed.

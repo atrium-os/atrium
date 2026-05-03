@@ -1,0 +1,11 @@
+# setup.timeout must be "<positive int><s|m|h>".
+# EXPECT_ERROR: must look like
+[app]
+id      = "org.example.x"
+name    = "X"
+version = "1.0.0"
+entry   = "bin/x"
+
+[setup]
+command = "scripts/firstrun.sh"
+timeout = "ten minutes"

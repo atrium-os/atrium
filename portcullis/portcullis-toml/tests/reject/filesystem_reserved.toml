@@ -1,0 +1,10 @@
+# filesystem paths cannot start with reserved prefixes.
+# EXPECT_ERROR: starts with reserved prefix
+[app]
+id      = "org.example.x"
+name    = "X"
+version = "1.0.0"
+entry   = "bin/x"
+
+[capabilities]
+filesystem = ["/atrium/sockets/bypass", "~/Documents"]

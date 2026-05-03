@@ -1,0 +1,37 @@
+# Exercises every documented section + capability.
+[app]
+id          = "org.atrium.edit"
+name        = "Atrium Edit"
+version     = "1.2.3"
+entry       = "bin/atrium-edit"
+description = "Lightweight text editor."
+
+[capabilities]
+graphics   = "fresco"
+clipboard  = true
+notify     = true
+open-uri   = true
+audio      = false
+filesystem = ["~/Documents", "~/Projects", "/usr/share/atrium-edit"]
+network    = "none"
+
+[capabilities.fonts]
+mode  = "read-only"
+paths = ["/usr/share/fonts"]
+
+[setup]
+command = "scripts/firstrun.sh"
+timeout = "120s"
+
+[setup.capabilities]
+network = "full"
+
+[resources]
+memory = "512M"
+cpu    = 200
+files  = 1024
+
+[supervision]
+restart    = "on-crash"
+keep-alive = false
+instances  = "single"

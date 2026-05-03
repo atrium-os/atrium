@@ -1,0 +1,7 @@
+# app.id must match `^[a-z][a-z0-9.-]*$` — uppercase is rejected.
+# EXPECT_ERROR: must match `^[a-z][a-z0-9.-]*$`
+[app]
+id      = "Org.Atrium.Edit"
+name    = "X"
+version = "1.0.0"
+entry   = "bin/x"
