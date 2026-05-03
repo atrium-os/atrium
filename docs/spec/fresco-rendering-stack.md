@@ -238,6 +238,102 @@ maybe one tier-2 (e.g., a vendor-supplied performance extension on
 hardware that benefits). We're not building a third-party extension
 marketplace.
 
+### 3.6 Where scenegraph traversal runs
+
+Engine extensions (§3.1–§3.5) describe how *individual ops* lower to
+Vulkan. But before any op handler runs, fresco-server has to walk the
+incoming scenegraph each frame: compose parent×child transforms,
+evaluate animations parameterised by the current frame, cull against
+clip rects, and decide which ops to dispatch. That traversal is its
+own architectural decision.
+
+**Decision: traversal runs on the GPU**, in a compute pass that
+reads a CAS-resident scene buffer and writes per-batch instance
+buffers + counts consumed by the render pass via indirect-instanced
+draws. The fresco-server core dispatches one compute kernel + one
+render pass per frame; per-frame host→GPU traffic is bounded by the
+frame counter and any structural deltas (~tens of bytes for the
+common case of stable scene structure with animation parameters).
+Engine extensions themselves keep their host-side shape — they emit
+SPIR-V/Vulkan against composed parameters supplied by the compute
+output.
+
+This decision is settled by two benchmarks:
+
+- **bench-fresco-runtime v1** (NO-GO): per-leaf
+  `MTLIndirectCommandBuffer render_command` encoding from a compute
+  kernel loses ~3.2× to instanced batched draws. Settled question:
+  **the render pass uses indirect-instanced draws**, not per-leaf
+  ICB encoding.
+- **bench-fresco-runtime v2** (GO): with the v1 verdict baked in
+  (both paths share an indirect-instanced render pass), GPU-side
+  traversal ties host-side 4-thread traversal on frame time and
+  wins decisively on host CPU (52× lower worst-case, constant
+  vs O(N×A×D) on host) and per-frame host→GPU bytes (240,000× at
+  N=100k, 55,532× average across 216 cells). On Apple M4 Max /
+  Metal 4.
+
+The host-CPU and bus-traffic axes are not optional in a desktop OS
+context: the host CPU also runs the compositor, app processes, input
+handling, and the engine extensions themselves; freeing 2 ms/frame
+of pure traversal cost at scale is the difference between
+interactive and laggy under load.
+
+#### Cross-platform note
+
+The v2 measurements are Apple Silicon; the architectural decision
+must hold on Vulkan-targeted discrete-GPU hosts too (per §2 the
+bottom contract is Vulkan). Reasoning, not measurement:
+
+- **Bus-traffic axis strengthens off Apple.** UMA makes H's
+  multi-MB/frame instance upload a free memcpy. PCIe makes it a
+  real cross-bus transfer in the critical path of every frame —
+  either with sync-stall risk or double-buffered staging eating
+  bandwidth otherwise available for asset streaming. The 240,000×
+  ratio that read as "interesting" on UMA reads as load-bearing
+  on discrete.
+- **Host-CPU axis is unchanged.** The host walks the scenegraph at
+  the same speed regardless of GPU topology.
+- **Frame-time axis depends on rasterizer-vs-compute throughput
+  and driver overhead.** On a beefier discrete GPU, both paths
+  shrink, but the host path now contains a real PCIe round-trip
+  the GPU has to wait for. Likely tilts further toward the GPU
+  path at large N, not less.
+- **Driver-maturity caveat.** Vulkan's
+  `VK_EXT_device_generated_commands` (the indirect-instanced
+  equivalent) is best-supported on NVIDIA, present on AMD, weakest
+  on Intel/Linux. Implementation risk is real but doesn't change
+  the architectural direction.
+
+We do not re-bench on Vulkan/discrete before locking the
+architectural decision. We do plan to validate via a Vulkan port
+of v2 (~2–3 days) ahead of any production Fresco runtime targeting
+non-Apple hardware, so we have one real number for the most likely
+external consumer (Linux + NVIDIA) before perf incidents make us
+re-derive it under pressure.
+
+#### Persistent megakernel (Path C) — explicitly deferred
+
+A long-running compute kernel that polls for frame-ready signals
+and never returns is the canonical "GPU runtime" shape. v2's per-
+frame compute dispatch already wins the architectural axes; Path C
+would shave at most tens of µs of dispatch overhead per frame, in
+the regime where v2's per-frame G already runs sub-millisecond, and
+zero help in the regime where both paths are rasterization-bound.
+
+Path C is therefore **not on the critical path for the architectural
+decision**. It is filed as:
+
+1. A future optimization to revisit if a measured perf incident
+   traces to dispatch overhead.
+2. A future programming-model question to revisit if/when the
+   engine wants to consume async scenegraph deltas without frame
+   coupling — at which point persistence is the natural runtime
+   shape, independent of frame-time numbers.
+
+Until one of those signals arrives, the production fresco-server
+core uses per-frame compute dispatch.
+
 ## 4. The "raw GPU access" escape hatch — and why we mostly don't need it
 
 Some workloads cannot fit any extensible scene model: graphics
@@ -272,12 +368,21 @@ Scope:
 - Per-app render contexts (memory budget separation)
 - Atrium-core extension implemented natively over Vulkan: rect /
   path / texture / glyph / transform ops
+- **GPU-side scenegraph traversal** per §3.6: CAS-resident scene
+  buffer, per-frame compute kernel composing transforms / animation
+  / culling, indirect-instanced render pass consuming compute output.
+  Path H_gcd4-equivalent (CPU-side traversal) kept available behind
+  a compile-time flag as the correctness reference and as the
+  fallback for debugging compute-shader regressions.
 - Output to scanout (initially via virtio-gpu in the VM; later via
   KMS-equivalent on real hardware)
 - Software fallback (tiny-skia) when no Vulkan device is available
 
 Estimated effort: ~3-4 weeks for a working but unoptimized version
-on the FreeBSD VM with virtio-gpu Vulkan.
+on the FreeBSD VM with virtio-gpu Vulkan. Add ~3 days for a Vulkan
+port of bench-fresco-runtime v2 to validate the v2 verdict on
+Linux+NVIDIA before production traffic hits non-Apple hardware (per
+§3.6 cross-platform note).
 
 ### Phase 3 (later): extension ABI + first non-core extension
 Define the C ABI for engine extensions, the manifest format, the
