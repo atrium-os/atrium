@@ -125,9 +125,9 @@ fn cmd_create(user: &str) -> ExitCode {
         return ExitCode::from(1);
     }
 
-    /* 1b. Compose the curated /etc tree (passwd/group/zshrc).
-     * Without this, getpwuid() inside the jail returns NULL and
-     * zsh can't expand ~/foo or render its prompt. */
+    /* 1b. Compose the curated /etc tree (passwd/group/shells).
+     * Without /etc/passwd in the jail, jexec -U fails getpwnam,
+     * zsh can't expand ~/foo, and getpwuid() returns NULL. */
     if let Err(e) = layout.compose_curated_etc(user) {
         eprintln!("atrium-session create: curated /etc: {e}");
         return ExitCode::from(1);
@@ -136,58 +136,38 @@ fn cmd_create(user: &str) -> ExitCode {
     /* 2. Defensive: tear down anything from a previous crash. */
     layout.umount_all_silent();
 
-    /* 3. Compose the lower layer by bind-mounting selected host
-     * base directories. We don't nullfs the whole host root —
-     * that would expose /root, /home/<otheruser>, /var/db secrets,
-     * etc. Selective mounts keep the session minimal. */
-    for (host, dst_under_lower) in BASE_RO_MOUNTS {
-        let dst = layout.lower.join(dst_under_lower);
-        if let Err(e) = std::fs::create_dir_all(&dst) {
-            eprintln!("create {}: {e}", dst.display());
+    /*
+     * 3. Compose the jail filesystem by bind-mounting each piece
+     *    DIRECTLY onto jail/<dst>. Earlier drafts used an
+     *    intermediate lower/ tree (multiple nullfs into lower/,
+     *    then nullfs of lower/→jail/, then unionfs overlay over
+     *    jail/), but FreeBSD nullfs doesn't pass through stacked
+     *    nullfs mounts — the resulting jail/bin appeared empty
+     *    even when lower/bin worked. Direct bind-mounts onto
+     *    jail/ are simpler and work.
+     *
+     *    No unionfs: writes outside $HOME aren't expected in a
+     *    well-behaved session, and the user's persistent state
+     *    is bind-mounted RW at jail/home from overlay/home/.
+     */
+
+    /* 3a. Read-only base: bin/sbin/lib/libexec/usr from host. */
+    for (host, dst) in BASE_RO_MOUNTS {
+        let dst_path = layout.jail.join(dst);
+        if let Err(e) = std::fs::create_dir_all(&dst_path) {
+            eprintln!("create {}: {e}", dst_path.display());
+            layout.umount_all_silent();
             return ExitCode::from(1);
         }
         if let Err(e) = run("mount", &["-t", "nullfs", "-o", "ro", host,
-                                        dst.to_str().unwrap()]) {
+                                        dst_path.to_str().unwrap()]) {
             eprintln!("mount {host}: {e}");
             layout.umount_all_silent();
             return ExitCode::from(1);
         }
     }
 
-    /* 4. Union the per-user overlay over the composed lower. */
-    if let Err(e) = run("mount", &["-t", "nullfs", "-o", "ro",
-                                    layout.lower.to_str().unwrap(),
-                                    layout.jail.to_str().unwrap()]) {
-        eprintln!("nullfs lower→jail: {e}");
-        layout.umount_all_silent();
-        return ExitCode::from(1);
-    }
-    if let Err(e) = run("mount", &["-t", "unionfs",
-                                    layout.overlay.to_str().unwrap(),
-                                    layout.jail.to_str().unwrap()]) {
-        eprintln!("unionfs overlay→jail: {e}");
-        layout.umount_all_silent();
-        return ExitCode::from(1);
-    }
-
-    /* 5. Bind-mount /apps and the portcullisd socket into the jail.
-     * The socket is bind-mounted by mounting its parent dir as
-     * nullfs RO; bind-mounting a single socket file isn't supported
-     * directly by nullfs. */
-    let apps_dst = layout.jail.join("apps");
-    if let Err(e) = std::fs::create_dir_all(&apps_dst) {
-        eprintln!("create apps mountpoint: {e}");
-        layout.umount_all_silent();
-        return ExitCode::from(1);
-    }
-    if let Err(e) = run("mount", &["-t", "nullfs", "-o", "ro", APPS_DIR,
-                                    apps_dst.to_str().unwrap()]) {
-        eprintln!("mount /apps: {e}");
-        layout.umount_all_silent();
-        return ExitCode::from(1);
-    }
-
-    /* 5b. Bind-mount the curated /etc into the jail. */
+    /* 3b. Curated /etc (passwd/group/shells). */
     let etc_dst = layout.jail.join("etc");
     if let Err(e) = std::fs::create_dir_all(&etc_dst) {
         eprintln!("create etc mountpoint: {e}");
@@ -202,17 +182,31 @@ fn cmd_create(user: &str) -> ExitCode {
         return ExitCode::from(1);
     }
 
+    /* 3c. /apps — RO view of installed apps. */
+    let apps_dst = layout.jail.join("apps");
+    if let Err(e) = std::fs::create_dir_all(&apps_dst) {
+        eprintln!("create apps mountpoint: {e}");
+        layout.umount_all_silent();
+        return ExitCode::from(1);
+    }
+    if let Err(e) = run("mount", &["-t", "nullfs", "-o", "ro", APPS_DIR,
+                                    apps_dst.to_str().unwrap()]) {
+        eprintln!("mount /apps: {e}");
+        layout.umount_all_silent();
+        return ExitCode::from(1);
+    }
+
+    /* 3d. /atrium/sockets — bind the host's socket directory so
+     *     in-jail clients reach portcullisd. Read-write because the
+     *     socket itself needs connect(); RO works for AF_UNIX
+     *     stream sockets actually, but RW future-proofs for daemons
+     *     that may want to create per-client sockets. */
     let socket_dir_dst = layout.jail.join("atrium/sockets");
     if let Err(e) = std::fs::create_dir_all(&socket_dir_dst) {
         eprintln!("create socket mountpoint: {e}");
         layout.umount_all_silent();
         return ExitCode::from(1);
     }
-    /* We expose the directory holding the socket, not just the
-     * socket file. Daemon's /var/run/ is a sensible directory to
-     * bind, but exposing all of /var/run is too broad. Use a
-     * dedicated /atrium/sockets/ on the host (created if absent)
-     * and bind that. */
     let host_sock_dir = std::path::Path::new("/atrium/sockets");
     if !host_sock_dir.exists() {
         if let Err(e) = std::fs::create_dir_all(host_sock_dir) {
@@ -228,6 +222,44 @@ fn cmd_create(user: &str) -> ExitCode {
         layout.umount_all_silent();
         return ExitCode::from(1);
     }
+
+    /* 3e. /home — bind-mount the per-user RW overlay's home/.
+     *     overlay/home/<user>/ on host appears as /home/<user>/
+     *     inside the jail and is the user's persistent state. */
+    let home_dst = layout.jail.join("home");
+    if let Err(e) = std::fs::create_dir_all(&home_dst) {
+        eprintln!("create home mountpoint: {e}");
+        layout.umount_all_silent();
+        return ExitCode::from(1);
+    }
+    if let Err(e) = run("mount", &["-t", "nullfs",
+                                    layout.overlay.join("home").to_str().unwrap(),
+                                    home_dst.to_str().unwrap()]) {
+        eprintln!("mount /home: {e}");
+        layout.umount_all_silent();
+        return ExitCode::from(1);
+    }
+
+    /* 3f. /dev mountpoint — jail.conf's mount.devfs=true populates it. */
+    if let Err(e) = std::fs::create_dir_all(layout.jail.join("dev")) {
+        eprintln!("create dev mountpoint: {e}");
+        layout.umount_all_silent();
+        return ExitCode::from(1);
+    }
+
+    /* 3g. /tmp — empty writable dir on host disk. tmpfs would be
+     *     cleaner (auto-cleared on umount, RAM-backed) and is a
+     *     follow-up; for now a plain dir is fine for shell scratch. */
+    if let Err(e) = std::fs::create_dir_all(layout.jail.join("tmp")) {
+        eprintln!("create tmp dir: {e}");
+        layout.umount_all_silent();
+        return ExitCode::from(1);
+    }
+    /* Make /tmp world-writable+sticky so non-root processes can use
+     * it (matches POSIX /tmp semantics). */
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(layout.jail.join("tmp"),
+                std::fs::Permissions::from_mode(0o1777));
 
     /* 6. Write the jail.conf and run jail -c. */
     let conf_path = std::env::temp_dir().join(format!("atrium-session-{user}.conf"));
@@ -324,9 +356,19 @@ const BASE_RO_MOUNTS: &[(&str, &str)] = &[
 struct SessionLayout {
     user:        String,
     root:        PathBuf,
-    lower:       PathBuf,
+    /// Per-user writable state. Only `home/<user>` is bind-mounted
+    /// into the jail (RW); the rest of the tree is reserved for
+    /// future expansion (state/, cache/, etc.) without changing
+    /// the layout contract.
     overlay:     PathBuf,
+    /// jail.path. Each system dir lands here as its own bind-mount
+    /// (no intermediate `lower/`, no unionfs — see cmd_create()
+    /// rationale: stacked nullfs over a directory containing
+    /// sub-mounts loses the sub-mounts per nullfs(5) "Mount events
+    /// from the underlying filesystem are not propagated through
+    /// the nullfs mount").
     jail:        PathBuf,
+    /// Curated minimal /etc bind-mounted RO at jail/etc.
     curated_etc: PathBuf,
 }
 
@@ -335,7 +377,6 @@ impl SessionLayout {
         let root = PathBuf::from(SESSIONS_DIR).join(user);
         Self {
             user:        user.to_string(),
-            lower:       root.join("lower"),
             overlay:     root.join("overlay"),
             jail:        root.join("jail"),
             curated_etc: root.join("etc"),
@@ -345,7 +386,6 @@ impl SessionLayout {
 
     fn create_dirs(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.root)?;
-        std::fs::create_dir_all(&self.lower)?;
         std::fs::create_dir_all(&self.overlay)?;
         std::fs::create_dir_all(&self.jail)?;
         std::fs::create_dir_all(&self.curated_etc)?;
@@ -367,16 +407,34 @@ impl SessionLayout {
     /// the jail at /etc as read-only at create time. Generated per
     /// user so each session sees its own passwd entry.
     fn compose_curated_etc(&self, user: &str) -> std::io::Result<()> {
-        /* passwd: bare entry for the session user. uid 1000 is a
-         * placeholder — exec.system_jail_user=true means jail(8)
-         * looks up the *host's* passwd for the actual uid when
-         * jexec'ing; this in-jail file just satisfies in-process
-         * lookups by zsh and friends. */
+        /* master.passwd: 10-field FreeBSD format
+         * (name:pw:uid:gid:class:change:expire:gecos:home:shell).
+         * pwd_mkdb compiles this into pwd.db / spwd.db / passwd
+         * (the 7-field POSIX view), which is what getpwnam(3)
+         * actually reads. Plain /etc/passwd alone is NOT enough.
+         *
+         * uid 1000 is a placeholder for in-jail name resolution;
+         * the actual uid jexec -U sets comes from the HOST's passwd
+         * (per the post-attach getpwnam path). For our test user
+         * "atrium" both happen to align (host=1001, jail=1000) but
+         * it doesn't matter because jexec uses the host lookup for
+         * the real setuid call. */
         let home = format!("/home/{user}");
-        let passwd = format!(
-            "root:*:0:0:Charlie &:/root:/usr/local/bin/zsh\n\
-             {user}:*:1000:1000:Atrium User:{home}:/usr/local/bin/zsh\n");
-        std::fs::write(self.curated_etc.join("passwd"), passwd)?;
+        let master_passwd = format!(
+            "root:*:0:0::0:0:Charlie &:/root:/usr/local/bin/zsh\n\
+             {user}:*:1000:1000::0:0:Atrium User:{home}:/usr/local/bin/zsh\n");
+        std::fs::write(self.curated_etc.join("master.passwd"), master_passwd)?;
+        /* Compile master.passwd → pwd.db / spwd.db / passwd. pwd_mkdb
+         * writes via temp+rename so it needs the dir writable;
+         * doing this BEFORE the bind-mount RO is correct. */
+        let st = Command::new("pwd_mkdb")
+            .arg("-p")  /* also write the 7-field passwd alongside */
+            .arg("-d").arg(&self.curated_etc)
+            .arg(self.curated_etc.join("master.passwd"))
+            .status()?;
+        if !st.success() {
+            return Err(std::io::Error::other(format!("pwd_mkdb: {st}")));
+        }
 
         let group = format!(
             "wheel:*:0:root,{user}\n\
@@ -408,21 +466,19 @@ echo 'Atrium session jail. `apps` lists installed apps; `./apps/<id>/<id>` runs 
     /// present, etc.) are silenced — this runs from error paths
     /// where we want best-effort cleanup, not noisy diagnostics.
     fn umount_all_silent(&self) {
-        let dev = self.jail.join("dev");
-        let _ = umount_silent(&dev);
-        let socket_dst = self.jail.join("atrium/sockets");
-        let _ = umount_silent(&socket_dst);
-        let etc_dst = self.jail.join("etc");
-        let _ = umount_silent(&etc_dst);
-        let apps_dst = self.jail.join("apps");
-        let _ = umount_silent(&apps_dst);
-        /* unionfs over jail */
-        let _ = umount_silent(&self.jail);
-        /* nullfs lower→jail */
-        let _ = umount_silent(&self.jail);
-        /* base RO mounts under lower/ — reverse order */
-        for (_, dst_under_lower) in BASE_RO_MOUNTS.iter().rev() {
-            let _ = umount_silent(&self.lower.join(dst_under_lower));
+        /* devfs (jail.conf mount.devfs=true puts it here) */
+        let _ = umount_silent(&self.jail.join("dev"));
+        /* /home overlay → jail/home */
+        let _ = umount_silent(&self.jail.join("home"));
+        /* /atrium/sockets bind */
+        let _ = umount_silent(&self.jail.join("atrium/sockets"));
+        /* /apps bind */
+        let _ = umount_silent(&self.jail.join("apps"));
+        /* curated /etc bind */
+        let _ = umount_silent(&self.jail.join("etc"));
+        /* base RO mounts at jail/<dst> — reverse order */
+        for (_, dst) in BASE_RO_MOUNTS.iter().rev() {
+            let _ = umount_silent(&self.jail.join(dst));
         }
     }
 }
@@ -508,7 +564,8 @@ mod tests {
     fn layout_paths_under_sessions_dir() {
         let l = SessionLayout::for_user("alice");
         assert!(l.root.starts_with("/var/lib/atrium/sessions/alice"));
-        assert_eq!(l.lower.file_name().unwrap(), "lower");
+        assert_eq!(l.overlay.file_name().unwrap(), "overlay");
         assert_eq!(l.jail.file_name().unwrap(), "jail");
+        assert_eq!(l.curated_etc.file_name().unwrap(), "etc");
     }
 }

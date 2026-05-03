@@ -117,6 +117,16 @@ pub fn launch_with_stdio(
         return Err(LaunchError::Failed("mount", format!("unionfs: {e}")));
     }
 
+    /* mount.devfs (set in jail.conf) needs the /dev mountpoint to
+     * exist inside jail.path. App trees don't ship /dev/, so create
+     * it now via the unionfs upper layer (writes land in overlay/dev). */
+    if let Err(e) = fs::create_dir_all(jail_path.join("dev")) {
+        let _ = umount(&jail_path);
+        let _ = umount(&jail_path);
+        return Err(LaunchError::Failed("mount",
+            format!("mkdir jail/dev: {e}")));
+    }
+
     /* Phase 4.5: first-run setup. Sentinel lives in the overlay so
      * it persists across launches; portcullis reinstall removes it
      * to force a re-run. */

@@ -239,6 +239,39 @@ fn resolve_app_tree(arg: &str) -> PathBuf {
 }
 
 fn cmd_launch(tree_arg: &str, dry_run: bool, no_prompt: bool) -> ExitCode {
+    /* Daemon-first short-circuit for app-id launches: when the arg
+     * is an app-id (not an explicit path) and we're not doing a
+     * dry-run, just forward to portcullisd. The daemon runs on the
+     * host where /var/lib/atrium/apps/<id>/ is reachable; the CLI
+     * may be running inside a session jail where it isn't. So
+     * don't try to read the manifest locally — let the daemon do
+     * the work. (Local manifest read remains for --dry-run and
+     * for explicit-path launches below.) */
+    if !dry_run && looks_like_app_id(tree_arg) {
+        match daemon::launch(tree_arg, no_prompt) {
+            Ok(Some(reply)) => {
+                return handle_daemon_launch_reply(reply, tree_arg, no_prompt);
+            }
+            Ok(None) => {
+                /* Daemon offline. For app-id launches we can't fall
+                 * back to in-process — that requires root + visibility
+                 * into /var/lib/atrium/apps/, which a session-jail CLI
+                 * doesn't have. Refuse with a clear message. */
+                eprintln!("portcullis launch: portcullisd not running ({} absent)",
+                    portcullis_ipc::SOCKET_PATH);
+                eprintln!("    start it on the host (or check the rc.d service)");
+                return ExitCode::from(1);
+            }
+            Err(e) => {
+                eprintln!("portcullisd launch: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+
+    /* Path-based or --dry-run path: read manifest locally. Same as
+     * before — used for development workflows that pass an app tree
+     * by path, and for `--dry-run` rendering. */
     let tree = resolve_app_tree(tree_arg);
     if !tree.exists() {
         if looks_like_app_id(tree_arg) {
@@ -529,6 +562,51 @@ fn teardown(jail_path: &Path) {
     let _ = umount(&dev);   /* devfs from mount.devfs in jail.conf */
     let _ = umount(jail_path);  /* unionfs */
     let _ = umount(jail_path);  /* nullfs */
+}
+
+/// Map a daemon LaunchReply to a CLI ExitCode. Used by the
+/// short-circuit "app-id → daemon" path that doesn't have the
+/// manifest text locally for persist_grant_for(). The full prompt
+/// loop with AllowAlways persistence lives in the path-based
+/// launch flow further down (it has manifest text in scope).
+fn handle_daemon_launch_reply(
+    reply: daemon::LaunchReply,
+    tree_arg: &str,
+    no_prompt: bool,
+) -> ExitCode {
+    match reply {
+        daemon::LaunchReply::Exited { code } => match code {
+            Some(0) => ExitCode::SUCCESS,
+            Some(c) => ExitCode::from(c.min(255).max(1) as u8),
+            None    => ExitCode::from(1),
+        },
+        daemon::LaunchReply::Failed { stage, message } => {
+            eprintln!("portcullis launch [{stage}]: {message}");
+            ExitCode::from(1)
+        }
+        daemon::LaunchReply::NeedsApproval { delta } => {
+            /* Short-circuit path — no manifest text on the CLI side
+             * (we may be running inside a session jail without
+             * /var/lib/atrium/apps/ access), so we can't run the
+             * full Allow-Always-persists-grant flow. Print the
+             * delta + suggest the way out. A future improvement
+             * would be a daemon RPC like `GrantFromManifest{app_id}`
+             * that lets the in-jail CLI persist a grant via the
+             * daemon's host-side manifest read. */
+            if no_prompt {
+                /* Shouldn't reach here — bypass would have prevented
+                 * the policy gate from refusing. Defensive. */
+                eprintln!("portcullis launch [policy]: NeedsApproval despite --no-prompt");
+                return ExitCode::from(1);
+            }
+            eprintln!("portcullis launch: {tree_arg} needs capabilities not yet granted:");
+            for line in &delta { eprintln!("    - {line}"); }
+            eprintln!();
+            eprintln!("    grant from a host shell: portcullis policy grant {tree_arg}");
+            eprintln!("    or bypass:               portcullis launch --no-prompt {tree_arg}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 // ── Phase 5: interactive approval prompt ─────────────────────────
