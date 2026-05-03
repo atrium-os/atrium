@@ -1,0 +1,56 @@
+#!/bin/sh
+#
+# portcullisd — Portcullis policy + launch daemon
+#
+# Install at /usr/local/etc/rc.d/portcullisd (mode 0755), then enable:
+#   sysrc portcullisd_enable=YES
+#   service portcullisd start
+#
+# The daemon binds /atrium/sockets/portcullis.sock (mode 0600 by
+# default, owned by the user the daemon runs as). For the current
+# single-user deployment we run as the test user via $portcullisd_user;
+# the long-term plan is per-user portcullisd instances spawned by
+# atrium-login (one daemon per logged-in user, socket owned by them).
+#
+# PROVIDE: portcullisd
+# REQUIRE: NETWORKING DAEMON FILESYSTEMS
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name=portcullisd
+rcvar=portcullisd_enable
+
+load_rc_config $name
+
+: ${portcullisd_enable:=NO}
+: ${portcullisd_user:=atrium}
+: ${portcullisd_socket:=/atrium/sockets/portcullis.sock}
+: ${portcullisd_logfile:=/var/log/portcullisd.log}
+
+command=/usr/sbin/daemon
+pidfile=/var/run/${name}.pid
+procname=/usr/local/bin/portcullisd
+
+command_args="-cf -P ${pidfile} -o ${portcullisd_logfile} \
+    ${procname} \
+    --user ${portcullisd_user} \
+    --socket ${portcullisd_socket}"
+
+start_precmd="${name}_prestart"
+
+portcullisd_prestart()
+{
+    # The socket dir must exist before the daemon binds. Sets up the
+    # standard /atrium/sockets/ that session jails bind-mount in.
+    install -d -m 0755 $(dirname ${portcullisd_socket})
+    # Layout dirs portcullisd + atrium-session + portcullis launch
+    # depend on. Idempotent.
+    install -d -m 0755 /var/lib/atrium/apps
+    install -d -m 0755 /var/lib/atrium/overlays
+    install -d -m 0755 /var/lib/atrium/jails
+    install -d -m 0755 /var/lib/atrium/sessions
+    install -d -m 0755 /var/db/atrium
+}
+
+run_rc_command "$1"

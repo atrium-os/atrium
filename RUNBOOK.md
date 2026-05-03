@@ -938,3 +938,148 @@ cd ~/src/fresco-server && RUST_LOG=info cargo run --release
 # terminal 2 — wait for "Waiting for QEMU to connect" then:
 ~/src/bsd/scripts/run-vm.sh --gpu
 ```
+
+### Deploy Portcullis end-to-end in a fresh VM
+
+After `Re-do first-boot setup from scratch` above, get from "fresh
+qcow2 with sshd" to "user logs in and lands in a session jail with
+working app launches" in ~5 minutes.
+
+```sh
+VSSH=~/src/bsd/scripts/vssh
+PORT=~/src/bsd/portcullis
+
+# 1. Cross-compile the Portcullis binaries (host; ~7s clean, ~2s incremental).
+cd $PORT
+cargo build --target aarch64-unknown-freebsd --release \
+    -p portcullis-cli -p portcullisd -p atrium-session
+
+# 2. Install zsh in the guest (atrium-login execs into zsh).
+$VSSH 'ASSUME_ALWAYS_YES=yes pkg install -y zsh'
+
+# 3. Install binaries (atrium-session MUST be setuid root — login(1)
+#    runs the user's shell as the user, so atrium-login has no privs;
+#    atrium-session escalates to do the mount + jail -c work).
+$VSSH "install -m 0755  /mnt/portcullis/target/aarch64-unknown-freebsd/release/portcullis      /usr/local/bin/portcullis &&
+       install -m 0755  /mnt/portcullis/target/aarch64-unknown-freebsd/release/portcullisd     /usr/local/bin/portcullisd &&
+       install -m 04755 /mnt/portcullis/target/aarch64-unknown-freebsd/release/atrium-session  /usr/local/bin/atrium-session &&
+       install -m 0755  /mnt/portcullis/atrium-session/install/atrium-login                    /usr/local/bin/atrium-login &&
+       install -m 0755  /mnt/portcullis/portcullisd/install/portcullisd                        /usr/local/etc/rc.d/portcullisd"
+
+# 4. Add a test user with atrium-login as their shell.
+$VSSH "pw useradd atrium -m -G wheel -s /usr/local/bin/atrium-login -w no
+       mkdir -p /home/atrium/.ssh
+       cp /root/.ssh/authorized_keys /home/atrium/.ssh/authorized_keys
+       chown -R atrium:atrium /home/atrium/.ssh
+       chmod 700 /home/atrium/.ssh"
+
+# 5. Enable + start portcullisd. Pre-creates /atrium/sockets/ and
+#    /var/lib/atrium/{apps,overlays,jails,sessions} on first start.
+$VSSH 'sysrc portcullisd_enable=YES portcullisd_user=atrium
+       service portcullisd start
+       ls -la /atrium/sockets/portcullis.sock'
+
+# 6. (TEMPORARY) chmod the socket so non-root users can connect.
+#    Real fix is per-user portcullisd; until then this is a manual step.
+$VSSH 'chmod 666 /atrium/sockets/portcullis.sock'
+
+# 7. Verify: ssh in as atrium, run a smoke command.
+ssh -i ~/.ssh/fresco_bsd_ed25519 -p 2222 atrium@localhost <<'EOF'
+hostname    # should print "atrium-session" (the session jail's hostname)
+id          # uid=1000(atrium) — the in-jail uid (host uid is 1001)
+ls /apps    # the apps registry
+exit
+EOF
+
+# 8. Install a test app + launch via session jail to verify the
+#    SCM_RIGHTS pty handoff path:
+$VSSH 'mkdir -p /var/lib/atrium/apps/test.hello
+       cp /rescue/sh /var/lib/atrium/apps/test.hello/sh
+       cat > /var/lib/atrium/apps/test.hello/atrium.toml <<MANIFEST
+[app]
+id = "test.hello"
+name = "Hello"
+version = "0.1.0"
+entry = "runme"
+
+[capabilities]
+network = "none"
+MANIFEST
+       cat > /var/lib/atrium/apps/test.hello/runme <<RUNME
+#!/sh
+echo "hello from app jail!"
+echo "pid=\$\$"
+RUNME
+       chmod +x /var/lib/atrium/apps/test.hello/runme
+       /usr/local/bin/portcullis link-apps'
+
+# Then ssh in as atrium and run:
+#     /apps/test.hello/test.hello
+# Expected output:
+#     hello from app jail!
+#     pid=<small number>
+```
+
+Known papered-over issues (see commit 4e52f9d for the full list):
+- Daemon socket needs chmod 666 manually until per-user daemon lands.
+- /usr/local/etc/zshrc isn't installed yet; default zsh prompt fine.
+- App jails inherit no /etc, no /sbin — apps must bring their own
+  binaries (or a curated etc); intentional sealed-app behaviour.
+
+### FreeBSD source fork (for kernel patches)
+
+We maintain a downstream fork of FreeBSD src for kernel-side patches
+we need across Atrium subsystems (vfs tweaks, scheduler hints, GPU
+ABI evolution, etc.). The fork lives at
+`atrium-os/freebsd-src-fork` on GitHub (created via GitHub's
+server-side fork API — instant, no upload of the full FreeBSD tree).
+
+```sh
+# One-time clone (partial — only fetches blobs on demand; ~3GB
+# checked out, less if you don't materialise everything).
+git clone --filter=blob:none https://github.com/freebsd/freebsd-src.git \
+    ~/src/freebsd-src
+cd ~/src/freebsd-src
+
+# Two remotes:
+#   upstream = freebsd/freebsd-src (read-only; sync from this)
+#   atrium   = atrium-os/freebsd-src-fork (push our branches here)
+git remote rename origin upstream
+git remote add atrium https://github.com/atrium-os/freebsd-src-fork.git
+
+# Working branch tracks our cumulative patches.
+git checkout -b atrium/main upstream/main
+git push -u atrium atrium/main
+```
+
+**Workflow for a new kernel patch:**
+
+```sh
+cd ~/src/freebsd-src
+git checkout -b atrium/<topic> atrium/main
+# ... edit, build (KERNCONF=GENERIC make -j8 buildkernel from /usr/src
+# inside the VM, NOT host — kernel build needs FreeBSD make + libs)
+git commit
+git push atrium atrium/<topic>
+```
+
+**Periodic upstream sync:**
+
+```sh
+cd ~/src/freebsd-src
+git fetch upstream
+git checkout atrium/main
+git rebase upstream/main      # or merge, our call per patch series
+git push atrium atrium/main --force-with-lease
+```
+
+**Why server-side fork instead of full re-push:** pushing 1.5GB of
+git pack from a partial clone requires fetching all missing blobs
+from upstream first (slow). The GitHub server-side fork (`gh repo
+fork freebsd/freebsd-src --org atrium-os`) creates the fork on
+GitHub's backend in seconds with no upload, and we just push our
+diffs as branches.
+
+(There's an empty `atrium-os/freebsd-src` placeholder repo lingering
+from a setup misstep. Delete via the web UI when convenient — needs
+`delete_repo` scope which `gh auth refresh` can grant.)
