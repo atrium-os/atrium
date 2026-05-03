@@ -638,6 +638,127 @@ decision**. It is filed as:
 Until one of those signals arrives, the production fresco-server
 core uses per-frame compute dispatch.
 
+### 3.7 Wire format: atrium-rpc + the display dictionary
+
+The scenegraph protocol does NOT define its own wire envelope.
+It rides on **atrium-rpc** (see [`atrium-rpc.md`](atrium-rpc.md)),
+the unified IPC substrate every Atrium service uses (clipboard,
+notify, broker, audio control, ...). One envelope, one client
+library, one debugger view, one CAS namespace across the OS.
+
+Fresco's display protocol is the dictionary at `opcode_class = 1`
+(`CLASS_DISPLAY` in `atrium-rpc/src/classes.rs`), implemented as a
+companion crate `atrium-rpc-display`. The migration of Fresco from
+its legacy 128-byte fixed-frame format to this envelope is the
+deferred D1.7+ work that
+[`atrium-rpc.md` §9.1](atrium-rpc.md#91-fresco-migration-deferred-d17-or-later)
+specs out. Building atrium-rpc-display alongside the new
+fresco-server (per §5 Phase 2) IS that migration.
+
+#### What we get for free
+
+- **CAS upload + dedup.** `atrium-rpc-core` (`opcode_class = 0`)
+  defines `UPLOAD_BEGIN/DATA/FINISH/ACK` and `FETCH_REQUEST/BEGIN`.
+  Every atrium-rpc speaker implements them. Hashes are SHA-256,
+  shared with Tessera. We do NOT redefine these in the display
+  dictionary.
+- **fd-passing for shm.** atrium-rpc handles `SCM_RIGHTS`
+  fd-passing for big payloads (decoded video frames, GPU
+  textures). Capability is the fd. Already available; no
+  display-specific work.
+- **Capability boundary.** Portcullis nullfs-mounts
+  `/atrium/sockets/fresco.sock` into jails that declare the
+  `graphics = "fresco"` capability. Standard pattern; nothing
+  Fresco-specific.
+- **Tessera integration.** Hashes shared across CAS namespace
+  means a texture rendered by Fresco AND copied to clipboard
+  AND in a notification is one allocation.
+
+#### What atrium-rpc-display defines
+
+The display dictionary has two op categories — **control ops**
+and **scene ops** — both addressed by the envelope's `op` field
+(u16) within `opcode_class = 1`.
+
+**Control ops** are handled by fresco-server's host shim directly.
+They mutate host-side state (CAS table, slot table, scene buffer);
+no SPIR-V dispatch involved. Examples (numbering mirrors the
+legacy wire-format.md vocabulary, adapted to the envelope):
+
+| op | name | purpose |
+|---|---|---|
+| `0x0020` | `OP_SLOT_SET`         | bind a CAS hash to a slot ID (per-client slot table) |
+| `0x0021` | `OP_SLOT_CLEAR`       | release a slot |
+| `0x0030` | `OP_SCENE_FRAME_BEGIN`| start composing a frame |
+| `0x0031` | `OP_SCENE_FRAME_END`  | commit + present |
+| `0x0040` | `OP_SCENE_NODE_SET`   | install/update a scene node (carries scene op-ID + params) |
+| `0x0041` | `OP_SCENE_NODE_CLEAR` | remove a scene node |
+| `0x0500` | `OP_WINDOW_CREATE`    | create a top-level window |
+| `0x0504` | `OP_WINDOW_PRESENT`   | per-window frame end |
+
+(Full set comes from translating `wire-format.md` §6.2 into
+envelope payloads. Bytes per command shrink because the envelope
+is variable-length; the legacy format was 128-byte fixed.)
+
+**Scene ops** are the §3.4 closed registry — what bundles
+implement. Scene op-IDs travel inside `OP_SCENE_NODE_SET`
+payloads, not as envelope opcodes. The host shim's per-frame
+compute kernel reads each scene node's op-ID and dispatches the
+appropriate bundle's SPIR-V compute fragment.
+
+```rust
+// atrium-rpc-display/src/lib.rs (sketch)
+pub mod control {
+    pub const OP_SLOT_SET:          u16 = 0x0020;
+    pub const OP_SCENE_FRAME_BEGIN: u16 = 0x0030;
+    pub const OP_SCENE_NODE_SET:    u16 = 0x0040;
+    // ...
+}
+
+pub mod scene_ops {
+    /// op-IDs from the §3.4 closed registry. Carried as a u32
+    /// inside SceneNodeSetPayload, NOT as envelope ops.
+    pub const ATRIUM_CORE_RECT:    u32 = 0x1000;
+    pub const ATRIUM_CORE_TEXTURE: u32 = 0x1001;
+    pub const ATRIUM_CORE_PATH:    u32 = 0x1002;
+    pub const ATRIUM_CORE_GLYPH:   u32 = 0x1003;
+    // ... future engine bundles get their own op-ID ranges
+    // pub const UEKE_LUMEN_GI:       u32 = 0x2000;
+}
+
+pub struct SceneNodeSetPayload {
+    pub node_id: u32,
+    pub op_id:   u32,        // from scene_ops above
+    pub params:  Vec<u8>,    // op-specific schema (per-op modules)
+}
+```
+
+#### Why this two-category split matters
+
+- **Control ops never reach bundles.** They mutate fresco-server
+  state (CAS table, slot table, scene buffer). A bundle CANNOT
+  define new control ops — the privileged host-side state is not
+  extensible from extension code. This is the same invariant that
+  §3.1 enforces by making bundles SPIR-V-only.
+- **Scene ops are bundle-defined.** New scene ops require an
+  op-ID reservation in the §3.4 registry plus a bundle that
+  implements them. The wire format itself doesn't change.
+- **Atrium-RPC is unaware of the distinction.** From the
+  envelope's view, both are just opcodes within `CLASS_DISPLAY`.
+  The host shim's dispatcher routes control ops to its own
+  handlers and scene ops to the bundle compute pass.
+
+#### What about the legacy fresco-socket-rs and 128-byte format?
+
+Both stay valid until their consumers migrate. The current
+fresco-server, fresco-socket-rs, atrium-edit-socket, etc. continue
+to use the 128-byte format documented in
+[`wire-format.md`](wire-format.md). They are unaffected by
+fresco-server-poc adopting the new envelope-based path. When the
+new path supersedes the old one (post-POC, after a migration
+window), `wire-format.md` gets a deprecation note. For now: two
+specs coexist, each governing its own implementations.
+
 ## 4. The "raw GPU access" escape hatch — and why we mostly don't need it
 
 Some workloads cannot fit any extensible scene model: graphics
