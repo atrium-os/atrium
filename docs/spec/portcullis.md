@@ -154,147 +154,162 @@ At parse time:
   OR a `policy.toml` admin grant.
 - Unknown keys are warnings, not errors (forward compatibility).
 
-## 3.4 The FreeBSD package pool
+## 3.4 FreeBSD package dependencies
 
-`[packages.freebsd]` declares pkg dependencies. Portcullis
-maintains a host-side pool at `/var/db/atrium/pkg-pool/`:
+`[packages.freebsd]` declares pkg dependencies. Portcullis runs
+`pkg install` **inside the app's jail** to satisfy them — standard
+FreeBSD admin model, no bespoke pool format. Cross-jail storage
+dedup is automatic via Tessera CAS-FS: 50 apps each pkg-installing
+openssl produce 50 logical installs but **one physical disk copy**.
 
-```
-/var/db/atrium/pkg-pool/
-├── pkg-db/                    ← pkg(8) sqlite + metadata (one global instance)
-├── files/
-│   ├── openssl/3.0.13/        ← per (pkg, version), full file tree
-│   │   └── usr/local/...
-│   ├── openssl/3.1.4/
-│   ├── libxml2/2.12.5/
-│   └── libpng/1.6.40/
-└── manifest.cache             ← per-package file list for fast jail-mount
-```
+### Mechanics
 
-The pool itself lives on Tessera-CAS storage so file-level dedup
-works across packages too (common READMEs, license texts, etc.
-collapse to one copy).
-
-### Pool installation
-
-A package is installed into the pool exactly once per (name, version):
-
-1. App's atrium.toml declares `openssl = "3.0"`.
-2. `tessera-import` (or a higher-level installer) checks the pool;
-   if `openssl-3.0` not present, runs:
-   ```
-   pkg --rootdir /var/db/atrium/pkg-pool/files/openssl/3.0.13 \
-       --chroot /var/db/atrium/pkg-pool/install-jail \
-       install openssl-3.0.13
-   ```
-   inside a small "install jail" that has network + write to the
-   pool but nothing else. pkg's install scripts run here; their
-   side effects land in the pool.
-3. Pool-side post-install: extract the file list, write to
-   `manifest.cache` for the package; this is what jail-launch
-   reads to decide what to mount.
-4. Subsequent apps that depend on `openssl-3.0` skip the install
-   entirely — pool entry already exists.
-
-Multiple versions coexist in the pool because they live under
-different (name, version) directories. Garbage-collected when no
-app's manifest references them anymore.
-
-### Pool → jail at launch time
-
-Per declared package, Portcullis adds nullfs mount entries to
-the jail's runtime.conf:
+When `tessera-import` materialises an app tree, it reads
+`[packages.freebsd]`. If the app's overlay doesn't already have
+the declared packages installed (lookup via pkg's own
+`/var/db/pkg/local.sqlite` inside the overlay), it runs:
 
 ```
-mount.nullfs += "/var/db/atrium/pkg-pool/files/openssl/3.0.13/usr/local/lib /usr/local/lib"
-mount.nullfs += "/var/db/atrium/pkg-pool/files/openssl/3.0.13/usr/local/include /usr/local/include"
-# ... per the package's manifest.cache subset of usr/local
+jail -c name=atrium-pkginstall-<id>           \
+       path=/var/lib/atrium/jails/<id>/...    \
+       ip4.addr=... vnet=...                  \  # transient network
+       command=/usr/sbin/pkg install -y openssl-3.0
 ```
 
-Trick: when multiple packages contribute files to the same path
-(e.g. both openssl AND libxml2 land things in `/usr/local/lib`),
-we union them via either:
-- a per-jail synthesized `/usr/local/lib` directory containing
-  symlinks to each package's actual files, or
-- nullfs the entire pool's per-package trees and rely on the
-  later mount winning conflicts.
+pkg downloads, verifies signatures, runs install scripts, writes
+files into the jail's rootfs+overlay. All standard FreeBSD pkg
+behaviour. Network access is transient — granted only for the
+install operation, dropped before the app launches normally.
 
-Phase-1 implementation picks the symlink-tree approach (cleaner
-conflict semantics; jail-launch creates the symlink tree on
-first run, caches in the per-app overlay).
+### Shared fetch cache
 
-### App-visible result
-
-Inside the jail, the app sees a normal FreeBSD layout:
+A host-side cache at `/var/cache/atrium/pkg/` mounted (read-write
+to the install jail, read-only to the app jail's pkg if the app
+ever runs `pkg upgrade`) avoids redundant downloads. Standard
+pkg.conf knob:
 
 ```
-/usr/local/lib/libssl.so.3    ← from openssl pool entry, nullfs ro
-/usr/local/lib/libxml2.so.16  ← from libxml2 pool entry, nullfs ro
-/usr/local/include/openssl/*  ← (only present if declared)
-/usr/local/share/man/...      ← (probably skipped — apps don't need man pages)
+PKG_CACHEDIR: /var/cache/atrium/pkg
 ```
 
-The dynamic linker finds shared libs at standard paths. No
-LD_LIBRARY_PATH munging. App's binary, built with the standard
-FreeBSD pkg layout in mind, just works.
+App A's install fetches openssl-3.0.13 into the cache; App B's
+install pulls from cache, no network round-trip. Cache is
+content-addressed by package signature — no ambiguity about
+"which 3.0.13 is this."
 
-### Cross-jail dedup, automatic
+### Storage outcome
 
-If 50 Atrium apps each declare `openssl = "3.0"`:
-- Pool stores one copy of the openssl files (~10 MB).
-- 50 jails each get a nullfs view of those files. Zero
-  additional disk usage per jail.
-- Compare with the alternative (each jail's rootfs containing
-  its own copy): 50 × 10 MB = 500 MB wasted.
+Each app's jail has its own pkg database, its own install-script
+side effects, its own etc/* contributions. The actual binary and
+data files (`/usr/local/lib/libssl.so.3`, `/usr/local/share/...`)
+are byte-identical across jails depending on the same package
+version. Tessera CAS-FS hashes those files and stores **one
+physical copy** regardless of how many jails reference them.
 
-This composes with Tessera's intra-app dedup (file-level CAS for
-the rootfs) and with D1.7 binsplit (function-level dedup for the
-app's own binaries) to give multiple compounding storage wins.
+What's NOT deduped (small, per-jail):
+- `/var/db/pkg/local.sqlite` — pkg's local database; per-jail
+  state (timestamps, install order). A few MB per jail.
+- Install-script effects on `/etc/passwd`, `/etc/group`, etc. if
+  any (rare for FreeBSD packages).
 
-### Updates + version pinning
+What IS deduped (large, the actual content):
+- `/usr/local/lib/*` — shared libraries
+- `/usr/local/share/*` — data, locales, docs
+- `/usr/local/include/*` — headers
+- `/usr/local/bin/*` — pkg-installed binaries
+- All of these are byte-identical across same-version pkg installs
 
-- App declares `openssl = "3.0"` (loose) or `"3.0.13"` (exact).
-- Pool may have multiple versions; the resolver picks the highest
-  matching the constraint.
-- A new pkg release of openssl-3.0.14 lands in the pool on next
-  pool refresh (manual `portcullis pool update` or scheduled).
-- Apps with `"3.0"` get the new version on next launch
-  (re-resolve constraints). Apps with `"3.0.13"` keep that exact
-  one until the manifest is bumped.
+For 50 apps depending on openssl, the storage cost is:
+`(one openssl install's content)` + `(50 × pkg-DB-overhead ~few MB)`
+vs. the naive 50 × full-install-size.
+
+### Multi-version
+
+Each app's jail has whatever version it requested. App A pinning
+openssl-3.0 and App B pinning openssl-3.1 just means each jail
+ran a different `pkg install`. Both versions exist on disk (one
+copy each, via Tessera CAS), no conflict.
+
+### Updates
+
+App author bumps the manifest version constraint and re-publishes;
+`tessera-import` re-runs the install in the jail with the new
+constraint. Standard atrium-package-upgrade story; doesn't need
+special pool-update tooling.
+
+For ad-hoc security updates (CVE drops on openssl): users can
+either wait for app authors to bump constraints, or trigger a
+"refresh installed packages" sweep via `portcullis pkg refresh`
+that re-runs `pkg upgrade` inside each app's jail (subject to
+the constraint in the manifest). All standard.
 
 ### Trust model
 
-- Packages are signed by the FreeBSD pkg infrastructure; pool
-  install verifies signatures.
-- The install-jail has no access to anything outside the pool
-  directory + network.
-- An installed package's files are read-only from app jails (the
-  nullfs mount is read-only). Apps can't tamper with the pool.
-- Pool corruption affects all apps using the corrupted package;
-  recovery is `portcullis pool reinstall <pkg>`.
+- Packages are pkg-signed; signature verification happens
+  per-install (standard pkg behaviour).
+- Install runs in the app's own jail with a transient network
+  capability — install-time access to pkg repos doesn't expand
+  the app's runtime capabilities.
+- A compromised package compromises the apps that installed it,
+  same as on any FreeBSD system. Tessera CAS doesn't add or
+  remove this risk.
 
-### What about transitive dependencies?
+### Transitive dependencies
 
-`pkg install openssl` may auto-install libfoo, libbar via pkg's
-own dependency resolution. Two options:
+`pkg install openssl` auto-installs its closure (libfoo, libbar,
+etc.) via pkg's own dependency resolution. The app gets
+everything it needs — no special handling required from
+Portcullis. The recorded "what's installed" lives in the jail's
+pkg DB; users can `portcullis describe <app>` to see it.
 
-1. **Implicit:** pool install runs `pkg install` and accepts the
-   full closure. The app's nullfs mount only exposes `openssl`
-   files; transitive deps live in the pool but aren't visible to
-   the app unless the app declared them too. Result: app's
-   binary may fail to find a transitive lib it links against.
-2. **Explicit:** Portcullis computes the transitive closure
-   from pkg's metadata at manifest-validation time, and either
-   (a) errors with "you forgot to declare libfoo" or
-   (b) auto-mounts the closure.
+### Why per-jail install over a host-side pool
 
-Phase-1 picks **2(b)** — auto-mount the transitive closure but
-record it so users see what they got. The manifest can opt out
-(`packages.freebsd.libfoo = false`) to deliberately exclude.
+The original design (early 2026-05-03 draft) proposed a host-side
+package pool with nullfs mounts into jails. Trade-off analysis:
+
+| | Pool | Per-jail install + shared cache |
+|---|---|---|
+| `pkg install` runs | 1 per (pkg, ver) | N per N jails |
+| Storage on disk | 1 copy via mounts | 1 copy via Tessera CAS |
+| Network fetches | 1 per (pkg, ver) | 1 per (pkg, ver) (cache) |
+| Architectural complexity | high | low |
+| App's view | bespoke mount layout | normal pkg layout |
+| `pkg info` inside jail | doesn't work | works |
+| Multi-version | per-(pkg, ver) dirs | per-jail DBs |
+| Conflict resolution | needed (pool overlap) | none — each jail isolated |
+
+Storage outcome is identical (Tessera CAS handles dedup either
+way). Install-time cost differs (N × seconds vs. 1 × seconds) but
+amortizes to nothing for steady-state usage. Complexity cost of
+the pool design is real and ongoing.
+
+**Per-jail install + shared fetch cache wins** on simplicity for
+identical storage outcome.
 
 ## 4. Jail filesystem layout
 
-Per-app jail at `/var/lib/atrium/jails/<app.id>/`:
+### 4.1 Single shared Tessera volume
+
+**All Atrium jails are subtrees of one underlying Tessera volume,
+not separate per-jail volumes.** This is the load-bearing
+architectural choice that makes cross-jail dedup work:
+
+- Tessera's CAS layer (pack registry, blob hashes, dedup) is
+  per-volume.
+- Two subtrees of the same volume → blobs are shared via the same
+  pack registry → cross-jail dedup is automatic and total.
+- Two separate volumes → blobs are independently stored → zero
+  cross-volume dedup.
+
+The shared volume lives at `/var/lib/atrium/store.tessera`
+(or wherever the host installer puts it). All jails' rootfs +
+overlay + (per-app pkg-installed files) are subtrees inside
+this single volume.
+
+### 4.2 Per-jail subtree
+
+Per-app jail at `/var/lib/atrium/jails/<app.id>/` (a subtree of
+the shared Tessera volume, NOT a separate Tessera image):
 
 ```
 /var/lib/atrium/jails/org.atrium.edit/
@@ -325,10 +340,45 @@ Inside the jail, the app sees a normal-looking root with:
 /dev             ← devfs limited by ruleset matching capabilities
 /home/<user>     ← the per-app home (overlay/home from above)
 /tmp             ← per-app tmp (overlay/tmp)
-/usr/local/lib   ← symlink-tree to declared FreeBSD packages in the pool
+/usr/local/lib   ← populated by per-jail `pkg install` (see §3.4); files dedup'd by Tessera CAS
 /usr/local/include
 /usr/local/share/...
 ```
+
+### 4.3 Lifecycle vs. dedup safety
+
+A common worry: "if I close app A, do its files (which app B
+might be sharing via dedup) disappear?"
+
+Answer: **no, never accidentally.** The mechanics:
+
+| Event | Mounts | A's subtree | Shared blob refs |
+|---|---|---|---|
+| App A jail stopped (`jail -r`) | Unmounted | Persists in Tessera | Unchanged (A still references) |
+| App A jail re-launched | Re-mounted | Same files visible | Unchanged |
+| App A uninstalled (`portcullis remove`) | Already stopped | Deleted (subtree removed from Tessera) | Decrement; zero-ref blobs become GC-eligible |
+| App B uninstalled later | — | Deleted | Refs reach 0 for blobs only B held → GC eventually reclaims |
+
+The key invariant: **Tessera GC only touches blobs whose refcount
+reaches zero.** A blob still referenced by ANY live inode (in any
+subtree on the volume) cannot be reclaimed. So:
+
+- Stopping a jail = unmounting a view; the underlying data is
+  unchanged. Other jails are unaffected.
+- Uninstalling an app = deleting its subtree; only blobs that
+  were unique to that app become reclaimable.
+- Shared blobs (`/usr/local/lib/libssl.so.3` referenced by both
+  A's and B's pkg-installed copies) remain on disk as long as
+  ANY app references them.
+
+This works because Tessera's GC walks the live-inode set and
+marks all reachable packs; unreachable packs are reclaimed.
+There is no path by which "app A stops" can remove a blob that
+"app B is using."
+
+(Tested behaviour, not theoretical — `tessera-import` re-import
+measurements land 9.6× dedup with both source trees intact;
+`data_gc_test` in `scratch/` covers GC correctness.)
 
 ## 5. Capability → jail config translation
 
@@ -367,12 +417,14 @@ network = "full"
       filtering by pf if configured)
 
 [packages.freebsd] openssl = "3.0", libxml2 = "*", ...
-  →  resolve each constraint against pool inventory
-  →  compute transitive closure via pkg metadata
-  →  generate symlink tree at overlay/state/pkg-symlinks/
-     pointing at /var/db/atrium/pkg-pool/files/<pkg>/<v>/
-  →  mount.nullfs += "<symlink-tree>/usr/local /usr/local"
-     (the app's binary then finds libs at standard paths)
+  →  at install (tessera-import) or first launch:
+       jail -c (transient install jail w/ network) command=
+         /usr/sbin/pkg install -y openssl libxml2
+       PKG_CACHEDIR=/var/cache/atrium/pkg  (shared across jails)
+  →  pkg writes files into the jail's rootfs+overlay (same
+     Tessera volume → identical files dedup automatically)
+  →  no extra mount needed; app sees normal pkg-installed
+     /usr/local layout
 ```
 
 The complete table lives in `portcullis/src/capabilities.rs`
@@ -600,17 +652,20 @@ Order matches risk (smallest blast radius first):
 - Implements the lifecycle in §6 end-to-end.
 - ~1 week.
 
-**Phase 4.5 — pkg pool.**
-- `portcullis pool {install,update,gc,list}` CLI for managing the
-  pool. `tessera-import` integration: reads `[packages.freebsd]`
-  from manifest, ensures pool entries exist before publishing the
-  app tree.
-- Per-package symlink-tree generator (caches in app overlay).
-- Manifest validation: resolve version constraints, compute
-  transitive closures via pkg metadata.
-- Pool-side garbage collection: walk all installed app
-  manifests; drop pool entries with zero refs.
-- ~1 wk.
+**Phase 4.5 — pkg dependency installer.**
+- `tessera-import` integration: reads `[packages.freebsd]`,
+  spawns a transient install-jail per app to run `pkg install`
+  with shared `PKG_CACHEDIR=/var/cache/atrium/pkg/`.
+- Network-only-during-install capability (transient ip4/vnet
+  for the install jail; dropped after).
+- `portcullis pkg {refresh,info}` CLI: refresh re-runs
+  `pkg upgrade` inside each app's jail subject to its
+  manifest constraints; info reports what's installed per app.
+- No symlink-tree synthesis, no pool conflict resolution, no
+  bespoke pool format — pkg's own database is the source of
+  truth inside each jail. Tessera CAS does the cross-jail
+  dedup transparently.
+- ~½ wk.
 
 **Phase 5 — capability prompt UI.**
 - A minimal `atrium-prompt` service (or wired into Forum once
@@ -668,20 +723,21 @@ D2.5 is "complete" when an end-to-end demo works:
   Multi-user would mean per-user `/atrium/sockets/` namespaces
   (e.g. `/atrium/sockets/<uid>/clipboard.sock`). Defer; current
   design mounts the singleton path.
-- **Pool-vs-rootfs file conflicts:** if an app's own rootfs ships
-  a libssl AND the manifest declares `openssl` from pkg, which
-  wins? Phase 4.5 design: error at install time ("ambiguous —
-  pick one"). Apps that want to ship vendored libs declare nothing
-  in `[packages.freebsd]`; apps that want pool deps don't ship
-  libs in their tree.
+- **App ships own libssl AND declares pkg openssl:** standard
+  pkg-on-FreeBSD precedence applies (vendored copies in the
+  app's rootfs win over /usr/local/lib/ files placed by pkg
+  install in the same jail). Documented as "pick one" but not
+  a structural conflict.
 - **Custom pkg repos:** an app needs something not in FreeBSD's
   main repo. Probably allow `[packages.<repo>]` keys with
   per-repo URL config; defer implementation until first user
   asks.
-- **Pool security updates:** how does Atrium know to pull a new
-  openssl when a CVE drops? Either a periodic `portcullis pool
-  refresh` (cron) or hooked to the FreeBSD security advisory
-  feed. Defer to operations layer.
-- **What about ports vs binary pkg:** for now, binary-only.
-  Building from ports would require a heavier tool chain in the
-  install jail; not worth the complexity for D2.5.
+- **Security updates:** how does Atrium know to pull a new
+  openssl when a CVE drops? `portcullis pkg refresh` re-runs
+  `pkg upgrade` inside each app's jail (subject to manifest
+  constraints). Either invoked manually, on a cron, or hooked
+  to the FreeBSD security advisory feed. Defer scheduling
+  policy to the operations layer.
+- **Ports vs binary pkg:** binary only for D2.5. Building from
+  ports would need ports tree + build toolchain in install jail;
+  not worth the complexity early.
