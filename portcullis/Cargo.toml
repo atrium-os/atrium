@@ -7,6 +7,7 @@ members = [
     "portcullis-ipc",
     "portcullis-cli",
     "portcullisd",
+    "atrium-session",
 ]
 
 [workspace.package]

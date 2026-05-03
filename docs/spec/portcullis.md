@@ -1037,10 +1037,19 @@ Order matches risk (smallest blast radius first):
   pulling in nix/passfd as a dep). Verified with a 3-fd
   pipe-pair round-trip test.
 
-  *Step 3 (pending):* Build the session jail composer:
-  read-only nullfs of the host base + per-user overlay for
-  /home + bind-mount of /var/lib/atrium/apps as /apps + the
-  portcullisd socket at /atrium/sockets/portcullis.sock.
+  *Step 3 (landed):* `atrium-session` crate. Composes a per-user
+  session jail under /var/lib/atrium/sessions/<user>/ with
+  selective host base bind-mounts (/bin, /sbin, /lib, /libexec,
+  /usr — NOT /etc, /var, /home, /root), a writable per-user
+  overlay over the union, /apps as a read-only view of installed
+  apps, and /atrium/sockets/ bind-mounted so the in-jail CLI
+  reaches portcullisd.
+
+  Subcommands: `render`, `create`, `destroy`. `persist=true`
+  jail (lifecycle decoupled from the shell process); login(8)
+  in step 4 will `jexec` zsh into the running jail. Curated
+  /etc tree (passwd/group/zshrc/login.conf) deferred to the
+  login-wiring step.
 
   *Step 4 (pending):* Login integration via login.conf or a
   small pam_atrium / nologin-style wrapper that creates the
