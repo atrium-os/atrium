@@ -1,0 +1,14 @@
+[package]
+name        = "portcullis-policy"
+version.workspace     = true
+edition.workspace     = true
+license.workspace     = true
+repository.workspace  = true
+description = "Per-user capability grant policy for Portcullis. policy.toml load/save + manifest-vs-grant delta computation."
+
+[dependencies]
+portcullis-toml = { path = "../portcullis-toml" }
+serde           = { version = "1", features = ["derive"] }
+toml            = "0.8"
+sha2            = "0.10"
+hex             = "0.4"

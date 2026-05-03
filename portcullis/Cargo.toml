@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "portcullis-toml",
     "portcullis-jail",
+    "portcullis-policy",
     "portcullis-cli",
 ]
 

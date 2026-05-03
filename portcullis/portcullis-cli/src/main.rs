@@ -38,6 +38,20 @@ usage:
         is currently running. Pass --keep-overlay to preserve user
         state across reinstall.
 
+    portcullis policy show [<app-id>]
+        Print the per-user policy file (or one app's grants).
+
+    portcullis policy diff <app-id>
+        Show what the installed app's manifest asks for that the
+        policy hasn't granted (the prompt the user would see).
+
+    portcullis policy grant <app-id>
+        Grant ALL capabilities the app's manifest declares. Phase 4
+        bootstrap: replaces the prompt UI until portcullisd lands.
+
+    portcullis policy revoke <app-id>
+        Drop the grant record for an app id (next launch re-prompts).
+
         Phase 2/3a dev mode — no policy/prompt mediation, no
         per-instance overlay yet (single instance per app).
 ");
@@ -78,6 +92,10 @@ fn main() -> ExitCode {
         "status" => {
             if args.len() != 2 { usage(); }
             cmd_status()
+        }
+        "policy" => {
+            if args.len() < 3 { usage(); }
+            cmd_policy(&args[2..])
         }
         "remove" => {
             let mut keep_overlay = false;
@@ -344,6 +362,180 @@ fn teardown(jail_path: &Path) {
     let _ = umount(jail_path);  /* unionfs */
     let _ = umount(jail_path);  /* nullfs */
 }
+
+// ── policy subcommands ───────────────────────────────────────────
+
+/// Resolve the current user's name for the policy file path.
+/// Falls back to "atrium" when neither USER nor LOGNAME is set
+/// (e.g. headless cron contexts) — the file will then be at
+/// /var/db/atrium/atrium/policy.toml.
+fn current_user() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "atrium".into())
+}
+
+/// Read + parse an app's manifest given its id (uses APPS_DIR).
+/// Returns (raw_text, parsed_manifest) since the policy delta needs
+/// the raw bytes for hashing.
+fn load_app_manifest(app_id: &str) -> Result<(String, portcullis_toml::Manifest), String> {
+    if !looks_like_app_id(app_id) {
+        return Err(format!("{app_id:?} is not a valid app id"));
+    }
+    let path = PathBuf::from(APPS_DIR).join(app_id).join("atrium.toml");
+    let text = fs::read_to_string(&path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let m = portcullis_toml::Manifest::from_str(&text)
+        .map_err(|e| format!("{}: parse error: {e}", path.display()))?;
+    Ok((text, m))
+}
+
+fn cmd_policy(args: &[String]) -> ExitCode {
+    let sub = args[0].as_str();
+    let rest = &args[1..];
+    match sub {
+        "show"   => policy_show(rest),
+        "diff"   => policy_diff(rest),
+        "grant"  => policy_grant(rest),
+        "revoke" => policy_revoke(rest),
+        other => {
+            eprintln!("portcullis policy: unknown action {other:?}");
+            usage();
+        }
+    }
+}
+
+fn policy_show(args: &[String]) -> ExitCode {
+    let path = portcullis_policy::Policy::user_path(&current_user());
+    let policy = match portcullis_policy::Policy::load(&path) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("portcullis policy show: {}: {e}", path.display());
+            return ExitCode::from(1);
+        }
+    };
+
+    if args.is_empty() {
+        println!("# {}", path.display());
+        if policy.grants.is_empty() {
+            println!("(no grants yet)");
+            return ExitCode::SUCCESS;
+        }
+        for (id, g) in &policy.grants {
+            println!("\n[{id}]");
+            println!("  granted_at = {}", g.granted_at);
+            println!("  manifest_hash = {}", g.manifest_hash);
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    let id = &args[0];
+    match policy.grants.get(id) {
+        None => {
+            eprintln!("no grant for {id}");
+            ExitCode::from(1)
+        }
+        Some(g) => {
+            print!("{}", g.to_toml_string());
+            ExitCode::SUCCESS
+        }
+    }
+}
+
+fn policy_diff(args: &[String]) -> ExitCode {
+    if args.len() != 1 {
+        eprintln!("usage: portcullis policy diff <app-id>");
+        return ExitCode::from(2);
+    }
+    let id = &args[0];
+    let (text, manifest) = match load_app_manifest(id) {
+        Ok(t) => t,
+        Err(e) => { eprintln!("{e}"); return ExitCode::from(1); }
+    };
+
+    let path = portcullis_policy::Policy::user_path(&current_user());
+    let policy = match portcullis_policy::Policy::load(&path) {
+        Ok(p) => p,
+        Err(e) => { eprintln!("{}: {e}", path.display()); return ExitCode::from(1); }
+    };
+
+    let current_hash = portcullis_policy::hash_manifest(text.as_bytes());
+    let prior        = policy.grants.get(id);
+    let delta = portcullis_policy::compute_delta(
+        &manifest.capabilities,
+        prior.map(|g| &g.capabilities),
+        prior.map(|g| g.manifest_hash.as_str()),
+        &current_hash,
+    );
+
+    if delta.is_empty() {
+        println!("{id}: all requested capabilities already granted");
+        return ExitCode::SUCCESS;
+    }
+    println!("{id} wants:");
+    for line in delta.describe() {
+        println!("  - {line}");
+    }
+    /* Exit 1 so scripts can detect "needs-prompt" without parsing. */
+    ExitCode::from(1)
+}
+
+fn policy_grant(args: &[String]) -> ExitCode {
+    if args.len() != 1 {
+        eprintln!("usage: portcullis policy grant <app-id>");
+        return ExitCode::from(2);
+    }
+    let id = &args[0];
+    let (text, manifest) = match load_app_manifest(id) {
+        Ok(t) => t,
+        Err(e) => { eprintln!("{e}"); return ExitCode::from(1); }
+    };
+
+    let path = portcullis_policy::Policy::user_path(&current_user());
+    let mut policy = match portcullis_policy::Policy::load(&path) {
+        Ok(p) => p,
+        Err(e) => { eprintln!("{}: {e}", path.display()); return ExitCode::from(1); }
+    };
+
+    let grant = portcullis_policy::Grant {
+        manifest_hash: portcullis_policy::hash_manifest(text.as_bytes()),
+        granted_at:    portcullis_policy::now_iso8601(),
+        capabilities:  manifest.capabilities.clone(),
+    };
+    policy.grants.insert(id.clone(), grant);
+
+    if let Err(e) = policy.save(&path) {
+        eprintln!("save {}: {e}", path.display());
+        return ExitCode::from(1);
+    }
+    println!("granted all capabilities to {id} → {}", path.display());
+    ExitCode::SUCCESS
+}
+
+fn policy_revoke(args: &[String]) -> ExitCode {
+    if args.len() != 1 {
+        eprintln!("usage: portcullis policy revoke <app-id>");
+        return ExitCode::from(2);
+    }
+    let id = &args[0];
+    let path = portcullis_policy::Policy::user_path(&current_user());
+    let mut policy = match portcullis_policy::Policy::load(&path) {
+        Ok(p) => p,
+        Err(e) => { eprintln!("{}: {e}", path.display()); return ExitCode::from(1); }
+    };
+    if policy.grants.remove(id).is_none() {
+        eprintln!("no grant to revoke for {id}");
+        return ExitCode::from(1);
+    }
+    if let Err(e) = policy.save(&path) {
+        eprintln!("save {}: {e}", path.display());
+        return ExitCode::from(1);
+    }
+    println!("revoked grant for {id}");
+    ExitCode::SUCCESS
+}
+
+// ── jail status helpers ──────────────────────────────────────────
 
 /// True if a jail with this name is currently running.
 /// Uses `jls -j <name>` (exit 0 = exists). Stderr suppressed because

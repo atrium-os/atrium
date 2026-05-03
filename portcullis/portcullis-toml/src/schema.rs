@@ -11,7 +11,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -40,7 +40,7 @@ pub struct AppSection {
 /// `extra` captures unknown keys for the validator to warn about
 /// without rejecting (forward compat). All known capability keys
 /// are explicit fields.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct Capabilities {
     pub graphics:   Option<String>,             /* "fresco" today */
     pub clipboard:  Option<bool>,
@@ -62,7 +62,7 @@ pub struct Capabilities {
     pub extra:      BTreeMap<String, toml::Value>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NetworkCap {
     None,
@@ -70,7 +70,7 @@ pub enum NetworkCap {
     Full,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FontsCap {
     pub mode:  String,        /* "read-only" today */
