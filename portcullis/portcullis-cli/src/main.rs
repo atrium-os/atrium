@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-use portcullis_jail::{build, BuildOpts};
+use portcullis_jail::{build, jail_name_from_app_id, BuildOpts};
 
 fn usage() -> ! {
     eprintln!("\
@@ -28,6 +28,15 @@ usage:
             - If it looks like an app id (lowercase + dots/hyphens),
               resolved to /var/lib/atrium/apps/<id>/.
             - Otherwise treated as a path.
+
+    portcullis status
+        List installed apps and which jails are currently running.
+
+    portcullis remove [--keep-overlay] <app-id>
+        Uninstall an app: removes /var/lib/atrium/apps/<id>/ and (by
+        default) /var/lib/atrium/overlays/<id>/. Refuses if the jail
+        is currently running. Pass --keep-overlay to preserve user
+        state across reinstall.
 
         Phase 2/3a dev mode — no policy/prompt mediation, no
         per-instance overlay yet (single instance per app).
@@ -65,6 +74,26 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
             cmd_launch(t, dry_run)
+        }
+        "status" => {
+            if args.len() != 2 { usage(); }
+            cmd_status()
+        }
+        "remove" => {
+            let mut keep_overlay = false;
+            let mut id: Option<&str> = None;
+            for a in &args[2..] {
+                match a.as_str() {
+                    "--keep-overlay" => keep_overlay = true,
+                    other if other.starts_with("--") => {
+                        eprintln!("unknown flag: {other}");
+                        usage();
+                    }
+                    other => id = Some(other),
+                }
+            }
+            let Some(id) = id else { usage() };
+            cmd_remove(id, keep_overlay)
         }
         "--help" | "-h" => usage(),
         other => {
@@ -316,5 +345,111 @@ fn teardown(jail_path: &Path) {
     let _ = umount(jail_path);  /* nullfs */
 }
 
-#[allow(dead_code)]
-fn assert_path_exists(p: &Path) -> bool { p.exists() }
+/// True if a jail with this name is currently running.
+/// Uses `jls -j <name>` (exit 0 = exists). Stderr suppressed because
+/// "jail not found" is a normal expected condition, not an error.
+fn jail_is_running(jail_name: &str) -> bool {
+    Command::new("jls")
+        .arg("-j").arg(jail_name)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn cmd_status() -> ExitCode {
+    let apps_dir = PathBuf::from(APPS_DIR);
+    let entries = match fs::read_dir(&apps_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!("(no apps installed — {} does not exist)", APPS_DIR);
+            return ExitCode::SUCCESS;
+        }
+        Err(e) => {
+            eprintln!("portcullis status: {}: {e}", apps_dir.display());
+            return ExitCode::from(1);
+        }
+    };
+
+    let mut ids: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    ids.sort();
+
+    if ids.is_empty() {
+        println!("(no apps installed)");
+        return ExitCode::SUCCESS;
+    }
+
+    println!("{:<40} {:<8} {}", "APP ID", "STATE", "OVERLAY");
+    for id in &ids {
+        let jname = jail_name_from_app_id(id);
+        let state = if jail_is_running(&jname) { "running" } else { "stopped" };
+        let overlay = PathBuf::from(OVERLAYS_DIR).join(id);
+        let overlay_state = if overlay.exists() {
+            format!("{}", overlay.display())
+        } else {
+            "—".to_string()
+        };
+        println!("{:<40} {:<8} {}", id, state, overlay_state);
+    }
+    ExitCode::SUCCESS
+}
+
+fn cmd_remove(app_id: &str, keep_overlay: bool) -> ExitCode {
+    /* Sanity: id must look like an app id, not a path. Avoid
+     * `portcullis remove ../foo` style accidents. */
+    if !looks_like_app_id(app_id) {
+        eprintln!("portcullis remove: {app_id:?} is not a valid app id");
+        return ExitCode::from(2);
+    }
+
+    let app_dir     = PathBuf::from(APPS_DIR).join(app_id);
+    let overlay_dir = PathBuf::from(OVERLAYS_DIR).join(app_id);
+    let jail_path   = PathBuf::from(JAILS_DIR).join(app_id);
+
+    if !app_dir.exists() && !overlay_dir.exists() {
+        eprintln!("portcullis remove: {app_id} not installed");
+        return ExitCode::from(1);
+    }
+
+    let jname = jail_name_from_app_id(app_id);
+    if jail_is_running(&jname) {
+        eprintln!("portcullis remove: jail {jname:?} is currently running; \
+                   stop it first (jail -r {jname})");
+        return ExitCode::from(1);
+    }
+
+    /* Defensive: if a previous launch crashed, the union mount may
+     * still be live even though no jail process is running. Tear it
+     * down so rmdir doesn't fail with EBUSY. */
+    if jail_path.exists() {
+        let _ = umount_silent(&jail_path.join("dev"));
+        let _ = umount_silent(&jail_path);
+        let _ = umount_silent(&jail_path);
+        let _ = fs::remove_dir(&jail_path);
+    }
+
+    if app_dir.exists() {
+        if let Err(e) = fs::remove_dir_all(&app_dir) {
+            eprintln!("portcullis remove: {}: {e}", app_dir.display());
+            return ExitCode::from(1);
+        }
+        println!("removed {}", app_dir.display());
+    }
+
+    if !keep_overlay && overlay_dir.exists() {
+        if let Err(e) = fs::remove_dir_all(&overlay_dir) {
+            eprintln!("portcullis remove: {}: {e}", overlay_dir.display());
+            return ExitCode::from(1);
+        }
+        println!("removed {}", overlay_dir.display());
+    } else if keep_overlay && overlay_dir.exists() {
+        println!("kept {} (--keep-overlay)", overlay_dir.display());
+    }
+
+    ExitCode::SUCCESS
+}
