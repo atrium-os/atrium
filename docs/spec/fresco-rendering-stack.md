@@ -247,16 +247,18 @@ evaluate animations parameterised by the current frame, cull against
 clip rects, and decide which ops to dispatch. That traversal is its
 own architectural decision.
 
-**Decision: traversal runs on the GPU**, in a compute pass that
-reads a CAS-resident scene buffer and writes per-batch instance
-buffers + counts consumed by the render pass via indirect-instanced
-draws. The fresco-server core dispatches one compute kernel + one
-render pass per frame; per-frame host→GPU traffic is bounded by the
-frame counter and any structural deltas (~tens of bytes for the
-common case of stable scene structure with animation parameters).
-Engine extensions themselves keep their host-side shape — they emit
-SPIR-V/Vulkan against composed parameters supplied by the compute
-output.
+**Decision: traversal runs on the GPU via per-frame compute
+dispatch**, in a compute pass that reads a CAS-resident scene buffer
+and writes per-batch instance buffers + counts consumed by the render
+pass via indirect-instanced draws. The fresco-server core dispatches
+one compute kernel + one render pass per frame; per-frame host→GPU
+traffic is bounded by the frame counter and any structural deltas
+(~tens of bytes for the common case of stable scene structure with
+animation parameters). Engine extensions themselves keep their
+host-side shape — they emit SPIR-V/Vulkan against composed parameters
+supplied by the compute output. (Persistent megakernels — see below —
+are explicitly deferred; "GPU traversal" here means per-frame compute
+dispatch, not a long-running kernel.)
 
 This decision is settled by two benchmarks:
 
@@ -290,8 +292,13 @@ bottom contract is Vulkan). Reasoning, not measurement:
   real cross-bus transfer in the critical path of every frame —
   either with sync-stall risk or double-buffered staging eating
   bandwidth otherwise available for asset streaming. The 240,000×
-  ratio that read as "interesting" on UMA reads as load-bearing
-  on discrete.
+  ratio that read as "interesting" on UMA becomes
+  **latency- and energy-load-bearing** on discrete: each frame's
+  upload adds µs to the host→GPU critical path before any compute
+  or render work can start, and PCIe transfers cost real package
+  power at scale. (Bandwidth itself is not saturated — 4.8 MB/frame
+  at 60 fps is ~0.9% of PCIe 4.0 x16 — the cost is per-transfer
+  fixed overhead and energy, not throughput.)
 - **Host-CPU axis is unchanged.** The host walks the scenegraph at
   the same speed regardless of GPU topology.
 - **Frame-time axis depends on rasterizer-vs-compute throughput
@@ -299,18 +306,30 @@ bottom contract is Vulkan). Reasoning, not measurement:
   shrink, but the host path now contains a real PCIe round-trip
   the GPU has to wait for. Likely tilts further toward the GPU
   path at large N, not less.
-- **Driver-maturity caveat.** Vulkan's
-  `VK_EXT_device_generated_commands` (the indirect-instanced
-  equivalent) is best-supported on NVIDIA, present on AMD, weakest
-  on Intel/Linux. Implementation risk is real but doesn't change
-  the architectural direction.
+- **No exotic-extension dependency.** v2's pattern is "compute
+  kernel writes instance buffer + count → render pass consumes via
+  `vkCmdDrawIndexedIndirect` (or `vkCmdDrawIndexedIndirectCount`
+  for the count-buffer variant)." Both are core Vulkan 1.0 / 1.2
+  respectively, available on every conformant Vulkan
+  implementation. We deliberately do NOT depend on the more
+  experimental `VK_EXT_device_generated_commands` (GPU-encoded
+  command buffers) — v1's NO-GO already established that
+  per-leaf GPU command encoding is the wrong pattern. Driver-
+  maturity risk for our pattern is therefore low; the compute +
+  indirect-draw path is among the most exercised in any Vulkan
+  driver.
 
 We do not re-bench on Vulkan/discrete before locking the
 architectural decision. We do plan to validate via a Vulkan port
-of v2 (~2–3 days) ahead of any production Fresco runtime targeting
-non-Apple hardware, so we have one real number for the most likely
-external consumer (Linux + NVIDIA) before perf incidents make us
-re-derive it under pressure.
+of v2 ahead of any production Fresco runtime targeting non-Apple
+hardware, so we have one real number for the most likely external
+consumer (Linux + NVIDIA) before perf incidents make us re-derive
+it under pressure. Realistic budget: **~1 week with an existing
+Vulkan template (`vulkano` / `vulkan-rs` / a cribbed
+`vulkan-tutorial` setup), 1–2 weeks from scratch** — Vulkan's
+boilerplate (instance + device + swapchain + descriptor sets +
+pipeline layout + MSL→SPIR-V cross-compile) is real work even
+for a port of an already-designed benchmark.
 
 #### Persistent megakernel (Path C) — explicitly deferred
 
@@ -371,18 +390,28 @@ Scope:
 - **GPU-side scenegraph traversal** per §3.6: CAS-resident scene
   buffer, per-frame compute kernel composing transforms / animation
   / culling, indirect-instanced render pass consuming compute output.
-  Path H_gcd4-equivalent (CPU-side traversal) kept available behind
-  a compile-time flag as the correctness reference and as the
-  fallback for debugging compute-shader regressions.
+  Path H_gcd4-equivalent (CPU-side traversal) kept available as a
+  **runtime fallback** (selectable via `FRESCO_TRAVERSAL=cpu` env
+  or equivalent compositor config) and as the correctness reference
+  for golden-image tests. Always compiled in — its size cost is
+  negligible against the rest of fresco-server, and having it
+  available at runtime turns a GPU-compute regression into "user
+  flips a switch and reports a bug" rather than "compositor stops
+  working."
+- Headless / no-GPU contexts (CI golden-image tests, server-side
+  rendering for remote display, bring-up on hardware without
+  working Vulkan) use the same CPU traversal path feeding
+  tiny-skia rasterization (extending Phase 1's existing fallback
+  rather than introducing a third path).
 - Output to scanout (initially via virtio-gpu in the VM; later via
-  KMS-equivalent on real hardware)
-- Software fallback (tiny-skia) when no Vulkan device is available
+  KMS-equivalent on real hardware).
 
 Estimated effort: ~3-4 weeks for a working but unoptimized version
-on the FreeBSD VM with virtio-gpu Vulkan. Add ~3 days for a Vulkan
-port of bench-fresco-runtime v2 to validate the v2 verdict on
-Linux+NVIDIA before production traffic hits non-Apple hardware (per
-§3.6 cross-platform note).
+on the FreeBSD VM with virtio-gpu Vulkan. Add **~1 week** for a
+Vulkan port of bench-fresco-runtime v2 to validate the v2 verdict
+on Linux+NVIDIA before production traffic hits non-Apple hardware
+(per §3.6 cross-platform note; longer if no Vulkan template is
+already at hand).
 
 ### Phase 3 (later): extension ABI + first non-core extension
 Define the C ABI for engine extensions, the manifest format, the
