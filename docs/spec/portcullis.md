@@ -106,9 +106,10 @@ command     = "scripts/firstrun.sh"
 timeout     = "120s"
 
 [setup.capabilities]              # only-during-setup overrides;
-network     = "full"              # any capability can be elevated; reverts
-                                  # to the runtime [capabilities] value
-                                  # after setup completes
+network     = "full"              # any capability can be overridden in
+                                  # either direction; reverts to the
+                                  # runtime [capabilities] value after
+                                  # setup completes
 
 [resources]                       # rctl-enforced limits, optional
 memory      = "512M"
@@ -172,8 +173,10 @@ timeout = "120s"                  # fail if it hangs
 
 [setup.capabilities]              # only-during-setup overrides
 network = "full"                  # uses the same capability vocabulary
-                                  # as [capabilities]; reverts to the
-                                  # runtime value after setup completes
+                                  # as [capabilities]; bidirectional
+                                  # (setup may have MORE or LESS than
+                                  # runtime); reverts to the runtime
+                                  # value after setup completes
 ```
 
 ### Mechanics
@@ -199,34 +202,45 @@ app's overlay (Tessera-backed; cross-jail dedup'd by content).
 
 Capability resolution is straightforward:
 - During the setup phase: merge `[setup.capabilities]` over
-  `[capabilities]` (overrides win); the resulting set is what
-  the jail sees.
+  `[capabilities]` (overrides win, in either direction); the
+  resulting set is what the jail sees.
 - After setup completes: revert to plain `[capabilities]`.
+
+The override is bidirectional. Common pattern: setup needs
+network for `pkg install`, runtime doesn't. Less common but
+valid: setup is purely local config-file generation and
+deliberately drops the network the runtime app uses, as a
+defense-in-depth measure against compromised setup scripts.
 
 There's no separate vocabulary for setup-only flags — the same
 capability keys mean the same thing in both contexts. A user
-prompt at first install shows both phases distinctly:
+prompt at first install shows the runtime set + a diff for
+setup, regardless of override direction:
 
 ```
 "Atrium Edit" wants:
 
-  Always (every launch):
+  Runtime (every launch):
       ✓ Display (Fresco)
       ✓ Clipboard
       ✓ Notifications
       ✓ Read/write your Documents folder
+      ✗ No network
 
-  Plus during one-time first-run setup:
-      ✓ Network access (overrides "none" → "full")
+  During one-time first-run setup, these change:
+      network: none → full     (additional access)
 
 [Allow once]   [Allow always]   [Deny]
 ```
 
-After setup exits cleanly, Portcullis tears down the
-elevated-capability jail and either re-creates the jail with
-runtime-only caps for the first real launch, or relies on
-jail.conf's exec.created vs exec.start phasing if the
-elevation can be expressed in one config block.
+(If a setup phase REDUCED something, the same diff format
+shows it — `filesystem: ["~/Documents"] → []` for example.)
+
+After setup exits cleanly, Portcullis tears down the setup-
+phase jail and re-creates the jail with runtime-only caps for
+the first real launch (or uses jail.conf's exec.created vs
+exec.start phasing if the override can be expressed in one
+config block).
 
 ### What apps typically do in setup
 
