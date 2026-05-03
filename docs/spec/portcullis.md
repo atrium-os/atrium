@@ -413,6 +413,124 @@ the pool design is real and ongoing.
 **Per-jail install + shared fetch cache wins** on simplicity for
 identical storage outcome.
 
+## 3.5 Using FreeBSD rc(8) inside the jail
+
+The jail is a normal FreeBSD environment. `/etc/rc`, `service(8)`,
+and the `rc.d` framework are all available — and recommended for
+apps with non-trivial structure (background services, multi-
+component setups, anything that wants supervision beyond a
+single foreground process).
+
+There's no Portcullis-specific schema for "this app uses rc."
+The atrium.toml fields `[setup].command` and `[app].entry` are
+plain shell invocations; rc patterns just slot in.
+
+### Three common shapes
+
+**Pattern A — single foreground binary (no rc).**
+
+```toml
+[app]
+entry = "bin/atrium-edit"
+```
+
+Portcullis execs the binary directly. Simplest case.
+
+**Pattern B — rc-managed services + foreground app.**
+
+App ships rc.d scripts in `usr/local/etc/rc.d/` (e.g.,
+`my-helper-daemon`). atrium.toml entry is the rc bringup wrapper,
+and the foreground app is the last step:
+
+```toml
+[app]
+entry = "bin/atrium-launch"   # tiny wrapper script
+```
+
+`bin/atrium-launch` is something like:
+
+```sh
+#!/bin/sh
+service my-helper-daemon onestart
+exec /usr/local/bin/myapp
+```
+
+Or, more rc-native, use a foreground rc.d script for the main
+app and let rc start everything:
+
+```toml
+[app]
+entry = "/usr/sbin/service"
+args  = ["myapp", "onestart-foreground"]
+```
+
+with the rc.d script using `command_args="-f"` (or similar) to
+keep its `command` in the foreground.
+
+**Pattern C — first-run via rc firstboot.**
+
+FreeBSD's `firstboot` mechanism marks rc.d scripts that should
+run only on first boot of a system. Place a sentinel touch in
+the app's overlay setup script:
+
+```toml
+[setup]
+command = "/etc/rc firstboot"
+timeout = "300s"
+
+[setup.capabilities]
+network = "full"   # for any pkg install rc.d scripts do
+```
+
+Apps' rc.d scripts opt into firstboot via:
+
+```sh
+# usr/local/etc/rc.d/atrium-edit-setup
+# PROVIDE: atrium-edit-setup
+# REQUIRE: NETWORKING firstboot
+# KEYWORD: firstboot
+
+. /etc/rc.subr
+name="atrium_edit_setup"
+start_cmd="atrium_edit_setup_start"
+atrium_edit_setup_start() {
+    pkg install -y openssl libxml2
+    /usr/local/bin/atrium-edit-init-config
+}
+load_rc_config $name
+run_rc_command "$1"
+```
+
+After `/etc/rc firstboot` runs, FreeBSD touches `/var/db/firstboot`
+inside the jail, marking it done. Portcullis writes its own
+sentinel `.atrium-firstrun-done` on top, so subsequent launches
+skip the setup phase entirely.
+
+### Why this matters
+
+- **Familiar.** FreeBSD admins already write rc.d scripts.
+  Atrium app authors get to use what they know.
+- **Composable.** Service dependencies (`# REQUIRE: foo bar`),
+  ordering (`# BEFORE: baz`), and lifecycle (`service foo
+  status/start/stop/restart`) all work.
+- **Logs.** rc.d output goes to standard FreeBSD logging; no
+  Atrium-specific log plumbing needed.
+- **No new framework.** Portcullis stays orthogonal — it just
+  runs commands. The orchestration richness comes from what's
+  already in the jail.
+
+### Caveats
+
+- Pattern A is fine and often best — don't add rc complexity
+  if a single binary suffices.
+- rc.d scripts that try to modify the host (loading kmods,
+  writing outside the jail) won't work, by design. The jail
+  forbids it.
+- Long-running rc-style services that should outlive the
+  foreground app need the `[supervision]` section to set
+  `keep-alive = true` so Portcullis doesn't tear down the jail
+  when the foreground process exits.
+
 ## 4. Jail filesystem layout
 
 ### 4.1 Single shared Tessera volume
