@@ -975,23 +975,23 @@ $VSSH "pw useradd atrium -m -G wheel -s /usr/local/bin/atrium-login -w no
 
 # 5. Enable + start portcullisd. Pre-creates /atrium/sockets/ and
 #    /var/lib/atrium/{apps,overlays,jails,sessions} on first start.
-$VSSH 'sysrc portcullisd_enable=YES portcullisd_user=atrium
+#    Daemon is multi-tenant: socket world-connectable (mode 0666),
+#    per-user authorization happens inside via getpeereid(2).
+$VSSH 'sysrc portcullisd_enable=YES
        service portcullisd start
        ls -la /atrium/sockets/portcullis.sock'
 
-# 6. (TEMPORARY) chmod the socket so non-root users can connect.
-#    Real fix is per-user portcullisd; until then this is a manual step.
-$VSSH 'chmod 666 /atrium/sockets/portcullis.sock'
-
-# 7. Verify: ssh in as atrium, run a smoke command.
+# 6. Verify: ssh in as atrium, run a smoke command.
 ssh -i ~/.ssh/fresco_bsd_ed25519 -p 2222 atrium@localhost <<'EOF'
 hostname    # should print "atrium-session" (the session jail's hostname)
-id          # uid=1000(atrium) — the in-jail uid (host uid is 1001)
+id          # uid=1001(atrium) — matches the host uid (atrium-session
+            # composes its in-jail passwd to mirror host uids so the
+            # daemon's getpeereid lookup resolves correctly)
 ls /apps    # the apps registry
 exit
 EOF
 
-# 8. Install a test app + launch via session jail to verify the
+# 7. Install a test app + launch via session jail to verify the
 #    SCM_RIGHTS pty handoff path:
 $VSSH 'mkdir -p /var/lib/atrium/apps/test.hello
        cp /rescue/sh /var/lib/atrium/apps/test.hello/sh
@@ -1020,8 +1020,8 @@ RUNME
 #     pid=<small number>
 ```
 
-Known papered-over issues (see commit 4e52f9d for the full list):
-- Daemon socket needs chmod 666 manually until per-user daemon lands.
+Known papered-over issues (see commits 4e52f9d, plus
+multi-tenancy fixes in the next commit):
 - /usr/local/etc/zshrc isn't installed yet; default zsh prompt fine.
 - App jails inherit no /etc, no /sbin — apps must bring their own
   binaries (or a curated etc); intentional sealed-app behaviour.

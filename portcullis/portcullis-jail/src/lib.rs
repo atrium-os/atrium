@@ -76,6 +76,13 @@ pub fn build(manifest: &Manifest, opts: &BuildOpts) -> Result<JailConfig, BuildE
      * looks in the SYSTEM passwd (host); false looks in the JAIL's
      * passwd (default for back-compat). We want the host lookup. */
     jc.set("exec.system_jail_user", Value::Bool(true));
+    /* exec.jail_user names the user the entry runs as inside the
+     * jail. Combined with exec.system_jail_user=true, jail(8) looks
+     * the name up in the HOST's passwd to get the uid, and the entry
+     * runs as that uid. portcullisd's per-user multi-tenancy passes
+     * the connecting user through opts.user_name and lands here, so
+     * an app launched by alice runs as uid(alice). */
+    jc.set("exec.jail_user", Value::String(opts.user_name.clone()));
     /* exec.start runs the app's entry. Inside the jail, rootfs is
      * mounted at /, so the manifest's relative entry path becomes
      * /<entry> in the jail's namespace.

@@ -413,16 +413,20 @@ impl SessionLayout {
          * (the 7-field POSIX view), which is what getpwnam(3)
          * actually reads. Plain /etc/passwd alone is NOT enough.
          *
-         * uid 1000 is a placeholder for in-jail name resolution;
-         * the actual uid jexec -U sets comes from the HOST's passwd
-         * (per the post-attach getpwnam path). For our test user
-         * "atrium" both happen to align (host=1001, jail=1000) but
-         * it doesn't matter because jexec uses the host lookup for
-         * the real setuid call. */
+         * Critical: the in-jail uid MUST match the host's uid for
+         * the same user. jexec(8) -U sets the in-jail uid from the
+         * jail's passwd (NOT the host's), and that uid is also what
+         * the kernel reports to peer processes (e.g., portcullisd
+         * on the host doing getpeereid on its socket). If the two
+         * passwds disagree, getpeereid → getpwuid_r on the host
+         * returns "not found" and the daemon refuses the connection.
+         * So look up the user's actual uid/gid on the host and use
+         * those values inside the curated passwd. */
+        let (uid, gid) = host_uid_gid(user)?;
         let home = format!("/home/{user}");
         let master_passwd = format!(
             "root:*:0:0::0:0:Charlie &:/root:/usr/local/bin/zsh\n\
-             {user}:*:1000:1000::0:0:Atrium User:{home}:/usr/local/bin/zsh\n");
+             {user}:*:{uid}:{gid}::0:0:Atrium User:{home}:/usr/local/bin/zsh\n");
         std::fs::write(self.curated_etc.join("master.passwd"), master_passwd)?;
         /* Compile master.passwd → pwd.db / spwd.db / passwd. pwd_mkdb
          * writes via temp+rename so it needs the dir writable;
@@ -438,7 +442,7 @@ impl SessionLayout {
 
         let group = format!(
             "wheel:*:0:root,{user}\n\
-             {user}:*:1000:\n");
+             {user}:*:{gid}:\n");
         std::fs::write(self.curated_etc.join("group"), group)?;
 
         let shells = "/usr/local/bin/zsh\n/bin/sh\n";
@@ -507,6 +511,30 @@ fn build_session_jail(user: &str) -> JailConfig {
 }
 
 // ── helpers ──────────────────────────────────────────────────────
+
+/// Look up (uid, gid) for `user` in the host's passwd. Used so the
+/// curated in-jail passwd matches host uids exactly — required for
+/// peer-cred lookups by host-side daemons (portcullisd) to resolve
+/// the connecting in-jail process to a real user.
+fn host_uid_gid(user: &str) -> std::io::Result<(u32, u32)> {
+    let cuser = std::ffi::CString::new(user)
+        .map_err(|e| std::io::Error::other(format!("user nul: {e}")))?;
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0u8 as libc::c_char; 4096];
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let r = unsafe {
+        libc::getpwnam_r(cuser.as_ptr(), &mut pwd, buf.as_mut_ptr(),
+                         buf.len(), &mut result)
+    };
+    if r != 0 {
+        return Err(std::io::Error::from_raw_os_error(r));
+    }
+    if result.is_null() {
+        return Err(std::io::Error::other(
+            format!("user {user:?} not in host passwd")));
+    }
+    Ok((pwd.pw_uid, pwd.pw_gid))
+}
 
 fn jail_is_running(jail_name: &str) -> bool {
     Command::new("jls")

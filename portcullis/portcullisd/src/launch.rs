@@ -56,7 +56,8 @@ pub struct LaunchOutcome {
 
 pub fn launch_with_stdio(
     app_id: &str,
-    stdio: Option<[OwnedFd; 3]>,
+    user:   &str,
+    stdio:  Option<[OwnedFd; 3]>,
 ) -> Result<LaunchOutcome, LaunchError> {
     let tree = PathBuf::from(APPS_DIR).join(app_id);
     if !tree.exists() {
@@ -80,13 +81,32 @@ pub fn launch_with_stdio(
     let overlay_dir = PathBuf::from(OVERLAYS_DIR).join(app_id);
     let jail_path   = PathBuf::from(JAILS_DIR).join(app_id);
 
+    /* The connecting user becomes the in-jail uid via exec.jail_user
+     * (set by portcullis-jail::build from opts.user_name). $HOME is
+     * the user's actual home on the host, used by ~/-prefixed
+     * filesystem capabilities. */
+    let user_home = match std::ffi::CString::new(user).ok().and_then(|cuser| {
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut buf = vec![0u8 as libc::c_char; 4096];
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        let r = unsafe {
+            libc::getpwnam_r(cuser.as_ptr(), &mut pwd, buf.as_mut_ptr(),
+                             buf.len(), &mut result)
+        };
+        if r != 0 || result.is_null() { None }
+        else {
+            let dir = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) };
+            Some(PathBuf::from(dir.to_string_lossy().into_owned()))
+        }
+    }) {
+        Some(h) => h,
+        None    => PathBuf::from(format!("/home/{user}")),
+    };
     let opts = BuildOpts {
         root_path:    jail_path.clone(),
         host_sockets: PathBuf::from("/atrium/sockets"),
-        user_home:    std::env::var_os("HOME")
-                          .map(PathBuf::from)
-                          .unwrap_or_else(|| PathBuf::from("/")),
-        user_name:    std::env::var("USER").unwrap_or_else(|_| "atrium".into()),
+        user_home:    user_home.clone(),
+        user_name:    user.to_string(),
         devfs_ruleset: 99,
     };
 
@@ -125,6 +145,22 @@ pub fn launch_with_stdio(
         let _ = umount(&jail_path);
         return Err(LaunchError::Failed("mount",
             format!("mkdir jail/dev: {e}")));
+    }
+
+    /* jail(8) with exec.jail_user does an implicit chdir to the
+     * user's home (looked up via host passwd because of
+     * exec.system_jail_user=true). App trees don't ship that
+     * dir, so create it inside the jail (writes land in overlay).
+     * Empty dir is fine — apps that need real $HOME contents
+     * declare a `filesystem` capability that bind-mounts them.
+     * Path varies by user: /home/<user>, /root, etc. */
+    let home_in_jail = jail_path.join(
+        user_home.strip_prefix("/").unwrap_or(&user_home));
+    if let Err(e) = fs::create_dir_all(&home_in_jail) {
+        let _ = umount(&jail_path);
+        let _ = umount(&jail_path);
+        return Err(LaunchError::Failed("mount",
+            format!("mkdir {}: {e}", home_in_jail.display())));
     }
 
     /* Phase 4.5: first-run setup. Sentinel lives in the overlay so

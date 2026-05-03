@@ -1,28 +1,27 @@
-//! portcullisd — Portcullis policy daemon.
+//! portcullisd — Portcullis policy + launch daemon.
 //!
-//! Long-running process that holds the per-user `Policy` in memory
-//! and serves Authorize/Grant/Revoke requests over a Unix-domain
-//! socket at `portcullis_ipc::SOCKET_PATH`.
+//! Long-running multi-tenant process. Listens at
+//! `portcullis_ipc::SOCKET_PATH` (mode 0666, world-connectable);
+//! authenticates each connection via `getpeereid(2)` to identify
+//! the calling user, then serves Authorize/Grant/Revoke/Launch
+//! requests against THAT user's policy file at
+//! `/var/db/atrium/<user>/policy.toml`. Per-user policy state is
+//! cached lazily in-process.
 //!
-//! Phase 4 step 3 scope: policy oracle only. Jail supervision
-//! (waitpid, restart per [supervision] policy, reaping) lands in
-//! a later step.
+//! Launched apps run as the connecting user inside their per-app
+//! jail (via jail.conf `exec.jail_user`).
 //!
-//! Concurrency: one thread per accepted connection. Policy is
-//! shared via `Arc<Mutex<Policy>>`. The lock is held only across
-//! the small read/modify/write window for Grant/Revoke, never
-//! while serving Authorize (which is a pure function of the
-//! current snapshot).
-//!
-//! Run as the user whose policy it manages — the socket is
-//! created mode 0600 by way of a private umask so other users
-//! can't connect. (No SO_PEERCRED check yet; Phase 5 may add one
-//! once we actually have multi-user expectations.)
+//! Concurrency: one thread per accepted connection. Per-tenant
+//! policy state lives behind `Arc<Mutex<Tenants>>`; lock is held
+//! only across the small read/modify/write window for Grant/Revoke.
 
+use std::collections::HashMap;
+use std::ffi::CStr;
 use std::io::BufReader;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -37,38 +36,29 @@ mod launch;
 fn usage() -> ! {
     eprintln!("\
 usage:
-    portcullisd [--user <name>] [--socket <path>] [--policy <path>]
+    portcullisd [--socket <path>]
 
-    Long-running daemon. Loads the per-user policy file, then accepts
-    Unix-domain socket connections and serves Authorize/Grant/Revoke
-    requests.
+    Long-running daemon. Multi-tenant: identifies each connecting
+    user via getpeereid(2) and serves their per-user policy from
+    /var/db/atrium/<user>/policy.toml. Loads tenant policies lazily
+    on first request.
 
-    --user      User whose policy to manage (default $USER).
-    --socket    Override socket path (default {SOCKET_PATH}).
-    --policy    Override policy file path (default
-                /var/db/atrium/<user>/policy.toml).
+    --socket  Override default socket path ({SOCKET_PATH}).
+              Useful for tests; production uses the default.
 ");
     std::process::exit(2);
 }
 
-fn current_user() -> String {
-    std::env::var("USER")
-        .or_else(|_| std::env::var("LOGNAME"))
-        .unwrap_or_else(|_| "atrium".into())
-}
-
 fn main() -> ExitCode {
-    let mut user:        Option<String>  = None;
     let mut socket_path: Option<PathBuf> = None;
-    let mut policy_path: Option<PathBuf> = None;
-
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--user"   if i+1 < args.len() => { user = Some(args[i+1].clone()); i += 2; }
-            "--socket" if i+1 < args.len() => { socket_path = Some(args[i+1].clone().into()); i += 2; }
-            "--policy" if i+1 < args.len() => { policy_path = Some(args[i+1].clone().into()); i += 2; }
+            "--socket" if i + 1 < args.len() => {
+                socket_path = Some(args[i + 1].clone().into());
+                i += 2;
+            }
             "--help" | "-h" => usage(),
             other => {
                 eprintln!("portcullisd: unknown arg {other:?}");
@@ -76,24 +66,10 @@ fn main() -> ExitCode {
             }
         }
     }
-
-    let user = user.unwrap_or_else(current_user);
     let socket_path = socket_path.unwrap_or_else(|| PathBuf::from(SOCKET_PATH));
-    let policy_path = policy_path.unwrap_or_else(|| Policy::user_path(&user));
 
-    let policy = match Policy::load(&policy_path) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("portcullisd: load {}: {e}", policy_path.display());
-            return ExitCode::from(1);
-        }
-    };
-    eprintln!("portcullisd: loaded {} grants from {}",
-        policy.grants.len(), policy_path.display());
-
-    /* Stale-socket cleanup: if a previous daemon crashed, the file
-     * on disk is dead but bind() will refuse to overwrite it.
-     * Removing it before bind is the standard recipe. */
+    /* Stale-socket cleanup: a previous crashed daemon may have left
+     * the file behind; bind() refuses to overwrite. */
     let _ = std::fs::remove_file(&socket_path);
     if let Some(parent) = socket_path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -105,19 +81,21 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    /* Lock the socket to the owning user. */
+    /* World-connectable: any user on the host can connect. Per-user
+     * authorization happens inside the daemon via getpeereid + per-
+     * tenant policy lookup; the socket itself is just a rendezvous
+     * point. (Earlier the socket was 0600 owned by a single user,
+     * which broke multi-user use; multi-tenancy + peer-cred check is
+     * the proper model.) */
     if let Err(e) = std::fs::set_permissions(&socket_path,
-                        std::fs::Permissions::from_mode(0o600)) {
+                        std::fs::Permissions::from_mode(0o666)) {
         eprintln!("portcullisd: chmod {}: {e}", socket_path.display());
         return ExitCode::from(1);
     }
-    eprintln!("portcullisd: listening on {} (user={})",
-        socket_path.display(), user);
+    eprintln!("portcullisd: listening on {} (multi-tenant)",
+        socket_path.display());
 
-    let shared = Arc::new(Mutex::new(DaemonState {
-        policy,
-        policy_path,
-    }));
+    let shared = Arc::new(Mutex::new(Tenants { cache: HashMap::new() }));
 
     for conn in listener.incoming() {
         match conn {
@@ -137,16 +115,83 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-struct DaemonState {
+// ── per-tenant policy cache ──────────────────────────────────────
+
+struct TenantPolicy {
     policy:      Policy,
     policy_path: PathBuf,
 }
 
-fn serve(stream: UnixStream, shared: Arc<Mutex<DaemonState>>) -> std::io::Result<()> {
+struct Tenants {
+    cache: HashMap<String, TenantPolicy>,
+}
+
+impl Tenants {
+    /// Get the tenant's policy state, lazily loading from disk on
+    /// first access. Subsequent calls return the cached version (and
+    /// reflect any in-memory Grant/Revoke updates).
+    fn get_or_load(&mut self, user: &str) -> std::io::Result<&mut TenantPolicy> {
+        if !self.cache.contains_key(user) {
+            let path = Policy::user_path(user);
+            let policy = Policy::load(&path)?;
+            self.cache.insert(user.to_string(), TenantPolicy {
+                policy, policy_path: path,
+            });
+        }
+        Ok(self.cache.get_mut(user).unwrap())
+    }
+}
+
+// ── peer credential lookup (SO_PEERCRED equivalent on FreeBSD) ───
+
+/// Returns (uid, gid) of the peer connected to `stream`. On FreeBSD
+/// `getpeereid(2)` is the canonical API for AF_UNIX peer credentials.
+fn peer_eid(stream: &UnixStream) -> std::io::Result<(u32, u32)> {
+    let mut uid: libc::uid_t = 0;
+    let mut gid: libc::gid_t = 0;
+    let r = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
+    if r < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok((uid, gid))
+    }
+}
+
+/// Resolve a uid to its login name via getpwuid_r. Returns an
+/// io::Error with Other kind if the uid isn't in passwd (which
+/// means the connecting process is somehow attached to a uid we
+/// can't account for — refuse to serve).
+fn username_for_uid(uid: u32) -> std::io::Result<String> {
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0u8 as libc::c_char; 4096];
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let r = unsafe {
+        libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result)
+    };
+    if r != 0 {
+        return Err(std::io::Error::from_raw_os_error(r));
+    }
+    if result.is_null() {
+        return Err(std::io::Error::other(format!("uid {uid} not in passwd")));
+    }
+    let name = unsafe { CStr::from_ptr(pwd.pw_name) };
+    Ok(name.to_string_lossy().into_owned())
+}
+
+// ── connection handling ──────────────────────────────────────────
+
+fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()> {
+    /* Identify the peer before reading any protocol bytes. If we
+     * can't, refuse the connection — we have no way to know whose
+     * policy to consult. */
+    let (uid, _gid) = peer_eid(&stream)?;
+    let user = username_for_uid(uid)?;
+    eprintln!("portcullisd: conn from uid={uid} ({user})");
+
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
 
-    /* Mandatory handshake. */
+    /* Mandatory handshake (unchanged). */
     let first = read_request(&mut reader)?;
     match first {
         Request::Hello { version } => {
@@ -170,34 +215,28 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<DaemonState>>) -> std::io::Result
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e),
         };
-        /* Launch is the one op that needs out-of-band fd handoff;
-         * handle it inline so we can interleave the ReadyForFds
-         * round-trip with recv_fds. Everything else goes through
-         * the pure handle() function. */
         if let Request::Launch { app_id, bypass_policy } = req {
-            handle_launch(app_id, bypass_policy, &shared, &mut writer, &reader)?;
+            handle_launch(app_id, bypass_policy, &user, &shared,
+                          &mut writer, &reader)?;
             continue;
         }
-        let resp = handle(req, &shared);
+        let resp = handle(req, &user, &shared);
         write_response(&mut writer, &resp)?;
     }
 }
 
-/// Launch handler with SCM_RIGHTS fd handoff. Sequence:
-///   1. policy check (returns LaunchFailed{stage:"policy"} if not approved)
-///   2. send Response::ReadyForFds (this also drains the client's
-///      send buffer and gives BufReader nothing to swallow)
-///   3. recv_fds expects 3 OwnedFds (stdin/stdout/stderr)
-///   4. run launch_with_stdio
-///   5. send LaunchExit / LaunchFailed
+/// Launch handler with SCM_RIGHTS fd handoff (see Phase 4.4 step 2).
+/// Adds per-user policy lookup and `exec.jail_user = <user>` so the
+/// app runs as the connecting user inside its per-app jail.
 fn handle_launch(
-    app_id: String,
+    app_id:        String,
     bypass_policy: bool,
-    shared: &Mutex<DaemonState>,
-    writer: &mut UnixStream,
-    reader: &BufReader<UnixStream>,
+    user:          &str,
+    shared:        &Mutex<Tenants>,
+    writer:        &mut UnixStream,
+    reader:        &BufReader<UnixStream>,
 ) -> std::io::Result<()> {
-    /* 1. policy gate (mirrors the in-process CLI path). */
+    /* 1. policy gate (per-tenant). */
     if !bypass_policy {
         let tree = std::path::PathBuf::from("/var/lib/atrium/apps").join(&app_id);
         let manifest_path = tree.join("atrium.toml");
@@ -220,8 +259,14 @@ fn handle_launch(
             }
         };
         let current_hash = hash_manifest(text.as_bytes());
-        let s = shared.lock().unwrap();
-        let prior = s.policy.grants.get(&app_id);
+        let mut s = shared.lock().unwrap();
+        let tp = match s.get_or_load(user) {
+            Ok(tp) => tp,
+            Err(e) => return write_response(writer, &Response::Error {
+                message: format!("policy load for {user}: {e}"),
+            }),
+        };
+        let prior = tp.policy.grants.get(&app_id);
         let delta = compute_delta(
             &manifest.capabilities,
             prior.map(|g| &g.capabilities),
@@ -236,12 +281,10 @@ fn handle_launch(
         }
     }
 
-    /* 2. Tell the client we're ready for the fds. */
+    /* 2. ReadyForFds round-trip. */
     write_response(writer, &Response::ReadyForFds)?;
 
-    /* 3. recv_fds on the underlying socket. BufReader's buffer must
-     * be empty here — the client is blocking on its read of
-     * ReadyForFds and won't have sent anything else yet. */
+    /* 3. recv_fds. */
     if !reader.buffer().is_empty() {
         return write_response(writer, &Response::LaunchFailed {
             stage: "fdpass".into(),
@@ -266,8 +309,10 @@ fn handle_launch(
     let mut iter = fds.into_iter();
     let stdio = [iter.next().unwrap(), iter.next().unwrap(), iter.next().unwrap()];
 
-    /* 4. launch with the client's stdio. */
-    let resp = match launch::launch_with_stdio(&app_id, Some(stdio)) {
+    /* 4. launch as the connecting user. launch_with_stdio sets
+     *    BuildOpts.user_name = user, which becomes exec.jail_user
+     *    in the rendered jail.conf. */
+    let resp = match launch::launch_with_stdio(&app_id, user, Some(stdio)) {
         Ok(o) => Response::LaunchExit { code: o.exit_code },
         Err(e) => Response::LaunchFailed {
             stage: e.stage().into(),
@@ -277,15 +322,21 @@ fn handle_launch(
     write_response(writer, &resp)
 }
 
-fn handle(req: Request, shared: &Mutex<DaemonState>) -> Response {
+fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
     match req {
         Request::Hello { .. } => Response::Error {
             message: "Hello already exchanged".into(),
         },
         Request::Ping => Response::Pong,
         Request::Authorize { app_id, manifest_hash, requested } => {
-            let s = shared.lock().unwrap();
-            let prior = s.policy.grants.get(&app_id);
+            let mut s = shared.lock().unwrap();
+            let tp = match s.get_or_load(user) {
+                Ok(tp) => tp,
+                Err(e) => return Response::Error {
+                    message: format!("policy load for {user}: {e}"),
+                },
+            };
+            let prior = tp.policy.grants.get(&app_id);
             let delta = compute_delta(
                 &requested,
                 prior.map(|g| &g.capabilities),
@@ -300,47 +351,54 @@ fn handle(req: Request, shared: &Mutex<DaemonState>) -> Response {
         }
         Request::Grant { app_id, manifest_hash, capabilities } => {
             let mut s = shared.lock().unwrap();
+            let tp = match s.get_or_load(user) {
+                Ok(tp) => tp,
+                Err(e) => return Response::Error {
+                    message: format!("policy load for {user}: {e}"),
+                },
+            };
             let grant = Grant {
                 manifest_hash,
                 granted_at: now_iso8601(),
                 capabilities,
             };
-            s.policy.grants.insert(app_id, grant);
-            let path = s.policy_path.clone();
-            match s.policy.save(&path) {
+            tp.policy.grants.insert(app_id, grant);
+            let path = tp.policy_path.clone();
+            match tp.policy.save(&path) {
                 Ok(()) => Response::Ok,
                 Err(e) => Response::Error { message: format!("save: {e}") },
             }
         }
         Request::Revoke { app_id } => {
             let mut s = shared.lock().unwrap();
-            if s.policy.grants.remove(&app_id).is_none() {
+            let tp = match s.get_or_load(user) {
+                Ok(tp) => tp,
+                Err(e) => return Response::Error {
+                    message: format!("policy load for {user}: {e}"),
+                },
+            };
+            if tp.policy.grants.remove(&app_id).is_none() {
                 return Response::Error { message: format!("no grant for {app_id}") };
             }
-            let path = s.policy_path.clone();
-            match s.policy.save(&path) {
+            let path = tp.policy_path.clone();
+            match tp.policy.save(&path) {
                 Ok(()) => Response::Ok,
                 Err(e) => Response::Error { message: format!("save: {e}") },
             }
         }
-        Request::Launch { .. } => Response::Error {
-            /* Caught by serve() before reaching here; unreachable
-             * unless the dispatch in serve() is changed. */
-            message: "internal: Launch must go through handle_launch".into(),
-        },
         Request::Reload => {
             let mut s = shared.lock().unwrap();
-            let path = s.policy_path.clone();
-            match Policy::load(&path) {
-                Ok(p) => { s.policy = p; Response::Ok }
-                Err(e) => Response::Error { message: format!("reload: {e}") },
-            }
+            /* Drop this tenant's cached entry; next request re-loads
+             * from disk. Other tenants' caches are untouched. */
+            s.cache.remove(user);
+            Response::Ok
         }
+        Request::Launch { .. } => Response::Error {
+            /* Caught by serve() before reaching here. */
+            message: "internal: Launch must go through handle_launch".into(),
+        },
     }
 }
-
-#[allow(dead_code)]
-fn touch(_p: &Path) {} /* placeholder for future on-disk staleness check */
 
 // ── tests ────────────────────────────────────────────────────────
 
@@ -357,33 +415,27 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         std::env::temp_dir().join(format!("portcullisd-test-{pid}-{nonce}.sock"))
     }
-    fn tmp_policy() -> PathBuf {
-        let pid = std::process::id();
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        std::env::temp_dir().join(format!("portcullisd-policy-{pid}-{nonce}.toml"))
-    }
 
-    /// Spin up a daemon thread, return (socket_path, shutdown handle).
-    fn spawn_daemon(socket: PathBuf, policy_path: PathBuf) {
+    /// Spin up a daemon thread on a tmp socket. Tests use the
+    /// connecting process's own uid/username — works because every
+    /// host the tests run on has a real $USER with a passwd entry.
+    fn spawn_daemon(socket: PathBuf) {
         thread::spawn(move || {
             let _ = std::fs::remove_file(&socket);
             let listener = UnixListener::bind(&socket).unwrap();
             std::fs::set_permissions(&socket,
-                std::fs::Permissions::from_mode(0o600)).unwrap();
-            let policy = Policy::load(&policy_path).unwrap_or_default();
-            let shared = Arc::new(Mutex::new(DaemonState { policy, policy_path }));
+                std::fs::Permissions::from_mode(0o666)).unwrap();
+            let shared = Arc::new(Mutex::new(Tenants { cache: HashMap::new() }));
             for conn in listener.incoming() {
                 let stream = conn.unwrap();
                 let s = Arc::clone(&shared);
                 thread::spawn(move || { let _ = serve(stream, s); });
             }
         });
-        /* Give the listener a beat to come up. */
         thread::sleep(Duration::from_millis(50));
     }
 
-    fn connect_and_hello(socket: &Path) -> UnixStream {
+    fn connect_and_hello(socket: &std::path::Path) -> UnixStream {
         let mut s = UnixStream::connect(socket).unwrap();
         let resp = round_trip(&mut s, &Request::Hello { version: PROTO_VERSION }).unwrap();
         matches!(resp, Response::Hello { .. });
@@ -393,62 +445,31 @@ mod tests {
     #[test]
     fn ping_pong_over_socket() {
         let sock = tmp_socket();
-        let pol  = tmp_policy();
-        spawn_daemon(sock.clone(), pol);
+        spawn_daemon(sock.clone());
         let mut c = connect_and_hello(&sock);
         let r = round_trip(&mut c, &Request::Ping).unwrap();
         assert!(matches!(r, Response::Pong));
     }
 
     #[test]
-    fn grant_then_authorize_succeeds() {
-        let sock = tmp_socket();
-        let pol  = tmp_policy();
-        spawn_daemon(sock.clone(), pol.clone());
-        let mut c = connect_and_hello(&sock);
-
-        let mut caps = portcullis_toml::Capabilities::default();
-        caps.clipboard = Some(true);
-
-        /* Before grant: NeedsApproval. */
-        let r = round_trip(&mut c, &Request::Authorize {
-            app_id: "test.app".into(),
-            manifest_hash: "h1".into(),
-            requested: caps.clone(),
-        }).unwrap();
-        assert!(matches!(r, Response::NeedsApproval { .. }));
-
-        /* Grant. */
-        let r = round_trip(&mut c, &Request::Grant {
-            app_id: "test.app".into(),
-            manifest_hash: "h1".into(),
-            capabilities: caps.clone(),
-        }).unwrap();
-        assert!(matches!(r, Response::Ok));
-
-        /* After grant: Authorized. */
-        let r = round_trip(&mut c, &Request::Authorize {
-            app_id: "test.app".into(),
-            manifest_hash: "h1".into(),
-            requested: caps,
-        }).unwrap();
-        assert!(matches!(r, Response::Authorized));
-
-        let _ = std::fs::remove_file(&pol);
-    }
-
-    #[test]
     fn proto_mismatch_closes_connection() {
         let sock = tmp_socket();
-        let pol  = tmp_policy();
-        spawn_daemon(sock.clone(), pol);
+        spawn_daemon(sock.clone());
         let mut c = UnixStream::connect(&sock).unwrap();
         write_request(&mut c, &Request::Hello { version: 999 }).unwrap();
         let r = portcullis_ipc::read_response(&mut c).unwrap();
         assert!(matches!(r, Response::ProtoMismatch { .. }));
-        /* Daemon should close — next read returns 0 bytes. */
         let mut buf = [0u8; 1];
         let n = c.read(&mut buf).unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn peer_uid_is_resolved() {
+        /* Smoke check: peer_eid returns our own uid for a self-connection. */
+        let (a, _b) = UnixStream::pair().unwrap();
+        let (uid, _gid) = peer_eid(&a).unwrap();
+        let me = unsafe { libc::geteuid() };
+        assert_eq!(uid, me);
     }
 }

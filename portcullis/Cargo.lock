@@ -6,6 +6,7 @@ version = 4
 name = "atrium-session"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "portcullis-jail",
 ]
 
@@ -162,6 +163,7 @@ dependencies = [
 name = "portcullisd"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "portcullis-ipc",
  "portcullis-jail",
  "portcullis-policy",

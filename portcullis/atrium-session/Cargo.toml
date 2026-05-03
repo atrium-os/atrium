@@ -12,3 +12,4 @@ path = "src/main.rs"
 
 [dependencies]
 portcullis-jail = { path = "../portcullis-jail" }
+libc            = "0.2"

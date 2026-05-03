@@ -6,11 +6,15 @@
 #   sysrc portcullisd_enable=YES
 #   service portcullisd start
 #
-# The daemon binds /atrium/sockets/portcullis.sock (mode 0600 by
-# default, owned by the user the daemon runs as). For the current
-# single-user deployment we run as the test user via $portcullisd_user;
-# the long-term plan is per-user portcullisd instances spawned by
-# atrium-login (one daemon per logged-in user, socket owned by them).
+# Multi-tenant: one daemon process serves all users on the host.
+# Authentication is via getpeereid(2) on each connection; the daemon
+# loads/caches per-user policy from /var/db/atrium/<user>/policy.toml
+# lazily. Socket is mode 0666 (anyone connects); per-user
+# authorization happens inside the daemon.
+#
+# Runs as root because:
+#   - launching apps requires mount(8) + jail(8), which need privs
+#   - getpwuid_r needs to resolve any uid on the host
 #
 # PROVIDE: portcullisd
 # REQUIRE: NETWORKING DAEMON FILESYSTEMS
@@ -24,7 +28,6 @@ rcvar=portcullisd_enable
 load_rc_config $name
 
 : ${portcullisd_enable:=NO}
-: ${portcullisd_user:=atrium}
 : ${portcullisd_socket:=/atrium/sockets/portcullis.sock}
 : ${portcullisd_logfile:=/var/log/portcullisd.log}
 
@@ -34,7 +37,6 @@ procname=/usr/local/bin/portcullisd
 
 command_args="-cf -P ${pidfile} -o ${portcullisd_logfile} \
     ${procname} \
-    --user ${portcullisd_user} \
     --socket ${portcullisd_socket}"
 
 start_precmd="${name}_prestart"

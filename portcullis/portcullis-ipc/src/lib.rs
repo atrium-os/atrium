@@ -22,11 +22,11 @@ use portcullis_toml::Capabilities;
 pub mod fdpass;
 pub use fdpass::{recv_fds, send_fds};
 
-/// Default socket path. Created by portcullisd at startup; mode 0600
-/// so only the owning user can connect (per-user policy oracle).
-/// Lives under /atrium/sockets/ so atrium-session's bind-mount of
-/// that directory exposes it to processes inside session jails
-/// without an extra mount entry.
+/// Default socket path. Created by portcullisd at startup mode 0666
+/// (world-connectable); per-user authorization happens inside the
+/// daemon via getpeereid(2). Lives under /atrium/sockets/ so
+/// atrium-session's bind-mount of that directory exposes it to
+/// processes inside session jails without an extra mount entry.
 pub const SOCKET_PATH: &str = "/atrium/sockets/portcullis.sock";
 
 /// Protocol version — bumped if a wire-incompatible change lands.
