@@ -136,13 +136,18 @@ pub fn reload() -> DaemonResult<()> {
     }
 }
 
-/// Outcome of asking the daemon to launch an app. `Exited(code)`
-/// holds the wrapped app's exit code; `Failed{stage, message}` is
-/// any setup/teardown error (with a coarse stage tag like
-/// "manifest", "mount", "jail-c", "policy").
+/// Outcome of asking the daemon to launch an app.
+///   Exited        — the wrapped app ran and finished with this code.
+///   Failed        — daemon-side setup/teardown error (manifest,
+///                   mount, jail-c, etc.).
+///   NeedsApproval — policy gate refused; caller should prompt the
+///                   user and either persist a grant + retry
+///                   (Allow Always), retry with bypass=true
+///                   (Allow Once), or give up (Deny).
 pub enum LaunchReply {
-    Exited { code: Option<i32> },
-    Failed { stage: String, message: String },
+    Exited        { code: Option<i32> },
+    Failed        { stage: String, message: String },
+    NeedsApproval { delta: Vec<String> },
 }
 
 /// Forward a launch to portcullisd. Synchronous: returns when the
@@ -160,11 +165,15 @@ pub fn launch(app_id: &str, bypass_policy: bool) -> DaemonResult<LaunchReply> {
         bypass_policy,
     })?;
 
-    /* Daemon either replies ReadyForFds (we proceed to the fd
-     * handoff) or LaunchFailed (policy refused, manifest missing,
-     * etc. — terminal). Anything else is a protocol bug. */
+    /* Daemon's first reply is one of:
+     *   ReadyForFds          → proceed to the fd handoff
+     *   LaunchNeedsApproval  → policy refused; surface for prompting
+     *   LaunchFailed         → manifest/build error; terminal
+     *   Error                → protocol/internal failure
+     */
     match read_response(&mut s)? {
         Response::ReadyForFds                     => { /* fall through */ }
+        Response::LaunchNeedsApproval { delta }   => return Ok(Some(LaunchReply::NeedsApproval { delta })),
         Response::LaunchFailed { stage, message } => return Ok(Some(LaunchReply::Failed { stage, message })),
         Response::Error{message}                  => return Err(io::Error::other(message)),
         other => return Err(io::Error::other(format!("unexpected pre-launch reply: {other:?}"))),

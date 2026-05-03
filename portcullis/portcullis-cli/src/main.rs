@@ -25,10 +25,13 @@ usage:
         Reads <tree>/atrium.toml, builds a jail.conf section, and
         launches the jail.
 
-        Default mode: consults the per-user policy file. Refuses if
-        the manifest asks for capabilities the user hasn't granted
-        (run `portcullis policy diff <id>` to see what's missing,
-        then `portcullis policy grant <id>` to approve).
+        Default mode: consults the per-user policy file. If the
+        manifest asks for capabilities the user hasn't granted,
+        prompts on the controlling tty:
+            Allow [o]nce    — this launch only; nothing persisted
+            Allow [a]lways  — persist a grant; future launches skip
+            [d]eny          — refuse this launch
+        Non-tty contexts (scripts) get the old refusal + hint.
 
         --dry-run    Render jail.conf + devfs.rules and exit; no
                      mounts, no jail, no policy check.
@@ -299,31 +302,53 @@ fn cmd_launch(tree_arg: &str, dry_run: bool, no_prompt: bool) -> ExitCode {
 
     /* Default mode: consult the policy. Try portcullisd first;
      * fall back to direct file access if the daemon isn't running.
-     * --no-prompt is the dev-mode bypass (Phase 5 will replace the
-     * "refuse and suggest grant" behaviour with an actual interactive
-     * prompt). */
+     * --no-prompt is the dev-mode bypass — skips the policy check
+     * AND the interactive prompt entirely. */
     if !no_prompt {
         let current_hash = portcullis_policy::hash_manifest(text.as_bytes());
-        let approval = check_authorization(&manifest.app.id, &current_hash,
-                                           &manifest.capabilities);
-        let lines = match approval {
-            Ok(None) => Vec::new(),       /* authorized */
-            Ok(Some(delta_lines)) => delta_lines,
-            Err(e) => {
-                eprintln!("portcullis launch: policy check failed: {e}");
+        loop {
+            let approval = check_authorization(&manifest.app.id, &current_hash,
+                                               &manifest.capabilities);
+            let lines = match approval {
+                Ok(None) => break,                 /* authorized */
+                Ok(Some(delta_lines)) => delta_lines,
+                Err(e) => {
+                    eprintln!("portcullis launch: policy check failed: {e}");
+                    return ExitCode::from(1);
+                }
+            };
+            /* Phase 5 prompt — same shape as the daemon-forward
+             * path but driven from the in-CLI delta. */
+            if !stdin_is_tty() {
+                eprintln!("portcullis launch: {} needs capabilities not yet granted:",
+                    manifest.app.id);
+                for line in &lines { eprintln!("    - {line}"); }
+                eprintln!();
+                eprintln!("    grant with: portcullis policy grant {}", manifest.app.id);
+                eprintln!("    or bypass:  portcullis launch --no-prompt {tree_arg}");
                 return ExitCode::from(1);
             }
-        };
-        if !lines.is_empty() {
-            eprintln!("portcullis launch: {} needs capabilities not yet granted:",
-                manifest.app.id);
-            for line in &lines {
-                eprintln!("    - {line}");
+            match prompt_for_approval(&manifest.app.id, &lines) {
+                ApprovalDecision::AllowOnce => {
+                    /* Skip remaining policy enforcement on this
+                     * launch only (no persistence). */
+                    break;
+                }
+                ApprovalDecision::AllowAlways => {
+                    if let Err(e) = persist_grant_for(
+                        &manifest.app.id, &text, &manifest.capabilities,
+                    ) {
+                        eprintln!("portcullis launch: persist grant: {e}");
+                        return ExitCode::from(1);
+                    }
+                    /* Re-run the check; should be empty delta now. */
+                    continue;
+                }
+                ApprovalDecision::Deny => {
+                    eprintln!("portcullis launch: denied by user");
+                    return ExitCode::from(1);
+                }
             }
-            eprintln!();
-            eprintln!("    grant with: portcullis policy grant {}", manifest.app.id);
-            eprintln!("    or bypass:  portcullis launch --no-prompt {tree_arg}");
-            return ExitCode::from(1);
         }
     }
 
@@ -333,22 +358,60 @@ fn cmd_launch(tree_arg: &str, dry_run: bool, no_prompt: bool) -> ExitCode {
      * the daemon isn't running — useful for headless development
      * and as a fallback if the daemon dies. */
     if looks_like_app_id(tree_arg) {
-        match daemon::launch(&manifest.app.id, no_prompt) {
-            Ok(Some(daemon::LaunchReply::Exited { code })) => {
-                return match code {
-                    Some(0) => ExitCode::SUCCESS,
-                    Some(c) => ExitCode::from(c.min(255).max(1) as u8),
-                    None    => ExitCode::from(1),  /* signal */
-                };
-            }
-            Ok(Some(daemon::LaunchReply::Failed { stage, message })) => {
-                eprintln!("portcullis launch [{stage}]: {message}");
-                return ExitCode::from(1);
-            }
-            Ok(None) => { /* daemon offline, fall through to local */ }
-            Err(e) => {
-                eprintln!("portcullisd launch: {e}");
-                return ExitCode::from(1);
+        let mut bypass = no_prompt;
+        loop {
+            match daemon::launch(&manifest.app.id, bypass) {
+                Ok(Some(daemon::LaunchReply::Exited { code })) => {
+                    return match code {
+                        Some(0) => ExitCode::SUCCESS,
+                        Some(c) => ExitCode::from(c.min(255).max(1) as u8),
+                        None    => ExitCode::from(1),  /* signal */
+                    };
+                }
+                Ok(Some(daemon::LaunchReply::Failed { stage, message })) => {
+                    eprintln!("portcullis launch [{stage}]: {message}");
+                    return ExitCode::from(1);
+                }
+                Ok(Some(daemon::LaunchReply::NeedsApproval { delta })) => {
+                    /* Phase 5: prompt on tty, refuse otherwise. */
+                    if !stdin_is_tty() {
+                        eprintln!("portcullis launch: {} needs capabilities not yet granted:",
+                            manifest.app.id);
+                        for line in &delta { eprintln!("    - {line}"); }
+                        eprintln!();
+                        eprintln!("    grant with: portcullis policy grant {}", manifest.app.id);
+                        eprintln!("    or bypass:  portcullis launch --no-prompt {tree_arg}");
+                        return ExitCode::from(1);
+                    }
+                    match prompt_for_approval(&manifest.app.id, &delta) {
+                        ApprovalDecision::AllowOnce => {
+                            bypass = true;
+                            continue;   /* retry the launch with bypass */
+                        }
+                        ApprovalDecision::AllowAlways => {
+                            if let Err(e) = persist_grant_for(
+                                &manifest.app.id, &text, &manifest.capabilities,
+                            ) {
+                                eprintln!("portcullis launch: persist grant: {e}");
+                                return ExitCode::from(1);
+                            }
+                            /* Loop: daemon will now Authorize. bypass
+                             * stays at its original value (likely
+                             * false) — we want the daemon to verify
+                             * the persisted grant covers everything. */
+                            continue;
+                        }
+                        ApprovalDecision::Deny => {
+                            eprintln!("portcullis launch: denied by user");
+                            return ExitCode::from(1);
+                        }
+                    }
+                }
+                Ok(None) => break,  /* daemon offline → local fallback below */
+                Err(e) => {
+                    eprintln!("portcullisd launch: {e}");
+                    return ExitCode::from(1);
+                }
             }
         }
     }
@@ -466,6 +529,84 @@ fn teardown(jail_path: &Path) {
     let _ = umount(&dev);   /* devfs from mount.devfs in jail.conf */
     let _ = umount(jail_path);  /* unionfs */
     let _ = umount(jail_path);  /* nullfs */
+}
+
+// ── Phase 5: interactive approval prompt ─────────────────────────
+
+#[derive(Debug)]
+enum ApprovalDecision {
+    AllowOnce,    /* this launch only — bypass_policy=true on retry  */
+    AllowAlways,  /* persist a grant + retry                          */
+    Deny,         /* refuse the launch                                */
+}
+
+/// True when stdin AND stderr (where the prompt lives) are both tty's.
+/// We require both because:
+///   - if stderr isn't a tty, the prompt is invisible (logged somewhere
+///     the user isn't looking),
+///   - if stdin isn't a tty, there's nobody at the keyboard.
+fn stdin_is_tty() -> bool {
+    /* libc::isatty returns 1 for tty, 0 otherwise. */
+    unsafe {
+        extern "C" { fn isatty(fd: i32) -> i32; }
+        isatty(0) == 1 && isatty(2) == 1
+    }
+}
+
+/// Print the delta + the three-way prompt; loop on bad input.
+/// Returns Deny on EOF (Ctrl-D).
+fn prompt_for_approval(app_id: &str, delta: &[String]) -> ApprovalDecision {
+    use std::io::{BufRead, Write};
+    eprintln!();
+    eprintln!("'{app_id}' wants to:");
+    for line in delta {
+        eprintln!("    • {line}");
+    }
+    eprintln!();
+    let stdin = std::io::stdin();
+    let mut buf = String::new();
+    loop {
+        eprint!("Allow? [o]nce, [a]lways, [d]eny: ");
+        let _ = std::io::stderr().flush();
+        buf.clear();
+        match stdin.lock().read_line(&mut buf) {
+            Ok(0) => return ApprovalDecision::Deny,   /* EOF */
+            Ok(_) => {}
+            Err(_) => return ApprovalDecision::Deny,
+        }
+        match buf.trim().to_ascii_lowercase().as_str() {
+            "o" | "once"   => return ApprovalDecision::AllowOnce,
+            "a" | "always" => return ApprovalDecision::AllowAlways,
+            "d" | "deny" | "n" | "no" | "" => return ApprovalDecision::Deny,
+            _ => eprintln!("    (please answer o, a, or d)"),
+        }
+    }
+}
+
+/// Persist a grant for ALL the manifest's requested capabilities.
+/// Used by the "Allow always" branch so the user doesn't have to
+/// re-prompt on every launch. Tries daemon first, falls back to
+/// direct file write — same shape as `policy_grant`.
+fn persist_grant_for(
+    app_id:        &str,
+    manifest_text: &str,
+    caps:          &portcullis_toml::Capabilities,
+) -> Result<(), String> {
+    let manifest_hash = portcullis_policy::hash_manifest(manifest_text.as_bytes());
+    match daemon::grant(app_id, &manifest_hash, caps) {
+        Ok(Some(())) => return Ok(()),
+        Ok(None) => { /* daemon offline, fall through */ }
+        Err(e) => return Err(format!("portcullisd grant: {e}")),
+    }
+    let path = portcullis_policy::Policy::user_path(&current_user());
+    let mut policy = portcullis_policy::Policy::load(&path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    policy.grants.insert(app_id.to_string(), portcullis_policy::Grant {
+        manifest_hash,
+        granted_at:    portcullis_policy::now_iso8601(),
+        capabilities:  caps.clone(),
+    });
+    policy.save(&path).map_err(|e| format!("save {}: {e}", path.display()))
 }
 
 // ── policy oracle (daemon-first, file-fallback) ──────────────────

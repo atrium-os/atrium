@@ -230,10 +230,8 @@ fn handle_launch(
         );
         drop(s);
         if !delta.is_empty() {
-            return write_response(writer, &Response::LaunchFailed {
-                stage: "policy".into(),
-                message: format!("needs approval: {}",
-                                 delta.describe().join("; ")),
+            return write_response(writer, &Response::LaunchNeedsApproval {
+                delta: delta.describe(),
             });
         }
     }

@@ -108,6 +108,14 @@ pub enum Response {
     /// drains the daemon's BufReader so the cmsg's 1-byte payload
     /// can't be silently swallowed by a buffered read.
     ReadyForFds,
+    /// Launch → policy gate refused. `delta` is the human-readable
+    /// list of capabilities the user hasn't granted yet (suitable
+    /// for showing in a prompt UI). Distinct from LaunchFailed —
+    /// this is "needs interactive approval", not a permanent error.
+    /// The CLI may prompt the user and re-issue Launch with
+    /// bypass_policy=true (Allow Once) or call Grant first then
+    /// re-issue (Allow Always).
+    LaunchNeedsApproval { delta: Vec<String> },
 }
 
 /// Send one request and read one response over a connected stream.

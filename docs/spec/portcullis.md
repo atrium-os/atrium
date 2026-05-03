@@ -1122,13 +1122,28 @@ Order matches risk (smallest blast radius first):
 - `portcullis reinstall <app>` CLI to wipe sentinel/overlay.
 - ~½ wk.
 
-**Phase 5 — capability prompt UI.**
-- A minimal `atrium-prompt` service (or wired into Forum once
-  D3 lands) that renders the prompt text + buttons.
-- Connects portcullisd's "I need user input" to a real GUI.
-- Until Forum exists, a CLI fallback: `tty` prompt for
-  development, headless mode for testing.
-- ~half-week.
+**Phase 5 — capability prompt UI (CLI tty version landed).**
+- IPC: new `Response::LaunchNeedsApproval { delta }` distinct
+  from `LaunchFailed` — daemon emits it when the policy gate
+  refuses, instead of conflating policy refusal with manifest
+  errors.
+- CLI prompt on the controlling tty:
+      Allow? [o]nce, [a]lways, [d]eny
+  - **Allow once** → re-issue Launch with bypass_policy=true
+    (nothing persisted to policy.toml).
+  - **Allow always** → persist a grant for the manifest's full
+    capability set (daemon-first, file-fallback) then re-issue.
+  - **Deny / Ctrl-D / empty input** → exit 1.
+- TTY detection via libc::isatty on stdin AND stderr (where the
+  prompt text lives). Non-tty contexts (scripts, cron) fall
+  back to the pre-Phase-5 behaviour: print the delta + a hint
+  to run `policy grant` or `--no-prompt`, exit 1.
+- Same prompt logic wired into both code paths: the daemon-
+  forward case (the common one) and the in-CLI fallback for
+  when portcullisd isn't running.
+- GUI version (Forum-rendered) is D3 work — slot in by adding
+  a parallel `Response::LaunchNeedsApproval` consumer that
+  routes the prompt through the desktop instead of stdin.
 
 D2.5 is "complete" when an end-to-end demo works:
 - atrium-edit-socket installed via `tessera-import` into a
