@@ -1,0 +1,16 @@
+[package]
+name        = "portcullisd"
+version.workspace     = true
+edition.workspace     = true
+license.workspace     = true
+repository.workspace  = true
+description = "Portcullis policy daemon. Long-running, holds the per-user grant policy in memory and serves authorize/grant/revoke requests over a Unix-domain socket."
+
+[[bin]]
+name = "portcullisd"
+path = "src/main.rs"
+
+[dependencies]
+portcullis-toml   = { path = "../portcullis-toml" }
+portcullis-policy = { path = "../portcullis-policy" }
+portcullis-ipc    = { path = "../portcullis-ipc" }

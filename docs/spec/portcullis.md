@@ -979,10 +979,20 @@ Order matches risk (smallest blast radius first):
   becomes the explicit dev-mode bypass; `--dry-run` skips the
   check (no execution → no policy needed).
 
-  *Step 3 (pending):* `portcullisd` daemon + IPC crate. Moves
-  the policy oracle out of the CLI and into a long-running
-  process so Forum / the prompt UI / multiple concurrent
-  launches all share one source of truth.
+  *Step 3 (landed):* `portcullis-ipc` crate (newline-delimited
+  JSON over Unix-domain socket; Hello/Ping/Authorize/Grant/
+  Revoke/Reload ops + ProtoMismatch handshake) and the
+  `portcullisd` binary (one thread per connection, in-memory
+  policy behind a Mutex, mode-0600 socket at
+  /var/run/portcullisd.sock). Daemon delegates to
+  portcullis-policy so the wire surface and the CLI's direct
+  file path stay semantically identical.
+
+  *Step 4 (pending):* Route `portcullis launch` (and the policy
+  CLI subcommands) through portcullisd when the socket is
+  available; fall back to direct file access otherwise. After
+  this lands the daemon is the canonical writer and the CLI is
+  a thin client.
 
 **Phase 4.5 — first-run setup phase.**
 - Per-app overlay sentinel (`.atrium-firstrun-done`) detection.

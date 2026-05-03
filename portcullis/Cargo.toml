@@ -4,7 +4,9 @@ members = [
     "portcullis-toml",
     "portcullis-jail",
     "portcullis-policy",
+    "portcullis-ipc",
     "portcullis-cli",
+    "portcullisd",
 ]
 
 [workspace.package]
