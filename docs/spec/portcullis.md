@@ -416,62 +416,76 @@ identical storage outcome.
 ## 3.5 Using FreeBSD rc(8) inside the jail
 
 The jail is a normal FreeBSD environment. `/etc/rc`, `service(8)`,
-and the `rc.d` framework are all available — and recommended for
-apps with non-trivial structure (background services, multi-
-component setups, anything that wants supervision beyond a
-single foreground process).
+and the `rc.d` framework are all available. **rc.d is for
+background helpers and one-shot setup, NOT for the foreground
+app.** Apps stay apps; rc.d holds the supporting machinery.
 
-There's no Portcullis-specific schema for "this app uses rc."
-The atrium.toml fields `[setup].command` and `[app].entry` are
-plain shell invocations; rc patterns just slot in.
+Two specific use cases for rc.d in an app's tree:
 
-### Three common shapes
+1. **First-run setup** — rc.d scripts with `KEYWORD: firstboot`
+   that run once via `/etc/rc firstboot`.
+2. **Background helpers** — long-running daemons the app needs
+   (a sync worker, an indexer, a local IPC bridge) declared as
+   normal rc.d services, listed in `[app].helpers`, started
+   before `entry` and stopped after.
 
-**Pattern A — single foreground binary (no rc).**
+The foreground app itself is always launched directly via
+`[app].entry` — never via `service` or rc.
+
+### Pattern A — single foreground binary
 
 ```toml
 [app]
 entry = "bin/atrium-edit"
 ```
 
-Portcullis execs the binary directly. Simplest case.
+Portcullis execs the binary directly. No rc, no helpers.
+Most apps fit here.
 
-**Pattern B — rc-managed services + foreground app.**
+### Pattern B — foreground app with background helpers
 
-App ships rc.d scripts in `usr/local/etc/rc.d/` (e.g.,
-`my-helper-daemon`). atrium.toml entry is the rc bringup wrapper,
-and the foreground app is the last step:
+App ships an indexer daemon as an rc.d script + rc.conf enable
+flag, exactly like a normal FreeBSD service:
+
+```
+usr/local/etc/rc.d/atrium-edit-indexer    ← rc.d script
+etc/rc.conf.d/atrium-edit-indexer         ← contains: atrium_edit_indexer_enable="YES"
+bin/atrium-edit                            ← foreground app
+```
+
+atrium.toml is unchanged from Pattern A:
 
 ```toml
 [app]
-entry = "bin/atrium-launch"   # tiny wrapper script
+entry = "bin/atrium-edit"
 ```
 
-`bin/atrium-launch` is something like:
+The helpers come up automatically because every jail launch
+runs `/etc/rc` (which iterates rc.d, starting everything
+enabled in rc.conf), then execs `[app].entry`. Standard FreeBSD
+jail behavior — Portcullis doesn't need a special schema field
+for "helpers" because the rc.conf model already expresses
+exactly that.
 
-```sh
-#!/bin/sh
-service my-helper-daemon onestart
-exec /usr/local/bin/myapp
-```
+Portcullis lifecycle (per launch):
 
-Or, more rc-native, use a foreground rc.d script for the main
-app and let rc start everything:
+1. (Setup phase if first launch — see §3.4.)
+2. `/etc/rc` (jail.conf `exec.start`) — brings up enabled services.
+3. Exec `[app].entry` as the foreground process.
+4. When entry exits: `/etc/rc.shutdown` (jail.conf `exec.stop`)
+   — stops services in reverse order.
+5. Tear down jail (`jail -r`).
 
-```toml
-[app]
-entry = "/usr/sbin/service"
-args  = ["myapp", "onestart-foreground"]
-```
+The foreground app is NOT in rc.d. It's the user-facing process,
+exec'd by Portcullis directly. Helpers are background and managed
+via rc/rc.conf; they live and die with the jail. No new Atrium
+schema for any of this — it's stock FreeBSD.
 
-with the rc.d script using `command_args="-f"` (or similar) to
-keep its `command` in the foreground.
-
-**Pattern C — first-run via rc firstboot.**
+### Pattern C — first-run setup via rc firstboot
 
 FreeBSD's `firstboot` mechanism marks rc.d scripts that should
-run only on first boot of a system. Place a sentinel touch in
-the app's overlay setup script:
+run only on a system's first boot. Atrium leverages this for
+[setup] phase:
 
 ```toml
 [setup]
@@ -479,10 +493,10 @@ command = "/etc/rc firstboot"
 timeout = "300s"
 
 [setup.capabilities]
-network = "full"   # for any pkg install rc.d scripts do
+network = "full"
 ```
 
-Apps' rc.d scripts opt into firstboot via:
+App ships a firstboot rc.d script:
 
 ```sh
 # usr/local/etc/rc.d/atrium-edit-setup
@@ -501,35 +515,38 @@ load_rc_config $name
 run_rc_command "$1"
 ```
 
-After `/etc/rc firstboot` runs, FreeBSD touches `/var/db/firstboot`
-inside the jail, marking it done. Portcullis writes its own
-sentinel `.atrium-firstrun-done` on top, so subsequent launches
-skip the setup phase entirely.
+`/etc/rc firstboot` runs all such KEYWORD-tagged scripts.
+FreeBSD touches `/var/db/firstboot` when done; Portcullis writes
+its own sentinel `.atrium-firstrun-done` on top so subsequent
+launches skip the setup phase entirely.
 
 ### Why this matters
 
-- **Familiar.** FreeBSD admins already write rc.d scripts.
-  Atrium app authors get to use what they know.
+- **Familiar.** FreeBSD admins already write rc.d scripts for
+  helpers and setup. Atrium app authors reuse what they know.
 - **Composable.** Service dependencies (`# REQUIRE: foo bar`),
-  ordering (`# BEFORE: baz`), and lifecycle (`service foo
+  ordering (`# BEFORE: baz`), lifecycle (`service foo
   status/start/stop/restart`) all work.
-- **Logs.** rc.d output goes to standard FreeBSD logging; no
-  Atrium-specific log plumbing needed.
-- **No new framework.** Portcullis stays orthogonal — it just
-  runs commands. The orchestration richness comes from what's
-  already in the jail.
+- **Logs.** rc.d output goes to standard FreeBSD logging
+  locations; no Atrium-specific log plumbing.
+- **No new framework.** Portcullis just runs commands. The
+  orchestration richness for helpers + setup comes from rc,
+  which is already in the jail.
+- **Foreground stays foreground.** The user-facing app isn't
+  buried in a service script — it's at the top level of
+  `[app].entry`, easy to see and reason about.
 
 ### Caveats
 
-- Pattern A is fine and often best — don't add rc complexity
-  if a single binary suffices.
+- Pattern A is often best — don't add helpers if you don't
+  need them. Empty rc.conf means `/etc/rc` is essentially a
+  no-op.
 - rc.d scripts that try to modify the host (loading kmods,
-  writing outside the jail) won't work, by design. The jail
-  forbids it.
-- Long-running rc-style services that should outlive the
-  foreground app need the `[supervision]` section to set
-  `keep-alive = true` so Portcullis doesn't tear down the jail
-  when the foreground process exits.
+  writing outside the jail) won't work, by design.
+- Helpers live and die with the jail. If a helper should
+  survive the foreground app (rare for desktop apps), it's
+  a system service, not a per-app helper — runs in its own
+  jail and is reachable via atrium-rpc.
 
 ## 4. Jail filesystem layout
 
@@ -723,18 +740,23 @@ alongside the parser, with one test per row.
               ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ 7. jail -c -f runtime.conf                                 │
-│    - enters the jail; runs exec.start (= app.entry)        │
+│    - enters the jail                                       │
+│    - exec.start runs /etc/rc which starts everything        │
+│      enabled in the jail's rc.conf (helpers, etc.)         │
+│    - then execs app.entry as the foreground PID            │
 │    - returns the jail's pid                                │
 └─────────────────────────────────────────────────────────────┘
               │
               ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ 8. portcullisd supervises                                  │
-│    - waitpid(jail.pid)                                     │
-│    - on exit: per supervision policy (do nothing, restart, │
-│      restart-on-crash, log the exit code)                  │
-│    - on app-id reuse mid-session: ensure single instance   │
-│      OR allow per-launch new jails (per atrium.toml)       │
+│    - waitpid(entry-pid)                                    │
+│    - on entry exit:                                        │
+│        per supervision policy: do nothing, restart, log    │
+│        jail -r runs /etc/rc.shutdown which stops services  │
+│        in reverse order, then destroys the jail            │
+│    - on app-id reuse mid-session: per atrium.toml          │
+│      [supervision].instances policy                        │
 └─────────────────────────────────────────────────────────────┘
 ```
 
