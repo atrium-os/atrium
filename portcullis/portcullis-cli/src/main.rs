@@ -305,7 +305,37 @@ fn cmd_launch(tree_arg: &str, dry_run: bool, no_prompt: bool) -> ExitCode {
         }
     }
 
-    /* Approved (or bypassed): set up overlay mounts, run jail, tear down. */
+    /* Daemon-first: if portcullisd is running, it owns the
+     * privileged side of the launch (mount + jail -c + teardown).
+     * The CLI degrades to performing the launch in-process when
+     * the daemon isn't running — useful for headless development
+     * and as a fallback if the daemon dies. */
+    if looks_like_app_id(tree_arg) {
+        match daemon::launch(&manifest.app.id, no_prompt) {
+            Ok(Some(daemon::LaunchReply::Exited { code })) => {
+                return match code {
+                    Some(0) => ExitCode::SUCCESS,
+                    Some(c) => ExitCode::from(c.min(255).max(1) as u8),
+                    None    => ExitCode::from(1),  /* signal */
+                };
+            }
+            Ok(Some(daemon::LaunchReply::Failed { stage, message })) => {
+                eprintln!("portcullis launch [{stage}]: {message}");
+                return ExitCode::from(1);
+            }
+            Ok(None) => { /* daemon offline, fall through to local */ }
+            Err(e) => {
+                eprintln!("portcullisd launch: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+    /* If the user passed an explicit path (not an app id), the
+     * daemon doesn't have a way to find it — daemon only knows
+     * APPS_DIR-installed apps. Falls through to local launch. */
+
+    /* Approved (or bypassed) and daemon offline: set up overlay
+     * mounts, run jail, tear down — same as before this commit. */
     let app_id = manifest.app.id.clone();
     let overlay_dir = PathBuf::from(OVERLAYS_DIR).join(&app_id);
     let jail_path   = PathBuf::from(JAILS_DIR).join(&app_id);

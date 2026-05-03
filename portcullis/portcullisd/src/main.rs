@@ -30,7 +30,9 @@ use std::thread;
 use portcullis_ipc::{
     read_request, write_response, Request, Response, PROTO_VERSION, SOCKET_PATH,
 };
-use portcullis_policy::{compute_delta, now_iso8601, Grant, Policy};
+use portcullis_policy::{compute_delta, hash_manifest, now_iso8601, Grant, Policy};
+
+mod launch;
 
 fn usage() -> ! {
     eprintln!("\
@@ -217,6 +219,56 @@ fn handle(req: Request, shared: &Mutex<DaemonState>) -> Response {
             match s.policy.save(&path) {
                 Ok(()) => Response::Ok,
                 Err(e) => Response::Error { message: format!("save: {e}") },
+            }
+        }
+        Request::Launch { app_id, bypass_policy } => {
+            /* Policy gate first (unless explicit dev bypass).
+             * Re-reads the manifest from disk so the hash check
+             * sees current bytes, matching what `policy diff` does. */
+            if !bypass_policy {
+                let tree = std::path::PathBuf::from("/var/lib/atrium/apps").join(&app_id);
+                let manifest_path = tree.join("atrium.toml");
+                let text = match std::fs::read_to_string(&manifest_path) {
+                    Ok(t) => t,
+                    Err(e) => return Response::LaunchFailed {
+                        stage: "manifest".into(),
+                        message: format!("{}: {e}", manifest_path.display()),
+                    },
+                };
+                let manifest = match portcullis_toml::Manifest::from_str(&text) {
+                    Ok(m) => m,
+                    Err(e) => return Response::LaunchFailed {
+                        stage: "manifest".into(),
+                        message: format!("parse error: {e}"),
+                    },
+                };
+                let current_hash = hash_manifest(text.as_bytes());
+                let s = shared.lock().unwrap();
+                let prior = s.policy.grants.get(&app_id);
+                let delta = compute_delta(
+                    &manifest.capabilities,
+                    prior.map(|g| &g.capabilities),
+                    prior.map(|g| g.manifest_hash.as_str()),
+                    &current_hash,
+                );
+                drop(s);
+                if !delta.is_empty() {
+                    /* "approval needed" fits LaunchFailed semantics for
+                     * step 1 — clearer to the client than reusing
+                     * NeedsApproval, which is an Authorize-shape reply. */
+                    return Response::LaunchFailed {
+                        stage: "policy".into(),
+                        message: format!("needs approval: {}",
+                                         delta.describe().join("; ")),
+                    };
+                }
+            }
+            match launch::launch(&app_id) {
+                Ok(o) => Response::LaunchExit { code: o.exit_code },
+                Err(e) => Response::LaunchFailed {
+                    stage: e.stage().into(),
+                    message: e.message(),
+                },
             }
         }
         Request::Reload => {

@@ -1000,6 +1000,57 @@ Order matches risk (smallest blast radius first):
   gracefully without it. Phase 5 adds the actual interactive
   prompt UI on top of `Authorize → NeedsApproval` replies.
 
+**Phase 4.4 — daemon owns launch + session jail.**
+- The whole "user lands in an unjailed shell after login" hole
+  the original spec papered over. We close it by:
+  (a) moving the privileged side of launch (mount, jail -c,
+      teardown) from the CLI into portcullisd, so the launching
+      client doesn't need root.
+  (b) adding a per-user *session jail* with the host base
+      mounted read-only, /apps as a read-only view of installed
+      apps, and the portcullisd socket bind-mounted in.
+  (c) using `zsh` as the in-jail login shell with a curated
+      /etc/zshrc (sensible prompt + tab-completion for
+      `launch <app-id>`). The jail is the security boundary;
+      the shell is just the shell.
+- Escape hatches during dev: single-user mode (always),
+  plus a `dev` user with `/bin/sh` as login shell that gets
+  removed for production.
+- ~1 week.
+
+  *Step 1 (landed):* `Request::Launch{app_id, bypass_policy}`
+  added to the IPC; daemon-side `launch.rs` carries the
+  mount/jail-c/teardown logic; CLI `launch <id>` forwards to
+  the daemon when present and falls back to in-process launch
+  otherwise. Stdio inherits the daemon (app output → daemon
+  log) for now — SCM_RIGHTS pty passing in step 2.
+
+  *Step 2 (pending):* Pass the requesting client's pty fd via
+  SCM_RIGHTS so the launched app's stdin/stdout/stderr is the
+  user's terminal. Verified with a stub launching `cat` from
+  the CLI, output appearing on the CLI's tty.
+
+  *Step 3 (pending):* Build the session jail composer:
+  read-only nullfs of the host base + per-user overlay for
+  /home + bind-mount of /var/lib/atrium/apps as /apps + the
+  portcullisd socket at /atrium/sockets/portcullis.sock.
+
+  *Step 4 (pending):* Login integration via login.conf or a
+  small pam_atrium / nologin-style wrapper that creates the
+  session jail and jexec's zsh into it.
+
+  *Step 5 (pending):* /apps wrapper scripts so `./<app-id>`
+  inside the session jail just works (each script execs
+  `portcullis launch "$(basename "$0")"`).
+
+**Phase 4.5 — first-run setup phase** (deferred, smaller now).
+  Per-app overlay sentinel (`.atrium-firstrun-done`) detection.
+  jail.conf `exec.created` invocation when sentinel absent
+  + `[setup]` is present. Setup-phase capability application
+  (network etc., dropped after). Optional shared fetch cache
+  mount at `/var/cache/atrium/pkg/`. ~½ wk. Downstream of 4.4
+  because setup scripts launch through the same path apps do.
+
 **Phase 4.5 — first-run setup phase.**
 - Per-app overlay sentinel (`.atrium-firstrun-done`) detection.
 - jail.conf `exec.created` invocation when sentinel absent

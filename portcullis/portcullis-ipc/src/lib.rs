@@ -56,6 +56,21 @@ pub enum Request {
     Revoke { app_id: String },
     /// Re-read policy.toml from disk (for after manual edits).
     Reload,
+    /// Run an installed app inside its per-app jail. Daemon does
+    /// the policy check, the overlay mount, the jail(8) invocation,
+    /// and the teardown — CLI just forwards and waits for the exit
+    /// status. `bypass_policy = true` is the daemon-side equivalent
+    /// of `portcullis launch --no-prompt` (dev mode; nothing
+    /// persisted).
+    ///
+    /// Stdio: this commit (Phase 4.4 step 1) inherits the daemon's
+    /// stdio, so app output lands in the daemon log. SCM_RIGHTS pty
+    /// passing arrives in step 2 and replaces this with proper
+    /// terminal handoff to the requesting client.
+    Launch {
+        app_id:        String,
+        bypass_policy: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,6 +92,12 @@ pub enum Response {
     ProtoMismatch { server_version: u32 },
     /// Daemon doesn't recognize this op (forward-compat).
     UnknownOp,
+    /// Launch → app exited with this status.
+    /// `code = None` if the jail terminated by signal (Unix
+    /// convention: signal-exit doesn't have a numeric exit code).
+    LaunchExit { code: Option<i32> },
+    /// Launch → setup or teardown failed before/after the app ran.
+    LaunchFailed { stage: String, message: String },
 }
 
 /// Send one request and read one response over a connected stream.

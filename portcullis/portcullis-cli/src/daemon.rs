@@ -134,6 +134,32 @@ pub fn reload() -> DaemonResult<()> {
     }
 }
 
+/// Outcome of asking the daemon to launch an app. `Exited(code)`
+/// holds the wrapped app's exit code; `Failed{stage, message}` is
+/// any setup/teardown error (with a coarse stage tag like
+/// "manifest", "mount", "jail-c", "policy").
+pub enum LaunchReply {
+    Exited { code: Option<i32> },
+    Failed { stage: String, message: String },
+}
+
+/// Forward a launch to portcullisd. Synchronous: returns when the
+/// jail has exited and been torn down. `Ok(None)` means daemon
+/// offline — caller should fall back to running the launch in-process.
+pub fn launch(app_id: &str, bypass_policy: bool) -> DaemonResult<LaunchReply> {
+    let Some(mut s) = opened()? else { return Ok(None) };
+    let resp = round_trip(&mut s, &Request::Launch {
+        app_id:        app_id.into(),
+        bypass_policy,
+    })?;
+    match resp {
+        Response::LaunchExit { code }            => Ok(Some(LaunchReply::Exited { code })),
+        Response::LaunchFailed { stage, message } => Ok(Some(LaunchReply::Failed { stage, message })),
+        Response::Error{message}                  => Err(io::Error::other(message)),
+        other => Err(io::Error::other(format!("unexpected launch reply: {other:?}"))),
+    }
+}
+
 pub fn ping() -> DaemonResult<()> {
     let Some(mut s) = opened()? else { return Ok(None) };
     let resp = round_trip(&mut s, &Request::Ping)?;
