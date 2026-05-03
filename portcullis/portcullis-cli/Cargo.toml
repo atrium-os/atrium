@@ -14,3 +14,4 @@ path = "src/main.rs"
 portcullis-toml   = { path = "../portcullis-toml" }
 portcullis-jail   = { path = "../portcullis-jail" }
 portcullis-policy = { path = "../portcullis-policy" }
+portcullis-ipc    = { path = "../portcullis-ipc" }

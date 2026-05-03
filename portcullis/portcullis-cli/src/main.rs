@@ -13,6 +13,8 @@ use std::process::{Command, ExitCode};
 
 use portcullis_jail::{build, jail_name_from_app_id, BuildOpts};
 
+mod daemon;
+
 fn usage() -> ! {
     eprintln!("\
 usage:
@@ -48,6 +50,16 @@ usage:
         default) /var/lib/atrium/overlays/<id>/. Refuses if the jail
         is currently running. Pass --keep-overlay to preserve user
         state across reinstall.
+
+    portcullis daemon ping
+        Test connectivity to portcullisd. Exit 0 if it answers, 1 if
+        the socket is missing or the daemon errors. Honours
+        $PORTCULLIS_SOCKET as an override for the default
+        /var/run/portcullisd.sock.
+
+    portcullis daemon reload
+        Tell portcullisd to re-read policy.toml from disk (use after
+        editing the file by hand).
 
     portcullis policy show [<app-id>]
         Print the per-user policy file (or one app's grants).
@@ -103,6 +115,10 @@ fn main() -> ExitCode {
         "policy" => {
             if args.len() < 3 { usage(); }
             cmd_policy(&args[2..])
+        }
+        "daemon" => {
+            if args.len() < 3 { usage(); }
+            cmd_daemon(&args[2..])
         }
         "remove" => {
             let mut keep_overlay = false;
@@ -259,30 +275,27 @@ fn cmd_launch(tree_arg: &str, dry_run: bool, no_prompt: bool) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    /* Default mode: consult the per-user policy file. --no-prompt
-     * is the dev-mode bypass (Phase 5 will replace the "refuse and
-     * suggest grant" behaviour with an actual interactive prompt). */
+    /* Default mode: consult the policy. Try portcullisd first;
+     * fall back to direct file access if the daemon isn't running.
+     * --no-prompt is the dev-mode bypass (Phase 5 will replace the
+     * "refuse and suggest grant" behaviour with an actual interactive
+     * prompt). */
     if !no_prompt {
-        let policy_path = portcullis_policy::Policy::user_path(&current_user());
-        let policy = match portcullis_policy::Policy::load(&policy_path) {
-            Ok(p) => p,
+        let current_hash = portcullis_policy::hash_manifest(text.as_bytes());
+        let approval = check_authorization(&manifest.app.id, &current_hash,
+                                           &manifest.capabilities);
+        let lines = match approval {
+            Ok(None) => Vec::new(),       /* authorized */
+            Ok(Some(delta_lines)) => delta_lines,
             Err(e) => {
-                eprintln!("portcullis launch: {}: {e}", policy_path.display());
+                eprintln!("portcullis launch: policy check failed: {e}");
                 return ExitCode::from(1);
             }
         };
-        let current_hash = portcullis_policy::hash_manifest(text.as_bytes());
-        let prior        = policy.grants.get(&manifest.app.id);
-        let delta = portcullis_policy::compute_delta(
-            &manifest.capabilities,
-            prior.map(|g| &g.capabilities),
-            prior.map(|g| g.manifest_hash.as_str()),
-            &current_hash,
-        );
-        if !delta.is_empty() {
+        if !lines.is_empty() {
             eprintln!("portcullis launch: {} needs capabilities not yet granted:",
                 manifest.app.id);
-            for line in delta.describe() {
+            for line in &lines {
                 eprintln!("    - {line}");
             }
             eprintln!();
@@ -401,6 +414,39 @@ fn teardown(jail_path: &Path) {
     let _ = umount(&dev);   /* devfs from mount.devfs in jail.conf */
     let _ = umount(jail_path);  /* unionfs */
     let _ = umount(jail_path);  /* nullfs */
+}
+
+// ── policy oracle (daemon-first, file-fallback) ──────────────────
+
+/// Returns `Ok(None)` if authorized, `Ok(Some(lines))` if approval
+/// is needed (with human-readable delta lines), `Err(_)` on real
+/// failure. Tries portcullisd over its socket first; on connection
+/// failure falls back to reading policy.toml directly so the CLI
+/// keeps working in headless / pre-daemon contexts.
+fn check_authorization(
+    app_id: &str,
+    manifest_hash: &str,
+    requested: &portcullis_toml::Capabilities,
+) -> std::io::Result<Option<Vec<String>>> {
+    match daemon::authorize(app_id, manifest_hash, requested)? {
+        Some(daemon::AuthorizeOutcome::Authorized)            => return Ok(None),
+        Some(daemon::AuthorizeOutcome::NeedsApproval(lines))  => return Ok(Some(lines)),
+        None => { /* daemon not running, fall through to file path */ }
+    }
+    let policy_path = portcullis_policy::Policy::user_path(&current_user());
+    let policy = portcullis_policy::Policy::load(&policy_path)?;
+    let prior = policy.grants.get(app_id);
+    let delta = portcullis_policy::compute_delta(
+        requested,
+        prior.map(|g| &g.capabilities),
+        prior.map(|g| g.manifest_hash.as_str()),
+        manifest_hash,
+    );
+    if delta.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(delta.describe()))
+    }
 }
 
 // ── policy subcommands ───────────────────────────────────────────
@@ -531,6 +577,23 @@ fn policy_grant(args: &[String]) -> ExitCode {
         Err(e) => { eprintln!("{e}"); return ExitCode::from(1); }
     };
 
+    let manifest_hash = portcullis_policy::hash_manifest(text.as_bytes());
+
+    /* Daemon-first: if portcullisd is running it's the canonical
+     * writer, and a parallel direct-file write would race its
+     * in-memory copy. */
+    match daemon::grant(id, &manifest_hash, &manifest.capabilities) {
+        Ok(Some(())) => {
+            println!("granted all capabilities to {id} (via portcullisd)");
+            return ExitCode::SUCCESS;
+        }
+        Ok(None) => { /* daemon offline, fall through */ }
+        Err(e) => {
+            eprintln!("portcullisd grant: {e}");
+            return ExitCode::from(1);
+        }
+    }
+
     let path = portcullis_policy::Policy::user_path(&current_user());
     let mut policy = match portcullis_policy::Policy::load(&path) {
         Ok(p) => p,
@@ -538,7 +601,7 @@ fn policy_grant(args: &[String]) -> ExitCode {
     };
 
     let grant = portcullis_policy::Grant {
-        manifest_hash: portcullis_policy::hash_manifest(text.as_bytes()),
+        manifest_hash,
         granted_at:    portcullis_policy::now_iso8601(),
         capabilities:  manifest.capabilities.clone(),
     };
@@ -552,12 +615,51 @@ fn policy_grant(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn cmd_daemon(args: &[String]) -> ExitCode {
+    match args[0].as_str() {
+        "ping" => match daemon::ping() {
+            Ok(Some(())) => { println!("portcullisd: pong"); ExitCode::SUCCESS }
+            Ok(None) => {
+                eprintln!("portcullisd: not running ({} not present)",
+                    portcullis_ipc::SOCKET_PATH);
+                ExitCode::from(1)
+            }
+            Err(e) => { eprintln!("portcullisd: {e}"); ExitCode::from(1) }
+        },
+        "reload" => match daemon::reload() {
+            Ok(Some(())) => { println!("portcullisd: reloaded"); ExitCode::SUCCESS }
+            Ok(None) => {
+                eprintln!("portcullisd: not running");
+                ExitCode::from(1)
+            }
+            Err(e) => { eprintln!("portcullisd: {e}"); ExitCode::from(1) }
+        },
+        other => {
+            eprintln!("portcullis daemon: unknown action {other:?}");
+            usage();
+        }
+    }
+}
+
 fn policy_revoke(args: &[String]) -> ExitCode {
     if args.len() != 1 {
         eprintln!("usage: portcullis policy revoke <app-id>");
         return ExitCode::from(2);
     }
     let id = &args[0];
+
+    match daemon::revoke(id) {
+        Ok(Some(())) => {
+            println!("revoked grant for {id} (via portcullisd)");
+            return ExitCode::SUCCESS;
+        }
+        Ok(None) => { /* daemon offline, fall through */ }
+        Err(e) => {
+            eprintln!("portcullisd revoke: {e}");
+            return ExitCode::from(1);
+        }
+    }
+
     let path = portcullis_policy::Policy::user_path(&current_user());
     let mut policy = match portcullis_policy::Policy::load(&path) {
         Ok(p) => p,

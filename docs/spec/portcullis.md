@@ -988,11 +988,17 @@ Order matches risk (smallest blast radius first):
   portcullis-policy so the wire surface and the CLI's direct
   file path stay semantically identical.
 
-  *Step 4 (pending):* Route `portcullis launch` (and the policy
-  CLI subcommands) through portcullisd when the socket is
-  available; fall back to direct file access otherwise. After
-  this lands the daemon is the canonical writer and the CLI is
-  a thin client.
+  *Step 4 (landed):* CLI now tries portcullisd first for every
+  policy operation (launch authorize, `policy grant`, `policy
+  revoke`); on socket-not-present it falls back to direct
+  policy.toml access. New `portcullis daemon ping/reload`
+  subcommands. `$PORTCULLIS_SOCKET` env override for non-root
+  development.
+
+  Phase 4 is now complete: a long-running daemon is the
+  canonical policy writer when present, and the CLI degrades
+  gracefully without it. Phase 5 adds the actual interactive
+  prompt UI on top of `Authorize → NeedsApproval` replies.
 
 **Phase 4.5 — first-run setup phase.**
 - Per-app overlay sentinel (`.atrium-firstrun-done`) detection.
