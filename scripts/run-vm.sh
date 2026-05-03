@@ -15,15 +15,25 @@
 #   MEM=MB       guest RAM, default 12288 (12 GiB).
 #
 # Power note (laptop battery):
-#   The biggest single host-power saver is GUEST-SIDE: set
-#       kern.hz="100"
-#   in the guest's /boot/loader.conf. FreeBSD defaults to 1000 Hz, which
-#   on a 4-vCPU idle guest fires ~4000 timer interrupts/sec, each one a
-#   VM-exit. Dropping to 100 Hz cuts that 10× and lets the host CPU
-#   reach deep C-states. (After editing loader.conf, reboot the guest.)
-#   On the host side: --display alone adds ~5% CPU for the Cocoa
-#   refresh loop; --tablet on top adds another 1–2% for USB HID polling.
-#   The default headless mode (no flags) is the most efficient.
+#   Measured 2026-05-03 on this VM: idle qemu sits at ~99% host CPU
+#   PER VCPU thread (so smp=4 → ~396% qemu CPU even when the guest's
+#   own `top` reports 99% idle). Linear scaling with smp confirmed.
+#   Cause: HVF on Apple Silicon doesn't park the vCPU thread when the
+#   guest's idle loop issues WFI — the WFI traps to qemu and returns
+#   EXCP_HLT, but the vCPU thread doesn't actually block. Real qemu
+#   patch needed (target/arm/hvf/hvf.c — a previous patch we thought
+#   we had turned out to be the ISV=0 LDP/STP decoder, not WFI).
+#
+#   Kern.hz on FreeBSD aarch64 already defaults to 100; the "set
+#   kern.hz=100 in loader.conf" advice that floats around is for x86
+#   guests where the default is 1000 — does not apply here.
+#
+#   Practical mitigations until the WFI patch lands:
+#     pkill -STOP qemu-system-aarch64    # pause when not using
+#     pkill -CONT qemu-system-aarch64    # resume
+#     SMP=2 run-vm.sh                    # halve the idle burn
+#   Display+tablet also add cost: --display ~5%, --tablet ~1-2%.
+#   Default headless mode is the most efficient.
 
 set -eu
 
