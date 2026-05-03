@@ -103,8 +103,12 @@ paths       = ["/usr/share/fonts"]
 
 [setup]                           # optional — runs once on first launch
 command     = "scripts/firstrun.sh"
-network     = true                # transient network during setup only
 timeout     = "120s"
+
+[setup.capabilities]              # only-during-setup overrides;
+network     = "full"              # any capability can be elevated; reverts
+                                  # to the runtime [capabilities] value
+                                  # after setup completes
 
 [resources]                       # rctl-enforced limits, optional
 memory      = "512M"
@@ -164,8 +168,12 @@ imperative bootstrap own that work in their `[setup]` section.
 ```toml
 [setup]
 command = "scripts/firstrun.sh"   # path within app tree
-network = true                    # transient network during setup
 timeout = "120s"                  # fail if it hangs
+
+[setup.capabilities]              # only-during-setup overrides
+network = "full"                  # uses the same capability vocabulary
+                                  # as [capabilities]; reverts to the
+                                  # runtime value after setup completes
 ```
 
 ### Mechanics
@@ -189,27 +197,36 @@ app's overlay (Tessera-backed; cross-jail dedup'd by content).
 
 ### Two-phase capabilities
 
-Setup capabilities are *additive* over runtime capabilities. A
-user prompt at first install distinguishes the two:
+Capability resolution is straightforward:
+- During the setup phase: merge `[setup.capabilities]` over
+  `[capabilities]` (overrides win); the resulting set is what
+  the jail sees.
+- After setup completes: revert to plain `[capabilities]`.
+
+There's no separate vocabulary for setup-only flags — the same
+capability keys mean the same thing in both contexts. A user
+prompt at first install shows both phases distinctly:
 
 ```
 "Atrium Edit" wants:
 
-  At setup (one-time, first launch):
-      ✓ Network access
-      ✓ Up to 120 seconds runtime
   Always (every launch):
       ✓ Display (Fresco)
       ✓ Clipboard
       ✓ Notifications
       ✓ Read/write your Documents folder
 
+  Plus during one-time first-run setup:
+      ✓ Network access (overrides "none" → "full")
+
 [Allow once]   [Allow always]   [Deny]
 ```
 
-After setup completes successfully, the network capability is
-dropped — the runtime jail has no network unless `[capabilities].
-network` says otherwise.
+After setup exits cleanly, Portcullis tears down the
+elevated-capability jail and either re-creates the jail with
+runtime-only caps for the first real launch, or relies on
+jail.conf's exec.created vs exec.start phasing if the
+elevation can be expressed in one config block.
 
 ### What apps typically do in setup
 
@@ -512,14 +529,16 @@ network = "full"
      (the host's default interface is reachable; outbound
       filtering by pf if configured)
 
-[setup] command = "scripts/firstrun.sh", network = true
+[setup] + [setup.capabilities]
   →  on first launch (no .atrium-firstrun-done sentinel):
-       jail.conf adds setup-phase capabilities (network etc.)
-       exec.created = "scripts/firstrun.sh"
-       on success: write sentinel; remove network capability
-       from runtime jail.conf for this app's subsequent launches
-  →  on subsequent launches: setup is skipped; only runtime
-     capabilities apply
+       compute effective_caps = [capabilities] ⊕ [setup.capabilities]
+       apply each effective cap via the same per-cap translators
+         used at runtime (uniform machinery)
+       exec.created = setup.command (with setup.timeout enforced)
+       on success: write sentinel; tear down the elevated jail.
+  →  every launch (incl. post-setup):
+       apply runtime [capabilities] only
+       exec.start = app.entry
 ```
 
 The complete table lives in `portcullis/src/capabilities.rs`
@@ -827,10 +846,12 @@ D2.5 is "complete" when an end-to-end demo works:
 - **Setup script auditability:** users can inspect the script
   before granting setup capabilities. UI should make this easy
   ("Show setup script") so users aren't approving a black box.
-- **Setup-phase capability prompts:** are setup capabilities
-  always prompted (even if runtime caps are auto-granted)? Yes
-  — network access during setup is still network access. Always
-  visible in the prompt.
+- **Setup-phase capability prompts:** the prompt UI shows the
+  setup-vs-runtime split (see §3.4 example). Capabilities only
+  elevated during setup are still surfaced — network during
+  setup is still network access, the user should know. Default-
+  grant rules apply to setup the same way (graphics + notify
+  silent; everything else prompts).
 - **Security updates:** how do CVEs get patched? Up to the app —
   it might re-check on launch and re-pkg-install if outdated.
   Atrium might surface a "no app has been re-installed in 90
