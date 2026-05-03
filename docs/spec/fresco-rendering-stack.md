@@ -330,22 +330,92 @@ described.
 ### 3.4 Extensibility model
 
 New rendering capabilities arrive as new SPIR-V bundles OR as new
-ops within an existing bundle:
+ops within an existing bundle. The three categories below are
+distinguished by **who writes them** — this is the central
+question for what the Atrium project itself is on the hook to ship
+versus what we depend on others for.
 
-- **atrium-core** (built into fresco-server's binary distribution):
-  rect, path, texture, glyph, transform, basic 3D mesh. This is the
-  bulk of what apps actually use. Ships pre-validated; trusted as
-  part of the system.
-- **Engine compat bundles** (UE, Godot, others if/when they port):
-  ship their engine's high-level ops as SPIR-V kernels + render
-  pipelines. Engine devs compile their existing shader code to
-  SPIR-V (HLSL→SPIR-V via dxc, or whatever toolchain they use),
-  package with a manifest, distribute. App code targeting those
-  engines runs on Atrium without modification of the engine's
-  app-facing API; the engine's renderer ports once.
-- **Vendor / research bundles** (hypothetical: NVIDIA-supplied RT,
-  research bundles for new techniques): same shape — SPIR-V +
-  manifest. Trust model in §3.5.
+- **atrium-core** (built into fresco-server's binary distribution).
+  **Atrium project writes this.** The canonical primitives every
+  app needs: rect, path, texture, glyph, transform, basic 3D mesh
+  draw. ~5-15 ops. Well-understood graphics, manageable scope,
+  exhaustively tested. This is the bulk of what most apps actually
+  use, and is what every Atrium installation has available
+  unconditionally.
+
+- **Engine compat bundles** (ueke, godot, others if/when they
+  port). **Engine vendors write these.** Epic's UE, the Godot
+  Foundation, etc. own their rendering algorithms (Lumen GI,
+  Nanite, Godot's GI, etc.) — those are decades of investment we
+  cannot replicate. They port their existing HLSL/GLSL/MSL to
+  SPIR-V via tools they already use (`dxc`, `glslang`, `slangc`),
+  package with our manifest format, distribute. App code targeting
+  those engines runs on Atrium without modification of the engine's
+  app-facing API; the engine's RENDERER ports once, the engine's
+  app-facing surface unchanged.
+
+- **Vendor / research bundles**. **GPU vendors or research groups
+  write these.** Hardware-optimized variants (NVIDIA-supplied RTX
+  path tracing, Apple Metal-FX equivalents, vendor neural
+  denoisers) or novel techniques from research labs. Same bundle
+  shape — SPIR-V + manifest. Trust model in §3.5.
+
+The pattern is the standard host-platform shape:
+
+| Atrium                | analogous to |
+|---|---|
+| atrium-core           | a browser's built-in CSS layout engine |
+| engine compat bundles | JavaScript libraries (D3, Three.js) |
+| vendor bundles        | DAW plugins (VST reverb / EQ from third parties) |
+
+We are the host platform for graphics. Sophisticated rendering
+algorithms live with the people who already build them.
+
+#### What this means for early Atrium
+
+With only atrium-core loaded (today, and for the near future), apps
+have access to: rectangles, paths, textures, glyphs, transforms,
+basic 3D mesh. Sufficient for desktops, GUIs, productivity apps,
+terminals, editors, the entire Atrium-on-FreeBSD development
+target. **Insufficient** for AAA games, sophisticated 3D scenes
+with realistic lighting, GPU-accelerated visualization — until
+someone writes/ports a bundle providing the relevant ops.
+
+This is not a bug in the architecture; it's the correct division of
+labor. We don't ship Lumen because we don't write Lumen. Epic does.
+If/when Epic ports, those apps can use it. Until then, apps get
+atrium-core or fall back gracefully via capability discovery
+(below).
+
+#### Op-ID vocabulary policy: closed registry
+
+The scenegraph protocol's op-ID space is **a closed registry**, not
+an open vocabulary. An op-ID can be used by apps only if **at least
+one shipping bundle implements it** AND **the op-ID + parameter
+schema have been added to the standardized registry** (owned by
+the Atrium project, with engine-vendor input).
+
+Two consequences:
+
+1. Apps writing against the protocol have a clear answer to "what
+   ops can I use?" — the registry. No ambiguity, no "this works on
+   my system but breaks on yours because the bundle isn't there."
+   (Capability discovery still applies for ops outside atrium-core
+   — the registry tells you the op exists; capability discovery
+   tells you whether THIS installation has a bundle for it.)
+2. New ops require coordination: a bundle author can't just invent
+   `vendorx.cool_new_thing` and expect apps to use it. The op gets
+   reserved in the registry first (Atrium project + engine-vendor
+   discussion); then bundles ship implementing it; then apps
+   target it.
+
+This is the standards-body work flagged earlier as a real cost —
+it's the price for "apps know what they can rely on." Vendor-
+specific extensions can use a `vendor.` prefix namespace
+(`nvidia.path_traced_gi`) for opt-in use without going through
+the standardized core.
+
+#### How a bundle is composed into the per-frame pass
 
 #### How a bundle is composed into the per-frame pass
 
@@ -683,11 +753,15 @@ A useful list to keep us honest:
   GPU pipelines; the compositor stitches finished buffers. Atrium
   apps emit scene structure; the compositor IS the renderer. Two
   fundamentally different layering decisions.
-- **Not a games platform that runs Steam titles.** Engines (UE,
-  Godot, Unity if/when) would need to port their backend to emit
-  Atrium scenegraph ops. We can make that port small (one engine
-  extension as a SPIR-V bundle, no per-vendor work), but we cannot
-  make it zero.
+- **Not a games platform that runs Steam titles unmodified.**
+  Engines (UE, Godot, Unity if/when) need to port their renderer
+  backend to ship a SPIR-V bundle implementing their ops in our
+  manifest format (per §3.4). The port is bounded — one bundle,
+  no per-vendor work, no per-app work, the engine's app-facing
+  API is unchanged — but it is not zero. Apps already targeting a
+  ported engine run on Atrium without modification. Apps using an
+  unported engine don't run until someone ports it; this is the
+  standard cost of any new platform's first decade.
 - **Not a host-extension architecture.** Per the §3.1 redesign,
   there is no dlopen path for arbitrary `.so` files into
   fresco-server. Extensions are SPIR-V bundles. The host shim
