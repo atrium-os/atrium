@@ -1079,13 +1079,37 @@ Order matches risk (smallest blast radius first):
   portcullisd which mounts/jail-c's the per-app jail with
   the user's tty handed over via SCM_RIGHTS.
 
-**Phase 4.5 — first-run setup phase** (deferred, smaller now).
-  Per-app overlay sentinel (`.atrium-firstrun-done`) detection.
-  jail.conf `exec.created` invocation when sentinel absent
-  + `[setup]` is present. Setup-phase capability application
-  (network etc., dropped after). Optional shared fetch cache
-  mount at `/var/cache/atrium/pkg/`. ~½ wk. Downstream of 4.4
-  because setup scripts launch through the same path apps do.
+**Phase 4.5 — first-run setup phase (landed).**
+  - Sentinel: `<overlay>/.atrium-firstrun-done`. Check on every
+    launch; if absent and `[setup]` exists, run setup; on success
+    write sentinel.
+  - Implementation note: spec's "use jail.conf exec.created"
+    doesn't actually work, because `network = "full"` during
+    setup-only requires `vnet=inherit` for the setup phase but
+    not the runtime — and vnet is fixed for a jail's lifetime.
+    The implementation runs setup and runtime as **two separate
+    jail-c invocations** sharing the same overlay mount. First
+    jail = "<id>_setup" with merged caps + entry =
+    `setup.command`. Second jail = the runtime jail as before.
+    Overlay mount-once / unmount-once spans both.
+  - Capability merge: new `merge_capabilities(base, override)`
+    in portcullis-toml. Override is bidirectional — setup may
+    add network OR drop network relative to runtime. Lists
+    (filesystem, fonts.paths) replace wholesale.
+  - Setup failure (non-zero exit) aborts the launch and leaves
+    the sentinel absent so the next launch retries.
+  - `portcullis reinstall <app-id>` — wipe the sentinel to force
+    re-setup. Refuses if jail running.
+  - Stdio: setup phase inherits the daemon (output → daemon
+    log) for now. A follow-up step can pipe setup output through
+    the same SCM_RIGHTS pty as the runtime app so the user sees
+    "running first-time setup..." on their terminal.
+
+  Out of scope for this commit (deferred):
+  - `setup.timeout` enforcement (spec mentions "120s"; today
+    it's parsed but not honored).
+  - Shared `/var/cache/atrium/pkg/` fetch cache mount with
+    `fetch-cache = "pkg"` capability.
 
 **Phase 4.5 — first-run setup phase.**
 - Per-app overlay sentinel (`.atrium-firstrun-done`) detection.

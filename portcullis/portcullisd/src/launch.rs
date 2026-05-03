@@ -2,28 +2,39 @@
 //! to do directly in cmd_launch — moved here so the daemon owns
 //! every privileged operation and the CLI becomes a thin client.
 //!
-//! Phase 4.4 step 1 scope: launched apps inherit the daemon's
-//! stdio. App output therefore lands in the daemon log, not on the
-//! requesting client's terminal. SCM_RIGHTS pty passing arrives in
-//! step 2 and replaces stdio inheritance with proper terminal handoff.
+//! Two-phase launch (Phase 4.5):
+//!   1. If `<overlay>/.atrium-firstrun-done` is absent and the app
+//!      manifest has a `[setup]` block, build a *setup jail* with
+//!      merged caps (runtime + setup overrides), run setup.command,
+//!      write the sentinel on success, then continue.
+//!   2. Build the runtime jail with plain `[capabilities]` and run
+//!      the app.
+//!
+//! Both phases share the same overlay mount, so anything the setup
+//! script writes to /usr/local, /etc, /var, etc. lands in the
+//! overlay and is visible to the runtime app — that's the whole
+//! point of separating the two phases (e.g., `pkg install` during
+//! setup with `network = "full"`, then runtime sees the installed
+//! files with `network = "none"`).
 
 use std::fs;
 use std::os::unix::io::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use portcullis_jail::{build, jail_name_from_app_id, BuildOpts};
-use portcullis_toml::Manifest;
+use portcullis_jail::{build, jail_name_from_app_id, BuildOpts, JailConfig};
+use portcullis_toml::{merge_capabilities, Manifest};
 
 const APPS_DIR:     &str = "/var/lib/atrium/apps";
 const OVERLAYS_DIR: &str = "/var/lib/atrium/overlays";
 const JAILS_DIR:    &str = "/var/lib/atrium/jails";
+const SENTINEL:     &str = ".atrium-firstrun-done";
 
 #[derive(Debug)]
 pub enum LaunchError {
     /// `(stage, message)` — `stage` is "manifest", "build", "mount",
-    /// "jail-c", "teardown", etc., useful for the client to show
-    /// where in the lifecycle things broke.
+    /// "jail-c", "setup", "teardown", etc., useful for the client to
+    /// show where in the lifecycle things broke.
     Failed(&'static str, String),
 }
 
@@ -37,23 +48,12 @@ impl LaunchError {
 }
 
 pub struct LaunchOutcome {
-    /// Exit code from `jail -c` (the wrapped app's exit code by way
-    /// of jail(8) propagation). `None` if the jail terminated by
-    /// signal — Unix has no numeric exit code in that case.
+    /// Exit code from the runtime jail (the wrapped app's exit code
+    /// by way of jail(8) propagation). `None` if the jail terminated
+    /// by signal — Unix has no numeric exit code in that case.
     pub exit_code: Option<i32>,
 }
 
-/// Run an app inside its per-app jail. Synchronous: returns when
-/// the jail has exited and been torn down.
-///
-/// `stdio = None` → jail(8) inherits the daemon's stdio (output
-/// goes to the daemon log). `stdio = Some([in, out, err])` →
-/// jail(8) runs with those three fds as 0/1/2, so a launching
-/// client's terminal becomes the app's terminal.
-///
-/// Caller is responsible for the policy check — by the time we get
-/// here, the launch is already approved (or the caller passed
-/// bypass_policy and accepts dev-mode semantics).
 pub fn launch_with_stdio(
     app_id: &str,
     stdio: Option<[OwnedFd; 3]>,
@@ -89,9 +89,10 @@ pub fn launch_with_stdio(
         user_name:    std::env::var("USER").unwrap_or_else(|_| "atrium".into()),
         devfs_ruleset: 99,
     };
-    let jc = build(&manifest, &opts)
-        .map_err(|e| LaunchError::Failed("build", e.to_string()))?;
 
+    /* Mount overlay once; both setup and runtime jails see the same
+     * union, so setup writes to /usr/local etc. are visible to the
+     * runtime app. */
     fs::create_dir_all(&overlay_dir)
         .map_err(|e| LaunchError::Failed("mount",
                  format!("create {}: {e}", overlay_dir.display())))?;
@@ -116,21 +117,107 @@ pub fn launch_with_stdio(
         return Err(LaunchError::Failed("mount", format!("unionfs: {e}")));
     }
 
+    /* Phase 4.5: first-run setup. Sentinel lives in the overlay so
+     * it persists across launches; portcullis reinstall removes it
+     * to force a re-run. */
+    let sentinel_path = overlay_dir.join(SENTINEL);
+    if !sentinel_path.exists() {
+        if let Some(setup) = &manifest.setup {
+            let setup_caps = match &setup.capabilities {
+                Some(ovr) => merge_capabilities(&manifest.capabilities, ovr),
+                None      => manifest.capabilities.clone(),
+            };
+            /* Synthesise a setup-time manifest with merged caps and
+             * setup.command as the entry. Same opts → same root_path
+             * → setup runs in the overlay we just mounted. */
+            let mut setup_manifest = clone_manifest_with(
+                &manifest, setup_caps, setup.command.clone());
+            setup_manifest.app.id = format!("{}_setup", manifest.app.id);
+            let setup_jc = build(&setup_manifest, &opts)
+                .map_err(|e| {
+                    full_teardown(&jail_path, None);
+                    LaunchError::Failed("build",
+                        format!("setup-jail build: {e}"))
+                })?;
+            let setup_exit = run_one_jail(&setup_jc, &jail_path, /* stdio
+                         inherits daemon intentionally — Phase 4.5
+                         step-1 simplification. Step-2 will pipe setup
+                         output through the same tty as the runtime
+                         app. */ None)
+                .map_err(|e| { full_teardown(&jail_path, None); e })?;
+            if setup_exit != Some(0) {
+                full_teardown(&jail_path, None);
+                return Err(LaunchError::Failed("setup",
+                    format!("setup script exited {:?} (sentinel not written; \
+                             next launch will retry)", setup_exit)));
+            }
+            /* Sentinel write goes directly to the overlay-on-host;
+             * unionfs writes from inside the jail land there too,
+             * but the daemon owning this is more honest. */
+            if let Err(e) = fs::write(&sentinel_path, b"ok\n") {
+                full_teardown(&jail_path, None);
+                return Err(LaunchError::Failed("setup",
+                    format!("write sentinel: {e}")));
+            }
+        } else {
+            /* No [setup] block → still write sentinel so we don't
+             * stat() the file every launch from now on. */
+            let _ = fs::write(&sentinel_path, b"ok\n");
+        }
+    }
+
+    /* Runtime phase. Build and run the actual app jail with plain
+     * runtime capabilities. */
+    let jc = build(&manifest, &opts)
+        .map_err(|e| {
+            full_teardown(&jail_path, None);
+            LaunchError::Failed("build", e.to_string())
+        })?;
+    let outcome = run_one_jail(&jc, &jail_path, stdio);
+
+    full_teardown(&jail_path, Some(&jc.name));
+
+    outcome.map(|exit_code| LaunchOutcome { exit_code })
+}
+
+/// Clone a manifest with substituted capabilities + entry. Used to
+/// build the setup-phase manifest from the runtime one without
+/// disturbing the original.
+fn clone_manifest_with(
+    base:  &Manifest,
+    caps:  portcullis_toml::Capabilities,
+    entry: String,
+) -> Manifest {
+    Manifest {
+        app: portcullis_toml::AppSection {
+            id:          base.app.id.clone(),
+            name:        base.app.name.clone(),
+            version:     base.app.version.clone(),
+            entry,
+            description: base.app.description.clone(),
+        },
+        capabilities: caps,
+        setup:        None,           /* setup never recurses */
+        resources:    None,
+        supervision:  None,
+    }
+}
+
+/// Run one jail-c against `jail_path`, capture exit, jail -r before
+/// returning. Caller owns the over-arching mount lifecycle.
+fn run_one_jail(
+    jc:        &JailConfig,
+    jail_path: &Path,
+    stdio:     Option<[OwnedFd; 3]>,
+) -> Result<Option<i32>, LaunchError> {
     let conf_path = std::env::temp_dir().join(format!(
-        "portcullisd-{}-{}.conf", std::process::id(), app_id.replace('.', "_")));
+        "portcullisd-{}-{}.conf", std::process::id(), jc.name));
     if let Err(e) = fs::write(&conf_path, jc.render_jail_conf()) {
-        teardown(&jail_path, &jc.name);
         return Err(LaunchError::Failed("jail-c",
                    format!("write {}: {e}", conf_path.display())));
     }
-
-    /* Stdio: if the caller passed three fds (the requesting
-     * client's stdin/stdout/stderr, handed over via SCM_RIGHTS),
-     * point jail(8) at them so the launched app talks to the
-     * client's terminal. Otherwise inherit the daemon's stdio
-     * (app output → daemon log). */
     let mut cmd = Command::new("jail");
-    cmd.arg("-c").arg("-f").arg(&conf_path).arg(&jail_name_from_app_id(app_id));
+    cmd.arg("-c").arg("-f").arg(&conf_path).arg(&jc.name);
     if let Some([sin, sout, serr]) = stdio {
         cmd.stdin (Stdio::from(sin));
         cmd.stdout(Stdio::from(sout));
@@ -138,14 +225,38 @@ pub fn launch_with_stdio(
     }
     let status = cmd.status();
     let _ = fs::remove_file(&conf_path);
+    /* Per-jail teardown: jail -r releases the jail's specific mounts
+     * (mount.devfs, capability mounts) without touching the
+     * overarching overlay union. */
+    let _ = Command::new("jail").arg("-r").arg(&jc.name).status();
+    let _ = umount(&jail_path.join("dev"));
 
-    teardown(&jail_path, &jc.name);
-
-    match status {
-        Ok(s) => Ok(LaunchOutcome { exit_code: s.code() }),
-        Err(e) => Err(LaunchError::Failed("jail-c",
+    let code = match status {
+        Ok(s) => s.code(),
+        Err(e) => return Err(LaunchError::Failed("jail-c",
                   format!("could not invoke jail(8): {e}"))),
+    };
+    /* Setup phase: a non-zero exit aborts the launch (sentinel
+     * stays absent so next launch retries). For the runtime phase
+     * the caller passes the code through verbatim — non-zero is
+     * just "the app exited non-zero", not a failure. So this fn
+     * returns Ok always for now and the caller distinguishes by
+     * looking at jc.name (or by passing an "is_setup" flag).
+     *
+     * Today setup failures are detected at the call site by
+     * checking `code != Some(0)` after this returns. */
+    Ok(code)
+}
+
+/// Final teardown: optional jail -r (idempotent if already removed),
+/// then unmount in reverse order: unionfs, then nullfs.
+fn full_teardown(jail_path: &Path, jail_name: Option<&str>) {
+    if let Some(n) = jail_name {
+        let _ = Command::new("jail").arg("-r").arg(n).status();
     }
+    let _ = umount(&jail_path.join("dev"));   /* belt-and-braces */
+    let _ = umount(jail_path);                 /* unionfs */
+    let _ = umount(jail_path);                 /* nullfs */
 }
 
 fn run(cmd: &str, args: &[&str]) -> std::io::Result<()> {
@@ -172,12 +283,7 @@ fn umount_silent(p: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// jail -r is idempotent if exec.start exit already removed the
-/// jail; umounts are in reverse order: devfs (mount.devfs in
-/// jail.conf), then unionfs (upper), then nullfs (lower).
-fn teardown(jail_path: &Path, jail_name: &str) {
-    let _ = Command::new("jail").arg("-r").arg(jail_name).status();
-    let _ = umount(&jail_path.join("dev"));
-    let _ = umount(jail_path);
-    let _ = umount(jail_path);
-}
+/// Suppress "unused" warning for jail_name_from_app_id which is used
+/// transitively via build()/render() but not directly here anymore.
+#[allow(dead_code)]
+fn _silence(s: &str) -> String { jail_name_from_app_id(s) }

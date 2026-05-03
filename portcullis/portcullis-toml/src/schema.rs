@@ -124,3 +124,69 @@ impl Manifest {
         toml::from_str(s)
     }
 }
+
+/// Merge `override_caps` over `base`, field by field. Any field set
+/// in the override wins; otherwise the base value carries through.
+/// List-shaped fields (filesystem, fonts.paths) replace wholesale —
+/// override wins as a complete set, not as an addition. Spec §3.4
+/// "two-phase capabilities" treats overrides as bidirectional, so a
+/// setup phase can equally well *drop* a runtime capability.
+pub fn merge_capabilities(base: &Capabilities, ovr: &Capabilities) -> Capabilities {
+    Capabilities {
+        graphics:         ovr.graphics.clone().or_else(|| base.graphics.clone()),
+        clipboard:        ovr.clipboard.or(base.clipboard),
+        notify:           ovr.notify.or(base.notify),
+        open_uri:         ovr.open_uri.or(base.open_uri),
+        audio:            ovr.audio.or(base.audio),
+        filesystem:       ovr.filesystem.clone().or_else(|| base.filesystem.clone()),
+        network:          ovr.network.or(base.network),
+        fonts:            ovr.fonts.clone().or_else(|| base.fonts.clone()),
+        tessera_cas_read: ovr.tessera_cas_read.or(base.tessera_cas_read),
+        usb_hid:          ovr.usb_hid.or(base.usb_hid),
+        camera:           ovr.camera.or(base.camera),
+        microphone:       ovr.microphone.or(base.microphone),
+        extra:            {
+            let mut e = base.extra.clone();
+            for (k, v) in &ovr.extra { e.insert(k.clone(), v.clone()); }
+            e
+        },
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+
+    #[test]
+    fn override_adds_network_keeps_runtime_clipboard() {
+        let mut base = Capabilities::default();
+        base.clipboard = Some(true);
+        let mut ovr = Capabilities::default();
+        ovr.network = Some(NetworkCap::Full);
+        let m = merge_capabilities(&base, &ovr);
+        assert_eq!(m.clipboard, Some(true));
+        assert_eq!(m.network, Some(NetworkCap::Full));
+    }
+
+    #[test]
+    fn override_can_drop_network() {
+        /* Bidirectional: setup phase deliberately strips runtime's
+         * loopback in favor of "no network at all" during setup. */
+        let mut base = Capabilities::default();
+        base.network = Some(NetworkCap::Loopback);
+        let mut ovr = Capabilities::default();
+        ovr.network = Some(NetworkCap::None);
+        let m = merge_capabilities(&base, &ovr);
+        assert_eq!(m.network, Some(NetworkCap::None));
+    }
+
+    #[test]
+    fn override_filesystem_replaces_wholesale() {
+        let mut base = Capabilities::default();
+        base.filesystem = Some(vec!["~/Documents".into()]);
+        let mut ovr = Capabilities::default();
+        ovr.filesystem = Some(vec!["~/Downloads".into()]);
+        let m = merge_capabilities(&base, &ovr);
+        assert_eq!(m.filesystem, Some(vec!["~/Downloads".to_string()]));
+    }
+}

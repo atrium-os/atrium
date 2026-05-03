@@ -51,6 +51,13 @@ usage:
         is currently running. Pass --keep-overlay to preserve user
         state across reinstall.
 
+    portcullis reinstall <app-id>
+        Force the app's first-run setup to re-execute on the next
+        launch by deleting the .atrium-firstrun-done sentinel from
+        the overlay. Refuses if the jail is currently running.
+        Use this after editing setup.command or after the app's
+        own /usr/local state goes wrong.
+
     portcullis link-apps
         Walk /var/lib/atrium/apps/ and drop a wrapper script
         <id>/<id> into each app directory so users can run installed
@@ -130,6 +137,10 @@ fn main() -> ExitCode {
         "link-apps" => {
             if args.len() != 2 { usage(); }
             cmd_link_apps()
+        }
+        "reinstall" => {
+            if args.len() != 3 { usage(); }
+            cmd_reinstall(&args[2])
         }
         "remove" => {
             let mut keep_overlay = false;
@@ -654,6 +665,39 @@ fn policy_grant(args: &[String]) -> ExitCode {
     }
     println!("granted all capabilities to {id} → {}", path.display());
     ExitCode::SUCCESS
+}
+
+/// Force the app's first-run setup to re-execute by removing
+/// the `.atrium-firstrun-done` sentinel. Refuses if the jail
+/// is running so we don't yank the sentinel out from under a
+/// half-completed launch.
+fn cmd_reinstall(app_id: &str) -> ExitCode {
+    if !looks_like_app_id(app_id) {
+        eprintln!("portcullis reinstall: {app_id:?} is not a valid app id");
+        return ExitCode::from(2);
+    }
+    let jname = portcullis_jail::jail_name_from_app_id(app_id);
+    if jail_is_running(&jname) {
+        eprintln!("portcullis reinstall: jail {jname:?} is currently running; \
+                   stop it first");
+        return ExitCode::from(1);
+    }
+    let sentinel = PathBuf::from(OVERLAYS_DIR).join(app_id).join(".atrium-firstrun-done");
+    match fs::remove_file(&sentinel) {
+        Ok(()) => {
+            println!("removed {} (next launch will re-run setup)", sentinel.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("portcullis reinstall: no sentinel at {} (already due to re-setup)",
+                sentinel.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("portcullis reinstall: {}: {e}", sentinel.display());
+            ExitCode::from(1)
+        }
+    }
 }
 
 /// Generate a per-app wrapper script at /var/lib/atrium/apps/<id>/<id>.
