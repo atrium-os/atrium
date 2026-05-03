@@ -101,6 +101,11 @@ audio       = false               # no audio access
 mode        = "read-only"
 paths       = ["/usr/share/fonts"]
 
+[packages.freebsd]                # FreeBSD pkg dependencies
+openssl     = "3.0"               # exact version
+libxml2     = "*"                 # any version (use pool's latest)
+libpng      = ">=1.6, <2.0"       # version constraint
+
 [resources]                       # rctl-enforced limits, optional
 memory      = "512M"
 cpu         = 200                 # percent of one core (200 = 2 cores)
@@ -149,6 +154,144 @@ At parse time:
   OR a `policy.toml` admin grant.
 - Unknown keys are warnings, not errors (forward compatibility).
 
+## 3.4 The FreeBSD package pool
+
+`[packages.freebsd]` declares pkg dependencies. Portcullis
+maintains a host-side pool at `/var/db/atrium/pkg-pool/`:
+
+```
+/var/db/atrium/pkg-pool/
+├── pkg-db/                    ← pkg(8) sqlite + metadata (one global instance)
+├── files/
+│   ├── openssl/3.0.13/        ← per (pkg, version), full file tree
+│   │   └── usr/local/...
+│   ├── openssl/3.1.4/
+│   ├── libxml2/2.12.5/
+│   └── libpng/1.6.40/
+└── manifest.cache             ← per-package file list for fast jail-mount
+```
+
+The pool itself lives on Tessera-CAS storage so file-level dedup
+works across packages too (common READMEs, license texts, etc.
+collapse to one copy).
+
+### Pool installation
+
+A package is installed into the pool exactly once per (name, version):
+
+1. App's atrium.toml declares `openssl = "3.0"`.
+2. `tessera-import` (or a higher-level installer) checks the pool;
+   if `openssl-3.0` not present, runs:
+   ```
+   pkg --rootdir /var/db/atrium/pkg-pool/files/openssl/3.0.13 \
+       --chroot /var/db/atrium/pkg-pool/install-jail \
+       install openssl-3.0.13
+   ```
+   inside a small "install jail" that has network + write to the
+   pool but nothing else. pkg's install scripts run here; their
+   side effects land in the pool.
+3. Pool-side post-install: extract the file list, write to
+   `manifest.cache` for the package; this is what jail-launch
+   reads to decide what to mount.
+4. Subsequent apps that depend on `openssl-3.0` skip the install
+   entirely — pool entry already exists.
+
+Multiple versions coexist in the pool because they live under
+different (name, version) directories. Garbage-collected when no
+app's manifest references them anymore.
+
+### Pool → jail at launch time
+
+Per declared package, Portcullis adds nullfs mount entries to
+the jail's runtime.conf:
+
+```
+mount.nullfs += "/var/db/atrium/pkg-pool/files/openssl/3.0.13/usr/local/lib /usr/local/lib"
+mount.nullfs += "/var/db/atrium/pkg-pool/files/openssl/3.0.13/usr/local/include /usr/local/include"
+# ... per the package's manifest.cache subset of usr/local
+```
+
+Trick: when multiple packages contribute files to the same path
+(e.g. both openssl AND libxml2 land things in `/usr/local/lib`),
+we union them via either:
+- a per-jail synthesized `/usr/local/lib` directory containing
+  symlinks to each package's actual files, or
+- nullfs the entire pool's per-package trees and rely on the
+  later mount winning conflicts.
+
+Phase-1 implementation picks the symlink-tree approach (cleaner
+conflict semantics; jail-launch creates the symlink tree on
+first run, caches in the per-app overlay).
+
+### App-visible result
+
+Inside the jail, the app sees a normal FreeBSD layout:
+
+```
+/usr/local/lib/libssl.so.3    ← from openssl pool entry, nullfs ro
+/usr/local/lib/libxml2.so.16  ← from libxml2 pool entry, nullfs ro
+/usr/local/include/openssl/*  ← (only present if declared)
+/usr/local/share/man/...      ← (probably skipped — apps don't need man pages)
+```
+
+The dynamic linker finds shared libs at standard paths. No
+LD_LIBRARY_PATH munging. App's binary, built with the standard
+FreeBSD pkg layout in mind, just works.
+
+### Cross-jail dedup, automatic
+
+If 50 Atrium apps each declare `openssl = "3.0"`:
+- Pool stores one copy of the openssl files (~10 MB).
+- 50 jails each get a nullfs view of those files. Zero
+  additional disk usage per jail.
+- Compare with the alternative (each jail's rootfs containing
+  its own copy): 50 × 10 MB = 500 MB wasted.
+
+This composes with Tessera's intra-app dedup (file-level CAS for
+the rootfs) and with D1.7 binsplit (function-level dedup for the
+app's own binaries) to give multiple compounding storage wins.
+
+### Updates + version pinning
+
+- App declares `openssl = "3.0"` (loose) or `"3.0.13"` (exact).
+- Pool may have multiple versions; the resolver picks the highest
+  matching the constraint.
+- A new pkg release of openssl-3.0.14 lands in the pool on next
+  pool refresh (manual `portcullis pool update` or scheduled).
+- Apps with `"3.0"` get the new version on next launch
+  (re-resolve constraints). Apps with `"3.0.13"` keep that exact
+  one until the manifest is bumped.
+
+### Trust model
+
+- Packages are signed by the FreeBSD pkg infrastructure; pool
+  install verifies signatures.
+- The install-jail has no access to anything outside the pool
+  directory + network.
+- An installed package's files are read-only from app jails (the
+  nullfs mount is read-only). Apps can't tamper with the pool.
+- Pool corruption affects all apps using the corrupted package;
+  recovery is `portcullis pool reinstall <pkg>`.
+
+### What about transitive dependencies?
+
+`pkg install openssl` may auto-install libfoo, libbar via pkg's
+own dependency resolution. Two options:
+
+1. **Implicit:** pool install runs `pkg install` and accepts the
+   full closure. The app's nullfs mount only exposes `openssl`
+   files; transitive deps live in the pool but aren't visible to
+   the app unless the app declared them too. Result: app's
+   binary may fail to find a transitive lib it links against.
+2. **Explicit:** Portcullis computes the transitive closure
+   from pkg's metadata at manifest-validation time, and either
+   (a) errors with "you forgot to declare libfoo" or
+   (b) auto-mounts the closure.
+
+Phase-1 picks **2(b)** — auto-mount the transitive closure but
+record it so users see what they got. The manifest can opt out
+(`packages.freebsd.libfoo = false`) to deliberately exclude.
+
 ## 4. Jail filesystem layout
 
 Per-app jail at `/var/lib/atrium/jails/<app.id>/`:
@@ -182,6 +325,9 @@ Inside the jail, the app sees a normal-looking root with:
 /dev             ← devfs limited by ruleset matching capabilities
 /home/<user>     ← the per-app home (overlay/home from above)
 /tmp             ← per-app tmp (overlay/tmp)
+/usr/local/lib   ← symlink-tree to declared FreeBSD packages in the pool
+/usr/local/include
+/usr/local/share/...
 ```
 
 ## 5. Capability → jail config translation
@@ -219,6 +365,14 @@ network = "full"
   →  vnet = inherit
      (the host's default interface is reachable; outbound
       filtering by pf if configured)
+
+[packages.freebsd] openssl = "3.0", libxml2 = "*", ...
+  →  resolve each constraint against pool inventory
+  →  compute transitive closure via pkg metadata
+  →  generate symlink tree at overlay/state/pkg-symlinks/
+     pointing at /var/db/atrium/pkg-pool/files/<pkg>/<v>/
+  →  mount.nullfs += "<symlink-tree>/usr/local /usr/local"
+     (the app's binary then finds libs at standard paths)
 ```
 
 The complete table lives in `portcullis/src/capabilities.rs`
@@ -446,6 +600,18 @@ Order matches risk (smallest blast radius first):
 - Implements the lifecycle in §6 end-to-end.
 - ~1 week.
 
+**Phase 4.5 — pkg pool.**
+- `portcullis pool {install,update,gc,list}` CLI for managing the
+  pool. `tessera-import` integration: reads `[packages.freebsd]`
+  from manifest, ensures pool entries exist before publishing the
+  app tree.
+- Per-package symlink-tree generator (caches in app overlay).
+- Manifest validation: resolve version constraints, compute
+  transitive closures via pkg metadata.
+- Pool-side garbage collection: walk all installed app
+  manifests; drop pool entries with zero refs.
+- ~1 wk.
+
 **Phase 5 — capability prompt UI.**
 - A minimal `atrium-prompt` service (or wired into Forum once
   D3 lands) that renders the prompt text + buttons.
@@ -456,11 +622,18 @@ Order matches risk (smallest blast radius first):
 
 D2.5 is "complete" when an end-to-end demo works:
 - atrium-edit-socket installed via `tessera-import` into a
-  managed Tessera location.
+  managed Tessera location, with `[packages.freebsd]` declaring
+  any pkg deps.
+- Pool ensures declared packages are present (single install per
+  package globally).
 - `portcullis launch org.atrium.edit` runs it in a jail with
-  exactly the capabilities declared.
-- Removes capabilities → app can't access them → fails cleanly.
-- Two parallel instances → isolated overlays, shared rootfs.
+  exactly the capabilities + the pool-mounted package files.
+- Removes capabilities or packages → app can't access them →
+  fails cleanly.
+- Two parallel instances → isolated overlays, shared rootfs,
+  shared pool.
+- Two different apps both depending on `openssl` → one pool entry,
+  zero per-app duplicate disk.
 
 ## 11. Open questions
 
@@ -495,3 +668,20 @@ D2.5 is "complete" when an end-to-end demo works:
   Multi-user would mean per-user `/atrium/sockets/` namespaces
   (e.g. `/atrium/sockets/<uid>/clipboard.sock`). Defer; current
   design mounts the singleton path.
+- **Pool-vs-rootfs file conflicts:** if an app's own rootfs ships
+  a libssl AND the manifest declares `openssl` from pkg, which
+  wins? Phase 4.5 design: error at install time ("ambiguous —
+  pick one"). Apps that want to ship vendored libs declare nothing
+  in `[packages.freebsd]`; apps that want pool deps don't ship
+  libs in their tree.
+- **Custom pkg repos:** an app needs something not in FreeBSD's
+  main repo. Probably allow `[packages.<repo>]` keys with
+  per-repo URL config; defer implementation until first user
+  asks.
+- **Pool security updates:** how does Atrium know to pull a new
+  openssl when a CVE drops? Either a periodic `portcullis pool
+  refresh` (cron) or hooked to the FreeBSD security advisory
+  feed. Defer to operations layer.
+- **What about ports vs binary pkg:** for now, binary-only.
+  Building from ports would require a heavier tool chain in the
+  install jail; not worth the complexity for D2.5.
