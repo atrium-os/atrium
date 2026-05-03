@@ -1051,13 +1051,33 @@ Order matches risk (smallest blast radius first):
   /etc tree (passwd/group/zshrc/login.conf) deferred to the
   login-wiring step.
 
-  *Step 4 (pending):* Login integration via login.conf or a
-  small pam_atrium / nologin-style wrapper that creates the
-  session jail and jexec's zsh into it.
+  *Step 4 (landed):* Login wiring via wrapper-shell route
+  (PAM rejected — see Phase 4 design notes for the cost
+  analysis: language-policy collision, system-wide blast
+  radius, slower test loop, config sprawl). The wrapper
+  ships at atrium-session/install/atrium-login as a 30-line
+  POSIX shell script: waits up to 5s for the portcullisd
+  socket, then execs `atrium-session enter $USER`. New
+  `atrium-session enter` subcommand is idempotent (no-op if
+  the jail is already running) and uses jexec -l -U to drop
+  to the user. Curated /etc tree composer (passwd, group,
+  shells, zshrc with `_atrium_launch` completion + `apps`
+  alias + welcome banner) lands per-session at
+  /var/lib/atrium/sessions/<user>/etc/, bind-mounted RO at
+  jail/etc.
 
-  *Step 5 (pending):* /apps wrapper scripts so `./<app-id>`
-  inside the session jail just works (each script execs
-  `portcullis launch "$(basename "$0")"`).
+  *Step 5 (landed):* `portcullis link-apps` walks APPS_DIR
+  and drops a 3-line wrapper at /var/lib/atrium/apps/<id>/<id>
+  per installed app (mode 0755). Inside the session jail,
+  `./apps/<id>/<id>` execs `portcullis launch <id>`. tessera-
+  import will call this on every install in a future commit;
+  for now run it by hand.
+
+  Phase 4.4 is now complete: a logged-in user lands in a
+  jailed shell with no path to the unjailed host, can list
+  installed apps via `apps`, and launches them through
+  portcullisd which mounts/jail-c's the per-app jail with
+  the user's tty handed over via SCM_RIGHTS.
 
 **Phase 4.5 — first-run setup phase** (deferred, smaller now).
   Per-app overlay sentinel (`.atrium-firstrun-done`) detection.

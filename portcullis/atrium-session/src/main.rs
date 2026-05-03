@@ -27,10 +27,13 @@
 //! Subcommands:
 //!   atrium-session render  <user>  → print the jail.conf (no I/O)
 //!   atrium-session create  <user>  → set up mounts + jail -c
+//!   atrium-session enter   <user>  → ensure created, then jexec zsh
 //!   atrium-session destroy <user>  → jail -r + tear down mounts
 //!
-//! Phase 4.4 step 3 scope: render + create + destroy. Login(8)
-//! integration is step 4; /apps wrapper scripts are step 5.
+//! `enter` is the entry point for the login wrapper shell — it
+//! makes session creation idempotent so logging in twice doesn't
+//! re-mount everything, and second/third ttys jexec into the
+//! already-running jail.
 
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
@@ -48,13 +51,19 @@ fn usage() -> ! {
     eprintln!("\
 usage:
     atrium-session render  <user>     print jail.conf section, no I/O
-    atrium-session create  <user>     set up mounts + jail -c
+    atrium-session create  <user>     set up mounts + jail -c (idempotent)
+    atrium-session enter   <user>     ensure created, then jexec zsh
     atrium-session destroy <user>     jail -r + unmount everything
 
     Builds a per-user session jail at /var/lib/atrium/sessions/<user>/.
     The user's login shell (zsh) runs inside it with /apps mounted
     read-only and the portcullisd socket bind-mounted at
     /atrium/sockets/portcullis.sock.
+
+    `enter` is what the atrium-login wrapper shell calls. It does
+    a no-op if the jail is already running (second tty for the
+    same user just jexec's in). Replaces the calling process via
+    exec — the login(1) parent waits on the jexec'd zsh.
 ");
     std::process::exit(2);
 }
@@ -70,6 +79,7 @@ fn main() -> ExitCode {
     match args[1].as_str() {
         "render"  => cmd_render(user),
         "create"  => cmd_create(user),
+        "enter"   => cmd_enter(user),
         "destroy" => cmd_destroy(user),
         "--help" | "-h" => usage(),
         other => {
@@ -103,9 +113,23 @@ fn cmd_create(user: &str) -> ExitCode {
     let layout = SessionLayout::for_user(user);
     let jc = build_session_jail(user);
 
+    /* Idempotent: if a session jail with this name is already
+     * running, do nothing. Lets `enter` call `create` blindly. */
+    if jail_is_running(&jc.name) {
+        return ExitCode::SUCCESS;
+    }
+
     /* 1. Create the directory skeleton. */
     if let Err(e) = layout.create_dirs() {
         eprintln!("atrium-session create: {e}");
+        return ExitCode::from(1);
+    }
+
+    /* 1b. Compose the curated /etc tree (passwd/group/zshrc).
+     * Without this, getpwuid() inside the jail returns NULL and
+     * zsh can't expand ~/foo or render its prompt. */
+    if let Err(e) = layout.compose_curated_etc(user) {
+        eprintln!("atrium-session create: curated /etc: {e}");
         return ExitCode::from(1);
     }
 
@@ -159,6 +183,21 @@ fn cmd_create(user: &str) -> ExitCode {
     if let Err(e) = run("mount", &["-t", "nullfs", "-o", "ro", APPS_DIR,
                                     apps_dst.to_str().unwrap()]) {
         eprintln!("mount /apps: {e}");
+        layout.umount_all_silent();
+        return ExitCode::from(1);
+    }
+
+    /* 5b. Bind-mount the curated /etc into the jail. */
+    let etc_dst = layout.jail.join("etc");
+    if let Err(e) = std::fs::create_dir_all(&etc_dst) {
+        eprintln!("create etc mountpoint: {e}");
+        layout.umount_all_silent();
+        return ExitCode::from(1);
+    }
+    if let Err(e) = run("mount", &["-t", "nullfs", "-o", "ro",
+                                    layout.curated_etc.to_str().unwrap(),
+                                    etc_dst.to_str().unwrap()]) {
+        eprintln!("mount /etc: {e}");
         layout.umount_all_silent();
         return ExitCode::from(1);
     }
@@ -221,6 +260,40 @@ fn cmd_create(user: &str) -> ExitCode {
     }
 }
 
+/// `enter` is what the atrium-login wrapper shell calls after
+/// login(1) authenticates the user. Ensures the session jail
+/// exists, then exec's `jexec session_<user> /usr/local/bin/zsh`
+/// — replaces this process so login(1)'s child wait completes
+/// when zsh exits.
+fn cmd_enter(user: &str) -> ExitCode {
+    /* Idempotent create. Inline the create-or-skip check rather
+     * than calling cmd_create, because ExitCode doesn't expose
+     * its inner u8 stably and we need to know success-vs-fail. */
+    let jail_name = format!("session_{user}");
+    if !jail_is_running(&jail_name) {
+        let rc = cmd_create(user);
+        /* If create failed, propagate. We can't pattern-match on
+         * ExitCode, but we can re-check: if the jail still isn't
+         * running, create failed. */
+        if !jail_is_running(&jail_name) {
+            return rc;
+        }
+    }
+    let zsh = "/usr/local/bin/zsh";
+    /* Use exec(3) family via std::os::unix::process::CommandExt::exec
+     * so we don't fork — login(1)'s child IS this jexec'd shell. */
+    use std::os::unix::process::CommandExt;
+    let err = Command::new("jexec")
+        .arg("-l")              /* clean login env */
+        .arg("-U").arg(user)    /* run as the user, not root */
+        .arg(&jail_name)
+        .arg(zsh)
+        .arg("-l")              /* zsh as a login shell */
+        .exec();                /* never returns on success */
+    eprintln!("atrium-session enter: jexec failed: {err}");
+    ExitCode::from(1)
+}
+
 fn cmd_destroy(user: &str) -> ExitCode {
     let jc = build_session_jail(user);
     let _ = Command::new("jail").arg("-r").arg(&jc.name).status();
@@ -249,21 +322,23 @@ const BASE_RO_MOUNTS: &[(&str, &str)] = &[
 ];
 
 struct SessionLayout {
-    user:    String,
-    root:    PathBuf,
-    lower:   PathBuf,
-    overlay: PathBuf,
-    jail:    PathBuf,
+    user:        String,
+    root:        PathBuf,
+    lower:       PathBuf,
+    overlay:     PathBuf,
+    jail:        PathBuf,
+    curated_etc: PathBuf,
 }
 
 impl SessionLayout {
     fn for_user(user: &str) -> Self {
         let root = PathBuf::from(SESSIONS_DIR).join(user);
         Self {
-            user:    user.to_string(),
-            lower:   root.join("lower"),
-            overlay: root.join("overlay"),
-            jail:    root.join("jail"),
+            user:        user.to_string(),
+            lower:       root.join("lower"),
+            overlay:     root.join("overlay"),
+            jail:        root.join("jail"),
+            curated_etc: root.join("etc"),
             root,
         }
     }
@@ -273,10 +348,59 @@ impl SessionLayout {
         std::fs::create_dir_all(&self.lower)?;
         std::fs::create_dir_all(&self.overlay)?;
         std::fs::create_dir_all(&self.jail)?;
+        std::fs::create_dir_all(&self.curated_etc)?;
         /* Pre-create $HOME inside the overlay so zsh sees it on
          * first login (otherwise the overlay is empty and zsh
          * cd's to / which is jarring). */
         std::fs::create_dir_all(self.overlay.join("home").join(&self.user))?;
+        Ok(())
+    }
+
+    /// Build the minimal /etc tree the in-jail shell needs:
+    ///
+    ///   passwd / group   so getpwuid()/getgrgid() resolve $USER
+    ///   zshrc            so the interactive prompt + tab-completion
+    ///                    for `launch <id>` are present
+    ///   shells           lists /usr/local/bin/zsh as valid
+    ///
+    /// Lives at <session-root>/etc/ on the host, bind-mounted into
+    /// the jail at /etc as read-only at create time. Generated per
+    /// user so each session sees its own passwd entry.
+    fn compose_curated_etc(&self, user: &str) -> std::io::Result<()> {
+        /* passwd: bare entry for the session user. uid 1000 is a
+         * placeholder — exec.system_jail_user=true means jail(8)
+         * looks up the *host's* passwd for the actual uid when
+         * jexec'ing; this in-jail file just satisfies in-process
+         * lookups by zsh and friends. */
+        let home = format!("/home/{user}");
+        let passwd = format!(
+            "root:*:0:0:Charlie &:/root:/usr/local/bin/zsh\n\
+             {user}:*:1000:1000:Atrium User:{home}:/usr/local/bin/zsh\n");
+        std::fs::write(self.curated_etc.join("passwd"), passwd)?;
+
+        let group = format!(
+            "wheel:*:0:root,{user}\n\
+             {user}:*:1000:\n");
+        std::fs::write(self.curated_etc.join("group"), group)?;
+
+        let shells = "/usr/local/bin/zsh\n/bin/sh\n";
+        std::fs::write(self.curated_etc.join("shells"), shells)?;
+
+        /* Curated zshrc: PS1 + tab-completion for `launch <id>`
+         * against /apps/. Anything else the user wants goes in
+         * their per-user overlay's $HOME/.zshrc. */
+        let zshrc = "\
+# Atrium session-jail zshrc — installed by atrium-session.
+# Personal overrides go in $HOME/.zshrc, loaded after this.
+autoload -Uz compinit && compinit -u
+PROMPT='%F{cyan}%n%f@%F{green}atrium%f:%~%# '
+# Tab-complete `launch <id>` from /apps/
+_atrium_launch() { _files -W /apps -/ ; }
+compdef _atrium_launch launch
+alias apps='ls /apps'
+echo 'Atrium session jail. `apps` lists installed apps; `./apps/<id>/<id>` runs one.'
+";
+        std::fs::write(self.curated_etc.join("zshrc"), zshrc)?;
         Ok(())
     }
 
@@ -288,6 +412,8 @@ impl SessionLayout {
         let _ = umount_silent(&dev);
         let socket_dst = self.jail.join("atrium/sockets");
         let _ = umount_silent(&socket_dst);
+        let etc_dst = self.jail.join("etc");
+        let _ = umount_silent(&etc_dst);
         let apps_dst = self.jail.join("apps");
         let _ = umount_silent(&apps_dst);
         /* unionfs over jail */
@@ -325,6 +451,16 @@ fn build_session_jail(user: &str) -> JailConfig {
 }
 
 // ── helpers ──────────────────────────────────────────────────────
+
+fn jail_is_running(jail_name: &str) -> bool {
+    Command::new("jls")
+        .arg("-j").arg(jail_name)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
 
 fn run(cmd: &str, args: &[&str]) -> std::io::Result<()> {
     let st = Command::new(cmd).args(args).status()?;

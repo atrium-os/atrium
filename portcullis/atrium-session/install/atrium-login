@@ -1,0 +1,47 @@
+#!/bin/sh
+# atrium-login — login wrapper that drops the user into a session jail.
+#
+# Install this at /usr/local/bin/atrium-login (mode 0755), then set
+# affected users' shell field in /etc/master.passwd to it:
+#
+#   pw usermod alice -s /usr/local/bin/atrium-login
+#   cap_mkdb /etc/login.conf
+#
+# login(1)/sshd then exec this on successful auth; we exec
+# atrium-session enter, which idempotently creates the per-user
+# session jail and jexec's zsh into it.
+#
+# Dev escape hatch: keep an unaffected dev account (e.g. `dev`) with
+# its shell still set to /bin/sh so you can always log in to the host
+# without the jail layer.
+
+set -e
+
+# atrium-session is privileged (it does mount + jail -c), so this
+# wrapper script is the security boundary: it must run as root.
+# login(1) invokes the user's shell as root before dropping privs;
+# atrium-session enter then re-drops to the user via `jexec -U`.
+if [ "$(id -u)" -ne 0 ]; then
+    exec /bin/sh -l "$@"   # not root — fall back to sh, no jail
+fi
+
+# Required: the user we're logging in as. login(1) sets $USER.
+if [ -z "${USER:-}" ]; then
+    echo "atrium-login: \$USER unset; refusing to enter session jail" >&2
+    exec /bin/sh -l "$@"
+fi
+
+# wait_for_socket: portcullisd may still be coming up at boot.
+# We give it 5s; if it never shows, fall through to the host shell
+# (degraded mode — better than the user being locked out entirely).
+i=0
+while [ $i -lt 50 ] && [ ! -S /var/run/portcullisd.sock ]; do
+    sleep 0.1
+    i=$((i + 1))
+done
+if [ ! -S /var/run/portcullisd.sock ]; then
+    echo "atrium-login: portcullisd not ready, dropping to /bin/sh" >&2
+    exec /bin/sh -l "$@"
+fi
+
+exec /usr/local/bin/atrium-session enter "$USER"
