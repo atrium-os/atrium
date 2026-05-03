@@ -1,33 +1,64 @@
 //! portcullis — CLI front-end.
 //!
-//! Phase 1 supports one subcommand: `validate <atrium.toml>`.
-//! Future phases add `launch`, `pkg refresh`, etc.
+//! Phase 1: `validate <atrium.toml>`
+//! Phase 2: `launch --dry-run <app-tree>` (renders jail.conf;
+//!          doesn't invoke jail(8) yet)
+//!          `launch --no-prompt <app-tree>` (also runs jail -c)
+//!
+//! Future phases add capability prompts, portcullisd integration, etc.
 
 use std::fs;
-use std::process::ExitCode;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode};
+
+use portcullis_jail::{build, BuildOpts};
 
 fn usage() -> ! {
     eprintln!("\
 usage:
     portcullis validate <atrium.toml>
+        Parses and validates a manifest. Exits 0 on success.
 
-    Parses and validates an atrium.toml manifest. Prints errors and
-    warnings; exits 0 if no errors, 1 otherwise.
+    portcullis launch [--dry-run | --no-prompt] <app-tree>
+        Reads <app-tree>/atrium.toml, builds a jail.conf section,
+        and either prints it (--dry-run) or runs `jail -c` (--no-prompt).
+        Phase 2 dev mode — no policy/prompt mediation yet.
 ");
     std::process::exit(2);
 }
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        usage();
-    }
+    if args.len() < 2 { usage(); }
     match args[1].as_str() {
         "validate" => {
             if args.len() != 3 { usage(); }
             cmd_validate(&args[2])
         }
-        "--help" | "-h" => { usage() }
+        "launch" => {
+            if args.len() < 3 { usage(); }
+            let mut dry_run = false;
+            let mut no_prompt = false;
+            let mut tree: Option<&str> = None;
+            for a in &args[2..] {
+                match a.as_str() {
+                    "--dry-run"   => dry_run = true,
+                    "--no-prompt" => no_prompt = true,
+                    other if other.starts_with("--") => {
+                        eprintln!("unknown flag: {other}");
+                        usage();
+                    }
+                    other => tree = Some(other),
+                }
+            }
+            let Some(t) = tree else { usage() };
+            if !dry_run && !no_prompt {
+                eprintln!("must pass --dry-run or --no-prompt (Phase 2 has no prompt mediation yet)");
+                return ExitCode::from(2);
+            }
+            cmd_launch(t, dry_run)
+        }
+        "--help" | "-h" => usage(),
         other => {
             eprintln!("portcullis: unknown subcommand {other:?}");
             usage();
@@ -51,12 +82,8 @@ fn cmd_validate(path: &str) -> ExitCode {
         }
         Ok(m) => {
             let report = portcullis_toml::validate(&m);
-            for w in &report.warnings {
-                eprintln!("warning: {w}");
-            }
-            for e in &report.errors {
-                eprintln!("error:   {e}");
-            }
+            for w in &report.warnings { eprintln!("warning: {w}"); }
+            for e in &report.errors   { eprintln!("error:   {e}"); }
             if report.is_ok() {
                 println!("{path}: OK ({} warning{})",
                     report.warnings.len(),
@@ -73,3 +100,85 @@ fn cmd_validate(path: &str) -> ExitCode {
         }
     }
 }
+
+fn cmd_launch(tree_path: &str, dry_run: bool) -> ExitCode {
+    let tree = PathBuf::from(tree_path);
+    let manifest_path = tree.join("atrium.toml");
+    let text = match fs::read_to_string(&manifest_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("portcullis launch: {}: {e}", manifest_path.display());
+            return ExitCode::from(1);
+        }
+    };
+    let manifest = match portcullis_toml::Manifest::from_str(&text) {
+        Err(e) => {
+            eprintln!("portcullis launch: parse error: {e}");
+            return ExitCode::from(1);
+        }
+        Ok(m) => m,
+    };
+    let report = portcullis_toml::validate(&manifest);
+    for w in &report.warnings { eprintln!("warning: {w}"); }
+    if !report.is_ok() {
+        for e in &report.errors { eprintln!("error:   {e}"); }
+        return ExitCode::from(1);
+    }
+
+    /* Defaults appropriate for Phase 2 dev launches. */
+    let opts = BuildOpts {
+        root_path:    tree.clone(),    /* dev mode: rootfs IS the app tree */
+        host_sockets: PathBuf::from("/atrium/sockets"),
+        user_home:    std::env::var_os("HOME")
+                          .map(PathBuf::from)
+                          .unwrap_or_else(|| PathBuf::from("/")),
+        user_name:    std::env::var("USER").unwrap_or_else(|_| "atrium".into()),
+        devfs_ruleset: 99,             /* Phase 4 manages allocation */
+    };
+
+    let jc = match build(&manifest, &opts) {
+        Err(e) => {
+            eprintln!("portcullis launch: build error: {e}");
+            return ExitCode::from(1);
+        }
+        Ok(jc) => jc,
+    };
+
+    if dry_run {
+        println!("# jail.conf section ──────────────────────────────");
+        print!("{}", jc.render_jail_conf());
+        println!();
+        println!("# devfs.rules ruleset ────────────────────────────");
+        print!("{}", jc.render_devfs_rules());
+        return ExitCode::SUCCESS;
+    }
+
+    /* --no-prompt: actually invoke jail -c. Requires root + FreeBSD. */
+    let conf_path = std::env::temp_dir().join(format!("portcullis-{}.conf",
+        std::process::id()));
+    if let Err(e) = fs::write(&conf_path, jc.render_jail_conf()) {
+        eprintln!("write {}: {e}", conf_path.display());
+        return ExitCode::from(1);
+    }
+    let status = Command::new("jail")
+        .arg("-c").arg("-f").arg(&conf_path).arg(&jc.name)
+        .status();
+    let _ = fs::remove_file(&conf_path);
+    match status {
+        Ok(s) if s.success() => {
+            println!("portcullis: jail '{}' running", jc.name);
+            ExitCode::SUCCESS
+        }
+        Ok(s) => {
+            eprintln!("jail -c failed: {s}");
+            ExitCode::from(1)
+        }
+        Err(e) => {
+            eprintln!("could not invoke jail: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn assert_path_exists(p: &Path) -> bool { p.exists() }

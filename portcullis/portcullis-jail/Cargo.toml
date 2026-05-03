@@ -1,0 +1,11 @@
+[package]
+name        = "portcullis-jail"
+version.workspace     = true
+edition.workspace     = true
+license.workspace     = true
+repository.workspace  = true
+description = "Translates an atrium.toml Manifest into a jail.conf section + mount/devfs rules per docs/spec/portcullis.md §5. Pure Rust; doesn't invoke jail(8) itself."
+
+[dependencies]
+portcullis-toml = { path = "../portcullis-toml" }
+thiserror       = "1"

@@ -12,3 +12,4 @@ path = "src/main.rs"
 
 [dependencies]
 portcullis-toml = { path = "../portcullis-toml" }
+portcullis-jail = { path = "../portcullis-jail" }
