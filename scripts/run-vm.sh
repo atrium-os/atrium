@@ -2,17 +2,36 @@
 # Boot FreeBSD 16.0-CURRENT arm64 under modified qemu + HVF on macOS.
 #
 # Usage:
-#   run-vm.sh                # boot without ivshmem (smoke test)
-#   run-vm.sh --gpu          # boot with ivshmem-doorbell (requires gpu server running)
-#   run-vm.sh --virtio-gpu       # add virtio-gpu-pci (D0 driver bring-up; no UI)
-#   run-vm.sh --virtio-gpu --display  # virtio-gpu + a Cocoa window so scanout is visible
-#   run-vm.sh --gpu --virtio-gpu  # both (transitional during D0)
+#   run-vm.sh                # headless (no display, ssh in via 2222)
+#   run-vm.sh --gpu          # ivshmem-doorbell (requires fresco server running)
+#   run-vm.sh --virtio-gpu   # add virtio-gpu-pci (D0 driver bring-up; no UI)
+#   run-vm.sh --virtio-gpu --display          # virtio-gpu + Cocoa window
+#   run-vm.sh --virtio-gpu --display --tablet # also absolute mouse (more battery cost)
+#   run-vm.sh --gpu --virtio-gpu              # both (transitional during D0)
+#
+# Tunables (env vars):
+#   SMP=N        vCPU count, default 4. Lower = less host wakeup overhead
+#                when the guest is idle. 2 is plenty for shell + cargo work.
+#   MEM=MB       guest RAM, default 12288 (12 GiB).
+#
+# Power note (laptop battery):
+#   The biggest single host-power saver is GUEST-SIDE: set
+#       kern.hz="100"
+#   in the guest's /boot/loader.conf. FreeBSD defaults to 1000 Hz, which
+#   on a 4-vCPU idle guest fires ~4000 timer interrupts/sec, each one a
+#   VM-exit. Dropping to 100 Hz cuts that 10× and lets the host CPU
+#   reach deep C-states. (After editing loader.conf, reboot the guest.)
+#   On the host side: --display alone adds ~5% CPU for the Cocoa
+#   refresh loop; --tablet on top adds another 1–2% for USB HID polling.
+#   The default headless mode (no flags) is the most efficient.
 
 set -eu
 
 BSD_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 QEMU_DIR="/Users/girivs/src/qemu-build"
 QEMU="$QEMU_DIR/build/qemu-system-aarch64"
+SMP="${SMP:-4}"
+MEM="${MEM:-12288}"
 EFI_SRC="$QEMU_DIR/build/qemu-bundle/opt/homebrew/share/qemu/edk2-aarch64-code.fd"
 EFI_PAD="$BSD_DIR/vm/edk2-aarch64-code.fd"
 EFI_VARS="$BSD_DIR/vm/edk2-arm-vars.fd"
@@ -38,6 +57,8 @@ truncate -s 67108864 "$EFI_VARS"
 GPU_ARGS=""
 VIRTIO_GPU_ARGS=""
 DISPLAY_FRONTEND=""
+WANT_DISPLAY=0
+WANT_TABLET=0
 # Serial on TCP + qemu monitor on a unix socket. Keeps the VM detachable
 # (no stdio coupling) while still letting us reach the FreeBSD serial
 # console — `nc 127.0.0.1 4444` and send `~^B` to drop into ddb when
@@ -71,15 +92,15 @@ for arg in "$@"; do
         --display)
             # Cocoa window so virtio-gpu scanout is actually visible.
             # Drops -nographic; serial console moves to mon:stdio.
-            # Also add a USB controller + keyboard + tablet so input
-            # in the Cocoa window flows through to the guest. ukbd
-            # claims usb-kbd → kbdmux0 → /dev/input/event0, which is
-            # what atrium-compositor's input_reader thread reads.
-            DISPLAY_FRONTEND="-display cocoa -serial mon:stdio \
-                              -device qemu-xhci \
-                              -device usb-kbd \
-                              -device usb-tablet"
-            NOGRAPHIC=""
+            # Adds USB xhci + usb-kbd so keyboard input flows through
+            # (ukbd → kbdmux0 → /dev/input/event0, what
+            # atrium-compositor's input_reader thread reads). Add
+            # --tablet on top for absolute-coordinate mouse, which is
+            # nicer UX but costs ~1–2% host CPU continuously polling.
+            WANT_DISPLAY=1
+            ;;
+        --tablet)
+            WANT_TABLET=1
             ;;
         *)
             echo "error: unknown arg $arg" >&2
@@ -88,9 +109,24 @@ for arg in "$@"; do
     esac
 done
 
+# Compose display frontend after arg parse so --tablet works regardless
+# of the flag order on the command line.
+if [ "$WANT_DISPLAY" = 1 ]; then
+    DISPLAY_FRONTEND="-display cocoa -serial mon:stdio \
+                      -device qemu-xhci \
+                      -device usb-kbd"
+    if [ "$WANT_TABLET" = 1 ]; then
+        DISPLAY_FRONTEND="$DISPLAY_FRONTEND -device usb-tablet"
+    fi
+    NOGRAPHIC=""
+elif [ "$WANT_TABLET" = 1 ]; then
+    echo "error: --tablet requires --display" >&2
+    exit 1
+fi
+
 exec "$QEMU" \
     -accel hvf -cpu host -machine virt,gic-version=2 \
-    -smp 4 -m 12288 \
+    -smp "$SMP" -m "$MEM" \
     -drive if=pflash,format=raw,unit=0,file="$EFI_PAD",readonly=on \
     -drive if=pflash,format=raw,unit=1,file="$EFI_VARS" \
     -drive if=virtio,file="$DISK",format=qcow2,cache=writeback \
