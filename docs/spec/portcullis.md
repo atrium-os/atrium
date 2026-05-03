@@ -101,10 +101,10 @@ audio       = false               # no audio access
 mode        = "read-only"
 paths       = ["/usr/share/fonts"]
 
-[packages.freebsd]                # FreeBSD pkg dependencies
-openssl     = "3.0"               # exact version
-libxml2     = "*"                 # any version (use pool's latest)
-libpng      = ">=1.6, <2.0"       # version constraint
+[setup]                           # optional — runs once on first launch
+command     = "scripts/firstrun.sh"
+network     = true                # transient network during setup only
+timeout     = "120s"
 
 [resources]                       # rctl-enforced limits, optional
 memory      = "512M"
@@ -154,13 +154,109 @@ At parse time:
   OR a `policy.toml` admin grant.
 - Unknown keys are warnings, not errors (forward compatibility).
 
-## 3.4 FreeBSD package dependencies
+## 3.4 Setup phase (first-run script)
 
-`[packages.freebsd]` declares pkg dependencies. Portcullis runs
-`pkg install` **inside the app's jail** to satisfy them — standard
-FreeBSD admin model, no bespoke pool format. Cross-jail storage
-dedup is automatic via Tessera CAS-FS: 50 apps each pkg-installing
-openssl produce 50 logical installs but **one physical disk copy**.
+Portcullis intentionally does **not** know what an app installs.
+Apps that need to `pkg install` dependencies, download model
+weights, generate keys, populate caches, or do any other
+imperative bootstrap own that work in their `[setup]` section.
+
+```toml
+[setup]
+command = "scripts/firstrun.sh"   # path within app tree
+network = true                    # transient network during setup
+timeout = "120s"                  # fail if it hangs
+```
+
+### Mechanics
+
+On launch, Portcullis checks the per-app overlay for a sentinel
+file `.atrium-firstrun-done`:
+
+- **Sentinel present** (subsequent launches): skip setup, jump
+  to runtime.
+- **Sentinel absent + `[setup]` exists** (first launch, or after
+  reinstall): apply runtime capabilities + setup additions
+  (network, etc.); execute `setup.command` via jail.conf's
+  `exec.created`. On clean exit, write sentinel. On failure,
+  leave sentinel absent so next launch retries.
+- **Sentinel absent + no `[setup]`**: write sentinel and proceed.
+
+The script runs inside the same jail the app will run in,
+with its working directory at the app's tree root. Whatever it
+puts in `/usr/local/...`, `/etc/...`, `/var/...` lands in the
+app's overlay (Tessera-backed; cross-jail dedup'd by content).
+
+### Two-phase capabilities
+
+Setup capabilities are *additive* over runtime capabilities. A
+user prompt at first install distinguishes the two:
+
+```
+"Atrium Edit" wants:
+
+  At setup (one-time, first launch):
+      ✓ Network access
+      ✓ Up to 120 seconds runtime
+  Always (every launch):
+      ✓ Display (Fresco)
+      ✓ Clipboard
+      ✓ Notifications
+      ✓ Read/write your Documents folder
+
+[Allow once]   [Allow always]   [Deny]
+```
+
+After setup completes successfully, the network capability is
+dropped — the runtime jail has no network unless `[capabilities].
+network` says otherwise.
+
+### What apps typically do in setup
+
+- `pkg install openssl libxml2` — pull FreeBSD pkg deps. Tessera
+  CAS-FS dedups identical files across all jails that did the
+  same install (one disk copy of openssl regardless of how many
+  apps).
+- `cargo install` or other language-specific package fetches.
+- Download large assets (ML models, asset bundles) from the web.
+- Run database migrations, generate keys, prepare caches.
+- Anything else — Portcullis doesn't care.
+
+### Cross-jail dedup is automatic, not orchestrated
+
+Because all app overlays are subtrees of the single shared
+Tessera volume (see §4.1), files written by one app's setup are
+content-addressed by Tessera. If app B's setup writes the same
+file (e.g., the same `libssl.so.3`), Tessera's pack registry
+finds the existing blob and dedupes — zero extra disk used.
+
+Portcullis doesn't need to know about pkg, the pool concept, or
+any specific package manager. The dedup is a property of the
+storage layer, not the launcher.
+
+### Sharing a fetch cache (optional)
+
+Apps that use `pkg install` benefit from a shared download cache
+to avoid redundant downloads. The convention is:
+
+```
+/var/cache/atrium/pkg/  ← shared across jails (read-only nullfs)
+```
+
+Apps' setup scripts can opt in by setting `PKG_CACHEDIR` to that
+path. This is a hint, not a requirement; Portcullis exposes the
+mount point via the `[capabilities]` system if the app declares
+it (`fetch-cache = "pkg"`).
+
+### Re-running setup (upgrades)
+
+If the app's manifest changes (manifest hash mismatch on grant),
+the user is re-prompted; if they re-grant setup, Portcullis
+clears the sentinel so setup re-runs on next launch. Apps should
+write idempotent setup scripts.
+
+`portcullis reinstall <app>` wipes the overlay (or just the
+sentinel) on user request.
 
 ### Mechanics
 
@@ -340,7 +436,7 @@ Inside the jail, the app sees a normal-looking root with:
 /dev             ← devfs limited by ruleset matching capabilities
 /home/<user>     ← the per-app home (overlay/home from above)
 /tmp             ← per-app tmp (overlay/tmp)
-/usr/local/lib   ← populated by per-jail `pkg install` (see §3.4); files dedup'd by Tessera CAS
+/usr/local/lib   ← populated by the app's first-run script (see §3.4) if it ran `pkg install` or similar; files dedup'd across jails by Tessera CAS automatically
 /usr/local/include
 /usr/local/share/...
 ```
@@ -416,15 +512,14 @@ network = "full"
      (the host's default interface is reachable; outbound
       filtering by pf if configured)
 
-[packages.freebsd] openssl = "3.0", libxml2 = "*", ...
-  →  at install (tessera-import) or first launch:
-       jail -c (transient install jail w/ network) command=
-         /usr/sbin/pkg install -y openssl libxml2
-       PKG_CACHEDIR=/var/cache/atrium/pkg  (shared across jails)
-  →  pkg writes files into the jail's rootfs+overlay (same
-     Tessera volume → identical files dedup automatically)
-  →  no extra mount needed; app sees normal pkg-installed
-     /usr/local layout
+[setup] command = "scripts/firstrun.sh", network = true
+  →  on first launch (no .atrium-firstrun-done sentinel):
+       jail.conf adds setup-phase capabilities (network etc.)
+       exec.created = "scripts/firstrun.sh"
+       on success: write sentinel; remove network capability
+       from runtime jail.conf for this app's subsequent launches
+  →  on subsequent launches: setup is skipped; only runtime
+     capabilities apply
 ```
 
 The complete table lives in `portcullis/src/capabilities.rs`
@@ -652,19 +747,15 @@ Order matches risk (smallest blast radius first):
 - Implements the lifecycle in §6 end-to-end.
 - ~1 week.
 
-**Phase 4.5 — pkg dependency installer.**
-- `tessera-import` integration: reads `[packages.freebsd]`,
-  spawns a transient install-jail per app to run `pkg install`
-  with shared `PKG_CACHEDIR=/var/cache/atrium/pkg/`.
-- Network-only-during-install capability (transient ip4/vnet
-  for the install jail; dropped after).
-- `portcullis pkg {refresh,info}` CLI: refresh re-runs
-  `pkg upgrade` inside each app's jail subject to its
-  manifest constraints; info reports what's installed per app.
-- No symlink-tree synthesis, no pool conflict resolution, no
-  bespoke pool format — pkg's own database is the source of
-  truth inside each jail. Tessera CAS does the cross-jail
-  dedup transparently.
+**Phase 4.5 — first-run setup phase.**
+- Per-app overlay sentinel (`.atrium-firstrun-done`) detection.
+- jail.conf `exec.created` invocation when sentinel absent
+  + `[setup]` is present.
+- Setup-phase capability application (network etc., dropped
+  after).
+- Optional shared fetch cache mount at `/var/cache/atrium/pkg/`
+  for apps that opt in via `fetch-cache = "pkg"` capability.
+- `portcullis reinstall <app>` CLI to wipe sentinel/overlay.
 - ~½ wk.
 
 **Phase 5 — capability prompt UI.**
@@ -723,21 +814,24 @@ D2.5 is "complete" when an end-to-end demo works:
   Multi-user would mean per-user `/atrium/sockets/` namespaces
   (e.g. `/atrium/sockets/<uid>/clipboard.sock`). Defer; current
   design mounts the singleton path.
-- **App ships own libssl AND declares pkg openssl:** standard
-  pkg-on-FreeBSD precedence applies (vendored copies in the
-  app's rootfs win over /usr/local/lib/ files placed by pkg
-  install in the same jail). Documented as "pick one" but not
-  a structural conflict.
-- **Custom pkg repos:** an app needs something not in FreeBSD's
-  main repo. Probably allow `[packages.<repo>]` keys with
-  per-repo URL config; defer implementation until first user
-  asks.
-- **Security updates:** how does Atrium know to pull a new
-  openssl when a CVE drops? `portcullis pkg refresh` re-runs
-  `pkg upgrade` inside each app's jail (subject to manifest
-  constraints). Either invoked manually, on a cron, or hooked
-  to the FreeBSD security advisory feed. Defer scheduling
-  policy to the operations layer.
-- **Ports vs binary pkg:** binary only for D2.5. Building from
-  ports would need ports tree + build toolchain in install jail;
-  not worth the complexity early.
+- **Setup script timeouts:** what's a reasonable default cap?
+  120 s feels right for "pkg install a few things" but apps that
+  download multi-GB ML models need more. Manifest declares its
+  own; Portcullis enforces the cap. Document expectation that
+  long-running setup should show progress to the user (probably
+  via the prompt UI showing "still installing…").
+- **Setup failures:** if setup script exits non-zero, leave
+  sentinel absent and let next launch retry? Or fail the launch
+  permanently and require user intervention? Probably retry-on-
+  next-launch up to N times, then surface as a UI error.
+- **Setup script auditability:** users can inspect the script
+  before granting setup capabilities. UI should make this easy
+  ("Show setup script") so users aren't approving a black box.
+- **Setup-phase capability prompts:** are setup capabilities
+  always prompted (even if runtime caps are auto-granted)? Yes
+  — network access during setup is still network access. Always
+  visible in the prompt.
+- **Security updates:** how do CVEs get patched? Up to the app —
+  it might re-check on launch and re-pkg-install if outdated.
+  Atrium might surface a "no app has been re-installed in 90
+  days" warning via the prompt UI. Operations-layer policy.

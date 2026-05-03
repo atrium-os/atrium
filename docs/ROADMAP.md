@@ -165,7 +165,7 @@ Spec: [`spec/portcullis.md`](spec/portcullis.md).
 2. **Phase 2 — jail builder.** `portcullis-jail` crate: capability → jail.conf translation per spec §5. CLI `portcullis launch --no-prompt` (dev mode). Integration: launch atrium-rpc-echo-{server,client} in separate jails and verify socket mount path. ~1 wk.
 3. **Phase 3 — overlay + rootfs unionfs.** Tessera read-only rootfs over Tessera read-write overlay; tested with two parallel instances of the same app. ~1 wk.
 4. **Phase 4 — `portcullisd` + capability policy.** Long-running daemon. atrium-rpc service. Policy file at `/var/db/atrium/<user>/policy.toml`. Implements end-to-end lifecycle. ~1 wk.
-5. **Phase 4.5 — pkg dependency installer.** Apps declare `[packages.freebsd]` in atrium.toml; `tessera-import` runs `pkg install` inside each app's jail (transient install-jail with network). Shared `PKG_CACHEDIR` at `/var/cache/atrium/pkg/` avoids redundant downloads. Tessera CAS-FS dedups identical files across jails automatically — N apps depending on openssl → 1 disk copy via dedup, no special pool plumbing. ~½ wk.
+5. **Phase 4.5 — first-run setup phase.** App's atrium.toml `[setup]` declares an optional first-run script + transient setup-only capabilities (network etc.). On first launch (no overlay sentinel), Portcullis grants setup caps + runs the script via jail.conf `exec.created`; on success, drops setup caps and writes sentinel. Apps own all imperative bootstrap (pkg install, downloads, key generation, etc.); Portcullis stays orthogonal. Tessera CAS dedups whatever the scripts produce. ~½ wk.
 6. **Phase 5 — capability prompt UI.** Atrium-prompt service (CLI fallback for headless dev; wired into Forum once D3 lands). ~½ wk.
 
 **Risks:**
@@ -177,10 +177,10 @@ Spec: [`spec/portcullis.md`](spec/portcullis.md).
 **Estimate:** ~4½–5 weeks focused. Phases are independent enough to parallelize if multiple hands.
 
 **Integrates with:**
-- Tessera CAS-FS (single shared volume holds all jails as subtrees; dedup is per-volume, so cross-jail dedup happens automatically — see spec §4.1)
-- `tessera-import` (app installation into managed location; spawns transient install jails for `[packages.freebsd]` deps)
+- Tessera CAS-FS (single shared volume holds all jails as subtrees; dedup is per-volume, so cross-jail dedup happens automatically for any files apps' setup scripts produce — see spec §4.1)
+- `tessera-import` (app installation into managed location)
 - atrium-rpc (service sockets are the capability boundary)
-- FreeBSD `pkg(8)` (per-jail standard installs; signature verification + install scripts unchanged)
+- FreeBSD `pkg(8)` (apps may use it inside their setup script; standard FreeBSD model — Portcullis is unaware)
 - D1.7 binsplit (function-level dedup; transparent to Portcullis — apps still look like normal ELF at exec time)
 
 ## D3 — Forum (shell) + Praeco (notifications)
