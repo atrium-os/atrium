@@ -1,17 +1,19 @@
-//! atrium-window-demo — exercises bidirectional events on the socket.
+//! atrium-window-demo — bidirectional events on the envelope-based
+//! Fresco socket protocol.
 //!
-//! Sends CMD_CREATE_WINDOW, then uses `Connection::create_window` (which
-//! internally calls `wait_event` until the matching WindowCreated arrives).
-//! Verifies the demux machinery: the server's response Completion is
-//! event-shaped (COMP_WINDOW_CREATED) and routes through the new
-//! `pending_events` queue rather than the old direct-response path.
+//! Migrated to `fresco-client` (M2.7b canary). Replaces the legacy
+//! 128-byte CMD_CREATE_WINDOW / COMP_WINDOW_CREATED dance with the
+//! aqueduct-envelope OP_WINDOW_CREATE call that returns the
+//! assigned window_id via the IS_RESPONSE flag.
 //!
-//! Sleeps after, so a second `wait_event` would block indefinitely
-//! waiting for async events (resize, close-requested) that today only
-//! fire under WM-driven user input — which we don't have until step
-//! 2(c.12) plumbs `/dev/usbhid`.
+//! The async-event surface is unchanged conceptually — `wait_event()`
+//! still returns the next server-pushed event; the wire format
+//! underneath is now fresco-protocol's `EV_WINDOW_*` opcodes
+//! (RESIZED / FOCUS_CHANGED / CLOSE_REQUESTED / DPI_CHANGED) instead
+//! of the legacy COMP_INPUT_KEY / COMP_FOCUS_CHANGED.
 
-use fresco_socket::Connection;
+use fresco_client::Connection;
+use fresco_protocol::WindowHints;
 
 fn main() -> std::io::Result<()> {
     let path = std::env::args().nth(1)
@@ -19,16 +21,16 @@ fn main() -> std::io::Result<()> {
     let mut conn = Connection::connect(&path)?;
     eprintln!("connected to {path}");
 
-    let win = conn.create_window(800, 600, Some("hello-window"))?;
+    let win = conn.window_create(800, 600, "hello-window", WindowHints::default())?;
     eprintln!("server assigned window_id = {win}");
 
-    // Hold socket open so the WM keeps the window alive (and so
-    // any future resize/close event would land here).
+    /* Hold socket open so the WM keeps the window alive (and so any
+     * resize/close event would land here). */
     eprintln!("waiting for further events; ^C to exit");
     loop {
         match conn.wait_event(None)? {
             Some(ev) => eprintln!("event: {ev:?}"),
-            None => break,
+            None     => break,
         }
     }
     Ok(())
