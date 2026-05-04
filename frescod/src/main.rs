@@ -442,6 +442,16 @@ fn draw_frame_indicator(pixmap: &mut PixmapMut, frame: u64) {
 
 fn main() -> std::io::Result<()> {
     let _ = env_logger::try_init();
+
+    /* M2.4d wiring check: confirm the Vulkan backend dependency links
+     * cleanly when --features vulkan is enabled. Real integration
+     * follows in M2.5+ when the per-connection SceneState rework
+     * redirects scene-graph mutations into HeadlessRenderer's
+     * set_rect_nodes / set_texture_batches APIs. */
+    #[cfg(feature = "vulkan")]
+    eprintln!("frescod: built with Vulkan backend (fresco-vulkan v{})",
+        env!("CARGO_PKG_VERSION"));
+
     let gpu = Gpu::open()?;
     let dpy = Display::open()?;
     dpy.bind(&gpu)?;
