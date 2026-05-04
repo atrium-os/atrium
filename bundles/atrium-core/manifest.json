@@ -1,0 +1,22 @@
+{
+  "name":    "atrium-core",
+  "version": 1,
+  "ops": [
+    {
+      "id":              4096,
+      "name":            "rect",
+      "compute_entry":   "compute/op_rectangle.comp.spv:main",
+      "render_pipeline": "pipelines/pipe_rectangle"
+    },
+    {
+      "id":              4097,
+      "name":            "texture",
+      "compute_entry":   "compute/op_texture.comp.spv:main",
+      "render_pipeline": "pipelines/pipe_texture"
+    }
+  ],
+  "depends_on":   [],
+  "gpu_resources": {
+    "max_instances": 65536
+  }
+}

@@ -1,0 +1,19 @@
+[package]
+name        = "fresco-vulkan"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "Vulkan setup + per-frame compute/render dispatch for fresco-scene-server. ash-based; works against vendor Vulkan on FreeBSD, MoltenVK on macOS dev, lavapipe for SW fallback."
+
+[lib]
+name = "fresco_vulkan"
+path = "src/lib.rs"
+
+[dependencies]
+ash               = "0.38"
+ash-window        = "0.13"
+raw-window-handle = "0.6"
+anyhow            = "1"
+log               = "0.4"
+fresco-bundle     = { path = "../fresco-bundle" }
