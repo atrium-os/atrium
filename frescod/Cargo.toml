@@ -10,6 +10,11 @@ description = "Fresco scene-server daemon for FreeBSD — tiny-skia rendering du
 name = "frescod"
 path = "src/main.rs"
 
+[[bin]]
+name              = "frescod-vulkan-smoke"
+path              = "src/bin/vulkan_smoke.rs"
+required-features = ["vulkan"]
+
 [features]
 default = []
 # Accept the vendor-extension `CMD_INJECT_KEY` opcode which lets a
@@ -20,19 +25,22 @@ default = []
 inject-input = []
 
 # Compile in the Vulkan rendering path (HeadlessRenderer + SPIR-V
-# bundle dispatch). When enabled, `--vulkan` on the command line picks
-# the Vulkan backend; without `--vulkan` the legacy tiny-skia path
-# stays. Production migration is M2.5+ when the per-connection
-# SceneState rework redirects scene-graph mutations into the Vulkan
-# pipeline; this feature gate exists now so the workspace builds with
-# the dep wired before that rework lands.
-vulkan = ["dep:fresco-vulkan"]
+# bundle dispatch + aqueduct/EnvelopeFrontend dispatch). Enables the
+# `frescod-vulkan-smoke` binary that integrates the new stack end-to-end
+# (no scanout — dumps frames to PNG for behavioral validation).
+# Production frescod main.rs rewrite is M2.7d-final; this smoke bin
+# is the integration testbed.
+vulkan = ["dep:fresco-vulkan", "dep:aqueduct", "dep:fresco-protocol", "dep:image"]
 
 [dependencies]
 atrium-gpu-rs = { path = "../atrium-gpu-rs" }
 fresco-scene-server = { path = "../fresco-scene-server", features = ["tiny-skia-backend"] }
 fresco-vulkan = { path = "../fresco-vulkan", optional = true }
+aqueduct = { path = "../aqueduct", optional = true }
+fresco-protocol = { path = "../fresco-protocol", optional = true }
 tiny-skia = "0.11"
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 libc = "0.2"
 bytemuck = "1"
 env_logger = "0.11"
+log = "0.4"
