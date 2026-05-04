@@ -1,32 +1,36 @@
-//! atrium-text-demo — first text on the FreeBSD-native stack.
+//! atrium-text-demo — first text on the FreeBSD-native stack, on the
+//! envelope-based wire.
 //!
-//! Uses `fresco-text` (rustybuzz shaping + swash rasterization) to
-//! produce a glyph atlas and per-glyph quads, then uploads each glyph
-//! as its own small RGBA texture and renders it at the baseline.
-//! Wasteful (one texture per glyph) but proves the text-rendering
-//! chain end-to-end without per-vertex UV support in the backend.
+//! Migrated to `fresco-client` (M2.7c). Same shaping + rasterization
+//! via fresco-text (rustybuzz + swash); each glyph becomes an RGBA
+//! upload, gets a per-glyph slot, and is rendered as one TEXTURE node
+//! at its baseline position. Wasteful (one texture per glyph) but
+//! proves the text-rendering chain end-to-end.
 //!
-//! Once tiny_skia_backend grows per-vertex-UV support (step 2c.10),
-//! a single shared atlas + UV-mapped glyph quads will replace this.
+//! Once atrium-text bundle ships (D3) with vector-outline rendering,
+//! this collapses to per-string SCENE_NODE_SETs against the bundle's
+//! glyph-run op. For now: explicit per-glyph slots + texture nodes.
 //!
-//! The atlas's source layout is `(R=255, G=255, B=255, A=coverage)`.
-//! We rewrite each per-glyph sub-image to `(A, A, A, A)` so it lands
-//! premultiplied (white-opacity) in tiny-skia's Pixmap, which is what
-//! the textured-material path expects.
+//! Premultiplication: fresco-text's atlas has (R=255,G=255,B=255,A=cov);
+//! we rewrite to (A,A,A,A) so it lands premultiplied (white-opacity)
+//! in the texture pipeline, matching what scene-graph TEXTURE nodes
+//! expect.
 
-use fresco_scene_server::command::protocol::{Hash256, NULL_HASH};
-use fresco_socket::{wire, Connection};
+use fresco_client::Connection;
+use fresco_protocol::{TextureFormat, TextureParams};
 use fresco_text::{shape_and_rasterize, GlyphAtlas};
 
-const FONT_PATH: &str = "/mnt/host/test-assets/DejaVuSansMono.ttf";
-const TEXT: &str = "Hello, FreeBSD!";
-const SIZE_PX: f32 = 64.0;
-const BASELINE_X: f32 = 80.0;
-const BASELINE_Y: f32 = 400.0;
+const FONT_PATH:   &str = "/mnt/host/test-assets/DejaVuSansMono.ttf";
+const TEXT:        &str = "Hello, FreeBSD!";
+const SIZE_PX:     f32  = 64.0;
+const BASELINE_X:  f32  = 80.0;
+const BASELINE_Y:  f32  = 400.0;
 
 /// Extract one glyph's RGBA bytes from the master atlas, premultiplied
 /// (white * coverage). Returns `(rgba, w, h, dst_rect)`.
-fn extract_glyph(atlas: &GlyphAtlas, idx: usize) -> Option<(Vec<u8>, u32, u32, (f32, f32, f32, f32))> {
+fn extract_glyph(atlas: &GlyphAtlas, idx: usize)
+    -> Option<(Vec<u8>, u32, u32, (f32, f32, f32, f32))>
+{
     let q = &atlas.glyphs[idx];
     let u0 = (q.u0 * atlas.width  as f32).round() as u32;
     let v0 = (q.v0 * atlas.height as f32).round() as u32;
@@ -60,42 +64,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let font = std::fs::read(FONT_PATH)?;
     let atlas = shape_and_rasterize(&font, TEXT, SIZE_PX)?;
     eprintln!(
-        "shaped {:?}: {} glyphs, atlas {}x{}, advance={:.1}, ascent={:.1} descent={:.1}",
-        TEXT, atlas.glyphs.len(), atlas.width, atlas.height,
-        atlas.advance, atlas.ascent, atlas.descent,
+        "shaped {:?}: {} glyphs, atlas {}x{}, advance={:.1}",
+        TEXT, atlas.glyphs.len(), atlas.width, atlas.height, atlas.advance,
     );
 
-    // Static unit-rect mesh — same one for every glyph.
-    let v = conn.upload_blob(&wire::vertex_data_xy(&[
-        (0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0),
-    ]))?;
-    let i = conn.upload_blob(&wire::index_data_u16(&[0, 1, 2, 0, 2, 3]))?;
-    let mesh = conn.upload_blob(&wire::mesh(4, 6, v, i))?;
-
-    let mut nodes: Vec<Hash256> = Vec::with_capacity(atlas.glyphs.len());
-
-    for i in 0..atlas.glyphs.len() {
+    /* Per-glyph: upload bytes → bind to a per-glyph slot → emit a
+     * TEXTURE node at the glyph's destination rect. Slot ids start at
+     * 100 to avoid collision with any app-level slots. */
+    conn.scene_frame_begin()?;
+    let mut emitted = 0u32;
+    for (i, _g) in atlas.glyphs.iter().enumerate() {
         let Some((rgba, gw, gh, (dx0, dy0, dx1, dy1))) = extract_glyph(&atlas, i) else {
             continue;
         };
-        let tex_h = conn.upload_texture(&rgba, gw, gh)?;
-        let mat   = conn.upload_blob(&wire::material_textured(tex_h, [0xff; 4]))?;
-
-        let xform = wire::affine_2d(
-            dx1 - dx0, dy1 - dy0,
-            BASELINE_X + dx0, BASELINE_Y + dy0,
-        );
-        let t  = conn.upload_blob(&wire::transform_matrix(&xform))?;
-        let r  = conn.upload_blob(&wire::renderable(mesh, mat))?;
-        let sn = conn.upload_blob(&wire::scene_node(t, r, NULL_HASH))?;
-        nodes.push(sn);
+        let hash = conn.upload_blob(&rgba)?;
+        let slot = 100 + i as u32;
+        conn.slot_set_texture(slot, hash, gw, gh, TextureFormat::Rgba8UnormSrgb)?;
+        conn.scene_node_texture(/*node_id=*/ slot, TextureParams {
+            x: BASELINE_X + dx0,
+            y: BASELINE_Y + dy0,
+            w: dx1 - dx0,
+            h: dy1 - dy0,
+            slot_id: slot,
+        })?;
+        emitted += 1;
     }
-    eprintln!("uploaded {} glyph render-nodes", nodes.len());
-
-    let nl = conn.upload_blob(&wire::node_list(&nodes))?;
-    let sr = conn.upload_blob(&wire::scene_root(nl, NULL_HASH))?;
-    conn.set_root(sr)?;
-    eprintln!("SET_ROOT — text should now be visible");
+    conn.scene_frame_end()?;
+    eprintln!("emitted {emitted} glyph texture nodes — text should be visible");
 
     std::thread::sleep(std::time::Duration::from_secs(3600));
     Ok(())
