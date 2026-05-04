@@ -1,0 +1,17 @@
+[package]
+name        = "fresco-client"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "Envelope-based Fresco protocol client. Wraps aqueduct + fresco-protocol with scene-graph convenience methods. Replaces fresco-socket-rs at the M2.7 cutover."
+
+[lib]
+name = "fresco_client"
+path = "src/lib.rs"
+
+[dependencies]
+aqueduct        = { path = "../aqueduct" }
+fresco-protocol = { path = "../fresco-protocol" }
+serde           = { version = "1", features = ["derive"] }
+log             = "0.4"
