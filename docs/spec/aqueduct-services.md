@@ -1,10 +1,10 @@
 # Atrium-RPC service author guide
 
-Companion to [`atrium-rpc.md`](atrium-rpc.md). This document tells
+Companion to [`aqueduct.md`](aqueduct.md). This document tells
 you how to **build** a service on the substrate, not how the
 substrate works internally.
 
-## 0. Decide if atrium-rpc is the right substrate
+## 0. Decide if aqueduct is the right substrate
 
 It is the right substrate if your service:
 
@@ -28,8 +28,8 @@ It is **not** the right substrate if:
 
 Edit two places together:
 
-- `docs/spec/atrium-rpc.md` §3.2 — the registry table.
-- `atrium-rpc/src/classes.rs` — the `CLASS_*` constants.
+- `docs/spec/aqueduct.md` §3.2 — the registry table.
+- `aqueduct/src/classes.rs` — the `CLASS_*` constants.
 
 Pick the next free class number in the 0..63 range (Atrium core).
 If your service is third-party / experimental, use 64..255.
@@ -45,12 +45,32 @@ Document each opcode in your service's crate doc. Suggested
 columns: op, name, direction (client→server / server→client / both),
 flags expected, payload schema.
 
+### Reference example: CLASS_DISPLAY (Fresco)
+
+`fresco-protocol` is the canonical example service on this
+substrate. Its op-number layout (in `fresco-protocol/src/lib.rs`)
+demonstrates the conventions:
+
+```text
+0x0010..=0x001F    Reserved for future control extensions
+0x0020..=0x002F    Slot table mutations (SLOT_*)
+0x0030..=0x003F    Scene frame boundaries (SCENE_FRAME_*)
+0x0040..=0x004F    Scene node mutations (SCENE_NODE_*)
+0x0500..=0x05FF    Window management (WINDOW_*); 0x0580..=0x05FF for events
+0x0600..=0x06FF    Reserved for D4.5 ANIMATION_* op family
+```
+
+Both control ops (client→server) and async events (server→client,
+sent with envelope `ASYNC_EVENT` flag) live in the same class; events
+are typically distinguished by living in a sub-range (e.g. `0x0580+`
+for window events).
+
 Reserve `0xFF` in your class for a `NEGOTIATE_CAPS`-equivalent
 that lets clients query supported features.
 
 ## 3. Pick a payload marshalling format
 
-atrium-rpc gives you bytes; what's inside is up to you.
+aqueduct gives you bytes; what's inside is up to you.
 
 **Defaults:**
 - **Postcard** for Rust↔Rust messaging. Compact, deterministic,
@@ -70,7 +90,7 @@ version**. You will regret not having it.
 ## 4. Sketch the server
 
 ```rust
-use atrium_rpc::{Connection, MessageKind, classes, envelope::flag};
+use aqueduct::{Connection, MessageKind, classes, envelope::flag};
 use std::os::unix::net::UnixListener;
 
 fn main() -> std::io::Result<()> {
@@ -114,7 +134,7 @@ fn handle(c: &mut Connection) -> std::io::Result<()> {
 ## 5. Sketch the client
 
 ```rust
-use atrium_rpc::{Connection, MessageKind, classes, envelope::flag};
+use aqueduct::{Connection, MessageKind, classes, envelope::flag};
 
 fn main() -> std::io::Result<()> {
     let mut c = Connection::connect("/atrium/sockets/myservice.sock")?;
@@ -204,7 +224,7 @@ for client in &mut clients {
 ```
 
 For broadcast across many clients, the service is responsible for
-maintaining a per-connection list. atrium-rpc doesn't do
+maintaining a per-connection list. aqueduct doesn't do
 many-to-many automatically.
 
 ## 8. Errors
@@ -220,7 +240,7 @@ Two layers:
   failing request.
 
 Don't use envelope flags for service-level errors; reserve
-flags for things atrium-rpc itself defines.
+flags for things aqueduct itself defines.
 
 ## 9. Capability declaration (Portcullis)
 
@@ -269,14 +289,14 @@ let mut server = Connection::wrap(b).unwrap();
 // drive the protocol; assert on messages
 ```
 
-This is what `atrium-rpc/src/connection.rs` uses. No filesystem,
+This is what `aqueduct/src/connection.rs` uses. No filesystem,
 no kernel scheduling — perfect for unit tests.
 
 ### Integration tests with the real server
 
-`atrium-rpc-echo` is the canonical example: spawn the server as
+`aqueduct-echo` is the canonical example: spawn the server as
 a child process, run the client, assert exit code. See
-`atrium-rpc-echo/src/bin/{server,client}.rs`.
+`aqueduct-echo/src/bin/{server,client}.rs`.
 
 ## 12. Performance checklist
 
@@ -287,7 +307,7 @@ a child process, run the client, assert exit code. See
   syscall round-trip).
 - Set `cache_cap` based on your service's working set; the
   default 8 MiB is fine for most.
-- Don't use atrium-rpc for streaming audio/video sample data —
+- Don't use aqueduct for streaming audio/video sample data —
   that's what shm + fd-passing is for.
 
 ## 13. Deployment

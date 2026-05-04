@@ -64,7 +64,7 @@ walks the dirty subtree, emits the wire deltas, and sends a single
    ┌─────────────────────────────┐
    │ fresco-socket-rs            │  ← low-level wire client
    └──────────────┬──────────────┘
-                  │  atrium-rpc UDS
+                  │  aqueduct UDS
                   ▼
             fresco-server
 ```

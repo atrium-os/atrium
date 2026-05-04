@@ -638,31 +638,31 @@ decision**. It is filed as:
 Until one of those signals arrives, the production fresco-server
 core uses per-frame compute dispatch.
 
-### 3.7 Wire format: atrium-rpc + the display dictionary
+### 3.7 Wire format: aqueduct + the display dictionary
 
 The scenegraph protocol does NOT define its own wire envelope.
-It rides on **atrium-rpc** (see [`atrium-rpc.md`](atrium-rpc.md)),
+It rides on **aqueduct** (see [`aqueduct.md`](aqueduct.md)),
 the unified IPC substrate every Atrium service uses (clipboard,
 notify, broker, audio control, ...). One envelope, one client
 library, one debugger view, one CAS namespace across the OS.
 
 Fresco's display protocol is the dictionary at `opcode_class = 1`
-(`CLASS_DISPLAY` in `atrium-rpc/src/classes.rs`), implemented as a
-companion crate `atrium-rpc-display`. The migration of Fresco from
+(`CLASS_DISPLAY` in `aqueduct/src/classes.rs`), implemented as a
+companion crate `fresco-protocol`. The migration of Fresco from
 its legacy 128-byte fixed-frame format to this envelope is the
 deferred D1.7+ work that
-[`atrium-rpc.md` §9.1](atrium-rpc.md#91-fresco-migration-deferred-d17-or-later)
-specs out. Building atrium-rpc-display alongside the new
+[`aqueduct.md` §9.1](aqueduct.md#91-fresco-migration-deferred-d17-or-later)
+specs out. Building fresco-protocol alongside the new
 fresco-server (per §5 Phase 2) IS that migration.
 
 #### What we get for free
 
-- **CAS upload + dedup.** `atrium-rpc-core` (`opcode_class = 0`)
+- **CAS upload + dedup.** `aqueduct` (`opcode_class = 0`)
   defines `UPLOAD_BEGIN/DATA/FINISH/ACK` and `FETCH_REQUEST/BEGIN`.
-  Every atrium-rpc speaker implements them. Hashes are SHA-256,
+  Every aqueduct speaker implements them. Hashes are SHA-256,
   shared with Tessera. We do NOT redefine these in the display
   dictionary.
-- **fd-passing for shm.** atrium-rpc handles `SCM_RIGHTS`
+- **fd-passing for shm.** aqueduct handles `SCM_RIGHTS`
   fd-passing for big payloads (decoded video frames, GPU
   textures). Capability is the fd. Already available; no
   display-specific work.
@@ -674,7 +674,7 @@ fresco-server (per §5 Phase 2) IS that migration.
   means a texture rendered by Fresco AND copied to clipboard
   AND in a notification is one allocation.
 
-#### What atrium-rpc-display defines
+#### What fresco-protocol defines
 
 The display dictionary has two op categories — **control ops**
 and **scene ops** — both addressed by the envelope's `op` field
@@ -707,7 +707,7 @@ compute kernel reads each scene node's op-ID and dispatches the
 appropriate bundle's SPIR-V compute fragment.
 
 ```rust
-// atrium-rpc-display/src/lib.rs (sketch)
+// fresco-protocol/src/lib.rs (sketch)
 pub mod control {
     pub const OP_SLOT_SET:          u16 = 0x0020;
     pub const OP_SCENE_FRAME_BEGIN: u16 = 0x0030;
@@ -791,7 +791,7 @@ Events (server → client):
 
 This is what xdg-shell solves for Wayland; we get to solve it once
 cleanly because we own the protocol. POC has stubs (`atrium-window-demo`);
-finalize the op set in `atrium-rpc-display` during D2.
+finalize the op set in `fresco-protocol` during D2.
 
 #### 3.8.2 Animation (declarative, server-driven)
 

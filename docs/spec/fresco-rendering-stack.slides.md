@@ -62,7 +62,7 @@ POC:  `~/src/fresco-poc` (verified on Apple M4 Max via MoltenVK)
 - **Atrium** — FreeBSD desktop platform
 - **Fresco** — the rendering stack (this deck)
 - **fresco-server** — host scene-server binary (POC name)
-- **atrium-rpc** — Atrium IPC substrate
+- **aqueduct** — Atrium IPC substrate
 - **atrium-core** — default Fresco bundle
 - **Tessera** — Atrium CAS filesystem
 - **Portcullis** — jail launcher / capability runtime
@@ -143,7 +143,7 @@ POC:  `~/src/fresco-poc` (verified on Apple M4 Max via MoltenVK)
 - **op-id** — 16-bit scene-primitive code (`rect=0x1000`)
 - **scene op** vs **control op** — bundle-dispatched vs host-handled
 
-**atrium-rpc message classes**
+**aqueduct message classes**
 - **CLASS_CORE** (0) — built-in CAS upload / fetch
 - **CLASS_DISPLAY** (1) — Fresco scene + slot ops
 
@@ -224,7 +224,7 @@ The benchmark probe (`docs/spec/fresco-runtime-benchmark*.md`) measured GPU comp
 ```
 ┌────────────────────────────────────────────────────────────┐
 │ 1. Scenegraph protocol  ── what apps send                  │
-│    (atrium-rpc CLASS_DISPLAY: SLOT_SET, SCENE_NODE_SET, …) │
+│    (aqueduct CLASS_DISPLAY: SLOT_SET, SCENE_NODE_SET, …) │
 ├────────────────────────────────────────────────────────────┤
 │ 2. SPIR-V bundles       ── what extensions ship            │
 │    (manifest + compute kernels + render pipelines)         │
@@ -258,9 +258,9 @@ The contract between each layer is **explicit and small**. Most of the complexit
    │ Skia/Cairo or      │           │ messages; does NOT │
    │ app-side GL / Vk   │           │ render pixels      │
    └─────────┬──────────┘           └─────────┬──────────┘
-             │ pixel buffers                  │ atrium-rpc msgs
+             │ pixel buffers                  │ aqueduct msgs
    ┌─────────▼──────────┐           ┌─────────▼──────────┐
-   │ libwayland (UDS)   │           │ atrium-rpc (UDS)   │
+   │ libwayland (UDS)   │           │ aqueduct (UDS)   │
    └─────────┬──────────┘           └─────────┬──────────┘
              │                                │
    ┌─────────▼──────────┐           ┌─────────▼──────────┐
@@ -347,7 +347,7 @@ SCENE_FRAME_END
 
 ---
 
-## Wire format — atrium-rpc envelope
+## Wire format — aqueduct envelope
 
 Borrowed wholesale from the Atrium IPC substrate. **Don't reinvent IPC.**
 
@@ -368,7 +368,7 @@ Borrowed wholesale from the Atrium IPC substrate. **Don't reinvent IPC.**
 
 ## CAS dedup — the killer feature
 
-Built-in to atrium-rpc's `CLASS_CORE`:
+Built-in to aqueduct's `CLASS_CORE`:
 
 ```
 client                                       compositor
@@ -511,7 +511,7 @@ th, td { padding: 4px 8px; vertical-align: top; }
 | Delta-only updates | ✓ (CA property diffs) | ✓ (`SCENE_NODE_SET`/`CLEAR`) |
 | Server-side animation (app suspended) | ✓ (`CAAnimation`) | ✗ — re-sends per frame *(gap)* |
 | Resource sharing | IOSurface — zero-copy, intra-machine, per-app | CAS — content-hash dedup across apps / machines / time (shared with Tessera CAS-FS) |
-| Wire-format scene graph (open, debuggable) | ✗ — Apple-internal IPC | ✓ — `atrium-rpc` postcard schemas |
+| Wire-format scene graph (open, debuggable) | ✗ — Apple-internal IPC | ✓ — `aqueduct` postcard schemas |
 | Extensible primitives | ✗ — baked into CA | ✓ — SPIR-V bundles |
 
 **iOS wins on**: server-side animations, intra-machine zero-copy.
@@ -523,7 +523,7 @@ th, td { padding: 4px 8px; vertical-align: top; }
 
 | Role | What it does |
 |---|---|
-| **IPC server** | Listens on UDS, parses atrium-rpc envelopes |
+| **IPC server** | Listens on UDS, parses aqueduct envelopes |
 | **Scene-state authority** | Owns canonical per-app scene trees + slot tables |
 | **Scene-graph processor** | Walks trees, applies WM transforms, flattens per-frame |
 | **Window manager** | Placement, z-order, focus, input routing |
@@ -641,7 +641,7 @@ Each app has its **own** scene tree on the host (per-connection state — apps c
 
 From the GPU's view there's no notion of "app" — just N rect-instances, M texture-instances, etc.
 
-<span class="small">*POC currently uses one global `SceneState`; per-connection split is designed-but-unimplemented.*</span>
+<span class="small">*The macOS POC used one global `SceneState`; production `fresco-scene-server` enforces per-window-with-client-owner isolation, structurally equivalent to per-connection.*</span>
 
 ---
 
@@ -723,7 +723,7 @@ CPU per frame: O(deltas), not O(scene). The compositor's CPU cost is constant in
 |-------|------|
 | 1–2   | winit + Vulkan instance + swapchain + clear |
 | 3–4   | `atrium-core` bundle (GLSL → SPIR-V → AOT pipelines) |
-| 5a    | `atrium-rpc-display` payload schemas (postcard) |
+| 5a    | `fresco-protocol` payload schemas (postcard) |
 | 5b    | UDS server, `Connection::recv_message` dispatch |
 | 6     | `SLOT_SET` → `vkImage` upload + per-slot resource table |
 | 7     | Compute traversal (atomic counter + readback verification) |

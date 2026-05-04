@@ -16,7 +16,7 @@
 |---|---|---|
 | Architectural POC (macOS, Vulkan via MoltenVK, SPIR-V bundles, CAS dedup) | ✅ Done — 12 commits, 99.8× CAS dedup measured, scene-a + scene-b visually verified | `~/src/fresco-poc` |
 | FreeBSD native scene server + clients (frescod, atrium-edit-socket, etc.) | 🟡 D1 in progress; tiny-skia rasterizer; not yet on bare metal | `~/src/bsd/frescod`, `fresco-socket-rs`, others |
-| Wire protocol (`atrium-rpc-display`) | 🟡 Stable enough for POC; needs the §3.8 op-family additions before D2 | `~/src/bsd/atrium-rpc/`, `~/src/fresco-poc/crates/atrium-rpc-display/` |
+| Wire protocol (`fresco-protocol`) | 🟡 Stable enough for POC; needs the §3.8 op-family additions before D2 | `~/src/bsd/aqueduct/`, `~/src/fresco-poc/crates/fresco-protocol/` |
 | Tessera CAS-FS | 🟡 D1.5 substantial work done; not the critical path for Fresco production | `~/src/bsd/fresco-kmod/` etc. |
 | Pergola toolkit | ⚪ Spec drafted (`docs/spec/pergola.md`); no code yet | (new) |
 | atrium-mesa fork | ⚪ Decision committed; no code yet (D5 work) | (new) |
@@ -61,13 +61,13 @@ Each milestone has a concrete **done-when** so we know to stop and check.
 
 **Goal:** lock the op set we're going to commit to before refactoring frescod (and the `fresco-scene-server` library it links) against it.
 
-- [ ] Port `atrium-rpc-display` payload schemas from the macOS POC into the bsd `atrium-rpc/` workspace.
+- [ ] Port `fresco-protocol` payload schemas from the macOS POC into the bsd `aqueduct/` workspace.
 - [ ] Implement the `WINDOW_*` op family per §3.8.1: control ops + async events.
 - [ ] Reserve op-id ranges per §3.4 closed registry: confirm `0x1000-0x1FFF` for atrium-core, `0x2000-` for atrium-text (D3), reserve `0x3000-` for animation, `0x4000-` for AX (deferred).
-- [ ] Spec-side: extend `docs/spec/atrium-rpc.md` if needed; ensure `atrium-rpc-services.md` reflects CLASS_DISPLAY content.
-- [ ] Add a wire-format conformance test crate (`atrium-rpc-conformance`?) that pins envelope encoding bit-for-bit.
+- [ ] Spec-side: extend `docs/spec/aqueduct.md` if needed; ensure `aqueduct-services.md` reflects CLASS_DISPLAY content.
+- [ ] Add a wire-format conformance test crate (`aqueduct-conformance`?) that pins envelope encoding bit-for-bit.
 
-**Done when:** atrium-rpc + atrium-rpc-display compile clean in the bsd workspace; conformance test passes; spec docs reference each op.
+**Done when:** aqueduct + fresco-protocol compile clean in the bsd workspace; conformance test passes; spec docs reference each op.
 
 ---
 
@@ -79,7 +79,7 @@ Each milestone has a concrete **done-when** so we know to stop and check.
 - [ ] Port `fresco-bundle` crate (manifest + SPIR-V load + reflection).
 - [ ] Port `atrium-core` bundle (rect, texture ops + GLSL sources + build.sh).
 - [ ] Wire bundle dispatch into `fresco-scene-server`'s render loop, replacing the tiny-skia rasterizer (frescod inherits this transparently).
-- [ ] Implement per-connection `SceneState` in `fresco-scene-server` (the POC currently shares one — explicit gap flagged in deck).
+- [x] ~~Implement per-connection `SceneState` in `fresco-scene-server`~~ — **resolved 2026-05-04 audit**: the existing fresco-scene-server already enforces per-window-with-client-owner isolation at every routable dispatch (see `command/frontend.rs:119`). The macOS POC's shared-SceneState gap was POC-specific, not architectural. M2.6's WINDOW_* dispatchers slot into the existing model.
 - [ ] Implement `WINDOW_*` op family in `fresco-scene-server`'s `CommandFrontend` (input routing, focus, close-request flow).
 - [ ] Validate against existing demos via frescod: rect-bouncer, slot-demo, edit-socket, textured, window-demo, keyboard.
 

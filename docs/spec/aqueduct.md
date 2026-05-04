@@ -3,7 +3,7 @@
 Status: design (D1.6).
 Last updated: 2026-05-03.
 
-This document specifies the atrium-rpc substrate used by every
+This document specifies the aqueduct substrate used by every
 Atrium service that needs IPC between two processes — including
 between processes in different jails. It is the foundation
 underneath Fresco (display), atrium-broker (URI handler),
@@ -22,7 +22,7 @@ services.
   reference content by hash. Shared CAS namespace means an
   image displayed by Fresco AND copied to clipboard AND in a
   notification is **one** allocation.
-- **Tessera integration.** Tessera CAS hashes and atrium-rpc
+- **Tessera integration.** Tessera CAS hashes and aqueduct
   hashes share a namespace. Trusted services can read content
   by hash directly from Tessera storage, bypassing the wire.
 - **High-bandwidth via shm + fd-passing.** Bulk data (decoded
@@ -35,11 +35,11 @@ services.
 
 - Not a marshalling library. Per-service opcodes define their
   own payload schemas (postcard, manual binary, whatever fits).
-  atrium-rpc gives them an envelope to ride in.
+  aqueduct gives them an envelope to ride in.
 - Not a service discovery / naming framework. Service rendezvous
   is done by readdir on `/atrium/sockets/`. No registry.
 - Not a security boundary in itself — that's the service's
-  job. atrium-rpc gives services a clean substrate; trust
+  job. aqueduct gives services a clean substrate; trust
   decisions remain with the service.
 - Not a replacement for sockets when sockets fit. A streaming
   audio pipe with millions of small messages can use the
@@ -54,7 +54,7 @@ services.
 | Per-service opcode dictionary                 |
 | (display | clipboard | notify | broker | ...) |
 +-----------------------------------------------+
-| atrium-rpc envelope                           |
+| aqueduct envelope                           |
 |   - opcode-tagged messages                    |
 |   - bidirectional (client ↔ service)          |
 |   - async events alongside RPC completions    |
@@ -85,7 +85,7 @@ All messages share an envelope:
 | Field          | Notes                                       |
 |----------------|---------------------------------------------|
 | `ver`          | Envelope version. Currently 1.              |
-| `opcode_class` | Top-level dictionary selector. 0 = atrium-rpc-core (CAS, events). 1 = display (Fresco). 2 = clipboard. 3 = notify. 4 = broker. 5 = audio-control. 6..63 reserved. 64..255 vendor/private. |
+| `opcode_class` | Top-level dictionary selector. 0 = aqueduct (CAS, events). 1 = display (Fresco). 2 = clipboard. 3 = notify. 4 = broker. 5 = audio-control. 6..63 reserved. 64..255 vendor/private. |
 | `op`           | Opcode within the class. Class-specific dictionary. |
 | `flags`        | Bit 0: payload contains hash refs (receiver should consult cache). Bit 1: response expected. Bit 2: this is a response. Bit 3: async event (no response expected). Bits 4..15 class-specific. |
 | `length`       | Payload byte count (excluding envelope).    |
@@ -95,7 +95,7 @@ Min message: 10 bytes. Max payload: `2^32 - 1` (in practice capped per-service).
 
 ### 3.3 The CAS layer (opcode_class = 0)
 
-Built-in opcodes. Every atrium-rpc speaker implements these.
+Built-in opcodes. Every aqueduct speaker implements these.
 
 | op   | name             | direction      | purpose |
 |------|------------------|----------------|---------|
@@ -115,9 +115,9 @@ Hash format: SHA-256 (32 bytes), matching Tessera. Hashes are
 ### 3.4 Service opcode dictionaries
 
 Each service registers an `opcode_class` and publishes its
-dictionary as a Rust crate (`atrium-rpc-display`, `atrium-rpc-
+dictionary as a Rust crate (`fresco-protocol`, `aqueduct-
 clipboard`, etc.). The class registry lives in this document
-and in `atrium-rpc-core/src/classes.rs` as a single source of
+and in `aqueduct/src/classes.rs` as a single source of
 truth.
 
 A service implementation:
@@ -134,7 +134,7 @@ trait AtriumService {
 ```
 
 Boilerplate (envelope decode, CAS handling, event dispatch) lives
-in atrium-rpc-core; only `handle` and the `Request`/`Response`/
+in aqueduct; only `handle` and the `Request`/`Response`/
 `Event` types are per-service.
 
 ## 4. Transport
@@ -175,7 +175,7 @@ For payloads where the bytes are not in CAS (decoded video frames,
 GPU textures, raw audio buffers) and don't make sense to hash:
 
 1. Producer creates `shm_open(SHM_ANON, ...)`, gets fd.
-2. Producer sends an atrium-rpc message describing layout (size,
+2. Producer sends an aqueduct message describing layout (size,
    stride, format, etc.) and includes the fd via `SCM_RIGHTS`.
 3. Consumer receives the fd, mmaps. Producer signals updates via
    subsequent normal messages (or an eventfd-style doorbell).
@@ -201,7 +201,7 @@ so unrecognised versions can be cleanly rejected.
 
 Classes 0..63 are reserved for Atrium core. Classes 64..255 are
 vendor / experimental. New core classes added by editing this
-document and `atrium-rpc-core/src/classes.rs` together.
+document and `aqueduct/src/classes.rs` together.
 
 ### 5.3 Per-class opcodes
 
@@ -218,7 +218,7 @@ in which case respond with an "opcode unknown" error.
 
 ### 5.4 Schema evolution within a class
 
-Per-service responsibility. atrium-rpc doesn't impose a marshalling
+Per-service responsibility. aqueduct doesn't impose a marshalling
 format — services pick (postcard for Rust↔Rust, hand-rolled binary
 for cross-language, etc.). A common pattern: a leading version byte
 in the payload, with backwards compatibility maintained at the
@@ -268,9 +268,9 @@ one-time verification on insertion + tamper-resistant cache
 allocation (e.g., immutable `MAP_PRIVATE` mapping). Optional;
 default is verify-on-use.
 
-### 6.4 The Tessera × atrium-rpc zero-copy path (optional capability)
+### 6.4 The Tessera × aqueduct zero-copy path (optional capability)
 
-Tessera and atrium-rpc share a hash space. When a service has the
+Tessera and aqueduct share a hash space. When a service has the
 optional `tessera-cas-read` capability granted by Portcullis:
 
 ```
@@ -311,7 +311,7 @@ OS). Mitigations live in service policy:
 - "Privacy mode" capability that opts a jail out of the shared
   service entirely.
 
-Out of scope for atrium-rpc itself; in scope for clipboard /
+Out of scope for aqueduct itself; in scope for clipboard /
 notify policy.
 
 ## 7. Threat model
@@ -333,7 +333,7 @@ Out of scope:
 - **Side channels via timing** — can't prevent at the IPC layer;
   service should be careful about user-data-dependent timing in
   responses.
-- **Rogue kernel** — atrium-rpc trusts the FreeBSD kernel.
+- **Rogue kernel** — aqueduct trusts the FreeBSD kernel.
 
 ## 8. Performance targets
 
@@ -351,64 +351,40 @@ not the QEMU-on-macOS dev rig):
 Subject to revision once we have real measurements on D2.5
 workloads.
 
-## 9. Implementation plan (D1.6)
+## 9. Implementation plan (D1.6 + Fresco migration)
 
-Strategy: **build greenfield, grandfather Fresco.** The Fresco
-wire format (128-byte fixed `Command`/`Completion` frames from
-fresco-server) is incompatible with the variable-length envelope
-specified in §3.2. Migrating Fresco is a substantial refactor
-across 7+ binaries (fresco-server dispatcher, fresco-socket-rs,
-all client demos, atrium-edit-socket). That migration happens
-later (D1.7+), gated on proving the new envelope on at least one
-real non-Fresco service.
-
-For D1.6 we build the substrate fresh and validate with a smoke-
-test service. Fresco continues to use its 128-byte format until
-the migration phase.
+D1.6 was built greenfield (envelope substrate + classes.rs
+constants), grandfathering Fresco's 128-byte fixed-frame format. As
+of M1 of the production rollout (`docs/spec/fresco-production-rollout.md`),
+Fresco is migrating onto the envelope as a **hard cutover** (no
+NEGOTIATE_CAPS coexistence window). The new
+[`fresco-protocol`](../../fresco-protocol/) crate publishes the
+CLASS_DISPLAY=1 dictionary; frescod and fresco-socket-rs are being
+refactored to speak it.
 
 Order of work:
 
-1. **Spec freeze.** This document, plus
-   `atrium-rpc-core/src/classes.rs` enumerating opcode_class
-   constants. Reviewed and committed.
-2. **Crate scaffold.** `atrium-rpc-core` (std for transport;
-   keeps the option open for no_std bits later). Defines:
-   envelope codec, `Connection` type, CAS upload/fetch state
-   machines, async event channel, fd-pass helper.
-3. **Smoke-test service.** A minimal `atrium-rpc-echo` server +
-   client that exercises the envelope, CAS upload, async events,
-   and fd-passing. Validates the substrate end-to-end without
-   pulling in display complexity.
-4. **Document patterns** for downstream services in
-   `docs/spec/atrium-rpc-services.md` (template + examples).
+1. **Spec freeze.** This document plus `aqueduct/src/classes.rs`
+   enumerating opcode_class constants. Done at D1.6.
+2. **Crate scaffold.** `aqueduct` (std for transport; keeps the
+   option open for no_std bits later). Defines: envelope codec,
+   `Connection` type, CAS upload/fetch state machines, async event
+   channel, fd-pass helper. Done at D1.6.
+3. **Smoke-test service.** `aqueduct-echo` server + client.
+4. **`fresco-protocol` crate** publishes the display dictionary
+   (class 1) — control + scene + window-management op families.
+   Lands at M1 of the production rollout.
+5. **frescod migration.** Dispatcher rewritten to parse envelope
+   ops instead of 128-byte frames. fresco-socket-rs becomes a thin
+   layer over `aqueduct` + `fresco-protocol`. All clients
+   migrate atomically. Lands at M2.
+6. **Document patterns** for downstream services in
+   `docs/spec/aqueduct-services.md` (template + examples).
 
-D1.6 is complete when:
-- The spec is published.
-- atrium-rpc-core builds, has unit tests, and the echo
-  smoke-test server+client cross-build for FreeBSD and exchange
-  CAS-keyed messages successfully under stress.
-- Existing Fresco demos remain untouched and continue to work.
-
-### 9.1 Fresco migration (deferred — D1.7 or later)
-
-Once D2.5 Portcullis ships and a few real services
-(`atrium-broker`, clipboard, notify) are running on
-atrium-rpc-core, migrate Fresco onto the same envelope. Plan:
-
-- New `atrium-rpc-display` crate publishes the display opcode
-  dictionary (class 1) over the shared envelope.
-- fresco-server's dispatcher rewritten to parse the envelope
-  instead of fixed 128-byte frames.
-- fresco-socket-rs becomes a thin layer (or alias) over
-  atrium-rpc-core + atrium-rpc-display.
-- All clients trivially update (the dispatch surface barely
-  changes; the wire format underneath does).
-- Wire-format compatibility window: fresco-server briefly
-  accepts both envelopes, advertised via NEGOTIATE_CAPS, until
-  all clients are rebuilt. Then drop the legacy path.
-
-Estimated effort: ~1 week focused. Lower risk than doing it now
-because the new envelope is already proven on real services.
+The hard-cutover decision (vs the originally-planned coexistence
+window via NEGOTIATE_CAPS) was taken because the consumer set is
+small (frescod + 7 demo apps) and changes can land atomically; a
+compatibility window would carry both code paths longer than needed.
 
 ## 10. Open questions
 

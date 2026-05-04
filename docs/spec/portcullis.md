@@ -13,7 +13,7 @@ session supervisor that does likewise.
 Portcullis is to Atrium what `systemd-nspawn` is to Linux + the
 permissions-model of mobile OSes — but built natively on FreeBSD
 jails, devfs.rules, nullfs, rctl, and the Atrium substrate
-(Tessera CAS-FS, atrium-rpc).
+(Tessera CAS-FS, aqueduct).
 
 ## 0. Naming + role
 
@@ -36,7 +36,7 @@ what doesn't."
   enforced by the FreeBSD kernel, not by a userspace policy
   daemon.
 - **Composable with everything we built.** Tessera CAS-FS for
-  jail trees with cross-jail dedup; atrium-rpc capability
+  jail trees with cross-jail dedup; aqueduct capability
   sockets nullfs-mounted per the manifest; binsplit-deduped
   function blobs (D1.7) shared across all jails on the host.
 - **Fast cold-launch.** Jail creation + exec ≤ 100 ms for typical
@@ -546,7 +546,7 @@ launches skip the setup phase entirely.
 - Helpers live and die with the jail. If a helper should
   survive the foreground app (rare for desktop apps), it's
   a system service, not a per-app helper — runs in its own
-  jail and is reachable via atrium-rpc.
+  jail and is reachable via aqueduct.
 
 ## 4. Jail filesystem layout
 
@@ -830,7 +830,7 @@ granted_at    = "2026-04-15T10:30:00Z"
 2. portcullis-cli connects to portcullisd via /atrium/sockets/portcullis.sock.
 3. portcullisd computes `delta = (manifest_caps - granted_caps)`.
 4. If `delta` is empty: launch immediately (return success to portcullis-cli).
-5. If non-empty: send a prompt message via atrium-rpc to a UI service
+5. If non-empty: send a prompt message via aqueduct to a UI service
    (Forum or a dedicated `atrium-prompt` daemon). UI presents:
    ```
    "Atrium Edit" wants to:
@@ -860,12 +860,12 @@ pre-grants for headless deployments.
 - The overlay is Tessera too — per-app writable, snapshottable,
   garbage-collected when the app is uninstalled.
 
-### 8.2 atrium-rpc
+### 8.2 aqueduct
 
-- The capability boundary IS the substrate atrium-rpc was
+- The capability boundary IS the substrate aqueduct was
   designed for. Each `<service> = true` line in the manifest
   becomes one nullfs mount of one socket. Apps without the
-  capability literally cannot see the socket — atrium-rpc's
+  capability literally cannot see the socket — aqueduct's
   "filesystem-as-capability" property is enforced by the
   kernel mount table.
 - `tessera-cas-read = true` is the special trusted-service
@@ -947,8 +947,8 @@ Order matches risk (smallest blast radius first):
   capability class.
 - CLI: `portcullis launch --no-prompt <tree>` runs an app with
   ALL declared capabilities granted (dev mode).
-- Integration: launch atrium-rpc-echo-server in a jail and have
-  atrium-rpc-echo-client (also in a jail) talk to it through
+- Integration: launch aqueduct-echo-server in a jail and have
+  aqueduct-echo-client (also in a jail) talk to it through
   the nullfs-mounted socket. Validates the IPC capability path.
 - ~1 week.
 
@@ -959,7 +959,7 @@ Order matches risk (smallest blast radius first):
 - ~1 week.
 
 **Phase 4 — portcullisd + capability policy.**
-- Long-running daemon. atrium-rpc service for portcullis-cli
+- Long-running daemon. aqueduct service for portcullis-cli
   to query/grant capabilities.
 - Policy file format + persistence at `/var/db/atrium/<user>/
   policy.toml`.
