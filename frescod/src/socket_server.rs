@@ -1,50 +1,55 @@
-//! Unix-socket Fresco protocol acceptor.
+//! Aqueduct/envelope-based connection acceptor for frescod.
 //!
-//! Per accepted connection, two threads run:
-//!   - **reader**: reads 128-byte `Command` structs from the socket,
-//!     dispatches via `CommandFrontend`, forwards any returned
-//!     `Completion` to its writer over an `mpsc::Sender<Completion>`.
-//!   - **writer**: receives `Completion` values from the reader AND
-//!     from any async producer (window-event fanout, future input
-//!     thread), and writes 128 bytes per to the socket.
+//! Each accepted connection gets two threads:
 //!
-//! The split lets async events reach the client without blocking on
-//! the reader's command-handling cadence — essential for input,
-//! WM-driven WindowResized / CloseRequested / FocusChange, and any
-//! other event the server pushes between command rounds.
+//!   - **reader**: wraps the read half in `aqueduct::Connection`,
+//!     pulls envelopes via `recv_message()`, dispatches CLASS_DISPLAY
+//!     ops through the shared `EnvelopeFrontend`. Any `Outbound`s
+//!     produced (e.g. WINDOW_CREATE's IS_RESPONSE reply) get queued
+//!     onto the per-connection writer mpsc.
 //!
-//! `event_subs`: every connection's `Sender` lives in a shared `Vec`.
-//! Producers (today: a 1Hz ticker; tomorrow: /dev/usbhid + WM) iterate
-//! the list and try-send to each. Disconnected senders fail the send;
-//! we leak them in the Vec for v0.1 — a real server prunes.
+//!   - **writer**: wraps the write half in its own `aqueduct::Connection`,
+//!     drains the mpsc and writes envelopes. The mpsc receives both
+//!     reader-produced responses *and* compositor-broadcast async
+//!     events.
+//!
+//! Async events come from `Compositor::set_event_sink(...)`: a single
+//! `Sender<DisplayEvent>` is plumbed from `main.rs` into the compositor;
+//! a fan-out thread (started by `spawn_event_fanout`) pulls each event,
+//! encodes it once, and forwards a clone to every registered writer
+//! mpsc. We keep a `Vec<Sender<Outbound>>` behind `EventSubs` for that.
+//!
+//! Two `aqueduct::Connection`s per UDS connection (one per direction)
+//! is intentional: aqueduct's CAS upload/recv state is direction-
+//! oriented (incoming uploads on the read side, outgoing publishes on
+//! the write side), so splitting on `UnixStream::try_clone()` keeps
+//! each direction's state coherent.
 
-use fresco_scene_server::command::frontend::CommandFrontend;
-use fresco_scene_server::command::protocol::{
-    Command, Completion, CMD_INJECT_KEY, COMP_INPUT_KEY, COMP_WINDOW_FOCUS,
+use aqueduct::{Connection as AqConn, CLASS_DISPLAY};
+use aqueduct::envelope::flag;
+use fresco_scene_server::command::envelope_frontend::{
+    EnvelopeFrontend, Outbound,
 };
+use fresco_scene_server::window::{DisplayEvent, encode_event};
 
-use std::io::{Read, Write};
+use std::io;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+
+/// Set of per-writer mpsc senders. A producer (event fan-out) holding
+/// this can broadcast an `Outbound` to every connected client. Senders
+/// disconnect when their writer thread exits; the broadcaster prunes
+/// failed sends on each pass.
+pub type EventSubs = Arc<Mutex<Vec<Sender<Outbound>>>>;
 
 pub struct Shared {
-    pub frontend: Arc<Mutex<CommandFrontend>>,
+    pub frontend: Arc<Mutex<EnvelopeFrontend>>,
 }
 
-/// Producer side of the async event fan-out: every accepted
-/// connection's writer-thread sender is registered here, paired
-/// with the connection's `client_id` so producers can route a
-/// completion to the *one* client that owns its target window
-/// (by consulting `WmCompositor::windows[id].owner`). A producer
-/// that doesn't care about routing (e.g. keyboard broadcast in
-/// the absence of focus) iterates and sends to every subscriber.
-pub type EventSubs = Arc<Mutex<Vec<(u8, Sender<Completion>)>>>;
-
-pub fn spawn(shared: Shared, sock_path: &Path) -> std::io::Result<EventSubs> {
+pub fn spawn(shared: Shared, sock_path: &Path) -> io::Result<EventSubs> {
     if sock_path.exists() {
         let _ = std::fs::remove_file(sock_path);
     }
@@ -55,11 +60,47 @@ pub fn spawn(shared: Shared, sock_path: &Path) -> std::io::Result<EventSubs> {
     let subs_for_loop = event_subs.clone();
 
     std::thread::Builder::new()
-        .name("atrium-socket-accept".into())
+        .name("frescod-accept".into())
         .spawn(move || accept_loop(listener, shared, subs_for_loop))
         .map(|_| ())?;
 
     Ok(event_subs)
+}
+
+/// Spawn the event fan-out thread. Receives `DisplayEvent` from the
+/// compositor's sink, encodes once into an envelope-shaped `Outbound`,
+/// and forwards to every writer mpsc. `Compositor::set_event_sink`
+/// expects the matching `Sender<DisplayEvent>` — caller hands one to
+/// the compositor and the other half to this function.
+pub fn spawn_event_fanout(
+    rx: Receiver<DisplayEvent>,
+    subs: EventSubs,
+) {
+    std::thread::Builder::new()
+        .name("frescod-event-fanout".into())
+        .spawn(move || {
+            for ev in rx.iter() {
+                let (op, payload) = match encode_event(&ev) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        log::debug!("encode_event failed: {e}");
+                        continue;
+                    }
+                };
+                let out = Outbound {
+                    op,
+                    flags:   flag::ASYNC_EVENT,
+                    payload,
+                };
+                let mut s = subs.lock().unwrap();
+                s.retain(|tx| tx.send(out_clone(&out)).is_ok());
+            }
+        })
+        .expect("spawn event fan-out");
+}
+
+fn out_clone(o: &Outbound) -> Outbound {
+    Outbound { op: o.op, flags: o.flags, payload: o.payload.clone() }
 }
 
 fn accept_loop(listener: UnixListener, shared: Shared, event_subs: EventSubs) {
@@ -68,48 +109,39 @@ fn accept_loop(listener: UnixListener, shared: Shared, event_subs: EventSubs) {
         match conn {
             Ok(stream) => {
                 let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed).max(1);
-                let (tx, rx) = mpsc::channel::<Completion>();
+                let (tx, rx) = mpsc::channel::<Outbound>();
 
-                // Register this connection's Sender so async producers
-                // can broadcast to it. We only register the clone the
-                // reader will hold; that way when the reader drops its
-                // tx, broadcasters' sends start failing (clean shutdown).
-                event_subs.lock().unwrap().push((client_id, tx.clone()));
+                /* Register writer's tx for async-event broadcast. */
+                event_subs.lock().unwrap().push(tx.clone());
 
-                // Writer thread.
                 let writer_stream = match stream.try_clone() {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!("try_clone failed for client {client_id}: {e}");
+                        eprintln!("frescod: try_clone for client {client_id}: {e}");
                         continue;
                     }
                 };
+
+                /* Writer thread. */
                 std::thread::Builder::new()
-                    .name(format!("atrium-socket-writer-{client_id}"))
-                    .spawn(move || writer_loop(writer_stream, rx))
+                    .name(format!("frescod-writer-{client_id}"))
+                    .spawn(move || writer_loop(writer_stream, rx, client_id))
                     .ok();
 
-                // Reader thread.
+                /* Reader thread. */
                 let frontend = shared.frontend.clone();
-                let subs_for_reader = event_subs.clone();
                 std::thread::Builder::new()
-                    .name(format!("atrium-socket-reader-{client_id}"))
+                    .name(format!("frescod-reader-{client_id}"))
                     .spawn(move || {
-                        if let Err(e) = reader_loop(stream, frontend.clone(), client_id, tx, subs_for_reader) {
-                            eprintln!("reader {client_id}: {e}");
+                        if let Err(e) = reader_loop(stream, frontend.clone(), client_id, tx) {
+                            eprintln!("frescod: reader {client_id}: {e}");
                         }
-                        // On disconnect, tear down all windows owned
-                        // by this client. Apps may exit without
-                        // calling destroy_window; without this step
-                        // the WM keeps the window registered, the
-                        // compositor keeps rendering its (stale) FBO,
-                        // and the visible window never goes away.
-                        cleanup_client_windows(&frontend, client_id);
+                        cleanup_client(&frontend, client_id);
                     })
                     .ok();
             }
             Err(e) => {
-                eprintln!("accept error: {e}");
+                eprintln!("frescod: accept: {e}");
                 break;
             }
         }
@@ -117,103 +149,75 @@ fn accept_loop(listener: UnixListener, shared: Shared, event_subs: EventSubs) {
 }
 
 fn reader_loop(
-    mut stream: UnixStream,
-    frontend: Arc<Mutex<CommandFrontend>>,
+    stream: UnixStream,
+    frontend: Arc<Mutex<EnvelopeFrontend>>,
     client_id: u8,
-    out: Sender<Completion>,
-    event_subs: EventSubs,
-) -> std::io::Result<()> {
-    let mut buf = [0u8; std::mem::size_of::<Command>()];
+    out: Sender<Outbound>,
+) -> io::Result<()> {
+    let mut conn = AqConn::wrap(stream)?;
     loop {
-        if let Err(e) = stream.read_exact(&mut buf) {
-            if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                return Ok(());
+        let msg = match conn.recv_message() {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(e) => return Err(e),
+        };
+
+        if msg.opcode_class != CLASS_DISPLAY {
+            log::debug!("client {client_id}: ignored class={} op={:#x}",
+                msg.opcode_class, msg.op);
+            continue;
+        }
+
+        let outs = match frontend.lock().unwrap().dispatch(&msg, client_id) {
+            Ok(v)  => v,
+            Err(e) => {
+                eprintln!("frescod: client {client_id} op={:#x}: {e:?}", msg.op);
+                Vec::new()
             }
-            return Err(e);
-        }
-        let cmd: Command = bytemuck::pod_read_unaligned(&buf);
-
-        // Vendor-extension opcode: client-injected input event for
-        // testing. Real input flows from native HID devices (D1 step
-        // 2c.16+), NOT from clients. Gated behind the `inject-input`
-        // feature so production builds reject the opcode and refuse
-        // to let untrusted clients spoof keystrokes.
-        #[cfg(feature = "inject-input")]
-        if cmd.opcode == CMD_INJECT_KEY {
-            let pb = cmd.payload_bytes();
-            let hid_usage = u16::from_le_bytes([pb[0], pb[1]]);
-            let pressed   = pb[2];
-            let modifiers = pb[3];
-            let target    = u32::from_le_bytes([pb[4], pb[5], pb[6], pb[7]]);
-            let mut result_hash = [0u8; 32];
-            result_hash[0..2].copy_from_slice(&hid_usage.to_le_bytes());
-            result_hash[2] = modifiers;
-            let comp = Completion {
-                comp_type:   COMP_INPUT_KEY,
-                status:      pressed as u16,
-                id:          target,
-                result_hash,
-                _pad:        [0u32; 22],
-            };
-            let mut subs = event_subs.lock().unwrap();
-            subs.retain(|(_, tx)| tx.send(comp).is_ok());
-            continue;
-        }
-        #[cfg(not(feature = "inject-input"))]
-        if cmd.opcode == CMD_INJECT_KEY {
-            eprintln!("CMD_INJECT_KEY rejected: compositor built without `inject-input` feature");
-            continue;
-        }
-
-        let comp = frontend.lock().unwrap().dispatch(&cmd, client_id);
-        if let Some(c) = comp {
-            if out.send(c).is_err() {
+        };
+        for o in outs {
+            if out.send(o).is_err() {
+                /* Writer exited; bail. */
                 return Ok(());
             }
         }
     }
 }
 
-/// Destroy every window whose `owner` matches the disconnecting
-/// client. Goes through `WmCompositor::destroy_with_focus_shift` so
-/// focus shifts properly (the next-most-recent window in z-order
-/// gains focus). The CommandFrontend exposes the WM via its public
-/// `compositor` Arc.
-fn cleanup_client_windows(
-    frontend: &Arc<Mutex<CommandFrontend>>,
-    client_id: u8,
-) {
-    let fe = frontend.lock().unwrap();
-    let wm_arc = fe.compositor.clone();
-    drop(fe);
-    let mut wm = wm_arc.lock().unwrap();
-    let owned: Vec<u16> = wm.windows.iter()
-        .filter(|(_, w)| w.owner as u8 == client_id)
-        .map(|(&id, _)| id)
-        .collect();
-    for id in owned {
-        let _ = wm.destroy_with_focus_shift(id, client_id as u32);
-    }
-}
-
-fn writer_loop(mut stream: UnixStream, rx: Receiver<Completion>) {
-    while let Ok(comp) = rx.recv() {
-        let bytes: [u8; std::mem::size_of::<Completion>()] = bytemuck::cast(comp);
-        if stream.write_all(&bytes).is_err() {
+fn writer_loop(stream: UnixStream, rx: Receiver<Outbound>, client_id: u8) {
+    let mut conn = match AqConn::wrap(stream) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("frescod: writer {client_id} wrap: {e}");
+            return;
+        }
+    };
+    while let Ok(o) = rx.recv() {
+        if let Err(e) = conn.send_message(CLASS_DISPLAY, o.op, o.flags, &o.payload) {
+            log::debug!("frescod: writer {client_id} send: {e}");
             break;
         }
     }
 }
 
-// (1 Hz ticker removed — replaced by CMD_INJECT_KEY → COMP_INPUT_KEY
-// fan-out for the input-driven flow. Step 2(c.14+) replaces this with
-// a kernel input reader that emits COMP_INPUT_* directly without going
-// through a client INJECT command.)
-#[allow(dead_code)]
-fn _unused_imports_anchor() {
-    // Keep the COMP_WINDOW_FOCUS / Duration imports referenced even
-    // when we drop the ticker — they'll come back when we restore a
-    // proper focus-event flow.
-    let _ = COMP_WINDOW_FOCUS;
-    let _ = Duration::from_secs(0);
+/// On client disconnect, drop every window the client owned and forget
+/// per-window scene state. Without this the renderer would keep
+/// pointing at the dead client's last frame indefinitely.
+fn cleanup_client(frontend: &Arc<Mutex<EnvelopeFrontend>>, client_id: u8) {
+    let mut fe = frontend.lock().unwrap();
+    let comp_arc = fe.compositor_arc().clone();
+    let owned: Vec<u32> = {
+        let comp = comp_arc.lock().unwrap();
+        comp.windows.iter()
+            .filter(|(_, w)| w.owner as u8 == client_id)
+            .map(|(&id, _)| id as u32)
+            .collect()
+    };
+    for id in owned {
+        {
+            let mut comp = comp_arc.lock().unwrap();
+            let _ = comp.destroy_with_focus_shift(id as u16, client_id as u32);
+        }
+        fe.forget_window(id);
+    }
 }

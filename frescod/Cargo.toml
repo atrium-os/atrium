@@ -4,43 +4,22 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 publish = false
-description = "Fresco scene-server daemon for FreeBSD — tiny-skia rendering during bring-up, atrium-gpu-rs scanout, native input."
+description = "Fresco scene-server daemon for FreeBSD — Vulkan SPIR-V bundle dispatch + atrium-gpu-rs scanout + envelope-based wire protocol."
 
 [[bin]]
 name = "frescod"
 path = "src/main.rs"
 
 [[bin]]
-name              = "frescod-vulkan-smoke"
-path              = "src/bin/vulkan_smoke.rs"
-required-features = ["vulkan"]
-
-[features]
-default = []
-# Accept the vendor-extension `CMD_INJECT_KEY` opcode which lets a
-# socket client push synthetic keyboard events into frescod's event
-# broadcast. Real input flows from native HID devices, NOT from clients —
-# INJECT exists purely for automation harnesses like `atrium-keyboard`.
-# Production builds disable it so untrusted clients can't spoof keystrokes.
-inject-input = []
-
-# Compile in the Vulkan rendering path (HeadlessRenderer + SPIR-V
-# bundle dispatch + aqueduct/EnvelopeFrontend dispatch). Enables the
-# `frescod-vulkan-smoke` binary that integrates the new stack end-to-end
-# (no scanout — dumps frames to PNG for behavioral validation).
-# Production frescod main.rs rewrite is M2.7d-final; this smoke bin
-# is the integration testbed.
-vulkan = ["dep:fresco-vulkan", "dep:aqueduct", "dep:fresco-protocol", "dep:image"]
+name = "frescod-vulkan-smoke"
+path = "src/bin/vulkan_smoke.rs"
 
 [dependencies]
-atrium-gpu-rs = { path = "../atrium-gpu-rs" }
-fresco-scene-server = { path = "../fresco-scene-server", features = ["tiny-skia-backend"] }
-fresco-vulkan = { path = "../fresco-vulkan", optional = true }
-aqueduct = { path = "../aqueduct", optional = true }
-fresco-protocol = { path = "../fresco-protocol", optional = true }
-tiny-skia = "0.11"
-image = { version = "0.25", default-features = false, features = ["png"], optional = true }
-libc = "0.2"
-bytemuck = "1"
+atrium-gpu-rs       = { path = "../atrium-gpu-rs" }
+fresco-scene-server = { path = "../fresco-scene-server" }
+fresco-vulkan       = { path = "../fresco-vulkan" }
+fresco-protocol     = { path = "../fresco-protocol" }
+aqueduct            = { path = "../aqueduct" }
+image               = { version = "0.25", default-features = false, features = ["png"] }
 env_logger = "0.11"
 log = "0.4"

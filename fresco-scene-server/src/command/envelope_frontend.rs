@@ -216,6 +216,13 @@ impl EnvelopeFrontend {
         self.per_window.remove(&window_id);
     }
 
+    /// Borrow the compositor `Arc` so callers can manipulate windows
+    /// outside the dispatch flow (client-disconnect cleanup, frescod's
+    /// per-frame render walking the window list, etc).
+    pub fn compositor_arc(&self) -> &Arc<Mutex<Compositor>> {
+        &self.compositor
+    }
+
     // ── Routable-op ownership check ──────────────────────────────────
 
     /// Resolve `msg.flags` into a target window_id and verify the
