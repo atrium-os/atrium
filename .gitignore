@@ -49,3 +49,8 @@ tarballs/
 # Settings local to one machine.
 .claude/settings.local.json
 atrium-kmod/bootfb/machine
+
+# Rendered presentation artifacts (regenerable from .slides.md via marp).
+docs/spec/*.slides.html
+docs/spec/*.slides.pdf
+docs/spec/*.slides.pptx
