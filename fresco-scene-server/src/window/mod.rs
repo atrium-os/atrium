@@ -16,7 +16,65 @@ use crate::command::protocol::{Hash256, NULL_HASH};
 use crate::render::font::FontData;
 use crate::scene::graph::SceneGraph;
 use crate::scene::slots::SlotTable;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
+
+/// Server-driven async events emitted by the compositor when its
+/// state changes (resize, focus, close-request, DPI). Per
+/// `docs/spec/fresco-rendering-stack.md` §3.8.1, these correspond
+/// to the `EV_WINDOW_*` op codes in fresco-protocol.
+///
+/// Compositor accumulates events through `event_sink` (optional
+/// `mpsc::Sender`); the consumer (frescod's per-connection writer
+/// thread) drains, filters by ownership, encodes via `encode_event`,
+/// and sends as aqueduct envelopes with the `ASYNC_EVENT` flag.
+#[derive(Clone, Debug)]
+pub enum DisplayEvent {
+    /// Window dimensions changed (compositor / WM resized; user
+    /// dragged corner; DPI scaling shift).
+    WindowResized        { window_id: u32, width: u32, height: u32 },
+    /// Focus gained or lost. Toolkits redraw active-state visuals.
+    WindowFocusChanged   { window_id: u32, gained: bool },
+    /// User clicked X (or equivalent gesture). Toolkit decides
+    /// whether to confirm; not the same as a server-initiated
+    /// close (which destroys directly).
+    WindowCloseRequested { window_id: u32 },
+    /// Output DPI changed (window moved to different display, etc.).
+    /// `scale_factor`: 1.0 = standard 96 DPI, 2.0 = HiDPI.
+    WindowDpiChanged     { window_id: u32, scale_factor: f32 },
+}
+
+/// Encode a `DisplayEvent` as a fresco-protocol payload. Returns
+/// `(op, payload)`; caller wraps in an aqueduct envelope with the
+/// `ASYNC_EVENT` flag and writes to the socket.
+pub fn encode_event(ev: &DisplayEvent)
+    -> Result<(u16, Vec<u8>), fresco_protocol::CodecError>
+{
+    use fresco_protocol::{control, encode, *};
+    match ev {
+        DisplayEvent::WindowResized { window_id, width, height } => {
+            let p = WindowResizedEvent {
+                window_id: *window_id, width: *width, height: *height,
+            };
+            Ok((control::EV_WINDOW_RESIZED, encode(&p)?))
+        }
+        DisplayEvent::WindowFocusChanged { window_id, gained } => {
+            let p = WindowFocusChangedEvent {
+                window_id: *window_id, gained: *gained,
+            };
+            Ok((control::EV_WINDOW_FOCUS_CHANGED, encode(&p)?))
+        }
+        DisplayEvent::WindowCloseRequested { window_id } => {
+            let p = WindowCloseRequestedEvent { window_id: *window_id };
+            Ok((control::EV_WINDOW_CLOSE_REQUESTED, encode(&p)?))
+        }
+        DisplayEvent::WindowDpiChanged { window_id, scale_factor } => {
+            let p = WindowDpiChangedEvent {
+                window_id: *window_id, scale_factor: *scale_factor,
+            };
+            Ok((control::EV_WINDOW_DPI_CHANGED, encode(&p)?))
+        }
+    }
+}
 
 /// Server-assigned window identifier. Stable for the window's
 /// lifetime, opaque to clients (they only know the ones the server
@@ -125,6 +183,12 @@ pub struct Compositor {
     /// Server's title font. Used to lay out window-title strings
     /// into glyph PathHeader hashes for the overlay pass.
     font: Option<FontData>,
+    /// Optional sink for `DisplayEvent`s emitted on state changes
+    /// (resize, focus, close-request, DPI). When `None`, events are
+    /// silently dropped — useful for tests that don't care. Frescod
+    /// wires this to a fan-out bus that broadcasts to per-connection
+    /// writer threads (see M2.7 cutover).
+    event_sink: Option<mpsc::Sender<DisplayEvent>>,
 }
 
 /// Server-side WM theme — controls how the compositor draws window
@@ -249,6 +313,25 @@ impl Compositor {
             title_text_material:   NULL_HASH,
             close_button_material: NULL_HASH,
             font: None,
+            event_sink: None,
+        }
+    }
+
+    /// Wire an `mpsc::Sender<DisplayEvent>` to receive async events
+    /// emitted by Compositor state mutations. If unset, events are
+    /// silently dropped (tests, headless smoke). Frescod sets this to
+    /// a fan-out forwarder that broadcasts to per-connection writer
+    /// threads.
+    pub fn set_event_sink(&mut self, sink: mpsc::Sender<DisplayEvent>) {
+        self.event_sink = Some(sink);
+    }
+
+    /// Push an event to the sink if one is wired. No-op if not.
+    /// Send failures (receiver dropped) are silently ignored — the
+    /// connection is being torn down.
+    fn emit(&self, ev: DisplayEvent) {
+        if let Some(sink) = &self.event_sink {
+            let _ = sink.send(ev);
         }
     }
 
@@ -443,6 +526,50 @@ impl Compositor {
         id
     }
 
+    /// Resize a window to (`width`, `height`) in logical pixels and
+    /// emit `DisplayEvent::WindowResized` if dimensions actually
+    /// changed. No-op (returns false) if the window doesn't exist.
+    /// Used by:
+    ///   - the input-reader's edge-drag completion (M2.7 wires this)
+    ///   - DPI-watcher (also emits DpiChanged)
+    ///   - explicit WM policy paths (snap-to-edge, tiling)
+    pub fn resize_window(&mut self, id: WindowId, width: u32, height: u32) -> bool {
+        let Some(win) = self.windows.get_mut(&id) else { return false; };
+        let new_size = (width as f32, height as f32);
+        if win.size == new_size {
+            return false;
+        }
+        win.size = new_size;
+        self.emit(DisplayEvent::WindowResized {
+            window_id: id as u32,
+            width, height,
+        });
+        true
+    }
+
+    /// Update DPI scale factor for `id`. Emits `WindowDpiChanged`.
+    pub fn set_window_dpi(&mut self, id: WindowId, scale_factor: f32) -> bool {
+        if !self.windows.contains_key(&id) {
+            return false;
+        }
+        self.emit(DisplayEvent::WindowDpiChanged {
+            window_id: id as u32, scale_factor,
+        });
+        true
+    }
+
+    /// Notify the window's owner that the user has requested close
+    /// (clicked the X / pressed the close key). Toolkit decides
+    /// whether to confirm + send `OP_WINDOW_DESTROY` or
+    /// `OP_WINDOW_REQUEST_CLOSE` in response.
+    pub fn request_close(&mut self, id: WindowId) -> bool {
+        if !self.windows.contains_key(&id) {
+            return false;
+        }
+        self.emit(DisplayEvent::WindowCloseRequested { window_id: id as u32 });
+        true
+    }
+
     /// Destroy returns the focus shift caused by removing `id`, if
     /// any (the destroyed window had focus and a new top now owns
     /// it). Caller emits a FOCUS-blurred for `id` regardless.
@@ -458,6 +585,11 @@ impl Compositor {
             self.focus = new_focus;
             new_focus.map(|n| FocusChange { prev: Some(id), new: n })
         } else { None };
+        if let Some(fc) = &shift {
+            self.emit(DisplayEvent::WindowFocusChanged {
+                window_id: fc.new as u32, gained: true,
+            });
+        }
         (true, shift)
     }
 
@@ -683,7 +815,19 @@ impl Compositor {
         self.z_order.push(id);
         let prev = self.focus;
         self.focus = Some(id);
-        if prev == Some(id) { None } else { Some(FocusChange { prev, new: id }) }
+        if prev == Some(id) {
+            None
+        } else {
+            if let Some(p) = prev {
+                self.emit(DisplayEvent::WindowFocusChanged {
+                    window_id: p as u32, gained: false,
+                });
+            }
+            self.emit(DisplayEvent::WindowFocusChanged {
+                window_id: id as u32, gained: true,
+            });
+            Some(FocusChange { prev, new: id })
+        }
     }
 
     /// Phase-B1c entry point: which window contains (x, y) at the top
@@ -791,4 +935,144 @@ fn build_textured_quad_mesh(cas: &mut CasStore) -> Hash256 {
     mb[16..48].copy_from_slice(&vh);
     mb[48..80].copy_from_slice(&ih);
     cas.store_pinned(&mb)
+}
+
+#[cfg(test)]
+mod event_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn comp_with_sink() -> (Compositor, mpsc::Receiver<DisplayEvent>) {
+        let (tx, rx) = mpsc::channel();
+        let mut c = Compositor::new();
+        c.set_event_sink(tx);
+        (c, rx)
+    }
+
+    /// Helper: assert the next event matches a pattern, with a short
+    /// timeout to avoid hanging if the event was never emitted.
+    fn expect_event(rx: &mpsc::Receiver<DisplayEvent>) -> DisplayEvent {
+        rx.recv_timeout(Duration::from_millis(100))
+            .expect("expected DisplayEvent within 100ms")
+    }
+
+    #[test]
+    fn no_sink_silently_drops() {
+        let mut c = Compositor::new();
+        let id = c.create(/*owner=*/ 7, (100, 100));
+        /* No sink wired; resize must not panic. */
+        assert!(c.resize_window(id, 200, 200));
+    }
+
+    #[test]
+    fn resize_emits_event() {
+        let (mut c, rx) = comp_with_sink();
+        let id = c.create(7, (100, 100));
+        assert!(c.resize_window(id, 320, 240));
+        match expect_event(&rx) {
+            DisplayEvent::WindowResized { window_id, width, height } => {
+                assert_eq!(window_id, id as u32);
+                assert_eq!((width, height), (320, 240));
+            }
+            other => panic!("expected WindowResized, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resize_no_op_emits_nothing() {
+        let (mut c, rx) = comp_with_sink();
+        let id = c.create(7, (100, 100));
+        /* Same dimensions — must not emit. */
+        assert!(!c.resize_window(id, 100, 100));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn raise_emits_focus_changed_pair() {
+        let (mut c, rx) = comp_with_sink();
+        let a = c.create(7, (100, 100));
+        let b = c.create(7, (100, 100));
+        /* Initial focus is window 0; raise a → focus shifts. */
+        let fc = c.raise(a).expect("focus moved");
+        assert_eq!(fc.new, a);
+        /* Two events: window 0 lost focus, window a gained. */
+        match expect_event(&rx) {
+            DisplayEvent::WindowFocusChanged { window_id: 0, gained: false } => {}
+            other => panic!("expected window 0 lost focus, got {other:?}"),
+        }
+        match expect_event(&rx) {
+            DisplayEvent::WindowFocusChanged { window_id, gained: true } => {
+                assert_eq!(window_id, a as u32);
+            }
+            other => panic!("expected window a gained focus, got {other:?}"),
+        }
+        /* Raise b → another shift. */
+        let _ = c.raise(b);
+        match expect_event(&rx) {
+            DisplayEvent::WindowFocusChanged { gained: false, .. } => {}
+            other => panic!("expected lost-focus, got {other:?}"),
+        }
+        match expect_event(&rx) {
+            DisplayEvent::WindowFocusChanged { gained: true, .. } => {}
+            other => panic!("expected gained-focus, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn destroy_with_focus_shift_emits_event() {
+        let (mut c, rx) = comp_with_sink();
+        let a = c.create(7, (100, 100));
+        c.raise(a);
+        /* Drain the focus-shift events from raise(). */
+        while rx.try_recv().is_ok() {}
+        /* Destroy a — focus shifts back to whatever was second. */
+        let (ok, _shift) = c.destroy_with_focus_shift(a, 7);
+        assert!(ok);
+        match expect_event(&rx) {
+            DisplayEvent::WindowFocusChanged { gained: true, .. } => {}
+            other => panic!("expected focus event from destroy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn close_request_emits() {
+        let (mut c, rx) = comp_with_sink();
+        let id = c.create(7, (100, 100));
+        assert!(c.request_close(id));
+        match expect_event(&rx) {
+            DisplayEvent::WindowCloseRequested { window_id } => {
+                assert_eq!(window_id, id as u32);
+            }
+            other => panic!("expected close-requested, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dpi_change_emits() {
+        let (mut c, rx) = comp_with_sink();
+        let id = c.create(7, (100, 100));
+        assert!(c.set_window_dpi(id, 2.0));
+        match expect_event(&rx) {
+            DisplayEvent::WindowDpiChanged { window_id, scale_factor } => {
+                assert_eq!(window_id, id as u32);
+                assert_eq!(scale_factor, 2.0);
+            }
+            other => panic!("expected DPI event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encode_event_roundtrip() {
+        use fresco_protocol::{control, decode, WindowResizedEvent};
+        let ev = DisplayEvent::WindowResized {
+            window_id: 7, width: 1280, height: 720,
+        };
+        let (op, payload) = encode_event(&ev).expect("encode");
+        assert_eq!(op, control::EV_WINDOW_RESIZED);
+        let decoded: WindowResizedEvent = decode(&payload).expect("decode");
+        assert_eq!(decoded.window_id, 7);
+        assert_eq!(decoded.width, 1280);
+        assert_eq!(decoded.height, 720);
+    }
 }
