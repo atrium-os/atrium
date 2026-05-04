@@ -24,6 +24,25 @@ This document records a one-time architectural decision so contributors know the
 4. **Already shipped.** `fresco-server`, the four foundation apps, `fresco-rs`, `fresco-text`, and `atrium-gpu-rs` are Rust. Switching is enormous cost for arguable gain.
 5. **Industry direction.** The Linux kernel accepts Rust. Microsoft is shipping Rust in Windows. Google ships Rust in Android. Betting on Rust as a systems language in 2026 is no longer speculative.
 
+## Vendored / forked dependencies stay in their native language
+
+The rule above governs **Atrium-authored** code. Code we vendor or fork from
+upstream (e.g. `atrium-mesa` forking Mesa, future kernel-driver imports)
+keeps its upstream language — we don't rewrite working C/C++ for ideological
+reasons. Specifically:
+
+- **Atrium-authored userspace** → Rust (per the rule).
+- **Forks we maintain** (atrium-mesa is the canonical example) → inherit the
+  upstream language. New code *we* add into those forks follows the Rust
+  default where natural.
+- **Where upstream is itself moving toward Rust** (Mesa's `nak` compiler is
+  Rust, more conversions discussed), we adopt and contribute to that
+  movement rather than running our own parallel rewrite.
+
+This is the same pragmatism as "we don't rewrite FreeBSD base." The thing
+that makes Atrium *Atrium* is the layer above; the layers below stay
+themselves.
+
 ## Why C at the boundaries
 
 This is the answer to "FreeBSD is a C culture; won't Rust create friction?"
