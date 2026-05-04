@@ -39,6 +39,8 @@ use fresco_protocol::{
     WindowHints,
     WindowResizedEvent, WindowFocusChangedEvent,
     WindowCloseRequestedEvent, WindowDpiChangedEvent,
+    InputKeyEvent, InputPointerMotionEvent,
+    InputPointerButtonEvent, InputPointerScrollEvent,
     scene_ops,
 };
 
@@ -54,6 +56,26 @@ pub enum Event {
     FocusChanged   { window_id: u32, gained: bool },
     CloseRequested { window_id: u32 },
     DpiChanged     { window_id: u32, scale_factor: f32 },
+    /// Keyboard press/release. `window_id == 0` indicates broadcast
+    /// (no focused window).
+    Key {
+        window_id: u32,
+        hid_usage: u16,
+        pressed:   bool,
+        modifiers: u8,
+    },
+    /// Pointer motion in window-local logical pixels.
+    PointerMotion { window_id: u32, x: f32, y: f32 },
+    /// Pointer button press/release.
+    PointerButton {
+        window_id: u32,
+        x: f32, y: f32,
+        button: u8,
+        pressed: bool,
+        modifiers: u8,
+    },
+    /// Pointer scroll delta in logical pixels.
+    PointerScroll { window_id: u32, dx: f32, dy: f32 },
     /// Op-id outside the events fresco-client knows about. App can
     /// either decode it itself or ignore.
     Unknown        { op: u16, payload: Vec<u8> },
@@ -366,6 +388,32 @@ fn decode_event(op: u16, payload: &[u8]) -> Event {
             },
             Err(_) => Event::Unknown { op, payload: payload.to_vec() },
         },
+        EV_INPUT_KEY => match decode::<InputKeyEvent>(payload) {
+            Ok(p) => Event::Key {
+                window_id: p.window_id, hid_usage: p.hid_usage,
+                pressed: p.pressed, modifiers: p.modifiers,
+            },
+            Err(_) => Event::Unknown { op, payload: payload.to_vec() },
+        },
+        EV_INPUT_POINTER_MOTION => match decode::<InputPointerMotionEvent>(payload) {
+            Ok(p) => Event::PointerMotion {
+                window_id: p.window_id, x: p.x, y: p.y,
+            },
+            Err(_) => Event::Unknown { op, payload: payload.to_vec() },
+        },
+        EV_INPUT_POINTER_BUTTON => match decode::<InputPointerButtonEvent>(payload) {
+            Ok(p) => Event::PointerButton {
+                window_id: p.window_id, x: p.x, y: p.y,
+                button: p.button, pressed: p.pressed, modifiers: p.modifiers,
+            },
+            Err(_) => Event::Unknown { op, payload: payload.to_vec() },
+        },
+        EV_INPUT_POINTER_SCROLL => match decode::<InputPointerScrollEvent>(payload) {
+            Ok(p) => Event::PointerScroll {
+                window_id: p.window_id, dx: p.dx, dy: p.dy,
+            },
+            Err(_) => Event::Unknown { op, payload: payload.to_vec() },
+        },
         _ => Event::Unknown { op, payload: payload.to_vec() },
     }
 }
@@ -402,6 +450,49 @@ mod tests {
                 assert_eq!(scale_factor, 2.0);
             }
             other => panic!("expected DpiChanged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_event_dispatches_input_variants() {
+        use control::*;
+
+        let p = InputKeyEvent {
+            window_id: 4, hid_usage: 0x04, /* 'a' */
+            pressed: true, modifiers: 0x01, /* shift */
+        };
+        let bytes = encode(&p).unwrap();
+        match decode_event(EV_INPUT_KEY, &bytes) {
+            Event::Key { window_id: 4, hid_usage: 0x04, pressed: true, modifiers: 0x01 } => {}
+            other => panic!("expected Key, got {other:?}"),
+        }
+
+        let p = InputPointerMotionEvent { window_id: 2, x: 100.5, y: 200.25 };
+        let bytes = encode(&p).unwrap();
+        match decode_event(EV_INPUT_POINTER_MOTION, &bytes) {
+            Event::PointerMotion { window_id: 2, x, y } => {
+                assert_eq!((x, y), (100.5, 200.25));
+            }
+            other => panic!("expected PointerMotion, got {other:?}"),
+        }
+
+        let p = InputPointerButtonEvent {
+            window_id: 1, x: 10.0, y: 20.0,
+            button: 1, pressed: true, modifiers: 0,
+        };
+        let bytes = encode(&p).unwrap();
+        match decode_event(EV_INPUT_POINTER_BUTTON, &bytes) {
+            Event::PointerButton { window_id: 1, button: 1, pressed: true, .. } => {}
+            other => panic!("expected PointerButton, got {other:?}"),
+        }
+
+        let p = InputPointerScrollEvent { window_id: 3, dx: 0.0, dy: -8.5 };
+        let bytes = encode(&p).unwrap();
+        match decode_event(EV_INPUT_POINTER_SCROLL, &bytes) {
+            Event::PointerScroll { window_id: 3, dx, dy } => {
+                assert_eq!((dx, dy), (0.0, -8.5));
+            }
+            other => panic!("expected PointerScroll, got {other:?}"),
         }
     }
 

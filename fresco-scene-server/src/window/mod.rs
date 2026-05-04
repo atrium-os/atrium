@@ -41,6 +41,30 @@ pub enum DisplayEvent {
     /// Output DPI changed (window moved to different display, etc.).
     /// `scale_factor`: 1.0 = standard 96 DPI, 2.0 = HiDPI.
     WindowDpiChanged     { window_id: u32, scale_factor: f32 },
+
+    /// Keyboard press/release routed to the focused window's owner.
+    /// `window_id == 0` = no focus, broadcast to all clients. See
+    /// `fresco_protocol::InputKeyEvent` for field semantics.
+    InputKey {
+        window_id: u32,
+        hid_usage: u16,
+        pressed:   bool,
+        modifiers: u8,
+    },
+    /// Pointer cursor moved over a window's content region.
+    InputPointerMotion { window_id: u32, x: f32, y: f32 },
+    /// Pointer button press/release on a window. `button`: 1=primary,
+    /// 2=secondary, 3=middle, 4-N reserved.
+    InputPointerButton {
+        window_id: u32,
+        x: f32, y: f32,
+        button: u8,
+        pressed: bool,
+        modifiers: u8,
+    },
+    /// Pointer scroll (wheel / two-finger). `dy > 0` = content scrolls
+    /// down (matches macOS/Wayland convention).
+    InputPointerScroll { window_id: u32, dx: f32, dy: f32 },
 }
 
 /// Encode a `DisplayEvent` as a fresco-protocol payload. Returns
@@ -72,6 +96,34 @@ pub fn encode_event(ev: &DisplayEvent)
                 window_id: *window_id, scale_factor: *scale_factor,
             };
             Ok((control::EV_WINDOW_DPI_CHANGED, encode(&p)?))
+        }
+        DisplayEvent::InputKey { window_id, hid_usage, pressed, modifiers } => {
+            let p = InputKeyEvent {
+                window_id: *window_id,
+                hid_usage: *hid_usage,
+                pressed:   *pressed,
+                modifiers: *modifiers,
+            };
+            Ok((control::EV_INPUT_KEY, encode(&p)?))
+        }
+        DisplayEvent::InputPointerMotion { window_id, x, y } => {
+            let p = InputPointerMotionEvent {
+                window_id: *window_id, x: *x, y: *y,
+            };
+            Ok((control::EV_INPUT_POINTER_MOTION, encode(&p)?))
+        }
+        DisplayEvent::InputPointerButton { window_id, x, y, button, pressed, modifiers } => {
+            let p = InputPointerButtonEvent {
+                window_id: *window_id, x: *x, y: *y,
+                button: *button, pressed: *pressed, modifiers: *modifiers,
+            };
+            Ok((control::EV_INPUT_POINTER_BUTTON, encode(&p)?))
+        }
+        DisplayEvent::InputPointerScroll { window_id, dx, dy } => {
+            let p = InputPointerScrollEvent {
+                window_id: *window_id, dx: *dx, dy: *dy,
+            };
+            Ok((control::EV_INPUT_POINTER_SCROLL, encode(&p)?))
         }
     }
 }

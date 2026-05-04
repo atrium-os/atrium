@@ -457,6 +457,7 @@ dependencies = [
  "fresco-scene-server",
  "fresco-vulkan",
  "image",
+ "libc",
  "log",
 ]
 

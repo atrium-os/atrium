@@ -23,6 +23,7 @@
 //! collisions across windows are not yet handled (M3+); typical
 //! single-window apps render correctly.
 
+mod input_reader;
 mod socket_server;
 
 use atrium_gpu::abi::*;
@@ -83,10 +84,12 @@ fn main() -> std::io::Result<()> {
     let slots = Arc::new(Mutex::new(SlotTable::new()));
     let comp  = Arc::new(Mutex::new(Compositor::new_with_window0(scene, slots)));
 
-    /* DisplayEvent sink: compositor pushes events; fan-out thread
-     * encodes + broadcasts to all per-connection writer mpscs. */
+    /* DisplayEvent sink: compositor pushes window events, input_reader
+     * pushes keyboard events; fan-out thread encodes + broadcasts to
+     * all per-connection writer mpscs. Senders are cheaply cloneable
+     * so each producer keeps its own. */
     let (ev_tx, ev_rx) = mpsc::channel();
-    comp.lock().unwrap().set_event_sink(ev_tx);
+    comp.lock().unwrap().set_event_sink(ev_tx.clone());
 
     let frontend = Arc::new(Mutex::new(EnvelopeFrontend::new(cas, comp.clone())));
 
@@ -99,6 +102,12 @@ fn main() -> std::io::Result<()> {
         &sock_path,
     )?;
     socket_server::spawn_event_fanout(ev_rx, event_subs);
+
+    /* Native FreeBSD keyboard input. Reads /dev/hidraw* directly,
+     * routes HID Usage Page 0x07 codes by focus, pushes
+     * DisplayEvent::InputKey through the same event sink. Fails soft —
+     * frescod runs without keyboard if no /dev/hidraw* matches. */
+    input_reader::spawn(ev_tx, comp.clone());
 
     /* ── Frame loop ─────────────────────────────────────────────── */
     let mut frame: u64 = 0;
