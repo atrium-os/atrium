@@ -14,12 +14,14 @@
 //! draws on top of this scaffolding.
 
 mod renderer;
+mod headless;
 mod pipeline;
 mod resource;
 mod frame;
 mod reflect;
 
 pub use renderer::{Renderer, TextureBatch};
+pub use headless::HeadlessRenderer;
 pub use pipeline::{OpKind, OpPipelines};
 pub use resource::{Resource, Texture, UploadRequest};
 pub use frame::{SceneNode, TextureNode};
