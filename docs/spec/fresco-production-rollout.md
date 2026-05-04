@@ -27,7 +27,7 @@
 
 All five locked during the planning conversation:
 
-1. **Rename `frescod` → `fresco-scene-server`** (or `frescod`) in the bsd repo. Retire the tiny-skia path from production; lavapipe is the SW fallback.
+1. **Rename `atrium-compositor` → `frescod`** (the daemon binary) and absorb the `fresco-server` library crate into bsd as `fresco-scene-server`. Retire the tiny-skia path from production; lavapipe is the SW fallback.
 2. **Archive `~/src/fresco-poc`.** Move under `bsd/scratch/fresco-arch-validation/` for posterity. Stop committing there.
 3. **Wire format: hard cutover at D2.** No coexistence window with the legacy 128-byte format.
 4. **Vulkan strategy:**
@@ -59,7 +59,7 @@ Each milestone has a concrete **done-when** so we know to stop and check.
 
 ### M1 — Wire protocol freeze for D2 (3–5 days)
 
-**Goal:** lock the op set we're going to commit to before refactoring `fresco-scene-server` against it.
+**Goal:** lock the op set we're going to commit to before refactoring frescod (and the `fresco-scene-server` library it links) against it.
 
 - [ ] Port `atrium-rpc-display` payload schemas from the macOS POC into the bsd `atrium-rpc/` workspace.
 - [ ] Implement the `WINDOW_*` op family per §3.8.1: control ops + async events.
@@ -71,17 +71,17 @@ Each milestone has a concrete **done-when** so we know to stop and check.
 
 ---
 
-### M2 — fresco-scene-server: SPIR-V backend + bundle loading (2–3 weeks)
+### M2 — frescod: SPIR-V backend + bundle loading (2–3 weeks)
 
-**Goal:** the renamed scene server replaces tiny-skia with the SPIR-V bundle dispatch path proven in the POC.
+**Goal:** frescod replaces tiny-skia with the SPIR-V bundle dispatch path proven in the POC. Most of the work lands inside the `fresco-scene-server` library (where the rendering machinery lives), with frescod as the consuming binary.
 
-- [ ] Port `fresco-vulkan` crate from POC into the bsd repo.
+- [ ] Port `fresco-vulkan` crate from POC into the bsd repo (new top-level crate).
 - [ ] Port `fresco-bundle` crate (manifest + SPIR-V load + reflection).
 - [ ] Port `atrium-core` bundle (rect, texture ops + GLSL sources + build.sh).
-- [ ] Wire bundle dispatch into `fresco-scene-server`'s render loop, replacing the tiny-skia rasterizer.
-- [ ] Implement per-connection `SceneState` (the POC currently shares one — explicit gap flagged in deck).
-- [ ] Implement `WINDOW_*` op family in the server (input routing, focus, close-request flow).
-- [ ] Validate against existing demos: rect-bouncer, slot-demo, edit-socket, textured, window-demo, keyboard.
+- [ ] Wire bundle dispatch into `fresco-scene-server`'s render loop, replacing the tiny-skia rasterizer (frescod inherits this transparently).
+- [ ] Implement per-connection `SceneState` in `fresco-scene-server` (the POC currently shares one — explicit gap flagged in deck).
+- [ ] Implement `WINDOW_*` op family in `fresco-scene-server`'s `CommandFrontend` (input routing, focus, close-request flow).
+- [ ] Validate against existing demos via frescod: rect-bouncer, slot-demo, edit-socket, textured, window-demo, keyboard.
 
 **Done when:** all pre-existing demos run on the new SPIR-V backend in QEMU (lavapipe). atrium-edit-socket is visually identical to its tiny-skia output. Multi-app: launch two demos in parallel, both render correctly without state interference.
 
@@ -99,7 +99,7 @@ Each milestone has a concrete **done-when** so we know to stop and check.
 - [ ] Document RUNBOOK setup: `MESA_VK_DEVICE_SELECT=*:llvmpipe` or similar, environment for guest-VM tests.
 - [ ] CI lane (later): headless render of scene-a, capture to PNG, pixel-diff against expected.
 
-**Done when:** `cargo run --bin fresco-scene-server` inside QEMU successfully renders scene-a + scene-b through lavapipe. Frame rate is allowed to be terrible.
+**Done when:** `cargo run --bin frescod` inside QEMU successfully renders scene-a + scene-b through lavapipe. Frame rate is allowed to be terrible.
 
 ---
 
@@ -198,9 +198,9 @@ M0 ──► M1 ──► M2 ──► M3 ──► M5 (real HW) ──► M6 �
             └► M8 (after M7)
 ```
 
-**M2 is the heavy lift.** Once SPIR-V bundles run on the renamed
-fresco-scene-server with per-connection state and the WM op family,
-everything after is incremental.
+**M2 is the heavy lift.** Once frescod runs the SPIR-V bundle dispatch
+path with per-connection state and the WM op family, everything after
+is incremental.
 
 ---
 
