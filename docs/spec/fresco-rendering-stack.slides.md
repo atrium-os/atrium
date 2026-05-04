@@ -776,14 +776,35 @@ The Atrium project owns `0x1000–0x7FFF` — and is the only authority that can
 
 ---
 
+## Pergola — the toolkit apps actually use
+
+Apps don't speak the Fresco wire protocol directly — that's tedious. They use **Pergola**, the Atrium UI toolkit (Latin: *ornamental garden structure with cross-beams*; the framework widgets grow on). Equivalent in role to Qt / GTK in current desktops.
+
+- **Library**, linked into each app process. Retained-mode widget tree.
+- Owns: widget vocabulary, layout, event routing, **window lifecycle**, text shaping (HarfBuzz on CPU), animation API, accessibility tree, theming.
+- Diff-on-commit: app mutates widget tree → Pergola walks dirty subtree → emits `SCENE_NODE_SET` / `CLEAR` deltas via `fresco-socket-rs`.
+
+**Three op families Pergola drives but the POC doesn't yet implement** (specced in `fresco-rendering-stack.md` §3.8):
+
+| Family | What | Lands |
+|---|---|---|
+| `WINDOW_*` | create/destroy, title, resize/focus events, DPI changes | D2 |
+| `ANIMATION_*` | declare interpolations server-side; app can sleep | D4 |
+| `CLASS_AX` | parallel AX tree → screen readers, UI tests, scripting | D5 |
+
+Bring-up: **adapt Slint** for D2/D3 (validate the toolkit→wire path fast), **build native Pergola** for D4+. Third-party Qt/GTK ports: deferred indefinitely; we publish the wire protocol, community ports if demand exists.
+
+---
+
 ## Where this leads
 
 The POC unblocks several Atrium initiatives:
 
-- **D2 (scene server on FreeBSD)** — port `fresco-server` (likely renamed `fresco-scene-server` / `frescod`) to vendor Vulkan + native event loop. The wire protocol is stable; the porting cost is the platform shim.
-- **D3 (atrium-text bundle)** — ship a glyph-rendering bundle (`0x2000` range). Validates the multi-bundle path.
-- **D5 (Atrium GPU ABI)** — replace MoltenVK / linuxkpi with the native FreeBSD GPU driver. Fresco still talks Vulkan; the driver layer changes underneath.
-- **Tessera integration** — same SHA-256 hash space, so once Atrium ships, persistent assets dedup across CAS-FS automatically.
+- **D2 (scene server on FreeBSD)** — port `fresco-server` (likely renamed `fresco-scene-server` / `frescod`) to vendor Vulkan + native event loop. WM op family lands here. Toolkit bring-up via Slint adapter.
+- **D3 (atrium-text bundle)** — ship a glyph-rendering bundle (`0x2000` range). Validates the multi-bundle path; exercises Pergola's text path.
+- **D4 (declarative animation)** — `ANIMATION_*` op family + Pergola surface; closes the iOS Render Server gap.
+- **D5 (Atrium GPU ABI + accessibility)** — replace MoltenVK / linuxkpi with the native FreeBSD GPU driver; land `CLASS_AX` and `pergola-ax` for first-class accessibility.
+- **Tessera integration** — same SHA-256 hash space, so persistent assets dedup across CAS-FS automatically.
 
 The scene server isn't a research vehicle. It's the **default Atrium graphics stack** going forward.
 

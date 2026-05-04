@@ -759,6 +759,88 @@ new path supersedes the old one (post-POC, after a migration
 window), `wire-format.md` gets a deprecation note. For now: two
 specs coexist, each governing its own implementations.
 
+### 3.8 Planned op families: window management, animation, accessibility
+
+The wire protocol grows three additional op families beyond the scene-
+graph primitives in §3.7. Each is **planned-but-deferred** — captured
+here so the design space is consistent across phases, but not yet
+implemented in the POC. All live in CLASS_DISPLAY (no new classes).
+
+#### 3.8.1 Window management
+
+The scene server already plays a window-manager role (placement, focus,
+z-order, input routing). Apps express window lifecycle through the
+toolkit (Pergola — see [`pergola.md`](pergola.md)), which emits these
+ops via fresco-socket-rs underneath. App code never calls these
+directly.
+
+```
+Control (client → server):
+  WINDOW_CREATE         id, hints (size, decorations, modal, parent)
+  WINDOW_DESTROY        id
+  WINDOW_SET_TITLE      id, string
+  WINDOW_SET_HINTS      id, hint-flags
+  WINDOW_REQUEST_CLOSE  id
+
+Events (server → client):
+  WINDOW_RESIZED         id, width, height
+  WINDOW_FOCUS_CHANGED   id, gained|lost
+  WINDOW_CLOSE_REQUESTED id   (user clicked X)
+  WINDOW_DPI_CHANGED     id, scale
+```
+
+This is what xdg-shell solves for Wayland; we get to solve it once
+cleanly because we own the protocol. POC has stubs (`atrium-window-demo`);
+finalize the op set in `atrium-rpc-display` during D2.
+
+#### 3.8.2 Animation (declarative, server-driven)
+
+Phase A (D2/D3): client-driven animation only — toolkit emits per-frame
+state via `SCENE_NODE_SET`. App must be running 60+ Hz during the
+animation; battery cost is real; smoothness suffers during app GC
+pauses or other host-side work.
+
+Phase B (D4+): declarative `ANIMATION_*` ops let fresco-server run an
+interpolator on its own tick. App can be suspended; animations still
+play to completion. Closes the iOS Render Server gap.
+
+```
+Control (client → server):
+  ANIMATION_START   handle, target_node, property,
+                    from, to, duration, curve, on_complete
+  ANIMATION_CANCEL  handle
+
+Events (server → client):
+  ANIMATION_FINISHED handle
+```
+
+Pergola's animation API surface should be the same in both phases —
+the app code never changes when we flip the implementation.
+
+#### 3.8.3 Accessibility (CLASS_AX)
+
+Architecturally first-class, not retrofitted. The scene server already
+mirrors per-app retained-mode trees; the AX tree is the same shape with
+different node payloads. Pergola owns both trees (scene + AX) and
+mirrors them in lockstep.
+
+Sibling dictionary to CLASS_DISPLAY:
+
+```
+AX_NODE_SET          node_id, role, label, value, state, parent, rect
+AX_NODE_CLEAR        node_id
+AX_TREE_FOCUS_CHANGE node_id
+```
+
+**Single semantic tree, three consumers:**
+
+1. Screen readers / voice control / switch control (assistive tech)
+2. UI testing / automation tools (the AX tree IS the test surface)
+3. Scripting (drive the UI from outside the app)
+
+Land in D5 alongside `pergola-ax`. Real differentiator vs. desktop
+Linux's fragmented AT-SPI.
+
 ## 4. The "raw GPU access" escape hatch — and why we mostly don't need it
 
 Some workloads cannot fit any extensible scene model: graphics

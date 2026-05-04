@@ -8,6 +8,7 @@ Canonical vocabulary for the Atrium platform. Every component in this table has 
 |---|---|---|---|
 | **The OS** | **Atrium** | central courtyard of a Roman house | the integrated platform |
 | **Display protocol** | **Fresco** | wall painting in lime plaster | retained-mode scenegraph protocol; what apps speak to render |
+| **UI toolkit** | **Pergola** | ornamental garden structure with cross-beams | the framework apps grow widgets on; emits Fresco scenegraph messages |
 | **Content-addressed filesystem** | **Tessera** | a single mosaic tile | per-file content-addressed dedup |
 | **Kernel/userspace GPU ABI** | (unnamed; just "Atrium GPU ABI") | — | the boundary the Fresco server uses to talk to native FreeBSD GPU drivers |
 
