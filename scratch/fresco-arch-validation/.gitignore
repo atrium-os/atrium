@@ -1,0 +1,6 @@
+target/
+**/*.rs.bk
+.DS_Store
+
+# SPIR-V build artifacts (we don't commit compiled .spv; rebuilt from .glsl).
+bundles/**/*.spv

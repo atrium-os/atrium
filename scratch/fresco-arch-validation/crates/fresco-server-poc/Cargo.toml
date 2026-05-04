@@ -1,0 +1,26 @@
+[package]
+name        = "fresco-server-poc"
+version.workspace     = true
+edition.workspace     = true
+license.workspace     = true
+rust-version.workspace = true
+publish.workspace     = true
+description = "Proof-of-concept fresco-server using atrium-rpc + SPIR-V bundles. Validates the architecture in docs/spec/fresco-rendering-stack.md."
+
+[[bin]]
+name = "fresco-server-poc"
+path = "src/main.rs"
+
+[dependencies]
+atrium-rpc.workspace          = true
+atrium-rpc-display.workspace  = true
+fresco-bundle.workspace       = true
+fresco-vulkan.workspace       = true
+
+ash.workspace                 = true
+winit.workspace               = true
+raw-window-handle.workspace   = true
+
+anyhow.workspace              = true
+log.workspace                 = true
+env_logger.workspace          = true

@@ -1,0 +1,13 @@
+# Embed Homebrew's lib dir in the binary's rpath so `dlopen("libvulkan.dylib")`
+# at runtime finds /opt/homebrew/lib/libvulkan.dylib without requiring
+# DYLD_LIBRARY_PATH (which macOS strips for some contexts under SIP).
+#
+# Apple Silicon: /opt/homebrew/lib. Intel: /usr/local/lib (default fallback
+# already covers it). For cross-platform runs, the installed target's
+# default loader lookup picks up the right libvulkan.
+
+[target.aarch64-apple-darwin]
+rustflags = [
+    "-C", "link-arg=-Wl,-rpath,/opt/homebrew/lib",
+    "-C", "link-arg=-Wl,-rpath,@executable_path",
+]

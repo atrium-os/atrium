@@ -1,0 +1,16 @@
+[package]
+name        = "fresco-vulkan"
+version.workspace     = true
+edition.workspace     = true
+license.workspace     = true
+rust-version.workspace = true
+publish.workspace     = true
+description = "Vulkan setup + per-frame compute/render dispatch for fresco-server. ash-based; MoltenVK on macOS during POC, vendor Vulkan on FreeBSD VM later."
+
+[dependencies]
+ash.workspace             = true
+ash-window.workspace      = true
+raw-window-handle.workspace = true
+anyhow.workspace          = true
+log.workspace             = true
+fresco-bundle.workspace   = true

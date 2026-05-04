@@ -1,0 +1,21 @@
+[package]
+name        = "fresco-test-client"
+version.workspace     = true
+edition.workspace     = true
+license.workspace     = true
+rust-version.workspace = true
+publish.workspace     = true
+description = "Test client for fresco-server-poc. Emits Scene A (rects) and Scene B (one texture × 100 instances, exercising CAS dedup)."
+
+[[bin]]
+name = "fresco-test-client"
+path = "src/main.rs"
+
+[dependencies]
+atrium-rpc.workspace          = true
+atrium-rpc-display.workspace  = true
+
+anyhow.workspace              = true
+log.workspace                 = true
+env_logger.workspace          = true
+serde.workspace               = true

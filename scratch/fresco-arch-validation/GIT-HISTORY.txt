@@ -1,0 +1,707 @@
+9c3033f 2026-05-04 SPIR-V reflection: descriptor layouts driven by the shader
+
+Drops the hardcoded create_compute_set_layout / create_render_set_layout
+paths from step 4 (the TODO that pipeline.rs flagged). The shader IS
+the source of truth for which (set, binding) slots exist and what
+descriptor type each one is — a third-party bundle with novel binding
+shapes now compiles without renderer changes.
+
+New crate-private module `reflect`: ~150 LOC SPIR-V parser that walks
+OpDecorate / OpVariable / OpTypePointer / OpTypeSampledImage to extract
+ReflectedBinding { set, binding, ty }. No external deps; using rspirv
+for this would be more dependency than reflection.
+
+build_set_layout_bindings merges multiple shaders' reflected bindings
+for one set, OR-ing stage flags (e.g. InstanceBuf bound by both
+compute and the vertex stage of the render pipeline gets
+COMPUTE | VERTEX automatically).
+
+OpKind survives only as a runtime hint for `frame.rs`'s buffer-sizing
+heuristic (rect: 32-byte nodes, texture: 16-byte; per-slot descriptor
+pool when render set has a sampler). Migrating that to reflection-
+or manifest-driven sizing is a follow-up — orthogonal to the
+descriptor-layout TODO this commit resolves.
+
+Smoke-tested: scene-b (texture op) and scene-a (rect op, 1000 rects)
+both render with no validation errors and the same atomic-counter
+readback as the hardcoded path produced.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+----
+
+694a991 2026-05-04 steps 10+11: scale scene-a to 1000 rects + bandwidth assertion
+
+scene-a: 10 → 1000 rects (the originally-specified workload). At 47 B
+per rect on the wire, the full scene fits in 47 KiB — far below the
+65 536-instance cap baked into the bundle's gpu_resources.
+
+scene-b: bandwidth accountant validates the §3.7 CAS-dedup thesis end
+to end. Mirrors atrium-rpc's documented framing locally rather than
+instrumenting Connection (which would touch the shared crate used by
+atrium-compositor + others). Asserts ratio ≥ 50× and logs:
+
+  scene-b wire bytes: 4 200 830 (4.01 MiB)
+  naive (texture inline × 100): 419 430 400 (400 MiB)
+  ratio: 99.8×
+
+Almost exactly the analytical upper bound of 100× for this scene
+shape (one 4 MiB upload + 100 × ~30 B references).
+
+Window title + startup banner bumped from "step 5b" to "step 9".
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+----
+
+70e02dc 2026-05-04 step 9: texture op (vkImage + sampler + per-slot descriptor sets)
+
+Bundle gains a second op (id 0x1001 = atrium-core.texture):
+op_texture.comp identity-writes per-instance models, pipe_texture.{vert,frag}
+sample a sampler2D at corner UVs.
+
+OpKind enum (Rect | Texture) selects descriptor-set shapes at AOT
+compile time. Texture's render set adds binding 2 = combined_image_sampler.
+A linear/clamp sampler shared across slots, and a per-slot descriptor
+set cache (allocated lazily, dropped on SLOT_CLEAR / texture
+replacement) avoid mid-frame descriptor writes against in-use sets.
+
+OpFrameResources gained kind + parametric node/instance sizes (rect: 32B
+each, texture: 16B each). Render-pool sizing differs: Rect allocates
+one set; Texture pre-sizes for SLOT_CAP=64 concurrent slots.
+
+Renderer::render() restructured: per-op DrawPlan structs are built in a
+pre-record phase (resolving handles, writing scene buffers, ensuring
+per-slot descriptors), then the recording loop walks plans without
+fighting borrow-checker over self.{op_pipelines,op_frames,resources}.
+Each plan gets compute (counter zero + dispatch + barrier) outside the
+render pass; all draws share one render pass.
+
+POC limitation: only the first texture batch per frame is rendered,
+since all batches share the texture op's single scene/instance buffer
+pair — issuing N in one cb would clobber data before earlier dispatches
+ran. Per-slot OpFrameResources or a per-batch buffer ring is the next
+step when scenes routinely span multiple slots.
+
+App side decodes both RectParams and TextureParams from SceneState,
+groups texture nodes by slot_id, hands batches to renderer.
+
+Smoke-tested with scene-b (1 texture slot × 100 instances): clean
+record + present, no validation errors.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+----
+
+aaf8278 2026-05-04 step 8: draw rect instances inside the render pass
+
+OpFrameResources gained a render-side descriptor pool + set wired to
+binding 0 = instance_buf (storage, populated by step 7's compute pass)
+and binding 1 = screen_buf (uniform vec2). The screen uniform is
+host-visible and refreshed at startup + on resize.
+
+In render(), inside the existing render pass:
+  cmd_set_viewport/cmd_set_scissor (dynamic)
+  cmd_bind_pipeline(rect render pipeline)
+  cmd_bind_descriptor_sets(render set)
+  cmd_draw(4, n, 0, 0)   — TRIANGLE_STRIP quad, n instances
+
+Using the host-known `n` from write_scene rather than going through
+cmd_draw_indirect[Count]. The GPU atomic counter is still computed
+and barriered to HOST so step 7's verification log keeps working;
+swapping to indirect is a one-line change once we want GPU-driven
+culling to skip nodes without a host roundtrip.
+
+Smoke-tested with scene-a's 10 rects: no validation errors, draw
+issued, "rect compute: 10 instance(s) emitted" log present.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+----
+
+f935445 2026-05-04 step 7: rect compute kernel dispatch + atomic-counter readback
+
+Per-op GPU buffers (scene host-visible, instance device-local, counter
+host-visible) live in OpFrameResources, allocated at load_bundle from
+manifest.gpu_resources.max_instances. Persistently-mapped scene buffer
+makes per-frame node uploads a plain memcpy.
+
+Per-frame work in render():
+  1. App decodes rect nodes from SceneState into SceneNode[] under
+     lock; passes to renderer via set_rect_nodes (keeps fresco-vulkan
+     ignorant of the wire format).
+  2. write_scene memcpys count + nodes into mapped scene buffer.
+  3. cmd_fill_buffer zeroes the atomic counter, barrier to compute.
+  4. cmd_dispatch ceil(N/64) work-groups, matching local_size_x.
+  5. Barrier compute → HOST + VERTEX_SHADER, so step 7 can read back
+     the counter and step 8 can read the instance buffer for the draw.
+
+Verification: at the start of each render() (after fence wait, so the
+prior frame is retired), read counter_buf and log on change. Scene-a's
+10 rects produced "rect compute: 10 instance(s) emitted", confirming
+the kernel ran on every node.
+
+Render pass still just clears — the indirect-instanced draw lands in
+step 8.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+----
+
+60e1de5 2026-05-04 step 6: host CAS → vkImage upload + per-slot resource table
+
+Dispatcher decodes SLOT_SET, pulls bytes from atrium-rpc's CAS, and
+queues an UploadRequest in SceneState. The main thread (winit event
+loop) drains the queue before each render() and runs upload_texture
+synchronously — staging buffer + vkImage + barriers + queue submit
++ wait. One frame of latency between "client sent SLOT_SET" and
+"GPU has bytes", which is fine for the POC.
+
+SLOT_CLEAR mirrors the same queue → drain pattern. Renderer's Drop
+also walks the resource table.
+
+Smoke-tested with scene-b: 4 MB checkerboard texture uploads once
+and 100 SCENE_NODE_SETs queue references to it. The vkImage isn't
+sampled yet — that arrives in step 9 with the texture render
+pipeline.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+----
+
+4f7575e 2026-05-04 step 5b: wire dispatch live — UDS + atrium-rpc Connection + handlers
+
+fresco-server-poc now opens a Unix socket and accepts atrium-rpc
+connections. Display-class messages (CLASS_DISPLAY=1) get
+dispatched to per-op handlers that mutate the server's in-memory
+SceneState. fresco-test-client sends real frames: Scene A (10
+rects, no CAS) and Scene B (one 4 MB texture uploaded once,
+referenced 100× via slot_id).
+
+This is the moment the architecture's bandwidth thesis becomes
+demonstrable on the wire half (client→server). The host→GPU half
+lands in step 7+. Visual output still pending — server keeps
+clearing to teal; SceneState is populated but no GPU writes yet.
+
+== fresco-server-poc/src/dispatch.rs (new) ==
+
+  socket_path()       /tmp/fresco-poc.sock by default;
+                      $FRESCO_SOCKET overrides
+  SceneState          slot_table: HashMap<slot_id, [u8;32]>
+                      nodes:      HashMap<node_id, (op_id, params)>
+                      frames_committed: u64
+  spawn_listener()    one listener thread; per-conn sub-thread.
+                      Stale-socket cleanup before bind.
+  serve_one()         loop recv_message + handle; clean exit on
+                      UnexpectedEof
+  handle()            dispatches OP_SLOT_SET / OP_SLOT_CLEAR /
+                      OP_SCENE_FRAME_BEGIN / OP_SCENE_FRAME_END /
+                      OP_SCENE_NODE_SET / OP_SCENE_NODE_CLEAR.
+                      Decodes postcard payloads. Mutates SceneState.
+                      Logs op + decoded fields for visibility.
+
+Non-display messages (rare under the current setup, since the
+atrium-rpc Connection auto-handles CLASS_CORE) are logged and
+skipped. SLOT_SET checks `Connection::cache_get` to confirm the
+referenced hash is in the in-process CAS — for Scene B this
+prints `cached=true`, proving the upload landed.
+
+== fresco-server-poc main ==
+
+Spawns the listener BEFORE the winit event loop takes over the
+main thread, so the test client can connect any time after
+startup. SceneState is shared via Arc<Mutex<>> with the
+dispatcher; renderer holds a handle but doesn't read it yet
+(#[allow(dead_code)] until step 7 reads from it during
+render()).
+
+== fresco-test-client ==
+
+Two real scenes:
+
+  scene-a  10 deterministic-RNG rects (size, color, position).
+           Simulates a small UI. xorshift64* seeded; reproducible
+           so step 12's pixel-diff has a stable target.
+
+  scene-b  Builds a 4 MB checkerboard texture in-process,
+           uploads it via Connection::upload_blob (CAS framing
+           handled by atrium-rpc), binds the resulting hash to
+           slot 1 via OP_SLOT_SET, then sends 100 OP_SCENE_NODE_SET
+           messages each carrying TextureParams { x,y,w,h,
+           slot_id=1 } (17 wire bytes each). Validates the CAS
+           dedup property: bytes-on-wire = 4 MB once, NOT 4 MB ×
+           100 = 400 MB.
+
+  send_ctrl helper (postcard encode + Connection::send_message).
+
+== verification ==
+
+  $ cargo run --bin fresco-server-poc &     (logs to /tmp/server.log)
+  $ cargo run --bin fresco-test-client scene-a
+    ... scene committed
+  $ cargo run --bin fresco-test-client scene-b
+    ... uploading texture (CAS)…
+    ... texture hash c2a3193acffee3fc…
+    ... scene committed
+
+Server log shows:
+  ... client connected
+  ... SCENE_NODE_SET node=0..9 op=0x1000 (atrium-core.rect) params=32B
+  ... SCENE_FRAME_END (frame #1, 10 nodes, 0 slots)
+  ... client disconnected
+  ... client connected
+  ... SLOT_SET slot=1 hash=c2a3193acffee3fc.. cached=true  ← CAS auto-handled
+  ... SCENE_NODE_SET node=0..99 op=0x1001 (atrium-core.texture) params=17B
+  ... SCENE_FRAME_END (frame #2, 100 nodes, 1 slots)
+
+Bandwidth notes:
+  - Scene A wire bytes (per node):  ~50 B  (env header + opcode + postcard)
+  - Scene B wire bytes:             4 MB upload once + 100 × ~30 B
+                                    = ~4.003 MB.  vs. naive (no CAS):
+                                    100 × 4 MB = 400 MB.  **133×
+                                    reduction on the wire** before
+                                    we even get to the host→GPU
+                                    side of the architecture (step 7+).
+
+== build hiccup ==
+
+fresco-test-client needed serde as a direct dep for the
+generic bound on send_ctrl. Added to its Cargo.toml; clean
+build after.
+
+Next: step 6 — host CAS + resource table. The dispatcher already
+sees `cached=true` for SLOT_SET; step 6 acts on it: when a slot
+binds a hash, allocate a vkImage / vkBuffer, copy the bytes from
+atrium-rpc's CAS, register in a host-side resource table keyed by
+slot_id. Per-frame, scene op handlers translate slot_id → resource
+binding for the GPU.
+
+----
+
+7660ae0 2026-05-04 step 5a: atrium-rpc-display payload schemas
+
+The display dictionary at CLASS_DISPLAY=1 (per atrium-rpc-display
+already declared in step 1) gets concrete payload structs and
+encoding helpers. No transport yet — that's step 5b. This commit
+just locks the wire shapes the test client (step 10) and the
+server dispatcher (step 5b) will exchange.
+
+Encoding: postcard, per atrium-rpc.md §10's "postcard for
+Rust↔Rust, hand-rolled binary for performance-critical opcodes."
+For the POC every payload is Rust↔Rust and none is hot enough to
+justify hand-rolled binary; postcard is the right default. Can
+swap individual ops to fixed-binary later without touching the
+envelope or other ops.
+
+== Public surface ==
+
+  encode<T: Serialize>(&T)         → Vec<u8>
+  decode<T: Deserialize>(&[u8])    → T
+
+  control::OP_*                     u16 envelope opcodes
+  scene_ops::ATRIUM_CORE_*          u32 scene op-IDs (registry §3.4)
+
+== Control payloads ==
+
+  SlotSetPayload          { slot_id: u32, hash: [u8;32] }   33 B
+  SlotClearPayload        { slot_id: u32 }                   1 B
+  SceneFrameBeginPayload  {}                                 0 B
+  SceneFrameEndPayload    {}                                 0 B
+  SceneNodeSetPayload     { node_id, op_id, params: Vec<u8> }
+  SceneNodeClearPayload   { node_id }
+  WindowCreatePayload     { width, height, title }
+  WindowPresentPayload    { window_id }
+
+The Vec<u8> in SceneNodeSetPayload is the load-bearing design
+choice: outer envelope schema stays stable as the per-op
+vocabulary grows. New ops drop in without touching the
+SCENE_NODE_SET payload schema. Inner params are decoded
+op-specifically by the host shim after dispatch on op_id.
+
+== Scene op param schemas ==
+
+  RectParams      { x,y,w,h, r,g,b,a: f32 }
+  TextureParams   { x,y,w,h: f32, slot_id: u32 }
+
+Both are postcard-encoded on the wire. RectParams' field order
+matches bundles/atrium-core/compute/op_rectangle.comp's GPU
+SceneNode (vec2 pos + vec2 size + vec4 color), so step 7's
+host→GPU rewrite is a straight memcpy after postcard decode.
+
+Wire shape vs GPU layout are deliberately decoupled: postcard on
+the wire (evolvable, varint-compact); fixed-binary in the GPU
+buffer (cache-friendly, GPU-readable). The host shim translates
+between them on each SCENE_NODE_SET.
+
+TextureParams ships its schema in step 5a so the test client can
+emit Scene B without further protocol changes; the actual op
+implementation lands in step 9.
+
+== Tests ==
+
+7 round-trip tests, all pass:
+  roundtrip_slot_set                (validates 33-byte expected size)
+  roundtrip_slot_clear              (1-byte varint)
+  roundtrip_frame_begin_end         (0-byte empties)
+  roundtrip_node_set_with_rect_params  (nested encoding works)
+  roundtrip_texture_params
+  roundtrip_window_create
+  class_display_constant_is_one     (sanity: CLASS_DISPLAY = 1)
+
+== Build hiccup ==
+
+postcard's `to_stdvec` is gated behind `use-std`, not `alloc` —
+took one rebuild to fix the Cargo.toml feature flag.
+
+Next: step 5b — fresco-server-poc grows an atrium-rpc Connection
+acceptor (UDS at /atrium/sockets/fresco-poc.sock or similar),
+dispatcher that routes envelope ops to handlers. That's where the
+test client first sees an actual server respond.
+
+----
+
+3225f61 2026-05-04 step 4: bundle loader + AOT pipeline compilation
+
+Wires fresco-bundle (parse + load + validate) and fresco-vulkan
+(create Vulkan objects from loaded SPIR-V) so bundles can be
+loaded at server startup. fresco-server-poc loads atrium-core at
+startup; pipelines AOT-compile cleanly; the screen still clears
+to teal because steps 7-8 haven't dispatched the pipelines yet.
+
+Per docs/spec/fresco-rendering-stack.md §3.1: "AOT-compile
+pipelines, persist pipeline cache." This commit does the AOT-
+compile half. Pipeline cache deferred — single-bundle cold start
+is sub-millisecond on M4 Max; cache is an optimisation for the
+multi-bundle large-shader-set future.
+
+== fresco-bundle ==
+
+Pure data crate; no Vulkan dep. Provides:
+  Manifest          — serde-derived parse of manifest.json
+  ManifestOp        — { id, name, compute_entry, render_pipeline }
+  LoadedOp          — id + name + compute SPIR-V words + entrypoint
+                       + vert/frag SPIR-V words
+  Bundle            — root path + manifest + HashMap<op_id, LoadedOp>
+  Bundle::load(p)   — parse manifest, read each op's .spv files
+                       (compute as path, render as base name +
+                       .vert.spv / .frag.spv), validate
+                       SPIR-V magic word, run spirv-val at load
+                       time per §3.5 (defense-in-depth; skipped
+                       silently if spirv-val isn't on PATH —
+                       build.sh already validated)
+  Bundle::ops()     — iter LoadedOp in manifest order
+  Bundle::op(id)    — lookup by op-id
+
+Test: load_atrium_core asserts the bundle parses, the rect op
+(0x1000) is present, name is "rect", entrypoint is "main", all
+three SPIR-V blobs are non-empty. Skips itself if .spv files
+aren't built.
+
+== fresco-vulkan ==
+
+New module fresco-vulkan/src/pipeline.rs:
+
+  OpPipelines       — per-op Vulkan objects:
+                       compute_set_layout / compute_pipe_layout /
+                       compute_pipeline (vkCreateComputePipelines)
+                       render_set_layout  / render_pipe_layout  /
+                       render_pipeline (vkCreateGraphicsPipelines)
+  OpPipelines::create(device, &LoadedOp, render_pass, viewport)
+  OpPipelines::destroy(device)  — reverse-order cleanup
+
+The graphics pipeline:
+  - no vertex bindings (pipe_rectangle.vert generates corners
+    from gl_VertexIndex)
+  - TRIANGLE_STRIP topology
+  - dynamic VIEWPORT + SCISSOR (so we don't recreate pipelines
+    on resize)
+  - alpha-blend ON (SRC_ALPHA / ONE_MINUS_SRC_ALPHA)
+
+Descriptor-set layouts (compute: 3 storage buffers; render: 1
+storage buffer + 1 uniform buffer) are HARDCODED to match
+atrium-core's rect bindings. Generalising to "drive layouts from
+manifest, or from SPIR-V reflection via rspirv" is filed in the
+TODO comment in pipeline.rs — not on the POC's critical path
+(only one bundle, only one shape).
+
+Renderer gains:
+  load_bundle(&Path)  — calls Bundle::load, OpPipelines::create
+                         per op, registers in op_pipelines map.
+                         Logs op-id + name. Op-id collisions
+                         logged as warnings per §3.4 (last
+                         bundle wins; for the POC with one
+                         bundle this only fires on packaging
+                         mistakes within the bundle itself).
+  op_pipelines(id)    — lookup for steps 7-8.
+
+Renderer Drop now also destroys op_pipelines after device-idle.
+
+== fresco-server-poc ==
+
+Resolves the bundle path via env!("CARGO_MANIFEST_DIR")/../../bundles/
+atrium-core (so it works from cargo run regardless of cwd).
+Calls renderer.load_bundle() once at startup after Vulkan init.
+Panics with a hint about build.sh if it fails. Title bumped to
+step 4.
+
+== verification ==
+
+  $ cargo test -p fresco-bundle
+  test tests::load_atrium_core ... ok
+
+  $ RUST_LOG=info timeout 1.5 fresco-server-poc
+  ... vulkan device: Apple M4 Max (api 1.3.334)
+  ... vulkan renderer initialised
+  ... bundle 'atrium-core' v1: 1 op(s)
+  ... op 4096 'rect' → pipelines created
+  ... clearing to Atrium teal; pipelines AOT-compiled but not
+                                 yet dispatched
+  ... resized: PhysicalSize { width: 1920, height: 1080 }
+
+vkCreateComputePipelines + vkCreateGraphicsPipelines accept the
+SPIR-V without validation errors — confirms compute + render
+shaders' descriptor-set bindings agree with the host's hardcoded
+layouts. Window still clears to teal; rect op compiled but not
+dispatched until steps 7-8.
+
+Build: cargo build clean in 1.65s incremental. 0 warnings.
+
+Next: step 5a — atrium-rpc-display crate. Define the display
+dictionary (control op envelope payloads + scene op IDs already
+present, plus per-op payload schemas). Then step 5b wires
+fresco-server-poc as an atrium-rpc Connection accepting display
+opcodes from fresco-test-client.
+
+----
+
+6ff47d3 2026-05-04 step 3: atrium-core bundle — manifest + GLSL + SPIR-V build
+
+First (and during the POC, only) bundle: atrium-core, providing the
+`rect` op (op-ID 0x1000 = ATRIUM_CORE_RECT per atrium-rpc-display's
+scene_ops module). Bundle is shipped as data on disk per
+docs/spec/fresco-rendering-stack.md §3.1; no host-loadable code.
+
+Layout:
+
+  bundles/atrium-core/
+    manifest.json         declares ops + entrypoints + GPU resources
+    compute/
+      op_rectangle.comp        compute kernel; one thread per scene
+                               node, writes one InstanceRecord +
+                               atomicAdd into counter
+      op_rectangle.comp.spv    SPIR-V (gitignored; rebuilt from .comp)
+    pipelines/
+      pipe_rectangle.vert      vertex shader; quad corners from
+                               gl_VertexIndex (TRIANGLE_STRIP), reads
+                               instance buffer the compute kernel wrote
+      pipe_rectangle.vert.spv  ditto (gitignored)
+      pipe_rectangle.frag      fragment shader; passes color through
+      pipe_rectangle.frag.spv  ditto (gitignored)
+    build.sh                   glslangValidator + spirv-val
+
+Manifest (manifest.json):
+
+  {
+    "name":    "atrium-core",
+    "version": 1,
+    "ops": [
+      {
+        "id":              4096,        // 0x1000 ATRIUM_CORE_RECT
+        "name":            "rect",
+        "compute_entry":   "compute/op_rectangle.comp.spv:main",
+        "render_pipeline": "pipelines/pipe_rectangle"
+      }
+    ],
+    "depends_on": [],
+    "gpu_resources": { "max_instances": 65536 }
+  }
+
+The render_pipeline base name expands to .vert.spv + .frag.spv at
+load time. Step 4's loader does that resolution.
+
+Compute + render data layouts pinned in the GLSL comments — the
+host-side Rust mirrors of SceneNode and InstanceRecord (in
+fresco-vulkan, step 7) must match these byte-for-byte. SceneNode
+is 32 bytes (vec2 pos + vec2 size + vec4 color); InstanceRecord
+is 32 bytes (vec4 model + vec4 color); both 16-byte aligned.
+
+Scene format is intentionally FLAT for steps 3-9 (one rect = one
+SceneNode, no parent/child). Hierarchy + transform composition
+arrives later when atrium-core grows beyond rect — at which point
+the §3.6 multi-level scene buffer takes over and atomicAdd's slot
+reservation already accommodates 0..N output instances per node.
+
+== build.sh ==
+
+Walks compute/*.comp + pipelines/*.{vert,frag}, compiles with
+glslangValidator -V --target-env vulkan1.3, validates output with
+spirv-val. Output naming preserves the .comp/.vert/.frag suffix
+(e.g. pipe_rectangle.vert → pipe_rectangle.vert.spv) so vert and
+frag don't collide on the same .spv name (initial draft did
+collide — fixed before commit).
+
+== verification ==
+
+  $ ./bundles/atrium-core/build.sh
+  compiling compute shaders:
+    compute/op_rectangle.comp → compute/op_rectangle.comp.spv
+  compiling render pipelines:
+    pipelines/pipe_rectangle.vert → pipelines/pipe_rectangle.vert.spv
+    pipelines/pipe_rectangle.frag → pipelines/pipe_rectangle.frag.spv
+  ok — all .spv built and validated
+
+Sizes: comp 2.5KB, vert 2.5KB, frag 376B. spirv-val passes on all
+three (would have failed the script's `set -e` otherwise).
+
+No code changes to crates this step; running fresco-server-poc
+still just clears to teal. Step 4 wires the loader so these .spv
+files actually get read.
+
+Next: step 4 — fresco-bundle's loader (parse manifest, mmap .spv,
+spirv-val at load, build dispatch table, AOT-compile pipelines via
+vkCreateGraphicsPipelines + vkCreateComputePipelines).
+
+----
+
+7218df7 2026-05-04 step 2: Vulkan instance + device + swapchain + clear-color render pass
+
+Replaces the winit default-fill from step 1 with a real Vulkan
+render pass that clears the swapchain image to Atrium teal
+(0.04, 0.50, 0.55, 1.0) every frame. Single frame in flight
+(one fence + two semaphores). Validates the bottom-contract
+plumbing per docs/spec/fresco-rendering-stack.md §0 / §3.7.
+
+== fresco-vulkan crate ==
+
+New `Renderer` type owns:
+  - Entry / Instance (with VK_KHR_portability_enumeration + flag
+    for MoltenVK)
+  - Surface via ash-window
+  - PhysicalDevice picked by graphics+present support
+  - Logical Device with VK_KHR_swapchain (+ VK_KHR_portability_subset
+    where present, transparently no-op on platforms that don't
+    expose it)
+  - Swapchain (FIFO present mode; B8G8R8A8_SRGB SRGB_NONLINEAR
+    surface format, falls back to whatever the driver offers)
+  - Render pass: 1 color attachment, LOAD_OP=CLEAR, STORE,
+    UNDEFINED→PRESENT_SRC_KHR layout transition with subpass
+    dependency on COLOR_ATTACHMENT_OUTPUT
+  - Per-image framebuffers + image views
+  - Command pool (RESET_COMMAND_BUFFER) + one primary command buffer
+  - Sync: image_available / render_finished semaphores, in_flight
+    fence (created signaled so first wait returns immediately)
+
+Renderer::render() does the standard frame loop: wait fence, acquire
+image (recreate swapchain on OUT_OF_DATE), reset cmd buffer, record
+clear-only render pass, submit, present (recreate swapchain on
+OUT_OF_DATE/SUBOPTIMAL).
+
+Renderer::resize() drains the device and recreates swapchain-derived
+state (swapchain, image views, framebuffers). Render pass + sync +
+command pool survive across resize.
+
+Drop impl reverses creation order after vkDeviceWaitIdle.
+
+== fresco-server-poc ==
+
+Wires the Renderer into the App's window_event handler:
+  - Resumed: create Renderer with the new Window
+  - Resized: forward to Renderer::resize
+  - RedrawRequested: Renderer::render + request_redraw (continuous,
+    drives the FIFO present pacing)
+Event loop control flow Poll (was Wait in step 1) for the
+continuous redraw.
+
+== .cargo/config.toml — rpath for /opt/homebrew/lib ==
+
+Homebrew's /opt/homebrew/lib isn't on macOS's default dylib search
+path under SIP. Without help, ash::Entry::load() does
+dlopen("libvulkan.dylib") which fails. Three workaround options:
+DYLD_FALLBACK_LIBRARY_PATH (env-fragile), explicit Entry::load_from
+(hardcodes a path), or rpath at link time.
+
+Going with rpath: target.aarch64-apple-darwin rustflags add
+"-Wl,-rpath,/opt/homebrew/lib" + "-Wl,-rpath,@executable_path".
+Verified via otool -l: LC_RPATH entries embedded. dlopen
+resolves libvulkan.1.dylib via the rpath chain.
+
+(Intel macOS: /usr/local/lib is on the default fallback path, so
+no rpath needed there. Linux/FreeBSD: ld.so finds libvulkan via
+ld.so.cache or LD_LIBRARY_PATH.)
+
+== Smoke test ==
+
+  $ RUST_LOG=info timeout 1.5 fresco-server-poc
+  ... fresco-server-poc step 2 — Vulkan clear-color render pass
+  ... window created: fresco-server-poc — step 2 (vulkan clear)
+                      PhysicalSize { width: 1920, height: 1080 }
+  ... vulkan device: Apple M4 Max (api 1.3.334)
+  ... vulkan renderer initialised; clearing to Atrium teal
+  ... resized: PhysicalSize { width: 1920, height: 1080 }
+  ...
+
+Renders teal at 1920×1080 (Retina downscales), no validation errors,
+clean exit on close. Resize tested via window drag — swapchain
+recreation works.
+
+Build: cargo build clean in 8.7s incremental, 0 warnings.
+
+Next: step 3 — atrium-core SPIR-V bundle (manifest + GLSL +
+offline glslangValidator → .spv build script).
+
+----
+
+b782ce1 2026-05-04 step 1: workspace skeleton + winit window
+
+Sets up the fresco-poc workspace per docs/spec/fresco-rendering-stack.md.
+Five crates + one bundle-data directory:
+
+  crates/atrium-rpc-display    — display opcode dictionary on top of
+                                  atrium-rpc (CLASS_DISPLAY=1). Module
+                                  structure for control ops + scene
+                                  op-IDs; payload schemas in step 5a.
+  crates/fresco-bundle         — SPIR-V bundle format (manifest +
+                                  loader + dispatch). Stub; loader in
+                                  step 4.
+  crates/fresco-vulkan         — Vulkan setup + per-frame dispatch.
+                                  Stub; instance/device/swapchain in
+                                  step 2; compute+render in 7-9.
+  crates/fresco-server-poc     — server binary. Step 1 deliverable:
+                                  opens a winit window, logs the
+                                  creation, exits cleanly on close.
+                                  Vulkan render pass replaces the
+                                  default-fill in step 2.
+  crates/fresco-test-client    — test client binary. Stub at step 1
+                                  (just prints which scene was asked
+                                  for); wire traffic comes online with
+                                  the dispatcher in step 5b.
+
+  bundles/atrium-core/         — directory layout reserved (compute/
+                                  and pipelines/ subdirs). Manifest +
+                                  GLSL sources + offline SPIR-V build
+                                  land in step 3.
+
+Builds clean (cargo build, ~19s from scratch on M-series). Verified:
+fresco-test-client runs, prints expected message; fresco-server-poc
+binary built (not auto-run — opening a window is interactive on
+macOS; user runs it manually to verify).
+
+Workspace dependency on atrium-rpc is a path dep to
+~/src/bsd/atrium-rpc (the existing crate). Step 5a/5b is the deferred
+D1.7+ Fresco migration onto the unified envelope, not new
+architecture — picking up work that atrium-rpc.md §9.1 already spec'd.
+
+Hard scope rules per the POC plan (not re-litigating in commit
+messages):
+  - macOS host with MoltenVK; FreeBSD VM port comes after architecture
+    validation
+  - atrium-rpc-level CAS dedup is the validation target; Tessera
+    integration is post-POC (additional layer on top, not prerequisite)
+  - rect + texture ops only; no glyph (no shape_text preprocessor in
+    POC scope), no engine compat bundles
+  - one client at a time, no Portcullis-jail integration in POC
+
+Next: step 2 — Vulkan instance/device/queue/swapchain via ash; replace
+the winit default-fill with a Vulkan clear-color render pass.
+
+----
