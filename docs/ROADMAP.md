@@ -215,23 +215,58 @@ Spec: [`spec/portcullis.md`](spec/portcullis.md).
 
 **Estimate:** 1.5–2 months total. Each app is small; cumulative.
 
-## D5 — Slint backend for Fresco
+## D4.5 — Declarative animation (server-side interpolation)
 
-**Deliverable:** Slint (`https://slint.dev/`) is a retained-mode UI framework with its own scene graph. Write a Fresco backend so any Slint app runs on Atrium unchanged. This is the moment the ecosystem inflects.
+**Deliverable:** the `ANIMATION_*` op family lands in `atrium-rpc-display`; the scene server runs interpolators on its own tick. Apps can be suspended without animations glitching. Closes the iOS Render Server gap noted in [`spec/fresco-rendering-stack.md`](spec/fresco-rendering-stack.md) §3.8.2.
 
-**Prerequisites:** D1.
+**Prerequisites:** D1 (scene server on bare metal).
 
 **Scope:**
-1. Implement Slint's `Renderer` trait against fresco-rs.
-2. Map Slint's animation timeline → Fresco transform updates.
-3. Map Slint's brushes/gradients/clip → Fresco materials.
-4. Demo: existing Slint examples (clock, todo, gallery) run on Fresco-on-FreeBSD with no source change.
+1. Op definitions: `ANIMATION_START / CANCEL`, async `ANIMATION_FINISHED` event.
+2. Server-side interpolator with curve registry (linear, ease, cubic-Bézier, spring).
+3. `pergola-anim` surface that targets either client-driven or declarative-to-server transparently — app code doesn't change.
+
+**Estimate:** 3–4 weeks focused.
+
+## D5 — Pergola native + atrium-mesa + accessibility
+
+**Deliverable:** the Atrium platform sheds its remaining Linux-shaped dependencies and gains first-class accessibility:
+
+- **Pergola native** — the in-tree Atrium UI toolkit (replaces the previous "D5: Slint backend" plan; Slint was rejected for license incompatibility, see [`LICENSING-POLICY.md`](../LICENSING-POLICY.md)).
+- **atrium-mesa fork** — Mesa pruned to NIR + radv/anv/nvk + nak + vk_common + lavapipe slice, with libdrm-coupling replaced by Atrium GPU ABI calls. drm-kmod (the only GPL dependency in the runtime) is excised. See [`spec/pergola.md`](spec/pergola.md), [`feedback_mesa_fork_decision`].
+- **Accessibility (CLASS_AX)** — sibling dictionary to CLASS_DISPLAY; `pergola-ax` crate maintains the AX tree; AT integration. Accessibility-first by architecture, not retrofitted.
+
+This is the moment the platform becomes structurally self-sufficient: no Linux DRM ABI, no GPL in the runtime, no toolkit dependency on a third-party.
+
+**Prerequisites:** D1 (scene server on bare metal), D0 (Atrium GPU ABI base done — extended here for full driver support), D4.5 (animation surface that Pergola needs).
+
+**Scope:**
+
+1. **Pergola** crates (per `spec/pergola.md`):
+   - `pergola-layout` (taffy or custom)
+   - `pergola-widgets` (Button, TextField, ScrollView, container layouts)
+   - `pergola-events` (input routing, focus, keyboard nav)
+   - `pergola-text` (rustybuzz/swash wrappers; emits glyph_run nodes)
+   - `pergola-anim` (animation surface from D4.5)
+   - `pergola-ax` (CLASS_AX tree maintenance)
+   - `pergola` top-level façade
+2. **atrium-mesa** fork:
+   - Audit upstream Mesa for permissive-only code per `LICENSING-POLICY.md`
+   - Prune everything OpenGL-related (GLX, EGL, GLU, mesa/main, old Gallium drivers)
+   - Replace libdrm calls with Atrium GPU ABI calls
+   - Ship lavapipe-from-our-fork as the SW path (used by CI + headless dev)
+   - Ship `LICENSES.md` inventorying all distinct licenses present
+3. **Atrium GPU ABI** native FreeBSD kernel driver (replaces drm-kmod). Per-vendor: AMD first via radv-equivalent paths, Intel and NVIDIA fall in line as bandwidth allows.
+4. **CLASS_AX** wire protocol per `fresco-rendering-stack.md` §3.8.3.
+5. **AT prototype** — at least one screen-reader proof-of-concept driven by the AX tree.
+6. **Foundation app rewrite** — atrium-edit / atrium-term migrated from raw `fresco-socket-rs` to Pergola, as canary apps for the toolkit.
 
 **Risks:**
-- Custom shaders in Slint may need protocol extensions.
-- Text rendering: Slint uses its own text shaping; map to fresco-text.
+- atrium-mesa per-vendor Vulkan driver porting (radv → Atrium GPU ABI) is the heaviest lift. Pergola native and CLASS_AX are bounded; the Mesa fork is the schedule risk.
+- Native NVIDIA support depends on `nvk` being mature enough on real hardware by the time we get here (likely fine — nvk is gaining velocity).
+- Pergola is the first "real" Atrium toolkit; expect API churn through D5 → D6.
 
-**Estimate:** 1 month focused.
+**Estimate:** 6–9 months focused. Multiple parallel tracks (Pergola crates can develop independently of the Mesa fork).
 
 ## D6 — Browser (Servo + Fresco backend)
 
@@ -275,18 +310,19 @@ Spec: [`spec/portcullis.md`](spec/portcullis.md).
 ## Dependencies
 
 ```
-D0 ──► D1 ──► D2 ──► D3 ──► D4
+D0 ──► D1 ──► D2 ──► D3 ──► D4 ──► D4.5 ──► D5 ──► D6 ──► D7
         │      ▲
         ▼      │
        D1.5 ──► D2.5
         │
         ▼
-       (D5 depends on D1)
-       (D6 depends on D5 helpful, D1 required)
+       D1.6 ──► D1.7
+       (D5 depends on D1, D0 base, D4.5)
+       (D6 depends on D5 — Pergola is the toolkit Servo's Fresco backend talks to)
        (D7 ideally after D6)
 ```
 
-D1.5 (Tessera) and D2.5 (Portcullis) are independent of D0 and could even precede it on a Linux dev machine; we keep them in the FreeBSD-native track because the integrated platform story requires all three.
+D1.5 (Tessera) and D2.5 (Portcullis) are independent of D0 and could even precede it on a Linux dev machine; we keep them in the FreeBSD-native track because the integrated platform story requires all three. D4.5 (declarative animation) was inserted between D4 and D5 to give Pergola a working server-side animation surface from day one.
 
 ## What's not on the roadmap (yet)
 
@@ -295,7 +331,7 @@ Conscious omissions, to be added when prioritized:
 - **Lyra (audio) full mixer.** Baseline ships in D4; full per-stream mix + routing is its own milestone. Reuses the slot/ring transport idea.
 - **Networking notification UI / VPN / etc.** — system-services UI. Each is a small Atrium app talking to a privileged service over Castellum.
 - **Multi-monitor.** The compositor today knows one screen window 0. Need to generalize.
-- **Accessibility.** Semantic tree alongside the visual tree. Big design space.
+- ~~**Accessibility.** Semantic tree alongside the visual tree. Big design space.~~ — promoted into D5 (CLASS_AX wire protocol + `pergola-ax`).
 - **IME / complex text input.** Composition + commit events. Protocol extension.
 - **Tabula (clipboard) + drag-and-drop.** Clipboard entries are CAS blobs with format declarations; DnD piggybacks the same shape.
 - **More GPU drivers.** Beyond virtio-gpu (D0): Raspberry Pi VideoCore VI/VII, Mali via Panfrost docs, AMD RDNA via partnerships, then Intel, NVIDIA, Apple Silicon (Asahi-style RE).
