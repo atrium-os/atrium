@@ -28,9 +28,36 @@ use std::path::Path;
 use anyhow::{anyhow, Context, Result};
 use ash::vk;
 
-use crate::frame::OpFrameResources;
+use crate::frame::{OpFrameResources, SceneNode};
 use crate::pipeline::{op_kind, OpPipelines};
-use crate::resource::Resource;
+use crate::renderer::TextureBatch;
+use crate::resource::{self, Resource, UploadRequest};
+
+/// Op-id for atrium-core's rect / texture ops. Hardcoded for now; per
+/// the spec §3.4, the closed registry pins these. Mirrors the constants
+/// in `atrium-rpc-display::scene_ops::*`.
+const OP_ID_RECT:    u32 = 0x1000;
+const OP_ID_TEXTURE: u32 = 0x1001;
+
+/// Atrium teal — the default clear color, same value as the windowed
+/// `Renderer`. Recognisable so smoke-tests can confirm the render-pass
+/// path is alive (vs an all-black image which could mean "render pass
+/// didn't run").
+const CLEAR_COLOR: [f32; 4] = [0.04, 0.50, 0.55, 1.0];
+
+/// Pre-recorded handles + count for one op's contribution to a frame.
+/// Same shape as the windowed Renderer's DrawPlan.
+struct DrawPlan {
+    compute_pipeline: vk::Pipeline,
+    compute_layout:   vk::PipelineLayout,
+    compute_set:      vk::DescriptorSet,
+    render_pipeline:  vk::Pipeline,
+    render_layout:    vk::PipelineLayout,
+    render_set:       vk::DescriptorSet,
+    counter_buf:      vk::Buffer,
+    instance_buf:     vk::Buffer,
+    n:                u32,
+}
 
 const COLOR_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
 
@@ -79,11 +106,18 @@ pub struct HeadlessRenderer {
     fence:      vk::Fence,
 
     /* Bundle dispatch state. Populated by `load_bundle()`; consumed
-     * by the per-frame compute + draw recording (M2.4c). For now
-     * `load_bundle` works but recording paths are still skeleton. */
+     * per-frame by `render_to_buffer()`. */
     op_pipelines: HashMap<u32, OpPipelines>,
     op_frames:    HashMap<u32, OpFrameResources>,
     resources:    HashMap<u32, Resource>,
+
+    /* Staging buffers for the next frame. Caller pushes via
+     * set_rect_nodes / set_texture_batches; render_to_buffer drains. */
+    rect_nodes:      Vec<SceneNode>,
+    texture_batches: Vec<TextureBatch>,
+
+    /// Last instance count we logged; suppresses spam.
+    last_logged_count: u32,
 }
 
 impl HeadlessRenderer {
@@ -140,6 +174,9 @@ impl HeadlessRenderer {
             op_pipelines: HashMap::new(),
             op_frames:    HashMap::new(),
             resources:    HashMap::new(),
+            rect_nodes:   Vec::new(),
+            texture_batches: Vec::new(),
+            last_logged_count: u32::MAX,
         })
     }
 
@@ -191,6 +228,296 @@ impl HeadlessRenderer {
 
     /// Number of ops with compiled pipelines (post-`load_bundle`).
     pub fn op_count(&self) -> usize { self.op_pipelines.len() }
+
+    /// Stage rect-op nodes for the next `render_to_buffer` call.
+    pub fn set_rect_nodes(&mut self, nodes: Vec<SceneNode>) {
+        self.rect_nodes = nodes;
+    }
+
+    /// Stage texture-op batches (one per slot) for the next render.
+    pub fn set_texture_batches(&mut self, batches: Vec<TextureBatch>) {
+        self.texture_batches = batches;
+    }
+
+    /// SLOT_CLEAR / texture replacement notification: drop any cached
+    /// per-slot descriptor that referenced the old ImageView.
+    pub fn invalidate_slot(&mut self, slot_id: u32) {
+        if let Some(f) = self.op_frames.get_mut(&OP_ID_TEXTURE) {
+            f.drop_texture_slot(slot_id);
+        }
+    }
+
+    /// Drain pending CAS upload + clear requests. Called before
+    /// `render_to_buffer`.
+    pub fn process_uploads(
+        &mut self,
+        uploads: Vec<UploadRequest>,
+        clears:  Vec<u32>,
+    ) -> Result<()> {
+        for slot_id in clears {
+            if let Some(r) = self.resources.remove(&slot_id) {
+                unsafe {
+                    self.device.device_wait_idle().ok();
+                    match r {
+                        Resource::Texture(t) => t.destroy(&self.device),
+                    }
+                }
+                self.invalidate_slot(slot_id);
+                log::info!("freed resource slot={}", slot_id);
+            }
+        }
+        for req in uploads {
+            match req {
+                UploadRequest::Texture { slot_id, bytes, width, height, format } => {
+                    let tex = resource::upload_texture(
+                        &self.device, self.queue, self.cmd_pool,
+                        self.physical_device, &self.instance,
+                        &bytes, width, height, format,
+                    )?;
+                    if let Some(prev) = self.resources.remove(&slot_id) {
+                        unsafe {
+                            self.device.device_wait_idle().ok();
+                            match prev {
+                                Resource::Texture(t) => t.destroy(&self.device),
+                            }
+                        }
+                    }
+                    self.invalidate_slot(slot_id);
+                    self.resources.insert(slot_id, Resource::Texture(tex));
+                    log::info!("uploaded texture slot={} {}x{} {}B",
+                        slot_id, width, height, bytes.len());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Render one frame into the off-screen image, copy pixels into
+    /// the readback buffer, return. After this call, `read_pixels` /
+    /// `read_pixels_vec` produce the rendered frame's pixels.
+    ///
+    /// Walks staged rect/texture data through the same compute +
+    /// indirect-draw machinery the windowed Renderer uses; the only
+    /// substantive difference is the post-draw image-layout transition
+    /// + cmd_copy_image_to_buffer, replacing the windowed path's
+    /// acquire/present.
+    pub fn render_to_buffer(&mut self) -> Result<()> {
+        unsafe {
+            /* Pre-record: build DrawPlan list. Same logic as windowed
+             * Renderer. */
+            let mut plans: Vec<DrawPlan> = Vec::new();
+
+            if let (Some(pipes), Some(frame)) =
+                (self.op_pipelines.get(&OP_ID_RECT),
+                 self.op_frames.get(&OP_ID_RECT))
+            {
+                let n = frame.write_scene(&self.rect_nodes);
+                if n < self.rect_nodes.len() as u32 {
+                    log::warn!("rect nodes {} > cap {}; dropping excess",
+                        self.rect_nodes.len(), frame.max_instances);
+                }
+                plans.push(DrawPlan {
+                    compute_pipeline:  pipes.compute_pipeline,
+                    compute_layout:    pipes.compute_pipe_layout,
+                    compute_set:       frame.descriptor_set,
+                    render_pipeline:   pipes.render_pipeline,
+                    render_layout:     pipes.render_pipe_layout,
+                    render_set:        frame.render_set
+                        .expect("rect frame missing single render_set"),
+                    counter_buf:       frame.counter_buf,
+                    instance_buf:      frame.instance_buf,
+                    n,
+                });
+            }
+
+            if let Some(batch) = self.texture_batches.first() {
+                if self.texture_batches.len() > 1 {
+                    log::warn!("only first texture batch rendered (POC limit; \
+                                {} batches received)", self.texture_batches.len());
+                }
+                let view = self.resources.get(&batch.slot_id)
+                    .map(|r| match r { Resource::Texture(t) => t.view });
+                let pipes = self.op_pipelines.get(&OP_ID_TEXTURE);
+                if let (Some(view), Some(pipes)) = (view, pipes) {
+                    let device_ref = &self.device;
+                    let frame = self.op_frames.get_mut(&OP_ID_TEXTURE)
+                        .expect("texture op frame missing");
+                    let n = frame.write_texture_scene(&batch.nodes);
+                    let render_set = frame.ensure_texture_descriptor(
+                        device_ref, batch.slot_id, view)?;
+                    plans.push(DrawPlan {
+                        compute_pipeline:  pipes.compute_pipeline,
+                        compute_layout:    pipes.compute_pipe_layout,
+                        compute_set:       frame.descriptor_set,
+                        render_pipeline:   pipes.render_pipeline,
+                        render_layout:     pipes.render_pipe_layout,
+                        render_set,
+                        counter_buf:       frame.counter_buf,
+                        instance_buf:      frame.instance_buf,
+                        n,
+                    });
+                } else if view.is_none() {
+                    log::warn!("texture batch slot={} not bound; skipping",
+                        batch.slot_id);
+                }
+            }
+
+            self.device.reset_command_buffer(
+                self.cmd_buffer, vk::CommandBufferResetFlags::empty())?;
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            self.device.begin_command_buffer(self.cmd_buffer, &begin)?;
+
+            /* Compute passes: zero counter + dispatch traversal,
+             * one cycle per plan. */
+            for plan in &plans {
+                self.device.cmd_fill_buffer(
+                    self.cmd_buffer, plan.counter_buf, 0, vk::WHOLE_SIZE, 0);
+                let counter_barrier = vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ
+                                   | vk::AccessFlags::SHADER_WRITE)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .buffer(plan.counter_buf)
+                    .offset(0).size(vk::WHOLE_SIZE);
+                self.device.cmd_pipeline_barrier(
+                    self.cmd_buffer,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[], &[counter_barrier], &[]);
+
+                if plan.n > 0 {
+                    self.device.cmd_bind_pipeline(
+                        self.cmd_buffer,
+                        vk::PipelineBindPoint::COMPUTE,
+                        plan.compute_pipeline);
+                    self.device.cmd_bind_descriptor_sets(
+                        self.cmd_buffer,
+                        vk::PipelineBindPoint::COMPUTE,
+                        plan.compute_layout,
+                        0, &[plan.compute_set], &[]);
+                    let groups = (plan.n + 63) / 64;
+                    self.device.cmd_dispatch(self.cmd_buffer, groups, 1, 1);
+                }
+
+                let post = [
+                    vk::BufferMemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::HOST_READ)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .buffer(plan.counter_buf)
+                        .offset(0).size(vk::WHOLE_SIZE),
+                    vk::BufferMemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .buffer(plan.instance_buf)
+                        .offset(0).size(vk::WHOLE_SIZE),
+                ];
+                self.device.cmd_pipeline_barrier(
+                    self.cmd_buffer,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::VERTEX_SHADER
+                        | vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[], &post, &[]);
+            }
+
+            /* Render pass: clear + draws. */
+            let clears = [vk::ClearValue {
+                color: vk::ClearColorValue { float32: CLEAR_COLOR },
+            }];
+            let rp_begin = vk::RenderPassBeginInfo::default()
+                .render_pass(self.render_pass)
+                .framebuffer(self.framebuffer)
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: self.extent,
+                })
+                .clear_values(&clears);
+            self.device.cmd_begin_render_pass(
+                self.cmd_buffer, &rp_begin, vk::SubpassContents::INLINE);
+
+            if !plans.is_empty() {
+                let viewports = [vk::Viewport {
+                    x: 0.0, y: 0.0,
+                    width:  self.extent.width  as f32,
+                    height: self.extent.height as f32,
+                    min_depth: 0.0, max_depth: 1.0,
+                }];
+                let scissors = [vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: self.extent,
+                }];
+                self.device.cmd_set_viewport(self.cmd_buffer, 0, &viewports);
+                self.device.cmd_set_scissor(self.cmd_buffer, 0, &scissors);
+            }
+            for plan in &plans {
+                if plan.n == 0 { continue; }
+                self.device.cmd_bind_pipeline(
+                    self.cmd_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    plan.render_pipeline);
+                self.device.cmd_bind_descriptor_sets(
+                    self.cmd_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    plan.render_layout,
+                    0, &[plan.render_set], &[]);
+                self.device.cmd_draw(self.cmd_buffer, 4, plan.n, 0, 0);
+            }
+            self.device.cmd_end_render_pass(self.cmd_buffer);
+
+            /* Post-render: image layout COLOR_ATTACHMENT_OPTIMAL →
+             * TRANSFER_SRC_OPTIMAL, then copy to readback buffer.
+             * Replaces the windowed path's acquire/present. */
+            transition_image(
+                &self.device, self.cmd_buffer, self.color_image,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                vk::AccessFlags::TRANSFER_READ,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::TRANSFER);
+
+            let region = vk::BufferImageCopy::default()
+                .buffer_offset(0)
+                .buffer_row_length(0).buffer_image_height(0)
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0, base_array_layer: 0, layer_count: 1,
+                })
+                .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+                .image_extent(vk::Extent3D {
+                    width: self.extent.width, height: self.extent.height, depth: 1,
+                });
+            self.device.cmd_copy_image_to_buffer(
+                self.cmd_buffer, self.color_image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                self.readback_buffer, &[region]);
+
+            self.device.end_command_buffer(self.cmd_buffer)?;
+
+            self.device.reset_fences(&[self.fence])?;
+            let submit = vk::SubmitInfo::default()
+                .command_buffers(std::slice::from_ref(&self.cmd_buffer));
+            self.device.queue_submit(self.queue, &[submit], self.fence)?;
+            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+
+            /* Counter readback (verification logging — same as windowed). */
+            if let Some(frame) = self.op_frames.get(&OP_ID_RECT) {
+                let n = frame.read_counter();
+                if n != self.last_logged_count {
+                    log::info!("rect compute: {} instance(s) emitted", n);
+                    self.last_logged_count = n;
+                }
+            }
+        }
+        Ok(())
+    }
 
     /// Width × height of the off-screen render target.
     pub fn extent(&self) -> (u32, u32) { (self.extent.width, self.extent.height) }
@@ -681,5 +1008,58 @@ mod tests {
 
         r.load_bundle(&bundle_path).expect("load_bundle");
         assert!(r.op_count() >= 2, "atrium-core has rect + texture, got {}", r.op_count());
+    }
+
+    /// End-to-end render: 10 rect nodes through compute + draw.
+    /// Validates: scene buffer write → compute dispatch → atomic counter
+    /// → instance buffer → indirect draw → render pass → image-to-buffer
+    /// copy → host readback.
+    ///
+    /// Skipped if SPIR-V or Vulkan loader missing.
+    #[test]
+    fn render_10_rects_end_to_end() {
+        let bundle_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap()
+            .join("bundles/atrium-core");
+        if !bundle_path.join("compute/op_rectangle.comp.spv").exists() {
+            eprintln!("skipping: SPIR-V not built");
+            return;
+        }
+        let mut r = match HeadlessRenderer::new(512, 512) {
+            Ok(r) => r,
+            Err(e) => { eprintln!("skipping: {e}"); return; }
+        };
+        r.load_bundle(&bundle_path).expect("load_bundle");
+
+        /* 10 rects across the screen — opaque white to be obvious. */
+        let mut nodes = Vec::new();
+        for i in 0..10 {
+            nodes.push(SceneNode {
+                position: [10.0 + i as f32 * 40.0, 100.0],
+                size:     [30.0, 30.0],
+                color:    [1.0, 1.0, 1.0, 1.0],
+            });
+        }
+        r.set_rect_nodes(nodes);
+
+        r.render_to_buffer().expect("render_to_buffer");
+
+        let pixels = r.read_pixels_vec().expect("read_pixels");
+        assert_eq!(pixels.len(), 512 * 512 * 4);
+
+        /* The cleared (teal) background should not be the entire image —
+         * count pixels that are clearly NOT teal (i.e. our white rects). */
+        let mut white_pixels = 0;
+        for px in pixels.chunks_exact(4) {
+            let (b, g, r) = (px[0], px[1], px[2]);
+            if b > 0xC0 && g > 0xC0 && r > 0xC0 {
+                white_pixels += 1;
+            }
+        }
+        /* 10 rects × 30×30 = 9000 white pixels expected (give or take
+         * AA, sRGB rounding). Lower bound is the verification: did the
+         * compute kernel + draw actually produce non-clear pixels? */
+        assert!(white_pixels > 1000,
+            "expected white rect pixels, found {white_pixels}");
     }
 }
