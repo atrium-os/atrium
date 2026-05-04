@@ -83,6 +83,15 @@ Each milestone has a concrete **done-when** so we know to stop and check.
 - [ ] Implement `WINDOW_*` op family in `fresco-scene-server`'s `CommandFrontend` (input routing, focus, close-request flow).
 - [ ] Validate against existing demos via frescod: rect-bouncer, slot-demo, edit-socket, textured, window-demo, keyboard.
 
+**M2.7c migration scope discovered 2026-05-04**: of the 8 atrium-test-client sub-binaries + 5 socket apps + splash, only the rect/texture-shaped ones can migrate now:
+
+- ✅ atrium-test-client (magenta rect), atrium-rect-bouncer, atrium-window-demo, atrium-textured, atrium-slot-demo, atrium-text-demo: migrated to fresco-client
+- 🚫 atrium-keyboard, atrium-mouse-demo: blocked on input-event op family (M3+ design)
+- 🚫 atrium-clock-socket, atrium-edit-socket, atrium-term-socket, atrium-find-socket: blocked on `ATRIUM_CORE_PATH` (rotated rects, glyph cursors, custom shapes). Op-id `0x1002` reserved per spec §3.4 but params struct + bundle compute kernel don't exist yet.
+- N/A atrium-splash: writes directly to EFI GOP framebuffer (`/dev/atrium-bootfb0`); not a Fresco client.
+
+**Implication**: M2.7c can complete only the 6 demos shipped above. Full demo migration unblocks at M3 (atrium-text bundle + atrium-core PATH op).
+
 **Done when:** all pre-existing demos run on the new SPIR-V backend in QEMU (lavapipe). atrium-edit-socket is visually identical to its tiny-skia output. Multi-app: launch two demos in parallel, both render correctly without state interference.
 
 **Risks:**

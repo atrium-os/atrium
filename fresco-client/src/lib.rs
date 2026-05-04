@@ -100,6 +100,18 @@ impl Connection {
     pub fn set_read_timeout(&self, t: Option<Duration>) -> io::Result<()> {
         self.inner.set_read_timeout(t)
     }
+}
+
+impl std::os::fd::AsRawFd for Connection {
+    /// The underlying socket's read fd. Used by apps that drive their
+    /// event loop via `kqueue` / `epoll` with the connection as one
+    /// of multiple readiness sources (clock-socket, term-socket).
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        std::os::fd::AsRawFd::as_raw_fd(&self.inner)
+    }
+}
+
+impl Connection {
 
     // ── Generic send / recv helpers ────────────────────────────────
 
