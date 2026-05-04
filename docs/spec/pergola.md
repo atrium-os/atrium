@@ -207,13 +207,14 @@ internally.
 
 ## §9. Roadmap alignment
 
-- **D2** (atrium-compositor port): pick adapter — likely Slint with a
-  Fresco backend — to validate the toolkit→wire path end to end
-- **D3** (atrium-text bundle): glyph-run rendering ships, exercises
-  Pergola's text path
-- **D4** (declarative animations): land `ANIMATION_*` ops + Pergola
-  surface
-- **D5** (accessibility): land `CLASS_AX`, `pergola-ax`, AT-tool
-  integration
-- **D6+** (native Pergola maturation): replace Slint adapter with
-  pure-Pergola implementation; rewrite atrium-edit / atrium-term on it
+- **D2 → D4** (frescod hardening + foundation apps): bring-up apps
+  continue speaking `fresco-socket-rs` directly; Pergola is *not* on the
+  critical path here. Pergola development happens in parallel.
+- **D4.5** (declarative animation): `ANIMATION_*` op family lands;
+  `pergola-anim` builds against it.
+- **D5** (Pergola native + accessibility): the toolkit ships
+  feature-complete enough to host a foundation app; `pergola-ax` lands
+  the AX tree path; CLASS_AX wire ops added. atrium-edit / atrium-term
+  rewritten on Pergola as canary apps.
+- **D6+** (Pergola maturation, additional widgets, theming, third-party
+  app uptake).

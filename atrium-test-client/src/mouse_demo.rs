@@ -1,4 +1,4 @@
-//! atrium-mouse-demo — connects to atrium-compositor, prints mouse
+//! atrium-mouse-demo — connects to frescod, prints mouse
 //! events as they stream in. Smoke-test for the
 //! `COMP_INPUT_MOUSE_MOVE/BUTTON/SCROLL` path driven by the compositor's
 //! native tablet reader.
@@ -12,8 +12,8 @@
 use fresco_socket::{Connection, Event};
 
 fn main() -> std::io::Result<()> {
-    let sock = std::env::var("ATRIUM_COMPOSITOR_SOCK")
-        .unwrap_or_else(|_| "/tmp/atrium-compositor.sock".to_string());
+    let sock = std::env::var("FRESCOD_SOCK")
+        .unwrap_or_else(|_| "/tmp/frescod.sock".to_string());
     let mut conn = Connection::connect(&sock)?;
     eprintln!("atrium-mouse-demo: connected to {sock}");
     eprintln!("move / click / scroll inside the QEMU window — events stream below.");

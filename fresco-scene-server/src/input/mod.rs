@@ -28,5 +28,3 @@ pub const INPUT_MOUSE_BUTTON: u16 = 3;
 pub const INPUT_SCROLL: u16 = 4;
 pub const INPUT_RESIZE: u16 = 5;
 
-#[cfg(target_os = "macos")]
-pub mod capture;

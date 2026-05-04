@@ -1,6 +1,6 @@
 //! Wire-format encoders for fresco-server's CAS-stored scene blobs.
 //!
-//! Mirrors the parsers in `fresco_server::scene::nodes::*`. Every
+//! Mirrors the parsers in `fresco_scene_server::scene::nodes::*`. Every
 //! function here produces the bytes that `NodeData::parse` would
 //! consume — feed the result into [`crate::Connection::upload_blob`]
 //! to land it in the server's CAS and get back the SHA-256 hash.
@@ -10,7 +10,7 @@
 //! `(type_id u16 le, version u16 le, flags u32 le)` followed by the
 //! type-specific body.
 
-use fresco_server::command::protocol::Hash256;
+use fresco_scene_server::command::protocol::Hash256;
 
 /// 8-byte BlobHeader + body. Caller passes the type_id and any flags
 /// bits the parser cares about (e.g. SceneNode VISIBLE = 0x01).

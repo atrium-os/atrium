@@ -15,7 +15,7 @@ use fresco_socket::Connection;
 
 fn main() -> std::io::Result<()> {
     let path = std::env::args().nth(1)
-        .unwrap_or_else(|| "/tmp/atrium-compositor.sock".to_string());
+        .unwrap_or_else(|| "/tmp/frescod.sock".to_string());
     let mut conn = Connection::connect(&path)?;
     eprintln!("connected to {path}");
 

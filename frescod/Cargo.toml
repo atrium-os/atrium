@@ -1,0 +1,28 @@
+[package]
+name = "frescod"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Fresco scene-server daemon for FreeBSD — tiny-skia rendering during bring-up, atrium-gpu-rs scanout, native input."
+
+[[bin]]
+name = "frescod"
+path = "src/main.rs"
+
+[features]
+default = []
+# Accept the vendor-extension `CMD_INJECT_KEY` opcode which lets a
+# socket client push synthetic keyboard events into frescod's event
+# broadcast. Real input flows from native HID devices, NOT from clients —
+# INJECT exists purely for automation harnesses like `atrium-keyboard`.
+# Production builds disable it so untrusted clients can't spoof keystrokes.
+inject-input = []
+
+[dependencies]
+atrium-gpu-rs = { path = "../atrium-gpu-rs" }
+fresco-scene-server = { path = "../fresco-scene-server", features = ["tiny-skia-backend"] }
+tiny-skia = "0.11"
+libc = "0.2"
+bytemuck = "1"
+env_logger = "0.11"

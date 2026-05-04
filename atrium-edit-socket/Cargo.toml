@@ -11,6 +11,6 @@ name = "atrium-edit-socket"
 path = "src/main.rs"
 
 [dependencies]
-fresco-server = { path = "../../fresco" }
+fresco-scene-server = { path = "../fresco-scene-server" }
 fresco-socket-rs = { path = "../fresco-socket-rs" }
 fresco-text = { path = "../fresco-text" }

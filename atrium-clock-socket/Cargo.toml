@@ -11,6 +11,6 @@ name = "atrium-clock-socket"
 path = "src/main.rs"
 
 [dependencies]
-fresco-server = { path = "../../fresco" }
+fresco-scene-server = { path = "../fresco-scene-server" }
 fresco-socket-rs = { path = "../fresco-socket-rs" }
 libc = "0.2"

@@ -104,7 +104,7 @@ for arg in "$@"; do
             # Drops -nographic; serial console moves to mon:stdio.
             # Adds USB xhci + usb-kbd so keyboard input flows through
             # (ukbd → kbdmux0 → /dev/input/event0, what
-            # atrium-compositor's input_reader thread reads). Add
+            # frescod's input_reader thread reads). Add
             # --tablet on top for absolute-coordinate mouse, which is
             # nicer UX but costs ~1–2% host CPU continuously polling.
             WANT_DISPLAY=1

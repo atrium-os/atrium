@@ -6,7 +6,7 @@
 //! overlay so we can tell from a single screenshot that texture
 //! sampling, the per-vertex UVs, and tint defaults are all working.
 
-use fresco_server::command::protocol::NULL_HASH;
+use fresco_scene_server::command::protocol::NULL_HASH;
 use fresco_socket::{wire, Connection};
 
 const TEX_W: u32 = 256;
@@ -14,7 +14,7 @@ const TEX_H: u32 = 256;
 
 fn main() -> std::io::Result<()> {
     let path = std::env::args().nth(1)
-        .unwrap_or_else(|| "/tmp/atrium-compositor.sock".to_string());
+        .unwrap_or_else(|| "/tmp/frescod.sock".to_string());
     let mut conn = Connection::connect(&path)?;
     eprintln!("connected to {path}");
 

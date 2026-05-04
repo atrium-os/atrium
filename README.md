@@ -37,7 +37,7 @@ atrium/
 ├── libfresco/               C client library (ivshmem transport)
 ├── fresco-kmod/             kmod for the ivshmem transport (development)
 │
-├── atrium-compositor/       FreeBSD-native server (TinySkiaBackend + socket)
+├── frescod/       FreeBSD-native server (TinySkiaBackend + socket)
 ├── atrium-edit/             text editor (libfresco / fresco-rs path)
 ├── atrium-edit-socket/      text editor on the FreeBSD-native socket path
 ├── atrium-term/             terminal emulator (libfresco path)
@@ -50,7 +50,7 @@ atrium/
 └── test-assets/             sample files used by demos
 ```
 
-The companion [`atrium-os/fresco`](https://github.com/atrium-os/fresco) repo holds the Fresco protocol server (and `fresco-server` Rust crate, kept as the historical crate name). This tree's `atrium-compositor` and the socket-side libraries link it as a path dependency at `../../fresco`. Clone both at the same parent directory:
+The companion [`atrium-os/fresco`](https://github.com/atrium-os/fresco) repo holds the Fresco protocol server (and `fresco-server` Rust crate, kept as the historical crate name). This tree's `frescod` and the socket-side libraries link it as a path dependency at `../../fresco`. Clone both at the same parent directory:
 
 ```sh
 git clone https://github.com/atrium-os/atrium
@@ -73,7 +73,7 @@ vssh "kldload p9fs; mount -t p9fs -o trans=virtio bsd_share /mnt/host"
 vssh "kldload /mnt/host/atrium-kmod/atrium_virtio_gpu.ko"
 vssh "devctl set driver -f vtgpu0 atrium_virtio_gpu"
 vssh "devctl enable atrium_virtio_gpu0"
-vssh "nohup /mnt/host/atrium-compositor/target/aarch64-unknown-freebsd/release/atrium-compositor > /tmp/comp.log 2>&1 < /dev/null &"
+vssh "nohup /mnt/host/frescod/target/aarch64-unknown-freebsd/release/frescod > /tmp/comp.log 2>&1 < /dev/null &"
 vssh "nohup /mnt/host/atrium-edit-socket/target/aarch64-unknown-freebsd/release/atrium-edit-socket > /tmp/edit.log 2>&1 < /dev/null &"
 ```
 

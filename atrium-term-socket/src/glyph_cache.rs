@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 
-use fresco_server::command::protocol::Hash256;
+use fresco_scene_server::command::protocol::Hash256;
 use fresco_socket::Connection;
 use fresco_text::shape_and_rasterize;
 

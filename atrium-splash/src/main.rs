@@ -5,7 +5,7 @@
 //! Polls for `/dev/atrium-display0` to appear; when it does, the
 //! native GPU driver (atrium-virtio-gpu / atrium-mali / etc.) has
 //! taken over the scanout and our writes to the EFI framebuffer are
-//! no longer visible — we exit cleanly so atrium-compositor takes
+//! no longer visible — we exit cleanly so frescod takes
 //! the screen from there.
 //!
 //! Visuals: dark background + centered "atrium" wordmark + a slow
@@ -56,9 +56,9 @@ fn main() -> std::io::Result<()> {
     let mut next = Instant::now() + Duration::from_nanos(FRAME_NS);
     loop {
         // Handoff: GPU driver came up, scanout is no longer the EFI
-        // framebuffer. Stop drawing — atrium-compositor takes over.
+        // framebuffer. Stop drawing — frescod takes over.
         if Path::new(HANDOFF_PATH).exists() {
-            eprintln!("atrium-splash: {HANDOFF_PATH} appeared — handing off to atrium-compositor");
+            eprintln!("atrium-splash: {HANDOFF_PATH} appeared — handing off to frescod");
             return Ok(());
         }
 

@@ -425,28 +425,28 @@ D0 step 2d (async fence retirement) and step 3.5 (vblank events, hardware cursor
 
 D0 step 2d (async fence retirement) and step 3.5 (vblank events, hardware cursor) remain deferred — neither blocks D1.
 
-**D1 step 2(b) (atrium-compositor first-light)** — DONE (2026-04-28). Standalone binary at `~/src/bsd/atrium-compositor/` owns the display + GPU cdevs, runs a 30 fps frame loop, renders an animated analog clock inside a shadowed panel via tiny-skia, page-flips. **Visually verified** — no fresco-server, no Metal, no winit, no QEMU host compositing. ~330 lines including drop shadow, tick marks, hands, frame heartbeat.
+**D1 step 2(b) (frescod first-light)** — DONE (2026-04-28). Standalone binary at `~/src/bsd/frescod/` owns the display + GPU cdevs, runs a 30 fps frame loop, renders an animated analog clock inside a shadowed panel via tiny-skia, page-flips. **Visually verified** — no fresco-server, no Metal, no winit, no QEMU host compositing. ~330 lines including drop shadow, tick marks, hands, frame heartbeat.
 
 **D1 step 2(c.0) (fresco-server → dual-target lib)** — DONE (2026-04-28). `~/src/fresco-server/` is now a Cargo lib + bin. macOS-only deps (winit, metal, objc2-*, core-graphics-types, raw-window-handle) gated under `[target.'cfg(target_os = "macos")'.dependencies]`. macOS-only modules cfg-gated: `render::metal_backend`, `input::capture`, the existing winit-coupled bin (moved to `main_macos.rs`, called from a stub `main.rs`). `GpuBackend` trait decoupled from `winit::Window` — `new()` removed from the trait, each concrete backend has its own constructor. `InputEvent` lifted from `input::capture` to `input::mod` so platform-neutral modules (ivshmem, network) can import it.
 
 Both targets build cleanly:
 - `cd /Users/girivs/src/fresco-server && cargo check --release` — full macOS bin
-- `cd /Users/girivs/src/bsd/atrium-compositor && cargo check --target aarch64-unknown-freebsd` — FreeBSD lib (atrium-compositor pulls fresco-server as a path dep; the cross-compile config in `bsd/.cargo/` propagates).
+- `cd /Users/girivs/src/bsd/frescod && cargo check --target aarch64-unknown-freebsd` — FreeBSD lib (frescod pulls fresco-server as a path dep; the cross-compile config in `bsd/.cargo/` propagates).
 
-`atrium-compositor` smoke-tested as still running after the restructure.
+`frescod` smoke-tested as still running after the restructure.
 
 **D1 step 2(c.1) (tiny_skia_backend in fresco-server)** — DONE (2026-04-28). New module `fresco_server::render::tiny_skia_backend` behind feature `tiny-skia-backend`. Implements `GpuBackend` over an internal `tiny_skia::Pixmap`:
 - `resize` reallocates the pixmap; `set_scale` records DPI scaling.
 - `render_frame` walks `SceneGraph::render_list()` and rasterizes each `RenderItem`: decodes mesh from CAS, builds a tiny-skia `Path` from the triangle list, decodes material (solid color or linear gradient), applies the affine 2D part of the world matrix as a `Transform`, calls `fill_path`. Textured materials, radial gradients, clip rects, and per-window FBOs are TODO for later sub-steps.
 - Convenience accessors: `pixmap_mut()` for direct-draw integration, `pixels()` for raw RGBA, `copy_to_bgra(dst)` for the virtio-gpu scanout swap.
 
-`atrium-compositor` refactored to use the backend: instead of allocating its own `PixmapMut::from_bytes(bo.as_mut_slice())`, it owns a `TinySkiaBackend` for the same dimensions, draws into `backend.pixmap_mut()`, then `backend.copy_to_bgra(bo.as_mut_slice())` before page flip. **Visually verified** — same clock as before, now running through fresco-server's lib.
+`frescod` refactored to use the backend: instead of allocating its own `PixmapMut::from_bytes(bo.as_mut_slice())`, it owns a `TinySkiaBackend` for the same dimensions, draws into `backend.pixmap_mut()`, then `backend.copy_to_bgra(bo.as_mut_slice())` before page flip. **Visually verified** — same clock as before, now running through fresco-server's lib.
 
-**D1 step 2(c.2) (SceneGraph-driven render)** — DONE (2026-04-28). atrium-compositor now constructs a `SceneGraph` + `CasStore` programmatically each frame and renders via `backend.render_frame(scene, cas, frame, cursor)`. Helper module `src/scene_build.rs` encodes the wire-format blobs (BlobHeader + body): solid-color material (0x0200), linear-gradient material (0x0201), mesh (0x0100) with vertex_data + index_data hashes. **Visually verified**: dark gradient background, translucent center panel, five orbiting colored squares (animating per-frame at ~0.7 rad/s), pulsing yellow center dot. Every visible rect flows `RenderItem → CAS → TinySkiaBackend → BO`. The same data path a real protocol client would feed.
+**D1 step 2(c.2) (SceneGraph-driven render)** — DONE (2026-04-28). frescod now constructs a `SceneGraph` + `CasStore` programmatically each frame and renders via `backend.render_frame(scene, cas, frame, cursor)`. Helper module `src/scene_build.rs` encodes the wire-format blobs (BlobHeader + body): solid-color material (0x0200), linear-gradient material (0x0201), mesh (0x0100) with vertex_data + index_data hashes. **Visually verified**: dark gradient background, translucent center panel, five orbiting colored squares (animating per-frame at ~0.7 rad/s), pulsing yellow center dot. Every visible rect flows `RenderItem → CAS → TinySkiaBackend → BO`. The same data path a real protocol client would feed.
 
-**D1 step 2(c.3) (clock through SceneGraph)** — DONE (2026-04-28). atrium-compositor's clock is now built entirely from `RenderItem`s: gradient bg + panel rect + 64-segment disk (face) + 80-segment ring (outer rim) + 12 oriented-rect ticks (heavier at quarters) + 3 oriented-rect hands (hour / minute / second) + small disk (hub). 19 RenderItems per frame; mesh primitives stored once at startup. New scene_build helpers: `store_disk(n_segs)`, `store_ring(n_segs, inner_ratio)`, `push_oriented_rect(cx, cy, angle, len, w)`, `push_disk`, `push_ring`. Visually verified — clock animates, every pixel except the heartbeat went through SceneGraph + tiny_skia_backend.
+**D1 step 2(c.3) (clock through SceneGraph)** — DONE (2026-04-28). frescod's clock is now built entirely from `RenderItem`s: gradient bg + panel rect + 64-segment disk (face) + 80-segment ring (outer rim) + 12 oriented-rect ticks (heavier at quarters) + 3 oriented-rect hands (hour / minute / second) + small disk (hub). 19 RenderItems per frame; mesh primitives stored once at startup. New scene_build helpers: `store_disk(n_segs)`, `store_ring(n_segs, inner_ratio)`, `push_oriented_rect(cx, cy, angle, len, w)`, `push_disk`, `push_ring`. Visually verified — clock animates, every pixel except the heartbeat went through SceneGraph + tiny_skia_backend.
 
-**D1 step 2(c.4) (Unix-socket Fresco protocol)** — DONE (2026-04-29). atrium-compositor now exposes `/tmp/atrium-compositor.sock` (override via `ATRIUM_COMPOSITOR_SOCK`). On accept, a per-connection thread reads 128-byte `Command` structs and dispatches a v0.1 subset against shared `Arc<Mutex<{CasStore,SceneGraph}>>`: `CMD_UPLOAD_BEGIN`/`DATA`/`FINISH` (inline path; up to 112 bytes initial in BEGIN, 116 per DATA, FINISH commits via `CasStore::finish_upload` and writes a `COMP_UPLOAD_COMPLETE`), `CMD_SET_ROOT` (sets scene root + marks dirty). DMA staging not supported — kmod-mediated mechanism, deferred.
+**D1 step 2(c.4) (Unix-socket Fresco protocol)** — DONE (2026-04-29). frescod now exposes `/tmp/frescod.sock` (override via `FRESCOD_SOCK`). On accept, a per-connection thread reads 128-byte `Command` structs and dispatches a v0.1 subset against shared `Arc<Mutex<{CasStore,SceneGraph}>>`: `CMD_UPLOAD_BEGIN`/`DATA`/`FINISH` (inline path; up to 112 bytes initial in BEGIN, 116 per DATA, FINISH commits via `CasStore::finish_upload` and writes a `COMP_UPLOAD_COMPLETE`), `CMD_SET_ROOT` (sets scene root + marks dirty). DMA staging not supported — kmod-mediated mechanism, deferred.
 
 `atrium-test-client` (new crate `~/src/bsd/atrium-test-client/`) builds 9 wire-format blobs (vertex/index/mesh/material/transform/renderable/scene_node/node_list/scene_root), uploads each via inline framing, then SET_ROOT. Compositor's render loop sees `root_hash != NULL`, calls `SceneGraph::traverse`, walks → renders. **Visually verified**: magenta rect at (200, 200) 400×300, exactly matching the test client's spec.
 
@@ -456,7 +456,7 @@ Two bugs fixed during bring-up (recorded so we don't repeat):
 
 **D1 step 2(c.5) (fresco-socket-rs client lib + bouncer demo)** — DONE (2026-04-29). New crate `~/src/bsd/fresco-socket-rs/` with a reusable Rust API for Fresco-over-Unix-socket: `Connection::connect(path)`, `connection.upload_blob(&[u8]) -> Hash` (handles BEGIN/DATA/FINISH framing + hash verification), `connection.set_root(hash)`. Wire-format encoders live in `fresco_socket::wire` (mirrors `scene::nodes::*` parsers). atrium-test-client refactored to use the lib (~30 lines) and a new bin `atrium-rect-bouncer` animates a rect bouncing across the viewport at 30 fps — every frame uploads 5 fresh blobs (transform/renderable/scene_node/node_list/scene_root) and SET_ROOTs. **Visually verified.**
 
-**D1 step 2(c.6) (CommandFrontend wired into socket dispatch)** — DONE (2026-04-29). atrium-compositor now constructs the full fresco-server state stack: `CasStore` + `SceneGraph` + `SlotTable` + `WmCompositor::new_with_window0` (with `init_decorations`) → `CommandFrontend`. Socket connections call `frontend.dispatch(&cmd, client_id)` for every command. Per-connection unique u8 `client_id` assigned from a static `AtomicU8` counter. The full Fresco opcode set is now reachable over the wire — UPLOAD_*, SET_ROOT/CAMERA, all SLOT_* ops, CREATE_WINDOW, FRAME_BEGIN/END, etc. — though multi-window FBO rendering still TODO in `TinySkiaBackend::sync_fbos / render_window_to_fbo`.
+**D1 step 2(c.6) (CommandFrontend wired into socket dispatch)** — DONE (2026-04-29). frescod now constructs the full fresco-server state stack: `CasStore` + `SceneGraph` + `SlotTable` + `WmCompositor::new_with_window0` (with `init_decorations`) → `CommandFrontend`. Socket connections call `frontend.dispatch(&cmd, client_id)` for every command. Per-connection unique u8 `client_id` assigned from a static `AtomicU8` counter. The full Fresco opcode set is now reachable over the wire — UPLOAD_*, SET_ROOT/CAMERA, all SLOT_* ops, CREATE_WINDOW, FRAME_BEGIN/END, etc. — though multi-window FBO rendering still TODO in `TinySkiaBackend::sync_fbos / render_window_to_fbo`.
 
 Lock-order rule: **cas first, scene second** (matches `CommandFrontend::handle_set_root`). The render loop must follow this or socket threads + render thread deadlock under contention.
 
@@ -466,7 +466,7 @@ Verified: magenta-rect demo + 30fps bouncer both work through CommandFrontend wi
 
 Two bugs fixed during bring-up:
 - `SLOT_FLAG_VISIBLE` (0x01) MUST be set in CMD_SLOT_ALLOC's flags. Without it `SlotTable::traverse_slot` early-returns silently.
-- atrium-compositor's render loop must NOT call `scene.traverse(&mut cas)` when `root_hash == NULL_HASH` — traverse() unconditionally clears render_list before its early-return, wiping the slot-built list.
+- frescod's render loop must NOT call `scene.traverse(&mut cas)` when `root_hash == NULL_HASH` — traverse() unconditionally clears render_list before its early-return, wiping the slot-built list.
 
 **D1 step 2(c.8) (textured material rendering)** — DONE (2026-04-29). `TinySkiaBackend` decodes `NODE_TEXTURE` blobs into `tiny_skia::Pixmap`s (cached by hash), and renders `NODE_MATERIAL_TEXTURED` items via tiny-skia's `Pattern` shader. fresco-socket-rs gained `wire::pixel_data`, `wire::texture`, `wire::material_textured`, plus `Connection::upload_texture(rgba, w, h)` convenience. `atrium-textured` demo (256×256 checkerboard + xy gradient) visually verified.
 
@@ -489,17 +489,17 @@ v0.1 limitations:
 
 Async WM-emitted events (CloseRequested when titlebar X clicked, WindowResized when titlebar drag-resizes) won't fire today — they require real input. Step 2(c.12) plumbs `/dev/usbhid` so input enters CommandFrontend, the WM acts on it, and async events flow back through the per-connection completion stream.
 
-**D1 step 2(c.12) (per-connection async writer + ticker, atrium-edit-socket cursor blink)** — DONE (2026-04-29). atrium-compositor's `socket_server` now runs **two threads per connection**: reader (commands → CommandFrontend → response) and writer (drains an `mpsc::Receiver<Completion>` to the socket). Reader sends responses through the same channel. A shared `Vec<Sender<Completion>>` (`event_subs`) lets async producers fan out events to every connected client. The reader's send-failure on a dead writer cleanly tears down the connection.
+**D1 step 2(c.12) (per-connection async writer + ticker, atrium-edit-socket cursor blink)** — DONE (2026-04-29). frescod's `socket_server` now runs **two threads per connection**: reader (commands → CommandFrontend → response) and writer (drains an `mpsc::Receiver<Completion>` to the socket). Reader sends responses through the same channel. A shared `Vec<Sender<Completion>>` (`event_subs`) lets async producers fan out events to every connected client. The reader's send-failure on a dead writer cleanly tears down the connection.
 
 Stand-in async producer: a 1 Hz "ticker" thread broadcasts `COMP_WINDOW_FOCUS` toggles to all subscribers. atrium-edit-socket's renderer toggles `cursor_visible` on each event and re-renders → server-driven cursor blink. Verified in the QEMU window: yellow cursor block on the file's content. The event loop pattern (`while let Some(ev) = conn.wait_event(None)? { ... }`) is now the editor's main loop — drop-in ready for real input events.
 
-**D1 step 2(c.13) (interactive atrium-edit-socket via injected keystrokes)** — DONE (2026-04-29). New protocol primitive `CMD_INJECT_KEY` (vendor opcode 0xF000) lets a client push HID-coded keystrokes into atrium-compositor's event broadcast. atrium-compositor's `reader_loop` intercepts the opcode, builds `COMP_INPUT_KEY` (0x14) Completions, fans out via `event_subs`. fresco-socket-rs gained `Event::Key { window_id, hid_usage, pressed, modifiers }` and `Connection::inject_key`. New `atrium-keyboard` test client maps an ASCII string to HID Usage codes (with shift modifiers) and injects them as down/up pairs at 25 cps. atrium-edit-socket's wait_event loop receives Key events, runs through the existing keymap → buffer-mutation → re-render path. **Visually verified**: "Hello atrium-edit on FreeBSD!" typed into an empty buffer, cursor visible at end, status shows `[*] [new buffer]`.
+**D1 step 2(c.13) (interactive atrium-edit-socket via injected keystrokes)** — DONE (2026-04-29). New protocol primitive `CMD_INJECT_KEY` (vendor opcode 0xF000) lets a client push HID-coded keystrokes into frescod's event broadcast. frescod's `reader_loop` intercepts the opcode, builds `COMP_INPUT_KEY` (0x14) Completions, fans out via `event_subs`. fresco-socket-rs gained `Event::Key { window_id, hid_usage, pressed, modifiers }` and `Connection::inject_key`. New `atrium-keyboard` test client maps an ASCII string to HID Usage codes (with shift modifiers) and injects them as down/up pairs at 25 cps. atrium-edit-socket's wait_event loop receives Key events, runs through the existing keymap → buffer-mutation → re-render path. **Visually verified**: "Hello atrium-edit on FreeBSD!" typed into an empty buffer, cursor visible at end, status shows `[*] [new buffer]`.
 
 Two correctness fixes during bring-up:
 - `set_read_timeout(Duration::from_millis(0))` is rejected on FreeBSD; `Connection::poll_event` switched to `set_nonblocking(true) / set_nonblocking(false)`.
 - ssh-spawned editor processes die when their parent ssh closes. Use `nohup … >log 2>&1 < /dev/null &` to detach for unattended runs.
 
-**D1 step 2(c.14) (native FreeBSD keyboard input — `/dev/input/event3` via hkbd → evdev)** — DONE (2026-04-29). atrium-compositor's `input_reader` thread opens the keyboard event device (probed by sysctl name match against "kbd"/"keyboard"), reads 24-byte `struct input_event` records, translates Linux keycodes to USB HID Usage Page 0x07, tracks shift/ctrl/alt modifier state, and broadcasts `COMP_INPUT_KEY` via `event_subs`. Source is evdev for tractability today; the wire stays HID per the protocol contract.
+**D1 step 2(c.14) (native FreeBSD keyboard input — `/dev/input/event3` via hkbd → evdev)** — DONE (2026-04-29). frescod's `input_reader` thread opens the keyboard event device (probed by sysctl name match against "kbd"/"keyboard"), reads 24-byte `struct input_event` records, translates Linux keycodes to USB HID Usage Page 0x07, tracks shift/ctrl/alt modifier state, and broadcasts `COMP_INPUT_KEY` via `event_subs`. Source is evdev for tractability today; the wire stays HID per the protocol contract.
 
 QEMU args added in `scripts/run-vm.sh --display`: `-device qemu-xhci -device usb-kbd -device usb-tablet`. The USB keyboard appears as `hkbd0` → evdev `event3`. The kbdmux0 multiplexer (event0) sees no input on `-machine virt` since there's no console keyboard, so we explicitly skip "multiplexer" devices in the probe.
 
@@ -515,7 +515,7 @@ Goal: paint a boot splash on the EFI GOP framebuffer between the kernel handing 
 
 - `atrium-kmod/bootfb/` — `atrium_bootfb.ko`. At `MOD_LOAD` reads `MODINFOMD_EFI_FB` from the bootloader's preserved metadata (`preload_search_info(preload_kmdp, MODINFO_METADATA | MODINFOMD_EFI_FB)` — the same lookup `vt_efifb` uses), publishes `/dev/atrium-bootfb0` with `d_mmap` returning the framebuffer's physical pages and `d_ioctl ATRIUM_BOOTFB_IOC_GET_INFO` reporting width/height/stride/format/masks. `VM_MEMATTR_WRITE_COMBINING` for the mapping so sequential writes batch. No exclusive ownership of the device — `vt_efifb` may also be writing console text into the same memory; the splash overpaints it.
 - `atrium-bootfb-rs/` — safe Rust binding (`BootFb::open` → mmap'd `&mut [u8]`).
-- `atrium-splash/` — userspace splash binary using the existing `tiny_skia::Pixmap`. Renders a gradient panel + hand-drawn "atrium" wordmark + an orbiting indicator dot at 30 fps. Polls `/dev/atrium-display0` and exits cleanly when it appears (handoff to atrium-compositor).
+- `atrium-splash/` — userspace splash binary using the existing `tiny_skia::Pixmap`. Renders a gradient panel + hand-drawn "atrium" wordmark + an orbiting indicator dot at 30 fps. Polls `/dev/atrium-display0` and exits cleanly when it appears (handoff to frescod).
 - `atrium-splash/atrium-splash.rc` — rc.d service script. `REQUIRE: mountcritlocal`, `BEFORE: FILESYSTEMS netif` so it paints the moment the root FS is up.
 
 **Setup on the VM (or any FreeBSD UEFI system)**
@@ -576,7 +576,7 @@ Three-app verification: editor + terminal + clock launched in parallel via a sin
 
 **D1 step 2(c.21) (final candidate cleanup)** — DONE (2026-04-29).
 
-- **`CMD_INJECT_KEY` cfg-gated.** The vendor-extension opcode that lets a client push synthetic key events is now behind the `inject-input` Cargo feature on `atrium-compositor`, default off. Production builds reject the opcode with a logged warning; test/automation builds (`cargo build --features inject-input`) keep working. `atrium-keyboard` test client still depends on this opcode being accepted, so it requires the feature.
+- **`CMD_INJECT_KEY` cfg-gated.** The vendor-extension opcode that lets a client push synthetic key events is now behind the `inject-input` Cargo feature on `frescod`, default off. Production builds reject the opcode with a logged warning; test/automation builds (`cargo build --features inject-input`) keep working. `atrium-keyboard` test client still depends on this opcode being accepted, so it requires the feature.
 
 - **Real HID descriptor parsing.** `pointer_reader` no longer hardcodes the QEMU `usb-tablet` 6-byte report layout. It runs `HIDIOCGRDESC` at startup, walks the descriptor (Main / Global / Local items), and builds a `PointerLayout` recording bit offsets + sizes for buttons / X / Y / wheel plus an absolute-vs-relative flag for the X/Y axes. `decode_report` then walks any pointer's reports against the layout. Verified against the QEMU usb-tablet (5-button absolute). Real USB mice with relative axes + wheel decode through the same code path; cursor advances by the report's signed deltas instead of being scaled from absolute axes.
 
@@ -615,7 +615,7 @@ vssh "kldload hidraw && sysrc kld_list+=hidraw"
 
 Cross-compile everything (host, ~3 s):
 ```sh
-cd ~/src/bsd/atrium-compositor && cargo build --release --target aarch64-unknown-freebsd
+cd ~/src/bsd/frescod && cargo build --release --target aarch64-unknown-freebsd
 cd ~/src/bsd/atrium-edit-socket && cargo build --release --target aarch64-unknown-freebsd
 cd ~/src/bsd/atrium-term-socket && cargo build --release --target aarch64-unknown-freebsd
 ```
@@ -642,7 +642,7 @@ vssh "ls /dev/hidraw*"   # expect /dev/hidraw0 (kbd) and /dev/hidraw1 (mouse)
 
 Launch the compositor + two clients (each via its own `vssh`):
 ```sh
-vssh "nohup /mnt/host/atrium-compositor/target/aarch64-unknown-freebsd/release/atrium-compositor > /tmp/comp.log 2>&1 < /dev/null &"
+vssh "nohup /mnt/host/frescod/target/aarch64-unknown-freebsd/release/frescod > /tmp/comp.log 2>&1 < /dev/null &"
 sleep 1
 vssh "nohup /mnt/host/atrium-edit-socket/target/aarch64-unknown-freebsd/release/atrium-edit-socket /mnt/host/test-assets/scratch.txt > /tmp/edit.log 2>&1 < /dev/null &"
 vssh "nohup /mnt/host/atrium-term-socket/target/aarch64-unknown-freebsd/release/atrium-term-socket > /tmp/term.log 2>&1 < /dev/null &"

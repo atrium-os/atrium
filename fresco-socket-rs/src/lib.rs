@@ -21,7 +21,7 @@ use std::path::Path;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use fresco_server::command::protocol::{
+use fresco_scene_server::command::protocol::{
     Command, Completion, Hash256,
     CMD_FRAME_BEGIN, CMD_FRAME_END, CMD_INJECT_KEY,
     CMD_SET_ROOT, CMD_SLOT_ALLOC, CMD_SLOT_FREE, CMD_SLOT_SET_CONTENT,
@@ -142,7 +142,7 @@ fn is_event_comp(c: &Completion) -> bool {
 }
 
 /// Connection to a Fresco server speaking the Unix-socket transport
-/// (today: `atrium-compositor`).
+/// (today: `frescod`).
 pub struct Connection {
     stream: UnixStream,
     next_seq: u32,
@@ -550,7 +550,7 @@ impl Connection {
 /// Kept narrow on purpose: only opcodes that mutate per-window
 /// scene/slot state get window-stamped.
 fn is_routable_opcode(opcode: u16) -> bool {
-    use fresco_server::command::protocol::*;
+    use fresco_scene_server::command::protocol::*;
     matches!(opcode,
         CMD_SET_ROOT | CMD_SET_CAMERA
         | CMD_SLOT_ALLOC | CMD_SLOT_FREE

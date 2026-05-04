@@ -1,8 +1,8 @@
-//! atrium-compositor — first-light native FreeBSD compositor demo.
+//! frescod — first-light native FreeBSD compositor demo.
 //!
 //! Owns the Atrium GPU + display cdevs, runs a frame loop, renders a
 //! desktop-shaped scene with tiny-skia, page-flips. The renderer is
-//! `fresco_server::render::tiny_skia_backend::TinySkiaBackend` —
+//! `fresco_scene_server::render::tiny_skia_backend::TinySkiaBackend` —
 //! the same backend that will eventually drive scene-graph rendering
 //! when a real protocol client connects (D1 step 2c.2).
 //!
@@ -29,14 +29,14 @@ mod socket_server;
 
 use atrium_gpu::abi::*;
 use atrium_gpu::{Bo, Display, Gpu, Mode};
-use fresco_server::cas::store::CasStore;
-use fresco_server::command::frontend::CommandFrontend;
-use fresco_server::command::protocol::{Hash256, NULL_HASH};
-use fresco_server::render::backend::{GpuBackend, WindowOverlay};
-use fresco_server::render::tiny_skia_backend::TinySkiaBackend;
-use fresco_server::scene::graph::SceneGraph;
-use fresco_server::scene::slots::SlotTable;
-use fresco_server::window::Compositor as WmCompositor;
+use fresco_scene_server::cas::store::CasStore;
+use fresco_scene_server::command::frontend::CommandFrontend;
+use fresco_scene_server::command::protocol::{Hash256, NULL_HASH};
+use fresco_scene_server::render::backend::{GpuBackend, WindowOverlay};
+use fresco_scene_server::render::tiny_skia_backend::TinySkiaBackend;
+use fresco_scene_server::scene::graph::SceneGraph;
+use fresco_scene_server::scene::slots::SlotTable;
+use fresco_scene_server::window::Compositor as WmCompositor;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -119,7 +119,7 @@ impl<'g> Compositor<'g> {
         // order. Lowest-z first so the backend interleaves blit +
         // decorations correctly: each window's chrome goes above its
         // own content, and below higher-z windows.
-        let layered: Vec<(WindowOverlay, Vec<fresco_server::scene::graph::RenderItem>)> = {
+        let layered: Vec<(WindowOverlay, Vec<fresco_scene_server::scene::graph::RenderItem>)> = {
             let g = self.wm.lock().unwrap();
             g.z_order.iter()
                 .filter_map(|&id| {
@@ -450,7 +450,7 @@ fn main() -> std::io::Result<()> {
     let conn = connectors.first().expect("at least one connector").clone();
     let mode = dpy.preferred_mode(conn.id)?;
     eprintln!(
-        "atrium-compositor: connector {} {}x{} @ {} mHz, target {} fps",
+        "frescod: connector {} {}x{} @ {} mHz, target {} fps",
         conn.id, mode.width, mode.height, mode.refresh_mhz, TARGET_FPS,
     );
 
@@ -484,16 +484,16 @@ fn main() -> std::io::Result<()> {
 
     // Spawn the Fresco-protocol socket server. Best-effort: if the
     // listener can't bind we still run, just without external clients.
-    let sock_path = std::env::var("ATRIUM_COMPOSITOR_SOCK")
+    let sock_path = std::env::var("FRESCOD_SOCK")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp/atrium-compositor.sock"));
+        .unwrap_or_else(|_| PathBuf::from("/tmp/frescod.sock"));
     let event_subs = match socket_server::spawn(
         socket_server::Shared { frontend: frontend.clone() },
         &sock_path,
     ) {
         Ok(subs) => Some(subs),
         Err(e) => {
-            eprintln!("atrium-compositor: socket server failed: {e}");
+            eprintln!("frescod: socket server failed: {e}");
             None
         }
     };

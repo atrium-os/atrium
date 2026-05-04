@@ -6,7 +6,7 @@
 use crate::buffer::Buffer;
 use crate::glyph_cache::GlyphCache;
 
-use fresco_server::command::protocol::{Hash256, NULL_HASH};
+use fresco_scene_server::command::protocol::{Hash256, NULL_HASH};
 use fresco_socket::{wire, Connection};
 
 pub struct Renderer<'a> {

@@ -12,7 +12,7 @@
 //! upload + SET_ROOT (no completion expected) = 5 messages, 4
 //! waits-for-completion. Comfortable on a Unix socket.
 
-use fresco_server::command::protocol::{Hash256, NULL_HASH};
+use fresco_scene_server::command::protocol::{Hash256, NULL_HASH};
 use fresco_socket::{wire, Connection};
 
 use std::time::{Duration, Instant};
@@ -40,7 +40,7 @@ fn build_root_with_transform(
 
 fn main() -> std::io::Result<()> {
     let path = std::env::args().nth(1)
-        .unwrap_or_else(|| "/tmp/atrium-compositor.sock".to_string());
+        .unwrap_or_else(|| "/tmp/frescod.sock".to_string());
     let mut conn = Connection::connect(&path)?;
     eprintln!("connected to {path}");
 

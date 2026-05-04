@@ -13,7 +13,7 @@
 //! and slot 1 is allocated once at startup. After that, animation is
 //! 3 commands per frame — much cheaper than rebuilding the scene tree.
 
-use fresco_server::command::protocol::NULL_HASH;
+use fresco_scene_server::command::protocol::NULL_HASH;
 use fresco_socket::{wire, Connection};
 
 use std::time::{Duration, Instant};
@@ -35,7 +35,7 @@ fn triangle(t: f32) -> f32 {
 
 fn main() -> std::io::Result<()> {
     let path = std::env::args().nth(1)
-        .unwrap_or_else(|| "/tmp/atrium-compositor.sock".to_string());
+        .unwrap_or_else(|| "/tmp/frescod.sock".to_string());
     let mut conn = Connection::connect(&path)?;
     eprintln!("connected to {path}");
 

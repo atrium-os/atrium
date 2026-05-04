@@ -7,7 +7,7 @@
 //!
 //! Interactive: receives `Event::Key` from the server (today via
 //! `atrium-keyboard` injecting over CMD_INJECT_KEY; tomorrow via
-//! `/dev/usbhid` plumbed through atrium-compositor). Routes through
+//! `/dev/usbhid` plumbed through frescod). Routes through
 //! the existing keymap → buffer-mutation → re-render loop.
 
 mod buffer;
@@ -36,8 +36,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let font = std::fs::read(FONT_PATH)?;
 
-    let sock = std::env::var("ATRIUM_COMPOSITOR_SOCK")
-        .unwrap_or_else(|_| "/tmp/atrium-compositor.sock".to_string());
+    let sock = std::env::var("FRESCOD_SOCK")
+        .unwrap_or_else(|_| "/tmp/frescod.sock".to_string());
     let mut conn = Connection::connect(&sock)?;
     eprintln!("connected to {sock}");
 

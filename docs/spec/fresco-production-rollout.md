@@ -15,7 +15,7 @@
 | Track | Status | Where |
 |---|---|---|
 | Architectural POC (macOS, Vulkan via MoltenVK, SPIR-V bundles, CAS dedup) | ✅ Done — 12 commits, 99.8× CAS dedup measured, scene-a + scene-b visually verified | `~/src/fresco-poc` |
-| FreeBSD native scene server + clients (atrium-compositor, atrium-edit-socket, etc.) | 🟡 D1 in progress; tiny-skia rasterizer; not yet on bare metal | `~/src/bsd/atrium-compositor`, `fresco-socket-rs`, others |
+| FreeBSD native scene server + clients (frescod, atrium-edit-socket, etc.) | 🟡 D1 in progress; tiny-skia rasterizer; not yet on bare metal | `~/src/bsd/frescod`, `fresco-socket-rs`, others |
 | Wire protocol (`atrium-rpc-display`) | 🟡 Stable enough for POC; needs the §3.8 op-family additions before D2 | `~/src/bsd/atrium-rpc/`, `~/src/fresco-poc/crates/atrium-rpc-display/` |
 | Tessera CAS-FS | 🟡 D1.5 substantial work done; not the critical path for Fresco production | `~/src/bsd/fresco-kmod/` etc. |
 | Pergola toolkit | ⚪ Spec drafted (`docs/spec/pergola.md`); no code yet | (new) |
@@ -27,7 +27,7 @@
 
 All five locked during the planning conversation:
 
-1. **Rename `atrium-compositor` → `fresco-scene-server`** (or `frescod`) in the bsd repo. Retire the tiny-skia path from production; lavapipe is the SW fallback.
+1. **Rename `frescod` → `fresco-scene-server`** (or `frescod`) in the bsd repo. Retire the tiny-skia path from production; lavapipe is the SW fallback.
 2. **Archive `~/src/fresco-poc`.** Move under `bsd/scratch/fresco-arch-validation/` for posterity. Stop committing there.
 3. **Wire format: hard cutover at D2.** No coexistence window with the legacy 128-byte format.
 4. **Vulkan strategy:**
@@ -46,12 +46,14 @@ Each milestone has a concrete **done-when** so we know to stop and check.
 
 **Goal:** clean working tree before any new code lands.
 
-- [ ] Move `~/src/fresco-poc` → `~/src/bsd/scratch/fresco-arch-validation/` as a frozen reference. Tag final commit.
-- [ ] Rename `atrium-compositor` → `fresco-scene-server` in the bsd repo (binary, crate, paths, references).
-- [ ] Update `docs/ROADMAP.md`: remove "D5: Slint backend"; replace with "D5: Pergola native + atrium-mesa fork + accessibility". Cross-reference `pergola.md` and `LICENSING-POLICY.md`.
-- [ ] Update any inline refs to `atrium-compositor` in spec docs to `fresco-scene-server` (or just "scene server" per the naming-convention memory).
+- [x] Archive `~/src/fresco-poc` to `bsd/scratch/fresco-arch-validation/` as a frozen reference (plain copy + GIT-HISTORY.txt; original repo retained at the source path).
+- [x] Update `docs/ROADMAP.md`: remove "D5: Slint backend"; replace with "D5: Pergola native + atrium-mesa fork + accessibility". Add D4.5 (declarative animation). Cross-reference `pergola.md` and `LICENSING-POLICY.md`.
+- [x] Subtree-merge `~/src/fresco/` (the `fresco-server` library crate) into bsd at `bsd/fresco-scene-server/`. Retire the macOS-only binary (winit + Metal) inside it. Rename crate `fresco-server` → `fresco-scene-server`.
+- [x] Rename the bsd binary crate `atrium-compositor` → `frescod` (binary name, crate name, directory). Update all consumer Cargo.toml path deps and Rust `use` statements across `fresco-socket-rs`, `atrium-edit-socket`, `atrium-term-socket`, `atrium-splash`, `atrium-clock-socket`, `atrium-find-socket`, `atrium-test-client`, and `frescod` itself. Rename the default socket path `/tmp/atrium-compositor.sock` → `/tmp/frescod.sock` and env var `ATRIUM_COMPOSITOR_SOCK` → `FRESCOD_SOCK`.
+- [ ] Update any remaining inline refs to `atrium-compositor` in spec docs / RUNBOOK / README to use the new naming.
+- [ ] Cross-compile workspace build smoke-test (cargo build per consumer; verify nothing's broken).
 
-**Done when:** `git grep atrium-compositor` returns only historical commit messages; ROADMAP.md is internally consistent; the macOS POC is no longer a live tree.
+**Done when:** `git grep atrium-compositor` returns only historical commit messages and intentional documentation of the rename; ROADMAP.md is internally consistent; bsd workspace builds.
 
 ---
 

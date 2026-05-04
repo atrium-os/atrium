@@ -18,8 +18,8 @@
 //! the list and try-send to each. Disconnected senders fail the send;
 //! we leak them in the Vec for v0.1 — a real server prunes.
 
-use fresco_server::command::frontend::CommandFrontend;
-use fresco_server::command::protocol::{
+use fresco_scene_server::command::frontend::CommandFrontend;
+use fresco_scene_server::command::protocol::{
     Command, Completion, CMD_INJECT_KEY, COMP_INPUT_KEY, COMP_WINDOW_FOCUS,
 };
 
@@ -49,7 +49,7 @@ pub fn spawn(shared: Shared, sock_path: &Path) -> std::io::Result<EventSubs> {
         let _ = std::fs::remove_file(sock_path);
     }
     let listener = UnixListener::bind(sock_path)?;
-    eprintln!("atrium-compositor: listening on {}", sock_path.display());
+    eprintln!("frescod: listening on {}", sock_path.display());
 
     let event_subs: EventSubs = Arc::new(Mutex::new(Vec::new()));
     let subs_for_loop = event_subs.clone();

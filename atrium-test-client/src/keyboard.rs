@@ -11,7 +11,7 @@
 //! existing keymap.
 //!
 //! Replaced by a real /dev/usbhid (or virtio-input) reader inside
-//! atrium-compositor in step 2(c.14).
+//! frescod in step 2(c.14).
 
 use fresco_socket::Connection;
 
@@ -97,7 +97,7 @@ fn main() -> std::io::Result<()> {
     let s = std::env::args().nth(1)
         .unwrap_or_else(|| "Hello, atrium!".to_string());
     let sock = std::env::args().nth(2)
-        .unwrap_or_else(|| "/tmp/atrium-compositor.sock".to_string());
+        .unwrap_or_else(|| "/tmp/frescod.sock".to_string());
     let mut conn = Connection::connect(&sock)?;
     eprintln!("connected to {sock}; injecting {:?}", s);
 

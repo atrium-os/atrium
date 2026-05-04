@@ -106,8 +106,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let font = std::fs::read(FONT_PATH)?;
 
-    let sock = std::env::var("ATRIUM_COMPOSITOR_SOCK")
-        .unwrap_or_else(|_| "/tmp/atrium-compositor.sock".to_string());
+    let sock = std::env::var("FRESCOD_SOCK")
+        .unwrap_or_else(|_| "/tmp/frescod.sock".to_string());
     let mut conn = Connection::connect(&sock)?;
     eprintln!("atrium-find-socket: connected to {sock}");
 

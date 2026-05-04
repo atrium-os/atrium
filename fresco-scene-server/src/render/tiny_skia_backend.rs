@@ -3,7 +3,7 @@
 //! Translates fresco-server's `SceneGraph` (which produces flattened
 //! triangle-mesh `RenderItem`s after tessellation) into tiny-skia paths
 //! and fills, rendered into an internal `Pixmap`. Consumers (notably
-//! `atrium-compositor` on FreeBSD) call `render_frame` and then read
+//! `frescod` on FreeBSD) call `render_frame` and then read
 //! `pixels()` to copy/swap into the scanout BO.
 //!
 //! Scope (v0.1):

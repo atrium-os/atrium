@@ -22,11 +22,11 @@
 use crate::cursor::CursorState;
 use crate::input_reader::SharedModifiers;
 
-use fresco_server::command::protocol::{
+use fresco_scene_server::command::protocol::{
     Completion, COMP_INPUT_MOUSE_BUTTON, COMP_INPUT_MOUSE_MOVE, COMP_INPUT_SCROLL,
     COMP_WINDOW_CLOSE_REQUESTED, COMP_WINDOW_FOCUS, COMP_WINDOW_RESIZED,
 };
-use fresco_server::window::{
+use fresco_scene_server::window::{
     self as wm_mod, Compositor as WmCompositor, FocusChange, ResizeAnchor,
     MIN_WINDOW_H, MIN_WINDOW_W, RESIZE_EDGE_B, RESIZE_EDGE_L, RESIZE_EDGE_R, RESIZE_EDGE_T,
 };

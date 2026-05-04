@@ -1,8 +1,13 @@
-//! fresco-server library crate. Re-exports the protocol/scene/cas/render
-//! modules so other binaries (notably the FreeBSD-native server) can reuse
-//! them. The traditional macOS+winit+Metal binary lives in `src/main.rs`
-//! and is the lib's first consumer; future binaries (atrium-server) link
-//! the lib and supply their own platform layer.
+//! fresco-scene-server — library implementing every scene-server role
+//! (IPC, scene-state authority, scene-graph processor, window manager,
+//! bundle host, GPU resource broker, GPU command driver) per
+//! `docs/spec/fresco-rendering-stack.md`. Platform-independent;
+//! consumed by `frescod` (the FreeBSD daemon binary) and other
+//! Atrium services that need any of the underlying machinery.
+//!
+//! Earlier macOS-only binaries (winit + Metal backend) were retired
+//! 2026-05-04 — they were superseded by the
+//! `scratch/fresco-arch-validation` POC and now by frescod itself.
 
 pub mod cas;
 pub mod scene;

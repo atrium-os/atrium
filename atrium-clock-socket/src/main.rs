@@ -31,8 +31,8 @@ fn local_hms() -> (u32, u32, u32) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let sock = std::env::var("ATRIUM_COMPOSITOR_SOCK")
-        .unwrap_or_else(|_| "/tmp/atrium-compositor.sock".to_string());
+    let sock = std::env::var("FRESCOD_SOCK")
+        .unwrap_or_else(|_| "/tmp/frescod.sock".to_string());
     let mut conn = Connection::connect(&sock)?;
     eprintln!("atrium-clock-socket: connected to {sock}");
 

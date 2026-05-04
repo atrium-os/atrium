@@ -1,15 +1,15 @@
-//! Programmatic SceneGraph construction for atrium-compositor.
+//! Programmatic SceneGraph construction for frescod.
 //!
 //! Builds CAS-stored mesh + material blobs in fresco-server's wire
 //! format, then emits `RenderItem`s via `SceneGraph::compose_append`.
-//! This is the bridge between atrium-compositor's Rust-native scene
+//! This is the bridge between frescod's Rust-native scene
 //! authoring and fresco-server's hash-addressed render path — every
 //! frame, the SceneGraph it produces could equivalently have come
 //! from a network protocol client.
 
-use fresco_server::cas::store::CasStore;
-use fresco_server::command::protocol::{Hash256, NULL_HASH};
-use fresco_server::scene::graph::{RenderItem, SceneGraph};
+use fresco_scene_server::cas::store::CasStore;
+use fresco_scene_server::command::protocol::{Hash256, NULL_HASH};
+use fresco_scene_server::scene::graph::{RenderItem, SceneGraph};
 
 /// 8-byte BlobHeader + body. fresco-server's `NodeData::parse` reads
 /// the header to dispatch on type_id; the body layout is per-type.

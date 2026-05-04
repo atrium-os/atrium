@@ -22,8 +22,8 @@
 //! to detach it first. `/dev/hidraw*` works in parallel without
 //! disturbing kbdmux/hkbd, identical philosophy to the pointer path.
 
-use fresco_server::command::protocol::{Completion, COMP_INPUT_KEY};
-use fresco_server::window::Compositor as WmCompositor;
+use fresco_scene_server::command::protocol::{Completion, COMP_INPUT_KEY};
+use fresco_scene_server::window::Compositor as WmCompositor;
 
 use std::fs::{File, OpenOptions};
 use std::io::Read;

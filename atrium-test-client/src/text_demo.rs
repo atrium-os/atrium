@@ -14,7 +14,7 @@
 //! premultiplied (white-opacity) in tiny-skia's Pixmap, which is what
 //! the textured-material path expects.
 
-use fresco_server::command::protocol::{Hash256, NULL_HASH};
+use fresco_scene_server::command::protocol::{Hash256, NULL_HASH};
 use fresco_socket::{wire, Connection};
 use fresco_text::{shape_and_rasterize, GlyphAtlas};
 
@@ -53,7 +53,7 @@ fn extract_glyph(atlas: &GlyphAtlas, idx: usize) -> Option<(Vec<u8>, u32, u32, (
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args().nth(1)
-        .unwrap_or_else(|| "/tmp/atrium-compositor.sock".to_string());
+        .unwrap_or_else(|| "/tmp/frescod.sock".to_string());
     let mut conn = Connection::connect(&path)?;
     eprintln!("connected to {path}");
 

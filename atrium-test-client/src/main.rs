@@ -8,12 +8,12 @@
 //! Hold the connection open after SET_ROOT so the server keeps the
 //! scene visible.
 
-use fresco_server::command::protocol::NULL_HASH;
+use fresco_scene_server::command::protocol::NULL_HASH;
 use fresco_socket::{wire, Connection};
 
 fn main() -> std::io::Result<()> {
     let path = std::env::args().nth(1)
-        .unwrap_or_else(|| "/tmp/atrium-compositor.sock".to_string());
+        .unwrap_or_else(|| "/tmp/frescod.sock".to_string());
     let mut conn = Connection::connect(&path)?;
     eprintln!("connected to {path}");
 
