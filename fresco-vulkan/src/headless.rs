@@ -21,10 +21,16 @@
 //! dev workflow when running a Vulkan demo directly. Production
 //! frescod uses this headless path exclusively.
 
+use std::collections::HashMap;
 use std::ffi::{c_char, CStr};
+use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
 use ash::vk;
+
+use crate::frame::OpFrameResources;
+use crate::pipeline::{op_kind, OpPipelines};
+use crate::resource::Resource;
 
 const COLOR_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
 
@@ -53,8 +59,15 @@ pub struct HeadlessRenderer {
     /* Off-screen render target: device-local image we render into. */
     color_image:     vk::Image,
     color_memory:    vk::DeviceMemory,
-    #[allow(dead_code)]
     color_view:      vk::ImageView,
+
+    /* Render-pass scaffolding so the off-screen image can be a real
+     * color attachment (begin/end render pass + cmd_draw inside).
+     * Same shape as `renderer.rs::create_render_pass`, minus the
+     * PRESENT_SRC final layout (we transition to TRANSFER_SRC manually
+     * before the readback copy). */
+    render_pass: vk::RenderPass,
+    framebuffer: vk::Framebuffer,
 
     /* Host-visible staging buffer for readback. */
     readback_buffer: vk::Buffer,
@@ -64,6 +77,13 @@ pub struct HeadlessRenderer {
     cmd_pool:   vk::CommandPool,
     cmd_buffer: vk::CommandBuffer,
     fence:      vk::Fence,
+
+    /* Bundle dispatch state. Populated by `load_bundle()`; consumed
+     * by the per-frame compute + draw recording (M2.4c). For now
+     * `load_bundle` works but recording paths are still skeleton. */
+    op_pipelines: HashMap<u32, OpPipelines>,
+    op_frames:    HashMap<u32, OpFrameResources>,
+    resources:    HashMap<u32, Resource>,
 }
 
 impl HeadlessRenderer {
@@ -90,6 +110,10 @@ impl HeadlessRenderer {
             &device, &mem_props, extent, COLOR_FORMAT)?;
         let color_view = create_image_view(&device, color_image, COLOR_FORMAT)?;
 
+        let render_pass = create_render_pass(&device, COLOR_FORMAT)?;
+        let framebuffer = create_framebuffer(
+            &device, render_pass, color_view, extent)?;
+
         /* Allocate readback buffer. 4 bytes/pixel for BGRA8. */
         let readback_size = (width as vk::DeviceSize) * (height as vk::DeviceSize) * 4;
         let (readback_buffer, readback_memory) = create_buffer(
@@ -110,18 +134,74 @@ impl HeadlessRenderer {
             device, queue,
             extent,
             color_image, color_memory, color_view,
+            render_pass, framebuffer,
             readback_buffer, readback_memory, readback_size,
             cmd_pool, cmd_buffer, fence,
+            op_pipelines: HashMap::new(),
+            op_frames:    HashMap::new(),
+            resources:    HashMap::new(),
         })
     }
+
+    /// AOT-compile every op in `bundle_path` and register by op-id.
+    /// Same machinery as the windowed Renderer's load_bundle — pipelines
+    /// + per-op frame resources land here so the per-frame recording
+    /// (M2.4c) can dispatch by op-id.
+    pub fn load_bundle(&mut self, bundle_path: &Path) -> Result<()> {
+        let bundle = fresco_bundle::Bundle::load(bundle_path)
+            .with_context(|| format!("load bundle {}", bundle_path.display()))?;
+        log::info!("bundle '{}' v{}: {} op(s)",
+            bundle.manifest.name,
+            bundle.manifest.version,
+            bundle.manifest.ops.len());
+
+        let max_instances = bundle.manifest.gpu_resources
+            .get("max_instances")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(65_536) as u32;
+
+        for op in bundle.ops() {
+            let pipelines = OpPipelines::create(
+                &self.device, op, self.render_pass, self.extent)?;
+            let frame = OpFrameResources::create(
+                &self.device, &self.instance, self.physical_device,
+                op_kind(op.id),
+                pipelines.compute_set_layout,
+                pipelines.render_set_layout,
+                max_instances)?;
+            frame.write_screen(self.extent.width, self.extent.height);
+            log::info!("  op {} '{}' → pipelines + buffers (cap {})",
+                op.id, op.name, max_instances);
+
+            if self.op_pipelines.contains_key(&op.id) {
+                log::warn!("op-id {} collision: replacing existing entry", op.id);
+                let prev = self.op_pipelines.remove(&op.id).unwrap();
+                let prev_frame = self.op_frames.remove(&op.id);
+                unsafe {
+                    self.device.device_wait_idle().ok();
+                    prev.destroy(&self.device);
+                    if let Some(f) = prev_frame { f.destroy(&self.device); }
+                }
+            }
+            self.op_pipelines.insert(op.id, pipelines);
+            self.op_frames.insert(op.id, frame);
+        }
+        Ok(())
+    }
+
+    /// Number of ops with compiled pipelines (post-`load_bundle`).
+    pub fn op_count(&self) -> usize { self.op_pipelines.len() }
 
     /// Width × height of the off-screen render target.
     pub fn extent(&self) -> (u32, u32) { (self.extent.width, self.extent.height) }
 
-    /// Clear the render target to `color` and copy the pixels back
-    /// into the host staging buffer. Returns once the GPU is idle and
-    /// `read_pixels` can be called. The simplest possible "make sure
-    /// the Vulkan path is alive" check.
+    /// Clear the render target to `color` (via a real render pass)
+    /// and copy the pixels back into the host staging buffer. Returns
+    /// once the GPU is idle and `read_pixels` can be called.
+    ///
+    /// Uses `cmd_begin_render_pass` with `LOAD_OP_CLEAR` so the
+    /// render-pass machinery is exercised — same code path the future
+    /// `record_frame` will use, just without any draws inside.
     ///
     /// `color` is a BGRA8 quadruple (each component 0..=255).
     pub fn clear_and_readback(&mut self, color: [u8; 4]) -> Result<()> {
@@ -133,44 +213,42 @@ impl HeadlessRenderer {
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
             self.device.begin_command_buffer(self.cmd_buffer, &begin)?;
 
-            /* UNDEFINED → TRANSFER_DST_OPTIMAL */
+            /* Begin render pass — clears via LOAD_OP_CLEAR. The render
+             * pass's initial_layout is UNDEFINED (we don't care about
+             * the previous contents), and final_layout is
+             * COLOR_ATTACHMENT_OPTIMAL (we transition to TRANSFER_SRC
+             * ourselves below). */
+            let clear_value = vk::ClearValue {
+                color: vk::ClearColorValue { float32: [
+                    color[2] as f32 / 255.0,
+                    color[1] as f32 / 255.0,
+                    color[0] as f32 / 255.0,
+                    color[3] as f32 / 255.0,
+                ]},
+            };
+            let clears = [clear_value];
+            let rp_begin = vk::RenderPassBeginInfo::default()
+                .render_pass(self.render_pass)
+                .framebuffer(self.framebuffer)
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: self.extent,
+                })
+                .clear_values(&clears);
+            self.device.cmd_begin_render_pass(
+                self.cmd_buffer, &rp_begin, vk::SubpassContents::INLINE);
+            /* No draws yet — M2.4c lands compute + indirect draw here. */
+            self.device.cmd_end_render_pass(self.cmd_buffer);
+
+            /* COLOR_ATTACHMENT_OPTIMAL → TRANSFER_SRC_OPTIMAL  for the
+             * upcoming copy-to-buffer. */
             transition_image(
                 &self.device, self.cmd_buffer, self.color_image,
-                vk::ImageLayout::UNDEFINED,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::AccessFlags::empty(),
-                vk::AccessFlags::TRANSFER_WRITE,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::TRANSFER);
-
-            /* Clear via vkCmdClearColorImage. */
-            let clear = vk::ClearColorValue {
-                float32: [
-                    color[2] as f32 / 255.0,  /* R */
-                    color[1] as f32 / 255.0,  /* G */
-                    color[0] as f32 / 255.0,  /* B */
-                    color[3] as f32 / 255.0,  /* A */
-                ],
-            };
-            let range = vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0, level_count: 1,
-                base_array_layer: 0, layer_count: 1,
-            };
-            self.device.cmd_clear_color_image(
-                self.cmd_buffer, self.color_image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &clear, &[range]);
-
-            /* TRANSFER_DST_OPTIMAL → TRANSFER_SRC_OPTIMAL  (for the
-             * upcoming copy-to-buffer). */
-            transition_image(
-                &self.device, self.cmd_buffer, self.color_image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
                 vk::AccessFlags::TRANSFER_READ,
-                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
                 vk::PipelineStageFlags::TRANSFER);
 
             /* Copy image → readback buffer. */
@@ -234,8 +312,21 @@ impl Drop for HeadlessRenderer {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+            for (_, r) in self.resources.drain() {
+                match r {
+                    Resource::Texture(t) => t.destroy(&self.device),
+                }
+            }
+            for (_, f) in self.op_frames.drain() {
+                f.destroy(&self.device);
+            }
+            for (_, p) in self.op_pipelines.drain() {
+                p.destroy(&self.device);
+            }
             self.device.destroy_fence(self.fence, None);
             self.device.destroy_command_pool(self.cmd_pool, None);
+            self.device.destroy_framebuffer(self.framebuffer, None);
+            self.device.destroy_render_pass(self.render_pass, None);
             self.device.destroy_image_view(self.color_view, None);
             self.device.destroy_image(self.color_image, None);
             self.device.free_memory(self.color_memory, None);
@@ -244,7 +335,7 @@ impl Drop for HeadlessRenderer {
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }
-        let _ = self.physical_device;  // pacify dead_code on some configs
+        let _ = self.physical_device;
     }
 }
 
@@ -436,6 +527,63 @@ fn create_command_pool(device: &ash::Device, queue_family: u32)
     Ok((pool, bufs[0]))
 }
 
+fn create_render_pass(device: &ash::Device, format: vk::Format)
+    -> Result<vk::RenderPass>
+{
+    let attachment = vk::AttachmentDescription::default()
+        .format(format)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .store_op(vk::AttachmentStoreOp::STORE)
+        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        /* Headless: end in COLOR_ATTACHMENT_OPTIMAL; the caller
+         * transitions to TRANSFER_SRC_OPTIMAL before copy-to-buffer. */
+        .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+
+    let color_ref = [vk::AttachmentReference {
+        attachment: 0,
+        layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+    }];
+    let subpass = vk::SubpassDescription::default()
+        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+        .color_attachments(&color_ref);
+
+    let dependency = vk::SubpassDependency::default()
+        .src_subpass(vk::SUBPASS_EXTERNAL)
+        .dst_subpass(0)
+        .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+        .src_access_mask(vk::AccessFlags::empty())
+        .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+        .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
+
+    let attachments = [attachment];
+    let subpasses   = [subpass];
+    let deps        = [dependency];
+    let info = vk::RenderPassCreateInfo::default()
+        .attachments(&attachments)
+        .subpasses(&subpasses)
+        .dependencies(&deps);
+    Ok(unsafe { device.create_render_pass(&info, None) }?)
+}
+
+fn create_framebuffer(
+    device:      &ash::Device,
+    render_pass: vk::RenderPass,
+    view:        vk::ImageView,
+    extent:      vk::Extent2D,
+) -> Result<vk::Framebuffer> {
+    let attachments = [view];
+    let info = vk::FramebufferCreateInfo::default()
+        .render_pass(render_pass)
+        .attachments(&attachments)
+        .width(extent.width)
+        .height(extent.height)
+        .layers(1);
+    Ok(unsafe { device.create_framebuffer(&info, None) }?)
+}
+
 fn transition_image(
     device:        &ash::Device,
     cb:            vk::CommandBuffer,
@@ -472,7 +620,8 @@ mod tests {
     use super::*;
 
     /// Smoke-test: create a 64×64 headless renderer, clear to a known
-    /// BGRA color, read back, verify every pixel matches.
+    /// BGRA color via a real render pass, read back, verify every
+    /// pixel matches.
     ///
     /// This test requires a Vulkan loader to be available
     /// (lavapipe / venus / vendor / MoltenVK on macOS). If none is
@@ -493,9 +642,9 @@ mod tests {
 
         assert_eq!(pixels.len(), 64 * 64 * 4);
 
-        /* Every pixel must match the cleared color. Lavapipe / vendor
-         * drivers may swizzle BGRA8 differently — check just the RGB
-         * channels with a tolerance for sRGB rounding. */
+        /* Every pixel must match the cleared color. Drivers may swizzle
+         * BGRA8 differently — check just the RGB channels with a
+         * tolerance for sRGB rounding. */
         let mut nonred = 0;
         for px in pixels.chunks_exact(4) {
             if px[0] < 0xF0 || px[1] > 0x10 || px[2] > 0x10 {
@@ -503,5 +652,34 @@ mod tests {
             }
         }
         assert_eq!(nonred, 0, "expected all-red, found {nonred} divergent pixels");
+    }
+
+    /// Test bundle loading: AOT-compile the atrium-core bundle's
+    /// pipelines + allocate per-op frame resources. Skipped if the
+    /// bundle's SPIR-V hasn't been built yet (run
+    /// `bundles/atrium-core/build.sh` to generate).
+    #[test]
+    fn load_atrium_core_bundle() {
+        let bundle_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap()
+            .join("bundles/atrium-core");
+
+        /* Skip if SPIR-V hasn't been built. The CI lane (M3) will
+         * have build.sh run as a pre-test step. */
+        if !bundle_path.join("compute/op_rectangle.comp.spv").exists() {
+            eprintln!("skipping: SPIR-V not built (run bundles/atrium-core/build.sh)");
+            return;
+        }
+
+        let mut r = match HeadlessRenderer::new(256, 256) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping: no Vulkan loader available ({e})");
+                return;
+            }
+        };
+
+        r.load_bundle(&bundle_path).expect("load_bundle");
+        assert!(r.op_count() >= 2, "atrium-core has rect + texture, got {}", r.op_count());
     }
 }
