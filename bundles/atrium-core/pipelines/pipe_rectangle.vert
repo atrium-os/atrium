@@ -41,13 +41,14 @@ void main() {
 
     vec2 pos = inst.model.xy + corner * inst.model.zw;
 
-    /* Screen-pixel space → Vulkan clip space:
-     *   x: [0, w] → [-1, 1]
-     *   y: [0, h] → [+1, -1]   (Vulkan Y-down on framebuffer; flip
-     *                            here so callers think top-left origin)
+    /* Screen-pixel space → Vulkan clip space. Vulkan's default clip
+     * space is Y-down (clip.y = -1 is top, +1 is bottom), matching
+     * the framebuffer memory layout. Our wire convention is top-left
+     * origin in pixels (pos.y=0 = top), so the mapping is the
+     * identity — no flip. (Earlier code flipped here as if this were
+     * OpenGL clip space, which it isn't.)
      */
     vec2 clip = (pos / screen.size) * 2.0 - 1.0;
-    clip.y = -clip.y;
 
     gl_Position = vec4(clip, 0.0, 1.0);
     v_color = inst.color;

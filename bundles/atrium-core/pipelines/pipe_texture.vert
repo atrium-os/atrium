@@ -29,9 +29,11 @@ void main() {
         float((gl_VertexIndex & 2) != 0)
     );
 
+    /* Vulkan default clip space is Y-down (clip.y=-1 top, +1 bottom);
+     * our wire convention is top-left pixels (pos.y=0 top). Identity
+     * mapping — no flip. */
     vec2 pos  = inst.model.xy + corner * inst.model.zw;
     vec2 clip = (pos / screen.size) * 2.0 - 1.0;
-    clip.y = -clip.y;
 
     gl_Position = vec4(clip, 0.0, 1.0);
     v_uv = corner;
