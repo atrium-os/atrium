@@ -275,6 +275,57 @@ The Path A / Path B decision is unaffected — Path B (client-rendered
 surfaces) bypasses the scene-graph layer entirely, so the GPU-driven
 scene processor optimization applies only to Path A content.
 
+### M11 (potential) — GPU-side content-addressed memory
+
+Extends Atrium's CAS-everywhere primitive to the GPU layer: a
+GPU-resident hash table maps `content_hash → vk::ImageView /
+vk::Buffer`, with shaders binding by hash rather than (or in addition
+to) slot_id.
+
+What this enables:
+- **Cross-app texture dedup at the GPU layer.** Even when CPU-side CAS
+  misses (two apps independently uploading the same glyph through
+  separate connections), the GPU detects and collapses the duplicates.
+  One copy in VRAM regardless of how many clients reference it.
+- **Texture identity = content hash.** Slot_ids become nicknames for
+  hashes; multiple slots referencing the same content share VRAM
+  storage. Descriptor updates become hash lookups.
+- **Compute-result caching.** atrium-text's glyph rasterization (M6)
+  caches outputs keyed by `hash(font, codepoint, size, AA params)`.
+  Subsequent renders of the same glyph hit cache. Generalizes the
+  per-bundle glyph-atlas pattern: any compute kernel can cache its
+  outputs by hash.
+
+What it doesn't help with:
+- **Per-frame dynamic content.** Hashing + lookup costs more than the
+  dedup saves when nodes are unique per frame.
+- **General-purpose scratch memory.** Most GPU buffers aren't content-
+  addressable; forcing CAS for everything is overhead with no payoff.
+- **High-contention insert paths.** Atomic CAS contention on shared
+  hash table entries can dominate cost in pathological access patterns.
+
+Right framing: a resource-management refinement of the slot/upload
+model, not a fundamental architectural change. Pairs naturally with
+M10 — the GPU-driven scene processor would use the GPU CAS for its
+own resource lookups, completing the "CAS everywhere from FS to
+pixels" story (Tessera at storage, aqueduct at IPC, slot table at
+protocol, GPU hash table at memory).
+
+Prerequisites:
+- Vulkan support for descriptor indirection cheap enough for per-bind
+  hash lookups (descriptor buffers, VK_EXT_descriptor_buffer).
+- A hash-table format that's update-friendly under concurrent shader
+  access (open-addressing with double-hashing, or compare-and-swap
+  chained buckets).
+- Eviction policy when GPU memory pressure hits (LRU? frequency-based?
+  refcounted-with-explicit-pin?).
+- Matching protocol-side affordance: clients SHOULD be able to bind
+  by hash directly, not only via the slot_id indirection.
+
+This is M11-shaped (post-M10). The substrate (GPU ABI v2 + dynamic
+bundles + frescod's existing slot table) doesn't preclude it; it's
+purely additive when implemented.
+
 ### Other future evolutions (placeholder)
 
 - **Bundle pipeline derivative caching** — if many bundles differ only
