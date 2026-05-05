@@ -1093,7 +1093,16 @@ atrium_virtio_gpu_probe(device_t dev)
 	if (virtio_get_device_type(dev) != ATRIUM_VIRTIO_ID_GPU)
 		return (ENXIO);
 	device_set_desc(dev, "Atrium virtio-gpu (native, no linuxkpi)");
-	return (BUS_PROBE_DEFAULT);
+	/* BUS_PROBE_VENDOR (> BUS_PROBE_DEFAULT) so we win the probe
+	 * against stock vtgpu when both are registered. Without this,
+	 * vtgpu wins the tie-break, attaches as the framebuffer backend
+	 * for vt(4), and the only way for atrium to take the slot is a
+	 * runtime `devctl set driver -f` — which on -CURRENT panics in
+	 * vt_timer because vt holds a stale callback into freed vtgpu
+	 * state (panic: "Offset 0x000002 out of fb size", trace via
+	 * scripts/ddb_session.py). Winning the probe at boot avoids the
+	 * detach path entirely. */
+	return (BUS_PROBE_VENDOR);
 }
 
 static void
