@@ -28,16 +28,17 @@ use std::path::Path;
 use anyhow::{anyhow, Context, Result};
 use ash::vk;
 
-use crate::frame::{OpFrameResources, SceneNode};
+use crate::frame::{OpFrameResources, PathNode, SceneNode};
 use crate::pipeline::{op_kind, OpPipelines};
 use crate::renderer::TextureBatch;
 use crate::resource::{self, Resource, UploadRequest};
 
-/// Op-id for atrium-core's rect / texture ops. Hardcoded for now; per
-/// the spec §3.4, the closed registry pins these. Mirrors the constants
-/// in `atrium-rpc-display::scene_ops::*`.
+/// Op-ids for atrium-core's bundled ops. Hardcoded for now; per the
+/// spec §3.4 closed registry, these are pinned. Mirrors the constants
+/// in `fresco-protocol::scene_ops::*`.
 const OP_ID_RECT:    u32 = 0x1000;
 const OP_ID_TEXTURE: u32 = 0x1001;
+const OP_ID_PATH:    u32 = 0x1002;
 
 /// Atrium teal — the default clear color, same value as the windowed
 /// `Renderer`. Recognisable so smoke-tests can confirm the render-pass
@@ -115,6 +116,7 @@ pub struct HeadlessRenderer {
      * set_rect_nodes / set_texture_batches; render_to_buffer drains. */
     rect_nodes:      Vec<SceneNode>,
     texture_batches: Vec<TextureBatch>,
+    path_nodes:      Vec<PathNode>,
 
     /// Last instance count we logged; suppresses spam.
     last_logged_count: u32,
@@ -176,6 +178,7 @@ impl HeadlessRenderer {
             resources:    HashMap::new(),
             rect_nodes:   Vec::new(),
             texture_batches: Vec::new(),
+            path_nodes:   Vec::new(),
             last_logged_count: u32::MAX,
         })
     }
@@ -237,6 +240,11 @@ impl HeadlessRenderer {
     /// Stage texture-op batches (one per slot) for the next render.
     pub fn set_texture_batches(&mut self, batches: Vec<TextureBatch>) {
         self.texture_batches = batches;
+    }
+
+    /// Stage path-op (rotated quad) nodes for the next render.
+    pub fn set_path_nodes(&mut self, nodes: Vec<PathNode>) {
+        self.path_nodes = nodes;
     }
 
     /// SLOT_CLEAR / texture replacement notification: drop any cached
@@ -324,6 +332,31 @@ impl HeadlessRenderer {
                     render_layout:     pipes.render_pipe_layout,
                     render_set:        frame.render_set
                         .expect("rect frame missing single render_set"),
+                    counter_buf:       frame.counter_buf,
+                    instance_buf:      frame.instance_buf,
+                    n,
+                });
+            }
+
+            /* Path-op plan: same shape as rect, just a different
+             * (compute_pipeline, render_pipeline, frame). */
+            if let (Some(pipes), Some(frame)) =
+                (self.op_pipelines.get(&OP_ID_PATH),
+                 self.op_frames.get(&OP_ID_PATH))
+            {
+                let n = frame.write_path_scene(&self.path_nodes);
+                if n < self.path_nodes.len() as u32 {
+                    log::warn!("path nodes {} > cap {}; dropping excess",
+                        self.path_nodes.len(), frame.max_instances);
+                }
+                plans.push(DrawPlan {
+                    compute_pipeline:  pipes.compute_pipeline,
+                    compute_layout:    pipes.compute_pipe_layout,
+                    compute_set:       frame.descriptor_set,
+                    render_pipeline:   pipes.render_pipeline,
+                    render_layout:     pipes.render_pipe_layout,
+                    render_set:        frame.render_set
+                        .expect("path frame missing single render_set"),
                     counter_buf:       frame.counter_buf,
                     instance_buf:      frame.instance_buf,
                     n,

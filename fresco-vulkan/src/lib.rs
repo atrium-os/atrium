@@ -24,4 +24,4 @@ pub use renderer::{Renderer, TextureBatch};
 pub use headless::HeadlessRenderer;
 pub use pipeline::{OpKind, OpPipelines};
 pub use resource::{Resource, Texture, UploadRequest};
-pub use frame::{SceneNode, TextureNode};
+pub use frame::{PathNode, SceneNode, TextureNode};

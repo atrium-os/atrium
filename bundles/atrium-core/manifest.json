@@ -13,6 +13,12 @@
       "name":            "texture",
       "compute_entry":   "compute/op_texture.comp.spv:main",
       "render_pipeline": "pipelines/pipe_texture"
+    },
+    {
+      "id":              4098,
+      "name":            "path",
+      "compute_entry":   "compute/op_path.comp.spv:main",
+      "render_pipeline": "pipelines/pipe_path"
     }
   ],
   "depends_on":   [],

@@ -1,0 +1,59 @@
+// Compute shader for atrium-core's `path` op — rotated quad
+// (oriented rectangle).
+//
+// Same shape as op_rectangle.comp: per scene node, write one
+// InstanceRecord into the instance buffer and bump the atomic counter.
+// The "path" name is forward-looking: this op's first form is a
+// rotated rect (cx, cy, length, width, angle, color), enough for the
+// blocked demos (clock tick marks, edit/term/find caret cursors). The
+// generic-Bezier flavour graduates to op_glyph (0x1003) when the
+// atrium-text bundle lands.
+//
+// Scene record / instance record layout: 48 bytes, three vec4s.
+//   - model: cx, cy, length, width
+//   - extra: angle (radians), pad, pad, pad
+//   - color: rgba
+
+#version 460
+
+struct SceneNode {
+    vec4 model;      /* cx, cy, length, width  (screen pixels) */
+    vec4 extra;      /* angle, _, _, _         (radians)       */
+    vec4 color;      /* rgba                                   */
+};
+
+struct InstanceRecord {
+    vec4 model;
+    vec4 extra;
+    vec4 color;
+};
+
+layout(set = 0, binding = 0) readonly buffer SceneBuf {
+    uint       node_count;
+    uint       _pad0[3];
+    SceneNode  nodes[];
+} scene;
+
+layout(set = 0, binding = 1) writeonly buffer InstanceBuf {
+    InstanceRecord instances[];
+} instance_buf;
+
+layout(set = 0, binding = 2) buffer CounterBuf {
+    uint count;
+} counter;
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= scene.node_count) {
+        return;
+    }
+    SceneNode n = scene.nodes[id];
+
+    uint slot = atomicAdd(counter.count, 1);
+
+    instance_buf.instances[slot].model = n.model;
+    instance_buf.instances[slot].extra = n.extra;
+    instance_buf.instances[slot].color = n.color;
+}

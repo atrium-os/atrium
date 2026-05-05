@@ -437,6 +437,29 @@ pub struct TextureParams {
     pub slot_id: u32,
 }
 
+/// Params for `scene_ops::ATRIUM_CORE_PATH` (rotated quad).
+///
+/// `(cx, cy)` is the rotation pivot. `length` is the size along the
+/// rotation axis (in screen pixels at angle = 0, this is the X
+/// extent); `width` is perpendicular. `angle` is in radians, CCW.
+/// Color is straight (non-premultiplied) RGBA in [0, 1].
+///
+/// At `angle = 0`, the quad spans `[(cx - length/2, cy - width/2),
+/// (cx + length/2, cy + width/2)]` — i.e. equivalent to a `RectParams`
+/// centered on (cx, cy).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct PathParams {
+    pub cx:     f32,
+    pub cy:     f32,
+    pub length: f32,
+    pub width:  f32,
+    pub angle:  f32,
+    pub r: f32,
+    pub g: f32,
+    pub b: f32,
+    pub a: f32,
+}
+
 // ── tests ────────────────────────────────────────────────────────────
 
 #[cfg(test)]

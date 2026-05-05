@@ -33,7 +33,7 @@ use fresco_protocol::{
     SlotSetPayload, SlotClearPayload, SlotKind, TextureDesc, TextureFormat,
     SceneFrameBeginPayload, SceneFrameEndPayload,
     SceneNodeSetPayload, SceneNodeClearPayload,
-    RectParams, TextureParams,
+    RectParams, TextureParams, PathParams,
     WindowCreatePayload, WindowDestroyPayload, WindowSetTitlePayload,
     WindowSetHintsPayload, WindowRequestClosePayload, WindowPresentPayload,
     WindowHints,
@@ -238,6 +238,15 @@ impl Connection {
         -> io::Result<()>
     {
         self.scene_node_set(node_id, scene_ops::ATRIUM_CORE_TEXTURE, &params)
+    }
+
+    /// Convenience: install a path node (atrium-core PATH op — rotated
+    /// quad). `params.angle` is in radians; angle = 0 produces an axis-
+    /// aligned rect of `length × width` centered on `(cx, cy)`.
+    pub fn scene_node_path(&mut self, node_id: u32, params: PathParams)
+        -> io::Result<()>
+    {
+        self.scene_node_set(node_id, scene_ops::ATRIUM_CORE_PATH, &params)
     }
 
     pub fn scene_node_clear(&mut self, node_id: u32) -> io::Result<()> {

@@ -41,7 +41,7 @@ use fresco_protocol::{
     control, decode, scene_ops,
     SceneNodeSetPayload, SceneNodeClearPayload,
     SlotSetPayload, SlotClearPayload,
-    RectParams, TextureParams,
+    RectParams, TextureParams, PathParams,
     WindowCreatePayload, WindowDestroyPayload,
     WindowSetTitlePayload, WindowSetHintsPayload,
     WindowRequestClosePayload, WindowPresentPayload,
@@ -65,6 +65,7 @@ use crate::window::Compositor;
 pub struct WindowSceneState {
     pub rect_nodes:    HashMap<u32, RectParams>,
     pub texture_nodes: HashMap<u32, TextureParams>,
+    pub path_nodes:    HashMap<u32, PathParams>,
     pub slot_table:    HashMap<u32, [u8; 32]>,
     pub in_frame:      bool,
 }
@@ -84,6 +85,17 @@ impl WindowSceneState {
             position: [p.x, p.y],
             size:     [p.w, p.h],
             color:    [p.r, p.g, p.b, p.a],
+        }).collect()
+    }
+
+    /// Snapshot the path-op nodes (rotated quads) as
+    /// `fresco_vulkan::PathNode`. Renderer feeds this to
+    /// `HeadlessRenderer::set_path_nodes`.
+    pub fn extract_path_nodes(&self) -> Vec<fresco_vulkan::PathNode> {
+        self.path_nodes.values().map(|p| fresco_vulkan::PathNode {
+            model: [p.cx, p.cy, p.length, p.width],
+            extra: [p.angle, 0.0, 0.0, 0.0],
+            color: [p.r, p.g, p.b, p.a],
         }).collect()
     }
 
@@ -308,17 +320,25 @@ impl EnvelopeFrontend {
                 let inner: RectParams = decode(&p.params)
                     .map_err(|_| DispatchError::BadPayload)?;
                 s.rect_nodes.insert(p.node_id, inner);
-                /* Repeat-node-id replaces — but if the previous binding
-                 * was a texture op, we need to evict from texture_nodes
-                 * to maintain the invariant "node_id appears in exactly
-                 * one map." */
+                /* Repeat-node-id replaces — evict from sibling op-kind
+                 * maps to maintain the invariant "node_id appears in
+                 * exactly one map." */
                 s.texture_nodes.remove(&p.node_id);
+                s.path_nodes.remove(&p.node_id);
             }
             scene_ops::ATRIUM_CORE_TEXTURE => {
                 let inner: TextureParams = decode(&p.params)
                     .map_err(|_| DispatchError::BadPayload)?;
                 s.texture_nodes.insert(p.node_id, inner);
                 s.rect_nodes.remove(&p.node_id);
+                s.path_nodes.remove(&p.node_id);
+            }
+            scene_ops::ATRIUM_CORE_PATH => {
+                let inner: PathParams = decode(&p.params)
+                    .map_err(|_| DispatchError::BadPayload)?;
+                s.path_nodes.insert(p.node_id, inner);
+                s.rect_nodes.remove(&p.node_id);
+                s.texture_nodes.remove(&p.node_id);
             }
             other => {
                 /* Unknown / unbundled op-id. The closed registry per
@@ -340,6 +360,7 @@ impl EnvelopeFrontend {
         if let Some(s) = self.per_window.get_mut(&win_id) {
             s.rect_nodes.remove(&p.node_id);
             s.texture_nodes.remove(&p.node_id);
+            s.path_nodes.remove(&p.node_id);
         }
         Ok(Vec::new())
     }

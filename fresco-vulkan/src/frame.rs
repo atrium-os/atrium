@@ -40,6 +40,17 @@ pub struct TextureNode {
     pub model: [f32; 4],   /* x, y, w, h */
 }
 
+/// One scene node for the path op (rotated quad). Mirrors `SceneNode`
+/// in `bundles/atrium-core/compute/op_path.comp` (48 bytes, three
+/// vec4s for std430 alignment).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PathNode {
+    pub model: [f32; 4],   /* cx, cy, length, width */
+    pub extra: [f32; 4],   /* angle, _pad, _pad, _pad */
+    pub color: [f32; 4],
+}
+
 /// Header word that precedes the SceneNode array in the scene buffer.
 /// Mirrors the `SceneBuf { uint node_count; uint _pad0[3]; SceneNode
 /// nodes[]; }` layout in the compute shader.
@@ -55,15 +66,17 @@ fn node_size_for(kind: OpKind) -> vk::DeviceSize {
     match kind {
         OpKind::Rect    => std::mem::size_of::<SceneNode>()   as vk::DeviceSize,
         OpKind::Texture => std::mem::size_of::<TextureNode>() as vk::DeviceSize,
+        OpKind::Path    => std::mem::size_of::<PathNode>()    as vk::DeviceSize,
     }
 }
 
-/// InstanceRecord size matches node size for both ops in the POC
-/// (rect: vec4 model + vec4 color = 32; texture: vec4 model = 16).
+/// InstanceRecord size matches node size for these ops (rect: vec4
+/// model + vec4 color = 32; texture: vec4 model = 16; path: 3×vec4 = 48).
 fn instance_size_for(kind: OpKind) -> vk::DeviceSize {
     match kind {
         OpKind::Rect    => 32,
         OpKind::Texture => 16,
+        OpKind::Path    => 48,
     }
 }
 
@@ -225,7 +238,11 @@ impl OpFrameResources {
          * needs one. */
         const SLOT_CAP: u32 = 64;
         let (render_pool, render_set, sampler, render_set_layout_keep) = match kind {
-            OpKind::Rect => {
+            /* Rect and Path share the same render-set shape: one
+             * storage buffer (instances) + one uniform (screen). The
+             * only difference is the per-record byte size, which is
+             * sized via node_bytes / instance_size_for above. */
+            OpKind::Rect | OpKind::Path => {
                 let sizes = [
                     vk::DescriptorPoolSize {
                         ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 1,
@@ -391,6 +408,14 @@ impl OpFrameResources {
         self.write_raw(nodes.as_ptr() as *const u8,
                        nodes.len(),
                        std::mem::size_of::<TextureNode>())
+    }
+
+    /// Write path-op (rotated quad) scene nodes into the scene buffer.
+    pub fn write_path_scene(&self, nodes: &[PathNode]) -> u32 {
+        debug_assert_eq!(self.kind, OpKind::Path);
+        self.write_raw(nodes.as_ptr() as *const u8,
+                       nodes.len(),
+                       std::mem::size_of::<PathNode>())
     }
 
     fn write_raw(&self, src: *const u8, count: usize, item_bytes: usize) -> u32 {

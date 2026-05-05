@@ -30,13 +30,13 @@ mod socket_server;
 use atrium_gpu::abi::*;
 use atrium_gpu::{Display, Gpu};
 
-use fresco_protocol::{RectParams, TextureParams};
+use fresco_protocol::{PathParams, RectParams, TextureParams};
 use fresco_scene_server::cas::store::CasStore;
 use fresco_scene_server::command::envelope_frontend::EnvelopeFrontend;
 use fresco_scene_server::scene::graph::SceneGraph;
 use fresco_scene_server::scene::slots::SlotTable;
 use fresco_scene_server::window::Compositor;
-use fresco_vulkan::{HeadlessRenderer, SceneNode, TextureBatch, TextureNode};
+use fresco_vulkan::{HeadlessRenderer, PathNode, SceneNode, TextureBatch, TextureNode};
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -165,6 +165,7 @@ fn render_one_frame(
     };
 
     let mut rects: Vec<SceneNode> = Vec::new();
+    let mut paths: Vec<PathNode>  = Vec::new();
     let mut tex_by_slot: std::collections::HashMap<u32, Vec<TextureNode>> =
         std::collections::HashMap::new();
     {
@@ -173,6 +174,9 @@ fn render_one_frame(
             let Some(state) = fe.window_state(*win_id) else { continue; };
             for p in state.rect_nodes.values() {
                 rects.push(translate_rect(p, *ox, *oy));
+            }
+            for p in state.path_nodes.values() {
+                paths.push(translate_path(p, *ox, *oy));
             }
             for p in state.texture_nodes.values() {
                 tex_by_slot.entry(p.slot_id).or_default()
@@ -185,6 +189,7 @@ fn render_one_frame(
         .collect();
 
     renderer.set_rect_nodes(rects);
+    renderer.set_path_nodes(paths);
     renderer.set_texture_batches(batches);
     renderer.render_to_buffer()?;
     Ok(())
@@ -200,6 +205,14 @@ fn translate_rect(p: &RectParams, ox: f32, oy: f32) -> SceneNode {
 
 fn translate_texture(p: &TextureParams, ox: f32, oy: f32) -> TextureNode {
     TextureNode { model: [p.x + ox, p.y + oy, p.w, p.h] }
+}
+
+fn translate_path(p: &PathParams, ox: f32, oy: f32) -> PathNode {
+    PathNode {
+        model: [p.cx + ox, p.cy + oy, p.length, p.width],
+        extra: [p.angle, 0.0, 0.0, 0.0],
+        color: [p.r, p.g, p.b, p.a],
+    }
 }
 
 /// Pull the rendered framebuffer out of `renderer` (BGRA8) and copy

@@ -132,8 +132,10 @@ fn main() -> io::Result<()> {
             let win_id = msg.flags as u32;
             if let Some(state) = frontend.window_state(win_id) {
                 let rects    = state.extract_rect_nodes();
+                let paths    = state.extract_path_nodes();
                 let textures = state.extract_texture_batches();
                 renderer.set_rect_nodes(rects);
+                renderer.set_path_nodes(paths);
                 renderer.set_texture_batches(textures);
                 renderer.render_to_buffer()
                     .map_err(|e| io::Error::new(io::ErrorKind::Other,

@@ -35,6 +35,11 @@ use crate::reflect;
 pub enum OpKind {
     Rect,
     Texture,
+    /// Rotated quad ("oriented rectangle"). 48-byte node/instance
+    /// records (model + extra + color). First flavour of the path op
+    /// family — generic Bezier paths land in `OpKind::Glyph` (0x1003)
+    /// when atrium-text ships.
+    Path,
 }
 
 /// Map op-id → kind. Hardcoded for buffer sizing only (see
@@ -44,6 +49,7 @@ pub fn op_kind(op_id: u32) -> OpKind {
     match op_id {
         0x1000 => OpKind::Rect,
         0x1001 => OpKind::Texture,
+        0x1002 => OpKind::Path,
         _      => OpKind::Rect,
     }
 }
