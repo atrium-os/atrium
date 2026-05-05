@@ -733,6 +733,29 @@ vssh "gpart recover vtbd1; gpart resize -i 3 vtbd1; growfs -y /"
 > doesn't fix it, instrument with WITNESS / lock-order tracing and
 > follow the lock chain.
 >
+> **Investigation update (2026-05-05):** rebuilt the kmod in-VM
+> against the current kernel headers — same hang. So it's not ABI
+> drift. Found a real bring-up shortcut in the kmod's controlq
+> path: `VQ_ALLOC_INFO_INIT(..., NULL, ...)` registers no interrupt
+> callback, and `atrium_vgpu_req_resp` busy-polls via
+> `virtqueue_poll` while holding `ctrl_lock`. This worked when MSI-X
+> for the controlq wasn't being delivered; on modern -CURRENT the
+> host fires the IRQ at completion and with no callback the IRQ
+> stays pending. Wrote a callback + cv_wait patch (`cv_init` in
+> attach, real intr handler that dequeues + `cv_signal`s, replace
+> `virtqueue_poll` with `while (!ctrl_done) cv_wait(...)`) — the
+> patch builds cleanly but **still hangs at `set driver -f`**. So
+> the IRQ-storm theory was incomplete; there's a second issue,
+> probably sleeping in attach context conflicting with a newbus
+> topology lock the patched cv_wait now hits. Next-session moves:
+> attach kgdb (`-s` to qemu, `kgdb` from host); enable WITNESS in
+> the kernel build for a real lock-order trace; or defer
+> `GET_DISPLAY_INFO` out of attach entirely (e.g. on first cdev
+> open) so attach doesn't sleep at all. The patch is in-tree
+> (`atrium-kmod/atrium_virtio_gpu.c`) since the structural
+> direction (callback-driven controlq) is correct even if it
+> didn't fully unstick this hang.
+>
 > Until resolved, scanout-integrated runs of frescod + the migrated
 > apps are blocked. The no-scanout subset (`frescod-vulkan-smoke`
 > renders to PNG without ever opening `/dev/atrium-display0`)

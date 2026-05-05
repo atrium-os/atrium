@@ -23,6 +23,7 @@
 #include <sys/malloc.h>
 #include <sys/lock.h>
 #include <sys/mutex.h>
+#include <sys/condvar.h>
 #include <sys/rman.h>
 #include <sys/sysctl.h>
 #include <sys/uio.h>
@@ -122,6 +123,18 @@ struct atrium_gpu_softc {
 	uint64_t                       features;
 	struct virtqueue              *ctrl_vq;
 	struct virtio_gpu_config       gpucfg;
+
+	/* Controlq completion signalling. Submitters serialise on
+	 * `ctrl_lock` (one in-flight at a time), enqueue+notify, then
+	 * cv_wait on this condvar; the controlq interrupt callback
+	 * dequeues + cv_signals. The `ctrl_done` flag guards against
+	 * spurious wakeups + loop-on-condition. Replaces an earlier
+	 * busy-poll-without-callback shortcut that deadlocked on modern
+	 * MSI-X virtio plumbing (host fires the IRQ at request
+	 * completion; with no callback registered the IRQ stayed pending
+	 * and starved the CPU shortly after attach returned). */
+	struct cv                      ctrl_done_cv;
+	bool                           ctrl_done;
 
 	/* Latest GET_DISPLAY_INFO response, cached for IOC_CAPS / debug. */
 	struct virtio_gpu_resp_display_info display_info;
@@ -774,11 +787,42 @@ atrium_display_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 /* ------------------------------------------------------------------------- */
 
 /*
+ * Controlq interrupt callback. Drains every completed request from the
+ * used ring, then signals waiters on `ctrl_done_cv`. With one in-flight
+ * request at a time (enforced by `ctrl_lock`), the dequeue loop runs
+ * exactly once per host completion; the loop form is defensive against
+ * batched completions if we later allow multiple in-flight.
+ */
+static void
+atrium_vgpu_ctrl_intr(void *xsc)
+{
+	struct atrium_gpu_softc *sc = xsc;
+
+	mtx_lock(&sc->ctrl_lock);
+	while (virtqueue_dequeue(sc->ctrl_vq, NULL) != NULL)
+		;
+	sc->ctrl_done = true;
+	cv_signal(&sc->ctrl_done_cv);
+	mtx_unlock(&sc->ctrl_lock);
+}
+
+/*
  * Synchronous request/response on the controlq. The caller supplies a
  * filled-in request struct and an out-buffer for the response. We build
- * a 2-segment scatter-gather list, enqueue, kick the device, and poll
- * until the response lands. Serialised by ctrl_lock so callers don't
- * race for the single in-flight slot we use today.
+ * a 2-segment scatter-gather list, enqueue under `ctrl_lock`, kick the
+ * device, then `cv_wait` until the controlq IRQ callback dequeues our
+ * response and sets `ctrl_done`. Serialised by `ctrl_lock` so we have
+ * exactly one in-flight request at a time — that lets us use a simple
+ * one-bit completion flag without per-cookie tracking.
+ *
+ * Earlier versions called `virtqueue_poll` here under the same lock,
+ * which deadlocked on modern -CURRENT once MSI-X delivery for the
+ * controlq became reliable: the host fired the IRQ but we'd registered
+ * NULL as the per-VQ callback at attach time, so the IRQ stayed
+ * asserted and starved the CPU shortly after attach returned. The
+
+ * callback + cv_wait pair is the standard FreeBSD-virtio idiom; see
+ * the per-driver files under sys/dev/virtio/ for analogues.
  */
 static int
 atrium_vgpu_req_resp(struct atrium_gpu_softc *sc,
@@ -795,10 +839,12 @@ atrium_vgpu_req_resp(struct atrium_gpu_softc *sc,
 		return (err);
 
 	mtx_lock(&sc->ctrl_lock);
+	sc->ctrl_done = false;
 	err = virtqueue_enqueue(sc->ctrl_vq, resp, &sg, 1, 1);
 	if (err == 0) {
 		virtqueue_notify(sc->ctrl_vq);
-		virtqueue_poll(sc->ctrl_vq, NULL);
+		while (!sc->ctrl_done)
+			cv_wait(&sc->ctrl_done_cv, &sc->ctrl_lock);
 	}
 	mtx_unlock(&sc->ctrl_lock);
 	return (err);
@@ -1052,6 +1098,8 @@ atrium_virtio_gpu_attach(device_t dev)
 	mtx_init(&sc->lock, "atrium-gpu", NULL, MTX_DEF);
 	mtx_init(&sc->ctrl_lock, "atrium-gpu ctrl", NULL, MTX_DEF);
 	mtx_init(&sc->bo_lock, "atrium-gpu bos", NULL, MTX_DEF);
+	cv_init(&sc->ctrl_done_cv, "atrium-gpu ctrl done");
+	sc->ctrl_done = false;
 
 	/* virtio handshake. */
 	virtio_set_feature_desc(dev, atrium_virtio_gpu_feature_desc);
@@ -1076,7 +1124,8 @@ atrium_virtio_gpu_attach(device_t dev)
 	/* Allocate controlq. cursorq comes in step 3 with hw cursor. */
 	{
 		struct vq_alloc_info vq_info[1];
-		VQ_ALLOC_INFO_INIT(&vq_info[0], 0, NULL, sc, &sc->ctrl_vq,
+		VQ_ALLOC_INFO_INIT(&vq_info[0], 0, atrium_vgpu_ctrl_intr,
+		    sc, &sc->ctrl_vq,
 		    "%s control", device_get_nameunit(dev));
 		if ((err = virtio_alloc_virtqueues(dev, 1, vq_info)) != 0) {
 			device_printf(dev, "virtio_alloc_virtqueues: %d\n", err);
@@ -1135,6 +1184,7 @@ fail_gpu_cdev:
 	destroy_dev(sc->gpu_cdev);
 fail_lock:
 fail_locks:
+	cv_destroy(&sc->ctrl_done_cv);
 	mtx_destroy(&sc->bo_lock);
 	mtx_destroy(&sc->ctrl_lock);
 	mtx_destroy(&sc->lock);
@@ -1156,6 +1206,7 @@ atrium_virtio_gpu_detach(device_t dev)
 		TAILQ_REMOVE(&sc->bos, bo, link);
 		atrium_bo_free(bo);
 	}
+	cv_destroy(&sc->ctrl_done_cv);
 	mtx_destroy(&sc->bo_lock);
 	mtx_destroy(&sc->ctrl_lock);
 	mtx_destroy(&sc->lock);
