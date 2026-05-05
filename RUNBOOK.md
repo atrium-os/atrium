@@ -701,6 +701,28 @@ vssh "gpart recover vtbd1; gpart resize -i 3 vtbd1; growfs -y /"
 #  takes the vtbd0 slot, pushing the rootfs disk to vtbd1.)
 ```
 
+> **✅ atrium-virtio-gpu kmod attach — RESOLVED 2026-05-05 (e210165).**
+> The fix was a one-line probe-priority bump (`BUS_PROBE_DEFAULT` →
+> `BUS_PROBE_VENDOR` in `atrium_virtio_gpu_probe`). With this, atrium
+> wins the virtio-child probe race against vtgpu at boot — vtgpu's
+> attach never runs, vt(4) never gets the bad framebuffer callback
+> registered, and `/dev/atrium-display0 + /dev/atrium-gpu0` come up
+> cleanly with no runtime devctl. Required loader.conf:
+>
+>     atrium_virtio_gpu_load="YES"
+>
+> (plus the .ko in /boot/modules/.) The `hint.vtgpu.0.disabled="1"`
+> recommendation in earlier session notes is no longer needed; probe
+> priority handles it. **Use the boot-time path; never use
+> `devctl set driver -f vtgpu0 atrium_virtio_gpu` at runtime — it
+> still triggers the panic described below.**
+>
+> Verified end-to-end in QEMU+HVF: frescod-vulkan-smoke +
+> atrium-test-client renders pixel-identical to the host MoltenVK
+> build via Mesa lavapipe.
+>
+> Diagnosis history (kept for reference):
+
 > **⚠ atrium-virtio-gpu kmod attach causes a vt(4) NULL-deref panic
 > on -CURRENT (2026-05-05) — root cause confirmed via ddb.** What
 > looked like a deadlock is actually a panic-inside-panic: the
