@@ -2,7 +2,7 @@
 name = "atrium-test-client"
 version = "0.1.0"
 edition = "2021"
-description = "Minimal Fresco protocol client over Unix socket — D1 step 2(c.4) smoke"
+description = "Fresco protocol smoke clients — envelope wire (M2.7+)."
 license = "MIT OR Apache-2.0"
 publish = false
 
@@ -30,17 +30,7 @@ path = "src/text_demo.rs"
 name = "atrium-window-demo"
 path = "src/window_demo.rs"
 
-[[bin]]
-name = "atrium-keyboard"
-path = "src/keyboard.rs"
-
-[[bin]]
-name = "atrium-mouse-demo"
-path = "src/mouse_demo.rs"
-
 [dependencies]
-fresco-scene-server = { path = "../fresco-scene-server" }
-fresco-socket-rs = { path = "../fresco-socket-rs" }
-fresco-client = { path = "../fresco-client" }
+fresco-client   = { path = "../fresco-client" }
 fresco-protocol = { path = "../fresco-protocol" }
-fresco-text = { path = "../fresco-text" }
+fresco-text     = { path = "../fresco-text" }

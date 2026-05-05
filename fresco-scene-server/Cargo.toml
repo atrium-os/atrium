@@ -10,12 +10,6 @@ description = "Fresco scene-server library: IPC, scene-state authority, scene-gr
 name = "fresco_scene_server"
 path = "src/lib.rs"
 
-[features]
-default = []
-# Software rasterizer GpuBackend over tiny-skia. Used by frescod
-# during bring-up + by lavapipe-equivalent SW paths post-D2.
-tiny-skia-backend = ["dep:tiny-skia"]
-
 [dependencies]
 bytemuck = { version = "1", features = ["derive"] }
 memmap2 = "0.9"
@@ -25,10 +19,7 @@ env_logger = "0.11"
 ttf-parser = "0.25"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 libc = "0.2"
-tiny-skia = { version = "0.11", optional = true }
 
-# M2.6 envelope-based dispatcher. Will become the sole frontend after
-# the M2.7 cutover deletes the legacy 128-byte CommandFrontend.
-aqueduct       = { path = "../aqueduct" }
+aqueduct        = { path = "../aqueduct" }
 fresco-protocol = { path = "../fresco-protocol" }
 fresco-vulkan   = { path = "../fresco-vulkan" }
