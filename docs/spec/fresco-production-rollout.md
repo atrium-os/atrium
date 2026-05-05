@@ -231,8 +231,72 @@ is incremental.
 
 ---
 
+## Future evolution (post-M9)
+
+### M10 (potential) — GPU-driven scene processor
+
+frescod's per-frame loop today does CPU-side scene-state extraction
+(walk per-window state, merge nodes, hand to fresco-vulkan). A future
+evolution would push this onto the GPU as a persistent compute kernel:
+
+- Per-window scene state lives in GPU-mapped memory (HOST_VISIBLE |
+  DEVICE_LOCAL). CPU envelope-decode writes update entries directly
+  into this buffer (memcpy-equivalent; no per-frame extraction loop).
+- A persistent GPU kernel (the "scene processor") integrates updates,
+  merges across windows, generates draw calls into an indirect-command
+  buffer, and dispatches the render passes — all without per-frame
+  CPU intervention beyond the page-flip trigger.
+- CPU per-frame work shrinks to "envelope decode → write update entry".
+  Scene merging, traversal, draw generation, rendering, presentation
+  all happen GPU-side in one continuous flow.
+
+This is the in-spirit answer to "could the GPU consume aqueduct
+directly?" — the wire-format decode stays CPU-side (sequential
+work, microseconds, not worth moving), but everything *after* scene
+state lives GPU-side.
+
+Prerequisites:
+- Hardware support for efficient persistent compute (vendor-dependent;
+  AMD MES-based scheduling, Intel GuC, Apple ASC all support it; older
+  GPUs would fall back to CPU-driven path).
+- Vulkan extension surface for cooperative-scheduled persistent kernels
+  (varies; some hardware exposes it cleanly, some doesn't).
+- Recovery path when the persistent kernel wedges (needs a watchdog +
+  restart story without full device reset, ideally).
+- A scene-state representation that's GPU-friendly (bounded arrays,
+  immutable update log + atomic head pointer, no pointer chasing).
+
+This is M10-shaped, not M3-shaped. The current architecture (CPU does
+per-frame extraction, GPU does dispatch) is correct for v1; the GPU-
+driven version is a refinement once the substrate is mature and the
+performance gap of the CPU-side extraction loop is measured to matter.
+
+The Path A / Path B decision is unaffected — Path B (client-rendered
+surfaces) bypasses the scene-graph layer entirely, so the GPU-driven
+scene processor optimization applies only to Path A content.
+
+### Other future evolutions (placeholder)
+
+- **Bundle pipeline derivative caching** — if many bundles differ only
+  in one parameter, share compilation work via Vulkan pipeline
+  derivatives. Cap-flagged extension.
+- **Persistent / system-wide bundles** — bundles registered once at
+  install time, available to all clients without re-registration.
+  Adds a trust + permission story; defer until use case appears.
+- **Multi-GPU presentation** — render on discrete GPU, present on
+  integrated. PRIME-equivalent across atrium-virtio-gpu / atrium-amdgpu /
+  atrium-display cdevs. Substrate already supports it via share_fd
+  (GPU ABI v2 §6.2); needs WSI-extension work in Mesa.
+- **Cross-app GPU work-sharing for bundles** — if two apps register
+  byte-identical SPIR-V, frescod could dedupe to one compiled pipeline.
+  Adds complexity for memory savings; defer.
+
+---
+
 ## Decision log
 
 | Date | Decision |
 |---|---|
 | 2026-05-04 | Drafted; not started. Pre-production gates settled per planning conversation. |
+| 2026-05-05 | M0 → M3 + M2.7e + four migrated socket apps + initial_position landed (eb0c7e1..38e018b, multiple commits). M4 status: virtio-gpu native via atrium-virtio-gpu kmod working in QEMU after probe-priority fix (e210165). M3 lavapipe verified end-to-end (frescod-vulkan-smoke + atrium-test-client renders pixel-identical to host MoltenVK build). |
+| 2026-05-05 | Architecture extended: drm-research-findings.md + atrium-gpu-abi-v2.md + fresco-dynamic-bundles.md drafts added. Path A/B decision: Path A (scene-graph dispatch) is the default + preferred; Path B (client-rendered surfaces) added as a documented escape hatch for engines, with explicit architecture-loss caveat (no CAS dedup, no per-node deltas, no GPU traversal benefit for those clients). M10 (GPU-driven scene processor) added as potential future evolution. |
