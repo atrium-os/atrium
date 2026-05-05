@@ -92,6 +92,13 @@ pub enum Event {
 pub struct Connection {
     inner:          AqConn,
     default_window: u16,
+    /// Watermark for the sequential-id `frame()` helper: the highest
+    /// node-id emitted by the previous `FrameBuilder::finish()` call.
+    /// On the next frame, ids that were live last time but not this
+    /// time get auto-cleared. Set to 0 by `connect`/`wrap`; updated
+    /// only by `FrameBuilder::finish`. Apps that hand-allocate
+    /// node_ids (calling `scene_node_*` directly) don't touch it.
+    seq_max_id:     u32,
 }
 
 impl Connection {
@@ -101,6 +108,7 @@ impl Connection {
         Ok(Self {
             inner: AqConn::connect(path)?,
             default_window: 0,
+            seq_max_id:     0,
         })
     }
 
@@ -109,6 +117,7 @@ impl Connection {
         Ok(Self {
             inner: AqConn::wrap(s)?,
             default_window: 0,
+            seq_max_id:     0,
         })
     }
 
@@ -367,6 +376,104 @@ impl Connection {
             }
             return Ok(decode_event(m.op, &m.payload));
         }
+    }
+}
+
+// ── sequential-id frame builder ──────────────────────────────────────
+
+/// Helper for the common "emit N nodes per frame, dynamic N" pattern.
+///
+/// Most app renderers (text editors, terminals, file browsers) emit a
+/// variable number of scene nodes each frame. The server retains
+/// nodes by `node_id` across frames, so a frame that emits *fewer*
+/// nodes than its predecessor must `scene_node_clear` the no-longer-
+/// used ids to avoid stale content from the previous frame leaking
+/// through.
+///
+/// `FrameBuilder` automates this:
+///
+///   1. `Connection::frame()` issues `scene_frame_begin` and returns
+///      a builder with `next_id = 1`.
+///   2. Each `rect` / `texture` / `path` call assigns the next
+///      sequential id, calls the corresponding `scene_node_*`, and
+///      bumps the counter.
+///   3. `finish()` (or `Drop`) computes the new high-water mark, clears
+///      `(new_max+1)..=old_max` from the previous frame, sends
+///      `scene_frame_end`, and updates the connection's stored
+///      watermark.
+///
+/// Apps that need stable hand-allocated `node_id`s (e.g. the analog
+/// clock that uses ids 13/14/15 for the three hands) call
+/// `scene_node_*` directly without this helper. Mixing modes on the
+/// same connection works but isn't recommended — the watermark is
+/// shared with `scene_node_*` only via direct calls that don't
+/// touch it.
+pub struct FrameBuilder<'a> {
+    conn:    &'a mut Connection,
+    next_id: u32,
+    finished: bool,
+}
+
+impl Connection {
+    /// Open a sequentially-keyed frame. See `FrameBuilder` for the
+    /// shrink-handling semantics.
+    pub fn frame(&mut self) -> io::Result<FrameBuilder<'_>> {
+        self.scene_frame_begin()?;
+        Ok(FrameBuilder { conn: self, next_id: 1, finished: false })
+    }
+}
+
+impl<'a> FrameBuilder<'a> {
+    /// Emit a `RectParams` node and return its assigned id.
+    pub fn rect(&mut self, p: RectParams) -> io::Result<u32> {
+        let id = self.next_id;
+        self.conn.scene_node_rect(id, p)?;
+        self.next_id += 1;
+        Ok(id)
+    }
+
+    /// Emit a `TextureParams` node and return its assigned id.
+    pub fn texture(&mut self, p: TextureParams) -> io::Result<u32> {
+        let id = self.next_id;
+        self.conn.scene_node_texture(id, p)?;
+        self.next_id += 1;
+        Ok(id)
+    }
+
+    /// Emit a `PathParams` (rotated quad) node and return its id.
+    pub fn path(&mut self, p: PathParams) -> io::Result<u32> {
+        let id = self.next_id;
+        self.conn.scene_node_path(id, p)?;
+        self.next_id += 1;
+        Ok(id)
+    }
+
+    /// Send `scene_node_clear` for every id that was live in the
+    /// previous frame but not this one, then `scene_frame_end`. Always
+    /// call this — the `Drop` impl is a fallback that swallows errors.
+    pub fn finish(mut self) -> io::Result<()> {
+        self.flush()
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.finished { return Ok(()); }
+        self.finished = true;
+        let new_max = self.next_id - 1;
+        let old_max = self.conn.seq_max_id;
+        for stale in (new_max + 1)..=old_max {
+            self.conn.scene_node_clear(stale)?;
+        }
+        self.conn.seq_max_id = new_max;
+        self.conn.scene_frame_end()
+    }
+}
+
+impl<'a> Drop for FrameBuilder<'a> {
+    fn drop(&mut self) {
+        /* Best-effort flush so a panicking handler doesn't leak the
+         * scene_frame_end. Errors here are dropped — apps that care
+         * about commit failures call `finish()` explicitly. */
+        let _ = self.flush();
     }
 }
 
