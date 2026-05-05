@@ -1,10 +1,9 @@
 //! atrium-clock-socket — analog clock on the Atrium FreeBSD-native
-//! stack, demoing multi-window FBO compositing with a non-text app.
+//! stack, ported to fresco-client + the atrium-core PATH op (M3c).
 //!
-//! Renders 12 hour ticks + hour/minute/second hands + a small center
-//! hub in its own window via fresco-socket-rs. A 1 Hz `EVFILT_TIMER`
-//! drives re-render; keyboard `Esc` quits. No glyph atlas — only
-//! rotated rectangles + a center square.
+//! Renders 12 hour ticks + 3 hands + a centre hub as 16 path nodes
+//! per frame. A 1 Hz `EVFILT_TIMER` drives re-render; keyboard `Esc`
+//! quits via the EV_INPUT_KEY (M3a) event surface.
 
 mod render;
 
@@ -13,10 +12,10 @@ use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
 use std::ptr;
 
-use fresco_socket::{Connection, Event};
+use fresco_client::{Connection, Event};
+use fresco_protocol::WindowHints;
 
 const HID_ESCAPE: u16 = 0x29;
-
 const WIN_W: u32 = 480;
 const WIN_H: u32 = 480;
 
@@ -36,17 +35,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut conn = Connection::connect(&sock)?;
     eprintln!("atrium-clock-socket: connected to {sock}");
 
-    let win = conn.create_window(WIN_W, WIN_H, Some("clock"))?;
-    let _ = conn.window_set_pos(win as u16, 380.0, 80.0);
-    conn.set_default_window(win as u16);
+    let win = conn.window_create(WIN_W, WIN_H, "clock", WindowHints::default())?;
     eprintln!("atrium-clock-socket: window {win} created — {WIN_W}x{WIN_H}");
 
-    let mut renderer = render::Renderer::new(&mut conn, WIN_W, WIN_H)?;
+    let renderer = render::Renderer::new(WIN_W, WIN_H);
     let (h, m, s) = local_hms();
     renderer.render(&mut conn, h, m, s)?;
     eprintln!("atrium-clock-socket: first frame rendered ({h:02}:{m:02}:{s:02})");
 
-    // ── kqueue: socket fd (events) + 1-second timer ─────────────
+    /* kqueue: socket fd (events) + 1-second timer. */
     let kq = unsafe { libc::kqueue() };
     if kq < 0 { return Err(io::Error::last_os_error().into()); }
     let chgs = [
@@ -61,7 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ident:  1,
             filter: libc::EVFILT_TIMER,
             flags:  libc::EV_ADD | libc::EV_ENABLE,
-            fflags: 0,            // 0 = millisecond units
+            fflags: 0,            /* milliseconds */
             data:   1000,
             udata:  ptr::null_mut(), ext: [0; 4],
         },
@@ -89,12 +86,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tick = true;
                 continue;
             }
-            // Otherwise: server event from socket.
+            /* Server event from socket. */
             while let Some(input) = conn.poll_event()? {
                 match input {
-                    Event::CloseRequested { .. } => alive = false,
-                    Event::Key { hid_usage, pressed, .. } => {
-                        if pressed && hid_usage == HID_ESCAPE { alive = false; }
+                    Event::CloseRequested { window_id } if window_id == win => {
+                        alive = false;
+                    }
+                    Event::Key { hid_usage, pressed, window_id, .. }
+                        if window_id == win && pressed && hid_usage == HID_ESCAPE =>
+                    {
+                        alive = false;
                     }
                     _ => {}
                 }
