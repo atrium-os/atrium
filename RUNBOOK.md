@@ -701,21 +701,60 @@ vssh "gpart recover vtbd1; gpart resize -i 3 vtbd1; growfs -y /"
 #  takes the vtbd0 slot, pushing the rootfs disk to vtbd1.)
 ```
 
-> **⚠ atrium-virtio-gpu kmod attach is fragile on -CURRENT today
-> (2026-05-05).** The runbook recipe (kldload, `devctl set driver -f
-> vtgpu0 atrium_virtio_gpu`, `devctl enable atrium_virtio_gpu0`)
-> succeeded once on a fresh boot of the verification session, then
-> hung the kernel on every subsequent attempt — across reboots, with
-> hint.vtgpu.0.disabled and without, with kmod preloaded via
-> loader.conf and not. Same kmod binary that worked at D1-step-2(b)
-> first-light. Likely candidates: kernel ABI drift between the kmod's
-> Apr 28 build and the current -CURRENT, or pkg-installed deps adding
-> kernel state that interferes (mesa-devel pulls in libdrm + python311
-> + LLVM userspace, but no kmods directly). Diagnosing this is its own
-> session — until resolved, only the no-scanout subset of verification
-> is reachable (frescod-vulkan-smoke renders to PNG without ever
-> opening /dev/atrium-display0). Scanout-integrated runs of frescod +
-> the four migrated apps are blocked.
+> **⚠ atrium-virtio-gpu kmod attach kernel-deadlocks on -CURRENT
+> today (2026-05-05) — isolated reproduction.** Restored
+> `vm.qcow2.xz` to the Apr 30 baseline (no mesa, no growfs, no
+> loader.conf changes), boot, then the absolute minimum:
+>
+> ```sh
+> kldload /mnt/host/atrium-kmod/atrium_virtio_gpu.ko
+> devctl set driver -f vtgpu0 atrium_virtio_gpu     # exit 0, silent
+> # kernel deadlocks within ~1 second; SSH dies, only kill -9 qemu recovers
+> ```
+>
+> The `set driver -f` returns exit 0 — and `devctl enable
+> atrium_virtio_gpu0` (if you race it) reports "Device busy", proving
+> the new attach completed and `atrium_virtio_gpu0` was created. The
+> deadlock is in the `set driver -f` itself: vtgpu's implicit detach
+> + atrium_virtio_gpu's attach interact with virtio bus locks in a
+> way the kmod (last built Apr 28) wasn't safe against. Historical
+> "worked" runs were timing-lucky.
+>
+> Confirmed *not* the cause: post-Apr-30 session state, mesa-devel
+> install, growfs, loader.conf preloads, hint.vtgpu.0.disabled,
+> command-batching style. Same hang with a one-line trigger on
+> pristine baseline.
+>
+> Suspected cause: kernel ABI drift since Apr 28 — vtgpu's
+> `detach()` and/or virtio_pci's bus locks gained order constraints
+> the kmod doesn't honor. **Path forward:** rebuild the kmod in-VM
+> against current kernel headers (C builds in the guest are fine
+> per §5 quirks; only `cargo --release` is forbidden). If the rebuild
+> doesn't fix it, instrument with WITNESS / lock-order tracing and
+> follow the lock chain.
+>
+> Until resolved, scanout-integrated runs of frescod + the migrated
+> apps are blocked. The no-scanout subset (`frescod-vulkan-smoke`
+> renders to PNG without ever opening `/dev/atrium-display0`)
+> remains the actionable substitute for the rendering-pipeline
+> correctness check — once `frescod-vulkan-smoke`'s separate
+> `vkCreateInstance` issue (see below) is sorted.
+
+> **⚠ frescod-vulkan-smoke fails `vkCreateInstance` on FreeBSD/aarch64
+> with mesa-devel-24.1.7 + vulkan-loader-1.4.336 (2026-05-05).**
+> `vulkaninfo --summary` reports `llvmpipe (LLVM 19.1.7)` cleanly,
+> proving lavapipe is reachable. The same shell session running
+> `frescod-vulkan-smoke` errors with `HeadlessRenderer::new:
+> create_instance`. Likely an ICD JSON path mismatch — vulkaninfo
+> warned about
+> `/usr/local/lib/libvulkan_radeon.so` differing from the installed
+> `libvulkan_radeon-devel.so`, which suggests at least one ICD JSON
+> points at a nonexistent .so name. ash-rs's loader may be stricter
+> than vulkaninfo's. Investigating needs `find /usr/local/share -name
+> '*.json'` (the `vulkan/icd.d` path was missing in our session,
+> hinting the package layout is non-standard) and possibly
+> `VK_DRIVER_FILES=/path/to/lvp_icd.aarch64.json` to override.
+> Diagnose in a session not also fighting the kmod hang.
 
 Launch frescod + all four apps (each via its own `vssh`):
 ```sh
