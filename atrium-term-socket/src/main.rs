@@ -41,7 +41,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut conn = Connection::connect(&sock)?;
     eprintln!("atrium-term-socket: connected to {sock}");
 
-    let win = conn.window_create(WIN_W, WIN_H, "term", WindowHints::default())?;
+    let win = conn.window_create(WIN_W, WIN_H, "term", WindowHints {
+        initial_position: Some((200, 200)),
+        ..Default::default()
+    })?;
     eprintln!("atrium-term-socket: window {win} created — {WIN_W}x{WIN_H}");
 
     let cache = glyph_cache::GlyphCache::build(&mut conn, &font, FONT_SIZE_PX)?;

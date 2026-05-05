@@ -113,7 +113,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut conn = Connection::connect(&sock)?;
     eprintln!("atrium-find-socket: connected to {sock}");
 
-    let win = conn.window_create(WIN_W, WIN_H, "find", WindowHints::default())?;
+    let win = conn.window_create(WIN_W, WIN_H, "find", WindowHints {
+        initial_position: Some((100, 100)),
+        ..Default::default()
+    })?;
     eprintln!("atrium-find-socket: window {win} created — {WIN_W}x{WIN_H}");
 
     let cache = glyph_cache::GlyphCache::build(&mut conn, &font, FONT_SIZE_PX)?;

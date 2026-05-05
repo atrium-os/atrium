@@ -380,10 +380,14 @@ impl EnvelopeFrontend {
          * glyph-baking path. */
         if let Some(win) = comp.windows.get_mut(&new_id) {
             win.title = p.title;
-            /* Hints are advisory; for now we record but don't act on
-             * server_decorations / min_size / max_size / initial_position.
-             * M2.6d's compositor-side event hooks will respect them. */
-            let _ = p.hints;
+            /* `initial_position` is the only hint the server currently
+             * acts on — it lets multi-window apps spread out instead
+             * of stacking at the WM's default origin. min_size /
+             * max_size / server_decorations / modal are still advisory
+             * (no enforcement / chrome path on the M3 stack). */
+            if let Some((x, y)) = p.hints.initial_position {
+                win.pos = (x as f32, y as f32);
+            }
             let _ = p.parent_window_id;
         }
 
@@ -641,6 +645,43 @@ mod tests {
          * is the screen). */
         let new_id: u32 = decode(&out[0].payload).expect("decode reply");
         assert!(new_id > 0);
+    }
+
+    #[test]
+    fn window_create_honors_initial_position() {
+        let mut f = fixture();
+        let p = WindowCreatePayload {
+            width: 480, height: 480, title: "clock".into(),
+            hints: WindowHints {
+                initial_position: Some((380, 80)),
+                ..Default::default()
+            },
+            parent_window_id: 0,
+        };
+        let out = f.dispatch(&msg(control::OP_WINDOW_CREATE, 0, encode(&p).unwrap()), 1)
+            .expect("window create");
+        let new_id: u32 = decode(&out[0].payload).unwrap();
+
+        /* Compositor's window.pos should reflect the hint. */
+        let comp = f.compositor_arc().lock().unwrap();
+        let win = comp.windows.get(&(new_id as u16)).expect("window exists");
+        assert_eq!(win.pos, (380.0, 80.0));
+    }
+
+    #[test]
+    fn window_create_default_position_is_origin() {
+        let mut f = fixture();
+        let p = WindowCreatePayload {
+            width: 100, height: 100, title: "".into(),
+            hints: WindowHints::default(), /* no initial_position */
+            parent_window_id: 0,
+        };
+        let out = f.dispatch(&msg(control::OP_WINDOW_CREATE, 0, encode(&p).unwrap()), 1)
+            .expect("create");
+        let new_id: u32 = decode(&out[0].payload).unwrap();
+        let comp = f.compositor_arc().lock().unwrap();
+        let win = comp.windows.get(&(new_id as u16)).expect("window exists");
+        assert_eq!(win.pos, (0.0, 0.0));
     }
 
     #[test]

@@ -35,7 +35,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut conn = Connection::connect(&sock)?;
     eprintln!("atrium-clock-socket: connected to {sock}");
 
-    let win = conn.window_create(WIN_W, WIN_H, "clock", WindowHints::default())?;
+    let win = conn.window_create(WIN_W, WIN_H, "clock", WindowHints {
+        initial_position: Some((380, 80)),
+        ..Default::default()
+    })?;
     eprintln!("atrium-clock-socket: window {win} created — {WIN_W}x{WIN_H}");
 
     let renderer = render::Renderer::new(WIN_W, WIN_H);
