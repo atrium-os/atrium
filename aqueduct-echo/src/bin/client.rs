@@ -1,6 +1,6 @@
-//! atrium-rpc-echo-client — smoke-test client.
+//! aqueduct-echo-client — smoke-test client.
 //!
-//! Connects to /tmp/atrium-rpc-echo.sock. Uploads a small blob,
+//! Connects to /tmp/aqueduct-echo.sock. Uploads a small blob,
 //! sends ECHO_REQ with the blob's hash, expects:
 //!   - ECHO_RESP echoing the hash back
 //!   - ECHO_NOTIFY async event with the bytes
@@ -12,11 +12,11 @@ use std::io;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use atrium_rpc::{
+use aqueduct::{
     cas, classes, envelope::flag, Connection, MessageKind,
 };
 
-const ECHO_SOCK: &str = "/tmp/atrium-rpc-echo.sock";
+const ECHO_SOCK: &str = "/tmp/aqueduct-echo.sock";
 
 const OP_ECHO_REQ: u16    = 0x01;
 const OP_ECHO_RESP: u16   = 0x02;

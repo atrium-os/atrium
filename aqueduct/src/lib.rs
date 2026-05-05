@@ -1,6 +1,6 @@
-//! atrium-rpc — unified IPC substrate for Atrium services.
+//! aqueduct — unified IPC substrate for Atrium services.
 //!
-//! See `docs/spec/atrium-rpc.md` for the full design. In short:
+//! See `docs/spec/aqueduct.md` for the full design. In short:
 //!
 //! - One versioned envelope across every service.
 //! - Built-in CAS (content-addressed) layer so the same blob

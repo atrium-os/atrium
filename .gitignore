@@ -5,6 +5,12 @@
 # Rust analyzer caches.
 **/.rustc_info.json
 
+# SPIR-V build artifacts — every SPIR-V bundle (`bundles/*/`) ships
+# its `.glsl` / `.comp` / `.vert` / `.frag` sources; the `.spv`
+# binaries are generated locally on each dev machine via that
+# bundle's `build.sh`. See `bundles/atrium-core/build.sh`.
+**/*.spv
+
 # Kernel-module build artifacts (atrium-kmod and any future kmod).
 **/*.kld
 **/*.ko

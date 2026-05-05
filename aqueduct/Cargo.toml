@@ -1,13 +1,13 @@
 [package]
-name        = "atrium-rpc"
+name        = "aqueduct"
 version     = "0.1.0"
 edition     = "2021"
 license     = "MIT OR Apache-2.0"
-description = "Unified IPC substrate for Atrium services. Versioned opcode-tagged envelope, content-addressed payloads, async events, fd-passed shm rendezvous, capability boundary via filesystem (Portcullis-mounted UDS sockets)."
+description = "OS-agnostic IPC substrate: versioned opcode-tagged envelope, content-addressed payloads, async events, fd-passed shm rendezvous. Atrium uses it via Portcullis-mounted UDS sockets, but the substrate itself is portable across BSDs / Linux / non-POSIX hosts."
 publish     = false
 
 [lib]
-name = "atrium_rpc"
+name = "aqueduct"
 path = "src/lib.rs"
 
 [dependencies]

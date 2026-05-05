@@ -87,21 +87,21 @@ Documented in [ARCHITECTURE.md](ARCHITECTURE.md), runtime details in [RUNBOOK.md
 
 **Deliverable:** every Atrium service (Fresco today; clipboard, notify, broker, audio control plane tomorrow) speaks the same wire envelope. CAS-keyed payloads share a hash space with Tessera so the same image referenced via clipboard, notification, and editor preview is one allocation. fd-passed shm handles high-bandwidth payloads. Capability is filesystem-enforced by Portcullis (D2.5) — apps see only the service sockets their manifest declares.
 
-Spec: [`spec/atrium-rpc.md`](spec/atrium-rpc.md).
+Spec: [`spec/aqueduct.md`](spec/aqueduct.md).
 
 **Prerequisites:** D1 software thesis (Fresco running natively on FreeBSD). D1.5 Tessera (for the optional zero-copy hash-via-CAS path).
 
 **Scope:**
-1. Spec freeze. `docs/spec/atrium-rpc.md` reviewed and committed; `atrium-rpc-core/src/classes.rs` enumerates `opcode_class` constants.
-2. `atrium-rpc-core` crate scaffold. Envelope codec, `Connection` type, CAS upload/fetch state machines, async event channel, fd-pass helper.
-3. Extract reusable layers from fresco-socket-rs into atrium-rpc-core. Keep fresco-socket-rs as a thin layer over atrium-rpc-core that adds the display opcode dictionary (class 1).
+1. Spec freeze. `docs/spec/aqueduct.md` reviewed and committed; `aqueduct/src/classes.rs` enumerates `opcode_class` constants.
+2. `aqueduct` crate scaffold. Envelope codec, `Connection` type, CAS upload/fetch state machines, async event channel, fd-pass helper.
+3. Extract reusable layers from fresco-socket-rs into aqueduct. Keep fresco-socket-rs as a thin layer over aqueduct that adds the display opcode dictionary (class 1).
 4. Verify all existing demos (rect-bouncer, slot-demo, edit-socket, textured, window-demo, keyboard) work unchanged on top of the refactored stack.
-5. Document patterns for downstream services (`docs/spec/atrium-rpc-services.md`).
+5. Document patterns for downstream services (`docs/spec/aqueduct-services.md`).
 
 **Risks:**
 - Refactor of the Fresco wire-format code. Existing demos + atrium-edit-socket must keep working.
 - The "CAS hashes are advisory pointers" semantic must be enforced rigorously (verify-on-use, sender-must-serve).
-- Opcode_class allocation needs a single source of truth — both this doc and `atrium-rpc-core/src/classes.rs`.
+- Opcode_class allocation needs a single source of truth — both this doc and `aqueduct/src/classes.rs`.
 
 **Estimate:** 2–3 weeks focused.
 
@@ -157,14 +157,14 @@ Spec + Phase 1 results: [`spec/tessera-binsplit.md`](spec/tessera-binsplit.md).
 
 Spec: [`spec/portcullis.md`](spec/portcullis.md).
 
-**Prerequisites:** D1.5 (Tessera for jail trees + per-app overlays) + D1.6 (atrium-rpc — defines the per-service-socket convention that capability mounts target).
+**Prerequisites:** D1.5 (Tessera for jail trees + per-app overlays) + D1.6 (aqueduct — defines the per-service-socket convention that capability mounts target).
 
 **Scope** (6 phases, ordered by risk; see spec §10):
 
 1. **Phase 1 — schema + parser.** `portcullis-toml` crate. Validation rules per spec §3.3. CLI `portcullis validate`. ~1 wk.
-2. **Phase 2 — jail builder.** `portcullis-jail` crate: capability → jail.conf translation per spec §5. CLI `portcullis launch --no-prompt` (dev mode). Integration: launch atrium-rpc-echo-{server,client} in separate jails and verify socket mount path. ~1 wk.
+2. **Phase 2 — jail builder.** `portcullis-jail` crate: capability → jail.conf translation per spec §5. CLI `portcullis launch --no-prompt` (dev mode). Integration: launch aqueduct-echo-{server,client} in separate jails and verify socket mount path. ~1 wk.
 3. **Phase 3 — overlay + rootfs unionfs.** Tessera read-only rootfs over Tessera read-write overlay; tested with two parallel instances of the same app. ~1 wk.
-4. **Phase 4 — `portcullisd` + capability policy.** Long-running daemon. atrium-rpc service. Policy file at `/var/db/atrium/<user>/policy.toml`. Implements end-to-end lifecycle. ~1 wk.
+4. **Phase 4 — `portcullisd` + capability policy.** Long-running daemon. aqueduct service. Policy file at `/var/db/atrium/<user>/policy.toml`. Implements end-to-end lifecycle. ~1 wk.
 5. **Phase 4.5 — first-run setup phase.** App's atrium.toml `[setup]` declares an optional first-run script + transient setup-only capabilities (network etc.). On first launch (no overlay sentinel), Portcullis grants setup caps + runs the script via jail.conf `exec.created`; on success, drops setup caps and writes sentinel. Apps own all imperative bootstrap (pkg install, downloads, key generation, etc.); Portcullis stays orthogonal. Tessera CAS dedups whatever the scripts produce. ~½ wk.
 6. **Phase 5 — capability prompt UI.** Atrium-prompt service (CLI fallback for headless dev; wired into Forum once D3 lands). ~½ wk.
 
@@ -179,7 +179,7 @@ Spec: [`spec/portcullis.md`](spec/portcullis.md).
 **Integrates with:**
 - Tessera CAS-FS (single shared volume holds all jails as subtrees; dedup is per-volume, so cross-jail dedup happens automatically for any files apps' setup scripts produce — see spec §4.1)
 - `tessera-import` (app installation into managed location)
-- atrium-rpc (service sockets are the capability boundary)
+- aqueduct (service sockets are the capability boundary)
 - FreeBSD `pkg(8)` (apps may use it inside their setup script; standard FreeBSD model — Portcullis is unaware)
 - D1.7 binsplit (function-level dedup; transparent to Portcullis — apps still look like normal ELF at exec time)
 
@@ -217,7 +217,7 @@ Spec: [`spec/portcullis.md`](spec/portcullis.md).
 
 ## D4.5 — Declarative animation (server-side interpolation)
 
-**Deliverable:** the `ANIMATION_*` op family lands in `atrium-rpc-display`; the scene server runs interpolators on its own tick. Apps can be suspended without animations glitching. Closes the iOS Render Server gap noted in [`spec/fresco-rendering-stack.md`](spec/fresco-rendering-stack.md) §3.8.2.
+**Deliverable:** the `ANIMATION_*` op family lands in `fresco-protocol`; the scene server runs interpolators on its own tick. Apps can be suspended without animations glitching. Closes the iOS Render Server gap noted in [`spec/fresco-rendering-stack.md`](spec/fresco-rendering-stack.md) §3.8.2.
 
 **Prerequisites:** D1 (scene server on bare metal).
 

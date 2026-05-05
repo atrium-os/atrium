@@ -1,18 +1,18 @@
 [package]
-name        = "atrium-rpc-echo"
+name        = "aqueduct-echo"
 version     = "0.1.0"
 edition     = "2021"
 license     = "MIT OR Apache-2.0"
-description = "Smoke-test server + client for atrium-rpc — exercises the envelope, CAS upload, and event channel end-to-end."
+description = "Smoke-test server + client for aqueduct — exercises the envelope, CAS upload, and event channel end-to-end."
 publish     = false
 
 [[bin]]
-name = "atrium-rpc-echo-server"
+name = "aqueduct-echo-server"
 path = "src/bin/server.rs"
 
 [[bin]]
-name = "atrium-rpc-echo-client"
+name = "aqueduct-echo-client"
 path = "src/bin/client.rs"
 
 [dependencies]
-atrium-rpc = { path = "../atrium-rpc" }
+aqueduct = { path = "../aqueduct" }

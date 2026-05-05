@@ -3,7 +3,7 @@
 version = 4
 
 [[package]]
-name = "atrium-rpc"
+name = "aqueduct"
 version = "0.1.0"
 dependencies = [
  "libc",
@@ -11,10 +11,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "atrium-rpc-echo"
+name = "aqueduct-echo"
 version = "0.1.0"
 dependencies = [
- "atrium-rpc",
+ "aqueduct",
 ]
 
 [[package]]

@@ -1,8 +1,8 @@
 //! Opcode-class registry — single source of truth.
 //!
-//! Each Atrium service that talks atrium-rpc owns one `opcode_class`
+//! Each Atrium service that talks aqueduct owns one `opcode_class`
 //! byte (top-level dictionary selector). Add new services by editing
-//! this file and `docs/spec/atrium-rpc.md` together.
+//! this file and `docs/spec/aqueduct.md` together.
 //!
 //! Classes 0..63 are reserved for Atrium core. 64..255 are vendor /
 //! experimental.
@@ -11,10 +11,12 @@
 /// implements these — they're the substrate.
 pub const CLASS_CORE:      u8 = 0;
 
-/// Fresco / display protocol. NOTE: Fresco currently uses its
-/// 128-byte fixed `Command`/`Completion` frames, NOT this envelope.
-/// The class number is reserved here for the eventual migration
-/// (D1.7+).
+/// Fresco / display protocol. Op dictionary published by
+/// `fresco-protocol` (control + scene + window-management op
+/// families). The legacy 128-byte fixed-frame format from D0–D1
+/// fresco-socket-rs is being replaced by this envelope as a hard
+/// cutover at M2 of the production rollout — see
+/// `docs/spec/fresco-production-rollout.md`.
 pub const CLASS_DISPLAY:   u8 = 1;
 
 /// Clipboard service.
@@ -31,7 +33,7 @@ pub const CLASS_BROKER:    u8 = 4;
 pub const CLASS_AUDIO:     u8 = 5;
 
 /// Smoke-test / fuzzing service. Not part of the production
-/// surface; used by atrium-rpc-echo and unit tests.
+/// surface; used by aqueduct-echo and unit tests.
 pub const CLASS_ECHO:      u8 = 63;
 
 /// First vendor / experimental class. Anything 64..=255 is outside

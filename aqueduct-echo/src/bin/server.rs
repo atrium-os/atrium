@@ -1,6 +1,6 @@
-//! atrium-rpc-echo-server — smoke-test server.
+//! aqueduct-echo-server — smoke-test server.
 //!
-//! Listens on `/tmp/atrium-rpc-echo.sock`. For each connection,
+//! Listens on `/tmp/aqueduct-echo.sock`. For each connection,
 //! handles a tiny opcode dictionary under CLASS_ECHO:
 //!
 //!   op 0x01 ECHO_REQ:
@@ -21,11 +21,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 
-use atrium_rpc::{
+use aqueduct::{
     cas, classes, envelope::flag, Connection, MessageKind,
 };
 
-const ECHO_SOCK: &str = "/tmp/atrium-rpc-echo.sock";
+const ECHO_SOCK: &str = "/tmp/aqueduct-echo.sock";
 
 const OP_ECHO_REQ: u16    = 0x01;
 const OP_ECHO_RESP: u16   = 0x02;
@@ -36,7 +36,7 @@ fn main() -> io::Result<()> {
     /* Cleanup stale socket if previous run was killed. */
     let _ = std::fs::remove_file(ECHO_SOCK);
     let listener = UnixListener::bind(ECHO_SOCK)?;
-    eprintln!("atrium-rpc-echo-server: listening on {ECHO_SOCK}");
+    eprintln!("aqueduct-echo-server: listening on {ECHO_SOCK}");
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop_clone = stop.clone();

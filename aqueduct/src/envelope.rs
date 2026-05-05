@@ -1,6 +1,6 @@
 //! Wire envelope codec.
 //!
-//! Every atrium-rpc message rides in a 10-byte fixed header followed
+//! Every aqueduct message rides in a 10-byte fixed header followed
 //! by `length` payload bytes. Header layout (little-endian for u16/u32):
 //!
 //! ```text

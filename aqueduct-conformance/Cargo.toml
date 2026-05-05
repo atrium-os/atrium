@@ -1,0 +1,15 @@
+[package]
+name        = "aqueduct-conformance"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "Wire-format conformance tests for aqueduct + fresco-protocol. Pins envelope + payload bytes bit-for-bit so refactors can't silently change the wire."
+
+[lib]
+name = "aqueduct_conformance"
+path = "src/lib.rs"
+
+[dependencies]
+aqueduct         = { path = "../aqueduct" }
+fresco-protocol = { path = "../fresco-protocol" }

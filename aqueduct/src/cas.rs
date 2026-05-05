@@ -1,6 +1,6 @@
 //! CAS layer (opcode_class = CLASS_CORE).
 //!
-//! Built-in opcodes that every atrium-rpc speaker implements. Hashes
+//! Built-in opcodes that every aqueduct speaker implements. Hashes
 //! are SHA-256 (32 bytes), matching Tessera so the same hash means
 //! the same content across the storage layer and the IPC fabric.
 //!
