@@ -136,8 +136,12 @@ struct atrium_gpu_softc {
 	struct cv                      ctrl_done_cv;
 	bool                           ctrl_done;
 
-	/* Latest GET_DISPLAY_INFO response, cached for IOC_CAPS / debug. */
+	/* Latest GET_DISPLAY_INFO response, cached for IOC_CAPS / debug.
+	 * `display_info_valid` is set on first successful fetch; the
+	 * fetch is lazy (deferred out of attach) because attach context
+	 * on -CURRENT can't sleep — see atrium_vgpu_ensure_display_info. */
 	struct virtio_gpu_resp_display_info display_info;
+	bool                                display_info_valid;
 
 	/* Monotonic fence-id source for virtio-gpu protocol fences. */
 	uint64_t                       next_fence;
@@ -179,6 +183,7 @@ static int atrium_vgpu_transfer_to_host_2d(struct atrium_gpu_softc *,
     uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint64_t);
 static int atrium_vgpu_resource_flush(struct atrium_gpu_softc *,
     uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+static int atrium_vgpu_ensure_display_info(struct atrium_gpu_softc *);
 
 struct atrium_display_file {
 	struct atrium_gpu_softc *sc;
@@ -629,6 +634,9 @@ atrium_display_enum_connectors(struct atrium_gpu_softc *sc,
 	uint32_t out = 0, i;
 	int err;
 
+	if ((err = atrium_vgpu_ensure_display_info(sc)) != 0)
+		return (err);
+
 	for (i = 0; i < sc->gpucfg.num_scanouts &&
 	    i < VIRTIO_GPU_MAX_SCANOUTS; i++) {
 		if (sc->display_info.pmodes[i].enabled == 0)
@@ -660,6 +668,9 @@ atrium_display_modes(struct atrium_gpu_softc *sc,
 	uint32_t i = args->connector_id;
 	int err;
 
+	if ((err = atrium_vgpu_ensure_display_info(sc)) != 0)
+		return (err);
+
 	if (i >= sc->gpucfg.num_scanouts || i >= VIRTIO_GPU_MAX_SCANOUTS ||
 	    sc->display_info.pmodes[i].enabled == 0)
 		return (ENOENT);
@@ -687,6 +698,9 @@ atrium_display_set_mode(struct atrium_gpu_softc *sc,
 	struct atrium_gpu_bo *bo;
 	uint32_t w, h, rid;
 	int err;
+
+	if ((err = atrium_vgpu_ensure_display_info(sc)) != 0)
+		return (err);
 
 	if (args->connector_id >= sc->gpucfg.num_scanouts)
 		return (ENOENT);
@@ -881,7 +895,30 @@ atrium_vgpu_get_display_info(struct atrium_gpu_softc *sc)
 		    le32toh(s.resp.pmodes[i].r.width),
 		    le32toh(s.resp.pmodes[i].r.height));
 	}
+	sc->display_info_valid = true;
 	return (0);
+}
+
+/*
+ * Fetch display info if we haven't yet. Called from IOCTL handlers
+ * (enum_connectors, modes, set_mode) on first use after attach. The
+ * direct fetch in attach() was removed — on modern -CURRENT, the
+ * newbus topology lock held during attach is non-sleepable, and the
+ * `cv_wait` inside `atrium_vgpu_req_resp` would hit a lock-order
+ * violation that manifests as a kernel deadlock right after attach
+ * returns. Deferring to first IOCTL guarantees we're in a normal
+ * thread context with no exceptional locks held. Stock vtgpu uses a
+ * similar deferred pattern.
+ */
+static int
+atrium_vgpu_ensure_display_info(struct atrium_gpu_softc *sc)
+{
+	int err;
+
+	if (sc->display_info_valid)
+		return (0);
+	err = atrium_vgpu_get_display_info(sc);
+	return (err);
 }
 
 /*
@@ -1138,10 +1175,11 @@ atrium_virtio_gpu_attach(device_t dev)
 		goto fail_locks;
 	}
 
-	if ((err = atrium_vgpu_get_display_info(sc)) != 0) {
-		device_printf(dev, "GET_DISPLAY_INFO failed: %d\n", err);
-		goto fail_locks;
-	}
+	/* GET_DISPLAY_INFO is deferred to first IOCTL via
+	 * atrium_vgpu_ensure_display_info — see that helper for the
+	 * lock-order rationale. attach context can't sleep on this
+	 * kernel, but the cdev IOCTL path runs in normal thread
+	 * context where cv_wait inside req_resp is safe. */
 
 	atrium_fill_caps(sc);
 

@@ -701,10 +701,64 @@ vssh "gpart recover vtbd1; gpart resize -i 3 vtbd1; growfs -y /"
 #  takes the vtbd0 slot, pushing the rootfs disk to vtbd1.)
 ```
 
-> **⚠ atrium-virtio-gpu kmod attach kernel-deadlocks on -CURRENT
-> today (2026-05-05) — isolated reproduction.** Restored
-> `vm.qcow2.xz` to the Apr 30 baseline (no mesa, no growfs, no
-> loader.conf changes), boot, then the absolute minimum:
+> **⚠ atrium-virtio-gpu kmod attach causes a vt(4) NULL-deref panic
+> on -CURRENT (2026-05-05) — root cause confirmed via ddb.** What
+> looked like a deadlock is actually a panic-inside-panic: the
+> first panic is in `vt_timer → vt_flush → vtgpu_fb_bitblt_text →
+> vt_fb_bitblt_bitmap` with `panic: Offset 0x000002 out of fb size`,
+> the second is `vtterm_cngrab` faulting on `0x1` while trying to
+> grab the console for the panic message — which keeps the kernel
+> alive in a half-dead state long enough that ssh times out instead
+> of cleanly rebooting on panic. ddb capture from `~/src/bsd/scripts/
+> ddb_session.py break` shows the trace cleanly.
+>
+> Mechanism: when `atrium_virtio_gpu` is attached to virtio_pci3 via
+> `devctl set driver -f vtgpu0 atrium_virtio_gpu`, vtgpu's softc is
+> torn down via its detach path. vt(4) holds a stale callback
+> pointer to `vtgpu_fb_bitblt_text` (vtgpu registered as vt's
+> framebuffer backend at attach time and doesn't deregister on
+> detach). The next periodic `vt_timer` tick (~1s later) calls into
+> the freed bitblt state and panics on `info->fb_size == 0`.
+>
+> The earlier in-source patches (cv_wait + lazy GET_DISPLAY_INFO)
+> didn't and couldn't fix this — the panic is in vt's stale
+> callback, not in atrium_virtio_gpu's code at all. Those patches
+> are still architecturally correct (the controlq path was a
+> bring-up shortcut and should be cleaned up) but they're not the
+> fix for this hang.
+>
+> **The proper fix is to never go through vtgpu's detach** — i.e.
+> have atrium_virtio_gpu claim virtio_pci3 *before* vtgpu's identify
+> creates the placeholder vtgpu0 child. Steps tried that DON'T
+> work:
+>
+> - `hint.vtgpu.0.disabled="1"` in loader.conf: vtgpu's identify
+>   still creates the *named* `vtgpu0` placeholder even when its
+>   attach is disabled by the hint. virtio_pci3 sees a named child
+>   and never offers the slot to other drivers.
+> - `atrium_virtio_gpu_load="YES"` preload: the kmod is loaded
+>   early but VIRTIO_DRIVER_MODULE registration alone doesn't make
+>   it claim a slot already occupied by a named child of a
+>   different name.
+> - `devctl delete -f vtgpu0` post-boot: removes the placeholder,
+>   but `devctl rescan virtio_pci3` reports "Operation not
+>   supported by device" — the virtio bus doesn't implement the
+>   rescan ivar — so no re-probing happens.
+>
+> The proper fix is to **add an `identify` routine to
+> `atrium_virtio_gpu`** that creates an `"atrium_virtio_gpu"`-named
+> child of virtio_pci3 at boot, with a `DEVICE_PASS` that runs
+> before vtgpu's identify. Then atrium_virtio_gpu owns the slot
+> from the start; vtgpu never attaches; vt never gets the bad
+> callback registered. Estimated patch: ~30 lines (DEVICE_IDENTIFY
+> method + a class identify routine). Reference: `sys/dev/virtio/
+> *.c` for identify-based virtio attach patterns.
+>
+> Until that patch lands, full-stack scanout verification is
+> blocked. ddb traces below for reference.
+
+> **⚠ atrium-virtio-gpu kmod attach hang signature (pre-ddb
+> diagnosis above).**
 >
 > ```sh
 > kldload /mnt/host/atrium-kmod/atrium_virtio_gpu.ko
