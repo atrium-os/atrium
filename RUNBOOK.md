@@ -611,63 +611,176 @@ vssh "kldload hidraw && sysrc kld_list+=hidraw"
 
 `atrium-term-socket` (new crate at `~/src/bsd/atrium-term-socket/`) ports atrium-term to fresco-socket-rs. `grid.rs` / `keymap.rs` / `pty.rs` copied unchanged from atrium-term (already protocol-agnostic). New `glyph_cache.rs` mirrors the editor's atlas mode. `main.rs` uses `kqueue` to multiplex the pty master fd and `Connection::as_raw_fd()` so a single `kevent()` wakes on either pty output or a server event.
 
-### Verification (multi-window: editor + terminal side by side)
+### Verification (M3 stack — Vulkan + envelope wire)
 
-Cross-compile everything (host, ~3 s):
+After the M2.7 / M3 cutover, frescod renders via Vulkan
+(`HeadlessRenderer` + SPIR-V bundle dispatch) instead of tiny-skia.
+Apps speak the envelope-based wire (CLASS_DISPLAY) via `fresco-client`
+instead of fresco-socket-rs's 128-byte `Command` / `Completion` shape.
+Verification therefore needs three new things on the guest:
+
+  1. **A Vulkan ICD** — Mesa lavapipe is the SW path. virtio-gpu
+     doesn't expose Vulkan from QEMU's stock virgl, so lavapipe
+     (Mesa's CPU rasterizer) is what makes `vkCreateInstance` succeed
+     in the guest.
+  2. **The atrium-core SPIR-V bundle** — frescod loads
+     `bundles/atrium-core/{compute,pipelines}/*.spv` at startup. The
+     `.spv` files are gitignored; build them once on the host.
+  3. **A bundle path the in-VM frescod can find** — default search
+     looks at `<frescod manifest dir>/../bundles/atrium-core` and
+     `/usr/local/share/atrium/bundles/atrium-core`. Cross-compiled
+     frescod runs from `/mnt/host/frescod/target/.../frescod`, so the
+     workspace-relative search lands at `/mnt/host/bundles/atrium-core`
+     — which works as long as `build.sh` was run on the host (the
+     `.spv` files end up under `~/src/bsd/bundles/atrium-core/` and
+     are visible to the guest via the 9p share).
+
+Cross-compile everything on the host (~3 s for incremental, longer
+on a clean tree):
 ```sh
-cd ~/src/bsd/frescod && cargo build --release --target aarch64-unknown-freebsd
-cd ~/src/bsd/atrium-edit-socket && cargo build --release --target aarch64-unknown-freebsd
-cd ~/src/bsd/atrium-term-socket && cargo build --release --target aarch64-unknown-freebsd
+# Build the SPIR-V bundle once. Requires `glslang` on the host
+# (`brew install glslang`).
+~/src/bsd/bundles/atrium-core/build.sh
+
+# All four shipping apps + frescod.
+for c in frescod atrium-clock-socket atrium-edit-socket \
+         atrium-term-socket atrium-find-socket; do
+    cd ~/src/bsd/$c && cargo build --release --target aarch64-unknown-freebsd
+done
 ```
 
-Boot + setup (one terminal):
+Boot the VM with the QEMU window so virtio-gpu scanout is visible:
 ```sh
 ~/src/bsd/scripts/run-vm.sh --virtio-gpu --display
 ```
 
-In the VM (via `vssh`):
+Guest-side setup (one-time per fresh VM, persisted via `sysrc`):
 ```sh
-# Mount the host share + load the kmod (same as previous steps)
+# 9p share + Atrium GPU kmod (D0 work — already covered above)
 vssh "kldload p9fs; mount -t p9fs -o trans=virtio bsd_share /mnt/host"
 vssh "kldload /mnt/host/atrium-kmod/atrium_virtio_gpu.ko"
 vssh "devctl set driver -f vtgpu0 atrium_virtio_gpu" || true
 vssh "devctl enable atrium_virtio_gpu0"
 
-# First-time only — load hidraw + persist it across boots. Hidraw
-# attaches in parallel to hkbd(4) and hms(4) via hidbus, giving the
-# compositor raw HID access without disturbing the dedicated drivers.
+# Hidraw — keyboard + mouse access for frescod's input readers.
 vssh "kldload hidraw && sysrc kld_list+=hidraw"
-vssh "ls /dev/hidraw*"   # expect /dev/hidraw0 (kbd) and /dev/hidraw1 (mouse)
+vssh "ls /dev/hidraw*"   # expect /dev/hidraw0 (kbd) /dev/hidraw1 (mouse)
+
+# Mesa with lavapipe (Vulkan ICD). Package name on FreeBSD-CURRENT
+# is TBD — probable candidates:
+#     pkg install mesa-libs    # (guess: contains libvulkan + lavapipe ICD)
+#     pkg install vulkan-loader vulkan-tools   # if separate
+# Verify with `vulkaninfo` once installed; the line
+#     deviceName = llvmpipe (LLVM ...)
+# confirms lavapipe is selected.
+vssh "pkg install -y mesa-libs vulkan-loader vulkan-tools"
+vssh "vulkaninfo --summary | head -20"
 ```
 
-Launch the compositor + two clients (each via its own `vssh`):
+> **Open: confirm exact pkg name.** This step is unverified from the
+> macOS host. The first session with VM access should pin down the
+> right `pkg install` line and update this block.
+
+Launch frescod + all four apps (each via its own `vssh`):
 ```sh
-vssh "nohup /mnt/host/frescod/target/aarch64-unknown-freebsd/release/frescod > /tmp/comp.log 2>&1 < /dev/null &"
+# frescod itself. The default bundle search succeeds at
+# /mnt/host/bundles/atrium-core — set FRESCOD_BUNDLE to override.
+vssh "nohup /mnt/host/frescod/target/aarch64-unknown-freebsd/release/frescod \
+        > /tmp/comp.log 2>&1 < /dev/null &"
 sleep 1
-vssh "nohup /mnt/host/atrium-edit-socket/target/aarch64-unknown-freebsd/release/atrium-edit-socket /mnt/host/test-assets/scratch.txt > /tmp/edit.log 2>&1 < /dev/null &"
-vssh "nohup /mnt/host/atrium-term-socket/target/aarch64-unknown-freebsd/release/atrium-term-socket > /tmp/term.log 2>&1 < /dev/null &"
+
+vssh "nohup /mnt/host/atrium-edit-socket/target/aarch64-unknown-freebsd/release/atrium-edit-socket \
+        /mnt/host/test-assets/scratch.txt > /tmp/edit.log 2>&1 < /dev/null &"
+
+vssh "nohup /mnt/host/atrium-term-socket/target/aarch64-unknown-freebsd/release/atrium-term-socket \
+        > /tmp/term.log 2>&1 < /dev/null &"
+
+vssh "nohup /mnt/host/atrium-clock-socket/target/aarch64-unknown-freebsd/release/atrium-clock-socket \
+        > /tmp/clock.log 2>&1 < /dev/null &"
+
+vssh "nohup /mnt/host/atrium-find-socket/target/aarch64-unknown-freebsd/release/atrium-find-socket \
+        / > /tmp/find.log 2>&1 < /dev/null &"
 ```
+
+Expected log output:
+
+`/tmp/comp.log`:
+```
+frescod: connector N 1280x800 @ 60000 mHz, target 30 fps
+frescod: atrium-core bundle loaded (3 ops)
+frescod: listening on /tmp/frescod.sock
+frescod: keyboard reading /dev/hidraw0
+frescod: mouse reading /dev/hidraw1
+```
+The "(3 ops)" count covers rect + texture + path. If it says "(0 ops)"
+then `bundle_path` failed — set `FRESCOD_BUNDLE=/mnt/host/bundles/atrium-core`
+explicitly.
+
+`/tmp/edit.log` (and similarly term/find):
+```
+buffer: N lines (path=Some("/mnt/host/test-assets/scratch.txt"))
+connected to /tmp/frescod.sock
+window 1 created — 720x540
+glyph cache: 94 glyphs, line_height=20.0 baseline=14.5 cell_w=10.0
+rendered initial view; now waiting for events
+```
+Note: the previous "glyph atlas: 512x512 px, 94 glyphs uploaded as
+1 CAS texture" line is gone — M3d switched to per-glyph slots
+(94 small CAS textures, 1 slot each).
 
 Verification points (visual, in the QEMU window):
-- **Cursor**: a small black-on-white arrow tracks pointer movement across the screen. (uhid → cursor overlay)
-- **Both windows visible**: editor showing scratch.txt, terminal showing a `$` prompt.
-- **Click-to-focus**: click on either window's content area; that window comes to the top of the z-order, the other one's cursor block (if the focused-cursor blink is enabled) goes dim.
-- **Per-window keyboard**: type — characters appear only in the focused window. Click the other window, type — characters appear there now, never in both.
-- **Drag**: press-and-hold on a window's titlebar, drag — window follows cursor 1:1.
-- **Resize**: press-and-hold near a window's edge (any of L/R/T/B), drag — window resizes; on release the editor receives `COMP_WINDOW_RESIZED` (logged) and the terminal's grid + pty re-layout to the new cell count via `SIGWINCH`.
-- **Close**: click the close button on a window's titlebar; the app exits cleanly (the editor's `atrium-edit-socket` quits, the terminal's `atrium-term-socket` shuts down its pty + exits).
-- **Atlas check** in `tail -f /tmp/edit.log`:
-  ```
-  glyph atlas: 512x512 px, 94 glyphs uploaded as 1 CAS texture
-  ```
-  (vs. the previous 94 individual `upload_texture` calls)
+- **Magenta scenes render at all** — confirms the Vulkan path through
+  lavapipe works end-to-end. If you see the Atrium teal background
+  but no client content, frescod is alive but Vulkan rendering is
+  failing silently; check `MESA_LOADER_DEBUG=1 vulkaninfo` for ICD
+  resolution.
+- **Atrium teal background** — the same `[0.04, 0.50, 0.55, 1.0]`
+  clear color seen in host smoke renders.
+- **Editor**: text renders at top-left `(16, 16)` per `scratch.txt`'s
+  contents. Cursor block (yellow) at column 0 row 0 initially.
+- **Terminal**: `$ ` prompt visible; cursor block half-alpha amber
+  under the cursor cell.
+- **Clock**: 12 white tick marks, three hands (white hour/minute,
+  red second), red centre hub. The second hand sweeps once per
+  second (1 Hz EVFILT_TIMER drives re-render).
+- **Find**: cwd path at top, file list with `> selected/` marker on
+  one row + indigo selection bar, preview pane on the right, footer
+  showing `[name] N entries`.
+- **Per-window keyboard routing** — type into the QEMU window. The
+  keystroke routes to the M3 input_reader's "topmost window if focus
+  is screen" fallback, so the most-recently-created window receives
+  it. Closing apps in reverse order changes which one gets keys.
 
-`/tmp/comp.log` should show:
-```
-pointer: reading /dev/hidraw1
-kbd: reading /dev/hidraw0
-```
-not `no /dev/hidraw*` or `KDSKBMODE(K_RAW) failed`.
+#### M3 known limitations vs the legacy stack
+
+The new frescod is intentionally minimal at this milestone. The
+following legacy capabilities are **not yet rewired** on the
+HeadlessRenderer + EnvelopeFrontend path:
+
+- **Server-drawn window chrome** (titlebars, close button, drag-to-
+  move, edge resize). The `Compositor::init_decorations` /
+  `compose_overlay` machinery still exists but isn't called by the
+  new render loop — it expects the legacy SceneGraph + tiny-skia
+  path. Apps appear as their content rect with no decoration.
+- **Click-to-focus / click-to-raise.** `pointer_reader` emits
+  `EV_INPUT_POINTER_BUTTON` envelopes but doesn't do WM intercepts
+  (click → raise → focus-change). Focus moves only via the
+  "topmost window when no explicit focus" fallback in `input_reader`.
+- **Resize** — pointer button drag near edges doesn't run any WM
+  resize logic; windows stay at their `WINDOW_CREATE`-requested
+  dimensions. `EV_WINDOW_RESIZED` events therefore never fire.
+- **Server cursor sprite.** Pointer position is tracked
+  (`Compositor::cursor`) and fans out as `EV_INPUT_POINTER_MOTION`,
+  but no cursor overlay is drawn. The QEMU window's host cursor is
+  what you see.
+- **WINDOW_SET_POS.** Demos that previously called `window_set_pos`
+  to stagger initial layout don't have the equivalent in fresco-
+  client; everything stacks at the WM's default origin (currently
+  `(0, 0)` for every new window).
+
+These are the next concrete follow-ups on the M3-final → "Fresco is
+real" path. None of them block the rendering-correctness verification
+above.
 
 ---
 
