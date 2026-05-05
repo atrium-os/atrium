@@ -773,13 +773,10 @@ HeadlessRenderer + EnvelopeFrontend path:
   (`Compositor::cursor`) and fans out as `EV_INPUT_POINTER_MOTION`,
   but no cursor overlay is drawn. The QEMU window's host cursor is
   what you see.
-- **WINDOW_SET_POS.** Demos that previously called `window_set_pos`
-  to stagger initial layout don't have the equivalent in fresco-
-  client; everything stacks at the WM's default origin (currently
-  `(0, 0)` for every new window).
-
 These are the next concrete follow-ups on the M3-final → "Fresco is
-real" path. None of them block the rendering-correctness verification
+real" path. (`WindowHints.initial_position` is honored at WINDOW_CREATE
+as of `7eb833b` — the four migrated apps spread out instead of
+stacking at the origin.) None of them block the rendering-correctness verification
 above.
 
 ---
