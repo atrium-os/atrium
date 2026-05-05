@@ -666,20 +666,56 @@ vssh "devctl enable atrium_virtio_gpu0"
 vssh "kldload hidraw && sysrc kld_list+=hidraw"
 vssh "ls /dev/hidraw*"   # expect /dev/hidraw0 (kbd) /dev/hidraw1 (mouse)
 
-# Mesa with lavapipe (Vulkan ICD). Package name on FreeBSD-CURRENT
-# is TBD — probable candidates:
-#     pkg install mesa-libs    # (guess: contains libvulkan + lavapipe ICD)
-#     pkg install vulkan-loader vulkan-tools   # if separate
-# Verify with `vulkaninfo` once installed; the line
-#     deviceName = llvmpipe (LLVM ...)
+# Mesa with lavapipe (Vulkan ICD). Confirmed working pkg names on
+# FreeBSD-CURRENT 16.0-CURRENT main-n285005-e9fc0c538264:
+#
+#     pkg install -y mesa-devel vulkan-loader vulkan-tools
+#
+# `mesa-libs` is OpenGL-only — the Vulkan drivers (lavapipe + others)
+# ship in `mesa-devel` (despite the name; it's the rolling-Mesa port).
+# Sanity check with `vulkaninfo --summary`; the line
+#     deviceName = llvmpipe (LLVM 19.1.7, 128 bits)
 # confirms lavapipe is selected.
-vssh "pkg install -y mesa-libs vulkan-loader vulkan-tools"
-vssh "vulkaninfo --summary | head -20"
+#
+# Heads-up: on -CURRENT the FreeBSD-base repo's metadata may be tagged
+# for an OS version pkg considers "wrong", causing `pkg update` to
+# error out. Workaround:
+#     echo 'FreeBSD-base: { enabled: no }' > /usr/local/etc/pkg/repos/FreeBSD.conf
+# (FreeBSD-ports + FreeBSD-ports-kmods still update normally and
+# carry mesa-devel + vulkan-*.)
+vssh "echo 'FreeBSD-base: { enabled: no }' > /usr/local/etc/pkg/repos/FreeBSD.conf
+      pkg install -y mesa-devel vulkan-loader vulkan-tools
+      vulkaninfo --summary | head -20"
 ```
 
-> **Open: confirm exact pkg name.** This step is unverified from the
-> macOS host. The first session with VM access should pin down the
-> right `pkg install` line and update this block.
+The pristine vm.qcow2 ships with a 5 GB rootfs; mesa-devel + 25 deps
+add ~270 MB of extracted files plus another ~50 MB of pkg cache,
+which doesn't fit. Grow the disk first (one-shot, persists):
+```sh
+vssh "shutdown -p now"
+qemu-img resize ~/src/bsd/vm/vm.qcow2 +20G
+~/src/bsd/scripts/run-vm.sh --virtio-gpu --display &
+until vssh true 2>/dev/null; do sleep 5; done
+vssh "gpart recover vtbd1; gpart resize -i 3 vtbd1; growfs -y /"
+# (Note: vtbd1, not vtbd0. The crash-test.img drive in run-vm.sh
+#  takes the vtbd0 slot, pushing the rootfs disk to vtbd1.)
+```
+
+> **⚠ atrium-virtio-gpu kmod attach is fragile on -CURRENT today
+> (2026-05-05).** The runbook recipe (kldload, `devctl set driver -f
+> vtgpu0 atrium_virtio_gpu`, `devctl enable atrium_virtio_gpu0`)
+> succeeded once on a fresh boot of the verification session, then
+> hung the kernel on every subsequent attempt — across reboots, with
+> hint.vtgpu.0.disabled and without, with kmod preloaded via
+> loader.conf and not. Same kmod binary that worked at D1-step-2(b)
+> first-light. Likely candidates: kernel ABI drift between the kmod's
+> Apr 28 build and the current -CURRENT, or pkg-installed deps adding
+> kernel state that interferes (mesa-devel pulls in libdrm + python311
+> + LLVM userspace, but no kmods directly). Diagnosing this is its own
+> session — until resolved, only the no-scanout subset of verification
+> is reachable (frescod-vulkan-smoke renders to PNG without ever
+> opening /dev/atrium-display0). Scanout-integrated runs of frescod +
+> the four migrated apps are blocked.
 
 Launch frescod + all four apps (each via its own `vssh`):
 ```sh
