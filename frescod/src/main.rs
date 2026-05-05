@@ -24,6 +24,7 @@
 //! single-window apps render correctly.
 
 mod input_reader;
+mod pointer_reader;
 mod socket_server;
 
 use atrium_gpu::abi::*;
@@ -103,11 +104,12 @@ fn main() -> std::io::Result<()> {
     )?;
     socket_server::spawn_event_fanout(ev_rx, event_subs);
 
-    /* Native FreeBSD keyboard input. Reads /dev/hidraw* directly,
-     * routes HID Usage Page 0x07 codes by focus, pushes
-     * DisplayEvent::InputKey through the same event sink. Fails soft —
-     * frescod runs without keyboard if no /dev/hidraw* matches. */
-    input_reader::spawn(ev_tx, comp.clone());
+    /* Native FreeBSD keyboard + pointer input. Both read /dev/hidraw*
+     * directly (boot-protocol HID), update server cursor / focus state,
+     * and push DisplayEvents through the shared event sink. Fail-soft:
+     * frescod runs without input if no matching /dev/hidraw* is found. */
+    input_reader::spawn(ev_tx.clone(), comp.clone());
+    pointer_reader::spawn(ev_tx, comp.clone(), mode.width, mode.height);
 
     /* ── Frame loop ─────────────────────────────────────────────── */
     let mut frame: u64 = 0;
