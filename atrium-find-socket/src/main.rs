@@ -1,7 +1,7 @@
 //! atrium-find-socket — two-pane file browser on the Atrium FreeBSD-
-//! native stack via fresco-socket-rs. Up/Down navigate, Enter
-//! descends into directories, Backspace/Left goes up to parent,
-//! Esc/Ctrl+Q quits. Vi-style hjkl also work.
+//! native stack, ported to fresco-client (M3d). Up/Down navigate,
+//! Enter descends, Backspace/Left goes to parent, Esc/Ctrl+Q quits.
+//! Vi-style hjkl also work via the keymap.
 
 mod dir;
 mod glyph_cache;
@@ -11,10 +11,11 @@ mod render;
 use std::io;
 use std::path::PathBuf;
 
-use fresco_socket::{Connection, Event};
+use fresco_client::{Connection, Event};
+use fresco_protocol::WindowHints;
 
-const FONT_PATH:    &str = "/mnt/host/test-assets/DejaVuSansMono.ttf";
-const FONT_SIZE_PX: f32  = 18.0;
+const FONT_PATH:    &str   = "/mnt/host/test-assets/DejaVuSansMono.ttf";
+const FONT_SIZE_PX: f32    = 18.0;
 const PREVIEW_LINES: usize = 64;
 const PREVIEW_BYTES: usize = 8192;
 const WIN_W: u32 = 1000;
@@ -102,7 +103,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| "/".into()));
 
     let mut state = State::open(start)?;
-    eprintln!("atrium-find-socket: cwd={} ({} entries)", state.cwd.display(), state.entries.len());
+    eprintln!("atrium-find-socket: cwd={} ({} entries)",
+        state.cwd.display(), state.entries.len());
 
     let font = std::fs::read(FONT_PATH)?;
 
@@ -111,16 +113,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut conn = Connection::connect(&sock)?;
     eprintln!("atrium-find-socket: connected to {sock}");
 
-    let win = conn.create_window(WIN_W, WIN_H, Some("find"))?;
-    let _ = conn.window_set_pos(win as u16, 100.0, 100.0);
-    conn.set_default_window(win as u16);
+    let win = conn.window_create(WIN_W, WIN_H, "find", WindowHints::default())?;
     eprintln!("atrium-find-socket: window {win} created — {WIN_W}x{WIN_H}");
 
     let cache = glyph_cache::GlyphCache::build(&mut conn, &font, FONT_SIZE_PX)?;
-    let renderer = render::Renderer::new(&cache, &mut conn, WIN_W, WIN_H)?;
+    let renderer = render::Renderer::new(&cache, WIN_W, WIN_H);
     let mut keymap = keymap::Keymap::new();
 
-    // Visible rows minus header(1) + gap(1) + footer(1) = list area.
     let visible_rows = ((WIN_H as f32 - 24.0) / cache.line_height).floor() as usize;
     let list_visible = visible_rows.saturating_sub(3);
 
@@ -134,8 +133,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut next = ev;
         loop {
             match next {
-                Some(Event::CloseRequested { .. }) => alive = false,
-                Some(Event::Key { hid_usage, pressed, .. }) => {
+                Some(Event::CloseRequested { window_id }) if window_id == win => {
+                    alive = false;
+                }
+                Some(Event::Key { hid_usage, pressed, window_id, .. }) if window_id == win => {
                     if let Some(action) = keymap.handle(hid_usage, pressed) {
                         use keymap::Action::*;
                         match action {

@@ -1,14 +1,13 @@
 //! atrium-term-socket — terminal emulator on the FreeBSD-native
-//! Atrium stack via fresco-socket-rs.
+//! Atrium stack, ported to fresco-client (M3d).
 //!
-//! Forks `/bin/sh` over a pty (`pty.rs`), feeds its output through a
-//! VTE parser into a cell grid (`grid.rs`), and renders the grid into
-//! the compositor's scene through fresco-socket-rs. Keystrokes from
-//! the compositor's native input pipeline (Event::Key, HID Usage) get
-//! translated into ASCII bytes (`keymap.rs`) and written to the pty.
+//! Forks /bin/sh over a pty, feeds output through a VTE parser into a
+//! cell grid, renders the grid as cursor (RECT) + per-cell TEXTURE
+//! nodes. Server-pushed EV_INPUT_KEY events translate to ASCII bytes
+//! via the unchanged keymap and write to the pty.
 //!
-//! kqueue multiplexes the pty master fd with the compositor socket fd
-//! — one `kevent()` wakes us on either pty output OR a server event.
+//! kqueue multiplexes pty master fd + compositor socket fd: one
+//! kevent() wakes us on either pty output OR a server input event.
 
 mod glyph_cache;
 mod grid;
@@ -23,12 +22,15 @@ use std::os::fd::AsRawFd;
 use std::ptr;
 use std::time::Duration;
 
-use fresco_socket::{Connection, Event};
+use fresco_client::{Connection, Event};
+use fresco_protocol::WindowHints;
 
 const FONT_PATH:    &str = "/mnt/host/test-assets/DejaVuSansMono.ttf";
 const FONT_SIZE_PX: f32  = 18.0;
 const COLS: u16 = 80;
 const ROWS: u16 = 24;
+const WIN_W: u32 = 880;
+const WIN_H: u32 = 540;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let font = std::fs::read(FONT_PATH)
@@ -39,18 +41,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut conn = Connection::connect(&sock)?;
     eprintln!("atrium-term-socket: connected to {sock}");
 
-    // Per-window FBO: create our window, stagger position so we
-    // don't overlap the editor when launched together, mark as the
-    // default route for subsequent SET_ROOT/SLOT_*/FRAME_* commands.
-    const WIN_W: u32 = 880;
-    const WIN_H: u32 = 540;
-    let win = conn.create_window(WIN_W, WIN_H, Some("term"))?;
-    let _ = conn.window_set_pos(win as u16, 200.0, 200.0);
-    conn.set_default_window(win as u16);
+    let win = conn.window_create(WIN_W, WIN_H, "term", WindowHints::default())?;
     eprintln!("atrium-term-socket: window {win} created — {WIN_W}x{WIN_H}");
 
     let cache = glyph_cache::GlyphCache::build(&mut conn, &font, FONT_SIZE_PX)?;
-    let renderer = render::Renderer::new(&cache, &mut conn)?;
+    let renderer = render::Renderer::new(&cache);
 
     let shell = pty::Shell::spawn(OsStr::new("/bin/sh"), &["-i"], COLS, ROWS)?;
     eprintln!("spawned /bin/sh pid={}", shell.pid);
@@ -61,7 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     renderer.render(&mut conn, &grid)?;
 
-    // ── kqueue: pty fd + compositor socket fd ────────────────────
+    /* kqueue: pty fd + compositor socket fd. */
     let kq = unsafe { libc::kqueue() };
     if kq < 0 { return Err(io::Error::last_os_error().into()); }
     let pty_fd  = shell.master.as_raw_fd();
@@ -106,12 +101,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else if fd == sock_fd {
                 while let Some(input) = conn.poll_event()? {
                     match input {
-                        Event::Key { hid_usage, pressed, .. } => {
+                        Event::Key { hid_usage, pressed, window_id, .. }
+                            if window_id == win =>
+                        {
                             if let Some(bytes) = keymap.handle(hid_usage, pressed) {
                                 let _ = shell.write(&bytes);
                             }
                         }
-                        Event::CloseRequested { .. } => {
+                        Event::CloseRequested { window_id } if window_id == win => {
                             eprintln!("close requested — exiting");
                             alive = false;
                         }
