@@ -1,20 +1,25 @@
-//! Atlas-based glyph cache for atrium-edit-socket.
+//! Glyph cache for atrium-edit-socket on the envelope+texture-op stack.
 //!
-//! Shapes each printable-ASCII character *individually* and shelf-
-//! packs every glyph's coverage bitmap into one shared atlas. Each
-//! per-glyph material references the atlas with the glyph's UV cell.
+//! Each printable-ASCII char gets:
+//!   - a per-glyph RGBA bitmap (premultiplied (A,A,A,A))
+//!   - a CAS hash (uploaded once via `Connection::upload_blob`)
+//!   - a per-glyph slot id (`OP_SLOT_SET` once, with TextureDesc)
 //!
-//! The per-char approach (vs. shaping the whole ASCII range as one
-//! string) avoids any ambiguity about input-char → output-glyph
-//! ordering: rustybuzz can reorder, drop, or merge glyphs depending
-//! on font features, and threading per-input-byte cluster info
-//! through the API just to undo that reordering is more code than
-//! shaping each char alone. Cost: ~94 shape calls, all sub-millisecond.
+//! The renderer references glyphs by slot id. This is wasteful per-
+//! glyph (no atlas, no shared texture) but matches the simplest path
+//! through the new texture op (`TextureParams { x, y, w, h, slot_id }`)
+//! whose params don't carry per-glyph UV coordinates. A real atlas
+//! would need either UV in `TextureParams` or a bundle op that takes
+//! a sub-rect — both are M3+ design choices, not blockers here.
+//!
+//! Cost: ~94 small CAS uploads + 94 slot-set messages at startup. Done
+//! once — the editor sends nothing glyph-related per keystroke beyond
+//! the per-character TEXTURE node.
 
 use std::collections::HashMap;
 
-use fresco_scene_server::command::protocol::Hash256;
-use fresco_socket::Connection;
+use fresco_client::Connection;
+use fresco_protocol::TextureFormat;
 use fresco_text::shape_and_rasterize;
 
 #[derive(Debug, Clone, Copy)]
@@ -25,10 +30,10 @@ pub struct GlyphMetrics {
     pub bearing_y: i32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct CachedGlyph {
-    pub material: Hash256,
-    pub metrics:  GlyphMetrics,
+    pub slot_id: u32,
+    pub metrics: GlyphMetrics,
 }
 
 pub struct GlyphCache {
@@ -38,8 +43,9 @@ pub struct GlyphCache {
     pub glyphs:      HashMap<char, CachedGlyph>,
 }
 
-const ATLAS_W: u32 = 512;
-const ATLAS_H: u32 = 512;
+/// First slot id used for glyphs. Apps can use lower ids for their
+/// own per-window slots (e.g. background image, icon).
+const GLYPH_SLOT_BASE: u32 = 100;
 
 impl GlyphCache {
     pub fn build(
@@ -52,16 +58,8 @@ impl GlyphCache {
         let baseline    = probe.ascent;
         let cell_w      = probe.advance.max(1.0);
 
-        // Master atlas: RGBA, premultiplied alpha (A,A,A,A).
-        let mut atlas = vec![0u8; (ATLAS_W * ATLAS_H * 4) as usize];
-        // Shelf-pack cursor.
-        let mut shelf_x: u32 = 1;
-        let mut shelf_y: u32 = 1;
-        let mut shelf_h: u32 = 0;
-
-        // Per-char metrics + UV — collected, materials uploaded after
-        // the atlas texture is uploaded once.
-        let mut pending: Vec<(char, GlyphMetrics, [f32; 4])> = Vec::new();
+        let mut glyphs = HashMap::new();
+        let mut next_slot = GLYPH_SLOT_BASE;
 
         for byte in 0x21u8..=0x7e {
             let ch = byte as char;
@@ -73,7 +71,6 @@ impl GlyphCache {
                 Some(q) => *q,
                 None    => continue,
             };
-            // Pixel-space bounding box of this glyph in its own atlas.
             let su0 = (q.u0 * a.width  as f32).round() as u32;
             let sv0 = (q.v0 * a.height as f32).round() as u32;
             let su1 = (q.u1 * a.width  as f32).round() as u32;
@@ -82,59 +79,38 @@ impl GlyphCache {
             let gh = sv1.saturating_sub(sv0);
             if gw == 0 || gh == 0 { continue; }
 
-            // Shelf-pack into master atlas (1 px gutter).
-            if shelf_x + gw + 1 > ATLAS_W {
-                shelf_x = 1;
-                shelf_y += shelf_h + 1;
-                shelf_h = 0;
-            }
-            if shelf_y + gh + 1 > ATLAS_H {
-                return Err("master atlas overflow".into());
-            }
-            shelf_h = shelf_h.max(gh);
-
-            // Copy + premultiply: source has (255, 255, 255, A); dest
-            // gets (A, A, A, A).
+            /* Extract glyph bytes (RGBA), premultiply (A,A,A,A) so the
+             * texture op's tint=white shader produces white-on-anything
+             * coverage. */
+            let mut rgba = vec![0u8; (gw * gh * 4) as usize];
             for row in 0..gh {
                 for col in 0..gw {
                     let src_off = (((sv0 + row) * a.width + (su0 + col)) * 4) as usize;
-                    let dst_off = (((shelf_y + row) * ATLAS_W + (shelf_x + col)) * 4) as usize;
+                    let dst_off = ((row * gw + col) * 4) as usize;
                     let alpha = a.pixels[src_off + 3];
-                    atlas[dst_off]     = alpha;
-                    atlas[dst_off + 1] = alpha;
-                    atlas[dst_off + 2] = alpha;
-                    atlas[dst_off + 3] = alpha;
+                    rgba[dst_off]     = alpha;
+                    rgba[dst_off + 1] = alpha;
+                    rgba[dst_off + 2] = alpha;
+                    rgba[dst_off + 3] = alpha;
                 }
             }
 
-            let u0 = shelf_x as f32 / ATLAS_W as f32;
-            let v0 = shelf_y as f32 / ATLAS_H as f32;
-            let u1 = (shelf_x + gw) as f32 / ATLAS_W as f32;
-            let v1 = (shelf_y + gh) as f32 / ATLAS_H as f32;
-            shelf_x += gw + 1;
+            let hash = conn.upload_blob(&rgba)?;
+            let slot_id = next_slot;
+            next_slot += 1;
+            conn.slot_set_texture(
+                slot_id, hash, gw, gh, TextureFormat::Rgba8UnormSrgb,
+            )?;
 
-            pending.push((ch, GlyphMetrics {
-                width:     gw,
-                height:    gh,
-                bearing_x: q.dx0.round() as i32,
-                bearing_y: (-q.dy0).round() as i32,
-            }, [u0, v0, u1, v1]));
-        }
-
-        let atlas_tex = conn.upload_texture(&atlas, ATLAS_W, ATLAS_H)?;
-        eprintln!(
-            "glyph atlas: {}x{} px, {} glyphs uploaded as 1 CAS texture",
-            ATLAS_W, ATLAS_H, pending.len()
-        );
-
-        let mut glyphs = HashMap::new();
-        for (ch, metrics, uv) in pending {
-            let mat = conn.upload_blob(&fresco_socket::wire::material_textured_uv(
-                atlas_tex,
-                [0xff; 4],
-                uv,
-            ))?;
-            glyphs.insert(ch, CachedGlyph { material: mat, metrics });
+            glyphs.insert(ch, CachedGlyph {
+                slot_id,
+                metrics: GlyphMetrics {
+                    width:     gw,
+                    height:    gh,
+                    bearing_x: q.dx0.round() as i32,
+                    bearing_y: (-q.dy0).round() as i32,
+                },
+            });
         }
 
         eprintln!(

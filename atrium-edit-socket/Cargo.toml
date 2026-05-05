@@ -2,7 +2,7 @@
 name = "atrium-edit-socket"
 version = "0.1.0"
 edition = "2021"
-description = "Minimal text editor on the Atrium FreeBSD-native stack via fresco-socket-rs"
+description = "Minimal text editor on the Atrium FreeBSD-native stack via fresco-client (envelope wire)."
 license = "MIT OR Apache-2.0"
 publish = false
 
@@ -11,6 +11,6 @@ name = "atrium-edit-socket"
 path = "src/main.rs"
 
 [dependencies]
-fresco-scene-server = { path = "../fresco-scene-server" }
-fresco-socket-rs = { path = "../fresco-socket-rs" }
-fresco-text = { path = "../fresco-text" }
+fresco-client   = { path = "../fresco-client" }
+fresco-protocol = { path = "../fresco-protocol" }
+fresco-text     = { path = "../fresco-text" }

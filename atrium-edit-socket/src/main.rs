@@ -1,14 +1,13 @@
-//! atrium-edit-socket — port of atrium-edit to the FreeBSD-native
-//! Atrium stack via fresco-socket-rs.
+//! atrium-edit-socket — minimal text editor on the Atrium FreeBSD
+//! stack, ported to fresco-client (M3d).
 //!
-//! Reuses atrium-edit's buffer + keymap modules unchanged. The
-//! renderer is rewritten to emit per-glyph textured RenderItems
-//! against the existing tiny_skia_backend (no per-vertex UV needed).
+//! Reuses the original buffer + keymap modules unchanged. Renderer
+//! emits per-glyph TEXTURE nodes against per-glyph slots and a single
+//! RECT node for the cursor (no rotation needed → RECT not PATH).
 //!
-//! Interactive: receives `Event::Key` from the server (today via
-//! `atrium-keyboard` injecting over CMD_INJECT_KEY; tomorrow via
-//! `/dev/usbhid` plumbed through frescod). Routes through
-//! the existing keymap → buffer-mutation → re-render loop.
+//! Interactive: server pushes EV_INPUT_KEY events (M3a — native
+//! /dev/hidraw → DisplayEvent fan-out); we filter by window_id, run
+//! through the existing keymap → buffer-mutation → re-render loop.
 
 mod buffer;
 mod glyph_cache;
@@ -18,13 +17,16 @@ mod render;
 use std::io;
 use std::path::PathBuf;
 
-use fresco_socket::{Connection, Event};
+use fresco_client::{Connection, Event};
+use fresco_protocol::WindowHints;
 
 use crate::keymap::Action;
 
 const FONT_PATH:    &str   = "/mnt/host/test-assets/DejaVuSansMono.ttf";
 const FONT_SIZE_PX: f32    = 18.0;
 const VIEWPORT_ROWS: usize = 24;
+const WIN_W: u32 = 720;
+const WIN_H: u32 = 540;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path: Option<PathBuf> = std::env::args().nth(1).map(PathBuf::from);
@@ -41,19 +43,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut conn = Connection::connect(&sock)?;
     eprintln!("connected to {sock}");
 
-    // Create our own window so the compositor's per-window FBO
-    // pipeline can composite us alongside other apps. Without this
-    // we'd render into the screen scene (window 0) and the last
-    // SET_ROOT writer would win.
-    const WIN_W: u32 = 720;
-    const WIN_H: u32 = 540;
-    let win = conn.create_window(WIN_W, WIN_H, Some("edit"))?;
-    let _ = conn.window_set_pos(win as u16, 60.0, 60.0);
-    conn.set_default_window(win as u16);
+    let win = conn.window_create(WIN_W, WIN_H, "edit", WindowHints::default())?;
     eprintln!("window {win} created — {WIN_W}x{WIN_H}");
 
     let cache    = glyph_cache::GlyphCache::build(&mut conn, &font, FONT_SIZE_PX)?;
-    let renderer = render::Renderer::new(&cache, &mut conn)?;
+    let renderer = render::Renderer::new(&cache);
     let mut keymap = keymap::Keymap::new();
 
     renderer.render(&mut conn, &buf, VIEWPORT_ROWS, /*cursor_visible=*/true)?;
@@ -64,13 +58,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ev = conn.wait_event(None)?;
         let mut dirty = false;
 
-        // Drain the burst — multiple keystrokes shouldn't trigger
-        // multiple renders.
+        /* Drain a burst — multiple keystrokes shouldn't trigger
+         * multiple renders. */
         let mut next = ev;
         loop {
             match next {
-                Some(Event::CloseRequested { .. }) => alive = false,
-                Some(Event::Key { hid_usage, pressed, modifiers, .. }) => {
+                Some(Event::CloseRequested { window_id }) if window_id == win => {
+                    alive = false;
+                }
+                Some(Event::Key { hid_usage, pressed, modifiers, window_id })
+                    if window_id == win =>
+                {
                     keymap.shift = modifiers & 0x01 != 0;
                     keymap.ctrl  = modifiers & 0x02 != 0;
                     if let Some(action) = keymap.handle(hid_usage, pressed) {
