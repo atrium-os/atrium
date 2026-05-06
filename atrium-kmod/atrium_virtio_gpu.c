@@ -190,7 +190,6 @@ struct atrium_gpu_softc {
 	 * window. shm_lock guards shm_bitmap; shm_res/shm_pa/shm_size are
 	 * write-once at first IOC_HOST_BLOB so are read lock-free. */
 	struct mtx                     shm_lock;
-	struct resource               *shm_res;       /* NULL until first use */
 	uint8_t                       *shm_bitmap;
 	uint32_t                       shm_n_pages;
 	bool                           shm_initialized;
@@ -1286,6 +1285,12 @@ atrium_vgpu_req_resp(struct atrium_gpu_softc *sc,
 
 	mtx_lock(&sc->ctrl_lock);
 	sc->ctrl_done = false;
+	{
+		uint32_t cmd_type = le32toh(*(uint32_t *)req);
+		device_printf(sc->dev,
+		    "req_resp: enqueue type=0x%x reqlen=%zu resplen=%zu\n",
+		    cmd_type, reqlen, resplen);
+	}
 	err = virtqueue_enqueue(sc->ctrl_vq, resp, &sg, 1, 1);
 	if (err != 0) {
 		device_printf(sc->dev, "req_resp: virtqueue_enqueue: %d\n", err);
@@ -1827,34 +1832,42 @@ atrium_vgpu_resource_map_blob(struct atrium_gpu_softc *sc,
 	return (0);
 }
 
-/* V5h: lazy first-time setup of the BAR-backed page allocator. Allocates
- * the BAR resource (ownership passes to us) and the per-page bitmap.
+/* V5h: lazy first-time setup of the BAR-backed page allocator. Reads
+ * the BAR's bus PA directly from PCI config space — we deliberately do
+ * NOT bus_alloc_resource_any() because virtio_pci_modern shares BAR4
+ * with MSI-X (table + PBA at the same BAR), and a competing alloc on
+ * a non-shared resource deadlocks newbus interactions with the
+ * interrupt path. The BAR is already programmed and we just need its
+ * PA to compose the absolute address for d_mmap.
+ *
  * Caller must hold sc->shm_lock. Returns 0 on success or already-init,
- * ENXIO if no host_visible region was advertised, ENOMEM on bitmap
- * allocation failure. */
+ * ENXIO if no host_visible region was advertised. */
 static int
 atrium_vgpu_shm_init_locked(struct atrium_gpu_softc *sc)
 {
-	int rid;
+	device_t pcidev;
+	uint32_t bar_lo, bar_hi;
+	uint64_t bar_pa;
 
 	if (sc->shm_initialized)
 		return (0);
 	if (sc->shm_size == 0)
 		return (ENXIO);
 
-	rid = PCIR_BAR(sc->shm_bar);
-	sc->shm_res = bus_alloc_resource_any(device_get_parent(sc->dev),
-	    SYS_RES_MEMORY, &rid, RF_ACTIVE | RF_SHAREABLE);
-	if (sc->shm_res == NULL) {
-		device_printf(sc->dev,
-		    "bus_alloc_resource(BAR%u) failed for HOST3D blob window\n",
-		    sc->shm_bar);
-		return (ENOMEM);
+	pcidev = device_get_parent(sc->dev);
+	bar_lo = pci_read_config(pcidev, PCIR_BAR(sc->shm_bar), 4);
+	/* Drop the low type/prefetch bits to get the base address.
+	 * 64-bit BARs use the next register slot for the high half. */
+	if ((bar_lo & PCIM_BAR_MEM_TYPE) == PCIM_BAR_MEM_64) {
+		bar_hi = pci_read_config(pcidev,
+		    PCIR_BAR(sc->shm_bar) + 4, 4);
+		bar_pa = ((uint64_t)bar_hi << 32) |
+		         (bar_lo & PCIM_BAR_MEM_BASE);
+	} else {
+		bar_pa = bar_lo & PCIM_BAR_MEM_BASE;
 	}
 
-	/* The cap gave us the offset *within* the BAR; compose with the
-	 * BAR's bus address to get the absolute PA we hand to userspace. */
-	sc->shm_pa = rman_get_start(sc->shm_res) + sc->shm_bar_offset;
+	sc->shm_pa = bar_pa + sc->shm_bar_offset;
 	sc->shm_n_pages = sc->shm_size / PAGE_SIZE;
 	sc->shm_bitmap = malloc(roundup2(sc->shm_n_pages, 8) / 8,
 	    M_ATRIUM_GPU, M_WAITOK | M_ZERO);
@@ -2146,21 +2159,12 @@ atrium_virtio_gpu_attach(device_t dev)
 
 	atrium_fill_caps(sc);
 
-	/* V5h step 1: probe for the host_visible shared-memory region. Optional
-	 * — absence just means HOST3D blob ioctls will refuse with ENXIO and
-	 * userspace falls back to BLOB_MEM_GUEST (the V5g code path). */
-	/* shmid 1 == VIRTIO_GPU_SHM_ID_HOST_VISIBLE per virtio-gpu spec.
-	 * (id 0 is "undefined"; the host_visible region is always id=1.) */
-	if (atrium_vgpu_find_shm_region(sc, 1) == 0) {
-		device_printf(dev,
-		    "host_visible shm region: BAR%u, off 0x%lx, size %lu MiB\n",
-		    sc->shm_bar, (unsigned long)sc->shm_bar_offset,
-		    (unsigned long)(sc->shm_size >> 20));
-	} else {
-		device_printf(dev,
-		    "no host_visible shm region (need QEMU -hostmem); "
-		    "venus HOST3D blobs unavailable\n");
-	}
+	/* V5h step 1: probe for the host_visible shared-memory region.
+	 * BISECT: temporarily disabled to isolate whether the cap walk
+	 * is what's wedging HVF on subsequent virtio commands. */
+	(void)atrium_vgpu_find_shm_region;
+	device_printf(dev,
+	    "host_visible shm region probe: SKIPPED (bisect)\n");
 
 	/* /dev/atrium-gpu0 */
 	make_dev_args_init(&args);
@@ -2227,12 +2231,6 @@ atrium_virtio_gpu_detach(device_t dev)
 	if (sc->shm_initialized) {
 		free(sc->shm_bitmap, M_ATRIUM_GPU);
 		sc->shm_bitmap = NULL;
-	}
-	if (sc->shm_res != NULL) {
-		int rid = PCIR_BAR(sc->shm_bar);
-		bus_release_resource(device_get_parent(dev), SYS_RES_MEMORY,
-		    rid, sc->shm_res);
-		sc->shm_res = NULL;
 	}
 	cv_destroy(&sc->ctrl_done_cv);
 	mtx_destroy(&sc->shm_lock);
