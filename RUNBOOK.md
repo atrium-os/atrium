@@ -417,6 +417,46 @@ To see scanout output: boot with `--virtio-gpu --display` (Cocoa window appears 
 
 D0 step 2d (async fence retirement) and step 3.5 (vblank events, hardware cursor) remain — neither blocks D1.
 
+#### Booting with the venus paravirt Vulkan stack (D1.x V5+)
+
+```sh
+~/src/bsd/scripts/run-vm.sh --venus       # headless, serial on TCP:4444, monitor on /tmp/qmp.sock
+~/src/bsd/scripts/run-vm.sh --venus --display    # add Cocoa window
+```
+
+`--venus` sets up `bochs-display` (boot splash) + `virtio-gpu-gl-pci,venus=on,blob=on,hostmem=512M` (the venus path), exports `VK_ICD_FILENAMES` to MoltenVK, captures `virgl_render_server` log to `/tmp/virgl-<pid>.log`, and selects the Atrium-patched QEMU under `~/src/qemu-build/build/qemu-system-aarch64`. Requires:
+
+- Atrium-patched QEMU (`qemu-build/`) — venus QEMU integration + macOS host shims for the missing EGL/GBM (`virtio-gpu-virgl.c` short-circuits vrend init when `qemu_egl_display` is NULL and adds `VIRGL_RENDERER_NO_VIRGL`).
+- Atrium-patched EDK2 (in the same `qemu-build/roms/edk2/`) — `VirtioGpuDxe` disabled in `ArmVirtPkg/ArmVirtQemu.dsc` and the FDF; otherwise EDK2 probes the GL/venus device at boot and hangs.
+- Atrium-built `virglrenderer` at `~/src/virglrenderer/build/server/virgl_render_server`, installed to `~/.local/libexec/virgl_render_server` and `~/.local/opt/homebrew/libexec/virgl_render_server` (the loader checks both).
+- MoltenVK ICD JSON at `/tmp/MoltenVK_atrium.json` pointing at `/opt/homebrew/lib/libMoltenVK.dylib` (run-vm.sh auto-generates).
+
+Inside the VM, the V5 atrium-mesa fork lives at `/root/mesa` (cloned from `github.com/atrium-os/mesa atrium/main`). Build the venus driver:
+
+```sh
+vssh "cd /root/mesa && meson setup build-atrium -Datrium=true -Dvulkan-drivers=virtio \
+      -Dgallium-drivers= -Dgles1=disabled -Dgles2=disabled -Dopengl=false -Degl=disabled \
+      -Dglx=disabled -Dplatforms= -Dllvm=disabled -Dshared-glapi=disabled -Dvideo-codecs= \
+      -Dtools= -Dbuildtype=debug"
+vssh "ninja -C /root/mesa/build-atrium src/virtio/vulkan/libvulkan_virtio.so"
+```
+
+Mesa build prereqs (one-time): `pkg install -y meson ninja pkgconf bison flex python3 py311-mako py311-pyyaml py311-packaging vulkan-headers vulkan-loader vulkan-tools libdrm git`.
+
+Run vulkaninfo against our ICD:
+
+```sh
+vssh "VK_DRIVER_FILES=/tmp/atrium_icd.json VN_DEBUG=init vulkaninfo --summary"
+# /tmp/atrium_icd.json points library_path at /root/mesa/build-atrium/src/virtio/vulkan/libvulkan_virtio.so
+```
+
+Diagnostics:
+- Guest kernel printfs (including the V5h `req_resp: enqueue type=…` traces) go to TCP serial: `nc 127.0.0.1 4444 > /tmp/atrium-console.log &` before running the test, then `tail` the file. Survives an SSH freeze, which is the usual failure mode.
+- Host venus log: `tail /tmp/virgl-<qemu-pid>.log` shows the proxy/render-server side. The pattern `proxy: exported res N to unexpected fd_type -1` followed by `Broken pipe` is the V5g-era fd-export failure (use HOST3D blobs — see `feedback_venus_shmem_must_be_host3d` memory note).
+- QEMU monitor: `nc -U /tmp/qmp.sock` (JSON QMP). Useful for `system_reset`, `query-status`. If QMP itself is unresponsive, HVF is wedged — only `kill -9` will recover, and the qcow2 will need fsck on next boot.
+
+V5h status (in progress): kmod side adds `IOC_HOST_BLOB` ioctl that does `RESOURCE_CREATE_BLOB(HOST3D, num_entries=0)` + `CTX_ATTACH_RESOURCE` + `RESOURCE_MAP_BLOB`, returning a window of the host_visible BAR for mmap. Mesa side switches `vn_renderer_shmem_create` and `vn_renderer_bo_create_from_device_memory` to use it. Currently blocked: on a fresh QEMU, `kldunload` + `kldload` of the V5h kmod re-attaches with `features=0x100000010` (CONTEXT_INIT claimed) but the next `CTX_CREATE` virtio command hangs the host. Likely the older auto-loaded kmod on `/boot` claimed the device with `features=0x100000000` first and FreeBSD's virtio framework didn't issue `DEVICE_RESET` on detach — re-negotiation half-applied on the host side. See the V5h-debug commit's body for the next-session plan.
+
 **D1 step 1 (atrium-gpu-rs Rust binding)** — DONE (2026-04-28). Crate at `~/src/bsd/atrium-gpu-rs/` exposes `Gpu`, `Bo`, `Display`, `Connector`, `Mode`. `examples/gradient.rs` visually verified.
 
 **D1 host cross-compile** — DONE (2026-04-28). `~/src/bsd/.cargo/config.toml` configures rust-lld + FreeBSD CRT objects (Scrt1.o, crti.o, crtbeginS.o, crtendS.o, crtn.o) from `sysroot/`; `rust-toolchain.toml` pins nightly + rust-src for `-Z build-std`. Incremental cross-builds for atrium-gpu-rs land in ~2s on the macOS host vs minutes in the VM. Build with `cargo build --target aarch64-unknown-freebsd --release --example <name>`; binary lands at `target/aarch64-unknown-freebsd/release/examples/<name>` (visible in VM via 9p). **In-VM cargo is no longer the iteration loop** — host cross is.
