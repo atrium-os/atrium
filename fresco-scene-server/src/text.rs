@@ -73,6 +73,9 @@ struct GlyphCacheEntry {
     /// Pen-advance for this glyph in pixels. For monospace fonts this
     /// is the font's `cell_w`; for proportional fonts it varies.
     advance:   f32,
+    /// Logical-clock LRU stamp: bumped on every cache hit. Eviction
+    /// drops the lowest stamps when the page can't fit a new glyph.
+    last_used: u64,
 }
 
 struct AtlasPage {
@@ -92,6 +95,10 @@ struct AtlasPage {
     /// Bbox of pixels modified since the last drain. None means no
     /// changes pending. After a drain the bbox resets.
     dirty_bbox: Option<(u32, u32, u32, u32)>,
+    /// Set after `evict_and_compact` rewrites the entire pixels
+    /// buffer; forces the next drain to ship a Full upload (every
+    /// glyph moved on the GPU side too).
+    needs_full_resync: bool,
 }
 
 impl AtlasPage {
@@ -103,7 +110,81 @@ impl AtlasPage {
             slot_id,
             allocated_on_gpu: false,
             dirty_bbox: None,
+            needs_full_resync: false,
         }
+    }
+
+    /// Drop the bottom `evict_pct` of the LRU and re-shelf-pack the
+    /// survivors into a freshly-zeroed page. Survivor pixels are
+    /// copied from the old atlas *into a side buffer* before we wipe
+    /// `pixels`, then written back into the new packing — no
+    /// re-rasterization, no per-glyph raster cache.
+    ///
+    /// Marks the page as needing a Full upload on next drain (every
+    /// glyph moved on the GPU side too).
+    fn evict_and_compact(&mut self, evict_pct: u32) {
+        type GKey = (u32, u32, u32);
+        let mut by_lru: Vec<(&GKey, &GlyphCacheEntry)> =
+            self.glyphs.iter().collect();
+        by_lru.sort_by(|a, b| b.1.last_used.cmp(&a.1.last_used)); /* newest first */
+        let keep_n = ((by_lru.len() as u64
+                       * (100 - evict_pct as u64) + 99) / 100) as usize;
+
+        /* Capture survivor pixel blocks from the existing atlas
+         * before we wipe it. (key, entry, pixel_bytes_or_empty). */
+        let mut survivors: Vec<(GKey, GlyphCacheEntry, Vec<u8>)> =
+            Vec::with_capacity(keep_n);
+        for (k, e) in by_lru.into_iter().take(keep_n) {
+            let bytes = if e.atlas_w == 0 || e.atlas_h == 0 {
+                Vec::new()
+            } else {
+                let mut b = Vec::with_capacity((e.atlas_w * e.atlas_h) as usize);
+                for row in 0..e.atlas_h {
+                    let s = ((e.atlas_v + row) * ATLAS_W + e.atlas_u) as usize;
+                    b.extend_from_slice(&self.pixels[s..s + e.atlas_w as usize]);
+                }
+                b
+            };
+            survivors.push((*k, *e, bytes));
+        }
+        let dropped = self.glyphs.len() - survivors.len();
+
+        for px in &mut self.pixels { *px = 0; }
+        self.shelf_x = 1; self.shelf_y = 1; self.shelf_h = 0;
+        let mut new_map: HashMap<GKey, GlyphCacheEntry> =
+            HashMap::with_capacity(survivors.len());
+
+        for (key, mut e, src) in survivors {
+            let gw = e.atlas_w; let gh = e.atlas_h;
+            if gw == 0 || gh == 0 {
+                new_map.insert(key, e);
+                continue;
+            }
+            if self.shelf_x + gw + 1 > ATLAS_W {
+                self.shelf_x = 1;
+                self.shelf_y += self.shelf_h + 1;
+                self.shelf_h = 0;
+            }
+            if self.shelf_y + gh + 1 > ATLAS_H { break; }
+            if gh > self.shelf_h { self.shelf_h = gh; }
+            for row in 0..gh {
+                let dst = ((self.shelf_y + row) * ATLAS_W
+                           + self.shelf_x) as usize;
+                let s = (row * gw) as usize;
+                self.pixels[dst..dst + gw as usize]
+                    .copy_from_slice(&src[s..s + gw as usize]);
+            }
+            e.atlas_u = self.shelf_x;
+            e.atlas_v = self.shelf_y;
+            new_map.insert(key, e);
+            self.shelf_x += gw + 1;
+        }
+
+        self.glyphs = new_map;
+        self.needs_full_resync = true;
+        self.dirty_bbox = Some((0, 0, ATLAS_W, ATLAS_H));
+        log::info!("evicted {dropped} glyph(s) from atlas slot={}; \
+                    {} survivors repacked", self.slot_id, self.glyphs.len());
     }
 
     fn mark_dirty(&mut self, x: u32, y: u32, w: u32, h: u32) {
@@ -139,10 +220,14 @@ impl AtlasPage {
         &mut self,
         font_id: u32, size_px: f32, codepoint: u32,
         font_bytes: &[u8],
+        clock: u64,
     ) -> Option<GlyphCacheEntry> {
         let size_key = (size_px * 100.0) as u32;
         let key = (font_id, size_key, codepoint);
-        if let Some(e) = self.glyphs.get(&key) { return Some(*e); }
+        if let Some(e) = self.glyphs.get_mut(&key) {
+            e.last_used = clock;
+            return Some(*e);
+        }
 
         let s = char::from_u32(codepoint)?.to_string();
         let atlas: GlyphAtlas = shape_and_rasterize(font_bytes, &s, size_px).ok()?;
@@ -154,6 +239,7 @@ impl AtlasPage {
                 atlas_u: 0, atlas_v: 0, atlas_w: 0, atlas_h: 0,
                 bearing_x: 0.0, bearing_y: 0.0,
                 advance: atlas.advance,
+                last_used: clock,
             };
             self.glyphs.insert(key, entry);
             return Some(entry);
@@ -171,6 +257,7 @@ impl AtlasPage {
                 atlas_u: 0, atlas_v: 0, atlas_w: 0, atlas_h: 0,
                 bearing_x: 0.0, bearing_y: 0.0,
                 advance: atlas.advance,
+                last_used: clock,
             };
             self.glyphs.insert(key, entry);
             return Some(entry);
@@ -182,11 +269,22 @@ impl AtlasPage {
             self.shelf_h = 0;
         }
         if self.shelf_y + gh + 1 > ATLAS_H {
-            log::warn!("atlas page slot={} exhausted at U+{:04X}; \
-                        text past this point will not render \
-                        (M6.4 page-split TODO)",
-                       self.slot_id, codepoint);
-            return None;
+            /* Page exhausted — evict the oldest 25% of glyphs by LRU
+             * stamp, repack, and retry. The new glyph itself is the
+             * most-recently-used (clock just bumped before this call)
+             * so it can't be evicted by its own miss. */
+            self.evict_and_compact(25);
+            if self.shelf_x + gw + 1 > ATLAS_W {
+                self.shelf_x = 1;
+                self.shelf_y += self.shelf_h + 1;
+                self.shelf_h = 0;
+            }
+            if self.shelf_y + gh + 1 > ATLAS_H {
+                log::warn!("atlas page slot={} still doesn't fit U+{:04X} \
+                            after eviction; dropping",
+                           self.slot_id, codepoint);
+                return None;
+            }
         }
         if gh > self.shelf_h { self.shelf_h = gh; }
 
@@ -207,6 +305,7 @@ impl AtlasPage {
             bearing_x: q.dx0,
             bearing_y: -q.dy0,
             advance: atlas.advance,
+            last_used: clock,
         };
         self.glyphs.insert(key, entry);
         self.mark_dirty(self.shelf_x, self.shelf_y, gw, gh);
@@ -246,6 +345,9 @@ pub struct TextEngine {
     /// signed-distance-field rendering.
     pages:  HashMap<(u32, u32), AtlasPage>,
     search_paths: Vec<PathBuf>,
+    /// Monotonic LRU clock. Each `ensure()` call bumps it; entries
+    /// stamp `last_used` from this. Eviction sorts by `last_used`.
+    lru_clock: u64,
 }
 
 impl TextEngine {
@@ -264,6 +366,7 @@ impl TextEngine {
             fonts: HashMap::new(),
             pages: HashMap::new(),
             search_paths: paths,
+            lru_clock: 0,
         }
     }
 
@@ -362,6 +465,7 @@ impl TextEngine {
             self.pages.insert(page_key, AtlasPage::new(id));
             id
         };
+        let mut clock = self.lru_clock;
         let page = self.pages.get_mut(&page_key).unwrap();
 
         /* Walk codepoints in text — POC shaping = one glyph per char
@@ -381,7 +485,8 @@ impl TextEngine {
              * compute tab stops themselves. Skip silently rather
              * than let the shaper emit a `.notdef` box. */
             if cp < 0x20 || cp == 0x7f { continue; }
-            let entry = match page.ensure(font_id, size_px, cp, &font_bytes) {
+            clock += 1;
+            let entry = match page.ensure(font_id, size_px, cp, &font_bytes, clock) {
                 Some(e) => e,
                 None    => continue,
             };
@@ -399,13 +504,18 @@ impl TextEngine {
             }
             pen_x += entry.advance;
         }
+        self.lru_clock = clock;
+        let page = self.pages.get_mut(&page_key).unwrap();
 
         let pending = if page.dirty_bbox.is_some() {
-            if !page.allocated_on_gpu {
-                /* First upload for this slot: ship the whole atlas
-                 * to allocate the GPU image. Wasteful (most of it is
-                 * zeros) but happens exactly once per (font, size). */
+            if !page.allocated_on_gpu || page.needs_full_resync {
+                /* First upload for this slot — or a post-eviction
+                 * resync where every glyph moved on the GPU side.
+                 * Either way ship the whole atlas. Happens exactly
+                 * once per (font, size) per process lifetime in the
+                 * common case (no eviction). */
                 page.allocated_on_gpu = true;
+                page.needs_full_resync = false;
                 page.dirty_bbox = None;
                 Some(PendingAtlasUpload::Full {
                     slot_id: page.slot_id,
@@ -434,6 +544,46 @@ impl TextEngine {
             glyphs,
         };
         Some((run, pending))
+    }
+
+    /// Shape `text` with `font_id` at `size_px` and return the run's
+    /// pixel-space metrics. Reuses `shape_text_run`'s machinery — the
+    /// caching side-effect is intentional, so a measure followed by an
+    /// install in the same frame doesn't pay double.
+    pub fn measure(
+        &mut self,
+        font_id: u32,
+        size_px: f32,
+        text: &str,
+    ) -> Option<(f32, f32, f32)> {
+        let f = self.fonts.get(&font_id)?;
+        let upe = f.metrics.units_per_em as f32;
+        let ascent_px  = f.metrics.ascent_units  as f32 * size_px / upe;
+        let descent_px = -(f.metrics.descent_units as f32) * size_px / upe;
+
+        let font_bytes = f.bytes.clone();
+        let size_key = (size_px * 100.0) as u32;
+        let page_key = (font_id, size_key);
+        if !self.pages.contains_key(&page_key) {
+            let id = self.next_slot_id;
+            self.next_slot_id += 1;
+            self.pages.insert(page_key, AtlasPage::new(id));
+        }
+        let mut clock = self.lru_clock;
+        let page = self.pages.get_mut(&page_key).unwrap();
+        let mut width = 0.0_f32;
+        for ch in text.chars() {
+            let cp = ch as u32;
+            if cp < 0x20 || cp == 0x7f { continue; }
+            clock += 1;
+            let entry = match page.ensure(font_id, size_px, cp, &font_bytes, clock) {
+                Some(e) => e,
+                None    => continue,
+            };
+            width += entry.advance;
+        }
+        self.lru_clock = clock;
+        Some((width, ascent_px, descent_px))
     }
 
     fn read_font(&self, name: &str) -> Option<Vec<u8>> {

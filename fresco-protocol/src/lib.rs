@@ -85,6 +85,7 @@ pub mod control {
     pub const OP_FONT_OPEN:          u16 = 0x0050;  // → response with font_id
     pub const OP_FONT_CLOSE:         u16 = 0x0051;
     pub const OP_TEXT_RUN_INSTALL:   u16 = 0x0052;
+    pub const OP_TEXT_MEASURE:       u16 = 0x0053;  // → response with width/ascent/descent
 
     // ── Window management (§3.8.1) ──
     // Control (client → server)
@@ -360,6 +361,33 @@ pub struct TextRunInstallPayload {
     /// in the bundle's frag shader.
     pub r: f32, pub g: f32, pub b: f32, pub a: f32,
     pub text:    String,
+}
+
+/// `OP_TEXT_MEASURE` — synchronous query: how wide is this string
+/// when shaped with `(font_id, size_px)`? Apps that lay out
+/// proportional text (toolkits with right-aligned widgets, dialog
+/// auto-sizing, in-line wrapping) call this once per logical run
+/// and use the returned width to position the next element.
+///
+/// Server replies with `OP_TEXT_MEASURE | flag::IS_RESPONSE` carrying
+/// `TextMeasureResponse`. Width / ascent / descent are in window
+/// pixels at the requested size.
+///
+/// Cost: one shape call. Server caches the per-glyph metrics in the
+/// same atlas page that `OP_TEXT_RUN_INSTALL` uses, so a measure
+/// followed by an install in the same frame doesn't pay twice.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TextMeasurePayload {
+    pub font_id: u32,
+    pub size_px: f32,
+    pub text:    String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct TextMeasureResponse {
+    pub width_px:   f32,
+    pub ascent_px:  f32,
+    pub descent_px: f32,
 }
 
 // ── Window event payloads (server → client, ASYNC_EVENT flag) ────────

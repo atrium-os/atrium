@@ -46,6 +46,7 @@ use fresco_protocol::{
     WindowSetTitlePayload, WindowSetHintsPayload,
     WindowRequestClosePayload, WindowPresentPayload,
     FontOpenPayload, FontOpenResponse, FontClosePayload, TextRunInstallPayload,
+    TextMeasurePayload, TextMeasureResponse,
 };
 use aqueduct::envelope::flag;
 use fresco_vulkan::UploadRequest;
@@ -353,10 +354,11 @@ impl EnvelopeFrontend {
             control::OP_SCENE_NODE_SET     => self.handle_scene_node_set(msg),
             control::OP_SCENE_NODE_CLEAR   => self.handle_scene_node_clear(msg),
 
-            // Server-side text (M6.3)
+            // Server-side text (M6.3 + M6.5)
             control::OP_FONT_OPEN          => self.handle_font_open(msg),
             control::OP_FONT_CLOSE         => self.handle_font_close(msg),
             control::OP_TEXT_RUN_INSTALL   => self.handle_text_run_install(msg),
+            control::OP_TEXT_MEASURE       => self.handle_text_measure(msg),
 
             // ── Window management ops (window_id is in payload) ──
             control::OP_WINDOW_CREATE        => self.handle_window_create(msg),
@@ -615,6 +617,27 @@ impl EnvelopeFrontend {
             .map_err(|_| DispatchError::BadPayload)?;
         self.text.write().unwrap().close(p.font_id);
         Ok(Vec::new())
+    }
+
+    fn handle_text_measure(&mut self, msg: &Message)
+        -> Result<Vec<Outbound>, DispatchError>
+    {
+        let p: TextMeasurePayload = decode(&msg.payload)
+            .map_err(|_| DispatchError::BadPayload)?;
+        let resp = match self.text.write().unwrap().measure(p.font_id, p.size_px, &p.text) {
+            Some((w, a, d)) => TextMeasureResponse {
+                width_px: w, ascent_px: a, descent_px: d,
+            },
+            None => TextMeasureResponse {
+                width_px: 0.0, ascent_px: 0.0, descent_px: 0.0,
+            },
+        };
+        let payload = encode(&resp).map_err(|_| DispatchError::BadPayload)?;
+        Ok(vec![Outbound {
+            op:      control::OP_TEXT_MEASURE,
+            flags:   flag::IS_RESPONSE,
+            payload,
+        }])
     }
 
     fn handle_text_run_install(&mut self, msg: &Message)

@@ -19,16 +19,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         f.font_id, f.units_per_em, f.ascent_units, f.descent_units,
     );
 
+    let text = "Hello from frescod!";
+    let m = conn.text_measure(f.font_id, 64.0, text)?;
+    eprintln!(
+        "measured '{text}' @ 64px → width={:.1} ascent={:.1} descent={:.1}",
+        m.width_px, m.ascent_px, m.descent_px,
+    );
+
     conn.scene_frame_begin()?;
     conn.text_run_install(
         /*node_id=*/ 200,
         f.font_id, /*size_px=*/ 64.0,
         /*x=*/ 80.0, /*y=*/ 400.0,
         /*color=*/ [1.0, 1.0, 1.0, 1.0],
-        "Hello from frescod!",
+        text,
     )?;
     conn.scene_frame_end()?;
-    eprintln!("installed text run 'Hello from frescod!'");
+    eprintln!("installed text run '{text}'");
 
     std::thread::sleep(std::time::Duration::from_secs(3600));
     Ok(())

@@ -45,9 +45,11 @@ use fresco_protocol::{
     InputKeyEvent, InputPointerMotionEvent,
     InputPointerButtonEvent, InputPointerScrollEvent,
     FontOpenPayload, FontOpenResponse, FontClosePayload, TextRunInstallPayload,
+    TextMeasurePayload, TextMeasureResponse,
     scene_ops,
 };
 pub use fresco_protocol::FontOpenResponse as RemoteFontMetrics;
+pub use fresco_protocol::TextMeasureResponse as TextMetrics;
 
 // ── async event surface ──────────────────────────────────────────────
 
@@ -372,6 +374,34 @@ impl Connection {
     pub fn font_close(&mut self, font_id: u32) -> io::Result<()> {
         self.send_routable(control::OP_FONT_CLOSE,
             &FontClosePayload { font_id })
+    }
+
+    /// Synchronous text measurement: ask the server for the pixel
+    /// width, ascent, and descent of `text` shaped with `font_id`
+    /// at `size_px`. Apps that lay out proportional text use this to
+    /// position right-aligned widgets, auto-size dialogs, or wrap.
+    ///
+    /// Cost: one round-trip + one server-side shape call (cached;
+    /// a follow-up `text_run_install` doesn't re-rasterize).
+    pub fn text_measure(
+        &mut self,
+        font_id: u32, size_px: f32,
+        text: impl Into<String>,
+    ) -> io::Result<TextMeasureResponse> {
+        self.send_payload(control::OP_TEXT_MEASURE, 0,
+            &TextMeasurePayload { font_id, size_px, text: text.into() })?;
+        loop {
+            let m = self.inner.recv_message()?;
+            if m.opcode_class == CLASS_DISPLAY
+               && m.op == control::OP_TEXT_MEASURE
+               && m.flags & flag::IS_RESPONSE != 0
+            {
+                return decode::<TextMeasureResponse>(&m.payload)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData,
+                        format!("decode TEXT_MEASURE reply: {e}")));
+            }
+            log::debug!("text_measure: skipping unrelated message op={:#x}", m.op);
+        }
     }
 
     /// Server-side shape + atlas + GLYPH_RUN install in one envelope.
