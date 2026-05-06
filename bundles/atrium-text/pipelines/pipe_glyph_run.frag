@@ -1,10 +1,10 @@
 // Fragment shader for atrium-text's `glyph_run` op.
 //
-// Samples a single-channel R8 atlas to get glyph coverage, multiplies
-// by the per-instance color, emits premultiplied output. The render
-// pipeline's blend state is ONE * src + (ONE_MINUS_SRC_ALPHA) * dst,
-// so this composites correctly over arbitrary backgrounds without a
-// separate alpha-channel test.
+// Samples a single-channel R8 atlas for glyph coverage and emits a
+// straight-alpha colour: full RGB, alpha modulated by coverage. The
+// pipeline-wide blend state is SRC_ALPHA / ONE_MINUS_SRC_ALPHA
+// (non-premul). Emitting premul here would double-multiply the
+// coverage into the colour and produce visible darker outlines.
 
 #version 460
 
@@ -16,5 +16,5 @@ layout(location = 0) out vec4 frag_color;
 
 void main() {
     float coverage = texture(atlas, v_uv).r;
-    frag_color = vec4(v_color.rgb * coverage, v_color.a * coverage);
+    frag_color = vec4(v_color.rgb, v_color.a * coverage);
 }

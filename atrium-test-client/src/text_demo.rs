@@ -23,13 +23,21 @@ const ATLAS_SLOT: u32 = 100;
 const RUN_NODE:   u32 = 200;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let font = std::fs::read(FONT_PATH)?;
+    let atlas = shape_and_rasterize(&font, TEXT, SIZE_PX)?;
+    if std::env::var("DUMP_ATLAS").is_ok() {
+        use std::io::Write;
+        let r8 = atlas.r8_pixels();
+        let mut f = std::fs::File::create("/tmp/atlas_r8.raw")?;
+        f.write_all(&r8)?;
+        eprintln!("dumped atlas to /tmp/atlas_r8.raw ({}x{})",
+                  atlas.width, atlas.height);
+        return Ok(());
+    }
     let path = std::env::args().nth(1)
         .unwrap_or_else(|| "/tmp/frescod.sock".to_string());
     let mut conn = Connection::connect(&path)?;
     eprintln!("connected to {path}");
-
-    let font = std::fs::read(FONT_PATH)?;
-    let atlas = shape_and_rasterize(&font, TEXT, SIZE_PX)?;
     eprintln!(
         "shaped {:?}: {} glyphs, atlas {}x{}, advance={:.1}",
         TEXT, atlas.glyphs.len(), atlas.width, atlas.height, atlas.advance,
