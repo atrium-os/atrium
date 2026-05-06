@@ -23,4 +23,5 @@ libc = "0.2"
 aqueduct        = { path = "../aqueduct" }
 fresco-protocol = { path = "../fresco-protocol" }
 fresco-vulkan   = { path = "../fresco-vulkan" }
+fresco-text     = { path = "../fresco-text" }
 ash             = "0.38"

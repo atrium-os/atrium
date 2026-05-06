@@ -30,6 +30,10 @@ path = "src/text_demo.rs"
 name = "atrium-window-demo"
 path = "src/window_demo.rs"
 
+[[bin]]
+name = "atrium-server-text-demo"
+path = "src/server_text_demo.rs"
+
 [dependencies]
 fresco-client   = { path = "../fresco-client" }
 fresco-protocol = { path = "../fresco-protocol" }

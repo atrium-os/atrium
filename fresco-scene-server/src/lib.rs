@@ -18,3 +18,4 @@ pub mod scene;
 pub mod command;
 pub mod render;
 pub mod window;
+pub mod text;

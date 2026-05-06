@@ -44,8 +44,10 @@ use fresco_protocol::{
     WindowCloseRequestedEvent, WindowDpiChangedEvent,
     InputKeyEvent, InputPointerMotionEvent,
     InputPointerButtonEvent, InputPointerScrollEvent,
+    FontOpenPayload, FontOpenResponse, FontClosePayload, TextRunInstallPayload,
     scene_ops,
 };
+pub use fresco_protocol::FontOpenResponse as RemoteFontMetrics;
 
 // ── async event surface ──────────────────────────────────────────────
 
@@ -341,6 +343,55 @@ impl Connection {
             &WindowPresentPayload { window_id })
     }
 
+    // ── Server-side text (M6.3) ────────────────────────────────────
+
+    /// Open a font by server-resolved name (e.g. `"system-mono"`,
+    /// `"DejaVuSansMono"`). Blocks for the server's reply containing
+    /// the assigned `font_id` + per-em metrics. `font_id == 0` in the
+    /// returned struct means the server couldn't locate the font.
+    pub fn font_open(&mut self, name: impl Into<String>) -> io::Result<FontOpenResponse> {
+        self.send_payload(control::OP_FONT_OPEN, 0,
+            &FontOpenPayload { name: name.into() })?;
+        loop {
+            let m = self.inner.recv_message()?;
+            if m.opcode_class == CLASS_DISPLAY
+               && m.op == control::OP_FONT_OPEN
+               && m.flags & flag::IS_RESPONSE != 0
+            {
+                let resp: FontOpenResponse = decode(&m.payload)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData,
+                        format!("decode FONT_OPEN reply: {e}")))?;
+                return Ok(resp);
+            }
+            log::debug!("font_open: skipping unrelated message op={:#x}", m.op);
+        }
+    }
+
+    /// Release a font reference. The server frees the loaded font
+    /// when its refcount drops to zero.
+    pub fn font_close(&mut self, font_id: u32) -> io::Result<()> {
+        self.send_routable(control::OP_FONT_CLOSE,
+            &FontClosePayload { font_id })
+    }
+
+    /// Server-side shape + atlas + GLYPH_RUN install in one envelope.
+    /// `(x, y)` is the run origin in window pixels with `y` at the
+    /// baseline. The server commits the resulting glyph_run node into
+    /// `node_id` in the routed window's scene state.
+    pub fn text_run_install(
+        &mut self,
+        node_id: u32, font_id: u32, size_px: f32,
+        x: f32, y: f32, color: [f32; 4],
+        text: impl Into<String>,
+    ) -> io::Result<()> {
+        self.send_routable(control::OP_TEXT_RUN_INSTALL,
+            &TextRunInstallPayload {
+                node_id, font_id, size_px, x, y,
+                r: color[0], g: color[1], b: color[2], a: color[3],
+                text: text.into(),
+            })
+    }
+
     // ── Async events ───────────────────────────────────────────────
 
     /// Non-blocking poll for the next server-pushed event.
@@ -467,6 +518,23 @@ impl<'a> FrameBuilder<'a> {
     pub fn glyph_run(&mut self, p: GlyphRunParams) -> io::Result<u32> {
         let id = self.next_id;
         self.conn.scene_node_glyph_run(id, p)?;
+        self.next_id += 1;
+        Ok(id)
+    }
+
+    /// M6.3 server-side text: install a shaped run by reference. The
+    /// server shapes `text` with `font_id` at `size_px`, lazily
+    /// extends its atlas, and commits the equivalent glyph_run node
+    /// at the returned id.
+    pub fn text_run(
+        &mut self,
+        font_id: u32, size_px: f32,
+        x: f32, y: f32,
+        color: [f32; 4],
+        text: impl Into<String>,
+    ) -> io::Result<u32> {
+        let id = self.next_id;
+        self.conn.text_run_install(id, font_id, size_px, x, y, color, text)?;
         self.next_id += 1;
         Ok(id)
     }

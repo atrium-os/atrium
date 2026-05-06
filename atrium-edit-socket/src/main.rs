@@ -1,16 +1,12 @@
 //! atrium-edit-socket — minimal text editor on the Atrium FreeBSD
-//! stack, ported to fresco-client (M3d).
+//! stack, on the M6.3 server-side text path.
 //!
-//! Reuses the original buffer + keymap modules unchanged. Renderer
-//! emits per-glyph TEXTURE nodes against per-glyph slots and a single
-//! RECT node for the cursor (no rotation needed → RECT not PATH).
-//!
-//! Interactive: server pushes EV_INPUT_KEY events (M3a — native
-//! /dev/hidraw → DisplayEvent fan-out); we filter by window_id, run
-//! through the existing keymap → buffer-mutation → re-render loop.
+//! Server owns the font + atlas + shaper. Per-frame the editor sends
+//! one OP_TEXT_RUN_INSTALL per visible line + one for the status bar
+//! and a single OP_SCENE_NODE_SET (RECT) for the cursor. No font file,
+//! no rustybuzz, no swash.
 
 mod buffer;
-use fresco_client::MonoAtlas;
 mod keymap;
 mod render;
 
@@ -22,7 +18,7 @@ use fresco_protocol::WindowHints;
 
 use crate::keymap::Action;
 
-const FONT_PATH:    &str   = "/mnt/host/test-assets/DejaVuSansMono.ttf";
+const FONT_NAME:    &str   = "system-mono";
 const FONT_SIZE_PX: f32    = 18.0;
 const VIEWPORT_ROWS: usize = 24;
 const WIN_W: u32 = 720;
@@ -36,8 +32,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     eprintln!("buffer: {} lines (path={:?})", buf.lines.len(), buf.path);
 
-    let font = std::fs::read(FONT_PATH)?;
-
     let sock = std::env::var("FRESCOD_SOCK")
         .unwrap_or_else(|_| "/tmp/frescod.sock".to_string());
     let mut conn = Connection::connect(&sock)?;
@@ -49,8 +43,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     eprintln!("window {win} created — {WIN_W}x{WIN_H}");
 
-    let cache    = MonoAtlas::build(&mut conn, &font, FONT_SIZE_PX, 100)?;
-    let renderer = render::Renderer::new(&cache);
+    let font = conn.font_open(FONT_NAME)?;
+    if font.font_id == 0 {
+        return Err(format!("server could not open '{FONT_NAME}'").into());
+    }
+    let upe = font.units_per_em as f32;
+    let ascent_px  = font.ascent_units  as f32 * FONT_SIZE_PX / upe;
+    let descent_px = -(font.descent_units as f32) * FONT_SIZE_PX / upe;
+    let cell_w     = if font.mono_advance_units > 0 {
+        font.mono_advance_units as f32 * FONT_SIZE_PX / upe
+    } else {
+        FONT_SIZE_PX * 0.6 /* heuristic fallback for proportional */
+    };
+    let line_h = ascent_px + descent_px + 2.0;
+
+    eprintln!(
+        "font: {} (id={}) cell_w={:.1} line_h={:.1} baseline={:.1}",
+        FONT_NAME, font.font_id, cell_w, line_h, ascent_px,
+    );
+
+    let renderer = render::Renderer::new(font.font_id, FONT_SIZE_PX,
+                                         cell_w, line_h, ascent_px);
     let mut keymap = keymap::Keymap::new();
 
     renderer.render(&mut conn, &buf, VIEWPORT_ROWS, /*cursor_visible=*/true)?;
@@ -61,8 +74,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ev = conn.wait_event(None)?;
         let mut dirty = false;
 
-        /* Drain a burst — multiple keystrokes shouldn't trigger
-         * multiple renders. */
         let mut next = ev;
         loop {
             match next {

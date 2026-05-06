@@ -74,6 +74,18 @@ pub mod control {
     pub const OP_SCENE_NODE_SET:     u16 = 0x0040;
     pub const OP_SCENE_NODE_CLEAR:   u16 = 0x0041;
 
+    // ── Server-side text (M6.3) ──
+    //
+    // Frescod owns the font registry and the rasterizer. Clients open
+    // a font by name, then install a text run by referencing the font
+    // id + size + a UTF-8 string. The server shapes, rasterizes lazily
+    // into a server-managed atlas, and commits the resulting GLYPH_RUN
+    // node into the client's window scene state — no client-side
+    // shaping crate, no client-side atlas, no font-file shipping.
+    pub const OP_FONT_OPEN:          u16 = 0x0050;  // → response with font_id
+    pub const OP_FONT_CLOSE:         u16 = 0x0051;
+    pub const OP_TEXT_RUN_INSTALL:   u16 = 0x0052;
+
     // ── Window management (§3.8.1) ──
     // Control (client → server)
     pub const OP_WINDOW_CREATE:        u16 = 0x0500;
@@ -273,6 +285,81 @@ pub struct WindowRequestClosePayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowPresentPayload {
     pub window_id: u32,
+}
+
+// ── Server-side text payloads (M6.3) ─────────────────────────────────
+
+/// `OP_FONT_OPEN` — request the server to load a font by name and
+/// return a `font_id` the client can pass to subsequent
+/// `OP_TEXT_RUN_INSTALL` calls.
+///
+/// `name` is a server-resolved identifier (e.g. `"DejaVuSansMono"` or
+/// `"system-mono"`). The server's font search path is implementation-
+/// defined; the POC ships a small built-in registry in
+/// `frescod::font`.
+///
+/// The server replies with `OP_FONT_OPEN | flag::IS_RESPONSE` carrying
+/// `FontOpenResponse`. `font_id == 0` indicates failure (font not
+/// found); apps should fall back or warn.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FontOpenPayload {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FontOpenResponse {
+    /// Server-assigned id, 0 on failure. Stable until the client
+    /// disconnects or sends `OP_FONT_CLOSE`.
+    pub font_id:     u32,
+    /// Font ascent at 1.0 size, in font-design units. Multiply by
+    /// `size_px / units_per_em` for pixel ascent. Surfaced so simple
+    /// clients can pre-size their layout without an extra round trip.
+    pub units_per_em: u32,
+    pub ascent_units: i32,
+    pub descent_units: i32,
+    /// Monospace per-glyph advance in font-design units, or 0 if the
+    /// font is proportional. Apps that lay out on a fixed grid
+    /// (terminal, code editor) read this to compute cell width;
+    /// proportional layouts measure each run with `OP_TEXT_MEASURE`
+    /// (deferred to M6.5).
+    pub mono_advance_units: i32,
+}
+
+/// `OP_FONT_CLOSE` — client signals it no longer needs `font_id`.
+/// Refcount-managed; the server only frees the underlying font when
+/// the last reference drops.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FontClosePayload {
+    pub font_id: u32,
+}
+
+/// `OP_TEXT_RUN_INSTALL` — server-side shaping + atlas + GLYPH_RUN
+/// install in one round-trip. The server shapes `text` with `font_id`
+/// at `size_px`, ensures every needed glyph is in its lazy atlas,
+/// then commits a `GlyphRunParams` node at `node_id` in the target
+/// window's scene state (just as if the client had sent the
+/// equivalent `OP_SCENE_NODE_SET` with op_id `ATRIUM_TEXT_GLYPH_RUN`).
+///
+/// Routable: target `window_id` lives in the envelope `flags` field
+/// like every other scene op.
+///
+/// No response — fire-and-forget. Apps that need to know the run's
+/// width (for layout) should use the per-font metrics returned by
+/// `OP_FONT_OPEN` and compute width = sum(glyph_advance) themselves,
+/// or use the future `OP_TEXT_MEASURE` op (deferred to M6.5).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TextRunInstallPayload {
+    pub node_id: u32,
+    pub font_id: u32,
+    pub size_px: f32,
+    /// Run origin in window pixels; `y` is the text baseline (matches
+    /// `GlyphRunParams` convention).
+    pub x:       f32,
+    pub y:       f32,
+    /// Foreground colour. Atlas coverage is multiplied against this
+    /// in the bundle's frag shader.
+    pub r: f32, pub g: f32, pub b: f32, pub a: f32,
+    pub text:    String,
 }
 
 // ── Window event payloads (server → client, ASYNC_EVENT flag) ────────

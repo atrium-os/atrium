@@ -38,15 +38,18 @@ use std::sync::{Arc, Mutex};
 
 use aqueduct::{Message, MessageKind};
 use fresco_protocol::{
-    control, decode, scene_ops,
+    control, decode, encode, scene_ops,
     SceneNodeSetPayload, SceneNodeClearPayload,
     SlotSetPayload, SlotClearPayload, SlotKind, TextureFormat,
     RectParams, TextureParams, PathParams, GlyphRunParams,
     WindowCreatePayload, WindowDestroyPayload,
     WindowSetTitlePayload, WindowSetHintsPayload,
     WindowRequestClosePayload, WindowPresentPayload,
+    FontOpenPayload, FontOpenResponse, FontClosePayload, TextRunInstallPayload,
 };
+use aqueduct::envelope::flag;
 use fresco_vulkan::UploadRequest;
+use crate::text::{TextEngine, SharedTextEngine, PendingAtlasUpload};
 
 use crate::cas::store::CasStore;
 use crate::window::Compositor;
@@ -224,17 +227,35 @@ pub struct EnvelopeFrontend {
     pending_slot_sets: Vec<(u32, [u8; 32], SlotKind)>,
     /// Slot CLEARs accumulated since the last drain.
     pending_slot_clears: Vec<u32>,
+    /// Atlas pages produced by server-side text shaping that need to
+    /// be re-uploaded before the next render.
+    pending_atlas_uploads: Vec<PendingAtlasUpload>,
+
+    /// Server-side text engine: font registry + lazy atlases. Shared
+    /// across all clients so DejaVuSansMono-16 atlas is built once and
+    /// reused regardless of which client first asked.
+    text: SharedTextEngine,
 }
 
 impl EnvelopeFrontend {
     pub fn new(cas: Arc<Mutex<CasStore>>,
                compositor: Arc<Mutex<Compositor>>) -> Self {
+        Self::new_with_text(cas, compositor,
+            Arc::new(std::sync::RwLock::new(TextEngine::new())))
+    }
+
+    pub fn new_with_text(
+        cas: Arc<Mutex<CasStore>>,
+        compositor: Arc<Mutex<Compositor>>,
+        text: SharedTextEngine,
+    ) -> Self {
         Self {
-            cas, compositor,
+            cas, compositor, text,
             per_window: HashMap::new(),
             current_client: 0,
             pending_slot_sets: Vec::new(),
             pending_slot_clears: Vec::new(),
+            pending_atlas_uploads: Vec::new(),
         }
     }
 
@@ -256,8 +277,9 @@ impl EnvelopeFrontend {
     pub fn take_pending_uploads(&mut self) -> (Vec<UploadRequest>, Vec<u32>) {
         let sets = std::mem::take(&mut self.pending_slot_sets);
         let clears = std::mem::take(&mut self.pending_slot_clears);
+        let atlas_uploads = std::mem::take(&mut self.pending_atlas_uploads);
         let cas = self.cas.lock().unwrap();
-        let mut uploads = Vec::with_capacity(sets.len());
+        let mut uploads = Vec::with_capacity(sets.len() + atlas_uploads.len());
         for (slot_id, hash, kind) in sets {
             let Some(bytes) = cas.load(&hash) else {
                 log::warn!("slot_set slot={slot_id}: CAS miss for hash; \
@@ -281,6 +303,19 @@ impl EnvelopeFrontend {
                     });
                 }
             }
+        }
+        /* Server-managed text atlases. Bytes already in hand from
+         * the text engine — bypass CAS, go straight to UploadRequest.
+         * The server-slot range (>= SERVER_SLOT_BASE) keeps these
+         * from colliding with client-managed slots. */
+        for a in atlas_uploads {
+            uploads.push(UploadRequest::Texture {
+                slot_id: a.slot_id,
+                bytes:   a.pixels,
+                width:   a.width,
+                height:  a.height,
+                format:  ash::vk::Format::R8_UNORM,
+            });
         }
         (uploads, clears)
     }
@@ -309,6 +344,11 @@ impl EnvelopeFrontend {
             control::OP_SCENE_FRAME_END    => self.handle_scene_frame_end(msg),
             control::OP_SCENE_NODE_SET     => self.handle_scene_node_set(msg),
             control::OP_SCENE_NODE_CLEAR   => self.handle_scene_node_clear(msg),
+
+            // Server-side text (M6.3)
+            control::OP_FONT_OPEN          => self.handle_font_open(msg),
+            control::OP_FONT_CLOSE         => self.handle_font_close(msg),
+            control::OP_TEXT_RUN_INSTALL   => self.handle_text_run_install(msg),
 
             // ── Window management ops (window_id is in payload) ──
             control::OP_WINDOW_CREATE        => self.handle_window_create(msg),
@@ -523,6 +563,76 @@ impl EnvelopeFrontend {
             s.glyph_run_nodes.remove(&p.node_id);
             s.node_writers.remove(&p.node_id);
         }
+        Ok(Vec::new())
+    }
+
+    // ── Server-side text handlers (M6.3) ─────────────────────────────
+
+    fn handle_font_open(&mut self, msg: &Message)
+        -> Result<Vec<Outbound>, DispatchError>
+    {
+        let p: FontOpenPayload = decode(&msg.payload)
+            .map_err(|_| DispatchError::BadPayload)?;
+        let mut text = self.text.write().unwrap();
+        let resp = match text.open(&p.name) {
+            Some((font_id, m)) => FontOpenResponse {
+                font_id,
+                units_per_em: m.units_per_em,
+                ascent_units: m.ascent_units,
+                descent_units: m.descent_units,
+                mono_advance_units: m.mono_advance_units,
+            },
+            None => {
+                log::warn!("FONT_OPEN '{}' failed — not found in search path",
+                           p.name);
+                FontOpenResponse {
+                    font_id: 0,
+                    units_per_em: 0, ascent_units: 0, descent_units: 0,
+                    mono_advance_units: 0,
+                }
+            }
+        };
+        let payload = encode(&resp).map_err(|_| DispatchError::BadPayload)?;
+        Ok(vec![Outbound {
+            op:      control::OP_FONT_OPEN,
+            flags:   flag::IS_RESPONSE,
+            payload,
+        }])
+    }
+
+    fn handle_font_close(&mut self, msg: &Message)
+        -> Result<Vec<Outbound>, DispatchError>
+    {
+        let p: FontClosePayload = decode(&msg.payload)
+            .map_err(|_| DispatchError::BadPayload)?;
+        self.text.write().unwrap().close(p.font_id);
+        Ok(Vec::new())
+    }
+
+    fn handle_text_run_install(&mut self, msg: &Message)
+        -> Result<Vec<Outbound>, DispatchError>
+    {
+        let win_id = self.check_routable(msg)?;
+        let p: TextRunInstallPayload = decode(&msg.payload)
+            .map_err(|_| DispatchError::BadPayload)?;
+
+        let (run, pending) = {
+            let mut text = self.text.write().unwrap();
+            text.shape_text_run(
+                p.font_id, p.size_px, p.x, p.y,
+                [p.r, p.g, p.b, p.a], &p.text,
+            ).ok_or(DispatchError::BadPayload)?
+        };
+        if let Some(up) = pending {
+            self.pending_atlas_uploads.push(up);
+        }
+        let writer = self.current_client;
+        let s = self.ensure_window_state(win_id);
+        s.glyph_run_nodes.insert(p.node_id, run);
+        s.rect_nodes.remove(&p.node_id);
+        s.texture_nodes.remove(&p.node_id);
+        s.path_nodes.remove(&p.node_id);
+        s.node_writers.insert(p.node_id, writer);
         Ok(Vec::new())
     }
 
