@@ -67,14 +67,18 @@ pub struct GlyphRunNode {
 }
 
 /// One glyph within a glyph run. Mirrors `GlyphInstance` in the GPU
-/// kernel (32 bytes). Lives in the per-frame glyphs storage buffer;
-/// the kernel reads them via `meta.y + i` indexing.
+/// kernel under std430 layout: `vec2 d_offset`, `vec4 atlas_uv`,
+/// `vec2 bearing`. std430 forces 16-byte alignment on vec4, padding
+/// the vec2s out to 48 bytes total. Explicit padding fields here
+/// make that match exact and keep `bytemuck::cast_slice` happy.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GlyphInstance {
     pub d_offset: [f32; 2],    /* dx, dy from run origin */
+    pub _pad0:    [f32; 2],
     pub atlas_uv: [f32; 4],    /* u, v, w, h in atlas pixel coords */
     pub bearing:  [f32; 2],    /* bearing_x, bearing_y */
+    pub _pad1:    [f32; 2],
 }
 
 /// Header word that precedes the SceneNode array in the scene buffer.

@@ -63,17 +63,26 @@ fn main() -> io::Result<()> {
     let mut renderer = HeadlessRenderer::new(WIDTH, HEIGHT)
         .map_err(|e| io::Error::new(io::ErrorKind::Other,
             format!("HeadlessRenderer::new: {e}")))?;
-    let bundle_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent().unwrap()
-        .join("bundles/atrium-core");
-    if !bundle_path.join("compute/op_rectangle.comp.spv").exists() {
+    let bundles_root = std::env::var("FRESCOD_BUNDLES_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().join("bundles"));
+    let core = bundles_root.join("atrium-core");
+    if !core.join("compute/op_rectangle.comp.spv").exists() {
         eprintln!("error: SPIR-V not built. Run bundles/atrium-core/build.sh first.");
         return Err(io::Error::new(io::ErrorKind::NotFound, "missing SPIR-V"));
     }
-    renderer.load_bundle(&bundle_path)
+    renderer.load_bundle(&core)
         .map_err(|e| io::Error::new(io::ErrorKind::Other,
-            format!("load_bundle: {e}")))?;
-    eprintln!("frescod-vulkan-smoke: atrium-core bundle loaded ({} ops)",
+            format!("load_bundle(atrium-core): {e}")))?;
+    let text = bundles_root.join("atrium-text");
+    if text.join("compute/op_glyph_run.comp.spv").exists() {
+        renderer.load_bundle(&text)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other,
+                format!("load_bundle(atrium-text): {e}")))?;
+        eprintln!("frescod-vulkan-smoke: atrium-text bundle loaded");
+    }
+    eprintln!("frescod-vulkan-smoke: total ops registered: {}",
         renderer.op_count());
 
     /* Set up the dispatcher. Compositor + CasStore + SceneGraph + SlotTable
@@ -84,7 +93,7 @@ fn main() -> io::Result<()> {
     let scene = Arc::new(Mutex::new(SceneGraph::new()));
     let slots = Arc::new(Mutex::new(SlotTable::new()));
     let comp  = Arc::new(Mutex::new(Compositor::new_with_window0(scene, slots)));
-    let mut frontend = EnvelopeFrontend::new(cas, comp);
+    let mut frontend = EnvelopeFrontend::new(cas.clone(), comp);
 
     /* Single-client smoke loop: accept one connection, drive everything
      * inline. Multi-client fan-out is M2.7d-final. */
@@ -111,6 +120,22 @@ fn main() -> io::Result<()> {
             continue;
         }
 
+        /* SLOT_SET references a CAS hash that was uploaded just before
+         * over CLASS_CORE; aqueduct's Connection has the bytes in its
+         * per-connection cache. The scene-server CasStore is separate;
+         * pull the bytes across now so `take_pending_uploads` can
+         * resolve the hash to data when it builds UploadRequests. */
+        if msg.op == control::OP_SLOT_SET {
+            if let Ok(p) = fresco_protocol::decode::<fresco_protocol::SlotSetPayload>(&msg.payload) {
+                if let Some(bytes) = conn.cache_get(&p.hash) {
+                    cas.lock().unwrap().store(&bytes);
+                } else {
+                    log::warn!("slot_set hash not in connection cache; \
+                                upload may not have completed");
+                }
+            }
+        }
+
         let was_frame_end = msg.op == control::OP_SCENE_FRAME_END;
 
         let outbound = match frontend.dispatch(&msg, client_id) {
@@ -130,13 +155,20 @@ fn main() -> io::Result<()> {
         /* On SCENE_FRAME_END, render + dump. */
         if was_frame_end {
             let win_id = msg.flags as u32;
-            if let Some(state) = frontend.window_state(win_id) {
-                let rects    = state.extract_rect_nodes();
-                let paths    = state.extract_path_nodes();
-                let textures = state.extract_texture_batches();
+            if frontend.window_state(win_id).is_some() {
+                let (uploads, clears) = frontend.take_pending_uploads();
+                renderer.process_uploads(uploads, clears)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other,
+                        format!("process_uploads: {e}")))?;
+                let state = frontend.window_state(win_id).unwrap();
+                let rects     = state.extract_rect_nodes();
+                let paths     = state.extract_path_nodes();
+                let textures  = state.extract_texture_batches();
+                let glyph_run = state.extract_glyph_run_batches();
                 renderer.set_rect_nodes(rects);
                 renderer.set_path_nodes(paths);
                 renderer.set_texture_batches(textures);
+                renderer.set_glyph_run_batches(glyph_run);
                 renderer.render_to_buffer()
                     .map_err(|e| io::Error::new(io::ErrorKind::Other,
                         format!("render: {e}")))?;

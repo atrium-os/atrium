@@ -75,7 +75,13 @@ struct DrawPlan {
     render_set:       vk::DescriptorSet,
     counter_buf:      vk::Buffer,
     instance_buf:     vk::Buffer,
+    /// Compute-dispatch input count (one work-item per scene node).
     n:                u32,
+    /// Total instance count for the indirect draw. Equal to `n` for
+    /// ops that expand 1 node → 1 instance (Rect, Texture, Path);
+    /// for GlyphRun, equal to the total glyph count across all nodes
+    /// in this batch (one node expands to N glyphs).
+    draw_instances:   u32,
 }
 
 const COLOR_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
@@ -367,6 +373,7 @@ impl HeadlessRenderer {
                     counter_buf:       frame.counter_buf,
                     instance_buf:      frame.instance_buf,
                     n,
+                    draw_instances:    n,
                 });
             }
 
@@ -392,6 +399,7 @@ impl HeadlessRenderer {
                     counter_buf:       frame.counter_buf,
                     instance_buf:      frame.instance_buf,
                     n,
+                    draw_instances:    n,
                 });
             }
 
@@ -420,6 +428,7 @@ impl HeadlessRenderer {
                         counter_buf:       frame.counter_buf,
                         instance_buf:      frame.instance_buf,
                         n,
+                        draw_instances:    n,
                     });
                 } else if view.is_none() {
                     log::warn!("texture batch slot={} not bound; skipping",
@@ -472,6 +481,7 @@ impl HeadlessRenderer {
                         counter_buf:       frame.counter_buf,
                         instance_buf:      frame.instance_buf,
                         n,
+                        draw_instances:    batch.glyphs.len() as u32,
                     });
                 } else if view.is_none() {
                     log::warn!("glyph_run batch atlas_slot={} not bound; \
@@ -574,7 +584,7 @@ impl HeadlessRenderer {
                 self.device.cmd_set_scissor(self.cmd_buffer, 0, &scissors);
             }
             for plan in &plans {
-                if plan.n == 0 { continue; }
+                if plan.draw_instances == 0 { continue; }
                 self.device.cmd_bind_pipeline(
                     self.cmd_buffer,
                     vk::PipelineBindPoint::GRAPHICS,
@@ -584,7 +594,7 @@ impl HeadlessRenderer {
                     vk::PipelineBindPoint::GRAPHICS,
                     plan.render_layout,
                     0, &[plan.render_set], &[]);
-                self.device.cmd_draw(self.cmd_buffer, 4, plan.n, 0, 0);
+                self.device.cmd_draw(self.cmd_buffer, 4, plan.draw_instances, 0, 0);
             }
             self.device.cmd_end_render_pass(self.cmd_buffer);
 

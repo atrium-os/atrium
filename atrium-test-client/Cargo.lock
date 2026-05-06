@@ -173,6 +173,7 @@ dependencies = [
 name = "fresco-text"
 version = "0.1.0"
 dependencies = [
+ "fresco-protocol",
  "rustybuzz",
  "swash",
  "ttf-parser",

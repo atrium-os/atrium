@@ -76,11 +76,13 @@ fn main() -> std::io::Result<()> {
     let mut renderer = HeadlessRenderer::new(mode.width, mode.height)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other,
             format!("HeadlessRenderer::new: {e}")))?;
-    let bundle_path = bundle_path()?;
-    renderer.load_bundle(&bundle_path)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other,
-            format!("load_bundle: {e}")))?;
-    eprintln!("frescod: atrium-core bundle loaded ({} ops)", renderer.op_count());
+    for bp in bundle_paths()? {
+        renderer.load_bundle(&bp)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other,
+                format!("load_bundle({}): {e}", bp.display())))?;
+        eprintln!("frescod: bundle loaded {}", bp.display());
+    }
+    eprintln!("frescod: total ops registered: {}", renderer.op_count());
 
     /* ── Shared scene-server state ───────────────────────────────── */
     let cas   = Arc::new(Mutex::new(CasStore::new()));
@@ -213,6 +215,7 @@ fn render_one_frame(
                         atlas_uv: [g.atlas_u as f32, g.atlas_v as f32,
                                    g.atlas_w as f32, g.atlas_h as f32],
                         bearing:  [g.bearing_x, g.bearing_y],
+                        ..Default::default()
                     });
                 }
             }
@@ -224,6 +227,11 @@ fn render_one_frame(
     let glyph_batches: Vec<GlyphRunBatch> =
         glyph_by_slot.into_values().collect();
 
+    let (uploads, clears) = {
+        let mut fe = frontend.lock().unwrap();
+        fe.take_pending_uploads()
+    };
+    renderer.process_uploads(uploads, clears)?;
     renderer.set_rect_nodes(rects);
     renderer.set_path_nodes(paths);
     renderer.set_texture_batches(batches);
@@ -264,27 +272,50 @@ fn copy_renderer_to_bo(
     Ok(())
 }
 
-fn bundle_path() -> std::io::Result<PathBuf> {
-    if let Ok(p) = std::env::var("FRESCOD_BUNDLE") {
-        return Ok(PathBuf::from(p));
+/// Discover bundles to load. atrium-core is mandatory; atrium-text is
+/// optional (only fails if FRESCOD_BUNDLES explicitly names it).
+///
+/// FRESCOD_BUNDLES, colon-separated paths, takes precedence; otherwise
+/// FRESCOD_BUNDLE (legacy single-path) is honoured for atrium-core and
+/// atrium-text is searched for next to it.
+fn bundle_paths() -> std::io::Result<Vec<PathBuf>> {
+    if let Ok(list) = std::env::var("FRESCOD_BUNDLES") {
+        let v: Vec<PathBuf> = list.split(':').filter(|s| !s.is_empty())
+            .map(PathBuf::from).collect();
+        if !v.is_empty() { return Ok(v); }
     }
-    /* Default search order:
-     *   1. ../bundles/atrium-core      (workspace dev layout)
-     *   2. /usr/local/share/atrium/bundles/atrium-core (installed) */
-    let candidates = [
-        Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap()
-            .join("bundles/atrium-core"),
-        PathBuf::from("/usr/local/share/atrium/bundles/atrium-core"),
+
+    let mut out = Vec::new();
+
+    let core_candidates: Vec<PathBuf> = if let Ok(p) = std::env::var("FRESCOD_BUNDLE") {
+        vec![PathBuf::from(p)]
+    } else {
+        vec![
+            Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap()
+                .join("bundles/atrium-core"),
+            PathBuf::from("/usr/local/share/atrium/bundles/atrium-core"),
+        ]
+    };
+    let core = core_candidates.iter().find(|c|
+        c.join("compute/op_rectangle.comp.spv").exists()
+    ).ok_or_else(|| std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "atrium-core bundle not found; set FRESCOD_BUNDLE/FRESCOD_BUNDLES",
+    ))?.clone();
+    out.push(core.clone());
+
+    /* atrium-text is best-effort: looked for as a sibling of atrium-core. */
+    let text_candidates = [
+        core.parent().map(|d| d.join("atrium-text")),
+        Some(PathBuf::from("/usr/local/share/atrium/bundles/atrium-text")),
     ];
-    for c in &candidates {
-        if c.join("compute/op_rectangle.comp.spv").exists() {
-            return Ok(c.clone());
+    for c in text_candidates.into_iter().flatten() {
+        if c.join("compute/op_glyph_run.comp.spv").exists() {
+            out.push(c);
+            break;
         }
     }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        "atrium-core bundle not found; set FRESCOD_BUNDLE or build bundles/atrium-core",
-    ))
+    Ok(out)
 }
 
 fn io_other<E: std::fmt::Display>(e: E) -> std::io::Error {

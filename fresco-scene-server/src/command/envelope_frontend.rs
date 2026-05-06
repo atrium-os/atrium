@@ -40,12 +40,13 @@ use aqueduct::{Message, MessageKind};
 use fresco_protocol::{
     control, decode, scene_ops,
     SceneNodeSetPayload, SceneNodeClearPayload,
-    SlotSetPayload, SlotClearPayload,
+    SlotSetPayload, SlotClearPayload, SlotKind, TextureFormat,
     RectParams, TextureParams, PathParams, GlyphRunParams,
     WindowCreatePayload, WindowDestroyPayload,
     WindowSetTitlePayload, WindowSetHintsPayload,
     WindowRequestClosePayload, WindowPresentPayload,
 };
+use fresco_vulkan::UploadRequest;
 
 use crate::cas::store::CasStore;
 use crate::window::Compositor;
@@ -138,6 +139,7 @@ impl WindowSceneState {
                     atlas_uv: [g.atlas_u as f32, g.atlas_v as f32,
                                g.atlas_w as f32, g.atlas_h as f32],
                     bearing:  [g.bearing_x, g.bearing_y],
+                    ..Default::default()
                 });
             }
         }
@@ -205,6 +207,13 @@ pub struct EnvelopeFrontend {
     /// Slot id of the client whose op is currently being dispatched.
     /// Set by `dispatch()`; consulted by handlers for ownership checks.
     current_client: u8,
+
+    /// Slot SETs accumulated since the last `take_pending_uploads()`.
+    /// Each entry is `(slot_id, hash, kind)`; renderer drains by hash
+    /// → CAS bytes → format-aware `UploadRequest`.
+    pending_slot_sets: Vec<(u32, [u8; 32], SlotKind)>,
+    /// Slot CLEARs accumulated since the last drain.
+    pending_slot_clears: Vec<u32>,
 }
 
 impl EnvelopeFrontend {
@@ -214,7 +223,46 @@ impl EnvelopeFrontend {
             cas, compositor,
             per_window: HashMap::new(),
             current_client: 0,
+            pending_slot_sets: Vec::new(),
+            pending_slot_clears: Vec::new(),
         }
+    }
+
+    /// Drain accumulated slot-bind / slot-clear ops into renderer-side
+    /// upload + free requests. Looks each `slot_set` hash up in CAS;
+    /// missing-blob entries are dropped with a warning. Caller passes
+    /// the returned vectors to `HeadlessRenderer::process_uploads`
+    /// before the next render.
+    pub fn take_pending_uploads(&mut self) -> (Vec<UploadRequest>, Vec<u32>) {
+        let sets = std::mem::take(&mut self.pending_slot_sets);
+        let clears = std::mem::take(&mut self.pending_slot_clears);
+        let cas = self.cas.lock().unwrap();
+        let mut uploads = Vec::with_capacity(sets.len());
+        for (slot_id, hash, kind) in sets {
+            let Some(bytes) = cas.load(&hash) else {
+                log::warn!("slot_set slot={slot_id}: CAS miss for hash; \
+                            drop pending upload");
+                continue;
+            };
+            match kind {
+                SlotKind::Texture(desc) => {
+                    let format = match desc.format {
+                        TextureFormat::Rgba8UnormSrgb =>
+                            ash::vk::Format::R8G8B8A8_SRGB,
+                        TextureFormat::R8Unorm =>
+                            ash::vk::Format::R8_UNORM,
+                    };
+                    uploads.push(UploadRequest::Texture {
+                        slot_id,
+                        bytes:  bytes.to_vec(),
+                        width:  desc.width,
+                        height: desc.height,
+                        format,
+                    });
+                }
+            }
+        }
+        (uploads, clears)
     }
 
     /// Dispatch one inbound message. Returns any outbound messages
@@ -313,11 +361,7 @@ impl EnvelopeFrontend {
             .map_err(|_| DispatchError::BadPayload)?;
         self.ensure_window_state(win_id)
             .slot_table.insert(p.slot_id, p.hash);
-        /* `kind` (TextureDesc / future MeshDesc) is consumed by the
-         * renderer's resource-table allocator, not stored here.
-         * EnvelopeFrontend just records the hash binding; M2.7 frescod
-         * integration will plumb the kind through to HeadlessRenderer's
-         * process_uploads at frame boundary. */
+        self.pending_slot_sets.push((p.slot_id, p.hash, p.kind));
         Ok(Vec::new())
     }
 
@@ -328,6 +372,7 @@ impl EnvelopeFrontend {
         if let Some(s) = self.per_window.get_mut(&win_id) {
             s.slot_table.remove(&p.slot_id);
         }
+        self.pending_slot_clears.push(p.slot_id);
         Ok(Vec::new())
     }
 
