@@ -2160,11 +2160,21 @@ atrium_virtio_gpu_attach(device_t dev)
 	atrium_fill_caps(sc);
 
 	/* V5h step 1: probe for the host_visible shared-memory region.
-	 * BISECT: temporarily disabled to isolate whether the cap walk
-	 * is what's wedging HVF on subsequent virtio commands. */
-	(void)atrium_vgpu_find_shm_region;
-	device_printf(dev,
-	    "host_visible shm region probe: SKIPPED (bisect)\n");
+	 * Optional — absence just means HOST3D blob ioctls will refuse with
+	 * ENXIO and userspace falls back to BLOB_MEM_GUEST (the V5g code
+	 * path). shmid 1 == VIRTIO_GPU_SHM_ID_HOST_VISIBLE per virtio-gpu
+	 * spec (id 0 is "undefined"; the host_visible region is always
+	 * id=1). */
+	if (atrium_vgpu_find_shm_region(sc, 1) == 0) {
+		device_printf(dev,
+		    "host_visible shm region: BAR%u, off 0x%lx, size %lu MiB\n",
+		    sc->shm_bar, (unsigned long)sc->shm_bar_offset,
+		    (unsigned long)(sc->shm_size >> 20));
+	} else {
+		device_printf(dev,
+		    "no host_visible shm region (need QEMU -hostmem); "
+		    "venus HOST3D blobs unavailable\n");
+	}
 
 	/* /dev/atrium-gpu0 */
 	make_dev_args_init(&args);

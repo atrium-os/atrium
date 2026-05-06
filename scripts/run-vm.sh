@@ -170,6 +170,7 @@ fi
 
 exec "$QEMU" \
     ${ATRIUM_QEMU_TRACE:+-trace events=$ATRIUM_QEMU_TRACE} \
+    -d guest_errors -D /tmp/qemu-guest-errors.log \
     -accel hvf -cpu host -machine virt,gic-version=2 \
     -smp "$SMP" -m "$MEM" \
     -drive if=pflash,format=raw,unit=0,file="$EFI_PAD",readonly=on \
