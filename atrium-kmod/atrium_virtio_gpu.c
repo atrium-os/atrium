@@ -170,6 +170,18 @@ struct atrium_gpu_softc {
 
 	/* Inferred capability snapshot for IOC_CAPS. Filled in attach. */
 	struct atrium_gpu_caps         caps;
+
+	/* V5h: virtio-gpu host_visible shared-memory region (shmid=0).
+	 * Populated at attach time by walking PCI vendor caps for
+	 * cfg_type=VIRTIO_PCI_CAP_SHARED_MEMORY_CFG. shm_size==0 means
+	 * the host didn't export a host_visible region (no -hostmem on
+	 * the QEMU command line); HOST3D blob ioctls then return ENXIO
+	 * and consumers must fall back to BLOB_MEM_GUEST. The BAR
+	 * resource itself is allocated lazily on first HOST_BLOB request
+	 * to avoid claiming MMIO we may never use. */
+	uint8_t                        shm_bar;
+	uint64_t                       shm_pa;     /* host-visible base PA */
+	uint64_t                       shm_size;   /* 0 == no region */
 };
 
 /* ------------------------------------------------------------------------- */
@@ -1721,6 +1733,68 @@ atrium_fill_caps(struct atrium_gpu_softc *sc)
 		c->feature_flags |= FRESCO_FEAT_COMPUTE;     /* coarse */
 }
 
+/* V5h step 1: walk the parent PCI device's vendor capability list looking
+ * for a virtio shared-memory-region cap (cfg_type=8, virtio spec 1.1+) with
+ * the requested shmid. virtio-gpu uses shmid=0 for the host_visible region.
+ *
+ * The cap layout (from virtio-spec virtio_pci_cap64):
+ *   off 0:  cap_vndr   (PCIY_VENDOR=9)
+ *   off 1:  cap_next
+ *   off 2:  cap_len
+ *   off 3:  cfg_type   (8 = SHARED_MEMORY_CFG)
+ *   off 4:  bar
+ *   off 5:  id         (shmid)
+ *   off 6-7: padding
+ *   off 8-11: offset_lo
+ *   off 12-15: length_lo
+ *   off 16-19: offset_hi
+ *   off 20-23: length_hi
+ *
+ * FreeBSD's virtio_pci_modern only parses cap types 1..5 (common, notify,
+ * isr, device, pci_cfg) so we have to do this ourselves. */
+#define ATRIUM_VIRTIO_PCI_CAP_SHARED_MEMORY_CFG  8
+static int
+atrium_vgpu_find_shm_region(struct atrium_gpu_softc *sc, uint8_t shmid)
+{
+	device_t pcidev;
+	int capreg;
+	int err;
+
+	/* virtio_pci_modern is itself the PCI device driver; it attaches as
+	 * a pci0 child, then creates a virtio bus on which our atrium-vgpu
+	 * lives. So device_get_parent(sc->dev) returns the virtio_pci_modern
+	 * device, which is what pci_find_cap works on. */
+	pcidev = device_get_parent(sc->dev);
+	if (pcidev == NULL)
+		return (ENXIO);
+
+	for (err = pci_find_cap(pcidev, PCIY_VENDOR, &capreg);
+	     err == 0;
+	     err = pci_find_next_cap(pcidev, PCIY_VENDOR, capreg, &capreg)) {
+		uint8_t cfg_type, bar, id;
+		uint32_t off_lo, off_hi, len_lo, len_hi;
+
+		cfg_type = pci_read_config(pcidev, capreg + 3, 1);
+		if (cfg_type != ATRIUM_VIRTIO_PCI_CAP_SHARED_MEMORY_CFG)
+			continue;
+		id = pci_read_config(pcidev, capreg + 5, 1);
+		if (id != shmid)
+			continue;
+
+		bar    = pci_read_config(pcidev, capreg + 4, 1);
+		off_lo = pci_read_config(pcidev, capreg + 8, 4);
+		len_lo = pci_read_config(pcidev, capreg + 12, 4);
+		off_hi = pci_read_config(pcidev, capreg + 16, 4);
+		len_hi = pci_read_config(pcidev, capreg + 20, 4);
+
+		sc->shm_bar  = bar;
+		sc->shm_pa   = ((uint64_t)off_hi << 32) | off_lo;
+		sc->shm_size = ((uint64_t)len_hi << 32) | len_lo;
+		return (0);
+	}
+	return (ENOENT);
+}
+
 static int
 atrium_virtio_gpu_attach(device_t dev)
 {
@@ -1797,6 +1871,22 @@ atrium_virtio_gpu_attach(device_t dev)
 	 * context where cv_wait inside req_resp is safe. */
 
 	atrium_fill_caps(sc);
+
+	/* V5h step 1: probe for the host_visible shared-memory region. Optional
+	 * — absence just means HOST3D blob ioctls will refuse with ENXIO and
+	 * userspace falls back to BLOB_MEM_GUEST (the V5g code path). */
+	/* shmid 1 == VIRTIO_GPU_SHM_ID_HOST_VISIBLE per virtio-gpu spec.
+	 * (id 0 is "undefined"; the host_visible region is always id=1.) */
+	if (atrium_vgpu_find_shm_region(sc, 1) == 0) {
+		device_printf(dev,
+		    "host_visible shm region: BAR%u, pa 0x%lx, size %lu MiB\n",
+		    sc->shm_bar, (unsigned long)sc->shm_pa,
+		    (unsigned long)(sc->shm_size >> 20));
+	} else {
+		device_printf(dev,
+		    "no host_visible shm region (need QEMU -hostmem); "
+		    "venus HOST3D blobs unavailable\n");
+	}
 
 	/* /dev/atrium-gpu0 */
 	make_dev_args_init(&args);
