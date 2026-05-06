@@ -1,14 +1,13 @@
-//! atrium-term-socket renderer on the envelope+texture-op stack.
+//! atrium-term-socket renderer on the M6.1 atrium-text bundle.
 //!
-//! Per frame: cursor RECT + one TEXTURE per visible non-blank cell.
-//! Frame shrink-handling (clearing cells that became blank, scrolled
-//! off, etc.) is delegated to `fresco_client::FrameBuilder`.
+//! Per frame: cursor RECT + one GLYPH_RUN node carrying every visible
+//! non-blank cell as a `GlyphInstance`.
 
 use crate::glyph_cache::GlyphCache;
 use crate::grid::Grid;
 
 use fresco_client::Connection;
-use fresco_protocol::{RectParams, TextureParams};
+use fresco_protocol::{GlyphInstance, GlyphRunParams, RectParams};
 
 pub struct Renderer<'a> {
     cache: &'a GlyphCache,
@@ -35,25 +34,30 @@ impl<'a> Renderer<'a> {
             r: 1.0, g: 0.80, b: 0.20, a: 0.5,
         })?;
 
+        let mut instances: Vec<GlyphInstance> = Vec::new();
         let cells = grid.cells();
         for row in 0..grid.rows {
-            let row_top = self.pad_y + (row as f32) * line_h;
             for col in 0..grid.cols {
                 let cell = cells[row as usize * grid.cols as usize + col as usize];
                 let ch = cell.ch;
                 if ch == ' ' || !ch.is_ascii_graphic() { continue; }
-                let g = match self.cache.lookup(ch) {
-                    Some(g) => *g,
-                    None    => continue,
-                };
-                let cx = self.pad_x + (col as f32) * cell_w;
-                let cy = row_top;
-                let px = cx + g.metrics.bearing_x as f32;
-                let py = cy + baseline - g.metrics.bearing_y as f32;
-                let w  = g.metrics.width  as f32;
-                let h  = g.metrics.height as f32;
-                f.texture(TextureParams { x: px, y: py, w, h, slot_id: g.slot_id })?;
+                if let Some(m) = self.cache.lookup(ch) {
+                    instances.push(GlyphCache::instance(
+                        m, col as usize, row as usize, cell_w, line_h));
+                }
             }
+        }
+
+        if !instances.is_empty() {
+            f.glyph_run(GlyphRunParams {
+                x: self.pad_x,
+                y: self.pad_y + baseline,
+                atlas_slot_id: self.cache.atlas_slot,
+                atlas_width:   self.cache.atlas_width,
+                atlas_height:  self.cache.atlas_height,
+                r: 0.95, g: 0.95, b: 0.95, a: 1.0,
+                glyphs: instances,
+            })?;
         }
 
         f.finish()
