@@ -716,6 +716,10 @@ atrium_gpu_ioc_host_blob(struct atrium_gpu_softc *sc,
 	/* Send RESOURCE_CREATE_BLOB(HOST3D) — host allocates shm; venus
 	 * sees blob_id (0 for shmem, the venus mem_id for VkDeviceMemory). */
 	resource_id = atomic_fetchadd_32(&sc->next_resource_id, 1);
+	device_printf(sc->dev,
+	    "HOST_BLOB: CREATE res=%u sz=%lu flags=0x%x blob_id=0x%lx off=0x%lx\n",
+	    resource_id, (unsigned long)actual_size, args->blob_flags,
+	    (unsigned long)args->blob_id, (unsigned long)bar_offset);
 	err = atrium_vgpu_resource_create_blob(sc, f->ctx_id, resource_id,
 	    ATRIUM_GPU_BLOB_MEM_HOST3D, args->blob_flags, args->blob_id,
 	    actual_size, 0, 0);  /* length=0 → no mem_entry */
@@ -724,13 +728,20 @@ atrium_gpu_ioc_host_blob(struct atrium_gpu_softc *sc,
 		    "HOST_BLOB: RESOURCE_CREATE_BLOB(HOST3D) failed: %d\n", err);
 		goto fail;
 	}
+	device_printf(sc->dev, "HOST_BLOB: CREATE ok, attaching\n");
 	err = atrium_vgpu_ctx_attach_resource(sc, f->ctx_id, resource_id);
-	if (err != 0)
+	if (err != 0) {
+		device_printf(sc->dev, "HOST_BLOB: ATTACH failed: %d\n", err);
 		goto fail_destroy;
+	}
+	device_printf(sc->dev, "HOST_BLOB: ATTACH ok, mapping\n");
 	err = atrium_vgpu_resource_map_blob(sc, f->ctx_id, resource_id,
 	    bar_offset);
-	if (err != 0)
+	if (err != 0) {
+		device_printf(sc->dev, "HOST_BLOB: MAP failed: %d\n", err);
 		goto fail_destroy;
+	}
+	device_printf(sc->dev, "HOST_BLOB: MAP ok\n");
 
 	bo->virtio_resource_id = resource_id;
 
