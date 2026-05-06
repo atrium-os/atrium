@@ -333,6 +333,23 @@ impl HeadlessRenderer {
                     log::info!("uploaded texture slot={} {}x{} {}B",
                         slot_id, width, height, bytes.len());
                 }
+                UploadRequest::TextureRegion {
+                    slot_id, bytes, dst_x, dst_y, width, height,
+                } => {
+                    let Some(Resource::Texture(t)) = self.resources.get(&slot_id) else {
+                        log::warn!("TextureRegion for slot={} but no image bound; \
+                                    drop", slot_id);
+                        continue;
+                    };
+                    let image = t.image;
+                    resource::upload_texture_region(
+                        &self.device, self.queue, self.cmd_pool,
+                        self.physical_device, &self.instance,
+                        image, &bytes, dst_x, dst_y, width, height,
+                    )?;
+                    log::info!("patched slot={} ({},{} {}x{}) {}B",
+                        slot_id, dst_x, dst_y, width, height, bytes.len());
+                }
             }
         }
         Ok(())

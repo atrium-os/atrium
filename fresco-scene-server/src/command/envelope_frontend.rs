@@ -306,16 +306,24 @@ impl EnvelopeFrontend {
         }
         /* Server-managed text atlases. Bytes already in hand from
          * the text engine — bypass CAS, go straight to UploadRequest.
-         * The server-slot range (>= SERVER_SLOT_BASE) keeps these
-         * from colliding with client-managed slots. */
+         * First upload of each (font, size) page goes via Full
+         * (allocates the GPU image); subsequent grow events ship
+         * just the dirty rectangle via TextureRegion. */
         for a in atlas_uploads {
-            uploads.push(UploadRequest::Texture {
-                slot_id: a.slot_id,
-                bytes:   a.pixels,
-                width:   a.width,
-                height:  a.height,
-                format:  ash::vk::Format::R8_UNORM,
-            });
+            match a {
+                PendingAtlasUpload::Full {
+                    slot_id, width, height, pixels,
+                } => uploads.push(UploadRequest::Texture {
+                    slot_id, bytes: pixels, width, height,
+                    format: ash::vk::Format::R8_UNORM,
+                }),
+                PendingAtlasUpload::Region {
+                    slot_id, dst_x, dst_y, width, height, pixels,
+                } => uploads.push(UploadRequest::TextureRegion {
+                    slot_id, bytes: pixels,
+                    dst_x, dst_y, width, height,
+                }),
+            }
         }
         (uploads, clears)
     }

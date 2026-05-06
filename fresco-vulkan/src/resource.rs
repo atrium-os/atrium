@@ -47,12 +47,29 @@ impl Texture {
 
 /// What the dispatcher hands the renderer per SLOT_SET.
 pub enum UploadRequest {
+    /// Allocate (or re-allocate) the slot's image and fill it with the
+    /// supplied bytes. Used for client-managed textures and for the
+    /// first upload of a server-managed atlas.
     Texture {
         slot_id: u32,
         bytes:   Vec<u8>,
         width:   u32,
         height:  u32,
         format:  vk::Format,
+    },
+    /// Patch a subregion of an existing slot's image. Image must
+    /// already be allocated (via a prior `Texture` upload). Bytes
+    /// length must equal `width * height * bytes_per_pixel(format)`
+    /// for the slot's bound format. Used by the server-side text
+    /// engine to ship only the freshly-rasterized glyphs instead of
+    /// re-uploading the whole atlas.
+    TextureRegion {
+        slot_id: u32,
+        bytes:   Vec<u8>,
+        dst_x:   u32,
+        dst_y:   u32,
+        width:   u32,
+        height:  u32,
     },
 }
 
@@ -199,6 +216,108 @@ pub fn upload_texture(
     let view = unsafe { device.create_image_view(&view_info, None) }?;
 
     Ok(Texture { image, view, memory, width, height, format })
+}
+
+/// Patch a subregion of an existing image. Image layout must be
+/// SHADER_READ_ONLY_OPTIMAL (the resting state after `upload_texture`)
+/// — we transition through TRANSFER_DST_OPTIMAL, copy from staging,
+/// and transition back. One queue submit + wait per call, same shape
+/// as `upload_texture`.
+pub fn upload_texture_region(
+    device:          &ash::Device,
+    queue:           vk::Queue,
+    cmd_pool:        vk::CommandPool,
+    physical_device: vk::PhysicalDevice,
+    instance:        &ash::Instance,
+    image:           vk::Image,
+    bytes:           &[u8],
+    dst_x:           u32,
+    dst_y:           u32,
+    width:           u32,
+    height:          u32,
+) -> Result<()> {
+    let device_mem_props = unsafe {
+        instance.get_physical_device_memory_properties(physical_device)
+    };
+    let staging_size = bytes.len() as vk::DeviceSize;
+    let (staging_buf, staging_mem) = create_buffer(
+        device, &device_mem_props, staging_size,
+        vk::BufferUsageFlags::TRANSFER_SRC,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+    )?;
+    unsafe {
+        let p = device.map_memory(staging_mem, 0, staging_size,
+            vk::MemoryMapFlags::empty())?;
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), p as *mut u8, bytes.len());
+        device.unmap_memory(staging_mem);
+    }
+
+    let cb_alloc = vk::CommandBufferAllocateInfo::default()
+        .command_pool(cmd_pool)
+        .level(vk::CommandBufferLevel::PRIMARY)
+        .command_buffer_count(1);
+    let cb = unsafe { device.allocate_command_buffers(&cb_alloc) }?[0];
+    unsafe {
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        device.begin_command_buffer(cb, &begin)?;
+
+        let to_dst = vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_READ)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(image_subresource());
+        device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[], &[], &[to_dst]);
+
+        let region = vk::BufferImageCopy::default()
+            .buffer_offset(0)
+            .buffer_row_length(0).buffer_image_height(0)
+            .image_subresource(vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0, base_array_layer: 0, layer_count: 1,
+            })
+            .image_offset(vk::Offset3D { x: dst_x as i32, y: dst_y as i32, z: 0 })
+            .image_extent(vk::Extent3D { width, height, depth: 1 });
+        device.cmd_copy_buffer_to_image(
+            cb, staging_buf, image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]);
+
+        let to_shader = vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(image_subresource());
+        device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::DependencyFlags::empty(),
+            &[], &[], &[to_shader]);
+
+        device.end_command_buffer(cb)?;
+        let cb_arr = [cb];
+        let submit = vk::SubmitInfo::default().command_buffers(&cb_arr);
+        device.queue_submit(queue, &[submit], vk::Fence::null())?;
+        device.queue_wait_idle(queue)?;
+
+        device.free_command_buffers(cmd_pool, &[cb]);
+        device.destroy_buffer(staging_buf, None);
+        device.free_memory(staging_mem, None);
+    }
+    Ok(())
 }
 
 // ── helpers ─────────────────────────────────────────────────────────
