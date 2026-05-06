@@ -189,6 +189,11 @@ struct atrium_gpu_file {
 	 * id; no other fd can address this context. */
 	uint32_t                 ctx_id;
 	uint32_t                 ctx_capset;
+
+	/* Latest fence id we've enqueued on this context. Used by
+	 * CTX_FENCE_WAIT to verify the requested fence belongs to this
+	 * fd's stream. Coarse but sufficient for V4 (synchronous submit). */
+	uint64_t                 ctx_last_fence;
 };
 
 /* Forward declarations: virtio-gpu helpers used by display ioctl handlers
@@ -213,6 +218,15 @@ static int atrium_vgpu_get_capset(struct atrium_gpu_softc *,
 static int atrium_vgpu_ctx_create(struct atrium_gpu_softc *,
     uint32_t, uint32_t, const char *);
 static int atrium_vgpu_ctx_destroy(struct atrium_gpu_softc *, uint32_t);
+
+/* V4: resource attach + 3D submit helpers (defined further down). */
+static int atrium_vgpu_resource_create_blob(struct atrium_gpu_softc *,
+    uint32_t, uint32_t, uint32_t, uint32_t, uint64_t, uint64_t,
+    vm_paddr_t, uint32_t);
+static int atrium_vgpu_ctx_attach_resource(struct atrium_gpu_softc *,
+    uint32_t, uint32_t);
+static int atrium_vgpu_submit_3d(struct atrium_gpu_softc *,
+    uint32_t, uint32_t, void *, size_t);
 
 struct atrium_display_file {
 	struct atrium_gpu_softc *sc;
@@ -564,6 +578,104 @@ atrium_gpu_ioc_ctx_init(struct atrium_gpu_softc *sc,
 	return (0);
 }
 
+/* ATRIUM_GPU_IOC_RESOURCE_ATTACH: bind a BO as a venus blob resource
+ * on this fd's context. The BO must be ATRIUM_GPU_BO_GPU_VISIBLE.
+ * Server-side resource_id is allocated from the kmod's monotonic
+ * `next_resource_id` counter; userspace embeds it in subsequent
+ * SUBMIT_3D command streams. */
+static int
+atrium_gpu_ioc_resource_attach(struct atrium_gpu_softc *sc,
+    struct atrium_gpu_file *f, struct atrium_gpu_resource_attach *args)
+{
+	struct atrium_gpu_bo *bo;
+	uint32_t resource_id;
+	int err;
+
+	if (f->ctx_id == 0)
+		return (ENOTCONN);  /* call CTX_INIT first */
+	if (args->blob_mem != ATRIUM_GPU_BLOB_MEM_GUEST &&
+	    args->blob_mem != ATRIUM_GPU_BLOB_MEM_HOST3D)
+		return (EINVAL);
+
+	mtx_lock(&sc->bo_lock);
+	bo = atrium_bo_find_locked(sc, args->bo_handle);
+	if (bo == NULL || bo->owner != f) {
+		mtx_unlock(&sc->bo_lock);
+		return (ENOENT);
+	}
+	resource_id = ++sc->next_resource_id;
+	bo->virtio_resource_id = resource_id;
+	mtx_unlock(&sc->bo_lock);
+
+	err = atrium_vgpu_resource_create_blob(sc, f->ctx_id, resource_id,
+	    args->blob_mem, args->blob_flags, args->blob_id, bo->size,
+	    bo->pa, (uint32_t)bo->size);
+	if (err != 0)
+		return (err);
+	err = atrium_vgpu_ctx_attach_resource(sc, f->ctx_id, resource_id);
+	if (err != 0)
+		return (err);
+
+	args->resource_id_out = resource_id;
+	return (0);
+}
+
+/* ATRIUM_GPU_IOC_SUBMIT_3D: ship an opaque venus command stream to
+ * this fd's context. Bytes are forwarded verbatim — the kernel does
+ * not parse them; validation is the host renderer's responsibility. */
+static int
+atrium_gpu_ioc_submit_3d(struct atrium_gpu_softc *sc,
+    struct atrium_gpu_file *f, struct atrium_gpu_submit_3d *args)
+{
+	void *cmd_buf;
+	uint64_t fence_id;
+	int err;
+
+	if (f->ctx_id == 0)
+		return (ENOTCONN);
+	if (args->cmd_size == 0 || args->cmd_size > 1024 * 1024)
+		return (EINVAL);
+
+	cmd_buf = malloc(args->cmd_size, M_ATRIUM_GPU, M_WAITOK);
+	err = copyin((const void *)(uintptr_t)args->cmd_ptr, cmd_buf,
+	    args->cmd_size);
+	if (err != 0) {
+		free(cmd_buf, M_ATRIUM_GPU);
+		return (err);
+	}
+
+	fence_id = atomic_fetchadd_64(&sc->next_fence, 1);
+	err = atrium_vgpu_submit_3d(sc, f->ctx_id, (uint32_t)fence_id,
+	    cmd_buf, args->cmd_size);
+	free(cmd_buf, M_ATRIUM_GPU);
+	if (err != 0)
+		return (err);
+
+	f->ctx_last_fence = fence_id;
+	args->fence_out = (args->flags & ATRIUM_GPU_SUBMIT_3D_SIGNAL_FENCE)
+	    ? fence_id : 0;
+	return (0);
+}
+
+/* ATRIUM_GPU_IOC_CTX_FENCE_WAIT: synchronous waits are trivial in
+ * V4 because atrium_vgpu_submit_3d blocks until the host fence
+ * retires (the controlq req_resp pattern). Any fence_id ≤ ctx_last_fence
+ * is therefore already signalled by definition. Async submit lands
+ * later (V4-stretch) and turns this into a real wait. */
+static int
+atrium_gpu_ioc_ctx_fence_wait(struct atrium_gpu_softc *sc __unused,
+    struct atrium_gpu_file *f, struct atrium_gpu_ctx_fence_wait *args)
+{
+	if (f->ctx_id == 0)
+		return (ENOTCONN);
+	if (args->fence > f->ctx_last_fence) {
+		args->status = EBUSY;  /* unknown fence — caller bug */
+		return (0);
+	}
+	args->status = 0;
+	return (0);
+}
+
 static int
 atrium_gpu_ioctl(struct cdev *cdev, u_long cmd, caddr_t data,
     int fflag __unused, struct thread *td __unused)
@@ -614,6 +726,15 @@ atrium_gpu_ioctl(struct cdev *cdev, u_long cmd, caddr_t data,
 	case ATRIUM_GPU_IOC_CTX_INIT:
 		return (atrium_gpu_ioc_ctx_init(sc, f,
 		    (struct atrium_gpu_ctx_init *)data));
+	case ATRIUM_GPU_IOC_RESOURCE_ATTACH:
+		return (atrium_gpu_ioc_resource_attach(sc, f,
+		    (struct atrium_gpu_resource_attach *)data));
+	case ATRIUM_GPU_IOC_SUBMIT_3D:
+		return (atrium_gpu_ioc_submit_3d(sc, f,
+		    (struct atrium_gpu_submit_3d *)data));
+	case ATRIUM_GPU_IOC_CTX_FENCE_WAIT:
+		return (atrium_gpu_ioc_ctx_fence_wait(sc, f,
+		    (struct atrium_gpu_ctx_fence_wait *)data));
 
 	default:
 		return (ENOTTY);
@@ -1424,6 +1545,134 @@ atrium_vgpu_ctx_destroy(struct atrium_gpu_softc *sc, uint32_t ctx_id)
 	if (err != 0)
 		return (err);
 	return (atrium_vgpu_check_ok(sc, "CTX_DESTROY", &s.resp));
+}
+
+/* ------------------------------------------------------------------------- */
+/* V4: resource_create_blob, ctx_attach_resource, submit_3d helpers.            */
+/*                                                                              */
+/* All operate against a per-fd context bound by ATRIUM_GPU_IOC_CTX_INIT;        */
+/* every command sets VIRTIO_GPU_FLAG_FENCE | VIRTIO_GPU_FLAG_INFO_RING_IDX     */
+/* so the fence routes through QEMU's per-context async path (legacy global    */
+/* path is broken under VIRGL_RENDERER_NO_VIRGL — the macOS host case).        */
+/* ------------------------------------------------------------------------- */
+
+static int
+atrium_vgpu_resource_create_blob(struct atrium_gpu_softc *sc,
+    uint32_t ctx_id, uint32_t resource_id, uint32_t blob_mem,
+    uint32_t blob_flags, uint64_t blob_id, uint64_t size,
+    vm_paddr_t pa, uint32_t length)
+{
+	struct {
+		struct virtio_gpu_resource_create_blob req;
+		struct virtio_gpu_mem_entry              ent;
+		char pad;
+		struct virtio_gpu_ctrl_hdr resp;
+	} s;
+	int err;
+
+	bzero(&s, sizeof(s));
+	s.req.hdr.type     = htole32(VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB);
+	s.req.hdr.flags    = htole32(VIRTIO_GPU_FLAG_FENCE |
+	                             VIRTIO_GPU_FLAG_INFO_RING_IDX);
+	s.req.hdr.fence_id = htole64(atomic_fetchadd_64(&sc->next_fence, 1));
+	s.req.hdr.ctx_id   = htole32(ctx_id);
+	s.req.hdr.ring_idx = 0;
+	s.req.resource_id  = htole32(resource_id);
+	s.req.blob_mem     = htole32(blob_mem);
+	s.req.blob_flags   = htole32(blob_flags);
+	s.req.blob_id      = htole64(blob_id);
+	s.req.size         = htole64(size);
+	s.req.nr_entries   = htole32(length > 0 ? 1 : 0);
+	if (length > 0) {
+		s.ent.addr   = htole64((uint64_t)pa);
+		s.ent.length = htole32(length);
+	}
+
+	err = atrium_vgpu_req_resp(sc,
+	    &s.req, sizeof(s.req) + (length > 0 ? sizeof(s.ent) : 0),
+	    &s.resp, sizeof(s.resp));
+	if (err != 0)
+		return (err);
+	return (atrium_vgpu_check_ok(sc, "RESOURCE_CREATE_BLOB", &s.resp));
+}
+
+static int
+atrium_vgpu_ctx_attach_resource(struct atrium_gpu_softc *sc,
+    uint32_t ctx_id, uint32_t resource_id)
+{
+	struct {
+		struct virtio_gpu_ctx_resource req;
+		char pad;
+		struct virtio_gpu_ctrl_hdr resp;
+	} s;
+	int err;
+
+	bzero(&s, sizeof(s));
+	s.req.hdr.type     = htole32(VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE);
+	s.req.hdr.flags    = htole32(VIRTIO_GPU_FLAG_FENCE |
+	                             VIRTIO_GPU_FLAG_INFO_RING_IDX);
+	s.req.hdr.fence_id = htole64(atomic_fetchadd_64(&sc->next_fence, 1));
+	s.req.hdr.ctx_id   = htole32(ctx_id);
+	s.req.hdr.ring_idx = 0;
+	s.req.resource_id  = htole32(resource_id);
+
+	err = atrium_vgpu_req_resp(sc, &s.req, sizeof(s.req),
+	    &s.resp, sizeof(s.resp));
+	if (err != 0)
+		return (err);
+	return (atrium_vgpu_check_ok(sc, "CTX_ATTACH_RESOURCE", &s.resp));
+}
+
+/* SUBMIT_3D ships an opaque venus command stream to the host. The
+ * kernel does not parse the bytes; they're concatenated after the
+ * header struct as a single sg entry to the controlq. */
+static int
+atrium_vgpu_submit_3d(struct atrium_gpu_softc *sc, uint32_t ctx_id,
+    uint32_t fence_id, void *cmd, size_t cmd_size)
+{
+	struct sglist sg;
+	struct sglist_seg segs[3];
+	struct virtio_gpu_cmd_submit hdr;
+	struct virtio_gpu_ctrl_hdr resp;
+	int err;
+
+	bzero(&hdr, sizeof(hdr));
+	hdr.hdr.type     = htole32(VIRTIO_GPU_CMD_SUBMIT_3D);
+	hdr.hdr.flags    = htole32(VIRTIO_GPU_FLAG_FENCE |
+	                           VIRTIO_GPU_FLAG_INFO_RING_IDX);
+	hdr.hdr.fence_id = htole64(fence_id);
+	hdr.hdr.ctx_id   = htole32(ctx_id);
+	hdr.hdr.ring_idx = 0;
+	hdr.size         = htole32((uint32_t)cmd_size);
+
+	sglist_init(&sg, 3, segs);
+	if ((err = sglist_append(&sg, &hdr, sizeof(hdr))) != 0)
+		return (err);
+	if (cmd_size > 0 && (err = sglist_append(&sg, cmd, cmd_size)) != 0)
+		return (err);
+	if ((err = sglist_append(&sg, &resp, sizeof(resp))) != 0)
+		return (err);
+
+	mtx_lock(&sc->ctrl_lock);
+	sc->ctrl_done = false;
+	err = virtqueue_enqueue(sc->ctrl_vq, &resp, &sg, 2, 1);
+	if (err != 0) {
+		mtx_unlock(&sc->ctrl_lock);
+		return (err);
+	}
+	virtqueue_notify(sc->ctrl_vq);
+	while (!sc->ctrl_done) {
+		err = cv_timedwait(&sc->ctrl_done_cv, &sc->ctrl_lock, 5 * hz);
+		if (err == EWOULDBLOCK && !sc->ctrl_done) {
+			device_printf(sc->dev,
+			    "submit_3d: timeout waiting for completion\n");
+			mtx_unlock(&sc->ctrl_lock);
+			return (EIO);
+		}
+		err = 0;
+	}
+	mtx_unlock(&sc->ctrl_lock);
+	return (atrium_vgpu_check_ok(sc, "SUBMIT_3D", &resp));
 }
 
 /* ------------------------------------------------------------------------- */

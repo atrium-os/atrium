@@ -208,6 +208,93 @@ struct atrium_gpu_ctx_init {
 };
 #define ATRIUM_GPU_IOC_CTX_INIT  _IOWR('G', 0x41, struct atrium_gpu_ctx_init)
 
+/*
+ * ATRIUM_GPU_IOC_RESOURCE_ATTACH — bind an existing BO as a venus
+ * blob resource visible to the host renderer.
+ *
+ * Per virtio-gpu spec §5.7 (BLOB), `blob_mem` is one of:
+ *   ATRIUM_GPU_BLOB_MEM_GUEST  (0x0001)  — guest-allocated pages,
+ *                                          host reads via attached
+ *                                          backing
+ *   ATRIUM_GPU_BLOB_MEM_HOST3D (0x0002)  — host-allocated, identified
+ *                                          by blob_id from venus
+ * `blob_flags` is a bitmask of:
+ *   ATRIUM_GPU_BLOB_USE_MAPPABLE (0x01)  — mappable into guest
+ *   ATRIUM_GPU_BLOB_USE_SHAREABLE(0x02)  — exportable to other ctxs
+ *   ATRIUM_GPU_BLOB_USE_CROSS_DEV(0x04)  — exportable to other devs
+ *
+ * Per-fd / per-context: the resource is owned by `f->ctx_id` (must be
+ * non-zero — call CTX_INIT first). Resource id is server-assigned;
+ * userspace embeds it in subsequent SUBMIT_3D payloads.
+ */
+#define ATRIUM_GPU_BLOB_MEM_GUEST    0x0001
+#define ATRIUM_GPU_BLOB_MEM_HOST3D   0x0002
+
+#define ATRIUM_GPU_BLOB_USE_MAPPABLE  0x01
+#define ATRIUM_GPU_BLOB_USE_SHAREABLE 0x02
+#define ATRIUM_GPU_BLOB_USE_CROSS_DEV 0x04
+
+struct atrium_gpu_resource_attach {
+	uint32_t bo_handle;       /* in: BO from IOC_ALLOC */
+	uint32_t blob_mem;        /* in: ATRIUM_GPU_BLOB_MEM_* */
+	uint32_t blob_flags;      /* in: ATRIUM_GPU_BLOB_USE_* bitmask */
+	uint32_t _pad0;
+	uint64_t blob_id;         /* in: opaque host-side id (venus assigns) */
+	uint32_t resource_id_out; /* out: kmod-allocated, monotonic */
+	uint32_t _reserved[3];
+};
+#define ATRIUM_GPU_IOC_RESOURCE_ATTACH \
+	_IOWR('G', 0x42, struct atrium_gpu_resource_attach)
+
+/*
+ * ATRIUM_GPU_IOC_SUBMIT_3D — submit an opaque venus command stream
+ * to this fd's context.
+ *
+ * The kernel does not parse `cmd_ptr`/`cmd_size` — bytes are forwarded
+ * verbatim to virglrenderer's render-server, which dispatches them
+ * against the per-context worker.
+ *
+ *   in:  cmd_ptr / cmd_size      — userspace command stream
+ *        bo_handles_ptr / count  — BOs the submit references; kept
+ *                                  pinned until the fence retires
+ *        flags                   — bit 0 = SIGNAL_FENCE (default on)
+ *   out: fence_out               — fence-id (0 if SIGNAL_FENCE clear)
+ */
+#define ATRIUM_GPU_SUBMIT_3D_SIGNAL_FENCE 0x01
+
+struct atrium_gpu_submit_3d {
+	uint64_t cmd_ptr;          /* in:  userspace pointer */
+	uint32_t cmd_size;         /* in:  bytes */
+	uint32_t flags;            /* in:  ATRIUM_GPU_SUBMIT_3D_* */
+	uint32_t bo_count;         /* in:  number of BO handles referenced */
+	uint32_t _pad0;
+	uint64_t bo_handles_ptr;   /* in:  userspace pointer to uint32_t[] */
+	uint64_t fence_out;        /* out: fence id (0 if no fence) */
+	uint64_t _reserved[2];
+};
+#define ATRIUM_GPU_IOC_SUBMIT_3D \
+	_IOWR('G', 0x43, struct atrium_gpu_submit_3d)
+
+/*
+ * ATRIUM_GPU_IOC_CTX_FENCE_WAIT — block until a venus fence retires.
+ *
+ * Distinct from the older `ATRIUM_GPU_IOC_FENCE_WAIT` (which targets
+ * the engine-wide fence stream): this waits on a fence_id from a
+ * SUBMIT_3D call on this fd's context.
+ *
+ *   in:   fence       — id from SUBMIT_3D fence_out
+ *         timeout_ns  — ~0 = block forever, 0 = poll
+ *   out:  status      — 0 signalled, EBUSY timed out
+ */
+struct atrium_gpu_ctx_fence_wait {
+	uint64_t fence;
+	uint64_t timeout_ns;
+	uint32_t status;
+	uint32_t _pad0;
+};
+#define ATRIUM_GPU_IOC_CTX_FENCE_WAIT \
+	_IOWR('G', 0x44, struct atrium_gpu_ctx_fence_wait)
+
 /* ---------- Display ---------- */
 
 struct atrium_display_bind_gpu {

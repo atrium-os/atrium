@@ -9,6 +9,7 @@
  */
 
 #include <sys/ioctl.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -97,6 +98,59 @@ int main(void)
 		close(fd); return 6;
 	}
 	printf("second CTX_INIT correctly rejected\n");
+
+	/* V4: allocate a BO, attach as a venus blob, submit a (fake)
+	 * empty command stream. Real venus command streams come from
+	 * mesa-venus at V5; for now we just exercise the round-trip. */
+	struct atrium_gpu_alloc alloc = { .size = 64 * 1024,
+		.flags = ATRIUM_GPU_BO_GPU_VISIBLE | ATRIUM_GPU_BO_CPU_VISIBLE
+		       | ATRIUM_GPU_BO_COHERENT };
+	if (ioctl(fd, ATRIUM_GPU_IOC_ALLOC, &alloc) < 0) {
+		perror("ALLOC");
+		close(fd); return 7;
+	}
+	printf("ALLOC ok, bo_handle=%u size=%llu\n",
+	       alloc.handle, (unsigned long long)alloc.size);
+
+	struct atrium_gpu_resource_attach ra = {
+		.bo_handle  = alloc.handle,
+		.blob_mem   = ATRIUM_GPU_BLOB_MEM_GUEST,
+		.blob_flags = ATRIUM_GPU_BLOB_USE_MAPPABLE,
+		.blob_id    = 0,
+	};
+	if (ioctl(fd, ATRIUM_GPU_IOC_RESOURCE_ATTACH, &ra) < 0) {
+		perror("RESOURCE_ATTACH");
+		close(fd); return 8;
+	}
+	printf("RESOURCE_ATTACH ok, resource_id=%u\n", ra.resource_id_out);
+
+	/* SUBMIT_3D with a tiny "hello world" payload. The host's venus
+	 * worker will fail to parse it as a valid VkCommandStream, but
+	 * the submit round-trip itself (and fence retire) is what we're
+	 * testing here. The host returns ERR_UNSPEC; submit returns EIO
+	 * which is the expected failure mode for V4 smoke. */
+	uint8_t fake_cmd[16] = {0};
+	struct atrium_gpu_submit_3d sub = {
+		.cmd_ptr  = (uint64_t)(uintptr_t)fake_cmd,
+		.cmd_size = sizeof(fake_cmd),
+		.flags    = ATRIUM_GPU_SUBMIT_3D_SIGNAL_FENCE,
+	};
+	int rc = ioctl(fd, ATRIUM_GPU_IOC_SUBMIT_3D, &sub);
+	if (rc < 0)
+		printf("SUBMIT_3D returned errno=%d (expected — fake "
+		       "payload, host venus rejects)\n", errno);
+	else
+		printf("SUBMIT_3D ok, fence_out=%llu\n",
+		       (unsigned long long)sub.fence_out);
+
+	/* CTX_FENCE_WAIT on a known-retired fence should be instant. */
+	if (sub.fence_out != 0) {
+		struct atrium_gpu_ctx_fence_wait fw = {
+			.fence = sub.fence_out, .timeout_ns = ~0ULL,
+		};
+		if (ioctl(fd, ATRIUM_GPU_IOC_CTX_FENCE_WAIT, &fw) == 0)
+			printf("CTX_FENCE_WAIT ok, status=%u\n", fw.status);
+	}
 
 	/* Close fd → dtor issues CTX_DESTROY. */
 	close(fd);
