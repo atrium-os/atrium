@@ -16,6 +16,7 @@ path = "src/bin/vulkan_smoke.rs"
 
 [dependencies]
 atrium-gpu-rs       = { path = "../atrium-gpu-rs" }
+atrium-devevents    = { path = "../atrium-devevents" }
 fresco-scene-server = { path = "../fresco-scene-server" }
 fresco-vulkan       = { path = "../fresco-vulkan" }
 fresco-protocol     = { path = "../fresco-protocol" }

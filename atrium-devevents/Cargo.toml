@@ -1,0 +1,15 @@
+[package]
+name = "atrium-devevents"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Cross-BSD device hotplug events. Per-OS backend (devd on FreeBSD, /dev/hotplug on OpenBSD, drvctl on NetBSD) under a uniform API."
+
+[lib]
+name = "atrium_devevents"
+path = "src/lib.rs"
+
+[dependencies]
+libc = "0.2"
+log  = "0.4"

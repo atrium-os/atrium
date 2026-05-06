@@ -32,6 +32,9 @@ use std::io::Read;
 use std::os::unix::io::AsRawFd;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+
+use atrium_devevents::{DeviceWatcher, Event};
 
 const HID_MAX_DESCRIPTOR_SIZE: usize = 4096;
 const HIDIOCGRDESCSIZE: libc::c_ulong = 0x4004551E;
@@ -85,17 +88,86 @@ fn find_keyboard_path() -> Option<String> {
     None
 }
 
-/// Spawn the keyboard reader thread. Returns immediately; failure to
-/// find a keyboard logs and the thread exits, leaving frescod running
-/// without keyboard input.
+/// Spawn the keyboard supervisor thread. It owns the lifetime of the
+/// per-device reader: at startup it scans existing `/dev/hidraw*`
+/// nodes and spawns a worker if a keyboard is found; on every devd
+/// hotplug event it re-scans (so plugging a USB keyboard mid-session
+/// just works). Worker exits on device removal (read EOF); the
+/// supervisor notices and re-attaches when a new device appears.
 pub fn spawn(
     event_sink: Sender<DisplayEvent>,
     wm:         Arc<Mutex<Compositor>>,
 ) {
     std::thread::Builder::new()
-        .name("frescod-kbd".into())
-        .spawn(move || run(event_sink, wm))
-        .expect("spawn keyboard reader");
+        .name("frescod-kbd-supv".into())
+        .spawn(move || supervise(event_sink, wm))
+        .expect("spawn keyboard supervisor");
+}
+
+fn supervise(event_sink: Sender<DisplayEvent>, wm: Arc<Mutex<Compositor>>) {
+    let mut worker: Option<(String, JoinHandle<()>)> = None;
+
+    let try_attach = |worker: &mut Option<(String, JoinHandle<()>)>| {
+        /* Reap a finished worker so a re-plug starts a fresh one. */
+        if let Some((path, h)) = worker.as_ref() {
+            if h.is_finished() {
+                let (path, h) = worker.take().unwrap();
+                let _ = h.join();
+                eprintln!("frescod: keyboard reader for {path} exited");
+            }
+        }
+        if worker.is_some() { return; }
+        let Some(path) = find_keyboard_path() else { return; };
+        let sink = event_sink.clone();
+        let wm   = wm.clone();
+        let p2   = path.clone();
+        let h = std::thread::Builder::new()
+            .name(format!("frescod-kbd:{path}"))
+            .spawn(move || run_one(p2, sink, wm))
+            .expect("spawn keyboard reader");
+        *worker = Some((path, h));
+    };
+
+    /* Seed once at startup. */
+    try_attach(&mut worker);
+    if worker.is_none() {
+        eprintln!(
+            "frescod: no keyboard /dev/hidraw* found yet — will attach \
+             on hotplug. (`kldload hidraw` if hidraw module isn't loaded.)"
+        );
+    }
+
+    let watcher = match DeviceWatcher::open() {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("frescod: devevents unavailable ({e}) — keyboard \
+                       hotplug disabled. devd(8) running?");
+            return;
+        }
+    };
+
+    loop {
+        let ev = match watcher.recv() {
+            Ok(ev) => ev,
+            Err(e) => {
+                eprintln!("frescod: devevents recv error: {e}; supervisor exits");
+                return;
+            }
+        };
+        match ev {
+            Event::Added { devnode } | Event::Removed { devnode }
+                if devnode.starts_with("/dev/hidraw") =>
+            {
+                /* Either kind triggers a re-scan: an Add gives us a new
+                 * device to attach; a Remove drops us back to "no
+                 * keyboard" and the next Add re-attaches. The worker
+                 * thread itself exits on EOF when its device disappears. */
+                eprintln!("frescod: hidraw event {devnode}; re-scanning");
+                try_attach(&mut worker);
+            }
+            _ => {} /* ignore other devices */
+        }
+    }
 }
 
 /// Map the HID Keyboard 8-bit modifier byte to the 3-bit wire bitmap.
@@ -109,17 +181,9 @@ fn hid_mod_to_wire(hid: u8) -> u8 {
     out
 }
 
-fn run(event_sink: Sender<DisplayEvent>, wm: Arc<Mutex<Compositor>>) {
-    let path = match find_keyboard_path() {
-        Some(p) => p,
-        None => {
-            eprintln!(
-                "frescod: no keyboard /dev/hidraw* found — keyboard input \
-                 disabled. `kldload hidraw` and retry."
-            );
-            return;
-        }
-    };
+fn run_one(path: String,
+           event_sink: Sender<DisplayEvent>,
+           wm: Arc<Mutex<Compositor>>) {
     let mut file = match File::open(&path) {
         Ok(f) => f,
         Err(e) => {

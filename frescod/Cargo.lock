@@ -111,6 +111,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-devevents"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "log",
+]
+
+[[package]]
 name = "atrium-gpu-rs"
 version = "0.1.0"
 dependencies = [
@@ -481,6 +489,7 @@ name = "frescod"
 version = "0.1.0"
 dependencies = [
  "aqueduct",
+ "atrium-devevents",
  "atrium-gpu-rs",
  "env_logger",
  "fresco-protocol",
