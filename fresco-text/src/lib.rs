@@ -233,3 +233,54 @@ pub fn build_text_mesh(
     }
     (verts, idx)
 }
+
+impl GlyphAtlas {
+    /// Extract the alpha channel as an R8 buffer for upload as
+    /// `TextureFormat::R8Unorm`. The fragment shader multiplies this
+    /// coverage against the run's color.
+    pub fn r8_pixels(&self) -> Vec<u8> {
+        let n = (self.width * self.height) as usize;
+        let mut out = Vec::with_capacity(n);
+        for px in self.pixels.chunks_exact(4) {
+            out.push(px[3]);
+        }
+        out
+    }
+
+    /// Build a `GlyphRunParams` referencing an already-uploaded R8
+    /// atlas slot. `(x, y)` is the run origin in window-pixel space
+    /// with y at the text baseline (pixel-y grows downward).
+    pub fn to_glyph_run(
+        &self,
+        x: f32,
+        y: f32,
+        color: [f32; 4],
+        atlas_slot_id: u32,
+    ) -> fresco_protocol::GlyphRunParams {
+        let mut glyphs = Vec::with_capacity(self.glyphs.len());
+        for q in &self.glyphs {
+            let gw = (q.dx1 - q.dx0).max(0.0);
+            let gh = (q.dy1 - q.dy0).max(0.0);
+            let au = (q.u0 * self.width  as f32).round() as u32;
+            let av = (q.v0 * self.height as f32).round() as u32;
+            glyphs.push(fresco_protocol::GlyphInstance {
+                dx: q.dx0,
+                dy: 0.0,
+                atlas_u: au,
+                atlas_v: av,
+                atlas_w: gw.round() as u32,
+                atlas_h: gh.round() as u32,
+                bearing_x: 0.0,
+                bearing_y: -q.dy0,
+            });
+        }
+        fresco_protocol::GlyphRunParams {
+            x, y,
+            atlas_slot_id,
+            atlas_width:  self.width,
+            atlas_height: self.height,
+            r: color[0], g: color[1], b: color[2], a: color[3],
+            glyphs,
+        }
+    }
+}

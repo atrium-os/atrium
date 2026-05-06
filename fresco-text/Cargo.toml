@@ -18,3 +18,4 @@ path = "src/lib.rs"
 rustybuzz = "0.20"
 swash = "0.1"
 ttf-parser = "0.25"
+fresco-protocol = { path = "../fresco-protocol" }
