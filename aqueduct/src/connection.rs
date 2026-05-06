@@ -378,6 +378,14 @@ impl Connection {
         self.rd.get_ref().set_read_timeout(t)
     }
 
+    /// Toggle non-blocking I/O. Used by clients that want a true
+    /// "is there data right now?" poll without setting a sub-tick
+    /// timeout (FreeBSD rejects `set_read_timeout(Duration::ZERO)`
+    /// with EINVAL — `set_nonblocking(true)` is the portable way).
+    pub fn set_nonblocking(&self, nb: bool) -> io::Result<()> {
+        self.rd.get_ref().set_nonblocking(nb)
+    }
+
     /// Diagnostic: how many bytes are currently in the cache.
     pub fn cache_used_bytes(&self) -> usize { self.cache_bytes }
 }

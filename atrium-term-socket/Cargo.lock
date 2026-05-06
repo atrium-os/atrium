@@ -31,7 +31,6 @@ version = "0.1.0"
 dependencies = [
  "fresco-client",
  "fresco-protocol",
- "fresco-text",
  "libc",
  "vte",
 ]

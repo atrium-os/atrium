@@ -396,10 +396,15 @@ impl Connection {
 
     /// Non-blocking poll for the next server-pushed event.
     /// Returns `Ok(None)` if no event is currently available.
+    ///
+    /// FreeBSD rejects `set_read_timeout(Duration::ZERO)` with EINVAL,
+    /// so we toggle non-blocking mode instead. The two are functionally
+    /// equivalent here — both make `recv` return EAGAIN when no data
+    /// is ready.
     pub fn poll_event(&mut self) -> io::Result<Option<Event>> {
-        self.set_read_timeout(Some(Duration::from_millis(0)))?;
+        self.inner.set_nonblocking(true)?;
         let result = self.recv_event_inner();
-        self.set_read_timeout(None)?;
+        self.inner.set_nonblocking(false)?;
         match result {
             Ok(ev) => Ok(Some(ev)),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock

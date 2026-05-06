@@ -9,7 +9,6 @@
 //! kqueue multiplexes pty master fd + compositor socket fd: one
 //! kevent() wakes us on either pty output OR a server input event.
 
-use fresco_client::MonoAtlas;
 mod grid;
 mod keymap;
 mod pty;
@@ -25,7 +24,7 @@ use std::time::Duration;
 use fresco_client::{Connection, Event};
 use fresco_protocol::WindowHints;
 
-const FONT_PATH:    &str = "/mnt/host/test-assets/DejaVuSansMono.ttf";
+const FONT_NAME:    &str = "system-mono";
 const FONT_SIZE_PX: f32  = 18.0;
 const COLS: u16 = 80;
 const ROWS: u16 = 24;
@@ -33,9 +32,6 @@ const WIN_W: u32 = 880;
 const WIN_H: u32 = 540;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let font = std::fs::read(FONT_PATH)
-        .map_err(|e| format!("read {FONT_PATH}: {e}"))?;
-
     let sock = std::env::var("FRESCOD_SOCK")
         .unwrap_or_else(|_| "/tmp/frescod.sock".to_string());
     let mut conn = Connection::connect(&sock)?;
@@ -47,8 +43,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     eprintln!("atrium-term-socket: window {win} created — {WIN_W}x{WIN_H}");
 
-    let cache = MonoAtlas::build(&mut conn, &font, FONT_SIZE_PX, 100)?;
-    let renderer = render::Renderer::new(&cache);
+    let font = conn.font_open(FONT_NAME)?;
+    if font.font_id == 0 {
+        return Err(format!("server could not open '{FONT_NAME}'").into());
+    }
+    let upe = font.units_per_em as f32;
+    let ascent_px  = font.ascent_units  as f32 * FONT_SIZE_PX / upe;
+    let descent_px = -(font.descent_units as f32) * FONT_SIZE_PX / upe;
+    let cell_w     = if font.mono_advance_units > 0 {
+        font.mono_advance_units as f32 * FONT_SIZE_PX / upe
+    } else { FONT_SIZE_PX * 0.6 };
+    let line_h = ascent_px + descent_px + 2.0;
+    let renderer = render::Renderer::new(font.font_id, FONT_SIZE_PX,
+                                         cell_w, line_h, ascent_px);
 
     let shell = pty::Shell::spawn(OsStr::new("/bin/sh"), &["-i"], COLS, ROWS)?;
     eprintln!("spawned /bin/sh pid={}", shell.pid);

@@ -13,5 +13,4 @@ path = "src/main.rs"
 [dependencies]
 fresco-client   = { path = "../fresco-client" }
 fresco-protocol = { path = "../fresco-protocol" }
-fresco-text     = { path = "../fresco-text" }
 libc = "0.2"

@@ -4,7 +4,6 @@
 //! Vi-style hjkl also work via the keymap.
 
 mod dir;
-use fresco_client::MonoAtlas;
 mod keymap;
 mod render;
 
@@ -14,7 +13,7 @@ use std::path::PathBuf;
 use fresco_client::{Connection, Event};
 use fresco_protocol::WindowHints;
 
-const FONT_PATH:    &str   = "/mnt/host/test-assets/DejaVuSansMono.ttf";
+const FONT_NAME:    &str   = "system-mono";
 const FONT_SIZE_PX: f32    = 18.0;
 const PREVIEW_LINES: usize = 64;
 const PREVIEW_BYTES: usize = 8192;
@@ -106,8 +105,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("atrium-find-socket: cwd={} ({} entries)",
         state.cwd.display(), state.entries.len());
 
-    let font = std::fs::read(FONT_PATH)?;
-
     let sock = std::env::var("FRESCOD_SOCK")
         .unwrap_or_else(|_| "/tmp/frescod.sock".to_string());
     let mut conn = Connection::connect(&sock)?;
@@ -119,11 +116,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     eprintln!("atrium-find-socket: window {win} created — {WIN_W}x{WIN_H}");
 
-    let cache = MonoAtlas::build(&mut conn, &font, FONT_SIZE_PX, 100)?;
-    let renderer = render::Renderer::new(&cache, WIN_W, WIN_H);
+    let font = conn.font_open(FONT_NAME)?;
+    if font.font_id == 0 {
+        return Err(format!("server could not open '{FONT_NAME}'").into());
+    }
+    let upe = font.units_per_em as f32;
+    let ascent_px  = font.ascent_units  as f32 * FONT_SIZE_PX / upe;
+    let descent_px = -(font.descent_units as f32) * FONT_SIZE_PX / upe;
+    let cell_w     = if font.mono_advance_units > 0 {
+        font.mono_advance_units as f32 * FONT_SIZE_PX / upe
+    } else { FONT_SIZE_PX * 0.6 };
+    let line_h = ascent_px + descent_px + 2.0;
+
+    let renderer = render::Renderer::new(font.font_id, FONT_SIZE_PX,
+                                         cell_w, line_h, ascent_px,
+                                         WIN_W, WIN_H);
     let mut keymap = keymap::Keymap::new();
 
-    let visible_rows = ((WIN_H as f32 - 24.0) / cache.line_height).floor() as usize;
+    let visible_rows = ((WIN_H as f32 - 24.0) / line_h).floor() as usize;
     let list_visible = visible_rows.saturating_sub(3);
 
     renderer.render(&mut conn, &state.cwd.display().to_string(),
