@@ -28,17 +28,35 @@ use std::path::Path;
 use anyhow::{anyhow, Context, Result};
 use ash::vk;
 
-use crate::frame::{OpFrameResources, PathNode, SceneNode};
+use crate::frame::{GlyphInstance, GlyphRunNode, OpFrameResources, PathNode, SceneNode};
 use crate::pipeline::{op_kind, OpPipelines};
 use crate::renderer::TextureBatch;
 use crate::resource::{self, Resource, UploadRequest};
 
+/// One glyph_run dispatch batched by atlas slot. The renderer issues
+/// one compute + one draw cycle per batch; nodes within the batch all
+/// reference the same atlas. Mirrors `TextureBatch`'s shape but with
+/// the per-glyph-instance data carried alongside the SceneNode list.
+#[derive(Clone, Debug)]
+pub struct GlyphRunBatch {
+    /// Atlas slot id; the per-slot descriptor set is allocated lazily
+    /// (same pattern as the texture op).
+    pub atlas_slot_id: u32,
+    /// Scene nodes for this batch. Each node's `meta[1]` (glyph_offset)
+    /// is into THIS batch's `glyphs` buffer (the renderer fixes up
+    /// offsets when assembling the per-frame storage).
+    pub nodes:  Vec<GlyphRunNode>,
+    /// Glyph instances referenced by the nodes' meta offsets.
+    pub glyphs: Vec<GlyphInstance>,
+}
+
 /// Op-ids for atrium-core's bundled ops. Hardcoded for now; per the
 /// spec §3.4 closed registry, these are pinned. Mirrors the constants
 /// in `fresco-protocol::scene_ops::*`.
-const OP_ID_RECT:    u32 = 0x1000;
-const OP_ID_TEXTURE: u32 = 0x1001;
-const OP_ID_PATH:    u32 = 0x1002;
+const OP_ID_RECT:            u32 = 0x1000;
+const OP_ID_TEXTURE:         u32 = 0x1001;
+const OP_ID_PATH:            u32 = 0x1002;
+const OP_ID_TEXT_GLYPH_RUN:  u32 = 0x2000;
 
 /// Atrium teal — the default clear color, same value as the windowed
 /// `Renderer`. Recognisable so smoke-tests can confirm the render-pass
@@ -117,6 +135,7 @@ pub struct HeadlessRenderer {
     rect_nodes:      Vec<SceneNode>,
     texture_batches: Vec<TextureBatch>,
     path_nodes:      Vec<PathNode>,
+    glyph_run_batches: Vec<GlyphRunBatch>,
 
     /// Last instance count we logged; suppresses spam.
     last_logged_count: u32,
@@ -179,6 +198,7 @@ impl HeadlessRenderer {
             rect_nodes:   Vec::new(),
             texture_batches: Vec::new(),
             path_nodes:   Vec::new(),
+            glyph_run_batches: Vec::new(),
             last_logged_count: u32::MAX,
         })
     }
@@ -247,10 +267,22 @@ impl HeadlessRenderer {
         self.path_nodes = nodes;
     }
 
+    /// Stage glyph_run batches for the next render. One batch per
+    /// distinct atlas slot; the renderer dispatches one compute +
+    /// one indirect draw cycle per batch.
+    pub fn set_glyph_run_batches(&mut self, batches: Vec<GlyphRunBatch>) {
+        self.glyph_run_batches = batches;
+    }
+
     /// SLOT_CLEAR / texture replacement notification: drop any cached
-    /// per-slot descriptor that referenced the old ImageView.
+    /// per-slot descriptor that referenced the old ImageView. Applies
+    /// to both Texture and GlyphRun ops since they share the per-slot
+    /// descriptor pattern.
     pub fn invalidate_slot(&mut self, slot_id: u32) {
         if let Some(f) = self.op_frames.get_mut(&OP_ID_TEXTURE) {
+            f.drop_texture_slot(slot_id);
+        }
+        if let Some(f) = self.op_frames.get_mut(&OP_ID_TEXT_GLYPH_RUN) {
             f.drop_texture_slot(slot_id);
         }
     }
@@ -392,6 +424,58 @@ impl HeadlessRenderer {
                 } else if view.is_none() {
                     log::warn!("texture batch slot={} not bound; skipping",
                         batch.slot_id);
+                }
+            }
+
+            /* Glyph_run plan: one batch per atlas slot. Each batch
+             * carries (a) the SceneNode list (one per text run) and
+             * (b) the per-glyph storage data. The per-batch path
+             * writes both into the shared scene + glyphs buffers and
+             * dispatches compute + indirect draw against the per-slot
+             * atlas binding (lazily allocated, same pattern as
+             * Texture). For now we render the first batch only;
+             * multi-atlas support comes when atrium-text grows
+             * multiple fonts. */
+            if let Some(batch) = self.glyph_run_batches.first() {
+                if self.glyph_run_batches.len() > 1 {
+                    log::warn!("only first glyph_run batch rendered (POC \
+                                limit; {} batches received)",
+                        self.glyph_run_batches.len());
+                }
+                let view = self.resources.get(&batch.atlas_slot_id)
+                    .map(|r| match r { Resource::Texture(t) => t.view });
+                let pipes = self.op_pipelines.get(&OP_ID_TEXT_GLYPH_RUN);
+                if let (Some(view), Some(pipes)) = (view, pipes) {
+                    let device_ref = &self.device;
+                    let frame = self.op_frames.get_mut(&OP_ID_TEXT_GLYPH_RUN)
+                        .expect("glyph_run op frame missing");
+                    /* Write per-frame glyphs storage and scene nodes.
+                     * Caller has already placed correct meta[1] offsets
+                     * in each scene node referencing this batch's
+                     * glyphs[] starting at index 0 (single-batch path). */
+                    let _ng = frame.write_glyphs(&batch.glyphs);
+                    let n = frame.write_glyph_run_scene(&batch.nodes);
+                    if n < batch.nodes.len() as u32 {
+                        log::warn!("glyph_run nodes {} > cap {}; \
+                                    dropping excess",
+                            batch.nodes.len(), frame.max_instances);
+                    }
+                    let render_set = frame.ensure_texture_descriptor(
+                        device_ref, batch.atlas_slot_id, view)?;
+                    plans.push(DrawPlan {
+                        compute_pipeline:  pipes.compute_pipeline,
+                        compute_layout:    pipes.compute_pipe_layout,
+                        compute_set:       frame.descriptor_set,
+                        render_pipeline:   pipes.render_pipeline,
+                        render_layout:     pipes.render_pipe_layout,
+                        render_set,
+                        counter_buf:       frame.counter_buf,
+                        instance_buf:      frame.instance_buf,
+                        n,
+                    });
+                } else if view.is_none() {
+                    log::warn!("glyph_run batch atlas_slot={} not bound; \
+                                skipping", batch.atlas_slot_id);
                 }
             }
 

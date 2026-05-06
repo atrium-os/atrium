@@ -51,6 +51,32 @@ pub struct PathNode {
     pub color: [f32; 4],
 }
 
+/// One scene node for the glyph_run op. Mirrors `SceneNode` in
+/// `bundles/atrium-text/compute/op_glyph_run.comp` (96 bytes: three
+/// vec4s + one ivec4 for std430 alignment). One node = one shaped
+/// text run; the kernel expands it into N InstanceRecords (one per
+/// glyph) by indexing into a separate glyphs storage buffer keyed by
+/// `meta[1]` (glyph_offset).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GlyphRunNode {
+    pub origin:    [f32; 4],   /* x, y, _, _ */
+    pub atlas_dim: [f32; 4],   /* width, height, _, _ */
+    pub color:     [f32; 4],   /* r, g, b, a */
+    pub meta:      [i32; 4],   /* glyph_count, glyph_offset, _, _ */
+}
+
+/// One glyph within a glyph run. Mirrors `GlyphInstance` in the GPU
+/// kernel (32 bytes). Lives in the per-frame glyphs storage buffer;
+/// the kernel reads them via `meta.y + i` indexing.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GlyphInstance {
+    pub d_offset: [f32; 2],    /* dx, dy from run origin */
+    pub atlas_uv: [f32; 4],    /* u, v, w, h in atlas pixel coords */
+    pub bearing:  [f32; 2],    /* bearing_x, bearing_y */
+}
+
 /// Header word that precedes the SceneNode array in the scene buffer.
 /// Mirrors the `SceneBuf { uint node_count; uint _pad0[3]; SceneNode
 /// nodes[]; }` layout in the compute shader.
@@ -64,21 +90,28 @@ const SCENE_HEADER_BYTES: vk::DeviceSize =
 
 fn node_size_for(kind: OpKind) -> vk::DeviceSize {
     match kind {
-        OpKind::Rect    => std::mem::size_of::<SceneNode>()   as vk::DeviceSize,
-        OpKind::Texture => std::mem::size_of::<TextureNode>() as vk::DeviceSize,
-        OpKind::Path    => std::mem::size_of::<PathNode>()    as vk::DeviceSize,
+        OpKind::Rect     => std::mem::size_of::<SceneNode>()    as vk::DeviceSize,
+        OpKind::Texture  => std::mem::size_of::<TextureNode>()  as vk::DeviceSize,
+        OpKind::Path     => std::mem::size_of::<PathNode>()     as vk::DeviceSize,
+        OpKind::GlyphRun => std::mem::size_of::<GlyphRunNode>() as vk::DeviceSize,
     }
 }
 
 /// InstanceRecord size matches node size for these ops (rect: vec4
-/// model + vec4 color = 32; texture: vec4 model = 16; path: 3×vec4 = 48).
+/// model + vec4 color = 32; texture: vec4 model = 16; path: 3×vec4 = 48;
+/// glyph_run: 3×vec4 = 48 — dst_rect + src_rect + color).
 fn instance_size_for(kind: OpKind) -> vk::DeviceSize {
     match kind {
-        OpKind::Rect    => 32,
-        OpKind::Texture => 16,
-        OpKind::Path    => 48,
+        OpKind::Rect     => 32,
+        OpKind::Texture  => 16,
+        OpKind::Path     => 48,
+        OpKind::GlyphRun => 48,
     }
 }
+
+/// Bytes per `GlyphInstance` in the per-frame glyphs storage buffer.
+const GLYPH_INSTANCE_BYTES: vk::DeviceSize =
+    std::mem::size_of::<GlyphInstance>() as vk::DeviceSize;
 
 pub struct OpFrameResources {
     pub kind:          OpKind,
@@ -123,6 +156,17 @@ pub struct OpFrameResources {
     pub sampler:           Option<vk::Sampler>,
     pub render_set_layout: Option<vk::DescriptorSetLayout>,
     pub slot_descriptors:  HashMap<u32, vk::DescriptorSet>,
+
+    /// GlyphRun-only: per-frame glyphs storage buffer (one
+    /// `GlyphInstance` per glyph across all runs in the frame). Bound
+    /// to compute set 0 binding 1; the kernel reads via
+    /// `meta[1] + i`. None for non-GlyphRun ops. Sized at create
+    /// time to `max_instances * GLYPH_INSTANCE_BYTES` — same
+    /// upper bound as the instance buffer, so a single run can have
+    /// up to `max_instances` glyphs.
+    pub glyphs_buf: Option<vk::Buffer>,
+    pub glyphs_mem: Option<vk::DeviceMemory>,
+    glyphs_ptr:     *mut u8,
 }
 
 /* SAFETY: the raw pointers point into Vulkan-owned memory tied to this
@@ -180,9 +224,13 @@ impl OpFrameResources {
             device.map_memory(counter_mem, 0, counter_size, vk::MemoryMapFlags::empty())?
         } as *mut u8;
 
+        /* GlyphRun's compute set has 4 storage buffers (scene,
+         * glyphs, instance, counter); other ops have 3 (scene,
+         * instance, counter). Pool size matches what we'll write. */
+        let n_storage = if kind == OpKind::GlyphRun { 4 } else { 3 };
         let pool_sizes = [vk::DescriptorPoolSize {
             ty: vk::DescriptorType::STORAGE_BUFFER,
-            descriptor_count: 3,
+            descriptor_count: n_storage,
         }];
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .max_sets(1)
@@ -197,6 +245,30 @@ impl OpFrameResources {
             .set_layouts(&layouts);
         let descriptor_set = unsafe { device.allocate_descriptor_sets(&alloc) }?[0];
 
+        /* GlyphRun-only: allocate the per-frame glyphs storage
+         * buffer. Sized to hold up to max_instances GlyphInstances
+         * — i.e., one frame can carry max_instances glyphs total
+         * across all runs. Host-visible so per-frame writes are a
+         * memcpy. */
+        let (glyphs_buf, glyphs_mem, glyphs_ptr) =
+            if kind == OpKind::GlyphRun {
+                let glyphs_size = GLYPH_INSTANCE_BYTES
+                    * max_instances as vk::DeviceSize;
+                let (buf, mem) = create_buffer(
+                    device, &mem_props, glyphs_size,
+                    vk::BufferUsageFlags::STORAGE_BUFFER,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE
+                        | vk::MemoryPropertyFlags::HOST_COHERENT,
+                )?;
+                let ptr = unsafe {
+                    device.map_memory(mem, 0, glyphs_size,
+                        vk::MemoryMapFlags::empty())?
+                } as *mut u8;
+                (Some(buf), Some(mem), ptr)
+            } else {
+                (None, None, std::ptr::null_mut())
+            };
+
         let scene_info = [vk::DescriptorBufferInfo {
             buffer: scene_buf, offset: 0, range: vk::WHOLE_SIZE,
         }];
@@ -206,21 +278,53 @@ impl OpFrameResources {
         let counter_info = [vk::DescriptorBufferInfo {
             buffer: counter_buf, offset: 0, range: vk::WHOLE_SIZE,
         }];
-        let writes = [
-            vk::WriteDescriptorSet::default()
-                .dst_set(descriptor_set).dst_binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&scene_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(descriptor_set).dst_binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&inst_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(descriptor_set).dst_binding(2)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&counter_info),
-        ];
-        unsafe { device.update_descriptor_sets(&writes, &[]); }
+
+        /* Compute descriptor-set bindings depend on op:
+         *   Rect/Texture/Path:   binding 0=scene, 1=instance, 2=counter
+         *   GlyphRun:            binding 0=scene, 1=glyphs,
+         *                        binding 2=instance, 3=counter
+         * Layout was derived from SPIR-V reflection so bindings match
+         * the kernel's declarations. */
+        if kind == OpKind::GlyphRun {
+            let glyphs_info = [vk::DescriptorBufferInfo {
+                buffer: glyphs_buf.unwrap(), offset: 0, range: vk::WHOLE_SIZE,
+            }];
+            let writes = [
+                vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_set).dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&scene_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_set).dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&glyphs_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_set).dst_binding(2)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&inst_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_set).dst_binding(3)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&counter_info),
+            ];
+            unsafe { device.update_descriptor_sets(&writes, &[]); }
+        } else {
+            let writes = [
+                vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_set).dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&scene_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_set).dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&inst_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_set).dst_binding(2)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&counter_info),
+            ];
+            unsafe { device.update_descriptor_sets(&writes, &[]); }
+        }
 
         /* ── Render-side resources: uniform + descriptor set(s). ── */
         let (screen_buf, screen_mem) = create_buffer(
@@ -278,7 +382,12 @@ impl OpFrameResources {
                 unsafe { device.update_descriptor_sets(&writes, &[]); }
                 (pool, Some(set), None, None)
             }
-            OpKind::Texture => {
+            /* Texture and GlyphRun share the same render-set shape:
+             * one storage buffer (instances) + one uniform (screen) +
+             * one combined-image-sampler (the texture / atlas).
+             * Per-slot descriptor sets are allocated lazily via
+             * `ensure_texture_descriptor`. */
+            OpKind::Texture | OpKind::GlyphRun => {
                 let sizes = [
                     vk::DescriptorPoolSize {
                         ty: vk::DescriptorType::STORAGE_BUFFER,
@@ -298,9 +407,7 @@ impl OpFrameResources {
                 let pool = unsafe { device.create_descriptor_pool(&info, None) }?;
 
                 /* One sampler shared across slots: linear filter, clamp
-                 * to edge. The 100-instance demo doesn't need anything
-                 * fancier; per-slot samplers can come later if a bundle
-                 * needs them. */
+                 * to edge. */
                 let sampler_info = vk::SamplerCreateInfo::default()
                     .mag_filter(vk::Filter::LINEAR)
                     .min_filter(vk::Filter::LINEAR)
@@ -323,6 +430,7 @@ impl OpFrameResources {
             render_pool, render_set,
             sampler, render_set_layout: render_set_layout_keep,
             slot_descriptors: HashMap::new(),
+            glyphs_buf, glyphs_mem, glyphs_ptr,
         })
     }
 
@@ -418,6 +526,38 @@ impl OpFrameResources {
                        std::mem::size_of::<PathNode>())
     }
 
+    /// Write glyph_run scene nodes into the scene buffer. The
+    /// per-node `meta[1]` (glyph_offset) must reference indices in
+    /// the glyphs buffer that were populated by `write_glyphs` before
+    /// the dispatch.
+    pub fn write_glyph_run_scene(&self, nodes: &[GlyphRunNode]) -> u32 {
+        debug_assert_eq!(self.kind, OpKind::GlyphRun);
+        self.write_raw(nodes.as_ptr() as *const u8,
+                       nodes.len(),
+                       std::mem::size_of::<GlyphRunNode>())
+    }
+
+    /// Write the per-frame glyphs storage buffer for a GlyphRun
+    /// dispatch. `instances.len()` must be ≤ `max_instances`. Returns
+    /// the actual count written (capped). Caller is expected to pre-
+    /// arrange `meta[1]` (glyph_offset) in each scene node so that
+    /// the kernel reads the right slice for each run.
+    pub fn write_glyphs(&self, instances: &[GlyphInstance]) -> u32 {
+        debug_assert_eq!(self.kind, OpKind::GlyphRun);
+        let n = instances.len().min(self.max_instances as usize) as u32;
+        if n == 0 || self.glyphs_ptr.is_null() {
+            return n;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                instances.as_ptr() as *const u8,
+                self.glyphs_ptr,
+                n as usize * std::mem::size_of::<GlyphInstance>(),
+            );
+        }
+        n
+    }
+
     fn write_raw(&self, src: *const u8, count: usize, item_bytes: usize) -> u32 {
         debug_assert_eq!(item_bytes as vk::DeviceSize, self.node_bytes);
         let n = count.min(self.max_instances as usize) as u32;
@@ -441,6 +581,11 @@ impl OpFrameResources {
     }
 
     pub unsafe fn destroy(&self, device: &ash::Device) {
+        if let (Some(buf), Some(mem)) = (self.glyphs_buf, self.glyphs_mem) {
+            device.unmap_memory(mem);
+            device.destroy_buffer(buf, None);
+            device.free_memory(mem, None);
+        }
         if let Some(s) = self.sampler {
             device.destroy_sampler(s, None);
         }

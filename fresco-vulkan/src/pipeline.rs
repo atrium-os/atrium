@@ -40,6 +40,14 @@ pub enum OpKind {
     /// family — generic Bezier paths land in `OpKind::Glyph` (0x1003)
     /// when atrium-text ships.
     Path,
+    /// atrium-text glyph run (op_id 0x2000). 96-byte SceneNode
+    /// (origin + atlas dims + color + glyph_count/offset meta) plus
+    /// a separate per-frame glyphs storage buffer (one
+    /// `GlyphInstance` per glyph, 32 bytes each). Compute kernel
+    /// expands one node into N instance records (one per glyph).
+    /// Render side binds the atlas as a per-slot texture, identical
+    /// to Texture's render-set shape.
+    GlyphRun,
 }
 
 /// Map op-id → kind. Hardcoded for buffer sizing only (see
@@ -50,6 +58,7 @@ pub fn op_kind(op_id: u32) -> OpKind {
         0x1000 => OpKind::Rect,
         0x1001 => OpKind::Texture,
         0x1002 => OpKind::Path,
+        0x2000 => OpKind::GlyphRun,
         _      => OpKind::Rect,
     }
 }

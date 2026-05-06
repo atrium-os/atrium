@@ -21,7 +21,7 @@ mod frame;
 mod reflect;
 
 pub use renderer::{Renderer, TextureBatch};
-pub use headless::HeadlessRenderer;
+pub use headless::{HeadlessRenderer, GlyphRunBatch};
 pub use pipeline::{OpKind, OpPipelines};
 pub use resource::{Resource, Texture, UploadRequest};
-pub use frame::{PathNode, SceneNode, TextureNode};
+pub use frame::{GlyphInstance, GlyphRunNode, PathNode, SceneNode, TextureNode};
