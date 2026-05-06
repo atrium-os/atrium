@@ -1375,9 +1375,17 @@ atrium_vgpu_ctx_create(struct atrium_gpu_softc *sc, uint32_t ctx_id,
 
 	bzero(&s, sizeof(s));
 	s.req.hdr.type     = htole32(VIRTIO_GPU_CMD_CTX_CREATE);
-	s.req.hdr.flags    = htole32(VIRTIO_GPU_FLAG_FENCE);
+	/* INFO_RING_IDX routes the fence through QEMU's per-context
+	 * async-fence path (virgl_renderer_context_create_fence) instead
+	 * of the legacy global path (virgl_renderer_create_fence). The
+	 * legacy path requires vrend_initialized, which is FALSE under
+	 * VIRGL_RENDERER_NO_VIRGL — so without this flag the fence is
+	 * silently dropped on macOS hosts and the guest times out. */
+	s.req.hdr.flags    = htole32(VIRTIO_GPU_FLAG_FENCE |
+	                             VIRTIO_GPU_FLAG_INFO_RING_IDX);
 	s.req.hdr.fence_id = htole64(atomic_fetchadd_64(&sc->next_fence, 1));
 	s.req.hdr.ctx_id   = htole32(ctx_id);
+	s.req.hdr.ring_idx = 0;  /* venus uses ring 0 for control */
 	/* context_init's low byte holds the capset id (mask 0xFF). */
 	s.req.context_init = htole32(capset_id &
 	    VIRTIO_GPU_CONTEXT_INIT_CAPSET_ID_MASK);
@@ -1404,9 +1412,12 @@ atrium_vgpu_ctx_destroy(struct atrium_gpu_softc *sc, uint32_t ctx_id)
 
 	bzero(&s, sizeof(s));
 	s.req.hdr.type     = htole32(VIRTIO_GPU_CMD_CTX_DESTROY);
-	s.req.hdr.flags    = htole32(VIRTIO_GPU_FLAG_FENCE);
+	/* See ctx_create — INFO_RING_IDX needed under NO_VIRGL hosts. */
+	s.req.hdr.flags    = htole32(VIRTIO_GPU_FLAG_FENCE |
+	                             VIRTIO_GPU_FLAG_INFO_RING_IDX);
 	s.req.hdr.fence_id = htole64(atomic_fetchadd_64(&sc->next_fence, 1));
 	s.req.hdr.ctx_id   = htole32(ctx_id);
+	s.req.hdr.ring_idx = 0;
 
 	err = atrium_vgpu_req_resp(sc, &s.req, sizeof(s.req),
 	    &s.resp, sizeof(s.resp));

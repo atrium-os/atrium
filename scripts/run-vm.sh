@@ -101,6 +101,11 @@ for arg in "$@"; do
             # in case the Vulkan loader's JSON resolution doesn't reach
             # virgl_render_server (which is fork'd from QEMU).
             export DYLD_LIBRARY_PATH="/opt/homebrew/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+            # Capture the render server's own log output to a per-pid
+            # file. Without this its messages may end up in macOS's
+            # unified log (via syslog) where they're hard to find.
+            export VIRGL_LOG_FILE="/tmp/virgl-%PID%.log"
+            export VIRGL_LOG_LEVEL=debug
             # Two GPU devices, by design:
             #
             #  bochs-display: gives EDK2 a real GOP that the loader
@@ -164,6 +169,7 @@ elif [ "$WANT_TABLET" = 1 ]; then
 fi
 
 exec "$QEMU" \
+    ${ATRIUM_QEMU_TRACE:+-trace events=$ATRIUM_QEMU_TRACE} \
     -accel hvf -cpu host -machine virt,gic-version=2 \
     -smp "$SMP" -m "$MEM" \
     -drive if=pflash,format=raw,unit=0,file="$EFI_PAD",readonly=on \
