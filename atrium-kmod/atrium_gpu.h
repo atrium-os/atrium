@@ -134,6 +134,80 @@ struct atrium_gpu_caps {
 
 #define ATRIUM_GPU_IOC_CAPS _IOR ('G', 7, struct atrium_gpu_caps)
 
+/* ---------- Venus / Vulkan paravirt (V3+) ---------------------------- */
+/*
+ * These ioctls let userspace drive virtio-gpu's context-init machinery,
+ * which is what `atrium-mesa-venus` (and any future paravirt-Vulkan ICD)
+ * uses to ship Vulkan command streams to a host renderer. See
+ * `docs/spec/atrium-venus.md` §3 for the contract.
+ *
+ * Capsicum shape: every operation here is per-fd. The kernel-side
+ * context state lives in the per-open private record (no global handle
+ * table), and CTX_INIT is idempotent at the fd level — the context is
+ * destroyed implicitly when the fd is closed. There is no escape hatch
+ * by which one fd can name another fd's context. A sandboxed process
+ * can be granted just CAP_IOCTL with this command list and operate
+ * normally.
+ */
+
+/* Capset IDs follow virglrenderer's VIRTGPU_DRM_CAPSET_* enum. Kept
+ * here verbatim so the kmod doesn't pull in virglrenderer's headers. */
+#define ATRIUM_GPU_CAPSET_VIRGL        1
+#define ATRIUM_GPU_CAPSET_VIRGL2       2
+#define ATRIUM_GPU_CAPSET_GFXSTREAM    3
+#define ATRIUM_GPU_CAPSET_VENUS        4
+#define ATRIUM_GPU_CAPSET_CROSS_DOMAIN 5
+#define ATRIUM_GPU_CAPSET_DRM          6
+
+/* Practical cap on capset blob size returned by GET_CAPSET. The host
+ * picks whatever the renderer reports; venus is ~256 bytes today. */
+#define ATRIUM_GPU_CAPSET_DATA_MAX  4096
+
+/*
+ * ATRIUM_GPU_IOC_CAPSET_QUERY — does the host advertise this capset?
+ *
+ *   in:   capset_id      — see ATRIUM_GPU_CAPSET_*
+ *         capset_version — requested version (0 = latest)
+ *         data_ptr       — userspace buffer for the capset blob, or NULL
+ *                          to query size only (data_size still returned)
+ *   out:  actual_version — 0 if capset isn't advertised by host
+ *         data_size      — bytes the host returned (or would have)
+ *
+ * Side-effect-free at the kmod/host level beyond a virtio round-trip;
+ * a sandboxed process that only needs to probe for venus can hold
+ * CAP_IOCTL on this command alone.
+ */
+struct atrium_gpu_capset_query {
+	uint32_t capset_id;
+	uint32_t capset_version;
+	uint32_t actual_version;
+	uint32_t data_size;
+	uint64_t data_ptr;
+	uint64_t _reserved[2];
+};
+#define ATRIUM_GPU_IOC_CAPSET_QUERY  _IOWR('G', 0x40, struct atrium_gpu_capset_query)
+
+/*
+ * ATRIUM_GPU_IOC_CTX_INIT — bind a virtio-gpu context to this fd.
+ *
+ * Per-fd: each open(/dev/atrium-gpu0) gets at most one context. A
+ * second CTX_INIT on the same fd returns EBUSY. Closing the fd implicitly
+ * destroys the context (CTX_DESTROY issued from the file-priv destructor).
+ *
+ *   in:   capset_id   — usually ATRIUM_GPU_CAPSET_VENUS
+ *         flags       — reserved, must be 0
+ *         debug_name  — passed to host for debugging; not interpreted
+ *   out:  ctx_id_out  — server-assigned id (informational; not a handle)
+ */
+struct atrium_gpu_ctx_init {
+	uint32_t capset_id;
+	uint32_t flags;
+	char     debug_name[64];
+	uint32_t ctx_id_out;
+	uint32_t _reserved[3];
+};
+#define ATRIUM_GPU_IOC_CTX_INIT  _IOWR('G', 0x41, struct atrium_gpu_ctx_init)
+
 /* ---------- Display ---------- */
 
 struct atrium_display_bind_gpu {

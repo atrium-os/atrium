@@ -59,8 +59,13 @@
 #define VIRTIO_PCI_VENDOR        0x1af4
 #define VIRTIO_GPU_PCI_DEVICE    0x1050
 
-/* Feature mask. v0.1 negotiates none; later steps add EDID and BLOB. */
-#define ATRIUM_VIRTIO_GPU_FEATURES  0
+/* Feature mask. CONTEXT_INIT lets us drive virtio-gpu's
+ * SUBMIT_3D / CTX_CREATE machinery — required for venus paravirt
+ * Vulkan. We negotiate it; if the host doesn't have it, the kmod
+ * still drives the basic 2D/scanout path fine and venus ioctls
+ * return ENOTSUP at runtime. */
+#define ATRIUM_VIRTIO_GPU_FEATURES \
+	((1ULL << VIRTIO_GPU_F_CONTEXT_INIT))
 
 static struct virtio_feature_desc atrium_virtio_gpu_feature_desc[] = {
 	{ VIRTIO_GPU_F_VIRGL,         "VirGL"       },
@@ -151,6 +156,14 @@ struct atrium_gpu_softc {
 	uint32_t                       next_handle;
 	uint32_t                       next_resource_id;  /* virtio-gpu side */
 
+	/* Monotonic per-driver context id allocator for CONTEXT_INIT.
+	 * Never returns 0 (zero is reserved for "no context"). The
+	 * counter is process-wide because virtio-gpu's context_id space
+	 * is per-device, but it never escapes the kmod — Capsicum scope
+	 * is preserved by keeping per-fd state the only addressable
+	 * handle. */
+	uint32_t                       next_ctx_id;
+
 	/* Cdevs. */
 	struct cdev                   *gpu_cdev;
 	struct cdev                   *display_cdev;
@@ -169,6 +182,13 @@ struct atrium_gpu_softc {
 
 struct atrium_gpu_file {
 	struct atrium_gpu_softc *sc;
+
+	/* Venus / virtio-gpu CONTEXT_INIT state. 0 = no context bound to
+	 * this fd. Set by ATRIUM_GPU_IOC_CTX_INIT, torn down in the
+	 * fd-priv destructor. Capsicum-shape: lookup is by fd, never by
+	 * id; no other fd can address this context. */
+	uint32_t                 ctx_id;
+	uint32_t                 ctx_capset;
 };
 
 /* Forward declarations: virtio-gpu helpers used by display ioctl handlers
@@ -184,6 +204,15 @@ static int atrium_vgpu_transfer_to_host_2d(struct atrium_gpu_softc *,
 static int atrium_vgpu_resource_flush(struct atrium_gpu_softc *,
     uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
 static int atrium_vgpu_ensure_display_info(struct atrium_gpu_softc *);
+
+/* V3: venus / context-init helpers (defined further down). */
+static int atrium_vgpu_find_capset(struct atrium_gpu_softc *,
+    uint32_t, uint32_t *, uint32_t *);
+static int atrium_vgpu_get_capset(struct atrium_gpu_softc *,
+    uint32_t, uint32_t, void *, size_t);
+static int atrium_vgpu_ctx_create(struct atrium_gpu_softc *,
+    uint32_t, uint32_t, const char *);
+static int atrium_vgpu_ctx_destroy(struct atrium_gpu_softc *, uint32_t);
 
 struct atrium_display_file {
 	struct atrium_gpu_softc *sc;
@@ -232,6 +261,15 @@ atrium_gpu_file_dtor(void *arg)
 	struct atrium_gpu_softc *sc = f->sc;
 	struct atrium_gpu_bo *bo, *tmp;
 	struct atrium_gpu_bo_list orphans;
+
+	/* Tear down virtio-gpu context (if any) before reclaiming BOs:
+	 * the host renderer may hold references to BOs attached to this
+	 * context, which won't release until CTX_DESTROY. Per-fd Capsicum
+	 * scope: this is the only path that can destroy this context. */
+	if (f->ctx_id != 0) {
+		(void)atrium_vgpu_ctx_destroy(sc, f->ctx_id);
+		f->ctx_id = 0;
+	}
 
 	TAILQ_INIT(&orphans);
 	mtx_lock(&sc->bo_lock);
@@ -434,6 +472,98 @@ atrium_gpu_ioc_submit(struct atrium_gpu_softc *sc, struct atrium_gpu_file *f,
 	return (0);
 }
 
+/* ATRIUM_GPU_IOC_CAPSET_QUERY: report whether `capset_id` is advertised
+ * by the host renderer, plus the capset blob if data_ptr != NULL. Pure
+ * read-side query — no per-fd state changed. */
+static int
+atrium_gpu_ioc_capset_query(struct atrium_gpu_softc *sc,
+    struct atrium_gpu_file *f __unused,
+    struct atrium_gpu_capset_query *args)
+{
+	uint32_t max_ver, max_size;
+	void *blob;
+	int err;
+
+	err = atrium_vgpu_find_capset(sc, args->capset_id,
+	    &max_ver, &max_size);
+	if (err == ENOENT) {
+		args->actual_version = 0;
+		args->data_size      = 0;
+		return (0);
+	}
+	if (err != 0)
+		return (err);
+	if (max_size > ATRIUM_GPU_CAPSET_DATA_MAX)
+		return (E2BIG);
+
+	args->actual_version = (args->capset_version == 0)
+	    ? max_ver
+	    : MIN(args->capset_version, max_ver);
+	args->data_size = max_size;
+
+	if (args->data_ptr == 0)
+		return (0);  /* size-only query */
+
+	blob = malloc(max_size + sizeof(struct virtio_gpu_ctrl_hdr),
+	    M_ATRIUM_GPU, M_WAITOK | M_ZERO);
+	err = atrium_vgpu_get_capset(sc, args->capset_id,
+	    args->actual_version, blob,
+	    max_size + sizeof(struct virtio_gpu_ctrl_hdr));
+	if (err == 0) {
+		struct virtio_gpu_resp_capset *r = blob;
+		err = copyout(r->capset_data,
+		    (void *)(uintptr_t)args->data_ptr, max_size);
+	}
+	free(blob, M_ATRIUM_GPU);
+	return (err);
+}
+
+/* ATRIUM_GPU_IOC_CTX_INIT: bind a virtio-gpu context to this fd.
+ * Capsicum-shape: the resulting context is reachable only through
+ * `f`; no other fd can name or operate on it. */
+static int
+atrium_gpu_ioc_ctx_init(struct atrium_gpu_softc *sc,
+    struct atrium_gpu_file *f, struct atrium_gpu_ctx_init *args)
+{
+	uint32_t ctx_id;
+	int err;
+
+	if (f->ctx_id != 0)
+		return (EBUSY);
+	if (args->flags != 0)
+		return (EINVAL);
+	if ((sc->features & (1ULL << VIRTIO_GPU_F_CONTEXT_INIT)) == 0)
+		return (ENOTSUP);
+
+	/* Confirm the host advertises the requested capset before
+	 * burning a context id. */
+	{
+		uint32_t mv, ms;
+		err = atrium_vgpu_find_capset(sc, args->capset_id, &mv, &ms);
+		if (err == ENOENT)
+			return (ENOTSUP);
+		if (err != 0)
+			return (err);
+	}
+
+	mtx_lock(&sc->lock);
+	ctx_id = ++sc->next_ctx_id;
+	mtx_unlock(&sc->lock);
+
+	/* NUL-terminate debug_name defensively even though virtio_gpu
+	 * uses an explicit length field. */
+	args->debug_name[sizeof(args->debug_name) - 1] = '\0';
+	err = atrium_vgpu_ctx_create(sc, ctx_id, args->capset_id,
+	    args->debug_name);
+	if (err != 0)
+		return (err);
+
+	f->ctx_id     = ctx_id;
+	f->ctx_capset = args->capset_id;
+	args->ctx_id_out = ctx_id;
+	return (0);
+}
+
 static int
 atrium_gpu_ioctl(struct cdev *cdev, u_long cmd, caddr_t data,
     int fflag __unused, struct thread *td __unused)
@@ -477,6 +607,13 @@ atrium_gpu_ioctl(struct cdev *cdev, u_long cmd, caddr_t data,
 		q->latest_retired = atomic_load_64(&sc->next_fence) - 1;
 		return (0);
 	}
+
+	case ATRIUM_GPU_IOC_CAPSET_QUERY:
+		return (atrium_gpu_ioc_capset_query(sc, f,
+		    (struct atrium_gpu_capset_query *)data));
+	case ATRIUM_GPU_IOC_CTX_INIT:
+		return (atrium_gpu_ioc_ctx_init(sc, f,
+		    (struct atrium_gpu_ctx_init *)data));
 
 	default:
 		return (ENOTTY);
@@ -1113,6 +1250,169 @@ atrium_vgpu_resource_flush(struct atrium_gpu_softc *sc, uint32_t resource_id,
 	if (err != 0)
 		return (err);
 	return (atrium_vgpu_check_ok(sc, "RESOURCE_FLUSH", &s.resp));
+}
+
+/* ------------------------------------------------------------------------- */
+/* Venus / context-init helpers (V3+).                                          */
+/*                                                                              */
+/* These wrap virtio-gpu's GET_CAPSET_INFO / GET_CAPSET / CTX_CREATE /         */
+/* CTX_DESTROY commands. The kmod doesn't interpret capset payloads or         */
+/* command streams; for venus the payloads are opaque blobs the host's          */
+/* virglrenderer parses.                                                        */
+/* ------------------------------------------------------------------------- */
+
+/* Number of capsets advertised in virtio_config.num_capsets. The host
+ * fills this when the device is realized; we cache it on first
+ * use to avoid re-reading PCI config space. */
+static uint32_t
+atrium_vgpu_num_capsets(struct atrium_gpu_softc *sc)
+{
+	return (le32toh(sc->gpucfg.num_capsets));
+}
+
+/* GET_CAPSET_INFO walks capset indexes [0, num_capsets); each returns
+ * a (capset_id, max_version, max_size) triple. We probe sequentially
+ * to find the one matching the requested capset_id. */
+static int
+atrium_vgpu_get_capset_info_at(struct atrium_gpu_softc *sc,
+    uint32_t index, uint32_t *out_id, uint32_t *out_max_ver,
+    uint32_t *out_max_size)
+{
+	struct {
+		struct virtio_gpu_get_capset_info req;
+		char pad;
+		struct virtio_gpu_resp_capset_info resp;
+	} s;
+	int err;
+
+	bzero(&s, sizeof(s));
+	s.req.hdr.type     = htole32(VIRTIO_GPU_CMD_GET_CAPSET_INFO);
+	s.req.hdr.flags    = htole32(VIRTIO_GPU_FLAG_FENCE);
+	s.req.hdr.fence_id = htole64(atomic_fetchadd_64(&sc->next_fence, 1));
+	s.req.capset_index = htole32(index);
+
+	err = atrium_vgpu_req_resp(sc, &s.req, sizeof(s.req),
+	    &s.resp, sizeof(s.resp));
+	if (err != 0)
+		return (err);
+	if (le32toh(s.resp.hdr.type) != VIRTIO_GPU_RESP_OK_CAPSET_INFO) {
+		device_printf(sc->dev,
+		    "GET_CAPSET_INFO[%u] resp 0x%x\n", index,
+		    le32toh(s.resp.hdr.type));
+		return (EIO);
+	}
+	*out_id       = le32toh(s.resp.capset_id);
+	*out_max_ver  = le32toh(s.resp.capset_max_version);
+	*out_max_size = le32toh(s.resp.capset_max_size);
+	return (0);
+}
+
+/* Lookup a capset by id (not index). Returns ENOENT if the host
+ * doesn't advertise it. Result is informational; callers use it to
+ * decide whether to issue a follow-up GET_CAPSET. */
+static int
+atrium_vgpu_find_capset(struct atrium_gpu_softc *sc, uint32_t want_id,
+    uint32_t *out_max_ver, uint32_t *out_max_size)
+{
+	uint32_t i, n, id, mv, ms;
+	int err;
+
+	n = atrium_vgpu_num_capsets(sc);
+	for (i = 0; i < n; i++) {
+		err = atrium_vgpu_get_capset_info_at(sc, i, &id, &mv, &ms);
+		if (err != 0)
+			return (err);
+		if (id == want_id) {
+			*out_max_ver  = mv;
+			*out_max_size = ms;
+			return (0);
+		}
+	}
+	return (ENOENT);
+}
+
+/* GET_CAPSET fetches the actual capability blob for a known capset.
+ * Caller supplies the response buffer sized at max_size. */
+static int
+atrium_vgpu_get_capset(struct atrium_gpu_softc *sc, uint32_t capset_id,
+    uint32_t version, void *resp_buf, size_t resp_size)
+{
+	struct virtio_gpu_get_capset req;
+	struct virtio_gpu_ctrl_hdr *hdr = resp_buf;
+	int err;
+
+	bzero(&req, sizeof(req));
+	bzero(resp_buf, resp_size);
+	req.hdr.type     = htole32(VIRTIO_GPU_CMD_GET_CAPSET);
+	req.hdr.flags    = htole32(VIRTIO_GPU_FLAG_FENCE);
+	req.hdr.fence_id = htole64(atomic_fetchadd_64(&sc->next_fence, 1));
+	req.capset_id    = htole32(capset_id);
+	req.capset_version = htole32(version);
+
+	err = atrium_vgpu_req_resp(sc, &req, sizeof(req),
+	    resp_buf, resp_size);
+	if (err != 0)
+		return (err);
+	if (le32toh(hdr->type) != VIRTIO_GPU_RESP_OK_CAPSET) {
+		device_printf(sc->dev, "GET_CAPSET resp 0x%x\n",
+		    le32toh(hdr->type));
+		return (EIO);
+	}
+	return (0);
+}
+
+static int
+atrium_vgpu_ctx_create(struct atrium_gpu_softc *sc, uint32_t ctx_id,
+    uint32_t capset_id, const char *debug_name)
+{
+	struct {
+		struct virtio_gpu_ctx_create req;
+		char pad;
+		struct virtio_gpu_ctrl_hdr resp;
+	} s;
+	size_t nlen;
+	int err;
+
+	bzero(&s, sizeof(s));
+	s.req.hdr.type     = htole32(VIRTIO_GPU_CMD_CTX_CREATE);
+	s.req.hdr.flags    = htole32(VIRTIO_GPU_FLAG_FENCE);
+	s.req.hdr.fence_id = htole64(atomic_fetchadd_64(&sc->next_fence, 1));
+	s.req.hdr.ctx_id   = htole32(ctx_id);
+	/* context_init's low byte holds the capset id (mask 0xFF). */
+	s.req.context_init = htole32(capset_id &
+	    VIRTIO_GPU_CONTEXT_INIT_CAPSET_ID_MASK);
+	nlen = strnlen(debug_name, sizeof(s.req.debug_name) - 1);
+	memcpy(s.req.debug_name, debug_name, nlen);
+	s.req.nlen = htole32((uint32_t)nlen);
+
+	err = atrium_vgpu_req_resp(sc, &s.req, sizeof(s.req),
+	    &s.resp, sizeof(s.resp));
+	if (err != 0)
+		return (err);
+	return (atrium_vgpu_check_ok(sc, "CTX_CREATE", &s.resp));
+}
+
+static int
+atrium_vgpu_ctx_destroy(struct atrium_gpu_softc *sc, uint32_t ctx_id)
+{
+	struct {
+		struct virtio_gpu_ctx_destroy req;
+		char pad;
+		struct virtio_gpu_ctrl_hdr resp;
+	} s;
+	int err;
+
+	bzero(&s, sizeof(s));
+	s.req.hdr.type     = htole32(VIRTIO_GPU_CMD_CTX_DESTROY);
+	s.req.hdr.flags    = htole32(VIRTIO_GPU_FLAG_FENCE);
+	s.req.hdr.fence_id = htole64(atomic_fetchadd_64(&sc->next_fence, 1));
+	s.req.hdr.ctx_id   = htole32(ctx_id);
+
+	err = atrium_vgpu_req_resp(sc, &s.req, sizeof(s.req),
+	    &s.resp, sizeof(s.resp));
+	if (err != 0)
+		return (err);
+	return (atrium_vgpu_check_ok(sc, "CTX_DESTROY", &s.resp));
 }
 
 /* ------------------------------------------------------------------------- */

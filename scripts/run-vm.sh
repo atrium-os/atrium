@@ -90,6 +90,17 @@ for arg in "$@"; do
             VIRTIO_GPU_ARGS="-device virtio-gpu-pci"
             ;;
         --venus)
+            # virgl_render_server (spawned by virglrenderer when venus is
+            # active) needs to find MoltenVK on macOS. Brew installs the
+            # ICD JSON outside the Vulkan loader's default search path;
+            # point at it explicitly so dlopen of libvulkan.dylib enumerates
+            # MoltenVK as the host Vulkan implementation.
+            export VK_ICD_FILENAMES="/tmp/MoltenVK_atrium.json"
+            export VK_DRIVER_FILES="$VK_ICD_FILENAMES"
+            # Also expose MoltenVK to the bare-basename dlopen path
+            # in case the Vulkan loader's JSON resolution doesn't reach
+            # virgl_render_server (which is fork'd from QEMU).
+            export DYLD_LIBRARY_PATH="/opt/homebrew/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
             # Two GPU devices, by design:
             #
             #  bochs-display: gives EDK2 a real GOP that the loader
