@@ -89,6 +89,21 @@ for arg in "$@"; do
         --virtio-gpu)
             VIRTIO_GPU_ARGS="-device virtio-gpu-pci"
             ;;
+        --venus)
+            # virtio-gpu-gl-pci with venus capset advertised. Requires
+            # the Atrium-patched QEMU + virglrenderer with -Dvenus=true.
+            # Guest atrium-virtio-gpu kmod will see capset 2 in
+            # GET_CAPSET_INFO once V3 lands. blob+hostmem are required
+            # by the venus capset.
+            #
+            # Pair with bochs-display: the prebuilt EDK2 ships a
+            # VirtioGpuDxe driver that hangs the firmware when the
+            # only GPU is the GL/venus variant. bochs-display gives
+            # EDK2 a working GOP framebuffer for boot, and FreeBSD
+            # discovers the venus device after kernel handoff.
+            VIRTIO_GPU_ARGS="-device bochs-display \
+                             -device virtio-gpu-gl-pci,venus=on,blob=on,hostmem=512M"
+            ;;
         --bochs)
             # bochs-display has BochsDisplayDxe support in the
             # prebuilt EDK2 we use, so EDK2 publishes a working GOP
