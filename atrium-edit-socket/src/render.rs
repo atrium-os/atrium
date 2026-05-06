@@ -1,15 +1,15 @@
-//! atrium-edit-socket renderer on the envelope+texture-op stack.
+//! atrium-edit-socket renderer on the M6.1 atrium-text bundle.
 //!
-//! Each visible glyph is one TextureParams node; the cursor is one
-//! RectParams node (axis-aligned, no rotation needed). Frame
-//! shrink-handling (clearing nodes that disappeared since last frame)
-//! is delegated to `fresco_client::FrameBuilder`.
+//! Per frame: one RECT for the cursor (if visible) plus one GLYPH_RUN
+//! node carrying every printable glyph in the visible page + status
+//! line as `GlyphInstance` entries. Replaces the per-glyph TEXTURE
+//! pattern.
 
 use crate::buffer::Buffer;
 use crate::glyph_cache::GlyphCache;
 
-use fresco_client::{Connection, FrameBuilder};
-use fresco_protocol::{RectParams, TextureParams};
+use fresco_client::Connection;
+use fresco_protocol::{GlyphInstance, GlyphRunParams, RectParams};
 
 pub struct Renderer<'a> {
     cache: &'a GlyphCache,
@@ -47,20 +47,20 @@ impl<'a> Renderer<'a> {
             }
         }
 
+        let mut instances: Vec<GlyphInstance> = Vec::new();
+
         let last = (buf.scroll_top + viewport_rows).min(buf.lines.len());
         for (row_in_viewport, line_idx) in (buf.scroll_top..last).enumerate() {
             let line = &buf.lines[line_idx];
-            let row_top = self.pad_y + (row_in_viewport as f32) * line_h;
             let mut col = 0usize;
             for ch in line.chars() {
                 if ch == '\t' { col = ((col / 8) + 1) * 8; continue; }
                 if ch == ' '  { col += 1; continue; }
                 if !ch.is_ascii_graphic() { continue; }
-                let g = match self.cache.lookup(ch) {
-                    Some(g) => *g,
-                    None    => { col += 1; continue; }
-                };
-                emit_glyph(&mut f, &g, self.pad_x, row_top, col, baseline, cell_w)?;
+                if let Some(m) = self.cache.lookup(ch) {
+                    instances.push(GlyphCache::instance(
+                        m, col, row_in_viewport, cell_w, line_h));
+                }
                 col += 1;
             }
         }
@@ -70,37 +70,29 @@ impl<'a> Renderer<'a> {
             if buf.modified { "[*] " } else { "" },
             if buf.status.is_empty() { format!("{:?}", buf.path) } else { buf.status.clone() },
         );
-        let row_top = self.pad_y + (viewport_rows as f32) * line_h;
         let mut col = 0usize;
         for ch in status.chars() {
             if ch == ' ' { col += 1; continue; }
             if !ch.is_ascii_graphic() { continue; }
-            let g = match self.cache.lookup(ch) {
-                Some(g) => *g,
-                None    => { col += 1; continue; }
-            };
-            emit_glyph(&mut f, &g, self.pad_x, row_top, col, baseline, cell_w)?;
+            if let Some(m) = self.cache.lookup(ch) {
+                instances.push(GlyphCache::instance(
+                    m, col, viewport_rows, cell_w, line_h));
+            }
             col += 1;
+        }
+
+        if !instances.is_empty() {
+            f.glyph_run(GlyphRunParams {
+                x: self.pad_x,
+                y: self.pad_y + baseline,
+                atlas_slot_id: self.cache.atlas_slot,
+                atlas_width:   self.cache.atlas_width,
+                atlas_height:  self.cache.atlas_height,
+                r: 0.95, g: 0.95, b: 0.95, a: 1.0,
+                glyphs: instances,
+            })?;
         }
 
         f.finish()
     }
-}
-
-fn emit_glyph(
-    f:        &mut FrameBuilder,
-    g:        &crate::glyph_cache::CachedGlyph,
-    pad_x:    f32,
-    row_top:  f32,
-    col:      usize,
-    baseline: f32,
-    cell_w:   f32,
-) -> std::io::Result<()> {
-    let cx = pad_x + (col as f32) * cell_w;
-    let px = cx + g.metrics.bearing_x as f32;
-    let py = row_top + baseline - g.metrics.bearing_y as f32;
-    let w  = g.metrics.width  as f32;
-    let h  = g.metrics.height as f32;
-    f.texture(TextureParams { x: px, y: py, w, h, slot_id: g.slot_id })?;
-    Ok(())
 }

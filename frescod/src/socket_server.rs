@@ -236,4 +236,8 @@ fn cleanup_client(frontend: &Arc<Mutex<EnvelopeFrontend>>, client_id: u8) {
         }
         fe.forget_window(id);
     }
+    /* Window 0 (the shared screen window) survives client disconnect,
+     * but the disconnecting client's nodes + slot bindings on it must
+     * be purged or they leak as ghost content under the next client. */
+    fe.forget_client_writes(client_id);
 }

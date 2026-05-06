@@ -70,6 +70,16 @@ pub struct WindowSceneState {
     pub glyph_run_nodes: HashMap<u32, GlyphRunParams>,
     pub slot_table:      HashMap<u32, [u8; 32]>,
     pub in_frame:        bool,
+
+    /// `node_id → client_id` for every live node in this window,
+    /// regardless of which op-kind map holds it. Used by
+    /// `forget_client_writes` on disconnect to purge only the
+    /// disconnecting client's contributions (relevant for the shared
+    /// screen window — id 0 — where multiple clients can write).
+    pub node_writers: HashMap<u32, u8>,
+    /// `slot_id → client_id` for every live slot binding in this
+    /// window. Same purpose as `node_writers`.
+    pub slot_writers: HashMap<u32, u8>,
 }
 
 impl WindowSceneState {
@@ -331,6 +341,39 @@ impl EnvelopeFrontend {
         self.per_window.remove(&window_id);
     }
 
+    /// Walk every per-window scene state and purge nodes + slot
+    /// bindings written by `client_id`. Used for the shared screen
+    /// window (id 0) where multiple clients can write — the per-
+    /// window state survives the disconnecting client and would
+    /// otherwise leak that client's last frame indefinitely.
+    /// Slot purges are queued through `pending_slot_clears` so the
+    /// renderer's next `process_uploads` cycle frees the GPU side.
+    pub fn forget_client_writes(&mut self, client_id: u8) {
+        for s in self.per_window.values_mut() {
+            let mut dead_nodes: Vec<u32> = Vec::new();
+            for (&id, &writer) in &s.node_writers {
+                if writer == client_id { dead_nodes.push(id); }
+            }
+            for id in dead_nodes {
+                s.rect_nodes.remove(&id);
+                s.texture_nodes.remove(&id);
+                s.path_nodes.remove(&id);
+                s.glyph_run_nodes.remove(&id);
+                s.node_writers.remove(&id);
+            }
+
+            let mut dead_slots: Vec<u32> = Vec::new();
+            for (&id, &writer) in &s.slot_writers {
+                if writer == client_id { dead_slots.push(id); }
+            }
+            for id in dead_slots {
+                s.slot_table.remove(&id);
+                s.slot_writers.remove(&id);
+                self.pending_slot_clears.push(id);
+            }
+        }
+    }
+
     /// Borrow the compositor `Arc` so callers can manipulate windows
     /// outside the dispatch flow (client-disconnect cleanup, frescod's
     /// per-frame render walking the window list, etc).
@@ -369,8 +412,10 @@ impl EnvelopeFrontend {
         let win_id = self.check_routable(msg)?;
         let p: SlotSetPayload = decode(&msg.payload)
             .map_err(|_| DispatchError::BadPayload)?;
-        self.ensure_window_state(win_id)
-            .slot_table.insert(p.slot_id, p.hash);
+        let writer = self.current_client;
+        let s = self.ensure_window_state(win_id);
+        s.slot_table.insert(p.slot_id, p.hash);
+        s.slot_writers.insert(p.slot_id, writer);
         self.pending_slot_sets.push((p.slot_id, p.hash, p.kind));
         Ok(Vec::new())
     }
@@ -381,6 +426,7 @@ impl EnvelopeFrontend {
             .map_err(|_| DispatchError::BadPayload)?;
         if let Some(s) = self.per_window.get_mut(&win_id) {
             s.slot_table.remove(&p.slot_id);
+            s.slot_writers.remove(&p.slot_id);
         }
         self.pending_slot_clears.push(p.slot_id);
         Ok(Vec::new())
@@ -414,7 +460,9 @@ impl EnvelopeFrontend {
         let win_id = self.check_routable(msg)?;
         let p: SceneNodeSetPayload = decode(&msg.payload)
             .map_err(|_| DispatchError::BadPayload)?;
+        let writer = self.current_client;
         let s = self.ensure_window_state(win_id);
+        s.node_writers.insert(p.node_id, writer);
         match p.op_id {
             scene_ops::ATRIUM_CORE_RECT => {
                 let inner: RectParams = decode(&p.params)
@@ -473,6 +521,7 @@ impl EnvelopeFrontend {
             s.texture_nodes.remove(&p.node_id);
             s.path_nodes.remove(&p.node_id);
             s.glyph_run_nodes.remove(&p.node_id);
+            s.node_writers.remove(&p.node_id);
         }
         Ok(Vec::new())
     }
