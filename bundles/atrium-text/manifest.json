@@ -1,0 +1,16 @@
+{
+  "name":    "atrium-text",
+  "version": 1,
+  "ops": [
+    {
+      "id":              8192,
+      "name":            "glyph_run",
+      "compute_entry":   "compute/op_glyph_run.comp.spv:main",
+      "render_pipeline": "pipelines/pipe_glyph_run"
+    }
+  ],
+  "depends_on":   [],
+  "gpu_resources": {
+    "max_instances": 65536
+  }
+}

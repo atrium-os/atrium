@@ -1,0 +1,105 @@
+// Compute shader for atrium-text's `glyph_run` op.
+//
+// Each scene node represents one shaped text run: an origin in window
+// coordinates, an atlas slot reference, and N glyphs at relative
+// (dx, dy) offsets from the origin. The kernel expands one node into
+// N InstanceRecords for the render pipeline to draw.
+//
+// SceneNode layout (96 bytes, three vec4s + one ivec4):
+//   - origin:    vec4(x, y, _, _)        run origin in window pixels
+//   - atlas_dim: vec4(width, height,_,_) atlas pixel dimensions
+//   - color:     vec4(r, g, b, a)        foreground color, premultiplied at frag
+//   - meta:      ivec4(glyph_count, glyph_offset, _, _)
+//
+// Glyphs live in a separate storage buffer (binding 1). meta.x is the
+// number of glyphs in this run; meta.y is the offset into the global
+// glyphs[] buffer where this run's glyphs start.
+//
+// InstanceRecord (48 bytes, three vec4s):
+//   - dst_rect:  vec4(x, y, w, h)        destination quad in window pixels
+//   - src_rect:  vec4(u0, v0, u1, v1)    atlas UV in [0, 1]
+//   - color:     vec4(r, g, b, a)        per-instance color (= run color)
+
+#version 460
+
+struct GlyphInstance {
+    vec2 d_offset;       /* dx, dy from run origin (in pixels) */
+    vec4 atlas_uv;       /* u, v, w, h in atlas pixel coords */
+    vec2 bearing;        /* bearing_x, bearing_y for baseline placement */
+};
+
+struct SceneNode {
+    vec4  origin;
+    vec4  atlas_dim;
+    vec4  color;
+    ivec4 meta;          /* x=glyph_count, y=glyph_offset, _, _ */
+};
+
+struct InstanceRecord {
+    vec4 dst_rect;
+    vec4 src_rect;
+    vec4 color;
+};
+
+layout(set = 0, binding = 0) readonly buffer SceneBuf {
+    uint      node_count;
+    uint      _pad0[3];
+    SceneNode nodes[];
+} scene;
+
+layout(set = 0, binding = 1) readonly buffer GlyphsBuf {
+    GlyphInstance glyphs[];
+} glyph_storage;
+
+layout(set = 0, binding = 2) writeonly buffer InstanceBuf {
+    InstanceRecord instances[];
+} instance_buf;
+
+layout(set = 0, binding = 3) buffer CounterBuf {
+    uint count;
+} counter;
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= scene.node_count) {
+        return;
+    }
+    SceneNode n = scene.nodes[id];
+    uint glyph_count  = uint(n.meta.x);
+    uint glyph_offset = uint(n.meta.y);
+
+    /* Reserve glyph_count consecutive instance-buffer slots so this
+     * run's glyphs land contiguously and can be drawn as one indirect
+     * draw range. */
+    uint base = atomicAdd(counter.count, glyph_count);
+
+    for (uint i = 0u; i < glyph_count; i++) {
+        GlyphInstance g = glyph_storage.glyphs[glyph_offset + i];
+
+        /* Destination rect in window coords. The glyph's quad starts
+         * at (origin + d_offset + bearing_x, origin + d_offset - bearing_y)
+         * with the FreeType convention that bearing_y is the
+         * baseline-to-top offset (positive = glyph drawn above
+         * baseline; we subtract because pixel y grows downward). */
+        vec4 dst = vec4(
+            n.origin.x + g.d_offset.x + g.bearing.x,
+            n.origin.y + g.d_offset.y - g.bearing.y,
+            g.atlas_uv.z,
+            g.atlas_uv.w
+        );
+
+        /* Atlas UVs normalized to [0, 1] from atlas pixel coordinates. */
+        vec4 src = vec4(
+            g.atlas_uv.x / n.atlas_dim.x,
+            g.atlas_uv.y / n.atlas_dim.y,
+            (g.atlas_uv.x + g.atlas_uv.z) / n.atlas_dim.x,
+            (g.atlas_uv.y + g.atlas_uv.w) / n.atlas_dim.y
+        );
+
+        instance_buf.instances[base + i].dst_rect = dst;
+        instance_buf.instances[base + i].src_rect = src;
+        instance_buf.instances[base + i].color    = n.color;
+    }
+}
