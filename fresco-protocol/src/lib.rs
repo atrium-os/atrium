@@ -145,6 +145,10 @@ pub struct TextureDesc {
 pub enum TextureFormat {
     /// 8-bit-per-channel RGBA, sRGB-decoded on sample.
     Rgba8UnormSrgb,
+    /// 8-bit single-channel (e.g. glyph coverage from rustybuzz +
+    /// swash). Sampled as a one-component texture; channels GBA
+    /// read as zero. Used by atrium-text's glyph_run op for atlases.
+    R8Unorm,
 }
 
 /// `OP_SLOT_CLEAR` — release a slot. The CAS blob remains in
@@ -399,8 +403,12 @@ pub mod scene_ops {
     pub const ATRIUM_CORE_PATH:    u32 = 0x1002;
     pub const ATRIUM_CORE_GLYPH:   u32 = 0x1003;
 
-    // atrium-text (D3) starts at 0x2000.
-    // Future engine bundles get their own ranges.
+    // atrium-text (0x2000..=0x2FFF). M6.1 ships atlas-based glyph runs;
+    // 0x2001..=0x2FFF reserved for future text ops (color-emoji glyph
+    // runs, atlas patch, server-shaped runs).
+    pub const ATRIUM_TEXT_GLYPH_RUN: u32 = 0x2000;
+
+    // Future engine bundles get their own ranges per spec §3.4.
 }
 
 // ── Scene op params ──────────────────────────────────────────────────
@@ -458,6 +466,61 @@ pub struct PathParams {
     pub g: f32,
     pub b: f32,
     pub a: f32,
+}
+
+/// Params for `scene_ops::ATRIUM_TEXT_GLYPH_RUN`.
+///
+/// One node = one shaped text run. `(x, y)` is the run origin in
+/// window pixels (top-left convention; the per-glyph `bearing_y`
+/// adjusts placement relative to the baseline). The run references a
+/// pre-uploaded R8 atlas via `atlas_slot_id` (set with `OP_SLOT_SET`,
+/// `SlotKind::Texture { format: R8Unorm }`); `atlas_width` /
+/// `atlas_height` are carried in the params rather than queried so
+/// the kernel can normalise UVs without a slot-table lookup.
+///
+/// `color` is the foreground tint; the atlas's coverage is multiplied
+/// against it in the fragment shader, producing premultiplied output.
+///
+/// Each `GlyphInstance` is 32 bytes; a typical line of 80 ASCII chars
+/// is ~2.5 KiB on the wire (vs ~5 KiB of envelope overhead alone for
+/// the per-glyph TEXTURE-node path it replaces).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlyphRunParams {
+    pub x: f32,
+    pub y: f32,
+
+    pub atlas_slot_id: u32,
+    pub atlas_width:   u32,
+    pub atlas_height:  u32,
+
+    pub r: f32,
+    pub g: f32,
+    pub b: f32,
+    pub a: f32,
+
+    pub glyphs: Vec<GlyphInstance>,
+}
+
+/// One glyph within a `GlyphRunParams`. `dx`/`dy` are the glyph's
+/// pen-position offset from the run origin (sub-pixel f32 even though
+/// M6.1 pixel-snaps; sub-pixel positioning unblocks at M6.3+ without
+/// a wire-format change). `(atlas_u, atlas_v, atlas_w, atlas_h)` is
+/// the source rectangle in *atlas pixel coordinates* (the kernel
+/// normalises against `atlas_width`/`atlas_height`). `bearing_x` and
+/// `bearing_y` follow the FreeType convention: `bearing_x` shifts
+/// the glyph right of the pen position; `bearing_y` is the
+/// baseline-to-top distance, so `dst.y = origin.y + dy - bearing_y`
+/// places the glyph correctly with pixel-y growing downward.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct GlyphInstance {
+    pub dx: f32,
+    pub dy: f32,
+    pub atlas_u: u32,
+    pub atlas_v: u32,
+    pub atlas_w: u32,
+    pub atlas_h: u32,
+    pub bearing_x: f32,
+    pub bearing_y: f32,
 }
 
 // ── tests ────────────────────────────────────────────────────────────
@@ -539,6 +602,41 @@ mod tests {
         let back: TextureParams = decode(&bytes).expect("decode");
         assert_eq!(back.slot_id, 42);
         assert_eq!(back.w, 256.0);
+    }
+
+    #[test]
+    fn roundtrip_glyph_run_params() {
+        let p = GlyphRunParams {
+            x: 80.0, y: 400.0,
+            atlas_slot_id: 100,
+            atlas_width: 512, atlas_height: 256,
+            r: 1.0, g: 1.0, b: 1.0, a: 1.0,
+            glyphs: vec![
+                GlyphInstance { dx:  0.0, dy: 0.0,
+                    atlas_u: 0,  atlas_v: 0, atlas_w: 24, atlas_h: 32,
+                    bearing_x: 2.0, bearing_y: 28.0 },
+                GlyphInstance { dx: 26.0, dy: 0.0,
+                    atlas_u: 25, atlas_v: 0, atlas_w: 22, atlas_h: 32,
+                    bearing_x: 1.0, bearing_y: 28.0 },
+                GlyphInstance { dx: 49.0, dy: 0.0,
+                    atlas_u: 48, atlas_v: 0, atlas_w: 18, atlas_h: 32,
+                    bearing_x: 1.0, bearing_y: 28.0 },
+            ],
+        };
+        let bytes = encode(&p).expect("encode");
+        let back: GlyphRunParams = decode(&bytes).expect("decode");
+        assert_eq!(back.atlas_slot_id, 100);
+        assert_eq!(back.atlas_width, 512);
+        assert_eq!(back.glyphs.len(), 3);
+        assert_eq!(back.glyphs[1].atlas_u, 25);
+        assert_eq!(back.glyphs[2].bearing_y, 28.0);
+    }
+
+    #[test]
+    fn r8_format_serializes() {
+        let bytes = encode(&TextureFormat::R8Unorm).expect("encode");
+        let back: TextureFormat = decode(&bytes).expect("decode");
+        assert!(matches!(back, TextureFormat::R8Unorm));
     }
 
     #[test]
