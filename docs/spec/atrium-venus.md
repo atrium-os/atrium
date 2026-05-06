@@ -347,10 +347,14 @@ The discipline is more important than the mechanism: **never modify upstream Mes
 ## 5. Implementation phases
 
 V1 (this doc).
-V2: host-side QEMU + virglrenderer build with venus enabled. Sanity-check on a Linux guest first to confirm the host path works. **No Atrium code yet.**
-V3: kmod — capset query + context lifecycle (3.1, 3.2). Verifiable via a tiny test program that opens the cdev, calls CAPSET_QUERY for venus, calls CTX_INIT, closes.
-V4: kmod — resource attach + SUBMIT_3D + fence wait (3.3, 3.4, 3.5). Verifiable by hand-crafting a minimal venus command stream (bytes captured from a known-good Linux run) and round-tripping through SUBMIT_3D + fence.
-V5: atrium-mesa fork + venus driver retargeting (4). Verify with `vkcube` (the canonical Vulkan demo).
+V2: host-side QEMU + virglrenderer build with venus enabled. Sanity-check on a Linux guest first to confirm the host path works. **No Atrium code yet.** ✅ **Done** — virglrenderer 1.3.0 built on macOS with `-Dvenus=true`; QEMU patched (6 small upstream-targetable patches via `atrium-shim/`); EDK2 patched to disable VirtioGpuDxe (the firmware was hanging on the GL/venus device); FreeBSD-CURRENT/aarch64 boots with the venus device visible to `pciconf`.
+
+V3: kmod — capset query + context lifecycle (3.1, 3.2). Verifiable via a tiny test program that opens the cdev, calls CAPSET_QUERY for venus, calls CTX_INIT, closes. ✅ **Done.** Lesson surfaced and saved to memory: virtio-gpu commands on `VIRGL_RENDERER_NO_VIRGL` hosts MUST set `VIRTIO_GPU_FLAG_INFO_RING_IDX` + `ring_idx` in addition to `VIRTIO_GPU_FLAG_FENCE`, or the legacy fence path returns EINVAL silently and the guest times out.
+
+V4: kmod — resource attach + SUBMIT_3D + fence wait (3.3, 3.4, 3.5). Verifiable by hand-crafting a minimal venus command stream (bytes captured from a known-good Linux run) and round-tripping through SUBMIT_3D + fence. ✅ **Done.** The fake-payload submit returns EIO from the host venus worker (correctly rejecting an invalid command stream), proving the round-trip plumbing works end-to-end through 8 layers.
+
+V5: atrium-mesa fork + venus driver retargeting (4). Verify with `vkcube` (the canonical Vulkan demo). 🚧 **Skeleton landed** at [github.com/atrium-os/mesa](https://github.com/atrium-os/mesa) (atrium/main branch). `src/atrium/vn_renderer_atrium.c` probes the cdev, queries the venus capset, creates a context; submit/wait/destroy are wired through; bo/shmem/sync ops are stubs. V5b finishes the ops table and verifies build + `vulkaninfo`.
+
 V6: frescod ICD selection. Confirm the QEMU window updates at host frame rate when frescod uses venus.
 
 Each step is independently verifiable; failures localize.
