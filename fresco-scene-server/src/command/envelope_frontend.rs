@@ -228,6 +228,16 @@ impl EnvelopeFrontend {
         }
     }
 
+    /// Stash a blob into the scene-server CasStore. The aqueduct
+    /// substrate auto-handles UPLOAD_BEGIN/DATA/FINISH into its
+    /// per-connection cache; the connection thread is responsible
+    /// for pulling those bytes out of `conn.cache_get(&hash)` and
+    /// handing them here so the upload pump can resolve hashes
+    /// referenced by SLOT_SET into renderer uploads.
+    pub fn ingest_blob(&self, bytes: &[u8]) {
+        self.cas.lock().unwrap().store(bytes);
+    }
+
     /// Drain accumulated slot-bind / slot-clear ops into renderer-side
     /// upload + free requests. Looks each `slot_set` hash up in CAS;
     /// missing-blob entries are dropped with a warning. Caller passes

@@ -168,6 +168,22 @@ fn reader_loop(
             continue;
         }
 
+        /* SLOT_SET references a CAS hash that was uploaded just before
+         * over CLASS_CORE; aqueduct auto-handled the UPLOAD_BEGIN/DATA/
+         * FINISH frames into its per-connection cache. The scene-server
+         * CasStore is separate; pull bytes across now so the renderer
+         * can resolve the slot binding when it processes uploads. */
+        if msg.op == fresco_protocol::control::OP_SLOT_SET {
+            if let Ok(p) = fresco_protocol::decode::<fresco_protocol::SlotSetPayload>(&msg.payload) {
+                if let Some(bytes) = conn.cache_get(&p.hash) {
+                    frontend.lock().unwrap().ingest_blob(&bytes);
+                } else {
+                    log::warn!("client {client_id}: slot_set hash not in \
+                                connection cache; upload dropped");
+                }
+            }
+        }
+
         let outs = match frontend.lock().unwrap().dispatch(&msg, client_id) {
             Ok(v)  => v,
             Err(e) => {
