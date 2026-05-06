@@ -12,13 +12,13 @@
 //! and footer.
 
 use crate::dir::Entry;
-use crate::glyph_cache::GlyphCache;
+use fresco_client::MonoAtlas;
 
 use fresco_client::Connection;
 use fresco_protocol::{GlyphInstance, GlyphRunParams, RectParams};
 
 pub struct Renderer<'a> {
-    cache: &'a GlyphCache,
+    cache: &'a MonoAtlas,
     pad_x: f32,
     pad_y: f32,
     win_w: f32,
@@ -26,7 +26,7 @@ pub struct Renderer<'a> {
 }
 
 impl<'a> Renderer<'a> {
-    pub fn new(cache: &'a GlyphCache, win_w: u32, win_h: u32) -> Self {
+    pub fn new(cache: &'a MonoAtlas, win_w: u32, win_h: u32) -> Self {
         Self {
             cache,
             pad_x: 12.0, pad_y: 12.0,
@@ -124,7 +124,7 @@ impl<'a> Renderer<'a> {
             if ch == ' '  { col += 1; continue; }
             if !ch.is_ascii_graphic() { continue; }
             if let Some(m) = self.cache.lookup(ch) {
-                instances.push(GlyphCache::instance(m, col, row, cell_w, line_h));
+                instances.push(MonoAtlas::instance(m, col, row, cell_w, line_h));
             }
             col += 1;
         }

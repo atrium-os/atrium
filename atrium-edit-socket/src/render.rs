@@ -6,19 +6,19 @@
 //! pattern.
 
 use crate::buffer::Buffer;
-use crate::glyph_cache::GlyphCache;
+use fresco_client::MonoAtlas;
 
 use fresco_client::Connection;
 use fresco_protocol::{GlyphInstance, GlyphRunParams, RectParams};
 
 pub struct Renderer<'a> {
-    cache: &'a GlyphCache,
+    cache: &'a MonoAtlas,
     pad_x: f32,
     pad_y: f32,
 }
 
 impl<'a> Renderer<'a> {
-    pub fn new(cache: &'a GlyphCache) -> Self {
+    pub fn new(cache: &'a MonoAtlas) -> Self {
         Self { cache, pad_x: 16.0, pad_y: 16.0 }
     }
 
@@ -58,7 +58,7 @@ impl<'a> Renderer<'a> {
                 if ch == ' '  { col += 1; continue; }
                 if !ch.is_ascii_graphic() { continue; }
                 if let Some(m) = self.cache.lookup(ch) {
-                    instances.push(GlyphCache::instance(
+                    instances.push(MonoAtlas::instance(
                         m, col, row_in_viewport, cell_w, line_h));
                 }
                 col += 1;
@@ -75,7 +75,7 @@ impl<'a> Renderer<'a> {
             if ch == ' ' { col += 1; continue; }
             if !ch.is_ascii_graphic() { continue; }
             if let Some(m) = self.cache.lookup(ch) {
-                instances.push(GlyphCache::instance(
+                instances.push(MonoAtlas::instance(
                     m, col, viewport_rows, cell_w, line_h));
             }
             col += 1;

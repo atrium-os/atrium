@@ -4,7 +4,7 @@
 //! Vi-style hjkl also work via the keymap.
 
 mod dir;
-mod glyph_cache;
+use fresco_client::MonoAtlas;
 mod keymap;
 mod render;
 
@@ -119,7 +119,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     eprintln!("atrium-find-socket: window {win} created — {WIN_W}x{WIN_H}");
 
-    let cache = glyph_cache::GlyphCache::build(&mut conn, &font, FONT_SIZE_PX)?;
+    let cache = MonoAtlas::build(&mut conn, &font, FONT_SIZE_PX, 100)?;
     let renderer = render::Renderer::new(&cache, WIN_W, WIN_H);
     let mut keymap = keymap::Keymap::new();
 

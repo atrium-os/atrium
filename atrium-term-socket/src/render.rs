@@ -3,20 +3,20 @@
 //! Per frame: cursor RECT + one GLYPH_RUN node carrying every visible
 //! non-blank cell as a `GlyphInstance`.
 
-use crate::glyph_cache::GlyphCache;
+use fresco_client::MonoAtlas;
 use crate::grid::Grid;
 
 use fresco_client::Connection;
 use fresco_protocol::{GlyphInstance, GlyphRunParams, RectParams};
 
 pub struct Renderer<'a> {
-    cache: &'a GlyphCache,
+    cache: &'a MonoAtlas,
     pad_x: f32,
     pad_y: f32,
 }
 
 impl<'a> Renderer<'a> {
-    pub fn new(cache: &'a GlyphCache) -> Self {
+    pub fn new(cache: &'a MonoAtlas) -> Self {
         Self { cache, pad_x: 8.0, pad_y: 8.0 }
     }
 
@@ -42,7 +42,7 @@ impl<'a> Renderer<'a> {
                 let ch = cell.ch;
                 if ch == ' ' || !ch.is_ascii_graphic() { continue; }
                 if let Some(m) = self.cache.lookup(ch) {
-                    instances.push(GlyphCache::instance(
+                    instances.push(MonoAtlas::instance(
                         m, col as usize, row as usize, cell_w, line_h));
                 }
             }

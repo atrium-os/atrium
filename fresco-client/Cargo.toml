@@ -13,5 +13,6 @@ path = "src/lib.rs"
 [dependencies]
 aqueduct        = { path = "../aqueduct" }
 fresco-protocol = { path = "../fresco-protocol" }
+fresco-text     = { path = "../fresco-text" }
 serde           = { version = "1", features = ["derive"] }
 log             = "0.4"

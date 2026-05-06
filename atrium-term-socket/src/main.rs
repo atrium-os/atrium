@@ -9,7 +9,7 @@
 //! kqueue multiplexes pty master fd + compositor socket fd: one
 //! kevent() wakes us on either pty output OR a server input event.
 
-mod glyph_cache;
+use fresco_client::MonoAtlas;
 mod grid;
 mod keymap;
 mod pty;
@@ -47,7 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     eprintln!("atrium-term-socket: window {win} created — {WIN_W}x{WIN_H}");
 
-    let cache = glyph_cache::GlyphCache::build(&mut conn, &font, FONT_SIZE_PX)?;
+    let cache = MonoAtlas::build(&mut conn, &font, FONT_SIZE_PX, 100)?;
     let renderer = render::Renderer::new(&cache);
 
     let shell = pty::Shell::spawn(OsStr::new("/bin/sh"), &["-i"], COLS, ROWS)?;

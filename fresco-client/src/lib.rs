@@ -21,6 +21,9 @@
 //! aqueduct). Apps that want concurrent reads + writes split the
 //! underlying `UnixStream` themselves; future work as needed.
 
+pub mod mono_atlas;
+pub use mono_atlas::{MonoAtlas, GlyphMetrics};
+
 use std::io;
 use std::path::Path;
 use std::time::Duration;

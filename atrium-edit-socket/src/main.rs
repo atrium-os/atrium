@@ -10,7 +10,7 @@
 //! through the existing keymap → buffer-mutation → re-render loop.
 
 mod buffer;
-mod glyph_cache;
+use fresco_client::MonoAtlas;
 mod keymap;
 mod render;
 
@@ -49,7 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     eprintln!("window {win} created — {WIN_W}x{WIN_H}");
 
-    let cache    = glyph_cache::GlyphCache::build(&mut conn, &font, FONT_SIZE_PX)?;
+    let cache    = MonoAtlas::build(&mut conn, &font, FONT_SIZE_PX, 100)?;
     let renderer = render::Renderer::new(&cache);
     let mut keymap = keymap::Keymap::new();
 
