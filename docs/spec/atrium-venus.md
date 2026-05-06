@@ -204,43 +204,120 @@ These are real D5 work for AMD/Intel/NVIDIA — and they don't get any easier be
 
 ## 4. Userspace: atrium-mesa-venus
 
-### 4.1 Fork scope
+The single most important property of this fork is **mergeability**. Upstream Mesa moves at thousands of commits per month; even venus alone (`src/virtio/vulkan/`) sees commits weekly. A hard fork — modify upstream files in place, lose touch with main — becomes unmaintainable within a year. atrium-mesa must be a soft fork: a small additive surface that lets us pull `git merge upstream/main` quarterly with predictable conflict resolution.
 
-Mesa is large. We do not fork all of it. The atrium-mesa repository starts as a sparse subtree of upstream Mesa containing only:
+This section is structured around that constraint. Every other concern (license audit, repo size, atrium-gpu adapter shape) bends to it.
+
+### 4.1 Repo structure: upstream as the spine, additions as branches
+
+The atrium-mesa repository is a **fork of upstream Mesa with no subtree pruning**. Yes, that means we ship a tree containing GLX/EGL/Gallium/etc. that we never build — but it costs ~3 MLoC of `git ls-files` and zero compile time, and it lets `git merge upstream/main` succeed without ever needing to re-introduce subtrees we removed earlier.
 
 ```
-src/vulkan/runtime/        # vk_common — Mesa's Vulkan dispatch helpers
-src/vulkan/util/           # generic helpers
-src/virtio/vulkan/         # the venus driver itself
-src/util/                  # NIR-adjacent utilities venus pulls in
-src/compiler/spirv/        # SPIR-V parser (venus needs it for nothing today
-                           # but vk_common pulls it in)
-include/                   # public headers
-meson.build + meson_options.txt
+atrium-mesa/
+├── (entire upstream Mesa tree, untouched)
+├── src/atrium/             ← all our code lives here, added wholesale
+│   ├── atrium_gpu.c        ← cdev adapter (replaces libdrm-virtgpu)
+│   ├── atrium_gpu.h
+│   ├── meson.build
+│   └── README.md
+├── meson_options.txt       ← +5 lines: with_atrium=true|false option
+├── meson.build             ← +1 line: subdir('src/atrium') under if option
+├── .atrium-patches/        ← any unavoidable upstream-file patches, one
+│   │                         per patch, with rationale in the header
+│   └── 0001-vn-pluggable-renderer.patch   (only if upstream rejects)
+└── ATRIUM-FORK.md          ← merge cadence, conflict-resolution playbook
 ```
 
-Everything else (GLX, EGL, GLU, mesa/main, every Gallium driver, every native Vulkan driver) is excluded at fork time. The repo is small (~200 KLoC instead of ~3 MLoC) and reviewable.
+Three things make this work:
 
-License audit at fork time: `LICENSES.md` enumerates every distinct license present. Per `LICENSING-POLICY.md`, only permissive licenses are allowed in the runtime; we drop any GPL/LGPL/CDDL fragment caught in the included subtree.
+1. **No subtree pruning.** We carry every file upstream carries. `git merge` is content-aware; deleted directories are diff hostile.
+2. **All Atrium code in `src/atrium/`.** That subdirectory does not exist upstream, so there are zero merge conflicts in our additive code.
+3. **Build-system gates, not preprocessor switches.** Adding our backend is `meson_options.txt + 5` and `meson.build + 1`. Upstream files we touch: at most two (the top-level meson.build and meson_options.txt), and the touches are append-only single lines that conflict only when upstream rewrites those exact lines (rare).
 
-### 4.2 libdrm replacement
+License audit: per the no-pruning rule, we ship upstream's tree as-is. `LICENSING-POLICY.md` cares about the **runtime artifacts**, not the source tree on disk. The build excludes everything we don't compile, so `pkg install atrium` ships only `libvulkan_venus.so` + `libvulkan_lvp.so` (lavapipe) + the atrium-gpu adapter's compiled output. None of those depend on GLX/EGL/Gallium subtrees — they sit unused on disk, license-wise irrelevant.
 
-Vanilla venus calls into libdrm:
+### 4.2 The adapter goes through Mesa's existing pluggability seam
 
-- `xf86drm.h` — generic DRM ioctl wrapper (`drmIoctl`, `drmCommandWrite`, etc.)
-- `libdrm_virtgpu` — virtio-gpu specific (`drm_virtgpu_*` ioctls)
+This is the linchpin. Vanilla venus already has a **pluggable renderer backend** abstraction at `src/virtio/vulkan/vn_renderer.h`:
 
-We replace these with a thin adapter at `src/atrium/atrium_gpu.c` that:
+```c
+struct vn_renderer_ops {
+    void (*destroy)(struct vn_renderer *renderer, ...);
+    VkResult (*submit)(struct vn_renderer *renderer, const struct vn_renderer_submit *submit);
+    VkResult (*wait)(struct vn_renderer *renderer, const struct vn_renderer_wait *wait);
+    /* ... */
+};
+```
 
-- Calls `open("/dev/atrium-gpu0", ...)` instead of `drmOpen`
-- Translates each libdrm-virtgpu call to the corresponding ATRIUM_GPU_IOC_* ioctl
-- Returns errors in the same shape libdrm did (so venus's own error handling is unchanged)
+Two backends ship upstream:
 
-The shim is **not** a general-purpose libdrm; it covers exactly the surface venus uses. Nothing else (radv, anv) gets to call into it. When AMD ports later, it gets its own much larger atrium-gpu surface — possibly extending the cdev's ioctl set significantly — and a similarly direct adapter.
+- `vn_renderer_virtgpu.c` — talks to `/dev/dri/renderD*` via libdrm-virtgpu ioctls.
+- `vn_renderer_vtest.c` — talks to a TCP/Unix socket for testing without a kernel driver.
 
-This is deliberately not "build a libdrm that runs on Atrium." That path leads to maintaining a Linux-DRM-shaped userspace forever.
+We add a **third sibling** at `src/atrium/vn_renderer_atrium.c` that talks to `/dev/atrium-gpu0` via our cdev ioctls. It implements the same `struct vn_renderer_ops` vtable. From venus's perspective it's just another renderer — no upstream venus code knows or cares we exist.
 
-### 4.3 Driver discovery
+Backend selection at runtime walks the registered backends in priority order; ours registers itself behind a probe that returns true only if `/dev/atrium-gpu0` exists and `CAPSET_QUERY(venus)` succeeds. On Linux guests (or FreeBSD without atrium-virtio-gpu loaded), our backend's probe returns false, vtest/virtgpu pick up, behaviour is unchanged.
+
+**Why this matters for mergeability:** the upstream venus code that calls into the backend table never needs to know about us. Adding `vn_renderer_atrium.c` is purely additive. Even significant venus refactors upstream — protocol revisions, command-stream restructuring, new `vn_renderer_ops` callbacks — propagate to us by re-implementing the new vtable callbacks in our backend, not by re-applying patches to upstream files.
+
+If a future upstream commit changes the `vn_renderer_ops` signature, we get a clean compile error in our backend file pointing at exactly what changed. That's the desired failure mode — local, obvious, fixable in our code.
+
+### 4.3 What if upstream's seam isn't enough?
+
+Two cases need handling:
+
+**(A) The seam is sufficient but our backend needs to live in `src/virtio/vulkan/` (Mesa's build wants the renderer files co-located with the venus driver).** Solution: a `meson.build` in `src/atrium/` declares its file with the right subdirectory layout, and we use `meson`'s `files()` + a relative path to inject our renderer source into the venus library target. Zero patches to upstream.
+
+**(B) Upstream venus has a hardcoded backend list (it currently doesn't, but might).** Solution: the absolute minimum upstream patch is a tiny one-liner adding our backend to the registration table. We carry it in `.atrium-patches/` as a numbered, rationale-headed patch:
+
+```
+# .atrium-patches/0001-vn-add-atrium-renderer-registration.patch
+# Adds atrium-gpu renderer to venus's backend list. One-line addition;
+# upstream-able as a generalization but kept local to avoid a dependency
+# on upstream review cadence.
+```
+
+The `.atrium-patches/` directory is applied on top of upstream by a small script (`tools/atrium/apply-patches.sh`) at build time. The directory is the **enforced minimum** — every patch in it must have a rationale comment, and the merge playbook (next section) audits the count.
+
+If we ever exceed ~10 patches in `.atrium-patches/`, the playbook says we've drifted; pause and either upstream the patches, or reconsider whether we're using Mesa's seams correctly.
+
+### 4.4 Merge cadence and playbook
+
+Documented in `atrium-mesa/ATRIUM-FORK.md`:
+
+```
+upstream remote:   https://gitlab.freedesktop.org/mesa/mesa.git
+upstream branch:   main
+our branch:        atrium
+
+Merge cadence: monthly, on the first business day. Done by:
+
+  git fetch upstream
+  git checkout atrium
+  git merge upstream/main
+  ./tools/atrium/apply-patches.sh    # re-apply .atrium-patches/
+  meson compile -C build atrium-mesa-venus
+  ./tools/atrium/smoke.sh            # vkcube against venus
+
+Expected conflict surface (in priority order):
+
+  1. meson.build (top-level)         — append-only, almost never conflicts
+  2. meson_options.txt               — append-only, almost never conflicts
+  3. .atrium-patches/*.patch         — re-apply may need adjustment if
+                                       upstream rearranged the patched file;
+                                       fix by editing the patch, not the
+                                       upstream file
+  4. src/atrium/*                    — never conflicts (additive)
+
+If conflicts appear OUTSIDE the first three categories, escalate. We've
+either accidentally modified an upstream file or upstream has restructured
+in a way our seam doesn't survive.
+
+If .atrium-patches grows past 10 patches, freeze new patches and either
+upstream them or rethink the architecture.
+```
+
+### 4.5 Driver discovery
 
 Mesa's Vulkan loader walks `VK_DRIVER_FILES` (or `/etc/vulkan/icd.d/*.json`) for ICD JSON manifests pointing at .so files. Atrium ships:
 
@@ -258,6 +335,14 @@ Mesa's Vulkan loader walks `VK_DRIVER_FILES` (or `/etc/vulkan/icd.d/*.json`) for
 Plus the lavapipe ICD already present. Loader tries both at `vkCreateInstance`; venus's `vkEnumeratePhysicalDevices` fails fast (returns 0 devices) on systems without venus capset, letting lavapipe take over for headless / CI use.
 
 frescod prefers venus when both are present (set `VK_ICD_FILENAMES=...atrium_venus_icd.json` or pick by physical-device extension list).
+
+### 4.6 What this buys us when AMD lands at D5
+
+The same model extends. radv has its own backend pluggability via `radv_winsys` (already factored — `radv_amdgpu_winsys.c` for hardware, `radv_null_winsys.c` for the null backend). When we port radv into atrium-mesa, we add `src/atrium/radv_atrium_winsys.c` as a third sibling, register it the same way venus's backend is registered, and the upstream radv code is again untouched.
+
+Pattern: **for each Mesa driver we want to support, find its winsys/backend abstraction and add a sibling**. Mesa's authors have already built the pluggability — our job is to find and use it, not to invent our own.
+
+The discipline is more important than the mechanism: **never modify upstream Mesa files except as a last resort, and when forced to, patch them with rationale and merge-cost in mind**. Every line we change upstream is a line we re-resolve every merge.
 
 ## 5. Implementation phases
 
