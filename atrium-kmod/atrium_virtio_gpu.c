@@ -180,9 +180,26 @@ struct atrium_gpu_softc {
 	 * resource itself is allocated lazily on first HOST_BLOB request
 	 * to avoid claiming MMIO we may never use. */
 	uint8_t                        shm_bar;
-	uint64_t                       shm_pa;     /* host-visible base PA */
+	uint64_t                       shm_bar_offset; /* offset within BAR */
+	uint64_t                       shm_pa;     /* host-visible base PA;
+	                                              filled by shm_init_locked
+	                                              after BAR is allocated */
 	uint64_t                       shm_size;   /* 0 == no region */
+
+	/* Lazily-acquired BAR resource + page-bitmap allocator over its
+	 * window. shm_lock guards shm_bitmap; shm_res/shm_pa/shm_size are
+	 * write-once at first IOC_HOST_BLOB so are read lock-free. */
+	struct mtx                     shm_lock;
+	struct resource               *shm_res;       /* NULL until first use */
+	uint8_t                       *shm_bitmap;
+	uint32_t                       shm_n_pages;
+	bool                           shm_initialized;
 };
+
+/* Internal-only BO flag: this BO is backed by a window of the
+ * host_visible BAR (not contigmalloc'd guest pages). atrium_bo_free
+ * uses it to skip the kva free and instead release the BAR window. */
+#define ATRIUM_BO_INT_HOST_BLOB  0x10000u
 
 /* ------------------------------------------------------------------------- */
 /* Per-fd state — one per open(/dev/atrium-gpu0).                             */
@@ -240,6 +257,15 @@ static int atrium_vgpu_ctx_attach_resource(struct atrium_gpu_softc *,
 static int atrium_vgpu_submit_3d(struct atrium_gpu_softc *,
     uint32_t, uint32_t, void *, size_t);
 
+/* V5h: HOST3D blob + host_visible BAR allocator (defined further down). */
+static int      atrium_vgpu_resource_map_blob(struct atrium_gpu_softc *,
+                    uint32_t, uint32_t, uint64_t);
+static int      atrium_vgpu_shm_init_locked(struct atrium_gpu_softc *);
+static uint64_t atrium_vgpu_shm_alloc_locked(struct atrium_gpu_softc *,
+                    uint32_t);
+static void     atrium_vgpu_shm_free_locked(struct atrium_gpu_softc *,
+                    uint64_t, uint32_t);
+
 struct atrium_display_file {
 	struct atrium_gpu_softc *sc;
 	bool                     bound;       /* IOC_BIND_GPU completed */
@@ -270,12 +296,24 @@ atrium_bo_find_locked(struct atrium_gpu_softc *sc, uint32_t handle)
 }
 
 /* Free the underlying memory + the descriptor. Caller must have already
- * removed the BO from the list. */
+ * removed the BO from the list. For HOST_BLOB BOs the storage lives in
+ * the host_visible BAR (host-allocated shm); we just release the BAR
+ * window we reserved at allocation time. */
 static void
 atrium_bo_free(struct atrium_gpu_bo *bo)
 {
-	if (bo->kva != 0)
+	if (bo->flags & ATRIUM_BO_INT_HOST_BLOB) {
+		struct atrium_gpu_softc *sc = bo->owner ? bo->owner->sc : NULL;
+		if (sc != NULL && sc->shm_initialized) {
+			uint64_t bar_offset = bo->pa - sc->shm_pa;
+			uint32_t npages = bo->size / PAGE_SIZE;
+			mtx_lock(&sc->shm_lock);
+			atrium_vgpu_shm_free_locked(sc, bar_offset, npages);
+			mtx_unlock(&sc->shm_lock);
+		}
+	} else if (bo->kva != 0) {
 		free((void *)bo->kva, M_ATRIUM_GPU);
+	}
 	free(bo, M_ATRIUM_GPU);
 }
 
@@ -632,6 +670,97 @@ atrium_gpu_ioc_resource_attach(struct atrium_gpu_softc *sc,
 	return (0);
 }
 
+/* ATRIUM_GPU_IOC_HOST_BLOB: V5h — allocate a HOST3D blob backed by a
+ * window of the host_visible BAR. No guest pages are allocated; the host
+ * (virglrenderer) sets up the actual storage via shm_open under
+ * RESOURCE_CREATE_BLOB(blob_mem=HOST3D, num_entries=0), and we publish
+ * the BAR offset to userspace so mmap() returns BAR pages directly. */
+static int
+atrium_gpu_ioc_host_blob(struct atrium_gpu_softc *sc,
+    struct atrium_gpu_file *f, struct atrium_gpu_host_blob *args)
+{
+	struct atrium_gpu_bo *bo;
+	uint64_t actual_size, bar_offset;
+	uint32_t resource_id, npages;
+	int err;
+
+	if (f->ctx_id == 0)
+		return (ENOTCONN);
+	if (args->size == 0 || args->size > (1ULL << 32))
+		return (EINVAL);
+
+	actual_size = roundup2(args->size, PAGE_SIZE);
+	npages = actual_size / PAGE_SIZE;
+
+	/* Reserve a BAR window. */
+	mtx_lock(&sc->shm_lock);
+	err = atrium_vgpu_shm_init_locked(sc);
+	if (err != 0) {
+		mtx_unlock(&sc->shm_lock);
+		return (err);
+	}
+	bar_offset = atrium_vgpu_shm_alloc_locked(sc, npages);
+	mtx_unlock(&sc->shm_lock);
+	if (bar_offset == (uint64_t)-1)
+		return (ENOMEM);
+
+	/* Allocate the BO descriptor. No guest pages — pa is the BAR PA
+	 * plus our window offset. */
+	bo = malloc(sizeof(*bo), M_ATRIUM_GPU, M_WAITOK | M_ZERO);
+	bo->size        = actual_size;
+	bo->flags       = ATRIUM_BO_INT_HOST_BLOB;
+	bo->kva         = 0;
+	bo->pa          = sc->shm_pa + bar_offset;
+	bo->owner       = f;
+
+	/* Send RESOURCE_CREATE_BLOB(HOST3D) — host allocates shm; venus
+	 * sees blob_id (0 for shmem, the venus mem_id for VkDeviceMemory). */
+	resource_id = atomic_fetchadd_32(&sc->next_resource_id, 1);
+	err = atrium_vgpu_resource_create_blob(sc, f->ctx_id, resource_id,
+	    ATRIUM_GPU_BLOB_MEM_HOST3D, args->blob_flags, args->blob_id,
+	    actual_size, 0, 0);  /* length=0 → no mem_entry */
+	if (err != 0) {
+		device_printf(sc->dev,
+		    "HOST_BLOB: RESOURCE_CREATE_BLOB(HOST3D) failed: %d\n", err);
+		goto fail;
+	}
+	err = atrium_vgpu_ctx_attach_resource(sc, f->ctx_id, resource_id);
+	if (err != 0)
+		goto fail_destroy;
+	err = atrium_vgpu_resource_map_blob(sc, f->ctx_id, resource_id,
+	    bar_offset);
+	if (err != 0)
+		goto fail_destroy;
+
+	bo->virtio_resource_id = resource_id;
+
+	/* Publish BO with a unique mmap_offset and handle. mmap_offset uses
+	 * BAR offset for unique-by-construction (no two HOST blobs share a
+	 * window) — userspace passes this to mmap(). */
+	mtx_lock(&sc->bo_lock);
+	bo->handle      = ++sc->next_handle;
+	bo->mmap_offset = bar_offset; /* uniqueness inherited from window */
+	TAILQ_INSERT_TAIL(&sc->bos, bo, link);
+	mtx_unlock(&sc->bo_lock);
+
+	args->bo_handle    = bo->handle;
+	args->resource_id  = resource_id;
+	args->mmap_offset  = bo->mmap_offset;
+	args->actual_size  = actual_size;
+	return (0);
+
+fail_destroy:
+	/* Best-effort: tell the host to drop the resource. We don't have a
+	 * dedicated UNREF helper yet; the next CTX_DESTROY (on fd close)
+	 * will collect it. */
+fail:
+	mtx_lock(&sc->shm_lock);
+	atrium_vgpu_shm_free_locked(sc, bar_offset, npages);
+	mtx_unlock(&sc->shm_lock);
+	free(bo, M_ATRIUM_GPU);
+	return (err);
+}
+
 /* ATRIUM_GPU_IOC_SUBMIT_3D: ship an opaque venus command stream to
  * this fd's context. Bytes are forwarded verbatim — the kernel does
  * not parse them; validation is the host renderer's responsibility. */
@@ -747,6 +876,9 @@ atrium_gpu_ioctl(struct cdev *cdev, u_long cmd, caddr_t data,
 	case ATRIUM_GPU_IOC_CTX_FENCE_WAIT:
 		return (atrium_gpu_ioc_ctx_fence_wait(sc, f,
 		    (struct atrium_gpu_ctx_fence_wait *)data));
+	case ATRIUM_GPU_IOC_HOST_BLOB:
+		return (atrium_gpu_ioc_host_blob(sc, f,
+		    (struct atrium_gpu_host_blob *)data));
 
 	default:
 		return (ENOTTY);
@@ -755,7 +887,7 @@ atrium_gpu_ioctl(struct cdev *cdev, u_long cmd, caddr_t data,
 
 static int
 atrium_gpu_mmap(struct cdev *cdev, vm_ooffset_t offset, vm_paddr_t *paddr,
-    int nprot __unused, vm_memattr_t *memattr __unused)
+    int nprot __unused, vm_memattr_t *memattr)
 {
 	struct atrium_gpu_softc *sc = cdev->si_drv1;
 	struct atrium_gpu_bo *bo;
@@ -769,6 +901,14 @@ atrium_gpu_mmap(struct cdev *cdev, vm_ooffset_t offset, vm_paddr_t *paddr,
 		if (bo_off >= bo->size)
 			continue;
 		*paddr = bo->pa + bo_off;
+		/* HOST_BLOB pages live in the host_visible BAR. QEMU backs
+		 * the BAR with shm pages (cacheable on the host); WB on the
+		 * guest matches the host policy and is what venus expects
+		 * for shmem-ring + VkDeviceMemory. The default (NULL = leave
+		 * memattr untouched, ARM64 picks DEVICE) would make the ring
+		 * uncacheable and ~100x slower, plus break some atomics. */
+		if (bo->flags & ATRIUM_BO_INT_HOST_BLOB)
+			*memattr = VM_MEMATTR_WRITE_BACK;
 		mtx_unlock(&sc->bo_lock);
 		return (0);
 	}
@@ -1635,6 +1775,127 @@ atrium_vgpu_ctx_attach_resource(struct atrium_gpu_softc *sc,
 	return (atrium_vgpu_check_ok(sc, "CTX_ATTACH_RESOURCE", &s.resp));
 }
 
+/* V5h: ask the host to map a HOST3D blob resource into our host_visible
+ * BAR at the requested offset. The reply's map_info field is the cache
+ * mode the host picked (CACHED/UNCACHED/WC); we currently ignore it and
+ * always set vm_memattr=WB on the userspace mapping (works for QEMU's
+ * shmem-backed regions). */
+static int
+atrium_vgpu_resource_map_blob(struct atrium_gpu_softc *sc,
+    uint32_t ctx_id, uint32_t resource_id, uint64_t bar_offset)
+{
+	struct {
+		struct virtio_gpu_resource_map_blob req;
+		char pad;
+		struct virtio_gpu_resp_map_info     resp;
+	} s;
+	int err;
+
+	bzero(&s, sizeof(s));
+	s.req.hdr.type     = htole32(VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB);
+	s.req.hdr.flags    = htole32(VIRTIO_GPU_FLAG_FENCE |
+	                             VIRTIO_GPU_FLAG_INFO_RING_IDX);
+	s.req.hdr.fence_id = htole64(atomic_fetchadd_64(&sc->next_fence, 1));
+	s.req.hdr.ctx_id   = htole32(ctx_id);
+	s.req.hdr.ring_idx = 0;
+	s.req.resource_id  = htole32(resource_id);
+	s.req.offset       = htole64(bar_offset);
+
+	err = atrium_vgpu_req_resp(sc, &s.req, sizeof(s.req),
+	    &s.resp, sizeof(s.resp));
+	if (err != 0)
+		return (err);
+	/* Response type for MAP_BLOB success is OK_MAP_INFO, not OK_NODATA;
+	 * check_ok would reject it. Just verify the type bucket. */
+	if (le32toh(s.resp.hdr.type) != VIRTIO_GPU_RESP_OK_MAP_INFO) {
+		device_printf(sc->dev,
+		    "RESOURCE_MAP_BLOB: host returned 0x%x\n",
+		    le32toh(s.resp.hdr.type));
+		return (EIO);
+	}
+	return (0);
+}
+
+/* V5h: lazy first-time setup of the BAR-backed page allocator. Allocates
+ * the BAR resource (ownership passes to us) and the per-page bitmap.
+ * Caller must hold sc->shm_lock. Returns 0 on success or already-init,
+ * ENXIO if no host_visible region was advertised, ENOMEM on bitmap
+ * allocation failure. */
+static int
+atrium_vgpu_shm_init_locked(struct atrium_gpu_softc *sc)
+{
+	int rid;
+
+	if (sc->shm_initialized)
+		return (0);
+	if (sc->shm_size == 0)
+		return (ENXIO);
+
+	rid = PCIR_BAR(sc->shm_bar);
+	sc->shm_res = bus_alloc_resource_any(device_get_parent(sc->dev),
+	    SYS_RES_MEMORY, &rid, RF_ACTIVE | RF_SHAREABLE);
+	if (sc->shm_res == NULL) {
+		device_printf(sc->dev,
+		    "bus_alloc_resource(BAR%u) failed for HOST3D blob window\n",
+		    sc->shm_bar);
+		return (ENOMEM);
+	}
+
+	/* The cap gave us the offset *within* the BAR; compose with the
+	 * BAR's bus address to get the absolute PA we hand to userspace. */
+	sc->shm_pa = rman_get_start(sc->shm_res) + sc->shm_bar_offset;
+	sc->shm_n_pages = sc->shm_size / PAGE_SIZE;
+	sc->shm_bitmap = malloc(roundup2(sc->shm_n_pages, 8) / 8,
+	    M_ATRIUM_GPU, M_WAITOK | M_ZERO);
+	sc->shm_initialized = true;
+	device_printf(sc->dev,
+	    "HOST3D blob window armed: BAR%u pa=0x%lx, %u pages\n",
+	    sc->shm_bar, (unsigned long)sc->shm_pa, sc->shm_n_pages);
+	return (0);
+}
+
+/* V5h: bitmap allocator over the host_visible BAR. Returns the byte
+ * offset of a contiguous run of `npages` pages, or (uint64_t)-1 on
+ * failure (region exhausted). Caller must hold sc->shm_lock. */
+static uint64_t
+atrium_vgpu_shm_alloc_locked(struct atrium_gpu_softc *sc, uint32_t npages)
+{
+	uint32_t i, j, run;
+
+	if (npages == 0 || npages > sc->shm_n_pages)
+		return ((uint64_t)-1);
+	run = 0;
+	for (i = 0; i < sc->shm_n_pages; i++) {
+		if (sc->shm_bitmap[i / 8] & (1u << (i % 8))) {
+			run = 0;
+			continue;
+		}
+		run++;
+		if (run == npages) {
+			uint32_t base = i + 1 - npages;
+			for (j = 0; j < npages; j++) {
+				uint32_t b = base + j;
+				sc->shm_bitmap[b / 8] |= (1u << (b % 8));
+			}
+			return ((uint64_t)base * PAGE_SIZE);
+		}
+	}
+	return ((uint64_t)-1);
+}
+
+static void
+atrium_vgpu_shm_free_locked(struct atrium_gpu_softc *sc,
+    uint64_t bar_offset, uint32_t npages)
+{
+	uint32_t base = bar_offset / PAGE_SIZE;
+	uint32_t j;
+
+	for (j = 0; j < npages; j++) {
+		uint32_t b = base + j;
+		sc->shm_bitmap[b / 8] &= ~(1u << (b % 8));
+	}
+}
+
 /* SUBMIT_3D ships an opaque venus command stream to the host. The
  * kernel does not parse the bytes; they're concatenated after the
  * header struct as a single sg entry to the controlq. */
@@ -1787,9 +2048,10 @@ atrium_vgpu_find_shm_region(struct atrium_gpu_softc *sc, uint8_t shmid)
 		off_hi = pci_read_config(pcidev, capreg + 16, 4);
 		len_hi = pci_read_config(pcidev, capreg + 20, 4);
 
-		sc->shm_bar  = bar;
-		sc->shm_pa   = ((uint64_t)off_hi << 32) | off_lo;
-		sc->shm_size = ((uint64_t)len_hi << 32) | len_lo;
+		sc->shm_bar        = bar;
+		sc->shm_bar_offset = ((uint64_t)off_hi << 32) | off_lo;
+		sc->shm_size       = ((uint64_t)len_hi << 32) | len_lo;
+		/* shm_pa is computed in shm_init_locked once we own the BAR. */
 		return (0);
 	}
 	return (ENOENT);
@@ -1810,6 +2072,7 @@ atrium_virtio_gpu_attach(device_t dev)
 	mtx_init(&sc->lock, "atrium-gpu", NULL, MTX_DEF);
 	mtx_init(&sc->ctrl_lock, "atrium-gpu ctrl", NULL, MTX_DEF);
 	mtx_init(&sc->bo_lock, "atrium-gpu bos", NULL, MTX_DEF);
+	mtx_init(&sc->shm_lock, "atrium-gpu shm", NULL, MTX_DEF);
 	cv_init(&sc->ctrl_done_cv, "atrium-gpu ctrl done");
 	sc->ctrl_done = false;
 
@@ -1879,8 +2142,8 @@ atrium_virtio_gpu_attach(device_t dev)
 	 * (id 0 is "undefined"; the host_visible region is always id=1.) */
 	if (atrium_vgpu_find_shm_region(sc, 1) == 0) {
 		device_printf(dev,
-		    "host_visible shm region: BAR%u, pa 0x%lx, size %lu MiB\n",
-		    sc->shm_bar, (unsigned long)sc->shm_pa,
+		    "host_visible shm region: BAR%u, off 0x%lx, size %lu MiB\n",
+		    sc->shm_bar, (unsigned long)sc->shm_bar_offset,
 		    (unsigned long)(sc->shm_size >> 20));
 	} else {
 		device_printf(dev,
@@ -1928,6 +2191,7 @@ fail_gpu_cdev:
 fail_lock:
 fail_locks:
 	cv_destroy(&sc->ctrl_done_cv);
+	mtx_destroy(&sc->shm_lock);
 	mtx_destroy(&sc->bo_lock);
 	mtx_destroy(&sc->ctrl_lock);
 	mtx_destroy(&sc->lock);
@@ -1949,7 +2213,18 @@ atrium_virtio_gpu_detach(device_t dev)
 		TAILQ_REMOVE(&sc->bos, bo, link);
 		atrium_bo_free(bo);
 	}
+	if (sc->shm_initialized) {
+		free(sc->shm_bitmap, M_ATRIUM_GPU);
+		sc->shm_bitmap = NULL;
+	}
+	if (sc->shm_res != NULL) {
+		int rid = PCIR_BAR(sc->shm_bar);
+		bus_release_resource(device_get_parent(dev), SYS_RES_MEMORY,
+		    rid, sc->shm_res);
+		sc->shm_res = NULL;
+	}
 	cv_destroy(&sc->ctrl_done_cv);
+	mtx_destroy(&sc->shm_lock);
 	mtx_destroy(&sc->bo_lock);
 	mtx_destroy(&sc->ctrl_lock);
 	mtx_destroy(&sc->lock);

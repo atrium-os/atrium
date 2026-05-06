@@ -295,6 +295,45 @@ struct atrium_gpu_ctx_fence_wait {
 #define ATRIUM_GPU_IOC_CTX_FENCE_WAIT \
 	_IOWR('G', 0x44, struct atrium_gpu_ctx_fence_wait)
 
+/*
+ * ATRIUM_GPU_IOC_HOST_BLOB — V5h: allocate a HOST3D blob backed by the
+ * virtio-gpu host_visible PCI BAR.
+ *
+ * Combines what would be ALLOC + RESOURCE_ATTACH + RESOURCE_MAP_BLOB on
+ * the upstream Linux uAPI. The BO returned has NO guest pages: mmap()ing
+ * it returns BAR pages (cacheable on the guest, allocated by virglrenderer
+ * on the host). This is the path the venus frontend's shmem ring + every
+ * VkDeviceMemory allocation needs — the proxy can export the host shmem
+ * fd to the render-server worker, where guest sglists fail (V5g
+ * fd_type=-1 problem).
+ *
+ *   in:   size        — requested bytes (page-rounded by kmod)
+ *         blob_flags  — VIRTIO_GPU_BLOB_USE_MAPPABLE + USE_SHAREABLE etc
+ *         blob_id     — venus mem_id when caller has one, 0 for shmem
+ *   out:  bo_handle      — kmod-local BO handle (for IOC_FREE)
+ *         resource_id    — virtio-gpu resource id (for SUBMIT_3D bo_handles)
+ *         mmap_offset    — pass to mmap(/dev/atrium-gpu0, ...) at this off
+ *         actual_size    — page-rounded size
+ *
+ * Requires CTX_INIT (fd has a venus context). Returns ENXIO if the host
+ * didn't expose a host_visible region (no QEMU -hostmem); userspace
+ * should then fall back to BLOB_MEM_GUEST + ATTACH (V5g path) and accept
+ * that venus won't work past the first vn_call.
+ */
+struct atrium_gpu_host_blob {
+	uint64_t size;
+	uint32_t blob_flags;
+	uint32_t _pad0;
+	uint64_t blob_id;
+	uint32_t bo_handle;
+	uint32_t resource_id;
+	uint64_t mmap_offset;
+	uint64_t actual_size;
+	uint64_t _reserved[2];
+};
+#define ATRIUM_GPU_IOC_HOST_BLOB \
+	_IOWR('G', 0x45, struct atrium_gpu_host_blob)
+
 /* ---------- Display ---------- */
 
 struct atrium_display_bind_gpu {
