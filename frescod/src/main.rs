@@ -36,7 +36,10 @@ use fresco_scene_server::command::envelope_frontend::EnvelopeFrontend;
 use fresco_scene_server::scene::graph::SceneGraph;
 use fresco_scene_server::scene::slots::SlotTable;
 use fresco_scene_server::window::Compositor;
-use fresco_vulkan::{HeadlessRenderer, PathNode, SceneNode, TextureBatch, TextureNode};
+use fresco_vulkan::{
+    GlyphInstance, GlyphRunBatch, GlyphRunNode,
+    HeadlessRenderer, PathNode, SceneNode, TextureBatch, TextureNode,
+};
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -168,6 +171,12 @@ fn render_one_frame(
     let mut paths: Vec<PathNode>  = Vec::new();
     let mut tex_by_slot: std::collections::HashMap<u32, Vec<TextureNode>> =
         std::collections::HashMap::new();
+    /* glyph_run nodes get translated by window position and grouped
+     * by atlas slot. Each batch's `glyphs` vector concatenates all
+     * runs in slot, with each node's meta[1] (glyph_offset) pointing
+     * at this batch's slice. */
+    let mut glyph_by_slot: std::collections::HashMap<u32, GlyphRunBatch> =
+        std::collections::HashMap::new();
     {
         let fe = frontend.lock().unwrap();
         for (win_id, (ox, oy)) in &layers {
@@ -182,15 +191,43 @@ fn render_one_frame(
                 tex_by_slot.entry(p.slot_id).or_default()
                     .push(translate_texture(p, *ox, *oy));
             }
+            for p in state.glyph_run_nodes.values() {
+                let entry = glyph_by_slot
+                    .entry(p.atlas_slot_id)
+                    .or_insert_with(|| GlyphRunBatch {
+                        atlas_slot_id: p.atlas_slot_id,
+                        nodes:  Vec::new(),
+                        glyphs: Vec::new(),
+                    });
+                let glyph_offset = entry.glyphs.len() as i32;
+                entry.nodes.push(GlyphRunNode {
+                    origin: [p.x + ox, p.y + oy, 0.0, 0.0],
+                    atlas_dim: [p.atlas_width as f32,
+                                p.atlas_height as f32, 0.0, 0.0],
+                    color: [p.r, p.g, p.b, p.a],
+                    meta: [p.glyphs.len() as i32, glyph_offset, 0, 0],
+                });
+                for g in &p.glyphs {
+                    entry.glyphs.push(GlyphInstance {
+                        d_offset: [g.dx, g.dy],
+                        atlas_uv: [g.atlas_u as f32, g.atlas_v as f32,
+                                   g.atlas_w as f32, g.atlas_h as f32],
+                        bearing:  [g.bearing_x, g.bearing_y],
+                    });
+                }
+            }
         }
     }
     let batches: Vec<TextureBatch> = tex_by_slot.into_iter()
         .map(|(slot_id, nodes)| TextureBatch { slot_id, nodes })
         .collect();
+    let glyph_batches: Vec<GlyphRunBatch> =
+        glyph_by_slot.into_values().collect();
 
     renderer.set_rect_nodes(rects);
     renderer.set_path_nodes(paths);
     renderer.set_texture_batches(batches);
+    renderer.set_glyph_run_batches(glyph_batches);
     renderer.render_to_buffer()?;
     Ok(())
 }

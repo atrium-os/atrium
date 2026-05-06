@@ -33,7 +33,7 @@ use fresco_protocol::{
     SlotSetPayload, SlotClearPayload, SlotKind, TextureDesc, TextureFormat,
     SceneFrameBeginPayload, SceneFrameEndPayload,
     SceneNodeSetPayload, SceneNodeClearPayload,
-    RectParams, TextureParams, PathParams,
+    RectParams, TextureParams, PathParams, GlyphRunParams,
     WindowCreatePayload, WindowDestroyPayload, WindowSetTitlePayload,
     WindowSetHintsPayload, WindowRequestClosePayload, WindowPresentPayload,
     WindowHints,
@@ -258,6 +258,16 @@ impl Connection {
         self.scene_node_set(node_id, scene_ops::ATRIUM_CORE_PATH, &params)
     }
 
+    /// Convenience: install a glyph_run node (atrium-text GLYPH_RUN
+    /// op). The run references an atlas slot established via
+    /// `slot_set_texture` with `TextureFormat::R8Unorm`. See
+    /// `docs/spec/atrium-text-bundle.md` for the wire-format details.
+    pub fn scene_node_glyph_run(
+        &mut self, node_id: u32, params: GlyphRunParams,
+    ) -> io::Result<()> {
+        self.scene_node_set(node_id, scene_ops::ATRIUM_TEXT_GLYPH_RUN, &params)
+    }
+
     pub fn scene_node_clear(&mut self, node_id: u32) -> io::Result<()> {
         self.send_routable(control::OP_SCENE_NODE_CLEAR,
             &SceneNodeClearPayload { node_id })
@@ -444,6 +454,16 @@ impl<'a> FrameBuilder<'a> {
     pub fn path(&mut self, p: PathParams) -> io::Result<u32> {
         let id = self.next_id;
         self.conn.scene_node_path(id, p)?;
+        self.next_id += 1;
+        Ok(id)
+    }
+
+    /// Emit a `GlyphRunParams` (atrium-text glyph_run) node and
+    /// return its id. The run references a pre-uploaded R8 atlas
+    /// via `params.atlas_slot_id`.
+    pub fn glyph_run(&mut self, p: GlyphRunParams) -> io::Result<u32> {
+        let id = self.next_id;
+        self.conn.scene_node_glyph_run(id, p)?;
         self.next_id += 1;
         Ok(id)
     }

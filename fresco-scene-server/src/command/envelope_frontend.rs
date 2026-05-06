@@ -41,7 +41,7 @@ use fresco_protocol::{
     control, decode, scene_ops,
     SceneNodeSetPayload, SceneNodeClearPayload,
     SlotSetPayload, SlotClearPayload,
-    RectParams, TextureParams, PathParams,
+    RectParams, TextureParams, PathParams, GlyphRunParams,
     WindowCreatePayload, WindowDestroyPayload,
     WindowSetTitlePayload, WindowSetHintsPayload,
     WindowRequestClosePayload, WindowPresentPayload,
@@ -63,11 +63,12 @@ use crate::window::Compositor;
 /// for now treats it as informational only.
 #[derive(Default)]
 pub struct WindowSceneState {
-    pub rect_nodes:    HashMap<u32, RectParams>,
-    pub texture_nodes: HashMap<u32, TextureParams>,
-    pub path_nodes:    HashMap<u32, PathParams>,
-    pub slot_table:    HashMap<u32, [u8; 32]>,
-    pub in_frame:      bool,
+    pub rect_nodes:      HashMap<u32, RectParams>,
+    pub texture_nodes:   HashMap<u32, TextureParams>,
+    pub path_nodes:      HashMap<u32, PathParams>,
+    pub glyph_run_nodes: HashMap<u32, GlyphRunParams>,
+    pub slot_table:      HashMap<u32, [u8; 32]>,
+    pub in_frame:        bool,
 }
 
 impl WindowSceneState {
@@ -97,6 +98,50 @@ impl WindowSceneState {
             extra: [p.angle, 0.0, 0.0, 0.0],
             color: [p.r, p.g, p.b, p.a],
         }).collect()
+    }
+
+    /// Group glyph_run nodes by atlas slot into
+    /// `fresco_vulkan::GlyphRunBatch`es. Each batch carries its
+    /// scene nodes (one per text run sharing this atlas) and a
+    /// concatenated glyphs vector with adjusted per-node
+    /// `meta[1]` (glyph_offset) so the GPU kernel reads each run's
+    /// glyphs from the right slice.
+    ///
+    /// The runs themselves are not pre-translated by window
+    /// position here — the merge step in frescod's render loop
+    /// adds the window offset, the same way it does for rect and
+    /// path nodes.
+    pub fn extract_glyph_run_batches(&self)
+        -> Vec<fresco_vulkan::GlyphRunBatch>
+    {
+        let mut by_slot:
+            HashMap<u32, fresco_vulkan::GlyphRunBatch> = HashMap::new();
+        for run in self.glyph_run_nodes.values() {
+            let entry = by_slot.entry(run.atlas_slot_id)
+                .or_insert_with(|| fresco_vulkan::GlyphRunBatch {
+                    atlas_slot_id: run.atlas_slot_id,
+                    nodes:  Vec::new(),
+                    glyphs: Vec::new(),
+                });
+            let glyph_offset = entry.glyphs.len() as i32;
+            entry.nodes.push(fresco_vulkan::GlyphRunNode {
+                origin:    [run.x, run.y, 0.0, 0.0],
+                atlas_dim: [run.atlas_width  as f32,
+                            run.atlas_height as f32,
+                            0.0, 0.0],
+                color:     [run.r, run.g, run.b, run.a],
+                meta:      [run.glyphs.len() as i32, glyph_offset, 0, 0],
+            });
+            for g in &run.glyphs {
+                entry.glyphs.push(fresco_vulkan::GlyphInstance {
+                    d_offset: [g.dx, g.dy],
+                    atlas_uv: [g.atlas_u as f32, g.atlas_v as f32,
+                               g.atlas_w as f32, g.atlas_h as f32],
+                    bearing:  [g.bearing_x, g.bearing_y],
+                });
+            }
+        }
+        by_slot.into_values().collect()
     }
 
     /// Group texture ops by `slot_id` into `TextureBatch`es. The
@@ -325,6 +370,7 @@ impl EnvelopeFrontend {
                  * exactly one map." */
                 s.texture_nodes.remove(&p.node_id);
                 s.path_nodes.remove(&p.node_id);
+                s.glyph_run_nodes.remove(&p.node_id);
             }
             scene_ops::ATRIUM_CORE_TEXTURE => {
                 let inner: TextureParams = decode(&p.params)
@@ -332,6 +378,7 @@ impl EnvelopeFrontend {
                 s.texture_nodes.insert(p.node_id, inner);
                 s.rect_nodes.remove(&p.node_id);
                 s.path_nodes.remove(&p.node_id);
+                s.glyph_run_nodes.remove(&p.node_id);
             }
             scene_ops::ATRIUM_CORE_PATH => {
                 let inner: PathParams = decode(&p.params)
@@ -339,6 +386,15 @@ impl EnvelopeFrontend {
                 s.path_nodes.insert(p.node_id, inner);
                 s.rect_nodes.remove(&p.node_id);
                 s.texture_nodes.remove(&p.node_id);
+                s.glyph_run_nodes.remove(&p.node_id);
+            }
+            scene_ops::ATRIUM_TEXT_GLYPH_RUN => {
+                let inner: GlyphRunParams = decode(&p.params)
+                    .map_err(|_| DispatchError::BadPayload)?;
+                s.glyph_run_nodes.insert(p.node_id, inner);
+                s.rect_nodes.remove(&p.node_id);
+                s.texture_nodes.remove(&p.node_id);
+                s.path_nodes.remove(&p.node_id);
             }
             other => {
                 /* Unknown / unbundled op-id. The closed registry per
@@ -361,6 +417,7 @@ impl EnvelopeFrontend {
             s.rect_nodes.remove(&p.node_id);
             s.texture_nodes.remove(&p.node_id);
             s.path_nodes.remove(&p.node_id);
+            s.glyph_run_nodes.remove(&p.node_id);
         }
         Ok(Vec::new())
     }
