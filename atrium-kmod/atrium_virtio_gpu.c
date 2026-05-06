@@ -811,12 +811,23 @@ static void
 atrium_vgpu_ctrl_intr(void *xsc)
 {
 	struct atrium_gpu_softc *sc = xsc;
+	int n = 0;
 
 	mtx_lock(&sc->ctrl_lock);
 	while (virtqueue_dequeue(sc->ctrl_vq, NULL) != NULL)
-		;
+		n++;
 	sc->ctrl_done = true;
 	cv_signal(&sc->ctrl_done_cv);
+
+	/* Re-arm the per-vq interrupt for the next request. Some
+	 * FreeBSD virtio drivers (vtnet, vtblk) re-enable inside the
+	 * intr handler after dequeueing; some rely on virtio framework
+	 * auto-re-enable. We do it explicitly: the cost is one MMIO
+	 * write per controlq round-trip, which is negligible. */
+	(void)virtqueue_enable_intr(sc->ctrl_vq);
+
+	if (bootverbose)
+		device_printf(sc->dev, "ctrl_intr: dequeued %d, signaled\n", n);
 	mtx_unlock(&sc->ctrl_lock);
 }
 
@@ -855,13 +866,34 @@ atrium_vgpu_req_resp(struct atrium_gpu_softc *sc,
 	mtx_lock(&sc->ctrl_lock);
 	sc->ctrl_done = false;
 	err = virtqueue_enqueue(sc->ctrl_vq, resp, &sg, 1, 1);
-	if (err == 0) {
-		virtqueue_notify(sc->ctrl_vq);
-		while (!sc->ctrl_done)
-			cv_wait(&sc->ctrl_done_cv, &sc->ctrl_lock);
+	if (err != 0) {
+		device_printf(sc->dev, "req_resp: virtqueue_enqueue: %d\n", err);
+		mtx_unlock(&sc->ctrl_lock);
+		return (err);
+	}
+	virtqueue_notify(sc->ctrl_vq);
+	if (bootverbose)
+		device_printf(sc->dev, "req_resp: notified, waiting...\n");
+
+	/* Bounded wait so a missed interrupt doesn't deadlock the caller
+	 * forever. 5 seconds is generous: a virtio-gpu controlq round-
+	 * trip on a healthy host is microseconds. If we time out, we
+	 * report failure and the caller's IOCTL returns EIO instead of
+	 * sleeping uninterruptibly forever. */
+	while (!sc->ctrl_done) {
+		err = cv_timedwait(&sc->ctrl_done_cv, &sc->ctrl_lock,
+		    5 * hz);
+		if (err == EWOULDBLOCK && !sc->ctrl_done) {
+			device_printf(sc->dev,
+			    "req_resp: timeout waiting for completion "
+			    "(host not responding or interrupt not delivered)\n");
+			mtx_unlock(&sc->ctrl_lock);
+			return (EIO);
+		}
+		err = 0;
 	}
 	mtx_unlock(&sc->ctrl_lock);
-	return (err);
+	return (0);
 }
 
 static int
@@ -1181,6 +1213,20 @@ atrium_virtio_gpu_attach(device_t dev)
 
 	if ((err = virtio_setup_intr(dev, INTR_TYPE_TTY)) != 0) {
 		device_printf(dev, "virtio_setup_intr: %d\n", err);
+		goto fail_locks;
+	}
+
+	/* Arm the controlq interrupt. virtio_setup_intr installs the IRQ
+	 * handler at the bus level but each virtqueue's per-vq interrupt
+	 * stays masked until enabled. The earlier virtqueue_poll-based
+	 * design enabled it as a side effect; the cv_wait callback path
+	 * needs an explicit arm. Without this, the host fires MSI-X on
+	 * request completion but the vq's used-ring monitor stays off,
+	 * so atrium_vgpu_ctrl_intr never runs and req_resp deadlocks
+	 * waiting on ctrl_done_cv. */
+	if (virtqueue_enable_intr(sc->ctrl_vq) != 0) {
+		device_printf(dev, "virtqueue_enable_intr(ctrl_vq) failed\n");
+		err = EIO;
 		goto fail_locks;
 	}
 
