@@ -73,9 +73,58 @@ pub struct ServiceManifest {
     pub mounts: Vec<ManifestMount>,
 
     pub exec: Option<ManifestExec>,
+
+    #[serde(default)]
+    pub supervision: Supervision,
 }
 
 fn default_true() -> bool { true }
+
+/// Restart policy for exec'd services (persistent-jail entries
+/// without exec are launched once and not supervised).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Supervision {
+    #[serde(default = "default_restart")]
+    pub restart: RestartPolicy,
+    /// Cooldown between an exit and the next restart attempt.
+    /// Defaults to 1 second; 0 means "immediately."
+    #[serde(default = "default_restart_after_secs")]
+    pub restart_after_secs: u64,
+    /// Backoff cap. If a service restarts more often than this in
+    /// a 60-second window, the supervisor pauses restarts on it
+    /// for `cooldown_after_burst_secs`.
+    #[serde(default = "default_max_restarts_per_minute")]
+    pub max_restarts_per_minute: u32,
+    #[serde(default = "default_cooldown_after_burst_secs")]
+    pub cooldown_after_burst_secs: u64,
+}
+
+impl Default for Supervision {
+    fn default() -> Self {
+        Self {
+            restart: default_restart(),
+            restart_after_secs: default_restart_after_secs(),
+            max_restarts_per_minute: default_max_restarts_per_minute(),
+            cooldown_after_burst_secs: default_cooldown_after_burst_secs(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RestartPolicy {
+    /// Restart unconditionally on any exit.
+    Always,
+    /// Restart only on non-zero exit / signal-induced exit.
+    OnFailure,
+    /// Never restart. The service runs once.
+    Never,
+}
+
+fn default_restart() -> RestartPolicy { RestartPolicy::OnFailure }
+fn default_restart_after_secs() -> u64 { 1 }
+fn default_max_restarts_per_minute() -> u32 { 5 }
+fn default_cooldown_after_burst_secs() -> u64 { 30 }
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ManifestMount {
@@ -267,6 +316,7 @@ mod tests {
                 kind:   MountKindStr::RoNullfs,
             }],
             exec: None,
+            supervision: Supervision::default(),
         };
         let req = m.to_create_request();
         assert_eq!(req.name, "atrium-x");
@@ -299,6 +349,31 @@ mod tests {
         let out = load_dir(dir.path()).unwrap();
         assert_eq!(out.manifests.len(), 1);
         assert_eq!(out.errors.len(), 1);
+    }
+
+    #[test]
+    fn supervision_defaults() {
+        let s = r#"name = "atrium-x"
+                   path = "/""#;
+        let m: ServiceManifest = toml::from_str(s).unwrap();
+        assert_eq!(m.supervision.restart, RestartPolicy::OnFailure);
+        assert_eq!(m.supervision.restart_after_secs, 1);
+        assert_eq!(m.supervision.max_restarts_per_minute, 5);
+    }
+
+    #[test]
+    fn supervision_parse() {
+        let s = r#"
+            name = "atrium-x"
+            path = "/"
+            [supervision]
+            restart = "always"
+            restart_after_secs = 5
+            max_restarts_per_minute = 10
+        "#;
+        let m: ServiceManifest = toml::from_str(s).unwrap();
+        assert_eq!(m.supervision.restart, RestartPolicy::Always);
+        assert_eq!(m.supervision.restart_after_secs, 5);
     }
 
     #[test]

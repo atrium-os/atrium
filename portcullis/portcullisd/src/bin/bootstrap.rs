@@ -1,22 +1,29 @@
-//! atrium-portcullisd-bootstrap — V1 system-service launcher.
+//! atrium-portcullisd-bootstrap — system-service launcher +
+//! supervisor.
 //!
 //! Reads `/etc/atrium/services.d/*.toml`, connects to jaild,
 //! sends a `CreateJail` request for each enabled manifest in
-//! lexicographic order. For exec'd services the procdesc fd
-//! returned via SCM_RIGHTS is held in memory until the binary
-//! exits — at which point the kernel closes them, the jails
-//! die, and the children get reaped (no daemon role yet; that's
-//! V2).
+//! lexicographic order. For exec'd services it then enters a
+//! kqueue loop with `EVFILT_PROCDESC` registrations; on
+//! `NOTE_EXIT` it consults the manifest's `[supervision].restart`
+//! policy and either re-launches (with cooldown + burst cap) or
+//! retires the service.
 //!
-//! V0/V1 limit: this binary is a one-shot launcher. It does NOT
-//! supervise — when it exits, the procdesc fds are closed and
-//! the launched services die. Use V2 (kqueue + restart policy)
-//! for a real long-running launcher.
+//! Persistent-jail manifests (no `[exec]` block) are launched
+//! once and not supervised — they live in jaild's state file
+//! until removed.
+//!
+//! Modes:
+//!   default            launch + kqueue-supervise forever
+//!   --once             launch + exit (V1 behaviour; the kernel
+//!                      closes our procdesc fds → exec'd jails
+//!                      die)
+//!   --dry-run          parse + log + exit, no jaild calls
 //!
 //! Usage:
 //!     atrium-portcullisd-bootstrap [--socket /var/run/atrium/jaild.sock]
 //!                                  [--services-dir /etc/atrium/services.d]
-//!                                  [--keep-running]
+//!                                  [--once] [--dry-run]
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -25,6 +32,7 @@ use std::time::Duration;
 use jaild::protocol::{Request, Response};
 use log::{error, info, warn};
 use portcullisd::jaild_client::Client;
+use portcullisd::supervisor::Supervisor;
 use portcullisd::system_services::{self, LoadOutcome};
 
 const DEFAULT_SOCKET: &str = "/var/run/atrium/jaild.sock";
@@ -36,10 +44,9 @@ usage:
   atrium-portcullisd-bootstrap
         [--socket <path>]            (default: {DEFAULT_SOCKET})
         [--services-dir <path>]      (default: {DEFAULT_SVCDIR})
-        [--keep-running]             hold procdesc fds open + sleep
-                                     forever (smoke-test mode; V2
-                                     replaces this with kqueue)
-        [--dry-run]                  load + log manifests, don't
+        [--once]                     launch + exit (no supervision;
+                                     exec'd jails die when fd closes)
+        [--dry-run]                  parse + log manifests, don't
                                      send anything to jaild
 ");
     ExitCode::from(2)
@@ -52,7 +59,7 @@ fn main() -> ExitCode {
 
     let mut socket_path  = PathBuf::from(DEFAULT_SOCKET);
     let mut services_dir = PathBuf::from(DEFAULT_SVCDIR);
-    let mut keep_running = false;
+    let mut once         = false;
     let mut dry_run      = false;
 
     let mut args = std::env::args().skip(1);
@@ -64,8 +71,8 @@ fn main() -> ExitCode {
             "--services-dir"  => match args.next() {
                 Some(v) => services_dir = v.into(), None => return usage(),
             },
-            "--keep-running"  => keep_running = true,
-            "--dry-run"       => dry_run      = true,
+            "--once"          => once    = true,
+            "--dry-run"       => dry_run = true,
             "--help" | "-h"   => return usage(),
             other => { eprintln!("unknown arg: {other}"); return ExitCode::from(2); }
         }
@@ -95,7 +102,7 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let mut client = match Client::connect(&socket_path) {
+    let client = match Client::connect(&socket_path) {
         Ok(c) => c,
         Err(e) => {
             error!("connect jaild socket {}: {e}", socket_path.display());
@@ -103,20 +110,45 @@ fn main() -> ExitCode {
         }
     };
 
-    /* For V1 we hold the procdesc fds in this Vec to keep the
-     * exec'd services alive — closing the fd makes the kernel
-     * close the procdesc, which makes the persist=0 jail go away.
-     * V2 will hand these to a kqueue loop. */
+    /* The supervisor takes ownership of the jaild connection and
+     * reuses it for relaunches — opening a second connection on a
+     * single-threaded jaild deadlocks. In --once mode we use
+     * the connection directly here and don't supervise. */
+    enum Driver { Once(Client), Supervise(Supervisor) }
+    let mut driver = if once {
+        Driver::Once(client)
+    } else {
+        match Supervisor::new(client) {
+            Ok(s)  => Driver::Supervise(s),
+            Err(e) => {
+                error!("kqueue init: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
     let mut held_fds: Vec<i32> = Vec::new();
     let mut launch_failures = 0;
 
-    for m in &enabled {
+    for m in enabled {
         let req = Request::CreateJail(m.to_create_request());
-        match client.send(&req) {
+        let send_result = match &mut driver {
+            Driver::Once(c)       => c.send(&req),
+            Driver::Supervise(s)  => s.client_mut().send(&req),
+        };
+        match send_result {
             Ok((Response::JailCreated(r), fd)) => {
                 info!("launched {}: jid={} pid={} procdesc_attached={}",
                     m.name, r.jid, r.pid, r.procdesc_attached);
-                if let Some(fd) = fd { held_fds.push(fd); }
+                match (fd, &mut driver) {
+                    (Some(fd), Driver::Supervise(sup)) => {
+                        if let Err(e) = sup.watch(m, fd, r.pid) {
+                            error!("watch register failed: {e}");
+                            launch_failures += 1;
+                        }
+                    }
+                    (Some(fd), Driver::Once(_)) => held_fds.push(fd),
+                    (None, _) => { /* persistent jail, no fd */ }
+                }
             }
             Ok((Response::PolicyDenied { rule, detail }, _)) => {
                 error!("policy denied {}: {rule}: {detail}", m.name);
@@ -138,15 +170,23 @@ fn main() -> ExitCode {
         }
     }
 
-    if !keep_running {
-        info!("bootstrap done; {} launched, {} failed", held_fds.len(), launch_failures);
-        /* About to drop fds → kernel closes the procdescs → jails
-         * with persist=0 die. That's the V1 limitation; the user
-         * called us without --keep-running so they're aware. */
-        return if launch_failures == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE };
+    match driver {
+        Driver::Supervise(mut sup) => {
+            info!("bootstrap launched {} supervised + {} held; entering kqueue loop",
+                sup.watched_count(), held_fds.len());
+            if let Err(e) = sup.run() {
+                error!("supervisor.run: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        Driver::Once(_client) => {
+            info!("bootstrap done; {} held, {} failed (--once mode)",
+                held_fds.len(), launch_failures);
+            /* About to drop fds → kernel closes the procdescs →
+             * exec'd jails with persist=0 die. */
+        }
     }
 
-    info!("bootstrap done; {} launched, {} failed; sleeping forever (--keep-running)",
-        held_fds.len(), launch_failures);
-    loop { std::thread::sleep(Duration::from_secs(60)); }
+    let _ = Duration::from_secs(0);  // silence unused-import lint
+    if launch_failures == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }

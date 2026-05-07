@@ -10,4 +10,5 @@
 #![deny(unsafe_code)]
 
 pub mod jaild_client;
+pub mod supervisor;
 pub mod system_services;

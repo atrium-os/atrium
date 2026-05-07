@@ -1,0 +1,28 @@
+# /etc/atrium/services.d/20-atrium-smoke-restart.toml
+#
+# V2 smoke service: an exec'd jail that exits cleanly after each
+# launch, with restart = "always" so the supervisor relaunches
+# every cycle. Used to verify the kqueue + EVFILT_PROCDESC +
+# restart loop end-to-end.
+
+enabled       = true
+name          = "atrium-smoke-restart"
+path          = "/"
+children_max  = 0
+devfs_ruleset = 0
+
+[exec]
+path = "/usr/local/bin/atrium-jaild"
+argv = ["atrium-jaild", "check-policy",
+        "--policy", "/etc/atrium/jaild.policy.toml"]
+uid  = 1001
+gid  = 1001
+
+[[exec.env]]
+key   = "PATH"
+value = "/bin:/usr/bin"
+
+[supervision]
+restart                 = "always"
+restart_after_secs      = 1
+max_restarts_per_minute = 30
