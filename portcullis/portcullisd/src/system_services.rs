@@ -50,7 +50,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use jaild::protocol::{
-    CreateJailRequest, EnvPair, ExecSpec, MountKind, MountSpec,
+    CreateJailRequest, EnvPair, ExecSpec, MountKind, MountSpec, NetworkConfig,
 };
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -71,6 +71,11 @@ pub struct ServiceManifest {
 
     #[serde(default)]
     pub mounts: Vec<ManifestMount>,
+
+    /// Network configuration. Default is `disable` (jail has no
+    /// network). See `docs/spec/network.md`.
+    #[serde(default)]
+    pub network: ManifestNetwork,
 
     pub exec: Option<ManifestExec>,
 
@@ -224,6 +229,25 @@ impl From<MountKindStr> for MountKind {
     }
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum ManifestNetwork {
+    #[default]
+    Disable,
+    Lo0Alias { addr: String },
+}
+
+impl From<&ManifestNetwork> for NetworkConfig {
+    fn from(n: &ManifestNetwork) -> Self {
+        match n {
+            ManifestNetwork::Disable           => NetworkConfig::Disable,
+            ManifestNetwork::Lo0Alias { addr } => NetworkConfig::Lo0Alias {
+                addr: addr.clone(),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ManifestExec {
     pub path: String,
@@ -256,6 +280,7 @@ impl ServiceManifest {
             path:          self.path.clone(),
             children_max:  self.children_max,
             devfs_ruleset: self.devfs_ruleset,
+            network:       (&self.network).into(),
             mounts: self.mounts.iter().map(|m| MountSpec {
                 source: m.source.clone(),
                 dest:   m.dest.clone(),
@@ -385,6 +410,7 @@ mod tests {
                 dest:   "usr/local/lib".into(),
                 kind:   MountKindStr::RoNullfs,
             }],
+            network: ManifestNetwork::Disable,
             exec: None,
             supervision: Supervision::default(),
         };

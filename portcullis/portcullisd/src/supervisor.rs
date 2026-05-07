@@ -268,6 +268,26 @@ impl Supervisor {
         let _ = ffi::close_fd(svc.procdesc_fd);
         svc.procdesc_fd = -1;
 
+        /* Ask jaild to clean up any per-jail state (lo0 alias,
+         * persisted record). Idempotent — a jail with no
+         * network or no state entry is a no-op. Done before
+         * the restart decision so the next launch starts from
+         * a clean slate. */
+        let cleanup_req = Request::RemoveJail {
+            jid:  None,
+            name: Some(svc.manifest.name.clone()),
+        };
+        match self.client.send(&cleanup_req) {
+            Ok((Response::Ok, _)) => {}
+            Ok((other, _)) => {
+                warn!("{}: post-exit cleanup unexpected response: {other:?}",
+                    svc.manifest.name);
+            }
+            Err(e) => {
+                warn!("{}: post-exit cleanup rpc error: {e}", svc.manifest.name);
+            }
+        }
+
         /* Failure-budget update. A "successful start" is alive
          * ≥ min_lifetime_for_success_secs; that refills the
          * budget. Anything shorter charges
@@ -433,7 +453,7 @@ impl Supervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::system_services::{ManifestExec, ManifestEnv, MountKindStr, RestartPolicy};
+    use crate::system_services::{ManifestExec, ManifestEnv, ManifestNetwork, MountKindStr, RestartPolicy};
 
     fn never_restart_manifest() -> ServiceManifest {
         ServiceManifest {
@@ -443,6 +463,7 @@ mod tests {
             children_max:  0,
             devfs_ruleset: 0,
             mounts:        vec![],
+            network:       ManifestNetwork::Disable,
             exec: Some(ManifestExec {
                 path: "/usr/local/bin/atrium-jaild".into(),
                 argv: vec!["atrium-jaild".into()],

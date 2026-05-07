@@ -52,6 +52,12 @@ pub struct JailRecord {
     pub name:            String,
     pub jid:             i32,
     pub created_at_unix: u64,
+    /// CIDR form lo0 alias address allocated for this jail, if
+    /// any. `None` if the jail had `network = disable` or
+    /// hasn't been migrated to the network-aware schema.
+    /// On RemoveJail this is what gets `ifconfig -alias`d.
+    #[serde(default)]
+    pub lo0_alias:       Option<String>,
 }
 
 impl PersistentState {
@@ -116,11 +122,12 @@ impl PersistentState {
         Ok(())
     }
 
-    pub fn add(&mut self, name: &str, jid: i32) {
+    pub fn add(&mut self, name: &str, jid: i32, lo0_alias: Option<String>) {
         self.jails.push(JailRecord {
             name: name.to_string(),
             jid,
             created_at_unix: now_unix(),
+            lo0_alias,
         });
         self.written_at_unix = now_unix();
     }
@@ -165,8 +172,8 @@ mod tests {
         let p = dir.path().join("state.toml");
 
         let mut st = PersistentState::empty();
-        st.add("atrium-foo", 7);
-        st.add("atrium-bar", 8);
+        st.add("atrium-foo", 7, None);
+        st.add("atrium-bar", 8, None);
         st.save(&p).unwrap();
 
         let back = PersistentState::load(&p).unwrap();
@@ -179,8 +186,8 @@ mod tests {
     #[test]
     fn remove_by_jid_works() {
         let mut st = PersistentState::empty();
-        st.add("atrium-a", 1);
-        st.add("atrium-b", 2);
+        st.add("atrium-a", 1, None);
+        st.add("atrium-b", 2, None);
         assert!(st.remove_by_jid(1));
         assert!(!st.has_name("atrium-a"));
         assert!(st.has_name("atrium-b"));
@@ -204,7 +211,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let p = dir.path().join("state.toml");
         let mut st = PersistentState::empty();
-        st.add("atrium-x", 5);
+        st.add("atrium-x", 5, None);
         st.save(&p).unwrap();
         let mut tmp = p.clone();
         tmp.set_extension("toml.tmp");

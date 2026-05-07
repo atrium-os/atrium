@@ -16,7 +16,7 @@
 use std::process::ExitCode;
 
 use jaild::protocol::{
-    CreateJailRequest, EnvPair, ExecSpec, Request, Response,
+    CreateJailRequest, EnvPair, ExecSpec, NetworkConfig, Request, Response,
 };
 use portcullisd::jaild_client::Client;
 
@@ -56,16 +56,18 @@ fn main() -> ExitCode {
                 children_max:  rest.get(2).and_then(|s| s.parse().ok()).unwrap_or(0),
                 mounts:        vec![],
                 devfs_ruleset: 0,
+                network:       NetworkConfig::Disable,
                 exec:          None,
             })
         }
         "remove" => {
             if rest.len() < 1 { return usage(); }
-            let jid: i32 = match rest[0].parse() {
-                Ok(j) => j,
-                Err(_) => { eprintln!("bad jid"); return usage(); }
-            };
-            Request::RemoveJail { jid }
+            // jid OR name; numeric → jid, else → name.
+            if let Ok(jid) = rest[0].parse::<i32>() {
+                Request::RemoveJail { jid: Some(jid), name: None }
+            } else {
+                Request::RemoveJail { jid: None, name: Some(rest[0].clone()) }
+            }
         }
         "exec" => {
             if rest.len() < 3 { return usage(); }
@@ -79,6 +81,7 @@ fn main() -> ExitCode {
                 children_max:  0,
                 mounts:        vec![],
                 devfs_ruleset: 0,
+                network:       NetworkConfig::Disable,
                 exec: Some(ExecSpec {
                     path: bin,
                     argv,

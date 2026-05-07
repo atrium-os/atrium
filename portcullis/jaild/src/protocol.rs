@@ -36,9 +36,18 @@ pub enum Request {
     /// V1.
     CreateJail(CreateJailRequest),
 
-    /// Remove a previously-created jail by jid. Idempotent — a
-    /// jid that's already gone returns success.
-    RemoveJail { jid: i32 },
+    /// Remove a previously-created jail. Idempotent — a jid /
+    /// name that's already gone returns success. Pass either
+    /// `jid` (preferred when known) OR `name` (used by the
+    /// supervisor for exec'd jails whose jid is unknown to it),
+    /// not both. Cleans up any associated lo0 alias from
+    /// jaild's network-state table.
+    RemoveJail {
+        #[serde(default)]
+        jid: Option<i32>,
+        #[serde(default)]
+        name: Option<String>,
+    },
 
     /// Health check. Returns `Response::Ok` if jaild is alive.
     Ping,
@@ -82,6 +91,12 @@ pub struct CreateJailRequest {
     /// against `policy.devfs_rulesets.allowed_ids` (0 always OK).
     #[serde(default)]
     pub devfs_ruleset: u32,
+
+    /// Network configuration. Default `Disable` = no
+    /// `socket(AF_INET, ...)` allowed in the jail. See
+    /// `docs/spec/network.md` for the full taxonomy.
+    #[serde(default)]
+    pub network: NetworkConfig,
 
     /// If set, the broker forks (pdfork), applies mounts,
     /// jail_attaches, drops to (gid, uid), and execs the binary.
@@ -135,6 +150,36 @@ pub struct ExecSpec {
 pub struct EnvPair {
     pub key:   String,
     pub value: String,
+}
+
+/// Per-jail network configuration. See `docs/spec/network.md` for
+/// the architectural model; jaild policy gating in
+/// `jaild_policy::NetworkPolicy`.
+///
+/// V0 (this commit) implements `Disable` and `Lo0Alias`. `Vnet`
+/// and `HostAlias` are reserved for future commits and rejected
+/// at the validator until then.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum NetworkConfig {
+    /// No network access. `ip4=disable` on the jail; processes
+    /// inside cannot `socket(AF_INET, ...)`. Default.
+    Disable,
+    /// A specific 127.x.x.x address aliased on the host's lo0.
+    /// `addr` is in CIDR form (e.g. "127.10.0.5/32"). Must
+    /// match (CIDR-contained-in) one of
+    /// `policy.network.allowed_addrs_on_lo0`.
+    Lo0Alias { addr: String },
+    /// Reserved for V1.
+    Vnet     { bridge: String, addr: String, gateway: Option<String> },
+    /// Reserved for V1.
+    HostAlias { interface: String, addr: String },
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        NetworkConfig::Disable
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -271,6 +316,7 @@ mod tests {
             children_max:  0,
             mounts:        vec![],
             devfs_ruleset: 0,
+            network:       NetworkConfig::Disable,
             exec:          None,
         });
         let bytes = serde_json::to_vec(&req).unwrap();

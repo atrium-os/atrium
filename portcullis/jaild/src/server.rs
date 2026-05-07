@@ -17,7 +17,7 @@ use log::{error, info, warn};
 use crate::ffi::{self, JailCreateSpec};
 use crate::protocol::{
     self, CreateJailRequest, CreateJailResponse, ExecSpec, MountKind,
-    Request, Response,
+    NetworkConfig, Request, Response,
 };
 use crate::state::PersistentState;
 use crate::validator;
@@ -146,27 +146,8 @@ fn dispatch(
             }
         }
 
-        Request::RemoveJail { jid } => {
-            if dry_run {
-                info!("jaild: dry-run RemoveJail jid={jid}");
-                state.remove_by_jid(jid);
-                return (Response::Ok, None);
-            }
-            match ffi::remove_jail(jid) {
-                Ok(()) => {
-                    if state.remove_by_jid(jid) {
-                        if let Err(e) = state.save(state_path) {
-                            warn!("jaild: state save after remove: {e}");
-                        }
-                    }
-                    (Response::Ok, None)
-                }
-                Err(e) => (Response::SyscallFailed {
-                    name:  "jail_remove".into(),
-                    errno: e.raw_os_error().unwrap_or(-1),
-                    msg:   format!("{e}"),
-                }, None),
-            }
+        Request::RemoveJail { jid, name } => {
+            handle_remove(jid, name, dry_run, state, state_path)
         }
     }
 }
@@ -176,6 +157,78 @@ fn dispatch(
 struct CreateOutcome {
     resp:        CreateJailResponse,
     procdesc_fd: Option<i32>,
+}
+
+/// Handle a RemoveJail request. Cleans up any associated lo0
+/// alias regardless of whether the kernel jail still exists.
+/// Idempotent: missing jid/name/jail/alias all fold to Ok.
+fn handle_remove(
+    jid:        Option<i32>,
+    name:       Option<String>,
+    dry_run:    bool,
+    state:      &mut PersistentState,
+    state_path: &Path,
+) -> (Response, Option<i32>) {
+    /* Look up the state record (if any) so we can clean up
+     * its lo0 alias. We accept either jid OR name. */
+    let record_idx = match (jid, &name) {
+        (Some(j), _) => state.jails.iter().position(|r| r.jid == j),
+        (None, Some(n)) => state.jails.iter().position(|r| &r.name == n),
+        (None, None) => {
+            return (Response::Error {
+                detail: "RemoveJail requires jid OR name".into(),
+            }, None);
+        }
+    };
+
+    if dry_run {
+        info!("jaild: dry-run RemoveJail jid={jid:?} name={name:?}");
+        if let Some(i) = record_idx { state.jails.remove(i); }
+        return (Response::Ok, None);
+    }
+
+    /* Capture alias info before we drop the record. */
+    let alias_addr = record_idx.and_then(|i| state.jails[i].lo0_alias.clone());
+
+    /* Resolve the jid for the actual jail_remove syscall. If we
+     * have a name but no jid, use the state record's jid (which
+     * is sentinel 0 for exec'd jails — those aren't in the
+     * kernel anymore, so jail_remove(0) returns ENOENT which is
+     * folded to Ok). */
+    let kernel_jid = match (jid, record_idx) {
+        (Some(j), _) => Some(j),
+        (None, Some(i)) => Some(state.jails[i].jid).filter(|&j| j > 0),
+        _ => None,
+    };
+
+    if let Some(j) = kernel_jid {
+        if let Err(e) = ffi::remove_jail(j) {
+            return (Response::SyscallFailed {
+                name:  "jail_remove".into(),
+                errno: e.raw_os_error().unwrap_or(-1),
+                msg:   format!("{e}"),
+            }, None);
+        }
+    }
+
+    /* Drop the lo0 alias if any. */
+    if let Some(addr) = alias_addr {
+        if let Err(e) = ffi::ifconfig_lo0_alias_del(&addr) {
+            warn!("jaild: ifconfig -alias {addr}: {e}");
+            /* Don't fail the response — the jail is gone, alias
+             * cleanup is best-effort. Log and move on. */
+        }
+    }
+
+    /* Drop the state entry. */
+    if let Some(i) = record_idx {
+        state.jails.remove(i);
+        if let Err(e) = state.save(state_path) {
+            warn!("jaild: state save after remove: {e}");
+        }
+    }
+
+    (Response::Ok, None)
 }
 
 fn handle_create(
@@ -214,8 +267,28 @@ fn handle_create(
         });
     }
 
+    /* Apply lo0 alias on the host BEFORE jail_set, so the
+     * address exists at the moment the kernel binds it to the
+     * jail. Cleanup on RemoveJail (handle_remove). */
+    let lo0_alias = match &req.network {
+        NetworkConfig::Lo0Alias { addr } => {
+            ffi::ifconfig_lo0_alias_add(addr).map_err(|e| {
+                JaildError::Syscall {
+                    name:  "ifconfig",
+                    errno: e.raw_os_error().unwrap_or(-1),
+                    msg:   format!("{e}"),
+                }
+            })?;
+            Some(addr.clone())
+        }
+        _ => None,
+    };
+    let ip4_addr_no_cidr = lo0_alias.as_ref().map(|a| ffi::strip_cidr_suffix(a));
+
     if let Some(exec) = &req.exec {
-        return handle_create_with_exec(req, exec);
+        return handle_create_with_exec(
+            req, exec, lo0_alias, ip4_addr_no_cidr, state, state_path,
+        );
     }
 
     let spec = JailCreateSpec {
@@ -224,17 +297,23 @@ fn handle_create(
         persist:        1,
         children_max:   req.children_max as i32,
         devfs_ruleset:  req.devfs_ruleset,
+        ip4_addr:       ip4_addr_no_cidr.as_deref(),
     };
     let created = ffi::create_persistent_jail(&spec).map_err(|e| {
+        /* Roll back the lo0 alias if jail_set failed. */
+        if let Some(addr) = &lo0_alias {
+            let _ = ffi::ifconfig_lo0_alias_del(addr);
+        }
         JaildError::Syscall {
             name:  "jail_set",
             errno: e.raw_os_error().unwrap_or(-1),
             msg:   format!("{e}"),
         }
     })?;
-    info!("jaild: jail_set OK name={} jid={}", req.name, created.jid);
+    info!("jaild: jail_set OK name={} jid={} lo0_alias={:?}",
+        req.name, created.jid, lo0_alias);
 
-    state.add(&req.name, created.jid);
+    state.add(&req.name, created.jid, lo0_alias);
     if let Err(e) = state.save(state_path) {
         /* The kernel has the jail; we just couldn't persist a
          * record. Log loudly but return success to the caller —
@@ -252,8 +331,12 @@ fn handle_create(
 }
 
 fn handle_create_with_exec(
-    req:  &CreateJailRequest,
-    exec: &ExecSpec,
+    req:        &CreateJailRequest,
+    exec:       &ExecSpec,
+    lo0_alias:  Option<String>,
+    ip4_addr:   Option<String>,
+    state:      &mut PersistentState,
+    state_path: &Path,
 ) -> Result<CreateOutcome, JaildError> {
     /* Pre-resolve mount targets into absolute paths under the jail
      * root so the child can apply them with a single nmount per
@@ -295,6 +378,7 @@ fn handle_create_with_exec(
             persist:        0,    // ATTACH path: jail dies with the process
             children_max:   req.children_max as i32,
             devfs_ruleset:  req.devfs_ruleset,
+            ip4_addr:       ip4_addr.as_deref(),
         };
         if let Err(e) = ffi::jail_create_and_attach(&spec) {
             eprintln!("jaild-child: jail_create_and_attach: {e}");
@@ -318,7 +402,20 @@ fn handle_create_with_exec(
     }
 
     /* ====== parent ====== */
-    info!("jaild: pdfork ok pid={} pdfd={}", pdf.pid, pdf.procdesc_fd);
+    info!("jaild: pdfork ok pid={} pdfd={} lo0_alias={:?}",
+        pdf.pid, pdf.procdesc_fd, lo0_alias);
+
+    /* If a lo0 alias is held for this jail, track it in state so
+     * a later RemoveJail (by name from the supervisor's
+     * procdesc-EOF handler) can ifconfig -alias it. Exec'd
+     * jails use jid sentinel 0 in state — handle_remove
+     * special-cases this. */
+    if lo0_alias.is_some() {
+        state.add(&req.name, 0, lo0_alias);
+        if let Err(e) = state.save(state_path) {
+            warn!("jaild: state save after exec'd-jail create: {e}");
+        }
+    }
 
     /* jid not knowable from the parent without enumerating the
      * kernel jail list; sentinel 0. The procdesc fd is the

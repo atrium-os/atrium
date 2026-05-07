@@ -12,7 +12,7 @@
 use jaild_policy::Policy;
 
 use crate::protocol::{
-    CreateJailRequest, ExecSpec, MountKind, MountSpec,
+    CreateJailRequest, ExecSpec, MountKind, MountSpec, NetworkConfig,
 };
 #[cfg(test)]
 use crate::protocol::EnvPair;
@@ -28,6 +28,7 @@ pub fn validate_create(
     validate_path(&req.path, policy)?;
     validate_children_max(req.children_max, policy)?;
     validate_devfs_ruleset(req.devfs_ruleset, policy)?;
+    validate_network(&req.network, policy)?;
     for m in &req.mounts {
         validate_mount(m, policy)?;
     }
@@ -35,6 +36,65 @@ pub fn validate_create(
         validate_exec(exec, policy)?;
     }
     Ok(())
+}
+
+fn validate_network(net: &NetworkConfig, policy: &Policy) -> Result<(), JaildError> {
+    match net {
+        NetworkConfig::Disable => {
+            /* Always permitted. policy.network.allow_disable is
+             * documented as "always true" in the policy schema;
+             * we don't even check the field. */
+            Ok(())
+        }
+        NetworkConfig::Lo0Alias { addr } => {
+            /* Validate addr is in CIDR form; check it's
+             * contained in one of policy.network.allowed_addrs_on_lo0. */
+            if !addr.contains('/') {
+                return Err(JaildError::PolicyViolation {
+                    rule:   "network.lo0_alias.addr_format",
+                    detail: format!("addr {addr:?} must be in CIDR form (e.g. 127.10.0.5/32)"),
+                });
+            }
+            let allowed = policy.network.allowed_addrs_on_lo0
+                .iter()
+                .any(|cidr| cidr_contains(cidr, addr));
+            if !allowed {
+                return Err(JaildError::PolicyViolation {
+                    rule:   "network.lo0_alias.addr_not_in_policy",
+                    detail: format!(
+                        "addr {addr:?} not in any policy.network.allowed_addrs_on_lo0 entry"),
+                });
+            }
+            Ok(())
+        }
+        NetworkConfig::Vnet { .. } => Err(JaildError::PolicyViolation {
+            rule:   "network.vnet.unimplemented_v0",
+            detail: "vnet mode is not implemented in jaild V0 (see docs/spec/network.md §4)".into(),
+        }),
+        NetworkConfig::HostAlias { .. } => Err(JaildError::PolicyViolation {
+            rule:   "network.host_alias.unimplemented_v0",
+            detail: "host_alias mode is not implemented in jaild V0 (see docs/spec/network.md §5)".into(),
+        }),
+    }
+}
+
+/// CIDR containment: returns true if the host portion of `addr`
+/// (matching `network`'s prefix length) equals `network`'s host.
+/// Both arguments are "<dotted-quad>/<prefix>" strings; returns
+/// false on parse error.
+fn cidr_contains(network: &str, addr: &str) -> bool {
+    fn parse(s: &str) -> Option<(u32, u8)> {
+        let (ip, plen) = s.split_once('/')?;
+        let ip: std::net::Ipv4Addr = ip.parse().ok()?;
+        let plen: u8 = plen.parse().ok()?;
+        if plen > 32 { return None; }
+        Some((u32::from(ip), plen))
+    }
+    let (net_ip, net_plen) = match parse(network) { Some(t) => t, None => return false };
+    let (req_ip, _)        = match parse(addr)    { Some(t) => t, None => return false };
+    if net_plen == 0 { return true; }   // 0.0.0.0/0
+    let mask = if net_plen == 32 { !0u32 } else { !0u32 << (32 - net_plen) };
+    (net_ip & mask) == (req_ip & mask)
 }
 
 fn validate_devfs_ruleset(id: u32, policy: &Policy) -> Result<(), JaildError> {
@@ -357,6 +417,7 @@ mod tests {
             children_max:  0,
             mounts:        vec![],
             devfs_ruleset: 0,
+            network:       NetworkConfig::Disable,
             exec:          None,
         };
         validate_create(&req, &p).unwrap();
@@ -371,6 +432,7 @@ mod tests {
             children_max:  0,
             mounts:        vec![],
             devfs_ruleset: 0,
+            network:       NetworkConfig::Disable,
             exec:          None,
         };
         let err = validate_create(&req, &p).unwrap_err();
@@ -387,6 +449,7 @@ mod tests {
             children_max:  0,
             mounts:        vec![],
             devfs_ruleset: 0,
+            network:       NetworkConfig::Disable,
             exec:          None,
         }
     }
@@ -534,6 +597,66 @@ mod tests {
             gid:  1001,
         });
         validate_create(&r, &p).unwrap();
+    }
+
+    #[test]
+    fn cidr_basics() {
+        assert!(cidr_contains("127.10.0.0/24", "127.10.0.5/32"));
+        assert!(cidr_contains("127.10.0.0/16", "127.10.5.99/32"));
+        assert!(cidr_contains("0.0.0.0/0",     "8.8.8.8/32"));
+        assert!(!cidr_contains("127.10.0.0/24", "127.11.0.5/32"));
+        assert!(!cidr_contains("127.10.0.0/24", "10.0.0.5/32"));
+        assert!(!cidr_contains("not-a-cidr",    "127.10.0.5/32"));
+        assert!(!cidr_contains("127.10.0.0/24", "no-slash"));
+    }
+
+    #[test]
+    fn network_disable_always_ok() {
+        let p = load_sample_policy();
+        validate_network(&NetworkConfig::Disable, &p).unwrap();
+    }
+
+    #[test]
+    fn network_lo0_alias_in_policy_ok() {
+        let p = load_sample_policy();
+        // sample policy has 127.10.0.0/16 in allowed_addrs_on_lo0
+        validate_network(
+            &NetworkConfig::Lo0Alias { addr: "127.10.0.5/32".into() },
+            &p,
+        ).unwrap();
+    }
+
+    #[test]
+    fn network_lo0_alias_outside_policy_rejected() {
+        let p = load_sample_policy();
+        let err = validate_network(
+            &NetworkConfig::Lo0Alias { addr: "10.0.0.5/32".into() },
+            &p,
+        ).unwrap_err();
+        assert!(matches!(err,
+            JaildError::PolicyViolation { rule: "network.lo0_alias.addr_not_in_policy", .. }));
+    }
+
+    #[test]
+    fn network_lo0_alias_bad_format_rejected() {
+        let p = load_sample_policy();
+        let err = validate_network(
+            &NetworkConfig::Lo0Alias { addr: "127.10.0.5".into() },  // no CIDR
+            &p,
+        ).unwrap_err();
+        assert!(matches!(err,
+            JaildError::PolicyViolation { rule: "network.lo0_alias.addr_format", .. }));
+    }
+
+    #[test]
+    fn network_vnet_v0_rejected() {
+        let p = load_sample_policy();
+        let err = validate_network(
+            &NetworkConfig::Vnet { bridge: "br0".into(), addr: "192.168.1.1/24".into(), gateway: None },
+            &p,
+        ).unwrap_err();
+        assert!(matches!(err,
+            JaildError::PolicyViolation { rule: "network.vnet.unimplemented_v0", .. }));
     }
 
     #[test]

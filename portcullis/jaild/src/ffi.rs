@@ -70,6 +70,11 @@ pub struct JailCreateSpec<'a> {
     /// 0 = inherit host devfs (do NOT pass devfs_ruleset key to
     /// jail_set). Non-zero = pass that ruleset id.
     pub devfs_ruleset:  u32,
+    /// IPv4 address for the jail in dotted-quad form (no CIDR).
+    /// `None` = pass `ip4=disable` to jail_set; `Some(...)` =
+    /// pass `ip4.addr=<addr>`. The host-side alias must already
+    /// be present; this is just the jail_set parameter.
+    pub ip4_addr:       Option<&'a str>,
 }
 
 /// Result of a successful `jail_set(JAIL_CREATE)`. The `jid` is
@@ -89,6 +94,7 @@ pub fn create_persistent_jail(spec: &JailCreateSpec) -> io::Result<CreatedJail> 
     if spec.devfs_ruleset != 0 {
         iob.add_u32("devfs_ruleset", spec.devfs_ruleset);
     }
+    iob.add_network(spec.ip4_addr)?;
     let mut errmsg = vec![0u8; 256];
     iob.add_buf("errmsg", &mut errmsg);
     let jid = iob.run(JAIL_CREATE, &errmsg)?;
@@ -177,6 +183,7 @@ pub fn jail_create_and_attach(spec: &JailCreateSpec) -> io::Result<i32> {
     if spec.devfs_ruleset != 0 {
         iob.add_u32("devfs_ruleset", spec.devfs_ruleset);
     }
+    iob.add_network(spec.ip4_addr)?;
     let mut errmsg = vec![0u8; 256];
     iob.add_buf("errmsg", &mut errmsg);
     iob.run(JAIL_CREATE | JAIL_ATTACH, &errmsg)
@@ -193,6 +200,7 @@ struct IovBuilder {
     vals:   Vec<CString>,        // string values
     i32s:   Vec<i32>,            // i32 values
     u32s:   Vec<u32>,            // u32 values
+    bufs:   Vec<Vec<u8>>,        // raw byte values (e.g. struct in_addr)
     /* For each entry, what kind of payload it has. The actual
      * iovec is built inside `run` from these arrays. */
     entries: Vec<Entry>,
@@ -205,7 +213,7 @@ enum Entry {
 }
 
 #[derive(Clone, Copy)]
-enum ValKind { Str, I32, U32 }
+enum ValKind { Str, I32, U32, Bytes }
 
 impl IovBuilder {
     fn new() -> Self {
@@ -214,6 +222,7 @@ impl IovBuilder {
             vals: Vec::with_capacity(4),
             i32s: Vec::with_capacity(2),
             u32s: Vec::with_capacity(2),
+            bufs: Vec::with_capacity(2),
             entries: Vec::with_capacity(8),
         }
     }
@@ -258,6 +267,41 @@ impl IovBuilder {
         });
     }
 
+    /// Add a raw-bytes value (e.g. a `struct in_addr`).
+    fn add_bytes(&mut self, key: &str, bytes: Vec<u8>) {
+        self.keys.push(CString::new(key).expect("static key has nul?"));
+        self.bufs.push(bytes);
+        self.entries.push(Entry::KeyVal {
+            key_idx: self.keys.len() - 1,
+            val_idx: self.bufs.len() - 1,
+            kind:    ValKind::Bytes,
+        });
+    }
+
+    /// Add the network configuration to the iovec. Either
+    /// `ip4=disable` (no addr) or `ip4.addr=<struct in_addr>`.
+    fn add_network(&mut self, ip4_addr: Option<&str>) -> io::Result<()> {
+        match ip4_addr {
+            None => {
+                /* `ip4=disable`. Value is the integer constant
+                 * JAIL_SYS_DISABLE = 0 (per <sys/jail.h>). */
+                self.add_i32("ip4", 0);
+                Ok(())
+            }
+            Some(addr) => {
+                /* "ip4.addr" expects a struct in_addr (4 bytes
+                 * in network byte order). Ipv4Addr::octets()
+                 * returns exactly that. */
+                let v4: std::net::Ipv4Addr = addr.parse().map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidInput,
+                        format!("ip4.addr {addr:?}: {e}"))
+                })?;
+                self.add_bytes("ip4.addr", v4.octets().to_vec());
+                Ok(())
+            }
+        }
+    }
+
     fn run(&self, flags: i32, errmsg: &[u8]) -> io::Result<i32> {
         let mut iov: Vec<libc::iovec> = Vec::with_capacity(self.entries.len() * 2);
         for entry in &self.entries {
@@ -286,6 +330,13 @@ impl IovBuilder {
                             iov.push(libc::iovec {
                                 iov_base: (&self.u32s[val_idx] as *const u32) as *mut _,
                                 iov_len:  std::mem::size_of::<u32>(),
+                            });
+                        }
+                        ValKind::Bytes => {
+                            let b = &self.bufs[val_idx];
+                            iov.push(libc::iovec {
+                                iov_base: b.as_ptr() as *mut _,
+                                iov_len:  b.len(),
                             });
                         }
                     }
@@ -530,4 +581,80 @@ pub fn close_fd(fd: i32) -> io::Result<()> {
 pub fn child_exit(code: i32) -> ! {
     // SAFETY: _exit is the safest call there is; never returns.
     unsafe { libc::_exit(code); }
+}
+
+// ====================================================================
+// Network: lo0 alias add/remove via ifconfig(8) shellout.
+//
+// V0 uses Command shellout for simplicity. The alternative —
+// SIOCAIFADDR via ioctl on a raw socket — is the kernel-direct path
+// but requires more code. ifconfig(8) is stable, audited, and
+// invoked exactly the way an operator would do it manually. The
+// per-jail rate is ~1 invocation per launch, so process-spawn
+// overhead is irrelevant.
+// ====================================================================
+
+/// Add a /32 alias on `lo0`. `addr` is in CIDR form
+/// (e.g. "127.10.0.5/32"). Idempotent: an EEXIST result (alias
+/// already present) is folded to Ok — happens during a relaunch
+/// when the previous jail's alias wasn't cleaned up cleanly.
+pub fn ifconfig_lo0_alias_add(addr: &str) -> io::Result<()> {
+    /* Refuse args that aren't a clean CIDR string — defends
+     * against shell-metacharacter injection through a malformed
+     * policy / spec. The validator should already have caught
+     * this; belt-and-braces. */
+    if !is_safe_cidr(addr) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput,
+            format!("addr {addr:?} contains unsafe characters")));
+    }
+    let out = std::process::Command::new("ifconfig")
+        .args(["lo0", "inet", addr, "alias"])
+        .output()?;
+    if out.status.success() {
+        return Ok(());
+    }
+    /* "file already exists" → EEXIST → idempotent. ifconfig
+     * spelling: "ifconfig: ioctl SIOCAIFADDR: File exists" */
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if stderr.contains("File exists") || stderr.contains("EEXIST") {
+        return Ok(());
+    }
+    Err(io::Error::new(io::ErrorKind::Other,
+        format!("ifconfig lo0 inet {addr} alias: {stderr}")))
+}
+
+/// Remove a /32 alias from `lo0`. Idempotent: ENOENT (alias
+/// already gone) is folded to Ok.
+pub fn ifconfig_lo0_alias_del(addr: &str) -> io::Result<()> {
+    if !is_safe_cidr(addr) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput,
+            format!("addr {addr:?} contains unsafe characters")));
+    }
+    let out = std::process::Command::new("ifconfig")
+        .args(["lo0", "inet", addr, "-alias"])
+        .output()?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if stderr.contains("Can't assign") || stderr.contains("does not exist") {
+        return Ok(());
+    }
+    Err(io::Error::new(io::ErrorKind::Other,
+        format!("ifconfig lo0 inet {addr} -alias: {stderr}")))
+}
+
+/// Strip the "/<prefix>" suffix to yield a bare dotted-quad
+/// suitable for jail_set's "ip4.addr" parameter. Input must be
+/// CIDR-validated already.
+pub fn strip_cidr_suffix(addr_with_cidr: &str) -> String {
+    addr_with_cidr.split('/').next().unwrap_or(addr_with_cidr).to_string()
+}
+
+fn is_safe_cidr(s: &str) -> bool {
+    /* Accept exactly digits, dots, and a single slash. No
+     * shell metacharacters can sneak through. */
+    !s.is_empty()
+        && s.bytes().all(|b| b.is_ascii_digit() || b == b'.' || b == b'/')
+        && s.matches('/').count() <= 1
 }

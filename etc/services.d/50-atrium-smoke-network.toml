@@ -1,0 +1,38 @@
+# /etc/atrium/services.d/50-atrium-smoke-network.toml
+#
+# Network smoke service: an exec'd jail with lo0_alias.
+# Validates the full V0 network path: jaild ifconfig + ip4.addr
+# in jail_set + state-tracked alias + supervisor RemoveJail-by-
+# name on procdesc EOF cleanly removing the alias.
+#
+# We use atrium-jaild check-policy as the jailed binary again
+# (it exits cleanly in <100 ms, then the supervisor restarts).
+# Per the failure-budget model, 0s lifetime + budget=12 gives
+# us ~3 retries before give-up.
+
+enabled       = true
+name          = "atrium-smoke-network"
+path          = "/"
+children_max  = 0
+devfs_ruleset = 0
+
+[network]
+mode = "lo0_alias"
+addr = "127.10.0.99/32"
+
+[exec]
+path = "/usr/local/bin/atrium-jaild"
+argv = ["atrium-jaild", "check-policy",
+        "--policy", "/etc/atrium/jaild.policy.toml"]
+uid  = 1001
+gid  = 1001
+
+[[exec.env]]
+key   = "PATH"
+value = "/bin:/usr/bin"
+
+[supervision]
+restart                       = "always"
+restart_after_secs            = 1
+failure_budget_secs           = 12
+min_lifetime_for_success_secs = 5
