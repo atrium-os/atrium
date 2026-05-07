@@ -19,8 +19,10 @@
 //!     frag.
 //!   - Assumes modern Vulkan SPIR-V (StorageBuffer storage class for
 //!     SSBOs, not the legacy Uniform + BufferBlock decoration). True
-//!     for glslangValidator with --target-env vulkan1.3 (what
-//!     `bundles/atrium-core/build.sh` runs).
+//!     for glslangValidator with --target-env vulkan1.3 (what the
+//!     pre-Slang `bundles/*/build.sh` ran) AND for slangc with
+//!     `-target spirv` (no `-profile glsl_460` — that flag would
+//!     force the legacy encoding).
 
 use std::collections::HashMap;
 

@@ -1,55 +1,79 @@
 #!/bin/sh
-# Compile atrium-text's GLSL sources to SPIR-V via glslangValidator.
+# Compile atrium-core's Slang sources to SPIR-V via slangc.
 #
-# .spv files land alongside their .comp/.vert/.frag sources and are
-# .gitignored — rebuild from source on every developer machine.
+# Why Slang (decided 2026-05-07):
+#  - Vulkan's actual native input is SPIR-V; the source language is
+#    our choice. None of GLSL/HLSL/Slang/WGSL is privileged.
+#  - Slang is shader-specific (no GL/DX heritage), Khronos-stewarded,
+#    Apache-2.0 with LLVM exception (matches Atrium's permissive-only
+#    licensing policy).
+#  - Multi-backend emit (SPIR-V / DXIL / Metal / CUDA from one source)
+#    means future Atrium-on-Metal / -on-Direct3D paths reuse these
+#    shaders unchanged.
 #
-# Run from anywhere:
-#   ~/src/fresco-poc/bundles/atrium-core/build.sh
+# Migration history:
+#  - pre-2026-05-07: GLSL via glslangValidator.
+#  - 2026-05-07:     migrated to Slang. Same SPIR-V output binary
+#                    interface; renderer code unchanged.
 #
-# Step 4's bundle loader reads the .spv files at server startup and
-# validates them with spirv-val before AOT-compiling pipelines.
+# CRITICAL: do NOT pass `-profile glsl_460` to slangc. That flag forces
+# the legacy `BufferBlock + Uniform SC` SSBO encoding, which fresco-
+# vulkan's reflect.rs treats as a UBO, blowing the descriptor pool.
+# Plain `-target spirv` emits the modern `Block + StorageBuffer SC`
+# style that matches what glslangValidator was producing.
+#
+# .spv files land alongside their .slang sources and are .gitignored;
+# rebuild from source on every developer machine.
 
 set -eu
 
 cd "$(dirname "$0")"
 
-GLSLANG="${GLSLANG:-glslangValidator}"
+SLANGC="${SLANGC:-slangc}"
 SPIRV_VAL="${SPIRV_VAL:-spirv-val}"
 
-if ! command -v "$GLSLANG" >/dev/null; then
-    echo "error: $GLSLANG not in PATH" >&2
-    echo "       brew install glslang  (macOS) / pkg install glslang (FreeBSD)" >&2
-    exit 1
+if ! command -v "$SLANGC" >/dev/null; then
+    if [ -x "$HOME/src/slang-bin/bin/slangc" ]; then
+        SLANGC="$HOME/src/slang-bin/bin/slangc"
+    else
+        echo "error: slangc not in PATH and not at \$HOME/src/slang-bin/bin/" >&2
+        echo "       see https://github.com/shader-slang/slang/releases" >&2
+        exit 1
+    fi
 fi
 
-# Vulkan target (so SPIR-V uses Vulkan-style binding decorations,
-# entry-point semantics, etc., not the OpenGL defaults).
-VFLAGS="-V --target-env vulkan1.3"
-
-compile() {
-    src=$1
-    # Append .spv (don't replace extension), so .vert/.frag/.comp
-    # are preserved in the output name. Otherwise `pipe_rectangle.vert`
-    # and `pipe_rectangle.frag` would BOTH compile to the same
-    # `pipe_rectangle.spv` and clobber each other.
-    out="${src}.spv"
-    echo "  $src → ${out#./}"
-    "$GLSLANG" $VFLAGS -o "$out" "$src" >/dev/null
+compile_pipe() {
+    src="$1"                 # e.g. pipelines/pipe_rectangle.slang
+    base="${src%.slang}"
+    echo "  $src → ${base}.{vert,frag}.spv"
+    "$SLANGC" "$src" -target spirv -entry vert_main -stage vertex   -o "${base}.vert.spv"
+    "$SLANGC" "$src" -target spirv -entry frag_main -stage fragment -o "${base}.frag.spv"
     if command -v "$SPIRV_VAL" >/dev/null; then
-        "$SPIRV_VAL" "$out"
+        "$SPIRV_VAL" "${base}.vert.spv"
+        "$SPIRV_VAL" "${base}.frag.spv"
     fi
 }
 
-echo "compiling compute shaders:"
-for f in compute/*.comp; do
-    compile "$f"
-done
+compile_compute() {
+    src="$1"
+    base="${src%.slang}"
+    echo "  $src → ${base}.comp.spv"
+    "$SLANGC" "$src" -target spirv -entry comp_main -stage compute -o "${base}.comp.spv"
+    if command -v "$SPIRV_VAL" >/dev/null; then
+        "$SPIRV_VAL" "${base}.comp.spv"
+    fi
+}
 
 echo "compiling render pipelines:"
-for f in pipelines/*.vert pipelines/*.frag; do
+for f in pipelines/*.slang; do
     [ -e "$f" ] || continue
-    compile "$f"
+    compile_pipe "$f"
+done
+
+echo "compiling compute kernels:"
+for f in compute/*.slang; do
+    [ -e "$f" ] || continue
+    compile_compute "$f"
 done
 
 echo "ok — all .spv built and validated"

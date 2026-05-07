@@ -1,0 +1,68 @@
+// pipe_glyph_run.slang — atrium-text's `glyph_run` op render pipeline.
+//
+// One instance per glyph (the compute kernel expanded each scene node
+// into N InstanceRecords). 4 vertices per instance form a quad via
+// TRIANGLE_STRIP. UVs are interpolated from the InstanceRecord's
+// src_rect; the fragment shader samples the R8 coverage atlas with
+// them.
+//
+// Vulkan default clip space is Y-down; identity mapping from
+// top-left-pixel wire convention.
+
+struct InstanceRecord {
+    float4 dst_rect;       // x, y, w, h in window pixels
+    float4 src_rect;       // u0, v0, u1, v1 in atlas UV [0, 1]
+    float4 color;
+};
+
+[[vk::binding(0, 0)]]
+StructuredBuffer<InstanceRecord> instances;
+
+[[vk::binding(1, 0)]]
+cbuffer Screen {
+    float2 size;
+};
+
+[[vk::binding(2, 0)]]
+Sampler2D atlas;
+
+struct VSOutput {
+    float4 position : SV_Position;
+    float2 uv       : TEXCOORD0;
+    float4 color    : COLOR0;
+};
+
+[shader("vertex")]
+VSOutput vert_main(uint vertex_index   : SV_VertexID,
+                   uint instance_index : SV_InstanceID)
+{
+    InstanceRecord inst = instances[instance_index];
+
+    /* TRIANGLE_STRIP corner ordering, [0,1]^2 unit square. */
+    float2 unit = float2(
+        float((vertex_index & 1) != 0),
+        float((vertex_index & 2) != 0)
+    );
+
+    float2 pos  = inst.dst_rect.xy + unit * inst.dst_rect.zw;
+    float2 clip = (pos / size) * 2.0 - 1.0;
+
+    VSOutput o;
+    o.position = float4(clip, 0.0, 1.0);
+    o.uv       = lerp(inst.src_rect.xy, inst.src_rect.zw, unit);
+    o.color    = inst.color;
+    return o;
+}
+
+/* Fragment shader: samples R8 atlas for glyph coverage, emits
+ * straight-alpha colour. Pipeline blend state is
+ * SRC_ALPHA / ONE_MINUS_SRC_ALPHA (non-premul). Emitting premul
+ * here would double-multiply coverage and produce visible darker
+ * outlines — exactly the shape of the bug we're fixing. */
+[shader("fragment")]
+float4 frag_main(float2 uv    : TEXCOORD0,
+                 float4 color : COLOR0) : SV_Target
+{
+    float coverage = atlas.Sample(uv).r;
+    return float4(color.rgb, color.a * coverage);
+}

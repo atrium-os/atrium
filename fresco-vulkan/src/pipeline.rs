@@ -258,8 +258,19 @@ fn create_render_pipeline(
             .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
             .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
             .color_blend_op(vk::BlendOp::ADD)
-            .src_alpha_blend_factor(vk::BlendFactor::ONE)
-            .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
+            /* Preserve the framebuffer alpha channel (cleared to 1.0
+             * each frame). The previous shape — src=ONE, dst=ZERO —
+             * wrote src.a=coverage straight into the framebuffer for
+             * glyph_run, producing transparent regions inside glyph
+             * cells. Downstream consumers (PNG readback in the smoke
+             * harness, future scanout that may premultiply, alpha-
+             * compositing viewers) interpreted that as "this pixel is
+             * transparent" and the visible-glyph-shape area dropped
+             * out, leaving only the antialiased glyph outline visible.
+             * src=ZERO, dst=ONE keeps the cleared 1.0 in the FB alpha
+             * regardless of what shaders write to src.a. */
+            .src_alpha_blend_factor(vk::BlendFactor::ZERO)
+            .dst_alpha_blend_factor(vk::BlendFactor::ONE)
             .alpha_blend_op(vk::BlendOp::ADD),
     ];
     let color_blend = vk::PipelineColorBlendStateCreateInfo::default()

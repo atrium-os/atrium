@@ -128,6 +128,44 @@ So a C-preferring contributor can:
 
 The only friction is "you can't write a privileged Atrium daemon for our reference desktop in C, because we already wrote it in Rust." That's a packaging choice, not an exclusionary one.
 
+## Shader source language
+
+Shaders compile to SPIR-V (Vulkan's native input). The source
+language is **Slang** as of 2026-05-07. Slang is Khronos-stewarded,
+Apache-2.0 with LLVM exception (matches Atrium's permissive-only
+licensing policy), has no GL/DX heritage, and emits to SPIR-V plus
+DXIL / Metal / CUDA / GLSL / HLSL — opening the door to Atrium
+running on non-Vulkan backends (Metal native, Direct3D guest)
+without re-authoring shaders.
+
+Pre-2026-05-07 history: shaders were authored in GLSL via
+glslangValidator. The GL ancestry was a cosmetic concern (modern
+Vulkan-flavoured GLSL is essentially a separate language) but Slang's
+multi-backend emit is a genuine architectural upside. Migration cost
+was small (~7 shaders, all under 100 lines each), and folded a
+pre-existing glyph-rendering bug fix into the same change.
+
+`rust-gpu` remains a tracked future option: write shaders in an
+actual Rust subset, fully aligning with the userspace-Rust policy.
+Deferred pending ecosystem maturity (revisit post-D3).
+
+### Slang invocation rules (important)
+
+`bundles/*/build.sh` invokes slangc as:
+
+```
+slangc <src>.slang -target spirv -entry <name> -stage <stage> -o <out>.spv
+```
+
+**Do not pass `-profile glsl_460`.** That flag forces Slang into
+GL-mimic mode which emits the legacy `BufferBlock` decoration +
+`Uniform` storage class for storage buffers. fresco-vulkan's reflect
+module treats that pair as a UBO (because it is, by name) and the
+descriptor pool runs out. Without `-profile glsl_460`, Slang emits
+the modern Vulkan-1.1+ `Block` decoration + `StorageBuffer` storage
+class, which is what glslangValidator-with-vulkan1.3 was producing
+and what the reflector expects.
+
 ## What this is NOT
 
 - **Atrium is not a "Rust OS."** It's not Redox. The kernel is FreeBSD; large parts of base are C; the ports tree is mostly C. We are not on a mission to rewrite anything that already works.
