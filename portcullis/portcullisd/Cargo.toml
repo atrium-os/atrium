@@ -6,13 +6,23 @@ license.workspace     = true
 repository.workspace  = true
 description = "Portcullis policy daemon. Long-running, holds the per-user grant policy in memory and serves authorize/grant/revoke requests over a Unix-domain socket."
 
+[lib]
+name = "portcullisd"
+path = "src/lib.rs"
+
 [[bin]]
 name = "portcullisd"
 path = "src/main.rs"
+
+[[bin]]
+name = "atrium-portcullisd-jclient"
+path = "src/bin/jclient.rs"
 
 [dependencies]
 portcullis-toml   = { path = "../portcullis-toml" }
 portcullis-jail   = { path = "../portcullis-jail" }
 portcullis-policy = { path = "../portcullis-policy" }
 portcullis-ipc    = { path = "../portcullis-ipc" }
+jaild             = { path = "../jaild" }
 libc              = "0.2"
+serde_json        = "1"

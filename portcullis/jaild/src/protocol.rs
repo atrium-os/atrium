@@ -150,12 +150,16 @@ pub enum Response {
     /// Request was structurally valid but rejected by jaild's
     /// policy (mount source not allowed, name pattern bad, …).
     /// Caller can surface this to the user; it's not retryable.
-    PolicyDenied { rule: &'static str, detail: String },
+    /// `rule` is owned so the response round-trips through serde
+    /// (deserialization can't borrow). Server-side this comes
+    /// from `JaildError::PolicyViolation { rule: &'static str }`
+    /// — the conversion to owned happens at the dispatch boundary.
+    PolicyDenied { rule: String, detail: String },
 
     /// Request was valid + allowed but the underlying syscall
     /// failed. Typically transient (ENOMEM, EAGAIN) or a kernel
     /// configuration issue.
-    SyscallFailed { name: &'static str, errno: i32, msg: String },
+    SyscallFailed { name: String, errno: i32, msg: String },
 
     /// Catch-all for anything that doesn't fit the above. Used
     /// for malformed JSON, oversize frames, etc. Caller should
