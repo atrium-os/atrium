@@ -1,0 +1,12 @@
+[package]
+name        = "jaild-policy"
+version.workspace     = true
+edition.workspace     = true
+license.workspace     = true
+repository.workspace  = true
+description = "Schema + parser for /etc/atrium/jaild.policy.toml — the allow-list jaild validates every request against. Pure data; no jail / IPC / privilege code. Spec: docs/spec/jaild-policy.md."
+
+[dependencies]
+serde      = { version = "1", features = ["derive"] }
+toml       = "0.8"
+thiserror  = "1"

@@ -1,0 +1,241 @@
+# /etc/atrium/jaild.policy.toml
+#
+# Atrium jaild allow-list. Single source of truth for what the
+# privileged jail-creation broker (jaild) will permit. Spec:
+# docs/spec/jaild-policy.md.
+#
+# Conservative by default. Each entry explicit. No wildcards
+# except where called out.
+
+schema_version = 1
+
+
+# ---------------------------------------------------------------
+# Filesystem mount sources permitted to be nullfs-mounted into a
+# jail. Children of jaild-jail can only have mounts whose source
+# path is in one of these sets, with the matching ro/rw flag.
+# ---------------------------------------------------------------
+[mount_sources]
+ro_paths = [
+    # Atrium runtime libs, bundles, fonts (read by every jailed
+    # process).
+    "/usr/local/lib",
+    "/usr/local/share/atrium",
+    "/usr/local/etc/fonts",
+
+    # Auth state — only mounted into vestibulum, but the source
+    # must be on the allow-list to be eligible.
+    "/etc/master.passwd",
+    "/etc/login.conf",
+    "/etc/group",
+    "/etc/pam.d",
+
+    # Atrium config (jaild policy itself, services manifests).
+    "/etc/atrium",
+]
+rw_paths = [
+    # Aqueduct service-socket directory (all jails that talk to
+    # frescod / portcullisd / etc. mount this rw to bind/connect
+    # their respective sockets).
+    "/var/run/aqueduct",
+
+    # Atrium logs.
+    "/var/log/atrium",
+
+    # Atrium shared state — session records, jaild persistent
+    # state, etc.
+    "/var/run/atrium",
+]
+rw_patterns = [
+    # Per-user home — mounted only into that user's supervisor
+    # jail and into apps the user grants the `home` capability to.
+    "/usr/home/*",
+
+    # Per-user persistent state under Atrium control (db, prefs).
+    "/var/db/atrium/users/*",
+]
+
+
+# ---------------------------------------------------------------
+# Devfs rulesets permitted in jail specs. Names are defined in
+# /etc/devfs.rules; jaild does not parse those — it just refuses
+# names not in this list.
+# ---------------------------------------------------------------
+[devfs_rulesets]
+allowed = [
+    "atrium-baseline",   # null, zero, random, urandom, tty
+    "atrium-gpu",        # baseline + atrium-gpu0
+    "atrium-input",      # baseline + input/event*
+    "atrium-tty",        # baseline + a specific allocated tty
+]
+
+
+# ---------------------------------------------------------------
+# Binary paths jaild may execve. Prefix match.
+# ---------------------------------------------------------------
+[exec_paths]
+allowed_prefixes = [
+    "/usr/local/bin/atrium-",
+    "/usr/local/sbin/atrium-",
+    "/usr/local/share/atrium/apps/",   # installed Atrium apps
+]
+
+
+# ---------------------------------------------------------------
+# Environment variable allow-list for execve. Anything not
+# matching is dropped.
+# ---------------------------------------------------------------
+[env]
+allowed_keys = [
+    "USER", "HOME", "LOGNAME", "PATH", "SHELL",
+    "TERM", "LANG", "LC_ALL", "TZ",
+]
+allowed_prefixes = [
+    "ATRIUM_",        # all Atrium-namespaced vars
+]
+
+
+# ---------------------------------------------------------------
+# UID / GID constraints.
+# ---------------------------------------------------------------
+[uid]
+min_user_uid        = 1000
+max_user_uid        = 65000
+allowed_system_uids = [
+    # 65 = _frescod        (reserved; not yet allocated in v1)
+    # 66 = _atrium-devevents
+    # 67 = _atrium-portcullisd
+]
+
+[gid]
+allowed_system_gids = [
+    # mirrors uid table
+]
+
+
+# ---------------------------------------------------------------
+# Maximum children.max value any single jail may declare.
+# ---------------------------------------------------------------
+[children_max]
+max = 64
+
+
+# ---------------------------------------------------------------
+# Network policy.
+# ---------------------------------------------------------------
+[network]
+allow_disable = true       # ip4=disable always permitted
+allow_host    = false      # cannot share host stack (use VNET or disable)
+allowed_addrs_on_lo0 = [
+    "127.10.0.0/16",       # loopback range reserved for atrium services
+]
+
+
+# ---------------------------------------------------------------
+# GPU driver attestation. Direct-GPU capability cannot be granted
+# until the bound driver is `production` AND
+# `isolation_test_passed`.
+# ---------------------------------------------------------------
+[gpu_drivers.attested.atrium-virtio-gpu]
+status                  = "production"
+isolation_test_passed   = true
+isolation_test_date     = "2026-05-07"
+isolation_test_commit   = "0000000"          # fill at test-run time
+notes = """
+D0 path. Isolation enforced by layered chain: kmod per-fd handle
+table → virtio-gpu spec context ownership → host venus
+per-VkInstance → MoltenVK MTLDevice context → Apple GPU IOMMU on
+M4 Max. See docs/spec/gpu-isolation.md.
+"""
+
+
+# ---------------------------------------------------------------
+# Named profiles for system services. portcullisd may only ask
+# jaild to start a service if the request matches one of these
+# stanzas; jaild rejects with EPERM otherwise.
+# ---------------------------------------------------------------
+[services.frescod]
+exec_path             = "/usr/local/bin/atrium-frescod"
+allowed_devfs_ruleset = "atrium-gpu"
+required_mounts_ro    = [
+    "/usr/local/lib",
+    "/usr/local/share/atrium",
+    "/usr/local/etc/fonts",
+]
+required_mounts_rw    = [
+    "/var/run/aqueduct",
+    "/var/log/atrium",
+]
+network      = "disable"
+uid          = "root"          # owns /dev/atrium-gpu0
+children_max = 0
+
+[services.atrium-devevents]
+exec_path             = "/usr/local/bin/atrium-devevents"
+allowed_devfs_ruleset = "atrium-input"
+required_mounts_ro    = [
+    "/usr/local/lib",
+]
+required_mounts_rw    = [
+    "/var/run/aqueduct",
+    "/var/log/atrium",
+]
+network      = "disable"
+uid          = "root"
+children_max = 0
+
+[services.vestibulum]
+exec_path             = "/usr/local/bin/atrium-vestibulum"
+allowed_devfs_ruleset = "atrium-baseline"
+required_mounts_ro    = [
+    "/usr/local/lib",
+    "/usr/local/share/atrium",
+    "/usr/local/etc/fonts",
+    "/etc/master.passwd",
+    "/etc/login.conf",
+    "/etc/group",
+]
+required_mounts_rw    = [
+    "/var/run/aqueduct",
+]
+network      = "disable"
+uid          = "root"          # needs to read /etc/master.passwd
+children_max = 0
+
+[services.atrium-supervisor]
+# Per-user supervisor. uid is overridden per-instance to the
+# logged-in user; here we just declare "user" rather than a
+# specific uid.
+exec_path             = "/usr/local/bin/atrium-supervisor"
+allowed_devfs_ruleset = "atrium-baseline"
+required_mounts_ro    = [
+    "/usr/local/lib",
+    "/usr/local/share/atrium",
+    "/usr/local/etc/fonts",
+]
+required_mounts_rw    = [
+    "/var/run/aqueduct",
+    # /usr/home/<user>     filled in per-instance
+    # /var/db/atrium/users/<user>     filled in per-instance
+]
+allowed_extra_mounts_rw = [
+    # User-supervisor may also rw-mount these globs at jaild's
+    # discretion when portcullisd asks; matched against
+    # mount_sources.rw_patterns.
+    "/usr/home/*",
+    "/var/db/atrium/users/*",
+]
+network      = "disable"
+uid          = "user"          # overridden by request to specific uid
+children_max = 32              # for app jails
+
+
+# ---------------------------------------------------------------
+# Constraints for user-launched apps (per-app jails). The actual
+# capability set comes from each app's atrium.toml; jaild enforces
+# the outer envelope.
+# ---------------------------------------------------------------
+[apps]
+allowed_exec_root         = "/usr/local/share/atrium/apps"
+default_devfs_ruleset     = "atrium-baseline"
+max_simultaneous_per_user = 32
