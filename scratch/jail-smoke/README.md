@@ -23,21 +23,49 @@ Test 2: jail_set is BLOCKED in Capsicum mode
         → portcullisd cannot use Capsicum + dynamic jail creation
 ```
 
-## Architectural decision (2026-05-07)
+## Architectural decision (2026-05-07, revised)
 
-`portcullisd` runs inside a parent jail with `children.max>0`,
-**not** under Capsicum. The parent jail is the containment boundary;
-giving it up would let a portcullisd compromise touch arbitrary
-host filesystems, the network stack, kernel modules, etc. Capsicum
-would be additional defence-in-depth, but losing dynamic jail
-creation is too steep a cost. Pre-allocating a jail pool (so
-Capsicum-mode portcullisd could `jail_attach` instead of
-`jail_set`) is rejected: caps simultaneous apps, adds bookkeeping,
-buys little.
+Initial reading of test 2 was "portcullisd can't be Capsicum'd; lean
+on the parent jail." Revised after considering the OpenSSH-style
+privsep pattern.
 
-This means: every Atrium process runs jailed. portcullisd's parent
-jail must be a superset of all capability mount sources (devices,
-ro library trees, aqueduct socket dir, user home tree). Children
-inherit subsets. Documented in
-`docs/spec/portcullis.md` §4 and in RUNBOOK V7-era architecture
-notes.
+**Final architecture (validated by `jaild-privsep.c`):**
+
+```
+host
+└── jaild-jail              tiny privileged broker; ONLY caller of
+    │                       jail_set(2). ~500 LoC, audited byte-by-byte.
+    │                       Validates each request against an allow-list
+    │                       of mount sources, devfs rulesets, exec paths.
+    │                       Cannot itself be Capsicum'd.
+    │
+    ├── portcullisd-jail    policy daemon; cap_enter()s after init.
+    │                       Opens jaild socket fd at startup, keeps it
+    │                       across cap_enter. Sends jail-creation
+    │                       requests over the socket; receives jids back.
+    │                       Confined by jail + Capsicum.
+    │
+    ├── frescod             every other Atrium process is a sibling
+    ├── atrium-devevents    under jaild-jail, created on portcullisd's
+    ├── vestibulum          request via jaild.
+    ├── user-N-supervisor
+    │   ├── apps
+    │   └── ...
+    └── ...
+```
+
+`jaild-privsep.c` (run on 16.0-CURRENT 2026-05-07) confirms:
+- portcullisd in Capsicum CAN read/write a pre-opened socket fd
+- portcullisd in Capsicum CANNOT `open()` arbitrary files (`ECAPMODE`)
+- portcullisd in Capsicum CANNOT call `jail_set` (`ECAPMODE`)
+- jaild-on-the-other-end can call `jail_set` and return the jid
+- the request/response round-trip works end-to-end despite confinement
+- jaild's allow-list rejects disallowed names with `EPERM`
+
+This is the OpenSSH/qmail privsep pattern. Trade-off accepted: one
+extra long-running daemon (jaild) buys us a Capsicum'd portcullisd
+plus a tiny audited TCB for the privileged operation. The "only
+caller of jail_set" is now ~500 LoC instead of all of portcullisd.
+
+To be folded into `docs/spec/portcullis.md` §4 when D2.5
+implementation begins.
