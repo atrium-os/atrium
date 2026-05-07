@@ -29,20 +29,29 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use jaild::protocol::{Request, Response};
+use jaild::protocol::{MountKind, MountSpec, Request, Response};
 use log::{error, info, warn};
 use portcullisd::jaild_client::Client;
 use portcullisd::supervisor::Supervisor;
-use portcullisd::system_services::{self, LoadOutcome};
+use portcullisd::system_services::{self, LoadOutcome, ManifestVolumeKind, ServiceManifest};
+use portcullisd::volumes_client;
 
 const DEFAULT_SOCKET: &str = "/var/run/atrium/jaild.sock";
 const DEFAULT_SVCDIR: &str = "/etc/atrium/services.d";
+const DEFAULT_VOLUMES_SOCKET: &str = "/var/run/atrium/atrium-volumes.sock";
 
 fn usage() -> ExitCode {
     eprintln!("\
 usage:
   atrium-portcullisd-bootstrap
-        [--socket <path>]            (default: {DEFAULT_SOCKET})
+        [--socket <path>]            jaild socket
+                                     (default: {DEFAULT_SOCKET})
+        [--volumes-socket <path>]    atrium-volumes socket
+                                     (default: {DEFAULT_VOLUMES_SOCKET};
+                                     pass empty to skip [[volumes]]
+                                     resolution — manifests with
+                                     persistent volumes will then
+                                     fail to launch)
         [--services-dir <path>]      (default: {DEFAULT_SVCDIR})
         [--once]                     launch + exit (no supervision;
                                      exec'd jails die when fd closes)
@@ -57,23 +66,34 @@ fn main() -> ExitCode {
         env_logger::Env::default().default_filter_or("info"),
     ).init();
 
-    let mut socket_path  = PathBuf::from(DEFAULT_SOCKET);
-    let mut services_dir = PathBuf::from(DEFAULT_SVCDIR);
-    let mut once         = false;
-    let mut dry_run      = false;
+    let mut socket_path     = PathBuf::from(DEFAULT_SOCKET);
+    let mut volumes_socket  = Some(PathBuf::from(DEFAULT_VOLUMES_SOCKET));
+    let mut services_dir    = PathBuf::from(DEFAULT_SVCDIR);
+    let mut once            = false;
+    let mut dry_run         = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--socket"        => match args.next() {
+            "--socket"          => match args.next() {
                 Some(v) => socket_path = v.into(), None => return usage(),
             },
-            "--services-dir"  => match args.next() {
+            "--volumes-socket"  => match args.next() {
+                Some(v) => {
+                    volumes_socket = if v.is_empty() {
+                        None
+                    } else {
+                        Some(v.into())
+                    };
+                },
+                None => return usage(),
+            },
+            "--services-dir"    => match args.next() {
                 Some(v) => services_dir = v.into(), None => return usage(),
             },
-            "--once"          => once    = true,
-            "--dry-run"       => dry_run = true,
-            "--help" | "-h"   => return usage(),
+            "--once"            => once    = true,
+            "--dry-run"         => dry_run = true,
+            "--help" | "-h"     => return usage(),
             other => { eprintln!("unknown arg: {other}"); return ExitCode::from(2); }
         }
     }
@@ -110,6 +130,23 @@ fn main() -> ExitCode {
         }
     };
 
+    /* Optional atrium-volumes connection. None = manifests with
+     * `[[volumes]]` of `kind = "persistent"` will fail; tmpfs
+     * still works (no allocator needed). */
+    let mut volumes = match &volumes_socket {
+        Some(path) => match volumes_client::Client::connect(path) {
+            Ok(c) => {
+                info!("connected to atrium-volumes at {}", path.display());
+                Some(c)
+            }
+            Err(e) => {
+                error!("connect atrium-volumes socket {}: {e}", path.display());
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+
     /* The supervisor takes ownership of the jaild connection and
      * reuses it for relaunches — opening a second connection on a
      * single-threaded jaild deadlocks. In --once mode we use
@@ -130,7 +167,25 @@ fn main() -> ExitCode {
     let mut launch_failures = 0;
 
     for m in enabled {
-        let req = Request::CreateJail(m.to_create_request());
+        let mut create_req = m.to_create_request();
+
+        /* Resolve [[volumes]] before launching: ask atrium-volumes
+         * to provision each persistent volume, then append the
+         * returned host paths as rw_nullfs mounts. tmpfs volumes
+         * become Tmpfs mounts directly (no allocator). cas
+         * volumes are V1. */
+        if !m.volumes.is_empty() {
+            match resolve_volumes(&m, &mut volumes) {
+                Ok(extra_mounts) => create_req.mounts.extend(extra_mounts),
+                Err(e) => {
+                    error!("{}: volume resolution: {e}", m.name);
+                    launch_failures += 1;
+                    continue;
+                }
+            }
+        }
+
+        let req = Request::CreateJail(create_req);
         let send_result = match &mut driver {
             Driver::Once(c)       => c.send(&req),
             Driver::Supervise(s)  => s.client_mut().send(&req),
@@ -189,4 +244,69 @@ fn main() -> ExitCode {
 
     let _ = Duration::from_secs(0);  // silence unused-import lint
     if launch_failures == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+}
+
+/// Walk the manifest's `[[volumes]]` and turn each into a
+/// `MountSpec` for the jail. Persistent volumes go through
+/// atrium-volumes (Provision returns a host path). Tmpfs
+/// volumes are direct (jaild handles the mount; source ignored
+/// per atrium-volumes V0). Cas volumes return an error in V0.
+fn resolve_volumes(
+    m:        &ServiceManifest,
+    volumes:  &mut Option<volumes_client::Client>,
+) -> Result<Vec<MountSpec>, String> {
+    use atrium_volumes::protocol::{ProvisionRequest, Request as VReq, Response as VResp};
+
+    let mut mounts: Vec<MountSpec> = Vec::with_capacity(m.volumes.len());
+    for v in &m.volumes {
+        match v.kind {
+            ManifestVolumeKind::Tmpfs => {
+                mounts.push(MountSpec {
+                    source: format!("tmpfs::{}/{}", m.name, v.name),
+                    dest:   v.mount_at.clone(),
+                    kind:   MountKind::Tmpfs,
+                });
+            }
+            ManifestVolumeKind::Cas => {
+                return Err(format!(
+                    "volume {:?}: kind = \"cas\" is V1 (Tessera CAS API not yet wired)",
+                    v.name));
+            }
+            ManifestVolumeKind::Persistent => {
+                let client = volumes.as_mut().ok_or_else(|| format!(
+                    "volume {:?}: kind = \"persistent\" but bootstrap was started \
+                     with --volumes-socket \"\" (allocator unavailable)",
+                    v.name))?;
+                let req = VReq::Provision(ProvisionRequest {
+                    jail_name: m.name.clone(),
+                    volume:    v.to_volume_spec(),
+                });
+                let host_path = match client.send(&req) {
+                    Ok(VResp::Provisioned { host_path })
+                    | Ok(VResp::AlreadyProvisioned { host_path }) => host_path,
+                    Ok(VResp::PolicyDenied { rule, detail }) => {
+                        return Err(format!("volume {:?}: policy denied: {rule}: {detail}",
+                            v.name));
+                    }
+                    Ok(VResp::BackendUnavailable { name, configured }) => {
+                        return Err(format!(
+                            "volume {:?}: backend {name:?} not configured (have: {configured:?})",
+                            v.name));
+                    }
+                    Ok(other) => {
+                        return Err(format!("volume {:?}: unexpected response: {other:?}",
+                            v.name));
+                    }
+                    Err(e) => return Err(format!("volume {:?}: rpc: {e}", v.name)),
+                };
+                info!("{}: provisioned volume {} → {}", m.name, v.name, host_path);
+                mounts.push(MountSpec {
+                    source: host_path,
+                    dest:   v.mount_at.clone(),
+                    kind:   MountKind::RwNullfs,
+                });
+            }
+        }
+    }
+    Ok(mounts)
 }

@@ -1,0 +1,51 @@
+# /etc/atrium/services.d/60-atrium-smoke-volumes.toml
+#
+# [[volumes]] smoke service. Validates the full chain:
+#   portcullisd reads manifest → calls atrium-volumes Provision
+#   for the persistent volume → uses the returned host path as a
+#   rw_nullfs MountSpec → asks jaild to launch with that mount.
+#
+# Two volumes:
+#   - "data": persistent, default backend (tessera). Should land
+#     at /var/lib/atrium/storage/jails/atrium-smoke-volumes/data
+#     and be visible inside the jail at /atrium-data.
+#   - "scratch": tmpfs. Direct in jaild; no atrium-volumes call.
+
+enabled       = true
+name          = "atrium-smoke-volumes"
+path          = "/"
+children_max  = 0
+devfs_ruleset = 0
+
+[[volumes]]
+name      = "data"
+kind      = "persistent"
+mount_at  = "/atrium-data"
+mode      = 448         # 0o700
+owner_uid = 0
+owner_gid = 0
+
+[[volumes]]
+name      = "scratch"
+kind      = "tmpfs"
+mount_at  = "/atrium-tmp"
+mode      = 1023        # 0o1777
+owner_uid = 0
+owner_gid = 0
+
+[exec]
+path = "/usr/local/bin/atrium-jaild"
+argv = ["atrium-jaild", "check-policy",
+        "--policy", "/etc/atrium/jaild.policy.toml"]
+uid  = 1001
+gid  = 1001
+
+[[exec.env]]
+key   = "PATH"
+value = "/bin:/usr/bin"
+
+[supervision]
+restart                       = "never"
+restart_after_secs            = 1
+failure_budget_secs           = 0       # disable give-up; we want a single launch
+min_lifetime_for_success_secs = 5

@@ -72,6 +72,14 @@ pub struct ServiceManifest {
     #[serde(default)]
     pub mounts: Vec<ManifestMount>,
 
+    /// Per-jail volume declarations. portcullisd asks
+    /// atrium-volumes to provision each one before launching
+    /// the jail; the returned host paths become rw_nullfs
+    /// mounts. See `docs/spec/storage.md` and
+    /// `docs/spec/atrium-volumes.md`.
+    #[serde(default)]
+    pub volumes: Vec<ManifestVolume>,
+
     /// Network configuration. Default is `disable` (jail has no
     /// network). See `docs/spec/network.md`.
     #[serde(default)]
@@ -225,6 +233,68 @@ impl From<MountKindStr> for MountKind {
             MountKindStr::RoNullfs => MountKind::RoNullfs,
             MountKindStr::RwNullfs => MountKind::RwNullfs,
             MountKindStr::Tmpfs    => MountKind::Tmpfs,
+        }
+    }
+}
+
+/// Per-jail volume declaration. Maps to atrium-volumes'
+/// `VolumeSpec` for provisioning, and to a `MountSpec` (or
+/// tmpfs entry) for the eventual `CreateJailRequest`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ManifestVolume {
+    pub name: String,
+    pub kind: ManifestVolumeKind,
+    /// Operator-configured backend name; `None` = use the
+    /// default-marked backend.
+    #[serde(default)]
+    pub backend: Option<String>,
+    /// Path inside the jail's chroot where the volume mounts.
+    pub mount_at: String,
+    /// Mode in octal (e.g. 0o700 → 448 if Rust integer literal,
+    /// or "0700" string). serde-toml gives us i64; accept either.
+    pub mode: u32,
+    pub owner_uid: u32,
+    pub owner_gid: u32,
+    /// Optional size hint in bytes. Backends that support it
+    /// honour as a quota; others ignore.
+    #[serde(default)]
+    pub size_max: Option<u64>,
+    /// For `kind = "cas"` only.
+    #[serde(default)]
+    pub cas_root: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ManifestVolumeKind {
+    Persistent,
+    Cas,
+    Tmpfs,
+}
+
+impl From<ManifestVolumeKind> for atrium_volumes::protocol::VolumeKind {
+    fn from(k: ManifestVolumeKind) -> Self {
+        match k {
+            ManifestVolumeKind::Persistent => atrium_volumes::protocol::VolumeKind::Persistent,
+            ManifestVolumeKind::Cas        => atrium_volumes::protocol::VolumeKind::Cas,
+            ManifestVolumeKind::Tmpfs      => atrium_volumes::protocol::VolumeKind::Tmpfs,
+        }
+    }
+}
+
+impl ManifestVolume {
+    /// Translate to the atrium-volumes wire-protocol type.
+    pub fn to_volume_spec(&self) -> atrium_volumes::protocol::VolumeSpec {
+        atrium_volumes::protocol::VolumeSpec {
+            name:      self.name.clone(),
+            kind:      self.kind.into(),
+            backend:   self.backend.clone(),
+            mount_at:  self.mount_at.clone(),
+            mode:      self.mode,
+            owner_uid: self.owner_uid,
+            owner_gid: self.owner_gid,
+            size_max:  self.size_max,
+            cas_root:  self.cas_root.clone(),
         }
     }
 }
@@ -410,6 +480,7 @@ mod tests {
                 dest:   "usr/local/lib".into(),
                 kind:   MountKindStr::RoNullfs,
             }],
+            volumes: vec![],
             network: ManifestNetwork::Disable,
             exec: None,
             supervision: Supervision::default(),
@@ -470,6 +541,57 @@ mod tests {
         let m: ServiceManifest = toml::from_str(s).unwrap();
         assert_eq!(m.supervision.restart, RestartPolicy::Always);
         assert_eq!(m.supervision.restart_after_secs, 5);
+    }
+
+    #[test]
+    fn parse_with_volumes() {
+        let s = r#"
+            name = "mysqld"
+            path = "/"
+
+            [[volumes]]
+            name = "data"
+            kind = "persistent"
+            backend = "fast-db"
+            mount_at = "/var/db/mysql"
+            mode = 448            # 0o700 = 448 decimal
+            owner_uid = 88
+            owner_gid = 88
+            size_max = 107374182400
+
+            [[volumes]]
+            name = "scratch"
+            kind = "tmpfs"
+            mount_at = "/tmp"
+            mode = 1023           # 0o1777 = 1023 decimal
+            owner_uid = 0
+            owner_gid = 0
+        "#;
+        let m: ServiceManifest = toml::from_str(s).unwrap();
+        assert_eq!(m.volumes.len(), 2);
+        assert_eq!(m.volumes[0].name, "data");
+        assert!(matches!(m.volumes[0].kind, ManifestVolumeKind::Persistent));
+        assert_eq!(m.volumes[0].backend.as_deref(), Some("fast-db"));
+        assert!(matches!(m.volumes[1].kind, ManifestVolumeKind::Tmpfs));
+    }
+
+    #[test]
+    fn volume_to_volume_spec() {
+        let v = ManifestVolume {
+            name: "data".into(),
+            kind: ManifestVolumeKind::Persistent,
+            backend: Some("fast-db".into()),
+            mount_at: "/var/db/mysql".into(),
+            mode: 0o700,
+            owner_uid: 88,
+            owner_gid: 88,
+            size_max: Some(100 * 1024 * 1024 * 1024),
+            cas_root: None,
+        };
+        let spec = v.to_volume_spec();
+        assert_eq!(spec.name, "data");
+        assert_eq!(spec.backend.as_deref(), Some("fast-db"));
+        assert_eq!(spec.size_max, Some(100 * 1024 * 1024 * 1024));
     }
 
     #[test]

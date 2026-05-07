@@ -463,6 +463,7 @@ mod tests {
             children_max:  0,
             devfs_ruleset: 0,
             mounts:        vec![],
+            volumes:       vec![],
             network:       ManifestNetwork::Disable,
             exec: Some(ManifestExec {
                 path: "/usr/local/bin/atrium-jaild".into(),

@@ -434,6 +434,7 @@ dependencies = [
 name = "portcullisd"
 version = "0.1.0"
 dependencies = [
+ "atrium-volumes",
  "env_logger",
  "jaild",
  "libc",

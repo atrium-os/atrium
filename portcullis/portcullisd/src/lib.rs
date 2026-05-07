@@ -12,3 +12,4 @@
 pub mod jaild_client;
 pub mod supervisor;
 pub mod system_services;
+pub mod volumes_client;

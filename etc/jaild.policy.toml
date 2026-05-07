@@ -55,6 +55,15 @@ rw_patterns = [
     "/var/db/atrium/users/*",
 ]
 
+# Prefix-match subtrees for atrium-volumes-managed allocation
+# paths. atrium-volumes nests two levels deep
+# (/var/lib/atrium/storage/jails/<jail>/<vol>); rw_patterns'
+# trailing-* glob is single-segment, so we use the prefix
+# allow-list here.
+rw_subtrees = [
+    "/var/lib/atrium/storage/jails/",
+]
+
 
 # ---------------------------------------------------------------
 # Devfs rulesets permitted in jail specs. Names are defined in

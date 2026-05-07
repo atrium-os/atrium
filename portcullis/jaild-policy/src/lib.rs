@@ -54,8 +54,19 @@ pub struct MountSources {
     pub ro_paths:    Vec<String>,
     #[serde(default)]
     pub rw_paths:    Vec<String>,
+    /// Single-segment trailing-`*` globs: `/usr/home/*` matches
+    /// `/usr/home/alice` but NOT `/usr/home/alice/foo`. For the
+    /// per-user-home and similar single-level cases.
     #[serde(default)]
     pub rw_patterns: Vec<String>,
+    /// Prefix-match subtrees: any path starting with one of
+    /// these is permitted as an rw mount source. Used for
+    /// atrium-volumes' deep-nested allocation paths
+    /// (`/var/lib/atrium/storage/jails/<jail>/<vol>` etc.).
+    /// Conservative defaults: leave empty until you have an
+    /// allocator daemon producing the paths.
+    #[serde(default)]
+    pub rw_subtrees: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

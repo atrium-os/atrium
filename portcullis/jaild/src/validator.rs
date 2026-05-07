@@ -221,12 +221,22 @@ fn validate_mount(m: &MountSpec, policy: &Policy) -> Result<(), JaildError> {
             }
         }
         MountKind::RwNullfs => {
-            let exact = policy.mount_sources.rw_paths.iter().any(|p| p == &m.source);
-            let glob  = policy.mount_sources.rw_patterns.iter().any(|pat| matches_glob(pat, &m.source));
-            if !exact && !glob {
+            let exact   = policy.mount_sources.rw_paths.iter().any(|p| p == &m.source);
+            let glob    = policy.mount_sources.rw_patterns.iter().any(|pat| matches_glob(pat, &m.source));
+            let subtree = policy.mount_sources.rw_subtrees.iter().any(|pfx| {
+                /* Defence in depth: refuse `..` even though
+                 * dest is what gets traversal-checked above; a
+                 * source containing `..` could still confuse
+                 * downstream tools. */
+                !m.source.contains("..")
+                    && (m.source == pfx.trim_end_matches('/')
+                        || m.source.starts_with(pfx)
+                        || m.source.starts_with(&format!("{}/", pfx.trim_end_matches('/'))))
+            });
+            if !exact && !glob && !subtree {
                 return Err(JaildError::PolicyViolation {
                     rule:   "mount.source.not_in_rw",
-                    detail: format!("rw source {:?} not in policy.mount_sources rw paths/patterns", m.source),
+                    detail: format!("rw source {:?} not in policy.mount_sources rw paths/patterns/subtrees", m.source),
                 });
             }
         }
@@ -506,6 +516,28 @@ mod tests {
             kind:   MountKind::Tmpfs,
         });
         validate_create(&r, &p).unwrap();
+    }
+
+    #[test]
+    fn mount_rw_subtree() {
+        let mut p = load_sample_policy();
+        p.mount_sources.rw_subtrees = vec!["/var/lib/atrium/storage/jails/".into()];
+        let mut r = req_default();
+        r.mounts.push(MountSpec {
+            source: "/var/lib/atrium/storage/jails/mysqld/data".into(),
+            dest:   "var/db/mysql".into(),
+            kind:   MountKind::RwNullfs,
+        });
+        validate_create(&r, &p).unwrap();
+
+        // outside the subtree → reject
+        let mut r2 = req_default();
+        r2.mounts.push(MountSpec {
+            source: "/var/lib/something-else/x".into(),
+            dest:   "x".into(),
+            kind:   MountKind::RwNullfs,
+        });
+        assert!(validate_create(&r2, &p).is_err());
     }
 
     #[test]
