@@ -1,0 +1,196 @@
+//! Wire protocol between portcullisd and jaild.
+//!
+//! Length-prefixed JSON. Each message is:
+//!
+//!   [4-byte little-endian u32 length] [<length> bytes UTF-8 JSON]
+//!
+//! Chosen for: extensibility (new fields without versioning hell);
+//! debuggability (you can `nc -U` the socket and see plaintext);
+//! existing-Rust-tooling (`serde_json` is in the allowed dep set).
+//! The smallest-TCB carve-out (LANGUAGE-POLICY.md) accepts
+//! serde_json.
+//!
+//! Maximum frame size is bounded — defends against a compromised
+//! portcullisd asking jaild to allocate gigabyte buffers.
+
+use serde::{Deserialize, Serialize};
+use std::io::{Read, Write};
+
+use crate::JaildError;
+
+/// Maximum size of a single inbound message in bytes. Generous
+/// enough for a fully-elaborated jail spec with mounts, env,
+/// argv (V1), but small enough that a runaway / malicious sender
+/// can't OOM jaild. 64 KiB is comfortably larger than any spec
+/// we'd reasonably build.
+pub const MAX_FRAME_BYTES: u32 = 64 * 1024;
+
+/// All requests jaild accepts. New variants are additive — older
+/// jaild fails with `Response::Error` on unknown variants.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Request {
+    /// Create a new persistent jail. Caller (portcullisd) is
+    /// responsible for any later `jail_remove` request when the
+    /// service inside it exits. V0 doesn't yet do exec; that's
+    /// V1.
+    CreateJail(CreateJailRequest),
+
+    /// Remove a previously-created jail by jid. Idempotent — a
+    /// jid that's already gone returns success.
+    RemoveJail { jid: i32 },
+
+    /// Health check. Returns `Response::Ok` if jaild is alive.
+    Ping,
+}
+
+/// V0 create-jail spec. Intentionally narrow; V1 will add
+/// `mounts`, `devfs_ruleset`, `exec_spec`, `inherit_fds`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CreateJailRequest {
+    /// Jail name. Validated against the policy's name rules
+    /// (regex, prefix allowlist).
+    pub name: String,
+
+    /// Filesystem path that becomes the jail root. Must be a
+    /// directory in the policy's `mount_sources.ro_paths` ∪
+    /// `rw_paths` ∪ matching `rw_patterns`.
+    pub path: String,
+
+    /// `children.max` for hierarchical jail creation. 0 = leaf
+    /// jail. Bounded by `policy.children_max.max`.
+    #[serde(default)]
+    pub children_max: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Response {
+    /// Generic "your request succeeded with no payload" (Ping,
+    /// RemoveJail).
+    Ok,
+
+    /// CreateJail succeeded; jail is alive in the kernel.
+    JailCreated(CreateJailResponse),
+
+    /// Request was structurally valid but rejected by jaild's
+    /// policy (mount source not allowed, name pattern bad, …).
+    /// Caller can surface this to the user; it's not retryable.
+    PolicyDenied { rule: &'static str, detail: String },
+
+    /// Request was valid + allowed but the underlying syscall
+    /// failed. Typically transient (ENOMEM, EAGAIN) or a kernel
+    /// configuration issue.
+    SyscallFailed { name: &'static str, errno: i32, msg: String },
+
+    /// Catch-all for anything that doesn't fit the above. Used
+    /// for malformed JSON, oversize frames, etc. Caller should
+    /// treat this as fatal.
+    Error { detail: String },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CreateJailResponse {
+    pub jid: i32,
+}
+
+// -----------------------------------------------------------------
+// Length-prefixed framing.
+// -----------------------------------------------------------------
+
+/// Read one length-prefixed frame from `r`. Returns `Ok(None)` on
+/// clean EOF before any byte is read (peer closed); any other
+/// short read is an error.
+pub fn read_frame<R: Read>(mut r: R) -> Result<Option<Vec<u8>>, JaildError> {
+    let mut len_buf = [0u8; 4];
+    match r.read(&mut len_buf)? {
+        0 => return Ok(None),
+        n if n < 4 => {
+            // Got 1-3 bytes then EOF — protocol violation, but
+            // treat as peer-closed for resilience.
+            r.read_exact(&mut len_buf[n..])?;
+        }
+        _ => {}
+    }
+    let len = u32::from_le_bytes(len_buf);
+    if len > MAX_FRAME_BYTES {
+        return Err(JaildError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("frame too large: {len} > {MAX_FRAME_BYTES}"),
+        )));
+    }
+    let mut buf = vec![0u8; len as usize];
+    r.read_exact(&mut buf)?;
+    Ok(Some(buf))
+}
+
+/// Write `body` framed with its u32-LE length to `w`. Single
+/// `write_all`s for both header and body — caller is responsible
+/// for flushing if needed.
+pub fn write_frame<W: Write>(mut w: W, body: &[u8]) -> Result<(), JaildError> {
+    if body.len() as u64 > MAX_FRAME_BYTES as u64 {
+        return Err(JaildError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("outbound frame too large: {} > {MAX_FRAME_BYTES}", body.len()),
+        )));
+    }
+    let len = (body.len() as u32).to_le_bytes();
+    w.write_all(&len)?;
+    w.write_all(body)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn frame_round_trip() {
+        let req = Request::Ping;
+        let body = serde_json::to_vec(&req).unwrap();
+
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &body).unwrap();
+
+        let mut r = Cursor::new(&buf);
+        let got = read_frame(&mut r).unwrap().expect("frame");
+        let req2: Request = serde_json::from_slice(&got).unwrap();
+        assert!(matches!(req2, Request::Ping));
+    }
+
+    #[test]
+    fn frame_oversize_rejected() {
+        let too_big = (MAX_FRAME_BYTES + 1).to_le_bytes();
+        let mut r = Cursor::new(too_big.to_vec());
+        let err = read_frame(&mut r).unwrap_err();
+        match err {
+            JaildError::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidData),
+            other => panic!("wrong err: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_eof_returns_none() {
+        let mut r = Cursor::new(Vec::new());
+        assert!(read_frame(&mut r).unwrap().is_none());
+    }
+
+    #[test]
+    fn create_jail_request_serde() {
+        let req = Request::CreateJail(CreateJailRequest {
+            name: "atrium-test".into(),
+            path: "/usr/local/share/atrium".into(),
+            children_max: 0,
+        });
+        let bytes = serde_json::to_vec(&req).unwrap();
+        let back: Request = serde_json::from_slice(&bytes).unwrap();
+        match back {
+            Request::CreateJail(r) => {
+                assert_eq!(r.name, "atrium-test");
+                assert_eq!(r.path, "/usr/local/share/atrium");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+}

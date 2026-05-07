@@ -9,6 +9,7 @@ members = [
     "portcullisd",
     "atrium-session",
     "jaild-policy",
+    "jaild",
 ]
 
 [workspace.package]

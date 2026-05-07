@@ -1,0 +1,28 @@
+[package]
+name        = "jaild"
+version.workspace     = true
+edition.workspace     = true
+license.workspace     = true
+repository.workspace  = true
+description = "Atrium privileged jail-creation broker. Sole caller of jail_set(2) at runtime; portcullisd talks to it over a unix socket. See docs/spec/portcullis.md §0.5 + docs/spec/login-handoff.md."
+
+[lib]
+name = "jaild"
+path = "src/lib.rs"
+
+[[bin]]
+name = "atrium-jaild"
+path = "src/main.rs"
+
+[dependencies]
+jaild-policy = { path = "../jaild-policy" }
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+toml         = "0.8"
+thiserror    = "1"
+libc         = "0.2"
+log          = "0.4"
+env_logger   = "0.11"
+
+[dev-dependencies]
+tempfile = "3"
