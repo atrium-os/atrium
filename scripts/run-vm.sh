@@ -91,16 +91,19 @@ for arg in "$@"; do
             ;;
         --venus)
             # virgl_render_server (spawned by virglrenderer when venus is
-            # active) needs to find MoltenVK on macOS. Brew installs the
-            # ICD JSON outside the Vulkan loader's default search path;
-            # point at it explicitly so dlopen of libvulkan.dylib enumerates
-            # MoltenVK as the host Vulkan implementation.
-            export VK_ICD_FILENAMES="/tmp/MoltenVK_atrium.json"
+            # active) needs to find MoltenVK on macOS. brew installs the
+            # ICD JSON at $(brew --prefix)/etc/vulkan/icd.d/, outside the
+            # Vulkan loader's default search path — point at it directly.
+            # The library_path inside the JSON is "../../../lib/libMoltenVK.dylib"
+            # which resolves correctly because the JSON sits at
+            # $(brew --prefix)/etc/vulkan/icd.d/.
+            BREW_PREFIX="$(brew --prefix 2>/dev/null || echo /opt/homebrew)"
+            export VK_ICD_FILENAMES="$BREW_PREFIX/etc/vulkan/icd.d/MoltenVK_icd.json"
             export VK_DRIVER_FILES="$VK_ICD_FILENAMES"
             # Also expose MoltenVK to the bare-basename dlopen path
             # in case the Vulkan loader's JSON resolution doesn't reach
             # virgl_render_server (which is fork'd from QEMU).
-            export DYLD_LIBRARY_PATH="/opt/homebrew/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+            export DYLD_LIBRARY_PATH="$BREW_PREFIX/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
             # Capture the render server's own log output to a per-pid
             # file. Without this its messages may end up in macOS's
             # unified log (via syslog) where they're hard to find.
