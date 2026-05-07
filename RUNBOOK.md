@@ -429,7 +429,7 @@ D0 step 2d (async fence retirement) and step 3.5 (vblank events, hardware cursor
 - Atrium-patched QEMU (`qemu-build/`) — venus QEMU integration + macOS host shims for the missing EGL/GBM (`virtio-gpu-virgl.c` short-circuits vrend init when `qemu_egl_display` is NULL and adds `VIRGL_RENDERER_NO_VIRGL`).
 - Atrium-patched EDK2 (in the same `qemu-build/roms/edk2/`) — `VirtioGpuDxe` disabled in `ArmVirtPkg/ArmVirtQemu.dsc` and the FDF; otherwise EDK2 probes the GL/venus device at boot and hangs.
 - Atrium-built `virglrenderer` at `~/src/virglrenderer/build/server/virgl_render_server`, installed to `~/.local/libexec/virgl_render_server` and `~/.local/opt/homebrew/libexec/virgl_render_server` (the loader checks both).
-- MoltenVK ICD JSON at `/tmp/MoltenVK_atrium.json` pointing at `/opt/homebrew/lib/libMoltenVK.dylib` (run-vm.sh auto-generates).
+- MoltenVK ICD at `$(brew --prefix)/etc/vulkan/icd.d/MoltenVK_icd.json` (brew installs it; run-vm.sh points `VK_ICD_FILENAMES` there directly — *don't* use `/tmp/MoltenVK_atrium.json`, that path doesn't survive macOS reboot and is a known V5h regression).
 
 Inside the VM, the V5 atrium-mesa fork lives at `/root/mesa` (cloned from `github.com/atrium-os/mesa atrium/main`). Build the venus driver:
 
@@ -455,7 +455,85 @@ Diagnostics:
 - Host venus log: `tail /tmp/virgl-<qemu-pid>.log` shows the proxy/render-server side. The pattern `proxy: exported res N to unexpected fd_type -1` followed by `Broken pipe` is the V5g-era fd-export failure (use HOST3D blobs — see `feedback_venus_shmem_must_be_host3d` memory note).
 - QEMU monitor: `nc -U /tmp/qmp.sock` (JSON QMP). Useful for `system_reset`, `query-status`. If QMP itself is unresponsive, HVF is wedged — only `kill -9` will recover, and the qcow2 will need fsck on next boot.
 
-V5h status (in progress): kmod side adds `IOC_HOST_BLOB` ioctl that does `RESOURCE_CREATE_BLOB(HOST3D, num_entries=0)` + `CTX_ATTACH_RESOURCE` + `RESOURCE_MAP_BLOB`, returning a window of the host_visible BAR for mmap. Mesa side switches `vn_renderer_shmem_create` and `vn_renderer_bo_create_from_device_memory` to use it. Currently blocked: on a fresh QEMU, `kldunload` + `kldload` of the V5h kmod re-attaches with `features=0x100000010` (CONTEXT_INIT claimed) but the next `CTX_CREATE` virtio command hangs the host. Likely the older auto-loaded kmod on `/boot` claimed the device with `features=0x100000000` first and FreeBSD's virtio framework didn't issue `DEVICE_RESET` on detach — re-negotiation half-applied on the host side. See the V5h-debug commit's body for the next-session plan.
+**V5h status (DONE 2026-05-07):** vulkaninfo enumerates the M4 Max as a Vulkan device through the full stack. Four bring-up fixes landed:
+
+  1. **Apple Silicon 16 KiB host-page alignment** in atrium-kmod's BAR-window allocator. macOS mmap MAP_FIXED into a partial range of an existing anon mapping requires *host-page* alignment, not just guest-page. Guest is 4 KiB pages; host is 16 KiB. `ATRIUM_HOST_PAGE_SIZE` macro in `atrium_virtio_gpu.c` used uniformly by allocator, IOC_HOST_BLOB size rounding, and bitmap math.
+
+  2. **Force EOPNOTSUPP fallback in virglrenderer's map_fixed on `__APPLE__`**. macOS HVF pins host pages at `hv_vm_map` time; subsequent userspace `MAP_FIXED|MAP_SHARED` doesn't refresh stage-2. Returning EOPNOTSUPP forces QEMU's `memory_region_add_subregion_overlap` fallback which goes through MemoryListener → triggers `hv_vm_unmap+hv_vm_map` → stage-2 picks up the SHM-backed pages. Patch in `virglrenderer.c:virgl_renderer_resource_map_fixed`.
+
+  3. **MoltenVK ICD JSON path**: point `VK_ICD_FILENAMES` at brew's persistent install path (`$(brew --prefix)/etc/vulkan/icd.d/MoltenVK_icd.json`), not at a `/tmp/` copy. brew updates it on every `brew upgrade molten-vk` and it survives reboot.
+
+  4. **`max_timeline_count = 64`** (was 1) in `atrium_init_renderer_info`. venus reserves ring 0 for the CPU timeline and allocates one ring per VkQueue; with `max=1` the first VkQueue bind fails with `VK_ERROR_INITIALIZATION_FAILED`.
+
+End-to-end via vulkaninfo: `Virtio-GPU Venus (Apple M4 Max)`, Vulkan 1.2, 22 instance extensions, modern feature set.
+
+**V6 status (partial):** GPU dispatch *executes* (host worker's `vkr_dispatch_vkCmdDispatch` reaches MoltenVK; queue completes) but readback comes back unchanged. Diagnosed via worker-side dump in `vkr_dispatch_vkQueueSubmit`: the imported MTLBuffer's CPU view (which we share with the guest via shm_fd + HVF stage-2) doesn't receive GPU writes. **MoltenVK appears to allocate a separate private MTLBuffer for VkBuffer's actual GPU storage rather than honoring the imported MTLBuffer from `VkImportMemoryMetalHandleInfoEXT`-backed VkDeviceMemory.** Three routes forward documented in `feedback_venus_shmem_must_be_host3d.md` memory note (patch MoltenVK / worker-side memcpy / switch translation layer).
+
+#### Build cycle: rebuilding virglrenderer/render_server (Apple Silicon)
+
+After editing `~/src/virglrenderer/`:
+
+```sh
+cd ~/src/virglrenderer && ninja -C build
+cp build/src/libvirglrenderer.1.dylib ~/.local/lib/
+cp build/server/virgl_render_server ~/.local/libexec/
+
+# CRITICAL: re-codesign or QEMU will SIGKILL within 2 seconds of launch.
+# macOS code-signing's CS_VALID page cache rejects the rebuilt dylib's
+# pages because the on-disk mtime no longer matches the cached value.
+# Symptom: empty /tmp/qemu-out.log, QEMU exits silently. The actual
+# error is in `log show --predicate 'eventMessage CONTAINS qemu-system'`:
+#   kernel: CODE SIGNING: process N: rejecting invalid page ...
+#                         cs_mtime != mtime ... SIGKILL
+codesign --remove-signature ~/.local/lib/libvirglrenderer.1.dylib \
+                            ~/.local/libexec/virgl_render_server
+codesign --force --sign - ~/.local/lib/libvirglrenderer.1.dylib
+codesign --force --sign - ~/.local/libexec/virgl_render_server
+
+# Now restart the running VM (the in-flight QEMU has the OLD dylib mmap'd):
+~/src/bsd/scripts/vssh "shutdown -p now"
+# wait for QEMU to exit, then:
+~/src/bsd/scripts/run-vm.sh --venus </dev/null >/tmp/qemu-out.log 2>&1 &
+```
+
+Wrapper-worthy. If you find yourself doing this dance more than twice, write a `~/src/virglrenderer/install.sh`.
+
+#### Build cycle: rebuilding atrium-mesa inside the VM
+
+After pushing changes to `atrium-os/mesa atrium/main`:
+
+```sh
+~/src/bsd/scripts/vssh "cd /root/mesa && git pull --ff-only && \
+                        ninja -C build-atrium src/virtio/vulkan/libvulkan_virtio.so"
+```
+
+No codesign step here — the guest is FreeBSD, not macOS. Just rebuild and re-run the test. Mesa builds incremental in seconds.
+
+#### Build cycle: rebuilding atrium-kmod
+
+```sh
+~/src/bsd/scripts/vssh "cd /mnt/host/atrium-kmod && make"
+~/src/bsd/scripts/vssh "kldunload atrium_virtio_gpu; kldload /mnt/host/atrium-kmod/atrium_virtio_gpu.ko"
+```
+
+For changes that need to apply on first attach (e.g., a new field that gets initialized at attach time), install into `/boot/modules/` and reboot:
+
+```sh
+~/src/bsd/scripts/vssh "cp /mnt/host/atrium-kmod/atrium_virtio_gpu.ko /boot/modules/ && shutdown -r now"
+```
+
+`loader.conf` already has `atrium_virtio_gpu_load="YES"` so the new copy auto-loads on next boot.
+
+#### MoltenVK env knobs the venus host worker inherits
+
+`run-vm.sh --venus` exports these for the worker process (forked from QEMU):
+
+| Var | Purpose |
+|---|---|
+| `VK_ICD_FILENAMES` / `VK_DRIVER_FILES` | Brew-installed MoltenVK ICD JSON. |
+| `DYLD_LIBRARY_PATH` | Brew lib dir, for bare-basename `dlopen`. |
+| `MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS=1` | Force MoltenVK to commit + wait Metal command buffers inline inside `vkQueueSubmit`. Required for the worker to dump consistent state right after submit returns; also stabilizes GPU debugging. |
+| `VIRGL_LOG_FILE` / `VIRGL_LOG_LEVEL=debug` | virglrenderer proxy log to `/tmp/virgl-<pid>.log`. |
 
 **D1 step 1 (atrium-gpu-rs Rust binding)** — DONE (2026-04-28). Crate at `~/src/bsd/atrium-gpu-rs/` exposes `Gpu`, `Bo`, `Display`, `Connector`, `Mode`. `examples/gradient.rs` visually verified.
 
