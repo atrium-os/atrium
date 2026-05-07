@@ -467,7 +467,31 @@ Diagnostics:
 
 End-to-end via vulkaninfo: `Virtio-GPU Venus (Apple M4 Max)`, Vulkan 1.2, 22 instance extensions, modern feature set.
 
-**V6 status (partial):** GPU dispatch *executes* (host worker's `vkr_dispatch_vkCmdDispatch` reaches MoltenVK; queue completes) but readback comes back unchanged. Diagnosed via worker-side dump in `vkr_dispatch_vkQueueSubmit`: the imported MTLBuffer's CPU view (which we share with the guest via shm_fd + HVF stage-2) doesn't receive GPU writes. **MoltenVK appears to allocate a separate private MTLBuffer for VkBuffer's actual GPU storage rather than honoring the imported MTLBuffer from `VkImportMemoryMetalHandleInfoEXT`-backed VkDeviceMemory.** Three routes forward documented in `feedback_venus_shmem_must_be_host3d.md` memory note (patch MoltenVK / worker-side memcpy / switch translation layer).
+**V6 status (DONE 2026-05-07):** GPU compute works end-to-end. `atrium-kmod/test_vk_compute.c` (squares 1024 floats via a compute shader) reports `PASS: 1024 elements squared correctly on Virtio-GPU Venus (Apple M4 Max)` through the full venus stack on patched MoltenVK.
+
+The fix turned out to be a one-line bug in MoltenVK: `MVKDeviceMemory::initExternalMemory`'s import path (`VkImportMemoryMetalHandleInfoEXT` + `MTLBUFFER_BIT_EXT` handle type) was missing the `_device->makeResident(_mtlBuffer)` call that the non-import path in `ensureMTLBuffer()` does immediately after creating the MTLBuffer. On Metal 3 / Xcode 16+, `makeResident` registers the MTLBuffer with the device's `MTLResidencySet`; without it, the GPU IOMMU doesn't map the buffer and GPU writes silently go to a non-resident region the CPU never sees. No errors raised — Metal accepts encoder commands and the queue completes normally.
+
+Fix lives at `atrium-os/MoltenVK main` (`MoltenVK/MoltenVK/GPUObjects/MVKDeviceMemory.mm`, +1 line). Standalone reproducer at `atrium-os/MoltenVK test_mvk_import.m` (no venus / virglrenderer / QEMU dependencies; ~175 lines). Pre-fix: FAIL 0/9 of slot writes visible. Post-fix: PASS 9/9.
+
+#### Build cycle: rebuilding the patched MoltenVK
+
+The atrium venus stack depends on `atrium-os/MoltenVK` (one-line fix vs upstream). After `git pull` on the fork:
+
+```sh
+cd ~/src/MoltenVK
+rm -rf build && mkdir build && cd build
+cmake -G Ninja -DCMAKE_BUILD_TYPE=Release ..
+ninja MoltenVK
+# brew's MoltenVK lib is read-only; chmod, replace, restore
+chmod +w $(brew --prefix)/Cellar/molten-vk/*/lib/libMoltenVK.dylib
+cp MoltenVK/libMoltenVK.1.4.2.dylib \
+   $(brew --prefix)/Cellar/molten-vk/*/lib/libMoltenVK.dylib
+chmod -w $(brew --prefix)/Cellar/molten-vk/*/lib/libMoltenVK.dylib
+```
+
+`fetchDependencies --macos` (upstream's preferred build path via xcodebuild) currently fails on Tahoe due to an unrelated Xcode plug-in DVT symbol mismatch — `cmake -G Ninja` works around it. CMake pulls SPIRV-Cross / SPIRV-Tools / Vulkan-Headers via CPM into `~/.cache/CPM/`; first build is ~3 minutes, incremental builds ~15 seconds.
+
+Worker process picks up the patched dylib via the brew ICD JSON path (`$(brew --prefix)/etc/vulkan/icd.d/MoltenVK_icd.json`'s `library_path` is relative to the JSON's location, which is in the brew Cellar tree — so replacing the dylib in-place is sufficient).
 
 #### Build cycle: rebuilding virglrenderer/render_server (Apple Silicon)
 
