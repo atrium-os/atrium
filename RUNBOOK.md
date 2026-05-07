@@ -498,6 +498,15 @@ vssh "cp /tmp/frescod-smoke-frame-0000.png /mnt/host/vm/frescod-smoke-frame-0000
 open ~/src/bsd/vm/frescod-smoke-frame-0000.png
 ```
 
+Other test clients exercise the bundle's other ops through the same smoke harness:
+
+| Client                      | Op exercised | Result                                    |
+|-----------------------------|--------------|-------------------------------------------|
+| `atrium-test-client`        | rect + path  | `vm/frescod-smoke-frame-0000.png` ✅      |
+| `atrium-textured`           | texture      | `vm/v7-textured.png` ✅                   |
+| `atrium-text-demo`          | glyph_run    | `vm/v7-text.png` ⚠ outline-only artifact (reproduces on lavapipe too — pre-existing glyph shader bug, **not** a venus issue) |
+| `atrium-rect-bouncer` (3 s) | rect (×91)   | `vm/v7-bounce-{00,30,62}.png` ✅, sustained ~21 fps GPU-bound, zero VK_ERROR / stall / fence-timeout in `/tmp/smoke.log` |
+
 #### Build cycle: rebuilding the patched MoltenVK
 
 The atrium venus stack depends on `atrium-os/MoltenVK` (one-line fix vs upstream). After `git pull` on the fork:
