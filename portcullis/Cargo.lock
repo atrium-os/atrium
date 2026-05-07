@@ -420,13 +420,18 @@ dependencies = [
 name = "portcullisd"
 version = "0.1.0"
 dependencies = [
+ "env_logger",
  "jaild",
  "libc",
+ "log",
  "portcullis-ipc",
  "portcullis-jail",
  "portcullis-policy",
  "portcullis-toml",
+ "serde",
  "serde_json",
+ "tempfile",
+ "toml",
 ]
 
 [[package]]

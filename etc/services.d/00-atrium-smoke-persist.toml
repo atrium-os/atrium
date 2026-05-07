@@ -1,0 +1,13 @@
+# /etc/atrium/services.d/00-atrium-smoke-persist.toml
+#
+# V1 smoke service: a *persistent* jail with no exec body. Lets us
+# verify that portcullisd-bootstrap can drive jaild's V0 path
+# (CreateJail without ExecSpec → real jid back).
+#
+# Numeric prefix sets boot order (lexicographic). Real services
+# under D2 will live alongside this.
+
+enabled      = true
+name         = "atrium-smoke-persist"
+path         = "/"
+children_max = 0

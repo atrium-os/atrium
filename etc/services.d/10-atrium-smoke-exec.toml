@@ -1,0 +1,23 @@
+# /etc/atrium/services.d/10-atrium-smoke-exec.toml
+#
+# V1 smoke service: an exec'd jail running `atrium-jaild
+# check-policy` as a 1001:1001 user, exits cleanly. Validates
+# the full V1a path (mounts + pdfork + execve + SCM_RIGHTS for
+# procdesc).
+
+enabled       = true
+name          = "atrium-smoke-exec"
+path          = "/"
+children_max  = 0
+devfs_ruleset = 0          # 0 = inherit; production uses non-zero
+
+[exec]
+path = "/usr/local/bin/atrium-jaild"
+argv = ["atrium-jaild", "check-policy",
+        "--policy", "/etc/atrium/jaild.policy.toml"]
+uid  = 1001
+gid  = 1001
+
+[[exec.env]]
+key   = "PATH"
+value = "/bin:/usr/bin"
