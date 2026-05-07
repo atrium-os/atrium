@@ -200,6 +200,14 @@ struct atrium_gpu_softc {
  * uses it to skip the kva free and instead release the BAR window. */
 #define ATRIUM_BO_INT_HOST_BLOB  0x10000u
 
+/* Host-side page size for the BAR-window allocator. We pick the
+ * worst-case host page (Apple Silicon = 16 KiB) regardless of the
+ * guest page size — the host's mmap MAP_FIXED into a sub-range of
+ * QEMU's hostmem mapping requires every BAR offset to be aligned
+ * to the host's actual page size, and Darwin returns EINVAL otherwise. */
+#define ATRIUM_HOST_PAGE_SHIFT 14
+#define ATRIUM_HOST_PAGE_SIZE  (1u << ATRIUM_HOST_PAGE_SHIFT)
+
 /* ------------------------------------------------------------------------- */
 /* Per-fd state — one per open(/dev/atrium-gpu0).                             */
 /*                                                                            */
@@ -305,7 +313,7 @@ atrium_bo_free(struct atrium_gpu_bo *bo)
 		struct atrium_gpu_softc *sc = bo->owner ? bo->owner->sc : NULL;
 		if (sc != NULL && sc->shm_initialized) {
 			uint64_t bar_offset = bo->pa - sc->shm_pa;
-			uint32_t npages = bo->size / PAGE_SIZE;
+			uint32_t npages = bo->size / ATRIUM_HOST_PAGE_SIZE;
 			mtx_lock(&sc->shm_lock);
 			atrium_vgpu_shm_free_locked(sc, bar_offset, npages);
 			mtx_unlock(&sc->shm_lock);
@@ -688,8 +696,10 @@ atrium_gpu_ioc_host_blob(struct atrium_gpu_softc *sc,
 	if (args->size == 0 || args->size > (1ULL << 32))
 		return (EINVAL);
 
-	actual_size = roundup2(args->size, PAGE_SIZE);
-	npages = actual_size / PAGE_SIZE;
+	/* Round up to the HOST page size, not the guest's — see
+	 * ATRIUM_HOST_PAGE_SIZE comment. */
+	actual_size = roundup2(args->size, ATRIUM_HOST_PAGE_SIZE);
+	npages = actual_size / ATRIUM_HOST_PAGE_SIZE;
 
 	/* Reserve a BAR window. */
 	mtx_lock(&sc->shm_lock);
@@ -787,6 +797,8 @@ atrium_gpu_ioc_submit_3d(struct atrium_gpu_softc *sc,
 	if (args->cmd_size == 0 || args->cmd_size > 1024 * 1024)
 		return (EINVAL);
 
+	device_printf(sc->dev, "SUBMIT_3D: ctx=%u cmd_size=%u flags=0x%x\n",
+	    f->ctx_id, args->cmd_size, args->flags);
 	cmd_buf = malloc(args->cmd_size, M_ATRIUM_GPU, M_WAITOK);
 	err = copyin((const void *)(uintptr_t)args->cmd_ptr, cmd_buf,
 	    args->cmd_size);
@@ -1868,13 +1880,16 @@ atrium_vgpu_shm_init_locked(struct atrium_gpu_softc *sc)
 	}
 
 	sc->shm_pa = bar_pa + sc->shm_bar_offset;
-	sc->shm_n_pages = sc->shm_size / PAGE_SIZE;
+	/* Bitmap tracks ATRIUM_HOST_PAGE_SIZE-sized chunks, not guest
+	 * PAGE_SIZE — see comment on the macro above. */
+	sc->shm_n_pages = sc->shm_size / ATRIUM_HOST_PAGE_SIZE;
 	sc->shm_bitmap = malloc(roundup2(sc->shm_n_pages, 8) / 8,
 	    M_ATRIUM_GPU, M_WAITOK | M_ZERO);
 	sc->shm_initialized = true;
 	device_printf(sc->dev,
-	    "HOST3D blob window armed: BAR%u pa=0x%lx, %u pages\n",
-	    sc->shm_bar, (unsigned long)sc->shm_pa, sc->shm_n_pages);
+	    "HOST3D blob window armed: BAR%u pa=0x%lx, %u host-pages (%u KiB each)\n",
+	    sc->shm_bar, (unsigned long)sc->shm_pa, sc->shm_n_pages,
+	    ATRIUM_HOST_PAGE_SIZE >> 10);
 	return (0);
 }
 
@@ -1901,7 +1916,7 @@ atrium_vgpu_shm_alloc_locked(struct atrium_gpu_softc *sc, uint32_t npages)
 				uint32_t b = base + j;
 				sc->shm_bitmap[b / 8] |= (1u << (b % 8));
 			}
-			return ((uint64_t)base * PAGE_SIZE);
+			return ((uint64_t)base << ATRIUM_HOST_PAGE_SHIFT);
 		}
 	}
 	return ((uint64_t)-1);
@@ -1911,7 +1926,7 @@ static void
 atrium_vgpu_shm_free_locked(struct atrium_gpu_softc *sc,
     uint64_t bar_offset, uint32_t npages)
 {
-	uint32_t base = bar_offset / PAGE_SIZE;
+	uint32_t base = bar_offset >> ATRIUM_HOST_PAGE_SHIFT;
 	uint32_t j;
 
 	for (j = 0; j < npages; j++) {
