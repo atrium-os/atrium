@@ -234,23 +234,6 @@ int main(void) {
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     };
     CHECK_VK(vkBeginCommandBuffer(cb, &cbbi));
-    /* Diag: fill buffer with sentinel BEFORE compute. If fillBuffer
-     * lands in our SHM (visible to guest readback), we know the
-     * VkBuffer->MTLBuffer binding works for transfer ops. The compute
-     * shader will then overwrite the sentinels with squares. */
-    vkCmdFillBuffer(cb, buf, 0, VK_WHOLE_SIZE, 0xCAFEBABEu);
-    VkBufferMemoryBarrier pre_dispatch = {
-        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .buffer = buf, .offset = 0, .size = VK_WHOLE_SIZE,
-    };
-    vkCmdPipelineBarrier(cb,
-                         VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         0, 0, NULL, 1, &pre_dispatch, 0, NULL);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &ds, 0, NULL);
     vkCmdDispatch(cb, N / 64, 1, 1);
