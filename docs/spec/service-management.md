@@ -260,6 +260,36 @@ service + jaild policy + atrium.toml capabilities.
   equivalent (`SystemCallFilter=`, `RestrictAddressFamilies=`)
   are Linux-specific or covered by jail isolation more strongly.
 
+### 4.11 GUI configuration of system state (Network Manager / settings panels) — (S) per-domain mediator daemons
+
+systemd absorbed networkd, resolved, timesyncd, hostnamed,
+homed, etc. so GUI configuration tools could reach them via
+D-Bus. Atrium apps run in jails and cannot shell out to
+`ifconfig`, `pw`, `ntpdate`, etc. directly — they need a
+privileged mediator.
+
+**Decision: per-domain mediator daemons (NOT portcullisd).**
+
+- These are different domains (Q2 in §5 checklist, STOP). A
+  compromise of network-config code shouldn't compromise
+  jail-creation policy; an account-management bug shouldn't
+  reach into the manifest interpreter.
+- Each mediator gets its own jail, root within that jail, narrow
+  surface, own audit boundary. See §6 for the full table:
+  `atrium-net`, `atrium-time`, `atrium-accounts`, `atrium-hwctrl`.
+- portcullisd's role: **capability-routing only**. atrium.toml
+  gains `[capabilities] service.atrium-net = "configure"` etc.;
+  portcullisd mounts the relevant aqueduct sockets into the
+  requesting app's jail at launch. portcullisd never executes
+  the operations.
+
+This is the OpenBSD-privsep pattern at platform scale: many
+small privileged components, each owning one domain, each with
+its own audit boundary. systemd's mistake was *not* "having one
+privileged daemon" but rather "having one privileged daemon that
+also did networking and DNS and time and login and …". We avoid
+this by keeping portcullisd a *router*, not an *implementer*.
+
 ## 5. Decision rule for future features
 
 Whenever someone proposes a new feature with a question of
@@ -300,25 +330,93 @@ We err on the side of more daemons, smaller scopes. The cost of
 adding a daemon is bounded; the cost of un-doing portcullisd
 scope creep later is unbounded.
 
-## 6. Watch list
+## 6. GUI-mediator daemons (the NetworkManager pattern)
 
-These are the features where the temptation to drop "just one
-more thing" into portcullisd will be strongest. Pre-bound here
-so the decision is already made:
+**Important distinction missed in earlier drafts:** "use base
+FreeBSD" works for *system-level* operations (dhclient, ntpd, pw
+on an admin CLI) but NOT for *GUI configuration tools*. An
+Atrium Network Manager GUI runs in its own jail with `ifconfig`
+not in its mount allow-list, `PF_ROUTE` not in its capability
+set, and raw sockets denied. To configure the network, it has to
+talk to *something* privileged.
 
-| Feature                       | Goes in     | Why not portcullisd                                   |
-|-------------------------------|-------------|-------------------------------------------------------|
-| Service log aggregation       | atrium-log  | Different domain; integrity-isolation from policy     |
-| Manifest-driven timers        | atrium-timer| Different domain; portcullisd is reactive, not active |
-| Network configuration         | atrium-net? | Different domain; not a portcullisd concern at all    |
-| DNS resolution                | (use base)  | unbound is fine; not a portcullisd concern            |
-| Time sync                     | (use base)  | ntpd / chronyd; not a portcullisd concern             |
-| User account management       | (use base)  | pw(8); per-user state is portcullis-policy crate, no daemon scope creep |
-| Hardware hotplug              | atrium-devevents (extended) | Already a separate daemon; add domains there |
-| Boot splash / progress        | (none)      | Out of scope                                          |
-| Crash dump processing         | atrium-log  | Logs are logs                                         |
+That something is **not portcullisd**. portcullisd is policy +
+lifecycle; it doesn't know `ifconfig` semantics. The right shape
+is a **per-domain mediator daemon** that wraps the privileged
+operations behind an aqueduct service interface, with portcullisd
+mediating capability grants ("this GUI is allowed to talk to
+atrium-net") but never touching the operations themselves.
 
-## 7. References
+This is the OpenBSD-privsep pattern at platform scale: many
+small privileged daemons, each owning one domain, each with its
+own audit boundary. portcullisd is a *capability router*, not a
+*capability implementer*.
+
+```
+GUI Network Manager (in jail "app-network-manager-1")
+  │ atrium.toml: [capabilities] service.atrium-net = "configure"
+  │ ↓ aqueduct
+atrium-net (its own jail, root-privileged, narrow scope)
+  │ ↓ ifconfig / route / wpa_supplicant / resolvconf
+kernel
+```
+
+portcullisd's contribution to this flow:
+
+- At app install: prompt "this app wants to configure network —
+  allow?" (already in the Portcullis spec).
+- At app launch: mount `/var/run/aqueduct/atrium-net.sock` rw
+  into the app's jail (existing capability-translation work).
+- At runtime: nothing. portcullisd doesn't see the operations.
+
+### The mediator-daemon table
+
+| Domain                                   | Daemon            | What it wraps                                       | Why a separate daemon                                                    |
+|------------------------------------------|-------------------|-----------------------------------------------------|--------------------------------------------------------------------------|
+| Networking (interfaces, routing, WiFi, VPN) | `atrium-net`     | `ifconfig`, `route`, `wpa_supplicant`               | Largest domain; would dwarf portcullisd. Compromise of net code shouldn't compromise jail policy. |
+| DNS resolver config                      | `atrium-net`*     | `/etc/resolv.conf`, `resolvconf(8)`                 | Folded into atrium-net (same domain).                                    |
+| Time + timezone                          | `atrium-time`     | `ntpd`/`chronyd` config, `/etc/localtime`, `tzsetup`| Tiny, but distinct threat model from networking. |
+| User / group accounts                    | `atrium-accounts` | `pw(8)`, `/etc/master.passwd` (write side)          | Auth-adjacent; can create root accounts if compromised; needs its own audit boundary. |
+| Display / audio / power                  | `atrium-hwctrl`   | backlight, mixer, `acpiconf`                        | Hardware-control domain; different surface from policy.                  |
+| Service log aggregation                  | `atrium-log`      | journald-equivalent                                 | Different domain; integrity-isolation from policy.                       |
+| Manifest-driven timers                   | `atrium-timer`    | systemd timer-unit equivalent                       | Different domain; portcullisd is reactive, not active.                   |
+
+\* DNS is a sub-domain of networking; doesn't justify a separate
+daemon today. Could split out as `atrium-resolved` if a
+DNS-only GUI ever needs more than `atrium-net` exposes.
+
+### When system services use base FreeBSD directly
+
+Several base FreeBSD daemons run *as the system itself*, not via
+mediators, and are configured via files written by the
+mediators. The mediator daemons sit *between* GUI clients and
+these base daemons:
+
+| Base FreeBSD daemon | Configured by    | Read by                                |
+|---------------------|------------------|----------------------------------------|
+| `dhclient`          | `atrium-net`     | (FreeBSD itself)                       |
+| `ntpd` / `chronyd`  | `atrium-time`    | (FreeBSD itself)                       |
+| `unbound`           | `atrium-net`     | (FreeBSD itself; system DNS resolver)  |
+| `cron`              | (none)           | Atrium uses cron directly for system schedules; per-app timers go via `atrium-timer` |
+| `syslogd`           | (none)           | (FreeBSD itself; only base services log via syslog) |
+
+This keeps the base FreeBSD service set unchanged. We're adding
+a userspace platform on top, not replacing FreeBSD's daemons.
+
+## 7. Other watch-list features
+
+Not GUI-mediator daemons; pre-bound for completeness:
+
+| Feature                       | Goes in           | Why not portcullisd                                  |
+|-------------------------------|-------------------|------------------------------------------------------|
+| Hardware hotplug              | `atrium-devevents` (extend) | Already a separate daemon; add domains there |
+| Boot splash / progress        | (none)            | Out of scope                                         |
+| Crash dump processing         | `atrium-log`      | Logs are logs                                        |
+| Per-user persistent state     | (filesystem)      | Lives under `/var/db/atrium/users/<N>/`; no daemon needed |
+| Inter-app clipboard           | `atrium-clipboard` (future, separate) | Different domain (data-flow), needs careful permission story |
+| Notifications                 | `atrium-notifyd` (future, separate)   | Different domain; user-visible IPC channel |
+
+## 8. References
 
 - `docs/spec/portcullis.md` — Portcullis full spec (manifests,
   jail builder, lifecycle).
