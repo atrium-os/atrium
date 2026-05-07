@@ -1,7 +1,7 @@
 # Portcullis — jail launcher + capability manifest
 
 Status: design (D2.5).
-Last updated: 2026-05-03.
+Last updated: 2026-05-07.
 
 The piece of Atrium that turns "an app" into "a running, isolated,
 capability-scoped process." Portcullis reads each app's
@@ -14,6 +14,81 @@ Portcullis is to Atrium what `systemd-nspawn` is to Linux + the
 permissions-model of mobile OSes — but built natively on FreeBSD
 jails, devfs.rules, nullfs, rctl, and the Atrium substrate
 (Tessera CAS-FS, aqueduct).
+
+## 0.5 Architecture (privsep — post-V7 revision)
+
+Originally this spec described a single `portcullisd` that did
+both policy interpretation and `jail_set(2)`. Validation work in
+2026-05-07 (`scratch/jail-smoke/`) showed two relevant facts:
+
+1. FreeBSD's hierarchical jails work cleanly: a jail with
+   `children.max>0` can host a process that creates child jails
+   via `jail_set`. Confirmed on 16.0-CURRENT.
+2. `jail_set` is **disabled** under Capsicum (`cap_enter()` →
+   `ECAPMODE`). Combining Capsicum confinement of the policy daemon
+   with dynamic jail creation requires privilege separation.
+
+Architecture revised accordingly. Final shape:
+
+```
+host (kernel + init)
+└── jaild-jail          PRIVILEGED BROKER (~500 LoC, audited)
+    │                   - sole caller of jail_set / jail_remove /
+    │                     pdfork / execve
+    │                   - validates each request from portcullisd
+    │                     against /etc/atrium/jaild.policy.toml
+    │                   - cannot itself be Capsicum'd
+    │
+    ├── portcullisd-jail POLICY DAEMON (Capsicum'd after init)
+    │                   - parses atrium.toml manifests
+    │                   - capability → jail-spec translation
+    │                   - sends specs to jaild over a pre-opened
+    │                     socket fd; never touches global namespace
+    │
+    ├── frescod                     ┐
+    ├── atrium-devevents            │ system services, child jails
+    ├── vestibulum  (per seat)      │ of jaild-jail; managed by
+    └── user-N-supervisor           │ portcullisd via jaild
+        └── apps (grandchildren)    ┘
+```
+
+Pattern: OpenSSH/qmail-style privsep. The privileged TCB is jaild
+(~500 LoC, no business logic, just request validation +
+`jail_set`/`execve`). The complex interpreter (portcullisd) is
+Capsicum-confined; even with a portcullisd RCE, an attacker only
+gets to ask jaild to do things, and jaild refuses anything outside
+the static policy file's allow-list.
+
+**Validating tests** (committed as ground truth):
+
+- `scratch/jail-smoke/jail-smoke.c` — confirms hierarchical jails
+  + `ECAPMODE` semantics on 16.0-CURRENT.
+- `scratch/jail-smoke/jaild-privsep.c` — confirms the full
+  privsep round-trip works: portcullisd-in-cap-mode can read/write
+  a pre-opened socket, cannot `open(/etc/passwd)`, cannot
+  `jail_set`, but can ask jaild over the socket and get a jid back;
+  jaild's allow-list rejects disallowed names.
+
+**Companion specs:**
+
+- `docs/spec/jaild-policy.md` — the jaild allow-list schema and
+  per-field validation rules. Sample at `etc/jaild.policy.toml`.
+  Rust types and parser at `portcullis/jaild-policy/`.
+- `docs/spec/login-handoff.md` — boot-to-session protocol on the
+  privsep arch. `pdfork(2)` + `EVFILT_PROCDESC` is the spine; works
+  in Capsicum mode.
+- `docs/spec/gpu-isolation.md` — invariants the kernel GPU driver
+  must enforce before Portcullis is allowed to grant the
+  `gpu-direct` capability. Default `render-only` capability
+  (frescod-mediated, no device access) bypasses this question
+  for most apps.
+
+The remainder of this document is largely unchanged in shape; "the
+daemon" is now logically split between jaild (privileged broker)
+and portcullisd (policy daemon), but the concepts (manifest schema,
+capability classes, jail layout, prompt UX, lifecycle) are the
+same. Where the privsep distinction matters, it's called out
+explicitly.
 
 ## 0. Naming + role
 
@@ -925,13 +1000,53 @@ pre-grants for headless deployments.
   shape on every desktop OS. Per-app clipboard scoping in the
   daemon is a mitigation, not a guarantee.
 - **Compromised system services.** A compromised Fresco gives
-  the attacker access to all rendered content. Standard. Service
-  hardening + capsicum are the answer; out of Portcullis's
-  scope.
+  the attacker access to all rendered content (every app's pixels).
+  This is intrinsic to having a centralised compositor. Mitigation
+  in the privsep architecture (§0.5): Fresco runs in its own jail
+  with a tiny mount set + no network + no filesystem write outside
+  its socket directory. A Fresco RCE doesn't escape that jail. The
+  attacker still has Fresco's privileges *within* the jail — keys,
+  pixels, GPU device — but no fs/network access beyond.
+
+### 9.3 Trust hierarchy
+
+| Component | TCB rank | Compromise impact |
+|-----------|----------|-------------------|
+| FreeBSD kernel | 0 (fully trusted) | game over |
+| jaild | 1 (audited, ~500 LoC, no business logic) | can create arbitrary jails permitted by policy file; cannot escape its own jail |
+| jaild policy file (`/etc/atrium/jaild.policy.toml`) | 1 (root of policy trust) | bad policy → broad jails. Change-control + future signing. |
+| portcullisd | 2 (Capsicum'd, larger interpreter) | can ask jaild for things in policy; cannot escape jaild policy |
+| atrium-authd (deferred, v1.5) | 2 (auth helper) | can verify credentials; no exec or jail authority |
+| frescod | 3 (jailed system service) | sees all rendered content; no fs/network |
+| vestibulum | 3 (jailed pre-auth screen) | can claim arbitrary user authenticated (worst case in v1; tightened by atrium-authd in v1.5) |
+| atrium-devevents | 3 (jailed input reader) | sees all keyboard/mouse input pre-routing |
+| user supervisor | 4 (jailed, uid=N) | bounded by user-N's grants |
+| user app | 5 (jailed, per-manifest caps) | bounded by capability set |
 
 ## 10. Implementation phases
 
-Order matches risk (smallest blast radius first):
+Order matches risk (smallest blast radius first). Phases 0a/0b
+were added in the 2026-05-07 privsep revision (§0.5); the existing
+phases 1-5 keep their numbering and shape.
+
+**Phase 0a — jaild policy schema (landed 2026-05-07, commit 8842358).**
+- `jaild-policy` crate: serde-typed schema for
+  `/etc/atrium/jaild.policy.toml`, parser, schema-version check,
+  shipped sample at `etc/jaild.policy.toml`.
+- Two unit tests green: parses sample, refuses bad version.
+- ~½ week (done).
+
+**Phase 0b — jaild daemon.**
+- New `jaild` crate. Reads policy file at startup. Listens on
+  `/var/run/atrium/jaild.sock`. Per-request: validate against
+  policy → `pdfork` → child does `jail_set` + `execve` → parent
+  returns jid + procdesc fd via `SCM_RIGHTS`.
+- `jail_remove` on request from portcullisd or on procdesc EOF
+  cleanup.
+- Persistent state file at `/var/run/atrium/jaild.state.toml`
+  for crash recovery (per `docs/spec/login-handoff.md` Phase 5).
+- Smoke validation pre-existed: `scratch/jail-smoke/jaild-privsep.c`.
+- Real implementation: ~1 week.
 
 **Phase 1 — schema + parser + validator.**
 - `portcullis-toml` crate: serde-deserialize `atrium.toml`,
@@ -964,6 +1079,13 @@ Order matches risk (smallest blast radius first):
 - Policy file format + persistence at `/var/db/atrium/<user>/
   policy.toml`.
 - Implements the lifecycle in §6 end-to-end.
+- **Privsep integration (per §0.5):** portcullisd opens its
+  jaild socket fd at startup (env var `ATRIUM_JAILD_FD`),
+  reads its initial state, then `cap_enter()`. From that
+  point all jail-creation goes through jaild. portcullisd
+  holds procdesc fds (received via `SCM_RIGHTS` from jaild
+  alongside each jid) and uses `EVFILT_PROCDESC` on
+  `NOTE_EXIT` for lifecycle.
 - ~1 week.
 
   *Step 1 (landed):* `portcullis-policy` crate — Policy/Grant
@@ -1162,6 +1284,28 @@ D2.5 is "complete" when an end-to-end demo works:
 
 ## 11. Open questions
 
+### 11.0 Resolved 2026-05-07
+
+- **Where does jail creation live?** Resolved by §0.5: a privsep
+  daemon (jaild) is the sole `jail_set` caller; portcullisd is
+  Capsicum-confined and asks jaild via socket. Validated by
+  `scratch/jail-smoke/`.
+- **GPU-capability gate:** spec'd in `docs/spec/gpu-isolation.md`.
+  Two-tier: `render-only` (frescod-mediated, always grantable) vs
+  `gpu-direct` (requires kernel-driver attestation in
+  `jaild.policy.toml` `[gpu_drivers.attested.<name>]`).
+- **Login privilege handoff:** spec'd in
+  `docs/spec/login-handoff.md`. `pdfork` + `EVFILT_PROCDESC` is
+  the spine; vestibulum sends portcullisd a nonce-bearing
+  `session_start`, portcullisd asks jaild to create the user
+  supervisor jail with `setuid(N)` + execve.
+- **Compromised system services:** §9.3 trust hierarchy makes the
+  blast radius explicit. Frescod / vestibulum / atrium-devevents
+  all run jailed; a compromise gets the privileges of the service
+  but no fs/network escape.
+
+### 11.1 Still open
+
 - **App identity for jails:** `app.id` directly as the jail name
   vs. derived UUID? Direct id is human-readable in `jls` output;
   UUID handles the case where two apps claim the same id (refuse
@@ -1206,6 +1350,30 @@ D2.5 is "complete" when an end-to-end demo works:
 - **Setup script auditability:** users can inspect the script
   before granting setup capabilities. UI should make this easy
   ("Show setup script") so users aren't approving a black box.
+
+### 11.2 Tracked but deferred
+
+- **`atrium-authd` privsep helper.** Per `login-handoff.md`,
+  vestibulum currently does `crypt(3)` directly. v1.5 hardening
+  splits this into a small auth-only daemon (OpenSSH-shaped),
+  bringing vestibulum's TCB down to "shows UI; forwards
+  credentials to authd; receives one-shot token; forwards token
+  to portcullisd."
+- **Policy-file signing.** `jaild.policy.toml` is the runtime
+  root of trust. Future: minisign-style detached signature so
+  jaild can verify the file is the operator-approved one before
+  loading. Defer; relies on key management story we don't have
+  yet.
+- **`test_gpu_isolation` regression.** The parametric kernel
+  test in `gpu-isolation.md` §Validation is spec-only; landing
+  it in `atrium-kmod/` is a prereq for any future driver
+  switching its attestation entry to `production`. Required for
+  D5; optional for D0+V7 (already attested via the layered chain).
+- **Per-context IOMMU enforcement on D5+ native GPU drivers.**
+  Each driver port needs a section under
+  `atrium-kmod/<port>/ISOLATION.md` mapping invariants I1–I5 to
+  HW mechanisms. Required before any `gpu-direct` grant for that
+  driver.
 - **Setup-phase capability prompts:** the prompt UI shows the
   setup-vs-runtime split (see §3.4 example). Capabilities only
   elevated during setup are still surfaced — network during
