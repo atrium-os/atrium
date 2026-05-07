@@ -428,7 +428,7 @@ D0 step 2d (async fence retirement) and step 3.5 (vblank events, hardware cursor
 
 - Atrium-patched QEMU (`qemu-build/`) — venus QEMU integration + macOS host shims for the missing EGL/GBM (`virtio-gpu-virgl.c` short-circuits vrend init when `qemu_egl_display` is NULL and adds `VIRGL_RENDERER_NO_VIRGL`).
 - Atrium-patched EDK2 (in the same `qemu-build/roms/edk2/`) — `VirtioGpuDxe` disabled in `ArmVirtPkg/ArmVirtQemu.dsc` and the FDF; otherwise EDK2 probes the GL/venus device at boot and hangs.
-- Atrium-built `virglrenderer` at `~/src/virglrenderer/build/server/virgl_render_server`, installed to `~/.local/libexec/virgl_render_server` and `~/.local/opt/homebrew/libexec/virgl_render_server` (the loader checks both).
+- Atrium-patched `virglrenderer` from `github.com/atrium-os/virglrenderer atrium/main` at `~/src/virglrenderer/build/server/virgl_render_server`, installed to `~/.local/libexec/virgl_render_server` and `~/.local/opt/homebrew/libexec/virgl_render_server` (the loader checks both). Four small macOS-host-venus patches: pthread shim for `<threads.h>` absence; render_log mirror to stderr; `__APPLE__` EOPNOTSUPP fallback in `virgl_renderer_resource_map_fixed` for HVF stage-2; comment on the `mtl_shm` `newBufferWithBytesNoCopy` choice. Source remote: `https://gitlab.freedesktop.org/virgl/virglrenderer.git` as `upstream`.
 - MoltenVK ICD at `$(brew --prefix)/etc/vulkan/icd.d/MoltenVK_icd.json` (brew installs it; run-vm.sh points `VK_ICD_FILENAMES` there directly — *don't* use `/tmp/MoltenVK_atrium.json`, that path doesn't survive macOS reboot and is a known V5h regression).
 
 Inside the VM, the V5 atrium-mesa fork lives at `/root/mesa` (cloned from `github.com/atrium-os/mesa atrium/main`). Build the venus driver:
