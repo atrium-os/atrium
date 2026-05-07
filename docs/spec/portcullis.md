@@ -92,6 +92,16 @@ the static policy file's allow-list.
   plain alternatives, named backend instances per operator,
   static + dynamic mount lifetime via jaild's mount-broker
   protocol.
+- `docs/spec/network.md` — jail networking: capability classes
+  (`disable` / `lo0_alias` / `vnet` / `host_alias`), jaild
+  protocol extension, `atrium-net` GUI mediator daemon, lo0
+  alias allocation, inter-jail policy.
+- `docs/spec/atrium-volumes.md` — the volume-allocation broker:
+  wire protocol, plugin model (tessera/zfs/plain/tmpfs), state
+  file, lifecycle.
+- `docs/spec/atrium-pkg.md` — Atrium package format and install
+  path: CAS-bundle ingest, manifest drop, atomic update, local +
+  remote (V1) registries.
 
 The remainder of this document is largely unchanged in shape; "the
 daemon" is now logically split between jaild (privileged broker)

@@ -426,6 +426,11 @@ Not GUI-mediator daemons; pre-bound for completeness:
 - `docs/spec/storage.md` — per-jail volume allocation
   (atrium-volumes), backend model, static + dynamic mount
   lifetime.
+- `docs/spec/network.md` — jail-side networking model.
+- `docs/spec/atrium-volumes.md` — the volume-allocation broker
+  daemon design.
+- `docs/spec/atrium-pkg.md` — Atrium package format and install
+  path.
 - `docs/LANGUAGE-POLICY.md` — Rust by default, smallest-TCB
   carve-out.
 - `scratch/jail-smoke/` — privsep model validation.

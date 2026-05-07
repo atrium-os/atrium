@@ -769,6 +769,11 @@ When work resumes, in priority order:
 - `docs/spec/jaild-policy.md` (mount source allow-list)
 - `docs/spec/login-handoff.md` (portcullisd's role in lifecycle)
 - `docs/spec/service-management.md` §5 (decomposition decision rule)
+- `docs/spec/network.md` (jail-side networking model)
+- `docs/spec/atrium-volumes.md` (the volume-allocation daemon
+  this spec proposes)
+- `docs/spec/atrium-pkg.md` (how packages get installed into the
+  shape this spec assumes)
 - `portcullis/jaild/INSTALL.md` (jaild client convention)
 - Project memory `tessera_perf_session_2026-05-03` (Tessera fsync perf)
 - Project memory `tessera_pjdfstest_sweep` (POSIX correctness)
