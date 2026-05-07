@@ -111,6 +111,15 @@ for arg in "$@"; do
             # right after vkQueueSubmit returns. Also helps establish
             # a baseline for cache-coherency debugging.
             export MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS=1
+            # Diagnostic: trace every Vulkan call landed on the host
+            # MoltenVK side. Output goes to QEMU stderr (qemu-out.log).
+            # 1 = name+thread, 2 = name+thread+args, 3 = enter+exit.
+            export MVK_CONFIG_TRACE_VULKAN_CALLS=1
+            export MVK_CONFIG_LOG_LEVEL=4
+            # MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS unset — leave
+            # MoltenVK's default (auto-detect / current is 1 on Tahoe).
+            # We tried 0 to chase a useResource:atRange theory — the GPU
+            # writes still didn't reach our buffer, ruling that out.
             # Capture the render server's own log output to a per-pid
             # file. Without this its messages may end up in macOS's
             # unified log (via syslog) where they're hard to find.
