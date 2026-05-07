@@ -82,6 +82,23 @@ fn default_true() -> bool { true }
 
 /// Restart policy for exec'd services (persistent-jail entries
 /// without exec are launched once and not supervised).
+///
+/// Two orthogonal limits prevent runaway behaviour:
+///
+/// - **`max_restarts_per_minute`** is a *rate limit*. Hitting it
+///   pauses restarts on the service for
+///   `cooldown_after_burst_secs`, then retries resume. The
+///   service is NOT given up on; this is just CPU thrashing
+///   protection.
+/// - **`max_consecutive_failures`** is a *give-up threshold*.
+///   A "failure" is an exit within `min_lifetime_for_success_secs`
+///   of being launched (the service didn't even survive a
+///   plausible startup window). After this many consecutive
+///   failures, the supervisor logs an error and stops trying.
+///   A service that survives long enough resets the counter.
+///
+/// systemd has the equivalent of these as `StartLimitBurst` +
+/// `StartLimitInterval` + an internal "start-limit-hit" failure.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Supervision {
     #[serde(default = "default_restart")]
@@ -90,13 +107,26 @@ pub struct Supervision {
     /// Defaults to 1 second; 0 means "immediately."
     #[serde(default = "default_restart_after_secs")]
     pub restart_after_secs: u64,
-    /// Backoff cap. If a service restarts more often than this in
-    /// a 60-second window, the supervisor pauses restarts on it
-    /// for `cooldown_after_burst_secs`.
+    /// Soft rate cap. If a service restarts more often than this
+    /// in a 60-second window, the supervisor pauses restarts on
+    /// it for `cooldown_after_burst_secs`. NOT a give-up
+    /// threshold; just thrashing protection.
     #[serde(default = "default_max_restarts_per_minute")]
     pub max_restarts_per_minute: u32,
     #[serde(default = "default_cooldown_after_burst_secs")]
     pub cooldown_after_burst_secs: u64,
+
+    /// Hard give-up threshold. After this many consecutive
+    /// fast-failures (exit within `min_lifetime_for_success_secs`
+    /// of launch), the supervisor logs the failure and stops
+    /// restarting the service. Default 5.
+    #[serde(default = "default_max_consecutive_failures")]
+    pub max_consecutive_failures: u32,
+    /// A service that survives at least this many seconds after
+    /// launch is considered to have started successfully; the
+    /// consecutive-failures counter resets. Default 5 s.
+    #[serde(default = "default_min_lifetime_for_success_secs")]
+    pub min_lifetime_for_success_secs: u64,
 }
 
 impl Default for Supervision {
@@ -106,6 +136,8 @@ impl Default for Supervision {
             restart_after_secs: default_restart_after_secs(),
             max_restarts_per_minute: default_max_restarts_per_minute(),
             cooldown_after_burst_secs: default_cooldown_after_burst_secs(),
+            max_consecutive_failures: default_max_consecutive_failures(),
+            min_lifetime_for_success_secs: default_min_lifetime_for_success_secs(),
         }
     }
 }
@@ -125,6 +157,8 @@ fn default_restart() -> RestartPolicy { RestartPolicy::OnFailure }
 fn default_restart_after_secs() -> u64 { 1 }
 fn default_max_restarts_per_minute() -> u32 { 5 }
 fn default_cooldown_after_burst_secs() -> u64 { 30 }
+fn default_max_consecutive_failures() -> u32 { 5 }
+fn default_min_lifetime_for_success_secs() -> u64 { 5 }
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ManifestMount {
@@ -374,6 +408,29 @@ mod tests {
         let m: ServiceManifest = toml::from_str(s).unwrap();
         assert_eq!(m.supervision.restart, RestartPolicy::Always);
         assert_eq!(m.supervision.restart_after_secs, 5);
+    }
+
+    #[test]
+    fn supervision_give_up_fields_default() {
+        let s = r#"name = "x"
+                   path = "/""#;
+        let m: ServiceManifest = toml::from_str(s).unwrap();
+        assert_eq!(m.supervision.max_consecutive_failures, 5);
+        assert_eq!(m.supervision.min_lifetime_for_success_secs, 5);
+    }
+
+    #[test]
+    fn supervision_give_up_fields_parse() {
+        let s = r#"
+            name = "x"
+            path = "/"
+            [supervision]
+            max_consecutive_failures = 3
+            min_lifetime_for_success_secs = 2
+        "#;
+        let m: ServiceManifest = toml::from_str(s).unwrap();
+        assert_eq!(m.supervision.max_consecutive_failures, 3);
+        assert_eq!(m.supervision.min_lifetime_for_success_secs, 2);
     }
 
     #[test]

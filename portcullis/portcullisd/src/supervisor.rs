@@ -35,12 +35,21 @@ pub struct ServiceState {
     pub manifest:    ServiceManifest,
     pub procdesc_fd: i32,
     pub pid:         i32,
+    /// Time the current process was launched. Used to decide
+    /// whether an exit counts as a "successful start" (alive
+    /// long enough) or a "fast failure" (didn't even survive
+    /// `min_lifetime_for_success_secs`).
+    pub launched_at: Instant,
     /// Restart-times in the last minute (sliding window).
     pub recent_restarts: VecDeque<Instant>,
     /// If Some(deadline), restarts are suppressed until that time
     /// (reached the burst cap). Reset to None on next launch
     /// after deadline.
     pub burst_pause_until: Option<Instant>,
+    /// How many fast-failures in a row. Reset on a successful
+    /// start. When this exceeds `max_consecutive_failures`, the
+    /// service is permanently retired.
+    pub consecutive_failures: u32,
 }
 
 #[cfg(target_os = "freebsd")]
@@ -200,8 +209,10 @@ impl Supervisor {
             manifest,
             procdesc_fd,
             pid,
+            launched_at: Instant::now(),
             recent_restarts: VecDeque::new(),
             burst_pause_until: None,
+            consecutive_failures: 0,
         });
         Ok(())
     }
@@ -245,10 +256,31 @@ impl Supervisor {
 
     fn handle_exit(&mut self, idx: usize, exit_status: i32) {
         let svc = &mut self.services[idx];
-        info!("{}: pid={} exited (status={exit_status})",
-            svc.manifest.name, svc.pid);
+        let now      = Instant::now();
+        let lifetime = now.duration_since(svc.launched_at);
+        info!("{}: pid={} exited after {:.2}s (status={exit_status})",
+            svc.manifest.name, svc.pid, lifetime.as_secs_f64());
         let _ = ffi::close_fd(svc.procdesc_fd);
         svc.procdesc_fd = -1;
+
+        /* Update consecutive-failure counter. A "successful
+         * start" is defined as surviving at least
+         * min_lifetime_for_success_secs — that's the operator's
+         * declared boundary between "this service is broken" and
+         * "this service is running fine." */
+        let min_lifetime = Duration::from_secs(svc.manifest.supervision.min_lifetime_for_success_secs);
+        if lifetime >= min_lifetime {
+            if svc.consecutive_failures > 0 {
+                debug!("{}: survived {:.2}s ≥ min_lifetime ({:.2}s); resetting failure counter",
+                    svc.manifest.name, lifetime.as_secs_f64(), min_lifetime.as_secs_f64());
+            }
+            svc.consecutive_failures = 0;
+        } else {
+            svc.consecutive_failures += 1;
+            warn!("{}: fast-fail #{} (alive {:.2}s < min_lifetime {:.2}s)",
+                svc.manifest.name, svc.consecutive_failures,
+                lifetime.as_secs_f64(), min_lifetime.as_secs_f64());
+        }
 
         let policy = svc.manifest.supervision.restart;
         let ok = exit_status == 0;
@@ -260,20 +292,28 @@ impl Supervisor {
         if !want_restart {
             info!("{}: not restarting (policy={policy:?}, status={exit_status})",
                 svc.manifest.name);
-            // Move manifest to retired, drop from supervised set.
-            let dead = self.services.remove(idx);
-            self.retired.push(dead.manifest);
-            // Note: udata indexes are now off-by-one for higher
-            // entries. This is fine because EV_ONESHOT removed
-            // the kevent on fire — the subsequent re-launch will
-            // register a new kevent with the correct (updated)
-            // index.
+            self.retire(idx);
+            return;
+        }
+
+        /* Hard give-up threshold. After max_consecutive_failures
+         * fast-failures in a row, declare the service permanently
+         * dead and stop trying. A failing service shouldn't
+         * consume the supervisor forever. */
+        if svc.consecutive_failures >= svc.manifest.supervision.max_consecutive_failures {
+            error!(
+                "{}: PERMANENTLY FAILED — {} consecutive fast-failures (max={}); \
+                 not restarting. Operator: inspect logs and `service` restart \
+                 the supervisor when fixed.",
+                svc.manifest.name,
+                svc.consecutive_failures,
+                svc.manifest.supervision.max_consecutive_failures);
+            self.retire(idx);
             return;
         }
 
         /* Burst control: track timestamp; if exceeded, pause
          * restarts on this service for the cooldown period. */
-        let now = Instant::now();
         let s = &mut self.services[idx];
         s.recent_restarts.push_back(now);
         let one_min_ago = now - Duration::from_secs(60);
@@ -287,6 +327,20 @@ impl Supervisor {
                 s.manifest.name, s.recent_restarts.len(),
                 s.manifest.supervision.cooldown_after_burst_secs);
         }
+    }
+
+    /// Move a service from supervised to retired. Used by both
+    /// the "policy doesn't want restart" path and the
+    /// "max_consecutive_failures hit" path.
+    ///
+    /// Note: udata indexes for higher-numbered services in the
+    /// kqueue are now off-by-one. This is fine because EV_ONESHOT
+    /// already deleted each registered kevent when it fired; the
+    /// next relaunch for any of them will re-register with the
+    /// (updated) index.
+    fn retire(&mut self, idx: usize) {
+        let dead = self.services.remove(idx);
+        self.retired.push(dead.manifest);
     }
 
     /// Walk supervised services with a closed procdesc and
@@ -335,6 +389,7 @@ impl Supervisor {
                 let s = &mut self.services[idx];
                 s.procdesc_fd       = fd;
                 s.pid               = r.pid;
+                s.launched_at       = Instant::now();
                 s.burst_pause_until = None;
             }
             Ok((Response::JailCreated(_), None)) => {

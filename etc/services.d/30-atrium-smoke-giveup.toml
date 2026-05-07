@@ -1,0 +1,31 @@
+# /etc/atrium/services.d/30-atrium-smoke-giveup.toml
+#
+# V3 smoke service: always-fast-fail. Every launch exits cleanly
+# in ~10 ms, well under min_lifetime_for_success_secs. Combined
+# with restart = "always" + max_consecutive_failures = 3, the
+# supervisor should give up after the third consecutive
+# fast-failure, log a PERMANENTLY FAILED error, and stop trying
+# (rather than the V2 behavior of restarting forever).
+
+enabled       = true
+name          = "atrium-smoke-giveup"
+path          = "/"
+children_max  = 0
+devfs_ruleset = 0
+
+[exec]
+path = "/usr/local/bin/atrium-jaild"
+argv = ["atrium-jaild", "check-policy",
+        "--policy", "/etc/atrium/jaild.policy.toml"]
+uid  = 1001
+gid  = 1001
+
+[[exec.env]]
+key   = "PATH"
+value = "/bin:/usr/bin"
+
+[supervision]
+restart                  = "always"
+restart_after_secs       = 1
+max_consecutive_failures = 3
+min_lifetime_for_success_secs = 5

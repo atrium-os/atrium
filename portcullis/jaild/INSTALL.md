@@ -4,6 +4,34 @@ This is the operational install path for the privileged jail-creation
 broker. Spec: `docs/spec/portcullis.md` §0.5,
 `docs/spec/login-handoff.md`.
 
+## Why single-threaded
+
+`atrium-jaild`'s accept loop processes one connection at a time.
+Every operation it does (`jail_set`, `jail_remove`, `pdfork`,
+`nmount`, `execve` in the fork-child) is a fast syscall —
+sub-millisecond on a healthy system. The work that *takes time*
+runs in the children jaild forks, which run in parallel by virtue
+of the kernel scheduler; jaild's parent side returns the moment
+`pdfork` does.
+
+This matches the OpenSSH-privsep pattern: smallest TCB, no shared
+mutable state, no locks, no race conditions. It is intentional.
+
+**Convention for clients:** *one* persistent connection per
+client process. Opening a second concurrent connection while the
+first is still open will block on `accept(2)` until the first
+connection is closed. portcullisd respects this convention; if
+another privileged daemon ever wants to be a jaild client (today
+none do — all the GUI-mediator daemons in
+`docs/spec/service-management.md` §6 manage their own domains),
+it should hold a single jaild connection and serialise its own
+requests through it.
+
+If multi-client jaild is ever genuinely needed, the right answer
+is a small thread-per-connection pool inside jaild — not async,
+not multiple jaild instances. That's a deliberate future
+re-architecture decision, not something to bolt on.
+
 ## Why root, not a dedicated user
 
 `atrium-jaild` runs as `root`. There is no `_jaild` system uid:
