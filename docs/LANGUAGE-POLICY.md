@@ -1,8 +1,12 @@
 # Language policy
 
-> **Kernel = C. Userspace = Rust. Public APIs = C ABI.**
+> **Kernel = C. Userspace = Rust by default. Public APIs = C ABI.**
+>
+> Carve-out: C is acceptable in userspace where (a) inherited from upstream, (b) the code lives in the smallest-TCB tier and a maintainer makes a written case for it, or (c) it's a thin C-ABI shim layer over a Rust implementation.
 
 This document records a one-time architectural decision so contributors know the rule and the reasoning behind it. Re-litigating the question costs more than it saves; that's the only reason this document exists.
+
+Last revised: 2026-05-07. Revisions are themselves rare and require a written case (see §Practical consequences).
 
 ## The rule
 
@@ -23,6 +27,69 @@ This document records a one-time architectural decision so contributors know the
 3. **Ecosystem alignment.** Slint (D5) and Servo + WebRender (D6) are Rust. Modern text and graphics tooling — `lyon`, `rustybuzz`, `swash`, `tiny-skia`, `cosmic-text` — is Rust-first. Asahi-style GPU reverse engineering is Rust-first. Picking C means re-implementing that stack ourselves.
 4. **Already shipped.** `fresco-server`, the four foundation apps, `fresco-rs`, `fresco-text`, and `atrium-gpu-rs` are Rust. Switching is enormous cost for arguable gain.
 5. **Industry direction.** The Linux kernel accepts Rust. Microsoft is shipping Rust in Windows. Google ships Rust in Android. Betting on Rust as a systems language in 2026 is no longer speculative.
+
+## The smallest-TCB carve-out
+
+Added 2026-05-07 after the privsep-architecture work for D2.5 (see
+`docs/spec/portcullis.md` §0.5 and `scratch/jail-smoke/`).
+
+Some Atrium components are the *smallest, most-trusted* tier of
+userspace — code that, if compromised, gives an attacker
+arbitrary-jail-creation, arbitrary-credential-verification, or
+similar root-of-trust privileges. The canonical examples are
+`jaild` (sole `jail_set(2)` caller) and the deferred `atrium-authd`
+(sole `crypt(3)` + master.passwd reader).
+
+For these specifically, C is **defensible but not preferred**. The
+honest argument for each:
+
+**Pro-C for smallest-TCB code:**
+- Auditability: a FreeBSD-shaped reviewer reads C natively.
+- TCB minimization: the most-trusted code shouldn't depend on a
+  large compiler toolchain (rustc) any more than necessary.
+- Tradition: OpenBSD privsep monitors are all small audited C.
+  Existence proof of the approach.
+
+**Pro-Rust for smallest-TCB code (and why we still pick Rust):**
+- Untrusted-input parsing dominates the LoC of these daemons.
+  jaild's policy file is TOML; atrium-authd takes credential bytes
+  from vestibulum. Hand-rolling parsers in C without `serde`-style
+  tooling is exactly the CVE source we're trying to avoid.
+- We depend on rustc for the rest of the platform anyway. Adding
+  a C component doesn't remove the rustc dependency, just adds
+  a different toolchain.
+- 500 LoC of Rust audits about the same as 500 LoC of C, with the
+  bonus that bounds checks aren't a manual-review responsibility.
+
+**Resolution:** smallest-TCB code **is** Rust, but with extra
+discipline:
+
+1. `#![forbid(unsafe_code)]` at the crate root, with a clearly-
+   named `unsafe` syscall-wrapper module (e.g. `mod ffi;`) being
+   the only exception.
+2. No async runtime (no `tokio`, no `async-std`). Use `std::thread`
+   + blocking I/O, or `std::os::unix::io` with `kqueue` directly.
+3. Minimal external dependencies: `libc`, `serde`, `toml`,
+   `thiserror` is a typical full set. Each new dep needs a written
+   justification.
+4. No clever traits, no procedural macros beyond the dep set above,
+   no GATs, no async fn. Aim for "C with safety" reading style;
+   a FreeBSD developer should find the control flow obvious.
+5. `CONTRIBUTING.md` in the crate documents these rules, with the
+   reasoning, so future contributors don't accidentally pull the
+   crate in a different direction.
+
+**Carve-out invocation procedure:** if a maintainer wants a
+new component to be C, they write a section in that component's
+top-level README: "Why this is C", linking to this policy file.
+The case must address (a) why the smallest-TCB argument
+specifically applies, and (b) how the parser-attack-surface concern
+is handled (typically: "no parsing of structured input"). PRs to
+new C-only Atrium-authored userspace components are reviewed
+against this written justification.
+
+To date, no carve-out has been invoked. jaild and atrium-authd are
+both Rust per §The smallest-TCB carve-out resolution above.
 
 ## Vendored / forked dependencies stay in their native language
 
@@ -72,7 +139,39 @@ The only friction is "you can't write a privileged Atrium daemon for our referen
 - New service from scratch → Rust crate, vendored deps via `cargo`, published as a port that wraps the cargo build.
 - New kernel driver → C source under `atrium-kmod/`, `bsd.kmod.mk` Makefile.
 - New public API → C header under each repo's `include/`, with a Rust binding crate alongside (`<service>-rs`).
-- Pull request reviews don't ask "should this be in C instead?" The choice is settled.
+- New smallest-TCB component (rare; jaild and the deferred atrium-authd are the only known cases) → Rust with the discipline rules from §The smallest-TCB carve-out. C is defensible if a maintainer makes the written case; default is still Rust.
+- Pull request reviews don't ask "should this be in C instead?" — the choice is settled — except for the smallest-TCB cases, where the question has a documented answer.
+- Smoke tests / scratch validation hitting raw FreeBSD APIs (jail_set, cap_enter, etc.) are pragmatically C if it's faster to write — see `scratch/jail-smoke/`. Production code is Rust.
+
+## Honest take on the FreeBSD-community question
+
+This was the question that prompted the 2026-05-07 revision: "won't
+Rust create friction with FreeBSD-native contributors?" The honest
+answer:
+
+- **Atrium's contributor pool isn't core-FreeBSD-committers.**
+  Atrium is a platform layered on FreeBSD, like X.org / Wayland /
+  KDE / GNOME are layered on Linux. Wayland's Weston is C; smithay
+  is Rust; both have communities. The Linux kernel community
+  didn't write Weston, and core FreeBSD developers won't be the
+  primary Atrium contributors either.
+- **A C-preferring contributor still has a clear path in.** Per
+  §"Why C at the boundaries", such a contributor can: write a
+  Fresco client in C, write a system service speaking aqueduct in
+  C, author a kernel driver targeting the Atrium GPU ABI in C, or
+  build a different desktop on top of Fresco in C. The "you can't
+  write a privileged Atrium daemon in C" friction applies only to
+  *our reference implementation* of those daemons.
+- **Don't optimise for hypothetical contributors who haven't
+  materialised yet.** Optimise for "the code I write today is
+  correct and safe", because that's what attracts contributors
+  long-term. The Rust safety story for privileged daemons is the
+  single biggest correctness lever we have.
+
+Picking Rust does mean some FreeBSD-native developers won't
+contribute to the daemons. We accept that trade-off. We don't
+accept the trade-off of writing privileged input parsers in
+hand-rolled C.
 
 ## See also
 
