@@ -1,0 +1,114 @@
+#!/bin/sh
+# PROVIDE: atrium_jaild
+# REQUIRE: FILESYSTEMS
+# KEYWORD: shutdown
+#
+# atrium-jaild — privileged jail-creation broker for Atrium.
+#
+# Spec: docs/spec/portcullis.md §0.5,
+#       docs/spec/login-handoff.md.
+#
+# Add to /etc/rc.conf:
+#   atrium_jaild_enable="YES"
+#
+# Optional:
+#   atrium_jaild_policy="/etc/atrium/jaild.policy.toml"
+#   atrium_jaild_socket="/var/run/atrium/jaild.sock"
+#   atrium_jaild_state="/var/run/atrium/jaild.state.toml"
+#   atrium_jaild_logfile="/var/log/atrium/jaild.log"
+#   atrium_jaild_log_level="info"
+
+. /etc/rc.subr
+
+name="atrium_jaild"
+desc="Atrium privileged jail-creation broker"
+rcvar="${name}_enable"
+
+load_rc_config "$name"
+
+: ${atrium_jaild_enable:="NO"}
+: ${atrium_jaild_policy:="/etc/atrium/jaild.policy.toml"}
+: ${atrium_jaild_socket:="/var/run/atrium/jaild.sock"}
+: ${atrium_jaild_state:="/var/run/atrium/jaild.state.toml"}
+: ${atrium_jaild_logfile:="/var/log/atrium/jaild.log"}
+: ${atrium_jaild_log_level:="info"}
+
+command="/usr/local/bin/atrium-jaild"
+command_args="serve --policy ${atrium_jaild_policy} --socket ${atrium_jaild_socket} --state ${atrium_jaild_state}"
+pidfile="/var/run/atrium/jaild.pid"
+
+# We can't use rc.subr's daemon(8) wrapping here because we need
+# the env-var for log level + redirect to a logfile. Use daemon(8)
+# directly via start_cmd.
+start_cmd="atrium_jaild_start"
+stop_cmd="atrium_jaild_stop"
+status_cmd="atrium_jaild_status"
+extra_commands="checkpolicy reload"
+checkpolicy_cmd="atrium_jaild_checkpolicy"
+reload_cmd=":"   # restart instead; no SIGHUP handler in jaild yet
+
+atrium_jaild_prepare_dirs() {
+    install -d -m 0755 -o root -g wheel /var/run/atrium
+    install -d -m 0755 -o root -g wheel /var/log/atrium
+    install -d -m 0755 -o root -g wheel /etc/atrium
+}
+
+atrium_jaild_start() {
+    atrium_jaild_prepare_dirs
+    if [ ! -f "${atrium_jaild_policy}" ]; then
+        err 1 "policy file ${atrium_jaild_policy} missing"
+    fi
+    if "${command}" check-policy --policy "${atrium_jaild_policy}" >/dev/null 2>&1; then
+        :
+    else
+        err 1 "policy file ${atrium_jaild_policy} failed validation; aborting start"
+    fi
+
+    echo "Starting ${name}."
+    /usr/sbin/daemon -f -p "${pidfile}" \
+        -o "${atrium_jaild_logfile}" \
+        -t "${name}" \
+        env RUST_LOG="${atrium_jaild_log_level}" \
+        "${command}" ${command_args}
+}
+
+atrium_jaild_stop() {
+    if [ ! -s "${pidfile}" ]; then
+        echo "${name} not running (no pidfile)."
+        return 0
+    fi
+    pid=$(cat "${pidfile}")
+    echo "Stopping ${name}."
+    kill -TERM "${pid}" 2>/dev/null
+    # daemon(8) removes the pidfile automatically when our child
+    # exits, so re-`cat` will fail mid-loop. Cache `${pid}` once
+    # and use kill -0 ${pid} as the liveness check.
+    for _ in 1 2 3 4 5; do
+        if kill -0 "${pid}" 2>/dev/null; then
+            sleep 1
+        else
+            break
+        fi
+    done
+    if kill -0 "${pid}" 2>/dev/null; then
+        echo "Force-killing ${name}."
+        kill -KILL "${pid}" 2>/dev/null
+    fi
+    rm -f "${pidfile}"
+    rm -f "${atrium_jaild_socket}"
+}
+
+atrium_jaild_status() {
+    if [ -s "${pidfile}" ] && kill -0 "$(cat "${pidfile}")" 2>/dev/null; then
+        echo "${name} is running as pid $(cat "${pidfile}")."
+        return 0
+    fi
+    echo "${name} is not running."
+    return 1
+}
+
+atrium_jaild_checkpolicy() {
+    "${command}" check-policy --policy "${atrium_jaild_policy}"
+}
+
+run_rc_command "$1"
