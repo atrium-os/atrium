@@ -68,6 +68,14 @@ allowed = [
     "atrium-input",      # baseline + input/event*
     "atrium-tty",        # baseline + a specific allocated tty
 ]
+# Numeric ruleset ids these names map to in /etc/devfs.rules.
+# jail_set takes a number; the names above are operator
+# documentation. Empty here means "no devfs_ruleset may be set"
+# (jails inherit the host devfs). Populate this list once the
+# operator has actual ruleset blocks defined; sample numbering:
+#   5 = atrium-baseline    6 = atrium-gpu
+#   7 = atrium-input       8 = atrium-tty
+allowed_ids = []
 
 
 # ---------------------------------------------------------------

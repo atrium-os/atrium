@@ -60,8 +60,18 @@ pub struct MountSources {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct DevfsRulesets {
+    /// Named rulesets, for documentation / cross-reference with
+    /// `/etc/devfs.rules`. Not used for kernel calls — `jail_set`
+    /// takes a number. See `allowed_ids`.
     #[serde(default)]
     pub allowed: Vec<String>,
+    /// Numeric ruleset IDs jaild may pass to `jail_set` as
+    /// `devfs_ruleset`. The kernel side of `jail_set` takes a
+    /// number; the names above are operator-readable only.
+    /// Empty list = no devfs_ruleset may be set on jails (inherit
+    /// host devfs). 0 is always permitted (= "inherit").
+    #[serde(default)]
+    pub allowed_ids: Vec<u32>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

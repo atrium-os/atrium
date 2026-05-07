@@ -75,6 +75,14 @@ pub struct CreateJailRequest {
     #[serde(default)]
     pub mounts: Vec<MountSpec>,
 
+    /// Numeric devfs ruleset ID. 0 (the default) means "inherit
+    /// the host's devfs", which is permissive — production jails
+    /// should always set a non-zero ruleset constraining
+    /// `/dev/*` visibility per their capability profile. Validated
+    /// against `policy.devfs_rulesets.allowed_ids` (0 always OK).
+    #[serde(default)]
+    pub devfs_ruleset: u32,
+
     /// If set, the broker forks (pdfork), applies mounts,
     /// jail_attaches, drops to (gid, uid), and execs the binary.
     /// The parent returns the procdesc fd via SCM_RIGHTS.
@@ -256,9 +264,10 @@ mod tests {
         let req = Request::CreateJail(CreateJailRequest {
             name: "atrium-test".into(),
             path: "/usr/local/share/atrium".into(),
-            children_max: 0,
-            mounts: vec![],
-            exec:   None,
+            children_max:  0,
+            mounts:        vec![],
+            devfs_ruleset: 0,
+            exec:          None,
         });
         let bytes = serde_json::to_vec(&req).unwrap();
         let back: Request = serde_json::from_slice(&bytes).unwrap();

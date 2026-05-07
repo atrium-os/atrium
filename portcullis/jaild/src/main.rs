@@ -18,6 +18,7 @@ use log::{error, info};
 
 const DEFAULT_POLICY: &str = "/etc/atrium/jaild.policy.toml";
 const DEFAULT_SOCKET: &str = "/var/run/atrium/jaild.sock";
+const DEFAULT_STATE:  &str = "/var/run/atrium/jaild.state.toml";
 
 fn main() -> ExitCode {
     /* env_logger reads RUST_LOG; default to info for jaild. The
@@ -35,6 +36,7 @@ fn main() -> ExitCode {
 
     let mut policy_path = PathBuf::from(DEFAULT_POLICY);
     let mut socket_path = PathBuf::from(DEFAULT_SOCKET);
+    let mut state_path  = PathBuf::from(DEFAULT_STATE);
     let mut dry_run     = false;
 
     while let Some(arg) = args.next() {
@@ -46,6 +48,10 @@ fn main() -> ExitCode {
             "--socket" => {
                 let Some(p) = args.next() else { return usage(); };
                 socket_path = PathBuf::from(p);
+            }
+            "--state" => {
+                let Some(p) = args.next() else { return usage(); };
+                state_path = PathBuf::from(p);
             }
             "--dry-run" => { dry_run = true; }
             "--help" | "-h" => return usage(),
@@ -72,7 +78,7 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        "serve" => match run_serve(&policy_path, &socket_path, dry_run) {
+        "serve" => match run_serve(&policy_path, &socket_path, &state_path, dry_run) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 error!("jaild fatal: {e}");
@@ -86,6 +92,7 @@ fn main() -> ExitCode {
 fn run_serve(
     policy_path: &std::path::Path,
     socket_path: &std::path::Path,
+    state_path:  &std::path::Path,
     dry_run:     bool,
 ) -> Result<(), jaild::JaildError> {
     let policy = Policy::load(policy_path)?;
@@ -103,7 +110,7 @@ fn run_serve(
     let listener = jaild::server::bind(socket_path)?;
     info!("jaild: listening on {}", socket_path.display());
 
-    jaild::server::serve(&listener, &policy, dry_run)?;
+    jaild::server::serve(&listener, &policy, dry_run, state_path)?;
     Ok(())
 }
 
@@ -111,7 +118,8 @@ fn usage() -> ExitCode {
     eprintln!(
         "usage:
   atrium-jaild check-policy [--policy <path>]
-  atrium-jaild serve        [--policy <path>] [--socket <path>] [--dry-run]
+  atrium-jaild serve        [--policy <path>] [--socket <path>]
+                            [--state  <path>] [--dry-run]
 "
     );
     ExitCode::from(2)

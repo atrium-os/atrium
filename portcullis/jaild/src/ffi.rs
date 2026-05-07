@@ -63,10 +63,13 @@ unsafe fn jail_remove(_jid: i32) -> i32 {
 /// devfs_ruleset, ip4, exec) will be added in V1 by adding more
 /// iovec pairs in the `create_jail` body.
 pub struct JailCreateSpec<'a> {
-    pub name:         &'a str,
-    pub path:         &'a str,
-    pub persist:      i32,    // 0 or 1
-    pub children_max: i32,
+    pub name:           &'a str,
+    pub path:           &'a str,
+    pub persist:        i32,    // 0 or 1
+    pub children_max:   i32,
+    /// 0 = inherit host devfs (do NOT pass devfs_ruleset key to
+    /// jail_set). Non-zero = pass that ruleset id.
+    pub devfs_ruleset:  u32,
 }
 
 /// Result of a successful `jail_set(JAIL_CREATE)`. The `jid` is
@@ -78,77 +81,18 @@ pub struct CreatedJail {
 /// Make a persistent jail. Wraps `jail_set(2)` with `JAIL_CREATE`.
 /// Returns the kernel-assigned jail id, or a typed error.
 pub fn create_persistent_jail(spec: &JailCreateSpec) -> io::Result<CreatedJail> {
-    /* Build C strings once; their `as_ptr()` is valid as long as
-     * each `CString` is held in scope, which lasts past the
-     * jail_set call. */
-    let c_name        = c_string(spec.name)?;
-    let c_path        = c_string(spec.path)?;
-    let mut errmsg    = vec![0u8; 256];
-
-    /* Field-name C strings. These can be 'static — they're string
-     * literals — but we still need NUL termination, which Rust
-     * string literals don't have. Use `CString::new` to add the
-     * NUL once at startup. */
-    let key_name         = c_string("name")?;
-    let key_path         = c_string("path")?;
-    let key_persist      = c_string("persist")?;
-    let key_children_max = c_string("children.max")?;
-    let key_errmsg       = c_string("errmsg")?;
-
-    let persist = spec.persist;
-    let cmax    = spec.children_max;
-
-    /* Build the iovec array. Each (key, value) pair consumes 2
-     * iovec slots. iov_len includes the trailing NUL for strings,
-     * and is sizeof(T) for scalars. */
-    let mut iov: [libc::iovec; 10] = [libc::iovec {
-        iov_base: std::ptr::null_mut(),
-        iov_len:  0,
-    }; 10];
-
-    // SAFETY: each `iov_base` points into a CString or local
-    // variable that outlives the jail_set call below. iov_len
-    // matches each region's size exactly.
-    unsafe {
-        iov[0].iov_base = key_name.as_ptr() as *mut _;
-        iov[0].iov_len  = key_name.as_bytes_with_nul().len();
-        iov[1].iov_base = c_name.as_ptr() as *mut _;
-        iov[1].iov_len  = c_name.as_bytes_with_nul().len();
-
-        iov[2].iov_base = key_path.as_ptr() as *mut _;
-        iov[2].iov_len  = key_path.as_bytes_with_nul().len();
-        iov[3].iov_base = c_path.as_ptr() as *mut _;
-        iov[3].iov_len  = c_path.as_bytes_with_nul().len();
-
-        iov[4].iov_base = key_persist.as_ptr() as *mut _;
-        iov[4].iov_len  = key_persist.as_bytes_with_nul().len();
-        iov[5].iov_base = (&persist as *const i32) as *mut _;
-        iov[5].iov_len  = std::mem::size_of::<i32>();
-
-        iov[6].iov_base = key_children_max.as_ptr() as *mut _;
-        iov[6].iov_len  = key_children_max.as_bytes_with_nul().len();
-        iov[7].iov_base = (&cmax as *const i32) as *mut _;
-        iov[7].iov_len  = std::mem::size_of::<i32>();
-
-        iov[8].iov_base = key_errmsg.as_ptr() as *mut _;
-        iov[8].iov_len  = key_errmsg.as_bytes_with_nul().len();
-        iov[9].iov_base = errmsg.as_mut_ptr() as *mut _;
-        iov[9].iov_len  = errmsg.len();
-
-        let jid = jail_set(iov.as_mut_ptr(), iov.len() as u32, JAIL_CREATE);
-        if jid < 0 {
-            // Trim errmsg to the C NUL if any.
-            let nul = errmsg.iter().position(|&b| b == 0).unwrap_or(errmsg.len());
-            errmsg.truncate(nul);
-            let extra = String::from_utf8_lossy(&errmsg).into_owned();
-            return Err(io::Error::new(
-                io::Error::last_os_error().kind(),
-                format!("jail_set: {} (kernel: {extra})",
-                    io::Error::last_os_error()),
-            ));
-        }
-        Ok(CreatedJail { jid })
+    let mut iob = IovBuilder::new();
+    iob.add_string("name", spec.name)?;
+    iob.add_string("path", spec.path)?;
+    iob.add_i32   ("persist",      spec.persist);
+    iob.add_i32   ("children.max", spec.children_max);
+    if spec.devfs_ruleset != 0 {
+        iob.add_u32("devfs_ruleset", spec.devfs_ruleset);
     }
+    let mut errmsg = vec![0u8; 256];
+    iob.add_buf("errmsg", &mut errmsg);
+    let jid = iob.run(JAIL_CREATE, &errmsg)?;
+    Ok(CreatedJail { jid })
 }
 
 /// Tear down a jail by jid. Idempotent at the wrapper level: ENOENT
@@ -226,53 +170,150 @@ pub fn pdfork() -> io::Result<PdforkOutcome> {
 /// process. Same iovec construction as `create_persistent_jail`,
 /// just different flags + no `persist` field.
 pub fn jail_create_and_attach(spec: &JailCreateSpec) -> io::Result<i32> {
-    let c_name        = c_string(spec.name)?;
-    let c_path        = c_string(spec.path)?;
-    let mut errmsg    = vec![0u8; 256];
+    let mut iob = IovBuilder::new();
+    iob.add_string("name", spec.name)?;
+    iob.add_string("path", spec.path)?;
+    iob.add_i32   ("children.max", spec.children_max);
+    if spec.devfs_ruleset != 0 {
+        iob.add_u32("devfs_ruleset", spec.devfs_ruleset);
+    }
+    let mut errmsg = vec![0u8; 256];
+    iob.add_buf("errmsg", &mut errmsg);
+    iob.run(JAIL_CREATE | JAIL_ATTACH, &errmsg)
+}
 
-    let key_name         = c_string("name")?;
-    let key_path         = c_string("path")?;
-    let key_children_max = c_string("children.max")?;
-    let key_errmsg       = c_string("errmsg")?;
+/// Tiny builder for the iovec array `jail_set` consumes. Owns
+/// the CStrings (so their pointers stay valid until `run`).
+/// Conditional pairs are easier with this shape than with fixed
+/// stack arrays — still all the action lives in one tight `unsafe`
+/// block at the bottom.
+struct IovBuilder {
+    /* Holders so each CString outlives the syscall. */
+    keys:   Vec<CString>,
+    vals:   Vec<CString>,        // string values
+    i32s:   Vec<i32>,            // i32 values
+    u32s:   Vec<u32>,            // u32 values
+    /* For each entry, what kind of payload it has. The actual
+     * iovec is built inside `run` from these arrays. */
+    entries: Vec<Entry>,
+}
 
-    let cmax = spec.children_max;
+enum Entry {
+    /* Indexes into the holder vectors above. */
+    KeyVal { key_idx: usize, val_idx: usize, kind: ValKind },
+    KeyBuf { key_idx: usize, buf_ptr: *mut u8, buf_len: usize },
+}
 
-    let mut iov: [libc::iovec; 8] = [libc::iovec {
-        iov_base: std::ptr::null_mut(),
-        iov_len:  0,
-    }; 8];
+#[derive(Clone, Copy)]
+enum ValKind { Str, I32, U32 }
 
-    // SAFETY: same as create_persistent_jail.
-    unsafe {
-        iov[0].iov_base = key_name.as_ptr() as *mut _;
-        iov[0].iov_len  = key_name.as_bytes_with_nul().len();
-        iov[1].iov_base = c_name.as_ptr() as *mut _;
-        iov[1].iov_len  = c_name.as_bytes_with_nul().len();
+impl IovBuilder {
+    fn new() -> Self {
+        Self {
+            keys: Vec::with_capacity(8),
+            vals: Vec::with_capacity(4),
+            i32s: Vec::with_capacity(2),
+            u32s: Vec::with_capacity(2),
+            entries: Vec::with_capacity(8),
+        }
+    }
 
-        iov[2].iov_base = key_path.as_ptr() as *mut _;
-        iov[2].iov_len  = key_path.as_bytes_with_nul().len();
-        iov[3].iov_base = c_path.as_ptr() as *mut _;
-        iov[3].iov_len  = c_path.as_bytes_with_nul().len();
+    fn add_string(&mut self, key: &str, val: &str) -> io::Result<()> {
+        self.keys.push(c_string(key)?);
+        self.vals.push(c_string(val)?);
+        self.entries.push(Entry::KeyVal {
+            key_idx: self.keys.len() - 1,
+            val_idx: self.vals.len() - 1,
+            kind:    ValKind::Str,
+        });
+        Ok(())
+    }
 
-        iov[4].iov_base = key_children_max.as_ptr() as *mut _;
-        iov[4].iov_len  = key_children_max.as_bytes_with_nul().len();
-        iov[5].iov_base = (&cmax as *const i32) as *mut _;
-        iov[5].iov_len  = std::mem::size_of::<i32>();
+    fn add_i32(&mut self, key: &str, val: i32) {
+        self.keys.push(CString::new(key).expect("static key has nul?"));
+        self.i32s.push(val);
+        self.entries.push(Entry::KeyVal {
+            key_idx: self.keys.len() - 1,
+            val_idx: self.i32s.len() - 1,
+            kind:    ValKind::I32,
+        });
+    }
 
-        iov[6].iov_base = key_errmsg.as_ptr() as *mut _;
-        iov[6].iov_len  = key_errmsg.as_bytes_with_nul().len();
-        iov[7].iov_base = errmsg.as_mut_ptr() as *mut _;
-        iov[7].iov_len  = errmsg.len();
+    fn add_u32(&mut self, key: &str, val: u32) {
+        self.keys.push(CString::new(key).expect("static key has nul?"));
+        self.u32s.push(val);
+        self.entries.push(Entry::KeyVal {
+            key_idx: self.keys.len() - 1,
+            val_idx: self.u32s.len() - 1,
+            kind:    ValKind::U32,
+        });
+    }
 
-        let jid = jail_set(iov.as_mut_ptr(), iov.len() as u32,
-                           JAIL_CREATE | JAIL_ATTACH);
+    fn add_buf(&mut self, key: &str, buf: &mut [u8]) {
+        self.keys.push(CString::new(key).expect("static key has nul?"));
+        self.entries.push(Entry::KeyBuf {
+            key_idx: self.keys.len() - 1,
+            buf_ptr: buf.as_mut_ptr(),
+            buf_len: buf.len(),
+        });
+    }
+
+    fn run(&self, flags: i32, errmsg: &[u8]) -> io::Result<i32> {
+        let mut iov: Vec<libc::iovec> = Vec::with_capacity(self.entries.len() * 2);
+        for entry in &self.entries {
+            match *entry {
+                Entry::KeyVal { key_idx, val_idx, kind } => {
+                    let k = &self.keys[key_idx];
+                    iov.push(libc::iovec {
+                        iov_base: k.as_ptr() as *mut _,
+                        iov_len:  k.as_bytes_with_nul().len(),
+                    });
+                    match kind {
+                        ValKind::Str => {
+                            let v = &self.vals[val_idx];
+                            iov.push(libc::iovec {
+                                iov_base: v.as_ptr() as *mut _,
+                                iov_len:  v.as_bytes_with_nul().len(),
+                            });
+                        }
+                        ValKind::I32 => {
+                            iov.push(libc::iovec {
+                                iov_base: (&self.i32s[val_idx] as *const i32) as *mut _,
+                                iov_len:  std::mem::size_of::<i32>(),
+                            });
+                        }
+                        ValKind::U32 => {
+                            iov.push(libc::iovec {
+                                iov_base: (&self.u32s[val_idx] as *const u32) as *mut _,
+                                iov_len:  std::mem::size_of::<u32>(),
+                            });
+                        }
+                    }
+                }
+                Entry::KeyBuf { key_idx, buf_ptr, buf_len } => {
+                    let k = &self.keys[key_idx];
+                    iov.push(libc::iovec {
+                        iov_base: k.as_ptr() as *mut _,
+                        iov_len:  k.as_bytes_with_nul().len(),
+                    });
+                    iov.push(libc::iovec {
+                        iov_base: buf_ptr as *mut _,
+                        iov_len:  buf_len,
+                    });
+                }
+            }
+        }
+        // SAFETY: each iov_base points into a holder above (CString
+        // / scalar / external buffer) that outlives this call.
+        let jid = unsafe {
+            jail_set(iov.as_mut_ptr(), iov.len() as u32, flags)
+        };
         if jid < 0 {
-            let nul = errmsg.iter().position(|&b| b == 0).unwrap_or(errmsg.len());
-            errmsg.truncate(nul);
-            let extra = String::from_utf8_lossy(&errmsg).into_owned();
+            let trimmed_len = errmsg.iter().position(|&b| b == 0).unwrap_or(errmsg.len());
+            let extra = String::from_utf8_lossy(&errmsg[..trimmed_len]).into_owned();
             return Err(io::Error::new(
                 io::Error::last_os_error().kind(),
-                format!("jail_set(CREATE|ATTACH): {} (kernel: {extra})",
+                format!("jail_set: {} (kernel: {extra})",
                     io::Error::last_os_error()),
             ));
         }

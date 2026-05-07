@@ -1,0 +1,214 @@
+//! Persistent state — the list of jaild-managed *persistent* jails
+//! that a restarted jaild needs to know about.
+//!
+//! Lives at `/var/run/atrium/jaild.state.toml`. Atomically updated
+//! (`<path>.tmp` + fsync + rename) on every persistent
+//! create/remove. On startup, jaild loads this file and uses it
+//! to refuse re-creating a jail that already exists.
+//!
+//! Exec'd jails (those with `ExecSpec`) are *not* tracked here.
+//! They use `persist=0` so they die with their process; they're
+//! also not jaild's responsibility to remember — the procdesc fd
+//! lives with the requester (portcullisd) and is the
+//! authoritative lifecycle handle.
+//!
+//! ## Crash semantics
+//!
+//! - jaild crashes mid-write: the `.tmp` file may be partial; the
+//!   rename hasn't happened, so the canonical file is still the
+//!   pre-crash state. On restart we'll re-claim those jails. The
+//!   only loss is the in-flight create/remove that was racing the
+//!   crash.
+//! - jaild crashes between `jail_set` returning and writing
+//!   state: the kernel has a jail jaild doesn't know about. On
+//!   restart we'd refuse to re-create the same name (because the
+//!   kernel still has it under that name), but our state file
+//!   wouldn't list it. **Not handled in V1b.** A future
+//!   "reconcile against `kern.jail.list`" pass at startup would
+//!   close this.
+
+use std::fs::{self, File};
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+
+use crate::JaildError;
+
+pub const SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct PersistentState {
+    pub schema_version: u32,
+    #[serde(default)]
+    pub written_at_unix: u64,
+    #[serde(default)]
+    pub jails: Vec<JailRecord>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct JailRecord {
+    pub name:            String,
+    pub jid:             i32,
+    pub created_at_unix: u64,
+}
+
+impl PersistentState {
+    pub fn empty() -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            written_at_unix: now_unix(),
+            jails: Vec::new(),
+        }
+    }
+
+    /// Load from `path` if it exists. Missing file → empty state
+    /// (first boot). Schema mismatch → error (operator must
+    /// migrate manually).
+    pub fn load(path: &Path) -> Result<Self, JaildError> {
+        match fs::read_to_string(path) {
+            Ok(s) => {
+                let st: PersistentState = toml::from_str(&s)
+                    .map_err(|e| JaildError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("parse state file: {e}"),
+                    )))?;
+                if st.schema_version != SCHEMA_VERSION {
+                    return Err(JaildError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "state schema_version {} unsupported (expect {})",
+                            st.schema_version, SCHEMA_VERSION),
+                    )));
+                }
+                Ok(st)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Ok(Self::empty())
+            }
+            Err(e) => Err(JaildError::Io(e)),
+        }
+    }
+
+    /// Atomically replace the file at `path` with the current
+    /// state. Pattern: write to `<path>.tmp`, fsync, rename.
+    /// Crash mid-write leaves the canonical file intact.
+    pub fn save(&self, path: &Path) -> Result<(), JaildError> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        let mut tmp_path = PathBuf::from(path);
+        tmp_path.set_extension("toml.tmp");
+        {
+            let mut f = File::create(&tmp_path)?;
+            let body = toml::to_string_pretty(self)
+                .map_err(|e| JaildError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("serialize state: {e}"),
+                )))?;
+            f.write_all(body.as_bytes())?;
+            f.sync_all()?;
+        }
+        fs::rename(&tmp_path, path)?;
+        Ok(())
+    }
+
+    pub fn add(&mut self, name: &str, jid: i32) {
+        self.jails.push(JailRecord {
+            name: name.to_string(),
+            jid,
+            created_at_unix: now_unix(),
+        });
+        self.written_at_unix = now_unix();
+    }
+
+    pub fn remove_by_jid(&mut self, jid: i32) -> bool {
+        let before = self.jails.len();
+        self.jails.retain(|r| r.jid != jid);
+        if self.jails.len() != before {
+            self.written_at_unix = now_unix();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn has_name(&self, name: &str) -> bool {
+        self.jails.iter().any(|r| r.name == name)
+    }
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn load_missing_returns_empty() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("nope.toml");
+        let st = PersistentState::load(&p).unwrap();
+        assert_eq!(st.schema_version, SCHEMA_VERSION);
+        assert!(st.jails.is_empty());
+    }
+
+    #[test]
+    fn save_then_load_round_trip() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("state.toml");
+
+        let mut st = PersistentState::empty();
+        st.add("atrium-foo", 7);
+        st.add("atrium-bar", 8);
+        st.save(&p).unwrap();
+
+        let back = PersistentState::load(&p).unwrap();
+        assert_eq!(back.jails.len(), 2);
+        assert_eq!(back.jails[0].name, "atrium-foo");
+        assert_eq!(back.jails[0].jid, 7);
+        assert!(back.has_name("atrium-bar"));
+    }
+
+    #[test]
+    fn remove_by_jid_works() {
+        let mut st = PersistentState::empty();
+        st.add("atrium-a", 1);
+        st.add("atrium-b", 2);
+        assert!(st.remove_by_jid(1));
+        assert!(!st.has_name("atrium-a"));
+        assert!(st.has_name("atrium-b"));
+        assert!(!st.remove_by_jid(99));   // no-op for unknown jid
+    }
+
+    #[test]
+    fn schema_mismatch_rejected() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("state.toml");
+        std::fs::write(&p, "schema_version = 999\nwritten_at_unix = 0\njails = []\n").unwrap();
+        let err = PersistentState::load(&p).unwrap_err();
+        match err {
+            JaildError::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidData),
+            other => panic!("wrong: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn atomic_save_leaves_no_tmp() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("state.toml");
+        let mut st = PersistentState::empty();
+        st.add("atrium-x", 5);
+        st.save(&p).unwrap();
+        let mut tmp = p.clone();
+        tmp.set_extension("toml.tmp");
+        assert!(p.exists());
+        assert!(!tmp.exists(), "tmp should be renamed away");
+    }
+}

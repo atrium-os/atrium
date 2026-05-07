@@ -19,6 +19,7 @@ use crate::protocol::{
     self, CreateJailRequest, CreateJailResponse, ExecSpec, MountKind,
     Request, Response,
 };
+use crate::state::PersistentState;
 use crate::validator;
 use crate::JaildError;
 
@@ -33,12 +34,20 @@ use crate::JaildError;
 /// `dry_run`: if true, the validator runs but `jail_set` is not
 /// invoked — useful for testing the protocol path without
 /// privileges.
+///
+/// `state_path`: path to the persistent state file. Atomically
+/// replaced on every successful persistent create/remove. Loaded
+/// once at startup; in-memory copy is the source of truth from
+/// then on (the file is just a crash-recovery snapshot).
 pub fn serve(
-    listener: &UnixListener,
-    policy:   &Policy,
-    dry_run:  bool,
+    listener:   &UnixListener,
+    policy:     &Policy,
+    dry_run:    bool,
+    state_path: &Path,
 ) -> Result<(), JaildError> {
-    info!("jaild: ready (dry_run={dry_run})");
+    let mut state = PersistentState::load(state_path)?;
+    info!("jaild: ready (dry_run={dry_run}); state has {} known jail(s)",
+        state.jails.len());
     for inbound in listener.incoming() {
         let stream = match inbound {
             Ok(s) => s,
@@ -47,7 +56,7 @@ pub fn serve(
                 return Err(JaildError::Io(e));
             }
         };
-        if let Err(e) = handle_connection(stream, policy, dry_run) {
+        if let Err(e) = handle_connection(stream, policy, dry_run, &mut state, state_path) {
             warn!("connection closed with error: {e}");
         }
     }
@@ -55,9 +64,11 @@ pub fn serve(
 }
 
 fn handle_connection(
-    stream:  UnixStream,
-    policy:  &Policy,
-    dry_run: bool,
+    stream:     UnixStream,
+    policy:     &Policy,
+    dry_run:    bool,
+    state:      &mut PersistentState,
+    state_path: &Path,
 ) -> Result<(), JaildError> {
     let peer_uid = peer_uid(&stream).unwrap_or(u32::MAX);
     info!("jaild: accepted conn (peer uid={peer_uid})");
@@ -98,7 +109,7 @@ fn handle_connection(
          * attach via SCM_RIGHTS; everything else returns None.
          * This branch keeps the raw send for the fd path while
          * everything else goes through the same single-call path. */
-        let (resp, fd_to_attach) = dispatch(req, policy, dry_run);
+        let (resp, fd_to_attach) = dispatch(req, policy, dry_run, state, state_path);
         send_response(socket_fd, &resp, fd_to_attach)?;
 
         /* If we sent an fd over SCM_RIGHTS, our copy is no longer
@@ -111,15 +122,17 @@ fn handle_connection(
 }
 
 fn dispatch(
-    req:     Request,
-    policy:  &Policy,
-    dry_run: bool,
+    req:        Request,
+    policy:     &Policy,
+    dry_run:    bool,
+    state:      &mut PersistentState,
+    state_path: &Path,
 ) -> (Response, Option<i32>) {
     match req {
         Request::Ping => (Response::Ok, None),
 
         Request::CreateJail(spec) => {
-            match handle_create(&spec, policy, dry_run) {
+            match handle_create(&spec, policy, dry_run, state, state_path) {
                 Ok(CreateOutcome { resp, procdesc_fd }) => {
                     (Response::JailCreated(resp), procdesc_fd)
                 }
@@ -136,10 +149,18 @@ fn dispatch(
         Request::RemoveJail { jid } => {
             if dry_run {
                 info!("jaild: dry-run RemoveJail jid={jid}");
+                state.remove_by_jid(jid);
                 return (Response::Ok, None);
             }
             match ffi::remove_jail(jid) {
-                Ok(()) => (Response::Ok, None),
+                Ok(()) => {
+                    if state.remove_by_jid(jid) {
+                        if let Err(e) = state.save(state_path) {
+                            warn!("jaild: state save after remove: {e}");
+                        }
+                    }
+                    (Response::Ok, None)
+                }
                 Err(e) => (Response::SyscallFailed {
                     name:  "jail_remove".into(),
                     errno: e.raw_os_error().unwrap_or(-1),
@@ -158,11 +179,27 @@ struct CreateOutcome {
 }
 
 fn handle_create(
-    req:     &CreateJailRequest,
-    policy:  &Policy,
-    dry_run: bool,
+    req:        &CreateJailRequest,
+    policy:     &Policy,
+    dry_run:    bool,
+    state:      &mut PersistentState,
+    state_path: &Path,
 ) -> Result<CreateOutcome, JaildError> {
     validator::validate_create(req, policy)?;
+
+    /* Persistent-jail name uniqueness: refuse to step on an
+     * existing record. (The kernel would reject the duplicate
+     * name anyway, but its error is less helpful than ours.)
+     * Exec'd jails skip this — they share a name across many
+     * launches, none of which we track. */
+    if req.exec.is_none() && state.has_name(&req.name) {
+        return Err(JaildError::PolicyViolation {
+            rule:   "name.duplicate",
+            detail: format!(
+                "persistent jail named {:?} already exists in jaild state",
+                req.name),
+        });
+    }
 
     if dry_run {
         info!(
@@ -182,10 +219,11 @@ fn handle_create(
     }
 
     let spec = JailCreateSpec {
-        name:         &req.name,
-        path:         &req.path,
-        persist:      1,
-        children_max: req.children_max as i32,
+        name:           &req.name,
+        path:           &req.path,
+        persist:        1,
+        children_max:   req.children_max as i32,
+        devfs_ruleset:  req.devfs_ruleset,
     };
     let created = ffi::create_persistent_jail(&spec).map_err(|e| {
         JaildError::Syscall {
@@ -195,6 +233,16 @@ fn handle_create(
         }
     })?;
     info!("jaild: jail_set OK name={} jid={}", req.name, created.jid);
+
+    state.add(&req.name, created.jid);
+    if let Err(e) = state.save(state_path) {
+        /* The kernel has the jail; we just couldn't persist a
+         * record. Log loudly but return success to the caller —
+         * they have the jid. State will be re-synced manually if
+         * this turns into a recovery problem. */
+        warn!("jaild: state save after create: {e}");
+    }
+
     Ok(CreateOutcome {
         resp: CreateJailResponse {
             jid: created.jid, pid: 0, procdesc_attached: false,
@@ -242,10 +290,11 @@ fn handle_create_with_exec(
         }
 
         let spec = JailCreateSpec {
-            name:         &req.name,
-            path:         &req.path,
-            persist:      0,    // ATTACH path: jail dies with the process
-            children_max: req.children_max as i32,
+            name:           &req.name,
+            path:           &req.path,
+            persist:        0,    // ATTACH path: jail dies with the process
+            children_max:   req.children_max as i32,
+            devfs_ruleset:  req.devfs_ruleset,
         };
         if let Err(e) = ffi::jail_create_and_attach(&spec) {
             eprintln!("jaild-child: jail_create_and_attach: {e}");

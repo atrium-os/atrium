@@ -27,11 +27,30 @@ pub fn validate_create(
     validate_name(&req.name)?;
     validate_path(&req.path, policy)?;
     validate_children_max(req.children_max, policy)?;
+    validate_devfs_ruleset(req.devfs_ruleset, policy)?;
     for m in &req.mounts {
         validate_mount(m, policy)?;
     }
     if let Some(exec) = &req.exec {
         validate_exec(exec, policy)?;
+    }
+    Ok(())
+}
+
+fn validate_devfs_ruleset(id: u32, policy: &Policy) -> Result<(), JaildError> {
+    /* 0 = "inherit host devfs". Always permitted; it's the
+     * default. Production policies SHOULD constrain to
+     * non-zero, but jaild doesn't enforce that — that's a
+     * portcullisd-side concern (what gets requested). */
+    if id == 0 {
+        return Ok(());
+    }
+    if !policy.devfs_rulesets.allowed_ids.iter().any(|n| *n == id) {
+        return Err(JaildError::PolicyViolation {
+            rule:   "devfs_ruleset.not_allowed",
+            detail: format!(
+                "devfs_ruleset {id} not in policy.devfs_rulesets.allowed_ids"),
+        });
     }
     Ok(())
 }
@@ -333,11 +352,12 @@ mod tests {
     fn create_request_full_validate() {
         let p = load_sample_policy();
         let req = CreateJailRequest {
-            name:         "atrium-test".into(),
-            path:         "/".into(),
-            children_max: 0,
-            mounts:       vec![],
-            exec:         None,
+            name:          "atrium-test".into(),
+            path:          "/".into(),
+            children_max:  0,
+            mounts:        vec![],
+            devfs_ruleset: 0,
+            exec:          None,
         };
         validate_create(&req, &p).unwrap();
     }
@@ -346,11 +366,12 @@ mod tests {
     fn create_request_bad_name_rejected() {
         let p = load_sample_policy();
         let req = CreateJailRequest {
-            name:         "evil-x".into(),
-            path:         "/".into(),
-            children_max: 0,
-            mounts:       vec![],
-            exec:         None,
+            name:          "evil-x".into(),
+            path:          "/".into(),
+            children_max:  0,
+            mounts:        vec![],
+            devfs_ruleset: 0,
+            exec:          None,
         };
         let err = validate_create(&req, &p).unwrap_err();
         match err {
@@ -363,9 +384,10 @@ mod tests {
         CreateJailRequest {
             name: "atrium-test".into(),
             path: "/".into(),
-            children_max: 0,
-            mounts: vec![],
-            exec: None,
+            children_max:  0,
+            mounts:        vec![],
+            devfs_ruleset: 0,
+            exec:          None,
         }
     }
 
@@ -512,6 +534,29 @@ mod tests {
             gid:  1001,
         });
         validate_create(&r, &p).unwrap();
+    }
+
+    #[test]
+    fn devfs_ruleset_zero_always_ok() {
+        let p = load_sample_policy();
+        // Sample policy has empty allowed_ids; 0 must still be OK.
+        validate_devfs_ruleset(0, &p).unwrap();
+    }
+
+    #[test]
+    fn devfs_ruleset_nonzero_rejected_when_empty_allowlist() {
+        let p = load_sample_policy();
+        let err = validate_devfs_ruleset(5, &p).unwrap_err();
+        assert!(matches!(err,
+            JaildError::PolicyViolation { rule: "devfs_ruleset.not_allowed", .. }));
+    }
+
+    #[test]
+    fn devfs_ruleset_nonzero_accepted_when_in_allowlist() {
+        let mut p = load_sample_policy();
+        p.devfs_rulesets.allowed_ids = vec![5, 6, 7];
+        validate_devfs_ruleset(6, &p).unwrap();
+        validate_devfs_ruleset(99, &p).unwrap_err();
     }
 
     #[test]

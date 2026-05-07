@@ -30,6 +30,7 @@ pub mod error;
 pub mod ffi;
 pub mod protocol;
 pub mod server;
+pub mod state;
 pub mod validator;
 
 pub use error::JaildError;
