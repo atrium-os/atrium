@@ -104,6 +104,13 @@ for arg in "$@"; do
             # in case the Vulkan loader's JSON resolution doesn't reach
             # virgl_render_server (which is fork'd from QEMU).
             export DYLD_LIBRARY_PATH="$BREW_PREFIX/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+            # Force MoltenVK to commit + wait Metal command buffers
+            # synchronously inside vkQueueSubmit, rather than queueing
+            # them. Required for venus host worker to see consistent
+            # state when it dumps the imported MTLBuffer's CPU view
+            # right after vkQueueSubmit returns. Also helps establish
+            # a baseline for cache-coherency debugging.
+            export MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS=1
             # Capture the render server's own log output to a per-pid
             # file. Without this its messages may end up in macOS's
             # unified log (via syslog) where they're hard to find.
