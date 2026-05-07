@@ -473,6 +473,31 @@ The fix turned out to be a one-line bug in MoltenVK: `MVKDeviceMemory::initExter
 
 Fix lives at `atrium-os/MoltenVK main` (`MoltenVK/MoltenVK/GPUObjects/MVKDeviceMemory.mm`, +1 line). Standalone reproducer at `atrium-os/MoltenVK test_mvk_import.m` (no venus / virglrenderer / QEMU dependencies; ~175 lines). Pre-fix: FAIL 0/9 of slot writes visible. Post-fix: PASS 9/9.
 
+**V7 status (DONE 2026-05-07):** real Fresco frame end-to-end through venus. `frescod-vulkan-smoke` (in the VM) accepts an `aqueduct` connection from `atrium-test-client`, runs the atrium-core compute + indirect-draw bundle on Apple M4 Max via venus, and dumps the readback as PNG. Visual confirmation: `vm/frescod-smoke-frame-0000.png` shows the magenta rect + yellow rotated path on teal background that the test client describes.
+
+Reproduce:
+```sh
+# host: cross-compile both ends (cached; ~1s if no source changes)
+cd ~/src/bsd/frescod && cargo build --release --target aarch64-unknown-freebsd --bin frescod-vulkan-smoke
+cd ~/src/bsd/atrium-test-client && cargo build --release --target aarch64-unknown-freebsd --bin atrium-test-client
+
+# VM: start the smoke server (FRESCOD_BUNDLES_ROOT needed because
+# CARGO_MANIFEST_DIR baked into the binary points at the host path
+# /Users/girivs/... which doesn't exist in-VM).
+vssh "rm -f /tmp/frescod-smoke.sock /tmp/frescod-smoke-frame-*.png && \
+      FRESCOD_BUNDLES_ROOT=/mnt/host/bundles \
+      nohup /mnt/host/frescod/target/aarch64-unknown-freebsd/release/frescod-vulkan-smoke \
+        > /tmp/smoke.log 2>&1 &"
+
+# VM: drive one frame
+vssh "/mnt/host/atrium-test-client/target/aarch64-unknown-freebsd/release/atrium-test-client /tmp/frescod-smoke.sock"
+# (test client holds the socket open with ^C; smoke renders + dumps on SCENE_FRAME_END before that)
+
+# host: pull the PNG back
+vssh "cp /tmp/frescod-smoke-frame-0000.png /mnt/host/vm/frescod-smoke-frame-0000.png"
+open ~/src/bsd/vm/frescod-smoke-frame-0000.png
+```
+
 #### Build cycle: rebuilding the patched MoltenVK
 
 The atrium venus stack depends on `atrium-os/MoltenVK` (one-line fix vs upstream). After `git pull` on the fork:
