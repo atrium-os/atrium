@@ -10,6 +10,7 @@ members = [
     "atrium-session",
     "jaild-policy",
     "jaild",
+    "atrium-volumes",
 ]
 
 [workspace.package]

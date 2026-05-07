@@ -1,0 +1,34 @@
+# /etc/atrium/volumes.policy.toml
+#
+# Operator-configured named backends for atrium-volumes.
+# Spec: docs/spec/atrium-volumes.md §4.
+
+schema_version = 1
+
+# Default backend used when a manifest's [[volumes]] entry doesn't
+# name one. Most deployments make this `tessera` (Atrium-native;
+# CAS dedup; POSIX-compliant). For testing on a non-Tessera host,
+# `plain` works on any UFS / ext4 / NFS / etc. mount.
+[[backend]]
+name    = "default"
+kind    = "tessera"
+root    = "/var/lib/atrium/storage"
+default = true
+
+# Operator's fast DB tier. Separate ZFS pool, tuned for small
+# random writes (recordsize=16k, logbias=throughput). The zfs
+# backend plugin is V1; the policy entry is here ahead of time
+# so manifests can reference it.
+#
+# [[backend]]
+# name        = "fast-db"
+# kind        = "zfs"
+
+# Plain backend over a UFS partition for use cases where neither
+# dedup nor advanced features matter. Useful as a fallback on
+# systems without Tessera.
+#
+# [[backend]]
+# name = "plain-on-ufs"
+# kind = "plain"
+# root = "/var/lib/atrium-plain"

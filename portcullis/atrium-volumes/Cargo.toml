@@ -1,0 +1,27 @@
+[package]
+name        = "atrium-volumes"
+version.workspace     = true
+edition.workspace     = true
+license.workspace     = true
+repository.workspace  = true
+description = "Atrium volume-allocation broker. Companion to jaild — jaild owns mount operations; atrium-volumes owns what gets mounted. See docs/spec/atrium-volumes.md."
+
+[lib]
+name = "atrium_volumes"
+path = "src/lib.rs"
+
+[[bin]]
+name = "atrium-volumes"
+path = "src/main.rs"
+
+[dependencies]
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml       = "0.8"
+thiserror  = "1"
+libc       = "0.2"
+log        = "0.4"
+env_logger = "0.11"
+
+[dev-dependencies]
+tempfile = "3"
