@@ -11,7 +11,11 @@
 
 use jaild_policy::Policy;
 
-use crate::protocol::CreateJailRequest;
+use crate::protocol::{
+    CreateJailRequest, ExecSpec, MountKind, MountSpec,
+};
+#[cfg(test)]
+use crate::protocol::EnvPair;
 use crate::JaildError;
 
 /// Validate a `CreateJail` request against the loaded policy.
@@ -23,6 +27,12 @@ pub fn validate_create(
     validate_name(&req.name)?;
     validate_path(&req.path, policy)?;
     validate_children_max(req.children_max, policy)?;
+    for m in &req.mounts {
+        validate_mount(m, policy)?;
+    }
+    if let Some(exec) = &req.exec {
+        validate_exec(exec, policy)?;
+    }
     Ok(())
 }
 
@@ -101,6 +111,119 @@ fn validate_children_max(n: u32, policy: &Policy) -> Result<(), JaildError> {
                 "children_max {} > policy max {}", n, policy.children_max.max),
         });
     }
+    Ok(())
+}
+
+fn validate_mount(m: &MountSpec, policy: &Policy) -> Result<(), JaildError> {
+    /* dest is a path inside the jail's chroot. Reject `..` and
+     * empty (we don't enforce absolute — relative is fine and
+     * common). */
+    if m.dest.is_empty() {
+        return Err(JaildError::PolicyViolation {
+            rule:   "mount.dest.empty",
+            detail: "mount destination is empty".into(),
+        });
+    }
+    if m.dest.split('/').any(|seg| seg == "..") {
+        return Err(JaildError::PolicyViolation {
+            rule:   "mount.dest.traversal",
+            detail: format!("mount dest {:?} contains '..'", m.dest),
+        });
+    }
+
+    match m.kind {
+        MountKind::RoNullfs => {
+            let allowed = policy.mount_sources.ro_paths.iter().any(|p| p == &m.source);
+            if !allowed {
+                return Err(JaildError::PolicyViolation {
+                    rule:   "mount.source.not_in_ro",
+                    detail: format!("ro source {:?} not in policy.mount_sources.ro_paths", m.source),
+                });
+            }
+        }
+        MountKind::RwNullfs => {
+            let exact = policy.mount_sources.rw_paths.iter().any(|p| p == &m.source);
+            let glob  = policy.mount_sources.rw_patterns.iter().any(|pat| matches_glob(pat, &m.source));
+            if !exact && !glob {
+                return Err(JaildError::PolicyViolation {
+                    rule:   "mount.source.not_in_rw",
+                    detail: format!("rw source {:?} not in policy.mount_sources rw paths/patterns", m.source),
+                });
+            }
+        }
+        MountKind::Tmpfs => {
+            /* tmpfs has no source, no allow-list. Always
+             * acceptable; the only resource cap is the
+             * (eventual) per-jail rctl in V1b. */
+        }
+    }
+    Ok(())
+}
+
+fn validate_exec(exec: &ExecSpec, policy: &Policy) -> Result<(), JaildError> {
+    /* Path prefix allow-list. */
+    if !policy.exec_paths.allowed_prefixes.iter().any(|p| exec.path.starts_with(p)) {
+        return Err(JaildError::PolicyViolation {
+            rule:   "exec.path.not_allowed",
+            detail: format!("exec path {:?} not in policy.exec_paths.allowed_prefixes", exec.path),
+        });
+    }
+
+    /* argv[0]'s basename must equal exec.path's basename — defends
+     * against argv[0] spoofing (a process advertising itself as a
+     * different program in `ps`). */
+    if exec.argv.is_empty() {
+        return Err(JaildError::PolicyViolation {
+            rule:   "exec.argv.empty",
+            detail: "exec.argv must have at least argv[0]".into(),
+        });
+    }
+    let basename = |s: &str| -> String {
+        s.rsplit('/').next().unwrap_or(s).to_owned()
+    };
+    if basename(&exec.argv[0]) != basename(&exec.path) {
+        return Err(JaildError::PolicyViolation {
+            rule:   "exec.argv0.basename_mismatch",
+            detail: format!(
+                "argv[0] basename {:?} != exec.path basename {:?}",
+                basename(&exec.argv[0]), basename(&exec.path)),
+        });
+    }
+
+    /* Env keys: each key must be in allowed_keys, OR start with
+     * one of allowed_prefixes. */
+    for kv in &exec.env {
+        let allowed = policy.env.allowed_keys.iter().any(|k| k == &kv.key)
+            || policy.env.allowed_prefixes.iter().any(|p| kv.key.starts_with(p));
+        if !allowed {
+            return Err(JaildError::PolicyViolation {
+                rule:   "exec.env.key_not_allowed",
+                detail: format!("env key {:?} not in policy.env allow-lists", kv.key),
+            });
+        }
+        /* Reject NUL in either side — would terminate the C string
+         * early and confuse the kernel. */
+        if kv.key.contains('\0') || kv.value.contains('\0') {
+            return Err(JaildError::PolicyViolation {
+                rule:   "exec.env.nul",
+                detail: format!("env entry {:?} contains NUL byte", kv.key),
+            });
+        }
+    }
+
+    /* uid: in the user range, OR in the system allowlist. */
+    let in_user_range = exec.uid >= policy.uid.min_user_uid
+                     && exec.uid <= policy.uid.max_user_uid;
+    let in_system     = policy.uid.allowed_system_uids.iter().any(|u| *u == exec.uid);
+    if !in_user_range && !in_system {
+        return Err(JaildError::PolicyViolation {
+            rule:   "exec.uid.not_allowed",
+            detail: format!(
+                "uid {} not in user range {}..={} and not in allowed_system_uids",
+                exec.uid, policy.uid.min_user_uid, policy.uid.max_user_uid),
+        });
+    }
+
     Ok(())
 }
 
@@ -213,6 +336,8 @@ mod tests {
             name:         "atrium-test".into(),
             path:         "/".into(),
             children_max: 0,
+            mounts:       vec![],
+            exec:         None,
         };
         validate_create(&req, &p).unwrap();
     }
@@ -224,6 +349,8 @@ mod tests {
             name:         "evil-x".into(),
             path:         "/".into(),
             children_max: 0,
+            mounts:       vec![],
+            exec:         None,
         };
         let err = validate_create(&req, &p).unwrap_err();
         match err {
@@ -231,4 +358,176 @@ mod tests {
             other => panic!("wrong: {other:?}"),
         }
     }
+
+    fn req_default() -> CreateJailRequest {
+        CreateJailRequest {
+            name: "atrium-test".into(),
+            path: "/".into(),
+            children_max: 0,
+            mounts: vec![],
+            exec: None,
+        }
+    }
+
+    #[test]
+    fn mount_ro_accepted_from_allowlist() {
+        let p = load_sample_policy();
+        let mut r = req_default();
+        r.mounts.push(MountSpec {
+            source: "/usr/local/lib".into(),
+            dest:   "usr/local/lib".into(),
+            kind:   MountKind::RoNullfs,
+        });
+        validate_create(&r, &p).unwrap();
+    }
+
+    #[test]
+    fn mount_ro_rejects_unlisted() {
+        let p = load_sample_policy();
+        let mut r = req_default();
+        r.mounts.push(MountSpec {
+            source: "/etc/master.passwd.bak".into(),
+            dest:   "etc".into(),
+            kind:   MountKind::RoNullfs,
+        });
+        let err = validate_create(&r, &p).unwrap_err();
+        match err {
+            JaildError::PolicyViolation { rule: "mount.source.not_in_ro", .. } => {}
+            other => panic!("wrong: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mount_rejects_traversal() {
+        let p = load_sample_policy();
+        let mut r = req_default();
+        r.mounts.push(MountSpec {
+            source: "/usr/local/lib".into(),
+            dest:   "../escape".into(),
+            kind:   MountKind::RoNullfs,
+        });
+        let err = validate_create(&r, &p).unwrap_err();
+        assert!(matches!(err,
+            JaildError::PolicyViolation { rule: "mount.dest.traversal", .. }));
+    }
+
+    #[test]
+    fn mount_tmpfs_no_source_check() {
+        let p = load_sample_policy();
+        let mut r = req_default();
+        r.mounts.push(MountSpec {
+            source: "ignored".into(),
+            dest:   "tmp".into(),
+            kind:   MountKind::Tmpfs,
+        });
+        validate_create(&r, &p).unwrap();
+    }
+
+    #[test]
+    fn mount_rw_glob() {
+        let p = load_sample_policy();
+        let mut r = req_default();
+        r.mounts.push(MountSpec {
+            source: "/usr/home/girivs".into(),
+            dest:   "home/girivs".into(),
+            kind:   MountKind::RwNullfs,
+        });
+        validate_create(&r, &p).unwrap();
+    }
+
+    #[test]
+    fn exec_accepted() {
+        let p = load_sample_policy();
+        let mut r = req_default();
+        r.exec = Some(ExecSpec {
+            path: "/usr/local/bin/atrium-frescod".into(),
+            argv: vec!["atrium-frescod".into()],
+            env:  vec![],
+            uid:  1001,
+            gid:  1001,
+        });
+        validate_create(&r, &p).unwrap();
+    }
+
+    #[test]
+    fn exec_rejects_bad_path() {
+        let p = load_sample_policy();
+        let mut r = req_default();
+        r.exec = Some(ExecSpec {
+            path: "/usr/bin/sh".into(),
+            argv: vec!["sh".into()],
+            env:  vec![],
+            uid:  1001,
+            gid:  1001,
+        });
+        let err = validate_create(&r, &p).unwrap_err();
+        assert!(matches!(err,
+            JaildError::PolicyViolation { rule: "exec.path.not_allowed", .. }));
+    }
+
+    #[test]
+    fn exec_rejects_argv0_spoof() {
+        let p = load_sample_policy();
+        let mut r = req_default();
+        r.exec = Some(ExecSpec {
+            path: "/usr/local/bin/atrium-frescod".into(),
+            argv: vec!["i-am-something-else".into()],
+            env:  vec![],
+            uid:  1001,
+            gid:  1001,
+        });
+        let err = validate_create(&r, &p).unwrap_err();
+        assert!(matches!(err,
+            JaildError::PolicyViolation { rule: "exec.argv0.basename_mismatch", .. }));
+    }
+
+    #[test]
+    fn exec_rejects_unknown_env() {
+        let p = load_sample_policy();
+        let mut r = req_default();
+        r.exec = Some(ExecSpec {
+            path: "/usr/local/bin/atrium-frescod".into(),
+            argv: vec!["atrium-frescod".into()],
+            env:  vec![EnvPair { key: "EVIL_VAR".into(), value: "x".into() }],
+            uid:  1001,
+            gid:  1001,
+        });
+        let err = validate_create(&r, &p).unwrap_err();
+        assert!(matches!(err,
+            JaildError::PolicyViolation { rule: "exec.env.key_not_allowed", .. }));
+    }
+
+    #[test]
+    fn exec_accepts_atrium_prefix_env() {
+        let p = load_sample_policy();
+        let mut r = req_default();
+        r.exec = Some(ExecSpec {
+            path: "/usr/local/bin/atrium-frescod".into(),
+            argv: vec!["atrium-frescod".into()],
+            env:  vec![EnvPair {
+                key:   "ATRIUM_BUNDLES_ROOT".into(),
+                value: "/usr/local/share/atrium/bundles".into(),
+            }],
+            uid:  1001,
+            gid:  1001,
+        });
+        validate_create(&r, &p).unwrap();
+    }
+
+    #[test]
+    fn exec_rejects_uid_out_of_range() {
+        let p = load_sample_policy();
+        let mut r = req_default();
+        r.exec = Some(ExecSpec {
+            path: "/usr/local/bin/atrium-frescod".into(),
+            argv: vec!["atrium-frescod".into()],
+            env:  vec![],
+            uid:  100, // below min_user_uid=1000 and not system
+            gid:  100,
+        });
+        let err = validate_create(&r, &p).unwrap_err();
+        assert!(matches!(err,
+            JaildError::PolicyViolation { rule: "exec.uid.not_allowed", .. }));
+    }
 }
+

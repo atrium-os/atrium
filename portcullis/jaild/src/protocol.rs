@@ -44,23 +44,89 @@ pub enum Request {
     Ping,
 }
 
-/// V0 create-jail spec. Intentionally narrow; V1 will add
-/// `mounts`, `devfs_ruleset`, `exec_spec`, `inherit_fds`.
+/// Create-jail spec.
+///
+/// V0 fields (`name`, `path`, `children_max`) are unchanged. V1a
+/// adds `mounts` and `exec`. If `exec` is `None` the jail is
+/// created persistently (no process inside) — useful for hand
+/// testing and for the V0 path. If `exec` is `Some`, jaild
+/// `pdfork`s, the child applies `mounts`, attaches the new jail,
+/// drops privileges, and `execve`s the binary; the parent returns
+/// the procdesc fd via `SCM_RIGHTS` alongside the JSON response.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CreateJailRequest {
     /// Jail name. Validated against the policy's name rules
-    /// (regex, prefix allowlist).
+    /// (charset + prefix allowlist).
     pub name: String,
 
     /// Filesystem path that becomes the jail root. Must be a
     /// directory in the policy's `mount_sources.ro_paths` ∪
-    /// `rw_paths` ∪ matching `rw_patterns`.
+    /// `rw_paths` ∪ matching `rw_patterns` (or `/` for tests).
     pub path: String,
 
     /// `children.max` for hierarchical jail creation. 0 = leaf
     /// jail. Bounded by `policy.children_max.max`.
     #[serde(default)]
     pub children_max: u32,
+
+    /// nullfs / tmpfs mounts to apply *inside* the jail before
+    /// jail_attach. Each source must be in the policy's mount
+    /// allow-list (matching ro vs rw).
+    #[serde(default)]
+    pub mounts: Vec<MountSpec>,
+
+    /// If set, the broker forks (pdfork), applies mounts,
+    /// jail_attaches, drops to (gid, uid), and execs the binary.
+    /// The parent returns the procdesc fd via SCM_RIGHTS.
+    /// If unset, the jail is created persistently and the caller
+    /// is responsible for an eventual `RemoveJail`.
+    #[serde(default)]
+    pub exec: Option<ExecSpec>,
+}
+
+/// One mount applied inside a jail. `source` is a path on the host
+/// fs that must appear in the policy file; `dest` is a path inside
+/// the jail's chroot (relative to `path` from the parent struct).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MountSpec {
+    pub source: String,
+    pub dest:   String,
+    pub kind:   MountKind,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MountKind {
+    /// Read-only nullfs over `source`. `source` must be in
+    /// `policy.mount_sources.ro_paths`.
+    RoNullfs,
+    /// Read-write nullfs over `source`. `source` must be in
+    /// `policy.mount_sources.rw_paths` or match an
+    /// `rw_patterns` glob.
+    RwNullfs,
+    /// tmpfs mount; `source` is ignored (use any string).
+    Tmpfs,
+}
+
+/// What to exec inside the new jail. Validated end-to-end:
+/// `path` against `exec_paths.allowed_prefixes`, `argv[0]`'s
+/// basename against `path`'s basename, env keys against
+/// `env.allowed_keys` ∪ `env.allowed_prefixes`, uid against
+/// `uid.min_user_uid..max_user_uid` ∪ `allowed_system_uids`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ExecSpec {
+    pub path: String,
+    pub argv: Vec<String>,
+    #[serde(default)]
+    pub env:  Vec<EnvPair>,
+    pub uid:  u32,
+    pub gid:  u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EnvPair {
+    pub key:   String,
+    pub value: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -92,6 +158,15 @@ pub enum Response {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CreateJailResponse {
     pub jid: i32,
+    /// PID of the exec'd child, or 0 if no `exec` was supplied
+    /// (V0 path: persistent jail, no process inside).
+    #[serde(default)]
+    pub pid: i32,
+    /// True if a procdesc fd was sent alongside this response via
+    /// SCM_RIGHTS. The fd is at the front of the receiver's cmsg
+    /// buffer; the JSON body merely flags its presence.
+    #[serde(default)]
+    pub procdesc_attached: bool,
 }
 
 // -----------------------------------------------------------------
@@ -182,6 +257,8 @@ mod tests {
             name: "atrium-test".into(),
             path: "/usr/local/share/atrium".into(),
             children_max: 0,
+            mounts: vec![],
+            exec:   None,
         });
         let bytes = serde_json::to_vec(&req).unwrap();
         let back: Request = serde_json::from_slice(&bytes).unwrap();
