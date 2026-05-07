@@ -87,6 +87,11 @@ the static policy file's allow-list.
   dedicated daemon (`atrium-log`, `atrium-timer`, …). Binding
   decision rule for future "should this go in portcullisd?"
   questions; the default answer is *separate daemon*.
+- `docs/spec/storage.md` — per-jail volume allocation via
+  `atrium-volumes` (new), Tessera as default backend with ZFS /
+  plain alternatives, named backend instances per operator,
+  static + dynamic mount lifetime via jaild's mount-broker
+  protocol.
 
 The remainder of this document is largely unchanged in shape; "the
 daemon" is now logically split between jaild (privileged broker)

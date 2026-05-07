@@ -380,6 +380,7 @@ portcullisd's contribution to this flow:
 | Display / audio / power                  | `atrium-hwctrl`   | backlight, mixer, `acpiconf`                        | Hardware-control domain; different surface from policy.                  |
 | Service log aggregation                  | `atrium-log`      | journald-equivalent                                 | Different domain; integrity-isolation from policy.                       |
 | Manifest-driven timers                   | `atrium-timer`    | systemd timer-unit equivalent                       | Different domain; portcullisd is reactive, not active.                   |
+| Per-jail volume allocation (DB data, app rootfs, tmpfs) | `atrium-volumes` | per-volume backend (Tessera default, ZFS / plain alternatives); see `docs/spec/storage.md` | Different domain (storage lifecycle); integrity-isolation from policy; pluggable backends; quota / snapshot / dedup features per-backend. |
 
 \* DNS is a sub-domain of networking; doesn't justify a separate
 daemon today. Could split out as `atrium-resolved` if a
@@ -422,6 +423,9 @@ Not GUI-mediator daemons; pre-bound for completeness:
   jail builder, lifecycle).
 - `docs/spec/login-handoff.md` — boot-to-session protocol.
 - `docs/spec/jaild-policy.md` — jaild allow-list schema.
+- `docs/spec/storage.md` — per-jail volume allocation
+  (atrium-volumes), backend model, static + dynamic mount
+  lifetime.
 - `docs/LANGUAGE-POLICY.md` — Rust by default, smallest-TCB
   carve-out.
 - `scratch/jail-smoke/` — privsep model validation.
