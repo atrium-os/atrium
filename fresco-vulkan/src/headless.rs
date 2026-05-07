@@ -842,16 +842,37 @@ fn create_instance(entry: &ash::Entry) -> Result<ash::Instance> {
 fn pick_physical_device(instance: &ash::Instance)
     -> Result<(vk::PhysicalDevice, u32)>
 {
+    /* Prefer hardware GPUs over the CPU-software lavapipe fallback.
+     * Order:
+     *   1. discrete GPU
+     *   2. integrated GPU      (Atrium's typical case: venus on
+     *                           Apple Silicon hosts, or D5+ native
+     *                           FreeBSD on integrated hardware)
+     *   3. virtual GPU
+     *   4. anything else with a graphics queue (lavapipe lands here)
+     * Within each tier, the first enumerated match wins. */
     let devices = unsafe { instance.enumerate_physical_devices() }?;
+    let mut by_type: [Option<(vk::PhysicalDevice, u32)>; 4] = [None; 4];
     for &pd in &devices {
-        let props = unsafe { instance.get_physical_device_queue_family_properties(pd) };
-        for (i, p) in props.iter().enumerate() {
-            if p.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
-                return Ok((pd, i as u32));
-            }
+        let qf = unsafe { instance.get_physical_device_queue_family_properties(pd) };
+        let Some(i) = qf.iter().position(
+            |p| p.queue_flags.contains(vk::QueueFlags::GRAPHICS)) else { continue };
+
+        let props = unsafe { instance.get_physical_device_properties(pd) };
+        let bucket = match props.device_type {
+            vk::PhysicalDeviceType::DISCRETE_GPU   => 0,
+            vk::PhysicalDeviceType::INTEGRATED_GPU => 1,
+            vk::PhysicalDeviceType::VIRTUAL_GPU    => 2,
+            _                                      => 3,
+        };
+        if by_type[bucket].is_none() {
+            by_type[bucket] = Some((pd, i as u32));
         }
     }
-    Err(anyhow!("no Vulkan device with a graphics queue"))
+    by_type.into_iter()
+        .flatten()
+        .next()
+        .ok_or_else(|| anyhow!("no Vulkan device with a graphics queue"))
 }
 
 fn log_physical_device(instance: &ash::Instance, pd: vk::PhysicalDevice) {
