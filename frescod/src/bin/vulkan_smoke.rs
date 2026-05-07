@@ -152,10 +152,24 @@ fn main() -> io::Result<()> {
             conn.send_message(CLASS_DISPLAY, o.op, o.flags, &o.payload)?;
         }
 
-        /* On SCENE_FRAME_END, render + dump. */
+        /* On SCENE_FRAME_END, render + dump.
+         *
+         * Per-phase timing is logged every 30 frames (or for the first
+         * frame) so the harness doubles as a perf probe. To skip PNG
+         * encode + readback for pure-render measurements:
+         *
+         *   FRESCOD_SMOKE_NO_PNG=1      (skip readback + encode + save)
+         *   FRESCOD_SMOKE_NO_ENCODE=1   (readback but skip PNG encode)
+         */
         if was_frame_end {
             let win_id = msg.flags as u32;
             if frontend.window_state(win_id).is_some() {
+                use std::time::Instant;
+                let no_png    = std::env::var("FRESCOD_SMOKE_NO_PNG").is_ok();
+                let no_encode = std::env::var("FRESCOD_SMOKE_NO_ENCODE").is_ok();
+                let log_perf  = frame_no == 0 || frame_no % 30 == 0;
+
+                let t0 = Instant::now();
                 let (uploads, clears) = frontend.take_pending_uploads();
                 renderer.process_uploads(uploads, clears)
                     .map_err(|e| io::Error::new(io::ErrorKind::Other,
@@ -169,28 +183,52 @@ fn main() -> io::Result<()> {
                 renderer.set_path_nodes(paths);
                 renderer.set_texture_batches(textures);
                 renderer.set_glyph_run_batches(glyph_run);
+                let t_setup = t0.elapsed();
+
+                let t1 = Instant::now();
                 renderer.render_to_buffer()
                     .map_err(|e| io::Error::new(io::ErrorKind::Other,
                         format!("render: {e}")))?;
-                let pixels = renderer.read_pixels_vec()
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other,
-                        format!("readback: {e}")))?;
+                let t_render = t1.elapsed();
 
-                /* HeadlessRenderer's color format is BGRA8_UNORM; the
-                 * `image` crate wants RGBA, so swap channels. */
-                let mut rgba = pixels.clone();
-                for px in rgba.chunks_exact_mut(4) {
-                    px.swap(0, 2);
+                let mut t_readback = std::time::Duration::ZERO;
+                let mut t_encode   = std::time::Duration::ZERO;
+                let mut t_save     = std::time::Duration::ZERO;
+
+                if !no_png {
+                    let t2 = Instant::now();
+                    let pixels = renderer.read_pixels_vec()
+                        .map_err(|e| io::Error::new(io::ErrorKind::Other,
+                            format!("readback: {e}")))?;
+                    t_readback = t2.elapsed();
+
+                    if !no_encode {
+                        let t3 = Instant::now();
+                        let mut rgba = pixels.clone();
+                        for px in rgba.chunks_exact_mut(4) { px.swap(0, 2); }
+                        let img = image::RgbaImage::from_raw(WIDTH, HEIGHT, rgba)
+                            .ok_or_else(|| io::Error::new(io::ErrorKind::Other,
+                                "RgbaImage::from_raw"))?;
+                        t_encode = t3.elapsed();
+
+                        let t4 = Instant::now();
+                        let path = format!("{png_prefix}{frame_no:04}.png");
+                        img.save(&path)
+                            .map_err(|e| io::Error::new(io::ErrorKind::Other,
+                                format!("save PNG: {e}")))?;
+                        t_save = t4.elapsed();
+                    }
                 }
 
-                let path = format!("{png_prefix}{frame_no:04}.png");
-                let img = image::RgbaImage::from_raw(WIDTH, HEIGHT, rgba)
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::Other,
-                        "RgbaImage::from_raw"))?;
-                img.save(&path)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other,
-                        format!("save PNG: {e}")))?;
-                eprintln!("frescod-vulkan-smoke: frame {frame_no} → {path}");
+                let total = t0.elapsed();
+                if log_perf {
+                    eprintln!("frescod-vulkan-smoke: frame {frame_no} \
+                        setup={:?} render={:?} readback={:?} \
+                        encode={:?} save={:?} total={:?} ({:.1} fps cap)",
+                        t_setup, t_render, t_readback,
+                        t_encode, t_save, total,
+                        1.0 / total.as_secs_f64());
+                }
                 frame_no += 1;
             }
         }

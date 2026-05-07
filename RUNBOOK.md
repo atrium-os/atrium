@@ -505,7 +505,22 @@ Other test clients exercise the bundle's other ops through the same smoke harnes
 | `atrium-test-client`        | rect + path  | `vm/frescod-smoke-frame-0000.png` ✅      |
 | `atrium-textured`           | texture      | `vm/v7-textured.png` ✅                   |
 | `atrium-text-demo`          | glyph_run    | `vm/v7-text.png` ⚠ outline-only artifact (reproduces on lavapipe too — pre-existing glyph shader bug, **not** a venus issue) |
-| `atrium-rect-bouncer` (3 s) | rect (×91)   | `vm/v7-bounce-{00,30,62}.png` ✅, sustained ~21 fps GPU-bound, zero VK_ERROR / stall / fence-timeout in `/tmp/smoke.log` |
+| `atrium-rect-bouncer` (3 s) | rect (×91)   | `vm/v7-bounce-{00,30,62}.png` ✅, sustained ~17 fps round-trip-bound (see perf note below), zero VK_ERROR / stall / fence-timeout in `/tmp/smoke.log` |
+
+##### V7 perf characterization (2026-05-07)
+
+`frescod-vulkan-smoke` runs strict-serial: every frame ends with `vkQueueSubmit` → `vkWaitForFences(u64::MAX)`. That makes the per-frame wall time = critical-path round-trip. Per-phase timing (env vars `FRESCOD_SMOKE_NO_PNG=1` to skip readback+encode, `FRESCOD_SMOKE_NO_ENCODE=1` to skip just the PNG):
+
+| ICD                                           | render_to_buffer | encode + save | fps cap |
+|-----------------------------------------------|------------------|---------------|---------|
+| atrium-mesa-venus → MoltenVK → Metal (M4 Max) | 60–63 ms         | ~2 ms         | ~16     |
+| lavapipe (CPU SW rasterizer, in-VM)           | 0.7–2.4 ms       | ~2 ms         | 400–1400|
+
+Lavapipe's <1 ms baseline shows the actual Vulkan-API + scene-build cost is negligible. The full 60 ms on venus is **paravirt round-trip latency** — guest `vkQueueSubmit` → venus ring → host worker (`virgl_render_server`) → MoltenVK encode → Metal command buffer → GPU exec → MTLEvent → fence write-back → virtio-gpu IRQ → guest `vkWaitForFences` returns.
+
+Reference: native Linux + venus + Linux host typically clocks 1–5 ms on the same round-trip. The 10–60× gap on our path is platform-shape: HVF IRQ-injection latency, macOS scheduler wake-up granularity for the host worker process, and MoltenVK's per-submit Metal command-buffer encoding cost. **Not a venus stack bug — a paravirt-on-macOS-host characteristic.** Real apps with multiple frames in flight + double/triple buffering will amortize most of it; the smoke harness's strict-serial pattern is a worst case.
+
+Tracked as a separate optimization task; not blocking any of D1/D2/D2.5.
 
 #### Build cycle: rebuilding the patched MoltenVK
 
