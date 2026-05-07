@@ -46,10 +46,14 @@ pub struct ServiceState {
     /// (reached the burst cap). Reset to None on next launch
     /// after deadline.
     pub burst_pause_until: Option<Instant>,
-    /// How many fast-failures in a row. Reset on a successful
-    /// start. When this exceeds `max_consecutive_failures`, the
-    /// service is permanently retired.
-    pub consecutive_failures: u32,
+    /// Remaining "unhealthy-lifetime deficit" the supervisor
+    /// will tolerate before giving up on this service. Each
+    /// fast-failure (lifetime < min_lifetime_for_success_secs)
+    /// subtracts (min - lifetime) seconds. A successful run
+    /// (lifetime ≥ min) refills this to
+    /// `manifest.supervision.failure_budget_secs`.
+    /// 0 → disabled (infinite restarts).
+    pub failure_budget_remaining: f64,
 }
 
 #[cfg(target_os = "freebsd")]
@@ -205,6 +209,7 @@ impl Supervisor {
         let idx = self.services.len();
         ffi::register_procdesc_exit(self.kq, procdesc_fd, idx)?;
         info!("supervising {}: pid={pid} procdesc={procdesc_fd}", manifest.name);
+        let initial_budget = manifest.supervision.failure_budget_secs as f64;
         self.services.push(ServiceState {
             manifest,
             procdesc_fd,
@@ -212,7 +217,7 @@ impl Supervisor {
             launched_at: Instant::now(),
             recent_restarts: VecDeque::new(),
             burst_pause_until: None,
-            consecutive_failures: 0,
+            failure_budget_remaining: initial_budget,
         });
         Ok(())
     }
@@ -263,23 +268,32 @@ impl Supervisor {
         let _ = ffi::close_fd(svc.procdesc_fd);
         svc.procdesc_fd = -1;
 
-        /* Update consecutive-failure counter. A "successful
-         * start" is defined as surviving at least
-         * min_lifetime_for_success_secs — that's the operator's
-         * declared boundary between "this service is broken" and
-         * "this service is running fine." */
+        /* Failure-budget update. A "successful start" is alive
+         * ≥ min_lifetime_for_success_secs; that refills the
+         * budget. Anything shorter charges
+         * (min_lifetime - actual_lifetime) seconds against the
+         * budget. The faster a service fails, the more it
+         * costs — so a 0.1 s loop exhausts the budget quickly,
+         * a 4 s loop slowly, and a steady-state ≥ 5 s service
+         * never depletes it. */
         let min_lifetime = Duration::from_secs(svc.manifest.supervision.min_lifetime_for_success_secs);
+        let budget_max   = svc.manifest.supervision.failure_budget_secs as f64;
         if lifetime >= min_lifetime {
-            if svc.consecutive_failures > 0 {
-                debug!("{}: survived {:.2}s ≥ min_lifetime ({:.2}s); resetting failure counter",
-                    svc.manifest.name, lifetime.as_secs_f64(), min_lifetime.as_secs_f64());
+            if svc.failure_budget_remaining < budget_max {
+                debug!("{}: survived {:.2}s ≥ min_lifetime ({:.2}s); refilling budget {:.2} → {:.2}",
+                    svc.manifest.name, lifetime.as_secs_f64(), min_lifetime.as_secs_f64(),
+                    svc.failure_budget_remaining, budget_max);
             }
-            svc.consecutive_failures = 0;
+            svc.failure_budget_remaining = budget_max;
         } else {
-            svc.consecutive_failures += 1;
-            warn!("{}: fast-fail #{} (alive {:.2}s < min_lifetime {:.2}s)",
-                svc.manifest.name, svc.consecutive_failures,
-                lifetime.as_secs_f64(), min_lifetime.as_secs_f64());
+            let deficit = min_lifetime.as_secs_f64() - lifetime.as_secs_f64();
+            svc.failure_budget_remaining -= deficit;
+            warn!("{}: fast-fail (alive {:.2}s, deficit {:.2}s, budget {:.2}/{:.2}s left)",
+                svc.manifest.name,
+                lifetime.as_secs_f64(),
+                deficit,
+                svc.failure_budget_remaining.max(0.0),
+                budget_max);
         }
 
         let policy = svc.manifest.supervision.restart;
@@ -296,18 +310,20 @@ impl Supervisor {
             return;
         }
 
-        /* Hard give-up threshold. After max_consecutive_failures
-         * fast-failures in a row, declare the service permanently
-         * dead and stop trying. A failing service shouldn't
-         * consume the supervisor forever. */
-        if svc.consecutive_failures >= svc.manifest.supervision.max_consecutive_failures {
+        /* Hard give-up threshold. Budget-driven. A
+         * `failure_budget_secs = 0` setting (or budget remaining
+         * equal to the configured max with no fast-fails) means
+         * "never give up" — useful for services that genuinely
+         * want infinite restart-on-crash. */
+        if budget_max > 0.0 && svc.failure_budget_remaining <= 0.0 {
             error!(
-                "{}: PERMANENTLY FAILED — {} consecutive fast-failures (max={}); \
-                 not restarting. Operator: inspect logs and `service` restart \
-                 the supervisor when fixed.",
+                "{}: PERMANENTLY FAILED — failure budget exhausted ({:.2}s of \
+                 {:.2}s consumed across fast-failures); not restarting. \
+                 Operator: inspect logs and `service` restart the supervisor \
+                 when fixed.",
                 svc.manifest.name,
-                svc.consecutive_failures,
-                svc.manifest.supervision.max_consecutive_failures);
+                budget_max - svc.failure_budget_remaining,
+                budget_max);
             self.retire(idx);
             return;
         }

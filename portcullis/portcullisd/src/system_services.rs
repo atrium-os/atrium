@@ -85,20 +85,55 @@ fn default_true() -> bool { true }
 ///
 /// Two orthogonal limits prevent runaway behaviour:
 ///
-/// - **`max_restarts_per_minute`** is a *rate limit*. Hitting it
-///   pauses restarts on the service for
-///   `cooldown_after_burst_secs`, then retries resume. The
-///   service is NOT given up on; this is just CPU thrashing
-///   protection.
-/// - **`max_consecutive_failures`** is a *give-up threshold*.
-///   A "failure" is an exit within `min_lifetime_for_success_secs`
-///   of being launched (the service didn't even survive a
-///   plausible startup window). After this many consecutive
-///   failures, the supervisor logs an error and stops trying.
-///   A service that survives long enough resets the counter.
+/// - **`max_restarts_per_minute`** is a *soft rate limit*.
+///   Hitting it pauses restarts on the service for
+///   `cooldown_after_burst_secs`, then retries resume. NOT a
+///   give-up threshold; just CPU thrashing protection.
+/// - **`failure_budget_secs`** is a *give-up threshold* that
+///   scales naturally with how badly the service is failing.
+///   See "Budget model" below.
 ///
-/// systemd has the equivalent of these as `StartLimitBurst` +
-/// `StartLimitInterval` + an internal "start-limit-hit" failure.
+/// ## Budget model
+///
+/// Each failed exit consumes failure-budget proportional to how
+/// short its lifetime was vs `min_lifetime_for_success_secs`. A
+/// successful run (alive ≥ `min_lifetime_for_success_secs`)
+/// refills the budget to full.
+///
+/// ```text
+/// on exit, with lifetime = now - launched_at:
+///   if lifetime >= min_lifetime_for_success_secs:
+///     budget_remaining = failure_budget_secs       // refill
+///   else:
+///     deficit = min_lifetime_for_success_secs - lifetime
+///     budget_remaining -= deficit
+///     if budget_remaining <= 0:
+///       PERMANENTLY FAILED — give up
+/// ```
+///
+/// Effect: faster fails consume more budget per attempt, so they
+/// run out sooner. Slower fails consume less, so they get more
+/// retries. With defaults `min = 5 s`, `budget = 25 s`:
+///
+/// | lifetime per attempt | retries before give-up |
+/// |----------------------|------------------------|
+/// | 0.1 s                | ~5                     |
+/// | 1 s                  | ~6                     |
+/// | 3 s                  | ~12                    |
+/// | 4 s                  | 25                     |
+/// | ≥ 5 s                | unlimited (refills)    |
+///
+/// Setting `failure_budget_secs = 0` disables the give-up
+/// entirely — equivalent to systemd `StartLimitBurst=0`. Use
+/// only for services where infinite restart is genuinely
+/// desired.
+///
+/// systemd's equivalent is `StartLimitBurst` +
+/// `StartLimitInterval` + an internal "start-limit-hit" failure;
+/// our model differs in that the cost-per-failure scales with
+/// lifetime instead of being a constant count over a window —
+/// catches "survives 4 s every time" patterns that a simple
+/// count-based limit would let run forever.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Supervision {
     #[serde(default = "default_restart")]
@@ -116,15 +151,16 @@ pub struct Supervision {
     #[serde(default = "default_cooldown_after_burst_secs")]
     pub cooldown_after_burst_secs: u64,
 
-    /// Hard give-up threshold. After this many consecutive
-    /// fast-failures (exit within `min_lifetime_for_success_secs`
-    /// of launch), the supervisor logs the failure and stops
-    /// restarting the service. Default 5.
-    #[serde(default = "default_max_consecutive_failures")]
-    pub max_consecutive_failures: u32,
+    /// Total "unhealthy-lifetime deficit" the supervisor will
+    /// tolerate before giving up. Per-failure deficit =
+    /// `min_lifetime_for_success_secs - actual_lifetime` (only
+    /// for fast-failures; healthy exits are free + refill).
+    /// Setting to 0 disables give-up. Default 25.
+    #[serde(default = "default_failure_budget_secs")]
+    pub failure_budget_secs: u64,
     /// A service that survives at least this many seconds after
     /// launch is considered to have started successfully; the
-    /// consecutive-failures counter resets. Default 5 s.
+    /// failure budget refills to full. Default 5 s.
     #[serde(default = "default_min_lifetime_for_success_secs")]
     pub min_lifetime_for_success_secs: u64,
 }
@@ -136,7 +172,7 @@ impl Default for Supervision {
             restart_after_secs: default_restart_after_secs(),
             max_restarts_per_minute: default_max_restarts_per_minute(),
             cooldown_after_burst_secs: default_cooldown_after_burst_secs(),
-            max_consecutive_failures: default_max_consecutive_failures(),
+            failure_budget_secs: default_failure_budget_secs(),
             min_lifetime_for_success_secs: default_min_lifetime_for_success_secs(),
         }
     }
@@ -157,7 +193,7 @@ fn default_restart() -> RestartPolicy { RestartPolicy::OnFailure }
 fn default_restart_after_secs() -> u64 { 1 }
 fn default_max_restarts_per_minute() -> u32 { 5 }
 fn default_cooldown_after_burst_secs() -> u64 { 30 }
-fn default_max_consecutive_failures() -> u32 { 5 }
+fn default_failure_budget_secs() -> u64 { 25 }
 fn default_min_lifetime_for_success_secs() -> u64 { 5 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -415,7 +451,7 @@ mod tests {
         let s = r#"name = "x"
                    path = "/""#;
         let m: ServiceManifest = toml::from_str(s).unwrap();
-        assert_eq!(m.supervision.max_consecutive_failures, 5);
+        assert_eq!(m.supervision.failure_budget_secs, 25);
         assert_eq!(m.supervision.min_lifetime_for_success_secs, 5);
     }
 
@@ -425,11 +461,11 @@ mod tests {
             name = "x"
             path = "/"
             [supervision]
-            max_consecutive_failures = 3
+            failure_budget_secs = 10
             min_lifetime_for_success_secs = 2
         "#;
         let m: ServiceManifest = toml::from_str(s).unwrap();
-        assert_eq!(m.supervision.max_consecutive_failures, 3);
+        assert_eq!(m.supervision.failure_budget_secs, 10);
         assert_eq!(m.supervision.min_lifetime_for_success_secs, 2);
     }
 

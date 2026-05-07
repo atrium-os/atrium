@@ -1,0 +1,33 @@
+# /etc/atrium/services.d/40-atrium-smoke-slowfail.toml
+#
+# V3 budget-model smoke: a service that lives ~3 s before
+# exiting. Each fast-fail charges (5 - 3) = 2 s against the
+# budget. With failure_budget_secs = 12, we should see ~6 retries
+# before give-up — meaningfully more than the ~3 retries the
+# fast-fail (0s lifetime) variant gets at the same budget.
+#
+# The "binary" is sh -c 'sleep 3'; we route it through
+# /usr/local/bin/atrium-slowfail (a small symlink installed at
+# smoke-test setup time) to satisfy jaild's exec-path allowlist.
+
+enabled       = true
+name          = "atrium-smoke-slowfail"
+path          = "/"
+children_max  = 0
+devfs_ruleset = 0
+
+[exec]
+path = "/usr/local/bin/atrium-slowfail"
+argv = ["atrium-slowfail"]
+uid  = 1001
+gid  = 1001
+
+[[exec.env]]
+key   = "PATH"
+value = "/bin:/usr/bin"
+
+[supervision]
+restart                       = "always"
+restart_after_secs            = 0   # no extra delay; total cycle = ~3s lifetime + restart latency
+failure_budget_secs           = 12
+min_lifetime_for_success_secs = 5

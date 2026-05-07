@@ -25,7 +25,9 @@ key   = "PATH"
 value = "/bin:/usr/bin"
 
 [supervision]
-restart                  = "always"
-restart_after_secs       = 1
-max_consecutive_failures = 3
+restart                       = "always"
+restart_after_secs            = 1
+# Fast-fail mode: small budget. Each launch dies in ~10 ms,
+# costing ~5s deficit per attempt → ~3 retries before give-up.
+failure_budget_secs           = 12
 min_lifetime_for_success_secs = 5
