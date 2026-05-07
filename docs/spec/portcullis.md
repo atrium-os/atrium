@@ -82,6 +82,11 @@ the static policy file's allow-list.
   `gpu-direct` capability. Default `render-only` capability
   (frescod-mediated, no device access) bypasses this question
   for most apps.
+- `docs/spec/service-management.md` — decomposition principle vs
+  systemd: which gaps fold into portcullisd vs which go into a
+  dedicated daemon (`atrium-log`, `atrium-timer`, …). Binding
+  decision rule for future "should this go in portcullisd?"
+  questions; the default answer is *separate daemon*.
 
 The remainder of this document is largely unchanged in shape; "the
 daemon" is now logically split between jaild (privileged broker)
