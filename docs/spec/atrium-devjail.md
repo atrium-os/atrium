@@ -110,12 +110,18 @@ cargo fetch || true   # warm the cache; ok if no internet yet
 
 $ atrium-devjail create
   → reads .atrium/devjail.toml
-  → asks atrium-pkg for the rust-1.83 + freebsd-deps overlay
+  → asks atrium-pkg for the rust-1.83 toolchain overlay
+       (Atrium-shaped artifact; CAS-distributed)
   → asks atrium-volumes to provision source/build/cache volumes
   → asks portcullisd to launch the jail with SSH keypair injected
-  → bridge IP allocated: 127.10.0.42
+  → lo0 alias allocated: 127.10.0.42
   → local /etc/hosts entry (in user's session jail) added:
        dev-myproject  127.10.0.42
+  → first-launch [setup] script runs INSIDE the jail
+       (per portcullis §3.4): pkg install + cargo install +
+       any user bootstrap. atrium-pkg does NOT mediate;
+       Tessera CAS dedups identical files across dev-jails
+       automatically.
 
   Dev jail "dev-myproject" ready.
   SSH:    ssh dev-myproject
@@ -201,7 +207,42 @@ pip      = ["black", "ruff"]                    # `pip install`
 go       = ["github.com/air-verse/air@latest"]  # `go install`
 ```
 
-These run during the `[setup]` phase (§3.7).
+**This block is convenience syntax — atrium-devjail expands
+it into a generated `[setup]` script** that runs inside the
+jail at first launch via portcullis's standard first-run
+mechanism (`portcullis.md` §3.4). The desugaring:
+
+```toml
+# user writes:
+[packages]
+freebsd  = ["openssl"]
+cargo    = ["cargo-watch"]
+```
+becomes (auto-generated, prepended to any user-written
+`[setup]` script):
+```
+pkg install -y openssl
+cargo install cargo-watch
+```
+
+Two architectural points worth being explicit about:
+
+- **atrium-pkg does not mediate these.** `pkg(8)` talks to
+  FreeBSD's package archive directly; `cargo` / `npm` / `pip` /
+  `go install` talk to their respective ecosystems directly.
+  atrium-pkg's domain is Atrium-shaped artifacts (apps,
+  toolchain overlays, service-jail base images) — not FreeBSD
+  packages or language-ecosystem packages.
+- **Tessera CAS dedupes for free.** Two dev-jails running
+  `pkg install openssl` end up with one disk copy of
+  `libssl.so.3` because Tessera content-addresses the result.
+  No package-manager-aware dedup pool needed; the storage
+  layer handles it.
+
+User can write `[setup]` directly if they want full control;
+`[packages]` is sugar for the common cases. Both end up at the
+same place: package-manager invocations inside the jail's
+first-run setup phase.
 
 ### 3.4 Volumes
 
@@ -325,14 +366,47 @@ cargo fetch
 network_outbound = ["github.com:443", "crates.io:443"]
 ```
 
+**This is where pkg installs happen.** Per portcullis §3.4,
+portcullis intentionally does *not* know what an app installs.
+The `[setup]` script runs *inside* the jail at first launch,
+calling `pkg(8)`, `cargo`, `pip`, etc. directly. atrium-pkg is
+not in this path — its domain is Atrium-shaped artifacts (apps,
+toolchain overlays, service-jail base images), not FreeBSD or
+language ecosystem packages.
+
+The desugared form of the user-facing manifest is:
+
+```
+generated-from-[packages]:                  ← from §3.3 desugaring
+    pkg install -y pkgconf openssl libpq
+    cargo install cargo-watch cargo-audit
+    npm install -g @biomejs/biome
+    ...
+
+then user's [setup] script:                 ← from this section
+    cargo fetch
+    ( cd dev-tools && cargo build )
+```
+
 The script runs as the jail's exec uid (default: a non-root uid
-allocated by atrium-pkg per the toolchain's conventions). It
-runs after toolchain + packages are installed; output goes to
+declared in the toolchain overlay's metadata, e.g. uid 1000 for
+the `dev-rust-1.83` overlay). The first phase (pkg install) runs
+as root via portcullis's `[setup.capabilities]` override
+mechanism — `pkg(8)` needs root inside the jail to write into
+`/usr/local/`. Output for both phases goes to
 `atrium-devjail logs setup`.
 
-If the script fails (non-zero exit), the jail is marked
-"setup-failed" and the user sees the error; the jail isn't
-ready to use until they fix and re-run setup.
+Sentinel handling per portcullis §3.4: on clean exit, write
+`.atrium-firstrun-done`; on failure, leave sentinel absent so
+the next launch retries. atrium-devjail surfaces failure via
+`atrium-devjail status`.
+
+**Tessera CAS dedup is automatic.** Identical files (e.g.,
+`libssl.so.3` installed by `pkg install openssl` in two
+different dev-jails) are stored once on disk. No
+package-manager-aware orchestration needed; the storage layer
+handles it transparently. This is the architectural property
+that makes "every dev-jail does its own pkg install" workable.
 
 ### 3.8 IDE / VS Code hints
 
@@ -382,17 +456,46 @@ The dev-jail's `/` is an overlay:
 ```
 /                                     ← dev-jail root (writable)
    ├── (atrium-dev-base CAS layer)    ← read-only Tessera CAS
+   │     atrium-pkg-distributed
+   │
    ├── (rust-1.83 toolchain layer)    ← read-only Tessera CAS
-   ├── (project packages layer)       ← per-jail; from setup
+   │     atrium-pkg-distributed
+   │
+   ├── (project packages from setup)  ← writable; written into the
+   │     pkg(8), cargo, npm, pip,         jail's writable rootfs by
+   │     etc. invocations from             the [setup] script;
+   │     §3.7 first-run                     CAS-deduped by Tessera
+   │                                        across dev-jails
+   │
    └── /atrium/source                  ← rw; project files volume
        /atrium/build                   ← rw; build artifacts volume
        /atrium/cache                   ← rw; toolchain cache volume
 ```
 
+What atrium-pkg distributes (Atrium-shaped):
+- `atrium-dev-base` rootfs layer
+- toolchain overlays (rust-1.83, node-20, python-3.12, ...)
+- service-jail base images (atrium-postgres:16, atrium-redis:7, ...)
+
+What [setup] installs locally (delegated to ecosystem tools):
+- FreeBSD packages via `pkg(8)`
+- Rust crates via `cargo install`
+- npm packages via `npm install -g`
+- Python packages via `pip install`
+- Go binaries via `go install`
+
+The architectural property: **atrium-pkg owns Atrium-shaped
+artifact distribution; ecosystem tools own their own ecosystems;
+Tessera CAS dedupes everything that ends up identical on disk.**
+No package-manager-aware coordination required — the storage
+layer handles cross-jail sharing as a property of how content
+addressing works.
+
 Per `storage.md`, the layered model is Tessera-overlay with the
 project volumes mounted on top. CAS dedup means base + toolchain
 are nearly free across multiple dev-jails sharing the same
-versions.
+versions; setup-installed packages are also deduped where
+content matches.
 
 ### 4.2 SSH key management
 
@@ -456,15 +559,31 @@ $ atrium-devjail create
 1. Read `.atrium/devjail.toml`.
 2. Validate: name not in use; manifest schema valid; declared
    network destinations on operator allow-list (per `network.md`).
-3. Resolve toolchain via atrium-pkg → CAS layer hash.
-4. Provision volumes via atrium-volumes (§3.4).
-5. Allocate lo0 alias via atrium-jaild.
-6. Generate per-jail SSH host keypair.
-7. Inject user's pubkey into `authorized_keys`.
-8. Launch jail via portcullisd-bootstrap.
-9. Run `[setup]` script; capture output to log.
-10. Update user's `~/.ssh/config` and `~/.config/atrium/devjail-list.toml`.
-11. Print connect string + status.
+3. **atrium-pkg work**: resolve `[toolchain]` declarations to
+   Atrium-shaped CAS layer hashes (e.g., `rust-1.83` →
+   `sha256:abc...`); pull the layer if not present locally.
+   This is the only step where atrium-pkg runs.
+4. atrium-volumes provisions source/build/cache volumes per
+   `[volumes]` (§3.4); applies tessera quotas.
+5. atrium-jaild allocates lo0 alias (e.g., `127.10.0.42`) and
+   `atrium0` outbound alias if `[network] outbound` is declared.
+6. atrium-devjail generates per-jail SSH host keypair.
+7. atrium-devjail injects user's pubkey into the jail's
+   `authorized_keys` (in the writable rootfs layer).
+8. atrium-devjail expands `[packages]` shorthand into a
+   pre-amble for the `[setup]` script (§3.3 desugaring).
+9. portcullisd-bootstrap launches the jail. portcullis's
+   first-run mechanism (§3.4) executes the merged `[setup]`
+   script *inside* the jail: pkg install, cargo install, user
+   bootstrap. atrium-pkg is **not** in this path. Tessera CAS
+   dedupes the resulting files across dev-jails automatically.
+10. On `[setup]` clean exit, sentinel `.atrium-firstrun-done`
+    is written; future launches skip setup. On failure, jail
+    is marked setup-failed; user fixes and reruns
+    `atrium-devjail rebuild`.
+11. atrium-devjail updates user's `~/.ssh/config` and
+    `~/.config/atrium/devjail-list.toml`.
+12. Print connect string + status.
 
 ### 5.2 Run / use
 
