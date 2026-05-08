@@ -109,27 +109,50 @@ impl Surface for LogSurface {
     }
 }
 
-/// A `Surface` backed by a real `fresco_client::Connection`. Each
-/// `set_node` becomes a `scene_node_rect` (or future `scene_node_path`,
-/// `scene_node_glyph_run`); `clear_node` becomes `scene_node_clear`;
-/// `begin_frame`/`end_frame` bracket the deltas with
-/// `scene_frame_begin`/`scene_frame_end`.
+/// A `Surface` backed by a real `fresco_client::Connection`.
 ///
-/// Note: corner radii on `Node::Rect` aren't yet expressible through
-/// `RectParams` (the atrium-core `RectParams` is x/y/w/h + rgba). The
-/// rounded-corner path lands in phase-4.5 via `scene_node_path`.
+/// Translation table:
+///   `Node::Rect` → `scene_node_rect` (corner radius is dropped at the
+///                   wire layer for now — atrium-core `RectParams`
+///                   has no radius field; rounded-corner path via
+///                   `scene_node_path` is a follow-up).
+///   `Node::Text` → `text_run_install` (the server shapes + rasterizes
+///                   + atlases on its side; the client just sends the
+///                   string + font + size + position + color).
+///   `Node::Stack` → no wire op (pure layout container).
+///
+/// Maintains a font_id cache keyed on family name so `font_open` is
+/// called at most once per family per session.
 pub struct FrescoSurface {
     conn: fresco_client::Connection,
     window_id: u32,
+    fonts: std::collections::HashMap<String, u32>,
 }
 
 impl FrescoSurface {
     pub fn new(conn: fresco_client::Connection, window_id: u32) -> Self {
-        Self { conn, window_id }
+        Self { conn, window_id, fonts: std::collections::HashMap::new() }
     }
 
     pub fn window_id(&self) -> u32 { self.window_id }
     pub fn connection(&mut self) -> &mut fresco_client::Connection { &mut self.conn }
+
+    /// Resolve a family name to a server-side `font_id`, opening the
+    /// font (and caching its id) on first use.
+    fn font_id(&mut self, family: &str) -> io::Result<u32> {
+        if let Some(id) = self.fonts.get(family) {
+            return Ok(*id);
+        }
+        let resp = self.conn.font_open(family.to_string())?;
+        if resp.font_id == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("font_open({family:?}) failed — server returned font_id 0"),
+            ));
+        }
+        self.fonts.insert(family.to_string(), resp.font_id);
+        Ok(resp.font_id)
+    }
 }
 
 impl Surface for FrescoSurface {
@@ -150,11 +173,20 @@ impl Surface for FrescoSurface {
                 };
                 self.conn.scene_node_rect(id.0, params)
             }
-            Node::Text { .. } => {
-                // TODO phase-4.5: shape via fresco-text, install glyph
-                // run via scene_node_glyph_run. For now skip; the rect
-                // primitives still appear so the layout is visible.
-                Ok(())
+            Node::Text { rect, content, style } => {
+                // Server-side shaping: install the run at this id.
+                // The fresco server allocates an atlas slot, shapes
+                // via rustybuzz, rasterizes via swash, and emits the
+                // glyph_run scene node for us — we only send the
+                // logical text + font + size + position + color.
+                let font_id = self.font_id(&style.family)?;
+                let color = [style.color.r, style.color.g, style.color.b, style.color.a];
+                self.conn.text_run_install(
+                    id.0, font_id, style.size,
+                    rect.x(), rect.y(),
+                    color,
+                    content.clone(),
+                )
             }
             Node::Stack { .. } => Ok(()),  // pure layout, no wire op
         }

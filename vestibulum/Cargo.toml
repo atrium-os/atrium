@@ -1,0 +1,18 @@
+[package]
+name        = "vestibulum"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "Atrium login screen. The first real Pergola app — opens a fresco window, accepts username + password, validates against pam-style local auth (stub for D2)."
+
+[[bin]]
+name = "vestibulum"
+path = "src/main.rs"
+
+[dependencies]
+pergola         = { path = "../pergola" }
+fresco-client   = { path = "../fresco-client" }
+fresco-protocol = { path = "../fresco-protocol" }
+log             = "0.4"
+env_logger      = "0.11"
