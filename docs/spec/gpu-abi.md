@@ -1,7 +1,7 @@
 # Atrium GPU ABI Specification
 
 **Version:** 0.1.0 (draft)
-**Status:** Pre-implementation. The first concrete driver targeting this ABI is `atrium-virtio-gpu` (D0).
+**Status:** Pre-implementation. The first concrete driver targeting this ABI is `atrium-virtio-gpu` (D0); the first real-hardware driver is `atrium-gpu-amd` (D5.2). Per-vendor architecture is a vendor choice — see [`atrium-gpu-amd-design.md`](atrium-gpu-amd-design.md) for the binding spec for the AMD module and the articulated principles offered as a non-binding reference for any future vendor module.
 
 > See [../NAMING.md](../NAMING.md) for component naming. `ATRIUM_GPU_*` / `ATRIUM_DISPLAY_*` are the kernel-side constants for this boundary; `FRESCO_*` constants belong to the wire protocol layer above (see [wire-format.md](wire-format.md)).
 

@@ -260,6 +260,7 @@ Adjacent infrastructure also shipped this round:
 
 - **Pergola native** — the in-tree Atrium UI toolkit (replaces the previous "D5: Slint backend" plan; Slint was rejected for license incompatibility, see [`LICENSING-POLICY.md`](../LICENSING-POLICY.md)).
 - **atrium-mesa fork** — Mesa pruned to NIR + radv/anv/nvk + nak + vk_common + lavapipe slice, with libdrm-coupling replaced by Atrium GPU ABI calls. drm-kmod (the only GPL dependency in the runtime) is excised. See [`spec/pergola.md`](spec/pergola.md), [`feedback_mesa_fork_decision`].
+- **atrium-gpu-amd** — first native FreeBSD vendor module. Framework-less per-vendor design (no DRM-shaped framework on Atrium); RDNA2-only V1; explicit state machines + linear control flow + native VM primitives, ~6-8K kernel LoC for the GPU module. Articulated as a reference design so future vendor modules have a coherent shape to react against (binding only for atrium-gpu-amd; suggestive for others). See [`spec/atrium-gpu-amd-design.md`](spec/atrium-gpu-amd-design.md).
 - **Accessibility (CLASS_AX)** — sibling dictionary to CLASS_DISPLAY; `pergola-ax` crate maintains the AX tree; AT integration. Accessibility-first by architecture, not retrofitted.
 
 This is the moment the platform becomes structurally self-sufficient: no Linux DRM ABI, no GPL in the runtime, no toolkit dependency on a third-party.
