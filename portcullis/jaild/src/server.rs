@@ -306,8 +306,33 @@ fn handle_attach_mount(
     };
     state.add_runtime_mount(&req.jail_name, &req.source, &req.dest,
         kind_str, &host_dest_str);
+
+    /* Transactional: if state.save fails, we have a kernel-side
+     * mount with no on-disk record, which would leak forever
+     * (DetachMount only knows about state-tracked mounts).
+     * Roll back the mount and tell the caller the operation
+     * failed. The detach reconciliation we built for jaild
+     * crashes wouldn't help here because the jail still exists. */
     if let Err(e) = state.save(state_path) {
-        warn!("jaild: state save after AttachMount: {e}");
+        error!("jaild: state save after AttachMount failed ({e}); \
+                rolling back the mount");
+        state.runtime_mounts.retain(|m|
+            !(m.jail_name == req.jail_name && m.dest == req.dest));
+        let c = std::ffi::CString::new(host_dest_str.clone()).ok();
+        if let Some(c) = c {
+            // SAFETY: c is a valid CStr; we just successfully mounted on it.
+            #[allow(unsafe_code)]
+            let rc = unsafe { libc::unmount(c.as_ptr(), 0) };
+            if rc < 0 {
+                warn!("jaild: rollback unmount {host_dest_str}: {}",
+                    std::io::Error::last_os_error());
+            }
+        }
+        return Response::SyscallFailed {
+            name:  "state_save".into(),
+            errno: -1,
+            msg:   format!("persist runtime mount: {e}; rolled back"),
+        };
     }
     info!("jaild: AttachMount jail={} {} {} -> {host_dest_str}",
         req.jail_name, kind_str, req.source);
