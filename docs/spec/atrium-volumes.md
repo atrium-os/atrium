@@ -106,6 +106,19 @@ pub enum Request {
     /// at manifest-install time to give clear errors when a
     /// manifest references an unconfigured backend.
     ListBackends,
+
+    /// Change a previously-provisioned volume's size limit.
+    /// Forwarded to the backend plugin (Tessera quota update;
+    /// `zfs set refquota=`; ignored on `plain`). New limit may
+    /// be smaller than current usage — future writes that exceed
+    /// the new limit fail with EDQUOT; existing data is not
+    /// evicted to fit. See `spec/tessera-quotas.md`.
+    SetSize(SetSizeRequest),
+
+    /// Query a volume's current usage. Returns
+    /// (limit, used) on backends that enforce quotas (Tessera, ZFS),
+    /// or `UsageNotEnforced` on `plain` / `tmpfs`.
+    QueryUsage(QueryUsageRequest),
 }
 
 pub struct ProvisionRequest {

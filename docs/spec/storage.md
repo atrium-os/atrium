@@ -703,9 +703,11 @@ refinement, not a replacement.
 
 ## 14. Open questions / future work
 
-1. **Quota enforcement on `tessera` backend.** Tessera v3 work
-   item; until then, `size_max` on Tessera-backed volumes is
-   documentation. Soft-enforce via `du(1)` daemon? TBD.
+1. ~~**Quota enforcement on `tessera` backend.**~~ Spec'd in
+   [`tessera-quotas.md`](tessera-quotas.md): per-directory-tree
+   quota domains, logical-bytes accounting, hard limit. The
+   `size_max` field becomes real enforcement on Tessera with that
+   work landed.
 2. **`plain` backend quota helper.** Same shape: a sidecar that
    periodically `du`s and warns/refuses on overrun.
 3. **Snapshot retention policies.** Per-volume snapshot
