@@ -39,17 +39,12 @@ pub struct VolumeSpec {
     pub owner_gid: u32,
     #[serde(default)]
     pub size_max:  Option<u64>,
-    /// For `kind = Cas`: the CAS root reference. Ignored on
-    /// other kinds.
-    #[serde(default)]
-    pub cas_root:  Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum VolumeKind {
     Persistent,
-    Cas,
     Tmpfs,
 }
 
@@ -172,7 +167,6 @@ mod tests {
                 owner_uid: 88,
                 owner_gid: 88,
                 size_max:  Some(100 * 1024 * 1024 * 1024),
-                cas_root:  None,
             },
         });
         let bytes = serde_json::to_vec(&req).unwrap();

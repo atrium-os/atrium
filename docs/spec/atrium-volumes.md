@@ -101,17 +101,16 @@ pub struct ProvisionRequest {
 
 pub struct VolumeSpec {
     pub name:      String,
-    pub kind:      VolumeKind,        // Persistent / Cas / Tmpfs
+    pub kind:      VolumeKind,        // Persistent / Tmpfs
     pub backend:   Option<String>,    // operator-configured name; None = default
     pub mount_at:  String,            // path inside the jail
     pub mode:      u32,               // octal (0700 etc.)
     pub owner_uid: u32,
     pub owner_gid: u32,
     pub size_max:  Option<u64>,       // bytes; backend honours where it can
-    pub cas_root:  Option<String>,    // for kind = Cas only
 }
 
-pub enum VolumeKind { Persistent, Cas, Tmpfs }
+pub enum VolumeKind { Persistent, Tmpfs }
 
 pub struct DestroyRequest {
     pub jail_name: String,
@@ -250,11 +249,9 @@ owner_gid        = 88
 mode             = "0750"
 ```
 
-`Cas` and `Tmpfs` volumes are NOT in this file:
-- `Cas`: tracked by Tessera CAS GC (ref-count of `cas_root`);
-  atrium-volumes just resolves to a path on demand.
-- `Tmpfs`: ephemeral; jaild handles mount/unmount, no
-  allocation state to track.
+`Tmpfs` volumes are NOT in this file: ephemeral, jaild handles
+mount/unmount inline at jail-launch time, no allocation state
+to track.
 
 ## 6. Plugin trait
 

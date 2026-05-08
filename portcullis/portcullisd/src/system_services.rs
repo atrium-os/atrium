@@ -259,9 +259,6 @@ pub struct ManifestVolume {
     /// honour as a quota; others ignore.
     #[serde(default)]
     pub size_max: Option<u64>,
-    /// For `kind = "cas"` only.
-    #[serde(default)]
-    pub cas_root: Option<String>,
 
     /// First-run initialization. If present, portcullisd runs this
     /// as a one-shot jail (sharing the manifest's mounts + path,
@@ -279,7 +276,6 @@ pub struct ManifestVolume {
 #[serde(rename_all = "snake_case")]
 pub enum ManifestVolumeKind {
     Persistent,
-    Cas,
     Tmpfs,
 }
 
@@ -287,7 +283,6 @@ impl From<ManifestVolumeKind> for atrium_volumes::protocol::VolumeKind {
     fn from(k: ManifestVolumeKind) -> Self {
         match k {
             ManifestVolumeKind::Persistent => atrium_volumes::protocol::VolumeKind::Persistent,
-            ManifestVolumeKind::Cas        => atrium_volumes::protocol::VolumeKind::Cas,
             ManifestVolumeKind::Tmpfs      => atrium_volumes::protocol::VolumeKind::Tmpfs,
         }
     }
@@ -305,7 +300,6 @@ impl ManifestVolume {
             owner_uid: self.owner_uid,
             owner_gid: self.owner_gid,
             size_max:  self.size_max,
-            cas_root:  self.cas_root.clone(),
         }
     }
 }
@@ -597,7 +591,6 @@ mod tests {
             owner_uid: 88,
             owner_gid: 88,
             size_max: Some(100 * 1024 * 1024 * 1024),
-            cas_root: None,
             init: None,
         };
         let spec = v.to_volume_spec();

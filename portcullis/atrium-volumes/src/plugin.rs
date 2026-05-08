@@ -242,7 +242,6 @@ mod tests {
             owner_uid: uid,
             owner_gid: gid,
             size_max:  None,
-            cas_root:  None,
         }
     }
 

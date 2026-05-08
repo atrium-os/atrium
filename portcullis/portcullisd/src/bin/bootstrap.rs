@@ -350,7 +350,7 @@ fn main() -> ExitCode {
 /// `MountSpec` for the jail. Persistent volumes go through
 /// atrium-volumes (Provision returns a host path). Tmpfs
 /// volumes are direct (jaild handles the mount; source ignored
-/// per atrium-volumes V0). Cas volumes return an error in V0.
+/// per atrium-volumes V0).
 fn resolve_volumes(
     m:        &ServiceManifest,
     volumes:  &mut Option<volumes_client::Client>,
@@ -367,11 +367,6 @@ fn resolve_volumes(
                     dest:   v.mount_at.clone(),
                     kind:   MountKind::Tmpfs,
                 });
-            }
-            ManifestVolumeKind::Cas => {
-                return Err(format!(
-                    "volume {:?}: kind = \"cas\" is V1 (Tessera CAS API not yet wired)",
-                    v.name));
             }
             ManifestVolumeKind::Persistent => {
                 let client = volumes.as_mut().ok_or_else(|| format!(

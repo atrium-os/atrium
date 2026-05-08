@@ -90,7 +90,7 @@ they're both clients of portcullisd, which orchestrates the flow.
 ## 3. Volume kinds (the abstract intent)
 
 The manifest declares volumes by *kind* — what the service needs
-semantically, not what filesystem implements it. Three kinds:
+semantically, not what filesystem implements it. Two kinds:
 
 ### 3.1 `persistent`
 
@@ -111,21 +111,7 @@ size_max  = "100GiB"     # backend honours where it can
 backend   = "fast-db"    # optional; references operator-named backend
 ```
 
-### 3.2 `cas`
-
-Read-only, content-addressed (Tessera CAS layer). Used for app
-rootfs (binaries, libs, share files). Multiple jails sharing the
-same `cas_root` automatically dedup at the chunk level.
-
-```toml
-[[volumes]]
-name     = "app"
-kind     = "cas"
-cas_root = "atrium-app:mysql80-server@8.0.36"
-mount_at = "/atrium/app"
-```
-
-### 3.3 `tmpfs`
+### 3.2 `tmpfs`
 
 Lives only as long as the jail lives. Wiped on teardown.
 
@@ -358,15 +344,6 @@ devfs_ruleset = 5
 
 # === volumes ===
 
-# App rootfs: read-only, CAS-deduplicated across all mysqld
-# instances. backend implicitly = tessera-cas (the only kind
-# that supports `cas`).
-[[volumes]]
-name     = "app"
-kind     = "cas"
-cas_root = "atrium-app:mysql80-server@8.0.36"
-mount_at = "/atrium/app"
-
 # Database tables: write-heavy, dedup-poor. Operator routes to
 # their fast-db backend (ZFS).
 [[volumes]]
@@ -555,14 +532,13 @@ pub struct ProvisionRequest {
 }
 pub struct VolumeSpec {
     pub name:      String,
-    pub kind:      VolumeKind,    // Persistent / Cas / Tmpfs
+    pub kind:      VolumeKind,    // Persistent / Tmpfs
     pub backend:   Option<String>, // operator-configured name; None = default
     pub mount_at:  String,
     pub mode:      u16,
     pub owner_uid: u32,
     pub owner_gid: u32,
     pub size_max:  Option<u64>,
-    pub cas_root:  Option<String>, // for kind = Cas
 }
 
 pub enum Response {
@@ -758,10 +734,8 @@ When work resumes, in priority order:
 5. Land `zfs` backend plugin (1 day; shells out to zfs(8)).
 6. Land jaild's `AttachMount` / `DetachMount` protocol (½ day;
    small extension to the existing wire format).
-7. Land `cas` volume kind + Tessera CAS plumbing (depends on
-   Tessera v2 CAS API maturity; D1.5 work track).
-8. Land `plain` backend (¼ day; trivial mkdir+chown).
-9. Land `atrium-pkg` install path (separate spec + 2 days).
+7. Land `plain` backend (¼ day; trivial mkdir+chown).
+8. Land `atrium-pkg` install path (separate spec + 2 days).
 
 ## References
 

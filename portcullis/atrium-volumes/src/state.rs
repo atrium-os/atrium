@@ -4,8 +4,8 @@
 //! Spec: `docs/spec/atrium-volumes.md` §5. Same atomic-replace
 //! pattern as jaild's state file.
 //!
-//! Cas + Tmpfs volumes are NOT tracked here (Cas is by Tessera
-//! ref-count; Tmpfs is jaild-mounted ephemeral).
+//! Tmpfs volumes are NOT tracked here — they're ephemeral and
+//! jaild applies the mount inline at jail-launch time.
 
 use std::fs::{self, File};
 use std::io::Write as _;

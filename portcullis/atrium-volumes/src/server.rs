@@ -139,20 +139,10 @@ fn handle_provision(
     state:      &mut State,
     state_path: &Path,
 ) -> Result<Response, VolumesError> {
-    /* Cas + Tmpfs short-circuits — neither uses persistent
-     * state. */
-    match req.volume.kind {
-        VolumeKind::Cas => {
-            return Err(VolumesError::PolicyViolation {
-                rule:   "cas.unimplemented_v0",
-                detail: "cas volumes require Tessera CAS API; deferred".into(),
-            });
-        }
-        VolumeKind::Tmpfs => {
-            let host_path = format!("tmpfs::{}/{}", req.jail_name, req.volume.name);
-            return Ok(Response::Provisioned { host_path });
-        }
-        VolumeKind::Persistent => {}
+    /* Tmpfs short-circuits — no persistent state, no plugin. */
+    if let VolumeKind::Tmpfs = req.volume.kind {
+        let host_path = format!("tmpfs::{}/{}", req.jail_name, req.volume.name);
+        return Ok(Response::Provisioned { host_path });
     }
 
     /* Idempotent: existing record returns AlreadyProvisioned. */

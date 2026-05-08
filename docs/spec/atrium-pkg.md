@@ -10,11 +10,25 @@ operator-facing tool that bridges third-party software (mysqld,
 postgres, browsers) into the Atrium-jailed-services world.
 
 Companion specs:
-- `docs/spec/storage.md` — Tessera CAS layer, `cas` volume kind
+- `docs/spec/storage.md` — volume kinds + backends
 - `docs/spec/portcullis.md` — manifests + capability schema
 - `docs/spec/atrium-volumes.md` — volume allocation
 - `docs/spec/jaild-policy.md` — manifests' jail-creation
   parameters
+
+> **Spec drift note (2026-05-08):** the original design used a
+> `kind = "cas"` volume to expose package contents read-only into
+> a jail. That kind was removed because Tessera CAS dedup is
+> automatic for *every* persistent volume — there's no
+> distinction at the volume API. The replacement mechanism is
+> still TBD; current best guess is that `atrium-pkg install`
+> writes package content under `/var/lib/atrium/apps/<id>/`
+> (which is on Tessera, so dedup happens transparently), and
+> service manifests reference that path either via `path =`
+> (jail rootfs) or `[[mounts]] kind = "ro_nullfs"`. The §3.4 /
+> §3.6 references to `cas_root` in this doc need a rewrite when
+> atrium-pkg gets built; for now they describe the original
+> intent, not the current code.
 
 ## 1. Principle
 
