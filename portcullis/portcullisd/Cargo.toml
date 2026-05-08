@@ -22,6 +22,10 @@ path = "src/bin/jclient.rs"
 name = "atrium-portcullisd-bootstrap"
 path = "src/bin/bootstrap.rs"
 
+[[bin]]
+name = "atrium-portcullisd-attach"
+path = "src/bin/attach.rs"
+
 [dependencies]
 portcullis-toml   = { path = "../portcullis-toml" }
 portcullis-jail   = { path = "../portcullis-jail" }

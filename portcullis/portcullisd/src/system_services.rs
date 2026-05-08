@@ -89,6 +89,39 @@ pub struct ServiceManifest {
 
     #[serde(default)]
     pub supervision: Supervision,
+
+    /// Per-jail capabilities. Things the operator authorizes the
+    /// jail to ask portcullisd for at runtime — most notably,
+    /// AttachMount / DetachMount of additional volumes onto the
+    /// running jail. Jaild's policy file is the *outer* allow-list
+    /// (cluster-wide ceiling); this `[capabilities]` block is the
+    /// *inner* per-service grant. Both must allow for an operation
+    /// to land. Default: nothing granted.
+    #[serde(default)]
+    pub capabilities: Capabilities,
+}
+
+/// Operator-facing capability grants for the manifest's jail.
+/// Add new capabilities here additively.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct Capabilities {
+    /// If true, portcullisd forwards AttachMount/DetachMount
+    /// requests for this jail to jaild. The mount source must
+    /// also be allow-listed in `attach_mount_sources` (prefix
+    /// match). False (default) → portcullisd refuses with a
+    /// `cap.attach_mount.denied` policy error before ever
+    /// reaching jaild.
+    #[serde(default)]
+    pub attach_mount: bool,
+
+    /// Source-path allow-list for AttachMount on this jail. An
+    /// entry "/mnt/usb/" allows source "/mnt/usb/photos" but not
+    /// "/mnt/usb-other/...". Trailing slash recommended for
+    /// directory matching. Empty list with `attach_mount = true`
+    /// authorizes the capability but no sources — useful for
+    /// allowing detach-only.
+    #[serde(default)]
+    pub attach_mount_sources: Vec<String>,
 }
 
 fn default_true() -> bool { true }
@@ -375,6 +408,60 @@ impl ServiceManifest {
     }
 }
 
+/// Result of capability check. `Allowed` means the operation can
+/// proceed to jaild. The string-bearing variants explain why a
+/// request was denied — caller should surface it verbatim to the
+/// operator.
+#[derive(Debug)]
+pub enum CapabilityCheck {
+    Allowed,
+    Denied { rule: &'static str, detail: String },
+}
+
+/// Capability gate for an AttachMount request against `manifest`.
+/// Verifies the manifest grants `attach_mount = true` AND the
+/// requested source is allow-listed (prefix match on the
+/// manifest's `attach_mount_sources`). Returns `Allowed` only if
+/// both conditions hold.
+pub fn check_attach_mount(manifest: &ServiceManifest, source: &str) -> CapabilityCheck {
+    if !manifest.capabilities.attach_mount {
+        return CapabilityCheck::Denied {
+            rule:   "cap.attach_mount.denied",
+            detail: format!(
+                "manifest for {:?} doesn't grant attach_mount capability",
+                manifest.name),
+        };
+    }
+    let ok = manifest.capabilities.attach_mount_sources.iter()
+        .any(|prefix| source.starts_with(prefix));
+    if !ok {
+        return CapabilityCheck::Denied {
+            rule:   "cap.attach_mount.source_not_allowed",
+            detail: format!(
+                "source {:?} not on attach_mount_sources allow-list (have: {:?})",
+                source, manifest.capabilities.attach_mount_sources),
+        };
+    }
+    CapabilityCheck::Allowed
+}
+
+/// Capability gate for a DetachMount request. Symmetric with
+/// `check_attach_mount` minus the source allow-list — by V0
+/// design, anyone allowed to attach is allowed to detach. (We
+/// could split this in V1 if a real use case appears.)
+pub fn check_detach_mount(manifest: &ServiceManifest) -> CapabilityCheck {
+    if !manifest.capabilities.attach_mount {
+        return CapabilityCheck::Denied {
+            rule:   "cap.attach_mount.denied",
+            detail: format!(
+                "manifest for {:?} doesn't grant attach_mount capability \
+                 (governs both attach and detach)",
+                manifest.name),
+        };
+    }
+    CapabilityCheck::Allowed
+}
+
 /// Read every `.toml` file under `dir`, parse, sort by filename
 /// for stable boot order. Files that fail to parse are reported
 /// in the returned error list (loader doesn't half-boot — the
@@ -489,6 +576,7 @@ mod tests {
             network: ManifestNetwork::Disable,
             exec: None,
             supervision: Supervision::default(),
+            capabilities: Capabilities::default(),
         };
         let req = m.to_create_request();
         assert_eq!(req.name, "atrium-x");
@@ -653,6 +741,89 @@ mod tests {
         assert_eq!(init.argv.len(), 2);
         assert_eq!(init.uid, 88);
         assert_eq!(init.env.len(), 1);
+    }
+
+    #[test]
+    fn parse_capabilities_default_empty() {
+        let s = r#"name = "atrium-x"
+                   path = "/""#;
+        let m: ServiceManifest = toml::from_str(s).unwrap();
+        assert!(!m.capabilities.attach_mount);
+        assert!(m.capabilities.attach_mount_sources.is_empty());
+    }
+
+    #[test]
+    fn parse_capabilities_attach_mount() {
+        let s = r#"
+            name = "atrium-photoeditor"
+            path = "/"
+            [capabilities]
+            attach_mount = true
+            attach_mount_sources = ["/mnt/usb/", "/var/projects/"]
+        "#;
+        let m: ServiceManifest = toml::from_str(s).unwrap();
+        assert!(m.capabilities.attach_mount);
+        assert_eq!(m.capabilities.attach_mount_sources.len(), 2);
+    }
+
+    #[test]
+    fn capability_check_attach_denied_without_grant() {
+        let s = r#"name = "atrium-x"
+                   path = "/""#;
+        let m: ServiceManifest = toml::from_str(s).unwrap();
+        match check_attach_mount(&m, "/mnt/usb/photos") {
+            CapabilityCheck::Denied { rule, .. } =>
+                assert_eq!(rule, "cap.attach_mount.denied"),
+            _ => panic!("expected Denied"),
+        }
+    }
+
+    #[test]
+    fn capability_check_attach_denied_for_off_list_source() {
+        let s = r#"
+            name = "atrium-x"
+            path = "/"
+            [capabilities]
+            attach_mount = true
+            attach_mount_sources = ["/mnt/usb/"]
+        "#;
+        let m: ServiceManifest = toml::from_str(s).unwrap();
+        match check_attach_mount(&m, "/etc/passwd") {
+            CapabilityCheck::Denied { rule, .. } =>
+                assert_eq!(rule, "cap.attach_mount.source_not_allowed"),
+            _ => panic!("expected Denied"),
+        }
+    }
+
+    #[test]
+    fn capability_check_attach_allowed_with_prefix_match() {
+        let s = r#"
+            name = "atrium-x"
+            path = "/"
+            [capabilities]
+            attach_mount = true
+            attach_mount_sources = ["/mnt/usb/"]
+        "#;
+        let m: ServiceManifest = toml::from_str(s).unwrap();
+        assert!(matches!(check_attach_mount(&m, "/mnt/usb/photos"),
+            CapabilityCheck::Allowed));
+    }
+
+    #[test]
+    fn capability_check_detach_follows_attach_grant() {
+        let s = r#"
+            name = "atrium-x"
+            path = "/"
+            [capabilities]
+            attach_mount = true
+        "#;
+        let m: ServiceManifest = toml::from_str(s).unwrap();
+        assert!(matches!(check_detach_mount(&m), CapabilityCheck::Allowed));
+
+        let s2 = r#"name = "atrium-y"
+                    path = "/""#;
+        let m2: ServiceManifest = toml::from_str(s2).unwrap();
+        assert!(matches!(check_detach_mount(&m2), CapabilityCheck::Denied { .. }));
     }
 
     #[test]

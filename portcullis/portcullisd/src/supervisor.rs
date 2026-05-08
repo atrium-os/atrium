@@ -521,6 +521,7 @@ mod tests {
                 restart: RestartPolicy::Never,
                 ..Default::default()
             },
+            capabilities: crate::system_services::Capabilities::default(),
         }
     }
 
