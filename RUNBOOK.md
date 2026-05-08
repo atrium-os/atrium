@@ -1450,6 +1450,33 @@ cd ~/src/fresco-server && RUST_LOG=info cargo run --release
 ~/src/bsd/scripts/run-vm.sh --gpu
 ```
 
+### Run vestibulum (Pergola login screen) on screen
+
+Phase 6 of the Pergola track. Cross-built for FreeBSD aarch64; runs
+inside the venus VM against a `frescod` daemon driving real scanout.
+
+```sh
+# host: build (cached after first time)
+cd ~/src/bsd/vestibulum && cargo build --release --target aarch64-unknown-freebsd
+
+# in-VM: start frescod (the daemon, NOT frescod-vulkan-smoke)
+~/src/bsd/scripts/vssh "FRESCOD_BUNDLES_ROOT=/mnt/host/bundles \
+    nohup /mnt/host/frescod/target/aarch64-unknown-freebsd/release/frescod \
+        > /tmp/frescod.log 2>&1 &"
+
+# in-VM: launch vestibulum (defaults FRESCO_SOCK=/tmp/frescod.sock)
+~/src/bsd/scripts/vssh "/mnt/host/vestibulum/target/aarch64-unknown-freebsd/release/vestibulum"
+```
+
+Login form appears in the QEMU display window. Click into the
+username field, type, click into password, type, press Sign in.
+`vestibulum` prints the captured username + status, sets
+`done=true`, and exits cleanly. Esc aborts.
+
+Real local-auth integration (pam_local equivalent) is a separate
+follow-up; the binary today demonstrates the toolkit + wire path
+end-to-end.
+
 ### Deploy Portcullis end-to-end in a fresh VM
 
 After `Re-do first-boot setup from scratch` above, get from "fresh
