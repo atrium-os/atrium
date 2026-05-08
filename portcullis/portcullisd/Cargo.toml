@@ -23,10 +23,6 @@ name = "atrium-portcullisd-bootstrap"
 path = "src/bin/bootstrap.rs"
 
 [[bin]]
-name = "atrium-portcullisd-attach"
-path = "src/bin/attach.rs"
-
-[[bin]]
 name = "atrium-portcullisd-daemon"
 path = "src/bin/daemon.rs"
 
