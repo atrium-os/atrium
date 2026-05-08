@@ -201,19 +201,34 @@ pub struct Supervisor {
     /// Tombstoned (`ServiceState.retired = true`) instead of
     /// removed, to keep Vec indices stable for kqueue udata.
     services:  Vec<ServiceState>,
-    /// The single, persistent jaild connection. Reused for all
-    /// relaunches. jaild is single-threaded and accepts one
-    /// connection at a time, so opening a fresh connection per
-    /// relaunch deadlocks: jaild can't accept the new conn until
-    /// the old one's handle_connection returns, which only
-    /// happens on EOF.
-    client:    Client,
+    /// Optional persistent jaild connection.
+    ///
+    /// During the bootstrap launch loop we hold this open and
+    /// reuse it for every CreateJail (jaild is single-threaded
+    /// accept-one-at-a-time; opening a *second* connection while
+    /// the first is held deadlocks).
+    ///
+    /// Once launch is done, bootstrap calls `release_client()` to
+    /// drop the connection so jaild becomes available for other
+    /// clients (notably the portcullisd daemon's per-request
+    /// connections from in-jail services). Subsequent operations
+    /// reconnect lazily via `ensure_client()`. The deadlock
+    /// concern only applies *within a process* — distinct procs
+    /// connecting sequentially is fine.
+    client:    Option<Client>,
+    /// Where to reconnect if `client` was released.
+    jaild_socket_path: std::path::PathBuf,
 }
 
 impl Supervisor {
-    pub fn new(client: Client) -> io::Result<Self> {
+    pub fn new(client: Client, jaild_socket_path: std::path::PathBuf) -> io::Result<Self> {
         let kq = ffi::kqueue()?;
-        Ok(Self { kq, services: Vec::new(), client })
+        Ok(Self {
+            kq,
+            services: Vec::new(),
+            client:   Some(client),
+            jaild_socket_path,
+        })
     }
 
     /// Add a freshly-launched exec'd service to the watch set.
@@ -257,7 +272,30 @@ impl Supervisor {
     /// reuse it for the initial launch loop. Reusing avoids the
     /// "second connection deadlocks against single-threaded jaild"
     /// issue.
-    pub fn client_mut(&mut self) -> &mut Client { &mut self.client }
+    /// Get a mutable connection, reconnecting if needed. Used by
+    /// bootstrap during the launch loop; supervisor methods use
+    /// `ensure_client()` for the same lazy-reconnect behaviour.
+    pub fn client_mut(&mut self) -> &mut Client {
+        self.ensure_client().expect("jaild reconnect failed")
+    }
+
+    /// Drop the persistent jaild connection. After this, the
+    /// supervisor blocks on kqueue without holding a connection,
+    /// freeing jaild for other clients (notably the portcullisd
+    /// daemon's per-request connections from in-jail services).
+    /// On the next operation that needs jaild — handle_exit's
+    /// RemoveJail, a relaunch — supervisor reconnects.
+    pub fn release_client(&mut self) {
+        self.client = None;
+    }
+
+    fn ensure_client(&mut self) -> io::Result<&mut Client> {
+        if self.client.is_none() {
+            let c = Client::connect(&self.jaild_socket_path)?;
+            self.client = Some(c);
+        }
+        Ok(self.client.as_mut().expect("just inserted"))
+    }
 
     /// Block forever, restarting services per their manifest
     /// policy. Returns when there are no more supervised
@@ -293,13 +331,17 @@ impl Supervisor {
     }
 
     fn handle_exit(&mut self, idx: usize, exit_status: i32) {
-        let svc = &mut self.services[idx];
         let now      = Instant::now();
-        let lifetime = now.duration_since(svc.launched_at);
-        info!("{}: pid={} exited after {:.2}s (status={exit_status})",
-            svc.manifest.name, svc.pid, lifetime.as_secs_f64());
-        let _ = ffi::close_fd(svc.procdesc_fd);
-        svc.procdesc_fd = -1;
+        let (lifetime, svc_name, procdesc_fd) = {
+            let svc = &mut self.services[idx];
+            let lifetime = now.duration_since(svc.launched_at);
+            info!("{}: pid={} exited after {:.2}s (status={exit_status})",
+                svc.manifest.name, svc.pid, lifetime.as_secs_f64());
+            let pdfd = svc.procdesc_fd;
+            svc.procdesc_fd = -1;
+            (lifetime, svc.manifest.name.clone(), pdfd)
+        };
+        let _ = ffi::close_fd(procdesc_fd);
 
         /* Ask jaild to clean up any per-jail state (lo0 alias,
          * persisted record). Idempotent — a jail with no
@@ -308,16 +350,22 @@ impl Supervisor {
          * a clean slate. */
         let cleanup_req = Request::RemoveJail {
             jid:  None,
-            name: Some(svc.manifest.name.clone()),
+            name: Some(svc_name.clone()),
         };
-        match self.client.send(&cleanup_req) {
+        let send_result = match self.ensure_client() {
+            Ok(c)  => c.send(&cleanup_req),
+            Err(e) => {
+                warn!("{}: cleanup reconnect to jaild: {e}", svc_name);
+                return;
+            }
+        };
+        match send_result {
             Ok((Response::Ok, _)) => {}
             Ok((other, _)) => {
-                warn!("{}: post-exit cleanup unexpected response: {other:?}",
-                    svc.manifest.name);
+                warn!("{}: post-exit cleanup unexpected response: {other:?}", svc_name);
             }
             Err(e) => {
-                warn!("{}: post-exit cleanup rpc error: {e}", svc.manifest.name);
+                warn!("{}: post-exit cleanup rpc error: {e}", svc_name);
             }
         }
 
@@ -442,19 +490,32 @@ impl Supervisor {
     }
 
     fn relaunch(&mut self, idx: usize) {
-        let s = &mut self.services[idx];
-        let after = Duration::from_secs(s.manifest.supervision.restart_after_secs);
+        let (after, name, req) = {
+            let s = &self.services[idx];
+            (
+                Duration::from_secs(s.manifest.supervision.restart_after_secs),
+                s.manifest.name.clone(),
+                /* Reuse the launch-time CreateJailRequest verbatim — its
+                 * `mounts` already include the resolved [[volumes]]
+                 * entries that to_create_request() alone would drop. */
+                Request::CreateJail(s.create_req.clone()),
+            )
+        };
         if after > Duration::ZERO {
             std::thread::sleep(after);
         }
-        info!("{}: restarting", s.manifest.name);
+        info!("{}: restarting", name);
 
-        /* Reuse the launch-time CreateJailRequest verbatim — its
-         * `mounts` already include the resolved [[volumes]]
-         * entries that to_create_request() alone would drop. */
-        let req = Request::CreateJail(s.create_req.clone());
-        debug!("{}: sending CreateJail (reusing connection)", s.manifest.name);
-        match self.client.send(&req) {
+        debug!("{}: sending CreateJail", name);
+        let send_result = match self.ensure_client() {
+            Ok(c)  => c.send(&req),
+            Err(e) => {
+                error!("{}: relaunch reconnect to jaild: {e}", name);
+                self.services[idx].procdesc_fd = -1;
+                return;
+            }
+        };
+        match send_result {
             Ok((Response::JailCreated(r), Some(fd))) => {
                 debug!("{}: jaild ok, registering new fd={fd} pid={}",
                     self.services[idx].manifest.name, r.pid);

@@ -157,7 +157,7 @@ fn main() -> ExitCode {
     let mut driver = if once {
         Driver::Once(client)
     } else {
-        match Supervisor::new(client) {
+        match Supervisor::new(client, socket_path.clone()) {
             Ok(s)  => Driver::Supervise(s),
             Err(e) => {
                 error!("kqueue init: {e}");
@@ -195,6 +195,17 @@ fn main() -> ExitCode {
                     continue;
                 }
             }
+        }
+
+        /* Capability-derived mounts. Per `docs/spec/aqueduct.md`
+         * §6.1, the capability boundary is the filesystem: jails
+         * granted [capabilities] attach_mount = true get the
+         * portcullisd socket nullfs-mounted into their chroot,
+         * jails without the grant simply don't see the directory.
+         * Source path comes from jaild's policy ro_paths
+         * allow-list (operator-curated). */
+        for mount in capability_mounts(&m) {
+            create_req.mounts.push(mount);
         }
 
         /* First-run init for any volume with [[volumes.init]] and
@@ -301,6 +312,15 @@ fn main() -> ExitCode {
 
     match driver {
         Driver::Supervise(mut sup) => {
+            /* Drop the persistent jaild connection now that the
+             * launch loop is done. While the supervisor is
+             * blocked on kqueue, no one in this process holds
+             * a connection — leaving jaild free for the
+             * portcullisd daemon to forward in-jail
+             * AttachMount/DetachMount requests. The supervisor
+             * reconnects lazily on its next operation
+             * (handle_exit's RemoveJail or a relaunch). */
+            sup.release_client();
             info!("bootstrap launched {} supervised + {} held; entering kqueue loop",
                 sup.watched_count(), held.len());
             if let Err(e) = sup.run() {
@@ -344,6 +364,28 @@ fn main() -> ExitCode {
 
     let _ = Duration::from_secs(0);  // silence unused-import lint
     if launch_failures == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+}
+
+/// Walk the manifest's `[capabilities]` block and emit the
+/// per-capability mounts to add to the CreateJailRequest.
+///
+/// Currently the only capability that materializes as a mount is
+/// `attach_mount = true` → ro_nullfs mount of the portcullisd
+/// daemon's per-capability directory. Future caps (clipboard,
+/// notify, audio, ...) follow the same shape: each has a
+/// `/var/run/atrium/caps/<name>/` directory on the host (curated
+/// by jaild policy ro_paths) and shows up in the jail at
+/// `/atrium/sockets/<name>/`. Per `docs/spec/aqueduct.md` §6.1.
+fn capability_mounts(m: &ServiceManifest) -> Vec<MountSpec> {
+    let mut out = Vec::new();
+    if m.capabilities.attach_mount {
+        out.push(MountSpec {
+            source: "/var/run/atrium/caps/portcullisd/".into(),
+            dest:   "/atrium/sockets/portcullisd/".into(),
+            kind:   MountKind::RoNullfs,
+        });
+    }
+    out
 }
 
 /// Walk the manifest's `[[volumes]]` and turn each into a

@@ -26,7 +26,10 @@ use portcullis_protocol::{
     OP_ATTACH_MOUNT, OP_DETACH_MOUNT, OP_MOUNT_REPLY,
 };
 
-const DEFAULT_SOCKET: &str = "/var/run/atrium/portcullisd.sock";
+/// In-jail path. Bootstrap nullfs-mounts the daemon's per-
+/// capability directory at `/atrium/sockets/portcullisd/`, so
+/// the socket inside the jail is at this path.
+const DEFAULT_SOCKET: &str = "/atrium/sockets/portcullisd/portcullisd.sock";
 
 fn usage() -> ExitCode {
     eprintln!("\

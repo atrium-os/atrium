@@ -53,7 +53,13 @@ use portcullisd::system_services::{
     self, CapabilityCheck, ServiceManifest,
 };
 
-const DEFAULT_SOCKET:        &str = "/var/run/atrium/portcullisd.sock";
+/// Per-capability socket path. The directory is what bootstrap
+/// nullfs-mounts into authorized jails at `/atrium/sockets/
+/// portcullisd/`, so the in-jail path is
+/// `/atrium/sockets/portcullisd/portcullisd.sock`. Per
+/// `docs/spec/aqueduct.md` §6.1, capability = mount; jails with
+/// no `attach_mount = true` simply don't see the directory.
+const DEFAULT_SOCKET:        &str = "/var/run/atrium/caps/portcullisd/portcullisd.sock";
 const DEFAULT_JAILD_SOCKET:  &str = "/var/run/atrium/jaild.sock";
 const DEFAULT_SVCDIR:        &str = "/etc/atrium/services.d";
 
@@ -95,17 +101,25 @@ fn main() -> ExitCode {
         }
     }
 
-    /* Pre-open jaild connection. We re-use this single connection
-     * for the daemon's lifetime; jaild is single-threaded accept-
-     * one-at-a-time. */
-    let mut jaild = match Client::connect(&jaild_path) {
-        Ok(c) => c,
-        Err(e) => {
-            error!("connect jaild socket {}: {e}", jaild_path.display());
+    /* We do NOT hold a persistent jaild connection. jaild is
+     * single-threaded accept-one-at-a-time, and bootstrap
+     * (running in supervisor mode) wants its own concurrent
+     * connection during the launch loop. Holding one here would
+     * deadlock the other. Instead we open a fresh connection per
+     * forwarded request — the connect/send/recv cost is
+     * negligible at the rates this daemon serves and avoids the
+     * coordination problem entirely. */
+
+    /* Ensure the per-capability socket directory exists; bootstrap
+     * nullfs-mounts the *directory* into authorized jails at
+     * `/atrium/sockets/portcullisd/`, so this layout has to be
+     * laid out before the daemon binds. */
+    if let Some(parent) = socket_path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            error!("create socket parent {}: {e}", parent.display());
             return ExitCode::FAILURE;
         }
-    };
-    info!("portcullisd-daemon: connected to jaild at {}", jaild_path.display());
+    }
 
     /* Cleanup stale socket from a previous run. */
     let _ = std::fs::remove_file(&socket_path);
@@ -116,12 +130,17 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    /* Mode 0600 — only owner connects. Per-jail visibility is
-     * achieved by jaild bind-mounting a copy of the socket into
-     * each authorized jail's chroot (V1; for now the daemon
-     * accepts from anyone with the same uid as itself). */
+    /* Mode 0666 — capability mediation is the bind-mount, not
+     * the file mode. Any uid that can see this socket has
+     * already been authorized by jaild's mount policy +
+     * bootstrap's [capabilities] derivation; restricting by uid
+     * here would just block legitimate in-jail callers (which
+     * run under the service's manifest-declared uid, not 0).
+     * The daemon still capability-checks each request server-
+     * side (via the manifest's [capabilities] block). */
+    use std::os::unix::fs::PermissionsExt;
     if let Err(e) = std::fs::set_permissions(&socket_path,
-        std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        std::fs::Permissions::from_mode(0o666))
     { warn!("chmod {}: {e}", socket_path.display()); }
     info!("portcullisd-daemon: listening on {}", socket_path.display());
 
@@ -130,7 +149,7 @@ fn main() -> ExitCode {
             Ok(s) => s,
             Err(e) => { warn!("accept: {e}"); continue; }
         };
-        if let Err(e) = handle_client(s, &mut jaild, &svcdir) {
+        if let Err(e) = handle_client(s, &jaild_path, &svcdir) {
             warn!("client handler: {e}");
         }
     }
@@ -138,9 +157,9 @@ fn main() -> ExitCode {
 }
 
 fn handle_client(
-    s:       UnixStream,
-    jaild:   &mut Client,
-    svcdir:  &Path,
+    s:           UnixStream,
+    jaild_path:  &Path,
+    svcdir:      &Path,
 ) -> io::Result<()> {
     let peer_uid = peer_uid(&s);
     info!("portcullisd-daemon: accepted (peer uid={peer_uid:?})");
@@ -176,8 +195,8 @@ fn handle_client(
             continue;
         }
         let reply = match m.op {
-            OP_ATTACH_MOUNT => handle_attach(&m.payload, &outcome.manifests, jaild),
-            OP_DETACH_MOUNT => handle_detach(&m.payload, &outcome.manifests, jaild),
+            OP_ATTACH_MOUNT => handle_attach(&m.payload, &outcome.manifests, jaild_path),
+            OP_DETACH_MOUNT => handle_detach(&m.payload, &outcome.manifests, jaild_path),
             other => MountReply::Error {
                 detail: format!("unknown opcode 0x{other:04x} on CLASS_PORTCULLIS"),
             },
@@ -186,10 +205,23 @@ fn handle_client(
     }
 }
 
+/// Open a one-shot jaild connection, send `req`, return the reply
+/// converted to MountReply. Connection is dropped (closed) at
+/// function exit, freeing jaild for the next caller.
+fn jaild_round_trip(jaild_path: &Path, req: &JaildReq) -> MountReply {
+    let mut client = match Client::connect(jaild_path) {
+        Ok(c)  => c,
+        Err(e) => return MountReply::Error {
+            detail: format!("connect jaild {}: {e}", jaild_path.display()),
+        },
+    };
+    forward_to_jaild(&mut client, req)
+}
+
 fn handle_attach(
     payload:    &[u8],
     manifests:  &[ServiceManifest],
-    jaild:      &mut Client,
+    jaild_path: &Path,
 ) -> MountReply {
     let req: AttachMountReq = match serde_json::from_slice(payload) {
         Ok(r) => r,
@@ -223,13 +255,13 @@ fn handle_attach(
             ProtoKind::Tmpfs    => JaildKind::Tmpfs,
         },
     });
-    forward_to_jaild(jaild, &jaild_req)
+    jaild_round_trip(jaild_path, &jaild_req)
 }
 
 fn handle_detach(
     payload:    &[u8],
     manifests:  &[ServiceManifest],
-    jaild:      &mut Client,
+    jaild_path: &Path,
 ) -> MountReply {
     let req: DetachMountReq = match serde_json::from_slice(payload) {
         Ok(r) => r,
@@ -257,7 +289,7 @@ fn handle_detach(
         dest:      req.dest.clone(),
         force:     req.force,
     });
-    forward_to_jaild(jaild, &jaild_req)
+    jaild_round_trip(jaild_path, &jaild_req)
 }
 
 fn forward_to_jaild(jaild: &mut Client, req: &JaildReq) -> MountReply {

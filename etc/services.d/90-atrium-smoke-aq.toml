@@ -1,0 +1,50 @@
+# /etc/atrium/services.d/90-atrium-smoke-aq.toml
+#
+# End-to-end aqueduct smoke. Validates the full chain spec'd in
+# `docs/spec/aqueduct.md` §6 and `storage.md` §6.2:
+#
+#   bootstrap reads [capabilities] attach_mount = true → derives a
+#       ro_nullfs mount of /var/run/atrium/caps/portcullisd/
+#       → /atrium/sockets/portcullisd/ in the jail.
+#   bootstrap launches the jail with that mount + the exec
+#       being the aqueduct client itself (atrium-portcullisd-aq).
+#   inside the jail: the client opens
+#       /atrium/sockets/portcullisd/portcullisd.sock, sends a
+#       CLASS_PORTCULLIS / OP_ATTACH_MOUNT request, gets back
+#       MountReply::Ok.
+#   on the host: portcullisd-daemon receives the request, runs
+#       this manifest's [capabilities] gate, forwards to jaild,
+#       jaild applies the runtime nullfs mount.
+#
+# This is the first time anything Atrium-shaped runs aqueduct
+# end-to-end in the production socket topology — capability =
+# directory mount, no daemon-side trust check on the path.
+
+enabled       = true
+name          = "atrium-aq-photoeditor"
+path          = "/"
+children_max  = 0
+devfs_ruleset = 0
+
+[exec]
+path = "/usr/local/bin/atrium-portcullisd-aq"
+argv = ["atrium-portcullisd-aq",
+        "attach", "atrium-aq-photoeditor",
+        "/var/lib/atrium/storage/jails/atrium-attach-source",
+        "/atrium-via-aq",
+        "rw_nullfs"]
+uid  = 1001
+gid  = 1001
+
+[[exec.env]]
+key   = "PATH"
+value = "/bin:/usr/bin"
+
+[capabilities]
+attach_mount         = true
+attach_mount_sources = ["/var/lib/atrium/storage/jails/"]
+
+[supervision]
+restart                       = "never"
+failure_budget_secs           = 0
+min_lifetime_for_success_secs = 1

@@ -32,6 +32,13 @@ ro_paths = [
 
     # Atrium config (jaild policy itself, services manifests).
     "/etc/atrium",
+
+    # Per-capability service-socket directories. Each grants the
+    # jail rendezvous with one Atrium service. Bootstrap derives
+    # the mount from the manifest's [capabilities] block; jails
+    # without the grant simply don't see the directory. See
+    # docs/spec/aqueduct.md §6.1.
+    "/var/run/atrium/caps/portcullisd/",
 ]
 rw_paths = [
     # Aqueduct service-socket directory (all jails that talk to
