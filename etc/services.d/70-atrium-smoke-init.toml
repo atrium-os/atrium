@@ -1,0 +1,67 @@
+# /etc/atrium/services.d/70-atrium-smoke-init.toml
+#
+# First-run init smoke. Validates the [[volumes.init]] lifecycle:
+#   portcullisd asks atrium-volumes to provision the persistent
+#   volume → checks for `<host_path>/.atrium-init-done` → if
+#   absent, sends a one-shot CreateJail to jaild with the init
+#   exec spec → blocks on kqueue+EVFILT_PROCDESC for the init
+#   process to exit → on clean exit writes the sentinel and
+#   continues to launch the real service.
+#
+# On second invocation the sentinel exists and init is skipped.
+#
+# The init binary is a stand-in: `atrium-jaild check-policy` is
+# the only exec already allow-listed by the policy that exits
+# cleanly with a real exit-status path through pdfork. It doesn't
+# actually write anything inside the volume — the sentinel write
+# is host-side. Real services (mysqld, etc.) point this at their
+# own `*_install_db`-style tool.
+#
+# `mount_at` is `/atrium-init-data` (NOT `/atrium-data` like
+# 60-atrium-smoke-volumes) because both manifests use `path = "/"`
+# and so both nullfs mounts land on the host's filesystem; using
+# the same target would collide (EDEADLK from the kernel's
+# nullfs lock). Real services will have proper jail-root trees
+# (D5 atrium-rootfs) and the collision will go away.
+
+enabled       = true
+name          = "atrium-smoke-init"
+path          = "/"
+children_max  = 0
+devfs_ruleset = 0
+
+[[volumes]]
+name      = "data"
+kind      = "persistent"
+mount_at  = "/atrium-init-data"
+mode      = 448         # 0o700
+owner_uid = 0
+owner_gid = 0
+
+[volumes.init]
+path = "/usr/local/bin/atrium-jaild"
+argv = ["atrium-jaild", "check-policy",
+        "--policy", "/etc/atrium/jaild.policy.toml"]
+uid  = 1001
+gid  = 1001
+
+[[volumes.init.env]]
+key   = "PATH"
+value = "/bin:/usr/bin"
+
+[exec]
+path = "/usr/local/bin/atrium-jaild"
+argv = ["atrium-jaild", "check-policy",
+        "--policy", "/etc/atrium/jaild.policy.toml"]
+uid  = 1001
+gid  = 1001
+
+[[exec.env]]
+key   = "PATH"
+value = "/bin:/usr/bin"
+
+[supervision]
+restart                       = "never"
+restart_after_secs            = 1
+failure_budget_secs           = 0
+min_lifetime_for_success_secs = 5

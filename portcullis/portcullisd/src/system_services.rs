@@ -262,6 +262,17 @@ pub struct ManifestVolume {
     /// For `kind = "cas"` only.
     #[serde(default)]
     pub cas_root: Option<String>,
+
+    /// First-run initialization. If present, portcullisd runs this
+    /// as a one-shot jail (sharing the manifest's mounts + path,
+    /// no network) before launching the real service. A sentinel
+    /// file `<host_path>/.atrium-init-done` is written on success;
+    /// on subsequent boots the init is skipped. Used for things
+    /// like `mysql_install_db` that need to run exactly once per
+    /// fresh persistent volume. Spec: `docs/spec/portcullis.md`
+    /// §3.4 + `docs/spec/storage.md` §8.2.
+    #[serde(default)]
+    pub init: Option<ManifestExec>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -318,7 +329,7 @@ impl From<&ManifestNetwork> for NetworkConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ManifestExec {
     pub path: String,
     pub argv: Vec<String>,
@@ -328,7 +339,7 @@ pub struct ManifestExec {
     pub env:  Vec<ManifestEnv>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ManifestEnv {
     pub key:   String,
     pub value: String,
@@ -587,6 +598,7 @@ mod tests {
             owner_gid: 88,
             size_max: Some(100 * 1024 * 1024 * 1024),
             cas_root: None,
+            init: None,
         };
         let spec = v.to_volume_spec();
         assert_eq!(spec.name, "data");
@@ -615,6 +627,39 @@ mod tests {
         let m: ServiceManifest = toml::from_str(s).unwrap();
         assert_eq!(m.supervision.failure_budget_secs, 10);
         assert_eq!(m.supervision.min_lifetime_for_success_secs, 2);
+    }
+
+    #[test]
+    fn parse_volume_with_init() {
+        let s = r#"
+            name = "mysqld"
+            path = "/"
+
+            [[volumes]]
+            name = "data"
+            kind = "persistent"
+            mount_at = "/var/db/mysql"
+            mode = 448
+            owner_uid = 88
+            owner_gid = 88
+
+            [volumes.init]
+            path = "/usr/local/bin/mysql_install_db"
+            argv = ["mysql_install_db", "--basedir=/usr/local"]
+            uid  = 88
+            gid  = 88
+
+            [[volumes.init.env]]
+            key   = "PATH"
+            value = "/bin:/usr/bin"
+        "#;
+        let m: ServiceManifest = toml::from_str(s).unwrap();
+        let v = &m.volumes[0];
+        let init = v.init.as_ref().expect("init present");
+        assert_eq!(init.path, "/usr/local/bin/mysql_install_db");
+        assert_eq!(init.argv.len(), 2);
+        assert_eq!(init.uid, 88);
+        assert_eq!(init.env.len(), 1);
     }
 
     #[test]

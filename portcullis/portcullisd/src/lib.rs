@@ -9,6 +9,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod init_phase;
 pub mod jaild_client;
 pub mod supervisor;
 pub mod system_services;

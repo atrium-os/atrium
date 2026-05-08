@@ -29,8 +29,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use jaild::protocol::{MountKind, MountSpec, Request, Response};
+use jaild::protocol::{EnvPair, ExecSpec, MountKind, MountSpec, Request, Response};
 use log::{error, info, warn};
+use portcullisd::init_phase::{self, InitOutcome};
 use portcullisd::jaild_client::Client;
 use portcullisd::supervisor::Supervisor;
 use portcullisd::system_services::{self, LoadOutcome, ManifestVolumeKind, ServiceManifest};
@@ -166,7 +167,7 @@ fn main() -> ExitCode {
     let mut held_fds: Vec<i32> = Vec::new();
     let mut launch_failures = 0;
 
-    for m in enabled {
+    'manifest: for m in enabled {
         let mut create_req = m.to_create_request();
 
         /* Resolve [[volumes]] before launching: ask atrium-volumes
@@ -174,13 +175,67 @@ fn main() -> ExitCode {
          * returned host paths as rw_nullfs mounts. tmpfs volumes
          * become Tmpfs mounts directly (no allocator). cas
          * volumes are V1. */
+        let mut persistent_host_paths: Vec<(String, String)> = Vec::new();
         if !m.volumes.is_empty() {
             match resolve_volumes(&m, &mut volumes) {
-                Ok(extra_mounts) => create_req.mounts.extend(extra_mounts),
+                Ok((extra_mounts, host_paths)) => {
+                    create_req.mounts.extend(extra_mounts);
+                    persistent_host_paths = host_paths;
+                }
                 Err(e) => {
                     error!("{}: volume resolution: {e}", m.name);
                     launch_failures += 1;
                     continue;
+                }
+            }
+        }
+
+        /* First-run init for any volume with [[volumes.init]] and
+         * no sentinel. Init runs in a one-shot jail with the same
+         * mounts as the real service; bootstrap blocks here until
+         * each init completes (kqueue+EVFILT_PROCDESC). On any
+         * failure, the manifest's real launch is skipped — better
+         * to leave the service down than to start it against a
+         * half-initialized volume. */
+        for v in &m.volumes {
+            let Some(init_exec_m) = &v.init else { continue; };
+            let Some((_, host_path)) = persistent_host_paths.iter()
+                .find(|(name, _)| name == &v.name) else {
+                error!("{}: volume {:?} has [init] but no host path \
+                        (kind != persistent?)", m.name, v.name);
+                launch_failures += 1;
+                continue 'manifest;
+            };
+            let init_exec = ExecSpec {
+                path: init_exec_m.path.clone(),
+                argv: init_exec_m.argv.clone(),
+                uid:  init_exec_m.uid,
+                gid:  init_exec_m.gid,
+                env:  init_exec_m.env.iter().map(|p| EnvPair {
+                    key:   p.key.clone(),
+                    value: p.value.clone(),
+                }).collect(),
+            };
+            let client = match &mut driver {
+                Driver::Once(c)      => c,
+                Driver::Supervise(s) => s.client_mut(),
+            };
+            let init_result = init_phase::run_init(
+                client,
+                &m.name,
+                &v.name,
+                host_path,
+                &m.path,
+                create_req.mounts.clone(),
+                init_exec,
+            );
+            match init_result {
+                Ok(InitOutcome::Ran)         => { /* sentinel was just written */ }
+                Ok(InitOutcome::AlreadyDone) => { /* nothing to do */ }
+                Err(e) => {
+                    error!("{}: init phase for volume {}: {e}", m.name, v.name);
+                    launch_failures += 1;
+                    continue 'manifest;
                 }
             }
         }
@@ -254,10 +309,11 @@ fn main() -> ExitCode {
 fn resolve_volumes(
     m:        &ServiceManifest,
     volumes:  &mut Option<volumes_client::Client>,
-) -> Result<Vec<MountSpec>, String> {
+) -> Result<(Vec<MountSpec>, Vec<(String, String)>), String> {
     use atrium_volumes::protocol::{ProvisionRequest, Request as VReq, Response as VResp};
 
-    let mut mounts: Vec<MountSpec> = Vec::with_capacity(m.volumes.len());
+    let mut mounts:     Vec<MountSpec>          = Vec::with_capacity(m.volumes.len());
+    let mut host_paths: Vec<(String, String)>   = Vec::new();
     for v in &m.volumes {
         match v.kind {
             ManifestVolumeKind::Tmpfs => {
@@ -301,12 +357,13 @@ fn resolve_volumes(
                 };
                 info!("{}: provisioned volume {} → {}", m.name, v.name, host_path);
                 mounts.push(MountSpec {
-                    source: host_path,
+                    source: host_path.clone(),
                     dest:   v.mount_at.clone(),
                     kind:   MountKind::RwNullfs,
                 });
+                host_paths.push((v.name.clone(), host_path));
             }
         }
     }
-    Ok(mounts)
+    Ok((mounts, host_paths))
 }
