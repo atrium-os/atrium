@@ -381,6 +381,7 @@ portcullisd's contribution to this flow:
 | Service log aggregation                  | `atrium-log`      | journald-equivalent                                 | Different domain; integrity-isolation from policy.                       |
 | Manifest-driven timers                   | `atrium-timer`    | systemd timer-unit equivalent                       | Different domain; portcullisd is reactive, not active.                   |
 | Per-jail volume allocation (DB data, app rootfs, tmpfs) | `atrium-volumes` | per-volume backend (Tessera default, ZFS / plain alternatives); see `docs/spec/storage.md` | Different domain (storage lifecycle); integrity-isolation from policy; pluggable backends; quota / snapshot / dedup features per-backend. |
+| Per-jail pf rule lifecycle (network policy enforcement)  | `atrium-netd`     | `/dev/pf` anchors derived from manifest `[capabilities] network.*`; see `docs/spec/atrium-netd.md` | Different domain (kernel firewall lifecycle); narrow `pf` capability via devfs ruleset; event-driven reconciler vs portcullisd-daemon's request-driven RPC; independent failure isolation. |
 
 \* DNS is a sub-domain of networking; doesn't justify a separate
 daemon today. Could split out as `atrium-resolved` if a
