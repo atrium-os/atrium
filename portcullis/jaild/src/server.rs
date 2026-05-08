@@ -361,6 +361,17 @@ fn handle_create_with_exec(
     if pdf.pid == 0 {
         /* ====== child ====== */
         for (src, dst, kind) in &resolved_mounts {
+            /* nullfs / tmpfs need the destination dir to exist —
+             * otherwise mount(2) returns ENOENT. We create it
+             * pre-jail_attach with mode 0755 (the mount overlays
+             * any contents anyway). Idempotent: existing dirs
+             * are fine. */
+            if let Err(e) = std::fs::create_dir_all(dst) {
+                if e.kind() != std::io::ErrorKind::AlreadyExists {
+                    eprintln!("jaild-child: mkdir -p {dst}: {e}");
+                    ffi::child_exit(101);
+                }
+            }
             let res = match kind {
                 MountKind::RoNullfs => ffi::nullfs_mount(src, dst, true),
                 MountKind::RwNullfs => ffi::nullfs_mount(src, dst, false),
