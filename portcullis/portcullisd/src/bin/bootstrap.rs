@@ -265,7 +265,7 @@ fn main() -> ExitCode {
                     m.name, r.jid, r.pid, r.procdesc_attached);
                 match (fd, &mut driver) {
                     (Some(fd), Driver::Supervise(sup)) => {
-                        if let Err(e) = sup.watch(m, fd, r.pid) {
+                        if let Err(e) = sup.watch(m, fd, r.pid, mount_dests) {
                             error!("watch register failed: {e}");
                             launch_failures += 1;
                         }

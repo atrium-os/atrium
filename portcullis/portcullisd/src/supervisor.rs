@@ -23,9 +23,10 @@ use std::collections::VecDeque;
 use std::io;
 use std::time::{Duration, Instant};
 
-use jaild::protocol::{Request, Response};
+use jaild::protocol::{MountKind, Request, Response};
 use log::{debug, error, info, warn};
 
+use crate::host_mount;
 use crate::jaild_client::Client;
 use crate::system_services::{RestartPolicy, ServiceManifest};
 
@@ -54,6 +55,20 @@ pub struct ServiceState {
     /// `manifest.supervision.failure_budget_secs`.
     /// 0 → disabled (infinite restarts).
     pub failure_budget_remaining: f64,
+    /// Mount destinations applied at launch. Walked at every
+    /// terminal event (exit-and-restart, retire) to unmount the
+    /// host-namespace mounts the previous instance left behind.
+    /// Without this, restarting any service with [[mounts]] /
+    /// [[volumes]] hits EDEADLK on the next nullfs(8) mount of
+    /// the same source/dest pair, since FreeBSD jails share the
+    /// global mount table with the host.
+    pub mount_dests: Vec<(String, MountKind)>,
+    /// Tombstone flag. Set by `retire()` instead of removing the
+    /// entry, because kqueue's per-kevent `udata` we use is the
+    /// services-vec index — removing would invalidate other
+    /// services' udata. Skipped by run() / process_pending_restarts
+    /// / process_kqueue_exit.
+    pub retired: bool,
 }
 
 #[cfg(target_os = "freebsd")]
@@ -182,11 +197,10 @@ mod ffi {
 /// V2; V3 can add SIGTERM handling).
 pub struct Supervisor {
     kq:        i32,
+    /// All services ever supervised in this Supervisor's lifetime.
+    /// Tombstoned (`ServiceState.retired = true`) instead of
+    /// removed, to keep Vec indices stable for kqueue udata.
     services:  Vec<ServiceState>,
-    /// Manifests that we're done with (e.g. `restart = "never"`
-    /// after a clean exit). Kept for completeness; not currently
-    /// inspected by anything outside the supervisor.
-    retired:   Vec<ServiceManifest>,
     /// The single, persistent jaild connection. Reused for all
     /// relaunches. jaild is single-threaded and accepts one
     /// connection at a time, so opening a fresh connection per
@@ -199,13 +213,23 @@ pub struct Supervisor {
 impl Supervisor {
     pub fn new(client: Client) -> io::Result<Self> {
         let kq = ffi::kqueue()?;
-        Ok(Self { kq, services: Vec::new(), retired: Vec::new(), client })
+        Ok(Self { kq, services: Vec::new(), client })
     }
 
     /// Add a freshly-launched exec'd service to the watch set.
     /// Persistent jails should not be added (they have no
     /// procdesc fd and don't get supervised).
-    pub fn watch(&mut self, manifest: ServiceManifest, procdesc_fd: i32, pid: i32) -> io::Result<()> {
+    ///
+    /// `mount_dests` is the (dest, kind) of every mount the jail
+    /// applied — manifest's `[[mounts]]` plus the dynamically-
+    /// resolved `[[volumes]]` mounts. Used at exit-time cleanup.
+    pub fn watch(
+        &mut self,
+        manifest:    ServiceManifest,
+        procdesc_fd: i32,
+        pid:         i32,
+        mount_dests: Vec<(String, MountKind)>,
+    ) -> io::Result<()> {
         let idx = self.services.len();
         ffi::register_procdesc_exit(self.kq, procdesc_fd, idx)?;
         info!("supervising {}: pid={pid} procdesc={procdesc_fd}", manifest.name);
@@ -218,11 +242,15 @@ impl Supervisor {
             recent_restarts: VecDeque::new(),
             burst_pause_until: None,
             failure_budget_remaining: initial_budget,
+            mount_dests,
+            retired: false,
         });
         Ok(())
     }
 
-    pub fn watched_count(&self) -> usize { self.services.len() }
+    pub fn watched_count(&self) -> usize {
+        self.services.iter().filter(|s| !s.retired).count()
+    }
 
     /// Borrow the jaild connection so the bootstrap launcher can
     /// reuse it for the initial launch loop. Reusing avoids the
@@ -234,7 +262,7 @@ impl Supervisor {
     /// policy. Returns when there are no more supervised
     /// services (all have retired into "never restart" state).
     pub fn run(&mut self) -> io::Result<()> {
-        while !self.services.is_empty() {
+        while self.services.iter().any(|s| !s.retired) {
             /* Bound the wait so that pending burst-cooldowns
              * get re-checked. 1s is fine; the cost is one
              * extra kevent call per second when idle. */
@@ -249,6 +277,10 @@ impl Supervisor {
                 let idx = ev.udata;
                 if idx >= self.services.len() {
                     warn!("kevent for unknown service index {idx}");
+                    continue;
+                }
+                if self.services[idx].retired {
+                    debug!("kevent for already-retired service idx={idx}");
                     continue;
                 }
                 self.handle_exit(idx, exit_status);
@@ -287,6 +319,21 @@ impl Supervisor {
                 warn!("{}: post-exit cleanup rpc error: {e}", svc.manifest.name);
             }
         }
+
+        /* Unmount the previous instance's host-namespace mounts.
+         * Always, regardless of restart decision: the next launch
+         * (if any) re-applies them through jaild's child, and
+         * mounting on top of an identical existing nullfs returns
+         * EDEADLK. Borrow svc again here since cleanup_req
+         * borrowed it earlier. */
+        let svc = &self.services[idx];
+        for (dest, kind) in &svc.mount_dests {
+            if let Err(e) = host_mount::unmount(dest) {
+                warn!("{}: post-exit unmount {kind:?} {dest}: {e}",
+                    svc.manifest.name);
+            }
+        }
+        let svc = &mut self.services[idx];
 
         /* Failure-budget update. A "successful start" is alive
          * ≥ min_lifetime_for_success_secs; that refills the
@@ -365,18 +412,13 @@ impl Supervisor {
         }
     }
 
-    /// Move a service from supervised to retired. Used by both
-    /// the "policy doesn't want restart" path and the
-    /// "max_consecutive_failures hit" path.
-    ///
-    /// Note: udata indexes for higher-numbered services in the
-    /// kqueue are now off-by-one. This is fine because EV_ONESHOT
-    /// already deleted each registered kevent when it fired; the
-    /// next relaunch for any of them will re-register with the
-    /// (updated) index.
+    /// Tombstone the service in place. Indices into
+    /// `self.services` must remain stable because they are the
+    /// `udata` of every kevent registered against the service's
+    /// procdesc fd — reusing a Vec slot or removing entries
+    /// would alias kqueue events to the wrong service.
     fn retire(&mut self, idx: usize) {
-        let dead = self.services.remove(idx);
-        self.retired.push(dead.manifest);
+        self.services[idx].retired = true;
     }
 
     /// Walk supervised services with a closed procdesc and
@@ -387,6 +429,7 @@ impl Supervisor {
         // Defer mutations to avoid borrowing issues
         let mut to_relaunch: Vec<usize> = Vec::new();
         for (i, s) in self.services.iter().enumerate() {
+            if s.retired { continue; }
             if s.procdesc_fd != -1 { continue; }   // still alive
             if let Some(deadline) = s.burst_pause_until {
                 if now < deadline { continue; }
@@ -419,7 +462,7 @@ impl Supervisor {
                     error!("{}: re-register kevent: {e}",
                         self.services[idx].manifest.name);
                     let _ = ffi::close_fd(fd);
-                    self.services.remove(idx);
+                    self.services[idx].retired = true;
                     return;
                 }
                 let s = &mut self.services[idx];
@@ -432,7 +475,7 @@ impl Supervisor {
                 warn!("{}: relaunch returned no procdesc (was a persistent-jail manifest?). \
                        Dropping from supervised set.",
                     self.services[idx].manifest.name);
-                self.services.remove(idx);
+                self.services[idx].retired = true;
             }
             Ok((other, _)) => {
                 error!("{}: relaunch jaild rejected: {other:?}",
