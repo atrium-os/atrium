@@ -12,11 +12,52 @@ use crate::node::{Node, NodeId, NodeTree};
 /// A single input event. Hit-testing is performed by the App; widget
 /// code receives the resolved `target_id` (when applicable) via its
 /// registered handler, not the raw event.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     PointerDown { at: Point },
     PointerUp { at: Point },
     PointerMove { at: Point },
+    /// A keyboard key transition (down or up). `key` is the
+    /// USB-HID-usage-code-style identifier from `Key`. `chars` is
+    /// any text input the platform decoded for this event (printable
+    /// characters and IME composition output go here, separately
+    /// from the raw key — TextField appends `chars` to its content).
+    Key {
+        kind: KeyEventKind,
+        key: Key,
+        modifiers: Modifiers,
+        chars: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyEventKind { Down, Up }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Modifiers {
+    pub shift: bool,
+    pub ctrl: bool,
+    pub alt: bool,
+    pub meta: bool,
+}
+
+/// Logical key. Phase-3.5 ships only what TextField + Form-nav need;
+/// fuller coverage layers in alongside the keyboard/IME pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Key {
+    /// Any printable character — actual text comes via `Event::Key.chars`.
+    Char,
+    Enter,
+    Escape,
+    Tab,
+    Backspace,
+    Delete,
+    Left,
+    Right,
+    Up,
+    Down,
+    Home,
+    End,
 }
 
 /// Topmost-node hit test. Walks the tree depth-first; returns the

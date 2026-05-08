@@ -10,16 +10,22 @@
 
 use std::collections::HashMap;
 
+use crate::event::Event;
 use crate::node::NodeId;
 
-/// A boxed closure run when a node is clicked. Held as a Box so the
-/// table is `Send + Sync`-able if needed later; concretely all our
-/// closures are short and run on the UI thread.
 pub type ClickHandler = Box<dyn Fn() + 'static>;
+/// Receives the full key event so handlers can match by kind, key,
+/// modifiers, and consume `chars`. TextField uses this to append
+/// text input.
+pub type KeyHandler = Box<dyn Fn(&Event) + 'static>;
 
 #[derive(Default)]
 pub struct Handlers {
     pub on_click: Option<ClickHandler>,
+    pub on_key: Option<KeyHandler>,
+    /// When `true`, this node can take keyboard focus. Pointer-down
+    /// on a focusable node sets focus; Tab navigates among focusables.
+    pub focusable: bool,
 }
 
 impl Handlers {

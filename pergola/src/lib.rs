@@ -33,13 +33,15 @@ pub mod reactive;
 pub mod surface;
 pub mod theme;
 pub mod view;
+pub mod widgets;
 
 pub use app::App;
 pub use color::Color;
-pub use event::{hit_test, Event};
+pub use event::{hit_test, Event, Key, KeyEventKind, Modifiers};
 pub use geom::{Point, Rect, Size};
 pub use interaction::{Handlers, Interactions};
 pub use node::{diff, Node, NodeDelta, NodeId, NodeTree, TextStyle};
 pub use reactive::Mutable;
 pub use surface::{commit, FrescoSurface, LogSurface, Surface};
 pub use view::{render, Ctx, View};
+pub use widgets::{Button, TextField};

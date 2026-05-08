@@ -67,6 +67,18 @@ impl<'a> Ctx<'a> {
     pub fn on_click<F: Fn() + 'static>(&mut self, id: NodeId, handler: F) {
         self.interactions.entry(id).on_click = Some(Box::new(handler) as ClickHandler);
     }
+
+    /// Attach a key handler. Fires on each `Event::Key` while the
+    /// node has focus. Replaces any existing key handler.
+    pub fn on_key<F: Fn(&crate::event::Event) + 'static>(&mut self, id: NodeId, handler: F) {
+        self.interactions.entry(id).on_key =
+            Some(Box::new(handler) as crate::interaction::KeyHandler);
+    }
+
+    /// Mark a node as eligible for keyboard focus.
+    pub fn focusable(&mut self, id: NodeId) {
+        self.interactions.entry(id).focusable = true;
+    }
 }
 
 /// Anything that can produce render output by emitting nodes into a `Ctx`.

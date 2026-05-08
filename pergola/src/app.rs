@@ -38,6 +38,10 @@ pub struct App<V: View> {
     /// PointerUp if the up event lands on the same node. Drag
     /// detection (when up lands elsewhere) lives in a future phase.
     pending_press: Option<NodeId>,
+    /// The node currently receiving keyboard input, if any.
+    /// Pointer-down on a focusable node sets this; nothing else
+    /// changes it yet (Tab navigation in a later phase).
+    focused: Option<NodeId>,
     dirty: Arc<AtomicBool>,
     pub theme: Semantic,
 }
@@ -65,6 +69,7 @@ impl<V: View> App<V> {
             prev_tree: NodeTree::new(),
             interactions: Interactions::new(),
             pending_press: None,
+            focused: None,
             dirty,
             theme: Semantic::LIGHT,
         }
@@ -115,18 +120,28 @@ impl<V: View> App<V> {
         deltas
     }
 
+    /// The node currently receiving keyboard input, if any.
+    pub fn focused(&self) -> Option<NodeId> { self.focused }
+
     /// Dispatch an input event. Pointer events are hit-tested against
     /// the current tree; matching handlers fire on `PointerUp` when
-    /// the up matches the same node as the prior `PointerDown`. Move
-    /// events are tracked but currently dispatch nothing — hover is
-    /// a phase-3.5 follow-up.
+    /// the up matches the same node as the prior `PointerDown`. Key
+    /// events go to the currently-focused node's `on_key` handler.
     pub fn handle_event(&mut self, event: Event) {
-        match event {
+        match &event {
             Event::PointerDown { at } => {
-                self.pending_press = hit_test(&self.prev_tree, at);
+                let hit = hit_test(&self.prev_tree, *at);
+                self.pending_press = hit;
+                // Pointer-down on a focusable node sets focus; on
+                // anything else, drops focus. Matches every desktop
+                // text-field-loses-focus-on-outside-click semantics.
+                let focusable_hit = hit.and_then(|id| {
+                    self.interactions.get(id).filter(|h| h.focusable).map(|_| id)
+                });
+                self.focused = focusable_hit;
             }
             Event::PointerUp { at } => {
-                let target = hit_test(&self.prev_tree, at);
+                let target = hit_test(&self.prev_tree, *at);
                 if let (Some(pressed), Some(up)) = (self.pending_press, target) {
                     if pressed == up {
                         if let Some(h) = self.interactions.get(pressed) {
@@ -139,7 +154,16 @@ impl<V: View> App<V> {
                 self.pending_press = None;
             }
             Event::PointerMove { .. } => {
-                // Hover/drag: phase 3.5
+                // Hover/drag: future phase
+            }
+            Event::Key { .. } => {
+                if let Some(id) = self.focused {
+                    if let Some(h) = self.interactions.get(id) {
+                        if let Some(cb) = &h.on_key {
+                            cb(&event);
+                        }
+                    }
+                }
             }
         }
     }
