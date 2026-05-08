@@ -46,8 +46,49 @@ pub fn serve(
     state_path: &Path,
 ) -> Result<(), JaildError> {
     let mut state = PersistentState::load(state_path)?;
-    info!("jaild: ready (dry_run={dry_run}); state has {} known jail(s)",
-        state.jails.len());
+    info!("jaild: ready (dry_run={dry_run}); state has {} known jail(s), \
+           {} runtime mount(s)",
+        state.jails.len(), state.runtime_mounts.len());
+
+    /* Reconcile runtime_mounts: any mount whose owning jail is no
+     * longer in state.jails is an orphan from a pre-crash session
+     * — unmount it from the host namespace and drop the record.
+     * Spec: docs/spec/storage.md §6.2 ("Cleanup ... jaild crashes
+     * → on restart, jaild reconciles ... unmounts orphans whose
+     * owning jail is gone"). */
+    if !dry_run {
+        let known_jails: std::collections::HashSet<String> =
+            state.jails.iter().map(|j| j.name.clone()).collect();
+        let orphans: Vec<crate::state::RuntimeMount> = state.runtime_mounts.iter()
+            .filter(|m| !known_jails.contains(&m.jail_name))
+            .cloned()
+            .collect();
+        for m in &orphans {
+            info!("jaild: reconcile orphan runtime mount jail={} dest={} (host {})",
+                m.jail_name, m.dest, m.host_dest);
+            // Best-effort unmount; EINVAL = already gone, fine.
+            let c = match std::ffi::CString::new(m.host_dest.as_str()) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            #[allow(unsafe_code)]
+            let rc = unsafe { libc::unmount(c.as_ptr(), 0) };
+            if rc < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.raw_os_error() != Some(libc::EINVAL) {
+                    warn!("jaild: orphan unmount {}: {e}", m.host_dest);
+                }
+            }
+        }
+        if !orphans.is_empty() {
+            state.runtime_mounts.retain(|m| known_jails.contains(&m.jail_name));
+            if let Err(e) = state.save(state_path) {
+                warn!("jaild: state save after reconcile: {e}");
+            }
+            info!("jaild: reconcile dropped {} orphan runtime mount(s)", orphans.len());
+        }
+    }
+
     for inbound in listener.incoming() {
         let stream = match inbound {
             Ok(s) => s,
