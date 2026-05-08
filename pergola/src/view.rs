@@ -16,13 +16,16 @@
 //! `futures-signals` is wired in. The current shape is a faithful
 //! subset that can be evolved without breaking existing code.
 
+use crate::interaction::{ClickHandler, Interactions};
 use crate::node::{Node, NodeId, NodeTree};
 use crate::theme::Semantic;
 
 /// Per-render context handed to `View::render`. Owns the in-construction
-/// `NodeTree` and tracks the current parent for nested views.
+/// `NodeTree`, tracks the current parent for nested views, and
+/// accumulates the `Interactions` table for this render pass.
 pub struct Ctx<'a> {
     pub tree: &'a mut NodeTree,
+    pub interactions: &'a mut Interactions,
     /// Current parent during traversal. `View::render` calls
     /// `push`/`pop` to descend into children; primitives call `add` to
     /// emit a leaf at the current parent.
@@ -32,8 +35,12 @@ pub struct Ctx<'a> {
 }
 
 impl<'a> Ctx<'a> {
-    pub fn new(tree: &'a mut NodeTree, theme: Semantic) -> Self {
-        Self { tree, parent_stack: Vec::new(), theme }
+    pub fn new(
+        tree: &'a mut NodeTree,
+        interactions: &'a mut Interactions,
+        theme: Semantic,
+    ) -> Self {
+        Self { tree, interactions, parent_stack: Vec::new(), theme }
     }
 
     /// Add a leaf node under the current parent.
@@ -53,6 +60,12 @@ impl<'a> Ctx<'a> {
 
     pub fn pop(&mut self) {
         self.parent_stack.pop();
+    }
+
+    /// Attach a click handler to a node previously emitted in this
+    /// render pass. Replaces any existing click handler on that node.
+    pub fn on_click<F: Fn() + 'static>(&mut self, id: NodeId, handler: F) {
+        self.interactions.entry(id).on_click = Some(Box::new(handler) as ClickHandler);
     }
 }
 
@@ -77,12 +90,15 @@ impl<V: View> View for Vec<V> {
     }
 }
 
-/// Run one render pass and return the resulting tree. The diff vs the
-/// previous tree (and the wire emission) lives in `commit` once we
-/// have a `fresco_client::Connection` to write into.
-pub fn render<V: View>(view: &V, theme: Semantic) -> NodeTree {
+/// Run one render pass and return both the resulting tree and the
+/// interaction table built up during the pass. The diff vs the
+/// previous tree (and the wire emission) lives in `surface::commit`.
+pub fn render<V: View>(view: &V, theme: Semantic) -> (NodeTree, Interactions) {
     let mut tree = NodeTree::new();
-    let mut ctx = Ctx::new(&mut tree, theme);
-    view.render(&mut ctx);
-    tree
+    let mut interactions = Interactions::new();
+    {
+        let mut ctx = Ctx::new(&mut tree, &mut interactions, theme);
+        view.render(&mut ctx);
+    }
+    (tree, interactions)
 }

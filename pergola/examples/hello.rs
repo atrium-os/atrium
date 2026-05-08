@@ -89,7 +89,7 @@ impl View for LoginPlaceholder {
 fn main() {
     env_logger::init();
 
-    let mut tree = render(&LoginPlaceholder, Semantic::LIGHT);
+    let (mut tree, _interactions) = render(&LoginPlaceholder, Semantic::LIGHT);
     // Run layout from each root.
     let roots: Vec<_> = tree.roots().collect();
     for root in roots {

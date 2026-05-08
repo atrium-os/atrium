@@ -24,7 +24,9 @@
 
 pub mod app;
 pub mod color;
+pub mod event;
 pub mod geom;
+pub mod interaction;
 pub mod layout;
 pub mod node;
 pub mod reactive;
@@ -34,7 +36,9 @@ pub mod view;
 
 pub use app::App;
 pub use color::Color;
+pub use event::{hit_test, Event};
 pub use geom::{Point, Rect, Size};
+pub use interaction::{Handlers, Interactions};
 pub use node::{diff, Node, NodeDelta, NodeId, NodeTree, TextStyle};
 pub use reactive::Mutable;
 pub use surface::{commit, FrescoSurface, LogSurface, Surface};

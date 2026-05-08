@@ -20,6 +20,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use crate::event::{hit_test, Event};
+use crate::interaction::Interactions;
 use crate::layout;
 use crate::node::{diff, NodeDelta, NodeId, NodeTree};
 use crate::reactive::Mutable;
@@ -29,6 +31,13 @@ use crate::view::{render, View};
 pub struct App<V: View> {
     view: V,
     prev_tree: NodeTree,
+    /// The most recent render's interaction table. Used by
+    /// `handle_event` to dispatch input. Rebuilt every `tick`.
+    interactions: Interactions,
+    /// Pointer-down's hit target; armed at PointerDown, fired at
+    /// PointerUp if the up event lands on the same node. Drag
+    /// detection (when up lands elsewhere) lives in a future phase.
+    pending_press: Option<NodeId>,
     dirty: Arc<AtomicBool>,
     pub theme: Semantic,
 }
@@ -51,7 +60,14 @@ impl<V: View> App<V> {
     /// let app   = App::new_with_flag(view, dirty);
     /// ```
     pub fn new_with_flag(view: V, dirty: Arc<AtomicBool>) -> Self {
-        Self { view, prev_tree: NodeTree::new(), dirty, theme: Semantic::LIGHT }
+        Self {
+            view,
+            prev_tree: NodeTree::new(),
+            interactions: Interactions::new(),
+            pending_press: None,
+            dirty,
+            theme: Semantic::LIGHT,
+        }
     }
 
     pub fn with_theme(mut self, theme: Semantic) -> Self {
@@ -85,7 +101,7 @@ impl<V: View> App<V> {
         if !self.dirty.swap(false, Ordering::AcqRel) {
             return Vec::new();
         }
-        let mut next = render(&self.view, self.theme);
+        let (mut next, interactions) = render(&self.view, self.theme);
         // Run layout from each root in the tree (a render pass may
         // produce multiple top-level nodes; in practice it's one per
         // window).
@@ -95,7 +111,37 @@ impl<V: View> App<V> {
         }
         let deltas = diff(&self.prev_tree, &next);
         self.prev_tree = next;
+        self.interactions = interactions;
         deltas
+    }
+
+    /// Dispatch an input event. Pointer events are hit-tested against
+    /// the current tree; matching handlers fire on `PointerUp` when
+    /// the up matches the same node as the prior `PointerDown`. Move
+    /// events are tracked but currently dispatch nothing — hover is
+    /// a phase-3.5 follow-up.
+    pub fn handle_event(&mut self, event: Event) {
+        match event {
+            Event::PointerDown { at } => {
+                self.pending_press = hit_test(&self.prev_tree, at);
+            }
+            Event::PointerUp { at } => {
+                let target = hit_test(&self.prev_tree, at);
+                if let (Some(pressed), Some(up)) = (self.pending_press, target) {
+                    if pressed == up {
+                        if let Some(h) = self.interactions.get(pressed) {
+                            if let Some(cb) = &h.on_click {
+                                cb();
+                            }
+                        }
+                    }
+                }
+                self.pending_press = None;
+            }
+            Event::PointerMove { .. } => {
+                // Hover/drag: phase 3.5
+            }
+        }
     }
 }
 
@@ -145,12 +191,7 @@ mod tests {
         // Pre-build the cell with the app's dirty flag.
         let dirty = Arc::new(AtomicBool::new(true));
         let fill = Mutable::with_dirty(red, Arc::clone(&dirty));
-        let mut app = App {
-            view: Square { fill: fill.clone() },
-            prev_tree: NodeTree::new(),
-            dirty,
-            theme: Semantic::LIGHT,
-        };
+        let mut app = App::new_with_flag(Square { fill: fill.clone() }, dirty);
 
         // First tick: Added.
         let d = app.tick();
