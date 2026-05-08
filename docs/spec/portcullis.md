@@ -1,7 +1,36 @@
 # Portcullis — jail launcher + capability manifest
 
-Status: design (D2.5).
-Last updated: 2026-05-07.
+Status: design + partial implementation (D2.5).
+Last updated: 2026-05-08.
+
+## Implementation status
+
+The privsep architecture (jaild + portcullisd, §0.5) is **alive end-to-end** as of 2026-05-08. Production-shape boot:
+
+```
+service atrium-jaild                       # privileged jail broker
+service atrium-volumes                     # volume allocation (spec/atrium-volumes.md)
+service atrium-portcullisd-daemon          # capability mediator (aqueduct, CLASS_PORTCULLIS=6)
+service atrium-portcullisd-bootstrap       # supervisor; reads /etc/atrium/services.d/
+```
+
+Each ships an `rc.d` script in-tree (`portcullis/{jaild,atrium-volumes,portcullisd}/etc/`).
+
+**Live properties** (VM-verified):
+- Manifest schema: `enabled`, `name`, `path`, `[[mounts]]`, `[[volumes]]` (with `[volumes.init]` first-run sentinels), `[exec]`, `[supervision]`, `[capabilities]`.
+- `[capabilities] attach_mount = true` derives a ro_nullfs mount of `/var/run/atrium/caps/portcullisd/` → `/atrium/sockets/portcullisd/` at jail-create time. In-jail services connect to the daemon over aqueduct.
+- Daemon-side authz: `getpeereid(2)` on each connection → cross-checked against `manifest.exec.uid` so a uid-1001 caller in jail-A cannot forge `jail_name = jail-B` to ride B's broader allow-list.
+- jaild grew `AttachMount` / `DetachMount` (spec/storage.md §6.2) + `runtime_mounts` state + orphan reconcile on jaild restart.
+- Failure-budget supervisor (cost-proportional retries, tombstone-style retire keeps kqueue udata stable).
+- Graceful shutdown: SIGTERM/SIGINT → close procdescs, unmount per-jail mounts, RemoveJail (which also drops the jail's runtime mounts).
+
+**Deliberately deferred** (V1):
+- Per-jail rootfs trees / overlay+unionfs. Smoke manifests use `path = "/"` as a transitional stand-in; D5 atrium-rootfs lands real per-jail trees.
+- Capability prompt UI (Forum integration — D3 dependency).
+- Multi-cap composition smoke (single `attach_mount` capability is exercised; multi-cap layout is designed but no second cap exists yet).
+- `portcullis launch <app-id>` user-app CLI (the daemon's underlying primitives are all there; the user-facing wrapper is a small additional slice).
+
+See [`ROADMAP.md`](../ROADMAP.md) §D2.5 for per-phase status.
 
 The piece of Atrium that turns "an app" into "a running, isolated,
 capability-scoped process." Portcullis reads each app's

@@ -1,7 +1,21 @@
 # `atrium-volumes` daemon
 
-**Status:** spec, 2026-05-08
+**Status:** spec + implementation (V0), 2026-05-08
 **Owner:** D2.5 storage track
+
+> **Implementation status (2026-05-08):** V0 of the daemon ships in
+> `portcullis/atrium-volumes/`. Wire protocol (Ping, Provision,
+> Destroy, Status, ListBackends) is fully implemented and VM-verified.
+> `tessera`, `plain`, `tmpfs` plugins land; `zfs` is the next plugin
+> in line. Operator CLI: `atrium-volumes-cli`. rc.d service:
+> `portcullis/atrium-volumes/etc/atrium-volumes`. Crash-recovery
+> orphan-mount sweep on jaild restart (companion piece) shipped at
+> jaild-side.
+>
+> The `cas` volume kind from earlier drafts was removed — every
+> persistent volume on Tessera gets CAS dedup automatically; raw
+> CAS-API access would be a separate primitive if a real consumer
+> ever shows up. See `storage.md` §3 for the trimmed kind list.
 
 The privileged daemon that owns volume *allocation* (creating
 datasets/directories, setting quotas, returning host paths). The

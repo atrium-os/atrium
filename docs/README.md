@@ -33,11 +33,18 @@ Architecture and design docs for an integrated FreeBSD desktop platform built ar
 - Native FreeBSD kmod (no linuxkpi).
 - Per-slot ring isolation (cmd / comp / input).
 - DMA upload, drag-to-resize, kernel-pty `TIOCSWINSZ` propagation.
+- **D0 + D1** native virtio-gpu driver and bare-metal Fresco server (atrium-edit running interactively over the full Fresco protocol).
+- **D1.5 Tessera** content-addressed filesystem: in-kernel `tessera_fs.ko`, POSIX-compliant (pjdfstest sweep), mmap/exec, snapshots via `/.tessera/snapshots/<gen>/`, perf matches/beats ZFS on multi-write fsync.
+- **D1.6 aqueduct substrate** (`aqueduct/`: Connection + envelope + CAS + classes registry); aqueduct-echo demo; `CLASS_PORTCULLIS = 6` registered with portcullisd as the first production consumer (2026-05-08).
+- **D2.5 portcullis core** (2026-05-08): privsep architecture live end-to-end. jaild + atrium-volumes + portcullisd-daemon + portcullisd-bootstrap, all with rc.d scripts. Manifest schema with `[[volumes]]`, `[volumes.init]` first-run sentinels, `[capabilities]` block. Capability mediation via aqueduct (in-jail `uid 1001` services drive runtime AttachMount/DetachMount through the daemon, with peer-uid → manifest cross-check). Defense-in-depth mount cleanup (per-exit + graceful-shutdown + jaild orphan-reconcile). Per-jail rootfs trees deferred to D5 (smoke uses `path = "/"`); capability prompt UI deferred to D3 (Forum).
 
-See [ARCHITECTURE.md § What's done](ARCHITECTURE.md#whats-done-2026-04-28).
+See [ARCHITECTURE.md § What's done](ARCHITECTURE.md#whats-done-2026-04-28) and [ROADMAP.md](ROADMAP.md) for per-phase status detail.
 
 ## What's next (immediate)
 
-**D0 — Native FreeBSD kernel GPU ABI + virtio-gpu driver.** First-class native graphics stack on FreeBSD with no linuxkpi dependency. See [ROADMAP.md § D0](ROADMAP.md#d0--native-freebsd-kernel-gpu-abi--virtio-gpu-driver).
+The active fronts as of 2026-05-08:
 
-After D0, the architectural foundation is complete and every subsequent phase (display manager, shell, foundation apps, Slint, browser) builds on a wholly native FreeBSD graphics stack.
+- **Fresco-on-aqueduct** — migrate Fresco from the legacy 128-byte fixed-frame format onto the unified envelope. The substrate is ready; the cutover plan is `spec/fresco-production-rollout.md` M2.
+- **D5 atrium-rootfs** — per-jail rootfs trees so manifests stop using `path = "/"`. Unblocks proper jail isolation testing and obsoletes the host-namespace mount workarounds.
+- **D2 vestibulum** (login screen) and **D3 forum** (dock) — both build on the jail runtime that now exists.
+- **atrium-mesa fork** (D5) — long-tail dependency for production-grade rendering.

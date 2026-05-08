@@ -123,8 +123,9 @@ Each is documented in its own file.
 - [Sandbox](subsystems/sandbox.md) — Portcullis (jails per app), capability manifest, privilege boundary, IPC channels.
 - [Transport](subsystems/transport.md) — Fresco protocol over ivshmem / cdev / TCP / QUIC / future hardware.
 
-## What's done (2026-04-28)
+## What's done (2026-04-28 baseline; updated 2026-05-08)
 
+### 2026-04-28 baseline
 - Fresco protocol: stable, retained-mode, content-addressed, multi-client. Per-slot ring isolation (cmd, comp, input).
 - Server: macOS-host development environment, Metal backend, full WM (decorations, drag, resize, close), per-window FBOs, ellipsis title truncation, focus-routed input.
 - Kmod: native FreeBSD, newbus/kqueue/cdev/libmd. No linuxkpi.
@@ -133,6 +134,18 @@ Each is documented in its own file.
 - Multi-process desktop demo: editor + terminal as separate FreeBSD processes, isolated input, drag-to-move-and-resize, kernel-pty `TIOCSWINSZ` propagation verified via `tput cols`.
 - DMA upload (one cmd vs ~36 000 inline chunks for a 4 MiB atlas).
 - Client-disconnect cleanup: kmod toggles `slots_alive_mask`, server reaps orphaned windows.
+
+### Through 2026-05-08
+- **D0 + D1** native virtio-gpu driver (`atrium-virtio-gpu`) and bare-metal Fresco server. atrium-edit running interactively on FreeBSD-native via the full Fresco protocol over Unix socket; native HID-keyboard input.
+- **D1.5 Tessera** content-addressed filesystem: in-kernel `tessera_fs.ko`, full POSIX (pjdfstest sweep), mmap/exec, snapshots via `/.tessera/snapshots/<gen>/` magic dir, multi-extent packs, Git-style background repack, in-memory CAS read cache, perf matches/beats ZFS on multi-write fsync.
+- **D1.7 binsplit Phase 1** — function-level dedup tooling (`tessera-binsplit --analyze | --compare | --multi`); 1.89× aggregate compression across 9 Atrium aarch64 binaries.
+- **D1.6 aqueduct substrate** (`aqueduct/`: Connection / envelope / CAS / classes registry); `aqueduct-echo` smoke; **`CLASS_PORTCULLIS = 6`** registered with portcullisd as the first production consumer.
+- **D2.5 Portcullis core** (privsep architecture live end-to-end):
+  - `atrium-jaild` (privileged jail broker; pdfork + EVFILT_PROCDESC; SCM_RIGHTS for procdesc handoff; runtime AttachMount/DetachMount; orphan reconcile on restart).
+  - `atrium-volumes` (separate allocation broker; tessera/plain/tmpfs plugins; idempotent provision; first-run init sentinels).
+  - `atrium-portcullisd-daemon` (aqueduct cap mediator; peer-uid → manifest cross-check; manifest `[capabilities]` gate).
+  - `atrium-portcullisd-bootstrap` (manifest-driven launcher + supervisor; failure-budget retries; tombstone retire; graceful SIGTERM/SIGINT shutdown).
+  - rc.d scripts for all four daemons; production-shape boot via `service`.
 
 ## What's planned
 

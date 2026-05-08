@@ -89,6 +89,13 @@ Documented in [ARCHITECTURE.md](ARCHITECTURE.md), runtime details in [RUNBOOK.md
 
 Spec: [`spec/aqueduct.md`](spec/aqueduct.md).
 
+### Implementation status (2026-05-08)
+
+Substrate done in earlier passes (`aqueduct/` crate: Connection / envelope / CAS / classes; aqueduct-echo demo). New this round:
+- **`CLASS_PORTCULLIS = 6`** registered for portcullisd's opcode dictionary (`portcullis-protocol` crate).
+- **First production consumer** end-to-end: an in-jail `uid 1001` aq-client, talking aqueduct over a per-capability bind-mounted socket, drives `AttachMount` through portcullisd → jaild. Verifies the spec's "capability = mount" property (§6.1) and the "no daemon-side trust check on the path" property end-to-end.
+- Fresco migration onto aqueduct (the spec's primary motivation) still pending — current Fresco demos use the legacy 128-byte fixed-frame format from D0–D1 fresco-socket-rs, slated for hard cutover at M2 of `spec/fresco-production-rollout.md`.
+
 **Prerequisites:** D1 software thesis (Fresco running natively on FreeBSD). D1.5 Tessera (for the optional zero-copy hash-via-CAS path).
 
 **Scope:**
@@ -155,11 +162,30 @@ Spec + Phase 1 results: [`spec/tessera-binsplit.md`](spec/tessera-binsplit.md).
 
 **Deliverable:** `portcullis launch <app-id>` reads the app's `atrium.toml` manifest, builds a jail with exactly the declared capabilities, execs the app inside. Forum (the dock, D3) calls Portcullis to launch apps. Two parallel instances of the same app: isolated overlays, shared (Tessera-dedup'd) rootfs.
 
-Spec: [`spec/portcullis.md`](spec/portcullis.md).
+Spec: [`spec/portcullis.md`](spec/portcullis.md), [`spec/storage.md`](spec/storage.md), [`spec/atrium-volumes.md`](spec/atrium-volumes.md).
 
 **Prerequisites:** D1.5 (Tessera for jail trees + per-app overlays) + D1.6 (aqueduct — defines the per-service-socket convention that capability mounts target).
 
-**Scope** (6 phases, ordered by risk; see spec §10):
+### Implementation status (2026-05-08)
+
+The privsep architecture (jaild + portcullisd, see [`spec/portcullis.md`](spec/portcullis.md) §0.5) is live end-to-end. Production-shape boot is `service atrium-jaild → atrium-volumes → atrium-portcullisd-daemon → atrium-portcullisd-bootstrap`; rc.d scripts ship in-tree. Mount-cleanup story is defense-in-depth (per-exit + graceful-shutdown + jaild orphan-reconcile). All paths VM-verified.
+
+| Phase | Status | Notes |
+|---|---|---|
+| 1 — schema + parser | ✅ done | `system_services.rs` (`ServiceManifest`, `ManifestVolume`, `[capabilities]`); 20 unit tests |
+| 2 — jail builder | ✅ done | jaild + bootstrap; `[[mounts]]`, `[[volumes]]`, network, exec all wired |
+| 3 — overlay + rootfs unionfs | ⬜ deferred | smoke uses `path="/"`; D5 atrium-rootfs lands per-jail trees |
+| 4 — portcullisd + capability policy | ✅ done | aqueduct daemon, `CLASS_PORTCULLIS = 6`, peer-uid → manifest cross-check, manifest `[capabilities]` gate |
+| 4.5 — first-run setup phase | ✅ done | per-volume `[volumes.init]` block + sentinel; init failure short-circuits launch |
+| 5 — capability prompt UI | ⬜ deferred | needs Forum (D3) |
+
+Adjacent infrastructure also shipped this round:
+- **atrium-volumes V0** — separate daemon, plugin trait, tessera/plain/tmpfs backends, idempotent provisioning (`spec/atrium-volumes.md`).
+- **AttachMount/DetachMount runtime broker** — jaild-side; runtime_mounts state; orphan reconcile on jaild restart; transactional rollback.
+- **Failure-budget supervisor** — cost-proportional retries with tombstone-style retire (kqueue udata stays stable across removals).
+- **Graceful shutdown** — SIGTERM/SIGINT → close procdescs, unmount, RemoveJail (which also drops jail's runtime mounts).
+
+### Scope (6 phases, ordered by risk; see spec §10):
 
 1. **Phase 1 — schema + parser.** `portcullis-toml` crate. Validation rules per spec §3.3. CLI `portcullis validate`. ~1 wk.
 2. **Phase 2 — jail builder.** `portcullis-jail` crate: capability → jail.conf translation per spec §5. CLI `portcullis launch --no-prompt` (dev mode). Integration: launch aqueduct-echo-{server,client} in separate jails and verify socket mount path. ~1 wk.

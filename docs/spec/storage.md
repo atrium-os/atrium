@@ -1,7 +1,14 @@
 # Atrium storage architecture
 
-**Status:** spec, 2026-05-08
+**Status:** spec + implementation, 2026-05-08
 **Owner:** D2.5 Portcullis + atrium-volumes (new) + jaild
+
+> **Implementation note (2026-05-08):** §§ 1–11 are implemented and
+> VM-verified as of this date. §12 (operator install flow) and §13
+> (interaction with atrium-pkg) are spec-only. §3 dropped the `cas`
+> volume kind (every persistent volume on Tessera is content-addressed
+> already; raw CAS-API access would be a separate primitive if a real
+> consumer ever appears). See `ROADMAP.md` §D2.5 for per-phase status.
 
 This doc records the architectural decisions for how Atrium-jailed
 services get persistent and ephemeral filesystem storage. Locks in

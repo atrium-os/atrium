@@ -13,7 +13,9 @@ For the full thesis see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). For canoni
 
 ## Status
 
-D0 (native virtio-gpu kmod through scanout) and D1 (atrium-edit running interactively on FreeBSD-native via the full Fresco protocol over Unix socket) are working. See [RUNBOOK.md](RUNBOOK.md) for the bring-up procedure, including the `--virtio-gpu --display` QEMU flags, the `vtgpu` disable hint, and the host cross-compile setup.
+D0 (native virtio-gpu kmod through scanout), D1 (atrium-edit running interactively on FreeBSD-native via the full Fresco protocol over Unix socket), D1.5 (Tessera CAS-FS in-kernel; mmap/exec; snapshots; perf matching ZFS on fsync), D1.6 (aqueduct IPC substrate), and the D2.5 Portcullis core (privsep jaild + atrium-volumes + portcullisd-daemon + supervisor; capability-mediated runtime mounts via aqueduct; rc.d scripts) are all working as of 2026-05-08. Per-jail rootfs trees (D5) and the capability prompt UI (D3) are the two architectural pieces still ahead before the platform can host real third-party apps.
+
+See [RUNBOOK.md](RUNBOOK.md) for the bring-up procedure (`--virtio-gpu --display` QEMU flags, the `vtgpu` disable hint, host cross-compile setup) and [docs/ROADMAP.md](docs/ROADMAP.md) for per-phase scope and remaining work.
 
 ## Layout
 

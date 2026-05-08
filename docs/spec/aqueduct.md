@@ -1,7 +1,27 @@
 # Atrium-RPC — unified IPC substrate
 
-Status: design (D1.6).
-Last updated: 2026-05-03.
+Status: design + substrate done; first production consumer landed (2026-05-08).
+Last updated: 2026-05-08.
+
+> **Implementation status (2026-05-08):** The substrate
+> (`aqueduct/`: Connection, envelope, CAS, classes registry) was
+> live in earlier passes; aqueduct-echo demo exercises the full
+> CAS upload/fetch/event path. New this round:
+>
+> - **`CLASS_PORTCULLIS = 6`** registered for portcullisd's
+>   capability-mediation opcode dictionary
+>   (`portcullis-protocol` crate). Three opcodes:
+>   `OP_ATTACH_MOUNT`, `OP_DETACH_MOUNT`, `OP_MOUNT_REPLY`.
+> - **First production consumer:** `atrium-portcullisd-daemon` +
+>   `atrium-portcullisd-aq` client. An in-jail `uid 1001` process
+>   talks aqueduct over a per-capability bind-mounted socket
+>   (`/atrium/sockets/portcullisd/portcullisd.sock`) to drive
+>   runtime mount attach/detach. Verifies §6.1 (capability =
+>   mount) and the "no daemon-side trust check on the path"
+>   property end-to-end, with peer-uid → manifest cross-check
+>   for defense in depth.
+> - **Fresco migration onto aqueduct** still pending — see
+>   `spec/fresco-production-rollout.md` for the M2 cutover plan.
 
 This document specifies the aqueduct substrate used by every
 Atrium service that needs IPC between two processes — including
@@ -85,7 +105,7 @@ All messages share an envelope:
 | Field          | Notes                                       |
 |----------------|---------------------------------------------|
 | `ver`          | Envelope version. Currently 1.              |
-| `opcode_class` | Top-level dictionary selector. 0 = aqueduct (CAS, events). 1 = display (Fresco). 2 = clipboard. 3 = notify. 4 = broker. 5 = audio-control. 6..63 reserved. 64..255 vendor/private. |
+| `opcode_class` | Top-level dictionary selector. 0 = aqueduct (CAS, events). 1 = display (Fresco). 2 = clipboard. 3 = notify. 4 = broker. 5 = audio-control. 6 = portcullis (capability-mediated runtime mounts; `portcullis-protocol` crate). 7..62 reserved. 63 = echo (smoke/fuzz). 64..255 vendor/private. |
 | `op`           | Opcode within the class. Class-specific dictionary. |
 | `flags`        | Bit 0: payload contains hash refs (receiver should consult cache). Bit 1: response expected. Bit 2: this is a response. Bit 3: async event (no response expected). Bits 4..15 class-specific. |
 | `length`       | Payload byte count (excluding envelope).    |
