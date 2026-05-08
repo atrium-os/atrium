@@ -186,9 +186,11 @@ fn main() -> io::Result<()> {
                 let t_setup = t0.elapsed();
 
                 let t1 = Instant::now();
+                atrium_trace::begin("guest.render_to_buffer");
                 renderer.render_to_buffer()
                     .map_err(|e| io::Error::new(io::ErrorKind::Other,
                         format!("render: {e}")))?;
+                atrium_trace::end("guest.render_to_buffer");
                 let t_render = t1.elapsed();
 
                 let mut t_readback = std::time::Duration::ZERO;

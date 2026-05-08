@@ -17,3 +17,4 @@ raw-window-handle = "0.6"
 anyhow            = "1"
 log               = "0.4"
 fresco-bundle     = { path = "../fresco-bundle" }
+atrium-trace      = { path = "../atrium-trace/rust" }

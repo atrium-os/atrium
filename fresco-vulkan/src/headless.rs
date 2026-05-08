@@ -648,8 +648,12 @@ impl HeadlessRenderer {
             self.device.reset_fences(&[self.fence])?;
             let submit = vk::SubmitInfo::default()
                 .command_buffers(std::slice::from_ref(&self.cmd_buffer));
+            atrium_trace::begin("guest.compute.submit");
             self.device.queue_submit(self.queue, &[submit], self.fence)?;
+            atrium_trace::end("guest.compute.submit");
+            atrium_trace::begin("guest.compute.wait_fence");
             self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+            atrium_trace::end("guest.compute.wait_fence");
 
             /* Counter readback (verification logging — same as windowed). */
             if let Some(frame) = self.op_frames.get(&OP_ID_RECT) {
@@ -746,8 +750,12 @@ impl HeadlessRenderer {
             self.device.reset_fences(&[self.fence])?;
             let submit = vk::SubmitInfo::default()
                 .command_buffers(std::slice::from_ref(&self.cmd_buffer));
+            atrium_trace::begin("guest.draw.submit");
             self.device.queue_submit(self.queue, &[submit], self.fence)?;
+            atrium_trace::end("guest.draw.submit");
+            atrium_trace::begin("guest.draw.wait_fence");
             self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+            atrium_trace::end("guest.draw.wait_fence");
         }
         Ok(())
     }

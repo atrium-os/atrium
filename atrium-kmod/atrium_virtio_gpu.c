@@ -49,6 +49,9 @@
 #include <sys/sglist.h>
 
 #include <dev/virtio/virtio.h>
+
+#define ATRIUM_TRACE_KMOD
+#include "atrium_trace.h"
 #include <dev/virtio/virtqueue.h>
 #include <dev/virtio/gpu/virtio_gpu.h>
 
@@ -140,6 +143,10 @@ struct atrium_gpu_softc {
 	 * and starved the CPU shortly after attach returned). */
 	struct cv                      ctrl_done_cv;
 	bool                           ctrl_done;
+	/* fence_id of the in-flight ctrl_vq request, for trace correlation.
+	 * Written under ctrl_lock by submit_3d before the kick; read under
+	 * ctrl_lock by ctrl_intr after dequeue. Zero when no request is in flight. */
+	uint64_t                       ctrl_inflight_fence;
 
 	/* Latest GET_DISPLAY_INFO response, cached for IOC_CAPS / debug.
 	 * `display_info_valid` is set on first successful fetch; the
@@ -1244,11 +1251,15 @@ atrium_vgpu_ctrl_intr(void *xsc)
 {
 	struct atrium_gpu_softc *sc = xsc;
 	int n = 0;
+	uint64_t fence_id;
 
 	mtx_lock(&sc->ctrl_lock);
+	fence_id = sc->ctrl_inflight_fence;
+	atrium_trace_kmod_log_id("kmod.ctrl_intr", fence_id);
 	while (virtqueue_dequeue(sc->ctrl_vq, NULL) != NULL)
 		n++;
 	sc->ctrl_done = true;
+	sc->ctrl_inflight_fence = 0;
 	cv_signal(&sc->ctrl_done_cv);
 
 	/* Re-arm the per-vq interrupt for the next request. Some
@@ -1948,6 +1959,8 @@ atrium_vgpu_submit_3d(struct atrium_gpu_softc *sc, uint32_t ctx_id,
 	struct virtio_gpu_ctrl_hdr resp;
 	int err;
 
+	atrium_trace_kmod_log_id("kmod.submit_3d_enter", fence_id);
+
 	bzero(&hdr, sizeof(hdr));
 	hdr.hdr.type     = htole32(VIRTIO_GPU_CMD_SUBMIT_3D);
 	hdr.hdr.flags    = htole32(VIRTIO_GPU_FLAG_FENCE |
@@ -1967,11 +1980,14 @@ atrium_vgpu_submit_3d(struct atrium_gpu_softc *sc, uint32_t ctx_id,
 
 	mtx_lock(&sc->ctrl_lock);
 	sc->ctrl_done = false;
+	sc->ctrl_inflight_fence = fence_id;
 	err = virtqueue_enqueue(sc->ctrl_vq, &resp, &sg, 2, 1);
 	if (err != 0) {
+		sc->ctrl_inflight_fence = 0;
 		mtx_unlock(&sc->ctrl_lock);
 		return (err);
 	}
+	atrium_trace_kmod_log_id("kmod.vq_notify", fence_id);
 	virtqueue_notify(sc->ctrl_vq);
 	while (!sc->ctrl_done) {
 		err = cv_timedwait(&sc->ctrl_done_cv, &sc->ctrl_lock, 5 * hz);
@@ -1983,6 +1999,7 @@ atrium_vgpu_submit_3d(struct atrium_gpu_softc *sc, uint32_t ctx_id,
 		}
 		err = 0;
 	}
+	atrium_trace_kmod_log_id("kmod.submit_3d_woke", fence_id);
 	mtx_unlock(&sc->ctrl_lock);
 	return (atrium_vgpu_check_ok(sc, "SUBMIT_3D", &resp));
 }

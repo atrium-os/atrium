@@ -21,6 +21,7 @@ fresco-scene-server = { path = "../fresco-scene-server" }
 fresco-vulkan       = { path = "../fresco-vulkan" }
 fresco-protocol     = { path = "../fresco-protocol" }
 aqueduct            = { path = "../aqueduct" }
+atrium-trace        = { path = "../atrium-trace/rust" }
 image               = { version = "0.25", default-features = false, features = ["png"] }
 libc       = "0.2"
 env_logger = "0.11"

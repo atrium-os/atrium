@@ -111,6 +111,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-trace"
+version = "0.1.0"
+
+[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -464,6 +468,7 @@ dependencies = [
  "anyhow",
  "ash",
  "ash-window",
+ "atrium-trace",
  "fresco-bundle",
  "log",
  "raw-window-handle",

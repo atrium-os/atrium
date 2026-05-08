@@ -522,6 +522,42 @@ Reference: native Linux + venus + Linux host typically clocks 1–5 ms on the sa
 
 Tracked as a separate optimization task; not blocking any of D1/D2/D2.5.
 
+##### V8 perf characterization (2026-05-08): 187× speedup, 16 fps → 3000+ fps
+
+**Update**: the V7 hypothesis above was *wrong*. Cross-boundary tracing
+(see `~/src/bsd/atrium-trace/`) showed the 60 ms was **not** HVF or
+scheduler latency — it was a hardcoded 10 ms fence-poll timer in
+QEMU's `virtio_gpu_fence_poll`. Each venus command's fence-retire was
+waiting up to 10 ms for the next timer fire.
+
+QEMU enables `VIRGL_RENDERER_ASYNC_FENCE_CB` (eventfd-driven async
+fence callbacks, no polling) only when EGL is present. macOS has no
+EGL, so QEMU fell back to polling. Fix in `qemu-build`: enable
+async-fence-cb for venus regardless of EGL. The `virgl_write_async_context_fence`
+callback works fine without a display — it just schedules a QEMU
+bottom-half from the worker's fence eventfd write.
+
+```c
+/* qemu-build/hw/display/virtio-gpu-virgl.c, virtio_gpu_virgl_init */
+if (!qemu_egl_display && virtio_gpu_venus_enabled(g->parent_obj.conf)) {
+    virtio_gpu_3d_cbs.version = 4;
+    virtio_gpu_3d_cbs.write_context_fence = virgl_write_async_context_fence;
+    flags |= VIRGL_RENDERER_ASYNC_FENCE_CB;
+    flags |= VIRGL_RENDERER_THREAD_SYNC;
+}
+```
+
+Post-fix per-frame timings (`frescod-vulkan-smoke` log):
+
+| Frame | Pre-fix | Post-fix |
+|---|---:|---:|
+| 0 (init) | 109 ms | 109 ms |
+| 30 | 60 ms | 334 µs |
+| 60 | 62 ms | 296 µs |
+| 90 | 62 ms | 331 µs |
+
+Trace data + writeup: `scratch/venus-perf/2026-05-08-trace*/`.
+
 #### Build cycle: rebuilding the patched MoltenVK
 
 The atrium venus stack depends on `atrium-os/MoltenVK` (one-line fix vs upstream). After `git pull` on the fork:

@@ -1,0 +1,3 @@
+[
+{"name":"worker.submit_fence_recv","ph":"i","ts":1778262524096652,"pid":97980,"tid":2223630,"args":{"id":1}},
+{"name":"worker.update_timeline","ph":"i","ts":1778262524096657,"pid":97980,"tid":2223630,"args":{"id":1}},
