@@ -20,6 +20,13 @@ timeout that's unrelated to Pergola).
   + Sign-in button background (Atrium amber-bronze, `accent_400`)
   are now visible.
 
+- **`v4-perslot.png`** — after the fresco-vulkan multi-batch fix
+  (per-atlas-slot dedicated buffers in `OpFrameResources::ensure_glyph_slot`).
+  Heading "Sign in to Atrium" now renders. "username" placeholder
+  visible. Sign-in button still rendered. TextField rect bgs and
+  remaining size-15 strings still missing — server-side issues
+  (see below).
+
 ## What proved
 
 - Pergola → fresco-client → fresco-server → MoltenVK → Metal →
@@ -33,19 +40,26 @@ timeout that's unrelated to Pergola).
 
 ## What's not yet right
 
+After the **fresco-vulkan multi-batch fix** (`v4-perslot.png`) — per-atlas-slot
+dedicated scene/glyphs/instance/counter buffers + descriptor sets, so
+each batch's host-write doesn't race the GPU's read of another batch's
+data — the size-22 heading now renders alongside the size-13 subhead
+and one size-15 string ("username" placeholder). Remaining issues are
+all on the fresco-server side:
+
 | Issue | Cause |
 |---|---|
-| Heading "Sign in to Atrium" missing (size 22) | fresco-side atlas-page allocation behaves oddly — only the subhead's size-13 page renders. |
-| Username/password placeholder text + button label "Sign in" missing (all size 15) | Same. Subhead is the only text rendered; everything else of size 22 or 15 is silent. |
-| Password TextField background (id=7) missing | One Rect inexplicably absent — same code path as the visible username Rect at id=5. |
+| Password placeholder text + button label "Sign in" missing (size 15) | All three size-15 strings live in atlas slot 4026531842 (one initial upload + two patches confirmed in smoke log), but only one TextRun reaches the per-slot scene buffer. fresco-server scene-management bug — `set_node` likely replacing earlier nodes by id collision or similar. |
+| TextField backgrounds (username + password Rect) missing | 5 Rect instances emitted from compute (canvas + panel + 2 fields + button), but fields aren't visible. HashMap iteration order? Or color-token collision with panel? Distinct from the text issue — Rect path didn't change. |
 | Window position not centered | `frescod-vulkan-smoke` doesn't composite, just dumps the raw 1280×720 render target. A real WM would center the window. |
 | Real scanout via `frescod` (not smoke) fails | Kernel log shows `RESOURCE_CREATE_BLOB` timeout — fresco→kmod→QEMU integration issue, separate from Pergola. |
 
-The remaining text-rendering anomalies need fresco-server debugging
-(probably in `fresco-scene-server/src/text.rs`'s `shape_text_run`
-or atlas-page allocator) — the LogSurface + smoke log confirm
-Pergola sends everything correctly; the rendering layer drops some
-glyph runs.
+The remaining text + rect anomalies need fresco-server debugging
+(probably in `fresco-scene-server/src/scene.rs`'s `set_node` /
+`text_run_install` path) — the LogSurface + smoke log confirm Pergola
+sends 3 size-15 text runs, fresco-server allocates and patches the
+atlas correctly, but the per-frame scene-graph traversal only emits
+one TextRun GPU node for them.
 
 ## How this was produced
 

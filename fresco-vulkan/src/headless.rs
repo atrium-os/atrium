@@ -453,56 +453,63 @@ impl HeadlessRenderer {
                 }
             }
 
-            /* Glyph_run plan: one batch per atlas slot. Each batch
-             * carries (a) the SceneNode list (one per text run) and
-             * (b) the per-glyph storage data. The per-batch path
-             * writes both into the shared scene + glyphs buffers and
-             * dispatches compute + indirect draw against the per-slot
-             * atlas binding (lazily allocated, same pattern as
-             * Texture). For now we render the first batch only;
-             * multi-atlas support comes when atrium-text grows
-             * multiple fonts. */
-            if let Some(batch) = self.glyph_run_batches.first() {
-                if self.glyph_run_batches.len() > 1 {
-                    log::warn!("only first glyph_run batch rendered (POC \
-                                limit; {} batches received)",
-                        self.glyph_run_batches.len());
-                }
-                let view = self.resources.get(&batch.atlas_slot_id)
-                    .map(|r| match r { Resource::Texture(t) => t.view });
-                let pipes = self.op_pipelines.get(&OP_ID_TEXT_GLYPH_RUN);
-                if let (Some(view), Some(pipes)) = (view, pipes) {
-                    let device_ref = &self.device;
-                    let frame = self.op_frames.get_mut(&OP_ID_TEXT_GLYPH_RUN)
-                        .expect("glyph_run op frame missing");
-                    /* Write per-frame glyphs storage and scene nodes.
-                     * Caller has already placed correct meta[1] offsets
-                     * in each scene node referencing this batch's
-                     * glyphs[] starting at index 0 (single-batch path). */
-                    let _ng = frame.write_glyphs(&batch.glyphs);
-                    let n = frame.write_glyph_run_scene(&batch.nodes);
+            /* Glyph_run plans: one per atlas slot. Each batch carries
+             * (a) the SceneNode list (one per text run) and (b) the
+             * per-glyph storage data. Per-slot dedicated buffers
+             * (scene/glyphs/instance/counter) plus per-slot compute +
+             * render descriptor sets are allocated lazily by
+             * `ensure_glyph_slot`; this lets us emit one compute+draw
+             * cycle per batch in a SINGLE render-pass instance, since
+             * host writes to slot A's buffers don't race the GPU's
+             * consumption of slot B's. The DrawPlan loop further down
+             * already handles N independent plans correctly — each
+             * batch becomes one more plan.
+             *
+             * Caller is expected to have placed `meta[1]` (glyph_offset)
+             * in each scene node so the kernel reads from offset 0 of
+             * THIS batch's per-slot glyphs buffer. */
+            let glyph_pipes = self.op_pipelines.get(&OP_ID_TEXT_GLYPH_RUN)
+                .map(|p| (p.compute_pipeline, p.compute_pipe_layout,
+                          p.render_pipeline,  p.render_pipe_layout));
+            if let Some((c_pipe, c_layout, r_pipe, r_layout)) = glyph_pipes {
+                /* Disjoint-field borrows so frame (mut from op_frames)
+                 * coexists with the iterator over glyph_run_batches and
+                 * the lookups in resources. */
+                let device_ref = &self.device;
+                let resources  = &self.resources;
+                let batches    = &self.glyph_run_batches;
+                let frame = self.op_frames.get_mut(&OP_ID_TEXT_GLYPH_RUN)
+                    .expect("glyph_run op frame missing");
+                let max_instances = frame.max_instances;
+                for batch in batches {
+                    let Some(view) = resources.get(&batch.atlas_slot_id)
+                        .map(|r| match r { Resource::Texture(t) => t.view })
+                    else {
+                        log::warn!("glyph_run batch atlas_slot={} not bound; \
+                                    skipping", batch.atlas_slot_id);
+                        continue;
+                    };
+                    let slot = frame.ensure_glyph_slot(
+                        device_ref, batch.atlas_slot_id, view)?;
+                    let n = slot.write_scene(&batch.nodes);
                     if n < batch.nodes.len() as u32 {
                         log::warn!("glyph_run nodes {} > cap {}; \
                                     dropping excess",
-                            batch.nodes.len(), frame.max_instances);
+                            batch.nodes.len(), max_instances);
                     }
-                    let render_set = frame.ensure_texture_descriptor(
-                        device_ref, batch.atlas_slot_id, view)?;
+                    slot.write_glyphs(&batch.glyphs);
                     plans.push(DrawPlan {
-                        compute_pipeline:  pipes.compute_pipeline,
-                        compute_layout:    pipes.compute_pipe_layout,
-                        compute_set:       frame.descriptor_set,
-                        render_pipeline:   pipes.render_pipeline,
-                        render_layout:     pipes.render_pipe_layout,
-                        render_set,
-                        counter_buf:       frame.counter_buf,
-                        instance_buf:      frame.instance_buf,
+                        compute_pipeline:  c_pipe,
+                        compute_layout:    c_layout,
+                        compute_set:       slot.compute_set,
+                        render_pipeline:   r_pipe,
+                        render_layout:     r_layout,
+                        render_set:        slot.render_set,
+                        counter_buf:       slot.counter_buf,
+                        instance_buf:      slot.instance_buf,
                         n,
                         draw_instances:    batch.glyphs.len() as u32,
                     });
-                } else if view.is_none() {
-                    log::warn!("glyph_run batch atlas_slot={} not bound; \
-                                skipping", batch.atlas_slot_id);
                 }
             }
 
