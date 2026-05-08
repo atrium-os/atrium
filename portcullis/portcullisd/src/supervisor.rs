@@ -23,7 +23,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::time::{Duration, Instant};
 
-use jaild::protocol::{MountKind, Request, Response};
+use jaild::protocol::{CreateJailRequest, Request, Response};
 use log::{debug, error, info, warn};
 
 use crate::host_mount;
@@ -55,14 +55,14 @@ pub struct ServiceState {
     /// `manifest.supervision.failure_budget_secs`.
     /// 0 → disabled (infinite restarts).
     pub failure_budget_remaining: f64,
-    /// Mount destinations applied at launch. Walked at every
-    /// terminal event (exit-and-restart, retire) to unmount the
-    /// host-namespace mounts the previous instance left behind.
-    /// Without this, restarting any service with [[mounts]] /
-    /// [[volumes]] hits EDEADLK on the next nullfs(8) mount of
-    /// the same source/dest pair, since FreeBSD jails share the
-    /// global mount table with the host.
-    pub mount_dests: Vec<(String, MountKind)>,
+    /// The exact CreateJailRequest used at the initial launch,
+    /// including dynamically-resolved [[volumes]] mounts. Re-sent
+    /// verbatim on every relaunch so persistent-volume services
+    /// don't silently come up without their volumes.
+    /// `manifest.to_create_request()` would drop the
+    /// volume-resolved mounts (those live in bootstrap's local
+    /// state, not back in the manifest).
+    pub create_req: CreateJailRequest,
     /// Tombstone flag. Set by `retire()` instead of removing the
     /// entry, because kqueue's per-kevent `udata` we use is the
     /// services-vec index — removing would invalidate other
@@ -220,15 +220,16 @@ impl Supervisor {
     /// Persistent jails should not be added (they have no
     /// procdesc fd and don't get supervised).
     ///
-    /// `mount_dests` is the (dest, kind) of every mount the jail
-    /// applied — manifest's `[[mounts]]` plus the dynamically-
-    /// resolved `[[volumes]]` mounts. Used at exit-time cleanup.
+    /// `create_req` is the full CreateJailRequest sent at launch
+    /// (including resolved [[volumes]] mounts). Stored to drive
+    /// relaunch + provide mount destinations for post-exit
+    /// cleanup.
     pub fn watch(
         &mut self,
         manifest:    ServiceManifest,
         procdesc_fd: i32,
         pid:         i32,
-        mount_dests: Vec<(String, MountKind)>,
+        create_req:  CreateJailRequest,
     ) -> io::Result<()> {
         let idx = self.services.len();
         ffi::register_procdesc_exit(self.kq, procdesc_fd, idx)?;
@@ -242,7 +243,7 @@ impl Supervisor {
             recent_restarts: VecDeque::new(),
             burst_pause_until: None,
             failure_budget_remaining: initial_budget,
-            mount_dests,
+            create_req,
             retired: false,
         });
         Ok(())
@@ -324,13 +325,12 @@ impl Supervisor {
          * Always, regardless of restart decision: the next launch
          * (if any) re-applies them through jaild's child, and
          * mounting on top of an identical existing nullfs returns
-         * EDEADLK. Borrow svc again here since cleanup_req
-         * borrowed it earlier. */
+         * EDEADLK. */
         let svc = &self.services[idx];
-        for (dest, kind) in &svc.mount_dests {
-            if let Err(e) = host_mount::unmount(dest) {
-                warn!("{}: post-exit unmount {kind:?} {dest}: {e}",
-                    svc.manifest.name);
+        for m in &svc.create_req.mounts {
+            if let Err(e) = host_mount::unmount(&m.dest) {
+                warn!("{}: post-exit unmount {:?} {}: {e}",
+                    svc.manifest.name, m.kind, m.dest);
             }
         }
         let svc = &mut self.services[idx];
@@ -449,7 +449,10 @@ impl Supervisor {
         }
         info!("{}: restarting", s.manifest.name);
 
-        let req = Request::CreateJail(s.manifest.to_create_request());
+        /* Reuse the launch-time CreateJailRequest verbatim — its
+         * `mounts` already include the resolved [[volumes]]
+         * entries that to_create_request() alone would drop. */
+        let req = Request::CreateJail(s.create_req.clone());
         debug!("{}: sending CreateJail (reusing connection)", s.manifest.name);
         match self.client.send(&req) {
             Ok((Response::JailCreated(r), Some(fd))) => {

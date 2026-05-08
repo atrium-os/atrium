@@ -247,12 +247,15 @@ fn main() -> ExitCode {
             }
         }
 
-        /* Capture mount dests now — Once mode needs them at
-         * teardown, and after CreateJail we drop create_req. */
-        let mount_dests: Vec<(String, MountKind)> = create_req.mounts.iter()
+        /* Save the resolved request — Supervise mode keeps it for
+         * relaunch (manifest.to_create_request() alone drops
+         * [[volumes]] mounts); Once mode keeps the dests for
+         * teardown unmount. */
+        let saved_req = create_req.clone();
+        let mount_dests: Vec<(String, MountKind)> = saved_req.mounts.iter()
             .map(|x| (x.dest.clone(), x.kind))
             .collect();
-        let jail_name_for_held = create_req.name.clone();
+        let jail_name_for_held = saved_req.name.clone();
 
         let req = Request::CreateJail(create_req);
         let send_result = match &mut driver {
@@ -265,7 +268,7 @@ fn main() -> ExitCode {
                     m.name, r.jid, r.pid, r.procdesc_attached);
                 match (fd, &mut driver) {
                     (Some(fd), Driver::Supervise(sup)) => {
-                        if let Err(e) = sup.watch(m, fd, r.pid, mount_dests) {
+                        if let Err(e) = sup.watch(m, fd, r.pid, saved_req) {
                             error!("watch register failed: {e}");
                             launch_failures += 1;
                         }

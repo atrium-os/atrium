@@ -1,0 +1,49 @@
+# /etc/atrium/services.d/80-atrium-smoke-relaunch.toml
+#
+# Relaunch smoke: validates that supervisor's relaunch path
+# preserves the dynamically-resolved [[volumes]] mounts.
+# Without create_req-on-relaunch, manifest.to_create_request()
+# would lose the volume mounts and the second instance would
+# come up missing them silently.
+#
+# Service: atrium-jaild check-policy (exits 0 immediately, ~0s
+# lifetime). With restart="always", supervisor will restart it
+# repeatedly. Each cycle: jail dies → host_mount::unmount runs
+# → relaunch sends saved create_req (same source/dest mounts) →
+# jaild's child re-mounts → service runs again. Budget burns
+# down (~5 fast-fails at default min_lifetime=5s, budget=25s)
+# then retires. Burst protection capped high so we observe full
+# budget exhaustion, not a 30-second cooldown.
+
+enabled       = true
+name          = "atrium-smoke-relaunch"
+path          = "/"
+children_max  = 0
+devfs_ruleset = 0
+
+[[volumes]]
+name      = "data"
+kind      = "persistent"
+mount_at  = "/atrium-relaunch-data"
+mode      = 448
+owner_uid = 0
+owner_gid = 0
+
+[exec]
+path = "/usr/local/bin/atrium-jaild"
+argv = ["atrium-jaild", "check-policy",
+        "--policy", "/etc/atrium/jaild.policy.toml"]
+uid  = 1001
+gid  = 1001
+
+[[exec.env]]
+key   = "PATH"
+value = "/bin:/usr/bin"
+
+[supervision]
+restart                       = "always"
+restart_after_secs            = 0
+max_restarts_per_minute       = 100   # don't trip burst before budget
+cooldown_after_burst_secs     = 1
+failure_budget_secs           = 25
+min_lifetime_for_success_secs = 5
