@@ -237,6 +237,25 @@ network.peer_jails       = ["dev-*"]                        # patterns of jails 
 network.peer_ports       = { "dev-*" = [22],                # per-peer port restrictions
                              "atrium-pkg-cache" = [8080] }
 
+# LAN-visible IP (rare; jail looks like a separate device on the LAN)
+network.lan_alias        = true                # alias on host's real interface
+                                                # (em0 etc.); needs operator-
+                                                # configured allow-list
+
+# Inbound port forwarding from host's external IP to a jail port
+network.expose           = [{ external = 2222, internal = 22 },
+                            { external = 8443, internal = 443 }]
+                                                # exposes host:2222 → jail:22
+                                                # via pf rdr; needs lan-side
+                                                # capability OR host's existing
+                                                # public IP, plus user prompt
+
+# mDNS / Bonjour participation (V2 reserved)
+network.mdns             = false               # V1: must be false; reserved
+                                                # for V2 capability that lets
+                                                # jail join host's mDNS group
+                                                # for LAN-device discovery
+
 # Specialty: full vnet (rare; for VPN clients, multi-tenant)
 network.vnet             = { bridge = "atrium-vnet0" }
 ```
@@ -319,6 +338,90 @@ network.peer_ports = {
 Default if a key is missing from `peer_ports` is "all ports
 allowed within the matched peer." Restrict explicitly when the
 peer should only be reached for specific services.
+
+#### `network.lan_alias = true`
+
+Allocates a unique IP on the host's *real* interface (`em0`,
+typically), making the jail visible as a separate device on the
+user's LAN. Other LAN devices can ARP for and connect to the
+jail's IP directly — no NAT, no port forwarding.
+
+Cost: real LAN IP consumed; ARP traffic; LAN-visible attack
+surface.
+
+Required when: a jail is meant to be reachable from other
+machines on the LAN as a service in its own right (a media
+server reachable as `atrium-jellyfin.lan`, a Samba share, etc.).
+
+Operator gates this in `jaild.policy.toml`:
+
+```toml
+[network.lan_alias]
+allowed_iface_addrs = [
+    { iface = "em0", range = "192.168.1.200/29" },
+]
+```
+
+The range is a small slice of the host's network the operator
+carves out for jail-LAN aliases. Without this allow-list,
+manifests requesting `lan_alias` are rejected at install time.
+
+Most jails will not need this; default-deny in policy is
+correct.
+
+#### `network.expose = [{ external, internal }, ...]`
+
+Inbound port forwarding from host's external IP (or `lan_alias`
+if the jail has one) to a port inside the jail. atrium-netd
+emits a pf `rdr` rule:
+
+```pf
+rdr on em0 proto tcp from any to (em0) port 2222 -> 100.64.0.42 port 22
+```
+
+Allows the dev jail's sshd (port 22 inside) to be reached as
+`<host's-external-IP>:2222` from anywhere reachable. Useful
+for: external SSH into a dev jail, public-facing web service
+without LAN-visible jail IP, etc.
+
+Each entry is `{ external: u16, internal: u16, proto?: "tcp"|"udp" }`.
+`proto` defaults to "tcp."
+
+Validation:
+
+- Requires `network.host_alias = true` OR `network.lan_alias = true`
+  (must have somewhere to forward FROM; without an alias, the
+  rdr has no consistent destination).
+- External ports must be in `policy.network.expose.allowed_external_ports`
+  range (operator-curated; default empty = no expose allowed).
+- Multiple manifests can't claim the same external port; conflict
+  detection at parse time.
+
+Capability prompt at install time shows the full mapping:
+
+```
+Network — port forwards:
+  host port 2222 (TCP) → vscode:22
+  host port 8443 (TCP) → vscode:443
+```
+
+User explicitly approves; the prompt can't hide a port mapping.
+
+#### `network.mdns = true` (**V2 reserved; must be false in V1**)
+
+Future capability that allows the jail to participate in the
+host's mDNS / Bonjour multicast group. atrium-netd would forward
+the jail's UDP socket on port 5353 onto the host's multicast
+group; the jail can advertise services AND discover external
+LAN devices (printers, AirPlay receivers, smart-home gear).
+
+V1: the field is reserved. atrium-netd rejects manifests with
+`network.mdns = true` until the V2 implementation lands.
+
+Why a capability and not just open by default: mDNS exposes
+service advertisements to the LAN, which can leak app behaviour
+(an app named "scribe-recorder" advertising itself is visible
+information). User opts in per app at install time.
 
 #### `network.vnet = { bridge = "..." }`
 
@@ -463,6 +566,78 @@ add policy on top (e.g., outbound rate limiting, host-level
 firewall, etc.). atrium-netd's anchors enforce the per-jail
 slice; the operator's outer rules enforce host-wide policy.
 
+### 5.6 Host pf.conf baseline (fail-closed default)
+
+The pf rule architecture has a subtle race: between
+atrium-jaild creating a jail (with its IP allocated and
+ifconfig'd) and atrium-netd noticing the state-file change +
+loading the per-jail anchor, there's a brief window — typically
+microseconds, but worst-case milliseconds during high load —
+where the jail exists with no anchor. If host pf.conf is
+permissive by default, the jail has unrestricted network access
+during that window.
+
+**Mitigation: a fail-closed baseline rule in host pf.conf**
+that denies all traffic to/from Atrium jail address ranges
+unless an anchor explicitly overrides:
+
+```pf
+# /etc/pf.conf — operator-owned, ships with Atrium baseline included
+
+# Atrium baseline: deny all traffic to/from jail address ranges.
+# atrium-netd's per-jail anchors layer "pass" rules on top of
+# this; without an anchor (e.g., during the create race window
+# OR if atrium-netd is offline), the deny stands.
+table <atrium_jail_addrs> { 127.10.0.0/16, 100.64.0.0/16 }
+
+block log on any from <atrium_jail_addrs> to any
+block log on any from any to <atrium_jail_addrs>
+
+# Per-jail anchors — populated by atrium-netd. Pass rules in
+# anchors override the baseline blocks for explicit allows.
+anchor "atrium/*"
+
+# Operator's other host-level rules below (rate limiting,
+# external firewall, etc.).
+```
+
+Properties this gives us:
+
+- **Fail-closed by construction.** atrium-netd offline →
+  baseline deny applies → no jail traffic flows. Operator
+  notices via service status, can't quietly leak traffic.
+- **Race-free jail create.** Anchor not yet loaded → baseline
+  deny → jail has no network until atrium-netd catches up.
+  Apps fail-startup gracefully (and supervisor restarts them);
+  no traffic escapes during the gap.
+- **Explicit override only.** Per-jail anchors must
+  affirmatively `pass` to override the deny. An empty anchor =
+  jail has no network. There's no "default open" path.
+
+The baseline rules ship in a recommended `/etc/pf.conf.atrium`
+fragment that operators include (or have included
+automatically by an `atrium-pf-baseline` package). The
+operator can add their own rules above (host-level firewall)
+and below (NAT for the host itself, etc.); the baseline lives
+in the middle, atrium-netd's anchor reference comes after.
+
+### 5.7 Anchor isolation across atrium-netd reloads
+
+A loaded anchor stays loaded until atrium-netd explicitly
+reloads or removes it. Implications:
+
+- Crashing atrium-netd does not drop existing anchors. Existing
+  jails keep their network policy; new jails (created during
+  the outage) get default-deny via the baseline (§5.6) until
+  atrium-netd restarts and reconciles.
+- A misconfiguration in one jail's manifest doesn't affect
+  other jails' anchors. Per-jail loading is the unit of
+  failure containment.
+- Operator can `pfctl -a "atrium/*" -F all` to flush every
+  Atrium anchor manually (emergency); atrium-netd recreates
+  them on next reconciliation pass (if running) or on its
+  next start.
+
 ## 6. Lifecycle: jaild + atrium-netd choreography
 
 The two daemons coordinate through the jaild state file (no
@@ -538,6 +713,72 @@ On atrium-jaild restart it re-reads the state and re-applies
 ifconfig aliases for any jail still alive (per the existing
 jaild reconciliation logic). atrium-netd's anchors are
 unaffected; they reference IPs, not state file pointers.
+
+### 6.6 Hot-reload semantics for in-flight TCP
+
+When atrium-netd reloads an anchor (manifest edit, peer pattern
+re-resolution, jail roster change), pf's rule replacement is
+atomic — but **existing TCP connections are not killed**.
+This is pf's standard behavior, and it's the right default:
+
+- A new pf rule that *would* have blocked an in-flight
+  connection doesn't terminate it; the connection stays open
+  until either side closes it.
+- A new pf rule that *would* have allowed a connection
+  doesn't apply retroactively — packets in flight at the
+  moment of the rule swap follow the old rules; from the next
+  packet onward, the new rules apply.
+
+For the typical Atrium use case, this is right:
+
+- Editing vscode's manifest to add a new dev-* peer doesn't
+  disrupt vscode's existing connections to other peers.
+- Removing a peer from `peer_jails` doesn't kill in-flight
+  connections to that peer; they drain naturally as TCP
+  sessions end. New connection attempts will fail.
+- A jail being destroyed has its IP de-aliased; in-flight
+  connections still associated with that IP get RST from the
+  kernel (no destination); apps see EHOSTUNREACH on their
+  next read/write.
+
+If an operator needs to *kill* in-flight connections (security
+incident, etc.), `pfctl -k` does it explicitly. atrium-netd
+does **not** issue per-anchor-reload kills; the operator opts
+in to that behavior when needed.
+
+This matches what operators expect from any pf-driven system;
+no novel semantics here, but worth documenting because the
+"manifest edit" UX implies an immediate effect that's only
+true for *new* connections.
+
+### 6.7 Operator-driven manifest reload
+
+An operator changing a manifest while a jail is running:
+
+```sh
+$ vim /etc/atrium/services.d/vscode.toml      # add a new peer pattern
+$ # save and exit
+```
+
+atrium-netd's kqueue notices `NOTE_WRITE` on the directory.
+After a 250ms debounce, it re-reads the modified manifest,
+verifies it parses + validates, regenerates the affected
+anchor, atomically reloads via `pfctl -a -f -`. The operator
+sees no command output — the change just takes effect. To
+verify:
+
+```sh
+$ atrium-netd-cli show vscode
+[... regenerated anchor with new peer pass-rule ...]
+```
+
+If the manifest fails validation, atrium-netd logs the error
+and leaves the previous anchor in place. The operator notices
+via:
+
+- `atrium-netd-cli reconcile` (forces re-read; reports errors)
+- `tail /var/log/atrium/netd.log` (structured error entries)
+- `sysctl kern.atrium.netd.last_error` (most-recent-failure ring)
 
 ## 7. Block events: pflog → atrium-notify
 
@@ -733,7 +974,123 @@ A `NetworkAlloc` requesting `vnet = Some(...)` against a policy
 with `allow_vnet = false` is rejected at jaild's validator.
 Symmetric for the other flags.
 
-## 11. Install-time capability prompt
+## 11. Observability and logging
+
+atrium-netd surfaces three classes of operator-facing signal:
+
+### 11.1 Structured log file
+
+`/var/log/atrium/netd.log` — JSON Lines, one record per event:
+
+```jsonl
+{"ts":"2026-05-08T12:34:56Z","level":"info","event":"anchor_loaded","jail":"vscode","manifest_hash":"sha256:abc..."}
+{"ts":"2026-05-08T12:35:01Z","level":"info","event":"jail_added","name":"dev-myproj","lo0":"127.10.0.42"}
+{"ts":"2026-05-08T12:35:01Z","level":"info","event":"pattern_resolved","jail":"vscode","pattern":"dev-*","matches":["dev-myproj"]}
+{"ts":"2026-05-08T12:35:01Z","level":"info","event":"anchor_reloaded","jail":"vscode","reason":"pattern_added","took_ms":3}
+{"ts":"2026-05-08T12:36:14Z","level":"warn","event":"block","jail":"vscode","src":"127.10.0.5","dst":"127.10.0.99","port":80,"protocol":"tcp"}
+{"ts":"2026-05-08T12:37:02Z","level":"error","event":"manifest_invalid","path":"/etc/atrium/services.d/atrium-experimental.toml","detail":"network.outbound set without network.host_alias"}
+```
+
+Rotation: standard newsyslog(8) policy. Operator configures.
+
+### 11.2 sysctls
+
+For low-overhead operator inspection without parsing logs:
+
+```
+kern.atrium.netd.anchors_active        # u32; current anchor count
+kern.atrium.netd.anchors_total         # u64; lifetime count of loads
+kern.atrium.netd.reloads_total         # u64; lifetime count of reloads
+kern.atrium.netd.blocks_total          # u64; lifetime count of pf blocks
+kern.atrium.netd.blocks_recent         # ring buffer (text dump):
+                                       #   "vscode→atrium-pkg-cache:8080 (denied)"
+                                       #   "vscode→evil.example.com:443 (denied)"
+                                       #   ... (last 64 entries)
+kern.atrium.netd.last_error            # most recent error: string
+kern.atrium.netd.last_reconcile_ms     # last reconciliation pass duration
+kern.atrium.netd.uptime_seconds        # since atrium-netd started
+```
+
+Same shape as the existing tessera observability sysctls.
+
+### 11.3 atrium-netd-cli
+
+CLI for richer queries:
+
+```
+$ atrium-netd-cli list
+JAIL                  LO0           ATRIUM0       ANCHOR  STATUS
+vscode                127.10.0.5    100.64.0.5    loaded  active (3 peer rules)
+dev-myproj            127.10.0.42   100.64.0.42   loaded  active
+atrium-pkg-cache      127.10.0.7    100.64.0.7    loaded  active
+
+$ atrium-netd-cli show vscode
+# anchor "atrium/jail-vscode"
+# generated 2026-05-08T12:35:01Z from
+#   /etc/atrium/services.d/vscode.toml (sha256:abc...)
+#
+pass out from 127.10.0.5  to ! 127.10.0.0/16   nat-to (em0)
+pass out from 100.64.0.5  to ! 100.64.0.0/16   nat-to (em0)
+pass out proto tcp from 127.10.0.5 to 127.10.0.42 port 22  # dev-myproj
+pass in  proto tcp from any        to 127.10.0.5  port { 22 }
+block in  log from any to 127.10.0.5
+block in  log from any to 100.64.0.5
+block out log from 127.10.0.5  to any
+block out log from 100.64.0.5  to any
+
+$ atrium-netd-cli why-blocked vscode
+[2026-05-08T12:36:14Z] vscode → 127.10.0.99:80
+  reason: 127.10.0.99 doesn't match any of vscode's network.peer_jails
+          patterns (currently: dev-*, atrium-pkg-cache)
+
+[2026-05-08T12:37:48Z] vscode → 8.8.8.8:53
+  reason: vscode has network.outbound = ["github.com:443",
+          "registry.atrium.dev:443"]; 8.8.8.8:53 not whitelisted.
+
+$ atrium-netd-cli stats
+Anchors active:          7
+Reloads (lifetime):      42
+Reloads (last hour):     3
+Blocks (lifetime):       18
+Blocks (last hour):      2
+Last reconcile:          2026-05-08T12:35:01Z (took 4ms)
+Uptime:                  6d 2h 14m
+
+$ atrium-netd-cli ranges
+[network]
+lo0_jail_range           = 127.10.0.0/16   (allocated: 7/65534)
+atrium_outbound_range    = 100.64.0.0/16   (allocated: 5/65534)
+atrium_outbound_iface    = atrium0          (up; bridge gateway 100.64.0.1)
+host_outbound_iface      = em0              (up; 192.168.1.42/24)
+
+$ atrium-netd-cli reconcile
+re-reading manifests...   done (12 manifests; 0 errors)
+re-resolving patterns...  done (7 anchors checked, 1 needed reload)
+loading anchors...        done (atrium/jail-vscode reloaded)
+```
+
+`atrium-netd-cli` reads atrium-netd's state file and pf state
+directly; doesn't need RPC to atrium-netd.
+
+### 11.4 What we deliberately don't expose
+
+- **Per-jail traffic byte/packet counters.** pf supports them
+  (label rules with `tag` or `count`); atrium-netd doesn't
+  enable by default. Counters cost CPU on each packet. V2
+  operator-opt-in via a `kern.atrium.netd.count_traffic =
+  true` sysctl. For now, operators wanting per-jail accounting
+  use `pfctl -ss` directly.
+- **Connection-table inspection.** Same — `pfctl -ss`
+  authoritative; atrium-netd doesn't duplicate.
+- **Historical block-event analytics.** netd.log is the
+  source of truth; analytics is the operator's call (Loki,
+  ELK, whatever). atrium-netd doesn't ship a query engine.
+
+The principle: atrium-netd surfaces *what its own state is*
+(anchors, blocks, errors) and delegates everything kernel-side
+to existing FreeBSD tools (`pfctl`, `tcpdump`, `netstat`).
+
+## 12. Install-time capability prompt
 
 When portcullisd validates an app's manifest at install time,
 the network capabilities surface in the prompt UI alongside
@@ -767,7 +1124,7 @@ For V0, capability validation happens at manifest-install
 (text output of `atrium-pkg install`); user accepts via CLI
 flag.
 
-## 12. Open questions / future work
+## 13. Open questions / future work
 
 1. **IPv6.** This spec is IPv4-centric. Real IPv6 means ULA
    range allocation (`fc00::/7`), separate pf rules, separate
@@ -800,7 +1157,7 @@ flag.
    NAT source changes. atrium-netd needs to react to host
    route changes (V2).
 
-## 13. Implementation order
+## 14. Implementation order
 
 When work resumes, network is a real engineering arc. Roughly:
 
@@ -823,7 +1180,7 @@ Total: ~5-6 weeks focused. Most weight in stages 5 and 7.
 The atrium-net GUI mediator is a separate work item (D3 /
 Forum); not included above.
 
-## 14. References
+## 15. References
 
 - [`atrium-netd.md`](atrium-netd.md) — the daemon that owns pf
   rule lifecycle (§§3-7 of this spec).
