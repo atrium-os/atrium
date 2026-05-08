@@ -54,6 +54,16 @@ if [ ! -f "$EFI_PAD" ]; then
     # pad to 64 MiB
     truncate -s 67108864 "$EFI_PAD"
 fi
+
+# Sparse 16 GiB image for atrium-volumes' tessera-backed
+# /var/lib/atrium/storage. Created on demand. Inside the guest:
+#   kldload tessera_fs && mkfs-tessera --create -s 16384 /dev/vtbd1
+#   mount -t tessera /dev/vtbd1 /var/lib/atrium/storage
+#   echo "/dev/vtbd1 /var/lib/atrium/storage tessera rw 0 0" >> /etc/fstab
+TESSERA_STORAGE="$BSD_DIR/vm/tessera-storage.img"
+if [ ! -f "$TESSERA_STORAGE" ]; then
+    truncate -s 16G "$TESSERA_STORAGE"
+fi
 if [ ! -f "$EFI_VARS" ]; then
     truncate -s 67108864 "$EFI_VARS"
 fi
@@ -190,6 +200,8 @@ exec "$QEMU" \
     -drive if=virtio,file="$DISK",format=qcow2,cache=writeback \
     -drive file="$BSD_DIR/vm/crash-test.img",format=raw,cache=writeback,if=none,id=crashdrv \
     -device virtio-blk-pci,drive=crashdrv,serial=tessera-crashtest,config-wce=on \
+    -drive file="$BSD_DIR/vm/tessera-storage.img",format=raw,cache=writeback,if=none,id=storagedrv \
+    -device virtio-blk-pci,drive=storagedrv,serial=atrium-storage,config-wce=on \
     -device virtio-net-pci,netdev=net0 \
     -netdev user,id=net0,hostfwd=tcp::2222-:22 \
     -fsdev local,id=share,path="$SHARE_DIR",security_model=none \
