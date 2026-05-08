@@ -68,6 +68,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "aqueduct"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "sha2",
+]
+
+[[package]]
 name = "atrium-session"
 version = "0.1.0"
 dependencies = [
@@ -422,6 +430,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "portcullis-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "portcullis-toml"
 version = "0.1.0"
 dependencies = [
@@ -434,6 +450,7 @@ dependencies = [
 name = "portcullisd"
 version = "0.1.0"
 dependencies = [
+ "aqueduct",
  "atrium-volumes",
  "env_logger",
  "jaild",
@@ -442,6 +459,7 @@ dependencies = [
  "portcullis-ipc",
  "portcullis-jail",
  "portcullis-policy",
+ "portcullis-protocol",
  "portcullis-toml",
  "serde",
  "serde_json",

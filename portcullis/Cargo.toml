@@ -5,6 +5,7 @@ members = [
     "portcullis-jail",
     "portcullis-policy",
     "portcullis-ipc",
+    "portcullis-protocol",
     "portcullis-cli",
     "portcullisd",
     "atrium-session",

@@ -32,6 +32,13 @@ pub const CLASS_BROKER:    u8 = 4;
 /// goes via shm + fd-passing on the same connection.
 pub const CLASS_AUDIO:     u8 = 5;
 
+/// portcullisd. In-jail services use this to request runtime
+/// AttachMount / DetachMount and (future) other capability-gated
+/// operations. Op dictionary lives in the `portcullis-protocol`
+/// crate. Per `docs/spec/storage.md` §6.2 portcullisd is the only
+/// jaild client; in-jail services never talk to jaild directly.
+pub const CLASS_PORTCULLIS: u8 = 6;
+
 /// Smoke-test / fuzzing service. Not part of the production
 /// surface; used by aqueduct-echo and unit tests.
 pub const CLASS_ECHO:      u8 = 63;
@@ -43,13 +50,14 @@ pub const CLASS_VENDOR_BASE: u8 = 64;
 /// Friendly name for a class (for logs / debugging).
 pub fn class_name(c: u8) -> &'static str {
     match c {
-        CLASS_CORE      => "core",
-        CLASS_DISPLAY   => "display",
-        CLASS_CLIPBOARD => "clipboard",
-        CLASS_NOTIFY    => "notify",
-        CLASS_BROKER    => "broker",
-        CLASS_AUDIO     => "audio",
-        CLASS_ECHO      => "echo",
+        CLASS_CORE       => "core",
+        CLASS_DISPLAY    => "display",
+        CLASS_CLIPBOARD  => "clipboard",
+        CLASS_NOTIFY     => "notify",
+        CLASS_BROKER     => "broker",
+        CLASS_AUDIO      => "audio",
+        CLASS_PORTCULLIS => "portcullis",
+        CLASS_ECHO       => "echo",
         c if c >= CLASS_VENDOR_BASE => "vendor",
         _ => "reserved",
     }
