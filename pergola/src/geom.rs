@@ -30,6 +30,10 @@ pub struct Rect {
 }
 
 impl Rect {
+    /// All zeros — useful when a node's size is computed by the
+    /// layout pass.
+    pub const ZERO_SIZED: Self = Self { origin: Point::ZERO, size: Size::ZERO };
+
     pub const fn new(x: f32, y: f32, w: f32, h: f32) -> Self {
         Self { origin: Point::new(x, y), size: Size::new(w, h) }
     }

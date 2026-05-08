@@ -28,6 +28,7 @@ pub mod geom;
 pub mod layout;
 pub mod node;
 pub mod reactive;
+pub mod surface;
 pub mod theme;
 pub mod view;
 
@@ -36,4 +37,5 @@ pub use color::Color;
 pub use geom::{Point, Rect, Size};
 pub use node::{diff, Node, NodeDelta, NodeId, NodeTree, TextStyle};
 pub use reactive::Mutable;
+pub use surface::{commit, FrescoSurface, LogSurface, Surface};
 pub use view::{render, Ctx, View};
