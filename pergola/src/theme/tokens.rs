@@ -31,9 +31,13 @@ pub mod space {
 // ────────────────────────────────────────────────────────────────────────────
 
 pub mod font {
-    /// PostScript family name expected from `font_open` on fresco-server.
-    pub const SANS: &str = "IBM Plex Sans";
-    pub const MONO: &str = "IBM Plex Mono";
+    /// Family name passed to `font_open`. The visual-language doc
+    /// commits to IBM Plex Sans/Mono; the system shell currently
+    /// ships with DejaVu via fresco-server's "system-*" aliases.
+    /// Bundling Plex is a follow-up — the *value* changes here when
+    /// fonts are bundled, so widgets always reference the token.
+    pub const SANS: &str = "system-sans";
+    pub const MONO: &str = "system-mono";
 }
 
 pub mod type_size {
@@ -130,14 +134,18 @@ impl Semantic {
     pub const DARK: Self = Self { mode: Mode::Dark };
 
     pub fn bg_canvas(&self) -> Color {
+        // Light mode inverts the dark-mode raise direction: raised
+        // surfaces are *lighter* (toward white) on dark, *also*
+        // lighter on light. So light's canvas is slightly darker
+        // (neutral_100) so panels (neutral_50) read as raised.
         match self.mode {
-            Mode::Light => palette::neutral_50(),
+            Mode::Light => palette::neutral_100(),
             Mode::Dark => palette::neutral_950(),
         }
     }
     pub fn bg_surface(&self) -> Color {
         match self.mode {
-            Mode::Light => palette::neutral_100(),
+            Mode::Light => palette::neutral_50(),
             Mode::Dark => palette::neutral_900(),
         }
     }
