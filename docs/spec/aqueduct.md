@@ -105,7 +105,7 @@ All messages share an envelope:
 | Field          | Notes                                       |
 |----------------|---------------------------------------------|
 | `ver`          | Envelope version. Currently 1.              |
-| `opcode_class` | Top-level dictionary selector. 0 = aqueduct (CAS, events). 1 = display (Fresco). 2 = clipboard. 3 = notify. 4 = broker. 5 = audio-control. 6 = portcullis (capability-mediated runtime mounts; `portcullis-protocol` crate). 7..62 reserved. 63 = echo (smoke/fuzz). 64..255 vendor/private. |
+| `opcode_class` | Top-level dictionary selector. 0 = aqueduct (CAS, events). 1 = display (Fresco). 2 = clipboard. 3 = notify. 4 = broker. 5 = audio-control. 6 = portcullis (capability-mediated runtime mounts; `portcullis-protocol` crate). 7 = input (HID-native keyboard/pointer/gamepad; `spec/atrium-input.md`). 8..62 reserved. 63 = echo (smoke/fuzz). 64..255 vendor/private. |
 | `op`           | Opcode within the class. Class-specific dictionary. |
 | `flags`        | Bit 0: payload contains hash refs (receiver should consult cache). Bit 1: response expected. Bit 2: this is a response. Bit 3: async event (no response expected). Bits 4..15 class-specific. |
 | `length`       | Payload byte count (excluding envelope).    |

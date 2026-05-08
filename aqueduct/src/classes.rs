@@ -39,6 +39,13 @@ pub const CLASS_AUDIO:     u8 = 5;
 /// jaild client; in-jail services never talk to jaild directly.
 pub const CLASS_PORTCULLIS: u8 = 6;
 
+/// Atrium input pipeline — keyboard, pointer, gamepad, touch.
+/// Routed by atrium-input-router (today: thread inside
+/// fresco-server). HID-native: codes are USB HID Usage Page
+/// values directly, no Linux evdev shim. Op dictionary spec'd in
+/// `docs/spec/atrium-input.md`.
+pub const CLASS_INPUT:     u8 = 7;
+
 /// Smoke-test / fuzzing service. Not part of the production
 /// surface; used by aqueduct-echo and unit tests.
 pub const CLASS_ECHO:      u8 = 63;
@@ -57,6 +64,7 @@ pub fn class_name(c: u8) -> &'static str {
         CLASS_BROKER     => "broker",
         CLASS_AUDIO      => "audio",
         CLASS_PORTCULLIS => "portcullis",
+        CLASS_INPUT      => "input",
         CLASS_ECHO       => "echo",
         c if c >= CLASS_VENDOR_BASE => "vendor",
         _ => "reserved",
