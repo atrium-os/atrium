@@ -16,8 +16,8 @@ use log::{error, info, warn};
 
 use crate::ffi::{self, JailCreateSpec};
 use crate::protocol::{
-    self, CreateJailRequest, CreateJailResponse, ExecSpec, MountKind,
-    NetworkConfig, Request, Response,
+    self, AttachMountRequest, CreateJailRequest, CreateJailResponse,
+    DetachMountRequest, ExecSpec, MountKind, NetworkConfig, Request, Response,
 };
 use crate::state::PersistentState;
 use crate::validator;
@@ -149,7 +149,188 @@ fn dispatch(
         Request::RemoveJail { jid, name } => {
             handle_remove(jid, name, dry_run, state, state_path)
         }
+
+        Request::AttachMount(req) => {
+            (handle_attach_mount(req, policy, dry_run, state, state_path), None)
+        }
+
+        Request::DetachMount(req) => {
+            (handle_detach_mount(req, dry_run, state, state_path), None)
+        }
     }
+}
+
+/// Apply a runtime nullfs/tmpfs mount to a live jail's chroot
+/// path. Source goes through the same allow-list as create-time
+/// mounts. Dest is in-jail; we resolve to host-side as
+/// `<jail.path>/<dest>`. The mount lands in the host's mount
+/// table; the jailed processes see it because vnode lookup goes
+/// through the same tree.
+fn handle_attach_mount(
+    req:        AttachMountRequest,
+    policy:     &Policy,
+    dry_run:    bool,
+    state:      &mut PersistentState,
+    state_path: &Path,
+) -> Response {
+    /* Find the jail in state. Without it we don't know the
+     * chroot path and can't compute the host-side mount target. */
+    let jail = match state.jails.iter().find(|j| j.name == req.jail_name) {
+        Some(j) => j.clone(),
+        None => {
+            return Response::PolicyDenied {
+                rule:   "attach.unknown_jail".into(),
+                detail: format!("no jail named {:?} in jaild state", req.jail_name),
+            };
+        }
+    };
+    if jail.path.is_empty() {
+        return Response::PolicyDenied {
+            rule:   "attach.no_jail_path".into(),
+            detail: format!("jail {:?} has no recorded path (V1 state file?); \
+                             recreate the jail to enable AttachMount", req.jail_name),
+        };
+    }
+
+    /* Validate source against the same mount allow-list used at
+     * create time. Reuses validator::validate_mount via a one-mount
+     * MountSpec. */
+    let mount = protocol::MountSpec {
+        source: req.source.clone(),
+        dest:   req.dest.clone(),
+        kind:   req.mount_kind,
+    };
+    if let Err(e) = validator::validate_mount_for_runtime(policy, &mount) {
+        return match e {
+            JaildError::PolicyViolation { rule, detail } =>
+                Response::PolicyDenied { rule: rule.into(), detail },
+            other => Response::Error { detail: format!("{other}") },
+        };
+    }
+
+    /* Resolve in-jail dest → host-side path. dest is expected to
+     * start with '/'; strip exactly one leading '/' to make join
+     * append rather than absolute-replace. */
+    let rel_dest = req.dest.trim_start_matches('/');
+    let host_dest = std::path::Path::new(&jail.path).join(rel_dest);
+    let host_dest_str = host_dest.to_string_lossy().into_owned();
+
+    /* Refuse double-attach on the same dest. */
+    if state.runtime_mounts.iter().any(|m|
+        m.jail_name == req.jail_name && m.dest == req.dest)
+    {
+        return Response::PolicyDenied {
+            rule:   "attach.already_attached".into(),
+            detail: format!("{:?} already has a runtime mount at {:?}",
+                req.jail_name, req.dest),
+        };
+    }
+
+    if dry_run {
+        info!("jaild: dry-run AttachMount jail={} {:?} {} -> {} (host {})",
+            req.jail_name, req.mount_kind, req.source, req.dest, host_dest_str);
+        return Response::Ok;
+    }
+
+    /* mkdir -p the host-side dest before mounting (same logic as
+     * jaild's pdfork-child for create-time mounts). */
+    if let Err(e) = std::fs::create_dir_all(&host_dest) {
+        if e.kind() != std::io::ErrorKind::AlreadyExists {
+            return Response::SyscallFailed {
+                name:  "mkdir".into(),
+                errno: e.raw_os_error().unwrap_or(-1),
+                msg:   format!("mkdir -p {host_dest_str}: {e}"),
+            };
+        }
+    }
+
+    let mount_res = match req.mount_kind {
+        MountKind::RoNullfs => ffi::nullfs_mount(&req.source, &host_dest_str, true),
+        MountKind::RwNullfs => ffi::nullfs_mount(&req.source, &host_dest_str, false),
+        MountKind::Tmpfs    => ffi::tmpfs_mount(&host_dest_str),
+    };
+    if let Err(e) = mount_res {
+        return Response::SyscallFailed {
+            name:  "nmount".into(),
+            errno: e.raw_os_error().unwrap_or(-1),
+            msg:   format!("AttachMount {:?} {} -> {host_dest_str}: {e}",
+                req.mount_kind, req.source),
+        };
+    }
+
+    let kind_str = match req.mount_kind {
+        MountKind::RoNullfs => "ro_nullfs",
+        MountKind::RwNullfs => "rw_nullfs",
+        MountKind::Tmpfs    => "tmpfs",
+    };
+    state.add_runtime_mount(&req.jail_name, &req.source, &req.dest,
+        kind_str, &host_dest_str);
+    if let Err(e) = state.save(state_path) {
+        warn!("jaild: state save after AttachMount: {e}");
+    }
+    info!("jaild: AttachMount jail={} {} {} -> {host_dest_str}",
+        req.jail_name, kind_str, req.source);
+    Response::Ok
+}
+
+/// Undo an AttachMount. Idempotent: a dest that isn't in state
+/// (or whose unmount returns EINVAL = not-mounted) folds to Ok.
+fn handle_detach_mount(
+    req:        DetachMountRequest,
+    dry_run:    bool,
+    state:      &mut PersistentState,
+    state_path: &Path,
+) -> Response {
+    let host_dest = match state.remove_runtime_mount(&req.jail_name, &req.dest) {
+        Some(p) => p,
+        None    => {
+            info!("jaild: DetachMount no record (idempotent ok) jail={} dest={}",
+                req.jail_name, req.dest);
+            return Response::Ok;
+        }
+    };
+
+    if dry_run {
+        info!("jaild: dry-run DetachMount jail={} dest={} host={}",
+            req.jail_name, req.dest, host_dest);
+        // Re-add for symmetry — dry run shouldn't mutate.
+        state.runtime_mounts.push(crate::state::RuntimeMount {
+            jail_name:        req.jail_name.clone(),
+            source:           String::new(),
+            dest:              req.dest.clone(),
+            kind:              String::new(),
+            host_dest:         host_dest.clone(),
+            attached_at_unix:  0,
+        });
+        return Response::Ok;
+    }
+
+    let flags = if req.force { libc::MNT_FORCE } else { 0 };
+    /* SAFETY: c is a valid CStr; flags well-defined. */
+    let c = match std::ffi::CString::new(host_dest.as_str()) {
+        Ok(c) => c,
+        Err(_) => return Response::Error { detail: "NUL in host_dest".into() },
+    };
+    #[allow(unsafe_code)]
+    let rc = unsafe { libc::unmount(c.as_ptr(), flags) };
+    if rc < 0 {
+        let e = std::io::Error::last_os_error();
+        // EINVAL = "not a mount" → fold to Ok (already gone).
+        if e.raw_os_error() != Some(libc::EINVAL) {
+            warn!("jaild: DetachMount unmount {host_dest}: {e}");
+            return Response::SyscallFailed {
+                name:  "unmount".into(),
+                errno: e.raw_os_error().unwrap_or(-1),
+                msg:   format!("{e}"),
+            };
+        }
+    }
+    if let Err(e) = state.save(state_path) {
+        warn!("jaild: state save after DetachMount: {e}");
+    }
+    info!("jaild: DetachMount jail={} dest={} (host {})",
+        req.jail_name, req.dest, host_dest);
+    Response::Ok
 }
 
 /// Internal carrier so handle_create can return both the JSON
@@ -313,7 +494,7 @@ fn handle_create(
     info!("jaild: jail_set OK name={} jid={} lo0_alias={:?}",
         req.name, created.jid, lo0_alias);
 
-    state.add(&req.name, created.jid, lo0_alias);
+    state.add(&req.name, created.jid, lo0_alias, &req.path);
     if let Err(e) = state.save(state_path) {
         /* The kernel has the jail; we just couldn't persist a
          * record. Log loudly but return success to the caller —
@@ -416,16 +597,13 @@ fn handle_create_with_exec(
     info!("jaild: pdfork ok pid={} pdfd={} lo0_alias={:?}",
         pdf.pid, pdf.procdesc_fd, lo0_alias);
 
-    /* If a lo0 alias is held for this jail, track it in state so
-     * a later RemoveJail (by name from the supervisor's
-     * procdesc-EOF handler) can ifconfig -alias it. Exec'd
-     * jails use jid sentinel 0 in state — handle_remove
-     * special-cases this. */
-    if lo0_alias.is_some() {
-        state.add(&req.name, 0, lo0_alias);
-        if let Err(e) = state.save(state_path) {
-            warn!("jaild: state save after exec'd-jail create: {e}");
-        }
+    /* Track every exec'd jail in state — needed for AttachMount
+     * (looks up the jail's chroot path) and for lo0-alias
+     * cleanup at RemoveJail. Exec'd jails use jid sentinel 0;
+     * handle_remove special-cases this. */
+    state.add(&req.name, 0, lo0_alias, &req.path);
+    if let Err(e) = state.save(state_path) {
+        warn!("jaild: state save after exec'd-jail create: {e}");
     }
 
     /* jid not knowable from the parent without enumerating the

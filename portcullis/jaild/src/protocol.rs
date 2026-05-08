@@ -49,8 +49,50 @@ pub enum Request {
         name: Option<String>,
     },
 
+    /// Attach a runtime mount to a jail that already exists.
+    /// Source must be on the policy's mount-source allow-list.
+    /// Dest is interpreted relative to the jail's chroot root —
+    /// jaild prepends the jail's `path` from state. The kernel
+    /// applies the mount in the host namespace; the jail sees it
+    /// inside as the dest path because the lookup goes through
+    /// the same vnode tree (FreeBSD has no per-jail mount ns).
+    /// Recorded in per-jail `runtime_mounts` in state.json so
+    /// DetachMount and crash-recovery can clean up.
+    /// See `docs/spec/storage.md` §6.2.
+    AttachMount(AttachMountRequest),
+
+    /// Detach a runtime mount previously attached via AttachMount.
+    /// Idempotent: a dest that isn't currently mounted returns
+    /// success. `force = true` adds MNT_FORCE.
+    DetachMount(DetachMountRequest),
+
     /// Health check. Returns `Response::Ok` if jaild is alive.
     Ping,
+}
+
+/// Runtime-mount attachment. See `docs/spec/storage.md` §6.2.
+///
+/// Note: the `MountKind` field is named `mount_kind` rather than
+/// `kind` to avoid colliding with the Request enum's
+/// `#[serde(tag = "kind")]` discriminator (which is flattened
+/// over this struct's fields by serde for tuple-variant enums).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AttachMountRequest {
+    pub jail_name:  String,
+    pub source:     String,
+    /// Path inside the jail's chroot. e.g. `/var/projects`.
+    pub dest:       String,
+    pub mount_kind: MountKind,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DetachMountRequest {
+    pub jail_name: String,
+    /// In-jail dest, same value used at AttachMount time. jaild
+    /// re-prepends the jail's chroot path internally.
+    pub dest:      String,
+    #[serde(default)]
+    pub force:     bool,
 }
 
 /// Create-jail spec.

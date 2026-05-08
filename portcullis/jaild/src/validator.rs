@@ -193,6 +193,12 @@ fn validate_children_max(n: u32, policy: &Policy) -> Result<(), JaildError> {
     Ok(())
 }
 
+/// Public re-export so AttachMount handlers can validate a single
+/// runtime mount against the same allow-list used at create time.
+pub fn validate_mount_for_runtime(policy: &Policy, m: &MountSpec) -> Result<(), JaildError> {
+    validate_mount(m, policy)
+}
+
 fn validate_mount(m: &MountSpec, policy: &Policy) -> Result<(), JaildError> {
     /* dest is a path inside the jail's chroot. Reject `..` and
      * empty (we don't enforce absolute — relative is fine and

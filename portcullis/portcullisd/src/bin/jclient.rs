@@ -16,7 +16,8 @@
 use std::process::ExitCode;
 
 use jaild::protocol::{
-    CreateJailRequest, EnvPair, ExecSpec, NetworkConfig, Request, Response,
+    AttachMountRequest, CreateJailRequest, DetachMountRequest, EnvPair,
+    ExecSpec, MountKind, NetworkConfig, Request, Response,
 };
 use portcullisd::jaild_client::Client;
 
@@ -27,6 +28,10 @@ usage:
   atrium-portcullisd-jclient <socket> create <name> <path> [<children_max>]
   atrium-portcullisd-jclient <socket> remove <jid>
   atrium-portcullisd-jclient <socket> exec <name> <path> <bin> [<arg>...]
+  atrium-portcullisd-jclient <socket> attach <jail> <source> <dest> <kind>
+  atrium-portcullisd-jclient <socket> detach <jail> <dest> [force]
+
+kind = ro_nullfs | rw_nullfs | tmpfs
 ");
     ExitCode::from(2)
 }
@@ -92,6 +97,30 @@ fn main() -> ExitCode {
                     uid:  1001,
                     gid:  1001,
                 }),
+            })
+        }
+        "attach" => {
+            if rest.len() < 4 { return usage(); }
+            let kind = match rest[3].as_str() {
+                "ro_nullfs" => MountKind::RoNullfs,
+                "rw_nullfs" => MountKind::RwNullfs,
+                "tmpfs"     => MountKind::Tmpfs,
+                _ => { eprintln!("bad kind: {:?}", rest[3]); return usage(); }
+            };
+            Request::AttachMount(AttachMountRequest {
+                jail_name:  rest[0].clone(),
+                source:     rest[1].clone(),
+                dest:       rest[2].clone(),
+                mount_kind: kind,
+            })
+        }
+        "detach" => {
+            if rest.len() < 2 { return usage(); }
+            let force = rest.get(2).map(|s| s == "force").unwrap_or(false);
+            Request::DetachMount(DetachMountRequest {
+                jail_name: rest[0].clone(),
+                dest:      rest[1].clone(),
+                force,
             })
         }
         _ => return usage(),

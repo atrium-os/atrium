@@ -45,6 +45,10 @@ pub struct PersistentState {
     pub written_at_unix: u64,
     #[serde(default)]
     pub jails: Vec<JailRecord>,
+    /// Runtime mounts attached on a per-jail basis after the jail
+    /// was created. See `docs/spec/storage.md` §6.2.
+    #[serde(default)]
+    pub runtime_mounts: Vec<RuntimeMount>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -58,6 +62,26 @@ pub struct JailRecord {
     /// On RemoveJail this is what gets `ifconfig -alias`d.
     #[serde(default)]
     pub lo0_alias:       Option<String>,
+    /// Jail chroot path on the host. Used by AttachMount to
+    /// resolve in-jail dest paths. Empty for V1 records loaded
+    /// from a pre-V2 state file; AttachMount returns an error
+    /// in that case.
+    #[serde(default)]
+    pub path:            String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RuntimeMount {
+    pub jail_name:        String,
+    pub source:           String,
+    /// In-jail dest path, e.g. `/var/projects`. The host-side
+    /// mount point is `<jail.path>/<this dest>` — derived at
+    /// detach time from the JailRecord's path (which we don't
+    /// currently store; AttachMount looks it up per-call).
+    pub dest:             String,
+    pub kind:             String,    // "ro_nullfs" / "rw_nullfs" / "tmpfs"
+    pub host_dest:        String,    // resolved <jail_path>/<dest>
+    pub attached_at_unix: u64,
 }
 
 impl PersistentState {
@@ -66,6 +90,7 @@ impl PersistentState {
             schema_version: SCHEMA_VERSION,
             written_at_unix: now_unix(),
             jails: Vec::new(),
+            runtime_mounts: Vec::new(),
         }
     }
 
@@ -122,14 +147,44 @@ impl PersistentState {
         Ok(())
     }
 
-    pub fn add(&mut self, name: &str, jid: i32, lo0_alias: Option<String>) {
+    pub fn add(&mut self, name: &str, jid: i32, lo0_alias: Option<String>, path: &str) {
         self.jails.push(JailRecord {
             name: name.to_string(),
             jid,
             created_at_unix: now_unix(),
             lo0_alias,
+            path: path.to_string(),
         });
         self.written_at_unix = now_unix();
+    }
+
+    pub fn add_runtime_mount(
+        &mut self,
+        jail_name: &str,
+        source:    &str,
+        dest:      &str,
+        kind:      &str,
+        host_dest: &str,
+    ) {
+        self.runtime_mounts.push(RuntimeMount {
+            jail_name:        jail_name.to_string(),
+            source:           source.to_string(),
+            dest:             dest.to_string(),
+            kind:             kind.to_string(),
+            host_dest:        host_dest.to_string(),
+            attached_at_unix: now_unix(),
+        });
+        self.written_at_unix = now_unix();
+    }
+
+    /// Remove the runtime-mount record matching jail_name + dest.
+    /// Returns the removed record's host_dest if any.
+    pub fn remove_runtime_mount(&mut self, jail_name: &str, dest: &str) -> Option<String> {
+        let pos = self.runtime_mounts.iter()
+            .position(|m| m.jail_name == jail_name && m.dest == dest)?;
+        let m = self.runtime_mounts.remove(pos);
+        self.written_at_unix = now_unix();
+        Some(m.host_dest)
     }
 
     pub fn remove_by_jid(&mut self, jid: i32) -> bool {
@@ -172,8 +227,8 @@ mod tests {
         let p = dir.path().join("state.toml");
 
         let mut st = PersistentState::empty();
-        st.add("atrium-foo", 7, None);
-        st.add("atrium-bar", 8, None);
+        st.add("atrium-foo", 7, None, "/");
+        st.add("atrium-bar", 8, None, "/");
         st.save(&p).unwrap();
 
         let back = PersistentState::load(&p).unwrap();
@@ -186,8 +241,8 @@ mod tests {
     #[test]
     fn remove_by_jid_works() {
         let mut st = PersistentState::empty();
-        st.add("atrium-a", 1, None);
-        st.add("atrium-b", 2, None);
+        st.add("atrium-a", 1, None, "/");
+        st.add("atrium-b", 2, None, "/");
         assert!(st.remove_by_jid(1));
         assert!(!st.has_name("atrium-a"));
         assert!(st.has_name("atrium-b"));
@@ -211,7 +266,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let p = dir.path().join("state.toml");
         let mut st = PersistentState::empty();
-        st.add("atrium-x", 5, None);
+        st.add("atrium-x", 5, None, "/");
         st.save(&p).unwrap();
         let mut tmp = p.clone();
         tmp.set_extension("toml.tmp");
