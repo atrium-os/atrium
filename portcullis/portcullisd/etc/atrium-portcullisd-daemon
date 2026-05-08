@@ -1,0 +1,104 @@
+#!/bin/sh
+# PROVIDE: atrium_portcullisd_daemon
+# REQUIRE: FILESYSTEMS atrium_jaild
+# KEYWORD: shutdown
+#
+# atrium-portcullisd-daemon — long-running aqueduct service for
+# capability-mediated runtime mount requests. Per-spec, this is
+# the only jaild client for AttachMount/DetachMount; in-jail
+# services talk to it via the per-capability socket bind-mount
+# at /atrium/sockets/portcullisd/portcullisd.sock.
+#
+# Spec: docs/spec/storage.md §6.2, docs/spec/aqueduct.md §6.
+#
+# Add to /etc/rc.conf:
+#   atrium_portcullisd_daemon_enable="YES"
+#
+# Optional:
+#   atrium_portcullisd_daemon_socket="/var/run/atrium/caps/portcullisd/portcullisd.sock"
+#   atrium_portcullisd_daemon_jaild_socket="/var/run/atrium/jaild.sock"
+#   atrium_portcullisd_daemon_services_dir="/etc/atrium/services.d"
+#   atrium_portcullisd_daemon_logfile="/var/log/atrium/portcullisd-daemon.log"
+#   atrium_portcullisd_daemon_log_level="info"
+
+. /etc/rc.subr
+
+name="atrium_portcullisd_daemon"
+desc="Atrium portcullisd capability mediator (aqueduct)"
+rcvar="${name}_enable"
+
+load_rc_config "$name"
+
+: ${atrium_portcullisd_daemon_enable:="NO"}
+: ${atrium_portcullisd_daemon_socket:="/var/run/atrium/caps/portcullisd/portcullisd.sock"}
+: ${atrium_portcullisd_daemon_jaild_socket:="/var/run/atrium/jaild.sock"}
+: ${atrium_portcullisd_daemon_services_dir:="/etc/atrium/services.d"}
+: ${atrium_portcullisd_daemon_logfile:="/var/log/atrium/portcullisd-daemon.log"}
+: ${atrium_portcullisd_daemon_log_level:="info"}
+
+command="/usr/local/bin/atrium-portcullisd-daemon"
+command_args="--socket ${atrium_portcullisd_daemon_socket} \
+              --jaild-socket ${atrium_portcullisd_daemon_jaild_socket} \
+              --services-dir ${atrium_portcullisd_daemon_services_dir}"
+pidfile="/var/run/atrium/portcullisd-daemon.pid"
+
+start_cmd="atrium_portcullisd_daemon_start"
+stop_cmd="atrium_portcullisd_daemon_stop"
+status_cmd="atrium_portcullisd_daemon_status"
+
+atrium_portcullisd_daemon_prepare_dirs() {
+    install -d -m 0755 -o root -g wheel /var/run/atrium
+    install -d -m 0755 -o root -g wheel /var/run/atrium/caps
+    # Per-capability dir (mode 0755 so the socket inside it can be
+    # found via path traversal from inside the jail's bind-mount).
+    install -d -m 0755 -o root -g wheel /var/run/atrium/caps/portcullisd
+    install -d -m 0755 -o root -g wheel /var/log/atrium
+}
+
+atrium_portcullisd_daemon_start() {
+    atrium_portcullisd_daemon_prepare_dirs
+
+    if [ ! -d "${atrium_portcullisd_daemon_services_dir}" ]; then
+        err 1 "services dir ${atrium_portcullisd_daemon_services_dir} missing"
+    fi
+    if [ ! -S "${atrium_portcullisd_daemon_jaild_socket}" ]; then
+        err 1 "jaild socket ${atrium_portcullisd_daemon_jaild_socket} not present; is atrium_jaild running?"
+    fi
+
+    echo "Starting ${name}."
+    /usr/sbin/daemon -f -p "${pidfile}" \
+        -o "${atrium_portcullisd_daemon_logfile}" \
+        -t "${name}" \
+        env RUST_LOG="${atrium_portcullisd_daemon_log_level}" \
+        "${command}" ${command_args}
+}
+
+atrium_portcullisd_daemon_stop() {
+    if [ ! -s "${pidfile}" ]; then
+        echo "${name} not running (no pidfile)."
+        return 0
+    fi
+    pid=$(cat "${pidfile}")
+    echo "Stopping ${name}."
+    kill -TERM "${pid}" 2>/dev/null
+    for _ in 1 2 3 4 5; do
+        if kill -0 "${pid}" 2>/dev/null; then sleep 1; else break; fi
+    done
+    if kill -0 "${pid}" 2>/dev/null; then
+        echo "Force-killing ${name}."
+        kill -KILL "${pid}" 2>/dev/null
+    fi
+    rm -f "${pidfile}"
+    rm -f "${atrium_portcullisd_daemon_socket}"
+}
+
+atrium_portcullisd_daemon_status() {
+    if [ -s "${pidfile}" ] && kill -0 "$(cat "${pidfile}")" 2>/dev/null; then
+        echo "${name} is running as pid $(cat "${pidfile}")."
+        return 0
+    fi
+    echo "${name} is not running."
+    return 1
+}
+
+run_rc_command "$1"

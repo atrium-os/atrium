@@ -1,0 +1,94 @@
+#!/bin/sh
+# PROVIDE: atrium_volumes
+# REQUIRE: FILESYSTEMS atrium_jaild
+# KEYWORD: shutdown
+#
+# atrium-volumes — per-jail volume allocation broker. Companion
+# to atrium-jaild: jaild owns mount operations, atrium-volumes
+# owns allocation of what gets mounted (Tessera-backed
+# directories, ZFS datasets, plain mkdir, tmpfs).
+#
+# Spec: docs/spec/atrium-volumes.md, docs/spec/storage.md.
+#
+# Add to /etc/rc.conf:
+#   atrium_volumes_enable="YES"
+#
+# Optional:
+#   atrium_volumes_policy="/etc/atrium/volumes.policy.toml"
+#   atrium_volumes_socket="/var/run/atrium/atrium-volumes.sock"
+#   atrium_volumes_state="/var/db/atrium/atrium-volumes.state.json"
+#   atrium_volumes_logfile="/var/log/atrium/atrium-volumes.log"
+#   atrium_volumes_log_level="info"
+
+. /etc/rc.subr
+
+name="atrium_volumes"
+desc="Atrium volume allocation broker"
+rcvar="${name}_enable"
+
+load_rc_config "$name"
+
+: ${atrium_volumes_enable:="NO"}
+: ${atrium_volumes_policy:="/etc/atrium/volumes.policy.toml"}
+: ${atrium_volumes_socket:="/var/run/atrium/atrium-volumes.sock"}
+: ${atrium_volumes_state:="/var/db/atrium/atrium-volumes.state.json"}
+: ${atrium_volumes_logfile:="/var/log/atrium/atrium-volumes.log"}
+: ${atrium_volumes_log_level:="info"}
+
+command="/usr/local/bin/atrium-volumes"
+command_args="serve --policy ${atrium_volumes_policy} --socket ${atrium_volumes_socket} --state ${atrium_volumes_state}"
+pidfile="/var/run/atrium/atrium-volumes.pid"
+
+start_cmd="atrium_volumes_start"
+stop_cmd="atrium_volumes_stop"
+status_cmd="atrium_volumes_status"
+
+atrium_volumes_prepare_dirs() {
+    install -d -m 0755 -o root -g wheel /var/run/atrium
+    install -d -m 0755 -o root -g wheel /var/db/atrium
+    install -d -m 0755 -o root -g wheel /var/log/atrium
+}
+
+atrium_volumes_start() {
+    atrium_volumes_prepare_dirs
+    if [ ! -f "${atrium_volumes_policy}" ]; then
+        err 1 "policy file ${atrium_volumes_policy} missing"
+    fi
+
+    echo "Starting ${name}."
+    /usr/sbin/daemon -f -p "${pidfile}" \
+        -o "${atrium_volumes_logfile}" \
+        -t "${name}" \
+        env RUST_LOG="${atrium_volumes_log_level}" \
+        "${command}" ${command_args}
+}
+
+atrium_volumes_stop() {
+    if [ ! -s "${pidfile}" ]; then
+        echo "${name} not running (no pidfile)."
+        return 0
+    fi
+    pid=$(cat "${pidfile}")
+    echo "Stopping ${name}."
+    kill -TERM "${pid}" 2>/dev/null
+    for _ in 1 2 3 4 5; do
+        if kill -0 "${pid}" 2>/dev/null; then sleep 1; else break; fi
+    done
+    if kill -0 "${pid}" 2>/dev/null; then
+        echo "Force-killing ${name}."
+        kill -KILL "${pid}" 2>/dev/null
+    fi
+    rm -f "${pidfile}"
+    rm -f "${atrium_volumes_socket}"
+}
+
+atrium_volumes_status() {
+    if [ -s "${pidfile}" ] && kill -0 "$(cat "${pidfile}")" 2>/dev/null; then
+        echo "${name} is running as pid $(cat "${pidfile}")."
+        return 0
+    fi
+    echo "${name} is not running."
+    return 1
+}
+
+run_rc_command "$1"
