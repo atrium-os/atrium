@@ -121,6 +121,18 @@ on either side, it was clearly a timer, not a wake-up issue.
 | MoltenVK per-submit encode cost | 0.16 ms p50 inside MVK | ❌ < 1% of budget |
 | Metal GPU exec | 0.48 ms p50 | ❌ < 1% of budget |
 
+**Post-fix verification with all "ruled out" mitigations reverted**
+(virglrenderer back to defaults: `render-server-worker=process`,
+no QoS bumps): same ~250–300 µs steady-state per-frame. Confirms
+the QEMU async-fence-cb patch is the **only** load-bearing change.
+Reverted QoS / worker-mode changes are kept out of upstream.
+
+```
+frame 30: 250 µs (4000 fps cap)
+frame 60: 301 µs (3300 fps cap)
+frame 90: 240 µs (4150 fps cap)
+```
+
 ## Files
 
 - `merged.json` — Chrome Trace JSON of the post-fix run (572 events; mostly
