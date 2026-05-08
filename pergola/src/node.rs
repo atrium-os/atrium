@@ -86,3 +86,121 @@ impl NodeTree {
     pub fn len(&self) -> usize { self.nodes.iter().filter(|n| n.is_some()).count() }
     pub fn is_empty(&self) -> bool { self.len() == 0 }
 }
+
+/// A single change between two `NodeTree`s. The diff pass produces a
+/// stream of these; on phase-4 wire integration these will translate
+/// into `SCENE_NODE_SET` / `SCENE_NODE_CLEAR` envelopes via fresco-client.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NodeDelta {
+    /// Node id was not present in the previous tree.
+    Added { id: NodeId, node: Node, parent: Option<NodeId> },
+    /// Node id existed but its payload changed.
+    Changed { id: NodeId, node: Node },
+    /// Node id was present in the previous tree but not in the new one.
+    Removed { id: NodeId },
+}
+
+/// Compute the minimal delta list between `prev` and `next`. The
+/// algorithm is positional: a NodeId in the new tree is "the same"
+/// node as that NodeId in the previous tree. View code that allocates
+/// stable ids therefore gets stable diffs.
+///
+/// This is the simple textbook diff — O(n) — appropriate while node
+/// counts are in the thousands. Keyed reconciliation (React-style) can
+/// layer on top later if collection-of-children patterns demand it.
+pub fn diff(prev: &NodeTree, next: &NodeTree) -> Vec<NodeDelta> {
+    let mut deltas = Vec::new();
+    let max = prev.nodes.len().max(next.nodes.len());
+
+    for i in 0..max {
+        let p = prev.nodes.get(i).and_then(|n| n.as_ref());
+        let n = next.nodes.get(i).and_then(|n| n.as_ref());
+        let id = NodeId(i as u32);
+
+        match (p, n) {
+            (None, Some(node)) => {
+                let parent = next.parent.get(i).copied().flatten();
+                deltas.push(NodeDelta::Added { id, node: node.clone(), parent });
+            }
+            (Some(_), None) => {
+                deltas.push(NodeDelta::Removed { id });
+            }
+            (Some(a), Some(b)) if a != b => {
+                deltas.push(NodeDelta::Changed { id, node: b.clone() });
+            }
+            _ => {} // unchanged or both empty
+        }
+    }
+
+    deltas
+}
+
+#[cfg(test)]
+mod diff_tests {
+    use super::*;
+    use crate::color::Color;
+    use crate::geom::Rect;
+
+    #[test]
+    fn empty_to_empty_is_noop() {
+        let prev = NodeTree::new();
+        let next = NodeTree::new();
+        assert!(diff(&prev, &next).is_empty());
+    }
+
+    #[test]
+    fn add_one_node() {
+        let prev = NodeTree::new();
+        let mut next = NodeTree::new();
+        let id = next.insert(None, Node::Rect {
+            rect: Rect::new(0.0, 0.0, 10.0, 10.0),
+            fill: Color::rgba(1.0, 0.0, 0.0, 1.0),
+            radius: 0.0,
+        });
+        let d = diff(&prev, &next);
+        assert_eq!(d.len(), 1);
+        match &d[0] {
+            NodeDelta::Added { id: did, .. } => assert_eq!(*did, id),
+            _ => panic!("expected Added"),
+        }
+    }
+
+    #[test]
+    fn change_one_node() {
+        let mut prev = NodeTree::new();
+        let id = prev.insert(None, Node::Rect {
+            rect: Rect::new(0.0, 0.0, 10.0, 10.0),
+            fill: Color::rgba(1.0, 0.0, 0.0, 1.0),
+            radius: 0.0,
+        });
+        let mut next = NodeTree::new();
+        next.insert(None, Node::Rect {
+            rect: Rect::new(0.0, 0.0, 10.0, 10.0),
+            fill: Color::rgba(0.0, 1.0, 0.0, 1.0),  // green now
+            radius: 0.0,
+        });
+        let d = diff(&prev, &next);
+        assert_eq!(d.len(), 1);
+        match &d[0] {
+            NodeDelta::Changed { id: did, .. } => assert_eq!(*did, id),
+            _ => panic!("expected Changed"),
+        }
+    }
+
+    #[test]
+    fn unchanged_is_no_delta() {
+        let mut a = NodeTree::new();
+        a.insert(None, Node::Rect {
+            rect: Rect::new(0.0, 0.0, 10.0, 10.0),
+            fill: Color::rgba(1.0, 0.0, 0.0, 1.0),
+            radius: 0.0,
+        });
+        let mut b = NodeTree::new();
+        b.insert(None, Node::Rect {
+            rect: Rect::new(0.0, 0.0, 10.0, 10.0),
+            fill: Color::rgba(1.0, 0.0, 0.0, 1.0),
+            radius: 0.0,
+        });
+        assert!(diff(&a, &b).is_empty());
+    }
+}

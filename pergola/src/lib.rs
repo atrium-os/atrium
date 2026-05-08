@@ -22,13 +22,17 @@
 //! stdout. Wire-protocol emission (the actual `fresco-client` calls)
 //! lands in phase 4 alongside the `Window` API.
 
+pub mod app;
 pub mod color;
 pub mod geom;
 pub mod node;
+pub mod reactive;
 pub mod theme;
 pub mod view;
 
+pub use app::App;
 pub use color::Color;
 pub use geom::{Point, Rect, Size};
-pub use node::{Node, NodeId, NodeTree};
+pub use node::{diff, Node, NodeDelta, NodeId, NodeTree};
+pub use reactive::Mutable;
 pub use view::{render, Ctx, View};

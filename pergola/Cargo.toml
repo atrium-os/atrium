@@ -13,6 +13,7 @@ path = "src/lib.rs"
 [dependencies]
 fresco-client   = { path = "../fresco-client" }
 fresco-protocol = { path = "../fresco-protocol" }
+futures-signals = "0.3"
 log             = "0.4"
 
 [dev-dependencies]

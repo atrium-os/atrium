@@ -120,6 +120,7 @@ pub enum Mode {
 /// Semantic color tokens. **Widgets use these, never `palette::*`
 /// directly.** Switching `Mode` flips the entire UI between light
 /// and dark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Semantic {
     pub mode: Mode,
 }
