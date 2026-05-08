@@ -34,7 +34,7 @@ use log::{error, info, warn};
 use portcullisd::host_mount;
 use portcullisd::init_phase::{self, InitOutcome};
 use portcullisd::jaild_client::Client;
-use portcullisd::supervisor::Supervisor;
+use portcullisd::supervisor::{self, Supervisor};
 use portcullisd::system_services::{self, LoadOutcome, ManifestVolumeKind, ServiceManifest};
 use portcullisd::volumes_client;
 
@@ -67,6 +67,18 @@ fn main() -> ExitCode {
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("info"),
     ).init();
+
+    /* Catch SIGTERM / SIGINT so the supervisor can run its
+     * graceful-shutdown path (close procdescs, unmount each
+     * service's mounts, RemoveJail) before we exit. Without
+     * this, kqueue blocks forever and a service-stop SIGKILLs
+     * us, leaking host-namespace mounts. The handler installs
+     * before we open any sockets so we don't miss an early
+     * SIGTERM during init. */
+    if let Err(e) = supervisor::install_shutdown_handlers() {
+        error!("install signal handlers: {e}");
+        return ExitCode::FAILURE;
+    }
 
     let mut socket_path     = PathBuf::from(DEFAULT_SOCKET);
     let mut volumes_socket  = Some(PathBuf::from(DEFAULT_VOLUMES_SOCKET));

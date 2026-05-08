@@ -27,12 +27,17 @@ children_max  = 0
 devfs_ruleset = 0
 
 [exec]
+# attach + linger 60s. The linger gives a SIGTERM-driven
+# shutdown smoke time to interrupt before the service exits
+# naturally. With restart="never" and a normal aq exit, the
+# service still retires cleanly after the sleep ends.
 path = "/usr/local/bin/atrium-portcullisd-aq"
 argv = ["atrium-portcullisd-aq",
         "attach", "atrium-aq-photoeditor",
         "/var/lib/atrium/storage/jails/atrium-attach-source",
         "/atrium-via-aq",
-        "rw_nullfs"]
+        "rw_nullfs",
+        "--sleep-after", "60"]
 uid  = 1001
 gid  = 1001
 

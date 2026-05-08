@@ -21,7 +21,42 @@
 
 use std::collections::VecDeque;
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+/// Set by the SIGTERM/SIGINT handler installed by
+/// `install_shutdown_handlers`. Polled at the top of every
+/// `run()` iteration; when set, the supervisor enters its
+/// graceful-shutdown path (close procdescs, RemoveJail, unmount,
+/// then exit cleanly).
+///
+/// Lives at the module level so the C signal handler can reach
+/// it without an instance pointer (which would be unsafe to share
+/// with a signal handler anyway). Single-process model: one
+/// supervisor per process, so a static is fine.
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Install SIGTERM + SIGINT handlers that flip the shutdown flag.
+/// Call once at process start. Idempotent across re-installs.
+///
+/// The handler does only an atomic store — signal-safe by trivial
+/// inspection. Unblocking the kqueue wait_for_event is handled by
+/// the wait's 1s timeout polling the flag in `run()`.
+pub fn install_shutdown_handlers() -> io::Result<()> {
+    extern "C" fn handler(_sig: libc::c_int) {
+        SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+    }
+    #[allow(unsafe_code)]
+    unsafe {
+        for sig in [libc::SIGTERM, libc::SIGINT] {
+            let rc = libc::signal(sig, handler as *const () as libc::sighandler_t);
+            if rc == libc::SIG_ERR {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
+    Ok(())
+}
 
 use jaild::protocol::{CreateJailRequest, Request, Response};
 use log::{debug, error, info, warn};
@@ -299,13 +334,30 @@ impl Supervisor {
 
     /// Block forever, restarting services per their manifest
     /// policy. Returns when there are no more supervised
-    /// services (all have retired into "never restart" state).
+    /// services (all have retired into "never restart" state)
+    /// OR a shutdown signal flips `SHUTDOWN_REQUESTED`.
     pub fn run(&mut self) -> io::Result<()> {
         while self.services.iter().any(|s| !s.retired) {
+            if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+                info!("supervisor: shutdown signal received; tearing down \
+                       {} live service(s)", self.watched_count());
+                self.graceful_shutdown();
+                return Ok(());
+            }
             /* Bound the wait so that pending burst-cooldowns
-             * get re-checked. 1s is fine; the cost is one
+             * get re-checked AND the shutdown flag is polled at
+             * least once per second. 1s is fine; the cost is one
              * extra kevent call per second when idle. */
-            let evs = ffi::wait_for_event(self.kq, Some(Duration::from_secs(1)))?;
+            let evs = match ffi::wait_for_event(self.kq, Some(Duration::from_secs(1))) {
+                Ok(e)  => e,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                    /* Signal interrupted the kevent wait; loop
+                     * back so the SHUTDOWN_REQUESTED check at
+                     * the top of the loop runs immediately. */
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             for ev in evs {
                 if ev.fflags & libc::NOTE_EXIT == 0 {
                     debug!("kevent fflags={:#x} data={} udata={}",
@@ -328,6 +380,55 @@ impl Supervisor {
         }
         info!("supervisor: all services retired; exit");
         Ok(())
+    }
+
+    /// Walk all live services, kill each (close procdesc),
+    /// unmount their host-namespace mounts, and ask jaild to
+    /// RemoveJail them. RemoveJail also drops any AttachMount-
+    /// applied runtime mounts on jaild's side (since 56183b5+).
+    /// Best-effort; a per-service failure is logged but doesn't
+    /// abort the rest of the shutdown.
+    fn graceful_shutdown(&mut self) {
+        let live_indices: Vec<usize> = (0..self.services.len())
+            .filter(|&i| !self.services[i].retired)
+            .collect();
+
+        for idx in live_indices {
+            let name = self.services[idx].manifest.name.clone();
+            info!("supervisor: shutting down {}", name);
+
+            let pdfd = self.services[idx].procdesc_fd;
+            if pdfd >= 0 {
+                /* Close → kernel SIGKILLs the jailed proc + reaps
+                 * the persist=0 jail. */
+                let _ = ffi::close_fd(pdfd);
+                self.services[idx].procdesc_fd = -1;
+            }
+
+            /* Unmount this service's create-time mounts (the
+             * runtime AttachMount-applied ones are jaild-side
+             * and get cleaned by RemoveJail below). */
+            let mounts = self.services[idx].create_req.mounts.clone();
+            for m in &mounts {
+                if let Err(e) = host_mount::unmount(&m.dest) {
+                    warn!("{}: shutdown unmount {:?} {}: {e}", name, m.kind, m.dest);
+                }
+            }
+
+            /* RemoveJail-by-name: clears jaild state, lo0 alias,
+             * runtime mounts. Idempotent. */
+            let req = Request::RemoveJail { jid: None, name: Some(name.clone()) };
+            match self.ensure_client() {
+                Ok(c) => match c.send(&req) {
+                    Ok(_) => {}
+                    Err(e) => warn!("{}: shutdown RemoveJail rpc: {e}", name),
+                },
+                Err(e) => warn!("{}: shutdown reconnect to jaild: {e}", name),
+            }
+
+            self.services[idx].retired = true;
+        }
+        info!("supervisor: graceful shutdown complete");
     }
 
     fn handle_exit(&mut self, idx: usize, exit_status: i32) {

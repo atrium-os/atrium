@@ -34,8 +34,10 @@ const DEFAULT_SOCKET: &str = "/atrium/sockets/portcullisd/portcullisd.sock";
 fn usage() -> ExitCode {
     eprintln!("\
 usage:
-  atrium-portcullisd-aq attach <jail> <source> <dest> <kind> [--socket <path>]
-  atrium-portcullisd-aq detach <jail> <dest> [force] [--socket <path>]
+  atrium-portcullisd-aq attach <jail> <source> <dest> <kind>
+        [--socket <path>] [--sleep-after <secs>]
+  atrium-portcullisd-aq detach <jail> <dest> [force]
+        [--socket <path>] [--sleep-after <secs>]
 
 kind = ro_nullfs | rw_nullfs | tmpfs
 
@@ -51,6 +53,11 @@ fn main() -> ExitCode {
     let cmd = raw[0].clone();
 
     let mut socket_path = PathBuf::from(DEFAULT_SOCKET);
+    /* Keep-alive after the RPC completes — useful for shutdown
+     * smoke tests where the supervisor needs a still-running
+     * service to interrupt with SIGTERM. None = exit
+     * immediately. */
+    let mut sleep_after: Option<u64> = None;
     let mut positional: Vec<String> = Vec::new();
     let mut i = 1;
     while i < raw.len() {
@@ -58,6 +65,14 @@ fn main() -> ExitCode {
             "--socket" => {
                 let Some(v) = raw.get(i + 1) else { return usage(); };
                 socket_path = v.into();
+                i += 2;
+            }
+            "--sleep-after" => {
+                let Some(v) = raw.get(i + 1) else { return usage(); };
+                sleep_after = match v.parse() {
+                    Ok(n)  => Some(n),
+                    Err(_) => { eprintln!("--sleep-after: not a number"); return usage(); }
+                };
                 i += 2;
             }
             other if other.starts_with("--") => {
@@ -133,8 +148,16 @@ fn main() -> ExitCode {
         Err(e) => { eprintln!("decode reply: {e}"); return ExitCode::FAILURE; }
     };
     println!("{}", serde_json::to_string_pretty(&reply).unwrap_or_default());
-    match reply {
+    let exit_code = match reply {
         MountReply::Ok => ExitCode::SUCCESS,
         _ => ExitCode::FAILURE,
+    };
+
+    /* Optional keep-alive. Finite sleep so a runaway smoke
+     * still terminates eventually. SIGTERM during the sleep
+     * unblocks the syscall and the process exits naturally. */
+    if let Some(secs) = sleep_after {
+        std::thread::sleep(std::time::Duration::from_secs(secs));
     }
+    exit_code
 }

@@ -468,8 +468,48 @@ fn handle_remove(
     }
 
     /* Drop the state entry. */
-    if let Some(i) = record_idx {
+    let jail_name_for_runtime_cleanup = if let Some(i) = record_idx {
+        let n = state.jails[i].name.clone();
         state.jails.remove(i);
+        Some(n)
+    } else {
+        name.clone()
+    };
+
+    /* Drop any runtime mounts that targeted this jail. Without
+     * this, AttachMount-applied mounts orphan in state +
+     * (after the next jaild restart) get caught by the
+     * orphan-reconcile path — but that's seconds-to-minutes of
+     * lag during which the host's mount table holds dead
+     * entries. Cleaning here closes the window for graceful
+     * shutdowns where RemoveJail runs before jaild dies. */
+    if let Some(jname) = &jail_name_for_runtime_cleanup {
+        let to_drop: Vec<crate::state::RuntimeMount> = state.runtime_mounts.iter()
+            .filter(|m| &m.jail_name == jname)
+            .cloned()
+            .collect();
+        for m in &to_drop {
+            // Best-effort unmount.
+            if let Ok(c) = std::ffi::CString::new(m.host_dest.as_str()) {
+                #[allow(unsafe_code)]
+                let rc = unsafe { libc::unmount(c.as_ptr(), 0) };
+                if rc < 0 {
+                    let e = std::io::Error::last_os_error();
+                    if e.raw_os_error() != Some(libc::EINVAL) {
+                        warn!("jaild: RemoveJail runtime-mount unmount {}: {e}",
+                            m.host_dest);
+                    }
+                }
+            }
+        }
+        if !to_drop.is_empty() {
+            state.runtime_mounts.retain(|m| &m.jail_name != jname);
+            info!("jaild: RemoveJail dropped {} runtime mount(s) for {}",
+                to_drop.len(), jname);
+        }
+    }
+
+    if record_idx.is_some() || !state.runtime_mounts.is_empty() {
         if let Err(e) = state.save(state_path) {
             warn!("jaild: state save after remove: {e}");
         }
