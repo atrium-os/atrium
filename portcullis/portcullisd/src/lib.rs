@@ -9,6 +9,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod host_mount;
 pub mod init_phase;
 pub mod jaild_client;
 pub mod supervisor;

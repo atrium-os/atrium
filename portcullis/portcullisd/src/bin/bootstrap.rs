@@ -31,6 +31,7 @@ use std::time::Duration;
 
 use jaild::protocol::{EnvPair, ExecSpec, MountKind, MountSpec, Request, Response};
 use log::{error, info, warn};
+use portcullisd::host_mount;
 use portcullisd::init_phase::{self, InitOutcome};
 use portcullisd::jaild_client::Client;
 use portcullisd::supervisor::Supervisor;
@@ -164,7 +165,13 @@ fn main() -> ExitCode {
             }
         }
     };
-    let mut held_fds: Vec<i32> = Vec::new();
+    /* In --once mode each exec'd jail's procdesc fd is held here
+     * until process exit; on drop the kernel closes it and the
+     * persist=0 jail dies. We also remember the jail's mount
+     * destinations + name so we can RemoveJail and unmount the
+     * leaked host-namespace mounts before exiting. */
+    struct HeldJail { fd: i32, name: String, mount_dests: Vec<(String, MountKind)> }
+    let mut held: Vec<HeldJail> = Vec::new();
     let mut launch_failures = 0;
 
     'manifest: for m in enabled {
@@ -240,6 +247,13 @@ fn main() -> ExitCode {
             }
         }
 
+        /* Capture mount dests now — Once mode needs them at
+         * teardown, and after CreateJail we drop create_req. */
+        let mount_dests: Vec<(String, MountKind)> = create_req.mounts.iter()
+            .map(|x| (x.dest.clone(), x.kind))
+            .collect();
+        let jail_name_for_held = create_req.name.clone();
+
         let req = Request::CreateJail(create_req);
         let send_result = match &mut driver {
             Driver::Once(c)       => c.send(&req),
@@ -256,7 +270,9 @@ fn main() -> ExitCode {
                             launch_failures += 1;
                         }
                     }
-                    (Some(fd), Driver::Once(_)) => held_fds.push(fd),
+                    (Some(fd), Driver::Once(_)) => held.push(HeldJail {
+                        fd, name: jail_name_for_held, mount_dests,
+                    }),
                     (None, _) => { /* persistent jail, no fd */ }
                 }
             }
@@ -283,17 +299,43 @@ fn main() -> ExitCode {
     match driver {
         Driver::Supervise(mut sup) => {
             info!("bootstrap launched {} supervised + {} held; entering kqueue loop",
-                sup.watched_count(), held_fds.len());
+                sup.watched_count(), held.len());
             if let Err(e) = sup.run() {
                 error!("supervisor.run: {e}");
                 return ExitCode::FAILURE;
             }
         }
-        Driver::Once(_client) => {
-            info!("bootstrap done; {} held, {} failed (--once mode)",
-                held_fds.len(), launch_failures);
-            /* About to drop fds → kernel closes the procdescs →
-             * exec'd jails with persist=0 die. */
+        Driver::Once(mut client) => {
+            info!("bootstrap done; {} held, {} failed (--once mode); cleaning up",
+                held.len(), launch_failures);
+            /* For each held jail (in reverse launch order, so a
+             * later jail's mounts are unmounted before an earlier
+             * jail's — relevant if they stack on the same target
+             * via init_phase + real-service):
+             *   1. close(fd) — kernel kills jailed proc + reaps jail
+             *   2. RemoveJail-by-name — clears jaild's state.json
+             *      entry + any lo0 alias.
+             *   3. unmount each mount dest from the host namespace.
+             * Errors at any step are logged but not fatal — best-
+             * effort cleanup is still better than dropping fds
+             * with no cleanup at all. */
+            while let Some(h) = held.pop() {
+                if let Err(e) = host_mount::close_fd(h.fd) {
+                    warn!("close procdesc for {}: {e}", h.name);
+                }
+                let rm_req = Request::RemoveJail {
+                    jid:  None,
+                    name: Some(h.name.clone()),
+                };
+                if let Err(e) = client.send(&rm_req) {
+                    warn!("RemoveJail({}) on cleanup: {e}", h.name);
+                }
+                for (dest, kind) in &h.mount_dests {
+                    if let Err(e) = host_mount::unmount(dest) {
+                        warn!("cleanup unmount {kind:?} {dest}: {e}");
+                    }
+                }
+            }
         }
     }
 

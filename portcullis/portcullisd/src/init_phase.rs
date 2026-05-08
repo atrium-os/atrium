@@ -160,14 +160,11 @@ pub fn run_init(
     }
 
     /* Unmount the init jail's mounts from the host namespace.
-     * unmount(2) is racy in pathological cases (multiple stacked
-     * mounts on the same target), but for our case — exactly one
-     * mount per (source, dest) pair freshly applied a few ms ago
-     * — it does what we want. Errors are logged, not fatal:
-     * leaked mounts cause the next bootstrap iteration to fail
-     * loud, which is a perfectly fine signal. */
+     * FreeBSD has no per-jail mount ns — nullfs/tmpfs mounts
+     * survive the jailed process's exit and would EDEADLK any
+     * subsequent identical mount. Errors are logged, not fatal. */
     for (dest, kind) in &mount_dests {
-        if let Err(e) = ffi::unmount(dest) {
+        if let Err(e) = crate::host_mount::unmount(dest) {
             warn!("{}: post-init unmount {kind:?} {dest}: {e}",
                 service_name);
         }
@@ -278,18 +275,6 @@ mod ffi {
         if rc < 0 { return Err(io::Error::last_os_error()); }
         Ok(())
     }
-
-    /// `unmount(2)` wrapper. `target` is a path; we use the default
-    /// flags (0) so it fails cleanly if anything inside the mount
-    /// is busy — for the init-phase case the init process has
-    /// already exited so nothing should hold it.
-    pub fn unmount(target: &str) -> io::Result<()> {
-        let c = std::ffi::CString::new(target)
-            .map_err(|_| io::Error::other("unmount: NUL in path"))?;
-        let rc = unsafe { libc::unmount(c.as_ptr(), 0) };
-        if rc < 0 { return Err(io::Error::last_os_error()); }
-        Ok(())
-    }
 }
 
 #[cfg(not(target_os = "freebsd"))]
@@ -307,7 +292,4 @@ mod ffi {
         Err(io::Error::new(io::ErrorKind::Unsupported, "FreeBSD only"))
     }
     pub fn close_fd(_fd: i32) -> io::Result<()> { Ok(()) }
-    pub fn unmount(_target: &str) -> io::Result<()> {
-        Err(io::Error::new(io::ErrorKind::Unsupported, "FreeBSD only"))
-    }
 }
