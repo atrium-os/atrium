@@ -161,8 +161,8 @@ fn handle_client(
     jaild_path:  &Path,
     svcdir:      &Path,
 ) -> io::Result<()> {
-    let peer_uid = peer_uid(&s);
-    info!("portcullisd-daemon: accepted (peer uid={peer_uid:?})");
+    let peer = peer_uid(&s);
+    info!("portcullisd-daemon: accepted (peer uid={peer:?})");
     let mut conn = Connection::wrap(s)?;
 
     /* Re-load manifests per connection so a manifest edited
@@ -195,14 +195,74 @@ fn handle_client(
             continue;
         }
         let reply = match m.op {
-            OP_ATTACH_MOUNT => handle_attach(&m.payload, &outcome.manifests, jaild_path),
-            OP_DETACH_MOUNT => handle_detach(&m.payload, &outcome.manifests, jaild_path),
+            OP_ATTACH_MOUNT => handle_attach(&m.payload, &outcome.manifests, peer, jaild_path),
+            OP_DETACH_MOUNT => handle_detach(&m.payload, &outcome.manifests, peer, jaild_path),
             other => MountReply::Error {
                 detail: format!("unknown opcode 0x{other:04x} on CLASS_PORTCULLIS"),
             },
         };
         send_reply(&mut conn, reply)?;
     }
+}
+
+/// Map a peer uid to the manifest whose exec runs under that uid.
+/// Returns:
+///   - Ok(Some(manifest)) — exactly one manifest matches
+///   - Ok(None)           — peer uid is 0 (operator/root); caller may
+///                          target any jail (skip the cross-check)
+///   - Err(MountReply)    — no match, multiple matches, or peer uid
+///                          unavailable; reply ready to send back
+fn peer_to_manifest<'a>(
+    peer:       Option<u32>,
+    manifests:  &'a [ServiceManifest],
+) -> Result<Option<&'a ServiceManifest>, MountReply> {
+    match peer {
+        Some(0)    => Ok(None),  // operator
+        None       => Err(MountReply::CapabilityDenied {
+            rule:   "peer.unknown_uid".into(),
+            detail: "could not recover peer uid via getpeereid".into(),
+        }),
+        Some(uid)  => {
+            let matches: Vec<&ServiceManifest> = manifests.iter()
+                .filter(|m| m.exec.as_ref().map(|e| e.uid) == Some(uid))
+                .collect();
+            match matches.as_slice() {
+                []    => Err(MountReply::CapabilityDenied {
+                    rule:   "peer.no_matching_manifest".into(),
+                    detail: format!(
+                        "peer uid {uid} doesn't match any manifest's exec.uid"),
+                }),
+                [one] => Ok(Some(*one)),
+                many  => Err(MountReply::CapabilityDenied {
+                    rule:   "peer.ambiguous_uid".into(),
+                    detail: format!(
+                        "peer uid {uid} matches {} manifests ({:?}); cannot \
+                         determine owning jail", many.len(),
+                        many.iter().map(|m| &m.name).collect::<Vec<_>>()),
+                }),
+            }
+        }
+    }
+}
+
+/// Cross-check that the request's claimed jail_name matches the
+/// manifest derived from the peer uid. Operator (uid 0) bypasses
+/// this — same authority that runs the CLI tool.
+fn enforce_caller_owns_jail(
+    peer_manifest:    Option<&ServiceManifest>,
+    requested_jail:   &str,
+) -> Result<(), MountReply> {
+    if let Some(m) = peer_manifest {
+        if m.name != requested_jail {
+            return Err(MountReply::CapabilityDenied {
+                rule:   "peer.jail_mismatch".into(),
+                detail: format!(
+                    "peer is jailed as {:?} but requested operations on {:?}",
+                    m.name, requested_jail),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Open a one-shot jaild connection, send `req`, return the reply
@@ -221,6 +281,7 @@ fn jaild_round_trip(jaild_path: &Path, req: &JaildReq) -> MountReply {
 fn handle_attach(
     payload:    &[u8],
     manifests:  &[ServiceManifest],
+    peer:       Option<u32>,
     jaild_path: &Path,
 ) -> MountReply {
     let req: AttachMountReq = match serde_json::from_slice(payload) {
@@ -229,6 +290,18 @@ fn handle_attach(
             detail: format!("decode AttachMountReq: {e}"),
         },
     };
+
+    /* Defense in depth: confirm the caller's uid matches the
+     * jail it claims to be (so a uid-1001 caller in jail-A can't
+     * forge `jail_name = jail-B` to ride jail-B's broader cap
+     * allow-list). Bypassed for uid 0 (operator). */
+    let peer_manifest = match peer_to_manifest(peer, manifests) {
+        Ok(opt) => opt,
+        Err(reply) => return reply,
+    };
+    if let Err(reply) = enforce_caller_owns_jail(peer_manifest, &req.jail_name) {
+        return reply;
+    }
 
     let manifest = match manifests.iter().find(|m| m.name == req.jail_name) {
         Some(m) => m,
@@ -261,6 +334,7 @@ fn handle_attach(
 fn handle_detach(
     payload:    &[u8],
     manifests:  &[ServiceManifest],
+    peer:       Option<u32>,
     jaild_path: &Path,
 ) -> MountReply {
     let req: DetachMountReq = match serde_json::from_slice(payload) {
@@ -269,6 +343,14 @@ fn handle_detach(
             detail: format!("decode DetachMountReq: {e}"),
         },
     };
+
+    let peer_manifest = match peer_to_manifest(peer, manifests) {
+        Ok(opt) => opt,
+        Err(reply) => return reply,
+    };
+    if let Err(reply) = enforce_caller_owns_jail(peer_manifest, &req.jail_name) {
+        return reply;
+    }
 
     let manifest = match manifests.iter().find(|m| m.name == req.jail_name) {
         Some(m) => m,
