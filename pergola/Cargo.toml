@@ -1,0 +1,23 @@
+[package]
+name        = "pergola"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "Atrium UI toolkit. Sits above Fresco; emits scene-graph deltas via fresco-client. Sync API with signal-based reactive bridge."
+
+[lib]
+name = "pergola"
+path = "src/lib.rs"
+
+[dependencies]
+fresco-client   = { path = "../fresco-client" }
+fresco-protocol = { path = "../fresco-protocol" }
+log             = "0.4"
+
+[dev-dependencies]
+env_logger = "0.11"
+
+[[example]]
+name = "hello"
+path = "examples/hello.rs"

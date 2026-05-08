@@ -5,8 +5,14 @@
 > messages via `fresco-socket-rs` underneath. Equivalent in role to
 > Qt / GTK / AppKit in current desktop stacks.
 
-**Status**: design phase. Implementation begins D2/D3 (adapt existing
-Rust toolkit) and D4+ (native crate).
+**Status (2026-05-09):** implementation phase. Pulled forward from
+D5 to land before D2 (vestibulum) and D3 (forum) so those apps come
+up on Pergola from day one rather than via direct `fresco-socket-rs`.
+
+**Companion docs:**
+- [docs/design/atrium-visual-language.md](../design/atrium-visual-language.md)
+  — typography, color, spacing, shape, motion. Read first; widgets
+  reference its tokens.
 
 ---
 
