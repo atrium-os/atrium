@@ -25,6 +25,7 @@
 pub mod app;
 pub mod color;
 pub mod geom;
+pub mod layout;
 pub mod node;
 pub mod reactive;
 pub mod theme;
@@ -33,6 +34,6 @@ pub mod view;
 pub use app::App;
 pub use color::Color;
 pub use geom::{Point, Rect, Size};
-pub use node::{diff, Node, NodeDelta, NodeId, NodeTree};
+pub use node::{diff, Node, NodeDelta, NodeId, NodeTree, TextStyle};
 pub use reactive::Mutable;
 pub use view::{render, Ctx, View};

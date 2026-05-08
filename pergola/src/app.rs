@@ -20,7 +20,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use crate::node::{diff, NodeDelta, NodeTree};
+use crate::layout;
+use crate::node::{diff, NodeDelta, NodeId, NodeTree};
 use crate::reactive::Mutable;
 use crate::theme::Semantic;
 use crate::view::{render, View};
@@ -84,7 +85,14 @@ impl<V: View> App<V> {
         if !self.dirty.swap(false, Ordering::AcqRel) {
             return Vec::new();
         }
-        let next = render(&self.view, self.theme);
+        let mut next = render(&self.view, self.theme);
+        // Run layout from each root in the tree (a render pass may
+        // produce multiple top-level nodes; in practice it's one per
+        // window).
+        let roots: Vec<NodeId> = next.roots().collect();
+        for root in roots {
+            layout::layout(&mut next, root);
+        }
         let deltas = diff(&self.prev_tree, &next);
         self.prev_tree = next;
         deltas

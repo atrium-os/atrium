@@ -15,11 +15,12 @@
 
 use pergola::geom::{Axis, Rect};
 use pergola::node::Node;
-use pergola::theme::{radius, space, Semantic};
+use pergola::theme::{font, radius, space, type_size, Semantic, Weight};
 use pergola::view::{Ctx, View};
-use pergola::{render, NodeId};
+use pergola::{render, NodeId, TextStyle};
 
-/// A minimal hand-written View: panel containing two stacked rectangles.
+/// A minimal hand-written login-form sketch using the visual language
+/// tokens. Layout pass turns the stack's children into placed rects.
 struct LoginPlaceholder;
 
 impl View for LoginPlaceholder {
@@ -27,21 +28,48 @@ impl View for LoginPlaceholder {
         // Outer panel (raised surface, rounded).
         let panel_bg = ctx.theme.bg_elevated();
         ctx.push(Node::Rect {
-            rect: Rect::new(0.0, 0.0, 480.0, 320.0),
+            rect: Rect::new(0.0, 0.0, 480.0, 360.0),
             fill: panel_bg,
             radius: radius::XL,
         });
 
-        // Stack container for content.
+        // Stack container for content. Inset by space::LG.
         ctx.push(Node::Stack {
-            rect: Rect::new(space::LG, space::LG, 480.0 - 2.0 * space::LG, 320.0 - 2.0 * space::LG),
+            rect: Rect::new(space::LG, space::LG, 480.0 - 2.0 * space::LG, 360.0 - 2.0 * space::LG),
             axis: Axis::Vertical,
             spacing: space::MD,
         });
 
-        // Two placeholder children — text + button slots, before
-        // those primitives exist. The accent rectangle stands in
-        // for the primary "Sign in" button to show accent flow.
+        // Heading.
+        ctx.add(Node::Text {
+            rect: Rect::new(0.0, 0.0, 0.0, 0.0),  // size derived by layout
+            content: "Sign in to Atrium".into(),
+            style: TextStyle {
+                family: font::SANS.into(),
+                size: type_size::XL,
+                weight: Weight::Semibold,
+                color: ctx.theme.text_primary(),
+            },
+        });
+
+        // Subhead.
+        ctx.add(Node::Text {
+            rect: Rect::new(0.0, 0.0, 0.0, 0.0),
+            content: "Use your local account password.".into(),
+            style: TextStyle {
+                family: font::SANS.into(),
+                size: type_size::SM,
+                weight: Weight::Regular,
+                color: ctx.theme.text_secondary(),
+            },
+        });
+
+        // Two input slot placeholders + a primary action.
+        ctx.add(Node::Rect {
+            rect: Rect::new(0.0, 0.0, 0.0, 32.0),
+            fill: ctx.theme.bg_surface(),
+            radius: radius::SM,
+        });
         ctx.add(Node::Rect {
             rect: Rect::new(0.0, 0.0, 0.0, 32.0),
             fill: ctx.theme.bg_surface(),
@@ -61,9 +89,14 @@ impl View for LoginPlaceholder {
 fn main() {
     env_logger::init();
 
-    let tree = render(&LoginPlaceholder, Semantic::LIGHT);
+    let mut tree = render(&LoginPlaceholder, Semantic::LIGHT);
+    // Run layout from each root.
+    let roots: Vec<_> = tree.roots().collect();
+    for root in roots {
+        pergola::layout::layout(&mut tree, root);
+    }
 
-    println!("Pergola phase 0 — render pass produced {} nodes:\n", tree.len());
+    println!("Pergola phase 2 — render + layout produced {} nodes:\n", tree.len());
     print_subtree(&tree, NodeId::ROOT, 0);
 }
 
@@ -72,11 +105,15 @@ fn print_subtree(tree: &pergola::NodeTree, id: NodeId, depth: usize) {
     if let Some(node) = tree.get(id) {
         match node {
             Node::Rect { rect, fill, radius } => println!(
-                "{indent}[{:>2}] Rect rect=({:.0},{:.0} {:.0}×{:.0}) radius={:.0}px fill=rgba({:.2},{:.2},{:.2},{:.2})",
+                "{indent}[{:>2}] Rect ({:>3.0},{:>3.0} {:>3.0}×{:>3.0}) r={:.0} fill=rgba({:.2},{:.2},{:.2},{:.2})",
                 id.0, rect.x(), rect.y(), rect.w(), rect.h(), radius, fill.r, fill.g, fill.b, fill.a,
             ),
+            Node::Text { rect, content, style } => println!(
+                "{indent}[{:>2}] Text ({:>3.0},{:>3.0} {:>3.0}×{:>3.0}) {:?}px {:?}  {:?}",
+                id.0, rect.x(), rect.y(), rect.w(), rect.h(), style.size, style.weight, content,
+            ),
             Node::Stack { rect, axis, spacing } => println!(
-                "{indent}[{:>2}] Stack rect=({:.0},{:.0} {:.0}×{:.0}) axis={:?} spacing={:.0}px",
+                "{indent}[{:>2}] Stack ({:>3.0},{:>3.0} {:>3.0}×{:>3.0}) axis={:?} sp={:.0}",
                 id.0, rect.x(), rect.y(), rect.w(), rect.h(), axis, spacing,
             ),
         }

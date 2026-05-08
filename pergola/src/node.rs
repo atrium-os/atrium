@@ -10,7 +10,8 @@
 //! `Path` arrive in subsequent phases.
 
 use crate::color::Color;
-use crate::geom::{Axis, Rect};
+use crate::geom::{Axis, Rect, Size};
+use crate::theme::tokens::Weight;
 
 /// Stable identifier for a node in the tree. Allocated by the `Ctx`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -18,6 +19,22 @@ pub struct NodeId(pub u32);
 
 impl NodeId {
     pub const ROOT: Self = Self(0);
+}
+
+/// A text-rendering style. Text nodes carry one of these alongside
+/// their content. Real shaping happens via `fresco-text` once wire
+/// emission lands (phase 4); for now `Text::measured_size` returns a
+/// proportional-font estimate good enough to drive layout smoke tests.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextStyle {
+    /// PostScript family name. Use `theme::font::SANS` / `MONO`.
+    pub family: String,
+    /// Logical pixels — pick from `theme::type_size`.
+    pub size: f32,
+    /// Weight from the theme's weight enum.
+    pub weight: Weight,
+    /// Fill color — use a `Semantic::text_*` token.
+    pub color: Color,
 }
 
 /// Per-node payload. Keep this small; structural layout sits in
@@ -30,14 +47,64 @@ pub enum Node {
         fill: Color,
         radius: f32,
     },
+    /// Single-line text. `rect.size` is overwritten by the layout
+    /// pass to match the shaped width × line-height; views that want
+    /// hard wrapping or multi-line text should use a `Stack` of
+    /// per-line `Text` nodes (this is fine — text is glyph-runs at
+    /// the GPU layer, not a rich layout primitive).
+    Text {
+        rect: Rect,
+        content: String,
+        style: TextStyle,
+    },
     /// A layout container that arranges children along an axis with
-    /// uniform spacing. Real flex/grid lands in phase 2 via `taffy`;
-    /// this is the placeholder for the commit-cycle smoke test.
+    /// uniform spacing. The layout pass walks Stacks and assigns
+    /// child rects based on intrinsic sizes + spacing + axis.
     Stack {
         rect: Rect,
         axis: Axis,
         spacing: f32,
     },
+}
+
+impl Node {
+    /// Logical bounds in this node's own (parent-relative) coordinate
+    /// space. Layout uses this as the *current* rect; for some node
+    /// kinds (Text) it is mutated in place by the layout pass.
+    pub fn rect(&self) -> Rect {
+        match self {
+            Node::Rect { rect, .. } | Node::Text { rect, .. } | Node::Stack { rect, .. } => *rect,
+        }
+    }
+
+    pub fn set_rect(&mut self, r: Rect) {
+        match self {
+            Node::Rect { rect, .. } | Node::Text { rect, .. } | Node::Stack { rect, .. } => *rect = r,
+        }
+    }
+
+    /// Intrinsic size — what this node "wants" to be when given no
+    /// outside constraint. Used by `layout::layout_stack` to
+    /// distribute children along the axis. Stack containers report
+    /// their declared size; primitives report their `rect.size`.
+    pub fn intrinsic_size(&self) -> Size {
+        match self {
+            Node::Rect { rect, .. } | Node::Stack { rect, .. } => rect.size,
+            Node::Text { content, style, .. } => Self::measure_text(content, style),
+        }
+    }
+
+    /// Proportional-font width estimate. **Placeholder.** Real
+    /// shaping comes from `fresco-text` once wire emission lands
+    /// (phase 4). Until then: average char width ≈ 0.55 × size for
+    /// proportional faces. Tuned to undershoot slightly so layout
+    /// doesn't overflow when real shaping replaces this.
+    pub fn measure_text(content: &str, style: &TextStyle) -> Size {
+        let avg_char_w = style.size * 0.55;
+        let w = content.chars().count() as f32 * avg_char_w;
+        let h = style.size * crate::theme::tokens::line_height::UI_SINGLE_LINE;
+        Size::new(w, h)
+    }
 }
 
 /// A flat arena of nodes. Tree structure lives in the
@@ -69,6 +136,10 @@ impl NodeTree {
         self.nodes.get(id.0 as usize).and_then(|n| n.as_ref())
     }
 
+    pub fn get_mut(&mut self, id: NodeId) -> Option<&mut Node> {
+        self.nodes.get_mut(id.0 as usize).and_then(|n| n.as_mut())
+    }
+
     pub fn parent_of(&self, id: NodeId) -> Option<NodeId> {
         self.parent.get(id.0 as usize).copied().flatten()
     }
@@ -80,6 +151,18 @@ impl NodeTree {
     pub fn iter(&self) -> impl Iterator<Item = (NodeId, &Node)> {
         self.nodes.iter().enumerate().filter_map(|(i, n)| {
             n.as_ref().map(|node| (NodeId(i as u32), node))
+        })
+    }
+
+    /// Iterate the node ids that have no parent (top-level nodes).
+    /// Layout is run once per root.
+    pub fn roots(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.parent.iter().enumerate().filter_map(|(i, p)| {
+            if p.is_none() && self.nodes.get(i).and_then(|n| n.as_ref()).is_some() {
+                Some(NodeId(i as u32))
+            } else {
+                None
+            }
         })
     }
 
