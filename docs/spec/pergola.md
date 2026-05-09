@@ -209,26 +209,41 @@ internally.
 - **Cross-app shared widget cache**: e.g. a "system Button" rendered
   once on the GPU and reused across apps. Future optimization.
 
-### §8.1 Near-term Pergola TODO
+### §8.1 Color management roadmap
 
-- **Auto-contrast text color.** Add `Color::auto_on(bg)` (and a
-  `theme.text_auto_on(bg) -> Color` convenience) that picks black or
-  white based on WCAG relative-luminance contrast, so widgets placed
-  on chromatic / unknown backgrounds (e.g. a transparent panel over
-  `bg_window`) don't render unreadable text. Keep `text_primary` /
-  `text_secondary` semantics unchanged — auto-color is opt-in by
-  callers that don't know their background statically. Unblocks the
-  "transparent vestibulum panel on teal" pattern below.
+Color management has three layers, addressed in order:
+
+1. **App layer (linear RGB).** Done. Pergola's `Color` stores linear
+   components; blending math (alpha compositing, gradients) is
+   correct.
+2. **Encoding layer (linear → sRGB).** Done. fresco-vulkan's color
+   attachment uses `B8G8R8A8_SRGB`, so the GPU applies the sRGB
+   transfer at attachment write. App code never thinks about gamma
+   encoding.
+3. **Display profile layer (sRGB → monitor).** **Deferred to D5+.**
+   Most consumer displays target sRGB out of the box, so #2 produces
+   acceptable results today. Real ICC support requires:
+   (a) frescod owning the scanout path end-to-end (currently kmod +
+       virtio-gpu hardcode `B8G8R8A8_UNORM`);
+   (b) an ICC profile registry per attached display
+       (`xdg-color-manager`-equivalent, parsed at scanout time);
+   (c) a way for windows to declare their content color space
+       (sRGB / Display-P3 / BT.2020) so frescod can pick the right
+       transformation; default is sRGB.
+   Until D5, "everything is sRGB" is the operating assumption.
+
+### §8.2 Near-term Pergola TODO
+
+- **Auto-contrast text color.** Done. `Color::auto_on(bg)` /
+  `theme.text_auto_on(bg)` pick black or white based on WCAG
+  relative-luminance contrast.
 - **Pre-WM full-screen + transparent-shell pattern for login apps.**
-  Vestibulum is the only app running before login; there's no
-  multi-window WM yet, so it should fill the framebuffer and let the
-  teal `bg_window` show through (no neutral panel card). Once WM
-  policy kicks in post-login, normal panel/canvas/border tokens
-  apply. Needs: (a) auto-contrast text (above) so the heading +
-  subhead remain readable on teal; (b) a way for an app to request
-  "framebuffer-sized" without hardcoding 1280×720; (c) a convention
-  for "panel-less" or "transparent shell" — likely just a
-  `Stack`-rooted form rather than a `bg_elevated` rect.
+  Done for vestibulum. Generalization for other login-time apps is a
+  later concern.
+- **Framebuffer-size discovery.** Vestibulum hardcodes 1280×720 to
+  match the smoke harness. Real frescod should hand framebuffer
+  dimensions back to the client (proposed: `WINDOW_CREATE` with
+  `width=0 height=0` → fullscreen; response carries actual size).
 
 ---
 

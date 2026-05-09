@@ -55,23 +55,11 @@ impl Color {
     }
 
     /// WCAG 2.x relative luminance of this color, range `[0.0, 1.0]`,
-    /// alpha ignored.
-    ///
-    /// Subtle: our `Color` is documented as linear, but fresco-vulkan's
-    /// current output path writes those values straight to a
-    /// `BGRA8_UNORM` framebuffer (no sRGB encoding), so each component
-    /// ends up displayed as if it were already sRGB-encoded. Auto-
-    /// contrast picks have to match what users actually see, so we
-    /// treat the stored components AS sRGB for the WCAG calculation
-    /// — apply the sRGB→linear transfer once before the weighted sum.
-    /// When fresco-vulkan grows a proper linear→sRGB output stage
-    /// (TODO: BGRA8_SRGB swapchain or fragment-shader encoding), drop
-    /// the inner conversion and read the components straight.
+    /// alpha ignored. Components are linear-light (per `Color`'s
+    /// documented convention); fresco-vulkan applies the linear→sRGB
+    /// transfer at attachment write, so this matches what users see.
     pub fn relative_luminance(self) -> f32 {
-        let l = |c: f32| -> f32 {
-            if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
-        };
-        0.2126 * l(self.r) + 0.7152 * l(self.g) + 0.0722 * l(self.b)
+        0.2126 * self.r + 0.7152 * self.g + 0.0722 * self.b
     }
 
     /// Pick black or white — whichever has the higher WCAG contrast
@@ -132,8 +120,9 @@ mod tests {
 
     #[test]
     fn auto_on_dark_picks_white() {
-        // Atrium deep teal — linear (0.04, 0.50, 0.55).
-        let teal = Color::rgba(0.04, 0.50, 0.55, 1.0);
+        // Atrium deep teal: sRGB #0A808C → linear ~(0.003, 0.216, 0.260).
+        // Relative luminance ≈ 0.174; white wins ~4.7:1 vs black ~4.5:1.
+        let teal = Color::from_hex("#0A808C");
         let fg = Color::auto_on(teal);
         assert_eq!(fg.r, 1.0); assert_eq!(fg.g, 1.0); assert_eq!(fg.b, 1.0);
     }

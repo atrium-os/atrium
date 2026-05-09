@@ -62,7 +62,12 @@ const OP_ID_TEXT_GLYPH_RUN:  u32 = 0x2000;
 /// `Renderer`. Recognisable so smoke-tests can confirm the render-pass
 /// path is alive (vs an all-black image which could mean "render pass
 /// didn't run").
-const CLEAR_COLOR: [f32; 4] = [0.04, 0.50, 0.55, 1.0];
+///
+/// Linear values that sRGB-encode to (10, 128, 140) = `#0A808C` (the
+/// signature dark teal). With the `B8G8R8A8_SRGB` color attachment
+/// format below the GPU applies the linear→sRGB transfer at write,
+/// so what ends up in the framebuffer + PNG is `#0A808C`.
+const CLEAR_COLOR: [f32; 4] = [0.00304, 0.2158, 0.2603, 1.0];
 
 /// Pre-recorded handles + count for one op's contribution to a frame.
 /// Same shape as the windowed Renderer's DrawPlan.
@@ -84,7 +89,13 @@ struct DrawPlan {
     draw_instances:   u32,
 }
 
-const COLOR_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
+/// sRGB color attachment: Pergola colors travel the wire in linear
+/// RGB (correct for blending math); the GPU applies the linear→sRGB
+/// transfer when writing to this attachment, so the final framebuffer
+/// holds sRGB-encoded bytes ready for direct scanout / PNG dump.
+/// Display ICC profiles (per-monitor calibration) are a separate
+/// later layer — see Pergola spec §8.1.
+const COLOR_FORMAT: vk::Format = vk::Format::B8G8R8A8_SRGB;
 
 /// A headless Vulkan device that renders into a single off-screen
 /// color image. The image is **device-local** (fast for GPU writes);

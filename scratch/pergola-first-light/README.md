@@ -67,6 +67,18 @@ timeout that's unrelated to Pergola).
   login forms typically look. Once the WM lands, normal
   panel/canvas/border policy kicks in for non-login apps.
 
+- **`v10-srgb-output.png`** — gamma-correct color output. fresco-vulkan's
+  color attachment switched from `B8G8R8A8_UNORM` to `B8G8R8A8_SRGB`,
+  so the GPU now applies the linear→sRGB transfer at write. All
+  existing palette colors (which travel as linear via `from_hex`) now
+  display at their true hex values rather than ~8% darker. The dark
+  teal `bg_window` is preserved by hand-compensating `deep_teal()` and
+  `CLEAR_COLOR` to the linear values that re-encode to `#0A808C`.
+  Visible improvements: TextField bgs are properly off-white,
+  amber-bronze button reads at full saturation, `relative_luminance`
+  drops the sRGB-conversion workaround. ICC display profiles per
+  monitor remain a D5+ task — see [docs/spec/pergola.md §8.1](../../docs/spec/pergola.md).
+
 ## What proved
 
 - Pergola → fresco-client → fresco-server → MoltenVK → Metal →

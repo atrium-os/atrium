@@ -95,11 +95,10 @@ pub mod palette {
     pub fn neutral_950() -> Color { Color::from_hex("#0E1114") }
 
     /// Atrium signature deep teal — the chromatic neutral used as the
-    /// outermost window background. Hand-tuned to match the linear
-    /// values fresco-vulkan uses for its render-target clear color
-    /// (`[0.04, 0.50, 0.55]`), so the window blends seamlessly into
-    /// any unpainted area on first paint.
-    pub fn deep_teal() -> Color { Color::rgba(0.04, 0.50, 0.55, 1.0) }
+    /// outermost window background. `#0A808C` in sRGB; matches
+    /// fresco-vulkan's render-target clear color exactly so the window
+    /// blends seamlessly into any unpainted area on first paint.
+    pub fn deep_teal() -> Color { Color::from_hex("#0A808C") }
 
     // Atrium amber-bronze accent (Romanesque, single accent)
     pub fn accent_50() -> Color { Color::from_hex("#FBF1E5") }
