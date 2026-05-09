@@ -36,6 +36,16 @@ timeout that's unrelated to Pergola).
   was reading garbage offsets. Both fixed; all 11 scene nodes (5 rects
   + 5 text runs + 1 button label) now render correctly.
 
+- **`v7-baseline.png`** — text baseline alignment. The wire `y` was
+  being passed straight through to the kernel, which expected the
+  baseline; Pergola was passing the top of the em-box (intuitive for
+  layout / vertical centering). Result: every text element rendered
+  with its baseline at the top of its container, leaving glyphs
+  partly above. `shape_text_run` now adds the font's ascender to the
+  incoming `y` so the on-wire convention is "top of em-box" and the
+  GPU still sees a baseline. Placeholders sit cleanly inside their
+  TextFields, button label centers on the button.
+
 ## What proved
 
 - Pergola → fresco-client → fresco-server → MoltenVK → Metal →

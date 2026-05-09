@@ -453,7 +453,19 @@ impl TextEngine {
         color: [f32; 4],
         text: &str,
     ) -> Option<(GlyphRunParams, Option<PendingAtlasUpload>)> {
-        let font_bytes = self.fonts.get(&font_id)?.bytes.clone();
+        /* Wire convention: `y` is the top of the text em-box (so apps
+         * compute it as e.g. `field_y + (field_h - text_h)/2` for
+         * vertical centering, without needing font metrics). The
+         * compute kernel expects `origin.y` to be the baseline (it
+         * does `origin.y - bearing.y` to derive each glyph's top).
+         * Add the font's ascender here so the on-wire bbox-top
+         * convention resolves to a baseline before reaching the GPU. */
+        let font = self.fonts.get(&font_id)?;
+        let upe = font.metrics.units_per_em as f32;
+        let ascender_px =
+            font.metrics.ascent_units as f32 * size_px / upe;
+        let y = y + ascender_px;
+        let font_bytes = font.bytes.clone();
 
         let size_key = (size_px * 100.0) as u32;
         let page_key = (font_id, size_key);
