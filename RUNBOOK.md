@@ -95,9 +95,9 @@ Two channels:
   ```
 
 ### Shutdown
-**Always use `~/src/bsd/scripts/vshutdown`.** It issues `shutdown -p now`, waits for QEMU to exit on its own (up to 60 s), and only escalates to SIGKILL if genuinely stuck. **Do not** `pkill -9` mid-shutdown — UFS softdep flush takes 8–15 s and SIGKILL during it corrupts files (we've lost cargo .rlib caches, the pkg DB, and entire pkg-installed font directories this way).
+**Always use `~/src/bsd/scripts/vshutdown`.** It issues `shutdown -p now`, waits for QEMU to exit on its own (up to 60 s), and only escalates to SIGKILL if genuinely stuck.
 
-Force-kill (only when guest is truly hung): `pkill -f qemu-system-aarch64` — accept that the qcow2 may need fsck or restore from `vm.qcow2.xz` next boot.
+The dev VM root is on **ZFS** (since the 2026-05-09 rebuild — see §11 *Dev VM rebuild milestone*). ZFS imports cleanly after any unclean shutdown — no fsck, no qcow2 corruption from mid-write `kill -9`. The historical "UFS softdep flush + SIGKILL = lost cargo caches" failure mode is gone. `pkill -f qemu-system-aarch64` is now a safe-ish recovery, though `vshutdown` is still preferred for in-flight write hygiene.
 
 > **Never run `cargo build --release` (or any --release-profile cargo) inside the VM.** It hangs the guest hard every single time — SSH dies, only `kill -9 qemu` recovers, and that corrupts the qcow2. The 12 GB VM RAM is exhausted by rustc + LTO under HVF before swap reaches steady state. Even small crates trip this. Always cross-compile from the macOS host (§4); the host config in `~/src/bsd/.cargo/config.toml` already targets `aarch64-unknown-freebsd`. C builds in the VM are fine and stay there.
 
@@ -225,7 +225,7 @@ Gotchas (each one cost a kernel panic + qcow2 restore — preserved here so the 
 - **`g_vfs_open(devvp, &cp, "tessera", wr)`** — pass `wr=1` even for a logically read-only mount, so the kmod can issue maintenance writes (e.g. dual-SB self-heal). User writes are blocked at the VFS layer via MNT_RDONLY + vop_access EROFS, not at the GEOM layer.
 - **B+tree key encoding**: inode_no is 4 bytes, encoded **big-endian** so the tree's memcmp ordering matches numeric ordering. Both mkfs (`tessera_volume_format`) and the kmod (`encode_inode_key`) use the same convention.
 
-If the kernel panics during a kmod experiment: `pkill -9 qemu-system-aarch64`, `xz -dk vm.qcow2.xz` (the post-first-boot baseline), boot, re-extract `src.txz`, rebuild. Don't `cargo build --release` in the VM — see `~/.claude/projects/.../memory/feedback_no_vm_cargo_release.md`.
+If the kernel panics during a kmod experiment: `pkill -9 qemu-system-aarch64`, then re-extract baseline if needed (`xz -dk vm.qcow2.xz`). With ZFS root the next boot imports cleanly without fsck; the `xz -dk` step is only needed if you want to roll back to the post-first-boot baseline (e.g. after testing destructive changes inside the VM). Don't `cargo build --release` in the VM — see `~/.claude/projects/.../memory/feedback_no_vm_cargo_release.md`.
 
 #### ddb over QEMU TCP serial (added 2026-05-01)
 
@@ -1621,3 +1621,89 @@ diffs as branches.
 (There's an empty `atrium-os/freebsd-src` placeholder repo lingering
 from a setup misstep. Delete via the web UI when convenient — needs
 `delete_repo` scope which `gh auth refresh` can grant.)
+
+---
+
+## 11. Dev VM rebuild — ZFS root (2026-05-09)
+
+The dev VM was rebuilt onto **ZFS root** to eliminate UFS-softdep-flush
+corruption from mid-write `kill -9`. With ZFS, the on-disk format is
+always atomically consistent — every `shutdown -p` is clean, every
+`kill -9` recovers without fsck. This was the recurring source of "the
+qcow2 is dirty, restore from baseline + reinstall pkgs" pain.
+
+### What's in the new baseline
+
+`vm/vm.qcow2` (post-rebuild snapshot, ~1.8 GiB compressed):
+
+- **Disk**: 32 GiB qcow2 (vs. 6 GiB old UFS baseline) — room for full
+  mesa + vulkan + dev tooling without space anxiety.
+- **Layout**: GPT, 200 MiB EFI (FAT32, FreeBSD `loader.efi` as
+  `BOOTAA64.EFI`) + remainder as `freebsd-zfs`.
+- **zpool**: `zroot` with `compress=lz4`, `atime=off`. Datasets:
+  `ROOT/default` (mounted /), `usr/{home,obj,ports,src}`, `var/{audit,
+  crash,log,mail,tmp}`, `tmp`. ARC capped at 2 GiB via
+  `vfs.zfs.arc_max=2147483648` in `/etc/sysctl.conf`.
+- **Hostname**: `atrium-dev`.
+- **SSH**: host keys generated, `~/.ssh/authorized_keys` carries the
+  dev `fresco_bsd_ed25519` pubkey, `PermitRootLogin without-password`.
+- **`/etc/fstab`**: `bsd_share /mnt/host p9fs rw,trans=virtio,noauto`
+  — opt-in 9p host share (`mount /mnt/host` to attach).
+- **`/boot/loader.conf`**:
+  - `zfs_load="YES"` + `vfs.root.mountfrom="zfs:zroot/ROOT/default"`
+  - `p9fs_load="YES"` + `virtio_p9fs_load="YES"`
+  - `atrium_virtio_gpu_load="YES"` — preload kmod so its probe wins
+    against stock vtgpu at boot (BUS_PROBE_VENDOR > BUS_PROBE_DEFAULT).
+    Runtime kldload after vtgpu has already attached doesn't displace
+    it; preloading is the clean fix.
+  - The kmod itself lives at `/boot/modules/atrium_virtio_gpu.ko`.
+- **Pkgs pre-installed**: `vulkan-loader`, `vulkan-tools`,
+  `mesa-libs`, `mesa-dri`, `rsync`, `pkg`. The lavapipe (CPU
+  rasterizer) Vulkan ICD is at `/usr/local/lib/libvulkan_lvp.so` /
+  `/usr/local/share/vulkan/icd.d/lvp_icd.aarch64.json`.
+
+### What's NOT in the baseline (intentionally)
+
+- **atrium-mesa / venus userspace ICD** — needs to be built from
+  source per host. Not included; frescod falls back to lavapipe via
+  the standard Vulkan loader.
+- **`/usr/src` kernel source** — re-extract on demand:
+  ```sh
+  vssh "tar -xJf /mnt/host/tarballs/src.txz -C /"
+  ```
+- **Big build artifacts** (`/usr/obj`, mesa build trees) — kept out
+  so the baseline stays small.
+
+### Building the rebuild
+
+The full procedure is captured in `scripts/build-zfs-root.sh`. To
+recreate from scratch (e.g. after a base.txz refresh):
+
+1. Boot the existing VM with `vm-zfs.qcow2` (blank, 32 GiB) attached
+   as a second disk. Use `qemu-img create -f qcow2 vm-zfs.qcow2 32G`.
+2. Inside VM, mount 9p share + build atrium-kmod (KBI-bound so must
+   build in-VM):
+   ```sh
+   mount -t p9fs -o trans=virtio bsd_share /mnt/host
+   tar -xJf /mnt/host/tarballs/src.txz -C / # only if /usr/src missing
+   cd /mnt/host/atrium-kmod && make
+   ```
+3. Run `/mnt/host/scripts/build-zfs-root.sh` — partitions vtbd0,
+   creates zpool, extracts base.txz + kernel.txz, configures /etc and
+   /boot, sets up SSH, generates host keys, exports pool.
+4. `shutdown -p now`.
+5. On host: `mv vm/vm.qcow2 vm/vm-old.qcow2 && mv vm/vm-zfs.qcow2
+   vm/vm.qcow2`.
+6. Boot — should come up as `atrium-dev` with `/dev/atrium-{gpu,
+   display}0` already present.
+7. Snapshot: `xz -k -T 0 -2 vm/vm.qcow2` produces a new
+   `vm/vm.qcow2.xz` baseline.
+
+### Known follow-up (not blocking dev work)
+
+`RESOURCE_CREATE_BLOB(blob_mem=GUEST)` times out under
+QEMU+virglrenderer on macOS hosts (no `udmabuf` for guest sglists at
+the renderer boundary). The kmod's BLOB scanout path will need to
+switch to `BLOB_MEM_HOST3D` + `USE_MAPPABLE` + map via the
+`host_visible` BAR — same machinery as venus's blob path. Tracked as
+its own milestone; doesn't block kmod / fresco / pergola development.

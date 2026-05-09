@@ -46,6 +46,10 @@ EFI_SRC="$QEMU_DIR/build/qemu-bundle/opt/homebrew/share/qemu/edk2-aarch64-code.f
 EFI_PAD="$BSD_DIR/vm/edk2-aarch64-code.fd"
 EFI_VARS="$BSD_DIR/vm/edk2-arm-vars.fd"
 DISK="$BSD_DIR/vm/vm.qcow2"
+# Note: vm.qcow2 is the dev VM with ZFS root (rebuilt 2026-05-09 — see
+# RUNBOOK §11). Pristine baseline is vm.qcow2.xz; restore via
+# `xz -dk vm/vm.qcow2.xz`. ZFS imports cleanly after `kill -9` —
+# fsck-after-hard-kill is not a thing on this image.
 SHARE_DIR="$BSD_DIR"
 
 # qemu wants exactly 64MiB for the EFI flash; pad if needed.
