@@ -21,28 +21,56 @@ whatever it talks to on the other side. Standardizing here is what
 lets the same kmod sit on top of venus, plain virtio-gpu, or future
 native drivers without per-backend code paths inside the kmod.
 
-## Required: BLOB-based scanout
+## Required: BLOB-based scanout via `BLOB_MEM_HOST3D`
 
 Every Atrium-supported host backend MUST implement the virtio-gpu
-BLOB resource family:
+BLOB resource family AND the host-allocated (`HOST3D`) backing mode:
 
-- Negotiate the **`VIRTIO_GPU_F_RESOURCE_BLOB`** feature.
+- Negotiate **`VIRTIO_GPU_F_RESOURCE_BLOB`** and
+  **`VIRTIO_GPU_F_CONTEXT_INIT`**.
+- Expose a **host-visible shared-memory region** (QEMU's `hostmem=N`
+  on `virtio-gpu-gl-pci`) — the kmod allocates BAR windows from it
+  and publishes them to userspace via `mmap`.
 - Accept **`VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB`** with
-  `blob_mem = VIRTIO_GPU_BLOB_MEM_GUEST` and one `virtio_gpu_mem_entry`
-  carrying the BO's contiguous physical address. (HOST3D variants are
-  used by venus for VkDeviceMemory-backed buffers, separately.)
+  `blob_mem = VIRTIO_GPU_BLOB_MEM_HOST3D`,
+  `blob_flags = VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE`, `blob_id = 0`,
+  `nr_entries = 0`. The host allocates the backing pages on its side;
+  the guest maps them via the BAR window.
+- Accept **`VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE`** + 
+  **`VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB`** for the scanout context's
+  ownership of the blob.
 - Accept **`VIRTIO_GPU_CMD_SET_SCANOUT_BLOB`** with
   `format = VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM`, single-plane
   (`strides[0] = w * 4`, `offsets[0] = 0`).
-- Accept **`VIRTIO_GPU_CMD_RESOURCE_FLUSH`** on a BLOB resource —
-  redraws the rectangle. No `TRANSFER_TO_HOST_2D` is needed: with
-  `BLOB_MEM_GUEST` the host reads guest RAM directly via the
-  registered `mem_entry`.
+- Accept **`VIRTIO_GPU_CMD_RESOURCE_FLUSH`** on a BLOB resource.
 
-The kmod uses **plain `VIRTIO_GPU_FLAG_FENCE`** (no
-`INFO_RING_IDX`) for these commands — scanout is a global operation,
-not per-context. (Venus's per-context blob path is separate, uses
-`INFO_RING_IDX`, and is independent.)
+`BLOB_MEM_GUEST` is **not** an acceptable scanout backing on macOS
+hosts: virglrenderer needs `udmabuf` to consume guest sglists, which
+Darwin doesn't have. `HOST3D + USE_MAPPABLE` works uniformly across
+all hosts and is the single path the kmod uses.
+
+### Per-context vs. global
+
+`HOST3D` blobs are tied to a virtio-gpu context. The kmod
+lazy-creates a kmod-internal **scanout context** (capset = venus,
+debug name `atrium-scanout`) to own these resources — userspace does
+not need its own venus context for plain scanout. Fences for context
+operations use **`VIRTIO_GPU_FLAG_FENCE | VIRTIO_GPU_FLAG_INFO_RING_IDX`**
+with `ring_idx = 0` so the host routes them through the per-context
+async-fence path (the legacy global path is broken under
+`VIRGL_RENDERER_NO_VIRGL`, the macOS host case).
+
+> **Known unresolved**: even with `INFO_RING_IDX`, the QEMU build at
+> `~/src/qemu-build` does not deliver the fence-completion for
+> `CTX_CREATE` back to the guest under our current `--venus`
+> configuration. The worker process IS spawned (`virgl_render_server
+> --worker-context-name atrium-scanout` visible in `ps`), but the
+> kmod's `req_resp` times out. This blocks end-to-end scanout
+> verification but is a host-side fence-routing issue, not a guest
+> kmod bug. Likely fixed by either (a) running atrium-mesa venus
+> userspace concurrently so venus init completes its handshake, or
+> (b) a virglrenderer/QEMU-side fix to deliver the worker-init fence
+> unconditionally.
 
 ## Why BLOB is the unifier
 
