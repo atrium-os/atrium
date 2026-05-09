@@ -89,26 +89,33 @@ pub struct WindowSceneState {
 impl WindowSceneState {
     pub fn new() -> Self { Self::default() }
 
-    /// Snapshot the rect-op nodes as `fresco_vulkan::SceneNode` in
-    /// insertion-order-undefined sequence. Renderer feeds this to
-    /// `HeadlessRenderer::set_rect_nodes`.
+    /// Snapshot the rect-op nodes as `fresco_vulkan::SceneNode` ordered
+    /// by ascending `node_id`. Clients that allocate node ids in
+    /// insertion order (Pergola does) get z-order-stable rendering:
+    /// the rect with the smallest id is drawn first (background),
+    /// later ids paint on top. Without this ordering, `HashMap.values()`
+    /// produces a hash-randomized order and same-color rects get
+    /// visually clobbered when a later-drawn rect happens to cover them.
     ///
     /// Returns a fresh `Vec` each call — the renderer takes ownership.
-    /// Cost: O(N_rects) to collect; called per-frame, so this is
-    /// expected to be in the µs range for typical scenes.
+    /// Cost: O(N_rects log N_rects) for the sort; still µs-range for
+    /// typical scenes.
     pub fn extract_rect_nodes(&self) -> Vec<fresco_vulkan::SceneNode> {
-        self.rect_nodes.values().map(|p| fresco_vulkan::SceneNode {
+        let mut entries: Vec<(&u32, &RectParams)> = self.rect_nodes.iter().collect();
+        entries.sort_by_key(|(id, _)| **id);
+        entries.into_iter().map(|(_, p)| fresco_vulkan::SceneNode {
             position: [p.x, p.y],
             size:     [p.w, p.h],
             color:    [p.r, p.g, p.b, p.a],
         }).collect()
     }
 
-    /// Snapshot the path-op nodes (rotated quads) as
-    /// `fresco_vulkan::PathNode`. Renderer feeds this to
-    /// `HeadlessRenderer::set_path_nodes`.
+    /// Snapshot the path-op nodes (rotated quads), ordered by ascending
+    /// `node_id` for z-order stability — see `extract_rect_nodes`.
     pub fn extract_path_nodes(&self) -> Vec<fresco_vulkan::PathNode> {
-        self.path_nodes.values().map(|p| fresco_vulkan::PathNode {
+        let mut entries: Vec<(&u32, &PathParams)> = self.path_nodes.iter().collect();
+        entries.sort_by_key(|(id, _)| **id);
+        entries.into_iter().map(|(_, p)| fresco_vulkan::PathNode {
             model: [p.cx, p.cy, p.length, p.width],
             extra: [p.angle, 0.0, 0.0, 0.0],
             color: [p.r, p.g, p.b, p.a],
@@ -129,9 +136,16 @@ impl WindowSceneState {
     pub fn extract_glyph_run_batches(&self)
         -> Vec<fresco_vulkan::GlyphRunBatch>
     {
+        /* Same id-ordering trick as extract_rect_nodes — preserves the
+         * client's insertion order so text rendered later overlaps
+         * text rendered earlier. Within a single batch (one atlas
+         * slot), glyph runs are appended in id order. */
+        let mut entries: Vec<(&u32, &GlyphRunParams)>
+            = self.glyph_run_nodes.iter().collect();
+        entries.sort_by_key(|(id, _)| **id);
         let mut by_slot:
             HashMap<u32, fresco_vulkan::GlyphRunBatch> = HashMap::new();
-        for run in self.glyph_run_nodes.values() {
+        for (_, run) in entries {
             let entry = by_slot.entry(run.atlas_slot_id)
                 .or_insert_with(|| fresco_vulkan::GlyphRunBatch {
                     atlas_slot_id: run.atlas_slot_id,

@@ -27,6 +27,15 @@ timeout that's unrelated to Pergola).
   remaining size-15 strings still missing — server-side issues
   (see below).
 
+- **`v6-stride-fix.png`** — complete render. Two more bugs fixed:
+  (1) `extract_rect_nodes` / `extract_glyph_run_batches` now sort by
+  `node_id` so HashMap iteration randomness no longer scrambles
+  z-order (panel was overdrawing TextField bgs); (2) glyph_run
+  compute kernel was reading scene nodes with stride 96 while Rust
+  writes with stride 64 — every node beyond thread 0 in a batch
+  was reading garbage offsets. Both fixed; all 11 scene nodes (5 rects
+  + 5 text runs + 1 button label) now render correctly.
+
 ## What proved
 
 - Pergola → fresco-client → fresco-server → MoltenVK → Metal →
@@ -40,26 +49,13 @@ timeout that's unrelated to Pergola).
 
 ## What's not yet right
 
-After the **fresco-vulkan multi-batch fix** (`v4-perslot.png`) — per-atlas-slot
-dedicated scene/glyphs/instance/counter buffers + descriptor sets, so
-each batch's host-write doesn't race the GPU's read of another batch's
-data — the size-22 heading now renders alongside the size-13 subhead
-and one size-15 string ("username" placeholder). Remaining issues are
-all on the fresco-server side:
+The full vestibulum login form renders end-to-end (`v6-stride-fix.png`).
+Remaining items aren't Pergola/vestibulum bugs:
 
 | Issue | Cause |
 |---|---|
-| Password placeholder text + button label "Sign in" missing (size 15) | All three size-15 strings live in atlas slot 4026531842 (one initial upload + two patches confirmed in smoke log), but only one TextRun reaches the per-slot scene buffer. fresco-server scene-management bug — `set_node` likely replacing earlier nodes by id collision or similar. |
-| TextField backgrounds (username + password Rect) missing | 5 Rect instances emitted from compute (canvas + panel + 2 fields + button), but fields aren't visible. HashMap iteration order? Or color-token collision with panel? Distinct from the text issue — Rect path didn't change. |
 | Window position not centered | `frescod-vulkan-smoke` doesn't composite, just dumps the raw 1280×720 render target. A real WM would center the window. |
 | Real scanout via `frescod` (not smoke) fails | Kernel log shows `RESOURCE_CREATE_BLOB` timeout — fresco→kmod→QEMU integration issue, separate from Pergola. |
-
-The remaining text + rect anomalies need fresco-server debugging
-(probably in `fresco-scene-server/src/scene.rs`'s `set_node` /
-`text_run_install` path) — the LogSurface + smoke log confirm Pergola
-sends 3 size-15 text runs, fresco-server allocates and patches the
-atlas correctly, but the per-frame scene-graph traversal only emits
-one TextRun GPU node for them.
 
 ## How this was produced
 

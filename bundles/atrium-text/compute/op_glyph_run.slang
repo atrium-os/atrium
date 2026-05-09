@@ -5,12 +5,16 @@
 // (dx, dy) offsets from the origin. The kernel expands one node into
 // N InstanceRecords for the render pipeline to draw.
 //
-// Scene buffer layout (matches the pre-Slang GLSL, 96 B per node):
+// Scene buffer layout — 64 B per node (4× vec4):
 //   bytes  0..15           header     = uint node_count + 12 B pad
-//   bytes 16..31  + 96*N   nodes[N].origin     (float4)
-//   bytes 32..47  + 96*N   nodes[N].atlas_dim  (float4)
-//   bytes 48..63  + 96*N   nodes[N].color      (float4)
-//   bytes 64..79  + 96*N   nodes[N].meta       (int4: glyph_count, glyph_offset, _, _)
+//   bytes 16..31  + 64*N   nodes[N].origin     (float4)
+//   bytes 32..47  + 64*N   nodes[N].atlas_dim  (float4)
+//   bytes 48..63  + 64*N   nodes[N].color      (float4)
+//   bytes 64..79  + 64*N   nodes[N].meta       (int4: glyph_count, glyph_offset, _, _)
+// Stride 64 matches Rust's `GlyphRunNode` (4× [f32; 4]). Earlier
+// kernels used stride 96 mistakenly, which corrupted reads of any
+// node beyond the first within a batch — visible as "only one text
+// run per atlas renders".
 //
 // GlyphInstance layout (32 B per glyph, packed std430-style):
 //   d_offset.xy           (float2)        bytes 0..7
@@ -61,8 +65,8 @@ void comp_main(uint3 tid : SV_DispatchThreadID)
         return;
     }
 
-    /* Read this run's SceneNode (96 B at offset 16 + 96*id). */
-    uint base       = 16u + 96u * id;
+    /* Read this run's SceneNode (64 B at offset 16 + 64*id). */
+    uint base       = 16u + 64u * id;
     float4 origin     = asfloat(scene.Load4(base       ));
     float4 atlas_dim  = asfloat(scene.Load4(base + 16u));
     float4 color      = asfloat(scene.Load4(base + 32u));
