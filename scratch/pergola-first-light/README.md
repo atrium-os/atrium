@@ -46,6 +46,17 @@ timeout that's unrelated to Pergola).
   GPU still sees a baseline. Placeholders sit cleanly inside their
   TextFields, button label centers on the button.
 
+- **`v8-teal-window.png`** — Atrium signature deep teal as the window
+  background. New `palette::deep_teal()` (linear `[0.04, 0.50, 0.55]`
+  — matches fresco-vulkan's render-target clear color exactly so the
+  window blends seamlessly into unpainted areas) and a new
+  `Semantic::bg_window()` token distinct from `bg_canvas` (the latter
+  stays as the recessed neutral used by inputs). Vestibulum's outer
+  rect uses `bg_window`. Pairs naturally with white text — about
+  4.7:1 WCAG contrast vs 4.5:1 for black, both pass AA but white
+  reads better and matches the "saturated dark hue + light text"
+  convention.
+
 ## What proved
 
 - Pergola → fresco-client → fresco-server → MoltenVK → Metal →

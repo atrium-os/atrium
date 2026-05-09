@@ -94,6 +94,13 @@ pub mod palette {
     pub fn neutral_900() -> Color { Color::from_hex("#181C20") }
     pub fn neutral_950() -> Color { Color::from_hex("#0E1114") }
 
+    /// Atrium signature deep teal — the chromatic neutral used as the
+    /// outermost window background. Hand-tuned to match the linear
+    /// values fresco-vulkan uses for its render-target clear color
+    /// (`[0.04, 0.50, 0.55]`), so the window blends seamlessly into
+    /// any unpainted area on first paint.
+    pub fn deep_teal() -> Color { Color::rgba(0.04, 0.50, 0.55, 1.0) }
+
     // Atrium amber-bronze accent (Romanesque, single accent)
     pub fn accent_50() -> Color { Color::from_hex("#FBF1E5") }
     pub fn accent_100() -> Color { Color::from_hex("#F4DEC0") }
@@ -133,11 +140,22 @@ impl Semantic {
     pub const LIGHT: Self = Self { mode: Mode::Light };
     pub const DARK: Self = Self { mode: Mode::Dark };
 
+    /// Outermost window background — Atrium signature teal in light
+    /// mode, near-black in dark. This is a level *above* `bg_canvas`:
+    /// it's the color you see in any area not painted by the app's
+    /// surfaces (e.g. the margin outside a centered panel). Use this
+    /// for the root window-fill rect.
+    pub fn bg_window(&self) -> Color {
+        match self.mode {
+            Mode::Light => palette::deep_teal(),
+            Mode::Dark => palette::neutral_950(),
+        }
+    }
     pub fn bg_canvas(&self) -> Color {
-        // Light mode inverts the dark-mode raise direction: raised
-        // surfaces are *lighter* (toward white) on dark, *also*
-        // lighter on light. So light's canvas is slightly darker
-        // (neutral_100) so panels (neutral_50) read as raised.
+        // Recessed neutral — the slightly-darker-than-elevated fill
+        // used for inputs and other inset surfaces sitting on top of
+        // a panel. Distinct from `bg_window`: this lives *inside* the
+        // panel hierarchy.
         match self.mode {
             Mode::Light => palette::neutral_100(),
             Mode::Dark => palette::neutral_950(),

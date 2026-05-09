@@ -51,10 +51,10 @@ impl View for LoginView {
     fn render(&self, ctx: &mut Ctx) {
         let theme = ctx.theme;
 
-        // Canvas background — neutral_50 covers the rest of the window.
+        // Window background — Atrium signature deep teal.
         ctx.tree.insert(None, Node::Rect {
             rect: Rect::new(0.0, 0.0, WIN_W as f32, WIN_H as f32),
-            fill: theme.bg_canvas(),
+            fill: theme.bg_window(),
             radius: 0.0,
         });
 
