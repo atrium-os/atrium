@@ -57,6 +57,16 @@ timeout that's unrelated to Pergola).
   reads better and matches the "saturated dark hue + light text"
   convention.
 
+- **`v9-fullscreen.png`** — vestibulum reshaped as a pre-WM access
+  manager: full 1280×720, no neutral panel card, form floats directly
+  on the teal `bg_window`. Heading + subhead use the new
+  `theme.text_auto_on(bg)` (which delegates to `Color::auto_on`,
+  WCAG-luminance-based black-or-white pick); subhead gets a softer
+  feel via `with_alpha(0.85)`. TextField bgs stay as recessed
+  neutrals — they read as light inset fields on the teal, the way
+  login forms typically look. Once the WM lands, normal
+  panel/canvas/border policy kicks in for non-login apps.
+
 ## What proved
 
 - Pergola → fresco-client → fresco-server → MoltenVK → Metal →

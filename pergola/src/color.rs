@@ -53,6 +53,48 @@ impl Color {
     pub fn with_alpha(self, factor: f32) -> Self {
         Self { a: (self.a * factor).clamp(0.0, 1.0), ..self }
     }
+
+    /// WCAG 2.x relative luminance of this color, range `[0.0, 1.0]`,
+    /// alpha ignored.
+    ///
+    /// Subtle: our `Color` is documented as linear, but fresco-vulkan's
+    /// current output path writes those values straight to a
+    /// `BGRA8_UNORM` framebuffer (no sRGB encoding), so each component
+    /// ends up displayed as if it were already sRGB-encoded. Auto-
+    /// contrast picks have to match what users actually see, so we
+    /// treat the stored components AS sRGB for the WCAG calculation
+    /// — apply the sRGB→linear transfer once before the weighted sum.
+    /// When fresco-vulkan grows a proper linear→sRGB output stage
+    /// (TODO: BGRA8_SRGB swapchain or fragment-shader encoding), drop
+    /// the inner conversion and read the components straight.
+    pub fn relative_luminance(self) -> f32 {
+        let l = |c: f32| -> f32 {
+            if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * l(self.r) + 0.7152 * l(self.g) + 0.0722 * l(self.b)
+    }
+
+    /// Pick black or white — whichever has the higher WCAG contrast
+    /// ratio against `bg` — for foreground text on `bg`. Use this
+    /// when a widget's background isn't statically known (e.g. text
+    /// rendered directly on a chromatic `bg_window`, or any user-
+    /// themed surface).
+    ///
+    /// `bg.a` is treated as opaque for the contrast calculation;
+    /// callers wanting an alpha-blended check should pre-composite.
+    pub fn auto_on(bg: Color) -> Color {
+        let l_bg    = bg.relative_luminance();
+        let l_white = 1.0;
+        let l_black = 0.0;
+        // Contrast ratio per WCAG: (L_lighter + 0.05) / (L_darker + 0.05).
+        let contrast_white = (l_white + 0.05) / (l_bg + 0.05);
+        let contrast_black = (l_bg + 0.05) / (l_black + 0.05);
+        if contrast_white >= contrast_black {
+            Color::rgba(1.0, 1.0, 1.0, 1.0)
+        } else {
+            Color::rgba(0.0, 0.0, 0.0, 1.0)
+        }
+    }
 }
 
 /// Standard sRGB → linear transfer.
@@ -86,5 +128,21 @@ mod tests {
     fn alpha_propagates() {
         let c = Color::from_hex("#FFFFFF80");
         assert!((c.a - 128.0 / 255.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn auto_on_dark_picks_white() {
+        // Atrium deep teal — linear (0.04, 0.50, 0.55).
+        let teal = Color::rgba(0.04, 0.50, 0.55, 1.0);
+        let fg = Color::auto_on(teal);
+        assert_eq!(fg.r, 1.0); assert_eq!(fg.g, 1.0); assert_eq!(fg.b, 1.0);
+    }
+
+    #[test]
+    fn auto_on_light_picks_black() {
+        // Near-white panel.
+        let panel = Color::from_hex("#FAFBFC");
+        let fg = Color::auto_on(panel);
+        assert_eq!(fg.r, 0.0); assert_eq!(fg.g, 0.0); assert_eq!(fg.b, 0.0);
     }
 }

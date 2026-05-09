@@ -227,6 +227,16 @@ impl Semantic {
             Mode::Dark => palette::accent_300(),
         }
     }
+
+    /// Auto-contrast text color: returns whichever of black or white
+    /// has the higher WCAG contrast ratio against `bg`. Use when the
+    /// widget's background isn't statically known (text directly on
+    /// `bg_window`, transparent panels, themed surfaces). Prefer the
+    /// statically-typed `text_primary`/`text_secondary` when the
+    /// widget always sits on a known panel surface.
+    pub fn text_auto_on(&self, bg: Color) -> Color {
+        Color::auto_on(bg)
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
