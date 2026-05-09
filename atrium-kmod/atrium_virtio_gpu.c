@@ -62,13 +62,19 @@
 #define VIRTIO_PCI_VENDOR        0x1af4
 #define VIRTIO_GPU_PCI_DEVICE    0x1050
 
-/* Feature mask. CONTEXT_INIT lets us drive virtio-gpu's
- * SUBMIT_3D / CTX_CREATE machinery — required for venus paravirt
- * Vulkan. We negotiate it; if the host doesn't have it, the kmod
- * still drives the basic 2D/scanout path fine and venus ioctls
- * return ENOTSUP at runtime. */
+/*
+ * Atrium GPU host contract (see docs/spec/atrium-gpu-host-contract.md):
+ *   - F_CONTEXT_INIT — required for venus / per-context async fences
+ *     (SUBMIT_3D / CTX_CREATE machinery for paravirt Vulkan).
+ *   - F_RESOURCE_BLOB — required for scanout. The kmod's canonical
+ *     scanout path is BLOB-based (RESOURCE_CREATE_BLOB +
+ *     SET_SCANOUT_BLOB), unifying venus, plain virtio-gpu, and any
+ *     future native backends behind one host-side wire format. Hosts
+ *     that don't advertise F_RESOURCE_BLOB fail attach.
+ */
 #define ATRIUM_VIRTIO_GPU_FEATURES \
-	((1ULL << VIRTIO_GPU_F_CONTEXT_INIT))
+	((1ULL << VIRTIO_GPU_F_CONTEXT_INIT) | \
+	 (1ULL << VIRTIO_GPU_F_RESOURCE_BLOB))
 
 static struct virtio_feature_desc atrium_virtio_gpu_feature_desc[] = {
 	{ VIRTIO_GPU_F_VIRGL,         "VirGL"       },
@@ -240,15 +246,10 @@ struct atrium_gpu_file {
 };
 
 /* Forward declarations: virtio-gpu helpers used by display ioctl handlers
- * which appear textually before the helpers in this file. */
-static int atrium_vgpu_resource_create_2d(struct atrium_gpu_softc *,
-    uint32_t, uint32_t, uint32_t, uint32_t);
-static int atrium_vgpu_attach_backing_single(struct atrium_gpu_softc *,
-    uint32_t, vm_paddr_t, uint32_t);
-static int atrium_vgpu_set_scanout(struct atrium_gpu_softc *, uint32_t,
-    uint32_t, uint32_t, uint32_t);
-static int atrium_vgpu_transfer_to_host_2d(struct atrium_gpu_softc *,
-    uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint64_t);
+ * which appear textually before the helpers in this file. Scanout uses
+ * the unified BLOB path — see atrium_promote_bo_to_resource. */
+static int atrium_vgpu_set_scanout_blob(struct atrium_gpu_softc *,
+    uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
 static int atrium_vgpu_resource_flush(struct atrium_gpu_softc *,
     uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
 static int atrium_vgpu_ensure_display_info(struct atrium_gpu_softc *);
@@ -1024,10 +1025,25 @@ atrium_display_bind_gpu(struct atrium_display_file *df,
 	return (0);
 }
 
-/* Promote a CPU-allocated BO to a virtio-gpu resource (CREATE_2D +
- * ATTACH_BACKING). Idempotent: if already promoted at the same
- * dimensions/format, returns immediately. Caller MUST NOT hold bo_lock
- * (helpers take ctrl_lock and may sleep). */
+/* Promote a CPU-allocated BO to a virtio-gpu BLOB resource. The BLOB
+ * path (RESOURCE_CREATE_BLOB with blob_mem=GUEST + a single mem_entry
+ * pointing at the BO's contiguous physical pages) is the canonical
+ * scanout format across all host backends — venus, plain virtio-gpu,
+ * future native drivers — so the kmod's scanout command set stays
+ * single-formed. Idempotent: if already promoted at the same
+ * dimensions/format, returns immediately.
+ *
+ * Caller MUST NOT hold bo_lock (helpers take ctrl_lock and may sleep).
+ *
+ * Requires the host to advertise F_RESOURCE_BLOB; we negotiate it in
+ * `ATRIUM_VIRTIO_GPU_FEATURES` and abort attach if absent (see header
+ * comment). The runtime check here is belt-and-suspenders: if a host
+ * misadvertises, we surface ENOTSUP at scanout time rather than
+ * silently timing out on RESOURCE_CREATE_BLOB. */
+static int atrium_vgpu_resource_create_blob_scanout(
+    struct atrium_gpu_softc *sc, uint32_t resource_id, uint64_t size,
+    vm_paddr_t pa);
+
 static int
 atrium_promote_bo_to_resource(struct atrium_gpu_softc *sc,
     struct atrium_gpu_bo *bo, uint32_t format, uint32_t w, uint32_t h)
@@ -1048,14 +1064,19 @@ atrium_promote_bo_to_resource(struct atrium_gpu_softc *sc,
 	if (bo->virtio_resource_id != 0)
 		return (EBUSY);  /* re-bind not supported in v0.1 */
 
+	if ((sc->features & (1ULL << VIRTIO_GPU_F_RESOURCE_BLOB)) == 0) {
+		device_printf(sc->dev,
+		    "scanout: host does not advertise F_RESOURCE_BLOB; "
+		    "Atrium requires it (see docs/spec/atrium-gpu-host-contract.md)\n");
+		return (ENOTSUP);
+	}
+
 	mtx_lock(&sc->bo_lock);
 	rid = sc->next_resource_id++;
 	mtx_unlock(&sc->bo_lock);
 
-	if ((err = atrium_vgpu_resource_create_2d(sc, rid, format, w, h)) != 0)
-		return (err);
-	if ((err = atrium_vgpu_attach_backing_single(sc, rid, bo->pa,
-	    (uint32_t)need)) != 0)
+	if ((err = atrium_vgpu_resource_create_blob_scanout(sc, rid,
+	    bo->size, bo->pa)) != 0)
 		return (err);
 
 	bo->virtio_resource_id = rid;
@@ -1159,7 +1180,11 @@ atrium_display_set_mode(struct atrium_gpu_softc *sc,
 		return (err);
 	rid = bo->virtio_resource_id;
 
-	return (atrium_vgpu_set_scanout(sc, args->connector_id, rid, w, h));
+	/* SET_SCANOUT_BLOB carries the format + stride explicitly — unlike
+	 * legacy SET_SCANOUT (which derives them from the prior
+	 * RESOURCE_CREATE_2D). This is the unified path. */
+	return (atrium_vgpu_set_scanout_blob(sc, args->connector_id, rid,
+	    VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM, w, h));
 }
 
 static int
@@ -1168,7 +1193,6 @@ atrium_display_page_flip(struct atrium_gpu_softc *sc,
 {
 	struct atrium_gpu_bo *bo;
 	uint32_t rid, w, h;
-	int err;
 
 	if (args->flags & FRESCO_PAGE_FLIP_INCLUDE_CURSOR)
 		return (EINVAL);  /* reserved for v0.2 */
@@ -1183,8 +1207,9 @@ atrium_display_page_flip(struct atrium_gpu_softc *sc,
 	w   = bo->scanout_width;
 	h   = bo->scanout_height;
 
-	if ((err = atrium_vgpu_transfer_to_host_2d(sc, rid, 0, 0, w, h, 0)) != 0)
-		return (err);
+	/* No TRANSFER_TO_HOST_2D for BLOB resources — the host reads
+	 * guest RAM directly via the mem_entry we registered at
+	 * CREATE_BLOB time. Just FLUSH to redraw the rectangle. */
 	return (atrium_vgpu_resource_flush(sc, rid, 0, 0, w, h));
 }
 
@@ -1420,76 +1445,70 @@ atrium_vgpu_check_ok(struct atrium_gpu_softc *sc, const char *what,
 	return (EIO);
 }
 
+/* Scanout-grade BLOB resource creation. blob_mem=GUEST + a single
+ * mem_entry pointing at the BO's contiguous physical pages; the host
+ * reads guest RAM directly (no separate TRANSFER step needed). Uses
+ * plain FENCE without INFO_RING_IDX — scanout is a global (no-ctx)
+ * operation, unlike venus's per-context blob path which routes
+ * through the per-ctx async-fence ring. */
 static int
-atrium_vgpu_resource_create_2d(struct atrium_gpu_softc *sc,
-    uint32_t resource_id, uint32_t format, uint32_t w, uint32_t h)
+atrium_vgpu_resource_create_blob_scanout(struct atrium_gpu_softc *sc,
+    uint32_t resource_id, uint64_t size, vm_paddr_t pa)
 {
 	struct {
-		struct virtio_gpu_resource_create_2d req;
-		char pad;
-		struct virtio_gpu_ctrl_hdr resp;
-	} s;
-	int err;
-
-	bzero(&s, sizeof(s));
-	s.req.hdr.type     = htole32(VIRTIO_GPU_CMD_RESOURCE_CREATE_2D);
-	s.req.hdr.flags    = htole32(VIRTIO_GPU_FLAG_FENCE);
-	s.req.hdr.fence_id = htole64(atomic_fetchadd_64(&sc->next_fence, 1));
-	s.req.resource_id  = htole32(resource_id);
-	s.req.format       = htole32(format);
-	s.req.width        = htole32(w);
-	s.req.height       = htole32(h);
-
-	err = atrium_vgpu_req_resp(sc, &s.req, sizeof(s.req),
-	    &s.resp, sizeof(s.resp));
-	if (err != 0)
-		return (err);
-	return (atrium_vgpu_check_ok(sc, "RESOURCE_CREATE_2D", &s.resp));
-}
-
-static int
-atrium_vgpu_attach_backing_single(struct atrium_gpu_softc *sc,
-    uint32_t resource_id, vm_paddr_t pa, uint32_t length)
-{
-	struct {
-		struct virtio_gpu_resource_attach_backing req;
+		struct virtio_gpu_resource_create_blob req;
 		struct virtio_gpu_mem_entry              ent;
 		char pad;
 		struct virtio_gpu_ctrl_hdr resp;
 	} s;
 	int err;
 
+	if (size > (uint64_t)UINT32_MAX) {
+		device_printf(sc->dev,
+		    "scanout blob: size %llu exceeds single-mem_entry cap\n",
+		    (unsigned long long)size);
+		return (EINVAL);
+	}
+
 	bzero(&s, sizeof(s));
-	s.req.hdr.type     = htole32(VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING);
+	s.req.hdr.type     = htole32(VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB);
 	s.req.hdr.flags    = htole32(VIRTIO_GPU_FLAG_FENCE);
 	s.req.hdr.fence_id = htole64(atomic_fetchadd_64(&sc->next_fence, 1));
 	s.req.resource_id  = htole32(resource_id);
+	s.req.blob_mem     = htole32(VIRTIO_GPU_BLOB_MEM_GUEST);
+	s.req.blob_flags   = 0;
+	s.req.blob_id      = 0;       /* unused for MEM_GUEST */
+	s.req.size         = htole64(size);
 	s.req.nr_entries   = htole32(1);
 	s.ent.addr         = htole64((uint64_t)pa);
-	s.ent.length       = htole32(length);
+	s.ent.length       = htole32((uint32_t)size);
 
-	/* Request is the header struct + one mem_entry, contiguous. */
 	err = atrium_vgpu_req_resp(sc,
 	    &s.req, sizeof(s.req) + sizeof(s.ent),
 	    &s.resp, sizeof(s.resp));
 	if (err != 0)
 		return (err);
-	return (atrium_vgpu_check_ok(sc, "RESOURCE_ATTACH_BACKING", &s.resp));
+	return (atrium_vgpu_check_ok(sc, "RESOURCE_CREATE_BLOB(scanout)",
+	    &s.resp));
 }
 
+/* SET_SCANOUT_BLOB binds a BLOB resource to a scanout, carrying
+ * width/height/format/stride explicitly (legacy SET_SCANOUT inherited
+ * those from a prior RESOURCE_CREATE_2D). Single-plane only — strides
+ * [1..3] and offsets[1..3] are zero (BGRA8 is one plane). */
 static int
-atrium_vgpu_set_scanout(struct atrium_gpu_softc *sc, uint32_t scanout_id,
-    uint32_t resource_id, uint32_t w, uint32_t h)
+atrium_vgpu_set_scanout_blob(struct atrium_gpu_softc *sc, uint32_t scanout_id,
+    uint32_t resource_id, uint32_t format, uint32_t w, uint32_t h)
 {
 	struct {
-		struct virtio_gpu_set_scanout req;
+		struct virtio_gpu_set_scanout_blob req;
 		char pad;
 		struct virtio_gpu_ctrl_hdr resp;
 	} s;
 	int err;
 
 	bzero(&s, sizeof(s));
-	s.req.hdr.type     = htole32(VIRTIO_GPU_CMD_SET_SCANOUT);
+	s.req.hdr.type     = htole32(VIRTIO_GPU_CMD_SET_SCANOUT_BLOB);
 	s.req.hdr.flags    = htole32(VIRTIO_GPU_FLAG_FENCE);
 	s.req.hdr.fence_id = htole64(atomic_fetchadd_64(&sc->next_fence, 1));
 	s.req.r.x          = 0;
@@ -1498,42 +1517,18 @@ atrium_vgpu_set_scanout(struct atrium_gpu_softc *sc, uint32_t scanout_id,
 	s.req.r.height     = htole32(h);
 	s.req.scanout_id   = htole32(scanout_id);
 	s.req.resource_id  = htole32(resource_id);
+	s.req.width        = htole32(w);
+	s.req.height       = htole32(h);
+	s.req.format       = htole32(format);
+	s.req.padding      = 0;
+	s.req.strides[0]   = htole32(w * 4);
+	s.req.offsets[0]   = 0;
 
 	err = atrium_vgpu_req_resp(sc, &s.req, sizeof(s.req),
 	    &s.resp, sizeof(s.resp));
 	if (err != 0)
 		return (err);
-	return (atrium_vgpu_check_ok(sc, "SET_SCANOUT", &s.resp));
-}
-
-static int
-atrium_vgpu_transfer_to_host_2d(struct atrium_gpu_softc *sc,
-    uint32_t resource_id, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
-    uint64_t offset)
-{
-	struct {
-		struct virtio_gpu_transfer_to_host_2d req;
-		char pad;
-		struct virtio_gpu_ctrl_hdr resp;
-	} s;
-	int err;
-
-	bzero(&s, sizeof(s));
-	s.req.hdr.type     = htole32(VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D);
-	s.req.hdr.flags    = htole32(VIRTIO_GPU_FLAG_FENCE);
-	s.req.hdr.fence_id = htole64(atomic_fetchadd_64(&sc->next_fence, 1));
-	s.req.r.x          = htole32(x);
-	s.req.r.y          = htole32(y);
-	s.req.r.width      = htole32(w);
-	s.req.r.height     = htole32(h);
-	s.req.offset       = htole64(offset);
-	s.req.resource_id  = htole32(resource_id);
-
-	err = atrium_vgpu_req_resp(sc, &s.req, sizeof(s.req),
-	    &s.resp, sizeof(s.resp));
-	if (err != 0)
-		return (err);
-	return (atrium_vgpu_check_ok(sc, "TRANSFER_TO_HOST_2D", &s.resp));
+	return (atrium_vgpu_check_ok(sc, "SET_SCANOUT_BLOB", &s.resp));
 }
 
 static int
@@ -2137,6 +2132,20 @@ atrium_virtio_gpu_attach(device_t dev)
 	sc->features = virtio_negotiate_features(dev, ATRIUM_VIRTIO_GPU_FEATURES);
 	if ((err = virtio_finalize_features(dev)) != 0) {
 		device_printf(dev, "virtio_finalize_features failed: %d\n", err);
+		goto fail_locks;
+	}
+
+	/* Atrium GPU host contract: F_RESOURCE_BLOB is required (canonical
+	 * scanout path is BLOB-based). Fail fast at attach rather than
+	 * deferring to a SCANOUT-time ENOTSUP — a misconfigured host
+	 * should be obvious in dmesg, not surface as "first frame
+	 * mysteriously errors". */
+	if ((sc->features & (1ULL << VIRTIO_GPU_F_RESOURCE_BLOB)) == 0) {
+		device_printf(dev,
+		    "host does not advertise VIRTIO_GPU_F_RESOURCE_BLOB; "
+		    "Atrium requires it for scanout. See "
+		    "docs/spec/atrium-gpu-host-contract.md\n");
+		err = ENOTSUP;
 		goto fail_locks;
 	}
 
