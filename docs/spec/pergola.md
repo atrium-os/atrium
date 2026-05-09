@@ -209,6 +209,27 @@ internally.
 - **Cross-app shared widget cache**: e.g. a "system Button" rendered
   once on the GPU and reused across apps. Future optimization.
 
+### §8.1 Near-term Pergola TODO
+
+- **Auto-contrast text color.** Add `Color::auto_on(bg)` (and a
+  `theme.text_auto_on(bg) -> Color` convenience) that picks black or
+  white based on WCAG relative-luminance contrast, so widgets placed
+  on chromatic / unknown backgrounds (e.g. a transparent panel over
+  `bg_window`) don't render unreadable text. Keep `text_primary` /
+  `text_secondary` semantics unchanged — auto-color is opt-in by
+  callers that don't know their background statically. Unblocks the
+  "transparent vestibulum panel on teal" pattern below.
+- **Pre-WM full-screen + transparent-shell pattern for login apps.**
+  Vestibulum is the only app running before login; there's no
+  multi-window WM yet, so it should fill the framebuffer and let the
+  teal `bg_window` show through (no neutral panel card). Once WM
+  policy kicks in post-login, normal panel/canvas/border tokens
+  apply. Needs: (a) auto-contrast text (above) so the heading +
+  subhead remain readable on teal; (b) a way for an app to request
+  "framebuffer-sized" without hardcoding 1280×720; (c) a convention
+  for "panel-less" or "transparent shell" — likely just a
+  `Stack`-rooted form rather than a `bg_elevated` rect.
+
 ---
 
 ## §9. Roadmap alignment
