@@ -630,16 +630,25 @@ Wrapper-worthy. If you find yourself doing this dance more than twice, write a `
 
 #### Build cycle: rebuilding atrium-mesa inside the VM
 
-After pushing changes to `atrium-os/mesa atrium/main`:
+Iterating on a venus / atrium-renderer change you've made on the host:
 
 ```sh
-~/src/bsd/scripts/vssh "cd /root/mesa && git pull --ff-only && \
-                        ninja -C build-atrium src/virtio/vulkan/libvulkan_virtio.so"
+# Fast path: rsync just the changed files (do this from host, not VM —
+# 9p file-descriptor exhaustion makes large rsyncs over /mnt/mesa fail
+# halfway with "Too many open files (24)").
+rsync -az -e "ssh -p 2222" \
+    ~/src/bsd/external/mesa/src/virtio/vulkan/ \
+    root@127.0.0.1:/root/mesa/src/virtio/vulkan/
+~/src/bsd/scripts/vssh "cd /root/mesa/build-atrium && ninja install"
 ```
 
-No codesign step here — the guest is FreeBSD, not macOS. Just rebuild and re-run the test. Mesa builds incremental in seconds.
+No codesign step here — the guest is FreeBSD, not macOS. Mesa builds incremental in seconds.
+
+**If `/root/mesa` doesn't exist** (post-baseline-restore), see "Post-restore reinstall sequence" below for the from-scratch path.
 
 #### Build cycle: rebuilding atrium-kmod
+
+The simple case — `/mnt/host` is mounted and `/usr/src` is present:
 
 ```sh
 ~/src/bsd/scripts/vssh "cd /mnt/host/atrium-kmod && make"
@@ -653,6 +662,153 @@ For changes that need to apply on first attach (e.g., a new field that gets init
 ```
 
 `loader.conf` already has `atrium_virtio_gpu_load="YES"` so the new copy auto-loads on next boot.
+
+**Gotchas when copying the kmod source into the VM:**
+
+- `make` here means *bmake* (FreeBSD make), not GNU make. It expects `bsd.kmod.mk` from `/usr/share/mk/` and headers from `/usr/src/sys/`. If `/usr/src` is empty (post-baseline-restore), bmake stops with "Unable to locate the kernel source tree" — install `src.txz` first (see "Post-restore reinstall sequence").
+- `bsd.kmod.mk` generates a `machine` symlink in the source dir pointing at the arch-specific sys headers. **`scp -r` of the atrium-kmod tree from macOS follows that symlink and dies with `local stat "machine": No such file or directory`** because the host doesn't have `/usr/src/sys/arm64/include`. Use `tar` over SSH and exclude the symlink:
+
+  ```sh
+  tar cf - --exclude='atrium-kmod/machine' --exclude='atrium-kmod/bootfb/machine' \
+          atrium-kmod | \
+    ssh -p 2222 root@127.0.0.1 'cd /root && rm -rf atrium-kmod && tar xf -'
+  vssh 'cd /root/atrium-kmod && rm -f machine bootfb/machine && make'
+  ```
+
+- macOS `tar c` preserves extended attributes by default; the receiving FreeBSD `tar x` prints `Cannot restore extended attributes: com.apple.provenance: Unknown error: -1` for every file. **Harmless** — the file contents land correctly. Add `--no-xattrs` to silence, but the warning is just noise.
+
+#### Restoring the dev VM from `vm.qcow2.xz` baseline
+
+**When you need to do this:** kernel panicked AND the qcow2 fs is corrupted (rare with ZFS root); a destructive in-VM experiment broke `/lib` or `/boot`; you replaced a system library with an ABI-incompatible copy and now sshd dies on every connection (see "replacing system libraries safely" below for how to avoid that).
+
+```sh
+pkill -9 qemu-system-aarch64
+xz -dkf ~/src/bsd/vm/vm.qcow2.xz   # 1.2 GB → 1.7 GB, ~30s
+~/src/bsd/scripts/run-vm.sh --venus    # or whatever profile
+```
+
+ZFS imports cleanly after restore — no fsck step.
+
+**What the baseline xz contains** (as of 2026-05-09): vanilla `build-zfs-root.sh` output + atrium-virtio-gpu kmod preloaded. **It does NOT contain:**
+
+- atrium-mesa userspace (`/usr/local/lib/libvulkan_virtio.so`, ICD JSON)
+- atrium-core / atrium-text bundles (`/usr/local/share/atrium/bundles/`)
+- frescod / vestibulum binaries in `/root/`
+- `/usr/src` (FreeBSD sources — not bundled to keep the xz small)
+- mesa source tree at `/root/mesa/`
+
+So after a baseline restore, a "ready to render" state requires the post-restore reinstall sequence below.
+
+#### Post-restore reinstall sequence (atrium-mesa + bundles + kmod)
+
+Mount host shares first:
+
+```sh
+vssh '
+mkdir -p /mnt/host /mnt/mesa
+mount /mnt/host                                          # bsd_share, in /etc/fstab as noauto
+mount -t p9fs -o trans=virtio mesa_share /mnt/mesa       # mesa-only share, mount on demand
+'
+```
+
+**Bundles** (small, fine over 9p):
+
+```sh
+vssh '
+mkdir -p /usr/local/share/atrium/bundles
+rsync -a /mnt/host/bundles/atrium-core /mnt/host/bundles/atrium-text \
+        /usr/local/share/atrium/bundles/
+'
+```
+
+**atrium-mesa source** — **DO NOT `rsync` over 9p**. The mesa tree is ~30k files and 9p exhausts its file-descriptor pool with "Too many open files (24)" mid-rsync, leaving a partial copy. Use SSH-rsync (host → guest):
+
+```sh
+rsync -avq --delete --exclude=.cache --exclude=build --exclude=.git \
+  -e "ssh -i ~/.ssh/fresco_bsd_ed25519 -o StrictHostKeyChecking=no -o BatchMode=yes -p 2222" \
+  ~/src/bsd/external/mesa/ root@127.0.0.1:/root/mesa/
+```
+
+**atrium-mesa build** — meson + ninja, in-VM (mesa is C, builds fast):
+
+```sh
+vssh 'cd /root/mesa && meson setup build-atrium -Datrium=true -Dplatforms= -Dbuildtype=release && ninja -C build-atrium install'
+```
+
+**atrium-kmod** — the baseline xz already has the kmod preloaded, but it's the *baseline* kmod from when the xz was rolled, missing fixes you've made since. Rebuild + drop into `/boot/modules/` + reboot:
+
+```sh
+# Get the source into the VM. tar+ssh (NOT scp -r — it follows symlinks
+# and the bsd.kmod.mk-generated `machine` symlink in atrium-kmod/ trips it):
+cd ~/src/bsd
+tar cf - --exclude='atrium-kmod/machine' --exclude='atrium-kmod/bootfb/machine' \
+        atrium-kmod | \
+  ssh -i ~/.ssh/fresco_bsd_ed25519 -p 2222 root@127.0.0.1 \
+        'cd /root && rm -rf atrium-kmod && tar xf -'
+
+# Build needs /usr/src for bsd.kmod.mk + sys headers. The baseline xz
+# doesn't have it — install the matching FreeBSD source tarball first:
+vssh 'fetch -o /tmp/src.txz https://download.freebsd.org/releases/arm64/aarch64/16.0-CURRENT/src.txz && tar -xf /tmp/src.txz -C /'
+
+vssh 'cd /root/atrium-kmod && rm -f machine bootfb/machine && make'
+vssh 'cp /root/atrium-kmod/atrium_virtio_gpu.ko /boot/modules/ && shutdown -r now'
+```
+
+`tar` over SSH from macOS prints `Cannot restore extended attributes: com.apple.provenance` warnings for every file — these are harmless macOS xattr noise. The actual files transfer fine.
+
+**Re-snapshot the baseline** once everything is back in place and known-good (saves the next restore from doing this whole dance):
+
+```sh
+vssh 'shutdown -p now'
+xz -k --extreme ~/src/bsd/vm/vm.qcow2 -o ~/src/bsd/vm/vm.qcow2.xz.new
+mv ~/src/bsd/vm/vm.qcow2.xz.new ~/src/bsd/vm/vm.qcow2.xz
+```
+
+#### Replacing system libraries safely (don't burn the VM)
+
+Lesson from 2026-05-10: replacing `/lib/libthr.so.3` with a custom build (`WITHOUT_PTHREADS_ASSERTIONS=yes`) bricked all dynamically-linked binaries, including sshd. The replacement library was 137280 bytes — exactly the size of the original — but had some undiagnosed ABI mismatch. Recovery required full xz restore + reinstall.
+
+**Procedure when you genuinely need to replace a `/lib` or `/usr/lib` library:**
+
+1. **Verify the replacement library loads** with a tiny test program *first*, ideally chrooted or via `LD_LIBRARY_PATH` so failure is recoverable:
+
+   ```sh
+   # In VM, before touching /lib:
+   vssh 'mkdir -p /tmp/libtest && cp /tmp/libthr-build/.../libthr.so.3 /tmp/libtest/
+         LD_LIBRARY_PATH=/tmp/libtest /usr/bin/cat /etc/hosts'
+   ```
+
+   If `cat` segfaults or rtld errors, the replacement is broken — **stop here**. Do not copy into `/lib`.
+
+2. **Keep a copy of the original** before clobbering. `chflags noschg` strips the system-immutable flag, but the file is still there to restore from:
+
+   ```sh
+   vssh 'chflags noschg /lib/libthr.so.3 && cp /lib/libthr.so.3 /root/libthr.so.3.orig'
+   vssh 'cp /tmp/.../libthr.so.3 /lib/libthr.so.3'
+   # Test ssh from a SECOND terminal (don't close the first one!)
+   ssh -i ~/.ssh/fresco_bsd_ed25519 -p 2222 root@127.0.0.1 'echo alive'
+   # If that works, you're fine. If not, rollback:
+   vssh 'cp /root/libthr.so.3.orig /lib/libthr.so.3'   # via the still-open shell
+   ```
+
+3. **Don't replace `libc` or `libsys`.** Those affect every binary including the rollback `cp` itself, and you can wedge yourself with no escape. Only consider this for libraries that aren't a hard dependency of `cp`/`sh`/`ssh`.
+
+#### Capturing the Cocoa window for screenshots
+
+Two paths, depending on whether `--display` is set:
+
+**With `--display` (Cocoa window visible)** — QMP socket is wired:
+
+```sh
+echo "screendump /tmp/atrium.ppm" | nc -U /tmp/qmp.sock -w 2
+sips -s format png /tmp/atrium.ppm --out vm/atrium.png
+```
+
+By default this dumps **console 0**. The default `--venus` profile used to attach two display devices (bochs-display + virtio-gpu-gl-pci); console 0 was bochs (showing "Guest has not initialized the display"), console 1 was the venus framebuffer. As of commit 19b75bd, the `--venus` profile drops bochs and virtio-gpu-gl-pci is the sole device on console 0 — `screendump` without args captures the venus output directly.
+
+If you ever re-add a secondary display device, dump a specific head with: `screendump <filename> <device-id> <head>` — the device id comes from `info qom-tree | grep <device-name>` on the QMP socket.
+
+**Without `--display`** — QMP isn't wired (HMP goes to stdio in headless mode). To screenshot, modify `run-vm.sh` to add `-monitor unix:/tmp/qmp.sock,server=on,wait=off` alongside `-display none`, or reboot with `--display`.
 
 #### MoltenVK env knobs the venus host worker inherits
 
