@@ -146,8 +146,12 @@ for arg in "$@"; do
             # Requires the Atrium-patched QEMU + virglrenderer (-Dvenus=true)
             # plus the Atrium-patched EDK2 that drops VirtioGpuDxe (so the
             # firmware doesn't probe the GL/venus device and hang the boot).
-            VIRTIO_GPU_ARGS="-device bochs-display \
-                             -device virtio-gpu-gl-pci,venus=on,blob=on,hostmem=512M"
+            # bochs-display dropped: with the BLOB-pixman scanout path
+            # (atrium qemu patch), virtio-gpu-gl-pci is the sole display
+            # post-handoff. EDK2 boot splash falls back to virtio-gpu's
+            # own framebuffer, which Cocoa renders fine via the same
+            # pixman path (no GOP needed for the splash on macOS host).
+            VIRTIO_GPU_ARGS="-device virtio-gpu-gl-pci,venus=on,blob=on,hostmem=512M,id=atrium-gpu"
             ;;
         --bochs)
             # bochs-display has BochsDisplayDxe support in the
@@ -182,7 +186,15 @@ done
 # Compose display frontend after arg parse so --tablet works regardless
 # of the flag order on the command line.
 if [ "$WANT_DISPLAY" = 1 ]; then
-    DISPLAY_FRONTEND="-display cocoa -serial mon:stdio \
+    # Keep TCP serial + QMP socket (same as headless NOGRAPHIC) so ddb
+    # remains reachable while the Cocoa window is up. Previously the
+    # display branch routed serial to mon:stdio, which clobbers
+    # ddb_session.py — defeats the point of "panic in display path"
+    # debugging. Use `nc 127.0.0.1 4444` for serial / break with
+    # `~^B`; QMP at /tmp/qmp.sock for screendumps etc.
+    DISPLAY_FRONTEND="-display cocoa \
+                      -serial tcp:127.0.0.1:4444,server=on,wait=off \
+                      -monitor unix:/tmp/qmp.sock,server=on,wait=off \
                       -device qemu-xhci \
                       -device usb-kbd"
     if [ "$WANT_TABLET" = 1 ]; then

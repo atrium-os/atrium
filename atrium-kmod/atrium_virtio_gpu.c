@@ -1623,8 +1623,15 @@ atrium_vgpu_set_scanout_blob(struct atrium_gpu_softc *sc, uint32_t scanout_id,
 
 	bzero(&s, sizeof(s));
 	s.req.hdr.type     = htole32(VIRTIO_GPU_CMD_SET_SCANOUT_BLOB);
-	s.req.hdr.flags    = htole32(VIRTIO_GPU_FLAG_FENCE);
+	/* INFO_RING_IDX routes the fence through the per-context async path;
+	 * the legacy global path is broken under VIRGL_RENDERER_NO_VIRGL
+	 * (the macOS host case). Same as ctx_create / submit_3d. The
+	 * kmod-internal scanout context (ring_idx=0) owns this command. */
+	s.req.hdr.flags    = htole32(VIRTIO_GPU_FLAG_FENCE |
+	                             VIRTIO_GPU_FLAG_INFO_RING_IDX);
 	s.req.hdr.fence_id = htole64(atomic_fetchadd_64(&sc->next_fence, 1));
+	s.req.hdr.ctx_id   = htole32(sc->scanout_ctx_id);
+	s.req.hdr.ring_idx = 0;
 	s.req.r.x          = 0;
 	s.req.r.y          = 0;
 	s.req.r.width      = htole32(w);
@@ -1658,8 +1665,12 @@ atrium_vgpu_resource_flush(struct atrium_gpu_softc *sc, uint32_t resource_id,
 
 	bzero(&s, sizeof(s));
 	s.req.hdr.type     = htole32(VIRTIO_GPU_CMD_RESOURCE_FLUSH);
-	s.req.hdr.flags    = htole32(VIRTIO_GPU_FLAG_FENCE);
+	/* See set_scanout_blob — INFO_RING_IDX needed under NO_VIRGL hosts. */
+	s.req.hdr.flags    = htole32(VIRTIO_GPU_FLAG_FENCE |
+	                             VIRTIO_GPU_FLAG_INFO_RING_IDX);
 	s.req.hdr.fence_id = htole64(atomic_fetchadd_64(&sc->next_fence, 1));
+	s.req.hdr.ctx_id   = htole32(sc->scanout_ctx_id);
+	s.req.hdr.ring_idx = 0;
 	s.req.r.x          = htole32(x);
 	s.req.r.y          = htole32(y);
 	s.req.r.width      = htole32(w);
