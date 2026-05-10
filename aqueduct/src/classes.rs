@@ -46,6 +46,15 @@ pub const CLASS_PORTCULLIS: u8 = 6;
 /// `docs/spec/atrium-input.md`.
 pub const CLASS_INPUT:     u8 = 7;
 
+/// Stoa — persistent session service. Local control plane for
+/// stoad: list/attach/detach/kill sessions, push/pull files,
+/// clipboard ops. The wire-to-stoad-from-stoactl path itself is
+/// direct UDP (for predictive-echo latency); this class is the
+/// local Aqueduct surface used by stoactl, Forum's "Sessions"
+/// panel, and Praeco for session-event notifications. Op
+/// dictionary spec'd in `docs/spec/stoa.md`.
+pub const CLASS_STOA:      u8 = 8;
+
 /// Smoke-test / fuzzing service. Not part of the production
 /// surface; used by aqueduct-echo and unit tests.
 pub const CLASS_ECHO:      u8 = 63;
@@ -65,6 +74,7 @@ pub fn class_name(c: u8) -> &'static str {
         CLASS_AUDIO      => "audio",
         CLASS_PORTCULLIS => "portcullis",
         CLASS_INPUT      => "input",
+        CLASS_STOA       => "stoa",
         CLASS_ECHO       => "echo",
         c if c >= CLASS_VENDOR_BASE => "vendor",
         _ => "reserved",

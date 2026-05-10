@@ -27,13 +27,14 @@ Canonical vocabulary for the Atrium platform. Every component in this table has 
 | **Settings** | **Curia** | senate house | system + per-app settings store |
 | **File manager** | **Scrinium** | document chest | jailed file picker + browser |
 | **Shell (wallpaper + statusbar + dock)** | **Forum** | public plaza | the visible desktop chrome |
+| **Persistent session service** | **Stoa** | (Greek) covered colonnade — public gathering space where people came and went | long-lived shell sessions on the host; clients attach/detach/roam, scrollback persists in Tessera; subsumes terminal emulator + remote-shell client |
 
 ## Foundation apps
 
 User-facing apps don't take Latin names — they keep plain descriptive names with an `atrium-` prefix to namespace their binaries:
 
 - `atrium-edit` — text editor
-- `atrium-term` — terminal emulator
+- `atrium-term` — graphical terminal (implemented as `stoactl-gui` against Stoa; see [`spec/stoa.md`](spec/stoa.md))
 - `atrium-files` — file browser (built atop Scrinium)
 - `atrium-image` — image viewer
 - `atrium-pdf` — PDF viewer
@@ -53,7 +54,8 @@ The user-facing display name can be unprefixed ("Edit", "Term", "Files"); the bi
 | `/dev/atrium-gpu-compute0` | future, capability-gated | per-jail compute access |
 | `/var/run/atrium/portcullisd.sock` | Portcullis | jail-management IPC |
 | `/var/run/atrium/castellumd.sock` | Castellum | bus admin |
-| `/var/run/atrium/{lyrad,tabulad,praecod,opifexd,curiad,scriniumd,vestibulumd}.sock` | respective services | service-specific |
+| `/var/run/atrium/{lyrad,tabulad,praecod,opifexd,curiad,scriniumd,vestibulumd,stoad}.sock` | respective services | service-specific |
+| `/var/db/atrium/stoa/<user>/<sess>/` | Stoa | per-session metadata + WAL pointers (blobs live in Tessera) |
 | `~/.local/share/atrium/apps/*.toml` | user | installed-app manifests |
 | `/var/lib/tessera/cas/*` | Tessera | content-addressed blob store |
 | `/etc/atrium/` | system | platform-wide config |
@@ -111,7 +113,7 @@ GitHub org: **`atrium-os`**. Repo names mirror service names where applicable.
 - **User-facing apps use plain descriptive names with `atrium-` prefix.** Avoids PATH collisions, doesn't burden users with vocabulary.
 - **Cdevs and ioctls use `atrium-` / `ATRIUM_*` prefix.** They're platform-level, not protocol-level.
 - **Fresco stays "Fresco" — it's the protocol, not the OS.** When in doubt, ask: is this about how apps render, or how the platform is configured? Rendering = Fresco, platform = Atrium.
-- **Daemons end in `d`.** `portcullisd`, `castellumd`, `lyrad`, `tabulad`, `praecod`, `opifexd`, `curiad`, `scriniumd`, `vestibulumd`. The dock is a UI app, no `d` suffix needed for `forum`.
+- **Daemons end in `d`.** `portcullisd`, `castellumd`, `lyrad`, `tabulad`, `praecod`, `opifexd`, `curiad`, `scriniumd`, `vestibulumd`, `stoad`. The dock is a UI app, no `d` suffix needed for `forum`.
 
 ## How this reads to a user
 
@@ -132,7 +134,7 @@ $ doas service portcullisd start
 $ ls /var/run/atrium/
   castellumd.sock   lyrad.sock        portcullisd.sock     vestibulumd.sock
   praecod.sock      tabulad.sock      scriniumd.sock       curiad.sock
-  opifexd.sock
+  opifexd.sock      stoad.sock
 
 $ pkg install atrium-edit
   Installing atrium-edit-1.2.3...

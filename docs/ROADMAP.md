@@ -209,6 +209,40 @@ Adjacent infrastructure also shipped this round:
 - FreeBSD `pkg(8)` (apps may use it inside their setup script; standard FreeBSD model — Portcullis is unaware)
 - D1.7 binsplit (function-level dedup; transparent to Portcullis — apps still look like normal ELF at exec time)
 
+## D2.7 — Stoa (persistent session service)
+
+**Deliverable:** ssh into a host, run a shell, walk away with the laptop closed for hours. Reattach from a different machine — same windows, same scrollback, same cwd. Open `atrium-term` on the desktop and it's a graphical client to the same daemon — terminal emulator and remote-shell client collapse into one component. Network drops, daemon restarts, host reboots all preserve scrollback (live processes die only on host reboot, like tmux).
+
+Spec: [`spec/stoa.md`](spec/stoa.md).
+
+**Prerequisites:** D1.5 Tessera (scrollback dedup), D1.6 Aqueduct (control plane), D2.5 Portcullis (session jails).
+
+**Scope:**
+1. `stoad` system daemon: UDP wire (envelope + MAC + replay window), pty multiplexer (windows + panes + tmux-compat keymap), per-session WAL.
+2. Clean-room SSP-shape predictor (permissive license; from the Winstein/Balakrishnan paper, not from mosh source) for local echo over high-RTT links.
+3. `stoa-shell` sshd handoff binary. Reuses existing `~/.ssh/authorized_keys` for auth; MAC key derived from SSH session id.
+4. Tessera-backed scrollback: 64 KiB blob granularity, content-addressed dedup, per-session retention policy.
+5. Multi-client mirror: N clients attached to the same session see the same authoritative state diffs; daemon picks `min(viewport)` for resize.
+6. UDP-over-TCP fallback for corporate-NAT / firewall-blocked-UDP environments.
+7. `stoactl-gui` — Fresco-surface client variant. Becomes the implementation of `atrium-term` in D3.
+8. Aqueduct `CLASS_STOA = 8` for local control plane (`stoactl list`, Forum's "Sessions" panel).
+
+**Risks:**
+- Predictor correctness — the multiplexer-aware input typing (§3.2 of the spec) is the new bit; mosh+tmux gets this wrong, and we're betting we can do it right. Validation: a predictor test harness that replays recorded keystroke streams against canonical pty traces.
+- Tessera unmount during a live session — design says existing sessions continue without persistence; ensure that's the actual behavior under fault injection.
+- Clean-room boundary on the SSP reimpl — track in commit history that the implementer hasn't read mosh's `statesync/`.
+
+**Estimate:** 10–12 weeks focused. 7 slices (S0..S6 in the spec).
+
+**Integrates with:**
+- Tessera (scrollback)
+- Aqueduct (`CLASS_STOA = 8`, control plane)
+- Portcullis + jaild (session-shell privsep)
+- sshd (one-time userauth)
+- Vestibulum (login also opens a session for the seat)
+- Forum (sessions panel)
+- atrium-term — collapses into `stoactl-gui` rather than being a separately-engineered emulator. **This is the win that drops a whole D3 component.**
+
 ## D3 — Forum (shell) + Praeco (notifications)
 
 **Deliverable:** after login: wallpaper + clock/status bar + app launcher dock. Click an icon, Forum asks Portcullis to launch the app in its jail, the app's window appears. Praeco renders transient toasts.
@@ -221,7 +255,8 @@ Adjacent infrastructure also shipped this round:
    - statusbar: clock, battery, network, volume, notification stack.
    - dock: reads `~/.local/share/atrium/apps/*.toml`, shows icons, asks Portcullis to launch.
 2. `praecod` — notification daemon; toast rendering + history.
-3. Window-snap, minimize-to-dock, maximize. Already have move + resize + close from earlier.
+3. `atrium-term` — graphical terminal. **Implemented as `stoactl-gui` against `stoad` (D2.7); not a separately-engineered emulator.** Local sessions use the local stoad over UNIX socket; remote sessions reuse the same binary with a host argument.
+4. Window-snap, minimize-to-dock, maximize. Already have move + resize + close from earlier.
 
 **Risks:** Mostly polish. No big architectural unknowns.
 
