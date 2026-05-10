@@ -49,10 +49,31 @@ Project context lives in claude-memory (`~/.claude/projects/-Users-girivs-src-bs
                           #   examples/hello_slint  HelloWorld Slint component runs through us
 ```
 
-**Sibling repos used:**
-- `~/src/qemu-build/` — modified QEMU (HVF + ivshmem patches). Master is 4 commits ahead of upstream.
-- `~/src/fresco-server/` — Fresco reference server (Rust crate `fresco-server`, Metal backend on macOS). Authoritative wire protocol in `src/command/protocol.rs`, layout in `src/platform/ivshmem.rs`. Renamed from `karythra-gpu-server`; karythra-os Makefile updated in lockstep.
-- `~/src/karythra-os/` — the OS that originated the Fresco protocol. Wire-protocol changes must stay in sync across this repo, `fresco-server`, and `libfresco`.
+**Vendored external clones** (under `~/src/bsd/external/`, gitignored
+— each is its own git working tree with its own remote):
+
+- `external/qemu-build/` — Atrium-patched QEMU (HVF + ivshmem +
+  async-fence + venus-hostmem patches). Origin
+  `gitlab.com/qemu-project/qemu`; ahead by Atrium-specific patches.
+- `external/virglrenderer/` — Atrium-patched virglrenderer. Origin
+  `github.com/atrium-os/virglrenderer atrium/main`; key macOS-host
+  fix is the socketpair-based eventfd emulation (commit `52903fdb`).
+- `external/mesa/` — Atrium-mesa fork. Atrium remote is
+  `github.com/atrium-os/mesa`; venus userspace ICD with
+  `vn_renderer_atrium.c` backend.
+- `external/MoltenVK/` — Atrium-patched MoltenVK. Origin
+  `github.com/atrium-os/MoltenVK`. Used by venus's worker process
+  to drive Apple GPUs through Metal.
+- `external/slang-bin/` — slangc compiler binary distribution
+  (atrium-core/atrium-text bundle SPIR-V build).
+
+**Other Atrium-related siblings (not under `external/`):**
+- `~/src/fresco-server/` — Fresco reference server (Rust crate
+  `fresco-server`, Metal backend on macOS). Predates the BSD port;
+  not vendored. Renamed from `karythra-gpu-server`.
+- `~/src/karythra-os/` — the OS that originated the Fresco protocol.
+  Wire-protocol changes stay in sync across this repo, `fresco-server`,
+  and `libfresco`.
 
 ---
 
@@ -108,7 +129,7 @@ The dev VM root is on **ZFS** (since the 2026-05-09 rebuild — see §11 *Dev VM
 Built into `scripts/run-vm.sh`, but reference here for one-offs:
 
 ```sh
-~/src/qemu-build/build/qemu-system-aarch64 \
+~/src/bsd/external/qemu-build/build/qemu-system-aarch64 \
   -accel hvf -cpu host -machine virt,gic-version=3 \
   -smp 4 -m 12288 \
   -drive if=pflash,format=raw,unit=0,file=~/src/bsd/vm/edk2-aarch64-code.fd,readonly=on \
@@ -424,11 +445,11 @@ D0 step 2d (async fence retirement) and step 3.5 (vblank events, hardware cursor
 ~/src/bsd/scripts/run-vm.sh --venus --display    # add Cocoa window
 ```
 
-`--venus` sets up `bochs-display` (boot splash) + `virtio-gpu-gl-pci,venus=on,blob=on,hostmem=512M` (the venus path), exports `VK_ICD_FILENAMES` to MoltenVK, captures `virgl_render_server` log to `/tmp/virgl-<pid>.log`, and selects the Atrium-patched QEMU under `~/src/qemu-build/build/qemu-system-aarch64`. Requires:
+`--venus` sets up `bochs-display` (boot splash) + `virtio-gpu-gl-pci,venus=on,blob=on,hostmem=512M` (the venus path), exports `VK_ICD_FILENAMES` to MoltenVK, captures `virgl_render_server` log to `/tmp/virgl-<pid>.log`, and selects the Atrium-patched QEMU under `~/src/bsd/external/qemu-build/build/qemu-system-aarch64`. Requires:
 
 - Atrium-patched QEMU (`qemu-build/`) — venus QEMU integration + macOS host shims for the missing EGL/GBM (`virtio-gpu-virgl.c` short-circuits vrend init when `qemu_egl_display` is NULL and adds `VIRGL_RENDERER_NO_VIRGL`).
 - Atrium-patched EDK2 (in the same `qemu-build/roms/edk2/`) — `VirtioGpuDxe` disabled in `ArmVirtPkg/ArmVirtQemu.dsc` and the FDF; otherwise EDK2 probes the GL/venus device at boot and hangs.
-- Atrium-patched `virglrenderer` from `github.com/atrium-os/virglrenderer atrium/main` at `~/src/virglrenderer/build/server/virgl_render_server`, installed to `~/.local/libexec/virgl_render_server` and `~/.local/opt/homebrew/libexec/virgl_render_server` (the loader checks both). Four small macOS-host-venus patches: pthread shim for `<threads.h>` absence; render_log mirror to stderr; `__APPLE__` EOPNOTSUPP fallback in `virgl_renderer_resource_map_fixed` for HVF stage-2; comment on the `mtl_shm` `newBufferWithBytesNoCopy` choice. Source remote: `https://gitlab.freedesktop.org/virgl/virglrenderer.git` as `upstream`.
+- Atrium-patched `virglrenderer` from `github.com/atrium-os/virglrenderer atrium/main` at `~/src/bsd/external/virglrenderer/build/server/virgl_render_server`, installed to `~/.local/libexec/virgl_render_server` and `~/.local/opt/homebrew/libexec/virgl_render_server` (the loader checks both). Four small macOS-host-venus patches: pthread shim for `<threads.h>` absence; render_log mirror to stderr; `__APPLE__` EOPNOTSUPP fallback in `virgl_renderer_resource_map_fixed` for HVF stage-2; comment on the `mtl_shm` `newBufferWithBytesNoCopy` choice. Source remote: `https://gitlab.freedesktop.org/virgl/virglrenderer.git` as `upstream`.
 - MoltenVK ICD at `$(brew --prefix)/etc/vulkan/icd.d/MoltenVK_icd.json` (brew installs it; run-vm.sh points `VK_ICD_FILENAMES` there directly — *don't* use `/tmp/MoltenVK_atrium.json`, that path doesn't survive macOS reboot and is a known V5h regression).
 
 Inside the VM, the V5 atrium-mesa fork lives at `/root/mesa` (cloned from `github.com/atrium-os/mesa atrium/main`). Build the venus driver:
@@ -563,7 +584,7 @@ Trace data + writeup: `scratch/venus-perf/2026-05-08-trace*/`.
 The atrium venus stack depends on `atrium-os/MoltenVK` (one-line fix vs upstream). After `git pull` on the fork:
 
 ```sh
-cd ~/src/MoltenVK
+cd ~/src/bsd/external/MoltenVK
 rm -rf build && mkdir build && cd build
 cmake -G Ninja -DCMAKE_BUILD_TYPE=Release ..
 ninja MoltenVK
@@ -580,10 +601,10 @@ Worker process picks up the patched dylib via the brew ICD JSON path (`$(brew --
 
 #### Build cycle: rebuilding virglrenderer/render_server (Apple Silicon)
 
-After editing `~/src/virglrenderer/`:
+After editing `~/src/bsd/external/virglrenderer/`:
 
 ```sh
-cd ~/src/virglrenderer && ninja -C build
+cd ~/src/bsd/external/virglrenderer && ninja -C build
 cp build/src/libvirglrenderer.1.dylib ~/.local/lib/
 cp build/server/virgl_render_server ~/.local/libexec/
 
@@ -605,7 +626,7 @@ codesign --force --sign - ~/.local/libexec/virgl_render_server
 ~/src/bsd/scripts/run-vm.sh --venus </dev/null >/tmp/qemu-out.log 2>&1 &
 ```
 
-Wrapper-worthy. If you find yourself doing this dance more than twice, write a `~/src/virglrenderer/install.sh`.
+Wrapper-worthy. If you find yourself doing this dance more than twice, write a `~/src/bsd/external/virglrenderer/install.sh`.
 
 #### Build cycle: rebuilding atrium-mesa inside the VM
 
@@ -1196,16 +1217,16 @@ above.
 - The `Latest/` symlink directory under `snapshots/VM-IMAGES/16.0-CURRENT/aarch64/` lists files but every file 404s. Use the dated subdirectory (e.g. `20260413/`) directly. Files there have suffixes like `-20260413-e9fc0c538264-285005.qcow2.xz`.
 
 ### QEMU EFI firmware
-- `~/src/qemu-build/build/qemu-bundle/.../edk2-aarch64-code.fd` is a *symlink* pointing at `~/src/qemu-build/build/pc-bios/edk2-aarch64-code.fd`, but only the bz2 source exists. Decompress it:
+- `~/src/bsd/external/qemu-build/build/qemu-bundle/.../edk2-aarch64-code.fd` is a *symlink* pointing at `~/src/bsd/external/qemu-build/build/pc-bios/edk2-aarch64-code.fd`, but only the bz2 source exists. Decompress it:
   ```sh
-  mkdir -p ~/src/qemu-build/build/pc-bios
-  bunzip2 -kc ~/src/qemu-build/pc-bios/edk2-aarch64-code.fd.bz2 \
-      > ~/src/qemu-build/build/pc-bios/edk2-aarch64-code.fd
+  mkdir -p ~/src/bsd/external/qemu-build/build/pc-bios
+  bunzip2 -kc ~/src/bsd/external/qemu-build/pc-bios/edk2-aarch64-code.fd.bz2 \
+      > ~/src/bsd/external/qemu-build/build/pc-bios/edk2-aarch64-code.fd
   ```
 - pflash files **must** be exactly 64 MiB. `cp` then `truncate -s 67108864`. The decompressed `.fd` is already 64 MiB so the truncate is a no-op but kept defensively in `run-vm.sh`.
 
 ### macOS HVF + ivshmem
-- The doorbell only works because of the **1 ms poll timer patch** in `~/src/qemu-build` (`hw/misc/ivshmem-pci.c`). Upstream QEMU on macOS+HVF does not deliver MSI-X from ivshmem because GLib's main loop never polls pipe fds under HVF. Do not regress this when rebasing QEMU.
+- The doorbell only works because of the **1 ms poll timer patch** in `~/src/bsd/external/qemu-build` (`hw/misc/ivshmem-pci.c`). Upstream QEMU on macOS+HVF does not deliver MSI-X from ivshmem because GLib's main loop never polls pipe fds under HVF. Do not regress this when rebasing QEMU.
 - HVF reports `ISV=0` on guest LDP/STP/LDR/STR to MMIO. Patched in `target/arm/hvf/hvf.c` to decode the instruction and emulate. Without the patch, qemu asserts.
 
 ### MSI-X is broken on FreeBSD/aarch64/qemu+HVF — we use polling instead
@@ -1714,7 +1735,7 @@ separately.
 
 ### Building atrium-mesa (venus userspace)
 
-The Atrium fork of Mesa lives at `~/src/mesa` (sibling to `~/src/bsd`).
+The Atrium fork of Mesa lives at `~/src/bsd/external/mesa` (sibling to `~/src/bsd`).
 Source is rsynced into the VM rather than 9p-mounted because the
 build opens many files concurrently and 9p's FD pressure leads to
 "too many open files" mid-copy.
@@ -1724,7 +1745,7 @@ build opens many files concurrently and 9p's FD pressure leads to
 rsync -a --exclude='.git/' --exclude='build*/' --exclude='__pycache__' \
     -e 'ssh -i ~/.ssh/fresco_bsd_ed25519 -p 2222 \
         -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null' \
-    ~/src/mesa/ root@localhost:/root/mesa/
+    ~/src/bsd/external/mesa/ root@localhost:/root/mesa/
 
 # VM: install build deps
 vssh "pkg install -y meson ninja py311-mako py311-pyyaml pkgconf \
@@ -1760,7 +1781,7 @@ vssh "cd /root/mesa && ninja -C build-atrium"
 vssh "cd /root/mesa && ninja -C build-atrium install"
 ```
 
-`scripts/run-vm.sh` exposes `~/src/mesa` as a second 9p share
+`scripts/run-vm.sh` exposes `~/src/bsd/external/mesa` as a second 9p share
 (`mesa_share` mount tag) for inspecting the build dir from host —
 but **don't** `cp -r` from `/mnt/mesa` inside the VM; 9p's FD pool
 exhausts mid-copy and locks up the guest. Always rsync over SSH.

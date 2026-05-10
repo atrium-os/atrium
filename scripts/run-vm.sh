@@ -38,7 +38,7 @@
 set -eu
 
 BSD_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-QEMU_DIR="/Users/girivs/src/qemu-build"
+QEMU_DIR="$BSD_DIR/external/qemu-build"
 QEMU="$QEMU_DIR/build/qemu-system-aarch64"
 SMP="${SMP:-4}"
 MEM="${MEM:-12288}"
@@ -195,6 +195,7 @@ elif [ "$WANT_TABLET" = 1 ]; then
 fi
 
 exec "$QEMU" \
+    -L "$QEMU_DIR/pc-bios" \
     ${ATRIUM_QEMU_TRACE:+-trace events=$ATRIUM_QEMU_TRACE} \
     -d guest_errors -D /tmp/qemu-guest-errors.log \
     -accel hvf -cpu host -machine virt,gic-version=2 \
@@ -210,7 +211,7 @@ exec "$QEMU" \
     -netdev user,id=net0,hostfwd=tcp::2222-:22 \
     -fsdev local,id=share,path="$SHARE_DIR",security_model=none \
     -device virtio-9p-pci,fsdev=share,mount_tag=bsd_share \
-    -fsdev local,id=mesa,path="$BSD_DIR/../mesa",security_model=none \
+    -fsdev local,id=mesa,path="$BSD_DIR/external/mesa",security_model=none \
     -device virtio-9p-pci,fsdev=mesa,mount_tag=mesa_share \
     $NOGRAPHIC \
     $DISPLAY_FRONTEND \

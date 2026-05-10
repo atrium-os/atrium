@@ -1510,13 +1510,14 @@ atrium_vgpu_req_resp(struct atrium_gpu_softc *sc,
 		device_printf(sc->dev, "req_resp: notified, waiting...\n");
 
 	/* Bounded wait so a missed interrupt doesn't deadlock the caller
-	 * forever. 5 seconds is generous: a virtio-gpu controlq round-
-	 * trip on a healthy host is microseconds. If we time out, we
-	 * report failure and the caller's IOCTL returns EIO instead of
-	 * sleeping uninterruptibly forever. */
+	 * forever. Most virtio-gpu commands round-trip in microseconds,
+	 * but venus context init (CTX_CREATE under venus capset) can take
+	 * seconds while the host's virgl_render_server worker spawns and
+	 * completes its handshake. 60s is generous enough to cover that
+	 * cold path; legitimate failures still surface as EIO. */
 	while (!sc->ctrl_done) {
 		err = cv_timedwait(&sc->ctrl_done_cv, &sc->ctrl_lock,
-		    5 * hz);
+		    60 * hz);
 		if (err == EWOULDBLOCK && !sc->ctrl_done) {
 			device_printf(sc->dev,
 			    "req_resp: timeout waiting for completion "

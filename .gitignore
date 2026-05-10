@@ -65,3 +65,7 @@ atrium-kmod/bootfb/machine
 docs/spec/*.slides.html
 docs/spec/*.slides.pdf
 docs/spec/*.slides.pptx
+
+# External clones (atrium-related repos vendored as siblings; each is
+# its own git working tree with its own remote — see RUNBOOK §11).
+external/

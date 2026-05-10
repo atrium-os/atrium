@@ -60,25 +60,23 @@ with `ring_idx = 0` so the host routes them through the per-context
 async-fence path (the legacy global path is broken under
 `VIRGL_RENDERER_NO_VIRGL`, the macOS host case).
 
-> **Known unresolved**: even with `INFO_RING_IDX`, the QEMU build at
-> `~/src/qemu-build` does not deliver the fence-completion for
-> `CTX_CREATE` back to the guest under our current `--venus`
-> configuration. The worker process IS spawned (`virgl_render_server
-> --worker-context-name atrium-scanout` visible in `ps`), but the
-> kmod's `req_resp` times out. This blocks end-to-end scanout
-> verification but is a host-side fence-routing issue, not a guest
-> kmod bug. Likely fixed by either (a) running atrium-mesa venus
-> userspace concurrently so venus init completes its handshake, or
-> (b) a virglrenderer/QEMU-side fix to deliver the worker-init fence
-> unconditionally.
+**Fence routing** — the per-context async fence path requires
+virglrenderer's proxy to create a fence-eventfd that the worker
+signals on retire. On Linux this uses `eventfd(2)`; the proxy
+unconditionally strips `VIRGL_RENDERER_THREAD_SYNC` from its flags
+when `<sys/eventfd.h>` is absent, which silently breaks fence
+delivery on macOS/FreeBSD hosts. The atrium-os virglrenderer fork
+provides a socketpair-based eventfd emulation (commit `52903fdb`)
+that closes this gap; both venus userspace and kmod-internal scanout
+contexts now retire fences correctly on macOS hosts.
 
 ## Why BLOB is the unifier
 
 | Backend | BLOB support | Notes |
 |---|---|---|
-| Plain `virtio-gpu-pci` | ✅ since spec rev 2021 | uses `MEM_GUEST` |
-| `virtio-gpu-gl-pci` + venus | ✅ required for venus | venus uses `MEM_HOST3D`; scanout uses `MEM_GUEST` |
-| llvmpipe-on-virtio (smoke) | ✅ | same path as plain virtio-gpu |
+| `virtio-gpu-gl-pci` + venus | ✅ required for venus | venus and scanout both use `MEM_HOST3D` |
+| Plain `virtio-gpu-pci` | ✗ on macOS hosts | `MEM_GUEST` blobs need `udmabuf` at the renderer boundary; absent on Darwin |
+| llvmpipe-on-virtio (smoke harness) | ✅ | uses the same `--venus` profile but with venus userspace falling back to lavapipe — the kmod-internal scanout context still needs venus capset for HOST3D |
 | Future native AMD/Intel | n/a (no virtio) | kmod's host-side translator targets the silicon's command set; the kmod's *internal* command shape stays BLOB-shaped |
 
 Legacy `RESOURCE_CREATE_2D` + `RESOURCE_ATTACH_BACKING` +
