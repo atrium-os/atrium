@@ -210,6 +210,8 @@ exec "$QEMU" \
     -netdev user,id=net0,hostfwd=tcp::2222-:22 \
     -fsdev local,id=share,path="$SHARE_DIR",security_model=none \
     -device virtio-9p-pci,fsdev=share,mount_tag=bsd_share \
+    -fsdev local,id=mesa,path="$BSD_DIR/../mesa",security_model=none \
+    -device virtio-9p-pci,fsdev=mesa,mount_tag=mesa_share \
     $NOGRAPHIC \
     $DISPLAY_FRONTEND \
     $GPU_ARGS \

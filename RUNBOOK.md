@@ -1701,9 +1701,66 @@ recreate from scratch (e.g. after a base.txz refresh):
 
 ### Known follow-up (not blocking dev work)
 
-`RESOURCE_CREATE_BLOB(blob_mem=GUEST)` times out under
-QEMU+virglrenderer on macOS hosts (no `udmabuf` for guest sglists at
-the renderer boundary). The kmod's BLOB scanout path will need to
-switch to `BLOB_MEM_HOST3D` + `USE_MAPPABLE` + map via the
-`host_visible` BAR — same machinery as venus's blob path. Tracked as
-its own milestone; doesn't block kmod / fresco / pergola development.
+The kmod's BLOB scanout path uses `BLOB_MEM_HOST3D` + `USE_MAPPABLE`
+(which requires a virtio-gpu context, which we satisfy with a
+kmod-internal venus-capset scanout context). End-to-end scanout is
+gated on `CTX_CREATE` getting a fence response back from the host;
+right now the host's `virgl_render_server` worker spawns
+(`atrium-scanout` visible in `ps`) but the fence completion never
+reaches the guest, so the kmod's `req_resp` times out. atrium-mesa
+userspace exhibits the same failure (vulkaninfo falls back to
+lavapipe). This is a host-side fence-routing issue; tracked
+separately.
+
+### Building atrium-mesa (venus userspace)
+
+The Atrium fork of Mesa lives at `~/src/mesa` (sibling to `~/src/bsd`).
+Source is rsynced into the VM rather than 9p-mounted because the
+build opens many files concurrently and 9p's FD pressure leads to
+"too many open files" mid-copy.
+
+```sh
+# Host: rsync source to VM
+rsync -a --exclude='.git/' --exclude='build*/' --exclude='__pycache__' \
+    -e 'ssh -i ~/.ssh/fresco_bsd_ed25519 -p 2222 \
+        -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null' \
+    ~/src/mesa/ root@localhost:/root/mesa/
+
+# VM: install build deps
+vssh "pkg install -y meson ninja py311-mako py311-pyyaml pkgconf \
+    wayland wayland-protocols vulkan-headers expat zstd llvm"
+
+# VM: apply atrium patches + complete the meson seam wiring
+# (Hunks 1+2 of the patch may need manual fixup if upstream has
+# rearranged the seams — see ATRIUM-FORK.md in the mesa repo. The
+# short version is: top-level meson.build needs `with_atrium =
+# get_option('atrium')`; src/meson.build needs `if with_atrium
+# subdir('atrium') endif` placed before src/virtio/vulkan; and
+# src/virtio/vulkan/meson.build needs an `if with_atrium ... endif`
+# block adding files_atrium_venus + inc_atrium + -DHAVE_ATRIUM.)
+vssh "cd /root/mesa && patch -p1 < .atrium-patches/0001-vn_renderer-add-atrium-backend-dispatch.patch"
+
+# VM: configure + build (no wayland WSI — FreeBSD lacks
+# CLOCK_MONOTONIC_RAW which mesa's wayland WSI uses)
+vssh "cd /root/mesa && meson setup build-atrium \
+    -Datrium=true \
+    -Dvulkan-drivers=virtio \
+    -Dgallium-drivers= \
+    -Dgles1=disabled -Dgles2=disabled -Dopengl=false -Dglx=disabled \
+    -Degl=disabled -Dglvnd=false \
+    -Dvulkan-layers= \
+    -Dplatforms= \
+    -Dprefix=/usr/local \
+    -Dvulkan-icd-dir=share/vulkan/icd.d \
+    --buildtype=release"
+vssh "cd /root/mesa && ninja -C build-atrium"
+
+# VM: install (lands /usr/local/lib/libvulkan_virtio.so +
+# /usr/local/share/vulkan/icd.d/virtio_icd.aarch64.json)
+vssh "cd /root/mesa && ninja -C build-atrium install"
+```
+
+`scripts/run-vm.sh` exposes `~/src/mesa` as a second 9p share
+(`mesa_share` mount tag) for inspecting the build dir from host —
+but **don't** `cp -r` from `/mnt/mesa` inside the VM; 9p's FD pool
+exhausts mid-copy and locks up the guest. Always rsync over SSH.
