@@ -1,0 +1,34 @@
+[package]
+name        = "aqueduct-gpu-host"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "macOS-side aqueduct-gpu host endpoint daemon. Accepts guest connections (from frescod's renderer and from atrium-vk-icd), maintains per-connection resource tables, dispatches frame command streams against MoltenVK. Bring-up-only — D5+ native HW replaces this with direct atrium-gpu kmod submission. See docs/spec/aqueduct-gpu.md §6 and §12."
+
+[lib]
+name = "aqueduct_gpu_host"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aqueduct-gpu-host"
+path = "src/bin/main.rs"
+
+[dependencies]
+aqueduct       = { path = "../aqueduct" }
+aqueduct-gpu   = { path = "../aqueduct-gpu" }
+serde          = { version = "1", features = ["derive"] }
+postcard       = { version = "1", features = ["use-std"] }
+thiserror      = "1"
+anyhow         = "1"
+log            = "0.4"
+env_logger     = "0.11"
+
+# Vulkan / MoltenVK on the macOS host. Phase 1.3 only constructs an
+# Instance + lists devices; full pipeline materialisation lands as
+# stubs first, real implementation in 1.3b alongside frescod's
+# renderer migration.
+ash            = "0.38"
+
+[dev-dependencies]
+aqueduct-gpu-client = { path = "../aqueduct-gpu-client" }
