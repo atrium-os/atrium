@@ -1,5 +1,24 @@
 # Atrium Venus — Paravirtualized Vulkan transport
 
+> **⚠ SUPERSEDED.** This document describes the venus-based paravirt
+> path used during early bring-up. After accumulating a long tail of
+> macOS-HVF / virglrenderer / virtio-gpu interaction issues (see the
+> "Why we're doing this" section of `aqueduct-gpu.md`), Atrium is
+> moving to a custom paravirt GPU protocol that ships our own wire
+> format and host endpoint, dropping venus, virglrenderer, and the
+> virtio-gpu protocol from the stack entirely.
+>
+> **The forward-looking design is `docs/spec/aqueduct-gpu.md`.**
+>
+> This document is preserved for historical context — the chassis
+> work it tracked (atrium-mesa fork mechanics, the libdrm-removal
+> pattern, the atrium-gpu cdev convention, BO allocator + fence
+> delivery + kqueue integration) is still relevant to aqueduct-gpu
+> and to D5+ native drivers. The venus-specific transport layer is
+> the part being replaced.
+
+---
+
 > **Status.** Draft. Implementation tracking name: V-series milestones (V1 = this doc, V2-V6 = code). First atrium-mesa driver. Targets QEMU + virglrenderer with venus support enabled.
 >
 > **Companion docs.** Read `atrium-gpu-abi-v2.md` first for the broader cdev/ioctl conventions. This doc covers what venus needs *on top of* that base and where it deliberately diverges from native vendor drivers.
