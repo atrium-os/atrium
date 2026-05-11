@@ -409,10 +409,11 @@ all are work.
 ## 4. Wire format
 
 Aqueduct-gpu lives on top of aqueduct's envelope transport (see
-`aqueduct.md` §3). One new opcode class:
+`aqueduct.md` §3). One new opcode class, registered in
+`aqueduct/src/classes.rs`:
 
 ```
-CLASS_GPU = 0x0030
+CLASS_GPU = 9
 ```
 
 ### 4.1. The two-phase shader path

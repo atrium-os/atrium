@@ -1,0 +1,19 @@
+[package]
+name        = "aqueduct-gpu"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "GPU opcode dictionary for aqueduct (CLASS_GPU=9). Frame-batched command streams, AOT-shader references, hash-cached pipelines, partitioned ID namespace. Wire-format types and frame builder; shared by guest-side client and host endpoint. Full design at docs/spec/aqueduct-gpu.md."
+
+[lib]
+name = "aqueduct_gpu"
+path = "src/lib.rs"
+
+[dependencies]
+aqueduct  = { path = "../aqueduct" }
+serde     = { version = "1", features = ["derive"] }
+postcard  = { version = "1", features = ["use-std"] }
+thiserror = "1"
+
+[dev-dependencies]

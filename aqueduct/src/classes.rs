@@ -55,6 +55,15 @@ pub const CLASS_INPUT:     u8 = 7;
 /// dictionary spec'd in `docs/spec/stoa.md`.
 pub const CLASS_STOA:      u8 = 8;
 
+/// Aqueduct-GPU — Atrium's GPU dispatch protocol. Frame-batched
+/// command streams, AOT-compiled shader references, hash-cached
+/// pipelines, universal sandbox enforcement. Used by frescod's
+/// renderer (direct API) and by atrium-vk-icd (Vulkan API surface)
+/// over the same wire. Replaces the venus paravirt path. Op
+/// dictionary lives in the `aqueduct-gpu` crate; full design spec
+/// at `docs/spec/aqueduct-gpu.md`.
+pub const CLASS_GPU:       u8 = 9;
+
 /// Smoke-test / fuzzing service. Not part of the production
 /// surface; used by aqueduct-echo and unit tests.
 pub const CLASS_ECHO:      u8 = 63;
@@ -75,6 +84,7 @@ pub fn class_name(c: u8) -> &'static str {
         CLASS_PORTCULLIS => "portcullis",
         CLASS_INPUT      => "input",
         CLASS_STOA       => "stoa",
+        CLASS_GPU        => "gpu",
         CLASS_ECHO       => "echo",
         c if c >= CLASS_VENDOR_BASE => "vendor",
         _ => "reserved",
