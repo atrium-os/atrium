@@ -1410,6 +1410,22 @@ above.
   ```
 - pflash files **must** be exactly 64 MiB. `cp` then `truncate -s 67108864`. The decompressed `.fd` is already 64 MiB so the truncate is a no-op but kept defensively in `run-vm.sh`.
 
+### macOS HVF — venus shmem aliases QEMU heap unless host pages are pre-faulted
+- Symptom: frescod (running venus over the QEMU host-visible BAR) aborts with `Fatal error 'mutex … own … is not on list 0x0 0x0' at line 138 in file /usr/src/lib/libthr/thread/thr_mutex.c`. Reading the venus ring `status` word (offset 0x80 of the ring shmem) returns the caller's own `pthread.tid` instead of a valid `VkRingStatusFlagsMESA` value, and venus writes into the "shmem" clobber adjacent libthr struct-pthread fields (specifically the per-thread `mutexq` head's `tqe_prev`).
+- Root cause: HVF's `hv_vm_map` captures the host VA→PA backing for the guest BAR aperture at call time. Anonymous SHM-fd-backed pages handed to `hv_vm_map` may not be faulted in yet; HVF then captures stale host pages (CoW-zero, or whatever QEMU's heap previously laid down there) for the guest's BAR view.
+- Fix lives in **two places**:
+  - `external/qemu-build/hw/display/virtio-gpu-virgl.c` `virtio_gpu_virgl_map_resource_blob`: under `CONFIG_DARWIN`, write a non-zero sentinel then zero into every host page of `data` (forces unique allocation) and `mlock` the range, all before `memory_region_add_subregion_overlap` runs the MemoryListener → `hv_vm_map`.
+  - `external/mesa/src/virtio/vulkan/vn_ring.c`: `atrium_ring_mutex_init` puts the ring's pthread mutex on its own page-aligned allocation via `_pthread_mutex_init_calloc_cb`. This is defense-in-depth — even if a residual HVF aliasing event slips past the QEMU pre-fault, it cannot land on the same page as libthr's struct pthread bookkeeping.
+- The architecturally cleaner fix would be in Apple's HVF kernel side. File against Apple if a developer relationship channel exists.
+
+### Dev VM has LGPL/GPL deps from old `dejavu` pkg install — must not ship in runtime image
+- `pkg info dejavu` was installed during early bring-up. It pulls in `fontconfig` (MIT) → `freetype2` (FTL/GPLv2+ dual) → `gettext-runtime` (LGPL21+/GPLv3+) and `libiconv` (GPLv3). Atrium runtime policy is permissive-only; the dev VM is fine for now but the production root image (D5+ Tessera-root) must rebuild fonts from `test-assets/DejaVu*.ttf` directly (Bitstream Vera license = permissive) without the `dejavu` pkg. Copy script:
+  ```sh
+  mkdir -p /usr/local/share/fonts/dejavu
+  cp ~/src/bsd/test-assets/DejaVu*.ttf /usr/local/share/fonts/dejavu/
+  ```
+- Frescod's font search path (`fresco-scene-server/src/text.rs`) includes `/usr/local/share/fonts/dejavu` so this just works without any extra wiring.
+
 ### macOS HVF + ivshmem
 - The doorbell only works because of the **1 ms poll timer patch** in `~/src/bsd/external/qemu-build` (`hw/misc/ivshmem-pci.c`). Upstream QEMU on macOS+HVF does not deliver MSI-X from ivshmem because GLib's main loop never polls pipe fds under HVF. Do not regress this when rebasing QEMU.
 - HVF reports `ISV=0` on guest LDP/STP/LDR/STR to MMIO. Patched in `target/arm/hvf/hvf.c` to decode the instruction and emulate. Without the patch, qemu asserts.
