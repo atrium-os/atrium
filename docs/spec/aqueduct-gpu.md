@@ -231,6 +231,44 @@ id-addressed with explicit lifetimes. IDs are assigned by the guest
 deterministically within the connection's namespace; the host
 validates as it processes, not on a synchronous response.
 
+**Partitioned ID namespace.** Each resource ID (pipeline, image,
+buffer, sampler, fence) is a u32 with its top 4 bits reserved as a
+namespace tag:
+
+| Tag (high 4 bits) | Allocator | Use |
+|---|---|---|
+| `0x0` | Atrium build process | Built-in pipelines/resources shipped in atrium-core / atrium-text bundles |
+| `0x1`–`0xE` | Host endpoint at `OP_GPU_BUNDLE_LOAD` | Per-third-party-bundle namespace; up to 14 bundles loaded concurrently |
+| `0xF` | ICD-runtime (monotonic) | App-created resources via Vulkan API or direct aqueduct-gpu |
+
+Bundle-shipped resources receive deterministic IDs derived from the
+manifest (`bundle_namespace × bundle_local_id`), assigned once at
+bundle load and stable for the lifetime of the bundle on the host.
+ICD-runtime resources are allocated monotonically per connection.
+This means a frame command stream can mix references to all three
+kinds of IDs without ambiguity, and bundle-shipped pipelines need
+no per-app round-trip to discover their handles.
+
+**Closed wire vocabulary.** The set of wire opcodes and frame ops
+(§4.3, §5.1) is fixed by this spec. Third-party bundles do **not**
+extend the wire format. All app expressiveness flows through (1)
+shader bytecode (AOT-compiled, hash-addressed), (2) pipeline state
+declarations in the bundle manifest, (3) descriptor binding choices
+encoded in `FOP_BIND_DESCRIPTORS`, and (4) push-constant data in
+`FOP_PUSH_CONSTANTS`. A bundle that wants to provide a "particle
+dispatch" op contributes a compute shader + a pipeline declaration;
+the bundle's app-side SDK turns `dispatch_particles(buffer, count)`
+into `FOP_BIND_PIPELINE` + `FOP_BIND_DESCRIPTORS` + `FOP_DISPATCH`
+on the wire. No new opcodes, no new payload schemas.
+
+This is a deliberate constraint — a closed vocabulary is far easier
+to validate than an open one. The validation surface for shaders
+is well-defined (SPIR-V → NIR → static checks); a parallel
+validation surface for arbitrary third-party wire ops would
+explode the trust boundary. By restricting bundles to shaders +
+manifests, the sandbox primitives (§11) cover everything that can
+go wrong at the GPU layer.
+
 ---
 
 ## 3.5. Round-trip reduction
@@ -460,9 +498,12 @@ launch.
 | `OP_GPU_SUBMIT_FRAME`    | 0x0200 | C → S     | no (async)        |
 | `OP_GPU_WAIT_FENCE`      | 0x0201 | C → S     | yes (signalled?)  |
 | `OP_GPU_SHARE_SURFACE`   | 0x0210 | C → S     | yes (share token) |
+| `OP_GPU_BUNDLE_LOAD`     | 0x0220 | C → S     | yes (bundle_namespace_id) |
+| `OP_GPU_BUNDLE_UNLOAD`   | 0x0221 | C → S     | no                |
 | `OP_GPU_FENCE_SIGNALED`  | 0x0301 | S → C     | async event       |
 | `OP_GPU_DEVICE_LOST`     | 0x0302 | S → C     | async event       |
 | `OP_GPU_VALIDATION_ERR`  | 0x0303 | S → C     | async event       |
+| `OP_GPU_BUNDLE_LOAD_ERR` | 0x0304 | S → C     | async per-resource validation failure during bundle load |
 
 The handshake exchanges supported features, format-rules tables, and
 backend identification. Most create ops return no response — the
@@ -470,6 +511,16 @@ client pre-assigns IDs within its namespace and the host validates as
 it processes. Validation failures and resource-creation failures
 propagate as async events into the next fence wait, where they surface
 to the client as standard Vulkan error returns.
+
+`OP_GPU_BUNDLE_LOAD` and `OP_GPU_BUNDLE_UNLOAD` are the lifecycle
+hooks for third-party scene-graph bundles (§7.3). LOAD takes a CAS
+hash of the manifest (which transitively references shader hashes,
+all pre-warmed in Tessera by atrium-pkg's install pass); the host
+materialises all declared pipelines + render passes + samplers,
+assigns them IDs in a fresh bundle namespace (`0x1`–`0xE` tag),
+returns the namespace ID. Per-resource validation failures are
+surfaced as `OP_GPU_BUNDLE_LOAD_ERR` async events; the bundle's load
+returns success only if all declared resources passed validation.
 
 ### 4.4. Memory transport
 
@@ -748,18 +799,98 @@ per-surface, not per-app.
 ### 7.3. Custom bundle ops (third-party scene-graph extensions)
 
 Atrium-native apps can ship their own bundle (matching the
-`atrium-core` / `atrium-text` shape) with custom scene ops and
-AOT-compiled shaders. frescod loads the bundle, validates the shaders
-through the universal sandbox primitives (§3), and dispatches custom
-ops alongside built-ins.
+`atrium-core` / `atrium-text` shape) with custom rendering. frescod
+loads the bundle, validates each declared resource through the
+universal sandbox primitives (§3, §11), and dispatches the bundle's
+work alongside built-ins.
 
 This is the path for apps that want semantic composition's wire
 benefits (dedup, delta updates) but need rendering beyond
 rects+text+textures. Indie/2D games, engine-shipped Atrium backends
-(Bevy, Godot, etc.), specialized visualization apps all fit here.
-The mechanism is the same as how Atrium itself ships `atrium-core`
-and `atrium-text`; user-shipped bundles get the same dispatch path
-with full sandbox enforcement.
+(Bevy, Godot, etc.), specialised visualisation apps all fit here.
+
+**What a bundle ships:**
+
+- AOT-compiled shaders for every supported backend (in
+  Tessera, content-addressed by hash; see §4.2)
+- A manifest declaring:
+  - Pipelines (compute or graphics): shader hashes + state +
+    descriptor-set layouts + push-constant ranges
+  - Render passes: attachment formats, load/store ops, sample counts
+  - Samplers: filter modes, address modes, anisotropy
+  - Bundle-local IDs for each declared resource (within the
+    bundle's namespace assigned at `OP_GPU_BUNDLE_LOAD`)
+- An app-side SDK (Rust crate, ideally) that translates the
+  bundle's higher-level operations into standard FOPs
+
+**What a bundle does NOT ship:** new wire opcodes, new frame-ops,
+new payload schemas. The wire vocabulary is closed (§3); the bundle
+operates entirely through composition of standard FOPs referencing
+bundle-shipped resources.
+
+**Concrete example.** A particle-system bundle:
+
+```
+particles.bundle/
+  manifest.json
+  shaders/
+    particles_update.spv          → AOT-compiled per backend in Tessera
+    particles_render.spv          → AOT-compiled per backend in Tessera
+  sdk/
+    Cargo.toml                    → Rust crate the app links
+    src/lib.rs                    → exposes dispatch_particles(),
+                                    render_particles() in app-friendly API
+```
+
+Bundle manifest (excerpt):
+
+```
+{
+  pipelines: [
+    { local_id: 0x0001, name: "update", kind: "compute",
+      shader: "particles_update.spv (sha256:abc...)",
+      descriptors: { set0: [storage_buffer, uniform_buffer] },
+      push_constants: { offset: 0, size: 32 } },
+    { local_id: 0x0002, name: "render", kind: "graphics",
+      vertex_shader:   "particles_render_vs.spv (sha256:def...)",
+      fragment_shader: "particles_render_fs.spv (sha256:ghi...)",
+      ... }
+  ],
+  passes: [ ... ],
+  samplers: [ ... ]
+}
+```
+
+Bundle's app-side SDK (excerpt):
+
+```rust
+impl ParticleSystem {
+  pub fn dispatch_update(&mut self, dt: f32, count: u32) {
+    let params = UpdateParams { dt, count };
+    self.frame.fop(FopBindPipeline { pipeline_id: self.update_pipeline });
+    self.frame.fop(FopBindDescriptors { set: 0,
+        buffer_ids: [self.particle_buffer, self.uniforms_buffer] });
+    self.frame.fop(FopPushConstants { offset: 0,
+        inline_bytes: postcard::to_bytes(&params)? });
+    self.frame.fop(FopDispatch { x: count.div_ceil(64), y: 1, z: 1 });
+  }
+}
+```
+
+`self.update_pipeline` is the bundle-namespaced pipeline_id returned
+by `OP_GPU_BUNDLE_LOAD` (the high 4 bits are the bundle's namespace
+tag, low 28 bits are `0x0000001`). At wire time, the host endpoint
+sees a sequence of standard FOPs referencing a pipeline_id it
+materialised at bundle load. No custom wire format, no schema
+negotiation, no per-frame validation.
+
+**This is exactly how atrium-core and atrium-text already work
+today** — they're bundles with manifests + shaders + an app-side
+SDK (frescod's rendering crate). The only thing that changes for
+third-party bundles is the trust posture: validation runs at install
+time (atrium-pkg) and at bundle-load time (frescod), and the
+sandbox primitives in §11 apply to every bundle-shipped shader
+regardless of source.
 
 ---
 
@@ -901,6 +1032,32 @@ static validation + descriptor-bounded isolation + GPU timeout
 enforcement, regardless of API surface (Vulkan or direct) or
 composition strategy (semantic or surface).
 
+**Two pre-execution gates, one set of primitives.** Validation runs at
+two well-defined points, never at runtime on the hot path:
+
+1. **Install-time** (atrium-pkg's shader-precompile hook, §4.2). For
+   third-party Vulkan apps shipping SPIR-V: spirv-val, bounded-loop
+   analysis, forbidden-feature check, descriptor-layout audit. Failures
+   reject the install. For third-party bundles shipping manifests:
+   shader interface vs declared descriptor layout / push-constant size,
+   manifest schema validation. Same primitives, applied to the bundle's
+   declarations.
+
+2. **Bundle-load-time** (`OP_GPU_BUNDLE_LOAD`, §4.3). When a bundle is
+   loaded into a running host endpoint, per-resource materialisation
+   runs again — the host validates that the shader's reflected interface
+   matches the manifest's claimed descriptor layout and that all
+   referenced shader CAS hashes are present in Tessera. Mismatch =
+   bundle load fails atomically (no partial state).
+
+The runtime wire path (`OP_GPU_SUBMIT_FRAME`) does no shader validation
+at all. Every shader on the wire has already passed both gates. Bundle
+resources have already been materialised. The frame stream is a closed
+vocabulary (§3) referencing pre-validated IDs.
+
+This is what makes fire-and-forget IDs safe: by the time an ID appears
+on the wire, the host knows it's well-formed.
+
 **Vulkan features that the sandbox excludes outright:**
 
 - `VK_KHR_buffer_device_address` — raw GPU pointers; the whole point
@@ -953,6 +1110,12 @@ runs in a sandbox."
   atrium-pkg. Runtime is pure hash lookup.
 - Universal sandbox; no unsandboxed GPU path.
 - Locally-assigned resource IDs; async create + async error reporting.
+- Partitioned u32 ID namespace: tag `0x0` for built-ins, `0x1`–`0xE`
+  for third-party bundles (assigned at `OP_GPU_BUNDLE_LOAD`), `0xF`
+  for ICD-runtime app allocations.
+- **Closed wire vocabulary.** Third-party bundles ship shaders +
+  manifests, not new wire opcodes. All app expressiveness flows
+  through standard FOPs referencing bundle-shipped pipelines.
 - Format-rules tables cached in the ICD; many `vkGet*` queries become
   local.
 - Memory regions are named, page-aligned, immutable in size.
