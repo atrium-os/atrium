@@ -1,0 +1,20 @@
+[package]
+name        = "aqueduct-gpu-client"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "Guest-side aqueduct-gpu client. Wraps an aqueduct::Connection with handshake, ID allocation, typed envelope helpers, frame submission. Consumed by frescod's renderer (direct) and by atrium-vk-icd (Vulkan ICD wrapper). See docs/spec/aqueduct-gpu.md."
+
+[lib]
+name = "aqueduct_gpu_client"
+path = "src/lib.rs"
+
+[dependencies]
+aqueduct      = { path = "../aqueduct" }
+aqueduct-gpu  = { path = "../aqueduct-gpu" }
+serde         = { version = "1", features = ["derive"] }
+postcard      = { version = "1", features = ["use-std"] }
+thiserror     = "1"
+
+[dev-dependencies]
