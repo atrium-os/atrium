@@ -1099,7 +1099,186 @@ runs in a sandbox."
 
 ---
 
-## 12. Decisions and non-decisions
+## 12. Trust boundaries and threat model
+
+### 12.1. What aqueduct-gpu defends against, and what it does not
+
+The aqueduct-gpu wire protocol enforces shader sandboxing (§11) and
+relies on the kernel + Portcullis layer for everything else. This
+section makes the trust-boundary decomposition explicit so the design
+is not silently assuming protection at the wrong layer.
+
+**Threats inside aqueduct-gpu's scope:**
+
+- *Untrusted shader code*. Apps and bundles ship shaders that may be
+  buggy or malicious. Defended by §11's universal sandbox: static
+  SPIR-V validation at install/bundle-load, descriptor-bounded resource
+  access (hardware MMU enforcement), GPU timeout, no
+  `buffer-device-address`, no descriptor-buffer, no foreign-handle
+  memory imports.
+- *Cross-app resource leakage via the GPU*. Apps must not be able to
+  read or write each other's textures, buffers, or descriptor sets via
+  the GPU. Defended by per-connection ID namespaces (§3) and per-fd
+  resource tables in the kmod (§12.3).
+- *Wire-protocol confusion*. Apps must not be able to issue commands
+  on another connection's behalf. Defended by aqueduct's per-connection
+  envelope routing and Portcullis's peer-uid-to-manifest cross-check.
+
+**Threats outside aqueduct-gpu's scope (deferred to other layers):**
+
+- *Compromised kmod / host endpoint*. The kmod and (on bring-up) the
+  `aqueduct-gpu-host` daemon are privileged mediators with full
+  visibility into every app's GPU memory by construction. If either is
+  compromised, the platform is gone. Mitigation: keep them small,
+  audit them, hold to the same scrutiny as any kernel/root daemon.
+- *GPU hardware side channels*. Cache contention, memory-bandwidth
+  observation, performance counter readbacks across shader executions.
+  These are properties of GPU hardware and not addressable at the
+  protocol layer; same situation on every commodity GPU.
+- *Wire snooping by an attacker who already has root or local kernel
+  access*. Encrypting the wire would not defend against this — the
+  attacker can read process memory directly.
+- *Compromised Atrium image / supply chain*. Atrium's signing + Tessera
+  CAS integrity properties live in atrium-pkg's threat model
+  (see `docs/spec/atrium-pkg.md`), not here.
+
+### 12.2. Wire encryption: no, with rationale
+
+Aqueduct-gpu does **not** encrypt its wire. The transports it uses
+during Phase 1 and the foreseeable arc are all local-machine:
+ivshmem (VM ↔ host endpoint on bring-up), Unix domain sockets
+(app ↔ aqueduct-gpu-host on the same machine), and direct kmod
+ioctls (D5+ native HW). For local transports:
+
+- Authentication is enforced by `SO_PEERCRED` (or kernel-level fd
+  ownership for the cdev path) and by Portcullis's manifest gate.
+  Encryption adds nothing here; the kernel already attests who is
+  who.
+- Snooping requires kernel/root access. An attacker with that access
+  can read process memory directly; encryption keys live in process
+  memory; therefore encryption defends against no threat that the
+  kernel doesn't already defend against.
+
+For remote aqueduct-gpu in a future deployment shape (thin-client
+compositor displaying an Atrium app rendered on a server; cross-machine
+collaboration; etc.), the recommendation matches aqueduct's broader
+position (`docs/spec/aqueduct.md` §7): tunnel through an existing
+encrypted transport (SSH, WireGuard, QUIC). Do not bake crypto into
+aqueduct itself. Same rationale as why HTTP didn't include TLS — the
+wrapping layer composes more cleanly than the embedded layer, and
+keeps the protocol's hot path narrow.
+
+This is consistent with how D-Bus, Wayland, X11, and every other
+local IPC protocol on commodity OSes handle the question.
+
+### 12.3. The aqueduct-gpu path through jails — concrete data flow
+
+For an app inside a Portcullis jail wanting GPU access:
+
+```
+1. Jail config (atrium-jaild) — devfs ruleset gates whether the
+   jail can see /dev/atrium-gpu0 at all. Jails without GPU access
+   never have the cdev in their /dev namespace.
+
+2. Portcullis manifest (atrium.toml) declares which GPU capability
+   the app needs. Required keys (proposed, §12.4):
+     [capabilities]
+     gpu.access  = true   # open /dev/atrium-gpu0, do GPU work
+     gpu.scanout = false  # default; only frescod sets true
+
+3. portcullisd cap-mediator cross-checks the connecting peer-uid
+   against the manifest before granting GPU access on the aqueduct
+   connection. Apps without gpu.access in the manifest cannot
+   establish an aqueduct-gpu connection at all.
+
+4. Inside the jail, the app's atrium-vk-icd (or aqueduct-gpu-client)
+   opens /dev/atrium-gpu0. The kmod's d_open callback creates a
+   fresh per-fd struct atrium_gpu_file via devfs_set_cdevpriv.
+
+5. All resources (BOs, memory regions, pipelines, fences, samplers,
+   images, buffers) the app creates live in *that fd's* resource
+   table. Resource IDs do not collide across fds; the kmod resolves
+   handles via the calling fd's private state, never via a global
+   table.
+
+6. The app's mmap(/dev/atrium-gpu0, offset = region_id × PAGE_SIZE)
+   maps only that fd's regions. App A's offsets do not address App
+   B's memory because the kmod's d_mmap walks only the calling
+   fd's BO list.
+
+7. On macOS bring-up: the underlying SHM fd that backs each region
+   lives in the aqueduct-gpu-host daemon's address space, not the
+   app's. The app never holds a raw SHM fd. The host endpoint is
+   the privileged dispatcher (analogous to portcullisd's role for
+   capability mediation) and is audited to that standard.
+
+8. On D5+ native HW: the kmod owns the GPU memory directly. The
+   app's mmap goes through the kmod's d_mmap, same as bring-up,
+   just without the host-endpoint hop.
+
+9. On fd close (app exit or crash): the per-fd resource table is
+   torn down by the kmod's d_close callback, releasing all the
+   fd's BOs / regions / pipelines. No leakage across the
+   close-reopen boundary.
+```
+
+Each layer is load-bearing. Removing any one of (1)–(6) weakens the
+isolation. The kernel-enforced layers — (1), (3) and (5)–(6) — are
+the structural primitives; the manifest layer (2) and the cap-mediator
+layer (3) are the policy that runs on top of them.
+
+### 12.4. `gpu.scanout` as a distinct capability
+
+The kmod's `IOC_ALLOC` accepts an `ATRIUM_GPU_BO_SCANOUT` flag that
+designates the BO as a scanout buffer (i.e., the buffer the display
+hardware reads directly via the kmod's `page_flip` operation). In a
+single-app bring-up world (frescod is the only thing using the GPU),
+any fd can request SCANOUT. In a multi-app world this becomes a
+privilege-escalation vector: a malicious app could allocate a scanout
+BO and write into it, observing or interfering with what the user
+sees on screen.
+
+The fix is a distinct Portcullis capability `gpu.scanout`, gated at
+the kmod's allocation path:
+
+| Capability | Grants | Mechanism |
+|---|---|---|
+| `gpu.access` | Open `/dev/atrium-gpu0`, allocate ordinary BOs, submit work | devfs rule + portcullisd cap check at open time |
+| `gpu.scanout` | Additionally allowed to set `ATRIUM_GPU_BO_SCANOUT` flag on allocations and call `page_flip` | kmod cross-checks the calling fd's Portcullis cap token against the SCANOUT flag at `IOC_ALLOC` and `IOC_PAGE_FLIP`; rejects with `EPERM` if not granted |
+
+Only `frescod` (and, in D5+, designated display-server processes)
+gets `gpu.scanout`. The vast majority of apps — vestibulum, Vulkan
+games, third-party bundles, Pergola apps — get `gpu.access` only
+and physically cannot allocate a scanout BO.
+
+The capability token from portcullisd needs to make it to the kmod
+in a kernel-trusted way. Options:
+
+- *(a) Portcullisd-issued descriptor.* portcullisd opens
+  `/dev/atrium-gpu0` itself with the appropriate cap flags set on
+  the fd via a new `IOC_SET_CAPS` ioctl, then passes the fd to the
+  app via SCM_RIGHTS. The app uses that fd; the kmod reads the
+  fd's cap flags from `struct atrium_gpu_file`.
+- *(b) Cred-tagged jail attribute.* portcullisd sets a jail-level
+  attribute (`security.atrium.gpu_caps`) at jail-create time; the
+  kmod reads it via `prison_get` when the app opens the cdev.
+- *(c) Aqueduct handshake.* aqueduct-gpu-host validates the cap on
+  connection establishment via portcullisd's existing peer-uid check
+  and stores the cap in its per-connection state; the kmod is
+  out-of-band and trusts the host endpoint's enforcement.
+
+For Phase 2 (when sandbox primitives land), option (a) is the
+preferred answer — kernel-enforced, doesn't require trusting the
+host endpoint for the privileged-cap decision, and reuses the
+existing portcullisd/SCM_RIGHTS infrastructure. Open implementation
+question; both (b) and (c) are workable fallbacks.
+
+The portcullis manifest spec gains the two capability declarations
+above (companion edit to `docs/spec/portcullis.md` §3.2).
+
+---
+
+## 13. Decisions and non-decisions
 
 ### Decided
 
@@ -1149,7 +1328,7 @@ runs in a sandbox."
 
 ---
 
-## 13. Risks
+## 14. Risks
 
 1. **NIR API stability.** Mesa's NIR is internal and changes between
    versions. Atrium-mesa is a fork; we pin the NIR version at fork
@@ -1189,7 +1368,7 @@ runs in a sandbox."
 
 ---
 
-## 14. Open questions
+## 15. Open questions
 
 - **Command-stream encoding.** Postcard (matching fresco-protocol) vs
   a flat memcpy-friendly format. Postcard wins for consistency but
@@ -1215,7 +1394,7 @@ runs in a sandbox."
 
 ---
 
-## 15. Companion code locations
+## 16. Companion code locations
 
 When implementation lands:
 
@@ -1225,9 +1404,11 @@ crates/aqueduct-gpu-client/           guest-side client (frescod, ICD)
 crates/aqueduct-gpu-host/             macOS daemon
 crates/atrium-vk-icd/                 Vulkan ICD
 external/wgpu/                        wgpu fork with aqueduct-gpu backend (Phase 1.5?)
-atrium-kmod/atrium_virtio_gpu.c       IOC_GPU_IMPORT_REGION, IOC_GPU_LIST_BACKENDS
+atrium-kmod/atrium_virtio_gpu.c       IOC_GPU_IMPORT_REGION, IOC_GPU_LIST_BACKENDS,
+                                      IOC_SET_CAPS (Phase 2; for gpu.scanout gating)
 docs/spec/aqueduct-gpu.md             this file
 docs/spec/atrium-venus.md             marked superseded, archived
 docs/spec/atrium-pkg.md               extended with shader-precompile hook
-docs/spec/atrium-gpu-abi-v2.md        extended with new ioctls
+docs/spec/atrium-gpu-abi-v2.md        extended with new ioctls + cap-gating
+docs/spec/portcullis.md               extended with gpu.access + gpu.scanout caps
 ```

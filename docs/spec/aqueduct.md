@@ -355,6 +355,80 @@ Out of scope:
   responses.
 - **Rogue kernel** — aqueduct trusts the FreeBSD kernel.
 
+### 7.1 Authentication is load-bearing; encryption is not (for local transports)
+
+Aqueduct does **not** encrypt its wire on local transports (Unix
+domain socket, posix shared memory, ivshmem). The reason is not
+"we forgot": encryption defends against an attacker who can read the
+wire but cannot read process memory. On a single machine, anyone who
+can read the wire bytes (root, kernel-level access, or a process with
+the same uid as a daemon) can already read process memory by
+definition — encryption keys live in process memory, so encryption
+defends against no threat the kernel doesn't already defend against.
+
+This is the same posture every other local-IPC protocol on commodity
+OSes takes: D-Bus, Wayland, X11, every Unix socket-based service.
+Local IPC is plaintext + kernel-permission-enforced.
+
+Authentication, on the other hand, is essential and is *enforced at
+every connection*:
+
+- `SO_PEERCRED` on Unix sockets attests the connecting process's uid/pid
+  to the kernel.
+- Portcullis's manifest-based gate (`atrium-portcullisd-daemon`)
+  cross-checks `peer_uid → manifest` before granting any capability.
+- `SCM_RIGHTS` moves capabilities by file descriptor, not by token —
+  caps cannot be replayed, guessed, or forged.
+
+These three mechanisms together replace what TLS+mTLS would do over
+a network: they prove *who* the peer is, *what* they can ask for, and
+*ensure* the capability cannot be reused outside its intended fd.
+Encryption would add only protection against an adversary already
+positioned to defeat all three.
+
+### 7.2 Remote aqueduct: tunnel, do not embed
+
+Atrium will eventually grow remote aqueduct use cases — Stoa
+persistent SSH sessions, thin-client compositor displaying an
+Atrium app on a remote server, future cross-machine collaboration
+shapes. For all of these, the recommendation is:
+
+- **Tunnel through an existing encrypted transport.** SSH for
+  interactive sessions (Stoa already builds on this).
+  WireGuard for site-to-site or trusted-fleet shapes. QUIC + TLS
+  for thin-client server-to-thin-client. Aqueduct itself stays
+  plaintext and transport-agnostic; the wrapping transport carries
+  the encryption.
+
+- **Aqueduct's envelope format is already transport-agnostic.**
+  Length-prefixed records work on Unix sockets, TCP, QUIC streams,
+  ivshmem rings. No design change is needed to support remote use;
+  we just don't pay for crypto today.
+
+- **Remote authentication is a future-phase concern.** Local
+  authentication via `SO_PEERCRED` obviously does not work across
+  a network. For remote shapes, expect a future
+  `OP_AQUEDUCT_HANDSHAKE` extension that supports
+  `AuthMethod::CapToken(...)` (signed by portcullisd on the
+  originating machine) or `AuthMethod::Mutual(...)` (mTLS-shape
+  for QUIC transport). Not in the protocol today.
+
+The composition principle is the same one HTTP used: don't embed
+TLS in HTTP, run HTTP over TLS. The wrapping layer composes cleanly,
+the protocol's hot path stays narrow, and the responsibility for
+crypto lives in code already audited for it.
+
+### 7.3 Aqueduct-gpu (the higher-bandwidth path)
+
+`aqueduct-gpu` (see `aqueduct-gpu.md`) carries shader bytecode,
+texture data, command streams, and large mappable memory regions.
+Its trust model is detailed in `aqueduct-gpu.md` §12: per-jail data
+flow, per-fd kmod resource isolation, `gpu.scanout` as a distinct
+Portcullis capability for display-server-only operations. The
+encryption posture above (no for local, tunnel for remote) applies
+identically — the kmod-level isolation and Portcullis cap mediation
+are the load-bearing primitives.
+
 ## 8. Performance targets
 
 Order-of-magnitude expectations on commodity hardware (real iron,
