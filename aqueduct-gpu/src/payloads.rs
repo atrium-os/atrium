@@ -83,6 +83,24 @@ impl HandshakeResponse {
     /// Host supports surface-share with the compositor.
     /// (Bring-up: yes; thin-client/headless host: no.)
     pub const CAPS_COMPOSITION:     u64 = 1 << 4;
+
+    // ─── Tier-1 software backend capabilities ─────────────────────
+    //
+    // Bits set by SoftwareBackend (`aqueduct-gpu-host`) to advertise
+    // which Atrium-native bundle ops it can rasterise on CPU via
+    // tiny-skia. See `docs/spec/aqueduct-gpu.md` §6.5. Clients use
+    // these to gate fallback-vs-refuse decisions when running on a
+    // SW host. Tier-2 (general SW Vulkan) is a separate capability
+    // that no current backend advertises.
+
+    /// SoftwareBackend can rasterise atrium-core's rect op.
+    pub const CAPS_TIER1_RECT:      u64 = 1 << 8;
+    /// SoftwareBackend can rasterise atrium-text's glyph_run op.
+    pub const CAPS_TIER1_TEXT:      u64 = 1 << 9;
+    /// SoftwareBackend can rasterise atrium-core's textured-rect op.
+    pub const CAPS_TIER1_TEXTURE:   u64 = 1 << 10;
+    /// SoftwareBackend can rasterise atrium-core's path op.
+    pub const CAPS_TIER1_PATH:      u64 = 1 << 11;
 }
 
 // ───── Memory regions ─────────────────────────────────────────────

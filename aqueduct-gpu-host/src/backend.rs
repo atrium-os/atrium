@@ -100,6 +100,115 @@ impl StubBackend {
     }
 }
 
+/// Tier-1 software renderer. Hand-coded CPU rasterisation of
+/// Atrium-native bundle operations via tiny-skia. **Does not
+/// interpret SPIR-V or NIR.**
+///
+/// Per `docs/spec/aqueduct-gpu.md` §6.5, this is the
+/// power-policy-friendly default for static / idle desktop UI on
+/// battery, and the only backend on GPU-less systems for
+/// Atrium-native workloads. Third-party bundles with custom
+/// shaders, and Vulkan games, are refused at handshake-cap
+/// negotiation.
+///
+/// Phase 1.3c-stub: the struct exists and the daemon's `--backend
+/// software` CLI flag selects it, but `submit_frame` panics rather
+/// than rasterise. The real tiny-skia integration lands in a
+/// follow-up commit. This stub lets the CLI surface and the
+/// capability advertisement stabilise before the rasterisation
+/// code lands.
+pub struct SoftwareBackend {
+    submissions: AtomicU64,
+}
+
+impl Default for SoftwareBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SoftwareBackend {
+    /// Construct a fresh tier-1 software backend.
+    pub fn new() -> Self {
+        Self { submissions: AtomicU64::new(0) }
+    }
+
+    /// How many frames have been submitted. Diagnostic.
+    pub fn submission_count(&self) -> u64 {
+        self.submissions.load(Ordering::Relaxed)
+    }
+}
+
+impl Backend for SoftwareBackend {
+    fn identity(&self) -> BackendId {
+        // Software vendor; generation 0 == tier-1 (tiny-skia).
+        // Reserve generation 1+ for future tier-2 (general SW Vulkan).
+        BackendId::new(GpuVendor::Software, 0)
+    }
+
+    fn caps(&self) -> u64 {
+        // Tier-1 advertises ONLY the per-bundle-op caps it has
+        // hand-coded equivalents for. Composition-related caps
+        // (CAPS_COMPOSITION, CAPS_SHARE_SURFACE) reflect whether
+        // tier-1 can hand a rendered framebuffer back to frescod;
+        // initially yes — tiny-skia produces raw pixels into a
+        // shared region.
+        //
+        // CAPS_COMPUTE / CAPS_SPIRV_UPLOAD / CAPS_BUNDLE_LOAD
+        // stay unset: tier-1 does not run arbitrary shaders, does
+        // not accept SPIR-V upload, does not materialise third-
+        // party bundles.
+        use aqueduct_gpu::payloads::HandshakeResponse as H;
+        H::CAPS_COMPOSITION
+            | H::CAPS_SHARE_SURFACE
+            | H::CAPS_TIER1_RECT
+            | H::CAPS_TIER1_TEXT
+            | H::CAPS_TIER1_TEXTURE
+            | H::CAPS_TIER1_PATH
+    }
+
+    fn max_frame_bytes(&self) -> u32 {
+        // Tier-1 rendering is CPU-bound; frames stay small. The
+        // tiny-skia integration parses one record at a time, so
+        // memory pressure scales with frame complexity, not size
+        // upfront. Cap at 1 MiB to keep guest allocations bounded.
+        1 << 20
+    }
+
+    fn max_fences_inflight(&self) -> u32 {
+        64
+    }
+
+    fn allocate_memory(&self, _size: u64, _usage: u8) -> [u8; 32] {
+        // Stub: returns a deterministic sentinel token. The
+        // tiny-skia path doesn't yet allocate real backing memory
+        // — that lands when frame dispatch lands.
+        let n = self.submissions.load(Ordering::Relaxed);
+        let mut tok = [0u8; 32];
+        tok[..8].copy_from_slice(&n.to_le_bytes());
+        tok[31] = 0xC0; // sentinel distinct from StubBackend's 0xAB
+        tok
+    }
+
+    fn submit_frame(&self, _fence_id: ResourceId, _timeline: u64, _frame_buf: &[u8]) -> bool {
+        self.submissions.fetch_add(1, Ordering::Relaxed);
+        // Phase 1.3c-stub: panic to make it obvious that the
+        // real rasterisation hasn't landed yet. Tests configured
+        // for `software` backend will fail here, which is the
+        // intended behaviour until the tiny-skia integration ships.
+        //
+        // Once frame dispatch lands, this becomes:
+        //   self.dispatch_frame(frame_buf, ...) -> Result<()>
+        //   self.signal_fence(fence_id, timeline);
+        //   true
+        unimplemented!(
+            "SoftwareBackend frame dispatch not yet implemented; \
+             use --backend stub for protocol tests or --backend \
+             moltenvk for real rendering"
+        );
+    }
+}
+
 impl Backend for StubBackend {
     fn identity(&self) -> BackendId {
         // Software backend, generation 0 — matches the convention
@@ -157,6 +266,42 @@ mod tests {
     fn stub_reports_software_backend() {
         let b = StubBackend::new();
         assert_eq!(b.identity().vendor, GpuVendor::Software);
+        assert_eq!(b.identity().generation, 0);
+    }
+
+    #[test]
+    fn software_backend_advertises_tier1_caps_not_compute() {
+        use aqueduct_gpu::payloads::HandshakeResponse as H;
+        let b = SoftwareBackend::new();
+        let caps = b.caps();
+
+        // Tier-1 ops are advertised…
+        assert!(caps & H::CAPS_TIER1_RECT != 0);
+        assert!(caps & H::CAPS_TIER1_TEXT != 0);
+        assert!(caps & H::CAPS_TIER1_TEXTURE != 0);
+        assert!(caps & H::CAPS_TIER1_PATH != 0);
+
+        // …and the composition path bits (so frescod knows it can
+        // receive rendered pixels via share-surface).
+        assert!(caps & H::CAPS_COMPOSITION != 0);
+        assert!(caps & H::CAPS_SHARE_SURFACE != 0);
+
+        // …but the third-party-shader caps stay clear.
+        assert_eq!(caps & H::CAPS_COMPUTE, 0,
+            "tier-1 does not run compute shaders");
+        assert_eq!(caps & H::CAPS_SPIRV_UPLOAD, 0,
+            "tier-1 does not accept SPIR-V upload");
+        assert_eq!(caps & H::CAPS_BUNDLE_LOAD, 0,
+            "tier-1 does not materialise third-party bundles");
+    }
+
+    #[test]
+    fn software_backend_identity_is_tier1() {
+        let b = SoftwareBackend::new();
+        assert_eq!(b.identity().vendor, GpuVendor::Software);
+        // generation 0 == tier-1 by convention (see spec §6.5).
+        // Tier-2 (general SW Vulkan) would use generation 1+ if it
+        // ever ships.
         assert_eq!(b.identity().generation, 0);
     }
 }

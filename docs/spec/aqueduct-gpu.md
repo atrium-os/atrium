@@ -699,6 +699,133 @@ enforced protocol-side via per-connection id namespaces.
 
 ---
 
+## 6.5. Backend tiers and power policy
+
+Aqueduct-gpu's `Backend` trait (`aqueduct-gpu-host/src/backend.rs`)
+allows multiple host-side implementations of the same wire protocol.
+Three tiers exist, picked by the daemon's `--backend` flag (or by
+the kmod in D5+ native HW). The wire protocol is identical across
+all of them; clients (frescod's renderer, atrium-vk-icd) never know
+or care which backend they're running on.
+
+### 6.5.1. The three tiers
+
+**Tier-1: SoftwareBackend (tiny-skia).** Pure-CPU rasterisation of
+Atrium-native bundle operations (atrium-core: rect, path, texture;
+atrium-text: glyph_run). Hand-implemented equivalents per bundle op
+— **does not interpret SPIR-V/NIR**. Restricted to bundles whose
+semantics we know at Atrium build time. Used for:
+
+- Power-policy-driven compositor rendering on battery: the GPU
+  stays asleep during static / low-activity UI, dropping system
+  power draw by ~5–15W on a typical laptop.
+- Devices without a usable GPU at all (basic VMs, embedded HMI,
+  certain industrial boxes, headless servers running a graphics
+  service for remote display).
+- CI / regression test environments where shipping a GPU stack
+  would be infrastructure overhead.
+- Compositor bring-up on platforms not yet covered by an MoltenVK
+  / native-Vulkan / atrium-gpu backend.
+
+Implementation cost: ~2–3 weeks for full atrium-core + atrium-text
+coverage. Reuses the tiny-skia integration Pergola already has
+(`pergola/`). Pure Atrium code, permissively licensed, no Mesa
+runtime dependency. Tracks tier-1 capability bits in the handshake
+response so clients can detect what's supported (initially:
+`CAPS_TIER1_RECT`, `CAPS_TIER1_TEXT`, `CAPS_TIER1_TEXTURE` — bits
+in `HandshakeResponse::caps`).
+
+**Tier-2: General SW Vulkan (deferred).** A SPIR-V-conformant CPU
+Vulkan implementation — what llvmpipe / lavapipe provides today on
+Linux. Required for:
+
+- Third-party bundles with custom shaders that we don't have
+  hand-coded equivalents for.
+- Vulkan games on GPU-less systems (a vanishingly small audience).
+- Full CTS-equivalent SW conformance testing.
+
+Phase 1 **does not** ship Tier-2. The only realistic open-source
+implementation is Mesa's gallium + llvmpipe stack; vendoring it at
+runtime would break the "Mesa only at build time" rule we
+committed to in §3. The cost-benefit is poor for the bring-up
+phase: maintenance overhead of carrying llvmpipe + gallium vs the
+small population of users who need pure-CPU general Vulkan on
+Atrium. Revisit when concrete demand surfaces.
+
+Until then, third-party bundles with custom shaders on a SW-only
+system get `OP_GPU_VALIDATION_ERR` at bundle-load time; Vulkan
+games get `VK_ERROR_FEATURE_NOT_PRESENT` at instance creation.
+This is an explicit scope choice, documented in the engine
+landscape (§10): "if you need Tier-2, run on a system with a GPU."
+
+**Tier-3: Hardware-accelerated.** The expected default —
+MoltenVkBackend on macOS bring-up, native Vulkan on Linux dev
+hosts, AtriumGpuBackend on D5+ native HW. Full pipeline
+materialisation, real GPU execution. Phase 1.3b lands MoltenVK;
+Phase 3 lands the native HW path.
+
+### 6.5.2. Power policy framework
+
+Tier selection is policy-driven, not capability-driven. A system
+with a discrete GPU still chooses tier-1 for static UI on battery
+to conserve power. The flow:
+
+```
+Power policy daemon (atrium-power-policy, future)
+   │  publishes current policy: {AC|Battery|LowPower|Performance}
+   ▼
+Backend selector (in aqueduct-gpu-host or atrium-gpu kmod)
+   │  picks Backend based on (available HW, policy, workload hints)
+   ▼
+Active Backend serves frame submissions
+   │  switches mid-session if policy or workload changes
+```
+
+Backend switching mid-session is the architecturally interesting
+part: in-flight resources need to drain on the outgoing backend
+before the incoming backend can pick up. The `Backend` trait will
+grow a `quiesce()` method in a future Phase, and aqueduct-gpu will
+surface a `BackendSwitched` event (analogous to `DeviceLost` but
+recoverable) for clients to recreate resources on the new backend.
+
+For **Phase 1 the policy is boot-time only**: the `--backend` CLI
+flag (or kmod boot-time tunable in D5+) picks one backend per
+daemon lifetime. Live switching deferred to Phase 2 when there's a
+concrete app whose performance benefits from it.
+
+### 6.5.3. Backend selection at daemon startup
+
+```
+aqueduct-gpu-host --backend stub | software | moltenvk
+                  [--socket /tmp/aqueduct-gpu.sock]
+
+stub      → StubBackend: protocol-correct, no GPU work; used for
+            wire-path tests and dev iteration without the real GPU.
+software  → SoftwareBackend: tiny-skia rasterisation for known
+            Atrium-native bundles; refuses unknown shaders.
+moltenvk  → MoltenVkBackend: ash::Entry::load → MoltenVK ICD →
+            real Metal GPU work. The default on macOS bring-up.
+```
+
+On D5+, the daemon goes away entirely; backend selection moves
+into the atrium-gpu kmod's boot-time configuration. The wire
+protocol stays the same.
+
+### 6.5.4. Demonstration angle
+
+The tier-1 SW renderer is itself a demonstrable architectural
+choice (per `docs/ARCHITECTURE.md` § "Atrium as technology
+demonstrator"): *"Atrium's compositor renders at full visual
+quality on a low-power CPU; the GPU stays asleep until you need
+it."* On a battery-powered laptop, idle-desktop power draw with
+tier-1 should be measurably lower than the equivalent on
+Linux+Wayland-mutter (which currently has no analogous
+GPU-bypass-for-static-UI mode). That delta is a reproducible
+benchmark + a 30-second video — both are demo-driven phase-exit
+deliverables.
+
+---
+
 ## 7. API surfaces and composition strategies
 
 ### 7.1. The Vulkan ICD path (atrium-vk-icd)

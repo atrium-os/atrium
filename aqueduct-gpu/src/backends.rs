@@ -36,8 +36,29 @@ pub enum GpuVendor {
     /// Atrium-gpu — our own native ISA. Used on D5+ HW; the kmod
     /// is the only backend on that path.
     AtriumGpu = 5,
-    /// Software rasteriser (llvmpipe / lavapipe / vulkan-sw).
-    /// Kept as a CI / fallback target; usable but slow.
+    /// Software renderer.
+    ///
+    /// Atrium ships two distinct SW paths under this same vendor
+    /// identifier:
+    ///
+    /// - **Tier-1 (`SoftwareBackend` in `aqueduct-gpu-host`):**
+    ///   tiny-skia-based rasterisation of Atrium-native bundle
+    ///   operations (atrium-core, atrium-text). Does *not* execute
+    ///   SPIR-V/NIR; uses hand-coded CPU equivalents per known
+    ///   bundle op. Fast, low-overhead, and power-policy-friendly:
+    ///   keeps the discrete GPU asleep during static / idle desktop
+    ///   UI. The default backend when no GPU is available or when
+    ///   the system is on battery in low-power mode.
+    ///
+    /// - **Tier-2 (deferred, see `docs/spec/aqueduct-gpu.md` §6.5):**
+    ///   general-purpose SW Vulkan (llvmpipe / lavapipe class). Not
+    ///   shipped in Phase 1. Vendoring it at runtime would break
+    ///   the "Mesa only at build time" stance; revisit if concrete
+    ///   demand surfaces.
+    ///
+    /// Clients distinguish tier-1 vs tier-2 capability via the
+    /// handshake response's `caps` bitset
+    /// (`CAPS_TIER1_RECT`, `CAPS_TIER1_TEXT`, ...).
     Software = 6,
 }
 
