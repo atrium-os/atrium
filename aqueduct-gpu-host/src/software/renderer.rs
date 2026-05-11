@@ -34,6 +34,56 @@ use super::{
     BUILTIN_PIPELINE_GLYPH_RUN,
 };
 
+/// Body layout for `FOP_BEGIN_RENDERPASS` records in tier-1.
+///
+/// Compositor-friendly minimal schema for Phase 1.3c: one color
+/// target + an RGBA8 clear colour. Multi-target / depth / multi-
+/// renderpass extensions land alongside the textured-rect + path
+/// rasterisers in follow-on commits.
+///
+/// Wire layout: 8 bytes, plain little-endian.
+///
+/// ```text
+///   offset  size  field
+///   0       4     target_image_id   (u32, ResourceId::raw())
+///   4       4     clear_color_rgba8 (4×u8: R, G, B, A premultiplied)
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[repr(C)]
+pub struct BeginRenderPassBody {
+    /// Image to render into. Resolved against the backend's image
+    /// table; missing target → `RendererError::Unsupported`.
+    pub target_image_id: u32,
+    /// Premultiplied straight-alpha clear colour, RGBA8.
+    pub clear_color_rgba8: [u8; 4],
+}
+
+impl BeginRenderPassBody {
+    /// Decode from a FOP record body.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, RendererError> {
+        if bytes.len() < 8 {
+            return Err(RendererError::ShortBody {
+                op: FrameOp::BeginRenderPass,
+                got: bytes.len(),
+                want: 8,
+            });
+        }
+        Ok(Self {
+            target_image_id: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            clear_color_rgba8: [bytes[4], bytes[5], bytes[6], bytes[7]],
+        })
+    }
+
+    /// Encode as plain little-endian bytes (8 bytes). Used by
+    /// clients constructing tier-1 frames.
+    pub fn to_bytes(&self) -> [u8; 8] {
+        let mut buf = [0u8; 8];
+        buf[..4].copy_from_slice(&self.target_image_id.to_le_bytes());
+        buf[4..].copy_from_slice(&self.clear_color_rgba8);
+        buf
+    }
+}
+
 /// Push-constant layout for the atrium-core rect pipeline. Fields
 /// match what `fresco-protocol::RectParams` carries on the wire, but
 /// encoded as plain little-endian bytes (postcard-free, hot path).
@@ -168,12 +218,13 @@ impl<'a> TinySkiaRenderer<'a> {
         if self.in_renderpass {
             return Err(RendererError::NestedRenderPass);
         }
-        // Phase 1.3c-rect: body parsing TBD when target-image-id
-        // selection lands. For now we just mark the state and use
-        // the renderer's preset target. Clear values + multi-target
-        // selection arrive when the textured-rect / multi-pass cases
-        // land.
-        let _ = body;
+        let p = BeginRenderPassBody::from_bytes(body)?;
+        // The renderer's `target` is set by the caller (typically
+        // SoftwareBackend::submit_frame, after resolving
+        // target_image_id against its image map). All we do here
+        // is honour the clear-colour and remember the in-pass state.
+        let [r, g, b, a] = p.clear_color_rgba8;
+        self.target.fill(Color::from_rgba8(r, g, b, a));
         self.in_renderpass = true;
         Ok(())
     }
@@ -379,11 +430,22 @@ mod tests {
     use aqueduct_gpu::ids::IdNamespace;
     use tiny_skia::Pixmap;
 
+    fn rp_body(target_image_local: u32, clear: [u8; 4]) -> [u8; 8] {
+        BeginRenderPassBody {
+            target_image_id: ResourceId::new(IdNamespace::IcdRuntime, target_image_local).raw(),
+            clear_color_rgba8: clear,
+        }.to_bytes()
+    }
+
     /// Build a frame command stream that fills the entire 64x64
     /// pixmap with magenta via the rect pipeline.
     fn magenta_rect_frame() -> Vec<u8> {
         let mut fb = FrameBuilder::new(1024);
-        fb.push(FrameOp::BeginRenderPass, &[]).unwrap();
+        // target image id is irrelevant in the in-module test
+        // (we hand the renderer an explicit PixmapMut), but the
+        // body schema requires 8 bytes; clear colour stays black
+        // so the test asserts on the actual rect rasterisation.
+        fb.push(FrameOp::BeginRenderPass, &rp_body(1, [0, 0, 0, 255])).unwrap();
 
         let rect_pipe = ResourceId::new(IdNamespace::Builtin, BUILTIN_PIPELINE_RECT);
         fb.push(FrameOp::BindPipeline, &rect_pipe.raw().to_le_bytes()).unwrap();
@@ -439,7 +501,7 @@ mod tests {
         let mut pixmap = Pixmap::new(16, 16).unwrap();
         let mut r = TinySkiaRenderer::new(pixmap.as_mut());
         let mut fb = FrameBuilder::new(128);
-        fb.push(FrameOp::BeginRenderPass, &[]).unwrap();
+        fb.push(FrameOp::BeginRenderPass, &rp_body(1, [0, 0, 0, 255])).unwrap();
         fb.push(FrameOp::Draw, &[0u8; 16]).unwrap();
         let err = r.dispatch_frame(&fb.into_buf()).unwrap_err();
         assert!(matches!(err, RendererError::NoPipelineBound));
@@ -498,7 +560,7 @@ mod tests {
         let mut r = TinySkiaRenderer::new(pixmap.as_mut());
 
         let mut fb = FrameBuilder::new(1024);
-        fb.push(FrameOp::BeginRenderPass, &[]).unwrap();
+        fb.push(FrameOp::BeginRenderPass, &rp_body(1, [0, 0, 0, 255])).unwrap();
         let rect_pipe = ResourceId::new(IdNamespace::Builtin, BUILTIN_PIPELINE_RECT);
         fb.push(FrameOp::BindPipeline, &rect_pipe.raw().to_le_bytes()).unwrap();
 

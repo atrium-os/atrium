@@ -164,12 +164,18 @@ impl Session {
             width: req.width, height: req.height, depth: req.depth,
             format: req.format,
         });
+        // Hand to the backend so it can allocate its per-image
+        // state (SW backend: tiny_skia::Pixmap; GPU backend:
+        // typically no-op, allocation happens via vkBindImageMemory
+        // equivalents).
+        self.backend.image_created(req.image_id, req.width, req.height);
         Ok(())
     }
 
     fn handle_image_destroy(&mut self, m: Message) -> Result<()> {
         let req: ImageDestroyPayload = postcard::from_bytes(&m.payload)?;
         self.table.remove_image(req.image_id);
+        self.backend.image_destroyed(req.image_id);
         Ok(())
     }
 

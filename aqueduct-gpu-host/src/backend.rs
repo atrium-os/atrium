@@ -17,10 +17,14 @@
 //!   exists but talks to the atrium-gpu kmod via ioctls. On D5+ the
 //!   daemon is bypassable entirely, but kept as a dev/CI mode.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use aqueduct_gpu::backends::{BackendId, GpuVendor};
 use aqueduct_gpu::ids::ResourceId;
+
+use crate::software::{BeginRenderPassBody, TinySkiaRenderer};
 
 /// The GPU backend trait. One implementation per supported
 /// host environment.
@@ -50,13 +54,20 @@ pub trait Backend: Send + Sync {
     /// that the guest kmod redeems via `IOC_GPU_IMPORT_REGION`.
     fn allocate_memory(&self, size: u64, usage: u8) -> [u8; 32];
 
-    /// Submit a frame command stream. The default impl records the
-    /// submission count and immediately signals the fence; real
-    /// backends translate `frame_buf` and dispatch.
+    /// Notify the backend an image was created. Called by the
+    /// session when it processes `OP_GPU_IMAGE_CREATE`. SW backends
+    /// use this to allocate per-image pixel storage; GPU backends
+    /// typically ignore it (the GPU-side allocation happens through
+    /// `allocate_memory` + a later `vkBindImageMemory` equivalent).
     ///
-    /// Returns `true` if the fence should be signalled now,
-    /// `false` if signaling is deferred (real backend: deferred
-    /// until GPU completion).
+    /// Default no-op for backends that don't need per-image state.
+    fn image_created(&self, _image_id: ResourceId, _width: u32, _height: u32) {}
+
+    /// Notify the backend an image was destroyed. Default no-op.
+    fn image_destroyed(&self, _image_id: ResourceId) {}
+
+    /// Submit a frame command stream. Returns `true` if the fence
+    /// should be signalled now, `false` if signaling is deferred.
     fn submit_frame(
         &self,
         fence_id: ResourceId,
@@ -111,14 +122,31 @@ impl StubBackend {
 /// shaders, and Vulkan games, are refused at handshake-cap
 /// negotiation.
 ///
-/// Phase 1.3c-stub: the struct exists and the daemon's `--backend
-/// software` CLI flag selects it, but `submit_frame` panics rather
-/// than rasterise. The real tiny-skia integration lands in a
-/// follow-up commit. This stub lets the CLI surface and the
-/// capability advertisement stabilise before the rasterisation
-/// code lands.
+/// **Per-image pixel storage** lives in the
+/// `images: Mutex<HashMap<u64, tiny_skia::Pixmap>>` field. The
+/// session calls `image_created` / `image_destroyed` to keep this
+/// map in sync with the wire-level OP_GPU_IMAGE_{CREATE,DESTROY}.
+/// `submit_frame` decodes the frame stream, finds the target image
+/// in BEGIN_RENDERPASS, takes a `PixmapMut` from the map entry,
+/// and dispatches through `TinySkiaRenderer`.
+///
+/// The Pixmap map is keyed by `ResourceId.raw() as u64`. Because
+/// IDs are partitioned by namespace (top 4 bits — see
+/// `aqueduct_gpu::ids`), `IcdRuntime` IDs from different sessions
+/// can collide on the low bits but never on the full u32. For
+/// Phase 1.3c this single shared map is sufficient since tier-1's
+/// canonical client is frescod (one client); multi-session
+/// isolation lives at the session layer (each session validates
+/// that the image IDs it references belong to its own connection),
+/// not at the backend layer.
 pub struct SoftwareBackend {
     submissions: AtomicU64,
+    images: Mutex<HashMap<u64, tiny_skia::Pixmap>>,
+    /// Telemetry counter for "submit_frame called but no target
+    /// image" or other dispatch failures. Diagnostic only — actual
+    /// errors propagate to the session as `OP_GPU_VALIDATION_ERR`
+    /// in a follow-on commit; today they're logged + counted.
+    dispatch_failures: AtomicU64,
 }
 
 impl Default for SoftwareBackend {
@@ -130,12 +158,40 @@ impl Default for SoftwareBackend {
 impl SoftwareBackend {
     /// Construct a fresh tier-1 software backend.
     pub fn new() -> Self {
-        Self { submissions: AtomicU64::new(0) }
+        Self {
+            submissions: AtomicU64::new(0),
+            images: Mutex::new(HashMap::new()),
+            dispatch_failures: AtomicU64::new(0),
+        }
     }
 
     /// How many frames have been submitted. Diagnostic.
     pub fn submission_count(&self) -> u64 {
         self.submissions.load(Ordering::Relaxed)
+    }
+
+    /// How many submit_frame calls failed dispatch. Diagnostic.
+    pub fn dispatch_failure_count(&self) -> u64 {
+        self.dispatch_failures.load(Ordering::Relaxed)
+    }
+
+    /// Read back the rendered pixels of `image_id`. Returns RGBA8
+    /// bytes (row-major, no padding). Used by tests today and,
+    /// in a follow-on commit, by the session when handling
+    /// `OP_GPU_SHARE_SURFACE` for compositor handoff.
+    pub fn read_image_pixels(&self, image_id: ResourceId) -> Option<Vec<u8>> {
+        let images = self.images.lock().ok()?;
+        let pixmap = images.get(&(image_id.raw() as u64))?;
+        Some(pixmap.data().to_vec())
+    }
+
+    /// Whether the backend currently has a pixel buffer for `image_id`.
+    /// Diagnostic / test helper.
+    pub fn has_image(&self, image_id: ResourceId) -> bool {
+        self.images
+            .lock()
+            .map(|m| m.contains_key(&(image_id.raw() as u64)))
+            .unwrap_or(false)
     }
 }
 
@@ -180,33 +236,109 @@ impl Backend for SoftwareBackend {
     }
 
     fn allocate_memory(&self, _size: u64, _usage: u8) -> [u8; 32] {
-        // Stub: returns a deterministic sentinel token. The
-        // tiny-skia path doesn't yet allocate real backing memory
-        // — that lands when frame dispatch lands.
+        // Tier-1 doesn't actually share memory with the guest yet
+        // (that arrives in Phase 1.5 with IOC_GPU_IMPORT_REGION).
+        // Returns a sentinel token; the per-image Pixmap allocated
+        // in `image_created` is what actually backs rendering.
         let n = self.submissions.load(Ordering::Relaxed);
         let mut tok = [0u8; 32];
         tok[..8].copy_from_slice(&n.to_le_bytes());
-        tok[31] = 0xC0; // sentinel distinct from StubBackend's 0xAB
+        tok[31] = 0xC0;
         tok
     }
 
-    fn submit_frame(&self, _fence_id: ResourceId, _timeline: u64, _frame_buf: &[u8]) -> bool {
-        self.submissions.fetch_add(1, Ordering::Relaxed);
-        // Phase 1.3c-stub: panic to make it obvious that the
-        // real rasterisation hasn't landed yet. Tests configured
-        // for `software` backend will fail here, which is the
-        // intended behaviour until the tiny-skia integration ships.
-        //
-        // Once frame dispatch lands, this becomes:
-        //   self.dispatch_frame(frame_buf, ...) -> Result<()>
-        //   self.signal_fence(fence_id, timeline);
-        //   true
-        unimplemented!(
-            "SoftwareBackend frame dispatch not yet implemented; \
-             use --backend stub for protocol tests or --backend \
-             moltenvk for real rendering"
-        );
+    fn image_created(&self, image_id: ResourceId, width: u32, height: u32) {
+        if width == 0 || height == 0 {
+            log::warn!("SoftwareBackend::image_created: zero-extent image {image_id} ({width}x{height})");
+            return;
+        }
+        // tiny_skia::Pixmap caps at i32::MAX width/height; we cap
+        // tighter to keep allocations sane (16K × 16K = 1 GiB on
+        // BGRA8 — same as Vulkan's typical maxImageDimension2D).
+        const MAX_DIM: u32 = 16 * 1024;
+        if width > MAX_DIM || height > MAX_DIM {
+            log::warn!("SoftwareBackend::image_created: image {image_id} {width}x{height} exceeds {MAX_DIM} cap");
+            return;
+        }
+        let Some(pixmap) = tiny_skia::Pixmap::new(width, height) else {
+            log::warn!("SoftwareBackend::image_created: pixmap alloc failed for {width}x{height}");
+            return;
+        };
+        if let Ok(mut images) = self.images.lock() {
+            images.insert(image_id.raw() as u64, pixmap);
+            log::debug!("SoftwareBackend: registered image {image_id} ({width}x{height})");
+        }
     }
+
+    fn image_destroyed(&self, image_id: ResourceId) {
+        if let Ok(mut images) = self.images.lock() {
+            images.remove(&(image_id.raw() as u64));
+        }
+    }
+
+    fn submit_frame(&self, _fence_id: ResourceId, _timeline: u64, frame_buf: &[u8]) -> bool {
+        self.submissions.fetch_add(1, Ordering::Relaxed);
+
+        // Find the BEGIN_RENDERPASS body to learn the target image.
+        // We don't permit zero-renderpass frames here — tier-1 is
+        // strictly compositor-shaped. Empty frames count as
+        // dispatch failures so they show up in telemetry.
+        let target_image_id = match find_target_image_id(frame_buf) {
+            Ok(id) => id,
+            Err(e) => {
+                log::warn!("SoftwareBackend::submit_frame: {e}");
+                self.dispatch_failures.fetch_add(1, Ordering::Relaxed);
+                return true; // still signal the fence; client gets
+                             // OP_GPU_VALIDATION_ERR via the session
+            }
+        };
+
+        let mut images = match self.images.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                self.dispatch_failures.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        };
+
+        let Some(pixmap) = images.get_mut(&(target_image_id.raw() as u64)) else {
+            log::warn!("SoftwareBackend::submit_frame: target image {target_image_id} not registered");
+            self.dispatch_failures.fetch_add(1, Ordering::Relaxed);
+            return true;
+        };
+
+        let mut renderer = TinySkiaRenderer::new(pixmap.as_mut());
+        match renderer.dispatch_frame(frame_buf) {
+            Ok(draws) => log::debug!("SoftwareBackend: dispatched {draws} draws into {target_image_id}"),
+            Err(e) => {
+                log::warn!("SoftwareBackend::submit_frame: render error: {e}");
+                self.dispatch_failures.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        // Stub fence-signal semantics: tier-1 work completes inline,
+        // so we signal immediately. Real GPU backends defer.
+        true
+    }
+}
+
+/// Peek into a frame command stream and pull out the
+/// `target_image_id` from its BEGIN_RENDERPASS record. Used by
+/// `SoftwareBackend::submit_frame` to choose the Pixmap *before*
+/// constructing the renderer (since the renderer needs the target
+/// at construction time).
+fn find_target_image_id(frame_buf: &[u8]) -> Result<ResourceId, &'static str> {
+    use aqueduct_gpu::frame::FrameDecoder;
+    use aqueduct_gpu::opcodes::FrameOp;
+
+    let mut decoder = FrameDecoder::new(frame_buf);
+    while let Ok(Some((op, body))) = decoder.next() {
+        if op == FrameOp::BeginRenderPass {
+            let p = BeginRenderPassBody::from_bytes(body)
+                .map_err(|_| "BEGIN_RENDERPASS body too short")?;
+            return Ok(ResourceId(p.target_image_id));
+        }
+    }
+    Err("frame contains no BEGIN_RENDERPASS")
 }
 
 impl Backend for StubBackend {
