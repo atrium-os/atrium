@@ -32,7 +32,10 @@
 
 pub mod renderer;
 
-pub use renderer::{BeginRenderPassBody, RectOpParams, RendererError, TinySkiaRenderer};
+pub use renderer::{
+    BeginRenderPassBody, PathCommand, PathFillRule, PathOpParams,
+    RectOpParams, RendererError, TinySkiaRenderer,
+};
 
 // Built-in pipeline local-IDs the renderer recognises.
 

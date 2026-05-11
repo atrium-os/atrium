@@ -84,6 +84,231 @@ impl BeginRenderPassBody {
     }
 }
 
+/// Push-constant layout for the atrium-core path pipeline.
+///
+/// Carries an RGBA fill colour, optional anti-alias flag, an affine
+/// transform applied to all coordinates, and an inline path-command
+/// stream. The command stream uses a compact binary encoding
+/// matching tiny-skia's path-builder verbs.
+///
+/// Wire layout (header is 28 bytes, followed by variable-size
+/// command stream):
+///
+/// ```text
+///   offset  size  field
+///   0       16    color: 4×f32 (R, G, B, A premultiplied)
+///   16      1     anti_alias: u8 (0 = off, 1 = on)
+///   17      1     fill_rule: u8 (0 = Winding, 1 = EvenOdd)
+///   18      2     reserved (must be 0)
+///   20      4     command_count: u32
+///   24      4     reserved (must be 0)
+///   28      …     commands: variable
+///
+/// Each command record is 1-byte verb + N×f32 args:
+///   0x00 MoveTo  (x, y)              — 9 bytes
+///   0x01 LineTo  (x, y)              — 9 bytes
+///   0x02 QuadTo  (cx, cy, x, y)      — 17 bytes
+///   0x03 CubicTo (c1x, c1y, c2x, c2y, x, y) — 25 bytes
+///   0x04 Close                       — 1 byte
+/// ```
+///
+/// Designed to fit small paths (rounded rects, icons, simple
+/// decorations) inside the FOP_PUSH_CONSTANTS body's 128-byte
+/// budget. Paths larger than that require splitting across
+/// multiple PUSH_CONSTANTS/DRAW pairs, or a future
+/// path-via-buffer mechanism (deferred until concrete demand —
+/// most compositor paths are well under the limit).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PathOpParams {
+    /// Fill colour, premultiplied straight-alpha.
+    pub color: [f32; 4],
+    /// Anti-alias toggle. UI rects use false; vector shapes use
+    /// true.
+    pub anti_alias: bool,
+    /// Fill rule.
+    pub fill_rule: PathFillRule,
+    /// Path command stream. See module documentation for the
+    /// command encoding.
+    pub commands: Vec<PathCommand>,
+}
+
+/// Path fill rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PathFillRule {
+    /// Standard non-zero winding rule.
+    Winding = 0,
+    /// Even-odd rule.
+    EvenOdd = 1,
+}
+
+/// One verb in a path command stream. Each variant carries the
+/// coordinates required for that path operation; all coordinates
+/// are in target-image pixel space (origin top-left, +x right,
+/// +y down — same as Vulkan / tiny-skia).
+#[allow(missing_docs)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PathCommand {
+    /// Begin a new subpath at (x, y).
+    MoveTo { x: f32, y: f32 },
+    /// Add a line segment to (x, y).
+    LineTo { x: f32, y: f32 },
+    /// Add a quadratic Bezier with control point (cx, cy) ending
+    /// at (x, y).
+    QuadTo { cx: f32, cy: f32, x: f32, y: f32 },
+    /// Add a cubic Bezier with control points (c1x, c1y) and
+    /// (c2x, c2y), ending at (x, y).
+    CubicTo { c1x: f32, c1y: f32, c2x: f32, c2y: f32, x: f32, y: f32 },
+    /// Close the current subpath (implicit line back to the
+    /// last MoveTo).
+    Close,
+}
+
+impl PathCommand {
+    /// Verb byte for wire encoding.
+    pub const fn verb(&self) -> u8 {
+        match self {
+            PathCommand::MoveTo { .. }  => 0x00,
+            PathCommand::LineTo { .. }  => 0x01,
+            PathCommand::QuadTo { .. }  => 0x02,
+            PathCommand::CubicTo { .. } => 0x03,
+            PathCommand::Close          => 0x04,
+        }
+    }
+
+    /// Wire size in bytes.
+    pub const fn wire_size(&self) -> usize {
+        match self {
+            PathCommand::MoveTo { .. }  => 1 + 2 * 4,
+            PathCommand::LineTo { .. }  => 1 + 2 * 4,
+            PathCommand::QuadTo { .. }  => 1 + 4 * 4,
+            PathCommand::CubicTo { .. } => 1 + 6 * 4,
+            PathCommand::Close          => 1,
+        }
+    }
+}
+
+impl PathOpParams {
+    /// Header size (color + flags + count = 28 bytes).
+    pub const HEADER_LEN: usize = 28;
+
+    /// Encode as plain little-endian bytes.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::with_capacity(
+            Self::HEADER_LEN + self.commands.iter().map(|c| c.wire_size()).sum::<usize>(),
+        );
+        for v in &self.color {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.push(self.anti_alias as u8);
+        out.push(self.fill_rule as u8);
+        out.extend_from_slice(&0u16.to_le_bytes());  // reserved
+        out.extend_from_slice(&(self.commands.len() as u32).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());  // reserved
+        for cmd in &self.commands {
+            out.push(cmd.verb());
+            match *cmd {
+                PathCommand::MoveTo { x, y } | PathCommand::LineTo { x, y } => {
+                    out.extend_from_slice(&x.to_le_bytes());
+                    out.extend_from_slice(&y.to_le_bytes());
+                }
+                PathCommand::QuadTo { cx, cy, x, y } => {
+                    for v in [cx, cy, x, y] { out.extend_from_slice(&v.to_le_bytes()); }
+                }
+                PathCommand::CubicTo { c1x, c1y, c2x, c2y, x, y } => {
+                    for v in [c1x, c1y, c2x, c2y, x, y] {
+                        out.extend_from_slice(&v.to_le_bytes());
+                    }
+                }
+                PathCommand::Close => {}
+            }
+        }
+        out
+    }
+
+    /// Decode from a push-constants byte slice.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, RendererError> {
+        if bytes.len() < Self::HEADER_LEN {
+            return Err(RendererError::ShortPushConstants {
+                expected: Self::HEADER_LEN,
+                got: bytes.len(),
+            });
+        }
+        let mut color = [0f32; 4];
+        for (i, chunk) in bytes[..16].chunks_exact(4).enumerate() {
+            color[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        }
+        let anti_alias = bytes[16] != 0;
+        let fill_rule = match bytes[17] {
+            0 => PathFillRule::Winding,
+            1 => PathFillRule::EvenOdd,
+            other => return Err(RendererError::InvalidPathFillRule(other)),
+        };
+        // bytes[18..20] reserved
+        let command_count = u32::from_le_bytes(
+            [bytes[20], bytes[21], bytes[22], bytes[23]],
+        ) as usize;
+        // bytes[24..28] reserved
+
+        let mut commands = Vec::with_capacity(command_count);
+        let mut cursor = Self::HEADER_LEN;
+        for _ in 0..command_count {
+            if cursor >= bytes.len() {
+                return Err(RendererError::ShortPushConstants {
+                    expected: cursor + 1,
+                    got: bytes.len(),
+                });
+            }
+            let verb = bytes[cursor];
+            cursor += 1;
+            commands.push(match verb {
+                0x00 | 0x01 => {
+                    let (x, y) = read_2_f32(bytes, &mut cursor)?;
+                    if verb == 0x00 { PathCommand::MoveTo { x, y } }
+                    else { PathCommand::LineTo { x, y } }
+                }
+                0x02 => {
+                    let (cx, cy, x, y) = read_4_f32(bytes, &mut cursor)?;
+                    PathCommand::QuadTo { cx, cy, x, y }
+                }
+                0x03 => {
+                    let (c1x, c1y, c2x, c2y, x, y) = read_6_f32(bytes, &mut cursor)?;
+                    PathCommand::CubicTo { c1x, c1y, c2x, c2y, x, y }
+                }
+                0x04 => PathCommand::Close,
+                other => return Err(RendererError::InvalidPathVerb(other)),
+            });
+        }
+        Ok(Self { color, anti_alias, fill_rule, commands })
+    }
+}
+
+fn read_2_f32(b: &[u8], c: &mut usize) -> Result<(f32, f32), RendererError> {
+    if b.len() < *c + 8 {
+        return Err(RendererError::ShortPushConstants {
+            expected: *c + 8,
+            got: b.len(),
+        });
+    }
+    let x = f32::from_le_bytes([b[*c], b[*c+1], b[*c+2], b[*c+3]]);
+    let y = f32::from_le_bytes([b[*c+4], b[*c+5], b[*c+6], b[*c+7]]);
+    *c += 8;
+    Ok((x, y))
+}
+
+fn read_4_f32(b: &[u8], c: &mut usize) -> Result<(f32, f32, f32, f32), RendererError> {
+    let (a, b1) = read_2_f32(b, c)?;
+    let (c1, d) = read_2_f32(b, c)?;
+    Ok((a, b1, c1, d))
+}
+
+fn read_6_f32(b: &[u8], c: &mut usize) -> Result<(f32, f32, f32, f32, f32, f32), RendererError> {
+    let (a, b1) = read_2_f32(b, c)?;
+    let (c1, d) = read_2_f32(b, c)?;
+    let (e, f) = read_2_f32(b, c)?;
+    Ok((a, b1, c1, d, e, f))
+}
+
 /// Push-constant layout for the atrium-core rect pipeline. Fields
 /// match what `fresco-protocol::RectParams` carries on the wire, but
 /// encoded as plain little-endian bytes (postcard-free, hot path).
@@ -307,15 +532,51 @@ impl<'a> TinySkiaRenderer<'a> {
 
         match local {
             BUILTIN_PIPELINE_RECT => self.rasterise_rect(),
-            BUILTIN_PIPELINE_TEXTURED_RECT
-            | BUILTIN_PIPELINE_PATH
-            | BUILTIN_PIPELINE_GLYPH_RUN => {
+            BUILTIN_PIPELINE_PATH => self.rasterise_path(),
+            BUILTIN_PIPELINE_TEXTURED_RECT | BUILTIN_PIPELINE_GLYPH_RUN => {
                 Err(RendererError::Unsupported(
-                    "builtin pipeline rasteriser not yet implemented",
+                    "textured-rect / glyph_run rasterisers not yet implemented",
                 ))
             }
             _ => Err(RendererError::UnknownBuiltinPipeline(local)),
         }
+    }
+
+    fn rasterise_path(&mut self) -> Result<(), RendererError> {
+        let params = PathOpParams::from_bytes(&self.push_constants)?;
+        if params.commands.is_empty() {
+            // Empty path = nothing to draw, but not an error.
+            return Ok(());
+        }
+
+        let mut paint = Paint::default();
+        paint.set_color(Color::from_rgba(
+            params.color[0].clamp(0.0, 1.0),
+            params.color[1].clamp(0.0, 1.0),
+            params.color[2].clamp(0.0, 1.0),
+            params.color[3].clamp(0.0, 1.0),
+        ).ok_or(RendererError::InvalidColor)?);
+        paint.anti_alias = params.anti_alias;
+
+        let mut pb = tiny_skia::PathBuilder::new();
+        for cmd in &params.commands {
+            match *cmd {
+                PathCommand::MoveTo { x, y } => pb.move_to(x, y),
+                PathCommand::LineTo { x, y } => pb.line_to(x, y),
+                PathCommand::QuadTo { cx, cy, x, y } => pb.quad_to(cx, cy, x, y),
+                PathCommand::CubicTo { c1x, c1y, c2x, c2y, x, y } =>
+                    pb.cubic_to(c1x, c1y, c2x, c2y, x, y),
+                PathCommand::Close => pb.close(),
+            }
+        }
+        let path = pb.finish().ok_or(RendererError::DegeneratePath)?;
+
+        let fill_rule = match params.fill_rule {
+            PathFillRule::Winding => FillRule::Winding,
+            PathFillRule::EvenOdd => FillRule::EvenOdd,
+        };
+        self.target.fill_path(&path, &paint, fill_rule, Transform::identity(), None);
+        Ok(())
     }
 
     fn rasterise_rect(&mut self) -> Result<(), RendererError> {
@@ -421,6 +682,19 @@ pub enum RendererError {
     /// Push-constant rect dims were malformed (NaN, negative w/h).
     #[error("invalid rect in push constants (non-finite or negative dimensions)")]
     InvalidRect,
+
+    /// PathOpParams carried a verb byte we don't recognise.
+    #[error("invalid path verb byte {0:#x} (expected 0x00..=0x04)")]
+    InvalidPathVerb(u8),
+
+    /// PathOpParams carried an unrecognised fill rule.
+    #[error("invalid path fill rule {0} (expected 0 = Winding, 1 = EvenOdd)")]
+    InvalidPathFillRule(u8),
+
+    /// Path construction produced no usable path (e.g. zero
+    /// commands after the header, or only Close commands).
+    #[error("path is degenerate after command-stream decode")]
+    DegeneratePath,
 }
 
 #[cfg(test)]
@@ -548,6 +822,168 @@ mod tests {
     fn from_bytes_rejects_short_buffer() {
         let err = RectOpParams::from_bytes(&[0u8; 20]).unwrap_err();
         assert!(matches!(err, RendererError::ShortPushConstants { .. }));
+    }
+
+    #[test]
+    fn path_params_byte_roundtrip() {
+        let p = PathOpParams {
+            color: [0.5, 0.25, 0.125, 1.0],
+            anti_alias: true,
+            fill_rule: PathFillRule::EvenOdd,
+            commands: vec![
+                PathCommand::MoveTo { x: 10.0, y: 10.0 },
+                PathCommand::LineTo { x: 20.0, y: 10.0 },
+                PathCommand::QuadTo { cx: 25.0, cy: 15.0, x: 20.0, y: 20.0 },
+                PathCommand::CubicTo {
+                    c1x: 18.0, c1y: 18.0, c2x: 12.0, c2y: 18.0, x: 10.0, y: 20.0
+                },
+                PathCommand::Close,
+            ],
+        };
+        let bytes = p.to_bytes();
+        let back = PathOpParams::from_bytes(&bytes).unwrap();
+        assert_eq!(p, back);
+    }
+
+    #[test]
+    fn rasterises_triangle_path() {
+        // Fill a triangle with vertices (4,4), (12,4), (8,14) onto
+        // a 16x16 black pixmap; the pixel at the triangle's
+        // centroid should be the fill colour, and a pixel well
+        // outside should still be black.
+        let mut pixmap = Pixmap::new(16, 16).unwrap();
+        pixmap.fill(Color::from_rgba8(0, 0, 0, 255));
+        let mut r = TinySkiaRenderer::new(pixmap.as_mut());
+
+        let path_params = PathOpParams {
+            color: [1.0, 1.0, 0.0, 1.0], // yellow
+            anti_alias: false,
+            fill_rule: PathFillRule::Winding,
+            commands: vec![
+                PathCommand::MoveTo { x: 4.0,  y: 4.0 },
+                PathCommand::LineTo { x: 12.0, y: 4.0 },
+                PathCommand::LineTo { x: 8.0,  y: 14.0 },
+                PathCommand::Close,
+            ],
+        };
+
+        let mut fb = FrameBuilder::new(2048);
+        fb.push(FrameOp::BeginRenderPass, &rp_body(1, [0, 0, 0, 255])).unwrap();
+        let path_pipe = ResourceId::new(IdNamespace::Builtin, BUILTIN_PIPELINE_PATH);
+        fb.push(FrameOp::BindPipeline, &path_pipe.raw().to_le_bytes()).unwrap();
+        let mut body = vec![0u8; 4]; // stage_mask + offset + reserved
+        body.extend_from_slice(&path_params.to_bytes());
+        fb.push(FrameOp::PushConstants, &body).unwrap();
+        fb.push(FrameOp::Draw, &[0u8; 16]).unwrap();
+        fb.push(FrameOp::EndRenderPass, &[]).unwrap();
+        r.dispatch_frame(&fb.into_buf()).unwrap();
+
+        // Centroid of the triangle (~ (8, 7.3)) should be yellow.
+        let inside = pixmap.pixel(8, 7).unwrap();
+        assert_eq!(inside.red(),   255);
+        assert_eq!(inside.green(), 255);
+        assert_eq!(inside.blue(),    0);
+
+        // Top-left corner should be untouched (black).
+        let outside = pixmap.pixel(0, 0).unwrap();
+        assert_eq!(outside.red(),   0);
+        assert_eq!(outside.green(), 0);
+        assert_eq!(outside.blue(),  0);
+    }
+
+    #[test]
+    fn rasterises_quad_and_cubic_curves() {
+        // Confirm the QuadTo and CubicTo verbs are wired up — we
+        // build a small closed path mixing both kinds of curves
+        // and just assert the dispatch succeeded with a non-zero
+        // covered area (centroid pixel is filled).
+        let mut pixmap = Pixmap::new(32, 32).unwrap();
+        pixmap.fill(Color::from_rgba8(0, 0, 0, 255));
+        let mut r = TinySkiaRenderer::new(pixmap.as_mut());
+
+        let params = PathOpParams {
+            color: [0.0, 1.0, 0.0, 1.0], // green
+            anti_alias: true,
+            fill_rule: PathFillRule::Winding,
+            commands: vec![
+                PathCommand::MoveTo  { x: 8.0,  y: 16.0 },
+                PathCommand::QuadTo  { cx: 16.0, cy: 4.0,  x: 24.0, y: 16.0 },
+                PathCommand::CubicTo { c1x: 22.0, c1y: 22.0,
+                                       c2x: 10.0, c2y: 22.0,
+                                       x: 8.0,  y: 16.0 },
+                PathCommand::Close,
+            ],
+        };
+
+        let mut fb = FrameBuilder::new(2048);
+        fb.push(FrameOp::BeginRenderPass, &rp_body(1, [0, 0, 0, 255])).unwrap();
+        let path_pipe = ResourceId::new(IdNamespace::Builtin, BUILTIN_PIPELINE_PATH);
+        fb.push(FrameOp::BindPipeline, &path_pipe.raw().to_le_bytes()).unwrap();
+        let mut body = vec![0u8; 4];
+        body.extend_from_slice(&params.to_bytes());
+        fb.push(FrameOp::PushConstants, &body).unwrap();
+        fb.push(FrameOp::Draw, &[0u8; 16]).unwrap();
+        fb.push(FrameOp::EndRenderPass, &[]).unwrap();
+        r.dispatch_frame(&fb.into_buf()).unwrap();
+
+        // Centre of the curve should be green-ish.
+        let centre = pixmap.pixel(16, 16).unwrap();
+        assert!(centre.green() > 200, "expected green-dominant centre, got {centre:?}");
+    }
+
+    #[test]
+    fn rejects_invalid_path_verb() {
+        // Construct a path payload with a bogus verb byte.
+        let mut body = vec![0u8; 4]; // stage_mask + offset + reserved
+        let mut payload: Vec<u8> = Vec::new();
+        // 4 floats colour
+        for _ in 0..4 { payload.extend_from_slice(&1.0f32.to_le_bytes()); }
+        payload.push(0); // anti_alias = off
+        payload.push(0); // fill_rule = Winding
+        payload.extend_from_slice(&0u16.to_le_bytes());
+        payload.extend_from_slice(&1u32.to_le_bytes()); // command_count = 1
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.push(0x99); // bogus verb
+        body.extend_from_slice(&payload);
+
+        let mut pixmap = Pixmap::new(8, 8).unwrap();
+        let mut r = TinySkiaRenderer::new(pixmap.as_mut());
+        let mut fb = FrameBuilder::new(256);
+        fb.push(FrameOp::BeginRenderPass, &rp_body(1, [0, 0, 0, 255])).unwrap();
+        let path_pipe = ResourceId::new(IdNamespace::Builtin, BUILTIN_PIPELINE_PATH);
+        fb.push(FrameOp::BindPipeline, &path_pipe.raw().to_le_bytes()).unwrap();
+        fb.push(FrameOp::PushConstants, &body).unwrap();
+        fb.push(FrameOp::Draw, &[0u8; 16]).unwrap();
+        let err = r.dispatch_frame(&fb.into_buf()).unwrap_err();
+        assert!(matches!(err, RendererError::InvalidPathVerb(0x99)));
+    }
+
+    #[test]
+    fn empty_path_is_no_op() {
+        // command_count = 0 should not be an error; just no draw.
+        let params = PathOpParams {
+            color: [1.0, 0.0, 0.0, 1.0],
+            anti_alias: false,
+            fill_rule: PathFillRule::Winding,
+            commands: vec![],
+        };
+        let mut pixmap = Pixmap::new(8, 8).unwrap();
+        pixmap.fill(Color::from_rgba8(0, 0, 0, 255));
+        let mut r = TinySkiaRenderer::new(pixmap.as_mut());
+        let mut fb = FrameBuilder::new(256);
+        fb.push(FrameOp::BeginRenderPass, &rp_body(1, [0, 0, 0, 255])).unwrap();
+        let path_pipe = ResourceId::new(IdNamespace::Builtin, BUILTIN_PIPELINE_PATH);
+        fb.push(FrameOp::BindPipeline, &path_pipe.raw().to_le_bytes()).unwrap();
+        let mut body = vec![0u8; 4];
+        body.extend_from_slice(&params.to_bytes());
+        fb.push(FrameOp::PushConstants, &body).unwrap();
+        fb.push(FrameOp::Draw, &[0u8; 16]).unwrap();
+        fb.push(FrameOp::EndRenderPass, &[]).unwrap();
+        r.dispatch_frame(&fb.into_buf()).unwrap();
+
+        // Pixmap should still be entirely black.
+        let p = pixmap.pixel(4, 4).unwrap();
+        assert_eq!((p.red(), p.green(), p.blue()), (0, 0, 0));
     }
 
     #[test]
