@@ -175,6 +175,149 @@ See [ROADMAP.md](ROADMAP.md). Phases D0..D7, roughly:
 | Native kernel GPU drivers | Yes | Yes | Yes | **No (linuxkpi+drm-kmod retrofit)** | **Yes (native, atrium-kmod)** |
 | Standardized | Wayland + Vulkan + DRM (3) | Closed | Partial | Inherits Linux | **In progress (D7)** |
 
+## Atrium as a technology demonstrator
+
+Atrium is **not** trying to replace Linux. It is trying to demonstrate
+what a desktop OS designed in 2026 — from the kernel up, without
+legacy commitments — would look like across every layer, and to let
+those design choices flow back into other ecosystems by example. The
+goal is influence-by-demonstration, not market share.
+
+This framing matters because it changes what "success" looks like.
+A platform aiming to replace Linux fails until it has 100M users. A
+platform aiming to be a coherent next-generation demonstrator
+succeeds when its design choices are visibly better and reproducibly
+verifiable, regardless of how many users adopt it. BeOS, Plan 9,
+NeXTSTEP, and Wayland are precedents — each one had small commercial
+reach but outsized influence on what mainstream OSes eventually
+adopted.
+
+### What Atrium is demonstrating
+
+Atrium ships **multiple coherent design statements**, each one
+addressing a long-standing pain point in current desktop OSes. The
+graphics stack is one such statement; it is not the only one.
+
+| Subsystem | Mainstream pattern | Atrium's bet | Demonstrated by |
+|---|---|---|---|
+| **Storage (Tessera)** | Per-app file duplication; snapshots as a bolt-on (ZFS, btrfs) | Content-addressed FS where dedup, snapshots, and time-machine retention are *first-class* properties of how data is stored, not afterthoughts | `tessera_fs.ko` in-kernel, full POSIX (pjdfstest), `/.tessera/snapshots/<gen>/` magic dir, perf matches/beats ZFS on multi-write fsync (D1.5 ✓) |
+| **IPC (Aqueduct)** | D-Bus and Unix sockets streaming raw bytes; expensive when sharing the same data across processes | Envelope-framed IPC with CAS-backed payloads — shared blobs dedupe across connections automatically | `aqueduct/` crate, `CLASS_PORTCULLIS = 6` already a production consumer, `aqueduct-echo` smoke (D1.6 ✓) |
+| **Sandboxing (Portcullis)** | LSM-stacked security policy (SELinux/AppArmor) or container layer (Docker/Flatpak) — both bolted on outside the kernel's primary security model | Kernel-enforced FreeBSD jails with capability manifests; default-deny by construction, *the* security boundary, not a layer | Privsep architecture live end-to-end: `atrium-jaild`, `atrium-volumes`, `atrium-portcullisd-daemon`, `atrium-portcullisd-bootstrap`, rc.d scripts (D2.5 ✓) |
+| **Package distribution (Opifex)** | dpkg / RPM / Flatpak with their own snapshot, dedup, rollback machinery layered on top | Install = unpack into Tessera (dedupes automatically); update = swap tree (delta bytes only); rollback = re-tag the FS snapshot | Spec at `docs/spec/atrium-pkg.md` and registry at `atrium-pkg-registry.md`; integrates Tessera (D1.5 ✓) + Portcullis (D2.5 ✓) |
+| **Binary format (binsplit)** | Dynamic linking (libfoo.so.X) — fragile at runtime, ABI-locked, frequent breakage | Static binaries that dedupe at *function granularity* via CAS storage. Linking happens at build time; sharing happens at storage time | `tessera-binsplit --analyze --compare --multi` Phase 1; 1.89× aggregate compression across 9 Atrium binaries (D1.7 ✓) |
+| **Graphics (Fresco + aqueduct-gpu)** | X11/Wayland + Mesa-as-runtime + drm-kmod + per-app shader trust | Retained-mode scenegraph protocol + universal shader sandbox + Mesa-as-build-tool + AOT shaders + closed wire vocabulary | aqueduct-gpu design in `docs/spec/aqueduct-gpu.md`; Phase 1+2 implementation in flight; frescod's Vulkan smoke proves the end-to-end path |
+| **Input** | Linux evdev codes carried via libinput | USB HID usage codes natively, no evdev intermediate | atrium-keyboard, atrium-input spec; HID-codes-on-the-wire is the protocol contract |
+| **Persistent sessions (Stoa)** | tmux + ssh, mosh, screen — all userland workarounds for a network-disconnect problem the OS doesn't address | Persistent SSH session service as a first-class OS daemon; graphical terminal falls out for free | Spec at `docs/spec/stoa.md`; D2.7 implementation deferred but architected |
+| **Language posture** | Linux is mostly C; Rust slowly arriving as opt-in | Rust userspace + C kernel from day one, public APIs as C ABI for stability | `docs/LANGUAGE-POLICY.md` locked 2026-04-28; every Atrium-authored userspace crate is Rust |
+| **License posture** | GPL kernel + mixed LGPL/permissive userland + proprietary vendor blobs | Permissive only in runtime (BSD/MIT/Apache); no GPL, no LGPL in the runtime image; closed drivers excluded by policy | `docs/LICENSING-POLICY.md`; the Mesa fork (`atrium-mesa`, MIT) replaces drm-kmod (GPL inherited from Linux) |
+| **Kernel-userspace fault line** | Linux DRM in kernel + libdrm + Mesa in userspace + per-app driver instances | Native FreeBSD kernel GPU drivers (atrium-gpu ABI); Mesa only at build/install time, never in a runtime app process | D0 atrium-virtio-gpu kmod ✓; aqueduct-gpu design (`docs/spec/aqueduct-gpu.md`) defines the userspace half |
+
+The coherence across this matrix is itself the meta-demonstration. The
+*same* design principles — content-addressing, capability manifests,
+permissive licensing, native FreeBSD primitives, no Linux-shape
+leakage — show up in storage, IPC, package distribution, binary
+format, graphics, and sandboxing. An app installed by atrium-pkg
+lives in a Portcullis jail, reads from Tessera (which deduplicates
+its binary at function granularity via binsplit), communicates over
+aqueduct (whose payloads are themselves CAS-deduplicated), and
+renders through aqueduct-gpu (whose shaders are AOT-compiled and
+stored in Tessera by hash). Every layer reinforces every other
+layer. That is the design statement.
+
+### The discipline: every phase exit produces a demonstration
+
+The strategic shift in being a technology demonstrator is that
+**engineering deliverables and demonstration artifacts are the same
+thing**. A phase exit is not "the test passes," it is "there is a
+recordable, reproducible, shareable thing that demonstrates the
+design choice."
+
+Concretely, phase exit criteria are augmented with:
+
+- A **reproducible benchmark** with the methodology published and the
+  code public (target: a reviewer can re-run on their hardware and
+  get within ±10% of our numbers).
+- A **side-by-side comparison artifact** with the equivalent on
+  Linux/macOS — screenshot, video, log, or perf number — where the
+  comparison is *honest* (call out where we lose, not just where we
+  win).
+- A **30-to-90-second video** or animated screenshot that
+  communicates the design choice without prose. Each demo should
+  stand alone on social media.
+- One **written explainer** (blog-post-shape, 1k–3k words) that ties
+  the demonstration to the design choice it embodies, with code
+  links and reproducibility notes.
+
+This is more work than "ship the feature, write a test, move on." It
+is also what turns engineering output into the platform's actual
+deliverable. Every Atrium milestone should be a thing someone outside
+the project can point at and say "that's a real design statement,
+backed by working code."
+
+### What this looks like across the upcoming arc
+
+Pulling from the implementation phases of various subsystems:
+
+- **Aqueduct-gpu Phase 1 + 1.5** (next 8–12 weeks). Demonstration:
+  vestibulum rendering visibly nicer than Wayland/X11 equivalents;
+  reproducible benchmark vs Linux+radv; "sandbox rejects a malicious
+  shader" 30-second video.
+- **Aqueduct-gpu Phase 2 + Bevy backend** (12–24 weeks). Demonstration:
+  a real Bevy game running on Atrium with first-frame latency
+  measurably better than the same game on Linux+radv; reproducible.
+- **Tessera storage demo cycle** (parallel, 8 weeks). Demonstration:
+  install 50 jailed apps; show disk usage; compare to the same 50
+  apps on Linux with Flatpak; the difference is graphical.
+- **Portcullis capability demo** (parallel, 4 weeks). Demonstration:
+  an app that *cannot* read your files because its manifest didn't
+  declare that capability; show the system-call returning EPERM at
+  the kernel boundary, not at an LSM hook.
+- **Aqueduct IPC dedup demo** (4 weeks). Demonstration: ten
+  applications all displaying the same large image; ten connections;
+  one CAS blob on the wire. Show the byte counter.
+- **Showcase content phase** (12–24 months parallel). An
+  AAA-quality 30-minute experience, a Veloren port via the Bevy
+  backend, ray-tracing demos. The "look at what runs here" tier.
+
+Each row produces a demonstration artifact that stands alone *and*
+contributes to the holistic argument that Atrium's design choices
+fit together coherently.
+
+### The audience for this demonstration
+
+(Existing "Audience" section below remains; this paragraph reframes
+the *purpose* of those conversations.)
+
+The demonstrations are aimed at three audiences:
+
+1. **System architects and OS researchers** — to influence what the
+   next generation of Linux, macOS, or new platforms eventually
+   adopt. The win condition is "Mesa upstream decides to land an
+   AOT-by-default mode after seeing Atrium's install-time pre-compile
+   pass; Wayland adds CAS-backed surface sharing after seeing
+   aqueduct-gpu's surface-share; FreeBSD's jail subsystem grows
+   capability-manifest support after Portcullis demonstrates it."
+   This is "influence-by-demonstration" working.
+2. **Developers of new engines, toolkits, and apps** — Bevy, Godot,
+   small open-source 3D engines, the Rust graphics community. The
+   win condition is "Bevy adds an aqueduct-gpu backend because
+   Atrium's protocol is the cleanest GPU API anyone's actually
+   implemented." A platform-as-design-reference, not necessarily a
+   platform-they-deploy-to.
+3. **The small set of users who want a coherent permissive desktop**
+   — embedded device builders, paranoid orgs, license-strict
+   enterprises, FOSS purists. The win condition is "Atrium runs as a
+   shipped product in some specialised niche where its design choices
+   are exactly what's needed (perhaps embedded HMI, perhaps secure
+   workstations, perhaps thin-client compositors)." Steam Deck's
+   analogue: not market-share-replacement, but defended niche.
+
+If any one of these audiences is moved, the technology demonstrator
+succeeded. If all three are moved, Atrium is the most influential
+desktop-OS demonstrator since BeOS.
+
+---
+
 ## Strategic posture
 
 This is a **multi-year program**. Not a single sprint. Honest scale:
