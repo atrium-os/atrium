@@ -138,8 +138,28 @@ pub struct HeadlessRenderer {
     readback_size:   vk::DeviceSize,
 
     cmd_pool:   vk::CommandPool,
+    /// "Current frame" handles — assigned at the start of each
+    /// `render_to_buffer` call from `cmd_buffers[frame_idx]` /
+    /// `fences[frame_idx]`. All existing recording/submit/wait code
+    /// keeps using `self.cmd_buffer` / `self.fence` unchanged.
     cmd_buffer: vk::CommandBuffer,
     fence:      vk::Fence,
+    /// Per-frame command-buffer ring. On macOS-HVF + venus,
+    /// `vkResetCommandBuffer` synchronously waits for the host
+    /// worker to release the cb from the previous submit; the host
+    /// can lag the guest by several frames after the fence is
+    /// signalled. Cycling between N buffers gives the host enough
+    /// time to fully release the cb at the other end of the ring
+    /// before we touch it again. N=2 is enough in practice on our
+    /// stack; bump if a workload demands more in-flight frames.
+    cmd_buffers: Vec<vk::CommandBuffer>,
+    fences:      Vec<vk::Fence>,
+    /// `true` for slots that have been submitted at least once. The
+    /// first use of each slot skips the wait_for_fences (no prior
+    /// submission to wait for, and venus does not always honour
+    /// `FENCE_CREATE_SIGNALED` on imported fences).
+    submitted:   Vec<bool>,
+    frame_idx:   usize,
 
     /* Bundle dispatch state. Populated by `load_bundle()`; consumed
      * per-frame by `render_to_buffer()`. */
@@ -194,11 +214,24 @@ impl HeadlessRenderer {
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         )?;
 
-        let (cmd_pool, cmd_buffer) = create_command_pool(&device, queue_family)?;
+        /* Ring depth = 2 is enough on observed macOS-HVF + venus
+         * latency; bump if a workload demands more in-flight frames.
+         * See comment on `cmd_buffers` field for the rationale. */
+        const RING_DEPTH: u32 = 2;
+        let (cmd_pool, cmd_buffers) =
+            create_command_pool(&device, queue_family, RING_DEPTH)?;
 
+        /* Fences are created unsignaled; we explicitly skip the first
+         * wait on each slot via the `submitted` flag. */
         let fence_info = vk::FenceCreateInfo::default();
-        let fence = unsafe { device.create_fence(&fence_info, None) }
-            .context("create_fence")?;
+        let mut fences = Vec::with_capacity(RING_DEPTH as usize);
+        for _ in 0..RING_DEPTH {
+            fences.push(unsafe { device.create_fence(&fence_info, None) }
+                .context("create_fence")?);
+        }
+        let cmd_buffer = cmd_buffers[0];
+        let fence = fences[0];
+        let submitted = vec![false; RING_DEPTH as usize];
 
         Ok(Self {
             _entry: entry, instance,
@@ -208,7 +241,9 @@ impl HeadlessRenderer {
             color_image, color_memory, color_view,
             render_pass, framebuffer,
             readback_buffer, readback_memory, readback_size,
-            cmd_pool, cmd_buffer, fence,
+            cmd_pool, cmd_buffer, fence, cmd_buffers, fences, submitted,
+            /* Start at usize::MAX so first advance lands on slot 0. */
+            frame_idx: usize::MAX,
             op_pipelines: HashMap::new(),
             op_frames:    HashMap::new(),
             resources:    HashMap::new(),
@@ -377,6 +412,20 @@ impl HeadlessRenderer {
     /// acquire/present.
     pub fn render_to_buffer(&mut self) -> Result<()> {
         unsafe {
+            /* Advance the command-buffer ring. If this slot has been
+             * submitted before, wait on its fence — by the time the
+             * ring wraps back, the host has had RING_DEPTH-1 frames
+             * of slack to fully release the cb. First-use of each
+             * slot has no prior submission to wait on. */
+            self.frame_idx = self.frame_idx
+                .wrapping_add(1) % self.cmd_buffers.len();
+            self.cmd_buffer = self.cmd_buffers[self.frame_idx];
+            self.fence      = self.fences[self.frame_idx];
+            if self.submitted[self.frame_idx] {
+                self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+                self.device.reset_fences(&[self.fence])?;
+            }
+            self.submitted[self.frame_idx] = true;
             /* Pre-record: build DrawPlan list. Same logic as windowed
              * Renderer. */
             let mut plans: Vec<DrawPlan> = Vec::new();
@@ -524,8 +573,13 @@ impl HeadlessRenderer {
                 }
             }
 
-            self.device.reset_command_buffer(
-                self.cmd_buffer, vk::CommandBufferResetFlags::empty())?;
+            /* No explicit reset_command_buffer here: the command pool was
+             * created with RESET_COMMAND_BUFFER, so begin_command_buffer
+             * with ONE_TIME_SUBMIT implicitly returns this cb to the
+             * recording state. An explicit reset_command_buffer on
+             * venus + macOS-HVF blocks indefinitely after the previous
+             * fence has signalled — the host worker hasn't released
+             * the cb back even though the fence reports completion. */
             let begin = vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
             self.device.begin_command_buffer(self.cmd_buffer, &begin)?;
@@ -662,7 +716,6 @@ impl HeadlessRenderer {
                 self.readback_buffer, &[region]);
 
             self.device.end_command_buffer(self.cmd_buffer)?;
-
             self.device.reset_fences(&[self.fence])?;
             let submit = vk::SubmitInfo::default()
                 .command_buffers(std::slice::from_ref(&self.cmd_buffer));
@@ -820,7 +873,13 @@ impl Drop for HeadlessRenderer {
             for (_, p) in self.op_pipelines.drain() {
                 p.destroy(&self.device);
             }
-            self.device.destroy_fence(self.fence, None);
+            /* `self.fence` is an alias into `self.fences`; don't free
+             * it twice. Same for `self.cmd_buffer` aliasing into
+             * `self.cmd_buffers` (cmd buffers are freed implicitly
+             * when the pool is destroyed). */
+            for f in self.fences.drain(..) {
+                self.device.destroy_fence(f, None);
+            }
             self.device.destroy_command_pool(self.cmd_pool, None);
             self.device.destroy_framebuffer(self.framebuffer, None);
             self.device.destroy_render_pass(self.render_pass, None);
@@ -1030,9 +1089,9 @@ fn find_memory_type(
     Err(anyhow!("no memory type matches bits={type_bits:#x} props={needed:?}"))
 }
 
-fn create_command_pool(device: &ash::Device, queue_family: u32)
-    -> Result<(vk::CommandPool, vk::CommandBuffer)>
-{
+fn create_command_pool(
+    device: &ash::Device, queue_family: u32, count: u32,
+) -> Result<(vk::CommandPool, Vec<vk::CommandBuffer>)> {
     let info = vk::CommandPoolCreateInfo::default()
         .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
         .queue_family_index(queue_family);
@@ -1040,9 +1099,9 @@ fn create_command_pool(device: &ash::Device, queue_family: u32)
     let alloc = vk::CommandBufferAllocateInfo::default()
         .command_pool(pool)
         .level(vk::CommandBufferLevel::PRIMARY)
-        .command_buffer_count(1);
+        .command_buffer_count(count);
     let bufs = unsafe { device.allocate_command_buffers(&alloc) }?;
-    Ok((pool, bufs[0]))
+    Ok((pool, bufs))
 }
 
 fn create_render_pass(device: &ash::Device, format: vk::Format)
