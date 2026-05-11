@@ -1543,8 +1543,10 @@ atrium_vgpu_get_display_info(struct atrium_gpu_softc *sc)
 
 	bzero(&s, sizeof(s));
 	s.req.type = htole32(VIRTIO_GPU_CMD_GET_DISPLAY_INFO);
-	s.req.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
-	s.req.fence_id = htole64(atomic_fetchadd_64(&sc->next_fence, 1));
+	/* No FENCE flag — req_resp is synchronous (we wait for the response
+	 * struct, not a fence). Setting FENCE without INFO_RING_IDX would
+	 * hit virgl_renderer_create_fence (legacy global fence path), which
+	 * returns EINVAL under VIRGL_RENDERER_NO_VIRGL on macOS hosts. */
 
 	err = atrium_vgpu_req_resp(sc, &s.req, sizeof(s.req),
 	    &s.resp, sizeof(s.resp));
@@ -1719,8 +1721,7 @@ atrium_vgpu_get_capset_info_at(struct atrium_gpu_softc *sc,
 
 	bzero(&s, sizeof(s));
 	s.req.hdr.type     = htole32(VIRTIO_GPU_CMD_GET_CAPSET_INFO);
-	s.req.hdr.flags    = htole32(VIRTIO_GPU_FLAG_FENCE);
-	s.req.hdr.fence_id = htole64(atomic_fetchadd_64(&sc->next_fence, 1));
+	/* No FENCE — synchronous req_resp; see GET_DISPLAY_INFO for why. */
 	s.req.capset_index = htole32(index);
 
 	err = atrium_vgpu_req_resp(sc, &s.req, sizeof(s.req),
@@ -1776,8 +1777,7 @@ atrium_vgpu_get_capset(struct atrium_gpu_softc *sc, uint32_t capset_id,
 	bzero(&req, sizeof(req));
 	bzero(resp_buf, resp_size);
 	req.hdr.type     = htole32(VIRTIO_GPU_CMD_GET_CAPSET);
-	req.hdr.flags    = htole32(VIRTIO_GPU_FLAG_FENCE);
-	req.hdr.fence_id = htole64(atomic_fetchadd_64(&sc->next_fence, 1));
+	/* No FENCE — synchronous req_resp; see GET_DISPLAY_INFO for why. */
 	req.capset_id    = htole32(capset_id);
 	req.capset_version = htole32(version);
 

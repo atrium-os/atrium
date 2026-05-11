@@ -677,9 +677,38 @@ For changes that need to apply on first attach (e.g., a new field that gets init
 
 - macOS `tar c` preserves extended attributes by default; the receiving FreeBSD `tar x` prints `Cannot restore extended attributes: com.apple.provenance: Unknown error: -1` for every file. **Harmless** — the file contents land correctly. Add `--no-xattrs` to silence, but the warning is just noise.
 
+#### Deferred kmod load — so a wedged kmod doesn't brick the VM
+
+**Problem (learned the hard way 2026-05-10/11):** if `atrium_virtio_gpu.ko` is preloaded via `/boot/loader.conf` and the kmod has any bug — panic at attach, CPU-spin on probe, deadlock in an IRQ handler — the VM boots into a state with **no diagnostic channel**: sshd never gets to run because the kmod is consuming all CPU, ddb-on-serial starves on missed interrupts, and the only recovery is `pkill -9 qemu` followed by a full xz baseline restore. That's an hour of work per failed kmod-debug iteration. The xz baseline restore loses everything not in the baseline image (atrium-mesa userspace, bundles, frescod/vestibulum binaries, /usr/src) so the next 30 minutes are spent reinstalling.
+
+**Fix:** don't preload the kmod. Load it after sshd via `/etc/rc.d/atrium_virtio_gpu`. If the kmod is broken, sshd comes up first, you SSH in, `scp` a fixed kmod into `/boot/modules/`, and `service atrium_virtio_gpu restart`. No reboot needed in most cases; even when a reboot is needed, no xz restore.
+
+**Setup (already in the post-2026-05-11 baseline xz):**
+
+- `/boot/loader.conf`: **no** `atrium_virtio_gpu_load="YES"`. Just `hint.vtgpu.0.disabled="1"` so the in-tree vtgpu doesn't grab the virtio-gpu device unit at boot.
+- `/etc/rc.conf`: `atrium_virtio_gpu_enable="YES"`.
+- `/etc/rc.d/atrium_virtio_gpu`: kldload's the kmod, then runs `devctl set driver -f vtgpu0 atrium_virtio_gpu && devctl enable atrium_virtio_gpu0` to bind the (vtgpu-disabled) device unit to atrium. `REQUIRE: sshd` in the rcorder line so it runs *after* sshd is up.
+- Source of truth: `~/src/bsd/atrium-kmod/rc.d/atrium_virtio_gpu`. `scripts/build-zfs-root.sh` installs it into new VMs.
+
+**Iterate on a kmod change without ever burning the VM:**
+
+```sh
+# 1. Build the new kmod (host or in-VM, doesn't matter).
+# 2. Copy it in:
+scp -i ~/.ssh/fresco_bsd_ed25519 -P 2222 \
+    ~/src/bsd/atrium-kmod/atrium_virtio_gpu.ko \
+    root@127.0.0.1:/boot/modules/
+# 3. Reload:
+vssh "kldunload atrium_virtio_gpu 2>/dev/null; service atrium_virtio_gpu start"
+# 4. If kldload panics the kernel: reboot, sshd comes back up cleanly,
+#    scp a fixed kmod, repeat. No xz restore.
+```
+
+The bad-kmod recovery loop is **30 seconds** instead of 30 minutes.
+
 #### Restoring the dev VM from `vm.qcow2.xz` baseline
 
-**When you need to do this:** kernel panicked AND the qcow2 fs is corrupted (rare with ZFS root); a destructive in-VM experiment broke `/lib` or `/boot`; you replaced a system library with an ABI-incompatible copy and now sshd dies on every connection (see "replacing system libraries safely" below for how to avoid that).
+**When you actually need this** (much rarer with deferred-load above): the qcow2 fs is corrupted (still rare with ZFS root); a destructive in-VM experiment broke `/lib` or `/boot` itself (see "replacing system libraries safely" below — and don't replace `libthr` again).
 
 ```sh
 pkill -9 qemu-system-aarch64

@@ -1,0 +1,73 @@
+#!/bin/sh
+#
+# Deferred load for the atrium-virtio-gpu kmod.
+#
+# DELIBERATELY runs AFTER sshd so a wedged kmod doesn't take down our
+# only diagnostic channel: sshd is up before this script touches the
+# kmod, so even if `kldload` panics or CPU-spins, the next boot still
+# starts sshd cleanly and we can `cp` a fixed kmod into /boot/modules.
+#
+# The historical comment in build-zfs-root.sh said "preloading is the
+# clean fix" because runtime kldload after vtgpu attaches won't
+# displace it. That's true — we work around it via
+# `hint.vtgpu.0.disabled="1"` in /boot/loader.conf, which keeps the
+# device unbound until we kldload here. The "preloading is clean"
+# comment was wrong by hindsight: preload also makes the kmod
+# unrecoverably-stuck-in-boot if it has any bug, and we found out the
+# hard way (multiple xz baseline restores in 2026-05).
+#
+
+# PROVIDE: atrium_virtio_gpu
+# REQUIRE: sshd
+# KEYWORD: nojail
+
+. /etc/rc.subr
+
+name="atrium_virtio_gpu"
+rcvar="atrium_virtio_gpu_enable"
+
+load_rc_config "$name"
+: ${atrium_virtio_gpu_enable:="YES"}
+
+start_cmd="atrium_kmod_load"
+stop_cmd="atrium_kmod_unload"
+
+atrium_kmod_load()
+{
+	if ! kldstat -q -m atrium_virtio_gpu; then
+		if [ ! -f /boot/modules/atrium_virtio_gpu.ko ]; then
+			echo "atrium_virtio_gpu: /boot/modules/atrium_virtio_gpu.ko not found, skipping"
+			return 0
+		fi
+		echo "atrium_virtio_gpu: loading kmod"
+		kldload /boot/modules/atrium_virtio_gpu.ko || {
+			echo "atrium_virtio_gpu: kldload failed"
+			return 1
+		}
+	fi
+	# Bind kmod to the (disabled) vtgpu0 device unit. The vtgpu in-tree
+	# driver is disabled via hint.vtgpu.0.disabled="1" in loader.conf,
+	# so its device unit exists but no driver is attached. We set the
+	# driver name and enable, which kicks BUS_PROBE and attaches
+	# atrium_virtio_gpu. The "set driver" message prints a misleading
+	# ENOENT but does the rename; `enable` triggers the actual probe.
+	if [ ! -c /dev/atrium-gpu0 ]; then
+		echo "atrium_virtio_gpu: binding to vtgpu0 unit"
+		devctl set driver -f vtgpu0 atrium_virtio_gpu 2>/dev/null || true
+		devctl enable atrium_virtio_gpu0 2>/dev/null || true
+	fi
+	if [ -c /dev/atrium-gpu0 ]; then
+		echo "atrium_virtio_gpu: /dev/atrium-gpu0 ready"
+	else
+		echo "atrium_virtio_gpu: WARNING /dev/atrium-gpu0 not present after bind"
+	fi
+}
+
+atrium_kmod_unload()
+{
+	if kldstat -q -m atrium_virtio_gpu; then
+		kldunload atrium_virtio_gpu || true
+	fi
+}
+
+run_rc_command "$1"

@@ -135,7 +135,7 @@ cat > $ALTROOT/etc/resolv.conf <<EOF
 nameserver 10.0.2.3
 EOF
 
-# ── 7. /boot/loader.conf — ZFS root + atrium kmod preload ─────────────
+# ── 7. /boot/loader.conf — ZFS root, no atrium kmod preload ───────────
 echo "=== 7. Writing /boot/loader.conf ==="
 cat > $ALTROOT/boot/loader.conf <<EOF
 # ZFS root
@@ -146,15 +146,36 @@ vfs.root.mountfrom="zfs:$POOL/ROOT/default"
 p9fs_load="YES"
 virtio_p9fs_load="YES"
 
-# Atrium GPU kmod — preload so its probe wins against stock vtgpu at
-# boot (BUS_PROBE_VENDOR > BUS_PROBE_DEFAULT). Runtime kldload after
-# vtgpu has already attached doesn't displace it; preloading is the
-# clean fix.
-atrium_virtio_gpu_load="YES"
+# Disable the in-tree vtgpu so it doesn't grab the virtio-gpu PCI device
+# at boot — runtime kldload of atrium-virtio-gpu can't displace an
+# already-attached vtgpu, but with vtgpu disabled the device is
+# unbound and atrium attaches cleanly later.
+hint.vtgpu.0.disabled="1"
+
+# atrium-virtio-gpu kmod is NOT preloaded here. It loads after sshd
+# is up via /etc/rc.d/atrium_virtio_gpu. Reason: a panicking or
+# CPU-spinning kmod loaded by the loader takes down the entire boot,
+# leaving no diagnostic channel (sshd never comes up, ddb-on-serial
+# starves on missed interrupts). With deferred load, sshd is up before
+# the kmod touches the device, so a buggy kmod is recoverable in
+# place — no xz baseline restore needed.
 EOF
 
 mkdir -p $ALTROOT/boot/modules
 cp $ATRIUM_KMOD $ALTROOT/boot/modules/
+
+# rc.d script that defer-loads the kmod after sshd
+mkdir -p $ALTROOT/etc/rc.d
+cp $(dirname $0)/../atrium-kmod/rc.d/atrium_virtio_gpu $ALTROOT/etc/rc.d/
+chmod +x $ALTROOT/etc/rc.d/atrium_virtio_gpu
+
+# rc.conf gets the enable knob (default YES from inside the script,
+# but explicit here so `service atrium_virtio_gpu disable` works).
+cat >> $ALTROOT/etc/rc.conf <<EOF
+
+# Defer-load atrium-virtio-gpu after sshd (see /etc/rc.d/atrium_virtio_gpu).
+atrium_virtio_gpu_enable="YES"
+EOF
 
 # ── 8. SSH setup ─────────────────────────────────────────────────────
 echo "=== 8. SSH setup ==="
