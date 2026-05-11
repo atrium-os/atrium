@@ -65,6 +65,7 @@ pub mod backend;
 pub mod listener;
 pub mod resources;
 pub mod session;
+pub mod software;
 
 pub use backend::{Backend, SoftwareBackend, StubBackend};
 pub use listener::Listener;

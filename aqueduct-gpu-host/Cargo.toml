@@ -30,5 +30,10 @@ env_logger     = "0.11"
 # renderer migration.
 ash            = "0.38"
 
+# Phase 1.3c: tier-1 SW renderer. Pure-Rust 2D rasterisation,
+# permissively licensed (BSD-Zero). Same version Pergola uses to
+# keep the workspace coherent.
+tiny-skia      = "0.11"
+
 [dev-dependencies]
 aqueduct-gpu-client = { path = "../aqueduct-gpu-client" }
