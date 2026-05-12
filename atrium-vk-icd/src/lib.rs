@@ -525,6 +525,71 @@ pub struct VkLayerProperties {
     description:           [c_char; VK_MAX_DESCRIPTION_SIZE],
 }
 
+/// Names that vkGetDeviceProcAddr must NOT resolve (per spec).
+/// The Khronos loader treats device-level proc-addr as the
+/// canonical fast path for an app, and apps occasionally call
+/// vkGetDeviceProcAddr with instance-level names to test that
+/// the ICD draws the line correctly. We return None for these.
+///
+/// This list is exhaustive against what we currently expose:
+/// keep in sync if vk_icdGetInstanceProcAddr gains new entries.
+const ATRIUM_INSTANCE_ONLY_ENTRY_POINTS: &[&str] = &[
+    "vkEnumerateInstanceVersion",
+    "vkEnumerateInstanceExtensionProperties",
+    "vkEnumerateInstanceLayerProperties",
+    "vkEnumerateDeviceExtensionProperties",
+    "vkCreateInstance",
+    "vkDestroyInstance",
+    "vkEnumeratePhysicalDevices",
+    "vkGetPhysicalDeviceProperties",
+    "vkGetPhysicalDeviceQueueFamilyProperties",
+    "vkGetPhysicalDeviceFeatures",
+    "vkGetPhysicalDeviceMemoryProperties",
+    "vkGetPhysicalDeviceFormatProperties",
+    "vkCreateDevice",
+    "vkDestroySurfaceKHR",
+    "vkCreateAtriumSurfaceEXT",
+    "vkGetPhysicalDeviceSurfaceSupportKHR",
+    "vkGetPhysicalDeviceSurfaceCapabilitiesKHR",
+    "vkGetPhysicalDeviceSurfaceFormatsKHR",
+    "vkGetPhysicalDeviceSurfacePresentModesKHR",
+    "vkCreateDebugUtilsMessengerEXT",
+    "vkDestroyDebugUtilsMessengerEXT",
+    "vkSubmitDebugUtilsMessageEXT",
+];
+
+/// `vkGetDeviceProcAddr` — resolves device-level entry points.
+///
+/// Per the Vulkan spec, this returns NULL for instance-level
+/// entry points even if the ICD exposes them via
+/// vk_icdGetInstanceProcAddr. Apps use this to retrieve a
+/// dispatch table that skips the loader's per-call instance
+/// thunking — the fast path for cmdbuf recording loops.
+///
+/// We delegate to vk_icdGetInstanceProcAddr (which knows every
+/// name we expose) but filter out the instance-only list so a
+/// well-behaved caller can't accidentally call e.g.
+/// vkCreateInstance via a device proc-addr.
+#[no_mangle]
+pub unsafe extern "C" fn vkGetDeviceProcAddr(
+    _device: VkDevice,
+    name:    *const c_char,
+) -> PFN_vkVoidFunction {
+    if name.is_null() {
+        return None;
+    }
+    let name_str = match CStr::from_ptr(name).to_str() {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+    if ATRIUM_INSTANCE_ONLY_ENTRY_POINTS.iter().any(|n| *n == name_str) {
+        return None;
+    }
+    // Delegate. We pass null instance — vk_icdGetInstanceProcAddr
+    // accepts that for any name it knows.
+    vk_icdGetInstanceProcAddr(std::ptr::null_mut(), name)
+}
+
 /// `vk_icdGetInstanceProcAddr` — the only symbol the Vulkan loader
 /// strictly requires us to export. Called by the loader to resolve
 /// every Vulkan function name on the application's behalf.
@@ -583,6 +648,10 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkPhysicalDevice, *const c_char, *mut u32, *mut VkExtensionProperties) -> VkResult, FnVoidPtr,
             >(vkEnumerateDeviceExtensionProperties)),
+        "vkGetDeviceProcAddr" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, *const c_char) -> PFN_vkVoidFunction, FnVoidPtr,
+            >(vkGetDeviceProcAddr)),
         "vkCreateInstance" =>
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(*const c_void, *const c_void, *mut VkInstance) -> VkResult, FnVoidPtr,
@@ -4818,6 +4887,53 @@ mod tests {
         assert_eq!(names[0], "VK_KHR_surface");
         assert_eq!(names[1], "VK_EXT_atrium_surface");
         assert_eq!(names[2], "VK_EXT_debug_utils");
+    }
+
+    #[test]
+    fn get_device_proc_addr_filters_instance_entry_points() {
+        // Resolve vkGetDeviceProcAddr itself first.
+        let f = lookup(b"vkGetDeviceProcAddr\0").unwrap();
+        let gdpa: unsafe extern "C" fn(VkDevice, *const c_char) -> PFN_vkVoidFunction =
+            unsafe { std::mem::transmute(f) };
+
+        // Device-level names: resolve.
+        for name in [
+            b"vkQueueSubmit\0".as_slice(),
+            b"vkCmdDraw\0".as_slice(),
+            b"vkCreateSwapchainKHR\0".as_slice(),
+            b"vkQueuePresentKHR\0".as_slice(),
+            b"vkSetDebugUtilsObjectNameEXT\0".as_slice(),
+            b"vkCmdBeginDebugUtilsLabelEXT\0".as_slice(),
+            b"vkGetDeviceProcAddr\0".as_slice(),
+        ] {
+            let r = unsafe { gdpa(std::ptr::null_mut(), name.as_ptr() as *const c_char) };
+            assert!(r.is_some(),
+                "vkGetDeviceProcAddr should resolve device-level: {:?}",
+                std::str::from_utf8(&name[..name.len()-1]).unwrap());
+        }
+
+        // Instance-level names: MUST be filtered out.
+        for name in [
+            b"vkCreateInstance\0".as_slice(),
+            b"vkDestroyInstance\0".as_slice(),
+            b"vkEnumerateInstanceExtensionProperties\0".as_slice(),
+            b"vkEnumeratePhysicalDevices\0".as_slice(),
+            b"vkGetPhysicalDeviceProperties\0".as_slice(),
+            b"vkCreateDevice\0".as_slice(),
+            b"vkCreateAtriumSurfaceEXT\0".as_slice(),
+            b"vkCreateDebugUtilsMessengerEXT\0".as_slice(),
+            b"vkGetPhysicalDeviceSurfaceCapabilitiesKHR\0".as_slice(),
+        ] {
+            let r = unsafe { gdpa(std::ptr::null_mut(), name.as_ptr() as *const c_char) };
+            assert!(r.is_none(),
+                "vkGetDeviceProcAddr MUST NOT resolve instance-level: {:?}",
+                std::str::from_utf8(&name[..name.len()-1]).unwrap());
+        }
+
+        // Null name + unknown name handling.
+        assert!(unsafe { gdpa(std::ptr::null_mut(), std::ptr::null()) }.is_none());
+        assert!(unsafe { gdpa(std::ptr::null_mut(),
+            b"vkNonexistentEntryPoint\0".as_ptr() as *const c_char) }.is_none());
     }
 
     #[test]
