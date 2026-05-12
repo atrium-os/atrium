@@ -98,6 +98,7 @@ use fresco_vulkan::UploadRequest;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -189,6 +190,55 @@ fn main() -> std::io::Result<()> {
         .unwrap_or_else(|_| "/tmp/frescod-aqueduct.sock".to_string());
     let _ = std::fs::remove_file(&aq_sock);
     let sw_backend = Arc::new(SoftwareBackend::new());
+
+    // ── VK present sidechannel ──────────────────────────────────
+    //
+    // atrium-vk-icd's vkQueuePresentKHR routes through
+    // OP_GPU_PRESENT → SoftwareBackend::present(image, surface,
+    // frame). `surface_id` is the Fresco window-id (by VK_EXT_
+    // atrium_surface convention: VkSurfaceKHR ≡ window-id).
+    //
+    // The hook below stashes the freshly-presented pixels into a
+    // per-window inbox. The main frame loop drains it each
+    // iteration, copies the pixels into the matching
+    // `WindowSurface::image`, and forces a composite redraw — the
+    // existing skip-hierarchy + queued page-flip then puts the
+    // pixels on screen at this window's (pos, size).
+    //
+    // The hook only stashes a Vec<u8>; the actual image write
+    // happens on the render-loop thread under its own locks, so
+    // the daemon's frame-processing thread (which calls the hook)
+    // never touches `window_surfaces` or talks to the kmod.
+    let vk_present_inbox: Arc<Mutex<HashMap<u32, Vec<u8>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let vk_present_dirty = Arc::new(AtomicBool::new(false));
+    {
+        let inbox = vk_present_inbox.clone();
+        let dirty = vk_present_dirty.clone();
+        sw_backend.set_present_hook(move |backend, image_id, surface_id, _frame_id| {
+            // Read back the swapchain-image pixels the ICD just
+            // rendered into. The image was created via OP_GPU_
+            // IMAGE_CREATE, so the SoftwareBackend has a Pixmap
+            // for it under `image_id`.
+            let Some(pixels) = backend.read_image_pixels(image_id) else {
+                log::debug!(
+                    "frescod-aqueduct: VK present hook — no pixels for image {image_id} \
+                     (surface={surface_id}); dropping"
+                );
+                return;
+            };
+            // surface_id is a u64; window-ids are u32 in fresco.
+            let win_id = surface_id as u32;
+            if let Ok(mut m) = inbox.lock() {
+                // Overwrite any prior pending pixels for this window —
+                // last-presented-wins; we always render the most recent
+                // frame, not a queue of stale ones.
+                m.insert(win_id, pixels);
+            }
+            dirty.store(true, Ordering::Relaxed);
+        });
+    }
+
     let backend_for_listener: Arc<dyn Backend> = sw_backend.clone();
     let listener = Listener::bind(&aq_sock, backend_for_listener)
         .map_err(io_other)?;
@@ -310,6 +360,60 @@ fn main() -> std::io::Result<()> {
         let mut prof = FrameProfile::default();
         timeline += 1;
 
+        // ── Drain pending VK presents from the sidechannel ───────
+        //
+        // For each (window_id, pixels) the present-hook stashed:
+        //   1. If we have a WindowSurface for that window and the
+        //      dimensions match, blit the pixels into the
+        //      surface's image via SoftwareBackend::image_write_
+        //      pixels (the public Backend-trait method).
+        //   2. Clear the surface's `last_bytes` so the dirty-check
+        //      in render_one_frame_multipass forces a composite
+        //      this frame.
+        //
+        // We also set `vk_forced_full = true` so the renderer is
+        // told to redo the composite pass even if no scene ops
+        // changed — otherwise an idle window with a one-shot VK
+        // present would never reach scanout.
+        let mut vk_forced_full = false;
+        if vk_present_dirty.swap(false, Ordering::Relaxed) {
+            let drained: Vec<(u32, Vec<u8>)> = vk_present_inbox
+                .lock()
+                .map(|mut m| m.drain().collect())
+                .unwrap_or_default();
+            for (win_id, pixels) in drained {
+                let Some(surf) = window_surfaces.get_mut(&win_id) else {
+                    log::debug!(
+                        "frescod-aqueduct: VK present drain — window {win_id} not in surfaces; \
+                         dropping {} bytes",
+                        pixels.len()
+                    );
+                    continue;
+                };
+                let need = (surf.width as usize) * (surf.height as usize) * 4;
+                if pixels.len() != need {
+                    log::warn!(
+                        "frescod-aqueduct: VK present drain — window {win_id} pixel-size \
+                         mismatch ({} bytes vs expected {} for {}x{}); dropping (scaling NYI)",
+                        pixels.len(), need, surf.width, surf.height
+                    );
+                    continue;
+                }
+                if let Err(e) = Backend::image_write_pixels(
+                    &*sw_backend, surf.image, surf.width * 4, &pixels,
+                ) {
+                    log::warn!(
+                        "frescod-aqueduct: VK present drain — image_write_pixels for window \
+                         {win_id} failed: {e}"
+                    );
+                    continue;
+                }
+                // Force this window through the composite pass.
+                surf.last_bytes.clear();
+                vk_forced_full = true;
+            }
+        }
+
         // Render into bos[next_render_idx]. The kmod is scanning
         // bos[last_flipped_idx]; the third slot is settled.
         let (composite, any_dirty) = render_one_frame_multipass(
@@ -318,7 +422,7 @@ fn main() -> std::io::Result<()> {
             &mut slot_images, &mut window_surfaces,
             mode.width, mode.height,
             &mut bos[next_render_idx], &mut prof,
-            /* force_full = */ false,
+            /* force_full = */ vk_forced_full,
         ).map_err(io_other)?;
 
         let layout_changed = composite != last_composite_bytes;
