@@ -30,50 +30,30 @@
 //! Listens on `/tmp/frescod.sock` (or `$FRESCOD_SOCK`). Standard
 //! fresco-protocol clients connect unchanged.
 //!
-//! # Deferred work — proper vsync + multi-buffer scanout (kmod 3.5)
+//! # Deferred work — proper vsync (kmod step 3.5)
 //!
-//! Today's frame loop is **wall-clock-paced single-buffer**: one
-//! scanout BO, `thread::sleep` to the connector's reported
-//! `refresh_mhz`, `Display::page_flip` whenever a new frame is
-//! ready. Tear-prone in theory (QEMU's host display backend may
-//! poll the BO mid-render-into-BO copy) but visually clean in
-//! practice on virtio-gpu under HVF.
+//! Today's frame loop is wall-clock-paced over a **triple-buffered**
+//! scanout ring. The kmod's page_flip rebinds the connector's
+//! scanout when the supplied BO differs (committed alongside this
+//! file as Phase 1.5b.a), so render-into-live-BO tearing is gone
+//! structurally.
 //!
-//! Three related improvements are all gated on the same kmod work
-//! (D0 step 3.5 / Phase 1.5b in the plan):
+//! What remains for proper vsync (still kmod-side, deferred to
+//! `docs/spec/aqueduct-gpu.md` §6.5.5.b + §6.5.5.c):
 //!
-//! 1. **`IOC_DISPLAY_PAGE_FLIP` should rebind scanout to a
-//!    different BO.** Today `atrium_display_page_flip` only does
-//!    `virtio-gpu RESOURCE_FLUSH` on the supplied BO's resource_id;
-//!    it does NOT issue `SET_SCANOUT(scanout, new_resource_id)`.
-//!    Consequence: flipping to any BO other than the one passed to
-//!    `set_mode` shows black, because the connector remains bound
-//!    to the original BO's resource_id. Fix: page_flip should
-//!    SET_SCANOUT to the new BO's resource_id (when it differs
-//!    from the currently-bound one) and then FLUSH. ~20 lines of
-//!    C in `atrium-kmod/atrium_virtio_gpu.c`.
-//!
-//! 2. **Multi-buffer scanout (double or triple).** Unlocks
-//!    structural tear-prevention: render into the back BO, flip
-//!    swaps roles atomically. Client-side change: ~30 lines in
-//!    this file (allocate N BOs, round-robin advance on real
-//!    flips, keepalive on the current scanout BO). Blocked on (1).
-//!
-//! 3. **Vblank events for phase-locked rendering.** Kmod gains an
-//!    IRQ handler that posts events to subscribers; new ioctl
+//! 1. **Vblank IRQ events.** Kmod gains an IRQ handler that posts
+//!    vblank events to subscribers; new ioctl
 //!    `IOC_DISPLAY_SUBSCRIBE_VBLANK` returns an event fd
-//!    (`kqueue`-friendly per `feedback_kqueue_native.md`). Client
-//!    side: replace `thread::sleep` pacer with a kqueue wait on
-//!    `(vblank, sock, input)`. On vblank fire: check per-window
-//!    dirty, render if so, page_flip. Kmod page_flip gains a
-//!    "queue for next vblank" mode that complements the immediate
-//!    mode used today. Real vsync, no tearing, no wasted frames.
+//!    (`kqueue`-friendly per `feedback_kqueue_native.md`).
 //!
-//! The per-window architecture (`window_surfaces` ring) is
-//! deliberately staged to make all three above changes localised
-//! when the kmod work lands — no client-side redesign needed.
+//! 2. **Queued page-flip semantics.** Kmod page_flip gains a
+//!    "queue for next vblank" flag complementing today's immediate
+//!    mode. With the BO ring already in place, the slots become
+//!    proper front/queued/back: render→queue→wait-vblank→advance.
 //!
-//! See `docs/spec/aqueduct-gpu.md` §6.5.5 for the spec-side note.
+//! Client side once those land: `atrium-gpu-rs` wraps the vblank
+//! fd; this file replaces `thread::sleep` with a kqueue wait on
+//! `(vblank, sock, input)`. ~50 lines of localised change.
 
 #[path = "../input_reader.rs"]
 mod input_reader;
@@ -152,39 +132,35 @@ fn main() -> std::io::Result<()> {
         | ATRIUM_GPU_BO_CPU_VISIBLE
         | ATRIUM_GPU_BO_COHERENT
         | ATRIUM_GPU_BO_SCANOUT;
-    // ── Scanout: single-buffered until kmod step 3.5 ─────────────
+    // ── Triple-buffered scanout ──────────────────────────────────
     //
-    // Today the kmod's IOC_DISPLAY_PAGE_FLIP does virtio-gpu
-    // RESOURCE_FLUSH on the BO's resource_id but does NOT issue
-    // SET_SCANOUT to rebind the connector to a different BO.
-    // Consequence: page_flip(bos[i]) for i != mode-set BO shows
-    // black, because the connector is still bound to bos[0]'s
-    // resource_id.
+    // Three scanout BOs used round-robin on real flips. Eliminates
+    // render-into-live-BO tearing structurally — we never mutate
+    // the BO the kmod is reading.
     //
-    // We allocate a single BO, render and BGRA-copy into it, then
-    // page_flip it. This is tear-prone in theory (QEMU's host
-    // display backend reads mid-copy) but works in practice on
-    // virtio-gpu where the host pulls the framebuffer on its own
-    // poll schedule, not in lockstep with our writes.
+    // Slot semantics:
+    //   bos[next_render_idx]  — about-to-be-written by the next
+    //                           dirty render
+    //   bos[last_flipped_idx] — currently being scanned out;
+    //                           keepalive flips re-assert this one
+    //   the third slot        — "settled" from a previous flip,
+    //                           safe to ignore
     //
-    // The kmod 3.5 work bundles three related gaps:
-    //   1. SET_SCANOUT-on-page-flip when the supplied BO differs
-    //      from the mode-set BO. This enables real multi-buffer
-    //      scanout, which prerequisite for both:
-    //   2. Triple-buffered scanout (3 BOs round-robin, eliminate
-    //      tear-from-render-into-live-BO).
-    //   3. Vblank IRQ events (`IOC_DISPLAY_SUBSCRIBE_VBLANK` +
-    //      event fd) for phase-locked render/flip pacing.
+    // Depends on kmod page_flip rebinding the connector's scanout
+    // when the supplied BO differs from the bound one (Phase 1.5b.a
+    // in `docs/spec/aqueduct-gpu.md` §6.5.5.a). Without that fix,
+    // the connector would keep scanning out bos[0] no matter which
+    // BO we hand to page_flip → second-frame black.
     //
-    // The client side of (2) and (3) lands behind the kmod work:
-    //   - Single → multi-BO rotation: ~30 lines of change in this
-    //     file once page_flip rebinds scanout.
-    //   - Wall-clock pacer → kqueue-driven vblank wait: ~50 lines
-    //     once IOC_DISPLAY_SUBSCRIBE_VBLANK is available.
-    //
-    // See `docs/spec/aqueduct-gpu.md` §6.5.5 and the header comment
-    // of this file. Tracked as Phase 1.5b in the project plan.
-    let mut bo = gpu.alloc(bytes, flags)?;
+    // Real vsync (kqueue on vblank-fd) still deferred to §6.5.5.b.
+    // Today's pacing remains wall-clock against mode.refresh_mhz.
+    let mut bos: [atrium_gpu::Bo; 3] = [
+        gpu.alloc(bytes, flags)?,
+        gpu.alloc(bytes, flags)?,
+        gpu.alloc(bytes, flags)?,
+    ];
+    let mut next_render_idx: usize = 0;
+    let mut last_flipped_idx: usize = 0;
 
     // ── In-process aqueduct-gpu-host + GpuClient ─────────────────
     // Use a Unix socket on tmpfs. In the D5+ end-state the client
@@ -277,8 +253,7 @@ fn main() -> std::io::Result<()> {
     let mut last_composite_bytes: Vec<u8> = Vec::new();
     let mut frames_since_real_flip: u32 = 0;
 
-    // First frame: always go through the full path (SET_MODE before
-    // page-flip is required regardless).
+    // First frame: render into bos[0]; set mode + first flip against it.
     {
         let mut p = FrameProfile::default();
         timeline += 1;
@@ -287,13 +262,15 @@ fn main() -> std::io::Result<()> {
             target, fence, &mut timeline,
             &mut slot_images, &mut window_surfaces,
             mode.width, mode.height,
-            &mut bo, &mut p,
+            &mut bos[0], &mut p,
             /* force_full = */ true,
         ).map_err(io_other)?;
         last_composite_bytes = composite;
     }
-    dpy.set_mode(conn.id, &bo, mode)?;
-    dpy.page_flip(conn.id, &bo)?;
+    dpy.set_mode(conn.id, &bos[0], mode)?;
+    dpy.page_flip(conn.id, &bos[0])?;
+    last_flipped_idx = 0;
+    next_render_idx = 1;
 
     // Rolling FPS counter. Once per FPS_REPORT_SECS we log the
     // window's frame count + min/avg/max render-time + per-phase
@@ -313,28 +290,36 @@ fn main() -> std::io::Result<()> {
         let mut prof = FrameProfile::default();
         timeline += 1;
 
+        // Render into bos[next_render_idx]. The kmod is scanning
+        // bos[last_flipped_idx]; the third slot is settled.
         let (composite, any_dirty) = render_one_frame_multipass(
             &mut client, &sw_backend, &frontend, &comp,
             target, fence, &mut timeline,
             &mut slot_images, &mut window_surfaces,
             mode.width, mode.height,
-            &mut bo, &mut prof,
+            &mut bos[next_render_idx], &mut prof,
             /* force_full = */ false,
         ).map_err(io_other)?;
 
-        // Outer skip combines two signals:
-        //   - any_dirty: at least one window re-rendered into its
-        //     surface this frame, so the BO has fresh pixels.
-        //   - composite-bytes changed: layout shifted (window moved,
-        //     resized, opened, closed) even if no window rasterised.
-        // Either one means the panel needs the new BO contents.
         let layout_changed = composite != last_composite_bytes;
         let need_keepalive = frames_since_real_flip >= VRR_KEEPALIVE_INTERVALS;
-        let flip_now = any_dirty || layout_changed || need_keepalive;
+        let real_flip = any_dirty || layout_changed;
 
-        if flip_now && !composite.is_empty() {
-            dpy.page_flip(conn.id, &bo)?;
+        if real_flip && !composite.is_empty() {
+            // Flip to the freshly-rendered BO; advance the ring.
+            // Kmod's page_flip will SET_SCANOUT-rebind the connector
+            // since we're flipping to a different BO than last frame.
+            dpy.page_flip(conn.id, &bos[next_render_idx])?;
+            last_flipped_idx = next_render_idx;
+            next_render_idx = (next_render_idx + 1) % bos.len();
             last_composite_bytes = composite;
+            frames_since_real_flip = 0;
+            window_flips += 1;
+        } else if need_keepalive {
+            // Re-assert the current scanout BO. Kmod's page_flip
+            // hits the same-BO fast path (no SET_SCANOUT, just
+            // RESOURCE_FLUSH). No ring advance.
+            dpy.page_flip(conn.id, &bos[last_flipped_idx])?;
             frames_since_real_flip = 0;
             window_flips += 1;
         } else {

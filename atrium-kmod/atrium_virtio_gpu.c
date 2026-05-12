@@ -183,6 +183,27 @@ struct atrium_gpu_softc {
 	 * sleepable work in attach. 0 = not yet created. */
 	uint32_t                       scanout_ctx_id;
 
+	/* Per-connector "currently bound" virtio_resource_id. Updated by
+	 * set_mode and by page_flip when the supplied BO differs from
+	 * the bound one. Lets page_flip detect when it must reissue
+	 * SET_SCANOUT_BLOB to retarget the connector at a different BO
+	 * (required for multi-buffer scanout / triple buffering).
+	 *
+	 * Indexed by scanout_id (connector_id). 0 means "not bound".
+	 * VIRTIO_GPU_MAX_SCANOUTS is 16 in the spec; size the array
+	 * conservatively. Reads + writes under `bo_lock` (matches the
+	 * lock context already held for BO lookup in set_mode /
+	 * page_flip). */
+#define ATRIUM_GPU_MAX_SCANOUTS	16
+	uint32_t                       current_scanout_rid[ATRIUM_GPU_MAX_SCANOUTS];
+	/* Per-connector mode dimensions captured at set_mode time.
+	 * Used by page_flip to auto-promote any BO that the caller
+	 * scanout-flips to but never set_mode'd against. Required for
+	 * multi-buffer scanout where each BO except the mode-set one
+	 * arrives at page_flip un-promoted. */
+	uint32_t                       scanout_width [ATRIUM_GPU_MAX_SCANOUTS];
+	uint32_t                       scanout_height[ATRIUM_GPU_MAX_SCANOUTS];
+
 	/* Cdevs. */
 	struct cdev                   *gpu_cdev;
 	struct cdev                   *display_cdev;
@@ -1343,8 +1364,21 @@ atrium_display_set_mode(struct atrium_gpu_softc *sc,
 	/* SET_SCANOUT_BLOB carries the format + stride explicitly — unlike
 	 * legacy SET_SCANOUT (which derives them from the prior
 	 * RESOURCE_CREATE_2D). This is the unified path. */
-	return (atrium_vgpu_set_scanout_blob(sc, args->connector_id, rid,
-	    VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM, w, h));
+	err = atrium_vgpu_set_scanout_blob(sc, args->connector_id, rid,
+	    VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM, w, h);
+	if (err != 0)
+		return (err);
+
+	/* Remember the bound resource_id + mode dims for page_flip's
+	 * rebinding fast-path and auto-promote-on-flip. */
+	if (args->connector_id < ATRIUM_GPU_MAX_SCANOUTS) {
+		mtx_lock(&sc->bo_lock);
+		sc->current_scanout_rid[args->connector_id] = rid;
+		sc->scanout_width [args->connector_id] = w;
+		sc->scanout_height[args->connector_id] = h;
+		mtx_unlock(&sc->bo_lock);
+	}
+	return (0);
 }
 
 static int
@@ -1352,20 +1386,61 @@ atrium_display_page_flip(struct atrium_gpu_softc *sc,
     struct atrium_display_page_flip *args)
 {
 	struct atrium_gpu_bo *bo;
-	uint32_t rid, w, h;
+	uint32_t rid, w, h, cur_rid, conn;
+	int err;
 
 	if (args->flags & FRESCO_PAGE_FLIP_INCLUDE_CURSOR)
 		return (EINVAL);  /* reserved for v0.2 */
+	if (args->connector_id >= ATRIUM_GPU_MAX_SCANOUTS)
+		return (ENOENT);
+	conn = args->connector_id;
 
 	mtx_lock(&sc->bo_lock);
 	bo = atrium_bo_find_locked(sc, args->scanout_handle);
+	cur_rid = sc->current_scanout_rid[conn];
+	w = sc->scanout_width [conn];
+	h = sc->scanout_height[conn];
 	mtx_unlock(&sc->bo_lock);
 	if (bo == NULL || bo->virtio_resource_id == 0)
 		return (ENOENT);
-
+	if (cur_rid == 0 || w == 0 || h == 0) {
+		/* No set_mode has run on this connector yet. */
+		return (ENXIO);
+	}
 	rid = bo->virtio_resource_id;
-	w   = bo->scanout_width;
-	h   = bo->scanout_height;
+
+	/* Multi-buffer scanout: if the caller is flipping to a BO whose
+	 * resource_id differs from the one currently bound to this
+	 * connector (set by a prior SET_MODE or page_flip), reissue
+	 * SET_SCANOUT_BLOB to rebind. Without this, the host's
+	 * RESOURCE_FLUSH below would flush the supplied BO's contents
+	 * but the connector would continue scanning out the previously-
+	 * bound resource_id — the visible symptom is "page_flip to a
+	 * second BO shows black because we never re-render into the
+	 * first one."
+	 *
+	 * Same-BO flips skip the rebinding step (RESOURCE_FLUSH alone
+	 * is the hot path for single-buffer scanout).
+	 */
+	if (rid != cur_rid) {
+		/* Auto-promote: a BO arriving at page_flip without a prior
+		 * set_mode never had scanout_format/width/height
+		 * populated. Reuse the connector's set-mode dims so the
+		 * caller doesn't need a separate IOC_DISPLAY_PROMOTE
+		 * ioctl per BO. Idempotent: returns 0 on re-promote of
+		 * already-promoted BOs. */
+		err = atrium_promote_bo_to_resource(sc, bo,
+		    VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM, w, h);
+		if (err != 0)
+			return (err);
+		err = atrium_vgpu_set_scanout_blob(sc, conn, rid,
+		    VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM, w, h);
+		if (err != 0)
+			return (err);
+		mtx_lock(&sc->bo_lock);
+		sc->current_scanout_rid[conn] = rid;
+		mtx_unlock(&sc->bo_lock);
+	}
 
 	/* No TRANSFER_TO_HOST_2D for BLOB resources — the host reads
 	 * guest RAM directly via the mem_entry we registered at
