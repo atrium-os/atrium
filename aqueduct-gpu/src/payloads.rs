@@ -483,6 +483,24 @@ pub struct ShareSurfaceResponse {
     pub share_token: [u8; 32],
 }
 
+/// Client → server: present a rendered swapchain image to a
+/// Fresco surface. Fire-and-forget. The host endpoint routes the
+/// image's pixels through to the surface's per-window
+/// `WindowSurface` (per `aqueduct-gpu.md` §7.1.1).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PresentPayload {
+    /// Source image (a VkImage from the app's swapchain ring,
+    /// already registered as an ICD-runtime ResourceId).
+    pub image_id: ResourceId,
+    /// Opaque Fresco surface id the swapchain was created
+    /// against. The daemon resolves this through its own
+    /// surface→window map.
+    pub surface_id: u64,
+    /// Monotonic frame number for diagnostics. Lets the daemon
+    /// detect dropped/coalesced presents.
+    pub frame_id: u64,
+}
+
 // ───── Bundle lifecycle ───────────────────────────────────────────
 
 /// Client → server: load a third-party bundle.

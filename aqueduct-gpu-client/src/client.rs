@@ -354,6 +354,19 @@ impl GpuClient {
         Ok(resp.share_token)
     }
 
+    /// Present a rendered swapchain image to a Fresco surface.
+    /// Fire-and-forget; the host endpoint routes the image's
+    /// pixels through to its per-window WindowSurface.
+    pub fn present(
+        &mut self,
+        image_id:   ResourceId,
+        surface_id: u64,
+        frame_id:   u64,
+    ) -> GpuClientResult<()> {
+        let req = PresentPayload { image_id, surface_id, frame_id };
+        self.send(OP_GPU_PRESENT, 0, &req)
+    }
+
     // ─── Bundle lifecycle ──────────────────────────────────────────
 
     /// Load a third-party scene-graph bundle. Returns the

@@ -4353,15 +4353,80 @@ pub unsafe extern "C" fn vkAcquireNextImageKHR(
     VK_SUCCESS
 }
 
-/// `vkQueuePresentKHR` — no-op success today. The spec'd
-/// OP_GPU_PRESENT opcode + daemon-side surface-routing aren't
-/// landed yet; offscreen-render-and-copy is the supported
-/// pattern (see headless_triangle).
+/// `vkQueuePresentKHR` — for each (swapchain, imageIndex) tuple
+/// in the VkPresentInfoKHR, fire an `OP_GPU_PRESENT` against the
+/// instance's GpuClient. Daemon-side routing through the
+/// surface→window map happens on the host endpoint (today
+/// frescod-aqueduct; the SoftwareBackend currently no-ops the
+/// opcode since it isn't wired to a windowing system).
+///
+/// VkPresentInfoKHR layout:
+///   0   sType
+///   8   pNext
+///   16  waitSemaphoreCount : u32
+///   24  pWaitSemaphores : ptr
+///   32  swapchainCount : u32
+///   40  pSwapchains : *const VkSwapchainKHR (u64)
+///   48  pImageIndices : *const u32
+///   56  pResults : *mut VkResult (optional)
 #[no_mangle]
 pub unsafe extern "C" fn vkQueuePresentKHR(
-    _queue:             VkQueue,
-    _p_present_info:    *const c_void,
+    queue:           VkQueue,
+    p_present_info:  *const c_void,
 ) -> VkResult {
+    if queue.is_null() || p_present_info.is_null() { return VK_SUCCESS; }
+    let q = &*(queue as *const AtriumQueue);
+    if q._device.is_null() { return VK_SUCCESS; }
+    let dev = &*(q._device as *const AtriumDevice);
+    if dev.instance.is_null() { return VK_SUCCESS; }
+    let inst = &*(dev.instance as *const AtriumInstance);
+    let Some(client_mu) = inst.client.as_ref() else { return VK_SUCCESS; };
+
+    let b = p_present_info as *const u8;
+    let sc_count       = std::ptr::read_unaligned(b.add(32) as *const u32);
+    let p_swapchains   = std::ptr::read_unaligned(b.add(40) as *const *const u64);
+    let p_image_indices = std::ptr::read_unaligned(b.add(48) as *const *const u32);
+    let p_results      = std::ptr::read_unaligned(b.add(56) as *const *mut VkResult);
+
+    if p_swapchains.is_null() || p_image_indices.is_null() {
+        return VK_SUCCESS;
+    }
+
+    for i in 0..sc_count {
+        let sc_handle = *p_swapchains.offset(i as isize);
+        let img_index = *p_image_indices.offset(i as isize);
+
+        // Resolve swapchain → (surface_id, image at index).
+        let (surface_id, image_handle) = {
+            let Ok(scs) = dev.swapchains.lock() else { continue; };
+            match scs.get(&sc_handle) {
+                Some(sc) => (sc.surface, sc.images.get(img_index as usize).copied().unwrap_or(0)),
+                None => continue,
+            }
+        };
+        if image_handle == 0 { continue; }
+
+        // VkImage → daemon-side image_id.
+        let image_id = match dev.images.lock() {
+            Ok(m) => m.get(&image_handle).and_then(|x| x.image_id),
+            Err(_) => None,
+        };
+        let Some(image_id) = image_id else {
+            if !p_results.is_null() {
+                *p_results.offset(i as isize) = -3 /* VK_ERROR_INITIALIZATION_FAILED */;
+            }
+            continue;
+        };
+
+        // Send OP_GPU_PRESENT with a monotonic frame_id.
+        dev.timeline.set(dev.timeline.get() + 1);
+        if let Ok(mut c) = client_mu.lock() {
+            let _ = c.present(image_id, surface_id, dev.timeline.get());
+        }
+        if !p_results.is_null() {
+            *p_results.offset(i as isize) = VK_SUCCESS;
+        }
+    }
     VK_SUCCESS
 }
 

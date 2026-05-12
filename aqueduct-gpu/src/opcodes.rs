@@ -138,6 +138,15 @@ pub const OP_GPU_WAIT_FENCE:      u16 = 0x0201;
 /// only the handle traverses the wire.
 pub const OP_GPU_SHARE_SURFACE:   u16 = 0x0210;
 
+/// Client → server: present a rendered image to a Fresco surface.
+/// Fired by `vkQueuePresentKHR` after the app's last frame for
+/// that swapchain image. The host endpoint (today
+/// frescod-aqueduct; native HW at D5+) routes the image's
+/// pixels to the surface's per-window `WindowSurface` per
+/// `aqueduct-gpu.md` §7.1.1. Fire-and-forget; ordering is
+/// preserved by aqueduct-gpu's per-connection timeline.
+pub const OP_GPU_PRESENT:         u16 = 0x0211;
+
 // ─── Bundle lifecycle (third-party scene-graph extensions) ──
 
 /// Load a third-party bundle into the host endpoint. Payload

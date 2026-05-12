@@ -120,6 +120,7 @@ impl Session {
             OP_GPU_SUBMIT_FRAME       => self.handle_submit_frame(m),
             OP_GPU_WAIT_FENCE         => self.handle_wait_fence(m),
             OP_GPU_SHARE_SURFACE      => self.handle_share_surface(m),
+            OP_GPU_PRESENT            => self.handle_present(m),
             OP_GPU_BUNDLE_LOAD        => self.handle_bundle_load(m),
             OP_GPU_BUNDLE_UNLOAD      => self.handle_bundle_unload(m),
             other => {
@@ -452,6 +453,17 @@ impl Session {
         log::info!("share_surface image={} purpose={:?}",
                    req.image_id, req.purpose);
         self.send_response(OP_GPU_SHARE_SURFACE, &resp)
+    }
+
+    /// `OP_GPU_PRESENT` — record the present intent. The backend
+    /// today logs it and returns; the actual surface→window
+    /// routing lands when frescod-aqueduct gains a per-surface
+    /// WindowSurface map.
+    fn handle_present(&mut self, m: Message) -> Result<()> {
+        let req: PresentPayload = postcard::from_bytes(&m.payload)?;
+        log::info!("present image={} surface={} frame={}",
+                   req.image_id, req.surface_id, req.frame_id);
+        Ok(())
     }
 
     fn handle_bundle_load(&mut self, m: Message) -> Result<()> {
