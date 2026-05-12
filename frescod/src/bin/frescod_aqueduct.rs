@@ -162,14 +162,15 @@ fn main() -> std::io::Result<()> {
                            slot_images: &mut HashMap<u32, SlotImage>,
                            timeline: &mut u64,
                            bo: &mut atrium_gpu::Bo|
-        -> Result<(), std::io::Error>
+        -> Result<Duration, std::io::Error>
     {
         *timeline += 1;
+        let t0 = Instant::now();
         render_one_frame_aqueduct(
             client, &frontend, &comp, target, fence, *timeline, slot_images,
         ).map_err(io_other)?;
         copy_backend_to_bo(&sw_backend, target, bo).map_err(io_other)?;
-        Ok(())
+        Ok(t0.elapsed())
     };
 
     // First frame: render + SET_MODE before flipping.
@@ -177,10 +178,47 @@ fn main() -> std::io::Result<()> {
     dpy.set_mode(conn.id, &bo, mode)?;
     dpy.page_flip(conn.id, &bo)?;
 
+    // Rolling FPS counter. Once per FPS_REPORT_SECS we log the
+    // window's frame count + min/avg/max render-time. Useful for
+    // catching slowdowns mid-session.
+    const FPS_REPORT_SECS: u64 = 5;
+    let mut window_start = Instant::now();
+    let mut window_frames: u32 = 0;
+    let mut window_render_min = Duration::from_secs(60);
+    let mut window_render_max = Duration::ZERO;
+    let mut window_render_sum = Duration::ZERO;
+
     let mut next = Instant::now() + Duration::from_nanos(FRAME_NS);
     loop {
-        render_and_flip(&mut client, &mut slot_images, &mut timeline, &mut bo)?;
+        let render_dur = render_and_flip(
+            &mut client, &mut slot_images, &mut timeline, &mut bo,
+        )?;
         dpy.page_flip(conn.id, &bo)?;
+
+        window_frames += 1;
+        window_render_sum += render_dur;
+        if render_dur < window_render_min { window_render_min = render_dur; }
+        if render_dur > window_render_max { window_render_max = render_dur; }
+        let elapsed = window_start.elapsed();
+        if elapsed >= Duration::from_secs(FPS_REPORT_SECS) {
+            let secs = elapsed.as_secs_f64();
+            let fps = window_frames as f64 / secs;
+            let avg_ms = window_render_sum.as_secs_f64() * 1000.0
+                       / window_frames.max(1) as f64;
+            eprintln!(
+                "frescod-aqueduct: {:.1} fps over {:.1}s ({} frames); \
+                 render time min/avg/max = {:.2}/{:.2}/{:.2} ms",
+                fps, secs, window_frames,
+                window_render_min.as_secs_f64() * 1000.0,
+                avg_ms,
+                window_render_max.as_secs_f64() * 1000.0,
+            );
+            window_start = Instant::now();
+            window_frames = 0;
+            window_render_min = Duration::from_secs(60);
+            window_render_max = Duration::ZERO;
+            window_render_sum = Duration::ZERO;
+        }
 
         let now = Instant::now();
         if next > now {
