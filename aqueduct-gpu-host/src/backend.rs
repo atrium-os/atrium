@@ -203,6 +203,18 @@ pub struct SoftwareBackend {
     dispatch_failures: AtomicU64,
     /// OP_GPU_PRESENT counter. Observable for tests.
     presents: AtomicU64,
+    /// Optional hook called from `present()`. Lets a higher-layer
+    /// daemon (frescod-aqueduct) install a routing callback that
+    /// reads the rendered image's pixmap and writes it into a
+    /// per-window WindowSurface. The hook receives the backend
+    /// (so it can call `read_image_pixels`), the image_id, the
+    /// surface_id (== Fresco window-id by atrium-vk-icd's
+    /// VK_EXT_atrium_surface convention), and the monotonic
+    /// frame_id. Default: None (just bumps the present counter).
+    #[allow(clippy::type_complexity)]
+    present_hook: Mutex<
+        Option<Box<dyn Fn(&SoftwareBackend, ResourceId, u64, u64) + Send + Sync>>,
+    >,
 }
 
 impl Default for SoftwareBackend {
@@ -219,6 +231,7 @@ impl SoftwareBackend {
             images: Mutex::new(HashMap::new()),
             dispatch_failures: AtomicU64::new(0),
             presents: AtomicU64::new(0),
+            present_hook: Mutex::new(None),
         }
     }
 
@@ -226,6 +239,34 @@ impl SoftwareBackend {
     /// test observation.
     pub fn present_count(&self) -> u64 {
         self.presents.load(Ordering::Relaxed)
+    }
+
+    /// Install a present routing callback. The hook fires from
+    /// `present()` after the counter bump; it receives a reference
+    /// to this backend (call `read_image_pixels` to fetch the
+    /// rendered bytes) and the present payload fields. Replaces
+    /// any previously-installed hook.
+    ///
+    /// Used by daemons that own a compositor (frescod-aqueduct):
+    /// install a hook that copies the rendered pixmap into the
+    /// surface's per-window WindowSurface; the existing
+    /// skip-hierarchy + queued page-flip path then handles the
+    /// actual scanout.
+    #[allow(clippy::type_complexity)]
+    pub fn set_present_hook<F>(&self, hook: F)
+    where
+        F: Fn(&SoftwareBackend, ResourceId, u64, u64) + Send + Sync + 'static,
+    {
+        if let Ok(mut h) = self.present_hook.lock() {
+            *h = Some(Box::new(hook));
+        }
+    }
+
+    /// Remove any installed present hook.
+    pub fn clear_present_hook(&self) {
+        if let Ok(mut h) = self.present_hook.lock() {
+            *h = None;
+        }
     }
 
     /// How many frames have been submitted. Diagnostic.
@@ -515,6 +556,14 @@ impl Backend for SoftwareBackend {
         log::debug!(
             "SoftwareBackend::present image={image_id} surface={surface_id} frame={frame_id}"
         );
+        // Fire the installed routing hook, if any. The hook can
+        // call `read_image_pixels` on us to materialize the
+        // rendered bytes for its compositor.
+        if let Ok(h) = self.present_hook.lock() {
+            if let Some(hook) = h.as_ref() {
+                hook(self, image_id, surface_id, frame_id);
+            }
+        }
     }
 }
 
@@ -669,5 +718,35 @@ mod tests {
         // Tier-2 (general SW Vulkan) would use generation 1+ if it
         // ever ships.
         assert_eq!(b.identity().generation, 0);
+    }
+
+    #[test]
+    fn software_backend_present_counter_ticks() {
+        use aqueduct_gpu::ids::IdNamespace;
+        let b = SoftwareBackend::new();
+        assert_eq!(b.present_count(), 0);
+        b.present(ResourceId::new(IdNamespace::IcdRuntime, 5), 42, 1);
+        b.present(ResourceId::new(IdNamespace::IcdRuntime, 6), 42, 2);
+        b.present(ResourceId::new(IdNamespace::IcdRuntime, 7), 42, 3);
+        assert_eq!(b.present_count(), 3);
+    }
+
+    #[test]
+    fn software_backend_present_hook_runs_with_atomic_counter() {
+        use aqueduct_gpu::ids::IdNamespace;
+        use std::sync::Arc;
+        let hook_runs = Arc::new(AtomicU64::new(0));
+        let hook_runs_inner = hook_runs.clone();
+        let b = SoftwareBackend::new();
+        b.set_present_hook(move |_back, _image_id, _surface_id, _frame_id| {
+            hook_runs_inner.fetch_add(1, Ordering::Relaxed);
+        });
+        b.present(ResourceId::new(IdNamespace::IcdRuntime, 5), 42, 1);
+        b.present(ResourceId::new(IdNamespace::IcdRuntime, 6), 42, 2);
+        assert_eq!(hook_runs.load(Ordering::Relaxed), 2);
+        b.clear_present_hook();
+        b.present(ResourceId::new(IdNamespace::IcdRuntime, 7), 42, 3);
+        assert_eq!(hook_runs.load(Ordering::Relaxed), 2);
+        assert_eq!(b.present_count(), 3);
     }
 }
