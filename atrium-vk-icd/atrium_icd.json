@@ -1,0 +1,8 @@
+{
+    "_comment": "Vulkan loader ICD manifest. Install to /usr/local/share/vulkan/icd.d/atrium_icd.json (FreeBSD) or /usr/share/vulkan/icd.d/atrium_icd.json (Linux). Tells libvulkan.so.1 where to find the atrium-vk-icd cdylib and what Vulkan API version it claims. api_version will move forward as more entry points are implemented.",
+    "file_format_version": "1.0.1",
+    "ICD": {
+        "library_path": "libatrium_vk_icd.so",
+        "api_version": "1.3.0"
+    }
+}

@@ -1976,6 +1976,13 @@ aqueduct-gpu-host/                    ✅ macOS daemon
 fresco-aqueduct-bridge/               ✅ fresco-protocol → FrameOp
                                          translator
 atrium-vk-icd/                        ⚠️ Vulkan ICD (Phase 2.5+)
+                                         skeleton landed: cdylib +
+                                         vk_icdGetInstanceProcAddr +
+                                         vk_icdNegotiateLoaderICDInterface-
+                                         Version stubs + atrium_icd.json
+                                         manifest. Phase 1.3b cmdbuf
+                                         + every other vk* entry point
+                                         pending.
 external/wgpu/                        ⚠️ wgpu fork w/ aqueduct-gpu
                                          backend (Phase 1.5?)
 atrium-kmod/atrium_virtio_gpu.c       ✅ IOC_GPU_MINT_TOKEN,

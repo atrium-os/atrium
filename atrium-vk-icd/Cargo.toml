@@ -1,0 +1,18 @@
+[package]
+name        = "atrium-vk-icd"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "Vulkan ICD (Installable Client Driver) speaking aqueduct-gpu. Translates Vulkan API calls into aqueduct-gpu protocol messages destined for the host endpoint (frescod-aqueduct today; native HW kmod at D5+). This is not a general Vulkan driver — it targets aqueduct-gpu specifically. The Vulkan loader resolves `libvulkan.so.1` lookups against this crate's exported symbols. See `docs/spec/aqueduct-gpu.md` §7.1."
+
+[lib]
+name       = "atrium_vk_icd"
+# cdylib so the Vulkan loader can dlopen() us and resolve the
+# loader-ICD entry points by symbol name.
+crate-type = ["cdylib"]
+
+[dependencies]
+aqueduct        = { path = "../aqueduct" }
+aqueduct-gpu    = { path = "../aqueduct-gpu" }
+aqueduct-gpu-client = { path = "../aqueduct-gpu-client" }
