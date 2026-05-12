@@ -232,14 +232,14 @@ struct AtriumDevice {
     /// that vkCmdBindPipeline references in the BindPipeline
     /// FrameOp.
     pipelines: std::sync::Mutex<std::collections::HashMap<u64, aqueduct_gpu::ids::ResourceId>>,
-    /// Per-VkDeviceMemory state. Owned heap allocations the ICD
-    /// hands out via vkMapMemory. Today these are pure local
-    /// buffers; bindings to the daemon-side region table
-    /// (OP_GPU_MEMORY_CREATE / IOC_GPU_IMPORT_REGION) arrive when
-    /// vkCreateBuffer + the resource-upload path lands.
-    /// Key: VkDeviceMemory u64. Value: Box<[u8]> so the storage
-    /// pointer is stable across map/unmap.
-    memories: std::sync::Mutex<std::collections::HashMap<u64, Box<[u8]>>>,
+    /// Per-VkDeviceMemory state. Each entry owns a host-allocated
+    /// `Box<[u8]>` for the storage (stable address for vkMapMemory)
+    /// AND optionally a daemon-side `region_id` from
+    /// OP_GPU_MEMORY_CREATE so vkCreateBuffer/vkBindBufferMemory
+    /// can wire the buffer to a real aqueduct-gpu region.
+    /// `region_id == None` means the instance had no live client
+    /// at allocation time — the memory is local-only.
+    memories: std::sync::Mutex<std::collections::HashMap<u64, AtriumDeviceMemory>>,
     /// Monotonic counter for VkDeviceMemory u64 handles.
     /// Non-dispatchable handles don't carry ICD_LOADER_MAGIC;
     /// they're opaque u64. We use a per-device counter so
@@ -265,6 +265,22 @@ struct AtriumBuffer {
     memory:        Option<u64>,
     memory_offset: u64,
     usage:         u32, /* VkBufferUsageFlags */
+    /// Daemon-side ResourceId for this buffer, set on a
+    /// successful vkBindBufferMemory when the memory carries a
+    /// region_id. None until then; FrameOps that reference this
+    /// buffer (BindVertexBuf etc.) need this set.
+    buffer_id: Option<aqueduct_gpu::ids::ResourceId>,
+}
+
+/// ICD-side state for a `VkDeviceMemory`.
+struct AtriumDeviceMemory {
+    /// Host-allocated storage. Stable address used by vkMapMemory;
+    /// also the source bytes for any daemon-side region (TODO:
+    /// future IMPORT_REGION mapping makes this redundant).
+    storage:   Box<[u8]>,
+    /// Daemon-side region_id from OP_GPU_MEMORY_CREATE. None if
+    /// the instance had no live client at allocation time.
+    region_id: Option<aqueduct_gpu::ids::ResourceId>,
 }
 
 /// ICD-side state behind a `VkQueue`. Same dispatchable-handle
@@ -936,8 +952,24 @@ pub unsafe extern "C" fn vkAllocateMemory(
     let handle = dev.next_memory_id.get();
     dev.next_memory_id.set(handle + 1);
 
+    // If the instance has a live client, register a daemon-side
+    // memory region. Best-effort — failure leaves region_id=None
+    // and the memory stays local-only.
+    let region_id = if !dev.instance.is_null() {
+        let inst = &*(dev.instance as *const AtriumInstance);
+        inst.client.as_ref().and_then(|m| {
+            m.lock().ok().and_then(|mut c| {
+                c.allocate_memory(size, aqueduct_gpu::payloads::MemoryUsage::BufferBacking)
+                    .ok()
+                    .map(|resp| resp.region_id)
+            })
+        })
+    } else {
+        None
+    };
+
     if let Ok(mut m) = dev.memories.lock() {
-        m.insert(handle, storage);
+        m.insert(handle, AtriumDeviceMemory { storage, region_id });
     } else {
         return VK_ERROR_INITIALIZATION_FAILED;
     }
@@ -988,16 +1020,16 @@ pub unsafe extern "C" fn vkMapMemory(
         Ok(m) => m,
         Err(_) => return VK_ERROR_INITIALIZATION_FAILED,
     };
-    let Some(storage) = m.get(&memory) else {
+    let Some(mem) = m.get(&memory) else {
         return VK_ERROR_INITIALIZATION_FAILED;
     };
-    if (offset as usize) > storage.len() {
+    if (offset as usize) > mem.storage.len() {
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     // The Box's storage is stable as long as it lives in the
     // HashMap (HashMap doesn't move its values). The pointer
     // remains valid until vkFreeMemory removes the entry.
-    let ptr = storage.as_ptr().add(offset as usize) as *mut c_void;
+    let ptr = mem.storage.as_ptr().add(offset as usize) as *mut c_void;
     *pp_data = ptr;
     VK_SUCCESS
 }
@@ -1047,6 +1079,7 @@ pub unsafe extern "C" fn vkCreateBuffer(
     if let Ok(mut b) = dev.buffers.lock() {
         b.insert(handle, AtriumBuffer {
             size, memory: None, memory_offset: 0, usage,
+            buffer_id: None,
         });
     } else {
         return VK_ERROR_INITIALIZATION_FAILED;
@@ -1115,13 +1148,52 @@ pub unsafe extern "C" fn vkBindBufferMemory(
     }
     let dev = &*(device as *const AtriumDevice);
 
-    // Validate the binding ranges in (the buffer's size).
-    let mem_size = match dev.memories.lock() {
-        Ok(m) => m.get(&memory).map(|s| s.len() as u64),
+    // Validate the binding ranges, capture region_id for the
+    // daemon-side create call below.
+    let (mem_size, region_id) = match dev.memories.lock() {
+        Ok(m) => match m.get(&memory) {
+            Some(am) => (am.storage.len() as u64, am.region_id),
+            None     => return VK_ERROR_INITIALIZATION_FAILED,
+        },
         Err(_) => return VK_ERROR_INITIALIZATION_FAILED,
     };
-    let Some(mem_size) = mem_size else {
-        return VK_ERROR_INITIALIZATION_FAILED;
+
+    let (size, usage) = {
+        let buffers = match dev.buffers.lock() {
+            Ok(b) => b,
+            Err(_) => return VK_ERROR_INITIALIZATION_FAILED,
+        };
+        let Some(buf) = buffers.get(&buffer) else {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        };
+        if memory_offset.checked_add(buf.size).map(|end| end > mem_size).unwrap_or(true) {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        (buf.size, buf.usage)
+    };
+
+    // If the memory carries a daemon-side region_id, register a
+    // daemon-side buffer too. Subsequent FrameOps that reference
+    // this buffer use the returned ResourceId.
+    let buffer_id = if let Some(region_id) = region_id {
+        if !dev.instance.is_null() {
+            let inst = &*(dev.instance as *const AtriumInstance);
+            inst.client.as_ref().and_then(|m| {
+                m.lock().ok().and_then(|mut c| {
+                    c.create_buffer(aqueduct_gpu::payloads::BufferCreatePayload {
+                        buffer_id:      aqueduct_gpu::ids::ResourceId(0),
+                        backing_region: region_id,
+                        region_offset:  memory_offset,
+                        size,
+                        usage,
+                    }).ok()
+                })
+            })
+        } else {
+            None
+        }
+    } else {
+        None
     };
 
     let mut buffers = match dev.buffers.lock() {
@@ -1131,11 +1203,9 @@ pub unsafe extern "C" fn vkBindBufferMemory(
     let Some(buf) = buffers.get_mut(&buffer) else {
         return VK_ERROR_INITIALIZATION_FAILED;
     };
-    if memory_offset.checked_add(buf.size).map(|end| end > mem_size).unwrap_or(true) {
-        return VK_ERROR_INITIALIZATION_FAILED;
-    }
     buf.memory        = Some(memory);
     buf.memory_offset = memory_offset;
+    buf.buffer_id     = buffer_id;
     VK_SUCCESS
 }
 
