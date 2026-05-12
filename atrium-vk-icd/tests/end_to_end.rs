@@ -1661,6 +1661,114 @@ fn full_triangle_frame_record_and_submit() {
 }
 
 #[test]
+fn swapchain_ring_acquire_present_round_trip() {
+    use atrium_vk_icd::{
+        vkAcquireNextImageKHR, vkCreateDevice, vkCreateSwapchainKHR,
+        vkDestroyDevice, vkDestroySwapchainKHR, vkGetPhysicalDeviceSurfaceFormatsKHR,
+        vkGetPhysicalDeviceSurfacePresentModesKHR, vkGetSwapchainImagesKHR,
+        vkQueuePresentKHR, vkGetDeviceQueue,
+    };
+
+    let sock = tmp_socket("swap");
+    let sw_backend = Arc::new(SoftwareBackend::new());
+    let backend_for_listener: Arc<dyn Backend> = sw_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap();
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+
+    type VkDevice = *mut std::ffi::c_void;
+    type VkQueue  = *mut std::ffi::c_void;
+
+    let mut instance: VkInstance = std::ptr::null_mut();
+    unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
+    let mut pds: [VkPhysicalDevice; 1] = [std::ptr::null_mut(); 1];
+    let mut cap: u32 = 1;
+    unsafe { vkEnumeratePhysicalDevices(instance, &mut cap, pds.as_mut_ptr()); }
+    let mut device: VkDevice = std::ptr::null_mut();
+    unsafe { vkCreateDevice(pds[0], std::ptr::null(), std::ptr::null(), &mut device); }
+    let mut queue: VkQueue = std::ptr::null_mut();
+    unsafe { vkGetDeviceQueue(device, 0, 0, &mut queue); }
+
+    // Probe surface formats (single canonical RGBA8/SRGB-NL).
+    let mut fmt_count: u32 = 0;
+    let r = unsafe {
+        vkGetPhysicalDeviceSurfaceFormatsKHR(pds[0], 1, &mut fmt_count, std::ptr::null_mut())
+    };
+    assert_eq!(r, 0);
+    assert_eq!(fmt_count, 1);
+
+    // Present modes: FIFO only.
+    let mut mode_count: u32 = 0;
+    unsafe {
+        vkGetPhysicalDeviceSurfacePresentModesKHR(
+            pds[0], 1, &mut mode_count, std::ptr::null_mut(),
+        );
+    }
+    assert_eq!(mode_count, 1);
+    let mut modes = [0u32; 4];
+    let mut got: u32 = 4;
+    unsafe {
+        vkGetPhysicalDeviceSurfacePresentModesKHR(
+            pds[0], 1, &mut got, modes.as_mut_ptr(),
+        );
+    }
+    assert_eq!(got, 1);
+    assert_eq!(modes[0], 2); // VK_PRESENT_MODE_FIFO_KHR
+
+    // Create a swapchain. VkSwapchainCreateInfoKHR layout from
+    // the implementation note in lib.rs.
+    let mut sc_info = [0u8; 104];
+    sc_info[ 0.. 4].copy_from_slice(&1000001000u32.to_le_bytes()); // sType
+    sc_info[20..28].copy_from_slice(&7u64.to_le_bytes());          // surface=opaque 7
+    sc_info[28..32].copy_from_slice(&3u32.to_le_bytes());          // minImageCount=3
+    sc_info[32..36].copy_from_slice(&37u32.to_le_bytes());         // RGBA8
+    sc_info[40..44].copy_from_slice(&800u32.to_le_bytes());        // width
+    sc_info[44..48].copy_from_slice(&600u32.to_le_bytes());        // height
+    sc_info[48..52].copy_from_slice(&1u32.to_le_bytes());          // arrayLayers
+    sc_info[52..56].copy_from_slice(&0x10u32.to_le_bytes());       // COLOR_ATTACHMENT
+
+    let mut swapchain: u64 = 0;
+    let r = unsafe {
+        vkCreateSwapchainKHR(device, sc_info.as_ptr() as *const _, std::ptr::null(), &mut swapchain)
+    };
+    assert_eq!(r, 0);
+    assert!(swapchain != 0);
+
+    // Query ring.
+    let mut n: u32 = 0;
+    unsafe { vkGetSwapchainImagesKHR(device, swapchain, &mut n, std::ptr::null_mut()); }
+    assert_eq!(n, 3);
+    let mut ring = [0u64; 3];
+    let mut k: u32 = 3;
+    unsafe { vkGetSwapchainImagesKHR(device, swapchain, &mut k, ring.as_mut_ptr()); }
+    assert_eq!(k, 3);
+    assert!(ring[0] != 0 && ring[1] != 0 && ring[2] != 0);
+    assert_ne!(ring[0], ring[1]);
+    assert_ne!(ring[1], ring[2]);
+
+    // Acquire 4 images — should round-robin 0, 1, 2, 0.
+    let mut acquired = [99u32; 4];
+    for slot in &mut acquired {
+        unsafe { vkAcquireNextImageKHR(device, swapchain, u64::MAX, 0, 0, slot); }
+    }
+    assert_eq!(acquired, [0, 1, 2, 0]);
+
+    // Present is a no-op success (today).
+    let mut present_info = [0u8; 56];
+    present_info[0..4].copy_from_slice(&1000001001u32.to_le_bytes());
+    let r = unsafe { vkQueuePresentKHR(queue, present_info.as_ptr() as *const _) };
+    assert_eq!(r, 0);
+
+    unsafe { vkDestroySwapchainKHR(device, swapchain, std::ptr::null()); }
+    unsafe { vkDestroyDevice(device, std::ptr::null()); }
+    unsafe { vkDestroyInstance(instance, std::ptr::null()); }
+    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[test]
 fn proc_addr_resolves_three_entry_points() {
     // No live daemon required for the get_proc_addr lookups.
     fn lookup(name: &[u8]) -> Option<unsafe extern "C" fn()> {

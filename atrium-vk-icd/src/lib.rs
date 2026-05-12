@@ -310,6 +310,12 @@ struct AtriumDevice {
     events: std::sync::Mutex<std::collections::HashMap<u64, bool>>,
     next_event_id:       std::cell::Cell<u64>,
     next_buffer_view_id: std::cell::Cell<u64>,
+    /// WSI — VkSwapchainKHR state. Each swapchain holds a Vec of
+    /// the VkImage handles in its ring + the next-acquire index.
+    /// VK_KHR_surface design sketch lives in docs/spec/
+    /// aqueduct-gpu.md §7.1.1.
+    swapchains: std::sync::Mutex<std::collections::HashMap<u64, AtriumSwapchain>>,
+    next_swapchain_id: std::cell::Cell<u64>,
     /// Per-VkDescriptorSetLayout state. Today: opaque non-zero
     /// u64 (we don't track per-binding type info — the host's
     /// pipeline / shader knows its expected layout).
@@ -346,6 +352,23 @@ struct AtriumDescriptorWrite {
 #[allow(dead_code)]
 struct AtriumDescriptorSet {
     writes: Vec<AtriumDescriptorWrite>,
+}
+
+/// Per-VkSwapchainKHR state. A ring of VkImage handles (allocated
+/// by the swapchain on create) + the index of the next image to
+/// hand out via vkAcquireNextImageKHR. The actual present routing
+/// (forwarding the rendered image to its Fresco surface) is
+/// daemon-side; today vkQueuePresentKHR is a success no-op while
+/// the spec'd `OP_GPU_PRESENT` opcode is pending.
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
+struct AtriumSwapchain {
+    surface:      u64,
+    images:       Vec<u64>,
+    next_acquire: u32,
+    width:        u32,
+    height:       u32,
+    format:       u32,
 }
 
 /// Per-VkFramebuffer state.
@@ -995,6 +1018,47 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkCommandBuffer, u32, *const VkCommandBuffer), FnVoidPtr,
             >(vkCmdExecuteCommands)),
+        // WSI: surface + swapchain. See docs/spec/aqueduct-gpu.md §7.1.1.
+        "vkDestroySurfaceKHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkInstance, u64, *const c_void), FnVoidPtr,
+            >(vkDestroySurfaceKHR)),
+        "vkGetPhysicalDeviceSurfaceSupportKHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkPhysicalDevice, u32, u64, *mut u32) -> VkResult, FnVoidPtr,
+            >(vkGetPhysicalDeviceSurfaceSupportKHR)),
+        "vkGetPhysicalDeviceSurfaceCapabilitiesKHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkPhysicalDevice, u64, *mut c_void) -> VkResult, FnVoidPtr,
+            >(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)),
+        "vkGetPhysicalDeviceSurfaceFormatsKHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkPhysicalDevice, u64, *mut u32, *mut c_void) -> VkResult, FnVoidPtr,
+            >(vkGetPhysicalDeviceSurfaceFormatsKHR)),
+        "vkGetPhysicalDeviceSurfacePresentModesKHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkPhysicalDevice, u64, *mut u32, *mut u32) -> VkResult, FnVoidPtr,
+            >(vkGetPhysicalDeviceSurfacePresentModesKHR)),
+        "vkCreateSwapchainKHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, *const c_void, *const c_void, *mut u64) -> VkResult, FnVoidPtr,
+            >(vkCreateSwapchainKHR)),
+        "vkDestroySwapchainKHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, *const c_void), FnVoidPtr,
+            >(vkDestroySwapchainKHR)),
+        "vkGetSwapchainImagesKHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, *mut u32, *mut u64) -> VkResult, FnVoidPtr,
+            >(vkGetSwapchainImagesKHR)),
+        "vkAcquireNextImageKHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, u64, u64, u64, *mut u32) -> VkResult, FnVoidPtr,
+            >(vkAcquireNextImageKHR)),
+        "vkQueuePresentKHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkQueue, *const c_void) -> VkResult, FnVoidPtr,
+            >(vkQueuePresentKHR)),
         _ => None,
     }
 }
@@ -1250,6 +1314,8 @@ pub unsafe extern "C" fn vkCreateDevice(
         events:              std::sync::Mutex::new(std::collections::HashMap::new()),
         next_event_id:       std::cell::Cell::new(1),
         next_buffer_view_id: std::cell::Cell::new(1),
+        swapchains:          std::sync::Mutex::new(std::collections::HashMap::new()),
+        next_swapchain_id:   std::cell::Cell::new(1),
     });
     let dev_ptr: *mut AtriumDevice = &mut *dev;
     let q = Box::new(AtriumQueue {
@@ -4001,6 +4067,304 @@ pub unsafe extern "C" fn vk_icdNegotiateLoaderICDInterfaceVersion(
     VK_SUCCESS
 }
 
+// ─────────────────────────────────────────────────────────────────
+// WSI — VK_KHR_surface + VK_KHR_swapchain (skeleton)
+// Design sketch: docs/spec/aqueduct-gpu.md §7.1.1.
+// ─────────────────────────────────────────────────────────────────
+
+/// VkSurfaceKHR is non-dispatchable (u64). Real ICDs would track a
+/// per-surface platform handle (Fresco window-id); today we hand
+/// back unique non-zero u64s and don't validate further. Surface
+/// destruction is a no-op.
+///
+/// Surfaces are typically created by platform extensions
+/// (vkCreateXcbSurfaceKHR / vkCreateWaylandSurfaceKHR /
+/// vkCreateMetalSurfaceEXT). Atrium's canonical creator is
+/// `vkCreateAtriumSurfaceEXT` (sized in the spec but not yet
+/// wired); apps that ship for Atrium link against the
+/// VK_EXT_atrium_surface extension.
+#[allow(dead_code)] // consumed by future vkCreateAtriumSurfaceEXT
+static ATRIUM_NEXT_SURFACE_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+/// `vkDestroySurfaceKHR` — no-op today (no per-surface state).
+#[no_mangle]
+pub unsafe extern "C" fn vkDestroySurfaceKHR(
+    _instance: VkInstance, _surface: u64, _p_allocator: *const c_void,
+) {}
+
+/// `vkGetPhysicalDeviceSurfaceSupportKHR` — always returns
+/// VK_TRUE for queue family 0 (our single family supports
+/// graphics+compute+transfer, and the spec sketch puts present
+/// on the same family). Per Vk, any other family + the only
+/// surface we can present to gets VK_TRUE too — Atrium's
+/// single-queue model is the source of truth.
+#[no_mangle]
+pub unsafe extern "C" fn vkGetPhysicalDeviceSurfaceSupportKHR(
+    _physical_device:     VkPhysicalDevice,
+    _queue_family_index:  u32,
+    _surface:             u64,
+    p_supported:          *mut u32,
+) -> VkResult {
+    if p_supported.is_null() { return VK_ERROR_INITIALIZATION_FAILED; }
+    *p_supported = 1; /* VK_TRUE */
+    VK_SUCCESS
+}
+
+/// VkSurfaceCapabilitiesKHR layout (52 bytes):
+///   0   minImageCount : u32
+///   4   maxImageCount : u32
+///   8   currentExtent : VkExtent2D (8 B)
+///   16  minImageExtent : VkExtent2D
+///   24  maxImageExtent : VkExtent2D
+///   32  maxImageArrayLayers : u32
+///   36  supportedTransforms : u32
+///   40  currentTransform : u32
+///   44  supportedCompositeAlpha : u32
+///   48  supportedUsageFlags : u32
+#[no_mangle]
+pub unsafe extern "C" fn vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
+    _physical_device: VkPhysicalDevice,
+    _surface:         u64,
+    p_caps:           *mut c_void, /* VkSurfaceCapabilitiesKHR */
+) -> VkResult {
+    if p_caps.is_null() { return VK_ERROR_INITIALIZATION_FAILED; }
+    let b = p_caps as *mut u8;
+    std::ptr::write_bytes(b, 0, 52);
+    let put32 = |off: usize, v: u32| {
+        std::ptr::copy_nonoverlapping(
+            v.to_le_bytes().as_ptr(), b.add(off), 4,
+        );
+    };
+    put32( 0, 3);                 // minImageCount = 3 (triple-buffer)
+    put32( 4, 4);                 // maxImageCount = 4
+    // currentExtent: 1280×800 (frescod-aqueduct's typical mode).
+    put32( 8, 1280); put32(12, 800);
+    put32(16, 64);   put32(20, 64);    // min 64×64
+    put32(24, 4096); put32(28, 4096);  // max 4096×4096
+    put32(32, 1);                 // maxImageArrayLayers
+    put32(36, 0x1);               // supportedTransforms = IDENTITY only
+    put32(40, 0x1);               // currentTransform = IDENTITY
+    put32(44, 0x1);               // supportedCompositeAlpha = OPAQUE only
+    put32(48, 0x10);              // supportedUsageFlags = COLOR_ATTACHMENT
+    VK_SUCCESS
+}
+
+/// `vkGetPhysicalDeviceSurfaceFormatsKHR` — one canonical format:
+/// R8G8B8A8_UNORM + SRGB_NONLINEAR. Matches the renderer's tier-1
+/// scanout BGRA-swap path.
+///
+/// VkSurfaceFormatKHR is 8 bytes (format u32 + colorSpace u32).
+#[no_mangle]
+pub unsafe extern "C" fn vkGetPhysicalDeviceSurfaceFormatsKHR(
+    _physical_device:     VkPhysicalDevice,
+    _surface:             u64,
+    p_surface_format_count: *mut u32,
+    p_surface_formats:    *mut c_void, /* VkSurfaceFormatKHR* */
+) -> VkResult {
+    if p_surface_format_count.is_null() { return VK_ERROR_INITIALIZATION_FAILED; }
+    if p_surface_formats.is_null() {
+        *p_surface_format_count = 1;
+        return VK_SUCCESS;
+    }
+    let cap = *p_surface_format_count;
+    if cap == 0 { return VK_SUCCESS; }
+    let b = p_surface_formats as *mut u8;
+    let put32 = |off: usize, v: u32| {
+        std::ptr::copy_nonoverlapping(
+            v.to_le_bytes().as_ptr(), b.add(off), 4,
+        );
+    };
+    put32(0, 37); /* VK_FORMAT_R8G8B8A8_UNORM */
+    put32(4, 0);  /* VK_COLOR_SPACE_SRGB_NONLINEAR_KHR */
+    *p_surface_format_count = 1;
+    VK_SUCCESS
+}
+
+/// `vkGetPhysicalDeviceSurfacePresentModesKHR` — FIFO only (the
+/// spec's required mode + the natural pairing with Atrium's
+/// server-side vblank pacing per §6.5.5).
+#[no_mangle]
+pub unsafe extern "C" fn vkGetPhysicalDeviceSurfacePresentModesKHR(
+    _physical_device:        VkPhysicalDevice,
+    _surface:                u64,
+    p_present_mode_count:    *mut u32,
+    p_present_modes:         *mut u32,
+) -> VkResult {
+    if p_present_mode_count.is_null() { return VK_ERROR_INITIALIZATION_FAILED; }
+    if p_present_modes.is_null() {
+        *p_present_mode_count = 1;
+        return VK_SUCCESS;
+    }
+    if *p_present_mode_count == 0 { return VK_SUCCESS; }
+    *p_present_modes = 2; /* VK_PRESENT_MODE_FIFO_KHR */
+    *p_present_mode_count = 1;
+    VK_SUCCESS
+}
+
+/// `vkCreateSwapchainKHR` — allocate the swapchain's ring of
+/// VkImages. Each image is an internal AtriumImage allocated
+/// with the same shape (format + extent) as a normal
+/// vkCreateImage; backed by ICD-owned memory.
+///
+/// VkSwapchainCreateInfoKHR layout:
+///   0   sType, 8 pNext, 16 flags,
+///   20  surface (u64),
+///   28  minImageCount (u32),
+///   32  imageFormat (u32),
+///   36  imageColorSpace (u32),
+///   40  imageExtent (VkExtent2D),
+///   48  imageArrayLayers (u32),
+///   52  imageUsage (u32), ...
+#[no_mangle]
+pub unsafe extern "C" fn vkCreateSwapchainKHR(
+    device:           VkDevice,
+    p_create_info:    *const c_void,
+    _p_allocator:     *const c_void,
+    p_swapchain:      *mut u64,
+) -> VkResult {
+    if device.is_null() || p_create_info.is_null() || p_swapchain.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let dev = &*(device as *const AtriumDevice);
+    let b = p_create_info as *const u8;
+    let surface = std::ptr::read_unaligned(b.add(20) as *const u64);
+    let n       = std::ptr::read_unaligned(b.add(28) as *const u32).max(1).min(8);
+    let format  = std::ptr::read_unaligned(b.add(32) as *const u32);
+    let width   = std::ptr::read_unaligned(b.add(40) as *const u32);
+    let height  = std::ptr::read_unaligned(b.add(44) as *const u32);
+    let usage   = std::ptr::read_unaligned(b.add(52) as *const u32);
+
+    // Allocate the ring of swapchain images by piggybacking on
+    // the existing vkCreateImage machinery.
+    let mut images = Vec::with_capacity(n as usize);
+    let mut img_info = [0u8; 88];
+    img_info[ 0.. 4].copy_from_slice(&14u32.to_le_bytes());
+    img_info[24..28].copy_from_slice(&format.to_le_bytes());
+    img_info[28..32].copy_from_slice(&width.to_le_bytes());
+    img_info[32..36].copy_from_slice(&height.to_le_bytes());
+    img_info[36..40].copy_from_slice(&1u32.to_le_bytes());
+    img_info[40..44].copy_from_slice(&1u32.to_le_bytes());
+    img_info[44..48].copy_from_slice(&1u32.to_le_bytes());
+    img_info[56..60].copy_from_slice(&usage.to_le_bytes());
+    for _ in 0..n {
+        let mut handle: u64 = 0;
+        let r = vkCreateImage(
+            device, img_info.as_ptr() as *const _, std::ptr::null(), &mut handle,
+        );
+        if r != VK_SUCCESS {
+            // Roll back any already-created images.
+            for h in &images {
+                vkDestroyImage(device, *h, std::ptr::null());
+            }
+            return r;
+        }
+        images.push(handle);
+    }
+
+    let h = dev.next_swapchain_id.get();
+    dev.next_swapchain_id.set(h + 1);
+    if let Ok(mut s) = dev.swapchains.lock() {
+        s.insert(h, AtriumSwapchain {
+            surface, images, next_acquire: 0, width, height, format,
+        });
+    } else {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    *p_swapchain = h;
+    VK_SUCCESS
+}
+
+/// `vkDestroySwapchainKHR` — free the ring's images + drop the
+/// swapchain entry.
+#[no_mangle]
+pub unsafe extern "C" fn vkDestroySwapchainKHR(
+    device:       VkDevice,
+    swapchain:    u64,
+    _p_allocator: *const c_void,
+) {
+    if device.is_null() || swapchain == 0 { return; }
+    let dev = &*(device as *const AtriumDevice);
+    let images = if let Ok(mut s) = dev.swapchains.lock() {
+        s.remove(&swapchain).map(|sc| sc.images).unwrap_or_default()
+    } else { return; };
+    for h in images {
+        vkDestroyImage(device, h, std::ptr::null());
+    }
+}
+
+/// `vkGetSwapchainImagesKHR` — two-call query for the ring of
+/// VkImages backing this swapchain.
+#[no_mangle]
+pub unsafe extern "C" fn vkGetSwapchainImagesKHR(
+    device:               VkDevice,
+    swapchain:            u64,
+    p_swapchain_image_count: *mut u32,
+    p_swapchain_images:   *mut u64,
+) -> VkResult {
+    if device.is_null() || swapchain == 0 || p_swapchain_image_count.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let dev = &*(device as *const AtriumDevice);
+    let images: Vec<u64> = match dev.swapchains.lock() {
+        Ok(s) => s.get(&swapchain).map(|sc| sc.images.clone()).unwrap_or_default(),
+        Err(_) => return VK_ERROR_INITIALIZATION_FAILED,
+    };
+    if p_swapchain_images.is_null() {
+        *p_swapchain_image_count = images.len() as u32;
+        return VK_SUCCESS;
+    }
+    let cap = *p_swapchain_image_count as usize;
+    let to_copy = images.len().min(cap);
+    for i in 0..to_copy {
+        *p_swapchain_images.offset(i as isize) = images[i];
+    }
+    *p_swapchain_image_count = to_copy as u32;
+    if to_copy < images.len() { 5 /* VK_INCOMPLETE */ } else { VK_SUCCESS }
+}
+
+/// `vkAcquireNextImageKHR` — round-robin pull from the ring.
+/// vblank pacing is server-side per spec §6.5.5; we don't block
+/// on the timeout. The provided VkSemaphore + VkFence (if any)
+/// are ignored — our timeline-via-submit serialization handles
+/// the ordering.
+#[no_mangle]
+pub unsafe extern "C" fn vkAcquireNextImageKHR(
+    device:       VkDevice,
+    swapchain:    u64,
+    _timeout_ns:  u64,
+    _semaphore:   u64,
+    _fence:       u64,
+    p_image_index: *mut u32,
+) -> VkResult {
+    if device.is_null() || swapchain == 0 || p_image_index.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let dev = &*(device as *const AtriumDevice);
+    let idx = if let Ok(mut s) = dev.swapchains.lock() {
+        let Some(sc) = s.get_mut(&swapchain) else {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        };
+        let i = sc.next_acquire;
+        sc.next_acquire = (sc.next_acquire + 1) % (sc.images.len() as u32).max(1);
+        i
+    } else { return VK_ERROR_INITIALIZATION_FAILED; };
+    *p_image_index = idx;
+    VK_SUCCESS
+}
+
+/// `vkQueuePresentKHR` — no-op success today. The spec'd
+/// OP_GPU_PRESENT opcode + daemon-side surface-routing aren't
+/// landed yet; offscreen-render-and-copy is the supported
+/// pattern (see headless_triangle).
+#[no_mangle]
+pub unsafe extern "C" fn vkQueuePresentKHR(
+    _queue:             VkQueue,
+    _p_present_info:    *const c_void,
+) -> VkResult {
+    VK_SUCCESS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4037,8 +4401,8 @@ mod tests {
 
     #[test]
     fn get_proc_addr_unknown_name_returns_none() {
-        // vkCreateSwapchainKHR isn't wired yet (WSI deferred).
-        let name = b"vkCreateSwapchainKHR\0";
+        // vkCreateAtriumSurfaceEXT isn't wired yet.
+        let name = b"vkCreateAtriumSurfaceEXT\0";
         let r = unsafe {
             vk_icdGetInstanceProcAddr(
                 std::ptr::null_mut(),
