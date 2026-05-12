@@ -1561,11 +1561,70 @@ pub unsafe extern "C" fn vkGetPhysicalDeviceMemoryProperties(
 #[no_mangle]
 pub unsafe extern "C" fn vkGetPhysicalDeviceFormatProperties(
     _physical_device:    VkPhysicalDevice,
-    _format:             ash::vk::Format,
+    format:              ash::vk::Format,
     p_format_properties: *mut ash::vk::FormatProperties,
 ) {
     if p_format_properties.is_null() { return; }
-    *p_format_properties = ash::vk::FormatProperties::default();
+    use ash::vk::FormatFeatureFlags as F;
+
+    // Tier-1 (tiny-skia) capability matrix:
+    //   - Color UNORM/SRGB: sample + color-attachment (+blend) +
+    //     blit src/dst + transfer src/dst + linear filter.
+    //   - Depth/stencil: sample + depth-stencil-attachment +
+    //     transfer + blit.
+    //   - Vertex-friendly numeric formats: vertex_buffer flag in
+    //     bufferFeatures.
+    //   - Everything else: zeroed (== FORMAT_NOT_SUPPORTED in
+    //     the per-feature sense).
+    let f = format.as_raw();
+    let mut props = ash::vk::FormatProperties::default();
+
+    let color_features =
+          F::SAMPLED_IMAGE
+        | F::COLOR_ATTACHMENT
+        | F::COLOR_ATTACHMENT_BLEND
+        | F::BLIT_SRC
+        | F::BLIT_DST
+        | F::TRANSFER_SRC
+        | F::TRANSFER_DST
+        | F::SAMPLED_IMAGE_FILTER_LINEAR;
+    let depth_features =
+          F::SAMPLED_IMAGE
+        | F::DEPTH_STENCIL_ATTACHMENT
+        | F::BLIT_SRC
+        | F::BLIT_DST
+        | F::TRANSFER_SRC
+        | F::TRANSFER_DST;
+
+    match f {
+        // R8G8B8A8_{UNORM,SRGB}, B8G8R8A8_{UNORM,SRGB} — tier-1
+        // composes natively in these.
+        37 | 43 | 44 | 50 => {
+            props.optimal_tiling_features = color_features;
+            props.linear_tiling_features  = color_features;
+            props.buffer_features         = F::VERTEX_BUFFER;
+        }
+        // D16_UNORM, D32_SFLOAT, D24_UNORM_S8_UINT, D32_SFLOAT_S8_UINT.
+        124 | 126 | 129 | 130 => {
+            props.optimal_tiling_features = depth_features;
+            props.linear_tiling_features  = depth_features;
+        }
+        // Common numeric vertex formats — bufferFeatures only.
+        //   100 R32_SFLOAT, 103 R32G32_SFLOAT, 106 R32G32B32_SFLOAT,
+        //   109 R32G32B32A32_SFLOAT.
+        //    99 R32_UINT, 102 R32G32_UINT, 105 R32G32B32_UINT,
+        //   108 R32G32B32A32_UINT.
+        //    98 R32_SINT, 101 R32G32_SINT, 104 R32G32B32_SINT,
+        //   107 R32G32B32A32_SINT.
+        98..=109 => {
+            props.buffer_features = F::VERTEX_BUFFER
+                | F::UNIFORM_TEXEL_BUFFER
+                | F::STORAGE_TEXEL_BUFFER;
+        }
+        _ => {} // zero-features = unsupported
+    }
+
+    *p_format_properties = props;
 }
 
 /// `vkGetPhysicalDeviceImageFormatProperties` — describe whether
@@ -5454,6 +5513,50 @@ mod tests {
         assert!(unsafe {
             vk_icdGetPhysicalDeviceProcAddr(inst, b"vkNonexistent\0".as_ptr() as *const c_char)
         }.is_none());
+    }
+
+    #[test]
+    fn format_properties_advertise_correct_tier1_features() {
+        use ash::vk::FormatFeatureFlags as F;
+        let pd = AtriumPhysicalDevice {
+            loader_dispatch_slot: VK_ICD_LOADER_MAGIC,
+            backend_vendor: aqueduct_gpu::backends::GpuVendor::Software,
+            backend_generation: 0,
+            instance: std::ptr::null_mut(),
+        };
+        let phys: VkPhysicalDevice = &pd as *const _ as *mut _;
+        let mut props = ash::vk::FormatProperties::default();
+
+        // R8G8B8A8_UNORM: full color set.
+        unsafe { vkGetPhysicalDeviceFormatProperties(
+            phys, ash::vk::Format::R8G8B8A8_UNORM, &mut props,
+        ); }
+        assert!(props.optimal_tiling_features.contains(F::COLOR_ATTACHMENT));
+        assert!(props.optimal_tiling_features.contains(F::COLOR_ATTACHMENT_BLEND));
+        assert!(props.optimal_tiling_features.contains(F::SAMPLED_IMAGE));
+        assert!(props.buffer_features.contains(F::VERTEX_BUFFER));
+
+        // D32_SFLOAT: depth attachment, no color.
+        unsafe { vkGetPhysicalDeviceFormatProperties(
+            phys, ash::vk::Format::D32_SFLOAT, &mut props,
+        ); }
+        assert!(props.optimal_tiling_features.contains(F::DEPTH_STENCIL_ATTACHMENT));
+        assert!(!props.optimal_tiling_features.contains(F::COLOR_ATTACHMENT));
+
+        // R32G32_SFLOAT: vertex/texel-buffer only, no image features.
+        unsafe { vkGetPhysicalDeviceFormatProperties(
+            phys, ash::vk::Format::R32G32_SFLOAT, &mut props,
+        ); }
+        assert!(props.buffer_features.contains(F::VERTEX_BUFFER));
+        assert!(props.optimal_tiling_features.is_empty());
+
+        // R8G8B8_UNORM (28): unsupported → all zero.
+        unsafe { vkGetPhysicalDeviceFormatProperties(
+            phys, ash::vk::Format::R8G8B8_UNORM, &mut props,
+        ); }
+        assert!(props.optimal_tiling_features.is_empty());
+        assert!(props.linear_tiling_features.is_empty());
+        assert!(props.buffer_features.is_empty());
     }
 
     #[test]

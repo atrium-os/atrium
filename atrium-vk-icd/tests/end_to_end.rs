@@ -390,16 +390,22 @@ fn physical_device_features_and_memory_queries() {
     assert!(mp.memory_types[0].property_flags
         .contains(ash::vk::MemoryPropertyFlags::HOST_COHERENT));
 
-    // Format: all zero today.
+    // Format: R8G8B8A8_UNORM advertises tier-1 color attachment
+    // + sampled + blend (see vkGetPhysicalDeviceFormatProperties
+    // capability matrix). Unit-test
+    // format_properties_advertise_correct_tier1_features covers
+    // the per-format detail; here we just confirm the e2e wiring
+    // returns the same shape against a live daemon.
+    use ash::vk::FormatFeatureFlags as F;
     let mut fp = ash::vk::FormatProperties::default();
     unsafe {
         vkGetPhysicalDeviceFormatProperties(
             devices[0], ash::vk::Format::R8G8B8A8_UNORM, &mut fp,
         );
     }
-    assert!(fp.linear_tiling_features.is_empty());
-    assert!(fp.optimal_tiling_features.is_empty());
-    assert!(fp.buffer_features.is_empty());
+    assert!(fp.optimal_tiling_features.contains(F::COLOR_ATTACHMENT));
+    assert!(fp.optimal_tiling_features.contains(F::SAMPLED_IMAGE));
+    assert!(fp.buffer_features.contains(F::VERTEX_BUFFER));
 
     unsafe { vkDestroyInstance(instance, std::ptr::null()); }
     // env var cleared by EnvLock drop
