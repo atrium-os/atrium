@@ -200,6 +200,77 @@ fn multi_node_scene_composites_through_bridge() {
 }
 
 #[test]
+fn partial_redraw_via_bridge_helpers() {
+    // Regression: begin_renderpass_no_clear + set_scissor through the
+    // bridge produce a working intra-window dirty-rect pass.
+    //
+    // Pass 1: full clear + cyan fill (whole 64×64).
+    // Pass 2: no_clear + scissor to top-left 16×16, magenta fill.
+    // Expected: scissor area magenta, rest still cyan.
+    let sock = tmp_socket("partial");
+    let sw_backend = Arc::new(SoftwareBackend::new());
+    let backend_for_listener: Arc<dyn Backend> = sw_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap();
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+
+    let conn = Connection::connect(&sock).unwrap();
+    let mut client = GpuClient::new(conn);
+    client.handshake(ClientKind::FrescodRenderer).unwrap();
+
+    let mem = client.allocate_memory(64 * 64 * 4, MemoryUsage::ImageBacking).unwrap();
+    let target = client.create_image(aqueduct_gpu::payloads::ImageCreatePayload {
+        image_id: ResourceId(0),
+        backing_region: mem.region_id,
+        region_offset: 0,
+        format: 37, width: 64, height: 64, depth: 1,
+        mip_levels: 1, array_layers: 1, usage: 0x07,
+    }).unwrap();
+    thread::sleep(Duration::from_millis(30));
+
+    let fence = client.create_fence().unwrap();
+    let mut fb = client.frame_builder();
+
+    // Pass 1: full clear-and-fill cyan.
+    fresco_aqueduct_bridge::begin_renderpass(&mut fb, target, [0, 0, 0, 255]).unwrap();
+    fresco_aqueduct_bridge::translate_rect(&mut fb, &fp::RectParams {
+        x: 0.0, y: 0.0, w: 64.0, h: 64.0,
+        r: 0.0, g: 1.0, b: 1.0, a: 1.0,
+    }).unwrap();
+    fresco_aqueduct_bridge::end_renderpass(&mut fb).unwrap();
+
+    // Pass 2: no-clear + scissor to top-left 16×16, draw magenta over the
+    // whole image. Only the scissor region should change colour.
+    fresco_aqueduct_bridge::begin_renderpass_no_clear(&mut fb, target).unwrap();
+    fresco_aqueduct_bridge::set_scissor(&mut fb, 0, 0, 16, 16).unwrap();
+    fresco_aqueduct_bridge::translate_rect(&mut fb, &fp::RectParams {
+        x: 0.0, y: 0.0, w: 64.0, h: 64.0,
+        r: 1.0, g: 0.0, b: 1.0, a: 1.0,
+    }).unwrap();
+    fresco_aqueduct_bridge::end_renderpass(&mut fb).unwrap();
+
+    client.submit_frame(fence, fb, 1).unwrap();
+    let _ = client.wait_fence(fence, 1_000_000_000);
+    thread::sleep(Duration::from_millis(50));
+
+    let pixels = sw_backend.read_image_pixels(target).expect("pixels");
+    // (8, 8): inside scissor → magenta (255, 0, 255, 255).
+    let inside = (8 * 64 + 8) * 4;
+    assert_eq!(pixels[inside + 0], 255, "R inside scissor");
+    assert_eq!(pixels[inside + 1],   0, "G inside scissor");
+    assert_eq!(pixels[inside + 2], 255, "B inside scissor");
+    // (20, 20): outside scissor → cyan preserved (0, 255, 255, 255).
+    let outside = (20 * 64 + 20) * 4;
+    assert_eq!(pixels[outside + 0],   0, "R outside (cyan preserved)");
+    assert_eq!(pixels[outside + 1], 255, "G outside");
+    assert_eq!(pixels[outside + 2], 255, "B outside");
+
+    drop(client);
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[test]
 fn _unused_idnamespace_warning_suppressor() {
     // Imports referenced by docs only.
     let _ = IdNamespace::Builtin;
