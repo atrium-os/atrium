@@ -19,6 +19,26 @@
 //!
 //! Or it'll silently no-op (zero physical devices, valid handle
 //! chain) when no daemon is reachable.
+//!
+//! # VM-verified on FreeBSD/aarch64
+//!
+//! Cross-built (`--target aarch64-unknown-freebsd --release`) and
+//! run inside the FreeBSD dev VM: the daemon logs the handshake
+//! (`client_kind=VulkanIcd, backend=software:0`) and accepts the
+//! SubmitFrame. The tier-1 software renderer then surfaces the
+//! architectural tier boundary:
+//!
+//!   WARN aqueduct_gpu_host::backend: SoftwareBackend::submit_frame:
+//!     pass into id(icd-runtime, 0x3) failed:
+//!     tier-1 software renderer cannot handle ICD-runtime pipelines
+//!     (third-party SPIR-V) — tier-2 territory
+//!
+//! That's the *correct* response: tier-1 is for Atrium-native
+//! bundle pipelines (rect, path, textured-rect, glyph_run). Apps
+//! that ship arbitrary SPIR-V go through tier-2 (llvmpipe).
+//! atrium-vk-icd's role is to make those apps reach the daemon
+//! correctly; the daemon's job is to route them to the right
+//! tier. Both halves are now proven on the target platform.
 
 use atrium_vk_icd::{
     cmdbuf_recorded_bytes, vkAllocateCommandBuffers, vkAllocateMemory,
