@@ -184,6 +184,11 @@ struct AtriumCommandBuffer {
     /// during `Recording` by vkCmd*; finalized in `Executable`;
     /// flushed to the host endpoint by vkQueueSubmit.
     frame: aqueduct_gpu::frame::FrameBuilder,
+    /// Back-pointer to the owning AtriumDevice. Borrowed (the
+    /// pool that allocated this cmdbuf is owned by the device).
+    /// vkCmd* uses it to resolve VkBuffer → ResourceId via the
+    /// device's `buffers` map. Set at vkAllocateCommandBuffers.
+    device: *mut AtriumDevice,
 }
 
 /// Test-only accessor — peek at a cmdbuf's recorded byte stream.
@@ -539,10 +544,21 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkDevice, u64, u64, u64) -> VkResult, FnVoidPtr,
             >(vkBindBufferMemory)),
+        "vkCmdBindVertexBuffers" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u32, u32, *const u64, *const u64), FnVoidPtr,
+            >(vkCmdBindVertexBuffers)),
+        "vkCmdBindIndexBuffer" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u64, u64, u32), FnVoidPtr,
+            >(vkCmdBindIndexBuffer)),
+        "vkCmdDrawIndexed" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u32, u32, u32, i32, u32), FnVoidPtr,
+            >(vkCmdDrawIndexed)),
         // Phase 1.3b+ continued: VkImage + vkBindImageMemory,
-        // vkCmdBindVertexBuffers, vkCmdBindIndexBuffer,
-        // vkCmdDrawIndexed, vkCmdCopyBuffer*,
-        // vkCmdPipelineBarrier, vkCmdBegin/EndRenderPass, …
+        // vkCmdCopyBuffer*, vkCmdPipelineBarrier,
+        // vkCmdBegin/EndRenderPass, vkCreateShaderModule, …
         _ => None,
     }
 }
@@ -1360,6 +1376,90 @@ pub unsafe extern "C" fn vkCmdDraw(
     let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::Draw, &body);
 }
 
+/// Helper: resolve a VkBuffer u64 to its daemon-side ResourceId via
+/// the owning device's `buffers` map. Returns `ResourceId(0)` if
+/// the buffer has no daemon-side binding (memory was local-only, or
+/// no vkBindBufferMemory yet). vkCmd* paths that hit this case
+/// still push the FrameOp — the host will reject the dispatch with
+/// `OP_GPU_VALIDATION_ERR` rather than the client silently dropping
+/// the record (a deferred-error pattern that surfaces upstream).
+#[inline]
+unsafe fn resolve_buffer(
+    cb: &AtriumCommandBuffer, handle: u64,
+) -> aqueduct_gpu::ids::ResourceId {
+    if cb.device.is_null() { return aqueduct_gpu::ids::ResourceId(0); }
+    let dev = &*(cb.device as *const AtriumDevice);
+    dev.buffers.lock().ok()
+        .and_then(|b| b.get(&handle).and_then(|x| x.buffer_id))
+        .unwrap_or(aqueduct_gpu::ids::ResourceId(0))
+}
+
+/// `vkCmdBindVertexBuffers` — one `BindVertexBuf` FrameOp per
+/// binding. Body: { binding_index: u32, buffer_id: u32, offset: u64 }
+/// per binding (16 B each).
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdBindVertexBuffers(
+    command_buffer:  VkCommandBuffer,
+    first_binding:   u32,
+    binding_count:   u32,
+    p_buffers:       *const u64,
+    p_offsets:       *const u64,
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    if p_buffers.is_null() || p_offsets.is_null() { return; }
+    for i in 0..binding_count {
+        let buffer_handle = *p_buffers.offset(i as isize);
+        let offset        = *p_offsets.offset(i as isize);
+        let rid = resolve_buffer(cb, buffer_handle);
+        let mut body = [0u8; 16];
+        body[ 0.. 4].copy_from_slice(&(first_binding + i).to_le_bytes());
+        body[ 4.. 8].copy_from_slice(&rid.raw().to_le_bytes());
+        body[ 8..16].copy_from_slice(&offset.to_le_bytes());
+        let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::BindVertexBuf, &body);
+    }
+}
+
+/// `vkCmdBindIndexBuffer` — one `BindIndexBuf` FrameOp.
+/// Body: { buffer_id: u32, _pad: u32, offset: u64, index_type: u32 }
+/// — 20 bytes. index_type: 0=UINT16, 1=UINT32 (VkIndexType enum).
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdBindIndexBuffer(
+    command_buffer: VkCommandBuffer,
+    buffer:         u64,
+    offset:         u64,
+    index_type:     u32, /* VkIndexType */
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    let rid = resolve_buffer(cb, buffer);
+    let mut body = [0u8; 20];
+    body[ 0.. 4].copy_from_slice(&rid.raw().to_le_bytes());
+    body[ 8..16].copy_from_slice(&offset.to_le_bytes());
+    body[16..20].copy_from_slice(&index_type.to_le_bytes());
+    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::BindIndexBuf, &body);
+}
+
+/// `vkCmdDrawIndexed` — like vkCmdDraw but with an index-buffer
+/// lookup and a vertexOffset that's signed. Body: 5 × u32 in Vk
+/// argument order. vertexOffset i32 is bit-cast to u32.
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdDrawIndexed(
+    command_buffer: VkCommandBuffer,
+    index_count:    u32,
+    instance_count: u32,
+    first_index:    u32,
+    vertex_offset:  i32,
+    first_instance: u32,
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    let mut body = [0u8; 20];
+    body[ 0.. 4].copy_from_slice(&index_count.to_le_bytes());
+    body[ 4.. 8].copy_from_slice(&instance_count.to_le_bytes());
+    body[ 8..12].copy_from_slice(&first_index.to_le_bytes());
+    body[12..16].copy_from_slice(&(vertex_offset as u32).to_le_bytes());
+    body[16..20].copy_from_slice(&first_instance.to_le_bytes());
+    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::DrawIndexed, &body);
+}
+
 /// `vkCreateCommandPool` — allocate a non-dispatchable
 /// VkCommandPool handle. We ignore the create-info (queue family,
 /// flags); Atrium's single queue family means every pool is
@@ -1422,13 +1522,14 @@ pub unsafe extern "C" fn vkDestroyCommandPool(
 /// buffer of at least `commandBufferCount` VkCommandBuffer slots.
 #[no_mangle]
 pub unsafe extern "C" fn vkAllocateCommandBuffers(
-    _device:            VkDevice,
+    device:             VkDevice,
     p_allocate_info:    *const c_void, /* const VkCommandBufferAllocateInfo* */
     p_command_buffers:  *mut VkCommandBuffer,
 ) -> VkResult {
-    if p_allocate_info.is_null() || p_command_buffers.is_null() {
+    if device.is_null() || p_allocate_info.is_null() || p_command_buffers.is_null() {
         return VK_ERROR_INITIALIZATION_FAILED;
     }
+    let dev_ptr = device as *mut AtriumDevice;
     // VkCommandBufferAllocateInfo layout:
     //   offset 0   sType : VkStructureType (u32)
     //   offset 8   pNext : *const c_void
@@ -1451,6 +1552,7 @@ pub unsafe extern "C" fn vkAllocateCommandBuffers(
             loader_dispatch_slot: VK_ICD_LOADER_MAGIC,
             state: CmdBufferState::Initial,
             frame: aqueduct_gpu::frame::FrameBuilder::new(ATRIUM_CMDBUF_INITIAL_CAPACITY),
+            device: dev_ptr,
         });
         let cb_raw = Box::into_raw(cb);
         pool.buffers.push(cb_raw);

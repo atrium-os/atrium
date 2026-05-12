@@ -783,6 +783,106 @@ fn buffer_create_bind_destroy_round_trip() {
 }
 
 #[test]
+fn vertex_index_buffer_bind_and_draw_indexed_records() {
+    use atrium_vk_icd::{
+        cmdbuf_recorded_bytes,
+        vkAllocateCommandBuffers, vkAllocateMemory, vkBeginCommandBuffer,
+        vkBindBufferMemory, vkCmdBindIndexBuffer, vkCmdBindVertexBuffers,
+        vkCmdDrawIndexed, vkCreateBuffer, vkCreateCommandPool, vkCreateDevice,
+        vkDestroyBuffer, vkDestroyCommandPool, vkDestroyDevice,
+        vkEndCommandBuffer, vkFreeMemory,
+    };
+
+    let sock = tmp_socket("vbib");
+    let sw_backend = Arc::new(SoftwareBackend::new());
+    let backend_for_listener: Arc<dyn Backend> = sw_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap();
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+
+    type VkDevice = *mut std::ffi::c_void;
+    type VkCommandBuffer = *mut std::ffi::c_void;
+
+    let mut instance: VkInstance = std::ptr::null_mut();
+    unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
+    let mut pds: [VkPhysicalDevice; 1] = [std::ptr::null_mut(); 1];
+    let mut cap: u32 = 1;
+    unsafe { vkEnumeratePhysicalDevices(instance, &mut cap, pds.as_mut_ptr()); }
+    let mut device: VkDevice = std::ptr::null_mut();
+    unsafe { vkCreateDevice(pds[0], std::ptr::null(), std::ptr::null(), &mut device); }
+
+    // Allocate one memory + create two buffers, bind both. The
+    // SoftwareBackend will receive OP_GPU_MEMORY_CREATE +
+    // OP_GPU_BUFFER_CREATE for each, and AtriumBuffer.buffer_id
+    // gets populated so vkCmd*'s resolve_buffer returns a real id.
+    let mut alloc = [0u8; 32];
+    alloc[0..4].copy_from_slice(&5u32.to_le_bytes());
+    alloc[16..24].copy_from_slice(&(8192u64).to_le_bytes());
+    let mut mem: u64 = 0;
+    unsafe { vkAllocateMemory(device, alloc.as_ptr() as *const _, std::ptr::null(), &mut mem); }
+    // Give the SW backend a moment to register the memory.
+    thread::sleep(Duration::from_millis(30));
+
+    fn make_buffer(device: VkDevice, size: u64, usage: u32) -> u64 {
+        let mut info = [0u8; 56];
+        info[0..4].copy_from_slice(&12u32.to_le_bytes());
+        info[24..32].copy_from_slice(&size.to_le_bytes());
+        info[32..36].copy_from_slice(&usage.to_le_bytes());
+        let mut handle: u64 = 0;
+        unsafe { vkCreateBuffer(device, info.as_ptr() as *const _, std::ptr::null(), &mut handle); }
+        handle
+    }
+    let vbuf = make_buffer(device, 1024, 0x80); // VERTEX_BUFFER
+    let ibuf = make_buffer(device, 1024, 0x40); // INDEX_BUFFER
+    unsafe { vkBindBufferMemory(device, vbuf, mem, 0); }
+    unsafe { vkBindBufferMemory(device, ibuf, mem, 4096); }
+    thread::sleep(Duration::from_millis(30));
+
+    // Record vkCmdBindVertexBuffers + vkCmdBindIndexBuffer +
+    // vkCmdDrawIndexed and inspect the FrameOp stream.
+    let mut pool: u64 = 0;
+    unsafe { vkCreateCommandPool(device, std::ptr::null(), std::ptr::null(), &mut pool); }
+    let mut cb_info = [0u8; 40];
+    cb_info[0..4].copy_from_slice(&40u32.to_le_bytes());
+    cb_info[16..24].copy_from_slice(&pool.to_le_bytes());
+    cb_info[28..32].copy_from_slice(&1u32.to_le_bytes());
+    let mut cbs: [VkCommandBuffer; 1] = [std::ptr::null_mut(); 1];
+    unsafe { vkAllocateCommandBuffers(device, cb_info.as_ptr() as *const _, cbs.as_mut_ptr()); }
+    let cb = cbs[0];
+
+    unsafe { vkBeginCommandBuffer(cb, std::ptr::null()); }
+    let bufs = [vbuf];
+    let offs = [0u64];
+    unsafe { vkCmdBindVertexBuffers(cb, 0, 1, bufs.as_ptr(), offs.as_ptr()); }
+    unsafe { vkCmdBindIndexBuffer(cb, ibuf, 0, 1 /* UINT32 */); }
+    unsafe { vkCmdDrawIndexed(cb, 6, 1, 0, 0, 0); }
+    unsafe { vkEndCommandBuffer(cb); }
+
+    let bytes = cmdbuf_recorded_bytes(cb);
+    // Three records: BindVertexBuf (8+16=24), BindIndexBuf (8+20=28),
+    // DrawIndexed (8+20=28). Total 80.
+    assert_eq!(bytes.len(), 80, "expected 80 bytes, got {}", bytes.len());
+
+    let op0 = u16::from_le_bytes([bytes[ 0], bytes[ 1]]);
+    let op1 = u16::from_le_bytes([bytes[24], bytes[25]]);
+    let op2 = u16::from_le_bytes([bytes[52], bytes[53]]);
+    assert_eq!(op0, 0x0022, "BindVertexBuf");
+    assert_eq!(op1, 0x0023, "BindIndexBuf");
+    assert_eq!(op2, 0x0041, "DrawIndexed");
+
+    unsafe { vkDestroyCommandPool(device, pool, std::ptr::null()); }
+    unsafe { vkDestroyBuffer(device, vbuf, std::ptr::null()); }
+    unsafe { vkDestroyBuffer(device, ibuf, std::ptr::null()); }
+    unsafe { vkFreeMemory(device, mem, std::ptr::null()); }
+    unsafe { vkDestroyDevice(device, std::ptr::null()); }
+    unsafe { vkDestroyInstance(instance, std::ptr::null()); }
+    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[test]
 fn proc_addr_resolves_three_entry_points() {
     // No live daemon required for the get_proc_addr lookups.
     fn lookup(name: &[u8]) -> Option<unsafe extern "C" fn()> {
