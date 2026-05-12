@@ -245,6 +245,26 @@ struct AtriumDevice {
     /// they're opaque u64. We use a per-device counter so
     /// handles are stable within a device's lifetime.
     next_memory_id: std::cell::Cell<u64>,
+    /// Per-VkBuffer state. Records the size requested at
+    /// vkCreateBuffer + the memory binding (if any) installed
+    /// later by vkBindBufferMemory. Buffers without bindings are
+    /// valid but unusable in commands.
+    buffers: std::sync::Mutex<std::collections::HashMap<u64, AtriumBuffer>>,
+    /// Monotonic counter for VkBuffer handles.
+    next_buffer_id: std::cell::Cell<u64>,
+}
+
+/// ICD-side state for a `VkBuffer`. Created by vkCreateBuffer
+/// with a size; gets its `memory` + `memory_offset` populated by
+/// a follow-up vkBindBufferMemory. vkCmdBindVertexBuffers /
+/// vkCmdBindIndexBuffer (future) resolve through this map.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // memory_offset/usage feed future vkCmd* paths
+struct AtriumBuffer {
+    size:          u64,
+    memory:        Option<u64>,
+    memory_offset: u64,
+    usage:         u32, /* VkBufferUsageFlags */
 }
 
 /// ICD-side state behind a `VkQueue`. Same dispatchable-handle
@@ -487,9 +507,25 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkDevice, u64), FnVoidPtr,
             >(vkUnmapMemory)),
-        // Phase 1.3b+ continued: VkBuffer + vkBindBufferMemory,
-        // VkImage + vkBindImageMemory, vkCmdBindVertexBuffers,
-        // vkCmdBindIndexBuffer, vkCmdDrawIndexed, vkCmdCopyBuffer*,
+        "vkCreateBuffer" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, *const c_void, *const c_void, *mut u64) -> VkResult, FnVoidPtr,
+            >(vkCreateBuffer)),
+        "vkDestroyBuffer" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, *const c_void), FnVoidPtr,
+            >(vkDestroyBuffer)),
+        "vkGetBufferMemoryRequirements" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, *mut ash::vk::MemoryRequirements), FnVoidPtr,
+            >(vkGetBufferMemoryRequirements)),
+        "vkBindBufferMemory" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, u64, u64) -> VkResult, FnVoidPtr,
+            >(vkBindBufferMemory)),
+        // Phase 1.3b+ continued: VkImage + vkBindImageMemory,
+        // vkCmdBindVertexBuffers, vkCmdBindIndexBuffer,
+        // vkCmdDrawIndexed, vkCmdCopyBuffer*,
         // vkCmdPipelineBarrier, vkCmdBegin/EndRenderPass, …
         _ => None,
     }
@@ -719,6 +755,8 @@ pub unsafe extern "C" fn vkCreateDevice(
         pipelines: std::sync::Mutex::new(std::collections::HashMap::new()),
         memories:  std::sync::Mutex::new(std::collections::HashMap::new()),
         next_memory_id: std::cell::Cell::new(1),
+        buffers:        std::sync::Mutex::new(std::collections::HashMap::new()),
+        next_buffer_id: std::cell::Cell::new(1),
     });
     let dev_ptr: *mut AtriumDevice = &mut *dev;
     let q = Box::new(AtriumQueue {
@@ -974,6 +1012,131 @@ pub unsafe extern "C" fn vkUnmapMemory(
     _device: VkDevice,
     _memory: u64,
 ) {
+}
+
+/// `vkCreateBuffer` — record an AtriumBuffer for the requested
+/// size + usage. Memory binding lands in a follow-up
+/// vkBindBufferMemory call. Today we ignore sharing-mode,
+/// queueFamilyIndices, and pNext — Atrium is single-queue.
+///
+/// VkBufferCreateInfo layout:
+///   0   sType
+///   8   pNext
+///   16  flags
+///   20  _pad
+///   24  size : u64
+///   32  usage : u32
+#[no_mangle]
+pub unsafe extern "C" fn vkCreateBuffer(
+    device:          VkDevice,
+    p_create_info:   *const c_void,
+    _p_allocator:    *const c_void,
+    p_buffer:        *mut u64,
+) -> VkResult {
+    if device.is_null() || p_create_info.is_null() || p_buffer.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let dev = &*(device as *const AtriumDevice);
+    let bytes = p_create_info as *const u8;
+    let size  = std::ptr::read_unaligned(bytes.add(24) as *const u64);
+    let usage = std::ptr::read_unaligned(bytes.add(32) as *const u32);
+    if size == 0 { return VK_ERROR_INITIALIZATION_FAILED; }
+
+    let handle = dev.next_buffer_id.get();
+    dev.next_buffer_id.set(handle + 1);
+    if let Ok(mut b) = dev.buffers.lock() {
+        b.insert(handle, AtriumBuffer {
+            size, memory: None, memory_offset: 0, usage,
+        });
+    } else {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    *p_buffer = handle;
+    VK_SUCCESS
+}
+
+/// `vkDestroyBuffer` — drop the AtriumBuffer entry. The underlying
+/// VkDeviceMemory is independent and survives.
+#[no_mangle]
+pub unsafe extern "C" fn vkDestroyBuffer(
+    device:       VkDevice,
+    buffer:       u64,
+    _p_allocator: *const c_void,
+) {
+    if device.is_null() || buffer == 0 { return; }
+    let dev = &*(device as *const AtriumDevice);
+    if let Ok(mut b) = dev.buffers.lock() {
+        b.remove(&buffer);
+    }
+}
+
+/// `vkGetBufferMemoryRequirements` — describe what memory shape
+/// `buffer` needs to be bound. We report:
+/// - size: as requested at create time
+/// - alignment: 16 bytes (covers the typical Vulkan minimums for
+///   uniform / storage / vertex buffers; real values come from
+///   the backend's caps eventually)
+/// - memoryTypeBits: 0b1 — only memory type 0 (which is our
+///   single host-visible | host-coherent | device-local type per
+///   vkGetPhysicalDeviceMemoryProperties)
+#[no_mangle]
+pub unsafe extern "C" fn vkGetBufferMemoryRequirements(
+    device:           VkDevice,
+    buffer:           u64,
+    p_requirements:   *mut ash::vk::MemoryRequirements,
+) {
+    if device.is_null() || p_requirements.is_null() { return; }
+    let dev = &*(device as *const AtriumDevice);
+    let size = dev.buffers.lock().ok()
+        .and_then(|b| b.get(&buffer).map(|x| x.size))
+        .unwrap_or(0);
+    *p_requirements = ash::vk::MemoryRequirements {
+        size,
+        alignment:        16,
+        memory_type_bits: 0b1,
+    };
+}
+
+/// `vkBindBufferMemory` — associate `buffer` with `memory_offset`
+/// in `memory`. Returns SUCCESS if the binding is valid (the
+/// buffer exists, the memory exists, and offset + buffer.size
+/// fits in memory.size). Subsequent vkCmd* operations that
+/// reference `buffer` resolve through this binding to reach the
+/// underlying VkDeviceMemory storage.
+#[no_mangle]
+pub unsafe extern "C" fn vkBindBufferMemory(
+    device:         VkDevice,
+    buffer:         u64,
+    memory:         u64,
+    memory_offset:  u64,
+) -> VkResult {
+    if device.is_null() || buffer == 0 || memory == 0 {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let dev = &*(device as *const AtriumDevice);
+
+    // Validate the binding ranges in (the buffer's size).
+    let mem_size = match dev.memories.lock() {
+        Ok(m) => m.get(&memory).map(|s| s.len() as u64),
+        Err(_) => return VK_ERROR_INITIALIZATION_FAILED,
+    };
+    let Some(mem_size) = mem_size else {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    };
+
+    let mut buffers = match dev.buffers.lock() {
+        Ok(b) => b,
+        Err(_) => return VK_ERROR_INITIALIZATION_FAILED,
+    };
+    let Some(buf) = buffers.get_mut(&buffer) else {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    };
+    if memory_offset.checked_add(buf.size).map(|end| end > mem_size).unwrap_or(true) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    buf.memory        = Some(memory);
+    buf.memory_offset = memory_offset;
+    VK_SUCCESS
 }
 
 /// `vkCmdBindPipeline` — push a `BindPipeline` FrameOp with the

@@ -706,6 +706,83 @@ fn device_memory_alloc_map_unmap_free() {
 }
 
 #[test]
+fn buffer_create_bind_destroy_round_trip() {
+    use atrium_vk_icd::{
+        vkAllocateMemory, vkBindBufferMemory, vkCreateBuffer, vkCreateDevice,
+        vkDestroyBuffer, vkDestroyDevice, vkFreeMemory,
+        vkGetBufferMemoryRequirements,
+    };
+
+    let sock = tmp_socket("buf");
+    let sw_backend = Arc::new(SoftwareBackend::new());
+    let backend_for_listener: Arc<dyn Backend> = sw_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap();
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+
+    type VkDevice = *mut std::ffi::c_void;
+
+    let mut instance: VkInstance = std::ptr::null_mut();
+    unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
+    let mut devices: [VkPhysicalDevice; 1] = [std::ptr::null_mut(); 1];
+    let mut cap: u32 = 1;
+    unsafe { vkEnumeratePhysicalDevices(instance, &mut cap, devices.as_mut_ptr()); }
+    let mut device: VkDevice = std::ptr::null_mut();
+    unsafe { vkCreateDevice(devices[0], std::ptr::null(), std::ptr::null(), &mut device); }
+
+    // VkBufferCreateInfo (56 bytes): sType@0, pNext@8, flags@16,
+    // size@24 (u64), usage@32, sharingMode@36, qfic@40, _pad@44,
+    // pQueueFamilyIndices@48.
+    let mut info = [0u8; 56];
+    info[0..4].copy_from_slice(&12u32.to_le_bytes()); // sType
+    info[24..32].copy_from_slice(&(4096u64).to_le_bytes());
+    info[32..36].copy_from_slice(&0x80u32.to_le_bytes()); // VERTEX_BUFFER_BIT
+    let mut buffer: u64 = 0;
+    let r = unsafe { vkCreateBuffer(device, info.as_ptr() as *const _, std::ptr::null(), &mut buffer) };
+    assert_eq!(r, 0);
+    assert!(buffer != 0);
+
+    // Memory-requirements query should report the requested size,
+    // 16-byte alignment, single-type memoryTypeBits.
+    let mut req = ash::vk::MemoryRequirements::default();
+    unsafe { vkGetBufferMemoryRequirements(device, buffer, &mut req); }
+    assert_eq!(req.size, 4096);
+    assert_eq!(req.alignment, 16);
+    assert_eq!(req.memory_type_bits, 0b1);
+
+    // Allocate matching memory, bind, verify.
+    let mut alloc_info = [0u8; 32];
+    alloc_info[0..4].copy_from_slice(&5u32.to_le_bytes());
+    alloc_info[16..24].copy_from_slice(&req.size.to_le_bytes());
+    let mut mem: u64 = 0;
+    unsafe { vkAllocateMemory(device, alloc_info.as_ptr() as *const _, std::ptr::null(), &mut mem); }
+    let r = unsafe { vkBindBufferMemory(device, buffer, mem, 0) };
+    assert_eq!(r, 0);
+
+    // Bind beyond the memory's bounds must reject.
+    let mut tiny_alloc = [0u8; 32];
+    tiny_alloc[0..4].copy_from_slice(&5u32.to_le_bytes());
+    tiny_alloc[16..24].copy_from_slice(&(1024u64).to_le_bytes());
+    let mut tiny_mem: u64 = 0;
+    unsafe { vkAllocateMemory(device, tiny_alloc.as_ptr() as *const _, std::ptr::null(), &mut tiny_mem); }
+    let r = unsafe { vkBindBufferMemory(device, buffer, tiny_mem, 0) };
+    assert_ne!(r, 0, "binding 4 KiB buffer to 1 KiB memory must fail");
+    // Bind with offset that overflows fails.
+    let r = unsafe { vkBindBufferMemory(device, buffer, mem, 4095) };
+    assert_ne!(r, 0, "offset 4095 + size 4096 > memory size 4096 must fail");
+
+    unsafe { vkFreeMemory(device, tiny_mem, std::ptr::null()); }
+    unsafe { vkFreeMemory(device, mem, std::ptr::null()); }
+    unsafe { vkDestroyBuffer(device, buffer, std::ptr::null()); }
+    unsafe { vkDestroyDevice(device, std::ptr::null()); }
+    unsafe { vkDestroyInstance(instance, std::ptr::null()); }
+    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[test]
 fn proc_addr_resolves_three_entry_points() {
     // No live daemon required for the get_proc_addr lookups.
     fn lookup(name: &[u8]) -> Option<unsafe extern "C" fn()> {
