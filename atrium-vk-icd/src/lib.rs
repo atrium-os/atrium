@@ -257,6 +257,55 @@ struct AtriumDevice {
     buffers: std::sync::Mutex<std::collections::HashMap<u64, AtriumBuffer>>,
     /// Monotonic counter for VkBuffer handles.
     next_buffer_id: std::cell::Cell<u64>,
+    /// Per-VkImage state. Mirrors `buffers` for the image side.
+    images: std::sync::Mutex<std::collections::HashMap<u64, AtriumImage>>,
+    /// Monotonic counter for VkImage handles.
+    next_image_id: std::cell::Cell<u64>,
+}
+
+/// ICD-side state for a `VkImage`. Created by vkCreateImage;
+/// `image_id` populated by vkBindImageMemory when the memory has a
+/// region_id. Future vkCmd* paths that target images
+/// (vkCmdCopyBufferToImage, vkCmdPipelineBarrier transitions) read
+/// the image_id from here.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // many fields feed future render-pass / descriptor paths
+struct AtriumImage {
+    width:        u32,
+    height:       u32,
+    depth:        u32,
+    mip_levels:   u32,
+    array_layers: u32,
+    format:       u32, /* VkFormat */
+    usage:        u32, /* VkImageUsageFlags */
+    memory:        Option<u64>,
+    memory_offset: u64,
+    /// Daemon-side ResourceId, populated by vkBindImageMemory.
+    image_id: Option<aqueduct_gpu::ids::ResourceId>,
+}
+
+/// Bytes-per-pixel for the small subset of VkFormat values we need
+/// to size memory requirements. Real ICDs ship a full format-rules
+/// table (e.g. atrium-vk-icd will eventually reuse the
+/// aqueduct-gpu format-rules table). 0 = unknown — caller gets a
+/// best-effort (width × height × 4) sizing.
+fn bpp_for_vk_format(format: u32) -> u32 {
+    // Vk numeric values, see VkFormat enum.
+    match format {
+        // 8-bit single-channel.
+        9 => 1,    // R8_UNORM
+        // 16-bit single-channel + 8-bit two-channel.
+        16 | 70 => 2,
+        // 24-bit (typically padded to 32 on most HW).
+        23 | 30 | 37 => 4,  // R8G8B8_UNORM / B8G8R8_UNORM / R8G8B8A8_UNORM
+        43 => 4,            // B8G8R8A8_UNORM
+        50 => 4,            // R8G8B8A8_SRGB
+        // 64-bit.
+        97 | 98 | 100 | 109 => 8,
+        // 128-bit.
+        106 | 109..=124 => 16,
+        _ => 4, // best effort
+    }
 }
 
 /// ICD-side state for a `VkBuffer`. Created by vkCreateBuffer
@@ -556,9 +605,25 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkCommandBuffer, u32, u32, u32, i32, u32), FnVoidPtr,
             >(vkCmdDrawIndexed)),
-        // Phase 1.3b+ continued: VkImage + vkBindImageMemory,
-        // vkCmdCopyBuffer*, vkCmdPipelineBarrier,
-        // vkCmdBegin/EndRenderPass, vkCreateShaderModule, …
+        "vkCreateImage" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, *const c_void, *const c_void, *mut u64) -> VkResult, FnVoidPtr,
+            >(vkCreateImage)),
+        "vkDestroyImage" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, *const c_void), FnVoidPtr,
+            >(vkDestroyImage)),
+        "vkGetImageMemoryRequirements" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, *mut ash::vk::MemoryRequirements), FnVoidPtr,
+            >(vkGetImageMemoryRequirements)),
+        "vkBindImageMemory" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, u64, u64) -> VkResult, FnVoidPtr,
+            >(vkBindImageMemory)),
+        // Phase 1.3b+ continued: vkCmdCopyBuffer*,
+        // vkCmdPipelineBarrier, vkCmdBegin/EndRenderPass,
+        // vkCreateShaderModule, …
         _ => None,
     }
 }
@@ -789,6 +854,8 @@ pub unsafe extern "C" fn vkCreateDevice(
         next_memory_id: std::cell::Cell::new(1),
         buffers:        std::sync::Mutex::new(std::collections::HashMap::new()),
         next_buffer_id: std::cell::Cell::new(1),
+        images:         std::sync::Mutex::new(std::collections::HashMap::new()),
+        next_image_id:  std::cell::Cell::new(1),
     });
     let dev_ptr: *mut AtriumDevice = &mut *dev;
     let q = Box::new(AtriumQueue {
@@ -1458,6 +1525,177 @@ pub unsafe extern "C" fn vkCmdDrawIndexed(
     body[12..16].copy_from_slice(&(vertex_offset as u32).to_le_bytes());
     body[16..20].copy_from_slice(&first_instance.to_le_bytes());
     let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::DrawIndexed, &body);
+}
+
+/// `vkCreateImage` — record an AtriumImage. The memory binding
+/// + daemon-side `image_id` land later via vkBindImageMemory.
+///
+/// VkImageCreateInfo layout (relevant fields):
+///   0   sType
+///   8   pNext
+///   16  flags
+///   20  imageType : u32
+///   24  format    : u32
+///   28  extent.width  : u32
+///   32  extent.height : u32
+///   36  extent.depth  : u32
+///   40  mipLevels  : u32
+///   44  arrayLayers : u32
+///   48  samples : u32
+///   52  tiling : u32
+///   56  usage  : u32
+#[no_mangle]
+pub unsafe extern "C" fn vkCreateImage(
+    device:          VkDevice,
+    p_create_info:   *const c_void,
+    _p_allocator:    *const c_void,
+    p_image:         *mut u64,
+) -> VkResult {
+    if device.is_null() || p_create_info.is_null() || p_image.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let dev = &*(device as *const AtriumDevice);
+    let b = p_create_info as *const u8;
+    let format       = std::ptr::read_unaligned(b.add(24) as *const u32);
+    let width        = std::ptr::read_unaligned(b.add(28) as *const u32);
+    let height       = std::ptr::read_unaligned(b.add(32) as *const u32);
+    let depth        = std::ptr::read_unaligned(b.add(36) as *const u32).max(1);
+    let mip_levels   = std::ptr::read_unaligned(b.add(40) as *const u32).max(1);
+    let array_layers = std::ptr::read_unaligned(b.add(44) as *const u32).max(1);
+    let usage        = std::ptr::read_unaligned(b.add(56) as *const u32);
+    if width == 0 || height == 0 {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    let handle = dev.next_image_id.get();
+    dev.next_image_id.set(handle + 1);
+    if let Ok(mut i) = dev.images.lock() {
+        i.insert(handle, AtriumImage {
+            width, height, depth, mip_levels, array_layers,
+            format, usage, memory: None, memory_offset: 0,
+            image_id: None,
+        });
+    } else {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    *p_image = handle;
+    VK_SUCCESS
+}
+
+/// `vkDestroyImage` — drop the AtriumImage entry. Backing memory
+/// is independent and survives.
+#[no_mangle]
+pub unsafe extern "C" fn vkDestroyImage(
+    device:       VkDevice,
+    image:        u64,
+    _p_allocator: *const c_void,
+) {
+    if device.is_null() || image == 0 { return; }
+    let dev = &*(device as *const AtriumDevice);
+    if let Ok(mut i) = dev.images.lock() {
+        i.remove(&image);
+    }
+}
+
+/// `vkGetImageMemoryRequirements` — report (width × height × depth
+/// × array_layers × bpp_for_format, 256-byte alignment, single
+/// memory-type). 256 is the typical Vulkan minimum for
+/// `optimalBufferCopyOffsetAlignment` on most HW; for the
+/// software backend it's overkill but safe.
+#[no_mangle]
+pub unsafe extern "C" fn vkGetImageMemoryRequirements(
+    device:           VkDevice,
+    image:            u64,
+    p_requirements:   *mut ash::vk::MemoryRequirements,
+) {
+    if device.is_null() || p_requirements.is_null() { return; }
+    let dev = &*(device as *const AtriumDevice);
+    let size = dev.images.lock().ok()
+        .and_then(|m| m.get(&image).copied())
+        .map(|img| {
+            let bpp = bpp_for_vk_format(img.format) as u64;
+            // Conservative mip + layer total — sum of per-level
+            // (w * h * depth * bpp) halved at each level, times
+            // array_layers. Real ICDs respect tiling-specific
+            // padding; for the skeleton we report a generous
+            // upper bound.
+            let base = (img.width as u64) * (img.height as u64) * (img.depth as u64) * bpp;
+            let mips = (0..img.mip_levels as u32).map(|l| base >> (2 * l)).sum::<u64>();
+            mips * (img.array_layers as u64)
+        }).unwrap_or(0);
+    *p_requirements = ash::vk::MemoryRequirements {
+        size,
+        alignment:        256,
+        memory_type_bits: 0b1,
+    };
+}
+
+/// `vkBindImageMemory` — associate `image` with `memory_offset` in
+/// `memory`. If the memory carries a daemon-side region_id and the
+/// instance has a live client, calls `GpuClient::create_image` to
+/// register the daemon-side image too; stores the returned
+/// ResourceId on AtriumImage.image_id for future vkCmd* paths.
+#[no_mangle]
+pub unsafe extern "C" fn vkBindImageMemory(
+    device:        VkDevice,
+    image:         u64,
+    memory:        u64,
+    memory_offset: u64,
+) -> VkResult {
+    if device.is_null() || image == 0 || memory == 0 {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let dev = &*(device as *const AtriumDevice);
+
+    let region_id = match dev.memories.lock() {
+        Ok(m) => match m.get(&memory) {
+            Some(am) => am.region_id,
+            None     => return VK_ERROR_INITIALIZATION_FAILED,
+        },
+        Err(_) => return VK_ERROR_INITIALIZATION_FAILED,
+    };
+
+    let img_snapshot = match dev.images.lock() {
+        Ok(i) => i.get(&image).copied(),
+        Err(_) => return VK_ERROR_INITIALIZATION_FAILED,
+    };
+    let Some(img) = img_snapshot else {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    };
+
+    let image_id = if let Some(region_id) = region_id {
+        if !dev.instance.is_null() {
+            let inst = &*(dev.instance as *const AtriumInstance);
+            inst.client.as_ref().and_then(|m| {
+                m.lock().ok().and_then(|mut c| {
+                    c.create_image(aqueduct_gpu::payloads::ImageCreatePayload {
+                        image_id:      aqueduct_gpu::ids::ResourceId(0),
+                        backing_region: region_id,
+                        region_offset:  memory_offset,
+                        format:         img.format,
+                        width:          img.width,
+                        height:         img.height,
+                        depth:          img.depth,
+                        mip_levels:     img.mip_levels,
+                        array_layers:   img.array_layers,
+                        usage:          img.usage,
+                    }).ok()
+                })
+            })
+        } else { None }
+    } else { None };
+
+    let mut images = match dev.images.lock() {
+        Ok(i) => i,
+        Err(_) => return VK_ERROR_INITIALIZATION_FAILED,
+    };
+    let Some(img) = images.get_mut(&image) else {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    };
+    img.memory        = Some(memory);
+    img.memory_offset = memory_offset;
+    img.image_id      = image_id;
+    VK_SUCCESS
 }
 
 /// `vkCreateCommandPool` — allocate a non-dispatchable

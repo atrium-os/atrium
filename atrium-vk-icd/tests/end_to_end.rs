@@ -883,6 +883,76 @@ fn vertex_index_buffer_bind_and_draw_indexed_records() {
 }
 
 #[test]
+fn image_create_bind_destroy_round_trip() {
+    use atrium_vk_icd::{
+        vkAllocateMemory, vkBindImageMemory, vkCreateDevice, vkCreateImage,
+        vkDestroyDevice, vkDestroyImage, vkFreeMemory,
+        vkGetImageMemoryRequirements,
+    };
+
+    let sock = tmp_socket("img");
+    let sw_backend = Arc::new(SoftwareBackend::new());
+    let backend_for_listener: Arc<dyn Backend> = sw_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap();
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+
+    type VkDevice = *mut std::ffi::c_void;
+
+    let mut instance: VkInstance = std::ptr::null_mut();
+    unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
+    let mut pds: [VkPhysicalDevice; 1] = [std::ptr::null_mut(); 1];
+    let mut cap: u32 = 1;
+    unsafe { vkEnumeratePhysicalDevices(instance, &mut cap, pds.as_mut_ptr()); }
+    let mut device: VkDevice = std::ptr::null_mut();
+    unsafe { vkCreateDevice(pds[0], std::ptr::null(), std::ptr::null(), &mut device); }
+
+    // 64×64 RGBA8 image. VkImageCreateInfo offsets per ICD:
+    //   24 format, 28 width, 32 height, 36 depth, 40 mipLevels,
+    //   44 arrayLayers, 56 usage.
+    // Size of struct is 88 bytes; we zero everything outside our fields.
+    let mut info = [0u8; 88];
+    info[ 0.. 4].copy_from_slice(&14u32.to_le_bytes()); // sType
+    info[24..28].copy_from_slice(&37u32.to_le_bytes()); // R8G8B8A8_UNORM
+    info[28..32].copy_from_slice(&64u32.to_le_bytes());
+    info[32..36].copy_from_slice(&64u32.to_le_bytes());
+    info[36..40].copy_from_slice(&1u32.to_le_bytes());
+    info[40..44].copy_from_slice(&1u32.to_le_bytes());
+    info[44..48].copy_from_slice(&1u32.to_le_bytes());
+    info[56..60].copy_from_slice(&0x07u32.to_le_bytes()); // SAMPLED|STORAGE|TRANSFER_DST
+    let mut img: u64 = 0;
+    let r = unsafe { vkCreateImage(device, info.as_ptr() as *const _, std::ptr::null(), &mut img) };
+    assert_eq!(r, 0);
+    assert!(img != 0);
+
+    // Memory requirements: 64*64*4 = 16384 bytes (1 mip × 1 layer),
+    // 256-byte alignment, single type.
+    let mut req = ash::vk::MemoryRequirements::default();
+    unsafe { vkGetImageMemoryRequirements(device, img, &mut req); }
+    assert_eq!(req.size, 64 * 64 * 4);
+    assert_eq!(req.alignment, 256);
+    assert_eq!(req.memory_type_bits, 0b1);
+
+    // Allocate memory and bind.
+    let mut alloc = [0u8; 32];
+    alloc[0..4].copy_from_slice(&5u32.to_le_bytes());
+    alloc[16..24].copy_from_slice(&req.size.to_le_bytes());
+    let mut mem: u64 = 0;
+    unsafe { vkAllocateMemory(device, alloc.as_ptr() as *const _, std::ptr::null(), &mut mem); }
+    let r = unsafe { vkBindImageMemory(device, img, mem, 0) };
+    assert_eq!(r, 0);
+
+    unsafe { vkDestroyImage(device, img, std::ptr::null()); }
+    unsafe { vkFreeMemory(device, mem, std::ptr::null()); }
+    unsafe { vkDestroyDevice(device, std::ptr::null()); }
+    unsafe { vkDestroyInstance(instance, std::ptr::null()); }
+    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[test]
 fn proc_addr_resolves_three_entry_points() {
     // No live daemon required for the get_proc_addr lookups.
     fn lookup(name: &[u8]) -> Option<unsafe extern "C" fn()> {
