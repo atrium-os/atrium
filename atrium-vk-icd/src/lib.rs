@@ -579,6 +579,10 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(*mut u32, *mut VkLayerProperties) -> VkResult, FnVoidPtr,
             >(vkEnumerateInstanceLayerProperties)),
+        "vkEnumerateDeviceExtensionProperties" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkPhysicalDevice, *const c_char, *mut u32, *mut VkExtensionProperties) -> VkResult, FnVoidPtr,
+            >(vkEnumerateDeviceExtensionProperties)),
         "vkCreateInstance" =>
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(*const c_void, *const c_void, *mut VkInstance) -> VkResult, FnVoidPtr,
@@ -4105,6 +4109,60 @@ pub unsafe extern "C" fn vkEnumerateInstanceExtensionProperties(
     if to_copy < n { 5 /* VK_INCOMPLETE */ } else { VK_SUCCESS }
 }
 
+/// Device-level extensions advertised by atrium-vk-icd.
+///
+/// VK_KHR_swapchain is the load-blocking one for any windowed
+/// app: the Khronos loader filters its swapchain dispatch through
+/// vkEnumerateDeviceExtensionProperties — apps that pass it in
+/// vkCreateDevice::enabledExtensions[] would otherwise hit
+/// VK_ERROR_EXTENSION_NOT_PRESENT even though atrium-vk-icd's
+/// vkCreateSwapchainKHR is fully wired.
+///
+/// VK_EXT_debug_marker stays an instance-level "no-op stub" via
+/// debug_utils — adding a separate device entry would be churn
+/// for no gain (debug_marker is legacy, superseded by
+/// debug_utils).
+const ATRIUM_DEVICE_EXTENSIONS: &[(&[u8], u32)] = &[
+    (b"VK_KHR_swapchain\0", 70),
+];
+
+/// `vkEnumerateDeviceExtensionProperties` — returns the device-
+/// level extensions atrium-vk-icd supports. Same two-call
+/// contract as the instance variant: caller passes null
+/// pProperties first to size, then a real buffer to fill.
+#[no_mangle]
+pub unsafe extern "C" fn vkEnumerateDeviceExtensionProperties(
+    _physical_device: VkPhysicalDevice,
+    _p_layer_name:    *const c_char,
+    p_property_count: *mut u32,
+    p_properties:     *mut VkExtensionProperties,
+) -> VkResult {
+    if p_property_count.is_null() {
+        return -7 /* VK_ERROR_INITIALIZATION_FAILED */;
+    }
+    let n = ATRIUM_DEVICE_EXTENSIONS.len() as u32;
+    if p_properties.is_null() {
+        *p_property_count = n;
+        return VK_SUCCESS;
+    }
+    let cap = *p_property_count;
+    let to_copy = cap.min(n);
+    for i in 0..to_copy {
+        let (name, ver) = ATRIUM_DEVICE_EXTENSIONS[i as usize];
+        let mut props = VkExtensionProperties {
+            extensionName: [0; VK_MAX_EXTENSION_NAME_SIZE],
+            specVersion:   ver,
+        };
+        for (j, &b) in name.iter().enumerate() {
+            if j >= VK_MAX_EXTENSION_NAME_SIZE { break; }
+            props.extensionName[j] = b as c_char;
+        }
+        *p_properties.offset(i as isize) = props;
+    }
+    *p_property_count = to_copy;
+    if to_copy < n { 5 /* VK_INCOMPLETE */ } else { VK_SUCCESS }
+}
+
 /// `vkEnumerateInstanceLayerProperties` — returns ICD-side instance
 /// layers. ICDs typically expose zero (layers come from external
 /// dlopen'd libraries known to the loader, not from drivers).
@@ -4760,6 +4818,26 @@ mod tests {
         assert_eq!(names[0], "VK_KHR_surface");
         assert_eq!(names[1], "VK_EXT_atrium_surface");
         assert_eq!(names[2], "VK_EXT_debug_utils");
+    }
+
+    #[test]
+    fn enumerate_device_extensions_lists_swapchain() {
+        let f = lookup(b"vkEnumerateDeviceExtensionProperties\0").unwrap();
+        let typed: unsafe extern "C" fn(VkPhysicalDevice, *const c_char, *mut u32, *mut VkExtensionProperties) -> VkResult =
+            unsafe { std::mem::transmute(f) };
+        let mut count: u32 = 99;
+        let r = unsafe { typed(std::ptr::null_mut(), std::ptr::null(), &mut count, std::ptr::null_mut()) };
+        assert_eq!(r, VK_SUCCESS);
+        assert_eq!(count, 1);
+
+        let mut props: [VkExtensionProperties; 2] = unsafe { std::mem::zeroed() };
+        let mut cap: u32 = 2;
+        let _ = unsafe { typed(std::ptr::null_mut(), std::ptr::null(), &mut cap, props.as_mut_ptr()) };
+        assert_eq!(cap, 1);
+        let name: Vec<u8> = props[0].extensionName.iter()
+            .take_while(|&&c| c != 0).map(|&c| c as u8).collect();
+        assert_eq!(std::str::from_utf8(&name).unwrap(), "VK_KHR_swapchain");
+        assert_eq!(props[0].specVersion, 70);
     }
 
     #[test]
