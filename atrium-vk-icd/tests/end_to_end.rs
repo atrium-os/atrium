@@ -460,6 +460,93 @@ fn cmdbuf_records_frame_ops_through_vkcmd_apis() {
 }
 
 #[test]
+fn submit_flushes_recorded_frame_to_aqueduct_backend() {
+    use atrium_vk_icd::{
+        vkAllocateCommandBuffers, vkBeginCommandBuffer, vkCmdDraw,
+        vkCmdSetViewport, vkCreateCommandPool, vkCreateDevice,
+        vkDestroyCommandPool, vkDestroyDevice, vkEndCommandBuffer,
+        vkGetDeviceQueue, vkQueueSubmit,
+    };
+
+    let sock = tmp_socket("submit");
+    let sw_backend = Arc::new(SoftwareBackend::new());
+    let backend_for_listener: Arc<dyn Backend> = sw_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap();
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+
+    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+
+    type VkDevice = *mut std::ffi::c_void;
+    type VkQueue  = *mut std::ffi::c_void;
+    type VkCommandBuffer = *mut std::ffi::c_void;
+
+    let mut instance: VkInstance = std::ptr::null_mut();
+    unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
+    let mut devices: [VkPhysicalDevice; 1] = [std::ptr::null_mut(); 1];
+    let mut cap: u32 = 1;
+    unsafe { vkEnumeratePhysicalDevices(instance, &mut cap, devices.as_mut_ptr()); }
+    let mut device: VkDevice = std::ptr::null_mut();
+    unsafe { vkCreateDevice(devices[0], std::ptr::null(), std::ptr::null(), &mut device); }
+    let mut queue: VkQueue = std::ptr::null_mut();
+    unsafe { vkGetDeviceQueue(device, 0, 0, &mut queue); }
+    let mut pool: u64 = 0;
+    unsafe { vkCreateCommandPool(device, std::ptr::null(), std::ptr::null(), &mut pool); }
+
+    let mut info = [0u8; 40];
+    info[0..4].copy_from_slice(&40u32.to_le_bytes());
+    info[16..24].copy_from_slice(&pool.to_le_bytes());
+    info[28..32].copy_from_slice(&1u32.to_le_bytes());
+    let mut cbs: [VkCommandBuffer; 1] = [std::ptr::null_mut(); 1];
+    unsafe { vkAllocateCommandBuffers(device, info.as_ptr() as *const _, cbs.as_mut_ptr()); }
+    let cb = cbs[0];
+
+    // Record a non-empty frame.
+    unsafe { vkBeginCommandBuffer(cb, std::ptr::null()); }
+    let vp = ash::vk::Viewport {
+        x: 0.0, y: 0.0, width: 1.0, height: 1.0,
+        min_depth: 0.0, max_depth: 1.0,
+    };
+    unsafe { vkCmdSetViewport(cb, 0, 1, &vp); }
+    unsafe { vkCmdDraw(cb, 3, 1, 0, 0); }
+    unsafe { vkEndCommandBuffer(cb); }
+
+    // Build a VkSubmitInfo (size 72) referencing the cmdbuf.
+    let pre_count = sw_backend.submission_count();
+    let mut submit_info = [0u8; 72];
+    submit_info[0..4].copy_from_slice(&4u32.to_le_bytes()); // sType
+    submit_info[40..44].copy_from_slice(&1u32.to_le_bytes()); // cb count
+    let cb_array = [cb];
+    let cb_ptr = cb_array.as_ptr();
+    submit_info[48..56].copy_from_slice(&(cb_ptr as u64).to_le_bytes());
+
+    let r = unsafe {
+        vkQueueSubmit(queue, 1, submit_info.as_ptr() as *const _, std::ptr::null_mut())
+    };
+    assert_eq!(r, 0);
+
+    // Give the SoftwareBackend a moment to process the SubmitFrame
+    // op through its session thread.
+    thread::sleep(Duration::from_millis(100));
+    let post_count = sw_backend.submission_count();
+    assert!(post_count > pre_count,
+        "backend should have observed the submit (pre={pre_count} post={post_count})");
+
+    // After submit, the cmdbuf's recording buffer should be empty
+    // (we swapped it out in vkQueueSubmit's drain).
+    let leftover = atrium_vk_icd::cmdbuf_recorded_bytes(cb);
+    assert_eq!(leftover.len(), 0,
+        "cmdbuf frame must be reset after submit, got {} bytes", leftover.len());
+
+    unsafe { vkDestroyCommandPool(device, pool, std::ptr::null()); }
+    unsafe { vkDestroyDevice(device, std::ptr::null()); }
+    unsafe { vkDestroyInstance(instance, std::ptr::null()); }
+    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[test]
 fn proc_addr_resolves_three_entry_points() {
     // No live daemon required for the get_proc_addr lookups.
     fn lookup(name: &[u8]) -> Option<unsafe extern "C" fn()> {

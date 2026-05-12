@@ -105,10 +105,12 @@ struct AtriumInstance {
     /// First field — see `VK_ICD_LOADER_MAGIC`. The loader writes
     /// over this slot on first dispatch.
     loader_dispatch_slot: usize,
-    /// The aqueduct-gpu client connection this instance owns.
-    /// `None` if connect/handshake failed at create time — the
-    /// instance is still valid, just exposes zero physical devices.
-    client: Option<aqueduct_gpu_client::GpuClient>,
+    /// The aqueduct-gpu client connection this instance owns,
+    /// wrapped in a Mutex for interior mutability — `submit_frame`
+    /// takes `&mut self` on the client, but vkQueueSubmit only
+    /// sees a `*const AtriumInstance` via back-pointer chain.
+    /// `None` if connect/handshake failed at create time.
+    client: Option<std::sync::Mutex<aqueduct_gpu_client::GpuClient>>,
     /// Physical devices discovered via the handshake. Each is a
     /// boxed pointer the loader sees as a `VkPhysicalDevice` handle.
     /// Owned: vkDestroyInstance walks this list and frees each.
@@ -126,6 +128,11 @@ struct AtriumPhysicalDevice {
     /// driver name) and to key the shader cache.
     backend_vendor:     aqueduct_gpu::backends::GpuVendor,
     backend_generation: u16,
+    /// Back-pointer to the owning AtriumInstance. Borrowed (the
+    /// physical device's lifetime is bounded by the instance, which
+    /// frees it in vkDestroyInstance). Lets vkCreateDevice + the
+    /// queue chain reach the aqueduct-gpu client.
+    instance: *mut AtriumInstance,
 }
 
 /// Vulkan handle types for device-level objects.
@@ -203,6 +210,19 @@ struct AtriumDevice {
     /// the loader sees as a `VkQueue` handle; freed in
     /// `vkDestroyDevice`.
     queues: Vec<*mut AtriumQueue>,
+    /// Back-pointer to the AtriumInstance that owns the
+    /// aqueduct-gpu client this device's submits flow through.
+    /// Borrowed (instance outlives device by spec — vkDestroyDevice
+    /// MUST run before vkDestroyInstance).
+    instance: *mut AtriumInstance,
+    /// Persistent fence allocated at vkCreateDevice via
+    /// `GpuClient::create_fence`. Reused across submits via the
+    /// monotonic timeline counter; saves a round-trip per
+    /// vkQueueSubmit. ResourceId(0) when the instance had no live
+    /// client (offline / handshake failed).
+    fence: aqueduct_gpu::ids::ResourceId,
+    /// Monotonic timeline value; incremented per submit.
+    timeline: std::cell::Cell<u64>,
 }
 
 /// ICD-side state behind a `VkQueue`. Same dispatchable-handle
@@ -600,19 +620,39 @@ pub unsafe extern "C" fn vkGetPhysicalDeviceFormatProperties(
 /// vkEnumeratePhysicalDevices. `p_device` must be a writable slot.
 #[no_mangle]
 pub unsafe extern "C" fn vkCreateDevice(
-    _physical_device: VkPhysicalDevice,
+    physical_device:  VkPhysicalDevice,
     _p_create_info:   *const c_void, /* const VkDeviceCreateInfo* */
     _p_allocator:     *const c_void, /* const VkAllocationCallbacks* */
     p_device:         *mut VkDevice,
 ) -> VkResult {
-    if p_device.is_null() {
+    if p_device.is_null() || physical_device.is_null() {
         return VK_ERROR_INITIALIZATION_FAILED;
     }
-    // Allocate the device first (we need its address for the queue
-    // back-pointer), then build a single queue and link it in.
+    let pd = &*(physical_device as *const AtriumPhysicalDevice);
+    let inst_ptr = pd.instance;
+
+    // Allocate a persistent fence on the instance's client. If the
+    // instance has no live client (offline / handshake failed), we
+    // still create the device but its fence is ResourceId(0) and
+    // submits no-op silently.
+    let fence = if !inst_ptr.is_null() {
+        let inst = &*inst_ptr;
+        match inst.client.as_ref().and_then(|m| {
+            m.lock().ok().and_then(|mut c| c.create_fence().ok())
+        }) {
+            Some(f) => f,
+            None    => aqueduct_gpu::ids::ResourceId(0),
+        }
+    } else {
+        aqueduct_gpu::ids::ResourceId(0)
+    };
+
     let mut dev = Box::new(AtriumDevice {
         loader_dispatch_slot: VK_ICD_LOADER_MAGIC,
-        queues: Vec::with_capacity(1),
+        queues:   Vec::with_capacity(1),
+        instance: inst_ptr,
+        fence,
+        timeline: std::cell::Cell::new(0),
     });
     let dev_ptr: *mut AtriumDevice = &mut *dev;
     let q = Box::new(AtriumQueue {
@@ -958,24 +998,84 @@ pub unsafe extern "C" fn vkResetCommandBuffer(
     VK_SUCCESS
 }
 
-/// `vkQueueSubmit` — flush recorded FrameOps from each submitted
-/// command buffer to the aqueduct-gpu host endpoint via the
-/// owning AtriumInstance's GpuClient.
+/// `vkQueueSubmit` — flush each submitted cmdbuf's FrameOp stream
+/// to the aqueduct-gpu host endpoint via the owning AtriumInstance's
+/// GpuClient.
 ///
-/// Today this is a no-op success: vkCmd* recording isn't wired yet,
-/// so every cmdbuf's FrameOp stream is empty. The signature + state
-/// transitions are in place so the Phase 1.3b+ vkCmd* chunk just
-/// has to push into `_frame`.
+/// Walks: queue → device → instance.client. Each `VkSubmitInfo`'s
+/// `pCommandBuffers` array is read by offset; each cmdbuf's
+/// `frame` is swapped out (left empty so the cmdbuf stays usable
+/// after submit per Vk spec's "pending" → "invalid" semantics) and
+/// the byte stream handed to `submit_frame`.
+///
+/// `VkSubmitInfo` layout (size 72, no pNext set):
+///   0   sType : u32
+///   4   _pad
+///   8   pNext : ptr
+///   16  waitSemaphoreCount : u32
+///   20  _pad
+///   24  pWaitSemaphores : ptr
+///   32  pWaitDstStageMask : ptr
+///   40  commandBufferCount : u32
+///   44  _pad
+///   48  pCommandBuffers : ptr
+///   56  signalSemaphoreCount : u32
+///   60  _pad
+///   64  pSignalSemaphores : ptr
+///
+/// Submit failures (client error, fence ResourceId(0) meaning no
+/// live client) silently no-op; vkQueueSubmit returns success
+/// regardless. Wait-semaphores + signal-semaphores are ignored —
+/// the timeline counter ordering handles serialization, and
+/// VkFence (the last arg) is also ignored for now.
 #[no_mangle]
 pub unsafe extern "C" fn vkQueueSubmit(
-    _queue:         VkQueue,
-    _submit_count:  u32,
-    _p_submits:     *const c_void, /* const VkSubmitInfo* */
-    _fence:         *mut c_void,   /* VkFence */
+    queue:         VkQueue,
+    submit_count:  u32,
+    p_submits:     *const c_void, /* const VkSubmitInfo* */
+    _fence:        *mut c_void,   /* VkFence */
 ) -> VkResult {
-    // TODO Phase 1.3b+: walk *p_submits, for each VkSubmitInfo's
-    // commandBuffers, transmute back to AtriumCommandBuffer, hand
-    // the FrameBuilder.into_buf() to GpuClient::submit_frame.
+    if queue.is_null() { return VK_ERROR_INITIALIZATION_FAILED; }
+    let q = &*(queue as *const AtriumQueue);
+    if q._device.is_null() { return VK_SUCCESS; }
+    let dev = &*(q._device as *const AtriumDevice);
+    if dev.instance.is_null() { return VK_SUCCESS; }
+    let inst = &*(dev.instance as *const AtriumInstance);
+
+    let Some(client_mu) = inst.client.as_ref() else { return VK_SUCCESS; };
+    if dev.fence == aqueduct_gpu::ids::ResourceId(0) { return VK_SUCCESS; }
+
+    if p_submits.is_null() || submit_count == 0 { return VK_SUCCESS; }
+
+    // Walk each VkSubmitInfo. Stride is 72 bytes.
+    let submits_base = p_submits as *const u8;
+    for s in 0..submit_count {
+        let info = submits_base.add(72 * s as usize);
+        let cb_count    = std::ptr::read_unaligned(info.add(40) as *const u32);
+        let cb_array_pp = std::ptr::read_unaligned(info.add(48) as *const *const VkCommandBuffer);
+        if cb_count == 0 || cb_array_pp.is_null() { continue; }
+
+        for c in 0..cb_count {
+            let cb_handle = *cb_array_pp.offset(c as isize);
+            if cb_handle.is_null() { continue; }
+            let cb = &mut *(cb_handle as *mut AtriumCommandBuffer);
+            // Snapshot the FrameOp stream and reset the cmdbuf's
+            // builder to an empty one so the cmdbuf stays reusable
+            // (per Vk spec, post-submit a cmdbuf re-enters
+            // Executable; vkBegin will reset it for the next
+            // recording).
+            let snapshot = std::mem::replace(
+                &mut cb.frame,
+                aqueduct_gpu::frame::FrameBuilder::new(ATRIUM_CMDBUF_INITIAL_CAPACITY),
+            );
+            if snapshot.is_empty() { continue; }
+
+            let Ok(mut c) = client_mu.lock() else { continue; };
+            dev.timeline.set(dev.timeline.get() + 1);
+            let timeline = dev.timeline.get();
+            let _ = c.submit_frame(dev.fence, snapshot, timeline);
+        }
+    }
     VK_SUCCESS
 }
 
@@ -1034,29 +1134,32 @@ pub unsafe extern "C" fn vkCreateInstance(
 
     // Best-effort aqueduct-gpu connection. Failure (no socket,
     // daemon not running) is non-fatal: the instance is still
-    // valid, just exposes zero physical devices. A Vulkan app
-    // then sees "Atrium ICD present, 0 GPUs available" — the
-    // same surface as if a real GPU were missing.
-    let (client, devices) = match try_connect_aqueduct() {
-        Some((client, backend)) => {
-            // One backend → one VkPhysicalDevice today. When the
-            // kmod gains multi-backend enumeration (D5+), this
-            // grows into a loop over IOC_GPU_LIST_BACKENDS.
-            let pd = Box::new(AtriumPhysicalDevice {
-                loader_dispatch_slot: VK_ICD_LOADER_MAGIC,
-                backend_vendor:     backend.vendor,
-                backend_generation: backend.generation,
-            });
-            (Some(client), vec![Box::into_raw(pd)])
-        }
-        None => (None, Vec::new()),
-    };
-
-    let inst = Box::new(AtriumInstance {
+    // valid, just exposes zero physical devices.
+    //
+    // Allocate the instance first (chicken-and-egg: AtriumPhysicalDevice
+    // carries an *mut AtriumInstance back-pointer, so we need the
+    // instance's heap address before constructing its devices).
+    let mut inst = Box::new(AtriumInstance {
         loader_dispatch_slot: VK_ICD_LOADER_MAGIC,
-        client,
-        devices,
+        client:  None,
+        devices: Vec::new(),
     });
+    let inst_ptr: *mut AtriumInstance = &mut *inst;
+
+    if let Some((client, backend)) = try_connect_aqueduct() {
+        // One backend → one VkPhysicalDevice today. When the
+        // kmod gains multi-backend enumeration (D5+), this grows
+        // into a loop over IOC_GPU_LIST_BACKENDS.
+        let pd = Box::new(AtriumPhysicalDevice {
+            loader_dispatch_slot: VK_ICD_LOADER_MAGIC,
+            backend_vendor:     backend.vendor,
+            backend_generation: backend.generation,
+            instance:           inst_ptr,
+        });
+        inst.client = Some(std::sync::Mutex::new(client));
+        inst.devices.push(Box::into_raw(pd));
+    }
+
     *p_instance = Box::into_raw(inst) as VkInstance;
     VK_SUCCESS
 }
