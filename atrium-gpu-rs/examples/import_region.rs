@@ -14,6 +14,15 @@
 //! Resolves the token via `IOC_GPU_IMPORT_REGION`, mmaps the BO, and
 //! verifies the payload bytes. Exits 0 if they match, 1 otherwise.
 //!
+//! Mode 3 (import-park):
+//!   atrium-gpu-rs import_region import-park <hex-token>
+//!
+//! Like `import`, but parks after verifying — keeps the importer's
+//! ref on the BO alive. Used to test the refcount-survives-minter
+//! property: kill the minter, then verify a fresh `import` still
+//! succeeds because the importer-park process is still holding a
+//! ref.
+//!
 //! This is the canonical Atrium cross-process memory-sharing pattern:
 //! a host endpoint mints, a jailed client imports, neither side has
 //! to share an address space.
@@ -48,7 +57,8 @@ fn main() -> std::io::Result<()> {
             std::thread::park();
             Ok(())
         }
-        "import" => {
+        "import" | "import-park" => {
+            let park = mode == "import-park";
             let hex = std::env::args().nth(2)
                 .expect("usage: import_region import <hex-token>");
             if hex.len() != 2 * abi::ATRIUM_GPU_TOKEN_LEN {
@@ -67,6 +77,11 @@ fn main() -> std::io::Result<()> {
             payload(&mut expected);
             if actual == expected.as_slice() {
                 println!("import OK: {} bytes match", actual.len());
+                std::io::stdout().flush()?;
+                if park {
+                    eprintln!("importer: holding ref; press Ctrl-C or kill to exit");
+                    std::thread::park();
+                }
                 Ok(())
             } else {
                 eprintln!("import MISMATCH at offset {}",
@@ -76,7 +91,7 @@ fn main() -> std::io::Result<()> {
             }
         }
         _ => {
-            eprintln!("usage: import_region mint | import <hex-token>");
+            eprintln!("usage: import_region mint | import <hex-token> | import-park <hex-token>");
             std::process::exit(2);
         }
     }
