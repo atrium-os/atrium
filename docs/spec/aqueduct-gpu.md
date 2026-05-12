@@ -1064,10 +1064,45 @@ walks the queue → device → instance → `Mutex<GpuClient>`
 back-pointer chain and calls `submit_frame` against a per-device
 persistent fence + monotonic timeline.
 
-Remaining: WSI (`VK_KHR_surface` / `VK_KHR_swapchain`), compute
-pipelines, the long tail of optional `vkCmd*`. A live Vulkan
-triangle binary against this ICD + frescod-aqueduct is the next
-empirical test.
+Remaining: WSI (`VK_KHR_surface` / `VK_KHR_swapchain`), tier-2
+(llvmpipe) shader execution on the host side, the live Vulkan
+triangle binary that exercises end-to-end rendering.
+
+#### 7.1.1. WSI design sketch (forward-looking)
+
+For windowed apps the natural mapping is:
+
+- `VK_KHR_surface` → a Fresco surface handle. The platform-specific
+  surface-creation extensions (`VK_EXT_atrium_surface`, named to
+  match `VK_MVK_macos_surface`-style convention; canonical creator
+  takes a Fresco window-id) construct a `VkSurfaceKHR` that wraps
+  a Fresco surface allocated through the fresco-protocol
+  `WindowCreate` op. The Khronos loader's xcb/wayland/macos
+  surface extensions are not implemented — Atrium apps live
+  inside the Atrium WM.
+
+- `vkGetPhysicalDeviceSurface{Capabilities,Formats,PresentModes}KHR`
+  → static-table answers. Atrium guarantees a single image
+  format (R8G8B8A8_UNORM, matching the renderer's tier-1
+  scanout BGRA-swap), FIFO present mode only, surface caps
+  matching the Fresco window's content size.
+
+- `VK_KHR_swapchain` → a ring of N `VkImage`s (typical N=3 for
+  triple-buffer) that the ICD allocates as plain
+  `IdNamespace::IcdRuntime` images. `vkAcquireNextImageKHR` is
+  a free-list pull (no real present-engine wait — Atrium's
+  vblank pacing is server-side per `aqueduct-gpu.md §6.5.5`).
+  `vkQueuePresentKHR` issues an aqueduct-gpu `OP_GPU_PRESENT`
+  (new) carrying the surface-id + image-id; the host endpoint
+  (frescod-aqueduct) routes the image to the surface's
+  per-window offscreen via the per-window `WindowSurface`
+  (per `aqueduct-gpu.md §6.5.6` level 2).
+
+Implementation cost estimate: ~600 LOC in atrium-vk-icd (six
+new entry points + the AtriumSurface/AtriumSwapchain structs),
+~100 LOC in frescod-aqueduct (surface→image routing in
+`render_one_frame_multipass`), one new `OP_GPU_PRESENT` opcode in
+aqueduct-gpu.
 
 Key API translations:
 
