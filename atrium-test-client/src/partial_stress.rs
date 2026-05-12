@@ -16,9 +16,11 @@
 //! first full frame.
 //!
 //! Usage:
-//!   atrium-partial-stress [SOCK]
+//!   atrium-partial-stress [SOCK] [DURATION_SECS]
 //!
-//! Defaults: /tmp/frescod.sock.
+//! Defaults: /tmp/frescod.sock, run forever (Ctrl-C to exit).
+//! Pass a positive DURATION_SECS to self-exit after that many seconds —
+//! convenient for scripted timing runs without an external pkill race.
 
 use fresco_client::Connection;
 use fresco_protocol::{RectParams, WindowHints};
@@ -33,9 +35,13 @@ const CURSOR: f32 = 32.0;
 fn main() -> std::io::Result<()> {
     let mut args = std::env::args().skip(1);
     let sock = args.next().unwrap_or_else(|| "/tmp/frescod.sock".to_string());
+    let duration_secs: Option<u64> = args.next().and_then(|s| s.parse().ok());
 
     let mut conn = Connection::connect(&sock)?;
     eprintln!("connected to {sock}");
+    if let Some(d) = duration_secs {
+        eprintln!("self-exiting after {d}s");
+    }
 
     let win = conn.window_create(
         WIN_W, WIN_H, "partial-stress", WindowHints::default(),
@@ -49,7 +55,14 @@ fn main() -> std::io::Result<()> {
     let mut frame: u64 = 0;
 
     loop {
-        let t = started.elapsed().as_secs_f32();
+        let elapsed = started.elapsed();
+        if let Some(d) = duration_secs {
+            if elapsed.as_secs() >= d {
+                eprintln!("duration reached; exiting after {frame} frames");
+                return Ok(());
+            }
+        }
+        let t = elapsed.as_secs_f32();
         conn.scene_frame_begin()?;
 
         // Four static corner rects (large, never change). Nodes 1..4.
