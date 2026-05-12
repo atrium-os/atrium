@@ -546,6 +546,16 @@ const ATRIUM_INSTANCE_ONLY_ENTRY_POINTS: &[&str] = &[
     "vkGetPhysicalDeviceFeatures",
     "vkGetPhysicalDeviceMemoryProperties",
     "vkGetPhysicalDeviceFormatProperties",
+    "vkGetPhysicalDeviceProperties2",
+    "vkGetPhysicalDeviceProperties2KHR",
+    "vkGetPhysicalDeviceFeatures2",
+    "vkGetPhysicalDeviceFeatures2KHR",
+    "vkGetPhysicalDeviceMemoryProperties2",
+    "vkGetPhysicalDeviceMemoryProperties2KHR",
+    "vkGetPhysicalDeviceFormatProperties2",
+    "vkGetPhysicalDeviceFormatProperties2KHR",
+    "vkGetPhysicalDeviceQueueFamilyProperties2",
+    "vkGetPhysicalDeviceQueueFamilyProperties2KHR",
     "vkCreateDevice",
     "vkDestroySurfaceKHR",
     "vkCreateAtriumSurfaceEXT",
@@ -652,6 +662,33 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkDevice, *const c_char) -> PFN_vkVoidFunction, FnVoidPtr,
             >(vkGetDeviceProcAddr)),
+        // Vulkan 1.1 pNext-chain variants — apps targeting >=1.1
+        // call these instead of the 1.0 counterparts.
+        "vkGetPhysicalDeviceProperties2" |
+        "vkGetPhysicalDeviceProperties2KHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkPhysicalDevice, *mut c_void), FnVoidPtr,
+            >(vkGetPhysicalDeviceProperties2)),
+        "vkGetPhysicalDeviceFeatures2" |
+        "vkGetPhysicalDeviceFeatures2KHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkPhysicalDevice, *mut c_void), FnVoidPtr,
+            >(vkGetPhysicalDeviceFeatures2)),
+        "vkGetPhysicalDeviceMemoryProperties2" |
+        "vkGetPhysicalDeviceMemoryProperties2KHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkPhysicalDevice, *mut c_void), FnVoidPtr,
+            >(vkGetPhysicalDeviceMemoryProperties2)),
+        "vkGetPhysicalDeviceFormatProperties2" |
+        "vkGetPhysicalDeviceFormatProperties2KHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkPhysicalDevice, ash::vk::Format, *mut c_void), FnVoidPtr,
+            >(vkGetPhysicalDeviceFormatProperties2)),
+        "vkGetPhysicalDeviceQueueFamilyProperties2" |
+        "vkGetPhysicalDeviceQueueFamilyProperties2KHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkPhysicalDevice, *mut u32, *mut c_void), FnVoidPtr,
+            >(vkGetPhysicalDeviceQueueFamilyProperties2)),
         "vkCreateInstance" =>
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(*const c_void, *const c_void, *mut VkInstance) -> VkResult, FnVoidPtr,
@@ -1451,6 +1488,127 @@ pub unsafe extern "C" fn vkGetPhysicalDeviceFormatProperties(
 ) {
     if p_format_properties.is_null() { return; }
     *p_format_properties = ash::vk::FormatProperties::default();
+}
+
+// ── Vulkan 1.1+ pNext-chain variants ─────────────────────────────
+//
+// atrium-vk-icd advertises apiVersion 1.3, so apps that target
+// ≥1.1 (most modern engines) call these *2 variants instead of
+// their 1.0 counterparts. Each takes a struct with sType + pNext
+// header followed by the same inner block; we fill the inner
+// block from the 1.0 path and walk pNext but don't populate any
+// extension structs today (the loader/app sees the chain as-is).
+//
+// Layout on 64-bit (matches Vulkan's typedef'd structs):
+//   0 : VkStructureType sType  (u32)
+//   4 : 4-byte compiler padding
+//   8 : void* pNext
+//   16: inner-properties block
+
+/// Walk the pNext chain starting at `start_p_next`, logging any
+/// non-null entry whose sType we don't recognise. Today we do
+/// nothing useful with it — extension property structs (e.g.
+/// PhysicalDeviceVulkan11Properties, PhysicalDeviceDriverProperties)
+/// stay zeroed.
+///
+/// Returns the count of links walked, for diagnostic logging.
+unsafe fn walk_p_next_chain(start_p_next: *mut c_void) -> u32 {
+    let mut n: u32 = 0;
+    let mut cur = start_p_next as *mut u8;
+    while !cur.is_null() {
+        let _s_type = std::ptr::read_unaligned(cur as *const u32);
+        let next    = std::ptr::read_unaligned(cur.add(8) as *const *mut c_void);
+        // Note: we don't populate extension structs today; the
+        // caller's zero-init is what the app sees. If we ever add
+        // VK_KHR_driver_properties etc., dispatch on _s_type here.
+        cur = next as *mut u8;
+        n += 1;
+        if n > 64 {
+            // Pathological chain; bail to avoid an infinite loop.
+            break;
+        }
+    }
+    n
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkGetPhysicalDeviceProperties2(
+    physical_device:  VkPhysicalDevice,
+    p_properties:     *mut c_void,
+) {
+    if physical_device.is_null() || p_properties.is_null() { return; }
+    let base = p_properties as *mut u8;
+    let p_next = std::ptr::read_unaligned(base.add(8) as *const *mut c_void);
+    let inner = base.add(16) as *mut ash::vk::PhysicalDeviceProperties;
+    vkGetPhysicalDeviceProperties(physical_device, inner);
+    let _ = walk_p_next_chain(p_next);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkGetPhysicalDeviceFeatures2(
+    physical_device: VkPhysicalDevice,
+    p_features:      *mut c_void,
+) {
+    if physical_device.is_null() || p_features.is_null() { return; }
+    let base = p_features as *mut u8;
+    let p_next = std::ptr::read_unaligned(base.add(8) as *const *mut c_void);
+    let inner = base.add(16) as *mut ash::vk::PhysicalDeviceFeatures;
+    vkGetPhysicalDeviceFeatures(physical_device, inner);
+    let _ = walk_p_next_chain(p_next);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkGetPhysicalDeviceMemoryProperties2(
+    physical_device:    VkPhysicalDevice,
+    p_memory_properties: *mut c_void,
+) {
+    if physical_device.is_null() || p_memory_properties.is_null() { return; }
+    let base = p_memory_properties as *mut u8;
+    let p_next = std::ptr::read_unaligned(base.add(8) as *const *mut c_void);
+    let inner = base.add(16) as *mut ash::vk::PhysicalDeviceMemoryProperties;
+    vkGetPhysicalDeviceMemoryProperties(physical_device, inner);
+    let _ = walk_p_next_chain(p_next);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkGetPhysicalDeviceFormatProperties2(
+    physical_device:     VkPhysicalDevice,
+    format:              ash::vk::Format,
+    p_format_properties: *mut c_void,
+) {
+    if physical_device.is_null() || p_format_properties.is_null() { return; }
+    let base = p_format_properties as *mut u8;
+    let p_next = std::ptr::read_unaligned(base.add(8) as *const *mut c_void);
+    let inner = base.add(16) as *mut ash::vk::FormatProperties;
+    vkGetPhysicalDeviceFormatProperties(physical_device, format, inner);
+    let _ = walk_p_next_chain(p_next);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkGetPhysicalDeviceQueueFamilyProperties2(
+    physical_device:               VkPhysicalDevice,
+    p_queue_family_property_count: *mut u32,
+    p_queue_family_properties:     *mut c_void,
+) {
+    if p_queue_family_property_count.is_null() { return; }
+    if p_queue_family_properties.is_null() {
+        vkGetPhysicalDeviceQueueFamilyProperties(
+            physical_device, p_queue_family_property_count,
+            std::ptr::null_mut(),
+        );
+        return;
+    }
+    let cap = *p_queue_family_property_count;
+    // Each VkQueueFamilyProperties2 = 16-byte header + inner.
+    // We fill one slot.
+    if cap == 0 { return; }
+    let slot = p_queue_family_properties as *mut u8;
+    let p_next = std::ptr::read_unaligned(slot.add(8) as *const *mut c_void);
+    let inner = slot.add(16) as *mut ash::vk::QueueFamilyProperties;
+    let mut one: u32 = 1;
+    vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &mut one, inner);
+    *p_queue_family_property_count = one;
+    let _ = walk_p_next_chain(p_next);
 }
 
 /// `vkCreateDevice` — allocate an `AtriumDevice` with one or more
@@ -5040,6 +5198,58 @@ mod tests {
         assert!(unsafe { gdpa(std::ptr::null_mut(), std::ptr::null()) }.is_none());
         assert!(unsafe { gdpa(std::ptr::null_mut(),
             b"vkNonexistentEntryPoint\0".as_ptr() as *const c_char) }.is_none());
+    }
+
+    #[test]
+    fn physical_device_properties2_fills_inner_struct_via_offset() {
+        // Build a fake AtriumPhysicalDevice we can pass through.
+        let pd = AtriumPhysicalDevice {
+            loader_dispatch_slot: VK_ICD_LOADER_MAGIC,
+            backend_vendor: aqueduct_gpu::backends::GpuVendor::Software,
+            backend_generation: 0,
+            instance: std::ptr::null_mut(),
+        };
+        let phys: VkPhysicalDevice = &pd as *const _ as *mut _;
+
+        // VkPhysicalDeviceProperties2: sType+pad+pNext = 16 B
+        // header, then VkPhysicalDeviceProperties.
+        let header_size = 16usize;
+        let inner_size  = std::mem::size_of::<ash::vk::PhysicalDeviceProperties>();
+        let total = header_size + inner_size;
+        let mut buf: Vec<u8> = vec![0u8; total];
+        // sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 (1000059001)
+        let s_type: u32 = 1_000_059_001;
+        unsafe {
+            std::ptr::write_unaligned(buf.as_mut_ptr() as *mut u32, s_type);
+        }
+        // pNext = null
+        unsafe {
+            std::ptr::write_unaligned(
+                buf.as_mut_ptr().add(8) as *mut *mut c_void, std::ptr::null_mut(),
+            );
+        }
+
+        let f = lookup(b"vkGetPhysicalDeviceProperties2\0").unwrap();
+        let g2: unsafe extern "C" fn(VkPhysicalDevice, *mut c_void) =
+            unsafe { std::mem::transmute(f) };
+        unsafe { g2(phys, buf.as_mut_ptr() as *mut c_void); }
+
+        // Read back inner.api_version — should match
+        // ATRIUM_ICD_API_VERSION.
+        let api_ver = unsafe {
+            std::ptr::read_unaligned(buf.as_ptr().add(header_size) as *const u32)
+        };
+        assert_eq!(api_ver, ATRIUM_ICD_API_VERSION,
+            "Properties2 must fill inner.api_version like Properties does");
+
+        // KHR alias must resolve too.
+        assert!(lookup(b"vkGetPhysicalDeviceProperties2KHR\0").is_some());
+
+        // All four other *2 entry points resolve.
+        assert!(lookup(b"vkGetPhysicalDeviceFeatures2\0").is_some());
+        assert!(lookup(b"vkGetPhysicalDeviceMemoryProperties2\0").is_some());
+        assert!(lookup(b"vkGetPhysicalDeviceFormatProperties2\0").is_some());
+        assert!(lookup(b"vkGetPhysicalDeviceQueueFamilyProperties2\0").is_some());
     }
 
     #[test]
