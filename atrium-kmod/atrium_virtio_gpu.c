@@ -204,6 +204,36 @@ struct atrium_gpu_softc {
 	uint32_t                       scanout_width [ATRIUM_GPU_MAX_SCANOUTS];
 	uint32_t                       scanout_height[ATRIUM_GPU_MAX_SCANOUTS];
 
+	/* Vblank state per connector.
+	 *
+	 * `vblank_co[i]`        callout firing at refresh-interval; the
+	 *                       callback increments `vblank_seq[i]` and
+	 *                       cv_broadcasts `vblank_cv[i]`.
+	 * `vblank_seq[i]`       monotonic counter, post-tick.
+	 * `vblank_cv[i]`        condvar waited on by IOC_WAIT_VBLANK.
+	 * `vblank_period_ticks` per-connector callout period (hz / refresh_hz).
+	 * `vblank_active[i]`    is the callout currently scheduled?
+	 *
+	 * Vblank is emulated today (virtio-gpu has no native vblank
+	 * source; the host display backend polls asynchronously). On
+	 * D5+ native HW the callout source is replaced by a GPU IRQ;
+	 * the userspace ABI does not change.
+	 */
+	struct callout                 vblank_co [ATRIUM_GPU_MAX_SCANOUTS];
+	uint64_t                       vblank_seq[ATRIUM_GPU_MAX_SCANOUTS];
+	struct cv                      vblank_cv [ATRIUM_GPU_MAX_SCANOUTS];
+	struct mtx                     vblank_mtx; /* guards seq + co_active */
+	int                            vblank_period_ticks[ATRIUM_GPU_MAX_SCANOUTS];
+	bool                           vblank_active[ATRIUM_GPU_MAX_SCANOUTS];
+	/* Per-connector callout cookie: { softc*, connector_id }. The
+	 * cookie's address is the callout's `arg`; we can't pack the
+	 * softc pointer + conn into a single void* on 64-bit kernels
+	 * (kernel pointers occupy the high bits). */
+	struct atrium_vblank_cookie {
+		struct atrium_gpu_softc *sc;
+		uint32_t                 conn;
+	}                              vblank_cookie[ATRIUM_GPU_MAX_SCANOUTS];
+
 	/* Cdevs. */
 	struct cdev                   *gpu_cdev;
 	struct cdev                   *display_cdev;
@@ -1332,6 +1362,95 @@ atrium_display_modes(struct atrium_gpu_softc *sc,
 	return (0);
 }
 
+/* Vblank tick callback. Runs at the connector's refresh interval.
+ * Increments the per-connector sequence counter and broadcasts the
+ * condvar so any threads in IOC_WAIT_VBLANK wake up. Re-arms itself.
+ *
+ * Today this is the emulated-vblank source on virtio-gpu (no real
+ * panel IRQ available). On D5+ native HW the callout is replaced by
+ * a GPU IRQ handler that calls into the same wakeup core.
+ */
+static void
+atrium_display_vblank_tick(void *arg)
+{
+	struct atrium_vblank_cookie *ck = arg;
+	struct atrium_gpu_softc *sc = ck->sc;
+	uint32_t conn = ck->conn;
+	int period;
+
+	if (conn >= ATRIUM_GPU_MAX_SCANOUTS)
+		return;
+	/* callout was init'd with callout_init_mtx(&vblank_mtx, ...) so
+	 * the mtx is already held here. Don't re-acquire. */
+	mtx_assert(&sc->vblank_mtx, MA_OWNED);
+	sc->vblank_seq[conn]++;
+	period = sc->vblank_period_ticks[conn];
+	cv_broadcast(&sc->vblank_cv[conn]);
+	if (sc->vblank_active[conn]) {
+		callout_reset(&sc->vblank_co[conn], period,
+		    atrium_display_vblank_tick, ck);
+	}
+}
+
+/* Start (or restart) the vblank callout for `conn` at `refresh_hz`.
+ * Called by set_mode after a successful SET_SCANOUT_BLOB. Safe to
+ * call repeatedly — re-arms with the new period.
+ */
+static void
+atrium_display_vblank_start(struct atrium_gpu_softc *sc, uint32_t conn,
+    uint32_t refresh_mhz)
+{
+	int period;
+	uint32_t hz_refresh;
+
+	if (conn >= ATRIUM_GPU_MAX_SCANOUTS)
+		return;
+	/* Convert refresh_mhz (e.g. 60000) → Hz (60) → ticks. hz is the
+	 * kernel's tick rate (1000 typically). */
+	hz_refresh = refresh_mhz / 1000;
+	if (hz_refresh == 0)
+		hz_refresh = 60;
+	period = hz / (int)hz_refresh;
+	if (period < 1)
+		period = 1;
+
+	mtx_lock(&sc->vblank_mtx);
+	sc->vblank_period_ticks[conn] = period;
+	sc->vblank_active[conn] = true;
+	sc->vblank_cookie[conn].sc = sc;
+	sc->vblank_cookie[conn].conn = conn;
+	/* callout_reset on a callout_init_mtx-bound callout requires
+	 * the bound mtx held. Re-arm under lock. */
+	callout_reset(&sc->vblank_co[conn], period,
+	    atrium_display_vblank_tick, &sc->vblank_cookie[conn]);
+	mtx_unlock(&sc->vblank_mtx);
+}
+
+static int
+atrium_display_wait_vblank(struct atrium_gpu_softc *sc,
+    struct atrium_display_wait_vblank *args)
+{
+	uint32_t conn = args->connector_id;
+	uint64_t pre;
+	int err = 0;
+
+	if (conn >= ATRIUM_GPU_MAX_SCANOUTS)
+		return (ENOENT);
+
+	mtx_lock(&sc->vblank_mtx);
+	if (!sc->vblank_active[conn]) {
+		mtx_unlock(&sc->vblank_mtx);
+		return (ENXIO); /* no set_mode yet → no vblank source */
+	}
+	pre = sc->vblank_seq[conn];
+	while (sc->vblank_seq[conn] == pre && err == 0) {
+		err = cv_wait_sig(&sc->vblank_cv[conn], &sc->vblank_mtx);
+	}
+	args->seq = sc->vblank_seq[conn];
+	mtx_unlock(&sc->vblank_mtx);
+	return (err);
+}
+
 static int
 atrium_display_set_mode(struct atrium_gpu_softc *sc,
     struct atrium_display_set_mode *args)
@@ -1377,6 +1496,11 @@ atrium_display_set_mode(struct atrium_gpu_softc *sc,
 		sc->scanout_width [args->connector_id] = w;
 		sc->scanout_height[args->connector_id] = h;
 		mtx_unlock(&sc->bo_lock);
+
+		/* Start (or re-arm) the vblank callout at the connector's
+		 * refresh interval. mode.refresh_mhz is in mHz; convert. */
+		atrium_display_vblank_start(sc, args->connector_id,
+		    args->mode.refresh_mhz);
 	}
 	return (0);
 }
@@ -1483,6 +1607,11 @@ atrium_display_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 			return (EINVAL);
 		return (atrium_display_page_flip(df->sc,
 		    (struct atrium_display_page_flip *)data));
+	case ATRIUM_DISPLAY_IOC_WAIT_VBLANK:
+		if (!df->bound)
+			return (EINVAL);
+		return (atrium_display_wait_vblank(df->sc,
+		    (struct atrium_display_wait_vblank *)data));
 	case ATRIUM_DISPLAY_IOC_CURSOR:
 		return (EOPNOTSUPP);  /* cursorq deferred */
 
@@ -2327,6 +2456,17 @@ atrium_virtio_gpu_attach(device_t dev)
 	cv_init(&sc->ctrl_done_cv, "atrium-gpu ctrl done");
 	sc->ctrl_done = false;
 
+	/* Vblank state — one callout + cv per scanout. The callouts are
+	 * started lazily by set_mode (we don't know the refresh rate
+	 * until then). */
+	mtx_init(&sc->vblank_mtx, "atrium-gpu vblank", NULL, MTX_DEF);
+	for (uint32_t i = 0; i < ATRIUM_GPU_MAX_SCANOUTS; i++) {
+		callout_init_mtx(&sc->vblank_co[i], &sc->vblank_mtx, 0);
+		cv_init(&sc->vblank_cv[i], "atrium-gpu vblank");
+		sc->vblank_seq[i] = 0;
+		sc->vblank_active[i] = false;
+	}
+
 	/* virtio handshake. */
 	virtio_set_feature_desc(dev, atrium_virtio_gpu_feature_desc);
 	sc->features = virtio_negotiate_features(dev, ATRIUM_VIRTIO_GPU_FEATURES);
@@ -2456,6 +2596,18 @@ fail_gpu_cdev:
 	destroy_dev(sc->gpu_cdev);
 fail_lock:
 fail_locks:
+	/* Vblank cleanup: drain any in-flight callouts, then destroy
+	 * the cvs + mtx. Drain is required to avoid the callback firing
+	 * after the softc is gone. */
+	for (uint32_t i = 0; i < ATRIUM_GPU_MAX_SCANOUTS; i++) {
+		mtx_lock(&sc->vblank_mtx);
+		sc->vblank_active[i] = false;
+		mtx_unlock(&sc->vblank_mtx);
+		callout_drain(&sc->vblank_co[i]);
+		cv_destroy(&sc->vblank_cv[i]);
+	}
+	mtx_destroy(&sc->vblank_mtx);
+
 	cv_destroy(&sc->ctrl_done_cv);
 	mtx_destroy(&sc->shm_lock);
 	mtx_destroy(&sc->bo_lock);
@@ -2483,6 +2635,18 @@ atrium_virtio_gpu_detach(device_t dev)
 		free(sc->shm_bitmap, M_ATRIUM_GPU);
 		sc->shm_bitmap = NULL;
 	}
+	/* Vblank cleanup: drain any in-flight callouts, then destroy
+	 * the cvs + mtx. Drain is required to avoid the callback firing
+	 * after the softc is gone. */
+	for (uint32_t i = 0; i < ATRIUM_GPU_MAX_SCANOUTS; i++) {
+		mtx_lock(&sc->vblank_mtx);
+		sc->vblank_active[i] = false;
+		mtx_unlock(&sc->vblank_mtx);
+		callout_drain(&sc->vblank_co[i]);
+		cv_destroy(&sc->vblank_cv[i]);
+	}
+	mtx_destroy(&sc->vblank_mtx);
+
 	cv_destroy(&sc->ctrl_done_cv);
 	mtx_destroy(&sc->shm_lock);
 	mtx_destroy(&sc->bo_lock);

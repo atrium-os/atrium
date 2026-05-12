@@ -284,7 +284,6 @@ fn main() -> std::io::Result<()> {
     let mut window_render_sum = Duration::ZERO;
     let mut window_profile = FrameProfile::default();
 
-    let mut next = Instant::now() + Duration::from_nanos(frame_ns);
     loop {
         let iter_t0 = Instant::now();
         let mut prof = FrameProfile::default();
@@ -368,11 +367,13 @@ fn main() -> std::io::Result<()> {
         }
 
         if !uncapped() {
-            let now = Instant::now();
-            if next > now {
-                std::thread::sleep(next - now);
-            }
-            next += Duration::from_nanos(frame_ns);
+            // Phase-lock to the kmod's vblank tick. The kmod's
+            // wait_vblank ioctl blocks until the next emulated
+            // vblank (callout-driven at the connector's refresh
+            // interval today; will become a real IRQ on D5+).
+            // Replaces wall-clock thread::sleep — see file header
+            // and aqueduct-gpu.md §6.5.5.b.
+            let _ = dpy.wait_vblank(conn.id);
         }
     }
 }

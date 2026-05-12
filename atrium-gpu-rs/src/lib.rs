@@ -279,6 +279,25 @@ impl Display {
         let r = unsafe { ioctl(self.fd, abi::ATRIUM_DISPLAY_IOC_PAGE_FLIP, &mut p) };
         rc(r, ())
     }
+
+    /// Block until the next vblank tick for `connector_id`. Returns
+    /// the kmod's sequence counter after the wait. Callers can
+    /// detect missed vblanks by comparing successive `seq` values
+    /// (a gap > 1 means a frame slot was skipped).
+    ///
+    /// Today's kmod emulates vblank with a `callout` at the
+    /// connector's mode refresh interval (set_mode-time). When D5+
+    /// native drivers land, the source becomes a real GPU IRQ; the
+    /// userspace ABI is unchanged.
+    pub fn wait_vblank(&self, connector_id: u32) -> io::Result<u64> {
+        let mut w = abi::atrium_display_wait_vblank {
+            connector_id,
+            _pad0: 0,
+            seq: 0,
+        };
+        let r = unsafe { ioctl(self.fd, abi::ATRIUM_DISPLAY_IOC_WAIT_VBLANK, &mut w) };
+        rc(r, w.seq)
+    }
 }
 
 impl Drop for Display {

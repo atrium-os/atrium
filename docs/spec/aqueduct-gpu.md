@@ -875,17 +875,36 @@ current scanout BO). Eliminates render-into-live-BO tearing
 structurally. Client-side cost: ~30 lines in
 `frescod/src/bin/frescod_aqueduct.rs`.
 
-#### 6.5.5.b. Vblank events for phase-locked rendering
+#### 6.5.5.b. Vblank events for phase-locked rendering — IMPLEMENTED
 
-Kmod gains an IRQ handler that posts vblank events to subscribers
-(new ioctl `IOC_DISPLAY_SUBSCRIBE_VBLANK` returning an event fd).
-`atrium-gpu-rs` wraps the fd as a `kqueue`-able source per the
-project's kqueue posture (`feedback_kqueue_native.md`).
+`IOC_DISPLAY_WAIT_VBLANK` ioctl: blocking wait for the next vblank
+tick on a connector. Returns post-wait sequence counter so callers
+can detect missed vblanks (`seq[N] - seq[N-1] > 1`).
 
-frescod-aqueduct's frame loop becomes event-driven: kqueue waits
-on `(vblank_fd, socket_server_reader, input_reader)`. On vblank:
-check per-window dirty, render dirty windows, page_flip. Real
-vsync, no wall-clock drift, no wasted frames.
+Source today (virtio-gpu has no native vblank IRQ): kmod
+`callout(9)` armed at the connector's mode refresh interval (e.g.
+`hz=1000 / 60Hz = 16 ticks`); the callback increments the sequence
+and `cv_broadcast`s the condvar. `atrium-gpu-rs` wraps it as
+`Display::wait_vblank(connector_id)`.
+
+frescod-aqueduct's frame loop now calls `dpy.wait_vblank` once per
+iteration in place of the prior `thread::sleep` pacer — render
+loop is phase-locked to the kmod's vblank cadence (no wall-clock
+drift). Measured on FreeBSD 16.0-CURRENT aarch64: ~70 iter/s
+matching the emulated tick, 30 flips/s on a 30 fps animation
+source, ~58% skipped.
+
+When D5+ native HW lands, the callout source is replaced by a real
+GPU IRQ handler that calls into the same wakeup core. Userspace
+ABI is unchanged.
+
+**Future extension** (deferred): kqueue-friendly variant. The
+current blocking ioctl is single-threaded; a separate
+`IOC_DISPLAY_SUBSCRIBE_VBLANK` returning an event fd would let
+frescod's loop wait on `(vblank, sock, input)` simultaneously
+instead of running input/socket handlers on separate threads that
+update shared state. Useful for sub-vblank input responsiveness
+but not blocking the current architecture.
 
 #### 6.5.5.c. Queued (vsync-aligned) page-flip semantics
 

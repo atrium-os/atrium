@@ -165,6 +165,35 @@ pub struct atrium_display_page_flip {
     pub _pad0: u32,
 }
 
+/// `IOC_DISPLAY_WAIT_VBLANK` — block until the next vblank tick for
+/// `connector_id`, then return the post-wait sequence counter.
+///
+/// Today the kmod emulates vblank with a `callout(9)` firing at the
+/// connector's mode refresh interval (see `atrium-virtio-gpu.c` /
+/// `atrium_display_vblank_tick`). On D5+ native hardware the
+/// callout source is replaced by a real GPU IRQ; the userspace ABI
+/// does not change.
+///
+/// Caller pattern (frescod-style):
+///
+/// ```rust
+/// loop {
+///     dpy.wait_vblank(connector_id)?;
+///     // render + page_flip ...
+/// }
+/// ```
+///
+/// `seq` is post-wait so callers can detect dropped vblanks across
+/// long render runs: `seq[N] - seq[N-1] > 1` ⇒ missed vblanks.
+#[repr(C)]
+#[derive(Default, Copy, Clone)]
+pub struct atrium_display_wait_vblank {
+    pub connector_id: u32,
+    pub _pad0: u32,
+    /// Out: sequence count after the wait returns.
+    pub seq: u64,
+}
+
 // ioctl numbers — matches `_IO[WR]+('G', n, ...)` and ('D', n, ...) macros
 // from atrium_gpu.h. FreeBSD's _IOC encoding:
 //   bits 28..29: dir (1=void, 2=out, 3=in, 4=inout — see <sys/ioccom.h>)
@@ -199,3 +228,4 @@ pub const ATRIUM_DISPLAY_IOC_ENUM_CONNECTORS: u64 = iowr(D, 1, std::mem::size_of
 pub const ATRIUM_DISPLAY_IOC_MODES:           u64 = iowr(D, 2, std::mem::size_of::<atrium_display_modes_query>()     as u32);
 pub const ATRIUM_DISPLAY_IOC_SET_MODE:        u64 = iow (D, 3, std::mem::size_of::<atrium_display_set_mode>()        as u32);
 pub const ATRIUM_DISPLAY_IOC_PAGE_FLIP:       u64 = iow (D, 4, std::mem::size_of::<atrium_display_page_flip>()       as u32);
+pub const ATRIUM_DISPLAY_IOC_WAIT_VBLANK:     u64 = iowr(D, 5, std::mem::size_of::<atrium_display_wait_vblank>()     as u32);

@@ -427,6 +427,23 @@ struct atrium_display_page_flip {
 
 #define ATRIUM_DISPLAY_IOC_PAGE_FLIP _IOW ('D', 4, struct atrium_display_page_flip)
 
+/* IOC_WAIT_VBLANK — block until next vblank tick on `connector_id`.
+ * Returns post-wait sequence counter in `seq`. Callers can detect
+ * missed vblanks: `seq[N] - seq[N-1] > 1` ⇒ frames were skipped.
+ *
+ * On virtio-gpu (no native vblank IRQ) the kmod emulates ticks via
+ * a `callout(9)` firing at the connector's mode refresh interval.
+ * On D5+ native HW the callout is replaced by a real GPU IRQ; the
+ * ABI is unchanged.
+ */
+struct atrium_display_wait_vblank {
+	uint32_t connector_id;
+	uint32_t _pad0;
+	uint64_t seq;
+};
+
+#define ATRIUM_DISPLAY_IOC_WAIT_VBLANK _IOWR('D', 5, struct atrium_display_wait_vblank)
+
 struct atrium_display_cursor {
 	uint32_t connector_id;
 	uint32_t cursor_handle;
