@@ -39,16 +39,37 @@
 //! atrium-vk-icd's role is to make those apps reach the daemon
 //! correctly; the daemon's job is to route them to the right
 //! tier. Both halves are now proven on the target platform.
+//!
+//! ## WSI present round-trip (2026-05-13)
+//!
+//! The example also drives vkCreateAtriumSurfaceEXT →
+//! vkCreateSwapchainKHR → vkGetSwapchainImagesKHR →
+//! vkBindImageMemory ×2 → vkQueuePresentKHR ×2 against the live
+//! daemon. With `RUST_LOG=debug` the daemon prints:
+//!
+//!   DEBUG aqueduct_gpu_host::session: present image=id(icd-runtime, 0x5) surface=123 frame=2
+//!   DEBUG aqueduct_gpu_host::backend: SoftwareBackend::present image=id(icd-runtime, 0x5) surface=123 frame=2
+//!   DEBUG aqueduct_gpu_host::session: present image=id(icd-runtime, 0x6) surface=123 frame=3
+//!   DEBUG aqueduct_gpu_host::backend: SoftwareBackend::present image=id(icd-runtime, 0x6) surface=123 frame=3
+//!
+//! Surface=123 is the Fresco window-id passed to
+//! vkCreateAtriumSurfaceEXT (VkSurfaceKHR ≡ window-id by
+//! VK_EXT_atrium_surface convention). The two distinct image_ids
+//! (0x5, 0x6) resolve the two ring images. This is the exact
+//! `(image_id, surface_id, frame_id)` tuple a frescod-aqueduct
+//! `set_present_hook` would receive — VM-verified end-to-end.
 
 use atrium_vk_icd::{
     cmdbuf_recorded_bytes, vkAllocateCommandBuffers, vkAllocateMemory,
     vkBeginCommandBuffer, vkBindImageMemory, vkCmdBeginRenderPass,
     vkCmdBindPipeline, vkCmdDraw, vkCmdEndRenderPass, vkCmdSetScissor,
-    vkCmdSetViewport, vkCreateCommandPool, vkCreateDevice, vkCreateFramebuffer,
-    vkCreateGraphicsPipelines, vkCreateImage, vkCreateImageView,
-    vkCreateInstance, vkCreatePipelineLayout, vkCreateRenderPass,
+    vkCmdSetViewport, vkCreateAtriumSurfaceEXT, vkCreateCommandPool,
+    vkCreateDevice, vkCreateFramebuffer, vkCreateGraphicsPipelines,
+    vkCreateImage, vkCreateImageView, vkCreateInstance,
+    vkCreatePipelineLayout, vkCreateRenderPass, vkCreateSwapchainKHR,
     vkEndCommandBuffer, vkEnumeratePhysicalDevices, vkGetDeviceQueue,
-    vkGetImageMemoryRequirements, vkQueueSubmit,
+    vkGetImageMemoryRequirements, vkGetSwapchainImagesKHR, vkQueuePresentKHR,
+    vkQueueSubmit,
 };
 use std::ffi::c_void;
 
@@ -181,5 +202,59 @@ fn main() {
         vkQueueSubmit(queue, 1, submit_info.as_ptr() as *const _, std::ptr::null_mut())
     };
     println!("vkQueueSubmit            → result = {r}");
-    println!("done — host endpoint received the frame.");
+
+    // ── WSI present epilogue ────────────────────────────────────
+    //
+    // Walks the same path frescod-aqueduct's set_present_hook now
+    // catches. We create a Fresco-window-id surface, a 2-deep
+    // swapchain bound to it, bind backing memory to both ring
+    // images, then present each one. On the daemon side this
+    // bumps the SoftwareBackend's present counter twice and (in
+    // a real frescod-aqueduct) would fire the per-window blit
+    // hook installed in 45fc60d.
+    let mut surf_info = [0u8; 24];
+    surf_info[ 0.. 4].copy_from_slice(&1_000_310_000u32.to_le_bytes());
+    surf_info[20..24].copy_from_slice(&123u32.to_le_bytes());
+    let mut surface: u64 = 0;
+    unsafe { vkCreateAtriumSurfaceEXT(instance, surf_info.as_ptr() as *const _, std::ptr::null(), &mut surface); }
+    println!("vkCreateAtriumSurfaceEXT → surface = {surface} (window-id 123)");
+
+    let mut sc_info = [0u8; 104];
+    sc_info[ 0.. 4].copy_from_slice(&1000001000u32.to_le_bytes());
+    sc_info[20..28].copy_from_slice(&surface.to_le_bytes());
+    sc_info[28..32].copy_from_slice(&2u32.to_le_bytes());
+    sc_info[32..36].copy_from_slice(&37u32.to_le_bytes());
+    sc_info[40..44].copy_from_slice(&64u32.to_le_bytes());
+    sc_info[44..48].copy_from_slice(&64u32.to_le_bytes());
+    sc_info[48..52].copy_from_slice(&1u32.to_le_bytes());
+    sc_info[52..56].copy_from_slice(&0x10u32.to_le_bytes());
+    let mut swapchain: u64 = 0;
+    unsafe { vkCreateSwapchainKHR(device, sc_info.as_ptr() as *const _, std::ptr::null(), &mut swapchain); }
+    println!("vkCreateSwapchainKHR     → swapchain = 0x{swapchain:x}");
+
+    let mut ring = [0u64; 2];
+    let mut k: u32 = 2;
+    unsafe { vkGetSwapchainImagesKHR(device, swapchain, &mut k, ring.as_mut_ptr()); }
+    let mut sreq = ash::vk::MemoryRequirements::default();
+    unsafe { vkGetImageMemoryRequirements(device, ring[0], &mut sreq); }
+    let mut salloc = [0u8; 32];
+    salloc[0..4].copy_from_slice(&5u32.to_le_bytes());
+    salloc[16..24].copy_from_slice(&(sreq.size * 2).to_le_bytes());
+    let mut smem: u64 = 0;
+    unsafe { vkAllocateMemory(device, salloc.as_ptr() as *const _, std::ptr::null(), &mut smem); }
+    unsafe { vkBindImageMemory(device, ring[0], smem, 0); }
+    unsafe { vkBindImageMemory(device, ring[1], smem, sreq.size); }
+
+    let sc_arr = [swapchain];
+    let idx_arr = [0u32, 1u32];
+    for i in 0..2 {
+        let mut info = [0u8; 64];
+        info[ 0.. 4].copy_from_slice(&1000001001u32.to_le_bytes());
+        info[32..36].copy_from_slice(&1u32.to_le_bytes());
+        info[40..48].copy_from_slice(&(sc_arr.as_ptr() as u64).to_le_bytes());
+        info[48..56].copy_from_slice(&(idx_arr[i..].as_ptr() as u64).to_le_bytes());
+        let pr = unsafe { vkQueuePresentKHR(queue, info.as_ptr() as *const _) };
+        println!("vkQueuePresentKHR[{i}]    → result = {pr}");
+    }
+    println!("done — host endpoint received the frame + 2 presents.");
 }
