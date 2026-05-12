@@ -455,14 +455,15 @@ impl Session {
         self.send_response(OP_GPU_SHARE_SURFACE, &resp)
     }
 
-    /// `OP_GPU_PRESENT` — record the present intent. The backend
-    /// today logs it and returns; the actual surface→window
-    /// routing lands when frescod-aqueduct gains a per-surface
-    /// WindowSurface map.
+    /// `OP_GPU_PRESENT` — forward to the backend's `present` hook.
+    /// Backends route to their actual surface→window map (today
+    /// just bumps a counter; frescod-aqueduct's installed
+    /// backend can override to drive its per-window WindowSurface).
     fn handle_present(&mut self, m: Message) -> Result<()> {
         let req: PresentPayload = postcard::from_bytes(&m.payload)?;
-        log::info!("present image={} surface={} frame={}",
+        log::debug!("present image={} surface={} frame={}",
                    req.image_id, req.surface_id, req.frame_id);
+        self.backend.present(req.image_id, req.surface_id, req.frame_id);
         Ok(())
     }
 

@@ -1808,6 +1808,104 @@ fn create_atrium_surface_ext_returns_window_id_as_handle() {
 }
 
 #[test]
+fn vkqueue_present_bumps_backend_present_counter() {
+    use atrium_vk_icd::{
+        vkAllocateMemory, vkBindImageMemory, vkCreateAtriumSurfaceEXT,
+        vkCreateDevice, vkCreateImage, vkCreateSwapchainKHR,
+        vkDestroyDevice, vkDestroyImage, vkDestroySwapchainKHR,
+        vkDestroySurfaceKHR, vkFreeMemory, vkGetDeviceQueue,
+        vkGetImageMemoryRequirements, vkGetSwapchainImagesKHR,
+        vkQueuePresentKHR,
+    };
+
+    let sock = tmp_socket("present");
+    let sw_backend = Arc::new(SoftwareBackend::new());
+    let backend_for_listener: Arc<dyn Backend> = sw_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap();
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+
+    type VkDevice = *mut std::ffi::c_void;
+    type VkQueue  = *mut std::ffi::c_void;
+
+    let mut instance: VkInstance = std::ptr::null_mut();
+    unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
+    let mut pds: [VkPhysicalDevice; 1] = [std::ptr::null_mut(); 1];
+    let mut cap: u32 = 1;
+    unsafe { vkEnumeratePhysicalDevices(instance, &mut cap, pds.as_mut_ptr()); }
+    let mut device: VkDevice = std::ptr::null_mut();
+    unsafe { vkCreateDevice(pds[0], std::ptr::null(), std::ptr::null(), &mut device); }
+    let mut queue: VkQueue = std::ptr::null_mut();
+    unsafe { vkGetDeviceQueue(device, 0, 0, &mut queue); }
+
+    // Create a surface with a Fresco window-id.
+    let mut surf_info = [0u8; 24];
+    surf_info[ 0.. 4].copy_from_slice(&1_000_310_000u32.to_le_bytes());
+    surf_info[20..24].copy_from_slice(&7u32.to_le_bytes());
+    let mut surface: u64 = 0;
+    unsafe { vkCreateAtriumSurfaceEXT(instance, surf_info.as_ptr() as *const _, std::ptr::null(), &mut surface); }
+    assert_eq!(surface, 7);
+
+    // Make a 2-deep swapchain bound to that surface.
+    let mut sc_info = [0u8; 104];
+    sc_info[ 0.. 4].copy_from_slice(&1000001000u32.to_le_bytes());
+    sc_info[20..28].copy_from_slice(&surface.to_le_bytes());
+    sc_info[28..32].copy_from_slice(&2u32.to_le_bytes());
+    sc_info[32..36].copy_from_slice(&37u32.to_le_bytes());
+    sc_info[40..44].copy_from_slice(&64u32.to_le_bytes());
+    sc_info[44..48].copy_from_slice(&64u32.to_le_bytes());
+    sc_info[48..52].copy_from_slice(&1u32.to_le_bytes());
+    sc_info[52..56].copy_from_slice(&0x10u32.to_le_bytes());
+    let mut swapchain: u64 = 0;
+    unsafe { vkCreateSwapchainKHR(device, sc_info.as_ptr() as *const _, std::ptr::null(), &mut swapchain); }
+
+    // Bind memory to the ring images so they have daemon-side
+    // image_ids (vkQueuePresentKHR's resolver needs them).
+    let mut ring = [0u64; 2];
+    let mut k: u32 = 2;
+    unsafe { vkGetSwapchainImagesKHR(device, swapchain, &mut k, ring.as_mut_ptr()); }
+    let mut req = ash::vk::MemoryRequirements::default();
+    unsafe { vkGetImageMemoryRequirements(device, ring[0], &mut req); }
+    let mut alloc = [0u8; 32];
+    alloc[0..4].copy_from_slice(&5u32.to_le_bytes());
+    alloc[16..24].copy_from_slice(&(req.size * 2).to_le_bytes());
+    let mut mem: u64 = 0;
+    unsafe { vkAllocateMemory(device, alloc.as_ptr() as *const _, std::ptr::null(), &mut mem); }
+    unsafe { vkBindImageMemory(device, ring[0], mem, 0); }
+    unsafe { vkBindImageMemory(device, ring[1], mem, req.size); }
+    thread::sleep(Duration::from_millis(30));
+
+    // Present each ring image once. VkPresentInfoKHR has size 64 B.
+    let pre = sw_backend.present_count();
+    let sc_arr = [swapchain];
+    let idx_arr = [0u32, 1u32];
+    for i in 0..2 {
+        let mut info = [0u8; 64];
+        info[ 0.. 4].copy_from_slice(&1000001001u32.to_le_bytes());
+        info[32..36].copy_from_slice(&1u32.to_le_bytes()); // swapchainCount
+        info[40..48].copy_from_slice(&(sc_arr.as_ptr() as u64).to_le_bytes());
+        info[48..56].copy_from_slice(&(idx_arr[i..].as_ptr() as u64).to_le_bytes());
+        unsafe { vkQueuePresentKHR(queue, info.as_ptr() as *const _); }
+    }
+    thread::sleep(Duration::from_millis(100));
+    let post = sw_backend.present_count();
+    assert_eq!(post - pre, 2, "expected 2 present ops, got {}", post - pre);
+
+    // Teardown.
+    unsafe { vkDestroySwapchainKHR(device, swapchain, std::ptr::null()); }
+    unsafe { vkDestroyImage(device, ring[0], std::ptr::null()); }
+    unsafe { vkDestroyImage(device, ring[1], std::ptr::null()); }
+    unsafe { vkFreeMemory(device, mem, std::ptr::null()); }
+    unsafe { vkDestroySurfaceKHR(instance, surface, std::ptr::null()); }
+    unsafe { vkDestroyDevice(device, std::ptr::null()); }
+    unsafe { vkDestroyInstance(instance, std::ptr::null()); }
+    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[test]
 fn proc_addr_resolves_three_entry_points() {
     // No live daemon required for the get_proc_addr lookups.
     fn lookup(name: &[u8]) -> Option<unsafe extern "C" fn()> {

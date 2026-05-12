@@ -107,6 +107,18 @@ pub trait Backend: Send + Sync {
         timeline: u64,
         frame_buf: &[u8],
     ) -> bool;
+
+    /// Present a previously-rendered image to a Fresco surface.
+    /// Default impl: count the present + return; backends that
+    /// route to a compositor override this. The `surface_id` is
+    /// a Fresco window-id (atrium-vk-icd's VkSurfaceKHR handle
+    /// is the same value).
+    fn present(
+        &self,
+        _image_id:   ResourceId,
+        _surface_id: u64,
+        _frame_id:   u64,
+    ) {}
 }
 
 /// Protocol-correct backend that does no GPU work.
@@ -123,6 +135,7 @@ pub trait Backend: Send + Sync {
 /// Signals fences immediately on submit (no GPU coupling).
 pub struct StubBackend {
     submissions: AtomicU64,
+    presents:    AtomicU64,
 }
 
 impl Default for StubBackend {
@@ -134,13 +147,21 @@ impl Default for StubBackend {
 impl StubBackend {
     /// Construct a fresh stub backend.
     pub fn new() -> Self {
-        Self { submissions: AtomicU64::new(0) }
+        Self {
+            submissions: AtomicU64::new(0),
+            presents:    AtomicU64::new(0),
+        }
     }
 
     /// How many frames have been submitted to this backend across
     /// all connections. Diagnostic.
     pub fn submission_count(&self) -> u64 {
         self.submissions.load(Ordering::Relaxed)
+    }
+
+    /// How many OP_GPU_PRESENT ops have been received. Diagnostic.
+    pub fn present_count(&self) -> u64 {
+        self.presents.load(Ordering::Relaxed)
     }
 }
 
@@ -180,6 +201,8 @@ pub struct SoftwareBackend {
     /// errors propagate to the session as `OP_GPU_VALIDATION_ERR`
     /// in a follow-on commit; today they're logged + counted.
     dispatch_failures: AtomicU64,
+    /// OP_GPU_PRESENT counter. Observable for tests.
+    presents: AtomicU64,
 }
 
 impl Default for SoftwareBackend {
@@ -195,7 +218,14 @@ impl SoftwareBackend {
             submissions: AtomicU64::new(0),
             images: Mutex::new(HashMap::new()),
             dispatch_failures: AtomicU64::new(0),
+            presents: AtomicU64::new(0),
         }
+    }
+
+    /// How many OP_GPU_PRESENT ops have been received. Diagnostic /
+    /// test observation.
+    pub fn present_count(&self) -> u64 {
+        self.presents.load(Ordering::Relaxed)
     }
 
     /// How many frames have been submitted. Diagnostic.
@@ -479,6 +509,13 @@ impl Backend for SoftwareBackend {
         // so we signal immediately. Real GPU backends defer.
         true
     }
+
+    fn present(&self, image_id: ResourceId, surface_id: u64, frame_id: u64) {
+        self.presents.fetch_add(1, Ordering::Relaxed);
+        log::debug!(
+            "SoftwareBackend::present image={image_id} surface={surface_id} frame={frame_id}"
+        );
+    }
 }
 
 /// One contiguous BeginRenderPass..EndRenderPass slice of a frame
@@ -570,6 +607,10 @@ impl Backend for StubBackend {
     fn submit_frame(&self, _fence_id: ResourceId, _timeline: u64, _frame_buf: &[u8]) -> bool {
         self.submissions.fetch_add(1, Ordering::Relaxed);
         true // signal fence immediately
+    }
+
+    fn present(&self, _image_id: ResourceId, _surface_id: u64, _frame_id: u64) {
+        self.presents.fetch_add(1, Ordering::Relaxed);
     }
 }
 
