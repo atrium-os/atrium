@@ -953,6 +953,69 @@ fn image_create_bind_destroy_round_trip() {
 }
 
 #[test]
+fn shader_module_create_destroy_through_daemon_cache() {
+    use atrium_vk_icd::{
+        vkCreateDevice, vkCreateShaderModule, vkDestroyDevice,
+        vkDestroyShaderModule,
+    };
+
+    let sock = tmp_socket("shader");
+    let sw_backend = Arc::new(SoftwareBackend::new());
+    let backend_for_listener: Arc<dyn Backend> = sw_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap();
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+
+    type VkDevice = *mut std::ffi::c_void;
+
+    let mut instance: VkInstance = std::ptr::null_mut();
+    unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
+    let mut pds: [VkPhysicalDevice; 1] = [std::ptr::null_mut(); 1];
+    let mut cap: u32 = 1;
+    unsafe { vkEnumeratePhysicalDevices(instance, &mut cap, pds.as_mut_ptr()); }
+    let mut device: VkDevice = std::ptr::null_mut();
+    unsafe { vkCreateDevice(pds[0], std::ptr::null(), std::ptr::null(), &mut device); }
+
+    // Minimal SPIR-V module: magic + version + 0 generator + 1 bound
+    // + 0 schema. 5 words = 20 bytes. Header-only; no actual
+    // instructions. The host validator accepts this (no forbidden
+    // capabilities present).
+    let spv: [u32; 5] = [0x07230203, 0x00010000, 0, 1, 0];
+    let code_size: u64 = 20;
+    let p_code: *const u32 = spv.as_ptr();
+
+    // VkShaderModuleCreateInfo: sType@0, pNext@8, flags@16,
+    // codeSize@24 (u64), pCode@32 (ptr).
+    let mut info = [0u8; 40];
+    info[ 0.. 4].copy_from_slice(&16u32.to_le_bytes()); // sType
+    info[24..32].copy_from_slice(&code_size.to_le_bytes());
+    info[32..40].copy_from_slice(&(p_code as u64).to_le_bytes());
+
+    let mut module: u64 = 0;
+    let r = unsafe { vkCreateShaderModule(device, info.as_ptr() as *const _, std::ptr::null(), &mut module) };
+    assert_eq!(r, 0);
+    assert!(module != 0);
+
+    // Create a second module with the same bytecode — the daemon
+    // should resolve from cache (no second upload). We can't
+    // observe submission_count for resolve, but the call must
+    // succeed and return a distinct VkShaderModule handle.
+    let mut module2: u64 = 0;
+    let r = unsafe { vkCreateShaderModule(device, info.as_ptr() as *const _, std::ptr::null(), &mut module2) };
+    assert_eq!(r, 0);
+    assert_ne!(module, module2);
+
+    unsafe { vkDestroyShaderModule(device, module, std::ptr::null()); }
+    unsafe { vkDestroyShaderModule(device, module2, std::ptr::null()); }
+    unsafe { vkDestroyDevice(device, std::ptr::null()); }
+    unsafe { vkDestroyInstance(instance, std::ptr::null()); }
+    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[test]
 fn proc_addr_resolves_three_entry_points() {
     // No live daemon required for the get_proc_addr lookups.
     fn lookup(name: &[u8]) -> Option<unsafe extern "C" fn()> {

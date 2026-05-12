@@ -228,6 +228,11 @@ struct AtriumDevice {
     fence: aqueduct_gpu::ids::ResourceId,
     /// Monotonic timeline value; incremented per submit.
     timeline: std::cell::Cell<u64>,
+    /// BackendId carried over from the physical device this
+    /// VkDevice was created from. Needed by shader upload/resolve
+    /// (the host endpoint keys its shader cache by
+    /// `(hash, backend_id, kind)`).
+    backend: aqueduct_gpu::backends::BackendId,
     /// Resource-ID allocator for ICD-side handles
     /// (VkPipeline, VkPipelineLayout, future VkBuffer/VkImage).
     /// Namespaced under `IdNamespace::IcdRuntime` so they don't
@@ -261,6 +266,26 @@ struct AtriumDevice {
     images: std::sync::Mutex<std::collections::HashMap<u64, AtriumImage>>,
     /// Monotonic counter for VkImage handles.
     next_image_id: std::cell::Cell<u64>,
+    /// Per-VkShaderModule state. vkCreateShaderModule hashes the
+    /// bytecode + calls resolve_shader (cache hit) or upload_shader
+    /// (cold path); stores the returned ResourceId so future
+    /// vkCreateGraphicsPipelines can wire it into a pipeline.
+    shaders: std::sync::Mutex<std::collections::HashMap<u64, AtriumShaderModule>>,
+    /// Monotonic counter for VkShaderModule handles.
+    next_shader_id: std::cell::Cell<u64>,
+}
+
+/// ICD-side state for a `VkShaderModule`. We don't keep the
+/// bytecode beyond create — the daemon owns the shader's lifecycle
+/// once uploaded.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+struct AtriumShaderModule {
+    /// Daemon-side ResourceId; None if the instance had no live
+    /// client or the upload failed validation.
+    shader_id: Option<aqueduct_gpu::ids::ResourceId>,
+    /// sha-256 of the SPIR-V bytecode at create time.
+    bytecode_hash: [u8; 32],
 }
 
 /// ICD-side state for a `VkImage`. Created by vkCreateImage;
@@ -621,9 +646,17 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkDevice, u64, u64, u64) -> VkResult, FnVoidPtr,
             >(vkBindImageMemory)),
+        "vkCreateShaderModule" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, *const c_void, *const c_void, *mut u64) -> VkResult, FnVoidPtr,
+            >(vkCreateShaderModule)),
+        "vkDestroyShaderModule" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, *const c_void), FnVoidPtr,
+            >(vkDestroyShaderModule)),
         // Phase 1.3b+ continued: vkCmdCopyBuffer*,
         // vkCmdPipelineBarrier, vkCmdBegin/EndRenderPass,
-        // vkCreateShaderModule, …
+        // VkRenderPass / VkFramebuffer / VkImageView, …
         _ => None,
     }
 }
@@ -844,6 +877,9 @@ pub unsafe extern "C" fn vkCreateDevice(
         instance: inst_ptr,
         fence,
         timeline: std::cell::Cell::new(0),
+        backend: aqueduct_gpu::backends::BackendId::new(
+            pd.backend_vendor, pd.backend_generation,
+        ),
         id_alloc: std::sync::Mutex::new(
             aqueduct_gpu_client::IdAllocator::with_namespace(
                 aqueduct_gpu::ids::IdNamespace::IcdRuntime,
@@ -856,6 +892,8 @@ pub unsafe extern "C" fn vkCreateDevice(
         next_buffer_id: std::cell::Cell::new(1),
         images:         std::sync::Mutex::new(std::collections::HashMap::new()),
         next_image_id:  std::cell::Cell::new(1),
+        shaders:        std::sync::Mutex::new(std::collections::HashMap::new()),
+        next_shader_id: std::cell::Cell::new(1),
     });
     let dev_ptr: *mut AtriumDevice = &mut *dev;
     let q = Box::new(AtriumQueue {
@@ -1696,6 +1734,94 @@ pub unsafe extern "C" fn vkBindImageMemory(
     img.memory_offset = memory_offset;
     img.image_id      = image_id;
     VK_SUCCESS
+}
+
+/// `vkCreateShaderModule` — sha-256 the SPIR-V bytecode, attempt
+/// a resolve-then-upload against the daemon's shader cache, and
+/// stash the resulting ResourceId on AtriumShaderModule. Future
+/// vkCreateGraphicsPipelines reads it to wire the shader into a
+/// pipeline.
+///
+/// VkShaderModuleCreateInfo layout:
+///   0   sType
+///   8   pNext
+///   16  flags : u32
+///   20  _pad
+///   24  codeSize : usize (u64 on 64-bit)
+///   32  pCode : *const u32
+///
+/// codeSize is BYTES, not words.
+#[no_mangle]
+pub unsafe extern "C" fn vkCreateShaderModule(
+    device:          VkDevice,
+    p_create_info:   *const c_void,
+    _p_allocator:    *const c_void,
+    p_shader_module: *mut u64,
+) -> VkResult {
+    use sha2::Digest;
+    if device.is_null() || p_create_info.is_null() || p_shader_module.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let dev = &*(device as *const AtriumDevice);
+    let b = p_create_info as *const u8;
+    let code_size: u64 = std::ptr::read_unaligned(b.add(24) as *const u64);
+    let p_code: *const u32 = std::ptr::read_unaligned(b.add(32) as *const *const u32);
+    if code_size == 0 || p_code.is_null() || code_size % 4 != 0 {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    let n_words = (code_size / 4) as usize;
+    let words: &[u32] = std::slice::from_raw_parts(p_code, n_words);
+    // Copy into a Vec<u8> for hashing + uploading.
+    let mut bytes = Vec::with_capacity(code_size as usize);
+    for &w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(&bytes);
+    let bytecode_hash: [u8; 32] = hasher.finalize().into();
+
+    // Resolve-or-upload against the daemon. Failure (no live
+    // client, validation rejection) leaves shader_id=None — the
+    // module exists locally; downstream pipeline creation will
+    // see the absence and surface a VK_ERROR.
+    let shader_id = if !dev.instance.is_null() {
+        let inst = &*(dev.instance as *const AtriumInstance);
+        inst.client.as_ref().and_then(|m| {
+            m.lock().ok().and_then(|mut c| {
+                let kind = aqueduct_gpu::payloads::ShaderKind::SpirV;
+                match c.resolve_shader(bytecode_hash, kind, dev.backend) {
+                    Ok(id) => Some(id),
+                    Err(_) => c.upload_shader(bytecode_hash, kind, dev.backend, bytes).ok(),
+                }
+            })
+        })
+    } else { None };
+
+    let handle = dev.next_shader_id.get();
+    dev.next_shader_id.set(handle + 1);
+    if let Ok(mut s) = dev.shaders.lock() {
+        s.insert(handle, AtriumShaderModule { shader_id, bytecode_hash });
+    } else {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    *p_shader_module = handle;
+    VK_SUCCESS
+}
+
+/// `vkDestroyShaderModule` — drop the local mapping. The
+/// daemon-side shader stays in the cache (lifetime is the host
+/// endpoint's, not the app's).
+#[no_mangle]
+pub unsafe extern "C" fn vkDestroyShaderModule(
+    device:       VkDevice,
+    module:       u64,
+    _p_allocator: *const c_void,
+) {
+    if device.is_null() || module == 0 { return; }
+    let dev = &*(device as *const AtriumDevice);
+    if let Ok(mut s) = dev.shaders.lock() {
+        s.remove(&module);
+    }
 }
 
 /// `vkCreateCommandPool` — allocate a non-dispatchable

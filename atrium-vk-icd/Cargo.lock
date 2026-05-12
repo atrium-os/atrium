@@ -159,6 +159,7 @@ dependencies = [
  "aqueduct-gpu-client",
  "aqueduct-gpu-host",
  "ash",
+ "sha2",
 ]
 
 [[package]]
