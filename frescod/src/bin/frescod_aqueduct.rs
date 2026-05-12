@@ -29,6 +29,51 @@
 //!
 //! Listens on `/tmp/frescod.sock` (or `$FRESCOD_SOCK`). Standard
 //! fresco-protocol clients connect unchanged.
+//!
+//! # Deferred work — proper vsync + multi-buffer scanout (kmod 3.5)
+//!
+//! Today's frame loop is **wall-clock-paced single-buffer**: one
+//! scanout BO, `thread::sleep` to the connector's reported
+//! `refresh_mhz`, `Display::page_flip` whenever a new frame is
+//! ready. Tear-prone in theory (QEMU's host display backend may
+//! poll the BO mid-render-into-BO copy) but visually clean in
+//! practice on virtio-gpu under HVF.
+//!
+//! Three related improvements are all gated on the same kmod work
+//! (D0 step 3.5 / Phase 1.5b in the plan):
+//!
+//! 1. **`IOC_DISPLAY_PAGE_FLIP` should rebind scanout to a
+//!    different BO.** Today `atrium_display_page_flip` only does
+//!    `virtio-gpu RESOURCE_FLUSH` on the supplied BO's resource_id;
+//!    it does NOT issue `SET_SCANOUT(scanout, new_resource_id)`.
+//!    Consequence: flipping to any BO other than the one passed to
+//!    `set_mode` shows black, because the connector remains bound
+//!    to the original BO's resource_id. Fix: page_flip should
+//!    SET_SCANOUT to the new BO's resource_id (when it differs
+//!    from the currently-bound one) and then FLUSH. ~20 lines of
+//!    C in `atrium-kmod/atrium_virtio_gpu.c`.
+//!
+//! 2. **Multi-buffer scanout (double or triple).** Unlocks
+//!    structural tear-prevention: render into the back BO, flip
+//!    swaps roles atomically. Client-side change: ~30 lines in
+//!    this file (allocate N BOs, round-robin advance on real
+//!    flips, keepalive on the current scanout BO). Blocked on (1).
+//!
+//! 3. **Vblank events for phase-locked rendering.** Kmod gains an
+//!    IRQ handler that posts events to subscribers; new ioctl
+//!    `IOC_DISPLAY_SUBSCRIBE_VBLANK` returns an event fd
+//!    (`kqueue`-friendly per `feedback_kqueue_native.md`). Client
+//!    side: replace `thread::sleep` pacer with a kqueue wait on
+//!    `(vblank, sock, input)`. On vblank fire: check per-window
+//!    dirty, render if so, page_flip. Kmod page_flip gains a
+//!    "queue for next vblank" mode that complements the immediate
+//!    mode used today. Real vsync, no tearing, no wasted frames.
+//!
+//! The per-window architecture (`window_surfaces` ring) is
+//! deliberately staged to make all three above changes localised
+//! when the kmod work lands — no client-side redesign needed.
+//!
+//! See `docs/spec/aqueduct-gpu.md` §6.5.5 for the spec-side note.
 
 #[path = "../input_reader.rs"]
 mod input_reader;
@@ -107,6 +152,38 @@ fn main() -> std::io::Result<()> {
         | ATRIUM_GPU_BO_CPU_VISIBLE
         | ATRIUM_GPU_BO_COHERENT
         | ATRIUM_GPU_BO_SCANOUT;
+    // ── Scanout: single-buffered until kmod step 3.5 ─────────────
+    //
+    // Today the kmod's IOC_DISPLAY_PAGE_FLIP does virtio-gpu
+    // RESOURCE_FLUSH on the BO's resource_id but does NOT issue
+    // SET_SCANOUT to rebind the connector to a different BO.
+    // Consequence: page_flip(bos[i]) for i != mode-set BO shows
+    // black, because the connector is still bound to bos[0]'s
+    // resource_id.
+    //
+    // We allocate a single BO, render and BGRA-copy into it, then
+    // page_flip it. This is tear-prone in theory (QEMU's host
+    // display backend reads mid-copy) but works in practice on
+    // virtio-gpu where the host pulls the framebuffer on its own
+    // poll schedule, not in lockstep with our writes.
+    //
+    // The kmod 3.5 work bundles three related gaps:
+    //   1. SET_SCANOUT-on-page-flip when the supplied BO differs
+    //      from the mode-set BO. This enables real multi-buffer
+    //      scanout, which prerequisite for both:
+    //   2. Triple-buffered scanout (3 BOs round-robin, eliminate
+    //      tear-from-render-into-live-BO).
+    //   3. Vblank IRQ events (`IOC_DISPLAY_SUBSCRIBE_VBLANK` +
+    //      event fd) for phase-locked render/flip pacing.
+    //
+    // The client side of (2) and (3) lands behind the kmod work:
+    //   - Single → multi-BO rotation: ~30 lines of change in this
+    //     file once page_flip rebinds scanout.
+    //   - Wall-clock pacer → kqueue-driven vblank wait: ~50 lines
+    //     once IOC_DISPLAY_SUBSCRIBE_VBLANK is available.
+    //
+    // See `docs/spec/aqueduct-gpu.md` §6.5.5 and the header comment
+    // of this file. Tracked as Phase 1.5b in the project plan.
     let mut bo = gpu.alloc(bytes, flags)?;
 
     // ── In-process aqueduct-gpu-host + GpuClient ─────────────────

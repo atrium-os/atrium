@@ -839,6 +839,79 @@ GPU-bypass-for-static-UI mode). That delta is a reproducible
 benchmark + a 30-second video — both are demo-driven phase-exit
 deliverables.
 
+### 6.5.5. Scanout buffering & vsync — current state and deferred work
+
+**Current state (frescod-aqueduct, single-buffered, wall-clock paced):**
+
+- One `atrium-gpu` scanout BO. Renders go directly into it; then
+  `Display::page_flip` (which today does `virtio-gpu
+  RESOURCE_FLUSH` on the BO's resource_id, signalling the host to
+  redraw).
+- Pacing is `thread::sleep` against the connector's reported
+  `mode.refresh_mhz`, not phase-locked to actual panel refresh.
+- Tear-prone in theory (QEMU's host display backend can poll the
+  BO mid-update); visually clean in practice on virtio-gpu under
+  HVF because the host backend is asynchronous and forgiving.
+
+**Three improvements bundled together** — all gated on kmod work
+(D0 step 3.5 / Phase 1.5b in the plan; the kmod's current
+`atrium_display_page_flip` only flushes, doesn't rebind scanout
+or signal vblanks):
+
+#### 6.5.5.a. Multi-buffer scanout (double / triple)
+
+Kmod `IOC_DISPLAY_PAGE_FLIP` must issue `SET_SCANOUT(scanout,
+new_resource_id)` when the supplied BO differs from the one
+currently bound to the connector, then `RESOURCE_FLUSH`. Without
+this rebinding step, flipping to any BO other than the `set_mode`
+BO results in the connector continuing to scan out the original
+BO (visually: black, or "frozen on first-frame contents").
+Implementation note: ~20 lines of C in
+`atrium-kmod/atrium_virtio_gpu.c`'s `atrium_display_page_flip`.
+
+Once it lands, frescod-aqueduct switches to a triple-buffer ring
+(three BOs, round-robin advance on real flips, keepalive on the
+current scanout BO). Eliminates render-into-live-BO tearing
+structurally. Client-side cost: ~30 lines in
+`frescod/src/bin/frescod_aqueduct.rs`.
+
+#### 6.5.5.b. Vblank events for phase-locked rendering
+
+Kmod gains an IRQ handler that posts vblank events to subscribers
+(new ioctl `IOC_DISPLAY_SUBSCRIBE_VBLANK` returning an event fd).
+`atrium-gpu-rs` wraps the fd as a `kqueue`-able source per the
+project's kqueue posture (`feedback_kqueue_native.md`).
+
+frescod-aqueduct's frame loop becomes event-driven: kqueue waits
+on `(vblank_fd, socket_server_reader, input_reader)`. On vblank:
+check per-window dirty, render dirty windows, page_flip. Real
+vsync, no wall-clock drift, no wasted frames.
+
+#### 6.5.5.c. Queued (vsync-aligned) page-flip semantics
+
+Kmod `IOC_DISPLAY_PAGE_FLIP` gains a "queue for next vblank" flag
+that complements current immediate-mode. With the triple-buffer
+ring from 6.5.5.a and vblank events from 6.5.5.b, the slots
+become proper front / queued / back: client renders into back,
+queues it via page_flip, kmod swaps at next vblank, posts a
+vblank event, client begins next render. On a VRR panel the
+kmod's vblank cadence drops naturally to scene-change rate
+(matches §6.5.2's power-policy goal).
+
+#### Architectural staging today
+
+The per-window `window_surfaces` ring + the `any_dirty` /
+`layout_changed` outer-skip path are staged so the three changes
+above land as localised swap-ins, not redesigns. Total expected
+diff when the kmod work is in:
+
+- `atrium-kmod/atrium_virtio_gpu.c`: ~80 lines (page_flip
+  rebinding + vblank IRQ + ioctl)
+- `atrium-gpu-rs`: ~50 lines (wrapper for VblankEvents fd, flag
+  for queued page_flip)
+- `frescod/src/bin/frescod_aqueduct.rs`: ~80 lines (BO ring,
+  kqueue main loop, queued-flip semantics)
+
 ---
 
 ## 7. API surfaces and composition strategies
