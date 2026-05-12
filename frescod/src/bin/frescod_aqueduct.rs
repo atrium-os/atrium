@@ -357,6 +357,16 @@ fn main() -> std::io::Result<()> {
                 window_profile.readback.as_secs_f64() * 1000.0 / n,
                 window_profile.copy_to_bo.as_secs_f64() * 1000.0 / n,
             );
+            let total_dirty = window_profile.partial_passes + window_profile.full_passes;
+            let partial_pct = if total_dirty > 0 {
+                100.0 * window_profile.partial_passes as f64 / total_dirty as f64
+            } else { 0.0 };
+            eprintln!(
+                "frescod-aqueduct:   damage-rect: {} partial, {} full ({:.0}% partial)",
+                window_profile.partial_passes,
+                window_profile.full_passes,
+                partial_pct,
+            );
             window_start = Instant::now();
             window_frames = 0;
             window_flips = 0;
@@ -394,6 +404,12 @@ struct FrameProfile {
     readback:   Duration,
     /// BGRA-swap copy from readback buffer into the scanout BO.
     copy_to_bo: Duration,
+    /// Per-window dirty-render passes this frame that took the
+    /// intra-window damage-rect path (skip-hierarchy level 3).
+    partial_passes: u32,
+    /// Per-window dirty-render passes this frame that took the full
+    /// window clear-and-redraw path.
+    full_passes:    u32,
 }
 
 impl FrameProfile {
@@ -404,6 +420,8 @@ impl FrameProfile {
         self.wait       += other.wait;
         self.readback   += other.readback;
         self.copy_to_bo += other.copy_to_bo;
+        self.partial_passes += other.partial_passes;
+        self.full_passes    += other.full_passes;
     }
 }
 
@@ -428,6 +446,129 @@ struct WindowSurface {
     /// Last frame's mini-FrameOp byte stream for this window. Used to
     /// detect dirty status by byte-compare.
     last_bytes: Vec<u8>,
+    /// Per-node hash + bbox snapshot from the previous frame.
+    /// Key: (class_tag, node_id). Used to compute an intra-window
+    /// damage rect for partial redraw (skip-hierarchy level 3).
+    /// `class_tag` is 0=rect, 1=texture, 2=path, 3=glyph_run.
+    prev_nodes: HashMap<(u8, u32), (u64, [f32; 4])>,
+}
+
+/// Damage-rect partial-redraw threshold. If the union of changed node
+/// bboxes is smaller than this fraction of the window area, the
+/// renderer is asked to redraw only that scissor; otherwise we use
+/// the normal full-window clear path.
+///
+/// 0.5 = sub-half-window changes go partial; bigger ones clear. The
+/// breakeven for tiny-skia is somewhere around 0.3–0.6 depending on
+/// content; 0.5 is the safe default and was easy to verify by eye.
+const DAMAGE_RECT_THRESHOLD: f32 = 0.5;
+
+/// Hash a slice of f32 / u32 fields treated as raw little-endian
+/// bytes. f32 bits-equal comparison is what we want for "did this
+/// node's params change?" — NaN-equality / +0/-0 quirks are moot
+/// because params are produced deterministically by the client.
+fn hash_words(words: &[u32]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for w in words {
+        w.hash(&mut h);
+    }
+    h.finish()
+}
+
+fn rect_hash(p: &fp::RectParams) -> u64 {
+    hash_words(&[
+        p.x.to_bits(), p.y.to_bits(), p.w.to_bits(), p.h.to_bits(),
+        p.r.to_bits(), p.g.to_bits(), p.b.to_bits(), p.a.to_bits(),
+    ])
+}
+fn rect_bbox(p: &fp::RectParams) -> [f32; 4] {
+    [p.x, p.y, p.x + p.w, p.y + p.h]
+}
+
+fn texture_hash(p: &fp::TextureParams) -> u64 {
+    hash_words(&[
+        p.x.to_bits(), p.y.to_bits(), p.w.to_bits(), p.h.to_bits(),
+        p.slot_id,
+    ])
+}
+fn texture_bbox(p: &fp::TextureParams) -> [f32; 4] {
+    [p.x, p.y, p.x + p.w, p.y + p.h]
+}
+
+fn path_hash(p: &fp::PathParams) -> u64 {
+    hash_words(&[
+        p.cx.to_bits(), p.cy.to_bits(), p.length.to_bits(),
+        p.width.to_bits(), p.angle.to_bits(),
+        p.r.to_bits(), p.g.to_bits(), p.b.to_bits(), p.a.to_bits(),
+    ])
+}
+fn path_bbox(p: &fp::PathParams) -> [f32; 4] {
+    // Conservative AABB of a rotated rect: half-diagonal radius
+    // around (cx, cy).
+    let half_diag = ((p.length * 0.5).powi(2) + (p.width * 0.5).powi(2)).sqrt();
+    [p.cx - half_diag, p.cy - half_diag, p.cx + half_diag, p.cy + half_diag]
+}
+
+fn glyph_run_hash(p: &fp::GlyphRunParams) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    p.x.to_bits().hash(&mut h);
+    p.y.to_bits().hash(&mut h);
+    p.atlas_slot_id.hash(&mut h);
+    p.atlas_width.hash(&mut h);
+    p.atlas_height.hash(&mut h);
+    p.r.to_bits().hash(&mut h);
+    p.g.to_bits().hash(&mut h);
+    p.b.to_bits().hash(&mut h);
+    p.a.to_bits().hash(&mut h);
+    for g in &p.glyphs {
+        g.dx.to_bits().hash(&mut h);
+        g.dy.to_bits().hash(&mut h);
+        g.atlas_u.hash(&mut h);
+        g.atlas_v.hash(&mut h);
+        g.atlas_w.hash(&mut h);
+        g.atlas_h.hash(&mut h);
+        g.bearing_x.to_bits().hash(&mut h);
+        g.bearing_y.to_bits().hash(&mut h);
+    }
+    h.finish()
+}
+fn glyph_run_bbox(p: &fp::GlyphRunParams) -> [f32; 4] {
+    if p.glyphs.is_empty() {
+        return [p.x, p.y, p.x, p.y];
+    }
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for g in &p.glyphs {
+        let dst_x = p.x + g.dx + g.bearing_x;
+        let dst_y = p.y + g.dy - g.bearing_y;
+        let dx2 = dst_x + g.atlas_w as f32;
+        let dy2 = dst_y + g.atlas_h as f32;
+        if dst_x < min_x { min_x = dst_x; }
+        if dst_y < min_y { min_y = dst_y; }
+        if dx2   > max_x { max_x = dx2; }
+        if dy2   > max_y { max_y = dy2; }
+    }
+    [min_x, min_y, max_x, max_y]
+}
+
+/// Union two AABBs in (x0, y0, x1, y1) form.
+fn bbox_union(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]
+}
+
+/// Clip an AABB to a window (0, 0, w, h) and snap to integer pixel
+/// extents. Returns None if the rect is empty after clipping.
+fn clip_and_snap(bb: [f32; 4], win_w: u32, win_h: u32) -> Option<(u32, u32, u32, u32)> {
+    let x0 = bb[0].floor().max(0.0) as i64;
+    let y0 = bb[1].floor().max(0.0) as i64;
+    let x1 = bb[2].ceil().min(win_w as f32) as i64;
+    let y1 = bb[3].ceil().min(win_h as f32) as i64;
+    if x1 <= x0 || y1 <= y0 { return None; }
+    Some((x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32))
 }
 
 /// Orchestrate one frame of per-window rendering + composite.
@@ -589,7 +730,9 @@ fn render_one_frame_multipass(
             mip_levels: 1, array_layers: 1, usage: 0x07,
         })?;
         window_surfaces.insert(*win_id, WindowSurface {
-            image, width: *sw, height: *sh, last_bytes: Vec::new(),
+            image, width: *sw, height: *sh,
+            last_bytes: Vec::new(),
+            prev_nodes: HashMap::new(),
         });
     }
 
@@ -599,16 +742,113 @@ fn render_one_frame_multipass(
     //       For other windows render in window-local coords; the
     //       composite pass places the surface at the window's pos.
     let mut any_dirty = false || force_full;
-    let mut per_window_frames: Vec<(u32, Vec<u8>)> = Vec::with_capacity(layers.len());
+    // (win_id, bytes, new_node_map). new_node_map is captured here
+    // and stored on the surface after the dirty check so we only pay
+    // the bbox/hash work once.
+    let mut per_window_frames:
+        Vec<(u32, Vec<u8>, HashMap<(u8, u32), (u64, [f32; 4])>)> =
+        Vec::with_capacity(layers.len());
     {
         let fe = frontend.lock().unwrap();
-        for (win_id, _, _) in &layers {
+        for (win_id, _, (sw, sh)) in &layers {
             let surface = window_surfaces.get(win_id).unwrap();
+
+            // Build current frame's per-node hash + bbox map. Used
+            // both to compute the damage rect and to roll forward
+            // surface.prev_nodes after rasterise.
+            let mut new_nodes: HashMap<(u8, u32), (u64, [f32; 4])> =
+                HashMap::new();
+            if let Some(state) = fe.window_state(*win_id) {
+                for (id, p) in &state.rect_nodes {
+                    new_nodes.insert((0, *id), (rect_hash(p), rect_bbox(p)));
+                }
+                for (id, p) in &state.texture_nodes {
+                    new_nodes.insert((1, *id), (texture_hash(p), texture_bbox(p)));
+                }
+                for (id, p) in &state.path_nodes {
+                    new_nodes.insert((2, *id), (path_hash(p), path_bbox(p)));
+                }
+                for (id, p) in &state.glyph_run_nodes {
+                    new_nodes.insert((3, *id), (glyph_run_hash(p), glyph_run_bbox(p)));
+                }
+            }
+
+            // Damage rect = union of bboxes of nodes that changed
+            // (added / removed / hash-different). Compared against
+            // surface.prev_nodes.
+            let mut damage: Option<[f32; 4]> = None;
+            for (key, (h_new, bb_new)) in &new_nodes {
+                match surface.prev_nodes.get(key) {
+                    Some((h_old, bb_old)) if h_old == h_new => { /* unchanged */ }
+                    Some((_, bb_old)) => {
+                        // Hash changed → union old + new.
+                        let u = bbox_union(*bb_old, *bb_new);
+                        damage = Some(match damage { Some(d) => bbox_union(d, u), None => u });
+                    }
+                    None => {
+                        // New node this frame.
+                        damage = Some(match damage {
+                            Some(d) => bbox_union(d, *bb_new), None => *bb_new,
+                        });
+                    }
+                }
+            }
+            for (key, (_, bb_old)) in &surface.prev_nodes {
+                if !new_nodes.contains_key(key) {
+                    // Node removed this frame.
+                    damage = Some(match damage {
+                        Some(d) => bbox_union(d, *bb_old), None => *bb_old,
+                    });
+                }
+            }
+
+            // Fast path: nothing in this window changed since last
+            // frame. Reuse the prior mini-frame bytes verbatim so the
+            // dirty byte-compare matches and we skip the submit.
+            // Without this short-circuit, switching between partial
+            // and full byte streams on a no-change frame would falsely
+            // mark the window dirty and trigger a redundant rasterise.
+            if !force_full
+                && damage.is_none()
+                && !surface.prev_nodes.is_empty()
+            {
+                per_window_frames.push(
+                    (*win_id, surface.last_bytes.clone(), new_nodes),
+                );
+                continue;
+            }
+
+            // Decide partial vs full. Window 0 (background) and
+            // forced full frames always use the clear path.
+            let clip = damage.and_then(|d| clip_and_snap(d, *sw, *sh));
+            let go_partial = !force_full
+                && *win_id != 0
+                && !surface.prev_nodes.is_empty()
+                && match clip {
+                    Some((_, _, dw, dh)) => {
+                        let dmg_area = (dw as f32) * (dh as f32);
+                        let win_area = (*sw as f32) * (*sh as f32);
+                        win_area > 0.0
+                            && dmg_area / win_area < DAMAGE_RECT_THRESHOLD
+                    }
+                    None => false,
+                };
+
             let mut fb = client.frame_builder();
-            fresco_aqueduct_bridge::begin_renderpass(
-                &mut fb, surface.image,
-                if *win_id == 0 { [0, 0, 0, 255] } else { [0, 0, 0, 0] },
-            )?;
+            if go_partial {
+                let (dx, dy, dw, dh) = clip.unwrap();
+                prof.partial_passes += 1;
+                fresco_aqueduct_bridge::begin_renderpass_no_clear(
+                    &mut fb, surface.image,
+                )?;
+                fresco_aqueduct_bridge::set_scissor(&mut fb, dx, dy, dw, dh)?;
+            } else {
+                prof.full_passes += 1;
+                fresco_aqueduct_bridge::begin_renderpass(
+                    &mut fb, surface.image,
+                    if *win_id == 0 { [0, 0, 0, 255] } else { [0, 0, 0, 0] },
+                )?;
+            }
             if let Some(state) = fe.window_state(*win_id) {
                 for p in state.rect_nodes.values() {
                     fresco_aqueduct_bridge::translate_rect(&mut fb, p)?;
@@ -631,7 +871,7 @@ fn render_one_frame_multipass(
             }
             fresco_aqueduct_bridge::end_renderpass(&mut fb)?;
             let bytes = fb.into_buf();
-            per_window_frames.push((*win_id, bytes));
+            per_window_frames.push((*win_id, bytes, new_nodes));
         }
     }
 
@@ -639,9 +879,9 @@ fn render_one_frame_multipass(
     // dirty window — they all target distinct images so this can be
     // batched in a single multi-renderpass submit, but per-window
     // submits give us the early-skip without extra plumbing.
-    for (win_id, bytes) in &per_window_frames {
-        let surface = window_surfaces.get_mut(win_id).unwrap();
-        let dirty = force_full || *bytes != surface.last_bytes;
+    for (win_id, bytes, new_nodes) in per_window_frames.drain(..) {
+        let surface = window_surfaces.get_mut(&win_id).unwrap();
+        let dirty = force_full || bytes != surface.last_bytes;
         if dirty {
             any_dirty = true;
             *timeline += 1;
@@ -654,8 +894,12 @@ fn render_one_frame_multipass(
             let t_wait = Instant::now();
             let _ = client.wait_fence(fence, 50_000_000)?;
             prof.wait += t_wait.elapsed();
-            surface.last_bytes = bytes.clone();
+            surface.last_bytes = bytes;
         }
+        // Always roll prev_nodes forward — even on a non-dirty
+        // frame the map may be empty-but-stable, and we want
+        // diff-against-truth, not against stale state.
+        surface.prev_nodes = new_nodes;
     }
 
     // ── 5. Composite pass: textured-rect each window's surface onto

@@ -211,6 +211,7 @@ fn software_backend_renders_rect_end_to_end() {
     fb.push(FrameOp::BeginRenderPass, &BeginRenderPassBody {
         target_image_id: image_id.raw(),
         clear_color_rgba8: [0, 0, 0, 255],
+        flags: 0,
     }.to_bytes()).unwrap();
 
     let rect_pipe = ResourceId::new(IdNamespace::Builtin, BUILTIN_PIPELINE_RECT);
@@ -320,6 +321,7 @@ fn software_backend_renders_textured_rect_end_to_end() {
     fb.push(FrameOp::BeginRenderPass, &BeginRenderPassBody {
         target_image_id: target_id.raw(),
         clear_color_rgba8: [0, 0, 0, 255],
+        flags: 0,
     }.to_bytes()).unwrap();
 
     let pipe = ResourceId::new(IdNamespace::Builtin, BUILTIN_PIPELINE_TEXTURED_RECT);
@@ -414,6 +416,7 @@ fn write_image_region_patches_subrect_only() {
     fb.push(FrameOp::BeginRenderPass, &BeginRenderPassBody {
         target_image_id: target.raw(),
         clear_color_rgba8: [0, 0, 0, 255],
+        flags: 0,
     }.to_bytes()).unwrap();
     let pipe = ResourceId::new(IdNamespace::Builtin, BUILTIN_PIPELINE_TEXTURED_RECT);
     fb.push(FrameOp::BindPipeline, &pipe.raw().to_le_bytes()).unwrap();
@@ -503,6 +506,7 @@ fn software_backend_handles_multi_renderpass_frame() {
     fb.push(FrameOp::BeginRenderPass, &BeginRenderPassBody {
         target_image_id: atlas_id.raw(),
         clear_color_rgba8: [0, 0, 0, 255],
+        flags: 0,
     }.to_bytes()).unwrap();
     let rect_pipe = ResourceId::new(IdNamespace::Builtin, BUILTIN_PIPELINE_RECT);
     fb.push(FrameOp::BindPipeline, &rect_pipe.raw().to_le_bytes()).unwrap();
@@ -519,6 +523,7 @@ fn software_backend_handles_multi_renderpass_frame() {
     fb.push(FrameOp::BeginRenderPass, &BeginRenderPassBody {
         target_image_id: screen_id.raw(),
         clear_color_rgba8: [0, 0, 0, 255],
+        flags: 0,
     }.to_bytes()).unwrap();
     let tex_pipe = ResourceId::new(IdNamespace::Builtin, BUILTIN_PIPELINE_TEXTURED_RECT);
     fb.push(FrameOp::BindPipeline, &tex_pipe.raw().to_le_bytes()).unwrap();
@@ -630,6 +635,7 @@ fn software_backend_renders_glyph_run_end_to_end() {
     fb.push(FrameOp::BeginRenderPass, &BeginRenderPassBody {
         target_image_id: target_id.raw(),
         clear_color_rgba8: [0, 0, 0, 255],
+        flags: 0,
     }.to_bytes()).unwrap();
 
     let pipe = ResourceId::new(IdNamespace::Builtin, BUILTIN_PIPELINE_GLYPH_RUN);
@@ -790,6 +796,123 @@ fn shader_resolve_returns_miss_then_upload_succeeds() {
     bad_spv.extend_from_slice(&5347u32.to_le_bytes());
     let rej = client.upload_shader(hash, ShaderKind::SpirV, backend_id, bad_spv);
     assert!(rej.is_err(), "validator must reject buffer-device-address");
+
+    drop(client);
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[test]
+fn software_backend_scissor_no_clear_partial_redraw() {
+    // Skip-hierarchy level 3: intra-window dirty rect.
+    //
+    // Pass 1 fills the entire 64×64 target cyan (clears + draws).
+    // Pass 2 reopens the renderpass with BEGIN_RP_FLAG_NO_CLEAR and
+    // a SetScissor restricting writes to the top-left 16×16, then
+    // draws a magenta rect covering the whole image.
+    //
+    // After pass 2:
+    // - pixels inside the 16×16 scissor must be magenta (overwritten),
+    // - pixels outside must still be the cyan from pass 1.
+    use aqueduct_gpu::opcodes::FrameOp;
+    use aqueduct_gpu::payloads::ImageCreatePayload;
+    use aqueduct_gpu::ids::{IdNamespace, ResourceId};
+    use aqueduct_gpu_host::software::{
+        BeginRenderPassBody, RectOpParams, SetScissorBody,
+        BEGIN_RP_FLAG_NO_CLEAR, BUILTIN_PIPELINE_RECT,
+    };
+
+    let sock = tmp_socket("sw_scissor");
+    let sw_backend = Arc::new(aqueduct_gpu_host::SoftwareBackend::new());
+    let backend_for_listener: Arc<dyn aqueduct_gpu_host::Backend> = sw_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap();
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+
+    let conn = Connection::connect(&sock).unwrap();
+    let mut client = GpuClient::new(conn);
+    client.handshake(ClientKind::FrescodRenderer).unwrap();
+
+    let mem = client.allocate_memory(64 * 64 * 4, MemoryUsage::ImageBacking).unwrap();
+    let image_id = client.create_image(ImageCreatePayload {
+        image_id: ResourceId(0),
+        backing_region: mem.region_id,
+        region_offset: 0,
+        format: 37, width: 64, height: 64, depth: 1,
+        mip_levels: 1, array_layers: 1, usage: 0x07,
+    }).unwrap();
+    thread::sleep(Duration::from_millis(20));
+
+    let rect_pipe = ResourceId::new(IdNamespace::Builtin, BUILTIN_PIPELINE_RECT);
+    let fence = client.create_fence().unwrap();
+    let mut fb = client.frame_builder();
+
+    // Pass 1: clear-and-fill cyan, full image.
+    fb.push(FrameOp::BeginRenderPass, &BeginRenderPassBody {
+        target_image_id: image_id.raw(),
+        clear_color_rgba8: [0, 0, 0, 255],
+        flags: 0,
+    }.to_bytes()).unwrap();
+    fb.push(FrameOp::BindPipeline, &rect_pipe.raw().to_le_bytes()).unwrap();
+    let cyan = RectOpParams {
+        x: 0.0, y: 0.0, w: 64.0, h: 64.0,
+        r: 0.0, g: 1.0, b: 1.0, a: 1.0,
+    };
+    let mut pc1 = vec![0u8; 4];
+    pc1.extend_from_slice(&cyan.to_bytes());
+    fb.push(FrameOp::PushConstants, &pc1).unwrap();
+    fb.push(FrameOp::Draw, &[0u8; 16]).unwrap();
+    fb.push(FrameOp::EndRenderPass, &[]).unwrap();
+
+    // Pass 2: no-clear + scissor to top-left 16×16, fill magenta.
+    fb.push(FrameOp::BeginRenderPass, &BeginRenderPassBody {
+        target_image_id: image_id.raw(),
+        clear_color_rgba8: [0, 0, 0, 255],
+        flags: BEGIN_RP_FLAG_NO_CLEAR,
+    }.to_bytes()).unwrap();
+    fb.push(FrameOp::SetScissor, &SetScissorBody {
+        x: 0, y: 0, w: 16, h: 16,
+    }.to_bytes()).unwrap();
+    fb.push(FrameOp::BindPipeline, &rect_pipe.raw().to_le_bytes()).unwrap();
+    let magenta = RectOpParams {
+        x: 0.0, y: 0.0, w: 64.0, h: 64.0,
+        r: 1.0, g: 0.0, b: 1.0, a: 1.0,
+    };
+    let mut pc2 = vec![0u8; 4];
+    pc2.extend_from_slice(&magenta.to_bytes());
+    fb.push(FrameOp::PushConstants, &pc2).unwrap();
+    fb.push(FrameOp::Draw, &[0u8; 16]).unwrap();
+    fb.push(FrameOp::EndRenderPass, &[]).unwrap();
+
+    client.submit_frame(fence, fb, 1).unwrap();
+    let _ = client.wait_fence(fence, 1_000_000_000).unwrap();
+    thread::sleep(Duration::from_millis(50));
+
+    let pixels = sw_backend.read_image_pixels(image_id)
+        .expect("SoftwareBackend should have pixels for the image");
+    assert_eq!(pixels.len(), 64 * 64 * 4);
+
+    // Inside scissor (e.g. pixel (8, 8)) → magenta (255, 0, 255, 255).
+    let inside = ((8 * 64) + 8) * 4;
+    assert_eq!(pixels[inside + 0], 255, "R inside scissor");
+    assert_eq!(pixels[inside + 1],   0, "G inside scissor");
+    assert_eq!(pixels[inside + 2], 255, "B inside scissor");
+    assert_eq!(pixels[inside + 3], 255, "A inside scissor");
+
+    // Just outside scissor (e.g. pixel (20, 20)) → cyan preserved.
+    let outside = ((20 * 64) + 20) * 4;
+    assert_eq!(pixels[outside + 0],   0, "R outside scissor (cyan preserved)");
+    assert_eq!(pixels[outside + 1], 255, "G outside scissor");
+    assert_eq!(pixels[outside + 2], 255, "B outside scissor");
+    assert_eq!(pixels[outside + 3], 255, "A outside scissor");
+
+    // Far corner — also should be cyan.
+    let corner = ((60 * 64) + 60) * 4;
+    assert_eq!(pixels[corner + 0],   0, "R far corner");
+    assert_eq!(pixels[corner + 1], 255, "G far corner");
+    assert_eq!(pixels[corner + 2], 255, "B far corner");
+
+    assert_eq!(sw_backend.dispatch_failure_count(), 0);
 
     drop(client);
     let _ = server_thread;

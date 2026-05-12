@@ -276,6 +276,14 @@ pub fn translate_glyph_run(
     Ok(())
 }
 
+/// Flag bits for `begin_renderpass_with_flags`. Mirrors
+/// `aqueduct_gpu_host::software::BEGIN_RP_FLAG_*`.
+///
+/// `BEGIN_RP_FLAG_NO_CLEAR` skips the framebuffer-clear at
+/// renderpass start; combined with a scissor it produces an
+/// intra-window dirty-rect partial redraw.
+pub const BEGIN_RP_FLAG_NO_CLEAR: u32 = 0x1;
+
 /// Emit a `BEGIN_RENDERPASS` record targeting `target_image_id`
 /// with the given clear colour. Convenience wrapper — callers
 /// could roll this themselves, but every frame needs one.
@@ -284,10 +292,51 @@ pub fn begin_renderpass(
     target_image_id: ResourceId,
     clear_color_rgba8: [u8; 4],
 ) -> Result<(), BridgeError> {
-    let mut body = [0u8; 8];
+    begin_renderpass_with_flags(fb, target_image_id, clear_color_rgba8, 0)
+}
+
+/// Like `begin_renderpass` but with explicit `flags`. Emits the
+/// extended 12-byte body the tier-1 renderer accepts; flags=0 is
+/// equivalent to the legacy 8-byte body.
+pub fn begin_renderpass_with_flags(
+    fb: &mut FrameBuilder,
+    target_image_id: ResourceId,
+    clear_color_rgba8: [u8; 4],
+    flags: u32,
+) -> Result<(), BridgeError> {
+    let mut body = [0u8; 12];
     body[..4].copy_from_slice(&target_image_id.raw().to_le_bytes());
-    body[4..].copy_from_slice(&clear_color_rgba8);
+    body[4..8].copy_from_slice(&clear_color_rgba8);
+    body[8..12].copy_from_slice(&flags.to_le_bytes());
     fb.push(FrameOp::BeginRenderPass, &body)?;
+    Ok(())
+}
+
+/// Shorthand for the intra-window dirty-rect case: begin a
+/// renderpass that preserves existing pixmap contents (no clear).
+/// Pair with `set_scissor` for the actual damage rect.
+pub fn begin_renderpass_no_clear(
+    fb: &mut FrameBuilder,
+    target_image_id: ResourceId,
+) -> Result<(), BridgeError> {
+    begin_renderpass_with_flags(
+        fb, target_image_id, [0, 0, 0, 0], BEGIN_RP_FLAG_NO_CLEAR,
+    )
+}
+
+/// Emit a `SET_SCISSOR` record restricting subsequent draws within
+/// the current renderpass to `(x, y, w, h)` in target pixels.
+/// Resets at the next `BEGIN_RENDERPASS` / `END_RENDERPASS`.
+pub fn set_scissor(
+    fb: &mut FrameBuilder,
+    x: u32, y: u32, w: u32, h: u32,
+) -> Result<(), BridgeError> {
+    let mut body = [0u8; 16];
+    body[ 0.. 4].copy_from_slice(&x.to_le_bytes());
+    body[ 4.. 8].copy_from_slice(&y.to_le_bytes());
+    body[ 8..12].copy_from_slice(&w.to_le_bytes());
+    body[12..16].copy_from_slice(&h.to_le_bytes());
+    fb.push(FrameOp::SetScissor, &body)?;
     Ok(())
 }
 

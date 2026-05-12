@@ -53,6 +53,14 @@ path = "src/glyph_stress.rs"
 name = "atrium-multiwindow-stress"
 path = "src/multiwindow_stress.rs"
 
+# Intra-window damage-rect scenario: one window with static
+# corner rects + a small bouncing "cursor" rect. Verifies
+# frescod-aqueduct's skip-hierarchy level 3 (partial redraw via
+# SetScissor + no-clear renderpass) fires.
+[[bin]]
+name = "atrium-partial-stress"
+path = "src/partial_stress.rs"
+
 [dependencies]
 fresco-client   = { path = "../fresco-client" }
 fresco-protocol = { path = "../fresco-protocol" }

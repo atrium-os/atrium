@@ -931,6 +931,59 @@ diff when the kmod work is in:
 - `frescod/src/bin/frescod_aqueduct.rs`: ~80 lines (BO ring,
   kqueue main loop, queued-flip semantics)
 
+### 6.5.6. Skip hierarchy — three levels of avoided work — IMPLEMENTED
+
+Beyond scanout buffering (§6.5.5), tier-1 rasterisation cost
+dominates frame budget. Three orthogonal skip layers, all
+landed:
+
+**Level 1: per-screen flip skip.** If the composite FrameOp
+byte-stream is identical to last frame AND no window dirtied
+its content this frame, skip `page_flip` entirely. The kmod
+keeps scanning out the last good BO. A VRR keepalive flip
+re-asserts the scanout every `VRR_KEEPALIVE_INTERVALS` (=60)
+refresh intervals to satisfy connectors that require periodic
+refresh.
+
+**Level 2: per-window rasterise skip.** Each window has its
+own offscreen image (`WindowSurface`). The per-window
+mini-frame's bytes are byte-compared against the prior frame;
+non-dirty windows skip submit + wait + readback. A final
+composite pass textured-rects each window onto the screen
+target. Validated end-to-end: 1 / 5 / 10 windows all hold
+~5 ms render cost with ~58 µs/window composite-only.
+
+**Level 3: intra-window dirty rect.** Per-window, per-node
+hashes + AABBs are tracked between frames. The union of changed
+nodes' bboxes is the damage rect. If the damage rect is below
+`DAMAGE_RECT_THRESHOLD` (=0.5) of the window area, the dirty
+render uses `BEGIN_RENDERPASS` with `BEGIN_RP_FLAG_NO_CLEAR` +
+`SET_SCISSOR(damage_rect)` — tier-1 rasterises only inside the
+scissor and preserves existing pixmap contents elsewhere.
+Window 0 (screen background) always uses the full clear path.
+A "nothing changed at all" fast path reuses the prior mini-
+frame bytes verbatim so byte-compare correctly skips submit.
+
+Validated end-to-end with `atrium-partial-stress` (800×600
+window with 4 static corner rects + 32×32 bouncing cursor):
+~30 partial passes/s match the client's 30 fps mutation rate;
+42 % of frescod iterations hit the no-change fast path; wait
+phase drops from 6.4 ms → 5.5 ms vs the full-clear baseline.
+
+Renderer additions (`aqueduct-gpu-host/src/software/renderer.rs`):
+
+- `BeginRenderPassBody.flags: u32` with `BEGIN_RP_FLAG_NO_CLEAR`
+  (12-byte body; 8-byte legacy form still accepted, flags=0).
+- `SetScissorBody { x, y, w, h }` (16 bytes); applies to
+  subsequent `fill_path` calls via a lazily-built
+  `tiny_skia::Mask`. Reset at `BeginRenderPass` /
+  `EndRenderPass`.
+
+Bridge additions (`fresco-aqueduct-bridge`):
+
+- `begin_renderpass_no_clear`, `set_scissor`,
+  `begin_renderpass_with_flags`, `BEGIN_RP_FLAG_NO_CLEAR`.
+
 ---
 
 ## 7. API surfaces and composition strategies

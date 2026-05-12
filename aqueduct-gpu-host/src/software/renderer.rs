@@ -38,18 +38,23 @@ use super::{
 
 /// Body layout for `FOP_BEGIN_RENDERPASS` records in tier-1.
 ///
-/// Compositor-friendly minimal schema for Phase 1.3c: one color
-/// target + an RGBA8 clear colour. Multi-target / depth / multi-
-/// renderpass extensions land alongside the textured-rect + path
-/// rasterisers in follow-on commits.
-///
-/// Wire layout: 8 bytes, plain little-endian.
+/// Wire layout: 8 or 12 bytes, plain little-endian. Newer clients
+/// emit 12-byte bodies with the trailing `flags` field; 8-byte
+/// bodies are accepted for backward compat (flags = 0).
 ///
 /// ```text
 ///   offset  size  field
 ///   0       4     target_image_id   (u32, ResourceId::raw())
 ///   4       4     clear_color_rgba8 (4×u8: R, G, B, A premultiplied)
+///   8       4     flags             (u32, optional; default 0)
 /// ```
+///
+/// Defined flag bits:
+///   `BEGIN_RP_FLAG_NO_CLEAR (0x1)` — skip the framebuffer fill at
+/// the start of the renderpass. Used by intra-window dirty-rect
+/// partial redraw: combined with a `SetScissor`, the pass writes
+/// new pixels only inside the scissor, leaving existing pixmap
+/// contents intact everywhere else.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[repr(C)]
 pub struct BeginRenderPassBody {
@@ -58,10 +63,18 @@ pub struct BeginRenderPassBody {
     pub target_image_id: u32,
     /// Premultiplied straight-alpha clear colour, RGBA8.
     pub clear_color_rgba8: [u8; 4],
+    /// Flag bits — see `BEGIN_RP_FLAG_*` constants.
+    pub flags: u32,
 }
 
+/// Skip the framebuffer-clear at renderpass start. Combined with
+/// a `SetScissor`, lets a partial redraw write only inside the
+/// scissor rect, preserving existing pixmap contents elsewhere.
+pub const BEGIN_RP_FLAG_NO_CLEAR: u32 = 0x1;
+
 impl BeginRenderPassBody {
-    /// Decode from a FOP record body.
+    /// Decode from a FOP record body. Accepts both 8-byte (legacy,
+    /// flags=0) and 12-byte (extended) bodies.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, RendererError> {
         if bytes.len() < 8 {
             return Err(RendererError::ShortBody {
@@ -70,18 +83,70 @@ impl BeginRenderPassBody {
                 want: 8,
             });
         }
+        let flags = if bytes.len() >= 12 {
+            u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]])
+        } else {
+            0
+        };
         Ok(Self {
             target_image_id: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
             clear_color_rgba8: [bytes[4], bytes[5], bytes[6], bytes[7]],
+            flags,
         })
     }
 
-    /// Encode as plain little-endian bytes (8 bytes). Used by
-    /// clients constructing tier-1 frames.
-    pub fn to_bytes(&self) -> [u8; 8] {
-        let mut buf = [0u8; 8];
+    /// Encode as plain little-endian bytes (12 bytes; emits the
+    /// extended form with the flags field).
+    pub fn to_bytes(&self) -> [u8; 12] {
+        let mut buf = [0u8; 12];
         buf[..4].copy_from_slice(&self.target_image_id.to_le_bytes());
-        buf[4..].copy_from_slice(&self.clear_color_rgba8);
+        buf[4..8].copy_from_slice(&self.clear_color_rgba8);
+        buf[8..12].copy_from_slice(&self.flags.to_le_bytes());
+        buf
+    }
+}
+
+/// Body layout for `FOP_SET_SCISSOR` records in tier-1.
+///
+/// Restricts subsequent draw calls in the current renderpass to the
+/// rectangle `[x..x+w, y..y+h]` in target pixels. Clearing the
+/// scissor: pass `w == 0 || h == 0` and the renderer drops the clip.
+///
+/// Wire layout: 16 bytes, plain little-endian (four u32).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[repr(C)]
+pub struct SetScissorBody {
+    /// Top-left X (target pixels).
+    pub x: u32,
+    /// Top-left Y.
+    pub y: u32,
+    /// Width.
+    pub w: u32,
+    /// Height.
+    pub h: u32,
+}
+
+impl SetScissorBody {
+    /// Decode from a FOP record body.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, RendererError> {
+        if bytes.len() < 16 {
+            return Err(RendererError::ShortBody {
+                op: FrameOp::SetScissor,
+                got: bytes.len(),
+                want: 16,
+            });
+        }
+        let u = |o: usize| u32::from_le_bytes([bytes[o], bytes[o+1], bytes[o+2], bytes[o+3]]);
+        Ok(Self { x: u(0), y: u(4), w: u(8), h: u(12) })
+    }
+
+    /// Encode as plain little-endian bytes (16 bytes).
+    pub fn to_bytes(&self) -> [u8; 16] {
+        let mut buf = [0u8; 16];
+        buf[..4].copy_from_slice(&self.x.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.y.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.w.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.h.to_le_bytes());
         buf
     }
 }
@@ -613,6 +678,12 @@ pub struct TinySkiaRenderer<'a> {
     in_renderpass: bool,
     current_pipeline: Option<ResourceId>,
     push_constants: Vec<u8>,
+    /// Current scissor rect in target pixels. `None` = no clip
+    /// (full target). Built into a tiny-skia `Mask` lazily on
+    /// first draw after `SetScissor` so single-renderpass code that
+    /// never sets a scissor pays no extra cost.
+    scissor: Option<(u32, u32, u32, u32)>,
+    scissor_mask: Option<tiny_skia::Mask>,
 }
 
 impl<'a> TinySkiaRenderer<'a> {
@@ -625,7 +696,39 @@ impl<'a> TinySkiaRenderer<'a> {
             in_renderpass: false,
             current_pipeline: None,
             push_constants: Vec::new(),
+            scissor: None,
+            scissor_mask: None,
         }
+    }
+
+    /// Lazily build / cache a `Mask` covering the current scissor
+    /// rect. After this returns, `self.scissor_mask` is `Some` if
+    /// a scissor is active, `None` otherwise. Split out of the
+    /// mask-read site to satisfy Rust's borrow checker: rasterisers
+    /// need to pass `self.scissor_mask.as_ref()` alongside a
+    /// `&mut self.target.fill_path(...)` call, so the mask field
+    /// must already be populated before the rasteriser borrows
+    /// `&mut self.target`.
+    fn ensure_scissor_mask(&mut self) {
+        let Some((x, y, w, h)) = self.scissor else { return; };
+        if self.scissor_mask.is_some() { return; }
+        let tw = self.target.width();
+        let th = self.target.height();
+        let Some(mut mask) = tiny_skia::Mask::new(tw, th) else { return; };
+        if w > 0 && h > 0 {
+            if let Some(rect) = tiny_skia::Rect::from_xywh(
+                x as f32, y as f32, w as f32, h as f32,
+            ) {
+                let path = tiny_skia::PathBuilder::from_rect(rect);
+                mask.fill_path(
+                    &path,
+                    tiny_skia::FillRule::Winding,
+                    true,
+                    tiny_skia::Transform::identity(),
+                );
+            }
+        }
+        self.scissor_mask = Some(mask);
     }
 
     /// Dispatch all records in a frame command stream. Returns the
@@ -644,6 +747,7 @@ impl<'a> TinySkiaRenderer<'a> {
                     self.handle_draw()?;
                     draws += 1;
                 }
+                FrameOp::SetScissor => self.handle_set_scissor(body)?,
 
                 // Frame ops the tier-1 renderer doesn't yet handle.
                 // Caller surfaces these via OP_GPU_VALIDATION_ERR.
@@ -651,7 +755,6 @@ impl<'a> TinySkiaRenderer<'a> {
                 | FrameOp::BindVertexBuf
                 | FrameOp::BindIndexBuf
                 | FrameOp::SetViewport
-                | FrameOp::SetScissor
                 | FrameOp::DrawIndexed
                 | FrameOp::DrawIndirect
                 | FrameOp::Dispatch
@@ -679,13 +782,19 @@ impl<'a> TinySkiaRenderer<'a> {
             return Err(RendererError::NestedRenderPass);
         }
         let p = BeginRenderPassBody::from_bytes(body)?;
-        // The renderer's `target` is set by the caller (typically
-        // SoftwareBackend::submit_frame, after resolving
-        // target_image_id against its image map). All we do here
-        // is honour the clear-colour and remember the in-pass state.
-        let [r, g, b, a] = p.clear_color_rgba8;
-        self.target.fill(Color::from_rgba8(r, g, b, a));
+        // Honour the clear-colour unless the caller set the
+        // BEGIN_RP_FLAG_NO_CLEAR flag (intra-window dirty-rect
+        // partial redraw: combined with a SetScissor, the pass
+        // touches only inside-scissor pixels and existing pixmap
+        // contents persist everywhere else).
+        if p.flags & BEGIN_RP_FLAG_NO_CLEAR == 0 {
+            let [r, g, b, a] = p.clear_color_rgba8;
+            self.target.fill(Color::from_rgba8(r, g, b, a));
+        }
         self.in_renderpass = true;
+        // Scissor state is per-renderpass; new pass starts unclipped.
+        self.scissor = None;
+        self.scissor_mask = None;
         Ok(())
     }
 
@@ -696,6 +805,21 @@ impl<'a> TinySkiaRenderer<'a> {
         self.in_renderpass = false;
         self.current_pipeline = None;
         self.push_constants.clear();
+        self.scissor = None;
+        self.scissor_mask = None;
+        Ok(())
+    }
+
+    fn handle_set_scissor(&mut self, body: &[u8]) -> Result<(), RendererError> {
+        let s = SetScissorBody::from_bytes(body)?;
+        if s.w == 0 || s.h == 0 {
+            // Clear scissor.
+            self.scissor = None;
+        } else {
+            self.scissor = Some((s.x, s.y, s.w, s.h));
+        }
+        // Force mask rebuild on next draw.
+        self.scissor_mask = None;
         Ok(())
     }
 
@@ -825,8 +949,10 @@ impl<'a> TinySkiaRenderer<'a> {
         paint.anti_alias = false;
 
         let path = tiny_skia::PathBuilder::from_rect(dst);
+        self.ensure_scissor_mask();
         self.target.fill_path(
-            &path, &paint, FillRule::Winding, Transform::identity(), None,
+            &path, &paint, FillRule::Winding, Transform::identity(),
+            self.scissor_mask.as_ref(),
         );
         // Tint RGB ignored for tier-1 (Pattern doesn't directly
         // accept an RGB multiplier). The alpha channel is honoured
@@ -839,6 +965,7 @@ impl<'a> TinySkiaRenderer<'a> {
     }
 
     fn rasterise_glyph_run(&mut self) -> Result<(), RendererError> {
+        self.ensure_scissor_mask();
         let params = GlyphRunParams::from_bytes(&self.push_constants)?;
         if params.glyphs.is_empty() {
             return Ok(());
@@ -902,7 +1029,8 @@ impl<'a> TinySkiaRenderer<'a> {
 
             let path = tiny_skia::PathBuilder::from_rect(dst);
             self.target.fill_path(
-                &path, &paint, FillRule::Winding, Transform::identity(), None,
+                &path, &paint, FillRule::Winding, Transform::identity(),
+                self.scissor_mask.as_ref(),
             );
         }
 
@@ -945,7 +1073,9 @@ impl<'a> TinySkiaRenderer<'a> {
             PathFillRule::Winding => FillRule::Winding,
             PathFillRule::EvenOdd => FillRule::EvenOdd,
         };
-        self.target.fill_path(&path, &paint, fill_rule, Transform::identity(), None);
+        self.ensure_scissor_mask();
+        self.target.fill_path(&path, &paint, fill_rule, Transform::identity(),
+            self.scissor_mask.as_ref());
         Ok(())
     }
 
@@ -969,12 +1099,13 @@ impl<'a> TinySkiaRenderer<'a> {
             .ok_or(RendererError::InvalidRect)?;
 
         let path = tiny_skia::PathBuilder::from_rect(rect);
+        self.ensure_scissor_mask();
         self.target.fill_path(
             &path,
             &paint,
             FillRule::Winding,
             Transform::identity(),
-            None,
+            self.scissor_mask.as_ref(),
         );
         Ok(())
     }
@@ -1097,10 +1228,11 @@ mod tests {
     use aqueduct_gpu::ids::IdNamespace;
     use tiny_skia::Pixmap;
 
-    fn rp_body(target_image_local: u32, clear: [u8; 4]) -> [u8; 8] {
+    fn rp_body(target_image_local: u32, clear: [u8; 4]) -> [u8; 12] {
         BeginRenderPassBody {
             target_image_id: ResourceId::new(IdNamespace::IcdRuntime, target_image_local).raw(),
             clear_color_rgba8: clear,
+            flags: 0,
         }.to_bytes()
     }
 
