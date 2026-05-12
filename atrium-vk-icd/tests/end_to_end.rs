@@ -1016,6 +1016,160 @@ fn shader_module_create_destroy_through_daemon_cache() {
 }
 
 #[test]
+fn render_pass_framebuffer_and_begin_end_recording() {
+    use atrium_vk_icd::{
+        cmdbuf_recorded_bytes,
+        vkAllocateCommandBuffers, vkAllocateMemory, vkBeginCommandBuffer,
+        vkBindImageMemory, vkCmdBeginRenderPass, vkCmdDraw, vkCmdEndRenderPass,
+        vkCreateCommandPool, vkCreateDevice, vkCreateFramebuffer, vkCreateImage,
+        vkCreateImageView, vkCreateRenderPass, vkDestroyCommandPool,
+        vkDestroyDevice, vkDestroyFramebuffer, vkDestroyImage,
+        vkDestroyImageView, vkDestroyRenderPass, vkEndCommandBuffer,
+        vkFreeMemory, vkGetImageMemoryRequirements,
+    };
+
+    let sock = tmp_socket("rp");
+    let sw_backend = Arc::new(SoftwareBackend::new());
+    let backend_for_listener: Arc<dyn Backend> = sw_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap();
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+
+    type VkDevice = *mut std::ffi::c_void;
+    type VkCommandBuffer = *mut std::ffi::c_void;
+
+    // Bootstrap.
+    let mut instance: VkInstance = std::ptr::null_mut();
+    unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
+    let mut pds: [VkPhysicalDevice; 1] = [std::ptr::null_mut(); 1];
+    let mut cap: u32 = 1;
+    unsafe { vkEnumeratePhysicalDevices(instance, &mut cap, pds.as_mut_ptr()); }
+    let mut device: VkDevice = std::ptr::null_mut();
+    unsafe { vkCreateDevice(pds[0], std::ptr::null(), std::ptr::null(), &mut device); }
+
+    // Image + view + bound memory.
+    let mut img_info = [0u8; 88];
+    img_info[ 0.. 4].copy_from_slice(&14u32.to_le_bytes());
+    img_info[24..28].copy_from_slice(&37u32.to_le_bytes()); // R8G8B8A8_UNORM
+    img_info[28..32].copy_from_slice(&64u32.to_le_bytes());
+    img_info[32..36].copy_from_slice(&64u32.to_le_bytes());
+    img_info[36..40].copy_from_slice(&1u32.to_le_bytes());
+    img_info[40..44].copy_from_slice(&1u32.to_le_bytes());
+    img_info[44..48].copy_from_slice(&1u32.to_le_bytes());
+    img_info[56..60].copy_from_slice(&0x10u32.to_le_bytes()); // COLOR_ATTACHMENT
+    let mut image: u64 = 0;
+    unsafe { vkCreateImage(device, img_info.as_ptr() as *const _, std::ptr::null(), &mut image); }
+    let mut req = ash::vk::MemoryRequirements::default();
+    unsafe { vkGetImageMemoryRequirements(device, image, &mut req); }
+    let mut alloc = [0u8; 32];
+    alloc[0..4].copy_from_slice(&5u32.to_le_bytes());
+    alloc[16..24].copy_from_slice(&req.size.to_le_bytes());
+    let mut mem: u64 = 0;
+    unsafe { vkAllocateMemory(device, alloc.as_ptr() as *const _, std::ptr::null(), &mut mem); }
+    unsafe { vkBindImageMemory(device, image, mem, 0); }
+    thread::sleep(Duration::from_millis(30));
+
+    // Image view referencing the image.
+    let mut view_info = [0u8; 80];
+    view_info[ 0.. 4].copy_from_slice(&15u32.to_le_bytes()); // sType
+    view_info[24..32].copy_from_slice(&image.to_le_bytes());
+    let mut view: u64 = 0;
+    unsafe { vkCreateImageView(device, view_info.as_ptr() as *const _, std::ptr::null(), &mut view); }
+    assert!(view != 0);
+
+    // Render pass: ignored fields, just need a non-zero handle.
+    let mut rp_info = [0u8; 64];
+    rp_info[0..4].copy_from_slice(&38u32.to_le_bytes());
+    let mut render_pass: u64 = 0;
+    unsafe { vkCreateRenderPass(device, rp_info.as_ptr() as *const _, std::ptr::null(), &mut render_pass); }
+    assert!(render_pass != 0);
+
+    // Framebuffer: 1 attachment, 64×64.
+    let mut fb_info = [0u8; 64];
+    fb_info[ 0.. 4].copy_from_slice(&37u32.to_le_bytes()); // sType
+    fb_info[24..32].copy_from_slice(&render_pass.to_le_bytes());
+    fb_info[32..36].copy_from_slice(&1u32.to_le_bytes());
+    let attachments_arr = [view];
+    let p_attachments_ptr = attachments_arr.as_ptr() as u64;
+    fb_info[40..48].copy_from_slice(&p_attachments_ptr.to_le_bytes());
+    fb_info[48..52].copy_from_slice(&64u32.to_le_bytes());
+    fb_info[52..56].copy_from_slice(&64u32.to_le_bytes());
+    let mut fb: u64 = 0;
+    unsafe { vkCreateFramebuffer(device, fb_info.as_ptr() as *const _, std::ptr::null(), &mut fb); }
+    assert!(fb != 0);
+
+    // Record a render pass.
+    let mut pool: u64 = 0;
+    unsafe { vkCreateCommandPool(device, std::ptr::null(), std::ptr::null(), &mut pool); }
+    let mut cb_info = [0u8; 40];
+    cb_info[0..4].copy_from_slice(&40u32.to_le_bytes());
+    cb_info[16..24].copy_from_slice(&pool.to_le_bytes());
+    cb_info[28..32].copy_from_slice(&1u32.to_le_bytes());
+    let mut cbs: [VkCommandBuffer; 1] = [std::ptr::null_mut(); 1];
+    unsafe { vkAllocateCommandBuffers(device, cb_info.as_ptr() as *const _, cbs.as_mut_ptr()); }
+    let cb = cbs[0];
+
+    unsafe { vkBeginCommandBuffer(cb, std::ptr::null()); }
+
+    // VkRenderPassBeginInfo: sType@0, pNext@8, renderPass@16,
+    // framebuffer@24, renderArea@32 (16 B), clearValueCount@48,
+    // pClearValues@56. Total 64 bytes.
+    let mut rpb = [0u8; 64];
+    rpb[ 0.. 4].copy_from_slice(&43u32.to_le_bytes()); // sType
+    rpb[16..24].copy_from_slice(&render_pass.to_le_bytes());
+    rpb[24..32].copy_from_slice(&fb.to_le_bytes());
+    rpb[48..52].copy_from_slice(&1u32.to_le_bytes());
+    let clear: [f32; 4] = [1.0, 0.5, 0.0, 1.0]; // orange
+    let clear_ptr = clear.as_ptr() as u64;
+    rpb[56..64].copy_from_slice(&clear_ptr.to_le_bytes());
+
+    unsafe { vkCmdBeginRenderPass(cb, rpb.as_ptr() as *const _, 0); }
+    unsafe { vkCmdDraw(cb, 3, 1, 0, 0); }
+    unsafe { vkCmdEndRenderPass(cb); }
+    unsafe { vkEndCommandBuffer(cb); }
+
+    // Decode the recorded stream:
+    //   BeginRenderPass (opcode 0x0010, body 12 B) = 20 B
+    //   Draw            (opcode 0x0040, body 16 B) = 24 B
+    //   EndRenderPass   (opcode 0x0011, body 0)    = 8 B
+    //   total 52 B.
+    let bytes = cmdbuf_recorded_bytes(cb);
+    assert_eq!(bytes.len(), 52, "expected 52 bytes, got {}", bytes.len());
+    let op0 = u16::from_le_bytes([bytes[0], bytes[1]]);
+    let op1 = u16::from_le_bytes([bytes[20], bytes[21]]);
+    let op2 = u16::from_le_bytes([bytes[44], bytes[45]]);
+    assert_eq!(op0, 0x0010, "BeginRenderPass");
+    assert_eq!(op1, 0x0040, "Draw");
+    assert_eq!(op2, 0x0011, "EndRenderPass");
+
+    // BeginRenderPass body: bytes[8..20]. target_image_id at [8..12],
+    // clear_color_rgba8 at [12..16]. Verify the clear quantized
+    // correctly: (1.0, 0.5, 0.0, 1.0) → (255, 127or128, 0, 255).
+    let r = bytes[12];
+    let g = bytes[13];
+    let b = bytes[14];
+    let a = bytes[15];
+    assert_eq!(r, 255);
+    assert!(g == 127 || g == 128);
+    assert_eq!(b, 0);
+    assert_eq!(a, 255);
+
+    // Cleanup.
+    unsafe { vkDestroyFramebuffer(device, fb, std::ptr::null()); }
+    unsafe { vkDestroyRenderPass(device, render_pass, std::ptr::null()); }
+    unsafe { vkDestroyImageView(device, view, std::ptr::null()); }
+    unsafe { vkDestroyImage(device, image, std::ptr::null()); }
+    unsafe { vkFreeMemory(device, mem, std::ptr::null()); }
+    unsafe { vkDestroyCommandPool(device, pool, std::ptr::null()); }
+    unsafe { vkDestroyDevice(device, std::ptr::null()); }
+    unsafe { vkDestroyInstance(instance, std::ptr::null()); }
+    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[test]
 fn proc_addr_resolves_three_entry_points() {
     // No live daemon required for the get_proc_addr lookups.
     fn lookup(name: &[u8]) -> Option<unsafe extern "C" fn()> {

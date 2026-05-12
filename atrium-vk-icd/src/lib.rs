@@ -273,6 +273,29 @@ struct AtriumDevice {
     shaders: std::sync::Mutex<std::collections::HashMap<u64, AtriumShaderModule>>,
     /// Monotonic counter for VkShaderModule handles.
     next_shader_id: std::cell::Cell<u64>,
+    /// Per-VkImageView state. Each view records the VkImage it
+    /// references; vkCmdBeginRenderPass walks framebuffer →
+    /// image-view → image → image_id to fill BeginRenderPass's
+    /// target_image_id field.
+    image_views: std::sync::Mutex<std::collections::HashMap<u64, u64 /* VkImage */>>,
+    next_image_view_id: std::cell::Cell<u64>,
+    /// Per-VkRenderPass state. Today: opaque non-zero u64 with
+    /// no fields tracked (the host endpoint's renderer abstracts
+    /// over render-pass details; we only need a valid handle).
+    next_render_pass_id: std::cell::Cell<u64>,
+    /// Per-VkFramebuffer state. Records the attachments + extent
+    /// so vkCmdBeginRenderPass can find the target image view.
+    framebuffers: std::sync::Mutex<std::collections::HashMap<u64, AtriumFramebuffer>>,
+    next_framebuffer_id: std::cell::Cell<u64>,
+}
+
+/// Per-VkFramebuffer state.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct AtriumFramebuffer {
+    width:        u32,
+    height:       u32,
+    attachments:  Vec<u64>, /* VkImageView handles */
 }
 
 /// ICD-side state for a `VkShaderModule`. We don't keep the
@@ -654,9 +677,40 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkDevice, u64, *const c_void), FnVoidPtr,
             >(vkDestroyShaderModule)),
+        "vkCreateImageView" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, *const c_void, *const c_void, *mut u64) -> VkResult, FnVoidPtr,
+            >(vkCreateImageView)),
+        "vkDestroyImageView" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, *const c_void), FnVoidPtr,
+            >(vkDestroyImageView)),
+        "vkCreateRenderPass" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, *const c_void, *const c_void, *mut u64) -> VkResult, FnVoidPtr,
+            >(vkCreateRenderPass)),
+        "vkDestroyRenderPass" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, *const c_void), FnVoidPtr,
+            >(vkDestroyRenderPass)),
+        "vkCreateFramebuffer" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, *const c_void, *const c_void, *mut u64) -> VkResult, FnVoidPtr,
+            >(vkCreateFramebuffer)),
+        "vkDestroyFramebuffer" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, *const c_void), FnVoidPtr,
+            >(vkDestroyFramebuffer)),
+        "vkCmdBeginRenderPass" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, *const c_void, u32), FnVoidPtr,
+            >(vkCmdBeginRenderPass)),
+        "vkCmdEndRenderPass" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer), FnVoidPtr,
+            >(vkCmdEndRenderPass)),
         // Phase 1.3b+ continued: vkCmdCopyBuffer*,
-        // vkCmdPipelineBarrier, vkCmdBegin/EndRenderPass,
-        // VkRenderPass / VkFramebuffer / VkImageView, …
+        // vkCmdPipelineBarrier, descriptor sets, samplers, …
         _ => None,
     }
 }
@@ -894,6 +948,11 @@ pub unsafe extern "C" fn vkCreateDevice(
         next_image_id:  std::cell::Cell::new(1),
         shaders:        std::sync::Mutex::new(std::collections::HashMap::new()),
         next_shader_id: std::cell::Cell::new(1),
+        image_views:        std::sync::Mutex::new(std::collections::HashMap::new()),
+        next_image_view_id: std::cell::Cell::new(1),
+        next_render_pass_id: std::cell::Cell::new(1),
+        framebuffers:        std::sync::Mutex::new(std::collections::HashMap::new()),
+        next_framebuffer_id: std::cell::Cell::new(1),
     });
     let dev_ptr: *mut AtriumDevice = &mut *dev;
     let q = Box::new(AtriumQueue {
@@ -1824,6 +1883,210 @@ pub unsafe extern "C" fn vkDestroyShaderModule(
     }
 }
 
+/// `vkCreateImageView` — record a (VkImageView u64 → VkImage u64)
+/// mapping. We ignore view-type / format / aspect-mask /
+/// subresource-range for the skeleton; vkCmdBeginRenderPass just
+/// needs the parent image's daemon-side image_id.
+///
+/// VkImageViewCreateInfo layout:
+///   0   sType, 8 pNext, 16 flags, 24 image (u64),
+///   32 viewType, 36 format, ...
+#[no_mangle]
+pub unsafe extern "C" fn vkCreateImageView(
+    device:        VkDevice,
+    p_create_info: *const c_void,
+    _p_allocator:  *const c_void,
+    p_view:        *mut u64,
+) -> VkResult {
+    if device.is_null() || p_create_info.is_null() || p_view.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let dev = &*(device as *const AtriumDevice);
+    let image = std::ptr::read_unaligned(
+        (p_create_info as *const u8).add(24) as *const u64,
+    );
+    let handle = dev.next_image_view_id.get();
+    dev.next_image_view_id.set(handle + 1);
+    if let Ok(mut v) = dev.image_views.lock() {
+        v.insert(handle, image);
+    } else {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    *p_view = handle;
+    VK_SUCCESS
+}
+
+/// `vkDestroyImageView` — drop the mapping.
+#[no_mangle]
+pub unsafe extern "C" fn vkDestroyImageView(
+    device:       VkDevice,
+    view:         u64,
+    _p_allocator: *const c_void,
+) {
+    if device.is_null() || view == 0 { return; }
+    let dev = &*(device as *const AtriumDevice);
+    if let Ok(mut v) = dev.image_views.lock() {
+        v.remove(&view);
+    }
+}
+
+/// `vkCreateRenderPass` — return a unique non-zero u64. We don't
+/// track attachment specs today; the host endpoint's renderer
+/// abstracts over render-pass details. Future Phase 1.3b+ would
+/// store the load/store-op list for vkCmdBeginRenderPass to
+/// derive the clear color / preserve semantics.
+#[no_mangle]
+pub unsafe extern "C" fn vkCreateRenderPass(
+    device:          VkDevice,
+    _p_create_info:  *const c_void,
+    _p_allocator:    *const c_void,
+    p_render_pass:   *mut u64,
+) -> VkResult {
+    if device.is_null() || p_render_pass.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let dev = &*(device as *const AtriumDevice);
+    let h = dev.next_render_pass_id.get();
+    dev.next_render_pass_id.set(h + 1);
+    *p_render_pass = h;
+    VK_SUCCESS
+}
+
+/// `vkDestroyRenderPass` — no-op; we don't track per-handle state.
+#[no_mangle]
+pub unsafe extern "C" fn vkDestroyRenderPass(
+    _device:        VkDevice,
+    _render_pass:   u64,
+    _p_allocator:   *const c_void,
+) {}
+
+/// `vkCreateFramebuffer` — record the attachment image views +
+/// extent.
+///
+/// VkFramebufferCreateInfo layout:
+///   0   sType, 8 pNext, 16 flags, 24 renderPass (u64),
+///   32 attachmentCount (u32), 36 _pad,
+///   40 pAttachments (*const VkImageView u64),
+///   48 width (u32), 52 height (u32), 56 layers (u32)
+#[no_mangle]
+pub unsafe extern "C" fn vkCreateFramebuffer(
+    device:          VkDevice,
+    p_create_info:   *const c_void,
+    _p_allocator:    *const c_void,
+    p_framebuffer:   *mut u64,
+) -> VkResult {
+    if device.is_null() || p_create_info.is_null() || p_framebuffer.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let dev = &*(device as *const AtriumDevice);
+    let b = p_create_info as *const u8;
+    let attachment_count = std::ptr::read_unaligned(b.add(32) as *const u32);
+    let p_attachments    = std::ptr::read_unaligned(b.add(40) as *const *const u64);
+    let width            = std::ptr::read_unaligned(b.add(48) as *const u32);
+    let height           = std::ptr::read_unaligned(b.add(52) as *const u32);
+
+    let mut attachments = Vec::with_capacity(attachment_count as usize);
+    if !p_attachments.is_null() {
+        for i in 0..attachment_count {
+            attachments.push(*p_attachments.offset(i as isize));
+        }
+    }
+    let handle = dev.next_framebuffer_id.get();
+    dev.next_framebuffer_id.set(handle + 1);
+    if let Ok(mut f) = dev.framebuffers.lock() {
+        f.insert(handle, AtriumFramebuffer { width, height, attachments });
+    } else {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    *p_framebuffer = handle;
+    VK_SUCCESS
+}
+
+/// `vkDestroyFramebuffer` — drop the mapping.
+#[no_mangle]
+pub unsafe extern "C" fn vkDestroyFramebuffer(
+    device:       VkDevice,
+    framebuffer:  u64,
+    _p_allocator: *const c_void,
+) {
+    if device.is_null() || framebuffer == 0 { return; }
+    let dev = &*(device as *const AtriumDevice);
+    if let Ok(mut f) = dev.framebuffers.lock() {
+        f.remove(&framebuffer);
+    }
+}
+
+/// `vkCmdBeginRenderPass` — push a `BeginRenderPass` FrameOp
+/// targeting the framebuffer's first attachment's image_id.
+/// Walks framebuffer → image_view → image → image_id.
+///
+/// VkRenderPassBeginInfo layout:
+///   0   sType, 8 pNext, 16 renderPass (u64), 24 framebuffer (u64),
+///   32 renderArea (VkRect2D, 16 B), 48 clearValueCount (u32),
+///   56 pClearValues (*const VkClearValue)
+///
+/// VkClearValue is a 16-byte union — first 4 bytes are r as f32,
+/// next 4 g, next 4 b, next 4 a. We read all four as f32 and
+/// quantize to u8 for the FrameOp body.
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdBeginRenderPass(
+    command_buffer:    VkCommandBuffer,
+    p_render_pass_begin: *const c_void,
+    _contents:         u32, /* VkSubpassContents */
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    if p_render_pass_begin.is_null() || cb.device.is_null() { return; }
+    let dev = &*(cb.device as *const AtriumDevice);
+    let b = p_render_pass_begin as *const u8;
+    let framebuffer = std::ptr::read_unaligned(b.add(24) as *const u64);
+    let clear_count = std::ptr::read_unaligned(b.add(48) as *const u32);
+    let p_clears    = std::ptr::read_unaligned(b.add(56) as *const *const u8);
+
+    // Resolve framebuffer → first attachment → image → image_id.
+    let fb_first_view = dev.framebuffers.lock().ok()
+        .and_then(|f| f.get(&framebuffer).and_then(|fb| fb.attachments.first().copied()));
+    let image = fb_first_view.and_then(|view| {
+        dev.image_views.lock().ok().and_then(|v| v.get(&view).copied())
+    });
+    let image_id = image.and_then(|img| {
+        dev.images.lock().ok()
+            .and_then(|m| m.get(&img).and_then(|x| x.image_id))
+    });
+
+    // Clear color: read 4 f32, quantize to RGBA8.
+    let mut clear_rgba8 = [0u8, 0, 0, 255];
+    if clear_count > 0 && !p_clears.is_null() {
+        let r = std::ptr::read_unaligned(p_clears as *const f32);
+        let g = std::ptr::read_unaligned(p_clears.add(4) as *const f32);
+        let bl = std::ptr::read_unaligned(p_clears.add(8) as *const f32);
+        let a = std::ptr::read_unaligned(p_clears.add(12) as *const f32);
+        clear_rgba8 = [
+            (r.clamp(0.0, 1.0) * 255.0) as u8,
+            (g.clamp(0.0, 1.0) * 255.0) as u8,
+            (bl.clamp(0.0, 1.0) * 255.0) as u8,
+            (a.clamp(0.0, 1.0) * 255.0) as u8,
+        ];
+    }
+
+    // BeginRenderPass body: 12 bytes (target_image_id u32 +
+    // clear_color_rgba8 [u8;4] + flags u32). flags=0 today.
+    let mut body = [0u8; 12];
+    let tid = image_id.map(|i| i.raw()).unwrap_or(0);
+    body[ 0.. 4].copy_from_slice(&tid.to_le_bytes());
+    body[ 4.. 8].copy_from_slice(&clear_rgba8);
+    // flags @ 8..12 already zero.
+    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::BeginRenderPass, &body);
+}
+
+/// `vkCmdEndRenderPass` — push `EndRenderPass`.
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdEndRenderPass(
+    command_buffer: VkCommandBuffer,
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::EndRenderPass, &[]);
+}
+
 /// `vkCreateCommandPool` — allocate a non-dispatchable
 /// VkCommandPool handle. We ignore the create-info (queue family,
 /// flags); Atrium's single queue family means every pool is
@@ -2363,8 +2626,8 @@ mod tests {
 
     #[test]
     fn get_proc_addr_unknown_name_returns_none() {
-        // vkCmdBeginRenderPass isn't wired yet.
-        let name = b"vkCmdBeginRenderPass\0";
+        // vkCmdPipelineBarrier isn't wired yet.
+        let name = b"vkCmdPipelineBarrier\0";
         let r = unsafe {
             vk_icdGetInstanceProcAddr(
                 std::ptr::null_mut(),
