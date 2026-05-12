@@ -27,3 +27,9 @@ sha2            = "0.10"
 
 [dev-dependencies]
 aqueduct-gpu-host = { path = "../aqueduct-gpu-host" }
+
+# Example binaries that drive the ICD through its C ABI without
+# the Khronos Vulkan loader.
+[[example]]
+name = "headless_triangle"
+path = "examples/headless_triangle.rs"
