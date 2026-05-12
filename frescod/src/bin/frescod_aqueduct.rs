@@ -63,8 +63,13 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const TARGET_FPS: u64 = 30;
+const TARGET_FPS: u64 = 60;
 const FRAME_NS:   u64 = 1_000_000_000 / TARGET_FPS;
+
+/// `FRESCOD_UNCAPPED=1` to disable the frame-rate cap (benchmark mode).
+fn uncapped() -> bool {
+    std::env::var("FRESCOD_UNCAPPED").map(|v| !v.is_empty() && v != "0").unwrap_or(false)
+}
 
 fn main() -> std::io::Result<()> {
     let _ = env_logger::try_init();
@@ -161,37 +166,44 @@ fn main() -> std::io::Result<()> {
     let render_and_flip = |client: &mut GpuClient,
                            slot_images: &mut HashMap<u32, SlotImage>,
                            timeline: &mut u64,
-                           bo: &mut atrium_gpu::Bo|
+                           bo: &mut atrium_gpu::Bo,
+                           prof: &mut FrameProfile|
         -> Result<Duration, std::io::Error>
     {
         *timeline += 1;
         let t0 = Instant::now();
         render_one_frame_aqueduct(
-            client, &frontend, &comp, target, fence, *timeline, slot_images,
+            client, &frontend, &comp, target, fence, *timeline, slot_images, prof,
         ).map_err(io_other)?;
-        copy_backend_to_bo(&sw_backend, target, bo).map_err(io_other)?;
+        copy_backend_to_bo_profiled(&sw_backend, target, bo, prof).map_err(io_other)?;
         Ok(t0.elapsed())
     };
 
     // First frame: render + SET_MODE before flipping.
-    render_and_flip(&mut client, &mut slot_images, &mut timeline, &mut bo)?;
+    {
+        let mut p = FrameProfile::default();
+        render_and_flip(&mut client, &mut slot_images, &mut timeline, &mut bo, &mut p)?;
+    }
     dpy.set_mode(conn.id, &bo, mode)?;
     dpy.page_flip(conn.id, &bo)?;
 
     // Rolling FPS counter. Once per FPS_REPORT_SECS we log the
-    // window's frame count + min/avg/max render-time. Useful for
-    // catching slowdowns mid-session.
+    // window's frame count + min/avg/max render-time + per-phase
+    // breakdown. Useful for catching slowdowns mid-session AND
+    // for steering tier-1 perf work.
     const FPS_REPORT_SECS: u64 = 5;
     let mut window_start = Instant::now();
     let mut window_frames: u32 = 0;
     let mut window_render_min = Duration::from_secs(60);
     let mut window_render_max = Duration::ZERO;
     let mut window_render_sum = Duration::ZERO;
+    let mut window_profile = FrameProfile::default();
 
     let mut next = Instant::now() + Duration::from_nanos(FRAME_NS);
     loop {
+        let mut prof = FrameProfile::default();
         let render_dur = render_and_flip(
-            &mut client, &mut slot_images, &mut timeline, &mut bo,
+            &mut client, &mut slot_images, &mut timeline, &mut bo, &mut prof,
         )?;
         dpy.page_flip(conn.id, &bo)?;
 
@@ -199,12 +211,13 @@ fn main() -> std::io::Result<()> {
         window_render_sum += render_dur;
         if render_dur < window_render_min { window_render_min = render_dur; }
         if render_dur > window_render_max { window_render_max = render_dur; }
+        window_profile.add(&prof);
         let elapsed = window_start.elapsed();
         if elapsed >= Duration::from_secs(FPS_REPORT_SECS) {
             let secs = elapsed.as_secs_f64();
             let fps = window_frames as f64 / secs;
-            let avg_ms = window_render_sum.as_secs_f64() * 1000.0
-                       / window_frames.max(1) as f64;
+            let n = window_frames.max(1) as f64;
+            let avg_ms = window_render_sum.as_secs_f64() * 1000.0 / n;
             eprintln!(
                 "frescod-aqueduct: {:.1} fps over {:.1}s ({} frames); \
                  render time min/avg/max = {:.2}/{:.2}/{:.2} ms",
@@ -213,18 +226,60 @@ fn main() -> std::io::Result<()> {
                 avg_ms,
                 window_render_max.as_secs_f64() * 1000.0,
             );
+            eprintln!(
+                "frescod-aqueduct:   per-phase avg ms: uploads={:.2} \
+                 build={:.2} submit={:.2} wait={:.2} readback={:.2} bo-copy={:.2}",
+                window_profile.uploads.as_secs_f64() * 1000.0 / n,
+                window_profile.build.as_secs_f64() * 1000.0 / n,
+                window_profile.submit.as_secs_f64() * 1000.0 / n,
+                window_profile.wait.as_secs_f64() * 1000.0 / n,
+                window_profile.readback.as_secs_f64() * 1000.0 / n,
+                window_profile.copy_to_bo.as_secs_f64() * 1000.0 / n,
+            );
             window_start = Instant::now();
             window_frames = 0;
             window_render_min = Duration::from_secs(60);
             window_render_max = Duration::ZERO;
             window_render_sum = Duration::ZERO;
+            window_profile = FrameProfile::default();
         }
 
-        let now = Instant::now();
-        if next > now {
-            std::thread::sleep(next - now);
+        if !uncapped() {
+            let now = Instant::now();
+            if next > now {
+                std::thread::sleep(next - now);
+            }
+            next += Duration::from_nanos(FRAME_NS);
         }
-        next += Duration::from_nanos(FRAME_NS);
+    }
+}
+
+/// Per-phase timing of one render-and-flip cycle. Summed across the
+/// reporting window in `frescod-aqueduct`'s main loop.
+#[derive(Default)]
+struct FrameProfile {
+    /// `EnvelopeFrontend::take_pending_uploads` + write_image[_region] loop.
+    uploads:    Duration,
+    /// Layer snapshot + bridge::translate_* into a FrameBuilder.
+    build:      Duration,
+    /// `client.submit_frame` (postcard encode + Unix-socket write).
+    submit:     Duration,
+    /// `client.wait_fence`.
+    wait:       Duration,
+    /// `sw_backend.read_image_pixels` (clones the Pixmap data).
+    readback:   Duration,
+    /// BGRA-swap copy from readback buffer into the scanout BO.
+    copy_to_bo: Duration,
+}
+
+impl FrameProfile {
+    fn add(&mut self, other: &FrameProfile) {
+        self.uploads    += other.uploads;
+        self.build      += other.build;
+        self.submit     += other.submit;
+        self.wait       += other.wait;
+        self.readback   += other.readback;
+        self.copy_to_bo += other.copy_to_bo;
     }
 }
 
@@ -247,9 +302,11 @@ fn render_one_frame_aqueduct(
     fence: ResourceId,
     timeline: u64,
     slot_images: &mut HashMap<u32, SlotImage>,
+    prof: &mut FrameProfile,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // ── 1. Drain pending texture uploads → write_image into the
     //       backend's per-slot Pixmaps.
+    let t_uploads = Instant::now();
     let (uploads, clears) = {
         let mut fe = frontend.lock().unwrap();
         fe.take_pending_uploads()
@@ -307,7 +364,10 @@ fn render_one_frame_aqueduct(
         }
     }
 
+    prof.uploads += t_uploads.elapsed();
+
     // ── 2. Snapshot per-window WM state in z-order bottom→top.
+    let t_build = Instant::now();
     let layers: Vec<(u32, (f32, f32))> = {
         let g = comp.lock().unwrap();
         let mut out = Vec::with_capacity(g.windows.len());
@@ -366,21 +426,37 @@ fn render_one_frame_aqueduct(
     }
 
     fresco_aqueduct_bridge::end_renderpass(&mut fb)?;
+    prof.build += t_build.elapsed();
 
     // ── 4. Submit + wait.
+    let t_submit = Instant::now();
     client.submit_frame(fence, fb, timeline)?;
+    prof.submit += t_submit.elapsed();
+    let t_wait = Instant::now();
     let _ = client.wait_fence(fence, 50_000_000)?; // 50ms budget per frame at 30 fps
+    prof.wait += t_wait.elapsed();
     Ok(())
 }
 
 /// Read tier-1 SW backend's target Pixmap → BGRA-swap → scanout BO.
-fn copy_backend_to_bo(
+///
+/// Caller passes a FrameProfile to attribute time between readback
+/// (the Pixmap → owned Vec clone inside read_image_pixels) and the
+/// BGRA-swap copy proper. Useful for steering tier-1 perf work —
+/// the clone is a known unnecessary copy if we add a direct-borrow
+/// accessor.
+fn copy_backend_to_bo_profiled(
     sw: &SoftwareBackend,
     target: ResourceId,
     bo: &mut atrium_gpu::Bo,
+    prof: &mut FrameProfile,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let t_readback = Instant::now();
     let pixels = sw.read_image_pixels(target)
         .ok_or_else(|| io_other("SoftwareBackend missing target image"))?;
+    prof.readback += t_readback.elapsed();
+
+    let t_copy = Instant::now();
     let dst = bo.as_mut_slice();
     if pixels.len() != dst.len() {
         return Err(Box::new(io_other(format!(
@@ -396,6 +472,7 @@ fn copy_backend_to_bo(
         dst[off + 2] = px[0];
         dst[off + 3] = px[3];
     }
+    prof.copy_to_bo += t_copy.elapsed();
     Ok(())
 }
 
