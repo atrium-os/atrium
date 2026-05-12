@@ -223,7 +223,7 @@ struct atrium_gpu_softc {
 	uint64_t                       vblank_seq[ATRIUM_GPU_MAX_SCANOUTS];
 	struct cv                      vblank_cv [ATRIUM_GPU_MAX_SCANOUTS];
 	struct mtx                     vblank_mtx; /* guards seq + co_active */
-	int                            vblank_period_ticks[ATRIUM_GPU_MAX_SCANOUTS];
+	sbintime_t                     vblank_period_sbt[ATRIUM_GPU_MAX_SCANOUTS];
 	bool                           vblank_active[ATRIUM_GPU_MAX_SCANOUTS];
 	/* Per-connector callout cookie: { softc*, connector_id }. The
 	 * cookie's address is the callout's `arg`; we can't pack the
@@ -1376,7 +1376,7 @@ atrium_display_vblank_tick(void *arg)
 	struct atrium_vblank_cookie *ck = arg;
 	struct atrium_gpu_softc *sc = ck->sc;
 	uint32_t conn = ck->conn;
-	int period;
+	sbintime_t period;
 
 	if (conn >= ATRIUM_GPU_MAX_SCANOUTS)
 		return;
@@ -1384,11 +1384,14 @@ atrium_display_vblank_tick(void *arg)
 	 * the mtx is already held here. Don't re-acquire. */
 	mtx_assert(&sc->vblank_mtx, MA_OWNED);
 	sc->vblank_seq[conn]++;
-	period = sc->vblank_period_ticks[conn];
+	period = sc->vblank_period_sbt[conn];
 	cv_broadcast(&sc->vblank_cv[conn]);
 	if (sc->vblank_active[conn]) {
-		callout_reset(&sc->vblank_co[conn], period,
-		    atrium_display_vblank_tick, ck);
+		/* Sub-tick precision via _sbt variant: `kern.hz=100` would
+		 * otherwise floor us to 10ms = 100Hz scheduling regardless
+		 * of the actual panel refresh. */
+		callout_reset_sbt(&sc->vblank_co[conn], period, 0,
+		    atrium_display_vblank_tick, ck, 0);
 	}
 }
 
@@ -1400,29 +1403,28 @@ static void
 atrium_display_vblank_start(struct atrium_gpu_softc *sc, uint32_t conn,
     uint32_t refresh_mhz)
 {
-	int period;
+	sbintime_t period;
 	uint32_t hz_refresh;
 
 	if (conn >= ATRIUM_GPU_MAX_SCANOUTS)
 		return;
-	/* Convert refresh_mhz (e.g. 60000) → Hz (60) → ticks. hz is the
-	 * kernel's tick rate (1000 typically). */
+	/* refresh_mhz (e.g. 60000) → Hz (60) → period in sbintime_t.
+	 * SBT_1S / hz_refresh gives exact sub-tick precision regardless
+	 * of kern.hz; the kernel's tick rate is decoupled. */
 	hz_refresh = refresh_mhz / 1000;
 	if (hz_refresh == 0)
 		hz_refresh = 60;
-	period = hz / (int)hz_refresh;
-	if (period < 1)
-		period = 1;
+	period = SBT_1S / hz_refresh;
 
 	mtx_lock(&sc->vblank_mtx);
-	sc->vblank_period_ticks[conn] = period;
+	sc->vblank_period_sbt[conn] = period;
 	sc->vblank_active[conn] = true;
 	sc->vblank_cookie[conn].sc = sc;
 	sc->vblank_cookie[conn].conn = conn;
-	/* callout_reset on a callout_init_mtx-bound callout requires
+	/* callout_reset_sbt on a callout_init_mtx-bound callout requires
 	 * the bound mtx held. Re-arm under lock. */
-	callout_reset(&sc->vblank_co[conn], period,
-	    atrium_display_vblank_tick, &sc->vblank_cookie[conn]);
+	callout_reset_sbt(&sc->vblank_co[conn], period, 0,
+	    atrium_display_vblank_tick, &sc->vblank_cookie[conn], 0);
 	mtx_unlock(&sc->vblank_mtx);
 }
 
