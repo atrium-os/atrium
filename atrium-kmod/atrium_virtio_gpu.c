@@ -88,6 +88,25 @@ static struct virtio_feature_desc atrium_virtio_gpu_feature_desc[] = {
 
 MALLOC_DEFINE(M_ATRIUM_GPU, "atrium_gpu", "Atrium GPU driver memory");
 
+/* ----------- Diagnostic sysctls ---------------------------------------- *
+ * kern.atrium_gpu.{tokens,bos}_outstanding expose the current size of the
+ * driver's token and BO tables. Useful for verifying that IMPORT_REGION's
+ * refcount path is leak-free: after every minter + importer exits, both
+ * counters should return to their pre-test baseline.
+ *
+ * Updated under softc->bo_lock at the same sites that mutate the lists. */
+static int atrium_gpu_tokens_outstanding;
+static int atrium_gpu_bos_outstanding;
+
+static SYSCTL_NODE(_kern, OID_AUTO, atrium_gpu,
+    CTLFLAG_RW | CTLFLAG_MPSAFE, NULL, "Atrium GPU driver");
+SYSCTL_INT(_kern_atrium_gpu, OID_AUTO, tokens_outstanding,
+    CTLFLAG_RD, &atrium_gpu_tokens_outstanding, 0,
+    "Number of IMPORT_REGION tokens currently registered with the kmod.");
+SYSCTL_INT(_kern_atrium_gpu, OID_AUTO, bos_outstanding,
+    CTLFLAG_RD, &atrium_gpu_bos_outstanding, 0,
+    "Number of BOs currently allocated (sum of refcounts is bo×fds).");
+
 /* ------------------------------------------------------------------------- */
 /* Device softc                                                               */
 /* ------------------------------------------------------------------------- */
@@ -494,9 +513,11 @@ atrium_bo_decref_locked(struct atrium_gpu_softc *sc, struct atrium_gpu_bo *bo)
 		if (te->bo == bo) {
 			TAILQ_REMOVE(&sc->tokens, te, link);
 			TAILQ_INSERT_TAIL(&retired_tokens, te, link);
+			atrium_gpu_tokens_outstanding--;
 		}
 	}
 	TAILQ_REMOVE(&sc->bos, bo, link);
+	atrium_gpu_bos_outstanding--;
 	mtx_unlock(&sc->bo_lock);
 
 	while ((te = TAILQ_FIRST(&retired_tokens)) != NULL) {
@@ -671,9 +692,11 @@ atrium_gpu_ioc_alloc(struct atrium_gpu_softc *sc, struct atrium_gpu_file *f,
 	bo->handle      = ++sc->next_handle;   /* never returns 0 */
 	bo->mmap_offset = (uint64_t)bo->handle * ATRIUM_BO_STRIDE;
 	TAILQ_INSERT_TAIL(&sc->bos, bo, link);
+	atrium_gpu_bos_outstanding++;
 	err = atrium_gpu_acl_add(f, bo);
 	if (err != 0) {
 		TAILQ_REMOVE(&sc->bos, bo, link);
+		atrium_gpu_bos_outstanding--;
 		mtx_unlock(&sc->bo_lock);
 		free((void *)bo->kva, M_ATRIUM_GPU);
 		free(bo, M_ATRIUM_GPU);
@@ -1064,9 +1087,11 @@ atrium_gpu_alloc_scanout_bo(struct atrium_gpu_softc *sc,
 	bo->handle      = ++sc->next_handle;
 	bo->mmap_offset = bar_offset;
 	TAILQ_INSERT_TAIL(&sc->bos, bo, link);
+	atrium_gpu_bos_outstanding++;
 	err = atrium_gpu_acl_add(f, bo);
 	if (err != 0) {
 		TAILQ_REMOVE(&sc->bos, bo, link);
+		atrium_gpu_bos_outstanding--;
 		mtx_unlock(&sc->bo_lock);
 		goto fail_window;
 	}
@@ -1168,9 +1193,11 @@ atrium_gpu_ioc_host_blob(struct atrium_gpu_softc *sc,
 	bo->handle      = ++sc->next_handle;
 	bo->mmap_offset = bar_offset; /* uniqueness inherited from window */
 	TAILQ_INSERT_TAIL(&sc->bos, bo, link);
+	atrium_gpu_bos_outstanding++;
 	err = atrium_gpu_acl_add(f, bo);
 	if (err != 0) {
 		TAILQ_REMOVE(&sc->bos, bo, link);
+		atrium_gpu_bos_outstanding--;
 		mtx_unlock(&sc->bo_lock);
 		goto fail;
 	}
@@ -1277,6 +1304,7 @@ atrium_gpu_ioc_mint_token(struct atrium_gpu_softc *sc,
 
 	mtx_lock(&sc->bo_lock);
 	TAILQ_INSERT_TAIL(&sc->tokens, te, link);
+	atrium_gpu_tokens_outstanding++;
 	mtx_unlock(&sc->bo_lock);
 
 	memcpy(args->token, te->token, ATRIUM_GPU_TOKEN_LEN);
