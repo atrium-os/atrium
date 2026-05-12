@@ -232,6 +232,19 @@ struct AtriumDevice {
     /// that vkCmdBindPipeline references in the BindPipeline
     /// FrameOp.
     pipelines: std::sync::Mutex<std::collections::HashMap<u64, aqueduct_gpu::ids::ResourceId>>,
+    /// Per-VkDeviceMemory state. Owned heap allocations the ICD
+    /// hands out via vkMapMemory. Today these are pure local
+    /// buffers; bindings to the daemon-side region table
+    /// (OP_GPU_MEMORY_CREATE / IOC_GPU_IMPORT_REGION) arrive when
+    /// vkCreateBuffer + the resource-upload path lands.
+    /// Key: VkDeviceMemory u64. Value: Box<[u8]> so the storage
+    /// pointer is stable across map/unmap.
+    memories: std::sync::Mutex<std::collections::HashMap<u64, Box<[u8]>>>,
+    /// Monotonic counter for VkDeviceMemory u64 handles.
+    /// Non-dispatchable handles don't carry ICD_LOADER_MAGIC;
+    /// they're opaque u64. We use a per-device counter so
+    /// handles are stable within a device's lifetime.
+    next_memory_id: std::cell::Cell<u64>,
 }
 
 /// ICD-side state behind a `VkQueue`. Same dispatchable-handle
@@ -458,7 +471,24 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkCommandBuffer, u32, u64), FnVoidPtr,
             >(vkCmdBindPipeline)),
-        // Phase 1.3b+ continued: vkCmdBindVertexBuffers,
+        "vkAllocateMemory" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, *const c_void, *const c_void, *mut u64) -> VkResult, FnVoidPtr,
+            >(vkAllocateMemory)),
+        "vkFreeMemory" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, *const c_void), FnVoidPtr,
+            >(vkFreeMemory)),
+        "vkMapMemory" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, u64, u64, u32, *mut *mut c_void) -> VkResult, FnVoidPtr,
+            >(vkMapMemory)),
+        "vkUnmapMemory" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64), FnVoidPtr,
+            >(vkUnmapMemory)),
+        // Phase 1.3b+ continued: VkBuffer + vkBindBufferMemory,
+        // VkImage + vkBindImageMemory, vkCmdBindVertexBuffers,
         // vkCmdBindIndexBuffer, vkCmdDrawIndexed, vkCmdCopyBuffer*,
         // vkCmdPipelineBarrier, vkCmdBegin/EndRenderPass, …
         _ => None,
@@ -687,6 +717,8 @@ pub unsafe extern "C" fn vkCreateDevice(
             ),
         ),
         pipelines: std::sync::Mutex::new(std::collections::HashMap::new()),
+        memories:  std::sync::Mutex::new(std::collections::HashMap::new()),
+        next_memory_id: std::cell::Cell::new(1),
     });
     let dev_ptr: *mut AtriumDevice = &mut *dev;
     let q = Box::new(AtriumQueue {
@@ -824,6 +856,124 @@ pub unsafe extern "C" fn vkDestroyPipeline(
     if let Ok(mut p) = dev.pipelines.lock() {
         p.remove(&pipeline);
     }
+}
+
+/// `vkAllocateMemory` — allocate device-memory storage on the ICD
+/// side. Reads `allocationSize` (u64 at offset 16) from the
+/// VkMemoryAllocateInfo; ignores memoryTypeIndex (we only have
+/// one type, see `vkGetPhysicalDeviceMemoryProperties`).
+///
+/// Returns a unique non-zero u64 the caller treats as
+/// VkDeviceMemory; the storage is a heap-allocated `Box<[u8]>`
+/// kept alive in the device's `memories` map until vkFreeMemory.
+///
+/// Today's storage is pure local — no daemon-side region binding.
+/// vkMapMemory just hands out the Box's pointer. Future Phase 1.3b+
+/// will wire OP_GPU_MEMORY_CREATE on alloc so submits + buffer
+/// uploads can reference these regions.
+#[no_mangle]
+pub unsafe extern "C" fn vkAllocateMemory(
+    device:          VkDevice,
+    p_allocate_info: *const c_void, /* const VkMemoryAllocateInfo* */
+    _p_allocator:    *const c_void,
+    p_memory:        *mut u64,
+) -> VkResult {
+    if device.is_null() || p_allocate_info.is_null() || p_memory.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let dev = &*(device as *const AtriumDevice);
+    // VkMemoryAllocateInfo:
+    //   0   sType : u32
+    //   4   _pad
+    //   8   pNext : ptr
+    //   16  allocationSize : u64
+    //   24  memoryTypeIndex : u32
+    let bytes = p_allocate_info as *const u8;
+    let size = std::ptr::read_unaligned(bytes.add(16) as *const u64);
+    if size == 0 || size > (1u64 << 32) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    let storage: Box<[u8]> = vec![0u8; size as usize].into_boxed_slice();
+    let handle = dev.next_memory_id.get();
+    dev.next_memory_id.set(handle + 1);
+
+    if let Ok(mut m) = dev.memories.lock() {
+        m.insert(handle, storage);
+    } else {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    *p_memory = handle;
+    VK_SUCCESS
+}
+
+/// `vkFreeMemory` — drop the storage behind a VkDeviceMemory.
+#[no_mangle]
+pub unsafe extern "C" fn vkFreeMemory(
+    device:       VkDevice,
+    memory:       u64,
+    _p_allocator: *const c_void,
+) {
+    if device.is_null() || memory == 0 { return; }
+    let dev = &*(device as *const AtriumDevice);
+    if let Ok(mut m) = dev.memories.lock() {
+        m.remove(&memory);
+    }
+}
+
+/// `vkMapMemory` — return a host pointer to a sub-range of the
+/// VkDeviceMemory's storage. Today's storage is host-allocated,
+/// so we just return a raw pointer into the Box's bytes.
+///
+/// `size == VK_WHOLE_SIZE (u64::MAX)` means "to end of allocation".
+/// `offset` must be within the allocation.
+///
+/// # Safety
+///
+/// `pp_data` must be a writable `*mut *mut c_void`. The returned
+/// pointer is valid until the next vkUnmapMemory / vkFreeMemory on
+/// the same VkDeviceMemory.
+#[no_mangle]
+pub unsafe extern "C" fn vkMapMemory(
+    device:    VkDevice,
+    memory:    u64,
+    offset:    u64,
+    _size:     u64,
+    _flags:    u32,
+    pp_data:   *mut *mut c_void,
+) -> VkResult {
+    if device.is_null() || memory == 0 || pp_data.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let dev = &*(device as *const AtriumDevice);
+    let m = match dev.memories.lock() {
+        Ok(m) => m,
+        Err(_) => return VK_ERROR_INITIALIZATION_FAILED,
+    };
+    let Some(storage) = m.get(&memory) else {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    };
+    if (offset as usize) > storage.len() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    // The Box's storage is stable as long as it lives in the
+    // HashMap (HashMap doesn't move its values). The pointer
+    // remains valid until vkFreeMemory removes the entry.
+    let ptr = storage.as_ptr().add(offset as usize) as *mut c_void;
+    *pp_data = ptr;
+    VK_SUCCESS
+}
+
+/// `vkUnmapMemory` — no-op today. Storage is always host-mapped
+/// (HOST_VISIBLE | HOST_COHERENT — see
+/// `vkGetPhysicalDeviceMemoryProperties`), so unmap is a logical
+/// boundary not a kernel-VA reclamation. Future tier-2 backends
+/// would munmap here.
+#[no_mangle]
+pub unsafe extern "C" fn vkUnmapMemory(
+    _device: VkDevice,
+    _memory: u64,
+) {
 }
 
 /// `vkCmdBindPipeline` — push a `BindPipeline` FrameOp with the

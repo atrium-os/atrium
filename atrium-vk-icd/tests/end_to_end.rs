@@ -630,6 +630,82 @@ fn pipeline_create_bind_destroy_round_trip() {
 }
 
 #[test]
+fn device_memory_alloc_map_unmap_free() {
+    use atrium_vk_icd::{
+        vkAllocateMemory, vkCreateDevice, vkDestroyDevice, vkFreeMemory,
+        vkMapMemory, vkUnmapMemory,
+    };
+
+    let sock = tmp_socket("mem");
+    let sw_backend = Arc::new(SoftwareBackend::new());
+    let backend_for_listener: Arc<dyn Backend> = sw_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap();
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+
+    type VkDevice = *mut std::ffi::c_void;
+
+    let mut instance: VkInstance = std::ptr::null_mut();
+    unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
+    let mut devices: [VkPhysicalDevice; 1] = [std::ptr::null_mut(); 1];
+    let mut cap: u32 = 1;
+    unsafe { vkEnumeratePhysicalDevices(instance, &mut cap, devices.as_mut_ptr()); }
+    let mut device: VkDevice = std::ptr::null_mut();
+    unsafe { vkCreateDevice(devices[0], std::ptr::null(), std::ptr::null(), &mut device); }
+
+    // VkMemoryAllocateInfo (32 bytes): sType@0, pNext@8,
+    // allocationSize@16, memoryTypeIndex@24.
+    let mut info = [0u8; 32];
+    info[0..4].copy_from_slice(&5u32.to_le_bytes()); // sType
+    info[16..24].copy_from_slice(&(1024u64).to_le_bytes()); // 1 KiB
+    let mut mem: u64 = 0;
+    let r = unsafe { vkAllocateMemory(device, info.as_ptr() as *const _, std::ptr::null(), &mut mem) };
+    assert_eq!(r, 0);
+    assert!(mem != 0);
+
+    // Map, write a pattern, verify by re-mapping later.
+    let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+    let r = unsafe { vkMapMemory(device, mem, 0, u64::MAX, 0, &mut p) };
+    assert_eq!(r, 0);
+    assert!(!p.is_null());
+
+    let slice = unsafe { std::slice::from_raw_parts_mut(p as *mut u8, 1024) };
+    for (i, b) in slice.iter_mut().enumerate() {
+        *b = (i & 0xff) as u8;
+    }
+    unsafe { vkUnmapMemory(device, mem); }
+
+    // Re-map and verify content survived.
+    let mut p2: *mut std::ffi::c_void = std::ptr::null_mut();
+    unsafe { vkMapMemory(device, mem, 0, u64::MAX, 0, &mut p2); }
+    let slice2 = unsafe { std::slice::from_raw_parts(p2 as *const u8, 1024) };
+    for (i, &b) in slice2.iter().enumerate() {
+        assert_eq!(b, (i & 0xff) as u8, "byte {i} changed across unmap/remap");
+    }
+    unsafe { vkUnmapMemory(device, mem); }
+
+    // Map at non-zero offset.
+    let mut p3: *mut std::ffi::c_void = std::ptr::null_mut();
+    unsafe { vkMapMemory(device, mem, 128, u64::MAX, 0, &mut p3); }
+    let first = unsafe { *(p3 as *const u8) };
+    assert_eq!(first, 128, "offset map must point at offset 128 of the storage");
+    unsafe { vkUnmapMemory(device, mem); }
+
+    // Free + verify the handle no longer maps.
+    unsafe { vkFreeMemory(device, mem, std::ptr::null()); }
+    let mut p_post: *mut std::ffi::c_void = std::ptr::null_mut();
+    let r = unsafe { vkMapMemory(device, mem, 0, u64::MAX, 0, &mut p_post) };
+    assert_ne!(r, 0, "vkMapMemory on freed VkDeviceMemory must error");
+
+    unsafe { vkDestroyDevice(device, std::ptr::null()); }
+    unsafe { vkDestroyInstance(instance, std::ptr::null()); }
+    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[test]
 fn proc_addr_resolves_three_entry_points() {
     // No live daemon required for the get_proc_addr lookups.
     fn lookup(name: &[u8]) -> Option<unsafe extern "C" fn()> {
