@@ -63,13 +63,27 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const TARGET_FPS: u64 = 60;
-const FRAME_NS:   u64 = 1_000_000_000 / TARGET_FPS;
-
-/// `FRESCOD_UNCAPPED=1` to disable the frame-rate cap (benchmark mode).
+/// `FRESCOD_UNCAPPED=1` to disable the display-rate cap (benchmark mode).
 fn uncapped() -> bool {
     std::env::var("FRESCOD_UNCAPPED").map(|v| !v.is_empty() && v != "0").unwrap_or(false)
 }
+
+/// Frame interval to pace at, derived from the connector's reported
+/// refresh rate (mHz → ns). Falls back to 60 Hz if the kmod returns
+/// something unusable.
+fn frame_interval_ns(refresh_mhz: u32) -> u64 {
+    if refresh_mhz < 1000 {
+        return 1_000_000_000 / 60; // sane fallback
+    }
+    // refresh_mhz / 1000 = Hz; 1e9 / Hz = ns per frame
+    1_000_000_000_000 / (refresh_mhz as u64)
+}
+
+/// VRR keepalive interval. Even when the scene is fully static the
+/// kmod's page-flip cadence should not stall indefinitely (some
+/// connectors require periodic refresh to maintain sync). Emit one
+/// "redundant" flip per this many real refresh intervals when idle.
+const VRR_KEEPALIVE_INTERVALS: u32 = 60;
 
 fn main() -> std::io::Result<()> {
     let _ = env_logger::try_init();
@@ -81,9 +95,11 @@ fn main() -> std::io::Result<()> {
     let connectors = dpy.connectors()?;
     let conn = connectors.first().expect("at least one connector").clone();
     let mode = dpy.preferred_mode(conn.id)?;
+    let frame_ns = frame_interval_ns(mode.refresh_mhz);
+    let target_fps = 1_000_000_000.0 / (frame_ns as f64);
     eprintln!(
-        "frescod-aqueduct: connector {} {}x{} @ {} mHz, target {} fps",
-        conn.id, mode.width, mode.height, mode.refresh_mhz, TARGET_FPS,
+        "frescod-aqueduct: connector {} {}x{} @ {} mHz, pacing at {:.1} fps",
+        conn.id, mode.width, mode.height, mode.refresh_mhz, target_fps,
     );
 
     let bytes = u64::from(mode.width) * u64::from(mode.height) * 4;
@@ -163,50 +179,82 @@ fn main() -> std::io::Result<()> {
 
     // ── Frame loop ───────────────────────────────────────────────
     let mut timeline: u64 = 0;
-    let render_and_flip = |client: &mut GpuClient,
-                           slot_images: &mut HashMap<u32, SlotImage>,
-                           timeline: &mut u64,
-                           bo: &mut atrium_gpu::Bo,
-                           prof: &mut FrameProfile|
-        -> Result<Duration, std::io::Error>
-    {
-        *timeline += 1;
-        let t0 = Instant::now();
-        render_one_frame_aqueduct(
-            client, &frontend, &comp, target, fence, *timeline, slot_images, prof,
-        ).map_err(io_other)?;
-        copy_backend_to_bo_profiled(&sw_backend, target, bo, prof).map_err(io_other)?;
-        Ok(t0.elapsed())
-    };
 
-    // First frame: render + SET_MODE before flipping.
+    // Scene-unchanged fast path: build the frame command stream
+    // (cheap byte-append), compare to the previous frame's bytes
+    // (cheap memcmp). If identical, skip the entire submit → wait →
+    // readback → bo-copy → page-flip cycle. The display already
+    // holds the right pixels and nothing has changed.
+    //
+    // Critical for VRR power: at our measured ~1000 fps idle ceiling
+    // we'd otherwise burn cycles flipping unchanged frames the
+    // panel can't even show.
+    let mut last_frame_bytes: Vec<u8> = Vec::new();
+    let mut frames_since_real_flip: u32 = 0;
+
+    // First frame: always render + flip (need SET_MODE) before the
+    // scene-diff loop takes over.
     {
         let mut p = FrameProfile::default();
-        render_and_flip(&mut client, &mut slot_images, &mut timeline, &mut bo, &mut p)?;
+        timeline += 1;
+        let first = build_frame_aqueduct(
+            &mut client, &frontend, &comp, target, &mut slot_images, &mut p,
+        ).map_err(io_other)?;
+        submit_and_readback(
+            &mut client, &sw_backend, target, fence, timeline, &first, &mut bo, &mut p,
+        ).map_err(io_other)?;
+        last_frame_bytes = first;
     }
     dpy.set_mode(conn.id, &bo, mode)?;
     dpy.page_flip(conn.id, &bo)?;
 
     // Rolling FPS counter. Once per FPS_REPORT_SECS we log the
     // window's frame count + min/avg/max render-time + per-phase
-    // breakdown. Useful for catching slowdowns mid-session AND
-    // for steering tier-1 perf work.
+    // breakdown + skip-ratio (scene-unchanged fast path).
     const FPS_REPORT_SECS: u64 = 5;
     let mut window_start = Instant::now();
-    let mut window_frames: u32 = 0;
+    let mut window_frames: u32 = 0;     // total iterations (incl. skipped)
+    let mut window_flips:  u32 = 0;     // real submits + page-flips
     let mut window_render_min = Duration::from_secs(60);
     let mut window_render_max = Duration::ZERO;
     let mut window_render_sum = Duration::ZERO;
     let mut window_profile = FrameProfile::default();
 
-    let mut next = Instant::now() + Duration::from_nanos(FRAME_NS);
+    let mut next = Instant::now() + Duration::from_nanos(frame_ns);
     loop {
+        let iter_t0 = Instant::now();
         let mut prof = FrameProfile::default();
-        let render_dur = render_and_flip(
-            &mut client, &mut slot_images, &mut timeline, &mut bo, &mut prof,
-        )?;
-        dpy.page_flip(conn.id, &bo)?;
+        timeline += 1;
 
+        // Phase 1: build the candidate frame's command stream. Cheap;
+        // no rasterisation work yet, no socket I/O.
+        let candidate = build_frame_aqueduct(
+            &mut client, &frontend, &comp, target, &mut slot_images, &mut prof,
+        ).map_err(io_other)?;
+
+        // Phase 2: scene-unchanged fast path. Byte-identical frame
+        // means the scene hasn't moved; the display already shows
+        // the right pixels. Skip submit → wait → readback → bo-copy
+        // → page-flip entirely. Emit one keepalive flip every N
+        // intervals so the kmod's flip cadence doesn't stall.
+        let unchanged = candidate == last_frame_bytes;
+        let need_keepalive = frames_since_real_flip >= VRR_KEEPALIVE_INTERVALS;
+        let do_render = !unchanged || need_keepalive;
+
+        if do_render {
+            submit_and_readback(
+                &mut client, &sw_backend, target, fence, timeline,
+                &candidate, &mut bo, &mut prof,
+            ).map_err(io_other)?;
+            dpy.page_flip(conn.id, &bo)?;
+            last_frame_bytes = candidate;
+            frames_since_real_flip = 0;
+            window_flips += 1;
+        } else {
+            frames_since_real_flip += 1;
+        }
+
+        let render_dur = iter_t0.elapsed();
         window_frames += 1;
         window_render_sum += render_dur;
         if render_dur < window_render_min { window_render_min = render_dur; }
@@ -215,13 +263,15 @@ fn main() -> std::io::Result<()> {
         let elapsed = window_start.elapsed();
         if elapsed >= Duration::from_secs(FPS_REPORT_SECS) {
             let secs = elapsed.as_secs_f64();
-            let fps = window_frames as f64 / secs;
+            let total_fps = window_frames as f64 / secs;
+            let flip_fps = window_flips as f64 / secs;
             let n = window_frames.max(1) as f64;
             let avg_ms = window_render_sum.as_secs_f64() * 1000.0 / n;
+            let skip_ratio = 1.0 - (window_flips as f64 / window_frames.max(1) as f64);
             eprintln!(
-                "frescod-aqueduct: {:.1} fps over {:.1}s ({} frames); \
-                 render time min/avg/max = {:.2}/{:.2}/{:.2} ms",
-                fps, secs, window_frames,
+                "frescod-aqueduct: {:.1} iter/s ({:.1} flips/s, {:.0}% skipped) \
+                 over {:.1}s; loop time min/avg/max = {:.2}/{:.2}/{:.2} ms",
+                total_fps, flip_fps, skip_ratio * 100.0, secs,
                 window_render_min.as_secs_f64() * 1000.0,
                 avg_ms,
                 window_render_max.as_secs_f64() * 1000.0,
@@ -238,6 +288,7 @@ fn main() -> std::io::Result<()> {
             );
             window_start = Instant::now();
             window_frames = 0;
+            window_flips = 0;
             window_render_min = Duration::from_secs(60);
             window_render_max = Duration::ZERO;
             window_render_sum = Duration::ZERO;
@@ -249,7 +300,7 @@ fn main() -> std::io::Result<()> {
             if next > now {
                 std::thread::sleep(next - now);
             }
-            next += Duration::from_nanos(FRAME_NS);
+            next += Duration::from_nanos(frame_ns);
         }
     }
 }
@@ -291,19 +342,20 @@ struct SlotImage {
     height: u32,
 }
 
-/// Snapshot per-window scene state, drain pending texture uploads,
-/// translate every node via `fresco-aqueduct-bridge`, submit one
-/// frame, wait its fence.
-fn render_one_frame_aqueduct(
+/// Snapshot per-window scene state, drain pending texture uploads
+/// (always — these have side effects the scene-diff fast path can't
+/// undo), translate every node via `fresco-aqueduct-bridge`. Returns
+/// the built FrameOp byte stream. Does NOT submit or wait — the
+/// caller compares against the prior frame's bytes and decides
+/// whether the expensive path runs.
+fn build_frame_aqueduct(
     client: &mut GpuClient,
     frontend: &Arc<Mutex<EnvelopeFrontend>>,
     comp: &Arc<Mutex<Compositor>>,
     target: ResourceId,
-    fence: ResourceId,
-    timeline: u64,
     slot_images: &mut HashMap<u32, SlotImage>,
     prof: &mut FrameProfile,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     // ── 1. Drain pending texture uploads → write_image into the
     //       backend's per-slot Pixmaps.
     let t_uploads = Instant::now();
@@ -427,14 +479,35 @@ fn render_one_frame_aqueduct(
 
     fresco_aqueduct_bridge::end_renderpass(&mut fb)?;
     prof.build += t_build.elapsed();
+    Ok(fb.into_buf())
+}
 
-    // ── 4. Submit + wait.
+/// Submit the (already-built) frame, wait its fence, read back the
+/// SoftwareBackend's target Pixmap, and BGRA-swap it into the
+/// scanout BO. The expensive half of the original render-one-frame
+/// path — only invoked when the candidate frame differs from the
+/// last one (or on the periodic VRR keepalive).
+fn submit_and_readback(
+    client: &mut GpuClient,
+    sw_backend: &SoftwareBackend,
+    target: ResourceId,
+    fence: ResourceId,
+    timeline: u64,
+    frame_buf: &[u8],
+    bo: &mut atrium_gpu::Bo,
+    prof: &mut FrameProfile,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use aqueduct_gpu::frame::FrameBuilder;
     let t_submit = Instant::now();
+    let fb = FrameBuilder::from_bytes(
+        frame_buf.len() as u32 + 16, frame_buf.to_vec(),
+    );
     client.submit_frame(fence, fb, timeline)?;
     prof.submit += t_submit.elapsed();
     let t_wait = Instant::now();
-    let _ = client.wait_fence(fence, 50_000_000)?; // 50ms budget per frame at 30 fps
+    let _ = client.wait_fence(fence, 50_000_000)?;
     prof.wait += t_wait.elapsed();
+    copy_backend_to_bo_profiled(sw_backend, target, bo, prof)?;
     Ok(())
 }
 

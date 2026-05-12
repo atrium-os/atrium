@@ -135,6 +135,15 @@ impl FrameBuilder {
         self.buf
     }
 
+    /// Adopt an already-built byte buffer (e.g. one returned by a
+    /// prior `into_buf()` that the caller deduplicated against the
+    /// previous frame, or a frame replayed from disk). The buffer
+    /// MUST be a valid record stream; the builder does not
+    /// re-validate. Future `push` calls append normally.
+    pub fn from_bytes(max_bytes: u32, buf: Vec<u8>) -> Self {
+        Self { buf, cap: max_bytes }
+    }
+
     /// Borrow the underlying buffer (e.g., for benchmarking, or to
     /// hand a slice to `SubmitFramePayload::command_buf` without
     /// consuming the builder).
