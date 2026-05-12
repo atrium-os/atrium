@@ -845,6 +845,14 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkQueue) -> VkResult, FnVoidPtr,
             >(vkQueueWaitIdle)),
+        "vkCreateComputePipelines" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, u32, *const c_void, *const c_void, *mut u64) -> VkResult, FnVoidPtr,
+            >(vkCreateComputePipelines)),
+        "vkCmdDispatch" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u32, u32, u32), FnVoidPtr,
+            >(vkCmdDispatch)),
         _ => None,
     }
 }
@@ -2810,6 +2818,62 @@ pub unsafe extern "C" fn vkQueueWaitIdle(
     VK_SUCCESS
 }
 
+/// `vkCreateComputePipelines` — like `vkCreateGraphicsPipelines`
+/// but for compute. Allocates one ResourceId per requested
+/// pipeline from the device's IdAllocator and registers it in
+/// the pipelines map. Today the create-info contents (shader
+/// stage, layout) are ignored — the host's bundle definition
+/// is the source of truth.
+#[no_mangle]
+pub unsafe extern "C" fn vkCreateComputePipelines(
+    device:             VkDevice,
+    _pipeline_cache:    u64,
+    create_info_count:  u32,
+    _p_create_infos:    *const c_void,
+    _p_allocator:       *const c_void,
+    p_pipelines:        *mut u64,
+) -> VkResult {
+    if device.is_null() || p_pipelines.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let dev = &*(device as *const AtriumDevice);
+    let mut alloc = match dev.id_alloc.lock() {
+        Ok(a) => a,
+        Err(_) => return VK_ERROR_INITIALIZATION_FAILED,
+    };
+    let mut pipelines = match dev.pipelines.lock() {
+        Ok(p) => p,
+        Err(_) => return VK_ERROR_INITIALIZATION_FAILED,
+    };
+    for i in 0..create_info_count {
+        let id = match alloc.next() {
+            Some(id) => id,
+            None     => return VK_ERROR_INITIALIZATION_FAILED,
+        };
+        let handle = id.raw() as u64;
+        pipelines.insert(handle, id);
+        *p_pipelines.offset(i as isize) = handle;
+    }
+    VK_SUCCESS
+}
+
+/// `vkCmdDispatch` — push a `Dispatch` FrameOp.
+/// Body: groupCountX/Y/Z (3 × u32 = 12 B).
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdDispatch(
+    command_buffer: VkCommandBuffer,
+    group_count_x:  u32,
+    group_count_y:  u32,
+    group_count_z:  u32,
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    let mut body = [0u8; 12];
+    body[ 0.. 4].copy_from_slice(&group_count_x.to_le_bytes());
+    body[ 4.. 8].copy_from_slice(&group_count_y.to_le_bytes());
+    body[ 8..12].copy_from_slice(&group_count_z.to_le_bytes());
+    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::Dispatch, &body);
+}
+
 /// `vkCreateCommandPool` — allocate a non-dispatchable
 /// VkCommandPool handle. We ignore the create-info (queue family,
 /// flags); Atrium's single queue family means every pool is
@@ -3349,8 +3413,8 @@ mod tests {
 
     #[test]
     fn get_proc_addr_unknown_name_returns_none() {
-        // vkCreateComputePipelines isn't wired yet (graphics-only).
-        let name = b"vkCreateComputePipelines\0";
+        // vkCreateSwapchainKHR isn't wired yet (WSI deferred).
+        let name = b"vkCreateSwapchainKHR\0";
         let r = unsafe {
             vk_icdGetInstanceProcAddr(
                 std::ptr::null_mut(),
