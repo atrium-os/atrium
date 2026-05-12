@@ -61,6 +61,19 @@ pub const OP_GPU_IMAGE_DESTROY:   u16 = 0x0111;
 /// (image not found, byte count mismatch, etc.).
 pub const OP_GPU_IMAGE_WRITE:     u16 = 0x0112;
 
+/// Inline write of a sub-region of an existing image's pixels.
+/// Used by atrium-text's server-side glyph rasteriser to patch
+/// newly-rasterised glyphs into an atlas without re-uploading the
+/// whole texture. Image must already exist via a prior
+/// `OP_GPU_IMAGE_CREATE` (+ `OP_GPU_IMAGE_WRITE` for the initial
+/// fill); this op only modifies the bytes inside the declared
+/// `dst_rect`.
+///
+/// Bounds checks: `dst_x + width ≤ image.width`,
+/// `dst_y + height ≤ image.height`, `pixels.len() = row_pitch × height`.
+/// Failure surfaces as `OP_GPU_VALIDATION_ERR`.
+pub const OP_GPU_IMAGE_WRITE_REGION: u16 = 0x0113;
+
 /// Allocate a buffer (vertex / index / uniform / storage).
 pub const OP_GPU_BUFFER_CREATE:   u16 = 0x0120;
 /// Destroy a buffer.

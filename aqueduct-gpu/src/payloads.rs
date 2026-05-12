@@ -213,6 +213,34 @@ pub struct ImageWritePayload {
     pub pixels: Vec<u8>,
 }
 
+/// Inline image sub-region write (`OP_GPU_IMAGE_WRITE_REGION`).
+///
+/// Patches the pixels inside `[dst_x..dst_x+width, dst_y..dst_y+height]`
+/// of `image_id` with the supplied bytes. `pixels.len()` must equal
+/// `row_pitch × height`. The image must already exist; the rest of
+/// the image's pixels are untouched.
+///
+/// Primary use case: atrium-text incremental glyph atlas updates.
+/// The text engine rasterises newly-cached glyphs into a stable
+/// atlas slot and ships only the dirty sub-rect each frame.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageWriteRegionPayload {
+    /// Target image.
+    pub image_id: ResourceId,
+    /// Top-left X of the destination rect in target pixels.
+    pub dst_x: u32,
+    /// Top-left Y.
+    pub dst_y: u32,
+    /// Width of the patched region.
+    pub width: u32,
+    /// Height of the patched region.
+    pub height: u32,
+    /// Bytes per row of `pixels`.
+    pub row_pitch: u32,
+    /// Inline pixel data (`row_pitch × height` bytes).
+    pub pixels: Vec<u8>,
+}
+
 // ───── Buffers ────────────────────────────────────────────────────
 
 /// Client → server: create a buffer. ID pre-assigned; no response.

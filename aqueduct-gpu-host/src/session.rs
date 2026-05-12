@@ -106,6 +106,7 @@ impl Session {
             OP_GPU_IMAGE_CREATE       => self.handle_image_create(m),
             OP_GPU_IMAGE_DESTROY      => self.handle_image_destroy(m),
             OP_GPU_IMAGE_WRITE        => self.handle_image_write(m),
+            OP_GPU_IMAGE_WRITE_REGION => self.handle_image_write_region(m),
             OP_GPU_BUFFER_CREATE      => self.handle_buffer_create(m),
             OP_GPU_BUFFER_DESTROY     => self.handle_buffer_destroy(m),
             OP_GPU_SAMPLER_CREATE     => self.handle_sampler_create(m),
@@ -210,6 +211,27 @@ impl Session {
             req.image_id, req.row_pitch, &req.pixels,
         ) {
             self.send_validation_err(OP_GPU_IMAGE_WRITE, Some(req.image_id), &diag)?;
+        }
+        Ok(())
+    }
+
+    fn handle_image_write_region(&mut self, m: Message) -> Result<()> {
+        let req: ImageWriteRegionPayload = postcard::from_bytes(&m.payload)?;
+        if self.table.get_image(req.image_id).is_none() {
+            self.send_validation_err(
+                OP_GPU_IMAGE_WRITE_REGION, Some(req.image_id),
+                "image not created on this session",
+            )?;
+            return Ok(());
+        }
+        if let Err(diag) = self.backend.image_write_region_pixels(
+            req.image_id,
+            req.dst_x, req.dst_y, req.width, req.height,
+            req.row_pitch, &req.pixels,
+        ) {
+            self.send_validation_err(
+                OP_GPU_IMAGE_WRITE_REGION, Some(req.image_id), &diag,
+            )?;
         }
         Ok(())
     }

@@ -83,6 +83,22 @@ pub trait Backend: Send + Sync {
         Err("backend does not support inline image write".into())
     }
 
+    /// Inline pixel write to a sub-region of an image. Called by the
+    /// session when it processes `OP_GPU_IMAGE_WRITE_REGION`. Same
+    /// contract as `image_write_pixels` for error reporting.
+    /// Default rejects.
+    #[allow(clippy::too_many_arguments)]
+    fn image_write_region_pixels(
+        &self,
+        _image_id: ResourceId,
+        _dst_x: u32, _dst_y: u32,
+        _width: u32, _height: u32,
+        _row_pitch: u32,
+        _pixels: &[u8],
+    ) -> Result<(), String> {
+        Err("backend does not support inline image write_region".into())
+    }
+
     /// Submit a frame command stream. Returns `true` if the fence
     /// should be signalled now, `false` if signaling is deferred.
     fn submit_frame(
@@ -331,6 +347,58 @@ impl Backend for SoftwareBackend {
             let dst_off = row * dst_pitch;
             dst[dst_off..dst_off + dst_pitch]
                 .copy_from_slice(&pixels[src_off..src_off + dst_pitch]);
+        }
+        Ok(())
+    }
+
+    fn image_write_region_pixels(
+        &self,
+        image_id: ResourceId,
+        dst_x: u32, dst_y: u32,
+        width: u32, height: u32,
+        row_pitch: u32,
+        pixels: &[u8],
+    ) -> Result<(), String> {
+        let mut images = self.images.lock()
+            .map_err(|_| "image table poisoned".to_string())?;
+        let pixmap = images.get_mut(&(image_id.raw() as u64))
+            .ok_or_else(|| format!("image {image_id} not registered"))?;
+
+        let img_w = pixmap.width()  as u64;
+        let img_h = pixmap.height() as u64;
+        let dst_x = dst_x as u64;
+        let dst_y = dst_y as u64;
+        let w = width as u64;
+        let h = height as u64;
+        if dst_x.saturating_add(w) > img_w || dst_y.saturating_add(h) > img_h {
+            return Err(format!(
+                "region ({dst_x},{dst_y} {w}×{h}) extends past image bounds {img_w}×{img_h}"
+            ));
+        }
+        let region_pitch = (w as usize) * 4;
+        let src_pitch    = row_pitch as usize;
+        if src_pitch < region_pitch {
+            return Err(format!(
+                "row_pitch {src_pitch} too small for region width {w} (need ≥{region_pitch})"
+            ));
+        }
+        if pixels.len() != src_pitch * (h as usize) {
+            return Err(format!(
+                "pixel buffer length {} != row_pitch {} × height {}",
+                pixels.len(), src_pitch, h
+            ));
+        }
+
+        // Copy row-by-row into the sub-rect. The Pixmap's internal
+        // row stride is `pixmap.width() * 4` (tightly packed).
+        let pixmap_pitch = pixmap.width() as usize * 4;
+        let dst = pixmap.data_mut();
+        for row in 0..(h as usize) {
+            let src_off = row * src_pitch;
+            let dst_off = ((dst_y as usize) + row) * pixmap_pitch
+                        + (dst_x as usize) * 4;
+            dst[dst_off..dst_off + region_pitch]
+                .copy_from_slice(&pixels[src_off..src_off + region_pitch]);
         }
         Ok(())
     }

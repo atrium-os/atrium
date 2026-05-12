@@ -248,15 +248,23 @@ fn render_one_frame_aqueduct(
                     .map_err(|e| io_other(format!("write slot {slot_id}: {e:?}")))?;
                 slot_images.insert(slot_id, SlotImage { image, width, height });
             }
-            UploadRequest::TextureRegion { slot_id, .. } => {
-                // Sub-region atlas patching (used by the server-side
-                // text engine for incremental glyph upload). Not yet
-                // supported by aqueduct-gpu's OP_GPU_IMAGE_WRITE which
-                // writes from offset 0. Log + skip. The text engine
-                // will re-emit a full Texture upload on the next
-                // dirty cycle which we DO handle.
-                log::debug!("frescod-aqueduct: skipped TextureRegion for slot {slot_id} \
-                             (sub-region upload not yet implemented)");
+            UploadRequest::TextureRegion {
+                slot_id, bytes, dst_x, dst_y, width, height,
+            } => {
+                let Some(slot) = slot_images.get(&slot_id) else {
+                    log::debug!("frescod-aqueduct: TextureRegion for unknown slot {slot_id}; \
+                                 skipping (no prior Texture upload)");
+                    continue;
+                };
+                let row_pitch = width * 4;
+                let pixels = premultiply_for_tiny_skia(&bytes);
+                client.write_image_region(
+                    slot.image,
+                    dst_x, dst_y, width, height,
+                    row_pitch, pixels,
+                ).map_err(|e| io_other(format!(
+                    "write_image_region slot {slot_id}: {e:?}"
+                )))?;
             }
         }
     }

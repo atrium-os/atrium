@@ -174,6 +174,29 @@ impl GpuClient {
         self.send(OP_GPU_IMAGE_WRITE, 0, &req)
     }
 
+    /// Inline sub-region pixel write. Fire-and-forget; failures
+    /// surface as `ValidationErr` events. The image must already
+    /// exist (prior `create_image` + initial `write_image`). The
+    /// pixels outside the declared `[dst_x..dst_x+width,
+    /// dst_y..dst_y+height]` rect are untouched.
+    ///
+    /// Used by atrium-text's server-side glyph rasteriser to ship
+    /// only newly-cached glyphs each frame instead of re-uploading
+    /// the whole atlas.
+    pub fn write_image_region(
+        &mut self,
+        image_id: ResourceId,
+        dst_x: u32, dst_y: u32,
+        width: u32, height: u32,
+        row_pitch: u32,
+        pixels: Vec<u8>,
+    ) -> GpuClientResult<()> {
+        let req = ImageWriteRegionPayload {
+            image_id, dst_x, dst_y, width, height, row_pitch, pixels,
+        };
+        self.send(OP_GPU_IMAGE_WRITE_REGION, 0, &req)
+    }
+
     /// Create a buffer. ID is pre-assigned. Returns it.
     pub fn create_buffer(&mut self, mut params: BufferCreatePayload) -> GpuClientResult<ResourceId> {
         params.buffer_id = self.alloc_id()?;

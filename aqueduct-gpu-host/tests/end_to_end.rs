@@ -360,6 +360,97 @@ fn software_backend_renders_textured_rect_end_to_end() {
 }
 
 #[test]
+fn write_image_region_patches_subrect_only() {
+    // Upload a fully-red 16×16 image, then patch a 4×4 green sub-rect
+    // at offset (6, 6). Render the patched image via textured-rect
+    // pipeline and verify (a) centre pixel is green (from the patch)
+    // and (b) corner pixels are still red.
+    use aqueduct_gpu::opcodes::FrameOp;
+    use aqueduct_gpu::payloads::ImageCreatePayload;
+    use aqueduct_gpu::ids::{IdNamespace, ResourceId};
+    use aqueduct_gpu_host::software::{
+        BeginRenderPassBody, TexturedRectOpParams,
+        BUILTIN_PIPELINE_TEXTURED_RECT,
+    };
+
+    let sock = tmp_socket("write_region");
+    let sw_backend = Arc::new(aqueduct_gpu_host::SoftwareBackend::new());
+    let backend_for_listener: Arc<dyn aqueduct_gpu_host::Backend> = sw_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap();
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+
+    let conn = Connection::connect(&sock).unwrap();
+    let mut client = GpuClient::new(conn);
+    client.handshake(ClientKind::FrescodRenderer).unwrap();
+
+    let atlas_mem  = client.allocate_memory(16*16*4, MemoryUsage::ImageBacking).unwrap();
+    let target_mem = client.allocate_memory(64*64*4, MemoryUsage::ImageBacking).unwrap();
+    let atlas = client.create_image(ImageCreatePayload {
+        image_id: ResourceId(0), backing_region: atlas_mem.region_id, region_offset: 0,
+        format: 37, width: 16, height: 16, depth: 1,
+        mip_levels: 1, array_layers: 1, usage: 0x07,
+    }).unwrap();
+    let target = client.create_image(ImageCreatePayload {
+        image_id: ResourceId(0), backing_region: target_mem.region_id, region_offset: 0,
+        format: 37, width: 64, height: 64, depth: 1,
+        mip_levels: 1, array_layers: 1, usage: 0x07,
+    }).unwrap();
+    thread::sleep(Duration::from_millis(30));
+
+    // Initial: fill atlas red.
+    let mut red = vec![0u8; 16*16*4];
+    for px in red.chunks_exact_mut(4) { px[0]=255; px[3]=255; }
+    client.write_image(atlas, 16*4, red).unwrap();
+
+    // Patch a 4×4 green sub-rect at (6, 6).
+    let mut green = vec![0u8; 4*4*4];
+    for px in green.chunks_exact_mut(4) { px[1]=255; px[3]=255; }
+    client.write_image_region(atlas, 6, 6, 4, 4, 4*4, green).unwrap();
+
+    // Render atlas scaled into target.
+    let fence = client.create_fence().unwrap();
+    let mut fb = client.frame_builder();
+    fb.push(FrameOp::BeginRenderPass, &BeginRenderPassBody {
+        target_image_id: target.raw(),
+        clear_color_rgba8: [0, 0, 0, 255],
+    }.to_bytes()).unwrap();
+    let pipe = ResourceId::new(IdNamespace::Builtin, BUILTIN_PIPELINE_TEXTURED_RECT);
+    fb.push(FrameOp::BindPipeline, &pipe.raw().to_le_bytes()).unwrap();
+    let params = TexturedRectOpParams {
+        dst_x: 0.0, dst_y: 0.0, dst_w: 64.0, dst_h: 64.0,
+        atlas_image_id: atlas.raw(),
+        src_u0: 0.0, src_v0: 0.0, src_u1: 16.0, src_v1: 16.0,
+        tint_r: 1.0, tint_g: 1.0, tint_b: 1.0, tint_a: 1.0,
+    };
+    let mut pc = vec![0u8; 4];
+    pc.extend_from_slice(&params.to_bytes());
+    fb.push(FrameOp::PushConstants, &pc).unwrap();
+    fb.push(FrameOp::Draw, &[0u8; 16]).unwrap();
+    fb.push(FrameOp::EndRenderPass, &[]).unwrap();
+    client.submit_frame(fence, fb, 1).unwrap();
+    let _ = client.wait_fence(fence, 1_000_000_000).unwrap();
+    thread::sleep(Duration::from_millis(50));
+
+    let pixels = sw_backend.read_image_pixels(target).expect("pixels");
+    // Atlas (8, 8) is inside the green patch (6..10). With src→dst
+    // scale 4×, target pixel (32, 32) samples atlas (8, 8) ⇒ green.
+    let centre = (32 * 64 + 32) * 4;
+    assert_eq!(pixels[centre + 0],   0, "centre R should be from green patch");
+    assert_eq!(pixels[centre + 1], 255, "centre G");
+    // Atlas (0, 0) is OUTSIDE the patch; target (0, 0) ⇒ red.
+    let corner = (0 * 64 + 0) * 4;
+    assert_eq!(pixels[corner + 0], 255, "corner R should still be red");
+    assert_eq!(pixels[corner + 1],   0, "corner G");
+
+    assert_eq!(sw_backend.dispatch_failure_count(), 0);
+
+    drop(client);
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[test]
 fn software_backend_handles_multi_renderpass_frame() {
     // Two renderpasses in one frame:
     //   pass 1: render a solid red 8×8 image (acts as a generated atlas)
