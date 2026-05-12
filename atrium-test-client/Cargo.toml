@@ -40,6 +40,12 @@ path = "src/server_text_demo.rs"
 name = "atrium-stress"
 path = "src/stress.rs"
 
+# Text-heavy variant: LINES rows of CHARS chars per frame as
+# separate glyph_run nodes. Closer to a terminal/editor workload.
+[[bin]]
+name = "atrium-glyph-stress"
+path = "src/glyph_stress.rs"
+
 [dependencies]
 fresco-client   = { path = "../fresco-client" }
 fresco-protocol = { path = "../fresco-protocol" }
