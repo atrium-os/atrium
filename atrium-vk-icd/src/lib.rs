@@ -68,6 +68,44 @@ type PFN_vkVoidFunction = Option<unsafe extern "C" fn()>;
 const VK_MAX_EXTENSION_NAME_SIZE: usize = 256;
 const VK_MAX_DESCRIPTION_SIZE:    usize = 256;
 
+/// VK_ERROR_INITIALIZATION_FAILED — used when a caller hands us a
+/// null out-pointer where the spec requires one.
+const VK_ERROR_INITIALIZATION_FAILED: VkResult = -3;
+
+/// VK_ICD_LOADER_MAGIC — the value the Khronos loader expects at
+/// offset 0 of every dispatchable handle (VkInstance,
+/// VkPhysicalDevice, VkDevice, VkQueue, VkCommandBuffer) returned by
+/// an ICD. The loader checks for this magic and overwrites the slot
+/// with its own dispatch-table pointer. ICDs that don't set it get
+/// rejected from the loader's dispatch chain.
+///
+/// Per `vk_icd.h` (Khronos `Vulkan-Headers` repo): defined as
+/// `0x01CDC0DE` cast to `void*`.
+const VK_ICD_LOADER_MAGIC: usize = 0x01CDC0DE;
+
+/// Opaque Vulkan handle types. The Vulkan loader-ICD ABI treats
+/// these as `void *`; the loader stores its dispatch table at the
+/// pointed-to location's first slot. For the ICD's purposes the
+/// pointer addresses an ICD-owned struct whose first field is
+/// `VK_ICD_LOADER_MAGIC` (set by us at create time).
+type VkInstance       = *mut c_void;
+type VkPhysicalDevice = *mut c_void;
+
+/// ICD-side state behind a `VkInstance`. The first field MUST be
+/// the loader magic — the loader overwrites it on first use with a
+/// pointer to its own dispatch table; we never read it after
+/// returning the handle. Future device tracking + the aqueduct-gpu
+/// connection live in the trailing fields.
+#[repr(C)]
+struct AtriumInstance {
+    /// First field — see `VK_ICD_LOADER_MAGIC`. The loader writes
+    /// over this slot on first dispatch.
+    loader_dispatch_slot: usize,
+    /// Reserved for future ICD state (aqueduct-gpu connection,
+    /// physical-device list, etc.).
+    _reserved: [u8; 0],
+}
+
 #[repr(C)]
 #[derive(Copy, Clone)]
 #[allow(dead_code)]
@@ -140,10 +178,97 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(*mut u32, *mut VkLayerProperties) -> VkResult, FnVoidPtr,
             >(vkEnumerateInstanceLayerProperties)),
-        // Phase 1.3b+: vkCreateInstance, vkDestroyInstance,
-        // vkEnumeratePhysicalDevices, command-buffer recording, …
+        "vkCreateInstance" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(*const c_void, *const c_void, *mut VkInstance) -> VkResult, FnVoidPtr,
+            >(vkCreateInstance)),
+        "vkDestroyInstance" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkInstance, *const c_void), FnVoidPtr,
+            >(vkDestroyInstance)),
+        "vkEnumeratePhysicalDevices" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkInstance, *mut u32, *mut VkPhysicalDevice) -> VkResult, FnVoidPtr,
+            >(vkEnumeratePhysicalDevices)),
+        // Phase 1.3b+: device-level entry points + command-buffer
+        // recording. The loader will discover them via
+        // vk_icdGetInstanceProcAddr with our returned VkInstance.
         _ => None,
     }
+}
+
+/// `vkCreateInstance` — allocate an ICD-owned VkInstance handle.
+///
+/// Today we ignore the create-info: no extensions to enable, no
+/// application info to record. The returned handle's first slot is
+/// `VK_ICD_LOADER_MAGIC` per the loader-ICD ABI; the loader
+/// overwrites that slot with its own dispatch-table pointer on first
+/// use.
+///
+/// # Safety
+///
+/// `p_instance` must be a writable `VkInstance` slot. `p_create_info`
+/// is currently unused; we don't dereference it.
+#[no_mangle]
+pub unsafe extern "C" fn vkCreateInstance(
+    _p_create_info: *const c_void, /* const VkInstanceCreateInfo* */
+    _p_allocator:   *const c_void, /* const VkAllocationCallbacks* */
+    p_instance:     *mut VkInstance,
+) -> VkResult {
+    if p_instance.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let inst = Box::new(AtriumInstance {
+        loader_dispatch_slot: VK_ICD_LOADER_MAGIC,
+        _reserved: [],
+    });
+    *p_instance = Box::into_raw(inst) as VkInstance;
+    VK_SUCCESS
+}
+
+/// `vkDestroyInstance` — reclaim the AtriumInstance allocation.
+///
+/// # Safety
+///
+/// `instance` must be a handle previously returned by
+/// `vkCreateInstance`, or null (no-op).
+#[no_mangle]
+pub unsafe extern "C" fn vkDestroyInstance(
+    instance:     VkInstance,
+    _p_allocator: *const c_void, /* const VkAllocationCallbacks* */
+) {
+    if instance.is_null() {
+        return;
+    }
+    let _ = Box::from_raw(instance as *mut AtriumInstance);
+}
+
+/// `vkEnumeratePhysicalDevices` — list the GPUs this ICD can target.
+///
+/// Today: zero. The full aqueduct-gpu device-discovery path
+/// (handshake against frescod-aqueduct, learn what tier-1/2/3
+/// backends are reachable, expose each as a `VkPhysicalDevice`)
+/// lands later in Phase 1.3b.
+///
+/// Standard Vulkan two-call query: caller invokes once with
+/// `p_devices=NULL` to learn the count, then again with a buffer.
+///
+/// # Safety
+///
+/// `p_count` must be writable. `p_devices` may be null (count-only
+/// query) or point to a writable buffer of at least `*p_count`
+/// `VkPhysicalDevice` slots.
+#[no_mangle]
+pub unsafe extern "C" fn vkEnumeratePhysicalDevices(
+    _instance:  VkInstance,
+    p_count:    *mut u32,
+    _p_devices: *mut VkPhysicalDevice,
+) -> VkResult {
+    if p_count.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    *p_count = 0;
+    VK_SUCCESS
 }
 
 /// `vkEnumerateInstanceVersion` — loader's first probe to learn what
@@ -260,8 +385,8 @@ mod tests {
 
     #[test]
     fn get_proc_addr_unknown_name_returns_none() {
-        // vkCreateInstance isn't wired yet (Phase 1.3b+).
-        let name = b"vkCreateInstance\0";
+        // vkCreateDevice isn't wired yet (Phase 1.3b+).
+        let name = b"vkCreateDevice\0";
         let r = unsafe {
             vk_icdGetInstanceProcAddr(
                 std::ptr::null_mut(),
@@ -318,5 +443,66 @@ mod tests {
         let r = unsafe { typed(&mut count, std::ptr::null_mut()) };
         assert_eq!(r, VK_SUCCESS);
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn create_and_destroy_instance_round_trip() {
+        let f_create = lookup(b"vkCreateInstance\0").unwrap();
+        let create: unsafe extern "C" fn(*const c_void, *const c_void, *mut VkInstance) -> VkResult =
+            unsafe { std::mem::transmute(f_create) };
+        let mut inst: VkInstance = std::ptr::null_mut();
+        let r = unsafe { create(std::ptr::null(), std::ptr::null(), &mut inst) };
+        assert_eq!(r, VK_SUCCESS);
+        assert!(!inst.is_null(), "create_instance must produce a non-null handle");
+
+        // Loader-ICD ABI: the first sizeof(void*) bytes of a
+        // dispatchable handle must be VK_ICD_LOADER_MAGIC when
+        // the ICD returns it.
+        let slot: usize = unsafe { *(inst as *const usize) };
+        assert_eq!(slot, VK_ICD_LOADER_MAGIC,
+            "first slot of VkInstance must hold ICD_LOADER_MAGIC for the loader");
+
+        let f_destroy = lookup(b"vkDestroyInstance\0").unwrap();
+        let destroy: unsafe extern "C" fn(VkInstance, *const c_void) =
+            unsafe { std::mem::transmute(f_destroy) };
+        unsafe { destroy(inst, std::ptr::null()); }
+        // No assertion — destroy is infallible by spec. The unit
+        // test passes if there's no leak/UB (Miri or ASan would
+        // catch use-after-free; the Drop on Box ran cleanly).
+    }
+
+    #[test]
+    fn enumerate_physical_devices_reports_zero_today() {
+        // Set up an instance.
+        let f_create = lookup(b"vkCreateInstance\0").unwrap();
+        let create: unsafe extern "C" fn(*const c_void, *const c_void, *mut VkInstance) -> VkResult =
+            unsafe { std::mem::transmute(f_create) };
+        let mut inst: VkInstance = std::ptr::null_mut();
+        let _ = unsafe { create(std::ptr::null(), std::ptr::null(), &mut inst) };
+
+        let f_enum = lookup(b"vkEnumeratePhysicalDevices\0").unwrap();
+        let enum_pd: unsafe extern "C" fn(VkInstance, *mut u32, *mut VkPhysicalDevice) -> VkResult =
+            unsafe { std::mem::transmute(f_enum) };
+        let mut count: u32 = 99;
+        let r = unsafe { enum_pd(inst, &mut count, std::ptr::null_mut()) };
+        assert_eq!(r, VK_SUCCESS);
+        // No physical devices wired up yet — Phase 1.3b will grow
+        // device-discovery against aqueduct-gpu and bump this.
+        assert_eq!(count, 0);
+
+        let f_destroy = lookup(b"vkDestroyInstance\0").unwrap();
+        let destroy: unsafe extern "C" fn(VkInstance, *const c_void) =
+            unsafe { std::mem::transmute(f_destroy) };
+        unsafe { destroy(inst, std::ptr::null()); }
+    }
+
+    #[test]
+    fn destroy_null_instance_is_safe() {
+        let f = lookup(b"vkDestroyInstance\0").unwrap();
+        let destroy: unsafe extern "C" fn(VkInstance, *const c_void) =
+            unsafe { std::mem::transmute(f) };
+        // Per Vulkan spec, vkDestroyInstance on VK_NULL_HANDLE is
+        // a documented no-op. Verify we don't panic.
+        unsafe { destroy(std::ptr::null_mut(), std::ptr::null()); }
     }
 }
