@@ -165,6 +165,17 @@ pub struct atrium_display_page_flip {
     pub _pad0: u32,
 }
 
+/// `flags` bit: defer the actual `SET_SCANOUT_BLOB` / `RESOURCE_FLUSH`
+/// to the next vblank tick on `connector_id`. The ioctl validates the
+/// BO (and auto-promotes it if necessary) then returns immediately;
+/// the kmod's taskqueue worker performs the real virtio commands at
+/// panel-refresh boundary. See `docs/spec/aqueduct-gpu.md` §6.5.5.c.
+///
+/// Single-deep queue: a second queued flip arriving before the first
+/// fires replaces it (newer frame wins). `flip_id` is the caller's
+/// monotonic frame ID so coalesced frames can be detected upstream.
+pub const ATRIUM_PAGE_FLIP_QUEUE_VBLANK: u32 = 0x04;
+
 /// `IOC_DISPLAY_WAIT_VBLANK` — block until the next vblank tick for
 /// `connector_id`, then return the post-wait sequence counter.
 ///

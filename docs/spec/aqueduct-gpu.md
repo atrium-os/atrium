@@ -906,16 +906,45 @@ instead of running input/socket handlers on separate threads that
 update shared state. Useful for sub-vblank input responsiveness
 but not blocking the current architecture.
 
-#### 6.5.5.c. Queued (vsync-aligned) page-flip semantics
+#### 6.5.5.c. Queued (vsync-aligned) page-flip semantics — IMPLEMENTED
 
-Kmod `IOC_DISPLAY_PAGE_FLIP` gains a "queue for next vblank" flag
-that complements current immediate-mode. With the triple-buffer
-ring from 6.5.5.a and vblank events from 6.5.5.b, the slots
-become proper front / queued / back: client renders into back,
-queues it via page_flip, kmod swaps at next vblank, posts a
-vblank event, client begins next render. On a VRR panel the
-kmod's vblank cadence drops naturally to scene-change rate
-(matches §6.5.2's power-policy goal).
+Kmod `IOC_DISPLAY_PAGE_FLIP` accepts a
+`ATRIUM_PAGE_FLIP_QUEUE_VBLANK` flag bit (`0x04`). With the
+flag set, the ioctl validates + auto-promotes the BO and
+records the request in a per-connector single-deep slot, then
+returns immediately. The next `vblank_tick` callback (softclock
+context) enqueues the connector's preallocated task on a
+dedicated taskqueue (sleepable kthread); the worker issues
+`SET_SCANOUT_BLOB` (if BO differs from current) +
+`RESOURCE_FLUSH` at panel-refresh boundary. Required because
+`atrium_vgpu_req_resp` blocks in `cv_timedwait` and cannot run
+from a callout.
+
+Single-deep slot: a second queued flip arriving before the
+first fires replaces it (newer frame wins, matching DRM
+atomic-modeset semantics). `flip_id` is the caller's monotonic
+frame ID so upstream code can detect coalesced frames.
+
+Userspace adoption: `atrium-gpu-rs` `Display::page_flip_queued`
+wraps the new flag; `frescod/src/bin/frescod_aqueduct.rs`
+replaced its synchronous `page_flip` calls with the queued
+variant. The render loop now pipelines: render(N) → enqueue(N)
+→ render(N+1) → wait_vblank. The vblank wait happens after
+rendering frame N+1, overlapping the kmod's deferred flip of
+frame N with the next frame's render.
+
+VM-verified with `atrium-partial-stress` (FreeBSD 16.0-CURRENT
+aarch64): 51.7 iter/s, 30 flips/s (matches client's 30 fps
+mutation rate), 42 % no-change skip ratio, dmesg confirms the
+taskqueue worker steadily issuing alternating
+`SET_SCANOUT_BLOB` + `RESOURCE_FLUSH` virtio commands at vblank
+cadence. Level-3 intra-window dirty rect (37 % partial) still
+fires through the new path.
+
+On a VRR panel the kmod's vblank cadence drops naturally to
+scene-change rate (matches §6.5.2's power-policy goal); on a
+fixed-refresh panel the deferred flip lands at the next tick
+regardless.
 
 #### Architectural staging today
 

@@ -280,6 +280,47 @@ impl Display {
         rc(r, ())
     }
 
+    /// Vsync-aligned (queued) page-flip. Returns immediately after the
+    /// kmod validates + auto-promotes the BO; the actual scanout
+    /// rebind + flush happens in a kthread at the connector's next
+    /// vblank tick. `flip_id` lets userspace tag the request — if a
+    /// second queued flip arrives before the first fires, the newer
+    /// one wins (single-deep queue, DRM atomic-modeset style).
+    ///
+    /// Compared to the call pattern of `page_flip` + `wait_vblank`:
+    ///
+    /// ```text
+    /// // immediate-flip path:
+    /// render(frame_n);
+    /// page_flip(...);         // synchronous SET_SCANOUT + FLUSH
+    /// wait_vblank(conn);      // block to pace next frame
+    /// render(frame_n + 1);
+    ///
+    /// // queued-flip path:
+    /// render(frame_n);
+    /// page_flip_queued(..., flip_id_n);  // returns immediately
+    /// render(frame_n + 1);    // overlaps with vblank wait
+    /// wait_vblank(conn);
+    /// ```
+    ///
+    /// See `docs/spec/aqueduct-gpu.md` §6.5.5.c.
+    pub fn page_flip_queued(
+        &self,
+        connector_id: u32,
+        scanout: &Bo<'_>,
+        flip_id: u64,
+    ) -> io::Result<()> {
+        let mut p = abi::atrium_display_page_flip {
+            connector_id,
+            scanout_handle: scanout.handle,
+            flip_id,
+            flags: abi::ATRIUM_PAGE_FLIP_QUEUE_VBLANK,
+            ..Default::default()
+        };
+        let r = unsafe { ioctl(self.fd, abi::ATRIUM_DISPLAY_IOC_PAGE_FLIP, &mut p) };
+        rc(r, ())
+    }
+
     /// Block until the next vblank tick for `connector_id`. Returns
     /// the kmod's sequence counter after the wait. Callers can
     /// detect missed vblanks by comparing successive `seq` values

@@ -416,6 +416,18 @@ struct atrium_display_set_mode {
 
 #define FRESCO_PAGE_FLIP_INCLUDE_CURSOR 0x02
 
+/* Defer SET_SCANOUT_BLOB / RESOURCE_FLUSH to the next vblank tick on
+ * `connector_id`. The ioctl returns immediately after validating the
+ * BO (and auto-promoting it if necessary); the actual virtio commands
+ * fire from a kthread the next time the connector's vblank callout
+ * tick runs. Lets userspace pipeline render and flip without an
+ * explicit IOC_WAIT_VBLANK round-trip per frame.
+ *
+ * Single-deep queue: a second queued flip arriving before the first
+ * fires replaces it (newer frame wins). flip_id is the caller's
+ * monotonic frame ID so coalesced frames can be detected. */
+#define ATRIUM_PAGE_FLIP_QUEUE_VBLANK   0x04
+
 struct atrium_display_page_flip {
 	uint32_t connector_id;
 	uint32_t scanout_handle;

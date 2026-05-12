@@ -24,6 +24,7 @@
 #include <sys/lock.h>
 #include <sys/mutex.h>
 #include <sys/condvar.h>
+#include <sys/taskqueue.h>
 #include <sys/rman.h>
 #include <sys/sysctl.h>
 #include <sys/uio.h>
@@ -233,6 +234,31 @@ struct atrium_gpu_softc {
 		struct atrium_gpu_softc *sc;
 		uint32_t                 conn;
 	}                              vblank_cookie[ATRIUM_GPU_MAX_SCANOUTS];
+
+	/* Per-connector queued page-flip slot — single-deep.
+	 *
+	 * A page_flip called with ATRIUM_PAGE_FLIP_QUEUE_VBLANK stores
+	 * its (resource_id, w, h) here and returns immediately. The
+	 * next vblank tick enqueues `vblank_task` (taskqueue worker
+	 * runs in a sleepable thread context, unlike the softclock
+	 * callout) which issues the deferred SET_SCANOUT_BLOB (if BO
+	 * differs from current) + RESOURCE_FLUSH. After execution the
+	 * slot is cleared.
+	 *
+	 * Single-deep: a second QUEUE_VBLANK arriving before the first
+	 * fires *replaces* the queued request (the newer frame wins,
+	 * matching DRM atomic-modeset semantics). Caller-supplied
+	 * flip_id lets userspace detect coalesced frames.
+	 *
+	 * Guarded by `vblank_mtx`. */
+	struct atrium_queued_flip {
+		uint32_t   resource_id;     /* 0 = slot empty */
+		uint32_t   width;
+		uint32_t   height;
+		uint64_t   flip_id;
+	}                              queued_flip[ATRIUM_GPU_MAX_SCANOUTS];
+	struct taskqueue              *vblank_tq;
+	struct task                    vblank_task[ATRIUM_GPU_MAX_SCANOUTS];
 
 	/* Cdevs. */
 	struct cdev                   *gpu_cdev;
@@ -1386,12 +1412,83 @@ atrium_display_vblank_tick(void *arg)
 	sc->vblank_seq[conn]++;
 	period = sc->vblank_period_sbt[conn];
 	cv_broadcast(&sc->vblank_cv[conn]);
+	/* Queued page-flip dispatch — see softc::queued_flip / §6.5.5.c.
+	 * Schedule the worker if a flip is queued for this connector;
+	 * the worker reads/clears the slot under vblank_mtx itself. We
+	 * can't issue virtio commands from softclock context (req_resp
+	 * blocks in cv_timedwait), so the deferred work runs in
+	 * sc->vblank_tq's kthread. */
+	if (sc->queued_flip[conn].resource_id != 0 && sc->vblank_tq != NULL) {
+		taskqueue_enqueue(sc->vblank_tq, &sc->vblank_task[conn]);
+	}
 	if (sc->vblank_active[conn]) {
 		/* Sub-tick precision via _sbt variant: `kern.hz=100` would
 		 * otherwise floor us to 10ms = 100Hz scheduling regardless
 		 * of the actual panel refresh. */
 		callout_reset_sbt(&sc->vblank_co[conn], period, 0,
 		    atrium_display_vblank_tick, ck, 0);
+	}
+}
+
+/* Taskqueue worker for queued page-flips. Runs in a kthread (created
+ * by taskqueue_create_fast at attach time) — sleepable, so we can
+ * issue virtio commands here that block in cv_timedwait. One task
+ * per connector is preallocated in softc.vblank_task[]; the cookie
+ * tells us which connector this invocation belongs to.
+ *
+ * Reads + clears the queued slot atomically under vblank_mtx so a
+ * concurrent ATRIUM_PAGE_FLIP_QUEUE_VBLANK doesn't race against the
+ * tick that scheduled us.
+ */
+static void
+atrium_display_queued_flip_worker(void *arg, int pending __unused)
+{
+	struct atrium_vblank_cookie *ck = arg;
+	struct atrium_gpu_softc *sc = ck->sc;
+	uint32_t conn = ck->conn;
+	uint32_t rid, cur_rid, w, h;
+	int err;
+
+	if (conn >= ATRIUM_GPU_MAX_SCANOUTS)
+		return;
+
+	/* Snapshot + clear the queued request under vblank_mtx. */
+	mtx_lock(&sc->vblank_mtx);
+	rid = sc->queued_flip[conn].resource_id;
+	w   = sc->queued_flip[conn].width;
+	h   = sc->queued_flip[conn].height;
+	sc->queued_flip[conn].resource_id = 0;
+	mtx_unlock(&sc->vblank_mtx);
+
+	if (rid == 0)
+		return;  /* slot was cleared before we got here */
+
+	/* Same set_scanout_blob + resource_flush dance as the synchronous
+	 * page_flip path. BO has already been auto-promoted at queue
+	 * time, so we just need to retarget the connector (if needed)
+	 * and flush. */
+	mtx_lock(&sc->bo_lock);
+	cur_rid = sc->current_scanout_rid[conn];
+	mtx_unlock(&sc->bo_lock);
+
+	if (rid != cur_rid) {
+		err = atrium_vgpu_set_scanout_blob(sc, conn, rid,
+		    VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM, w, h);
+		if (err != 0) {
+			device_printf(sc->dev,
+			    "queued page_flip: set_scanout_blob conn=%u "
+			    "rid=%u: %d\n", conn, rid, err);
+			return;
+		}
+		mtx_lock(&sc->bo_lock);
+		sc->current_scanout_rid[conn] = rid;
+		mtx_unlock(&sc->bo_lock);
+	}
+	err = atrium_vgpu_resource_flush(sc, rid, 0, 0, w, h);
+	if (err != 0) {
+		device_printf(sc->dev,
+		    "queued page_flip: resource_flush conn=%u rid=%u: %d\n",
+		    conn, rid, err);
 	}
 }
 
@@ -1534,6 +1631,29 @@ atrium_display_page_flip(struct atrium_gpu_softc *sc,
 		return (ENXIO);
 	}
 	rid = bo->virtio_resource_id;
+
+	/* Queued (vsync-aligned) path: pre-promote the BO now (sleepable
+	 * context here, unlike the vblank tick), then stash the request
+	 * for the next vblank tick's taskqueue worker to execute. The
+	 * tick fires the worker; the worker issues SET_SCANOUT_BLOB +
+	 * RESOURCE_FLUSH at panel-refresh boundary. See §6.5.5.c.
+	 *
+	 * Single-deep slot: a second queued flip arriving before the
+	 * first fires replaces it. Matches DRM atomic-modeset semantics
+	 * — the newer frame wins. */
+	if (args->flags & ATRIUM_PAGE_FLIP_QUEUE_VBLANK) {
+		err = atrium_promote_bo_to_resource(sc, bo,
+		    VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM, w, h);
+		if (err != 0)
+			return (err);
+		mtx_lock(&sc->vblank_mtx);
+		sc->queued_flip[conn].resource_id = rid;
+		sc->queued_flip[conn].width       = w;
+		sc->queued_flip[conn].height      = h;
+		sc->queued_flip[conn].flip_id     = args->flip_id;
+		mtx_unlock(&sc->vblank_mtx);
+		return (0);
+	}
 
 	/* Multi-buffer scanout: if the caller is flipping to a BO whose
 	 * resource_id differs from the one currently bound to this
@@ -2467,7 +2587,21 @@ atrium_virtio_gpu_attach(device_t dev)
 		cv_init(&sc->vblank_cv[i], "atrium-gpu vblank");
 		sc->vblank_seq[i] = 0;
 		sc->vblank_active[i] = false;
+		sc->queued_flip[i].resource_id = 0;
+		sc->vblank_cookie[i].sc = sc;
+		sc->vblank_cookie[i].conn = i;
+		TASK_INIT(&sc->vblank_task[i], 0,
+		    atrium_display_queued_flip_worker,
+		    &sc->vblank_cookie[i]);
 	}
+	/* Dedicated kthread for vsync-aligned page-flip dispatch.
+	 * Sleepable context (unlike the vblank callout, which runs in
+	 * softclock and can't issue virtio commands). One thread is
+	 * enough — vblank ticks for all connectors share it. */
+	sc->vblank_tq = taskqueue_create_fast("atrium-gpu vblank tq",
+	    M_WAITOK, taskqueue_thread_enqueue, &sc->vblank_tq);
+	taskqueue_start_threads(&sc->vblank_tq, 1, PI_DISK,
+	    "atrium-gpu vblank");
 
 	/* virtio handshake. */
 	virtio_set_feature_desc(dev, atrium_virtio_gpu_feature_desc);
@@ -2604,9 +2738,19 @@ fail_locks:
 	for (uint32_t i = 0; i < ATRIUM_GPU_MAX_SCANOUTS; i++) {
 		mtx_lock(&sc->vblank_mtx);
 		sc->vblank_active[i] = false;
+		sc->queued_flip[i].resource_id = 0;
 		mtx_unlock(&sc->vblank_mtx);
 		callout_drain(&sc->vblank_co[i]);
 		cv_destroy(&sc->vblank_cv[i]);
+	}
+	/* Drain + free the queued-flip taskqueue. Must come after the
+	 * callout drain so no new tasks can be enqueued. taskqueue_free
+	 * blocks until in-flight tasks complete. */
+	if (sc->vblank_tq != NULL) {
+		for (uint32_t i = 0; i < ATRIUM_GPU_MAX_SCANOUTS; i++)
+			taskqueue_drain(sc->vblank_tq, &sc->vblank_task[i]);
+		taskqueue_free(sc->vblank_tq);
+		sc->vblank_tq = NULL;
 	}
 	mtx_destroy(&sc->vblank_mtx);
 
@@ -2643,9 +2787,19 @@ atrium_virtio_gpu_detach(device_t dev)
 	for (uint32_t i = 0; i < ATRIUM_GPU_MAX_SCANOUTS; i++) {
 		mtx_lock(&sc->vblank_mtx);
 		sc->vblank_active[i] = false;
+		sc->queued_flip[i].resource_id = 0;
 		mtx_unlock(&sc->vblank_mtx);
 		callout_drain(&sc->vblank_co[i]);
 		cv_destroy(&sc->vblank_cv[i]);
+	}
+	/* Drain + free the queued-flip taskqueue. Must come after the
+	 * callout drain so no new tasks can be enqueued. taskqueue_free
+	 * blocks until in-flight tasks complete. */
+	if (sc->vblank_tq != NULL) {
+		for (uint32_t i = 0; i < ATRIUM_GPU_MAX_SCANOUTS; i++)
+			taskqueue_drain(sc->vblank_tq, &sc->vblank_task[i]);
+		taskqueue_free(sc->vblank_tq);
+		sc->vblank_tq = NULL;
 	}
 	mtx_destroy(&sc->vblank_mtx);
 

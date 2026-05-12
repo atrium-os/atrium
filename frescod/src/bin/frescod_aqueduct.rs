@@ -305,20 +305,22 @@ fn main() -> std::io::Result<()> {
         let real_flip = any_dirty || layout_changed;
 
         if real_flip && !composite.is_empty() {
-            // Flip to the freshly-rendered BO; advance the ring.
-            // Kmod's page_flip will SET_SCANOUT-rebind the connector
-            // since we're flipping to a different BO than last frame.
-            dpy.page_flip(conn.id, &bos[next_render_idx])?;
+            // Queue the flip for the next vblank tick — kmod's
+            // taskqueue worker performs the SET_SCANOUT_BLOB +
+            // RESOURCE_FLUSH at panel-refresh boundary. Returns
+            // immediately so the next render can overlap with
+            // vblank wait. See aqueduct-gpu.md §6.5.5.c.
+            dpy.page_flip_queued(conn.id, &bos[next_render_idx], timeline)?;
             last_flipped_idx = next_render_idx;
             next_render_idx = (next_render_idx + 1) % bos.len();
             last_composite_bytes = composite;
             frames_since_real_flip = 0;
             window_flips += 1;
         } else if need_keepalive {
-            // Re-assert the current scanout BO. Kmod's page_flip
-            // hits the same-BO fast path (no SET_SCANOUT, just
-            // RESOURCE_FLUSH). No ring advance.
-            dpy.page_flip(conn.id, &bos[last_flipped_idx])?;
+            // VRR keepalive — re-queue the current scanout BO. Same-BO
+            // case in the worker hits the fast path (no SET_SCANOUT,
+            // just RESOURCE_FLUSH).
+            dpy.page_flip_queued(conn.id, &bos[last_flipped_idx], timeline)?;
             frames_since_real_flip = 0;
             window_flips += 1;
         } else {
