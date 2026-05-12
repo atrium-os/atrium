@@ -334,6 +334,53 @@ struct atrium_gpu_host_blob {
 #define ATRIUM_GPU_IOC_HOST_BLOB \
 	_IOWR('G', 0x45, struct atrium_gpu_host_blob)
 
+/* ---------- Backend enumeration ---------- */
+/*
+ * ATRIUM_GPU_IOC_LIST_BACKENDS — enumerate the (vendor_id,
+ * generation_id, family) tuples this kmod can target.
+ *
+ * Used by atrium-pkg at install time to compile a game's shaders
+ * against every locally-installed backend, and by atrium-vk-icd at
+ * runtime to pick the right precompiled blob from the package.
+ *
+ * Today the kmod has exactly one backend (atrium-gpu-v1 over
+ * virtio-gpu), but the ABI is shaped for the multi-backend future
+ * (D5+ where one kmod could expose e.g. atrium-gpu-v1 + amdgpu-rdna3
+ * if multiple GPUs are present).
+ *
+ * Userspace pattern (matches IOC_DISPLAY_ENUM_CONNECTORS):
+ *   1. Call with count_in=0 to learn the actual count via count_out.
+ *   2. Allocate a buffer for `count_out` entries.
+ *   3. Call again with count_in=N, backends_ptr → buffer.
+ *
+ * `name` is a stable identifier suitable for atrium-pkg's
+ * shader-precompile cache key (kebab-case, e.g. "atrium-gpu-v1").
+ */
+struct atrium_gpu_backend_info {
+	uint32_t vendor_id;        /* matches atrium_gpu_caps.vendor_id */
+	uint32_t generation_id;    /* compiler-target version, monotone */
+	char     name[32];         /* kebab-case backend identifier */
+	uint32_t feature_flags;    /* FRESCO_FEAT_* mask */
+	uint32_t _pad0;
+	uint64_t _reserved[4];
+};
+
+struct atrium_gpu_list_backends {
+	uint32_t count_in;         /* number of slots backends_ptr can hold */
+	uint32_t count_out;        /* number the kmod has, may exceed count_in */
+	uint64_t backends_ptr;     /* userspace ptr to count_in * struct */
+};
+
+#define ATRIUM_GPU_IOC_LIST_BACKENDS \
+	_IOWR('G', 0x46, struct atrium_gpu_list_backends)
+
+/* Backend identifiers known today. Future backends (D5+ native HW
+ * drivers, atrium-gpu-v2 wire bump) extend the table; atrium-pkg's
+ * shader cache is keyed on (vendor_id, generation_id) so old
+ * precompiled entries stay valid across kmod adds. */
+#define ATRIUM_GPU_BACKEND_V1_VENDOR    0xA710  /* "Atrium" */
+#define ATRIUM_GPU_BACKEND_V1_GEN       1
+
 /* ---------- Display ---------- */
 
 struct atrium_display_bind_gpu {

@@ -51,6 +51,18 @@ pub struct Gpu {
     fd: RawFd,
 }
 
+/// One backend descriptor returned by `Gpu::backends`. The
+/// `(vendor_id, generation_id)` pair is a stable key suitable for
+/// atrium-pkg's shader-precompile cache; `name` is the kebab-case
+/// human-readable identifier (e.g. `"atrium-gpu-v1"`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Backend {
+    pub vendor_id:     u32,
+    pub generation_id: u32,
+    pub name:          String,
+    pub feature_flags: u32,
+}
+
 impl Gpu {
     pub fn open() -> io::Result<Self> {
         Ok(Self { fd: open_rdwr("/dev/atrium-gpu0")? })
@@ -69,6 +81,48 @@ impl Gpu {
         };
         let nul = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
         Ok(String::from_utf8_lossy(&bytes[..nul]).into_owned())
+    }
+
+    /// Enumerate the (vendor_id, generation_id, name) backend
+    /// descriptors this kmod can target. Used by atrium-pkg at
+    /// install time to compile shaders for every locally-installed
+    /// backend; used by atrium-vk-icd at runtime to pick the right
+    /// precompiled blob from a package's shader cache.
+    ///
+    /// Two-phase under the hood: a probe call learns `count_out`,
+    /// then a single fill call returns the backends.
+    pub fn backends(&self) -> io::Result<Vec<Backend>> {
+        // Phase 1: probe.
+        let mut q = abi::atrium_gpu_list_backends {
+            count_in: 0,
+            count_out: 0,
+            backends_ptr: 0,
+        };
+        let r = unsafe { ioctl(self.fd, abi::ATRIUM_GPU_IOC_LIST_BACKENDS, &mut q) };
+        rc(r, ())?;
+        let n = q.count_out as usize;
+        if n == 0 { return Ok(Vec::new()); }
+
+        // Phase 2: fill.
+        let mut buf: Vec<abi::atrium_gpu_backend_info> =
+            vec![abi::atrium_gpu_backend_info::default(); n];
+        q.count_in     = n as u32;
+        q.backends_ptr = buf.as_mut_ptr() as u64;
+        let r = unsafe { ioctl(self.fd, abi::ATRIUM_GPU_IOC_LIST_BACKENDS, &mut q) };
+        rc(r, ())?;
+
+        Ok(buf.iter().map(|b| {
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(b.name.as_ptr() as *const u8, b.name.len())
+            };
+            let nul = bytes.iter().position(|&x| x == 0).unwrap_or(bytes.len());
+            Backend {
+                vendor_id:     b.vendor_id,
+                generation_id: b.generation_id,
+                name:          String::from_utf8_lossy(&bytes[..nul]).into_owned(),
+                feature_flags: b.feature_flags,
+            }
+        }).collect())
     }
 
     /// Allocate a buffer object. The returned [`Bo`] owns the BO and

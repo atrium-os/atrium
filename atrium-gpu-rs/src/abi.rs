@@ -90,6 +90,41 @@ impl Default for atrium_gpu_caps {
     }
 }
 
+/// Backend descriptor surfaced by `IOC_GPU_LIST_BACKENDS`. Matches
+/// `struct atrium_gpu_backend_info` in `atrium_gpu.h`. Today the kmod
+/// reports exactly one entry (`atrium-gpu-v1` over virtio-gpu); the
+/// ABI is shaped for the multi-backend future.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct atrium_gpu_backend_info {
+    pub vendor_id:     u32,
+    pub generation_id: u32,
+    pub name:          [c_char; 32],
+    pub feature_flags: u32,
+    pub _pad0:         u32,
+    pub _reserved:     [u64; 4],
+}
+impl Default for atrium_gpu_backend_info {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+/// Argument struct for `IOC_GPU_LIST_BACKENDS`. Two-phase call:
+/// invoke once with `count_in=0` to learn `count_out`, then again
+/// with a buffer of that capacity.
+#[repr(C)]
+#[derive(Default, Copy, Clone)]
+pub struct atrium_gpu_list_backends {
+    pub count_in:     u32,
+    pub count_out:    u32,
+    pub backends_ptr: u64,
+}
+
+/// Known backend (`vendor_id`, `generation_id`) pairs.
+pub const ATRIUM_GPU_BACKEND_V1_VENDOR: u32 = 0xA710;
+pub const ATRIUM_GPU_BACKEND_V1_GEN:    u32 = 1;
+
 #[repr(C)]
 #[derive(Default, Copy, Clone)]
 pub struct atrium_display_bind_gpu {
@@ -233,6 +268,7 @@ pub const ATRIUM_GPU_IOC_SUBMIT:       u64 = iowr(G, 4, std::mem::size_of::<atri
 pub const ATRIUM_GPU_IOC_FENCE_WAIT:   u64 = iow (G, 5, std::mem::size_of::<atrium_gpu_fence_wait>()   as u32);
 pub const ATRIUM_GPU_IOC_FENCE_QUERY:  u64 = iowr(G, 6, std::mem::size_of::<atrium_gpu_fence_query>()  as u32);
 pub const ATRIUM_GPU_IOC_CAPS:         u64 = ior (G, 7, std::mem::size_of::<atrium_gpu_caps>()         as u32);
+pub const ATRIUM_GPU_IOC_LIST_BACKENDS:u64 = iowr(G, 0x46, std::mem::size_of::<atrium_gpu_list_backends>() as u32);
 
 pub const ATRIUM_DISPLAY_IOC_BIND_GPU:        u64 = iow (D, 0, std::mem::size_of::<atrium_display_bind_gpu>()        as u32);
 pub const ATRIUM_DISPLAY_IOC_ENUM_CONNECTORS: u64 = iowr(D, 1, std::mem::size_of::<atrium_display_enum>()            as u32);

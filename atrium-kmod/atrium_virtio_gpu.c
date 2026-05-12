@@ -1107,6 +1107,43 @@ atrium_gpu_ioc_ctx_fence_wait(struct atrium_gpu_softc *sc __unused,
 	return (0);
 }
 
+/* ATRIUM_GPU_IOC_LIST_BACKENDS — fill the caller's buffer with the
+ * backend descriptors this kmod can target. Today there's exactly
+ * one (atrium-gpu-v1 over virtio-gpu); count_out is always 1.
+ *
+ * Userspace pattern (atrium_gpu.h):
+ *   1. ioctl(fd, ..., {count_in=0}) → learns count_out.
+ *   2. ioctl(fd, ..., {count_in=N, backends_ptr=buf}) → fills up
+ *      to min(count_in, count_out) slots.
+ *
+ * count_out reports the true backend count regardless of how many
+ * slots the caller provided (mirrors enum_connectors semantics).
+ */
+static int
+atrium_gpu_ioc_list_backends(struct atrium_gpu_softc *sc __unused,
+    struct atrium_gpu_list_backends *args)
+{
+	struct atrium_gpu_backend_info b;
+	int err;
+
+	args->count_out = 1;
+	if (args->count_in == 0)
+		return (0);
+	if (args->backends_ptr == 0)
+		return (EFAULT);
+
+	bzero(&b, sizeof(b));
+	b.vendor_id     = ATRIUM_GPU_BACKEND_V1_VENDOR;
+	b.generation_id = ATRIUM_GPU_BACKEND_V1_GEN;
+	strlcpy(b.name, "atrium-gpu-v1", sizeof(b.name));
+	b.feature_flags = 0;
+
+	err = copyout(&b, (void *)args->backends_ptr, sizeof(b));
+	if (err != 0)
+		return (err);
+	return (0);
+}
+
 static int
 atrium_gpu_ioctl(struct cdev *cdev, u_long cmd, caddr_t data,
     int fflag __unused, struct thread *td __unused)
@@ -1169,6 +1206,9 @@ atrium_gpu_ioctl(struct cdev *cdev, u_long cmd, caddr_t data,
 	case ATRIUM_GPU_IOC_HOST_BLOB:
 		return (atrium_gpu_ioc_host_blob(sc, f,
 		    (struct atrium_gpu_host_blob *)data));
+	case ATRIUM_GPU_IOC_LIST_BACKENDS:
+		return (atrium_gpu_ioc_list_backends(sc,
+		    (struct atrium_gpu_list_backends *)data));
 
 	default:
 		return (ENOTTY);
