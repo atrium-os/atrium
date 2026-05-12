@@ -303,6 +303,42 @@ struct AtriumDevice {
     /// the sampler. `None` if the instance had no live client.
     samplers: std::sync::Mutex<std::collections::HashMap<u64, Option<aqueduct_gpu::ids::ResourceId>>>,
     next_sampler_id: std::cell::Cell<u64>,
+    /// Per-VkDescriptorSetLayout state. Today: opaque non-zero
+    /// u64 (we don't track per-binding type info — the host's
+    /// pipeline / shader knows its expected layout).
+    next_dsl_id: std::cell::Cell<u64>,
+    /// Per-VkDescriptorPool state. Same: opaque non-zero u64.
+    next_dpool_id: std::cell::Cell<u64>,
+    /// Per-VkDescriptorSet state. Each set holds an array of
+    /// binding writes installed by vkUpdateDescriptorSets — those
+    /// are what vkCmdBindDescriptorSets references when packing
+    /// the BindDescriptors FrameOp.
+    descriptor_sets: std::sync::Mutex<std::collections::HashMap<u64, AtriumDescriptorSet>>,
+    next_dset_id: std::cell::Cell<u64>,
+}
+
+/// One binding write in a `VkDescriptorSet`. The variant
+/// determines which of `buffer_id` / `image_id` / `sampler_id`
+/// is meaningful; the others are zero.
+#[derive(Debug, Clone, Copy, Default)]
+#[allow(dead_code)]
+struct AtriumDescriptorWrite {
+    binding:        u32,
+    /// VkDescriptorType numeric value. 6=UNIFORM_BUFFER,
+    /// 1=COMBINED_IMAGE_SAMPLER, ...
+    descriptor_type: u32,
+    buffer_id:  u32, /* ResourceId.raw() or 0 */
+    image_id:   u32,
+    sampler_id: u32,
+    offset:     u64,
+    range:      u64,
+}
+
+/// Per-VkDescriptorSet state.
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
+struct AtriumDescriptorSet {
+    writes: Vec<AtriumDescriptorWrite>,
 }
 
 /// Per-VkFramebuffer state.
@@ -761,7 +797,35 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkDevice, u64, *const c_void), FnVoidPtr,
             >(vkDestroySampler)),
-        // Phase 1.3b+ continued: descriptor sets, vkCmdCopyBuffer*,
+        "vkCreateDescriptorSetLayout" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, *const c_void, *const c_void, *mut u64) -> VkResult, FnVoidPtr,
+            >(vkCreateDescriptorSetLayout)),
+        "vkDestroyDescriptorSetLayout" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, *const c_void), FnVoidPtr,
+            >(vkDestroyDescriptorSetLayout)),
+        "vkCreateDescriptorPool" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, *const c_void, *const c_void, *mut u64) -> VkResult, FnVoidPtr,
+            >(vkCreateDescriptorPool)),
+        "vkDestroyDescriptorPool" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, *const c_void), FnVoidPtr,
+            >(vkDestroyDescriptorPool)),
+        "vkAllocateDescriptorSets" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, *const c_void, *mut u64) -> VkResult, FnVoidPtr,
+            >(vkAllocateDescriptorSets)),
+        "vkUpdateDescriptorSets" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u32, *const c_void, u32, *const c_void), FnVoidPtr,
+            >(vkUpdateDescriptorSets)),
+        "vkCmdBindDescriptorSets" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u32, u64, u32, u32, *const u64, u32, *const u32), FnVoidPtr,
+            >(vkCmdBindDescriptorSets)),
+        // Phase 1.3b+ continued: vkCmdCopyBuffer*,
         // vkCmdPipelineBarrier, vkDeviceWaitIdle, …
         _ => None,
     }
@@ -1010,6 +1074,10 @@ pub unsafe extern "C" fn vkCreateDevice(
         next_semaphore_id:   std::cell::Cell::new(1),
         samplers:            std::sync::Mutex::new(std::collections::HashMap::new()),
         next_sampler_id:     std::cell::Cell::new(1),
+        next_dsl_id:         std::cell::Cell::new(1),
+        next_dpool_id:       std::cell::Cell::new(1),
+        descriptor_sets:     std::sync::Mutex::new(std::collections::HashMap::new()),
+        next_dset_id:        std::cell::Cell::new(1),
     });
     let dev_ptr: *mut AtriumDevice = &mut *dev;
     let q = Box::new(AtriumQueue {
@@ -2354,6 +2422,234 @@ pub unsafe extern "C" fn vkDestroySampler(
     let dev = &*(device as *const AtriumDevice);
     if let Ok(mut s) = dev.samplers.lock() {
         s.remove(&sampler);
+    }
+}
+
+/// `vkCreateDescriptorSetLayout` — opaque non-zero u64. The host
+/// endpoint's pipeline / shader knows the expected binding layout
+/// (via the bundle definition); we don't validate set-layout
+/// compatibility today.
+#[no_mangle]
+pub unsafe extern "C" fn vkCreateDescriptorSetLayout(
+    device:           VkDevice,
+    _p_create_info:   *const c_void,
+    _p_allocator:     *const c_void,
+    p_set_layout:     *mut u64,
+) -> VkResult {
+    if device.is_null() || p_set_layout.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let dev = &*(device as *const AtriumDevice);
+    let h = dev.next_dsl_id.get();
+    dev.next_dsl_id.set(h + 1);
+    *p_set_layout = h;
+    VK_SUCCESS
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkDestroyDescriptorSetLayout(
+    _device:        VkDevice,
+    _set_layout:    u64,
+    _p_allocator:   *const c_void,
+) {}
+
+/// `vkCreateDescriptorPool` — opaque non-zero u64. We don't
+/// enforce the pool's maxSets / per-type budgets today.
+#[no_mangle]
+pub unsafe extern "C" fn vkCreateDescriptorPool(
+    device:          VkDevice,
+    _p_create_info:  *const c_void,
+    _p_allocator:    *const c_void,
+    p_pool:          *mut u64,
+) -> VkResult {
+    if device.is_null() || p_pool.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let dev = &*(device as *const AtriumDevice);
+    let h = dev.next_dpool_id.get();
+    dev.next_dpool_id.set(h + 1);
+    *p_pool = h;
+    VK_SUCCESS
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkDestroyDescriptorPool(
+    _device:        VkDevice,
+    _pool:          u64,
+    _p_allocator:   *const c_void,
+) {}
+
+/// `vkAllocateDescriptorSets` — allocate N empty descriptor sets.
+///
+/// VkDescriptorSetAllocateInfo layout:
+///   0   sType, 8 pNext, 16 descriptorPool (u64),
+///   24  descriptorSetCount (u32), 28 _pad,
+///   32  pSetLayouts (*const VkDescriptorSetLayout u64)
+#[no_mangle]
+pub unsafe extern "C" fn vkAllocateDescriptorSets(
+    device:           VkDevice,
+    p_allocate_info:  *const c_void,
+    p_descriptor_sets: *mut u64,
+) -> VkResult {
+    if device.is_null() || p_allocate_info.is_null() || p_descriptor_sets.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let dev = &*(device as *const AtriumDevice);
+    let b = p_allocate_info as *const u8;
+    let count = std::ptr::read_unaligned(b.add(24) as *const u32);
+
+    if let Ok(mut sets) = dev.descriptor_sets.lock() {
+        for i in 0..count {
+            let h = dev.next_dset_id.get();
+            dev.next_dset_id.set(h + 1);
+            sets.insert(h, AtriumDescriptorSet::default());
+            *p_descriptor_sets.offset(i as isize) = h;
+        }
+    } else {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    VK_SUCCESS
+}
+
+/// `vkUpdateDescriptorSets` — process `descriptorWriteCount`
+/// VkWriteDescriptorSet records. Each describes which binding in
+/// which descriptor set gets updated with which resource(s).
+///
+/// VkWriteDescriptorSet layout (64 bytes):
+///   0   sType, 8 pNext,
+///   16  dstSet (u64), 24 dstBinding (u32), 28 dstArrayElement (u32),
+///   32  descriptorCount (u32), 36 descriptorType (u32),
+///   40  pImageInfo  (*const VkDescriptorImageInfo),
+///   48  pBufferInfo (*const VkDescriptorBufferInfo),
+///   56  pTexelBufferView (*const VkBufferView)
+///
+/// VkDescriptorImageInfo: sampler(u64)@0, imageView(u64)@8, imageLayout(u32)@16
+/// VkDescriptorBufferInfo: buffer(u64)@0, offset(u64)@8, range(u64)@16
+///
+/// pDescriptorCopies is ignored (descriptor-to-descriptor copy not
+/// needed in skeleton).
+#[no_mangle]
+pub unsafe extern "C" fn vkUpdateDescriptorSets(
+    device:                VkDevice,
+    descriptor_write_count: u32,
+    p_descriptor_writes:    *const c_void,
+    _descriptor_copy_count: u32,
+    _p_descriptor_copies:   *const c_void,
+) {
+    if device.is_null() || p_descriptor_writes.is_null() {
+        return;
+    }
+    let dev = &*(device as *const AtriumDevice);
+    let writes_base = p_descriptor_writes as *const u8;
+
+    let mut sets = match dev.descriptor_sets.lock() { Ok(s) => s, Err(_) => return };
+    let buffers = dev.buffers.lock().ok();
+    let images  = dev.images.lock().ok();
+    let samplers = dev.samplers.lock().ok();
+
+    for i in 0..descriptor_write_count {
+        let w = writes_base.add(64 * i as usize);
+        let dst_set      = std::ptr::read_unaligned(w.add(16) as *const u64);
+        let dst_binding  = std::ptr::read_unaligned(w.add(24) as *const u32);
+        let count        = std::ptr::read_unaligned(w.add(32) as *const u32);
+        let ty           = std::ptr::read_unaligned(w.add(36) as *const u32);
+        let p_image_info  = std::ptr::read_unaligned(w.add(40) as *const *const u8);
+        let p_buffer_info = std::ptr::read_unaligned(w.add(48) as *const *const u8);
+
+        let Some(set) = sets.get_mut(&dst_set) else { continue; };
+
+        for j in 0..count {
+            let mut write = AtriumDescriptorWrite {
+                binding:        dst_binding + j,
+                descriptor_type: ty,
+                ..AtriumDescriptorWrite::default()
+            };
+            match ty {
+                // 6 = UNIFORM_BUFFER, 7 = STORAGE_BUFFER,
+                // 8 = UNIFORM_BUFFER_DYNAMIC, 9 = STORAGE_BUFFER_DYNAMIC.
+                6 | 7 | 8 | 9 if !p_buffer_info.is_null() => {
+                    let bi = p_buffer_info.add(24 * j as usize);
+                    let buf = std::ptr::read_unaligned(bi as *const u64);
+                    let offset = std::ptr::read_unaligned(bi.add(8) as *const u64);
+                    let range  = std::ptr::read_unaligned(bi.add(16) as *const u64);
+                    let bid = buffers.as_ref()
+                        .and_then(|b| b.get(&buf).and_then(|x| x.buffer_id))
+                        .map(|r| r.raw()).unwrap_or(0);
+                    write.buffer_id = bid;
+                    write.offset    = offset;
+                    write.range     = range;
+                }
+                // 0 = SAMPLER, 1 = COMBINED_IMAGE_SAMPLER,
+                // 2 = SAMPLED_IMAGE, 3 = STORAGE_IMAGE,
+                // 4 = UNIFORM_TEXEL_BUFFER, 5 = STORAGE_TEXEL_BUFFER.
+                0 | 1 | 2 | 3 if !p_image_info.is_null() => {
+                    let ii = p_image_info.add(24 * j as usize);
+                    let sampler   = std::ptr::read_unaligned(ii as *const u64);
+                    let image_view = std::ptr::read_unaligned(ii.add(8) as *const u64);
+                    let sid = samplers.as_ref()
+                        .and_then(|s| s.get(&sampler).and_then(|o| *o))
+                        .map(|r| r.raw()).unwrap_or(0);
+                    // image_view → image → image_id
+                    let img = dev.image_views.lock().ok()
+                        .and_then(|v| v.get(&image_view).copied()).unwrap_or(0);
+                    let iid = images.as_ref()
+                        .and_then(|m| m.get(&img).and_then(|x| x.image_id))
+                        .map(|r| r.raw()).unwrap_or(0);
+                    write.sampler_id = sid;
+                    write.image_id   = iid;
+                }
+                _ => {}
+            }
+            // Replace existing entry for this binding or append.
+            if let Some(slot) = set.writes.iter_mut().find(|x| x.binding == write.binding) {
+                *slot = write;
+            } else {
+                set.writes.push(write);
+            }
+        }
+    }
+}
+
+/// `vkCmdBindDescriptorSets` — push one `BindDescriptors` FrameOp
+/// per descriptor set being bound. Body layout (28 bytes per
+/// binding write, plus a 4-byte header): set_index u32 +
+/// write_count u32 + per-write { binding u32, type u32,
+/// buffer_id u32, image_id u32, sampler_id u32, offset u64,
+/// range u64 } (= 32 B per write).
+///
+/// pDynamicOffsets is ignored today.
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdBindDescriptorSets(
+    command_buffer:        VkCommandBuffer,
+    _pipeline_bind_point:  u32,
+    _layout:               u64,
+    first_set:             u32,
+    descriptor_set_count:  u32,
+    p_descriptor_sets:     *const u64,
+    _dynamic_offset_count: u32,
+    _p_dynamic_offsets:    *const u32,
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    if p_descriptor_sets.is_null() || cb.device.is_null() { return; }
+    let dev = &*(cb.device as *const AtriumDevice);
+
+    let sets = match dev.descriptor_sets.lock() { Ok(s) => s, Err(_) => return };
+    for i in 0..descriptor_set_count {
+        let h = *p_descriptor_sets.offset(i as isize);
+        let Some(set) = sets.get(&h) else { continue; };
+        let mut body = Vec::with_capacity(8 + set.writes.len() * 32);
+        body.extend_from_slice(&(first_set + i).to_le_bytes());
+        body.extend_from_slice(&(set.writes.len() as u32).to_le_bytes());
+        for w in &set.writes {
+            body.extend_from_slice(&w.binding.to_le_bytes());
+            body.extend_from_slice(&w.descriptor_type.to_le_bytes());
+            body.extend_from_slice(&w.buffer_id.to_le_bytes());
+            body.extend_from_slice(&w.image_id.to_le_bytes());
+            body.extend_from_slice(&w.sampler_id.to_le_bytes());
+            body.extend_from_slice(&w.offset.to_le_bytes());
+            body.extend_from_slice(&w.range.to_le_bytes());
+        }
+        let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::BindDescriptors, &body);
     }
 }
 

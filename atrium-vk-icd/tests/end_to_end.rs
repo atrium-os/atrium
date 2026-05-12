@@ -1250,6 +1250,143 @@ fn fence_semaphore_sampler_lifecycle() {
 }
 
 #[test]
+fn descriptor_set_alloc_update_bind_round_trip() {
+    use atrium_vk_icd::{
+        cmdbuf_recorded_bytes,
+        vkAllocateCommandBuffers, vkAllocateDescriptorSets, vkAllocateMemory,
+        vkBeginCommandBuffer, vkBindBufferMemory, vkCmdBindDescriptorSets,
+        vkCreateBuffer, vkCreateCommandPool, vkCreateDescriptorPool,
+        vkCreateDescriptorSetLayout, vkCreateDevice, vkDestroyBuffer,
+        vkDestroyCommandPool, vkDestroyDescriptorPool,
+        vkDestroyDescriptorSetLayout, vkDestroyDevice, vkEndCommandBuffer,
+        vkFreeMemory, vkUpdateDescriptorSets,
+    };
+
+    let sock = tmp_socket("dset");
+    let sw_backend = Arc::new(SoftwareBackend::new());
+    let backend_for_listener: Arc<dyn Backend> = sw_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap();
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+
+    type VkDevice = *mut std::ffi::c_void;
+    type VkCommandBuffer = *mut std::ffi::c_void;
+
+    let mut instance: VkInstance = std::ptr::null_mut();
+    unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
+    let mut pds: [VkPhysicalDevice; 1] = [std::ptr::null_mut(); 1];
+    let mut cap: u32 = 1;
+    unsafe { vkEnumeratePhysicalDevices(instance, &mut cap, pds.as_mut_ptr()); }
+    let mut device: VkDevice = std::ptr::null_mut();
+    unsafe { vkCreateDevice(pds[0], std::ptr::null(), std::ptr::null(), &mut device); }
+
+    // Create a uniform buffer (size 256, USAGE_UNIFORM_BUFFER=0x10).
+    let mut buf_info = [0u8; 56];
+    buf_info[ 0.. 4].copy_from_slice(&12u32.to_le_bytes());
+    buf_info[24..32].copy_from_slice(&(256u64).to_le_bytes());
+    buf_info[32..36].copy_from_slice(&0x10u32.to_le_bytes());
+    let mut ubuf: u64 = 0;
+    unsafe { vkCreateBuffer(device, buf_info.as_ptr() as *const _, std::ptr::null(), &mut ubuf); }
+    let mut alloc = [0u8; 32];
+    alloc[0..4].copy_from_slice(&5u32.to_le_bytes());
+    alloc[16..24].copy_from_slice(&(256u64).to_le_bytes());
+    let mut mem: u64 = 0;
+    unsafe { vkAllocateMemory(device, alloc.as_ptr() as *const _, std::ptr::null(), &mut mem); }
+    unsafe { vkBindBufferMemory(device, ubuf, mem, 0); }
+    thread::sleep(Duration::from_millis(30));
+
+    // Layout (opaque) + pool + allocate one set.
+    let mut layout: u64 = 0;
+    unsafe { vkCreateDescriptorSetLayout(device, std::ptr::null(), std::ptr::null(), &mut layout); }
+    let mut pool: u64 = 0;
+    unsafe { vkCreateDescriptorPool(device, std::ptr::null(), std::ptr::null(), &mut pool); }
+    // VkDescriptorSetAllocateInfo: sType@0, pNext@8, pool@16,
+    // count@24, pSetLayouts@32.
+    let mut da = [0u8; 40];
+    da[ 0.. 4].copy_from_slice(&34u32.to_le_bytes());
+    da[16..24].copy_from_slice(&pool.to_le_bytes());
+    da[24..28].copy_from_slice(&1u32.to_le_bytes());
+    let layouts_arr = [layout];
+    let layouts_ptr = layouts_arr.as_ptr() as u64;
+    da[32..40].copy_from_slice(&layouts_ptr.to_le_bytes());
+    let mut sets: [u64; 1] = [0];
+    unsafe { vkAllocateDescriptorSets(device, da.as_ptr() as *const _, sets.as_mut_ptr()); }
+    assert!(sets[0] != 0);
+
+    // VkWriteDescriptorSet (64 B): bind the uniform buffer at
+    // binding 0 of the set. descriptorType=6 (UNIFORM_BUFFER).
+    let buf_info_arr: [u8; 24] = {
+        let mut b = [0u8; 24];
+        b[ 0.. 8].copy_from_slice(&ubuf.to_le_bytes());
+        b[ 8..16].copy_from_slice(&0u64.to_le_bytes());        // offset
+        b[16..24].copy_from_slice(&(256u64).to_le_bytes());    // range
+        b
+    };
+    let buf_info_ptr = buf_info_arr.as_ptr() as u64;
+    let mut write = [0u8; 64];
+    write[ 0.. 4].copy_from_slice(&35u32.to_le_bytes());        // sType
+    write[16..24].copy_from_slice(&sets[0].to_le_bytes());      // dstSet
+    write[24..28].copy_from_slice(&0u32.to_le_bytes());         // dstBinding
+    write[32..36].copy_from_slice(&1u32.to_le_bytes());         // descriptorCount
+    write[36..40].copy_from_slice(&6u32.to_le_bytes());         // type=UNIFORM_BUFFER
+    write[48..56].copy_from_slice(&buf_info_ptr.to_le_bytes()); // pBufferInfo
+
+    unsafe { vkUpdateDescriptorSets(device, 1, write.as_ptr() as *const _, 0, std::ptr::null()); }
+
+    // Record vkCmdBindDescriptorSets and verify the FrameOp body.
+    let mut pool_cb: u64 = 0;
+    unsafe { vkCreateCommandPool(device, std::ptr::null(), std::ptr::null(), &mut pool_cb); }
+    let mut cb_info = [0u8; 40];
+    cb_info[0..4].copy_from_slice(&40u32.to_le_bytes());
+    cb_info[16..24].copy_from_slice(&pool_cb.to_le_bytes());
+    cb_info[28..32].copy_from_slice(&1u32.to_le_bytes());
+    let mut cbs: [VkCommandBuffer; 1] = [std::ptr::null_mut(); 1];
+    unsafe { vkAllocateCommandBuffers(device, cb_info.as_ptr() as *const _, cbs.as_mut_ptr()); }
+    let cb = cbs[0];
+
+    unsafe { vkBeginCommandBuffer(cb, std::ptr::null()); }
+    unsafe {
+        vkCmdBindDescriptorSets(
+            cb, 0, layout, 0, 1, sets.as_ptr(), 0, std::ptr::null(),
+        );
+    }
+    unsafe { vkEndCommandBuffer(cb); }
+
+    // BindDescriptors record: 8 B record header + body. Body =
+    // 8 B per-set header (set_index, write_count) +
+    // 36 B per write (binding/type/buffer_id/image_id/sampler_id =
+    // 5×4, then offset+range = 2×8) × 1 = 44 B body. Total 52 B.
+    let bytes = cmdbuf_recorded_bytes(cb);
+    assert_eq!(bytes.len(), 52, "expected 52 bytes, got {}", bytes.len());
+    let op = u16::from_le_bytes([bytes[0], bytes[1]]);
+    assert_eq!(op, 0x0021, "BindDescriptors opcode");
+    // Body @ bytes[8..]. set_index=0, write_count=1, binding=0,
+    // type=6, buffer_id=...,...
+    let set_index = u32::from_le_bytes([bytes[ 8], bytes[ 9], bytes[10], bytes[11]]);
+    let wcount    = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+    let binding   = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    let ty        = u32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+    let bid       = u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]);
+    assert_eq!(set_index, 0);
+    assert_eq!(wcount, 1);
+    assert_eq!(binding, 0);
+    assert_eq!(ty, 6);
+    assert!(bid != 0, "buffer should have a daemon-side id (was {})", bid);
+
+    unsafe { vkDestroyCommandPool(device, pool_cb, std::ptr::null()); }
+    unsafe { vkDestroyDescriptorPool(device, pool, std::ptr::null()); }
+    unsafe { vkDestroyDescriptorSetLayout(device, layout, std::ptr::null()); }
+    unsafe { vkDestroyBuffer(device, ubuf, std::ptr::null()); }
+    unsafe { vkFreeMemory(device, mem, std::ptr::null()); }
+    unsafe { vkDestroyDevice(device, std::ptr::null()); }
+    unsafe { vkDestroyInstance(instance, std::ptr::null()); }
+    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[test]
 fn proc_addr_resolves_three_entry_points() {
     // No live daemon required for the get_proc_addr lookups.
     fn lookup(name: &[u8]) -> Option<unsafe extern "C" fn()> {
