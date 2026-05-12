@@ -1170,6 +1170,86 @@ fn render_pass_framebuffer_and_begin_end_recording() {
 }
 
 #[test]
+fn fence_semaphore_sampler_lifecycle() {
+    use atrium_vk_icd::{
+        vkCreateDevice, vkCreateFence, vkCreateSampler, vkCreateSemaphore,
+        vkDestroyDevice, vkDestroyFence, vkDestroySampler, vkDestroySemaphore,
+        vkGetFenceStatus, vkResetFences, vkWaitForFences,
+    };
+
+    let sock = tmp_socket("sync");
+    let sw_backend = Arc::new(SoftwareBackend::new());
+    let backend_for_listener: Arc<dyn Backend> = sw_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap();
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+
+    type VkDevice = *mut std::ffi::c_void;
+
+    let mut instance: VkInstance = std::ptr::null_mut();
+    unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
+    let mut pds: [VkPhysicalDevice; 1] = [std::ptr::null_mut(); 1];
+    let mut cap: u32 = 1;
+    unsafe { vkEnumeratePhysicalDevices(instance, &mut cap, pds.as_mut_ptr()); }
+    let mut device: VkDevice = std::ptr::null_mut();
+    unsafe { vkCreateDevice(pds[0], std::ptr::null(), std::ptr::null(), &mut device); }
+
+    // Unsignaled fence: flags=0.
+    let mut fence_info = [0u8; 20];
+    fence_info[ 0.. 4].copy_from_slice(&8u32.to_le_bytes());
+    let mut fence: u64 = 0;
+    unsafe { vkCreateFence(device, fence_info.as_ptr() as *const _, std::ptr::null(), &mut fence); }
+    assert_eq!(unsafe { vkGetFenceStatus(device, fence) }, 3, "fresh fence is unsignaled (VK_NOT_READY)");
+
+    // vkWaitForFences signals the fence (synchronous-submit shortcut).
+    let fences = [fence];
+    let r = unsafe { vkWaitForFences(device, 1, fences.as_ptr(), 1, u64::MAX) };
+    assert_eq!(r, 0);
+    assert_eq!(unsafe { vkGetFenceStatus(device, fence) }, 0, "after wait, fence is signaled (VK_SUCCESS)");
+
+    // vkResetFences puts it back to unsignaled.
+    unsafe { vkResetFences(device, 1, fences.as_ptr()); }
+    assert_eq!(unsafe { vkGetFenceStatus(device, fence) }, 3);
+
+    // Pre-signaled fence: flags = VK_FENCE_CREATE_SIGNALED_BIT (0x1).
+    fence_info[16..20].copy_from_slice(&1u32.to_le_bytes());
+    let mut fence2: u64 = 0;
+    unsafe { vkCreateFence(device, fence_info.as_ptr() as *const _, std::ptr::null(), &mut fence2); }
+    assert_eq!(unsafe { vkGetFenceStatus(device, fence2) }, 0, "signaled-bit fence starts ready");
+
+    // Semaphores: just need a non-zero handle.
+    let mut sem_info = [0u8; 16];
+    sem_info[0..4].copy_from_slice(&9u32.to_le_bytes());
+    let mut sem: u64 = 0;
+    unsafe { vkCreateSemaphore(device, sem_info.as_ptr() as *const _, std::ptr::null(), &mut sem); }
+    assert!(sem != 0);
+
+    // Sampler with default linear filtering.
+    let mut samp_info = [0u8; 80];
+    samp_info[ 0.. 4].copy_from_slice(&31u32.to_le_bytes());
+    samp_info[20..24].copy_from_slice(&1u32.to_le_bytes()); // mag = LINEAR
+    samp_info[24..28].copy_from_slice(&1u32.to_le_bytes()); // min = LINEAR
+    samp_info[64..68].copy_from_slice(&0.0f32.to_le_bytes()); // minLod
+    samp_info[68..72].copy_from_slice(&1.0f32.to_le_bytes()); // maxLod
+    let mut samp: u64 = 0;
+    let r = unsafe { vkCreateSampler(device, samp_info.as_ptr() as *const _, std::ptr::null(), &mut samp) };
+    assert_eq!(r, 0);
+    assert!(samp != 0);
+
+    // Cleanup.
+    unsafe { vkDestroySampler(device, samp, std::ptr::null()); }
+    unsafe { vkDestroySemaphore(device, sem, std::ptr::null()); }
+    unsafe { vkDestroyFence(device, fence, std::ptr::null()); }
+    unsafe { vkDestroyFence(device, fence2, std::ptr::null()); }
+    unsafe { vkDestroyDevice(device, std::ptr::null()); }
+    unsafe { vkDestroyInstance(instance, std::ptr::null()); }
+    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[test]
 fn proc_addr_resolves_three_entry_points() {
     // No live daemon required for the get_proc_addr lookups.
     fn lookup(name: &[u8]) -> Option<unsafe extern "C" fn()> {

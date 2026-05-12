@@ -287,6 +287,22 @@ struct AtriumDevice {
     /// so vkCmdBeginRenderPass can find the target image view.
     framebuffers: std::sync::Mutex<std::collections::HashMap<u64, AtriumFramebuffer>>,
     next_framebuffer_id: std::cell::Cell<u64>,
+    /// Per-VkFence state: just a "signaled" bool. Submits today
+    /// are synchronous from the ICD's POV (vkQueueSubmit returns
+    /// before the host has fully processed), so vkWaitForFences
+    /// returns immediately. Future async submit grows this into
+    /// a wait-on-aqueduct-fence story.
+    fences: std::sync::Mutex<std::collections::HashMap<u64, bool>>,
+    next_fence_id: std::cell::Cell<u64>,
+    /// Per-VkSemaphore — opaque non-zero u64. Atrium's wire
+    /// timeline (one per VkQueueSubmit) handles serialization;
+    /// semaphores are bookkeeping-only today.
+    next_semaphore_id: std::cell::Cell<u64>,
+    /// Per-VkSampler: maps VkSampler u64 → daemon-side
+    /// ResourceId so future descriptor-set updates can reference
+    /// the sampler. `None` if the instance had no live client.
+    samplers: std::sync::Mutex<std::collections::HashMap<u64, Option<aqueduct_gpu::ids::ResourceId>>>,
+    next_sampler_id: std::cell::Cell<u64>,
 }
 
 /// Per-VkFramebuffer state.
@@ -709,8 +725,44 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkCommandBuffer), FnVoidPtr,
             >(vkCmdEndRenderPass)),
-        // Phase 1.3b+ continued: vkCmdCopyBuffer*,
-        // vkCmdPipelineBarrier, descriptor sets, samplers, …
+        "vkCreateFence" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, *const c_void, *const c_void, *mut u64) -> VkResult, FnVoidPtr,
+            >(vkCreateFence)),
+        "vkDestroyFence" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, *const c_void), FnVoidPtr,
+            >(vkDestroyFence)),
+        "vkWaitForFences" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u32, *const u64, u32, u64) -> VkResult, FnVoidPtr,
+            >(vkWaitForFences)),
+        "vkResetFences" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u32, *const u64) -> VkResult, FnVoidPtr,
+            >(vkResetFences)),
+        "vkGetFenceStatus" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64) -> VkResult, FnVoidPtr,
+            >(vkGetFenceStatus)),
+        "vkCreateSemaphore" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, *const c_void, *const c_void, *mut u64) -> VkResult, FnVoidPtr,
+            >(vkCreateSemaphore)),
+        "vkDestroySemaphore" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, *const c_void), FnVoidPtr,
+            >(vkDestroySemaphore)),
+        "vkCreateSampler" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, *const c_void, *const c_void, *mut u64) -> VkResult, FnVoidPtr,
+            >(vkCreateSampler)),
+        "vkDestroySampler" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, *const c_void), FnVoidPtr,
+            >(vkDestroySampler)),
+        // Phase 1.3b+ continued: descriptor sets, vkCmdCopyBuffer*,
+        // vkCmdPipelineBarrier, vkDeviceWaitIdle, …
         _ => None,
     }
 }
@@ -953,6 +1005,11 @@ pub unsafe extern "C" fn vkCreateDevice(
         next_render_pass_id: std::cell::Cell::new(1),
         framebuffers:        std::sync::Mutex::new(std::collections::HashMap::new()),
         next_framebuffer_id: std::cell::Cell::new(1),
+        fences:              std::sync::Mutex::new(std::collections::HashMap::new()),
+        next_fence_id:       std::cell::Cell::new(1),
+        next_semaphore_id:   std::cell::Cell::new(1),
+        samplers:            std::sync::Mutex::new(std::collections::HashMap::new()),
+        next_sampler_id:     std::cell::Cell::new(1),
     });
     let dev_ptr: *mut AtriumDevice = &mut *dev;
     let q = Box::new(AtriumQueue {
@@ -2085,6 +2142,219 @@ pub unsafe extern "C" fn vkCmdEndRenderPass(
 ) {
     let Some(cb) = cmdbuf_recording(command_buffer) else { return };
     let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::EndRenderPass, &[]);
+}
+
+/// `vkCreateFence` — allocate a u64 handle + signaled bit. Reads
+/// VkFenceCreateFlags @ offset 16; the only bit we honor is
+/// VK_FENCE_CREATE_SIGNALED_BIT (0x1).
+#[no_mangle]
+pub unsafe extern "C" fn vkCreateFence(
+    device:          VkDevice,
+    p_create_info:   *const c_void,
+    _p_allocator:    *const c_void,
+    p_fence:         *mut u64,
+) -> VkResult {
+    if device.is_null() || p_fence.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let dev = &*(device as *const AtriumDevice);
+    let signaled = if !p_create_info.is_null() {
+        let flags = std::ptr::read_unaligned(
+            (p_create_info as *const u8).add(16) as *const u32,
+        );
+        flags & 0x1 != 0
+    } else { false };
+
+    let h = dev.next_fence_id.get();
+    dev.next_fence_id.set(h + 1);
+    if let Ok(mut f) = dev.fences.lock() {
+        f.insert(h, signaled);
+    } else {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    *p_fence = h;
+    VK_SUCCESS
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkDestroyFence(
+    device:       VkDevice,
+    fence:        u64,
+    _p_allocator: *const c_void,
+) {
+    if device.is_null() || fence == 0 { return; }
+    let dev = &*(device as *const AtriumDevice);
+    if let Ok(mut f) = dev.fences.lock() {
+        f.remove(&fence);
+    }
+}
+
+/// `vkWaitForFences` — vkQueueSubmit is synchronous from the
+/// ICD's POV today, so all fences are always-signaled. Mark them
+/// signaled + return success. wait_all and timeout are ignored.
+#[no_mangle]
+pub unsafe extern "C" fn vkWaitForFences(
+    device:       VkDevice,
+    fence_count:  u32,
+    p_fences:     *const u64,
+    _wait_all:    u32, /* VkBool32 */
+    _timeout_ns:  u64,
+) -> VkResult {
+    if device.is_null() || p_fences.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let dev = &*(device as *const AtriumDevice);
+    if let Ok(mut f) = dev.fences.lock() {
+        for i in 0..fence_count {
+            let h = *p_fences.offset(i as isize);
+            if let Some(s) = f.get_mut(&h) {
+                *s = true;
+            }
+        }
+    }
+    VK_SUCCESS
+}
+
+/// `vkResetFences` — clear the signaled bit on each.
+#[no_mangle]
+pub unsafe extern "C" fn vkResetFences(
+    device:       VkDevice,
+    fence_count:  u32,
+    p_fences:     *const u64,
+) -> VkResult {
+    if device.is_null() || p_fences.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let dev = &*(device as *const AtriumDevice);
+    if let Ok(mut f) = dev.fences.lock() {
+        for i in 0..fence_count {
+            let h = *p_fences.offset(i as isize);
+            if let Some(s) = f.get_mut(&h) {
+                *s = false;
+            }
+        }
+    }
+    VK_SUCCESS
+}
+
+/// `vkGetFenceStatus` — VK_SUCCESS = signaled, VK_NOT_READY (3)
+/// = not signaled, VK_ERROR_DEVICE_LOST (-4) = lost.
+#[no_mangle]
+pub unsafe extern "C" fn vkGetFenceStatus(
+    device: VkDevice,
+    fence:  u64,
+) -> VkResult {
+    if device.is_null() || fence == 0 {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let dev = &*(device as *const AtriumDevice);
+    match dev.fences.lock().ok().and_then(|f| f.get(&fence).copied()) {
+        Some(true)  => VK_SUCCESS,
+        Some(false) => 3, /* VK_NOT_READY */
+        None        => -4, /* VK_ERROR_DEVICE_LOST */
+    }
+}
+
+/// `vkCreateSemaphore` — opaque non-zero u64. Atrium's
+/// per-VkQueueSubmit timeline handles serialization; semaphores
+/// are bookkeeping-only today.
+#[no_mangle]
+pub unsafe extern "C" fn vkCreateSemaphore(
+    device:           VkDevice,
+    _p_create_info:   *const c_void,
+    _p_allocator:     *const c_void,
+    p_semaphore:      *mut u64,
+) -> VkResult {
+    if device.is_null() || p_semaphore.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let dev = &*(device as *const AtriumDevice);
+    let h = dev.next_semaphore_id.get();
+    dev.next_semaphore_id.set(h + 1);
+    *p_semaphore = h;
+    VK_SUCCESS
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkDestroySemaphore(
+    _device:      VkDevice,
+    _semaphore:   u64,
+    _p_allocator: *const c_void,
+) {}
+
+/// `vkCreateSampler` — read filter/address/lod fields and call
+/// GpuClient::create_sampler.
+///
+/// VkSamplerCreateInfo layout (relevant fields, all u32 unless
+/// noted):
+///   0   sType, 8 pNext, 16 flags,
+///   20  magFilter, 24 minFilter, 28 mipmapMode,
+///   32  addressModeU, 36 addressModeV, 40 addressModeW,
+///   44  mipLodBias : f32,
+///   48  anisotropyEnable : VkBool32,
+///   52  maxAnisotropy : f32,
+///   56  compareEnable, 60 compareOp,
+///   64  minLod : f32, 68 maxLod : f32,
+///   72  borderColor, 76 unnormalizedCoordinates
+#[no_mangle]
+pub unsafe extern "C" fn vkCreateSampler(
+    device:        VkDevice,
+    p_create_info: *const c_void,
+    _p_allocator:  *const c_void,
+    p_sampler:     *mut u64,
+) -> VkResult {
+    if device.is_null() || p_create_info.is_null() || p_sampler.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let dev = &*(device as *const AtriumDevice);
+    let b = p_create_info as *const u8;
+    let mag = std::ptr::read_unaligned(b.add(20) as *const u32) as u8;
+    let min = std::ptr::read_unaligned(b.add(24) as *const u32) as u8;
+    let mip = std::ptr::read_unaligned(b.add(28) as *const u32) as u8;
+    let au = std::ptr::read_unaligned(b.add(32) as *const u32) as u8;
+    let av = std::ptr::read_unaligned(b.add(36) as *const u32) as u8;
+    let aw = std::ptr::read_unaligned(b.add(40) as *const u32) as u8;
+    let aniso = std::ptr::read_unaligned(b.add(52) as *const f32);
+    let min_lod = std::ptr::read_unaligned(b.add(64) as *const f32);
+    let max_lod = std::ptr::read_unaligned(b.add(68) as *const f32);
+
+    let sid = if !dev.instance.is_null() {
+        let inst = &*(dev.instance as *const AtriumInstance);
+        inst.client.as_ref().and_then(|m| {
+            m.lock().ok().and_then(|mut c| {
+                c.create_sampler(aqueduct_gpu::payloads::SamplerCreatePayload {
+                    sampler_id: aqueduct_gpu::ids::ResourceId(0),
+                    min_filter: min, mag_filter: mag, mip_filter: mip,
+                    address_modes: [au, av, aw],
+                    max_anisotropy: aniso,
+                    min_lod, max_lod,
+                }).ok()
+            })
+        })
+    } else { None };
+
+    let h = dev.next_sampler_id.get();
+    dev.next_sampler_id.set(h + 1);
+    if let Ok(mut s) = dev.samplers.lock() {
+        s.insert(h, sid);
+    } else {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    *p_sampler = h;
+    VK_SUCCESS
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkDestroySampler(
+    device:       VkDevice,
+    sampler:      u64,
+    _p_allocator: *const c_void,
+) {
+    if device.is_null() || sampler == 0 { return; }
+    let dev = &*(device as *const AtriumDevice);
+    if let Ok(mut s) = dev.samplers.lock() {
+        s.remove(&sampler);
+    }
 }
 
 /// `vkCreateCommandPool` — allocate a non-dispatchable
