@@ -469,7 +469,21 @@ struct WindowSurface {
 /// 0.5 = sub-half-window changes go partial; bigger ones clear. The
 /// breakeven for tiny-skia is somewhere around 0.3–0.6 depending on
 /// content; 0.5 is the safe default and was easy to verify by eye.
-const DAMAGE_RECT_THRESHOLD: f32 = 0.5;
+const DAMAGE_RECT_THRESHOLD_DEFAULT: f32 = 0.5;
+
+/// Read the damage-rect threshold from `FRESCOD_DAMAGE_THRESHOLD` if
+/// set (clamped to (0.0, 1.0]); else the compile-time default.
+/// Lets perf A/B testing tune the level-3 partial-redraw breakeven
+/// without rebuilding. `0.0` disables level-3 entirely (everything
+/// goes through the clear path); `1.0` always goes partial when any
+/// damage is detected.
+fn damage_rect_threshold() -> f32 {
+    std::env::var("FRESCOD_DAMAGE_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0 && *v <= 1.0)
+        .unwrap_or(DAMAGE_RECT_THRESHOLD_DEFAULT)
+}
 
 /// Hash a slice of f32 / u32 fields treated as raw little-endian
 /// bytes. f32 bits-equal comparison is what we want for "did this
@@ -836,8 +850,12 @@ fn render_one_frame_multipass(
                     Some((_, _, dw, dh)) => {
                         let dmg_area = (dw as f32) * (dh as f32);
                         let win_area = (*sw as f32) * (*sh as f32);
-                        win_area > 0.0
-                            && dmg_area / win_area < DAMAGE_RECT_THRESHOLD
+                        // Cache the env-resolved threshold across frames;
+                        // OnceLock::get_or_init runs the env read once.
+                        static THRESH: std::sync::OnceLock<f32> =
+                            std::sync::OnceLock::new();
+                        let t = *THRESH.get_or_init(damage_rect_threshold);
+                        win_area > 0.0 && dmg_area / win_area < t
                     }
                     None => false,
                 };
