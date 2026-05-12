@@ -174,10 +174,20 @@ struct AtriumCommandBuffer {
     /// Recording state machine.
     state: CmdBufferState,
     /// Accumulated FrameOp stream. Empty in `Initial`; populated
-    /// during `Recording`; finalized in `Executable`.
-    /// `_` because nothing actually pushes to it yet — vkCmd*
-    /// recording lands in the next chunk of Phase 1.3b.
-    _frame: aqueduct_gpu::frame::FrameBuilder,
+    /// during `Recording` by vkCmd*; finalized in `Executable`;
+    /// flushed to the host endpoint by vkQueueSubmit.
+    frame: aqueduct_gpu::frame::FrameBuilder,
+}
+
+/// Test-only accessor — peek at a cmdbuf's recorded byte stream.
+/// Used by integration tests to verify that vkCmd* actually push
+/// the expected FrameOp bytes. Not part of any Vulkan ABI; not
+/// exported from the cdylib.
+#[doc(hidden)]
+pub fn cmdbuf_recorded_bytes(cb: VkCommandBuffer) -> Vec<u8> {
+    if cb.is_null() { return Vec::new(); }
+    let cbref = unsafe { &*(cb as *const AtriumCommandBuffer) };
+    cbref.frame.as_bytes().to_vec()
 }
 
 /// ICD-side state behind a `VkDevice`. The first slot holds the
@@ -383,8 +393,26 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkQueue, u32, *const c_void, *mut c_void) -> VkResult, FnVoidPtr,
             >(vkQueueSubmit)),
-        // Phase 1.3b+: vkCmd* — actual command recording that
-        // produces FrameOps in the AtriumCommandBuffer's frame.
+        "vkCmdSetViewport" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u32, u32, *const ash::vk::Viewport), FnVoidPtr,
+            >(vkCmdSetViewport)),
+        "vkCmdSetScissor" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u32, u32, *const ash::vk::Rect2D), FnVoidPtr,
+            >(vkCmdSetScissor)),
+        "vkCmdPushConstants" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u64, u32, u32, u32, *const c_void), FnVoidPtr,
+            >(vkCmdPushConstants)),
+        "vkCmdDraw" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u32, u32, u32, u32), FnVoidPtr,
+            >(vkCmdDraw)),
+        // Phase 1.3b+ continued: vkCmdBindPipeline (needs VkPipeline
+        // → ResourceId mapping), vkCmdBindVertexBuffers,
+        // vkCmdBindIndexBuffer, vkCmdDrawIndexed, vkCmdCopyBuffer*,
+        // vkCmdPipelineBarrier, …
         _ => None,
     }
 }
@@ -618,6 +646,130 @@ pub unsafe extern "C" fn vkDestroyDevice(
     }
 }
 
+/// Helper: get the AtriumCommandBuffer behind a handle, with state
+/// validation. Returns None and silently drops the command if the
+/// buffer isn't currently Recording (Vulkan spec says vkCmd* outside
+/// recording is undefined behavior; we drop rather than panic).
+#[inline]
+unsafe fn cmdbuf_recording(cb: VkCommandBuffer) -> Option<&'static mut AtriumCommandBuffer> {
+    if cb.is_null() { return None; }
+    let cbref = &mut *(cb as *mut AtriumCommandBuffer);
+    if cbref.state != CmdBufferState::Recording { return None; }
+    Some(cbref)
+}
+
+/// `vkCmdSetViewport` — record a viewport state change.
+///
+/// Vk takes (firstViewport, viewportCount, *pViewports). Atrium's
+/// `FrameOp::SetViewport` body is one viewport at a time; if the
+/// caller wrote more than one, we record each in sequence. The Vk
+/// 1.0 floor mandates `maxViewports >= 1` so single-viewport is
+/// the typical case.
+///
+/// Wire body (matches the renderer's expected layout — same `f32`
+/// fields the Vk struct uses, plain LE memcpy):
+///   x, y, w, h, minDepth, maxDepth  (24 bytes).
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdSetViewport(
+    command_buffer:  VkCommandBuffer,
+    _first_viewport: u32,
+    viewport_count:  u32,
+    p_viewports:     *const ash::vk::Viewport,
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    if p_viewports.is_null() { return; }
+    for i in 0..viewport_count {
+        let vp = &*p_viewports.offset(i as isize);
+        let mut body = [0u8; 24];
+        body[ 0.. 4].copy_from_slice(&vp.x.to_le_bytes());
+        body[ 4.. 8].copy_from_slice(&vp.y.to_le_bytes());
+        body[ 8..12].copy_from_slice(&vp.width.to_le_bytes());
+        body[12..16].copy_from_slice(&vp.height.to_le_bytes());
+        body[16..20].copy_from_slice(&vp.min_depth.to_le_bytes());
+        body[20..24].copy_from_slice(&vp.max_depth.to_le_bytes());
+        let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::SetViewport, &body);
+    }
+}
+
+/// `vkCmdSetScissor` — record a scissor rect.
+///
+/// Wire body (matches SetScissorBody on the renderer side):
+///   x: u32, y: u32, w: u32, h: u32  (16 bytes).
+/// Vk's `offset.{x,y}` are `i32` but always non-negative for a
+/// valid scissor (a negative offset is a spec violation). We clamp
+/// to non-negative before transmute.
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdSetScissor(
+    command_buffer: VkCommandBuffer,
+    _first_scissor: u32,
+    scissor_count:  u32,
+    p_scissors:     *const ash::vk::Rect2D,
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    if p_scissors.is_null() { return; }
+    for i in 0..scissor_count {
+        let s = &*p_scissors.offset(i as isize);
+        let x = s.offset.x.max(0) as u32;
+        let y = s.offset.y.max(0) as u32;
+        let mut body = [0u8; 16];
+        body[ 0.. 4].copy_from_slice(&x.to_le_bytes());
+        body[ 4.. 8].copy_from_slice(&y.to_le_bytes());
+        body[ 8..12].copy_from_slice(&s.extent.width.to_le_bytes());
+        body[12..16].copy_from_slice(&s.extent.height.to_le_bytes());
+        let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::SetScissor, &body);
+    }
+}
+
+/// `vkCmdPushConstants` — record push-constant bytes.
+///
+/// Vk passes (layout, stageFlags, offset, size, pValues). Atrium's
+/// PushConstants body is (stage_mask: u32, offset: u32) + payload.
+/// We drop `layout` (Atrium's push-constants are pipeline-global)
+/// and pack the rest in a 4-byte header + payload bytes.
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdPushConstants(
+    command_buffer: VkCommandBuffer,
+    _layout:        u64, /* VkPipelineLayout */
+    stage_flags:    u32, /* VkShaderStageFlags */
+    offset:         u32,
+    size:           u32,
+    p_values:       *const c_void,
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    if p_values.is_null() || size == 0 { return; }
+    // 4-byte header (stage_mask | offset packed into u32 pair via
+    // 2-u16; we don't have a stable header yet so use a simple
+    // layout: stage_flags u32 | offset u32 in 8 bytes).
+    let mut body = Vec::with_capacity(8 + size as usize);
+    body.extend_from_slice(&stage_flags.to_le_bytes());
+    body.extend_from_slice(&offset.to_le_bytes());
+    let payload = std::slice::from_raw_parts(p_values as *const u8, size as usize);
+    body.extend_from_slice(payload);
+    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::PushConstants, &body);
+}
+
+/// `vkCmdDraw` — record a non-indexed draw.
+///
+/// Vk passes (vertexCount, instanceCount, firstVertex,
+/// firstInstance). Atrium's `FrameOp::Draw` body is the same four
+/// u32 in the same order.
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdDraw(
+    command_buffer: VkCommandBuffer,
+    vertex_count:   u32,
+    instance_count: u32,
+    first_vertex:   u32,
+    first_instance: u32,
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    let mut body = [0u8; 16];
+    body[ 0.. 4].copy_from_slice(&vertex_count.to_le_bytes());
+    body[ 4.. 8].copy_from_slice(&instance_count.to_le_bytes());
+    body[ 8..12].copy_from_slice(&first_vertex.to_le_bytes());
+    body[12..16].copy_from_slice(&first_instance.to_le_bytes());
+    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::Draw, &body);
+}
+
 /// `vkCreateCommandPool` — allocate a non-dispatchable
 /// VkCommandPool handle. We ignore the create-info (queue family,
 /// flags); Atrium's single queue family means every pool is
@@ -708,7 +860,7 @@ pub unsafe extern "C" fn vkAllocateCommandBuffers(
         let cb = Box::new(AtriumCommandBuffer {
             loader_dispatch_slot: VK_ICD_LOADER_MAGIC,
             state: CmdBufferState::Initial,
-            _frame: aqueduct_gpu::frame::FrameBuilder::new(ATRIUM_CMDBUF_INITIAL_CAPACITY),
+            frame: aqueduct_gpu::frame::FrameBuilder::new(ATRIUM_CMDBUF_INITIAL_CAPACITY),
         });
         let cb_raw = Box::into_raw(cb);
         pool.buffers.push(cb_raw);
@@ -762,7 +914,7 @@ pub unsafe extern "C" fn vkBeginCommandBuffer(
     }
     let cb = &mut *(command_buffer as *mut AtriumCommandBuffer);
     cb.state = CmdBufferState::Recording;
-    cb._frame = aqueduct_gpu::frame::FrameBuilder::new(ATRIUM_CMDBUF_INITIAL_CAPACITY);
+    cb.frame = aqueduct_gpu::frame::FrameBuilder::new(ATRIUM_CMDBUF_INITIAL_CAPACITY);
     VK_SUCCESS
 }
 
@@ -802,7 +954,7 @@ pub unsafe extern "C" fn vkResetCommandBuffer(
     }
     let cb = &mut *(command_buffer as *mut AtriumCommandBuffer);
     cb.state = CmdBufferState::Initial;
-    cb._frame = aqueduct_gpu::frame::FrameBuilder::new(ATRIUM_CMDBUF_INITIAL_CAPACITY);
+    cb.frame = aqueduct_gpu::frame::FrameBuilder::new(ATRIUM_CMDBUF_INITIAL_CAPACITY);
     VK_SUCCESS
 }
 
@@ -1092,8 +1244,8 @@ mod tests {
 
     #[test]
     fn get_proc_addr_unknown_name_returns_none() {
-        // vkCmdDraw isn't wired yet (Phase 1.3b cmdbuf).
-        let name = b"vkCmdDraw\0";
+        // vkCmdBindPipeline isn't wired yet.
+        let name = b"vkCmdBindPipeline\0";
         let r = unsafe {
             vk_icdGetInstanceProcAddr(
                 std::ptr::null_mut(),

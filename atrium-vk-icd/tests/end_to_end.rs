@@ -369,6 +369,97 @@ fn physical_device_features_and_memory_queries() {
 }
 
 #[test]
+fn cmdbuf_records_frame_ops_through_vkcmd_apis() {
+    use atrium_vk_icd::{
+        cmdbuf_recorded_bytes,
+        vkAllocateCommandBuffers, vkBeginCommandBuffer, vkCmdDraw,
+        vkCmdSetScissor, vkCmdSetViewport, vkCmdPushConstants,
+        vkCreateCommandPool, vkCreateDevice, vkDestroyCommandPool,
+        vkDestroyDevice, vkEndCommandBuffer,
+    };
+
+    let sock = tmp_socket("rec");
+    let sw_backend = Arc::new(SoftwareBackend::new());
+    let backend_for_listener: Arc<dyn Backend> = sw_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap();
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+
+    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+
+    type VkDevice = *mut std::ffi::c_void;
+    type VkCommandBuffer = *mut std::ffi::c_void;
+
+    // Bootstrap.
+    let mut instance: VkInstance = std::ptr::null_mut();
+    unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
+    let mut devices: [VkPhysicalDevice; 1] = [std::ptr::null_mut(); 1];
+    let mut cap: u32 = 1;
+    unsafe { vkEnumeratePhysicalDevices(instance, &mut cap, devices.as_mut_ptr()); }
+    let mut device: VkDevice = std::ptr::null_mut();
+    unsafe { vkCreateDevice(devices[0], std::ptr::null(), std::ptr::null(), &mut device); }
+    let mut pool: u64 = 0;
+    unsafe { vkCreateCommandPool(device, std::ptr::null(), std::ptr::null(), &mut pool); }
+
+    let mut info = [0u8; 40];
+    info[0..4].copy_from_slice(&40u32.to_le_bytes());
+    info[16..24].copy_from_slice(&pool.to_le_bytes());
+    info[28..32].copy_from_slice(&1u32.to_le_bytes());
+    let mut cbs: [VkCommandBuffer; 1] = [std::ptr::null_mut(); 1];
+    unsafe { vkAllocateCommandBuffers(device, info.as_ptr() as *const _, cbs.as_mut_ptr()); }
+    let cb = cbs[0];
+
+    // vkCmd* before Begin: silently dropped (state machine guard).
+    unsafe { vkCmdDraw(cb, 3, 1, 0, 0); }
+    assert_eq!(cmdbuf_recorded_bytes(cb).len(), 0,
+        "vkCmd* outside Recording must drop, not record");
+
+    // Begin → record 4 ops → End.
+    unsafe { vkBeginCommandBuffer(cb, std::ptr::null()); }
+    assert_eq!(cmdbuf_recorded_bytes(cb).len(), 0, "fresh Recording starts empty");
+
+    let vp = ash::vk::Viewport {
+        x: 0.0, y: 0.0, width: 800.0, height: 600.0,
+        min_depth: 0.0, max_depth: 1.0,
+    };
+    unsafe { vkCmdSetViewport(cb, 0, 1, &vp); }
+    let sc = ash::vk::Rect2D {
+        offset: ash::vk::Offset2D { x: 0, y: 0 },
+        extent: ash::vk::Extent2D { width: 800, height: 600 },
+    };
+    unsafe { vkCmdSetScissor(cb, 0, 1, &sc); }
+    let pc_bytes: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+    unsafe { vkCmdPushConstants(cb, 0, 0x00000010 /* FRAGMENT */, 0, 8,
+        pc_bytes.as_ptr() as *const _); }
+    unsafe { vkCmdDraw(cb, 3, 1, 0, 0); }
+    unsafe { vkEndCommandBuffer(cb); }
+
+    // Inspect the recorded stream. Each record is 8 bytes of
+    // header + body bytes. The four ops are:
+    //   SetViewport    (0x0030, body 24 bytes) → 8 + 24 = 32 bytes
+    //   SetScissor     (0x0031, body 16 bytes) → 8 + 16 = 24 bytes
+    //   PushConstants  (0x0032, body 8 hdr + 8 payload = 16) → 24 bytes
+    //   Draw           (0x0040, body 16 bytes) → 24 bytes
+    //   Total: 104 bytes.
+    let bytes = cmdbuf_recorded_bytes(cb);
+    assert_eq!(bytes.len(), 104, "expected 104 bytes recorded, got {}", bytes.len());
+
+    // Verify the first two opcodes are SetViewport, SetScissor.
+    let op0 = u16::from_le_bytes([bytes[0], bytes[1]]);
+    let op1 = u16::from_le_bytes([bytes[32], bytes[33]]);
+    assert_eq!(op0, 0x0030, "first op must be SetViewport");
+    assert_eq!(op1, 0x0031, "second op must be SetScissor");
+
+    // Cleanup.
+    unsafe { vkDestroyCommandPool(device, pool, std::ptr::null()); }
+    unsafe { vkDestroyDevice(device, std::ptr::null()); }
+    unsafe { vkDestroyInstance(instance, std::ptr::null()); }
+    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[test]
 fn proc_addr_resolves_three_entry_points() {
     // No live daemon required for the get_proc_addr lookups.
     fn lookup(name: &[u8]) -> Option<unsafe extern "C" fn()> {

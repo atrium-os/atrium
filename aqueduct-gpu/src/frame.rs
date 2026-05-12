@@ -135,6 +135,15 @@ impl FrameBuilder {
         self.buf
     }
 
+    /// Borrow the currently-accumulated buffer without consuming
+    /// the builder. Useful when a caller needs to peek at the
+    /// in-progress record stream (e.g. cmdbuf-recording verification
+    /// tests in atrium-vk-icd) while keeping the builder live for
+    /// further `push` calls.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buf
+    }
+
     /// Adopt an already-built byte buffer (e.g. one returned by a
     /// prior `into_buf()` that the caller deduplicated against the
     /// previous frame, or a frame replayed from disk). The buffer
