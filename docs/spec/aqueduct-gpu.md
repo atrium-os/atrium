@@ -1045,8 +1045,29 @@ Bridge additions (`fresco-aqueduct-bridge`):
 `atrium-vk-icd` is a Vulkan ICD implemented in Rust that translates
 Vulkan API calls into aqueduct-gpu protocol calls. It is not a generic
 Vulkan driver — it targets aqueduct-gpu specifically. There is no
-Vulkan loader, no WSI plugin, no driver-discovery dance: the ICD is
-what `libvulkan.so.1` resolves to on Atrium.
+Vulkan loader-wrapping, no WSI plugin proper, no driver-discovery
+dance: the ICD is what the Khronos `libvulkan.so.1` loader resolves
+to on Atrium.
+
+**Status (landed):** the cdylib + JSON manifest are discovered by
+the standard Khronos loader (`vk_icdNegotiateLoaderICDInterfaceVersion`
+returns v7; `vk_icdGetInstanceProcAddr` dispatches by name). The
+ICD answers the full setup-record-submit lifecycle — every Vulkan
+handle type (`VkInstance`, `VkPhysicalDevice`, `VkDevice`, `VkQueue`,
+`VkCommandPool`/`Buffer`, `VkBuffer`, `VkImage`, `VkImageView`,
+`VkDeviceMemory`, `VkRenderPass`, `VkFramebuffer`, `VkPipeline`/
+`Layout`, `VkShaderModule`, `VkSampler`, `VkFence`, `VkSemaphore`,
+`VkDescriptorSetLayout`/`Pool`/`Set`) with daemon-side ResourceId
+tracking where applicable, and every standard `vkCmd*` recording
+op the renderer's FrameOp dispatcher accepts. `vkQueueSubmit`
+walks the queue → device → instance → `Mutex<GpuClient>`
+back-pointer chain and calls `submit_frame` against a per-device
+persistent fence + monotonic timeline.
+
+Remaining: WSI (`VK_KHR_surface` / `VK_KHR_swapchain`), compute
+pipelines, the long tail of optional `vkCmd*`. A live Vulkan
+triangle binary against this ICD + frescod-aqueduct is the next
+empirical test.
 
 Key API translations:
 
@@ -1329,12 +1350,41 @@ frame counter still incrementing.
 
 ### Phase 2 — Vulkan ICD + install-time AOT (4–6 weeks)
 
-**Status: validator (2.0–2.2) and shader cache (2.3) landed;
-2.4 (spirv-tools), ICD, atrium-pkg integration pending.**
+**Status: validator (2.0–2.2), shader cache (2.3),
+spirv-tools cross-check (2.4), and atrium-vk-icd (skeleton →
+full setup-record-submit lifecycle) all landed. atrium-pkg
+integration + a live Vulkan triangle demo remain pending.**
 
 Deliverables:
-- ⚠️ `atrium-vk-icd` crate: Vulkan ICD speaking aqueduct-gpu —
-  **pending**.
+- ✅ `atrium-vk-icd` crate: Vulkan ICD speaking aqueduct-gpu —
+  **landed**. cdylib + JSON manifest discovered by the Khronos
+  loader. Surface (~75 entry points, 29 tests green):
+  - Loader negotiate + bootstrap probes (vkEnumerateInstance*).
+  - Instance + physical-device + device + queue lifecycle.
+  - Physical-device queries: Properties / Features / Memory /
+    Format / QueueFamily.
+  - Command pool + cmdbuf state machine; vkCmd* recording
+    (Viewport, Scissor, PushConstants, BindPipeline,
+    BindVertex/IndexBuffers, BindDescriptorSets, Draw,
+    DrawIndexed, Begin/EndRenderPass, CopyBuffer/CopyBufferToImage,
+    PipelineBarrier).
+  - Resources: VkBuffer, VkImage, VkImageView, VkDeviceMemory,
+    VkSampler — each carrying a daemon-side ResourceId from
+    GpuClient::create_buffer / create_image / create_sampler.
+  - VkShaderModule with sha-256 + resolve-then-upload against
+    the daemon's shader cache.
+  - VkPipeline / PipelineLayout (IcdRuntime-namespaced IDs).
+  - VkRenderPass + VkFramebuffer (target image resolved at
+    vkCmdBeginRenderPass).
+  - VkDescriptorSetLayout / Pool / Set, vkUpdateDescriptorSets,
+    vkCmdBindDescriptorSets.
+  - VkFence (synchronous-submit shortcut), VkSemaphore (opaque
+    handle, timeline-via-submit handles serialization).
+  - vkQueueSubmit walks the queue → device → instance →
+    Mutex<GpuClient> back-pointer chain and calls
+    submit_frame against the per-device persistent fence +
+    monotonic timeline.
+  - vkDeviceWaitIdle / vkQueueWaitIdle.
 - ✅ Sandbox primitives (`aqueduct_gpu_host::shader_validator`):
   - Phase 2.0: magic / version / size caps, forbidden capability
     list (PhysicalStorageBufferAddresses, RayTracing*, MeshShading*,
@@ -1975,14 +2025,22 @@ aqueduct-gpu-host/                    ✅ macOS daemon
                                           (--backend stub|software|moltenvk)
 fresco-aqueduct-bridge/               ✅ fresco-protocol → FrameOp
                                          translator
-atrium-vk-icd/                        ⚠️ Vulkan ICD (Phase 2.5+)
-                                         skeleton landed: cdylib +
-                                         vk_icdGetInstanceProcAddr +
-                                         vk_icdNegotiateLoaderICDInterface-
-                                         Version stubs + atrium_icd.json
-                                         manifest. Phase 1.3b cmdbuf
-                                         + every other vk* entry point
-                                         pending.
+atrium-vk-icd/                        ✅ Vulkan ICD: full setup-
+                                         record-submit lifecycle. cdylib
+                                         + atrium_icd.json. ~75 entry
+                                         points, 29 tests green. Live
+                                         e2e tests verify the chain
+                                         loader → vkCreateInstance →
+                                         physical-device queries →
+                                         vkCreateDevice → cmdbuf record
+                                         → vkQueueSubmit observed via
+                                         SoftwareBackend's submission
+                                         counter. Resource handles
+                                         carry daemon-side ResourceIds
+                                         via GpuClient::create_buffer
+                                         / image / sampler / shader_upload.
+                                         Vulkan triangle demo against
+                                         live frescod-aqueduct pending.
 external/wgpu/                        ⚠️ wgpu fork w/ aqueduct-gpu
                                          backend (Phase 1.5?)
 atrium-kmod/atrium_virtio_gpu.c       ✅ IOC_GPU_MINT_TOKEN,
