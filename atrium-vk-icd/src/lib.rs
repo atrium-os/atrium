@@ -1023,6 +1023,10 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkInstance, u64, *const c_void), FnVoidPtr,
             >(vkDestroySurfaceKHR)),
+        "vkCreateAtriumSurfaceEXT" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkInstance, *const c_void, *const c_void, *mut u64) -> VkResult, FnVoidPtr,
+            >(vkCreateAtriumSurfaceEXT)),
         "vkGetPhysicalDeviceSurfaceSupportKHR" =>
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkPhysicalDevice, u32, u64, *mut u32) -> VkResult, FnVoidPtr,
@@ -4003,10 +4007,17 @@ pub unsafe extern "C" fn vkEnumerateInstanceVersion(
     VK_SUCCESS
 }
 
-/// `vkEnumerateInstanceExtensionProperties` — returns the list of
-/// instance-level extensions this ICD supports. Skeleton: zero
-/// extensions. Standard two-call query: caller invokes once with
-/// `p_props=NULL` to learn the count, then again with a buffer.
+/// `vkEnumerateInstanceExtensionProperties` — returns the
+/// instance-level extensions this ICD supports.
+///
+/// Today: VK_KHR_surface (1), VK_EXT_atrium_surface (1). Swapchain
+/// is a device-level extension and surfaces at
+/// vkEnumerateDeviceExtensionProperties.
+const ATRIUM_INSTANCE_EXTENSIONS: &[(&[u8], u32)] = &[
+    (b"VK_KHR_surface\0", 25),
+    (b"VK_EXT_atrium_surface\0", 1),
+];
+
 #[no_mangle]
 pub unsafe extern "C" fn vkEnumerateInstanceExtensionProperties(
     _p_layer_name: *const c_char,
@@ -4016,13 +4027,27 @@ pub unsafe extern "C" fn vkEnumerateInstanceExtensionProperties(
     if p_property_count.is_null() {
         return -7 /* VK_ERROR_INITIALIZATION_FAILED */;
     }
-    // Zero extensions supported today. p_properties is ignored
-    // because count is zero; future implementations would fill it.
-    let cap_in = *p_property_count;
-    *p_property_count = 0;
-    let _ = p_properties;
-    let _ = cap_in;
-    VK_SUCCESS
+    let n = ATRIUM_INSTANCE_EXTENSIONS.len() as u32;
+    if p_properties.is_null() {
+        *p_property_count = n;
+        return VK_SUCCESS;
+    }
+    let cap = *p_property_count;
+    let to_copy = cap.min(n);
+    for i in 0..to_copy {
+        let (name, ver) = ATRIUM_INSTANCE_EXTENSIONS[i as usize];
+        let mut props = VkExtensionProperties {
+            extensionName: [0; VK_MAX_EXTENSION_NAME_SIZE],
+            specVersion:   ver,
+        };
+        for (j, &b) in name.iter().enumerate() {
+            if j >= VK_MAX_EXTENSION_NAME_SIZE { break; }
+            props.extensionName[j] = b as c_char;
+        }
+        *p_properties.offset(i as isize) = props;
+    }
+    *p_property_count = to_copy;
+    if to_copy < n { 5 /* VK_INCOMPLETE */ } else { VK_SUCCESS }
 }
 
 /// `vkEnumerateInstanceLayerProperties` — returns ICD-side instance
@@ -4092,6 +4117,51 @@ static ATRIUM_NEXT_SURFACE_ID: std::sync::atomic::AtomicU64 =
 pub unsafe extern "C" fn vkDestroySurfaceKHR(
     _instance: VkInstance, _surface: u64, _p_allocator: *const c_void,
 ) {}
+
+/// `vkCreateAtriumSurfaceEXT` — Atrium's canonical
+/// VkSurfaceKHR creator (VK_EXT_atrium_surface). The create-info
+/// carries a Fresco window-id (u32, allocated by the app via
+/// fresco-protocol's WindowCreate). The returned VkSurfaceKHR's
+/// numeric value IS that window-id widened to u64, so
+/// OP_GPU_PRESENT.surface_id is directly routable on the daemon
+/// side (no extra surface→window map needed).
+///
+/// VkAtriumSurfaceCreateInfoEXT layout:
+///   0   sType : u32  (1_000_310_000 — extension number 310 ×
+///                     1000 + 0 per Khronos convention; reserved
+///                     for VK_EXT_atrium_surface in our local
+///                     numbering until upstream assigns).
+///   4   _pad
+///   8   pNext : ptr
+///   16  flags : u32
+///   20  window_id : u32  (Fresco window-id)
+#[no_mangle]
+pub unsafe extern "C" fn vkCreateAtriumSurfaceEXT(
+    _instance:     VkInstance,
+    p_create_info: *const c_void,
+    _p_allocator:  *const c_void,
+    p_surface:     *mut u64,
+) -> VkResult {
+    if p_create_info.is_null() || p_surface.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let b = p_create_info as *const u8;
+    let window_id = std::ptr::read_unaligned(b.add(20) as *const u32);
+    if window_id == 0 {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    // The surface handle IS the window-id widened. Lets the
+    // daemon route OP_GPU_PRESENT directly through its existing
+    // per-window WindowSurface map without a separate
+    // surface→window translation step.
+    //
+    // ATRIUM_NEXT_SURFACE_ID is reserved for a future generation
+    // scheme if surface lifetime starts to outlive its window.
+    let _ = ATRIUM_NEXT_SURFACE_ID
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    *p_surface = window_id as u64;
+    VK_SUCCESS
+}
 
 /// `vkGetPhysicalDeviceSurfaceSupportKHR` — always returns
 /// VK_TRUE for queue family 0 (our single family supports
@@ -4466,8 +4536,9 @@ mod tests {
 
     #[test]
     fn get_proc_addr_unknown_name_returns_none() {
-        // vkCreateAtriumSurfaceEXT isn't wired yet.
-        let name = b"vkCreateAtriumSurfaceEXT\0";
+        // vkCreateXlibSurfaceKHR — Atrium ICD doesn't expose this
+        // platform extension (Atrium apps use VK_EXT_atrium_surface).
+        let name = b"vkCreateXlibSurfaceKHR\0";
         let r = unsafe {
             vk_icdGetInstanceProcAddr(
                 std::ptr::null_mut(),
@@ -4505,14 +4576,28 @@ mod tests {
     }
 
     #[test]
-    fn enumerate_instance_extensions_reports_zero() {
+    fn enumerate_instance_extensions_lists_atrium_surface() {
+        // VK_KHR_surface + VK_EXT_atrium_surface — see
+        // ATRIUM_INSTANCE_EXTENSIONS.
         let f = lookup(b"vkEnumerateInstanceExtensionProperties\0").unwrap();
         let typed: unsafe extern "C" fn(*const c_char, *mut u32, *mut VkExtensionProperties) -> VkResult =
             unsafe { std::mem::transmute(f) };
         let mut count: u32 = 99;
         let r = unsafe { typed(std::ptr::null(), &mut count, std::ptr::null_mut()) };
         assert_eq!(r, VK_SUCCESS);
-        assert_eq!(count, 0);
+        assert_eq!(count, 2);
+
+        let mut props: [VkExtensionProperties; 4] = unsafe { std::mem::zeroed() };
+        let mut cap: u32 = 4;
+        let _ = unsafe { typed(std::ptr::null(), &mut cap, props.as_mut_ptr()) };
+        assert_eq!(cap, 2);
+        // First entry: VK_KHR_surface.
+        let bytes0: Vec<u8> = props[0].extensionName.iter()
+            .take_while(|&&c| c != 0).map(|&c| c as u8).collect();
+        assert_eq!(std::str::from_utf8(&bytes0).unwrap(), "VK_KHR_surface");
+        let bytes1: Vec<u8> = props[1].extensionName.iter()
+            .take_while(|&&c| c != 0).map(|&c| c as u8).collect();
+        assert_eq!(std::str::from_utf8(&bytes1).unwrap(), "VK_EXT_atrium_surface");
     }
 
     #[test]

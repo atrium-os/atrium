@@ -1769,6 +1769,45 @@ fn swapchain_ring_acquire_present_round_trip() {
 }
 
 #[test]
+fn create_atrium_surface_ext_returns_window_id_as_handle() {
+    use atrium_vk_icd::{vkCreateAtriumSurfaceEXT, vkDestroySurfaceKHR};
+
+    let sock = tmp_socket("surf");
+    let sw_backend = Arc::new(SoftwareBackend::new());
+    let backend_for_listener: Arc<dyn Backend> = sw_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap();
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+
+    let mut instance: VkInstance = std::ptr::null_mut();
+    unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
+
+    // VkAtriumSurfaceCreateInfoEXT: sType@0, _pad@4, pNext@8,
+    // flags@16, window_id@20.
+    let mut info = [0u8; 24];
+    info[ 0.. 4].copy_from_slice(&1_000_310_000u32.to_le_bytes());
+    info[20..24].copy_from_slice(&42u32.to_le_bytes()); // window id
+
+    let mut surface: u64 = 0;
+    let r = unsafe { vkCreateAtriumSurfaceEXT(instance, info.as_ptr() as *const _, std::ptr::null(), &mut surface) };
+    assert_eq!(r, 0);
+    assert_eq!(surface, 42, "surface handle should be the window-id widened");
+
+    // window_id=0 must reject.
+    info[20..24].copy_from_slice(&0u32.to_le_bytes());
+    let mut bad: u64 = 0;
+    let r = unsafe { vkCreateAtriumSurfaceEXT(instance, info.as_ptr() as *const _, std::ptr::null(), &mut bad) };
+    assert_ne!(r, 0);
+
+    unsafe { vkDestroySurfaceKHR(instance, surface, std::ptr::null()); }
+    unsafe { vkDestroyInstance(instance, std::ptr::null()); }
+    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[test]
 fn proc_addr_resolves_three_entry_points() {
     // No live daemon required for the get_proc_addr lookups.
     fn lookup(name: &[u8]) -> Option<unsafe extern "C" fn()> {
