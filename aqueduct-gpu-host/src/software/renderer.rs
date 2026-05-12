@@ -19,9 +19,11 @@
 //! path, glyph_run) are reserved but return `RendererError::Unsupported`
 //! until their dispatch lands.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tiny_skia::{Color, FillRule, Paint, PixmapMut, Rect, Transform};
+use tiny_skia::{Color, FillRule, Paint, Pixmap, PixmapMut, Rect, Transform};
 
 use aqueduct_gpu::frame::{FrameDecodeError, FrameDecoder};
 use aqueduct_gpu::ids::{IdNamespace, ResourceId};
@@ -372,21 +374,254 @@ impl RectOpParams {
     }
 }
 
+/// Push-constant layout for the atrium-core textured-rect pipeline.
+///
+/// Samples a sub-rect of a source atlas image into a destination
+/// rect, with an RGBA tint multiplier. Wire layout: 52 bytes, plain
+/// little-endian.
+///
+/// ```text
+///   offset  size  field
+///   0       16    dst rect: 4×f32 (x, y, w, h) in target pixels
+///   16      4     atlas_image_id: u32 (ResourceId::raw())
+///   20      16    src rect (UV in pixels of the atlas): u0, v0, u1, v1
+///   36      16    tint: 4×f32 RGBA premultiplied
+/// ```
+///
+/// UVs are in *pixels of the atlas image*, not normalised [0..1] —
+/// matches how tier-1 atlases (icons, glyph atlases) think.
+/// `(u1, v1)` is exclusive.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[repr(C)]
+pub struct TexturedRectOpParams {
+    /// Destination rect X (target-pixel space).
+    pub dst_x: f32,
+    /// Destination rect Y.
+    pub dst_y: f32,
+    /// Destination rect width.
+    pub dst_w: f32,
+    /// Destination rect height.
+    pub dst_h: f32,
+    /// Atlas image resource ID (raw u32).
+    pub atlas_image_id: u32,
+    /// Source U0 (atlas pixels).
+    pub src_u0: f32,
+    /// Source V0.
+    pub src_v0: f32,
+    /// Source U1 (exclusive).
+    pub src_u1: f32,
+    /// Source V1.
+    pub src_v1: f32,
+    /// Tint R (multiplied into sampled colour, premultiplied alpha).
+    pub tint_r: f32,
+    /// Tint G.
+    pub tint_g: f32,
+    /// Tint B.
+    pub tint_b: f32,
+    /// Tint A.
+    pub tint_a: f32,
+}
+
+impl TexturedRectOpParams {
+    /// Decode from a push-constants byte slice. Requires 52 bytes.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, RendererError> {
+        const SZ: usize = 52;
+        if bytes.len() < SZ {
+            return Err(RendererError::ShortPushConstants {
+                expected: SZ, got: bytes.len(),
+            });
+        }
+        let f = |off: usize| f32::from_le_bytes(
+            [bytes[off], bytes[off+1], bytes[off+2], bytes[off+3]]
+        );
+        let u = |off: usize| u32::from_le_bytes(
+            [bytes[off], bytes[off+1], bytes[off+2], bytes[off+3]]
+        );
+        Ok(Self {
+            dst_x: f(0), dst_y: f(4), dst_w: f(8), dst_h: f(12),
+            atlas_image_id: u(16),
+            src_u0: f(20), src_v0: f(24), src_u1: f(28), src_v1: f(32),
+            tint_r: f(36), tint_g: f(40), tint_b: f(44), tint_a: f(48),
+        })
+    }
+
+    /// Encode as plain little-endian bytes (52 bytes).
+    pub fn to_bytes(&self) -> [u8; 52] {
+        let mut buf = [0u8; 52];
+        let floats = [
+            self.dst_x, self.dst_y, self.dst_w, self.dst_h,
+        ];
+        for (i, v) in floats.iter().enumerate() {
+            buf[i*4..i*4+4].copy_from_slice(&v.to_le_bytes());
+        }
+        buf[16..20].copy_from_slice(&self.atlas_image_id.to_le_bytes());
+        let uvs = [self.src_u0, self.src_v0, self.src_u1, self.src_v1,
+                   self.tint_r, self.tint_g, self.tint_b, self.tint_a];
+        for (i, v) in uvs.iter().enumerate() {
+            let off = 20 + i*4;
+            buf[off..off+4].copy_from_slice(&v.to_le_bytes());
+        }
+        buf
+    }
+}
+
+/// One glyph instance in a glyph_run draw.
+///
+/// Wire layout: 24 bytes, plain little-endian.
+///
+/// ```text
+///   offset  size  field
+///   0       8     dst (dx, dy): 2×f32, run-origin-relative
+///   8       4     atlas_u: u32 (atlas pixels)
+///   12      4     atlas_v: u32
+///   16      4     atlas_w: u32
+///   20      4     atlas_h: u32
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[repr(C)]
+pub struct GlyphInstance {
+    /// Destination X offset from run origin (target pixels).
+    pub dx: f32,
+    /// Destination Y offset from run origin.
+    pub dy: f32,
+    /// Atlas-pixel U origin of this glyph's sub-rect.
+    pub atlas_u: u32,
+    /// Atlas-pixel V origin.
+    pub atlas_v: u32,
+    /// Width of the glyph's atlas region (pixels).
+    pub atlas_w: u32,
+    /// Height of the glyph's atlas region.
+    pub atlas_h: u32,
+}
+
+impl GlyphInstance {
+    /// Encode as 24 little-endian bytes.
+    pub fn to_bytes(&self) -> [u8; 24] {
+        let mut b = [0u8; 24];
+        b[0..4].copy_from_slice(&self.dx.to_le_bytes());
+        b[4..8].copy_from_slice(&self.dy.to_le_bytes());
+        b[8..12].copy_from_slice(&self.atlas_u.to_le_bytes());
+        b[12..16].copy_from_slice(&self.atlas_v.to_le_bytes());
+        b[16..20].copy_from_slice(&self.atlas_w.to_le_bytes());
+        b[20..24].copy_from_slice(&self.atlas_h.to_le_bytes());
+        b
+    }
+}
+
+/// Push-constant layout for the atrium-core glyph_run pipeline.
+///
+/// Batches N glyph quads from one atlas in a single Draw. The atlas
+/// is expected to already encode final colour (premultiplied RGBA8) —
+/// the client side (atrium-text bundle / fresco-text) is responsible
+/// for compositing tint into the atlas at rasterise time. Tier-1 does
+/// not apply a per-run RGB tint (deferred to tier-2 SW Vulkan where a
+/// fragment shader can multiply).
+///
+/// Wire layout (header 28 bytes + N × 24-byte [`GlyphInstance`]):
+///
+/// ```text
+///   offset  size  field
+///   0       16    color: 4×f32 RGBA (only A used in tier-1; for opacity)
+///   16      4     atlas_image_id: u32 (ResourceId::raw())
+///   20      4     glyph_count: u32
+///   24      8     origin: 2×f32 (run x, y in target pixels)
+///   32      ...   glyph_count × GlyphInstance (24 bytes each)
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct GlyphRunParams {
+    /// Run colour. Tier-1 honours only `color[3]` as run opacity.
+    pub color: [f32; 4],
+    /// Atlas image holding the rasterised glyphs.
+    pub atlas_image_id: u32,
+    /// Run origin (target pixels). Per-glyph dx/dy are relative to this.
+    pub origin: [f32; 2],
+    /// One entry per glyph, in draw order.
+    pub glyphs: Vec<GlyphInstance>,
+}
+
+impl GlyphRunParams {
+    const HEADER_SZ: usize = 32;
+    const INSTANCE_SZ: usize = 24;
+
+    /// Decode from a push-constants byte slice.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, RendererError> {
+        if bytes.len() < Self::HEADER_SZ {
+            return Err(RendererError::ShortPushConstants {
+                expected: Self::HEADER_SZ, got: bytes.len(),
+            });
+        }
+        let f = |off: usize| f32::from_le_bytes(
+            [bytes[off], bytes[off+1], bytes[off+2], bytes[off+3]]
+        );
+        let u = |off: usize| u32::from_le_bytes(
+            [bytes[off], bytes[off+1], bytes[off+2], bytes[off+3]]
+        );
+        let color = [f(0), f(4), f(8), f(12)];
+        let atlas_image_id = u(16);
+        let glyph_count = u(20) as usize;
+        let origin = [f(24), f(28)];
+
+        let want_total = Self::HEADER_SZ + glyph_count * Self::INSTANCE_SZ;
+        if bytes.len() < want_total {
+            return Err(RendererError::ShortPushConstants {
+                expected: want_total, got: bytes.len(),
+            });
+        }
+        let mut glyphs = Vec::with_capacity(glyph_count);
+        for i in 0..glyph_count {
+            let off = Self::HEADER_SZ + i * Self::INSTANCE_SZ;
+            glyphs.push(GlyphInstance {
+                dx: f(off),
+                dy: f(off + 4),
+                atlas_u: u(off + 8),
+                atlas_v: u(off + 12),
+                atlas_w: u(off + 16),
+                atlas_h: u(off + 20),
+            });
+        }
+        Ok(Self { color, atlas_image_id, origin, glyphs })
+    }
+
+    /// Encode to a length-prefix-free byte buffer suitable for push-constants.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::HEADER_SZ + self.glyphs.len() * Self::INSTANCE_SZ);
+        for v in &self.color {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(&self.atlas_image_id.to_le_bytes());
+        out.extend_from_slice(&(self.glyphs.len() as u32).to_le_bytes());
+        for v in &self.origin {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        for g in &self.glyphs {
+            out.extend_from_slice(&g.to_bytes());
+        }
+        out
+    }
+}
+
 /// Renderer state. Owns a borrowed `PixmapMut` for the duration of
 /// `dispatch_frame`. State machine fields (current pipeline, last
 /// push-constants) reset between renderpasses.
 pub struct TinySkiaRenderer<'a> {
     target: PixmapMut<'a>,
+    /// Source images keyed by `ResourceId::raw() as u64`. Read-only
+    /// access for textured-rect / glyph_run rasterisers. Excludes the
+    /// target image — caller (SoftwareBackend::submit_frame) removes
+    /// it from the map before constructing the renderer.
+    sources: &'a HashMap<u64, Pixmap>,
     in_renderpass: bool,
     current_pipeline: Option<ResourceId>,
     push_constants: Vec<u8>,
 }
 
 impl<'a> TinySkiaRenderer<'a> {
-    /// Wrap a tiny-skia `PixmapMut` as the render target.
-    pub fn new(target: PixmapMut<'a>) -> Self {
+    /// Wrap a tiny-skia `PixmapMut` as the render target plus a
+    /// read-only sources map for textured-rect / glyph_run.
+    pub fn new(target: PixmapMut<'a>, sources: &'a HashMap<u64, Pixmap>) -> Self {
         Self {
             target,
+            sources,
             in_renderpass: false,
             current_pipeline: None,
             push_constants: Vec::new(),
@@ -533,13 +768,148 @@ impl<'a> TinySkiaRenderer<'a> {
         match local {
             BUILTIN_PIPELINE_RECT => self.rasterise_rect(),
             BUILTIN_PIPELINE_PATH => self.rasterise_path(),
-            BUILTIN_PIPELINE_TEXTURED_RECT | BUILTIN_PIPELINE_GLYPH_RUN => {
-                Err(RendererError::Unsupported(
-                    "textured-rect / glyph_run rasterisers not yet implemented",
-                ))
-            }
+            BUILTIN_PIPELINE_TEXTURED_RECT => self.rasterise_textured_rect(),
+            BUILTIN_PIPELINE_GLYPH_RUN => self.rasterise_glyph_run(),
             _ => Err(RendererError::UnknownBuiltinPipeline(local)),
         }
+    }
+
+    fn rasterise_textured_rect(&mut self) -> Result<(), RendererError> {
+        let params = TexturedRectOpParams::from_bytes(&self.push_constants)?;
+
+        let atlas = self.sources
+            .get(&(params.atlas_image_id as u64))
+            .ok_or(RendererError::AtlasNotRegistered(params.atlas_image_id))?;
+
+        // Sub-pixmap UV range sanity. We allow exclusive u1/v1 == w/h.
+        let aw = atlas.width()  as f32;
+        let ah = atlas.height() as f32;
+        if params.src_u0 < 0.0 || params.src_v0 < 0.0
+            || params.src_u1 > aw || params.src_v1 > ah
+            || params.src_u1 <= params.src_u0
+            || params.src_v1 <= params.src_v0
+        {
+            return Err(RendererError::InvalidUv {
+                u0: params.src_u0, v0: params.src_v0,
+                u1: params.src_u1, v1: params.src_v1,
+                atlas_w: aw as u32, atlas_h: ah as u32,
+            });
+        }
+
+        let dst = Rect::from_xywh(params.dst_x, params.dst_y, params.dst_w, params.dst_h)
+            .ok_or(RendererError::InvalidRect)?;
+
+        // tiny-skia's `Pattern.transform` is the pattern-to-world
+        // mapping: for a pattern-space point P, the corresponding
+        // target-space (world) point is `transform * P`. To sample
+        // atlas point A at target point T:
+        //   T = scale_inv · A + (dst_xy - scale_inv · atlas_uv0)
+        // where scale_inv = dst_size / atlas_uv_size (i.e., the
+        // pattern-space → world-space scale).
+        let scale_inv_x = params.dst_w / (params.src_u1 - params.src_u0);
+        let scale_inv_y = params.dst_h / (params.src_v1 - params.src_v0);
+        let tx = params.dst_x - params.src_u0 * scale_inv_x;
+        let ty = params.dst_y - params.src_v0 * scale_inv_y;
+        let pattern_xform = Transform::from_row(scale_inv_x, 0.0, 0.0, scale_inv_y, tx, ty);
+
+        let pattern = tiny_skia::Pattern::new(
+            atlas.as_ref(),
+            tiny_skia::SpreadMode::Pad,
+            tiny_skia::FilterQuality::Bilinear,
+            params.tint_a.clamp(0.0, 1.0),
+            pattern_xform,
+        );
+
+        let mut paint = Paint::default();
+        paint.shader = pattern;
+        paint.anti_alias = false;
+
+        let path = tiny_skia::PathBuilder::from_rect(dst);
+        self.target.fill_path(
+            &path, &paint, FillRule::Winding, Transform::identity(), None,
+        );
+        // Tint RGB ignored for tier-1 (Pattern doesn't directly
+        // accept an RGB multiplier). The alpha channel is honoured
+        // via the `opacity` arg above; glyph-tinting will arrive
+        // alongside glyph_run by way of a per-glyph colour modulator
+        // baked into the atlas, or a shader-side multiply when
+        // tier-2 lands.
+        let _ = (params.tint_r, params.tint_g, params.tint_b);
+        Ok(())
+    }
+
+    fn rasterise_glyph_run(&mut self) -> Result<(), RendererError> {
+        let params = GlyphRunParams::from_bytes(&self.push_constants)?;
+        if params.glyphs.is_empty() {
+            return Ok(());
+        }
+        let atlas = self.sources
+            .get(&(params.atlas_image_id as u64))
+            .ok_or(RendererError::AtlasNotRegistered(params.atlas_image_id))?;
+
+        let aw = atlas.width();
+        let ah = atlas.height();
+
+        let opacity = params.color[3].clamp(0.0, 1.0);
+
+        for g in &params.glyphs {
+            if g.atlas_w == 0 || g.atlas_h == 0 { continue; }
+
+            // Bounds-check the atlas sub-rect. Reject the whole run
+            // on malformed input — tier-1's "validate or refuse"
+            // posture (no clamping, no silent dropping).
+            if g.atlas_u.saturating_add(g.atlas_w) > aw
+                || g.atlas_v.saturating_add(g.atlas_h) > ah
+            {
+                return Err(RendererError::InvalidUv {
+                    u0: g.atlas_u as f32,
+                    v0: g.atlas_v as f32,
+                    u1: (g.atlas_u + g.atlas_w) as f32,
+                    v1: (g.atlas_v + g.atlas_h) as f32,
+                    atlas_w: aw, atlas_h: ah,
+                });
+            }
+
+            let dst_x = params.origin[0] + g.dx;
+            let dst_y = params.origin[1] + g.dy;
+            let dst_w = g.atlas_w as f32;
+            let dst_h = g.atlas_h as f32;
+
+            let dst = Rect::from_xywh(dst_x, dst_y, dst_w, dst_h)
+                .ok_or(RendererError::InvalidRect)?;
+
+            // tiny-skia Pattern transform is pattern-to-world.
+            // 1:1 scale: target_p = atlas_p + (dst_xy - atlas_uv0).
+            let tx = dst_x - g.atlas_u as f32;
+            let ty = dst_y - g.atlas_v as f32;
+            let xform = Transform::from_row(1.0, 0.0, 0.0, 1.0, tx, ty);
+
+            // Nearest-neighbour for crisp glyph bitmaps; switch to
+            // Bilinear once we have subpixel positioning (post-Phase-1).
+            let pattern = tiny_skia::Pattern::new(
+                atlas.as_ref(),
+                tiny_skia::SpreadMode::Pad,
+                tiny_skia::FilterQuality::Nearest,
+                opacity,
+                xform,
+            );
+
+            let mut paint = Paint::default();
+            paint.shader = pattern;
+            paint.anti_alias = false;
+            // tiny-skia's default blend is SourceOver, which is what
+            // we want for glyph composition over a cleared target.
+
+            let path = tiny_skia::PathBuilder::from_rect(dst);
+            self.target.fill_path(
+                &path, &paint, FillRule::Winding, Transform::identity(), None,
+            );
+        }
+
+        // RGB tint is reserved (atlas is expected to bake colour).
+        // See GlyphRunParams docs.
+        let _ = (params.color[0], params.color[1], params.color[2]);
+        Ok(())
     }
 
     fn rasterise_path(&mut self) -> Result<(), RendererError> {
@@ -695,6 +1065,29 @@ pub enum RendererError {
     /// commands after the header, or only Close commands).
     #[error("path is degenerate after command-stream decode")]
     DegeneratePath,
+
+    /// Textured-rect referenced an atlas image that hasn't been
+    /// registered via `image_created` (created on this session).
+    #[error("textured-rect atlas image {0:#010x} not registered")]
+    AtlasNotRegistered(u32),
+
+    /// Textured-rect UV rect was malformed (out of atlas bounds,
+    /// zero/negative area, or non-finite values).
+    #[error("invalid textured-rect UV ({u0},{v0})-({u1},{v1}) over atlas {atlas_w}x{atlas_h}")]
+    InvalidUv {
+        /// Source u0.
+        u0: f32,
+        /// Source v0.
+        v0: f32,
+        /// Source u1 (exclusive).
+        u1: f32,
+        /// Source v1 (exclusive).
+        v1: f32,
+        /// Atlas width.
+        atlas_w: u32,
+        /// Atlas height.
+        atlas_h: u32,
+    },
 }
 
 #[cfg(test)]
@@ -745,7 +1138,8 @@ mod tests {
         let mut pixmap = Pixmap::new(64, 64).unwrap();
         // Fill with non-magenta to verify the renderer actually wrote.
         pixmap.fill(Color::from_rgba8(0, 0, 0, 255));
-        let mut r = TinySkiaRenderer::new(pixmap.as_mut());
+        let sources = HashMap::new();
+        let mut r = TinySkiaRenderer::new(pixmap.as_mut(), &sources);
         let draws = r.dispatch_frame(&magenta_rect_frame()).unwrap();
         assert_eq!(draws, 1);
 
@@ -761,7 +1155,8 @@ mod tests {
     #[test]
     fn rejects_draw_outside_renderpass() {
         let mut pixmap = Pixmap::new(16, 16).unwrap();
-        let mut r = TinySkiaRenderer::new(pixmap.as_mut());
+        let sources = HashMap::new();
+        let mut r = TinySkiaRenderer::new(pixmap.as_mut(), &sources);
         let mut fb = FrameBuilder::new(128);
         let rect_pipe = ResourceId::new(IdNamespace::Builtin, BUILTIN_PIPELINE_RECT);
         fb.push(FrameOp::BindPipeline, &rect_pipe.raw().to_le_bytes()).unwrap();
@@ -773,7 +1168,8 @@ mod tests {
     #[test]
     fn rejects_draw_without_pipeline() {
         let mut pixmap = Pixmap::new(16, 16).unwrap();
-        let mut r = TinySkiaRenderer::new(pixmap.as_mut());
+        let sources = HashMap::new();
+        let mut r = TinySkiaRenderer::new(pixmap.as_mut(), &sources);
         let mut fb = FrameBuilder::new(128);
         fb.push(FrameOp::BeginRenderPass, &rp_body(1, [0, 0, 0, 255])).unwrap();
         fb.push(FrameOp::Draw, &[0u8; 16]).unwrap();
@@ -784,7 +1180,8 @@ mod tests {
     #[test]
     fn rejects_unknown_builtin_pipeline() {
         let mut pixmap = Pixmap::new(16, 16).unwrap();
-        let mut r = TinySkiaRenderer::new(pixmap.as_mut());
+        let sources = HashMap::new();
+        let mut r = TinySkiaRenderer::new(pixmap.as_mut(), &sources);
         let mut fb = FrameBuilder::new(128);
         let bogus = ResourceId::new(IdNamespace::Builtin, 0x9999);
         fb.push(FrameOp::BindPipeline, &bogus.raw().to_le_bytes()).unwrap();
@@ -795,7 +1192,8 @@ mod tests {
     #[test]
     fn rejects_icd_runtime_pipeline_as_tier2() {
         let mut pixmap = Pixmap::new(16, 16).unwrap();
-        let mut r = TinySkiaRenderer::new(pixmap.as_mut());
+        let sources = HashMap::new();
+        let mut r = TinySkiaRenderer::new(pixmap.as_mut(), &sources);
         let mut fb = FrameBuilder::new(128);
         // ICD-runtime pipelines (top tag 0xF) require shader
         // execution — tier-1 rejects with "Unsupported".
@@ -853,7 +1251,8 @@ mod tests {
         // outside should still be black.
         let mut pixmap = Pixmap::new(16, 16).unwrap();
         pixmap.fill(Color::from_rgba8(0, 0, 0, 255));
-        let mut r = TinySkiaRenderer::new(pixmap.as_mut());
+        let sources = HashMap::new();
+        let mut r = TinySkiaRenderer::new(pixmap.as_mut(), &sources);
 
         let path_params = PathOpParams {
             color: [1.0, 1.0, 0.0, 1.0], // yellow
@@ -899,7 +1298,8 @@ mod tests {
         // covered area (centroid pixel is filled).
         let mut pixmap = Pixmap::new(32, 32).unwrap();
         pixmap.fill(Color::from_rgba8(0, 0, 0, 255));
-        let mut r = TinySkiaRenderer::new(pixmap.as_mut());
+        let sources = HashMap::new();
+        let mut r = TinySkiaRenderer::new(pixmap.as_mut(), &sources);
 
         let params = PathOpParams {
             color: [0.0, 1.0, 0.0, 1.0], // green
@@ -947,7 +1347,8 @@ mod tests {
         body.extend_from_slice(&payload);
 
         let mut pixmap = Pixmap::new(8, 8).unwrap();
-        let mut r = TinySkiaRenderer::new(pixmap.as_mut());
+        let sources = HashMap::new();
+        let mut r = TinySkiaRenderer::new(pixmap.as_mut(), &sources);
         let mut fb = FrameBuilder::new(256);
         fb.push(FrameOp::BeginRenderPass, &rp_body(1, [0, 0, 0, 255])).unwrap();
         let path_pipe = ResourceId::new(IdNamespace::Builtin, BUILTIN_PIPELINE_PATH);
@@ -969,7 +1370,8 @@ mod tests {
         };
         let mut pixmap = Pixmap::new(8, 8).unwrap();
         pixmap.fill(Color::from_rgba8(0, 0, 0, 255));
-        let mut r = TinySkiaRenderer::new(pixmap.as_mut());
+        let sources = HashMap::new();
+        let mut r = TinySkiaRenderer::new(pixmap.as_mut(), &sources);
         let mut fb = FrameBuilder::new(256);
         fb.push(FrameOp::BeginRenderPass, &rp_body(1, [0, 0, 0, 255])).unwrap();
         let path_pipe = ResourceId::new(IdNamespace::Builtin, BUILTIN_PIPELINE_PATH);
@@ -993,7 +1395,8 @@ mod tests {
         // both rects land.
         let mut pixmap = Pixmap::new(16, 16).unwrap();
         pixmap.fill(Color::from_rgba8(0, 0, 0, 255));
-        let mut r = TinySkiaRenderer::new(pixmap.as_mut());
+        let sources = HashMap::new();
+        let mut r = TinySkiaRenderer::new(pixmap.as_mut(), &sources);
 
         let mut fb = FrameBuilder::new(1024);
         fb.push(FrameOp::BeginRenderPass, &rp_body(1, [0, 0, 0, 255])).unwrap();

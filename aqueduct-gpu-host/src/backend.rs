@@ -66,6 +66,23 @@ pub trait Backend: Send + Sync {
     /// Notify the backend an image was destroyed. Default no-op.
     fn image_destroyed(&self, _image_id: ResourceId) {}
 
+    /// Inline pixel write into an image. Called by the session when
+    /// it processes `OP_GPU_IMAGE_WRITE`. SW backends copy into their
+    /// per-image Pixmap; GPU backends stage through a transient
+    /// upload buffer + vkCmdCopyBufferToImage equivalent. Returns
+    /// `Err(diagnostic)` on validation failure (size mismatch,
+    /// unknown image) — the session surfaces it as
+    /// `OP_GPU_VALIDATION_ERR`. Default rejects (backends without
+    /// inline-write support).
+    fn image_write_pixels(
+        &self,
+        _image_id: ResourceId,
+        _row_pitch: u32,
+        _pixels: &[u8],
+    ) -> Result<(), String> {
+        Err("backend does not support inline image write".into())
+    }
+
     /// Submit a frame command stream. Returns `true` if the fence
     /// should be signalled now, `false` if signaling is deferred.
     fn submit_frame(
@@ -276,20 +293,66 @@ impl Backend for SoftwareBackend {
         }
     }
 
+    fn image_write_pixels(
+        &self,
+        image_id: ResourceId,
+        row_pitch: u32,
+        pixels: &[u8],
+    ) -> Result<(), String> {
+        let mut images = self.images.lock()
+            .map_err(|_| "image table poisoned".to_string())?;
+        let pixmap = images.get_mut(&(image_id.raw() as u64))
+            .ok_or_else(|| format!("image {image_id} not registered"))?;
+
+        let width  = pixmap.width()  as usize;
+        let height = pixmap.height() as usize;
+        let dst_pitch = width * 4;
+        let src_pitch = row_pitch as usize;
+
+        if src_pitch < dst_pitch {
+            return Err(format!(
+                "row_pitch {} too small for {}×{} image (need ≥{})",
+                src_pitch, width, height, dst_pitch));
+        }
+        if pixels.len() != src_pitch * height {
+            return Err(format!(
+                "pixel buffer length {} != row_pitch {} × height {}",
+                pixels.len(), src_pitch, height));
+        }
+
+        // Copy row-by-row. tiny-skia Pixmaps are tightly packed
+        // RGBA8 (no destination padding); source may pad to a wider
+        // pitch. Note tiny-skia stores PREMULTIPLIED RGBA — callers
+        // uploading non-premultiplied pixels must premultiply first.
+        // (Tier-1 atlas-upload callers like glyph_cache already do.)
+        let dst = pixmap.data_mut();
+        for row in 0..height {
+            let src_off = row * src_pitch;
+            let dst_off = row * dst_pitch;
+            dst[dst_off..dst_off + dst_pitch]
+                .copy_from_slice(&pixels[src_off..src_off + dst_pitch]);
+        }
+        Ok(())
+    }
+
     fn submit_frame(&self, _fence_id: ResourceId, _timeline: u64, frame_buf: &[u8]) -> bool {
         self.submissions.fetch_add(1, Ordering::Relaxed);
 
-        // Find the BEGIN_RENDERPASS body to learn the target image.
-        // We don't permit zero-renderpass frames here — tier-1 is
-        // strictly compositor-shaped. Empty frames count as
-        // dispatch failures so they show up in telemetry.
-        let target_image_id = match find_target_image_id(frame_buf) {
-            Ok(id) => id,
+        // Partition the frame into renderpasses. Each pass renders
+        // into its own target image; supporting multiple per frame
+        // lets compositors do offscreen-then-sample patterns (e.g.
+        // render glyph atlas, then sample it in the main pass).
+        let passes = match partition_renderpasses(frame_buf) {
+            Ok(p) if p.is_empty() => {
+                log::warn!("SoftwareBackend::submit_frame: frame contains no BEGIN_RENDERPASS");
+                self.dispatch_failures.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+            Ok(p) => p,
             Err(e) => {
                 log::warn!("SoftwareBackend::submit_frame: {e}");
                 self.dispatch_failures.fetch_add(1, Ordering::Relaxed);
-                return true; // still signal the fence; client gets
-                             // OP_GPU_VALIDATION_ERR via the session
+                return true;
             }
         };
 
@@ -301,19 +364,48 @@ impl Backend for SoftwareBackend {
             }
         };
 
-        let Some(pixmap) = images.get_mut(&(target_image_id.raw() as u64)) else {
-            log::warn!("SoftwareBackend::submit_frame: target image {target_image_id} not registered");
-            self.dispatch_failures.fetch_add(1, Ordering::Relaxed);
-            return true;
-        };
-
-        let mut renderer = TinySkiaRenderer::new(pixmap.as_mut());
-        match renderer.dispatch_frame(frame_buf) {
-            Ok(draws) => log::debug!("SoftwareBackend: dispatched {draws} draws into {target_image_id}"),
-            Err(e) => {
-                log::warn!("SoftwareBackend::submit_frame: render error: {e}");
+        for pass in &passes {
+            // Take this pass's target Pixmap out of the map so we can
+            // split borrows: the renderer needs `&mut PixmapMut` on
+            // the target plus `&HashMap<u64, Pixmap>` for source
+            // images (atlases for textured-rect / glyph_run).
+            //
+            // Critical for multi-pass: each pass's target may serve
+            // as the SOURCE for a subsequent pass (the render-to-
+            // texture pattern). Re-insertion happens between passes,
+            // so subsequent passes see the previous pass's output as
+            // a source image.
+            let target_key = pass.target_id.raw() as u64;
+            let Some(mut target_pixmap) = images.remove(&target_key) else {
+                log::warn!(
+                    "SoftwareBackend::submit_frame: pass target image {} not registered",
+                    pass.target_id,
+                );
                 self.dispatch_failures.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+
+            // The pass's byte range is [Begin .. End], inclusive of
+            // both bookend records — the renderer walks the full
+            // range and runs its Begin/End handlers.
+            let pass_bytes = &frame_buf[pass.byte_range.clone()];
+            {
+                let mut renderer = TinySkiaRenderer::new(target_pixmap.as_mut(), &images);
+                match renderer.dispatch_frame(pass_bytes) {
+                    Ok(draws) => log::debug!(
+                        "SoftwareBackend: pass into {}: {draws} draws",
+                        pass.target_id,
+                    ),
+                    Err(e) => {
+                        log::warn!(
+                            "SoftwareBackend::submit_frame: pass into {} failed: {e}",
+                            pass.target_id,
+                        );
+                        self.dispatch_failures.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
             }
+            images.insert(target_key, target_pixmap);
         }
         // Stub fence-signal semantics: tier-1 work completes inline,
         // so we signal immediately. Real GPU backends defer.
@@ -321,24 +413,57 @@ impl Backend for SoftwareBackend {
     }
 }
 
-/// Peek into a frame command stream and pull out the
-/// `target_image_id` from its BEGIN_RENDERPASS record. Used by
-/// `SoftwareBackend::submit_frame` to choose the Pixmap *before*
-/// constructing the renderer (since the renderer needs the target
-/// at construction time).
-fn find_target_image_id(frame_buf: &[u8]) -> Result<ResourceId, &'static str> {
+/// One contiguous BeginRenderPass..EndRenderPass slice of a frame
+/// command stream. The byte range covers both bookends inclusively.
+#[derive(Debug, Clone)]
+struct RenderPassSlice {
+    target_id: ResourceId,
+    byte_range: std::ops::Range<usize>,
+}
+
+/// Walk the frame stream and pull out one [`RenderPassSlice`] per
+/// BeginRenderPass..EndRenderPass pair. Records outside any
+/// renderpass are ignored (they'd be a validation error at the
+/// renderer level anyway).
+fn partition_renderpasses(frame_buf: &[u8]) -> Result<Vec<RenderPassSlice>, &'static str> {
     use aqueduct_gpu::frame::FrameDecoder;
     use aqueduct_gpu::opcodes::FrameOp;
 
     let mut decoder = FrameDecoder::new(frame_buf);
+    let mut out = Vec::new();
+    // Offset of the in-progress BeginRenderPass record's first byte.
+    let mut open: Option<(ResourceId, usize)> = None;
+    let header_sz = 8usize; // FrameOp record header (per spec §5.1)
+
+    let mut cursor = 0usize;
     while let Ok(Some((op, body))) = decoder.next() {
-        if op == FrameOp::BeginRenderPass {
-            let p = BeginRenderPassBody::from_bytes(body)
-                .map_err(|_| "BEGIN_RENDERPASS body too short")?;
-            return Ok(ResourceId(p.target_image_id));
+        let rec_start = cursor;
+        let rec_end = cursor + header_sz + body.len();
+        match op {
+            FrameOp::BeginRenderPass => {
+                if open.is_some() {
+                    return Err("nested BEGIN_RENDERPASS");
+                }
+                let p = BeginRenderPassBody::from_bytes(body)
+                    .map_err(|_| "BEGIN_RENDERPASS body too short")?;
+                open = Some((ResourceId(p.target_image_id), rec_start));
+            }
+            FrameOp::EndRenderPass => {
+                let (target_id, start) = open.take()
+                    .ok_or("END_RENDERPASS without matching BEGIN")?;
+                out.push(RenderPassSlice {
+                    target_id,
+                    byte_range: start..rec_end,
+                });
+            }
+            _ => {}
         }
+        cursor = rec_end;
     }
-    Err("frame contains no BEGIN_RENDERPASS")
+    if open.is_some() {
+        return Err("BEGIN_RENDERPASS without matching END_RENDERPASS");
+    }
+    Ok(out)
 }
 
 impl Backend for StubBackend {

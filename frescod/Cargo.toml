@@ -14,6 +14,22 @@ path = "src/main.rs"
 name = "frescod-vulkan-smoke"
 path = "src/bin/vulkan_smoke.rs"
 
+# Aqueduct-gpu smoke test: paint a fresco-protocol scene directly to
+# the scanout BO via the new aqueduct-gpu stack (no venus, no
+# HeadlessRenderer, no fresco-vulkan). Intermediate target between
+# the bridge's PNG demo and the eventual frescod main-binary swap.
+[[bin]]
+name = "frescod-aqueduct-smoke"
+path = "src/bin/aqueduct_smoke.rs"
+
+# Full frescod rewire: multi-window, fresco-protocol clients,
+# input readers — but drives the aqueduct-gpu stack instead of
+# fresco-vulkan's HeadlessRenderer. Coexists with the venus-based
+# `frescod` binary during transition.
+[[bin]]
+name = "frescod-aqueduct"
+path = "src/bin/frescod_aqueduct.rs"
+
 [dependencies]
 atrium-gpu-rs       = { path = "../atrium-gpu-rs" }
 atrium-devevents    = { path = "../atrium-devevents" }
@@ -21,6 +37,11 @@ fresco-scene-server = { path = "../fresco-scene-server" }
 fresco-vulkan       = { path = "../fresco-vulkan" }
 fresco-protocol     = { path = "../fresco-protocol" }
 aqueduct            = { path = "../aqueduct" }
+aqueduct-gpu        = { path = "../aqueduct-gpu" }
+aqueduct-gpu-client = { path = "../aqueduct-gpu-client" }
+aqueduct-gpu-host   = { path = "../aqueduct-gpu-host" }
+fresco-aqueduct-bridge = { path = "../fresco-aqueduct-bridge" }
+fresco-text         = { path = "../fresco-text" }
 atrium-trace        = { path = "../atrium-trace/rust" }
 image               = { version = "0.25", default-features = false, features = ["png"] }
 libc       = "0.2"

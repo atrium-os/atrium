@@ -63,11 +63,17 @@
 
 pub mod backend;
 pub mod listener;
+pub mod moltenvk;
 pub mod resources;
 pub mod session;
+pub mod shader_annotate;
+pub mod shader_cache;
+pub mod shader_inspect;
+pub mod shader_validator;
 pub mod software;
 
 pub use backend::{Backend, SoftwareBackend, StubBackend};
+pub use moltenvk::{MoltenVkBackend, MoltenVkError};
 pub use listener::Listener;
 pub use resources::ResourceTable;
 pub use session::Session;

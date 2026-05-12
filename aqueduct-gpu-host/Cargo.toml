@@ -14,6 +14,14 @@ path = "src/lib.rs"
 name = "aqueduct-gpu-host"
 path = "src/bin/main.rs"
 
+# Developer / atrium-pkg tooling. Wraps shader_validator and
+# shader_cache for offline use: CI gates, atrium-pkg's install-time
+# precompile hook (Phase 2.5), local dev shader-check.
+[[bin]]
+name = "aqueduct-shader-tool"
+path = "src/bin/shader_tool.rs"
+
+
 [dependencies]
 aqueduct       = { path = "../aqueduct" }
 aqueduct-gpu   = { path = "../aqueduct-gpu" }
@@ -34,6 +42,17 @@ ash            = "0.38"
 # permissively licensed (BSD-Zero). Same version Pergola uses to
 # keep the workspace coherent.
 tiny-skia      = "0.11"
+
+# Phase 2.5: shader_tool CLI uses SHA-256 to key the cache. The
+# aqueduct workspace already pulls sha2 in transitively; declaring
+# it directly here makes the dep explicit.
+sha2           = "0.10"
+
+# Phase 2.9: shader_tool `verify-bundle` parses bundle manifest.json
+# files. serde_json is the standard light JSON parser; adds <100 KB
+# to the binary.
+serde_json     = "1"
+
 
 [dev-dependencies]
 aqueduct-gpu-client = { path = "../aqueduct-gpu-client" }

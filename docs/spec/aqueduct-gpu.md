@@ -418,6 +418,21 @@ CLASS_GPU = 9
 
 ### 4.1. The two-phase shader path
 
+**Source language posture.** Atrium-native bundles author shaders in
+**Slang** (Khronos-stewarded, Apache-2.0, no GL/DX legacy, multi-
+backend emit). slangc compiles to SPIR-V, which is what flows over
+the aqueduct-gpu wire; atrium-pkg's install hook (§4.2) further
+cross-compiles to backend-native bytecode for whatever GPUs the host
+exposes. The Slang choice is locked in
+[`docs/LANGUAGE-POLICY.md`](../LANGUAGE-POLICY.md#shader-source-language);
+the validator's `Unroll` acceptance (§11.1) is calibrated against
+slangc output.
+
+Third-party Vulkan apps still ship SPIR-V regardless of source
+language (dxc, glslang, naga, etc.); the wire shape is the same.
+"Slang by default" is a posture for *new* Atrium-shipped code, not
+a wire restriction.
+
 Aqueduct-gpu distinguishes between **resolve** (cheap, by hash) and
 **upload** (slow, transfers bytecode + triggers compile). The common
 case is RESOLVE always hits.
@@ -1053,49 +1068,113 @@ frescod and the GPU.
 
 ### Phase 1 — protocol + macOS host endpoint (4–6 weeks)
 
-Deliverables:
-- `aqueduct-gpu` crate: opcodes, payload schemas, encoders/decoders,
-  guest-side client (used by frescod first, ICD later).
-- `aqueduct-gpu-host` crate: macOS host endpoint daemon. Bound to one
-  MoltenVK device. Per-connection resource tables. Frame dispatcher
-  → MoltenVK.
-- `atrium-virtio-gpu` kmod extensions: `IOC_GPU_IMPORT_REGION`,
-  `IOC_GPU_LIST_BACKENDS`, region table, ivshmem command-ring
-  servicing.
-- Migrate frescod's `HeadlessRenderer` to aqueduct-gpu.
-- Validation: vestibulum renders end-to-end on macOS-HVF without
-  venus, virglrenderer, or virtio-gpu in the stack. **Multiple frames
-  per second**, not one frame total.
+**Status: Phase 1.1–1.4 landed; 1.3b-cmdbuf, 1.4-frescod-swap, 1.5 pending.**
 
-Exit criterion: `vm/v?-aqueduct-gpu-vestibulum.png` shows the login
-form (heading + fields + button rendered), captured 30 seconds after
-launch with the frame counter still incrementing.
+Deliverables:
+- ✅ `aqueduct-gpu` crate: opcodes, payload schemas, encoders/decoders.
+- ✅ `aqueduct-gpu-client` crate: guest-side client (`GpuClient`,
+  `FrameBuilder`, async event demux).
+- ✅ `aqueduct-gpu-host` crate: macOS host endpoint daemon. Per-
+  connection [`Session`](aqueduct-gpu-host/src/session.rs) with
+  resource tables; pluggable [`Backend`] trait.
+  - ✅ `StubBackend` — protocol-correct, no GPU work.
+  - ✅ `SoftwareBackend` — tier-1 tiny-skia rasterisation.
+    Built-in pipelines: rect, path, textured-rect, glyph_run.
+  - ⚠️ `MoltenVkBackend` — **skeleton only**. Loader, instance,
+    device, queue selection done; `VkCommandBuffer` recording not
+    yet (Phase 1.3b-cmdbuf).
+- ✅ `fresco-aqueduct-bridge` crate: pure translator from
+  `fresco_protocol::*Params` to FrameOp records. Per-node
+  functions: `translate_rect`, `translate_path`,
+  `translate_texture`, `translate_glyph_run`.
+- ⚠️ Frescod render-loop swap onto bridge — **pending**
+  (FreeBSD-only; can't host-test, deferred to VM session).
+- ⚠️ `atrium-virtio-gpu` kmod extensions: `IOC_GPU_IMPORT_REGION`,
+  `IOC_GPU_LIST_BACKENDS` — **pending** (Phase 1.5).
+
+Validation done so far:
+- Tier-1 SW backend produces real pixels through full wire stack
+  (10 end-to-end socket tests, e.g. `software_backend_renders_*`,
+  `multi_renderpass_frame`).
+- `fresco-aqueduct-bridge` end-to-end tests render fresco-shaped
+  scenes (rect, path, multi-node) through real Unix socket →
+  Session → `SoftwareBackend` → tiny-skia → readback.
+- All four Atrium crates (`aqueduct-gpu`, `aqueduct-gpu-client`,
+  `fresco-aqueduct-bridge`, `aqueduct-gpu-host`) cross-compile to
+  `aarch64-unknown-freebsd` from the macOS host.
+- `aqueduct-shader-tool verify-bundle` runs natively inside the
+  FreeBSD VM and gives identical verdicts to the macOS host on
+  both `bundles/atrium-core` (9 ok / 0 rejected) and
+  `bundles/atrium-text` (3 ok / 0 rejected).
+- The `examples/demo` (fresco-protocol scene → bridge →
+  GpuClient → SoftwareBackend → PNG) runs **inside the FreeBSD
+  VM** producing a byte-identical PNG to the macOS-host run.
+  This is the minimum-viable Phase 1 demonstration:
+  fresco-protocol scene rendered by FreeBSD-native code without
+  venus / virglrenderer / virtio-gpu in the chain.
+- Bug found-and-fixed during glyph_run e2e: tiny-skia
+  `Pattern.transform` is pattern→world, not the inverse. Affected
+  both textured-rect and glyph_run; the textured-rect test passed
+  initially only because that test used a uniform-colour atlas.
+- Bug found-and-fixed during `inspect`-driven review: LoopControl
+  bit values were off by one position in the validator + annotate
+  (annotate was emitting `IterationMultiple` (0x40) instead of
+  `MaxIterations` (0x20)). Tests passed because validator-strict
+  accepted either, but driver semantics differed. Now correct.
+
+Exit criterion (unchanged): `vm/v?-aqueduct-gpu-vestibulum.png`
+shows the login form, captured 30 seconds after launch with the
+frame counter still incrementing.
 
 ### Phase 2 — Vulkan ICD + install-time AOT (4–6 weeks)
 
-Deliverables:
-- `atrium-vk-icd` crate: Vulkan ICD speaking aqueduct-gpu.
-- Sandbox primitives: SPIR-V validator (bounded loops, no
-  buffer-device-address, descriptor-bounded access), per-bundle
-  descriptor isolation in the host endpoint, GPU-timeout enforcement
-  hooks in the kmod.
-- atrium-pkg integration: install-time `shader-precompile` hook
-  walking the package's SPIR-V, detecting installed GPU backends,
-  cross-compiling via the appropriate Mesa subset, storing results
-  in Tessera CAS keyed by (spirv_hash, backend_id, compiler_version),
-  recording cache table in package metadata. Runs in a background
-  Portcullis jail with progress UI.
-- A small Vulkan 3D test (rotating cube, textured) running under
-  Atrium and presenting to frescod via surface share.
+**Status: validator (2.0–2.2) and shader cache (2.3) landed;
+2.4 (spirv-tools), ICD, atrium-pkg integration pending.**
 
-Exit criteria:
+Deliverables:
+- ⚠️ `atrium-vk-icd` crate: Vulkan ICD speaking aqueduct-gpu —
+  **pending**.
+- ✅ Sandbox primitives (`aqueduct_gpu_host::shader_validator`):
+  - Phase 2.0: magic / version / size caps, forbidden capability
+    list (PhysicalStorageBufferAddresses, RayTracing*, MeshShading*,
+    CooperativeMatrix*), forbidden extension list
+    (SPV_KHR_physical_storage_buffer, ray/mesh extensions),
+    truncation / zero-word-count safety.
+  - Phase 2.1: instruction-count / loop-count / function-count
+    caps, storage-class denylist (defense-in-depth against BDA).
+  - Phase 2.2: every `OpLoopMerge` must carry a bounded-iteration
+    annotation (`MinIterations` / `MaxIterations` / etc.); literals
+    capped at `MAX_LOOP_ITERATIONS`. Modules without producer-
+    supplied iteration bounds are rejected with the diagnostic
+    `"rebuild with bounded-loop emission enabled, e.g. glslang -Os"`.
+  - 24 unit tests + 1000-byte-sequence fuzz; wired into
+    `Session::handle_shader_upload` (SpirV kind only; NIR bypasses).
+- ⚠️ Phase 2.4: link `spirv-tools-rs` for the long tail beyond
+  Atrium policy — pending.
+- ✅ Phase 2.3: warm-path shader cache
+  (`aqueduct_gpu_host::shader_cache::ShaderCache`):
+  - Disk store keyed by `(hash, backend_vendor, generation,
+    compiler_version, kind)`. Atomic write-to-temp+rename.
+  - In-memory LRU (bounded, default cap 64) above the disk store.
+  - `Listener::with_shader_cache(Arc<ShaderCache>)` builder-style
+    wiring. `Session::handle_shader_resolve` consults the cache and
+    emits real `Hit { shader_id }` so subsequent draws can
+    reference it; `handle_shader_upload` writes post-validation.
+  - End-to-end test `shader_cache_warm_path_hit_after_upload`
+    proves a fresh connection resolves what a prior connection
+    uploaded.
+  - **Eventual home: Tessera CAS.** API is shaped so the Tessera-
+    backed implementation swaps in mechanically.
+- ⚠️ atrium-pkg `shader-precompile` install-hook — **pending**.
+- ⚠️ Vulkan triangle / textured-cube demo — **pending**.
+
+Exit criteria (unchanged):
 - Vulkan triangle demo + textured cube demo run at ≥30 fps on
   macOS-HVF host, composited by frescod.
-- `atrium-pkg install` of a third-party SPIR-V-shipping package
-  populates Tessera; subsequent `atrium-pkg run` shows
+- `atrium-pkg install` populates Tessera; `atrium-pkg run` shows
   `OP_GPU_SHADER_RESOLVE` hits with no SHADER_UPLOAD traffic.
-- `docs/spec/atrium-pkg.md` gains a "Shader precompile install hook"
-  section.
+- ✅ `docs/spec/atrium-pkg.md` §3.6.5 documents the
+  shader-precompile install step.
 
 ### Phase 3 — native HW backend (D5+, deferred)
 
@@ -1185,6 +1264,136 @@ vocabulary (§3) referencing pre-validated IDs.
 
 This is what makes fire-and-forget IDs safe: by the time an ID appears
 on the wire, the host knows it's well-formed.
+
+### 11.1. Bounded-loop policy: strict literal bounds
+
+Every `OpLoopMerge` in a SPIR-V module must declare a literal
+iteration bound via one of the `LoopControl` bits that carries an
+operand: `MinIterations`, `MaxIterations`, `IterationMultiple`,
+`PeelCount`, `PartialCount`, `DependencyLength`. The validator
+caps annotated values at `MAX_LOOP_ITERATIONS` (1 << 24).
+
+What's rejected:
+- `LoopControl = 0` (no annotation)
+- `LoopControl = Unroll` alone (no literal)
+- `LoopControl = DontUnroll` alone (no literal)
+
+**Why strict.** A single, uniform rule — every loop has a literal
+bound — is easier to reason about than a tiered "Unroll counts but
+only if the backend refuses to fall back" policy. The earlier
+permissive design shifted trust onto every backend's codegen path
+to enforce the no-runtime-fallback rule; strict mode eliminates
+that obligation.
+
+The cost is that bare slangc / glslang / dxc output does NOT pass
+the validator directly — producers don't reliably emit literal
+bounds. Atrium handles this in the toolchain: see §11.2.
+
+### 11.2. The `annotate` step: closing the producer gap
+
+slangc 2026.8 silently drops `[MaxIters(N)]` source annotations
+(verified upstream; tracked as a producer-side bug). glslang and
+dxc behave similarly for many patterns. To bridge the gap,
+Atrium's shader-tool ships an `annotate` subcommand that walks a
+SPIR-V binary and injects `MaxIterations | <literal>` into every
+`OpLoopMerge` whose `LoopControl` lacks a literal-bearing bit:
+
+```sh
+aqueduct-shader-tool annotate --max-iters 65536 input.spv
+```
+
+Properties:
+- **Idempotent**: loops that already carry a literal-bearing bit
+  (e.g. emitted by a future slangc release that fixes the bug,
+  or by an upstream `spirv-opt` pass) are skipped.
+- **Preserves `Unroll`**: the bit stays in the mask so drivers
+  continue to unroll where appropriate. The literal is just
+  additional evidence the validator demands.
+- **In-tree library** (`aqueduct_gpu_host::shader_annotate`):
+  unit-tested, called by `bundles/*/build.sh` after slangc and
+  by atrium-pkg's install hook (§Phase 2.5) before validation.
+
+Atrium pins a real `slangc 2026.8` output corpus
+(`tests::SLANGC_UNROLL_LOOP_SPV`) with two CI-locked properties:
+1. The raw corpus is rejected by the strict-mode validator.
+2. After `annotate → validate`, the corpus passes.
+
+CI catches regressions in either direction — accidental validator
+relaxation, or annotate-step breakage.
+
+### 11.3. Descriptor-binding coverage
+
+Every `OpVariable` declared in a resource storage class must carry
+**both** `DescriptorSet` and `Binding` decorations. The driver's
+descriptor-table lookup is the boundary that contains a shader's
+view of host memory; without explicit slot decorations the driver
+picks slots non-deterministically, opening a descriptor-confusion
+attack vector.
+
+Resource storage classes the validator enforces this on (SPIR-V
+§3.7 StorageClass):
+
+| Code | Name | Used for |
+|---|---|---|
+| `0`  | `UniformConstant` | samplers, images, opaque types |
+| `2`  | `Uniform`         | UBOs |
+| `10` | `AtomicCounter`   | atomic counter buffers |
+| `11` | `Image`           | legacy image load/store |
+| `12` | `StorageBuffer`   | SSBOs (SPV 1.3+) |
+
+Classes deliberately NOT enforced (they're not descriptor-backed):
+`Function` (7), `PushConstant` (9), `Input` (1), `Output` (3),
+`Workgroup` (4), `Private` (6).
+
+The validator is order-tolerant: decorations may appear before or
+after the OpVariable they target. The check runs as a post-pass
+after the single forward walk has collected both sides.
+
+slangc, glslang, and dxc all emit `DescriptorSet` and `Binding`
+for properly-decorated source. Modules failing this check are
+typically hand-crafted attack inputs or compilation bugs.
+
+### 11.4. Entry-point / capability consistency
+
+Every `OpEntryPoint` declares an `ExecutionModel` (Vertex, Fragment,
+GLCompute, etc.). Each model requires a specific `Capability` to be
+declared via `OpCapability` somewhere in the module. The validator
+cross-checks these:
+
+| Execution model | Required capability |
+|---|---|
+| `Vertex` (0)              | `Shader` (1) |
+| `TessellationControl` (1) | `Tessellation` (3) |
+| `TessellationEvaluation` (2) | `Tessellation` (3) |
+| `Geometry` (3)            | `Geometry` (2) |
+| `Fragment` (4)            | `Shader` (1) |
+| `GLCompute` (5)           | `Shader` (1) |
+| `Kernel` (6)              | **forbidden** (OpenCL-style; outside Atrium's Vulkan-shaped sandbox) |
+
+A module with an entry point whose required capability isn't
+declared has driver-undefined behaviour: the driver may silently
+fall back to a model it does support, or it may dispatch the
+intended model on hardware that lacks the feature. Both are
+sandbox-escape vectors. The validator rejects upfront.
+
+`Kernel` execution model is rejected outright, regardless of cap
+declarations. Atrium's sandbox is Vulkan-shaped — compute work
+flows through `GLCompute` entry points and descriptor-bounded
+buffers, not the OpenCL kernel/address-space model.
+
+Modules with no `OpEntryPoint` at all are accepted by the
+validator (library/fragment shaders linked into a full module
+before submission). The cross-check is per-entry-point; absence
+of entry points means nothing to check.
+
+### 11.5. Atrium-shipped bundles
+
+`bundles/atrium-core/build.sh` and `bundles/atrium-text/build.sh`
+both invoke `slangc -target spirv` then
+`aqueduct-shader-tool annotate --max-iters N` (per-kernel `N`
+chosen from a worst-case analysis comment in the build script).
+The resulting SPIR-V passes the strict-mode validator directly
+when the bundle is loaded.
 
 **Vulkan features that the sandbox excludes outright:**
 
@@ -1524,19 +1733,53 @@ above (companion edit to `docs/spec/portcullis.md` §3.2).
 
 ## 16. Companion code locations
 
-When implementation lands:
+Repository layout as of Phase 2.3 (✅ = landed, ⚠️ = skeleton/pending):
 
 ```
-crates/aqueduct-gpu/                  guest + host shared types
-crates/aqueduct-gpu-client/           guest-side client (frescod, ICD)
-crates/aqueduct-gpu-host/             macOS daemon
-crates/atrium-vk-icd/                 Vulkan ICD
-external/wgpu/                        wgpu fork with aqueduct-gpu backend (Phase 1.5?)
-atrium-kmod/atrium_virtio_gpu.c       IOC_GPU_IMPORT_REGION, IOC_GPU_LIST_BACKENDS,
-                                      IOC_SET_CAPS (Phase 2; for gpu.scanout gating)
-docs/spec/aqueduct-gpu.md             this file
-docs/spec/atrium-venus.md             marked superseded, archived
-docs/spec/atrium-pkg.md               extended with shader-precompile hook
-docs/spec/atrium-gpu-abi-v2.md        extended with new ioctls + cap-gating
-docs/spec/portcullis.md               extended with gpu.access + gpu.scanout caps
+aqueduct-gpu/                         ✅ guest + host shared types
+                                         (opcodes, payloads, frame
+                                          encoder/decoder, ids,
+                                          BackendId, GpuVendor)
+aqueduct-gpu-client/                  ✅ guest-side client
+                                         (GpuClient, FrameBuilder,
+                                          IdAllocator, event demux)
+aqueduct-gpu-host/                    ✅ macOS daemon
+   src/backend.rs                     ✅   Backend trait, StubBackend,
+                                            SoftwareBackend
+   src/moltenvk.rs                    ⚠️   MoltenVkBackend skeleton
+                                            (loader/instance/device;
+                                             cmdbuf recording pending)
+   src/software/                      ✅   tiny-skia tier-1 rasteriser
+       renderer.rs                          (rect/path/textured-rect/
+                                             glyph_run)
+   src/shader_validator.rs            ✅   SPIR-V validator (Phase 2.0–2.2:
+                                            structural + policy + DoS
+                                            caps + bounded-loop
+                                            annotation enforcement)
+   src/shader_cache.rs                ✅   warm-path cache (Phase 2.3:
+                                            disk + in-mem LRU; future
+                                            Tessera-backed)
+   src/session.rs                     ✅   per-connection dispatch
+   src/listener.rs                    ✅   accept loop
+   src/resources.rs                   ✅   per-session resource table
+   src/bin/main.rs                    ✅   daemon entry point
+                                          (--backend stub|software|moltenvk)
+fresco-aqueduct-bridge/               ✅ fresco-protocol → FrameOp
+                                         translator
+atrium-vk-icd/                        ⚠️ Vulkan ICD (Phase 2.5+)
+external/wgpu/                        ⚠️ wgpu fork w/ aqueduct-gpu
+                                         backend (Phase 1.5?)
+atrium-kmod/atrium_virtio_gpu.c       ⚠️ IOC_GPU_IMPORT_REGION,
+                                         IOC_GPU_LIST_BACKENDS,
+                                         IOC_SET_CAPS (Phase 1.5 +
+                                         Phase 2 for gpu.scanout
+                                         gating)
+docs/spec/aqueduct-gpu.md             ✅ this file
+docs/spec/atrium-venus.md             ✅ marked superseded, archived
+docs/spec/atrium-pkg.md               ✅ extended with shader-
+                                         precompile hook
+docs/spec/atrium-gpu-abi-v2.md        ⚠️ extended with new ioctls +
+                                         cap-gating
+docs/spec/portcullis.md               ✅ extended with gpu.access +
+                                         gpu.scanout caps
 ```

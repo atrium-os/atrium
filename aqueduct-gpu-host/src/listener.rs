@@ -17,12 +17,17 @@ use aqueduct::Connection;
 
 use crate::backend::Backend;
 use crate::session::Session;
+use crate::shader_cache::ShaderCache;
 
 /// The host endpoint's accept loop.
 pub struct Listener {
     socket_path: PathBuf,
     listener: UnixListener,
     backend: Arc<dyn Backend>,
+    /// Process-wide shader cache shared across sessions. `None` means
+    /// resolves always miss and uploads aren't cached (legacy
+    /// behaviour kept for tests that don't need warm-path).
+    shader_cache: Option<Arc<ShaderCache>>,
 }
 
 impl Listener {
@@ -35,7 +40,16 @@ impl Listener {
         let listener = UnixListener::bind(&socket_path)
             .with_context(|| format!("bind {}", socket_path.display()))?;
         log::info!("listening on {}", socket_path.display());
-        Ok(Self { socket_path, listener, backend })
+        Ok(Self { socket_path, listener, backend, shader_cache: None })
+    }
+
+    /// Attach a shader cache for the warm path. Sessions will
+    /// consult it during `OP_GPU_SHADER_RESOLVE` and populate it
+    /// after successful `OP_GPU_SHADER_UPLOAD` validation. Builder-
+    /// style — call once before `accept_loop`.
+    pub fn with_shader_cache(mut self, cache: Arc<ShaderCache>) -> Self {
+        self.shader_cache = Some(cache);
+        self
     }
 
     /// The socket path the listener is bound to.
@@ -54,11 +68,14 @@ impl Listener {
                     let conn = Connection::wrap(stream)
                         .context("wrap accepted stream")?;
                     let backend = Arc::clone(&self.backend);
+                    let cache = self.shader_cache.clone();
                     log::info!("new client connection");
                     thread::Builder::new()
                         .name("aqueduct-gpu-session".to_string())
                         .spawn(move || {
-                            if let Err(e) = Session::new(conn, backend).run() {
+                            let mut sess = Session::new(conn, backend);
+                            if let Some(c) = cache { sess.set_shader_cache(c); }
+                            if let Err(e) = sess.run() {
                                 log::warn!("session ended with error: {e}");
                             } else {
                                 log::info!("session ended cleanly");

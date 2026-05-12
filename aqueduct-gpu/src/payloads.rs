@@ -193,6 +193,26 @@ pub struct ImageDestroyPayload {
     pub image_id: ResourceId,
 }
 
+/// Inline image write (tier-1 / debug path; see
+/// `OP_GPU_IMAGE_WRITE`'s opcode docstring).
+///
+/// `pixels.len()` must equal `row_pitch × height` for the target
+/// image. The host validates this and surfaces a
+/// `ValidationErr` event on mismatch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageWritePayload {
+    /// Target image.
+    pub image_id: ResourceId,
+    /// Bytes per row of pixels in `pixels`. Equal to
+    /// `width * bytes_per_pixel` for tightly-packed input;
+    /// callers may pad to alignment if needed.
+    pub row_pitch: u32,
+    /// Inline pixel data. The host treats this as RGBA8 if the
+    /// image was created with an RGBA-class format. Other formats
+    /// pass the bytes through unmodified.
+    pub pixels: Vec<u8>,
+}
+
 // ───── Buffers ────────────────────────────────────────────────────
 
 /// Client → server: create a buffer. ID pre-assigned; no response.

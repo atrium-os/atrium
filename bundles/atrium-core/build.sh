@@ -32,6 +32,27 @@ cd "$(dirname "$0")"
 SLANGC="${SLANGC:-slangc}"
 SPIRV_VAL="${SPIRV_VAL:-spirv-val}"
 
+# Post-process step: aqueduct-gpu's sandbox (aqueduct-gpu.md §11.1)
+# runs in strict mode — every OpLoopMerge must carry a literal
+# MaxIterations bound. slangc 2026.8 doesn't emit one from
+# [MaxIters(N)]. The annotate tool injects bounds before validation.
+#
+# atrium-core happens to fully-unroll all its loops at slangc
+# compile time today, so this is a no-op here — but we wire it in
+# anyway for forward-compat: any future runtime loop here gets
+# annotated automatically.
+ANNOTATE_TOOL="${AQUEDUCT_SHADER_TOOL:-aqueduct-shader-tool}"
+if ! command -v "$ANNOTATE_TOOL" >/dev/null; then
+    HOST_TOOL="$(dirname "$0")/../../aqueduct-gpu-host/target/debug/aqueduct-shader-tool"
+    if [ -x "$HOST_TOOL" ]; then
+        ANNOTATE_TOOL="$HOST_TOOL"
+    else
+        echo "warning: aqueduct-shader-tool not found; runtime-loop shaders won't pass" >&2
+        echo "         the validator. Build aqueduct-gpu-host or set AQUEDUCT_SHADER_TOOL." >&2
+        ANNOTATE_TOOL=""
+    fi
+fi
+
 if ! command -v "$SLANGC" >/dev/null; then
     if [ -x "$HOME/src/slang-bin/bin/slangc" ]; then
         SLANGC="$HOME/src/slang-bin/bin/slangc"
@@ -56,9 +77,13 @@ compile_pipe() {
 
 compile_compute() {
     src="$1"
+    max_iters="${2:-4096}"           # default bound for any runtime loop
     base="${src%.slang}"
-    echo "  $src → ${base}.comp.spv"
+    echo "  $src → ${base}.comp.spv  [MaxIters=$max_iters]"
     "$SLANGC" "$src" -target spirv -entry comp_main -stage compute -o "${base}.comp.spv"
+    if [ -n "$ANNOTATE_TOOL" ]; then
+        "$ANNOTATE_TOOL" annotate --max-iters "$max_iters" "${base}.comp.spv"
+    fi
     if command -v "$SPIRV_VAL" >/dev/null; then
         "$SPIRV_VAL" "${base}.comp.spv"
     fi

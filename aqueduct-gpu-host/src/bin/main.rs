@@ -21,7 +21,9 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 
-use aqueduct_gpu_host::{Backend, Listener, SoftwareBackend, StubBackend};
+use aqueduct_gpu_host::{
+    Backend, Listener, MoltenVkBackend, MoltenVkError, SoftwareBackend, StubBackend,
+};
 
 const DEFAULT_SOCKET: &str = "/tmp/aqueduct-gpu.sock";
 
@@ -91,10 +93,17 @@ fn make_backend(kind: BackendKind) -> Result<Arc<dyn Backend>> {
     match kind {
         BackendKind::Stub     => Ok(Arc::new(StubBackend::new())),
         BackendKind::Software => Ok(Arc::new(SoftwareBackend::new())),
-        BackendKind::MoltenVk => Err(anyhow!(
-            "--backend moltenvk not yet implemented (lands in Phase 1.3b); \
-             try --backend stub or --backend software"
-        )),
+        BackendKind::MoltenVk => match MoltenVkBackend::new() {
+            Ok(b) => {
+                log::info!("MoltenVK backend: {}", b.device_summary());
+                Ok(Arc::new(b))
+            }
+            Err(MoltenVkError::LoaderUnavailable(e)) => {
+                log::warn!("MoltenVK loader unavailable: {e}; falling back to SoftwareBackend");
+                Ok(Arc::new(SoftwareBackend::new()))
+            }
+            Err(e) => Err(anyhow!("MoltenVK init failed: {e}")),
+        },
     }
 }
 

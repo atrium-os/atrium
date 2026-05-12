@@ -157,6 +157,23 @@ impl GpuClient {
         self.send(OP_GPU_IMAGE_DESTROY, 0, &req)
     }
 
+    /// Inline upload of pixel data to an image. Fire-and-forget; the
+    /// host validates `pixels.len() == row_pitch * height` and surfaces
+    /// failures via [`recv_event`](Self::recv_event) as `ValidationErr`.
+    ///
+    /// This is the tier-1 / debug-path upload route — small textures
+    /// and glyph-atlas regions. Large textures should flow through
+    /// buffer-staged copies (Phase 1.5+).
+    pub fn write_image(
+        &mut self,
+        image_id: ResourceId,
+        row_pitch: u32,
+        pixels: Vec<u8>,
+    ) -> GpuClientResult<()> {
+        let req = ImageWritePayload { image_id, row_pitch, pixels };
+        self.send(OP_GPU_IMAGE_WRITE, 0, &req)
+    }
+
     /// Create a buffer. ID is pre-assigned. Returns it.
     pub fn create_buffer(&mut self, mut params: BufferCreatePayload) -> GpuClientResult<ResourceId> {
         params.buffer_id = self.alloc_id()?;

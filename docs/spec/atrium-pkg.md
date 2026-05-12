@@ -183,6 +183,84 @@ installed_at   = "2026-05-08T12:34:56Z"
 provenance     = "freebsd_pkg"
 ```
 
+### 3.6.5 Shader precompile (V2+; aqueduct-gpu §9 Phase 2)
+
+For packages shipping GPU shaders (any `.spv` files under
+`content/`), `atrium-pkg install` runs a one-shot precompile pass
+before §3.7. This is the warm-path side of the aqueduct-gpu
+`OP_GPU_SHADER_RESOLVE` / `OP_GPU_SHADER_UPLOAD` two-phase wire
+(see `docs/spec/aqueduct-gpu.md` §4.1–4.2): by validating shaders
+and populating the cache at install time, app startup pays zero
+SPIR-V upload round-trips.
+
+Atrium-shipped packages author shaders in Slang (Khronos-stewarded,
+Apache-2.0, multi-backend emit) — see
+[`docs/LANGUAGE-POLICY.md`](../LANGUAGE-POLICY.md#shader-source-language).
+The packaging step still ships SPIR-V (the wire format), so this
+hook is source-language-agnostic: any compiler that emits valid
+SPIR-V (slangc, glslang, dxc, naga) works, and the per-file validator
+verdict is the same.
+
+What runs (reference implementation:
+`aqueduct-gpu-host/scripts/atrium-pkg-precompile-hook.sh`):
+
+```sh
+# 1. Compile  — run bundle's build.sh if present (slangc + annotate)
+# 2. Verify   — manifest schema + every referenced shader
+aqueduct-shader-tool verify-bundle <pkg-staging>/content/
+
+# 3. Cache populate (per detected backend)
+aqueduct-shader-tool precompile \
+    --cache  /var/db/atrium/shaders/    \
+    --backend <detected-host-vendor>    \
+    --generation <detected-generation>  \
+    --compiler-version <current>        \
+    <pkg-staging>/content/
+```
+
+Atomicity: verify must succeed before precompile runs. A validator
+rejection from verify aborts the install before the cache is
+touched.
+
+Per-file outcomes:
+- **OK** — validator (`aqueduct_gpu_host::shader_validator`) accepted
+  the bytes. Inserted into the cache keyed by `(SHA-256(bytes),
+  backend, generation, compiler_version, SpirV)`. A subsequent
+  `OP_GPU_SHADER_RESOLVE` from the running app hits warm.
+- **REJECTED** — validator rejected. The install **aborts** with a
+  per-file diagnostic; CAS-ingested content stays (harmless), no
+  manifest is dropped. Rejection reasons include: forbidden
+  capability (e.g. `PhysicalStorageBufferAddresses`), unbounded
+  loop, oversized module, ray-tracing / mesh-shader features the
+  sandbox doesn't support yet, etc.
+
+The precompile pass runs **inside a Portcullis jail** with:
+- Capability `cap.fs:/var/db/atrium/shaders` (writable, for cache
+  insert).
+- Capability `cap.cpu_time:60s` (precompile is bounded; if it
+  spins, jaild SIGKILLs).
+- No network. No FS access outside the staging directory and
+  cache directory.
+
+On hosts where multiple backends are present (e.g. MoltenVK on
+macOS-HVF for dev, plus Software fallback), precompile runs once
+per `(vendor, generation)` pair the host advertises via
+`IOC_GPU_LIST_BACKENDS`. Cache files are vendor-keyed so they
+don't collide.
+
+V2 limitations:
+- Precompile keeps shaders in their original SPIR-V form. Phase 3
+  swaps in **backend-bytecode** translation (SPIR-V → MTLLibrary
+  for MoltenVK, SPIR-V → AMDGPU ISA via atrium-mesa for the AMD
+  native path) and the cache stores the translated artifact. The
+  cache key already includes `compiler_version`, so the schema
+  doesn't change.
+- Tessera-backed cache lives at `/var/db/atrium/shaders/`
+  for V2. The aqueduct-gpu host daemon's `ShaderCache::open` path
+  points at this directory; the daemon and the package installer
+  share the cache layer. Phase 3 migrates this to a Tessera
+  prefix, eliminating the bespoke disk layout.
+
 ### 3.7 First launch
 
 `atrium-pkg install` does NOT start the service. The operator

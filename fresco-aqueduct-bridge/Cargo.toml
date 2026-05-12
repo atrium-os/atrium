@@ -1,0 +1,39 @@
+[package]
+name = "fresco-aqueduct-bridge"
+version = "0.1.0"
+edition = "2021"
+description = "Translation layer: fresco-protocol scene nodes → aqueduct-gpu frame ops"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Where this lives in the architecture:
+#
+#   frescod (scene server)
+#       │ owns fresco-protocol parsing + scene graph
+#       ▼
+#   fresco-aqueduct-bridge   ← this crate
+#       │ translates per-node Params → FrameOp records
+#       ▼
+#   aqueduct-gpu-client
+#       │ wraps the wire protocol
+#       ▼
+#   aqueduct-gpu-host (tier-1 SW, tier-3 HW)
+#
+# The bridge is the seam where frescod's renderer becomes wire-only.
+# It depends on BOTH ends but neither end depends on it.
+
+[dependencies]
+fresco-protocol     = { path = "../fresco-protocol" }
+aqueduct-gpu        = { path = "../aqueduct-gpu" }
+aqueduct-gpu-client = { path = "../aqueduct-gpu-client" }
+
+[dev-dependencies]
+aqueduct           = { path = "../aqueduct" }
+aqueduct-gpu-host  = { path = "../aqueduct-gpu-host" }
+# Text shaping + rasterization for examples/demo.rs (rustybuzz +
+# swash via fresco-text). The demo renders a real string into the
+# tier-1 SW renderer via glyph_run, end-to-end.
+fresco-text        = { path = "../fresco-text" }
+# PNG encoding for examples/demo.rs. Pulled in transitively via
+# aqueduct-gpu-host → tiny-skia, but declared here for explicitness.
+png                = "0.17"

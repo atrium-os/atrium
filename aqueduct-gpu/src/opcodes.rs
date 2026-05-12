@@ -42,6 +42,24 @@ pub const OP_GPU_MEMORY_DESTROY:  u16 = 0x0101;
 pub const OP_GPU_IMAGE_CREATE:    u16 = 0x0110;
 /// Destroy an image.
 pub const OP_GPU_IMAGE_DESTROY:   u16 = 0x0111;
+/// Write pixel data directly into an image. The full payload
+/// carries the bytes inline — there's no staging buffer.
+///
+/// **Tier-1 / debug path only.** Real GPU backends prefer
+/// `OP_GPU_BUFFER_CREATE` + `FOP_COPY_BUF_TO_IMG` because the
+/// staging buffer can be GPU-resident and the upload can pipeline
+/// with rendering. This op carries the pixels in the aqueduct
+/// envelope itself, which:
+///
+/// - works without Phase 1.5 kmod shared-memory support
+/// - is bandwidth-inefficient for large textures
+/// - is sufficient for tier-1 SW rendering and for small atlases
+///   (icons, glyph atlases ≤ 16 KiB) where the buffer-staging
+///   overhead would dominate
+///
+/// Fire-and-forget; failures surface as `OP_GPU_VALIDATION_ERR`
+/// (image not found, byte count mismatch, etc.).
+pub const OP_GPU_IMAGE_WRITE:     u16 = 0x0112;
 
 /// Allocate a buffer (vertex / index / uniform / storage).
 pub const OP_GPU_BUFFER_CREATE:   u16 = 0x0120;

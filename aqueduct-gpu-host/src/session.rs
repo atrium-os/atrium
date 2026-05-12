@@ -17,6 +17,7 @@ use crate::resources::{
     BufferRecord, FenceRecord, ImageRecord, MemoryRecord, PipelineRecord,
     ResourceTable, SamplerRecord, ShaderRecord,
 };
+use crate::shader_cache::{CacheKey, LookupResult, ShaderCache};
 
 /// One connection's worth of state. Constructed by the listener when
 /// a guest connects.
@@ -30,6 +31,13 @@ pub struct Session {
     handshake_done: bool,
     /// Monotonic timeline observed from the client's submits.
     last_timeline: u64,
+    /// Optional warm-path shader cache. When `None`, every resolve
+    /// misses and uploads aren't persisted; when `Some`, the cache
+    /// is the source of truth.
+    shader_cache: Option<Arc<ShaderCache>>,
+    /// Compiler-version tag for cache keys. Currently 0; bump in
+    /// lockstep with backend-shader-translator changes.
+    compiler_version: u32,
 }
 
 impl Session {
@@ -41,7 +49,16 @@ impl Session {
             backend,
             handshake_done: false,
             last_timeline: 0,
+            shader_cache: None,
+            compiler_version: 0,
         }
+    }
+
+    /// Attach a process-wide shader cache. Called by the listener
+    /// before [`run`](Self::run) when the daemon was configured
+    /// with one.
+    pub fn set_shader_cache(&mut self, cache: Arc<ShaderCache>) {
+        self.shader_cache = Some(cache);
     }
 
     /// Run the dispatch loop until the client disconnects or an
@@ -88,6 +105,7 @@ impl Session {
             OP_GPU_MEMORY_DESTROY     => self.handle_memory_destroy(m),
             OP_GPU_IMAGE_CREATE       => self.handle_image_create(m),
             OP_GPU_IMAGE_DESTROY      => self.handle_image_destroy(m),
+            OP_GPU_IMAGE_WRITE        => self.handle_image_write(m),
             OP_GPU_BUFFER_CREATE      => self.handle_buffer_create(m),
             OP_GPU_BUFFER_DESTROY     => self.handle_buffer_destroy(m),
             OP_GPU_SAMPLER_CREATE     => self.handle_sampler_create(m),
@@ -179,6 +197,23 @@ impl Session {
         Ok(())
     }
 
+    fn handle_image_write(&mut self, m: Message) -> Result<()> {
+        let req: ImageWritePayload = postcard::from_bytes(&m.payload)?;
+        if self.table.get_image(req.image_id).is_none() {
+            self.send_validation_err(
+                OP_GPU_IMAGE_WRITE, Some(req.image_id),
+                "image not created on this session",
+            )?;
+            return Ok(());
+        }
+        if let Err(diag) = self.backend.image_write_pixels(
+            req.image_id, req.row_pitch, &req.pixels,
+        ) {
+            self.send_validation_err(OP_GPU_IMAGE_WRITE, Some(req.image_id), &diag)?;
+        }
+        Ok(())
+    }
+
     fn handle_buffer_create(&mut self, m: Message) -> Result<()> {
         let req: BufferCreatePayload = postcard::from_bytes(&m.payload)?;
         if let Err(why) = ResourceTable::validate_namespace(req.buffer_id) {
@@ -215,20 +250,88 @@ impl Session {
 
     fn handle_shader_resolve(&mut self, m: Message) -> Result<()> {
         let req: ShaderResolvePayload = postcard::from_bytes(&m.payload)?;
-        // Stub backend: every shader is a Miss. Real backends look
-        // up `(hash, backend, version)` in Tessera CAS.
+
+        let (status, shader_id) = match &self.shader_cache {
+            None => (ShaderResolveStatus::Miss, None),
+            Some(cache) => {
+                let key = CacheKey {
+                    bytecode_hash: req.bytecode_hash,
+                    backend: req.backend,
+                    compiler_version: self.compiler_version,
+                    kind: req.kind,
+                };
+                match cache.lookup(&key) {
+                    LookupResult::Hit(_) => {
+                        // Bytes are cached; materialise a resource-id
+                        // so the client can reference the shader.
+                        // ID derivation: lower 24 bits of the hash.
+                        let local = ((req.bytecode_hash[0] as u32) << 16)
+                            | ((req.bytecode_hash[1] as u32) << 8)
+                            |  (req.bytecode_hash[2] as u32);
+                        let id = aqueduct_gpu::ids::ResourceId::new(
+                            aqueduct_gpu::ids::IdNamespace::IcdRuntime,
+                            local | 0x1,
+                        );
+                        self.table.insert_shader(id, ShaderRecord {
+                            bytecode_hash: req.bytecode_hash,
+                        });
+                        (ShaderResolveStatus::Hit, Some(id))
+                    }
+                    LookupResult::Miss => (ShaderResolveStatus::Miss, None),
+                    LookupResult::Error(e) => {
+                        log::warn!("shader cache lookup error: {e}");
+                        (ShaderResolveStatus::Miss, None)
+                    }
+                }
+            }
+        };
+
         let resp = ShaderResolveResponse {
             bytecode_hash: req.bytecode_hash,
-            status: ShaderResolveStatus::Miss,
-            shader_id: None,
+            status,
+            shader_id,
         };
         self.send_response(OP_GPU_SHADER_RESOLVE, &resp)
     }
 
     fn handle_shader_upload(&mut self, m: Message) -> Result<()> {
         let req: ShaderUploadPayload = postcard::from_bytes(&m.payload)?;
-        // Stub backend: accept everything. Real backends run
-        // spirv-val + bounded-loop analysis + backend codegen.
+
+        // Phase 2.0 gate: structural + policy validation. Applies to
+        // SPIR-V only; NIR bypasses (atrium-mesa emits trusted NIR).
+        if matches!(req.kind, ShaderKind::SpirV) {
+            if let Err(e) = crate::shader_validator::validate_spirv(&req.bytecode) {
+                let diag = format!("shader validator rejected upload: {e}");
+                log::warn!("{diag}");
+                let resp = ShaderUploadResponse {
+                    bytecode_hash: req.bytecode_hash,
+                    shader_id: None,
+                    diagnostic: diag,
+                };
+                return self.send_response(OP_GPU_SHADER_UPLOAD, &resp);
+            }
+        }
+
+        // Stub backend: accept everything that passed validation.
+        // Real backends additionally run spirv-val (Phase 2.4) +
+        // backend codegen. After validation, persist into the
+        // shader cache so a future RESOLVE with the same key Hits.
+        if let Some(cache) = &self.shader_cache {
+            let key = CacheKey {
+                bytecode_hash: req.bytecode_hash,
+                backend: req.backend,
+                compiler_version: self.compiler_version,
+                kind: req.kind,
+            };
+            if let Err(e) = cache.insert(&key, &req.bytecode) {
+                // Cache write failure is non-fatal — the upload still
+                // succeeded for this session; only the warm-path
+                // optimisation degrades.
+                log::warn!("shader cache insert failed (warm path disabled for {:?}): {e}",
+                           req.bytecode_hash);
+            }
+        }
+
         let shader_id = aqueduct_gpu::ids::ResourceId::new(
             aqueduct_gpu::ids::IdNamespace::IcdRuntime,
             (req.bytecode_hash[0] as u32) << 16 | (req.bytecode_hash[1] as u32) << 8 | 1,

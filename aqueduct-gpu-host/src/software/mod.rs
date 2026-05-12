@@ -33,8 +33,9 @@
 pub mod renderer;
 
 pub use renderer::{
-    BeginRenderPassBody, PathCommand, PathFillRule, PathOpParams,
-    RectOpParams, RendererError, TinySkiaRenderer,
+    BeginRenderPassBody, GlyphInstance, GlyphRunParams, PathCommand,
+    PathFillRule, PathOpParams, RectOpParams, RendererError,
+    TexturedRectOpParams, TinySkiaRenderer,
 };
 
 // Built-in pipeline local-IDs the renderer recognises.

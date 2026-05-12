@@ -32,6 +32,26 @@ cd "$(dirname "$0")"
 SLANGC="${SLANGC:-slangc}"
 SPIRV_VAL="${SPIRV_VAL:-spirv-val}"
 
+# Post-process step: slangc 2026.8 does NOT emit MaxIterations from
+# `[MaxIters]` annotations (silently dropped). Atrium's universal
+# sandbox (aqueduct-gpu.md §11.1) requires every OpLoopMerge to
+# carry a termination promise — `Unroll` for [unroll] loops, or
+# `MaxIterations | N` for genuine runtime loops. We patch the SPIR-V
+# binary post-emit to inject the bound. Each compute shader's
+# `MAX_ITERS` is set per call below based on a source-level analysis
+# of the worst-case bound.
+ANNOTATE_TOOL="${AQUEDUCT_SHADER_TOOL:-aqueduct-shader-tool}"
+if ! command -v "$ANNOTATE_TOOL" >/dev/null; then
+    HOST_TOOL="$(dirname "$0")/../../aqueduct-gpu-host/target/debug/aqueduct-shader-tool"
+    if [ -x "$HOST_TOOL" ]; then
+        ANNOTATE_TOOL="$HOST_TOOL"
+    else
+        echo "warning: aqueduct-shader-tool not found; runtime-loop shaders won't pass" >&2
+        echo "         the validator. Build aqueduct-gpu-host or set AQUEDUCT_SHADER_TOOL." >&2
+        ANNOTATE_TOOL=""
+    fi
+fi
+
 if ! command -v "$SLANGC" >/dev/null; then
     if [ -x "$HOME/src/slang-bin/bin/slangc" ]; then
         SLANGC="$HOME/src/slang-bin/bin/slangc"
@@ -56,9 +76,13 @@ compile_pipe() {
 
 compile_compute() {
     src="$1"
+    max_iters="$2"               # MaxIterations bound for runtime loops
     base="${src%.slang}"
-    echo "  $src → ${base}.comp.spv"
+    echo "  $src → ${base}.comp.spv  [MaxIters=$max_iters]"
     "$SLANGC" "$src" -target spirv -entry comp_main -stage compute -o "${base}.comp.spv"
+    if [ -n "$ANNOTATE_TOOL" ] && [ "$max_iters" -gt 0 ]; then
+        "$ANNOTATE_TOOL" annotate --max-iters "$max_iters" "${base}.comp.spv"
+    fi
     if command -v "$SPIRV_VAL" >/dev/null; then
         "$SPIRV_VAL" "${base}.comp.spv"
     fi
@@ -71,9 +95,10 @@ for f in pipelines/*.slang; do
 done
 
 echo "compiling compute kernels:"
-for f in compute/*.slang; do
-    [ -e "$f" ] || continue
-    compile_compute "$f"
-done
+# Per-kernel MaxIterations bounds. Worst-case glyphs per shaped run
+# is bounded by the wire (a single OP_GPU_SUBMIT_FRAME's command
+# stream caps at MAX_FRAME_BYTES; a glyph_run header + N×24-byte
+# instances at 1 MiB ÷ 24 ≈ 43K). 65536 is conservative headroom.
+compile_compute "compute/op_glyph_run.slang" 65536
 
 echo "ok — all .spv built and validated"
