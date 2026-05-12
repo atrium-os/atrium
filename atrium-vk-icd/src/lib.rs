@@ -881,6 +881,34 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkCommandBuffer, *const f32), FnVoidPtr,
             >(vkCmdSetBlendConstants)),
+        "vkCmdClearColorImage" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u64, u32, *const c_void, u32, *const c_void), FnVoidPtr,
+            >(vkCmdClearColorImage)),
+        "vkCmdClearDepthStencilImage" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u64, u32, *const c_void, u32, *const c_void), FnVoidPtr,
+            >(vkCmdClearDepthStencilImage)),
+        "vkCmdClearAttachments" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u32, *const c_void, u32, *const c_void), FnVoidPtr,
+            >(vkCmdClearAttachments)),
+        "vkCmdCopyImage" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u64, u32, u64, u32, u32, *const c_void), FnVoidPtr,
+            >(vkCmdCopyImage)),
+        "vkCmdBlitImage" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u64, u32, u64, u32, u32, *const c_void, u32), FnVoidPtr,
+            >(vkCmdBlitImage)),
+        "vkCmdResolveImage" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u64, u32, u64, u32, u32, *const c_void), FnVoidPtr,
+            >(vkCmdResolveImage)),
+        "vkCmdCopyImageToBuffer" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u64, u32, u64, u32, *const c_void), FnVoidPtr,
+            >(vkCmdCopyImageToBuffer)),
         _ => None,
     }
 }
@@ -2999,6 +3027,167 @@ pub unsafe extern "C" fn vkCmdSetBlendConstants(
     _command_buffer:    VkCommandBuffer,
     _p_blend_constants: *const f32, /* [f32; 4] */
 ) {}
+
+/// Helper: resolve a VkImage u64 to its daemon-side ResourceId.
+#[inline]
+unsafe fn resolve_image(
+    cb: &AtriumCommandBuffer, handle: u64,
+) -> aqueduct_gpu::ids::ResourceId {
+    if cb.device.is_null() { return aqueduct_gpu::ids::ResourceId(0); }
+    let dev = &*(cb.device as *const AtriumDevice);
+    dev.images.lock().ok()
+        .and_then(|m| m.get(&handle).and_then(|x| x.image_id))
+        .unwrap_or(aqueduct_gpu::ids::ResourceId(0))
+}
+
+/// `vkCmdClearColorImage` — no FrameOp counterpart today; the
+/// renderer's clear-color path is the begin-renderpass clear.
+/// Recorded as a sentinel Blit with src=dst and a marker body
+/// so the host can decline gracefully. Future protocol revision
+/// adds a dedicated ClearColorImage opcode.
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdClearColorImage(
+    _command_buffer: VkCommandBuffer,
+    _image:          u64,
+    _image_layout:   u32,
+    _p_color:        *const c_void,
+    _range_count:    u32,
+    _p_ranges:       *const c_void,
+) {}
+
+/// `vkCmdClearDepthStencilImage` — same shape as ClearColorImage;
+/// no-op today (depth-stencil targets aren't in the tier-1 renderer).
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdClearDepthStencilImage(
+    _command_buffer:    VkCommandBuffer,
+    _image:             u64,
+    _image_layout:      u32,
+    _p_depth_stencil:   *const c_void,
+    _range_count:       u32,
+    _p_ranges:          *const c_void,
+) {}
+
+/// `vkCmdClearAttachments` — mid-render-pass clear. No FrameOp
+/// counterpart; no-op today. Real apps that depend on this for
+/// per-attachment clears would re-issue a BeginRenderPass with
+/// the desired clear value to achieve the same effect.
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdClearAttachments(
+    _command_buffer:    VkCommandBuffer,
+    _attachment_count:  u32,
+    _p_attachments:     *const c_void,
+    _rect_count:        u32,
+    _p_rects:           *const c_void,
+) {}
+
+/// `vkCmdCopyImage` — image-to-image region copy.
+/// Body: src_image_id u32 + dst_image_id u32 + src_layout u32 +
+/// dst_layout u32 + region_count u32 + per-region 68 B (VkImageCopy)
+/// = 24 B header + 68 B × N.
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdCopyImage(
+    command_buffer:  VkCommandBuffer,
+    src_image:       u64,
+    src_image_layout: u32,
+    dst_image:       u64,
+    dst_image_layout: u32,
+    region_count:    u32,
+    p_regions:       *const c_void,
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    let src_id = resolve_image(cb, src_image).raw();
+    let dst_id = resolve_image(cb, dst_image).raw();
+    let mut body = Vec::with_capacity(24 + (region_count as usize) * 68);
+    body.extend_from_slice(&src_id.to_le_bytes());
+    body.extend_from_slice(&dst_id.to_le_bytes());
+    body.extend_from_slice(&src_image_layout.to_le_bytes());
+    body.extend_from_slice(&dst_image_layout.to_le_bytes());
+    body.extend_from_slice(&region_count.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes()); // _pad to 24 B
+    if !p_regions.is_null() {
+        let rb = p_regions as *const u8;
+        for i in 0..region_count {
+            body.extend_from_slice(std::slice::from_raw_parts(rb.add(68 * i as usize), 68));
+        }
+    }
+    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::Blit, &body);
+}
+
+/// `vkCmdBlitImage` — scaled image-to-image copy with filter.
+/// Body: src_image_id u32 + dst_image_id u32 + src_layout u32 +
+/// dst_layout u32 + filter u32 + region_count u32 + per-region
+/// 80 B (VkImageBlit). 24 B header + 80 B × N.
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdBlitImage(
+    command_buffer:  VkCommandBuffer,
+    src_image:       u64,
+    src_image_layout: u32,
+    dst_image:       u64,
+    dst_image_layout: u32,
+    region_count:    u32,
+    p_regions:       *const c_void,
+    filter:          u32, /* VkFilter */
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    let src_id = resolve_image(cb, src_image).raw();
+    let dst_id = resolve_image(cb, dst_image).raw();
+    let mut body = Vec::with_capacity(24 + (region_count as usize) * 80);
+    body.extend_from_slice(&src_id.to_le_bytes());
+    body.extend_from_slice(&dst_id.to_le_bytes());
+    body.extend_from_slice(&src_image_layout.to_le_bytes());
+    body.extend_from_slice(&dst_image_layout.to_le_bytes());
+    body.extend_from_slice(&filter.to_le_bytes());
+    body.extend_from_slice(&region_count.to_le_bytes());
+    if !p_regions.is_null() {
+        let rb = p_regions as *const u8;
+        for i in 0..region_count {
+            body.extend_from_slice(std::slice::from_raw_parts(rb.add(80 * i as usize), 80));
+        }
+    }
+    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::Blit, &body);
+}
+
+/// `vkCmdResolveImage` — MSAA resolve. Tier-1 software doesn't
+/// support MSAA; no-op.
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdResolveImage(
+    _command_buffer:  VkCommandBuffer,
+    _src_image:       u64,
+    _src_image_layout: u32,
+    _dst_image:       u64,
+    _dst_image_layout: u32,
+    _region_count:    u32,
+    _p_regions:       *const c_void,
+) {}
+
+/// `vkCmdCopyImageToBuffer` — image readback. Body:
+/// src_image_id u32 + dst_buffer_id u32 + src_layout u32 +
+/// region_count u32 + per-region 56 B (VkBufferImageCopy).
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdCopyImageToBuffer(
+    command_buffer:  VkCommandBuffer,
+    src_image:       u64,
+    src_image_layout: u32,
+    dst_buffer:      u64,
+    region_count:    u32,
+    p_regions:       *const c_void,
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    let src_id = resolve_image(cb, src_image).raw();
+    let dst_id = resolve_buffer(cb, dst_buffer).raw();
+    let mut body = Vec::with_capacity(16 + (region_count as usize) * 56);
+    body.extend_from_slice(&src_id.to_le_bytes());
+    body.extend_from_slice(&dst_id.to_le_bytes());
+    body.extend_from_slice(&src_image_layout.to_le_bytes());
+    body.extend_from_slice(&region_count.to_le_bytes());
+    if !p_regions.is_null() {
+        let rb = p_regions as *const u8;
+        for i in 0..region_count {
+            body.extend_from_slice(std::slice::from_raw_parts(rb.add(64 * i as usize), 56));
+        }
+    }
+    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::CopyImgToBuf, &body);
+}
 
 /// `vkCreateCommandPool` — allocate a non-dispatchable
 /// VkCommandPool handle. We ignore the create-info (queue family,
