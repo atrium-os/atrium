@@ -1224,6 +1224,112 @@ pub unsafe extern "C" fn vkGetPhysicalDeviceProperties(
     props.device_id      = pd.backend_generation as u32;
     props.device_type    = ash::vk::PhysicalDeviceType::VIRTUAL_GPU;
 
+    // ── Limits ──────────────────────────────────────────────────
+    //
+    // We fill the "Required Limits" set from the Vk 1.3 spec —
+    // values an app is allowed to assume without inspecting
+    // limits at all. Apps that DO inspect limits would otherwise
+    // bail when they see e.g. maxImageDimension2D = 0.
+    //
+    // Tier-1 (tiny-skia) caps at 16K×16K (backend.rs MAX_DIM),
+    // which matches the Vulkan minimum-max. Sample counts are
+    // SAMPLE_COUNT_1_BIT only — tier-1 is non-MSAA.
+    let sc1 = ash::vk::SampleCountFlags::TYPE_1;
+    let lim = &mut props.limits;
+    lim.max_image_dimension1_d                 = 16384;
+    lim.max_image_dimension2_d                 = 16384;
+    lim.max_image_dimension3_d                 = 2048;
+    lim.max_image_dimension_cube               = 16384;
+    lim.max_image_array_layers                 = 256;
+    lim.max_texel_buffer_elements              = 65536;
+    lim.max_uniform_buffer_range               = 16384;
+    lim.max_storage_buffer_range               = 128 * 1024 * 1024;
+    lim.max_push_constants_size                = 128;
+    lim.max_memory_allocation_count            = 4096;
+    lim.max_sampler_allocation_count           = 4000;
+    lim.buffer_image_granularity               = 1;
+    lim.sparse_address_space_size              = 0;
+    lim.max_bound_descriptor_sets              = 4;
+    lim.max_per_stage_descriptor_samplers      = 16;
+    lim.max_per_stage_descriptor_uniform_buffers = 12;
+    lim.max_per_stage_descriptor_storage_buffers = 4;
+    lim.max_per_stage_descriptor_sampled_images  = 16;
+    lim.max_per_stage_descriptor_storage_images  = 4;
+    lim.max_per_stage_descriptor_input_attachments = 4;
+    lim.max_per_stage_resources                = 128;
+    lim.max_descriptor_set_samplers            = 96;
+    lim.max_descriptor_set_uniform_buffers     = 72;
+    lim.max_descriptor_set_uniform_buffers_dynamic = 8;
+    lim.max_descriptor_set_storage_buffers     = 24;
+    lim.max_descriptor_set_storage_buffers_dynamic = 4;
+    lim.max_descriptor_set_sampled_images      = 96;
+    lim.max_descriptor_set_storage_images      = 24;
+    lim.max_descriptor_set_input_attachments   = 4;
+    lim.max_vertex_input_attributes            = 16;
+    lim.max_vertex_input_bindings              = 16;
+    lim.max_vertex_input_attribute_offset      = 2047;
+    lim.max_vertex_input_binding_stride        = 2048;
+    lim.max_vertex_output_components           = 64;
+    lim.max_fragment_input_components          = 64;
+    lim.max_fragment_output_attachments        = 4;
+    lim.max_fragment_dual_src_attachments      = 1;
+    lim.max_fragment_combined_output_resources = 4;
+    lim.max_compute_shared_memory_size         = 16384;
+    lim.max_compute_work_group_count           = [65535, 65535, 65535];
+    lim.max_compute_work_group_invocations     = 128;
+    lim.max_compute_work_group_size            = [128, 128, 64];
+    lim.sub_pixel_precision_bits               = 4;
+    lim.sub_texel_precision_bits               = 4;
+    lim.mipmap_precision_bits                  = 4;
+    lim.max_draw_indexed_index_value           = u32::MAX;
+    lim.max_draw_indirect_count                = u32::MAX;
+    lim.max_sampler_lod_bias                   = 2.0;
+    lim.max_sampler_anisotropy                 = 1.0;
+    lim.max_viewports                          = 16;
+    lim.max_viewport_dimensions                = [16384, 16384];
+    lim.viewport_bounds_range                  = [-32768.0, 32767.0];
+    lim.viewport_sub_pixel_bits                = 0;
+    lim.min_memory_map_alignment               = 64;
+    lim.min_texel_buffer_offset_alignment      = 256;
+    lim.min_uniform_buffer_offset_alignment    = 256;
+    lim.min_storage_buffer_offset_alignment    = 256;
+    lim.min_texel_offset                       = -8;
+    lim.max_texel_offset                       = 7;
+    lim.min_texel_gather_offset                = -8;
+    lim.max_texel_gather_offset                = 7;
+    lim.min_interpolation_offset               = -0.5;
+    lim.max_interpolation_offset               = 0.4375;
+    lim.sub_pixel_interpolation_offset_bits    = 4;
+    lim.max_framebuffer_width                  = 16384;
+    lim.max_framebuffer_height                 = 16384;
+    lim.max_framebuffer_layers                 = 256;
+    lim.framebuffer_color_sample_counts        = sc1;
+    lim.framebuffer_depth_sample_counts        = sc1;
+    lim.framebuffer_stencil_sample_counts      = sc1;
+    lim.framebuffer_no_attachments_sample_counts = sc1;
+    lim.max_color_attachments                  = 4;
+    lim.sampled_image_color_sample_counts      = sc1;
+    lim.sampled_image_integer_sample_counts    = sc1;
+    lim.sampled_image_depth_sample_counts      = sc1;
+    lim.sampled_image_stencil_sample_counts    = sc1;
+    lim.storage_image_sample_counts            = sc1;
+    lim.max_sample_mask_words                  = 1;
+    lim.timestamp_compute_and_graphics         = ash::vk::FALSE;
+    lim.timestamp_period                       = 0.0;
+    lim.max_clip_distances                     = 8;
+    lim.max_cull_distances                     = 8;
+    lim.max_combined_clip_and_cull_distances   = 8;
+    lim.discrete_queue_priorities              = 2;
+    lim.point_size_range                       = [1.0, 64.0];
+    lim.line_width_range                       = [1.0, 1.0];
+    lim.point_size_granularity                 = 0.0;
+    lim.line_width_granularity                 = 0.0;
+    lim.strict_lines                           = ash::vk::TRUE;
+    lim.standard_sample_locations              = ash::vk::TRUE;
+    lim.optimal_buffer_copy_offset_alignment   = 1;
+    lim.optimal_buffer_copy_row_pitch_alignment = 1;
+    lim.non_coherent_atom_size                 = 64;
+
     // Fill device_name from a fixed-format string. The Vk spec
     // bounds it at VK_MAX_PHYSICAL_DEVICE_NAME_SIZE = 256 bytes
     // including the NUL.
@@ -4934,6 +5040,56 @@ mod tests {
         assert!(unsafe { gdpa(std::ptr::null_mut(), std::ptr::null()) }.is_none());
         assert!(unsafe { gdpa(std::ptr::null_mut(),
             b"vkNonexistentEntryPoint\0".as_ptr() as *const c_char) }.is_none());
+    }
+
+    #[test]
+    fn physical_device_properties_limits_meet_spec_minimums() {
+        // Create instance + enumerate a physical device via the
+        // null-instance bootstrap so we get a real
+        // AtriumPhysicalDevice handle.
+        let f_ci = lookup(b"vkCreateInstance\0").unwrap();
+        let ci: unsafe extern "C" fn(*const c_void, *const c_void, *mut VkInstance) -> VkResult =
+            unsafe { std::mem::transmute(f_ci) };
+        let mut inst: VkInstance = std::ptr::null_mut();
+        unsafe { ci(std::ptr::null(), std::ptr::null(), &mut inst); }
+        // No live daemon → 0 devices, but we still need a non-
+        // null AtriumPhysicalDevice to call vkGet…Properties on.
+        // Stub the call against a stack-allocated handle: this
+        // test exercises the *limits-fill* path, not enumeration.
+        let pd = AtriumPhysicalDevice {
+            loader_dispatch_slot: VK_ICD_LOADER_MAGIC,
+            backend_vendor: aqueduct_gpu::backends::GpuVendor::Software,
+            backend_generation: 0,
+            instance: std::ptr::null_mut(),
+        };
+        let phys: VkPhysicalDevice = &pd as *const _ as *mut _;
+        let mut props = ash::vk::PhysicalDeviceProperties::default();
+        unsafe { vkGetPhysicalDeviceProperties(phys, &mut props); }
+
+        // Vulkan 1.3 spec "Required Limits" lower bounds for any
+        // conformant implementation. If any of these fail, an
+        // app that targets baseline Vulkan would reject us.
+        let l = &props.limits;
+        assert!(l.max_image_dimension2_d >= 4096, "spec min 4096");
+        assert!(l.max_image_dimension_cube >= 4096);
+        assert!(l.max_image_array_layers >= 256);
+        assert!(l.max_bound_descriptor_sets >= 4);
+        assert!(l.max_framebuffer_width >= 4096);
+        assert!(l.max_framebuffer_height >= 4096);
+        assert!(l.max_color_attachments >= 4);
+        assert!(l.max_push_constants_size >= 128);
+        assert!(l.max_viewports >= 1);
+        assert_eq!(l.max_vertex_input_attributes >= 16, true);
+        // Sample counts: must include 1-bit somewhere.
+        assert!(l.framebuffer_color_sample_counts
+            .contains(ash::vk::SampleCountFlags::TYPE_1));
+        assert!(l.sampled_image_color_sample_counts
+            .contains(ash::vk::SampleCountFlags::TYPE_1));
+
+        let f_di = lookup(b"vkDestroyInstance\0").unwrap();
+        let di: unsafe extern "C" fn(VkInstance, *const c_void) =
+            unsafe { std::mem::transmute(f_di) };
+        unsafe { di(inst, std::ptr::null()); }
     }
 
     #[test]
