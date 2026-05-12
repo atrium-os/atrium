@@ -217,6 +217,102 @@ fn device_create_queue_destroy_round_trip() {
 }
 
 #[test]
+fn command_pool_and_buffer_lifecycle() {
+    use atrium_vk_icd::{
+        vkAllocateCommandBuffers, vkBeginCommandBuffer, vkCreateCommandPool,
+        vkCreateDevice, vkDestroyCommandPool, vkDestroyDevice, vkEndCommandBuffer,
+        vkFreeCommandBuffers, vkQueueSubmit, vkResetCommandBuffer, vkGetDeviceQueue,
+    };
+
+    let sock = tmp_socket("cb");
+    let sw_backend = Arc::new(SoftwareBackend::new());
+    let backend_for_listener: Arc<dyn Backend> = sw_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap();
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+
+    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+
+    type VkDevice = *mut std::ffi::c_void;
+    type VkQueue  = *mut std::ffi::c_void;
+    type VkCommandBuffer = *mut std::ffi::c_void;
+
+    // Bootstrap: instance + physical + logical device.
+    let mut instance: VkInstance = std::ptr::null_mut();
+    unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
+    let mut devices: [VkPhysicalDevice; 1] = [std::ptr::null_mut(); 1];
+    let mut cap: u32 = 1;
+    unsafe { vkEnumeratePhysicalDevices(instance, &mut cap, devices.as_mut_ptr()); }
+    let mut device: VkDevice = std::ptr::null_mut();
+    unsafe { vkCreateDevice(devices[0], std::ptr::null(), std::ptr::null(), &mut device); }
+
+    // Create a command pool.
+    let mut pool: u64 = 0;
+    let r = unsafe {
+        vkCreateCommandPool(device, std::ptr::null(), std::ptr::null(), &mut pool)
+    };
+    assert_eq!(r, 0);
+    assert!(pool != 0);
+
+    // Allocate 2 command buffers from it.
+    // VkCommandBufferAllocateInfo layout (40 bytes, no pNext set):
+    //   0   sType : u32   = 40 (VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO)
+    //   4   _pad : u32
+    //   8   pNext : ptr   = null
+    //   16  commandPool : u64
+    //   24  level : u32   = 0 (PRIMARY)
+    //   28  commandBufferCount : u32 = 2
+    //   32  _pad : u32
+    //   36  _pad : u32
+    let mut info = [0u8; 40];
+    info[0..4].copy_from_slice(&40u32.to_le_bytes());
+    info[16..24].copy_from_slice(&pool.to_le_bytes());
+    info[28..32].copy_from_slice(&2u32.to_le_bytes());
+
+    let mut cbs: [VkCommandBuffer; 2] = [std::ptr::null_mut(); 2];
+    let r = unsafe {
+        vkAllocateCommandBuffers(device, info.as_ptr() as *const _, cbs.as_mut_ptr())
+    };
+    assert_eq!(r, 0);
+    assert!(!cbs[0].is_null() && !cbs[1].is_null());
+    // Both carry loader magic.
+    for cb in &cbs {
+        let slot: usize = unsafe { *(*cb as *const usize) };
+        assert_eq!(slot, 0x01CDC0DE);
+    }
+
+    // Begin → End → Reset cycle on the first buffer.
+    assert_eq!(unsafe { vkBeginCommandBuffer(cbs[0], std::ptr::null()) }, 0);
+    assert_eq!(unsafe { vkEndCommandBuffer(cbs[0]) }, 0);
+    // Calling End on a non-Recording buffer is an error.
+    assert_ne!(unsafe { vkEndCommandBuffer(cbs[0]) }, 0,
+        "End on Executable must error");
+    assert_eq!(unsafe { vkResetCommandBuffer(cbs[0], 0) }, 0);
+    // Now back in Initial, Begin works again.
+    assert_eq!(unsafe { vkBeginCommandBuffer(cbs[0], std::ptr::null()) }, 0);
+    assert_eq!(unsafe { vkEndCommandBuffer(cbs[0]) }, 0);
+
+    // Get the queue and submit. Today vkQueueSubmit is a no-op
+    // success since vkCmd* isn't wired; just verify the entry
+    // point + signature compile and return success.
+    let mut queue: VkQueue = std::ptr::null_mut();
+    unsafe { vkGetDeviceQueue(device, 0, 0, &mut queue); }
+    let r = unsafe {
+        vkQueueSubmit(queue, 0, std::ptr::null(), std::ptr::null_mut())
+    };
+    assert_eq!(r, 0);
+
+    // Free one buffer explicitly, leave the other for pool teardown.
+    unsafe { vkFreeCommandBuffers(device, pool, 1, &cbs[1] as *const _); }
+    unsafe { vkDestroyCommandPool(device, pool, std::ptr::null()); }
+    unsafe { vkDestroyDevice(device, std::ptr::null()); }
+    unsafe { vkDestroyInstance(instance, std::ptr::null()); }
+    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[test]
 fn proc_addr_resolves_three_entry_points() {
     // No live daemon required for the get_proc_addr lookups.
     fn lookup(name: &[u8]) -> Option<unsafe extern "C" fn()> {

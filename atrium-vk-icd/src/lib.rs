@@ -131,6 +131,54 @@ struct AtriumPhysicalDevice {
 /// Vulkan handle types for device-level objects.
 type VkDevice = *mut c_void;
 type VkQueue  = *mut c_void;
+/// VkCommandBuffer is dispatchable (carries loader magic at offset 0).
+type VkCommandBuffer = *mut c_void;
+/// VkCommandPool is non-dispatchable — opaque u64 the loader never
+/// indexes into. We cast `Box<AtriumCommandPool>` raw pointer to u64.
+type VkCommandPool = u64;
+
+/// Default FrameBuilder capacity per command buffer. 256 KiB is the
+/// budget per recording; Phase 1.3b+ may grow this or make it
+/// re-allocating.
+const ATRIUM_CMDBUF_INITIAL_CAPACITY: u32 = 256 * 1024;
+
+/// ICD-side state behind a `VkCommandPool`. Tracks the buffers it
+/// has allocated so `vkDestroyCommandPool` can free them in bulk.
+struct AtriumCommandPool {
+    /// All command buffers allocated from this pool (as raw
+    /// pointers, owned). vkFreeCommandBuffers can remove entries;
+    /// vkDestroyCommandPool walks whatever's left and frees them.
+    buffers: Vec<*mut AtriumCommandBuffer>,
+}
+
+/// Recording state for a command buffer. Vulkan's state machine:
+/// Initial → Recording (vkBeginCommandBuffer) → Executable
+/// (vkEndCommandBuffer) → Invalid (after vkResetCommandBuffer or
+/// re-Begin). We only track the gross states needed to gate
+/// vkCmd*/vkEnd/vkBegin transitions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CmdBufferState {
+    Initial,
+    Recording,
+    Executable,
+}
+
+/// ICD-side state behind a `VkCommandBuffer`. The first field MUST
+/// be the loader magic. The `frame` field is the aqueduct-gpu
+/// FrameOp stream being recorded; vkCmd* push into it, vkQueueSubmit
+/// hands it to the aqueduct-gpu client.
+#[repr(C)]
+struct AtriumCommandBuffer {
+    /// First field — see `VK_ICD_LOADER_MAGIC`.
+    loader_dispatch_slot: usize,
+    /// Recording state machine.
+    state: CmdBufferState,
+    /// Accumulated FrameOp stream. Empty in `Initial`; populated
+    /// during `Recording`; finalized in `Executable`.
+    /// `_` because nothing actually pushes to it yet — vkCmd*
+    /// recording lands in the next chunk of Phase 1.3b.
+    _frame: aqueduct_gpu::frame::FrameBuilder,
+}
 
 /// ICD-side state behind a `VkDevice`. The first slot holds the
 /// loader magic. We currently allocate one `AtriumQueue` per
@@ -291,8 +339,40 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkDevice, u32, u32, *mut VkQueue), FnVoidPtr,
             >(vkGetDeviceQueue)),
-        // Phase 1.3b+: vkCreateCommandPool, vkAllocateCommandBuffers,
-        // vkBegin/EndCommandBuffer, vkCmd*, vkQueueSubmit, …
+        "vkCreateCommandPool" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, *const c_void, *const c_void, *mut VkCommandPool) -> VkResult, FnVoidPtr,
+            >(vkCreateCommandPool)),
+        "vkDestroyCommandPool" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, VkCommandPool, *const c_void), FnVoidPtr,
+            >(vkDestroyCommandPool)),
+        "vkAllocateCommandBuffers" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, *const c_void, *mut VkCommandBuffer) -> VkResult, FnVoidPtr,
+            >(vkAllocateCommandBuffers)),
+        "vkFreeCommandBuffers" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, VkCommandPool, u32, *const VkCommandBuffer), FnVoidPtr,
+            >(vkFreeCommandBuffers)),
+        "vkBeginCommandBuffer" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, *const c_void) -> VkResult, FnVoidPtr,
+            >(vkBeginCommandBuffer)),
+        "vkEndCommandBuffer" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer) -> VkResult, FnVoidPtr,
+            >(vkEndCommandBuffer)),
+        "vkResetCommandBuffer" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u32) -> VkResult, FnVoidPtr,
+            >(vkResetCommandBuffer)),
+        "vkQueueSubmit" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkQueue, u32, *const c_void, *mut c_void) -> VkResult, FnVoidPtr,
+            >(vkQueueSubmit)),
+        // Phase 1.3b+: vkCmd* — actual command recording that
+        // produces FrameOps in the AtriumCommandBuffer's frame.
         _ => None,
     }
 }
@@ -462,6 +542,215 @@ pub unsafe extern "C" fn vkDestroyDevice(
     for q in &dev.queues {
         let _ = Box::from_raw(*q);
     }
+}
+
+/// `vkCreateCommandPool` — allocate a non-dispatchable
+/// VkCommandPool handle. We ignore the create-info (queue family,
+/// flags); Atrium's single queue family means every pool is
+/// equivalent.
+///
+/// # Safety
+///
+/// `p_command_pool` must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn vkCreateCommandPool(
+    _device:          VkDevice,
+    _p_create_info:   *const c_void, /* const VkCommandPoolCreateInfo* */
+    _p_allocator:     *const c_void, /* const VkAllocationCallbacks* */
+    p_command_pool:   *mut VkCommandPool,
+) -> VkResult {
+    if p_command_pool.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let pool = Box::new(AtriumCommandPool { buffers: Vec::new() });
+    *p_command_pool = Box::into_raw(pool) as VkCommandPool;
+    VK_SUCCESS
+}
+
+/// `vkDestroyCommandPool` — reclaim the pool + every buffer it
+/// still owns. Apps that called vkFreeCommandBuffers first will
+/// have left the pool's buffers list empty; the rest are freed
+/// here.
+///
+/// # Safety
+///
+/// `command_pool` must be a handle from `vkCreateCommandPool` or
+/// `VK_NULL_HANDLE` (no-op).
+#[no_mangle]
+pub unsafe extern "C" fn vkDestroyCommandPool(
+    _device:        VkDevice,
+    command_pool:   VkCommandPool,
+    _p_allocator:   *const c_void, /* const VkAllocationCallbacks* */
+) {
+    if command_pool == 0 {
+        return;
+    }
+    let pool = Box::from_raw(command_pool as *mut AtriumCommandPool);
+    for b in &pool.buffers {
+        let _ = Box::from_raw(*b);
+    }
+}
+
+/// `vkAllocateCommandBuffers` — allocate N command buffers from the
+/// pool. We accept the pNext-less form and only read
+/// `commandPool` + `commandBufferCount` from the VkAllocateInfo
+/// (offsets 16 and 28 respectively per the Vk spec). `level` is
+/// ignored — Atrium doesn't distinguish primary/secondary buffers.
+///
+/// The result array must hold at least `commandBufferCount` slots.
+///
+/// # Safety
+///
+/// `p_allocate_info` must point to a properly-laid-out
+/// VkCommandBufferAllocateInfo. `p_command_buffers` must point to a
+/// buffer of at least `commandBufferCount` VkCommandBuffer slots.
+#[no_mangle]
+pub unsafe extern "C" fn vkAllocateCommandBuffers(
+    _device:            VkDevice,
+    p_allocate_info:    *const c_void, /* const VkCommandBufferAllocateInfo* */
+    p_command_buffers:  *mut VkCommandBuffer,
+) -> VkResult {
+    if p_allocate_info.is_null() || p_command_buffers.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    // VkCommandBufferAllocateInfo layout:
+    //   offset 0   sType : VkStructureType (u32)
+    //   offset 8   pNext : *const c_void
+    //   offset 16  commandPool : VkCommandPool (u64)
+    //   offset 24  level : VkCommandBufferLevel (u32)
+    //   offset 28  commandBufferCount : u32
+    let bytes = p_allocate_info as *const u8;
+    // read_unaligned — Vulkan struct layouts are 8-byte-aligned in
+    // theory, but defensive against weird caller layouts (test
+    // fixtures, partial struct construction, etc.) is cheap.
+    let pool_u64  = std::ptr::read_unaligned(bytes.add(16) as *const u64);
+    let count     = std::ptr::read_unaligned(bytes.add(28) as *const u32);
+    if pool_u64 == 0 {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let pool = &mut *(pool_u64 as *mut AtriumCommandPool);
+
+    for i in 0..count {
+        let cb = Box::new(AtriumCommandBuffer {
+            loader_dispatch_slot: VK_ICD_LOADER_MAGIC,
+            state: CmdBufferState::Initial,
+            _frame: aqueduct_gpu::frame::FrameBuilder::new(ATRIUM_CMDBUF_INITIAL_CAPACITY),
+        });
+        let cb_raw = Box::into_raw(cb);
+        pool.buffers.push(cb_raw);
+        *p_command_buffers.offset(i as isize) = cb_raw as VkCommandBuffer;
+    }
+    VK_SUCCESS
+}
+
+/// `vkFreeCommandBuffers` — return the listed buffers to the pool.
+///
+/// # Safety
+///
+/// `p_command_buffers` must point to `command_buffer_count`
+/// VkCommandBuffer handles previously returned by
+/// `vkAllocateCommandBuffers` against `command_pool`.
+#[no_mangle]
+pub unsafe extern "C" fn vkFreeCommandBuffers(
+    _device:               VkDevice,
+    command_pool:          VkCommandPool,
+    command_buffer_count:  u32,
+    p_command_buffers:     *const VkCommandBuffer,
+) {
+    if command_pool == 0 || p_command_buffers.is_null() {
+        return;
+    }
+    let pool = &mut *(command_pool as *mut AtriumCommandPool);
+    for i in 0..command_buffer_count {
+        let cb_handle = *p_command_buffers.offset(i as isize);
+        if cb_handle.is_null() { continue; }
+        let cb_raw = cb_handle as *mut AtriumCommandBuffer;
+        // Remove from the pool's tracking list before freeing.
+        pool.buffers.retain(|&b| b != cb_raw);
+        let _ = Box::from_raw(cb_raw);
+    }
+}
+
+/// `vkBeginCommandBuffer` — transition Initial/Executable →
+/// Recording, resetting any previously-accumulated FrameOps.
+///
+/// # Safety
+///
+/// `command_buffer` must be a handle from
+/// `vkAllocateCommandBuffers`.
+#[no_mangle]
+pub unsafe extern "C" fn vkBeginCommandBuffer(
+    command_buffer:    VkCommandBuffer,
+    _p_begin_info:     *const c_void, /* const VkCommandBufferBeginInfo* */
+) -> VkResult {
+    if command_buffer.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let cb = &mut *(command_buffer as *mut AtriumCommandBuffer);
+    cb.state = CmdBufferState::Recording;
+    cb._frame = aqueduct_gpu::frame::FrameBuilder::new(ATRIUM_CMDBUF_INITIAL_CAPACITY);
+    VK_SUCCESS
+}
+
+/// `vkEndCommandBuffer` — finalize Recording → Executable.
+///
+/// # Safety
+///
+/// `command_buffer` must be in Recording state.
+#[no_mangle]
+pub unsafe extern "C" fn vkEndCommandBuffer(
+    command_buffer: VkCommandBuffer,
+) -> VkResult {
+    if command_buffer.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let cb = &mut *(command_buffer as *mut AtriumCommandBuffer);
+    if cb.state != CmdBufferState::Recording {
+        // Vk spec: vkEndCommandBuffer on a non-Recording buffer is
+        // undefined behavior. We return a soft error instead of
+        // panicking.
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    cb.state = CmdBufferState::Executable;
+    VK_SUCCESS
+}
+
+/// `vkResetCommandBuffer` — drop any recorded FrameOps, return to
+/// Initial state. The `flags` argument is ignored (we always
+/// release any pool memory we held).
+#[no_mangle]
+pub unsafe extern "C" fn vkResetCommandBuffer(
+    command_buffer: VkCommandBuffer,
+    _flags:         u32, /* VkCommandBufferResetFlags */
+) -> VkResult {
+    if command_buffer.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let cb = &mut *(command_buffer as *mut AtriumCommandBuffer);
+    cb.state = CmdBufferState::Initial;
+    cb._frame = aqueduct_gpu::frame::FrameBuilder::new(ATRIUM_CMDBUF_INITIAL_CAPACITY);
+    VK_SUCCESS
+}
+
+/// `vkQueueSubmit` — flush recorded FrameOps from each submitted
+/// command buffer to the aqueduct-gpu host endpoint via the
+/// owning AtriumInstance's GpuClient.
+///
+/// Today this is a no-op success: vkCmd* recording isn't wired yet,
+/// so every cmdbuf's FrameOp stream is empty. The signature + state
+/// transitions are in place so the Phase 1.3b+ vkCmd* chunk just
+/// has to push into `_frame`.
+#[no_mangle]
+pub unsafe extern "C" fn vkQueueSubmit(
+    _queue:         VkQueue,
+    _submit_count:  u32,
+    _p_submits:     *const c_void, /* const VkSubmitInfo* */
+    _fence:         *mut c_void,   /* VkFence */
+) -> VkResult {
+    // TODO Phase 1.3b+: walk *p_submits, for each VkSubmitInfo's
+    // commandBuffers, transmute back to AtriumCommandBuffer, hand
+    // the FrameBuilder.into_buf() to GpuClient::submit_frame.
+    VK_SUCCESS
 }
 
 /// `vkGetDeviceQueue` — return the queue for `(family, index)`.
