@@ -46,6 +46,13 @@ path = "src/stress.rs"
 name = "atrium-glyph-stress"
 path = "src/glyph_stress.rs"
 
+# Multi-window scenario: N windows open, only ONE updates per
+# frame (the "active" one cycles slowly). Verifies per-window
+# dirty tracking actually skips un-dirty windows.
+[[bin]]
+name = "atrium-multiwindow-stress"
+path = "src/multiwindow_stress.rs"
+
 [dependencies]
 fresco-client   = { path = "../fresco-client" }
 fresco-protocol = { path = "../fresco-protocol" }
