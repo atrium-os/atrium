@@ -546,6 +546,9 @@ const ATRIUM_INSTANCE_ONLY_ENTRY_POINTS: &[&str] = &[
     "vkGetPhysicalDeviceFeatures",
     "vkGetPhysicalDeviceMemoryProperties",
     "vkGetPhysicalDeviceFormatProperties",
+    "vkGetPhysicalDeviceImageFormatProperties",
+    "vkGetPhysicalDeviceImageFormatProperties2",
+    "vkGetPhysicalDeviceImageFormatProperties2KHR",
     "vkGetPhysicalDeviceProperties2",
     "vkGetPhysicalDeviceProperties2KHR",
     "vkGetPhysicalDeviceFeatures2",
@@ -689,6 +692,15 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkPhysicalDevice, *mut u32, *mut c_void), FnVoidPtr,
             >(vkGetPhysicalDeviceQueueFamilyProperties2)),
+        "vkGetPhysicalDeviceImageFormatProperties" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkPhysicalDevice, ash::vk::Format, ash::vk::ImageType, ash::vk::ImageTiling, ash::vk::ImageUsageFlags, ash::vk::ImageCreateFlags, *mut ash::vk::ImageFormatProperties) -> VkResult, FnVoidPtr,
+            >(vkGetPhysicalDeviceImageFormatProperties)),
+        "vkGetPhysicalDeviceImageFormatProperties2" |
+        "vkGetPhysicalDeviceImageFormatProperties2KHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkPhysicalDevice, *const c_void, *mut c_void) -> VkResult, FnVoidPtr,
+            >(vkGetPhysicalDeviceImageFormatProperties2)),
         "vkCreateInstance" =>
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(*const c_void, *const c_void, *mut VkInstance) -> VkResult, FnVoidPtr,
@@ -1488,6 +1500,114 @@ pub unsafe extern "C" fn vkGetPhysicalDeviceFormatProperties(
 ) {
     if p_format_properties.is_null() { return; }
     *p_format_properties = ash::vk::FormatProperties::default();
+}
+
+/// `vkGetPhysicalDeviceImageFormatProperties` — describe whether
+/// a (format, type, tiling, usage, flags) combination is
+/// supported and what extents/mip-levels/sample-counts the
+/// implementation allows for it.
+///
+/// Apps that follow Vulkan best practices call this BEFORE
+/// vkCreateImage to validate the request. atrium-vk-icd has been
+/// silently passing every vkCreateImage through to the daemon
+/// (tier-1 silently dropping unsupported requests on the floor);
+/// returning supported caps from this entry point lets apps
+/// front-load the rejection / fallback decision.
+///
+/// Tier-1 acceptance policy (subject to tier widening when
+/// llvmpipe lands):
+///   - 2D images at R8G8B8A8_UNORM (37) or B8G8R8A8_UNORM (44)
+///     OR any depth format — supported at 16K×16K, 14 mip
+///     levels, 256 array layers, 1-sample.
+///   - 1D / 3D / cube images — rejected with FORMAT_NOT_SUPPORTED.
+///     (Tier-1 has no path for them.)
+///   - Tiling LINEAR vs OPTIMAL — both accepted (no GPU layout
+///     to honor; tiny-skia treats both identically).
+///   - flags = 0 — sparse / aliased / cube-compat / etc. all
+///     rejected.
+///
+/// We don't enforce usage bits — the daemon accepts every
+/// usage today.
+#[no_mangle]
+pub unsafe extern "C" fn vkGetPhysicalDeviceImageFormatProperties(
+    _physical_device:           VkPhysicalDevice,
+    format:                     ash::vk::Format,
+    image_type:                 ash::vk::ImageType,
+    _tiling:                    ash::vk::ImageTiling,
+    _usage:                     ash::vk::ImageUsageFlags,
+    flags:                      ash::vk::ImageCreateFlags,
+    p_image_format_properties:  *mut ash::vk::ImageFormatProperties,
+) -> VkResult {
+    if p_image_format_properties.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    // Only 2D supported in tier-1.
+    if image_type != ash::vk::ImageType::TYPE_2D {
+        return -11 /* VK_ERROR_FORMAT_NOT_SUPPORTED */;
+    }
+    if !flags.is_empty() {
+        return -11;
+    }
+    // Format whitelist: R8G8B8A8_UNORM (37), B8G8R8A8_UNORM (44),
+    // R8G8B8A8_SRGB (43), B8G8R8A8_SRGB (50), D16 (124), D32_SFLOAT
+    // (126), D24_UNORM_S8_UINT (129), D32_SFLOAT_S8_UINT (130).
+    let f = format.as_raw();
+    let supported = matches!(f, 37 | 43 | 44 | 50 | 124 | 126 | 129 | 130);
+    if !supported {
+        return -11;
+    }
+
+    let mut props = ash::vk::ImageFormatProperties::default();
+    props.max_extent = ash::vk::Extent3D { width: 16384, height: 16384, depth: 1 };
+    props.max_mip_levels   = 14; // log2(16384) + 1
+    props.max_array_layers = 256;
+    props.sample_counts    = ash::vk::SampleCountFlags::TYPE_1;
+    // Spec-defined: must be at least 2^31 for >=2D images. Use a
+    // generous cap reflecting our 16K×16K×8-byte worst case.
+    props.max_resource_size = 16384u64 * 16384u64 * 16u64;
+    *p_image_format_properties = props;
+    VK_SUCCESS
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkGetPhysicalDeviceImageFormatProperties2(
+    physical_device:  VkPhysicalDevice,
+    p_image_format_info: *const c_void,
+    p_image_format_properties: *mut c_void,
+) -> VkResult {
+    if p_image_format_info.is_null() || p_image_format_properties.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    // VkPhysicalDeviceImageFormatInfo2: 16-byte header + format(u32)
+    // + type(u32) + tiling(u32) + usage(u32) + flags(u32).
+    let info = p_image_format_info as *const u8;
+    let info_p_next = std::ptr::read_unaligned(info.add(8) as *const *mut c_void);
+    let format = ash::vk::Format::from_raw(
+        std::ptr::read_unaligned(info.add(16) as *const i32),
+    );
+    let image_type = ash::vk::ImageType::from_raw(
+        std::ptr::read_unaligned(info.add(20) as *const i32),
+    );
+    let tiling = ash::vk::ImageTiling::from_raw(
+        std::ptr::read_unaligned(info.add(24) as *const i32),
+    );
+    let usage = ash::vk::ImageUsageFlags::from_raw(
+        std::ptr::read_unaligned(info.add(28) as *const u32),
+    );
+    let flags = ash::vk::ImageCreateFlags::from_raw(
+        std::ptr::read_unaligned(info.add(32) as *const u32),
+    );
+    let _ = walk_p_next_chain(info_p_next);
+
+    // VkImageFormatProperties2: 16-byte header + inner.
+    let out = p_image_format_properties as *mut u8;
+    let out_p_next = std::ptr::read_unaligned(out.add(8) as *const *mut c_void);
+    let inner = out.add(16) as *mut ash::vk::ImageFormatProperties;
+    let r = vkGetPhysicalDeviceImageFormatProperties(
+        physical_device, format, image_type, tiling, usage, flags, inner,
+    );
+    let _ = walk_p_next_chain(out_p_next);
+    r
 }
 
 // ── Vulkan 1.1+ pNext-chain variants ─────────────────────────────
@@ -5198,6 +5318,65 @@ mod tests {
         assert!(unsafe { gdpa(std::ptr::null_mut(), std::ptr::null()) }.is_none());
         assert!(unsafe { gdpa(std::ptr::null_mut(),
             b"vkNonexistentEntryPoint\0".as_ptr() as *const c_char) }.is_none());
+    }
+
+    #[test]
+    fn image_format_properties_accepts_supported_rejects_unsupported() {
+        let pd = AtriumPhysicalDevice {
+            loader_dispatch_slot: VK_ICD_LOADER_MAGIC,
+            backend_vendor: aqueduct_gpu::backends::GpuVendor::Software,
+            backend_generation: 0,
+            instance: std::ptr::null_mut(),
+        };
+        let phys: VkPhysicalDevice = &pd as *const _ as *mut _;
+        let f = lookup(b"vkGetPhysicalDeviceImageFormatProperties\0").unwrap();
+        let g: unsafe extern "C" fn(VkPhysicalDevice, ash::vk::Format, ash::vk::ImageType, ash::vk::ImageTiling, ash::vk::ImageUsageFlags, ash::vk::ImageCreateFlags, *mut ash::vk::ImageFormatProperties) -> VkResult =
+            unsafe { std::mem::transmute(f) };
+
+        // Supported: R8G8B8A8_UNORM (37), 2D, OPTIMAL.
+        let mut props = ash::vk::ImageFormatProperties::default();
+        let r = unsafe { g(
+            phys,
+            ash::vk::Format::R8G8B8A8_UNORM,
+            ash::vk::ImageType::TYPE_2D,
+            ash::vk::ImageTiling::OPTIMAL,
+            ash::vk::ImageUsageFlags::COLOR_ATTACHMENT,
+            ash::vk::ImageCreateFlags::empty(),
+            &mut props,
+        ) };
+        assert_eq!(r, VK_SUCCESS);
+        assert_eq!(props.max_extent.width, 16384);
+        assert_eq!(props.max_array_layers, 256);
+        assert_eq!(props.max_mip_levels, 14);
+        assert!(props.sample_counts.contains(ash::vk::SampleCountFlags::TYPE_1));
+
+        // Unsupported: random YUV format.
+        let r = unsafe { g(
+            phys,
+            ash::vk::Format::G8B8G8R8_422_UNORM,
+            ash::vk::ImageType::TYPE_2D,
+            ash::vk::ImageTiling::OPTIMAL,
+            ash::vk::ImageUsageFlags::SAMPLED,
+            ash::vk::ImageCreateFlags::empty(),
+            &mut props,
+        ) };
+        assert_eq!(r, -11 /* FORMAT_NOT_SUPPORTED */);
+
+        // Unsupported: 3D image even at a supported format.
+        let r = unsafe { g(
+            phys,
+            ash::vk::Format::R8G8B8A8_UNORM,
+            ash::vk::ImageType::TYPE_3D,
+            ash::vk::ImageTiling::OPTIMAL,
+            ash::vk::ImageUsageFlags::SAMPLED,
+            ash::vk::ImageCreateFlags::empty(),
+            &mut props,
+        ) };
+        assert_eq!(r, -11);
+
+        // *2 variant resolves.
+        assert!(lookup(b"vkGetPhysicalDeviceImageFormatProperties2\0").is_some());
+        assert!(lookup(b"vkGetPhysicalDeviceImageFormatProperties2KHR\0").is_some());
     }
 
     #[test]
