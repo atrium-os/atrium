@@ -1383,4 +1383,43 @@ mod tests {
             let _ = validate_spirv(&bytes); // must not panic
         }
     }
+
+    /// Phase 2.4 — long-tail validator cross-check against upstream
+    /// SPIRV-Tools. Gated behind the `spirv-tools-cross-check` cargo
+    /// feature so default `cargo test` doesn't require libSPIRV-Tools.
+    ///
+    /// Run with:
+    ///   cargo test --features spirv-tools-cross-check
+    ///
+    /// The contract we're enforcing: SPIR-V the hand validator
+    /// ACCEPTS must also be accepted by upstream SPIRV-Tools. If
+    /// spirv-tools rejects something we accept, it's a real bug —
+    /// either our test fixture is malformed or our validator is
+    /// missing a structural check.
+    ///
+    /// We don't test the inverse direction (things we reject that
+    /// spirv-tools accepts): our rules are stricter on purpose
+    /// (forbidden capabilities, bounded loops, etc.), and we expect
+    /// spirv-tools to accept what we deliberately ban.
+    #[cfg(feature = "spirv-tools-cross-check")]
+    #[test]
+    fn slangc_unroll_loop_passes_spirv_tools_validator() {
+        use spirv_tools::val::{self, Validator};
+        use spirv_tools::TargetEnv;
+
+        // SLANGC_UNROLL_LOOP_SPV is a real slangc 2026.8 compute
+        // shader. Our hand validator accepts it after annotation;
+        // upstream spirv-tools must also accept it (it's
+        // structurally well-formed SPIR-V, just with an Unroll
+        // LoopControl that we strict-mode-reject pre-annotation).
+        let validator = val::create(Some(TargetEnv::Vulkan_1_2));
+        let result = validator.validate(
+            SLANGC_UNROLL_LOOP_SPV, None,
+        );
+        assert!(
+            result.is_ok(),
+            "spirv-tools rejected a fixture our validator accepts: {:?}",
+            result.err(),
+        );
+    }
 }

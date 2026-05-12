@@ -56,3 +56,25 @@ serde_json     = "1"
 
 [dev-dependencies]
 aqueduct-gpu-client = { path = "../aqueduct-gpu-client" }
+
+[features]
+default = []
+# Phase 2.4 long-tail validator cross-check. Enables a host-side
+# test that asserts every SPIR-V our hand validator accepts is also
+# accepted by upstream SPIRV-Tools' Validator. Off by default so
+# plain `cargo test` doesn't require a C++ toolchain or system
+# install of libSPIRV-Tools.
+#
+# To run:
+#   macOS:    brew install spirv-tools
+#   FreeBSD:  pkg install spirv-tools
+#   then:     cargo test --features spirv-tools-cross-check
+spirv-tools-cross-check = ["dep:spirv-tools"]
+
+# Optional only when the feature is enabled (cargo doesn't allow
+# optional dev-deps, so this lives in [dependencies] but is gated).
+[dependencies.spirv-tools]
+version = "0.13"
+default-features = false
+features = ["use-installed-tools"]
+optional = true

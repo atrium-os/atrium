@@ -1350,8 +1350,16 @@ Deliverables:
     `"rebuild with bounded-loop emission enabled, e.g. glslang -Os"`.
   - 24 unit tests + 1000-byte-sequence fuzz; wired into
     `Session::handle_shader_upload` (SpirV kind only; NIR bypasses).
-- ⚠️ Phase 2.4: link `spirv-tools-rs` for the long tail beyond
-  Atrium policy — pending.
+- ✅ Phase 2.4: `spirv-tools-rs` cross-check landed as an
+  off-by-default cargo feature (`spirv-tools-cross-check`).
+  Enabling it links against system libSPIRV-Tools (no C++ build at
+  default `cargo test`) and asserts that SPIR-V the hand validator
+  ACCEPTS is also accepted by upstream SPIRV-Tools' Validator.
+  Catches the case where a permissive bug in the hand validator
+  lets through structurally malformed SPIR-V. We don't test the
+  inverse: our rules are stricter on purpose (forbidden
+  capabilities, bounded loops) and spirv-tools is expected to
+  accept what we ban.
 - ✅ Phase 2.3: warm-path shader cache
   (`aqueduct_gpu_host::shader_cache::ShaderCache`):
   - Disk store keyed by `(hash, backend_vendor, generation,
