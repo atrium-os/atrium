@@ -31,6 +31,45 @@ fn tmp_socket(name: &str) -> std::path::PathBuf {
     p
 }
 
+/// Process-wide serialization point for tests that drive the ICD
+/// via `ATRIUM_VK_ICD_SOCKET`.
+///
+/// The ICD reads that env var inside `try_connect_aqueduct` on
+/// each `vkCreateInstance`. The env var is process-global, so
+/// parallel cargo-test workers would otherwise overwrite each
+/// other's settings and connect to the wrong daemon (the
+/// observed flakes before this guard landed). Tests acquire the
+/// lock + set the var via `EnvLock::set`, and the RAII drop
+/// clears the var when the test's instance has been destroyed.
+///
+/// Using `parking_lot`'s style here would be cleaner, but
+/// std::sync::Mutex is good enough and keeps the dev-deps list
+/// tight. Lock poisoning on a panicked test isn't a real concern
+/// — cargo aborts the worker, but the OS reclaims the env var.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct EnvLock {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl EnvLock {
+    fn set(sock: &std::path::Path) -> Self {
+        // Recover from a poisoned mutex — a previously-panicked
+        // test would otherwise wedge every subsequent test in the
+        // suite. The mutex protects an env var, not invariants
+        // we care about, so taking the inner guard is safe.
+        let guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("ATRIUM_VK_ICD_SOCKET", sock);
+        EnvLock { _guard: guard }
+    }
+}
+
+impl Drop for EnvLock {
+    fn drop(&mut self) {
+        // env var cleared by EnvLock drop
+    }
+}
+
 #[test]
 fn live_handshake_reports_one_physical_device() {
     let sock = tmp_socket("live");
@@ -41,7 +80,7 @@ fn live_handshake_reports_one_physical_device() {
     thread::sleep(Duration::from_millis(50));
 
     // Point the ICD's connect path at our temp socket.
-    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+    let _env = EnvLock::set(&sock);
 
     let mut instance: VkInstance = std::ptr::null_mut();
     let r = unsafe {
@@ -76,7 +115,7 @@ fn live_handshake_reports_one_physical_device() {
 
     unsafe { vkDestroyInstance(instance, std::ptr::null()); }
 
-    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    // env var cleared by EnvLock drop
     let _ = server_thread;
     let _ = std::fs::remove_file(&sock);
 }
@@ -92,7 +131,7 @@ fn physical_device_properties_match_backend() {
     let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
     thread::sleep(Duration::from_millis(50));
 
-    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+    let _env = EnvLock::set(&sock);
 
     let mut instance: VkInstance = std::ptr::null_mut();
     unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
@@ -118,7 +157,7 @@ fn physical_device_properties_match_backend() {
     assert!(name.starts_with("atrium-vk-icd"), "got {name:?}");
 
     unsafe { vkDestroyInstance(instance, std::ptr::null()); }
-    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    // env var cleared by EnvLock drop
     let _ = server_thread;
     let _ = std::fs::remove_file(&sock);
 }
@@ -134,7 +173,7 @@ fn queue_family_properties_report_one_unified_family() {
     let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
     thread::sleep(Duration::from_millis(50));
 
-    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+    let _env = EnvLock::set(&sock);
 
     let mut instance: VkInstance = std::ptr::null_mut();
     unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
@@ -159,7 +198,7 @@ fn queue_family_properties_report_one_unified_family() {
     assert_eq!(qfp[0].queue_count, 1);
 
     unsafe { vkDestroyInstance(instance, std::ptr::null()); }
-    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    // env var cleared by EnvLock drop
     let _ = server_thread;
     let _ = std::fs::remove_file(&sock);
 }
@@ -175,7 +214,7 @@ fn device_create_queue_destroy_round_trip() {
     let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
     thread::sleep(Duration::from_millis(50));
 
-    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+    let _env = EnvLock::set(&sock);
 
     let mut instance: VkInstance = std::ptr::null_mut();
     unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
@@ -211,7 +250,7 @@ fn device_create_queue_destroy_round_trip() {
 
     unsafe { vkDestroyDevice(device, std::ptr::null()); }
     unsafe { vkDestroyInstance(instance, std::ptr::null()); }
-    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    // env var cleared by EnvLock drop
     let _ = server_thread;
     let _ = std::fs::remove_file(&sock);
 }
@@ -231,7 +270,7 @@ fn command_pool_and_buffer_lifecycle() {
     let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
     thread::sleep(Duration::from_millis(50));
 
-    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+    let _env = EnvLock::set(&sock);
 
     type VkDevice = *mut std::ffi::c_void;
     type VkQueue  = *mut std::ffi::c_void;
@@ -307,7 +346,7 @@ fn command_pool_and_buffer_lifecycle() {
     unsafe { vkDestroyCommandPool(device, pool, std::ptr::null()); }
     unsafe { vkDestroyDevice(device, std::ptr::null()); }
     unsafe { vkDestroyInstance(instance, std::ptr::null()); }
-    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    // env var cleared by EnvLock drop
     let _ = server_thread;
     let _ = std::fs::remove_file(&sock);
 }
@@ -326,7 +365,7 @@ fn physical_device_features_and_memory_queries() {
     let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
     thread::sleep(Duration::from_millis(50));
 
-    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+    let _env = EnvLock::set(&sock);
 
     let mut instance: VkInstance = std::ptr::null_mut();
     unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
@@ -363,7 +402,7 @@ fn physical_device_features_and_memory_queries() {
     assert!(fp.buffer_features.is_empty());
 
     unsafe { vkDestroyInstance(instance, std::ptr::null()); }
-    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    // env var cleared by EnvLock drop
     let _ = server_thread;
     let _ = std::fs::remove_file(&sock);
 }
@@ -385,7 +424,7 @@ fn cmdbuf_records_frame_ops_through_vkcmd_apis() {
     let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
     thread::sleep(Duration::from_millis(50));
 
-    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+    let _env = EnvLock::set(&sock);
 
     type VkDevice = *mut std::ffi::c_void;
     type VkCommandBuffer = *mut std::ffi::c_void;
@@ -454,7 +493,7 @@ fn cmdbuf_records_frame_ops_through_vkcmd_apis() {
     unsafe { vkDestroyCommandPool(device, pool, std::ptr::null()); }
     unsafe { vkDestroyDevice(device, std::ptr::null()); }
     unsafe { vkDestroyInstance(instance, std::ptr::null()); }
-    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    // env var cleared by EnvLock drop
     let _ = server_thread;
     let _ = std::fs::remove_file(&sock);
 }
@@ -475,7 +514,7 @@ fn submit_flushes_recorded_frame_to_aqueduct_backend() {
     let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
     thread::sleep(Duration::from_millis(50));
 
-    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+    let _env = EnvLock::set(&sock);
 
     type VkDevice = *mut std::ffi::c_void;
     type VkQueue  = *mut std::ffi::c_void;
@@ -541,7 +580,7 @@ fn submit_flushes_recorded_frame_to_aqueduct_backend() {
     unsafe { vkDestroyCommandPool(device, pool, std::ptr::null()); }
     unsafe { vkDestroyDevice(device, std::ptr::null()); }
     unsafe { vkDestroyInstance(instance, std::ptr::null()); }
-    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    // env var cleared by EnvLock drop
     let _ = server_thread;
     let _ = std::fs::remove_file(&sock);
 }
@@ -563,7 +602,7 @@ fn pipeline_create_bind_destroy_round_trip() {
     let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
     thread::sleep(Duration::from_millis(50));
 
-    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+    let _env = EnvLock::set(&sock);
 
     type VkDevice = *mut std::ffi::c_void;
     type VkCommandBuffer = *mut std::ffi::c_void;
@@ -624,7 +663,7 @@ fn pipeline_create_bind_destroy_round_trip() {
     unsafe { vkDestroyCommandPool(device, pool, std::ptr::null()); }
     unsafe { vkDestroyDevice(device, std::ptr::null()); }
     unsafe { vkDestroyInstance(instance, std::ptr::null()); }
-    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    // env var cleared by EnvLock drop
     let _ = server_thread;
     let _ = std::fs::remove_file(&sock);
 }
@@ -642,7 +681,7 @@ fn device_memory_alloc_map_unmap_free() {
     let listener = Listener::bind(&sock, backend_for_listener).unwrap();
     let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
     thread::sleep(Duration::from_millis(50));
-    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+    let _env = EnvLock::set(&sock);
 
     type VkDevice = *mut std::ffi::c_void;
 
@@ -700,7 +739,7 @@ fn device_memory_alloc_map_unmap_free() {
 
     unsafe { vkDestroyDevice(device, std::ptr::null()); }
     unsafe { vkDestroyInstance(instance, std::ptr::null()); }
-    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    // env var cleared by EnvLock drop
     let _ = server_thread;
     let _ = std::fs::remove_file(&sock);
 }
@@ -719,7 +758,7 @@ fn buffer_create_bind_destroy_round_trip() {
     let listener = Listener::bind(&sock, backend_for_listener).unwrap();
     let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
     thread::sleep(Duration::from_millis(50));
-    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+    let _env = EnvLock::set(&sock);
 
     type VkDevice = *mut std::ffi::c_void;
 
@@ -777,7 +816,7 @@ fn buffer_create_bind_destroy_round_trip() {
     unsafe { vkDestroyBuffer(device, buffer, std::ptr::null()); }
     unsafe { vkDestroyDevice(device, std::ptr::null()); }
     unsafe { vkDestroyInstance(instance, std::ptr::null()); }
-    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    // env var cleared by EnvLock drop
     let _ = server_thread;
     let _ = std::fs::remove_file(&sock);
 }
@@ -799,7 +838,7 @@ fn vertex_index_buffer_bind_and_draw_indexed_records() {
     let listener = Listener::bind(&sock, backend_for_listener).unwrap();
     let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
     thread::sleep(Duration::from_millis(50));
-    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+    let _env = EnvLock::set(&sock);
 
     type VkDevice = *mut std::ffi::c_void;
     type VkCommandBuffer = *mut std::ffi::c_void;
@@ -877,7 +916,7 @@ fn vertex_index_buffer_bind_and_draw_indexed_records() {
     unsafe { vkFreeMemory(device, mem, std::ptr::null()); }
     unsafe { vkDestroyDevice(device, std::ptr::null()); }
     unsafe { vkDestroyInstance(instance, std::ptr::null()); }
-    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    // env var cleared by EnvLock drop
     let _ = server_thread;
     let _ = std::fs::remove_file(&sock);
 }
@@ -896,7 +935,7 @@ fn image_create_bind_destroy_round_trip() {
     let listener = Listener::bind(&sock, backend_for_listener).unwrap();
     let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
     thread::sleep(Duration::from_millis(50));
-    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+    let _env = EnvLock::set(&sock);
 
     type VkDevice = *mut std::ffi::c_void;
 
@@ -947,7 +986,7 @@ fn image_create_bind_destroy_round_trip() {
     unsafe { vkFreeMemory(device, mem, std::ptr::null()); }
     unsafe { vkDestroyDevice(device, std::ptr::null()); }
     unsafe { vkDestroyInstance(instance, std::ptr::null()); }
-    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    // env var cleared by EnvLock drop
     let _ = server_thread;
     let _ = std::fs::remove_file(&sock);
 }
@@ -965,7 +1004,7 @@ fn shader_module_create_destroy_through_daemon_cache() {
     let listener = Listener::bind(&sock, backend_for_listener).unwrap();
     let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
     thread::sleep(Duration::from_millis(50));
-    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+    let _env = EnvLock::set(&sock);
 
     type VkDevice = *mut std::ffi::c_void;
 
@@ -1010,7 +1049,7 @@ fn shader_module_create_destroy_through_daemon_cache() {
     unsafe { vkDestroyShaderModule(device, module2, std::ptr::null()); }
     unsafe { vkDestroyDevice(device, std::ptr::null()); }
     unsafe { vkDestroyInstance(instance, std::ptr::null()); }
-    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    // env var cleared by EnvLock drop
     let _ = server_thread;
     let _ = std::fs::remove_file(&sock);
 }
@@ -1034,7 +1073,7 @@ fn render_pass_framebuffer_and_begin_end_recording() {
     let listener = Listener::bind(&sock, backend_for_listener).unwrap();
     let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
     thread::sleep(Duration::from_millis(50));
-    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+    let _env = EnvLock::set(&sock);
 
     type VkDevice = *mut std::ffi::c_void;
     type VkCommandBuffer = *mut std::ffi::c_void;
@@ -1164,7 +1203,7 @@ fn render_pass_framebuffer_and_begin_end_recording() {
     unsafe { vkDestroyCommandPool(device, pool, std::ptr::null()); }
     unsafe { vkDestroyDevice(device, std::ptr::null()); }
     unsafe { vkDestroyInstance(instance, std::ptr::null()); }
-    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    // env var cleared by EnvLock drop
     let _ = server_thread;
     let _ = std::fs::remove_file(&sock);
 }
@@ -1183,7 +1222,7 @@ fn fence_semaphore_sampler_lifecycle() {
     let listener = Listener::bind(&sock, backend_for_listener).unwrap();
     let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
     thread::sleep(Duration::from_millis(50));
-    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+    let _env = EnvLock::set(&sock);
 
     type VkDevice = *mut std::ffi::c_void;
 
@@ -1244,7 +1283,7 @@ fn fence_semaphore_sampler_lifecycle() {
     unsafe { vkDestroyFence(device, fence2, std::ptr::null()); }
     unsafe { vkDestroyDevice(device, std::ptr::null()); }
     unsafe { vkDestroyInstance(instance, std::ptr::null()); }
-    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    // env var cleared by EnvLock drop
     let _ = server_thread;
     let _ = std::fs::remove_file(&sock);
 }
@@ -1268,7 +1307,7 @@ fn descriptor_set_alloc_update_bind_round_trip() {
     let listener = Listener::bind(&sock, backend_for_listener).unwrap();
     let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
     thread::sleep(Duration::from_millis(50));
-    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+    let _env = EnvLock::set(&sock);
 
     type VkDevice = *mut std::ffi::c_void;
     type VkCommandBuffer = *mut std::ffi::c_void;
@@ -1381,7 +1420,7 @@ fn descriptor_set_alloc_update_bind_round_trip() {
     unsafe { vkFreeMemory(device, mem, std::ptr::null()); }
     unsafe { vkDestroyDevice(device, std::ptr::null()); }
     unsafe { vkDestroyInstance(instance, std::ptr::null()); }
-    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    // env var cleared by EnvLock drop
     let _ = server_thread;
     let _ = std::fs::remove_file(&sock);
 }
@@ -1421,7 +1460,7 @@ fn full_triangle_frame_record_and_submit() {
     let listener = Listener::bind(&sock, backend_for_listener).unwrap();
     let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
     thread::sleep(Duration::from_millis(50));
-    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+    let _env = EnvLock::set(&sock);
 
     type VkDevice = *mut std::ffi::c_void;
     type VkQueue  = *mut std::ffi::c_void;
@@ -1655,7 +1694,7 @@ fn full_triangle_frame_record_and_submit() {
     unsafe { vkFreeMemory(device, mem, std::ptr::null()); }
     unsafe { vkDestroyDevice(device, std::ptr::null()); }
     unsafe { vkDestroyInstance(instance, std::ptr::null()); }
-    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    // env var cleared by EnvLock drop
     let _ = server_thread;
     let _ = std::fs::remove_file(&sock);
 }
@@ -1675,7 +1714,7 @@ fn swapchain_ring_acquire_present_round_trip() {
     let listener = Listener::bind(&sock, backend_for_listener).unwrap();
     let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
     thread::sleep(Duration::from_millis(50));
-    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+    let _env = EnvLock::set(&sock);
 
     type VkDevice = *mut std::ffi::c_void;
     type VkQueue  = *mut std::ffi::c_void;
@@ -1763,7 +1802,7 @@ fn swapchain_ring_acquire_present_round_trip() {
     unsafe { vkDestroySwapchainKHR(device, swapchain, std::ptr::null()); }
     unsafe { vkDestroyDevice(device, std::ptr::null()); }
     unsafe { vkDestroyInstance(instance, std::ptr::null()); }
-    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    // env var cleared by EnvLock drop
     let _ = server_thread;
     let _ = std::fs::remove_file(&sock);
 }
@@ -1778,7 +1817,7 @@ fn create_atrium_surface_ext_returns_window_id_as_handle() {
     let listener = Listener::bind(&sock, backend_for_listener).unwrap();
     let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
     thread::sleep(Duration::from_millis(50));
-    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+    let _env = EnvLock::set(&sock);
 
     let mut instance: VkInstance = std::ptr::null_mut();
     unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
@@ -1802,7 +1841,7 @@ fn create_atrium_surface_ext_returns_window_id_as_handle() {
 
     unsafe { vkDestroySurfaceKHR(instance, surface, std::ptr::null()); }
     unsafe { vkDestroyInstance(instance, std::ptr::null()); }
-    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    // env var cleared by EnvLock drop
     let _ = server_thread;
     let _ = std::fs::remove_file(&sock);
 }
@@ -1824,7 +1863,7 @@ fn vkqueue_present_bumps_backend_present_counter() {
     let listener = Listener::bind(&sock, backend_for_listener).unwrap();
     let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
     thread::sleep(Duration::from_millis(50));
-    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+    let _env = EnvLock::set(&sock);
 
     type VkDevice = *mut std::ffi::c_void;
     type VkQueue  = *mut std::ffi::c_void;
@@ -1900,7 +1939,7 @@ fn vkqueue_present_bumps_backend_present_counter() {
     unsafe { vkDestroySurfaceKHR(instance, surface, std::ptr::null()); }
     unsafe { vkDestroyDevice(device, std::ptr::null()); }
     unsafe { vkDestroyInstance(instance, std::ptr::null()); }
-    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    // env var cleared by EnvLock drop
     let _ = server_thread;
     let _ = std::fs::remove_file(&sock);
 }
@@ -1948,7 +1987,7 @@ fn vkqueue_present_fires_software_backend_hook_with_surface_id() {
     let listener = Listener::bind(&sock, backend_for_listener).unwrap();
     let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
     thread::sleep(Duration::from_millis(50));
-    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+    let _env = EnvLock::set(&sock);
 
     type VkDevice = *mut std::ffi::c_void;
     type VkQueue  = *mut std::ffi::c_void;
@@ -2033,7 +2072,7 @@ fn vkqueue_present_fires_software_backend_hook_with_surface_id() {
     unsafe { vkDestroySurfaceKHR(instance, surface, std::ptr::null()); }
     unsafe { vkDestroyDevice(device, std::ptr::null()); }
     unsafe { vkDestroyInstance(instance, std::ptr::null()); }
-    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    // env var cleared by EnvLock drop
     let _ = server_thread;
     let _ = std::fs::remove_file(&sock);
 }
