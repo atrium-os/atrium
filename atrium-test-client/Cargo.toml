@@ -34,6 +34,12 @@ path = "src/window_demo.rs"
 name = "atrium-server-text-demo"
 path = "src/server_text_demo.rs"
 
+# Scene-complexity stress test. Emits N animated rects per frame
+# so frescod-aqueduct's tier-1 wait-phase scaling can be measured.
+[[bin]]
+name = "atrium-stress"
+path = "src/stress.rs"
+
 [dependencies]
 fresco-client   = { path = "../fresco-client" }
 fresco-protocol = { path = "../fresco-protocol" }
