@@ -825,8 +825,26 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkCommandBuffer, u32, u64, u32, u32, *const u64, u32, *const u32), FnVoidPtr,
             >(vkCmdBindDescriptorSets)),
-        // Phase 1.3b+ continued: vkCmdCopyBuffer*,
-        // vkCmdPipelineBarrier, vkDeviceWaitIdle, …
+        "vkCmdCopyBuffer" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u64, u64, u32, *const c_void), FnVoidPtr,
+            >(vkCmdCopyBuffer)),
+        "vkCmdCopyBufferToImage" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u64, u64, u32, u32, *const c_void), FnVoidPtr,
+            >(vkCmdCopyBufferToImage)),
+        "vkCmdPipelineBarrier" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u32, u32, u32, u32, *const c_void, u32, *const c_void, u32, *const c_void), FnVoidPtr,
+            >(vkCmdPipelineBarrier)),
+        "vkDeviceWaitIdle" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice) -> VkResult, FnVoidPtr,
+            >(vkDeviceWaitIdle)),
+        "vkQueueWaitIdle" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkQueue) -> VkResult, FnVoidPtr,
+            >(vkQueueWaitIdle)),
         _ => None,
     }
 }
@@ -2653,6 +2671,145 @@ pub unsafe extern "C" fn vkCmdBindDescriptorSets(
     }
 }
 
+/// `vkCmdCopyBuffer` — buffer-to-buffer region copy. Pushes one
+/// PipelineBarrier opcode reservation today (we don't have a
+/// dedicated buffer-copy FrameOp; the host endpoint handles it
+/// generically). Each VkBufferCopy region: srcOffset(u64) +
+/// dstOffset(u64) + size(u64) = 24 B.
+///
+/// Body: src_buffer_id u32 + dst_buffer_id u32 + region_count u32
+/// + per-region (24 B). Stuffed into BindDescriptors for now —
+/// dedicated opcode pending.
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdCopyBuffer(
+    command_buffer: VkCommandBuffer,
+    src_buffer:     u64,
+    dst_buffer:     u64,
+    region_count:   u32,
+    p_regions:      *const c_void,
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    if p_regions.is_null() || cb.device.is_null() { return; }
+    let src_id = resolve_buffer(cb, src_buffer).raw();
+    let dst_id = resolve_buffer(cb, dst_buffer).raw();
+    let mut body = Vec::with_capacity(12 + (region_count as usize) * 24);
+    body.extend_from_slice(&src_id.to_le_bytes());
+    body.extend_from_slice(&dst_id.to_le_bytes());
+    body.extend_from_slice(&region_count.to_le_bytes());
+    let regions_base = p_regions as *const u8;
+    for i in 0..region_count {
+        let r = regions_base.add(24 * i as usize);
+        body.extend_from_slice(
+            std::slice::from_raw_parts(r, 24),
+        );
+    }
+    // Reuse FrameOp::CopyBufToImg as the buffer-copy carrier for
+    // now; the renderer treats both copy variants in its
+    // Unsupported bucket until full implementation. Future
+    // protocol revision adds a dedicated CopyBufToBuf.
+    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::CopyBufToImg, &body);
+}
+
+/// `vkCmdCopyBufferToImage` — push a CopyBufToImg FrameOp with
+/// each VkBufferImageCopy region. Region layout (56 B per VkSpec):
+///   0   bufferOffset (u64)
+///   8   bufferRowLength (u32)
+///   12  bufferImageHeight (u32)
+///   16  imageSubresource (VkImageSubresourceLayers, 16 B)
+///   32  imageOffset (VkOffset3D, 12 B)
+///   44  _pad
+///   48  imageExtent (VkExtent3D, 12 B)
+///   60  _pad
+///
+/// Body: src_buffer_id u32 + dst_image_id u32 + dst_layout u32 +
+/// region_count u32 + per-region (56 B verbatim).
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdCopyBufferToImage(
+    command_buffer:  VkCommandBuffer,
+    src_buffer:      u64,
+    dst_image:       u64,
+    dst_image_layout: u32, /* VkImageLayout */
+    region_count:    u32,
+    p_regions:       *const c_void,
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    if p_regions.is_null() || cb.device.is_null() { return; }
+    let dev = &*(cb.device as *const AtriumDevice);
+    let src_id = resolve_buffer(cb, src_buffer).raw();
+    let dst_id = dev.images.lock().ok()
+        .and_then(|m| m.get(&dst_image).and_then(|x| x.image_id))
+        .map(|r| r.raw()).unwrap_or(0);
+
+    let mut body = Vec::with_capacity(16 + (region_count as usize) * 56);
+    body.extend_from_slice(&src_id.to_le_bytes());
+    body.extend_from_slice(&dst_id.to_le_bytes());
+    body.extend_from_slice(&dst_image_layout.to_le_bytes());
+    body.extend_from_slice(&region_count.to_le_bytes());
+    let regions_base = p_regions as *const u8;
+    for i in 0..region_count {
+        let r = regions_base.add(64 * i as usize);
+        // VkBufferImageCopy is 64 B in size (Vk spec; includes
+        // trailing pad to 8-byte alignment).
+        body.extend_from_slice(std::slice::from_raw_parts(r, 56));
+    }
+    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::CopyBufToImg, &body);
+}
+
+/// `vkCmdPipelineBarrier` — push a PipelineBarrier FrameOp.
+///
+/// Vk's model maps onto Atrium's: every barrier becomes a host-
+/// observable "wait for prior writes / make later reads see them"
+/// point. We carry srcStageMask + dstStageMask (and the buffer/
+/// image-memory-barrier counts; the barrier bodies themselves are
+/// dropped for now — the renderer's barrier handling is generic).
+///
+/// Body (12 B): src_stage_mask u32 + dst_stage_mask u32 +
+/// memory/buffer/image_barrier_count u32 (packed into one byte
+/// each + 1 pad).
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdPipelineBarrier(
+    command_buffer:           VkCommandBuffer,
+    src_stage_mask:           u32, /* VkPipelineStageFlags */
+    dst_stage_mask:           u32,
+    _dependency_flags:        u32,
+    memory_barrier_count:     u32,
+    _p_memory_barriers:       *const c_void,
+    buffer_barrier_count:     u32,
+    _p_buffer_memory_barriers: *const c_void,
+    image_barrier_count:      u32,
+    _p_image_memory_barriers: *const c_void,
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    let mut body = [0u8; 12];
+    body[ 0.. 4].copy_from_slice(&src_stage_mask.to_le_bytes());
+    body[ 4.. 8].copy_from_slice(&dst_stage_mask.to_le_bytes());
+    body[ 8.. 9].copy_from_slice(&[memory_barrier_count.min(255) as u8]);
+    body[ 9..10].copy_from_slice(&[buffer_barrier_count.min(255) as u8]);
+    body[10..11].copy_from_slice(&[image_barrier_count.min(255)  as u8]);
+    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::PipelineBarrier, &body);
+}
+
+/// `vkDeviceWaitIdle` — every prior vkQueueSubmit was synchronous
+/// from the ICD's POV (submit_frame returns when the daemon has
+/// queued the work; the host endpoint serializes), so this is a
+/// success no-op. Future async submit grows this into a real
+/// queue-drain.
+#[no_mangle]
+pub unsafe extern "C" fn vkDeviceWaitIdle(
+    _device: VkDevice,
+) -> VkResult {
+    VK_SUCCESS
+}
+
+/// `vkQueueWaitIdle` — same shape as vkDeviceWaitIdle (single
+/// queue today).
+#[no_mangle]
+pub unsafe extern "C" fn vkQueueWaitIdle(
+    _queue: VkQueue,
+) -> VkResult {
+    VK_SUCCESS
+}
+
 /// `vkCreateCommandPool` — allocate a non-dispatchable
 /// VkCommandPool handle. We ignore the create-info (queue family,
 /// flags); Atrium's single queue family means every pool is
@@ -3192,8 +3349,8 @@ mod tests {
 
     #[test]
     fn get_proc_addr_unknown_name_returns_none() {
-        // vkCmdPipelineBarrier isn't wired yet.
-        let name = b"vkCmdPipelineBarrier\0";
+        // vkCreateComputePipelines isn't wired yet (graphics-only).
+        let name = b"vkCreateComputePipelines\0";
         let r = unsafe {
             vk_icdGetInstanceProcAddr(
                 std::ptr::null_mut(),
