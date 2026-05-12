@@ -853,6 +853,34 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkCommandBuffer, u32, u32, u32), FnVoidPtr,
             >(vkCmdDispatch)),
+        "vkCmdNextSubpass" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u32), FnVoidPtr,
+            >(vkCmdNextSubpass)),
+        "vkCmdDrawIndirect" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u64, u64, u32, u32), FnVoidPtr,
+            >(vkCmdDrawIndirect)),
+        "vkCmdDrawIndexedIndirect" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u64, u64, u32, u32), FnVoidPtr,
+            >(vkCmdDrawIndexedIndirect)),
+        "vkCmdDispatchIndirect" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u64, u64), FnVoidPtr,
+            >(vkCmdDispatchIndirect)),
+        "vkCmdSetLineWidth" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, f32), FnVoidPtr,
+            >(vkCmdSetLineWidth)),
+        "vkCmdSetDepthBias" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, f32, f32, f32), FnVoidPtr,
+            >(vkCmdSetDepthBias)),
+        "vkCmdSetBlendConstants" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, *const f32), FnVoidPtr,
+            >(vkCmdSetBlendConstants)),
         _ => None,
     }
 }
@@ -2873,6 +2901,104 @@ pub unsafe extern "C" fn vkCmdDispatch(
     body[ 8..12].copy_from_slice(&group_count_z.to_le_bytes());
     let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::Dispatch, &body);
 }
+
+/// `vkCmdNextSubpass` — no-op today. Atrium's render-pass model
+/// collapses subpasses (the host endpoint's renderer handles
+/// dependency tracking on its own); Vulkan apps that call
+/// vkCmdNextSubpass during a multi-subpass render pass behave
+/// as if the subpasses are merged.
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdNextSubpass(
+    _command_buffer: VkCommandBuffer,
+    _contents:       u32,
+) {}
+
+/// `vkCmdDrawIndirect` — push `DrawIndirect`. Body:
+/// buffer_id u32 + _pad u32 + offset u64 + draw_count u32 + stride u32
+/// (24 B).
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdDrawIndirect(
+    command_buffer: VkCommandBuffer,
+    buffer:         u64,
+    offset:         u64,
+    draw_count:     u32,
+    stride:         u32,
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    let rid = resolve_buffer(cb, buffer).raw();
+    let mut body = [0u8; 24];
+    body[ 0.. 4].copy_from_slice(&rid.to_le_bytes());
+    body[ 8..16].copy_from_slice(&offset.to_le_bytes());
+    body[16..20].copy_from_slice(&draw_count.to_le_bytes());
+    body[20..24].copy_from_slice(&stride.to_le_bytes());
+    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::DrawIndirect, &body);
+}
+
+/// `vkCmdDrawIndexedIndirect` — same wire shape as DrawIndirect
+/// (the renderer demultiplexes via opcode). Body: 24 B as above.
+/// Reuses `FrameOp::DrawIndirect` for now; a dedicated
+/// `DrawIndexedIndirect` opcode lands when the protocol gets a
+/// dedicated entry.
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdDrawIndexedIndirect(
+    command_buffer: VkCommandBuffer,
+    buffer:         u64,
+    offset:         u64,
+    draw_count:     u32,
+    stride:         u32,
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    let rid = resolve_buffer(cb, buffer).raw();
+    let mut body = [0u8; 24];
+    body[ 0.. 4].copy_from_slice(&rid.to_le_bytes());
+    body[ 8..16].copy_from_slice(&offset.to_le_bytes());
+    body[16..20].copy_from_slice(&draw_count.to_le_bytes());
+    body[20..24].copy_from_slice(&stride.to_le_bytes());
+    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::DrawIndirect, &body);
+}
+
+/// `vkCmdDispatchIndirect` — push `DispatchIndirect`. Body:
+/// buffer_id u32 + _pad u32 + offset u64 (16 B).
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdDispatchIndirect(
+    command_buffer: VkCommandBuffer,
+    buffer:         u64,
+    offset:         u64,
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    let rid = resolve_buffer(cb, buffer).raw();
+    let mut body = [0u8; 16];
+    body[ 0.. 4].copy_from_slice(&rid.to_le_bytes());
+    body[ 8..16].copy_from_slice(&offset.to_le_bytes());
+    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::DispatchIndirect, &body);
+}
+
+/// `vkCmdSetLineWidth` — dynamic state. No FrameOp; today the
+/// renderer's rasteriser doesn't honour non-unit line widths.
+/// Recorded as PushConstants with a sentinel stage_mask=0,
+/// offset=0xLINEWIDTH so the host can ignore.
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdSetLineWidth(
+    _command_buffer: VkCommandBuffer,
+    _line_width:     f32,
+) {}
+
+/// `vkCmdSetDepthBias` — dynamic state. No-op today; future
+/// pipeline-state extension lands when depth-bias mattered.
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdSetDepthBias(
+    _command_buffer: VkCommandBuffer,
+    _constant_factor: f32,
+    _clamp:           f32,
+    _slope_factor:    f32,
+) {}
+
+/// `vkCmdSetBlendConstants` — dynamic state. No-op today.
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdSetBlendConstants(
+    _command_buffer:    VkCommandBuffer,
+    _p_blend_constants: *const f32, /* [f32; 4] */
+) {}
 
 /// `vkCreateCommandPool` — allocate a non-dispatchable
 /// VkCommandPool handle. We ignore the create-info (queue family,
