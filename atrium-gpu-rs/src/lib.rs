@@ -125,6 +125,70 @@ impl Gpu {
         }).collect())
     }
 
+    /// Mint a 32-byte unforgeable token for `bo`. The caller sends the
+    /// token to a peer (typically over an aqueduct-gpu protocol socket
+    /// in a different Portcullis jail); the peer presents it to
+    /// [`Gpu::import_region`] to register its own ref on the same BO.
+    ///
+    /// The minter's `Bo` continues to own the BO; the token-holder's
+    /// ref is independent. The BO is freed when *all* refs are
+    /// dropped, so the minter can hand out tokens and exit without
+    /// breaking the importer.
+    ///
+    /// See `docs/spec/aqueduct-gpu.md` (token model) and
+    /// `atrium_gpu.h` (wire details).
+    pub fn mint_token(&self, bo: &Bo<'_>) -> io::Result<[u8; abi::ATRIUM_GPU_TOKEN_LEN]> {
+        let mut m = abi::atrium_gpu_mint_token {
+            handle: bo.handle,
+            ..Default::default()
+        };
+        let r = unsafe { ioctl(self.fd, abi::ATRIUM_GPU_IOC_MINT_TOKEN, &mut m) };
+        if r != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(m.token)
+    }
+
+    /// Resolve a token (received out-of-band from the minter) into a
+    /// `Bo` owned by this fd. The kmod bumps the BO's refcount;
+    /// dropping the returned `Bo` calls `IOC_FREE` to drop this fd's
+    /// ref (the underlying BO survives if other fds still hold it).
+    pub fn import_region(
+        &self, token: &[u8; abi::ATRIUM_GPU_TOKEN_LEN],
+    ) -> io::Result<Bo<'_>> {
+        let mut i = abi::atrium_gpu_import_region {
+            token: *token,
+            ..Default::default()
+        };
+        let r = unsafe { ioctl(self.fd, abi::ATRIUM_GPU_IOC_IMPORT_REGION, &mut i) };
+        if r != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let page = unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) } as usize;
+        let map_len = ((i.size as usize) + page - 1) & !(page - 1);
+        let p = unsafe {
+            mmap(
+                ptr::null_mut(),
+                map_len,
+                PROT_READ | PROT_WRITE,
+                MAP_SHARED,
+                self.fd,
+                i.mmap_offset as i64,
+            )
+        };
+        if p == MAP_FAILED {
+            let e = io::Error::last_os_error();
+            unsafe { ioctl(self.fd, abi::ATRIUM_GPU_IOC_FREE, &i.handle) };
+            return Err(e);
+        }
+        Ok(Bo {
+            gpu: self,
+            handle: i.handle,
+            map: p as *mut u8,
+            map_len,
+        })
+    }
+
     /// Allocate a buffer object. The returned [`Bo`] owns the BO and
     /// frees it on drop.
     pub fn alloc(&self, size: u64, flags: u32) -> io::Result<Bo<'_>> {

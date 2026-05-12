@@ -125,6 +125,39 @@ pub struct atrium_gpu_list_backends {
 pub const ATRIUM_GPU_BACKEND_V1_VENDOR: u32 = 0xA710;
 pub const ATRIUM_GPU_BACKEND_V1_GEN:    u32 = 1;
 
+/// Cross-process region-sharing token length. See atrium_gpu.h
+/// §"Cross-process region sharing" for the full design.
+pub const ATRIUM_GPU_TOKEN_LEN: usize = 32;
+
+/// Mint an unguessable token for a BO this fd owns.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct atrium_gpu_mint_token {
+    pub handle: u32,
+    pub _pad0:  u32,
+    pub token:  [u8; ATRIUM_GPU_TOKEN_LEN],
+}
+impl Default for atrium_gpu_mint_token {
+    fn default() -> Self { unsafe { std::mem::zeroed() } }
+}
+
+/// Resolve a token to a BO and register it with this fd.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct atrium_gpu_import_region {
+    pub token:       [u8; ATRIUM_GPU_TOKEN_LEN],
+    pub handle:      u32,
+    pub _pad0:       u32,
+    pub size:        u64,
+    pub mmap_offset: u64,
+    pub flags:       u32,
+    pub _pad1:       u32,
+    pub _reserved:   [u64; 4],
+}
+impl Default for atrium_gpu_import_region {
+    fn default() -> Self { unsafe { std::mem::zeroed() } }
+}
+
 #[repr(C)]
 #[derive(Default, Copy, Clone)]
 pub struct atrium_display_bind_gpu {
@@ -269,6 +302,8 @@ pub const ATRIUM_GPU_IOC_FENCE_WAIT:   u64 = iow (G, 5, std::mem::size_of::<atri
 pub const ATRIUM_GPU_IOC_FENCE_QUERY:  u64 = iowr(G, 6, std::mem::size_of::<atrium_gpu_fence_query>()  as u32);
 pub const ATRIUM_GPU_IOC_CAPS:         u64 = ior (G, 7, std::mem::size_of::<atrium_gpu_caps>()         as u32);
 pub const ATRIUM_GPU_IOC_LIST_BACKENDS:u64 = iowr(G, 0x46, std::mem::size_of::<atrium_gpu_list_backends>() as u32);
+pub const ATRIUM_GPU_IOC_MINT_TOKEN:   u64 = iowr(G, 0x47, std::mem::size_of::<atrium_gpu_mint_token>()    as u32);
+pub const ATRIUM_GPU_IOC_IMPORT_REGION:u64 = iowr(G, 0x48, std::mem::size_of::<atrium_gpu_import_region>() as u32);
 
 pub const ATRIUM_DISPLAY_IOC_BIND_GPU:        u64 = iow (D, 0, std::mem::size_of::<atrium_display_bind_gpu>()        as u32);
 pub const ATRIUM_DISPLAY_IOC_ENUM_CONNECTORS: u64 = iowr(D, 1, std::mem::size_of::<atrium_display_enum>()            as u32);

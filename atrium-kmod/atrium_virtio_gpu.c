@@ -117,7 +117,17 @@ struct atrium_gpu_bo {
 	uint64_t                   mmap_offset;
 	vm_offset_t                kva;
 	vm_paddr_t                 pa;
+	/* Minter — the fd that originally allocated this BO. Used as a
+	 * back-pointer to softc in atrium_bo_free and for diagnostics.
+	 * Liveness is NOT tied to the minter; an importing fd can keep
+	 * the BO alive even after the minter closes. See `refcount`. */
 	struct atrium_gpu_file    *owner;
+	/* Refcount: bumps once per fd that has the BO in its
+	 * `mmap_acl` (minter at alloc time = 1; each successful
+	 * IOC_GPU_IMPORT_REGION = +1). Decremented by IOC_GPU_FREE on a
+	 * fd that holds a ref, and by fd-close walking that fd's acl.
+	 * BO is freed when refcount hits 0. Guarded by softc->bo_lock. */
+	uint32_t                   refcount;
 
 	/* virtio-gpu resource binding, set lazily by IOC_SET_MODE. 0 = unbound. */
 	uint32_t                   virtio_resource_id;
@@ -125,6 +135,25 @@ struct atrium_gpu_bo {
 	uint32_t                   scanout_width;
 	uint32_t                   scanout_height;
 };
+
+/* Per-fd access entry — one node per BO this fd can free + (in
+ * future, when the cdev mmap path gets per-fd auth) mmap. Each entry
+ * holds one count of the BO's refcount. */
+struct atrium_gpu_bo_ref {
+	TAILQ_ENTRY(atrium_gpu_bo_ref) link;
+	struct atrium_gpu_bo          *bo;
+};
+TAILQ_HEAD(atrium_gpu_bo_ref_list, atrium_gpu_bo_ref);
+
+/* Token table entry — maps an unguessable 32-byte token to a BO.
+ * Lives in softc, guarded by bo_lock. Inserted by IOC_GPU_MINT_TOKEN,
+ * removed when the BO's refcount hits 0. */
+struct atrium_gpu_token_entry {
+	TAILQ_ENTRY(atrium_gpu_token_entry) link;
+	uint8_t                token[ATRIUM_GPU_TOKEN_LEN];
+	struct atrium_gpu_bo  *bo;
+};
+TAILQ_HEAD(atrium_gpu_token_list, atrium_gpu_token_entry);
 
 TAILQ_HEAD(atrium_gpu_bo_list, atrium_gpu_bo);
 
@@ -169,6 +198,13 @@ struct atrium_gpu_softc {
 	struct atrium_gpu_bo_list      bos;
 	uint32_t                       next_handle;
 	uint32_t                       next_resource_id;  /* virtio-gpu side */
+
+	/* Token table for cross-process region sharing
+	 * (IOC_GPU_MINT_TOKEN / IOC_GPU_IMPORT_REGION). Linear search is
+	 * fine for the expected N (single-digit shared regions per
+	 * frescod ↔ ICD link). Guarded by `bo_lock` since every operation
+	 * is paired with a BO-table touch. */
+	struct atrium_gpu_token_list   tokens;
 
 	/* Monotonic per-driver context id allocator for CONTEXT_INIT.
 	 * Never returns 0 (zero is reserved for "no context"). The
@@ -326,6 +362,15 @@ struct atrium_gpu_file {
 	 * CTX_FENCE_WAIT to verify the requested fence belongs to this
 	 * fd's stream. Coarse but sufficient for V4 (synchronous submit). */
 	uint64_t                 ctx_last_fence;
+
+	/* Per-fd BO access list. One entry per BO this fd can free
+	 * (and, in the hardened mmap path, can mmap). Created by
+	 * IOC_GPU_ALLOC (for the minter) and IOC_GPU_IMPORT_REGION
+	 * (for importers). Each entry holds one count of the BO's
+	 * refcount. Walked by IOC_GPU_FREE to identify the caller's
+	 * ref to a given handle, and by the file dtor to decref at
+	 * close. Guarded by softc->bo_lock. */
+	struct atrium_gpu_bo_ref_list  mmap_acl;
 };
 
 /* Forward declarations: virtio-gpu helpers used by display ioctl handlers
@@ -421,14 +466,57 @@ atrium_bo_free(struct atrium_gpu_bo *bo)
 	free(bo, M_ATRIUM_GPU);
 }
 
-/* On fd close, drop every BO this fd owned. */
+/* Drop one ref on a BO. Caller holds bo_lock. If refcount hits zero,
+ * unlink from softc->bos, retire any token-table entries that point
+ * at this BO, drop the lock, and free the BO + tokens.
+ *
+ * Returns true if the BO was freed (i.e. last ref dropped), false
+ * otherwise. The caller drops the lock either way; we drop+re-lock
+ * around the free because atrium_bo_free can sleep (shm_lock,
+ * contigmalloc / free).
+ */
+static bool
+atrium_bo_decref_locked(struct atrium_gpu_softc *sc, struct atrium_gpu_bo *bo)
+{
+	struct atrium_gpu_token_entry *te, *te_tmp;
+	struct atrium_gpu_token_list  retired_tokens;
+
+	mtx_assert(&sc->bo_lock, MA_OWNED);
+	KASSERT(bo->refcount > 0,
+	    ("atrium-gpu: decref on bo with refcount 0"));
+	if (--bo->refcount > 0)
+		return (false);
+
+	/* Last ref — collect any tokens pointing at this BO so we can
+	 * free them after dropping bo_lock (atrium_bo_free may sleep). */
+	TAILQ_INIT(&retired_tokens);
+	TAILQ_FOREACH_SAFE(te, &sc->tokens, link, te_tmp) {
+		if (te->bo == bo) {
+			TAILQ_REMOVE(&sc->tokens, te, link);
+			TAILQ_INSERT_TAIL(&retired_tokens, te, link);
+		}
+	}
+	TAILQ_REMOVE(&sc->bos, bo, link);
+	mtx_unlock(&sc->bo_lock);
+
+	while ((te = TAILQ_FIRST(&retired_tokens)) != NULL) {
+		TAILQ_REMOVE(&retired_tokens, te, link);
+		free(te, M_ATRIUM_GPU);
+	}
+	atrium_bo_free(bo);
+
+	mtx_lock(&sc->bo_lock);
+	return (true);
+}
+
+/* On fd close, drop every BO this fd had access to (minted or
+ * imported). Each acl entry holds one count of the BO's refcount. */
 static void
 atrium_gpu_file_dtor(void *arg)
 {
 	struct atrium_gpu_file *f = arg;
 	struct atrium_gpu_softc *sc = f->sc;
-	struct atrium_gpu_bo *bo, *tmp;
-	struct atrium_gpu_bo_list orphans;
+	struct atrium_gpu_bo_ref *r;
 
 	/* Tear down virtio-gpu context (if any) before reclaiming BOs:
 	 * the host renderer may hold references to BOs attached to this
@@ -439,19 +527,17 @@ atrium_gpu_file_dtor(void *arg)
 		f->ctx_id = 0;
 	}
 
-	TAILQ_INIT(&orphans);
-	mtx_lock(&sc->bo_lock);
-	TAILQ_FOREACH_SAFE(bo, &sc->bos, link, tmp) {
-		if (bo->owner == f) {
-			TAILQ_REMOVE(&sc->bos, bo, link);
-			TAILQ_INSERT_TAIL(&orphans, bo, link);
-		}
-	}
-	mtx_unlock(&sc->bo_lock);
-
-	while ((bo = TAILQ_FIRST(&orphans)) != NULL) {
-		TAILQ_REMOVE(&orphans, bo, link);
-		atrium_bo_free(bo);
+	/* Walk the per-fd acl, decref each BO. Note that
+	 * atrium_bo_decref_locked drops bo_lock around the free, so the
+	 * acl list itself is owned solely by `f` (not protected by
+	 * bo_lock) and is safe to mutate without it. We do hold bo_lock
+	 * for each decref. */
+	while ((r = TAILQ_FIRST(&f->mmap_acl)) != NULL) {
+		TAILQ_REMOVE(&f->mmap_acl, r, link);
+		mtx_lock(&sc->bo_lock);
+		(void)atrium_bo_decref_locked(sc, r->bo);
+		mtx_unlock(&sc->bo_lock);
+		free(r, M_ATRIUM_GPU);
 	}
 	free(f, M_ATRIUM_GPU);
 }
@@ -491,8 +577,41 @@ atrium_gpu_open(struct cdev *cdev, int oflags __unused, int devtype __unused,
 
 	f = malloc(sizeof(*f), M_ATRIUM_GPU, M_WAITOK | M_ZERO);
 	f->sc = sc;
+	TAILQ_INIT(&f->mmap_acl);
 	devfs_set_cdevpriv(f, atrium_gpu_file_dtor);
 	return (0);
+}
+
+/* Add a refcount + acl entry for `bo` to `f`. Caller must hold
+ * bo_lock to bump refcount atomically with the BO being addressable.
+ * Returns ENOMEM if the acl entry can't be allocated. */
+static int
+atrium_gpu_acl_add(struct atrium_gpu_file *f, struct atrium_gpu_bo *bo)
+{
+	struct atrium_gpu_bo_ref *r;
+
+	r = malloc(sizeof(*r), M_ATRIUM_GPU, M_NOWAIT | M_ZERO);
+	if (r == NULL)
+		return (ENOMEM);
+	r->bo = bo;
+	bo->refcount++;
+	TAILQ_INSERT_TAIL(&f->mmap_acl, r, link);
+	return (0);
+}
+
+/* Find this fd's acl entry for `handle`. Returns NULL if no such
+ * entry. Caller may hold or not hold bo_lock — the acl is per-fd.
+ * The returned pointer is valid as long as the caller doesn't yield. */
+static struct atrium_gpu_bo_ref *
+atrium_gpu_acl_find(struct atrium_gpu_file *f, uint32_t handle)
+{
+	struct atrium_gpu_bo_ref *r;
+
+	TAILQ_FOREACH(r, &f->mmap_acl, link) {
+		if (r->bo->handle == handle)
+			return (r);
+	}
+	return (NULL);
 }
 
 static int
@@ -546,11 +665,20 @@ atrium_gpu_ioc_alloc(struct atrium_gpu_softc *sc, struct atrium_gpu_file *f,
 	bo->size  = aligned;
 	bo->flags = args->flags;
 	bo->owner = f;
+	bo->refcount = 0;  /* acl_add bumps to 1 */
 
 	mtx_lock(&sc->bo_lock);
 	bo->handle      = ++sc->next_handle;   /* never returns 0 */
 	bo->mmap_offset = (uint64_t)bo->handle * ATRIUM_BO_STRIDE;
 	TAILQ_INSERT_TAIL(&sc->bos, bo, link);
+	err = atrium_gpu_acl_add(f, bo);
+	if (err != 0) {
+		TAILQ_REMOVE(&sc->bos, bo, link);
+		mtx_unlock(&sc->bo_lock);
+		free((void *)bo->kva, M_ATRIUM_GPU);
+		free(bo, M_ATRIUM_GPU);
+		return (err);
+	}
 	mtx_unlock(&sc->bo_lock);
 
 	args->handle      = bo->handle;
@@ -562,17 +690,20 @@ static int
 atrium_gpu_ioc_free(struct atrium_gpu_softc *sc, struct atrium_gpu_file *f,
     uint32_t handle)
 {
-	struct atrium_gpu_bo *bo;
+	struct atrium_gpu_bo_ref *r;
 
-	mtx_lock(&sc->bo_lock);
-	bo = atrium_bo_find_locked(sc, handle);
-	if (bo == NULL || bo->owner != f) {
-		mtx_unlock(&sc->bo_lock);
+	/* Find this fd's claim on `handle`. The minter calls FREE on a
+	 * BO it allocated; an importer can also call FREE to drop its
+	 * imported ref. The BO is freed (and any pending tokens retired)
+	 * only when its refcount hits zero across all fds. */
+	r = atrium_gpu_acl_find(f, handle);
+	if (r == NULL)
 		return (ENOENT);
-	}
-	TAILQ_REMOVE(&sc->bos, bo, link);
+	TAILQ_REMOVE(&f->mmap_acl, r, link);
+	mtx_lock(&sc->bo_lock);
+	(void)atrium_bo_decref_locked(sc, r->bo);
 	mtx_unlock(&sc->bo_lock);
-	atrium_bo_free(bo);
+	free(r, M_ATRIUM_GPU);
 	return (0);
 }
 
@@ -618,7 +749,7 @@ atrium_gpu_ioc_submit(struct atrium_gpu_softc *sc, struct atrium_gpu_file *f,
 
 	mtx_lock(&sc->bo_lock);
 	cmd_bo = atrium_bo_find_locked(sc, args->cmd_handle);
-	if (cmd_bo == NULL || cmd_bo->owner != f) {
+	if (cmd_bo == NULL || atrium_gpu_acl_find(f, args->cmd_handle) == NULL) {
 		mtx_unlock(&sc->bo_lock);
 		return (ENOENT);
 	}
@@ -772,7 +903,7 @@ atrium_gpu_ioc_resource_attach(struct atrium_gpu_softc *sc,
 
 	mtx_lock(&sc->bo_lock);
 	bo = atrium_bo_find_locked(sc, args->bo_handle);
-	if (bo == NULL || bo->owner != f) {
+	if (bo == NULL || atrium_gpu_acl_find(f, args->bo_handle) == NULL) {
 		mtx_unlock(&sc->bo_lock);
 		return (ENOENT);
 	}
@@ -928,10 +1059,17 @@ atrium_gpu_alloc_scanout_bo(struct atrium_gpu_softc *sc,
 	/* 5. Publish handle + mmap_offset. mmap_offset uses the BAR
 	 *    window offset so it's globally unique (no two HOST blobs
 	 *    share a window). */
+	bo->refcount = 0;
 	mtx_lock(&sc->bo_lock);
 	bo->handle      = ++sc->next_handle;
 	bo->mmap_offset = bar_offset;
 	TAILQ_INSERT_TAIL(&sc->bos, bo, link);
+	err = atrium_gpu_acl_add(f, bo);
+	if (err != 0) {
+		TAILQ_REMOVE(&sc->bos, bo, link);
+		mtx_unlock(&sc->bo_lock);
+		goto fail_window;
+	}
 	mtx_unlock(&sc->bo_lock);
 
 	*bo_out = bo;
@@ -1021,6 +1159,7 @@ atrium_gpu_ioc_host_blob(struct atrium_gpu_softc *sc,
 	device_printf(sc->dev, "HOST_BLOB: MAP ok\n");
 
 	bo->virtio_resource_id = resource_id;
+	bo->refcount = 0;
 
 	/* Publish BO with a unique mmap_offset and handle. mmap_offset uses
 	 * BAR offset for unique-by-construction (no two HOST blobs share a
@@ -1029,6 +1168,12 @@ atrium_gpu_ioc_host_blob(struct atrium_gpu_softc *sc,
 	bo->handle      = ++sc->next_handle;
 	bo->mmap_offset = bar_offset; /* uniqueness inherited from window */
 	TAILQ_INSERT_TAIL(&sc->bos, bo, link);
+	err = atrium_gpu_acl_add(f, bo);
+	if (err != 0) {
+		TAILQ_REMOVE(&sc->bos, bo, link);
+		mtx_unlock(&sc->bo_lock);
+		goto fail;
+	}
 	mtx_unlock(&sc->bo_lock);
 
 	args->bo_handle    = bo->handle;
@@ -1104,6 +1249,76 @@ atrium_gpu_ioc_ctx_fence_wait(struct atrium_gpu_softc *sc __unused,
 		return (0);
 	}
 	args->status = 0;
+	return (0);
+}
+
+/* ATRIUM_GPU_IOC_MINT_TOKEN — mint a 32-byte unforgeable token for a
+ * BO this fd owns. The token is the cross-process capability: the
+ * minter sends it out-of-band (over the aqueduct-gpu protocol socket,
+ * itself a Portcullis-mounted capability) to a peer in a different
+ * jail; the peer presents the token to IOC_GPU_IMPORT_REGION to
+ * receive its own mmap'able handle for the same BO. See atrium_gpu.h
+ * §"Cross-process region sharing".
+ */
+static int
+atrium_gpu_ioc_mint_token(struct atrium_gpu_softc *sc,
+    struct atrium_gpu_file *f, struct atrium_gpu_mint_token *args)
+{
+	struct atrium_gpu_bo_ref *r;
+	struct atrium_gpu_token_entry *te;
+
+	r = atrium_gpu_acl_find(f, args->handle);
+	if (r == NULL)
+		return (ENOENT);
+
+	te = malloc(sizeof(*te), M_ATRIUM_GPU, M_WAITOK | M_ZERO);
+	arc4rand(te->token, ATRIUM_GPU_TOKEN_LEN, /*reseed=*/0);
+	te->bo = r->bo;
+
+	mtx_lock(&sc->bo_lock);
+	TAILQ_INSERT_TAIL(&sc->tokens, te, link);
+	mtx_unlock(&sc->bo_lock);
+
+	memcpy(args->token, te->token, ATRIUM_GPU_TOKEN_LEN);
+	return (0);
+}
+
+/* ATRIUM_GPU_IOC_IMPORT_REGION — resolve a token to a BO and register
+ * it with this fd. ++refcount; caller can now IOC_GPU_FREE the BO
+ * to drop its ref or mmap it via the returned mmap_offset.
+ *
+ * The token is the only auth — no per-jail check, because the
+ * aqueduct-gpu socket capability already gates which jails receive
+ * tokens. Possession proves access.
+ */
+static int
+atrium_gpu_ioc_import_region(struct atrium_gpu_softc *sc,
+    struct atrium_gpu_file *f, struct atrium_gpu_import_region *args)
+{
+	struct atrium_gpu_token_entry *te;
+	struct atrium_gpu_bo *bo = NULL;
+	int err;
+
+	mtx_lock(&sc->bo_lock);
+	TAILQ_FOREACH(te, &sc->tokens, link) {
+		if (memcmp(te->token, args->token, ATRIUM_GPU_TOKEN_LEN) == 0) {
+			bo = te->bo;
+			break;
+		}
+	}
+	if (bo == NULL) {
+		mtx_unlock(&sc->bo_lock);
+		return (ENOENT);
+	}
+	err = atrium_gpu_acl_add(f, bo);
+	mtx_unlock(&sc->bo_lock);
+	if (err != 0)
+		return (err);
+
+	args->handle      = bo->handle;
+	args->size        = bo->size;
+	args->mmap_offset = bo->mmap_offset;
+	args->flags       = bo->flags;
 	return (0);
 }
 
@@ -1209,6 +1424,12 @@ atrium_gpu_ioctl(struct cdev *cdev, u_long cmd, caddr_t data,
 	case ATRIUM_GPU_IOC_LIST_BACKENDS:
 		return (atrium_gpu_ioc_list_backends(sc,
 		    (struct atrium_gpu_list_backends *)data));
+	case ATRIUM_GPU_IOC_MINT_TOKEN:
+		return (atrium_gpu_ioc_mint_token(sc, f,
+		    (struct atrium_gpu_mint_token *)data));
+	case ATRIUM_GPU_IOC_IMPORT_REGION:
+		return (atrium_gpu_ioc_import_region(sc, f,
+		    (struct atrium_gpu_import_region *)data));
 
 	default:
 		return (ENOTTY);
@@ -2611,6 +2832,7 @@ atrium_virtio_gpu_attach(device_t dev)
 	sc->next_handle = 0;
 	sc->next_resource_id = 1;
 	TAILQ_INIT(&sc->bos);
+	TAILQ_INIT(&sc->tokens);
 	mtx_init(&sc->lock, "atrium-gpu", NULL, MTX_DEF);
 	mtx_init(&sc->ctrl_lock, "atrium-gpu ctrl", NULL, MTX_DEF);
 	mtx_init(&sc->bo_lock, "atrium-gpu bos", NULL, MTX_DEF);

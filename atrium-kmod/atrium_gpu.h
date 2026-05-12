@@ -334,6 +334,62 @@ struct atrium_gpu_host_blob {
 #define ATRIUM_GPU_IOC_HOST_BLOB \
 	_IOWR('G', 0x45, struct atrium_gpu_host_blob)
 
+/* ---------- Cross-process region sharing (Phase 1.5) ---------- */
+/*
+ * Atrium's GPU memory model: any process opens /dev/atrium-gpu0 and
+ * calls IOC_ALLOC to create a BO it owns. To share a BO with another
+ * process (the canonical case: the aqueduct-gpu host service shares
+ * a memory region with an atrium-vk-icd client in a different
+ * Portcullis jail), the owning fd MINTs a 32-byte unforgeable token
+ * via IOC_GPU_MINT_TOKEN. The token travels out-of-band — over the
+ * aqueduct-gpu protocol socket, which is itself a Portcullis-mounted
+ * capability — to the consumer. The consumer's fd calls
+ * IOC_GPU_IMPORT_REGION with the token; the kmod registers the BO in
+ * the consumer's per-fd access set, bumps the BO's refcount, and
+ * returns a handle the consumer can mmap.
+ *
+ * Lifetime: BOs are refcounted. mint = ref 1 (minter). import = ref++.
+ * IOC_FREE on any fd decrefs that fd's claim. The BO is freed when
+ * refcount hits zero. So the host service can mint, hand out tokens,
+ * and exit without breaking clients.
+ *
+ * Jail compatibility: the token is the only auth. devfs ruleset gates
+ * /dev/atrium-gpu0 visibility per jail (Portcullis manifest:
+ * `capabilities = [..., "gpu"]`). The aqueduct-gpu socket capability
+ * gates which jails receive tokens. No per-prison policy hooks are
+ * needed in the kmod — possession is sufficient.
+ *
+ * Security: tokens are 32 bytes of arc4random_buf — 256-bit
+ * unguessable. mmap is restricted to BOs in the calling fd's access
+ * set (closes a latent issue where a fd that opens /dev/atrium-gpu0
+ * could mmap any BO by guessing its kernel-assigned offset).
+ */
+
+#define ATRIUM_GPU_TOKEN_LEN 32
+
+struct atrium_gpu_mint_token {
+	uint32_t handle;                          /* in: BO this fd owns */
+	uint32_t _pad0;
+	uint8_t  token[ATRIUM_GPU_TOKEN_LEN];     /* out: opaque, unguessable */
+};
+
+#define ATRIUM_GPU_IOC_MINT_TOKEN \
+	_IOWR('G', 0x47, struct atrium_gpu_mint_token)
+
+struct atrium_gpu_import_region {
+	uint8_t  token[ATRIUM_GPU_TOKEN_LEN];     /* in: from minter */
+	uint32_t handle;                          /* out: BO handle for this fd */
+	uint32_t _pad0;
+	uint64_t size;                            /* out: BO size in bytes */
+	uint64_t mmap_offset;                     /* out: arg to mmap(2) */
+	uint32_t flags;                           /* out: BO flags as at alloc */
+	uint32_t _pad1;
+	uint64_t _reserved[4];
+};
+
+#define ATRIUM_GPU_IOC_IMPORT_REGION \
+	_IOWR('G', 0x48, struct atrium_gpu_import_region)
+
 /* ---------- Backend enumeration ---------- */
 /*
  * ATRIUM_GPU_IOC_LIST_BACKENDS — enumerate the (vendor_id,

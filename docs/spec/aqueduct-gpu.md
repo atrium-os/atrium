@@ -571,6 +571,29 @@ page-set; userspace `mmap(2)` on the kmod cdev fd exposes the region.
 No fixed BAR aperture. Each region is its own mmap. No subregion
 overlay games. No HVF stage-2 thrashing.
 
+**Implementation (Phase 1.5, FreeBSD-VM):** the kmod refcounts BOs
+and exposes two ioctls — `IOC_GPU_MINT_TOKEN(handle) → token[32]`
+(allocator's side) and `IOC_GPU_IMPORT_REGION(token[32]) →
+handle/size/mmap_offset` (consumer's side). The token is 32 bytes
+of `arc4random_buf` — 256-bit unguessable. Possession is the
+capability; no per-prison policy hooks are needed in the kmod
+because the aqueduct-gpu protocol socket the token travels over is
+itself a Portcullis-mounted capability.
+
+Refcount semantics: mint = ref 1 (minter), import = ref++, FREE
+on any fd that holds a ref = ref--, fd close walks the fd's
+acl and decrefs each. BO + token entry are freed when refcount
+hits zero. So the host service can mint, hand out tokens, and
+exit without breaking importing clients.
+
+VM-verified end-to-end with `examples/import_region`: minter
+process allocates a 4 KiB BO, writes a payload, prints a hex
+token; importer process resolves the token, mmaps the BO, reads
+back the same 4096 bytes byte-for-byte. Frescod-aqueduct
+regression run clean (49.9 iter/s, 28% level-3 partial)
+verifying the refcount refactor doesn't perturb the existing
+single-fd path.
+
 ### 4.5. macOS-HVF stage-2 contract
 
 The painful lessons from venus apply here too, but bounded to one
