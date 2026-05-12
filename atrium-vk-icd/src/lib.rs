@@ -91,19 +91,63 @@ const VK_ICD_LOADER_MAGIC: usize = 0x01CDC0DE;
 type VkInstance       = *mut c_void;
 type VkPhysicalDevice = *mut c_void;
 
+/// Environment variable for the aqueduct-gpu socket path. Mirrors
+/// frescod-aqueduct's FRESCOD_AQUEDUCT_SOCK to keep the same default.
+const ATRIUM_VK_ICD_SOCKET_ENV: &str = "ATRIUM_VK_ICD_SOCKET";
+const ATRIUM_VK_ICD_SOCKET_DEFAULT: &str = "/tmp/frescod-aqueduct.sock";
+
 /// ICD-side state behind a `VkInstance`. The first field MUST be
 /// the loader magic — the loader overwrites it on first use with a
 /// pointer to its own dispatch table; we never read it after
-/// returning the handle. Future device tracking + the aqueduct-gpu
-/// connection live in the trailing fields.
+/// returning the handle.
 #[repr(C)]
 struct AtriumInstance {
     /// First field — see `VK_ICD_LOADER_MAGIC`. The loader writes
     /// over this slot on first dispatch.
     loader_dispatch_slot: usize,
-    /// Reserved for future ICD state (aqueduct-gpu connection,
-    /// physical-device list, etc.).
-    _reserved: [u8; 0],
+    /// The aqueduct-gpu client connection this instance owns.
+    /// `None` if connect/handshake failed at create time — the
+    /// instance is still valid, just exposes zero physical devices.
+    client: Option<aqueduct_gpu_client::GpuClient>,
+    /// Physical devices discovered via the handshake. Each is a
+    /// boxed pointer the loader sees as a `VkPhysicalDevice` handle.
+    /// Owned: vkDestroyInstance walks this list and frees each.
+    devices: Vec<*mut AtriumPhysicalDevice>,
+}
+
+/// ICD-side state behind a `VkPhysicalDevice`. The first field MUST
+/// be the loader magic (same dispatch contract as `VkInstance`).
+#[repr(C)]
+struct AtriumPhysicalDevice {
+    /// First field — see `VK_ICD_LOADER_MAGIC`.
+    loader_dispatch_slot: usize,
+    /// Backend identity from the aqueduct-gpu handshake. Used to
+    /// answer vkGetPhysicalDeviceProperties (vendor/device IDs,
+    /// driver name) and to key the shader cache.
+    backend_vendor:     aqueduct_gpu::backends::GpuVendor,
+    backend_generation: u16,
+}
+
+/// Attempt the aqueduct-gpu socket connect + handshake. Returns the
+/// connected client + the BackendId, or `None` on any failure (no
+/// socket, daemon not running, protocol mismatch). vkCreateInstance
+/// treats failure as "zero physical devices" rather than refusing
+/// to create the instance, so a Vulkan app on a system without
+/// atrium-gpu running sees a present-but-empty ICD instead of an
+/// outright VK_ERROR_INCOMPATIBLE_DRIVER.
+fn try_connect_aqueduct() -> Option<(
+    aqueduct_gpu_client::GpuClient,
+    aqueduct_gpu::backends::BackendId,
+)> {
+    let sock = std::env::var(ATRIUM_VK_ICD_SOCKET_ENV)
+        .unwrap_or_else(|_| ATRIUM_VK_ICD_SOCKET_DEFAULT.to_string());
+    let conn = aqueduct::Connection::connect(&sock).ok()?;
+    let mut client = aqueduct_gpu_client::GpuClient::new(conn);
+    let resp = client.handshake(
+        aqueduct_gpu::payloads::ClientKind::VulkanIcd,
+    ).ok()?;
+    let backend = resp.backend;
+    Some((client, backend))
 }
 
 #[repr(C)]
@@ -218,9 +262,31 @@ pub unsafe extern "C" fn vkCreateInstance(
     if p_instance.is_null() {
         return VK_ERROR_INITIALIZATION_FAILED;
     }
+
+    // Best-effort aqueduct-gpu connection. Failure (no socket,
+    // daemon not running) is non-fatal: the instance is still
+    // valid, just exposes zero physical devices. A Vulkan app
+    // then sees "Atrium ICD present, 0 GPUs available" — the
+    // same surface as if a real GPU were missing.
+    let (client, devices) = match try_connect_aqueduct() {
+        Some((client, backend)) => {
+            // One backend → one VkPhysicalDevice today. When the
+            // kmod gains multi-backend enumeration (D5+), this
+            // grows into a loop over IOC_GPU_LIST_BACKENDS.
+            let pd = Box::new(AtriumPhysicalDevice {
+                loader_dispatch_slot: VK_ICD_LOADER_MAGIC,
+                backend_vendor:     backend.vendor,
+                backend_generation: backend.generation,
+            });
+            (Some(client), vec![Box::into_raw(pd)])
+        }
+        None => (None, Vec::new()),
+    };
+
     let inst = Box::new(AtriumInstance {
         loader_dispatch_slot: VK_ICD_LOADER_MAGIC,
-        _reserved: [],
+        client,
+        devices,
     });
     *p_instance = Box::into_raw(inst) as VkInstance;
     VK_SUCCESS
@@ -240,7 +306,14 @@ pub unsafe extern "C" fn vkDestroyInstance(
     if instance.is_null() {
         return;
     }
-    let _ = Box::from_raw(instance as *mut AtriumInstance);
+    // Reclaim the AtriumInstance and its owned VkPhysicalDevice
+    // handles. The Vec's Drop frees the Vec itself; we own each
+    // device via raw pointer and free them explicitly.
+    let inst = Box::from_raw(instance as *mut AtriumInstance);
+    for pd in &inst.devices {
+        let _ = Box::from_raw(*pd);
+    }
+    // inst goes out of scope here, dropping the GpuClient + Vec.
 }
 
 /// `vkEnumeratePhysicalDevices` — list the GPUs this ICD can target.
@@ -260,15 +333,32 @@ pub unsafe extern "C" fn vkDestroyInstance(
 /// `VkPhysicalDevice` slots.
 #[no_mangle]
 pub unsafe extern "C" fn vkEnumeratePhysicalDevices(
-    _instance:  VkInstance,
-    p_count:    *mut u32,
-    _p_devices: *mut VkPhysicalDevice,
+    instance:  VkInstance,
+    p_count:   *mut u32,
+    p_devices: *mut VkPhysicalDevice,
 ) -> VkResult {
-    if p_count.is_null() {
+    if p_count.is_null() || instance.is_null() {
         return VK_ERROR_INITIALIZATION_FAILED;
     }
-    *p_count = 0;
-    VK_SUCCESS
+    let inst = &*(instance as *const AtriumInstance);
+    let n = inst.devices.len() as u32;
+
+    if p_devices.is_null() {
+        // Count-only query.
+        *p_count = n;
+        return VK_SUCCESS;
+    }
+    let cap = *p_count;
+    let to_copy = cap.min(n);
+    for i in 0..to_copy {
+        *p_devices.offset(i as isize) = inst.devices[i as usize] as VkPhysicalDevice;
+    }
+    *p_count = to_copy;
+    // VK_INCOMPLETE (5) signals "you asked for fewer slots than I
+    // have devices; here's what I could fit". Strictly, our count
+    // is 0 or 1 today, so this fires only when cap=0 and we have a
+    // device — also a legitimate "size probe" call pattern.
+    if to_copy < n { 5 /* VK_INCOMPLETE */ } else { VK_SUCCESS }
 }
 
 /// `vkEnumerateInstanceVersion` — loader's first probe to learn what

@@ -8,11 +8,16 @@ description = "Vulkan ICD (Installable Client Driver) speaking aqueduct-gpu. Tra
 
 [lib]
 name       = "atrium_vk_icd"
-# cdylib so the Vulkan loader can dlopen() us and resolve the
-# loader-ICD entry points by symbol name.
-crate-type = ["cdylib"]
+# cdylib: so the Vulkan loader can dlopen() us and resolve the
+# loader-ICD entry points by symbol name. rlib: so integration
+# tests under `tests/` can link our `pub extern "C"` symbols
+# directly without going through the dlopen path.
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 aqueduct        = { path = "../aqueduct" }
 aqueduct-gpu    = { path = "../aqueduct-gpu" }
 aqueduct-gpu-client = { path = "../aqueduct-gpu-client" }
+
+[dev-dependencies]
+aqueduct-gpu-host = { path = "../aqueduct-gpu-host" }
