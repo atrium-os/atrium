@@ -159,8 +159,12 @@ fn main() -> std::io::Result<()> {
         gpu.alloc(bytes, flags)?,
         gpu.alloc(bytes, flags)?,
     ];
-    let mut next_render_idx: usize = 0;
-    let mut last_flipped_idx: usize = 0;
+    // Triple-buffer ring indices. Set by the first-frame block
+    // below (declared `mut` because the main loop rotates them on
+    // every real flip). Avoiding `= 0` initialization here keeps
+    // rustc from flagging the first-frame writes as dead.
+    let mut next_render_idx: usize;
+    let mut last_flipped_idx: usize;
 
     // ── In-process aqueduct-gpu-host + GpuClient ─────────────────
     // Use a Unix socket on tmpfs. In the D5+ end-state the client
@@ -250,7 +254,9 @@ fn main() -> std::io::Result<()> {
     // The whole-screen skip path (composite bytes unchanged AND no
     // window dirtied this frame) lets us elide the page-flip too.
     let mut window_surfaces: HashMap<u32, WindowSurface> = HashMap::new();
-    let mut last_composite_bytes: Vec<u8> = Vec::new();
+    // Initialised by the first-frame block below; main loop reassigns
+    // on every real flip. See next_render_idx above for the rationale.
+    let mut last_composite_bytes: Vec<u8>;
     let mut frames_since_real_flip: u32 = 0;
 
     // First frame: render into bos[0]; set mode + first flip against it.
