@@ -1063,6 +1063,53 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkQueue, *const c_void) -> VkResult, FnVoidPtr,
             >(vkQueuePresentKHR)),
+        // VK_EXT_debug_utils — no-op stubs (see "Debug-utils stubs"
+        // section). Lets validation layers + apps that probe for
+        // the extension load against atrium-vk-icd.
+        "vkCreateDebugUtilsMessengerEXT" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkInstance, *const c_void, *const c_void, *mut u64) -> VkResult, FnVoidPtr,
+            >(vkCreateDebugUtilsMessengerEXT)),
+        "vkDestroyDebugUtilsMessengerEXT" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkInstance, u64, *const c_void), FnVoidPtr,
+            >(vkDestroyDebugUtilsMessengerEXT)),
+        "vkSubmitDebugUtilsMessageEXT" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkInstance, u32, u32, *const c_void), FnVoidPtr,
+            >(vkSubmitDebugUtilsMessageEXT)),
+        "vkSetDebugUtilsObjectNameEXT" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, *const c_void) -> VkResult, FnVoidPtr,
+            >(vkSetDebugUtilsObjectNameEXT)),
+        "vkSetDebugUtilsObjectTagEXT" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, *const c_void) -> VkResult, FnVoidPtr,
+            >(vkSetDebugUtilsObjectTagEXT)),
+        "vkQueueBeginDebugUtilsLabelEXT" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkQueue, *const c_void), FnVoidPtr,
+            >(vkQueueBeginDebugUtilsLabelEXT)),
+        "vkQueueEndDebugUtilsLabelEXT" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkQueue), FnVoidPtr,
+            >(vkQueueEndDebugUtilsLabelEXT)),
+        "vkQueueInsertDebugUtilsLabelEXT" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkQueue, *const c_void), FnVoidPtr,
+            >(vkQueueInsertDebugUtilsLabelEXT)),
+        "vkCmdBeginDebugUtilsLabelEXT" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, *const c_void), FnVoidPtr,
+            >(vkCmdBeginDebugUtilsLabelEXT)),
+        "vkCmdEndDebugUtilsLabelEXT" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer), FnVoidPtr,
+            >(vkCmdEndDebugUtilsLabelEXT)),
+        "vkCmdInsertDebugUtilsLabelEXT" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, *const c_void), FnVoidPtr,
+            >(vkCmdInsertDebugUtilsLabelEXT)),
         _ => None,
     }
 }
@@ -4016,6 +4063,14 @@ pub unsafe extern "C" fn vkEnumerateInstanceVersion(
 const ATRIUM_INSTANCE_EXTENSIONS: &[(&[u8], u32)] = &[
     (b"VK_KHR_surface\0", 25),
     (b"VK_EXT_atrium_surface\0", 1),
+    // VK_EXT_debug_utils — we expose no-op stubs (see "Debug-utils
+    // stubs" section below). Lets apps + validation layers that
+    // probe for the extension load against atrium-vk-icd without
+    // tripping VK_ERROR_EXTENSION_NOT_PRESENT. The stubs are
+    // genuinely no-ops: messenger create/destroy succeed but never
+    // fire callbacks; labels and object names are silently dropped.
+    // Real diagnostic forwarding can land later if useful.
+    (b"VK_EXT_debug_utils\0", 2),
 ];
 
 #[no_mangle]
@@ -4162,6 +4217,112 @@ pub unsafe extern "C" fn vkCreateAtriumSurfaceEXT(
     *p_surface = window_id as u64;
     VK_SUCCESS
 }
+
+// ── VK_EXT_debug_utils stubs ─────────────────────────────────────
+//
+// All entry points here are intentionally no-ops. We expose the
+// extension so apps and validation layers that probe for it can
+// load against atrium-vk-icd without aborting on
+// VK_ERROR_EXTENSION_NOT_PRESENT — common with the Khronos
+// loader's debug-utils path.
+//
+// Stubs return success and do not retain any state:
+//   - Messenger create/destroy succeed but never fire callbacks.
+//   - Object name/tag setters accept the call and drop the
+//     metadata.
+//   - Queue + cmdbuf labels are silently dropped.
+//   - vkSubmitDebugUtilsMessageEXT is a no-op (no registered
+//     callbacks anyway).
+//
+// Real diagnostic forwarding to a fresco "debug" channel can
+// land later if Atrium gains a validation story; for now the
+// goal is unblocking app load.
+
+/// Pseudo-handle for VkDebugUtilsMessengerEXT. The ICD doesn't
+/// retain any state, but the loader insists on a non-null handle
+/// to forward through dispatch. We return a stable sentinel
+/// (any non-null aligned address) plus increment a counter so
+/// distinct messengers have distinct handles, which keeps
+/// "double-destroy" probes from passing accidentally.
+static ATRIUM_NEXT_DEBUG_MESSENGER_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+#[no_mangle]
+pub unsafe extern "C" fn vkCreateDebugUtilsMessengerEXT(
+    _instance:      VkInstance,
+    _p_create_info: *const c_void,
+    _p_allocator:   *const c_void,
+    p_messenger:    *mut u64,
+) -> VkResult {
+    if p_messenger.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let id = ATRIUM_NEXT_DEBUG_MESSENGER_ID
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    *p_messenger = id;
+    VK_SUCCESS
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkDestroyDebugUtilsMessengerEXT(
+    _instance:    VkInstance,
+    _messenger:   u64,
+    _p_allocator: *const c_void,
+) {}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkSubmitDebugUtilsMessageEXT(
+    _instance:        VkInstance,
+    _message_severity: u32,
+    _message_types:    u32,
+    _p_callback_data:  *const c_void,
+) {}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkSetDebugUtilsObjectNameEXT(
+    _device:      VkDevice,
+    _p_name_info: *const c_void,
+) -> VkResult { VK_SUCCESS }
+
+#[no_mangle]
+pub unsafe extern "C" fn vkSetDebugUtilsObjectTagEXT(
+    _device:     VkDevice,
+    _p_tag_info: *const c_void,
+) -> VkResult { VK_SUCCESS }
+
+#[no_mangle]
+pub unsafe extern "C" fn vkQueueBeginDebugUtilsLabelEXT(
+    _queue:       VkQueue,
+    _p_label_info: *const c_void,
+) {}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkQueueEndDebugUtilsLabelEXT(
+    _queue: VkQueue,
+) {}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkQueueInsertDebugUtilsLabelEXT(
+    _queue:        VkQueue,
+    _p_label_info: *const c_void,
+) {}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdBeginDebugUtilsLabelEXT(
+    _cmd_buffer:   VkCommandBuffer,
+    _p_label_info: *const c_void,
+) {}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdEndDebugUtilsLabelEXT(
+    _cmd_buffer: VkCommandBuffer,
+) {}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdInsertDebugUtilsLabelEXT(
+    _cmd_buffer:   VkCommandBuffer,
+    _p_label_info: *const c_void,
+) {}
 
 /// `vkGetPhysicalDeviceSurfaceSupportKHR` — always returns
 /// VK_TRUE for queue family 0 (our single family supports
@@ -4577,27 +4738,76 @@ mod tests {
 
     #[test]
     fn enumerate_instance_extensions_lists_atrium_surface() {
-        // VK_KHR_surface + VK_EXT_atrium_surface — see
-        // ATRIUM_INSTANCE_EXTENSIONS.
+        // VK_KHR_surface + VK_EXT_atrium_surface + VK_EXT_debug_utils
+        // — see ATRIUM_INSTANCE_EXTENSIONS.
         let f = lookup(b"vkEnumerateInstanceExtensionProperties\0").unwrap();
         let typed: unsafe extern "C" fn(*const c_char, *mut u32, *mut VkExtensionProperties) -> VkResult =
             unsafe { std::mem::transmute(f) };
         let mut count: u32 = 99;
         let r = unsafe { typed(std::ptr::null(), &mut count, std::ptr::null_mut()) };
         assert_eq!(r, VK_SUCCESS);
-        assert_eq!(count, 2);
+        assert_eq!(count, 3);
 
         let mut props: [VkExtensionProperties; 4] = unsafe { std::mem::zeroed() };
         let mut cap: u32 = 4;
         let _ = unsafe { typed(std::ptr::null(), &mut cap, props.as_mut_ptr()) };
-        assert_eq!(cap, 2);
-        // First entry: VK_KHR_surface.
-        let bytes0: Vec<u8> = props[0].extensionName.iter()
-            .take_while(|&&c| c != 0).map(|&c| c as u8).collect();
-        assert_eq!(std::str::from_utf8(&bytes0).unwrap(), "VK_KHR_surface");
-        let bytes1: Vec<u8> = props[1].extensionName.iter()
-            .take_while(|&&c| c != 0).map(|&c| c as u8).collect();
-        assert_eq!(std::str::from_utf8(&bytes1).unwrap(), "VK_EXT_atrium_surface");
+        assert_eq!(cap, 3);
+        let names: Vec<String> = (0..3).map(|i| {
+            let bytes: Vec<u8> = props[i].extensionName.iter()
+                .take_while(|&&c| c != 0).map(|&c| c as u8).collect();
+            String::from_utf8(bytes).unwrap()
+        }).collect();
+        assert_eq!(names[0], "VK_KHR_surface");
+        assert_eq!(names[1], "VK_EXT_atrium_surface");
+        assert_eq!(names[2], "VK_EXT_debug_utils");
+    }
+
+    #[test]
+    fn debug_utils_messenger_round_trip_and_label_stubs() {
+        // Create instance.
+        let f_ci = lookup(b"vkCreateInstance\0").unwrap();
+        let ci: unsafe extern "C" fn(*const c_void, *const c_void, *mut VkInstance) -> VkResult =
+            unsafe { std::mem::transmute(f_ci) };
+        let mut inst: VkInstance = std::ptr::null_mut();
+        unsafe { ci(std::ptr::null(), std::ptr::null(), &mut inst); }
+
+        // Messenger create returns success + non-null id; second
+        // call returns a DISTINCT id (catches "always 1" regression).
+        let f_cm = lookup(b"vkCreateDebugUtilsMessengerEXT\0").unwrap();
+        let cm: unsafe extern "C" fn(VkInstance, *const c_void, *const c_void, *mut u64) -> VkResult =
+            unsafe { std::mem::transmute(f_cm) };
+        let mut m1: u64 = 0;
+        let mut m2: u64 = 0;
+        let r1 = unsafe { cm(inst, std::ptr::null(), std::ptr::null(), &mut m1) };
+        let r2 = unsafe { cm(inst, std::ptr::null(), std::ptr::null(), &mut m2) };
+        assert_eq!(r1, VK_SUCCESS);
+        assert_eq!(r2, VK_SUCCESS);
+        assert_ne!(m1, 0);
+        assert_ne!(m1, m2, "distinct messenger handles");
+
+        // Destroy + the label/object-name stubs — none of these
+        // should crash or return a value we'd notice.
+        let f_dm = lookup(b"vkDestroyDebugUtilsMessengerEXT\0").unwrap();
+        let dm: unsafe extern "C" fn(VkInstance, u64, *const c_void) =
+            unsafe { std::mem::transmute(f_dm) };
+        unsafe { dm(inst, m1, std::ptr::null()); }
+        unsafe { dm(inst, m2, std::ptr::null()); }
+
+        // Spot-check the rest resolve to non-null function pointers.
+        assert!(lookup(b"vkSubmitDebugUtilsMessageEXT\0").is_some());
+        assert!(lookup(b"vkSetDebugUtilsObjectNameEXT\0").is_some());
+        assert!(lookup(b"vkSetDebugUtilsObjectTagEXT\0").is_some());
+        assert!(lookup(b"vkQueueBeginDebugUtilsLabelEXT\0").is_some());
+        assert!(lookup(b"vkQueueEndDebugUtilsLabelEXT\0").is_some());
+        assert!(lookup(b"vkQueueInsertDebugUtilsLabelEXT\0").is_some());
+        assert!(lookup(b"vkCmdBeginDebugUtilsLabelEXT\0").is_some());
+        assert!(lookup(b"vkCmdEndDebugUtilsLabelEXT\0").is_some());
+        assert!(lookup(b"vkCmdInsertDebugUtilsLabelEXT\0").is_some());
+
+        let f_di = lookup(b"vkDestroyInstance\0").unwrap();
+        let di: unsafe extern "C" fn(VkInstance, *const c_void) =
+            unsafe { std::mem::transmute(f_di) };
+        unsafe { di(inst, std::ptr::null()); }
     }
 
     #[test]
