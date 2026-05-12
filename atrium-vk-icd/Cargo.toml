@@ -18,6 +18,11 @@ crate-type = ["cdylib", "rlib"]
 aqueduct        = { path = "../aqueduct" }
 aqueduct-gpu    = { path = "../aqueduct-gpu" }
 aqueduct-gpu-client = { path = "../aqueduct-gpu-client" }
+# ash for the raw Vulkan struct + handle types only — disable the
+# default `loaded` runtime feature (we don't load libvulkan; we ARE
+# libvulkan from the loader's perspective). Saves ~hundreds of
+# lines of error-prone hand-defined Vk* structs.
+ash             = { version = "0.38", default-features = false }
 
 [dev-dependencies]
 aqueduct-gpu-host = { path = "../aqueduct-gpu-host" }

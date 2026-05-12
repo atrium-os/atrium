@@ -82,6 +82,89 @@ fn live_handshake_reports_one_physical_device() {
 }
 
 #[test]
+fn physical_device_properties_match_backend() {
+    use atrium_vk_icd::vkGetPhysicalDeviceProperties;
+
+    let sock = tmp_socket("props");
+    let sw_backend = Arc::new(SoftwareBackend::new());
+    let backend_for_listener: Arc<dyn Backend> = sw_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap();
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+
+    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+
+    let mut instance: VkInstance = std::ptr::null_mut();
+    unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
+    let mut devices: [VkPhysicalDevice; 1] = [std::ptr::null_mut(); 1];
+    let mut cap: u32 = 1;
+    unsafe { vkEnumeratePhysicalDevices(instance, &mut cap, devices.as_mut_ptr()); }
+    assert_eq!(cap, 1);
+
+    let mut props = ash::vk::PhysicalDeviceProperties::default();
+    unsafe { vkGetPhysicalDeviceProperties(devices[0], &mut props); }
+
+    // apiVersion encodes major=1 minor=3.
+    let major = (props.api_version >> 22) & 0x7f;
+    let minor = (props.api_version >> 12) & 0x3ff;
+    assert_eq!((major, minor), (1, 3));
+    assert_eq!(props.device_type, ash::vk::PhysicalDeviceType::VIRTUAL_GPU);
+    // deviceName starts with "atrium-vk-icd".
+    let name_bytes: Vec<u8> = props.device_name.iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
+    let name = std::str::from_utf8(&name_bytes).unwrap();
+    assert!(name.starts_with("atrium-vk-icd"), "got {name:?}");
+
+    unsafe { vkDestroyInstance(instance, std::ptr::null()); }
+    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[test]
+fn queue_family_properties_report_one_unified_family() {
+    use atrium_vk_icd::vkGetPhysicalDeviceQueueFamilyProperties;
+
+    let sock = tmp_socket("qfp");
+    let sw_backend = Arc::new(SoftwareBackend::new());
+    let backend_for_listener: Arc<dyn Backend> = sw_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap();
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+
+    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+
+    let mut instance: VkInstance = std::ptr::null_mut();
+    unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
+    let mut devices: [VkPhysicalDevice; 1] = [std::ptr::null_mut(); 1];
+    let mut cap: u32 = 1;
+    unsafe { vkEnumeratePhysicalDevices(instance, &mut cap, devices.as_mut_ptr()); }
+
+    // Count-only.
+    let mut count: u32 = 0;
+    unsafe { vkGetPhysicalDeviceQueueFamilyProperties(devices[0], &mut count, std::ptr::null_mut()); }
+    assert_eq!(count, 1);
+
+    // Fill.
+    let mut qfp = [ash::vk::QueueFamilyProperties::default(); 4];
+    let mut cap_q: u32 = 4;
+    unsafe { vkGetPhysicalDeviceQueueFamilyProperties(devices[0], &mut cap_q, qfp.as_mut_ptr()); }
+    assert_eq!(cap_q, 1);
+    let want = ash::vk::QueueFlags::GRAPHICS
+        | ash::vk::QueueFlags::COMPUTE
+        | ash::vk::QueueFlags::TRANSFER;
+    assert_eq!(qfp[0].queue_flags & want, want, "queue family must support gfx+compute+transfer");
+    assert_eq!(qfp[0].queue_count, 1);
+
+    unsafe { vkDestroyInstance(instance, std::ptr::null()); }
+    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[test]
 fn proc_addr_resolves_three_entry_points() {
     // No live daemon required for the get_proc_addr lookups.
     fn lookup(name: &[u8]) -> Option<unsafe extern "C" fn()> {

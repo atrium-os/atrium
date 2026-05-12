@@ -234,11 +234,117 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkInstance, *mut u32, *mut VkPhysicalDevice) -> VkResult, FnVoidPtr,
             >(vkEnumeratePhysicalDevices)),
-        // Phase 1.3b+: device-level entry points + command-buffer
-        // recording. The loader will discover them via
-        // vk_icdGetInstanceProcAddr with our returned VkInstance.
+        "vkGetPhysicalDeviceProperties" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkPhysicalDevice, *mut ash::vk::PhysicalDeviceProperties), FnVoidPtr,
+            >(vkGetPhysicalDeviceProperties)),
+        "vkGetPhysicalDeviceQueueFamilyProperties" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkPhysicalDevice, *mut u32, *mut ash::vk::QueueFamilyProperties), FnVoidPtr,
+            >(vkGetPhysicalDeviceQueueFamilyProperties)),
+        // Phase 1.3b+: vkCreateDevice, vkGetDeviceQueue,
+        // vkCreateCommandPool, vkAllocateCommandBuffers, vkBegin/
+        // EndCommandBuffer, vkCmd*, vkQueueSubmit, …
         _ => None,
     }
+}
+
+/// `vkGetPhysicalDeviceProperties` — describe the device's vendor /
+/// driver / limits. Apps use this to pick a physical device by
+/// vendorID + apiVersion + features.
+///
+/// We fill:
+/// - apiVersion: ATRIUM_ICD_API_VERSION (1.3.0 today).
+/// - driverVersion: 0 — bumps as the ICD reaches feature parity.
+/// - vendorID / deviceID: derived from the BackendId. For the
+///   Software backend that's Software vendor + generation 0.
+/// - deviceType: VIRTUAL_GPU (matches what a paravirt driver
+///   reports — applications shouldn't expect real-HW guarantees).
+/// - deviceName: "atrium-vk-icd ({vendor}:{generation})".
+/// - limits / sparseProperties: zeroed for skeleton. Real limits
+///   come from the backend's caps (Phase 1.3b+ wires them).
+///
+/// # Safety
+///
+/// `physical_device` must be a handle previously returned by our
+/// `vkEnumeratePhysicalDevices`. `p_properties` must be a writable
+/// `VkPhysicalDeviceProperties`.
+#[no_mangle]
+pub unsafe extern "C" fn vkGetPhysicalDeviceProperties(
+    physical_device: VkPhysicalDevice,
+    p_properties:    *mut ash::vk::PhysicalDeviceProperties,
+) {
+    if physical_device.is_null() || p_properties.is_null() {
+        return;
+    }
+    let pd = &*(physical_device as *const AtriumPhysicalDevice);
+
+    let mut props = ash::vk::PhysicalDeviceProperties::default();
+    props.api_version    = ATRIUM_ICD_API_VERSION;
+    props.driver_version = 0;
+    props.vendor_id      = pd.backend_vendor as u32;
+    props.device_id      = pd.backend_generation as u32;
+    props.device_type    = ash::vk::PhysicalDeviceType::VIRTUAL_GPU;
+
+    // Fill device_name from a fixed-format string. The Vk spec
+    // bounds it at VK_MAX_PHYSICAL_DEVICE_NAME_SIZE = 256 bytes
+    // including the NUL.
+    let name = format!("atrium-vk-icd ({}:{})",
+        pd.backend_vendor.name(), pd.backend_generation);
+    let name_bytes = name.as_bytes();
+    let n = name_bytes.len().min(props.device_name.len() - 1);
+    for (i, &b) in name_bytes.iter().take(n).enumerate() {
+        props.device_name[i] = b as c_char;
+    }
+    props.device_name[n] = 0;
+
+    *p_properties = props;
+}
+
+/// `vkGetPhysicalDeviceQueueFamilyProperties` — describe each queue
+/// family. We expose exactly one: graphics + compute + transfer,
+/// queue count 1. Atrium's GPU model is single-queue per device
+/// (the aqueduct-gpu wire is serial; multi-queue arrives when the
+/// kmod gains parallel submission rings, D5+).
+///
+/// Standard two-call query: caller invokes once with
+/// `p_properties=NULL` to learn the count, then again with a
+/// buffer.
+///
+/// # Safety
+///
+/// `p_queue_family_property_count` must be writable. `p_properties`
+/// may be null (count-only query) or point to a writable buffer of
+/// at least `*p_queue_family_property_count`
+/// `VkQueueFamilyProperties` slots.
+#[no_mangle]
+pub unsafe extern "C" fn vkGetPhysicalDeviceQueueFamilyProperties(
+    _physical_device:              VkPhysicalDevice,
+    p_queue_family_property_count: *mut u32,
+    p_properties:                  *mut ash::vk::QueueFamilyProperties,
+) {
+    if p_queue_family_property_count.is_null() {
+        return;
+    }
+    if p_properties.is_null() {
+        *p_queue_family_property_count = 1;
+        return;
+    }
+    let cap = *p_queue_family_property_count;
+    if cap == 0 {
+        return;
+    }
+    let mut qfp = ash::vk::QueueFamilyProperties::default();
+    qfp.queue_flags = ash::vk::QueueFlags::GRAPHICS
+        | ash::vk::QueueFlags::COMPUTE
+        | ash::vk::QueueFlags::TRANSFER;
+    qfp.queue_count          = 1;
+    qfp.timestamp_valid_bits = 0;
+    qfp.min_image_transfer_granularity = ash::vk::Extent3D {
+        width: 1, height: 1, depth: 1,
+    };
+    *p_properties.offset(0) = qfp;
+    *p_queue_family_property_count = 1;
 }
 
 /// `vkCreateInstance` — allocate an ICD-owned VkInstance handle.
