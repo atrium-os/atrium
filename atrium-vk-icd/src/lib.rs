@@ -525,6 +525,72 @@ pub struct VkLayerProperties {
     description:           [c_char; VK_MAX_DESCRIPTION_SIZE],
 }
 
+/// Names that vk_icdGetPhysicalDeviceProcAddr resolves.
+///
+/// Per ICD ABI v4+, the Khronos loader probes this function to
+/// fast-path physical-device entry points — bypassing the
+/// instance-thunking step on every call. The set is exactly
+/// the entry points whose first parameter is VkPhysicalDevice.
+///
+/// Returns NULL for anything else (instance- or device-level)
+/// even when those names are valid via
+/// vk_icdGetInstanceProcAddr. This is what the loader expects
+/// to decide whether it should keep its dispatch table entry or
+/// fall back to the slow path.
+const ATRIUM_PHYSICAL_DEVICE_ENTRY_POINTS: &[&str] = &[
+    "vkGetPhysicalDeviceProperties",
+    "vkGetPhysicalDeviceFeatures",
+    "vkGetPhysicalDeviceMemoryProperties",
+    "vkGetPhysicalDeviceQueueFamilyProperties",
+    "vkGetPhysicalDeviceFormatProperties",
+    "vkGetPhysicalDeviceImageFormatProperties",
+    "vkGetPhysicalDeviceProperties2",
+    "vkGetPhysicalDeviceProperties2KHR",
+    "vkGetPhysicalDeviceFeatures2",
+    "vkGetPhysicalDeviceFeatures2KHR",
+    "vkGetPhysicalDeviceMemoryProperties2",
+    "vkGetPhysicalDeviceMemoryProperties2KHR",
+    "vkGetPhysicalDeviceQueueFamilyProperties2",
+    "vkGetPhysicalDeviceQueueFamilyProperties2KHR",
+    "vkGetPhysicalDeviceFormatProperties2",
+    "vkGetPhysicalDeviceFormatProperties2KHR",
+    "vkGetPhysicalDeviceImageFormatProperties2",
+    "vkGetPhysicalDeviceImageFormatProperties2KHR",
+    "vkGetPhysicalDeviceSurfaceSupportKHR",
+    "vkGetPhysicalDeviceSurfaceCapabilitiesKHR",
+    "vkGetPhysicalDeviceSurfaceFormatsKHR",
+    "vkGetPhysicalDeviceSurfacePresentModesKHR",
+    "vkEnumerateDeviceExtensionProperties",
+];
+
+/// `vk_icdGetPhysicalDeviceProcAddr` — ICD ABI v4+ fast-path for
+/// physical-device entry points. The Khronos loader detects this
+/// function via dlsym and uses it (instead of
+/// vk_icdGetInstanceProcAddr) to populate its physical-device
+/// dispatch table, avoiding a thunk through the loader's
+/// instance dispatch on every call.
+///
+/// Returns NULL for instance-level (vkCreateInstance, …) and
+/// device-level (vkQueueSubmit, …) names, even though we DO
+/// expose those via vk_icdGetInstanceProcAddr.
+#[no_mangle]
+pub unsafe extern "C" fn vk_icdGetPhysicalDeviceProcAddr(
+    _instance: *mut c_void,
+    name:      *const c_char,
+) -> PFN_vkVoidFunction {
+    if name.is_null() {
+        return None;
+    }
+    let name_str = match CStr::from_ptr(name).to_str() {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+    if !ATRIUM_PHYSICAL_DEVICE_ENTRY_POINTS.iter().any(|n| *n == name_str) {
+        return None;
+    }
+    vk_icdGetInstanceProcAddr(std::ptr::null_mut(), name)
+}
+
 /// Names that vkGetDeviceProcAddr must NOT resolve (per spec).
 /// The Khronos loader treats device-level proc-addr as the
 /// canonical fast path for an app, and apps occasionally call
@@ -5318,6 +5384,76 @@ mod tests {
         assert!(unsafe { gdpa(std::ptr::null_mut(), std::ptr::null()) }.is_none());
         assert!(unsafe { gdpa(std::ptr::null_mut(),
             b"vkNonexistentEntryPoint\0".as_ptr() as *const c_char) }.is_none());
+    }
+
+    #[test]
+    fn icd_get_physical_device_proc_addr_resolves_only_phys_device_entries() {
+        // Direct call — this function isn't routed through
+        // vk_icdGetInstanceProcAddr (the loader looks it up via
+        // dlsym), so we call it directly.
+        let inst: *mut c_void = std::ptr::null_mut();
+
+        // Physical-device entry points: resolve.
+        for name in [
+            "vkGetPhysicalDeviceProperties\0",
+            "vkGetPhysicalDeviceProperties2\0",
+            "vkGetPhysicalDeviceProperties2KHR\0",
+            "vkGetPhysicalDeviceFeatures\0",
+            "vkGetPhysicalDeviceFeatures2\0",
+            "vkGetPhysicalDeviceImageFormatProperties\0",
+            "vkGetPhysicalDeviceSurfaceCapabilitiesKHR\0",
+            "vkEnumerateDeviceExtensionProperties\0",
+        ] {
+            let r = unsafe {
+                vk_icdGetPhysicalDeviceProcAddr(inst, name.as_ptr() as *const c_char)
+            };
+            assert!(r.is_some(),
+                "vk_icdGetPhysicalDeviceProcAddr should resolve {:?}",
+                &name[..name.len()-1]);
+        }
+
+        // Instance-level: rejected.
+        for name in [
+            "vkCreateInstance\0",
+            "vkDestroyInstance\0",
+            "vkEnumerateInstanceExtensionProperties\0",
+            "vkEnumeratePhysicalDevices\0",
+            "vkCreateDevice\0",
+            "vkCreateAtriumSurfaceEXT\0",
+            "vkDestroySurfaceKHR\0",
+            "vkCreateDebugUtilsMessengerEXT\0",
+        ] {
+            let r = unsafe {
+                vk_icdGetPhysicalDeviceProcAddr(inst, name.as_ptr() as *const c_char)
+            };
+            assert!(r.is_none(),
+                "vk_icdGetPhysicalDeviceProcAddr MUST NOT resolve {:?}",
+                &name[..name.len()-1]);
+        }
+
+        // Device-level: rejected.
+        for name in [
+            "vkQueueSubmit\0",
+            "vkCmdDraw\0",
+            "vkCreateSwapchainKHR\0",
+            "vkQueuePresentKHR\0",
+            "vkGetDeviceProcAddr\0",
+        ] {
+            let r = unsafe {
+                vk_icdGetPhysicalDeviceProcAddr(inst, name.as_ptr() as *const c_char)
+            };
+            assert!(r.is_none(),
+                "vk_icdGetPhysicalDeviceProcAddr MUST NOT resolve {:?}",
+                &name[..name.len()-1]);
+        }
+
+        // Edge cases.
+        assert!(unsafe {
+            vk_icdGetPhysicalDeviceProcAddr(inst, std::ptr::null())
+        }.is_none());
+        assert!(unsafe {
+            vk_icdGetPhysicalDeviceProcAddr(inst, b"vkNonexistent\0".as_ptr() as *const c_char)
+        }.is_none());
     }
 
     #[test]
