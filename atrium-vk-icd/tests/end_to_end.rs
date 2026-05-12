@@ -165,6 +165,58 @@ fn queue_family_properties_report_one_unified_family() {
 }
 
 #[test]
+fn device_create_queue_destroy_round_trip() {
+    use atrium_vk_icd::{vkCreateDevice, vkDestroyDevice, vkGetDeviceQueue};
+
+    let sock = tmp_socket("dev");
+    let sw_backend = Arc::new(SoftwareBackend::new());
+    let backend_for_listener: Arc<dyn Backend> = sw_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap();
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+
+    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+
+    let mut instance: VkInstance = std::ptr::null_mut();
+    unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
+    let mut devices: [VkPhysicalDevice; 1] = [std::ptr::null_mut(); 1];
+    let mut cap: u32 = 1;
+    unsafe { vkEnumeratePhysicalDevices(instance, &mut cap, devices.as_mut_ptr()); }
+    assert_eq!(cap, 1);
+
+    // Create logical device on the physical device.
+    type VkDevice = *mut std::ffi::c_void;
+    type VkQueue  = *mut std::ffi::c_void;
+    let mut device: VkDevice = std::ptr::null_mut();
+    let r = unsafe {
+        vkCreateDevice(devices[0], std::ptr::null(), std::ptr::null(), &mut device)
+    };
+    assert_eq!(r, 0);
+    assert!(!device.is_null());
+    // Loader-ICD magic at offset 0.
+    let slot: usize = unsafe { *(device as *const usize) };
+    assert_eq!(slot, 0x01CDC0DE, "VkDevice must carry the loader magic");
+
+    // Grab the queue for (family=0, index=0).
+    let mut queue: VkQueue = std::ptr::null_mut();
+    unsafe { vkGetDeviceQueue(device, 0, 0, &mut queue); }
+    assert!(!queue.is_null(), "(0, 0) queue must exist on Atrium devices");
+    let qslot: usize = unsafe { *(queue as *const usize) };
+    assert_eq!(qslot, 0x01CDC0DE, "VkQueue must carry the loader magic");
+
+    // A bogus (family, index) returns NULL.
+    let mut bogus: VkQueue = std::ptr::null_mut();
+    unsafe { vkGetDeviceQueue(device, 0, 99, &mut bogus); }
+    assert!(bogus.is_null(), "out-of-range queue must return NULL");
+
+    unsafe { vkDestroyDevice(device, std::ptr::null()); }
+    unsafe { vkDestroyInstance(instance, std::ptr::null()); }
+    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[test]
 fn proc_addr_resolves_three_entry_points() {
     // No live daemon required for the get_proc_addr lookups.
     fn lookup(name: &[u8]) -> Option<unsafe extern "C" fn()> {

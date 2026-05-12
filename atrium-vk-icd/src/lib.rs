@@ -128,6 +128,43 @@ struct AtriumPhysicalDevice {
     backend_generation: u16,
 }
 
+/// Vulkan handle types for device-level objects.
+type VkDevice = *mut c_void;
+type VkQueue  = *mut c_void;
+
+/// ICD-side state behind a `VkDevice`. The first slot holds the
+/// loader magic. We currently allocate one `AtriumQueue` per
+/// VkDeviceQueueCreateInfo entry; Atrium's single-queue model means
+/// there's exactly one queue per device today.
+#[repr(C)]
+struct AtriumDevice {
+    /// First field — see `VK_ICD_LOADER_MAGIC`.
+    loader_dispatch_slot: usize,
+    /// Owned queues, indexed by (queue_family_index, queue_index).
+    /// Today: a single (0, 0) entry. Each queue is a Box pointer
+    /// the loader sees as a `VkQueue` handle; freed in
+    /// `vkDestroyDevice`.
+    queues: Vec<*mut AtriumQueue>,
+}
+
+/// ICD-side state behind a `VkQueue`. Same dispatchable-handle
+/// contract (first field = loader magic). Carries a back-pointer
+/// to its owning device so `vkQueueSubmit` can reach the
+/// aqueduct-gpu connection.
+#[repr(C)]
+struct AtriumQueue {
+    /// First field — see `VK_ICD_LOADER_MAGIC`.
+    loader_dispatch_slot: usize,
+    /// Back-pointer to the AtriumDevice that owns this queue.
+    /// Borrowed (the queue is freed before the device it
+    /// references).
+    _device: *mut AtriumDevice,
+    /// Family + index from the VkDeviceQueueCreateInfo this queue
+    /// satisfies. Used by `vkGetDeviceQueue` for lookup.
+    family: u32,
+    index:  u32,
+}
+
 /// Attempt the aqueduct-gpu socket connect + handshake. Returns the
 /// connected client + the BackendId, or `None` on any failure (no
 /// socket, daemon not running, protocol mismatch). vkCreateInstance
@@ -242,9 +279,20 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkPhysicalDevice, *mut u32, *mut ash::vk::QueueFamilyProperties), FnVoidPtr,
             >(vkGetPhysicalDeviceQueueFamilyProperties)),
-        // Phase 1.3b+: vkCreateDevice, vkGetDeviceQueue,
-        // vkCreateCommandPool, vkAllocateCommandBuffers, vkBegin/
-        // EndCommandBuffer, vkCmd*, vkQueueSubmit, …
+        "vkCreateDevice" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkPhysicalDevice, *const c_void, *const c_void, *mut VkDevice) -> VkResult, FnVoidPtr,
+            >(vkCreateDevice)),
+        "vkDestroyDevice" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, *const c_void), FnVoidPtr,
+            >(vkDestroyDevice)),
+        "vkGetDeviceQueue" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u32, u32, *mut VkQueue), FnVoidPtr,
+            >(vkGetDeviceQueue)),
+        // Phase 1.3b+: vkCreateCommandPool, vkAllocateCommandBuffers,
+        // vkBegin/EndCommandBuffer, vkCmd*, vkQueueSubmit, …
         _ => None,
     }
 }
@@ -345,6 +393,106 @@ pub unsafe extern "C" fn vkGetPhysicalDeviceQueueFamilyProperties(
     };
     *p_properties.offset(0) = qfp;
     *p_queue_family_property_count = 1;
+}
+
+/// `vkCreateDevice` — allocate an `AtriumDevice` with one or more
+/// queues. We honor the `VkDeviceQueueCreateInfo` list only insofar
+/// as we materialize the requested queues; everything else (enabled
+/// features, layer/extension lists, pNext chain) is ignored today.
+///
+/// Each created queue is a Box-allocated `AtriumQueue` with the
+/// loader magic at offset 0; the device tracks them in
+/// `device.queues` and frees them on `vkDestroyDevice`.
+///
+/// Sane simplification: we know Atrium exposes exactly one queue
+/// family with exactly one queue (see
+/// `vkGetPhysicalDeviceQueueFamilyProperties`). So we ignore the
+/// create-info's `queueFamilyIndex` and `queueCount` requests and
+/// just create our single queue. Apps that requested more queues
+/// will get exactly one (a deliberate spec deviation for now,
+/// surfaced via a future debug log).
+///
+/// # Safety
+///
+/// `physical_device` must be a handle we returned from
+/// vkEnumeratePhysicalDevices. `p_device` must be a writable slot.
+#[no_mangle]
+pub unsafe extern "C" fn vkCreateDevice(
+    _physical_device: VkPhysicalDevice,
+    _p_create_info:   *const c_void, /* const VkDeviceCreateInfo* */
+    _p_allocator:     *const c_void, /* const VkAllocationCallbacks* */
+    p_device:         *mut VkDevice,
+) -> VkResult {
+    if p_device.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    // Allocate the device first (we need its address for the queue
+    // back-pointer), then build a single queue and link it in.
+    let mut dev = Box::new(AtriumDevice {
+        loader_dispatch_slot: VK_ICD_LOADER_MAGIC,
+        queues: Vec::with_capacity(1),
+    });
+    let dev_ptr: *mut AtriumDevice = &mut *dev;
+    let q = Box::new(AtriumQueue {
+        loader_dispatch_slot: VK_ICD_LOADER_MAGIC,
+        _device: dev_ptr,
+        family: 0,
+        index:  0,
+    });
+    dev.queues.push(Box::into_raw(q));
+    *p_device = Box::into_raw(dev) as VkDevice;
+    VK_SUCCESS
+}
+
+/// `vkDestroyDevice` — reclaim the AtriumDevice + all its queues.
+///
+/// # Safety
+///
+/// `device` must be a handle previously returned by
+/// `vkCreateDevice`, or null (no-op).
+#[no_mangle]
+pub unsafe extern "C" fn vkDestroyDevice(
+    device:       VkDevice,
+    _p_allocator: *const c_void, /* const VkAllocationCallbacks* */
+) {
+    if device.is_null() {
+        return;
+    }
+    let dev = Box::from_raw(device as *mut AtriumDevice);
+    for q in &dev.queues {
+        let _ = Box::from_raw(*q);
+    }
+}
+
+/// `vkGetDeviceQueue` — return the queue for `(family, index)`.
+///
+/// Today we materialize a single (family=0, index=0) queue at
+/// vkCreateDevice time. Any other `(family, index)` pair writes
+/// `VK_NULL_HANDLE` to `p_queue`.
+///
+/// # Safety
+///
+/// `device` must be a handle from `vkCreateDevice`. `p_queue` must
+/// be writable.
+#[no_mangle]
+pub unsafe extern "C" fn vkGetDeviceQueue(
+    device:             VkDevice,
+    queue_family_index: u32,
+    queue_index:        u32,
+    p_queue:            *mut VkQueue,
+) {
+    if device.is_null() || p_queue.is_null() {
+        return;
+    }
+    let dev = &*(device as *const AtriumDevice);
+    *p_queue = std::ptr::null_mut();
+    for &q in &dev.queues {
+        let qref = &*q;
+        if qref.family == queue_family_index && qref.index == queue_index {
+            *p_queue = q as VkQueue;
+            return;
+        }
+    }
 }
 
 /// `vkCreateInstance` — allocate an ICD-owned VkInstance handle.
@@ -581,8 +729,8 @@ mod tests {
 
     #[test]
     fn get_proc_addr_unknown_name_returns_none() {
-        // vkCreateDevice isn't wired yet (Phase 1.3b+).
-        let name = b"vkCreateDevice\0";
+        // vkCmdDraw isn't wired yet (Phase 1.3b cmdbuf).
+        let name = b"vkCmdDraw\0";
         let r = unsafe {
             vk_icdGetInstanceProcAddr(
                 std::ptr::null_mut(),
