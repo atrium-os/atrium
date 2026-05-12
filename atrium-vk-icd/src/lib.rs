@@ -303,6 +303,13 @@ struct AtriumDevice {
     /// the sampler. `None` if the instance had no live client.
     samplers: std::sync::Mutex<std::collections::HashMap<u64, Option<aqueduct_gpu::ids::ResourceId>>>,
     next_sampler_id: std::cell::Cell<u64>,
+    /// Per-VkQueryPool / VkEvent / VkBufferView: opaque non-zero
+    /// u64 counters. Real implementations would model the per-
+    /// query data; the renderer's tier-1 has no query support.
+    next_query_pool_id:  std::cell::Cell<u64>,
+    events: std::sync::Mutex<std::collections::HashMap<u64, bool>>,
+    next_event_id:       std::cell::Cell<u64>,
+    next_buffer_view_id: std::cell::Cell<u64>,
     /// Per-VkDescriptorSetLayout state. Today: opaque non-zero
     /// u64 (we don't track per-binding type info — the host's
     /// pipeline / shader knows its expected layout).
@@ -909,6 +916,85 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkCommandBuffer, u64, u32, u64, u32, *const c_void), FnVoidPtr,
             >(vkCmdCopyImageToBuffer)),
+        // Query pools — no-ops + opaque handles.
+        "vkCreateQueryPool" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, *const c_void, *const c_void, *mut u64) -> VkResult, FnVoidPtr,
+            >(vkCreateQueryPool)),
+        "vkDestroyQueryPool" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, *const c_void), FnVoidPtr,
+            >(vkDestroyQueryPool)),
+        "vkCmdBeginQuery" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u64, u32, u32), FnVoidPtr,
+            >(vkCmdBeginQuery)),
+        "vkCmdEndQuery" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u64, u32), FnVoidPtr,
+            >(vkCmdEndQuery)),
+        "vkCmdResetQueryPool" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u64, u32, u32), FnVoidPtr,
+            >(vkCmdResetQueryPool)),
+        "vkCmdWriteTimestamp" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u32, u64, u32), FnVoidPtr,
+            >(vkCmdWriteTimestamp)),
+        "vkGetQueryPoolResults" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, u32, u32, usize, *mut c_void, u64, u32) -> VkResult, FnVoidPtr,
+            >(vkGetQueryPoolResults)),
+        // Events.
+        "vkCreateEvent" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, *const c_void, *const c_void, *mut u64) -> VkResult, FnVoidPtr,
+            >(vkCreateEvent)),
+        "vkDestroyEvent" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, *const c_void), FnVoidPtr,
+            >(vkDestroyEvent)),
+        "vkSetEvent" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64) -> VkResult, FnVoidPtr,
+            >(vkSetEvent)),
+        "vkResetEvent" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64) -> VkResult, FnVoidPtr,
+            >(vkResetEvent)),
+        "vkGetEventStatus" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64) -> VkResult, FnVoidPtr,
+            >(vkGetEventStatus)),
+        "vkCmdSetEvent" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u64, u32), FnVoidPtr,
+            >(vkCmdSetEvent)),
+        "vkCmdResetEvent" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u64, u32), FnVoidPtr,
+            >(vkCmdResetEvent)),
+        "vkCmdWaitEvents" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u32, *const u64, u32, u32, u32, *const c_void, u32, *const c_void, u32, *const c_void), FnVoidPtr,
+            >(vkCmdWaitEvents)),
+        // VkBufferView.
+        "vkCreateBufferView" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, *const c_void, *const c_void, *mut u64) -> VkResult, FnVoidPtr,
+            >(vkCreateBufferView)),
+        "vkDestroyBufferView" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, *const c_void), FnVoidPtr,
+            >(vkDestroyBufferView)),
+        // Secondary-cmdbuf execution — no-op today (no secondary
+        // buffers ever populated; an app calling this gets nothing
+        // appended to the primary's frame stream, matching the
+        // observable behavior of "no secondary recorded any ops").
+        "vkCmdExecuteCommands" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u32, *const VkCommandBuffer), FnVoidPtr,
+            >(vkCmdExecuteCommands)),
         _ => None,
     }
 }
@@ -1160,6 +1246,10 @@ pub unsafe extern "C" fn vkCreateDevice(
         next_dpool_id:       std::cell::Cell::new(1),
         descriptor_sets:     std::sync::Mutex::new(std::collections::HashMap::new()),
         next_dset_id:        std::cell::Cell::new(1),
+        next_query_pool_id:  std::cell::Cell::new(1),
+        events:              std::sync::Mutex::new(std::collections::HashMap::new()),
+        next_event_id:       std::cell::Cell::new(1),
+        next_buffer_view_id: std::cell::Cell::new(1),
     });
     let dev_ptr: *mut AtriumDevice = &mut *dev;
     let q = Box::new(AtriumQueue {
@@ -3187,6 +3277,225 @@ pub unsafe extern "C" fn vkCmdCopyImageToBuffer(
         }
     }
     let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::CopyImgToBuf, &body);
+}
+
+// ───── Query pools ──────────────────────────────────────────────
+
+#[no_mangle]
+pub unsafe extern "C" fn vkCreateQueryPool(
+    device:        VkDevice,
+    _p_create_info: *const c_void,
+    _p_allocator:   *const c_void,
+    p_query_pool:   *mut u64,
+) -> VkResult {
+    if device.is_null() || p_query_pool.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let dev = &*(device as *const AtriumDevice);
+    let h = dev.next_query_pool_id.get();
+    dev.next_query_pool_id.set(h + 1);
+    *p_query_pool = h;
+    VK_SUCCESS
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkDestroyQueryPool(
+    _device: VkDevice, _query_pool: u64, _p_allocator: *const c_void,
+) {}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdBeginQuery(
+    _command_buffer: VkCommandBuffer, _query_pool: u64, _query: u32, _flags: u32,
+) {}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdEndQuery(
+    _command_buffer: VkCommandBuffer, _query_pool: u64, _query: u32,
+) {}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdResetQueryPool(
+    _command_buffer: VkCommandBuffer, _query_pool: u64,
+    _first_query: u32, _query_count: u32,
+) {}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdWriteTimestamp(
+    _command_buffer: VkCommandBuffer, _stage: u32, _query_pool: u64, _query: u32,
+) {}
+
+/// `vkGetQueryPoolResults` — return zero data + VK_NOT_READY so
+/// apps that wait on results know to stop. (Tier-1 has no
+/// hardware timestamps; reporting zeros would be a silent lie.)
+#[no_mangle]
+pub unsafe extern "C" fn vkGetQueryPoolResults(
+    _device:     VkDevice,
+    _query_pool: u64,
+    _first_query: u32,
+    _query_count: u32,
+    _data_size:  usize,
+    _p_data:     *mut c_void,
+    _stride:     u64,
+    _flags:      u32,
+) -> VkResult {
+    3 /* VK_NOT_READY */
+}
+
+// ───── Events ───────────────────────────────────────────────────
+
+#[no_mangle]
+pub unsafe extern "C" fn vkCreateEvent(
+    device:          VkDevice,
+    _p_create_info:  *const c_void,
+    _p_allocator:    *const c_void,
+    p_event:         *mut u64,
+) -> VkResult {
+    if device.is_null() || p_event.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let dev = &*(device as *const AtriumDevice);
+    let h = dev.next_event_id.get();
+    dev.next_event_id.set(h + 1);
+    if let Ok(mut e) = dev.events.lock() {
+        e.insert(h, false);
+    } else {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    *p_event = h;
+    VK_SUCCESS
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkDestroyEvent(
+    device: VkDevice, event: u64, _p_allocator: *const c_void,
+) {
+    if device.is_null() || event == 0 { return; }
+    let dev = &*(device as *const AtriumDevice);
+    if let Ok(mut e) = dev.events.lock() {
+        e.remove(&event);
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkSetEvent(device: VkDevice, event: u64) -> VkResult {
+    if device.is_null() || event == 0 { return VK_ERROR_INITIALIZATION_FAILED; }
+    let dev = &*(device as *const AtriumDevice);
+    if let Ok(mut e) = dev.events.lock() {
+        if let Some(s) = e.get_mut(&event) { *s = true; }
+    }
+    VK_SUCCESS
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkResetEvent(device: VkDevice, event: u64) -> VkResult {
+    if device.is_null() || event == 0 { return VK_ERROR_INITIALIZATION_FAILED; }
+    let dev = &*(device as *const AtriumDevice);
+    if let Ok(mut e) = dev.events.lock() {
+        if let Some(s) = e.get_mut(&event) { *s = false; }
+    }
+    VK_SUCCESS
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkGetEventStatus(device: VkDevice, event: u64) -> VkResult {
+    if device.is_null() || event == 0 { return VK_ERROR_INITIALIZATION_FAILED; }
+    let dev = &*(device as *const AtriumDevice);
+    match dev.events.lock().ok().and_then(|e| e.get(&event).copied()) {
+        Some(true)  => VK_SUCCESS,        // VK_EVENT_SET
+        Some(false) => 4,                 // VK_EVENT_RESET
+        None        => VK_ERROR_INITIALIZATION_FAILED,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdSetEvent(
+    _command_buffer: VkCommandBuffer, _event: u64, _stage_mask: u32,
+) {}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdResetEvent(
+    _command_buffer: VkCommandBuffer, _event: u64, _stage_mask: u32,
+) {}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdWaitEvents(
+    _command_buffer:           VkCommandBuffer,
+    _event_count:              u32,
+    _p_events:                 *const u64,
+    _src_stage_mask:           u32,
+    _dst_stage_mask:           u32,
+    _memory_barrier_count:     u32,
+    _p_memory_barriers:        *const c_void,
+    _buffer_barrier_count:     u32,
+    _p_buffer_memory_barriers: *const c_void,
+    _image_barrier_count:      u32,
+    _p_image_memory_barriers:  *const c_void,
+) {}
+
+// ───── VkBufferView ─────────────────────────────────────────────
+
+#[no_mangle]
+pub unsafe extern "C" fn vkCreateBufferView(
+    device:          VkDevice,
+    _p_create_info:  *const c_void,
+    _p_allocator:    *const c_void,
+    p_view:          *mut u64,
+) -> VkResult {
+    if device.is_null() || p_view.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let dev = &*(device as *const AtriumDevice);
+    let h = dev.next_buffer_view_id.get();
+    dev.next_buffer_view_id.set(h + 1);
+    *p_view = h;
+    VK_SUCCESS
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkDestroyBufferView(
+    _device: VkDevice, _view: u64, _p_allocator: *const c_void,
+) {}
+
+// ───── Secondary cmdbuf execution ───────────────────────────────
+
+/// `vkCmdExecuteCommands` — replay each secondary cmdbuf's
+/// recorded FrameOps into the primary. Walks the secondary's
+/// frame.as_bytes() record-by-record and pushes each into the
+/// primary. Atrium has no protocol-level distinction between
+/// primary and secondary, so this concatenates the streams.
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdExecuteCommands(
+    command_buffer:        VkCommandBuffer,
+    command_buffer_count:  u32,
+    p_command_buffers:     *const VkCommandBuffer,
+) {
+    let Some(primary) = cmdbuf_recording(command_buffer) else { return };
+    if p_command_buffers.is_null() { return; }
+    for i in 0..command_buffer_count {
+        let sec_handle = *p_command_buffers.offset(i as isize);
+        if sec_handle.is_null() { continue; }
+        let sec = &*(sec_handle as *const AtriumCommandBuffer);
+        if sec.state != CmdBufferState::Executable {
+            continue;
+        }
+        let bytes = sec.frame.as_bytes();
+        let mut off = 0;
+        while off + 8 <= bytes.len() {
+            let opcode = u16::from_le_bytes([bytes[off], bytes[off + 1]]);
+            let total = u32::from_le_bytes([
+                bytes[off + 4], bytes[off + 5], bytes[off + 6], bytes[off + 7],
+            ]) as usize;
+            if total < 8 || off + total > bytes.len() { break; }
+            let body = &bytes[off + 8 .. off + total];
+            // Convert raw opcode back to FrameOp; on unknown,
+            // skip (we'd be replaying something our renderer
+            // doesn't understand anyway).
+            if let Some(op) = aqueduct_gpu::opcodes::FrameOp::from_u16(opcode) {
+                let _ = primary.frame.push(op, body);
+            }
+            off += total;
+        }
+    }
 }
 
 /// `vkCreateCommandPool` — allocate a non-dispatchable
