@@ -180,30 +180,40 @@ fn main() -> std::io::Result<()> {
     // ── Frame loop ───────────────────────────────────────────────
     let mut timeline: u64 = 0;
 
-    // Scene-unchanged fast path: build the frame command stream
-    // (cheap byte-append), compare to the previous frame's bytes
-    // (cheap memcmp). If identical, skip the entire submit → wait →
-    // readback → bo-copy → page-flip cycle. The display already
-    // holds the right pixels and nothing has changed.
+    // Per-window dirty tracking + per-window offscreen surfaces.
     //
-    // Critical for VRR power: at our measured ~1000 fps idle ceiling
-    // we'd otherwise burn cycles flipping unchanged frames the
-    // panel can't even show.
-    let mut last_frame_bytes: Vec<u8> = Vec::new();
+    // For each window the renderer:
+    //   1. Builds a "mini-frame" of just that window's nodes in
+    //      window-local coordinates.
+    //   2. Byte-compares against the prior frame's mini-frame for
+    //      the same window.
+    //   3. If different (or first-seen), submits a render into the
+    //      window's offscreen image (window-sized, persistent).
+    //   4. Otherwise leaves the window's image intact — its pixels
+    //      from a previous frame are still valid.
+    //
+    // A final composite pass then textured-rects every visible
+    // window's surface onto the screen target at its (pos, size).
+    // The whole-screen skip path (composite bytes unchanged AND no
+    // window dirtied this frame) lets us elide the page-flip too.
+    let mut window_surfaces: HashMap<u32, WindowSurface> = HashMap::new();
+    let mut last_composite_bytes: Vec<u8> = Vec::new();
     let mut frames_since_real_flip: u32 = 0;
 
-    // First frame: always render + flip (need SET_MODE) before the
-    // scene-diff loop takes over.
+    // First frame: always go through the full path (SET_MODE before
+    // page-flip is required regardless).
     {
         let mut p = FrameProfile::default();
         timeline += 1;
-        let first = build_frame_aqueduct(
-            &mut client, &frontend, &comp, target, &mut slot_images, &mut p,
+        let (composite, _) = render_one_frame_multipass(
+            &mut client, &sw_backend, &frontend, &comp,
+            target, fence, &mut timeline,
+            &mut slot_images, &mut window_surfaces,
+            mode.width, mode.height,
+            &mut bo, &mut p,
+            /* force_full = */ true,
         ).map_err(io_other)?;
-        submit_and_readback(
-            &mut client, &sw_backend, target, fence, timeline, &first, &mut bo, &mut p,
-        ).map_err(io_other)?;
-        last_frame_bytes = first;
+        last_composite_bytes = composite;
     }
     dpy.set_mode(conn.id, &bo, mode)?;
     dpy.page_flip(conn.id, &bo)?;
@@ -226,28 +236,28 @@ fn main() -> std::io::Result<()> {
         let mut prof = FrameProfile::default();
         timeline += 1;
 
-        // Phase 1: build the candidate frame's command stream. Cheap;
-        // no rasterisation work yet, no socket I/O.
-        let candidate = build_frame_aqueduct(
-            &mut client, &frontend, &comp, target, &mut slot_images, &mut prof,
+        let (composite, any_dirty) = render_one_frame_multipass(
+            &mut client, &sw_backend, &frontend, &comp,
+            target, fence, &mut timeline,
+            &mut slot_images, &mut window_surfaces,
+            mode.width, mode.height,
+            &mut bo, &mut prof,
+            /* force_full = */ false,
         ).map_err(io_other)?;
 
-        // Phase 2: scene-unchanged fast path. Byte-identical frame
-        // means the scene hasn't moved; the display already shows
-        // the right pixels. Skip submit → wait → readback → bo-copy
-        // → page-flip entirely. Emit one keepalive flip every N
-        // intervals so the kmod's flip cadence doesn't stall.
-        let unchanged = candidate == last_frame_bytes;
+        // Outer skip combines two signals:
+        //   - any_dirty: at least one window re-rendered into its
+        //     surface this frame, so the BO has fresh pixels.
+        //   - composite-bytes changed: layout shifted (window moved,
+        //     resized, opened, closed) even if no window rasterised.
+        // Either one means the panel needs the new BO contents.
+        let layout_changed = composite != last_composite_bytes;
         let need_keepalive = frames_since_real_flip >= VRR_KEEPALIVE_INTERVALS;
-        let do_render = !unchanged || need_keepalive;
+        let flip_now = any_dirty || layout_changed || need_keepalive;
 
-        if do_render {
-            submit_and_readback(
-                &mut client, &sw_backend, target, fence, timeline,
-                &candidate, &mut bo, &mut prof,
-            ).map_err(io_other)?;
+        if flip_now && !composite.is_empty() {
             dpy.page_flip(conn.id, &bo)?;
-            last_frame_bytes = candidate;
+            last_composite_bytes = composite;
             frames_since_real_flip = 0;
             window_flips += 1;
         } else {
@@ -342,20 +352,67 @@ struct SlotImage {
     height: u32,
 }
 
-/// Snapshot per-window scene state, drain pending texture uploads
-/// (always — these have side effects the scene-diff fast path can't
-/// undo), translate every node via `fresco-aqueduct-bridge`. Returns
-/// the built FrameOp byte stream. Does NOT submit or wait — the
-/// caller compares against the prior frame's bytes and decides
-/// whether the expensive path runs.
-fn build_frame_aqueduct(
+/// Per-window persistent offscreen surface. Each window's nodes are
+/// rasterised into its own image (window-local coords). The final
+/// composite pass textured-rects each surface onto the screen target.
+///
+/// Lets the render loop skip rasterisation of un-dirty windows. Only
+/// the window whose scene state changed pays the per-glyph cost.
+struct WindowSurface {
+    image: ResourceId,
+    width: u32,
+    height: u32,
+    /// Last frame's mini-FrameOp byte stream for this window. Used to
+    /// detect dirty status by byte-compare.
+    last_bytes: Vec<u8>,
+}
+
+/// Orchestrate one frame of per-window rendering + composite.
+///
+/// Steps:
+/// 1. Drain pending texture/atlas uploads (shared across all windows).
+/// 2. Snapshot WM state into a list of (window_id, pos, size).
+/// 3. Reconcile per-window surface map: allocate new windows'
+///    surfaces, destroy obsolete ones (window-closed).
+/// 4. For each window: build mini-frame in window-local coords;
+///    byte-compare; only rasterise into its surface if dirty.
+/// 5. Build the composite frame: BeginRenderPass on `target`,
+///    textured-rect each visible window's surface at its (pos, size),
+///    EndRenderPass.
+/// 6. If any window dirtied this frame (or `force_full`): submit
+///    composite, wait fence, read back, BGRA-copy into the BO.
+///    Otherwise skip the readback chain — the BO still holds the
+///    last good composite.
+///
+/// Returns `(composite_bytes, any_window_rasterised)`. The caller's
+/// outer skip-flip condition needs BOTH:
+///
+///   - `composite_bytes` catches LAYOUT changes (window moved/resized,
+///     window list mutated). The composite FrameOp stream encodes
+///     (target, image_id, dst_rect) per window; if any of those change
+///     the bytes differ.
+///   - `any_window_rasterised` catches CONTENT changes within a stable
+///     layout. The composite command stream is identical when only
+///     window contents change (same textured-rect ops referencing
+///     same image_ids), but the BO has fresh pixels and must be
+///     flipped.
+#[allow(clippy::too_many_arguments)]
+fn render_one_frame_multipass(
     client: &mut GpuClient,
+    sw_backend: &SoftwareBackend,
     frontend: &Arc<Mutex<EnvelopeFrontend>>,
     comp: &Arc<Mutex<Compositor>>,
     target: ResourceId,
+    fence: ResourceId,
+    timeline: &mut u64,
     slot_images: &mut HashMap<u32, SlotImage>,
+    window_surfaces: &mut HashMap<u32, WindowSurface>,
+    screen_w: u32,
+    screen_h: u32,
+    bo: &mut atrium_gpu::Bo,
     prof: &mut FrameProfile,
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    force_full: bool,
+) -> Result<(Vec<u8>, bool), Box<dyn std::error::Error>> {
     // ── 1. Drain pending texture uploads → write_image into the
     //       backend's per-slot Pixmaps.
     let t_uploads = Instant::now();
@@ -419,96 +476,162 @@ fn build_frame_aqueduct(
     prof.uploads += t_uploads.elapsed();
 
     // ── 2. Snapshot per-window WM state in z-order bottom→top.
+    //       Each entry: (window_id, pos, size). Window 0 (background)
+    //       spans the whole screen.
     let t_build = Instant::now();
-    let layers: Vec<(u32, (f32, f32))> = {
+    let layers: Vec<(u32, (f32, f32), (u32, u32))> = {
         let g = comp.lock().unwrap();
         let mut out = Vec::with_capacity(g.windows.len());
-        out.push((0u32, (0.0, 0.0)));
+        out.push((0u32, (0.0, 0.0), (screen_w, screen_h)));
         for &id in &g.z_order {
             if id == 0 { continue; }
             if let Some(w) = g.windows.get(&id) {
-                out.push((id as u32, (w.pos.0, w.pos.1)));
+                let sw = (w.size.0.max(1.0) as u32).min(screen_w);
+                let sh = (w.size.1.max(1.0) as u32).min(screen_h);
+                out.push((id as u32, (w.pos.0, w.pos.1), (sw, sh)));
             }
         }
         out
     };
 
-    // ── 3. Build a single frame: BeginRenderPass → walk nodes →
-    //       per-node bridge translator → EndRenderPass.
-    let mut fb = client.frame_builder();
-    fresco_aqueduct_bridge::begin_renderpass(&mut fb, target, [0, 0, 0, 255])?;
+    // ── 3. Reconcile per-window surface map: drop surfaces for
+    //       closed windows or windows whose size changed.
+    let live_ids: std::collections::HashSet<u32> = layers.iter().map(|(id, ..)| *id).collect();
+    let to_destroy: Vec<u32> = window_surfaces.keys()
+        .filter(|id| !live_ids.contains(id))
+        .copied()
+        .collect();
+    for id in to_destroy {
+        if let Some(s) = window_surfaces.remove(&id) {
+            let _ = client.destroy_image(s.image);
+        }
+    }
+    for (win_id, _, (sw, sh)) in &layers {
+        if let Some(existing) = window_surfaces.get(win_id) {
+            if existing.width == *sw && existing.height == *sh {
+                continue;
+            }
+            // Size changed: drop and re-create.
+            let _ = client.destroy_image(existing.image);
+            window_surfaces.remove(win_id);
+        }
+        let mem = client.allocate_memory(
+            (*sw as u64) * (*sh as u64) * 4,
+            MemoryUsage::ImageBacking,
+        )?;
+        let image = client.create_image(ImageCreatePayload {
+            image_id: ResourceId(0),
+            backing_region: mem.region_id, region_offset: 0,
+            format: 37, width: *sw, height: *sh, depth: 1,
+            mip_levels: 1, array_layers: 1, usage: 0x07,
+        })?;
+        window_surfaces.insert(*win_id, WindowSurface {
+            image, width: *sw, height: *sh, last_bytes: Vec::new(),
+        });
+    }
 
+    // ── 4. Build & maybe-render each window's mini-frame.
+    //       For window 0 (screen background) keep screen-space coords
+    //       (nodes are already in screen coords; pos is (0,0)).
+    //       For other windows render in window-local coords; the
+    //       composite pass places the surface at the window's pos.
+    let mut any_dirty = false || force_full;
+    let mut per_window_frames: Vec<(u32, Vec<u8>)> = Vec::with_capacity(layers.len());
     {
         let fe = frontend.lock().unwrap();
-        for (win_id, (ox, oy)) in &layers {
-            let Some(state) = fe.window_state(*win_id) else { continue; };
-
-            // rect_nodes
-            for p in state.rect_nodes.values() {
-                let translated = fp::RectParams { x: p.x + ox, y: p.y + oy, ..*p };
-                fresco_aqueduct_bridge::translate_rect(&mut fb, &translated)?;
+        for (win_id, _, _) in &layers {
+            let surface = window_surfaces.get(win_id).unwrap();
+            let mut fb = client.frame_builder();
+            fresco_aqueduct_bridge::begin_renderpass(
+                &mut fb, surface.image,
+                if *win_id == 0 { [0, 0, 0, 255] } else { [0, 0, 0, 0] },
+            )?;
+            if let Some(state) = fe.window_state(*win_id) {
+                for p in state.rect_nodes.values() {
+                    fresco_aqueduct_bridge::translate_rect(&mut fb, p)?;
+                }
+                for p in state.path_nodes.values() {
+                    fresco_aqueduct_bridge::translate_path(&mut fb, p)?;
+                }
+                for p in state.texture_nodes.values() {
+                    let Some(slot) = slot_images.get(&p.slot_id) else { continue; };
+                    fresco_aqueduct_bridge::translate_texture(
+                        &mut fb, p, slot.image, slot.width, slot.height,
+                    )?;
+                }
+                for p in state.glyph_run_nodes.values() {
+                    let Some(slot) = slot_images.get(&p.atlas_slot_id) else { continue; };
+                    fresco_aqueduct_bridge::translate_glyph_run(
+                        &mut fb, p, slot.image,
+                    )?;
+                }
             }
-            // path_nodes (centre coords get the window offset)
-            for p in state.path_nodes.values() {
-                let translated = fp::PathParams { cx: p.cx + ox, cy: p.cy + oy, ..*p };
-                fresco_aqueduct_bridge::translate_path(&mut fb, &translated)?;
-            }
-            // texture_nodes — need the slot's image_id
-            for p in state.texture_nodes.values() {
-                let Some(slot) = slot_images.get(&p.slot_id) else { continue; };
-                let translated = fp::TextureParams { x: p.x + ox, y: p.y + oy, ..*p };
-                fresco_aqueduct_bridge::translate_texture(
-                    &mut fb, &translated,
-                    slot.image, slot.width, slot.height,
-                )?;
-            }
-            // glyph_run_nodes — same: look up the atlas slot's image
-            for p in state.glyph_run_nodes.values() {
-                let Some(slot) = slot_images.get(&p.atlas_slot_id) else { continue; };
-                let translated = fp::GlyphRunParams {
-                    x: p.x + ox, y: p.y + oy,
-                    glyphs: p.glyphs.clone(),
-                    ..*p
-                };
-                fresco_aqueduct_bridge::translate_glyph_run(
-                    &mut fb, &translated, slot.image,
-                )?;
-            }
+            fresco_aqueduct_bridge::end_renderpass(&mut fb)?;
+            let bytes = fb.into_buf();
+            per_window_frames.push((*win_id, bytes));
         }
     }
 
-    fresco_aqueduct_bridge::end_renderpass(&mut fb)?;
-    prof.build += t_build.elapsed();
-    Ok(fb.into_buf())
-}
+    // Detect dirty windows & rasterise them. Submit one frame per
+    // dirty window — they all target distinct images so this can be
+    // batched in a single multi-renderpass submit, but per-window
+    // submits give us the early-skip without extra plumbing.
+    for (win_id, bytes) in &per_window_frames {
+        let surface = window_surfaces.get_mut(win_id).unwrap();
+        let dirty = force_full || *bytes != surface.last_bytes;
+        if dirty {
+            any_dirty = true;
+            *timeline += 1;
+            let t_submit = Instant::now();
+            let fb = aqueduct_gpu::frame::FrameBuilder::from_bytes(
+                bytes.len() as u32 + 16, bytes.clone(),
+            );
+            client.submit_frame(fence, fb, *timeline)?;
+            prof.submit += t_submit.elapsed();
+            let t_wait = Instant::now();
+            let _ = client.wait_fence(fence, 50_000_000)?;
+            prof.wait += t_wait.elapsed();
+            surface.last_bytes = bytes.clone();
+        }
+    }
 
-/// Submit the (already-built) frame, wait its fence, read back the
-/// SoftwareBackend's target Pixmap, and BGRA-swap it into the
-/// scanout BO. The expensive half of the original render-one-frame
-/// path — only invoked when the candidate frame differs from the
-/// last one (or on the periodic VRR keepalive).
-fn submit_and_readback(
-    client: &mut GpuClient,
-    sw_backend: &SoftwareBackend,
-    target: ResourceId,
-    fence: ResourceId,
-    timeline: u64,
-    frame_buf: &[u8],
-    bo: &mut atrium_gpu::Bo,
-    prof: &mut FrameProfile,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use aqueduct_gpu::frame::FrameBuilder;
-    let t_submit = Instant::now();
-    let fb = FrameBuilder::from_bytes(
-        frame_buf.len() as u32 + 16, frame_buf.to_vec(),
-    );
-    client.submit_frame(fence, fb, timeline)?;
-    prof.submit += t_submit.elapsed();
-    let t_wait = Instant::now();
-    let _ = client.wait_fence(fence, 50_000_000)?;
-    prof.wait += t_wait.elapsed();
-    copy_backend_to_bo_profiled(sw_backend, target, bo, prof)?;
-    Ok(())
+    // ── 5. Composite pass: textured-rect each window's surface onto
+    //       the screen target at (pos, size). Window 0 first (it
+    //       acts as the screen background); subsequent windows
+    //       layer on top in z-order.
+    let mut composite = client.frame_builder();
+    fresco_aqueduct_bridge::begin_renderpass(&mut composite, target, [0, 0, 0, 255])?;
+    for (win_id, (ox, oy), (sw, sh)) in &layers {
+        let surface = window_surfaces.get(win_id).unwrap();
+        let tex = fp::TextureParams {
+            x: *ox, y: *oy, w: *sw as f32, h: *sh as f32, slot_id: 0,
+        };
+        fresco_aqueduct_bridge::translate_texture(
+            &mut composite, &tex, surface.image, *sw, *sh,
+        )?;
+    }
+    fresco_aqueduct_bridge::end_renderpass(&mut composite)?;
+    let composite_bytes = composite.into_buf();
+    prof.build += t_build.elapsed();
+
+    // ── 6. Submit composite + read back to BO only when something
+    //       changed. The outer skip path (composite bytes unchanged)
+    //       still handles "no flip needed" at the page-flip layer.
+    if any_dirty {
+        *timeline += 1;
+        let t_submit = Instant::now();
+        let fb = aqueduct_gpu::frame::FrameBuilder::from_bytes(
+            composite_bytes.len() as u32 + 16, composite_bytes.clone(),
+        );
+        client.submit_frame(fence, fb, *timeline)?;
+        prof.submit += t_submit.elapsed();
+        let t_wait = Instant::now();
+        let _ = client.wait_fence(fence, 50_000_000)?;
+        prof.wait += t_wait.elapsed();
+        copy_backend_to_bo_profiled(sw_backend, target, bo, prof)?;
+    }
+
+    Ok((composite_bytes, any_dirty))
 }
 
 /// Read tier-1 SW backend's target Pixmap → BGRA-swap → scanout BO.
