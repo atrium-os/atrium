@@ -1387,6 +1387,280 @@ fn descriptor_set_alloc_update_bind_round_trip() {
 }
 
 #[test]
+fn full_triangle_frame_record_and_submit() {
+    //! Composes the full setup-record-submit chain a "hello
+    //! triangle" Vulkan app would issue, against a live
+    //! SoftwareBackend listener. Verifies that the
+    //! AtriumCommandBuffer's FrameOp stream contains the
+    //! expected opcode sequence and that vkQueueSubmit flushes
+    //! it through GpuClient::submit_frame (observed via the
+    //! backend's submission counter).
+    use atrium_vk_icd::{
+        cmdbuf_recorded_bytes,
+        vkAllocateCommandBuffers, vkAllocateDescriptorSets,
+        vkAllocateMemory, vkBeginCommandBuffer, vkBindBufferMemory,
+        vkBindImageMemory, vkCmdBeginRenderPass,
+        vkCmdBindDescriptorSets, vkCmdBindIndexBuffer, vkCmdBindPipeline,
+        vkCmdBindVertexBuffers, vkCmdDrawIndexed, vkCmdEndRenderPass,
+        vkCmdPushConstants, vkCmdSetScissor, vkCmdSetViewport,
+        vkCreateBuffer, vkCreateCommandPool, vkCreateDescriptorPool,
+        vkCreateDescriptorSetLayout, vkCreateDevice, vkCreateFramebuffer,
+        vkCreateGraphicsPipelines, vkCreateImage, vkCreateImageView,
+        vkCreatePipelineLayout, vkCreateRenderPass, vkCreateShaderModule,
+        vkDestroyBuffer, vkDestroyCommandPool, vkDestroyDescriptorPool,
+        vkDestroyDescriptorSetLayout, vkDestroyDevice, vkDestroyFramebuffer,
+        vkDestroyImage, vkDestroyImageView, vkDestroyPipeline,
+        vkDestroyPipelineLayout, vkDestroyRenderPass, vkDestroyShaderModule,
+        vkEndCommandBuffer, vkFreeMemory, vkGetDeviceQueue,
+        vkGetImageMemoryRequirements, vkQueueSubmit, vkUpdateDescriptorSets,
+    };
+
+    let sock = tmp_socket("triangle");
+    let sw_backend = Arc::new(SoftwareBackend::new());
+    let backend_for_listener: Arc<dyn Backend> = sw_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap();
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+
+    type VkDevice = *mut std::ffi::c_void;
+    type VkQueue  = *mut std::ffi::c_void;
+    type VkCommandBuffer = *mut std::ffi::c_void;
+
+    // Bootstrap: instance → physical → device → queue.
+    let mut instance: VkInstance = std::ptr::null_mut();
+    unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
+    let mut pds: [VkPhysicalDevice; 1] = [std::ptr::null_mut(); 1];
+    let mut cap: u32 = 1;
+    unsafe { vkEnumeratePhysicalDevices(instance, &mut cap, pds.as_mut_ptr()); }
+    let mut device: VkDevice = std::ptr::null_mut();
+    unsafe { vkCreateDevice(pds[0], std::ptr::null(), std::ptr::null(), &mut device); }
+    let mut queue: VkQueue = std::ptr::null_mut();
+    unsafe { vkGetDeviceQueue(device, 0, 0, &mut queue); }
+
+    // Vertex buffer (256 B), index buffer (256 B), uniform buffer
+    // (128 B). One memory allocation backs all three.
+    fn mk_buffer(device: VkDevice, size: u64, usage: u32) -> u64 {
+        let mut info = [0u8; 56];
+        info[ 0.. 4].copy_from_slice(&12u32.to_le_bytes());
+        info[24..32].copy_from_slice(&size.to_le_bytes());
+        info[32..36].copy_from_slice(&usage.to_le_bytes());
+        let mut h: u64 = 0;
+        unsafe { vkCreateBuffer(device, info.as_ptr() as *const _, std::ptr::null(), &mut h); }
+        h
+    }
+    let vbuf = mk_buffer(device, 256, 0x80); // VERTEX
+    let ibuf = mk_buffer(device, 256, 0x40); // INDEX
+    let ubuf = mk_buffer(device, 128, 0x10); // UNIFORM
+
+    let mut alloc = [0u8; 32];
+    alloc[0..4].copy_from_slice(&5u32.to_le_bytes());
+    alloc[16..24].copy_from_slice(&(8192u64).to_le_bytes());
+    let mut mem: u64 = 0;
+    unsafe { vkAllocateMemory(device, alloc.as_ptr() as *const _, std::ptr::null(), &mut mem); }
+    unsafe { vkBindBufferMemory(device, vbuf, mem,    0); }
+    unsafe { vkBindBufferMemory(device, ibuf, mem, 1024); }
+    unsafe { vkBindBufferMemory(device, ubuf, mem, 2048); }
+
+    // Color attachment image + view + memory.
+    let mut img_info = [0u8; 88];
+    img_info[ 0.. 4].copy_from_slice(&14u32.to_le_bytes());
+    img_info[24..28].copy_from_slice(&37u32.to_le_bytes());
+    img_info[28..32].copy_from_slice(&64u32.to_le_bytes());
+    img_info[32..36].copy_from_slice(&64u32.to_le_bytes());
+    img_info[36..40].copy_from_slice(&1u32.to_le_bytes());
+    img_info[40..44].copy_from_slice(&1u32.to_le_bytes());
+    img_info[44..48].copy_from_slice(&1u32.to_le_bytes());
+    img_info[56..60].copy_from_slice(&0x10u32.to_le_bytes()); // COLOR_ATTACHMENT
+    let mut color: u64 = 0;
+    unsafe { vkCreateImage(device, img_info.as_ptr() as *const _, std::ptr::null(), &mut color); }
+    let mut req = ash::vk::MemoryRequirements::default();
+    unsafe { vkGetImageMemoryRequirements(device, color, &mut req); }
+    let mut img_alloc = [0u8; 32];
+    img_alloc[0..4].copy_from_slice(&5u32.to_le_bytes());
+    img_alloc[16..24].copy_from_slice(&req.size.to_le_bytes());
+    let mut img_mem: u64 = 0;
+    unsafe { vkAllocateMemory(device, img_alloc.as_ptr() as *const _, std::ptr::null(), &mut img_mem); }
+    unsafe { vkBindImageMemory(device, color, img_mem, 0); }
+    let mut view_info = [0u8; 80];
+    view_info[ 0.. 4].copy_from_slice(&15u32.to_le_bytes());
+    view_info[24..32].copy_from_slice(&color.to_le_bytes());
+    let mut view: u64 = 0;
+    unsafe { vkCreateImageView(device, view_info.as_ptr() as *const _, std::ptr::null(), &mut view); }
+    thread::sleep(Duration::from_millis(30));
+
+    // Shader modules: minimal SPIR-V (header only).
+    let spv: [u32; 5] = [0x07230203, 0x00010000, 0, 1, 0];
+    let mut sh_info = [0u8; 40];
+    sh_info[ 0.. 4].copy_from_slice(&16u32.to_le_bytes());
+    sh_info[24..32].copy_from_slice(&20u64.to_le_bytes());
+    sh_info[32..40].copy_from_slice(&(spv.as_ptr() as u64).to_le_bytes());
+    let mut vs: u64 = 0; let mut fs: u64 = 0;
+    unsafe { vkCreateShaderModule(device, sh_info.as_ptr() as *const _, std::ptr::null(), &mut vs); }
+    unsafe { vkCreateShaderModule(device, sh_info.as_ptr() as *const _, std::ptr::null(), &mut fs); }
+
+    // Descriptor set layout + pool + set with uniform buffer at binding 0.
+    let mut layout: u64 = 0;
+    unsafe { vkCreateDescriptorSetLayout(device, std::ptr::null(), std::ptr::null(), &mut layout); }
+    let mut dpool: u64 = 0;
+    unsafe { vkCreateDescriptorPool(device, std::ptr::null(), std::ptr::null(), &mut dpool); }
+    let mut da = [0u8; 40];
+    da[ 0.. 4].copy_from_slice(&34u32.to_le_bytes());
+    da[16..24].copy_from_slice(&dpool.to_le_bytes());
+    da[24..28].copy_from_slice(&1u32.to_le_bytes());
+    let layouts_arr = [layout];
+    da[32..40].copy_from_slice(&(layouts_arr.as_ptr() as u64).to_le_bytes());
+    let mut dset: u64 = 0;
+    unsafe { vkAllocateDescriptorSets(device, da.as_ptr() as *const _, &mut dset); }
+
+    let buf_info_arr: [u8; 24] = {
+        let mut b = [0u8; 24];
+        b[ 0.. 8].copy_from_slice(&ubuf.to_le_bytes());
+        b[16..24].copy_from_slice(&(128u64).to_le_bytes());
+        b
+    };
+    let mut write = [0u8; 64];
+    write[ 0.. 4].copy_from_slice(&35u32.to_le_bytes());
+    write[16..24].copy_from_slice(&dset.to_le_bytes());
+    write[32..36].copy_from_slice(&1u32.to_le_bytes());
+    write[36..40].copy_from_slice(&6u32.to_le_bytes()); // UNIFORM_BUFFER
+    write[48..56].copy_from_slice(&(buf_info_arr.as_ptr() as u64).to_le_bytes());
+    unsafe { vkUpdateDescriptorSets(device, 1, write.as_ptr() as *const _, 0, std::ptr::null()); }
+
+    // Pipeline layout + graphics pipeline.
+    let mut pl_layout: u64 = 0;
+    unsafe { vkCreatePipelineLayout(device, std::ptr::null(), std::ptr::null(), &mut pl_layout); }
+    let mut pipeline: u64 = 0;
+    unsafe {
+        vkCreateGraphicsPipelines(
+            device, 0, 1, std::ptr::null(), std::ptr::null(), &mut pipeline,
+        );
+    }
+
+    // Render pass + framebuffer.
+    let mut rp_info = [0u8; 64];
+    rp_info[0..4].copy_from_slice(&38u32.to_le_bytes());
+    let mut render_pass: u64 = 0;
+    unsafe { vkCreateRenderPass(device, rp_info.as_ptr() as *const _, std::ptr::null(), &mut render_pass); }
+    let mut fb_info = [0u8; 64];
+    fb_info[ 0.. 4].copy_from_slice(&37u32.to_le_bytes());
+    fb_info[24..32].copy_from_slice(&render_pass.to_le_bytes());
+    fb_info[32..36].copy_from_slice(&1u32.to_le_bytes());
+    let atts = [view];
+    fb_info[40..48].copy_from_slice(&(atts.as_ptr() as u64).to_le_bytes());
+    fb_info[48..52].copy_from_slice(&64u32.to_le_bytes());
+    fb_info[52..56].copy_from_slice(&64u32.to_le_bytes());
+    let mut framebuffer: u64 = 0;
+    unsafe { vkCreateFramebuffer(device, fb_info.as_ptr() as *const _, std::ptr::null(), &mut framebuffer); }
+
+    // Command pool + cmdbuf.
+    let mut pool: u64 = 0;
+    unsafe { vkCreateCommandPool(device, std::ptr::null(), std::ptr::null(), &mut pool); }
+    let mut cb_info = [0u8; 40];
+    cb_info[0..4].copy_from_slice(&40u32.to_le_bytes());
+    cb_info[16..24].copy_from_slice(&pool.to_le_bytes());
+    cb_info[28..32].copy_from_slice(&1u32.to_le_bytes());
+    let mut cbs: [VkCommandBuffer; 1] = [std::ptr::null_mut(); 1];
+    unsafe { vkAllocateCommandBuffers(device, cb_info.as_ptr() as *const _, cbs.as_mut_ptr()); }
+    let cb = cbs[0];
+
+    // RECORD the triangle frame.
+    unsafe { vkBeginCommandBuffer(cb, std::ptr::null()); }
+    let mut rpb = [0u8; 64];
+    rpb[ 0.. 4].copy_from_slice(&43u32.to_le_bytes());
+    rpb[16..24].copy_from_slice(&render_pass.to_le_bytes());
+    rpb[24..32].copy_from_slice(&framebuffer.to_le_bytes());
+    rpb[48..52].copy_from_slice(&1u32.to_le_bytes());
+    let clear: [f32; 4] = [0.2, 0.2, 0.4, 1.0];
+    rpb[56..64].copy_from_slice(&(clear.as_ptr() as u64).to_le_bytes());
+    unsafe { vkCmdBeginRenderPass(cb, rpb.as_ptr() as *const _, 0); }
+
+    unsafe { vkCmdBindPipeline(cb, 0 /* graphics */, pipeline); }
+    let vp = ash::vk::Viewport { x: 0.0, y: 0.0, width: 64.0, height: 64.0, min_depth: 0.0, max_depth: 1.0 };
+    unsafe { vkCmdSetViewport(cb, 0, 1, &vp); }
+    let sc = ash::vk::Rect2D {
+        offset: ash::vk::Offset2D { x: 0, y: 0 },
+        extent: ash::vk::Extent2D { width: 64, height: 64 },
+    };
+    unsafe { vkCmdSetScissor(cb, 0, 1, &sc); }
+    let dsets = [dset];
+    unsafe { vkCmdBindDescriptorSets(cb, 0, pl_layout, 0, 1, dsets.as_ptr(), 0, std::ptr::null()); }
+
+    let vbs = [vbuf]; let vos: [u64; 1] = [0];
+    unsafe { vkCmdBindVertexBuffers(cb, 0, 1, vbs.as_ptr(), vos.as_ptr()); }
+    unsafe { vkCmdBindIndexBuffer(cb, ibuf, 0, 1 /* UINT32 */); }
+    let pc_bytes: [u8; 4] = [0; 4];
+    unsafe { vkCmdPushConstants(cb, pl_layout, 0x10, 0, 4, pc_bytes.as_ptr() as *const _); }
+    unsafe { vkCmdDrawIndexed(cb, 3, 1, 0, 0, 0); }
+    unsafe { vkCmdEndRenderPass(cb); }
+    unsafe { vkEndCommandBuffer(cb); }
+
+    // Verify the FrameOp stream: BeginRP, BindPipeline, SetVP,
+    // SetSc, BindDescriptors, BindVB, BindIB, PushConstants,
+    // DrawIndexed, EndRP — 10 records in order.
+    let bytes = cmdbuf_recorded_bytes(cb);
+    let expected: &[u16] = &[
+        0x0010, // BeginRenderPass
+        0x0020, // BindPipeline
+        0x0030, // SetViewport
+        0x0031, // SetScissor
+        0x0021, // BindDescriptors
+        0x0022, // BindVertexBuf
+        0x0023, // BindIndexBuf
+        0x0032, // PushConstants
+        0x0041, // DrawIndexed
+        0x0011, // EndRenderPass
+    ];
+    let mut offset = 0;
+    for (i, &op) in expected.iter().enumerate() {
+        let got = u16::from_le_bytes([bytes[offset], bytes[offset + 1]]);
+        assert_eq!(got, op,
+            "record {i}: expected opcode 0x{op:04x}, got 0x{got:04x} at offset {offset}");
+        let total = u32::from_le_bytes([
+            bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7],
+        ]);
+        offset += total as usize;
+    }
+    assert_eq!(offset, bytes.len(), "frame stream has trailing bytes after expected ops");
+
+    // Submit + verify the backend observed it.
+    let pre = sw_backend.submission_count();
+    let mut sinfo = [0u8; 72];
+    sinfo[0..4].copy_from_slice(&4u32.to_le_bytes());
+    sinfo[40..44].copy_from_slice(&1u32.to_le_bytes());
+    let cb_arr = [cb];
+    sinfo[48..56].copy_from_slice(&(cb_arr.as_ptr() as u64).to_le_bytes());
+    let r = unsafe { vkQueueSubmit(queue, 1, sinfo.as_ptr() as *const _, std::ptr::null_mut()) };
+    assert_eq!(r, 0);
+    thread::sleep(Duration::from_millis(100));
+    assert!(sw_backend.submission_count() > pre,
+        "backend must have observed the triangle-frame submit");
+
+    // Tear down in order.
+    unsafe { vkDestroyCommandPool(device, pool, std::ptr::null()); }
+    unsafe { vkDestroyFramebuffer(device, framebuffer, std::ptr::null()); }
+    unsafe { vkDestroyRenderPass(device, render_pass, std::ptr::null()); }
+    unsafe { vkDestroyPipeline(device, pipeline, std::ptr::null()); }
+    unsafe { vkDestroyPipelineLayout(device, pl_layout, std::ptr::null()); }
+    unsafe { vkDestroyDescriptorPool(device, dpool, std::ptr::null()); }
+    unsafe { vkDestroyDescriptorSetLayout(device, layout, std::ptr::null()); }
+    unsafe { vkDestroyShaderModule(device, vs, std::ptr::null()); }
+    unsafe { vkDestroyShaderModule(device, fs, std::ptr::null()); }
+    unsafe { vkDestroyImageView(device, view, std::ptr::null()); }
+    unsafe { vkDestroyImage(device, color, std::ptr::null()); }
+    unsafe { vkFreeMemory(device, img_mem, std::ptr::null()); }
+    unsafe { vkDestroyBuffer(device, vbuf, std::ptr::null()); }
+    unsafe { vkDestroyBuffer(device, ibuf, std::ptr::null()); }
+    unsafe { vkDestroyBuffer(device, ubuf, std::ptr::null()); }
+    unsafe { vkFreeMemory(device, mem, std::ptr::null()); }
+    unsafe { vkDestroyDevice(device, std::ptr::null()); }
+    unsafe { vkDestroyInstance(instance, std::ptr::null()); }
+    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[test]
 fn proc_addr_resolves_three_entry_points() {
     // No live daemon required for the get_proc_addr lookups.
     fn lookup(name: &[u8]) -> Option<unsafe extern "C" fn()> {
