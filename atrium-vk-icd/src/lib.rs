@@ -5017,9 +5017,27 @@ pub unsafe extern "C" fn vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
     VK_SUCCESS
 }
 
-/// `vkGetPhysicalDeviceSurfaceFormatsKHR` — one canonical format:
-/// R8G8B8A8_UNORM + SRGB_NONLINEAR. Matches the renderer's tier-1
-/// scanout BGRA-swap path.
+/// Surface formats atrium-vk-icd exposes. Listed in priority
+/// order (apps that pick the first match get the renderer's
+/// preferred scanout format).
+///
+/// All map onto the renderer's BGRA scanout chain via the kmod's
+/// hardcoded R↔B swap (D1 step 2(a) bring-up note), so swapchain
+/// images in any of the four can be displayed without an extra
+/// conversion pass.
+///
+/// (format, color_space): VkFormat numeric code +
+/// VK_COLOR_SPACE_SRGB_NONLINEAR_KHR (0).
+const ATRIUM_SURFACE_FORMATS: &[(u32, u32)] = &[
+    (37, 0),  // R8G8B8A8_UNORM
+    (43, 0),  // R8G8B8A8_SRGB
+    (44, 0),  // B8G8R8A8_UNORM
+    (50, 0),  // B8G8R8A8_SRGB
+];
+
+/// `vkGetPhysicalDeviceSurfaceFormatsKHR` — return our four
+/// scanout-compatible formats in priority order. Apps typically
+/// walk the list and pick the first match they prefer.
 ///
 /// VkSurfaceFormatKHR is 8 bytes (format u32 + colorSpace u32).
 #[no_mangle]
@@ -5030,22 +5048,28 @@ pub unsafe extern "C" fn vkGetPhysicalDeviceSurfaceFormatsKHR(
     p_surface_formats:    *mut c_void, /* VkSurfaceFormatKHR* */
 ) -> VkResult {
     if p_surface_format_count.is_null() { return VK_ERROR_INITIALIZATION_FAILED; }
+    let n = ATRIUM_SURFACE_FORMATS.len() as u32;
     if p_surface_formats.is_null() {
-        *p_surface_format_count = 1;
+        *p_surface_format_count = n;
         return VK_SUCCESS;
     }
     let cap = *p_surface_format_count;
     if cap == 0 { return VK_SUCCESS; }
+    let to_copy = cap.min(n);
     let b = p_surface_formats as *mut u8;
     let put32 = |off: usize, v: u32| {
         std::ptr::copy_nonoverlapping(
             v.to_le_bytes().as_ptr(), b.add(off), 4,
         );
     };
-    put32(0, 37); /* VK_FORMAT_R8G8B8A8_UNORM */
-    put32(4, 0);  /* VK_COLOR_SPACE_SRGB_NONLINEAR_KHR */
-    *p_surface_format_count = 1;
-    VK_SUCCESS
+    for i in 0..to_copy {
+        let (fmt, cs) = ATRIUM_SURFACE_FORMATS[i as usize];
+        let off = (i as usize) * 8;
+        put32(off, fmt);
+        put32(off + 4, cs);
+    }
+    *p_surface_format_count = to_copy;
+    if to_copy < n { 5 /* VK_INCOMPLETE */ } else { VK_SUCCESS }
 }
 
 /// `vkGetPhysicalDeviceSurfacePresentModesKHR` — FIFO only (the

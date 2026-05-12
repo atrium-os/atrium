@@ -1735,13 +1735,36 @@ fn swapchain_ring_acquire_present_round_trip() {
     let mut queue: VkQueue = std::ptr::null_mut();
     unsafe { vkGetDeviceQueue(device, 0, 0, &mut queue); }
 
-    // Probe surface formats (single canonical RGBA8/SRGB-NL).
+    // Probe surface formats. The ICD advertises four scanout-
+    // compatible formats (R8G8B8A8 UNORM/SRGB + B8G8R8A8
+    // UNORM/SRGB) in priority order — see ATRIUM_SURFACE_FORMATS.
     let mut fmt_count: u32 = 0;
     let r = unsafe {
         vkGetPhysicalDeviceSurfaceFormatsKHR(pds[0], 1, &mut fmt_count, std::ptr::null_mut())
     };
     assert_eq!(r, 0);
-    assert_eq!(fmt_count, 1);
+    assert_eq!(fmt_count, 4);
+
+    let mut fmts = [0u8; 8 * 4];
+    let mut got: u32 = 4;
+    let r = unsafe {
+        vkGetPhysicalDeviceSurfaceFormatsKHR(
+            pds[0], 1, &mut got, fmts.as_mut_ptr() as *mut std::ffi::c_void,
+        )
+    };
+    assert_eq!(r, 0);
+    assert_eq!(got, 4);
+    let read_u32 = |off: usize| u32::from_le_bytes(
+        fmts[off..off+4].try_into().unwrap()
+    );
+    assert_eq!(read_u32(0),  37); // R8G8B8A8_UNORM first (priority)
+    assert_eq!(read_u32(8),  43); // R8G8B8A8_SRGB
+    assert_eq!(read_u32(16), 44); // B8G8R8A8_UNORM
+    assert_eq!(read_u32(24), 50); // B8G8R8A8_SRGB
+    // colorSpace == SRGB_NONLINEAR_KHR (0) for all four.
+    for i in 0..4 {
+        assert_eq!(read_u32(i * 8 + 4), 0);
+    }
 
     // Present modes: FIFO only.
     let mut mode_count: u32 = 0;
