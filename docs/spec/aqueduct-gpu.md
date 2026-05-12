@@ -1286,8 +1286,12 @@ Deliverables:
   `translate_texture`, `translate_glyph_run`.
 - ⚠️ Frescod render-loop swap onto bridge — **pending**
   (FreeBSD-only; can't host-test, deferred to VM session).
-- ⚠️ `atrium-virtio-gpu` kmod extensions: `IOC_GPU_IMPORT_REGION`,
-  `IOC_GPU_LIST_BACKENDS` — **pending** (Phase 1.5).
+- ✅ `atrium-virtio-gpu` kmod extensions: `IOC_GPU_IMPORT_REGION`,
+  `IOC_GPU_MINT_TOKEN`, `IOC_GPU_LIST_BACKENDS` — landed (Phase 1.5).
+  Refcounted BOs + token table; two-process round-trip + refcount
+  lifecycle + 1000-iter leak-free stress verified.
+  `kern.atrium_gpu.{bos,tokens}_outstanding` sysctls expose live
+  table sizes for diagnostic.
 
 Validation done so far:
 - Tier-1 SW backend produces real pixels through full wire stack
@@ -1966,11 +1970,12 @@ fresco-aqueduct-bridge/               ✅ fresco-protocol → FrameOp
 atrium-vk-icd/                        ⚠️ Vulkan ICD (Phase 2.5+)
 external/wgpu/                        ⚠️ wgpu fork w/ aqueduct-gpu
                                          backend (Phase 1.5?)
-atrium-kmod/atrium_virtio_gpu.c       ⚠️ IOC_GPU_IMPORT_REGION,
-                                         IOC_GPU_LIST_BACKENDS,
-                                         IOC_SET_CAPS (Phase 1.5 +
-                                         Phase 2 for gpu.scanout
-                                         gating)
+atrium-kmod/atrium_virtio_gpu.c       ✅ IOC_GPU_MINT_TOKEN,
+                                         IOC_GPU_IMPORT_REGION,
+                                         IOC_GPU_LIST_BACKENDS landed
+                                         (Phase 1.5). IOC_SET_CAPS for
+                                         gpu.scanout gating still
+                                         pending (Phase 2).
 docs/spec/aqueduct-gpu.md             ✅ this file
 docs/spec/atrium-venus.md             ✅ marked superseded, archived
 docs/spec/atrium-pkg.md               ✅ extended with shader-
