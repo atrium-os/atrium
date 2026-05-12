@@ -1859,7 +1859,7 @@ atrium_vgpu_req_resp(struct atrium_gpu_softc *sc,
 
 	mtx_lock(&sc->ctrl_lock);
 	sc->ctrl_done = false;
-	{
+	if (bootverbose) {
 		uint32_t cmd_type = le32toh(*(uint32_t *)req);
 		device_printf(sc->dev,
 		    "req_resp: enqueue type=0x%x reqlen=%zu resplen=%zu\n",
