@@ -327,6 +327,18 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkPhysicalDevice, *mut u32, *mut ash::vk::QueueFamilyProperties), FnVoidPtr,
             >(vkGetPhysicalDeviceQueueFamilyProperties)),
+        "vkGetPhysicalDeviceFeatures" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkPhysicalDevice, *mut ash::vk::PhysicalDeviceFeatures), FnVoidPtr,
+            >(vkGetPhysicalDeviceFeatures)),
+        "vkGetPhysicalDeviceMemoryProperties" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkPhysicalDevice, *mut ash::vk::PhysicalDeviceMemoryProperties), FnVoidPtr,
+            >(vkGetPhysicalDeviceMemoryProperties)),
+        "vkGetPhysicalDeviceFormatProperties" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkPhysicalDevice, ash::vk::Format, *mut ash::vk::FormatProperties), FnVoidPtr,
+            >(vkGetPhysicalDeviceFormatProperties)),
         "vkCreateDevice" =>
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkPhysicalDevice, *const c_void, *const c_void, *mut VkDevice) -> VkResult, FnVoidPtr,
@@ -473,6 +485,68 @@ pub unsafe extern "C" fn vkGetPhysicalDeviceQueueFamilyProperties(
     };
     *p_properties.offset(0) = qfp;
     *p_queue_family_property_count = 1;
+}
+
+/// `vkGetPhysicalDeviceFeatures` — feature set this device supports.
+/// Skeleton: zero features. Real ICDs turn on the subset that maps
+/// to native backend capabilities; for tier-1 software that's
+/// effectively none — apps must stick to the Vulkan 1.0 core
+/// feature floor.
+#[no_mangle]
+pub unsafe extern "C" fn vkGetPhysicalDeviceFeatures(
+    _physical_device: VkPhysicalDevice,
+    p_features:       *mut ash::vk::PhysicalDeviceFeatures,
+) {
+    if p_features.is_null() { return; }
+    *p_features = ash::vk::PhysicalDeviceFeatures::default();
+}
+
+/// `vkGetPhysicalDeviceMemoryProperties` — heap + memory-type
+/// layout. Skeleton: one heap (4 GiB advertised, host-visible),
+/// one memory type pointing at it with HOST_VISIBLE | HOST_COHERENT
+/// | DEVICE_LOCAL flags.
+///
+/// Real Atrium maps the BO refcount + IMPORT_REGION model onto a
+/// single heap; multi-heap (system-RAM vs VRAM split) arrives only
+/// when atrium-vk-icd targets a native HW backend with dedicated
+/// VRAM. The software backend is single-heap by construction.
+#[no_mangle]
+pub unsafe extern "C" fn vkGetPhysicalDeviceMemoryProperties(
+    _physical_device:    VkPhysicalDevice,
+    p_memory_properties: *mut ash::vk::PhysicalDeviceMemoryProperties,
+) {
+    if p_memory_properties.is_null() { return; }
+    let mut mp = ash::vk::PhysicalDeviceMemoryProperties::default();
+
+    mp.memory_heap_count = 1;
+    mp.memory_heaps[0]   = ash::vk::MemoryHeap {
+        size:  4 * 1024 * 1024 * 1024, // 4 GiB nominal
+        flags: ash::vk::MemoryHeapFlags::DEVICE_LOCAL,
+    };
+
+    mp.memory_type_count = 1;
+    mp.memory_types[0]   = ash::vk::MemoryType {
+        property_flags: ash::vk::MemoryPropertyFlags::DEVICE_LOCAL
+            | ash::vk::MemoryPropertyFlags::HOST_VISIBLE
+            | ash::vk::MemoryPropertyFlags::HOST_COHERENT,
+        heap_index:     0,
+    };
+
+    *p_memory_properties = mp;
+}
+
+/// `vkGetPhysicalDeviceFormatProperties` — what's supported for a
+/// given image format. Skeleton: every format reports zero
+/// supported features. Apps that respect this will fall back to
+/// the Vulkan-mandated minimum format list.
+#[no_mangle]
+pub unsafe extern "C" fn vkGetPhysicalDeviceFormatProperties(
+    _physical_device:    VkPhysicalDevice,
+    _format:             ash::vk::Format,
+    p_format_properties: *mut ash::vk::FormatProperties,
+) {
+    if p_format_properties.is_null() { return; }
+    *p_format_properties = ash::vk::FormatProperties::default();
 }
 
 /// `vkCreateDevice` — allocate an `AtriumDevice` with one or more

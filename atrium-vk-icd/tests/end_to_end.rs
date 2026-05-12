@@ -313,6 +313,62 @@ fn command_pool_and_buffer_lifecycle() {
 }
 
 #[test]
+fn physical_device_features_and_memory_queries() {
+    use atrium_vk_icd::{
+        vkGetPhysicalDeviceFeatures, vkGetPhysicalDeviceMemoryProperties,
+        vkGetPhysicalDeviceFormatProperties,
+    };
+
+    let sock = tmp_socket("trio");
+    let sw_backend = Arc::new(SoftwareBackend::new());
+    let backend_for_listener: Arc<dyn Backend> = sw_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap();
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+
+    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+
+    let mut instance: VkInstance = std::ptr::null_mut();
+    unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
+    let mut devices: [VkPhysicalDevice; 1] = [std::ptr::null_mut(); 1];
+    let mut cap: u32 = 1;
+    unsafe { vkEnumeratePhysicalDevices(instance, &mut cap, devices.as_mut_ptr()); }
+
+    // Features: zero (no features enabled).
+    let mut feats = ash::vk::PhysicalDeviceFeatures::default();
+    feats.geometry_shader = 1; // dirty the field; verify ICD zeros it.
+    unsafe { vkGetPhysicalDeviceFeatures(devices[0], &mut feats); }
+    assert_eq!(feats.geometry_shader, 0);
+
+    // Memory: 1 heap + 1 memory type, host-visible + coherent.
+    let mut mp = ash::vk::PhysicalDeviceMemoryProperties::default();
+    unsafe { vkGetPhysicalDeviceMemoryProperties(devices[0], &mut mp); }
+    assert_eq!(mp.memory_heap_count, 1);
+    assert_eq!(mp.memory_type_count, 1);
+    assert!(mp.memory_heaps[0].size >= 1024 * 1024 * 1024);
+    assert!(mp.memory_types[0].property_flags
+        .contains(ash::vk::MemoryPropertyFlags::HOST_VISIBLE));
+    assert!(mp.memory_types[0].property_flags
+        .contains(ash::vk::MemoryPropertyFlags::HOST_COHERENT));
+
+    // Format: all zero today.
+    let mut fp = ash::vk::FormatProperties::default();
+    unsafe {
+        vkGetPhysicalDeviceFormatProperties(
+            devices[0], ash::vk::Format::R8G8B8A8_UNORM, &mut fp,
+        );
+    }
+    assert!(fp.linear_tiling_features.is_empty());
+    assert!(fp.optimal_tiling_features.is_empty());
+    assert!(fp.buffer_features.is_empty());
+
+    unsafe { vkDestroyInstance(instance, std::ptr::null()); }
+    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[test]
 fn proc_addr_resolves_three_entry_points() {
     // No live daemon required for the get_proc_addr lookups.
     fn lookup(name: &[u8]) -> Option<unsafe extern "C" fn()> {
