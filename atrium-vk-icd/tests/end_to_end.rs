@@ -547,6 +547,89 @@ fn submit_flushes_recorded_frame_to_aqueduct_backend() {
 }
 
 #[test]
+fn pipeline_create_bind_destroy_round_trip() {
+    use atrium_vk_icd::{
+        cmdbuf_recorded_bytes,
+        vkAllocateCommandBuffers, vkBeginCommandBuffer, vkCmdBindPipeline,
+        vkCreateCommandPool, vkCreateDevice, vkCreateGraphicsPipelines,
+        vkCreatePipelineLayout, vkDestroyCommandPool, vkDestroyDevice,
+        vkDestroyPipeline, vkDestroyPipelineLayout, vkEndCommandBuffer,
+    };
+
+    let sock = tmp_socket("pipe");
+    let sw_backend = Arc::new(SoftwareBackend::new());
+    let backend_for_listener: Arc<dyn Backend> = sw_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap();
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+
+    std::env::set_var("ATRIUM_VK_ICD_SOCKET", &sock);
+
+    type VkDevice = *mut std::ffi::c_void;
+    type VkCommandBuffer = *mut std::ffi::c_void;
+
+    let mut instance: VkInstance = std::ptr::null_mut();
+    unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
+    let mut devices: [VkPhysicalDevice; 1] = [std::ptr::null_mut(); 1];
+    let mut cap: u32 = 1;
+    unsafe { vkEnumeratePhysicalDevices(instance, &mut cap, devices.as_mut_ptr()); }
+    let mut device: VkDevice = std::ptr::null_mut();
+    unsafe { vkCreateDevice(devices[0], std::ptr::null(), std::ptr::null(), &mut device); }
+
+    // Pipeline layout: should round-trip (non-zero u64).
+    let mut layout: u64 = 0;
+    let r = unsafe { vkCreatePipelineLayout(device, std::ptr::null(), std::ptr::null(), &mut layout) };
+    assert_eq!(r, 0);
+    assert!(layout != 0);
+
+    // Create 2 pipelines.
+    let mut pipes: [u64; 2] = [0, 0];
+    let r = unsafe {
+        vkCreateGraphicsPipelines(
+            device, 0, 2, std::ptr::null(), std::ptr::null(), pipes.as_mut_ptr(),
+        )
+    };
+    assert_eq!(r, 0);
+    assert!(pipes[0] != 0 && pipes[1] != 0);
+    assert_ne!(pipes[0], pipes[1], "each pipeline must get a fresh id");
+
+    // Record vkCmdBindPipeline against the first pipeline.
+    let mut pool: u64 = 0;
+    unsafe { vkCreateCommandPool(device, std::ptr::null(), std::ptr::null(), &mut pool); }
+    let mut info = [0u8; 40];
+    info[0..4].copy_from_slice(&40u32.to_le_bytes());
+    info[16..24].copy_from_slice(&pool.to_le_bytes());
+    info[28..32].copy_from_slice(&1u32.to_le_bytes());
+    let mut cbs: [VkCommandBuffer; 1] = [std::ptr::null_mut(); 1];
+    unsafe { vkAllocateCommandBuffers(device, info.as_ptr() as *const _, cbs.as_mut_ptr()); }
+    let cb = cbs[0];
+
+    unsafe { vkBeginCommandBuffer(cb, std::ptr::null()); }
+    unsafe { vkCmdBindPipeline(cb, 0, pipes[0]); }
+    unsafe { vkEndCommandBuffer(cb); }
+
+    let bytes = cmdbuf_recorded_bytes(cb);
+    // BindPipeline record: 8-byte header + 4-byte body (u32 ResourceId).
+    assert_eq!(bytes.len(), 12, "BindPipeline record must be 12 bytes");
+    let op = u16::from_le_bytes([bytes[0], bytes[1]]);
+    assert_eq!(op, 0x0020, "first op must be BindPipeline (0x0020)");
+    let id = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+    assert_eq!(id, pipes[0] as u32,
+        "BindPipeline body must carry the resolved ResourceId");
+
+    // Cleanup.
+    unsafe { vkDestroyPipeline(device, pipes[0], std::ptr::null()); }
+    unsafe { vkDestroyPipeline(device, pipes[1], std::ptr::null()); }
+    unsafe { vkDestroyPipelineLayout(device, layout, std::ptr::null()); }
+    unsafe { vkDestroyCommandPool(device, pool, std::ptr::null()); }
+    unsafe { vkDestroyDevice(device, std::ptr::null()); }
+    unsafe { vkDestroyInstance(instance, std::ptr::null()); }
+    std::env::remove_var("ATRIUM_VK_ICD_SOCKET");
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[test]
 fn proc_addr_resolves_three_entry_points() {
     // No live daemon required for the get_proc_addr lookups.
     fn lookup(name: &[u8]) -> Option<unsafe extern "C" fn()> {

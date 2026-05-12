@@ -223,6 +223,15 @@ struct AtriumDevice {
     fence: aqueduct_gpu::ids::ResourceId,
     /// Monotonic timeline value; incremented per submit.
     timeline: std::cell::Cell<u64>,
+    /// Resource-ID allocator for ICD-side handles
+    /// (VkPipeline, VkPipelineLayout, future VkBuffer/VkImage).
+    /// Namespaced under `IdNamespace::IcdRuntime` so they don't
+    /// collide with Builtin/Bundle IDs.
+    id_alloc: std::sync::Mutex<aqueduct_gpu_client::IdAllocator>,
+    /// Per-VkPipeline state: maps VkPipeline u64 → ResourceId
+    /// that vkCmdBindPipeline references in the BindPipeline
+    /// FrameOp.
+    pipelines: std::sync::Mutex<std::collections::HashMap<u64, aqueduct_gpu::ids::ResourceId>>,
 }
 
 /// ICD-side state behind a `VkQueue`. Same dispatchable-handle
@@ -429,10 +438,29 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkCommandBuffer, u32, u32, u32, u32), FnVoidPtr,
             >(vkCmdDraw)),
-        // Phase 1.3b+ continued: vkCmdBindPipeline (needs VkPipeline
-        // → ResourceId mapping), vkCmdBindVertexBuffers,
+        "vkCreatePipelineLayout" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, *const c_void, *const c_void, *mut u64) -> VkResult, FnVoidPtr,
+            >(vkCreatePipelineLayout)),
+        "vkDestroyPipelineLayout" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, *const c_void), FnVoidPtr,
+            >(vkDestroyPipelineLayout)),
+        "vkCreateGraphicsPipelines" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, u32, *const c_void, *const c_void, *mut u64) -> VkResult, FnVoidPtr,
+            >(vkCreateGraphicsPipelines)),
+        "vkDestroyPipeline" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, *const c_void), FnVoidPtr,
+            >(vkDestroyPipeline)),
+        "vkCmdBindPipeline" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u32, u64), FnVoidPtr,
+            >(vkCmdBindPipeline)),
+        // Phase 1.3b+ continued: vkCmdBindVertexBuffers,
         // vkCmdBindIndexBuffer, vkCmdDrawIndexed, vkCmdCopyBuffer*,
-        // vkCmdPipelineBarrier, …
+        // vkCmdPipelineBarrier, vkCmdBegin/EndRenderPass, …
         _ => None,
     }
 }
@@ -653,6 +681,12 @@ pub unsafe extern "C" fn vkCreateDevice(
         instance: inst_ptr,
         fence,
         timeline: std::cell::Cell::new(0),
+        id_alloc: std::sync::Mutex::new(
+            aqueduct_gpu_client::IdAllocator::with_namespace(
+                aqueduct_gpu::ids::IdNamespace::IcdRuntime,
+            ),
+        ),
+        pipelines: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
     let dev_ptr: *mut AtriumDevice = &mut *dev;
     let q = Box::new(AtriumQueue {
@@ -684,6 +718,139 @@ pub unsafe extern "C" fn vkDestroyDevice(
     for q in &dev.queues {
         let _ = Box::from_raw(*q);
     }
+}
+
+/// `vkCreatePipelineLayout` — non-dispatchable handle, opaque
+/// today (we ignore descriptor-set + push-constant range info; the
+/// renderer's push-constant path is pipeline-global, and we don't
+/// have descriptor sets yet). Returns a unique non-zero u64 so
+/// that callers passing it back round-trip correctly.
+#[no_mangle]
+pub unsafe extern "C" fn vkCreatePipelineLayout(
+    device:           VkDevice,
+    _p_create_info:   *const c_void,
+    _p_allocator:     *const c_void,
+    p_pipeline_layout: *mut u64,
+) -> VkResult {
+    if device.is_null() || p_pipeline_layout.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let dev = &*(device as *const AtriumDevice);
+    let id = match dev.id_alloc.lock().ok().and_then(|mut a| a.next()) {
+        Some(id) => id,
+        None     => return VK_ERROR_INITIALIZATION_FAILED,
+    };
+    *p_pipeline_layout = id.raw() as u64;
+    VK_SUCCESS
+}
+
+/// `vkDestroyPipelineLayout` — no-op today; pipeline layouts hold
+/// no ICD-side state worth reclaiming. Future descriptor-set
+/// tracking would free the layout's slot here.
+#[no_mangle]
+pub unsafe extern "C" fn vkDestroyPipelineLayout(
+    _device:        VkDevice,
+    _layout:        u64,
+    _p_allocator:   *const c_void,
+) {
+}
+
+/// `vkCreateGraphicsPipelines` — allocate one ResourceId per
+/// requested pipeline, register it in the device's pipelines map.
+/// vkCmdBindPipeline later looks the VkPipeline u64 up and pushes
+/// a `BindPipeline` FrameOp with the resolved ResourceId.
+///
+/// We ignore the pipeline-cache + VkGraphicsPipelineCreateInfo
+/// contents — shader stages, vertex input, rasterizer, blend,
+/// depth/stencil, render-pass, subpass. The host endpoint sees
+/// the resolved ResourceId in BindPipeline and resolves it
+/// against the shader-cache / bundle-pipeline machinery (today,
+/// against `IdNamespace::IcdRuntime` IDs that no upload has yet
+/// registered — so the host will fail the dispatch with
+/// `OP_GPU_VALIDATION_ERR`. Future Phase 1.3b+ wires
+/// vkCreateShaderModule + the create-info shader stages through
+/// to OP_GPU_SHADER_UPLOAD).
+///
+/// # Safety
+///
+/// `p_pipelines` must point to at least `create_info_count` u64
+/// slots. `p_create_infos` is unused today; we don't dereference.
+#[no_mangle]
+pub unsafe extern "C" fn vkCreateGraphicsPipelines(
+    device:             VkDevice,
+    _pipeline_cache:    u64,   /* VkPipelineCache */
+    create_info_count:  u32,
+    _p_create_infos:    *const c_void,
+    _p_allocator:       *const c_void,
+    p_pipelines:        *mut u64,
+) -> VkResult {
+    if device.is_null() || p_pipelines.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let dev = &*(device as *const AtriumDevice);
+    let mut alloc = match dev.id_alloc.lock() {
+        Ok(a) => a,
+        Err(_) => return VK_ERROR_INITIALIZATION_FAILED,
+    };
+    let mut pipelines = match dev.pipelines.lock() {
+        Ok(p) => p,
+        Err(_) => return VK_ERROR_INITIALIZATION_FAILED,
+    };
+    for i in 0..create_info_count {
+        let id = match alloc.next() {
+            Some(id) => id,
+            None     => return VK_ERROR_INITIALIZATION_FAILED,
+        };
+        // Use the ResourceId's raw u32 widened to u64 as the
+        // VkPipeline handle. Round-trips through pipelines map.
+        let handle = id.raw() as u64;
+        pipelines.insert(handle, id);
+        *p_pipelines.offset(i as isize) = handle;
+    }
+    VK_SUCCESS
+}
+
+/// `vkDestroyPipeline` — remove the (VkPipeline → ResourceId)
+/// entry from the device's pipelines map. The ResourceId itself
+/// stays consumed; we don't reuse IDs.
+#[no_mangle]
+pub unsafe extern "C" fn vkDestroyPipeline(
+    device:       VkDevice,
+    pipeline:     u64,
+    _p_allocator: *const c_void,
+) {
+    if device.is_null() || pipeline == 0 { return; }
+    let dev = &*(device as *const AtriumDevice);
+    if let Ok(mut p) = dev.pipelines.lock() {
+        p.remove(&pipeline);
+    }
+}
+
+/// `vkCmdBindPipeline` — push a `BindPipeline` FrameOp with the
+/// resolved ResourceId. The Vk `pipelineBindPoint` is ignored —
+/// Atrium's FrameOp dispatch is single-bind-point (the host
+/// figures out whether to dispatch to graphics or compute from
+/// the pipeline's bundle definition).
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdBindPipeline(
+    command_buffer:       VkCommandBuffer,
+    _pipeline_bind_point: u32, /* VkPipelineBindPoint */
+    pipeline:             u64,
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    // Resolve VkPipeline → ResourceId via the owning device's
+    // pipelines map. Walk back-pointer: cmdbuf → device.
+    //
+    // (Today: cmdbufs don't carry a device back-pointer; vkCmd*
+    // is per-buffer but resolution needs the device. Use the
+    // pipeline u64 directly as the ResourceId raw — they're the
+    // same value by our convention above. Future: thread the
+    // device pointer through cmdbuf for stricter validation.)
+    let id_raw = pipeline as u32;
+    let _ = cb.frame.push(
+        aqueduct_gpu::opcodes::FrameOp::BindPipeline,
+        &id_raw.to_le_bytes(),
+    );
 }
 
 /// Helper: get the AtriumCommandBuffer behind a handle, with state
@@ -1347,8 +1514,8 @@ mod tests {
 
     #[test]
     fn get_proc_addr_unknown_name_returns_none() {
-        // vkCmdBindPipeline isn't wired yet.
-        let name = b"vkCmdBindPipeline\0";
+        // vkCmdBeginRenderPass isn't wired yet.
+        let name = b"vkCmdBeginRenderPass\0";
         let r = unsafe {
             vk_icdGetInstanceProcAddr(
                 std::ptr::null_mut(),
