@@ -30,30 +30,45 @@
 //! Listens on `/tmp/frescod.sock` (or `$FRESCOD_SOCK`). Standard
 //! fresco-protocol clients connect unchanged.
 //!
-//! # Deferred work — proper vsync (kmod step 3.5)
+//! # Rendering pipeline (current state)
 //!
-//! Today's frame loop is wall-clock-paced over a **triple-buffered**
-//! scanout ring. The kmod's page_flip rebinds the connector's
-//! scanout when the supplied BO differs (committed alongside this
-//! file as Phase 1.5b.a), so render-into-live-BO tearing is gone
-//! structurally.
+//! Triple-buffered scanout ring, vblank-paced, queued page-flip.
+//! See `docs/spec/aqueduct-gpu.md` §6.5.5 (a, b, c — all landed).
 //!
-//! What remains for proper vsync (still kmod-side, deferred to
-//! `docs/spec/aqueduct-gpu.md` §6.5.5.b + §6.5.5.c):
+//! - **Triple-buffer ring** (§6.5.5.a): three scanout BOs, round-
+//!   robin advance on real flips, keepalive flips re-assert the
+//!   current scanout BO. Eliminates render-into-live-BO tearing.
+//! - **Vblank pacing** (§6.5.5.b): `dpy.wait_vblank(conn.id)` once
+//!   per loop iteration in place of wall-clock sleep — frame loop
+//!   is phase-locked to the kmod's emulated vblank cadence.
+//! - **Queued page-flip** (§6.5.5.c): `dpy.page_flip_queued`
+//!   records the request in the kmod's per-connector slot; a
+//!   taskqueue worker fires SET_SCANOUT_BLOB + RESOURCE_FLUSH at
+//!   the next vblank tick. Render(N+1) overlaps with the kmod's
+//!   deferred flip of frame N.
 //!
-//! 1. **Vblank IRQ events.** Kmod gains an IRQ handler that posts
-//!    vblank events to subscribers; new ioctl
-//!    `IOC_DISPLAY_SUBSCRIBE_VBLANK` returns an event fd
-//!    (`kqueue`-friendly per `feedback_kqueue_native.md`).
+//! # Skip hierarchy (§6.5.6 — all landed)
 //!
-//! 2. **Queued page-flip semantics.** Kmod page_flip gains a
-//!    "queue for next vblank" flag complementing today's immediate
-//!    mode. With the BO ring already in place, the slots become
-//!    proper front/queued/back: render→queue→wait-vblank→advance.
+//! 1. **Per-screen flip skip.** No `page_flip` when composite bytes
+//!    AND per-window dirty status are both unchanged.
+//! 2. **Per-window rasterise skip.** Each window has its own
+//!    offscreen `WindowSurface`; non-dirty windows skip submit +
+//!    wait + readback. A final composite pass textured-rects every
+//!    visible surface onto the screen target.
+//! 3. **Intra-window dirty rect.** Per-node hash + bbox tracking;
+//!    if the damage rect covers less than
+//!    `FRESCOD_DAMAGE_THRESHOLD` (default 0.5) of the window area,
+//!    emit `BEGIN_RENDERPASS_NO_CLEAR` + `SET_SCISSOR(damage)`.
 //!
-//! Client side once those land: `atrium-gpu-rs` wraps the vblank
-//! fd; this file replaces `thread::sleep` with a kqueue wait on
-//! `(vblank, sock, input)`. ~50 lines of localised change.
+//! # Environment variables
+//!
+//! - `FRESCOD_SOCK` — Unix socket path for fresco-protocol clients
+//!   (default `/tmp/frescod.sock`).
+//! - `FRESCOD_AQUEDUCT_SOCK` — Unix socket path for the in-process
+//!   aqueduct-gpu listener (default `/tmp/frescod-aqueduct.sock`).
+//! - `FRESCOD_UNCAPPED=1` — disable vblank pacing (benchmark mode).
+//! - `FRESCOD_DAMAGE_THRESHOLD=<f32>` — override the level-3
+//!   partial-redraw threshold (0.0..=1.0; 0.0 disables level-3).
 
 #[path = "../input_reader.rs"]
 mod input_reader;
