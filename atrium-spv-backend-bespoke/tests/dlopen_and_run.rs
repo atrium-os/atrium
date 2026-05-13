@@ -187,6 +187,95 @@ fn bespoke_shader_runs_long_add_chain_through_linear_scan_ra() {
         "long-add-chain got {out_color:?}, expected {expected:?}");
 }
 
+/// Build a shader that reads a single `float scale` from
+/// a push-constant block at offset 0 and writes
+/// `vec4(scale, scale * 0.5, 0.25, 1.0)`. Exercises
+/// AccessChain + Load + FMul through the bespoke pipeline.
+fn build_pushconst_scale_shader() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let f32_ty = b.type_float(32, None);
+    let i32_ty = b.type_int(32, 1);
+    let vec4 = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let pc_struct = b.type_struct(vec![f32_ty]);
+    b.member_decorate(pc_struct, 0, Decoration::Offset,
+                      vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(pc_struct, Decoration::Block, vec![]);
+    let ptr_pc_struct = b.type_pointer(None, StorageClass::PushConstant, pc_struct);
+    let ptr_pc_f32    = b.type_pointer(None, StorageClass::PushConstant, f32_ty);
+    let ptr_out_vec4  = b.type_pointer(None, StorageClass::Output, vec4);
+    let zero_i = b.constant_bit32(i32_ty, 0u32);
+    let c025 = b.constant_bit32(f32_ty, 0.25f32.to_bits());
+    let c05  = b.constant_bit32(f32_ty, 0.5f32.to_bits());
+    let c1   = b.constant_bit32(f32_ty, 1.0f32.to_bits());
+    let pc_var = b.variable(ptr_pc_struct, None, StorageClass::PushConstant, None);
+    let out    = b.variable(ptr_out_vec4,  None, StorageClass::Output,       None);
+    b.decorate(out, Decoration::Location,
+               vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let scale_ptr = b.access_chain(ptr_pc_f32, None, pc_var, vec![zero_i]).unwrap();
+    let scale = b.load(f32_ty, None, scale_ptr, None, vec![]).unwrap();
+    let half = b.f_mul(f32_ty, None, scale, c05).unwrap();
+    let color = b.composite_construct(vec4, None,
+        vec![scale, half, c025, c1]).unwrap();
+    b.store(out, color, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![out]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn bespoke_shader_reads_push_constant_and_does_arith() {
+    let spirv = build_pushconst_scale_shader();
+    let module = translate(&spirv).expect("translate");
+    let out = compile(&module, Target::host()).expect("bespoke compile");
+    let dir = TempDir::new().unwrap();
+    let obj_path = dir.path().join("shader.o");
+    std::fs::write(&obj_path, &out.object).unwrap();
+    let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
+    let lib_path = dir.path().join(format!("shader.{ext}"));
+    link_to_shared_library(&obj_path, &lib_path).unwrap();
+    let lib = unsafe { libloading::Library::new(&lib_path).unwrap() };
+    type FsMain = unsafe extern "C" fn(
+        *const u8, *const u8, *const u8,
+        f32, f32, f32, f32, u32,
+        *mut f32, *mut f32,
+    );
+    let fs_main: libloading::Symbol<FsMain> = unsafe {
+        lib.get(b"atrium_fs_main").unwrap()
+    };
+    let scale_value = 0.6f32;
+    let mut pc_buf = [0u8; 4];
+    pc_buf.copy_from_slice(&scale_value.to_le_bytes());
+    let mut out_color = [0.0f32; 4];
+    let mut out_depth = 0.0f32;
+    unsafe {
+        fs_main(
+            std::ptr::null(), std::ptr::null(), pc_buf.as_ptr(),
+            0.0, 0.0, 0.0, 0.0, 0,
+            out_color.as_mut_ptr(), &mut out_depth,
+        );
+    }
+    let expected = [scale_value, scale_value * 0.5, 0.25, 1.0];
+    assert_eq!(out_color, expected,
+        "bespoke push-const + arith got {out_color:?}, expected {expected:?}");
+}
+
 #[test]
 fn bespoke_shader_runs_fp_arithmetic() {
     let (a, b) = (0.75f32, 0.25f32);

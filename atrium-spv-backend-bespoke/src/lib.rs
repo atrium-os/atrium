@@ -183,6 +183,10 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
     // scalars[id] = Vreg holding the live f32 (S-reg view).
     let mut scalars: HashMap<ValueId, asm::Vreg> = HashMap::new();
     let mut vectors: HashMap<ValueId, Vec<Value>> = HashMap::new();
+    // Pointer-typed Values: (base X-reg, byte offset).
+    // Seeded lazily from a Variable's storage class on
+    // first reference; threaded by Op::AccessChain.
+    let mut pointers: HashMap<ValueId, (asm::Xreg, i32)> = HashMap::new();
 
     // X4 holds out_color. Scratch X9/W9 for constant
     // materialisation + fmov bridging.
@@ -223,6 +227,14 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
         }
 
         match &inst.op {
+            Op::ConstInt { .. } | Op::ConstNull => {
+                // Constants used solely by AccessChain
+                // index resolution are orphan Insts at the
+                // bespoke level — AccessChain carries the
+                // resolved byte_offset directly. Skipping
+                // codegen here is safe; integer arithmetic
+                // lands in step 6+.
+            }
             Op::ConstFloat { value, kind: FloatKind::F32 } => {
                 let bits = (*value as f32).to_bits();
                 let result = inst.result.as_ref().ok_or_else(||
@@ -277,6 +289,73 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
                     a.emit(asm::str_w_offset(w_tmp, x_out, offset_bytes));
                 }
             }
+            Op::AccessChain { base, byte_offset } => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "AccessChain without result".into()))?;
+                let (param, base_off) =
+                    resolve_or_make_pointer(base, &mut pointers)?;
+                let new_off = base_off.saturating_add(*byte_offset as i32);
+                pointers.insert(result.id, (param, new_off));
+            }
+            Op::Load(ptr) => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal("Load without result".into()))?;
+                let (param, off) =
+                    resolve_or_make_pointer(ptr, &mut pointers)?;
+                let pointee = match &ptr.ty {
+                    Type::Pointer(_, inner) => (**inner).clone(),
+                    other => return Err(BackendError::Unsupported(format!(
+                        "Op::Load ptr {other:?} is not a Pointer type"))),
+                };
+                match &pointee {
+                    Type::F32 => {
+                        let v = alloc_vreg(
+                            &mut free_pool, &mut owners, result.id)?;
+                        emit_load_f32_offset(&mut a, w_tmp, param, off, v)?;
+                        scalars.insert(result.id, v);
+                    }
+                    Type::Vec2(_) | Type::Vec3(_) | Type::Vec4(_) => {
+                        let lane_count = match &pointee {
+                            Type::Vec2(_) => 2usize,
+                            Type::Vec3(_) => 3usize,
+                            Type::Vec4(_) => 4usize,
+                            _ => unreachable!(),
+                        };
+                        // Synthesise lane Values + collect
+                        // into vectors[result.id]. Each lane
+                        // gets a fresh S-reg + ldr+fmov.
+                        let mut lanes = Vec::with_capacity(lane_count);
+                        for lane_i in 0..lane_count {
+                            let lane_off = off.saturating_add((lane_i * 4) as i32);
+                            // Manufacture a synthetic
+                            // ValueId for the lane scalar.
+                            // We won't put it back in
+                            // id_map (the IR doesn't expect
+                            // one), but `vectors` needs
+                            // Values and the V-reg pool
+                            // needs an owner id. Use a
+                            // tagged synthetic id: result.id
+                            // * 16 + lane_i + 1 (collision-
+                            // free for any sensibly-sized
+                            // result.id).
+                            let synthetic_id = atrium_spv_ir::ValueId(
+                                result.id.0.wrapping_mul(16)
+                                    .wrapping_add(lane_i as u32 + 1));
+                            let v = alloc_vreg(
+                                &mut free_pool, &mut owners, synthetic_id)?;
+                            emit_load_f32_offset(&mut a, w_tmp, param, lane_off, v)?;
+                            scalars.insert(synthetic_id, v);
+                            lanes.push(Value {
+                                id: synthetic_id, ty: Type::F32,
+                            });
+                        }
+                        vectors.insert(result.id, lanes);
+                    }
+                    other => return Err(BackendError::Unsupported(format!(
+                        "Op::Load of {other:?} not supported"))),
+                }
+            }
             Op::Return => {
                 a.emit(asm::ret());
             }
@@ -287,6 +366,59 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
         }
     }
     Ok(a.into_bytes())
+}
+
+/// Materialise the (base X-reg, byte offset) pointer
+/// repr for a pointer-typed Value. If the Value already
+/// has a repr (set by a prior AccessChain), return it.
+/// Otherwise it must be a Variable: derive the base
+/// register from its storage class per the fragment-
+/// shader AAPCS64 split.
+fn resolve_or_make_pointer(
+    v: &Value,
+    pointers: &mut HashMap<ValueId, (asm::Xreg, i32)>,
+) -> Result<(asm::Xreg, i32), BackendError> {
+    if let Some(p) = pointers.get(&v.id) { return Ok(*p); }
+    let storage = match &v.ty {
+        Type::Pointer(sc, _) => sc,
+        other => return Err(BackendError::Unsupported(format!(
+            "pointer Value is not Pointer-typed: {other:?}"))),
+    };
+    let param = match storage {
+        StorageClass::Input        => asm::Xreg(0), // in_varyings
+        StorageClass::Uniform      => asm::Xreg(1),
+        StorageClass::PushConstant => asm::Xreg(2),
+        StorageClass::Output       => asm::Xreg(4),
+        other => return Err(BackendError::Unsupported(format!(
+            "storage class {other:?} not mapped to an ABI register"))),
+    };
+    let repr = (param, 0);
+    pointers.insert(v.id, repr);
+    Ok(repr)
+}
+
+/// Emit `ldr w_tmp, [param, #off]; fmov s_dst, w_tmp` —
+/// load an f32 from `[param + off]` into an S-reg via a
+/// W-reg bridge (pptk has no `ldr_s_offset` yet).
+fn emit_load_f32_offset(
+    a: &mut asm::Asm,
+    w_tmp: asm::Wreg,
+    param: asm::Xreg,
+    off: i32,
+    dst: asm::Vreg,
+) -> Result<(), BackendError> {
+    if off < 0 {
+        return Err(BackendError::Unsupported(format!(
+            "negative load offset {off} not supported")));
+    }
+    if off > u16::MAX as i32 {
+        return Err(BackendError::Unsupported(format!(
+            "load offset {off} exceeds u16 — large offsets need
+             a different addressing mode")));
+    }
+    a.emit(asm::ldr_w_offset(w_tmp, param, off as u16));
+    a.emit(asm::fmov_s_from_w(dst, w_tmp));
+    Ok(())
 }
 
 /// Linear-scan allocator helper: take one V-reg from the
@@ -332,6 +464,26 @@ fn compute_last_use(insts: &[atrium_spv_ir::Inst]) -> HashMap<ValueId, usize> {
                 mark(l.id); mark(r.id);
             }
             Op::FNeg(s) => mark(s.id),
+            Op::AccessChain { base: _, byte_offset: _ } => {
+                // Base is a pointer Value, not a scalar —
+                // no V-reg liveness implication.
+            }
+            Op::Load(_) => {
+                // The result may produce a vec4; if so,
+                // its synthetic lane scalars get their
+                // last_use set when we walk the Store.
+                // The result itself is a fresh scalar
+                // value (handled by alloc_vreg + Store).
+                // For a scalar Load result, last_use will
+                // be populated by whatever later op
+                // references it (FAdd / Store etc.).
+                if let Some(r) = inst.result.as_ref() {
+                    // Seed last_use so a Load result
+                    // unused later still has a defined
+                    // last_use of its own def.
+                    last_use.entry(r.id).or_insert(i);
+                }
+            }
             Op::Store { ptr: _, value } => {
                 mark(value.id);
                 if let Some(lane_ids) = vec_lanes.get(&value.id).cloned() {
