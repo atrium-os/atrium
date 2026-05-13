@@ -1400,6 +1400,10 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkPhysicalDevice, u64, *mut u32, *mut c_void) -> VkResult, FnVoidPtr,
             >(vkGetPhysicalDevicePresentRectanglesKHR)),
+        "vkResetQueryPool" | "vkResetQueryPoolEXT" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, u32, u32), FnVoidPtr,
+            >(vkResetQueryPool)),
         // 1.2 indirect-count draws — forward to non-Count variants
         // with max_draw_count as the static count.
         "vkCmdDrawIndirectCount" |
@@ -5417,6 +5421,15 @@ pub unsafe extern "C" fn vkCmdPushDescriptorSetWithTemplate(
     _layout:            u64,
     _set:               u32,
     _p_data:            *const c_void,
+) {}
+
+/// `vkResetQueryPool` — 1.2 mandatory host-side query-pool
+/// reset (vs the cmdbuf-side vkCmdResetQueryPool). Tier-1's
+/// query pool is itself a no-op (queries return NOT_READY);
+/// reset is a no-op.
+#[no_mangle]
+pub unsafe extern "C" fn vkResetQueryPool(
+    _device: VkDevice, _query_pool: u64, _first_query: u32, _query_count: u32,
 ) {}
 
 // ── WSI device-group extras (VK_KHR_swapchain DG additions) ─────

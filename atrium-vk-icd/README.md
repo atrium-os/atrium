@@ -12,10 +12,49 @@ the install-time AOT-compiled shader cache.
 
 ## Status
 
-**Vulkan 1.3 dispatch surface: complete.** ~140 entry points,
-26 unit + 29 e2e tests, live two-process verification on
-macOS/aarch64 and FreeBSD/aarch64. WSI Present round-trip
-VM-verified.
+**Vulkan 1.0/1.1/1.2/1.3 mandatory dispatch surface: complete.**
+~190 entry points (with KHR/EXT aliases), 33 unit + 32 e2e
+tests, live two-process verification on macOS/aarch64 and
+FreeBSD/aarch64. WSI Present round-trip VM-verified.
+
+### Recent fillouts (Vulkan ≥1.1 mandatory + common extensions)
+
+- 1.1: `vkBindBufferMemory2{,KHR}`, `vkBindImageMemory2{,KHR}`,
+  `vkEnumeratePhysicalDeviceGroups{,KHR}`,
+  `vkGetDeviceGroupPeerMemoryFeatures{,KHR}`,
+  `vkGetDeviceQueue2`, `vkGetDescriptorSetLayoutSupport{,KHR}`,
+  `vkGetPhysicalDeviceExternal{Buffer,Fence,Semaphore}Properties
+  {,KHR}`, descriptor-update templates, batch memreq.
+- 1.2: `vkCreateRenderPass2{,KHR}` +
+  `vkCmd{Begin,Next,End}RenderPass2{,KHR}`,
+  `vkResetQueryPool{,EXT}`, timeline-semaphore stubs,
+  `vkCmdDraw{,Indexed}IndirectCount{,KHR,AMD}`.
+- 1.3: dynamic rendering (`vkCmdBegin/EndRendering{,KHR}`),
+  `vkQueueSubmit2{,KHR}`, `vkCmdPipelineBarrier2{,KHR}`,
+  sync2 events, `vkCmdWriteTimestamp2{,KHR}`, sync2 copy/blit/
+  resolve, `vkGetDevice{Buffer,Image}MemoryRequirements{,KHR}`,
+  private-data slots, extended dynamic state (14),
+  `vkGetPhysicalDeviceToolProperties{,EXT}`.
+- WSI: `VK_KHR_swapchain` device-group present extras
+  (`vkGetDeviceGroupPresentCapabilitiesKHR`,
+  `vkGetDeviceGroupSurfacePresentModesKHR`,
+  `vkGetPhysicalDevicePresentRectanglesKHR`).
+- VkPipelineCache shims, sparse-image honest-zero stubs,
+  `VK_KHR_push_descriptor`, `VK_KHR_get_surface_capabilities2`,
+  `VK_EXT_debug_utils`.
+
+Behavioral correctness fixes worth flagging:
+- `vkAcquireNextImageKHR` + `vkQueueSubmit{,2}` now signal the
+  supplied fence (apps on the canonical
+  `acquire → wait` / `submit → wait` idiom were hanging).
+- `vkGetPhysicalDeviceFormatProperties` returns a real tier-1
+  capability matrix per format (color attachment, depth, vertex)
+  instead of zero everywhere.
+- `vkGetPhysicalDeviceSurfaceCapabilitiesKHR` honors
+  `ATRIUM_VK_SCREEN_EXTENT=WxH` for VM testing without
+  recompiling; `maxImageExtent` grows with currentExtent.
+- `VkPhysicalDeviceLimits` filled to Vulkan 1.3 §43.1 "Required
+  Limits".
 
 ### Implemented
 
