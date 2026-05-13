@@ -1486,6 +1486,10 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkDevice, u64, u64, u64, u64, *mut u32) -> VkResult, FnVoidPtr,
             >(vkAcquireNextImageKHR)),
+        "vkAcquireNextImage2KHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, *const c_void, *mut u32) -> VkResult, FnVoidPtr,
+            >(vkAcquireNextImage2KHR)),
         "vkQueuePresentKHR" =>
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkQueue, *const c_void) -> VkResult, FnVoidPtr,
@@ -6380,7 +6384,7 @@ pub unsafe extern "C" fn vkAcquireNextImageKHR(
     swapchain:    u64,
     _timeout_ns:  u64,
     _semaphore:   u64,
-    _fence:       u64,
+    fence:        u64,
     p_image_index: *mut u32,
 ) -> VkResult {
     if device.is_null() || swapchain == 0 || p_image_index.is_null() {
@@ -6395,8 +6399,44 @@ pub unsafe extern "C" fn vkAcquireNextImageKHR(
         sc.next_acquire = (sc.next_acquire + 1) % (sc.images.len() as u32).max(1);
         i
     } else { return VK_ERROR_INITIALIZATION_FAILED; };
+    // Spec: must signal the fence (if non-null) and the wait
+    // semaphore (if non-null) once the image is available.
+    // tier-1's acquire is synchronous (we just hand back a ring
+    // index), so the image is "available" the instant we return.
+    //
+    // Fence: flip its signaled bit so apps that vkWaitForFences
+    // on the acquire fence wake up immediately rather than hang.
+    // Semaphore: our binary semaphores have no host-visible
+    // state; vkQueueSubmit's wait-semaphore handling already
+    // assumes signaled, and vkWaitSemaphores returns SUCCESS
+    // immediately for timeline semaphores. So nothing to do.
+    if fence != 0 {
+        if let Ok(mut f) = dev.fences.lock() {
+            f.insert(fence, true);
+        }
+    }
     *p_image_index = idx;
     VK_SUCCESS
+}
+
+/// `vkAcquireNextImage2KHR` — 1.1 pNext-chain variant. Parses
+/// VkAcquireNextImageInfoKHR (56 bytes) and forwards to
+/// vkAcquireNextImageKHR. deviceMask is ignored (single-GPU).
+#[no_mangle]
+pub unsafe extern "C" fn vkAcquireNextImage2KHR(
+    device:        VkDevice,
+    p_acquire_info: *const c_void,
+    p_image_index: *mut u32,
+) -> VkResult {
+    if p_acquire_info.is_null() || p_image_index.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let b = p_acquire_info as *const u8;
+    let swapchain = std::ptr::read_unaligned(b.add(16) as *const u64);
+    let timeout   = std::ptr::read_unaligned(b.add(24) as *const u64);
+    let semaphore = std::ptr::read_unaligned(b.add(32) as *const u64);
+    let fence     = std::ptr::read_unaligned(b.add(40) as *const u64);
+    vkAcquireNextImageKHR(device, swapchain, timeout, semaphore, fence, p_image_index)
 }
 
 /// `vkQueuePresentKHR` — for each (swapchain, imageIndex) tuple

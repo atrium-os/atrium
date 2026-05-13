@@ -724,6 +724,108 @@ fn dynamic_rendering_emits_begin_end_render_pass_frame_ops() {
 }
 
 #[test]
+fn acquire_next_image_signals_fence_so_wait_does_not_hang() {
+    // Spec: vkAcquireNextImageKHR signals the fence (if non-null)
+    // once the image is available. Prior to this commit we
+    // ignored the fence argument; an app that did
+    // AcquireNextImage(.., fence) -> WaitForFences(fence) would
+    // hang forever. This test fails-loud on regression: it
+    // creates an unsignalled fence, acquires with it, then waits
+    // with a 0-ns timeout — must return SUCCESS, not TIMEOUT.
+    use atrium_vk_icd::{
+        vkAcquireNextImageKHR, vkAllocateMemory, vkBindImageMemory,
+        vkCreateAtriumSurfaceEXT, vkCreateDevice, vkCreateFence,
+        vkCreateSwapchainKHR, vkDestroyDevice, vkDestroyFence,
+        vkDestroyImage, vkDestroySwapchainKHR, vkDestroySurfaceKHR,
+        vkFreeMemory, vkGetImageMemoryRequirements,
+        vkGetSwapchainImagesKHR, vkWaitForFences,
+    };
+
+    let sock = tmp_socket("acquire-fence");
+    let sw_backend = Arc::new(SoftwareBackend::new());
+    let backend_for_listener: Arc<dyn Backend> = sw_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap();
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+    let _env = EnvLock::set(&sock);
+
+    type VkDevice = *mut std::ffi::c_void;
+
+    let mut instance: VkInstance = std::ptr::null_mut();
+    unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
+    let mut devices: [VkPhysicalDevice; 1] = [std::ptr::null_mut(); 1];
+    let mut cap: u32 = 1;
+    unsafe { vkEnumeratePhysicalDevices(instance, &mut cap, devices.as_mut_ptr()); }
+    let mut device: VkDevice = std::ptr::null_mut();
+    unsafe { vkCreateDevice(devices[0], std::ptr::null(), std::ptr::null(), &mut device); }
+
+    // Surface + swapchain.
+    let mut surf_info = [0u8; 24];
+    surf_info[0..4].copy_from_slice(&1_000_310_000u32.to_le_bytes());
+    surf_info[20..24].copy_from_slice(&9u32.to_le_bytes());
+    let mut surface: u64 = 0;
+    unsafe { vkCreateAtriumSurfaceEXT(instance, surf_info.as_ptr() as *const _, std::ptr::null(), &mut surface); }
+    let mut sc_info = [0u8; 104];
+    sc_info[0..4].copy_from_slice(&1000001000u32.to_le_bytes());
+    sc_info[20..28].copy_from_slice(&surface.to_le_bytes());
+    sc_info[28..32].copy_from_slice(&2u32.to_le_bytes());
+    sc_info[32..36].copy_from_slice(&37u32.to_le_bytes());
+    sc_info[40..44].copy_from_slice(&64u32.to_le_bytes());
+    sc_info[44..48].copy_from_slice(&64u32.to_le_bytes());
+    sc_info[48..52].copy_from_slice(&1u32.to_le_bytes());
+    sc_info[52..56].copy_from_slice(&0x10u32.to_le_bytes());
+    let mut swapchain: u64 = 0;
+    unsafe { vkCreateSwapchainKHR(device, sc_info.as_ptr() as *const _, std::ptr::null(), &mut swapchain); }
+    let mut ring = [0u64; 2];
+    let mut k: u32 = 2;
+    unsafe { vkGetSwapchainImagesKHR(device, swapchain, &mut k, ring.as_mut_ptr()); }
+    let mut req = ash::vk::MemoryRequirements::default();
+    unsafe { vkGetImageMemoryRequirements(device, ring[0], &mut req); }
+    let mut alloc = [0u8; 32];
+    alloc[0..4].copy_from_slice(&5u32.to_le_bytes());
+    alloc[16..24].copy_from_slice(&(req.size * 2).to_le_bytes());
+    let mut mem: u64 = 0;
+    unsafe { vkAllocateMemory(device, alloc.as_ptr() as *const _, std::ptr::null(), &mut mem); }
+    unsafe { vkBindImageMemory(device, ring[0], mem, 0); }
+    unsafe { vkBindImageMemory(device, ring[1], mem, req.size); }
+
+    // Unsignalled fence: VkFenceCreateInfo flags=0.
+    let mut fc = [0u8; 24];
+    fc[0..4].copy_from_slice(&8u32.to_le_bytes()); // sType
+    let mut fence: u64 = 0;
+    unsafe { vkCreateFence(device, fc.as_ptr() as *const _, std::ptr::null(), &mut fence); }
+    assert_ne!(fence, 0);
+
+    // Acquire — pass our unsignalled fence.
+    let mut idx: u32 = 999;
+    let r = unsafe {
+        vkAcquireNextImageKHR(device, swapchain, 0, 0, fence, &mut idx)
+    };
+    assert_eq!(r, 0);
+    assert!(idx < 2);
+
+    // Now wait on the fence with timeout=0. Must succeed (the
+    // acquire-signal landed); a regression that ignores the
+    // fence would return VK_TIMEOUT (or worse, hang).
+    let fences = [fence];
+    let r = unsafe {
+        vkWaitForFences(device, 1, fences.as_ptr(), 1 /* wait_all */, 0)
+    };
+    assert_eq!(r, 0, "vkWaitForFences must return SUCCESS; acquire signaled the fence");
+
+    unsafe { vkDestroyFence(device, fence, std::ptr::null()); }
+    unsafe { vkDestroySwapchainKHR(device, swapchain, std::ptr::null()); }
+    unsafe { vkDestroyImage(device, ring[0], std::ptr::null()); }
+    unsafe { vkDestroyImage(device, ring[1], std::ptr::null()); }
+    unsafe { vkFreeMemory(device, mem, std::ptr::null()); }
+    unsafe { vkDestroySurfaceKHR(instance, surface, std::ptr::null()); }
+    unsafe { vkDestroyDevice(device, std::ptr::null()); }
+    unsafe { vkDestroyInstance(instance, std::ptr::null()); }
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[test]
 fn surface_capabilities_honors_atrium_vk_screen_extent_override() {
     // Set the env override to a non-default 1920x1080, drive
     // vkGetPhysicalDeviceSurfaceCapabilitiesKHR, and verify the
