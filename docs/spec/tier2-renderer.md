@@ -1,31 +1,37 @@
 # Tier-2 Renderer — AOT software Vulkan for Atrium
 
-> **Status.** Design. No code yet.
+> **Status.** Design v2. No code yet.
 >
 > **Companion docs.** Read `aqueduct-gpu.md` (the GPU dispatch
 > protocol) and `atrium-pkg.md` (Atrium's bundle / install
 > story) first. This spec defines the second renderer tier
-> on the daemon side of aqueduct-gpu, and the install-time
-> shader-compile pipeline that feeds it.
+> on the daemon side of aqueduct-gpu, and the AOT shader-
+> compile pipeline that feeds it.
 >
 > **One-line summary.** Tier-2 is the software renderer for
-> third-party Vulkan apps whose shaders aren't part of Atrium's
-> built-in bundle catalog. Shaders are translated SPIR-V → Rust
-> → native `.so` *outside* the renderer process, cached on disk
-> by content hash, and dlopen'd by the daemon at runtime. The
-> daemon never runs a compiler; the renderer's hot loop only
-> ever calls native code it loaded from disk.
+> third-party Vulkan apps whose shaders aren't part of
+> Atrium's built-in bundle catalog. SPIR-V is translated to
+> a small SSA IR (`atrium-spv-ir`) and then compiled to
+> native code by *two* backends: a bespoke ARM64/x86_64
+> backend (leveraging the encoder from the `pptk` project)
+> for performance, plus a Cranelift backend as a graceful-
+> degradation fallback. A third reference path — a SPIR-V
+> interpreter — exists only in the test harness as the
+> differential-test oracle. All compilation happens in a
+> jailed sub-process *before* the daemon dlopens the
+> resulting `.so`. The daemon process never runs a compiler
+> in its hot loop.
 
 ---
 
 ## 1. Why we're doing this
 
-Tier-1 (`aqueduct-gpu-host/src/software/`, the tiny-skia backend)
-handles Atrium-native bundle pipelines: rect, path,
-textured-rect, glyph_run. That covers every drawable in
-fresco-server's scene graph and every renderer the in-tree
-Atrium apps need. When atrium-vk-icd routes a third-party
-SPIR-V pipeline at it, tier-1 returns:
+Tier-1 (`aqueduct-gpu-host/src/software/`, the tiny-skia
+backend) handles Atrium-native bundle pipelines: rect,
+path, textured-rect, glyph_run. That covers every drawable
+in fresco-server's scene graph and every renderer the
+in-tree Atrium apps need. When atrium-vk-icd routes a
+third-party SPIR-V pipeline at it, tier-1 returns:
 
 ```
 WARN aqueduct_gpu_host::backend: SoftwareBackend::submit_frame:
@@ -39,230 +45,300 @@ job is *Atrium's* shaders, and widening it would compromise
 its main-loop simplicity. Tier-2 exists to take the rejection
 path and turn it into pixels.
 
-The constraint that shapes the entire design: **no JIT, no
-interpreter in the renderer's hot path.** Every per-pixel
-shader call must be a regular function call into native code
-that was compiled by a normal Rust toolchain at some point
-*before* the renderer launches. Interpretation is too slow
-for any non-trivial fragment shader (rule of thumb: 50–200×
-slower than native). JIT compiles at runtime, lives in
-mutable executable pages, and turns the renderer into a
-security headache (RWX memory, codegen bugs become RCE
-surfaces, can't audit what code runs in the hot loop). Both
-are out.
+Three constraints shape the design:
 
-The non-obvious move is that "no JIT" *doesn't* mean "no
-SPIR-V → native translation" — it just means the translation
-must happen in a separate process at a defined point in time
-and produce a `.so` on disk. Once that file exists, the
-renderer's relationship to it is the same as its relationship
-to any other linked library: dlopen, grab symbols, call.
+1. **No JIT or interpreter in the renderer's hot path.**
+   Every per-pixel shader call must be a regular function
+   call into native code that was compiled by a defined
+   pipeline at some point *before* the renderer launches.
+   Interpretation is too slow (50–200× native) for any
+   non-trivial fragment shader. JIT-in-process commits the
+   daemon to W+X memory pages, complicates auditing, and
+   couples codegen security to the renderer.
+
+2. **Target the steady-state perf of hand-written ARM64
+   code, not "credible-fallback" perf.** Past experience
+   on a sibling project (PPTK — see §13) measured general-
+   purpose AOT translation at <30% of hand-written native.
+   For a software renderer in the pixel hot loop, that's
+   the difference between "Atrium app at 30 FPS" and
+   "Atrium app at 8 FPS." We need ≥80% of hand-written
+   native, which means a bespoke backend that exploits
+   the structure of shader code rather than a general-
+   purpose compiler tuned for arbitrary input.
+
+3. **Ship working code on day 1, then improve perf
+   incrementally.** The bespoke backend will take months
+   to cover the full SPIR-V opcode surface for the GLSL
+   4.50 core subset that Khronos samples use. We can't
+   block tier-2's first end-to-end demo on full bespoke
+   coverage. The architectural answer is a second
+   backend (Cranelift) that handles the long tail at
+   acceptable-but-degraded perf, with bespoke taking over
+   shader-by-shader as its op coverage widens.
+
+These three constraints land us at the three-tier model in
+§2.
 
 ---
 
-## 2. The execution model — AOT-on-first-use
-
-The pattern has a name, used by Android's `dex2oat`, Mono's
-`--aot`, GCJ, and several research VMs:
+## 2. The three-tier execution model
 
 ```
-                     ┌──────────────────────────────────────────┐
-                     │  vkCreateShaderModule(device, spirv)     │
-                     │  (daemon-side, in tier-2 session router) │
-                     └──────────────────────────────────────────┘
+                                  SPIR-V module
                                        │
                                        ▼
-                        hash = sha256(spirv_bytes)
-                        path = /var/atrium/shaders/v{N}/{hash}.so
+                  ┌───────────────────────────────────────────┐
+                  │  atrium-spv-frontend                      │
+                  │  (rspirv parse + SSA construction +       │
+                  │   structured-CFG recovery from            │
+                  │   OpSelectionMerge / OpLoopMerge)         │
+                  └───────────────────────────────────────────┘
                                        │
-                ┌──────────────────────┴─────────────────────┐
-                │                                            │
-        path.exists()?                              path doesn't exist?
-                │                                            │
-                ▼                                            ▼
-        ┌───────────────┐                  ┌─────────────────────────────┐
-        │ dlopen(path)  │                  │ spawn atrium-spv-compile    │
-        │ grab vs_main, │                  │   pipe SPIR-V bytes to it,  │
-        │   fs_main     │                  │   wait for child to write   │
-        │ cache module  │                  │   {hash}.so + exit          │
-        │ return        │                  │ (runs in its own Portcullis │
-        └───────────────┘                  │  jail; no FS write except   │
-                                           │  the cache dir.)            │
-                                           └─────────────────────────────┘
-                                                         │
-                                                         ▼
-                                                 (then dlopen path)
+                                       ▼
+                            atrium-spv-ir module
+                                       │
+              ┌────────────────────────┼─────────────────────────┐
+              ▼                        ▼                         ▼
+     ┌────────────────┐      ┌─────────────────┐      ┌──────────────────┐
+     │  bespoke       │      │  Cranelift      │      │  interpreter     │
+     │  ARM64/x86_64  │      │  fallback       │      │  (test-only;     │
+     │  backend       │      │  (atrium-spv-ir │      │   walks SPIR-V   │
+     │  (linear-scan  │      │   → cranelift   │      │   directly, no   │
+     │   RA + ISel +  │      │   IR adapter,   │      │   shared         │
+     │   pptk asm.rs) │      │   then          │      │   frontend with  │
+     │                │      │   cranelift-    │      │   the production │
+     │                │      │   object)       │      │   backends)      │
+     └────────┬───────┘      └────────┬────────┘      └─────────┬────────┘
+              │                       │                         │
+              ▼                       ▼                         ▼
+        .o → ld → .so          .o → ld → .so              in-process
+              │                       │                  shader execution
+              │                       │                  (cargo test only)
+              └───────┬───────────────┘
+                      ▼
+        /var/atrium/shaders/v{N}/{hash}.so
+                      │
+                      ▼
+       daemon dlopens at runtime, normal path
 ```
 
-Three properties fall out of this design:
+### Backend selection at compile time
 
-1. **Cold-launch latency on first install** — typically 1–5 s
-   per shader for `rustc --opt-level 3`. Happens once, ever,
-   per `(shader-bytes, ABI-version)` pair. After that the
-   cache is warm forever.
+`atrium-spv-compile` tries bespoke first. The bespoke
+backend exposes a `can_handle(&atrium_spv_ir::Function) -> bool`
+predicate; if it returns false (e.g., the function uses a
+SPIR-V op the bespoke backend hasn't grown support for
+yet), `atrium-spv-compile` falls back to the Cranelift
+backend, which has wider coverage from day 1 because
+Cranelift's IR is more general-purpose.
 
-2. **Renderer process never runs a compiler.** It only does
-   dlopen + symbol lookup + native function calls. No JIT
-   pages, no in-process codegen, no surprises in the hot
-   loop.
+The resulting `.so` is identical in shape regardless of
+which backend produced it — same exported symbols, same
+ABI, same metadata struct (§4). The daemon doesn't know or
+care which backend was used. The cache directory tracks
+which backend produced each entry (in metadata) so we can
+measure coverage and prioritise bespoke work, but
+behaviourally it's transparent.
 
-3. **Compile failure is recoverable.** If `atrium-spv-compile`
-   exits non-zero on a malformed SPIR-V, the daemon returns
-   `VK_ERROR_INVALID_SHADER_NV` from `vkCreateShaderModule`
-   and the app's normal error path takes over — same as a
-   real driver rejecting a bogus shader.
+### Cache + on-demand compile
 
-### When does the compile happen?
-
-Two trigger points, both supported:
+Two trigger points for compilation, both supported:
 
 **(a) Install-time, driven by `atrium-pkg`** — the
 happy path. When an Atrium-shipped app installs, `atrium-pkg`
-scans the bundle's shader manifest (a static list of SPIR-V
-blobs the bundle declares it uses), runs `atrium-spv-compile`
-on each one, and lands the resulting `.so` files in the
-shader cache before the app ever runs. First launch is
-instant.
+scans the bundle's shader manifest, runs `atrium-spv-compile`
+on each blob, and lands the resulting `.so` files in
+`/var/atrium/shaders/v{N}/` before the app ever runs.
+First launch is instant.
 
 **(b) First-`vkCreateShaderModule`, on demand** — the
-fallback. Apps that synthesize shaders at runtime (shader-
-permutation engines, RenderDoc-style capture replay tools,
-debug builds with hot-reload) hit this path. The vkCreate
-call blocks for the compile, then proceeds. Slow on first
-encounter, instant thereafter.
+fallback. Apps that synthesize shaders at runtime or
+weren't installed through `atrium-pkg` hit this path. The
+vkCreate call blocks for the compile (bespoke ~50–200 ms,
+Cranelift ~50–200 ms; comparable), then proceeds.
 
-The (a) path is preferred because it makes the install ↔
-runtime contract explicit: the bundle declares its shader
-dependencies, atrium-pkg satisfies them ahead of time, and
-the runtime can detect a missing shader and report it
-honestly (vs. a runtime app that synthesises a shader on
-the fly). It also keeps untrusted compile work out of the
-hot path. The (b) path is the safety valve for binaries
-that don't go through Atrium's installer at all.
+### Test path
+
+The interpreter never ships. In `cargo test`, every test
+shader is compiled three ways:
+
+1. Bespoke output (if bespoke can_handle returns true)
+2. Cranelift output
+3. Interpreter "output" (just a function we can call with
+   inputs to get the expected outputs)
+
+The test harness drives the same inputs through all three
+and compares pixel-for-pixel. Disagreement is a bug; the
+disagreement pattern (which two of three agree) tells us
+where the bug is (frontend, bespoke backend, Cranelift
+adapter).
 
 ---
 
-## 3. The four decisions, locked
+## 3. The five locked decisions
 
 > Where this spec deviates from "obvious" it's deliberate.
-> These are the four decisions whose alternatives were
-> explicitly considered.
+> These are the five decisions whose alternatives were
+> explicitly considered and rejected.
 
-### D1. AOT-on-first-use, not JIT
+### D1. AOT, not JIT, not interpreter (in production)
 
-**Decision.** All SPIR-V → native code generation happens in
-`atrium-spv-compile`, in its own process, before the daemon
-ever calls the shader. Output is a `.so` on disk.
+**Decision.** All SPIR-V → native code generation happens
+in `atrium-spv-compile`, in its own process, before the
+daemon ever calls the shader. Output is a `.so` on disk.
 
-**Why not JIT (LLVM/Cranelift).** JIT is the standard answer
-for SW Vulkan (llvmpipe). For Atrium it's wrong because:
-runtime codegen in a privileged daemon is a security concern
-(JIT'd pages are W+X by definition; bugs in the codegen
-become RCE); the codegen latency is paid every launch (no
-cross-run cache); LLVM is a heavyweight dependency that
-prevents us from shipping the daemon as a single self-
-contained Rust binary.
+**Why not JIT (LLVM/Cranelift in-process).** JIT is the
+standard answer for SW Vulkan (llvmpipe). For Atrium it's
+wrong because: runtime codegen in a privileged daemon is
+a security concern (JIT'd pages are W+X by definition;
+bugs in the codegen become RCE); the codegen latency is
+paid every launch (no cross-run cache); LLVM is a
+heavyweight dependency that prevents us from shipping the
+daemon as a single self-contained Rust binary.
 
-**Why not an interpreter.** Per-pixel fragment-shader work
-done by interpreting SPIR-V opcodes is 50–200× slower than
-native. The whole point of tier-2 is to be a credible
-software renderer, not a fallback for "at least it draws
-something". Interpretation is fine for compute-shader-light
-debug paths but is the wrong primitive for the per-pixel
-hot loop.
+**Why not an interpreter (in production).** Per-pixel
+fragment-shader work done by interpreting SPIR-V opcodes
+is 50–200× slower than native. The whole point of tier-2
+is to be a credible software renderer.
 
-### D2. Output language is Rust
+(The interpreter exists in the test harness — see D5.)
 
-**Decision.** `atrium-spv-translate` emits Rust source.
-`atrium-spv-compile` invokes `rustc --crate-type cdylib
---opt-level 3 --target $atrium_target` to produce the `.so`.
+### D2. Bespoke ARM64/x86_64 backend for the fast path, Cranelift for the fallback
 
-**Why Rust.** Matches the rest of Atrium's userspace
-language policy (`docs/LANGUAGE-POLICY.md`). Lets the
-translator emit straightforward Rust that LLVM-via-rustc
-optimises hard. Gives shader code access to `std::simd` for
-hand-vectorisable patterns. Calling convention from the
-rasterizer (also Rust) is zero-cost; no FFI marshalling.
+**Decision.** Two production backends:
 
-**Why not LLVM IR directly.** Would skip the `rustc`
-frontend but would lock us into LLVM's exact IR — a moving
-target — and lose the readability that lets us debug
-generated shaders by reading the source. The `rustc`
-dependency at install time is acceptable: Atrium dev
-machines have it, and end-user machines can either depend
-on `rust` package or ship a stripped `rustc`-as-shader-
-compiler (decision deferred).
+- **Bespoke**: SSA IR (`atrium-spv-ir`) → linear-scan
+  register allocator → hand-written instruction selector
+  that emits through the `pptk-codegen-arm64::asm.rs`
+  encoder (reused; see §13). x86_64 backend parallel
+  structure; deferrable to v1.5 if we ship FreeBSD-ARM64
+  only first. Output: object file via PPTK's encoder
+  patterns; linked with system `ld` to produce the `.so`.
+
+- **Cranelift fallback**: atrium-spv-ir → cranelift IR
+  via a thin adapter (~1500 LoC) → `cranelift-object` →
+  object file → `ld` → `.so`. Used when the bespoke
+  backend's `can_handle` returns false.
+
+**Why bespoke.** PPTK measured general-purpose AOT
+translation at <30% of hand-written native on a different
+workload (binary translation), but for SPIR-V → ARM64 the
+adversarial conditions don't apply (we have full semantic
+information, no x86 flag/calling-convention emulation
+required). The achievable perf for shader-shape code with
+a bespoke backend is 80–95% of hand-tuned native. For a
+SW renderer that's the difference between viable and
+not-viable.
+
+**Why also Cranelift, not "just ship bespoke."** Bespoke
+will take months to cover the full SPIR-V op surface.
+Cranelift handles the long tail from day 1 at acceptable
+(if slower) perf. Trading a 30 MB binary-size cost for
+"working tier-2 from the first commit, with quality
+ramping in over time" is the right call.
+
+**Why not LLVM-as-library** (the third option). LLVM
+would give ~95% of hand-written perf with ~6 weeks of
+work, vs bespoke's 90% with ~20 weeks. The blocker is
+policy: committing tier-2 to LLVM means LLVM is a
+permanent base dependency, vs Cranelift's pure-Rust
+self-contained nature. The atrium-mesa precedent shows
+LLVM as a *transitional* layer is acceptable, but tier-2
+is the long-term Vulkan story and shouldn't inherit
+LLVM's release cadence + security disclosures + C++
+surface area permanently.
 
 ### D3. Compilation runs in a jailed sub-process
 
-**Decision.** `atrium-spv-compile` is a standalone binary,
-not a library linked into the daemon. It runs under
-Portcullis with no capabilities except read on
-`/var/atrium/shaders/incoming/<hash>.spv` (the SPIR-V the
-daemon dropped for it) and write on
-`/var/atrium/shaders/v{N}/<hash>.so` (the result).
+**Decision.** `atrium-spv-compile` is a standalone
+binary. It runs under Portcullis with FS capabilities
+only for the input SPIR-V and output `.so` paths.
 
-**Why a sub-process.** Two reasons. First: rustc is itself
-a large attack surface, and we don't want untrusted SPIR-V
-processed in the same process tree as the renderer.
-Second: it makes the daemon's `cargo` dependency tree
-strictly smaller — no `rspirv`, no `naga`, no codegen
-machinery; the daemon links only against the runtime
-shader-cache table.
+**Why a sub-process.** Two reasons. First: untrusted
+SPIR-V is the input, and bugs in the translator/codegen
+shouldn't reach the privileged daemon. Second: it makes
+the daemon's `cargo` dependency tree strictly smaller —
+no rspirv, no Cranelift, no pptk codegen libraries in
+the daemon's link line; the daemon links only against
+the runtime shader-cache + Tier2Backend dispatch.
 
 ### D4. Cache versioning lives in the path
 
-**Decision.** Cache layout is `/var/atrium/shaders/v{N}/
-<sha256>.so` where `N` is the shader-ABI version. ABI
-changes (new uniform-layout rule, varying-passing
-convention change, calling-convention bump) bump `N`. Old
-versions' directories become unreachable; first-launch
-post-bump recompiles transparently.
+**Decision.** Cache layout is
+`/var/atrium/shaders/v{N}/<sha256>.so` where `N` is the
+shader-ABI version. ABI changes bump `N`. Old versions'
+directories become unreachable; first launch post-bump
+recompiles transparently. A periodic
+`atrium-pkg gc shader-cache` sweeps unused versions.
 
-**Why path-based versioning.** Same playbook Tessera uses
-for its content-addressed pack format. Lets multiple ABI
-versions coexist during a daemon upgrade transition. A
-periodic `atrium-pkg gc shader-cache` sweeps unused
-versions.
+**Why path-based versioning.** Same playbook Tessera
+uses for its content-addressed pack format. Lets
+multiple ABI versions coexist during a daemon upgrade
+transition.
+
+### D5. Differential testing via a third (test-only) SPIR-V interpreter
+
+**Decision.** A SPIR-V interpreter lives in the test
+harness (`atrium-spv-tests/src/interpreter.rs`),
+walking SPIR-V bytes directly — *no shared frontend
+with the production backends.* Every test shader is
+compiled all three ways (bespoke, Cranelift,
+interpreter); outputs are compared pixel-for-pixel.
+
+**Why have an interpreter even when we have two
+production backends.** If bespoke and Cranelift share
+the SPIR-V → atrium-spv-ir frontend, a bug in the
+frontend produces wrong output in *both* backends —
+they agree with each other but disagree with reality,
+and a "compare bespoke vs Cranelift" test won't catch
+it. The interpreter sidesteps this by reading SPIR-V
+directly with no shared code. It's the only path that
+can catch frontend-translation bugs.
+
+**Why it doesn't violate D1.** D1 is about the renderer
+process at production runtime. The interpreter only runs
+in `cargo test`, in a developer's shell. The shipped
+daemon never sees it.
 
 ---
 
 ## 4. The shader ABI
 
-This is the load-bearing contract between
-`atrium-spv-translate`'s output and tier-2's rasterizer.
-It is the surface that the cache-version (D4) protects.
+This is the load-bearing contract between every backend's
+output and tier-2's rasterizer. The cache-version (D4)
+protects this surface.
 
 ### 4.1 Exported symbols
 
-A compiled shader `.so` exports exactly the symbols that
-its SPIR-V entry points declared, prefixed with `atrium_`:
+A compiled shader `.so` exports exactly the symbols its
+SPIR-V entry points declared, prefixed with `atrium_`:
 
 ```rust
 // Vertex shader.
 #[no_mangle]
 pub unsafe extern "C" fn atrium_vs_main(
-    in_attributes:    *const u8,  // packed per-vertex attribute bytes
-    in_attr_strides:  *const u32, // stride per binding (for indexing)
-    uniforms:         *const u8,  // descriptor-set-flattened uniform block
-    push_constants:   *const u8,  // 128 bytes max per PhysicalDeviceLimits
+    in_attributes:    *const u8,
+    in_attr_strides:  *const u32,
+    uniforms:         *const u8,
+    push_constants:   *const u8,
     vertex_index:     u32,
     instance_index:   u32,
-    out_position:     *mut [f32; 4],   // gl_Position
-    out_varyings:     *mut u8,         // packed varying-out bytes
-    out_clip_distance: *mut f32,       // optional; null if shader didn't write it
+    out_position:     *mut [f32; 4],
+    out_varyings:     *mut u8,
+    out_clip_distance: *mut f32,
 );
 
 // Fragment shader.
 #[no_mangle]
 pub unsafe extern "C" fn atrium_fs_main(
-    in_varyings:    *const u8,    // interpolated per-pixel varyings
+    in_varyings:    *const u8,
     uniforms:       *const u8,
     push_constants: *const u8,
-    frag_coord:     [f32; 4],     // gl_FragCoord
-    samples_mask:   u32,          // gl_SampleMask in (currently always 0x1)
+    frag_coord:     [f32; 4],
+    samples_mask:   u32,
     out_color:      *mut [f32; 4],
-    out_depth:      *mut f32,     // optional; null if shader didn't write gl_FragDepth
+    out_depth:      *mut f32,
 );
 
 // Compute shader.
@@ -275,9 +351,8 @@ pub unsafe extern "C" fn atrium_cs_main(
 );
 ```
 
-Each emitted shader also exports a metadata blob the
-daemon reads at dlopen time to validate the ABI version
-and discover attribute/varying/uniform layout:
+Plus a metadata blob for ABI validation and layout
+discovery:
 
 ```rust
 #[no_mangle]
@@ -286,141 +361,199 @@ pub static ATRIUM_SHADER_METADATA: AtriumShaderMetadata = ...;
 #[repr(C)]
 pub struct AtriumShaderMetadata {
     pub abi_version:      u32,   // must == TIER2_SHADER_ABI_VERSION
-    pub stage_kind:       u32,   // 0=vertex, 1=fragment, 2=compute, ...
+    pub stage_kind:       u32,
+    pub backend_kind:     u32,   // 0=bespoke, 1=cranelift (informational)
     pub attr_count:       u32,
-    pub attr_offsets:     [u32; 16],   // per-attribute byte offset
+    pub attr_offsets:     [u32; 16],
     pub attr_formats:     [u32; 16],   // VkFormat numeric
     pub varying_count:    u32,
     pub varying_offsets:  [u32; 16],
     pub varying_formats:  [u32; 16],
-    pub uniform_size:     u32,         // bytes of the flattened uniform block
-    pub local_size:       [u32; 3],    // compute only
+    pub uniform_size:     u32,
+    pub local_size:       [u32; 3],
 }
 ```
 
+`backend_kind` lets the daemon's metrics distinguish how
+many shaders are still on the Cranelift path vs bespoke
+— operational visibility, not behavioural.
+
 ### 4.2 Layout rules
 
-- **Vertex attributes** are packed per-binding in the order
-  declared by `VkPipelineVertexInputStateCreateInfo`. The
-  rasterizer's vertex-fetch step gathers bytes per binding/
-  stride into a contiguous buffer the shader sees as
-  `in_attributes`. Padding follows std430 rules for
-  alignment within the buffer.
-
-- **Varyings** are packed in `location` order, std430-style.
-  Perspective-correct interpolation coefficients are
-  computed by the rasterizer and applied before the
-  fragment shader sees `in_varyings`.
-
-- **Uniforms** from all bound descriptor sets are flattened
+- **Vertex attributes** packed per-binding in declaration
+  order; std430-style padding for alignment.
+- **Varyings** packed in `location` order, std430-style.
+  Perspective-correct interpolation coefficients computed
+  by the rasterizer before the fragment shader sees
+  `in_varyings`.
+- **Uniforms** from all bound descriptor sets flattened
   into one contiguous block at `vkCmdBindDescriptorSets`
-  time. The translator emits accesses that point into the
-  flat block via fixed offsets computed at translate time
-  from the descriptor-set layout. No indirection at run
-  time.
-
-- **Push constants** are passed as a separate 128-byte block
-  (capped by `maxPushConstantsSize` advertised in
-  `PhysicalDeviceLimits`). The translator generates direct
-  reads off this pointer.
-
-- **Sampled images** are special: the translator emits a
-  call into `atrium-vk-icd-rt::sample_image_2d` (or 1D/3D/
-  cube variants) — a small runtime library tier-2 ships
-  alongside the rasterizer. Sampler state (filter, wrap,
-  border colour) is in the uniform block. This keeps the
-  per-shader `.so` small and lets us improve sampling
-  quality across all shaders by upgrading one library.
+  time. Translator emits direct offsets at translate time.
+- **Push constants** as a separate 128-byte block.
+- **Sampled images** are special: translator emits calls
+  into `atrium-spv-runtime::sample_image_2d` (or 1D/3D/
+  cube variants) — a small Rust library tier-2 ships
+  alongside the rasterizer.
 
 ### 4.3 ABI versioning
 
 `TIER2_SHADER_ABI_VERSION` is a build-time `u32` constant
-in both the daemon and the translator. Bumped when any of:
-- a symbol name changes
-- a function signature changes
+in both the daemon and every backend. Bumped when any of:
+- a symbol name or function signature changes
 - the metadata struct layout changes
 - the per-shader runtime library's API changes
 - the uniform/varying layout rules change
 
-The daemon checks the `.so`'s `abi_version` field on
-dlopen and rejects mismatches (returns the loaded module
-to the cold-compile path under the new `v{N}/` directory).
+Mismatch on dlopen → daemon rejects the cached `.so`
+and falls through to the cold-compile path under the
+new `v{N}/`.
 
 ---
 
-## 5. The compile pipeline
+## 5. atrium-spv-ir — the internal IR
 
-Two binaries + one library.
+A small SSA-form IR designed for shader workloads. Shared
+by both production backends so they consume the same
+frontend output.
 
-### 5.1 `atrium-spv-translate` (library + thin CLI)
+### 5.1 Shape
 
-Takes SPIR-V bytes, emits a `.rs` source string + a
-`AtriumShaderMetadata` populated from the SPIR-V's
-reflection.
+- **SSA form.** Every value is defined exactly once;
+  phi nodes at block merge points. Standard SPIR-V
+  shape.
+- **Structured control flow.** Blocks are organised as
+  `Block { kind: BlockKind, instructions: Vec<Inst> }`
+  where `BlockKind` is one of `Linear`, `If { then, else,
+  merge }`, `Loop { header, body, continue, merge }`,
+  or `Switch { cases, default, merge }`. The frontend
+  recovers this from SPIR-V's `OpSelectionMerge` /
+  `OpLoopMerge` markers and refuses to compile
+  unstructured CFGs (these don't come out of glslc
+  anyway).
+- **First-class vector types.** `Type::Vec2(f32)`,
+  `Vec3(f32)`, `Vec4(f32)` are not lowered to scalar
+  until very late (instruction selection). This is
+  critical for SIMD codegen — late lowering preserves
+  vectorisation information for the backend.
+- **Numeric type set.** `i32`, `u32`, `i64` (rare),
+  `u64` (rare), `f32`, `f64` (rare; many tier-2 targets
+  may not implement). Bools represented as `i32` with
+  the standard 0/1 convention.
+- **Memory model.** Pointers represent typed slots into
+  the uniform / push-constant blocks. No general-purpose
+  heap; no aliasing concerns; all addresses are known at
+  translate time from descriptor-set layout.
+- **No exceptions, no GC, no dynamic dispatch.** The
+  only "external" calls are texture-sample helpers
+  (resolved at link time to `atrium-spv-runtime`) and
+  the trio of derivative ops (dFdx / dFdy / fwidth),
+  which the rasterizer provides via numerical estimates
+  computed across pixel quads.
 
-```rust
-pub fn translate(spirv: &[u8]) -> Result<TranslatedShader, TranslateError>;
+### 5.2 Why this shape
 
-pub struct TranslatedShader {
-    pub rust_source: String,
-    pub metadata: AtriumShaderMetadata,
-}
-```
+- **Bespoke backend stays simple.** Pattern-matching
+  vector ops to NEON / AVX2 instructions is much easier
+  when the IR carries first-class vec types. If we
+  lowered to scalar early, we'd need an autovectoriser,
+  and that's a deep rabbit hole.
+- **Cranelift adapter stays simple.** Cranelift IR has
+  vector types too; the adapter is a near-1:1 walk.
+- **Interpreter stays simple.** Scalar walk over typed
+  values; vector ops dispatch to per-lane scalar ops.
 
-Implementation: `rspirv` for the parse, a custom emitter
-that walks the SPIR-V `Function` records and prints
-matching Rust. The emitter is the bulk of the work — every
-SPIR-V opcode gets a Rust mapping, with care taken for the
-ones that don't have direct equivalents (texture sample
-ops become library calls; control-flow with `OpPhi`
-becomes labelled blocks). Roughly 3–6 weeks of careful
-work for a useful first cut covering the GLSL 4.50 core
-subset that the Khronos samples use.
+### 5.3 What it doesn't have
 
-### 5.2 `atrium-spv-compile` (binary)
-
-Glue around translate + rustc:
-
-```
-Usage: atrium-spv-compile --input <spirv> --output <so>
-       [--opt-level <0|1|2|3>] [--target <triple>]
-```
-
-Reads SPIR-V from `--input` (or stdin), calls
-`atrium-spv-translate::translate`, writes the result to a
-tempdir, invokes `rustc --crate-type cdylib
---edition 2024 -C opt-level=3 -C target-cpu=native
-<tempdir>/shader.rs -o <output>`, exits 0 on success.
-
-Designed to be jailed: no network, no FS access outside
-the input path and output path and a private tempdir.
-
-### 5.3 `atrium-vk-icd-rt` (the per-shader runtime library)
-
-A small `staticlib` linked into every compiled shader
-`.so`. Contains the texture-sampling kernels, the
-fixed-function math helpers (perspective divide,
-barycentric interpolation receivers — actually the
-rasterizer side calls these so they live in the daemon,
-not in the .so; this library is only stuff the *shader*
-calls).
-
-Surface area should stay tiny — a handful of functions —
-to minimise churn against the ABI version.
+- **No general CFG.** Unstructured control flow gets
+  rejected at the frontend, returning `VK_ERROR_INVALID_SHADER_NV`
+  from `vkCreateShaderModule`. This is fine for ~99% of
+  glslc output; the few corner cases (computed gotos,
+  irreducible loops) aren't shapes shader compilers
+  produce.
+- **No SSA-deconstruction pass in the frontend.** Both
+  backends are SSA-aware and handle phi nodes directly.
+  Cranelift IR is SSA; bespoke's regalloc resolves phis
+  during linear-scan as part of liveness analysis.
 
 ---
 
-## 6. The Tier2Backend interface
+## 6. The compile pipeline
+
+```
+                        ┌──────────────────────────────────────┐
+                        │  atrium-spv-compile (jailed binary)  │
+                        │  ────────────────────────────────    │
+                        │  1. Read SPIR-V from --input         │
+                        │  2. atrium-spv-frontend: parse +     │
+                        │     SSA + structured CFG → IR        │
+                        │  3. Try bespoke backend:             │
+                        │     bespoke::can_handle(&ir)?        │
+                        │       yes: bespoke::compile(&ir)     │
+                        │       no:  cranelift::compile(&ir)   │
+                        │  4. Emit object file (.o)            │
+                        │  5. spawn `ld` to link → .so         │
+                        │  6. Generate PC-map sidecar (.pcmap) │
+                        │  7. write both to --output dir       │
+                        │  8. exit                             │
+                        └──────────────────────────────────────┘
+```
+
+### 6.1 Crates
+
+- **`atrium-spv-ir`** — the IR types (Function, Block,
+  Inst, Type, Value, etc.). No backends, no parsing.
+  Used by everything downstream.
+
+- **`atrium-spv-frontend`** — SPIR-V → atrium-spv-ir.
+  rspirv for the byte-level parse; our own SSA builder
+  + structured-CFG recoverer on top.
+
+- **`atrium-spv-backend-bespoke`** — atrium-spv-ir → object
+  bytes. Contains the linear-scan regalloc, the instruction
+  selector, and the ARM64 + x86_64 emitters. Depends on
+  `pptk-codegen-arm64` for the ARM64 instruction-encoding
+  primitives (the `asm.rs` layer; see §13).
+
+- **`atrium-spv-backend-cranelift`** — atrium-spv-ir →
+  cranelift IR → object bytes. Thin adapter layer; the
+  heavy lifting is Cranelift's.
+
+- **`atrium-spv-runtime`** — small `staticlib` linked
+  into every compiled shader `.so`. Texture-sample
+  kernels, derivative helpers, miscellaneous math.
+  Surface area kept tiny to minimise ABI-version churn.
+
+- **`atrium-spv-compile`** — the binary, glues the above.
+
+- **`atrium-spv-tests`** — the test harness, including
+  the SPIR-V interpreter and the differential-test
+  framework.
+
+### 6.2 Linker
+
+Output is an object file (Mach-O on macOS dev hosts,
+ELF on FreeBSD targets). `atrium-spv-compile` shells
+out to the system `ld` (`/usr/bin/ld`) for the final
+link. ~50 ms of `ld` startup is included in the
+per-shader compile latency budget.
+
+We do not bundle our own linker. System `ld` is
+universally available, well-tested, and the only
+external program tier-2 invokes.
+
+---
+
+## 7. The Tier2Backend interface
 
 A new module `aqueduct-gpu-host/src/tier2/` parallel to
-`software/`. The top-level type:
+`software/`. Sketch:
 
 ```rust
 pub struct Tier2Backend {
     shader_cache: Mutex<HashMap<ShaderHash, LoadedShader>>,
     pipelines:    Mutex<HashMap<ResourceId, Tier2Pipeline>>,
     rasterizer:   RefCell<Rasterizer>,
-    // metrics, etc.
+    metrics:      Tier2Metrics,
 }
 
 struct LoadedShader {
@@ -429,12 +562,13 @@ struct LoadedShader {
     fs:            Option<unsafe extern "C" fn(...)>,
     cs:            Option<unsafe extern "C" fn(...)>,
     metadata:      AtriumShaderMetadata,
+    pc_map:        Option<PcMap>,    // for crash triage
 }
 
 struct Tier2Pipeline {
     vs:                  unsafe extern "C" fn(...),
     fs:                  unsafe extern "C" fn(...),
-    raster_state:        RasterState,    // cull, fill, blend, depth/stencil
+    raster_state:        RasterState,
     vertex_input:        VertexInputState,
     descriptor_layout:   DescriptorLayout,
 }
@@ -444,88 +578,47 @@ impl Backend for Tier2Backend {
     // ... usual Backend trait methods.
     fn submit_frame(&self, ...) -> Result<(), String> {
         // Walks FrameOp stream like SoftwareBackend does,
-        // but the BindPipeline / Draw* dispatch goes through
-        // self.rasterizer.draw(...) which calls the
-        // pipeline's vs/fs function pointers per vertex/pixel.
+        // but the BindPipeline / Draw* dispatch goes
+        // through self.rasterizer.draw(...) which calls
+        // the pipeline's vs/fs function pointers per
+        // vertex/pixel.
     }
 }
 ```
 
-### Trait change worth scoping
+### Backend trait change
 
-Tier-2 needs per-draw state that tier-1 doesn't care
-about: vertex buffer pointers + strides, full viewport,
-render-target metadata. The existing `Backend` trait
-flattens many of those because tier-1 doesn't need them.
-Two options:
-
-**(a)** Bump the `Backend` trait to pass the full state.
-Tier-1 ignores fields it doesn't care about.
-**(b)** Add a `tier_caps()` accessor and split the
-`submit_frame` path: tier-1 takes the existing simplified
-flattened state; tier-2 takes a richer struct.
-
-Recommendation: (a). One source of truth, no
-duplicated dispatch, minor cost to tier-1's
-trait-method size. Decided when the
-`Tier2Backend` skeleton lands.
+Tier-2 needs per-draw state tier-1 doesn't care about:
+vertex buffer pointers + strides, full viewport, render-
+target metadata. The existing `Backend` trait flattens
+many of those. We'll bump the trait to pass the full
+state, with tier-1 ignoring fields it doesn't care
+about. One source of truth, no duplicated dispatch.
 
 ---
 
-## 7. The rasterizer
+## 8. The rasterizer
 
 The other half of the renderer. Self-contained, no SPIR-V
 or shader concerns; takes a Tier2Pipeline + draw call +
 bound buffers and writes pixels.
 
-### 7.1 Pipeline stages
+### 8.1 Pipeline stages
 
 ```
-        ┌────────────┐
-        │ Index/draw │  vkCmdDraw / DrawIndexed / DrawIndirect
-        │  walker    │
-        └─────┬──────┘
-              ▼
-        ┌────────────┐
-        │ Vertex     │  → calls pipeline.vs per vertex
-        │ assembly + │  → outputs gl_Position + varyings
-        │ shading    │
-        └─────┬──────┘
-              ▼
-        ┌────────────┐
-        │ Primitive  │  → 3 vertices per triangle (handles topology,
-        │ assembly   │     index buffer, instancing)
-        └─────┬──────┘
-              ▼
-        ┌────────────┐
-        │ Clipping   │  → against view frustum + per-vertex
-        │            │     gl_ClipDistance
-        └─────┬──────┘
-              ▼
-        ┌────────────┐
-        │ Perspective│  → clip-space → NDC
-        │ divide     │
-        │ Viewport   │  → NDC → screen-space
-        │ transform  │
-        └─────┬──────┘
-              ▼
-        ┌────────────┐
-        │ Triangle   │  → edge functions, bounding rect,
-        │ setup      │     perspective-correct interpolation coefs
-        └─────┬──────┘
-              ▼
-        ┌────────────┐
-        │ Tiled      │  → 8×8 or 16×16 tiles
-        │ rasteriser │  → per-pixel inner loop:
-        │            │       interpolate varyings
-        │            │       depth test
-        │            │       fragment shader call
-        │            │       blend
-        │            │       depth/stencil/colour write
-        └────────────┘
+  Index/draw walker  →  Vertex shading  →  Primitive assembly
+        →  Clipping  →  Perspective divide + viewport
+        →  Triangle setup (edge funcs, bbox, perspective-
+                            correct interpolation coefs)
+        →  Tiled rasteriser (8×8 or 16×16 tiles):
+              interpolate varyings →
+              depth test →
+              fragment shader call →
+              blend →
+              colour / depth / stencil write
 ```
 
-### 7.2 Performance budget
+### 8.2 Performance budget
 
 Aspirational, not blocking on first iteration:
 
@@ -534,133 +627,297 @@ Aspirational, not blocking on first iteration:
 - Multi-thread the tile raster across N cores in iteration
   3; expect ~linear scaling up to memory bandwidth.
 - SIMD-vectorise the per-pixel inner loop with `std::simd`
-  in iteration 4 (4-wide or 8-wide pixel quads).
+  in iteration 4 (4-wide or 8-wide pixel quads, calling
+  the bespoke-backend's SIMD fs entry point).
 
 First iteration is scalar single-thread; the architecture
-is laid out to make those upgrades drop-in.
+makes those upgrades drop-in.
 
 ---
 
-## 8. Implementation phases
+## 9. ARM64 codegen constraints
 
-**Phase 1 — translator MVP.** `atrium-spv-translate`
-handles the no-vertex-shader pass-through case: a built-in
-fullscreen-triangle vertex shader, an arbitrary SPIR-V
-fragment shader using only constant colour + uniform
-reads. Output: `.rs` source emitter for ~40 SPIR-V
-opcodes. Deliverable: standalone CLI that compiles a
-trivial GLSL fragment shader to a working `.so`. (~3
-weeks)
+Lifted from PPTK's `crates/pptk-codegen-arm64/CONSTRAINTS.md`
+(see §13) and adapted for our SSA IR → ARM64 path. These
+are the gotchas the PPTK author hit in 100+ debugging
+sessions; encoded here so we don't re-hit them.
 
-**Phase 2 — rasterizer skeleton.** `Tier2Backend` with
-scalar single-thread rasterizer, no MSAA, single colour
-attachment, no depth, no blend modes beyond opaque. Drives
-a triangle to pixels by hand-injecting a `Tier2Pipeline`.
-Deliverable: a unit test that handed three vertices +
-trivial shaders produces the expected RGBA8 buffer.
-(~2 weeks)
+### 9.1 PSTATE / NZCV semantics
 
-**Phase 3 — wire end-to-end.** Tier-2 picked by the
-session router for `id(icd-runtime, *)` pipelines.
-Daemon-side cache + on-demand compile via
-`atrium-spv-compile`. End-to-end VM test: drive
-atrium-vk-icd's headless_triangle example against a daemon
-running with tier-2 enabled, observe a real rendered
-triangle. (~2 weeks)
+- **Flag-setting forms.** ARM64 has separate ADD / ADDS
+  variants; only ADDS updates NZCV. If subsequent code
+  reads flags (e.g. via B.cond), the prior arithmetic
+  *must* be the `-s` form. The instruction selector
+  must track which IR values feed into branches and
+  emit flag-setting forms for those producers.
+- **Carry-flag polarity.** ARM64 SUBS sets C *inverted*
+  from x86. For shader code (no x86 emulation involved)
+  this doesn't matter directly, but it bites if we ever
+  hand-write a sequence assuming x86 semantics. PPTK had
+  to emit `CFINV` after ADDS to compensate; we don't,
+  because shader code never has "expected x86 carry."
+- **Narrow-register flag updates.** `AND w17, w0, #1`
+  doesn't update flags. `ANDS w17, w0, #1` does. The
+  selector must use the `-s` form when feeding flags.
 
-**Phase 4 — atrium-pkg install hook.** Bundle manifest
-scanner; pre-compile bundle shaders at install time;
-ensure runtime is always cache-hit for properly installed
-apps. (~1 week)
+### 9.2 Immediate encoding
 
-**Phase 5 — broaden the translator.** Vertex shaders with
-attribute fetch, varyings, more SPIR-V opcodes, texture
-sampling. Iterative; one test app at a time. (Open-ended)
+- **Logical immediates** (used by AND/ORR/EOR) must be
+  one of 5334 representable "bit-mask" patterns. Random
+  constants don't fit; emit `MOV` to a scratch register
+  first.
+- **Arithmetic immediates** (used by ADD/SUB/CMP) are
+  12 bits unsigned, optionally shifted by 12. Larger
+  constants need `MOV` + register form.
+- **Load/store offsets.** Unsigned 12-bit scaled by
+  element size. Larger offsets need address materialisation.
+- The encoder (`pptk asm.rs`) asserts on invalid
+  immediates rather than silently truncating. Selector
+  must materialise constants before calling encoder.
 
-**Phase 6 — depth/stencil + blend + MSAA + multi-attachment.**
-Rasterizer features. Iterative. (Open-ended)
+### 9.3 Addressing modes
 
-**Phase 7 — multi-thread + SIMD.** Performance work.
-(Open-ended)
+- ARM64 has rich addressing modes
+  (`[Xn, Xm, lsl #imm]`, `[Xn, #imm]!`, `[Xn], #imm`)
+  but the encoder only supports the subset PPTK needed.
+  Our selector should prefer the base+offset form for
+  simplicity; pre/post-index variants are perf wins for
+  loop-carried address increments and can come later.
 
-Phases 1–4 are the "first credible third-party Vulkan app
-runs through atrium-vk-icd via tier-2" milestone. Estimate
-~8 weeks of focused work.
+### 9.4 Branch reach
+
+- B and BL have ±128 MB range (26-bit signed PC-relative).
+- B.cond has ±1 MB range (19-bit signed).
+- Per-shader `.so` sizes are tiny (<1 MB typically), so
+  both fit comfortably. Cross-function calls within the
+  same `.so` are direct; calls into `atrium-spv-runtime`
+  go through the GOT and have unbounded range.
+
+### 9.5 SIMD lowering
+
+- NEON 128-bit registers `v0`-`v31`. `vec4<f32>` maps to
+  one register; `vec3<f32>` uses a 4-lane register with
+  the high lane ignored (waste but simple).
+- `vec2<f32>` uses the low 64 bits (instructions like
+  `FADD v0.2s, v1.2s, v2.2s`).
+- Per-lane element selectors (e.g. `OpVectorExtractDynamic`)
+  with a non-constant index require `DUP` + lane-extract
+  patterns. Constant-index extracts use `MOV.S w_dst, vN.s[i]`.
+
+### 9.6 Encoder gaps to fill
+
+PPTK's `asm.rs` covers the x86 subset 7-Zip needs. For
+shaders we additionally need:
+
+- **NEON shuffle/permute** (`TBL`, `TBX`, `ZIP1/ZIP2`,
+  `UZP1/UZP2`, `EXT`) — for swizzles like `.xyzw → .wxyz`.
+- **NEON dup-from-scalar** (`DUP V, W`) — for splatting a
+  uniform value across a vector.
+- **Floating-point conversions** (`SCVTF`, `FCVTZS`) —
+  int↔float casts in shaders.
+- **Reciprocal / reciprocal-sqrt approximations** (`FRECPE`,
+  `FRSQRTE` + Newton-Raphson refinement) — for `1.0/x`
+  and `inversesqrt`.
+- **Min/max/abs** (`FMIN`, `FMAX`, `FABS`) — every shader
+  uses these.
+
+Estimated ~1–2 weeks of additive encoder work, layered on
+top of PPTK's solid foundation. Not a rewrite.
 
 ---
 
-## 9. Open questions
+## 10. PC-map sidecar + differential test harness
 
-- **rustc as a runtime dependency on user systems.** Fine
-  on dev machines. On end-user atrium systems we either
-  add `rust` to the base or ship a stripped-down `rustc`-
-  as-shader-compiler bundle. Decision deferred until
-  Phase 4 ↔ atrium-pkg.
+Two pieces of infrastructure that PPTK's runbook
+identifies as their biggest hindsight regret — "should
+have had this from day 1."
 
-- **Shader IL choice for the cache key.** Today: sha256 of
-  the SPIR-V bytes. Two apps that compile from the same
-  GLSL source through different SPIR-V optimisation
-  passes get different cache entries. Tolerable for v1.
-  A future "canonicalise SPIR-V before hashing" pass
-  could de-duplicate, but adds translator-side complexity
-  for modest cache-size savings. Defer.
+### 10.1 PC-map sidecar
 
-- **Per-shader runtime library distribution.** If
-  `atrium-vk-icd-rt` is statically linked into every
-  shader `.so`, each `.so` carries its copy of the
-  texture-sample kernels (~100 KB after opt). On a system
-  with hundreds of installed Atrium apps this is a few
-  tens of MB of dup. Alternative: ship the runtime as a
-  separate `.so` and have shader `.so`s reference it via
-  dynamic symbol resolution. Decision deferred to Phase
-  3 once we measure typical shader-`.so` size.
+Every compiled shader `.so` ships with a `.pcmap` sidecar:
+
+```rust
+#[repr(C)]
+pub struct PcMap {
+    pub entries: Vec<PcMapEntry>,
+}
+
+#[repr(C)]
+pub struct PcMapEntry {
+    pub spirv_offset:    u32,   // byte offset into source SPIR-V
+    pub host_offset:     u32,   // byte offset into the .so's __text
+}
+```
+
+Generated by the bespoke backend during instruction
+emission (we already know which IR instruction we're
+emitting; the IR carries provenance to the SPIR-V offset
+that produced it). Cranelift backend generates a less-
+precise map (per-function granularity).
+
+When a shader crashes (SIGSEGV, SIGILL) or produces
+unexpected pixels, the daemon's crash handler reads the
+faulting PC, subtracts the `.so` base, looks up the
+`.pcmap`, and reports "shader %s, SPIR-V offset 0x%x"
+in the log instead of just a raw PC. PPTK explicitly
+wishes they had this from day 1.
+
+### 10.2 Differential test harness
+
+In `atrium-spv-tests`:
+
+```rust
+/// Compile a SPIR-V shader through all three backends,
+/// run with given inputs, and assert pixel-for-pixel
+/// agreement.
+fn assert_shader_agrees(
+    spirv: &[u8],
+    inputs: ShaderInputs,
+    tolerance: ColorTolerance,
+);
+```
+
+Internally:
+1. Spawn `atrium-spv-compile` to produce bespoke `.so`
+   (if `can_handle` allows).
+2. Spawn `atrium-spv-compile` with `--backend cranelift`
+   to produce Cranelift `.so`.
+3. Walk SPIR-V via the in-process interpreter.
+4. Compare outputs.
+
+Disagreement pattern → bug location:
+- Bespoke ≠ Cranelift, both = interpreter: **bespoke
+  backend bug.**
+- Bespoke = Cranelift, both ≠ interpreter: **frontend
+  bug** (both production paths inherit the bug from
+  shared frontend).
+- Bespoke ≠ Cranelift ≠ interpreter: **probably
+  multiple bugs** (rare; investigate carefully).
+- All three agree: shader works ✓.
+
+This harness IS the project's debugging infrastructure.
+Every bug report should be reproducible as a failing
+`assert_shader_agrees` test.
+
+---
+
+## 11. Implementation phases
+
+The infrastructure-first ordering reflects PPTK's
+hindsight regret. The dependencies are pretty linear
+through phase 6; phase 7 (rasterizer) can land in
+parallel with phases 3–5.
+
+| Phase | Work | Est. |
+|---|---|---|
+| **0** | **Infrastructure.** SPIR-V interpreter (~1500 LoC, test-only). PC-map sidecar format + reader. Differential-test harness. Lift PPTK's CONSTRAINTS.md into `docs/spec/tier2-shader-codegen-constraints.md`. Stand up `atrium-spv-ir` crate with the basic types. | 3 wk |
+| **1** | `atrium-spv-frontend`: rspirv parse → atrium-spv-ir SSA construction → structured CFG recovery. Tests use the interpreter to verify roundtrip semantics. | 3 wk |
+| **2** | `atrium-spv-backend-cranelift`: atrium-spv-ir → cranelift IR → object → ld → .so. Establishes the working-shader-end-to-end demo and the production fallback. End-to-end VM render of a constant-colour fullscreen quad. | 3 wk |
+| **3** | `atrium-spv-backend-bespoke` skeleton: linear-scan regalloc + instruction selector + ARM64 emitter (via pptk-codegen-arm64's asm.rs). Initially handles only a narrow op subset (`+`, `*`, constants). Differential tests pass for the supported ops. | 4 wk |
+| **4** | x86_64 backend (selector + encoder). Deferrable if FreeBSD-ARM64-only for v1. | 3 wk |
+| **5** | ELF object writer (parallel to pptk-macho). Reuse pptk-codegen-common's Reloc enum. | 1 wk |
+| **6** | `Tier2Backend` skeleton + `atrium-spv-compile` binary + Portcullis jail setup + cache + dlopen plumbing. | 2 wk |
+| **7** | Rasterizer (scalar single-thread, single colour attachment, no depth). End-to-end VM render with a textured triangle. | 3 wk |
+| **8** | NEON encoder extensions (§9.6) + SIMD lowering in bespoke selector. 4-wide pixel quads. | 2 wk |
+| **9** | Texture sampling (atrium-spv-runtime kernels), derivatives, broaden SPIR-V coverage. Iterative; one Khronos sample at a time. | open |
+| **10** | atrium-pkg install-time shader-precompile hook. | 1 wk |
+
+**Phases 0–8: ~24 weeks of focused work** to first end-
+to-end render with SIMD. Working tier-2 (Cranelift only,
+scalar rasterizer) demo possible at the ~11-week mark
+after phases 0+1+2+6+7. Bespoke perf ramps in shader-by-
+shader through phases 3, 8, 9.
+
+Without phase 4 (x86_64), ~21 weeks. Worth considering
+as the v1 scope, with x86_64 added later when we want
+tier-2 on macOS dev hosts outside the VM.
+
+---
+
+## 12. Open questions
+
+- **Bundle x86_64 in v1, or ship FreeBSD-ARM64-only?**
+  Saves 3 weeks if deferred. Cost: can't dev-iterate on
+  macOS host outside the VM. Probably worth deferring;
+  the VM is the production target anyway.
+
+- **Cranelift cache poisoning.** If a Cranelift backend
+  bug produces wrong output, the cache holds the wrong
+  `.so` until the ABI bumps. Mitigation: tests run
+  every CI pass; bugs surface fast. Worst case: bump
+  the ABI version even for a Cranelift-only fix to
+  invalidate stale caches.
+
+- **PPTK encoder version pinning.** We depend on pptk-
+  codegen-arm64 as a path dep (since both are in the
+  Atrium tree). When PPTK lands a new release, do we
+  pull it in automatically or pin to a known-tested
+  rev? Recommend: pin to a sha in our Cargo.toml,
+  refresh deliberately.
 
 - **Compute-shader workgroup execution model.** Tier-2's
-  rasterizer naturally parallelises across tiles for
-  graphics. Compute shaders need their own dispatcher:
-  per-workgroup × per-invocation iteration. First-cut:
-  scalar single-thread iteration matching the SPIR-V
-  invocation count. Multi-thread is Phase 7.
+  rasterizer parallelises across tiles for graphics.
+  Compute shaders need their own dispatcher; first cut
+  is scalar per-invocation iteration.
 
-- **vkCmdDispatchIndirect** with a count buffer the
-  daemon hasn't seen the contents of. Tier-2's compute
-  dispatcher needs to read the count buffer at draw time.
-  The aqueduct-gpu protocol already plumbs buffer
-  contents (CopyBufToImg path); a similar
-  `READ_BUFFER_FOR_DISPATCH` op or equivalent might
-  be needed. Defer until Phase 5 / 6.
+- **What does cargo's link line look like?** rustc
+  built-in linker, or shell out to system ld? PPTK uses
+  the system `ld`. We probably do too — keep the
+  toolchain dependency minimal.
 
 - **Validation-layer hostility.** Apps with
   `VK_LAYER_KHRONOS_validation` loaded will probe a lot
-  of state our tier-2 doesn't honour. Most are already
-  fine because our PhysicalDeviceLimits answer is real
-  (commit `7092903`). Worth running the layer in CI
-  against Phase-3 builds to flush out any remaining
-  surprises.
+  of state. Tier-2 should pass the layer's tests as
+  much as possible; worth running CI against it from
+  phase 6.
 
 ---
 
-## 10. Relationship to other Atrium components
+## 13. Relationships to other components
 
-- **atrium-vk-icd.** Already routes third-party shaders as
-  `id(icd-runtime, *)`. No code changes required to start
-  hitting tier-2; the dispatch decision is daemon-side.
+- **atrium-vk-icd.** Already routes third-party
+  shaders as `id(icd-runtime, *)`. No code changes
+  required to start hitting tier-2; the dispatch
+  decision is daemon-side.
 
 - **aqueduct-gpu protocol.** No new opcodes for tier-2's
-  steady state. Phase 5+ may add `READ_BUFFER_FOR_DISPATCH`.
+  steady state. Phase 9 may add `READ_BUFFER_FOR_DISPATCH`
+  for vkCmdDispatchIndirect.
 
 - **atrium-pkg.** Owns the install-time shader-precompile
-  hook (Phase 4). The bundle manifest format gets a
-  `shaders: [...]` array listing the SPIR-V blobs the
-  bundle declares.
+  hook (phase 10). Bundle manifest gets a
+  `shaders: [...]` array.
 
 - **Portcullis / jails.** `atrium-spv-compile` runs in a
-  jail with FS caps for the input/output paths only.
+  jail with FS caps for input/output paths only.
 
-- **Tessera.** The `/var/atrium/shaders/v{N}/` cache lives
-  on a Tessera-backed volume; cache eviction integrates
-  with the standard Tessera GC policy (LRU on
-  last-dlopen time).
+- **Tessera.** `/var/atrium/shaders/v{N}/` lives on a
+  Tessera-backed volume; cache eviction integrates with
+  the standard Tessera GC policy.
+
+- **PPTK.** The pptk project (under `/Users/girivs/src/pptk`)
+  provides:
+  - `pptk-codegen-arm64::asm.rs` — the ARM64 instruction
+    encoder we link as a path dep.
+  - `pptk-codegen-common::Reloc` — relocation enum we reuse.
+  - `pptk-macho` — Mach-O object emitter; useful for
+    macOS dev iteration. ELF emitter (phase 5) is our
+    own work but follows the same architectural
+    pattern.
+  - `CONSTRAINTS.md` — the gotchas catalogue we adapt
+    in §9 and `docs/spec/tier2-shader-codegen-constraints.md`.
+  - The runbook (`debug/NEXT_SESSION.md`) — read by the
+    spec author at design time; supplied the
+    infrastructure-first phase 0 ordering, the dual-
+    backend oracle insight, and many specific gotcha
+    rules. *Not* a runtime dependency.
+
+  We do NOT reuse: the PE loader, the x86→ARM64
+  lowering tables, the pinned-register convention, the
+  PE-mirror / IAT-shim / segment-handling code, or the
+  pptk-lift pipeline. Tier-2's architecture differs in
+  having an actual IR and an actual register allocator;
+  PPTK's pipeline shape doesn't transfer.
 
 - **Future tier-3 (real GPU).** When native atrium-gpu
   drivers land at D5+, they'll have their own
@@ -671,38 +928,46 @@ runs through atrium-vk-icd via tier-2" milestone. Estimate
 
 ---
 
-## 11. What we are NOT building
+## 14. What we are NOT building
 
-- A JIT. Period.
-- A SPIR-V interpreter. Even for debug builds; the AOT
-  pipeline is fast enough on cold compile that an
-  interpreter wouldn't be meaningfully faster to first
-  pixel.
-- A general OpenGL ES path. Tier-2 is Vulkan-shaped only;
-  apps that ship GLES go through a separate translator
-  (out of scope here).
+- A JIT in the renderer process. Period.
+- A SPIR-V interpreter in production.
+- A general OpenGL ES path.
 - A GPU-shaped tile binner with vertex pre-pass. Tier-2
-  is a forward immediate-mode rasterizer. Performance
-  ceiling is "credible for an Atrium curated app, not for
-  AAA games" — that's the right ceiling.
+  is a forward immediate-mode rasterizer.
 - Vulkan extensions beyond core 1.3 plus what
   atrium-vk-icd already advertises. Ray tracing, mesh
   shaders, video — all out of scope.
+- A custom linker. We shell out to system `ld`.
+- Sparse memory. Already stubbed at the ICD layer.
+- Tier-2 on macOS host for dev iteration in v1 (deferred
+  to v1.5 if we ship FreeBSD-ARM64-only).
 
 ---
 
-## 12. Status / next steps
+## 15. Status / next steps
 
-This is the design doc. No code yet.
+This is the design doc, v2. No code yet.
 
-If approved, the next deliverable is a phase-1
-`atrium-spv-translate` skeleton — `rspirv` parse + a Rust
-emitter walking the SPIR-V module tree, emitting matching
-Rust for the GLSL 4.50 fragment-shader core subset. That's
-the riskiest piece of the design; building it first
-de-risks everything downstream.
+If approved, phase 0 starts. The three concrete v0
+deliverables are:
 
-After phase 1: phase 2 (rasterizer skeleton) and phase 3
-(end-to-end wiring) can land roughly in parallel. Phase 4
-(atrium-pkg integration) is gated on phase 3 being
-demonstrably working in the VM.
+1. **`atrium-spv-ir` crate skeleton** — types only, no
+   methods. Just the IR shape locked in.
+2. **`atrium-spv-tests::interpreter`** — walks SPIR-V
+   directly, produces outputs for the differential
+   harness. Test-only, never ships.
+3. **`docs/spec/tier2-shader-codegen-constraints.md`** —
+   lifted from PPTK's `CONSTRAINTS.md`, adapted for
+   SPIR-V → ARM64. The "things to not get wrong"
+   catalogue.
+
+Phase 0 also includes the differential test harness
+itself, the PC-map sidecar format, and the cache
+directory layout. All before any real codegen.
+
+Phase 1 (frontend) and phase 2 (Cranelift backend) then
+land in series; phase 6 (Tier2Backend + plumbing) and
+phase 7 (rasterizer) can land in parallel with phase 3
+(bespoke skeleton). The bespoke perf work (phases 3, 8,
+9) is iterative thereafter.
