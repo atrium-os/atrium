@@ -1,0 +1,129 @@
+//! atrium-spv-frontend — SPIR-V → atrium-spv-ir.
+//!
+//! Parses SPIR-V via `rspirv::dr`, walks the module, and
+//! produces an [`atrium_spv_ir::Module`] suitable for both
+//! production backends to consume.
+//!
+//! # Spec references
+//!
+//! - [`docs/spec/tier2-renderer.md`] §6.1 — crate layout
+//! - [`docs/spec/tier2-shader-codegen-constraints.md`] §A —
+//!   frontend invariants (reject unstructured CFGs early,
+//!   preserve SPIR-V source offsets, validate capabilities,
+//!   one-shot structured-CFG recovery)
+//!
+//! # Phase status
+//!
+//! **Phase 1 v1.** Implements the narrow path the
+//! phase-0 v0c interpreter handles: single-block fragment
+//! shaders that store a constant `vec4<f32>` to an Output
+//! variable and return. Sufficient to validate the
+//! frontend-side architecture + integrate with the
+//! Cranelift backend's first end-to-end demo. Opcode
+//! coverage widens iteratively from here.
+//!
+//! Unsupported constructs return
+//! [`FrontendError::Unsupported`] with a human-readable
+//! description, which `atrium-spv-compile` translates to
+//! `VK_ERROR_INVALID_SHADER_NV` for the app.
+//!
+//! # Architecture
+//!
+//! ```text
+//!     SPIR-V bytes
+//!          │
+//!          ▼  rspirv::dr::Loader
+//!     rspirv::dr::Module
+//!          │
+//!          ▼  Frontend::translate (this crate)
+//!     atrium_spv_ir::Module
+//! ```
+//!
+//! The frontend itself is split into:
+//!
+//! - [`types`]: SPIR-V type ids → [`atrium_spv_ir::Type`]
+//! - [`constants`]: SPIR-V constant ids → IR constant ops
+//! - [`interface`]: walk entry-points + variables to
+//!   populate `Module::entry_points` + `Module::uniforms`
+//!   + per-stage interface
+//! - [`functions`]: SPIR-V function bodies → IR functions
+//! - [`cfg`]: structured-CFG recovery (stub in v1; full
+//!   implementation in v2)
+//! - [`error`]: the [`FrontendError`] enum
+
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
+pub mod cfg;
+pub mod constants;
+pub mod error;
+pub mod functions;
+pub mod interface;
+pub mod types;
+
+pub use error::FrontendError;
+
+use atrium_spv_ir::Module;
+use rspirv::dr;
+
+/// Top-level translation entry point.
+///
+/// Takes SPIR-V bytes, produces an
+/// [`atrium_spv_ir::Module`]. Validates SPIR-V structural
+/// invariants along the way; rejects unstructured CFGs
+/// per constraint A1.
+pub fn translate(spirv: &[u8]) -> Result<Module, FrontendError> {
+    // ── 1. Parse via rspirv. ────────────────────────────────
+    let mut loader = dr::Loader::new();
+    rspirv::binary::parse_bytes(spirv, &mut loader)
+        .map_err(|e| FrontendError::ParseFailed(format!("{e:?}")))?;
+    let rspirv_module = loader.module();
+
+    // ── 2. Validate declared capabilities ───────────────────
+    //
+    // Per constraint A3, reject capabilities outside our
+    // supported set. Phase 1 v1 only handles Shader (the
+    // baseline Vulkan capability).
+    for cap_inst in &rspirv_module.capabilities {
+        if let Some(rspirv::dr::Operand::Capability(cap)) = cap_inst.operands.first() {
+            if *cap != rspirv::spirv::Capability::Shader {
+                return Err(FrontendError::Unsupported(format!(
+                    "capability {cap:?} not supported in phase-1 v1",
+                )));
+            }
+        }
+    }
+
+    // ── 3. Index types + constants + variables ──────────────
+    let type_ctx = types::TypeContext::build(&rspirv_module)?;
+    let const_ctx = constants::ConstantContext::build(&rspirv_module, &type_ctx)?;
+    let iface_ctx = interface::InterfaceContext::build(
+        &rspirv_module, &type_ctx,
+    )?;
+
+    // ── 4. Translate functions ──────────────────────────────
+    let functions = functions::translate_all(
+        &rspirv_module,
+        &type_ctx,
+        &const_ctx,
+        &iface_ctx,
+    )?;
+
+    // ── 5. Assemble the Module ──────────────────────────────
+    //
+    // Patch entry_point.function_index now that the function
+    // vector is laid out. The interface pass left them as
+    // 0 placeholders.
+    let entry_points = functions::patch_entry_point_indices(
+        &rspirv_module, &iface_ctx,
+    );
+    let module = Module {
+        functions,
+        entry_points,
+        uniforms: iface_ctx.uniforms,
+        push_constants_size: iface_ctx.push_constants_size,
+        vertex_inputs: iface_ctx.vertex_inputs,
+        varyings: iface_ctx.varyings,
+    };
+    Ok(module)
+}

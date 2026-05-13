@@ -1,0 +1,18 @@
+[package]
+name        = "atrium-spv-frontend"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "SPIR-V → atrium-spv-ir frontend. Parses SPIR-V via rspirv, recovers structured CFG from OpSelectionMerge / OpLoopMerge, builds atrium-spv-ir SSA. Sole entry point for both production backends (bespoke + Cranelift); the test-only interpreter at atrium-spv-tests deliberately does NOT share this code (per constraint F1)."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+atrium-spv-ir = { path = "../atrium-spv-ir" }
+rspirv        = "0.13"
+
+[dev-dependencies]
+# Differential testing via the interpreter oracle.
+atrium-spv-tests = { path = "../atrium-spv-tests" }
