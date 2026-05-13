@@ -569,6 +569,8 @@ const ATRIUM_PHYSICAL_DEVICE_ENTRY_POINTS: &[&str] = &[
     "vkGetPhysicalDeviceExternalSemaphoreProperties",
     "vkGetPhysicalDeviceExternalSemaphorePropertiesKHR",
     "vkEnumerateDeviceExtensionProperties",
+    "vkEnumeratePhysicalDeviceGroups",
+    "vkEnumeratePhysicalDeviceGroupsKHR",
 ];
 
 /// `vk_icdGetPhysicalDeviceProcAddr` — ICD ABI v4+ fast-path for
@@ -648,6 +650,8 @@ const ATRIUM_INSTANCE_ONLY_ENTRY_POINTS: &[&str] = &[
     "vkGetPhysicalDeviceExternalFencePropertiesKHR",
     "vkGetPhysicalDeviceExternalSemaphoreProperties",
     "vkGetPhysicalDeviceExternalSemaphorePropertiesKHR",
+    "vkEnumeratePhysicalDeviceGroups",
+    "vkEnumeratePhysicalDeviceGroupsKHR",
     "vkCreateDebugUtilsMessengerEXT",
     "vkDestroyDebugUtilsMessengerEXT",
     "vkSubmitDebugUtilsMessageEXT",
@@ -1297,6 +1301,23 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkPhysicalDevice, *const c_void, *mut c_void), FnVoidPtr,
             >(vkGetPhysicalDeviceExternalSemaphoreProperties)),
+        // 1.1 batch bind + device groups.
+        "vkBindBufferMemory2" | "vkBindBufferMemory2KHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u32, *const c_void) -> VkResult, FnVoidPtr,
+            >(vkBindBufferMemory2)),
+        "vkBindImageMemory2" | "vkBindImageMemory2KHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u32, *const c_void) -> VkResult, FnVoidPtr,
+            >(vkBindImageMemory2)),
+        "vkEnumeratePhysicalDeviceGroups" | "vkEnumeratePhysicalDeviceGroupsKHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkInstance, *mut u32, *mut c_void) -> VkResult, FnVoidPtr,
+            >(vkEnumeratePhysicalDeviceGroups)),
+        "vkGetDeviceGroupPeerMemoryFeatures" | "vkGetDeviceGroupPeerMemoryFeaturesKHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u32, u32, u32, *mut u32), FnVoidPtr,
+            >(vkGetDeviceGroupPeerMemoryFeatures)),
         // 1.2 indirect-count draws — forward to non-Count variants
         // with max_draw_count as the static count.
         "vkCmdDrawIndirectCount" |
@@ -5316,6 +5337,123 @@ pub unsafe extern "C" fn vkCmdPushDescriptorSetWithTemplate(
     _p_data:            *const c_void,
 ) {}
 
+// ── 1.1 batch bind + device groups ─────────────────────────────
+//
+// vkBindBufferMemory2 / vkBindImageMemory2 are the 1.1
+// mandatory batch-bind variants; sub-allocators use them to
+// commit hundreds of bindings in a single call.
+//
+// vkEnumeratePhysicalDeviceGroups + GetDeviceGroupPeerMemory
+// Features are 1.1 mandatory device-group queries. Tier-1 is
+// single-device; we report 1 group of 1 device, no peer
+// access.
+
+/// VkBindBufferMemoryInfo (40 bytes): sType + pNext + buffer +
+/// memory + memoryOffset. Walk array, forward each to
+/// vkBindBufferMemory.
+#[no_mangle]
+pub unsafe extern "C" fn vkBindBufferMemory2(
+    device:          VkDevice,
+    bind_info_count: u32,
+    p_bind_infos:    *const c_void,
+) -> VkResult {
+    if p_bind_infos.is_null() { return VK_ERROR_INITIALIZATION_FAILED; }
+    let base = p_bind_infos as *const u8;
+    for i in 0..bind_info_count {
+        let info = base.add(40 * i as usize);
+        let buffer = std::ptr::read_unaligned(info.add(16) as *const u64);
+        let memory = std::ptr::read_unaligned(info.add(24) as *const u64);
+        let offset = std::ptr::read_unaligned(info.add(32) as *const u64);
+        let r = vkBindBufferMemory(device, buffer, memory, offset);
+        if r != VK_SUCCESS { return r; }
+    }
+    VK_SUCCESS
+}
+
+/// VkBindImageMemoryInfo (40 bytes): same shape as buffer.
+#[no_mangle]
+pub unsafe extern "C" fn vkBindImageMemory2(
+    device:          VkDevice,
+    bind_info_count: u32,
+    p_bind_infos:    *const c_void,
+) -> VkResult {
+    if p_bind_infos.is_null() { return VK_ERROR_INITIALIZATION_FAILED; }
+    let base = p_bind_infos as *const u8;
+    for i in 0..bind_info_count {
+        let info = base.add(40 * i as usize);
+        let image  = std::ptr::read_unaligned(info.add(16) as *const u64);
+        let memory = std::ptr::read_unaligned(info.add(24) as *const u64);
+        let offset = std::ptr::read_unaligned(info.add(32) as *const u64);
+        let r = vkBindImageMemory(device, image, memory, offset);
+        if r != VK_SUCCESS { return r; }
+    }
+    VK_SUCCESS
+}
+
+/// `vkEnumeratePhysicalDeviceGroups` — tier-1 is single-device,
+/// so 1 group of 1 device. The output struct
+/// VkPhysicalDeviceGroupProperties is 288 bytes (sType + pNext
+/// + count + 32 device ptrs + subsetAllocation + pad).
+#[no_mangle]
+pub unsafe extern "C" fn vkEnumeratePhysicalDeviceGroups(
+    instance:                       VkInstance,
+    p_physical_device_group_count: *mut u32,
+    p_physical_device_groups:      *mut c_void,
+) -> VkResult {
+    if p_physical_device_group_count.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    if p_physical_device_groups.is_null() {
+        *p_physical_device_group_count = 1;
+        return VK_SUCCESS;
+    }
+    if *p_physical_device_group_count == 0 { return VK_SUCCESS; }
+
+    // Use the existing vkEnumeratePhysicalDevices to materialize
+    // a real VkPhysicalDevice handle for this group's slot 0.
+    let mut pd: VkPhysicalDevice = std::ptr::null_mut();
+    let mut count: u32 = 1;
+    vkEnumeratePhysicalDevices(instance, &mut count, &mut pd);
+    if count == 0 || pd.is_null() {
+        *p_physical_device_group_count = 0;
+        return VK_SUCCESS;
+    }
+
+    let g = p_physical_device_groups as *mut u8;
+    let out_p_next = std::ptr::read_unaligned(g.add(8) as *const *mut c_void);
+    // physicalDeviceCount = 1
+    std::ptr::write_unaligned(g.add(16) as *mut u32, 1);
+    // physicalDevices[0] = pd; clear the remaining 31 slots.
+    std::ptr::write_bytes(g.add(24), 0, 32 * 8);
+    std::ptr::write_unaligned(g.add(24) as *mut VkPhysicalDevice, pd);
+    // subsetAllocation = VK_FALSE.
+    std::ptr::write_unaligned(g.add(280) as *mut u32, 0);
+    let _ = walk_p_next_chain(out_p_next);
+
+    *p_physical_device_group_count = 1;
+    VK_SUCCESS
+}
+
+/// `vkGetDeviceGroupPeerMemoryFeatures` — single-device group:
+/// the only local==remote case yields PEER_MEMORY_FEATURE_COPY_
+/// SRC | DST | GENERIC_SRC | GENERIC_DST (all 4 bits = 0xF).
+/// Different local/remote indices report 0 (no peer access).
+#[no_mangle]
+pub unsafe extern "C" fn vkGetDeviceGroupPeerMemoryFeatures(
+    _device:             VkDevice,
+    _heap_index:         u32,
+    local_device_index:  u32,
+    remote_device_index: u32,
+    p_peer_memory_features: *mut u32,
+) {
+    if p_peer_memory_features.is_null() { return; }
+    *p_peer_memory_features = if local_device_index == remote_device_index {
+        0xF // all 4 PEER_MEMORY_FEATURE_* bits
+    } else {
+        0   // no peer (tier-1 is single-device)
+    };
+}
+
 // ── Capability-probe entries (1.1 + maintenance) ───────────────
 //
 // Apps probe these as part of feature negotiation: "can I create
@@ -7137,6 +7275,56 @@ mod tests {
         assert!(props.optimal_tiling_features.is_empty());
         assert!(props.linear_tiling_features.is_empty());
         assert!(props.buffer_features.is_empty());
+    }
+
+    #[test]
+    fn batch_bind_and_device_group_stubs_resolve() {
+        for name in [
+            b"vkBindBufferMemory2\0".as_slice(),
+            b"vkBindBufferMemory2KHR\0".as_slice(),
+            b"vkBindImageMemory2\0".as_slice(),
+            b"vkBindImageMemory2KHR\0".as_slice(),
+            b"vkEnumeratePhysicalDeviceGroups\0".as_slice(),
+            b"vkEnumeratePhysicalDeviceGroupsKHR\0".as_slice(),
+            b"vkGetDeviceGroupPeerMemoryFeatures\0".as_slice(),
+            b"vkGetDeviceGroupPeerMemoryFeaturesKHR\0".as_slice(),
+        ] {
+            assert!(lookup(name).is_some(),
+                "must resolve {}",
+                std::str::from_utf8(&name[..name.len()-1]).unwrap());
+        }
+
+        // GetDeviceGroupPeerMemoryFeatures:
+        //   local==remote → 0xF (all 4 peer-memory bits)
+        //   local!=remote → 0 (no peer)
+        let f = lookup(b"vkGetDeviceGroupPeerMemoryFeatures\0").unwrap();
+        let g: unsafe extern "C" fn(VkDevice, u32, u32, u32, *mut u32) =
+            unsafe { std::mem::transmute(f) };
+        let mut v: u32 = 0xdead_beef;
+        unsafe { g(std::ptr::null_mut(), 0, 0, 0, &mut v); }
+        assert_eq!(v, 0xF);
+        unsafe { g(std::ptr::null_mut(), 0, 0, 1, &mut v); }
+        assert_eq!(v, 0, "peer features should be 0 when local != remote on single-device tier-1");
+
+        // EnumeratePhysicalDeviceGroups size-query: returns 1.
+        let f = lookup(b"vkEnumeratePhysicalDeviceGroups\0").unwrap();
+        let g: unsafe extern "C" fn(VkInstance, *mut u32, *mut c_void) -> VkResult =
+            unsafe { std::mem::transmute(f) };
+        let mut count: u32 = 0;
+        // Bootstrap an instance so PD enumeration is meaningful.
+        let f_ci = lookup(b"vkCreateInstance\0").unwrap();
+        let ci: unsafe extern "C" fn(*const c_void, *const c_void, *mut VkInstance) -> VkResult =
+            unsafe { std::mem::transmute(f_ci) };
+        let mut inst: VkInstance = std::ptr::null_mut();
+        unsafe { ci(std::ptr::null(), std::ptr::null(), &mut inst); }
+        let r = unsafe { g(inst, &mut count, std::ptr::null_mut()) };
+        assert_eq!(r, VK_SUCCESS);
+        assert_eq!(count, 1, "single device group");
+
+        let f_di = lookup(b"vkDestroyInstance\0").unwrap();
+        let di: unsafe extern "C" fn(VkInstance, *const c_void) =
+            unsafe { std::mem::transmute(f_di) };
+        unsafe { di(inst, std::ptr::null()); }
     }
 
     #[test]
