@@ -429,13 +429,18 @@ impl Interpreter {
         }
     }
 
-    /// Evaluate a SPIR-V scalar float-arithmetic binop
+    /// Evaluate a SPIR-V float-arithmetic binop
     /// (FAdd / FSub / FMul / FDiv).
+    ///
+    /// Polymorphic by operand type: scalar f32/f64 or vec
+    /// of same. For Vec operands, walks lanes element-by-
+    /// element. Mixed-shape (one scalar, one vec) is
+    /// rejected — SPIR-V doesn't allow that anyway.
     fn eval_binop_float(
         &self,
         inst: &Instruction,
         values: &mut HashMap<Word, ConstantValue>,
-        op: impl FnOnce(f64, f64) -> f64,
+        op: impl Fn(f64, f64) -> f64,
     ) -> Result<(), InterpError> {
         let result_id = inst.result_id.ok_or_else(||
             InterpError::BadConstant(0))?;
@@ -443,56 +448,24 @@ impl Interpreter {
         let rhs_id = op_id(&inst.operands, 1)?;
         let lhs = self.lookup_value(lhs_id, values)?;
         let rhs = self.lookup_value(rhs_id, values)?;
-        let (lhs_f, rhs_f) = match (&lhs, &rhs) {
-            (ConstantValue::F32(a), ConstantValue::F32(b)) =>
-                (*a as f64, *b as f64),
-            (ConstantValue::F64(a), ConstantValue::F64(b)) =>
-                (*a, *b),
-            (ConstantValue::F32(a), ConstantValue::F64(b)) =>
-                (*a as f64, *b),
-            (ConstantValue::F64(a), ConstantValue::F32(b)) =>
-                (*a, *b as f64),
-            _ => return Err(InterpError::UnsupportedOpcode(format!(
-                "float binop on non-float operands: {lhs:?}, {rhs:?}",
-            ))),
-        };
-        let result = op(lhs_f, rhs_f);
-        // Reuse the wider of the input widths. Phase 1 v3
-        // only handles f32 so far, but the test currently
-        // passes f32 in (so the result narrows back).
-        let stored = match (&lhs, &rhs) {
-            (ConstantValue::F64(_), _) | (_, ConstantValue::F64(_)) =>
-                ConstantValue::F64(result),
-            _ => ConstantValue::F32(result as f32),
-        };
+        let stored = eval_float_binop_value(&lhs, &rhs, &op)?;
         values.insert(result_id, stored);
         Ok(())
     }
 
-    /// Evaluate a SPIR-V scalar float-arithmetic unop
-    /// (FNegate).
+    /// Evaluate a SPIR-V float-arithmetic unop
+    /// (FNegate). Polymorphic for scalar or vec.
     fn eval_unop_float(
         &self,
         inst: &Instruction,
         values: &mut HashMap<Word, ConstantValue>,
-        op: impl FnOnce(f64) -> f64,
+        op: impl Fn(f64) -> f64,
     ) -> Result<(), InterpError> {
         let result_id = inst.result_id.ok_or_else(||
             InterpError::BadConstant(0))?;
         let src_id = op_id(&inst.operands, 0)?;
         let src = self.lookup_value(src_id, values)?;
-        let src_f = match &src {
-            ConstantValue::F32(a) => *a as f64,
-            ConstantValue::F64(a) => *a,
-            _ => return Err(InterpError::UnsupportedOpcode(format!(
-                "float unop on non-float operand: {src:?}",
-            ))),
-        };
-        let result = op(src_f);
-        let stored = match &src {
-            ConstantValue::F64(_) => ConstantValue::F64(result),
-            _ => ConstantValue::F32(result as f32),
-        };
+        let stored = eval_float_unop_value(&src, &op)?;
         values.insert(result_id, stored);
         Ok(())
     }
@@ -536,6 +509,71 @@ fn op_storage(operands: &[Operand], i: usize) -> Result<StorageClass, InterpErro
         .ok_or_else(|| InterpError::ParseFailed(
             format!("expected StorageClass at operand {i}"),
         ))
+}
+
+/// Apply a scalar-f64 binary operator across two
+/// ConstantValues, handling both scalar and vector
+/// shapes. Recursive: vec lanes are themselves
+/// ConstantValues (scalar in practice).
+fn eval_float_binop_value(
+    lhs: &ConstantValue,
+    rhs: &ConstantValue,
+    op: &impl Fn(f64, f64) -> f64,
+) -> Result<ConstantValue, InterpError> {
+    match (lhs, rhs) {
+        // Scalar × Scalar.
+        (ConstantValue::F32(a), ConstantValue::F32(b)) =>
+            Ok(ConstantValue::F32(op(*a as f64, *b as f64) as f32)),
+        (ConstantValue::F64(a), ConstantValue::F64(b)) =>
+            Ok(ConstantValue::F64(op(*a, *b))),
+        (ConstantValue::F32(a), ConstantValue::F64(b)) =>
+            Ok(ConstantValue::F64(op(*a as f64, *b))),
+        (ConstantValue::F64(a), ConstantValue::F32(b)) =>
+            Ok(ConstantValue::F64(op(*a, *b as f64))),
+
+        // Vec × Vec.
+        (ConstantValue::Vec(a), ConstantValue::Vec(b)) => {
+            if a.len() != b.len() {
+                return Err(InterpError::UnsupportedOpcode(format!(
+                    "vec binop with mismatched lane counts: {} vs {}",
+                    a.len(), b.len(),
+                )));
+            }
+            let mut out = Vec::with_capacity(a.len());
+            for (la, lb) in a.iter().zip(b.iter()) {
+                out.push(eval_float_binop_value(la, lb, op)?);
+            }
+            Ok(ConstantValue::Vec(out))
+        }
+
+        _ => Err(InterpError::UnsupportedOpcode(format!(
+            "float binop on incompatible operands: {lhs:?}, {rhs:?}",
+        ))),
+    }
+}
+
+/// Apply a scalar-f64 unary operator across a
+/// ConstantValue, handling both scalar and vector shapes.
+fn eval_float_unop_value(
+    src: &ConstantValue,
+    op: &impl Fn(f64) -> f64,
+) -> Result<ConstantValue, InterpError> {
+    match src {
+        ConstantValue::F32(a) =>
+            Ok(ConstantValue::F32(op(*a as f64) as f32)),
+        ConstantValue::F64(a) =>
+            Ok(ConstantValue::F64(op(*a))),
+        ConstantValue::Vec(lanes) => {
+            let mut out = Vec::with_capacity(lanes.len());
+            for l in lanes {
+                out.push(eval_float_unop_value(l, op)?);
+            }
+            Ok(ConstantValue::Vec(out))
+        }
+        _ => Err(InterpError::UnsupportedOpcode(format!(
+            "float unop on incompatible operand: {src:?}",
+        ))),
+    }
 }
 
 fn constant_to_rgba(v: &ConstantValue) -> Result<RgbaF32, InterpError> {

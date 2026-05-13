@@ -366,57 +366,109 @@ impl FnTranslator {
             // Vec arithmetic is the next widening; the
             // bin/unop helper would walk both vectors
             // lane-by-lane.
-            Op::FAdd(a, b) => self.emit_scalar_binop(
+            // Float arithmetic is polymorphic by operand
+            // type — SPIR-V's OpFAdd works on scalar f32
+            // AND vec[2,3,4]<f32>. The dispatch helper
+            // checks whether the operands live in
+            // `scalars` (lane count 1) or `vectors`
+            // (lane count >= 2) and walks lanes
+            // accordingly.
+            Op::FAdd(a, b) => self.emit_float_binop(
                 builder, &inst.result, a, b, |b, x, y| b.ins().fadd(x, y),
             ),
-            Op::FSub(a, b) => self.emit_scalar_binop(
+            Op::FSub(a, b) => self.emit_float_binop(
                 builder, &inst.result, a, b, |b, x, y| b.ins().fsub(x, y),
             ),
-            Op::FMul(a, b) => self.emit_scalar_binop(
+            Op::FMul(a, b) => self.emit_float_binop(
                 builder, &inst.result, a, b, |b, x, y| b.ins().fmul(x, y),
             ),
-            Op::FDiv(a, b) => self.emit_scalar_binop(
+            Op::FDiv(a, b) => self.emit_float_binop(
                 builder, &inst.result, a, b, |b, x, y| b.ins().fdiv(x, y),
             ),
-            Op::FNeg(a) => {
-                let av = self.scalars.get(&a.id).copied().ok_or_else(||
-                    BackendError::Unsupported(format!(
-                        "FNeg operand id {:?} not in scalars", a.id,
-                    )))?;
-                let result = inst.result.as_ref().ok_or_else(||
-                    BackendError::Internal(
-                        "FNeg without result Value".to_string()))?;
-                let v = builder.ins().fneg(av);
-                self.scalars.insert(result.id, v);
-                Ok(())
-            }
+            Op::FNeg(a) => self.emit_float_unop(
+                builder, &inst.result, a, |b, x| b.ins().fneg(x),
+            ),
             other => Err(BackendError::Unsupported(format!(
                 "Op {other:?} not supported in phase 2 v6",
             ))),
         }
     }
 
-    /// Helper for scalar f32 binary arithmetic.
-    fn emit_scalar_binop(
+    /// Helper for f32 binary arithmetic that may be
+    /// scalar or vector. SPIR-V's OpFAdd / OpFSub /
+    /// OpFMul / OpFDiv are polymorphic by operand type;
+    /// we dispatch on whether both operands live in the
+    /// vectors map (lane-walk) or both in scalars (single
+    /// op). Mixed-shape operands aren't allowed by SPIR-V.
+    fn emit_float_binop(
         &mut self,
         builder: &mut FunctionBuilder,
         result: &Option<atrium_spv_ir::Value>,
         a: &atrium_spv_ir::Value,
         b: &atrium_spv_ir::Value,
-        emit: impl FnOnce(&mut FunctionBuilder, ClifValue, ClifValue) -> ClifValue,
+        emit: impl Fn(&mut FunctionBuilder, ClifValue, ClifValue) -> ClifValue,
     ) -> Result<(), BackendError> {
-        let av = self.scalars.get(&a.id).copied().ok_or_else(||
-            BackendError::Unsupported(format!(
-                "binop lhs id {:?} not in scalars", a.id,
-            )))?;
-        let bv = self.scalars.get(&b.id).copied().ok_or_else(||
-            BackendError::Unsupported(format!(
-                "binop rhs id {:?} not in scalars", b.id,
-            )))?;
         let result = result.as_ref().ok_or_else(||
             BackendError::Internal(
                 "binop without result Value".to_string()))?;
+
+        // Vec → vec.
+        if let (Some(a_lanes), Some(b_lanes)) =
+            (self.vectors.get(&a.id).cloned(), self.vectors.get(&b.id).cloned())
+        {
+            if a_lanes.len() != b_lanes.len() {
+                return Err(BackendError::Unsupported(format!(
+                    "vec binop with mismatched lane counts: {} vs {}",
+                    a_lanes.len(), b_lanes.len(),
+                )));
+            }
+            let mut out_lanes = Vec::with_capacity(a_lanes.len());
+            for (la, lb) in a_lanes.iter().zip(b_lanes.iter()) {
+                out_lanes.push(emit(builder, *la, *lb));
+            }
+            self.vectors.insert(result.id, out_lanes);
+            return Ok(());
+        }
+
+        // Scalar.
+        let av = self.scalars.get(&a.id).copied().ok_or_else(||
+            BackendError::Unsupported(format!(
+                "float binop lhs id {:?} not in scalars or vectors", a.id,
+            )))?;
+        let bv = self.scalars.get(&b.id).copied().ok_or_else(||
+            BackendError::Unsupported(format!(
+                "float binop rhs id {:?} not in scalars or vectors", b.id,
+            )))?;
         let v = emit(builder, av, bv);
+        self.scalars.insert(result.id, v);
+        Ok(())
+    }
+
+    /// Same shape as [`Self::emit_float_binop`] for unary
+    /// ops (FNeg).
+    fn emit_float_unop(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        result: &Option<atrium_spv_ir::Value>,
+        a: &atrium_spv_ir::Value,
+        emit: impl Fn(&mut FunctionBuilder, ClifValue) -> ClifValue,
+    ) -> Result<(), BackendError> {
+        let result = result.as_ref().ok_or_else(||
+            BackendError::Internal(
+                "unop without result Value".to_string()))?;
+        if let Some(a_lanes) = self.vectors.get(&a.id).cloned() {
+            let mut out_lanes = Vec::with_capacity(a_lanes.len());
+            for la in a_lanes.iter() {
+                out_lanes.push(emit(builder, *la));
+            }
+            self.vectors.insert(result.id, out_lanes);
+            return Ok(());
+        }
+        let av = self.scalars.get(&a.id).copied().ok_or_else(||
+            BackendError::Unsupported(format!(
+                "float unop operand id {:?} not in scalars or vectors", a.id,
+            )))?;
+        let v = emit(builder, av);
         self.scalars.insert(result.id, v);
         Ok(())
     }

@@ -253,6 +253,93 @@ fn build_arithmetic_shader(a: f32, b: f32, c: f32) -> Vec<u8> {
     bytes
 }
 
+/// Build a shader: out_color = vec_a + vec_b
+/// where vec_a and vec_b are constant vec4<f32>.
+fn build_vec_add_shader(a: [f32; 4], b: [f32; 4]) -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, ExecutionMode, ExecutionModel,
+        FunctionControl, MemoryModel, StorageClass,
+    };
+
+    let mut bld = rspirv::dr::Builder::new();
+    bld.set_version(1, 0);
+    bld.capability(Capability::Shader);
+    bld.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+
+    let void = bld.type_void();
+    let f32_ty = bld.type_float(32, None);
+    let vec4_f32 = bld.type_vector(f32_ty, 4);
+    let void_fn = bld.type_function(void, vec![]);
+    let ptr_out_vec4 = bld.type_pointer(None, StorageClass::Output, vec4_f32);
+
+    let ca: Vec<_> = a.iter().map(|x| bld.constant_bit32(f32_ty, x.to_bits())).collect();
+    let cb: Vec<_> = b.iter().map(|x| bld.constant_bit32(f32_ty, x.to_bits())).collect();
+    let va = bld.constant_composite(vec4_f32, ca);
+    let vb = bld.constant_composite(vec4_f32, cb);
+
+    let out = bld.variable(ptr_out_vec4, None, StorageClass::Output, None);
+    bld.decorate(out, rspirv::spirv::Decoration::Location,
+                 vec![rspirv::dr::Operand::LiteralBit32(0)]);
+
+    let main = bld.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    bld.begin_block(None).unwrap();
+    let sum = bld.f_add(vec4_f32, None, va, vb).unwrap();
+    bld.store(out, sum, None, vec![]).unwrap();
+    bld.ret().unwrap();
+    bld.end_function().unwrap();
+
+    bld.entry_point(ExecutionModel::Fragment, main, "main", vec![out]);
+    bld.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+
+    let words: Vec<u32> = bld.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn cranelift_shader_runs_vec_arithmetic() {
+    let a = [0.1f32, 0.2, 0.3, 0.4];
+    let b = [0.5f32, 0.6, 0.7, 0.0];
+    let spirv = build_vec_add_shader(a, b);
+    let module = atrium_spv_frontend::translate(&spirv).unwrap();
+    let object_bytes = atrium_spv_backend_cranelift::compile(
+        &module, Target::host(),
+    ).unwrap().object;
+
+    let dir = TempDir::new().unwrap();
+    let obj_path = dir.path().join("shader.o");
+    std::fs::write(&obj_path, &object_bytes).unwrap();
+    let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
+    let lib_path = dir.path().join(format!("shader.{ext}"));
+    link_to_shared_library(&obj_path, &lib_path).unwrap();
+
+    let lib = unsafe { libloading::Library::new(&lib_path).unwrap() };
+    type FsMain = unsafe extern "C" fn(
+        *const u8, *const u8, *const u8,
+        f32, f32, f32, f32, u32,
+        *mut f32, *mut f32,
+    );
+    let fs_main: libloading::Symbol<FsMain> = unsafe {
+        lib.get(b"atrium_fs_main").unwrap()
+    };
+    let mut out_color = [0.0f32; 4];
+    let mut out_depth = 0.0f32;
+    unsafe {
+        fs_main(
+            std::ptr::null(), std::ptr::null(), std::ptr::null(),
+            0.0, 0.0, 0.0, 0.0, 0,
+            out_color.as_mut_ptr(), &mut out_depth,
+        );
+    }
+    let expected = [a[0]+b[0], a[1]+b[1], a[2]+b[2], a[3]+b[3]];
+    for i in 0..4 {
+        assert!((out_color[i] - expected[i]).abs() < 1e-6,
+            "lane {i}: got {}, expected {}", out_color[i], expected[i]);
+    }
+}
+
 #[test]
 fn cranelift_shader_runs_real_arithmetic() {
     let a = 0.5f32;
