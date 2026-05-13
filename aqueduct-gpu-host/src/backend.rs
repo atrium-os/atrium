@@ -119,6 +119,21 @@ pub trait Backend: Send + Sync {
         _surface_id: u64,
         _frame_id:   u64,
     ) {}
+
+    /// Tell the backend that pipeline `pipeline_id` should run
+    /// `tier2_shader_id`'s compiled fragment shader during
+    /// subsequent draws against it. Called by `Session::handle_
+    /// pipeline_create` when the bound fragment shader has a
+    /// `tier2_id` recorded.
+    ///
+    /// Default no-op for backends that don't support Tier-2
+    /// shader execution; [`Tier2Backend`](crate::Tier2Backend)
+    /// overrides this to populate its pipeline → shader map.
+    fn bind_pipeline_tier2(
+        &self,
+        _pipeline_id: ResourceId,
+        _tier2_shader_id: crate::Tier2ShaderId,
+    ) {}
 }
 
 /// Protocol-correct backend that does no GPU work.

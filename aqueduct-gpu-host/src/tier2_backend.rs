@@ -228,4 +228,12 @@ impl Backend for Tier2Backend {
     ) {
         self.presents.fetch_add(1, Ordering::Relaxed);
     }
+
+    fn bind_pipeline_tier2(
+        &self,
+        pipeline_id: ResourceId,
+        tier2_shader_id: Tier2ShaderId,
+    ) {
+        self.bind_pipeline(pipeline_id, tier2_shader_id);
+    }
 }

@@ -428,6 +428,24 @@ impl Session {
         self.table.insert_pipeline(req.pipeline_id, PipelineRecord {
             shaders: req.shaders.clone(),
         });
+
+        // Tier-2 auto-bind: for a graphics pipeline whose
+        // bound fragment shader (index 1) has a recorded
+        // tier2_id, tell the backend so draws against this
+        // pipeline trigger Tier-2 shader execution. Other
+        // pipeline kinds + shaders without a tier2_id are
+        // silently skipped — backends that don't support
+        // Tier-2 default-no-op on `bind_pipeline_tier2`.
+        use aqueduct_gpu::payloads::PipelineKind;
+        if matches!(req.kind, PipelineKind::Graphics) {
+            if let Some(frag_id) = req.shaders.get(1).copied() {
+                if let Some(rec) = self.table.get_shader(frag_id) {
+                    if let Some(tier2) = rec.tier2_id {
+                        self.backend.bind_pipeline_tier2(req.pipeline_id, tier2);
+                    }
+                }
+            }
+        }
         Ok(())
     }
 

@@ -191,6 +191,109 @@ fn tier2_backend_submit_frame_no_bound_pipeline_leaves_image_unchanged() {
     assert!(pixels.iter().all(|b| *b == 0));
 }
 
+/// End-to-end wire integration: shader upload + pipeline
+/// create + submit_frame all flow through a real Listener
+/// + Session, and the Tier2Backend ends up with the right
+/// pipeline → shader binding. We assert via the backend's
+/// own state (the wire doesn't yet have a read-pixels op).
+#[test]
+fn session_pipeline_create_auto_binds_tier2_shader() {
+    use std::thread;
+    use std::time::Duration;
+
+    use aqueduct::Connection;
+    use aqueduct_gpu::ClientKind;
+    use aqueduct_gpu::backends::{BackendId, GpuVendor};
+    use aqueduct_gpu::payloads::{PipelineKind, ShaderKind};
+    use aqueduct_gpu_client::GpuClient;
+    use aqueduct_gpu_host::{Backend, Listener};
+
+    let cache_dir = TempDir::new().unwrap();
+    let registry = Arc::new(Tier2Registry::new(LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    }));
+    let backend = Arc::new(Tier2Backend::new(registry.clone()));
+    let backend_dyn: Arc<dyn Backend> = backend.clone();
+
+    let sock = std::env::temp_dir().join(format!(
+        "atrium-tier2-session-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&sock);
+
+    let listener = Listener::bind(&sock, backend_dyn)
+        .unwrap()
+        .with_tier2_registry(registry.clone());
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+
+    // Build a fragment shader the registry can compile.
+    let spirv = build_constant_color_spirv([0.9, 0.1, 0.4, 1.0]);
+    let mut hash = [0u8; 32];
+    {
+        use sha2::Digest;
+        let mut h = sha2::Sha256::new();
+        h.update(&spirv);
+        hash.copy_from_slice(&h.finalize());
+    }
+    let backend_id = BackendId::new(GpuVendor::Software, 2);
+
+    // Connection 1: handshake, upload shader, create pipeline.
+    let conn = Connection::connect(&sock).unwrap();
+    let mut client = GpuClient::new(conn);
+    client.handshake(ClientKind::FrescodRenderer).unwrap();
+
+    let shader_id = client.upload_shader(
+        hash, ShaderKind::SpirV, backend_id, spirv.clone()).unwrap();
+    // Pipeline shaders = [vertex, fragment]; we'll use the
+    // same id for both — the upload was a fragment shader,
+    // and only the fragment slot matters for Tier-2 auto-
+    // bind right now.
+    let pipeline_id = client.create_pipeline(
+        PipelineKind::Graphics,
+        vec![shader_id, shader_id],
+        vec![],
+    ).unwrap();
+
+    // Give the daemon a beat to process.
+    drop(client);
+    thread::sleep(Duration::from_millis(50));
+
+    // The backend's pipeline_shaders map should now hold
+    // the binding. We don't expose it directly; instead
+    // confirm by directly calling submit_frame in this
+    // thread on the same backend handle and verifying
+    // pixel output.
+    let image_id = aqueduct_gpu::ids::ResourceId::new(
+        aqueduct_gpu::ids::IdNamespace::IcdRuntime, 0xA002);
+    backend.image_created(image_id, 4, 4);
+
+    use aqueduct_gpu::frame::FrameBuilder;
+    use aqueduct_gpu::opcodes::FrameOp;
+    let mut fb = FrameBuilder::new(1024);
+    let mut begin = [0u8; 12];
+    begin[..4].copy_from_slice(&image_id.raw().to_le_bytes());
+    begin[4..8].copy_from_slice(&4u32.to_le_bytes());
+    begin[8..12].copy_from_slice(&4u32.to_le_bytes());
+    fb.push(FrameOp::BeginRenderPass, &begin).unwrap();
+    fb.push(FrameOp::BindPipeline, &pipeline_id.raw().to_le_bytes()).unwrap();
+    fb.push(FrameOp::EndRenderPass, &[]).unwrap();
+
+    let fence = aqueduct_gpu::ids::ResourceId::new(
+        aqueduct_gpu::ids::IdNamespace::IcdRuntime, 0xA003);
+    backend.submit_frame(fence, 1, fb.as_bytes());
+
+    let pixels = backend.read_image_pixels(image_id).unwrap();
+    let r = (0.9 * 255.0 + 0.5) as u8;
+    let g = (0.1 * 255.0 + 0.5) as u8;
+    let b = (0.4 * 255.0 + 0.5) as u8;
+    assert_eq!(&pixels[..4], &[r, g, b, 255],
+        "session pipeline_create must auto-bind the Tier-2 shader");
+
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
+
 #[test]
 fn tier2_backend_submit_frame_counts() {
     let cache_dir = TempDir::new().unwrap();
