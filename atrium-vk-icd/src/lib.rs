@@ -1064,6 +1064,11 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkCommandBuffer, u32, u32, u32, u32, *const c_void, u32, *const c_void, u32, *const c_void), FnVoidPtr,
             >(vkCmdPipelineBarrier)),
+        "vkCmdPipelineBarrier2" |
+        "vkCmdPipelineBarrier2KHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, *const c_void), FnVoidPtr,
+            >(vkCmdPipelineBarrier2)),
         "vkDeviceWaitIdle" =>
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkDevice) -> VkResult, FnVoidPtr,
@@ -3656,6 +3661,70 @@ pub unsafe extern "C" fn vkCmdPipelineBarrier(
     body[ 8.. 9].copy_from_slice(&[memory_barrier_count.min(255) as u8]);
     body[ 9..10].copy_from_slice(&[buffer_barrier_count.min(255) as u8]);
     body[10..11].copy_from_slice(&[image_barrier_count.min(255)  as u8]);
+    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::PipelineBarrier, &body);
+}
+
+/// `vkCmdPipelineBarrier2` — Vulkan 1.3 mandatory barrier with
+/// VkDependencyInfo. Each contained barrier carries 64-bit stage
+/// and access masks (vs the 32-bit masks in the 1.0 variant) and
+/// per-barrier sync rather than a single global stage pair.
+///
+/// We collapse to the same per-cmdbuf PipelineBarrier FrameOp
+/// the 1.0 path emits: take the FIRST memory barrier's stage
+/// masks (truncated u64 → u32) as the global pair, and forward
+/// the three barrier counts. Atrium's renderer treats every
+/// barrier as a global write→read fence; the per-barrier
+/// granularity is not yet wired through the daemon.
+///
+/// VkDependencyInfo (64 bytes):
+///   0  sType
+///   8  pNext
+///   16 dependencyFlags (u32)
+///   20 memoryBarrierCount (u32)
+///   24 pMemoryBarriers (*const VkMemoryBarrier2)
+///   32 bufferMemoryBarrierCount (u32)
+///   40 pBufferMemoryBarriers
+///   48 imageMemoryBarrierCount (u32)
+///   56 pImageMemoryBarriers
+///
+/// VkMemoryBarrier2 (48 bytes):
+///   0  sType
+///   8  pNext
+///   16 srcStageMask (u64)
+///   24 srcAccessMask (u64)
+///   32 dstStageMask (u64)
+///   40 dstAccessMask (u64)
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdPipelineBarrier2(
+    command_buffer: VkCommandBuffer,
+    p_dependency_info: *const c_void,
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    if p_dependency_info.is_null() { return; }
+    let dep = p_dependency_info as *const u8;
+    let mem_count = std::ptr::read_unaligned(dep.add(20) as *const u32);
+    let p_mem     = std::ptr::read_unaligned(dep.add(24) as *const *const u8);
+    let buf_count = std::ptr::read_unaligned(dep.add(32) as *const u32);
+    let img_count = std::ptr::read_unaligned(dep.add(48) as *const u32);
+
+    let (src_stage_mask, dst_stage_mask) = if mem_count > 0 && !p_mem.is_null() {
+        let s = std::ptr::read_unaligned(p_mem.add(16) as *const u64) as u32;
+        let d = std::ptr::read_unaligned(p_mem.add(32) as *const u64) as u32;
+        (s, d)
+    } else {
+        // Spec allows zero memory barriers + only buffer/image
+        // barriers. Use a conservative ALL_COMMANDS pair so the
+        // renderer's barrier walks aren't accidentally reordered.
+        // 0x00010000 = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT (1.0 enum).
+        (0x00010000, 0x00010000)
+    };
+
+    let mut body = [0u8; 12];
+    body[ 0.. 4].copy_from_slice(&src_stage_mask.to_le_bytes());
+    body[ 4.. 8].copy_from_slice(&dst_stage_mask.to_le_bytes());
+    body[ 8.. 9].copy_from_slice(&[mem_count.min(255) as u8]);
+    body[ 9..10].copy_from_slice(&[buf_count.min(255) as u8]);
+    body[10..11].copy_from_slice(&[img_count.min(255) as u8]);
     let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::PipelineBarrier, &body);
 }
 

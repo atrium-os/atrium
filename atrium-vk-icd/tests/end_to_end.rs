@@ -592,6 +592,102 @@ fn submit_flushes_recorded_frame_to_aqueduct_backend() {
 }
 
 #[test]
+fn cmd_pipeline_barrier2_records_frame_op_with_extracted_masks() {
+    // Drive vkCmdPipelineBarrier2 with a real VkDependencyInfo +
+    // single VkMemoryBarrier2. Check the recorded FrameOp body
+    // carries the (truncated u64 -> u32) src/dst stage masks at
+    // bytes 0..8 and the (mem=1, buf=0, img=0) counts at bytes
+    // 8..11. This proves the 1.3-style barrier reaches the daemon
+    // with the same shape the renderer's PipelineBarrier handler
+    // already understands.
+    use atrium_vk_icd::{
+        cmdbuf_recorded_bytes, vkAllocateCommandBuffers, vkBeginCommandBuffer,
+        vkCmdPipelineBarrier2, vkCreateCommandPool, vkCreateDevice,
+        vkDestroyCommandPool, vkDestroyDevice, vkEndCommandBuffer,
+    };
+
+    let sock = tmp_socket("barrier2");
+    let sw_backend = Arc::new(SoftwareBackend::new());
+    let backend_for_listener: Arc<dyn Backend> = sw_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap();
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+    let _env = EnvLock::set(&sock);
+
+    type VkDevice = *mut std::ffi::c_void;
+    type VkCommandBuffer = *mut std::ffi::c_void;
+
+    let mut instance: VkInstance = std::ptr::null_mut();
+    unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
+    let mut devices: [VkPhysicalDevice; 1] = [std::ptr::null_mut(); 1];
+    let mut cap: u32 = 1;
+    unsafe { vkEnumeratePhysicalDevices(instance, &mut cap, devices.as_mut_ptr()); }
+    let mut device: VkDevice = std::ptr::null_mut();
+    unsafe { vkCreateDevice(devices[0], std::ptr::null(), std::ptr::null(), &mut device); }
+    let mut pool: u64 = 0;
+    unsafe { vkCreateCommandPool(device, std::ptr::null(), std::ptr::null(), &mut pool); }
+
+    let mut info = [0u8; 40];
+    info[0..4].copy_from_slice(&40u32.to_le_bytes());
+    info[16..24].copy_from_slice(&pool.to_le_bytes());
+    info[28..32].copy_from_slice(&1u32.to_le_bytes());
+    let mut cbs: [VkCommandBuffer; 1] = [std::ptr::null_mut(); 1];
+    unsafe { vkAllocateCommandBuffers(device, info.as_ptr() as *const _, cbs.as_mut_ptr()); }
+    let cb = cbs[0];
+
+    // VkMemoryBarrier2 (48 bytes):
+    //   src_stage_mask u64 0x1234_0000_0000 — top bits dropped on
+    //   truncation; bottom u32 = 0; pick masks that lose nothing.
+    let src_stage: u64 = 0x0000_0080;  // FRAGMENT_SHADER
+    let dst_stage: u64 = 0x0000_0400;  // COLOR_ATTACHMENT_OUTPUT
+    let mut mb = [0u8; 48];
+    mb[0..4].copy_from_slice(&1_000_314_008u32.to_le_bytes()); // sType
+    mb[16..24].copy_from_slice(&src_stage.to_le_bytes());
+    mb[32..40].copy_from_slice(&dst_stage.to_le_bytes());
+
+    // VkDependencyInfo (64 bytes):
+    let mut dep = [0u8; 64];
+    dep[0..4].copy_from_slice(&1_000_314_007u32.to_le_bytes()); // sType
+    dep[20..24].copy_from_slice(&1u32.to_le_bytes()); // memoryBarrierCount
+    let mb_ptr = mb.as_ptr() as u64;
+    dep[24..32].copy_from_slice(&mb_ptr.to_le_bytes());
+
+    unsafe { vkBeginCommandBuffer(cb, std::ptr::null()); }
+    unsafe { vkCmdPipelineBarrier2(cb, dep.as_ptr() as *const _); }
+    unsafe { vkEndCommandBuffer(cb); }
+
+    let bytes = cmdbuf_recorded_bytes(cb);
+    // Find the PipelineBarrier opcode (0x0070).
+    let mut found = false;
+    let mut off = 0;
+    while off + 8 <= bytes.len() {
+        let opcode = u16::from_le_bytes([bytes[off], bytes[off+1]]);
+        let total  = u32::from_le_bytes(bytes[off+4..off+8].try_into().unwrap()) as usize;
+        if opcode == 0x0070 {
+            // Body starts at off + 8 (FrameOp header).
+            let body = &bytes[off+8..off+total];
+            let s = u32::from_le_bytes(body[0..4].try_into().unwrap());
+            let d = u32::from_le_bytes(body[4..8].try_into().unwrap());
+            assert_eq!(s as u64, src_stage);
+            assert_eq!(d as u64, dst_stage);
+            assert_eq!(body[8],  1, "mem_count");
+            assert_eq!(body[9],  0, "buf_count");
+            assert_eq!(body[10], 0, "img_count");
+            found = true;
+            break;
+        }
+        off += total;
+    }
+    assert!(found, "PipelineBarrier opcode 0x0070 not found in {} bytes", bytes.len());
+
+    unsafe { vkDestroyCommandPool(device, pool, std::ptr::null()); }
+    unsafe { vkDestroyDevice(device, std::ptr::null()); }
+    unsafe { vkDestroyInstance(instance, std::ptr::null()); }
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[test]
 fn queue_submit2_routes_cmdbufs_through_vksubmitinfo2() {
     // Same shape as submit_flushes_recorded_frame_to_aqueduct_backend
     // but uses vkQueueSubmit2 + VkSubmitInfo2 +
