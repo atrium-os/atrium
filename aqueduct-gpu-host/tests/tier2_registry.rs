@@ -213,6 +213,142 @@ fn listener_routes_shader_upload_through_tier2_registry() {
 }
 
 #[test]
+fn fill_image_fragment_constant_color() {
+    let cache_dir = TempDir::new().unwrap();
+    let config = LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    };
+    let registry = Tier2Registry::new(config);
+
+    let expected = [0.2f32, 0.4, 0.6, 1.0];
+    let spirv = build_constant_color_spirv(expected);
+    let id = registry.register(&spirv).expect("register");
+
+    let (w, h) = (8u32, 4u32);
+    let mut pixels = vec![0u8; (w * h * 4) as usize];
+    registry.fill_image_fragment(id, &[], &[], w, h, &mut pixels)
+        .expect("fill_image_fragment");
+
+    // Every pixel should equal the expected colour, u8-quantised.
+    let expected_u8 = [
+        (expected[0] * 255.0 + 0.5) as u8,
+        (expected[1] * 255.0 + 0.5) as u8,
+        (expected[2] * 255.0 + 0.5) as u8,
+        (expected[3] * 255.0 + 0.5) as u8,
+    ];
+    for y in 0..h {
+        for x in 0..w {
+            let i = ((y * w + x) * 4) as usize;
+            assert_eq!(
+                &pixels[i..i+4],
+                &expected_u8[..],
+                "pixel ({x}, {y}) mismatch"
+            );
+        }
+    }
+}
+
+/// Build a fragment shader that reads the f32 push-
+/// constant `scale` and writes
+/// `vec4(scale, 0, 0, 1)` — independent of frag_coord but
+/// non-trivial to compile (AccessChain + Load + struct
+/// member offsets).
+fn build_pushconst_red_shader() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let f32_ty = b.type_float(32, None);
+    let i32_ty = b.type_int(32, 1);
+    let vec4_f32 = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let pc_struct = b.type_struct(vec![f32_ty]);
+    b.member_decorate(pc_struct, 0, Decoration::Offset,
+                      vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(pc_struct, Decoration::Block, vec![]);
+    let ptr_pc_struct = b.type_pointer(None, StorageClass::PushConstant, pc_struct);
+    let ptr_pc_f32    = b.type_pointer(None, StorageClass::PushConstant, f32_ty);
+    let ptr_out_vec4  = b.type_pointer(None, StorageClass::Output, vec4_f32);
+    let zero_i = b.constant_bit32(i32_ty, 0u32);
+    let c0 = b.constant_bit32(f32_ty, 0.0f32.to_bits());
+    let c1 = b.constant_bit32(f32_ty, 1.0f32.to_bits());
+    let pc_var = b.variable(ptr_pc_struct, None, StorageClass::PushConstant, None);
+    let out = b.variable(ptr_out_vec4, None, StorageClass::Output, None);
+    b.decorate(out, Decoration::Location, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let p = b.access_chain(ptr_pc_f32, None, pc_var, vec![zero_i]).unwrap();
+    let v = b.load(f32_ty, None, p, None, vec![]).unwrap();
+    let color = b.composite_construct(vec4_f32, None, vec![v, c0, c0, c1]).unwrap();
+    b.store(out, color, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![out]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn fill_image_fragment_with_push_constants() {
+    let cache_dir = TempDir::new().unwrap();
+    let config = LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    };
+    let registry = Tier2Registry::new(config);
+    let spirv = build_pushconst_red_shader();
+    let id = registry.register(&spirv).expect("register");
+
+    let scale = 0.5f32;
+    let mut pc = [0u8; 4];
+    pc.copy_from_slice(&scale.to_le_bytes());
+
+    let (w, h) = (4u32, 2u32);
+    let mut pixels = vec![0u8; (w * h * 4) as usize];
+    registry.fill_image_fragment(id, &pc, &[], w, h, &mut pixels)
+        .expect("fill_image_fragment");
+
+    let r_expected = (scale * 255.0 + 0.5) as u8;
+    for px in pixels.chunks_exact(4) {
+        assert_eq!(px[0], r_expected, "red channel mismatch");
+        assert_eq!(px[1], 0,          "green should be 0");
+        assert_eq!(px[2], 0,          "blue should be 0");
+        assert_eq!(px[3], 255,        "alpha should be 1.0 → 255");
+    }
+}
+
+#[test]
+fn fill_image_fragment_rejects_bad_buffer_size() {
+    use aqueduct_gpu_host::tier2_registry::Tier2ExecError;
+    let cache_dir = TempDir::new().unwrap();
+    let config = LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    };
+    let registry = Tier2Registry::new(config);
+    let spirv = build_constant_color_spirv([0.5, 0.5, 0.5, 1.0]);
+    let id = registry.register(&spirv).unwrap();
+
+    let mut pixels = vec![0u8; 100]; // wrong size for 8×4 (=128)
+    let err = registry.fill_image_fragment(id, &[], &[], 8, 4, &mut pixels)
+        .expect_err("must reject bad size");
+    assert!(matches!(err, Tier2ExecError::BadPixelsLen { .. }));
+}
+
+#[test]
 fn registry_forget_drops_the_id() {
     let cache_dir = TempDir::new().unwrap();
     let config = LoaderConfig {

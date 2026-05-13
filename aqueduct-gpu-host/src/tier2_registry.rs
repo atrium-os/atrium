@@ -107,4 +107,111 @@ impl Tier2Registry {
             by_hash.retain(|_h, v| *v != id);
         }
     }
+
+    /// Render a fragment shader into a flat RGBA8 image
+    /// buffer.
+    ///
+    /// Walks every pixel of a `width × height` image,
+    /// invoking `atrium_fs_main` once per pixel with the
+    /// supplied push-constant + uniform buffers. The
+    /// shader's output `vec4` is converted from float
+    /// `[0, 1]` to `u8` (saturating cast) and written into
+    /// `pixels` as RGBA bytes in row-major order.
+    ///
+    /// `pixels.len()` must equal `width * height * 4`.
+    ///
+    /// This is the simplest possible Tier-2 execution
+    /// primitive: no geometry, no interpolated varyings,
+    /// no depth. It corresponds exactly to drawing a full-
+    /// screen quad with a constant-vertex fragment shader.
+    /// Real submit_frame integration with rasterised
+    /// geometry lands in a follow-up step.
+    pub fn fill_image_fragment(
+        &self,
+        shader_id: Tier2ShaderId,
+        push_constants: &[u8],
+        uniforms: &[u8],
+        width: u32,
+        height: u32,
+        pixels: &mut [u8],
+    ) -> Result<(), Tier2ExecError> {
+        let expected_len = (width as usize) * (height as usize) * 4;
+        if pixels.len() != expected_len {
+            return Err(Tier2ExecError::BadPixelsLen {
+                expected: expected_len, got: pixels.len(),
+            });
+        }
+        let loaded = self.get(shader_id)
+            .ok_or(Tier2ExecError::UnknownShader(shader_id))?;
+        let fs_main = loaded.entry_points.fs_main
+            .ok_or(Tier2ExecError::NotAFragmentShader)?;
+
+        for y in 0..height {
+            for x in 0..width {
+                let mut out_color = [0.0f32; 4];
+                let mut out_depth = 0.0f32;
+                // SAFETY: fs_main is a dlopened C ABI
+                // function; the ShaderRecord guarantees its
+                // signature matches FsMain (checked at
+                // dlopen time by atrium-spv-loader). Input
+                // pointers are non-null only when their
+                // buffers are non-empty.
+                unsafe {
+                    let pc_ptr = if push_constants.is_empty() {
+                        std::ptr::null()
+                    } else {
+                        push_constants.as_ptr()
+                    };
+                    let uni_ptr = if uniforms.is_empty() {
+                        std::ptr::null()
+                    } else {
+                        uniforms.as_ptr()
+                    };
+                    fs_main(
+                        std::ptr::null(), uni_ptr, pc_ptr,
+                        x as f32 + 0.5, y as f32 + 0.5, 0.0, 1.0,
+                        0,
+                        out_color.as_mut_ptr(),
+                        &mut out_depth,
+                    );
+                }
+                let idx = ((y as usize) * (width as usize) + (x as usize)) * 4;
+                pixels[idx    ] = f32_to_u8(out_color[0]);
+                pixels[idx + 1] = f32_to_u8(out_color[1]);
+                pixels[idx + 2] = f32_to_u8(out_color[2]);
+                pixels[idx + 3] = f32_to_u8(out_color[3]);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Saturating float-to-u8 conversion matching the standard
+/// sRGB framebuffer convention.
+fn f32_to_u8(v: f32) -> u8 {
+    if v.is_nan() { 0 }
+    else if v <= 0.0 { 0 }
+    else if v >= 1.0 { 255 }
+    else { (v * 255.0 + 0.5) as u8 }
+}
+
+/// Errors from [`Tier2Registry::fill_image_fragment`].
+#[derive(Debug, thiserror::Error)]
+pub enum Tier2ExecError {
+    /// `pixels.len()` didn't match `width * height * 4`.
+    #[error("pixels buffer length {got} doesn't match expected {expected}")]
+    BadPixelsLen {
+        /// Required length.
+        expected: usize,
+        /// Caller-provided length.
+        got: usize,
+    },
+    /// `shader_id` not in the registry (never registered or
+    /// forgotten).
+    #[error("Tier-2 shader id {0:?} not in registry")]
+    UnknownShader(Tier2ShaderId),
+    /// The shader doesn't export `atrium_fs_main` (e.g.
+    /// it's a vertex or compute shader).
+    #[error("shader has no atrium_fs_main entry point")]
+    NotAFragmentShader,
 }
