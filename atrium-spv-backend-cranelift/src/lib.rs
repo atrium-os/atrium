@@ -685,6 +685,76 @@ impl FnTranslator {
                 self.scalars.insert(result.id, v);
                 Ok(())
             }
+            // Bitwise + shifts. Shift amounts in Cranelift
+            // are taken modulo the type width; our SPIR-V
+            // shift ops have the same semantics for in-range
+            // amounts (out-of-range is undefined in SPIR-V).
+            Op::BitAnd(a, b) => self.emit_int_binop(
+                builder, &inst.result, a, b, |b, x, y| b.ins().band(x, y)),
+            Op::BitOr(a, b) => self.emit_int_binop(
+                builder, &inst.result, a, b, |b, x, y| b.ins().bor(x, y)),
+            Op::BitXor(a, b) => self.emit_int_binop(
+                builder, &inst.result, a, b, |b, x, y| b.ins().bxor(x, y)),
+            Op::BitNot(a) => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal("BitNot without result".into()))?;
+                let av = self.scalars.get(&a.id).copied().ok_or_else(||
+                    BackendError::Internal(format!(
+                        "BitNot operand {:?} not in scalars", a.id)))?;
+                let v = builder.ins().bnot(av);
+                self.scalars.insert(result.id, v);
+                Ok(())
+            }
+            Op::Shl(a, b) => self.emit_int_binop(
+                builder, &inst.result, a, b, |b, x, y| b.ins().ishl(x, y)),
+            Op::LShr(a, b) => self.emit_int_binop(
+                builder, &inst.result, a, b, |b, x, y| b.ins().ushr(x, y)),
+            Op::AShr(a, b) => self.emit_int_binop(
+                builder, &inst.result, a, b, |b, x, y| b.ins().sshr(x, y)),
+            // Int↔float conversions. Cranelift's
+            // fcvt_to_sint/fcvt_to_uint trap on NaN; SPIR-V
+            // says NaN→0 (saturated). Use the saturating
+            // variants to match.
+            Op::ConvertSToF(a) => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal("ConvertSToF without result".into()))?;
+                let av = self.scalars.get(&a.id).copied().ok_or_else(||
+                    BackendError::Internal(format!(
+                        "ConvertSToF operand {:?} not in scalars", a.id)))?;
+                let v = builder.ins().fcvt_from_sint(clif_types::F32, av);
+                self.scalars.insert(result.id, v);
+                Ok(())
+            }
+            Op::ConvertUToF(a) => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal("ConvertUToF without result".into()))?;
+                let av = self.scalars.get(&a.id).copied().ok_or_else(||
+                    BackendError::Internal(format!(
+                        "ConvertUToF operand {:?} not in scalars", a.id)))?;
+                let v = builder.ins().fcvt_from_uint(clif_types::F32, av);
+                self.scalars.insert(result.id, v);
+                Ok(())
+            }
+            Op::ConvertFToS(a) => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal("ConvertFToS without result".into()))?;
+                let av = self.scalars.get(&a.id).copied().ok_or_else(||
+                    BackendError::Internal(format!(
+                        "ConvertFToS operand {:?} not in scalars", a.id)))?;
+                let v = builder.ins().fcvt_to_sint_sat(clif_types::I32, av);
+                self.scalars.insert(result.id, v);
+                Ok(())
+            }
+            Op::ConvertFToU(a) => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal("ConvertFToU without result".into()))?;
+                let av = self.scalars.get(&a.id).copied().ok_or_else(||
+                    BackendError::Internal(format!(
+                        "ConvertFToU operand {:?} not in scalars", a.id)))?;
+                let v = builder.ins().fcvt_to_uint_sat(clif_types::I32, av);
+                self.scalars.insert(result.id, v);
+                Ok(())
+            }
             // Integer comparisons → Bool (i32 0/1 per B4).
             Op::IEq(a, b) => self.emit_icmp(
                 builder, &inst.result, a, b, IntCC::Equal),

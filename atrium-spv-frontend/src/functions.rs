@@ -464,6 +464,52 @@ fn translate_inst(
             id_map, next_value_id, insts, source_spirv_offset,
             |a, b| Op::UGe(a, b),
         ),
+        // Bitwise + shifts.
+        SpvOp::BitwiseAnd => emit_binop_int(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::BitAnd(a, b)),
+        SpvOp::BitwiseOr => emit_binop_int(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::BitOr(a, b)),
+        SpvOp::BitwiseXor => emit_binop_int(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::BitXor(a, b)),
+        SpvOp::Not => emit_unop_int(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            Op::BitNot),
+        SpvOp::ShiftLeftLogical => emit_binop_int(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::Shl(a, b)),
+        SpvOp::ShiftRightLogical => emit_binop_int(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::LShr(a, b)),
+        SpvOp::ShiftRightArithmetic => emit_binop_int(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::AShr(a, b)),
+        // Int↔float conversions.
+        SpvOp::ConvertSToF => emit_unop_int(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            Op::ConvertSToF),
+        SpvOp::ConvertUToF => emit_unop_int(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            Op::ConvertUToF),
+        SpvOp::ConvertFToS => emit_unop_int(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            Op::ConvertFToS),
+        SpvOp::ConvertFToU => emit_unop_int(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            Op::ConvertFToU),
         SpvOp::FAdd => emit_binop_float(
             spv_inst, types, constants, iface,
             id_map, next_value_id, insts, source_spirv_offset,

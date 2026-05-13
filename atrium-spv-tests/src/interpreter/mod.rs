@@ -571,6 +571,84 @@ impl Interpreter {
                 (a as u64) >  (b as u64)),
             Op::UGreaterThanEqual => self.eval_icmp(inst, values, |a, b|
                 (a as u64) >= (b as u64)),
+            // Bitwise + shifts (i32-width SPIR-V semantics:
+            // shift amount mod 32).
+            Op::BitwiseAnd => self.eval_binop_int(inst, values, |a, b| a & b),
+            Op::BitwiseOr  => self.eval_binop_int(inst, values, |a, b| a | b),
+            Op::BitwiseXor => self.eval_binop_int(inst, values, |a, b| a ^ b),
+            Op::Not        => self.eval_unop_int(inst, values, |a|
+                ((a as i32) ^ -1) as i64),
+            Op::ShiftLeftLogical => self.eval_binop_int(inst, values, |a, b|
+                ((a as i32).wrapping_shl((b & 31) as u32)) as i64),
+            Op::ShiftRightLogical => self.eval_binop_int(inst, values, |a, b|
+                ((a as u32).wrapping_shr((b & 31) as u32)) as i64),
+            Op::ShiftRightArithmetic => self.eval_binop_int(inst, values, |a, b|
+                ((a as i32).wrapping_shr((b & 31) as u32)) as i64),
+            // Int↔float conversions.
+            Op::ConvertSToF => {
+                let result_id = inst.result_id.ok_or_else(||
+                    InterpError::BadConstant(0))?;
+                let src_id = op_id(&inst.operands, 0)?;
+                let src = self.lookup_value(src_id, values)?;
+                let v = match src {
+                    ConstantValue::Int(n) => (n as i32) as f32,
+                    other => return Err(InterpError::UnsupportedOpcode(
+                        format!("ConvertSToF on non-int: {other:?}"))),
+                };
+                values.insert(result_id, ConstantValue::F32(v));
+                Ok(())
+            }
+            Op::ConvertUToF => {
+                let result_id = inst.result_id.ok_or_else(||
+                    InterpError::BadConstant(0))?;
+                let src_id = op_id(&inst.operands, 0)?;
+                let src = self.lookup_value(src_id, values)?;
+                let v = match src {
+                    ConstantValue::Int(n) => (n as u32) as f32,
+                    other => return Err(InterpError::UnsupportedOpcode(
+                        format!("ConvertUToF on non-int: {other:?}"))),
+                };
+                values.insert(result_id, ConstantValue::F32(v));
+                Ok(())
+            }
+            Op::ConvertFToS => {
+                let result_id = inst.result_id.ok_or_else(||
+                    InterpError::BadConstant(0))?;
+                let src_id = op_id(&inst.operands, 0)?;
+                let src = self.lookup_value(src_id, values)?;
+                let v = match src {
+                    ConstantValue::F32(f) => {
+                        if f.is_nan() { 0 } else { f as i32 as i64 }
+                    }
+                    ConstantValue::F64(f) => {
+                        if f.is_nan() { 0 } else { f as i32 as i64 }
+                    }
+                    other => return Err(InterpError::UnsupportedOpcode(
+                        format!("ConvertFToS on non-float: {other:?}"))),
+                };
+                values.insert(result_id, ConstantValue::Int(v));
+                Ok(())
+            }
+            Op::ConvertFToU => {
+                let result_id = inst.result_id.ok_or_else(||
+                    InterpError::BadConstant(0))?;
+                let src_id = op_id(&inst.operands, 0)?;
+                let src = self.lookup_value(src_id, values)?;
+                let v = match src {
+                    ConstantValue::F32(f) => {
+                        if f.is_nan() || f < 0.0 { 0 }
+                        else { f as u32 as i64 }
+                    }
+                    ConstantValue::F64(f) => {
+                        if f.is_nan() || f < 0.0 { 0 }
+                        else { f as u32 as i64 }
+                    }
+                    other => return Err(InterpError::UnsupportedOpcode(
+                        format!("ConvertFToU on non-float: {other:?}"))),
+                };
+                values.insert(result_id, ConstantValue::Int(v));
+                Ok(())
+            }
             Op::FAdd => self.eval_binop_float(inst, values, |a, b| a + b),
             Op::FSub => self.eval_binop_float(inst, values, |a, b| a - b),
             Op::FMul | Op::VectorTimesScalar =>
