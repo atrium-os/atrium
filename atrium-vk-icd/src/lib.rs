@@ -1318,6 +1318,35 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkDevice, u32, u32, u32, *mut u32), FnVoidPtr,
             >(vkGetDeviceGroupPeerMemoryFeatures)),
+        // 1.3 private-data slots + 1.1 device-group cmds + GetDeviceQueue2.
+        "vkCreatePrivateDataSlot" | "vkCreatePrivateDataSlotEXT" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, *const c_void, *const c_void, *mut u64) -> VkResult, FnVoidPtr,
+            >(vkCreatePrivateDataSlot)),
+        "vkDestroyPrivateDataSlot" | "vkDestroyPrivateDataSlotEXT" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, *const c_void), FnVoidPtr,
+            >(vkDestroyPrivateDataSlot)),
+        "vkSetPrivateData" | "vkSetPrivateDataEXT" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u32, u64, u64, u64) -> VkResult, FnVoidPtr,
+            >(vkSetPrivateData)),
+        "vkGetPrivateData" | "vkGetPrivateDataEXT" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u32, u64, u64, *mut u64), FnVoidPtr,
+            >(vkGetPrivateData)),
+        "vkCmdSetDeviceMask" | "vkCmdSetDeviceMaskKHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u32), FnVoidPtr,
+            >(vkCmdSetDeviceMask)),
+        "vkCmdDispatchBase" | "vkCmdDispatchBaseKHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u32, u32, u32, u32, u32, u32), FnVoidPtr,
+            >(vkCmdDispatchBase)),
+        "vkGetDeviceQueue2" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, *const c_void, *mut VkQueue), FnVoidPtr,
+            >(vkGetDeviceQueue2)),
         // 1.2 indirect-count draws — forward to non-Count variants
         // with max_draw_count as the static count.
         "vkCmdDrawIndirectCount" |
@@ -5337,6 +5366,90 @@ pub unsafe extern "C" fn vkCmdPushDescriptorSetWithTemplate(
     _p_data:            *const c_void,
 ) {}
 
+// ── 1.3 private-data slots + 1.1 device-group cmds ──────────────
+//
+// Vulkan 1.3 mandatory: VkPrivateDataSlot lets apps (and
+// validation layers) attach per-handle u64 metadata. Tier-1
+// doesn't ride on the metadata, but the entry points must
+// resolve. We store nothing — Set returns SUCCESS, Get returns
+// 0 (the spec's "never-set" sentinel).
+//
+// Vulkan 1.1 mandatory device-group cmds + GetDeviceQueue2:
+// single-device topology makes device-mask a no-op,
+// DispatchBase forwards to vkCmdDispatch dropping the baseGroup
+// offset (tier-1 doesn't honor it; the shader would have to
+// uniformly add it which we don't run), GetDeviceQueue2 parses
+// VkDeviceQueueInfo2 and forwards to the 1.0 entry.
+
+#[no_mangle]
+pub unsafe extern "C" fn vkCreatePrivateDataSlot(
+    _device:        VkDevice,
+    _p_create_info: *const c_void,
+    _p_allocator:   *const c_void,
+    p_slot:         *mut u64,
+) -> VkResult {
+    if p_slot.is_null() { return VK_ERROR_INITIALIZATION_FAILED; }
+    static NEXT_ID: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(1);
+    *p_slot = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    VK_SUCCESS
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkDestroyPrivateDataSlot(
+    _device: VkDevice, _slot: u64, _p_allocator: *const c_void,
+) {}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkSetPrivateData(
+    _device: VkDevice, _object_type: u32, _object_handle: u64,
+    _slot: u64, _data: u64,
+) -> VkResult { VK_SUCCESS }
+
+#[no_mangle]
+pub unsafe extern "C" fn vkGetPrivateData(
+    _device: VkDevice, _object_type: u32, _object_handle: u64,
+    _slot: u64, p_data: *mut u64,
+) {
+    if !p_data.is_null() { *p_data = 0; }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdSetDeviceMask(
+    _command_buffer: VkCommandBuffer, _device_mask: u32,
+) {}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdDispatchBase(
+    command_buffer:   VkCommandBuffer,
+    _base_group_x:    u32,
+    _base_group_y:    u32,
+    _base_group_z:    u32,
+    group_count_x:    u32,
+    group_count_y:    u32,
+    group_count_z:    u32,
+) {
+    vkCmdDispatch(command_buffer, group_count_x, group_count_y, group_count_z)
+}
+
+/// `vkGetDeviceQueue2` — VkDeviceQueueInfo2 layout (24 bytes):
+///   0  sType, 8 pNext, 16 flags (u32),
+///   20 queueFamilyIndex (u32),
+///   24 queueIndex (u32)
+/// Total alignment-padded to 32. Forward to vkGetDeviceQueue.
+#[no_mangle]
+pub unsafe extern "C" fn vkGetDeviceQueue2(
+    device:       VkDevice,
+    p_queue_info: *const c_void,
+    p_queue:      *mut VkQueue,
+) {
+    if p_queue_info.is_null() || p_queue.is_null() { return; }
+    let b = p_queue_info as *const u8;
+    let family = std::ptr::read_unaligned(b.add(20) as *const u32);
+    let index  = std::ptr::read_unaligned(b.add(24) as *const u32);
+    vkGetDeviceQueue(device, family, index, p_queue)
+}
+
 // ── 1.1 batch bind + device groups ─────────────────────────────
 //
 // vkBindBufferMemory2 / vkBindImageMemory2 are the 1.1
@@ -7275,6 +7388,48 @@ mod tests {
         assert!(props.optimal_tiling_features.is_empty());
         assert!(props.linear_tiling_features.is_empty());
         assert!(props.buffer_features.is_empty());
+    }
+
+    #[test]
+    fn private_data_slot_and_device_group_cmd_stubs_resolve() {
+        for name in [
+            b"vkCreatePrivateDataSlot\0".as_slice(),
+            b"vkCreatePrivateDataSlotEXT\0".as_slice(),
+            b"vkDestroyPrivateDataSlot\0".as_slice(),
+            b"vkDestroyPrivateDataSlotEXT\0".as_slice(),
+            b"vkSetPrivateData\0".as_slice(),
+            b"vkSetPrivateDataEXT\0".as_slice(),
+            b"vkGetPrivateData\0".as_slice(),
+            b"vkGetPrivateDataEXT\0".as_slice(),
+            b"vkCmdSetDeviceMask\0".as_slice(),
+            b"vkCmdSetDeviceMaskKHR\0".as_slice(),
+            b"vkCmdDispatchBase\0".as_slice(),
+            b"vkCmdDispatchBaseKHR\0".as_slice(),
+            b"vkGetDeviceQueue2\0".as_slice(),
+        ] {
+            assert!(lookup(name).is_some(),
+                "must resolve {}",
+                std::str::from_utf8(&name[..name.len()-1]).unwrap());
+        }
+
+        // CreatePrivateDataSlot returns distinct handles.
+        let f = lookup(b"vkCreatePrivateDataSlot\0").unwrap();
+        let g: unsafe extern "C" fn(VkDevice, *const c_void, *const c_void, *mut u64) -> VkResult =
+            unsafe { std::mem::transmute(f) };
+        let mut s1: u64 = 0;
+        let mut s2: u64 = 0;
+        unsafe { g(std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), &mut s1); }
+        unsafe { g(std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), &mut s2); }
+        assert_ne!(s1, 0);
+        assert_ne!(s1, s2);
+
+        // GetPrivateData writes 0 (never-set sentinel).
+        let f = lookup(b"vkGetPrivateData\0").unwrap();
+        let g: unsafe extern "C" fn(VkDevice, u32, u64, u64, *mut u64) =
+            unsafe { std::mem::transmute(f) };
+        let mut v: u64 = 0xdead_beef;
+        unsafe { g(std::ptr::null_mut(), 0, 1, s1, &mut v); }
+        assert_eq!(v, 0);
     }
 
     #[test]
