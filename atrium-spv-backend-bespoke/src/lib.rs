@@ -149,28 +149,27 @@ pub fn compile(module: &Module, target: Target) -> Result<CompileOutput, Backend
 
 /// Emit the ARM64 instruction bytes for one function.
 ///
-/// Phase 3 step 2: supports the constant-vec4 store shape
-/// (the canonical "constant-colour fragment shader"):
-///   ConstFloat × 4 → ConstVec → Store(out, vec) → Return
+/// Phase 3 step 3: scalar f32 ISel.
 ///
-/// Strategy:
-/// * We don't yet have a register allocator. ConstFloat
-///   values are kept as raw f32 bit patterns (no register
-///   assigned until Store time). ConstVec just collects
-///   the lane ValueIds.
-/// * Store onto an Output pointer emits, for each lane:
-///     movz w_tmp, #lo16
-///     movk w_tmp, #hi16, lsl 16
-///     str  w_tmp, [x_out, #(i*4)]
-///   Storing the f32 bit pattern via a w-register instead
-///   of an s-register avoids the fmov dance we'd need if
-///   we were keeping the value in an FP register.
+/// * Every f32 scalar lives in an S-register from creation.
+/// * ConstFloat materialises into a fresh S-reg via the
+///   movz/movk/fmov_s_from_w sequence.
+/// * FAdd / FSub / FMul / FDiv emit the scalar S-reg
+///   form directly (fadd_s / fsub_s / fmul_s / fdiv_s).
+/// * Store of a vec4 onto an Output pointer emits, per
+///   lane: fmov_w_from_s into a scratch w-reg, then
+///   str_w_offset at the per-lane offset.
 /// * Return → `ret`.
 ///
-/// The out-pointer is in `X4` per the AAPCS64 split for
-/// the fragment shader ABI:
-///   X0=in_varyings, X1=uniforms, X2=push_consts,
-///   X3=samples_mask, X4=out_color, X5=out_depth
+/// Register allocation: trivial bump allocator starting
+/// at V16 (caller-saved per AAPCS64, so no prologue
+/// needed). Up to 16 simultaneously-live scalar values
+/// are supported before we run out and return
+/// Unsupported. Step 4 lands a real linear-scan RA.
+///
+/// Fragment shader ABI (AAPCS64 split):
+///   X0=in_varyings X1=uniforms X2=push_consts
+///   X3=samples_mask X4=out_color X5=out_depth
 ///   S0..S3 = frag_coord {x, y, z, w}
 fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
     if func.stage != ShaderStage::Fragment {
@@ -181,13 +180,30 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
         BackendError::Internal("entry block missing".into()))?;
 
     let mut a = asm::Asm::new();
-    let mut scalars: HashMap<ValueId, u32> = HashMap::new();
+    // scalars[id] = Vreg holding the live f32 (S-reg view).
+    let mut scalars: HashMap<ValueId, asm::Vreg> = HashMap::new();
     let mut vectors: HashMap<ValueId, Vec<Value>> = HashMap::new();
 
-    // X4 holds out_color.
+    // X4 holds out_color. Scratch X9/W9 for constant
+    // materialisation + fmov bridging.
     let x_out = asm::Xreg(4);
-    // Scratch W register for constant materialisation.
     let w_tmp = asm::Wreg(9);
+
+    // Trivial register allocator: bump V-reg from V16.
+    // V16..V31 are caller-saved in AAPCS64, so we can use
+    // them without a prologue. 16 slots is enough for any
+    // single-block scalar shader the test harness drives.
+    let mut next_vreg: u8 = 16;
+    let mut alloc_vreg = || -> Result<asm::Vreg, BackendError> {
+        if next_vreg >= 32 {
+            return Err(BackendError::Unsupported(
+                "ran out of scratch V-regs (>16 live scalars); \
+                 linear-scan RA lands in step 4".into()));
+        }
+        let v = asm::Vreg(next_vreg);
+        next_vreg += 1;
+        Ok(v)
+    };
 
     for inst in &block.insts {
         match &inst.op {
@@ -195,51 +211,56 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
                 let bits = (*value as f32).to_bits();
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal("ConstFloat without result".into()))?;
-                scalars.insert(result.id, bits);
+                let v = alloc_vreg()?;
+                materialise_u32_into_w(&mut a, w_tmp, bits);
+                a.emit(asm::fmov_s_from_w(v, w_tmp));
+                scalars.insert(result.id, v);
             }
             Op::ConstVec(elements) => {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal("ConstVec without result".into()))?;
-                // Verify every lane is a known scalar bit
-                // pattern — only the constant case is
-                // supported in step 2.
+                // Verify every lane is a known scalar.
                 for el in elements {
                     if !scalars.contains_key(&el.id) {
                         return Err(BackendError::Unsupported(format!(
-                            "ConstVec lane {:?} is not a known constant scalar; \
-                             step 2 supports constant vecs only",
-                            el.id)));
+                            "ConstVec lane {:?} not in scalars", el.id)));
                     }
                 }
                 vectors.insert(result.id, elements.clone());
             }
+            Op::FAdd(a_v, b_v) => emit_fp_binop_inline(
+                &mut a, &mut scalars, &mut alloc_vreg,
+                inst, a_v, b_v, asm::fadd_s)?,
+            Op::FSub(a_v, b_v) => emit_fp_binop_inline(
+                &mut a, &mut scalars, &mut alloc_vreg,
+                inst, a_v, b_v, asm::fsub_s)?,
+            Op::FMul(a_v, b_v) => emit_fp_binop_inline(
+                &mut a, &mut scalars, &mut alloc_vreg,
+                inst, a_v, b_v, asm::fmul_s)?,
+            Op::FDiv(a_v, b_v) => emit_fp_binop_inline(
+                &mut a, &mut scalars, &mut alloc_vreg,
+                inst, a_v, b_v, asm::fdiv_s)?,
             Op::Store { ptr, value } => {
-                // Pointer must be Output (the only sink in
-                // step 2). The lane bits must be in
-                // `vectors`. Emit movz/movk/str per lane.
                 match &ptr.ty {
                     Type::Pointer(StorageClass::Output, _) => {}
                     other => return Err(BackendError::Unsupported(format!(
-                        "Store target {other:?} not supported in step 2"
-                    ))),
+                        "Store target {other:?} not supported"))),
                 }
                 let lanes = vectors.get(&value.id).ok_or_else(||
                     BackendError::Unsupported(format!(
-                        "Op::Store value {:?} is not a vector; step 2 supports vec stores only",
-                        value.id)))?;
+                        "Op::Store value {:?} is not a vector", value.id)))?;
                 if lanes.len() > 4 {
                     return Err(BackendError::Unsupported(format!(
                         "Store of {}-lane vector not supported", lanes.len())));
                 }
                 for (i, lane) in lanes.iter().enumerate() {
-                    let bits = *scalars.get(&lane.id).ok_or_else(||
+                    let sreg = *scalars.get(&lane.id).ok_or_else(||
                         BackendError::Internal(format!(
-                            "lane {:?} missing", lane.id)))?;
-                    materialise_u32_into_w(&mut a, w_tmp, bits);
-                    // pptk's str_w_offset takes the byte
-                    // offset directly (asserts it's a
-                    // multiple of 4) and scales internally
-                    // to the ARM64 pimm12 field.
+                            "lane {:?} not in scalars", lane.id)))?;
+                    // Move f32 bits S-reg → W-reg, then
+                    // store the W-reg at the per-lane
+                    // offset. (No str_s_offset in pptk yet.)
+                    a.emit(asm::fmov_w_from_s(w_tmp, sreg));
                     let offset_bytes = (i as u16) * 4;
                     a.emit(asm::str_w_offset(w_tmp, x_out, offset_bytes));
                 }
@@ -249,11 +270,35 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
             }
             other => {
                 return Err(BackendError::Unsupported(format!(
-                    "op {other:?} not supported in step 2")));
+                    "op {other:?} not supported")));
             }
         }
     }
     Ok(a.into_bytes())
+}
+
+/// Emit one scalar f32 binary op (fadd/fsub/fmul/fdiv).
+/// Takes `&mut HashMap` for both lookup + insert to keep
+/// the borrow checker happy.
+fn emit_fp_binop_inline(
+    a: &mut asm::Asm,
+    scalars: &mut HashMap<ValueId, asm::Vreg>,
+    alloc_vreg: &mut dyn FnMut() -> Result<asm::Vreg, BackendError>,
+    inst: &atrium_spv_ir::Inst,
+    lhs: &Value,
+    rhs: &Value,
+    make_inst: fn(asm::Vreg, asm::Vreg, asm::Vreg) -> u32,
+) -> Result<(), BackendError> {
+    let result = inst.result.as_ref().ok_or_else(||
+        BackendError::Internal("fp binop without result".into()))?;
+    let l = *scalars.get(&lhs.id).ok_or_else(||
+        BackendError::Internal(format!("fp binop lhs {:?} missing", lhs.id)))?;
+    let r = *scalars.get(&rhs.id).ok_or_else(||
+        BackendError::Internal(format!("fp binop rhs {:?} missing", rhs.id)))?;
+    let d = alloc_vreg()?;
+    a.emit(make_inst(d, l, r));
+    scalars.insert(result.id, d);
+    Ok(())
 }
 
 /// Load a 32-bit immediate into a W register via the
