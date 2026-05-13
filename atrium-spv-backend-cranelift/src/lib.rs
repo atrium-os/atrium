@@ -358,10 +358,67 @@ impl FnTranslator {
                     "ReturnValue not supported in phase 2 v2 (void shaders only)"
                         .to_string()))
             }
+            // ── Float arithmetic (phase 2 v6) ───────────
+            //
+            // Scalar f32 binops: look up both operands
+            // from the scalars map, emit the Cranelift
+            // arithmetic instruction, cache the result.
+            // Vec arithmetic is the next widening; the
+            // bin/unop helper would walk both vectors
+            // lane-by-lane.
+            Op::FAdd(a, b) => self.emit_scalar_binop(
+                builder, &inst.result, a, b, |b, x, y| b.ins().fadd(x, y),
+            ),
+            Op::FSub(a, b) => self.emit_scalar_binop(
+                builder, &inst.result, a, b, |b, x, y| b.ins().fsub(x, y),
+            ),
+            Op::FMul(a, b) => self.emit_scalar_binop(
+                builder, &inst.result, a, b, |b, x, y| b.ins().fmul(x, y),
+            ),
+            Op::FDiv(a, b) => self.emit_scalar_binop(
+                builder, &inst.result, a, b, |b, x, y| b.ins().fdiv(x, y),
+            ),
+            Op::FNeg(a) => {
+                let av = self.scalars.get(&a.id).copied().ok_or_else(||
+                    BackendError::Unsupported(format!(
+                        "FNeg operand id {:?} not in scalars", a.id,
+                    )))?;
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "FNeg without result Value".to_string()))?;
+                let v = builder.ins().fneg(av);
+                self.scalars.insert(result.id, v);
+                Ok(())
+            }
             other => Err(BackendError::Unsupported(format!(
-                "Op {other:?} not supported in phase 2 v2",
+                "Op {other:?} not supported in phase 2 v6",
             ))),
         }
+    }
+
+    /// Helper for scalar f32 binary arithmetic.
+    fn emit_scalar_binop(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        result: &Option<atrium_spv_ir::Value>,
+        a: &atrium_spv_ir::Value,
+        b: &atrium_spv_ir::Value,
+        emit: impl FnOnce(&mut FunctionBuilder, ClifValue, ClifValue) -> ClifValue,
+    ) -> Result<(), BackendError> {
+        let av = self.scalars.get(&a.id).copied().ok_or_else(||
+            BackendError::Unsupported(format!(
+                "binop lhs id {:?} not in scalars", a.id,
+            )))?;
+        let bv = self.scalars.get(&b.id).copied().ok_or_else(||
+            BackendError::Unsupported(format!(
+                "binop rhs id {:?} not in scalars", b.id,
+            )))?;
+        let result = result.as_ref().ok_or_else(||
+            BackendError::Internal(
+                "binop without result Value".to_string()))?;
+        let v = emit(builder, av, bv);
+        self.scalars.insert(result.id, v);
+        Ok(())
     }
 
     /// Map a storage-class pointer type to its Cranelift

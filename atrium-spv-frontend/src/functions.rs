@@ -217,10 +217,160 @@ fn translate_inst(
 
         SpvOp::FunctionEnd => Ok(()),
 
+        // ── Float arithmetic (phase 1 v3) ───────────────
+        //
+        // OpFAdd / OpFSub / OpFMul / OpFDiv / OpFNegate
+        // all share the same shape: result_id +
+        // result_type + N source-value operands.
+        // Scalar f32 only in v3; vec arithmetic comes
+        // next.
+
+        SpvOp::FAdd => emit_binop_float(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::FAdd(a, b),
+        ),
+        SpvOp::FSub => emit_binop_float(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::FSub(a, b),
+        ),
+        SpvOp::FMul => emit_binop_float(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::FMul(a, b),
+        ),
+        SpvOp::FDiv => emit_binop_float(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::FDiv(a, b),
+        ),
+        SpvOp::FNegate => emit_unop_float(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a| Op::FNeg(a),
+        ),
+
+        // OpCompositeConstruct: build a vector (or
+        // matrix; matrices not supported yet) from N
+        // element Values. Per the IR's ConstVec doc:
+        // "elements may be runtime-computed Values, not
+        // just constants" — the name has a Const prefix
+        // for historical reasons but the semantics match
+        // SPIR-V's OpCompositeConstruct exactly.
+        SpvOp::CompositeConstruct => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed(
+                    "CompositeConstruct without result id".to_string()))?;
+            let result_type_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed(
+                    "CompositeConstruct without result type".to_string()))?;
+            let ty = types.get(result_type_id)?.clone();
+            let mut elements = Vec::with_capacity(spv_inst.operands.len());
+            for op in &spv_inst.operands {
+                let elem_id = match op {
+                    Operand::IdRef(id) => *id,
+                    other => return Err(FrontendError::Malformed(format!(
+                        "CompositeConstruct expected IdRef, got {other:?}",
+                    ))),
+                };
+                let v = resolve_value(
+                    elem_id, types, constants, id_map, next_value_id, insts,
+                    source_spirv_offset,
+                )?;
+                elements.push(v);
+            }
+            let result = fresh_value(ty, next_value_id);
+            id_map.insert(result_id, result.clone());
+            insts.push(Inst {
+                op: Op::ConstVec(elements),
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
+
         other => Err(FrontendError::Unsupported(format!(
-            "opcode {other:?} not supported in phase 1 v1",
+            "opcode {other:?} not supported in phase 1 v3",
         ))),
     }
+}
+
+/// Helper: translate a SPIR-V binary float-arithmetic
+/// instruction (FAdd / FSub / FMul / FDiv etc.) into the
+/// equivalent atrium-spv-ir Op via a constructor closure.
+#[allow(clippy::too_many_arguments)]
+fn emit_binop_float(
+    spv_inst: &Instruction,
+    types: &TypeContext,
+    constants: &ConstantContext,
+    iface: &InterfaceContext,
+    id_map: &mut HashMap<Word, Value>,
+    next_value_id: &mut u32,
+    insts: &mut Vec<Inst>,
+    source_spirv_offset: u32,
+    make_op: impl FnOnce(Value, Value) -> Op,
+) -> Result<(), FrontendError> {
+    let _ = iface;
+    let result_id = spv_inst.result_id.ok_or_else(|| FrontendError::Malformed(
+        format!("{:?} without result id", spv_inst.class.opcode)))?;
+    let result_type_id = spv_inst.result_type.ok_or_else(|| FrontendError::Malformed(
+        format!("{:?} without result type", spv_inst.class.opcode)))?;
+    let ty = types.get(result_type_id)?.clone();
+    let lhs_id = expect_id(&spv_inst.operands, 0)?;
+    let rhs_id = expect_id(&spv_inst.operands, 1)?;
+    let lhs = resolve_value(
+        lhs_id, types, constants, id_map, next_value_id, insts,
+        source_spirv_offset,
+    )?;
+    let rhs = resolve_value(
+        rhs_id, types, constants, id_map, next_value_id, insts,
+        source_spirv_offset,
+    )?;
+    let result = fresh_value(ty, next_value_id);
+    id_map.insert(result_id, result.clone());
+    insts.push(Inst {
+        op: make_op(lhs, rhs),
+        result: Some(result),
+        source_spirv_offset,
+    });
+    Ok(())
+}
+
+/// Helper: translate a SPIR-V unary float-arithmetic
+/// instruction (FNegate) into the equivalent
+/// atrium-spv-ir Op.
+#[allow(clippy::too_many_arguments)]
+fn emit_unop_float(
+    spv_inst: &Instruction,
+    types: &TypeContext,
+    constants: &ConstantContext,
+    iface: &InterfaceContext,
+    id_map: &mut HashMap<Word, Value>,
+    next_value_id: &mut u32,
+    insts: &mut Vec<Inst>,
+    source_spirv_offset: u32,
+    make_op: impl FnOnce(Value) -> Op,
+) -> Result<(), FrontendError> {
+    let _ = iface;
+    let result_id = spv_inst.result_id.ok_or_else(|| FrontendError::Malformed(
+        format!("{:?} without result id", spv_inst.class.opcode)))?;
+    let result_type_id = spv_inst.result_type.ok_or_else(|| FrontendError::Malformed(
+        format!("{:?} without result type", spv_inst.class.opcode)))?;
+    let ty = types.get(result_type_id)?.clone();
+    let src_id = expect_id(&spv_inst.operands, 0)?;
+    let src = resolve_value(
+        src_id, types, constants, id_map, next_value_id, insts,
+        source_spirv_offset,
+    )?;
+    let result = fresh_value(ty, next_value_id);
+    id_map.insert(result_id, result.clone());
+    insts.push(Inst {
+        op: make_op(src),
+        result: Some(result),
+        source_spirv_offset,
+    });
+    Ok(())
 }
 
 /// Resolve a SPIR-V id → IR Value, materialising a

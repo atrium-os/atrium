@@ -402,8 +402,99 @@ impl Interpreter {
             // as block.label, not in instructions, but
             // older parses might leave it. No-op either way.
             Op::Label | Op::Nop => Ok(()),
+            // ── Float arithmetic ──────────────────────────
+            Op::FAdd => self.eval_binop_float(inst, values, |a, b| a + b),
+            Op::FSub => self.eval_binop_float(inst, values, |a, b| a - b),
+            Op::FMul => self.eval_binop_float(inst, values, |a, b| a * b),
+            Op::FDiv => self.eval_binop_float(inst, values, |a, b| a / b),
+            Op::FNegate => self.eval_unop_float(inst, values, |a| -a),
+            // OpCompositeConstruct: pack N source values
+            // into a Vec.
+            Op::CompositeConstruct => {
+                let result_id = inst.result_id.ok_or_else(||
+                    InterpError::BadConstant(0))?;
+                let mut elements = Vec::with_capacity(inst.operands.len());
+                for op in &inst.operands {
+                    let id = match op {
+                        rspirv::dr::Operand::IdRef(id) => *id,
+                        _ => return Err(InterpError::ParseFailed(
+                            "CompositeConstruct expected IdRef".to_string())),
+                    };
+                    elements.push(self.lookup_value(id, values)?);
+                }
+                values.insert(result_id, ConstantValue::Vec(elements));
+                Ok(())
+            }
             other => Err(InterpError::UnsupportedOpcode(format!("{:?}", other))),
         }
+    }
+
+    /// Evaluate a SPIR-V scalar float-arithmetic binop
+    /// (FAdd / FSub / FMul / FDiv).
+    fn eval_binop_float(
+        &self,
+        inst: &Instruction,
+        values: &mut HashMap<Word, ConstantValue>,
+        op: impl FnOnce(f64, f64) -> f64,
+    ) -> Result<(), InterpError> {
+        let result_id = inst.result_id.ok_or_else(||
+            InterpError::BadConstant(0))?;
+        let lhs_id = op_id(&inst.operands, 0)?;
+        let rhs_id = op_id(&inst.operands, 1)?;
+        let lhs = self.lookup_value(lhs_id, values)?;
+        let rhs = self.lookup_value(rhs_id, values)?;
+        let (lhs_f, rhs_f) = match (&lhs, &rhs) {
+            (ConstantValue::F32(a), ConstantValue::F32(b)) =>
+                (*a as f64, *b as f64),
+            (ConstantValue::F64(a), ConstantValue::F64(b)) =>
+                (*a, *b),
+            (ConstantValue::F32(a), ConstantValue::F64(b)) =>
+                (*a as f64, *b),
+            (ConstantValue::F64(a), ConstantValue::F32(b)) =>
+                (*a, *b as f64),
+            _ => return Err(InterpError::UnsupportedOpcode(format!(
+                "float binop on non-float operands: {lhs:?}, {rhs:?}",
+            ))),
+        };
+        let result = op(lhs_f, rhs_f);
+        // Reuse the wider of the input widths. Phase 1 v3
+        // only handles f32 so far, but the test currently
+        // passes f32 in (so the result narrows back).
+        let stored = match (&lhs, &rhs) {
+            (ConstantValue::F64(_), _) | (_, ConstantValue::F64(_)) =>
+                ConstantValue::F64(result),
+            _ => ConstantValue::F32(result as f32),
+        };
+        values.insert(result_id, stored);
+        Ok(())
+    }
+
+    /// Evaluate a SPIR-V scalar float-arithmetic unop
+    /// (FNegate).
+    fn eval_unop_float(
+        &self,
+        inst: &Instruction,
+        values: &mut HashMap<Word, ConstantValue>,
+        op: impl FnOnce(f64) -> f64,
+    ) -> Result<(), InterpError> {
+        let result_id = inst.result_id.ok_or_else(||
+            InterpError::BadConstant(0))?;
+        let src_id = op_id(&inst.operands, 0)?;
+        let src = self.lookup_value(src_id, values)?;
+        let src_f = match &src {
+            ConstantValue::F32(a) => *a as f64,
+            ConstantValue::F64(a) => *a,
+            _ => return Err(InterpError::UnsupportedOpcode(format!(
+                "float unop on non-float operand: {src:?}",
+            ))),
+        };
+        let result = op(src_f);
+        let stored = match &src {
+            ConstantValue::F64(_) => ConstantValue::F64(result),
+            _ => ConstantValue::F32(result as f32),
+        };
+        values.insert(result_id, stored);
+        Ok(())
     }
 
     fn lookup_value(
