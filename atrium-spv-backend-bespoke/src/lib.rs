@@ -183,6 +183,12 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
     let mut vectors: HashMap<ValueId, Vec<Value>> = HashMap::new();
     // Pointer-typed Values: (base X-reg, byte offset).
     let mut pointers: HashMap<ValueId, (asm::Xreg, i32)> = HashMap::new();
+    // Bool-typed Values (results of FOrd*/FUnord*): held
+    // in a W-reg as i32 0/1 per constraint B4. Allocated
+    // from a tiny separate pool W10..W15 — bools are rare
+    // and short-lived, so no reuse needed yet.
+    let mut bools: HashMap<ValueId, asm::Wreg> = HashMap::new();
+    let mut next_bool_w: u8 = 10;
 
     // X4 holds out_color. Scratch X9/W9 for constant
     // materialisation + fmov bridging.
@@ -234,6 +240,10 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
     // Pending `b imm26` relocations: (asm_byte_offset of
     // the placeholder instruction, target BlockId).
     let mut branch_relocs: Vec<(usize, BlockId)> = Vec::new();
+    // Pending `b.cond imm19` relocations: same shape.
+    // We always emit b.cond.NE (taken if W-bool != 0)
+    // so re-patching only needs the imm19 update.
+    let mut cond_branch_relocs: Vec<(usize, BlockId)> = Vec::new();
 
     let mut flat_i: usize = 0;
     for bid in &block_order {
@@ -286,6 +296,25 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
                 }
                 vectors.insert(result.id, elements.clone());
             }
+            // Float compares → Bool (i32 0/1 in a W-reg).
+            Op::FOrdEq(a_v, b_v) => emit_fcmp_to_bool(
+                &mut a, &scalars, &mut bools, &mut next_bool_w,
+                inst, a_v, b_v, asm::Cond::Eq)?,
+            Op::FOrdNe(a_v, b_v) => emit_fcmp_to_bool(
+                &mut a, &scalars, &mut bools, &mut next_bool_w,
+                inst, a_v, b_v, asm::Cond::Ne)?,
+            Op::FOrdLt(a_v, b_v) => emit_fcmp_to_bool(
+                &mut a, &scalars, &mut bools, &mut next_bool_w,
+                inst, a_v, b_v, asm::Cond::Mi)?,
+            Op::FOrdLe(a_v, b_v) => emit_fcmp_to_bool(
+                &mut a, &scalars, &mut bools, &mut next_bool_w,
+                inst, a_v, b_v, asm::Cond::Ls)?,
+            Op::FOrdGt(a_v, b_v) => emit_fcmp_to_bool(
+                &mut a, &scalars, &mut bools, &mut next_bool_w,
+                inst, a_v, b_v, asm::Cond::Gt)?,
+            Op::FOrdGe(a_v, b_v) => emit_fcmp_to_bool(
+                &mut a, &scalars, &mut bools, &mut next_bool_w,
+                inst, a_v, b_v, asm::Cond::Ge)?,
             Op::FAdd(a_v, b_v) => emit_fp_binop_with_pool(
                 &mut a, &mut scalars, &mut free_pool, &mut owners,
                 inst, a_v, b_v, asm::fadd_s)?,
@@ -399,6 +428,22 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
                 a.emit(asm::b(0));
                 branch_relocs.push((patch_off, *target));
             }
+            Op::BranchCond { cond, t_block, f_block } => {
+                let w_bool = *bools.get(&cond.id).ok_or_else(||
+                    BackendError::Unsupported(format!(
+                        "BranchCond cond {:?} is not a known Bool W-reg",
+                        cond.id)))?;
+                // cmp w_bool, #0  → flags reflect zero-ness
+                a.emit(asm::cmp_imm_w(w_bool, 0));
+                // b.ne t_block (taken if w_bool != 0).
+                let patch_t = a.len();
+                a.emit(asm::b_cond(asm::Cond::Ne, 0));
+                cond_branch_relocs.push((patch_t, *t_block));
+                // Unconditional fallthrough to f_block.
+                let patch_f = a.len();
+                a.emit(asm::b(0));
+                branch_relocs.push((patch_f, *f_block));
+            }
             other => {
                 return Err(BackendError::Unsupported(format!(
                     "op {other:?} not supported")));
@@ -430,6 +475,24 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
                 "branch delta {delta_insts} exceeds imm26 range")));
         }
         a.patch(*patch_off, asm::b(delta_insts));
+    }
+
+    // Conditional-branch fixup (imm19, ±2^18 insts).
+    for (patch_off, target_bid) in &cond_branch_relocs {
+        let target_byte = *block_asm_offset.get(target_bid).ok_or_else(||
+            BackendError::Internal(format!(
+                "cond branch target {target_bid:?} has no asm offset")))?;
+        let delta_bytes = target_byte as i64 - *patch_off as i64;
+        if delta_bytes % 4 != 0 {
+            return Err(BackendError::Internal(
+                "cond branch delta not 4-aligned".into()));
+        }
+        let delta_insts = (delta_bytes / 4) as i32;
+        if !(-(1 << 18)..(1 << 18)).contains(&delta_insts) {
+            return Err(BackendError::Unsupported(format!(
+                "cond-branch delta {delta_insts} exceeds imm19 range")));
+        }
+        a.patch(*patch_off, asm::b_cond(asm::Cond::Ne, delta_insts));
     }
 
     Ok(a.into_bytes())
@@ -488,6 +551,39 @@ fn emit_load_f32_offset(
     Ok(())
 }
 
+/// Emit `fcmp_s + cset_w` for a float comparison.
+/// Materialises Bool (i32 0/1) into a fresh W-reg drawn
+/// from the bool pool (W10..W15). Subsequent Op::BranchCond
+/// can test it via `cmp w, #0; b.ne target`.
+#[allow(clippy::too_many_arguments)]
+fn emit_fcmp_to_bool(
+    a: &mut asm::Asm,
+    scalars: &HashMap<ValueId, asm::Vreg>,
+    bools: &mut HashMap<ValueId, asm::Wreg>,
+    next_bool_w: &mut u8,
+    inst: &atrium_spv_ir::Inst,
+    lhs: &Value,
+    rhs: &Value,
+    cond: asm::Cond,
+) -> Result<(), BackendError> {
+    let result = inst.result.as_ref().ok_or_else(||
+        BackendError::Internal("fcmp without result".into()))?;
+    let l = *scalars.get(&lhs.id).ok_or_else(||
+        BackendError::Internal(format!("fcmp lhs {:?} missing", lhs.id)))?;
+    let r = *scalars.get(&rhs.id).ok_or_else(||
+        BackendError::Internal(format!("fcmp rhs {:?} missing", rhs.id)))?;
+    if *next_bool_w >= 16 {
+        return Err(BackendError::Unsupported(
+            "ran out of Bool W-regs (W10..W15 exhausted)".into()));
+    }
+    let w_bool = asm::Wreg(*next_bool_w);
+    *next_bool_w += 1;
+    a.emit(asm::fcmp_s(l, r));
+    a.emit(asm::cset_w(w_bool, cond));
+    bools.insert(result.id, w_bool);
+    Ok(())
+}
+
 /// Linear-scan allocator helper: take one V-reg from the
 /// free pool, remember which value owns it. Returns
 /// Unsupported when the pool is empty (spilling lands
@@ -531,6 +627,12 @@ fn compute_last_use_flat(insts: &[&atrium_spv_ir::Inst]) -> HashMap<ValueId, usi
                 mark(l.id); mark(r.id);
             }
             Op::FNeg(s) => mark(s.id),
+            Op::FOrdEq(l, r) | Op::FOrdNe(l, r)
+            | Op::FOrdLt(l, r) | Op::FOrdLe(l, r)
+            | Op::FOrdGt(l, r) | Op::FOrdGe(l, r) => {
+                mark(l.id); mark(r.id);
+            }
+            Op::BranchCond { cond, .. } => mark(cond.id),
             Op::AccessChain { base: _, byte_offset: _ } => {
                 // Base is a pointer Value, not a scalar —
                 // no V-reg liveness implication.
