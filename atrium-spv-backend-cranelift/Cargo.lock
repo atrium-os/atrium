@@ -26,6 +26,7 @@ version = "0.1.0"
 dependencies = [
  "atrium-spv-frontend",
  "atrium-spv-ir",
+ "atrium-spv-pcmap",
  "atrium-spv-tests",
  "cranelift-codegen",
  "cranelift-frontend",
@@ -47,6 +48,10 @@ dependencies = [
 
 [[package]]
 name = "atrium-spv-ir"
+version = "0.1.0"
+
+[[package]]
+name = "atrium-spv-pcmap"
 version = "0.1.0"
 
 [[package]]

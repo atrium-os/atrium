@@ -132,8 +132,9 @@ fn cranelift_shader_dlopens_and_writes_expected_rgba() {
     // Frontend.
     let module = translate(&spirv).expect("frontend must accept the shader");
     // Backend → object bytes.
-    let object_bytes = compile(&module, Target::host())
+    let output = compile(&module, Target::host())
         .expect("backend must compile the shader");
+    let object_bytes = output.object;
 
     // Write object bytes to tempfile, link into a .dylib /
     // .so via `cc`.
@@ -210,7 +211,7 @@ fn cranelift_shader_dlopens_and_writes_different_rgba() {
     let rgba = [0.2, 0.7, 0.1, 0.9];
     let spirv = build_constant_color_spirv(rgba);
     let module = translate(&spirv).unwrap();
-    let object_bytes = compile(&module, Target::host()).unwrap();
+    let object_bytes = compile(&module, Target::host()).unwrap().object;
 
     let dir = TempDir::new().unwrap();
     let obj_path = dir.path().join("shader.o");

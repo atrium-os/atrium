@@ -67,7 +67,8 @@ fn frontend_to_backend_constant_color() {
 
     // Backend.
     let object_bytes = compile(&module, Target::host())
-        .expect("backend must compile the IR");
+        .expect("backend must compile the IR")
+        .object;
 
     // Sanity: valid object-file magic + symbol present.
     assert!(!object_bytes.is_empty());
@@ -95,6 +96,33 @@ fn frontend_to_backend_constant_color() {
         "object bytes look suspiciously short ({} bytes); \
          may indicate empty function body",
         object_bytes.len());
+}
+
+#[test]
+fn compile_emits_a_parseable_pcmap_sidecar() {
+    // The CompileOutput.pcmap bytes must be a well-formed
+    // atrium-spv-pcmap v1 sidecar. Cranelift's pcmap is
+    // function-granularity: one entry per Function in the
+    // module, host_offset=0, spirv_offset=first inst's
+    // source_spirv_offset. Phase 1 v1 always sets the
+    // latter to 0 (placeholder); we assert the structural
+    // properties regardless.
+    let spirv = build_constant_color_spirv([0.1, 0.2, 0.3, 0.4]);
+    let module = atrium_spv_frontend::translate(&spirv).unwrap();
+    let output = compile(&module, Target::host()).unwrap();
+
+    // Parse the sidecar; it must round-trip.
+    let pcmap = atrium_spv_pcmap::PcMap::from_bytes(&output.pcmap)
+        .expect("pcmap sidecar must parse");
+    assert_eq!(pcmap.entries().len(), module.functions.len(),
+        "expected one pcmap entry per IR function");
+    // Every entry's host_offset is 0 (function-relative)
+    // per the Cranelift backend's documented granularity.
+    for e in pcmap.entries() {
+        assert_eq!(e.host_offset, 0,
+            "Cranelift pcmap entries are function-relative; expected host_offset=0, got {}",
+            e.host_offset);
+    }
 }
 
 #[test]
@@ -139,6 +167,6 @@ fn empty_module_still_produces_valid_object() {
         vertex_inputs: Vec::new(),
         varyings: Vec::new(),
     };
-    let bytes = compile(&module, Target::host()).unwrap();
-    assert!(!bytes.is_empty());
+    let output = compile(&module, Target::host()).unwrap();
+    assert!(!output.object.is_empty());
 }

@@ -10,7 +10,8 @@ description = "Cranelift backend for tier-2 software Vulkan. Translates atrium-s
 path = "src/lib.rs"
 
 [dependencies]
-atrium-spv-ir = { path = "../atrium-spv-ir" }
+atrium-spv-ir       = { path = "../atrium-spv-ir" }
+atrium-spv-pcmap    = { path = "../atrium-spv-pcmap" }
 cranelift-codegen   = { version = "0.131", features = ["std"] }
 cranelift-module    = { version = "0.131", features = ["std"] }
 cranelift-object    = "0.131"
@@ -19,6 +20,7 @@ target-lexicon      = "0.13"
 
 [dev-dependencies]
 atrium-spv-frontend = { path = "../atrium-spv-frontend" }
+atrium-spv-pcmap    = { path = "../atrium-spv-pcmap" }
 atrium-spv-tests    = { path = "../atrium-spv-tests" }
 rspirv              = "0.13"
 libloading          = "0.8"

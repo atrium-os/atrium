@@ -98,19 +98,45 @@ impl Target {
     }
 }
 
-/// Compile an atrium-spv-ir module to a native object file.
+/// Result of compiling a module.
 ///
-/// Returns the raw object bytes (suitable for passing to
-/// `ld` for the final link into a `.so`). The bytes start
-/// with the target's object-format magic (Mach-O on
-/// Darwin, ELF on FreeBSD/Linux).
+/// `object` is the raw object-file bytes ready to pass
+/// to `ld` (production) or `cc -shared`/`-dynamiclib`
+/// (test harness) for the final `.so` link.
 ///
-/// On unsupported IR shapes (which phase 2 v1 mostly is),
-/// returns [`BackendError::Unsupported`]. The
-/// `atrium-spv-compile` driver interprets that as "fall
-/// back to bespoke" in the production path, or
-/// "skip this runner" in the test harness.
-pub fn compile(module: &Module, target: Target) -> Result<Vec<u8>, BackendError> {
+/// `pcmap` is the serialized [`atrium_spv_pcmap`] sidecar.
+/// Per spec §10.1, the Cranelift backend produces a
+/// function-granularity map (one entry per function start)
+/// rather than per-instruction. Cranelift's emission API
+/// doesn't expose per-instruction host PCs at the
+/// granularity our IR's `source_spirv_offset` field
+/// targets. The bespoke backend (phase 3+) emits the
+/// fine-grained map by virtue of controlling every
+/// instruction byte directly.
+///
+/// For shaders compiled via this backend, crash triage
+/// can attribute a faulting host PC to the containing
+/// function via `dlsym` + symbol table, then use the
+/// pcmap to find the SPIR-V offset where that function
+/// started. Better than a raw native PC; worse than the
+/// instruction-level map the bespoke backend will give us.
+#[derive(Debug, Clone)]
+pub struct CompileOutput {
+    /// Object-file bytes.
+    pub object: Vec<u8>,
+    /// PC-map sidecar bytes (atrium-spv-pcmap format v1).
+    pub pcmap: Vec<u8>,
+}
+
+/// Compile an atrium-spv-ir module to a native object
+/// file + PC-map sidecar.
+///
+/// On unsupported IR shapes, returns
+/// [`BackendError::Unsupported`]. The `atrium-spv-compile`
+/// driver interprets that as "fall back to bespoke" in
+/// the production path, or "skip this runner" in the
+/// test harness.
+pub fn compile(module: &Module, target: Target) -> Result<CompileOutput, BackendError> {
     // ── 1. Set up the target ISA ────────────────────────────
     let triple: Triple = target.triple().parse()
         .map_err(|e| BackendError::Internal(format!("triple parse: {e}")))?;
@@ -128,16 +154,55 @@ pub fn compile(module: &Module, target: Target) -> Result<Vec<u8>, BackendError>
     ).map_err(|e| BackendError::Internal(format!("ObjectBuilder: {e}")))?;
     let mut clif_module = ObjectModule::new(builder);
 
-    // ── 3. Emit each function ──────────────────────────────
+    // ── 3. Emit each function + build the pcmap ────────────
+    //
+    // Cranelift's emission API doesn't surface per-host-
+    // instruction source-loc → PC mapping cleanly at this
+    // version, so the pcmap is function-granularity only.
+    // For each atrium-spv-ir function we record one entry
+    // whose host_offset is 0 (function-relative — the
+    // daemon resolves which function via dlsym first) and
+    // whose spirv_offset is the first IR instruction's
+    // source_spirv_offset.
+    //
+    // Today every IR Inst has source_spirv_offset = 0
+    // (the frontend phase 1 v1 placeholder, to be wired
+    // properly in phase 1 v2 via an rspirv Consumer
+    // adapter). So the pcmap entries all show 0; the
+    // shape is correct + the data lands when the frontend
+    // starts emitting real offsets.
+    let mut pcmap = atrium_spv_pcmap::Builder::new();
     for func in &module.functions {
         emit_function(&mut clif_module, func)?;
+        // Add a pcmap entry for this function's start.
+        // host_offset stays at 0 — function-relative;
+        // production crash handlers resolve which function
+        // via dlsym first and consult the pcmap second.
+        let first_spirv_offset = module.functions
+            .iter()
+            .find(|f| f.name == func.name)
+            .and_then(|f| f.blocks.get(&f.entry_block))
+            .and_then(|b| b.insts.first())
+            .map(|i| i.source_spirv_offset)
+            .unwrap_or(0);
+        // For multi-function modules every entry currently
+        // has host_offset=0 (we don't have real per-
+        // function host PCs from Cranelift). The pcmap
+        // format tolerates duplicate host_offsets per
+        // atrium_spv_pcmap::PcMap's `lookup` contract;
+        // for phase 2 v4 we accept that lookup returns
+        // the last-recorded entry. Future work: switch
+        // to one pcmap per .so symbol when the production
+        // dispatcher needs per-function distinction.
+        pcmap.push(0, first_spirv_offset);
     }
 
     // ── 4. Finalise and emit bytes ─────────────────────────
     let product = clif_module.finish();
-    let bytes = product.emit()
+    let object = product.emit()
         .map_err(|e| BackendError::Internal(format!("object emit: {e}")))?;
-    Ok(bytes)
+    let pcmap = pcmap.finish_to_bytes();
+    Ok(CompileOutput { object, pcmap })
 }
 
 /// Emit one function body.

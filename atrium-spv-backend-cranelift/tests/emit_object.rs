@@ -73,7 +73,8 @@ fn compile_produces_object_bytes_with_target_magic() {
     // Darwin-ARM64 (the dev host) when running on macOS.
     let target = Target::host();
     let bytes = compile(&module, target)
-        .expect("compile should succeed for an empty Fragment function");
+        .expect("compile should succeed for an empty Fragment function")
+        .object;
 
     assert!(!bytes.is_empty(), "expected non-empty object output");
 
@@ -97,7 +98,7 @@ fn compile_emits_atrium_fs_main_symbol() {
     // using the shader-ABI name regardless of the
     // atrium-spv-ir Function's own `name` field.
     let module = build_minimal_fragment_module();
-    let bytes = compile(&module, Target::host()).unwrap();
+    let bytes = compile(&module, Target::host()).unwrap().object;
     let needle = b"atrium_fs_main";
     let found = bytes.windows(needle.len()).any(|w| w == needle);
     assert!(found, "symbol 'atrium_fs_main' not found in object bytes");
@@ -108,7 +109,7 @@ fn vertex_stage_emits_atrium_vs_main_symbol() {
     let mut module = build_minimal_fragment_module();
     module.functions[0].stage = ShaderStage::Vertex;
     module.entry_points[0].stage = ShaderStage::Vertex;
-    let bytes = compile(&module, Target::host()).unwrap();
+    let bytes = compile(&module, Target::host()).unwrap().object;
     assert!(bytes.windows(b"atrium_vs_main".len())
             .any(|w| w == b"atrium_vs_main"));
 }
@@ -118,7 +119,7 @@ fn compute_stage_emits_atrium_cs_main_symbol() {
     let mut module = build_minimal_fragment_module();
     module.functions[0].stage = ShaderStage::Compute;
     module.entry_points[0].stage = ShaderStage::Compute;
-    let bytes = compile(&module, Target::host()).unwrap();
+    let bytes = compile(&module, Target::host()).unwrap().object;
     assert!(bytes.windows(b"atrium_cs_main".len())
             .any(|w| w == b"atrium_cs_main"));
 }
