@@ -53,9 +53,20 @@ sha2           = "0.10"
 # to the binary.
 serde_json     = "1"
 
+# Tier-2 (v5c+): software shader execution. The loader is responsible
+# for SPIR-V → IR → .so AOT compile + dlopen; aqueduct-gpu-host wraps
+# it in a Tier-2 shader registry that the eventual Tier2Backend will
+# consume.
+atrium-spv-loader = { path = "../atrium-spv-loader" }
+
 
 [dev-dependencies]
 aqueduct-gpu-client = { path = "../aqueduct-gpu-client" }
+# Tier-2 registry integration test: build a SPIR-V shader,
+# register it via Tier2Registry, dlopen + call.
+rspirv          = "0.13"
+tempfile        = "3"
+atrium-spv-ir   = { path = "../atrium-spv-ir" }
 
 [features]
 default = []

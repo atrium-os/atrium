@@ -111,13 +111,17 @@ dependencies = [
  "aqueduct-gpu",
  "aqueduct-gpu-client",
  "ash",
+ "atrium-spv-ir",
+ "atrium-spv-loader",
  "env_logger",
  "log",
  "postcard",
+ "rspirv",
  "serde",
  "serde_json",
  "sha2",
  "spirv-tools",
+ "tempfile",
  "thiserror 1.0.69",
  "tiny-skia",
 ]
@@ -151,6 +155,23 @@ checksum = "8cf2bce30dfe09ef0bfaef228b9d414faaf7e563035494d7fe092dba54b300f4"
 dependencies = [
  "critical-section",
 ]
+
+[[package]]
+name = "atrium-spv-ir"
+version = "0.1.0"
+
+[[package]]
+name = "atrium-spv-loader"
+version = "0.1.0"
+dependencies = [
+ "atrium-spv-pcmap",
+ "libloading",
+ "sha2",
+]
+
+[[package]]
+name = "atrium-spv-pcmap"
+version = "0.1.0"
 
 [[package]]
 name = "bitflags"
@@ -675,6 +696,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
+name = "rspirv"
+version = "0.13.0+sdk-1.4.341.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "091dca2e1d6fd3098417b5ec88e77e80d1ba5945750943419dc976858082c296"
+dependencies = [
+ "rustc-hash",
+ "spirv",
+]
+
+[[package]]
+name = "rustc-hash"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
+
+[[package]]
 name = "rustc_version"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -781,6 +818,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
 dependencies = [
  "lock_api",
+]
+
+[[package]]
+name = "spirv"
+version = "0.4.0+sdk-1.4.341.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d9571ea910ebd84c86af4b3ed27f9dbdc6ad06f17c5f96146b2b671e2976744f"
+dependencies = [
+ "bitflags 2.11.1",
 ]
 
 [[package]]
