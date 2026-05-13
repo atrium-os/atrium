@@ -416,6 +416,7 @@ impl Interpreter {
         // terminator (OpBranch / OpBranchConditional /
         // OpReturn / OpKill etc.); we follow it.
         let mut current_idx: usize = 0;
+        let mut prev_label: Option<Word> = None;
         let mut hops: u32 = 0;
         const MAX_HOPS: u32 = 1024;
         loop {
@@ -429,9 +430,41 @@ impl Interpreter {
                 InterpError::UnsupportedControlFlow(format!(
                     "block index {current_idx} out of range",
                 )))?;
-            // Run every non-terminator inst.
+            let current_label = block.label.as_ref()
+                .and_then(|l| l.result_id);
+
+            // Resolve any leading OpPhi instructions using
+            // prev_label to pick the right arm.
+            let mut phi_count = 0;
+            for inst in &block.instructions {
+                if inst.class.opcode != Op::Phi { break; }
+                let result_id = inst.result_id.ok_or_else(||
+                    InterpError::BadConstant(0))?;
+                // Walk arm pairs.
+                let mut chosen: Option<ConstantValue> = None;
+                let mut j = 0;
+                while j + 1 < inst.operands.len() {
+                    let val_id = op_id(&inst.operands, j)?;
+                    let parent  = op_id(&inst.operands, j+1)?;
+                    if Some(parent) == prev_label {
+                        chosen = Some(self.lookup_value(val_id, &values)?);
+                        break;
+                    }
+                    j += 2;
+                }
+                let chosen = chosen.ok_or_else(||
+                    InterpError::UnsupportedControlFlow(format!(
+                        "OpPhi in block {current_label:?} has no arm \
+                         matching prev block {prev_label:?}",
+                    )))?;
+                values.insert(result_id, chosen);
+                phi_count += 1;
+            }
+
+            // Run every non-terminator, non-phi inst.
             let last_idx = block.instructions.len().saturating_sub(1);
             for (i, inst) in block.instructions.iter().enumerate() {
+                if i < phi_count { continue; }
                 if i == last_idx { break; }
                 self.eval_inst(inst, &mut values, &mut storage, inputs)?;
             }
@@ -443,6 +476,7 @@ impl Interpreter {
                 | Op::Unreachable => break,
                 Op::Branch => {
                     let label = op_id(&term.operands, 0)?;
+                    prev_label = current_label;
                     current_idx = self.find_block_index(func, label)?;
                 }
                 Op::BranchConditional => {
@@ -457,6 +491,7 @@ impl Interpreter {
                             format!("BranchConditional cond: {other:?}"))),
                     };
                     let target = if taken { t_label } else { f_label };
+                    prev_label = current_label;
                     current_idx = self.find_block_index(func, target)?;
                 }
                 Op::SelectionMerge | Op::LoopMerge =>

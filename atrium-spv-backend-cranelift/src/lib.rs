@@ -274,11 +274,37 @@ fn emit_function(
 
         // Walk every IR block in id order, switching the
         // builder to the Cranelift block for each. The
-        // terminator (Branch / BranchCond / Return) emits
-        // the right Cranelift control-flow instruction.
+        // terminator (Branch / BranchCond / Return) is
+        // emitted here directly so it can pass Phi-arm
+        // block-args to its target(s).
         let mut block_ids: Vec<atrium_spv_ir::BlockId> =
             func.blocks.keys().copied().collect();
         block_ids.sort_by_key(|b| b.0);
+
+        // First pass: declare Cranelift block params for
+        // every leading Op::Phi in non-entry blocks. Done
+        // before the second pass emits branches so target
+        // block params already exist when we generate the
+        // `jump` / `brif` call sites.
+        for id in &block_ids {
+            if *id == func.entry_block { continue; }
+            let block = func.blocks.get(id).unwrap();
+            let cl_block = *translator.block_map.get(id).unwrap();
+            for inst in &block.insts {
+                let result = match &inst.op {
+                    Op::Phi(_) => match inst.result.as_ref() {
+                        Some(r) => r,
+                        None => continue,
+                    },
+                    _ => break, // Phi must lead its block
+                };
+                declare_phi_block_param(
+                    cl_block, result, &mut builder, &mut translator,
+                )?;
+            }
+        }
+
+        // Second pass: emit instructions + branches.
         for id in &block_ids {
             let block = func.blocks.get(id).ok_or_else(||
                 BackendError::Internal(format!("missing block {id:?}")))?;
@@ -289,6 +315,42 @@ fn emit_function(
             }
             for inst in &block.insts {
                 translator.emit_inst(inst, &mut builder)?;
+                // Terminator: emit the right Cranelift
+                // control-flow op AFTER emit_inst (which
+                // is a no-op for these). Collect any
+                // phi-args for the target block(s).
+                match &inst.op {
+                    Op::Branch(target) => {
+                        let args = collect_phi_args(
+                            *target, *id, func, &translator)?;
+                        let cl_target = *translator.block_map
+                            .get(target).unwrap();
+                        let bargs: Vec<cranelift_codegen::ir::BlockArg> =
+                            args.into_iter().map(Into::into).collect();
+                        builder.ins().jump(cl_target, &bargs);
+                    }
+                    Op::BranchCond { cond, t_block, f_block } => {
+                        let cv = translator.scalars.get(&cond.id)
+                            .copied()
+                            .ok_or_else(|| BackendError::Internal(format!(
+                                "BranchCond cond {:?} not in scalars",
+                                cond.id)))?;
+                        let t_args = collect_phi_args(
+                            *t_block, *id, func, &translator)?;
+                        let f_args = collect_phi_args(
+                            *f_block, *id, func, &translator)?;
+                        let cl_t = *translator.block_map
+                            .get(t_block).unwrap();
+                        let cl_f = *translator.block_map
+                            .get(f_block).unwrap();
+                        let t_bargs: Vec<cranelift_codegen::ir::BlockArg> =
+                            t_args.into_iter().map(Into::into).collect();
+                        let f_bargs: Vec<cranelift_codegen::ir::BlockArg> =
+                            f_args.into_iter().map(Into::into).collect();
+                        builder.ins().brif(cv, cl_t, &t_bargs, cl_f, &f_bargs);
+                    }
+                    _ => {}
+                }
             }
         }
 
@@ -302,6 +364,99 @@ fn emit_function(
             format!("define_function({symbol_name}): {e:?}"),
         ))?;
     Ok(())
+}
+
+/// Declare Cranelift block param(s) for one Op::Phi
+/// result. Scalars get one block param; vectors get one
+/// per lane. Stored in translator.scalars / .vectors so
+/// downstream uses look them up exactly like any other
+/// computed Value.
+fn declare_phi_block_param(
+    cl_block: cranelift_codegen::ir::Block,
+    result: &atrium_spv_ir::Value,
+    builder: &mut FunctionBuilder,
+    translator: &mut FnTranslator,
+) -> Result<(), BackendError> {
+    match &result.ty {
+        Type::F32 => {
+            let p = builder.append_block_param(cl_block, clif_types::F32);
+            translator.scalars.insert(result.id, p);
+        }
+        Type::I32 | Type::U32 | Type::Bool => {
+            let p = builder.append_block_param(cl_block, clif_types::I32);
+            translator.scalars.insert(result.id, p);
+        }
+        Type::I64 | Type::U64 => {
+            let p = builder.append_block_param(cl_block, clif_types::I64);
+            translator.scalars.insert(result.id, p);
+        }
+        Type::Vec2(_) | Type::Vec3(_) | Type::Vec4(_) => {
+            let count = match &result.ty {
+                Type::Vec2(_) => 2,
+                Type::Vec3(_) => 3,
+                Type::Vec4(_) => 4,
+                _ => unreachable!(),
+            };
+            let mut lanes = Vec::with_capacity(count);
+            for _ in 0..count {
+                lanes.push(builder.append_block_param(cl_block, clif_types::F32));
+            }
+            translator.vectors.insert(result.id, lanes);
+        }
+        other => return Err(BackendError::Unsupported(format!(
+            "Phi result of type {other:?} not supported",
+        ))),
+    }
+    Ok(())
+}
+
+/// Collect the Cranelift values to pass as block-args
+/// when branching from `source` to `target`. Reads each
+/// leading Op::Phi in `target` and picks the arm with
+/// `from == source`.
+fn collect_phi_args(
+    target: atrium_spv_ir::BlockId,
+    source: atrium_spv_ir::BlockId,
+    func: &atrium_spv_ir::Function,
+    translator: &FnTranslator,
+) -> Result<Vec<ClifValue>, BackendError> {
+    let block = func.blocks.get(&target).ok_or_else(||
+        BackendError::Internal(format!(
+            "collect_phi_args: target block {target:?} missing",
+        )))?;
+    let mut args: Vec<ClifValue> = Vec::new();
+    for inst in &block.insts {
+        let arms = match &inst.op {
+            Op::Phi(arms) => arms,
+            _ => break, // phis lead the block
+        };
+        let arm = arms.iter().find(|a| a.from == source).ok_or_else(||
+            BackendError::Internal(format!(
+                "Op::Phi in block {target:?} has no arm from {source:?}",
+            )))?;
+        match &arm.value.ty {
+            Type::F32 | Type::I32 | Type::U32 | Type::I64 | Type::U64
+            | Type::Bool => {
+                let v = translator.scalars.get(&arm.value.id).copied()
+                    .ok_or_else(|| BackendError::Internal(format!(
+                        "Phi arm scalar {:?} not lowered yet",
+                        arm.value.id)))?;
+                args.push(v);
+            }
+            Type::Vec2(_) | Type::Vec3(_) | Type::Vec4(_) => {
+                let lanes = translator.vectors.get(&arm.value.id)
+                    .cloned()
+                    .ok_or_else(|| BackendError::Internal(format!(
+                        "Phi arm vector {:?} not lowered yet",
+                        arm.value.id)))?;
+                args.extend(lanes);
+            }
+            other => return Err(BackendError::Unsupported(format!(
+                "Phi arm of type {other:?} not supported",
+            ))),
+        }
+    }
+    Ok(args)
 }
 
 /// Per-function translation state.
@@ -470,30 +625,15 @@ impl FnTranslator {
                 }
                 Ok(())
             }
-            Op::Branch(target) => {
-                let cl_target = *self.block_map.get(target).ok_or_else(||
-                    BackendError::Internal(format!(
-                        "Op::Branch to unknown block {target:?}",
-                    )))?;
-                builder.ins().jump(cl_target, &[]);
-                Ok(())
-            }
-            Op::BranchCond { cond, t_block, f_block } => {
-                let cv = self.scalars.get(&cond.id).copied().ok_or_else(||
-                    BackendError::Internal(format!(
-                        "Op::BranchCond cond {:?} not in scalars",
-                        cond.id)))?;
-                let cl_t = *self.block_map.get(t_block).ok_or_else(||
-                    BackendError::Internal(format!(
-                        "BranchCond true target unknown: {t_block:?}",
-                    )))?;
-                let cl_f = *self.block_map.get(f_block).ok_or_else(||
-                    BackendError::Internal(format!(
-                        "BranchCond false target unknown: {f_block:?}",
-                    )))?;
-                builder.ins().brif(cv, cl_t, &[], cl_f, &[]);
-                Ok(())
-            }
+            // Op::Branch / Op::BranchCond are handled at
+            // the caller level in `emit_function` so it can
+            // collect Phi-args from the target block(s)
+            // before emitting `jump` / `brif`.
+            Op::Branch(_) | Op::BranchCond { .. } => Ok(()),
+            // Op::Phi is materialised as a Cranelift block
+            // param at block entry; the Inst itself is a
+            // no-op at this point.
+            Op::Phi(_) => Ok(()),
             Op::Return => {
                 builder.ins().return_(&[]);
                 Ok(())

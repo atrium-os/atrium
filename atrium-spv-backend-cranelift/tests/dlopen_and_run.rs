@@ -1211,6 +1211,149 @@ fn cranelift_shader_runs_if_else_else_branch() {
     assert_eq!(out, [0.0, 0.0, 1.0, 1.0]);
 }
 
+/// Build a shader using OpPhi at an if/else merge:
+///
+/// ```glsl
+/// float v = (scale < 0.5) ? 1.0 : 0.25;
+/// out = vec4(v, v, v, 1.0);
+/// ```
+///
+/// Emitted as branching CFG with a Phi in the merge
+/// block (not OpSelect) to exercise the Phi codegen path.
+fn build_phi_shader() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, SelectionControl,
+        StorageClass,
+    };
+
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+
+    let void = b.type_void();
+    let f32_ty = b.type_float(32, None);
+    let bool_ty = b.type_bool();
+    let i32_ty = b.type_int(32, 1);
+    let vec4_f32 = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+
+    let pc_struct = b.type_struct(vec![f32_ty]);
+    b.member_decorate(pc_struct, 0, Decoration::Offset,
+                      vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(pc_struct, Decoration::Block, vec![]);
+
+    let ptr_pc_struct = b.type_pointer(None, StorageClass::PushConstant, pc_struct);
+    let ptr_pc_f32    = b.type_pointer(None, StorageClass::PushConstant, f32_ty);
+    let ptr_out_vec4  = b.type_pointer(None, StorageClass::Output, vec4_f32);
+
+    let zero_i = b.constant_bit32(i32_ty, 0u32);
+    let c05  = b.constant_bit32(f32_ty, 0.5f32.to_bits());
+    let c1   = b.constant_bit32(f32_ty, 1.0f32.to_bits());
+    let c025 = b.constant_bit32(f32_ty, 0.25f32.to_bits());
+    let c10  = b.constant_bit32(f32_ty, 1.0f32.to_bits());
+
+    let pc_var = b.variable(ptr_pc_struct, None, StorageClass::PushConstant, None);
+    let out    = b.variable(ptr_out_vec4,  None, StorageClass::Output,       None);
+    b.decorate(out, Decoration::Location,
+               vec![rspirv::dr::Operand::LiteralBit32(0)]);
+
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let entry_label = b.selected_block().unwrap();
+    let _ = entry_label;
+    let scale_ptr = b.access_chain(ptr_pc_f32, None, pc_var, vec![zero_i]).unwrap();
+    let scale = b.load(f32_ty, None, scale_ptr, None, vec![]).unwrap();
+    let cond = b.f_ord_less_than(bool_ty, None, scale, c05).unwrap();
+
+    let then_id = b.id();
+    let else_id = b.id();
+    let merge_id = b.id();
+    b.selection_merge(merge_id, SelectionControl::NONE).unwrap();
+    b.branch_conditional(cond, then_id, else_id, vec![]).unwrap();
+
+    // then-branch: yields 1.0, ends at then_id_actual
+    b.begin_block(Some(then_id)).unwrap();
+    b.branch(merge_id).unwrap();
+
+    // else-branch: yields 0.25
+    b.begin_block(Some(else_id)).unwrap();
+    b.branch(merge_id).unwrap();
+
+    // merge: %v = phi (1.0 from then, 0.25 from else)
+    b.begin_block(Some(merge_id)).unwrap();
+    let v = b.phi(f32_ty, None, vec![(c1, then_id), (c025, else_id)]).unwrap();
+    let color = b.composite_construct(vec4_f32, None, vec![v, v, v, c10]).unwrap();
+    b.store(out, color, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![out]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+fn run_phi_shader(scale: f32) -> [f32; 4] {
+    let spirv = build_phi_shader();
+    let module = translate(&spirv).expect("frontend translate");
+    let object_bytes = compile(&module, Target::host())
+        .expect("backend compile").object;
+    let dir = TempDir::new().unwrap();
+    let obj_path = dir.path().join("shader.o");
+    std::fs::write(&obj_path, &object_bytes).unwrap();
+    let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
+    let lib_path = dir.path().join(format!("shader.{ext}"));
+    link_to_shared_library(&obj_path, &lib_path).unwrap();
+
+    let lib = unsafe { libloading::Library::new(&lib_path).unwrap() };
+    type FsMain = unsafe extern "C" fn(
+        *const u8, *const u8, *const u8,
+        f32, f32, f32, f32, u32,
+        *mut f32, *mut f32,
+    );
+    let fs_main: libloading::Symbol<FsMain> = unsafe {
+        lib.get(b"atrium_fs_main").unwrap()
+    };
+    let mut pc_buf = [0u8; 4];
+    pc_buf.copy_from_slice(&scale.to_le_bytes());
+    let mut out_color = [0.0f32; 4];
+    let mut out_depth = 0.0f32;
+    unsafe {
+        fs_main(
+            std::ptr::null(), std::ptr::null(), pc_buf.as_ptr(),
+            0.0, 0.0, 0.0, 0.0, 0,
+            out_color.as_mut_ptr(), &mut out_depth,
+        );
+    }
+    let mut interp_inputs = ShaderInputs::default();
+    interp_inputs.push_constants[..4].copy_from_slice(&pc_buf);
+    let interp = Interpreter::new(&spirv).expect("interp parse");
+    let interp_out = interp.run_fragment(&interp_inputs).expect("interp run");
+    let interp_px = interp_out.pixels.first().copied().expect("pixel");
+    assert_eq!(out_color, interp_px,
+        "phi: backend/interp disagree at scale={scale}: \
+         backend={out_color:?} interp={interp_px:?}");
+    out_color
+}
+
+#[test]
+fn cranelift_shader_runs_phi_then() {
+    let out = run_phi_shader(0.2);   // 0.2 < 0.5 → 1.0
+    assert_eq!(out, [1.0, 1.0, 1.0, 1.0]);
+}
+
+#[test]
+fn cranelift_shader_runs_phi_else() {
+    let out = run_phi_shader(0.8);   // 0.8 < 0.5 false → 0.25
+    assert_eq!(out, [0.25, 0.25, 0.25, 1.0]);
+}
+
 #[test]
 fn cranelift_shader_dlopens_and_writes_different_rgba() {
     // Sanity guard: a different shader produces different

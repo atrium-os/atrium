@@ -264,8 +264,8 @@ fn translate_inst_with_cfg(
             Ok(())
         }
         _ => translate_inst(
-            spv_inst, types, constants, iface, id_map, next_value_id,
-            insts, source_spirv_offset,
+            spv_inst, types, constants, iface, label_to_block_id,
+            id_map, next_value_id, insts, source_spirv_offset,
         ),
     }
 }
@@ -277,11 +277,13 @@ fn translate_inst_with_cfg(
 /// `source_spirv_offset` is the byte offset of this
 /// instruction in the source SPIR-V; preserved on every
 /// emitted IR Inst per constraint A2.
+#[allow(clippy::too_many_arguments)]
 fn translate_inst(
     spv_inst: &Instruction,
     types: &TypeContext,
     constants: &ConstantContext,
     iface: &InterfaceContext,
+    label_to_block_id: &HashMap<Word, BlockId>,
     id_map: &mut HashMap<Word, Value>,
     next_value_id: &mut u32,
     insts: &mut Vec<Inst>,
@@ -568,6 +570,56 @@ fn translate_inst(
             id_map.insert(result_id, result.clone());
             insts.push(Inst {
                 op: Op::ConstVec(elements),
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
+
+        // OpPhi: pick a value based on which predecessor
+        // block transferred control here. Operands are a
+        // sequence of (value_id, parent_label_id) pairs.
+        // The frontend converts each parent_label_id to
+        // the IR BlockId we assigned during block walk.
+        SpvOp::Phi => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed(
+                    "Phi without result id".to_string()))?;
+            let result_type_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed(
+                    "Phi without result type".to_string()))?;
+            let ty = types.get(result_type_id)?.clone();
+            // Walk operands two at a time.
+            let mut arms: Vec<atrium_spv_ir::PhiArm> = Vec::new();
+            let mut i = 0;
+            while i + 1 < spv_inst.operands.len() {
+                let val_id = match &spv_inst.operands[i] {
+                    Operand::IdRef(id) => *id,
+                    other => return Err(FrontendError::Malformed(format!(
+                        "Phi arm value: expected IdRef, got {other:?}",
+                    ))),
+                };
+                let parent_label = match &spv_inst.operands[i+1] {
+                    Operand::IdRef(id) => *id,
+                    other => return Err(FrontendError::Malformed(format!(
+                        "Phi arm parent: expected IdRef, got {other:?}",
+                    ))),
+                };
+                let from = label_to_block_id.get(&parent_label).copied()
+                    .ok_or_else(|| FrontendError::Malformed(format!(
+                        "Phi arm parent label {parent_label} not in this function",
+                    )))?;
+                let value = resolve_value(
+                    val_id, types, constants, id_map,
+                    next_value_id, insts, source_spirv_offset,
+                )?;
+                arms.push(atrium_spv_ir::PhiArm { from, value });
+                i += 2;
+            }
+            let result = fresh_value(ty, next_value_id);
+            id_map.insert(result_id, result.clone());
+            insts.push(Inst {
+                op: Op::Phi(arms),
                 result: Some(result),
                 source_spirv_offset,
             });
