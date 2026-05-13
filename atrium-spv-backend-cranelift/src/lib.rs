@@ -43,6 +43,7 @@ use atrium_spv_ir::{
     FloatKind, Module, Op, ShaderStage, StorageClass, Type, ValueId,
 };
 
+use cranelift_codegen::ir::condcodes::FloatCC;
 use cranelift_codegen::ir::{
     AbiParam, Function as ClifFunction, InstBuilder, MemFlags, Signature, UserFuncName,
     Value as ClifValue,
@@ -388,6 +389,69 @@ impl FnTranslator {
             Op::FNeg(a) => self.emit_float_unop(
                 builder, &inst.result, a, |b, x| b.ins().fneg(x),
             ),
+            // Float comparisons (constraint B4: result
+            // is i32 0/1). Cranelift's fcmp produces an
+            // I8 boolean; we uextend to I32 to match our
+            // Bool storage convention.
+            Op::FOrdEq(a, b) => self.emit_fcmp(builder, &inst.result, a, b, FloatCC::Equal),
+            Op::FOrdNe(a, b) => self.emit_fcmp(builder, &inst.result, a, b, FloatCC::OrderedNotEqual),
+            Op::FOrdLt(a, b) => self.emit_fcmp(builder, &inst.result, a, b, FloatCC::LessThan),
+            Op::FOrdLe(a, b) => self.emit_fcmp(builder, &inst.result, a, b, FloatCC::LessThanOrEqual),
+            Op::FOrdGt(a, b) => self.emit_fcmp(builder, &inst.result, a, b, FloatCC::GreaterThan),
+            Op::FOrdGe(a, b) => self.emit_fcmp(builder, &inst.result, a, b, FloatCC::GreaterThanOrEqual),
+            Op::FUnordEq(a, b) => self.emit_fcmp(builder, &inst.result, a, b, FloatCC::UnorderedOrEqual),
+            Op::FUnordNe(a, b) => self.emit_fcmp(builder, &inst.result, a, b, FloatCC::NotEqual),
+            Op::FUnordLt(a, b) => self.emit_fcmp(builder, &inst.result, a, b, FloatCC::UnorderedOrLessThan),
+            Op::FUnordLe(a, b) => self.emit_fcmp(builder, &inst.result, a, b, FloatCC::UnorderedOrLessThanOrEqual),
+            Op::FUnordGt(a, b) => self.emit_fcmp(builder, &inst.result, a, b, FloatCC::UnorderedOrGreaterThan),
+            Op::FUnordGe(a, b) => self.emit_fcmp(builder, &inst.result, a, b, FloatCC::UnorderedOrGreaterThanOrEqual),
+
+            // OpSelect: cond ? t : f. Cranelift's select
+            // takes any integer ctrl; non-zero selects t.
+            // Per constraint B4, Bool is i32 0/1, so a
+            // direct pass through works.
+            Op::Select { cond, t_val, f_val } => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "Select without result Value".to_string()))?;
+                let cv = self.scalars.get(&cond.id).copied().ok_or_else(||
+                    BackendError::Unsupported(format!(
+                        "Select cond id {:?} not in scalars (per-lane vec \
+                         cond not supported yet)", cond.id,
+                    )))?;
+                // Vec select: lane-walk if both t_val and
+                // f_val are vectors.
+                if let (Some(t_lanes), Some(f_lanes)) =
+                    (self.vectors.get(&t_val.id).cloned(),
+                     self.vectors.get(&f_val.id).cloned())
+                {
+                    if t_lanes.len() != f_lanes.len() {
+                        return Err(BackendError::Unsupported(format!(
+                            "Select vec lane-count mismatch: {} vs {}",
+                            t_lanes.len(), f_lanes.len(),
+                        )));
+                    }
+                    let mut out_lanes = Vec::with_capacity(t_lanes.len());
+                    for (tl, fl) in t_lanes.iter().zip(f_lanes.iter()) {
+                        out_lanes.push(builder.ins().select(cv, *tl, *fl));
+                    }
+                    self.vectors.insert(result.id, out_lanes);
+                    return Ok(());
+                }
+                // Scalar select.
+                let tv = self.scalars.get(&t_val.id).copied().ok_or_else(||
+                    BackendError::Unsupported(format!(
+                        "Select t_val id {:?} not in scalars", t_val.id,
+                    )))?;
+                let fv = self.scalars.get(&f_val.id).copied().ok_or_else(||
+                    BackendError::Unsupported(format!(
+                        "Select f_val id {:?} not in scalars", f_val.id,
+                    )))?;
+                let v = builder.ins().select(cv, tv, fv);
+                self.scalars.insert(result.id, v);
+                Ok(())
+            }
+
             // Op::VectorShuffle: gather lanes from
             // src1 ++ src2 by per-output-lane index.
             // With our per-lane scalar storage this is
@@ -551,6 +615,59 @@ impl FnTranslator {
             )))?;
         let v = emit(builder, av, bv);
         self.scalars.insert(result.id, v);
+        Ok(())
+    }
+
+    /// Emit a float-comparison instruction. Polymorphic
+    /// by operand shape (scalar/vec). Result is Bool
+    /// (constraint B4 == i32 0/1). Cranelift's fcmp
+    /// produces an I8 boolean which we uextend to I32.
+    /// For vec inputs, emits N fcmps and stores the
+    /// uextend'd bools as a vec<i32>.
+    fn emit_fcmp(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        result: &Option<atrium_spv_ir::Value>,
+        a: &atrium_spv_ir::Value,
+        b: &atrium_spv_ir::Value,
+        cc: FloatCC,
+    ) -> Result<(), BackendError> {
+        let result = result.as_ref().ok_or_else(||
+            BackendError::Internal(
+                "fcmp without result Value".to_string()))?;
+
+        // Vec × vec.
+        if let (Some(a_lanes), Some(b_lanes)) =
+            (self.vectors.get(&a.id).cloned(), self.vectors.get(&b.id).cloned())
+        {
+            if a_lanes.len() != b_lanes.len() {
+                return Err(BackendError::Unsupported(format!(
+                    "vec fcmp with mismatched lane counts: {} vs {}",
+                    a_lanes.len(), b_lanes.len(),
+                )));
+            }
+            let mut out_lanes = Vec::with_capacity(a_lanes.len());
+            for (la, lb) in a_lanes.iter().zip(b_lanes.iter()) {
+                let bool_v = builder.ins().fcmp(cc, *la, *lb);
+                let i32_v = builder.ins().uextend(clif_types::I32, bool_v);
+                out_lanes.push(i32_v);
+            }
+            self.vectors.insert(result.id, out_lanes);
+            return Ok(());
+        }
+
+        // Scalar.
+        let av = self.scalars.get(&a.id).copied().ok_or_else(||
+            BackendError::Unsupported(format!(
+                "fcmp lhs id {:?} not in scalars or vectors", a.id,
+            )))?;
+        let bv = self.scalars.get(&b.id).copied().ok_or_else(||
+            BackendError::Unsupported(format!(
+                "fcmp rhs id {:?} not in scalars or vectors", b.id,
+            )))?;
+        let bool_v = builder.ins().fcmp(cc, av, bv);
+        let i32_v = builder.ins().uextend(clif_types::I32, bool_v);
+        self.scalars.insert(result.id, i32_v);
         Ok(())
     }
 

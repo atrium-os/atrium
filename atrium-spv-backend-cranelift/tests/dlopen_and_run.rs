@@ -586,6 +586,126 @@ fn cranelift_shader_runs_real_arithmetic() {
         out_color, expected);
 }
 
+/// Build a shader exercising OpFOrdLessThan + OpSelect.
+///
+/// Computes per-channel: `c < threshold ? t : f` for four
+/// independent scalar conditions, packing the four
+/// resulting f32s into the output vec4. This exercises:
+///   - scalar OpFOrdLessThan producing Bool
+///   - scalar OpSelect choosing between two f32 branches
+///   - vec4 result via OpCompositeConstruct
+fn build_compare_select_shader(
+    inputs: [(f32, f32, f32, f32); 4],
+) -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, ExecutionMode, ExecutionModel,
+        FunctionControl, MemoryModel, StorageClass,
+    };
+
+    let mut bld = rspirv::dr::Builder::new();
+    bld.set_version(1, 0);
+    bld.capability(Capability::Shader);
+    bld.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+
+    let void = bld.type_void();
+    let f32_ty = bld.type_float(32, None);
+    let bool_ty = bld.type_bool();
+    let vec4_f32 = bld.type_vector(f32_ty, 4);
+    let void_fn = bld.type_function(void, vec![]);
+    let ptr_out_vec4 = bld.type_pointer(None, StorageClass::Output, vec4_f32);
+
+    let out = bld.variable(ptr_out_vec4, None, StorageClass::Output, None);
+    bld.decorate(out, rspirv::spirv::Decoration::Location,
+                 vec![rspirv::dr::Operand::LiteralBit32(0)]);
+
+    let main = bld.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    bld.begin_block(None).unwrap();
+
+    let mut lanes = Vec::with_capacity(4);
+    for (c, thresh, t, f) in inputs.iter().copied() {
+        let c_v = bld.constant_bit32(f32_ty, c.to_bits());
+        let thr_v = bld.constant_bit32(f32_ty, thresh.to_bits());
+        let t_v = bld.constant_bit32(f32_ty, t.to_bits());
+        let f_v = bld.constant_bit32(f32_ty, f.to_bits());
+        let cond = bld.f_ord_less_than(bool_ty, None, c_v, thr_v).unwrap();
+        let chosen = bld.select(f32_ty, None, cond, t_v, f_v).unwrap();
+        lanes.push(chosen);
+    }
+    let color = bld.composite_construct(vec4_f32, None, lanes).unwrap();
+    bld.store(out, color, None, vec![]).unwrap();
+    bld.ret().unwrap();
+    bld.end_function().unwrap();
+
+    bld.entry_point(ExecutionModel::Fragment, main, "main", vec![out]);
+    bld.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+
+    let words: Vec<u32> = bld.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn cranelift_shader_runs_comparison_and_select() {
+    // Lane 0: 0.1 < 0.5 → true  → 1.0
+    // Lane 1: 0.9 < 0.5 → false → 0.25
+    // Lane 2: 0.5 < 0.5 → false → 0.75   (ord-less is strict)
+    // Lane 3: -1.0 < 0.0 → true → 0.5
+    let inputs = [
+        (0.1f32, 0.5f32, 1.0f32, 0.0f32),
+        (0.9f32, 0.5f32, 0.0f32, 0.25f32),
+        (0.5f32, 0.5f32, 0.0f32, 0.75f32),
+        (-1.0f32, 0.0f32, 0.5f32, 0.0f32),
+    ];
+    let expected = [1.0f32, 0.25, 0.75, 0.5];
+
+    let spirv = build_compare_select_shader(inputs);
+    let module = translate(&spirv)
+        .expect("frontend must translate compare/select shader");
+    let object_bytes = compile(&module, Target::host())
+        .expect("backend must compile compare/select shader").object;
+
+    let dir = TempDir::new().unwrap();
+    let obj_path = dir.path().join("shader.o");
+    std::fs::write(&obj_path, &object_bytes).unwrap();
+    let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
+    let lib_path = dir.path().join(format!("shader.{ext}"));
+    link_to_shared_library(&obj_path, &lib_path).unwrap();
+
+    let lib = unsafe { libloading::Library::new(&lib_path).unwrap() };
+    type FsMain = unsafe extern "C" fn(
+        *const u8, *const u8, *const u8,
+        f32, f32, f32, f32, u32,
+        *mut f32, *mut f32,
+    );
+    let fs_main: libloading::Symbol<FsMain> = unsafe {
+        lib.get(b"atrium_fs_main").unwrap()
+    };
+    let mut out_color = [0.0f32; 4];
+    let mut out_depth = 0.0f32;
+    unsafe {
+        fs_main(
+            std::ptr::null(), std::ptr::null(), std::ptr::null(),
+            0.0, 0.0, 0.0, 0.0, 0,
+            out_color.as_mut_ptr(), &mut out_depth,
+        );
+    }
+    assert_eq!(out_color, expected,
+        "compare/select wrong: got {:?}, expected {:?}",
+        out_color, expected);
+
+    // Differential: interpreter must agree.
+    let interp = Interpreter::new(&spirv).expect("interp parse");
+    let interp_out = interp.run_fragment(&ShaderInputs::default())
+        .expect("interp run");
+    let interp_px = interp_out.pixels.first().copied()
+        .expect("interp must emit at least one pixel");
+    assert_eq!(interp_px, expected,
+        "interpreter compare/select disagrees: {:?} vs {:?}",
+        interp_px, expected);
+}
+
 #[test]
 fn cranelift_shader_dlopens_and_writes_different_rgba() {
     // Sanity guard: a different shader produces different

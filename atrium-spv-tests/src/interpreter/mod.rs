@@ -463,6 +463,39 @@ impl Interpreter {
                 Ok(())
             }
 
+            // Float comparisons → Bool (i32 0/1 per
+            // constraint B4). Ordered semantics treat NaN
+            // operands as false; unordered treat them as
+            // true.
+            Op::FOrdEqual => self.eval_fcmp(inst, values, FCmp::OrdEq),
+            Op::FOrdNotEqual => self.eval_fcmp(inst, values, FCmp::OrdNe),
+            Op::FOrdLessThan => self.eval_fcmp(inst, values, FCmp::OrdLt),
+            Op::FOrdLessThanEqual => self.eval_fcmp(inst, values, FCmp::OrdLe),
+            Op::FOrdGreaterThan => self.eval_fcmp(inst, values, FCmp::OrdGt),
+            Op::FOrdGreaterThanEqual => self.eval_fcmp(inst, values, FCmp::OrdGe),
+            Op::FUnordEqual => self.eval_fcmp(inst, values, FCmp::UnordEq),
+            Op::FUnordNotEqual => self.eval_fcmp(inst, values, FCmp::UnordNe),
+            Op::FUnordLessThan => self.eval_fcmp(inst, values, FCmp::UnordLt),
+            Op::FUnordLessThanEqual => self.eval_fcmp(inst, values, FCmp::UnordLe),
+            Op::FUnordGreaterThan => self.eval_fcmp(inst, values, FCmp::UnordGt),
+            Op::FUnordGreaterThanEqual => self.eval_fcmp(inst, values, FCmp::UnordGe),
+
+            // OpSelect: cond ? t : f. cond is Bool
+            // (i32 0/1) per B4.
+            Op::Select => {
+                let result_id = inst.result_id.ok_or_else(||
+                    InterpError::BadConstant(0))?;
+                let cond_id = op_id(&inst.operands, 0)?;
+                let t_id    = op_id(&inst.operands, 1)?;
+                let f_id    = op_id(&inst.operands, 2)?;
+                let cond = self.lookup_value(cond_id, values)?;
+                let t_val = self.lookup_value(t_id, values)?;
+                let f_val = self.lookup_value(f_id, values)?;
+                let stored = eval_select_value(&cond, &t_val, &f_val)?;
+                values.insert(result_id, stored);
+                Ok(())
+            }
+
             // OpDot: sum of element-wise products.
             Op::Dot => {
                 let result_id = inst.result_id.ok_or_else(||
@@ -494,6 +527,26 @@ impl Interpreter {
             }
             other => Err(InterpError::UnsupportedOpcode(format!("{:?}", other))),
         }
+    }
+
+    /// Evaluate a SPIR-V float comparison
+    /// (FOrd*/FUnord*). Returns Bool (scalar) or Vec of
+    /// Bool (per-lane) depending on operand shape.
+    fn eval_fcmp(
+        &self,
+        inst: &Instruction,
+        values: &mut HashMap<Word, ConstantValue>,
+        cmp: FCmp,
+    ) -> Result<(), InterpError> {
+        let result_id = inst.result_id.ok_or_else(||
+            InterpError::BadConstant(0))?;
+        let lhs_id = op_id(&inst.operands, 0)?;
+        let rhs_id = op_id(&inst.operands, 1)?;
+        let lhs = self.lookup_value(lhs_id, values)?;
+        let rhs = self.lookup_value(rhs_id, values)?;
+        let stored = eval_fcmp_value(&lhs, &rhs, cmp)?;
+        values.insert(result_id, stored);
+        Ok(())
     }
 
     /// Evaluate a SPIR-V float-arithmetic binop
@@ -635,6 +688,111 @@ fn eval_float_binop_value(
         _ => Err(InterpError::UnsupportedOpcode(format!(
             "float binop on incompatible operands: {lhs:?}, {rhs:?}",
         ))),
+    }
+}
+
+/// Float-comparison tag for the interpreter's
+/// eval_fcmp dispatch. Ordered comparisons treat NaN
+/// operands as false; unordered as true.
+#[derive(Copy, Clone, Debug)]
+enum FCmp {
+    OrdEq, OrdNe, OrdLt, OrdLe, OrdGt, OrdGe,
+    UnordEq, UnordNe, UnordLt, UnordLe, UnordGt, UnordGe,
+}
+
+fn fcmp_scalar(a: f64, b: f64, cmp: FCmp) -> bool {
+    let unordered = a.is_nan() || b.is_nan();
+    match cmp {
+        FCmp::OrdEq   => !unordered && a == b,
+        FCmp::OrdNe   => !unordered && a != b,
+        FCmp::OrdLt   => !unordered && a <  b,
+        FCmp::OrdLe   => !unordered && a <= b,
+        FCmp::OrdGt   => !unordered && a >  b,
+        FCmp::OrdGe   => !unordered && a >= b,
+        FCmp::UnordEq =>  unordered || a == b,
+        FCmp::UnordNe =>  unordered || a != b,
+        FCmp::UnordLt =>  unordered || a <  b,
+        FCmp::UnordLe =>  unordered || a <= b,
+        FCmp::UnordGt =>  unordered || a >  b,
+        FCmp::UnordGe =>  unordered || a >= b,
+    }
+}
+
+fn as_f64(v: &ConstantValue) -> Option<f64> {
+    match v {
+        ConstantValue::F32(x) => Some(*x as f64),
+        ConstantValue::F64(x) => Some(*x),
+        _ => None,
+    }
+}
+
+/// Polymorphic float-compare: scalar×scalar → Bool,
+/// vec×vec → Vec<Bool>.
+fn eval_fcmp_value(
+    lhs: &ConstantValue,
+    rhs: &ConstantValue,
+    cmp: FCmp,
+) -> Result<ConstantValue, InterpError> {
+    match (lhs, rhs) {
+        (ConstantValue::Vec(a), ConstantValue::Vec(b)) => {
+            if a.len() != b.len() {
+                return Err(InterpError::UnsupportedOpcode(format!(
+                    "fcmp with mismatched lane counts: {} vs {}",
+                    a.len(), b.len(),
+                )));
+            }
+            let mut out = Vec::with_capacity(a.len());
+            for (la, lb) in a.iter().zip(b.iter()) {
+                out.push(eval_fcmp_value(la, lb, cmp)?);
+            }
+            Ok(ConstantValue::Vec(out))
+        }
+        _ => {
+            let a = as_f64(lhs).ok_or_else(|| InterpError::UnsupportedOpcode(
+                format!("fcmp on non-float: {lhs:?}")))?;
+            let b = as_f64(rhs).ok_or_else(|| InterpError::UnsupportedOpcode(
+                format!("fcmp on non-float: {rhs:?}")))?;
+            Ok(ConstantValue::Bool(fcmp_scalar(a, b, cmp)))
+        }
+    }
+}
+
+/// Evaluate OpSelect: cond ? t : f. Supports scalar cond
+/// with scalar-or-vec branches, and per-lane vec cond
+/// with vec branches.
+fn eval_select_value(
+    cond: &ConstantValue,
+    t_val: &ConstantValue,
+    f_val: &ConstantValue,
+) -> Result<ConstantValue, InterpError> {
+    match cond {
+        ConstantValue::Bool(c) => Ok(if *c { t_val.clone() } else { f_val.clone() }),
+        // i32 0/1 convention: treat non-zero as true.
+        ConstantValue::Int(n) => Ok(if *n != 0 { t_val.clone() } else { f_val.clone() }),
+        ConstantValue::Vec(cs) => {
+            let ts = match t_val {
+                ConstantValue::Vec(v) => v,
+                _ => return Err(InterpError::UnsupportedOpcode(
+                    "Select with vec cond requires vec branches".into())),
+            };
+            let fs = match f_val {
+                ConstantValue::Vec(v) => v,
+                _ => return Err(InterpError::UnsupportedOpcode(
+                    "Select with vec cond requires vec branches".into())),
+            };
+            if cs.len() != ts.len() || cs.len() != fs.len() {
+                return Err(InterpError::UnsupportedOpcode(format!(
+                    "Select lane-count mismatch: cond={}, t={}, f={}",
+                    cs.len(), ts.len(), fs.len())));
+            }
+            let mut out = Vec::with_capacity(cs.len());
+            for ((c, t), f) in cs.iter().zip(ts.iter()).zip(fs.iter()) {
+                out.push(eval_select_value(c, t, f)?);
+            }
+            Ok(ConstantValue::Vec(out))
+        }
+        other => Err(InterpError::UnsupportedOpcode(format!(
+            "Select cond is not Bool/Int/Vec: {other:?}"))),
     }
 }
 

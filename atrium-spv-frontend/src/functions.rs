@@ -256,6 +256,107 @@ fn translate_inst(
             |a, b| Op::Dot(a, b),
         ),
 
+        // Float comparisons → Bool (i32 0/1). All 12
+        // variants map 1:1 to Op::FOrd* / FUnord*.
+        SpvOp::FOrdEqual => emit_binop_float(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::FOrdEq(a, b),
+        ),
+        SpvOp::FOrdNotEqual => emit_binop_float(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::FOrdNe(a, b),
+        ),
+        SpvOp::FOrdLessThan => emit_binop_float(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::FOrdLt(a, b),
+        ),
+        SpvOp::FOrdLessThanEqual => emit_binop_float(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::FOrdLe(a, b),
+        ),
+        SpvOp::FOrdGreaterThan => emit_binop_float(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::FOrdGt(a, b),
+        ),
+        SpvOp::FOrdGreaterThanEqual => emit_binop_float(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::FOrdGe(a, b),
+        ),
+        SpvOp::FUnordEqual => emit_binop_float(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::FUnordEq(a, b),
+        ),
+        SpvOp::FUnordNotEqual => emit_binop_float(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::FUnordNe(a, b),
+        ),
+        SpvOp::FUnordLessThan => emit_binop_float(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::FUnordLt(a, b),
+        ),
+        SpvOp::FUnordLessThanEqual => emit_binop_float(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::FUnordLe(a, b),
+        ),
+        SpvOp::FUnordGreaterThan => emit_binop_float(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::FUnordGt(a, b),
+        ),
+        SpvOp::FUnordGreaterThanEqual => emit_binop_float(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::FUnordGe(a, b),
+        ),
+
+        // OpSelect: cond ? t_val : f_val. cond is Bool
+        // (scalar) or vec<Bool> (per-lane). Operands:
+        //   0  cond
+        //   1  t_val (selected when cond != 0)
+        //   2  f_val (selected when cond == 0)
+        SpvOp::Select => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed(
+                    "Select without result id".to_string()))?;
+            let result_type_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed(
+                    "Select without result type".to_string()))?;
+            let ty = types.get(result_type_id)?.clone();
+            let cond_id = expect_id(&spv_inst.operands, 0)?;
+            let t_id    = expect_id(&spv_inst.operands, 1)?;
+            let f_id    = expect_id(&spv_inst.operands, 2)?;
+            let cond = resolve_value(
+                cond_id, types, constants, id_map, next_value_id, insts,
+                source_spirv_offset,
+            )?;
+            let t_val = resolve_value(
+                t_id, types, constants, id_map, next_value_id, insts,
+                source_spirv_offset,
+            )?;
+            let f_val = resolve_value(
+                f_id, types, constants, id_map, next_value_id, insts,
+                source_spirv_offset,
+            )?;
+            let result = fresh_value(ty, next_value_id);
+            id_map.insert(result_id, result.clone());
+            insts.push(Inst {
+                op: Op::Select { cond, t_val, f_val },
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
+
         // OpVectorShuffle: produce a new vector by
         // selecting lanes from two source vectors.
         // Operand layout:
