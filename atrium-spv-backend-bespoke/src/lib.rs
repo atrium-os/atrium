@@ -195,6 +195,16 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
     let x_out = asm::Xreg(4);
     let w_tmp = asm::Wreg(9);
 
+    // Synthetic-id counter for per-lane Values that need a
+    // ValueId but don't exist in the IR (vec-Load lane
+    // scalars, vec-arithmetic-result lane scalars).
+    // Starts well above any realistic IR ValueId to avoid
+    // colliding with scalars-map entries for real IR
+    // values — small backend-side multipliers were
+    // colliding with the dense low IR ValueIds the
+    // pre-allocation pass assigns to function results.
+    let mut next_synth_id: u32 = 1_000_000;
+
     // ── Block layout ──────────────────────────────────────────
     //
     // Walk blocks in BlockId order (matches the frontend's
@@ -315,17 +325,21 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
             Op::FOrdGe(a_v, b_v) => emit_fcmp_to_bool(
                 &mut a, &scalars, &mut bools, &mut next_bool_w,
                 inst, a_v, b_v, asm::Cond::Ge)?,
-            Op::FAdd(a_v, b_v) => emit_fp_binop_with_pool(
-                &mut a, &mut scalars, &mut free_pool, &mut owners,
+            Op::FAdd(a_v, b_v) => emit_fp_binop_poly(
+                &mut a, &mut scalars, &mut vectors,
+                &mut free_pool, &mut owners, &mut next_synth_id,
                 inst, a_v, b_v, asm::fadd_s)?,
-            Op::FSub(a_v, b_v) => emit_fp_binop_with_pool(
-                &mut a, &mut scalars, &mut free_pool, &mut owners,
+            Op::FSub(a_v, b_v) => emit_fp_binop_poly(
+                &mut a, &mut scalars, &mut vectors,
+                &mut free_pool, &mut owners, &mut next_synth_id,
                 inst, a_v, b_v, asm::fsub_s)?,
-            Op::FMul(a_v, b_v) => emit_fp_binop_with_pool(
-                &mut a, &mut scalars, &mut free_pool, &mut owners,
+            Op::FMul(a_v, b_v) => emit_fp_binop_poly(
+                &mut a, &mut scalars, &mut vectors,
+                &mut free_pool, &mut owners, &mut next_synth_id,
                 inst, a_v, b_v, asm::fmul_s)?,
-            Op::FDiv(a_v, b_v) => emit_fp_binop_with_pool(
-                &mut a, &mut scalars, &mut free_pool, &mut owners,
+            Op::FDiv(a_v, b_v) => emit_fp_binop_poly(
+                &mut a, &mut scalars, &mut vectors,
+                &mut free_pool, &mut owners, &mut next_synth_id,
                 inst, a_v, b_v, asm::fdiv_s)?,
             Op::Store { ptr, value } => {
                 match &ptr.ty {
@@ -388,20 +402,12 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
                         let mut lanes = Vec::with_capacity(lane_count);
                         for lane_i in 0..lane_count {
                             let lane_off = off.saturating_add((lane_i * 4) as i32);
-                            // Manufacture a synthetic
-                            // ValueId for the lane scalar.
-                            // We won't put it back in
-                            // id_map (the IR doesn't expect
-                            // one), but `vectors` needs
-                            // Values and the V-reg pool
-                            // needs an owner id. Use a
-                            // tagged synthetic id: result.id
-                            // * 16 + lane_i + 1 (collision-
-                            // free for any sensibly-sized
-                            // result.id).
-                            let synthetic_id = atrium_spv_ir::ValueId(
-                                result.id.0.wrapping_mul(16)
-                                    .wrapping_add(lane_i as u32 + 1));
+                            // Synthetic ValueId from the
+                            // dedicated high-range counter
+                            // — collision-free with any IR
+                            // ValueId the frontend assigns.
+                            let synthetic_id = ValueId(next_synth_id);
+                            next_synth_id += 1;
                             let v = alloc_vreg(
                                 &mut free_pool, &mut owners, synthetic_id)?;
                             emit_load_f32_offset(&mut a, w_tmp, param, lane_off, v)?;
@@ -625,6 +631,15 @@ fn compute_last_use_flat(insts: &[&atrium_spv_ir::Inst]) -> HashMap<ValueId, usi
             Op::FAdd(l, r) | Op::FSub(l, r)
             | Op::FMul(l, r) | Op::FDiv(l, r) => {
                 mark(l.id); mark(r.id);
+                // If either operand is a vec, its lanes
+                // need to be alive too (per-lane scalars
+                // are read at this op's index).
+                if let Some(lanes) = vec_lanes.get(&l.id).cloned() {
+                    for lid in &lanes { mark(*lid); }
+                }
+                if let Some(lanes) = vec_lanes.get(&r.id).cloned() {
+                    for lid in &lanes { mark(*lid); }
+                }
             }
             Op::FNeg(s) => mark(s.id),
             Op::FOrdEq(l, r) | Op::FOrdNe(l, r)
@@ -665,29 +680,123 @@ fn compute_last_use_flat(insts: &[&atrium_spv_ir::Inst]) -> HashMap<ValueId, usi
     last_use
 }
 
-/// Emit one scalar f32 binary op (fadd/fsub/fmul/fdiv).
-/// Allocates the destination V-reg from the linear-scan
-/// free pool.
+/// Emit one polymorphic float binary op (fadd/fsub/fmul/
+/// fdiv). Dispatches on operand shape:
+///
+/// * scalar × scalar → one S-reg op.
+/// * vec   × vec     → per-lane S-reg ops (lane count
+///                     must match).
+/// * vec   × scalar  → broadcast scalar to every lane.
+/// * scalar × vec    → same, symmetric.
+///
+/// Result is stored in `scalars` (scalar shape) or
+/// `vectors` (vec shape).
 #[allow(clippy::too_many_arguments)]
-fn emit_fp_binop_with_pool(
+fn emit_fp_binop_poly(
     a: &mut asm::Asm,
     scalars: &mut HashMap<ValueId, asm::Vreg>,
+    vectors: &mut HashMap<ValueId, Vec<Value>>,
     free_pool: &mut Vec<u8>,
     owners: &mut HashMap<u8, ValueId>,
+    next_synth_id: &mut u32,
     inst: &atrium_spv_ir::Inst,
     lhs: &Value,
     rhs: &Value,
     make_inst: fn(asm::Vreg, asm::Vreg, asm::Vreg) -> u32,
 ) -> Result<(), BackendError> {
+    let mut fresh_synth = || {
+        let id = ValueId(*next_synth_id);
+        *next_synth_id += 1;
+        id
+    };
     let result = inst.result.as_ref().ok_or_else(||
         BackendError::Internal("fp binop without result".into()))?;
-    let l = *scalars.get(&lhs.id).ok_or_else(||
-        BackendError::Internal(format!("fp binop lhs {:?} missing", lhs.id)))?;
-    let r = *scalars.get(&rhs.id).ok_or_else(||
-        BackendError::Internal(format!("fp binop rhs {:?} missing", rhs.id)))?;
-    let d = alloc_vreg(free_pool, owners, result.id)?;
-    a.emit(make_inst(d, l, r));
-    scalars.insert(result.id, d);
+
+    let lhs_is_vec = vectors.contains_key(&lhs.id);
+    let rhs_is_vec = vectors.contains_key(&rhs.id);
+
+    match (lhs_is_vec, rhs_is_vec) {
+        (false, false) => {
+            // Scalar × scalar.
+            let l = *scalars.get(&lhs.id).ok_or_else(||
+                BackendError::Internal(format!(
+                    "fp binop lhs {:?} missing", lhs.id)))?;
+            let r = *scalars.get(&rhs.id).ok_or_else(||
+                BackendError::Internal(format!(
+                    "fp binop rhs {:?} missing", rhs.id)))?;
+            let d = alloc_vreg(free_pool, owners, result.id)?;
+            a.emit(make_inst(d, l, r));
+            scalars.insert(result.id, d);
+        }
+        (true, true) => {
+            // Vec × vec lane-walk.
+            let l_lanes = vectors.get(&lhs.id).unwrap().clone();
+            let r_lanes = vectors.get(&rhs.id).unwrap().clone();
+            if l_lanes.len() != r_lanes.len() {
+                return Err(BackendError::Unsupported(format!(
+                    "vec fp binop mismatched lanes: {} vs {}",
+                    l_lanes.len(), r_lanes.len())));
+            }
+            let mut out_lanes = Vec::with_capacity(l_lanes.len());
+            for (li, (ll, rl)) in l_lanes.iter().zip(r_lanes.iter()).enumerate() {
+                let l = *scalars.get(&ll.id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "vec fp binop lane {li} lhs {:?} missing",
+                        ll.id)))?;
+                let r = *scalars.get(&rl.id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "vec fp binop lane {li} rhs {:?} missing",
+                        rl.id)))?;
+                // Synthetic per-lane result ValueId.
+                let synth = fresh_synth();
+                let d = alloc_vreg(free_pool, owners, synth)?;
+                a.emit(make_inst(d, l, r));
+                scalars.insert(synth, d);
+                out_lanes.push(Value {
+                    id: synth, ty: ll.ty.clone(),
+                });
+            }
+            vectors.insert(result.id, out_lanes);
+        }
+        (true, false) => {
+            // Vec × scalar broadcast.
+            let l_lanes = vectors.get(&lhs.id).unwrap().clone();
+            let r = *scalars.get(&rhs.id).ok_or_else(||
+                BackendError::Internal(format!(
+                    "vec×scalar fp binop scalar {:?} missing", rhs.id)))?;
+            let mut out_lanes = Vec::with_capacity(l_lanes.len());
+            for (li, ll) in l_lanes.iter().enumerate() {
+                let l = *scalars.get(&ll.id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "vec×scalar lane {li} lhs missing")))?;
+                let synth = fresh_synth();
+                let d = alloc_vreg(free_pool, owners, synth)?;
+                a.emit(make_inst(d, l, r));
+                scalars.insert(synth, d);
+                out_lanes.push(Value { id: synth, ty: ll.ty.clone() });
+            }
+            vectors.insert(result.id, out_lanes);
+        }
+        (false, true) => {
+            // Scalar × vec broadcast (symmetric).
+            let r_lanes = vectors.get(&rhs.id).unwrap().clone();
+            let l = *scalars.get(&lhs.id).ok_or_else(||
+                BackendError::Internal(format!(
+                    "scalar×vec fp binop scalar {:?} missing", lhs.id)))?;
+            let mut out_lanes = Vec::with_capacity(r_lanes.len());
+            for (li, rl) in r_lanes.iter().enumerate() {
+                let r = *scalars.get(&rl.id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "scalar×vec lane {li} rhs missing")))?;
+                let synth = fresh_synth();
+                let d = alloc_vreg(free_pool, owners, synth)?;
+                a.emit(make_inst(d, l, r));
+                scalars.insert(synth, d);
+                out_lanes.push(Value { id: synth, ty: rl.ty.clone() });
+            }
+            vectors.insert(result.id, out_lanes);
+        }
+    }
     Ok(())
 }
 

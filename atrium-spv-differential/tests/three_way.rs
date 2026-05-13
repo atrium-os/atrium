@@ -82,6 +82,46 @@ fn build_arith_shader(a: f32, b: f32) -> Vec<u8> {
     bytes
 }
 
+/// Build `out = (a_vec + b_vec) * (a_vec - b_vec)` using
+/// SPIR-V vec4 ops. Exercises vec×vec FAdd / FSub / FMul.
+fn build_vec_arith_shader(a: [f32; 4], b: [f32; 4]) -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, ExecutionMode, ExecutionModel,
+        FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut bld = rspirv::dr::Builder::new();
+    bld.set_version(1, 0);
+    bld.capability(Capability::Shader);
+    bld.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = bld.type_void();
+    let f32_ty = bld.type_float(32, None);
+    let vec4 = bld.type_vector(f32_ty, 4);
+    let void_fn = bld.type_function(void, vec![]);
+    let ptr_out = bld.type_pointer(None, StorageClass::Output, vec4);
+    let ca: Vec<_> = a.iter().map(|x| bld.constant_bit32(f32_ty, x.to_bits())).collect();
+    let cb: Vec<_> = b.iter().map(|x| bld.constant_bit32(f32_ty, x.to_bits())).collect();
+    let va = bld.constant_composite(vec4, ca);
+    let vb = bld.constant_composite(vec4, cb);
+    let out = bld.variable(ptr_out, None, StorageClass::Output, None);
+    bld.decorate(out, rspirv::spirv::Decoration::Location,
+                 vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let main = bld.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    bld.begin_block(None).unwrap();
+    let sum  = bld.f_add(vec4, None, va, vb).unwrap();
+    let diff = bld.f_sub(vec4, None, va, vb).unwrap();
+    let prod = bld.f_mul(vec4, None, sum, diff).unwrap();
+    bld.store(out, prod, None, vec![]).unwrap();
+    bld.ret().unwrap();
+    bld.end_function().unwrap();
+    bld.entry_point(ExecutionModel::Fragment, main, "main", vec![out]);
+    bld.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+    let words: Vec<u32> = bld.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
 fn build_if_else_shader() -> Vec<u8> {
     use rspirv::binary::Assemble;
     use rspirv::spirv::{
@@ -167,6 +207,21 @@ fn three_way_constant_color_shader() {
 #[test]
 fn three_way_fp_arithmetic_shader() {
     let spirv = build_arith_shader(0.75, 0.25);
+    let rs = runners();
+    let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
+    assert_shader_agrees(
+        &spirv,
+        &ShaderInputs::default(),
+        ColorTolerance::Exact,
+        &refs,
+    );
+}
+
+#[test]
+fn three_way_vec_arithmetic() {
+    let a = [0.5f32, 0.6, 0.7, 0.8];
+    let b = [0.1f32, 0.2, 0.3, 0.4];
+    let spirv = build_vec_arith_shader(a, b);
     let rs = runners();
     let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
     assert_shader_agrees(
