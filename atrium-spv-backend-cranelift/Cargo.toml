@@ -19,4 +19,7 @@ target-lexicon      = "0.13"
 
 [dev-dependencies]
 atrium-spv-frontend = { path = "../atrium-spv-frontend" }
+atrium-spv-tests    = { path = "../atrium-spv-tests" }
 rspirv              = "0.13"
+libloading          = "0.8"
+tempfile            = "3"
