@@ -104,6 +104,89 @@ fn build_arith_shader(a: f32, b: f32) -> Vec<u8> {
     bytes
 }
 
+/// Build a chain of N FAdds: `acc = a; for _ in 0..N { acc = acc + b; }`.
+/// Result is `a + N*b`. With a bump V-reg allocator this
+/// would burn N+1 regs (panic past 16). Linear-scan
+/// recycles each intermediate's V-reg right after the
+/// next add consumes it, keeping live-count at 3.
+fn build_long_add_chain_shader(a: f32, b: f32, n: usize) -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, ExecutionMode, ExecutionModel,
+        FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut bld = rspirv::dr::Builder::new();
+    bld.set_version(1, 0);
+    bld.capability(Capability::Shader);
+    bld.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = bld.type_void();
+    let f32_ty = bld.type_float(32, None);
+    let vec4 = bld.type_vector(f32_ty, 4);
+    let void_fn = bld.type_function(void, vec![]);
+    let ptr_out = bld.type_pointer(None, StorageClass::Output, vec4);
+    let ca = bld.constant_bit32(f32_ty, a.to_bits());
+    let cb = bld.constant_bit32(f32_ty, b.to_bits());
+    let c1 = bld.constant_bit32(f32_ty, 1.0f32.to_bits());
+    let out = bld.variable(ptr_out, None, StorageClass::Output, None);
+    bld.decorate(out, rspirv::spirv::Decoration::Location,
+                 vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let main = bld.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    bld.begin_block(None).unwrap();
+    let mut acc = ca;
+    for _ in 0..n {
+        acc = bld.f_add(f32_ty, None, acc, cb).unwrap();
+    }
+    let color = bld.composite_construct(vec4, None,
+        vec![acc, acc, acc, c1]).unwrap();
+    bld.store(out, color, None, vec![]).unwrap();
+    bld.ret().unwrap();
+    bld.end_function().unwrap();
+    bld.entry_point(ExecutionModel::Fragment, main, "main", vec![out]);
+    bld.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+    let words: Vec<u32> = bld.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn bespoke_shader_runs_long_add_chain_through_linear_scan_ra() {
+    // 20 chained adds — would blow a bump allocator past
+    // 16 regs. Linear-scan recycles each intermediate.
+    let (a, b, n) = (0.1f32, 0.05f32, 20usize);
+    let spirv = build_long_add_chain_shader(a, b, n);
+    let module = translate(&spirv).expect("translate");
+    let out = compile(&module, Target::host()).expect("bespoke compile");
+    let dir = TempDir::new().unwrap();
+    let obj_path = dir.path().join("shader.o");
+    std::fs::write(&obj_path, &out.object).unwrap();
+    let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
+    let lib_path = dir.path().join(format!("shader.{ext}"));
+    link_to_shared_library(&obj_path, &lib_path).unwrap();
+    let lib = unsafe { libloading::Library::new(&lib_path).unwrap() };
+    type FsMain = unsafe extern "C" fn(
+        *const u8, *const u8, *const u8,
+        f32, f32, f32, f32, u32,
+        *mut f32, *mut f32,
+    );
+    let fs_main: libloading::Symbol<FsMain> = unsafe {
+        lib.get(b"atrium_fs_main").unwrap()
+    };
+    let mut out_color = [0.0f32; 4];
+    let mut out_depth = 0.0f32;
+    unsafe {
+        fs_main(
+            std::ptr::null(), std::ptr::null(), std::ptr::null(),
+            0.0, 0.0, 0.0, 0.0, 0,
+            out_color.as_mut_ptr(), &mut out_depth,
+        );
+    }
+    let expected_acc = a + b * (n as f32);
+    let expected = [expected_acc, expected_acc, expected_acc, 1.0];
+    assert_eq!(out_color, expected,
+        "long-add-chain got {out_color:?}, expected {expected:?}");
+}
+
 #[test]
 fn bespoke_shader_runs_fp_arithmetic() {
     let (a, b) = (0.75f32, 0.25f32);

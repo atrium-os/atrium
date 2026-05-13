@@ -189,29 +189,45 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
     let x_out = asm::Xreg(4);
     let w_tmp = asm::Wreg(9);
 
-    // Trivial register allocator: bump V-reg from V16.
-    // V16..V31 are caller-saved in AAPCS64, so we can use
-    // them without a prologue. 16 slots is enough for any
-    // single-block scalar shader the test harness drives.
-    let mut next_vreg: u8 = 16;
-    let mut alloc_vreg = || -> Result<asm::Vreg, BackendError> {
-        if next_vreg >= 32 {
-            return Err(BackendError::Unsupported(
-                "ran out of scratch V-regs (>16 live scalars); \
-                 linear-scan RA lands in step 4".into()));
-        }
-        let v = asm::Vreg(next_vreg);
-        next_vreg += 1;
-        Ok(v)
-    };
+    // ── Pre-pass: live-range analysis ─────────────────────────
+    //
+    // For each scalar ValueId compute the highest inst
+    // index that references it. ConstVec lanes inherit the
+    // ConstVec result's uses transitively, so a Store of a
+    // vector keeps every lane alive through the Store.
+    let last_use = compute_last_use(&block.insts);
 
-    for inst in &block.insts {
+    // ── Linear-scan register allocator ─────────────────────────
+    //
+    // Free pool of V-regs (V16..V31, caller-saved in
+    // AAPCS64). At each inst i, before defining any new
+    // value, expire scalars whose last_use < i and return
+    // their V-regs to the pool. Then allocate from the pool
+    // for new defs.
+    let mut free_pool: Vec<u8> = (16..32).rev().collect();
+    let mut owners: HashMap<u8, ValueId> = HashMap::new();
+
+    for (i, inst) in block.insts.iter().enumerate() {
+        // Expire scalars whose last_use < i. Their V-regs
+        // return to the free pool. Drain into a temp Vec
+        // first to dodge the borrow checker.
+        let dead: Vec<u8> = owners.iter()
+            .filter_map(|(n, id)|
+                if last_use.get(id).copied().unwrap_or(usize::MAX) < i {
+                    Some(*n)
+                } else { None })
+            .collect();
+        for n in dead {
+            owners.remove(&n);
+            free_pool.push(n);
+        }
+
         match &inst.op {
             Op::ConstFloat { value, kind: FloatKind::F32 } => {
                 let bits = (*value as f32).to_bits();
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal("ConstFloat without result".into()))?;
-                let v = alloc_vreg()?;
+                let v = alloc_vreg(&mut free_pool, &mut owners, result.id)?;
                 materialise_u32_into_w(&mut a, w_tmp, bits);
                 a.emit(asm::fmov_s_from_w(v, w_tmp));
                 scalars.insert(result.id, v);
@@ -219,7 +235,6 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
             Op::ConstVec(elements) => {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal("ConstVec without result".into()))?;
-                // Verify every lane is a known scalar.
                 for el in elements {
                     if !scalars.contains_key(&el.id) {
                         return Err(BackendError::Unsupported(format!(
@@ -228,17 +243,17 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
                 }
                 vectors.insert(result.id, elements.clone());
             }
-            Op::FAdd(a_v, b_v) => emit_fp_binop_inline(
-                &mut a, &mut scalars, &mut alloc_vreg,
+            Op::FAdd(a_v, b_v) => emit_fp_binop_with_pool(
+                &mut a, &mut scalars, &mut free_pool, &mut owners,
                 inst, a_v, b_v, asm::fadd_s)?,
-            Op::FSub(a_v, b_v) => emit_fp_binop_inline(
-                &mut a, &mut scalars, &mut alloc_vreg,
+            Op::FSub(a_v, b_v) => emit_fp_binop_with_pool(
+                &mut a, &mut scalars, &mut free_pool, &mut owners,
                 inst, a_v, b_v, asm::fsub_s)?,
-            Op::FMul(a_v, b_v) => emit_fp_binop_inline(
-                &mut a, &mut scalars, &mut alloc_vreg,
+            Op::FMul(a_v, b_v) => emit_fp_binop_with_pool(
+                &mut a, &mut scalars, &mut free_pool, &mut owners,
                 inst, a_v, b_v, asm::fmul_s)?,
-            Op::FDiv(a_v, b_v) => emit_fp_binop_inline(
-                &mut a, &mut scalars, &mut alloc_vreg,
+            Op::FDiv(a_v, b_v) => emit_fp_binop_with_pool(
+                &mut a, &mut scalars, &mut free_pool, &mut owners,
                 inst, a_v, b_v, asm::fdiv_s)?,
             Op::Store { ptr, value } => {
                 match &ptr.ty {
@@ -253,15 +268,12 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
                     return Err(BackendError::Unsupported(format!(
                         "Store of {}-lane vector not supported", lanes.len())));
                 }
-                for (i, lane) in lanes.iter().enumerate() {
+                for (lane_i, lane) in lanes.iter().enumerate() {
                     let sreg = *scalars.get(&lane.id).ok_or_else(||
                         BackendError::Internal(format!(
                             "lane {:?} not in scalars", lane.id)))?;
-                    // Move f32 bits S-reg → W-reg, then
-                    // store the W-reg at the per-lane
-                    // offset. (No str_s_offset in pptk yet.)
                     a.emit(asm::fmov_w_from_s(w_tmp, sreg));
-                    let offset_bytes = (i as u16) * 4;
+                    let offset_bytes = (lane_i as u16) * 4;
                     a.emit(asm::str_w_offset(w_tmp, x_out, offset_bytes));
                 }
             }
@@ -277,13 +289,70 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
     Ok(a.into_bytes())
 }
 
+/// Linear-scan allocator helper: take one V-reg from the
+/// free pool, remember which value owns it. Returns
+/// Unsupported when the pool is empty (spilling lands
+/// in step 5+).
+fn alloc_vreg(
+    free_pool: &mut Vec<u8>,
+    owners: &mut HashMap<u8, ValueId>,
+    owner: ValueId,
+) -> Result<asm::Vreg, BackendError> {
+    let n = free_pool.pop().ok_or_else(|| BackendError::Unsupported(
+        "linear-scan RA ran out of V-regs; spilling lands in step 5".into()))?;
+    owners.insert(n, owner);
+    Ok(asm::Vreg(n))
+}
+
+/// Compute the highest inst index that references each
+/// scalar ValueId. ConstVec lanes inherit the ConstVec
+/// result's uses transitively (a Store of a vector keeps
+/// each lane alive through the Store).
+fn compute_last_use(insts: &[atrium_spv_ir::Inst]) -> HashMap<ValueId, usize> {
+    let mut last_use: HashMap<ValueId, usize> = HashMap::new();
+    let mut vec_lanes: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
+    for (i, inst) in insts.iter().enumerate() {
+        let mut mark = |id: ValueId| {
+            last_use.entry(id)
+                .and_modify(|e| *e = (*e).max(i))
+                .or_insert(i);
+        };
+        match &inst.op {
+            Op::ConstFloat { .. } | Op::ConstInt { .. } | Op::ConstNull => {}
+            Op::ConstVec(els) => {
+                let lane_ids: Vec<ValueId> =
+                    els.iter().map(|v| v.id).collect();
+                for lid in &lane_ids { mark(*lid); }
+                if let Some(r) = inst.result.as_ref() {
+                    vec_lanes.insert(r.id, lane_ids);
+                }
+            }
+            Op::FAdd(l, r) | Op::FSub(l, r)
+            | Op::FMul(l, r) | Op::FDiv(l, r) => {
+                mark(l.id); mark(r.id);
+            }
+            Op::FNeg(s) => mark(s.id),
+            Op::Store { ptr: _, value } => {
+                mark(value.id);
+                if let Some(lane_ids) = vec_lanes.get(&value.id).cloned() {
+                    for lid in &lane_ids { mark(*lid); }
+                }
+            }
+            _ => {}
+        }
+    }
+    last_use
+}
+
 /// Emit one scalar f32 binary op (fadd/fsub/fmul/fdiv).
-/// Takes `&mut HashMap` for both lookup + insert to keep
-/// the borrow checker happy.
-fn emit_fp_binop_inline(
+/// Allocates the destination V-reg from the linear-scan
+/// free pool.
+#[allow(clippy::too_many_arguments)]
+fn emit_fp_binop_with_pool(
     a: &mut asm::Asm,
     scalars: &mut HashMap<ValueId, asm::Vreg>,
-    alloc_vreg: &mut dyn FnMut() -> Result<asm::Vreg, BackendError>,
+    free_pool: &mut Vec<u8>,
+    owners: &mut HashMap<u8, ValueId>,
     inst: &atrium_spv_ir::Inst,
     lhs: &Value,
     rhs: &Value,
@@ -295,7 +364,7 @@ fn emit_fp_binop_inline(
         BackendError::Internal(format!("fp binop lhs {:?} missing", lhs.id)))?;
     let r = *scalars.get(&rhs.id).ok_or_else(||
         BackendError::Internal(format!("fp binop rhs {:?} missing", rhs.id)))?;
-    let d = alloc_vreg()?;
+    let d = alloc_vreg(free_pool, owners, result.id)?;
     a.emit(make_inst(d, l, r));
     scalars.insert(result.id, d);
     Ok(())
