@@ -1,0 +1,24 @@
+[package]
+name        = "atrium-spv-tests"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "Test harness for tier-2 software Vulkan: SPIR-V interpreter (the differential-test oracle that walks SPIR-V bytes directly with no shared frontend) + assert_shader_agrees framework that drives shaders through all three production backends + the interpreter and compares pixel-for-pixel. See docs/spec/tier2-renderer.md §10 and docs/spec/tier2-shader-codegen-constraints.md §F1."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# rspirv: only the parser (the `dr` module that produces our
+# walkable IR). We do NOT depend on `atrium-spv-ir` deliberately
+# — the interpreter must read SPIR-V directly per constraint F1,
+# with zero shared code with the production frontend, otherwise
+# bugs in the shared frontend would silently agree with the
+# production backends and slip past the diff harness.
+rspirv = "0.13"
+
+[dev-dependencies]
+# Tests sometimes build SPIR-V by hand. Plus a few small
+# integration tests verifying constant-colour shaders flow
+# through the interpreter cleanly.
