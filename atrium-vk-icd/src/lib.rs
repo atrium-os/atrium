@@ -1230,6 +1230,23 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkCommandBuffer, u64, u64, u32, *const c_void), FnVoidPtr,
             >(vkCmdPushDescriptorSetWithTemplate)),
+        // VkPipelineCache shims.
+        "vkCreatePipelineCache" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, *const c_void, *const c_void, *mut u64) -> VkResult, FnVoidPtr,
+            >(vkCreatePipelineCache)),
+        "vkDestroyPipelineCache" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, *const c_void), FnVoidPtr,
+            >(vkDestroyPipelineCache)),
+        "vkGetPipelineCacheData" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, *mut usize, *mut c_void) -> VkResult, FnVoidPtr,
+            >(vkGetPipelineCacheData)),
+        "vkMergePipelineCaches" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, u32, *const u64) -> VkResult, FnVoidPtr,
+            >(vkMergePipelineCaches)),
         // 1.2 indirect-count draws — forward to non-Count variants
         // with max_draw_count as the static count.
         "vkCmdDrawIndirectCount" |
@@ -5183,6 +5200,61 @@ pub unsafe extern "C" fn vkCmdPushDescriptorSetWithTemplate(
     _p_data:            *const c_void,
 ) {}
 
+// ── VkPipelineCache stubs ───────────────────────────────────────
+//
+// Modern engines (wgpu, Bevy, RPCS3, RenderDoc replay tooling)
+// always pass a VkPipelineCache to vkCreateGraphicsPipelines /
+// vkCreateComputePipelines to avoid re-compiling shaders across
+// runs, and call vkGetPipelineCacheData on shutdown to save it
+// to disk. atrium-vk-icd's shader caching lives daemon-side
+// (resolve_shader hash → blob) and is already cross-run, so the
+// VkPipelineCache here is a pure compat shim: distinct handle,
+// empty data on read, SUCCESS on merge.
+
+#[no_mangle]
+pub unsafe extern "C" fn vkCreatePipelineCache(
+    _device:         VkDevice,
+    _p_create_info:  *const c_void,
+    _p_allocator:    *const c_void,
+    p_cache:         *mut u64,
+) -> VkResult {
+    if p_cache.is_null() { return VK_ERROR_INITIALIZATION_FAILED; }
+    static NEXT_ID: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(1);
+    *p_cache = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    VK_SUCCESS
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkDestroyPipelineCache(
+    _device: VkDevice, _cache: u64, _p_allocator: *const c_void,
+) {}
+
+/// `vkGetPipelineCacheData` — report size=0 (no data) on the
+/// first call (caller queries size). Subsequent call with a
+/// non-null buffer also writes 0 bytes and returns SUCCESS.
+/// Apps that round-trip cache data to disk will save an empty
+/// blob; loading an empty blob back in vkCreatePipelineCache is
+/// well-defined.
+#[no_mangle]
+pub unsafe extern "C" fn vkGetPipelineCacheData(
+    _device:  VkDevice,
+    _cache:   u64,
+    p_size:   *mut usize,
+    _p_data:  *mut c_void,
+) -> VkResult {
+    if !p_size.is_null() { *p_size = 0; }
+    VK_SUCCESS
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkMergePipelineCaches(
+    _device:        VkDevice,
+    _dst_cache:     u64,
+    _src_cache_count: u32,
+    _p_src_caches:  *const u64,
+) -> VkResult { VK_SUCCESS }
+
 /// `vkFreeDescriptorSets` — release descriptor sets back to the
 /// pool. atrium-vk-icd's descriptor sets are non-resource-owning
 /// (the resource bindings live in the per-cmdbuf BindDescriptors
@@ -6860,6 +6932,42 @@ mod tests {
         assert!(props.optimal_tiling_features.is_empty());
         assert!(props.linear_tiling_features.is_empty());
         assert!(props.buffer_features.is_empty());
+    }
+
+    #[test]
+    fn pipeline_cache_shims_round_trip() {
+        // All four entry points resolve.
+        for name in [
+            b"vkCreatePipelineCache\0".as_slice(),
+            b"vkDestroyPipelineCache\0".as_slice(),
+            b"vkGetPipelineCacheData\0".as_slice(),
+            b"vkMergePipelineCaches\0".as_slice(),
+        ] {
+            assert!(lookup(name).is_some(),
+                "must resolve {}",
+                std::str::from_utf8(&name[..name.len()-1]).unwrap());
+        }
+
+        // Create returns SUCCESS + non-null + distinct handles.
+        let f = lookup(b"vkCreatePipelineCache\0").unwrap();
+        let g: unsafe extern "C" fn(VkDevice, *const c_void, *const c_void, *mut u64) -> VkResult =
+            unsafe { std::mem::transmute(f) };
+        let mut c1: u64 = 0;
+        let mut c2: u64 = 0;
+        let r = unsafe { g(std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), &mut c1) };
+        assert_eq!(r, VK_SUCCESS);
+        unsafe { g(std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), &mut c2); }
+        assert_ne!(c1, 0);
+        assert_ne!(c1, c2);
+
+        // GetData with null data + size-query writes 0.
+        let f = lookup(b"vkGetPipelineCacheData\0").unwrap();
+        let g: unsafe extern "C" fn(VkDevice, u64, *mut usize, *mut c_void) -> VkResult =
+            unsafe { std::mem::transmute(f) };
+        let mut sz: usize = 0xdead_beef;
+        let r = unsafe { g(std::ptr::null_mut(), c1, &mut sz, std::ptr::null_mut()) };
+        assert_eq!(r, VK_SUCCESS);
+        assert_eq!(sz, 0, "tier-1's pipeline cache reports zero saved data");
     }
 
     #[test]
