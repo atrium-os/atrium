@@ -16,3 +16,7 @@ cranelift-module    = { version = "0.131", features = ["std"] }
 cranelift-object    = "0.131"
 cranelift-frontend  = "0.131"
 target-lexicon      = "0.13"
+
+[dev-dependencies]
+atrium-spv-frontend = { path = "../atrium-spv-frontend" }
+rspirv              = "0.13"

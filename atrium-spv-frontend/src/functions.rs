@@ -14,7 +14,7 @@ use rspirv::dr::{Function as SpvFunction, Instruction, Module, Operand};
 use rspirv::spirv::{Op as SpvOp, Word};
 
 use crate::cfg;
-use crate::constants::ConstantContext;
+use crate::constants::{ConstantContext, ConstantKind};
 use crate::error::FrontendError;
 use crate::interface::InterfaceContext;
 use crate::types::TypeContext;
@@ -93,16 +93,15 @@ fn translate_one(
     let mut insts: Vec<Inst> = Vec::new();
 
     for spv_inst in &spv_block.instructions {
-        if let Some(ir_inst) = translate_inst(
+        translate_inst(
             spv_inst,
             types,
             constants,
             iface,
             &mut id_map,
             &mut next_value_id,
-        )? {
-            insts.push(ir_inst);
-        }
+            &mut insts,
+        )?;
     }
 
     blocks.insert(block_id, Block {
@@ -121,12 +120,9 @@ fn translate_one(
     })
 }
 
-/// Translate one SPIR-V instruction.
-///
-/// Returns `Ok(None)` for instructions we deliberately drop
-/// (debug names, decorations rolled into the interface
-/// pass, etc.). Returns `Ok(Some(inst))` when we emit an
-/// IR instruction.
+/// Translate one SPIR-V instruction. Pushes zero or more
+/// [`Inst`]s onto `insts` — constants that need
+/// materialising prefix any non-constant use.
 fn translate_inst(
     spv_inst: &Instruction,
     types: &TypeContext,
@@ -134,9 +130,8 @@ fn translate_inst(
     iface: &InterfaceContext,
     id_map: &mut HashMap<Word, Value>,
     next_value_id: &mut u32,
-) -> Result<Option<Inst>, FrontendError> {
-    let _ = iface; // reserved for future passes (descriptor lookup)
-
+    insts: &mut Vec<Inst>,
+) -> Result<(), FrontendError> {
     // Source SPIR-V offset for the PC-map sidecar (constraint A2).
     // rspirv doesn't surface the original byte offset on dr::Instruction,
     // so for phase 1 v1 we use 0 as a placeholder. Phase 1 v2 wires this
@@ -146,7 +141,7 @@ fn translate_inst(
 
     match spv_inst.class.opcode {
         // Block label — handled by block-walking, no IR emit.
-        SpvOp::Label | SpvOp::Nop => Ok(None),
+        SpvOp::Label | SpvOp::Nop => Ok(()),
 
         SpvOp::Store => {
             let ptr_id = expect_id(&spv_inst.operands, 0)?;
@@ -158,39 +153,43 @@ fn translate_inst(
             )? {
                 Some(v) => v,
                 None => resolve_value(
-                    ptr_id, types, constants, id_map, next_value_id,
+                    ptr_id, types, constants, id_map, next_value_id, insts,
                 )?,
             };
             let value_value = resolve_value(
-                value_id, types, constants, id_map, next_value_id,
+                value_id, types, constants, id_map, next_value_id, insts,
             )?;
-            // OpStore has no result.
-            Ok(Some(Inst {
+            insts.push(Inst {
                 op: Op::Store { ptr: ptr_value, value: value_value },
                 result: None,
                 source_spirv_offset,
-            }))
+            });
+            Ok(())
         }
 
-        SpvOp::Return => Ok(Some(Inst {
-            op: Op::Return,
-            result: None,
-            source_spirv_offset,
-        })),
+        SpvOp::Return => {
+            insts.push(Inst {
+                op: Op::Return,
+                result: None,
+                source_spirv_offset,
+            });
+            Ok(())
+        }
 
         SpvOp::ReturnValue => {
             let val_id = expect_id(&spv_inst.operands, 0)?;
             let val = resolve_value(
-                val_id, types, constants, id_map, next_value_id,
+                val_id, types, constants, id_map, next_value_id, insts,
             )?;
-            Ok(Some(Inst {
+            insts.push(Inst {
                 op: Op::ReturnValue(val),
                 result: None,
                 source_spirv_offset,
-            }))
+            });
+            Ok(())
         }
 
-        SpvOp::FunctionEnd => Ok(None),
+        SpvOp::FunctionEnd => Ok(()),
 
         other => Err(FrontendError::Unsupported(format!(
             "opcode {other:?} not supported in phase 1 v1",
@@ -198,56 +197,71 @@ fn translate_inst(
     }
 }
 
-/// Resolve a SPIR-V id → IR Value, materialising a constant
-/// or variable handle into a fresh SSA value the first
-/// time we see it.
+/// Resolve a SPIR-V id → IR Value, materialising a
+/// constant by pushing the defining Inst(s) onto `insts`.
+///
+/// Idempotent: subsequent lookups of the same id return
+/// the cached Value from `id_map` without re-emitting.
 fn resolve_value(
     id: Word,
     types: &TypeContext,
     constants: &ConstantContext,
     id_map: &mut HashMap<Word, Value>,
     next_value_id: &mut u32,
+    insts: &mut Vec<Inst>,
 ) -> Result<Value, FrontendError> {
     if let Some(v) = id_map.get(&id) { return Ok(v.clone()); }
 
-    // Is it a constant?
+    // Is it a constant? Materialise it.
     if let Some(stored) = constants.get(id) {
         let ty = types.get(stored.type_id)?.clone();
-        let v = fresh_value(ty, next_value_id);
-        id_map.insert(id, v.clone());
-        // Phase 1 v1: constants used in the body are
-        // expected to have been materialised into the
-        // instruction stream by the function-translation
-        // pass. For OpStore-of-const-composite (the
-        // canonical phase-0c case), the const composite's
-        // *value* doesn't actually need an IR Inst — the
-        // backend can reference the stored constant
-        // directly via Op::ConstVec lookup. So we don't
-        // emit an Inst here; the OpStore's value reads
-        // through the SSA id_map to find this Value.
-        //
-        // For richer cases (OpIAdd of two constants, etc.)
-        // we'll need to materialise the constant as an
-        // actual IR instruction. Phase 1 v2 handles that
-        // when arithmetic lands.
-        return Ok(v);
+        let stored = stored.clone(); // free of borrow on `constants`
+        return materialize_constant(
+            id, &stored.kind, ty, types, constants, id_map, next_value_id, insts,
+        );
     }
-
-    // Variables: we need a different path that consults
-    // `iface.variables`. resolve_value's signature didn't
-    // thread the interface context through; refactor to
-    // accept it in a follow-up commit if we hit a shader
-    // that needs OpLoad/OpStore on a variable id that
-    // wasn't already mapped by the function pass.
-    //
-    // For phase 1 v1's constant-store case, the OpStore
-    // path materialises the Output-variable id via
-    // `resolve_variable` directly before calling
-    // resolve_value on it — see `translate_inst`.
 
     Err(FrontendError::Malformed(format!(
         "SSA id {id} referenced but not defined (no constant, no variable)",
     )))
+}
+
+/// Emit the IR instructions defining a constant's value
+/// and return its SSA Value. Recursive: composites
+/// materialise their elements first.
+fn materialize_constant(
+    id: Word,
+    kind: &ConstantKind,
+    ty: Type,
+    types: &TypeContext,
+    constants: &ConstantContext,
+    id_map: &mut HashMap<Word, Value>,
+    next_value_id: &mut u32,
+    insts: &mut Vec<Inst>,
+) -> Result<Value, FrontendError> {
+    let result = fresh_value(ty.clone(), next_value_id);
+    let op = match kind {
+        ConstantKind::Scalar(op) => op.clone(),
+        ConstantKind::Null => Op::ConstNull,
+        ConstantKind::Composite(element_ids) => {
+            // Materialise each element first (recursively).
+            let mut elements = Vec::with_capacity(element_ids.len());
+            for eid in element_ids {
+                let v = resolve_value(
+                    *eid, types, constants, id_map, next_value_id, insts,
+                )?;
+                elements.push(v);
+            }
+            Op::ConstVec(elements)
+        }
+    };
+    insts.push(Inst {
+        op,
+        result: Some(result.clone()),
+        source_spirv_offset: 0,
+    });
+    id_map.insert(id, result.clone());
+    Ok(result)
 }
 
 /// Materialise a variable id as a pointer-typed Value.

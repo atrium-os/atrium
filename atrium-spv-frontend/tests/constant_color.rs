@@ -101,18 +101,50 @@ fn frontend_translates_constant_color_shader() {
     assert!(matches!(last.op, Op::Return),
             "expected Op::Return, got {:?}", last.op);
 
-    // ── 5. Block contains an Op::Store. ────────────────────
+    // ── 5. Block contains constant materialisation + Store ─
+    //
+    // Per the constant-materialisation rule (constraints
+    // A2 + B1: every used value must have a defining
+    // Inst), the body should be:
+    //   ConstFloat(1.0)
+    //   ConstFloat(0.5)
+    //   ConstFloat(0.25)
+    //   ConstFloat(1.0)
+    //   ConstVec([f1, f2, f3, f4])
+    //   Store { ptr=output_var, value=vec }
+    //   Return
+    //
+    // We assert: 4 ConstFloats with the right values, 1
+    // ConstVec referencing those 4 values, 1 Store using
+    // the ConstVec's result, and Return as the terminator.
+    let const_floats: Vec<f32> = block.insts.iter().filter_map(|i| {
+        if let Op::ConstFloat { value, kind: atrium_spv_ir::FloatKind::F32 } = &i.op {
+            Some(*value as f32)
+        } else { None }
+    }).collect();
+    assert_eq!(const_floats, vec![1.0, 0.5, 0.25, 1.0],
+               "expected exactly four ConstFloat insts with shader's RGBA");
+
+    let const_vec = block.insts.iter()
+        .find(|i| matches!(i.op, Op::ConstVec(_)))
+        .expect("expected an Op::ConstVec");
+    if let Op::ConstVec(elements) = &const_vec.op {
+        assert_eq!(elements.len(), 4, "ConstVec must have 4 elements");
+    }
+
     let store = block.insts.iter()
         .find(|i| matches!(i.op, Op::Store { .. }))
         .expect("expected an Op::Store");
-    if let Op::Store { ptr, .. } = &store.op {
-        // The pointer should be a Pointer(Output, Vec4(F32)).
+    if let Op::Store { ptr, value } = &store.op {
         match &ptr.ty {
             Type::Pointer(StorageClass::Output, inner) => {
                 assert_eq!(**inner, Type::Vec4(VecElement::F32));
             }
             other => panic!("expected Pointer(Output, Vec4(F32)); got {other:?}"),
         }
+        // Store.value must be the ConstVec's result.
+        let cv_result = const_vec.result.as_ref().unwrap();
+        assert_eq!(value.id, cv_result.id);
     }
 
     // ── 6. Module's varyings list has one entry. ───────────

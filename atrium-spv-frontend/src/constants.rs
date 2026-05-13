@@ -26,8 +26,28 @@ use crate::types::TypeContext;
 pub struct StoredConstant {
     /// SPIR-V id of the constant's result type.
     pub type_id: Word,
-    /// The IR Op that constructs this constant value.
-    pub op: Op,
+    /// Logical shape of the constant.
+    pub kind: ConstantKind,
+}
+
+/// Logical structure of a stored constant.
+///
+/// The function-translation pass uses this to materialise
+/// the constant as one or more IR instructions on first
+/// use. Scalars become one `Op::ConstInt` or `ConstFloat`;
+/// composites become N scalar-defining Insts plus one
+/// `Op::ConstVec` aggregating them.
+#[derive(Debug, Clone)]
+pub enum ConstantKind {
+    /// A scalar (int or float). The Op variant carries
+    /// the actual value.
+    Scalar(Op),
+    /// The null / zero value for the constant's type.
+    Null,
+    /// A composite (vector or matrix) whose elements
+    /// are themselves stored constants. SPIR-V ids of
+    /// the element constants, in lane order.
+    Composite(Vec<Word>),
 }
 
 /// Map from SPIR-V constant id → [`StoredConstant`].
@@ -50,17 +70,21 @@ impl ConstantContext {
                 SpvOp::ConstantTrue => StoredConstant {
                     type_id: inst.result_type.ok_or_else(|| FrontendError::Malformed(
                         "ConstantTrue without result type".to_string()))?,
-                    op: Op::ConstInt { value: 1, kind: IntKind::I32 },
+                    kind: ConstantKind::Scalar(Op::ConstInt {
+                        value: 1, kind: IntKind::I32,
+                    }),
                 },
                 SpvOp::ConstantFalse => StoredConstant {
                     type_id: inst.result_type.ok_or_else(|| FrontendError::Malformed(
                         "ConstantFalse without result type".to_string()))?,
-                    op: Op::ConstInt { value: 0, kind: IntKind::I32 },
+                    kind: ConstantKind::Scalar(Op::ConstInt {
+                        value: 0, kind: IntKind::I32,
+                    }),
                 },
                 SpvOp::ConstantNull => StoredConstant {
                     type_id: inst.result_type.ok_or_else(|| FrontendError::Malformed(
                         "ConstantNull without result type".to_string()))?,
-                    op: Op::ConstNull,
+                    kind: ConstantKind::Null,
                 },
                 SpvOp::ConstantComposite => translate_constant_composite(
                     inst, &ctx,
@@ -101,7 +125,7 @@ fn translate_op_constant(
             };
             Ok(StoredConstant {
                 type_id,
-                op: Op::ConstInt { value, kind },
+                kind: ConstantKind::Scalar(Op::ConstInt { value, kind }),
             })
         }
         Type::I64 | Type::U64 => {
@@ -126,7 +150,7 @@ fn translate_op_constant(
             let kind = if matches!(ty, Type::I64) { IntKind::I64 } else { IntKind::U64 };
             Ok(StoredConstant {
                 type_id,
-                op: Op::ConstInt { value, kind },
+                kind: ConstantKind::Scalar(Op::ConstInt { value, kind }),
             })
         }
         Type::F32 => {
@@ -138,10 +162,10 @@ fn translate_op_constant(
             };
             Ok(StoredConstant {
                 type_id,
-                op: Op::ConstFloat {
+                kind: ConstantKind::Scalar(Op::ConstFloat {
                     value: f32::from_bits(bits) as f64,
                     kind: FloatKind::F32,
-                },
+                }),
             })
         }
         Type::F64 => {
@@ -162,10 +186,10 @@ fn translate_op_constant(
             };
             Ok(StoredConstant {
                 type_id,
-                op: Op::ConstFloat {
+                kind: ConstantKind::Scalar(Op::ConstFloat {
                     value: f64::from_bits(bits),
                     kind: FloatKind::F64,
-                },
+                }),
             })
         }
         other => Err(FrontendError::Unsupported(format!(
@@ -180,20 +204,6 @@ fn translate_constant_composite(
 ) -> Result<StoredConstant, FrontendError> {
     let type_id = inst.result_type.ok_or_else(|| FrontendError::Malformed(
         "ConstantComposite without result type".to_string()))?;
-    // We can't yet build the inner `Value` list — the
-    // function-translation pass owns the SSA renaming and
-    // will look up these constituent constants when it
-    // emits the composite. For now we store the
-    // operand id list as a `ConstVec` with placeholder
-    // values; the function pass replaces those with real
-    // Values during translation.
-    //
-    // Phase 1 v1's narrow scope means we only encounter
-    // ConstantComposite for vec4 outputs, which the
-    // function pass handles specially. Storing the
-    // op-with-placeholder lets us defer the real
-    // construction to the place that has the SSA-renaming
-    // context.
     let mut element_ids = Vec::with_capacity(inst.operands.len());
     for op in &inst.operands {
         match op {
@@ -210,17 +220,8 @@ fn translate_constant_composite(
             ))),
         }
     }
-    // Stash the element ids on the op via a side channel:
-    // we re-use Op::ConstVec but with an empty Vec, and
-    // the function pass reads the operand list directly
-    // from the SPIR-V instruction when it needs the
-    // element ids. To make that possible we also return
-    // the raw element-id list via the ConstantContext —
-    // but for v1 the function pass walks the source
-    // SPIR-V instruction directly.
-    let _ = element_ids; // see comment above
     Ok(StoredConstant {
         type_id,
-        op: Op::ConstVec(Vec::new()),
+        kind: ConstantKind::Composite(element_ids),
     })
 }
