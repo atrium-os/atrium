@@ -988,6 +988,23 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkCommandBuffer), FnVoidPtr,
             >(vkCmdEndRenderPass)),
+        // 1.2 RenderPass2 (VK_KHR_create_renderpass2 aliases).
+        "vkCreateRenderPass2" | "vkCreateRenderPass2KHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, *const c_void, *const c_void, *mut u64) -> VkResult, FnVoidPtr,
+            >(vkCreateRenderPass2)),
+        "vkCmdBeginRenderPass2" | "vkCmdBeginRenderPass2KHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, *const c_void, *const c_void), FnVoidPtr,
+            >(vkCmdBeginRenderPass2)),
+        "vkCmdNextSubpass2" | "vkCmdNextSubpass2KHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, *const c_void, *const c_void), FnVoidPtr,
+            >(vkCmdNextSubpass2)),
+        "vkCmdEndRenderPass2" | "vkCmdEndRenderPass2KHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, *const c_void), FnVoidPtr,
+            >(vkCmdEndRenderPass2)),
         // 1.3 dynamic-rendering — VK_KHR_dynamic_rendering KHR aliases.
         "vkCmdBeginRendering" | "vkCmdBeginRenderingKHR" =>
             Some(std::mem::transmute::<
@@ -3298,6 +3315,72 @@ pub unsafe extern "C" fn vkDestroyRenderPass(
     _render_pass:   u64,
     _p_allocator:   *const c_void,
 ) {}
+
+/// `vkCreateRenderPass2` — Vulkan 1.2 mandatory richer variant of
+/// vkCreateRenderPass (per-subpass view masks, per-attachment
+/// stencil layouts, depth-stencil resolve). atrium-vk-icd
+/// allocates a handle the same way the 1.0 entry does and
+/// ignores the create-info — the daemon's render-pass model is
+/// driven by per-frame Begin/EndRenderPass FrameOps, not by
+/// vkCreateRenderPass metadata.
+#[no_mangle]
+pub unsafe extern "C" fn vkCreateRenderPass2(
+    device:          VkDevice,
+    p_create_info:   *const c_void,
+    p_allocator:     *const c_void,
+    p_render_pass:   *mut u64,
+) -> VkResult {
+    vkCreateRenderPass(device, p_create_info, p_allocator, p_render_pass)
+}
+
+/// `vkCmdBeginRenderPass2` — Vulkan 1.2 variant. Takes a second
+/// VkSubpassBeginInfo (16 bytes: sType + pNext + contents) that
+/// we extract `contents` from and forward to the 1.0 entry.
+///
+/// VkSubpassBeginInfo (16 bytes):
+///   0  sType
+///   8  pNext
+///   16 contents (u32) — but actually offset 16 would be past
+///                       struct; let me recheck.
+/// Actually VkSubpassBeginInfo on 64-bit:
+///   0  sType (u32) + 4 pad
+///   8  pNext (8)
+///   16 contents (u32) + 4 pad = 24 bytes
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdBeginRenderPass2(
+    command_buffer:     VkCommandBuffer,
+    p_render_pass_begin: *const c_void,
+    p_subpass_begin_info: *const c_void,
+) {
+    let contents = if !p_subpass_begin_info.is_null() {
+        std::ptr::read_unaligned((p_subpass_begin_info as *const u8).add(16) as *const u32)
+    } else { 0 };
+    vkCmdBeginRenderPass(command_buffer, p_render_pass_begin, contents)
+}
+
+/// `vkCmdNextSubpass2` — delegate to vkCmdNextSubpass with the
+/// extracted contents byte (same VkSubpassBeginInfo layout).
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdNextSubpass2(
+    command_buffer: VkCommandBuffer,
+    p_subpass_begin_info: *const c_void,
+    _p_subpass_end_info:  *const c_void,
+) {
+    let contents = if !p_subpass_begin_info.is_null() {
+        std::ptr::read_unaligned((p_subpass_begin_info as *const u8).add(16) as *const u32)
+    } else { 0 };
+    vkCmdNextSubpass(command_buffer, contents)
+}
+
+/// `vkCmdEndRenderPass2` — VkSubpassEndInfo carries no payload
+/// we honor; delegate.
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdEndRenderPass2(
+    command_buffer: VkCommandBuffer,
+    _p_subpass_end_info: *const c_void,
+) {
+    vkCmdEndRenderPass(command_buffer)
+}
 
 /// `vkCreateFramebuffer` — record the attachment image views +
 /// extent.
@@ -6932,6 +7015,24 @@ mod tests {
         assert!(props.optimal_tiling_features.is_empty());
         assert!(props.linear_tiling_features.is_empty());
         assert!(props.buffer_features.is_empty());
+    }
+
+    #[test]
+    fn renderpass2_entry_points_resolve() {
+        for name in [
+            b"vkCreateRenderPass2\0".as_slice(),
+            b"vkCreateRenderPass2KHR\0".as_slice(),
+            b"vkCmdBeginRenderPass2\0".as_slice(),
+            b"vkCmdBeginRenderPass2KHR\0".as_slice(),
+            b"vkCmdNextSubpass2\0".as_slice(),
+            b"vkCmdNextSubpass2KHR\0".as_slice(),
+            b"vkCmdEndRenderPass2\0".as_slice(),
+            b"vkCmdEndRenderPass2KHR\0".as_slice(),
+        ] {
+            assert!(lookup(name).is_some(),
+                "must resolve {}",
+                std::str::from_utf8(&name[..name.len()-1]).unwrap());
+        }
     }
 
     #[test]
