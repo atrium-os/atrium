@@ -1,0 +1,15 @@
+[package]
+name        = "atrium-spv-pcmap"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "PC-map sidecar format for tier-2 software Vulkan shaders. Maps host instruction PCs back to source SPIR-V byte offsets so crash triage can report 'shader X, SPIR-V offset 0x...' instead of a raw native PC. Produced by both production backends during codegen; consumed by the daemon's crash handler. See docs/spec/tier2-renderer.md §10.1."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# No deps. The format is a tight binary structure
+# (8-byte magic, 4-byte version, 4-byte count, N×8-byte
+# entries). Build + parse with std only.
