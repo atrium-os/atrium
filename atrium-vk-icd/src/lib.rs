@@ -1267,6 +1267,23 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkCommandBuffer, u32, *const u64, u32, u32, u32, *const c_void, u32, *const c_void, u32, *const c_void), FnVoidPtr,
             >(vkCmdWaitEvents)),
+        // Vulkan 1.3 sync2 event variants.
+        "vkCmdSetEvent2" | "vkCmdSetEvent2KHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u64, *const c_void), FnVoidPtr,
+            >(vkCmdSetEvent2)),
+        "vkCmdResetEvent2" | "vkCmdResetEvent2KHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u64, u64), FnVoidPtr,
+            >(vkCmdResetEvent2)),
+        "vkCmdWaitEvents2" | "vkCmdWaitEvents2KHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u32, *const u64, *const c_void), FnVoidPtr,
+            >(vkCmdWaitEvents2)),
+        "vkCmdWriteTimestamp2" | "vkCmdWriteTimestamp2KHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u64, u64, u32), FnVoidPtr,
+            >(vkCmdWriteTimestamp2)),
         // VkBufferView.
         "vkCreateBufferView" =>
             Some(std::mem::transmute::<
@@ -4335,6 +4352,49 @@ pub unsafe extern "C" fn vkCmdWaitEvents(
     _p_image_memory_barriers:  *const c_void,
 ) {}
 
+// ── Vulkan 1.3 sync2 event variants ─────────────────────────────
+//
+// All three are no-ops on tier-1 (sequential submission +
+// daemon-side fence sync make events redundant). Wired so the
+// 1.3 / VK_KHR_synchronization2 dispatch table resolves them
+// instead of bailing.
+
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdSetEvent2(
+    _command_buffer:    VkCommandBuffer,
+    _event:             u64,
+    _p_dependency_info: *const c_void,
+) {}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdResetEvent2(
+    _command_buffer: VkCommandBuffer,
+    _event:          u64,
+    _stage_mask:     u64, /* VkPipelineStageFlags2 — wider than 1.0 */
+) {}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdWaitEvents2(
+    _command_buffer:     VkCommandBuffer,
+    _event_count:        u32,
+    _p_events:           *const u64,
+    _p_dependency_infos: *const c_void,
+) {}
+
+/// `vkCmdWriteTimestamp2` — 1.3 timestamp write. tier-1 has no
+/// real query pool (queries are SUCCESS no-ops); writing a
+/// timestamp is therefore also a no-op. Apps that subsequently
+/// read via vkGetQueryPoolResults will see zeros, which matches
+/// our timestampPeriod=0 limit (signals "queries not really
+/// supported").
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdWriteTimestamp2(
+    _command_buffer: VkCommandBuffer,
+    _stage:          u64,
+    _query_pool:     u64,
+    _query:          u32,
+) {}
+
 // ───── VkBufferView ─────────────────────────────────────────────
 
 #[no_mangle]
@@ -6260,6 +6320,32 @@ mod tests {
         assert!(props.optimal_tiling_features.is_empty());
         assert!(props.linear_tiling_features.is_empty());
         assert!(props.buffer_features.is_empty());
+    }
+
+    #[test]
+    fn sync2_event_and_timestamp_stubs_resolve() {
+        for name in [
+            b"vkCmdSetEvent2\0".as_slice(),
+            b"vkCmdSetEvent2KHR\0".as_slice(),
+            b"vkCmdResetEvent2\0".as_slice(),
+            b"vkCmdResetEvent2KHR\0".as_slice(),
+            b"vkCmdWaitEvents2\0".as_slice(),
+            b"vkCmdWaitEvents2KHR\0".as_slice(),
+            b"vkCmdWriteTimestamp2\0".as_slice(),
+            b"vkCmdWriteTimestamp2KHR\0".as_slice(),
+        ] {
+            assert!(lookup(name).is_some(),
+                "must resolve {}",
+                std::str::from_utf8(&name[..name.len()-1]).unwrap());
+        }
+
+        // No-op invocations on null cmdbuf must not panic — the
+        // existing 1.0 event stubs also accept null and we keep
+        // the same forgiving contract.
+        let f = lookup(b"vkCmdSetEvent2\0").unwrap();
+        let g: unsafe extern "C" fn(VkCommandBuffer, u64, *const c_void) =
+            unsafe { std::mem::transmute(f) };
+        unsafe { g(std::ptr::null_mut(), 0, std::ptr::null()); }
     }
 
     #[test]
