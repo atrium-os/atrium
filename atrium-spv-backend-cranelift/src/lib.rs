@@ -388,6 +388,39 @@ impl FnTranslator {
             Op::FNeg(a) => self.emit_float_unop(
                 builder, &inst.result, a, |b, x| b.ins().fneg(x),
             ),
+            // Op::Dot: per-lane fmul, then tree-reduce
+            // with fadd. Result is a scalar.
+            Op::Dot(a, b) => {
+                let a_lanes = self.vectors.get(&a.id).cloned()
+                    .ok_or_else(|| BackendError::Unsupported(format!(
+                        "Dot lhs id {:?} not in vectors", a.id,
+                    )))?;
+                let b_lanes = self.vectors.get(&b.id).cloned()
+                    .ok_or_else(|| BackendError::Unsupported(format!(
+                        "Dot rhs id {:?} not in vectors", b.id,
+                    )))?;
+                if a_lanes.len() != b_lanes.len() {
+                    return Err(BackendError::Unsupported(format!(
+                        "Dot with mismatched lane counts: {} vs {}",
+                        a_lanes.len(), b_lanes.len(),
+                    )));
+                }
+                if a_lanes.is_empty() {
+                    return Err(BackendError::Unsupported(
+                        "Dot on zero-lane vectors".to_string(),
+                    ));
+                }
+                let mut acc = builder.ins().fmul(a_lanes[0], b_lanes[0]);
+                for (la, lb) in a_lanes.iter().zip(b_lanes.iter()).skip(1) {
+                    let prod = builder.ins().fmul(*la, *lb);
+                    acc = builder.ins().fadd(acc, prod);
+                }
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "Dot without result Value".to_string()))?;
+                self.scalars.insert(result.id, acc);
+                Ok(())
+            }
             other => Err(BackendError::Unsupported(format!(
                 "Op {other:?} not supported in phase 2 v6",
             ))),
@@ -425,6 +458,33 @@ impl FnTranslator {
             let mut out_lanes = Vec::with_capacity(a_lanes.len());
             for (la, lb) in a_lanes.iter().zip(b_lanes.iter()) {
                 out_lanes.push(emit(builder, *la, *lb));
+            }
+            self.vectors.insert(result.id, out_lanes);
+            return Ok(());
+        }
+
+        // Vec × scalar (broadcast). OpVectorTimesScalar
+        // lowers through here: SPIR-V puts the vec
+        // first, scalar second.
+        if let (Some(a_lanes), Some(b_scalar)) =
+            (self.vectors.get(&a.id).cloned(), self.scalars.get(&b.id).copied())
+        {
+            let mut out_lanes = Vec::with_capacity(a_lanes.len());
+            for la in a_lanes.iter() {
+                out_lanes.push(emit(builder, *la, b_scalar));
+            }
+            self.vectors.insert(result.id, out_lanes);
+            return Ok(());
+        }
+
+        // Scalar × vec (broadcast, commutative for our
+        // supported ops). Symmetric case for safety.
+        if let (Some(a_scalar), Some(b_lanes)) =
+            (self.scalars.get(&a.id).copied(), self.vectors.get(&b.id).cloned())
+        {
+            let mut out_lanes = Vec::with_capacity(b_lanes.len());
+            for lb in b_lanes.iter() {
+                out_lanes.push(emit(builder, a_scalar, *lb));
             }
             self.vectors.insert(result.id, out_lanes);
             return Ok(());

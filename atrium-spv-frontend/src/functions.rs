@@ -235,7 +235,12 @@ fn translate_inst(
             id_map, next_value_id, insts, source_spirv_offset,
             |a, b| Op::FSub(a, b),
         ),
-        SpvOp::FMul => emit_binop_float(
+        // OpFMul + OpVectorTimesScalar both lower to
+        // Op::FMul; the backend's emit_float_binop
+        // dispatches on (scalar × scalar) / (vec × vec) /
+        // (vec × scalar with broadcast) by inspecting the
+        // operand storage.
+        SpvOp::FMul | SpvOp::VectorTimesScalar => emit_binop_float(
             spv_inst, types, constants, iface,
             id_map, next_value_id, insts, source_spirv_offset,
             |a, b| Op::FMul(a, b),
@@ -244,6 +249,11 @@ fn translate_inst(
             spv_inst, types, constants, iface,
             id_map, next_value_id, insts, source_spirv_offset,
             |a, b| Op::FDiv(a, b),
+        ),
+        SpvOp::Dot => emit_binop_float(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::Dot(a, b),
         ),
         SpvOp::FNegate => emit_unop_float(
             spv_inst, types, constants, iface,

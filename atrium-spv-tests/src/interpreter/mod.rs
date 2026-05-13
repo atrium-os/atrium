@@ -405,9 +405,22 @@ impl Interpreter {
             // ── Float arithmetic ──────────────────────────
             Op::FAdd => self.eval_binop_float(inst, values, |a, b| a + b),
             Op::FSub => self.eval_binop_float(inst, values, |a, b| a - b),
-            Op::FMul => self.eval_binop_float(inst, values, |a, b| a * b),
+            Op::FMul | Op::VectorTimesScalar =>
+                self.eval_binop_float(inst, values, |a, b| a * b),
             Op::FDiv => self.eval_binop_float(inst, values, |a, b| a / b),
             Op::FNegate => self.eval_unop_float(inst, values, |a| -a),
+            // OpDot: sum of element-wise products.
+            Op::Dot => {
+                let result_id = inst.result_id.ok_or_else(||
+                    InterpError::BadConstant(0))?;
+                let lhs_id = op_id(&inst.operands, 0)?;
+                let rhs_id = op_id(&inst.operands, 1)?;
+                let lhs = self.lookup_value(lhs_id, values)?;
+                let rhs = self.lookup_value(rhs_id, values)?;
+                let stored = eval_dot_value(&lhs, &rhs)?;
+                values.insert(result_id, stored);
+                Ok(())
+            }
             // OpCompositeConstruct: pack N source values
             // into a Vec.
             Op::CompositeConstruct => {
@@ -546,10 +559,69 @@ fn eval_float_binop_value(
             Ok(ConstantValue::Vec(out))
         }
 
+        // Vec × scalar broadcast (and symmetric).
+        // OpVectorTimesScalar lowers to the FMul case
+        // where one operand is vec and the other is
+        // f32 — apply the scalar to every lane.
+        (ConstantValue::Vec(a), scalar @ (ConstantValue::F32(_) | ConstantValue::F64(_))) => {
+            let mut out = Vec::with_capacity(a.len());
+            for la in a {
+                out.push(eval_float_binop_value(la, scalar, op)?);
+            }
+            Ok(ConstantValue::Vec(out))
+        }
+        (scalar @ (ConstantValue::F32(_) | ConstantValue::F64(_)), ConstantValue::Vec(b)) => {
+            let mut out = Vec::with_capacity(b.len());
+            for lb in b {
+                out.push(eval_float_binop_value(scalar, lb, op)?);
+            }
+            Ok(ConstantValue::Vec(out))
+        }
+
         _ => Err(InterpError::UnsupportedOpcode(format!(
             "float binop on incompatible operands: {lhs:?}, {rhs:?}",
         ))),
     }
+}
+
+/// Evaluate OpDot: sum of element-wise products. Both
+/// operands must be vectors of the same length.
+fn eval_dot_value(
+    lhs: &ConstantValue,
+    rhs: &ConstantValue,
+) -> Result<ConstantValue, InterpError> {
+    let (a, b) = match (lhs, rhs) {
+        (ConstantValue::Vec(a), ConstantValue::Vec(b)) => (a, b),
+        _ => return Err(InterpError::UnsupportedOpcode(format!(
+            "Dot expects two vectors, got {lhs:?} and {rhs:?}",
+        ))),
+    };
+    if a.len() != b.len() {
+        return Err(InterpError::UnsupportedOpcode(format!(
+            "Dot with mismatched lane counts: {} vs {}",
+            a.len(), b.len(),
+        )));
+    }
+    let mut acc: f64 = 0.0;
+    let mut had_f64 = false;
+    for (la, lb) in a.iter().zip(b.iter()) {
+        let (av, bv, f64_op) = match (la, lb) {
+            (ConstantValue::F32(x), ConstantValue::F32(y)) =>
+                (*x as f64, *y as f64, false),
+            (ConstantValue::F64(x), ConstantValue::F64(y)) =>
+                (*x, *y, true),
+            (ConstantValue::F32(x), ConstantValue::F64(y)) =>
+                (*x as f64, *y, true),
+            (ConstantValue::F64(x), ConstantValue::F32(y)) =>
+                (*x, *y as f64, true),
+            _ => return Err(InterpError::UnsupportedOpcode(format!(
+                "Dot lane has non-float elements: {la:?}, {lb:?}",
+            ))),
+        };
+        had_f64 |= f64_op;
+        acc += av * bv;
+    }
+    Ok(if had_f64 { ConstantValue::F64(acc) } else { ConstantValue::F32(acc as f32) })
 }
 
 /// Apply a scalar-f64 unary operator across a

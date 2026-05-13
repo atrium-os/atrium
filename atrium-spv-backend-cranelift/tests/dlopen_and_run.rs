@@ -340,6 +340,118 @@ fn cranelift_shader_runs_vec_arithmetic() {
     }
 }
 
+/// Build a shader exercising OpVectorTimesScalar + OpDot
+/// in a single straight-line body:
+///
+///   scaled  = vec_a * s              // VectorTimesScalar
+///   dot_val = dot(scaled, vec_b)     // Dot
+///   out     = vec4(dot_val, 0, 0, 1)
+fn build_vec_scale_dot_shader(
+    vec_a: [f32; 4], s: f32, vec_b: [f32; 4],
+) -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, ExecutionMode, ExecutionModel,
+        FunctionControl, MemoryModel, StorageClass,
+    };
+
+    let mut bld = rspirv::dr::Builder::new();
+    bld.set_version(1, 0);
+    bld.capability(Capability::Shader);
+    bld.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+
+    let void = bld.type_void();
+    let f32_ty = bld.type_float(32, None);
+    let vec4_f32 = bld.type_vector(f32_ty, 4);
+    let void_fn = bld.type_function(void, vec![]);
+    let ptr_out_vec4 = bld.type_pointer(None, StorageClass::Output, vec4_f32);
+
+    let ca: Vec<_> = vec_a.iter().map(|x| bld.constant_bit32(f32_ty, x.to_bits())).collect();
+    let cb: Vec<_> = vec_b.iter().map(|x| bld.constant_bit32(f32_ty, x.to_bits())).collect();
+    let cs = bld.constant_bit32(f32_ty, s.to_bits());
+    let c_zero = bld.constant_bit32(f32_ty, 0.0f32.to_bits());
+    let c_one  = bld.constant_bit32(f32_ty, 1.0f32.to_bits());
+
+    let va = bld.constant_composite(vec4_f32, ca);
+    let vb = bld.constant_composite(vec4_f32, cb);
+
+    let out = bld.variable(ptr_out_vec4, None, StorageClass::Output, None);
+    bld.decorate(out, rspirv::spirv::Decoration::Location,
+                 vec![rspirv::dr::Operand::LiteralBit32(0)]);
+
+    let main = bld.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    bld.begin_block(None).unwrap();
+    let scaled = bld.vector_times_scalar(vec4_f32, None, va, cs).unwrap();
+    let dot_val = bld.dot(f32_ty, None, scaled, vb).unwrap();
+    let color = bld.composite_construct(vec4_f32, None, vec![dot_val, c_zero, c_zero, c_one]).unwrap();
+    bld.store(out, color, None, vec![]).unwrap();
+    bld.ret().unwrap();
+    bld.end_function().unwrap();
+
+    bld.entry_point(ExecutionModel::Fragment, main, "main", vec![out]);
+    bld.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+
+    let words: Vec<u32> = bld.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn cranelift_shader_runs_vector_times_scalar_and_dot() {
+    let vec_a = [0.5f32, 1.0, 0.25, 0.0];
+    let s = 0.5f32;
+    let vec_b = [1.0f32, 0.5, 4.0, 0.0];
+    let spirv = build_vec_scale_dot_shader(vec_a, s, vec_b);
+
+    let module = atrium_spv_frontend::translate(&spirv).unwrap();
+    let object_bytes = atrium_spv_backend_cranelift::compile(
+        &module, Target::host(),
+    ).unwrap().object;
+    let dir = TempDir::new().unwrap();
+    let obj_path = dir.path().join("shader.o");
+    std::fs::write(&obj_path, &object_bytes).unwrap();
+    let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
+    let lib_path = dir.path().join(format!("shader.{ext}"));
+    link_to_shared_library(&obj_path, &lib_path).unwrap();
+
+    let lib = unsafe { libloading::Library::new(&lib_path).unwrap() };
+    type FsMain = unsafe extern "C" fn(
+        *const u8, *const u8, *const u8,
+        f32, f32, f32, f32, u32,
+        *mut f32, *mut f32,
+    );
+    let fs_main: libloading::Symbol<FsMain> = unsafe {
+        lib.get(b"atrium_fs_main").unwrap()
+    };
+    let mut out_color = [0.0f32; 4];
+    let mut out_depth = 0.0f32;
+    unsafe {
+        fs_main(
+            std::ptr::null(), std::ptr::null(), std::ptr::null(),
+            0.0, 0.0, 0.0, 0.0, 0,
+            out_color.as_mut_ptr(), &mut out_depth,
+        );
+    }
+
+    // Expected:
+    //   scaled  = (0.25, 0.5, 0.125, 0.0)
+    //   dot     = 0.25*1.0 + 0.5*0.5 + 0.125*4.0 + 0.0*0.0
+    //           = 0.25 + 0.25 + 0.5 + 0.0
+    //           = 1.0
+    //   out     = (1.0, 0.0, 0.0, 1.0)
+    let scaled = [
+        vec_a[0] * s, vec_a[1] * s, vec_a[2] * s, vec_a[3] * s,
+    ];
+    let dot = scaled.iter().zip(vec_b.iter()).map(|(a, b)| a * b).sum::<f32>();
+    let expected = [dot, 0.0, 0.0, 1.0];
+
+    for i in 0..4 {
+        assert!((out_color[i] - expected[i]).abs() < 1e-6,
+            "lane {i}: got {}, expected {}", out_color[i], expected[i]);
+    }
+}
+
 #[test]
 fn cranelift_shader_runs_real_arithmetic() {
     let a = 0.5f32;
