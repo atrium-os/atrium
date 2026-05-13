@@ -1482,6 +1482,187 @@ fn cranelift_shader_runs_int_arith_mismatch() {
     assert_eq!(out, [0.5, 0.0, 0.0, 1.0]);
 }
 
+/// Build a shader implementing a simple loop:
+///
+/// ```glsl
+/// int n = push_const.n;
+/// int acc = 0;
+/// for (int i = 0; i < n; ++i) acc = acc + i;
+/// out = (acc == EXPECTED) ? vec4(1,1,1,1) : vec4(0,0,0,1);
+/// ```
+///
+/// where EXPECTED is the well-known triangular-number sum
+/// 0+1+2+...+(n-1) = n*(n-1)/2.
+///
+/// SPIR-V CFG:
+///   entry → header
+///   header: %i_phi, %acc_phi = OpPhi
+///           %cmp = SLT(%i_phi, n)
+///           OpLoopMerge merge, continue, None
+///           BranchConditional cmp, body, merge
+///   body:   OpBranch continue
+///   continue: %i_next = IAdd %i_phi 1
+///             %acc_next = IAdd %acc_phi %i_phi
+///             OpBranch header   ← back-edge
+///   merge:  ... uses %acc_phi (or its final value via Phi)
+fn build_loop_sum_shader() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, LoopControl, MemoryModel,
+        StorageClass,
+    };
+
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+
+    let void = b.type_void();
+    let f32_ty = b.type_float(32, None);
+    let i32_ty = b.type_int(32, 1);
+    let bool_ty = b.type_bool();
+    let vec4_f32 = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+
+    let pc_struct = b.type_struct(vec![i32_ty]);
+    b.member_decorate(pc_struct, 0, Decoration::Offset,
+                      vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(pc_struct, Decoration::Block, vec![]);
+
+    let ptr_pc_struct = b.type_pointer(None, StorageClass::PushConstant, pc_struct);
+    let ptr_pc_i32    = b.type_pointer(None, StorageClass::PushConstant, i32_ty);
+    let ptr_out_vec4  = b.type_pointer(None, StorageClass::Output, vec4_f32);
+
+    let zero_i = b.constant_bit32(i32_ty, 0u32);
+    let one_i  = b.constant_bit32(i32_ty, 1u32);
+    let c0  = b.constant_bit32(f32_ty, 0.0f32.to_bits());
+    let c1  = b.constant_bit32(f32_ty, 1.0f32.to_bits());
+
+    let pc_var = b.variable(ptr_pc_struct, None, StorageClass::PushConstant, None);
+    let out    = b.variable(ptr_out_vec4,  None, StorageClass::Output,       None);
+    b.decorate(out, Decoration::Location,
+               vec![rspirv::dr::Operand::LiteralBit32(0)]);
+
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+
+    // Pre-allocate block ids so the Phi can refer to the
+    // entry block by id.
+    let entry_id = b.id();
+    let header_id = b.id();
+    let body_id = b.id();
+    let continue_id = b.id();
+    let merge_id = b.id();
+
+    // entry block: load n, jump to header.
+    b.begin_block(Some(entry_id)).unwrap();
+    let n_ptr = b.access_chain(ptr_pc_i32, None, pc_var, vec![zero_i]).unwrap();
+    let n = b.load(i32_ty, None, n_ptr, None, vec![]).unwrap();
+    b.branch(header_id).unwrap();
+
+    // Header block.
+    b.begin_block(Some(header_id)).unwrap();
+    // Need ids for the eventual i_next / acc_next defined
+    // in the continue-block; allocate them now so the Phi
+    // operands can reference them.
+    let i_next = b.id();
+    let acc_next = b.id();
+    let i_phi = b.phi(i32_ty, None, vec![
+        (zero_i, entry_id),
+        (i_next, continue_id),
+    ]).unwrap();
+    let acc_phi = b.phi(i32_ty, None, vec![
+        (zero_i, entry_id),
+        (acc_next, continue_id),
+    ]).unwrap();
+    let cmp = b.s_less_than(bool_ty, None, i_phi, n).unwrap();
+    b.loop_merge(merge_id, continue_id, LoopControl::NONE, vec![]).unwrap();
+    b.branch_conditional(cmp, body_id, merge_id, vec![]).unwrap();
+
+    // Body block (empty — just jump to continue).
+    b.begin_block(Some(body_id)).unwrap();
+    b.branch(continue_id).unwrap();
+
+    // Continue block: i_next = i+1, acc_next = acc+i, back to header.
+    b.begin_block(Some(continue_id)).unwrap();
+    b.i_add(i32_ty, Some(i_next), i_phi, one_i).unwrap();
+    b.i_add(i32_ty, Some(acc_next), acc_phi, i_phi).unwrap();
+    b.branch(header_id).unwrap();
+
+    // Merge: pick a colour based on acc_phi value.
+    b.begin_block(Some(merge_id)).unwrap();
+    // Store acc_phi shifted into red channel (as raw bits
+    // -- we just want to check the integer comes out
+    // right). We'll encode by bitcasting to f32 via store
+    // — but no, easier: just write vec4(0,0,0,1) and
+    // depth = (float)acc. We don't yet have OpConvertSToF.
+    //
+    // So compare acc_phi to known expected value, write
+    // white if match, black if not.
+    // expected for n=5 is 0+1+2+3+4 = 10.
+    let expected = b.constant_bit32(i32_ty, 10u32);
+    let ok = b.i_equal(bool_ty, None, acc_phi, expected).unwrap();
+    let red = b.select(f32_ty, None, ok, c1, c0).unwrap();
+    let color = b.composite_construct(vec4_f32, None, vec![red, red, red, c1]).unwrap();
+    b.store(out, color, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![out]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn cranelift_shader_runs_simple_loop() {
+    let spirv = build_loop_sum_shader();
+    let module = translate(&spirv).expect("frontend translate");
+    let object_bytes = compile(&module, Target::host())
+        .expect("backend compile").object;
+    let dir = TempDir::new().unwrap();
+    let obj_path = dir.path().join("shader.o");
+    std::fs::write(&obj_path, &object_bytes).unwrap();
+    let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
+    let lib_path = dir.path().join(format!("shader.{ext}"));
+    link_to_shared_library(&obj_path, &lib_path).unwrap();
+    let lib = unsafe { libloading::Library::new(&lib_path).unwrap() };
+    type FsMain = unsafe extern "C" fn(
+        *const u8, *const u8, *const u8,
+        f32, f32, f32, f32, u32,
+        *mut f32, *mut f32,
+    );
+    let fs_main: libloading::Symbol<FsMain> = unsafe {
+        lib.get(b"atrium_fs_main").unwrap()
+    };
+    // n=5 → sum should be 10 → white pixel.
+    let n: i32 = 5;
+    let mut pc_buf = [0u8; 4];
+    pc_buf.copy_from_slice(&n.to_le_bytes());
+    let mut out_color = [0.0f32; 4];
+    let mut out_depth = 0.0f32;
+    unsafe {
+        fs_main(
+            std::ptr::null(), std::ptr::null(), pc_buf.as_ptr(),
+            0.0, 0.0, 0.0, 0.0, 0,
+            out_color.as_mut_ptr(), &mut out_depth,
+        );
+    }
+    assert_eq!(out_color, [1.0, 1.0, 1.0, 1.0],
+        "loop sum at n=5 should produce white; got {out_color:?}");
+
+    let mut interp_inputs = ShaderInputs::default();
+    interp_inputs.push_constants[..4].copy_from_slice(&pc_buf);
+    let interp = Interpreter::new(&spirv).expect("interp parse");
+    let interp_out = interp.run_fragment(&interp_inputs).expect("interp run");
+    let interp_px = interp_out.pixels.first().copied().expect("pixel");
+    assert_eq!(interp_px, [1.0, 1.0, 1.0, 1.0],
+        "interp loop sum at n=5 should produce white; got {interp_px:?}");
+}
+
 #[test]
 fn cranelift_shader_dlopens_and_writes_different_rgba() {
     // Sanity guard: a different shader produces different

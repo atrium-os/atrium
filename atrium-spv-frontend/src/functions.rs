@@ -119,6 +119,25 @@ fn translate_one(
         + 1
         + spv.parameters.len();
 
+    // Pre-allocate IR Values for every function-local
+    // result_id, so forward references (e.g. a loop
+    // header's OpPhi arm referring to a value computed
+    // in the continue-block on the back-edge) can be
+    // resolved during translation without the defining
+    // instruction having been visited yet.
+    for spv_block in &spv.blocks {
+        for inst in &spv_block.instructions {
+            let Some(rid) = inst.result_id else { continue };
+            if id_map.contains_key(&rid) { continue; }
+            let ty = match inst.result_type {
+                Some(tid) => types.get(tid).cloned().unwrap_or(Type::Void),
+                None => Type::Void,
+            };
+            let _ = alloc_or_get_result(
+                rid, ty, &mut id_map, &mut next_value_id);
+        }
+    }
+
     // Pre-materialise every constant in the entry block so
     // SSA references from later blocks remain dominated.
     // Without this hoist, a constant first referenced
@@ -567,8 +586,7 @@ fn translate_inst(
                 f_id, types, constants, id_map, next_value_id, insts,
                 source_spirv_offset,
             )?;
-            let result = fresh_value(ty, next_value_id);
-            id_map.insert(result_id, result.clone());
+            let result = alloc_or_get_result(result_id, ty, id_map, next_value_id);
             insts.push(Inst {
                 op: Op::Select { cond, t_val, f_val },
                 result: Some(result),
@@ -614,8 +632,7 @@ fn translate_inst(
                     ))),
                 }
             }
-            let result = fresh_value(ty, next_value_id);
-            id_map.insert(result_id, result.clone());
+            let result = alloc_or_get_result(result_id, ty, id_map, next_value_id);
             insts.push(Inst {
                 op: Op::VectorShuffle { src1, src2, components },
                 result: Some(result),
@@ -658,8 +675,7 @@ fn translate_inst(
                 )?;
                 elements.push(v);
             }
-            let result = fresh_value(ty, next_value_id);
-            id_map.insert(result_id, result.clone());
+            let result = alloc_or_get_result(result_id, ty, id_map, next_value_id);
             insts.push(Inst {
                 op: Op::ConstVec(elements),
                 result: Some(result),
@@ -708,8 +724,7 @@ fn translate_inst(
                 arms.push(atrium_spv_ir::PhiArm { from, value });
                 i += 2;
             }
-            let result = fresh_value(ty, next_value_id);
-            id_map.insert(result_id, result.clone());
+            let result = alloc_or_get_result(result_id, ty, id_map, next_value_id);
             insts.push(Inst {
                 op: Op::Phi(arms),
                 result: Some(result),
@@ -790,8 +805,7 @@ fn translate_inst(
                 }
             }
 
-            let result = fresh_value(result_ty, next_value_id);
-            id_map.insert(result_id, result.clone());
+            let result = alloc_or_get_result(result_id, result_ty, id_map, next_value_id);
             insts.push(Inst {
                 op: Op::AccessChain { base, byte_offset },
                 result: Some(result),
@@ -823,8 +837,7 @@ fn translate_inst(
                         "Load pointer id {ptr_id} not a variable or AccessChain result",
                     )))?,
             };
-            let result = fresh_value(result_ty, next_value_id);
-            id_map.insert(result_id, result.clone());
+            let result = alloc_or_get_result(result_id, result_ty, id_map, next_value_id);
             insts.push(Inst {
                 op: Op::Load(ptr_value),
                 result: Some(result),
@@ -875,8 +888,7 @@ fn emit_binop_int(
         rhs_id, types, constants, id_map, next_value_id, insts,
         source_spirv_offset,
     )?;
-    let result = fresh_value(ty, next_value_id);
-    id_map.insert(result_id, result.clone());
+    let result = alloc_or_get_result(result_id, ty, id_map, next_value_id);
     insts.push(Inst {
         op: make_op(lhs, rhs),
         result: Some(result),
@@ -910,8 +922,7 @@ fn emit_unop_int(
         src_id, types, constants, id_map, next_value_id, insts,
         source_spirv_offset,
     )?;
-    let result = fresh_value(ty, next_value_id);
-    id_map.insert(result_id, result.clone());
+    let result = alloc_or_get_result(result_id, ty, id_map, next_value_id);
     insts.push(Inst {
         op: make_op(src),
         result: Some(result),
@@ -947,8 +958,7 @@ fn emit_binop_float(
         rhs_id, types, constants, id_map, next_value_id, insts,
         source_spirv_offset,
     )?;
-    let result = fresh_value(ty, next_value_id);
-    id_map.insert(result_id, result.clone());
+    let result = alloc_or_get_result(result_id, ty, id_map, next_value_id);
     insts.push(Inst {
         op: make_op(lhs, rhs),
         result: Some(result),
@@ -983,8 +993,7 @@ fn emit_unop_float(
         src_id, types, constants, id_map, next_value_id, insts,
         source_spirv_offset,
     )?;
-    let result = fresh_value(ty, next_value_id);
-    id_map.insert(result_id, result.clone());
+    let result = alloc_or_get_result(result_id, ty, id_map, next_value_id);
     insts.push(Inst {
         op: make_op(src),
         result: Some(result),
@@ -1096,6 +1105,26 @@ fn resolve_variable(
     let v = fresh_value(ty, next_value_id);
     id_map.insert(id, v.clone());
     Ok(Some(v))
+}
+
+/// Get the pre-allocated [`Value`] for `result_id` if one
+/// exists (set by the pre-pass), else allocate a fresh one
+/// and cache it. Used by every translator arm that emits
+/// an Inst with a result; making this a single helper lets
+/// us pre-allocate Values for forward-referenced ids (e.g.
+/// loop-induction Phi back-edge values) so the per-block
+/// walk doesn't have to encounter the defining inst before
+/// any use.
+fn alloc_or_get_result(
+    result_id: Word,
+    ty: Type,
+    id_map: &mut HashMap<Word, Value>,
+    next_value_id: &mut u32,
+) -> Value {
+    if let Some(v) = id_map.get(&result_id) { return v.clone(); }
+    let v = fresh_value(ty, next_value_id);
+    id_map.insert(result_id, v.clone());
+    v
 }
 
 fn fresh_value(ty: Type, next_value_id: &mut u32) -> Value {
