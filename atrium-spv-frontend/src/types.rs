@@ -131,11 +131,19 @@ impl TypeContext {
             Op::TypePointer => {
                 let storage = read_storage(&inst.operands, 0)?;
                 let pointee_id = read_id(&inst.operands, 1)?;
-                let pointee = self.types.get(&pointee_id).ok_or_else(||
-                    FrontendError::Malformed(format!(
-                        "TypePointer references unknown pointee type {pointee_id}",
-                    )))?;
-                Ok(Type::Pointer(translate_storage(storage)?, Box::new(pointee.clone())))
+                // The pointee might be an aggregate (Struct
+                // / Array) that has no IR Type; we still
+                // need a Pointer with *some* pointee for
+                // type tracking through Store/AccessChain.
+                // Fall back to Void — leaf pointers (used by
+                // OpLoad) always go through OpAccessChain,
+                // which builds a fresh Pointer with the
+                // resolved leaf type, so this placeholder
+                // never reaches the backend's load path.
+                let pointee = self.types.get(&pointee_id)
+                    .cloned()
+                    .unwrap_or(Type::Void);
+                Ok(Type::Pointer(translate_storage(storage)?, Box::new(pointee)))
             }
             Op::TypeFunction => {
                 // Function types aren't represented in

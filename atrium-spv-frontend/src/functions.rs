@@ -738,7 +738,12 @@ fn resolve_variable(
     let Some((storage, pointee_id)) = iface.variables.get(&id) else {
         return Ok(None);
     };
-    let pointee = types.get(*pointee_id)?.clone();
+    // Aggregate pointees (Struct / Array) have no IR Type;
+    // fall back to Void. Such variables are only addressed
+    // through OpAccessChain, which produces a fresh Pointer
+    // with the resolved leaf type — the placeholder Void
+    // never reaches the backend.
+    let pointee = types.get(*pointee_id).cloned().unwrap_or(Type::Void);
     let storage = crate::types::translate_storage(*storage)?;
     let ty = Type::Pointer(storage, Box::new(pointee));
     let v = fresh_value(ty, next_value_id);

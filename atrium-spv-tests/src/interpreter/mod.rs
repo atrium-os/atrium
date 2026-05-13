@@ -120,6 +120,11 @@ pub struct Interpreter {
     constants: HashMap<Word, ConstantValue>,
     /// Variable-id → (storage class, type id).
     variables: HashMap<Word, (StorageClass, Word)>,
+    /// Struct id → ordered list of (member_byte_offset,
+    /// member_type_id). Populated from OpTypeStruct +
+    /// OpMemberDecorate Offset. Used by OpAccessChain to
+    /// resolve member-index chains to a byte offset.
+    struct_layouts: HashMap<Word, Vec<(u32, Word)>>,
     /// Entry point declared with ExecutionModel::Fragment.
     fragment_entry: Option<Word>,
 }
@@ -169,6 +174,10 @@ enum ConstantValue {
     Bool(bool),
     /// Vector composite: element values in lane order.
     Vec(Vec<ConstantValue>),
+    /// A tagged pointer: SPIR-V variable id + byte offset
+    /// into that storage block. Produced by OpAccessChain;
+    /// consumed by OpLoad / OpStore.
+    Ptr { var_id: Word, byte_offset: u32 },
 }
 
 impl Interpreter {
@@ -184,6 +193,7 @@ impl Interpreter {
             types: HashMap::new(),
             constants: HashMap::new(),
             variables: HashMap::new(),
+            struct_layouts: HashMap::new(),
             fragment_entry: None,
         };
         interp.index()?;
@@ -204,7 +214,7 @@ impl Interpreter {
         let n = inputs.varyings_per_invocation.len().max(1);
         let mut pixels = Vec::with_capacity(n);
         for _ in 0..n {
-            let pixel = self.eval_fragment_invocation(entry)?;
+            let pixel = self.eval_fragment_invocation(entry, inputs)?;
             pixels.push(pixel);
         }
         Ok(ShaderOutputs { pixels })
@@ -234,6 +244,45 @@ impl Interpreter {
         let globals = self.module.types_global_values.clone();
         for inst in &globals {
             self.index_global_inst(inst)?;
+        }
+
+        // OpMemberDecorate Offset → struct_layouts.
+        // Two-pass: first collect (struct_id, member_idx,
+        // offset) from annotations, then merge with each
+        // OpTypeStruct's member-type-id sequence.
+        let mut member_offsets: HashMap<(Word, u32), u32> = HashMap::new();
+        for inst in &self.module.annotations.clone() {
+            if inst.class.opcode != Op::MemberDecorate { continue; }
+            let struct_id = op_id(&inst.operands, 0)?;
+            let member_idx = op_lit(&inst.operands, 1)?;
+            let kind = match inst.operands.get(2) {
+                Some(Operand::Decoration(d)) => *d,
+                _ => continue,
+            };
+            if kind == rspirv::spirv::Decoration::Offset {
+                if let Some(Operand::LiteralBit32(off)) = inst.operands.get(3) {
+                    member_offsets.insert((struct_id, member_idx), *off);
+                }
+            }
+        }
+        for inst in &globals {
+            if inst.class.opcode != Op::TypeStruct { continue; }
+            let Some(struct_id) = inst.result_id else { continue };
+            let mut members = Vec::with_capacity(inst.operands.len());
+            let mut ok = true;
+            for (idx, op) in inst.operands.iter().enumerate() {
+                let type_id = match op {
+                    Operand::IdRef(id) => *id,
+                    _ => { ok = false; break; }
+                };
+                match member_offsets.get(&(struct_id, idx as u32)) {
+                    Some(off) => members.push((*off, type_id)),
+                    None => { ok = false; break; }
+                }
+            }
+            if ok && !members.is_empty() {
+                self.struct_layouts.insert(struct_id, members);
+            }
         }
         Ok(())
     }
@@ -346,7 +395,11 @@ impl Interpreter {
     /// the function body is a single straight-line block
     /// that stores a constant vec4<f32> into the Output
     /// variable and returns.
-    fn eval_fragment_invocation(&self, entry: Word) -> Result<RgbaF32, InterpError> {
+    fn eval_fragment_invocation(
+        &self,
+        entry: Word,
+        inputs: &ShaderInputs,
+    ) -> Result<RgbaF32, InterpError> {
         let func = self.module.functions.iter()
             .find(|f| f.def.as_ref().and_then(|d| d.result_id) == Some(entry))
             .ok_or(InterpError::NoEntryPoint("Fragment (function body missing)"))?;
@@ -365,7 +418,7 @@ impl Interpreter {
         }
         let block = &func.blocks[0];
         for inst in &block.instructions {
-            self.eval_inst(inst, &mut values, &mut storage)?;
+            self.eval_inst(inst, &mut values, &mut storage, inputs)?;
         }
 
         // Find the Output variable; expect vec4<f32>.
@@ -387,6 +440,7 @@ impl Interpreter {
         inst: &Instruction,
         values: &mut HashMap<Word, ConstantValue>,
         storage: &mut HashMap<Word, ConstantValue>,
+        inputs: &ShaderInputs,
     ) -> Result<(), InterpError> {
         match inst.class.opcode {
             Op::Store => {
@@ -496,6 +550,82 @@ impl Interpreter {
                 Ok(())
             }
 
+            // OpAccessChain / OpInBoundsAccessChain:
+            // produce a tagged Ptr from base var + a
+            // resolved byte offset (struct member walk).
+            Op::AccessChain | Op::InBoundsAccessChain => {
+                let result_id = inst.result_id.ok_or_else(||
+                    InterpError::BadConstant(0))?;
+                let base_id = op_id(&inst.operands, 0)?;
+                // Base must be a Variable. Look up pointee
+                // type id to start the walk.
+                let (_storage, base_ptr_ty) = self.variables.get(&base_id)
+                    .copied()
+                    .ok_or_else(|| InterpError::UnsupportedOpcode(format!(
+                        "AccessChain base id {base_id} is not a known Variable",
+                    )))?;
+                // base_ptr_ty is the OpTypePointer id; its
+                // pointee is the variable's content type.
+                let mut current_type = match self.types.get(&base_ptr_ty) {
+                    Some(TypeInfo::Pointer { pointee, .. }) => *pointee,
+                    _ => return Err(InterpError::UnsupportedOpcode(format!(
+                        "AccessChain base var's type {base_ptr_ty} is not a pointer",
+                    ))),
+                };
+                let mut byte_offset: u32 = 0;
+                for op in inst.operands.iter().skip(1) {
+                    let idx_id = match op {
+                        Operand::IdRef(id) => *id,
+                        _ => return Err(InterpError::ParseFailed(
+                            "AccessChain index expected IdRef".to_string())),
+                    };
+                    let idx_val: u32 = match self.constants.get(&idx_id) {
+                        Some(ConstantValue::Int(v)) => *v as u32,
+                        _ => return Err(InterpError::UnsupportedOpcode(format!(
+                            "AccessChain index id {idx_id} is not a known integer constant",
+                        ))),
+                    };
+                    let layout = self.struct_layouts.get(&current_type)
+                        .ok_or_else(|| InterpError::UnsupportedOpcode(format!(
+                            "AccessChain step through non-struct type id {current_type} \
+                             not supported",
+                        )))?;
+                    let (mem_off, mem_ty) = layout.get(idx_val as usize)
+                        .copied()
+                        .ok_or_else(|| InterpError::UnsupportedOpcode(format!(
+                            "AccessChain index {idx_val} out of range",
+                        )))?;
+                    byte_offset = byte_offset.saturating_add(mem_off);
+                    current_type = mem_ty;
+                }
+                values.insert(result_id, ConstantValue::Ptr {
+                    var_id: base_id, byte_offset,
+                });
+                Ok(())
+            }
+            // OpLoad: read leaf value through a pointer.
+            // The pointer is either an AccessChain result
+            // (Ptr in values) or a bare Variable.
+            Op::Load => {
+                let result_id = inst.result_id.ok_or_else(||
+                    InterpError::BadConstant(0))?;
+                let result_type_id = inst.result_type.ok_or_else(||
+                    InterpError::BadType(0))?;
+                let ptr_id = op_id(&inst.operands, 0)?;
+                let (var_id, off) = match values.get(&ptr_id) {
+                    Some(ConstantValue::Ptr { var_id, byte_offset }) =>
+                        (*var_id, *byte_offset),
+                    _ => (ptr_id, 0u32),
+                };
+                let (storage_class, _) = self.variables.get(&var_id).copied()
+                    .ok_or_else(|| InterpError::UnsupportedOpcode(format!(
+                        "Load of unknown variable id {var_id}",
+                    )))?;
+                let value = self.load_from_storage(
+                    storage_class, off, result_type_id, inputs)?;
+                values.insert(result_id, value);
+                Ok(())
+            }
             // OpDot: sum of element-wise products.
             Op::Dot => {
                 let result_id = inst.result_id.ok_or_else(||
@@ -588,6 +718,63 @@ impl Interpreter {
         let stored = eval_float_unop_value(&src, &op)?;
         values.insert(result_id, stored);
         Ok(())
+    }
+
+    /// Read a leaf value out of the per-storage-class byte
+    /// buffer (push-constants / uniforms) at the given byte
+    /// offset. Result type is decoded from the type id.
+    fn load_from_storage(
+        &self,
+        storage_class: StorageClass,
+        byte_offset: u32,
+        type_id: Word,
+        inputs: &ShaderInputs,
+    ) -> Result<ConstantValue, InterpError> {
+        // Pick the source buffer.
+        let buf: &[u8] = match storage_class {
+            StorageClass::PushConstant => &inputs.push_constants[..],
+            StorageClass::Uniform | StorageClass::UniformConstant
+            | StorageClass::StorageBuffer => &inputs.uniforms[..],
+            other => return Err(InterpError::UnsupportedOpcode(format!(
+                "Load from storage class {other:?} not supported",
+            ))),
+        };
+        let info = self.types.get(&type_id)
+            .ok_or(InterpError::BadType(type_id))?
+            .clone();
+        match info {
+            TypeInfo::Float { width: 32 } => {
+                Ok(ConstantValue::F32(read_f32_at(buf, byte_offset)?))
+            }
+            TypeInfo::Int { width: 32, signed } => {
+                let v = read_u32_at(buf, byte_offset)? as i64;
+                let v = if signed { (v as i32) as i64 } else { v & 0xFFFF_FFFF };
+                Ok(ConstantValue::Int(v))
+            }
+            TypeInfo::Vector { element, count } => {
+                let elem_info = self.types.get(&element)
+                    .ok_or(InterpError::BadType(element))?
+                    .clone();
+                let elem_size: u32 = match elem_info {
+                    TypeInfo::Float { width } => width / 8,
+                    TypeInfo::Int   { width, .. } => width / 8,
+                    _ => return Err(InterpError::UnsupportedOpcode(format!(
+                        "Load of vector with non-scalar element {elem_info:?}",
+                    ))),
+                };
+                let mut lanes = Vec::with_capacity(count as usize);
+                for i in 0..count {
+                    let off = byte_offset.saturating_add(i * elem_size);
+                    let v = self.load_from_storage(
+                        storage_class, off, element, inputs)?;
+                    lanes.push(v);
+                }
+                Ok(ConstantValue::Vec(lanes))
+            }
+            other => Err(InterpError::UnsupportedOpcode(format!(
+                "Load of type {other:?} not supported",
+            ))),
+        }
     }
 
     fn lookup_value(
@@ -860,6 +1047,21 @@ fn eval_float_unop_value(
     }
 }
 
+fn read_u32_at(buf: &[u8], byte_offset: u32) -> Result<u32, InterpError> {
+    let lo = byte_offset as usize;
+    let hi = lo.checked_add(4).ok_or_else(|| InterpError::UnsupportedOpcode(
+        "Load offset overflow".into()))?;
+    if hi > buf.len() {
+        return Err(InterpError::UnsupportedOpcode(format!(
+            "Load out of bounds: offset {lo}+4 > buf len {}", buf.len())));
+    }
+    Ok(u32::from_le_bytes([buf[lo], buf[lo+1], buf[lo+2], buf[lo+3]]))
+}
+
+fn read_f32_at(buf: &[u8], byte_offset: u32) -> Result<f32, InterpError> {
+    Ok(f32::from_bits(read_u32_at(buf, byte_offset)?))
+}
+
 fn constant_to_rgba(v: &ConstantValue) -> Result<RgbaF32, InterpError> {
     match v {
         ConstantValue::Vec(elements) if elements.len() == 4 => {
@@ -872,6 +1074,9 @@ fn constant_to_rgba(v: &ConstantValue) -> Result<RgbaF32, InterpError> {
                     ConstantValue::Bool(b) => if *b { 1.0 } else { 0.0 },
                     ConstantValue::Vec(_) => return Err(InterpError::UnsupportedOutput(
                         "nested vector in output".to_string(),
+                    )),
+                    ConstantValue::Ptr { .. } => return Err(InterpError::UnsupportedOutput(
+                        "pointer in output".to_string(),
                     )),
                 };
             }

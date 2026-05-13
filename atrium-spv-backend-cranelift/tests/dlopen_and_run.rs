@@ -706,6 +706,135 @@ fn cranelift_shader_runs_comparison_and_select() {
         interp_px, expected);
 }
 
+/// Build a shader that reads a single `float scale` from a
+/// push-constant block at offset 0 and writes
+/// `vec4(scale, 0.0, 0.0, 1.0)` to the fragment output.
+///
+/// SPIR-V layout:
+///   - struct PC { float scale; } with OpMemberDecorate
+///     Offset 0
+///   - OpVariable<PushConstant>(ptr_to_PC) %pc_var
+///   - body: OpAccessChain ptr_f32 %pc_var %i0
+///           OpLoad f32 %scale through that ptr
+///           CompositeConstruct vec4(scale, 0, 0, 1)
+///           Store to fragment output
+fn build_pushconst_scale_shader() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+
+    let mut bld = rspirv::dr::Builder::new();
+    bld.set_version(1, 0);
+    bld.capability(Capability::Shader);
+    bld.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+
+    let void = bld.type_void();
+    let f32_ty = bld.type_float(32, None);
+    let i32_ty = bld.type_int(32, 1);
+    let vec4_f32 = bld.type_vector(f32_ty, 4);
+    let void_fn = bld.type_function(void, vec![]);
+
+    // struct PC { float scale; }
+    let pc_struct = bld.type_struct(vec![f32_ty]);
+    bld.member_decorate(pc_struct, 0, Decoration::Offset,
+                        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    bld.decorate(pc_struct, Decoration::Block, vec![]);
+
+    let ptr_pc_struct = bld.type_pointer(None, StorageClass::PushConstant, pc_struct);
+    let ptr_pc_f32    = bld.type_pointer(None, StorageClass::PushConstant, f32_ty);
+    let ptr_out_vec4  = bld.type_pointer(None, StorageClass::Output, vec4_f32);
+
+    let zero_i = bld.constant_bit32(i32_ty, 0u32);
+    let c0 = bld.constant_bit32(f32_ty, 0.0f32.to_bits());
+    let c1 = bld.constant_bit32(f32_ty, 1.0f32.to_bits());
+
+    let pc_var  = bld.variable(ptr_pc_struct, None, StorageClass::PushConstant, None);
+    let out     = bld.variable(ptr_out_vec4,  None, StorageClass::Output,       None);
+    bld.decorate(out, Decoration::Location,
+                 vec![rspirv::dr::Operand::LiteralBit32(0)]);
+
+    let main = bld.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    bld.begin_block(None).unwrap();
+    let scale_ptr = bld.access_chain(ptr_pc_f32, None, pc_var, vec![zero_i]).unwrap();
+    let scale = bld.load(f32_ty, None, scale_ptr, None, vec![]).unwrap();
+    let color = bld.composite_construct(vec4_f32, None,
+                                        vec![scale, c0, c0, c1]).unwrap();
+    bld.store(out, color, None, vec![]).unwrap();
+    bld.ret().unwrap();
+    bld.end_function().unwrap();
+
+    bld.entry_point(ExecutionModel::Fragment, main, "main", vec![out]);
+    bld.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+
+    let words: Vec<u32> = bld.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn cranelift_shader_reads_push_constant_scale() {
+    let spirv = build_pushconst_scale_shader();
+
+    // Frontend must discover the push-constant block + size.
+    let module = translate(&spirv).expect("frontend translate");
+    assert_eq!(module.push_constants_size, 4,
+        "expected 4-byte push-constant block, got {}",
+        module.push_constants_size);
+
+    let object_bytes = compile(&module, Target::host())
+        .expect("backend compile").object;
+    let dir = TempDir::new().unwrap();
+    let obj_path = dir.path().join("shader.o");
+    std::fs::write(&obj_path, &object_bytes).unwrap();
+    let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
+    let lib_path = dir.path().join(format!("shader.{ext}"));
+    link_to_shared_library(&obj_path, &lib_path).unwrap();
+
+    let lib = unsafe { libloading::Library::new(&lib_path).unwrap() };
+    type FsMain = unsafe extern "C" fn(
+        *const u8, *const u8, *const u8,
+        f32, f32, f32, f32, u32,
+        *mut f32, *mut f32,
+    );
+    let fs_main: libloading::Symbol<FsMain> = unsafe {
+        lib.get(b"atrium_fs_main").unwrap()
+    };
+
+    // Push-constant buffer holds a single f32 at offset 0.
+    let scale_value = 0.7f32;
+    let mut pc_buf = [0u8; 4];
+    pc_buf.copy_from_slice(&scale_value.to_le_bytes());
+
+    let mut out_color = [0.0f32; 4];
+    let mut out_depth = 0.0f32;
+    unsafe {
+        fs_main(
+            std::ptr::null(), std::ptr::null(), pc_buf.as_ptr(),
+            0.0, 0.0, 0.0, 0.0, 0,
+            out_color.as_mut_ptr(), &mut out_depth,
+        );
+    }
+    let expected = [scale_value, 0.0, 0.0, 1.0];
+    assert_eq!(out_color, expected,
+        "push-const scale wrong: got {:?}, expected {:?}",
+        out_color, expected);
+
+    // Differential against interpreter oracle.
+    let mut interp_inputs = ShaderInputs::default();
+    interp_inputs.push_constants[..4].copy_from_slice(&pc_buf);
+    let interp = Interpreter::new(&spirv).expect("interp parse");
+    let interp_out = interp.run_fragment(&interp_inputs)
+        .expect("interp run");
+    let interp_px = interp_out.pixels.first().copied()
+        .expect("interp must emit at least one pixel");
+    assert_eq!(interp_px, expected,
+        "interpreter push-const disagrees: {:?} vs {:?}",
+        interp_px, expected);
+}
+
 #[test]
 fn cranelift_shader_dlopens_and_writes_different_rgba() {
     // Sanity guard: a different shader produces different
