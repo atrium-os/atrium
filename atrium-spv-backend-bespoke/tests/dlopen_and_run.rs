@@ -276,6 +276,123 @@ fn bespoke_shader_reads_push_constant_and_does_arith() {
         "bespoke push-const + arith got {out_color:?}, expected {expected:?}");
 }
 
+/// Two-block straight-line CFG: entry → merge. Tests the
+/// branch-relocation machinery and cross-block live-range
+/// handling without needing conditionals or phis.
+fn build_two_block_shader() -> Vec<u8> {
+    // We can't easily get the SPIR-V builder to emit a
+    // bare entry-block-with-OpBranch in a fragment shader
+    // (every shader is one function), so we build the IR
+    // module directly and skip the frontend.
+    let _ = ();
+    Vec::new()
+}
+
+#[test]
+fn bespoke_shader_runs_two_block_branch() {
+    use atrium_spv_ir::{
+        Block, BlockId, BlockKind, EntryPoint, FloatKind, Function, Inst,
+        Module, Op, ShaderStage, StorageClass, Type, Value, ValueId,
+    };
+    use std::collections::HashMap;
+    let _ = build_two_block_shader();
+
+    // Build IR by hand:
+    //   block 0 (entry):
+    //     v0 = ConstFloat 0.4
+    //     v1 = ConstFloat 0.5
+    //     v2 = ConstFloat 0.6
+    //     v3 = ConstFloat 1.0
+    //     Branch -> block 1
+    //   block 1 (merge):
+    //     v4 = ConstVec [v0, v1, v2, v3]
+    //     Store(out_var, v4)
+    //     Return
+    let f32_ty = Type::F32;
+    let vec4_ty = Type::Vec4(atrium_spv_ir::VecElement::F32);
+    let out_ptr_ty = Type::Pointer(StorageClass::Output, Box::new(vec4_ty.clone()));
+
+    let v0 = Value { id: ValueId(0), ty: f32_ty.clone() };
+    let v1 = Value { id: ValueId(1), ty: f32_ty.clone() };
+    let v2 = Value { id: ValueId(2), ty: f32_ty.clone() };
+    let v3 = Value { id: ValueId(3), ty: f32_ty.clone() };
+    let v4 = Value { id: ValueId(4), ty: vec4_ty.clone() };
+    let out_v = Value { id: ValueId(5), ty: out_ptr_ty.clone() };
+    let mk_inst = |op, result, off: u32| Inst { op, result, source_spirv_offset: off };
+
+    let entry = Block {
+        id: BlockId(0),
+        kind: BlockKind::Linear,
+        insts: vec![
+            mk_inst(Op::ConstFloat { value: 0.4, kind: FloatKind::F32 }, Some(v0.clone()), 1),
+            mk_inst(Op::ConstFloat { value: 0.5, kind: FloatKind::F32 }, Some(v1.clone()), 2),
+            mk_inst(Op::ConstFloat { value: 0.6, kind: FloatKind::F32 }, Some(v2.clone()), 3),
+            mk_inst(Op::ConstFloat { value: 1.0, kind: FloatKind::F32 }, Some(v3.clone()), 4),
+            mk_inst(Op::Branch(BlockId(1)), None, 5),
+        ],
+    };
+    let merge = Block {
+        id: BlockId(1),
+        kind: BlockKind::Linear,
+        insts: vec![
+            mk_inst(Op::ConstVec(vec![v0, v1, v2, v3]), Some(v4.clone()), 6),
+            mk_inst(Op::Store { ptr: out_v, value: v4 }, None, 7),
+            mk_inst(Op::Return, None, 8),
+        ],
+    };
+    let mut blocks = HashMap::new();
+    blocks.insert(entry.id, entry);
+    blocks.insert(merge.id, merge);
+
+    let module = Module {
+        functions: vec![Function {
+            name: "main".to_string(),
+            stage: ShaderStage::Fragment,
+            params: Vec::new(),
+            return_type: Type::Void,
+            entry_block: BlockId(0),
+            blocks,
+        }],
+        entry_points: vec![EntryPoint {
+            stage: ShaderStage::Fragment,
+            function_index: 0,
+            name: "main".to_string(),
+        }],
+        uniforms: Vec::new(),
+        push_constants_size: 0,
+        vertex_inputs: Vec::new(),
+        varyings: Vec::new(),
+    };
+
+    let out = compile(&module, Target::host()).expect("bespoke compile");
+    let dir = TempDir::new().unwrap();
+    let obj_path = dir.path().join("shader.o");
+    std::fs::write(&obj_path, &out.object).unwrap();
+    let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
+    let lib_path = dir.path().join(format!("shader.{ext}"));
+    link_to_shared_library(&obj_path, &lib_path).unwrap();
+    let lib = unsafe { libloading::Library::new(&lib_path).unwrap() };
+    type FsMain = unsafe extern "C" fn(
+        *const u8, *const u8, *const u8,
+        f32, f32, f32, f32, u32,
+        *mut f32, *mut f32,
+    );
+    let fs_main: libloading::Symbol<FsMain> = unsafe {
+        lib.get(b"atrium_fs_main").unwrap()
+    };
+    let mut out_color = [0.0f32; 4];
+    let mut out_depth = 0.0f32;
+    unsafe {
+        fs_main(
+            std::ptr::null(), std::ptr::null(), std::ptr::null(),
+            0.0, 0.0, 0.0, 0.0, 0,
+            out_color.as_mut_ptr(), &mut out_depth,
+        );
+    }
+    assert_eq!(out_color, [0.4, 0.5, 0.6, 1.0],
+        "two-block bespoke shader produced {out_color:?}");
+}
+
 #[test]
 fn bespoke_shader_runs_fp_arithmetic() {
     let (a, b) = (0.75f32, 0.25f32);

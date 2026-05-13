@@ -34,7 +34,7 @@
 use std::collections::HashMap;
 
 use atrium_spv_ir::{
-    FloatKind, Function, Module, Op, ShaderStage, StorageClass, Type,
+    BlockId, FloatKind, Function, Module, Op, ShaderStage, StorageClass, Type,
     Value, ValueId,
 };
 use pptk_codegen_arm64::asm;
@@ -176,16 +176,12 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
         return Err(BackendError::Unsupported(format!(
             "stage {:?} not yet supported", func.stage)));
     }
-    let block = func.blocks.get(&func.entry_block).ok_or_else(||
-        BackendError::Internal("entry block missing".into()))?;
 
     let mut a = asm::Asm::new();
     // scalars[id] = Vreg holding the live f32 (S-reg view).
     let mut scalars: HashMap<ValueId, asm::Vreg> = HashMap::new();
     let mut vectors: HashMap<ValueId, Vec<Value>> = HashMap::new();
     // Pointer-typed Values: (base X-reg, byte offset).
-    // Seeded lazily from a Variable's storage class on
-    // first reference; threaded by Op::AccessChain.
     let mut pointers: HashMap<ValueId, (asm::Xreg, i32)> = HashMap::new();
 
     // X4 holds out_color. Scratch X9/W9 for constant
@@ -193,13 +189,33 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
     let x_out = asm::Xreg(4);
     let w_tmp = asm::Wreg(9);
 
-    // ── Pre-pass: live-range analysis ─────────────────────────
+    // ── Block layout ──────────────────────────────────────────
     //
-    // For each scalar ValueId compute the highest inst
-    // index that references it. ConstVec lanes inherit the
-    // ConstVec result's uses transitively, so a Store of a
-    // vector keeps every lane alive through the Store.
-    let last_use = compute_last_use(&block.insts);
+    // Walk blocks in BlockId order (matches the frontend's
+    // assignment). Build a FLAT list of insts across all
+    // blocks so live-range analysis can span block
+    // boundaries — without flat indices, a scalar defined
+    // in entry block and used in a successor would look
+    // dead at the block boundary and get its V-reg
+    // recycled.
+    let mut block_order: Vec<BlockId> =
+        func.blocks.keys().copied().collect();
+    block_order.sort_by_key(|b| b.0);
+
+    // Flat-index → (BlockId, intra-block-index). Inverse
+    // map: per-block-start flat index.
+    let mut flat_insts: Vec<&atrium_spv_ir::Inst> = Vec::new();
+    let mut block_flat_start: HashMap<BlockId, usize> = HashMap::new();
+    for bid in &block_order {
+        let block = func.blocks.get(bid).unwrap();
+        block_flat_start.insert(*bid, flat_insts.len());
+        for inst in &block.insts {
+            flat_insts.push(inst);
+        }
+    }
+
+    // ── Pre-pass: live-range analysis on the flat stream ───
+    let last_use = compute_last_use_flat(&flat_insts);
 
     // ── Linear-scan register allocator ─────────────────────────
     //
@@ -211,7 +227,22 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
     let mut free_pool: Vec<u8> = (16..32).rev().collect();
     let mut owners: HashMap<u8, ValueId> = HashMap::new();
 
-    for (i, inst) in block.insts.iter().enumerate() {
+    // Record where each block starts in the asm byte
+    // stream so branches can be patched after the full
+    // function is emitted.
+    let mut block_asm_offset: HashMap<BlockId, usize> = HashMap::new();
+    // Pending `b imm26` relocations: (asm_byte_offset of
+    // the placeholder instruction, target BlockId).
+    let mut branch_relocs: Vec<(usize, BlockId)> = Vec::new();
+
+    let mut flat_i: usize = 0;
+    for bid in &block_order {
+        let block = func.blocks.get(bid).unwrap();
+        block_asm_offset.insert(*bid, a.len());
+    for (block_inst_idx, inst) in block.insts.iter().enumerate() {
+        let i = flat_i;
+        flat_i += 1;
+        let _ = block_inst_idx;
         // Expire scalars whose last_use < i. Their V-regs
         // return to the free pool. Drain into a temp Vec
         // first to dodge the borrow checker.
@@ -359,12 +390,48 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
             Op::Return => {
                 a.emit(asm::ret());
             }
+            Op::Branch(target) => {
+                // Emit a placeholder `b 0` and record the
+                // patch site. The actual imm26 is resolved
+                // after every block has a known asm
+                // offset.
+                let patch_off = a.len();
+                a.emit(asm::b(0));
+                branch_relocs.push((patch_off, *target));
+            }
             other => {
                 return Err(BackendError::Unsupported(format!(
                     "op {other:?} not supported")));
             }
         }
     }
+    } // end of per-block loop
+
+    // ── Branch fixup ──────────────────────────────────────────
+    //
+    // Walk each pending `b imm26` placeholder and patch it
+    // with the resolved instruction-relative offset.
+    // imm26 is the signed instruction-count delta from
+    // the branch's PC to the target block's first
+    // instruction.
+    for (patch_off, target_bid) in &branch_relocs {
+        let target_byte = *block_asm_offset.get(target_bid).ok_or_else(||
+            BackendError::Internal(format!(
+                "branch target {target_bid:?} has no asm offset")))?;
+        let delta_bytes = target_byte as i64 - *patch_off as i64;
+        if delta_bytes % 4 != 0 {
+            return Err(BackendError::Internal(
+                "branch delta not 4-aligned".into()));
+        }
+        let delta_insts = (delta_bytes / 4) as i32;
+        // imm26 is 26 signed bits → range ±2^25 insts.
+        if !(-(1 << 25)..(1 << 25)).contains(&delta_insts) {
+            return Err(BackendError::Unsupported(format!(
+                "branch delta {delta_insts} exceeds imm26 range")));
+        }
+        a.patch(*patch_off, asm::b(delta_insts));
+    }
+
     Ok(a.into_bytes())
 }
 
@@ -440,7 +507,7 @@ fn alloc_vreg(
 /// scalar ValueId. ConstVec lanes inherit the ConstVec
 /// result's uses transitively (a Store of a vector keeps
 /// each lane alive through the Store).
-fn compute_last_use(insts: &[atrium_spv_ir::Inst]) -> HashMap<ValueId, usize> {
+fn compute_last_use_flat(insts: &[&atrium_spv_ir::Inst]) -> HashMap<ValueId, usize> {
     let mut last_use: HashMap<ValueId, usize> = HashMap::new();
     let mut vec_lanes: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
     for (i, inst) in insts.iter().enumerate() {
