@@ -1204,6 +1204,32 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkDevice, *const c_void, *mut c_void), FnVoidPtr,
             >(vkGetDeviceImageMemoryRequirements)),
+        // 1.1 descriptor-update templates + VK_KHR_push_descriptor
+        "vkCreateDescriptorUpdateTemplate" |
+        "vkCreateDescriptorUpdateTemplateKHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, *const c_void, *const c_void, *mut u64) -> VkResult, FnVoidPtr,
+            >(vkCreateDescriptorUpdateTemplate)),
+        "vkDestroyDescriptorUpdateTemplate" |
+        "vkDestroyDescriptorUpdateTemplateKHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, *const c_void), FnVoidPtr,
+            >(vkDestroyDescriptorUpdateTemplate)),
+        "vkUpdateDescriptorSetWithTemplate" |
+        "vkUpdateDescriptorSetWithTemplateKHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, u64, *const c_void), FnVoidPtr,
+            >(vkUpdateDescriptorSetWithTemplate)),
+        "vkCmdPushDescriptorSet" |
+        "vkCmdPushDescriptorSetKHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u32, u64, u32, u32, *const c_void), FnVoidPtr,
+            >(vkCmdPushDescriptorSet)),
+        "vkCmdPushDescriptorSetWithTemplate" |
+        "vkCmdPushDescriptorSetWithTemplateKHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u64, u64, u32, *const c_void), FnVoidPtr,
+            >(vkCmdPushDescriptorSetWithTemplate)),
         "vkDeviceWaitIdle" =>
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkDevice) -> VkResult, FnVoidPtr,
@@ -5046,6 +5072,74 @@ pub unsafe extern "C" fn vkGetDeviceImageMemoryRequirements(
     let _ = walk_p_next_chain(out_p_next);
 }
 
+// ── Push-descriptor + descriptor-update-template stubs ──────────
+//
+// Templates (1.1) let an app bake a sequence of descriptor
+// updates once and replay them with a single pointer-walk. Push
+// descriptors (VK_KHR_push_descriptor) bind descriptors inline
+// at the cmdbuf without going through a VkDescriptorSet. Both
+// are popular fast-paths in modern Vulkan codebases (wgpu,
+// Slang, SaschaWillems samples). Without them, those codebases
+// resolve null and either fall back or fail.
+//
+// tier-1's renderer doesn't honor descriptor bindings (the
+// bundle pipelines are baked); these are no-ops that satisfy
+// the loader + let the app proceed.
+
+/// `vkCreateDescriptorUpdateTemplate` — allocate a u64 handle.
+/// Template contents (the update sequence) are ignored; we keep
+/// only the handle so vkDestroy + vkUpdateDescriptorSetWithTemplate
+/// recognise it.
+#[no_mangle]
+pub unsafe extern "C" fn vkCreateDescriptorUpdateTemplate(
+    _device:         VkDevice,
+    _p_create_info:  *const c_void,
+    _p_allocator:    *const c_void,
+    p_template:      *mut u64,
+) -> VkResult {
+    if p_template.is_null() { return VK_ERROR_INITIALIZATION_FAILED; }
+    static NEXT_ID: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(1);
+    *p_template = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    VK_SUCCESS
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkDestroyDescriptorUpdateTemplate(
+    _device: VkDevice, _template: u64, _p_allocator: *const c_void,
+) {}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkUpdateDescriptorSetWithTemplate(
+    _device:    VkDevice,
+    _set:       u64,
+    _template:  u64,
+    _p_data:    *const c_void,
+) {}
+
+/// `vkCmdPushDescriptorSet` — VK_KHR_push_descriptor. Tier-1
+/// doesn't bind descriptors at the cmdbuf level so this is a
+/// no-op; the renderer's bundle pipelines stay using the
+/// pipeline-baked binding model.
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdPushDescriptorSet(
+    _command_buffer:    VkCommandBuffer,
+    _pipeline_bind_point: u32,
+    _layout:            u64,
+    _set:               u32,
+    _descriptor_write_count: u32,
+    _p_descriptor_writes: *const c_void,
+) {}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdPushDescriptorSetWithTemplate(
+    _command_buffer:    VkCommandBuffer,
+    _template:          u64,
+    _layout:            u64,
+    _set:               u32,
+    _p_data:            *const c_void,
+) {}
+
 /// `vkFreeDescriptorSets` — release descriptor sets back to the
 /// pool. atrium-vk-icd's descriptor sets are non-resource-owning
 /// (the resource bindings live in the per-cmdbuf BindDescriptors
@@ -5533,6 +5627,13 @@ pub unsafe extern "C" fn vkEnumerateInstanceExtensionProperties(
 /// debug_utils).
 const ATRIUM_DEVICE_EXTENSIONS: &[(&[u8], u32)] = &[
     (b"VK_KHR_swapchain\0", 70),
+    // VK_KHR_push_descriptor — apps that bind descriptors at
+    // draw time without going through vkAllocateDescriptorSets
+    // (Slang/wgpu's fast path; SaschaWillems samples) probe for
+    // this extension. We expose no-op cmd stubs (see "push-
+    // descriptor + descriptor-update-template stubs" below);
+    // tier-1's renderer ignores per-draw descriptor bindings.
+    (b"VK_KHR_push_descriptor\0", 2),
 ];
 
 /// `vkEnumerateDeviceExtensionProperties` — returns the device-
@@ -6879,16 +6980,56 @@ mod tests {
         let mut count: u32 = 99;
         let r = unsafe { typed(std::ptr::null_mut(), std::ptr::null(), &mut count, std::ptr::null_mut()) };
         assert_eq!(r, VK_SUCCESS);
-        assert_eq!(count, 1);
+        assert_eq!(count, 2);
 
-        let mut props: [VkExtensionProperties; 2] = unsafe { std::mem::zeroed() };
-        let mut cap: u32 = 2;
+        let mut props: [VkExtensionProperties; 4] = unsafe { std::mem::zeroed() };
+        let mut cap: u32 = 4;
         let _ = unsafe { typed(std::ptr::null_mut(), std::ptr::null(), &mut cap, props.as_mut_ptr()) };
-        assert_eq!(cap, 1);
-        let name: Vec<u8> = props[0].extensionName.iter()
-            .take_while(|&&c| c != 0).map(|&c| c as u8).collect();
-        assert_eq!(std::str::from_utf8(&name).unwrap(), "VK_KHR_swapchain");
-        assert_eq!(props[0].specVersion, 70);
+        assert_eq!(cap, 2);
+        let names: Vec<String> = (0..2).map(|i| {
+            let bytes: Vec<u8> = props[i].extensionName.iter()
+                .take_while(|&&c| c != 0).map(|&c| c as u8).collect();
+            String::from_utf8(bytes).unwrap()
+        }).collect();
+        assert_eq!(names[0], "VK_KHR_swapchain");
+        assert_eq!(names[1], "VK_KHR_push_descriptor");
+    }
+
+    #[test]
+    fn descriptor_update_template_and_push_descriptor_stubs_resolve() {
+        for name in [
+            b"vkCreateDescriptorUpdateTemplate\0".as_slice(),
+            b"vkCreateDescriptorUpdateTemplateKHR\0".as_slice(),
+            b"vkDestroyDescriptorUpdateTemplate\0".as_slice(),
+            b"vkDestroyDescriptorUpdateTemplateKHR\0".as_slice(),
+            b"vkUpdateDescriptorSetWithTemplate\0".as_slice(),
+            b"vkUpdateDescriptorSetWithTemplateKHR\0".as_slice(),
+            b"vkCmdPushDescriptorSet\0".as_slice(),
+            b"vkCmdPushDescriptorSetKHR\0".as_slice(),
+            b"vkCmdPushDescriptorSetWithTemplate\0".as_slice(),
+            b"vkCmdPushDescriptorSetWithTemplateKHR\0".as_slice(),
+        ] {
+            assert!(lookup(name).is_some(),
+                "must resolve {}",
+                std::str::from_utf8(&name[..name.len()-1]).unwrap());
+        }
+
+        // Create returns distinct handles.
+        let f = lookup(b"vkCreateDescriptorUpdateTemplate\0").unwrap();
+        let g: unsafe extern "C" fn(VkDevice, *const c_void, *const c_void, *mut u64) -> VkResult =
+            unsafe { std::mem::transmute(f) };
+        let mut t1: u64 = 0;
+        let mut t2: u64 = 0;
+        unsafe { g(std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), &mut t1); }
+        unsafe { g(std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), &mut t2); }
+        assert_ne!(t1, 0);
+        assert_ne!(t1, t2, "successive Create returns distinct handles");
+
+        // Cmd stubs accept null cmdbuf without panicking.
+        let f = lookup(b"vkCmdPushDescriptorSet\0").unwrap();
+        let g: unsafe extern "C" fn(VkCommandBuffer, u32, u64, u32, u32, *const c_void) =
+            unsafe { std::mem::transmute(f) };
+        unsafe { g(std::ptr::null_mut(), 0, 0, 0, 0, std::ptr::null()); }
     }
 
     #[test]
