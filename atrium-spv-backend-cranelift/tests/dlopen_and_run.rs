@@ -835,6 +835,236 @@ fn cranelift_shader_reads_push_constant_scale() {
         interp_px, expected);
 }
 
+/// Build a shader reading a `vec4 color` from a push-
+/// constant block at offset 0. Exercises the vec lane-
+/// walk path of Op::Load.
+fn build_pushconst_vec4_shader() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+
+    let mut bld = rspirv::dr::Builder::new();
+    bld.set_version(1, 0);
+    bld.capability(Capability::Shader);
+    bld.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+
+    let void = bld.type_void();
+    let f32_ty = bld.type_float(32, None);
+    let i32_ty = bld.type_int(32, 1);
+    let vec4_f32 = bld.type_vector(f32_ty, 4);
+    let void_fn = bld.type_function(void, vec![]);
+
+    let pc_struct = bld.type_struct(vec![vec4_f32]);
+    bld.member_decorate(pc_struct, 0, Decoration::Offset,
+                        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    bld.decorate(pc_struct, Decoration::Block, vec![]);
+
+    let ptr_pc_struct = bld.type_pointer(None, StorageClass::PushConstant, pc_struct);
+    let ptr_pc_vec4   = bld.type_pointer(None, StorageClass::PushConstant, vec4_f32);
+    let ptr_out_vec4  = bld.type_pointer(None, StorageClass::Output, vec4_f32);
+
+    let zero_i = bld.constant_bit32(i32_ty, 0u32);
+
+    let pc_var = bld.variable(ptr_pc_struct, None, StorageClass::PushConstant, None);
+    let out    = bld.variable(ptr_out_vec4,  None, StorageClass::Output,       None);
+    bld.decorate(out, Decoration::Location,
+                 vec![rspirv::dr::Operand::LiteralBit32(0)]);
+
+    let main = bld.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    bld.begin_block(None).unwrap();
+    let color_ptr = bld.access_chain(ptr_pc_vec4, None, pc_var, vec![zero_i]).unwrap();
+    let color = bld.load(vec4_f32, None, color_ptr, None, vec![]).unwrap();
+    bld.store(out, color, None, vec![]).unwrap();
+    bld.ret().unwrap();
+    bld.end_function().unwrap();
+
+    bld.entry_point(ExecutionModel::Fragment, main, "main", vec![out]);
+    bld.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+
+    let words: Vec<u32> = bld.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn cranelift_shader_reads_push_constant_vec4() {
+    let spirv = build_pushconst_vec4_shader();
+    let module = translate(&spirv).expect("frontend translate");
+    assert_eq!(module.push_constants_size, 16,
+        "expected 16-byte push-constant block, got {}",
+        module.push_constants_size);
+
+    let object_bytes = compile(&module, Target::host())
+        .expect("backend compile").object;
+    let dir = TempDir::new().unwrap();
+    let obj_path = dir.path().join("shader.o");
+    std::fs::write(&obj_path, &object_bytes).unwrap();
+    let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
+    let lib_path = dir.path().join(format!("shader.{ext}"));
+    link_to_shared_library(&obj_path, &lib_path).unwrap();
+
+    let lib = unsafe { libloading::Library::new(&lib_path).unwrap() };
+    type FsMain = unsafe extern "C" fn(
+        *const u8, *const u8, *const u8,
+        f32, f32, f32, f32, u32,
+        *mut f32, *mut f32,
+    );
+    let fs_main: libloading::Symbol<FsMain> = unsafe {
+        lib.get(b"atrium_fs_main").unwrap()
+    };
+
+    let expected = [0.1f32, 0.3, 0.5, 0.9];
+    let mut pc_buf = [0u8; 16];
+    for (i, v) in expected.iter().enumerate() {
+        pc_buf[i*4..i*4+4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    let mut out_color = [0.0f32; 4];
+    let mut out_depth = 0.0f32;
+    unsafe {
+        fs_main(
+            std::ptr::null(), std::ptr::null(), pc_buf.as_ptr(),
+            0.0, 0.0, 0.0, 0.0, 0,
+            out_color.as_mut_ptr(), &mut out_depth,
+        );
+    }
+    assert_eq!(out_color, expected,
+        "push-const vec4 wrong: got {:?}, expected {:?}",
+        out_color, expected);
+
+    let mut interp_inputs = ShaderInputs::default();
+    interp_inputs.push_constants[..16].copy_from_slice(&pc_buf);
+    let interp = Interpreter::new(&spirv).expect("interp parse");
+    let interp_out = interp.run_fragment(&interp_inputs)
+        .expect("interp run");
+    let interp_px = interp_out.pixels.first().copied()
+        .expect("at least one pixel");
+    assert_eq!(interp_px, expected,
+        "interpreter push-const vec4 disagrees: {:?} vs {:?}",
+        interp_px, expected);
+}
+
+/// Build a shader reading a `vec4 color` from a Uniform
+/// (UBO) block at descriptor (set=0, binding=0).
+/// Exercises the StorageClass::Uniform path through the
+/// uniforms ABI parameter (frag param index 1).
+fn build_uniform_vec4_shader() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+
+    let mut bld = rspirv::dr::Builder::new();
+    bld.set_version(1, 0);
+    bld.capability(Capability::Shader);
+    bld.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+
+    let void = bld.type_void();
+    let f32_ty = bld.type_float(32, None);
+    let i32_ty = bld.type_int(32, 1);
+    let vec4_f32 = bld.type_vector(f32_ty, 4);
+    let void_fn = bld.type_function(void, vec![]);
+
+    let ubo_struct = bld.type_struct(vec![vec4_f32]);
+    bld.member_decorate(ubo_struct, 0, Decoration::Offset,
+                        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    bld.decorate(ubo_struct, Decoration::Block, vec![]);
+
+    let ptr_ubo_struct = bld.type_pointer(None, StorageClass::Uniform, ubo_struct);
+    let ptr_ubo_vec4   = bld.type_pointer(None, StorageClass::Uniform, vec4_f32);
+    let ptr_out_vec4   = bld.type_pointer(None, StorageClass::Output, vec4_f32);
+
+    let zero_i = bld.constant_bit32(i32_ty, 0u32);
+
+    let ubo_var = bld.variable(ptr_ubo_struct, None, StorageClass::Uniform, None);
+    bld.decorate(ubo_var, Decoration::DescriptorSet,
+                 vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    bld.decorate(ubo_var, Decoration::Binding,
+                 vec![rspirv::dr::Operand::LiteralBit32(0)]);
+
+    let out = bld.variable(ptr_out_vec4, None, StorageClass::Output, None);
+    bld.decorate(out, Decoration::Location,
+                 vec![rspirv::dr::Operand::LiteralBit32(0)]);
+
+    let main = bld.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    bld.begin_block(None).unwrap();
+    let color_ptr = bld.access_chain(ptr_ubo_vec4, None, ubo_var, vec![zero_i]).unwrap();
+    let color = bld.load(vec4_f32, None, color_ptr, None, vec![]).unwrap();
+    bld.store(out, color, None, vec![]).unwrap();
+    bld.ret().unwrap();
+    bld.end_function().unwrap();
+
+    bld.entry_point(ExecutionModel::Fragment, main, "main", vec![out]);
+    bld.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+
+    let words: Vec<u32> = bld.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn cranelift_shader_reads_uniform_vec4() {
+    let spirv = build_uniform_vec4_shader();
+    let module = translate(&spirv).expect("frontend translate");
+    assert!(!module.uniforms.is_empty(), "expected one uniform binding");
+
+    let object_bytes = compile(&module, Target::host())
+        .expect("backend compile").object;
+    let dir = TempDir::new().unwrap();
+    let obj_path = dir.path().join("shader.o");
+    std::fs::write(&obj_path, &object_bytes).unwrap();
+    let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
+    let lib_path = dir.path().join(format!("shader.{ext}"));
+    link_to_shared_library(&obj_path, &lib_path).unwrap();
+
+    let lib = unsafe { libloading::Library::new(&lib_path).unwrap() };
+    type FsMain = unsafe extern "C" fn(
+        *const u8, *const u8, *const u8,
+        f32, f32, f32, f32, u32,
+        *mut f32, *mut f32,
+    );
+    let fs_main: libloading::Symbol<FsMain> = unsafe {
+        lib.get(b"atrium_fs_main").unwrap()
+    };
+
+    let expected = [0.2f32, 0.4, 0.6, 0.8];
+    let mut ubo_buf = vec![0u8; 16];
+    for (i, v) in expected.iter().enumerate() {
+        ubo_buf[i*4..i*4+4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    let mut out_color = [0.0f32; 4];
+    let mut out_depth = 0.0f32;
+    unsafe {
+        fs_main(
+            std::ptr::null(), ubo_buf.as_ptr(), std::ptr::null(),
+            0.0, 0.0, 0.0, 0.0, 0,
+            out_color.as_mut_ptr(), &mut out_depth,
+        );
+    }
+    assert_eq!(out_color, expected,
+        "uniform vec4 wrong: got {:?}, expected {:?}",
+        out_color, expected);
+
+    let interp_inputs = ShaderInputs {
+        uniforms: ubo_buf.clone(),
+        ..ShaderInputs::default()
+    };
+    let interp = Interpreter::new(&spirv).expect("interp parse");
+    let interp_out = interp.run_fragment(&interp_inputs)
+        .expect("interp run");
+    let interp_px = interp_out.pixels.first().copied()
+        .expect("at least one pixel");
+    assert_eq!(interp_px, expected,
+        "interpreter uniform vec4 disagrees: {:?} vs {:?}",
+        interp_px, expected);
+}
+
 #[test]
 fn cranelift_shader_dlopens_and_writes_different_rgba() {
     // Sanity guard: a different shader produces different

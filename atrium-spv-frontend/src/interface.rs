@@ -220,9 +220,18 @@ impl InterfaceContext {
             match storage {
                 SpvStorageClass::Uniform | SpvStorageClass::UniformConstant => {
                     if let Some(d) = deco {
-                        if let (Some(set), Some(binding), Some(ty)) =
-                            (d.descriptor_set, d.binding, pointee_ty)
+                        if let (Some(set), Some(binding)) =
+                            (d.descriptor_set, d.binding)
                         {
+                            // UBO pointees are typically
+                            // OpTypeStruct (no IR Type);
+                            // record the binding anyway
+                            // with Void as a placeholder.
+                            // Member-level reads land via
+                            // OpAccessChain, which carries
+                            // the resolved leaf type.
+                            let ty = pointee_ty.clone()
+                                .unwrap_or(atrium_spv_ir::Type::Void);
                             ctx.uniforms.push(UniformBinding {
                                 set, binding, offset: 0, ty,
                             });
