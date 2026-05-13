@@ -312,6 +312,60 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
                 &mut a, &mut ints, &mut next_int_w, inst, l, r, asm::sdiv_w)?,
             Op::UDiv(l, r) => emit_int_binop(
                 &mut a, &mut ints, &mut next_int_w, inst, l, r, asm::udiv_w)?,
+            // Bitwise + shifts.
+            Op::BitAnd(l, r) => emit_int_binop(
+                &mut a, &mut ints, &mut next_int_w, inst, l, r, asm::and_w)?,
+            Op::BitOr(l, r) => emit_int_binop(
+                &mut a, &mut ints, &mut next_int_w, inst, l, r, asm::orr_w)?,
+            Op::BitXor(l, r) => emit_int_binop(
+                &mut a, &mut ints, &mut next_int_w, inst, l, r, asm::eor_w)?,
+            Op::Shl(l, r) => emit_int_binop(
+                &mut a, &mut ints, &mut next_int_w, inst, l, r, asm::lslv_w)?,
+            Op::LShr(l, r) => emit_int_binop(
+                &mut a, &mut ints, &mut next_int_w, inst, l, r, asm::lsrv_w)?,
+            Op::AShr(l, r) => emit_int_binop(
+                &mut a, &mut ints, &mut next_int_w, inst, l, r, asm::asrv_w)?,
+            Op::BitNot(s) => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal("BitNot without result".into()))?;
+                let s_w = *ints.get(&s.id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "BitNot operand {:?} not in ints", s.id)))?;
+                let d_w = alloc_int_w(&mut next_int_w)?;
+                a.emit(asm::mvn_w(d_w, s_w));
+                ints.insert(result.id, d_w);
+            }
+            // Integer comparisons → Bool W-reg.
+            Op::IEq(l, r) => emit_icmp_to_bool(
+                &mut a, &ints, &mut bools, &mut next_bool_w,
+                inst, l, r, asm::Cond::Eq)?,
+            Op::INe(l, r) => emit_icmp_to_bool(
+                &mut a, &ints, &mut bools, &mut next_bool_w,
+                inst, l, r, asm::Cond::Ne)?,
+            Op::SLt(l, r) => emit_icmp_to_bool(
+                &mut a, &ints, &mut bools, &mut next_bool_w,
+                inst, l, r, asm::Cond::Lt)?,
+            Op::SLe(l, r) => emit_icmp_to_bool(
+                &mut a, &ints, &mut bools, &mut next_bool_w,
+                inst, l, r, asm::Cond::Le)?,
+            Op::SGt(l, r) => emit_icmp_to_bool(
+                &mut a, &ints, &mut bools, &mut next_bool_w,
+                inst, l, r, asm::Cond::Gt)?,
+            Op::SGe(l, r) => emit_icmp_to_bool(
+                &mut a, &ints, &mut bools, &mut next_bool_w,
+                inst, l, r, asm::Cond::Ge)?,
+            Op::ULt(l, r) => emit_icmp_to_bool(
+                &mut a, &ints, &mut bools, &mut next_bool_w,
+                inst, l, r, asm::Cond::Cc)?,
+            Op::ULe(l, r) => emit_icmp_to_bool(
+                &mut a, &ints, &mut bools, &mut next_bool_w,
+                inst, l, r, asm::Cond::Ls)?,
+            Op::UGt(l, r) => emit_icmp_to_bool(
+                &mut a, &ints, &mut bools, &mut next_bool_w,
+                inst, l, r, asm::Cond::Hi)?,
+            Op::UGe(l, r) => emit_icmp_to_bool(
+                &mut a, &ints, &mut bools, &mut next_bool_w,
+                inst, l, r, asm::Cond::Cs)?,
             Op::INeg(s) => {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal("INeg without result".into()))?;
@@ -672,6 +726,42 @@ fn emit_int_binop(
     Ok(())
 }
 
+/// Emit `cmp_w + cset_w` for an integer comparison.
+/// Bool result lands in the bool W-pool, same as float
+/// comparisons.
+#[allow(clippy::too_many_arguments)]
+fn emit_icmp_to_bool(
+    a: &mut asm::Asm,
+    ints: &HashMap<ValueId, asm::Wreg>,
+    bools: &mut HashMap<ValueId, asm::Wreg>,
+    next_bool_w: &mut u8,
+    inst: &atrium_spv_ir::Inst,
+    lhs: &Value,
+    rhs: &Value,
+    cond: asm::Cond,
+) -> Result<(), BackendError> {
+    let result = inst.result.as_ref().ok_or_else(||
+        BackendError::Internal("icmp without result".into()))?;
+    let l = *ints.get(&lhs.id).ok_or_else(||
+        BackendError::Internal(format!(
+            "icmp lhs {:?} not in ints", lhs.id)))?;
+    let r = *ints.get(&rhs.id).ok_or_else(||
+        BackendError::Internal(format!(
+            "icmp rhs {:?} not in ints", rhs.id)))?;
+    if *next_bool_w >= 13 {
+        // W10..W12 are bool pool (3 slots); W13..W17 are
+        // the int pool. The ranges must not overlap.
+        return Err(BackendError::Unsupported(
+            "ran out of Bool W-regs (W10..W12 exhausted)".into()));
+    }
+    let w_bool = asm::Wreg(*next_bool_w);
+    *next_bool_w += 1;
+    a.emit(asm::cmp_w(l, r));
+    a.emit(asm::cset_w(w_bool, cond));
+    bools.insert(result.id, w_bool);
+    Ok(())
+}
+
 /// Emit `fcmp_s + cset_w` for a float comparison.
 /// Materialises Bool (i32 0/1) into a fresh W-reg drawn
 /// from the bool pool (W10..W15). Subsequent Op::BranchCond
@@ -693,9 +783,11 @@ fn emit_fcmp_to_bool(
         BackendError::Internal(format!("fcmp lhs {:?} missing", lhs.id)))?;
     let r = *scalars.get(&rhs.id).ok_or_else(||
         BackendError::Internal(format!("fcmp rhs {:?} missing", rhs.id)))?;
-    if *next_bool_w >= 16 {
+    if *next_bool_w >= 13 {
+        // W10..W12 are bool pool (3 slots); the int pool
+        // starts at W13 so the ranges must not overlap.
         return Err(BackendError::Unsupported(
-            "ran out of Bool W-regs (W10..W15 exhausted)".into()));
+            "ran out of Bool W-regs (W10..W12 exhausted)".into()));
     }
     let w_bool = asm::Wreg(*next_bool_w);
     *next_bool_w += 1;

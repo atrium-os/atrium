@@ -176,6 +176,139 @@ fn build_int_arith_shader() -> Vec<u8> {
     bytes
 }
 
+/// Shader exercising bitwise + int↔float. Reads i32
+/// `n` from push-const, computes:
+///   hi   = (n >> 4) & 0xF       upper nibble
+///   lo   = n & 0xF              lower nibble
+///   xor  = n ^ 0xAA             bitwise xor
+///   or_  = n | 0x10             bitwise or
+/// Output: vec4(float(hi)/15.0, float(lo)/15.0,
+///             float(xor)/255.0, float(or_)/255.0)
+fn build_int_cmp_bitwise_shader() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let f32_ty = b.type_float(32, None);
+    let i32_ty = b.type_int(32, 1);
+    let vec4 = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let pc_struct = b.type_struct(vec![i32_ty]);
+    b.member_decorate(pc_struct, 0, Decoration::Offset,
+                      vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(pc_struct, Decoration::Block, vec![]);
+    let ptr_pc_struct = b.type_pointer(None, StorageClass::PushConstant, pc_struct);
+    let ptr_pc_i32    = b.type_pointer(None, StorageClass::PushConstant, i32_ty);
+    let ptr_out       = b.type_pointer(None, StorageClass::Output, vec4);
+    let zero_i = b.constant_bit32(i32_ty, 0u32);
+    let four_i = b.constant_bit32(i32_ty, 4u32);
+    let mask_i = b.constant_bit32(i32_ty, 0xFu32);
+    let xor_i  = b.constant_bit32(i32_ty, 0xAAu32);
+    let or_i   = b.constant_bit32(i32_ty, 0x10u32);
+    let c15 = b.constant_bit32(f32_ty, 15.0f32.to_bits());
+    let c255 = b.constant_bit32(f32_ty, 255.0f32.to_bits());
+    let pc_var = b.variable(ptr_pc_struct, None, StorageClass::PushConstant, None);
+    let out = b.variable(ptr_out, None, StorageClass::Output, None);
+    b.decorate(out, Decoration::Location, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let p = b.access_chain(ptr_pc_i32, None, pc_var, vec![zero_i]).unwrap();
+    let n = b.load(i32_ty, None, p, None, vec![]).unwrap();
+    let shifted = b.shift_right_arithmetic(i32_ty, None, n, four_i).unwrap();
+    let hi = b.bitwise_and(i32_ty, None, shifted, mask_i).unwrap();
+    let lo = b.bitwise_and(i32_ty, None, n, mask_i).unwrap();
+    let xor = b.bitwise_xor(i32_ty, None, n, xor_i).unwrap();
+    let or_ = b.bitwise_or(i32_ty, None, n, or_i).unwrap();
+    let hi_f = b.convert_s_to_f(f32_ty, None, hi).unwrap();
+    let lo_f = b.convert_s_to_f(f32_ty, None, lo).unwrap();
+    let xor_f = b.convert_s_to_f(f32_ty, None, xor).unwrap();
+    let or_f = b.convert_s_to_f(f32_ty, None, or_).unwrap();
+    let hi_n = b.f_div(f32_ty, None, hi_f, c15).unwrap();
+    let lo_n = b.f_div(f32_ty, None, lo_f, c15).unwrap();
+    let xor_n = b.f_div(f32_ty, None, xor_f, c255).unwrap();
+    let or_n = b.f_div(f32_ty, None, or_f, c255).unwrap();
+    let color = b.composite_construct(vec4, None,
+        vec![hi_n, lo_n, xor_n, or_n]).unwrap();
+    b.store(out, color, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![out]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+/// Shader using integer compare + structured if/else:
+/// if (n < 10) out = red; else out = blue.
+fn build_int_if_else_shader() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, SelectionControl,
+        StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let f32_ty = b.type_float(32, None);
+    let i32_ty = b.type_int(32, 1);
+    let bool_ty = b.type_bool();
+    let vec4 = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let pc_struct = b.type_struct(vec![i32_ty]);
+    b.member_decorate(pc_struct, 0, Decoration::Offset,
+                      vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(pc_struct, Decoration::Block, vec![]);
+    let ptr_pc_struct = b.type_pointer(None, StorageClass::PushConstant, pc_struct);
+    let ptr_pc_i32    = b.type_pointer(None, StorageClass::PushConstant, i32_ty);
+    let ptr_out       = b.type_pointer(None, StorageClass::Output, vec4);
+    let zero_i = b.constant_bit32(i32_ty, 0u32);
+    let ten_i  = b.constant_bit32(i32_ty, 10u32);
+    let c0  = b.constant_bit32(f32_ty, 0.0f32.to_bits());
+    let c1  = b.constant_bit32(f32_ty, 1.0f32.to_bits());
+    let red  = b.constant_composite(vec4, vec![c1, c0, c0, c1]);
+    let blue = b.constant_composite(vec4, vec![c0, c0, c1, c1]);
+    let pc_var = b.variable(ptr_pc_struct, None, StorageClass::PushConstant, None);
+    let out = b.variable(ptr_out, None, StorageClass::Output, None);
+    b.decorate(out, Decoration::Location,
+               vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let p = b.access_chain(ptr_pc_i32, None, pc_var, vec![zero_i]).unwrap();
+    let n = b.load(i32_ty, None, p, None, vec![]).unwrap();
+    let cond = b.s_less_than(bool_ty, None, n, ten_i).unwrap();
+    let then_id = b.id();
+    let else_id = b.id();
+    let merge_id = b.id();
+    b.selection_merge(merge_id, SelectionControl::NONE).unwrap();
+    b.branch_conditional(cond, then_id, else_id, vec![]).unwrap();
+    b.begin_block(Some(then_id)).unwrap();
+    b.store(out, red, None, vec![]).unwrap();
+    b.branch(merge_id).unwrap();
+    b.begin_block(Some(else_id)).unwrap();
+    b.store(out, blue, None, vec![]).unwrap();
+    b.branch(merge_id).unwrap();
+    b.begin_block(Some(merge_id)).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![out]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
 fn build_if_else_shader() -> Vec<u8> {
     use rspirv::binary::Assemble;
     use rspirv::spirv::{
@@ -281,6 +414,54 @@ fn three_way_vec_arithmetic() {
     assert_shader_agrees(
         &spirv,
         &ShaderInputs::default(),
+        ColorTolerance::Exact,
+        &refs,
+    );
+}
+
+#[test]
+fn three_way_bitwise_and_shift() {
+    let spirv = build_int_cmp_bitwise_shader();
+    let mut inputs = ShaderInputs::default();
+    let n: i32 = 0xC3; // upper=0xC, lower=0x3
+    inputs.push_constants[..4].copy_from_slice(&n.to_le_bytes());
+    let rs = runners();
+    let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
+    assert_shader_agrees(
+        &spirv,
+        &inputs,
+        ColorTolerance::Exact,
+        &refs,
+    );
+}
+
+#[test]
+fn three_way_int_compare_then_branch() {
+    let spirv = build_int_if_else_shader();
+    let mut inputs = ShaderInputs::default();
+    let n: i32 = 5;
+    inputs.push_constants[..4].copy_from_slice(&n.to_le_bytes());
+    let rs = runners();
+    let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
+    assert_shader_agrees(
+        &spirv,
+        &inputs,
+        ColorTolerance::Exact,
+        &refs,
+    );
+}
+
+#[test]
+fn three_way_int_compare_else_branch() {
+    let spirv = build_int_if_else_shader();
+    let mut inputs = ShaderInputs::default();
+    let n: i32 = 99;
+    inputs.push_constants[..4].copy_from_slice(&n.to_le_bytes());
+    let rs = runners();
+    let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
+    assert_shader_agrees(
+        &spirv,
+        &inputs,
         ColorTolerance::Exact,
         &refs,
     );
