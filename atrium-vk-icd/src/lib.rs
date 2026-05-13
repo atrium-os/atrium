@@ -1073,6 +1073,23 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkDevice, u64, *const c_void, *mut c_void), FnVoidPtr,
             >(vkGetImageSubresourceLayout)),
+        "vkResetCommandPool" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, u32) -> VkResult, FnVoidPtr,
+            >(vkResetCommandPool)),
+        "vkTrimCommandPool" |
+        "vkTrimCommandPoolKHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, u32), FnVoidPtr,
+            >(vkTrimCommandPool)),
+        "vkFlushMappedMemoryRanges" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u32, *const c_void) -> VkResult, FnVoidPtr,
+            >(vkFlushMappedMemoryRanges)),
+        "vkInvalidateMappedMemoryRanges" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u32, *const c_void) -> VkResult, FnVoidPtr,
+            >(vkInvalidateMappedMemoryRanges)),
         "vkDeviceWaitIdle" =>
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkDevice) -> VkResult, FnVoidPtr,
@@ -4531,6 +4548,52 @@ pub unsafe extern "C" fn vkResetCommandBuffer(
     VK_SUCCESS
 }
 
+/// `vkResetCommandPool` — reset all cmdbufs in a pool. Today this
+/// is a SUCCESS no-op: atrium-vk-icd doesn't track which cmdbufs
+/// belong to which pool (alloc returns a `Box<AtriumCommandBuffer>`
+/// with no back-pointer), and the standard recycle pattern
+/// (alloc → record → submit → reset_pool → vkBeginCommandBuffer
+/// → record again) still works correctly because
+/// vkBeginCommandBuffer unconditionally resets the cmdbuf state
+/// + drops its FrameBuilder.
+///
+/// Spec-deviation note: apps that strictly rely on the pool reset
+/// putting EVERY allocated cmdbuf back to Initial without a
+/// subsequent vkBeginCommandBuffer would see stale state. Real
+/// apps don't do this; a future per-pool cmdbuf list can fix it
+/// if needed.
+#[no_mangle]
+pub unsafe extern "C" fn vkResetCommandPool(
+    _device:     VkDevice,
+    _pool:       u64,
+    _flags:      u32, /* VkCommandPoolResetFlags */
+) -> VkResult { VK_SUCCESS }
+
+/// `vkTrimCommandPool` — release unused command-pool memory back
+/// to the system. We allocate per-cmdbuf via Box, so there's no
+/// pool-wide buffer to trim. SUCCESS no-op.
+#[no_mangle]
+pub unsafe extern "C" fn vkTrimCommandPool(
+    _device: VkDevice, _pool: u64, _flags: u32,
+) {}
+
+/// `vkFlushMappedMemoryRanges` — flush writes to non-coherent
+/// host-visible memory. atrium-vk-icd advertises every memory
+/// type as HOST_COHERENT (vkGetPhysicalDeviceMemoryProperties),
+/// so this is spec-required to be a SUCCESS no-op for any range
+/// we'd see.
+#[no_mangle]
+pub unsafe extern "C" fn vkFlushMappedMemoryRanges(
+    _device: VkDevice, _range_count: u32, _p_ranges: *const c_void,
+) -> VkResult { VK_SUCCESS }
+
+/// `vkInvalidateMappedMemoryRanges` — symmetric counterpart to
+/// vkFlushMappedMemoryRanges; same coherent-memory rationale.
+#[no_mangle]
+pub unsafe extern "C" fn vkInvalidateMappedMemoryRanges(
+    _device: VkDevice, _range_count: u32, _p_ranges: *const c_void,
+) -> VkResult { VK_SUCCESS }
+
 /// `vkQueueSubmit` — flush each submitted cmdbuf's FrameOp stream
 /// to the aqueduct-gpu host endpoint via the owning AtriumInstance's
 /// GpuClient.
@@ -5944,6 +6007,36 @@ mod tests {
         assert!(props.optimal_tiling_features.is_empty());
         assert!(props.linear_tiling_features.is_empty());
         assert!(props.buffer_features.is_empty());
+    }
+
+    #[test]
+    fn command_pool_and_memory_range_stubs_resolve_and_succeed() {
+        // 5 entry points — all proc-addr resolvable and all return
+        // SUCCESS / void without crashing on null-ish inputs.
+        for name in [
+            b"vkResetCommandPool\0".as_slice(),
+            b"vkTrimCommandPool\0".as_slice(),
+            b"vkTrimCommandPoolKHR\0".as_slice(),
+            b"vkFlushMappedMemoryRanges\0".as_slice(),
+            b"vkInvalidateMappedMemoryRanges\0".as_slice(),
+        ] {
+            let r = lookup(name);
+            assert!(r.is_some(),
+                "must resolve {}",
+                std::str::from_utf8(&name[..name.len()-1]).unwrap());
+        }
+
+        let f = lookup(b"vkResetCommandPool\0").unwrap();
+        let g: unsafe extern "C" fn(VkDevice, u64, u32) -> VkResult =
+            unsafe { std::mem::transmute(f) };
+        let r = unsafe { g(std::ptr::null_mut(), 0, 0) };
+        assert_eq!(r, VK_SUCCESS);
+
+        let f = lookup(b"vkFlushMappedMemoryRanges\0").unwrap();
+        let g: unsafe extern "C" fn(VkDevice, u32, *const c_void) -> VkResult =
+            unsafe { std::mem::transmute(f) };
+        let r = unsafe { g(std::ptr::null_mut(), 0, std::ptr::null()) };
+        assert_eq!(r, VK_SUCCESS);
     }
 
     #[test]
