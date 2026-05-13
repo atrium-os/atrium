@@ -1090,6 +1090,29 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkDevice, u32, *const c_void) -> VkResult, FnVoidPtr,
             >(vkInvalidateMappedMemoryRanges)),
+        "vkFreeDescriptorSets" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, u32, *const u64) -> VkResult, FnVoidPtr,
+            >(vkFreeDescriptorSets)),
+        "vkResetDescriptorPool" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, u32) -> VkResult, FnVoidPtr,
+            >(vkResetDescriptorPool)),
+        "vkSignalSemaphore" |
+        "vkSignalSemaphoreKHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, *const c_void) -> VkResult, FnVoidPtr,
+            >(vkSignalSemaphore)),
+        "vkWaitSemaphores" |
+        "vkWaitSemaphoresKHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, *const c_void, u64) -> VkResult, FnVoidPtr,
+            >(vkWaitSemaphores)),
+        "vkGetSemaphoreCounterValue" |
+        "vkGetSemaphoreCounterValueKHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, *mut u64) -> VkResult, FnVoidPtr,
+            >(vkGetSemaphoreCounterValue)),
         "vkDeviceWaitIdle" =>
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkDevice) -> VkResult, FnVoidPtr,
@@ -4548,6 +4571,55 @@ pub unsafe extern "C" fn vkResetCommandBuffer(
     VK_SUCCESS
 }
 
+/// `vkFreeDescriptorSets` — release descriptor sets back to the
+/// pool. atrium-vk-icd's descriptor sets are non-resource-owning
+/// (the resource bindings live in the per-cmdbuf BindDescriptors
+/// FrameOps), so freeing is a SUCCESS no-op.
+#[no_mangle]
+pub unsafe extern "C" fn vkFreeDescriptorSets(
+    _device: VkDevice, _pool: u64, _count: u32, _sets: *const u64,
+) -> VkResult { VK_SUCCESS }
+
+/// `vkResetDescriptorPool` — recycle all descriptor sets from a
+/// pool. Same rationale as vkFreeDescriptorSets: descriptor sets
+/// don't hold pool memory on our side.
+#[no_mangle]
+pub unsafe extern "C" fn vkResetDescriptorPool(
+    _device: VkDevice, _pool: u64, _flags: u32,
+) -> VkResult { VK_SUCCESS }
+
+/// `vkSignalSemaphore` — host-side timeline-semaphore signal
+/// (Vulkan 1.2). atrium-vk-icd's submission path is sequential
+/// (each vkQueueSubmit returns after the daemon has queued the
+/// work), so any wait on a signaled value is already satisfied
+/// by the time the next call lands. Returns SUCCESS.
+#[no_mangle]
+pub unsafe extern "C" fn vkSignalSemaphore(
+    _device: VkDevice, _p_signal_info: *const c_void,
+) -> VkResult { VK_SUCCESS }
+
+/// `vkWaitSemaphores` — host-side wait for one-or-more timeline
+/// semaphores to reach given values. With our sequential submit
+/// model every prior signal has already happened on the daemon
+/// side; return SUCCESS immediately regardless of timeout.
+#[no_mangle]
+pub unsafe extern "C" fn vkWaitSemaphores(
+    _device: VkDevice, _p_wait_info: *const c_void, _timeout: u64,
+) -> VkResult { VK_SUCCESS }
+
+/// `vkGetSemaphoreCounterValue` — return the current value of a
+/// timeline semaphore. Without real timeline tracking on the
+/// ICD side we return 0 (the spec-mandated initial value);
+/// well-behaved apps subsequently call vkSignalSemaphore /
+/// vkWaitSemaphores rather than treating this as authoritative.
+#[no_mangle]
+pub unsafe extern "C" fn vkGetSemaphoreCounterValue(
+    _device: VkDevice, _semaphore: u64, p_value: *mut u64,
+) -> VkResult {
+    if !p_value.is_null() { *p_value = 0; }
+    VK_SUCCESS
+}
+
 /// `vkResetCommandPool` — reset all cmdbufs in a pool. Today this
 /// is a SUCCESS no-op: atrium-vk-icd doesn't track which cmdbufs
 /// belong to which pool (alloc returns a `Box<AtriumCommandBuffer>`
@@ -6007,6 +6079,51 @@ mod tests {
         assert!(props.optimal_tiling_features.is_empty());
         assert!(props.linear_tiling_features.is_empty());
         assert!(props.buffer_features.is_empty());
+    }
+
+    #[test]
+    fn timeline_semaphore_and_descriptor_recycling_stubs() {
+        // 8 entry points + KHR aliases — all resolve, all return
+        // SUCCESS / harmless on null-ish input.
+        for name in [
+            b"vkFreeDescriptorSets\0".as_slice(),
+            b"vkResetDescriptorPool\0".as_slice(),
+            b"vkSignalSemaphore\0".as_slice(),
+            b"vkSignalSemaphoreKHR\0".as_slice(),
+            b"vkWaitSemaphores\0".as_slice(),
+            b"vkWaitSemaphoresKHR\0".as_slice(),
+            b"vkGetSemaphoreCounterValue\0".as_slice(),
+            b"vkGetSemaphoreCounterValueKHR\0".as_slice(),
+        ] {
+            assert!(lookup(name).is_some(),
+                "must resolve {}",
+                std::str::from_utf8(&name[..name.len()-1]).unwrap());
+        }
+
+        // GetSemaphoreCounterValue should write the spec-mandated
+        // initial value (0) to *p_value.
+        let f = lookup(b"vkGetSemaphoreCounterValue\0").unwrap();
+        let g: unsafe extern "C" fn(VkDevice, u64, *mut u64) -> VkResult =
+            unsafe { std::mem::transmute(f) };
+        let mut v: u64 = 0xdead_beef_dead_beef;
+        let r = unsafe { g(std::ptr::null_mut(), 1, &mut v) };
+        assert_eq!(r, VK_SUCCESS);
+        assert_eq!(v, 0, "must overwrite the caller buffer with 0");
+
+        // Null p_value must not crash.
+        let r = unsafe { g(std::ptr::null_mut(), 1, std::ptr::null_mut()) };
+        assert_eq!(r, VK_SUCCESS);
+
+        // vkWaitSemaphores must return immediately regardless of
+        // the timeout we pass.
+        let f = lookup(b"vkWaitSemaphores\0").unwrap();
+        let g: unsafe extern "C" fn(VkDevice, *const c_void, u64) -> VkResult =
+            unsafe { std::mem::transmute(f) };
+        let t0 = std::time::Instant::now();
+        let r = unsafe { g(std::ptr::null_mut(), std::ptr::null(), u64::MAX) };
+        assert_eq!(r, VK_SUCCESS);
+        assert!(t0.elapsed() < std::time::Duration::from_millis(50),
+            "stub must NOT actually wait the timeout");
     }
 
     #[test]
