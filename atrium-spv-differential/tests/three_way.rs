@@ -504,6 +504,111 @@ fn build_switch_shader() -> Vec<u8> {
     bytes
 }
 
+/// Build a simple counted-loop shader:
+///   int acc = 0; for (int i = 0; i < n; i++) acc += i;
+///   out = (acc == EXPECTED) ? vec4(1,1,1,1) : vec4(0,0,0,1)
+/// Phi at the loop header (induction `i` + accumulator
+/// `acc`). BranchCond at the header tests `i < n` and
+/// branches to body or merge — neither is Phi-bearing
+/// (the header itself is, but isn't a BranchCond target).
+fn build_loop_sum_shader() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, LoopControl, MemoryModel,
+        SelectionControl, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let f32_ty = b.type_float(32, None);
+    let i32_ty = b.type_int(32, 1);
+    let bool_ty = b.type_bool();
+    let vec4 = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let pc_struct = b.type_struct(vec![i32_ty]);
+    b.member_decorate(pc_struct, 0, Decoration::Offset,
+                      vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(pc_struct, Decoration::Block, vec![]);
+    let ptr_pc_struct = b.type_pointer(None, StorageClass::PushConstant, pc_struct);
+    let ptr_pc_i32    = b.type_pointer(None, StorageClass::PushConstant, i32_ty);
+    let ptr_out       = b.type_pointer(None, StorageClass::Output, vec4);
+    let zero_i = b.constant_bit32(i32_ty, 0u32);
+    let one_i  = b.constant_bit32(i32_ty, 1u32);
+    let c0  = b.constant_bit32(f32_ty, 0.0f32.to_bits());
+    let c1  = b.constant_bit32(f32_ty, 1.0f32.to_bits());
+    let pc_var = b.variable(ptr_pc_struct, None, StorageClass::PushConstant, None);
+    let out = b.variable(ptr_out, None, StorageClass::Output, None);
+    b.decorate(out, Decoration::Location,
+               vec![rspirv::dr::Operand::LiteralBit32(0)]);
+
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+
+    // Pre-allocate block + value ids so the Phi can name
+    // the back-edge values.
+    let entry_id = b.id();
+    let header_id = b.id();
+    let body_id = b.id();
+    let cont_id = b.id();
+    let merge_id = b.id();
+    let i_next = b.id();
+    let acc_next = b.id();
+
+    // entry: load n, branch to header.
+    b.begin_block(Some(entry_id)).unwrap();
+    let p = b.access_chain(ptr_pc_i32, None, pc_var, vec![zero_i]).unwrap();
+    let n = b.load(i32_ty, None, p, None, vec![]).unwrap();
+    b.branch(header_id).unwrap();
+
+    // header: phi i, phi acc, cmp, LoopMerge, BranchCond.
+    b.begin_block(Some(header_id)).unwrap();
+    let i_phi = b.phi(i32_ty, None, vec![
+        (zero_i, entry_id),
+        (i_next, cont_id),
+    ]).unwrap();
+    let acc_phi = b.phi(i32_ty, None, vec![
+        (zero_i, entry_id),
+        (acc_next, cont_id),
+    ]).unwrap();
+    let cond = b.s_less_than(bool_ty, None, i_phi, n).unwrap();
+    b.loop_merge(merge_id, cont_id, LoopControl::NONE, vec![]).unwrap();
+    b.branch_conditional(cond, body_id, merge_id, vec![]).unwrap();
+
+    // body: empty, branch to continue.
+    b.begin_block(Some(body_id)).unwrap();
+    b.branch(cont_id).unwrap();
+
+    // continue: i_next = i+1, acc_next = acc+i, back-edge.
+    b.begin_block(Some(cont_id)).unwrap();
+    b.i_add(i32_ty, Some(i_next), i_phi, one_i).unwrap();
+    b.i_add(i32_ty, Some(acc_next), acc_phi, i_phi).unwrap();
+    b.branch(header_id).unwrap();
+
+    // merge: check acc_phi vs expected, write colour.
+    b.begin_block(Some(merge_id)).unwrap();
+    // expected = n*(n-1)/2; we hardcode for n=5 → 10.
+    let expected = b.constant_bit32(i32_ty, 10u32);
+    let ok = b.i_equal(bool_ty, None, acc_phi, expected).unwrap();
+    let red = b.select(f32_ty, None, ok, c1, c0).unwrap();
+    let color = b.composite_construct(vec4, None,
+        vec![red, red, red, c1]).unwrap();
+    b.store(out, color, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+
+    let _ = SelectionControl::NONE; // silence unused
+
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![out]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
 fn build_if_else_shader() -> Vec<u8> {
     use rspirv::binary::Assemble;
     use rspirv::spirv::{
@@ -737,6 +842,17 @@ fn three_way_switch_default() {
     let spirv = build_switch_shader();
     let mut inputs = ShaderInputs::default();
     inputs.push_constants[..4].copy_from_slice(&99i32.to_le_bytes());
+    let rs = runners();
+    let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
+    assert_shader_agrees(&spirv, &inputs, ColorTolerance::Exact, &refs);
+}
+
+#[test]
+fn three_way_simple_loop() {
+    let spirv = build_loop_sum_shader();
+    let mut inputs = ShaderInputs::default();
+    let n: i32 = 5; // 0+1+2+3+4 = 10 = expected
+    inputs.push_constants[..4].copy_from_slice(&n.to_le_bytes());
     let rs = runners();
     let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
     assert_shader_agrees(&spirv, &inputs, ColorTolerance::Exact, &refs);
