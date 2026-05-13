@@ -353,6 +353,98 @@ fn translate_inst(
         // Scalar f32 only in v3; vec arithmetic comes
         // next.
 
+        // Integer arithmetic.
+        SpvOp::IAdd => emit_binop_int(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::IAdd(a, b),
+        ),
+        SpvOp::ISub => emit_binop_int(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::ISub(a, b),
+        ),
+        SpvOp::IMul => emit_binop_int(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::IMul(a, b),
+        ),
+        SpvOp::SDiv => emit_binop_int(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::SDiv(a, b),
+        ),
+        SpvOp::UDiv => emit_binop_int(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::UDiv(a, b),
+        ),
+        SpvOp::SMod => emit_binop_int(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::SMod(a, b),
+        ),
+        SpvOp::UMod => emit_binop_int(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::UMod(a, b),
+        ),
+        SpvOp::SNegate => emit_unop_int(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a| Op::INeg(a),
+        ),
+        // Integer comparisons.
+        SpvOp::IEqual => emit_binop_int(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::IEq(a, b),
+        ),
+        SpvOp::INotEqual => emit_binop_int(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::INe(a, b),
+        ),
+        SpvOp::SLessThan => emit_binop_int(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::SLt(a, b),
+        ),
+        SpvOp::SLessThanEqual => emit_binop_int(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::SLe(a, b),
+        ),
+        SpvOp::SGreaterThan => emit_binop_int(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::SGt(a, b),
+        ),
+        SpvOp::SGreaterThanEqual => emit_binop_int(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::SGe(a, b),
+        ),
+        SpvOp::ULessThan => emit_binop_int(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::ULt(a, b),
+        ),
+        SpvOp::ULessThanEqual => emit_binop_int(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::ULe(a, b),
+        ),
+        SpvOp::UGreaterThan => emit_binop_int(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::UGt(a, b),
+        ),
+        SpvOp::UGreaterThanEqual => emit_binop_int(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::UGe(a, b),
+        ),
         SpvOp::FAdd => emit_binop_float(
             spv_inst, types, constants, iface,
             id_map, next_value_id, insts, source_spirv_offset,
@@ -751,6 +843,83 @@ fn translate_inst(
 /// instruction (FAdd / FSub / FMul / FDiv etc.) into the
 /// equivalent atrium-spv-ir Op via a constructor closure.
 #[allow(clippy::too_many_arguments)]
+/// Helper: translate a SPIR-V binary integer instruction
+/// (IAdd / ISub / IMul / SDiv / IEqual / SLessThan etc.)
+/// into the equivalent atrium-spv-ir Op. Same shape as
+/// [`emit_binop_float`] but stays in the integer family.
+#[allow(clippy::too_many_arguments)]
+fn emit_binop_int(
+    spv_inst: &Instruction,
+    types: &TypeContext,
+    constants: &ConstantContext,
+    iface: &InterfaceContext,
+    id_map: &mut HashMap<Word, Value>,
+    next_value_id: &mut u32,
+    insts: &mut Vec<Inst>,
+    source_spirv_offset: u32,
+    make_op: impl FnOnce(Value, Value) -> Op,
+) -> Result<(), FrontendError> {
+    let _ = iface;
+    let result_id = spv_inst.result_id.ok_or_else(|| FrontendError::Malformed(
+        format!("{:?} without result id", spv_inst.class.opcode)))?;
+    let result_type_id = spv_inst.result_type.ok_or_else(|| FrontendError::Malformed(
+        format!("{:?} without result type", spv_inst.class.opcode)))?;
+    let ty = types.get(result_type_id)?.clone();
+    let lhs_id = expect_id(&spv_inst.operands, 0)?;
+    let rhs_id = expect_id(&spv_inst.operands, 1)?;
+    let lhs = resolve_value(
+        lhs_id, types, constants, id_map, next_value_id, insts,
+        source_spirv_offset,
+    )?;
+    let rhs = resolve_value(
+        rhs_id, types, constants, id_map, next_value_id, insts,
+        source_spirv_offset,
+    )?;
+    let result = fresh_value(ty, next_value_id);
+    id_map.insert(result_id, result.clone());
+    insts.push(Inst {
+        op: make_op(lhs, rhs),
+        result: Some(result),
+        source_spirv_offset,
+    });
+    Ok(())
+}
+
+/// Helper: translate a SPIR-V unary integer instruction
+/// (SNegate) into the equivalent atrium-spv-ir Op.
+#[allow(clippy::too_many_arguments)]
+fn emit_unop_int(
+    spv_inst: &Instruction,
+    types: &TypeContext,
+    constants: &ConstantContext,
+    iface: &InterfaceContext,
+    id_map: &mut HashMap<Word, Value>,
+    next_value_id: &mut u32,
+    insts: &mut Vec<Inst>,
+    source_spirv_offset: u32,
+    make_op: impl FnOnce(Value) -> Op,
+) -> Result<(), FrontendError> {
+    let _ = iface;
+    let result_id = spv_inst.result_id.ok_or_else(|| FrontendError::Malformed(
+        format!("{:?} without result id", spv_inst.class.opcode)))?;
+    let result_type_id = spv_inst.result_type.ok_or_else(|| FrontendError::Malformed(
+        format!("{:?} without result type", spv_inst.class.opcode)))?;
+    let ty = types.get(result_type_id)?.clone();
+    let src_id = expect_id(&spv_inst.operands, 0)?;
+    let src = resolve_value(
+        src_id, types, constants, id_map, next_value_id, insts,
+        source_spirv_offset,
+    )?;
+    let result = fresh_value(ty, next_value_id);
+    id_map.insert(result_id, result.clone());
+    insts.push(Inst {
+        op: make_op(src),
+        result: Some(result),
+        source_spirv_offset,
+    });
+    Ok(())
+}
+
 fn emit_binop_float(
     spv_inst: &Instruction,
     types: &TypeContext,

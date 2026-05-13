@@ -43,7 +43,7 @@ use atrium_spv_ir::{
     FloatKind, Module, Op, ShaderStage, StorageClass, Type, ValueId,
 };
 
-use cranelift_codegen::ir::condcodes::FloatCC;
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{
     AbiParam, Function as ClifFunction, InstBuilder, MemFlags, Signature, UserFuncName,
     Value as ClifValue,
@@ -658,6 +658,54 @@ impl FnTranslator {
             // `scalars` (lane count 1) or `vectors`
             // (lane count >= 2) and walks lanes
             // accordingly.
+            // Integer arithmetic. All scalar; vec int
+            // ops would lane-walk like float, but we
+            // don't support vec ints yet.
+            Op::IAdd(a, b) => self.emit_int_binop(
+                builder, &inst.result, a, b, |b, x, y| b.ins().iadd(x, y)),
+            Op::ISub(a, b) => self.emit_int_binop(
+                builder, &inst.result, a, b, |b, x, y| b.ins().isub(x, y)),
+            Op::IMul(a, b) => self.emit_int_binop(
+                builder, &inst.result, a, b, |b, x, y| b.ins().imul(x, y)),
+            Op::SDiv(a, b) => self.emit_int_binop(
+                builder, &inst.result, a, b, |b, x, y| b.ins().sdiv(x, y)),
+            Op::UDiv(a, b) => self.emit_int_binop(
+                builder, &inst.result, a, b, |b, x, y| b.ins().udiv(x, y)),
+            Op::SMod(a, b) => self.emit_int_binop(
+                builder, &inst.result, a, b, |b, x, y| b.ins().srem(x, y)),
+            Op::UMod(a, b) => self.emit_int_binop(
+                builder, &inst.result, a, b, |b, x, y| b.ins().urem(x, y)),
+            Op::INeg(a) => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal("INeg without result".into()))?;
+                let av = self.scalars.get(&a.id).copied().ok_or_else(||
+                    BackendError::Internal(format!(
+                        "INeg operand {:?} not in scalars", a.id)))?;
+                let v = builder.ins().ineg(av);
+                self.scalars.insert(result.id, v);
+                Ok(())
+            }
+            // Integer comparisons → Bool (i32 0/1 per B4).
+            Op::IEq(a, b) => self.emit_icmp(
+                builder, &inst.result, a, b, IntCC::Equal),
+            Op::INe(a, b) => self.emit_icmp(
+                builder, &inst.result, a, b, IntCC::NotEqual),
+            Op::SLt(a, b) => self.emit_icmp(
+                builder, &inst.result, a, b, IntCC::SignedLessThan),
+            Op::SLe(a, b) => self.emit_icmp(
+                builder, &inst.result, a, b, IntCC::SignedLessThanOrEqual),
+            Op::SGt(a, b) => self.emit_icmp(
+                builder, &inst.result, a, b, IntCC::SignedGreaterThan),
+            Op::SGe(a, b) => self.emit_icmp(
+                builder, &inst.result, a, b, IntCC::SignedGreaterThanOrEqual),
+            Op::ULt(a, b) => self.emit_icmp(
+                builder, &inst.result, a, b, IntCC::UnsignedLessThan),
+            Op::ULe(a, b) => self.emit_icmp(
+                builder, &inst.result, a, b, IntCC::UnsignedLessThanOrEqual),
+            Op::UGt(a, b) => self.emit_icmp(
+                builder, &inst.result, a, b, IntCC::UnsignedGreaterThan),
+            Op::UGe(a, b) => self.emit_icmp(
+                builder, &inst.result, a, b, IntCC::UnsignedGreaterThanOrEqual),
             Op::FAdd(a, b) => self.emit_float_binop(
                 builder, &inst.result, a, b, |b, x, y| b.ins().fadd(x, y),
             ),
@@ -908,6 +956,55 @@ impl FnTranslator {
     /// produces an I8 boolean which we uextend to I32.
     /// For vec inputs, emits N fcmps and stores the
     /// uextend'd bools as a vec<i32>.
+    /// Emit a scalar integer binary op (iadd / isub /
+    /// imul / sdiv / etc.). Operands looked up in
+    /// self.scalars; result written there.
+    fn emit_int_binop(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        result: &Option<atrium_spv_ir::Value>,
+        a: &atrium_spv_ir::Value,
+        b: &atrium_spv_ir::Value,
+        emit: impl FnOnce(&mut FunctionBuilder, ClifValue, ClifValue) -> ClifValue,
+    ) -> Result<(), BackendError> {
+        let result = result.as_ref().ok_or_else(||
+            BackendError::Internal("int binop without result".into()))?;
+        let av = self.scalars.get(&a.id).copied().ok_or_else(||
+            BackendError::Internal(format!(
+                "int binop lhs {:?} not in scalars", a.id)))?;
+        let bv = self.scalars.get(&b.id).copied().ok_or_else(||
+            BackendError::Internal(format!(
+                "int binop rhs {:?} not in scalars", b.id)))?;
+        let v = emit(builder, av, bv);
+        self.scalars.insert(result.id, v);
+        Ok(())
+    }
+
+    /// Emit a scalar integer comparison; Cranelift's icmp
+    /// returns I8 boolean which we uextend to I32 per
+    /// constraint B4.
+    fn emit_icmp(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        result: &Option<atrium_spv_ir::Value>,
+        a: &atrium_spv_ir::Value,
+        b: &atrium_spv_ir::Value,
+        cc: IntCC,
+    ) -> Result<(), BackendError> {
+        let result = result.as_ref().ok_or_else(||
+            BackendError::Internal("icmp without result".into()))?;
+        let av = self.scalars.get(&a.id).copied().ok_or_else(||
+            BackendError::Internal(format!(
+                "icmp lhs {:?} not in scalars", a.id)))?;
+        let bv = self.scalars.get(&b.id).copied().ok_or_else(||
+            BackendError::Internal(format!(
+                "icmp rhs {:?} not in scalars", b.id)))?;
+        let bool_v = builder.ins().icmp(cc, av, bv);
+        let i32_v = builder.ins().uextend(clif_types::I32, bool_v);
+        self.scalars.insert(result.id, i32_v);
+        Ok(())
+    }
+
     fn emit_fcmp(
         &mut self,
         builder: &mut FunctionBuilder,

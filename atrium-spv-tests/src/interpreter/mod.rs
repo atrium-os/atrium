@@ -543,6 +543,34 @@ impl Interpreter {
             // Op{Branch,BranchConditional}.
             Op::SelectionMerge | Op::LoopMerge => Ok(()),
             // ── Float arithmetic ──────────────────────────
+            // Integer arithmetic.
+            Op::IAdd => self.eval_binop_int(inst, values, |a, b| a.wrapping_add(b)),
+            Op::ISub => self.eval_binop_int(inst, values, |a, b| a.wrapping_sub(b)),
+            Op::IMul => self.eval_binop_int(inst, values, |a, b| a.wrapping_mul(b)),
+            Op::SDiv => self.eval_binop_int(inst, values, |a, b|
+                if b == 0 { 0 } else { a.wrapping_div(b) }),
+            Op::UDiv => self.eval_binop_int(inst, values, |a, b|
+                if b == 0 { 0 } else { (a as u64).wrapping_div(b as u64) as i64 }),
+            Op::SMod => self.eval_binop_int(inst, values, |a, b|
+                if b == 0 { 0 } else { a.wrapping_rem(b) }),
+            Op::UMod => self.eval_binop_int(inst, values, |a, b|
+                if b == 0 { 0 } else { (a as u64).wrapping_rem(b as u64) as i64 }),
+            Op::SNegate => self.eval_unop_int(inst, values, |a| a.wrapping_neg()),
+            // Integer comparisons → Bool.
+            Op::IEqual => self.eval_icmp(inst, values, |a, b| a == b),
+            Op::INotEqual => self.eval_icmp(inst, values, |a, b| a != b),
+            Op::SLessThan => self.eval_icmp(inst, values, |a, b| a < b),
+            Op::SLessThanEqual => self.eval_icmp(inst, values, |a, b| a <= b),
+            Op::SGreaterThan => self.eval_icmp(inst, values, |a, b| a > b),
+            Op::SGreaterThanEqual => self.eval_icmp(inst, values, |a, b| a >= b),
+            Op::ULessThan => self.eval_icmp(inst, values, |a, b|
+                (a as u64) <  (b as u64)),
+            Op::ULessThanEqual => self.eval_icmp(inst, values, |a, b|
+                (a as u64) <= (b as u64)),
+            Op::UGreaterThan => self.eval_icmp(inst, values, |a, b|
+                (a as u64) >  (b as u64)),
+            Op::UGreaterThanEqual => self.eval_icmp(inst, values, |a, b|
+                (a as u64) >= (b as u64)),
             Op::FAdd => self.eval_binop_float(inst, values, |a, b| a + b),
             Op::FSub => self.eval_binop_float(inst, values, |a, b| a - b),
             Op::FMul | Op::VectorTimesScalar =>
@@ -772,6 +800,73 @@ impl Interpreter {
     /// of same. For Vec operands, walks lanes element-by-
     /// element. Mixed-shape (one scalar, one vec) is
     /// rejected — SPIR-V doesn't allow that anyway.
+    /// Evaluate a scalar integer binary op. Both operands
+    /// must be ConstantValue::Int; result is Int.
+    fn eval_binop_int(
+        &self,
+        inst: &Instruction,
+        values: &mut HashMap<Word, ConstantValue>,
+        op: impl Fn(i64, i64) -> i64,
+    ) -> Result<(), InterpError> {
+        let result_id = inst.result_id.ok_or_else(||
+            InterpError::BadConstant(0))?;
+        let lhs_id = op_id(&inst.operands, 0)?;
+        let rhs_id = op_id(&inst.operands, 1)?;
+        let lhs = self.lookup_value(lhs_id, values)?;
+        let rhs = self.lookup_value(rhs_id, values)?;
+        let (la, lb) = match (&lhs, &rhs) {
+            (ConstantValue::Int(a), ConstantValue::Int(b)) => (*a, *b),
+            _ => return Err(InterpError::UnsupportedOpcode(format!(
+                "int binop on non-int: {lhs:?}, {rhs:?}",
+            ))),
+        };
+        values.insert(result_id, ConstantValue::Int(op(la, lb)));
+        Ok(())
+    }
+
+    /// Evaluate a scalar integer unary op (SNegate).
+    fn eval_unop_int(
+        &self,
+        inst: &Instruction,
+        values: &mut HashMap<Word, ConstantValue>,
+        op: impl Fn(i64) -> i64,
+    ) -> Result<(), InterpError> {
+        let result_id = inst.result_id.ok_or_else(||
+            InterpError::BadConstant(0))?;
+        let src_id = op_id(&inst.operands, 0)?;
+        let src = self.lookup_value(src_id, values)?;
+        let a = match src {
+            ConstantValue::Int(v) => v,
+            other => return Err(InterpError::UnsupportedOpcode(format!(
+                "int unop on non-int: {other:?}"))),
+        };
+        values.insert(result_id, ConstantValue::Int(op(a)));
+        Ok(())
+    }
+
+    /// Evaluate a scalar integer comparison; result is Bool.
+    fn eval_icmp(
+        &self,
+        inst: &Instruction,
+        values: &mut HashMap<Word, ConstantValue>,
+        cmp: impl Fn(i64, i64) -> bool,
+    ) -> Result<(), InterpError> {
+        let result_id = inst.result_id.ok_or_else(||
+            InterpError::BadConstant(0))?;
+        let lhs_id = op_id(&inst.operands, 0)?;
+        let rhs_id = op_id(&inst.operands, 1)?;
+        let lhs = self.lookup_value(lhs_id, values)?;
+        let rhs = self.lookup_value(rhs_id, values)?;
+        let (la, lb) = match (&lhs, &rhs) {
+            (ConstantValue::Int(a), ConstantValue::Int(b)) => (*a, *b),
+            _ => return Err(InterpError::UnsupportedOpcode(format!(
+                "icmp on non-int: {lhs:?}, {rhs:?}",
+            ))),
+        };
+        values.insert(result_id, ConstantValue::Bool(cmp(la, lb)));
+        Ok(())
+    }
+
     fn eval_binop_float(
         &self,
         inst: &Instruction,
