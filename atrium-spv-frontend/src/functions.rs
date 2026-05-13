@@ -259,6 +259,51 @@ fn translate_inst_with_cfg(
             });
             Ok(())
         }
+        SpvOp::Switch => {
+            // Operands: selector, default, (lit, target)+.
+            let sel_id = expect_id(&spv_inst.operands, 0)?;
+            let default_label = expect_id(&spv_inst.operands, 1)?;
+            let selector = resolve_value(
+                sel_id, types, constants, id_map, next_value_id, insts,
+                source_spirv_offset,
+            )?;
+            let default = label_to_block_id.get(&default_label).copied()
+                .ok_or_else(|| FrontendError::Malformed(format!(
+                    "OpSwitch default target {default_label} not in this function",
+                )))?;
+            let mut cases: Vec<(i64, BlockId)> = Vec::new();
+            let mut i = 2;
+            while i + 1 < spv_inst.operands.len() {
+                // SPIR-V allows multi-word case literals
+                // for >32-bit selectors. v5 supports only
+                // 32-bit selectors; literal sits in one
+                // LiteralBit32.
+                let lit = match &spv_inst.operands[i] {
+                    Operand::LiteralBit32(v) => *v as i32 as i64,
+                    other => return Err(FrontendError::Malformed(format!(
+                        "OpSwitch case literal: expected LiteralBit32, got {other:?}",
+                    ))),
+                };
+                let target_label = match &spv_inst.operands[i + 1] {
+                    Operand::IdRef(id) => *id,
+                    other => return Err(FrontendError::Malformed(format!(
+                        "OpSwitch case target: expected IdRef, got {other:?}",
+                    ))),
+                };
+                let target = label_to_block_id.get(&target_label).copied()
+                    .ok_or_else(|| FrontendError::Malformed(format!(
+                        "OpSwitch case target {target_label} not in this function",
+                    )))?;
+                cases.push((lit, target));
+                i += 2;
+            }
+            insts.push(Inst {
+                op: Op::Switch { selector, cases, default },
+                result: None,
+                source_spirv_offset,
+            });
+            Ok(())
+        }
         SpvOp::BranchConditional => {
             let cond_id = expect_id(&spv_inst.operands, 0)?;
             let t_label = expect_id(&spv_inst.operands, 1)?;

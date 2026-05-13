@@ -479,6 +479,36 @@ impl Interpreter {
                     prev_label = current_label;
                     current_idx = self.find_block_index(func, label)?;
                 }
+                Op::Switch => {
+                    // Operands: selector, default, (lit, target)+.
+                    let sel_id = op_id(&term.operands, 0)?;
+                    let default_label = op_id(&term.operands, 1)?;
+                    let sel = self.lookup_value(sel_id, &values)?;
+                    let sel_v: i64 = match sel {
+                        ConstantValue::Int(n) => n,
+                        ConstantValue::Bool(b) => if b { 1 } else { 0 },
+                        other => return Err(InterpError::UnsupportedOpcode(
+                            format!("Switch selector: {other:?}"))),
+                    };
+                    // Walk pairs.
+                    let mut chosen_label = default_label;
+                    let mut j = 2;
+                    while j + 1 < term.operands.len() {
+                        let lit = match &term.operands[j] {
+                            Operand::LiteralBit32(v) => *v as i32 as i64,
+                            _ => return Err(InterpError::ParseFailed(
+                                "Switch case literal".into())),
+                        };
+                        let tgt = op_id(&term.operands, j + 1)?;
+                        if lit == sel_v {
+                            chosen_label = tgt;
+                            break;
+                        }
+                        j += 2;
+                    }
+                    prev_label = current_label;
+                    current_idx = self.find_block_index(func, chosen_label)?;
+                }
                 Op::BranchConditional => {
                     let cond_id = op_id(&term.operands, 0)?;
                     let t_label = op_id(&term.operands, 1)?;

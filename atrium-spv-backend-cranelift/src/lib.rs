@@ -329,6 +329,59 @@ fn emit_function(
                             args.into_iter().map(Into::into).collect();
                         builder.ins().jump(cl_target, &bargs);
                     }
+                    Op::Switch { selector, cases, default } => {
+                        // Lower to a chain of icmp + brif:
+                        //   for each (lit, target):
+                        //     cmp = icmp eq selector, lit
+                        //     brif cmp, target, next_fall
+                        //   final fall_through: jump default
+                        let sv = translator.scalars
+                            .get(&selector.id).copied()
+                            .ok_or_else(|| BackendError::Internal(format!(
+                                "Switch selector {:?} not in scalars",
+                                selector.id)))?;
+                        for (case_idx, (lit, target)) in cases.iter().enumerate() {
+                            let cmp = builder.ins().icmp_imm(
+                                cranelift_codegen::ir::condcodes::IntCC::Equal,
+                                sv, *lit);
+                            let case_args = collect_phi_args(
+                                *target, *id, func, &translator)?;
+                            let case_bargs: Vec<cranelift_codegen::ir::BlockArg> =
+                                case_args.into_iter().map(Into::into).collect();
+                            let cl_target = *translator.block_map
+                                .get(target).unwrap();
+                            if case_idx + 1 == cases.len() {
+                                // Last case: false → default.
+                                let def_args = collect_phi_args(
+                                    *default, *id, func, &translator)?;
+                                let def_bargs: Vec<cranelift_codegen::ir::BlockArg> =
+                                    def_args.into_iter().map(Into::into).collect();
+                                let cl_def = *translator.block_map
+                                    .get(default).unwrap();
+                                builder.ins().brif(
+                                    cmp, cl_target, &case_bargs,
+                                    cl_def, &def_bargs);
+                            } else {
+                                // More cases: false → fresh
+                                // fall-through Cranelift block.
+                                let fall = builder.create_block();
+                                builder.ins().brif(
+                                    cmp, cl_target, &case_bargs, fall, &[]);
+                                builder.switch_to_block(fall);
+                            }
+                        }
+                        if cases.is_empty() {
+                            // No cases: unconditional jump
+                            // to default.
+                            let def_args = collect_phi_args(
+                                *default, *id, func, &translator)?;
+                            let def_bargs: Vec<cranelift_codegen::ir::BlockArg> =
+                                def_args.into_iter().map(Into::into).collect();
+                            let cl_def = *translator.block_map
+                                .get(default).unwrap();
+                            builder.ins().jump(cl_def, &def_bargs);
+                        }
+                    }
                     Op::BranchCond { cond, t_block, f_block } => {
                         let cv = translator.scalars.get(&cond.id)
                             .copied()
@@ -625,11 +678,13 @@ impl FnTranslator {
                 }
                 Ok(())
             }
-            // Op::Branch / Op::BranchCond are handled at
-            // the caller level in `emit_function` so it can
-            // collect Phi-args from the target block(s)
-            // before emitting `jump` / `brif`.
-            Op::Branch(_) | Op::BranchCond { .. } => Ok(()),
+            // Op::Branch / Op::BranchCond / Op::Switch are
+            // handled at the caller level in `emit_function`
+            // so it can collect Phi-args from the target
+            // block(s) before emitting `jump` / `brif` /
+            // br-table chain.
+            Op::Branch(_) | Op::BranchCond { .. }
+            | Op::Switch { .. } => Ok(()),
             // Op::Phi is materialised as a Cranelift block
             // param at block entry; the Inst itself is a
             // no-op at this point.
