@@ -1,0 +1,21 @@
+[package]
+name        = "atrium-spv-compile"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "The standalone jailed binary that compiles SPIR-V to a native .so + PC-map sidecar for tier-2 software Vulkan. Ties together atrium-spv-frontend, atrium-spv-backend-cranelift (and eventually atrium-spv-backend-bespoke at phase 3+), and the system linker. Spawned by the daemon's Tier2Backend on vkCreateShaderModule cache-miss; runs in its own Portcullis jail with FS caps only for the input SPIR-V + output cache dir. See docs/spec/tier2-renderer.md §6 + D3."
+
+[[bin]]
+name = "atrium-spv-compile"
+path = "src/main.rs"
+
+[dependencies]
+atrium-spv-frontend         = { path = "../atrium-spv-frontend" }
+atrium-spv-backend-cranelift = { path = "../atrium-spv-backend-cranelift" }
+sha2 = "0.10"
+
+[dev-dependencies]
+rspirv   = "0.13"
+sha2     = "0.10"
+tempfile = "3"
