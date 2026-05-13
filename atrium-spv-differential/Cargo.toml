@@ -1,0 +1,21 @@
+[package]
+name        = "atrium-spv-differential"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "Three-way differential harness for tier-2 software Vulkan. Wraps the bespoke + Cranelift backends as ShaderRunner implementations and drives them through atrium-spv-tests::assert_shader_agrees alongside the interpreter oracle. Lives in its own crate to keep atrium-spv-tests free of any frontend/backend dependency (constraint F1: the interpreter must read SPIR-V directly with no shared code with the production compilers)."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+atrium-spv-tests             = { path = "../atrium-spv-tests" }
+atrium-spv-frontend          = { path = "../atrium-spv-frontend" }
+atrium-spv-backend-cranelift = { path = "../atrium-spv-backend-cranelift" }
+atrium-spv-backend-bespoke   = { path = "../atrium-spv-backend-bespoke" }
+libloading                   = "0.8"
+tempfile                     = "3"
+
+[dev-dependencies]
+rspirv                       = "0.13"
