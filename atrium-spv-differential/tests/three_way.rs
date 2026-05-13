@@ -122,6 +122,60 @@ fn build_vec_arith_shader(a: [f32; 4], b: [f32; 4]) -> Vec<u8> {
     bytes
 }
 
+/// Shader: read i32 `n` from push-const, compute
+/// `vec4(float(n), float(n*2), float(n+5), 1.0)`.
+/// Exercises ConstInt, IAdd, IMul, ConvertSToF.
+fn build_int_arith_shader() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let f32_ty = b.type_float(32, None);
+    let i32_ty = b.type_int(32, 1);
+    let vec4 = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let pc_struct = b.type_struct(vec![i32_ty]);
+    b.member_decorate(pc_struct, 0, Decoration::Offset,
+                      vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(pc_struct, Decoration::Block, vec![]);
+    let ptr_pc_struct = b.type_pointer(None, StorageClass::PushConstant, pc_struct);
+    let ptr_pc_i32    = b.type_pointer(None, StorageClass::PushConstant, i32_ty);
+    let ptr_out       = b.type_pointer(None, StorageClass::Output, vec4);
+    let zero_i = b.constant_bit32(i32_ty, 0u32);
+    let two_i  = b.constant_bit32(i32_ty, 2u32);
+    let five_i = b.constant_bit32(i32_ty, 5u32);
+    let c1f = b.constant_bit32(f32_ty, 1.0f32.to_bits());
+    let pc_var = b.variable(ptr_pc_struct, None, StorageClass::PushConstant, None);
+    let out = b.variable(ptr_out, None, StorageClass::Output, None);
+    b.decorate(out, Decoration::Location, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let p = b.access_chain(ptr_pc_i32, None, pc_var, vec![zero_i]).unwrap();
+    let n = b.load(i32_ty, None, p, None, vec![]).unwrap();
+    let two_n = b.i_mul(i32_ty, None, n, two_i).unwrap();
+    let n_plus_5 = b.i_add(i32_ty, None, n, five_i).unwrap();
+    let n_f = b.convert_s_to_f(f32_ty, None, n).unwrap();
+    let two_n_f = b.convert_s_to_f(f32_ty, None, two_n).unwrap();
+    let np5_f = b.convert_s_to_f(f32_ty, None, n_plus_5).unwrap();
+    let color = b.composite_construct(vec4, None,
+        vec![n_f, two_n_f, np5_f, c1f]).unwrap();
+    b.store(out, color, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![out]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
 fn build_if_else_shader() -> Vec<u8> {
     use rspirv::binary::Assemble;
     use rspirv::spirv::{
@@ -227,6 +281,22 @@ fn three_way_vec_arithmetic() {
     assert_shader_agrees(
         &spirv,
         &ShaderInputs::default(),
+        ColorTolerance::Exact,
+        &refs,
+    );
+}
+
+#[test]
+fn three_way_int_arith_and_convert() {
+    let spirv = build_int_arith_shader();
+    let mut inputs = ShaderInputs::default();
+    let n: i32 = 7;
+    inputs.push_constants[..4].copy_from_slice(&n.to_le_bytes());
+    let rs = runners();
+    let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
+    assert_shader_agrees(
+        &spirv,
+        &inputs,
         ColorTolerance::Exact,
         &refs,
     );

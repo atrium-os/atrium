@@ -189,6 +189,11 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
     // and short-lived, so no reuse needed yet.
     let mut bools: HashMap<ValueId, asm::Wreg> = HashMap::new();
     let mut next_bool_w: u8 = 10;
+    // Integer scalar Values (i32/u32): held in W-regs
+    // drawn from a separate pool W13..W17 (5 slots).
+    // Caller-saved per AAPCS64, so no prologue needed.
+    let mut ints: HashMap<ValueId, asm::Wreg> = HashMap::new();
+    let mut next_int_w: u8 = 13;
 
     // X4 holds out_color. Scratch X9/W9 for constant
     // materialisation + fmov bridging.
@@ -278,13 +283,88 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
         }
 
         match &inst.op {
-            Op::ConstInt { .. } | Op::ConstNull => {
-                // Constants used solely by AccessChain
-                // index resolution are orphan Insts at the
-                // bespoke level — AccessChain carries the
-                // resolved byte_offset directly. Skipping
-                // codegen here is safe; integer arithmetic
-                // lands in step 6+.
+            Op::ConstInt { value, kind: _ } => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal("ConstInt without result".into()))?;
+                // If the constant is referenced by an int
+                // arithmetic op, we need it in a W-reg.
+                // Otherwise (e.g. orphan AccessChain index),
+                // skip codegen. Cheap heuristic: always
+                // materialise; if the W-pool is full,
+                // skip silently (assumes it was an orphan).
+                if next_int_w < 18 {
+                    let w = asm::Wreg(next_int_w);
+                    next_int_w += 1;
+                    materialise_u32_into_w(&mut a, w, *value as i32 as u32);
+                    ints.insert(result.id, w);
+                }
+            }
+            Op::ConstNull => {
+                // Treat as an orphan — no W-reg.
+            }
+            Op::IAdd(l, r) => emit_int_binop(
+                &mut a, &mut ints, &mut next_int_w, inst, l, r, asm::add_w)?,
+            Op::ISub(l, r) => emit_int_binop(
+                &mut a, &mut ints, &mut next_int_w, inst, l, r, asm::sub_w)?,
+            Op::IMul(l, r) => emit_int_binop(
+                &mut a, &mut ints, &mut next_int_w, inst, l, r, asm::mul_w)?,
+            Op::SDiv(l, r) => emit_int_binop(
+                &mut a, &mut ints, &mut next_int_w, inst, l, r, asm::sdiv_w)?,
+            Op::UDiv(l, r) => emit_int_binop(
+                &mut a, &mut ints, &mut next_int_w, inst, l, r, asm::udiv_w)?,
+            Op::INeg(s) => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal("INeg without result".into()))?;
+                let s_w = *ints.get(&s.id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "INeg operand {:?} not in ints", s.id)))?;
+                let d_w = alloc_int_w(&mut next_int_w)?;
+                a.emit(asm::neg_w(d_w, s_w));
+                ints.insert(result.id, d_w);
+            }
+            Op::ConvertSToF(s) => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "ConvertSToF without result".into()))?;
+                let s_w = *ints.get(&s.id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "ConvertSToF operand {:?} not in ints", s.id)))?;
+                let d_v = alloc_vreg(&mut free_pool, &mut owners, result.id)?;
+                a.emit(asm::scvtf_s_from_w(d_v, s_w));
+                scalars.insert(result.id, d_v);
+            }
+            Op::ConvertUToF(s) => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "ConvertUToF without result".into()))?;
+                let s_w = *ints.get(&s.id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "ConvertUToF operand {:?} not in ints", s.id)))?;
+                let d_v = alloc_vreg(&mut free_pool, &mut owners, result.id)?;
+                a.emit(asm::ucvtf_s_from_w(d_v, s_w));
+                scalars.insert(result.id, d_v);
+            }
+            Op::ConvertFToS(s) => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "ConvertFToS without result".into()))?;
+                let s_v = *scalars.get(&s.id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "ConvertFToS operand {:?} not in scalars", s.id)))?;
+                let d_w = alloc_int_w(&mut next_int_w)?;
+                a.emit(asm::fcvtzs_w_from_s(d_w, s_v));
+                ints.insert(result.id, d_w);
+            }
+            Op::ConvertFToU(s) => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "ConvertFToU without result".into()))?;
+                let s_v = *scalars.get(&s.id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "ConvertFToU operand {:?} not in scalars", s.id)))?;
+                let d_w = alloc_int_w(&mut next_int_w)?;
+                a.emit(asm::fcvtzu_w_from_s(d_w, s_v));
+                ints.insert(result.id, d_w);
             }
             Op::ConstFloat { value, kind: FloatKind::F32 } => {
                 let bits = (*value as f32).to_bits();
@@ -554,6 +634,41 @@ fn emit_load_f32_offset(
     }
     a.emit(asm::ldr_w_offset(w_tmp, param, off as u16));
     a.emit(asm::fmov_s_from_w(dst, w_tmp));
+    Ok(())
+}
+
+/// Bump-allocate one W-reg from the int pool (W13..W17).
+fn alloc_int_w(next_int_w: &mut u8) -> Result<asm::Wreg, BackendError> {
+    if *next_int_w >= 18 {
+        return Err(BackendError::Unsupported(
+            "ran out of int W-regs (W13..W17 exhausted)".into()));
+    }
+    let w = asm::Wreg(*next_int_w);
+    *next_int_w += 1;
+    Ok(w)
+}
+
+/// Emit one scalar i32 binary op (add/sub/mul/sdiv/udiv).
+fn emit_int_binop(
+    a: &mut asm::Asm,
+    ints: &mut HashMap<ValueId, asm::Wreg>,
+    next_int_w: &mut u8,
+    inst: &atrium_spv_ir::Inst,
+    lhs: &Value,
+    rhs: &Value,
+    make_inst: fn(asm::Wreg, asm::Wreg, asm::Wreg) -> u32,
+) -> Result<(), BackendError> {
+    let result = inst.result.as_ref().ok_or_else(||
+        BackendError::Internal("int binop without result".into()))?;
+    let l = *ints.get(&lhs.id).ok_or_else(||
+        BackendError::Internal(format!(
+            "int binop lhs {:?} not in ints", lhs.id)))?;
+    let r = *ints.get(&rhs.id).ok_or_else(||
+        BackendError::Internal(format!(
+            "int binop rhs {:?} not in ints", rhs.id)))?;
+    let d = alloc_int_w(next_int_w)?;
+    a.emit(make_inst(d, l, r));
+    ints.insert(result.id, d);
     Ok(())
 }
 
