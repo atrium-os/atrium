@@ -1123,6 +1123,16 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkDevice, *const c_void, *mut c_void), FnVoidPtr,
             >(vkGetImageMemoryRequirements2)),
+        "vkGetDeviceBufferMemoryRequirements" |
+        "vkGetDeviceBufferMemoryRequirementsKHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, *const c_void, *mut c_void), FnVoidPtr,
+            >(vkGetDeviceBufferMemoryRequirements)),
+        "vkGetDeviceImageMemoryRequirements" |
+        "vkGetDeviceImageMemoryRequirementsKHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, *const c_void, *mut c_void), FnVoidPtr,
+            >(vkGetDeviceImageMemoryRequirements)),
         "vkDeviceWaitIdle" =>
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkDevice) -> VkResult, FnVoidPtr,
@@ -4633,6 +4643,105 @@ pub unsafe extern "C" fn vkGetImageMemoryRequirements2(
 
     let mut tmp = ash::vk::MemoryRequirements::default();
     vkGetImageMemoryRequirements(device, image, &mut tmp);
+    let out = p_requirements as *mut u8;
+    let out_p_next = std::ptr::read_unaligned(out.add(8) as *const *mut c_void);
+    std::ptr::copy_nonoverlapping(
+        &tmp as *const _ as *const u8,
+        out.add(16),
+        std::mem::size_of::<ash::vk::MemoryRequirements>(),
+    );
+    let _ = walk_p_next_chain(out_p_next);
+}
+
+/// `vkGetDeviceBufferMemoryRequirements` — Vulkan 1.3 entry that
+/// computes the memory-requirements a vkCreateBuffer +
+/// vkGetBufferMemoryRequirements pair would have reported, but
+/// without actually creating the buffer. Useful for size-
+/// planning before allocation.
+///
+/// VkDeviceBufferMemoryRequirements (24 bytes):
+///   0  sType
+///   8  pNext
+///   16 pCreateInfo: *const VkBufferCreateInfo
+///
+/// Output VkMemoryRequirements2: 16-byte header + inner block at
+/// offset 16 (byte-copied to dodge alignment traps from
+/// caller-provided Vec<u8>-style buffers — same rationale as
+/// vkGetBufferMemoryRequirements2).
+#[no_mangle]
+pub unsafe extern "C" fn vkGetDeviceBufferMemoryRequirements(
+    _device:        VkDevice,
+    p_info:         *const c_void,
+    p_requirements: *mut c_void,
+) {
+    if p_info.is_null() || p_requirements.is_null() { return; }
+    let info = p_info as *const u8;
+    let info_p_next = std::ptr::read_unaligned(info.add(8) as *const *mut c_void);
+    let p_create = std::ptr::read_unaligned(info.add(16) as *const *const u8);
+    let _ = walk_p_next_chain(info_p_next);
+    let size = if p_create.is_null() { 0 } else {
+        // VkBufferCreateInfo: size at offset 24 (matches
+        // vkCreateBuffer's parser).
+        std::ptr::read_unaligned(p_create.add(24) as *const u64)
+    };
+    let tmp = ash::vk::MemoryRequirements {
+        size,
+        alignment: 16,
+        memory_type_bits: 0b1,
+    };
+    let out = p_requirements as *mut u8;
+    let out_p_next = std::ptr::read_unaligned(out.add(8) as *const *mut c_void);
+    std::ptr::copy_nonoverlapping(
+        &tmp as *const _ as *const u8,
+        out.add(16),
+        std::mem::size_of::<ash::vk::MemoryRequirements>(),
+    );
+    let _ = walk_p_next_chain(out_p_next);
+}
+
+/// `vkGetDeviceImageMemoryRequirements` — image-side counterpart.
+///
+/// VkDeviceImageMemoryRequirements (32 bytes):
+///   0  sType
+///   8  pNext
+///   16 pCreateInfo: *const VkImageCreateInfo
+///   24 planeAspect (VkImageAspectFlagBits) — ignored (no
+///      multi-planar support in tier-1)
+///
+/// Image-size accounting mirrors vkGetImageMemoryRequirements:
+/// sum of per-mip (w * h * d * bpp) halved at each level times
+/// array_layers.
+#[no_mangle]
+pub unsafe extern "C" fn vkGetDeviceImageMemoryRequirements(
+    _device:        VkDevice,
+    p_info:         *const c_void,
+    p_requirements: *mut c_void,
+) {
+    if p_info.is_null() || p_requirements.is_null() { return; }
+    let info = p_info as *const u8;
+    let info_p_next = std::ptr::read_unaligned(info.add(8) as *const *mut c_void);
+    let p_create = std::ptr::read_unaligned(info.add(16) as *const *const u8);
+    let _ = walk_p_next_chain(info_p_next);
+    let size = if p_create.is_null() { 0 } else {
+        // VkImageCreateInfo: format=24, width=28, height=32,
+        // depth=36, mipLevels=40, arrayLayers=44 (matches
+        // vkCreateImage's parser).
+        let format       = std::ptr::read_unaligned(p_create.add(24) as *const u32);
+        let width        = std::ptr::read_unaligned(p_create.add(28) as *const u32) as u64;
+        let height       = std::ptr::read_unaligned(p_create.add(32) as *const u32) as u64;
+        let depth        = (std::ptr::read_unaligned(p_create.add(36) as *const u32).max(1)) as u64;
+        let mip_levels   = std::ptr::read_unaligned(p_create.add(40) as *const u32).max(1);
+        let array_layers = (std::ptr::read_unaligned(p_create.add(44) as *const u32).max(1)) as u64;
+        let bpp = bpp_for_vk_format(format) as u64;
+        let base = width * height * depth * bpp;
+        let mips: u64 = (0..mip_levels).map(|l| base >> (2 * l)).sum();
+        mips * array_layers
+    };
+    let tmp = ash::vk::MemoryRequirements {
+        size,
+        alignment: 256,
+        memory_type_bits: 0b1,
+    };
     let out = p_requirements as *mut u8;
     let out_p_next = std::ptr::read_unaligned(out.add(8) as *const *mut c_void);
     std::ptr::copy_nonoverlapping(

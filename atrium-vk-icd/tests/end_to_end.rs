@@ -592,6 +592,87 @@ fn submit_flushes_recorded_frame_to_aqueduct_backend() {
 }
 
 #[test]
+fn device_memory_requirements_reports_size_without_creating_resource() {
+    // vkGetDeviceBufferMemoryRequirements / Image variant — 1.3
+    // entries that report what the requirements WOULD be for a
+    // would-be-created resource, no handle round-trip.
+    use atrium_vk_icd::{
+        vkCreateDevice, vkDestroyDevice,
+        vkGetDeviceBufferMemoryRequirements,
+        vkGetDeviceImageMemoryRequirements,
+    };
+
+    let sock = tmp_socket("dev-memreq");
+    let sw_backend = Arc::new(SoftwareBackend::new());
+    let backend_for_listener: Arc<dyn Backend> = sw_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap();
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+    let _env = EnvLock::set(&sock);
+
+    type VkDevice = *mut std::ffi::c_void;
+
+    let mut instance: VkInstance = std::ptr::null_mut();
+    unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
+    let mut devices: [VkPhysicalDevice; 1] = [std::ptr::null_mut(); 1];
+    let mut cap: u32 = 1;
+    unsafe { vkEnumeratePhysicalDevices(instance, &mut cap, devices.as_mut_ptr()); }
+    let mut device: VkDevice = std::ptr::null_mut();
+    unsafe { vkCreateDevice(devices[0], std::ptr::null(), std::ptr::null(), &mut device); }
+
+    // ── Buffer path ─────────────────────────────────────────────
+    // VkBufferCreateInfo: size at offset 24.
+    let mut bc = [0u8; 56];
+    bc[0..4].copy_from_slice(&12u32.to_le_bytes()); // sType
+    bc[24..32].copy_from_slice(&4096u64.to_le_bytes());
+    // VkDeviceBufferMemoryRequirements (24 bytes): pCreateInfo at off 16.
+    let mut bdi = [0u8; 24];
+    bdi[0..4].copy_from_slice(&1_000_257_002u32.to_le_bytes()); // sType
+    bdi[16..24].copy_from_slice(&(bc.as_ptr() as u64).to_le_bytes());
+    let mut out = [0u8; 16 + 24]; // VkMemoryRequirements2 header + inner
+    out[0..4].copy_from_slice(&1_000_146_003u32.to_le_bytes());
+    unsafe {
+        vkGetDeviceBufferMemoryRequirements(
+            device, bdi.as_ptr() as *const _, out.as_mut_ptr() as *mut _,
+        );
+    }
+    let read_u64 = |buf: &[u8], off: usize| u64::from_le_bytes(buf[off..off+8].try_into().unwrap());
+    let read_u32 = |buf: &[u8], off: usize| u32::from_le_bytes(buf[off..off+4].try_into().unwrap());
+    assert_eq!(read_u64(&out, 16), 4096, "buffer size 4096");
+    assert_eq!(read_u64(&out, 24), 16, "buffer alignment 16");
+    assert_eq!(read_u32(&out, 32), 0b1, "buffer memTypeBits = bit0");
+    assert_eq!(read_u32(&out, 0), 1_000_146_003, "header sType preserved");
+
+    // ── Image path ──────────────────────────────────────────────
+    // 32x16 R8G8B8A8_UNORM, 1 mip / 1 layer / depth=1 → 32*16*4=2048.
+    let mut ic = [0u8; 88];
+    ic[0..4].copy_from_slice(&14u32.to_le_bytes());
+    ic[24..28].copy_from_slice(&37u32.to_le_bytes()); // R8G8B8A8_UNORM
+    ic[28..32].copy_from_slice(&32u32.to_le_bytes());
+    ic[32..36].copy_from_slice(&16u32.to_le_bytes());
+    ic[36..40].copy_from_slice(&1u32.to_le_bytes());
+    ic[40..44].copy_from_slice(&1u32.to_le_bytes());
+    ic[44..48].copy_from_slice(&1u32.to_le_bytes());
+    let mut idi = [0u8; 32];
+    idi[0..4].copy_from_slice(&1_000_257_003u32.to_le_bytes());
+    idi[16..24].copy_from_slice(&(ic.as_ptr() as u64).to_le_bytes());
+    let mut iout = [0u8; 16 + 24];
+    iout[0..4].copy_from_slice(&1_000_146_003u32.to_le_bytes());
+    unsafe {
+        vkGetDeviceImageMemoryRequirements(
+            device, idi.as_ptr() as *const _, iout.as_mut_ptr() as *mut _,
+        );
+    }
+    assert_eq!(read_u64(&iout, 16), 32 * 16 * 4, "image size");
+    assert_eq!(read_u64(&iout, 24), 256, "image alignment");
+
+    unsafe { vkDestroyDevice(device, std::ptr::null()); }
+    unsafe { vkDestroyInstance(instance, std::ptr::null()); }
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[test]
 fn memory_requirements2_routes_through_1_0_path() {
     // Drive vkGetImageMemoryRequirements2 with a real
     // VkImageMemoryRequirementsInfo2 + VkMemoryRequirements2 round
