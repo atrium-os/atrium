@@ -248,6 +248,45 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
     let mut free_pool: Vec<u8> = (16..32).rev().collect();
     let mut owners: HashMap<u8, ValueId> = HashMap::new();
 
+    // ── Pre-pass: discover Phi nodes ──────────────────────────
+    //
+    // For each Op::Phi at the top of a block, allocate one
+    // destination V-reg. Build a per-edge move list:
+    // phi_moves[(from_bid, to_bid)] = Vec<(dest_vreg,
+    // source_value_id)> — the predecessor block's branch
+    // emits an `fmov s_dest, s_src` per entry just before
+    // its terminator.
+    let mut phi_moves: HashMap<(BlockId, BlockId),
+                               Vec<(asm::Vreg, ValueId)>> = HashMap::new();
+    // Used by Op::BranchCond to detect a Phi-bearing
+    // target (critical-edge splitting lands in v12).
+    let mut phi_target_blocks: std::collections::HashSet<BlockId> =
+        std::collections::HashSet::new();
+    for bid in &block_order {
+        let block = func.blocks.get(bid).unwrap();
+        for inst in &block.insts {
+            let arms = match &inst.op {
+                Op::Phi(arms) => arms,
+                _ => break, // Phis must lead the block.
+            };
+            let result = inst.result.as_ref().ok_or_else(||
+                BackendError::Internal("Phi without result".into()))?;
+            match &result.ty {
+                Type::F32 => {}
+                other => return Err(BackendError::Unsupported(format!(
+                    "Phi of type {other:?} not supported in v11"))),
+            }
+            let dest = alloc_vreg(&mut free_pool, &mut owners, result.id)?;
+            scalars.insert(result.id, dest);
+            phi_target_blocks.insert(*bid);
+            for arm in arms {
+                phi_moves.entry((arm.from, *bid))
+                    .or_default()
+                    .push((dest, arm.value.id));
+            }
+        }
+    }
+
     // Record where each block starts in the asm byte
     // stream so branches can be patched after the full
     // function is emitted.
@@ -556,19 +595,46 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
                         "Op::Load of {other:?} not supported"))),
                 }
             }
+            Op::Phi(_) => {
+                // Phi result V-reg was pre-allocated; the
+                // per-edge move emits land at the
+                // predecessor's branch. Nothing to do here.
+            }
             Op::Return => {
                 a.emit(asm::ret());
             }
             Op::Branch(target) => {
-                // Emit a placeholder `b 0` and record the
-                // patch site. The actual imm26 is resolved
-                // after every block has a known asm
-                // offset.
+                // Phi-edge moves: if `target` has incoming
+                // Phis, emit fmov_s for each before the
+                // branch.
+                if let Some(moves) = phi_moves.get(&(*bid, *target)) {
+                    for (dest, src_id) in moves {
+                        let src = *scalars.get(src_id).ok_or_else(||
+                            BackendError::Internal(format!(
+                                "Phi source {:?} not in scalars",
+                                src_id)))?;
+                        a.emit(asm::fmov_s(*dest, src));
+                    }
+                }
                 let patch_off = a.len();
                 a.emit(asm::b(0));
                 branch_relocs.push((patch_off, *target));
             }
             Op::BranchCond { cond, t_block, f_block } => {
+                // BranchCond targeting a Phi-bearing block
+                // requires critical-edge splitting (so the
+                // moves only run on one outgoing edge). v11
+                // defers to keep scope tight; the if/else
+                // pattern doesn't hit this because then/else
+                // branches are unconditional. Loops do hit
+                // it — v12 lands the splitter.
+                if phi_target_blocks.contains(t_block)
+                    || phi_target_blocks.contains(f_block)
+                {
+                    return Err(BackendError::Unsupported(
+                        "BranchCond into Phi-bearing block; \
+                         critical-edge splitting lands in v12".into()));
+                }
                 let w_bool = *bools.get(&cond.id).ok_or_else(||
                     BackendError::Unsupported(format!(
                         "BranchCond cond {:?} is not a known Bool W-reg",
@@ -855,6 +921,9 @@ fn compute_last_use_flat(insts: &[&atrium_spv_ir::Inst]) -> HashMap<ValueId, usi
                 mark(l.id); mark(r.id);
             }
             Op::BranchCond { cond, .. } => mark(cond.id),
+            Op::Phi(arms) => {
+                for arm in arms { mark(arm.value.id); }
+            }
             Op::AccessChain { base: _, byte_offset: _ } => {
                 // Base is a pointer Value, not a scalar —
                 // no V-reg liveness implication.
