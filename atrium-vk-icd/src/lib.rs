@@ -562,6 +562,12 @@ const ATRIUM_PHYSICAL_DEVICE_ENTRY_POINTS: &[&str] = &[
     "vkGetPhysicalDeviceSurfacePresentModesKHR",
     "vkGetPhysicalDeviceSurfaceCapabilities2KHR",
     "vkGetPhysicalDeviceSurfaceFormats2KHR",
+    "vkGetPhysicalDeviceExternalBufferProperties",
+    "vkGetPhysicalDeviceExternalBufferPropertiesKHR",
+    "vkGetPhysicalDeviceExternalFenceProperties",
+    "vkGetPhysicalDeviceExternalFencePropertiesKHR",
+    "vkGetPhysicalDeviceExternalSemaphoreProperties",
+    "vkGetPhysicalDeviceExternalSemaphorePropertiesKHR",
     "vkEnumerateDeviceExtensionProperties",
 ];
 
@@ -636,6 +642,12 @@ const ATRIUM_INSTANCE_ONLY_ENTRY_POINTS: &[&str] = &[
     "vkGetPhysicalDeviceSurfacePresentModesKHR",
     "vkGetPhysicalDeviceSurfaceCapabilities2KHR",
     "vkGetPhysicalDeviceSurfaceFormats2KHR",
+    "vkGetPhysicalDeviceExternalBufferProperties",
+    "vkGetPhysicalDeviceExternalBufferPropertiesKHR",
+    "vkGetPhysicalDeviceExternalFenceProperties",
+    "vkGetPhysicalDeviceExternalFencePropertiesKHR",
+    "vkGetPhysicalDeviceExternalSemaphoreProperties",
+    "vkGetPhysicalDeviceExternalSemaphorePropertiesKHR",
     "vkCreateDebugUtilsMessengerEXT",
     "vkDestroyDebugUtilsMessengerEXT",
     "vkSubmitDebugUtilsMessageEXT",
@@ -1264,6 +1276,27 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkDevice, u64, u32, *const u64) -> VkResult, FnVoidPtr,
             >(vkMergePipelineCaches)),
+        // 1.1 capability probes.
+        "vkGetDescriptorSetLayoutSupport" |
+        "vkGetDescriptorSetLayoutSupportKHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, *const c_void, *mut c_void), FnVoidPtr,
+            >(vkGetDescriptorSetLayoutSupport)),
+        "vkGetPhysicalDeviceExternalBufferProperties" |
+        "vkGetPhysicalDeviceExternalBufferPropertiesKHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkPhysicalDevice, *const c_void, *mut c_void), FnVoidPtr,
+            >(vkGetPhysicalDeviceExternalBufferProperties)),
+        "vkGetPhysicalDeviceExternalFenceProperties" |
+        "vkGetPhysicalDeviceExternalFencePropertiesKHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkPhysicalDevice, *const c_void, *mut c_void), FnVoidPtr,
+            >(vkGetPhysicalDeviceExternalFenceProperties)),
+        "vkGetPhysicalDeviceExternalSemaphoreProperties" |
+        "vkGetPhysicalDeviceExternalSemaphorePropertiesKHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkPhysicalDevice, *const c_void, *mut c_void), FnVoidPtr,
+            >(vkGetPhysicalDeviceExternalSemaphoreProperties)),
         // 1.2 indirect-count draws — forward to non-Count variants
         // with max_draw_count as the static count.
         "vkCmdDrawIndirectCount" |
@@ -5283,6 +5316,95 @@ pub unsafe extern "C" fn vkCmdPushDescriptorSetWithTemplate(
     _p_data:            *const c_void,
 ) {}
 
+// ── Capability-probe entries (1.1 + maintenance) ───────────────
+//
+// Apps probe these as part of feature negotiation: "can I create
+// this descriptor-set layout?", "can I export this buffer to
+// a shared-memory handle?". The honest tier-1 answer is:
+//   - DescriptorSetLayout: yes, supported. (tier-1 ignores
+//     bindings anyway; nothing to reject.)
+//   - External buffer / fence / semaphore: zero features (i.e.
+//     this handle type isn't exportable/importable). Apps see
+//     "no shared-memory support" and either fall back to copy
+//     or skip the cross-process feature — never crashes.
+
+/// `vkGetDescriptorSetLayoutSupport` — output struct is
+/// VkDescriptorSetLayoutSupport (24 bytes: 16-byte sType+pNext
+/// header + supported u32 + 4-byte pad).
+#[no_mangle]
+pub unsafe extern "C" fn vkGetDescriptorSetLayoutSupport(
+    _device:        VkDevice,
+    _p_create_info: *const c_void,
+    p_support:      *mut c_void,
+) {
+    if p_support.is_null() { return; }
+    let out = p_support as *mut u8;
+    let out_p_next = std::ptr::read_unaligned(out.add(8) as *const *mut c_void);
+    std::ptr::write_unaligned(out.add(16) as *mut u32, 1 /* VK_TRUE */);
+    let _ = walk_p_next_chain(out_p_next);
+}
+
+/// `vkGetPhysicalDeviceExternalBufferProperties` — output
+/// VkExternalBufferProperties (32 bytes: 16-byte header +
+/// VkExternalMemoryProperties (12 bytes) + 4-byte pad).
+/// Zero externalMemoryFeatures = handle type not supported.
+#[no_mangle]
+pub unsafe extern "C" fn vkGetPhysicalDeviceExternalBufferProperties(
+    _physical_device: VkPhysicalDevice,
+    p_info:           *const c_void,
+    p_props:          *mut c_void,
+) {
+    if p_props.is_null() { return; }
+    let out = p_props as *mut u8;
+    let out_p_next = std::ptr::read_unaligned(out.add(8) as *const *mut c_void);
+    // Zero the 12-byte VkExternalMemoryProperties block at off 16.
+    std::ptr::write_bytes(out.add(16), 0, 12);
+    if !p_info.is_null() {
+        let info_p_next = std::ptr::read_unaligned((p_info as *const u8).add(8) as *const *mut c_void);
+        let _ = walk_p_next_chain(info_p_next);
+    }
+    let _ = walk_p_next_chain(out_p_next);
+}
+
+/// `vkGetPhysicalDeviceExternalFenceProperties` — same shape;
+/// VkExternalFenceProperties (32 bytes: 16-byte header + 16-byte
+/// inner of three u32s + pad).
+#[no_mangle]
+pub unsafe extern "C" fn vkGetPhysicalDeviceExternalFenceProperties(
+    _physical_device: VkPhysicalDevice,
+    p_info:           *const c_void,
+    p_props:          *mut c_void,
+) {
+    if p_props.is_null() { return; }
+    let out = p_props as *mut u8;
+    let out_p_next = std::ptr::read_unaligned(out.add(8) as *const *mut c_void);
+    std::ptr::write_bytes(out.add(16), 0, 16);
+    if !p_info.is_null() {
+        let info_p_next = std::ptr::read_unaligned((p_info as *const u8).add(8) as *const *mut c_void);
+        let _ = walk_p_next_chain(info_p_next);
+    }
+    let _ = walk_p_next_chain(out_p_next);
+}
+
+/// `vkGetPhysicalDeviceExternalSemaphoreProperties` — same shape;
+/// 16-byte inner.
+#[no_mangle]
+pub unsafe extern "C" fn vkGetPhysicalDeviceExternalSemaphoreProperties(
+    _physical_device: VkPhysicalDevice,
+    p_info:           *const c_void,
+    p_props:          *mut c_void,
+) {
+    if p_props.is_null() { return; }
+    let out = p_props as *mut u8;
+    let out_p_next = std::ptr::read_unaligned(out.add(8) as *const *mut c_void);
+    std::ptr::write_bytes(out.add(16), 0, 16);
+    if !p_info.is_null() {
+        let info_p_next = std::ptr::read_unaligned((p_info as *const u8).add(8) as *const *mut c_void);
+        let _ = walk_p_next_chain(info_p_next);
+    }
+    let _ = walk_p_next_chain(out_p_next);
+}
+
 // ── VkPipelineCache stubs ───────────────────────────────────────
 //
 // Modern engines (wgpu, Bevy, RPCS3, RenderDoc replay tooling)
@@ -7015,6 +7137,55 @@ mod tests {
         assert!(props.optimal_tiling_features.is_empty());
         assert!(props.linear_tiling_features.is_empty());
         assert!(props.buffer_features.is_empty());
+    }
+
+    #[test]
+    fn capability_probe_stubs_report_honest_answers() {
+        // 8 entry points + KHR aliases = all resolve.
+        for name in [
+            b"vkGetDescriptorSetLayoutSupport\0".as_slice(),
+            b"vkGetDescriptorSetLayoutSupportKHR\0".as_slice(),
+            b"vkGetPhysicalDeviceExternalBufferProperties\0".as_slice(),
+            b"vkGetPhysicalDeviceExternalBufferPropertiesKHR\0".as_slice(),
+            b"vkGetPhysicalDeviceExternalFenceProperties\0".as_slice(),
+            b"vkGetPhysicalDeviceExternalFencePropertiesKHR\0".as_slice(),
+            b"vkGetPhysicalDeviceExternalSemaphoreProperties\0".as_slice(),
+            b"vkGetPhysicalDeviceExternalSemaphorePropertiesKHR\0".as_slice(),
+        ] {
+            assert!(lookup(name).is_some(),
+                "must resolve {}",
+                std::str::from_utf8(&name[..name.len()-1]).unwrap());
+        }
+
+        // DescriptorSetLayoutSupport: must write supported=1 at offset 16.
+        let f = lookup(b"vkGetDescriptorSetLayoutSupport\0").unwrap();
+        let g: unsafe extern "C" fn(VkDevice, *const c_void, *mut c_void) =
+            unsafe { std::mem::transmute(f) };
+        // 24-byte output: header + supported + pad.
+        let mut out = [0u8; 24];
+        out[0..4].copy_from_slice(&1_000_168_001u32.to_le_bytes()); // sType
+        unsafe {
+            g(std::ptr::null_mut(), std::ptr::null(), out.as_mut_ptr() as *mut _);
+        }
+        let supported = u32::from_le_bytes(out[16..20].try_into().unwrap());
+        assert_eq!(supported, 1, "supported must be VK_TRUE");
+
+        // ExternalBufferProperties: must zero the 12-byte inner.
+        let f = lookup(b"vkGetPhysicalDeviceExternalBufferProperties\0").unwrap();
+        let g: unsafe extern "C" fn(VkPhysicalDevice, *const c_void, *mut c_void) =
+            unsafe { std::mem::transmute(f) };
+        let mut out = [0xFFu8; 32]; // header + 12-byte inner + pad; pre-fill inner with junk
+        out[0..4].copy_from_slice(&1_000_071_002u32.to_le_bytes());
+        // pNext at off 8 must be null — we walk the chain and would
+        // dereference a garbage pointer otherwise.
+        for i in 8..16 { out[i] = 0; }
+        unsafe {
+            g(std::ptr::null_mut(), std::ptr::null(), out.as_mut_ptr() as *mut _);
+        }
+        for i in 16..28 {
+            assert_eq!(out[i], 0,
+                "byte {i} of inner must be cleared (= no external support)");
+        }
     }
 
     #[test]
