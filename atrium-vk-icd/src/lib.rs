@@ -988,6 +988,15 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkCommandBuffer), FnVoidPtr,
             >(vkCmdEndRenderPass)),
+        // 1.3 dynamic-rendering — VK_KHR_dynamic_rendering KHR aliases.
+        "vkCmdBeginRendering" | "vkCmdBeginRenderingKHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, *const c_void), FnVoidPtr,
+            >(vkCmdBeginRendering)),
+        "vkCmdEndRendering" | "vkCmdEndRenderingKHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer), FnVoidPtr,
+            >(vkCmdEndRendering)),
         "vkCreateFence" =>
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkDevice, *const c_void, *const c_void, *mut u64) -> VkResult, FnVoidPtr,
@@ -3180,6 +3189,86 @@ pub unsafe extern "C" fn vkCmdBeginRenderPass(
 /// `vkCmdEndRenderPass` — push `EndRenderPass`.
 #[no_mangle]
 pub unsafe extern "C" fn vkCmdEndRenderPass(
+    command_buffer: VkCommandBuffer,
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::EndRenderPass, &[]);
+}
+
+/// `vkCmdBeginRendering` — Vulkan 1.3 dynamic-rendering entry.
+/// Replaces the vkCreateRenderPass + vkCreateFramebuffer ceremony
+/// with inline attachment specs at draw time. Used by every
+/// modern Vulkan-1.3-targeting renderer (Bevy, wgpu, Slang,
+/// Forge); apps that opt into dynamic rendering would otherwise
+/// fall back to the deprecated render-pass path or fail to load.
+///
+/// Resolves the first color attachment's imageView → image →
+/// daemon-side image_id (same path as vkCmdBeginRenderPass takes
+/// through the framebuffer), extracts the inline clear color, and
+/// emits the same BeginRenderPass FrameOp the legacy path uses —
+/// tier-1's renderer doesn't care whether the app went through
+/// the dynamic or static-render-pass model.
+///
+/// VkRenderingInfo layout (72 bytes):
+///   0  sType, 8 pNext, 16 flags,
+///   20 renderArea (16 bytes),
+///   36 layerCount, 40 viewMask, 44 colorAttachmentCount,
+///   48 pColorAttachments (*const VkRenderingAttachmentInfo),
+///   56 pDepthAttachment, 64 pStencilAttachment.
+///
+/// VkRenderingAttachmentInfo layout (72 bytes):
+///   0  sType, 8 pNext, 16 imageView,
+///   24 imageLayout, 28 resolveMode,
+///   32 resolveImageView, 40 resolveImageLayout,
+///   44 loadOp, 48 storeOp,
+///   52 clearValue (16 bytes — first 4 f32 = clearColor.float32).
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdBeginRendering(
+    command_buffer:    VkCommandBuffer,
+    p_rendering_info:  *const c_void,
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    if p_rendering_info.is_null() || cb.device.is_null() { return; }
+    let dev = &*(cb.device as *const AtriumDevice);
+    let info = p_rendering_info as *const u8;
+    let color_count = std::ptr::read_unaligned(info.add(44) as *const u32);
+    let p_color     = std::ptr::read_unaligned(info.add(48) as *const *const u8);
+
+    let (image_id, clear_rgba8) = if color_count > 0 && !p_color.is_null() {
+        let att = p_color; // first attachment
+        let view = std::ptr::read_unaligned(att.add(16) as *const u64);
+        let img = dev.image_views.lock().ok()
+            .and_then(|v| v.get(&view).copied());
+        let image_id = img.and_then(|i| {
+            dev.images.lock().ok()
+                .and_then(|m| m.get(&i).and_then(|x| x.image_id))
+        });
+        let r  = std::ptr::read_unaligned(att.add(52) as *const f32);
+        let g  = std::ptr::read_unaligned(att.add(56) as *const f32);
+        let bl = std::ptr::read_unaligned(att.add(60) as *const f32);
+        let a  = std::ptr::read_unaligned(att.add(64) as *const f32);
+        let clear = [
+            (r.clamp(0.0, 1.0)  * 255.0) as u8,
+            (g.clamp(0.0, 1.0)  * 255.0) as u8,
+            (bl.clamp(0.0, 1.0) * 255.0) as u8,
+            (a.clamp(0.0, 1.0)  * 255.0) as u8,
+        ];
+        (image_id, clear)
+    } else {
+        (None, [0u8, 0, 0, 255])
+    };
+
+    let mut body = [0u8; 12];
+    let tid = image_id.map(|i| i.raw()).unwrap_or(0);
+    body[ 0.. 4].copy_from_slice(&tid.to_le_bytes());
+    body[ 4.. 8].copy_from_slice(&clear_rgba8);
+    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::BeginRenderPass, &body);
+}
+
+/// `vkCmdEndRendering` — 1.3 dynamic-rendering counterpart to
+/// vkCmdEndRenderPass. Emits the same EndRenderPass FrameOp.
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdEndRendering(
     command_buffer: VkCommandBuffer,
 ) {
     let Some(cb) = cmdbuf_recording(command_buffer) else { return };

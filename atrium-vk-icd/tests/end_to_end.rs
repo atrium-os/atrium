@@ -592,6 +592,138 @@ fn submit_flushes_recorded_frame_to_aqueduct_backend() {
 }
 
 #[test]
+fn dynamic_rendering_emits_begin_end_render_pass_frame_ops() {
+    // vkCmdBeginRendering with a single VkRenderingAttachmentInfo
+    // pointing at a real image view; vkCmdEndRendering. Inspect
+    // the recorded FrameOp stream and verify:
+    //   - BeginRenderPass (0x0010) opcode present with the
+    //     attachment image's image_id and the clear color
+    //     quantized correctly.
+    //   - EndRenderPass (0x0011) opcode present.
+    use atrium_vk_icd::{
+        cmdbuf_recorded_bytes,
+        vkAllocateCommandBuffers, vkAllocateMemory, vkBeginCommandBuffer,
+        vkBindImageMemory, vkCmdBeginRendering, vkCmdEndRendering,
+        vkCreateCommandPool, vkCreateDevice, vkCreateImage, vkCreateImageView,
+        vkDestroyCommandPool, vkDestroyDevice, vkDestroyImage, vkDestroyImageView,
+        vkEndCommandBuffer, vkFreeMemory, vkGetImageMemoryRequirements,
+    };
+
+    let sock = tmp_socket("dynrender");
+    let sw_backend = Arc::new(SoftwareBackend::new());
+    let backend_for_listener: Arc<dyn Backend> = sw_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap();
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+    let _env = EnvLock::set(&sock);
+
+    type VkDevice = *mut std::ffi::c_void;
+    type VkCommandBuffer = *mut std::ffi::c_void;
+
+    let mut instance: VkInstance = std::ptr::null_mut();
+    unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
+    let mut devices: [VkPhysicalDevice; 1] = [std::ptr::null_mut(); 1];
+    let mut cap: u32 = 1;
+    unsafe { vkEnumeratePhysicalDevices(instance, &mut cap, devices.as_mut_ptr()); }
+    let mut device: VkDevice = std::ptr::null_mut();
+    unsafe { vkCreateDevice(devices[0], std::ptr::null(), std::ptr::null(), &mut device); }
+    let mut pool: u64 = 0;
+    unsafe { vkCreateCommandPool(device, std::ptr::null(), std::ptr::null(), &mut pool); }
+
+    // Image + memory + view (need image_id bound for resolution).
+    let mut img_info = [0u8; 88];
+    img_info[0..4].copy_from_slice(&14u32.to_le_bytes());
+    img_info[24..28].copy_from_slice(&37u32.to_le_bytes());
+    img_info[28..32].copy_from_slice(&64u32.to_le_bytes());
+    img_info[32..36].copy_from_slice(&64u32.to_le_bytes());
+    img_info[36..40].copy_from_slice(&1u32.to_le_bytes());
+    img_info[40..44].copy_from_slice(&1u32.to_le_bytes());
+    img_info[44..48].copy_from_slice(&1u32.to_le_bytes());
+    img_info[56..60].copy_from_slice(&0x10u32.to_le_bytes());
+    let mut image: u64 = 0;
+    unsafe { vkCreateImage(device, img_info.as_ptr() as *const _, std::ptr::null(), &mut image); }
+    let mut req = ash::vk::MemoryRequirements::default();
+    unsafe { vkGetImageMemoryRequirements(device, image, &mut req); }
+    let mut alloc = [0u8; 32];
+    alloc[0..4].copy_from_slice(&5u32.to_le_bytes());
+    alloc[16..24].copy_from_slice(&req.size.to_le_bytes());
+    let mut mem: u64 = 0;
+    unsafe { vkAllocateMemory(device, alloc.as_ptr() as *const _, std::ptr::null(), &mut mem); }
+    unsafe { vkBindImageMemory(device, image, mem, 0); }
+    let mut view_info = [0u8; 80];
+    view_info[0..4].copy_from_slice(&15u32.to_le_bytes());
+    view_info[24..32].copy_from_slice(&image.to_le_bytes());
+    let mut view: u64 = 0;
+    unsafe { vkCreateImageView(device, view_info.as_ptr() as *const _, std::ptr::null(), &mut view); }
+
+    // Cmdbuf.
+    let mut cb_info = [0u8; 40];
+    cb_info[0..4].copy_from_slice(&40u32.to_le_bytes());
+    cb_info[16..24].copy_from_slice(&pool.to_le_bytes());
+    cb_info[28..32].copy_from_slice(&1u32.to_le_bytes());
+    let mut cbs: [VkCommandBuffer; 1] = [std::ptr::null_mut(); 1];
+    unsafe { vkAllocateCommandBuffers(device, cb_info.as_ptr() as *const _, cbs.as_mut_ptr()); }
+    let cb = cbs[0];
+
+    // VkRenderingAttachmentInfo (72 bytes):
+    //   16 imageView, 52..68 clearValue (4 f32 = 0.5, 0.25, 1.0, 1.0)
+    let mut att = [0u8; 72];
+    att[0..4].copy_from_slice(&1_000_044_000u32.to_le_bytes());  // sType
+    att[16..24].copy_from_slice(&view.to_le_bytes());
+    att[52..56].copy_from_slice(&0.5f32.to_le_bytes());
+    att[56..60].copy_from_slice(&0.25f32.to_le_bytes());
+    att[60..64].copy_from_slice(&1.0f32.to_le_bytes());
+    att[64..68].copy_from_slice(&1.0f32.to_le_bytes());
+
+    // VkRenderingInfo (72 bytes):
+    //   44 colorAttachmentCount=1, 48 pColorAttachments
+    let mut ri = [0u8; 72];
+    ri[0..4].copy_from_slice(&1_000_044_002u32.to_le_bytes());
+    ri[44..48].copy_from_slice(&1u32.to_le_bytes());
+    ri[48..56].copy_from_slice(&(att.as_ptr() as u64).to_le_bytes());
+
+    unsafe { vkBeginCommandBuffer(cb, std::ptr::null()); }
+    unsafe { vkCmdBeginRendering(cb, ri.as_ptr() as *const _); }
+    unsafe { vkCmdEndRendering(cb); }
+    unsafe { vkEndCommandBuffer(cb); }
+
+    let bytes = cmdbuf_recorded_bytes(cb);
+    let mut saw_begin = false;
+    let mut saw_end = false;
+    let mut off = 0;
+    while off + 8 <= bytes.len() {
+        let opcode = u16::from_le_bytes([bytes[off], bytes[off+1]]);
+        let total  = u32::from_le_bytes(bytes[off+4..off+8].try_into().unwrap()) as usize;
+        if opcode == 0x0010 {
+            saw_begin = true;
+            let body = &bytes[off+8..off+total];
+            // image_id at body[0..4] — non-zero proves view → image_id
+            // resolution worked.
+            let tid = u32::from_le_bytes(body[0..4].try_into().unwrap());
+            assert_ne!(tid, 0, "image_id resolution must produce non-zero id");
+            // clear color quantized: 0.5 → 127, 0.25 → 63, 1.0 → 255.
+            assert_eq!(body[4], 127, "R quantized");
+            assert_eq!(body[5], 63,  "G quantized");
+            assert_eq!(body[6], 255, "B quantized");
+            assert_eq!(body[7], 255, "A quantized");
+        }
+        if opcode == 0x0011 { saw_end = true; }
+        off += total;
+    }
+    assert!(saw_begin, "BeginRenderPass opcode 0x0010 missing");
+    assert!(saw_end,   "EndRenderPass opcode 0x0011 missing");
+
+    unsafe { vkDestroyImageView(device, view, std::ptr::null()); }
+    unsafe { vkDestroyImage(device, image, std::ptr::null()); }
+    unsafe { vkFreeMemory(device, mem, std::ptr::null()); }
+    unsafe { vkDestroyCommandPool(device, pool, std::ptr::null()); }
+    unsafe { vkDestroyDevice(device, std::ptr::null()); }
+    unsafe { vkDestroyInstance(instance, std::ptr::null()); }
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[test]
 fn device_memory_requirements_reports_size_without_creating_resource() {
     // vkGetDeviceBufferMemoryRequirements / Image variant — 1.3
     // entries that report what the requirements WOULD be for a
