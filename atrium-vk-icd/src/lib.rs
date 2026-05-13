@@ -576,6 +576,7 @@ const ATRIUM_PHYSICAL_DEVICE_ENTRY_POINTS: &[&str] = &[
     "vkGetPhysicalDeviceSparseImageFormatProperties2KHR",
     "vkGetPhysicalDeviceToolProperties",
     "vkGetPhysicalDeviceToolPropertiesEXT",
+    "vkGetPhysicalDevicePresentRectanglesKHR",
 ];
 
 /// `vk_icdGetPhysicalDeviceProcAddr` — ICD ABI v4+ fast-path for
@@ -662,6 +663,7 @@ const ATRIUM_INSTANCE_ONLY_ENTRY_POINTS: &[&str] = &[
     "vkGetPhysicalDeviceSparseImageFormatProperties2KHR",
     "vkGetPhysicalDeviceToolProperties",
     "vkGetPhysicalDeviceToolPropertiesEXT",
+    "vkGetPhysicalDevicePresentRectanglesKHR",
     "vkCreateDebugUtilsMessengerEXT",
     "vkDestroyDebugUtilsMessengerEXT",
     "vkSubmitDebugUtilsMessageEXT",
@@ -1385,6 +1387,19 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkPhysicalDevice, *mut u32, *mut c_void) -> VkResult, FnVoidPtr,
             >(vkGetPhysicalDeviceToolProperties)),
+        // WSI device-group extras.
+        "vkGetDeviceGroupPresentCapabilitiesKHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, *mut c_void) -> VkResult, FnVoidPtr,
+            >(vkGetDeviceGroupPresentCapabilitiesKHR)),
+        "vkGetDeviceGroupSurfacePresentModesKHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, *mut u32) -> VkResult, FnVoidPtr,
+            >(vkGetDeviceGroupSurfacePresentModesKHR)),
+        "vkGetPhysicalDevicePresentRectanglesKHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkPhysicalDevice, u64, *mut u32, *mut c_void) -> VkResult, FnVoidPtr,
+            >(vkGetPhysicalDevicePresentRectanglesKHR)),
         // 1.2 indirect-count draws — forward to non-Count variants
         // with max_draw_count as the static count.
         "vkCmdDrawIndirectCount" |
@@ -5404,6 +5419,67 @@ pub unsafe extern "C" fn vkCmdPushDescriptorSetWithTemplate(
     _p_data:            *const c_void,
 ) {}
 
+// ── WSI device-group extras (VK_KHR_swapchain DG additions) ─────
+//
+// Apps that opt into device-group present (mostly desktop
+// multi-GPU rendering paths) probe these alongside the basic
+// Acquire/Present flow. Tier-1 is single-device + single-screen;
+// "local present only, one rect, mode = LOCAL" is the honest
+// answer.
+
+/// `vkGetDeviceGroupPresentCapabilitiesKHR` — output
+/// VkDeviceGroupPresentCapabilitiesKHR (160 bytes: 16-byte
+/// header + presentMask[32] u32 + modes u32 + 4-pad).
+#[no_mangle]
+pub unsafe extern "C" fn vkGetDeviceGroupPresentCapabilitiesKHR(
+    _device: VkDevice,
+    p_device_group_present_capabilities: *mut c_void,
+) -> VkResult {
+    if p_device_group_present_capabilities.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let out = p_device_group_present_capabilities as *mut u8;
+    let out_p_next = std::ptr::read_unaligned(out.add(8) as *const *mut c_void);
+    // Zero the entire 32-slot mask + 4-byte modes + pad (132 B
+    // after the 16-byte header).
+    std::ptr::write_bytes(out.add(16), 0, 132);
+    // presentMask[0] = 0x1 (device 0 can present to itself).
+    std::ptr::write_unaligned(out.add(16) as *mut u32, 1);
+    // modes = VK_DEVICE_GROUP_PRESENT_MODE_LOCAL_BIT_KHR (0x1).
+    std::ptr::write_unaligned(out.add(144) as *mut u32, 1);
+    let _ = walk_p_next_chain(out_p_next);
+    VK_SUCCESS
+}
+
+/// `vkGetDeviceGroupSurfacePresentModesKHR` — writes the supported
+/// device-group present modes for (device, surface). Tier-1
+/// returns LOCAL_BIT only.
+#[no_mangle]
+pub unsafe extern "C" fn vkGetDeviceGroupSurfacePresentModesKHR(
+    _device:  VkDevice,
+    _surface: u64,
+    p_modes:  *mut u32,
+) -> VkResult {
+    if p_modes.is_null() { return VK_ERROR_INITIALIZATION_FAILED; }
+    *p_modes = 1; // VK_DEVICE_GROUP_PRESENT_MODE_LOCAL_BIT_KHR
+    VK_SUCCESS
+}
+
+/// `vkGetPhysicalDevicePresentRectanglesKHR` — returns the
+/// rectangles that compose the surface. Tier-1's whole-screen
+/// model: zero rectangles (the spec treats this as "the entire
+/// surface").
+#[no_mangle]
+pub unsafe extern "C" fn vkGetPhysicalDevicePresentRectanglesKHR(
+    _physical_device: VkPhysicalDevice,
+    _surface:         u64,
+    p_rect_count:     *mut u32,
+    _p_rects:         *mut c_void,
+) -> VkResult {
+    if !p_rect_count.is_null() { *p_rect_count = 0; }
+    VK_SUCCESS
+}
+
 // ── Sparse + tooling honest-zero stubs ──────────────────────────
 //
 // Sparse memory is a real feature on big-iron Vulkan; tier-1
@@ -7500,6 +7576,50 @@ mod tests {
         assert!(props.optimal_tiling_features.is_empty());
         assert!(props.linear_tiling_features.is_empty());
         assert!(props.buffer_features.is_empty());
+    }
+
+    #[test]
+    fn wsi_device_group_extras_resolve_and_report_local() {
+        for name in [
+            b"vkGetDeviceGroupPresentCapabilitiesKHR\0".as_slice(),
+            b"vkGetDeviceGroupSurfacePresentModesKHR\0".as_slice(),
+            b"vkGetPhysicalDevicePresentRectanglesKHR\0".as_slice(),
+        ] {
+            assert!(lookup(name).is_some(),
+                "must resolve {}",
+                std::str::from_utf8(&name[..name.len()-1]).unwrap());
+        }
+
+        // GetDeviceGroupSurfacePresentModesKHR must report
+        // LOCAL_BIT only.
+        let f = lookup(b"vkGetDeviceGroupSurfacePresentModesKHR\0").unwrap();
+        let g: unsafe extern "C" fn(VkDevice, u64, *mut u32) -> VkResult =
+            unsafe { std::mem::transmute(f) };
+        let mut modes: u32 = 0xdead;
+        let r = unsafe { g(std::ptr::null_mut(), 1, &mut modes) };
+        assert_eq!(r, VK_SUCCESS);
+        assert_eq!(modes, 1, "LOCAL_BIT only on tier-1 single-device");
+
+        // PresentRectanglesKHR size-query writes 0.
+        let f = lookup(b"vkGetPhysicalDevicePresentRectanglesKHR\0").unwrap();
+        let g: unsafe extern "C" fn(VkPhysicalDevice, u64, *mut u32, *mut c_void) -> VkResult =
+            unsafe { std::mem::transmute(f) };
+        let mut n: u32 = 0xdead;
+        let r = unsafe { g(std::ptr::null_mut(), 1, &mut n, std::ptr::null_mut()) };
+        assert_eq!(r, VK_SUCCESS);
+        assert_eq!(n, 0);
+
+        // DeviceGroupPresentCapabilities: presentMask[0]=1, modes=1.
+        let f = lookup(b"vkGetDeviceGroupPresentCapabilitiesKHR\0").unwrap();
+        let g: unsafe extern "C" fn(VkDevice, *mut c_void) -> VkResult =
+            unsafe { std::mem::transmute(f) };
+        let mut out = [0u8; 16 + 132];
+        // sType + null pNext (pre-zero).
+        let r = unsafe { g(std::ptr::null_mut(), out.as_mut_ptr() as *mut _) };
+        assert_eq!(r, VK_SUCCESS);
+        let read = |off: usize| u32::from_le_bytes(out[off..off+4].try_into().unwrap());
+        assert_eq!(read(16), 1, "presentMask[0]");
+        assert_eq!(read(144), 1, "modes = LOCAL_BIT");
     }
 
     #[test]
