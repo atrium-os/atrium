@@ -724,6 +724,78 @@ fn dynamic_rendering_emits_begin_end_render_pass_frame_ops() {
 }
 
 #[test]
+fn surface_capabilities_honors_atrium_vk_screen_extent_override() {
+    // Set the env override to a non-default 1920x1080, drive
+    // vkGetPhysicalDeviceSurfaceCapabilitiesKHR, and verify the
+    // returned currentExtent matches. Also verify maxImageExtent
+    // grows to >= currentExtent (spec requires it; we cap to
+    // 16384 either way).
+    use atrium_vk_icd::{
+        vkCreateAtriumSurfaceEXT, vkDestroySurfaceKHR,
+        vkGetPhysicalDeviceSurfaceCapabilitiesKHR,
+    };
+
+    let sock = tmp_socket("surfext");
+    let sw_backend = Arc::new(SoftwareBackend::new());
+    let backend_for_listener: Arc<dyn Backend> = sw_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap();
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+    let _env = EnvLock::set(&sock);
+    // Process-wide env var — relies on EnvLock to serialize
+    // against other tests that touch ATRIUM_VK_ICD_SOCKET.
+    // ATRIUM_VK_SCREEN_EXTENT is only consumed by
+    // vkGetPhysicalDeviceSurfaceCapabilitiesKHR, so a quick
+    // set/probe/clear sequence inside this test is safe even
+    // though it doesn't go through EnvLock — the surrounding
+    // EnvLock keeps other tests out.
+    std::env::set_var("ATRIUM_VK_SCREEN_EXTENT", "1920x1080");
+
+    let mut instance: VkInstance = std::ptr::null_mut();
+    unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
+    let mut devices: [VkPhysicalDevice; 1] = [std::ptr::null_mut(); 1];
+    let mut cap: u32 = 1;
+    unsafe { vkEnumeratePhysicalDevices(instance, &mut cap, devices.as_mut_ptr()); }
+
+    let mut surf_info = [0u8; 24];
+    surf_info[0..4].copy_from_slice(&1_000_310_000u32.to_le_bytes());
+    surf_info[20..24].copy_from_slice(&5u32.to_le_bytes());
+    let mut surface: u64 = 0;
+    unsafe { vkCreateAtriumSurfaceEXT(instance, surf_info.as_ptr() as *const _, std::ptr::null(), &mut surface); }
+
+    let mut caps = [0u8; 52];
+    let r = unsafe {
+        vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
+            devices[0], surface, caps.as_mut_ptr() as *mut _,
+        )
+    };
+    assert_eq!(r, 0);
+    let read = |off: usize| u32::from_le_bytes(caps[off..off+4].try_into().unwrap());
+    assert_eq!(read( 8), 1920, "currentExtent.width");
+    assert_eq!(read(12), 1080, "currentExtent.height");
+    assert!(read(24) >= 1920, "maxImageExtent.width must be >= currentExtent");
+    assert!(read(28) >= 1080, "maxImageExtent.height must be >= currentExtent");
+
+    // Garbage value falls back to default 1280x800.
+    std::env::set_var("ATRIUM_VK_SCREEN_EXTENT", "not-a-resolution");
+    let mut caps2 = [0u8; 52];
+    unsafe {
+        vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
+            devices[0], surface, caps2.as_mut_ptr() as *mut _,
+        );
+    }
+    let read2 = |off: usize| u32::from_le_bytes(caps2[off..off+4].try_into().unwrap());
+    assert_eq!(read2( 8), 1280);
+    assert_eq!(read2(12), 800);
+
+    std::env::remove_var("ATRIUM_VK_SCREEN_EXTENT");
+    unsafe { vkDestroySurfaceKHR(instance, surface, std::ptr::null()); }
+    unsafe { vkDestroyInstance(instance, std::ptr::null()); }
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[test]
 fn device_memory_requirements_reports_size_without_creating_resource() {
     // vkGetDeviceBufferMemoryRequirements / Image variant — 1.3
     // entries that report what the requirements WOULD be for a

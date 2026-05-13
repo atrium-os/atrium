@@ -6033,6 +6033,32 @@ pub unsafe extern "C" fn vkGetPhysicalDeviceSurfaceSupportKHR(
 ///   40  currentTransform : u32
 ///   44  supportedCompositeAlpha : u32
 ///   48  supportedUsageFlags : u32
+/// Resolve the surface extent the ICD should report for the
+/// frescod-aqueduct screen. Priority:
+///   1. `ATRIUM_VK_SCREEN_EXTENT=WxH` env override (test/VM
+///      harnesses that know the kmod mode + want the swapchain
+///      to match without recompiling).
+///   2. Default 1280x800 (frescod-aqueduct's typical mode).
+///
+/// A future revision should round-trip a query through the live
+/// GpuClient — the daemon-side connector knows the truth — but
+/// that needs an OP_GPU_QUERY_DISPLAY round-trip on the protocol
+/// + a way to plumb the answer back through the surface lookup
+/// (the ICD doesn't yet associate a surface with a particular
+/// physical-device/client at probe time).
+fn atrium_surface_extent() -> (u32, u32) {
+    if let Ok(s) = std::env::var("ATRIUM_VK_SCREEN_EXTENT") {
+        if let Some((w, h)) = s.split_once('x') {
+            if let (Ok(w), Ok(h)) = (w.parse::<u32>(), h.parse::<u32>()) {
+                if w > 0 && h > 0 && w <= 16384 && h <= 16384 {
+                    return (w, h);
+                }
+            }
+        }
+    }
+    (1280, 800)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
     _physical_device: VkPhysicalDevice,
@@ -6047,12 +6073,17 @@ pub unsafe extern "C" fn vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
             v.to_le_bytes().as_ptr(), b.add(off), 4,
         );
     };
+    let (ext_w, ext_h) = atrium_surface_extent();
+    // maxImageExtent grows with the current extent: must be >=
+    // currentExtent or the spec rejects any swapchain at
+    // currentExtent. Cap at 16K (matches PhysicalDeviceLimits).
+    let max_w = ext_w.max(4096).min(16384);
+    let max_h = ext_h.max(4096).min(16384);
     put32( 0, 3);                 // minImageCount = 3 (triple-buffer)
     put32( 4, 4);                 // maxImageCount = 4
-    // currentExtent: 1280×800 (frescod-aqueduct's typical mode).
-    put32( 8, 1280); put32(12, 800);
-    put32(16, 64);   put32(20, 64);    // min 64×64
-    put32(24, 4096); put32(28, 4096);  // max 4096×4096
+    put32( 8, ext_w); put32(12, ext_h);  // currentExtent
+    put32(16, 64);    put32(20, 64);     // minImageExtent 64x64
+    put32(24, max_w); put32(28, max_h);  // maxImageExtent
     put32(32, 1);                 // maxImageArrayLayers
     put32(36, 0x1);               // supportedTransforms = IDENTITY only
     put32(40, 0x1);               // currentTransform = IDENTITY
