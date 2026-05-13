@@ -592,6 +592,95 @@ fn submit_flushes_recorded_frame_to_aqueduct_backend() {
 }
 
 #[test]
+fn image_subresource_layout_reports_tier1_linear_layout() {
+    // Create a 32x16 R8G8B8A8_UNORM image and ask for its
+    // subresource layout. Tier-1 is row-major BGRA with no
+    // padding, so we expect:
+    //   offset      = 0
+    //   size        = 32*16*4 = 2048
+    //   rowPitch    = 32*4 = 128
+    //   arrayPitch  = 2048
+    //   depthPitch  = 2048
+    use atrium_vk_icd::{
+        vkCreateDevice, vkCreateImage, vkDestroyDevice, vkDestroyImage,
+        vkGetImageSubresourceLayout,
+    };
+
+    let sock = tmp_socket("subres");
+    let sw_backend = Arc::new(SoftwareBackend::new());
+    let backend_for_listener: Arc<dyn Backend> = sw_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap();
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+    let _env = EnvLock::set(&sock);
+
+    type VkDevice = *mut std::ffi::c_void;
+
+    let mut instance: VkInstance = std::ptr::null_mut();
+    unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
+    let mut devices: [VkPhysicalDevice; 1] = [std::ptr::null_mut(); 1];
+    let mut cap: u32 = 1;
+    unsafe { vkEnumeratePhysicalDevices(instance, &mut cap, devices.as_mut_ptr()); }
+    let mut device: VkDevice = std::ptr::null_mut();
+    unsafe { vkCreateDevice(devices[0], std::ptr::null(), std::ptr::null(), &mut device); }
+
+    // VkImageCreateInfo (88 bytes):
+    //   24 format (u32), 28 width, 32 height, 36 depth, 40 mip,
+    //   44 array, 56 usage.
+    let mut img_info = [0u8; 88];
+    img_info[0..4].copy_from_slice(&14u32.to_le_bytes()); // sType
+    img_info[24..28].copy_from_slice(&37u32.to_le_bytes()); // R8G8B8A8_UNORM
+    img_info[28..32].copy_from_slice(&32u32.to_le_bytes());
+    img_info[32..36].copy_from_slice(&16u32.to_le_bytes());
+    img_info[36..40].copy_from_slice(&1u32.to_le_bytes());
+    img_info[40..44].copy_from_slice(&1u32.to_le_bytes());
+    img_info[44..48].copy_from_slice(&1u32.to_le_bytes());
+    img_info[56..60].copy_from_slice(&0x10u32.to_le_bytes()); // COLOR_ATTACHMENT
+    let mut image: u64 = 0;
+    unsafe { vkCreateImage(device, img_info.as_ptr() as *const _, std::ptr::null(), &mut image); }
+    assert_ne!(image, 0);
+
+    // VkImageSubresource (16 bytes): aspect=COLOR, mip=0, layer=0.
+    let mut sub = [0u8; 16];
+    sub[0..4].copy_from_slice(&1u32.to_le_bytes()); // VK_IMAGE_ASPECT_COLOR_BIT
+
+    // VkSubresourceLayout (40 bytes): offset, size, rowPitch,
+    // arrayPitch, depthPitch (all u64).
+    let mut layout = [0u8; 40];
+    unsafe {
+        vkGetImageSubresourceLayout(
+            device, image, sub.as_ptr() as *const _,
+            layout.as_mut_ptr() as *mut _,
+        );
+    }
+    let u64_at = |off: usize| u64::from_le_bytes(
+        layout[off..off+8].try_into().unwrap()
+    );
+    assert_eq!(u64_at( 0), 0,            "offset");
+    assert_eq!(u64_at( 8), 32 * 16 * 4,  "size");
+    assert_eq!(u64_at(16), 32 * 4,       "rowPitch");
+    assert_eq!(u64_at(24), 32 * 16 * 4,  "arrayPitch");
+    assert_eq!(u64_at(32), 32 * 16 * 4,  "depthPitch");
+
+    // Unknown image handle: layout must be untouched.
+    let mut layout2 = [0xAAu8; 40];
+    unsafe {
+        vkGetImageSubresourceLayout(
+            device, 0xdead_beef_dead_beefu64,
+            sub.as_ptr() as *const _, layout2.as_mut_ptr() as *mut _,
+        );
+    }
+    assert!(layout2.iter().all(|&b| b == 0xAA),
+        "unknown image should leave caller buffer untouched");
+
+    unsafe { vkDestroyImage(device, image, std::ptr::null()); }
+    unsafe { vkDestroyDevice(device, std::ptr::null()); }
+    unsafe { vkDestroyInstance(instance, std::ptr::null()); }
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[test]
 fn cmd_pipeline_barrier2_records_frame_op_with_extracted_masks() {
     // Drive vkCmdPipelineBarrier2 with a real VkDependencyInfo +
     // single VkMemoryBarrier2. Check the recorded FrameOp body

@@ -1069,6 +1069,10 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkCommandBuffer, *const c_void), FnVoidPtr,
             >(vkCmdPipelineBarrier2)),
+        "vkGetImageSubresourceLayout" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, *const c_void, *mut c_void), FnVoidPtr,
+            >(vkGetImageSubresourceLayout)),
         "vkDeviceWaitIdle" =>
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkDevice) -> VkResult, FnVoidPtr,
@@ -3662,6 +3666,60 @@ pub unsafe extern "C" fn vkCmdPipelineBarrier(
     body[ 9..10].copy_from_slice(&[buffer_barrier_count.min(255) as u8]);
     body[10..11].copy_from_slice(&[image_barrier_count.min(255)  as u8]);
     let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::PipelineBarrier, &body);
+}
+
+/// `vkGetImageSubresourceLayout` — describe the linear layout of
+/// an image subresource within its backing memory. Required by
+/// apps that vkMapMemory a LINEAR-tiling image and walk pixels
+/// directly (texture loaders, CPU-side readback, screenshot
+/// tools, RenderDoc-style capture probes).
+///
+/// Tier-1 (tiny-skia) treats every image as row-major BGRA with
+/// no padding, one mip level, one array layer. So for any
+/// subresource we return a flat:
+///   offset      = 0
+///   size        = width * height * bpp
+///   rowPitch    = width * bpp
+///   arrayPitch  = size
+///   depthPitch  = size
+///
+/// The 1.0 entry takes a VkImageSubresource (16 bytes:
+/// aspectMask u32 + mipLevel u32 + arrayLayer u32 + 4-byte pad)
+/// and fills a VkSubresourceLayout (40 bytes: 5x u64).
+#[no_mangle]
+pub unsafe extern "C" fn vkGetImageSubresourceLayout(
+    device:        VkDevice,
+    image:         u64,
+    _p_subresource: *const c_void, /* VkImageSubresource — accepted but ignored */
+    p_layout:      *mut c_void,    /* VkSubresourceLayout */
+) {
+    if device.is_null() || p_layout.is_null() || image == 0 { return; }
+    let dev = &*(device as *const AtriumDevice);
+    let (width, height, format) = {
+        let images = match dev.images.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        match images.get(&image) {
+            Some(img) => (img.width, img.height, img.format),
+            None => return,
+        }
+    };
+    let bpp = bpp_for_vk_format(format).max(1) as u64;
+    let row_pitch = width as u64 * bpp;
+    let size      = row_pitch * height as u64;
+
+    let b = p_layout as *mut u8;
+    let put64 = |off: usize, v: u64| {
+        std::ptr::copy_nonoverlapping(
+            v.to_le_bytes().as_ptr(), b.add(off), 8,
+        );
+    };
+    put64( 0, 0);          // offset
+    put64( 8, size);       // size
+    put64(16, row_pitch);  // rowPitch
+    put64(24, size);       // arrayPitch
+    put64(32, size);       // depthPitch
 }
 
 /// `vkCmdPipelineBarrier2` — Vulkan 1.3 mandatory barrier with
