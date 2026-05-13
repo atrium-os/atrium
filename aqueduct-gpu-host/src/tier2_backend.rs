@@ -35,8 +35,43 @@ use crate::tier2_registry::{Tier2ExecError, Tier2Registry, Tier2ShaderId};
 pub struct Tier2Backend {
     registry: Arc<Tier2Registry>,
     images:   Mutex<HashMap<u64, ImageStorage>>,
+    /// Pipeline ResourceId.raw() → bound Tier-2 fragment
+    /// shader. Populated by [`Tier2Backend::bind_pipeline`]
+    /// (called by the Session when it processes
+    /// `OP_GPU_PIPELINE_CREATE` for a Tier-2 pipeline).
+    /// `submit_frame` consults this map to know which
+    /// shader to fire for each `FrameOp::BindPipeline`
+    /// record it walks.
+    pipeline_shaders: Mutex<HashMap<u32, Tier2ShaderId>>,
     submissions: AtomicU64,
     presents:    AtomicU64,
+}
+
+/// Walk a renderpass's bytes looking for the most recent
+/// `FrameOp::BindPipeline` whose pipeline id has been
+/// Tier-2-bound. Returns the bound Tier2ShaderId, or
+/// `None` if no recognised pipeline was bound (in which
+/// case the pass is a no-op for Tier2Backend).
+fn find_bound_tier2_shader(
+    pass_bytes: &[u8],
+    pipeline_shaders: &HashMap<u32, Tier2ShaderId>,
+) -> Option<Tier2ShaderId> {
+    use aqueduct_gpu::frame::FrameDecoder;
+    use aqueduct_gpu::opcodes::FrameOp;
+
+    let mut decoder = FrameDecoder::new(pass_bytes);
+    let mut active: Option<Tier2ShaderId> = None;
+    while let Ok(Some((op, body))) = decoder.next() {
+        if let FrameOp::BindPipeline = op {
+            if body.len() >= 4 {
+                let raw = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+                if let Some(sid) = pipeline_shaders.get(&raw) {
+                    active = Some(*sid);
+                }
+            }
+        }
+    }
+    active
 }
 
 /// Per-image RGBA8 storage owned by the backend.
@@ -54,9 +89,24 @@ impl Tier2Backend {
         Self {
             registry,
             images: Mutex::new(HashMap::new()),
+            pipeline_shaders: Mutex::new(HashMap::new()),
             submissions: AtomicU64::new(0),
             presents:    AtomicU64::new(0),
         }
+    }
+
+    /// Associate a pipeline ResourceId with a Tier-2
+    /// fragment shader. When `submit_frame` later sees a
+    /// `BindPipeline` of this id followed by a draw, it
+    /// fires `run_fragment_shader_into` for the active
+    /// renderpass's target image.
+    pub fn bind_pipeline(
+        &self,
+        pipeline_id: ResourceId,
+        shader_id: Tier2ShaderId,
+    ) {
+        self.pipeline_shaders.lock().unwrap()
+            .insert(pipeline_id.raw(), shader_id);
     }
 
     /// How many `submit_frame` calls have arrived. Useful
@@ -135,12 +185,38 @@ impl Backend for Tier2Backend {
         &self,
         _fence_id: ResourceId,
         _timeline: u64,
-        _frame_buf: &[u8],
+        frame_buf: &[u8],
     ) -> bool {
-        // v5d step 2: submit_frame is a stub. Real wire-
-        // protocol routing (draw stream → pipeline lookup →
-        // run_fragment_shader_into) lands in v5e.
         self.submissions.fetch_add(1, Ordering::Relaxed);
+
+        // Partition into renderpasses (reuses the shared
+        // helper used by SoftwareBackend).
+        let passes = match crate::backend::partition_renderpasses(frame_buf) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("Tier2Backend::submit_frame: partition error: {e}");
+                return true;
+            }
+        };
+
+        for pass in &passes {
+            // For each pass, walk its body and find the
+            // bound pipeline (the most recent BindPipeline
+            // before any Draw / End). If we recognise it
+            // as one we've Tier-2-bound, fire the shader
+            // into the pass's target image.
+            let pass_bytes = &frame_buf[pass.byte_range.clone()];
+            let active_shader = find_bound_tier2_shader(
+                pass_bytes, &self.pipeline_shaders.lock().unwrap());
+            let Some(shader_id) = active_shader else { continue };
+
+            if let Err(e) = self.run_fragment_shader_into(
+                pass.target_id, shader_id, &[], &[])
+            {
+                log::warn!("Tier2Backend: shader exec into {} failed: {e}",
+                           pass.target_id);
+            }
+        }
         true
     }
 

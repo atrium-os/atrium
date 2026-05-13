@@ -110,6 +110,88 @@ fn tier2_backend_image_destroyed_drops_storage() {
 }
 
 #[test]
+fn tier2_backend_submit_frame_runs_bound_shader() {
+    use aqueduct_gpu::frame::FrameBuilder;
+    use aqueduct_gpu::opcodes::FrameOp;
+
+    let cache_dir = TempDir::new().unwrap();
+    let registry = Arc::new(Tier2Registry::new(LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    }));
+    let backend = Tier2Backend::new(registry.clone());
+
+    // Set up: 8×4 image + shader + bind pipeline → shader.
+    let image_id = ResourceId::new(IdNamespace::IcdRuntime, 0x4000);
+    backend.image_created(image_id, 8, 4);
+    let expected = [0.7f32, 0.2, 0.5, 1.0];
+    let spirv = build_constant_color_spirv(expected);
+    let shader_id = registry.register(&spirv).unwrap();
+    let pipeline_id = ResourceId::new(IdNamespace::IcdRuntime, 0x4001);
+    backend.bind_pipeline(pipeline_id, shader_id);
+
+    // Build a frame stream: Begin RP → BindPipeline → End RP.
+    let mut fb = FrameBuilder::new(1024);
+    let mut begin = [0u8; 12];
+    begin[..4].copy_from_slice(&image_id.raw().to_le_bytes());
+    begin[4..8].copy_from_slice(&8u32.to_le_bytes());
+    begin[8..12].copy_from_slice(&4u32.to_le_bytes());
+    fb.push(FrameOp::BeginRenderPass, &begin).unwrap();
+    fb.push(FrameOp::BindPipeline, &pipeline_id.raw().to_le_bytes()).unwrap();
+    fb.push(FrameOp::EndRenderPass, &[]).unwrap();
+
+    // Submit. Pre-submit the image should be zeros.
+    let pre = backend.read_image_pixels(image_id).unwrap();
+    assert!(pre.iter().all(|b| *b == 0), "pre-submit must be cleared");
+
+    let fence = ResourceId::new(IdNamespace::IcdRuntime, 0x4002);
+    let signalled = backend.submit_frame(fence, 1, fb.as_bytes());
+    assert!(signalled);
+
+    // Post-submit: every pixel should be the shader colour.
+    let post = backend.read_image_pixels(image_id).unwrap();
+    let eq = |v: f32| (v * 255.0 + 0.5) as u8;
+    let exp_u8 = [eq(expected[0]), eq(expected[1]),
+                  eq(expected[2]), eq(expected[3])];
+    for px in post.chunks_exact(4) {
+        assert_eq!(px, &exp_u8[..],
+            "post-submit pixel {px:?} != expected {exp_u8:?}");
+    }
+}
+
+#[test]
+fn tier2_backend_submit_frame_no_bound_pipeline_leaves_image_unchanged() {
+    use aqueduct_gpu::frame::FrameBuilder;
+    use aqueduct_gpu::opcodes::FrameOp;
+
+    let cache_dir = TempDir::new().unwrap();
+    let registry = Arc::new(Tier2Registry::new(LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    }));
+    let backend = Tier2Backend::new(registry);
+    let image_id = ResourceId::new(IdNamespace::IcdRuntime, 0x5000);
+    backend.image_created(image_id, 4, 4);
+
+    let mut fb = FrameBuilder::new(1024);
+    let mut begin = [0u8; 12];
+    begin[..4].copy_from_slice(&image_id.raw().to_le_bytes());
+    begin[4..8].copy_from_slice(&4u32.to_le_bytes());
+    begin[8..12].copy_from_slice(&4u32.to_le_bytes());
+    fb.push(FrameOp::BeginRenderPass, &begin).unwrap();
+    fb.push(FrameOp::EndRenderPass, &[]).unwrap();
+
+    let fence = ResourceId::new(IdNamespace::IcdRuntime, 0x5002);
+    backend.submit_frame(fence, 1, fb.as_bytes());
+
+    // No bound pipeline → no shader fired → image still cleared.
+    let pixels = backend.read_image_pixels(image_id).unwrap();
+    assert!(pixels.iter().all(|b| *b == 0));
+}
+
+#[test]
 fn tier2_backend_submit_frame_counts() {
     let cache_dir = TempDir::new().unwrap();
     let registry = Arc::new(Tier2Registry::new(LoaderConfig {

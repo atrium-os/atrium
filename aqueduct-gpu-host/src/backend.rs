@@ -570,16 +570,16 @@ impl Backend for SoftwareBackend {
 /// One contiguous BeginRenderPass..EndRenderPass slice of a frame
 /// command stream. The byte range covers both bookends inclusively.
 #[derive(Debug, Clone)]
-struct RenderPassSlice {
-    target_id: ResourceId,
-    byte_range: std::ops::Range<usize>,
+pub(crate) struct RenderPassSlice {
+    pub(crate) target_id: ResourceId,
+    pub(crate) byte_range: std::ops::Range<usize>,
 }
 
 /// Walk the frame stream and pull out one [`RenderPassSlice`] per
 /// BeginRenderPass..EndRenderPass pair. Records outside any
 /// renderpass are ignored (they'd be a validation error at the
 /// renderer level anyway).
-fn partition_renderpasses(frame_buf: &[u8]) -> Result<Vec<RenderPassSlice>, &'static str> {
+pub(crate) fn partition_renderpasses(frame_buf: &[u8]) -> Result<Vec<RenderPassSlice>, &'static str> {
     use aqueduct_gpu::frame::FrameDecoder;
     use aqueduct_gpu::opcodes::FrameOp;
 
