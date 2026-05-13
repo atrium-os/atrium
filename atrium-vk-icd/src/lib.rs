@@ -997,6 +997,68 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkCommandBuffer), FnVoidPtr,
             >(vkCmdEndRendering)),
+        // 1.3 extended dynamic state (promoted from
+        // VK_EXT_extended_dynamic_state{,2,3}).
+        "vkCmdSetViewportWithCount" | "vkCmdSetViewportWithCountEXT" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u32, *const ash::vk::Viewport), FnVoidPtr,
+            >(vkCmdSetViewportWithCount)),
+        "vkCmdSetScissorWithCount" | "vkCmdSetScissorWithCountEXT" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u32, *const ash::vk::Rect2D), FnVoidPtr,
+            >(vkCmdSetScissorWithCount)),
+        "vkCmdBindVertexBuffers2" | "vkCmdBindVertexBuffers2EXT" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u32, u32, *const u64, *const u64, *const u64, *const u64), FnVoidPtr,
+            >(vkCmdBindVertexBuffers2)),
+        "vkCmdSetCullMode" | "vkCmdSetCullModeEXT" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u32), FnVoidPtr,
+            >(vkCmdSetCullMode)),
+        "vkCmdSetFrontFace" | "vkCmdSetFrontFaceEXT" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u32), FnVoidPtr,
+            >(vkCmdSetFrontFace)),
+        "vkCmdSetPrimitiveTopology" | "vkCmdSetPrimitiveTopologyEXT" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u32), FnVoidPtr,
+            >(vkCmdSetPrimitiveTopology)),
+        "vkCmdSetDepthTestEnable" | "vkCmdSetDepthTestEnableEXT" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u32), FnVoidPtr,
+            >(vkCmdSetDepthTestEnable)),
+        "vkCmdSetDepthWriteEnable" | "vkCmdSetDepthWriteEnableEXT" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u32), FnVoidPtr,
+            >(vkCmdSetDepthWriteEnable)),
+        "vkCmdSetDepthCompareOp" | "vkCmdSetDepthCompareOpEXT" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u32), FnVoidPtr,
+            >(vkCmdSetDepthCompareOp)),
+        "vkCmdSetDepthBoundsTestEnable" | "vkCmdSetDepthBoundsTestEnableEXT" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u32), FnVoidPtr,
+            >(vkCmdSetDepthBoundsTestEnable)),
+        "vkCmdSetStencilTestEnable" | "vkCmdSetStencilTestEnableEXT" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u32), FnVoidPtr,
+            >(vkCmdSetStencilTestEnable)),
+        "vkCmdSetStencilOp" | "vkCmdSetStencilOpEXT" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u32, u32, u32, u32, u32), FnVoidPtr,
+            >(vkCmdSetStencilOp)),
+        "vkCmdSetRasterizerDiscardEnable" | "vkCmdSetRasterizerDiscardEnableEXT" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u32), FnVoidPtr,
+            >(vkCmdSetRasterizerDiscardEnable)),
+        "vkCmdSetDepthBiasEnable" | "vkCmdSetDepthBiasEnableEXT" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u32), FnVoidPtr,
+            >(vkCmdSetDepthBiasEnable)),
+        "vkCmdSetPrimitiveRestartEnable" | "vkCmdSetPrimitiveRestartEnableEXT" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u32), FnVoidPtr,
+            >(vkCmdSetPrimitiveRestartEnable)),
         "vkCreateFence" =>
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkDevice, *const c_void, *const c_void, *mut u64) -> VkResult, FnVoidPtr,
@@ -2597,6 +2659,89 @@ pub unsafe extern "C" fn vkCmdSetScissor(
         let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::SetScissor, &body);
     }
 }
+
+// ── Extended dynamic state (Vk 1.3 + VK_EXT_extended_dynamic_state{,2,3})
+//
+// 1.3 promoted a stack of per-cmdbuf state setters from extensions
+// into core. Apps that opt into dynamic state (i.e. set pipeline
+// state at draw time rather than baking it into the pipeline)
+// resolve these via the 1.3 dispatch table. Modern engines
+// (wgpu, Bevy with the dynamic-state feature) emit them
+// unconditionally.
+//
+// Tier-1 doesn't honor most of these (rasteriser is fixed),
+// but they must resolve and not crash. The two with a wire-
+// format home (ViewportWithCount, ScissorWithCount,
+// BindVertexBuffers2) delegate to their 1.0 counterparts.
+
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdSetViewportWithCount(
+    command_buffer: VkCommandBuffer,
+    viewport_count: u32,
+    p_viewports:    *const ash::vk::Viewport,
+) {
+    vkCmdSetViewport(command_buffer, 0, viewport_count, p_viewports)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdSetScissorWithCount(
+    command_buffer: VkCommandBuffer,
+    scissor_count:  u32,
+    p_scissors:     *const ash::vk::Rect2D,
+) {
+    vkCmdSetScissor(command_buffer, 0, scissor_count, p_scissors)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdBindVertexBuffers2(
+    command_buffer: VkCommandBuffer,
+    first_binding:  u32,
+    binding_count:  u32,
+    p_buffers:      *const u64,
+    p_offsets:      *const u64,
+    _p_sizes:       *const u64, /* per-buffer size — ignored (tier-1 doesn't bound-check) */
+    _p_strides:     *const u64, /* per-buffer stride — ignored (pipeline already declares stride) */
+) {
+    vkCmdBindVertexBuffers(command_buffer, first_binding, binding_count, p_buffers, p_offsets)
+}
+
+// The rest are state-machine setters tier-1 doesn't care about.
+// All take a single primitive value (u32 enum or VkBool32) plus
+// the cmdbuf. Implemented as no-ops; the loader sees them resolve
+// and validation layers see consistent state-change ordering.
+
+macro_rules! ext_state_stub_u32 {
+    ($name:ident) => {
+        #[no_mangle]
+        pub unsafe extern "C" fn $name(
+            _command_buffer: VkCommandBuffer, _value: u32,
+        ) {}
+    };
+}
+
+ext_state_stub_u32!(vkCmdSetCullMode);
+ext_state_stub_u32!(vkCmdSetFrontFace);
+ext_state_stub_u32!(vkCmdSetPrimitiveTopology);
+ext_state_stub_u32!(vkCmdSetDepthTestEnable);
+ext_state_stub_u32!(vkCmdSetDepthWriteEnable);
+ext_state_stub_u32!(vkCmdSetDepthCompareOp);
+ext_state_stub_u32!(vkCmdSetDepthBoundsTestEnable);
+ext_state_stub_u32!(vkCmdSetStencilTestEnable);
+ext_state_stub_u32!(vkCmdSetRasterizerDiscardEnable);
+ext_state_stub_u32!(vkCmdSetDepthBiasEnable);
+ext_state_stub_u32!(vkCmdSetPrimitiveRestartEnable);
+
+/// `vkCmdSetStencilOp` — face_mask + failOp/passOp/depthFailOp/compareOp,
+/// 5 u32 args. No-op stub.
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdSetStencilOp(
+    _command_buffer:    VkCommandBuffer,
+    _face_mask:         u32,
+    _fail_op:           u32,
+    _pass_op:           u32,
+    _depth_fail_op:     u32,
+    _compare_op:        u32,
+) {}
 
 /// `vkCmdPushConstants` — record push-constant bytes.
 ///
@@ -6409,6 +6554,59 @@ mod tests {
         assert!(props.optimal_tiling_features.is_empty());
         assert!(props.linear_tiling_features.is_empty());
         assert!(props.buffer_features.is_empty());
+    }
+
+    #[test]
+    fn extended_dynamic_state_stubs_resolve() {
+        // All 14 entry points + 14 EXT aliases — 28 names total.
+        for name in [
+            "vkCmdSetViewportWithCount",
+            "vkCmdSetViewportWithCountEXT",
+            "vkCmdSetScissorWithCount",
+            "vkCmdSetScissorWithCountEXT",
+            "vkCmdBindVertexBuffers2",
+            "vkCmdBindVertexBuffers2EXT",
+            "vkCmdSetCullMode",
+            "vkCmdSetCullModeEXT",
+            "vkCmdSetFrontFace",
+            "vkCmdSetFrontFaceEXT",
+            "vkCmdSetPrimitiveTopology",
+            "vkCmdSetPrimitiveTopologyEXT",
+            "vkCmdSetDepthTestEnable",
+            "vkCmdSetDepthTestEnableEXT",
+            "vkCmdSetDepthWriteEnable",
+            "vkCmdSetDepthWriteEnableEXT",
+            "vkCmdSetDepthCompareOp",
+            "vkCmdSetDepthCompareOpEXT",
+            "vkCmdSetDepthBoundsTestEnable",
+            "vkCmdSetDepthBoundsTestEnableEXT",
+            "vkCmdSetStencilTestEnable",
+            "vkCmdSetStencilTestEnableEXT",
+            "vkCmdSetStencilOp",
+            "vkCmdSetStencilOpEXT",
+            "vkCmdSetRasterizerDiscardEnable",
+            "vkCmdSetRasterizerDiscardEnableEXT",
+            "vkCmdSetDepthBiasEnable",
+            "vkCmdSetDepthBiasEnableEXT",
+            "vkCmdSetPrimitiveRestartEnable",
+            "vkCmdSetPrimitiveRestartEnableEXT",
+        ] {
+            let with_nul: Vec<u8> = name.bytes().chain(std::iter::once(0)).collect();
+            assert!(lookup(&with_nul).is_some(),
+                "must resolve {name}");
+        }
+
+        // Each stub must accept null cmdbuf without panicking
+        // (matches the 1.0 cmd-stub forgiveness contract).
+        let f = lookup(b"vkCmdSetCullMode\0").unwrap();
+        let g: unsafe extern "C" fn(VkCommandBuffer, u32) =
+            unsafe { std::mem::transmute(f) };
+        unsafe { g(std::ptr::null_mut(), 1); }
+
+        let f = lookup(b"vkCmdSetStencilOp\0").unwrap();
+        let g: unsafe extern "C" fn(VkCommandBuffer, u32, u32, u32, u32, u32) =
+            unsafe { std::mem::transmute(f) };
+        unsafe { g(std::ptr::null_mut(), 1, 2, 3, 4, 5); }
     }
 
     #[test]
