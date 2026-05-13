@@ -571,6 +571,11 @@ const ATRIUM_PHYSICAL_DEVICE_ENTRY_POINTS: &[&str] = &[
     "vkEnumerateDeviceExtensionProperties",
     "vkEnumeratePhysicalDeviceGroups",
     "vkEnumeratePhysicalDeviceGroupsKHR",
+    "vkGetPhysicalDeviceSparseImageFormatProperties",
+    "vkGetPhysicalDeviceSparseImageFormatProperties2",
+    "vkGetPhysicalDeviceSparseImageFormatProperties2KHR",
+    "vkGetPhysicalDeviceToolProperties",
+    "vkGetPhysicalDeviceToolPropertiesEXT",
 ];
 
 /// `vk_icdGetPhysicalDeviceProcAddr` — ICD ABI v4+ fast-path for
@@ -652,6 +657,11 @@ const ATRIUM_INSTANCE_ONLY_ENTRY_POINTS: &[&str] = &[
     "vkGetPhysicalDeviceExternalSemaphorePropertiesKHR",
     "vkEnumeratePhysicalDeviceGroups",
     "vkEnumeratePhysicalDeviceGroupsKHR",
+    "vkGetPhysicalDeviceSparseImageFormatProperties",
+    "vkGetPhysicalDeviceSparseImageFormatProperties2",
+    "vkGetPhysicalDeviceSparseImageFormatProperties2KHR",
+    "vkGetPhysicalDeviceToolProperties",
+    "vkGetPhysicalDeviceToolPropertiesEXT",
     "vkCreateDebugUtilsMessengerEXT",
     "vkDestroyDebugUtilsMessengerEXT",
     "vkSubmitDebugUtilsMessageEXT",
@@ -1347,6 +1357,34 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkDevice, *const c_void, *mut VkQueue), FnVoidPtr,
             >(vkGetDeviceQueue2)),
+        // Sparse + tooling honest-zero stubs.
+        "vkGetImageSparseMemoryRequirements" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, u64, *mut u32, *mut c_void), FnVoidPtr,
+            >(vkGetImageSparseMemoryRequirements)),
+        "vkGetImageSparseMemoryRequirements2" |
+        "vkGetImageSparseMemoryRequirements2KHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, *const c_void, *mut u32, *mut c_void), FnVoidPtr,
+            >(vkGetImageSparseMemoryRequirements2)),
+        "vkGetPhysicalDeviceSparseImageFormatProperties" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkPhysicalDevice, ash::vk::Format, ash::vk::ImageType, u32, u32, u32, *mut u32, *mut c_void), FnVoidPtr,
+            >(vkGetPhysicalDeviceSparseImageFormatProperties)),
+        "vkGetPhysicalDeviceSparseImageFormatProperties2" |
+        "vkGetPhysicalDeviceSparseImageFormatProperties2KHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkPhysicalDevice, *const c_void, *mut u32, *mut c_void), FnVoidPtr,
+            >(vkGetPhysicalDeviceSparseImageFormatProperties2)),
+        "vkQueueBindSparse" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkQueue, u32, *const c_void, *mut c_void) -> VkResult, FnVoidPtr,
+            >(vkQueueBindSparse)),
+        "vkGetPhysicalDeviceToolProperties" |
+        "vkGetPhysicalDeviceToolPropertiesEXT" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkPhysicalDevice, *mut u32, *mut c_void) -> VkResult, FnVoidPtr,
+            >(vkGetPhysicalDeviceToolProperties)),
         // 1.2 indirect-count draws — forward to non-Count variants
         // with max_draw_count as the static count.
         "vkCmdDrawIndirectCount" |
@@ -5366,6 +5404,80 @@ pub unsafe extern "C" fn vkCmdPushDescriptorSetWithTemplate(
     _p_data:            *const c_void,
 ) {}
 
+// ── Sparse + tooling honest-zero stubs ──────────────────────────
+//
+// Sparse memory is a real feature on big-iron Vulkan; tier-1
+// doesn't support it. Apps probing for sparse caps should see
+// "zero requirements / not supported" without crashing. Tooling
+// info (1.3) lets apps enumerate active validation layers /
+// debug tools — we have none.
+
+#[no_mangle]
+pub unsafe extern "C" fn vkGetImageSparseMemoryRequirements(
+    _device:        VkDevice,
+    _image:         u64,
+    p_count:        *mut u32,
+    _p_requirements: *mut c_void,
+) {
+    if !p_count.is_null() { *p_count = 0; }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkGetImageSparseMemoryRequirements2(
+    _device:        VkDevice,
+    _p_info:        *const c_void,
+    p_count:        *mut u32,
+    _p_requirements: *mut c_void,
+) {
+    if !p_count.is_null() { *p_count = 0; }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkGetPhysicalDeviceSparseImageFormatProperties(
+    _physical_device: VkPhysicalDevice,
+    _format:          ash::vk::Format,
+    _ty:              ash::vk::ImageType,
+    _samples:         u32,
+    _usage:           u32,
+    _tiling:          u32,
+    p_count:          *mut u32,
+    _p_properties:    *mut c_void,
+) {
+    if !p_count.is_null() { *p_count = 0; }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkGetPhysicalDeviceSparseImageFormatProperties2(
+    _physical_device: VkPhysicalDevice,
+    _p_info:          *const c_void,
+    p_count:          *mut u32,
+    _p_properties:    *mut c_void,
+) {
+    if !p_count.is_null() { *p_count = 0; }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkQueueBindSparse(
+    _queue:        VkQueue,
+    _bind_info_count: u32,
+    _p_bind_info:  *const c_void,
+    _fence:        *mut c_void,
+) -> VkResult { VK_SUCCESS }
+
+/// `vkGetPhysicalDeviceToolProperties` — 1.3 mandatory. Reports
+/// no tools active (count=0); apps that probe for RenderDoc /
+/// validation-layer hooks via this entry see "no tools" and
+/// proceed normally.
+#[no_mangle]
+pub unsafe extern "C" fn vkGetPhysicalDeviceToolProperties(
+    _physical_device:  VkPhysicalDevice,
+    p_tool_count:      *mut u32,
+    _p_tool_properties: *mut c_void,
+) -> VkResult {
+    if !p_tool_count.is_null() { *p_tool_count = 0; }
+    VK_SUCCESS
+}
+
 // ── 1.3 private-data slots + 1.1 device-group cmds ──────────────
 //
 // Vulkan 1.3 mandatory: VkPrivateDataSlot lets apps (and
@@ -7388,6 +7500,45 @@ mod tests {
         assert!(props.optimal_tiling_features.is_empty());
         assert!(props.linear_tiling_features.is_empty());
         assert!(props.buffer_features.is_empty());
+    }
+
+    #[test]
+    fn sparse_and_tooling_zero_stubs() {
+        for name in [
+            b"vkGetImageSparseMemoryRequirements\0".as_slice(),
+            b"vkGetImageSparseMemoryRequirements2\0".as_slice(),
+            b"vkGetImageSparseMemoryRequirements2KHR\0".as_slice(),
+            b"vkGetPhysicalDeviceSparseImageFormatProperties\0".as_slice(),
+            b"vkGetPhysicalDeviceSparseImageFormatProperties2\0".as_slice(),
+            b"vkGetPhysicalDeviceSparseImageFormatProperties2KHR\0".as_slice(),
+            b"vkQueueBindSparse\0".as_slice(),
+            b"vkGetPhysicalDeviceToolProperties\0".as_slice(),
+            b"vkGetPhysicalDeviceToolPropertiesEXT\0".as_slice(),
+        ] {
+            assert!(lookup(name).is_some(),
+                "must resolve {}",
+                std::str::from_utf8(&name[..name.len()-1]).unwrap());
+        }
+
+        // ToolProperties size-query: must write 0.
+        let f = lookup(b"vkGetPhysicalDeviceToolProperties\0").unwrap();
+        let g: unsafe extern "C" fn(VkPhysicalDevice, *mut u32, *mut c_void) -> VkResult =
+            unsafe { std::mem::transmute(f) };
+        let mut n: u32 = 0xdead;
+        let r = unsafe { g(std::ptr::null_mut(), &mut n, std::ptr::null_mut()) };
+        assert_eq!(r, VK_SUCCESS);
+        assert_eq!(n, 0);
+
+        // SparseImageFormatProperties size-query: must write 0.
+        let f = lookup(b"vkGetPhysicalDeviceSparseImageFormatProperties\0").unwrap();
+        let g: unsafe extern "C" fn(VkPhysicalDevice, ash::vk::Format, ash::vk::ImageType, u32, u32, u32, *mut u32, *mut c_void) =
+            unsafe { std::mem::transmute(f) };
+        let mut n: u32 = 0xdead;
+        unsafe { g(std::ptr::null_mut(),
+                   ash::vk::Format::R8G8B8A8_UNORM,
+                   ash::vk::ImageType::TYPE_2D,
+                   1, 0x10, 0, &mut n, std::ptr::null_mut()); }
+        assert_eq!(n, 0);
     }
 
     #[test]
