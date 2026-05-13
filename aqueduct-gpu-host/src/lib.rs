@@ -71,9 +71,11 @@ pub mod shader_cache;
 pub mod shader_inspect;
 pub mod shader_validator;
 pub mod software;
+pub mod tier2_backend;
 pub mod tier2_registry;
 
 pub use backend::{Backend, SoftwareBackend, StubBackend};
+pub use tier2_backend::Tier2Backend;
 pub use tier2_registry::{Tier2Registry, Tier2ShaderId};
 pub use moltenvk::{MoltenVkBackend, MoltenVkError};
 pub use listener::Listener;
