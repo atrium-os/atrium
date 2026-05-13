@@ -448,6 +448,121 @@ fn translate_inst(
             Ok(())
         }
 
+        // OpAccessChain / OpInBoundsAccessChain: resolve a
+        // chain of constant indices to a single byte offset
+        // per constraint B5. The result is a Pointer Value
+        // carrying the storage class + leaf pointee type.
+        SpvOp::AccessChain | SpvOp::InBoundsAccessChain => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed(
+                    "AccessChain without result id".to_string()))?;
+            let result_type_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed(
+                    "AccessChain without result type".to_string()))?;
+            let result_ty = types.get(result_type_id)?.clone();
+
+            let base_id = expect_id(&spv_inst.operands, 0)?;
+            let base = resolve_variable(
+                base_id, types, iface, id_map, next_value_id,
+            )?.ok_or_else(|| FrontendError::Unsupported(format!(
+                "AccessChain base id {base_id} is not a Variable",
+            )))?;
+
+            // Recover the variable's pointee type id from
+            // iface.variables so we can walk struct members
+            // for offset resolution.
+            let (_storage, mut current_pointee_id) = iface.variables
+                .get(&base_id)
+                .copied()
+                .ok_or_else(|| FrontendError::Malformed(format!(
+                    "AccessChain base var {base_id} not in iface.variables",
+                )))?;
+
+            let mut byte_offset: u32 = 0;
+            for op in spv_inst.operands.iter().skip(1) {
+                let idx_id = match op {
+                    Operand::IdRef(id) => *id,
+                    other => return Err(FrontendError::Malformed(format!(
+                        "AccessChain expected IdRef index, got {other:?}",
+                    ))),
+                };
+                let idx_const = constants.get(idx_id).ok_or_else(||
+                    FrontendError::Unsupported(format!(
+                        "AccessChain index id {idx_id} is not a constant \
+                         (constraint B5 requires constant indices)",
+                    )))?;
+                let idx_val: u32 = match &idx_const.kind {
+                    ConstantKind::Scalar(Op::ConstInt { value, .. }) =>
+                        *value as u32,
+                    other => return Err(FrontendError::Unsupported(format!(
+                        "AccessChain index must be a scalar int constant, got {other:?}",
+                    ))),
+                };
+
+                // Step through the pointee. If it's a
+                // struct we know about, descend via the
+                // recorded layout; otherwise we don't
+                // support deeper chains yet.
+                if let Some(layout) = iface.struct_layouts.get(&current_pointee_id) {
+                    let member = layout.get(idx_val as usize).ok_or_else(||
+                        FrontendError::Malformed(format!(
+                            "AccessChain index {idx_val} out of range for struct \
+                             with {} members",
+                            layout.len(),
+                        )))?;
+                    byte_offset = byte_offset.saturating_add(member.byte_offset);
+                    current_pointee_id = member.type_id;
+                } else {
+                    return Err(FrontendError::Unsupported(format!(
+                        "AccessChain step through non-struct pointee \
+                         (type id {current_pointee_id}) not supported yet",
+                    )));
+                }
+            }
+
+            let result = fresh_value(result_ty, next_value_id);
+            id_map.insert(result_id, result.clone());
+            insts.push(Inst {
+                op: Op::AccessChain { base, byte_offset },
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
+
+        // OpLoad: load a leaf value through a pointer. The
+        // pointer is either a bare Variable (offset 0) or an
+        // AccessChain result.
+        SpvOp::Load => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed(
+                    "Load without result id".to_string()))?;
+            let result_type_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed(
+                    "Load without result type".to_string()))?;
+            let result_ty = types.get(result_type_id)?.clone();
+            let ptr_id = expect_id(&spv_inst.operands, 0)?;
+            // Try variable first; fall back to id_map (set
+            // by a prior AccessChain).
+            let ptr_value = match resolve_variable(
+                ptr_id, types, iface, id_map, next_value_id,
+            )? {
+                Some(v) => v,
+                None => id_map.get(&ptr_id).cloned().ok_or_else(||
+                    FrontendError::Malformed(format!(
+                        "Load pointer id {ptr_id} not a variable or AccessChain result",
+                    )))?,
+            };
+            let result = fresh_value(result_ty, next_value_id);
+            id_map.insert(result_id, result.clone());
+            insts.push(Inst {
+                op: Op::Load(ptr_value),
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
+
         other => Err(FrontendError::Unsupported(format!(
             "opcode {other:?} not supported in phase 1 v3",
         ))),

@@ -250,6 +250,7 @@ fn emit_function(
             params: builder.func.dfg.block_params(entry).to_vec(),
             scalars: HashMap::new(),
             vectors: HashMap::new(),
+            pointers: HashMap::new(),
         };
 
         // Single-block IR per phase 1 v1.
@@ -287,6 +288,12 @@ struct FnTranslator {
     params: Vec<ClifValue>,
     scalars: HashMap<ValueId, ClifValue>,
     vectors: HashMap<ValueId, Vec<ClifValue>>,
+    /// IR Value (Pointer-typed) → (base Cranelift pointer
+    /// value from `params`, byte offset). Populated by
+    /// `Op::AccessChain` and on first reference to a bare
+    /// Variable. `Op::Load` / `Op::Store` consult this map
+    /// to find what `mem.load`/`mem.store` should target.
+    pointers: HashMap<ValueId, (ClifValue, i32)>,
 }
 
 impl FnTranslator {
@@ -347,6 +354,68 @@ impl FnTranslator {
                 for (i, lane) in lanes.iter().enumerate() {
                     let offset = (i as i32) * (bytes_per_lane as i32);
                     builder.ins().store(MemFlags::new(), *lane, ptr_param, offset);
+                }
+                Ok(())
+            }
+            // OpAccessChain: produce a (param, offset)
+            // pointer repr by adding the IR's resolved
+            // byte_offset to the base pointer's existing
+            // offset. The frontend has already resolved all
+            // chain indices to a single byte_offset
+            // (constraint B5).
+            Op::AccessChain { base, byte_offset } => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "AccessChain without result Value".to_string()))?;
+                let (param, base_off) = self.resolve_or_make_pointer(base)?;
+                let new_off = base_off.saturating_add(*byte_offset as i32);
+                self.pointers.insert(result.id, (param, new_off));
+                Ok(())
+            }
+            // OpLoad: read a leaf value through a pointer.
+            // The result type is the Pointer's pointee
+            // recorded on the result Value.
+            Op::Load(ptr) => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "Load without result Value".to_string()))?;
+                let (param, off) = self.resolve_or_make_pointer(ptr)?;
+                let pointee = match &ptr.ty {
+                    Type::Pointer(_, inner) => (**inner).clone(),
+                    other => return Err(BackendError::Unsupported(format!(
+                        "Op::Load pointer Value is not Pointer-typed: {other:?}",
+                    ))),
+                };
+                match &pointee {
+                    Type::F32 => {
+                        let v = builder.ins().load(
+                            clif_types::F32, MemFlags::new(), param, off);
+                        self.scalars.insert(result.id, v);
+                    }
+                    Type::I32 | Type::U32 | Type::Bool => {
+                        let v = builder.ins().load(
+                            clif_types::I32, MemFlags::new(), param, off);
+                        self.scalars.insert(result.id, v);
+                    }
+                    Type::Vec2(_) | Type::Vec3(_) | Type::Vec4(_) => {
+                        let (lane_ty, lane_count) = match &pointee {
+                            Type::Vec2(_) => (clif_types::F32, 2usize),
+                            Type::Vec3(_) => (clif_types::F32, 3usize),
+                            Type::Vec4(_) => (clif_types::F32, 4usize),
+                            _ => unreachable!(),
+                        };
+                        let mut lanes = Vec::with_capacity(lane_count);
+                        for i in 0..lane_count {
+                            let lane_off = off.saturating_add((i * 4) as i32);
+                            let v = builder.ins().load(
+                                lane_ty, MemFlags::new(), param, lane_off);
+                            lanes.push(v);
+                        }
+                        self.vectors.insert(result.id, lanes);
+                    }
+                    other => return Err(BackendError::Unsupported(format!(
+                        "Op::Load of pointee type {other:?} not supported",
+                    ))),
                 }
                 Ok(())
             }
@@ -698,6 +767,23 @@ impl FnTranslator {
         let v = emit(builder, av);
         self.scalars.insert(result.id, v);
         Ok(())
+    }
+
+    /// Look up or materialise the (base param, byte
+    /// offset) repr for a pointer-typed IR Value.
+    ///
+    /// If the Value already has a repr in `self.pointers`
+    /// (set by a prior OpAccessChain), return it.
+    /// Otherwise the Value is a bare Variable: derive the
+    /// param from its storage class and seed offset=0.
+    fn resolve_or_make_pointer(
+        &mut self,
+        v: &atrium_spv_ir::Value,
+    ) -> Result<(ClifValue, i32), BackendError> {
+        if let Some(p) = self.pointers.get(&v.id) { return Ok(*p); }
+        let param = self.resolve_pointer_param(&v.ty)?;
+        self.pointers.insert(v.id, (param, 0));
+        Ok((param, 0))
     }
 
     /// Map a storage-class pointer type to its Cranelift
