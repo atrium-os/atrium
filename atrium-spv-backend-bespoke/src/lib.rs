@@ -499,6 +499,54 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
             Op::FOrdGe(a_v, b_v) => emit_fcmp_to_bool(
                 &mut a, &scalars, &mut bools, &mut next_bool_w,
                 inst, a_v, b_v, asm::Cond::Ge)?,
+            // OpDot: scalar = Σ a_i * b_i. Lowers to one
+            // fmul_s for the first lane + (fmul_s + fadd_s)
+            // per additional lane.
+            Op::Dot(l, r) => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal("Dot without result".into()))?;
+                let l_lanes = vectors.get(&l.id).cloned().ok_or_else(||
+                    BackendError::Unsupported(format!(
+                        "Dot lhs {:?} not a vec", l.id)))?;
+                let r_lanes = vectors.get(&r.id).cloned().ok_or_else(||
+                    BackendError::Unsupported(format!(
+                        "Dot rhs {:?} not a vec", r.id)))?;
+                if l_lanes.len() != r_lanes.len() {
+                    return Err(BackendError::Unsupported(format!(
+                        "Dot mismatched lanes: {} vs {}",
+                        l_lanes.len(), r_lanes.len())));
+                }
+                // Accumulator V-reg owned by the final result id.
+                let acc = alloc_vreg(&mut free_pool, &mut owners, result.id)?;
+                // First lane: acc = l[0] * r[0].
+                let l0 = *scalars.get(&l_lanes[0].id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "Dot lane 0 lhs {:?} missing", l_lanes[0].id)))?;
+                let r0 = *scalars.get(&r_lanes[0].id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "Dot lane 0 rhs {:?} missing", r_lanes[0].id)))?;
+                a.emit(asm::fmul_s(acc, l0, r0));
+                // Remaining lanes: tmp = l[i] * r[i]; acc += tmp.
+                for i in 1..l_lanes.len() {
+                    let li = *scalars.get(&l_lanes[i].id).ok_or_else(||
+                        BackendError::Internal(format!(
+                            "Dot lane {i} lhs missing")))?;
+                    let ri = *scalars.get(&r_lanes[i].id).ok_or_else(||
+                        BackendError::Internal(format!(
+                            "Dot lane {i} rhs missing")))?;
+                    let tmp_synth = ValueId(next_synth_id);
+                    next_synth_id += 1;
+                    let tmp = alloc_vreg(&mut free_pool, &mut owners, tmp_synth)?;
+                    a.emit(asm::fmul_s(tmp, li, ri));
+                    a.emit(asm::fadd_s(acc, acc, tmp));
+                    // tmp dies immediately; manually return
+                    // its V-reg to the pool to avoid burning
+                    // 3 regs for a 4-lane Dot.
+                    free_pool.push(tmp.0);
+                    owners.remove(&tmp.0);
+                }
+                scalars.insert(result.id, acc);
+            }
             Op::FAdd(a_v, b_v) => emit_fp_binop_poly(
                 &mut a, &mut scalars, &mut vectors,
                 &mut free_pool, &mut owners, &mut next_synth_id,
@@ -1019,6 +1067,15 @@ fn compute_last_use_flat(insts: &[&atrium_spv_ir::Inst]) -> HashMap<ValueId, usi
                 }
             }
             Op::FNeg(s) => mark(s.id),
+            Op::Dot(l, r) => {
+                mark(l.id); mark(r.id);
+                if let Some(lanes) = vec_lanes.get(&l.id).cloned() {
+                    for lid in &lanes { mark(*lid); }
+                }
+                if let Some(lanes) = vec_lanes.get(&r.id).cloned() {
+                    for lid in &lanes { mark(*lid); }
+                }
+            }
             Op::FOrdEq(l, r) | Op::FOrdNe(l, r)
             | Op::FOrdLt(l, r) | Op::FOrdLe(l, r)
             | Op::FOrdGt(l, r) | Op::FOrdGe(l, r) => {
