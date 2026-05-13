@@ -18,6 +18,7 @@ use crate::resources::{
     ResourceTable, SamplerRecord, ShaderRecord,
 };
 use crate::shader_cache::{CacheKey, LookupResult, ShaderCache};
+use crate::tier2_registry::Tier2Registry;
 
 /// One connection's worth of state. Constructed by the listener when
 /// a guest connects.
@@ -38,6 +39,14 @@ pub struct Session {
     /// Compiler-version tag for cache keys. Currently 0; bump in
     /// lockstep with backend-shader-translator changes.
     compiler_version: u32,
+    /// Optional Tier-2 software-shader registry. When attached,
+    /// every successful SPIR-V upload also gets compiled through
+    /// atrium-spv-loader so subsequent pipeline + draw ops can
+    /// invoke the resulting `atrium_fs_main` / `atrium_vs_main`
+    /// function pointer. Tier-2 failures are non-fatal at
+    /// upload time — the protocol-level upload still succeeds and
+    /// the ShaderRecord just records `tier2_id = None`.
+    tier2_registry: Option<Arc<Tier2Registry>>,
 }
 
 impl Session {
@@ -51,6 +60,7 @@ impl Session {
             last_timeline: 0,
             shader_cache: None,
             compiler_version: 0,
+            tier2_registry: None,
         }
     }
 
@@ -59,6 +69,14 @@ impl Session {
     /// with one.
     pub fn set_shader_cache(&mut self, cache: Arc<ShaderCache>) {
         self.shader_cache = Some(cache);
+    }
+
+    /// Attach a process-wide Tier-2 software-shader registry.
+    /// Every successful SPIR-V upload thereafter will also be
+    /// compiled through atrium-spv-loader; the registry id lands
+    /// on the [`ShaderRecord`] for downstream lookup.
+    pub fn set_tier2_registry(&mut self, registry: Arc<Tier2Registry>) {
+        self.tier2_registry = Some(registry);
     }
 
     /// Run the dispatch loop until the client disconnects or an
@@ -297,6 +315,14 @@ impl Session {
                         );
                         self.table.insert_shader(id, ShaderRecord {
                             bytecode_hash: req.bytecode_hash,
+                            // Cache-hit path doesn't see the
+                            // raw SPIR-V bytes; Tier-2 compile
+                            // requires UPLOAD to seed it.
+                            // Future: extend the cache to
+                            // record the Tier2 .so path too,
+                            // so a RESOLVE hit can fast-path
+                            // into dlopen without recompile.
+                            tier2_id: None,
                         });
                         (ShaderResolveStatus::Hit, Some(id))
                     }
@@ -355,12 +381,35 @@ impl Session {
             }
         }
 
+        // Tier-2 compile path. If a Tier2Registry is attached and
+        // this is SPIR-V, kick off (or hit) the atrium-spv-compile
+        // pipeline. Failures are non-fatal: log + record
+        // tier2_id=None. This means a client can mix Tier-2-
+        // capable shaders with shaders we can't AOT compile yet
+        // (vec3 perf paths, uncommon opcodes, etc.) without
+        // breaking the upload contract.
+        let tier2_id = if matches!(req.kind, ShaderKind::SpirV) {
+            match &self.tier2_registry {
+                Some(reg) => match reg.register(&req.bytecode) {
+                    Ok(id) => Some(id),
+                    Err(e) => {
+                        log::warn!("Tier-2 compile failed (shader still accepted): {e}");
+                        None
+                    }
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
+
         let shader_id = aqueduct_gpu::ids::ResourceId::new(
             aqueduct_gpu::ids::IdNamespace::IcdRuntime,
             (req.bytecode_hash[0] as u32) << 16 | (req.bytecode_hash[1] as u32) << 8 | 1,
         );
         self.table.insert_shader(shader_id, ShaderRecord {
             bytecode_hash: req.bytecode_hash,
+            tier2_id,
         });
         let resp = ShaderUploadResponse {
             bytecode_hash: req.bytecode_hash,

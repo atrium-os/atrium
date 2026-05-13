@@ -18,6 +18,7 @@ use aqueduct::Connection;
 use crate::backend::Backend;
 use crate::session::Session;
 use crate::shader_cache::ShaderCache;
+use crate::tier2_registry::Tier2Registry;
 
 /// The host endpoint's accept loop.
 pub struct Listener {
@@ -28,6 +29,10 @@ pub struct Listener {
     /// resolves always miss and uploads aren't cached (legacy
     /// behaviour kept for tests that don't need warm-path).
     shader_cache: Option<Arc<ShaderCache>>,
+    /// Process-wide Tier-2 software-shader registry shared across
+    /// sessions. `None` means uploads skip the atrium-spv-compile
+    /// pipeline. Tier-2 failures are non-fatal at the wire level.
+    tier2_registry: Option<Arc<Tier2Registry>>,
 }
 
 impl Listener {
@@ -40,7 +45,11 @@ impl Listener {
         let listener = UnixListener::bind(&socket_path)
             .with_context(|| format!("bind {}", socket_path.display()))?;
         log::info!("listening on {}", socket_path.display());
-        Ok(Self { socket_path, listener, backend, shader_cache: None })
+        Ok(Self {
+            socket_path, listener, backend,
+            shader_cache: None,
+            tier2_registry: None,
+        })
     }
 
     /// Attach a shader cache for the warm path. Sessions will
@@ -49,6 +58,14 @@ impl Listener {
     /// style — call once before `accept_loop`.
     pub fn with_shader_cache(mut self, cache: Arc<ShaderCache>) -> Self {
         self.shader_cache = Some(cache);
+        self
+    }
+
+    /// Attach a Tier-2 software-shader registry. Sessions will
+    /// route every successful SPIR-V upload through it for
+    /// AOT compilation into a dlopened .so. Builder-style.
+    pub fn with_tier2_registry(mut self, reg: Arc<Tier2Registry>) -> Self {
+        self.tier2_registry = Some(reg);
         self
     }
 
@@ -69,12 +86,14 @@ impl Listener {
                         .context("wrap accepted stream")?;
                     let backend = Arc::clone(&self.backend);
                     let cache = self.shader_cache.clone();
+                    let tier2 = self.tier2_registry.clone();
                     log::info!("new client connection");
                     thread::Builder::new()
                         .name("aqueduct-gpu-session".to_string())
                         .spawn(move || {
                             let mut sess = Session::new(conn, backend);
                             if let Some(c) = cache { sess.set_shader_cache(c); }
+                            if let Some(r) = tier2 { sess.set_tier2_registry(r); }
                             if let Err(e) = sess.run() {
                                 log::warn!("session ended with error: {e}");
                             } else {

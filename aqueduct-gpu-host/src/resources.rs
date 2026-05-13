@@ -93,6 +93,16 @@ pub struct FenceRecord {
 pub struct ShaderRecord {
     /// SHA-256 of the source bytecode.
     pub bytecode_hash: [u8; 32],
+    /// If the session has a `Tier2Registry` attached and
+    /// this shader compiled successfully through the
+    /// atrium-spv pipeline, the registry id that
+    /// downstream pipeline + draw ops use to look up the
+    /// compiled `atrium_fs_main` / `atrium_vs_main`
+    /// function pointer. None for sessions without
+    /// Tier-2 enabled or for shaders that failed Tier-2
+    /// compile (the upload still succeeds; only Tier-2
+    /// execution is unavailable).
+    pub tier2_id: Option<crate::tier2_registry::Tier2ShaderId>,
 }
 
 /// Pipeline book-keeping.
