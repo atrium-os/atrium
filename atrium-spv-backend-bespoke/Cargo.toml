@@ -1,0 +1,21 @@
+[package]
+name        = "atrium-spv-backend-bespoke"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "Bespoke ARM64 backend for tier-2 software Vulkan. Emits AArch64 machine code directly via pptk-codegen-arm64::asm — bypassing Cranelift to claw back the perf the user explicitly committed to early on (target: ≥ 90% of bespoke-quality scalar code rather than Cranelift's ~70% with its general-purpose regalloc). Phase 3 skeleton: single-pass ISel + linear-scan RA, no peephole pass yet. Same public CompileOutput signature as atrium-spv-backend-cranelift so atrium-spv-compile + the differential harness can swap backends transparently."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+atrium-spv-ir       = { path = "../atrium-spv-ir" }
+atrium-spv-pcmap    = { path = "../atrium-spv-pcmap" }
+pptk-codegen-arm64  = { path = "../../pptk/crates/pptk-codegen-arm64" }
+object              = { version = "0.36", features = ["write"] }
+thiserror           = "1"
+
+[dev-dependencies]
+atrium-spv-frontend = { path = "../atrium-spv-frontend" }
+rspirv              = "0.13"
