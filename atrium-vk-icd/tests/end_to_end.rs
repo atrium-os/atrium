@@ -592,6 +592,77 @@ fn submit_flushes_recorded_frame_to_aqueduct_backend() {
 }
 
 #[test]
+fn memory_requirements2_routes_through_1_0_path() {
+    // Drive vkGetImageMemoryRequirements2 with a real
+    // VkImageMemoryRequirementsInfo2 + VkMemoryRequirements2 round
+    // trip. Verify the inner block (at offset 16 of the output
+    // struct) matches what the 1.0 entry point returns.
+    use atrium_vk_icd::{
+        vkCreateDevice, vkCreateImage, vkDestroyDevice, vkDestroyImage,
+        vkGetImageMemoryRequirements, vkGetImageMemoryRequirements2,
+    };
+
+    let sock = tmp_socket("memreq2");
+    let sw_backend = Arc::new(SoftwareBackend::new());
+    let backend_for_listener: Arc<dyn Backend> = sw_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap();
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+    let _env = EnvLock::set(&sock);
+
+    type VkDevice = *mut std::ffi::c_void;
+
+    let mut instance: VkInstance = std::ptr::null_mut();
+    unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
+    let mut devices: [VkPhysicalDevice; 1] = [std::ptr::null_mut(); 1];
+    let mut cap: u32 = 1;
+    unsafe { vkEnumeratePhysicalDevices(instance, &mut cap, devices.as_mut_ptr()); }
+    let mut device: VkDevice = std::ptr::null_mut();
+    unsafe { vkCreateDevice(devices[0], std::ptr::null(), std::ptr::null(), &mut device); }
+
+    let mut img_info = [0u8; 88];
+    img_info[0..4].copy_from_slice(&14u32.to_le_bytes());
+    img_info[24..28].copy_from_slice(&37u32.to_le_bytes()); // R8G8B8A8_UNORM
+    img_info[28..32].copy_from_slice(&64u32.to_le_bytes());
+    img_info[32..36].copy_from_slice(&64u32.to_le_bytes());
+    img_info[36..40].copy_from_slice(&1u32.to_le_bytes());
+    img_info[40..44].copy_from_slice(&1u32.to_le_bytes());
+    img_info[44..48].copy_from_slice(&1u32.to_le_bytes());
+    img_info[56..60].copy_from_slice(&0x10u32.to_le_bytes());
+    let mut image: u64 = 0;
+    unsafe { vkCreateImage(device, img_info.as_ptr() as *const _, std::ptr::null(), &mut image); }
+
+    // Baseline via 1.0 entry.
+    let mut req10 = ash::vk::MemoryRequirements::default();
+    unsafe { vkGetImageMemoryRequirements(device, image, &mut req10); }
+
+    // *2 round trip.
+    let mut info2 = [0u8; 24];
+    info2[0..4].copy_from_slice(&1_000_146_001u32.to_le_bytes()); // VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2
+    info2[16..24].copy_from_slice(&image.to_le_bytes());
+    let mut out = [0u8; 16 + 24]; // header + inner
+    out[0..4].copy_from_slice(&1_000_146_003u32.to_le_bytes()); // VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2
+    unsafe {
+        vkGetImageMemoryRequirements2(
+            device, info2.as_ptr() as *const _, out.as_mut_ptr() as *mut _,
+        );
+    }
+    let read_u64 = |off: usize| u64::from_le_bytes(out[off..off+8].try_into().unwrap());
+    let read_u32 = |off: usize| u32::from_le_bytes(out[off..off+4].try_into().unwrap());
+    assert_eq!(read_u64(16), req10.size, "size matches 1.0");
+    assert_eq!(read_u64(24), req10.alignment, "alignment matches 1.0");
+    assert_eq!(read_u32(32), req10.memory_type_bits, "memTypeBits matches 1.0");
+    // Caller-supplied header sType preserved.
+    assert_eq!(read_u32(0), 1_000_146_003);
+
+    unsafe { vkDestroyImage(device, image, std::ptr::null()); }
+    unsafe { vkDestroyDevice(device, std::ptr::null()); }
+    unsafe { vkDestroyInstance(instance, std::ptr::null()); }
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[test]
 fn image_subresource_layout_reports_tier1_linear_layout() {
     // Create a 32x16 R8G8B8A8_UNORM image and ask for its
     // subresource layout. Tier-1 is row-major BGRA with no

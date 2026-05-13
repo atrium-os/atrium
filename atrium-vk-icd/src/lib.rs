@@ -1113,6 +1113,16 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkDevice, u64, *mut u64) -> VkResult, FnVoidPtr,
             >(vkGetSemaphoreCounterValue)),
+        "vkGetBufferMemoryRequirements2" |
+        "vkGetBufferMemoryRequirements2KHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, *const c_void, *mut c_void), FnVoidPtr,
+            >(vkGetBufferMemoryRequirements2)),
+        "vkGetImageMemoryRequirements2" |
+        "vkGetImageMemoryRequirements2KHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkDevice, *const c_void, *mut c_void), FnVoidPtr,
+            >(vkGetImageMemoryRequirements2)),
         "vkDeviceWaitIdle" =>
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkDevice) -> VkResult, FnVoidPtr,
@@ -4569,6 +4579,68 @@ pub unsafe extern "C" fn vkResetCommandBuffer(
     cb.state = CmdBufferState::Initial;
     cb.frame = aqueduct_gpu::frame::FrameBuilder::new(ATRIUM_CMDBUF_INITIAL_CAPACITY);
     VK_SUCCESS
+}
+
+/// `vkGetBufferMemoryRequirements2` — Vulkan 1.1 pNext-chain
+/// variant. Parses VkBufferMemoryRequirementsInfo2 (16-byte
+/// header + buffer u64 at offset 16) and fills VkMemoryRequirements2
+/// (16-byte header + inner VkMemoryRequirements at offset 16).
+///
+/// We compute requirements into a stack-aligned MemoryRequirements
+/// and then copy it byte-wise into the caller's output buffer to
+/// avoid an aligned-write panic when the caller's struct sits
+/// at an address that's well-aligned for VkMemoryRequirements2
+/// (8 bytes) but not for the inner VkMemoryRequirements at
+/// offset 16 — both happen to be 8-aligned, but tests sometimes
+/// hand us a raw `Vec<u8>` whose data() isn't 8-aligned.
+#[no_mangle]
+pub unsafe extern "C" fn vkGetBufferMemoryRequirements2(
+    device:           VkDevice,
+    p_info:           *const c_void,
+    p_requirements:   *mut c_void,
+) {
+    if p_info.is_null() || p_requirements.is_null() { return; }
+    let info = p_info as *const u8;
+    let info_p_next = std::ptr::read_unaligned(info.add(8) as *const *mut c_void);
+    let buffer = std::ptr::read_unaligned(info.add(16) as *const u64);
+    let _ = walk_p_next_chain(info_p_next);
+
+    let mut tmp = ash::vk::MemoryRequirements::default();
+    vkGetBufferMemoryRequirements(device, buffer, &mut tmp);
+    let out = p_requirements as *mut u8;
+    let out_p_next = std::ptr::read_unaligned(out.add(8) as *const *mut c_void);
+    std::ptr::copy_nonoverlapping(
+        &tmp as *const _ as *const u8,
+        out.add(16),
+        std::mem::size_of::<ash::vk::MemoryRequirements>(),
+    );
+    let _ = walk_p_next_chain(out_p_next);
+}
+
+/// `vkGetImageMemoryRequirements2` — Vulkan 1.1 pNext-chain
+/// variant. Same shape as the buffer variant.
+#[no_mangle]
+pub unsafe extern "C" fn vkGetImageMemoryRequirements2(
+    device:           VkDevice,
+    p_info:           *const c_void,
+    p_requirements:   *mut c_void,
+) {
+    if p_info.is_null() || p_requirements.is_null() { return; }
+    let info = p_info as *const u8;
+    let info_p_next = std::ptr::read_unaligned(info.add(8) as *const *mut c_void);
+    let image = std::ptr::read_unaligned(info.add(16) as *const u64);
+    let _ = walk_p_next_chain(info_p_next);
+
+    let mut tmp = ash::vk::MemoryRequirements::default();
+    vkGetImageMemoryRequirements(device, image, &mut tmp);
+    let out = p_requirements as *mut u8;
+    let out_p_next = std::ptr::read_unaligned(out.add(8) as *const *mut c_void);
+    std::ptr::copy_nonoverlapping(
+        &tmp as *const _ as *const u8,
+        out.add(16),
+        std::mem::size_of::<ash::vk::MemoryRequirements>(),
+    );
+    let _ = walk_p_next_chain(out_p_next);
 }
 
 /// `vkFreeDescriptorSets` — release descriptor sets back to the
