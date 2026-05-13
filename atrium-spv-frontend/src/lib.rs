@@ -59,9 +59,11 @@ pub mod constants;
 pub mod error;
 pub mod functions;
 pub mod interface;
+pub mod offsets;
 pub mod types;
 
 pub use error::FrontendError;
+pub use offsets::OffsetTable;
 
 use atrium_spv_ir::Module;
 use rspirv::dr;
@@ -73,6 +75,10 @@ use rspirv::dr;
 /// invariants along the way; rejects unstructured CFGs
 /// per constraint A1.
 pub fn translate(spirv: &[u8]) -> Result<Module, FrontendError> {
+    // ── 0. Build the byte-offset table for source-position
+    //       preservation through the IR (constraint A2).
+    let offsets = OffsetTable::build(spirv)?;
+
     // ── 1. Parse via rspirv. ────────────────────────────────
     let mut loader = dr::Loader::new();
     rspirv::binary::parse_bytes(spirv, &mut loader)
@@ -101,12 +107,51 @@ pub fn translate(spirv: &[u8]) -> Result<Module, FrontendError> {
         &rspirv_module, &type_ctx,
     )?;
 
+    // Compute the OffsetTable index of each function's
+    // OpFunction instruction. Module instructions appear
+    // in this source-byte order:
+    //   capabilities, extensions, ext_inst_imports,
+    //   memory_model, entry_points, execution_modes,
+    //   debug_string_source, debug_names,
+    //   debug_module_processed, annotations,
+    //   types_global_values,
+    //   then each function (def, parameters, blocks
+    //     (label + instructions), end).
+    let pre_function_count =
+          rspirv_module.capabilities.len()
+        + rspirv_module.extensions.len()
+        + rspirv_module.ext_inst_imports.len()
+        + rspirv_module.memory_model.iter().count()
+        + rspirv_module.entry_points.len()
+        + rspirv_module.execution_modes.len()
+        + rspirv_module.debug_string_source.len()
+        + rspirv_module.debug_names.len()
+        + rspirv_module.debug_module_processed.len()
+        + rspirv_module.annotations.len()
+        + rspirv_module.types_global_values.len();
+    let mut function_start_indices = Vec::with_capacity(rspirv_module.functions.len());
+    let mut running = pre_function_count;
+    for func in &rspirv_module.functions {
+        function_start_indices.push(running);
+        // OpFunction itself + parameters + each block's
+        // (OpLabel + instructions) + OpFunctionEnd.
+        running += 1; // OpFunction
+        running += func.parameters.len();
+        for block in &func.blocks {
+            running += block.label.iter().count();
+            running += block.instructions.len();
+        }
+        running += func.end.iter().count();
+    }
+
     // ── 4. Translate functions ──────────────────────────────
     let functions = functions::translate_all(
         &rspirv_module,
         &type_ctx,
         &const_ctx,
         &iface_ctx,
+        &offsets,
+        &function_start_indices,
     )?;
 
     // ── 5. Assemble the Module ──────────────────────────────

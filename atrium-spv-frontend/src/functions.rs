@@ -17,6 +17,7 @@ use crate::cfg;
 use crate::constants::{ConstantContext, ConstantKind};
 use crate::error::FrontendError;
 use crate::interface::InterfaceContext;
+use crate::offsets::OffsetTable;
 use crate::types::TypeContext;
 
 /// Translate every function in the module.
@@ -25,15 +26,22 @@ use crate::types::TypeContext;
 /// `Vec`. Order matches the SPIR-V module's function order
 /// (so an entry-point's `function_index` is a direct lookup
 /// against this Vec).
+///
+/// `offsets` + `function_start_indices` thread the source-
+/// SPIR-V byte offset of each instruction through to the
+/// IR via Inst::source_spirv_offset (constraint A2).
 pub fn translate_all(
     module: &Module,
     types: &TypeContext,
     constants: &ConstantContext,
     iface: &InterfaceContext,
+    offsets: &OffsetTable,
+    function_start_indices: &[usize],
 ) -> Result<Vec<Function>, FrontendError> {
     let mut out = Vec::with_capacity(module.functions.len());
-    for func in &module.functions {
-        let translated = translate_one(func, types, constants, iface)?;
+    for (idx, func) in module.functions.iter().enumerate() {
+        let start = function_start_indices.get(idx).copied().unwrap_or(0);
+        let translated = translate_one(func, types, constants, iface, offsets, start)?;
         out.push(translated);
     }
     // Patch entry_point.function_index now that we've laid
@@ -60,6 +68,8 @@ fn translate_one(
     types: &TypeContext,
     constants: &ConstantContext,
     iface: &InterfaceContext,
+    offsets: &OffsetTable,
+    fn_start_index: usize,
 ) -> Result<Function, FrontendError> {
     // Reject control flow per v1 stub.
     cfg::reject_unstructured(spv)?;
@@ -92,7 +102,19 @@ fn translate_one(
     let spv_block = &spv.blocks[0];
     let mut insts: Vec<Inst> = Vec::new();
 
+    // The OffsetTable index for this function's first
+    // body instruction:
+    //   fn_start_index points at OpFunction.
+    //   + 1 OpFunction itself
+    //   + parameters.len() OpFunctionParameter records
+    //   + 1 OpLabel of the first (and only) block
+    let mut spv_inst_index = fn_start_index
+        + 1
+        + spv.parameters.len()
+        + spv_block.label.iter().count();
+
     for spv_inst in &spv_block.instructions {
+        let source_offset = offsets.get(spv_inst_index);
         translate_inst(
             spv_inst,
             types,
@@ -101,7 +123,9 @@ fn translate_one(
             &mut id_map,
             &mut next_value_id,
             &mut insts,
+            source_offset,
         )?;
+        spv_inst_index += 1;
     }
 
     blocks.insert(block_id, Block {
@@ -123,6 +147,10 @@ fn translate_one(
 /// Translate one SPIR-V instruction. Pushes zero or more
 /// [`Inst`]s onto `insts` — constants that need
 /// materialising prefix any non-constant use.
+///
+/// `source_spirv_offset` is the byte offset of this
+/// instruction in the source SPIR-V; preserved on every
+/// emitted IR Inst per constraint A2.
 fn translate_inst(
     spv_inst: &Instruction,
     types: &TypeContext,
@@ -131,13 +159,8 @@ fn translate_inst(
     id_map: &mut HashMap<Word, Value>,
     next_value_id: &mut u32,
     insts: &mut Vec<Inst>,
+    source_spirv_offset: u32,
 ) -> Result<(), FrontendError> {
-    // Source SPIR-V offset for the PC-map sidecar (constraint A2).
-    // rspirv doesn't surface the original byte offset on dr::Instruction,
-    // so for phase 1 v1 we use 0 as a placeholder. Phase 1 v2 wires this
-    // through a parser-level adapter (a custom Consumer impl) that records
-    // offsets per instruction.
-    let source_spirv_offset = 0;
 
     match spv_inst.class.opcode {
         // Block label — handled by block-walking, no IR emit.
@@ -154,10 +177,12 @@ fn translate_inst(
                 Some(v) => v,
                 None => resolve_value(
                     ptr_id, types, constants, id_map, next_value_id, insts,
+                    source_spirv_offset,
                 )?,
             };
             let value_value = resolve_value(
                 value_id, types, constants, id_map, next_value_id, insts,
+                source_spirv_offset,
             )?;
             insts.push(Inst {
                 op: Op::Store { ptr: ptr_value, value: value_value },
@@ -180,6 +205,7 @@ fn translate_inst(
             let val_id = expect_id(&spv_inst.operands, 0)?;
             let val = resolve_value(
                 val_id, types, constants, id_map, next_value_id, insts,
+                source_spirv_offset,
             )?;
             insts.push(Inst {
                 op: Op::ReturnValue(val),
@@ -202,6 +228,12 @@ fn translate_inst(
 ///
 /// Idempotent: subsequent lookups of the same id return
 /// the cached Value from `id_map` without re-emitting.
+///
+/// `source_spirv_offset` is the offset of the USING
+/// instruction; synthesised constant-defining Insts
+/// inherit it so crash triage attributes a faulting
+/// instruction back to the spot in the source SPIR-V
+/// that first needed the constant.
 fn resolve_value(
     id: Word,
     types: &TypeContext,
@@ -209,6 +241,7 @@ fn resolve_value(
     id_map: &mut HashMap<Word, Value>,
     next_value_id: &mut u32,
     insts: &mut Vec<Inst>,
+    source_spirv_offset: u32,
 ) -> Result<Value, FrontendError> {
     if let Some(v) = id_map.get(&id) { return Ok(v.clone()); }
 
@@ -218,6 +251,7 @@ fn resolve_value(
         let stored = stored.clone(); // free of borrow on `constants`
         return materialize_constant(
             id, &stored.kind, ty, types, constants, id_map, next_value_id, insts,
+            source_spirv_offset,
         );
     }
 
@@ -238,6 +272,7 @@ fn materialize_constant(
     id_map: &mut HashMap<Word, Value>,
     next_value_id: &mut u32,
     insts: &mut Vec<Inst>,
+    source_spirv_offset: u32,
 ) -> Result<Value, FrontendError> {
     let result = fresh_value(ty.clone(), next_value_id);
     let op = match kind {
@@ -249,6 +284,7 @@ fn materialize_constant(
             for eid in element_ids {
                 let v = resolve_value(
                     *eid, types, constants, id_map, next_value_id, insts,
+                    source_spirv_offset,
                 )?;
                 elements.push(v);
             }
@@ -258,7 +294,7 @@ fn materialize_constant(
     insts.push(Inst {
         op,
         result: Some(result.clone()),
-        source_spirv_offset: 0,
+        source_spirv_offset,
     });
     id_map.insert(id, result.clone());
     Ok(result)

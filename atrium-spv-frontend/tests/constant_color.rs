@@ -151,6 +151,30 @@ fn frontend_translates_constant_color_shader() {
     assert_eq!(module.varyings.len(), 1);
     assert_eq!(module.varyings[0].location, 0);
     assert_eq!(module.varyings[0].ty, Type::Vec4(VecElement::F32));
+
+    // ── 7. source_spirv_offset is plumbed (constraint A2) ──
+    //
+    // Every body Inst should carry a non-zero byte offset
+    // (the function's body starts well past byte 0 in the
+    // SPIR-V). The OpStore and OpReturn instructions each
+    // have distinct offsets; constants synthesised by the
+    // function pass inherit the offset of the using-op
+    // (the OpStore in this case).
+    for inst in &block.insts {
+        assert!(inst.source_spirv_offset > 0,
+            "every IR Inst must carry a non-zero source SPIR-V offset \
+             (constraint A2); got 0 on op {:?}", inst.op);
+    }
+    // The terminator (Return) has a strictly greater
+    // offset than the Store before it.
+    let store_off = block.insts.iter()
+        .find(|i| matches!(i.op, Op::Store { .. }))
+        .map(|i| i.source_spirv_offset).unwrap();
+    let ret_off = block.insts.iter()
+        .find(|i| matches!(i.op, Op::Return))
+        .map(|i| i.source_spirv_offset).unwrap();
+    assert!(ret_off > store_off,
+        "Return offset {ret_off} should be > Store offset {store_off}");
 }
 
 #[test]

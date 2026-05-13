@@ -123,6 +123,15 @@ fn compile_emits_a_parseable_pcmap_sidecar() {
             "Cranelift pcmap entries are function-relative; expected host_offset=0, got {}",
             e.host_offset);
     }
+    // Per phase 1 v2: source_spirv_offset is now real,
+    // not placeholder 0. The pcmap entry for the entry-
+    // point function should carry the offset of its first
+    // body instruction (a non-zero value past the module
+    // header + global declarations).
+    let entry = pcmap.entries().first().expect("at least one entry");
+    assert!(entry.spirv_offset > 0,
+        "expected non-zero spirv_offset post-phase-1-v2; \
+         got {}", entry.spirv_offset);
 }
 
 #[test]
