@@ -1,0 +1,18 @@
+[package]
+name        = "atrium-spv-backend-cranelift"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "Cranelift backend for tier-2 software Vulkan. Translates atrium-spv-ir to native object files via Cranelift's AOT-to-object pipeline. Serves as both (a) the graceful-degradation production fallback for shaders the bespoke backend doesn't yet support, and (b) one of three runners in the differential test harness. Per docs/spec/tier2-renderer.md §6.1 — the adapter layer is thin; the heavy lifting is Cranelift's."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+atrium-spv-ir = { path = "../atrium-spv-ir" }
+cranelift-codegen   = { version = "0.131", features = ["std"] }
+cranelift-module    = { version = "0.131", features = ["std"] }
+cranelift-object    = "0.131"
+cranelift-frontend  = "0.131"
+target-lexicon      = "0.13"
