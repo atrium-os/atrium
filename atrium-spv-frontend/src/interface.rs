@@ -43,6 +43,30 @@ pub struct InterfaceContext {
     /// id). Used by function translation to figure out
     /// what each `OpStore`/`OpLoad` is touching.
     pub variables: HashMap<Word, (SpvStorageClass, Word)>,
+    /// SPIR-V struct id → list of `(member_byte_offset,
+    /// member_type_id)` in declaration order. Populated for
+    /// every `OpTypeStruct` whose members carry an explicit
+    /// `OpMemberDecorate Offset N` annotation (i.e. blocks
+    /// in Uniform / PushConstant / StorageBuffer storage).
+    /// `OpAccessChain` translation consults this map to
+    /// resolve member indices to constant byte offsets per
+    /// constraint B5.
+    pub struct_layouts: HashMap<Word, Vec<StructMember>>,
+    /// SPIR-V variable id of the (singleton) push-constant
+    /// block, if any. SPIR-V allows at most one such
+    /// variable per entry point.
+    pub push_constant_var: Option<Word>,
+}
+
+/// One member of an `OpTypeStruct` annotated with an
+/// explicit byte offset.
+#[derive(Debug, Clone)]
+pub struct StructMember {
+    /// `OpMemberDecorate Offset` literal.
+    pub byte_offset: u32,
+    /// SPIR-V id of the member's type (looked up via
+    /// [`TypeContext::get`] to materialise an IR `Type`).
+    pub type_id: Word,
 }
 
 impl InterfaceContext {
@@ -99,6 +123,56 @@ impl InterfaceContext {
                 ))),
             };
             ctx.variables.insert(var_id, (storage, pointee_id));
+        }
+
+        // Member decorations: collect `Offset` literals
+        // for every OpTypeStruct. Used by AccessChain
+        // resolution to flatten member indices → byte
+        // offsets (constraint B5).
+        let mut member_offsets: HashMap<(Word, u32), u32> = HashMap::new();
+        for inst in &module.annotations {
+            if inst.class.opcode != SpvOp::MemberDecorate { continue; }
+            // Operands: struct_id, member_idx, Decoration, [literal].
+            let struct_id = read_id_ref(&inst.operands, 0)?;
+            let member_idx = match inst.operands.get(1) {
+                Some(Operand::LiteralBit32(v)) => *v,
+                _ => continue,
+            };
+            let kind = match inst.operands.get(2) {
+                Some(Operand::Decoration(d)) => *d,
+                _ => continue,
+            };
+            if kind == Decoration::Offset {
+                if let Some(Operand::LiteralBit32(off)) = inst.operands.get(3) {
+                    member_offsets.insert((struct_id, member_idx), *off);
+                }
+            }
+        }
+
+        // Now walk OpTypeStruct in the global type table
+        // and build struct_layouts. We only retain structs
+        // whose members all carry an explicit Offset.
+        for inst in &module.types_global_values {
+            if inst.class.opcode != SpvOp::TypeStruct { continue; }
+            let Some(struct_id) = inst.result_id else { continue };
+            let mut members = Vec::with_capacity(inst.operands.len());
+            let mut all_have_offsets = true;
+            for (idx, op) in inst.operands.iter().enumerate() {
+                let type_id = match op {
+                    Operand::IdRef(id) => *id,
+                    _ => { all_have_offsets = false; break; }
+                };
+                match member_offsets.get(&(struct_id, idx as u32)) {
+                    Some(off) => members.push(StructMember {
+                        byte_offset: *off,
+                        type_id,
+                    }),
+                    None => { all_have_offsets = false; break; }
+                }
+            }
+            if all_have_offsets && !members.is_empty() {
+                ctx.struct_layouts.insert(struct_id, members);
+            }
         }
 
         // Per-binding decorations (set / binding /
@@ -168,6 +242,21 @@ impl InterfaceContext {
                         }
                     }
                 }
+                SpvStorageClass::PushConstant => {
+                    // SPIR-V mandates exactly one PushConstant
+                    // variable per entry point. Record it +
+                    // compute the block's total size from
+                    // the struct layout.
+                    ctx.push_constant_var = Some(*var_id);
+                    if let Some(layout) = ctx.struct_layouts.get(pointee_id) {
+                        let mut total: u32 = 0;
+                        for m in layout {
+                            let size = ir_type_size_bytes_for(&types.types, m.type_id);
+                            total = total.max(m.byte_offset.saturating_add(size));
+                        }
+                        ctx.push_constants_size = total;
+                    }
+                }
                 SpvStorageClass::Output => {
                     if let Some(d) = deco {
                         if let (Some(location), Some(ty)) = (d.location, pointee_ty) {
@@ -216,6 +305,26 @@ fn read_string(operands: &[Operand], i: usize) -> Result<String, FrontendError> 
         other => Err(FrontendError::Malformed(format!(
             "expected LiteralString at operand {i}, got {other:?}",
         ))),
+    }
+}
+
+/// Byte size of a leaf IR type, looked up by SPIR-V id
+/// from the TypeContext's type map. Used to compute push-
+/// constant block totals from struct-member offsets +
+/// trailing-member size. Unknown types return 0.
+fn ir_type_size_bytes_for(
+    types: &HashMap<Word, atrium_spv_ir::Type>,
+    id: Word,
+) -> u32 {
+    use atrium_spv_ir::Type;
+    match types.get(&id) {
+        Some(Type::Bool)
+        | Some(Type::I32) | Some(Type::U32) | Some(Type::F32) => 4,
+        Some(Type::I64) | Some(Type::U64) | Some(Type::F64) => 8,
+        Some(Type::Vec2(_)) => 8,
+        Some(Type::Vec3(_)) => 12,
+        Some(Type::Vec4(_)) => 16,
+        _ => 0,
     }
 }
 

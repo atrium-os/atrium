@@ -43,6 +43,15 @@ impl TypeContext {
                     let ty = ctx.translate_inst(inst)?;
                     ctx.types.insert(id, ty);
                 }
+                // TypeStruct / TypeArray have no leaf IR
+                // Type (pointers to them get resolved by
+                // OpAccessChain in the frontend, before
+                // they reach the backend). We still need
+                // the raw instruction so the interface
+                // pass can walk struct members.
+                Op::TypeStruct | Op::TypeArray | Op::TypeRuntimeArray => {
+                    ctx.raw.insert(id, inst.clone());
+                }
                 _ => {}
             }
         }

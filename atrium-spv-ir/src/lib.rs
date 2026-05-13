@@ -419,16 +419,18 @@ pub enum Op {
         value: Value,
     },
     /// SPIR-V's `OpAccessChain`: produce a new pointer by
-    /// stepping through nested type indices. Frontend
-    /// resolves the indices to a constant byte offset at
-    /// translate time (constraint B5).
+    /// adding a constant byte offset to `base`. Per
+    /// constraint B5 the frontend resolves all index
+    /// chains to a single byte offset at translate time;
+    /// the backend never walks indices at runtime.
+    ///
+    /// The result Value's type is `Pointer(<base's storage
+    /// class>, <pointee leaf type>)`.
     AccessChain {
         /// Base pointer.
         base: Value,
-        /// Index sequence. All must be constant per
-        /// constraint B5; the frontend rejects non-constant
-        /// indices.
-        indices: Vec<Value>,
+        /// Byte offset from `base` to the leaf pointee.
+        byte_offset: u32,
     },
 
     // ── Type conversions ───────────────────────────────────────
