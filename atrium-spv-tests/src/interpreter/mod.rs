@@ -409,6 +409,60 @@ impl Interpreter {
                 self.eval_binop_float(inst, values, |a, b| a * b),
             Op::FDiv => self.eval_binop_float(inst, values, |a, b| a / b),
             Op::FNegate => self.eval_unop_float(inst, values, |a| -a),
+            // OpVectorShuffle: gather lanes from
+            // src1 ++ src2 by index.
+            Op::VectorShuffle => {
+                let result_id = inst.result_id.ok_or_else(||
+                    InterpError::BadConstant(0))?;
+                let src1_id = op_id(&inst.operands, 0)?;
+                let src2_id = op_id(&inst.operands, 1)?;
+                let src1 = self.lookup_value(src1_id, values)?;
+                let src2 = self.lookup_value(src2_id, values)?;
+                let s1_lanes: &[ConstantValue] = match &src1 {
+                    ConstantValue::Vec(v) => v,
+                    _ => return Err(InterpError::UnsupportedOpcode(format!(
+                        "VectorShuffle src1 is not a Vec: {src1:?}",
+                    ))),
+                };
+                let s2_lanes: &[ConstantValue] = match &src2 {
+                    ConstantValue::Vec(v) => v,
+                    _ => return Err(InterpError::UnsupportedOpcode(format!(
+                        "VectorShuffle src2 is not a Vec: {src2:?}",
+                    ))),
+                };
+                let combined_len = s1_lanes.len() + s2_lanes.len();
+                let mut out = Vec::with_capacity(inst.operands.len() - 2);
+                for op in &inst.operands[2..] {
+                    let idx = match op {
+                        rspirv::dr::Operand::LiteralBit32(v) => *v,
+                        _ => return Err(InterpError::ParseFailed(
+                            "VectorShuffle component expected LiteralBit32"
+                                .to_string())),
+                    };
+                    if idx == 0xFFFF_FFFF {
+                        // "Undefined" sentinel — match the
+                        // backend's choice of 0.0.
+                        out.push(ConstantValue::F32(0.0));
+                        continue;
+                    }
+                    let idx = idx as usize;
+                    if idx >= combined_len {
+                        return Err(InterpError::UnsupportedOpcode(format!(
+                            "VectorShuffle component {idx} out of range \
+                             (combined source length {combined_len})",
+                        )));
+                    }
+                    let lane = if idx < s1_lanes.len() {
+                        s1_lanes[idx].clone()
+                    } else {
+                        s2_lanes[idx - s1_lanes.len()].clone()
+                    };
+                    out.push(lane);
+                }
+                values.insert(result_id, ConstantValue::Vec(out));
+                Ok(())
+            }
+
             // OpDot: sum of element-wise products.
             Op::Dot => {
                 let result_id = inst.result_id.ok_or_else(||

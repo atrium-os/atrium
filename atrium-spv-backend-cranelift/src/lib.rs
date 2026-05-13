@@ -388,6 +388,56 @@ impl FnTranslator {
             Op::FNeg(a) => self.emit_float_unop(
                 builder, &inst.result, a, |b, x| b.ins().fneg(x),
             ),
+            // Op::VectorShuffle: gather lanes from
+            // src1 ++ src2 by per-output-lane index.
+            // With our per-lane scalar storage this is
+            // just a permutation — no Cranelift
+            // instruction needed.
+            Op::VectorShuffle { src1, src2, components } => {
+                let s1_lanes = self.vectors.get(&src1.id).cloned()
+                    .ok_or_else(|| BackendError::Unsupported(format!(
+                        "VectorShuffle src1 id {:?} not in vectors", src1.id,
+                    )))?;
+                let s2_lanes = self.vectors.get(&src2.id).cloned()
+                    .ok_or_else(|| BackendError::Unsupported(format!(
+                        "VectorShuffle src2 id {:?} not in vectors", src2.id,
+                    )))?;
+                let combined_len = s1_lanes.len() + s2_lanes.len();
+                let mut out_lanes = Vec::with_capacity(components.len());
+                for c in components {
+                    let idx = *c as usize;
+                    // 0xFFFFFFFF is SPIR-V's "Undefined"
+                    // sentinel. The renderer spec § B3
+                    // mandates writing all lanes even when
+                    // their content is undefined; we
+                    // synthesise a zero constant for the
+                    // slot so the output is still
+                    // well-defined SSA.
+                    if *c == 0xFFFF_FFFF {
+                        let z = builder.ins().f32const(0.0f32);
+                        out_lanes.push(z);
+                        continue;
+                    }
+                    if idx >= combined_len {
+                        return Err(BackendError::Unsupported(format!(
+                            "VectorShuffle component {idx} out of range \
+                             (combined source length {combined_len})",
+                        )));
+                    }
+                    let lane = if idx < s1_lanes.len() {
+                        s1_lanes[idx]
+                    } else {
+                        s2_lanes[idx - s1_lanes.len()]
+                    };
+                    out_lanes.push(lane);
+                }
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "VectorShuffle without result Value".to_string()))?;
+                self.vectors.insert(result.id, out_lanes);
+                Ok(())
+            }
+
             // Op::Dot: per-lane fmul, then tree-reduce
             // with fadd. Result is a scalar.
             Op::Dot(a, b) => {

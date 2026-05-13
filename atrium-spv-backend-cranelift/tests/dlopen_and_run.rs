@@ -452,6 +452,96 @@ fn cranelift_shader_runs_vector_times_scalar_and_dot() {
     }
 }
 
+/// Build a shader that swizzles a constant vec4 with
+/// OpVectorShuffle:
+///
+///   color = vec_a              // (r, g, b, a)
+///   out   = color.bgra         // swizzle indices (2,1,0,3)
+fn build_swizzle_shader(vec_a: [f32; 4], components: [u32; 4]) -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, ExecutionMode, ExecutionModel,
+        FunctionControl, MemoryModel, StorageClass,
+    };
+
+    let mut bld = rspirv::dr::Builder::new();
+    bld.set_version(1, 0);
+    bld.capability(Capability::Shader);
+    bld.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+
+    let void = bld.type_void();
+    let f32_ty = bld.type_float(32, None);
+    let vec4_f32 = bld.type_vector(f32_ty, 4);
+    let void_fn = bld.type_function(void, vec![]);
+    let ptr_out_vec4 = bld.type_pointer(None, StorageClass::Output, vec4_f32);
+
+    let ca: Vec<_> = vec_a.iter().map(|x| bld.constant_bit32(f32_ty, x.to_bits())).collect();
+    let va = bld.constant_composite(vec4_f32, ca);
+
+    let out = bld.variable(ptr_out_vec4, None, StorageClass::Output, None);
+    bld.decorate(out, rspirv::spirv::Decoration::Location,
+                 vec![rspirv::dr::Operand::LiteralBit32(0)]);
+
+    let main = bld.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    bld.begin_block(None).unwrap();
+    let swizzled = bld.vector_shuffle(vec4_f32, None, va, va,
+                                      components.to_vec()).unwrap();
+    bld.store(out, swizzled, None, vec![]).unwrap();
+    bld.ret().unwrap();
+    bld.end_function().unwrap();
+
+    bld.entry_point(ExecutionModel::Fragment, main, "main", vec![out]);
+    bld.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+
+    let words: Vec<u32> = bld.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn cranelift_shader_runs_swizzle() {
+    let vec_a = [0.1f32, 0.2, 0.3, 0.4];
+    // .bgra → indices (2, 1, 0, 3).
+    let swizzle = [2u32, 1, 0, 3];
+    let spirv = build_swizzle_shader(vec_a, swizzle);
+    let module = atrium_spv_frontend::translate(&spirv).unwrap();
+    let object_bytes = atrium_spv_backend_cranelift::compile(
+        &module, Target::host(),
+    ).unwrap().object;
+    let dir = TempDir::new().unwrap();
+    let obj_path = dir.path().join("shader.o");
+    std::fs::write(&obj_path, &object_bytes).unwrap();
+    let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
+    let lib_path = dir.path().join(format!("shader.{ext}"));
+    link_to_shared_library(&obj_path, &lib_path).unwrap();
+
+    let lib = unsafe { libloading::Library::new(&lib_path).unwrap() };
+    type FsMain = unsafe extern "C" fn(
+        *const u8, *const u8, *const u8,
+        f32, f32, f32, f32, u32,
+        *mut f32, *mut f32,
+    );
+    let fs_main: libloading::Symbol<FsMain> = unsafe {
+        lib.get(b"atrium_fs_main").unwrap()
+    };
+    let mut out_color = [0.0f32; 4];
+    let mut out_depth = 0.0f32;
+    unsafe {
+        fs_main(
+            std::ptr::null(), std::ptr::null(), std::ptr::null(),
+            0.0, 0.0, 0.0, 0.0, 0,
+            out_color.as_mut_ptr(), &mut out_depth,
+        );
+    }
+    let expected = [
+        vec_a[swizzle[0] as usize], vec_a[swizzle[1] as usize],
+        vec_a[swizzle[2] as usize], vec_a[swizzle[3] as usize],
+    ];
+    assert_eq!(out_color, expected,
+        "swizzle wrong: got {:?}, expected {:?}", out_color, expected);
+}
+
 #[test]
 fn cranelift_shader_runs_real_arithmetic() {
     let a = 0.5f32;

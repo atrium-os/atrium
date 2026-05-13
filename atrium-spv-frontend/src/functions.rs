@@ -255,6 +255,53 @@ fn translate_inst(
             id_map, next_value_id, insts, source_spirv_offset,
             |a, b| Op::Dot(a, b),
         ),
+
+        // OpVectorShuffle: produce a new vector by
+        // selecting lanes from two source vectors.
+        // Operand layout:
+        //   0   src1: IdRef
+        //   1   src2: IdRef
+        //   2.. components: LiteralBit32 (per-output-lane
+        //       index into src1 ++ src2; 0xFFFFFFFF means
+        //       "undefined" but we punt on that for v4)
+        SpvOp::VectorShuffle => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed(
+                    "VectorShuffle without result id".to_string()))?;
+            let result_type_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed(
+                    "VectorShuffle without result type".to_string()))?;
+            let ty = types.get(result_type_id)?.clone();
+            let src1_id = expect_id(&spv_inst.operands, 0)?;
+            let src2_id = expect_id(&spv_inst.operands, 1)?;
+            let src1 = resolve_value(
+                src1_id, types, constants, id_map, next_value_id, insts,
+                source_spirv_offset,
+            )?;
+            let src2 = resolve_value(
+                src2_id, types, constants, id_map, next_value_id, insts,
+                source_spirv_offset,
+            )?;
+            let mut components: Vec<u32> = Vec::with_capacity(
+                spv_inst.operands.len().saturating_sub(2),
+            );
+            for op in &spv_inst.operands[2..] {
+                match op {
+                    Operand::LiteralBit32(v) => components.push(*v),
+                    other => return Err(FrontendError::Malformed(format!(
+                        "VectorShuffle component expected LiteralBit32, got {other:?}",
+                    ))),
+                }
+            }
+            let result = fresh_value(ty, next_value_id);
+            id_map.insert(result_id, result.clone());
+            insts.push(Inst {
+                op: Op::VectorShuffle { src1, src2, components },
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
         SpvOp::FNegate => emit_unop_float(
             spv_inst, types, constants, iface,
             id_map, next_value_id, insts, source_spirv_offset,
