@@ -294,10 +294,11 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
     // Pending `b imm26` relocations: (asm_byte_offset of
     // the placeholder instruction, target BlockId).
     let mut branch_relocs: Vec<(usize, BlockId)> = Vec::new();
-    // Pending `b.cond imm19` relocations: same shape.
-    // We always emit b.cond.NE (taken if W-bool != 0)
-    // so re-patching only needs the imm19 update.
+    // Pending `b.cond imm19` relocations:
+    // * cond_branch_relocs       — b.cond.NE (BranchCond)
+    // * cond_branch_relocs_eq    — b.cond.EQ (Switch cases)
     let mut cond_branch_relocs: Vec<(usize, BlockId)> = Vec::new();
+    let mut cond_branch_relocs_eq: Vec<(usize, BlockId)> = Vec::new();
 
     let mut flat_i: usize = 0;
     for bid in &block_order {
@@ -595,6 +596,36 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
                         "Op::Load of {other:?} not supported"))),
                 }
             }
+            // OpSelect: cond ? t : f. cond is Bool W-reg
+            // per B4; t/f scalar f32 per v12 scope. Vec
+            // selects defer.
+            Op::Select { cond, t_val, f_val } => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "Select without result".into()))?;
+                let w_cond = *bools.get(&cond.id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "Select cond {:?} not in bools", cond.id)))?;
+                match &result.ty {
+                    Type::F32 => {
+                        let s_t = *scalars.get(&t_val.id).ok_or_else(||
+                            BackendError::Internal(format!(
+                                "Select t {:?} not in scalars", t_val.id)))?;
+                        let s_f = *scalars.get(&f_val.id).ok_or_else(||
+                            BackendError::Internal(format!(
+                                "Select f {:?} not in scalars", f_val.id)))?;
+                        let s_d = alloc_vreg(
+                            &mut free_pool, &mut owners, result.id)?;
+                        // cmp w_cond, #0 → flags.
+                        a.emit(asm::cmp_imm_w(w_cond, 0));
+                        // fcsel s_d, s_t, s_f, NE (cond != 0).
+                        a.emit(asm::fcsel_s(s_d, s_t, s_f, asm::Cond::Ne));
+                        scalars.insert(result.id, s_d);
+                    }
+                    other => return Err(BackendError::Unsupported(format!(
+                        "Select of type {other:?} not supported in v12"))),
+                }
+            }
             Op::Phi(_) => {
                 // Phi result V-reg was pre-allocated; the
                 // per-edge move emits land at the
@@ -619,6 +650,40 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
                 let patch_off = a.len();
                 a.emit(asm::b(0));
                 branch_relocs.push((patch_off, *target));
+            }
+            Op::Switch { selector, cases, default } => {
+                // Lower to a chain of cmp_imm_w + b.cond.EQ
+                // + final unconditional jump to default.
+                // Reject Phi-bearing target as with
+                // BranchCond.
+                if phi_target_blocks.contains(default)
+                    || cases.iter().any(|(_, t)|
+                        phi_target_blocks.contains(t))
+                {
+                    return Err(BackendError::Unsupported(
+                        "Switch into Phi-bearing block; \
+                         critical-edge splitting lands in v13".into()));
+                }
+                let w_sel = *ints.get(&selector.id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "Switch selector {:?} not in ints",
+                        selector.id)))?;
+                for (lit, target) in cases {
+                    if *lit < 0 || *lit > 4095 {
+                        return Err(BackendError::Unsupported(format!(
+                            "Switch case literal {lit} outside \
+                             cmp_imm_w 12-bit range (use a wide-
+                             literal lowering path in v13+)")));
+                    }
+                    a.emit(asm::cmp_imm_w(w_sel, *lit as u16));
+                    let patch_t = a.len();
+                    a.emit(asm::b_cond(asm::Cond::Eq, 0));
+                    cond_branch_relocs_eq.push((patch_t, *target));
+                }
+                // Fall-through to default.
+                let patch_d = a.len();
+                a.emit(asm::b(0));
+                branch_relocs.push((patch_d, *default));
             }
             Op::BranchCond { cond, t_block, f_block } => {
                 // BranchCond targeting a Phi-bearing block
@@ -684,21 +749,28 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
     }
 
     // Conditional-branch fixup (imm19, ±2^18 insts).
-    for (patch_off, target_bid) in &cond_branch_relocs {
-        let target_byte = *block_asm_offset.get(target_bid).ok_or_else(||
-            BackendError::Internal(format!(
-                "cond branch target {target_bid:?} has no asm offset")))?;
-        let delta_bytes = target_byte as i64 - *patch_off as i64;
-        if delta_bytes % 4 != 0 {
-            return Err(BackendError::Internal(
-                "cond branch delta not 4-aligned".into()));
+    // BranchCond writes the NE list; Switch writes the EQ
+    // list. Both share the imm19 range and patch logic.
+    for (relocs, cond) in [
+        (&cond_branch_relocs, asm::Cond::Ne),
+        (&cond_branch_relocs_eq, asm::Cond::Eq),
+    ] {
+        for (patch_off, target_bid) in relocs {
+            let target_byte = *block_asm_offset.get(target_bid).ok_or_else(||
+                BackendError::Internal(format!(
+                    "cond branch target {target_bid:?} has no asm offset")))?;
+            let delta_bytes = target_byte as i64 - *patch_off as i64;
+            if delta_bytes % 4 != 0 {
+                return Err(BackendError::Internal(
+                    "cond branch delta not 4-aligned".into()));
+            }
+            let delta_insts = (delta_bytes / 4) as i32;
+            if !(-(1 << 18)..(1 << 18)).contains(&delta_insts) {
+                return Err(BackendError::Unsupported(format!(
+                    "cond-branch delta {delta_insts} exceeds imm19 range")));
+            }
+            a.patch(*patch_off, asm::b_cond(cond, delta_insts));
         }
-        let delta_insts = (delta_bytes / 4) as i32;
-        if !(-(1 << 18)..(1 << 18)).contains(&delta_insts) {
-            return Err(BackendError::Unsupported(format!(
-                "cond-branch delta {delta_insts} exceeds imm19 range")));
-        }
-        a.patch(*patch_off, asm::b_cond(asm::Cond::Ne, delta_insts));
     }
 
     Ok(a.into_bytes())
@@ -921,6 +993,10 @@ fn compute_last_use_flat(insts: &[&atrium_spv_ir::Inst]) -> HashMap<ValueId, usi
                 mark(l.id); mark(r.id);
             }
             Op::BranchCond { cond, .. } => mark(cond.id),
+            Op::Switch { selector, .. } => mark(selector.id),
+            Op::Select { cond, t_val, f_val } => {
+                mark(cond.id); mark(t_val.id); mark(f_val.id);
+            }
             Op::Phi(arms) => {
                 for arm in arms { mark(arm.value.id); }
             }

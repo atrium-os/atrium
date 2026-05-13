@@ -379,6 +379,131 @@ fn build_phi_if_else_shader() -> Vec<u8> {
     bytes
 }
 
+/// Build a shader using OpSelect to pick a scalar:
+/// `v = (scale < 0.5) ? 1.0 : 0.25; out = vec4(v, v, v, 1)`.
+fn build_select_shader() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let f32_ty = b.type_float(32, None);
+    let bool_ty = b.type_bool();
+    let i32_ty = b.type_int(32, 1);
+    let vec4 = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let pc_struct = b.type_struct(vec![f32_ty]);
+    b.member_decorate(pc_struct, 0, Decoration::Offset,
+                      vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(pc_struct, Decoration::Block, vec![]);
+    let ptr_pc_struct = b.type_pointer(None, StorageClass::PushConstant, pc_struct);
+    let ptr_pc_f32    = b.type_pointer(None, StorageClass::PushConstant, f32_ty);
+    let ptr_out       = b.type_pointer(None, StorageClass::Output, vec4);
+    let zero_i = b.constant_bit32(i32_ty, 0u32);
+    let c025 = b.constant_bit32(f32_ty, 0.25f32.to_bits());
+    let c05  = b.constant_bit32(f32_ty, 0.5f32.to_bits());
+    let c1   = b.constant_bit32(f32_ty, 1.0f32.to_bits());
+    let pc_var = b.variable(ptr_pc_struct, None, StorageClass::PushConstant, None);
+    let out = b.variable(ptr_out, None, StorageClass::Output, None);
+    b.decorate(out, Decoration::Location, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let p = b.access_chain(ptr_pc_f32, None, pc_var, vec![zero_i]).unwrap();
+    let v = b.load(f32_ty, None, p, None, vec![]).unwrap();
+    let cond = b.f_ord_less_than(bool_ty, None, v, c05).unwrap();
+    let chosen = b.select(f32_ty, None, cond, c1, c025).unwrap();
+    let color = b.composite_construct(vec4, None,
+        vec![chosen, chosen, chosen, c1]).unwrap();
+    b.store(out, color, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![out]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+/// 4-case Switch shader: `case 0 → red; case 1 → green;
+/// case 2 → blue; default → white`.
+fn build_switch_shader() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, SelectionControl,
+        StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let f32_ty = b.type_float(32, None);
+    let i32_ty = b.type_int(32, 1);
+    let vec4 = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let pc_struct = b.type_struct(vec![i32_ty]);
+    b.member_decorate(pc_struct, 0, Decoration::Offset,
+                      vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(pc_struct, Decoration::Block, vec![]);
+    let ptr_pc_struct = b.type_pointer(None, StorageClass::PushConstant, pc_struct);
+    let ptr_pc_i32    = b.type_pointer(None, StorageClass::PushConstant, i32_ty);
+    let ptr_out       = b.type_pointer(None, StorageClass::Output, vec4);
+    let zero_i = b.constant_bit32(i32_ty, 0u32);
+    let c0 = b.constant_bit32(f32_ty, 0.0f32.to_bits());
+    let c1 = b.constant_bit32(f32_ty, 1.0f32.to_bits());
+    let red   = b.constant_composite(vec4, vec![c1, c0, c0, c1]);
+    let green = b.constant_composite(vec4, vec![c0, c1, c0, c1]);
+    let blue  = b.constant_composite(vec4, vec![c0, c0, c1, c1]);
+    let white = b.constant_composite(vec4, vec![c1, c1, c1, c1]);
+    let pc_var = b.variable(ptr_pc_struct, None, StorageClass::PushConstant, None);
+    let out = b.variable(ptr_out, None, StorageClass::Output, None);
+    b.decorate(out, Decoration::Location,
+               vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let p = b.access_chain(ptr_pc_i32, None, pc_var, vec![zero_i]).unwrap();
+    let n = b.load(i32_ty, None, p, None, vec![]).unwrap();
+    let c0_id = b.id();
+    let c1_id = b.id();
+    let c2_id = b.id();
+    let dflt_id = b.id();
+    let merge_id = b.id();
+    b.selection_merge(merge_id, SelectionControl::NONE).unwrap();
+    b.switch(n, dflt_id, vec![
+        (rspirv::dr::Operand::LiteralBit32(0), c0_id),
+        (rspirv::dr::Operand::LiteralBit32(1), c1_id),
+        (rspirv::dr::Operand::LiteralBit32(2), c2_id),
+    ]).unwrap();
+    b.begin_block(Some(c0_id)).unwrap();
+    b.store(out, red, None, vec![]).unwrap();
+    b.branch(merge_id).unwrap();
+    b.begin_block(Some(c1_id)).unwrap();
+    b.store(out, green, None, vec![]).unwrap();
+    b.branch(merge_id).unwrap();
+    b.begin_block(Some(c2_id)).unwrap();
+    b.store(out, blue, None, vec![]).unwrap();
+    b.branch(merge_id).unwrap();
+    b.begin_block(Some(dflt_id)).unwrap();
+    b.store(out, white, None, vec![]).unwrap();
+    b.branch(merge_id).unwrap();
+    b.begin_block(Some(merge_id)).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![out]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
 fn build_if_else_shader() -> Vec<u8> {
     use rspirv::binary::Assemble;
     use rspirv::spirv::{
@@ -565,6 +690,56 @@ fn three_way_phi_else_branch() {
         ColorTolerance::Exact,
         &refs,
     );
+}
+
+#[test]
+fn three_way_select_then() {
+    let spirv = build_select_shader();
+    let mut inputs = ShaderInputs::default();
+    inputs.push_constants[..4].copy_from_slice(&0.2f32.to_le_bytes());
+    let rs = runners();
+    let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
+    assert_shader_agrees(&spirv, &inputs, ColorTolerance::Exact, &refs);
+}
+
+#[test]
+fn three_way_select_else() {
+    let spirv = build_select_shader();
+    let mut inputs = ShaderInputs::default();
+    inputs.push_constants[..4].copy_from_slice(&0.8f32.to_le_bytes());
+    let rs = runners();
+    let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
+    assert_shader_agrees(&spirv, &inputs, ColorTolerance::Exact, &refs);
+}
+
+#[test]
+fn three_way_switch_case0() {
+    let spirv = build_switch_shader();
+    let mut inputs = ShaderInputs::default();
+    inputs.push_constants[..4].copy_from_slice(&0i32.to_le_bytes());
+    let rs = runners();
+    let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
+    assert_shader_agrees(&spirv, &inputs, ColorTolerance::Exact, &refs);
+}
+
+#[test]
+fn three_way_switch_case1() {
+    let spirv = build_switch_shader();
+    let mut inputs = ShaderInputs::default();
+    inputs.push_constants[..4].copy_from_slice(&1i32.to_le_bytes());
+    let rs = runners();
+    let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
+    assert_shader_agrees(&spirv, &inputs, ColorTolerance::Exact, &refs);
+}
+
+#[test]
+fn three_way_switch_default() {
+    let spirv = build_switch_shader();
+    let mut inputs = ShaderInputs::default();
+    inputs.push_constants[..4].copy_from_slice(&99i32.to_le_bytes());
+    let rs = runners();
+    let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
+    assert_shader_agrees(&spirv, &inputs, ColorTolerance::Exact, &refs);
 }
 
 #[test]
