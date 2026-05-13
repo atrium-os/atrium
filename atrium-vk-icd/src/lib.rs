@@ -1230,6 +1230,45 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkCommandBuffer, u64, u64, u32, *const c_void), FnVoidPtr,
             >(vkCmdPushDescriptorSetWithTemplate)),
+        // 1.2 indirect-count draws — forward to non-Count variants
+        // with max_draw_count as the static count.
+        "vkCmdDrawIndirectCount" |
+        "vkCmdDrawIndirectCountKHR" |
+        "vkCmdDrawIndirectCountAMD" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u64, u64, u64, u64, u32, u32), FnVoidPtr,
+            >(vkCmdDrawIndirectCount)),
+        "vkCmdDrawIndexedIndirectCount" |
+        "vkCmdDrawIndexedIndirectCountKHR" |
+        "vkCmdDrawIndexedIndirectCountAMD" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u64, u64, u64, u64, u32, u32), FnVoidPtr,
+            >(vkCmdDrawIndexedIndirectCount)),
+        // 1.3 sync2 copy/blit/resolve variants — no-op stubs.
+        "vkCmdCopyBuffer2" | "vkCmdCopyBuffer2KHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, *const c_void), FnVoidPtr,
+            >(vkCmdCopyBuffer2)),
+        "vkCmdCopyImage2" | "vkCmdCopyImage2KHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, *const c_void), FnVoidPtr,
+            >(vkCmdCopyImage2)),
+        "vkCmdCopyBufferToImage2" | "vkCmdCopyBufferToImage2KHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, *const c_void), FnVoidPtr,
+            >(vkCmdCopyBufferToImage2)),
+        "vkCmdCopyImageToBuffer2" | "vkCmdCopyImageToBuffer2KHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, *const c_void), FnVoidPtr,
+            >(vkCmdCopyImageToBuffer2)),
+        "vkCmdBlitImage2" | "vkCmdBlitImage2KHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, *const c_void), FnVoidPtr,
+            >(vkCmdBlitImage2)),
+        "vkCmdResolveImage2" | "vkCmdResolveImage2KHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, *const c_void), FnVoidPtr,
+            >(vkCmdResolveImage2)),
         "vkDeviceWaitIdle" =>
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkDevice) -> VkResult, FnVoidPtr,
@@ -5189,6 +5228,79 @@ pub unsafe extern "C" fn vkGetSemaphoreCounterValue(
     VK_SUCCESS
 }
 
+// ── Indirect-count draws + sync2 copy variants ──────────────────
+//
+// Vulkan 1.2: vkCmdDraw{,Indexed}IndirectCount take a second
+// "count buffer" whose first u32 dictates how many draws to
+// emit, capped by maxDrawCount. Tier-1's renderer doesn't read
+// the count buffer; we forward to the non-Count variant with
+// max_draw_count as the static count — same conservative upper
+// bound the validation layer assumes when count_buffer reads
+// would have returned max.
+//
+// Vulkan 1.3: vkCmd{Copy,Blit,Resolve}…2 variants wrap the 1.0
+// region structs in pNext-able VkCopy*Info2 records. tier-1's
+// 1.0 copy entries are themselves only partially wired (the
+// renderer treats them as Unsupported); the *2 variants stub as
+// honest no-ops so apps that opt into the sync2 copy API don't
+// resolve null.
+
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdDrawIndirectCount(
+    command_buffer: VkCommandBuffer,
+    buffer:         u64,
+    offset:         u64,
+    _count_buffer:  u64,
+    _count_buffer_offset: u64,
+    max_draw_count: u32,
+    stride:         u32,
+) {
+    vkCmdDrawIndirect(command_buffer, buffer, offset, max_draw_count, stride)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdDrawIndexedIndirectCount(
+    command_buffer: VkCommandBuffer,
+    buffer:         u64,
+    offset:         u64,
+    _count_buffer:  u64,
+    _count_buffer_offset: u64,
+    max_draw_count: u32,
+    stride:         u32,
+) {
+    vkCmdDrawIndexedIndirect(command_buffer, buffer, offset, max_draw_count, stride)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdCopyBuffer2(
+    _command_buffer: VkCommandBuffer, _p_copy_info: *const c_void,
+) {}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdCopyImage2(
+    _command_buffer: VkCommandBuffer, _p_copy_info: *const c_void,
+) {}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdCopyBufferToImage2(
+    _command_buffer: VkCommandBuffer, _p_copy_info: *const c_void,
+) {}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdCopyImageToBuffer2(
+    _command_buffer: VkCommandBuffer, _p_copy_info: *const c_void,
+) {}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdBlitImage2(
+    _command_buffer: VkCommandBuffer, _p_blit_info: *const c_void,
+) {}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdResolveImage2(
+    _command_buffer: VkCommandBuffer, _p_resolve_info: *const c_void,
+) {}
+
 /// `vkResetCommandPool` — reset all cmdbufs in a pool. Today this
 /// is a SUCCESS no-op: atrium-vk-icd doesn't track which cmdbufs
 /// belong to which pool (alloc returns a `Box<AtriumCommandBuffer>`
@@ -6655,6 +6767,34 @@ mod tests {
         assert!(props.optimal_tiling_features.is_empty());
         assert!(props.linear_tiling_features.is_empty());
         assert!(props.buffer_features.is_empty());
+    }
+
+    #[test]
+    fn indirect_count_and_sync2_copy_variants_resolve() {
+        // 8 + 12 = 20 names.
+        for name in [
+            "vkCmdDrawIndirectCount", "vkCmdDrawIndirectCountKHR",
+            "vkCmdDrawIndirectCountAMD",
+            "vkCmdDrawIndexedIndirectCount",
+            "vkCmdDrawIndexedIndirectCountKHR",
+            "vkCmdDrawIndexedIndirectCountAMD",
+            "vkCmdCopyBuffer2", "vkCmdCopyBuffer2KHR",
+            "vkCmdCopyImage2", "vkCmdCopyImage2KHR",
+            "vkCmdCopyBufferToImage2", "vkCmdCopyBufferToImage2KHR",
+            "vkCmdCopyImageToBuffer2", "vkCmdCopyImageToBuffer2KHR",
+            "vkCmdBlitImage2", "vkCmdBlitImage2KHR",
+            "vkCmdResolveImage2", "vkCmdResolveImage2KHR",
+        ] {
+            let with_nul: Vec<u8> = name.bytes().chain(std::iter::once(0)).collect();
+            assert!(lookup(&with_nul).is_some(),
+                "must resolve {name}");
+        }
+
+        // CmdCopyBuffer2 no-op stub must survive null cmdbuf.
+        let f = lookup(b"vkCmdCopyBuffer2\0").unwrap();
+        let g: unsafe extern "C" fn(VkCommandBuffer, *const c_void) =
+            unsafe { std::mem::transmute(f) };
+        unsafe { g(std::ptr::null_mut(), std::ptr::null()); }
     }
 
     #[test]
