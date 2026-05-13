@@ -847,6 +847,11 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkQueue, u32, *const c_void, *mut c_void) -> VkResult, FnVoidPtr,
             >(vkQueueSubmit)),
+        "vkQueueSubmit2" |
+        "vkQueueSubmit2KHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkQueue, u32, *const c_void, *mut c_void) -> VkResult, FnVoidPtr,
+            >(vkQueueSubmit2)),
         "vkCmdSetViewport" =>
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkCommandBuffer, u32, u32, *const ash::vk::Viewport), FnVoidPtr,
@@ -4471,6 +4476,76 @@ pub unsafe extern "C" fn vkQueueSubmit(
             );
             if snapshot.is_empty() { continue; }
 
+            let Ok(mut c) = client_mu.lock() else { continue; };
+            dev.timeline.set(dev.timeline.get() + 1);
+            let timeline = dev.timeline.get();
+            let _ = c.submit_frame(dev.fence, snapshot, timeline);
+        }
+    }
+    VK_SUCCESS
+}
+
+/// `vkQueueSubmit2` — Vulkan 1.3 mandatory submit. Differs from
+/// vkQueueSubmit in that each VkSubmitInfo2 carries semaphore
+/// metadata (stage masks, timeline values) inline via
+/// VkSemaphoreSubmitInfo, and command buffers via
+/// VkCommandBufferSubmitInfo (which itself carries a deviceMask
+/// for multi-GPU). atrium-vk-icd is single-queue + tier-1 has
+/// no real semaphores, so we walk straight to the cmdbuf array.
+///
+/// Layout notes (offsets verified against Vulkan 1.3 headers):
+///
+///   VkSubmitInfo2 (64 bytes):
+///     0  sType
+///     8  pNext
+///     16 flags
+///     20 waitSemaphoreInfoCount
+///     24 pWaitSemaphoreInfos
+///     32 commandBufferInfoCount
+///     40 pCommandBufferInfos
+///     48 signalSemaphoreInfoCount
+///     56 pSignalSemaphoreInfos
+///
+///   VkCommandBufferSubmitInfo (32 bytes):
+///     0  sType
+///     8  pNext
+///     16 commandBuffer (VkCommandBuffer; 8 bytes)
+///     24 deviceMask
+#[no_mangle]
+pub unsafe extern "C" fn vkQueueSubmit2(
+    queue:         VkQueue,
+    submit_count:  u32,
+    p_submits:     *const c_void, /* const VkSubmitInfo2* */
+    _fence:        *mut c_void,
+) -> VkResult {
+    if queue.is_null() { return VK_ERROR_INITIALIZATION_FAILED; }
+    let q = &*(queue as *const AtriumQueue);
+    if q._device.is_null() { return VK_SUCCESS; }
+    let dev = &*(q._device as *const AtriumDevice);
+    if dev.instance.is_null() { return VK_SUCCESS; }
+    let inst = &*(dev.instance as *const AtriumInstance);
+    let Some(client_mu) = inst.client.as_ref() else { return VK_SUCCESS; };
+    if dev.fence == aqueduct_gpu::ids::ResourceId(0) { return VK_SUCCESS; }
+    if p_submits.is_null() || submit_count == 0 { return VK_SUCCESS; }
+
+    const SUBMIT_INFO_2_STRIDE: usize = 64;
+    const CMDBUF_INFO_STRIDE: usize = 32;
+    let submits_base = p_submits as *const u8;
+    for s in 0..submit_count {
+        let info = submits_base.add(SUBMIT_INFO_2_STRIDE * s as usize);
+        let cb_count    = std::ptr::read_unaligned(info.add(32) as *const u32);
+        let cb_array_p  = std::ptr::read_unaligned(info.add(40) as *const *const u8);
+        if cb_count == 0 || cb_array_p.is_null() { continue; }
+        for c in 0..cb_count {
+            let cbi = cb_array_p.add(CMDBUF_INFO_STRIDE * c as usize);
+            let cb_handle = std::ptr::read_unaligned(cbi.add(16) as *const VkCommandBuffer);
+            if cb_handle.is_null() { continue; }
+            let cb = &mut *(cb_handle as *mut AtriumCommandBuffer);
+            let snapshot = std::mem::replace(
+                &mut cb.frame,
+                aqueduct_gpu::frame::FrameBuilder::new(ATRIUM_CMDBUF_INITIAL_CAPACITY),
+            );
+            if snapshot.is_empty() { continue; }
             let Ok(mut c) = client_mu.lock() else { continue; };
             dev.timeline.set(dev.timeline.get() + 1);
             let timeline = dev.timeline.get();

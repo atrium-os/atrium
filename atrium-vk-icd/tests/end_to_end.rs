@@ -592,6 +592,94 @@ fn submit_flushes_recorded_frame_to_aqueduct_backend() {
 }
 
 #[test]
+fn queue_submit2_routes_cmdbufs_through_vksubmitinfo2() {
+    // Same shape as submit_flushes_recorded_frame_to_aqueduct_backend
+    // but uses vkQueueSubmit2 + VkSubmitInfo2 +
+    // VkCommandBufferSubmitInfo (the Vulkan 1.3 mandatory submit
+    // path). Proves the *2 cmdbuf-array offsets are right and
+    // that 1.3-style apps reach the daemon.
+    use atrium_vk_icd::{
+        vkAllocateCommandBuffers, vkBeginCommandBuffer, vkCmdDraw,
+        vkCreateCommandPool, vkCreateDevice, vkDestroyCommandPool,
+        vkDestroyDevice, vkEndCommandBuffer, vkGetDeviceQueue,
+        vkQueueSubmit2,
+    };
+
+    let sock = tmp_socket("submit2");
+    let sw_backend = Arc::new(SoftwareBackend::new());
+    let backend_for_listener: Arc<dyn Backend> = sw_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap();
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+
+    let _env = EnvLock::set(&sock);
+
+    type VkDevice = *mut std::ffi::c_void;
+    type VkQueue  = *mut std::ffi::c_void;
+    type VkCommandBuffer = *mut std::ffi::c_void;
+
+    let mut instance: VkInstance = std::ptr::null_mut();
+    unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
+    let mut devices: [VkPhysicalDevice; 1] = [std::ptr::null_mut(); 1];
+    let mut cap: u32 = 1;
+    unsafe { vkEnumeratePhysicalDevices(instance, &mut cap, devices.as_mut_ptr()); }
+    let mut device: VkDevice = std::ptr::null_mut();
+    unsafe { vkCreateDevice(devices[0], std::ptr::null(), std::ptr::null(), &mut device); }
+    let mut queue: VkQueue = std::ptr::null_mut();
+    unsafe { vkGetDeviceQueue(device, 0, 0, &mut queue); }
+    let mut pool: u64 = 0;
+    unsafe { vkCreateCommandPool(device, std::ptr::null(), std::ptr::null(), &mut pool); }
+
+    let mut info = [0u8; 40];
+    info[0..4].copy_from_slice(&40u32.to_le_bytes());
+    info[16..24].copy_from_slice(&pool.to_le_bytes());
+    info[28..32].copy_from_slice(&1u32.to_le_bytes());
+    let mut cbs: [VkCommandBuffer; 1] = [std::ptr::null_mut(); 1];
+    unsafe { vkAllocateCommandBuffers(device, info.as_ptr() as *const _, cbs.as_mut_ptr()); }
+    let cb = cbs[0];
+
+    unsafe { vkBeginCommandBuffer(cb, std::ptr::null()); }
+    unsafe { vkCmdDraw(cb, 3, 1, 0, 0); }
+    unsafe { vkEndCommandBuffer(cb); }
+
+    let pre_count = sw_backend.submission_count();
+
+    // VkCommandBufferSubmitInfo (32 bytes): sType=1000314000, pNext, cb, deviceMask.
+    let mut cbi = [0u8; 32];
+    cbi[0..4].copy_from_slice(&1_000_314_000u32.to_le_bytes());
+    cbi[16..24].copy_from_slice(&(cb as u64).to_le_bytes());
+
+    // VkSubmitInfo2 (64 bytes): sType=1000314001, pNext, flags,
+    // waitInfoCount/Ptr (zero), cbInfoCount=1, pCommandBufferInfos.
+    let mut si = [0u8; 64];
+    si[0..4].copy_from_slice(&1_000_314_001u32.to_le_bytes());
+    si[32..36].copy_from_slice(&1u32.to_le_bytes());                // cbInfoCount
+    let cbi_ptr = cbi.as_ptr() as u64;
+    si[40..48].copy_from_slice(&cbi_ptr.to_le_bytes());
+
+    let r = unsafe {
+        vkQueueSubmit2(queue, 1, si.as_ptr() as *const _, std::ptr::null_mut())
+    };
+    assert_eq!(r, 0);
+
+    thread::sleep(Duration::from_millis(100));
+    let post_count = sw_backend.submission_count();
+    assert!(post_count > pre_count,
+        "vkQueueSubmit2 must reach backend (pre={pre_count} post={post_count})");
+
+    let leftover = atrium_vk_icd::cmdbuf_recorded_bytes(cb);
+    assert_eq!(leftover.len(), 0,
+        "cmdbuf frame must be reset after vkQueueSubmit2, got {} bytes",
+        leftover.len());
+
+    unsafe { vkDestroyCommandPool(device, pool, std::ptr::null()); }
+    unsafe { vkDestroyDevice(device, std::ptr::null()); }
+    unsafe { vkDestroyInstance(instance, std::ptr::null()); }
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[test]
 fn pipeline_create_bind_destroy_round_trip() {
     use atrium_vk_icd::{
         cmdbuf_recorded_bytes,
