@@ -596,9 +596,10 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
                         "Op::Load of {other:?} not supported"))),
                 }
             }
-            // OpSelect: cond ? t : f. cond is Bool W-reg
-            // per B4; t/f scalar f32 per v12 scope. Vec
-            // selects defer.
+            // OpSelect: cond ? t : f. cond is Bool W-reg.
+            // Supports:
+            //   - scalar cond + scalar f32 t/f
+            //   - scalar cond + vec f32 t/f  (lane-walk)
             Op::Select { cond, t_val, f_val } => {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal(
@@ -606,6 +607,10 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
                 let w_cond = *bools.get(&cond.id).ok_or_else(||
                     BackendError::Internal(format!(
                         "Select cond {:?} not in bools", cond.id)))?;
+                // Set NZCV once; both scalar and vec paths
+                // reuse the same cmp+fcsel sequence per
+                // lane / per scalar.
+                a.emit(asm::cmp_imm_w(w_cond, 0));
                 match &result.ty {
                     Type::F32 => {
                         let s_t = *scalars.get(&t_val.id).ok_or_else(||
@@ -616,14 +621,41 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
                                 "Select f {:?} not in scalars", f_val.id)))?;
                         let s_d = alloc_vreg(
                             &mut free_pool, &mut owners, result.id)?;
-                        // cmp w_cond, #0 → flags.
-                        a.emit(asm::cmp_imm_w(w_cond, 0));
-                        // fcsel s_d, s_t, s_f, NE (cond != 0).
                         a.emit(asm::fcsel_s(s_d, s_t, s_f, asm::Cond::Ne));
                         scalars.insert(result.id, s_d);
                     }
+                    Type::Vec2(_) | Type::Vec3(_) | Type::Vec4(_) => {
+                        let t_lanes = vectors.get(&t_val.id).cloned().ok_or_else(||
+                            BackendError::Internal(format!(
+                                "vec Select t {:?} not in vectors", t_val.id)))?;
+                        let f_lanes = vectors.get(&f_val.id).cloned().ok_or_else(||
+                            BackendError::Internal(format!(
+                                "vec Select f {:?} not in vectors", f_val.id)))?;
+                        if t_lanes.len() != f_lanes.len() {
+                            return Err(BackendError::Unsupported(format!(
+                                "vec Select mismatched lanes: {} vs {}",
+                                t_lanes.len(), f_lanes.len())));
+                        }
+                        let mut out_lanes = Vec::with_capacity(t_lanes.len());
+                        for (li, (tl, fl)) in t_lanes.iter().zip(f_lanes.iter()).enumerate() {
+                            let st = *scalars.get(&tl.id).ok_or_else(||
+                                BackendError::Internal(format!(
+                                    "vec Select t lane {li} {:?} missing", tl.id)))?;
+                            let sf = *scalars.get(&fl.id).ok_or_else(||
+                                BackendError::Internal(format!(
+                                    "vec Select f lane {li} {:?} missing", fl.id)))?;
+                            let synth = ValueId(next_synth_id);
+                            next_synth_id += 1;
+                            let sd = alloc_vreg(
+                                &mut free_pool, &mut owners, synth)?;
+                            a.emit(asm::fcsel_s(sd, st, sf, asm::Cond::Ne));
+                            scalars.insert(synth, sd);
+                            out_lanes.push(Value { id: synth, ty: tl.ty.clone() });
+                        }
+                        vectors.insert(result.id, out_lanes);
+                    }
                     other => return Err(BackendError::Unsupported(format!(
-                        "Select of type {other:?} not supported in v12"))),
+                        "Select of type {other:?} not supported"))),
                 }
             }
             Op::Phi(_) => {
@@ -996,6 +1028,17 @@ fn compute_last_use_flat(insts: &[&atrium_spv_ir::Inst]) -> HashMap<ValueId, usi
             Op::Switch { selector, .. } => mark(selector.id),
             Op::Select { cond, t_val, f_val } => {
                 mark(cond.id); mark(t_val.id); mark(f_val.id);
+                // Vec operands' lane scalars need to stay
+                // alive across the Select — without this
+                // the per-lane fcsel_s reads scalars[lane]
+                // for V-regs that may have already been
+                // recycled by the linear-scan.
+                if let Some(lanes) = vec_lanes.get(&t_val.id).cloned() {
+                    for lid in &lanes { mark(*lid); }
+                }
+                if let Some(lanes) = vec_lanes.get(&f_val.id).cloned() {
+                    for lid in &lanes { mark(*lid); }
+                }
             }
             Op::Phi(arms) => {
                 for arm in arms { mark(arm.value.id); }

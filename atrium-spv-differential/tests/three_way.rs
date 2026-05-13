@@ -609,6 +609,57 @@ fn build_loop_sum_shader() -> Vec<u8> {
     bytes
 }
 
+/// OpSelect with scalar cond + vec4 t/f operands.
+/// out = (scale < 0.5) ? red_vec : blue_vec
+fn build_vec_select_shader() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let f32_ty = b.type_float(32, None);
+    let bool_ty = b.type_bool();
+    let i32_ty = b.type_int(32, 1);
+    let vec4 = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let pc_struct = b.type_struct(vec![f32_ty]);
+    b.member_decorate(pc_struct, 0, Decoration::Offset,
+                      vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(pc_struct, Decoration::Block, vec![]);
+    let ptr_pc_struct = b.type_pointer(None, StorageClass::PushConstant, pc_struct);
+    let ptr_pc_f32    = b.type_pointer(None, StorageClass::PushConstant, f32_ty);
+    let ptr_out       = b.type_pointer(None, StorageClass::Output, vec4);
+    let zero_i = b.constant_bit32(i32_ty, 0u32);
+    let c0  = b.constant_bit32(f32_ty, 0.0f32.to_bits());
+    let c05 = b.constant_bit32(f32_ty, 0.5f32.to_bits());
+    let c1  = b.constant_bit32(f32_ty, 1.0f32.to_bits());
+    let red_v  = b.constant_composite(vec4, vec![c1, c0, c0, c1]);
+    let blue_v = b.constant_composite(vec4, vec![c0, c0, c1, c1]);
+    let pc_var = b.variable(ptr_pc_struct, None, StorageClass::PushConstant, None);
+    let out = b.variable(ptr_out, None, StorageClass::Output, None);
+    b.decorate(out, Decoration::Location, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let p = b.access_chain(ptr_pc_f32, None, pc_var, vec![zero_i]).unwrap();
+    let v = b.load(f32_ty, None, p, None, vec![]).unwrap();
+    let cond = b.f_ord_less_than(bool_ty, None, v, c05).unwrap();
+    let chosen = b.select(vec4, None, cond, red_v, blue_v).unwrap();
+    b.store(out, chosen, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![out]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
 fn build_if_else_shader() -> Vec<u8> {
     use rspirv::binary::Assemble;
     use rspirv::spirv::{
@@ -853,6 +904,26 @@ fn three_way_simple_loop() {
     let mut inputs = ShaderInputs::default();
     let n: i32 = 5; // 0+1+2+3+4 = 10 = expected
     inputs.push_constants[..4].copy_from_slice(&n.to_le_bytes());
+    let rs = runners();
+    let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
+    assert_shader_agrees(&spirv, &inputs, ColorTolerance::Exact, &refs);
+}
+
+#[test]
+fn three_way_vec_select_then() {
+    let spirv = build_vec_select_shader();
+    let mut inputs = ShaderInputs::default();
+    inputs.push_constants[..4].copy_from_slice(&0.2f32.to_le_bytes());
+    let rs = runners();
+    let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
+    assert_shader_agrees(&spirv, &inputs, ColorTolerance::Exact, &refs);
+}
+
+#[test]
+fn three_way_vec_select_else() {
+    let spirv = build_vec_select_shader();
+    let mut inputs = ShaderInputs::default();
+    inputs.push_constants[..4].copy_from_slice(&0.8f32.to_le_bytes());
     let rs = runners();
     let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
     assert_shader_agrees(&spirv, &inputs, ColorTolerance::Exact, &refs);
