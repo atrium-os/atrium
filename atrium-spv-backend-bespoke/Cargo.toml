@@ -19,3 +19,5 @@ thiserror           = "1"
 [dev-dependencies]
 atrium-spv-frontend = { path = "../atrium-spv-frontend" }
 rspirv              = "0.13"
+tempfile            = "3"
+libloading          = "0.8"
