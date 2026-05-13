@@ -1,0 +1,19 @@
+[package]
+name        = "atrium-spv-loader"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "Daemon-side cache + loader for tier-2 software Vulkan shaders. Hashes SPIR-V, looks up /var/atrium/shaders/v{N}/<hash>.so, dlopens hits, spawns atrium-spv-compile on miss + caches the result. Exposes typed function-pointer accessors per shader stage. The future Tier2Backend in aqueduct-gpu-host wraps this; for now it's a standalone building block. See docs/spec/tier2-renderer.md §2 (cache + on-demand compile) and §6.1 (crate layout)."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+atrium-spv-pcmap = { path = "../atrium-spv-pcmap" }
+libloading       = "0.8"
+sha2             = "0.10"
+
+[dev-dependencies]
+rspirv   = "0.13"
+tempfile = "3"
