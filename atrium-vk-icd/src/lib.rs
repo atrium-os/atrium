@@ -5386,7 +5386,7 @@ pub unsafe extern "C" fn vkQueueSubmit(
     queue:         VkQueue,
     submit_count:  u32,
     p_submits:     *const c_void, /* const VkSubmitInfo* */
-    _fence:        *mut c_void,   /* VkFence */
+    fence:         *mut c_void,   /* VkFence (non-dispatchable u64 ABI) */
 ) -> VkResult {
     if queue.is_null() { return VK_ERROR_INITIALIZATION_FAILED; }
     let q = &*(queue as *const AtriumQueue);
@@ -5429,6 +5429,19 @@ pub unsafe extern "C" fn vkQueueSubmit(
             let _ = c.submit_frame(dev.fence, snapshot, timeline);
         }
     }
+    // Spec: signal the supplied VkFence once the submitted work
+    // completes. Our submit_frame is synchronous (the daemon has
+    // queued the work by the time it returns) — equivalent to
+    // "complete" from the spec's POV, so flip the fence bit now.
+    // VkFence is a non-dispatchable handle: u64 on every Vulkan
+    // ABI we support, transported through the C *mut c_void
+    // slot.
+    let fence_handle = fence as usize as u64;
+    if fence_handle != 0 {
+        if let Ok(mut f) = dev.fences.lock() {
+            f.insert(fence_handle, true);
+        }
+    }
     VK_SUCCESS
 }
 
@@ -5463,7 +5476,7 @@ pub unsafe extern "C" fn vkQueueSubmit2(
     queue:         VkQueue,
     submit_count:  u32,
     p_submits:     *const c_void, /* const VkSubmitInfo2* */
-    _fence:        *mut c_void,
+    fence:         *mut c_void,   /* VkFence (non-dispatchable u64 ABI) */
 ) -> VkResult {
     if queue.is_null() { return VK_ERROR_INITIALIZATION_FAILED; }
     let q = &*(queue as *const AtriumQueue);
@@ -5497,6 +5510,15 @@ pub unsafe extern "C" fn vkQueueSubmit2(
             dev.timeline.set(dev.timeline.get() + 1);
             let timeline = dev.timeline.get();
             let _ = c.submit_frame(dev.fence, snapshot, timeline);
+        }
+    }
+    // Same fence-signal contract as vkQueueSubmit (see comment
+    // there): non-null fence becomes signaled because our submit
+    // path is synchronous.
+    let fence_handle = fence as usize as u64;
+    if fence_handle != 0 {
+        if let Ok(mut f) = dev.fences.lock() {
+            f.insert(fence_handle, true);
         }
     }
     VK_SUCCESS

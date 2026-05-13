@@ -724,6 +724,82 @@ fn dynamic_rendering_emits_begin_end_render_pass_frame_ops() {
 }
 
 #[test]
+fn queue_submit_signals_fence_so_wait_does_not_hang() {
+    // Symmetric to acquire_next_image_signals_fence — but for
+    // vkQueueSubmit. Apps that pass a fence to QueueSubmit and
+    // immediately WaitForFences(fence) for completion would hang
+    // forever before this commit.
+    use atrium_vk_icd::{
+        vkAllocateCommandBuffers, vkBeginCommandBuffer, vkCmdDraw,
+        vkCreateCommandPool, vkCreateDevice, vkCreateFence,
+        vkDestroyCommandPool, vkDestroyDevice, vkDestroyFence,
+        vkEndCommandBuffer, vkGetDeviceQueue, vkQueueSubmit, vkWaitForFences,
+    };
+
+    let sock = tmp_socket("submit-fence");
+    let sw_backend = Arc::new(SoftwareBackend::new());
+    let backend_for_listener: Arc<dyn Backend> = sw_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap();
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+    let _env = EnvLock::set(&sock);
+
+    type VkDevice = *mut std::ffi::c_void;
+    type VkQueue = *mut std::ffi::c_void;
+    type VkCommandBuffer = *mut std::ffi::c_void;
+
+    let mut instance: VkInstance = std::ptr::null_mut();
+    unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
+    let mut devices: [VkPhysicalDevice; 1] = [std::ptr::null_mut(); 1];
+    let mut cap: u32 = 1;
+    unsafe { vkEnumeratePhysicalDevices(instance, &mut cap, devices.as_mut_ptr()); }
+    let mut device: VkDevice = std::ptr::null_mut();
+    unsafe { vkCreateDevice(devices[0], std::ptr::null(), std::ptr::null(), &mut device); }
+    let mut queue: VkQueue = std::ptr::null_mut();
+    unsafe { vkGetDeviceQueue(device, 0, 0, &mut queue); }
+    let mut pool: u64 = 0;
+    unsafe { vkCreateCommandPool(device, std::ptr::null(), std::ptr::null(), &mut pool); }
+
+    let mut cbinfo = [0u8; 40];
+    cbinfo[0..4].copy_from_slice(&40u32.to_le_bytes());
+    cbinfo[16..24].copy_from_slice(&pool.to_le_bytes());
+    cbinfo[28..32].copy_from_slice(&1u32.to_le_bytes());
+    let mut cbs: [VkCommandBuffer; 1] = [std::ptr::null_mut(); 1];
+    unsafe { vkAllocateCommandBuffers(device, cbinfo.as_ptr() as *const _, cbs.as_mut_ptr()); }
+    let cb = cbs[0];
+    unsafe { vkBeginCommandBuffer(cb, std::ptr::null()); }
+    unsafe { vkCmdDraw(cb, 3, 1, 0, 0); }
+    unsafe { vkEndCommandBuffer(cb); }
+
+    // Unsignalled fence.
+    let mut fc = [0u8; 24];
+    fc[0..4].copy_from_slice(&8u32.to_le_bytes());
+    let mut fence: u64 = 0;
+    unsafe { vkCreateFence(device, fc.as_ptr() as *const _, std::ptr::null(), &mut fence); }
+
+    let mut si = [0u8; 72];
+    si[0..4].copy_from_slice(&4u32.to_le_bytes());
+    si[40..44].copy_from_slice(&1u32.to_le_bytes());
+    let cb_arr = [cb];
+    si[48..56].copy_from_slice(&(cb_arr.as_ptr() as u64).to_le_bytes());
+    let r = unsafe {
+        vkQueueSubmit(queue, 1, si.as_ptr() as *const _, fence as *mut std::ffi::c_void)
+    };
+    assert_eq!(r, 0);
+
+    let fences = [fence];
+    let r = unsafe { vkWaitForFences(device, 1, fences.as_ptr(), 1, 0) };
+    assert_eq!(r, 0, "QueueSubmit must signal the fence on completion");
+
+    unsafe { vkDestroyFence(device, fence, std::ptr::null()); }
+    unsafe { vkDestroyCommandPool(device, pool, std::ptr::null()); }
+    unsafe { vkDestroyDevice(device, std::ptr::null()); }
+    unsafe { vkDestroyInstance(instance, std::ptr::null()); }
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[test]
 fn acquire_next_image_signals_fence_so_wait_does_not_hang() {
     // Spec: vkAcquireNextImageKHR signals the fence (if non-null)
     // once the image is available. Prior to this commit we
