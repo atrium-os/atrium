@@ -410,15 +410,61 @@ impl Interpreter {
         // stored value.
         let mut storage: HashMap<Word, ConstantValue> = HashMap::new();
 
-        if func.blocks.len() != 1 {
-            return Err(InterpError::UnsupportedControlFlow(
-                format!("fragment has {} blocks; v0c supports exactly 1",
-                        func.blocks.len()),
-            ));
-        }
-        let block = &func.blocks[0];
-        for inst in &block.instructions {
-            self.eval_inst(inst, &mut values, &mut storage, inputs)?;
+        // Multi-block walk: start at the first block (rspirv
+        // keeps SPIR-V function blocks in declaration order;
+        // the first one is the entry). Each block ends with a
+        // terminator (OpBranch / OpBranchConditional /
+        // OpReturn / OpKill etc.); we follow it.
+        let mut current_idx: usize = 0;
+        let mut hops: u32 = 0;
+        const MAX_HOPS: u32 = 1024;
+        loop {
+            if hops >= MAX_HOPS {
+                return Err(InterpError::UnsupportedControlFlow(format!(
+                    "fragment exceeded {MAX_HOPS} block-hops (loop?)"
+                )));
+            }
+            hops += 1;
+            let block = func.blocks.get(current_idx).ok_or_else(||
+                InterpError::UnsupportedControlFlow(format!(
+                    "block index {current_idx} out of range",
+                )))?;
+            // Run every non-terminator inst.
+            let last_idx = block.instructions.len().saturating_sub(1);
+            for (i, inst) in block.instructions.iter().enumerate() {
+                if i == last_idx { break; }
+                self.eval_inst(inst, &mut values, &mut storage, inputs)?;
+            }
+            let term = block.instructions.last().ok_or_else(||
+                InterpError::UnsupportedControlFlow(
+                    "block has no instructions".into()))?;
+            match term.class.opcode {
+                Op::Return | Op::Kill | Op::TerminateInvocation
+                | Op::Unreachable => break,
+                Op::Branch => {
+                    let label = op_id(&term.operands, 0)?;
+                    current_idx = self.find_block_index(func, label)?;
+                }
+                Op::BranchConditional => {
+                    let cond_id = op_id(&term.operands, 0)?;
+                    let t_label = op_id(&term.operands, 1)?;
+                    let f_label = op_id(&term.operands, 2)?;
+                    let cond = self.lookup_value(cond_id, &values)?;
+                    let taken = match cond {
+                        ConstantValue::Bool(b) => b,
+                        ConstantValue::Int(n) => n != 0,
+                        other => return Err(InterpError::UnsupportedOpcode(
+                            format!("BranchConditional cond: {other:?}"))),
+                    };
+                    let target = if taken { t_label } else { f_label };
+                    current_idx = self.find_block_index(func, target)?;
+                }
+                Op::SelectionMerge | Op::LoopMerge =>
+                    return Err(InterpError::UnsupportedControlFlow(
+                        "merge marker as terminator".into())),
+                other => return Err(InterpError::UnsupportedControlFlow(
+                    format!("unsupported terminator {other:?}"))),
+            }
         }
 
         // Find the Output variable; expect vec4<f32>.
@@ -456,6 +502,11 @@ impl Interpreter {
             // as block.label, not in instructions, but
             // older parses might leave it. No-op either way.
             Op::Label | Op::Nop => Ok(()),
+            // Structured-CFG merge markers carry no
+            // runtime semantics for the interpreter — the
+            // multi-block stepper already follows
+            // Op{Branch,BranchConditional}.
+            Op::SelectionMerge | Op::LoopMerge => Ok(()),
             // ── Float arithmetic ──────────────────────────
             Op::FAdd => self.eval_binop_float(inst, values, |a, b| a + b),
             Op::FSub => self.eval_binop_float(inst, values, |a, b| a - b),
@@ -718,6 +769,22 @@ impl Interpreter {
         let stored = eval_float_unop_value(&src, &op)?;
         values.insert(result_id, stored);
         Ok(())
+    }
+
+    /// Find a SPIR-V function's block by its OpLabel id.
+    fn find_block_index(
+        &self,
+        func: &rspirv::dr::Function,
+        label_id: Word,
+    ) -> Result<usize, InterpError> {
+        for (i, b) in func.blocks.iter().enumerate() {
+            if b.label.as_ref().and_then(|l| l.result_id) == Some(label_id) {
+                return Ok(i);
+            }
+        }
+        Err(InterpError::UnsupportedControlFlow(format!(
+            "block label {label_id} not found in function",
+        )))
     }
 
     /// Read a leaf value out of the per-storage-class byte

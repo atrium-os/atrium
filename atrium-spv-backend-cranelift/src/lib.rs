@@ -179,12 +179,17 @@ pub fn compile(module: &Module, target: Target) -> Result<CompileOutput, Backend
         // host_offset stays at 0 — function-relative;
         // production crash handlers resolve which function
         // via dlsym first and consult the pcmap second.
+        // First *real* source SPIR-V offset for this fn:
+        // skip the entry-block prelude of hoisted constants
+        // (source_spirv_offset == 0) and pick the first
+        // instruction translated from real SPIR-V.
         let first_spirv_offset = module.functions
             .iter()
             .find(|f| f.name == func.name)
             .and_then(|f| f.blocks.get(&f.entry_block))
-            .and_then(|b| b.insts.first())
-            .map(|i| i.source_spirv_offset)
+            .and_then(|b| b.insts.iter()
+                .map(|i| i.source_spirv_offset)
+                .find(|o| *o != 0))
             .unwrap_or(0);
         // For multi-function modules every entry currently
         // has host_offset=0 (we don't have real per-
@@ -241,6 +246,19 @@ fn emit_function(
         builder.switch_to_block(entry);
         builder.append_block_params_for_function_params(entry);
 
+        // Pre-create one Cranelift block per IR block (so
+        // terminators in any block can reference each
+        // other freely). The entry IR block reuses the
+        // Cranelift entry block (which carries the
+        // function params).
+        let mut block_map: HashMap<atrium_spv_ir::BlockId,
+                                   cranelift_codegen::ir::Block> = HashMap::new();
+        block_map.insert(func.entry_block, entry);
+        for (id, _) in &func.blocks {
+            if *id == func.entry_block { continue; }
+            block_map.insert(*id, builder.create_block());
+        }
+
         let mut translator = FnTranslator {
             stage: func.stage,
             entry_block: entry,
@@ -251,13 +269,27 @@ fn emit_function(
             scalars: HashMap::new(),
             vectors: HashMap::new(),
             pointers: HashMap::new(),
+            block_map,
         };
 
-        // Single-block IR per phase 1 v1.
-        let block = func.blocks.get(&func.entry_block).ok_or_else(||
-            BackendError::Internal("entry block missing".to_string()))?;
-        for inst in &block.insts {
-            translator.emit_inst(inst, &mut builder)?;
+        // Walk every IR block in id order, switching the
+        // builder to the Cranelift block for each. The
+        // terminator (Branch / BranchCond / Return) emits
+        // the right Cranelift control-flow instruction.
+        let mut block_ids: Vec<atrium_spv_ir::BlockId> =
+            func.blocks.keys().copied().collect();
+        block_ids.sort_by_key(|b| b.0);
+        for id in &block_ids {
+            let block = func.blocks.get(id).ok_or_else(||
+                BackendError::Internal(format!("missing block {id:?}")))?;
+            let cl_block = *translator.block_map.get(id).ok_or_else(||
+                BackendError::Internal(format!("no cl block for {id:?}")))?;
+            if *id != func.entry_block {
+                builder.switch_to_block(cl_block);
+            }
+            for inst in &block.insts {
+                translator.emit_inst(inst, &mut builder)?;
+            }
         }
 
         builder.seal_all_blocks();
@@ -267,7 +299,7 @@ fn emit_function(
     clif_module
         .define_function(func_id, &mut ctx)
         .map_err(|e| BackendError::Internal(
-            format!("define_function({symbol_name}): {e}"),
+            format!("define_function({symbol_name}): {e:?}"),
         ))?;
     Ok(())
 }
@@ -294,6 +326,10 @@ struct FnTranslator {
     /// Variable. `Op::Load` / `Op::Store` consult this map
     /// to find what `mem.load`/`mem.store` should target.
     pointers: HashMap<ValueId, (ClifValue, i32)>,
+    /// IR BlockId → Cranelift block. Pre-populated for
+    /// every IR block so terminators can branch freely.
+    block_map: HashMap<atrium_spv_ir::BlockId,
+                       cranelift_codegen::ir::Block>,
 }
 
 impl FnTranslator {
@@ -303,6 +339,21 @@ impl FnTranslator {
         builder: &mut FunctionBuilder,
     ) -> Result<(), BackendError> {
         match &inst.op {
+            Op::ConstInt { value, kind } => {
+                use atrium_spv_ir::IntKind;
+                let (clif_ty, narrowed) = match kind {
+                    IntKind::I32 | IntKind::U32 =>
+                        (clif_types::I32, (*value as i32) as i64),
+                    IntKind::I64 | IntKind::U64 =>
+                        (clif_types::I64, *value),
+                };
+                let v = builder.ins().iconst(clif_ty, narrowed);
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "ConstInt without result Value".to_string()))?;
+                self.scalars.insert(result.id, v);
+                Ok(())
+            }
             Op::ConstFloat { value, kind: FloatKind::F32 } => {
                 let v = builder.ins().f32const(*value as f32);
                 let result = inst.result.as_ref().ok_or_else(||
@@ -417,6 +468,30 @@ impl FnTranslator {
                         "Op::Load of pointee type {other:?} not supported",
                     ))),
                 }
+                Ok(())
+            }
+            Op::Branch(target) => {
+                let cl_target = *self.block_map.get(target).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "Op::Branch to unknown block {target:?}",
+                    )))?;
+                builder.ins().jump(cl_target, &[]);
+                Ok(())
+            }
+            Op::BranchCond { cond, t_block, f_block } => {
+                let cv = self.scalars.get(&cond.id).copied().ok_or_else(||
+                    BackendError::Internal(format!(
+                        "Op::BranchCond cond {:?} not in scalars",
+                        cond.id)))?;
+                let cl_t = *self.block_map.get(t_block).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "BranchCond true target unknown: {t_block:?}",
+                    )))?;
+                let cl_f = *self.block_map.get(f_block).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "BranchCond false target unknown: {f_block:?}",
+                    )))?;
+                builder.ins().brif(cv, cl_t, &[], cl_f, &[]);
                 Ok(())
             }
             Op::Return => {

@@ -100,6 +100,14 @@ impl ConstantContext {
     pub fn get(&self, id: Word) -> Option<&StoredConstant> {
         self.constants.get(&id)
     }
+
+    /// Iterate over every (id, stored-constant) pair.
+    /// Used by multi-block translation to pre-materialise
+    /// every constant in the entry block so SSA references
+    /// from any subsequent block stay dominated.
+    pub fn iter(&self) -> impl Iterator<Item = (&Word, &StoredConstant)> {
+        self.constants.iter()
+    }
 }
 
 fn translate_op_constant(

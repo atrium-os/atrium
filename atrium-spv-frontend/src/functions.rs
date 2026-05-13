@@ -71,8 +71,10 @@ fn translate_one(
     offsets: &OffsetTable,
     fn_start_index: usize,
 ) -> Result<Function, FrontendError> {
-    // Reject control flow per v1 stub.
-    cfg::reject_unstructured(spv)?;
+    // Classify all blocks up front; this also validates the
+    // SPIR-V is structured (Op{Branch,Switch}Conditional
+    // must follow Op{Selection,Loop}Merge).
+    let classification = cfg::classify(spv)?;
 
     let def = spv.def.as_ref().ok_or_else(|| FrontendError::Malformed(
         "function missing OpFunction def".to_string()))?;
@@ -93,55 +95,179 @@ fn translate_one(
         .unwrap_or_else(|| format!("fn_{fn_id}"));
 
     // ── Walk blocks ─────────────────────────────────────────
+    //
+    // Build a SPIR-V-label-id → IR BlockId map first so
+    // terminators emitted in this pass can reference the
+    // right target.
     let mut id_map: HashMap<Word, Value> = HashMap::new();
     let mut next_value_id: u32 = 0;
     let mut blocks: HashMap<BlockId, Block> = HashMap::new();
 
-    // Phase 1 v1: exactly one block per cfg::reject_unstructured.
-    let block_id = BlockId(0);
-    let spv_block = &spv.blocks[0];
-    let mut insts: Vec<Inst> = Vec::new();
-
-    // The OffsetTable index for this function's first
-    // body instruction:
-    //   fn_start_index points at OpFunction.
-    //   + 1 OpFunction itself
-    //   + parameters.len() OpFunctionParameter records
-    //   + 1 OpLabel of the first (and only) block
-    let mut spv_inst_index = fn_start_index
-        + 1
-        + spv.parameters.len()
-        + spv_block.label.iter().count();
-
-    for spv_inst in &spv_block.instructions {
-        let source_offset = offsets.get(spv_inst_index);
-        translate_inst(
-            spv_inst,
-            types,
-            constants,
-            iface,
-            &mut id_map,
-            &mut next_value_id,
-            &mut insts,
-            source_offset,
-        )?;
-        spv_inst_index += 1;
+    let mut label_to_block_id: HashMap<Word, BlockId> = HashMap::new();
+    for (i, spv_block) in spv.blocks.iter().enumerate() {
+        let label_id = spv_block.label.as_ref().and_then(|l| l.result_id)
+            .ok_or_else(|| FrontendError::Malformed(
+                "block without OpLabel".to_string()))?;
+        label_to_block_id.insert(label_id, BlockId(i as u32));
     }
 
-    blocks.insert(block_id, Block {
-        id: block_id,
-        kind: BlockKind::Linear,
-        insts,
-    });
+    // OffsetTable index starts at the first instruction
+    // after OpFunction + parameters; we increment as we
+    // walk every instruction (including OpLabels) so the
+    // table stays aligned with the source stream.
+    let mut spv_inst_index = fn_start_index
+        + 1
+        + spv.parameters.len();
+
+    // Pre-materialise every constant in the entry block so
+    // SSA references from later blocks remain dominated.
+    // Without this hoist, a constant first referenced
+    // inside one branch can be re-used from a sibling
+    // branch, violating Cranelift's dominance verifier.
+    let mut entry_prelude: Vec<Inst> = Vec::new();
+    {
+        // Collect ids first to avoid borrowing `constants`
+        // while we recurse into resolve_value.
+        let const_ids: Vec<Word> = constants.iter().map(|(id, _)| *id).collect();
+        for cid in const_ids {
+            // Use offset 0 — these instructions don't map
+            // to any specific source SPIR-V byte. (The
+            // ConstFloat / ConstVec emissions don't carry
+            // user-visible offsets anyway.)
+            let _ = resolve_value(
+                cid, types, constants, &mut id_map,
+                &mut next_value_id, &mut entry_prelude, 0,
+            );
+            // Errors here (e.g. a constant whose type isn't
+            // representable) are ignored — the constant
+            // will fail later if actually referenced, with
+            // a more localised diagnostic.
+        }
+    }
+
+    for (i, spv_block) in spv.blocks.iter().enumerate() {
+        let label_id = spv_block.label.as_ref().and_then(|l| l.result_id)
+            .ok_or_else(|| FrontendError::Malformed(
+                "block without OpLabel".to_string()))?;
+        let block_id = BlockId(i as u32);
+        // Step past the OpLabel itself.
+        if spv_block.label.is_some() { spv_inst_index += 1; }
+
+        // For the entry block, seed insts with the pre-
+        // materialised constants so all later SSA refs are
+        // dominated.
+        let mut insts: Vec<Inst> = if i == 0 {
+            std::mem::take(&mut entry_prelude)
+        } else {
+            Vec::new()
+        };
+        let block_kind = classification.get(label_id)
+            .cloned()
+            .unwrap_or(BlockKind::Linear);
+
+        for spv_inst in &spv_block.instructions {
+            let source_offset = offsets.get(spv_inst_index);
+            translate_inst_with_cfg(
+                spv_inst,
+                types,
+                constants,
+                iface,
+                &label_to_block_id,
+                &mut id_map,
+                &mut next_value_id,
+                &mut insts,
+                source_offset,
+            )?;
+            spv_inst_index += 1;
+        }
+
+        blocks.insert(block_id, Block {
+            id: block_id,
+            kind: block_kind,
+            insts,
+        });
+    }
+
+    let entry_block_id = label_to_block_id
+        .get(&spv.blocks.first()
+             .and_then(|b| b.label.as_ref().and_then(|l| l.result_id))
+             .unwrap_or(0))
+        .copied()
+        .unwrap_or(BlockId(0));
 
     Ok(Function {
         name,
         stage,
         params: Vec::new(), // no params in v1 narrow scope
         return_type,
-        entry_block: block_id,
+        entry_block: entry_block_id,
         blocks,
     })
+}
+
+/// CFG-aware shim around [`translate_inst`]. Handles the
+/// terminator + merge-marker opcodes that need the
+/// SPIR-V-label → IR BlockId map; delegates everything
+/// else to the existing per-instruction translator.
+#[allow(clippy::too_many_arguments)]
+fn translate_inst_with_cfg(
+    spv_inst: &Instruction,
+    types: &TypeContext,
+    constants: &ConstantContext,
+    iface: &InterfaceContext,
+    label_to_block_id: &HashMap<Word, BlockId>,
+    id_map: &mut HashMap<Word, Value>,
+    next_value_id: &mut u32,
+    insts: &mut Vec<Inst>,
+    source_spirv_offset: u32,
+) -> Result<(), FrontendError> {
+    match spv_inst.class.opcode {
+        // Structured-CFG markers — their merge / continue
+        // operands are already encoded in BlockKind, so
+        // they emit no IR instruction.
+        SpvOp::SelectionMerge | SpvOp::LoopMerge => Ok(()),
+        SpvOp::Branch => {
+            let target_label = expect_id(&spv_inst.operands, 0)?;
+            let target = label_to_block_id.get(&target_label)
+                .copied()
+                .ok_or_else(|| FrontendError::Malformed(format!(
+                    "OpBranch target label {target_label} not in this function",
+                )))?;
+            insts.push(Inst {
+                op: Op::Branch(target),
+                result: None,
+                source_spirv_offset,
+            });
+            Ok(())
+        }
+        SpvOp::BranchConditional => {
+            let cond_id = expect_id(&spv_inst.operands, 0)?;
+            let t_label = expect_id(&spv_inst.operands, 1)?;
+            let f_label = expect_id(&spv_inst.operands, 2)?;
+            let cond = resolve_value(
+                cond_id, types, constants, id_map, next_value_id, insts,
+                source_spirv_offset,
+            )?;
+            let t_block = label_to_block_id.get(&t_label).copied()
+                .ok_or_else(|| FrontendError::Malformed(format!(
+                    "OpBranchConditional true target {t_label} not in this function",
+                )))?;
+            let f_block = label_to_block_id.get(&f_label).copied()
+                .ok_or_else(|| FrontendError::Malformed(format!(
+                    "OpBranchConditional false target {f_label} not in this function",
+                )))?;
+            insts.push(Inst {
+                op: Op::BranchCond { cond, t_block, f_block },
+                result: None,
+                source_spirv_offset,
+            });
+            Ok(())
+        }
+        _ => translate_inst(
+            spv_inst, types, constants, iface, id_map, next_value_id,
+            insts, source_spirv_offset,
+        ),
+    }
 }
 
 /// Translate one SPIR-V instruction. Pushes zero or more
