@@ -560,6 +560,8 @@ const ATRIUM_PHYSICAL_DEVICE_ENTRY_POINTS: &[&str] = &[
     "vkGetPhysicalDeviceSurfaceCapabilitiesKHR",
     "vkGetPhysicalDeviceSurfaceFormatsKHR",
     "vkGetPhysicalDeviceSurfacePresentModesKHR",
+    "vkGetPhysicalDeviceSurfaceCapabilities2KHR",
+    "vkGetPhysicalDeviceSurfaceFormats2KHR",
     "vkEnumerateDeviceExtensionProperties",
 ];
 
@@ -632,6 +634,8 @@ const ATRIUM_INSTANCE_ONLY_ENTRY_POINTS: &[&str] = &[
     "vkGetPhysicalDeviceSurfaceCapabilitiesKHR",
     "vkGetPhysicalDeviceSurfaceFormatsKHR",
     "vkGetPhysicalDeviceSurfacePresentModesKHR",
+    "vkGetPhysicalDeviceSurfaceCapabilities2KHR",
+    "vkGetPhysicalDeviceSurfaceFormats2KHR",
     "vkCreateDebugUtilsMessengerEXT",
     "vkDestroyDebugUtilsMessengerEXT",
     "vkSubmitDebugUtilsMessageEXT",
@@ -1231,6 +1235,14 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkPhysicalDevice, u64, *mut u32, *mut u32) -> VkResult, FnVoidPtr,
             >(vkGetPhysicalDeviceSurfacePresentModesKHR)),
+        "vkGetPhysicalDeviceSurfaceCapabilities2KHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkPhysicalDevice, *const c_void, *mut c_void) -> VkResult, FnVoidPtr,
+            >(vkGetPhysicalDeviceSurfaceCapabilities2KHR)),
+        "vkGetPhysicalDeviceSurfaceFormats2KHR" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkPhysicalDevice, *const c_void, *mut u32, *mut c_void) -> VkResult, FnVoidPtr,
+            >(vkGetPhysicalDeviceSurfaceFormats2KHR)),
         "vkCreateSwapchainKHR" =>
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkDevice, *const c_void, *const c_void, *mut u64) -> VkResult, FnVoidPtr,
@@ -4653,6 +4665,13 @@ const ATRIUM_INSTANCE_EXTENSIONS: &[(&[u8], u32)] = &[
     // fire callbacks; labels and object names are silently dropped.
     // Real diagnostic forwarding can land later if useful.
     (b"VK_EXT_debug_utils\0", 2),
+    // VK_KHR_get_surface_capabilities2 — instance-level
+    // extension that exposes the *2 surface-probe entry points.
+    // Apps that opt in to KHR_get_physical_device_properties2
+    // typically also enable this one; required by VK_KHR_
+    // surface_protected_capabilities and several other
+    // downstream extensions Mesa/SDL2 probe for.
+    (b"VK_KHR_get_surface_capabilities2\0", 1),
 ];
 
 #[no_mangle]
@@ -5072,6 +5091,86 @@ pub unsafe extern "C" fn vkGetPhysicalDeviceSurfaceFormatsKHR(
     if to_copy < n { 5 /* VK_INCOMPLETE */ } else { VK_SUCCESS }
 }
 
+/// `vkGetPhysicalDeviceSurfaceCapabilities2KHR` — VK_KHR_
+/// get_surface_capabilities2 variant. Parses
+/// VkPhysicalDeviceSurfaceInfo2KHR (16-byte header + surface at
+/// offset 16) and fills VkSurfaceCapabilities2KHR (16-byte
+/// header + inner caps at offset 16).
+#[no_mangle]
+pub unsafe extern "C" fn vkGetPhysicalDeviceSurfaceCapabilities2KHR(
+    physical_device:  VkPhysicalDevice,
+    p_surface_info:   *const c_void,
+    p_caps:           *mut c_void,
+) -> VkResult {
+    if p_surface_info.is_null() || p_caps.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let info = p_surface_info as *const u8;
+    let info_p_next = std::ptr::read_unaligned(info.add(8) as *const *mut c_void);
+    let surface = std::ptr::read_unaligned(info.add(16) as *const u64);
+    let _ = walk_p_next_chain(info_p_next);
+
+    let out = p_caps as *mut u8;
+    let out_p_next = std::ptr::read_unaligned(out.add(8) as *const *mut c_void);
+    let inner = out.add(16) as *mut c_void;
+    let r = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface, inner);
+    let _ = walk_p_next_chain(out_p_next);
+    r
+}
+
+/// `vkGetPhysicalDeviceSurfaceFormats2KHR` — VK_KHR_get_surface_
+/// capabilities2 variant. Output array is VkSurfaceFormat2KHR
+/// (16-byte header + 8-byte VkSurfaceFormatKHR inner per slot).
+#[no_mangle]
+pub unsafe extern "C" fn vkGetPhysicalDeviceSurfaceFormats2KHR(
+    physical_device:       VkPhysicalDevice,
+    p_surface_info:        *const c_void,
+    p_surface_format_count: *mut u32,
+    p_surface_formats:     *mut c_void,
+) -> VkResult {
+    if p_surface_info.is_null() || p_surface_format_count.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    let info = p_surface_info as *const u8;
+    let info_p_next = std::ptr::read_unaligned(info.add(8) as *const *mut c_void);
+    let surface = std::ptr::read_unaligned(info.add(16) as *const u64);
+    let _ = walk_p_next_chain(info_p_next);
+
+    let n = ATRIUM_SURFACE_FORMATS.len() as u32;
+    if p_surface_formats.is_null() {
+        *p_surface_format_count = n;
+        let _ = physical_device; let _ = surface;
+        return VK_SUCCESS;
+    }
+    let cap = *p_surface_format_count;
+    if cap == 0 { return VK_SUCCESS; }
+    let to_copy = cap.min(n);
+
+    // Each VkSurfaceFormat2KHR is 16-byte header (sType+pad+pNext)
+    // + 8-byte inner VkSurfaceFormatKHR. The struct's natural
+    // stride is 24 bytes; layout-checked by ash + by the test
+    // below.
+    const SLOT_STRIDE: usize = 24;
+    let base = p_surface_formats as *mut u8;
+    let put32 = |b: *mut u8, off: usize, v: u32| {
+        std::ptr::copy_nonoverlapping(
+            v.to_le_bytes().as_ptr(), b.add(off), 4,
+        );
+    };
+    for i in 0..to_copy {
+        let slot = base.add((i as usize) * SLOT_STRIDE);
+        let slot_p_next = std::ptr::read_unaligned(slot.add(8) as *const *mut c_void);
+        // Don't overwrite the caller-provided sType / pNext header;
+        // we only fill the inner block at offset 16.
+        let (fmt, cs) = ATRIUM_SURFACE_FORMATS[i as usize];
+        put32(slot, 16, fmt);
+        put32(slot, 20, cs);
+        let _ = walk_p_next_chain(slot_p_next);
+    }
+    *p_surface_format_count = to_copy;
+    if to_copy < n { 5 /* VK_INCOMPLETE */ } else { VK_SUCCESS }
+}
+
 /// `vkGetPhysicalDeviceSurfacePresentModesKHR` — FIFO only (the
 /// spec's required mode + the natural pairing with Atrium's
 /// server-side vblank pacing per §6.5.5).
@@ -5399,20 +5498,21 @@ mod tests {
     #[test]
     fn enumerate_instance_extensions_lists_atrium_surface() {
         // VK_KHR_surface + VK_EXT_atrium_surface + VK_EXT_debug_utils
-        // — see ATRIUM_INSTANCE_EXTENSIONS.
+        // + VK_KHR_get_surface_capabilities2 — see
+        // ATRIUM_INSTANCE_EXTENSIONS.
         let f = lookup(b"vkEnumerateInstanceExtensionProperties\0").unwrap();
         let typed: unsafe extern "C" fn(*const c_char, *mut u32, *mut VkExtensionProperties) -> VkResult =
             unsafe { std::mem::transmute(f) };
         let mut count: u32 = 99;
         let r = unsafe { typed(std::ptr::null(), &mut count, std::ptr::null_mut()) };
         assert_eq!(r, VK_SUCCESS);
-        assert_eq!(count, 3);
+        assert_eq!(count, 4);
 
-        let mut props: [VkExtensionProperties; 4] = unsafe { std::mem::zeroed() };
-        let mut cap: u32 = 4;
+        let mut props: [VkExtensionProperties; 8] = unsafe { std::mem::zeroed() };
+        let mut cap: u32 = 8;
         let _ = unsafe { typed(std::ptr::null(), &mut cap, props.as_mut_ptr()) };
-        assert_eq!(cap, 3);
-        let names: Vec<String> = (0..3).map(|i| {
+        assert_eq!(cap, 4);
+        let names: Vec<String> = (0..4).map(|i| {
             let bytes: Vec<u8> = props[i].extensionName.iter()
                 .take_while(|&&c| c != 0).map(|&c| c as u8).collect();
             String::from_utf8(bytes).unwrap()
@@ -5420,6 +5520,67 @@ mod tests {
         assert_eq!(names[0], "VK_KHR_surface");
         assert_eq!(names[1], "VK_EXT_atrium_surface");
         assert_eq!(names[2], "VK_EXT_debug_utils");
+        assert_eq!(names[3], "VK_KHR_get_surface_capabilities2");
+    }
+
+    #[test]
+    fn surface_capabilities2_and_formats2_match_1_0_variants() {
+        // *2 entry points must resolve.
+        assert!(lookup(b"vkGetPhysicalDeviceSurfaceCapabilities2KHR\0").is_some());
+        assert!(lookup(b"vkGetPhysicalDeviceSurfaceFormats2KHR\0").is_some());
+
+        // Drive Formats2 against an opaque physical-device handle.
+        let pd = AtriumPhysicalDevice {
+            loader_dispatch_slot: VK_ICD_LOADER_MAGIC,
+            backend_vendor: aqueduct_gpu::backends::GpuVendor::Software,
+            backend_generation: 0,
+            instance: std::ptr::null_mut(),
+        };
+        let phys: VkPhysicalDevice = &pd as *const _ as *mut _;
+
+        // VkPhysicalDeviceSurfaceInfo2KHR: 16-byte header + 8-byte
+        // surface (u64) = 24 bytes total.
+        let mut info = [0u8; 24];
+        info[0..4].copy_from_slice(&1_000_119_000u32.to_le_bytes()); // sType
+        // pNext at offset 8 stays null.
+        info[16..24].copy_from_slice(&42u64.to_le_bytes()); // surface
+
+        // First call: size query.
+        let mut count: u32 = 0;
+        let r = unsafe {
+            vkGetPhysicalDeviceSurfaceFormats2KHR(
+                phys, info.as_ptr() as *const c_void, &mut count, std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(r, VK_SUCCESS);
+        assert_eq!(count, 4, "must report all four ATRIUM_SURFACE_FORMATS");
+
+        // Second call: real buffer (24 bytes per VkSurfaceFormat2KHR).
+        let mut buf = vec![0u8; 24 * 4];
+        // Pre-fill caller-side sType for each slot.
+        for i in 0..4 {
+            buf[i*24..i*24+4].copy_from_slice(&1_000_119_002u32.to_le_bytes());
+        }
+        let mut got: u32 = 4;
+        let r = unsafe {
+            vkGetPhysicalDeviceSurfaceFormats2KHR(
+                phys, info.as_ptr() as *const c_void,
+                &mut got, buf.as_mut_ptr() as *mut c_void,
+            )
+        };
+        assert_eq!(r, VK_SUCCESS);
+        assert_eq!(got, 4);
+
+        // Inner VkSurfaceFormatKHR sits at offset 16 of each slot.
+        let read = |off: usize| u32::from_le_bytes(
+            buf[off..off+4].try_into().unwrap()
+        );
+        assert_eq!(read(16),  37); // slot 0: R8G8B8A8_UNORM
+        assert_eq!(read(40),  43); // slot 1: R8G8B8A8_SRGB
+        assert_eq!(read(64),  44); // slot 2: B8G8R8A8_UNORM
+        assert_eq!(read(88),  50); // slot 3: B8G8R8A8_SRGB
+        // sType preserved by us (we don't touch the header).
+        assert_eq!(read(0), 1_000_119_002);
     }
 
     #[test]
