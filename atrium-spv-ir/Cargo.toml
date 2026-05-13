@@ -1,0 +1,15 @@
+[package]
+name        = "atrium-spv-ir"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "SSA IR for atrium-vk-icd's tier-2 software Vulkan renderer. Sits between atrium-spv-frontend (SPIR-V parser) and the production backends (atrium-spv-backend-bespoke + atrium-spv-backend-cranelift). Test-only consumer: atrium-spv-tests::interpreter. See docs/spec/tier2-renderer.md §5 and docs/spec/tier2-shader-codegen-constraints.md §B."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# No runtime deps — this crate is types only. Frontend / backends /
+# interpreter pull in their own dependencies (rspirv, cranelift,
+# pptk-codegen-arm64, etc.).
