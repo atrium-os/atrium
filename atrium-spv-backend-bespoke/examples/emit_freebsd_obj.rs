@@ -20,6 +20,12 @@
 //!   emit_freebsd_obj <out.o> cextract   -- OpCompositeExtract
 //!   emit_freebsd_obj <out.o> dot        -- OpDot + VectorTimesScalar
 //!
+//! Prefix any kind with `spirv` to write the raw SPIR-V
+//! module instead of a compiled object (for the end-to-end
+//! in-VM check that drives the real atrium-spv-compile):
+//!   emit_freebsd_obj <out.spv> spirv const
+//!   emit_freebsd_obj <out.spv> spirv loop 5
+//!
 //! stdout is always the expected RGBA for the chosen
 //! shader+input, so the in-VM harness can diff against it
 //! without re-deriving.
@@ -686,7 +692,17 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let path = args.next()
         .unwrap_or_else(|| "/tmp/atrium_fs_freebsd.o".to_string());
-    let kind = args.next().unwrap_or_else(|| "const".to_string());
+    let mut kind = args.next().unwrap_or_else(|| "const".to_string());
+
+    // `spirv` mode: write the raw SPIR-V module for the
+    // *next* kind argument to <path> instead of a compiled
+    // object. Used by the end-to-end in-VM check, which
+    // feeds the .spv to the real atrium-spv-compile binary
+    // on-target rather than emitting the object host-side.
+    let emit_spirv_only = kind == "spirv";
+    if emit_spirv_only {
+        kind = args.next().unwrap_or_else(|| "const".to_string());
+    }
 
     let (spirv, expected): (Vec<u8>, [f32; 4]) = match kind.as_str() {
         "const" => {
@@ -791,6 +807,15 @@ fn main() {
             std::process::exit(2);
         }
     };
+
+    if emit_spirv_only {
+        std::fs::write(&path, &spirv).expect("write spirv");
+        // stdout: the expected RGBA the in-VM harness diffs against.
+        println!("{} {} {} {}", expected[0], expected[1], expected[2], expected[3]);
+        eprintln!("wrote {} ({} bytes, SPIR-V, kind={})",
+                  path, spirv.len(), kind);
+        return;
+    }
 
     let module = translate(&spirv).expect("frontend translate");
     let out = compile(&module, Target::Aarch64FreeBSD).expect("bespoke compile");

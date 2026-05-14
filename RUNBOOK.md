@@ -2208,3 +2208,49 @@ correctly on the production target, not just the macOS host.
 > bespoke runner because i32 Phis returned Unsupported.
 > Lesson: the in-VM check is not optional; the host suite
 > alone masked a whole class of bugs.
+
+### End-to-end in-VM verification (production compile chain)
+
+`run-in-vm.sh` emits the object file *host-side* and only
+ships the `.o`. That proves the bespoke backend's codegen,
+but not the rest of the production chain. `run-e2e-in-vm.sh`
+closes that gap — it drives the real `atrium-spv-compile`
+binary, cross-built for FreeBSD/aarch64 and run **inside the
+VM**, on a raw SPIR-V input:
+
+```bash
+sh atrium-spv-backend-bespoke/verify/run-e2e-in-vm.sh
+```
+
+```text
+SPIR-V file  ->  atrium-spv-compile (in VM)
+             ->  frontend + bespoke backend + `cc -shared`
+             ->  <hash>.so + <hash>.pcmap
+             ->  dlopen + atrium_fs_main  ->  pixels
+```
+
+So this exercises the production binary's argument handling,
+the **bespoke-first / Cranelift-fallback selection**, the
+in-VM linker invocation, and the `.pcmap` sidecar — the
+whole chain the daemon's `Tier2Backend` shells out to, on
+the real target. The script also parses the `"backend"`
+field from the binary's G7 metrics line and prints it, so a
+silent regression to the Cranelift fallback is visible.
+
+`emit_freebsd_obj` gained a `spirv` mode (`emit_freebsd_obj
+<out.spv> spirv <kind> [args]`) that writes the raw SPIR-V
+module instead of a compiled object, so the e2e script
+reuses the same shader builders as `run-in-vm.sh`.
+
+Verified 2026-05-14 on FreeBSD 16.0-CURRENT arm64 — all
+seven shaders compiled by the production binary on-target,
+all `backend=bespoke`:
+```
+PASS  const        -> [0.125 0.375 0.625 1]   (backend=bespoke)
+PASS  ifelse then  -> [1 0 0 1]               (backend=bespoke)
+PASS  ifelse else  -> [0 0 1 1]               (backend=bespoke)
+PASS  loop n=5     -> [1 1 1 1]               (backend=bespoke)
+PASS  loop n=4     -> [0 0 0 1]               (backend=bespoke)
+PASS  switch n=1   -> [0 1 0 1]               (backend=bespoke)
+PASS  switch n=9   -> [1 1 1 1]               (backend=bespoke)
+```
