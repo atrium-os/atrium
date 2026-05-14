@@ -2,10 +2,12 @@
 //! tier-2 software Vulkan shaders.
 //!
 //! Reads SPIR-V from a file, runs it through the frontend
-//! + backend pipeline, links the produced object file
-//! into a `.so` via the system `cc`, writes `.so` and
-//! `.pcmap` files to an output directory keyed by content
-//! hash.
+//! + backend pipeline, and writes a flat executable
+//! `atrium-spv-blob` (`.afblob`) plus its `.pcmap` sidecar
+//! to an output directory keyed by content hash. Both
+//! backends emit the blob directly — there is no `cc`
+//! link step (JIT-emit phase 4); the daemon's loader
+//! `mmap`s the blob `PROT_EXEC`.
 //!
 //! # Usage
 //!
@@ -13,18 +15,20 @@
 //! atrium-spv-compile --input <SPIR-V file> \
 //!                    --output-dir <cache dir> \
 //!                    [--target <triple>] \
-//!                    [--abi-version <N>]
+//!                    [--hash <override>]
 //! ```
 //!
 //! On success, exits 0 and writes:
-//!   `<output-dir>/<sha256>.so`
+//!   `<output-dir>/<sha256>.afblob`
 //!   `<output-dir>/<sha256>.pcmap`
 //!
 //! On stderr the binary prints one structured JSON line
-//! per compile (constraint G7) describing the result:
+//! per compile (constraint G7) describing the result —
+//! `link_us` is always 0 now that `cc` is gone, kept in
+//! the schema for continuity:
 //!
 //! ```json
-//! {"shader_hash":"abc...","backend":"cranelift","ops":42,"compile_ms":123,"size_bytes":9216}
+//! {"shader_hash":"abc...","backend":"bespoke","compile_ms":1,"frontend_us":600,"backend_us":240,"link_us":0,"size_bytes":292}
 //! ```
 //!
 //! # Exit codes
@@ -48,15 +52,17 @@
 //!   metrics output)
 
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::path::PathBuf;
+use std::process::ExitCode;
 use std::time::Instant;
 
 use atrium_spv_backend_bespoke::{
     compile_blob as bespoke_compile_blob, BackendError as BespokeError,
     Target as BespokeTarget,
 };
-use atrium_spv_backend_cranelift::{compile as cranelift_compile, Target};
+use atrium_spv_backend_cranelift::{
+    compile_blob as cranelift_compile_blob, Target,
+};
 use atrium_spv_frontend::translate as frontend_translate;
 use sha2::{Digest, Sha256};
 
@@ -238,20 +244,19 @@ fn run(args: &Args) -> Result<CompileReport, CompileError> {
         Target::X86_64FreeBSD  => None,
     };
 
-    // The two artifact shapes a backend can produce:
-    //   * Blob   — a flat `atrium-spv-blob`, written
-    //              straight to `<hash>.afblob`. No linker.
-    //              The bespoke JIT-emit path.
-    //   * Object — an ELF/Mach-O object, linked by `cc`
-    //              into `<hash>.so`. The Cranelift path
-    //              (until JIT-emit phase 4).
-    enum Artifact { Blob(Vec<u8>), Object(Vec<u8>) }
-
-    // Cranelift fallback, shared by the no-bespoke-target
-    // case and the bespoke-returned-Unsupported case.
-    let cranelift_path = || -> Result<(Artifact, Vec<u8>, &'static str), CompileError> {
-        match cranelift_compile(&module, args.target) {
-            Ok(o) => Ok((Artifact::Object(o.object), o.pcmap, "cranelift")),
+    // Both backends now emit a flat `atrium-spv-blob`
+    // (`compile_blob`) — there is no object/`cc`/`.so`
+    // path anymore. The Cranelift backend re-parses its
+    // own object internally to lift out the flat `.text`;
+    // if it ever hits a relocation it fails loudly rather
+    // than silently falling back (no `cc` safety net —
+    // that's the whole point of JIT-emit phase 4).
+    //
+    // Cranelift path, shared by the no-bespoke-target case
+    // and the bespoke-returned-Unsupported case.
+    let cranelift_path = || -> Result<(Vec<u8>, Vec<u8>, &'static str), CompileError> {
+        match cranelift_compile_blob(&module, args.target) {
+            Ok(o) => Ok((o.blob, o.pcmap, "cranelift")),
             Err(atrium_spv_backend_cranelift::BackendError::Unsupported(m)) =>
                 Err(CompileError::Unsupported(m)),
             Err(other) =>
@@ -260,10 +265,10 @@ fn run(args: &Args) -> Result<CompileReport, CompileError> {
     };
 
     let t_backend = Instant::now();
-    let (artifact, pcmap, backend_name): (Artifact, Vec<u8>, &'static str) =
+    let (blob, pcmap, backend_name): (Vec<u8>, Vec<u8>, &'static str) =
         match bespoke_target {
             Some(bt) => match bespoke_compile_blob(&module, bt) {
-                Ok(o) => (Artifact::Blob(o.blob), o.pcmap, "bespoke"),
+                Ok(o) => (o.blob, o.pcmap, "bespoke"),
                 Err(BespokeError::Unsupported(_)) => cranelift_path()?,
                 Err(BespokeError::Internal(m)) =>
                     return Err(CompileError::Internal(
@@ -276,44 +281,23 @@ fn run(args: &Args) -> Result<CompileReport, CompileError> {
     // the whole selection, not just the winning backend.
     let backend_us = t_backend.elapsed().as_micros();
 
-    // 5. Write the artifact into the cache directory.
+    // 5. Write the flat blob into the cache directory. The
+    // loader `mmap`s it `PROT_EXEC` directly — no linker,
+    // so the ~99.5%-of-compile `cc` step is simply gone.
     std::fs::create_dir_all(&args.output_dir).map_err(|e|
         CompileError::Internal(format!(
             "creating output dir {}: {e}", args.output_dir.display(),
         )))?;
 
-    let (link_us, size_bytes) = match artifact {
-        Artifact::Blob(blob) => {
-            // The flat blob is the final artifact — the
-            // loader `mmap`s it directly. No linker, so
-            // `link_us` is zero (the ~99.5%-of-compile `cc`
-            // step is gone for the bespoke path).
-            let blob_path = args.output_dir.join(format!("{hash}.afblob"));
-            std::fs::write(&blob_path, &blob).map_err(|e|
-                CompileError::Internal(format!(
-                    "writing {}: {e}", blob_path.display())))?;
-            (0u128, blob.len())
-        }
-        Artifact::Object(object) => {
-            // Object → temp `.o` → `cc -shared` → `<hash>.so`.
-            let obj_path = args.output_dir.join(format!("{hash}.o"));
-            std::fs::write(&obj_path, &object).map_err(|e|
-                CompileError::Internal(format!(
-                    "writing {}: {e}", obj_path.display())))?;
-            let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
-            let so_path = args.output_dir.join(format!("{hash}.{ext}"));
-            let t_link = Instant::now();
-            link_to_shared_lib(&obj_path, &so_path)?;
-            let link_us = t_link.elapsed().as_micros();
-            // Cache only needs the `.so` + `.pcmap`.
-            let _ = std::fs::remove_file(&obj_path);
-            let size = std::fs::metadata(&so_path)
-                .map(|m| m.len() as usize).unwrap_or(0);
-            (link_us, size)
-        }
-    };
+    let blob_path = args.output_dir.join(format!("{hash}.afblob"));
+    std::fs::write(&blob_path, &blob).map_err(|e|
+        CompileError::Internal(format!(
+            "writing {}: {e}", blob_path.display())))?;
+    let size_bytes = blob.len();
+    // No link step on any path now.
+    let link_us: u128 = 0;
 
-    // 6. Write pcmap sidecar (identical for both paths).
+    // 6. Write pcmap sidecar.
     let pcmap_path = args.output_dir.join(format!("{hash}.pcmap"));
     std::fs::write(&pcmap_path, &pcmap).map_err(|e|
         CompileError::Internal(format!(
@@ -332,22 +316,6 @@ fn run(args: &Args) -> Result<CompileReport, CompileError> {
         link_us,
         size_bytes: so_size,
     })
-}
-
-fn link_to_shared_lib(obj: &Path, out: &Path) -> Result<(), CompileError> {
-    let flag = if cfg!(target_os = "macos") { "-dynamiclib" } else { "-shared" };
-    let output = Command::new("cc")
-        .arg(flag).arg("-o").arg(out).arg(obj)
-        .output()
-        .map_err(|e| CompileError::Internal(format!("spawn cc: {e}")))?;
-    if !output.status.success() {
-        return Err(CompileError::Internal(format!(
-            "cc failed: status={}\nstderr={}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr),
-        )));
-    }
-    Ok(())
 }
 
 /// Compute the standard cache filename for a SPIR-V blob.

@@ -129,6 +129,21 @@ pub struct CompileOutput {
     pub pcmap: Vec<u8>,
 }
 
+/// Result of [`compile_blob`] — the JIT-emit counterpart
+/// of [`CompileOutput`], matching
+/// [`atrium_spv_backend_bespoke::BlobOutput`] field-for-
+/// field so `atrium-spv-compile` can handle both backends'
+/// blob output uniformly.
+#[derive(Debug, Clone)]
+pub struct BlobOutput {
+    /// Serialised `atrium-spv-blob` container — a flat
+    /// position-independent code blob the loader `mmap`s
+    /// `PROT_EXEC` directly. No `cc`, no `dlopen`.
+    pub blob: Vec<u8>,
+    /// PC-map sidecar bytes (atrium-spv-pcmap format v1).
+    pub pcmap: Vec<u8>,
+}
+
 /// Compile an atrium-spv-ir module to a native object
 /// file + PC-map sidecar.
 ///
@@ -209,6 +224,86 @@ pub fn compile(module: &Module, target: Target) -> Result<CompileOutput, Backend
         .map_err(|e| BackendError::Internal(format!("object emit: {e}")))?;
     let pcmap = pcmap.finish_to_bytes();
     Ok(CompileOutput { object, pcmap })
+}
+
+/// Compile an atrium-spv-ir module straight to a flat
+/// executable blob — the JIT-emit path's Cranelift entry,
+/// matching [`atrium_spv_backend_bespoke::compile_blob`].
+///
+/// Cranelift's aarch64 lowering materialises shader
+/// constants inline (no literal pool / `.rodata`) and
+/// shaders are single-function, so the emitted `.text` for
+/// every shader in the corpus has **zero relocations** —
+/// it's already self-contained PIC code, exactly like the
+/// bespoke backend's output. `compile_blob` builds the
+/// object as usual, then re-parses it (`object` read API,
+/// ELF/Mach-O-agnostic) to lift out the flat `.text` bytes
+/// and the per-stage entry-symbol offsets.
+///
+/// If the object ever *does* carry a relocation, this
+/// returns [`BackendError::Internal`] rather than silently
+/// producing broken code — a loud signal to implement a
+/// reloc table in the blob format. (`atrium-spv-compile`
+/// has no `cc` fallback anymore; that's deliberate.)
+pub fn compile_blob(module: &Module, target: Target)
+    -> Result<BlobOutput, BackendError>
+{
+    use object::{Object, ObjectSection, ObjectSymbol};
+
+    let CompileOutput { object, pcmap } = compile(module, target)?;
+
+    let obj = object::File::parse(&*object).map_err(|e|
+        BackendError::Internal(format!("re-parsing emitted object: {e}")))?;
+
+    // The single text section holds all the code.
+    let text = obj.sections()
+        .find(|s| s.kind() == object::SectionKind::Text)
+        .ok_or_else(|| BackendError::Internal(
+            "emitted object has no text section".into()))?;
+    // Self-contained-PIC invariant: no relocations. If this
+    // ever trips, the blob format needs a reloc table —
+    // fail loud rather than emit code that jumps nowhere.
+    if text.relocations().next().is_some() {
+        return Err(BackendError::Internal(
+            "Cranelift object carries relocations — the flat-blob path \
+             needs a relocation table (open question 1 in the RUNBOOK \
+             JIT-emit design)".into()));
+    }
+    let text_addr = text.address();
+    let code = text.data()
+        .map_err(|e| BackendError::Internal(format!(
+            "reading text section: {e}")))?
+        .to_vec();
+
+    // Entry offsets from the exported symbols. Mach-O
+    // prefixes symbol names with `_`; strip it.
+    let mut entries = atrium_spv_blob::EntryOffsets::default();
+    for sym in obj.symbols() {
+        let Ok(name) = sym.name() else { continue };
+        let name = name.strip_prefix('_').unwrap_or(name);
+        // In a relocatable object the text section's
+        // address is 0, but subtract it anyway to be exact.
+        let off = (sym.address() - text_addr) as u32;
+        match name {
+            "atrium_vs_main" => entries.vs = Some(off),
+            "atrium_fs_main" => entries.fs = Some(off),
+            "atrium_cs_main" => entries.cs = Some(off),
+            _ => {}
+        }
+    }
+    if entries.vs.is_none() && entries.fs.is_none()
+        && entries.cs.is_none()
+    {
+        return Err(BackendError::Internal(
+            "emitted object exports no atrium_(vs|fs|cs)_main symbol".into()));
+    }
+
+    let blob = atrium_spv_blob::ShaderBlob {
+        arch: atrium_spv_blob::ARCH_AARCH64,
+        code,
+        entries,
+    };
+    Ok(BlobOutput { blob: blob.to_bytes(), pcmap })
 }
 
 /// Emit one function body.

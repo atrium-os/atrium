@@ -42,12 +42,14 @@ dependencies = [
 name = "atrium-spv-backend-cranelift"
 version = "0.1.0"
 dependencies = [
+ "atrium-spv-blob",
  "atrium-spv-ir",
  "atrium-spv-pcmap",
  "cranelift-codegen",
  "cranelift-frontend",
  "cranelift-module",
  "cranelift-object",
+ "object 0.36.7",
  "target-lexicon",
 ]
 
