@@ -115,7 +115,7 @@ pub fn compile(module: &Module, target: Target) -> Result<CompileOutput, Backend
     let mut pcmap = atrium_spv_pcmap::Builder::new();
 
     for func in &module.functions {
-        let body = emit_function(func)?;
+        let (body, pc_entries) = emit_function(func)?;
         let symbol_name = exported_symbol_name(func);
 
         let sym = obj.add_symbol(object::write::Symbol {
@@ -129,16 +129,18 @@ pub fn compile(module: &Module, target: Target) -> Result<CompileOutput, Backend
             flags: object::SymbolFlags::None,
         });
         // 4-byte alignment for ARM64 instructions.
-        let _off = obj.add_symbol_data(sym, text_section, &body, 4);
+        let off = obj.add_symbol_data(sym, text_section, &body, 4);
 
-        // PC-map entry: function-relative host_offset = 0,
-        // spirv_offset = first body inst's
-        // source_spirv_offset (or 0 if no insts).
-        let first_offset = func.blocks.get(&func.entry_block)
-            .and_then(|b| b.insts.first())
-            .map(|i| i.source_spirv_offset)
-            .unwrap_or(0);
-        pcmap.push(0, first_offset);
+        // PC-map: one entry per lowered IR instruction.
+        // `emit_function` records each inst's body-relative
+        // byte offset paired with its source SPIR-V offset;
+        // shift by this function's offset within the text
+        // section so host_offsets are section-relative. The
+        // section grows per function so offsets stay
+        // monotone non-decreasing across the whole module.
+        for (rel_host, spirv) in pc_entries {
+            pcmap.push(off as u32 + rel_host, spirv);
+        }
     }
 
     let object_bytes = obj.write()
@@ -171,13 +173,26 @@ pub fn compile(module: &Module, target: Target) -> Result<CompileOutput, Backend
 ///   X0=in_varyings X1=uniforms X2=push_consts
 ///   X3=samples_mask X4=out_color X5=out_depth
 ///   S0..S3 = frag_coord {x, y, z, w}
-fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
+///
+/// Returns the ARM64 body bytes plus the PC-map entries
+/// `(body_relative_host_offset, source_spirv_offset)` —
+/// one per lowered IR instruction, recorded in codegen-
+/// walk order so their host offsets are already monotone
+/// non-decreasing.
+fn emit_function(
+    func: &Function,
+) -> Result<(Vec<u8>, Vec<(u32, u32)>), BackendError> {
     if func.stage != ShaderStage::Fragment {
         return Err(BackendError::Unsupported(format!(
             "stage {:?} not yet supported", func.stage)));
     }
 
     let mut a = asm::Asm::new();
+    // PC-map entries: (body-relative host byte offset,
+    // source SPIR-V offset) — one per IR inst, pushed in
+    // codegen-walk order. `a` only ever grows, so the host
+    // offsets come out monotone non-decreasing.
+    let mut pcmap_entries: Vec<(u32, u32)> = Vec::new();
     // scalars[id] = Vreg holding the live f32 (S-reg view).
     let mut scalars: HashMap<ValueId, asm::Vreg> = HashMap::new();
     let mut vectors: HashMap<ValueId, Vec<Value>> = HashMap::new();
@@ -365,6 +380,15 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
         let i = flat_i;
         flat_i += 1;
         let _ = block_inst_idx;
+        // Record the PC-map entry for this IR inst: the
+        // current body byte offset (this inst's first
+        // native byte) → its source SPIR-V offset. Done
+        // before emission so the offset points at the
+        // start of the inst's code. Ops that lower to zero
+        // native bytes (Phi, ConstVec, VectorShuffle …)
+        // share the next inst's offset — a duplicate
+        // host_offset, which the pcmap format allows.
+        pcmap_entries.push((a.len() as u32, inst.source_spirv_offset));
         // Expire scalars whose last_use < i. Their V-regs
         // return to the free pool. Drain into a temp Vec
         // first to dodge the borrow checker.
@@ -1050,7 +1074,7 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
         }
     }
 
-    Ok(a.into_bytes())
+    Ok((a.into_bytes(), pcmap_entries))
 }
 
 /// Materialise the (base X-reg, byte offset) pointer
