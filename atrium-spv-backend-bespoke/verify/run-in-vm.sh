@@ -38,6 +38,12 @@
 #     Driven with n=0 (a case), n=2 (last case), n=7
 #     (default) so the case path and the fall-through both
 #     run. On-target twin of the host three_way_switch_*.
+#   * phi — if(scale<0.5) 1.0 else 0.25, joined by an OpPhi
+#     at the merge block (empty then/else blocks). Phi
+#     convergence in a non-loop CFG: each arm's value must
+#     land in the Phi's register on the correct predecessor
+#     edge. Driven with 0.2 (then) and 0.8 (else). On-target
+#     twin of the host three_way_phi_* differential tests.
 #
 # Prereqs: the dev VM is up (scripts/run-vm.sh) and
 # reachable on localhost:2222 with the fresco_bsd key.
@@ -103,6 +109,8 @@ verify "vecarith"     ""        vecarith
 verify "switch n=0"   "0 int"   switch 0
 verify "switch n=2"   "2 int"   switch 2
 verify "switch n=7"   "7 int"   switch 7
+verify "phi then"     "0.2"     phi 0.2
+verify "phi else"     "0.8"     phi 0.8
 
 if [ "$FAILED" = "0" ]; then
   echo "==> PASS — bespoke ELF + AAPCS64 codegen verified on FreeBSD aarch64"

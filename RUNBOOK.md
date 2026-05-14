@@ -2104,7 +2104,7 @@ What it does:
    fragment ABI and prints the RGBA.
 4. Compares VM output against the host-side expected value.
 
-The script covers seven shaders:
+The script covers eight shaders:
 * **const** — constant-colour store: exercises the ELF object
   format, the exported symbol, and the Store path.
 * **ifelse** — `if (push_const.scale < 0.5) red else blue`:
@@ -2142,6 +2142,14 @@ The script covers seven shaders:
   with `n=0` (a case), `n=2` (last case), `n=7` (default)
   so the case path and the fall-through both run. On-target
   twin of the host `three_way_switch_*` differential tests.
+* **phi** — `if (scale < 0.5) chosen = 1.0 else chosen =
+  0.25`, where `chosen` is produced by an `OpPhi` at the
+  merge block (the then/else blocks are empty — they only
+  carry the branch). Phi convergence in a *non-loop* CFG:
+  each arm's value must land in the Phi's register on the
+  correct predecessor edge. Driven with `0.2` (then) and
+  `0.8` (else). On-target twin of the host `three_way_phi_*`
+  differential tests.
 
 Verified 2026-05-14 on FreeBSD 16.0-CURRENT arm64:
 ```
@@ -2158,6 +2166,8 @@ PASS  vecarith     -> [0.1875 0.75 2 3]
 PASS  switch n=0   -> [1 0 0 1]
 PASS  switch n=2   -> [0 0 1 1]
 PASS  switch n=7   -> [1 1 1 1]
+PASS  phi then     -> [1 1 1 1]
+PASS  phi else     -> [0.25 0.25 0.25 1]
 ```
 The harness prints with `%.9g`, not the default `%g` —
 `%g` caps at 6 significant digits, so an exact value like

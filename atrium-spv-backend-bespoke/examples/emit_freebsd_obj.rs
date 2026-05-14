@@ -15,6 +15,7 @@
 //!   emit_freebsd_obj <out.o> bitwise <n>-- nibble/xor/or extract
 //!   emit_freebsd_obj <out.o> vecarith   -- (a+b)*(a-b) over vec4s
 //!   emit_freebsd_obj <out.o> switch <n> -- switch(n) colour select
+//!   emit_freebsd_obj <out.o> phi <s>    -- if/else joined by OpPhi
 //!
 //! stdout is always the expected RGBA for the chosen
 //! shader+input, so the in-VM harness can diff against it
@@ -468,6 +469,78 @@ fn build_switch_spirv() -> Vec<u8> {
     bytes
 }
 
+/// `if (push_const.scale < 0.5) chosen = 1.0 else chosen
+/// = 0.25;` where `chosen` is produced by an `OpPhi` at
+/// the merge block (the then/else blocks are empty — they
+/// only carry the branch). Output `vec4(chosen^3, 1)`.
+/// Exercises Phi convergence in a *non-loop* CFG: the Phi
+/// arms are constants defined in the entry block but the
+/// Phi value materialises only at the merge, so the
+/// backend must place each arm's value into the Phi's
+/// register on the correct predecessor edge. On-target
+/// twin of the host `three_way_phi_*` differential tests.
+fn build_phi_spirv() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, SelectionControl,
+        StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let f32_ty = b.type_float(32, None);
+    let bool_ty = b.type_bool();
+    let i32_ty = b.type_int(32, 1);
+    let vec4 = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let pc_struct = b.type_struct(vec![f32_ty]);
+    b.member_decorate(pc_struct, 0, Decoration::Offset,
+                      vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(pc_struct, Decoration::Block, vec![]);
+    let ptr_pc_struct = b.type_pointer(None, StorageClass::PushConstant, pc_struct);
+    let ptr_pc_f32    = b.type_pointer(None, StorageClass::PushConstant, f32_ty);
+    let ptr_out       = b.type_pointer(None, StorageClass::Output, vec4);
+    let zero_i = b.constant_bit32(i32_ty, 0u32);
+    let c025 = b.constant_bit32(f32_ty, 0.25f32.to_bits());
+    let c05  = b.constant_bit32(f32_ty, 0.5f32.to_bits());
+    let c1   = b.constant_bit32(f32_ty, 1.0f32.to_bits());
+    let pc_var = b.variable(ptr_pc_struct, None, StorageClass::PushConstant, None);
+    let out = b.variable(ptr_out, None, StorageClass::Output, None);
+    b.decorate(out, Decoration::Location,
+               vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let p = b.access_chain(ptr_pc_f32, None, pc_var, vec![zero_i]).unwrap();
+    let v = b.load(f32_ty, None, p, None, vec![]).unwrap();
+    let cond = b.f_ord_less_than(bool_ty, None, v, c05).unwrap();
+    let then_id = b.id();
+    let else_id = b.id();
+    let merge_id = b.id();
+    b.selection_merge(merge_id, SelectionControl::NONE).unwrap();
+    b.branch_conditional(cond, then_id, else_id, vec![]).unwrap();
+    b.begin_block(Some(then_id)).unwrap();
+    b.branch(merge_id).unwrap();
+    b.begin_block(Some(else_id)).unwrap();
+    b.branch(merge_id).unwrap();
+    b.begin_block(Some(merge_id)).unwrap();
+    let chosen = b.phi(f32_ty, None,
+        vec![(c1, then_id), (c025, else_id)]).unwrap();
+    let color = b.composite_construct(vec4, None,
+        vec![chosen, chosen, chosen, c1]).unwrap();
+    b.store(out, color, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![out]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let path = args.next()
@@ -547,6 +620,14 @@ fn main() {
                 _ => [1.0, 1.0, 1.0, 1.0], // white (default)
             };
             (build_switch_spirv(), expected)
+        }
+        "phi" => {
+            // scale<0.5 ? 1.0 : 0.25, joined by OpPhi.
+            let scale: f32 = args.next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.2);
+            let chosen = if scale < 0.5 { 1.0 } else { 0.25 };
+            (build_phi_spirv(), [chosen, chosen, chosen, 1.0])
         }
         other => {
             eprintln!("unknown shader kind: {other}");
