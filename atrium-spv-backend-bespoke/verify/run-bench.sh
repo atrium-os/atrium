@@ -1,15 +1,19 @@
 #!/bin/sh
-# bespoke-vs-Cranelift micro-benchmark, host + in-VM.
+# bespoke-backend micro-benchmark, host + in-VM.
 #
 # Runs the bench_driver example over a fixed shader corpus
-# and prints, per shader, the two numbers that decide
-# whether the bespoke backend earns its complexity:
+# and prints, per shader:
 #
-#   compile  — ns for backend::compile() (frontend + `cc`
-#              excluded). Cache-miss latency budget.
-#   run      — ns per atrium_fs_main call of the linked +
-#              dlopen'd shader. The per-draw hot path
-#              (spec §8.1).
+#   compile  — ns for backend::compile() (bespoke vs
+#              Cranelift — same IR input, the fair compile
+#              comparison). Cache-miss latency budget.
+#   run      — ns per atrium_fs_main call. The per-draw hot
+#              path (spec §8.1). bespoke vs Cranelift vs —
+#              for shaders with a hand-written C reference
+#              in native/ — `clang -O2`, the perf *bar*.
+#              Cranelift dragged bespoke up to fast-tier
+#              quality; the question now is the gap to a
+#              real optimising native compiler.
 #
 # The same bench_driver binary is run on the macOS host
 # (Aarch64Darwin) and, cross-built, inside the FreeBSD/
@@ -28,24 +32,29 @@ SSHOPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMod
 HOST_BIN="$WS/atrium-spv-compile/target/release/examples/bench_driver"
 VM_BIN="$WS/atrium-spv-compile/target/aarch64-unknown-freebsd/release/examples/bench_driver"
 
-# Shader corpus: <label> <kind> [emit/pc args...]
-# The emit args double as the bench_driver push-const args
+# Shader corpus: <label>|<kind>|<pc args>|<native-C ref>
+# The pc args double as the bench_driver push-const args
 # (same convention as the harness): the kind's first arg is
 # both the shader parameter and the runtime push-const.
+# The 4th field, when set, is a hand-written C reference
+# (path relative to verify/) — bench_driver compiles it
+# with `clang -O2` as the runtime perf bar. Only shaders
+# whose runtime clears call overhead get one; `heavy` is
+# the meaningful case.
 CORPUS='
-const|const|
-ifelse|ifelse|0.2
-loop|loop|64 int
-switch|switch|2 int
-arith|arith|7 int
-bitwise|bitwise|0x53 int
-vecarith|vecarith|
-dot|dot|
-shuffle|shuffle|
-cextract|cextract|
-phi|phi|0.2
-unordcmp|unordcmp|0.2
-heavy|heavy|512 int
+const|const||
+ifelse|ifelse|0.2|
+loop|loop|64 int|
+switch|switch|2 int|
+arith|arith|7 int|
+bitwise|bitwise|0x53 int|
+vecarith|vecarith||
+dot|dot||
+shuffle|shuffle||
+cextract|cextract||
+phi|phi|0.2|
+unordcmp|unordcmp|0.2|
+heavy|heavy|512 int|native/heavy.c
 '
 
 echo "==> building bench_driver (host release + FreeBSD aarch64 cross)"
@@ -73,18 +82,26 @@ emit_spirv() {
 }
 
 run_one() {
-  where=$1; label=$2; kind=$3; pc=$4
+  where=$1; label=$2; kind=$3; pc=$4; native=$5
   if [ "$where" = "host" ]; then
-    "$HOST_BIN" "/tmp/bench_$kind.spv" $pc 2>/dev/null \
+    native_arg=""
+    [ -n "$native" ] && native_arg="--native $HERE/$native"
+    "$HOST_BIN" "/tmp/bench_$kind.spv" $pc $native_arg 2>/dev/null \
       | grep -E "compile:|run:"
   else
     scp -i "$KEY" $SSHOPTS -P 2222 "/tmp/bench_$kind.spv" \
         root@localhost:"/tmp/bench_$kind.spv" >/dev/null 2>&1
+    native_arg=""
+    if [ -n "$native" ]; then
+      scp -i "$KEY" $SSHOPTS -P 2222 "$HERE/$native" \
+          root@localhost:"/tmp/bench_native_$kind.c" >/dev/null 2>&1
+      native_arg="--native /tmp/bench_native_$kind.c"
+    fi
     # -n: don't read stdin. Without it ssh drains the
     # `while read` loop's CORPUS pipe and the loop stops
     # after the first shader.
     ssh -n -i "$KEY" $SSHOPTS -p 2222 root@localhost \
-      "/tmp/bench_driver /tmp/bench_$kind.spv $pc" 2>/dev/null \
+      "/tmp/bench_driver /tmp/bench_$kind.spv $pc $native_arg" 2>/dev/null \
       | grep -E "compile:|run:"
   fi
 }
@@ -93,15 +110,15 @@ run_corpus() {
   where=$1; title=$2
   echo
   echo "############################################################"
-  echo "## $title  (bespoke vs cranelift; lower ns = better)"
+  echo "## $title  (lower ns = better; native = clang -O2 bar)"
   echo "############################################################"
-  echo "$CORPUS" | while IFS='|' read -r label kind pc; do
+  echo "$CORPUS" | while IFS='|' read -r label kind pc native; do
     [ -z "$label" ] && continue
     if ! emit_spirv "$kind" $pc; then
       echo "  $label  FAIL (host spirv emit)"
       continue
     fi
-    run_one "$where" "$label" "$kind" "$pc"
+    run_one "$where" "$label" "$kind" "$pc" "$native"
   done
 }
 
