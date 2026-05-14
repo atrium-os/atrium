@@ -307,6 +307,67 @@ fn emit_function(
         }
     }
 
+    // ── Immediate-fold pre-pass (opt #3) ──────────────────────
+    //
+    // A small integer constant used *only* as an add/sub
+    // operand doesn't need its own W-reg — it can ride in
+    // the instruction's imm12 field (`add w,w,#1` instead
+    // of `mov w,#1` + `add w,w,w`). This both shrinks the
+    // prologue and, more importantly, frees a W-reg for the
+    // whole function — easing the pressure that opt #5
+    // (spilling) addresses.
+    //
+    // A ConstInt is foldable when its value fits imm12
+    // (0..=4095) and every use is a foldable add/sub
+    // position: either operand of `IAdd` (commutative) or
+    // the RHS of `ISub`. Any other use — Phi arm, IMul,
+    // Store, a second constant operand — disqualifies it.
+    let mut const_int_value: HashMap<ValueId, i64> = HashMap::new();
+    for inst in &flat_insts {
+        if let Op::ConstInt { value, .. } = &inst.op {
+            if let Some(r) = inst.result.as_ref() {
+                const_int_value.insert(r.id, *value);
+            }
+        }
+    }
+    let mut fold_const: std::collections::HashSet<ValueId> =
+        const_int_value.iter()
+            .filter(|(_, &v)| (0..=4095).contains(&v))
+            .map(|(&id, _)| id)
+            .collect();
+    for inst in &flat_insts {
+        match &inst.op {
+            Op::IAdd(l, r) => {
+                // A candidate operand here is a foldable
+                // use — unless *both* operands are
+                // constants (can't fold both into one
+                // instruction), in which case neither
+                // folds.
+                if const_int_value.contains_key(&l.id)
+                    && const_int_value.contains_key(&r.id)
+                {
+                    fold_const.remove(&l.id);
+                    fold_const.remove(&r.id);
+                }
+            }
+            Op::ISub(l, r) => {
+                // Only the RHS rides in `sub_imm`. An LHS
+                // constant is a non-foldable use.
+                fold_const.remove(&l.id);
+                if const_int_value.contains_key(&l.id)
+                    && const_int_value.contains_key(&r.id)
+                {
+                    fold_const.remove(&r.id);
+                }
+            }
+            other => {
+                // Any other op that reads a candidate uses
+                // it non-foldably.
+                fold_const.retain(|cid| !op_reads(other, *cid));
+            }
+        }
+    }
+
     // ── Linear-scan register allocator ─────────────────────────
     //
     // Free pool of V-regs (V16..V31, caller-saved in
@@ -611,7 +672,12 @@ fn emit_function(
                 // next inst (last_use < i), so this is
                 // cheap; on pool exhaustion we skip
                 // codegen (assume orphan).
-                if let Ok(w) = alloc_int_w(&mut int_pool, result.id) {
+                // Folded constants (opt #3) ride in an
+                // add/sub imm12 field — no W-reg, no
+                // materialisation.
+                if fold_const.contains(&result.id) {
+                    // nothing to emit
+                } else if let Ok(w) = alloc_int_w(&mut int_pool, result.id) {
                     materialise_u32_into_w(&mut a, w, *value as i32 as u32);
                     ints.insert(result.id, w);
                 }
@@ -619,10 +685,12 @@ fn emit_function(
             Op::ConstNull => {
                 // Treat as an orphan — no W-reg.
             }
-            Op::IAdd(l, r) => emit_int_binop(
-                &mut a, &mut ints, &mut int_pool, coalesce_w, inst, l, r, asm::add_w)?,
-            Op::ISub(l, r) => emit_int_binop(
-                &mut a, &mut ints, &mut int_pool, coalesce_w, inst, l, r, asm::sub_w)?,
+            Op::IAdd(l, r) => emit_int_addsub(
+                &mut a, &mut ints, &mut int_pool, coalesce_w,
+                &fold_const, &const_int_value, inst, l, r, false)?,
+            Op::ISub(l, r) => emit_int_addsub(
+                &mut a, &mut ints, &mut int_pool, coalesce_w,
+                &fold_const, &const_int_value, inst, l, r, true)?,
             Op::IMul(l, r) => emit_int_binop(
                 &mut a, &mut ints, &mut int_pool, coalesce_w, inst, l, r, asm::mul_w)?,
             Op::SDiv(l, r) => emit_int_binop(
@@ -1458,6 +1526,66 @@ fn emit_int_binop(
         None => alloc_int_w(int_pool, result.id)?,
     };
     a.emit(make_inst(d, l, r));
+    ints.insert(result.id, d);
+    Ok(())
+}
+
+/// Emit an integer add or sub, folding a small constant
+/// operand into the `imm12` field when the immediate-fold
+/// pre-pass marked it foldable (opt #3) — `add w,w,#1`
+/// instead of materialising the constant into a W-reg.
+/// `coalesce` behaves as in [`emit_int_binop`].
+#[allow(clippy::too_many_arguments)]
+fn emit_int_addsub(
+    a: &mut asm::Asm,
+    ints: &mut HashMap<ValueId, asm::Wreg>,
+    int_pool: &mut IntPool,
+    coalesce: Option<asm::Wreg>,
+    fold_const: &std::collections::HashSet<ValueId>,
+    const_int_value: &HashMap<ValueId, i64>,
+    inst: &atrium_spv_ir::Inst,
+    lhs: &Value,
+    rhs: &Value,
+    is_sub: bool,
+) -> Result<(), BackendError> {
+    let result = inst.result.as_ref().ok_or_else(||
+        BackendError::Internal("int add/sub without result".into()))?;
+    // Foldable constant operand? `sub` only folds its RHS
+    // (`sub w,w,#imm`); `add` is commutative so either.
+    let folded: Option<(asm::Wreg, u16)> = if fold_const.contains(&rhs.id) {
+        let rn = *ints.get(&lhs.id).ok_or_else(||
+            BackendError::Internal(format!(
+                "int add/sub reg operand {:?} not in ints", lhs.id)))?;
+        Some((rn, const_int_value[&rhs.id] as u16))
+    } else if !is_sub && fold_const.contains(&lhs.id) {
+        let rn = *ints.get(&rhs.id).ok_or_else(||
+            BackendError::Internal(format!(
+                "int add reg operand {:?} not in ints", rhs.id)))?;
+        Some((rn, const_int_value[&lhs.id] as u16))
+    } else {
+        None
+    };
+    let d = match coalesce {
+        Some(d) => d,
+        None => alloc_int_w(int_pool, result.id)?,
+    };
+    match folded {
+        Some((rn, imm)) => a.emit(if is_sub {
+            asm::sub_imm_w(d, rn, imm)
+        } else {
+            asm::add_imm_w(d, rn, imm)
+        }),
+        None => {
+            let l = *ints.get(&lhs.id).ok_or_else(||
+                BackendError::Internal(format!(
+                    "int add/sub lhs {:?} not in ints", lhs.id)))?;
+            let r = *ints.get(&rhs.id).ok_or_else(||
+                BackendError::Internal(format!(
+                    "int add/sub rhs {:?} not in ints", rhs.id)))?;
+            a.emit(if is_sub { asm::sub_w(d, l, r) }
+                   else { asm::add_w(d, l, r) });
+        }
+    }
     ints.insert(result.id, d);
     Ok(())
 }
