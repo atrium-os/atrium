@@ -2508,3 +2508,44 @@ register-pressure `heavy4` — pass bit-exact against the
 interpreter oracle. The bespoke backend's headline
 justification — steady-state hand-written-ARM64 perf — is
 now demonstrated, not just asserted.
+
+#### Compile-pipeline phase breakdown — `cc` is the cost
+
+With the backend ~4.7× faster, the question came up: is
+compile now fast enough to do in-memory every run
+(llvmpipe-style) and drop the on-disk `.so` cache?
+`atrium-spv-compile` was instrumented to split its wall
+clock into frontend / backend / link (the G7 metrics line
+gained `frontend_us` / `backend_us` / `link_us`). Measured
+over the full corpus, host and in-VM:
+
+| phase             | typical time      | share |
+|-------------------|-------------------|-------|
+| frontend (SPIR-V→IR) | ~50–210 µs     | ~0.4% |
+| backend (IR→object)  | ~30–100 µs (bespoke); ~0.8–1.4 ms (Cranelift fallback) | ~0.2% |
+| **link (`cc`→`.so`)** | **~36–43 ms**   | **~99.5%** |
+
+`cc` is essentially the *entire* compile cost — a process
+spawn + full linker run. The bespoke backend's 4.7× win
+moved ~70 µs inside a ~41 ms pipeline; invisible
+end-to-end.
+
+So the architecture conclusion is **not** "compile every
+run":
+* The jailed compile sub-process (D3) stays regardless —
+  it's a security boundary, not a speed knob; compiling
+  in-process llvmpipe-style would forfeit it.
+* The persistent content-hash cache stays — cross-run
+  reuse is real on a desktop platform; "recompile every
+  launch" discards free work.
+* **The lever is dropping `cc`.** A JIT-emit path —
+  backend emits a flat relocatable code blob instead of an
+  ELF object, the loader `mmap`s it `PROT_EXEC` instead of
+  `cc -shared` + `dlopen` — would cut compile from ~41 ms
+  to ~0.3 ms (~130×) *and* remove the `cc` toolchain
+  dependency from the runtime. The jail and the cache are
+  kept; the cache just stores the blob. Trade-off: loses
+  the dynamic linker's symbol info for debuggers/profilers
+  — which is exactly what the `.pcmap` sidecar already
+  mitigates. This is the high-value follow-up; "compile
+  every run" is not.

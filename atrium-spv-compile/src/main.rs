@@ -74,13 +74,24 @@ fn main() -> ExitCode {
     };
     match run(&args) {
         Ok(report) => {
-            // G7: structured metrics line on stderr.
+            // G7: structured metrics line on stderr. The
+            // `*_us` fields break the wall-clock down into
+            // the three pipeline phases — frontend (SPIR-V
+            // → IR), backend (IR → object), link (`cc`
+            // → .so) — so the cost of each is visible
+            // (informs the in-memory / JIT-emit question:
+            // if `link_us` dominates, dropping `cc` is the
+            // real lever, not the backend speed).
             let _ = writeln!(
                 std::io::stderr(),
                 "{{\"shader_hash\":\"{}\",\"backend\":\"{}\",\
-                  \"compile_ms\":{},\"size_bytes\":{}}}",
+                  \"compile_ms\":{},\"frontend_us\":{},\
+                  \"backend_us\":{},\"link_us\":{},\
+                  \"size_bytes\":{}}}",
                 report.shader_hash, report.backend,
-                report.compile_ms, report.size_bytes,
+                report.compile_ms, report.frontend_us,
+                report.backend_us, report.link_us,
+                report.size_bytes,
             );
             ExitCode::from(EXIT_OK)
         }
@@ -168,6 +179,13 @@ struct CompileReport {
     shader_hash: String,
     backend: &'static str,
     compile_ms: u128,
+    /// Per-phase breakdown of the wall clock, microseconds:
+    /// frontend (SPIR-V → IR), backend (IR → object), link
+    /// (`cc` object → `.so`). Reading + hashing + file I/O
+    /// is the small remainder.
+    frontend_us: u128,
+    backend_us: u128,
+    link_us: u128,
     size_bytes: usize,
 }
 
@@ -194,11 +212,13 @@ fn run(args: &Args) -> Result<CompileReport, CompileError> {
     });
 
     // 3. Frontend: SPIR-V → atrium-spv-ir.
+    let t_frontend = Instant::now();
     let module = frontend_translate(&spirv).map_err(|e| match e {
         atrium_spv_frontend::FrontendError::Unsupported(m) =>
             CompileError::Unsupported(m),
         other => CompileError::Internal(format!("frontend: {other}")),
     })?;
+    let frontend_us = t_frontend.elapsed().as_micros();
 
     // 4. Backend.
     //
@@ -218,6 +238,7 @@ fn run(args: &Args) -> Result<CompileReport, CompileError> {
         Target::X86_64FreeBSD  => None,
     };
 
+    let t_backend = Instant::now();
     let bespoke_output = match bespoke_target {
         Some(bt) => match bespoke_compile(&module, bt) {
             Ok(o) => Some(o),
@@ -239,6 +260,10 @@ fn run(args: &Args) -> Result<CompileReport, CompileError> {
                     return Err(CompileError::Internal(format!("cranelift: {other}"))),
             },
         };
+    // Includes the bespoke probe-then-fallback when it
+    // happens — that's the real production cost, so time
+    // the whole selection, not just the winning backend.
+    let backend_us = t_backend.elapsed().as_micros();
 
     // 5. Write object to temp file, link via `cc` into
     // the cache directory under <hash>.so.
@@ -255,7 +280,9 @@ fn run(args: &Args) -> Result<CompileReport, CompileError> {
 
     let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
     let so_path = args.output_dir.join(format!("{hash}.{ext}"));
+    let t_link = Instant::now();
     link_to_shared_lib(&obj_path, &so_path)?;
+    let link_us = t_link.elapsed().as_micros();
     // Remove the intermediate object file — cache only
     // needs the .so + .pcmap.
     let _ = std::fs::remove_file(&obj_path);
@@ -276,6 +303,9 @@ fn run(args: &Args) -> Result<CompileReport, CompileError> {
         shader_hash: hash,
         backend: backend_name,
         compile_ms: elapsed_ms,
+        frontend_us,
+        backend_us,
+        link_us,
         size_bytes: so_size,
     })
 }
