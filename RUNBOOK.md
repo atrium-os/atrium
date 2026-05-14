@@ -2080,3 +2080,30 @@ The bespoke backend's ARM64 encoder is `pptk-codegen-arm64` from the
 added f32-scalar encoders there (`fadd_s`/`fsub_s`/`fmul_s`/`fdiv_s`,
 `fcmp_s`, `fmov_s`, `fcsel_s`, `scvtf_s_from_w`, `fcvtzs_w_from_s`,
 etc.) — companion commits live in the pptk repo, not here.
+
+### In-VM verification of the bespoke backend
+
+The unit + three-way differential suites all run on the macOS
+**host** (Mach-O, `Aarch64Darwin`). The bespoke backend's actual
+production target is FreeBSD/aarch64 (ELF, `Aarch64FreeBSD`) — a
+different object format and the genuine AAPCS64 environment. To
+close that gap:
+
+```bash
+# Dev VM must be up (scripts/run-vm.sh) + reachable on :2222.
+sh atrium-spv-backend-bespoke/verify/run-in-vm.sh
+```
+
+What it does:
+1. Host: `cargo run --example emit_freebsd_obj` cross-emits a
+   constant-colour fragment shader as a FreeBSD/aarch64 **ELF**
+   object (`compile(module, Target::Aarch64FreeBSD)`).
+2. `scp`s the object + `verify/harness.c` into the VM.
+3. VM: `cc -shared` links the object → `.so`; `cc` builds the
+   dlopen harness; harness calls `atrium_fs_main` per the
+   fragment ABI and prints the RGBA.
+4. Compares VM output against the host-side expected value.
+
+Verified 2026-05-14: `0.125 0.375 0.625 1` round-trips exactly —
+the bespoke ELF + AAPCS64 codegen runs correctly on FreeBSD
+16.0-CURRENT arm64, not just the macOS host.
