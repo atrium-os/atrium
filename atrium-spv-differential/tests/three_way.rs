@@ -609,6 +609,103 @@ fn build_loop_sum_shader() -> Vec<u8> {
     bytes
 }
 
+/// The heavyweight benchmark loop, as a differential
+/// correctness gate. Mirrors `build_heavy_spirv` in
+/// `atrium-spv-backend-bespoke/examples/emit_freebsd_obj.rs`:
+/// a counted loop (`n` from an i32 push-constant) with two
+/// cross-coupled contractive f32 accumulators, ~6 FMul/FAdd
+/// per iteration. Output is `vec4(a, b, 0, 1)`.
+///
+/// This shader is what `run-bench.sh` measures; keeping it
+/// in the strict three-way corpus means every bespoke
+/// codegen optimisation is checked bit-exact against the
+/// interpreter oracle + Cranelift before it can change the
+/// benchmark number.
+fn build_heavy_shader() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, LoopControl, MemoryModel,
+        StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let f32_ty = b.type_float(32, None);
+    let i32_ty = b.type_int(32, 1);
+    let bool_ty = b.type_bool();
+    let vec4 = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let pc_struct = b.type_struct(vec![i32_ty]);
+    b.member_decorate(pc_struct, 0, Decoration::Offset,
+                      vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(pc_struct, Decoration::Block, vec![]);
+    let ptr_pc_struct = b.type_pointer(None, StorageClass::PushConstant, pc_struct);
+    let ptr_pc_i32    = b.type_pointer(None, StorageClass::PushConstant, i32_ty);
+    let ptr_out       = b.type_pointer(None, StorageClass::Output, vec4);
+    let zero_i = b.constant_bit32(i32_ty, 0u32);
+    let one_i  = b.constant_bit32(i32_ty, 1u32);
+    let k_a0 = b.constant_bit32(f32_ty, 0.5f32.to_bits());
+    let k_b0 = b.constant_bit32(f32_ty, 0.25f32.to_bits());
+    let k99  = b.constant_bit32(f32_ty, 0.99f32.to_bits());
+    let k01  = b.constant_bit32(f32_ty, 0.01f32.to_bits());
+    let c0   = b.constant_bit32(f32_ty, 0.0f32.to_bits());
+    let c1   = b.constant_bit32(f32_ty, 1.0f32.to_bits());
+    let pc_var = b.variable(ptr_pc_struct, None, StorageClass::PushConstant, None);
+    let out = b.variable(ptr_out, None, StorageClass::Output, None);
+    b.decorate(out, Decoration::Location,
+               vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    let entry_id  = b.id();
+    let header_id = b.id();
+    let body_id   = b.id();
+    let cont_id   = b.id();
+    let merge_id  = b.id();
+    let i_next  = b.id();
+    let a_next  = b.id();
+    let b_next  = b.id();
+    b.begin_block(Some(entry_id)).unwrap();
+    let p = b.access_chain(ptr_pc_i32, None, pc_var, vec![zero_i]).unwrap();
+    let n = b.load(i32_ty, None, p, None, vec![]).unwrap();
+    b.branch(header_id).unwrap();
+    b.begin_block(Some(header_id)).unwrap();
+    let i_phi = b.phi(i32_ty, None,
+        vec![(zero_i, entry_id), (i_next, cont_id)]).unwrap();
+    let a_phi = b.phi(f32_ty, None,
+        vec![(k_a0, entry_id), (a_next, cont_id)]).unwrap();
+    let b_phi = b.phi(f32_ty, None,
+        vec![(k_b0, entry_id), (b_next, cont_id)]).unwrap();
+    let cond = b.s_less_than(bool_ty, None, i_phi, n).unwrap();
+    b.loop_merge(merge_id, cont_id, LoopControl::NONE, vec![]).unwrap();
+    b.branch_conditional(cond, body_id, merge_id, vec![]).unwrap();
+    b.begin_block(Some(body_id)).unwrap();
+    let t1     = b.f_mul(f32_ty, None, a_phi, b_phi).unwrap();
+    let a_keep = b.f_mul(f32_ty, None, a_phi, k99).unwrap();
+    let a_mix  = b.f_mul(f32_ty, None, b_phi, k01).unwrap();
+    let _a_n   = b.f_add(f32_ty, Some(a_next), a_keep, a_mix).unwrap();
+    let b_keep = b.f_mul(f32_ty, None, b_phi, k99).unwrap();
+    let b_mix  = b.f_mul(f32_ty, None, t1, k01).unwrap();
+    let _b_n   = b.f_add(f32_ty, Some(b_next), b_keep, b_mix).unwrap();
+    b.branch(cont_id).unwrap();
+    b.begin_block(Some(cont_id)).unwrap();
+    b.i_add(i32_ty, Some(i_next), i_phi, one_i).unwrap();
+    b.branch(header_id).unwrap();
+    b.begin_block(Some(merge_id)).unwrap();
+    let color = b.composite_construct(vec4, None,
+        vec![a_phi, b_phi, c0, c1]).unwrap();
+    b.store(out, color, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![out]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
 /// OpSelect with scalar cond + vec4 t/f operands.
 /// out = (scale < 0.5) ? red_vec : blue_vec
 fn build_vec_select_shader() -> Vec<u8> {
@@ -1062,6 +1159,23 @@ fn three_way_simple_loop() {
     let spirv = build_loop_sum_shader();
     let mut inputs = ShaderInputs::default();
     let n: i32 = 5; // 0+1+2+3+4 = 10 = expected
+    inputs.push_constants[..4].copy_from_slice(&n.to_le_bytes());
+    let rs = runners();
+    let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
+    assert_shader_agrees_all(&spirv, &inputs, ColorTolerance::Exact, &refs);
+}
+
+#[test]
+fn three_way_heavy() {
+    // The benchmark loop. Driven with a modest iteration
+    // count — correctness, not perf, is the point here;
+    // run-bench.sh drives it with n=512. All three runners
+    // must agree bit-exact, so any bespoke codegen
+    // optimisation that breaks the loop body is caught
+    // before it reaches the bench.
+    let spirv = build_heavy_shader();
+    let mut inputs = ShaderInputs::default();
+    let n: i32 = 32;
     inputs.push_constants[..4].copy_from_slice(&n.to_le_bytes());
     let rs = runners();
     let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
