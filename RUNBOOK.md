@@ -2563,6 +2563,46 @@ category Cranelift skips too. Still unmeasured: vector-
 heavy loops (blocked — bespoke has no vec Phi yet) and
 texture/sampler-heavy shaders.
 
+#### Next arc — scoped: vec Phi in the bespoke backend
+
+The vector-heavy loop shape — a `vec4` accumulator carried
+across a loop — is the one we most want to measure against
+`clang -O2` (clang SIMD-packs it; bespoke lane-walks) but
+*can't*: the bespoke Phi pre-pass rejects `Type::Vec2/3/4`
+(`"Phi of type … not supported"`), so any vec-carrying
+loop falls back to Cranelift wholesale. That's both a
+measurement blocker and a real coverage gap — `vec4`
+accumulation (lighting, blending) is a common real-shader
+pattern.
+
+**Design.** The backend already represents a vector as a
+list of per-lane scalar `Value`s (`vectors: HashMap<…,
+Vec<Value>>`), each lane registered in `scalars`. So a
+vec Phi decomposes cleanly into *N per-lane scalar Phis*:
+allocate N never-expired V-regs in the Phi pre-pass,
+register them as `vectors[phi_result]`, build per-lane
+phi-move lists. The just-landed `mov_v_16b` phi-move and
+the opt-#4 coalescing both extend per-lane with no new
+ideas. `PhiDest` either grows a `Vec(Vec<Vreg>)` variant
+or the pre-pass emits N `PhiDest::Float` entries.
+
+**Risk — register pressure.** A `vec4` Phi reserves 4
+never-expired V-regs; two `vec4` accumulators + temps will
+exhaust even the 24-reg post-#5 file. There is no
+spilling, so an over-pressured vec loop returns
+`Unsupported` → Cranelift fallback. That's acceptable
+graceful degradation, but it caps how heavy a vec shader
+the bespoke path can take.
+
+**Phasing.**
+1. vec Phi in the pre-pass + per-lane phi-move emission
+   (no coalescing). Gate: a new `three_way` vec-loop test
+   (interpreter + Cranelift + bespoke bit-exact) + in-VM.
+2. extend opt-#4 coalescing to vec-Phi lanes.
+3. add a vector-heavy bench shader + `native/` C ref;
+   measure the bespoke-vs-`clang -O2` gap on the shape
+   that should finally expose one.
+
 #### Compile-pipeline phase breakdown — `cc` is the cost
 
 With the backend ~4.7× faster, the question came up: is
