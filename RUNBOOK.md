@@ -2526,26 +2526,27 @@ loop}.c`), in-VM (FreeBSD/aarch64), ns/call:
 
 | shader  | bespoke | Cranelift | clang-O2 strict | clang-O2 fma |
 |---------|---------|-----------|-----------------|--------------|
-| heavy   | 996     | 999       | 1536            | 1054         |
-| heavy4  | 658     | **536**   | 1107            | 1046         |
-| loop    | 34      | 34        | **0.96**        | 0.97         |
-
-The single "no gap" headline from `heavy` does **not**
-cleanly generalise — the three shapes tell three stories:
+| heavy   | 979     | 989       | 1513            | 1024         |
+| heavy4  | 515     | 509       | 1073            | 1017         |
+| loop    | 34      | 33        | **0.93**        | 0.98         |
 
 * **`heavy`** (2-accumulator scalar-FP dependency chain) —
   bespoke ≈ Cranelift ≈ clang. No gap. clang's strict
-  build is even *slower* (1536) because its auto-vectoriser
+  build is even *slower* (1513) because its auto-vectoriser
   mis-packed the serial loop into 2-lane SIMD with
   per-iteration cross-lane shuffles.
-* **`heavy4`** (4 accumulators — register pressure, more
-  ILP) — bespoke **1.22× slower than Cranelift** (658 vs
-  536). Both still beat clang (same auto-vec misfire), but
-  *bespoke lost its parity with Cranelift here.* Under
-  real register pressure — the V8..V15 spill tier, more
-  simultaneously-live values — the single-pass linear-scan
-  shows seams that opts #1–#5 didn't reach. **This is the
-  measured weak spot.**
+* **`heavy4`** (4 accumulators, more ILP) — bespoke ≈
+  Cranelift (515 vs 509), both well ahead of clang. *This
+  used to be the weak spot* — bespoke was 1.22× slower
+  than Cranelift (658 vs 536). Disasm showed the two
+  loops structurally identical except the loop-carried
+  Phi move: bespoke emitted `fmov s` (FP-pipe latency),
+  Cranelift `mov vd.16b` (the ORR alias — rename-
+  eliminated). Switching the Phi-move emission to the
+  vector form (`22eea7c`) took heavy4 658 → 515 ns and
+  restored parity. The "register pressure" hunch was a
+  near-miss: the cost was Phi-move latency, which heavy4's
+  denser loop merely exposed.
 * **`loop`** (counted integer sum) — bespoke ≈ Cranelift,
   both **~35× slower than clang**. Not a codegen-quality
   gap: `clang -O2` strength-reduces `for i in 0..n: acc+=i`
@@ -2554,11 +2555,11 @@ cleanly generalise — the three shapes tell three stories:
   of optimisation, shared-absent in both.
 
 So the honest picture: bespoke is at the `clang -O2` bar
-for straight scalar-FP work; it trails *Cranelift* under
-register pressure; and loop-idiom recognition is an
-unattempted category for both fast-tier backends. The next
-optimisation pass has a measured target (heavy4 / register
-pressure) instead of a guess. Still unmeasured: vector-
+for straight scalar-FP work, at *both* shapes measured
+(2- and 4-accumulator loops), and matches Cranelift on
+all three. The one large remaining gap to a full
+optimiser — `loop` — is loop-idiom recognition, a
+category Cranelift skips too. Still unmeasured: vector-
 heavy loops (blocked — bespoke has no vec Phi yet) and
 texture/sampler-heavy shaders.
 
