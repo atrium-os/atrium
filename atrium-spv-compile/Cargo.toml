@@ -17,6 +17,8 @@ atrium-spv-backend-bespoke   = { path = "../atrium-spv-backend-bespoke" }
 sha2 = "0.10"
 
 [dev-dependencies]
-rspirv   = "0.13"
-sha2     = "0.10"
-tempfile = "3"
+rspirv     = "0.13"
+sha2       = "0.10"
+tempfile   = "3"
+# For the bench_driver example: dlopen the linked shaders.
+libloading = "0.8"

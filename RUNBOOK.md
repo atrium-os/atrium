@@ -2367,3 +2367,60 @@ PASS  unordcmp  -> entries=1  first_spirv=436 last_host=0   mid_lookup=436
 > to its source SPIR-V offset. (`unordcmp` is the
 > Cranelift-fallback shader — Cranelift's own pcmap is
 > separate and sparser.)
+
+### bespoke-vs-Cranelift benchmark
+
+`run-bench.sh` runs the `bench_driver` example
+(`atrium-spv-compile/examples/bench_driver.rs`) over a
+12-shader corpus, host and in-VM, measuring the two axes
+that decide whether the bespoke backend earns its
+complexity:
+
+* **compile** — ns for `backend::compile()` alone
+  (frontend + `cc` link excluded). The cache-miss latency
+  budget.
+* **run** — ns per `atrium_fs_main` call of the linked +
+  dlopen'd shader. The per-draw hot path (spec §8.1).
+
+```bash
+sh atrium-spv-backend-bespoke/verify/run-bench.sh
+```
+
+First run, 2026-05-14, in-VM (FreeBSD/aarch64) — `Nx` is
+the bespoke speedup (>1 = bespoke faster):
+
+| shader   | compile | run   |
+|----------|---------|-------|
+| const    | 2.30x   | 1.22x |
+| ifelse   | 5.15x   | 0.69x |
+| loop     | 3.20x   | 0.95x |
+| switch   | 3.65x   | 0.74x |
+| arith    | 2.95x   | 1.02x |
+| vecarith | 2.60x   | 0.80x |
+| dot      | 2.44x   | 0.67x |
+| shuffle  | 3.23x   | 1.05x |
+| cextract | 2.78x   | 1.07x |
+| phi      | 3.21x   | 0.82x |
+
+> **Reading the result.** The bespoke backend wins
+> **compile time decisively — 2.3–5.2× faster** than
+> Cranelift across the board (single-pass ISel vs
+> Cranelift's full optimisation pipeline). But on
+> **runtime it does *not* yet win**: the corpus shaders
+> are tiny (most ~1–1.7 ns/call — basically call
+> overhead), and where there's a real signal it's a
+> wash-to-slightly-behind — `loop`, the only shader doing
+> sustained work (~35 ns/call), has bespoke at 0.95×.
+> Bespoke's single-pass output carries slack (redundant
+> `fmov`/loads, no peephole pass) that Cranelift's
+> optimiser removes.
+>
+> This does **not** contradict the architecture — spec
+> §8.1 says bespoke perf "ramps in shader-by-shader" — but
+> it means the bespoke backend's headline justification
+> (steady-state hand-written-ARM64 perf) is **not yet
+> demonstrated**. Two follow-ups: (1) a heavyweight
+> benchmark shader that actually stresses the per-pixel
+> path, since the current corpus can't show a runtime
+> delta; (2) a peephole/redundant-move pass on the
+> bespoke backend.
