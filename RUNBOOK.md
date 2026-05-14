@@ -2306,3 +2306,38 @@ PASS  loop n=5     -> [1 1 1 1]
 PASS  switch n=2   -> [0 0 1 1]
 PASS  unordcmp lt  -> [1 0 0 1]
 ```
+
+### .pcmap sidecar round-trip in-VM
+
+`atrium-spv-compile` writes a `<hash>.pcmap` sidecar next
+to every `<hash>.so` — the host-PC → SPIR-V-offset map the
+daemon's crash handler uses for source attribution. The
+loader reads it back through `PcMap::from_bytes`, storing
+`Some(PcMap)` on the `LoadedShader`.
+`run-pcmap-e2e-in-vm.sh` drives `loader_e2e_driver` in
+`--check-pcmap` mode on the target — it loads each shader
+through the loader, then prints the parsed sidecar state
+instead of running the shader.
+
+```bash
+sh atrium-spv-backend-bespoke/verify/run-pcmap-e2e-in-vm.sh
+```
+
+Verified 2026-05-14 on FreeBSD 16.0-CURRENT arm64 — the
+sidecar the production compile binary emits round-trips
+cleanly through the loader's parser on-target:
+```
+PASS  const     -> pcmap present entries=1 first_spirv=0 last_host=0
+PASS  ifelse    -> pcmap present entries=1 first_spirv=0 last_host=0
+PASS  loop      -> pcmap present entries=1 first_spirv=0 last_host=0
+PASS  switch    -> pcmap present entries=1 first_spirv=0 last_host=0
+PASS  unordcmp  -> pcmap present entries=1 first_spirv=436 last_host=0
+```
+
+> Observed: the **bespoke** backend emits only a single
+> stub pcmap entry (`push(0, first_offset)`), so crash
+> triage on bespoke-compiled shaders can't attribute past
+> the first instruction. The sidecar *format* round-trips
+> correctly — this is a content-completeness gap in the
+> bespoke backend, tracked separately. Cranelift emits a
+> populated map (note `unordcmp`'s non-zero `first_spirv`).

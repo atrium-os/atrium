@@ -21,21 +21,37 @@
 //!
 //! Usage:
 //!   loader_e2e_driver <spirv> <compile-bin> <cache-root> \
-//!                     [push-const] [int]
+//!                     [push-const] [int] [--check-pcmap]
 //!
 //! The optional push-const mirrors `verify/harness.c`: a
 //! bare value is an f32 in `push_constants[0..4]`; the
 //! trailing literal `int` switches it to an i32.
 //!
-//! stdout: `r g b a` on success. Exit non-zero on any
-//! loader error (including a spurious re-spawn attempt).
+//! With `--check-pcmap` (accepted anywhere in the args),
+//! the driver skips the `fs_main` call and instead prints
+//! the state of the `.pcmap` sidecar the loader parsed off
+//! disk — `pcmap present entries=N first_spirv=X
+//! last_host=Y` or `pcmap absent`. This verifies the
+//! sidecar atrium-spv-compile wrote round-trips through the
+//! loader's `PcMap::from_bytes` on the target, so
+//! crash-triage source attribution is wired end to end.
+//!
+//! stdout: `r g b a` (default) or the `pcmap ...` line
+//! (`--check-pcmap`). Exit non-zero on any loader error
+//! (including a spurious re-spawn attempt).
 
 use std::path::PathBuf;
 
 use atrium_spv_loader::{LoaderConfig, ShaderCache};
 
 fn main() {
-    let mut args = std::env::args().skip(1);
+    let mut argv: Vec<String> = std::env::args().skip(1).collect();
+    let check_pcmap = {
+        let before = argv.len();
+        argv.retain(|a| a != "--check-pcmap");
+        argv.len() != before
+    };
+    let mut args = argv.into_iter();
     let spirv_path = args.next().expect("arg1: spirv path");
     let compile_bin = args.next().expect("arg2: atrium-spv-compile path");
     let cache_root = args.next().expect("arg3: cache root dir");
@@ -70,6 +86,28 @@ fn main() {
     let shader2 = cache2.load_or_compile(&spirv)
         .expect("disk-cache load failed — loader tried to re-spawn the \
                  compiler instead of reusing the cached .so");
+
+    // --check-pcmap: report the parsed sidecar state and
+    // exit, rather than running the shader. Proves the
+    // `.pcmap` atrium-spv-compile wrote round-trips through
+    // the loader's `PcMap::from_bytes` on the target.
+    if check_pcmap {
+        match &shader2.pcmap {
+            Some(pcmap) => {
+                let entries = pcmap.entries();
+                let first_spirv = entries.first()
+                    .map(|e| e.spirv_offset).unwrap_or(0);
+                let last_host = entries.last()
+                    .map(|e| e.host_offset).unwrap_or(0);
+                println!(
+                    "pcmap present entries={} first_spirv={} last_host={}",
+                    entries.len(), first_spirv, last_host,
+                );
+            }
+            None => println!("pcmap absent"),
+        }
+        return;
+    }
 
     let fs_main = shader2.entry_points.fs_main
         .expect("shader exports no atrium_fs_main");
