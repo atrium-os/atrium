@@ -273,6 +273,40 @@ fn emit_function(
     let (last_use, use_counts) = compute_last_use_flat(
         &flat_insts, &block_term_idx, &block_flat_start);
 
+    // Flat index of each result value's defining inst —
+    // Phi-move coalescing uses it to locate a Phi arm's
+    // producer and check the Phi value isn't read past it.
+    let mut value_def_flat_idx: HashMap<ValueId, usize> = HashMap::new();
+    for (idx, inst) in flat_insts.iter().enumerate() {
+        if let Some(r) = inst.result.as_ref() {
+            value_def_flat_idx.insert(r.id, idx);
+        }
+    }
+
+    // Predecessor map: which blocks branch into each block.
+    // Phi-move coalescing uses it to recognise the
+    // body→continue shape — a Phi arm's value is produced
+    // in the loop body but the arm's `from` is the
+    // continue block (the header's immediate predecessor).
+    let mut preds: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+    for bid in &block_order {
+        let block = func.blocks.get(bid).unwrap();
+        match block.insts.last().map(|i| &i.op) {
+            Some(Op::Branch(t)) => preds.entry(*t).or_default().push(*bid),
+            Some(Op::BranchCond { t_block, f_block, .. }) => {
+                preds.entry(*t_block).or_default().push(*bid);
+                preds.entry(*f_block).or_default().push(*bid);
+            }
+            Some(Op::Switch { cases, default, .. }) => {
+                preds.entry(*default).or_default().push(*bid);
+                for (_, t) in cases {
+                    preds.entry(*t).or_default().push(*bid);
+                }
+            }
+            _ => {}
+        }
+    }
+
     // ── Linear-scan register allocator ─────────────────────────
     //
     // Free pool of V-regs (V16..V31, caller-saved in
@@ -300,6 +334,28 @@ fn emit_function(
     // target (critical-edge splitting lands later).
     let mut phi_target_blocks: std::collections::HashSet<BlockId> =
         std::collections::HashSet::new();
+    // ── Phi-move coalescing ───────────────────────────────────
+    //
+    // `coalesce_into[v] = D` means "when the instruction
+    // producing value `v` is emitted, write its result
+    // straight into the Phi register `D` instead of a
+    // fresh register" — so the phi-move `fmov D, <v's reg>`
+    // becomes an identity and is dropped. These `fmov`s sit
+    // directly on a loop's carried dependency chain, so
+    // removing them is the actual runtime lever (opt #4).
+    //
+    // Safe to coalesce a Phi arm `(src, from)` into the
+    // Phi's register `D` when, all together:
+    //   * `src` is produced by a scalar binary op P in
+    //     block `from` (so P goes through a coalesce-aware
+    //     emit path);
+    //   * `src` is single-use — only the phi-move reads it
+    //     (`use_counts[src] == 1`);
+    //   * the Phi's own value is not read *after* P, using
+    //     the pre-extension `raw_last_use` (P may read it —
+    //     ARM reads operands before writing the dest, so
+    //     `add D,D,#1` is fine — but nothing later may).
+    let mut coalesce_into: HashMap<ValueId, PhiDest> = HashMap::new();
     for bid in &block_order {
         let block = func.blocks.get(bid).unwrap();
         for inst in &block.insts {
@@ -342,6 +398,82 @@ fn emit_function(
                 phi_moves.entry((arm.from, *bid))
                     .or_default()
                     .push((dest, arm.value.id));
+
+                // Decide coalescing for this arm.
+                let src = arm.value.id;
+                let Some(&p_idx) = value_def_flat_idx.get(&src) else {
+                    continue;
+                };
+                let p = flat_insts[p_idx];
+                // P must dominate the phi-move site (the
+                // terminator of `arm.from`). Two provably
+                // safe shapes:
+                //   1. P is in `arm.from` itself — the
+                //      phi-move comes right after P in the
+                //      same straight-line block (induction
+                //      variables: `i_next` in the continue
+                //      block).
+                //   2. P is in a block B whose sole job is
+                //      to fall through to `arm.from`: B's
+                //      terminator is `Branch(arm.from)` and
+                //      B is `arm.from`'s only predecessor
+                //      (loop accumulators: `a_next` is
+                //      produced in the body, the arm's
+                //      `from` is the continue block).
+                let p_in = |b: &BlockId| -> bool {
+                    block_flat_start.get(b).zip(block_term_idx.get(b))
+                        .is_some_and(|(&s, &e)| s <= p_idx && p_idx <= e)
+                };
+                let case1 = p_in(&arm.from);
+                let case2 = !case1
+                    && preds.get(&arm.from)
+                        .filter(|v| v.len() == 1)
+                        .is_some_and(|v| {
+                            let b = v[0];
+                            p_in(&b)
+                                && matches!(
+                                    func.blocks.get(&b)
+                                        .and_then(|bl| bl.insts.last())
+                                        .map(|i| &i.op),
+                                    Some(Op::Branch(t)) if *t == arm.from)
+                        });
+                if !(case1 || case2) { continue; }
+                // P must be a scalar binary op whose result
+                // type matches the Phi register class, and
+                // it must go through a coalesce-aware emit
+                // path (emit_fp_binop_poly / emit_int_binop).
+                let op_ok = match dest {
+                    PhiDest::Float(_) => matches!(&p.op,
+                        Op::FAdd(..) | Op::FSub(..)
+                        | Op::FMul(..) | Op::FDiv(..)),
+                    PhiDest::Int(_) => matches!(&p.op,
+                        Op::IAdd(..) | Op::ISub(..) | Op::IMul(..)
+                        | Op::SDiv(..) | Op::UDiv(..)
+                        | Op::SMod(..) | Op::UMod(..)
+                        | Op::BitAnd(..) | Op::BitOr(..) | Op::BitXor(..)
+                        | Op::Shl(..) | Op::LShr(..) | Op::AShr(..)),
+                };
+                if !op_ok { continue; }
+                // `src` single-use (only the phi-move reads it).
+                if use_counts.get(&src).copied() != Some(1) { continue; }
+                // The Phi value must not be read by anything
+                // that executes *between* P and the
+                // back-edge phi-move. Reads BEFORE P (this
+                // iteration's Phi value, e.g. the header
+                // compare or body uses ahead of P) are fine
+                // — P hasn't overwritten the register yet.
+                // Reads AFTER the loop (the merge block) are
+                // fine too — the register holds the final
+                // back-edge value, which is exactly what the
+                // Phi resolves to on exit. So scan only the
+                // half-open flat span (P, back-edge].
+                let back_edge_idx = block_term_idx.get(&arm.from)
+                    .copied().unwrap_or(p_idx);
+                let phi_id = result.id;
+                let read_between = (p_idx + 1..=back_edge_idx)
+                    .any(|fi| op_reads(&flat_insts[fi].op, phi_id));
+                if read_between { continue; }
+                coalesce_into.insert(src, dest);
             }
         }
     }
@@ -442,6 +574,23 @@ fn emit_function(
                 && use_counts.get(&res.id).copied() == Some(1)
         });
 
+        // Phi-move coalescing target for this instruction's
+        // result, if any (see the Phi pre-pass). When set,
+        // the producing binop writes straight into the Phi
+        // register and the corresponding phi-move is
+        // dropped below. Split into the V-reg / W-reg forms
+        // the two binop emit helpers expect.
+        let coalesce_dest: Option<PhiDest> = inst.result.as_ref()
+            .and_then(|r| coalesce_into.get(&r.id).copied());
+        let coalesce_v: Option<asm::Vreg> = match coalesce_dest {
+            Some(PhiDest::Float(v)) => Some(v),
+            _ => None,
+        };
+        let coalesce_w: Option<asm::Wreg> = match coalesce_dest {
+            Some(PhiDest::Int(w)) => Some(w),
+            _ => None,
+        };
+
         match &inst.op {
             Op::ConstInt { value, kind: _ } => {
                 let result = inst.result.as_ref().ok_or_else(||
@@ -466,28 +615,28 @@ fn emit_function(
                 // Treat as an orphan — no W-reg.
             }
             Op::IAdd(l, r) => emit_int_binop(
-                &mut a, &mut ints, &mut int_pool, inst, l, r, asm::add_w)?,
+                &mut a, &mut ints, &mut int_pool, coalesce_w, inst, l, r, asm::add_w)?,
             Op::ISub(l, r) => emit_int_binop(
-                &mut a, &mut ints, &mut int_pool, inst, l, r, asm::sub_w)?,
+                &mut a, &mut ints, &mut int_pool, coalesce_w, inst, l, r, asm::sub_w)?,
             Op::IMul(l, r) => emit_int_binop(
-                &mut a, &mut ints, &mut int_pool, inst, l, r, asm::mul_w)?,
+                &mut a, &mut ints, &mut int_pool, coalesce_w, inst, l, r, asm::mul_w)?,
             Op::SDiv(l, r) => emit_int_binop(
-                &mut a, &mut ints, &mut int_pool, inst, l, r, asm::sdiv_w)?,
+                &mut a, &mut ints, &mut int_pool, coalesce_w, inst, l, r, asm::sdiv_w)?,
             Op::UDiv(l, r) => emit_int_binop(
-                &mut a, &mut ints, &mut int_pool, inst, l, r, asm::udiv_w)?,
+                &mut a, &mut ints, &mut int_pool, coalesce_w, inst, l, r, asm::udiv_w)?,
             // Bitwise + shifts.
             Op::BitAnd(l, r) => emit_int_binop(
-                &mut a, &mut ints, &mut int_pool, inst, l, r, asm::and_w)?,
+                &mut a, &mut ints, &mut int_pool, coalesce_w, inst, l, r, asm::and_w)?,
             Op::BitOr(l, r) => emit_int_binop(
-                &mut a, &mut ints, &mut int_pool, inst, l, r, asm::orr_w)?,
+                &mut a, &mut ints, &mut int_pool, coalesce_w, inst, l, r, asm::orr_w)?,
             Op::BitXor(l, r) => emit_int_binop(
-                &mut a, &mut ints, &mut int_pool, inst, l, r, asm::eor_w)?,
+                &mut a, &mut ints, &mut int_pool, coalesce_w, inst, l, r, asm::eor_w)?,
             Op::Shl(l, r) => emit_int_binop(
-                &mut a, &mut ints, &mut int_pool, inst, l, r, asm::lslv_w)?,
+                &mut a, &mut ints, &mut int_pool, coalesce_w, inst, l, r, asm::lslv_w)?,
             Op::LShr(l, r) => emit_int_binop(
-                &mut a, &mut ints, &mut int_pool, inst, l, r, asm::lsrv_w)?,
+                &mut a, &mut ints, &mut int_pool, coalesce_w, inst, l, r, asm::lsrv_w)?,
             Op::AShr(l, r) => emit_int_binop(
-                &mut a, &mut ints, &mut int_pool, inst, l, r, asm::asrv_w)?,
+                &mut a, &mut ints, &mut int_pool, coalesce_w, inst, l, r, asm::asrv_w)?,
             Op::BitNot(s) => {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal("BitNot without result".into()))?;
@@ -742,19 +891,19 @@ fn emit_function(
             Op::FAdd(a_v, b_v) => emit_fp_binop_poly(
                 &mut a, &mut scalars, &mut vectors,
                 &mut free_pool, &mut owners, &mut next_synth_id,
-                inst, a_v, b_v, asm::fadd_s)?,
+                coalesce_v, inst, a_v, b_v, asm::fadd_s)?,
             Op::FSub(a_v, b_v) => emit_fp_binop_poly(
                 &mut a, &mut scalars, &mut vectors,
                 &mut free_pool, &mut owners, &mut next_synth_id,
-                inst, a_v, b_v, asm::fsub_s)?,
+                coalesce_v, inst, a_v, b_v, asm::fsub_s)?,
             Op::FMul(a_v, b_v) => emit_fp_binop_poly(
                 &mut a, &mut scalars, &mut vectors,
                 &mut free_pool, &mut owners, &mut next_synth_id,
-                inst, a_v, b_v, asm::fmul_s)?,
+                coalesce_v, inst, a_v, b_v, asm::fmul_s)?,
             Op::FDiv(a_v, b_v) => emit_fp_binop_poly(
                 &mut a, &mut scalars, &mut vectors,
                 &mut free_pool, &mut owners, &mut next_synth_id,
-                inst, a_v, b_v, asm::fdiv_s)?,
+                coalesce_v, inst, a_v, b_v, asm::fdiv_s)?,
             Op::Store { ptr, value } => {
                 match &ptr.ty {
                     Type::Pointer(StorageClass::Output, _) => {}
@@ -930,6 +1079,13 @@ fn emit_function(
                 // each, just before the branch.
                 if let Some(moves) = phi_moves.get(&(*bid, *target)) {
                     for (dest, src_id) in moves {
+                        // Coalesced arm: the producing binop
+                        // already wrote straight into `dest`,
+                        // so the move would be an identity —
+                        // skip it (opt #4).
+                        if coalesce_into.get(src_id) == Some(dest) {
+                            continue;
+                        }
                         match dest {
                             PhiDest::Float(dv) => {
                                 let src = *scalars.get(src_id).ok_or_else(||
@@ -1185,7 +1341,7 @@ fn emit_load_f32_offset(
 /// Destination register for a Phi node. f32 Phis land in
 /// a V-reg (moved with `fmov_s`); i32/u32 Phis land in a
 /// W-reg (moved with `mov_w`).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PhiDest {
     Float(asm::Vreg),
     Int(asm::Wreg),
@@ -1250,10 +1406,17 @@ fn alloc_int_w(
 }
 
 /// Emit one scalar i32 binary op (add/sub/mul/sdiv/udiv).
+///
+/// `coalesce` — when `Some(d)` this op's result is a Phi
+/// arm being coalesced into the Phi register `d`: compute
+/// straight into `d` instead of allocating a fresh W-reg,
+/// so the phi-move drops to an identity (see opt #4).
+#[allow(clippy::too_many_arguments)]
 fn emit_int_binop(
     a: &mut asm::Asm,
     ints: &mut HashMap<ValueId, asm::Wreg>,
     int_pool: &mut IntPool,
+    coalesce: Option<asm::Wreg>,
     inst: &atrium_spv_ir::Inst,
     lhs: &Value,
     rhs: &Value,
@@ -1267,7 +1430,13 @@ fn emit_int_binop(
     let r = *ints.get(&rhs.id).ok_or_else(||
         BackendError::Internal(format!(
             "int binop rhs {:?} not in ints", rhs.id)))?;
-    let d = alloc_int_w(int_pool, result.id)?;
+    // ARM reads both source operands before writing the
+    // destination, so coalescing into a register that is
+    // also a source (`add D, D, r`) is correct.
+    let d = match coalesce {
+        Some(d) => d,
+        None => alloc_int_w(int_pool, result.id)?,
+    };
     a.emit(make_inst(d, l, r));
     ints.insert(result.id, d);
     Ok(())
@@ -1396,6 +1565,65 @@ fn alloc_vreg(
 /// so `use_counts[v] == 1` is a reliable "single use"
 /// signal even for a value used inside a loop. Compare→
 /// branch fusion relies on this.
+/// Does instruction `op` read `id` as one of its operands?
+///
+/// Used by Phi-move coalescing to scan the flat span
+/// between a Phi arm's producer and the back-edge for any
+/// read of the Phi value. Conservative: any op shape not
+/// explicitly enumerated returns `true` ("assume it reads
+/// it" → block the coalesce), so an unhandled op can never
+/// make coalescing *un*safe — only miss an opportunity.
+fn op_reads(op: &Op, id: ValueId) -> bool {
+    use Op::*;
+    match op {
+        ConstInt { .. } | ConstFloat { .. } | ConstNull
+        | Branch(_) | Return | Discard => false,
+        ConstVec(els) => els.iter().any(|v| v.id == id),
+        IAdd(l, r) | ISub(l, r) | IMul(l, r) | UDiv(l, r) | SDiv(l, r)
+        | UMod(l, r) | SMod(l, r) | FAdd(l, r) | FSub(l, r)
+        | FMul(l, r) | FDiv(l, r) | FRem(l, r)
+        | BitAnd(l, r) | BitOr(l, r) | BitXor(l, r)
+        | Shl(l, r) | LShr(l, r) | AShr(l, r)
+        | IEq(l, r) | INe(l, r)
+        | ULt(l, r) | ULe(l, r) | UGt(l, r) | UGe(l, r)
+        | SLt(l, r) | SLe(l, r) | SGt(l, r) | SGe(l, r)
+        | FOrdEq(l, r) | FOrdNe(l, r) | FOrdLt(l, r)
+        | FOrdLe(l, r) | FOrdGt(l, r) | FOrdGe(l, r)
+        | FUnordEq(l, r) | FUnordNe(l, r) | FUnordLt(l, r)
+        | FUnordLe(l, r) | FUnordGt(l, r) | FUnordGe(l, r)
+        | Dot(l, r) =>
+            l.id == id || r.id == id,
+        INeg(s) | FNeg(s) | BitNot(s)
+        | ConvertSToF(s) | ConvertFToS(s)
+        | ConvertUToF(s) | ConvertFToU(s)
+        | SConvert(s, _) | UConvert(s, _) | FConvert(s, _)
+        | Bitcast(s, _) | Load(s)
+        | DPdx(s) | DPdy(s) | Fwidth(s) | ReturnValue(s) =>
+            s.id == id,
+        VectorShuffle { src1, src2, .. } =>
+            src1.id == id || src2.id == id,
+        VectorExtract { vector, .. } => vector.id == id,
+        VectorInsert { vector, scalar, .. } =>
+            vector.id == id || scalar.id == id,
+        AccessChain { base, .. } => base.id == id,
+        Store { ptr, value } => ptr.id == id || value.id == id,
+        Select { cond, t_val, f_val } =>
+            cond.id == id || t_val.id == id || f_val.id == id,
+        BranchCond { cond, .. } => cond.id == id,
+        Switch { selector, .. } => selector.id == id,
+        Phi(arms) => arms.iter().any(|a| a.value.id == id),
+        // Atomics, image ops, and anything else: conservative.
+        _ => true,
+    }
+}
+
+/// Returns `(last_use, use_counts)`:
+/// * `last_use` — loop-extension applied (the value the
+///   linear-scan expiry consults).
+/// * `use_counts` — raw operand-occurrence tally; NOT
+///   perturbed by the loop extension, so `use_counts[v]
+///   == 1` is a reliable "single use" signal for the
+///   compare→branch fusion and Phi-coalescing checks.
 fn compute_last_use_flat(
     insts: &[&atrium_spv_ir::Inst],
     block_term_idx: &HashMap<BlockId, usize>,
@@ -1632,6 +1860,7 @@ fn compute_last_use_flat(
 /// Result is stored in `scalars` (scalar shape) or
 /// `vectors` (vec shape).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn emit_fp_binop_poly(
     a: &mut asm::Asm,
     scalars: &mut HashMap<ValueId, asm::Vreg>,
@@ -1639,6 +1868,7 @@ fn emit_fp_binop_poly(
     free_pool: &mut Vec<u8>,
     owners: &mut HashMap<u8, ValueId>,
     next_synth_id: &mut u32,
+    coalesce: Option<asm::Vreg>,
     inst: &atrium_spv_ir::Inst,
     lhs: &Value,
     rhs: &Value,
@@ -1664,7 +1894,15 @@ fn emit_fp_binop_poly(
             let r = *scalars.get(&rhs.id).ok_or_else(||
                 BackendError::Internal(format!(
                     "fp binop rhs {:?} missing", rhs.id)))?;
-            let d = alloc_vreg(free_pool, owners, result.id)?;
+            // Phi-move coalescing: write straight into the
+            // Phi register when this scalar result is a
+            // single-use Phi arm (see opt #4). ARM reads
+            // both operands before writing the dest, so
+            // coalescing into a source register is correct.
+            let d = match coalesce {
+                Some(d) => d,
+                None => alloc_vreg(free_pool, owners, result.id)?,
+            };
             a.emit(make_inst(d, l, r));
             scalars.insert(result.id, d);
         }
