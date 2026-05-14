@@ -12,6 +12,7 @@
 //!   emit_freebsd_obj <out.o> ifelse <s> -- if(s<0.5) red else blue
 //!   emit_freebsd_obj <out.o> loop <n>   -- counted-loop sum check
 //!   emit_freebsd_obj <out.o> arith <n>  -- out = (n*2+1)*0.125
+//!   emit_freebsd_obj <out.o> bitwise <n>-- nibble/xor/or extract
 //!
 //! stdout is always the expected RGBA for the chosen
 //! shader+input, so the in-VM harness can diff against it
@@ -264,6 +265,79 @@ fn build_arith_spirv() -> Vec<u8> {
     bytes
 }
 
+/// Bitwise + shift: `n` is an i32 push-constant; compute
+///   hi  = (n >> 4) & 0xF      (AShr, BitAnd)
+///   lo  = n & 0xF             (BitAnd)
+///   xor = n ^ 0xAA            (BitXor)
+///   or_ = n | 0x10            (BitOr)
+/// Output `vec4(hi/16, lo/16, xor/256, or_/256)` — all
+/// divisors are powers of two so every quotient is exact
+/// in f32 and prints identically under Rust `{}` and the
+/// harness's C `%g`. The on-target twin of the host
+/// `three_way_bitwise_and_shift` differential test.
+fn build_bitwise_spirv() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let f32_ty = b.type_float(32, None);
+    let i32_ty = b.type_int(32, 1);
+    let vec4 = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let pc_struct = b.type_struct(vec![i32_ty]);
+    b.member_decorate(pc_struct, 0, Decoration::Offset,
+                      vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(pc_struct, Decoration::Block, vec![]);
+    let ptr_pc_struct = b.type_pointer(None, StorageClass::PushConstant, pc_struct);
+    let ptr_pc_i32    = b.type_pointer(None, StorageClass::PushConstant, i32_ty);
+    let ptr_out       = b.type_pointer(None, StorageClass::Output, vec4);
+    let zero_i = b.constant_bit32(i32_ty, 0u32);
+    let four_i = b.constant_bit32(i32_ty, 4u32);
+    let mask_i = b.constant_bit32(i32_ty, 0xFu32);
+    let xor_i  = b.constant_bit32(i32_ty, 0xAAu32);
+    let or_i   = b.constant_bit32(i32_ty, 0x10u32);
+    let c16  = b.constant_bit32(f32_ty, 16.0f32.to_bits());
+    let c256 = b.constant_bit32(f32_ty, 256.0f32.to_bits());
+    let pc_var = b.variable(ptr_pc_struct, None, StorageClass::PushConstant, None);
+    let out = b.variable(ptr_out, None, StorageClass::Output, None);
+    b.decorate(out, Decoration::Location,
+               vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let p = b.access_chain(ptr_pc_i32, None, pc_var, vec![zero_i]).unwrap();
+    let n = b.load(i32_ty, None, p, None, vec![]).unwrap();
+    let shifted = b.shift_right_arithmetic(i32_ty, None, n, four_i).unwrap();
+    let hi = b.bitwise_and(i32_ty, None, shifted, mask_i).unwrap();
+    let lo = b.bitwise_and(i32_ty, None, n, mask_i).unwrap();
+    let xor = b.bitwise_xor(i32_ty, None, n, xor_i).unwrap();
+    let or_ = b.bitwise_or(i32_ty, None, n, or_i).unwrap();
+    let hi_f = b.convert_s_to_f(f32_ty, None, hi).unwrap();
+    let lo_f = b.convert_s_to_f(f32_ty, None, lo).unwrap();
+    let xor_f = b.convert_s_to_f(f32_ty, None, xor).unwrap();
+    let or_f = b.convert_s_to_f(f32_ty, None, or_).unwrap();
+    let hi_n = b.f_div(f32_ty, None, hi_f, c16).unwrap();
+    let lo_n = b.f_div(f32_ty, None, lo_f, c16).unwrap();
+    let xor_n = b.f_div(f32_ty, None, xor_f, c256).unwrap();
+    let or_n = b.f_div(f32_ty, None, or_f, c256).unwrap();
+    let color = b.composite_construct(vec4, None,
+        vec![hi_n, lo_n, xor_n, or_n]).unwrap();
+    b.store(out, color, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![out]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let path = args.next()
@@ -309,6 +383,19 @@ fn main() {
                 .unwrap_or(3);
             let lum = (n * 2 + 1) as f32 * 0.125;
             (build_arith_spirv(), [lum, lum, lum, 1.0])
+        }
+        "bitwise" => {
+            // n from an i32 push-const; vec4 of nibble /
+            // xor / or extractions, all power-of-two
+            // normalised.
+            let n: i32 = args.next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0x53);
+            let hi = ((n >> 4) & 0xF) as f32 / 16.0;
+            let lo = (n & 0xF) as f32 / 16.0;
+            let xor = (n ^ 0xAA) as f32 / 256.0;
+            let or_ = (n | 0x10) as f32 / 256.0;
+            (build_bitwise_spirv(), [hi, lo, xor, or_])
         }
         other => {
             eprintln!("unknown shader kind: {other}");

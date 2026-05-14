@@ -55,7 +55,14 @@ int main(int argc, char **argv) {
     float out[4] = {0,0,0,0};
     float depth = 0;
     fs(NULL, NULL, pc_ptr, 0.f, 0.f, 0.f, 0.f, 0u, out, &depth);
-    printf("%g %g %g %g\n", out[0], out[1], out[2], out[3]);
+    /* %.9g, not %g: the default %g caps at 6 significant
+     * digits, so exact values like 0.97265625 print as
+     * "0.972656" and spuriously diverge from the host's
+     * Rust `{}` (shortest round-trip) expected string. All
+     * verification shaders use power-of-two-derived exact
+     * f32 values, so 9 significant digits reproduces them
+     * exactly and matches Rust's formatting. */
+    printf("%.9g %.9g %.9g %.9g\n", out[0], out[1], out[2], out[3]);
     dlclose(h);
     return 0;
 }

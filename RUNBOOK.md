@@ -2104,7 +2104,7 @@ What it does:
    fragment ABI and prints the RGBA.
 4. Compares VM output against the host-side expected value.
 
-The script covers four shaders:
+The script covers five shaders:
 * **const** — constant-colour store: exercises the ELF object
   format, the exported symbol, and the Store path.
 * **ifelse** — `if (push_const.scale < 0.5) red else blue`:
@@ -2125,6 +2125,11 @@ The script covers four shaders:
   0.125 scale is a negative power of two so every result is
   exact in f32 and prints identically under Rust's `{}` and
   the harness's C `%g`. Driven with `n=3` and `n=1`.
+* **bitwise** — nibble / xor / or extraction from an i32
+  push-const: `AShr`, `BitAnd`, `BitXor`, `BitOr`, then
+  `ConvertSToF` + `FDiv`, all power-of-two normalised. The
+  on-target twin of the host `three_way_bitwise_and_shift`
+  differential test. Driven with `n=0x53` and `n=0xC1`.
 
 Verified 2026-05-14 on FreeBSD 16.0-CURRENT arm64:
 ```
@@ -2135,7 +2140,14 @@ PASS  loop n=5     -> [1 1 1 1]
 PASS  loop n=4     -> [0 0 0 1]
 PASS  arith n=3    -> [0.875 0.875 0.875 1]
 PASS  arith n=1    -> [0.375 0.375 0.375 1]
+PASS  bitwise 0x53 -> [0.3125 0.1875 0.97265625 0.32421875]
+PASS  bitwise 0xC1 -> [0.75 0.0625 0.41796875 0.81640625]
 ```
+The harness prints with `%.9g`, not the default `%g` —
+`%g` caps at 6 significant digits, so an exact value like
+`0.97265625` would print `0.972656` and spuriously diverge
+from the host's Rust `{}` (shortest round-trip) expected
+string.
 The bespoke ELF + AAPCS64 codegen — object format, `cc -shared`
 link, `dlopen`/`dlsym`, the fragment ABI, the conditional-
 branch path, **and counted loops** (Phi back-edges,

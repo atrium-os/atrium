@@ -24,6 +24,10 @@
 #     IAdd, ConvertSToF (scvtf), FMul on the W-reg pool +
 #     int->float path. On-target twin of the host
 #     three_way_int_arith_and_convert differential test.
+#   * bitwise — nibble/xor/or extraction from an i32 push-
+#     const: AShr, BitAnd, BitXor, BitOr + ConvertSToF +
+#     FDiv, all power-of-two normalised. On-target twin of
+#     the host three_way_bitwise_and_shift differential test.
 #
 # Prereqs: the dev VM is up (scripts/run-vm.sh) and
 # reachable on localhost:2222 with the fresco_bsd key.
@@ -83,6 +87,8 @@ verify "loop n=5"     "5 int"   loop 5
 verify "loop n=4"     "4 int"   loop 4
 verify "arith n=3"    "3 int"   arith 3
 verify "arith n=1"    "1 int"   arith 1
+verify "bitwise 0x53" "83 int"  bitwise 83
+verify "bitwise 0xC1" "193 int" bitwise 193
 
 if [ "$FAILED" = "0" ]; then
   echo "==> PASS — bespoke ELF + AAPCS64 codegen verified on FreeBSD aarch64"
