@@ -2642,3 +2642,37 @@ suites):
    inlining), the blob needs intra-blob call relocation.
    Current shaders are single-function; confirm the
    frontend's policy before relying on "no relocs".
+
+#### JIT-emit path — status
+
+* **Phase 1 ✅** (`8bdef55`). New `atrium-spv-blob` crate:
+  48-byte header + flat PIC code, `to_bytes`/`from_bytes`
+  with full validation (9 tests). Bespoke `compile_blob()`
+  — strictly less work than `compile()`, since the
+  backend's `.text` is already self-contained.
+* **Phase 2 ✅** (`135bbf5`). `atrium-spv-loader::jitmap` —
+  `map_blob()` does `mmap` → copy → **icache flush**
+  (`__clear_cache` on FreeBSD/Linux, `sys_icache_invalidate`
+  on macOS) → `mprotect` RX, with a `MAP_JIT` path for the
+  macOS host build. Host unit test maps + *runs* a real
+  const shader.
+* **Phase 3 ✅** (`417524a`). Wired through: `atrium-spv-compile`
+  bespoke path writes `<hash>.afblob` (no `cc`);
+  `atrium-spv-loader` prefers the blob, `mmap`s it, falls
+  back to `dlopen` for Cranelift `.so`s. `LoadedShader`'s
+  backing is now a `CodeBacking` enum. **Measured: heavy
+  shader compile `~41 ms → ~1 ms`** (`link_us` 41000 → 0);
+  the 292-byte `.afblob` replaces a ~16 KB `.so`. 25/25
+  differential + 3/3 in-VM scripts pass — the FreeBSD
+  `__clear_cache` + `mprotect` path executes correctly
+  on-target. (`run-e2e-in-vm.sh` retired —
+  `run-loader-e2e-in-vm.sh` drives the real loader and
+  supersedes it.)
+* **Phase 4 ⏳** — Cranelift blob output. Open question 1
+  (does `cranelift-object` carry relocations?) decides
+  whether this is small or a sub-arc. Until then the
+  Cranelift fallback keeps the `cc` → `.so` → `dlopen`
+  path, which still works — the loader handles both
+  artifact types. Only the *common* (bespoke) case gets
+  the ~40× compile win so far, but that's the case that
+  matters.
