@@ -2444,42 +2444,65 @@ In priority order (impact × inverse-risk):
    barely moved (~3%): the removed `cset`/`cmp` are cheap
    integer ops a superscalar core runs in parallel with
    the FP work — they were never on the critical path.
-2. **Branch-to-next-block elision.** If a block's
-   unconditional-branch target is the block emitted
-   immediately after it, drop the branch. Self-contained,
-   no RA interaction.
-3. **Immediate forms.** `add`/`sub` with a small immediate
-   instead of `mov`-into-reg-then-add; `fmov s, #imm` for
-   representable float constants; `movi` for zero.
+2. **Branch-to-next-block elision.** ✅ **DONE**
+   (`53388b6`). A block's unconditional branch to the
+   block emitted immediately after it is dropped — control
+   falls through. Applied to `Op::Branch`, the BranchCond
+   false edge, and the Switch default jump.
+3. **Immediate-form add/sub.** ✅ **DONE** (`162a633`). A
+   small integer constant (imm12 range) used only as an
+   add/sub operand rides in the instruction's immediate
+   field instead of occupying a W-reg — `add w,w,#1`. Both
+   code-size and register-pressure hygiene; the freed
+   W-reg eases #5's problem. (The `fmov s,#imm` / `movi`
+   float-immediate forms are deferred — they need new pptk
+   encoders and only touch the run-once prologue.)
 4. **Phi / copy coalescing.** ✅ **DONE** (`8c53315`). When
    a Phi arm's value is produced by a scalar binary op,
    that op writes straight into the Phi register and the
    `fmov`/`mov` is elided. These moves sat *on* the
    loop-carried dependency chain — this was the real
    runtime lever, as the disasm analysis predicted.
-5. **Register spilling.** Out of scope for the `heavy`
-   shader (sized to fit) but a hard limit: a
-   four-accumulator variant fails to compile at all
-   ("linear-scan RA ran out of V-regs"). Needed before the
-   bespoke backend can be the *default* for arbitrary
-   shaders rather than falling back to Cranelift on
-   pressure.
+5. **Register spilling / pressure relief.** ⏳ **NEXT — its
+   own focused effort.** A hard limit: a four-accumulator
+   `heavy` variant fails to compile ("linear-scan RA ran
+   out of V-regs"). Two routes, decision pending:
+   * **Extend the V-reg pool into V8..V15** (callee-saved
+     per AAPCS64) — mirrors the existing W19..W28
+     callee-saved-integer mechanism: prologue `stp d`,
+     epilogue `ldp d`. Low-risk, ~16→24 f32 regs, covers
+     virtually all real shaders, but needs `stp_d_pre` /
+     `ldp_d_post` encoders added to pptk first.
+   * **True spill/reload** — unbounded, but invasive:
+     every operand-fetch site must reload-if-spilled, and
+     the victim-selection + stack-slot machinery touches
+     the whole allocator.
+   Recommended: ship the V8..V15 extension first (raises
+   the ceiling enough that true spilling becomes a rare-
+   case completeness item), then true spilling as a
+   separate arc. Needed before bespoke can be the
+   *default* for arbitrary shaders instead of falling back
+   to Cranelift on pressure.
 
-#### Result after opts #1 + #4
+#### Result after opts #1–#4
 
 `heavy` shader runtime, bespoke vs Cranelift (`Nx`, >1 =
 bespoke faster):
 
-| stage                | in-VM ns/call (besp / clif) | ratio |
-|----------------------|-----------------------------|-------|
-| baseline             | 1290 / 1002                 | 0.78x |
-| + compare→branch (#1)| 1250 / 1002                 | 0.77x |
-| + Phi coalescing (#4)| 1113 / 1097                 | **0.99x** |
+| stage                  | in-VM ns/call (besp / clif) | ratio |
+|------------------------|-----------------------------|-------|
+| baseline               | 1290 / 1002                 | 0.78x |
+| + compare→branch (#1)  | 1250 / 1002                 | 0.77x |
+| + Phi coalescing (#4)  | 1113 / 1097                 | 0.99x |
+| + branch elision (#2) + immediate add (#3) | 1087 / 1090     | **1.00x** |
 
-The bespoke backend is now at **runtime parity** with
-Cranelift on the heavy loop (0.99x, host agrees) **while
-still compiling ~4.7× faster** — it now earns its
-complexity. Opt #4 confirmed the disasm prediction: the
-loop-carried Phi `fmov`s were the cost, not the
-instruction count. Opts #2 and #3 remain as code-size
-hygiene; #5 (spilling) is the next structural item.
+The bespoke backend is now at **exact runtime parity**
+with Cranelift on the heavy loop (1.00x, host agrees)
+**while still compiling ~4.7× faster** — it now earns its
+complexity. Opt #4 was the real runtime lever (the
+loop-carried Phi `fmov`s); #1/#2/#3 are code-size and
+register-pressure hygiene. The full in-VM verification
+suite (codegen / compile chain / loader cache / pcmap) and
+24/24 three-way differential tests pass with all four
+optimisations applied. #5 (register pressure) is the
+remaining structural item.
