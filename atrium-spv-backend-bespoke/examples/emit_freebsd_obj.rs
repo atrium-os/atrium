@@ -21,6 +21,8 @@
 //!   emit_freebsd_obj <out.o> dot        -- OpDot + VectorTimesScalar
 //!   emit_freebsd_obj <out.o> unordcmp <s> -- OpFUnordLessThan (bespoke
 //!                                            Unsupported -> Cranelift)
+//!   emit_freebsd_obj <out.o> heavy <n>  -- heavyweight benchmark loop
+//!                                          (4 coupled accumulators)
 //!
 //! Prefix any kind with `spirv` to write the raw SPIR-V
 //! module instead of a compiled object (for the end-to-end
@@ -760,6 +762,130 @@ fn build_unordcmp_spirv() -> Vec<u8> {
     bytes
 }
 
+/// Heavyweight benchmark shader: a counted loop with two
+/// cross-coupled f32 accumulators, ~6 FMul/FAdd per
+/// iteration. `n` (i32 push-constant) is the iteration
+/// count. Every update is contractive (`x*0.99 + small`),
+/// so the accumulators stay bounded — no inf/NaN however
+/// large `n` is.
+///
+/// Unlike the rest of the corpus this is *deliberately*
+/// heavy: with `n` in the hundreds the per-call cost is
+/// dominated by the loop body, not call overhead, so the
+/// bench can actually see codegen-quality differences
+/// (loop-carried Phis, float-op scheduling, redundant
+/// moves).
+///
+/// Sized to *just* fit the bespoke backend's V-register
+/// file: two accumulators + the induction Phi + the body
+/// temporaries stay under V16..V31. A four-accumulator
+/// variant overflowed it ("linear-scan RA ran out of
+/// V-regs; spilling lands in step 5") — the bespoke
+/// backend has no register spilling yet, which is itself a
+/// benchmark finding.
+fn build_heavy_spirv() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, LoopControl, MemoryModel,
+        StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let f32_ty = b.type_float(32, None);
+    let i32_ty = b.type_int(32, 1);
+    let bool_ty = b.type_bool();
+    let vec4 = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let pc_struct = b.type_struct(vec![i32_ty]);
+    b.member_decorate(pc_struct, 0, Decoration::Offset,
+                      vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(pc_struct, Decoration::Block, vec![]);
+    let ptr_pc_struct = b.type_pointer(None, StorageClass::PushConstant, pc_struct);
+    let ptr_pc_i32    = b.type_pointer(None, StorageClass::PushConstant, i32_ty);
+    let ptr_out       = b.type_pointer(None, StorageClass::Output, vec4);
+    let zero_i = b.constant_bit32(i32_ty, 0u32);
+    let one_i  = b.constant_bit32(i32_ty, 1u32);
+    let k_a0 = b.constant_bit32(f32_ty, 0.5f32.to_bits());
+    let k_b0 = b.constant_bit32(f32_ty, 0.25f32.to_bits());
+    let k99  = b.constant_bit32(f32_ty, 0.99f32.to_bits());
+    let k01  = b.constant_bit32(f32_ty, 0.01f32.to_bits());
+    let c0   = b.constant_bit32(f32_ty, 0.0f32.to_bits());
+    let c1   = b.constant_bit32(f32_ty, 1.0f32.to_bits());
+    let pc_var = b.variable(ptr_pc_struct, None, StorageClass::PushConstant, None);
+    let out = b.variable(ptr_out, None, StorageClass::Output, None);
+    b.decorate(out, Decoration::Location,
+               vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    let entry_id  = b.id();
+    let header_id = b.id();
+    let body_id   = b.id();
+    let cont_id   = b.id();
+    let merge_id  = b.id();
+    let i_next  = b.id();
+    let a_next  = b.id();
+    let b_next  = b.id();
+    b.begin_block(Some(entry_id)).unwrap();
+    let p = b.access_chain(ptr_pc_i32, None, pc_var, vec![zero_i]).unwrap();
+    let n = b.load(i32_ty, None, p, None, vec![]).unwrap();
+    b.branch(header_id).unwrap();
+    b.begin_block(Some(header_id)).unwrap();
+    let i_phi = b.phi(i32_ty, None,
+        vec![(zero_i, entry_id), (i_next, cont_id)]).unwrap();
+    let a_phi = b.phi(f32_ty, None,
+        vec![(k_a0, entry_id), (a_next, cont_id)]).unwrap();
+    let b_phi = b.phi(f32_ty, None,
+        vec![(k_b0, entry_id), (b_next, cont_id)]).unwrap();
+    let cond = b.s_less_than(bool_ty, None, i_phi, n).unwrap();
+    b.loop_merge(merge_id, cont_id, LoopControl::NONE, vec![]).unwrap();
+    b.branch_conditional(cond, body_id, merge_id, vec![]).unwrap();
+    b.begin_block(Some(body_id)).unwrap();
+    // Two cross-coupled contractive updates. Both Phi
+    // values are live across the whole body.
+    let t1     = b.f_mul(f32_ty, None, a_phi, b_phi).unwrap();
+    let a_keep = b.f_mul(f32_ty, None, a_phi, k99).unwrap();
+    let a_mix  = b.f_mul(f32_ty, None, b_phi, k01).unwrap();
+    let _a_n   = b.f_add(f32_ty, Some(a_next), a_keep, a_mix).unwrap();
+    let b_keep = b.f_mul(f32_ty, None, b_phi, k99).unwrap();
+    let b_mix  = b.f_mul(f32_ty, None, t1, k01).unwrap();
+    let _b_n   = b.f_add(f32_ty, Some(b_next), b_keep, b_mix).unwrap();
+    b.branch(cont_id).unwrap();
+    b.begin_block(Some(cont_id)).unwrap();
+    b.i_add(i32_ty, Some(i_next), i_phi, one_i).unwrap();
+    b.branch(header_id).unwrap();
+    b.begin_block(Some(merge_id)).unwrap();
+    let color = b.composite_construct(vec4, None,
+        vec![a_phi, b_phi, c0, c1]).unwrap();
+    b.store(out, color, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![out]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+/// Reference evaluation of the `heavy` shader — the same
+/// f32 op sequence build_heavy_spirv emits, so the in-VM
+/// harness can diff against it.
+fn eval_heavy(n: i32) -> [f32; 4] {
+    let (mut a, mut b) = (0.5f32, 0.25f32);
+    let mut i = 0i32;
+    while i < n {
+        let t1 = a * b;
+        let a_n = a * 0.99 + b * 0.01;
+        let b_n = b * 0.99 + t1 * 0.01;
+        a = a_n; b = b_n;
+        i += 1;
+    }
+    [a, b, 0.0, 1.0]
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let path = args.next()
@@ -873,6 +999,15 @@ fn main() {
             let bv = [0.5f32, 0.5, 0.5, 1.0];
             let d: f32 = (0..4).map(|i| a[i] * bv[i]).sum();
             (build_dot_spirv(), [a[0]*bv[0], a[1]*bv[1], a[2]*bv[2], d])
+        }
+        "heavy" => {
+            // n from an i32 push-const drives the loop
+            // count; default 256 — heavy enough that the
+            // bench sees codegen quality, not call overhead.
+            let n: i32 = args.next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(256);
+            (build_heavy_spirv(), eval_heavy(n))
         }
         "unordcmp" => {
             // Same pixels as `ifelse` for finite inputs,

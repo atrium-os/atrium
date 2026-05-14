@@ -45,6 +45,7 @@ shuffle|shuffle|
 cextract|cextract|
 phi|phi|0.2
 unordcmp|unordcmp|0.2
+heavy|heavy|512 int
 '
 
 echo "==> building bench_driver (host release + FreeBSD aarch64 cross)"
