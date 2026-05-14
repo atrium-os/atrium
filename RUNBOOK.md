@@ -2387,40 +2387,79 @@ sh atrium-spv-backend-bespoke/verify/run-bench.sh
 ```
 
 First run, 2026-05-14, in-VM (FreeBSD/aarch64) — `Nx` is
-the bespoke speedup (>1 = bespoke faster):
+the bespoke speedup (>1 = bespoke faster). The `heavy`
+shader (added second run) is the only one whose runtime
+clears call overhead:
 
-| shader   | compile | run   |
-|----------|---------|-------|
-| const    | 2.30x   | 1.22x |
-| ifelse   | 5.15x   | 0.69x |
-| loop     | 3.20x   | 0.95x |
-| switch   | 3.65x   | 0.74x |
-| arith    | 2.95x   | 1.02x |
-| vecarith | 2.60x   | 0.80x |
-| dot      | 2.44x   | 0.67x |
-| shuffle  | 3.23x   | 1.05x |
-| cextract | 2.78x   | 1.07x |
-| phi      | 3.21x   | 0.82x |
+| shader   | compile | run   | run ns (besp / clif) |
+|----------|---------|-------|----------------------|
+| const    | 2.30x   | 1.22x | tiny — call overhead |
+| ifelse   | 5.15x   | 0.69x | tiny — call overhead |
+| loop     | 3.20x   | 0.95x | 35 / 33              |
+| switch   | 3.65x   | 0.74x | tiny — call overhead |
+| arith    | 2.95x   | 1.02x | tiny — call overhead |
+| vecarith | 2.60x   | 0.80x | tiny — call overhead |
+| dot      | 2.44x   | 0.67x | tiny — call overhead |
+| shuffle  | 3.23x   | 1.05x | tiny — call overhead |
+| cextract | 2.78x   | 1.07x | tiny — call overhead |
+| phi      | 3.21x   | 0.82x | tiny — call overhead |
+| **heavy**| **4.67x** | **0.78x** | **1290 / 1002**  |
 
 > **Reading the result.** The bespoke backend wins
 > **compile time decisively — 2.3–5.2× faster** than
 > Cranelift across the board (single-pass ISel vs
-> Cranelift's full optimisation pipeline). But on
-> **runtime it does *not* yet win**: the corpus shaders
-> are tiny (most ~1–1.7 ns/call — basically call
-> overhead), and where there's a real signal it's a
-> wash-to-slightly-behind — `loop`, the only shader doing
-> sustained work (~35 ns/call), has bespoke at 0.95×.
-> Bespoke's single-pass output carries slack (redundant
-> `fmov`/loads, no peephole pass) that Cranelift's
-> optimiser removes.
->
-> This does **not** contradict the architecture — spec
-> §8.1 says bespoke perf "ramps in shader-by-shader" — but
-> it means the bespoke backend's headline justification
-> (steady-state hand-written-ARM64 perf) is **not yet
-> demonstrated**. Two follow-ups: (1) a heavyweight
-> benchmark shader that actually stresses the per-pixel
-> path, since the current corpus can't show a runtime
-> delta; (2) a peephole/redundant-move pass on the
-> bespoke backend.
+> Cranelift's full optimisation pipeline). On **runtime it
+> does not yet win**: on the `heavy` shader — a 512-iter
+> loop, ~1.3 µs/call, the only shader with real signal —
+> bespoke is **0.78× (28% slower)** than Cranelift. Host
+> and in-VM agree to within 1%, so this is real, not
+> noise.
+
+#### Why bespoke loses the `heavy` loop — disasm analysis
+
+bespoke loop body = **17 instructions**, Cranelift = **10**.
+The seven-instruction gap, per iteration:
+
+| issue | bespoke emits | Cranelift emits | cost |
+|-------|---------------|-----------------|------|
+| compare→branch not fused | `cmp; cset w,lt; cmp w,#0; b.ne` | `cmp; b.lt` | **2** |
+| Phi-move not coalesced | `fadd s25,…; fmov s16,s25` (×2 accumulators) | `fadd s17,…` straight into the Phi reg | **2** |
+| induction-var copy not coalesced | `add w15,w13,w14; mov w13,w15` | `add w3,w3,#1` in place | **1** |
+| branch-to-next-block not elided | `b 0xa8` (target is the next insn) | — | **1** |
+| no immediate `add` | `mov w14,#1` (hoisted) + `add …,w14` | `add …,#0x1` | ~0/iter |
+
+This **does not contradict the architecture** — spec §8.1
+says bespoke perf "ramps in shader-by-shader" — but it
+turns the headline justification into a concrete backlog.
+
+#### Bespoke backend optimisation backlog (data-driven)
+
+In priority order (impact × inverse-risk):
+
+1. **Compare→branch fusion.** When an `IComparison` /
+   `FComparison` result feeds *only* a `BranchConditional`,
+   skip materialising the i32 bool (constraint B4) — emit
+   `cmp` + a fused `b.<cond>`. 2 insns/iter here, and it
+   fires in *every* conditional in *every* shader. Lowest
+   risk, highest reach.
+2. **Branch-to-next-block elision.** If a block's
+   unconditional-branch target is the block emitted
+   immediately after it, drop the branch. Self-contained,
+   no RA interaction.
+3. **Immediate forms.** `add`/`sub` with a small immediate
+   instead of `mov`-into-reg-then-add; `fmov s, #imm` for
+   representable float constants; `movi` for zero.
+4. **Phi / copy coalescing.** When a Phi's back-edge arm
+   value is produced by an instruction in the predecessor,
+   allocate that instruction's result directly into the
+   Phi's register, eliminating the `fmov`/`mov`. Biggest
+   structural win (covers both the accumulator `fmov`s and
+   the induction-var `mov`) but needs RA changes — highest
+   risk, do last.
+5. **Register spilling.** Out of scope for the `heavy`
+   shader (sized to fit) but a hard limit: a
+   four-accumulator variant fails to compile at all
+   ("linear-scan RA ran out of V-regs"). Needed before the
+   bespoke backend can be the *default* for arbitrary
+   shaders rather than falling back to Cranelift on
+   pressure.
