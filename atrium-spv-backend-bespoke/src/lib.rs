@@ -204,6 +204,13 @@ fn emit_function(
     // and short-lived, so no reuse needed yet.
     let mut bools: HashMap<ValueId, asm::Wreg> = HashMap::new();
     let mut next_bool_w: u8 = 10;
+    // Set by a comparison whose result feeds only the
+    // block's BranchCond terminator (compare→branch
+    // fusion): `(comparison result id, condition code)`.
+    // The BranchCond arm consumes it on the very next
+    // instruction — flags survive intact because the
+    // comparison sits immediately before the terminator.
+    let mut fused_branch: Option<(ValueId, asm::Cond)> = None;
     // Integer scalar Values (i32/u32): held in W-regs
     // drawn from a separate linear-scan pool W13..W17
     // (5 slots, caller-saved per AAPCS64 → no prologue).
@@ -263,7 +270,7 @@ fn emit_function(
     }
 
     // ── Pre-pass: live-range analysis on the flat stream ───
-    let last_use = compute_last_use_flat(
+    let (last_use, use_counts) = compute_last_use_flat(
         &flat_insts, &block_term_idx, &block_flat_start);
 
     // ── Linear-scan register allocator ─────────────────────────
@@ -346,11 +353,12 @@ fn emit_function(
     // Pending `b imm26` relocations: (asm_byte_offset of
     // the placeholder instruction, target BlockId).
     let mut branch_relocs: Vec<(usize, BlockId)> = Vec::new();
-    // Pending `b.cond imm19` relocations:
-    // * cond_branch_relocs       — b.cond.NE (BranchCond)
-    // * cond_branch_relocs_eq    — b.cond.EQ (Switch cases)
-    let mut cond_branch_relocs: Vec<(usize, BlockId)> = Vec::new();
-    let mut cond_branch_relocs_eq: Vec<(usize, BlockId)> = Vec::new();
+    // Pending `b.cond imm19` relocations, each carrying its
+    // own condition code: `(patch byte offset, target,
+    // cond)`. BranchCond pushes `Ne` (test a materialised
+    // bool) or, with compare→branch fusion, the comparison's
+    // own condition code; Switch pushes `Eq`.
+    let mut cond_branch_relocs: Vec<(usize, BlockId, asm::Cond)> = Vec::new();
 
     // ── Prologue placeholder ──────────────────────────────────
     //
@@ -404,6 +412,35 @@ fn emit_function(
         }
         // Same expiry pass for the integer W-reg pool.
         int_pool.expire(i, &last_use);
+
+        // ── compare→branch fusion eligibility ───────────────
+        //
+        // True when this instruction is a comparison whose
+        // result feeds *only* this block's BranchCond
+        // terminator, and the comparison sits immediately
+        // before that terminator. Both conditions matter:
+        //   * immediately-before → nothing between the
+        //     `cmp` and the `b.cond` clobbers NZCV;
+        //   * sole use → no OpSelect / later block needs the
+        //     materialised i32 bool, so skipping `cset` is
+        //     safe.
+        // Sole-use is checked via `use_counts` (the raw
+        // operand tally) rather than `last_use`: the
+        // loop-liveness extension pushes a loop-header
+        // comparison's `last_use` out to the back-edge, so
+        // `last_use == terminator` would spuriously fail for
+        // exactly the loop-exit branches this optimisation
+        // most wants to fuse.
+        // The comparison arms read this; a fused comparison
+        // emits just `cmp`/`fcmp` and stashes the condition
+        // in `fused_branch` for the BranchCond arm.
+        let fuse_eligible: bool = inst.result.as_ref().is_some_and(|res| {
+            block_inst_idx + 2 == block.insts.len()
+                && matches!(
+                    &block.insts[block_inst_idx + 1].op,
+                    Op::BranchCond { cond, .. } if cond.id == res.id)
+                && use_counts.get(&res.id).copied() == Some(1)
+        });
 
         match &inst.op {
             Op::ConstInt { value, kind: _ } => {
@@ -464,34 +501,34 @@ fn emit_function(
             // Integer comparisons → Bool W-reg.
             Op::IEq(l, r) => emit_icmp_to_bool(
                 &mut a, &ints, &mut bools, &mut next_bool_w,
-                inst, l, r, asm::Cond::Eq)?,
+                &mut fused_branch, fuse_eligible, inst, l, r, asm::Cond::Eq)?,
             Op::INe(l, r) => emit_icmp_to_bool(
                 &mut a, &ints, &mut bools, &mut next_bool_w,
-                inst, l, r, asm::Cond::Ne)?,
+                &mut fused_branch, fuse_eligible, inst, l, r, asm::Cond::Ne)?,
             Op::SLt(l, r) => emit_icmp_to_bool(
                 &mut a, &ints, &mut bools, &mut next_bool_w,
-                inst, l, r, asm::Cond::Lt)?,
+                &mut fused_branch, fuse_eligible, inst, l, r, asm::Cond::Lt)?,
             Op::SLe(l, r) => emit_icmp_to_bool(
                 &mut a, &ints, &mut bools, &mut next_bool_w,
-                inst, l, r, asm::Cond::Le)?,
+                &mut fused_branch, fuse_eligible, inst, l, r, asm::Cond::Le)?,
             Op::SGt(l, r) => emit_icmp_to_bool(
                 &mut a, &ints, &mut bools, &mut next_bool_w,
-                inst, l, r, asm::Cond::Gt)?,
+                &mut fused_branch, fuse_eligible, inst, l, r, asm::Cond::Gt)?,
             Op::SGe(l, r) => emit_icmp_to_bool(
                 &mut a, &ints, &mut bools, &mut next_bool_w,
-                inst, l, r, asm::Cond::Ge)?,
+                &mut fused_branch, fuse_eligible, inst, l, r, asm::Cond::Ge)?,
             Op::ULt(l, r) => emit_icmp_to_bool(
                 &mut a, &ints, &mut bools, &mut next_bool_w,
-                inst, l, r, asm::Cond::Cc)?,
+                &mut fused_branch, fuse_eligible, inst, l, r, asm::Cond::Cc)?,
             Op::ULe(l, r) => emit_icmp_to_bool(
                 &mut a, &ints, &mut bools, &mut next_bool_w,
-                inst, l, r, asm::Cond::Ls)?,
+                &mut fused_branch, fuse_eligible, inst, l, r, asm::Cond::Ls)?,
             Op::UGt(l, r) => emit_icmp_to_bool(
                 &mut a, &ints, &mut bools, &mut next_bool_w,
-                inst, l, r, asm::Cond::Hi)?,
+                &mut fused_branch, fuse_eligible, inst, l, r, asm::Cond::Hi)?,
             Op::UGe(l, r) => emit_icmp_to_bool(
                 &mut a, &ints, &mut bools, &mut next_bool_w,
-                inst, l, r, asm::Cond::Cs)?,
+                &mut fused_branch, fuse_eligible, inst, l, r, asm::Cond::Cs)?,
             Op::INeg(s) => {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal("INeg without result".into()))?;
@@ -569,22 +606,22 @@ fn emit_function(
             // Float compares → Bool (i32 0/1 in a W-reg).
             Op::FOrdEq(a_v, b_v) => emit_fcmp_to_bool(
                 &mut a, &scalars, &mut bools, &mut next_bool_w,
-                inst, a_v, b_v, asm::Cond::Eq)?,
+                &mut fused_branch, fuse_eligible, inst, a_v, b_v, asm::Cond::Eq)?,
             Op::FOrdNe(a_v, b_v) => emit_fcmp_to_bool(
                 &mut a, &scalars, &mut bools, &mut next_bool_w,
-                inst, a_v, b_v, asm::Cond::Ne)?,
+                &mut fused_branch, fuse_eligible, inst, a_v, b_v, asm::Cond::Ne)?,
             Op::FOrdLt(a_v, b_v) => emit_fcmp_to_bool(
                 &mut a, &scalars, &mut bools, &mut next_bool_w,
-                inst, a_v, b_v, asm::Cond::Mi)?,
+                &mut fused_branch, fuse_eligible, inst, a_v, b_v, asm::Cond::Mi)?,
             Op::FOrdLe(a_v, b_v) => emit_fcmp_to_bool(
                 &mut a, &scalars, &mut bools, &mut next_bool_w,
-                inst, a_v, b_v, asm::Cond::Ls)?,
+                &mut fused_branch, fuse_eligible, inst, a_v, b_v, asm::Cond::Ls)?,
             Op::FOrdGt(a_v, b_v) => emit_fcmp_to_bool(
                 &mut a, &scalars, &mut bools, &mut next_bool_w,
-                inst, a_v, b_v, asm::Cond::Gt)?,
+                &mut fused_branch, fuse_eligible, inst, a_v, b_v, asm::Cond::Gt)?,
             Op::FOrdGe(a_v, b_v) => emit_fcmp_to_bool(
                 &mut a, &scalars, &mut bools, &mut next_bool_w,
-                inst, a_v, b_v, asm::Cond::Ge)?,
+                &mut fused_branch, fuse_eligible, inst, a_v, b_v, asm::Cond::Ge)?,
             // OpVectorShuffle: produce a new vector by
             // picking per-output-lane indices into
             // src1 ++ src2. With our per-lane S-reg
@@ -942,7 +979,7 @@ fn emit_function(
                     a.emit(asm::cmp_imm_w(w_sel, *lit as u16));
                     let patch_t = a.len();
                     a.emit(asm::b_cond(asm::Cond::Eq, 0));
-                    cond_branch_relocs_eq.push((patch_t, *target));
+                    cond_branch_relocs.push((patch_t, *target, asm::Cond::Eq));
                 }
                 // Fall-through to default.
                 let patch_d = a.len();
@@ -964,16 +1001,34 @@ fn emit_function(
                         "BranchCond into Phi-bearing block; \
                          critical-edge splitting lands in v12".into()));
                 }
-                let w_bool = *bools.get(&cond.id).ok_or_else(||
-                    BackendError::Unsupported(format!(
-                        "BranchCond cond {:?} is not a known Bool W-reg",
-                        cond.id)))?;
-                // cmp w_bool, #0  → flags reflect zero-ness
-                a.emit(asm::cmp_imm_w(w_bool, 0));
-                // b.ne t_block (taken if w_bool != 0).
-                let patch_t = a.len();
-                a.emit(asm::b_cond(asm::Cond::Ne, 0));
-                cond_branch_relocs.push((patch_t, *t_block));
+                // Compare→branch fusion: if the immediately
+                // preceding comparison stashed its condition
+                // for this exact cond value, NZCV is still
+                // live from its `cmp`/`fcmp` — emit the
+                // conditional branch directly, no bool
+                // materialised, no `cmp w,#0`.
+                let (patch_t, branch_cond) = match fused_branch.take()
+                    .filter(|(fid, _)| *fid == cond.id)
+                {
+                    Some((_, fcond)) => {
+                        let patch_t = a.len();
+                        a.emit(asm::b_cond(fcond, 0));
+                        (patch_t, fcond)
+                    }
+                    None => {
+                        let w_bool = *bools.get(&cond.id).ok_or_else(||
+                            BackendError::Unsupported(format!(
+                                "BranchCond cond {:?} is not a known Bool W-reg",
+                                cond.id)))?;
+                        // cmp w_bool, #0  → flags reflect zero-ness
+                        a.emit(asm::cmp_imm_w(w_bool, 0));
+                        // b.ne t_block (taken if w_bool != 0).
+                        let patch_t = a.len();
+                        a.emit(asm::b_cond(asm::Cond::Ne, 0));
+                        (patch_t, asm::Cond::Ne)
+                    }
+                };
+                cond_branch_relocs.push((patch_t, *t_block, branch_cond));
                 // Unconditional fallthrough to f_block.
                 let patch_f = a.len();
                 a.emit(asm::b(0));
@@ -1012,29 +1067,25 @@ fn emit_function(
         a.patch(*patch_off, asm::b(delta_insts));
     }
 
-    // Conditional-branch fixup (imm19, ±2^18 insts).
-    // BranchCond writes the NE list; Switch writes the EQ
-    // list. Both share the imm19 range and patch logic.
-    for (relocs, cond) in [
-        (&cond_branch_relocs, asm::Cond::Ne),
-        (&cond_branch_relocs_eq, asm::Cond::Eq),
-    ] {
-        for (patch_off, target_bid) in relocs {
-            let target_byte = *block_asm_offset.get(target_bid).ok_or_else(||
-                BackendError::Internal(format!(
-                    "cond branch target {target_bid:?} has no asm offset")))?;
-            let delta_bytes = target_byte as i64 - *patch_off as i64;
-            if delta_bytes % 4 != 0 {
-                return Err(BackendError::Internal(
-                    "cond branch delta not 4-aligned".into()));
-            }
-            let delta_insts = (delta_bytes / 4) as i32;
-            if !(-(1 << 18)..(1 << 18)).contains(&delta_insts) {
-                return Err(BackendError::Unsupported(format!(
-                    "cond-branch delta {delta_insts} exceeds imm19 range")));
-            }
-            a.patch(*patch_off, asm::b_cond(cond, delta_insts));
+    // Conditional-branch fixup (imm19, ±2^18 insts). Each
+    // reloc carries its own condition code — `Ne` for a
+    // bool-test BranchCond, the comparison's code for a
+    // fused BranchCond, `Eq` for a Switch case.
+    for (patch_off, target_bid, cond) in &cond_branch_relocs {
+        let target_byte = *block_asm_offset.get(target_bid).ok_or_else(||
+            BackendError::Internal(format!(
+                "cond branch target {target_bid:?} has no asm offset")))?;
+        let delta_bytes = target_byte as i64 - *patch_off as i64;
+        if delta_bytes % 4 != 0 {
+            return Err(BackendError::Internal(
+                "cond branch delta not 4-aligned".into()));
         }
+        let delta_insts = (delta_bytes / 4) as i32;
+        if !(-(1 << 18)..(1 << 18)).contains(&delta_insts) {
+            return Err(BackendError::Unsupported(format!(
+                "cond-branch delta {delta_insts} exceeds imm19 range")));
+        }
+        a.patch(*patch_off, asm::b_cond(*cond, delta_insts));
     }
 
     // ── Prologue / epilogue fixup ─────────────────────────────
@@ -1222,15 +1273,28 @@ fn emit_int_binop(
     Ok(())
 }
 
-/// Emit `cmp_w + cset_w` for an integer comparison.
-/// Bool result lands in the bool W-pool, same as float
-/// comparisons.
+/// Emit an integer comparison.
+///
+/// Two lowerings:
+///
+/// * **fused** (`fuse_eligible`) — the comparison result
+///   feeds *only* the block's `BranchCond` terminator and
+///   sits immediately before it, so NZCV survives intact
+///   from the `cmp` to the `b.cond`. Emit just `cmp_w` and
+///   record the condition in `fused_branch`; the
+///   `BranchCond` arm consumes it and emits a single
+///   `b.<cond>`. No Bool W-reg is materialised.
+/// * **materialised** — emit `cmp_w + cset_w` into a
+///   fresh bool W-pool register (the value is used by an
+///   `OpSelect`, a later block, etc.).
 #[allow(clippy::too_many_arguments)]
 fn emit_icmp_to_bool(
     a: &mut asm::Asm,
     ints: &HashMap<ValueId, asm::Wreg>,
     bools: &mut HashMap<ValueId, asm::Wreg>,
     next_bool_w: &mut u8,
+    fused_branch: &mut Option<(ValueId, asm::Cond)>,
+    fuse_eligible: bool,
     inst: &atrium_spv_ir::Inst,
     lhs: &Value,
     rhs: &Value,
@@ -1244,6 +1308,11 @@ fn emit_icmp_to_bool(
     let r = *ints.get(&rhs.id).ok_or_else(||
         BackendError::Internal(format!(
             "icmp rhs {:?} not in ints", rhs.id)))?;
+    if fuse_eligible {
+        a.emit(asm::cmp_w(l, r));
+        *fused_branch = Some((result.id, cond));
+        return Ok(());
+    }
     if *next_bool_w >= 13 {
         // W10..W12 are bool pool (3 slots); W13..W17 are
         // the int pool. The ranges must not overlap.
@@ -1258,16 +1327,18 @@ fn emit_icmp_to_bool(
     Ok(())
 }
 
-/// Emit `fcmp_s + cset_w` for a float comparison.
-/// Materialises Bool (i32 0/1) into a fresh W-reg drawn
-/// from the bool pool (W10..W15). Subsequent Op::BranchCond
-/// can test it via `cmp w, #0; b.ne target`.
+/// Emit a float comparison. Same two lowerings as
+/// [`emit_icmp_to_bool`]: fused (`fcmp_s` only, condition
+/// recorded in `fused_branch`) or materialised
+/// (`fcmp_s + cset_w` into a bool W-pool register).
 #[allow(clippy::too_many_arguments)]
 fn emit_fcmp_to_bool(
     a: &mut asm::Asm,
     scalars: &HashMap<ValueId, asm::Vreg>,
     bools: &mut HashMap<ValueId, asm::Wreg>,
     next_bool_w: &mut u8,
+    fused_branch: &mut Option<(ValueId, asm::Cond)>,
+    fuse_eligible: bool,
     inst: &atrium_spv_ir::Inst,
     lhs: &Value,
     rhs: &Value,
@@ -1279,6 +1350,11 @@ fn emit_fcmp_to_bool(
         BackendError::Internal(format!("fcmp lhs {:?} missing", lhs.id)))?;
     let r = *scalars.get(&rhs.id).ok_or_else(||
         BackendError::Internal(format!("fcmp rhs {:?} missing", rhs.id)))?;
+    if fuse_eligible {
+        a.emit(asm::fcmp_s(l, r));
+        *fused_branch = Some((result.id, cond));
+        return Ok(());
+    }
     if *next_bool_w >= 13 {
         // W10..W12 are bool pool (3 slots); the int pool
         // starts at W13 so the ranges must not overlap.
@@ -1308,16 +1384,25 @@ fn alloc_vreg(
     Ok(asm::Vreg(n))
 }
 
-/// Compute the highest inst index that references each
-/// scalar ValueId. ConstVec lanes inherit the ConstVec
-/// result's uses transitively (a Store of a vector keeps
-/// each lane alive through the Store).
+/// Compute, per scalar ValueId: the highest inst index
+/// that references it (`last_use`) and how many operand
+/// occurrences reference it (`use_counts`). ConstVec lanes
+/// inherit the ConstVec result's uses transitively (a
+/// Store of a vector keeps each lane alive through the
+/// Store).
+///
+/// `use_counts` is the *raw* operand-occurrence tally — it
+/// is NOT perturbed by the loop-liveness extension below,
+/// so `use_counts[v] == 1` is a reliable "single use"
+/// signal even for a value used inside a loop. Compare→
+/// branch fusion relies on this.
 fn compute_last_use_flat(
     insts: &[&atrium_spv_ir::Inst],
     block_term_idx: &HashMap<BlockId, usize>,
     block_flat_start: &HashMap<BlockId, usize>,
-) -> HashMap<ValueId, usize> {
+) -> (HashMap<ValueId, usize>, HashMap<ValueId, u32>) {
     let mut last_use: HashMap<ValueId, usize> = HashMap::new();
+    let mut use_counts: HashMap<ValueId, u32> = HashMap::new();
     let mut vec_lanes: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
     // Phi arm uses are deferred: a Phi arm `(value, from)`
     // is *read* by the phi-move emitted at `from`'s
@@ -1328,6 +1413,7 @@ fn compute_last_use_flat(
     let mut phi_arm_uses: Vec<(ValueId, BlockId)> = Vec::new();
     for (i, inst) in insts.iter().enumerate() {
         let mut mark = |id: ValueId| {
+            *use_counts.entry(id).or_insert(0) += 1;
             last_use.entry(id)
                 .and_modify(|e| *e = (*e).max(i))
                 .or_insert(i);
@@ -1481,6 +1567,11 @@ fn compute_last_use_flat(
     // linear-scan doesn't recycle the reg before the
     // back-edge writes it.
     for (value_id, from) in phi_arm_uses {
+        // Count the phi-arm read too, so `use_counts` stays
+        // a true total — a value that is both a comparison
+        // result and a Phi arm source must not look
+        // single-use to the fusion check.
+        *use_counts.entry(value_id).or_insert(0) += 1;
         if let Some(&term) = block_term_idx.get(&from) {
             last_use.entry(value_id)
                 .and_modify(|e| *e = (*e).max(term))
@@ -1526,7 +1617,7 @@ fn compute_last_use_flat(
         if !changed { break; }
     }
 
-    last_use
+    (last_use, use_counts)
 }
 
 /// Emit one polymorphic float binary op (fadd/fsub/fmul/
