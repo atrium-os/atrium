@@ -11,9 +11,14 @@ path = "src/lib.rs"
 
 [dependencies]
 atrium-spv-pcmap = { path = "../atrium-spv-pcmap" }
+atrium-spv-blob  = { path = "../atrium-spv-blob" }
 libloading       = "0.8"
+libc             = "0.2"
 sha2             = "0.10"
 
 [dev-dependencies]
 rspirv   = "0.13"
 tempfile = "3"
+# The jitmap unit test compiles a real blob to mmap + run.
+atrium-spv-frontend        = { path = "../atrium-spv-frontend" }
+atrium-spv-backend-bespoke = { path = "../atrium-spv-backend-bespoke" }

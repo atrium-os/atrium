@@ -45,6 +45,15 @@ use sha2::{Digest, Sha256};
 mod dlopen;
 pub use dlopen::{LoadedShader, ShaderEntryPoints};
 
+// The JIT-emit path: mmap a flat `atrium-spv-blob`
+// PROT_EXEC instead of `dlopen`ing a `.so`. Same local
+// `allow(unsafe_code)` discipline as `dlopen`. Wired into
+// `load_or_compile` in phase 3; phase 2 lands the mapping
+// machinery + its unit test, so it's `dead_code` until
+// then.
+#[allow(dead_code)]
+mod jitmap;
+
 /// Loader configuration.
 #[derive(Debug, Clone)]
 pub struct LoaderConfig {
