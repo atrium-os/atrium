@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use atrium_spv_backend_bespoke::{compile, Target};
+use atrium_spv_backend_bespoke::{compile, compile_blob, Target};
 use atrium_spv_ir::{
     Block, BlockId, BlockKind, EntryPoint, Function, Inst, Module, Op,
     ShaderStage, Type,
@@ -69,6 +69,58 @@ fn empty_fragment_emits_ret_instruction() {
     let pcmap = atrium_spv_pcmap::PcMap::from_bytes(&out.pcmap)
         .expect("pcmap parses");
     assert_eq!(pcmap.entries().len(), module.functions.len());
+}
+
+#[test]
+fn compile_blob_emits_parseable_flat_blob() {
+    let module = empty_fragment_module();
+    let out = compile_blob(&module, Target::host()).expect("compile_blob");
+
+    // The blob must parse + validate.
+    let blob = atrium_spv_blob::ShaderBlob::from_bytes(&out.blob)
+        .expect("blob parses");
+    assert_eq!(blob.arch, atrium_spv_blob::ARCH_AARCH64);
+
+    // A single fragment function → the fs entry sits at
+    // offset 0, vs/cs absent.
+    assert_eq!(blob.entries.fs, Some(0));
+    assert_eq!(blob.entries.vs, None);
+    assert_eq!(blob.entries.cs, None);
+
+    // The code is the raw function body — exactly the ARM64
+    // `ret` (0xD65F03C0) for an empty fragment shader, with
+    // no object-file framing around it.
+    let ret_bytes = 0xD65F_03C0u32.to_le_bytes();
+    assert!(
+        blob.code.windows(4).any(|w| w == ret_bytes),
+        "expected ARM64 `ret` bytes in the blob code; got len={}",
+        blob.code.len(),
+    );
+
+    // The blob carries *only* code — no `atrium_fs_main`
+    // symbol string, no ELF/Mach-O headers (that's the
+    // whole point: the loader resolves the entry point by
+    // offset, not by `dlsym`).
+    assert!(
+        !blob.code.windows(b"atrium_fs_main".len())
+            .any(|w| w == b"atrium_fs_main"),
+        "blob code should not contain a symbol name",
+    );
+
+    // pcmap is identical in shape to the object path: one
+    // entry per lowered IR instruction.
+    let pcmap = atrium_spv_pcmap::PcMap::from_bytes(&out.pcmap)
+        .expect("pcmap parses");
+    assert_eq!(pcmap.entries().len(), module.functions.len());
+
+    // The blob's code is the same bytes the object path
+    // wraps — sanity-check they agree on the body.
+    let obj_out = compile(&module, Target::host()).expect("compile");
+    assert!(
+        obj_out.object.windows(blob.code.len())
+            .any(|w| w == blob.code.as_slice()),
+        "object's .text should contain exactly the blob's code",
+    );
 }
 
 #[test]

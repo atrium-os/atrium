@@ -1,0 +1,14 @@
+[package]
+name        = "atrium-spv-blob"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "Flat executable-blob container for tier-2 software Vulkan shaders. A backend emits a position-independent native code blob plus a per-stage entry-offset table; the daemon's loader mmaps it PROT_EXEC directly — no ELF object, no `cc -shared`, no `dlopen`. Replaces the object→cc→.so→dlopen path (which measured as ~99.5% of compile wall-clock). See docs/spec/tier2-renderer.md §10 and the RUNBOOK 'JIT-emit path' design."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# No deps. The format is a tight binary structure built +
+# parsed with std only — same discipline as atrium-spv-pcmap.

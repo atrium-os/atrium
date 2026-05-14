@@ -12,6 +12,7 @@ path = "src/lib.rs"
 [dependencies]
 atrium-spv-ir       = { path = "../atrium-spv-ir" }
 atrium-spv-pcmap    = { path = "../atrium-spv-pcmap" }
+atrium-spv-blob     = { path = "../atrium-spv-blob" }
 pptk-codegen-arm64  = { path = "../../pptk/crates/pptk-codegen-arm64" }
 object              = { version = "0.36", features = ["write"] }
 thiserror           = "1"

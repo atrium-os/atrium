@@ -149,6 +149,75 @@ pub fn compile(module: &Module, target: Target) -> Result<CompileOutput, Backend
     Ok(CompileOutput { object: object_bytes, pcmap: pcmap_bytes })
 }
 
+/// Result of [`compile_blob`] — the JIT-emit counterpart
+/// of [`CompileOutput`].
+#[derive(Debug, Clone)]
+pub struct BlobOutput {
+    /// Serialised `atrium-spv-blob` container: a flat
+    /// position-independent code blob plus a per-stage
+    /// entry-offset table. The loader `mmap`s this
+    /// `PROT_EXEC` directly — no `cc`, no `dlopen`.
+    pub blob: Vec<u8>,
+    /// PC-map sidecar bytes (atrium-spv-pcmap format v1),
+    /// identical to [`CompileOutput::pcmap`].
+    pub pcmap: Vec<u8>,
+}
+
+/// Compile an atrium-spv-ir module straight to a flat
+/// executable blob — no ELF object, no linker.
+///
+/// This is the fast path: the bespoke backend already
+/// emits self-contained PIC machine code (branches patched
+/// in-backend, constants materialised inline, the fragment
+/// ABI entirely register/pointer), so there is nothing for
+/// `cc` to do — `compile_blob` just concatenates the
+/// per-function bodies and records where each stage's
+/// entry point lands. It is strictly *less* work than
+/// [`compile`], which wraps the same bytes in an
+/// `object::write::Object` so `cc -shared` can re-derive a
+/// `.so` from them.
+///
+/// `target` is accepted for API symmetry with [`compile`]
+/// but the emitted code is OS-agnostic — a flat AAPCS64
+/// blob is identical whether the eventual host is FreeBSD
+/// or Darwin; only the architecture matters.
+pub fn compile_blob(module: &Module, target: Target)
+    -> Result<BlobOutput, BackendError>
+{
+    let _ = target; // aarch64 either way; see doc comment.
+    let mut code: Vec<u8> = Vec::new();
+    let mut pcmap = atrium_spv_pcmap::Builder::new();
+    let mut entries = atrium_spv_blob::EntryOffsets::default();
+
+    for func in &module.functions {
+        let (body, pc_entries) = emit_function(func)?;
+        // Each body is a whole number of 4-byte ARM64
+        // instructions, so concatenating keeps every
+        // function — and therefore every entry offset —
+        // 4-byte aligned without explicit padding.
+        let off = code.len() as u32;
+        for (rel_host, spirv) in pc_entries {
+            pcmap.push(off + rel_host, spirv);
+        }
+        match func.stage {
+            ShaderStage::Vertex   => entries.vs = Some(off),
+            ShaderStage::Fragment => entries.fs = Some(off),
+            ShaderStage::Compute  => entries.cs = Some(off),
+        }
+        code.extend_from_slice(&body);
+    }
+
+    let blob = atrium_spv_blob::ShaderBlob {
+        arch: atrium_spv_blob::ARCH_AARCH64,
+        code,
+        entries,
+    };
+    Ok(BlobOutput {
+        blob: blob.to_bytes(),
+        pcmap: pcmap.finish_to_bytes(),
+    })
+}
+
 /// Emit the ARM64 instruction bytes for one function.
 ///
 /// Phase 3 step 3: scalar f32 ISel.
