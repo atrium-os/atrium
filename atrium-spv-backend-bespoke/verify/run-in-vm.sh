@@ -25,19 +25,24 @@
 # reachable on localhost:2222 with the fresco_bsd key.
 #
 # Usage:  sh atrium-spv-backend-bespoke/verify/run-in-vm.sh
-set -e
+# NOTE: deliberately *not* `set -e`. The verify function
+# tracks failures itself; aborting the whole script on a
+# single slow ssh (the dev VM is often under concurrent
+# host-build load) would mask the later shaders. Each
+# step instead carries a generous ConnectTimeout and the
+# function records FAILED on any mismatch-or-error.
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 CRATE=$(cd "$HERE/.." && pwd)
 KEY="$HOME/.ssh/fresco_bsd_ed25519"
-SSHOPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes"
+SSHOPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=15"
 OBJ=/tmp/atrium_fs_freebsd.o
 
-# Ship the harness once.
+# Ship the harness once. (Best-effort; verify() re-checks.)
 scp -i "$KEY" $SSHOPTS -P 2222 "$HERE/harness.c" \
-    root@localhost:/tmp/atrium_fs_harness.c >/dev/null
+    root@localhost:/tmp/atrium_fs_harness.c >/dev/null 2>&1
 ssh -i "$KEY" $SSHOPTS -p 2222 root@localhost \
-    'cc -o /tmp/atrium_harness /tmp/atrium_fs_harness.c' 2>/dev/null
+    'cc -o /tmp/atrium_harness /tmp/atrium_fs_harness.c' >/dev/null 2>&1
 
 FAILED=0
 
@@ -47,10 +52,17 @@ FAILED=0
 verify() {
   label=$1; pc=$2; shift 2
   expected=$(cd "$CRATE" && cargo run --quiet --example emit_freebsd_obj "$OBJ" "$@" 2>/dev/null)
-  scp -i "$KEY" $SSHOPTS -P 2222 "$OBJ" root@localhost:"$OBJ" >/dev/null
+  if [ -z "$expected" ]; then
+    echo "  FAIL  $label  (host emit produced no output)"
+    FAILED=1; return
+  fi
+  if ! scp -i "$KEY" $SSHOPTS -P 2222 "$OBJ" root@localhost:"$OBJ" >/dev/null 2>&1; then
+    echo "  FAIL  $label  (scp to VM failed — is the VM up + idle?)"
+    FAILED=1; return
+  fi
   got=$(ssh -i "$KEY" $SSHOPTS -p 2222 root@localhost \
     "cd /tmp && cc -shared -o atrium_fs.so atrium_fs_freebsd.o \
-     && ./atrium_harness ./atrium_fs.so $pc")
+     && ./atrium_harness ./atrium_fs.so $pc" 2>/dev/null)
   if [ "$got" = "$expected" ]; then
     echo "  PASS  $label  -> [$got]"
   else
@@ -63,15 +75,8 @@ echo "==> in-VM verification (FreeBSD aarch64, localhost:2222)"
 verify "const"        ""        const
 verify "ifelse then"  "0.2"     ifelse 0.2
 verify "ifelse else"  "0.8"     ifelse 0.8
-# loop shaders need the callee-saved-register prologue
-# (next widening) — the 5-slot caller-saved int pool can't
-# hold 3 hoisted int constants + 2 loop-carried Phi dests
-# + the iteration count + loop-body temps. The int Phi /
-# int Load / int linear-scan plumbing is all in place;
-# only register pressure blocks them. Re-enable once the
-# prologue lands:
-#   verify "loop n=5"   "5 int"   loop 5
-#   verify "loop n=4"   "4 int"   loop 4
+verify "loop n=5"     "5 int"   loop 5
+verify "loop n=4"     "4 int"   loop 4
 
 if [ "$FAILED" = "0" ]; then
   echo "==> PASS — bespoke ELF + AAPCS64 codegen verified on FreeBSD aarch64"

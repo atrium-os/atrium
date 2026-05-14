@@ -227,19 +227,29 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
     block_order.sort_by_key(|b| b.0);
 
     // Flat-index → (BlockId, intra-block-index). Inverse
-    // map: per-block-start flat index.
+    // map: per-block-start flat index. Also the flat
+    // index of each block's *terminator* — needed so Phi
+    // arm sources used on a back-edge get a live range
+    // that reaches the predecessor's branch, not just the
+    // (earlier-in-flat-order) Phi.
     let mut flat_insts: Vec<&atrium_spv_ir::Inst> = Vec::new();
     let mut block_flat_start: HashMap<BlockId, usize> = HashMap::new();
+    let mut block_term_idx: HashMap<BlockId, usize> = HashMap::new();
     for bid in &block_order {
         let block = func.blocks.get(bid).unwrap();
         block_flat_start.insert(*bid, flat_insts.len());
         for inst in &block.insts {
             flat_insts.push(inst);
         }
+        // Terminator = last inst pushed for this block.
+        if !flat_insts.is_empty() {
+            block_term_idx.insert(*bid, flat_insts.len() - 1);
+        }
     }
 
     // ── Pre-pass: live-range analysis on the flat stream ───
-    let last_use = compute_last_use_flat(&flat_insts);
+    let last_use = compute_last_use_flat(
+        &flat_insts, &block_term_idx, &block_flat_start);
 
     // ── Linear-scan register allocator ─────────────────────────
     //
@@ -326,6 +336,26 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
     // * cond_branch_relocs_eq    — b.cond.EQ (Switch cases)
     let mut cond_branch_relocs: Vec<(usize, BlockId)> = Vec::new();
     let mut cond_branch_relocs_eq: Vec<(usize, BlockId)> = Vec::new();
+
+    // ── Prologue placeholder ──────────────────────────────────
+    //
+    // The int pool can dip into callee-saved registers
+    // (X19..X28) when a shader's integer pressure exceeds
+    // the 5 caller-saved slots — loops do this. Per AAPCS64
+    // those must be saved/restored across the call. We
+    // don't know yet whether any get used, so reserve a
+    // fixed 5-instruction prologue region (NOPs for now)
+    // and patch it after body emission. Reserving a fixed
+    // size keeps every body offset — block_asm_offset,
+    // branch patch sites — consistent regardless of
+    // whether the prologue ends up real or NOPs.
+    const PROLOGUE_INSTS: usize = 5;
+    let prologue_off = a.len();
+    for _ in 0..PROLOGUE_INSTS { a.emit(asm::nop()); }
+    // Epilogue placeholder offsets — one per `ret`. Each
+    // is a 5-NOP region emitted just before its ret;
+    // patched to ldp's iff the prologue is real.
+    let mut epilogue_offs: Vec<usize> = Vec::new();
 
     let mut flat_i: usize = 0;
     for bid in &block_order {
@@ -825,6 +855,11 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
                 // predecessor's branch. Nothing to do here.
             }
             Op::Return => {
+                // Epilogue placeholder (5 NOPs) before
+                // every ret — patched to ldp's iff the
+                // prologue is real.
+                epilogue_offs.push(a.len());
+                for _ in 0..PROLOGUE_INSTS { a.emit(asm::nop()); }
                 a.emit(asm::ret());
             }
             Op::Branch(target) => {
@@ -978,6 +1013,43 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
         }
     }
 
+    // ── Prologue / epilogue fixup ─────────────────────────────
+    //
+    // If the int pool dipped into callee-saved registers
+    // (W19..W28 — only happens under heavy integer
+    // pressure, e.g. loops), patch the reserved 5-NOP
+    // prologue + every 5-NOP epilogue with the AAPCS64
+    // save/restore sequence. We save all of X19..X28 (5
+    // pairs) unconditionally when *any* are used —
+    // conservative but correct; a used-set-precise
+    // prologue is a later optimisation. If no callee-saved
+    // reg was touched the placeholders stay NOPs (zero
+    // cost beyond 5+5 NOP slots).
+    if int_pool.used_callee_saved {
+        // Prologue: 5× pre-indexed stp, each dropping SP
+        // by 16. Order: x19/x20 highest address … x27/x28
+        // lowest.
+        let save_pairs = [
+            (asm::Xreg(19), asm::Xreg(20)),
+            (asm::Xreg(21), asm::Xreg(22)),
+            (asm::Xreg(23), asm::Xreg(24)),
+            (asm::Xreg(25), asm::Xreg(26)),
+            (asm::Xreg(27), asm::Xreg(28)),
+        ];
+        for (i, (a_reg, b_reg)) in save_pairs.iter().enumerate() {
+            a.patch(prologue_off + i * 4,
+                    asm::stp_x_pre(*a_reg, *b_reg, asm::Xreg(31), -16));
+        }
+        // Epilogue: reverse-order post-indexed ldp, each
+        // bumping SP back up by 16.
+        for &ep in &epilogue_offs {
+            for (i, (a_reg, b_reg)) in save_pairs.iter().rev().enumerate() {
+                a.patch(ep + i * 4,
+                        asm::ldp_x_post(*a_reg, *b_reg, asm::Xreg(31), 16));
+            }
+        }
+    }
+
     Ok(a.into_bytes())
 }
 
@@ -1052,18 +1124,28 @@ enum PhiDest {
 struct IntPool {
     free: Vec<u8>,
     owners: HashMap<u8, ValueId>,
+    /// Set once any callee-saved reg (W19..W28) is handed
+    /// out — drives whether emit_function patches in the
+    /// stp/ldp prologue + epilogue.
+    used_callee_saved: bool,
 }
 
 impl IntPool {
     fn new() -> Self {
-        // W13..W17, popped low-first like the V-pool.
-        Self { free: (13..18).rev().collect(), owners: HashMap::new() }
+        // Pop order: W13..W17 (caller-saved, free) first,
+        // then W19..W28 (callee-saved — using these forces
+        // a prologue, so they're the overflow tier). Vec
+        // end is W13 so `pop` hands out caller-saved first.
+        let mut free: Vec<u8> = (19..29).rev().collect();
+        free.extend((13..18).rev());
+        Self { free, owners: HashMap::new(), used_callee_saved: false }
     }
 
     fn alloc(&mut self, owner: ValueId) -> Result<asm::Wreg, BackendError> {
         let n = self.free.pop().ok_or_else(|| BackendError::Unsupported(
-            "int linear-scan RA ran out of W-regs (W13..W17); \
+            "int linear-scan RA ran out of W-regs (W13..W17 + W19..W28); \
              spilling lands in a later widening".into()))?;
+        if n >= 19 { self.used_callee_saved = true; }
         self.owners.insert(n, owner);
         Ok(asm::Wreg(n))
     }
@@ -1206,9 +1288,20 @@ fn alloc_vreg(
 /// scalar ValueId. ConstVec lanes inherit the ConstVec
 /// result's uses transitively (a Store of a vector keeps
 /// each lane alive through the Store).
-fn compute_last_use_flat(insts: &[&atrium_spv_ir::Inst]) -> HashMap<ValueId, usize> {
+fn compute_last_use_flat(
+    insts: &[&atrium_spv_ir::Inst],
+    block_term_idx: &HashMap<BlockId, usize>,
+    block_flat_start: &HashMap<BlockId, usize>,
+) -> HashMap<ValueId, usize> {
     let mut last_use: HashMap<ValueId, usize> = HashMap::new();
     let mut vec_lanes: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
+    // Phi arm uses are deferred: a Phi arm `(value, from)`
+    // is *read* by the phi-move emitted at `from`'s
+    // terminator — which on a back-edge is LATER in flat
+    // order than the Phi itself. Collect them and apply
+    // after the per-inst sweep, marking each at its
+    // predecessor block's terminator index.
+    let mut phi_arm_uses: Vec<(ValueId, BlockId)> = Vec::new();
     for (i, inst) in insts.iter().enumerate() {
         let mut mark = |id: ValueId| {
             last_use.entry(id)
@@ -1239,6 +1332,29 @@ fn compute_last_use_flat(insts: &[&atrium_spv_ir::Inst]) -> HashMap<ValueId, usi
                 }
             }
             Op::FNeg(s) => mark(s.id),
+            // Integer arithmetic / bitwise / shifts /
+            // comparisons — operands are scalar W-reg
+            // values. Without these arms an int operand's
+            // live range is never recorded, so the
+            // linear-scan reclaims its W-reg the moment a
+            // stale seed (e.g. a Load's `or_insert`) falls
+            // behind `i` — which is exactly what made a
+            // loop-invariant `n` get clobbered mid-loop.
+            Op::IAdd(l, r) | Op::ISub(l, r) | Op::IMul(l, r)
+            | Op::SDiv(l, r) | Op::UDiv(l, r)
+            | Op::SMod(l, r) | Op::UMod(l, r)
+            | Op::BitAnd(l, r) | Op::BitOr(l, r) | Op::BitXor(l, r)
+            | Op::Shl(l, r) | Op::LShr(l, r) | Op::AShr(l, r)
+            | Op::IEq(l, r) | Op::INe(l, r)
+            | Op::SLt(l, r) | Op::SLe(l, r)
+            | Op::SGt(l, r) | Op::SGe(l, r)
+            | Op::ULt(l, r) | Op::ULe(l, r)
+            | Op::UGt(l, r) | Op::UGe(l, r) => {
+                mark(l.id); mark(r.id);
+            }
+            Op::INeg(s) | Op::BitNot(s)
+            | Op::ConvertSToF(s) | Op::ConvertUToF(s)
+            | Op::ConvertFToS(s) | Op::ConvertFToU(s) => mark(s.id),
             Op::Dot(l, r) => {
                 mark(l.id); mark(r.id);
                 if let Some(lanes) = vec_lanes.get(&l.id).cloned() {
@@ -1291,7 +1407,19 @@ fn compute_last_use_flat(insts: &[&atrium_spv_ir::Inst]) -> HashMap<ValueId, usi
                 }
             }
             Op::Phi(arms) => {
-                for arm in arms { mark(arm.value.id); }
+                // Defer: each arm's value is read by the
+                // phi-move at `arm.from`'s terminator, not
+                // here. Marking at the Phi's own index
+                // would give a back-edge value a live
+                // range that ENDS before it's even
+                // defined — the linear-scan would then
+                // recycle its reg, colliding with the
+                // value computed right after it (the
+                // classic "i_next and acc_next share a
+                // reg → infinite loop" bug).
+                for arm in arms {
+                    phi_arm_uses.push((arm.value.id, arm.from));
+                }
             }
             Op::AccessChain { base: _, byte_offset: _ } => {
                 // Base is a pointer Value, not a scalar —
@@ -1322,6 +1450,58 @@ fn compute_last_use_flat(insts: &[&atrium_spv_ir::Inst]) -> HashMap<ValueId, usi
             _ => {}
         }
     }
+
+    // Apply deferred Phi arm uses. Each arm value is read
+    // by the phi-move at its predecessor block's
+    // terminator — extend its live range there so the
+    // linear-scan doesn't recycle the reg before the
+    // back-edge writes it.
+    for (value_id, from) in phi_arm_uses {
+        if let Some(&term) = block_term_idx.get(&from) {
+            last_use.entry(value_id)
+                .and_modify(|e| *e = (*e).max(term))
+                .or_insert(term);
+        }
+    }
+
+    // ── Loop liveness extension ───────────────────────────────
+    //
+    // Flat-order linear-scan can't see that a loop body
+    // re-executes: a loop-invariant value (e.g. the
+    // iteration count `n`, loaded in the preheader, read
+    // in the loop header's compare) has a flat last_use
+    // *inside* the loop — earlier than the back-edge — so
+    // the allocator would recycle its register mid-loop
+    // and a value computed in the loop tail would clobber
+    // it. Fix: identify each loop by its back-edge (a
+    // `Branch` whose target block starts at a LOWER flat
+    // index than the branch itself) and extend every
+    // value whose last_use lands inside the loop's flat
+    // span to the loop's end (the back-edge index).
+    // Iterated to a fixpoint to handle nested loops.
+    let mut loops: Vec<(usize, usize)> = Vec::new(); // (start, end)
+    for (i, inst) in insts.iter().enumerate() {
+        if let Op::Branch(target) = &inst.op {
+            if let Some(&start) = block_flat_start.get(target) {
+                if start <= i {
+                    loops.push((start, i));
+                }
+            }
+        }
+    }
+    loop {
+        let mut changed = false;
+        for &(start, end) in &loops {
+            for lu in last_use.values_mut() {
+                if *lu >= start && *lu < end {
+                    *lu = end;
+                    changed = true;
+                }
+            }
+        }
+        if !changed { break; }
+    }
+
     last_use
 }
 
