@@ -1255,7 +1255,26 @@ fn emit_function(
                                     BackendError::Internal(format!(
                                         "Phi f32 source {:?} not in scalars",
                                         src_id)))?;
-                                a.emit(asm::fmov_s(*dv, src));
+                                // Use the 128-bit vector move
+                                // (`mov vd.16b, vn.16b`, an
+                                // `ORR` alias) rather than the
+                                // scalar `fmov s`. Both copy
+                                // the f32 (it lives in the low
+                                // 32 bits; we only ever read
+                                // the S-reg view), but the
+                                // `ORR`-form vector move is
+                                // eliminated at register rename
+                                // on the target cores, whereas
+                                // `fmov s` goes down the FP
+                                // pipe with real latency — and
+                                // these phi-moves sit on the
+                                // loop-carried critical path.
+                                // (Disasm-confirmed: this is
+                                // exactly the one instruction
+                                // Cranelift picks differently,
+                                // and the heavy4 gap to
+                                // Cranelift narrows to it.)
+                                a.emit(asm::mov_v_16b(*dv, src));
                             }
                             PhiDest::Int(dw) => {
                                 let src = *ints.get(src_id).ok_or_else(||
