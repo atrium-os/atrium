@@ -2104,6 +2104,22 @@ What it does:
    fragment ABI and prints the RGBA.
 4. Compares VM output against the host-side expected value.
 
-Verified 2026-05-14: `0.125 0.375 0.625 1` round-trips exactly —
-the bespoke ELF + AAPCS64 codegen runs correctly on FreeBSD
-16.0-CURRENT arm64, not just the macOS host.
+The script covers two shaders:
+* **const** — constant-colour store: exercises the ELF object
+  format, the exported symbol, and the Store path.
+* **ifelse** — `if (push_const.scale < 0.5) red else blue`:
+  exercises AccessChain + Load + FOrdLt + BranchCond + multi-
+  block CFG + branch relocation. Driven with two inputs
+  (`0.2` → then, `0.8` → else) so **both `b.cond` outcomes**
+  run on the real target.
+
+Verified 2026-05-14 on FreeBSD 16.0-CURRENT arm64:
+```
+PASS  const        -> [0.125 0.375 0.625 1]
+PASS  ifelse then  -> [1 0 0 1]
+PASS  ifelse else  -> [0 0 1 1]
+```
+The bespoke ELF + AAPCS64 codegen — object format, `cc -shared`
+link, `dlopen`/`dlsym`, the fragment ABI, **and the
+conditional-branch path** — all run correctly on the
+production target, not just the macOS host.
