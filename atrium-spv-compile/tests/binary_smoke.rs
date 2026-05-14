@@ -170,7 +170,13 @@ fn binary_emits_metrics_json_on_stderr() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("\"shader_hash\":"));
-    assert!(stderr.contains("\"backend\":\"cranelift\""));
+    // A constant-colour store is fully within the bespoke
+    // ARM64 backend's opcode surface, and atrium-spv-compile
+    // tries bespoke first (spec §2 production order), so the
+    // metrics line must report the bespoke backend — not the
+    // Cranelift fallback.
+    assert!(stderr.contains("\"backend\":\"bespoke\""),
+            "expected bespoke backend, got: {stderr}");
     assert!(stderr.contains("\"compile_ms\":"));
     assert!(stderr.contains("\"size_bytes\":"));
 }

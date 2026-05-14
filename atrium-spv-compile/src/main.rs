@@ -52,6 +52,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::Instant;
 
+use atrium_spv_backend_bespoke::{
+    compile as bespoke_compile, BackendError as BespokeError,
+    Target as BespokeTarget,
+};
 use atrium_spv_backend_cranelift::{compile as cranelift_compile, Target};
 use atrium_spv_frontend::translate as frontend_translate;
 use sha2::{Digest, Sha256};
@@ -198,24 +202,43 @@ fn run(args: &Args) -> Result<CompileReport, CompileError> {
 
     // 4. Backend.
     //
-    // Production order per spec §2: try bespoke first
-    // (when phase 3 lands), fall back to Cranelift on
-    // Unsupported. Today only Cranelift exists, so we
-    // skip the bespoke try and go straight to it. When
-    // the bespoke backend ships, replace this with:
+    // Production order per spec §2: try the bespoke ARM64
+    // backend first (fast path, hand-tuned codegen), fall
+    // back to Cranelift when bespoke returns `Unsupported`
+    // for an opcode/shape it doesn't handle yet. A bespoke
+    // `Internal` error is a real bug, not a fallback
+    // signal — it surfaces as a compile failure.
     //
-    //   let output = bespoke::compile(&module, args.target)
-    //       .or_else(|e| match e {
-    //           Unsupported(_) => cranelift_compile(&module, args.target),
-    //           other => Err(other),
-    //       })?;
-    let (output, backend_name) = match cranelift_compile(&module, args.target) {
-        Ok(o) => (o, "cranelift"),
-        Err(atrium_spv_backend_cranelift::BackendError::Unsupported(m)) =>
-            return Err(CompileError::Unsupported(m)),
-        Err(other) =>
-            return Err(CompileError::Internal(format!("cranelift: {other}"))),
+    // The bespoke backend is ARM64-only by charter; for an
+    // x86_64 target there is no bespoke target to map to,
+    // so we go straight to Cranelift.
+    let bespoke_target: Option<BespokeTarget> = match args.target {
+        Target::Aarch64FreeBSD => Some(BespokeTarget::Aarch64FreeBSD),
+        Target::Aarch64Darwin  => Some(BespokeTarget::Aarch64Darwin),
+        Target::X86_64FreeBSD  => None,
     };
+
+    let bespoke_output = match bespoke_target {
+        Some(bt) => match bespoke_compile(&module, bt) {
+            Ok(o) => Some(o),
+            Err(BespokeError::Unsupported(_)) => None, // fall back
+            Err(BespokeError::Internal(m)) =>
+                return Err(CompileError::Internal(format!("bespoke: {m}"))),
+        },
+        None => None,
+    };
+
+    let (object, pcmap, backend_name): (Vec<u8>, Vec<u8>, &'static str) =
+        match bespoke_output {
+            Some(o) => (o.object, o.pcmap, "bespoke"),
+            None => match cranelift_compile(&module, args.target) {
+                Ok(o) => (o.object, o.pcmap, "cranelift"),
+                Err(atrium_spv_backend_cranelift::BackendError::Unsupported(m)) =>
+                    return Err(CompileError::Unsupported(m)),
+                Err(other) =>
+                    return Err(CompileError::Internal(format!("cranelift: {other}"))),
+            },
+        };
 
     // 5. Write object to temp file, link via `cc` into
     // the cache directory under <hash>.so.
@@ -225,7 +248,7 @@ fn run(args: &Args) -> Result<CompileReport, CompileError> {
         )))?;
 
     let obj_path = args.output_dir.join(format!("{hash}.o"));
-    std::fs::write(&obj_path, &output.object).map_err(|e|
+    std::fs::write(&obj_path, &object).map_err(|e|
         CompileError::Internal(format!(
             "writing {}: {e}", obj_path.display(),
         )))?;
@@ -239,7 +262,7 @@ fn run(args: &Args) -> Result<CompileReport, CompileError> {
 
     // 6. Write pcmap sidecar.
     let pcmap_path = args.output_dir.join(format!("{hash}.pcmap"));
-    std::fs::write(&pcmap_path, &output.pcmap).map_err(|e|
+    std::fs::write(&pcmap_path, &pcmap).map_err(|e|
         CompileError::Internal(format!(
             "writing {}: {e}", pcmap_path.display(),
         )))?;

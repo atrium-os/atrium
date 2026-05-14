@@ -2007,7 +2007,7 @@ decision (`docs/spec/tier2-renderer.md` §D1).
 | `atrium-spv-tests` | Interpreter (the F1-clean oracle — walks SPIR-V directly, zero shared frontend code) + `assert_shader_agrees`. |
 | `atrium-spv-differential` | `CraneliftRunner` + `BespokeRunner`; three-way harness. |
 | `atrium-spv-loader` | `ShaderCache`: SHA-256-keyed `.so` cache + dlopen. Spawns `atrium-spv-compile` on miss. |
-| `atrium-spv-compile` | Standalone compile binary the loader shells out to. |
+| `atrium-spv-compile` | Standalone compile binary the loader shells out to. Tries the bespoke ARM64 backend first, falls back to Cranelift on `Unsupported` (spec §2 production order); emits `<hash>.so` + `<hash>.pcmap` and a `"backend":"bespoke"\|"cranelift"` metrics line. |
 
 ### Three-tier model
 
