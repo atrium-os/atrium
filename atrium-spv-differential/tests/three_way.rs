@@ -773,6 +773,52 @@ fn build_swizzle_shader(comps: [u32; 4]) -> Vec<u8> {
     bytes
 }
 
+/// OpCompositeExtract exercise: extract individual lanes
+/// from a vec4 and recombine them in a different order
+/// via OpCompositeConstruct.
+///   va = (0.1, 0.2, 0.3, 0.4)
+///   out = vec4(va[3], va[0], va[2], va[1])
+fn build_composite_extract_shader() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, ExecutionMode, ExecutionModel,
+        FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut bld = rspirv::dr::Builder::new();
+    bld.set_version(1, 0);
+    bld.capability(Capability::Shader);
+    bld.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = bld.type_void();
+    let f32_ty = bld.type_float(32, None);
+    let vec4 = bld.type_vector(f32_ty, 4);
+    let void_fn = bld.type_function(void, vec![]);
+    let ptr_out = bld.type_pointer(None, StorageClass::Output, vec4);
+    let lanes = [0.1f32, 0.2, 0.3, 0.4];
+    let cs: Vec<_> = lanes.iter()
+        .map(|x| bld.constant_bit32(f32_ty, x.to_bits())).collect();
+    let va = bld.constant_composite(vec4, cs);
+    let out = bld.variable(ptr_out, None, StorageClass::Output, None);
+    bld.decorate(out, rspirv::spirv::Decoration::Location,
+                 vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let main = bld.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    bld.begin_block(None).unwrap();
+    let e3 = bld.composite_extract(f32_ty, None, va, vec![3]).unwrap();
+    let e0 = bld.composite_extract(f32_ty, None, va, vec![0]).unwrap();
+    let e2 = bld.composite_extract(f32_ty, None, va, vec![2]).unwrap();
+    let e1 = bld.composite_extract(f32_ty, None, va, vec![1]).unwrap();
+    let color = bld.composite_construct(vec4, None,
+        vec![e3, e0, e2, e1]).unwrap();
+    bld.store(out, color, None, vec![]).unwrap();
+    bld.ret().unwrap();
+    bld.end_function().unwrap();
+    bld.entry_point(ExecutionModel::Fragment, main, "main", vec![out]);
+    bld.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+    let words: Vec<u32> = bld.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
 fn build_if_else_shader() -> Vec<u8> {
     use rspirv::binary::Assemble;
     use rspirv::spirv::{
@@ -1060,6 +1106,15 @@ fn three_way_vector_shuffle_cross_source() {
     // sources are the same vector — exercises the
     // cross-source branch of the shuffle.
     let spirv = build_swizzle_shader([0, 5, 2, 7]);
+    let rs = runners();
+    let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
+    assert_shader_agrees(&spirv, &ShaderInputs::default(),
+                         ColorTolerance::Exact, &refs);
+}
+
+#[test]
+fn three_way_composite_extract() {
+    let spirv = build_composite_extract_shader();
     let rs = runners();
     let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
     assert_shader_agrees(&spirv, &ShaderInputs::default(),

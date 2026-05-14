@@ -959,6 +959,25 @@ impl FnTranslator {
                 Ok(())
             }
 
+            // Op::VectorExtract: pull lane `index` out of
+            // a vector into a scalar. Pure indexing with
+            // our per-lane storage.
+            Op::VectorExtract { vector, index } => {
+                let lanes = self.vectors.get(&vector.id).cloned()
+                    .ok_or_else(|| BackendError::Unsupported(format!(
+                        "VectorExtract source {:?} not in vectors",
+                        vector.id)))?;
+                let lane = lanes.get(*index as usize).copied()
+                    .ok_or_else(|| BackendError::Unsupported(format!(
+                        "VectorExtract index {index} out of range \
+                         (vector has {} lanes)", lanes.len())))?;
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "VectorExtract without result Value".to_string()))?;
+                self.scalars.insert(result.id, lane);
+                Ok(())
+            }
+
             // Op::Dot: per-lane fmul, then tree-reduce
             // with fadd. Result is a scalar.
             Op::Dot(a, b) => {

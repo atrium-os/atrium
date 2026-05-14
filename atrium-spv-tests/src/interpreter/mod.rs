@@ -877,6 +877,39 @@ impl Interpreter {
                 values.insert(result_id, ConstantValue::Vec(elements));
                 Ok(())
             }
+            // OpCompositeExtract: pull one scalar lane out
+            // of a vector. Single-level vector index only
+            // (matches the frontend's restriction).
+            Op::CompositeExtract => {
+                let result_id = inst.result_id.ok_or_else(||
+                    InterpError::BadConstant(0))?;
+                let composite_id = op_id(&inst.operands, 0)?;
+                let composite = self.lookup_value(composite_id, values)?;
+                // Remaining operands are literal indices.
+                let indices: Vec<u32> = inst.operands[1..].iter()
+                    .filter_map(|o| match o {
+                        rspirv::dr::Operand::LiteralBit32(v) => Some(*v),
+                        _ => None,
+                    })
+                    .collect();
+                if indices.len() != 1 {
+                    return Err(InterpError::UnsupportedOpcode(format!(
+                        "CompositeExtract with {} indices; only single-level \
+                         vector extract supported", indices.len())));
+                }
+                let lane = match &composite {
+                    ConstantValue::Vec(lanes) => lanes
+                        .get(indices[0] as usize)
+                        .cloned()
+                        .ok_or_else(|| InterpError::UnsupportedOpcode(format!(
+                            "CompositeExtract index {} out of range ({} lanes)",
+                            indices[0], lanes.len())))?,
+                    other => return Err(InterpError::UnsupportedOpcode(format!(
+                        "CompositeExtract of non-vector: {other:?}"))),
+                };
+                values.insert(result_id, lane);
+                Ok(())
+            }
             other => Err(InterpError::UnsupportedOpcode(format!("{:?}", other))),
         }
     }

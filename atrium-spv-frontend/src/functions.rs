@@ -737,6 +737,45 @@ fn translate_inst(
             |a| Op::FNeg(a),
         ),
 
+        // OpCompositeExtract: pull one scalar lane out of
+        // a vector. SPIR-V allows multi-level index chains
+        // for nested aggregates; we support the single-
+        // index vector case (the only one shaders hit —
+        // GLSL `color.r` etc.). Deeper chains → Unsupported.
+        SpvOp::CompositeExtract => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed(
+                    "CompositeExtract without result id".to_string()))?;
+            let result_type_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed(
+                    "CompositeExtract without result type".to_string()))?;
+            let ty = types.get(result_type_id)?.clone();
+            let composite_id = expect_id(&spv_inst.operands, 0)?;
+            // Exactly one literal index for the vector case.
+            let indices: Vec<u32> = spv_inst.operands[1..].iter()
+                .filter_map(|o| match o {
+                    Operand::LiteralBit32(v) => Some(*v),
+                    _ => None,
+                })
+                .collect();
+            if indices.len() != 1 {
+                return Err(FrontendError::Unsupported(format!(
+                    "CompositeExtract with {} indices; only single-level \
+                     vector extract supported", indices.len())));
+            }
+            let vector = resolve_value(
+                composite_id, types, constants, id_map, next_value_id,
+                insts, source_spirv_offset,
+            )?;
+            let result = alloc_or_get_result(result_id, ty, id_map, next_value_id);
+            insts.push(Inst {
+                op: Op::VectorExtract { vector, index: indices[0] },
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
+
         // OpCompositeConstruct: build a vector (or
         // matrix; matrices not supported yet) from N
         // element Values. Per the IR's ConstVec doc:

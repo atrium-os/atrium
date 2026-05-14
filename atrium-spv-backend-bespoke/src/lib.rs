@@ -549,6 +549,25 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
                 }
                 vectors.insert(result.id, out_lanes);
             }
+            // OpVectorExtract: alias lane `index`'s S-reg
+            // Value into the scalar result. No instruction
+            // emitted — pure aliasing, like VectorShuffle.
+            Op::VectorExtract { vector, index } => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "VectorExtract without result".into()))?;
+                let lanes = vectors.get(&vector.id).cloned().ok_or_else(||
+                    BackendError::Unsupported(format!(
+                        "VectorExtract source {:?} not a vec", vector.id)))?;
+                let lane = lanes.get(*index as usize).ok_or_else(||
+                    BackendError::Unsupported(format!(
+                        "VectorExtract index {index} out of range \
+                         ({} lanes)", lanes.len())))?;
+                let s = *scalars.get(&lane.id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "VectorExtract lane {:?} not in scalars", lane.id)))?;
+                scalars.insert(result.id, s);
+            }
             // OpDot: scalar = Σ a_i * b_i. Lowers to one
             // fmul_s for the first lane + (fmul_s + fadd_s)
             // per additional lane.
@@ -1135,6 +1154,15 @@ fn compute_last_use_flat(insts: &[&atrium_spv_ir::Inst]) -> HashMap<ValueId, usi
                     for lid in &lanes { mark(*lid); }
                 }
                 if let Some(lanes) = vec_lanes.get(&src2.id).cloned() {
+                    for lid in &lanes { mark(*lid); }
+                }
+            }
+            Op::VectorExtract { vector, .. } => {
+                mark(vector.id);
+                // The extracted lane's S-reg is aliased
+                // into the result; keep all source lanes
+                // live through the extract.
+                if let Some(lanes) = vec_lanes.get(&vector.id).cloned() {
                     for lid in &lanes { mark(*lid); }
                 }
             }
