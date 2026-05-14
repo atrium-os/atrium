@@ -4,7 +4,7 @@
 
 use atrium_spv_differential::{BespokeRunner, CraneliftRunner};
 use atrium_spv_tests::harness::{
-    assert_shader_agrees, InterpreterRunner, ShaderRunner,
+    assert_shader_agrees_all, InterpreterRunner, ShaderRunner,
 };
 use atrium_spv_tests::interpreter::ShaderInputs;
 use atrium_spv_tests::pixels::ColorTolerance;
@@ -893,7 +893,7 @@ fn three_way_constant_color_shader() {
     let spirv = build_constant_color_spirv([0.4, 0.5, 0.6, 1.0]);
     let rs = runners();
     let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
-    assert_shader_agrees(
+    assert_shader_agrees_all(
         &spirv,
         &ShaderInputs::default(),
         ColorTolerance::Exact,
@@ -906,7 +906,7 @@ fn three_way_fp_arithmetic_shader() {
     let spirv = build_arith_shader(0.75, 0.25);
     let rs = runners();
     let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
-    assert_shader_agrees(
+    assert_shader_agrees_all(
         &spirv,
         &ShaderInputs::default(),
         ColorTolerance::Exact,
@@ -921,7 +921,7 @@ fn three_way_vec_arithmetic() {
     let spirv = build_vec_arith_shader(a, b);
     let rs = runners();
     let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
-    assert_shader_agrees(
+    assert_shader_agrees_all(
         &spirv,
         &ShaderInputs::default(),
         ColorTolerance::Exact,
@@ -937,7 +937,7 @@ fn three_way_bitwise_and_shift() {
     inputs.push_constants[..4].copy_from_slice(&n.to_le_bytes());
     let rs = runners();
     let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
-    assert_shader_agrees(
+    assert_shader_agrees_all(
         &spirv,
         &inputs,
         ColorTolerance::Exact,
@@ -953,7 +953,7 @@ fn three_way_int_compare_then_branch() {
     inputs.push_constants[..4].copy_from_slice(&n.to_le_bytes());
     let rs = runners();
     let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
-    assert_shader_agrees(
+    assert_shader_agrees_all(
         &spirv,
         &inputs,
         ColorTolerance::Exact,
@@ -969,7 +969,7 @@ fn three_way_int_compare_else_branch() {
     inputs.push_constants[..4].copy_from_slice(&n.to_le_bytes());
     let rs = runners();
     let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
-    assert_shader_agrees(
+    assert_shader_agrees_all(
         &spirv,
         &inputs,
         ColorTolerance::Exact,
@@ -984,7 +984,7 @@ fn three_way_phi_then_branch() {
     inputs.push_constants[..4].copy_from_slice(&0.2f32.to_le_bytes());
     let rs = runners();
     let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
-    assert_shader_agrees(
+    assert_shader_agrees_all(
         &spirv,
         &inputs,
         ColorTolerance::Exact,
@@ -999,7 +999,7 @@ fn three_way_phi_else_branch() {
     inputs.push_constants[..4].copy_from_slice(&0.8f32.to_le_bytes());
     let rs = runners();
     let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
-    assert_shader_agrees(
+    assert_shader_agrees_all(
         &spirv,
         &inputs,
         ColorTolerance::Exact,
@@ -1014,7 +1014,7 @@ fn three_way_select_then() {
     inputs.push_constants[..4].copy_from_slice(&0.2f32.to_le_bytes());
     let rs = runners();
     let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
-    assert_shader_agrees(&spirv, &inputs, ColorTolerance::Exact, &refs);
+    assert_shader_agrees_all(&spirv, &inputs, ColorTolerance::Exact, &refs);
 }
 
 #[test]
@@ -1024,7 +1024,7 @@ fn three_way_select_else() {
     inputs.push_constants[..4].copy_from_slice(&0.8f32.to_le_bytes());
     let rs = runners();
     let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
-    assert_shader_agrees(&spirv, &inputs, ColorTolerance::Exact, &refs);
+    assert_shader_agrees_all(&spirv, &inputs, ColorTolerance::Exact, &refs);
 }
 
 #[test]
@@ -1034,7 +1034,7 @@ fn three_way_switch_case0() {
     inputs.push_constants[..4].copy_from_slice(&0i32.to_le_bytes());
     let rs = runners();
     let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
-    assert_shader_agrees(&spirv, &inputs, ColorTolerance::Exact, &refs);
+    assert_shader_agrees_all(&spirv, &inputs, ColorTolerance::Exact, &refs);
 }
 
 #[test]
@@ -1044,7 +1044,7 @@ fn three_way_switch_case1() {
     inputs.push_constants[..4].copy_from_slice(&1i32.to_le_bytes());
     let rs = runners();
     let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
-    assert_shader_agrees(&spirv, &inputs, ColorTolerance::Exact, &refs);
+    assert_shader_agrees_all(&spirv, &inputs, ColorTolerance::Exact, &refs);
 }
 
 #[test]
@@ -1054,7 +1054,7 @@ fn three_way_switch_default() {
     inputs.push_constants[..4].copy_from_slice(&99i32.to_le_bytes());
     let rs = runners();
     let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
-    assert_shader_agrees(&spirv, &inputs, ColorTolerance::Exact, &refs);
+    assert_shader_agrees_all(&spirv, &inputs, ColorTolerance::Exact, &refs);
 }
 
 #[test]
@@ -1065,7 +1065,7 @@ fn three_way_simple_loop() {
     inputs.push_constants[..4].copy_from_slice(&n.to_le_bytes());
     let rs = runners();
     let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
-    assert_shader_agrees(&spirv, &inputs, ColorTolerance::Exact, &refs);
+    assert_shader_agrees_all(&spirv, &inputs, ColorTolerance::Exact, &refs);
 }
 
 #[test]
@@ -1075,7 +1075,7 @@ fn three_way_vec_select_then() {
     inputs.push_constants[..4].copy_from_slice(&0.2f32.to_le_bytes());
     let rs = runners();
     let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
-    assert_shader_agrees(&spirv, &inputs, ColorTolerance::Exact, &refs);
+    assert_shader_agrees_all(&spirv, &inputs, ColorTolerance::Exact, &refs);
 }
 
 #[test]
@@ -1085,7 +1085,7 @@ fn three_way_vec_select_else() {
     inputs.push_constants[..4].copy_from_slice(&0.8f32.to_le_bytes());
     let rs = runners();
     let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
-    assert_shader_agrees(&spirv, &inputs, ColorTolerance::Exact, &refs);
+    assert_shader_agrees_all(&spirv, &inputs, ColorTolerance::Exact, &refs);
 }
 
 #[test]
@@ -1094,7 +1094,7 @@ fn three_way_vector_shuffle_bgra() {
     let spirv = build_swizzle_shader([2, 1, 0, 3]);
     let rs = runners();
     let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
-    assert_shader_agrees(&spirv, &ShaderInputs::default(),
+    assert_shader_agrees_all(&spirv, &ShaderInputs::default(),
                          ColorTolerance::Exact, &refs);
 }
 
@@ -1108,7 +1108,7 @@ fn three_way_vector_shuffle_cross_source() {
     let spirv = build_swizzle_shader([0, 5, 2, 7]);
     let rs = runners();
     let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
-    assert_shader_agrees(&spirv, &ShaderInputs::default(),
+    assert_shader_agrees_all(&spirv, &ShaderInputs::default(),
                          ColorTolerance::Exact, &refs);
 }
 
@@ -1117,7 +1117,7 @@ fn three_way_composite_extract() {
     let spirv = build_composite_extract_shader();
     let rs = runners();
     let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
-    assert_shader_agrees(&spirv, &ShaderInputs::default(),
+    assert_shader_agrees_all(&spirv, &ShaderInputs::default(),
                          ColorTolerance::Exact, &refs);
 }
 
@@ -1126,7 +1126,7 @@ fn three_way_dot_and_composite() {
     let spirv = build_dot_vts_shader();
     let rs = runners();
     let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
-    assert_shader_agrees(&spirv, &ShaderInputs::default(),
+    assert_shader_agrees_all(&spirv, &ShaderInputs::default(),
                          ColorTolerance::Exact, &refs);
 }
 
@@ -1138,7 +1138,7 @@ fn three_way_int_arith_and_convert() {
     inputs.push_constants[..4].copy_from_slice(&n.to_le_bytes());
     let rs = runners();
     let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
-    assert_shader_agrees(
+    assert_shader_agrees_all(
         &spirv,
         &inputs,
         ColorTolerance::Exact,
@@ -1153,7 +1153,7 @@ fn three_way_if_else_then_branch() {
     inputs.push_constants[..4].copy_from_slice(&0.2f32.to_le_bytes());
     let rs = runners();
     let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
-    assert_shader_agrees(
+    assert_shader_agrees_all(
         &spirv,
         &inputs,
         ColorTolerance::Exact,
@@ -1168,7 +1168,7 @@ fn three_way_if_else_else_branch() {
     inputs.push_constants[..4].copy_from_slice(&0.8f32.to_le_bytes());
     let rs = runners();
     let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
-    assert_shader_agrees(
+    assert_shader_agrees_all(
         &spirv,
         &inputs,
         ColorTolerance::Exact,

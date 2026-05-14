@@ -207,3 +207,78 @@ pub fn assert_shader_agrees(
         panic!("{msg}");
     }
 }
+
+/// Strict variant of [`assert_shader_agrees`]: **every**
+/// passed runner must successfully produce output —
+/// `Unsupported` is treated as a failure, not a skip.
+///
+/// # Why this exists
+///
+/// The lenient `assert_shader_agrees` silently drops a
+/// runner that returns `Unsupported`, comparing only the
+/// rest. That's correct for tests deliberately exercising
+/// an opcode some backend doesn't implement yet — but it
+/// is a *trap* for the common case. The bespoke backend's
+/// i32-Phi loop bug hid for several iterations precisely
+/// because the loop differential test let bespoke skip:
+/// interpreter + Cranelift agreed, the test went green,
+/// and the on-target infinite loop was invisible until
+/// the in-VM check caught it.
+///
+/// The three-way differential corpus is built from the
+/// *common* shader surface — opcodes every runner is
+/// expected to handle. Those tests should use this strict
+/// form so a regression that makes one runner fall back
+/// to `Unsupported` is a loud failure, not a silent
+/// coverage hole. Reserve the lenient variant for tests
+/// that intentionally probe partial-support opcodes.
+pub fn assert_shader_agrees_all(
+    spirv: &[u8],
+    inputs: &ShaderInputs,
+    tolerance: ColorTolerance,
+    runners: &[&dyn ShaderRunner],
+) {
+    if runners.len() < 2 {
+        panic!("assert_shader_agrees_all needs ≥2 runners; got {}",
+               runners.len());
+    }
+    let mut results: Vec<(&'static str, ShaderOutputs)> = Vec::new();
+    let mut errors: Vec<(&'static str, String)> = Vec::new();
+    for runner in runners {
+        match runner.run(spirv, inputs) {
+            Ok(out) => results.push((runner.name(), out)),
+            Err(BackendError::Unsupported(why)) => errors.push((
+                runner.name(),
+                format!("returned Unsupported ({why}) — in strict mode \
+                         every runner must compile the shader; a skip \
+                         here means a coverage hole or a regressed \
+                         backend"),
+            )),
+            Err(other) => errors.push((runner.name(), other.to_string())),
+        }
+    }
+    if !errors.is_empty() {
+        let mut msg = String::from(
+            "assert_shader_agrees_all: not every runner produced output:\n");
+        for (name, why) in &errors {
+            msg.push_str(&format!("  - {name}: {why}\n"));
+        }
+        panic!("{msg}");
+    }
+    // Every runner succeeded — cross-compare against the first.
+    let baseline_name = results[0].0;
+    let baseline_pixels = &results[0].1.pixels;
+    let mut failures: Vec<(String, PixelMismatch)> = Vec::new();
+    for (name, out) in &results[1..] {
+        if let Err(mm) = compare_buffers(baseline_pixels, &out.pixels, tolerance) {
+            failures.push((format!("{baseline_name} vs {name}"), mm));
+        }
+    }
+    if !failures.is_empty() {
+        let mut msg = String::from("shader output diverges:\n");
+        for (label, err) in &failures {
+            msg.push_str(&format!("  - {label}: {err}\n"));
+        }
+        panic!("{msg}");
+    }
+}
