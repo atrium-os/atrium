@@ -2509,6 +2509,46 @@ interpreter oracle. The bespoke backend's headline
 justification — steady-state hand-written-ARM64 perf — is
 now demonstrated, not just asserted.
 
+#### Raising the bar: bespoke vs `clang -O2`
+
+Cranelift did its job — it dragged the bespoke backend up
+to fast-tier-JIT parity. But Cranelift isn't a
+*native-speed* bar; it trades codegen quality for compile
+speed. So the bench's runtime oracle moved to a
+hand-written C reference compiled with `clang -O2`
+(`verify/native/heavy.c`; `bench_driver --native`). Two
+builds: `-ffp-contract=off` (same arithmetic as the
+backends) and plain `-O2` (the true ceiling, FMA-fused —
+results no longer bit-identical).
+
+`heavy` shader, in-VM (FreeBSD/aarch64), ns/call:
+
+| contender                | ns    | vs bespoke |
+|--------------------------|-------|------------|
+| bespoke                  | 1085  | —          |
+| Cranelift                | 1083  | 1.00×      |
+| `clang -O2 -ffp-contract=off` | 1685  | bespoke **1.55× faster** |
+| `clang -O2` (FMA)        | 1146  | bespoke **1.06× faster** |
+
+**There is effectively no gap.** On this shader the
+bespoke backend matches or slightly beats `clang -O2`.
+clang's strict build is *slower* because its
+auto-vectoriser packed the serial dependency-chain loop
+into 2-lane SIMD with per-iteration cross-lane shuffles
+that cost more than they saved; the FMA build (clang's
+genuine best) is a near dead heat. Host numbers agree
+within ~5%.
+
+> **Caveat — this is one shader.** `heavy` is a scalar FP
+> dependency-chain loop, a shape that resists
+> vectorisation. "No gap on `heavy`" is *not* "no gap
+> everywhere": a shader with independent per-pixel work
+> would let clang's vectoriser actually win, and texture
+> sampling / heavy vector math are unmeasured. Generalising
+> the claim needs more native references (vector-heavy,
+> control-flow-heavy). What's proven: on the one shader
+> with real signal, bespoke is at the `clang -O2` bar.
+
 #### Compile-pipeline phase breakdown — `cc` is the cost
 
 With the backend ~4.7× faster, the question came up: is
