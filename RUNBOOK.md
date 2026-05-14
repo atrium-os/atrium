@@ -2668,11 +2668,27 @@ suites):
   on-target. (`run-e2e-in-vm.sh` retired —
   `run-loader-e2e-in-vm.sh` drives the real loader and
   supersedes it.)
-* **Phase 4 ⏳** — Cranelift blob output. Open question 1
-  (does `cranelift-object` carry relocations?) decides
-  whether this is small or a sub-arc. Until then the
-  Cranelift fallback keeps the `cc` → `.so` → `dlopen`
-  path, which still works — the loader handles both
-  artifact types. Only the *common* (bespoke) case gets
-  the ~40× compile win so far, but that's the case that
-  matters.
+* **Phase 4 ✅** (`2bef9c5`). Open question 1 answered
+  empirically: dumped the Cranelift object's relocations
+  across the whole corpus — *zero* relocations, *zero*
+  rodata, every shader. Cranelift's aarch64 lowering
+  materialises constants inline just like the bespoke
+  backend. So phase 4 was the small version: the Cranelift
+  backend gained `compile_blob()` (build the object, then
+  re-parse it to lift the flat `.text` + entry offsets,
+  with a loud relocation guard), and `atrium-spv-compile`
+  dropped `Artifact::Object`, `link_to_shared_lib`, and
+  the `cc` invocation entirely. **`cc` is now completely
+  gone from the production compile pipeline** — both
+  backends emit flat blobs. The `unordcmp`
+  Cranelift-fallback shader compiles in ~1 ms to a
+  112-byte `.afblob` (was ~41 ms).
+
+The JIT-emit arc is **complete**: `cc` eliminated, compile
+~41 ms → ~1 ms across both backends, the loader `mmap`s
+flat blobs `PROT_EXEC`. The jailed compile sub-process,
+the content-hash cache, and the `.pcmap` sidecar are all
+unchanged. `dlopen.rs` stays as the legacy reader for any
+pre-existing `.so` cache entries; nothing produces `.so`
+anymore. 25/25 differential + 3/3 in-VM scripts pass on
+the FreeBSD target throughout.
