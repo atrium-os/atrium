@@ -2087,10 +2087,28 @@ The unit + three-way differential suites all run on the macOS
 **host** (Mach-O, `Aarch64Darwin`). The bespoke backend's actual
 production target is FreeBSD/aarch64 (ELF, `Aarch64FreeBSD`) — a
 different object format and the genuine AAPCS64 environment. To
-close that gap:
+close that gap there are four focused in-VM scripts, each
+verifying a different layer of the production chain, plus a
+wrapper that runs all four with a single pass/fail summary:
 
 ```bash
 # Dev VM must be up (scripts/run-vm.sh) + reachable on :2222.
+sh atrium-spv-backend-bespoke/verify/run-all-in-vm.sh   # the lot
+```
+
+| script                     | layer verified on-target                                  |
+|----------------------------|-----------------------------------------------------------|
+| `run-in-vm.sh`             | bespoke backend object emission + AAPCS64 codegen         |
+| `run-e2e-in-vm.sh`         | the production `atrium-spv-compile` binary + backend selection |
+| `run-loader-e2e-in-vm.sh`  | `atrium-spv-loader`'s `ShaderCache` (hash, handshake, disk cache, dlopen) |
+| `run-pcmap-e2e-in-vm.sh`   | the `.pcmap` sidecar round-trip through the loader's parser |
+
+`run-all-in-vm.sh` sequences them and tallies the result; a
+sub-script failure doesn't abort the run, so one break can't
+mask the others. Each sub-script is also runnable on its own
+— the rest of this section documents them individually.
+
+```bash
 sh atrium-spv-backend-bespoke/verify/run-in-vm.sh
 ```
 
