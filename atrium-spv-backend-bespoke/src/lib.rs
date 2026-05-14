@@ -190,10 +190,13 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
     let mut bools: HashMap<ValueId, asm::Wreg> = HashMap::new();
     let mut next_bool_w: u8 = 10;
     // Integer scalar Values (i32/u32): held in W-regs
-    // drawn from a separate pool W13..W17 (5 slots).
-    // Caller-saved per AAPCS64, so no prologue needed.
+    // drawn from a separate linear-scan pool W13..W17
+    // (5 slots, caller-saved per AAPCS64 → no prologue).
+    // Loops with i32 induction variables push past a
+    // bump allocator's budget, so the int pool recycles
+    // dead W-regs the same way the f32 V-pool does.
     let mut ints: HashMap<ValueId, asm::Wreg> = HashMap::new();
-    let mut next_int_w: u8 = 13;
+    let mut int_pool = IntPool::new();
 
     // X4 holds out_color. Scratch X9/W9 for constant
     // materialisation + fmov bridging.
@@ -251,15 +254,18 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
     // ── Pre-pass: discover Phi nodes ──────────────────────────
     //
     // For each Op::Phi at the top of a block, allocate one
-    // destination V-reg. Build a per-edge move list:
-    // phi_moves[(from_bid, to_bid)] = Vec<(dest_vreg,
+    // destination register and build a per-edge move list:
+    // phi_moves[(from_bid, to_bid)] = Vec<(PhiDest,
     // source_value_id)> — the predecessor block's branch
-    // emits an `fmov s_dest, s_src` per entry just before
-    // its terminator.
+    // emits the matching register move per entry just
+    // before its terminator. f32 Phis live in V-regs
+    // (fmov_s move); i32/u32 Phis live in W-regs (mov_w
+    // move) — loops with i32 induction variables hit the
+    // latter.
     let mut phi_moves: HashMap<(BlockId, BlockId),
-                               Vec<(asm::Vreg, ValueId)>> = HashMap::new();
+                               Vec<(PhiDest, ValueId)>> = HashMap::new();
     // Used by Op::BranchCond to detect a Phi-bearing
-    // target (critical-edge splitting lands in v12).
+    // target (critical-edge splitting lands later).
     let mut phi_target_blocks: std::collections::HashSet<BlockId> =
         std::collections::HashSet::new();
     for bid in &block_order {
@@ -271,13 +277,34 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
             };
             let result = inst.result.as_ref().ok_or_else(||
                 BackendError::Internal("Phi without result".into()))?;
-            match &result.ty {
-                Type::F32 => {}
+            // Phi destination registers are loop-carried:
+            // a loop back-edge writes them via the phi-
+            // move just before re-entering the header.
+            // They must therefore live for the *entire*
+            // function — NOT be subject to linear-scan
+            // expiry — so we pop them straight off the
+            // free pool without registering an owner
+            // (expire only reclaims owned regs).
+            let dest = match &result.ty {
+                Type::F32 => {
+                    let n = free_pool.pop().ok_or_else(||
+                        BackendError::Unsupported(
+                            "out of V-regs allocating Phi dest".into()))?;
+                    let v = asm::Vreg(n);
+                    scalars.insert(result.id, v);
+                    PhiDest::Float(v)
+                }
+                Type::I32 | Type::U32 => {
+                    let n = int_pool.free.pop().ok_or_else(||
+                        BackendError::Unsupported(
+                            "out of int W-regs allocating Phi dest".into()))?;
+                    let w = asm::Wreg(n);
+                    ints.insert(result.id, w);
+                    PhiDest::Int(w)
+                }
                 other => return Err(BackendError::Unsupported(format!(
-                    "Phi of type {other:?} not supported in v11"))),
-            }
-            let dest = alloc_vreg(&mut free_pool, &mut owners, result.id)?;
-            scalars.insert(result.id, dest);
+                    "Phi of type {other:?} not supported"))),
+            };
             phi_target_blocks.insert(*bid);
             for arm in arms {
                 phi_moves.entry((arm.from, *bid))
@@ -321,20 +348,25 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
             owners.remove(&n);
             free_pool.push(n);
         }
+        // Same expiry pass for the integer W-reg pool.
+        int_pool.expire(i, &last_use);
 
         match &inst.op {
             Op::ConstInt { value, kind: _ } => {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal("ConstInt without result".into()))?;
                 // If the constant is referenced by an int
-                // arithmetic op, we need it in a W-reg.
-                // Otherwise (e.g. orphan AccessChain index),
-                // skip codegen. Cheap heuristic: always
-                // materialise; if the W-pool is full,
-                // skip silently (assumes it was an orphan).
-                if next_int_w < 18 {
-                    let w = asm::Wreg(next_int_w);
-                    next_int_w += 1;
+                // arithmetic op, it needs a W-reg.
+                // Orphan ConstInts (e.g. AccessChain index
+                // resolutions) are consumed by the frontend
+                // before the backend sees them — but a
+                // genuinely-unused ConstInt left in the
+                // stream would still get a reg here. With
+                // linear-scan the reg is reclaimed at the
+                // next inst (last_use < i), so this is
+                // cheap; on pool exhaustion we skip
+                // codegen (assume orphan).
+                if let Ok(w) = alloc_int_w(&mut int_pool, result.id) {
                     materialise_u32_into_w(&mut a, w, *value as i32 as u32);
                     ints.insert(result.id, w);
                 }
@@ -343,35 +375,35 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
                 // Treat as an orphan — no W-reg.
             }
             Op::IAdd(l, r) => emit_int_binop(
-                &mut a, &mut ints, &mut next_int_w, inst, l, r, asm::add_w)?,
+                &mut a, &mut ints, &mut int_pool, inst, l, r, asm::add_w)?,
             Op::ISub(l, r) => emit_int_binop(
-                &mut a, &mut ints, &mut next_int_w, inst, l, r, asm::sub_w)?,
+                &mut a, &mut ints, &mut int_pool, inst, l, r, asm::sub_w)?,
             Op::IMul(l, r) => emit_int_binop(
-                &mut a, &mut ints, &mut next_int_w, inst, l, r, asm::mul_w)?,
+                &mut a, &mut ints, &mut int_pool, inst, l, r, asm::mul_w)?,
             Op::SDiv(l, r) => emit_int_binop(
-                &mut a, &mut ints, &mut next_int_w, inst, l, r, asm::sdiv_w)?,
+                &mut a, &mut ints, &mut int_pool, inst, l, r, asm::sdiv_w)?,
             Op::UDiv(l, r) => emit_int_binop(
-                &mut a, &mut ints, &mut next_int_w, inst, l, r, asm::udiv_w)?,
+                &mut a, &mut ints, &mut int_pool, inst, l, r, asm::udiv_w)?,
             // Bitwise + shifts.
             Op::BitAnd(l, r) => emit_int_binop(
-                &mut a, &mut ints, &mut next_int_w, inst, l, r, asm::and_w)?,
+                &mut a, &mut ints, &mut int_pool, inst, l, r, asm::and_w)?,
             Op::BitOr(l, r) => emit_int_binop(
-                &mut a, &mut ints, &mut next_int_w, inst, l, r, asm::orr_w)?,
+                &mut a, &mut ints, &mut int_pool, inst, l, r, asm::orr_w)?,
             Op::BitXor(l, r) => emit_int_binop(
-                &mut a, &mut ints, &mut next_int_w, inst, l, r, asm::eor_w)?,
+                &mut a, &mut ints, &mut int_pool, inst, l, r, asm::eor_w)?,
             Op::Shl(l, r) => emit_int_binop(
-                &mut a, &mut ints, &mut next_int_w, inst, l, r, asm::lslv_w)?,
+                &mut a, &mut ints, &mut int_pool, inst, l, r, asm::lslv_w)?,
             Op::LShr(l, r) => emit_int_binop(
-                &mut a, &mut ints, &mut next_int_w, inst, l, r, asm::lsrv_w)?,
+                &mut a, &mut ints, &mut int_pool, inst, l, r, asm::lsrv_w)?,
             Op::AShr(l, r) => emit_int_binop(
-                &mut a, &mut ints, &mut next_int_w, inst, l, r, asm::asrv_w)?,
+                &mut a, &mut ints, &mut int_pool, inst, l, r, asm::asrv_w)?,
             Op::BitNot(s) => {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal("BitNot without result".into()))?;
                 let s_w = *ints.get(&s.id).ok_or_else(||
                     BackendError::Internal(format!(
                         "BitNot operand {:?} not in ints", s.id)))?;
-                let d_w = alloc_int_w(&mut next_int_w)?;
+                let d_w = alloc_int_w(&mut int_pool, result.id)?;
                 a.emit(asm::mvn_w(d_w, s_w));
                 ints.insert(result.id, d_w);
             }
@@ -412,7 +444,7 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
                 let s_w = *ints.get(&s.id).ok_or_else(||
                     BackendError::Internal(format!(
                         "INeg operand {:?} not in ints", s.id)))?;
-                let d_w = alloc_int_w(&mut next_int_w)?;
+                let d_w = alloc_int_w(&mut int_pool, result.id)?;
                 a.emit(asm::neg_w(d_w, s_w));
                 ints.insert(result.id, d_w);
             }
@@ -445,7 +477,7 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
                 let s_v = *scalars.get(&s.id).ok_or_else(||
                     BackendError::Internal(format!(
                         "ConvertFToS operand {:?} not in scalars", s.id)))?;
-                let d_w = alloc_int_w(&mut next_int_w)?;
+                let d_w = alloc_int_w(&mut int_pool, result.id)?;
                 a.emit(asm::fcvtzs_w_from_s(d_w, s_v));
                 ints.insert(result.id, d_w);
             }
@@ -456,7 +488,7 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
                 let s_v = *scalars.get(&s.id).ok_or_else(||
                     BackendError::Internal(format!(
                         "ConvertFToU operand {:?} not in scalars", s.id)))?;
-                let d_w = alloc_int_w(&mut next_int_w)?;
+                let d_w = alloc_int_w(&mut int_pool, result.id)?;
                 a.emit(asm::fcvtzu_w_from_s(d_w, s_v));
                 ints.insert(result.id, d_w);
             }
@@ -680,6 +712,18 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
                         emit_load_f32_offset(&mut a, w_tmp, param, off, v)?;
                         scalars.insert(result.id, v);
                     }
+                    Type::I32 | Type::U32 => {
+                        // Load a 32-bit int straight into
+                        // the int W-pool: `ldr w_dst,
+                        // [param, #off]`.
+                        if off < 0 || off > u16::MAX as i32 {
+                            return Err(BackendError::Unsupported(format!(
+                                "int Load offset {off} out of range")));
+                        }
+                        let w = alloc_int_w(&mut int_pool, result.id)?;
+                        a.emit(asm::ldr_w_offset(w, param, off as u16));
+                        ints.insert(result.id, w);
+                    }
                     Type::Vec2(_) | Type::Vec3(_) | Type::Vec4(_) => {
                         let lane_count = match &pointee {
                             Type::Vec2(_) => 2usize,
@@ -785,15 +829,27 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
             }
             Op::Branch(target) => {
                 // Phi-edge moves: if `target` has incoming
-                // Phis, emit fmov_s for each before the
-                // branch.
+                // Phis, emit the matching register move
+                // (fmov_s for f32, mov_w for i32/u32) for
+                // each, just before the branch.
                 if let Some(moves) = phi_moves.get(&(*bid, *target)) {
                     for (dest, src_id) in moves {
-                        let src = *scalars.get(src_id).ok_or_else(||
-                            BackendError::Internal(format!(
-                                "Phi source {:?} not in scalars",
-                                src_id)))?;
-                        a.emit(asm::fmov_s(*dest, src));
+                        match dest {
+                            PhiDest::Float(dv) => {
+                                let src = *scalars.get(src_id).ok_or_else(||
+                                    BackendError::Internal(format!(
+                                        "Phi f32 source {:?} not in scalars",
+                                        src_id)))?;
+                                a.emit(asm::fmov_s(*dv, src));
+                            }
+                            PhiDest::Int(dw) => {
+                                let src = *ints.get(src_id).ok_or_else(||
+                                    BackendError::Internal(format!(
+                                        "Phi int source {:?} not in ints",
+                                        src_id)))?;
+                                a.emit(asm::mov_w(*dw, src));
+                            }
+                        }
                     }
                 }
                 let patch_off = a.len();
@@ -979,21 +1035,68 @@ fn emit_load_f32_offset(
 }
 
 /// Bump-allocate one W-reg from the int pool (W13..W17).
-fn alloc_int_w(next_int_w: &mut u8) -> Result<asm::Wreg, BackendError> {
-    if *next_int_w >= 18 {
-        return Err(BackendError::Unsupported(
-            "ran out of int W-regs (W13..W17 exhausted)".into()));
+/// Destination register for a Phi node. f32 Phis land in
+/// a V-reg (moved with `fmov_s`); i32/u32 Phis land in a
+/// W-reg (moved with `mov_w`).
+#[derive(Debug, Clone, Copy)]
+enum PhiDest {
+    Float(asm::Vreg),
+    Int(asm::Wreg),
+}
+
+/// Linear-scan allocator for the integer W-reg pool
+/// (W13..W17). Mirrors the f32 V-reg pool: pop on alloc,
+/// return on expiry. `owner` is the ValueId that gets the
+/// reg — `expire` consults `last_use` to know when to
+/// reclaim.
+struct IntPool {
+    free: Vec<u8>,
+    owners: HashMap<u8, ValueId>,
+}
+
+impl IntPool {
+    fn new() -> Self {
+        // W13..W17, popped low-first like the V-pool.
+        Self { free: (13..18).rev().collect(), owners: HashMap::new() }
     }
-    let w = asm::Wreg(*next_int_w);
-    *next_int_w += 1;
-    Ok(w)
+
+    fn alloc(&mut self, owner: ValueId) -> Result<asm::Wreg, BackendError> {
+        let n = self.free.pop().ok_or_else(|| BackendError::Unsupported(
+            "int linear-scan RA ran out of W-regs (W13..W17); \
+             spilling lands in a later widening".into()))?;
+        self.owners.insert(n, owner);
+        Ok(asm::Wreg(n))
+    }
+
+    /// Return W-regs whose owner's last_use < `before`.
+    fn expire(&mut self, before: usize,
+              last_use: &HashMap<ValueId, usize>) {
+        let dead: Vec<u8> = self.owners.iter()
+            .filter_map(|(n, id)|
+                if last_use.get(id).copied().unwrap_or(usize::MAX) < before {
+                    Some(*n)
+                } else { None })
+            .collect();
+        for n in dead {
+            self.owners.remove(&n);
+            self.free.push(n);
+        }
+    }
+}
+
+/// Convenience: alloc one int W-reg for `owner`.
+fn alloc_int_w(
+    pool: &mut IntPool,
+    owner: ValueId,
+) -> Result<asm::Wreg, BackendError> {
+    pool.alloc(owner)
 }
 
 /// Emit one scalar i32 binary op (add/sub/mul/sdiv/udiv).
 fn emit_int_binop(
     a: &mut asm::Asm,
     ints: &mut HashMap<ValueId, asm::Wreg>,
-    next_int_w: &mut u8,
+    int_pool: &mut IntPool,
     inst: &atrium_spv_ir::Inst,
     lhs: &Value,
     rhs: &Value,
@@ -1007,7 +1110,7 @@ fn emit_int_binop(
     let r = *ints.get(&rhs.id).ok_or_else(||
         BackendError::Internal(format!(
             "int binop rhs {:?} not in ints", rhs.id)))?;
-    let d = alloc_int_w(next_int_w)?;
+    let d = alloc_int_w(int_pool, result.id)?;
     a.emit(make_inst(d, l, r));
     ints.insert(result.id, d);
     Ok(())

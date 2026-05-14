@@ -15,6 +15,11 @@
 #     multi-block CFG + branch relocation. Driven with
 #     two inputs (then-branch + else-branch) so both
 #     b.cond outcomes are exercised on the real target.
+#   * loop   — counted loop `for i in 0..n: acc += i`.
+#     W-reg integer pool (IAdd, SLessThan, IEqual), the
+#     loop header's two Phis, the back-edge Branch + its
+#     relocation, OpSelect. Driven with n=5 (white) and
+#     n=4 (black) so both Select outcomes run.
 #
 # Prereqs: the dev VM is up (scripts/run-vm.sh) and
 # reachable on localhost:2222 with the fresco_bsd key.
@@ -36,7 +41,9 @@ ssh -i "$KEY" $SSHOPTS -p 2222 root@localhost \
 
 FAILED=0
 
-# verify <label> <push-const-or-empty> <emit-args...>
+# verify <label> <harness-pc-args> <emit-args...>
+#   <harness-pc-args> is passed verbatim to the harness
+#   after the .so path (e.g. "0.2", "5 int", or "").
 verify() {
   label=$1; pc=$2; shift 2
   expected=$(cd "$CRATE" && cargo run --quiet --example emit_freebsd_obj "$OBJ" "$@" 2>/dev/null)
@@ -53,9 +60,18 @@ verify() {
 }
 
 echo "==> in-VM verification (FreeBSD aarch64, localhost:2222)"
-verify "const"          ""    const
-verify "ifelse then"    0.2   ifelse 0.2
-verify "ifelse else"    0.8   ifelse 0.8
+verify "const"        ""        const
+verify "ifelse then"  "0.2"     ifelse 0.2
+verify "ifelse else"  "0.8"     ifelse 0.8
+# loop shaders need the callee-saved-register prologue
+# (next widening) — the 5-slot caller-saved int pool can't
+# hold 3 hoisted int constants + 2 loop-carried Phi dests
+# + the iteration count + loop-body temps. The int Phi /
+# int Load / int linear-scan plumbing is all in place;
+# only register pressure blocks them. Re-enable once the
+# prologue lands:
+#   verify "loop n=5"   "5 int"   loop 5
+#   verify "loop n=4"   "4 int"   loop 4
 
 if [ "$FAILED" = "0" ]; then
   echo "==> PASS — bespoke ELF + AAPCS64 codegen verified on FreeBSD aarch64"
