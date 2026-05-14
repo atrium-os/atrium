@@ -30,6 +30,7 @@ checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
 name = "atrium-spv-backend-bespoke"
 version = "0.1.0"
 dependencies = [
+ "atrium-spv-blob",
  "atrium-spv-ir",
  "atrium-spv-pcmap",
  "object 0.36.7",
@@ -49,6 +50,10 @@ dependencies = [
  "cranelift-object",
  "target-lexicon",
 ]
+
+[[package]]
+name = "atrium-spv-blob"
+version = "0.1.0"
 
 [[package]]
 name = "atrium-spv-differential"

@@ -47,11 +47,7 @@ pub use dlopen::{LoadedShader, ShaderEntryPoints};
 
 // The JIT-emit path: mmap a flat `atrium-spv-blob`
 // PROT_EXEC instead of `dlopen`ing a `.so`. Same local
-// `allow(unsafe_code)` discipline as `dlopen`. Wired into
-// `load_or_compile` in phase 3; phase 2 lands the mapping
-// machinery + its unit test, so it's `dead_code` until
-// then.
-#[allow(dead_code)]
+// `allow(unsafe_code)` discipline as `dlopen`.
 mod jitmap;
 
 /// Loader configuration.
@@ -116,8 +112,19 @@ impl ShaderCache {
         format!("{:x}", h.finalize())
     }
 
-    /// Cache path for a hash's compiled shared library.
-    /// `.dylib` on macOS, `.so` elsewhere.
+    /// Cache path for a hash's flat executable blob — the
+    /// JIT-emit artifact (`atrium-spv-blob` format). The
+    /// bespoke backend writes this; the loader `mmap`s it
+    /// `PROT_EXEC` directly. Preferred over [`Self::so_path`]
+    /// when both exist for the same hash.
+    pub fn blob_path(&self, hash: &str) -> PathBuf {
+        self.version_dir().join(format!("{hash}.afblob"))
+    }
+
+    /// Cache path for a hash's compiled shared library —
+    /// the legacy `dlopen` artifact. `.dylib` on macOS,
+    /// `.so` elsewhere. Still produced for Cranelift-
+    /// compiled shaders (until JIT-emit phase 4).
     pub fn so_path(&self, hash: &str) -> PathBuf {
         let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
         self.version_dir().join(format!("{hash}.{ext}"))
@@ -148,20 +155,23 @@ impl ShaderCache {
             }
         }
 
-        // Disk-cache miss → spawn the compile binary.
+        // Disk-cache miss → spawn the compile binary. The
+        // compiler writes one of two artifacts: a flat
+        // `.afblob` (bespoke backend, the JIT-emit path) or
+        // a `.so` (Cranelift fallback, until phase 4).
+        let blob_path = self.blob_path(&hash);
         let so_path = self.so_path(&hash);
         let pcmap_path = self.pcmap_path(&hash);
-        if !so_path.exists() {
+        if !blob_path.exists() && !so_path.exists() {
             self.compile(spirv, &hash)?;
-            if !so_path.exists() {
+            if !blob_path.exists() && !so_path.exists() {
                 return Err(LoadError::Internal(format!(
-                    "atrium-spv-compile exited 0 but {} doesn't exist",
-                    so_path.display(),
+                    "atrium-spv-compile exited 0 but neither {} nor {} exists",
+                    blob_path.display(), so_path.display(),
                 )));
             }
         }
 
-        // Dlopen + cache the LoadedShader.
         let pcmap_bytes = if pcmap_path.exists() {
             Some(std::fs::read(&pcmap_path).map_err(|e| LoadError::Internal(
                 format!("reading {}: {e}", pcmap_path.display()),
@@ -169,7 +179,18 @@ impl ShaderCache {
         } else {
             None
         };
-        let shader = dlopen::open(&so_path, pcmap_bytes.as_deref())?;
+
+        // Prefer the JIT-emit blob (`mmap PROT_EXEC`); fall
+        // back to `dlopen`ing the `.so` for Cranelift-
+        // compiled shaders.
+        let shader = if blob_path.exists() {
+            let blob_bytes = std::fs::read(&blob_path).map_err(|e|
+                LoadError::Internal(format!(
+                    "reading {}: {e}", blob_path.display())))?;
+            jitmap::open(&blob_bytes, pcmap_bytes.as_deref())?
+        } else {
+            dlopen::open(&so_path, pcmap_bytes.as_deref())?
+        };
         let shader = Arc::new(shader);
 
         let mut loaded = self.loaded.lock().map_err(|_| LoadError::Internal(

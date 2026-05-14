@@ -3,23 +3,34 @@
 # software Vulkan shader pipeline, end to end, with a
 # single pass/fail summary.
 #
-# Wraps the four focused scripts, each of which verifies a
+# Wraps the three focused scripts, each of which verifies a
 # different layer of the production chain on the real
 # FreeBSD/aarch64 target:
 #
 #   run-in-vm.sh          bespoke backend object emission +
 #                         AAPCS64 codegen (host-emitted .o,
-#                         linked + run in the VM)
-#   run-e2e-in-vm.sh      the production atrium-spv-compile
-#                         binary, run in the VM, incl. the
-#                         bespoke-first / Cranelift-fallback
-#                         backend selection
-#   run-loader-e2e-in-vm.sh  atrium-spv-loader's ShaderCache:
-#                         hashing, the compile-binary
-#                         handshake, the path-versioned disk
-#                         cache, dlopen + entry-point call
+#                         linked + run in the VM) — exercises
+#                         the backend's `compile()` object
+#                         path directly
+#   run-loader-e2e-in-vm.sh  the full production chain:
+#                         atrium-spv-loader's ShaderCache
+#                         drives atrium-spv-compile, then
+#                         loads the artifact it produced —
+#                         the bespoke JIT-emit `.afblob`
+#                         (mmap PROT_EXEC) or the Cranelift
+#                         `.so` (dlopen) — and calls the
+#                         entry point. Covers hashing, the
+#                         compile-binary handshake, the disk
+#                         cache, both load paths, and the
+#                         AAPCS64 call.
 #   run-pcmap-e2e-in-vm.sh   the .pcmap sidecar round-trip
 #                         through the loader's parser
+#
+# (run-e2e-in-vm.sh was retired at JIT-emit phase 3: it
+# dlopen'd the compile binary's artifact directly, which
+# only works for the legacy `.so`. run-loader-e2e-in-vm.sh
+# supersedes it — it goes through the real loader, which
+# handles both the `.afblob` and `.so` artifacts.)
 #
 # Each sub-script is self-contained (cross-builds what it
 # needs, ships it, runs it); this wrapper just sequences
@@ -34,7 +45,7 @@
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 
-SCRIPTS="run-in-vm.sh run-e2e-in-vm.sh run-loader-e2e-in-vm.sh run-pcmap-e2e-in-vm.sh"
+SCRIPTS="run-in-vm.sh run-loader-e2e-in-vm.sh run-pcmap-e2e-in-vm.sh"
 
 PASSED=0
 FAILED=0

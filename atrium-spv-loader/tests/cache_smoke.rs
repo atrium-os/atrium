@@ -114,9 +114,13 @@ fn cache_miss_compiles_then_hit_returns_same_handle() {
     assert!(s1.entry_points.vs_main.is_none());
     assert!(s1.entry_points.cs_main.is_none());
 
-    // The cached files should exist now.
+    // The cached files should exist now. A constant-colour
+    // shader compiles via the bespoke backend → JIT-emit
+    // path → flat `.afblob` artifact, not a `cc`-linked
+    // `.so`.
     let hash = ShaderCache::hash(&spirv);
-    assert!(cache.so_path(&hash).exists());
+    assert!(cache.blob_path(&hash).exists(),
+        "expected {} after compile", cache.blob_path(&hash).display());
     assert!(cache.pcmap_path(&hash).exists());
 
     // Second call: cache hit → Arc returns same allocation.
@@ -159,13 +163,16 @@ fn disk_cache_survives_in_memory_eviction() {
     let hash = ShaderCache::hash(&spirv);
     cache.forget(&hash);
 
-    // Note when the .so was last modified, drop the
+    // Note when the artifact was last modified, drop the
     // in-memory entry, reload, and confirm no
-    // re-compilation (mtime unchanged).
-    let so_path = cache.so_path(&hash);
-    let mtime_before = std::fs::metadata(&so_path).unwrap().modified().unwrap();
+    // re-compilation (mtime unchanged). The bespoke
+    // JIT-emit path's artifact is the `.afblob`.
+    let blob_path = cache.blob_path(&hash);
+    let mtime_before = std::fs::metadata(&blob_path).unwrap()
+        .modified().unwrap();
     let _s3 = cache.load_or_compile(&spirv).unwrap();
-    let mtime_after = std::fs::metadata(&so_path).unwrap().modified().unwrap();
+    let mtime_after = std::fs::metadata(&blob_path).unwrap()
+        .modified().unwrap();
     assert_eq!(mtime_before, mtime_after,
         "disk cache hit must not re-run the compile binary");
 }

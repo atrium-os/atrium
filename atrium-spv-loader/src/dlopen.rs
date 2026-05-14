@@ -24,10 +24,12 @@ use crate::LoadError;
 /// and uses its own synchronization.
 #[derive(Debug)]
 pub struct LoadedShader {
-    // Drop order matters: function pointers must not
-    // outlive the Library. Rust drops fields in
-    // declaration order so `entry_points` first, then
-    // `library`.
+    // Drop order matters: the function pointers must not
+    // outlive the code they point into. Rust drops fields
+    // in declaration order, so `entry_points` (plain
+    // pointers, no-op drop) first, then `backing` last —
+    // the `dlclose` / `munmap` happens after nothing can
+    // call through the shader anymore.
     /// Resolved entry-point function pointers.
     pub entry_points: ShaderEntryPoints,
     /// Parsed PC-map sidecar (if the `.pcmap` file
@@ -35,20 +37,53 @@ pub struct LoadedShader {
     /// pcmap-emission path landed; crash handlers
     /// downgrade to "no source attribution available."
     pub pcmap: Option<PcMap>,
-    /// The dlopen handle. Dropping unloads the `.so`.
-    /// Marked `_library` because we don't read it after
-    /// construction — its purpose is the Drop impl
-    /// (unload on shader eviction).
+    /// Whatever owns the executable code — a `dlopen`
+    /// handle (the legacy `.so` / Cranelift-fallback path)
+    /// or an `mmap`ed flat blob (the JIT-emit path). Held
+    /// purely for its `Drop`: dropping unloads / unmaps
+    /// the code. Must be the last field.
     #[allow(dead_code)]
-    library: libloading::Library,
+    backing: CodeBacking,
 }
 
-// SAFETY: libloading::Library is Send + Sync. The raw
-// function pointers in ShaderEntryPoints are just bytes;
-// calling them is the daemon's responsibility (it locks
-// per draw if it needs to).
+/// What owns the executable code behind a [`LoadedShader`].
+///
+/// Two artifact paths converge here: a `.so` loaded with
+/// `dlopen` (Cranelift-compiled shaders, until phase 4) or
+/// a flat `atrium-spv-blob` `mmap`ed `PROT_EXEC` (the
+/// bespoke JIT-emit path). Either way, dropping it
+/// releases the mapping.
+// The payloads are held purely for their `Drop` — nothing
+// ever reads them back out — so `dead_code` is expected.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) enum CodeBacking {
+    /// A `dlopen`ed shared library; drop = `dlclose`.
+    Dlopen(libloading::Library),
+    /// An `mmap`ed flat code blob; drop = `munmap`.
+    Jit(crate::jitmap::JitMapping),
+}
+
+// SAFETY: both backings are Send + Sync (libloading's
+// Library is; JitMapping is an immutable executable
+// mapping behind a raw pointer). The function pointers in
+// ShaderEntryPoints are just bytes; calling them is the
+// daemon's responsibility (it locks per draw if needed).
 unsafe impl Send for LoadedShader {}
 unsafe impl Sync for LoadedShader {}
+
+impl LoadedShader {
+    /// Assemble a `LoadedShader` from already-resolved
+    /// parts. Used by both load paths ([`open`] here and
+    /// [`crate::jitmap::open`]).
+    pub(crate) fn new(
+        entry_points: ShaderEntryPoints,
+        pcmap: Option<PcMap>,
+        backing: CodeBacking,
+    ) -> Self {
+        Self { entry_points, pcmap, backing }
+    }
+}
 
 /// Stage-specific entry-point function pointers.
 ///
@@ -153,9 +188,9 @@ pub(crate) fn open(
         )))
         .transpose()?;
 
-    Ok(LoadedShader {
-        entry_points: ShaderEntryPoints { vs_main, fs_main, cs_main },
+    Ok(LoadedShader::new(
+        ShaderEntryPoints { vs_main, fs_main, cs_main },
         pcmap,
-        library,
-    })
+        CodeBacking::Dlopen(library),
+    ))
 }

@@ -89,19 +89,29 @@ fn binary_compiles_constant_color_shader() {
         .expect("spawn atrium-spv-compile");
     assert!(status.success(), "binary exited non-zero: {status}");
 
-    // Verify the expected cache files exist.
-    let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
-    let so_path = output_dir.join(format!("{hash}.{ext}"));
+    // A constant-colour shader compiles via the bespoke
+    // backend, which now takes the JIT-emit path: the
+    // artifact is a flat `<hash>.afblob`, not a `cc`-linked
+    // `.so`. (Cranelift-fallback shaders still produce a
+    // `.so` — see binary_smoke's unsupported-capability
+    // test for that path.)
+    let blob_path = output_dir.join(format!("{hash}.afblob"));
     let pcmap_path = output_dir.join(format!("{hash}.pcmap"));
-    assert!(so_path.exists(),
-        "expected {} to exist after compile", so_path.display());
+    assert!(blob_path.exists(),
+        "expected {} to exist after compile", blob_path.display());
     assert!(pcmap_path.exists(),
         "expected {} to exist after compile", pcmap_path.display());
 
-    // Intermediate .o should be cleaned up by the binary.
+    // The blob path runs no linker, so neither an
+    // intermediate `.o` nor a `.so` should appear.
     let obj_path = output_dir.join(format!("{hash}.o"));
     assert!(!obj_path.exists(),
         "intermediate .o leaked into cache: {}", obj_path.display());
+    let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
+    let so_path = output_dir.join(format!("{hash}.{ext}"));
+    assert!(!so_path.exists(),
+        "bespoke JIT-emit path should not produce a .so: {}",
+        so_path.display());
 }
 
 #[test]

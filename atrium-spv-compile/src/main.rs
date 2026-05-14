@@ -53,7 +53,7 @@ use std::process::{Command, ExitCode};
 use std::time::Instant;
 
 use atrium_spv_backend_bespoke::{
-    compile as bespoke_compile, BackendError as BespokeError,
+    compile_blob as bespoke_compile_blob, BackendError as BespokeError,
     Target as BespokeTarget,
 };
 use atrium_spv_backend_cranelift::{compile as cranelift_compile, Target};
@@ -238,65 +238,89 @@ fn run(args: &Args) -> Result<CompileReport, CompileError> {
         Target::X86_64FreeBSD  => None,
     };
 
-    let t_backend = Instant::now();
-    let bespoke_output = match bespoke_target {
-        Some(bt) => match bespoke_compile(&module, bt) {
-            Ok(o) => Some(o),
-            Err(BespokeError::Unsupported(_)) => None, // fall back
-            Err(BespokeError::Internal(m)) =>
-                return Err(CompileError::Internal(format!("bespoke: {m}"))),
-        },
-        None => None,
+    // The two artifact shapes a backend can produce:
+    //   * Blob   — a flat `atrium-spv-blob`, written
+    //              straight to `<hash>.afblob`. No linker.
+    //              The bespoke JIT-emit path.
+    //   * Object — an ELF/Mach-O object, linked by `cc`
+    //              into `<hash>.so`. The Cranelift path
+    //              (until JIT-emit phase 4).
+    enum Artifact { Blob(Vec<u8>), Object(Vec<u8>) }
+
+    // Cranelift fallback, shared by the no-bespoke-target
+    // case and the bespoke-returned-Unsupported case.
+    let cranelift_path = || -> Result<(Artifact, Vec<u8>, &'static str), CompileError> {
+        match cranelift_compile(&module, args.target) {
+            Ok(o) => Ok((Artifact::Object(o.object), o.pcmap, "cranelift")),
+            Err(atrium_spv_backend_cranelift::BackendError::Unsupported(m)) =>
+                Err(CompileError::Unsupported(m)),
+            Err(other) =>
+                Err(CompileError::Internal(format!("cranelift: {other}"))),
+        }
     };
 
-    let (object, pcmap, backend_name): (Vec<u8>, Vec<u8>, &'static str) =
-        match bespoke_output {
-            Some(o) => (o.object, o.pcmap, "bespoke"),
-            None => match cranelift_compile(&module, args.target) {
-                Ok(o) => (o.object, o.pcmap, "cranelift"),
-                Err(atrium_spv_backend_cranelift::BackendError::Unsupported(m)) =>
-                    return Err(CompileError::Unsupported(m)),
-                Err(other) =>
-                    return Err(CompileError::Internal(format!("cranelift: {other}"))),
+    let t_backend = Instant::now();
+    let (artifact, pcmap, backend_name): (Artifact, Vec<u8>, &'static str) =
+        match bespoke_target {
+            Some(bt) => match bespoke_compile_blob(&module, bt) {
+                Ok(o) => (Artifact::Blob(o.blob), o.pcmap, "bespoke"),
+                Err(BespokeError::Unsupported(_)) => cranelift_path()?,
+                Err(BespokeError::Internal(m)) =>
+                    return Err(CompileError::Internal(
+                        format!("bespoke: {m}"))),
             },
+            None => cranelift_path()?,
         };
     // Includes the bespoke probe-then-fallback when it
     // happens — that's the real production cost, so time
     // the whole selection, not just the winning backend.
     let backend_us = t_backend.elapsed().as_micros();
 
-    // 5. Write object to temp file, link via `cc` into
-    // the cache directory under <hash>.so.
+    // 5. Write the artifact into the cache directory.
     std::fs::create_dir_all(&args.output_dir).map_err(|e|
         CompileError::Internal(format!(
             "creating output dir {}: {e}", args.output_dir.display(),
         )))?;
 
-    let obj_path = args.output_dir.join(format!("{hash}.o"));
-    std::fs::write(&obj_path, &object).map_err(|e|
-        CompileError::Internal(format!(
-            "writing {}: {e}", obj_path.display(),
-        )))?;
+    let (link_us, size_bytes) = match artifact {
+        Artifact::Blob(blob) => {
+            // The flat blob is the final artifact — the
+            // loader `mmap`s it directly. No linker, so
+            // `link_us` is zero (the ~99.5%-of-compile `cc`
+            // step is gone for the bespoke path).
+            let blob_path = args.output_dir.join(format!("{hash}.afblob"));
+            std::fs::write(&blob_path, &blob).map_err(|e|
+                CompileError::Internal(format!(
+                    "writing {}: {e}", blob_path.display())))?;
+            (0u128, blob.len())
+        }
+        Artifact::Object(object) => {
+            // Object → temp `.o` → `cc -shared` → `<hash>.so`.
+            let obj_path = args.output_dir.join(format!("{hash}.o"));
+            std::fs::write(&obj_path, &object).map_err(|e|
+                CompileError::Internal(format!(
+                    "writing {}: {e}", obj_path.display())))?;
+            let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
+            let so_path = args.output_dir.join(format!("{hash}.{ext}"));
+            let t_link = Instant::now();
+            link_to_shared_lib(&obj_path, &so_path)?;
+            let link_us = t_link.elapsed().as_micros();
+            // Cache only needs the `.so` + `.pcmap`.
+            let _ = std::fs::remove_file(&obj_path);
+            let size = std::fs::metadata(&so_path)
+                .map(|m| m.len() as usize).unwrap_or(0);
+            (link_us, size)
+        }
+    };
 
-    let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
-    let so_path = args.output_dir.join(format!("{hash}.{ext}"));
-    let t_link = Instant::now();
-    link_to_shared_lib(&obj_path, &so_path)?;
-    let link_us = t_link.elapsed().as_micros();
-    // Remove the intermediate object file — cache only
-    // needs the .so + .pcmap.
-    let _ = std::fs::remove_file(&obj_path);
-
-    // 6. Write pcmap sidecar.
+    // 6. Write pcmap sidecar (identical for both paths).
     let pcmap_path = args.output_dir.join(format!("{hash}.pcmap"));
     std::fs::write(&pcmap_path, &pcmap).map_err(|e|
         CompileError::Internal(format!(
             "writing {}: {e}", pcmap_path.display(),
         )))?;
 
-    let so_size = std::fs::metadata(&so_path)
-        .map(|m| m.len() as usize)
-        .unwrap_or(0);
+    let so_size = size_bytes;
     let elapsed_ms = t0.elapsed().as_millis();
 
     Ok(CompileReport {

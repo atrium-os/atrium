@@ -39,8 +39,11 @@
 use std::ptr;
 
 use atrium_spv_blob::ShaderBlob;
+use atrium_spv_pcmap::PcMap;
 
-use crate::dlopen::{CsMain, FsMain, ShaderEntryPoints, VsMain};
+use crate::dlopen::{
+    CodeBacking, CsMain, FsMain, LoadedShader, ShaderEntryPoints, VsMain,
+};
 use crate::LoadError;
 
 /// An executable mapping of a shader blob's code.
@@ -137,6 +140,26 @@ pub(crate) fn map_blob(blob: &ShaderBlob)
     }
 
     Ok((JitMapping { base, len }, entry_points))
+}
+
+/// Load a flat shader blob into a [`LoadedShader`] — the
+/// JIT-emit counterpart of [`crate::dlopen::open`].
+///
+/// `blob_bytes` is the contents of a `<hash>.afblob` cache
+/// file; `pcmap_bytes` the optional `<hash>.pcmap` sidecar.
+pub(crate) fn open(
+    blob_bytes: &[u8],
+    pcmap_bytes: Option<&[u8]>,
+) -> Result<LoadedShader, LoadError> {
+    let blob = ShaderBlob::from_bytes(blob_bytes)
+        .map_err(|e| LoadError::Internal(format!("parsing shader blob: {e}")))?;
+    let (mapping, entry_points) = map_blob(&blob)?;
+    let pcmap = pcmap_bytes
+        .map(|b| PcMap::from_bytes(b).map_err(|e| LoadError::Internal(
+            format!("parsing pcmap: {e}"),
+        )))
+        .transpose()?;
+    Ok(LoadedShader::new(entry_points, pcmap, CodeBacking::Jit(mapping)))
 }
 
 /// FreeBSD / Linux: `mmap` RW, copy, flush the icache,

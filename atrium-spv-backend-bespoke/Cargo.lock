@@ -18,6 +18,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 name = "atrium-spv-backend-bespoke"
 version = "0.1.0"
 dependencies = [
+ "atrium-spv-blob",
  "atrium-spv-frontend",
  "atrium-spv-ir",
  "atrium-spv-pcmap",
@@ -28,6 +29,10 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
 ]
+
+[[package]]
+name = "atrium-spv-blob"
+version = "0.1.0"
 
 [[package]]
 name = "atrium-spv-frontend"
