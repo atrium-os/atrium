@@ -13,6 +13,7 @@
 //!   emit_freebsd_obj <out.o> loop <n>   -- counted-loop sum check
 //!   emit_freebsd_obj <out.o> arith <n>  -- out = (n*2+1)*0.125
 //!   emit_freebsd_obj <out.o> bitwise <n>-- nibble/xor/or extract
+//!   emit_freebsd_obj <out.o> vecarith   -- (a+b)*(a-b) over vec4s
 //!
 //! stdout is always the expected RGBA for the chosen
 //! shader+input, so the in-VM harness can diff against it
@@ -338,6 +339,55 @@ fn build_bitwise_spirv() -> Vec<u8> {
     bytes
 }
 
+/// Vector arithmetic over constant vec4s:
+///   a = [0.5, 1.0, 1.5, 2.0]   b = [0.25, 0.5, 0.5, 1.0]
+///   out = (a + b) * (a - b)        (= a^2 - b^2)
+/// No control flow, no push-const. Exercises per-lane
+/// `FAdd` / `FSub` / `FMul` and the V-reg vector lane
+/// allocator across three chained vec4 ops. All inputs
+/// are halves/quarters so every lane result is exact in
+/// f32. On-target twin of the host `three_way_vec_arithmetic`
+/// differential test.
+fn build_vecarith_spirv() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let a = [0.5f32, 1.0, 1.5, 2.0];
+    let bvec = [0.25f32, 0.5, 0.5, 1.0];
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let f32_ty = b.type_float(32, None);
+    let vec4 = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let ptr_out = b.type_pointer(None, StorageClass::Output, vec4);
+    let ca: Vec<_> = a.iter().map(|x| b.constant_bit32(f32_ty, x.to_bits())).collect();
+    let cb: Vec<_> = bvec.iter().map(|x| b.constant_bit32(f32_ty, x.to_bits())).collect();
+    let va = b.constant_composite(vec4, ca);
+    let vb = b.constant_composite(vec4, cb);
+    let out = b.variable(ptr_out, None, StorageClass::Output, None);
+    b.decorate(out, Decoration::Location,
+               vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let sum  = b.f_add(vec4, None, va, vb).unwrap();
+    let diff = b.f_sub(vec4, None, va, vb).unwrap();
+    let prod = b.f_mul(vec4, None, sum, diff).unwrap();
+    b.store(out, prod, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![out]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let path = args.next()
@@ -396,6 +446,14 @@ fn main() {
             let xor = (n ^ 0xAA) as f32 / 256.0;
             let or_ = (n | 0x10) as f32 / 256.0;
             (build_bitwise_spirv(), [hi, lo, xor, or_])
+        }
+        "vecarith" => {
+            // (a+b)*(a-b) for the hardcoded constant vec4s.
+            let a = [0.5f32, 1.0, 1.5, 2.0];
+            let bv = [0.25f32, 0.5, 0.5, 1.0];
+            let mut e = [0.0f32; 4];
+            for i in 0..4 { e[i] = (a[i] + bv[i]) * (a[i] - bv[i]); }
+            (build_vecarith_spirv(), e)
         }
         other => {
             eprintln!("unknown shader kind: {other}");

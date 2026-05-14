@@ -28,6 +28,10 @@
 #     const: AShr, BitAnd, BitXor, BitOr + ConvertSToF +
 #     FDiv, all power-of-two normalised. On-target twin of
 #     the host three_way_bitwise_and_shift differential test.
+#   * vecarith — (a+b)*(a-b) over two constant vec4s: per-
+#     lane FAdd/FSub/FMul + the V-reg vector lane allocator
+#     across three chained vec4 ops. On-target twin of the
+#     host three_way_vec_arithmetic differential test.
 #
 # Prereqs: the dev VM is up (scripts/run-vm.sh) and
 # reachable on localhost:2222 with the fresco_bsd key.
@@ -89,6 +93,7 @@ verify "arith n=3"    "3 int"   arith 3
 verify "arith n=1"    "1 int"   arith 1
 verify "bitwise 0x53" "83 int"  bitwise 83
 verify "bitwise 0xC1" "193 int" bitwise 193
+verify "vecarith"     ""        vecarith
 
 if [ "$FAILED" = "0" ]; then
   echo "==> PASS — bespoke ELF + AAPCS64 codegen verified on FreeBSD aarch64"
