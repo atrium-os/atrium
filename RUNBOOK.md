@@ -2463,28 +2463,23 @@ In priority order (impact × inverse-risk):
    `fmov`/`mov` is elided. These moves sat *on* the
    loop-carried dependency chain — this was the real
    runtime lever, as the disasm analysis predicted.
-5. **Register spilling / pressure relief.** ⏳ **NEXT — its
-   own focused effort.** A hard limit: a four-accumulator
-   `heavy` variant fails to compile ("linear-scan RA ran
-   out of V-regs"). Two routes, decision pending:
-   * **Extend the V-reg pool into V8..V15** (callee-saved
-     per AAPCS64) — mirrors the existing W19..W28
-     callee-saved-integer mechanism: prologue `stp d`,
-     epilogue `ldp d`. Low-risk, ~16→24 f32 regs, covers
-     virtually all real shaders, but needs `stp_d_pre` /
-     `ldp_d_post` encoders added to pptk first.
-   * **True spill/reload** — unbounded, but invasive:
-     every operand-fetch site must reload-if-spilled, and
-     the victim-selection + stack-slot machinery touches
-     the whole allocator.
-   Recommended: ship the V8..V15 extension first (raises
-   the ceiling enough that true spilling becomes a rare-
-   case completeness item), then true spilling as a
-   separate arc. Needed before bespoke can be the
-   *default* for arbitrary shaders instead of falling back
-   to Cranelift on pressure.
+5. **Register pressure relief — V8..V15 extension.** ✅
+   **DONE** (pptk `b513d15`, atrium `7a25c72`). The
+   linear-scan RA aborted once f32 pressure exceeded the
+   16 caller-saved V16..V31 — a four-accumulator loop
+   failed to compile outright. Route A: added V8..V15 as
+   an overflow tier, mirroring the W19..W28 callee-saved-
+   integer mechanism (prologue `stp d`, epilogue `ldp d`,
+   via new pptk encoders). f32 ceiling 16 → 24, covering
+   essentially all real fragment shaders. The new `heavy4`
+   shader (four accumulators, five Phis) is the proof:
+   it overflowed before, now compiles — verified bit-exact
+   in the three-way differential (`three_way_heavy4`) and
+   executing correctly on the FreeBSD/aarch64 target.
+   *True unbounded spill/reload* remains future work, but
+   is now a rare-case completeness item, not a blocker.
 
-#### Result after opts #1–#4
+#### Result after opts #1–#5
 
 `heavy` shader runtime, bespoke vs Cranelift (`Nx`, >1 =
 bespoke faster):
@@ -2501,8 +2496,15 @@ with Cranelift on the heavy loop (1.00x, host agrees)
 **while still compiling ~4.7× faster** — it now earns its
 complexity. Opt #4 was the real runtime lever (the
 loop-carried Phi `fmov`s); #1/#2/#3 are code-size and
-register-pressure hygiene. The full in-VM verification
-suite (codegen / compile chain / loader cache / pcmap) and
-24/24 three-way differential tests pass with all four
-optimisations applied. #5 (register pressure) is the
-remaining structural item.
+register-pressure hygiene; #5 lifts the f32 register
+ceiling 16 → 24 so register-pressured shaders compile on
+the bespoke path instead of falling back to Cranelift.
+
+All five verified together: the full in-VM verification
+suite (codegen / compile chain / loader cache / pcmap),
+the `run-bench.sh` corpus, and **25/25 three-way
+differential tests** — including `heavy` and the
+register-pressure `heavy4` — pass bit-exact against the
+interpreter oracle. The bespoke backend's headline
+justification — steady-state hand-written-ARM64 perf — is
+now demonstrated, not just asserted.
