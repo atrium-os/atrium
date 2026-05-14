@@ -44,7 +44,7 @@ VM_BIN="$WS/atrium-spv-compile/target/aarch64-unknown-freebsd/release/examples/b
 CORPUS='
 const|const||
 ifelse|ifelse|0.2|
-loop|loop|64 int|
+loop|loop|64 int|native/loop.c
 switch|switch|2 int|
 arith|arith|7 int|
 bitwise|bitwise|0x53 int|
@@ -55,6 +55,7 @@ cextract|cextract||
 phi|phi|0.2|
 unordcmp|unordcmp|0.2|
 heavy|heavy|512 int|native/heavy.c
+heavy4|heavy4|256 int|native/heavy4.c
 '
 
 echo "==> building bench_driver (host release + FreeBSD aarch64 cross)"
