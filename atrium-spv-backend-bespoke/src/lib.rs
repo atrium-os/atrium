@@ -499,6 +499,56 @@ fn emit_function(func: &Function) -> Result<Vec<u8>, BackendError> {
             Op::FOrdGe(a_v, b_v) => emit_fcmp_to_bool(
                 &mut a, &scalars, &mut bools, &mut next_bool_w,
                 inst, a_v, b_v, asm::Cond::Ge)?,
+            // OpVectorShuffle: produce a new vector by
+            // picking per-output-lane indices into
+            // src1 ++ src2. With our per-lane S-reg
+            // storage this is pure aliasing — each output
+            // lane reuses an existing source S-reg, so no
+            // new V-regs are allocated (modulo 0xFFFFFFFF
+            // "Undefined" slots which materialise a 0.0).
+            Op::VectorShuffle { src1, src2, components } => {
+                let s1 = vectors.get(&src1.id).cloned().ok_or_else(||
+                    BackendError::Unsupported(format!(
+                        "VectorShuffle src1 {:?} not a vec", src1.id)))?;
+                let s2 = vectors.get(&src2.id).cloned().ok_or_else(||
+                    BackendError::Unsupported(format!(
+                        "VectorShuffle src2 {:?} not a vec", src2.id)))?;
+                let combined = s1.len() + s2.len();
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal("VectorShuffle without result".into()))?;
+                let mut out_lanes = Vec::with_capacity(components.len());
+                for c in components {
+                    if *c == 0xFFFF_FFFF {
+                        // Undefined → zero. Materialise a
+                        // fresh S-reg holding 0.0 (movz w,0
+                        // + fmov_s_from_w) for B3 well-
+                        // definedness.
+                        let synth = ValueId(next_synth_id);
+                        next_synth_id += 1;
+                        let v = alloc_vreg(&mut free_pool, &mut owners, synth)?;
+                        a.emit(asm::movz_w(w_tmp, 0, 0));
+                        a.emit(asm::fmov_s_from_w(v, w_tmp));
+                        scalars.insert(synth, v);
+                        out_lanes.push(Value { id: synth, ty: Type::F32 });
+                        continue;
+                    }
+                    let idx = *c as usize;
+                    if idx >= combined {
+                        return Err(BackendError::Unsupported(format!(
+                            "VectorShuffle component {idx} out of range \
+                             (combined len {combined})")));
+                    }
+                    let src_lane = if idx < s1.len() {
+                        s1[idx].clone()
+                    } else {
+                        s2[idx - s1.len()].clone()
+                    };
+                    // Alias: reuse the existing lane Value
+                    // (and its V-reg). No fmov needed.
+                    out_lanes.push(src_lane);
+                }
+                vectors.insert(result.id, out_lanes);
+            }
             // OpDot: scalar = Σ a_i * b_i. Lowers to one
             // fmul_s for the first lane + (fmul_s + fadd_s)
             // per additional lane.
@@ -1073,6 +1123,18 @@ fn compute_last_use_flat(insts: &[&atrium_spv_ir::Inst]) -> HashMap<ValueId, usi
                     for lid in &lanes { mark(*lid); }
                 }
                 if let Some(lanes) = vec_lanes.get(&r.id).cloned() {
+                    for lid in &lanes { mark(*lid); }
+                }
+            }
+            Op::VectorShuffle { src1, src2, .. } => {
+                mark(src1.id); mark(src2.id);
+                // Shuffle aliases lanes — they must stay
+                // live forever past this op since the
+                // shuffle result reuses their V-regs.
+                if let Some(lanes) = vec_lanes.get(&src1.id).cloned() {
+                    for lid in &lanes { mark(*lid); }
+                }
+                if let Some(lanes) = vec_lanes.get(&src2.id).cloned() {
                     for lid in &lanes { mark(*lid); }
                 }
             }
