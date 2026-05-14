@@ -2521,33 +2521,46 @@ builds: `-ffp-contract=off` (same arithmetic as the
 backends) and plain `-O2` (the true ceiling, FMA-fused —
 results no longer bit-identical).
 
-`heavy` shader, in-VM (FreeBSD/aarch64), ns/call:
+Three native references now (`verify/native/{heavy,heavy4,
+loop}.c`), in-VM (FreeBSD/aarch64), ns/call:
 
-| contender                | ns    | vs bespoke |
-|--------------------------|-------|------------|
-| bespoke                  | 1085  | —          |
-| Cranelift                | 1083  | 1.00×      |
-| `clang -O2 -ffp-contract=off` | 1685  | bespoke **1.55× faster** |
-| `clang -O2` (FMA)        | 1146  | bespoke **1.06× faster** |
+| shader  | bespoke | Cranelift | clang-O2 strict | clang-O2 fma |
+|---------|---------|-----------|-----------------|--------------|
+| heavy   | 996     | 999       | 1536            | 1054         |
+| heavy4  | 658     | **536**   | 1107            | 1046         |
+| loop    | 34      | 34        | **0.96**        | 0.97         |
 
-**There is effectively no gap.** On this shader the
-bespoke backend matches or slightly beats `clang -O2`.
-clang's strict build is *slower* because its
-auto-vectoriser packed the serial dependency-chain loop
-into 2-lane SIMD with per-iteration cross-lane shuffles
-that cost more than they saved; the FMA build (clang's
-genuine best) is a near dead heat. Host numbers agree
-within ~5%.
+The single "no gap" headline from `heavy` does **not**
+cleanly generalise — the three shapes tell three stories:
 
-> **Caveat — this is one shader.** `heavy` is a scalar FP
-> dependency-chain loop, a shape that resists
-> vectorisation. "No gap on `heavy`" is *not* "no gap
-> everywhere": a shader with independent per-pixel work
-> would let clang's vectoriser actually win, and texture
-> sampling / heavy vector math are unmeasured. Generalising
-> the claim needs more native references (vector-heavy,
-> control-flow-heavy). What's proven: on the one shader
-> with real signal, bespoke is at the `clang -O2` bar.
+* **`heavy`** (2-accumulator scalar-FP dependency chain) —
+  bespoke ≈ Cranelift ≈ clang. No gap. clang's strict
+  build is even *slower* (1536) because its auto-vectoriser
+  mis-packed the serial loop into 2-lane SIMD with
+  per-iteration cross-lane shuffles.
+* **`heavy4`** (4 accumulators — register pressure, more
+  ILP) — bespoke **1.22× slower than Cranelift** (658 vs
+  536). Both still beat clang (same auto-vec misfire), but
+  *bespoke lost its parity with Cranelift here.* Under
+  real register pressure — the V8..V15 spill tier, more
+  simultaneously-live values — the single-pass linear-scan
+  shows seams that opts #1–#5 didn't reach. **This is the
+  measured weak spot.**
+* **`loop`** (counted integer sum) — bespoke ≈ Cranelift,
+  both **~35× slower than clang**. Not a codegen-quality
+  gap: `clang -O2` strength-reduces `for i in 0..n: acc+=i`
+  to the closed form `n*(n-1)/2` (O(1)); neither fast-tier
+  backend does loop-idiom recognition. A whole *category*
+  of optimisation, shared-absent in both.
+
+So the honest picture: bespoke is at the `clang -O2` bar
+for straight scalar-FP work; it trails *Cranelift* under
+register pressure; and loop-idiom recognition is an
+unattempted category for both fast-tier backends. The next
+optimisation pass has a measured target (heavy4 / register
+pressure) instead of a guess. Still unmeasured: vector-
+heavy loops (blocked — bespoke has no vec Phi yet) and
+texture/sampler-heavy shaders.
 
 #### Compile-pipeline phase breakdown — `cc` is the cost
 
