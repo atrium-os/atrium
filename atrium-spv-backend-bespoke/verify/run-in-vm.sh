@@ -32,6 +32,12 @@
 #     lane FAdd/FSub/FMul + the V-reg vector lane allocator
 #     across three chained vec4 ops. On-target twin of the
 #     host three_way_vec_arithmetic differential test.
+#   * switch — switch(n){0:red 1:green 2:blue default:white}
+#     from an i32 push-const: OpSwitch multi-target jump
+#     codegen + a 5-block CFG with four branch relocations.
+#     Driven with n=0 (a case), n=2 (last case), n=7
+#     (default) so the case path and the fall-through both
+#     run. On-target twin of the host three_way_switch_*.
 #
 # Prereqs: the dev VM is up (scripts/run-vm.sh) and
 # reachable on localhost:2222 with the fresco_bsd key.
@@ -94,6 +100,9 @@ verify "arith n=1"    "1 int"   arith 1
 verify "bitwise 0x53" "83 int"  bitwise 83
 verify "bitwise 0xC1" "193 int" bitwise 193
 verify "vecarith"     ""        vecarith
+verify "switch n=0"   "0 int"   switch 0
+verify "switch n=2"   "2 int"   switch 2
+verify "switch n=7"   "7 int"   switch 7
 
 if [ "$FAILED" = "0" ]; then
   echo "==> PASS — bespoke ELF + AAPCS64 codegen verified on FreeBSD aarch64"

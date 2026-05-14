@@ -2104,7 +2104,7 @@ What it does:
    fragment ABI and prints the RGBA.
 4. Compares VM output against the host-side expected value.
 
-The script covers six shaders:
+The script covers seven shaders:
 * **const** — constant-colour store: exercises the ELF object
   format, the exported symbol, and the Store path.
 * **ifelse** — `if (push_const.scale < 0.5) red else blue`:
@@ -2135,6 +2135,13 @@ The script covers six shaders:
   vector lane allocator across three chained vec4 ops. The
   on-target twin of the host `three_way_vec_arithmetic`
   differential test.
+* **switch** — `switch (n) { 0:red 1:green 2:blue
+  default:white }` from an i32 push-const: `OpSwitch`
+  multi-target jump codegen + a 5-block CFG with four
+  branch relocations converging on a merge block. Driven
+  with `n=0` (a case), `n=2` (last case), `n=7` (default)
+  so the case path and the fall-through both run. On-target
+  twin of the host `three_way_switch_*` differential tests.
 
 Verified 2026-05-14 on FreeBSD 16.0-CURRENT arm64:
 ```
@@ -2148,6 +2155,9 @@ PASS  arith n=1    -> [0.375 0.375 0.375 1]
 PASS  bitwise 0x53 -> [0.3125 0.1875 0.97265625 0.32421875]
 PASS  bitwise 0xC1 -> [0.75 0.0625 0.41796875 0.81640625]
 PASS  vecarith     -> [0.1875 0.75 2 3]
+PASS  switch n=0   -> [1 0 0 1]
+PASS  switch n=2   -> [0 0 1 1]
+PASS  switch n=7   -> [1 1 1 1]
 ```
 The harness prints with `%.9g`, not the default `%g` —
 `%g` caps at 6 significant digits, so an exact value like
