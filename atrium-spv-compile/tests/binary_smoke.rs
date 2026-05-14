@@ -187,6 +187,9 @@ fn binary_emits_metrics_json_on_stderr() {
     // Cranelift fallback.
     assert!(stderr.contains("\"backend\":\"bespoke\""),
             "expected bespoke backend, got: {stderr}");
-    assert!(stderr.contains("\"compile_ms\":"));
+    // Microsecond resolution: with `cc` gone the whole
+    // compile is sub-millisecond, so `compile_ms` would
+    // truncate to a near-useless integer.
+    assert!(stderr.contains("\"compile_us\":"));
     assert!(stderr.contains("\"size_bytes\":"));
 }

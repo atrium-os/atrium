@@ -28,7 +28,7 @@
 //! the schema for continuity:
 //!
 //! ```json
-//! {"shader_hash":"abc...","backend":"bespoke","compile_ms":1,"frontend_us":600,"backend_us":240,"link_us":0,"size_bytes":292}
+//! {"shader_hash":"abc...","backend":"bespoke","compile_us":870,"frontend_us":600,"backend_us":240,"link_us":0,"size_bytes":292}
 //! ```
 //!
 //! # Exit codes
@@ -91,11 +91,11 @@ fn main() -> ExitCode {
             let _ = writeln!(
                 std::io::stderr(),
                 "{{\"shader_hash\":\"{}\",\"backend\":\"{}\",\
-                  \"compile_ms\":{},\"frontend_us\":{},\
+                  \"compile_us\":{},\"frontend_us\":{},\
                   \"backend_us\":{},\"link_us\":{},\
                   \"size_bytes\":{}}}",
                 report.shader_hash, report.backend,
-                report.compile_ms, report.frontend_us,
+                report.compile_us, report.frontend_us,
                 report.backend_us, report.link_us,
                 report.size_bytes,
             );
@@ -184,11 +184,17 @@ fn print_usage() {
 struct CompileReport {
     shader_hash: String,
     backend: &'static str,
-    compile_ms: u128,
+    /// Total compile wall clock, **microseconds**. Was
+    /// `compile_ms` until `cc` was removed (JIT-emit phase
+    /// 4) dropped the whole pipeline into sub-millisecond
+    /// territory — millisecond resolution truncated both
+    /// backends to "1" and hid the real ~2–4× backend
+    /// difference. Microseconds keeps it visible.
+    compile_us: u128,
     /// Per-phase breakdown of the wall clock, microseconds:
-    /// frontend (SPIR-V → IR), backend (IR → object), link
-    /// (`cc` object → `.so`). Reading + hashing + file I/O
-    /// is the small remainder.
+    /// frontend (SPIR-V → IR), backend (IR → object/blob),
+    /// link (`cc`; always 0 now). Reading + hashing + file
+    /// I/O is the small remainder.
     frontend_us: u128,
     backend_us: u128,
     link_us: u128,
@@ -305,12 +311,12 @@ fn run(args: &Args) -> Result<CompileReport, CompileError> {
         )))?;
 
     let so_size = size_bytes;
-    let elapsed_ms = t0.elapsed().as_millis();
+    let elapsed_us = t0.elapsed().as_micros();
 
     Ok(CompileReport {
         shader_hash: hash,
         backend: backend_name,
-        compile_ms: elapsed_ms,
+        compile_us: elapsed_us,
         frontend_us,
         backend_us,
         link_us,
