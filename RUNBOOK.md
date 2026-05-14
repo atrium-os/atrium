@@ -2233,18 +2233,26 @@ So this exercises the production binary's argument handling,
 the **bespoke-first / Cranelift-fallback selection**, the
 in-VM linker invocation, and the `.pcmap` sidecar — the
 whole chain the daemon's `Tier2Backend` shells out to, on
-the real target. The script also parses the `"backend"`
-field from the binary's G7 metrics line and prints it, so a
-silent regression to the Cranelift fallback is visible.
+the real target. Each row asserts *which* backend the
+binary's G7 metrics line reports, so a silent regression
+to the Cranelift fallback (or a broken bespoke path) fails
+the row — not just diverging pixels.
+
+The corpus includes a deliberate **fallback probe**: the
+`unordcmp` shader uses `OpFUnordLessThan`, which the
+bespoke backend has no arm for. `atrium-spv-compile` must
+fall back to Cranelift for it — the row asserts
+`backend=cranelift` *and* correct pixels, exercising the
+production fallback path on-target.
 
 `emit_freebsd_obj` gained a `spirv` mode (`emit_freebsd_obj
 <out.spv> spirv <kind> [args]`) that writes the raw SPIR-V
 module instead of a compiled object, so the e2e script
 reuses the same shader builders as `run-in-vm.sh`.
 
-Verified 2026-05-14 on FreeBSD 16.0-CURRENT arm64 — all
-seven shaders compiled by the production binary on-target,
-all `backend=bespoke`:
+Verified 2026-05-14 on FreeBSD 16.0-CURRENT arm64 — seven
+shaders on the bespoke path, two on the Cranelift fallback,
+all pixel-correct:
 ```
 PASS  const        -> [0.125 0.375 0.625 1]   (backend=bespoke)
 PASS  ifelse then  -> [1 0 0 1]               (backend=bespoke)
@@ -2253,4 +2261,6 @@ PASS  loop n=5     -> [1 1 1 1]               (backend=bespoke)
 PASS  loop n=4     -> [0 0 0 1]               (backend=bespoke)
 PASS  switch n=1   -> [0 1 0 1]               (backend=bespoke)
 PASS  switch n=9   -> [1 1 1 1]               (backend=bespoke)
+PASS  unordcmp lt  -> [1 0 0 1]               (backend=cranelift)
+PASS  unordcmp ge  -> [0 0 1 1]               (backend=cranelift)
 ```

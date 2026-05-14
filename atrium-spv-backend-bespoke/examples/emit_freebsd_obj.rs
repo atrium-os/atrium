@@ -19,6 +19,8 @@
 //!   emit_freebsd_obj <out.o> shuffle    -- OpVectorShuffle (bgra)
 //!   emit_freebsd_obj <out.o> cextract   -- OpCompositeExtract
 //!   emit_freebsd_obj <out.o> dot        -- OpDot + VectorTimesScalar
+//!   emit_freebsd_obj <out.o> unordcmp <s> -- OpFUnordLessThan (bespoke
+//!                                            Unsupported -> Cranelift)
 //!
 //! Prefix any kind with `spirv` to write the raw SPIR-V
 //! module instead of a compiled object (for the end-to-end
@@ -688,6 +690,76 @@ fn build_dot_spirv() -> Vec<u8> {
     bytes
 }
 
+/// `if (push_const.scale `OpFUnordLessThan` 0.5) red else
+/// blue`. Structurally identical to the `ifelse` shader,
+/// but uses the *unordered* float compare. The bespoke
+/// backend has no `Op::FUnordLt` arm, so it returns
+/// `Unsupported` for this shader — which makes it the
+/// fallback probe: through `atrium-spv-compile` it must
+/// land on the Cranelift backend instead. For finite
+/// (non-NaN) inputs FUnordLt and FOrdLt agree, so the
+/// expected pixels are the same as `ifelse`.
+fn build_unordcmp_spirv() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, SelectionControl,
+        StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let f32_ty = b.type_float(32, None);
+    let bool_ty = b.type_bool();
+    let i32_ty = b.type_int(32, 1);
+    let vec4 = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let pc_struct = b.type_struct(vec![f32_ty]);
+    b.member_decorate(pc_struct, 0, Decoration::Offset,
+                      vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(pc_struct, Decoration::Block, vec![]);
+    let ptr_pc_struct = b.type_pointer(None, StorageClass::PushConstant, pc_struct);
+    let ptr_pc_f32    = b.type_pointer(None, StorageClass::PushConstant, f32_ty);
+    let ptr_out       = b.type_pointer(None, StorageClass::Output, vec4);
+    let zero_i = b.constant_bit32(i32_ty, 0u32);
+    let c0  = b.constant_bit32(f32_ty, 0.0f32.to_bits());
+    let c05 = b.constant_bit32(f32_ty, 0.5f32.to_bits());
+    let c1  = b.constant_bit32(f32_ty, 1.0f32.to_bits());
+    let red  = b.constant_composite(vec4, vec![c1, c0, c0, c1]);
+    let blue = b.constant_composite(vec4, vec![c0, c0, c1, c1]);
+    let pc_var = b.variable(ptr_pc_struct, None, StorageClass::PushConstant, None);
+    let out = b.variable(ptr_out, None, StorageClass::Output, None);
+    b.decorate(out, Decoration::Location,
+               vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let p = b.access_chain(ptr_pc_f32, None, pc_var, vec![zero_i]).unwrap();
+    let v = b.load(f32_ty, None, p, None, vec![]).unwrap();
+    let cond = b.f_unord_less_than(bool_ty, None, v, c05).unwrap();
+    let then_id = b.id();
+    let else_id = b.id();
+    let merge_id = b.id();
+    b.selection_merge(merge_id, SelectionControl::NONE).unwrap();
+    b.branch_conditional(cond, then_id, else_id, vec![]).unwrap();
+    b.begin_block(Some(then_id)).unwrap();
+    b.store(out, red, None, vec![]).unwrap();
+    b.branch(merge_id).unwrap();
+    b.begin_block(Some(else_id)).unwrap();
+    b.store(out, blue, None, vec![]).unwrap();
+    b.branch(merge_id).unwrap();
+    b.begin_block(Some(merge_id)).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![out]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let path = args.next()
@@ -801,6 +873,21 @@ fn main() {
             let bv = [0.5f32, 0.5, 0.5, 1.0];
             let d: f32 = (0..4).map(|i| a[i] * bv[i]).sum();
             (build_dot_spirv(), [a[0]*bv[0], a[1]*bv[1], a[2]*bv[2], d])
+        }
+        "unordcmp" => {
+            // Same pixels as `ifelse` for finite inputs,
+            // but uses OpFUnordLessThan — bespoke returns
+            // Unsupported, so this probes the Cranelift
+            // fallback path through atrium-spv-compile.
+            let scale: f32 = args.next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.2);
+            let expected = if scale < 0.5 {
+                [1.0, 0.0, 0.0, 1.0]   // red
+            } else {
+                [0.0, 0.0, 1.0, 1.0]   // blue
+            };
+            (build_unordcmp_spirv(), expected)
         }
         other => {
             eprintln!("unknown shader kind: {other}");

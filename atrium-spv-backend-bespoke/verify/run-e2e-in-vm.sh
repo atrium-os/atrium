@@ -57,9 +57,13 @@ ssh -i "$KEY" $SSHOPTS -p 2222 root@localhost \
 
 FAILED=0
 
-# verify <label> <harness-pc-args> <emit-kind> [emit-args...]
+# verify <label> <expect-backend> <harness-pc-args> <emit-kind> [emit-args...]
+#   <expect-backend> is "bespoke" or "cranelift" — the
+#   backend atrium-spv-compile's metrics line must report.
+#   A mismatch (e.g. a shader silently falling back, or a
+#   regression that breaks the bespoke path) fails the row.
 verify() {
-  label=$1; pc=$2; shift 2
+  label=$1; want_backend=$2; pc=$3; shift 3
   expected=$(cd "$CRATE" && \
     cargo run --quiet --example emit_freebsd_obj "$SPV" spirv "$@" 2>/dev/null)
   if [ -z "$expected" ]; then
@@ -83,22 +87,31 @@ verify() {
   backend=$(ssh -i "$KEY" $SSHOPTS -p 2222 root@localhost \
     "sed -n 's/.*\"backend\":\"\\([a-z]*\\)\".*/\\1/p' /tmp/atrium_e2e.json" \
     2>/dev/null)
-  if [ "$got" = "$expected" ]; then
-    echo "  PASS  $label  -> [$got]  (backend=$backend)"
-  else
+  if [ "$got" != "$expected" ]; then
     echo "  FAIL  $label  expected [$expected] got [$got]  (backend=$backend)"
     FAILED=1
+  elif [ "$backend" != "$want_backend" ]; then
+    echo "  FAIL  $label  pixels OK [$got] but backend=$backend, wanted $want_backend"
+    FAILED=1
+  else
+    echo "  PASS  $label  -> [$got]  (backend=$backend)"
   fi
 }
 
 echo "==> end-to-end in-VM verification (FreeBSD aarch64, localhost:2222)"
-verify "const"        ""        const
-verify "ifelse then"  "0.2"     ifelse 0.2
-verify "ifelse else"  "0.8"     ifelse 0.8
-verify "loop n=5"     "5 int"   loop 5
-verify "loop n=4"     "4 int"   loop 4
-verify "switch n=1"   "1 int"   switch 1
-verify "switch n=9"   "9 int"   switch 9
+#       label          backend     pc        kind   [args]
+verify "const"        bespoke   ""        const
+verify "ifelse then"  bespoke   "0.2"     ifelse 0.2
+verify "ifelse else"  bespoke   "0.8"     ifelse 0.8
+verify "loop n=5"     bespoke   "5 int"   loop 5
+verify "loop n=4"     bespoke   "4 int"   loop 4
+verify "switch n=1"   bespoke   "1 int"   switch 1
+verify "switch n=9"   bespoke   "9 int"   switch 9
+# OpFUnordLessThan: bespoke has no arm for it, so the
+# production binary must fall back to Cranelift and still
+# produce correct pixels — the fallback-path probe.
+verify "unordcmp lt"  cranelift "0.2"     unordcmp 0.2
+verify "unordcmp ge"  cranelift "0.8"     unordcmp 0.8
 
 if [ "$FAILED" = "0" ]; then
   echo "==> PASS — production atrium-spv-compile chain verified on FreeBSD aarch64"
