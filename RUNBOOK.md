@@ -2325,19 +2325,21 @@ sh atrium-spv-backend-bespoke/verify/run-pcmap-e2e-in-vm.sh
 
 Verified 2026-05-14 on FreeBSD 16.0-CURRENT arm64 — the
 sidecar the production compile binary emits round-trips
-cleanly through the loader's parser on-target:
+cleanly through the loader's parser on-target, with real
+per-instruction entries:
 ```
-PASS  const     -> pcmap present entries=1 first_spirv=0 last_host=0
-PASS  ifelse    -> pcmap present entries=1 first_spirv=0 last_host=0
-PASS  loop      -> pcmap present entries=1 first_spirv=0 last_host=0
-PASS  switch    -> pcmap present entries=1 first_spirv=0 last_host=0
-PASS  unordcmp  -> pcmap present entries=1 first_spirv=436 last_host=0
+PASS  const     -> pcmap present entries=7  first_spirv=0   last_host=100
+PASS  ifelse    -> pcmap present entries=15 first_spirv=0   last_host=156
+PASS  loop      -> pcmap present entries=21 first_spirv=0   last_host=160
+PASS  switch    -> pcmap present entries=19 first_spirv=0   last_host=220
+PASS  unordcmp  -> pcmap present entries=1  first_spirv=436 last_host=0
 ```
 
-> Observed: the **bespoke** backend emits only a single
-> stub pcmap entry (`push(0, first_offset)`), so crash
-> triage on bespoke-compiled shaders can't attribute past
-> the first instruction. The sidecar *format* round-trips
-> correctly — this is a content-completeness gap in the
-> bespoke backend, tracked separately. Cranelift emits a
-> populated map (note `unordcmp`'s non-zero `first_spirv`).
+> The bespoke backend originally emitted only a single
+> stub pcmap entry (`push(0, first_offset)`); commit
+> `0328e45` made `emit_function` record a real
+> `(host_offset, spirv_offset)` pair per lowered IR
+> instruction, so crash triage can now attribute a fault
+> to its source SPIR-V offset. (`unordcmp` is the
+> Cranelift-fallback shader — Cranelift's own pcmap is
+> separate and sparser.)
