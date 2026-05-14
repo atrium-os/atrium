@@ -2104,7 +2104,7 @@ What it does:
    fragment ABI and prints the RGBA.
 4. Compares VM output against the host-side expected value.
 
-The script covers eight shaders:
+The script covers eleven shaders:
 * **const** — constant-colour store: exercises the ELF object
   format, the exported symbol, and the Store path.
 * **ifelse** — `if (push_const.scale < 0.5) red else blue`:
@@ -2150,6 +2150,17 @@ The script covers eight shaders:
   correct predecessor edge. Driven with `0.2` (then) and
   `0.8` (else). On-target twin of the host `three_way_phi_*`
   differential tests.
+* **shuffle** — `OpVectorShuffle` (`va.bgra`): ARM64
+  lane-shuffle codegen, moving lanes between V-register
+  positions. On-target twin of host
+  `three_way_vector_shuffle_bgra`.
+* **cextract** — `OpCompositeExtract` + `OpCompositeConstruct`:
+  single-lane extraction and recombination in a new order.
+  On-target twin of host `three_way_composite_extract`.
+* **dot** — `OpDot` + `OpVectorTimesScalar` + per-lane
+  `FMul` + `CompositeConstruct` threading the dot result
+  through a lane. On-target twin of host
+  `three_way_dot_and_composite`.
 
 Verified 2026-05-14 on FreeBSD 16.0-CURRENT arm64:
 ```
@@ -2168,7 +2179,14 @@ PASS  switch n=2   -> [0 0 1 1]
 PASS  switch n=7   -> [1 1 1 1]
 PASS  phi then     -> [1 1 1 1]
 PASS  phi else     -> [0.25 0.25 0.25 1]
+PASS  shuffle      -> [0.75 0.5 0.25 1]
+PASS  cextract     -> [1 0.25 0.75 0.5]
+PASS  dot          -> [0.25 0.125 0.0625 0.4375]
 ```
+In-VM coverage now mirrors the host three-way differential
+corpus: every common-shader opcode + CFG path the host
+suite exercises is also verified on the production
+FreeBSD/aarch64 target.
 The harness prints with `%.9g`, not the default `%g` —
 `%g` caps at 6 significant digits, so an exact value like
 `0.97265625` would print `0.972656` and spuriously diverge

@@ -44,6 +44,15 @@
 #     land in the Phi's register on the correct predecessor
 #     edge. Driven with 0.2 (then) and 0.8 (else). On-target
 #     twin of the host three_way_phi_* differential tests.
+#   * shuffle — OpVectorShuffle (va.bgra): ARM64 lane-shuffle
+#     codegen, moving lanes between V-register positions.
+#     On-target twin of host three_way_vector_shuffle_bgra.
+#   * cextract — OpCompositeExtract + OpCompositeConstruct:
+#     single-lane extraction + recombination in a new order.
+#     On-target twin of host three_way_composite_extract.
+#   * dot — OpDot + OpVectorTimesScalar + per-lane FMul +
+#     CompositeConstruct threading the dot result through a
+#     lane. On-target twin of host three_way_dot_and_composite.
 #
 # Prereqs: the dev VM is up (scripts/run-vm.sh) and
 # reachable on localhost:2222 with the fresco_bsd key.
@@ -111,6 +120,9 @@ verify "switch n=2"   "2 int"   switch 2
 verify "switch n=7"   "7 int"   switch 7
 verify "phi then"     "0.2"     phi 0.2
 verify "phi else"     "0.8"     phi 0.8
+verify "shuffle"      ""        shuffle
+verify "cextract"     ""        cextract
+verify "dot"          ""        dot
 
 if [ "$FAILED" = "0" ]; then
   echo "==> PASS — bespoke ELF + AAPCS64 codegen verified on FreeBSD aarch64"

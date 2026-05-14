@@ -16,6 +16,9 @@
 //!   emit_freebsd_obj <out.o> vecarith   -- (a+b)*(a-b) over vec4s
 //!   emit_freebsd_obj <out.o> switch <n> -- switch(n) colour select
 //!   emit_freebsd_obj <out.o> phi <s>    -- if/else joined by OpPhi
+//!   emit_freebsd_obj <out.o> shuffle    -- OpVectorShuffle (bgra)
+//!   emit_freebsd_obj <out.o> cextract   -- OpCompositeExtract
+//!   emit_freebsd_obj <out.o> dot        -- OpDot + VectorTimesScalar
 //!
 //! stdout is always the expected RGBA for the chosen
 //! shader+input, so the in-VM harness can diff against it
@@ -541,6 +544,144 @@ fn build_phi_spirv() -> Vec<u8> {
     bytes
 }
 
+/// `OpVectorShuffle`: `va = [0.25, 0.5, 0.75, 1.0]`,
+/// `out = va.bgra` (shuffle indices `[2, 1, 0, 3]`).
+/// Exercises the ARM64 lane-shuffle codegen — distinct
+/// from per-lane arithmetic, this moves lanes between
+/// V-register positions. All lanes are exact in f32.
+/// On-target twin of host `three_way_vector_shuffle_bgra`.
+fn build_shuffle_spirv() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let f32_ty = b.type_float(32, None);
+    let vec4 = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let ptr_out = b.type_pointer(None, StorageClass::Output, vec4);
+    let lanes = [0.25f32, 0.5, 0.75, 1.0];
+    let cs: Vec<_> = lanes.iter()
+        .map(|x| b.constant_bit32(f32_ty, x.to_bits())).collect();
+    let va = b.constant_composite(vec4, cs);
+    let out = b.variable(ptr_out, None, StorageClass::Output, None);
+    b.decorate(out, Decoration::Location,
+               vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let swizzled = b.vector_shuffle(vec4, None, va, va, vec![2, 1, 0, 3]).unwrap();
+    b.store(out, swizzled, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![out]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+/// `OpCompositeExtract` + `OpCompositeConstruct`: pull
+/// individual lanes from `va = [0.25, 0.5, 0.75, 1.0]` and
+/// recombine in a different order — `out = vec4(va[3],
+/// va[0], va[2], va[1])`. Exercises single-lane extraction
+/// codegen. All lanes are exact in f32. On-target twin of
+/// host `three_way_composite_extract`.
+fn build_cextract_spirv() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let f32_ty = b.type_float(32, None);
+    let vec4 = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let ptr_out = b.type_pointer(None, StorageClass::Output, vec4);
+    let lanes = [0.25f32, 0.5, 0.75, 1.0];
+    let cs: Vec<_> = lanes.iter()
+        .map(|x| b.constant_bit32(f32_ty, x.to_bits())).collect();
+    let va = b.constant_composite(vec4, cs);
+    let out = b.variable(ptr_out, None, StorageClass::Output, None);
+    b.decorate(out, Decoration::Location,
+               vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let e3 = b.composite_extract(f32_ty, None, va, vec![3]).unwrap();
+    let e0 = b.composite_extract(f32_ty, None, va, vec![0]).unwrap();
+    let e2 = b.composite_extract(f32_ty, None, va, vec![2]).unwrap();
+    let e1 = b.composite_extract(f32_ty, None, va, vec![1]).unwrap();
+    let color = b.composite_construct(vec4, None, vec![e3, e0, e2, e1]).unwrap();
+    b.store(out, color, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![out]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+/// `OpDot` + `OpVectorTimesScalar`: `d = dot(va, vb)`,
+/// `scaled = vb * d` (exercised but unused), then
+/// `out = vec4(va.x*vb.x, va.y*vb.y, va.z*vb.z, d)`.
+/// `va = [0.5, 0.25, 0.125, 0.0]`, `vb = [0.5, 0.5, 0.5,
+/// 1.0]` — every product and the dot result are exact in
+/// f32. On-target twin of host `three_way_dot_and_composite`.
+fn build_dot_spirv() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let f32_ty = b.type_float(32, None);
+    let vec4 = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let ptr_out = b.type_pointer(None, StorageClass::Output, vec4);
+    let a = [0.5f32, 0.25, 0.125, 0.0];
+    let bvec = [0.5f32, 0.5, 0.5, 1.0];
+    let ca: Vec<_> = a.iter().map(|x| b.constant_bit32(f32_ty, x.to_bits())).collect();
+    let cb: Vec<_> = bvec.iter().map(|x| b.constant_bit32(f32_ty, x.to_bits())).collect();
+    let va = b.constant_composite(vec4, ca.clone());
+    let vb = b.constant_composite(vec4, cb.clone());
+    let out = b.variable(ptr_out, None, StorageClass::Output, None);
+    b.decorate(out, Decoration::Location,
+               vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let d = b.dot(f32_ty, None, va, vb).unwrap();
+    // Exercise OpVectorTimesScalar; the result is unused.
+    let _scaled = b.vector_times_scalar(vec4, None, vb, d).unwrap();
+    let m0 = b.f_mul(f32_ty, None, ca[0], cb[0]).unwrap();
+    let m1 = b.f_mul(f32_ty, None, ca[1], cb[1]).unwrap();
+    let m2 = b.f_mul(f32_ty, None, ca[2], cb[2]).unwrap();
+    let color = b.composite_construct(vec4, None, vec![m0, m1, m2, d]).unwrap();
+    b.store(out, color, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![out]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let path = args.next()
@@ -628,6 +769,22 @@ fn main() {
                 .unwrap_or(0.2);
             let chosen = if scale < 0.5 { 1.0 } else { 0.25 };
             (build_phi_spirv(), [chosen, chosen, chosen, 1.0])
+        }
+        "shuffle" => {
+            // va.bgra over [0.25,0.5,0.75,1.0].
+            (build_shuffle_spirv(), [0.75, 0.5, 0.25, 1.0])
+        }
+        "cextract" => {
+            // vec4(va[3],va[0],va[2],va[1]) over [0.25,0.5,0.75,1.0].
+            (build_cextract_spirv(), [1.0, 0.25, 0.75, 0.5])
+        }
+        "dot" => {
+            // d = dot(va,vb); out = (va.x*vb.x, va.y*vb.y,
+            //                        va.z*vb.z, d).
+            let a = [0.5f32, 0.25, 0.125, 0.0];
+            let bv = [0.5f32, 0.5, 0.5, 1.0];
+            let d: f32 = (0..4).map(|i| a[i] * bv[i]).sum();
+            (build_dot_spirv(), [a[0]*bv[0], a[1]*bv[1], a[2]*bv[2], d])
         }
         other => {
             eprintln!("unknown shader kind: {other}");
