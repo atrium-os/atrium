@@ -22,7 +22,9 @@
 //!   emit_freebsd_obj <out.o> unordcmp <s> -- OpFUnordLessThan (bespoke
 //!                                            Unsupported -> Cranelift)
 //!   emit_freebsd_obj <out.o> heavy <n>  -- heavyweight benchmark loop
-//!                                          (4 coupled accumulators)
+//!                                          (2 coupled accumulators)
+//!   emit_freebsd_obj <out.o> heavy4 <n> -- register-pressure variant
+//!                                          (4 accumulators; needs V8-V15)
 //!
 //! Prefix any kind with `spirv` to write the raw SPIR-V
 //! module instead of a compiled object (for the end-to-end
@@ -886,6 +888,128 @@ fn eval_heavy(n: i32) -> [f32; 4] {
     [a, b, 0.0, 1.0]
 }
 
+/// Register-pressure variant of `heavy`: **four**
+/// cross-coupled f32 accumulators (~12 FMul/FAdd per
+/// iteration), five loop-carried Phis. This is the shader
+/// that overflowed the bespoke V-register file before opt
+/// #5 extended the pool into the callee-saved V8..V15 —
+/// it's the on-target proof that the FP callee-saved
+/// prologue/epilogue is emitted and works.
+fn build_heavy4_spirv() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, LoopControl, MemoryModel,
+        StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let f32_ty = b.type_float(32, None);
+    let i32_ty = b.type_int(32, 1);
+    let bool_ty = b.type_bool();
+    let vec4 = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let pc_struct = b.type_struct(vec![i32_ty]);
+    b.member_decorate(pc_struct, 0, Decoration::Offset,
+                      vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(pc_struct, Decoration::Block, vec![]);
+    let ptr_pc_struct = b.type_pointer(None, StorageClass::PushConstant, pc_struct);
+    let ptr_pc_i32    = b.type_pointer(None, StorageClass::PushConstant, i32_ty);
+    let ptr_out       = b.type_pointer(None, StorageClass::Output, vec4);
+    let zero_i = b.constant_bit32(i32_ty, 0u32);
+    let one_i  = b.constant_bit32(i32_ty, 1u32);
+    let k_a0 = b.constant_bit32(f32_ty, 0.5f32.to_bits());
+    let k_b0 = b.constant_bit32(f32_ty, 0.25f32.to_bits());
+    let k_c0 = b.constant_bit32(f32_ty, 0.125f32.to_bits());
+    let k_d0 = b.constant_bit32(f32_ty, 0.0625f32.to_bits());
+    let k99  = b.constant_bit32(f32_ty, 0.99f32.to_bits());
+    let k01  = b.constant_bit32(f32_ty, 0.01f32.to_bits());
+    let k005 = b.constant_bit32(f32_ty, 0.005f32.to_bits());
+    let pc_var = b.variable(ptr_pc_struct, None, StorageClass::PushConstant, None);
+    let out = b.variable(ptr_out, None, StorageClass::Output, None);
+    b.decorate(out, Decoration::Location,
+               vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    let entry_id  = b.id();
+    let header_id = b.id();
+    let body_id   = b.id();
+    let cont_id   = b.id();
+    let merge_id  = b.id();
+    let i_next = b.id();
+    let a_next = b.id();
+    let b_next = b.id();
+    let c_next = b.id();
+    let d_next = b.id();
+    b.begin_block(Some(entry_id)).unwrap();
+    let p = b.access_chain(ptr_pc_i32, None, pc_var, vec![zero_i]).unwrap();
+    let n = b.load(i32_ty, None, p, None, vec![]).unwrap();
+    b.branch(header_id).unwrap();
+    b.begin_block(Some(header_id)).unwrap();
+    let i_phi = b.phi(i32_ty, None,
+        vec![(zero_i, entry_id), (i_next, cont_id)]).unwrap();
+    let a_phi = b.phi(f32_ty, None,
+        vec![(k_a0, entry_id), (a_next, cont_id)]).unwrap();
+    let b_phi = b.phi(f32_ty, None,
+        vec![(k_b0, entry_id), (b_next, cont_id)]).unwrap();
+    let c_phi = b.phi(f32_ty, None,
+        vec![(k_c0, entry_id), (c_next, cont_id)]).unwrap();
+    let d_phi = b.phi(f32_ty, None,
+        vec![(k_d0, entry_id), (d_next, cont_id)]).unwrap();
+    let cond = b.s_less_than(bool_ty, None, i_phi, n).unwrap();
+    b.loop_merge(merge_id, cont_id, LoopControl::NONE, vec![]).unwrap();
+    b.branch_conditional(cond, body_id, merge_id, vec![]).unwrap();
+    b.begin_block(Some(body_id)).unwrap();
+    let t1 = b.f_mul(f32_ty, None, a_phi, b_phi).unwrap();
+    let t2 = b.f_mul(f32_ty, None, c_phi, d_phi).unwrap();
+    let a_keep = b.f_mul(f32_ty, None, a_phi, k99).unwrap();
+    let a_mix  = b.f_mul(f32_ty, None, t2, k01).unwrap();
+    let _a_n   = b.f_add(f32_ty, Some(a_next), a_keep, a_mix).unwrap();
+    let b_keep = b.f_mul(f32_ty, None, b_phi, k99).unwrap();
+    let b_mix  = b.f_mul(f32_ty, None, t1, k01).unwrap();
+    let _b_n   = b.f_add(f32_ty, Some(b_next), b_keep, b_mix).unwrap();
+    let c_keep = b.f_mul(f32_ty, None, c_phi, k99).unwrap();
+    let c_mix  = b.f_mul(f32_ty, None, a_phi, k005).unwrap();
+    let _c_n   = b.f_add(f32_ty, Some(c_next), c_keep, c_mix).unwrap();
+    let d_keep = b.f_mul(f32_ty, None, d_phi, k99).unwrap();
+    let d_mix  = b.f_mul(f32_ty, None, b_phi, k005).unwrap();
+    let _d_n   = b.f_add(f32_ty, Some(d_next), d_keep, d_mix).unwrap();
+    b.branch(cont_id).unwrap();
+    b.begin_block(Some(cont_id)).unwrap();
+    b.i_add(i32_ty, Some(i_next), i_phi, one_i).unwrap();
+    b.branch(header_id).unwrap();
+    b.begin_block(Some(merge_id)).unwrap();
+    let color = b.composite_construct(vec4, None,
+        vec![a_phi, b_phi, c_phi, d_phi]).unwrap();
+    b.store(out, color, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![out]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+fn eval_heavy4(n: i32) -> [f32; 4] {
+    let (mut a, mut b, mut c, mut d) = (0.5f32, 0.25f32, 0.125f32, 0.0625f32);
+    let mut i = 0i32;
+    while i < n {
+        let t1 = a * b;
+        let t2 = c * d;
+        let a_n = a * 0.99 + t2 * 0.01;
+        let b_n = b * 0.99 + t1 * 0.01;
+        let c_n = c * 0.99 + a * 0.005;
+        let d_n = d * 0.99 + b * 0.005;
+        a = a_n; b = b_n; c = c_n; d = d_n;
+        i += 1;
+    }
+    [a, b, c, d]
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let path = args.next()
@@ -1008,6 +1132,15 @@ fn main() {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(256);
             (build_heavy_spirv(), eval_heavy(n))
+        }
+        "heavy4" => {
+            // Four-accumulator register-pressure variant —
+            // overflows V16..V31, exercises the opt #5
+            // callee-saved V8..V15 prologue/epilogue.
+            let n: i32 = args.next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(256);
+            (build_heavy4_spirv(), eval_heavy4(n))
         }
         "unordcmp" => {
             // Same pixels as `ifelse` for finite inputs,

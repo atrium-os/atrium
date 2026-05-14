@@ -53,6 +53,11 @@
 #   * dot — OpDot + OpVectorTimesScalar + per-lane FMul +
 #     CompositeConstruct threading the dot result through a
 #     lane. On-target twin of host three_way_dot_and_composite.
+#   * heavy4 — four-accumulator counted loop (~12 FMul/FAdd,
+#     five loop-carried Phis). Overflows the bespoke V-reg
+#     file's caller-saved tier (V16..V31) and forces the
+#     callee-saved V8..V15 — exercises the opt #5 FP
+#     `stp d`/`ldp d` prologue+epilogue on the real target.
 #
 # Prereqs: the dev VM is up (scripts/run-vm.sh) and
 # reachable on localhost:2222 with the fresco_bsd key.
@@ -96,7 +101,24 @@ verify() {
   got=$(ssh -i "$KEY" $SSHOPTS -p 2222 root@localhost \
     "cd /tmp && cc -shared -o atrium_fs.so atrium_fs_freebsd.o \
      && ./atrium_harness ./atrium_fs.so $pc" 2>/dev/null)
-  if [ "$got" = "$expected" ]; then
+  # Numeric compare with a tiny tolerance, not string
+  # equality: the host prints f32s via Rust's shortest
+  # round-trip `{}` while the harness prints C `%.9g`, so
+  # bit-identical values can render as different strings
+  # (e.g. 0.36522064 vs 0.365220636). 1e-6 tolerates the
+  # formatting gap while still catching any real codegen
+  # divergence — wrong codegen is off by orders of
+  # magnitude, never 1e-7. (Host-side bit-exactness is
+  # separately enforced by the three-way differential.)
+  if awk -v a="$expected" -v b="$got" 'BEGIN {
+        na = split(a, ea, " "); nb = split(b, eb, " ");
+        if (na != 4 || nb != 4) exit 1;
+        for (i = 1; i <= 4; i++) {
+          d = ea[i] - eb[i]; if (d < 0) d = -d;
+          if (d > 1e-6) exit 1;
+        }
+        exit 0
+      }'; then
     echo "  PASS  $label  -> [$got]"
   else
     echo "  FAIL  $label  expected [$expected] got [$got]"
@@ -123,6 +145,7 @@ verify "phi else"     "0.8"     phi 0.8
 verify "shuffle"      ""        shuffle
 verify "cextract"     ""        cextract
 verify "dot"          ""        dot
+verify "heavy4 n=32"  "32 int"  heavy4 32
 
 if [ "$FAILED" = "0" ]; then
   echo "==> PASS — bespoke ELF + AAPCS64 codegen verified on FreeBSD aarch64"

@@ -370,13 +370,25 @@ fn emit_function(
 
     // ── Linear-scan register allocator ─────────────────────────
     //
-    // Free pool of V-regs (V16..V31, caller-saved in
-    // AAPCS64). At each inst i, before defining any new
-    // value, expire scalars whose last_use < i and return
-    // their V-regs to the pool. Then allocate from the pool
-    // for new defs.
-    let mut free_pool: Vec<u8> = (16..32).rev().collect();
+    // Free pool of V-regs. Two tiers:
+    //   * V16..V31 — caller-saved per AAPCS64, no prologue
+    //     cost; the preferred tier (handed out first).
+    //   * V8..V15  — callee-saved (the low 64 bits must be
+    //     preserved). Using one forces an `stp d`/`ldp d`
+    //     prologue+epilogue, exactly like the W19..W28
+    //     integer overflow tier — so they're the overflow
+    //     tier, popped only once V16..V31 is exhausted.
+    // `pop` takes from the end, so the vec is ordered
+    // [V15..V8, V31..V16] → V16 first, V8..V15 last.
+    // At each inst i, before defining any new value, expire
+    // scalars whose last_use < i and return their V-regs to
+    // the pool. Then allocate from the pool for new defs.
+    let mut free_pool: Vec<u8> = (8..16).rev().collect();
+    free_pool.extend((16..32).rev());
     let mut owners: HashMap<u8, ValueId> = HashMap::new();
+    // Set once any V8..V15 reg is handed out — drives the
+    // callee-saved FP `stp d`/`ldp d` prologue+epilogue.
+    let mut used_callee_saved_v = false;
 
     // ── Pre-pass: discover Phi nodes ──────────────────────────
     //
@@ -439,6 +451,7 @@ fn emit_function(
                     let n = free_pool.pop().ok_or_else(||
                         BackendError::Unsupported(
                             "out of V-regs allocating Phi dest".into()))?;
+                    if n < 16 { used_callee_saved_v = true; }
                     let v = asm::Vreg(n);
                     scalars.insert(result.id, v);
                     PhiDest::Float(v)
@@ -555,22 +568,30 @@ fn emit_function(
 
     // ── Prologue placeholder ──────────────────────────────────
     //
-    // The int pool can dip into callee-saved registers
-    // (X19..X28) when a shader's integer pressure exceeds
-    // the 5 caller-saved slots — loops do this. Per AAPCS64
-    // those must be saved/restored across the call. We
-    // don't know yet whether any get used, so reserve a
-    // fixed 5-instruction prologue region (NOPs for now)
-    // and patch it after body emission. Reserving a fixed
-    // size keeps every body offset — block_asm_offset,
-    // branch patch sites — consistent regardless of
-    // whether the prologue ends up real or NOPs.
-    const PROLOGUE_INSTS: usize = 5;
+    // Both register pools can dip into callee-saved
+    // registers under pressure: the int pool into X19..X28,
+    // the V-reg pool into V8..V15. Per AAPCS64 those must
+    // be saved/restored across the call. We don't know yet
+    // which (if any) get used, so reserve a fixed
+    // PROLOGUE_INSTS-instruction region (NOPs for now) and
+    // patch it after body emission. A fixed size keeps
+    // every body offset — block_asm_offset, branch patch
+    // sites — consistent regardless of whether the prologue
+    // ends up real or NOPs.
+    //
+    // Layout: 5 slots for the integer pairs (X19/X20 …
+    // X27/X28) then 4 slots for the FP pairs (D8/D9 …
+    // D14/D15). The two halves are independent — either,
+    // both, or neither may be real; unused slots stay NOPs.
+    const PROLOGUE_INT_INSTS: usize = 5;
+    const PROLOGUE_FP_INSTS: usize = 4;
+    const PROLOGUE_INSTS: usize = PROLOGUE_INT_INSTS + PROLOGUE_FP_INSTS;
     let prologue_off = a.len();
     for _ in 0..PROLOGUE_INSTS { a.emit(asm::nop()); }
-    // Epilogue placeholder offsets — one per `ret`. Each
-    // is a 5-NOP region emitted just before its ret;
-    // patched to ldp's iff the prologue is real.
+    // Epilogue placeholder offsets — one per `ret`. Each is
+    // a PROLOGUE_INSTS-NOP region emitted just before its
+    // ret. Mirror-image layout: 4 FP slots then 5 int slots
+    // (restores run in reverse of the prologue's saves).
     let mut epilogue_offs: Vec<usize> = Vec::new();
 
     let mut flat_i: usize = 0;
@@ -768,7 +789,7 @@ fn emit_function(
                 let s_w = *ints.get(&s.id).ok_or_else(||
                     BackendError::Internal(format!(
                         "ConvertSToF operand {:?} not in ints", s.id)))?;
-                let d_v = alloc_vreg(&mut free_pool, &mut owners, result.id)?;
+                let d_v = alloc_vreg(&mut free_pool, &mut owners, &mut used_callee_saved_v,result.id)?;
                 a.emit(asm::scvtf_s_from_w(d_v, s_w));
                 scalars.insert(result.id, d_v);
             }
@@ -779,7 +800,7 @@ fn emit_function(
                 let s_w = *ints.get(&s.id).ok_or_else(||
                     BackendError::Internal(format!(
                         "ConvertUToF operand {:?} not in ints", s.id)))?;
-                let d_v = alloc_vreg(&mut free_pool, &mut owners, result.id)?;
+                let d_v = alloc_vreg(&mut free_pool, &mut owners, &mut used_callee_saved_v,result.id)?;
                 a.emit(asm::ucvtf_s_from_w(d_v, s_w));
                 scalars.insert(result.id, d_v);
             }
@@ -809,7 +830,7 @@ fn emit_function(
                 let bits = (*value as f32).to_bits();
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal("ConstFloat without result".into()))?;
-                let v = alloc_vreg(&mut free_pool, &mut owners, result.id)?;
+                let v = alloc_vreg(&mut free_pool, &mut owners, &mut used_callee_saved_v,result.id)?;
                 materialise_u32_into_w(&mut a, w_tmp, bits);
                 a.emit(asm::fmov_s_from_w(v, w_tmp));
                 scalars.insert(result.id, v);
@@ -870,7 +891,7 @@ fn emit_function(
                         // definedness.
                         let synth = ValueId(next_synth_id);
                         next_synth_id += 1;
-                        let v = alloc_vreg(&mut free_pool, &mut owners, synth)?;
+                        let v = alloc_vreg(&mut free_pool, &mut owners, &mut used_callee_saved_v,synth)?;
                         a.emit(asm::movz_w(w_tmp, 0, 0));
                         a.emit(asm::fmov_s_from_w(v, w_tmp));
                         scalars.insert(synth, v);
@@ -931,7 +952,7 @@ fn emit_function(
                         l_lanes.len(), r_lanes.len())));
                 }
                 // Accumulator V-reg owned by the final result id.
-                let acc = alloc_vreg(&mut free_pool, &mut owners, result.id)?;
+                let acc = alloc_vreg(&mut free_pool, &mut owners, &mut used_callee_saved_v,result.id)?;
                 // First lane: acc = l[0] * r[0].
                 let l0 = *scalars.get(&l_lanes[0].id).ok_or_else(||
                     BackendError::Internal(format!(
@@ -950,7 +971,7 @@ fn emit_function(
                             "Dot lane {i} rhs missing")))?;
                     let tmp_synth = ValueId(next_synth_id);
                     next_synth_id += 1;
-                    let tmp = alloc_vreg(&mut free_pool, &mut owners, tmp_synth)?;
+                    let tmp = alloc_vreg(&mut free_pool, &mut owners, &mut used_callee_saved_v,tmp_synth)?;
                     a.emit(asm::fmul_s(tmp, li, ri));
                     a.emit(asm::fadd_s(acc, acc, tmp));
                     // tmp dies immediately; manually return
@@ -963,19 +984,19 @@ fn emit_function(
             }
             Op::FAdd(a_v, b_v) => emit_fp_binop_poly(
                 &mut a, &mut scalars, &mut vectors,
-                &mut free_pool, &mut owners, &mut next_synth_id,
+                &mut free_pool, &mut owners, &mut used_callee_saved_v,&mut next_synth_id,
                 coalesce_v, inst, a_v, b_v, asm::fadd_s)?,
             Op::FSub(a_v, b_v) => emit_fp_binop_poly(
                 &mut a, &mut scalars, &mut vectors,
-                &mut free_pool, &mut owners, &mut next_synth_id,
+                &mut free_pool, &mut owners, &mut used_callee_saved_v,&mut next_synth_id,
                 coalesce_v, inst, a_v, b_v, asm::fsub_s)?,
             Op::FMul(a_v, b_v) => emit_fp_binop_poly(
                 &mut a, &mut scalars, &mut vectors,
-                &mut free_pool, &mut owners, &mut next_synth_id,
+                &mut free_pool, &mut owners, &mut used_callee_saved_v,&mut next_synth_id,
                 coalesce_v, inst, a_v, b_v, asm::fmul_s)?,
             Op::FDiv(a_v, b_v) => emit_fp_binop_poly(
                 &mut a, &mut scalars, &mut vectors,
-                &mut free_pool, &mut owners, &mut next_synth_id,
+                &mut free_pool, &mut owners, &mut used_callee_saved_v,&mut next_synth_id,
                 coalesce_v, inst, a_v, b_v, asm::fdiv_s)?,
             Op::Store { ptr, value } => {
                 match &ptr.ty {
@@ -1021,7 +1042,7 @@ fn emit_function(
                 match &pointee {
                     Type::F32 => {
                         let v = alloc_vreg(
-                            &mut free_pool, &mut owners, result.id)?;
+                            &mut free_pool, &mut owners, &mut used_callee_saved_v,result.id)?;
                         emit_load_f32_offset(&mut a, w_tmp, param, off, v)?;
                         scalars.insert(result.id, v);
                     }
@@ -1057,7 +1078,7 @@ fn emit_function(
                             let synthetic_id = ValueId(next_synth_id);
                             next_synth_id += 1;
                             let v = alloc_vreg(
-                                &mut free_pool, &mut owners, synthetic_id)?;
+                                &mut free_pool, &mut owners, &mut used_callee_saved_v,synthetic_id)?;
                             emit_load_f32_offset(&mut a, w_tmp, param, lane_off, v)?;
                             scalars.insert(synthetic_id, v);
                             lanes.push(Value {
@@ -1094,7 +1115,7 @@ fn emit_function(
                             BackendError::Internal(format!(
                                 "Select f {:?} not in scalars", f_val.id)))?;
                         let s_d = alloc_vreg(
-                            &mut free_pool, &mut owners, result.id)?;
+                            &mut free_pool, &mut owners, &mut used_callee_saved_v,result.id)?;
                         a.emit(asm::fcsel_s(s_d, s_t, s_f, asm::Cond::Ne));
                         scalars.insert(result.id, s_d);
                     }
@@ -1121,7 +1142,7 @@ fn emit_function(
                             let synth = ValueId(next_synth_id);
                             next_synth_id += 1;
                             let sd = alloc_vreg(
-                                &mut free_pool, &mut owners, synth)?;
+                                &mut free_pool, &mut owners, &mut used_callee_saved_v,synth)?;
                             a.emit(asm::fcsel_s(sd, st, sf, asm::Cond::Ne));
                             scalars.insert(synth, sd);
                             out_lanes.push(Value { id: synth, ty: tl.ty.clone() });
@@ -1334,37 +1355,61 @@ fn emit_function(
 
     // ── Prologue / epilogue fixup ─────────────────────────────
     //
-    // If the int pool dipped into callee-saved registers
-    // (W19..W28 — only happens under heavy integer
-    // pressure, e.g. loops), patch the reserved 5-NOP
-    // prologue + every 5-NOP epilogue with the AAPCS64
-    // save/restore sequence. We save all of X19..X28 (5
-    // pairs) unconditionally when *any* are used —
-    // conservative but correct; a used-set-precise
-    // prologue is a later optimisation. If no callee-saved
-    // reg was touched the placeholders stay NOPs (zero
-    // cost beyond 5+5 NOP slots).
+    // Each pool that dipped into callee-saved registers
+    // gets its reserved NOP slots patched with the AAPCS64
+    // save/restore sequence. The two halves are
+    // independent — either, both, or neither runs; unused
+    // slots stay NOPs (zero cost beyond the reserved
+    // space). When a half *is* used we save its whole
+    // register bank unconditionally (conservative but
+    // correct; a used-set-precise prologue is a later
+    // optimisation).
+    //
+    // Prologue order: 5 int pairs (slots 0..5) then 4 FP
+    // pairs (slots 5..9), SP dropping 16 per `stp`.
+    // Epilogue order is the mirror: 4 FP pairs (slots 0..4)
+    // then 5 int pairs (slots 4..9), each `ldp` bumping SP
+    // back up — restores unwind in reverse of the saves
+    // regardless of which halves are active, since NOP
+    // slots don't touch SP.
+    let int_pairs = [
+        (asm::Xreg(19), asm::Xreg(20)),
+        (asm::Xreg(21), asm::Xreg(22)),
+        (asm::Xreg(23), asm::Xreg(24)),
+        (asm::Xreg(25), asm::Xreg(26)),
+        (asm::Xreg(27), asm::Xreg(28)),
+    ];
+    let fp_pairs = [
+        (asm::Vreg(8),  asm::Vreg(9)),
+        (asm::Vreg(10), asm::Vreg(11)),
+        (asm::Vreg(12), asm::Vreg(13)),
+        (asm::Vreg(14), asm::Vreg(15)),
+    ];
     if int_pool.used_callee_saved {
-        // Prologue: 5× pre-indexed stp, each dropping SP
-        // by 16. Order: x19/x20 highest address … x27/x28
-        // lowest.
-        let save_pairs = [
-            (asm::Xreg(19), asm::Xreg(20)),
-            (asm::Xreg(21), asm::Xreg(22)),
-            (asm::Xreg(23), asm::Xreg(24)),
-            (asm::Xreg(25), asm::Xreg(26)),
-            (asm::Xreg(27), asm::Xreg(28)),
-        ];
-        for (i, (a_reg, b_reg)) in save_pairs.iter().enumerate() {
+        // Prologue int slots: 0..5.
+        for (i, (a_reg, b_reg)) in int_pairs.iter().enumerate() {
             a.patch(prologue_off + i * 4,
                     asm::stp_x_pre(*a_reg, *b_reg, asm::Xreg(31), -16));
         }
-        // Epilogue: reverse-order post-indexed ldp, each
-        // bumping SP back up by 16.
+        // Epilogue int slots: 4..9, reverse pair order.
         for &ep in &epilogue_offs {
-            for (i, (a_reg, b_reg)) in save_pairs.iter().rev().enumerate() {
-                a.patch(ep + i * 4,
+            for (i, (a_reg, b_reg)) in int_pairs.iter().rev().enumerate() {
+                a.patch(ep + (PROLOGUE_FP_INSTS + i) * 4,
                         asm::ldp_x_post(*a_reg, *b_reg, asm::Xreg(31), 16));
+            }
+        }
+    }
+    if used_callee_saved_v {
+        // Prologue FP slots: 5..9.
+        for (i, (a_reg, b_reg)) in fp_pairs.iter().enumerate() {
+            a.patch(prologue_off + (PROLOGUE_INT_INSTS + i) * 4,
+                    asm::stp_d_pre(*a_reg, *b_reg, asm::Xreg(31), -16));
+        }
+        // Epilogue FP slots: 0..4, reverse pair order.
+        for &ep in &epilogue_offs {
+            for (i, (a_reg, b_reg)) in fp_pairs.iter().rev().enumerate() {
+                a.patch(ep + i * 4,
+                        asm::ldp_d_post(*a_reg, *b_reg, asm::Xreg(31), 16));
             }
         }
     }
@@ -1693,10 +1738,15 @@ fn emit_fcmp_to_bool(
 fn alloc_vreg(
     free_pool: &mut Vec<u8>,
     owners: &mut HashMap<u8, ValueId>,
+    used_callee_saved_v: &mut bool,
     owner: ValueId,
 ) -> Result<asm::Vreg, BackendError> {
     let n = free_pool.pop().ok_or_else(|| BackendError::Unsupported(
-        "linear-scan RA ran out of V-regs; spilling lands in step 5".into()))?;
+        "linear-scan RA ran out of V-regs (V16..V31 + V8..V15); \
+         true spilling lands in a later widening".into()))?;
+    // V8..V15 are callee-saved — first use forces the FP
+    // prologue/epilogue.
+    if n < 16 { *used_callee_saved_v = true; }
     owners.insert(n, owner);
     Ok(asm::Vreg(n))
 }
@@ -2015,6 +2065,7 @@ fn emit_fp_binop_poly(
     vectors: &mut HashMap<ValueId, Vec<Value>>,
     free_pool: &mut Vec<u8>,
     owners: &mut HashMap<u8, ValueId>,
+    used_callee_saved_v: &mut bool,
     next_synth_id: &mut u32,
     coalesce: Option<asm::Vreg>,
     inst: &atrium_spv_ir::Inst,
@@ -2049,7 +2100,7 @@ fn emit_fp_binop_poly(
             // coalescing into a source register is correct.
             let d = match coalesce {
                 Some(d) => d,
-                None => alloc_vreg(free_pool, owners, result.id)?,
+                None => alloc_vreg(free_pool, owners, used_callee_saved_v,result.id)?,
             };
             a.emit(make_inst(d, l, r));
             scalars.insert(result.id, d);
@@ -2075,7 +2126,7 @@ fn emit_fp_binop_poly(
                         rl.id)))?;
                 // Synthetic per-lane result ValueId.
                 let synth = fresh_synth();
-                let d = alloc_vreg(free_pool, owners, synth)?;
+                let d = alloc_vreg(free_pool, owners, used_callee_saved_v,synth)?;
                 a.emit(make_inst(d, l, r));
                 scalars.insert(synth, d);
                 out_lanes.push(Value {
@@ -2096,7 +2147,7 @@ fn emit_fp_binop_poly(
                     BackendError::Internal(format!(
                         "vec×scalar lane {li} lhs missing")))?;
                 let synth = fresh_synth();
-                let d = alloc_vreg(free_pool, owners, synth)?;
+                let d = alloc_vreg(free_pool, owners, used_callee_saved_v,synth)?;
                 a.emit(make_inst(d, l, r));
                 scalars.insert(synth, d);
                 out_lanes.push(Value { id: synth, ty: ll.ty.clone() });
@@ -2115,7 +2166,7 @@ fn emit_fp_binop_poly(
                     BackendError::Internal(format!(
                         "scalar×vec lane {li} rhs missing")))?;
                 let synth = fresh_synth();
-                let d = alloc_vreg(free_pool, owners, synth)?;
+                let d = alloc_vreg(free_pool, owners, used_callee_saved_v,synth)?;
                 a.emit(make_inst(d, l, r));
                 scalars.insert(synth, d);
                 out_lanes.push(Value { id: synth, ty: rl.ty.clone() });
