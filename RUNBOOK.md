@@ -2436,12 +2436,14 @@ turns the headline justification into a concrete backlog.
 
 In priority order (impact × inverse-risk):
 
-1. **Compare→branch fusion.** When an `IComparison` /
-   `FComparison` result feeds *only* a `BranchConditional`,
-   skip materialising the i32 bool (constraint B4) — emit
-   `cmp` + a fused `b.<cond>`. 2 insns/iter here, and it
-   fires in *every* conditional in *every* shader. Lowest
-   risk, highest reach.
+1. **Compare→branch fusion.** ✅ **DONE** (`7d11ff4`). When
+   an `IComparison` / `FComparison` result feeds *only* a
+   `BranchConditional`, skip materialising the i32 bool
+   (constraint B4) — emit `cmp` + a fused `b.<cond>`. 2
+   insns/iter. Correct, but the heavy-shader runtime
+   barely moved (~3%): the removed `cset`/`cmp` are cheap
+   integer ops a superscalar core runs in parallel with
+   the FP work — they were never on the critical path.
 2. **Branch-to-next-block elision.** If a block's
    unconditional-branch target is the block emitted
    immediately after it, drop the branch. Self-contained,
@@ -2449,13 +2451,12 @@ In priority order (impact × inverse-risk):
 3. **Immediate forms.** `add`/`sub` with a small immediate
    instead of `mov`-into-reg-then-add; `fmov s, #imm` for
    representable float constants; `movi` for zero.
-4. **Phi / copy coalescing.** When a Phi's back-edge arm
-   value is produced by an instruction in the predecessor,
-   allocate that instruction's result directly into the
-   Phi's register, eliminating the `fmov`/`mov`. Biggest
-   structural win (covers both the accumulator `fmov`s and
-   the induction-var `mov`) but needs RA changes — highest
-   risk, do last.
+4. **Phi / copy coalescing.** ✅ **DONE** (`8c53315`). When
+   a Phi arm's value is produced by a scalar binary op,
+   that op writes straight into the Phi register and the
+   `fmov`/`mov` is elided. These moves sat *on* the
+   loop-carried dependency chain — this was the real
+   runtime lever, as the disasm analysis predicted.
 5. **Register spilling.** Out of scope for the `heavy`
    shader (sized to fit) but a hard limit: a
    four-accumulator variant fails to compile at all
@@ -2463,3 +2464,22 @@ In priority order (impact × inverse-risk):
    bespoke backend can be the *default* for arbitrary
    shaders rather than falling back to Cranelift on
    pressure.
+
+#### Result after opts #1 + #4
+
+`heavy` shader runtime, bespoke vs Cranelift (`Nx`, >1 =
+bespoke faster):
+
+| stage                | in-VM ns/call (besp / clif) | ratio |
+|----------------------|-----------------------------|-------|
+| baseline             | 1290 / 1002                 | 0.78x |
+| + compare→branch (#1)| 1250 / 1002                 | 0.77x |
+| + Phi coalescing (#4)| 1113 / 1097                 | **0.99x** |
+
+The bespoke backend is now at **runtime parity** with
+Cranelift on the heavy loop (0.99x, host agrees) **while
+still compiling ~4.7× faster** — it now earns its
+complexity. Opt #4 confirmed the disasm prediction: the
+loop-carried Phi `fmov`s were the cost, not the
+instruction count. Opts #2 and #3 remain as code-size
+hygiene; #5 (spilling) is the next structural item.
