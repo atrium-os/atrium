@@ -2341,16 +2341,22 @@ instead of running the shader.
 sh atrium-spv-backend-bespoke/verify/run-pcmap-e2e-in-vm.sh
 ```
 
+The driver also exercises `PcMap::lookup` — the host-PC →
+SPIR-V-offset binary search the crash handler actually
+calls — on a mid-function PC, and reports `mid_lookup=Z`
+(`none` if the search fails).
+
 Verified 2026-05-14 on FreeBSD 16.0-CURRENT arm64 — the
 sidecar the production compile binary emits round-trips
 cleanly through the loader's parser on-target, with real
-per-instruction entries:
+per-instruction entries, and `lookup` resolves a
+mid-function PC to its source offset:
 ```
-PASS  const     -> pcmap present entries=7  first_spirv=0   last_host=100
-PASS  ifelse    -> pcmap present entries=15 first_spirv=0   last_host=156
-PASS  loop      -> pcmap present entries=21 first_spirv=0   last_host=160
-PASS  switch    -> pcmap present entries=19 first_spirv=0   last_host=220
-PASS  unordcmp  -> pcmap present entries=1  first_spirv=436 last_host=0
+PASS  const     -> entries=7  first_spirv=0   last_host=100 mid_lookup=0
+PASS  ifelse    -> entries=15 first_spirv=0   last_host=156 mid_lookup=456
+PASS  loop      -> entries=21 first_spirv=0   last_host=160 mid_lookup=504
+PASS  switch    -> entries=19 first_spirv=0   last_host=220 mid_lookup=516
+PASS  unordcmp  -> entries=1  first_spirv=436 last_host=0   mid_lookup=436
 ```
 
 > The bespoke backend originally emitted only a single

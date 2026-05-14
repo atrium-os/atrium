@@ -69,12 +69,16 @@ verify() {
     "rm -rf /tmp/atrium_pcmap_cache && \
      /tmp/loader_e2e_driver $SPV /tmp/atrium-spv-compile \
        /tmp/atrium_pcmap_cache --check-pcmap" 2>/dev/null)
-  # Expect: "pcmap present entries=N ..." with N >= 1.
+  # Expect: "pcmap present entries=N ... mid_lookup=Z" with
+  # N >= 1 and a successful lookup (mid_lookup != none).
   case "$got" in
     "pcmap present entries=0 "*)
       echo "  FAIL  $label  pcmap parsed but empty: [$got]"
       FAILED=1 ;;
-    "pcmap present entries="*)
+    *" mid_lookup=none")
+      echo "  FAIL  $label  lookup() failed on-target: [$got]"
+      FAILED=1 ;;
+    "pcmap present entries="*" mid_lookup="*)
       echo "  PASS  $label  -> $got" ;;
     *)
       echo "  FAIL  $label  expected 'pcmap present ...' got [$got]"

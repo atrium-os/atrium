@@ -31,10 +31,13 @@
 //! the driver skips the `fs_main` call and instead prints
 //! the state of the `.pcmap` sidecar the loader parsed off
 //! disk — `pcmap present entries=N first_spirv=X
-//! last_host=Y` or `pcmap absent`. This verifies the
-//! sidecar atrium-spv-compile wrote round-trips through the
-//! loader's `PcMap::from_bytes` on the target, so
-//! crash-triage source attribution is wired end to end.
+//! last_host=Y mid_lookup=Z` or `pcmap absent`. This
+//! verifies the sidecar atrium-spv-compile wrote
+//! round-trips through the loader's `PcMap::from_bytes` on
+//! the target, *and* that the `PcMap::lookup` host-PC ->
+//! SPIR-V-offset binary search resolves a mid-function PC
+//! — so crash-triage source attribution is wired end to
+//! end. `mid_lookup=none` means the lookup failed.
 //!
 //! stdout: `r g b a` (default) or the `pcmap ...` line
 //! (`--check-pcmap`). Exit non-zero on any loader error
@@ -99,9 +102,27 @@ fn main() {
                     .map(|e| e.spirv_offset).unwrap_or(0);
                 let last_host = entries.last()
                     .map(|e| e.host_offset).unwrap_or(0);
+                // Exercise the host_pc -> spirv_offset
+                // binary search on a mid-function PC. Query
+                // *just past* the middle entry's host
+                // offset: lookup must return the entry the
+                // PC is "inside of", i.e. the middle
+                // entry's spirv_offset (largest host_offset
+                // <= query). `none` would mean the binary
+                // search is broken on-target.
+                let mid_lookup = if entries.is_empty() {
+                    "none".to_string()
+                } else {
+                    let mid = &entries[entries.len() / 2];
+                    match pcmap.lookup(mid.host_offset + 1) {
+                        Some(spirv) => spirv.to_string(),
+                        None => "none".to_string(),
+                    }
+                };
                 println!(
-                    "pcmap present entries={} first_spirv={} last_host={}",
-                    entries.len(), first_spirv, last_host,
+                    "pcmap present entries={} first_spirv={} \
+                     last_host={} mid_lookup={}",
+                    entries.len(), first_spirv, last_host, mid_lookup,
                 );
             }
             None => println!("pcmap absent"),
