@@ -2264,3 +2264,45 @@ PASS  switch n=9   -> [1 1 1 1]               (backend=bespoke)
 PASS  unordcmp lt  -> [1 0 0 1]               (backend=cranelift)
 PASS  unordcmp ge  -> [0 0 1 1]               (backend=cranelift)
 ```
+
+### Loader-cache in-VM verification
+
+`run-e2e-in-vm.sh` drives the `atrium-spv-compile` binary
+directly. `run-loader-e2e-in-vm.sh` goes one layer up — it
+exercises `atrium-spv-loader`'s `ShaderCache`, the
+daemon-side component that hashes SPIR-V, looks up the
+on-disk cache, spawns `atrium-spv-compile` only on a miss,
+dlopens the result, and hands back typed entry-point
+pointers.
+
+```bash
+sh atrium-spv-backend-bespoke/verify/run-loader-e2e-in-vm.sh
+```
+
+The driver (`atrium-spv-loader/examples/loader_e2e_driver.rs`,
+cross-built + run in the VM) loads each shader **twice**:
+
+1. **cold** — a real `compile_binary`; the cache miss
+   spawns it, writing `<hash>.so` + `<hash>.pcmap`.
+2. **warm** — a *fresh* `ShaderCache` (empty in-memory
+   state) whose `compile_binary` is a deliberately bogus
+   path. A miss here would try to spawn it and fail — so
+   reaching a `LoadedShader` proves the load was served
+   purely from the on-disk `.so`, with **no re-compile**.
+
+It then calls the disk-cache-loaded entry point and prints
+the RGBA. A PASS therefore proves, on the production
+target: loader hashing, the loader↔compile-binary
+handshake, the path-versioned disk cache, the dlopen/dlsym
+path, and the AAPCS64 entry-point call.
+
+Verified 2026-05-14 on FreeBSD 16.0-CURRENT arm64 (the
+`unordcmp` row also confirms a Cranelift-fallback shader
+round-trips through the loader cache):
+```
+PASS  const        -> [0.125 0.375 0.625 1]
+PASS  ifelse then  -> [1 0 0 1]
+PASS  loop n=5     -> [1 1 1 1]
+PASS  switch n=2   -> [0 0 1 1]
+PASS  unordcmp lt  -> [1 0 0 1]
+```
