@@ -2549,3 +2549,96 @@ run":
   — which is exactly what the `.pcmap` sidecar already
   mitigates. This is the high-value follow-up; "compile
   every run" is not.
+
+#### JIT-emit path — scoped design
+
+Goal: replace `object → cc -shared → .so → dlopen` with
+`object → flat code blob → mmap PROT_EXEC`. Target ~41 ms
+→ ~0.3 ms compile, and no `cc` in the runtime dependency
+set. **Unchanged:** the jailed `atrium-spv-compile`
+sub-process (D3), the SHA-256 content-hash cache, the
+`v{N}/` ABI versioning, the bespoke-first/Cranelift
+backend selection, the `.pcmap` sidecar.
+
+**Why this is mostly cheap for the bespoke backend.** Its
+`.text` is already self-contained, position-independent
+machine code: branches are PC-relative and patched
+*inside* `compile()` (the `branch_relocs` /
+`cond_branch_relocs` passes), float constants are
+materialised inline (`mov`/`movk`+`fmov`, no constant
+pool), and the fragment ABI is entirely
+register/pointer — **no external relocations, no rodata,
+no `.data`**. `compile()` already has the raw bytes in its
+`asm::Asm` buffer *before* it wraps them in an
+`object::write::Object`; a `compile_blob()` is strictly
+less work than the object path. The entry point is offset
+0 (the function starts with the prologue).
+
+**The blob format** (`atrium-spv-blob` crate, or fold into
+`atrium-spv-pcmap`):
+`[magic | version | arch | flags | code_len | entry table | code …]`.
+The entry table names which of `atrium_fs_main` /
+`atrium_vs_main` / `atrium_cs_main` are present and their
+byte offsets. A flat AAPCS64 code blob is **OS-agnostic**
+(only arch-specific) — a nice simplification over the
+ELF-vs-Mach-O object split. Reloc/rodata fields are
+reserved but unused for bespoke; see open question 1.
+
+**Per-component changes:**
+* `atrium-spv-backend-bespoke` — add `compile_blob()`
+  returning `(code: Vec<u8>, entry_offsets, pcmap)`
+  alongside the existing `compile()`. Nearly free.
+* `atrium-spv-backend-cranelift` — needs the same, but
+  Cranelift's blob output is the real unknown (open Q1).
+* `atrium-spv-compile` — drop `link_to_shared_lib`; write
+  `<hash>.afblob` + `<hash>.pcmap`. Backend selection
+  unchanged.
+* `atrium-spv-loader` — new `mmap`-load path beside
+  `dlopen.rs` (same local `allow(unsafe_code)` island):
+  `mmap` anon RW → copy code → (apply relocs) →
+  **flush the icache** → `mprotect` RX → entry pointers =
+  `base + offset`. `LoadedShader` swaps its
+  `libloading::Library` field for the mapping handle
+  (drop = `munmap`); same outward shape.
+
+**Phasing** (each phase gated by the differential + in-VM
+suites):
+1. Blob format crate + `compile_blob()` on the bespoke
+   backend (no relocs — the easy 80%). Unit-test round-trip.
+2. Loader `mmap`-load path incl. the icache flush. Host
+   unit test: bespoke → blob → mmap → call a `const`
+   shader.
+3. Wire `atrium-spv-compile` to emit blobs and
+   `atrium-spv-loader` to load them; bump the cache `v{N}`.
+   Run the full differential + in-VM + bench suites — the
+   bench should now show the ~130× compile win.
+4. Cranelift blob output (open Q1) — or, interim, keep
+   Cranelift-compiled shaders on a `cc` fallback path so
+   the common (bespoke) case still gets the win.
+
+**Open questions / risks:**
+1. **Cranelift relocations** — does `cranelift-object`'s
+   output carry rodata-relative or other relocs? If so the
+   blob format needs a reloc table the loader applies, or
+   Cranelift must be driven via its lower-level
+   code+relocs API (it's built for JIT — `cranelift-jit`
+   exists — so feasible). This decides whether phase 4 is
+   small or a sub-arc.
+2. **ARM64 icache flush** — writing code then executing it
+   *requires* an explicit i-cache invalidation; `dlopen`
+   does this for us today. Must not forget — stale-icache
+   bugs are nondeterministic and brutal.
+3. **`PROT_EXEC` mmap in the daemon's environment** — the
+   loader runs in the daemon (not the jail); confirm no
+   MAC policy / jail cap blocks anonymous executable
+   mappings on the FreeBSD target.
+4. **Debugger / profiler visibility** — a raw mmap'd blob
+   has no dynamic-linker symbol; backtraces show a bare
+   address. `.pcmap` covers crash-triage source
+   attribution; live `perf` would later want a jitdump
+   registration. Acceptable, noted.
+5. **Multi-function modules** — if the frontend ever keeps
+   `OpFunctionCall` (separate IR functions rather than
+   inlining), the blob needs intra-blob call relocation.
+   Current shaders are single-function; confirm the
+   frontend's policy before relying on "no relocs".
