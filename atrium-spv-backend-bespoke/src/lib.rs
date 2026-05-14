@@ -513,9 +513,14 @@ fn emit_function(
     let mut epilogue_offs: Vec<usize> = Vec::new();
 
     let mut flat_i: usize = 0;
-    for bid in &block_order {
+    for (block_pos, bid) in block_order.iter().enumerate() {
         let block = func.blocks.get(bid).unwrap();
         block_asm_offset.insert(*bid, a.len());
+        // The block emitted immediately after this one, if
+        // any — branch-to-next-block elision drops an
+        // unconditional `b` whose target is this block.
+        let next_block: Option<BlockId> =
+            block_order.get(block_pos + 1).copied();
     for (block_inst_idx, inst) in block.insts.iter().enumerate() {
         let i = flat_i;
         flat_i += 1;
@@ -1104,9 +1109,15 @@ fn emit_function(
                         }
                     }
                 }
-                let patch_off = a.len();
-                a.emit(asm::b(0));
-                branch_relocs.push((patch_off, *target));
+                // Branch-to-next-block elision: if `target`
+                // is the very next block in emission order,
+                // the `b` would jump to the following
+                // instruction — just fall through.
+                if next_block != Some(*target) {
+                    let patch_off = a.len();
+                    a.emit(asm::b(0));
+                    branch_relocs.push((patch_off, *target));
+                }
             }
             Op::Switch { selector, cases, default } => {
                 // Lower to a chain of cmp_imm_w + b.cond.EQ
@@ -1137,10 +1148,13 @@ fn emit_function(
                     a.emit(asm::b_cond(asm::Cond::Eq, 0));
                     cond_branch_relocs.push((patch_t, *target, asm::Cond::Eq));
                 }
-                // Fall-through to default.
-                let patch_d = a.len();
-                a.emit(asm::b(0));
-                branch_relocs.push((patch_d, *default));
+                // Jump to default — elided if default is
+                // the next block in emission order.
+                if next_block != Some(*default) {
+                    let patch_d = a.len();
+                    a.emit(asm::b(0));
+                    branch_relocs.push((patch_d, *default));
+                }
             }
             Op::BranchCond { cond, t_block, f_block } => {
                 // BranchCond targeting a Phi-bearing block
@@ -1185,10 +1199,16 @@ fn emit_function(
                     }
                 };
                 cond_branch_relocs.push((patch_t, *t_block, branch_cond));
-                // Unconditional fallthrough to f_block.
-                let patch_f = a.len();
-                a.emit(asm::b(0));
-                branch_relocs.push((patch_f, *f_block));
+                // Unconditional branch to f_block — elided
+                // when f_block is the next block emitted
+                // (the conditional `b.<cond>` above already
+                // handles the taken edge; control just
+                // falls through to f_block).
+                if next_block != Some(*f_block) {
+                    let patch_f = a.len();
+                    a.emit(asm::b(0));
+                    branch_relocs.push((patch_f, *f_block));
+                }
             }
             other => {
                 return Err(BackendError::Unsupported(format!(
