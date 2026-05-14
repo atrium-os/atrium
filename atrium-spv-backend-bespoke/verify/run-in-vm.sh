@@ -20,6 +20,10 @@
 #     loop header's two Phis, the back-edge Branch + its
 #     relocation, OpSelect. Driven with n=5 (white) and
 #     n=4 (black) so both Select outcomes run.
+#   * arith  — `out = (n*2+1)*0.125`, no control flow. IMul,
+#     IAdd, ConvertSToF (scvtf), FMul on the W-reg pool +
+#     int->float path. On-target twin of the host
+#     three_way_int_arith_and_convert differential test.
 #
 # Prereqs: the dev VM is up (scripts/run-vm.sh) and
 # reachable on localhost:2222 with the fresco_bsd key.
@@ -77,6 +81,8 @@ verify "ifelse then"  "0.2"     ifelse 0.2
 verify "ifelse else"  "0.8"     ifelse 0.8
 verify "loop n=5"     "5 int"   loop 5
 verify "loop n=4"     "4 int"   loop 4
+verify "arith n=3"    "3 int"   arith 3
+verify "arith n=1"    "1 int"   arith 1
 
 if [ "$FAILED" = "0" ]; then
   echo "==> PASS — bespoke ELF + AAPCS64 codegen verified on FreeBSD aarch64"

@@ -2104,7 +2104,7 @@ What it does:
    fragment ABI and prints the RGBA.
 4. Compares VM output against the host-side expected value.
 
-The script covers three shaders:
+The script covers four shaders:
 * **const** — constant-colour store: exercises the ELF object
   format, the exported symbol, and the Store path.
 * **ifelse** — `if (push_const.scale < 0.5) red else blue`:
@@ -2118,6 +2118,13 @@ The script covers three shaders:
   (`stp`/`ldp` of X19..X28 — loops outrun the 5 caller-saved
   int slots), and the loop-liveness machinery. Driven with
   `n=5` (sum 10 → white) and `n=4` (sum 6 → black).
+* **arith** — `out = (n*2+1)*0.125`, no control flow: IMul,
+  IAdd, ConvertSToF (`scvtf`), FMul on the W-reg integer pool
+  + the int→float path. The on-target twin of the host
+  `three_way_int_arith_and_convert` differential test. The
+  0.125 scale is a negative power of two so every result is
+  exact in f32 and prints identically under Rust's `{}` and
+  the harness's C `%g`. Driven with `n=3` and `n=1`.
 
 Verified 2026-05-14 on FreeBSD 16.0-CURRENT arm64:
 ```
@@ -2126,6 +2133,8 @@ PASS  ifelse then  -> [1 0 0 1]
 PASS  ifelse else  -> [0 0 1 1]
 PASS  loop n=5     -> [1 1 1 1]
 PASS  loop n=4     -> [0 0 0 1]
+PASS  arith n=3    -> [0.875 0.875 0.875 1]
+PASS  arith n=1    -> [0.375 0.375 0.375 1]
 ```
 The bespoke ELF + AAPCS64 codegen — object format, `cc -shared`
 link, `dlopen`/`dlsym`, the fragment ABI, the conditional-

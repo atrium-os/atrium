@@ -10,6 +10,8 @@
 //!   emit_freebsd_obj <out.o>            -- constant-colour shader
 //!   emit_freebsd_obj <out.o> const      -- (same)
 //!   emit_freebsd_obj <out.o> ifelse <s> -- if(s<0.5) red else blue
+//!   emit_freebsd_obj <out.o> loop <n>   -- counted-loop sum check
+//!   emit_freebsd_obj <out.o> arith <n>  -- out = (n*2+1)*0.125
 //!
 //! stdout is always the expected RGBA for the chosen
 //! shader+input, so the in-VM harness can diff against it
@@ -199,6 +201,69 @@ fn build_loop_spirv() -> Vec<u8> {
     bytes
 }
 
+/// Integer arithmetic + int→float conversion:
+/// `n` is an i32 push-constant; compute `r = n*2 + 1`
+/// (IMul, IAdd), convert to f32 (ConvertSToF), scale by
+/// 0.125 (FMul), and store `[r,r,r,1]`. The 0.125 scale
+/// is a negative power of two so every result is exact in
+/// f32 and prints identically under Rust's `{}` and the
+/// harness's C `%g` — avoids a spurious format-precision
+/// diff. Exercises the W-reg
+/// integer pool and the scvtf path on the real target,
+/// independent of any control flow — the on-target twin
+/// of the host `three_way_int_arith_and_convert` test.
+fn build_arith_spirv() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let f32_ty = b.type_float(32, None);
+    let i32_ty = b.type_int(32, 1);
+    let vec4 = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let pc_struct = b.type_struct(vec![i32_ty]);
+    b.member_decorate(pc_struct, 0, Decoration::Offset,
+                      vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(pc_struct, Decoration::Block, vec![]);
+    let ptr_pc_struct = b.type_pointer(None, StorageClass::PushConstant, pc_struct);
+    let ptr_pc_i32    = b.type_pointer(None, StorageClass::PushConstant, i32_ty);
+    let ptr_out       = b.type_pointer(None, StorageClass::Output, vec4);
+    let zero_i = b.constant_bit32(i32_ty, 0u32);
+    let one_i  = b.constant_bit32(i32_ty, 1u32);
+    let two_i  = b.constant_bit32(i32_ty, 2u32);
+    let c01 = b.constant_bit32(f32_ty, 0.125f32.to_bits());
+    let c1  = b.constant_bit32(f32_ty, 1.0f32.to_bits());
+    let pc_var = b.variable(ptr_pc_struct, None, StorageClass::PushConstant, None);
+    let out = b.variable(ptr_out, None, StorageClass::Output, None);
+    b.decorate(out, Decoration::Location,
+               vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let p = b.access_chain(ptr_pc_i32, None, pc_var, vec![zero_i]).unwrap();
+    let n = b.load(i32_ty, None, p, None, vec![]).unwrap();
+    let m = b.i_mul(i32_ty, None, n, two_i).unwrap();
+    let r_i = b.i_add(i32_ty, None, m, one_i).unwrap();
+    let r_f = b.convert_s_to_f(f32_ty, None, r_i).unwrap();
+    let lum = b.f_mul(f32_ty, None, r_f, c01).unwrap();
+    let color = b.composite_construct(vec4, None,
+        vec![lum, lum, lum, c1]).unwrap();
+    b.store(out, color, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![out]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let path = args.next()
@@ -236,6 +301,14 @@ fn main() {
                 [0.0, 0.0, 0.0, 1.0]   // black
             };
             (build_loop_spirv(), expected)
+        }
+        "arith" => {
+            // n from an i32 push-const; out = (n*2+1)*0.125.
+            let n: i32 = args.next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(3);
+            let lum = (n * 2 + 1) as f32 * 0.125;
+            (build_arith_spirv(), [lum, lum, lum, 1.0])
         }
         other => {
             eprintln!("unknown shader kind: {other}");
