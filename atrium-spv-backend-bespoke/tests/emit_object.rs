@@ -76,20 +76,23 @@ fn unsupported_op_falls_back_with_unsupported_error() {
     use atrium_spv_backend_bespoke::BackendError;
     use atrium_spv_ir::{Value, ValueId};
 
-    // Build a module with an int-arithmetic op. Step 2's
-    // ISel doesn't cover IAdd yet → must return
-    // Unsupported (the production driver interprets that
-    // as "fall back to Cranelift").
+    // Build a module with a screen-space derivative op.
+    // The bespoke backend's ISel covers the full common
+    // fragment-shader surface now, but derivatives
+    // (DPdx/DPdy/Fwidth) need quad-level cooperation the
+    // bespoke per-invocation model doesn't provide → it
+    // returns Unsupported, and the production driver
+    // falls back to Cranelift.
     let entry_block = BlockId(0);
     let mut blocks = HashMap::new();
-    let v = Value { id: ValueId(0), ty: Type::I32 };
+    let v = Value { id: ValueId(0), ty: Type::F32 };
     blocks.insert(entry_block, Block {
         id: entry_block,
         kind: BlockKind::Linear,
         insts: vec![
             Inst {
-                op: Op::IAdd(v.clone(), v.clone()),
-                result: Some(Value { id: ValueId(1), ty: Type::I32 }),
+                op: Op::Fwidth(v.clone()),
+                result: Some(Value { id: ValueId(1), ty: Type::F32 }),
                 source_spirv_offset: 0,
             },
             Inst { op: Op::Return, result: None, source_spirv_offset: 0 },

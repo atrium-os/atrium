@@ -117,13 +117,25 @@ fn frontend_translates_constant_color_shader() {
     // We assert: 4 ConstFloats with the right values, 1
     // ConstVec referencing those 4 values, 1 Store using
     // the ConstVec's result, and Return as the terminator.
-    let const_floats: Vec<f32> = block.insts.iter().filter_map(|i| {
-        if let Op::ConstFloat { value, kind: atrium_spv_ir::FloatKind::F32 } = &i.op {
-            Some(*value as f32)
-        } else { None }
-    }).collect();
-    assert_eq!(const_floats, vec![1.0, 0.5, 0.25, 1.0],
-               "expected exactly four ConstFloat insts with shader's RGBA");
+    // The entry block opens with the pre-materialised
+    // constant prelude (added so SSA refs from any block
+    // stay dominated — see functions.rs). rspirv dedups
+    // identical OpConstant ids, so the shader's RGBA
+    // (1.0, 0.5, 0.25, 1.0) yields three *distinct*
+    // ConstFloats; the hoist walks the constant table in
+    // HashMap order, so we assert the SET, not an ordered
+    // list with the duplicate.
+    let const_floats: std::collections::HashSet<u32> =
+        block.insts.iter().filter_map(|i| {
+            if let Op::ConstFloat { value, kind: atrium_spv_ir::FloatKind::F32 } = &i.op {
+                Some((*value as f32).to_bits())
+            } else { None }
+        }).collect();
+    let expected: std::collections::HashSet<u32> =
+        [1.0f32, 0.5, 0.25].iter().map(|f| f.to_bits()).collect();
+    assert_eq!(const_floats, expected,
+               "expected the shader's three distinct ConstFloat values \
+                (1.0, 0.5, 0.25) materialised in the entry-block prelude");
 
     let const_vec = block.insts.iter()
         .find(|i| matches!(i.op, Op::ConstVec(_)))
@@ -154,16 +166,23 @@ fn frontend_translates_constant_color_shader() {
 
     // ── 7. source_spirv_offset is plumbed (constraint A2) ──
     //
-    // Every body Inst should carry a non-zero byte offset
-    // (the function's body starts well past byte 0 in the
-    // SPIR-V). The OpStore and OpReturn instructions each
-    // have distinct offsets; constants synthesised by the
-    // function pass inherit the offset of the using-op
-    // (the OpStore in this case).
+    // Every Inst translated from a *real* source
+    // instruction carries a non-zero byte offset (the
+    // function body starts well past byte 0). The
+    // constant-hoist prelude (ConstFloat / ConstVec
+    // synthesised before the block walk so SSA refs stay
+    // dominated) legitimately carries offset 0 — those
+    // Insts don't correspond to a single source op.
+    // So we check every non-prelude Inst.
     for inst in &block.insts {
+        if matches!(inst.op,
+            Op::ConstFloat { .. } | Op::ConstVec(_) | Op::ConstInt { .. })
+        {
+            continue; // hoisted prelude — exempt
+        }
         assert!(inst.source_spirv_offset > 0,
-            "every IR Inst must carry a non-zero source SPIR-V offset \
-             (constraint A2); got 0 on op {:?}", inst.op);
+            "every non-prelude IR Inst must carry a non-zero source \
+             SPIR-V offset (constraint A2); got 0 on op {:?}", inst.op);
     }
     // The terminator (Return) has a strictly greater
     // offset than the Store before it.

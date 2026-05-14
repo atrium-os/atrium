@@ -1986,3 +1986,97 @@ vssh "cd /root/mesa && ninja -C build-atrium install"
 (`mesa_share` mount tag) for inspecting the build dir from host —
 but **don't** `cp -r` from `/mnt/mesa` inside the VM; 9p's FD pool
 exhausts mid-copy and locks up the guest. Always rsync over SSH.
+
+## 12. Tier-2 software Vulkan renderer (atrium-spv-*)
+
+The tier-2 path runs arbitrary SPIR-V shaders on the CPU when no
+native GPU path exists. AOT-on-first-use: SPIR-V → IR → object →
+`ld` → `.so`, cached on disk, then dlopen'd and called. **Not a
+JIT** — static translation + execution, per the locked design
+decision (`docs/spec/tier2-renderer.md` §D1).
+
+### Crate map
+
+| Crate | Role |
+|-------|------|
+| `atrium-spv-ir` | Types-only SSA IR. `Op` enum, `Type`, `Block`/`BlockKind`, `Module`. No logic. |
+| `atrium-spv-pcmap` | Binary PC-map sidecar format (`ATRPCMAP` magic) for crash triage. |
+| `atrium-spv-frontend` | SPIR-V → IR. Structured-CFG recovery, constant hoist, offset table (constraint A2). |
+| `atrium-spv-backend-cranelift` | IR → object via Cranelift. The graceful-degradation fallback + differential twin. |
+| `atrium-spv-backend-bespoke` | IR → ARM64 object via `pptk-codegen-arm64::asm`. The perf path. |
+| `atrium-spv-tests` | Interpreter (the F1-clean oracle — walks SPIR-V directly, zero shared frontend code) + `assert_shader_agrees`. |
+| `atrium-spv-differential` | `CraneliftRunner` + `BespokeRunner`; three-way harness. |
+| `atrium-spv-loader` | `ShaderCache`: SHA-256-keyed `.so` cache + dlopen. Spawns `atrium-spv-compile` on miss. |
+| `atrium-spv-compile` | Standalone compile binary the loader shells out to. |
+
+### Three-tier model
+
+1. **bespoke** — ARM64 codegen, the production hot path. Linear-scan
+   register allocator, single-pass ISel.
+2. **Cranelift** — fallback for IR shapes bespoke returns
+   `Unsupported` for (matrices, images/samplers, atomics,
+   derivatives). Also the differential twin.
+3. **interpreter** — the test oracle. Reads SPIR-V via `rspirv::dr`
+   directly; **constraint F1**: zero shared code with the production
+   frontend, so a frontend bug makes two-of-three runners agree with
+   each other and *disagree* with the interpreter.
+
+### Bespoke backend opcode coverage (as of v17)
+
+Full common fragment-shader surface:
+- scalar + vec FP arithmetic (FAdd/FSub/FMul/FDiv/FNeg)
+- integer arithmetic (IAdd/ISub/IMul/SDiv/UDiv/INeg) + bitwise
+  (And/Or/Xor/Not) + shifts (Shl/LShr/AShr)
+- all 16 comparisons (6 FOrd + 10 int signed/unsigned)
+- int↔float conversions (ConvertSToF/UToF/FToS/FToU)
+- structured CFG: if/else, loops, switch — Branch / BranchCond /
+  Switch with post-emit relocation patching
+- Phi at merge blocks (per-edge `fmov_s` moves)
+- Select (scalar + vec, `fcsel_s`)
+- Dot, VectorTimesScalar, VectorShuffle, CompositeConstruct,
+  CompositeExtract
+- AccessChain + Load through push-constant / uniform pointers
+
+Register pools (all caller-saved, no prologue):
+- V16..V31 — f32 scalar linear-scan pool
+- W10..W12 — Bool pool (fcmp/icmp results)
+- W13..W17 — integer scalar pool
+
+ABI (AAPCS64 fragment split): `X0`=in_varyings `X1`=uniforms
+`X2`=push_constants `X3`=samples_mask `X4`=out_color `X5`=out_depth;
+`S0..S3`=frag_coord.
+
+### Running the tests
+
+```bash
+# Each crate independently (host, fast — bespoke needs cc + dlopen)
+for c in atrium-spv-{ir,pcmap,frontend,tests,backend-cranelift,\
+backend-bespoke,loader,compile,differential}; do
+  (cd "$c" && cargo test)
+done
+
+# The three-way differential harness is the key signal:
+(cd atrium-spv-differential && cargo test)   # 23 tests, all 3 runners
+```
+
+`atrium-spv-compile` must be built before `atrium-spv-loader` /
+`aqueduct-gpu-host` integration tests run — they shell out to the
+binary by path (`../atrium-spv-compile/target/debug/`).
+
+### Host integration
+
+`aqueduct-gpu-host` wraps the loader: `Tier2Registry` (SHA-256 →
+compiled `LoadedShader`) + `Tier2Backend` (a `Backend` trait impl
+that runs `atrium_fs_main` per pixel during `submit_frame`).
+`Session::handle_pipeline_create` auto-binds a graphics pipeline's
+fragment shader to its `tier2_id` so the standard wire sequence
+(SHADER_UPLOAD → PIPELINE_CREATE → SUBMIT_FRAME) drives Tier-2
+execution with no out-of-band wiring.
+
+### pptk dependency
+
+The bespoke backend's ARM64 encoder is `pptk-codegen-arm64` from the
+**adjacent PPTK repo** (`~/src/pptk`), not vendored. Tier-2 work
+added f32-scalar encoders there (`fadd_s`/`fsub_s`/`fmul_s`/`fdiv_s`,
+`fcmp_s`, `fmov_s`, `fcsel_s`, `scvtf_s_from_w`, `fcvtzs_w_from_s`,
+etc.) — companion commits live in the pptk repo, not here.
