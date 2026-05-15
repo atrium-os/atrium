@@ -3205,10 +3205,37 @@ So the door is open; the work is wiring through.
    `interpreter_passthrough_vertex_three_vertices`
    (distinct attribute per vertex → distinct positions
    per invocation; gates the inv_idx threading).
-2. Cranelift vertex codegen: the signature exists;
-   wire `resolve_pointer_param` for Vertex storage
-   classes that the existing OpStore/OpLoad code paths
-   already handle for Fragment.
+2. **✅ done.** Cranelift vertex codegen. Existing
+   scaffolding (build_signature, resolve_pointer_param
+   Input/Uniform/PushConstant mappings) was nearly
+   complete — only the Output mapping needed
+   adjustment: `(Vertex, Output) → params[6]`
+   (`out_position`), not `params[7]` (`out_varyings`).
+   The v1 mapping assumes the shader only writes
+   gl_Position; a real shader with both gl_Position and
+   Location-decorated varyings needs richer dispatch
+   (look at the variable's `BuiltIn` vs `Location`
+   decoration). Queued for phase 4+.
+
+   Two new tests (`atrium-spv-differential/tests/
+   vertex_constant.rs`):
+   * `cranelift_constant_position_vertex` —
+     `gl_Position = constant_composite vec4(0.25, 0.5,
+     0.75, 1.0)`, compiled through Cranelift,
+     `cc -shared`, `dlopen`, `atrium_vs_main(...)`
+     invoked with all-null args + a host stack slot
+     for `out_position`. Result matches both the
+     interpreter and the literal expected.
+   * `cranelift_passthrough_vertex` — the real
+     passthrough: `vec3 location=0` attribute
+     `(0.25, -0.5, 0.75)` packed as 12 bytes, fed via
+     `in_attributes`. The shader OpLoad's the vec3,
+     `composite_construct(x, y, z, 1.0)`, stores into
+     gl_Position. Cranelift's output matches the
+     interpreter's bit-tolerant.
+
+   **First-ever vertex shader compiled through a
+   backend and producing correct gl_Position on host.**
 3. Bespoke vertex codegen: same — extend
    `resolve_pointer_param` (and the equivalent of x_out
    for vertex's `out_position` / `out_varyings`).

@@ -1497,7 +1497,15 @@ impl FnTranslator {
             (ShaderStage::Vertex, StorageClass::Input) => Ok(self.params[0]),
             (ShaderStage::Vertex, StorageClass::Uniform) => Ok(self.params[2]),
             (ShaderStage::Vertex, StorageClass::PushConstant) => Ok(self.params[3]),
-            (ShaderStage::Vertex, StorageClass::Output) => Ok(self.params[7]),
+            // v1 maps Vertex Output → out_position (param
+            // 6) on the assumption the shader only writes
+            // gl_Position. A real shader with both
+            // gl_Position AND Location-decorated varyings
+            // needs richer dispatch (look at the variable's
+            // BuiltIn vs Location decoration to choose
+            // out_position vs out_varyings); landing that
+            // is queued for vertex phase 4+.
+            (ShaderStage::Vertex, StorageClass::Output) => Ok(self.params[6]),
             // Compute (params: uniforms, push, workgroup_id*3, local_id*3)
             (ShaderStage::Compute, StorageClass::Uniform) => Ok(self.params[0]),
             (ShaderStage::Compute, StorageClass::PushConstant) => Ok(self.params[1]),
