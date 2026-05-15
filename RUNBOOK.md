@@ -2761,6 +2761,52 @@ correctness parity with the interpreter oracle; the
 `native/fma` bench column stays the separate, explicitly
 non-bit-exact ceiling.
 
+#### Next arc — scoped: ConstVec literal pool
+
+The NEON-vectoriser arc left a residual ~57 ns gap on
+`heavyvec` (bespoke 274 ns vs `clang -O2` 217 ns). The
+loop body is at parity; the gap is per-call prologue. A
+pack-friendly `ConstVec` currently materialises via 4
+`movz/movk w` + 4 `fmov s,w` + 4 `ins v.s[k]` = 12 insts
+per vec4, plus extra inst slots for non-trivial bit
+patterns. `heavyvec` has 3 such ConstVecs → ~36 prologue
+instructions for vector constants alone. `clang -O2`
+emits the 16-byte literal once and reads it with a single
+`ldr q, [pc-rel]` per use — the obvious cheap path.
+
+**Design.** Append a per-function literal pool *inside*
+the same `.text` symbol, after the `ret`. PC-relative
+`LDR Qt, label` (imm19, ±1 MiB) reaches it in one
+instruction with zero relocs — fits the JIT-emit
+constraints already met by the rest of the code. The
+pool stays in the same mapped region (`PROT_EXEC`-readable
+on FreeBSD/Linux ARM64 and inside macOS `MAP_JIT`), and
+the symbol size grows to cover it, so dlopen / mmap of
+the blob loads it intact. ConstVec dedup is a free hash;
+identical vec4s share a slot.
+
+**Risk — none material.** `ret` precedes the pool so it's
+never executed; imm19 ±1 MiB dwarfs realistic function
+sizes; rodata-in-.text is conventional for tiny PIC
+helpers. The pool only applies to *pack-friendly*
+`ConstVec`s (all-`ConstFloat` lanes); a per-lane ConstVec
+still wants the existing per-S-reg path.
+
+**Phasing.**
+0. pptk: add `ldr_q_literal(rt, imm19)` encoder + spot
+   test (LDR (literal) SIMD&FP, opc=10, V=1).
+1. backend: pre-pass collects unique pack-friendly
+   ConstVec constants → slot table; packed-ConstVec
+   emission becomes a single placeholder `ldr q`; after
+   the function body emit, lay out the pool (16-byte
+   aligned, deduped) and patch each placeholder's imm19.
+   Gate: full differential 26/26 + in-VM 19/19 still
+   bit-exact; disasm shows one `ldr q` per ConstVec.
+2. re-bench `heavyvec`. Target: <250 ns (close to
+   native's 217 ns). If the gap closes to <10%, the arc
+   is done; if not, investigate the entry-edge packed
+   Phi-move + the residual per-call cost.
+
 #### Compile-pipeline phase breakdown — `cc` is the cost
 
 With the backend ~4.7× faster, the question came up: is
