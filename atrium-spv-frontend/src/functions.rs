@@ -947,6 +947,14 @@ fn translate_inst(
         // OpLoad: load a leaf value through a pointer. The
         // pointer is either a bare Variable (offset 0) or an
         // AccessChain result.
+        //
+        // Special case: a Load whose result type is an
+        // Image / Sampler / SampledImage isn't a memory
+        // load — descriptor-bound resources don't have a
+        // loadable byte region. We emit `Op::ImageHandle`
+        // carrying the variable's `(set, binding)` instead,
+        // so the backend / interpreter can resolve the
+        // descriptor at the sample call site.
         SpvOp::Load => {
             let result_id = spv_inst.result_id.ok_or_else(||
                 FrontendError::Malformed(
@@ -956,6 +964,28 @@ fn translate_inst(
                     "Load without result type".to_string()))?;
             let result_ty = types.get(result_type_id)?.clone();
             let ptr_id = expect_id(&spv_inst.operands, 0)?;
+
+            // Image / sampler / sampled-image load → ImageHandle.
+            if matches!(&result_ty,
+                atrium_spv_ir::Type::Image(_)
+                | atrium_spv_ir::Type::Sampler
+                | atrium_spv_ir::Type::SampledImage(_))
+            {
+                let (set, binding) = iface.var_binding.get(&ptr_id)
+                    .copied()
+                    .ok_or_else(|| FrontendError::Malformed(format!(
+                        "Load of image/sampler variable {ptr_id} \
+                         missing DescriptorSet+Binding decorations",
+                    )))?;
+                let result = alloc_or_get_result(result_id, result_ty, id_map, next_value_id);
+                insts.push(Inst {
+                    op: Op::ImageHandle { set, binding },
+                    result: Some(result),
+                    source_spirv_offset,
+                });
+                return Ok(());
+            }
+
             // Try variable first; fall back to id_map (set
             // by a prior AccessChain).
             let ptr_value = match resolve_variable(

@@ -538,6 +538,19 @@ pub enum Op {
     // backend emits the call sequence; the runtime kernel
     // does the actual filtered sample.
 
+    /// A descriptor-bound handle to an image / sampler /
+    /// sampled-image. Produced by the frontend in place of
+    /// `Op::Load` when the load targets a `UniformConstant`
+    /// variable of image/sampler type — *not* a memory
+    /// load, but the binding's `(set, binding)` resolved
+    /// at translate time. Consumed by `CombineSampledImage`
+    /// and `ImageSample*` / `ImageFetch`.
+    ImageHandle {
+        /// SPIR-V `DescriptorSet` decoration value.
+        set:     u32,
+        /// SPIR-V `Binding` decoration value.
+        binding: u32,
+    },
     /// Combine an image binding and a sampler binding into
     /// a sampled-image value (SPIR-V `OpSampledImage`).
     /// Both operands are descriptor references — produced

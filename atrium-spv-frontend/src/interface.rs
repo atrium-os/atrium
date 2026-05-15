@@ -56,6 +56,13 @@ pub struct InterfaceContext {
     /// block, if any. SPIR-V allows at most one such
     /// variable per entry point.
     pub push_constant_var: Option<Word>,
+    /// SPIR-V variable id → `(set, binding)` from `OpDecorate`
+    /// `DescriptorSet`/`Binding`. Function translation uses
+    /// this for image/sampler `OpLoad` — those become
+    /// `Op::ImageHandle { set, binding }` rather than a
+    /// memory load, since descriptor-bound resources aren't
+    /// loadable byte regions.
+    pub var_binding: HashMap<Word, (u32, u32)>,
 }
 
 /// One member of an `OpTypeStruct` annotated with an
@@ -235,6 +242,7 @@ impl InterfaceContext {
                             ctx.uniforms.push(UniformBinding {
                                 set, binding, offset: 0, ty,
                             });
+                            ctx.var_binding.insert(*var_id, (set, binding));
                         }
                     }
                 }
