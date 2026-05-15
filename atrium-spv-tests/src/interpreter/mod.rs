@@ -212,6 +212,12 @@ enum TypeInfo {
     Float { width: u32 },
     /// `OpTypeVector element_type_id element_count`.
     Vector { element: Word, count: u32 },
+    /// `OpTypeMatrix column_type_id column_count` —
+    /// column-major, per SPIR-V. The interpreter stores
+    /// matrix values as `ConstantValue::Vec(columns)`
+    /// where each column is itself a `ConstantValue::Vec`
+    /// of element scalars.
+    Matrix { column: Word, count: u32 },
     /// `OpTypePointer storage_class pointee_type_id`.
     Pointer { storage: StorageClass, pointee: Word },
     /// `OpTypeFunction return_type [param_types]`.
@@ -446,6 +452,11 @@ impl Interpreter {
                 let element = op_id(&inst.operands, 0)?;
                 let count = op_lit(&inst.operands, 1)?;
                 self.types.insert(result_id, TypeInfo::Vector { element, count });
+            }
+            Op::TypeMatrix => {
+                let column = op_id(&inst.operands, 0)?;
+                let count = op_lit(&inst.operands, 1)?;
+                self.types.insert(result_id, TypeInfo::Matrix { column, count });
             }
             Op::TypePointer => {
                 let storage = op_storage(&inst.operands, 0)?;
@@ -1358,6 +1369,58 @@ impl Interpreter {
                 ]));
                 Ok(())
             }
+            // OpMatrixTimesVector: column-major mat × col
+            // vector. Result lane `i = Σ matrix[j][i] *
+            // vector[j]`. Matrix stored as Vec-of-Vecs
+            // (one column per outer entry, one lane per
+            // inner). Vector stored as Vec of lanes. v1
+            // assumes f32 throughout.
+            Op::MatrixTimesVector => {
+                let result_id = inst.result_id.ok_or_else(||
+                    InterpError::BadConstant(0))?;
+                let mat_id = op_id(&inst.operands, 0)?;
+                let vec_id = op_id(&inst.operands, 1)?;
+                let mat = self.lookup_value(mat_id, values)?;
+                let vec = self.lookup_value(vec_id, values)?;
+                let columns: Vec<Vec<f32>> = match mat {
+                    ConstantValue::Vec(cols) => cols.iter().map(|c| match c {
+                        ConstantValue::Vec(lanes) => lanes.iter().map(|l| match l {
+                            ConstantValue::F32(x) => Ok(*x),
+                            other => Err(InterpError::UnsupportedOpcode(format!(
+                                "MatrixTimesVector: matrix lane not f32: {other:?}"))),
+                        }).collect::<Result<Vec<f32>, _>>(),
+                        other => Err(InterpError::UnsupportedOpcode(format!(
+                            "MatrixTimesVector: matrix column not a Vec: {other:?}"))),
+                    }).collect::<Result<Vec<Vec<f32>>, _>>()?,
+                    other => return Err(InterpError::UnsupportedOpcode(format!(
+                        "MatrixTimesVector: matrix not a Vec-of-Vecs: {other:?}"))),
+                };
+                let v: Vec<f32> = match vec {
+                    ConstantValue::Vec(lanes) => lanes.iter().map(|l| match l {
+                        ConstantValue::F32(x) => Ok(*x),
+                        other => Err(InterpError::UnsupportedOpcode(format!(
+                            "MatrixTimesVector: vector lane not f32: {other:?}"))),
+                    }).collect::<Result<Vec<f32>, _>>()?,
+                    other => return Err(InterpError::UnsupportedOpcode(format!(
+                        "MatrixTimesVector: vector not a Vec: {other:?}"))),
+                };
+                if columns.len() != v.len() {
+                    return Err(InterpError::UnsupportedOpcode(format!(
+                        "MatrixTimesVector: {} columns × {}-lane vector mismatch",
+                        columns.len(), v.len())));
+                }
+                let n_lanes = columns[0].len();
+                let mut result = vec![0.0f32; n_lanes];
+                for j in 0..columns.len() {
+                    let vj = v[j];
+                    for i in 0..n_lanes {
+                        result[i] += columns[j][i] * vj;
+                    }
+                }
+                values.insert(result_id, ConstantValue::Vec(
+                    result.into_iter().map(ConstantValue::F32).collect()));
+                Ok(())
+            }
             other => Err(InterpError::UnsupportedOpcode(format!("{:?}", other))),
         }
     }
@@ -1575,6 +1638,31 @@ impl Interpreter {
                     lanes.push(v);
                 }
                 Ok(ConstantValue::Vec(lanes))
+            }
+            TypeInfo::Matrix { column, count } => {
+                // SPIR-V's matrix stride defaults to the
+                // column type's natural size (16 bytes for
+                // a vec4). v1 assumes the canonical layout —
+                // 4 columns of vec4<f32> = 64 bytes total.
+                // Each column loaded recursively as a
+                // Vector → ConstantValue::Vec; the matrix
+                // ends up as a Vec-of-Vecs.
+                let col_info = self.types.get(&column)
+                    .ok_or(InterpError::BadType(column))?
+                    .clone();
+                let col_stride: u32 = match col_info {
+                    TypeInfo::Vector { count: lanes, .. } => lanes * 4,
+                    _ => return Err(InterpError::UnsupportedOpcode(format!(
+                        "Load of matrix with non-vector column {col_info:?}"))),
+                };
+                let mut columns = Vec::with_capacity(count as usize);
+                for i in 0..count {
+                    let off = byte_offset.saturating_add(i * col_stride);
+                    let c = self.load_from_storage(
+                        storage_class, off, column, inputs, inv_idx, is_vertex)?;
+                    columns.push(c);
+                }
+                Ok(ConstantValue::Vec(columns))
             }
             other => Err(InterpError::UnsupportedOpcode(format!(
                 "Load of type {other:?} not supported",

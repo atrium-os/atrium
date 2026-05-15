@@ -3183,7 +3183,21 @@ the matrix multiply already exists.
    end-to-end (i.e., once interpreter + backends handle
    `Op::MatrixTimesVector` and we wire a uniform-mat4
    shader).
-2. Interpreter: walk the matrix×vec dot products.
+2. **✅ done.** Interpreter. `TypeInfo::Matrix { column,
+   count }` indexed from `OpTypeMatrix`; `load_from_storage`
+   handles matrix types by loading `count` consecutive
+   columns at 16-byte stride into a `ConstantValue::Vec`-
+   of-`Vec`s. `Op::MatrixTimesVector` handler walks the
+   column-major dot products. Two new tests
+   (`atrium-spv-tests/tests/vertex_matrix.rs`):
+   * `interpreter_mvp_transforms_position` — uniform
+     translation matrix applied to a vec3 input attribute,
+     expects `pos + (tx, ty, tz)`.
+   * `interpreter_mvp_scale_matrix` — uniform diagonal
+     scale matrix, expects each lane scaled.
+
+   First mat4 × vec4 transform working end-to-end (host-
+   side, oracle level).
 3. Cranelift: lower `Op::MatrixTimesVector` to 4
    broadcasts + 3 adds + 1 add of the four columns.
    No new code-generator surface — reuses existing
