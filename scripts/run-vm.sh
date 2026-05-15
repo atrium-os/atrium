@@ -83,6 +83,7 @@ VIRTIO_GPU_ARGS=""
 DISPLAY_FRONTEND=""
 WANT_DISPLAY=0
 WANT_TABLET=0
+WANT_KGDB=0
 # Serial on TCP + qemu monitor on a unix socket. Keeps the VM detachable
 # (no stdio coupling) while still letting us reach the FreeBSD serial
 # console — `nc 127.0.0.1 4444` and send `~^B` to drop into ddb when
@@ -176,6 +177,14 @@ for arg in "$@"; do
         --tablet)
             WANT_TABLET=1
             ;;
+        --kgdb)
+            # Enable QEMU gdb stub on tcp::1234.  Attach from host
+            # with: scripts/kgdb-attach.sh
+            # Live single-step + breakpoints into the running kernel
+            # using aarch64-elf-gdb against the LAMINAR-DEV
+            # kernel.full (with debug symbols).
+            WANT_KGDB=1
+            ;;
         *)
             echo "error: unknown arg $arg" >&2
             exit 1
@@ -206,6 +215,22 @@ elif [ "$WANT_TABLET" = 1 ]; then
     exit 1
 fi
 
+KGDB_ARGS=""
+if [ "$WANT_KGDB" = 1 ]; then
+    # -s = shorthand for -gdb tcp::1234, host-side.
+    # NOTE: with QEMU 10.x + HVF the guest starts PAUSED when -s is
+    # present (undocumented; differs from KVM behaviour).  Send
+    # `cont` via the QMP socket once it's up so boot proceeds.
+    KGDB_ARGS="-s"
+    echo "kgdb: gdb stub on 127.0.0.1:1234; attach with scripts/kgdb-attach.sh"
+    (
+        # Wait for QMP socket then resume guest.
+        until [ -S /tmp/qmp.sock ]; do sleep 0.2; done
+        sleep 0.5
+        echo "cont" | nc -U /tmp/qmp.sock -w 1 >/dev/null 2>&1 || true
+    ) &
+fi
+
 exec "$QEMU" \
     -L "$QEMU_DIR/pc-bios" \
     ${ATRIUM_QEMU_TRACE:+-trace events=$ATRIUM_QEMU_TRACE} \
@@ -228,4 +253,5 @@ exec "$QEMU" \
     $NOGRAPHIC \
     $DISPLAY_FRONTEND \
     $GPU_ARGS \
-    $VIRTIO_GPU_ARGS
+    $VIRTIO_GPU_ARGS \
+    $KGDB_ARGS
