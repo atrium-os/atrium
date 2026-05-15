@@ -27,6 +27,14 @@
 //!                                          (4 accumulators; needs V8-V15)
 //!   emit_freebsd_obj <out.o> heavyvec <n> -- vec4 Phi loop (per-lane
 //!                                            phi-move emission)
+//!   emit_freebsd_obj <out.o> texsample    -- sampler2D + ImageSample
+//!                                            at u=v=0.25 (centre of
+//!                                            texel (0,0) → red on
+//!                                            the harness's 2x2 RGBW
+//!                                            checker; on-target
+//!                                            gate for the texture
+//!                                            arc's reloc-free
+//!                                            descriptor ABI)
 //!
 //! Prefix any kind with `spirv` to write the raw SPIR-V
 //! module instead of a compiled object (for the end-to-end
@@ -1012,6 +1020,68 @@ fn eval_heavy4(n: i32) -> [f32; 4] {
     [a, b, c, d]
 }
 
+/// Texture-sample shader: declares a `sampler2D` at
+/// (set=0, binding=0) and reads `texture(tex, vec2(0.25))`.
+/// The in-VM harness pairs this with a 2x2 RGBW texture +
+/// Nearest/Clamp sampler, so the centre of texel (0,0) at
+/// u=v=0.25 (post the Vulkan `u*w - 0.5` mapping) lands
+/// on (0,0) — red. On-target gate for the texture/sampler
+/// arc's reloc-free descriptor ABI.
+fn build_texsample_spirv() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, Dim, ExecutionMode,
+        ExecutionModel, FunctionControl, ImageFormat, MemoryModel,
+        StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+
+    let void = b.type_void();
+    let f32_ty = b.type_float(32, None);
+    let vec2_f32 = b.type_vector(f32_ty, 2);
+    let vec4_f32 = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+
+    let image_ty = b.type_image(
+        f32_ty, Dim::Dim2D, 0, 0, 0, 1, ImageFormat::Unknown, None);
+    let sampled_image_ty = b.type_sampled_image(image_ty);
+
+    let ptr_uc_si    = b.type_pointer(None, StorageClass::UniformConstant, sampled_image_ty);
+    let ptr_out_vec4 = b.type_pointer(None, StorageClass::Output, vec4_f32);
+
+    let tex = b.variable(ptr_uc_si, None, StorageClass::UniformConstant, None);
+    b.decorate(tex, Decoration::DescriptorSet,
+               vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(tex, Decoration::Binding,
+               vec![rspirv::dr::Operand::LiteralBit32(0)]);
+
+    let out = b.variable(ptr_out_vec4, None, StorageClass::Output, None);
+    b.decorate(out, Decoration::Location,
+               vec![rspirv::dr::Operand::LiteralBit32(0)]);
+
+    let c_quarter = b.constant_bit32(f32_ty, 0.25f32.to_bits());
+    let uv = b.constant_composite(vec2_f32, vec![c_quarter, c_quarter]);
+
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let sampled = b.load(sampled_image_ty, None, tex, None, vec![]).unwrap();
+    let pixel = b.image_sample_implicit_lod(
+        vec4_f32, None, sampled, uv, None, vec![]).unwrap();
+    b.store(out, pixel, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![tex, out]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
 /// Vector-carrying loop: a `vec4` accumulator threaded
 /// through the loop's `OpPhi` — the shape that exercises
 /// the bespoke backend's vec-Phi support (a vecN Phi
@@ -1248,6 +1318,14 @@ fn main() {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(256);
             (build_heavyvec_spirv(), eval_heavyvec(n))
+        }
+        "texsample" => {
+            // sampler2D + OpImageSampleImplicitLod at
+            // u=v=0.25 (the centre of texel (0,0)). The
+            // in-VM harness pairs this with a 2x2 RGBW
+            // texture + Nearest/Clamp sampler, so the
+            // shader returns texel (0,0)'s colour — red.
+            (build_texsample_spirv(), [1.0, 0.0, 0.0, 1.0])
         }
         "unordcmp" => {
             // Same pixels as `ifelse` for finite inputs,

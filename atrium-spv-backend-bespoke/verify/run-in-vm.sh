@@ -62,6 +62,18 @@
 #     loop-carried value is a vec4, so the bespoke pre-pass
 #     decomposes it into four per-lane scalar Phis and emits
 #     four per-lane `mov v.16b` phi-moves on the back-edge.
+#   * texsample — `sampler2D` + `OpImageSampleImplicitLod`
+#     at u=v=0.25 (centre of texel (0,0) on a 2x2 RGBW
+#     checker). Gates the texture/sampler arc's
+#     reloc-free descriptor ABI on FreeBSD aarch64:
+#     the bespoke-emitted shader code reads the
+#     `atrium_tex_sample_2d` function pointer + the
+#     `(tex_desc*, samp_desc*)` slot out of the uniforms
+#     buffer (which `atrium_harness texsample` packs)
+#     and `blr`s through to a C-side sampler implementation
+#     in the harness. Expected pixel: `(1, 0, 0, 1)` —
+#     red, the texel-(0,0) colour the Nearest/Clamp
+#     sampler resolves to.
 #
 # Prereqs: the dev VM is up (scripts/run-vm.sh) and
 # reachable on localhost:2222 with the fresco_bsd key.
@@ -151,6 +163,7 @@ verify "cextract"     ""        cextract
 verify "dot"          ""        dot
 verify "heavy4 n=32"  "32 int"  heavy4 32
 verify "heavyvec n=16" "16 int" heavyvec 16
+verify "texsample"    "texsample" texsample
 
 if [ "$FAILED" = "0" ]; then
   echo "==> PASS — bespoke ELF + AAPCS64 codegen verified on FreeBSD aarch64"

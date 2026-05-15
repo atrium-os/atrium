@@ -3062,9 +3062,24 @@ extends the `atrium-spv-blob` format slightly — a
    `ImageSample` needs proper save/restore or a regalloc
    that forces V8..V15 across calls. Scoped as a follow-
    on when a non-trivial textured shader trips it.
-6. In-VM: a `tex_sample` shader added to `run-in-vm.sh`
-   with a host-shipped texture blob. The first real-
-   shader-shape end-to-end test on FreeBSD aarch64.
+6. **✅ done.** In-VM `texsample` shader added to
+   `run-in-vm.sh`. The harness's `texsample` mode builds
+   a 2×2 RGBW texture + Nearest/Clamp sampler in C,
+   packs the v1 uniforms-buffer prefix (helper pointers
+   at bytes 0..16, descriptor slot 0 at 16..32 — the
+   sample fn-ptr points at a C-side
+   `atrium_tex_sample_2d` baked into the harness binary),
+   and invokes the shader. The bespoke-emitted shader
+   reads everything out of uniforms and `blr`s through —
+   reloc-free. Expected pixel `(1, 0, 0, 1)`: the
+   centre of texel (0,0) at u=v=0.25 (post the Vulkan
+   `u*w - 0.5` mapping). **Result on FreeBSD aarch64:
+   PASS** — bespoke ELF → cc -shared → dlopen → blr
+   into the host C sampler → red pixel. 20/20 in-VM
+   shaders green. The texture/sampler arc is end-to-end
+   complete: every layer (frontend, IR, interpreter,
+   Cranelift, bespoke, in-VM gate) handles image-sample
+   correctly under the same v1 ABI.
 
 #### `heavyvec` tail inquiry — loop rotation is the lever
 
