@@ -1021,6 +1021,66 @@ fn eval_heavy4(n: i32) -> [f32; 4] {
 }
 
 /// Texture-sample shader: declares a `sampler2D` at
+/// Passthrough vertex shader: `vec3 in_pos` at
+/// `Location=0`, reads it, constructs
+/// `vec4(in_pos.xyz, 1.0)`, stores into
+/// `gl_Position`. On-target gate for the vertex-stage
+/// arc — same shader the host differential gates.
+fn build_vertex_passthrough_spirv() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, ExecutionModel,
+        FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+
+    let void = b.type_void();
+    let f32_ty = b.type_float(32, None);
+    let i32_ty = b.type_int(32, 1);
+    let vec3 = b.type_vector(f32_ty, 3);
+    let vec4 = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+
+    let per_vertex_struct = b.type_struct(vec![vec4]);
+    b.member_decorate(per_vertex_struct, 0, Decoration::BuiltIn,
+                      vec![rspirv::dr::Operand::BuiltIn(BuiltIn::Position)]);
+    b.member_decorate(per_vertex_struct, 0, Decoration::Offset,
+                      vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(per_vertex_struct, Decoration::Block, vec![]);
+
+    let ptr_pv_struct = b.type_pointer(None, StorageClass::Output, per_vertex_struct);
+    let ptr_out_vec4 = b.type_pointer(None, StorageClass::Output, vec4);
+    let ptr_in_vec3 = b.type_pointer(None, StorageClass::Input, vec3);
+
+    let in_pos = b.variable(ptr_in_vec3, None, StorageClass::Input, None);
+    b.decorate(in_pos, Decoration::Location,
+               vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let pv_var = b.variable(ptr_pv_struct, None, StorageClass::Output, None);
+    let c_zero_i = b.constant_bit32(i32_ty, 0u32);
+    let c_one_f  = b.constant_bit32(f32_ty, 1.0f32.to_bits());
+
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let pos = b.load(vec3, None, in_pos, None, vec![]).unwrap();
+    let x = b.composite_extract(f32_ty, None, pos, vec![0]).unwrap();
+    let y = b.composite_extract(f32_ty, None, pos, vec![1]).unwrap();
+    let z = b.composite_extract(f32_ty, None, pos, vec![2]).unwrap();
+    let pos4 = b.composite_construct(vec4, None, vec![x, y, z, c_one_f]).unwrap();
+    let pos_ptr = b.access_chain(ptr_out_vec4, None, pv_var, vec![c_zero_i]).unwrap();
+    b.store(pos_ptr, pos4, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Vertex, main, "main", vec![in_pos, pv_var]);
+
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
 /// (set=0, binding=0) and reads `texture(tex, vec2(0.25))`.
 /// The in-VM harness pairs this with a 2x2 RGBW texture +
 /// Nearest/Clamp sampler, so the centre of texel (0,0) at
@@ -1326,6 +1386,17 @@ fn main() {
             // texture + Nearest/Clamp sampler, so the
             // shader returns texel (0,0)'s colour — red.
             (build_texsample_spirv(), [1.0, 0.0, 0.0, 1.0])
+        }
+        "vertex_passthrough" => {
+            // Passthrough vec3 attribute → gl_Position.
+            // The in-VM harness packs (x, y, z) from argv
+            // into a 12-byte attribute buffer; the shader
+            // produces vec4(x, y, z, 1.0). The expected
+            // shape printed here is just the spec answer
+            // for a chosen test point (0.25, -0.5, 0.75)
+            // — the harness diffs against this string.
+            (build_vertex_passthrough_spirv(),
+             [0.25, -0.5, 0.75, 1.0])
         }
         "unordcmp" => {
             // Same pixels as `ifelse` for finite inputs,

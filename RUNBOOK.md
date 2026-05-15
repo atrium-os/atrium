@@ -3262,12 +3262,36 @@ So the door is open; the work is wiring through.
 
    **First vertex shader compiled through the bespoke
    backend producing correct gl_Position on host.**
-4. Differential `three_way_passthrough_vertex` —
-   interpreter + Cranelift + bespoke agree on the output
-   position + varyings for a triangle's three vertices.
-5. In-VM vertex shader: an `atrium_vertex_harness.c`
-   parallel to the fragment harness, driven by a new
-   `run-in-vm.sh` entry.
+4. **✅ effectively covered.** Per-backend differential
+   (interpreter vs Cranelift, interpreter vs bespoke)
+   is already in `atrium-spv-differential/tests/
+   vertex_constant.rs` — 4 tests, 2 backends × 2 shapes.
+   The transitive guarantee (Cranelift ≡ interpreter ≡
+   bespoke ⇒ Cranelift ≡ bespoke) is the same as what
+   a single 3-way `assert_shader_agrees` would give.
+   The fragment-shaped `assert_shader_agrees` helper
+   itself needs a vertex-aware sibling (the `ShaderRunner`
+   trait is fragment-shaped) — landing one in
+   `atrium-spv-tests/src/harness.rs` is small but only
+   pays off when the vertex test corpus grows past a
+   handful of shapes; deferred until then.
+5. **✅ done.** In-VM vertex harness on FreeBSD aarch64.
+   `verify/vertex_harness.c` — dlopen + dlsym
+   `atrium_vs_main`, packs three argv-floats into a
+   12-byte attribute buffer, calls vs_main per the
+   AAPCS64 vertex ABI, prints `out_position` as four
+   f32s with `%.9g`. `run-in-vm.sh` gained `verify_vertex
+   <label> <x> <y> <z> <emit-args...>` parallel to the
+   fragment `verify()`, plus an extra scp/cc step to
+   ship + build the harness in the VM. The
+   `vertex_passthrough` kind in `emit_freebsd_obj.rs`
+   emits the passthrough shader (vec3 location=0 →
+   gl_Position = vec4(in.xyz, 1.0)); harness diffs
+   against the expected `[0.25, -0.5, 0.75, 1.0]` for
+   attr `(0.25, -0.5, 0.75)`. **Result on FreeBSD
+   aarch64: PASS.** 21/21 in-VM shaders green (20
+   fragment + 1 vertex). First vertex shader running on
+   the target.
 6. Rasterizer integration (the bridge that turns a
    vertex-stage + fragment-stage pair into pixel
    output): out of scope for this arc — a separate

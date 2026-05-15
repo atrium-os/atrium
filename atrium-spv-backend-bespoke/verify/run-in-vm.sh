@@ -97,6 +97,10 @@ scp -i "$KEY" $SSHOPTS -P 2222 "$HERE/harness.c" \
     root@localhost:/tmp/atrium_fs_harness.c >/dev/null 2>&1
 ssh -i "$KEY" $SSHOPTS -p 2222 root@localhost \
     'cc -o /tmp/atrium_harness /tmp/atrium_fs_harness.c' >/dev/null 2>&1
+scp -i "$KEY" $SSHOPTS -P 2222 "$HERE/vertex_harness.c" \
+    root@localhost:/tmp/atrium_vs_harness.c >/dev/null 2>&1
+ssh -i "$KEY" $SSHOPTS -p 2222 root@localhost \
+    'cc -o /tmp/atrium_vertex_harness /tmp/atrium_vs_harness.c' >/dev/null 2>&1
 
 FAILED=0
 
@@ -142,6 +146,41 @@ verify() {
   fi
 }
 
+# verify_vertex <label> <x> <y> <z> <emit-args...>
+#   Vertex-stage parallel of verify(). Same cross-emit +
+#   scp + cc + numeric-diff plumbing, but invokes the
+#   vertex harness with three packed `vec3` attribute
+#   floats and reads gl_Position from its stdout.
+verify_vertex() {
+  label=$1; x=$2; y=$3; z=$4; shift 4
+  expected=$(cd "$CRATE" && cargo run --quiet --example emit_freebsd_obj "$OBJ" "$@" 2>/dev/null)
+  if [ -z "$expected" ]; then
+    echo "  FAIL  $label  (host emit produced no output)"
+    FAILED=1; return
+  fi
+  if ! scp -i "$KEY" $SSHOPTS -P 2222 "$OBJ" root@localhost:"$OBJ" >/dev/null 2>&1; then
+    echo "  FAIL  $label  (scp to VM failed — is the VM up + idle?)"
+    FAILED=1; return
+  fi
+  got=$(ssh -i "$KEY" $SSHOPTS -p 2222 root@localhost \
+    "cd /tmp && cc -shared -o atrium_vs.so atrium_fs_freebsd.o \
+     && ./atrium_vertex_harness ./atrium_vs.so $x $y $z" 2>/dev/null)
+  if awk -v a="$expected" -v b="$got" 'BEGIN {
+        na = split(a, ea, " "); nb = split(b, eb, " ");
+        if (na != 4 || nb != 4) exit 1;
+        for (i = 1; i <= 4; i++) {
+          d = ea[i] - eb[i]; if (d < 0) d = -d;
+          if (d > 1e-6) exit 1;
+        }
+        exit 0
+      }'; then
+    echo "  PASS  $label  -> [$got]"
+  else
+    echo "  FAIL  $label  expected [$expected] got [$got]"
+    FAILED=1
+  fi
+}
+
 echo "==> in-VM verification (FreeBSD aarch64, localhost:2222)"
 verify "const"        ""        const
 verify "ifelse then"  "0.2"     ifelse 0.2
@@ -164,6 +203,7 @@ verify "dot"          ""        dot
 verify "heavy4 n=32"  "32 int"  heavy4 32
 verify "heavyvec n=16" "16 int" heavyvec 16
 verify "texsample"    "texsample" texsample
+verify_vertex "vertex_passthrough"  0.25 -0.5 0.75  vertex_passthrough
 
 if [ "$FAILED" = "0" ]; then
   echo "==> PASS — bespoke ELF + AAPCS64 codegen verified on FreeBSD aarch64"
