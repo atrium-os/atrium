@@ -99,44 +99,96 @@ pub struct SamplerDesc {
     pub wrap_t:     u32,
 }
 
-// ── Descriptor table ──────────────────────────────────────
+// ── Uniforms-buffer layout (v1) ───────────────────────────
 //
 // How a compiled shader finds its bound textures + samplers
-// at runtime. The Atrium-Tier-2 fragment-shader AAPCS64
-// split passes a `uniforms` pointer in X1 (per
-// docs/spec/tier2-renderer.md §4.1). v1 of the texture
-// path *overlays* the uniforms buffer's first
-// `count * DESC_SLOT_BYTES` bytes with a flat array of
-// descriptor-pointer pairs, indexed by SPIR-V `Binding`
-// number (single descriptor set assumed). A backend that
-// sees an `ImageSample` against binding `B` emits:
+// + the runtime helpers to call. The Atrium-Tier-2
+// fragment-shader AAPCS64 split passes a `uniforms` pointer
+// in X1 (per docs/spec/tier2-renderer.md §4.1). v1 of the
+// texture path overlays the buffer's prefix with:
 //
-//     ldr  x_tex,  [X1, #B*16 + 0]   ; tex_desc*
-//     ldr  x_samp, [X1, #B*16 + 8]   ; samp_desc*
-//     bl   atrium_tex_sample_2d
+//   bytes  0..16 : runtime-helper function pointers
+//                  ( 0:  atrium_tex_sample_2d
+//                    8:  atrium_tex_fetch_2d )
+//   bytes 16..   : flat descriptor table — slot `B` at
+//                  byte `UNIFORMS_DESC_BASE + B*16`,
+//                  carrying ( 0: tex_desc*, 8: samp_desc* )
 //
-// Shaders that *also* read a uniform block must arrange
-// for that block to live past the descriptor table (set
-// the buffer's binding offsets accordingly). Multi-set
-// support + a dedicated descriptor-table register (X6)
-// land later when a real shader needs both.
+// A backend that sees an `ImageSample` against binding `B`
+// emits the call-via-pointer sequence:
+//
+//     ldr  x_fn,   [X1]                    ; helper ptr
+//     ldr  x_tex,  [X1, #16 + B*16]        ; tex_desc*
+//     ldr  x_samp, [X1, #16 + B*16 + 8]    ; samp_desc*
+//     blr  x_fn
+//
+// The deliberate `blr <reg>` (not `bl <symbol>`) keeps the
+// emitted code reloc-free, so the bespoke JIT-emit blob
+// path works unchanged — the host caller patches in the
+// helper addresses at descriptor-table build time. The
+// Cranelift `compile()` (object → cc → dlopen) path uses
+// the same mechanism rather than relying on `cc`'s
+// dynamic-linker to resolve the runtime crate; this keeps
+// the two backends on a single descriptor-table ABI.
+//
+// Shaders that *also* read a uniform block must arrange for
+// it to live past the descriptor table (set the buffer's
+// binding offsets accordingly). Multi-set support + a
+// dedicated descriptor-table register (X6) land later when
+// a real shader needs both.
+
+/// Offset of the runtime-helper pointer block at the start
+/// of the uniforms buffer. `uniforms + 0` is
+/// `atrium_tex_sample_2d`; `uniforms + 8` is
+/// `atrium_tex_fetch_2d`.
+pub const UNIFORMS_HELPERS_BASE: usize = 0;
+
+/// Offset of the descriptor table within the uniforms
+/// buffer. Slot `B` lives at `UNIFORMS_DESC_BASE + B * DESC_SLOT_BYTES`.
+pub const UNIFORMS_DESC_BASE: usize = 16;
 
 /// Bytes per descriptor slot in the table. Two 64-bit
 /// pointers packed back-to-back — `tex_desc*` then
 /// `samp_desc*`.
 pub const DESC_SLOT_BYTES: usize = 16;
 
-/// Build the uniforms-buffer prefix for `count` descriptor
-/// slots. Caller writes `slot * DESC_SLOT_BYTES` to set the
-/// pair for binding `slot`. Returns a zero-initialised
-/// buffer of exactly `count * DESC_SLOT_BYTES` bytes.
+/// Build a uniforms-buffer prefix sized for `count`
+/// descriptor slots, including the 16-byte runtime-helper
+/// header. Caller fills helper pointers with
+/// [`write_helper_pointers`] and descriptor slots with
+/// [`write_descriptor_slot`].
 pub fn descriptor_table_buffer(count: usize) -> Vec<u8> {
-    vec![0u8; count * DESC_SLOT_BYTES]
+    vec![0u8; UNIFORMS_DESC_BASE + count * DESC_SLOT_BYTES]
+}
+
+/// Write the runtime-helper function-pointer header.
+/// Pass the actual `atrium_tex_sample_2d` /
+/// `atrium_tex_fetch_2d` function addresses; the shader's
+/// emitted code reads them with a plain `ldr [X1, #0/+8]`
+/// and `blr`s through.
+///
+/// # Safety
+/// The function pointers must remain valid for the lifetime
+/// of every shader invocation that uses this buffer.
+pub unsafe fn write_helper_pointers(
+    buf: &mut [u8],
+    sample_2d: unsafe extern "C" fn(
+        *const TexDesc, *const SamplerDesc, f32, f32, *mut f32),
+    fetch_2d: unsafe extern "C" fn(
+        *const TexDesc, i32, i32, i32, *mut f32),
+) {
+    assert!(buf.len() >= UNIFORMS_DESC_BASE,
+        "uniforms buffer too small for the helper header");
+    let s = (sample_2d as usize as u64).to_le_bytes();
+    let f = (fetch_2d  as usize as u64).to_le_bytes();
+    buf[0..8].copy_from_slice(&s);
+    buf[8..16].copy_from_slice(&f);
 }
 
 /// Write a `(tex_desc, samp_desc)` pointer pair at binding
-/// slot `slot` in a descriptor-table buffer. The buffer
-/// must be `>= (slot + 1) * DESC_SLOT_BYTES` long.
+/// slot `slot`. The buffer must be
+/// `>= UNIFORMS_DESC_BASE + (slot + 1) * DESC_SLOT_BYTES`
+/// long.
 ///
 /// # Safety
 /// The host pointers must outlive every shader invocation
@@ -147,7 +199,7 @@ pub unsafe fn write_descriptor_slot(
     tex: *const TexDesc,
     samp: *const SamplerDesc,
 ) {
-    let base = slot * DESC_SLOT_BYTES;
+    let base = UNIFORMS_DESC_BASE + slot * DESC_SLOT_BYTES;
     assert!(buf.len() >= base + DESC_SLOT_BYTES,
         "descriptor-table buffer too small for slot {slot}");
     let tex_bytes  = (tex as usize as u64).to_le_bytes();
@@ -535,18 +587,27 @@ mod tests {
         let _ = &mut tex_a;
 
         let mut buf = descriptor_table_buffer(2);
-        assert_eq!(buf.len(), 2 * DESC_SLOT_BYTES);
+        assert_eq!(buf.len(), UNIFORMS_DESC_BASE + 2 * DESC_SLOT_BYTES);
         unsafe {
+            write_helper_pointers(&mut buf,
+                atrium_tex_sample_2d, atrium_tex_fetch_2d);
             write_descriptor_slot(&mut buf, 0, tex_a_ptr, samp_a_ptr);
             write_descriptor_slot(&mut buf, 1, tex_b_ptr, samp_b_ptr);
         }
 
         let read_u64 = |off: usize| u64::from_le_bytes(
             buf[off..off + 8].try_into().unwrap());
-        assert_eq!(read_u64(0),  tex_a_ptr  as usize as u64);
-        assert_eq!(read_u64(8),  samp_a_ptr as usize as u64);
-        assert_eq!(read_u64(16), tex_b_ptr  as usize as u64);
-        assert_eq!(read_u64(24), samp_b_ptr as usize as u64);
+        // Helper header.
+        assert_eq!(read_u64(0), atrium_tex_sample_2d as usize as u64);
+        assert_eq!(read_u64(8), atrium_tex_fetch_2d  as usize as u64);
+        // Descriptor slot 0 (binding 0).
+        assert_eq!(read_u64(UNIFORMS_DESC_BASE),     tex_a_ptr  as usize as u64);
+        assert_eq!(read_u64(UNIFORMS_DESC_BASE + 8), samp_a_ptr as usize as u64);
+        // Descriptor slot 1 (binding 1).
+        assert_eq!(read_u64(UNIFORMS_DESC_BASE + 16),
+            tex_b_ptr  as usize as u64);
+        assert_eq!(read_u64(UNIFORMS_DESC_BASE + 24),
+            samp_b_ptr as usize as u64);
     }
 
     #[test]

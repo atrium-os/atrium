@@ -2968,27 +2968,43 @@ extends the `atrium-spv-blob` format slightly — a
    easier of the two — `cranelift-module` already does
    relocations.
 
-   **Descriptor ABI (v1)** — how compiled shader code
-   finds bound textures + samplers at runtime. The
-   AAPCS64 split passes `uniforms` in X1; v1 *overlays*
-   the buffer's first `count * DESC_SLOT_BYTES` bytes
-   with a flat array of descriptor-pointer pairs (two
-   64-bit pointers per slot: `tex_desc*`, `samp_desc*`),
-   indexed by SPIR-V `Binding`. A backend that sees an
-   `ImageSample` against binding `B` emits:
+   **Descriptor ABI (v1, reloc-free)** — how compiled
+   shader code finds bound textures + samplers + the
+   runtime helpers it calls. The AAPCS64 split passes
+   `uniforms` in X1; v1 overlays the buffer's prefix as
+   a two-region header:
+   * **Bytes 0..16** — runtime-helper function pointers
+     (0: `atrium_tex_sample_2d`, 8: `atrium_tex_fetch_2d`).
+   * **Bytes 16.. (`UNIFORMS_DESC_BASE`)** — flat
+     descriptor table; slot `B` carries
+     `(tex_desc*, samp_desc*)` at `UNIFORMS_DESC_BASE +
+     B*DESC_SLOT_BYTES`.
+
+   A backend that sees an `ImageSample` at binding `B`
+   emits exactly four instructions:
    ```
-   ldr  x_tex,  [X1, #B*16 + 0]   ; tex_desc*
-   ldr  x_samp, [X1, #B*16 + 8]   ; samp_desc*
-   bl   atrium_tex_sample_2d
+   ldr  x_fn,   [X1]                       ; helper ptr
+   ldr  x_tex,  [X1, #16 + B*16]           ; tex_desc*
+   ldr  x_samp, [X1, #16 + B*16 + 8]       ; samp_desc*
+   blr  x_fn
    ```
-   `atrium-spv-runtime` exposes a `descriptor_table_buffer`
-   helper + a `write_descriptor_slot` unsafe writer so
-   the harness can pack the prefix; the unit test
-   `descriptor_table_layout_round_trips` pins the byte
-   layout. Multi-set support + a dedicated descriptor-
-   table register (X6) land later when a real shader
-   needs both descriptors and a regular uniform block in
-   the same invocation.
+
+   The deliberate `blr <reg>` keeps the emitted code
+   **reloc-free**, so the bespoke JIT-emit blob path
+   works unchanged — the host caller patches in helper
+   addresses at descriptor-table build time. The
+   Cranelift `compile()` (object → cc → dlopen) path
+   uses the *same* mechanism rather than going through
+   `cc`'s dynamic linker, which keeps the two backends
+   on one descriptor-table ABI.
+
+   `atrium-spv-runtime` exposes `descriptor_table_buffer`
+   + `write_helper_pointers` + `write_descriptor_slot`;
+   the round-trip test `descriptor_table_layout_round_trips`
+   pins the byte layout. Multi-set support + a dedicated
+   descriptor-table register (X6) land later when a real
+   shader needs both descriptors and a regular uniform
+   block in the same invocation.
 5. Bespoke backend: same call shape, but the JIT-emit
    blob path needs the new "runtime imports" table in
    `atrium-spv-blob` + a loader-time pointer patch.
