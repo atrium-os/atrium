@@ -1,0 +1,15 @@
+[package]
+name        = "atrium-spv-runtime"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "Runtime helpers called from compiled tier-2 shaders. The IR's image ops (ImageSampleImplicitLod, ImageSampleExplicitLod, ImageFetch) lower to calls into this crate, per docs/spec/tier2-renderer.md. Stable C-ABI: descriptor structs are #[repr(C)] and the entry points are `extern \"C\"`, so a backend can emit a plain `bl atrium_tex_sample_2d` and the loader/JIT can patch the address into the function-pointer slot in the blob."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Deliberately none. Runtime helpers are pure compute over
+# raw byte buffers; pulling in dependencies here would
+# bloat the shader runtime footprint.
