@@ -115,7 +115,7 @@ fn run_via_dlopen(
 
     let n = inputs.varyings_per_invocation.len().max(1);
     let mut pixels: Vec<RgbaF32> = Vec::with_capacity(n);
-    for _ in 0..n {
+    for i in 0..n {
         let mut out_color = [0.0f32; 4];
         let mut out_depth = 0.0f32;
         let pc_ptr = if inputs.push_constants.iter().any(|b| *b != 0) {
@@ -131,9 +131,18 @@ fn run_via_dlopen(
         } else {
             inputs.uniforms.as_ptr()
         };
+        // Per-invocation in_varyings buffer (X0 in the
+        // fragment AAPCS64 split). Null when no varyings
+        // are supplied — shaders that don't read varyings
+        // (the bulk of the existing test corpus) never
+        // dereference this pointer.
+        let in_varyings_ptr = inputs.varyings_per_invocation
+            .get(i)
+            .map(|v| v.as_ptr())
+            .unwrap_or(std::ptr::null());
         unsafe {
             fs_main(
-                std::ptr::null(), uni_ptr, pc_ptr,
+                in_varyings_ptr, uni_ptr, pc_ptr,
                 0.0, 0.0, 0.0, 0.0, 0,
                 out_color.as_mut_ptr(), &mut out_depth,
             );

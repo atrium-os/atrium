@@ -3275,6 +3275,28 @@ So the door is open; the work is wiring through.
    `atrium-spv-tests/src/harness.rs` is small but only
    pays off when the vertex test corpus grows past a
    handful of shapes; deferred until then.
+5b. **✅ done.** Fragment-varying-load — the natural
+   follow-on after vertex stage landed. The interpreter's
+   `load_from_storage` Input arm now dispatches by
+   stage: vertex → `vertex_attributes_per_invocation`,
+   fragment → `varyings_per_invocation` (an `is_vertex`
+   flag threaded through `eval_inst`). The differential
+   harness's `run_via_dlopen` now passes
+   `varyings_per_invocation[i].as_ptr()` as the
+   `in_varyings` X0 argument per invocation; backends'
+   existing `(Fragment, Input) → X0` mapping reads
+   through.
+
+   New tests: `atrium-spv-tests/tests/fragment_varying.rs::
+   interpreter_fragment_passthrough_varying` (three
+   varyings → three pixels via the interpreter alone) and
+   `atrium-spv-differential/tests/fragment_varying.rs::
+   three_way_fragment_passthrough_varying` (interpreter +
+   Cranelift + bespoke all agree). First test that
+   actually consumes per-pixel varying data — the real
+   shape of inter-stage data flow once a rasterizer is
+   wired.
+
 5. **✅ done.** In-VM vertex harness on FreeBSD aarch64.
    `verify/vertex_harness.c` — dlopen + dlsym
    `atrium_vs_main`, packs three argv-floats into a

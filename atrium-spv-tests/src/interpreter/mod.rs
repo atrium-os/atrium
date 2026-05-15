@@ -560,6 +560,7 @@ impl Interpreter {
         inputs: &ShaderInputs,
         inv_idx: usize,
     ) -> Result<RgbaF32, InterpError> {
+        let is_vertex = false;
         let func = self.module.functions.iter()
             .find(|f| f.def.as_ref().and_then(|d| d.result_id) == Some(entry))
             .ok_or(InterpError::NoEntryPoint("Fragment (function body missing)"))?;
@@ -626,7 +627,7 @@ impl Interpreter {
             for (i, inst) in block.instructions.iter().enumerate() {
                 if i < phi_count { continue; }
                 if i == last_idx { break; }
-                self.eval_inst(inst, &mut values, &mut storage, inputs, inv_idx)?;
+                self.eval_inst(inst, &mut values, &mut storage, inputs, inv_idx, is_vertex)?;
             }
             let term = block.instructions.last().ok_or_else(||
                 InterpError::UnsupportedControlFlow(
@@ -719,6 +720,7 @@ impl Interpreter {
         inputs: &ShaderInputs,
         inv_idx: usize,
     ) -> Result<[f32; 4], InterpError> {
+        let is_vertex = true;
         let func = self.module.functions.iter()
             .find(|f| f.def.as_ref().and_then(|d| d.result_id) == Some(entry))
             .ok_or(InterpError::NoEntryPoint("Vertex (function body missing)"))?;
@@ -767,7 +769,7 @@ impl Interpreter {
             for (i, inst) in block.instructions.iter().enumerate() {
                 if i < phi_count { continue; }
                 if i == last_idx { break; }
-                self.eval_inst(inst, &mut values, &mut storage, inputs, inv_idx)?;
+                self.eval_inst(inst, &mut values, &mut storage, inputs, inv_idx, is_vertex)?;
             }
             let term = block.instructions.last().ok_or_else(||
                 InterpError::UnsupportedControlFlow(
@@ -830,6 +832,7 @@ impl Interpreter {
         storage: &mut HashMap<Word, ConstantValue>,
         inputs: &ShaderInputs,
         inv_idx: usize,
+        is_vertex: bool,
     ) -> Result<(), InterpError> {
         match inst.class.opcode {
             Op::Store => {
@@ -1143,7 +1146,7 @@ impl Interpreter {
                     return Ok(());
                 }
                 let value = self.load_from_storage(
-                    storage_class, off, result_type_id, inputs, inv_idx)?;
+                    storage_class, off, result_type_id, inputs, inv_idx, is_vertex)?;
                 values.insert(result_id, value);
                 Ok(())
             }
@@ -1451,6 +1454,7 @@ impl Interpreter {
         type_id: Word,
         inputs: &ShaderInputs,
         inv_idx: usize,
+        is_vertex: bool,
     ) -> Result<ConstantValue, InterpError> {
         // Pick the source buffer.
         let empty: [u8; 0] = [];
@@ -1458,16 +1462,22 @@ impl Interpreter {
             StorageClass::PushConstant => &inputs.push_constants[..],
             StorageClass::Uniform | StorageClass::UniformConstant
             | StorageClass::StorageBuffer => &inputs.uniforms[..],
-            // Per-vertex / per-fragment attribute reads
-            // index into the current invocation's packed
-            // attribute bytes. (Fragment-stage varyings will
-            // share this path when wired through; for the
-            // vertex stage `inv_idx` is the vertex index.)
-            StorageClass::Input => inputs
-                .vertex_attributes_per_invocation
-                .get(inv_idx)
-                .map(|v| v.as_slice())
-                .unwrap_or(&empty),
+            // Input loads dispatch by stage:
+            //   * Vertex Input  → per-vertex attribute
+            //     bytes (`vertex_attributes_per_invocation`).
+            //   * Fragment Input → interpolated varying
+            //     bytes (`varyings_per_invocation`) —
+            //     produced upstream by the vertex stage,
+            //     or packed directly by the test harness
+            //     when not running a real rasterizer.
+            StorageClass::Input => {
+                let src = if is_vertex {
+                    &inputs.vertex_attributes_per_invocation
+                } else {
+                    &inputs.varyings_per_invocation
+                };
+                src.get(inv_idx).map(|v| v.as_slice()).unwrap_or(&empty)
+            }
             other => return Err(InterpError::UnsupportedOpcode(format!(
                 "Load from storage class {other:?} not supported",
             ))),
@@ -1499,7 +1509,7 @@ impl Interpreter {
                 for i in 0..count {
                     let off = byte_offset.saturating_add(i * elem_size);
                     let v = self.load_from_storage(
-                        storage_class, off, element, inputs, inv_idx)?;
+                        storage_class, off, element, inputs, inv_idx, is_vertex)?;
                     lanes.push(v);
                 }
                 Ok(ConstantValue::Vec(lanes))
