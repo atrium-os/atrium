@@ -1296,6 +1296,68 @@ impl Interpreter {
                 ]));
                 Ok(())
             }
+            // OpImageFetch: unfiltered integer-coord texel
+            // load. Operand 0 is an *image* (not a sampled-
+            // image — fetch doesn't use the sampler);
+            // operand 1 is an ivec2 coord. Optional
+            // Image Operands + Lod after; v1 ignores them
+            // (the runtime's atrium_tex_fetch_2d takes lod
+            // but doesn't read it yet).
+            Op::ImageFetch => {
+                let result_id = inst.result_id.ok_or_else(||
+                    InterpError::BadConstant(0))?;
+                let img_id = op_id(&inst.operands, 0)?;
+                let coord_id = op_id(&inst.operands, 1)?;
+                let handle = self.lookup_value(img_id, values)?;
+                let (set, binding) = match handle {
+                    ConstantValue::Texture { set, binding } => (set, binding),
+                    _ => return Err(InterpError::UnsupportedOpcode(format!(
+                        "ImageFetch image operand is not a Texture handle: \
+                         {handle:?}"))),
+                };
+                let coord = self.lookup_value(coord_id, values)?;
+                let (x, y) = match coord {
+                    ConstantValue::Vec(ref lanes) if lanes.len() >= 2 => {
+                        let x = match &lanes[0] {
+                            ConstantValue::Int(n) => *n as i32,
+                            other => return Err(InterpError::UnsupportedOpcode(
+                                format!("ImageFetch coord lane 0 not int: {other:?}"))),
+                        };
+                        let y = match &lanes[1] {
+                            ConstantValue::Int(n) => *n as i32,
+                            other => return Err(InterpError::UnsupportedOpcode(
+                                format!("ImageFetch coord lane 1 not int: {other:?}"))),
+                        };
+                        (x, y)
+                    }
+                    other => return Err(InterpError::UnsupportedOpcode(format!(
+                        "ImageFetch coord operand not an ivec2: {other:?}"))),
+                };
+                let tex = inputs.textures.iter()
+                    .find(|t| t.set == set && t.binding == binding)
+                    .ok_or_else(|| InterpError::UnsupportedOpcode(format!(
+                        "ImageFetch: no TextureBinding for (set={set}, binding={binding})")))?;
+                let tex_desc = atrium_spv_runtime::TexDesc {
+                    data:         std::ptr::null(),
+                    width:        tex.width,
+                    height:       tex.height,
+                    stride_bytes: tex.stride_bytes,
+                    format:       tex.format,
+                };
+                // v1: lod ignored. If the SPIR-V supplies a
+                // Lod via Image Operands we still pass 0 —
+                // the runtime helper's signature accepts it
+                // but doesn't use it (mip-0 only).
+                let out = atrium_spv_runtime::fetch_2d(
+                    &tex.data, &tex_desc, x, y, 0);
+                values.insert(result_id, ConstantValue::Vec(vec![
+                    ConstantValue::F32(out[0]),
+                    ConstantValue::F32(out[1]),
+                    ConstantValue::F32(out[2]),
+                    ConstantValue::F32(out[3]),
+                ]));
+                Ok(())
+            }
             other => Err(InterpError::UnsupportedOpcode(format!("{:?}", other))),
         }
     }

@@ -1225,6 +1225,78 @@ impl FnTranslator {
                 self.vectors.insert(result.id, lanes);
                 Ok(())
             }
+            // ImageFetch — unfiltered integer-coord texel
+            // load. v1 ABI: helper fn pointer at
+            // uniforms[8] (the fetch slot), tex_desc* at
+            // the descriptor slot for this binding;
+            // sampler ignored. Args by AAPCS64 / SystemV:
+            //   atrium_tex_fetch_2d(
+            //     const TexDesc*,
+            //     int32_t x, int32_t y, int32_t lod,
+            //     float *out_rgba);
+            Op::ImageFetch { image, coord, lod } => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "ImageFetch without result".to_string()))?;
+                let (_, binding) = self.image_handles.get(&image.id)
+                    .copied()
+                    .ok_or_else(|| BackendError::Internal(format!(
+                        "ImageFetch image {:?} not an ImageHandle",
+                        image.id)))?;
+                let coord_lanes = self.vectors.get(&coord.id).cloned()
+                    .ok_or_else(|| BackendError::Internal(format!(
+                        "ImageFetch coord {:?} not a vector", coord.id)))?;
+                if coord_lanes.len() < 2 {
+                    return Err(BackendError::Unsupported(format!(
+                        "ImageFetch 2D coord must have ≥2 lanes, \
+                         got {}", coord_lanes.len())));
+                }
+                let x = coord_lanes[0];
+                let y = coord_lanes[1];
+                // Optional explicit lod operand; v1 passes
+                // 0 if absent. The runtime ignores it for
+                // now (mip-0 only).
+                let lod_val = match lod {
+                    Some(lv) => *self.scalars.get(&lv.id)
+                        .ok_or_else(|| BackendError::Internal(format!(
+                            "ImageFetch lod {:?} not in scalars", lv.id)))?,
+                    None => builder.ins().iconst(clif_types::I32, 0),
+                };
+
+                let pointer_type = builder.func.dfg
+                    .value_type(self.params[1]);
+                let uniforms = self.params[1];
+
+                let desc_off: i32 = 16 + (binding as i32) * 16;
+                let fn_ptr = builder.ins().load(
+                    pointer_type, MemFlags::new(), uniforms, 8); // fetch slot
+                let tex_ptr = builder.ins().load(
+                    pointer_type, MemFlags::new(), uniforms, desc_off);
+
+                let slot = builder.create_sized_stack_slot(
+                    StackSlotData::new(StackSlotKind::ExplicitSlot, 16, 4));
+                let out_ptr = builder.ins().stack_addr(pointer_type, slot, 0);
+
+                let mut call_sig = Signature::new(CallConv::SystemV);
+                call_sig.params.push(AbiParam::new(pointer_type));
+                call_sig.params.push(AbiParam::new(clif_types::I32));
+                call_sig.params.push(AbiParam::new(clif_types::I32));
+                call_sig.params.push(AbiParam::new(clif_types::I32));
+                call_sig.params.push(AbiParam::new(pointer_type));
+                let sig_ref = builder.import_signature(call_sig);
+                builder.ins().call_indirect(
+                    sig_ref, fn_ptr,
+                    &[tex_ptr, x, y, lod_val, out_ptr]);
+
+                let mut lanes = Vec::with_capacity(4);
+                for i in 0..4i32 {
+                    let l = builder.ins().load(
+                        clif_types::F32, MemFlags::new(), out_ptr, i * 4);
+                    lanes.push(l);
+                }
+                self.vectors.insert(result.id, lanes);
+                Ok(())
+            }
             other => Err(BackendError::Unsupported(format!(
                 "Op {other:?} not supported in phase 2 v6",
             ))),
