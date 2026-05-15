@@ -2793,19 +2793,41 @@ helpers. The pool only applies to *pack-friendly*
 still wants the existing per-S-reg path.
 
 **Phasing.**
-0. pptk: add `ldr_q_literal(rt, imm19)` encoder + spot
-   test (LDR (literal) SIMD&FP, opc=10, V=1).
-1. backend: pre-pass collects unique pack-friendly
-   ConstVec constants → slot table; packed-ConstVec
-   emission becomes a single placeholder `ldr q`; after
-   the function body emit, lay out the pool (16-byte
-   aligned, deduped) and patch each placeholder's imm19.
-   Gate: full differential 26/26 + in-VM 19/19 still
-   bit-exact; disasm shows one `ldr q` per ConstVec.
-2. re-bench `heavyvec`. Target: <250 ns (close to
-   native's 217 ns). If the gap closes to <10%, the arc
-   is done; if not, investigate the entry-edge packed
-   Phi-move + the residual per-call cost.
+0. **✅ done** (pptk `a234963`). `ldr_q_literal(rt, imm19)`
+   encoder + three spot tests (LDR (literal) SIMD&FP,
+   opc=10, V=1; zero/positive/negative imm19).
+1. **✅ done.** backend: pool pre-pass + dead-ConstFloat
+   pre-pass + per-function pool emit/patch. A
+   pack-friendly ConstVec lowers to one `ldr q,
+   [pc-rel]` placeholder; the pool is 16-byte-aligned
+   and laid out after the final `ret` (never executed);
+   placeholders are patched with the resolved imm19.
+   Dedup is free — identical vec4s share a slot. A
+   second pre-pass marks ConstFloats whose every consumer
+   is a pool ConstVec as *dead* and skips their emission
+   entirely (otherwise the prologue would still drag 4
+   `movz/movk + fmov s,w` ops per pool ConstVec for the
+   now-unread lane S-regs). Disasm-confirmed on
+   `heavyvec`: 3 ConstVecs collapse from ~36 prologue
+   ops to 3 `ldr q`. Gate met: full differential 26/26 +
+   in-VM 19/19 still bit-exact on FreeBSD aarch64.
+2. **bench, partial result.** `vecarith` (prologue-
+   dominated, no loop) drops from **2.01 → 1.03 ns**
+   in-VM — about half, as expected once the per-lane
+   constant build is gone. `heavyvec` (loop-dominated,
+   256 iters) stays at native parity within the bench
+   noise floor (~300 ns vs ~230 ns native, 0.77× — same
+   as pre-pool 0.79×); the residual gap is now the
+   entry-edge packed Phi-move + the inherent per-iter
+   cost of an unfused `.4s` loop, not the prologue. So
+   the arc closes the *categorical* per-call setup cost
+   cleanly (proved by `vecarith` + disasm); the
+   loop-amortised `heavyvec` shape was never going to
+   move much from this lever. Closing the `heavyvec` 23%
+   tail is a separate (small) inquiry — likely the entry-
+   edge `mov v.16b` for the initial Phi value, since the
+   loop body itself is already at clang's unfused
+   `.4s` 4-instruction shape.
 
 #### Compile-pipeline phase breakdown — `cc` is the cost
 

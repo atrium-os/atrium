@@ -564,6 +564,84 @@ fn emit_function(
     let packed_ids: std::collections::HashSet<ValueId> =
         vec4_ids.difference(&disqualified).copied().collect();
 
+    // ── ConstVec literal-pool pre-pass ────────────────────────
+    //
+    // Every pack-friendly `ConstVec` (vec4 of genuine
+    // `ConstFloat`s, classified as packed) gets a deduped
+    // slot in a per-function literal pool laid out after
+    // the final `ret`. At emit time the ConstVec lowers to
+    // a single `ldr q, [pc-rel]` placeholder; after the
+    // function body is fully emitted (post per-block loop,
+    // before branch fixup) the pool is laid out 16-byte
+    // aligned and each placeholder's `imm19` is patched
+    // with the resolved PC-relative instruction delta.
+    //
+    // This is the obvious analogue of what `clang -O2` does
+    // for vec constants — replacing a 12+-insn per-lane
+    // build (`movz/movk` + `fmov s,w` + `ins v.s[k]`) with
+    // one PIC load.
+    let mut const_float_bits: HashMap<ValueId, u32> = HashMap::new();
+    for inst in &flat_insts {
+        if let Op::ConstFloat { value, kind: _ } = &inst.op {
+            if let Some(r) = inst.result.as_ref() {
+                const_float_bits.insert(r.id, (*value as f32).to_bits());
+            }
+        }
+    }
+    let mut pool_slots: Vec<[u32; 4]> = Vec::new();
+    let mut constvec_pool_slot: HashMap<ValueId, usize> = HashMap::new();
+    for inst in &flat_insts {
+        if let (Op::ConstVec(els), Some(r)) = (&inst.op, inst.result.as_ref()) {
+            if !packed_ids.contains(&r.id) { continue; }
+            if els.len() != 4 { continue; }
+            let mut lanes = [0u32; 4];
+            let mut all_const = true;
+            for (i, el) in els.iter().enumerate() {
+                match const_float_bits.get(&el.id) {
+                    Some(b) => lanes[i] = *b,
+                    None => { all_const = false; break; }
+                }
+            }
+            if !all_const { continue; }
+            let slot = pool_slots.iter().position(|s| s == &lanes)
+                .unwrap_or_else(|| {
+                    pool_slots.push(lanes);
+                    pool_slots.len() - 1
+                });
+            constvec_pool_slot.insert(r.id, slot);
+        }
+    }
+    // Placeholders to patch once the pool's start offset is
+    // known: (asm byte offset of the `ldr q`, slot index,
+    // destination Q-reg).
+    let mut pool_patches: Vec<(usize, usize, asm::Vreg)> = Vec::new();
+
+    // ConstFloats whose every consumer is a pool-eligible
+    // ConstVec can be skipped entirely: their bit pattern
+    // lives in the pool, never in an S-reg. Without this,
+    // each pool ConstVec would still drag 4 dead `movz/movk
+    // + fmov s,w` ops through the prologue.
+    let mut dead_const_floats: std::collections::HashSet<ValueId> =
+        std::collections::HashSet::new();
+    'cf: for inst in &flat_insts {
+        if !matches!(&inst.op, Op::ConstFloat { .. }) { continue; }
+        let Some(r) = inst.result.as_ref() else { continue; };
+        let cid = r.id;
+        let mut any_use = false;
+        for u in &flat_insts {
+            if !op_reads(&u.op, cid) { continue; }
+            any_use = true;
+            // Only pool-eligible ConstVecs are "transparent"
+            // consumers — any other reader keeps the
+            // ConstFloat alive.
+            let pool_consumer = matches!(&u.op, Op::ConstVec(_))
+                && u.result.as_ref()
+                    .is_some_and(|ur| constvec_pool_slot.contains_key(&ur.id));
+            if !pool_consumer { continue 'cf; }
+        }
+        if any_use { dead_const_floats.insert(cid); }
+    }
+
     // ── Linear-scan register allocator ─────────────────────────
     //
     // Free pool of V-regs. Two tiers:
@@ -1081,9 +1159,13 @@ fn emit_function(
                 ints.insert(result.id, d_w);
             }
             Op::ConstFloat { value, kind: FloatKind::F32 } => {
-                let bits = (*value as f32).to_bits();
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal("ConstFloat without result".into()))?;
+                // Dead — only used by pool-eligible ConstVecs,
+                // which read the literal pool instead. Skip
+                // the materialise to drop the prologue cost.
+                if dead_const_floats.contains(&result.id) { continue; }
+                let bits = (*value as f32).to_bits();
                 let v = alloc_vreg(&mut free_pool, &mut owners, &mut used_callee_saved_v,result.id)?;
                 materialise_u32_into_w(&mut a, w_tmp, bits);
                 a.emit(asm::fmov_s_from_w(v, w_tmp));
@@ -1092,28 +1174,40 @@ fn emit_function(
             Op::ConstVec(elements) => {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal("ConstVec without result".into()))?;
-                for el in elements {
-                    if !scalars.contains_key(&el.id) {
-                        return Err(BackendError::Unsupported(format!(
-                            "ConstVec lane {:?} not in scalars", el.id)));
-                    }
-                }
                 if packed_ids.contains(&result.id) {
-                    // NEON-packed: assemble the four lane
-                    // S-regs into one Q-register via per-lane
-                    // `ins`. The lane S-regs die right after
-                    // (their last_use is this ConstVec).
                     let q = alloc_vreg(&mut free_pool, &mut owners,
                         &mut used_callee_saved_v, result.id)?;
-                    for (lane_i, el) in elements.iter().enumerate() {
-                        let s = *scalars.get(&el.id).ok_or_else(||
-                            BackendError::Internal(format!(
-                                "ConstVec lane {:?} not in scalars",
-                                el.id)))?;
-                        a.emit(asm::ins_v_s(q, lane_i as u8, s, 0));
+                    if let Some(&slot) = constvec_pool_slot.get(&result.id) {
+                        // Literal-pool path: one `ldr q,
+                        // [pc-rel]` placeholder; imm19 gets
+                        // patched after the pool layout is
+                        // known. No per-lane S-regs needed —
+                        // their ConstFloat producers are
+                        // skipped by `dead_const_floats`.
+                        let off = a.len();
+                        a.emit(asm::ldr_q_literal(q, 0));
+                        pool_patches.push((off, slot, q));
+                    } else {
+                        // Fallback (mixed-shape ConstVec):
+                        // assemble lanes via per-lane `ins`.
+                        for (lane_i, el) in elements.iter().enumerate() {
+                            let s = *scalars.get(&el.id).ok_or_else(||
+                                BackendError::Internal(format!(
+                                    "ConstVec lane {:?} not in scalars",
+                                    el.id)))?;
+                            a.emit(asm::ins_v_s(q, lane_i as u8, s, 0));
+                        }
                     }
                     packed.insert(result.id, q);
                 } else {
+                    // Per-lane representation: each lane
+                    // must already exist in `scalars`.
+                    for el in elements {
+                        if !scalars.contains_key(&el.id) {
+                            return Err(BackendError::Unsupported(format!(
+                                "ConstVec lane {:?} not in scalars", el.id)));
+                        }
+                    }
                     vectors.insert(result.id, elements.clone());
                 }
             }
@@ -1645,6 +1739,40 @@ fn emit_function(
         }
     }
     } // end of per-block loop
+
+    // ── ConstVec literal pool ─────────────────────────────────
+    //
+    // Lay out the deduped pack-friendly ConstVec literals
+    // right here — after the final block's `ret`, so the
+    // pool is never executed — and patch each `ldr q`
+    // placeholder's imm19 with the resolved PC-relative
+    // instruction delta. Pool entries are 16-byte aligned
+    // (the LDR-literal natural alignment); pad with NOPs.
+    if !pool_slots.is_empty() {
+        while a.len() % 16 != 0 {
+            a.emit(0xd503_201f); // nop
+        }
+        let pool_start = a.len();
+        for slot in &pool_slots {
+            for lane in slot {
+                a.emit(*lane);
+            }
+        }
+        for (patch_off, slot, rt) in &pool_patches {
+            let slot_byte = pool_start + slot * 16;
+            let delta_bytes = slot_byte as i64 - *patch_off as i64;
+            if delta_bytes % 4 != 0 {
+                return Err(BackendError::Internal(
+                    "ldr-q-literal delta not 4-aligned".into()));
+            }
+            let delta_insts = (delta_bytes / 4) as i32;
+            if !(-(1 << 18)..(1 << 18)).contains(&delta_insts) {
+                return Err(BackendError::Unsupported(format!(
+                    "ldr-q-literal delta {delta_insts} exceeds imm19 range")));
+            }
+            a.patch(*patch_off, asm::ldr_q_literal(*rt, delta_insts));
+        }
+    }
 
     // ── Branch fixup ──────────────────────────────────────────
     //
