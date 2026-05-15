@@ -265,6 +265,11 @@ fn emit_function(
     // scalars[id] = Vreg holding the live f32 (S-reg view).
     let mut scalars: HashMap<ValueId, asm::Vreg> = HashMap::new();
     let mut vectors: HashMap<ValueId, Vec<Value>> = HashMap::new();
+    // NEON-packed vec4 values: the whole vector in one
+    // Q-register, driven with `.4s` ops. A vec4 ValueId is
+    // in *either* `vectors` (per-lane) or `packed`, never
+    // both — the NEON-pack classifier (below) decides.
+    let mut packed: HashMap<ValueId, asm::Vreg> = HashMap::new();
     // Pointer-typed Values: (base X-reg, byte offset).
     let mut pointers: HashMap<ValueId, (asm::Xreg, i32)> = HashMap::new();
     // Bool-typed Values (results of FOrd*/FUnord*): held
@@ -436,6 +441,106 @@ fn emit_function(
             }
         }
     }
+
+    // ── NEON-pack classifier (phase 1) ────────────────────────
+    //
+    // A vec4 value can live in a single Q-register and be
+    // driven with `.4s` ops instead of the four-scalar
+    // lane-walk — but only if its entire def-use subgraph is
+    // "pack-friendly": produced by a `ConstVec` or a vec×vec
+    // FP binop, and consumed only by vec×vec FP binops or a
+    // whole-vector `Store`. Anything lane-addressed (Shuffle,
+    // Extract, Dot, Phi, Select, Composite*, Insert,
+    // AccessChain) forces the per-lane representation. The
+    // two representations don't mix mid-graph yet (no
+    // packed↔lanes bridge — a later phase), so one tainted
+    // value disqualifies its whole connected component.
+    //
+    // Implementation: seed `disqualified` from every vec4
+    // value touched by a non-pack-friendly op, then
+    // fixed-point propagate across vec×vec FP binop cliques
+    // (result + both operands share a fate).
+    let is_vec4 = |ty: &Type| matches!(ty, Type::Vec4(_));
+    // Every vec4-typed SSA value (each is some inst's result).
+    let mut vec4_ids: std::collections::HashSet<ValueId> =
+        std::collections::HashSet::new();
+    for inst in &flat_insts {
+        if let Some(r) = inst.result.as_ref() {
+            if is_vec4(&r.ty) { vec4_ids.insert(r.id); }
+        }
+    }
+    // A vec×vec FP binop is the only pack-friendly
+    // *propagating* producer (ConstVec is a leaf, Store a
+    // sink). Returns the two operand ids when it matches.
+    let vecvec_fp_binop = |op: &Op| -> Option<(ValueId, ValueId)> {
+        match op {
+            Op::FAdd(l, r) | Op::FSub(l, r)
+            | Op::FMul(l, r) | Op::FDiv(l, r)
+                if is_vec4(&l.ty) && is_vec4(&r.ty) =>
+                Some((l.id, r.id)),
+            _ => None,
+        }
+    };
+    // True scalar constants — the only ConstVec elements we
+    // pack directly. A ConstVec whose lanes are *computed*
+    // scalars (a CompositeConstruct of extracted/derived
+    // values) must stay per-lane: its element S-regs alias
+    // a per-lane subgraph, and assembling them into a fresh
+    // Q-register can clobber a still-live aliased reg. Such
+    // a ConstVec is treated as non-friendly below.
+    let mut const_float_ids: std::collections::HashSet<ValueId> =
+        std::collections::HashSet::new();
+    for inst in &flat_insts {
+        if matches!(&inst.op, Op::ConstFloat { .. }) {
+            if let Some(r) = inst.result.as_ref() {
+                const_float_ids.insert(r.id);
+            }
+        }
+    }
+    let pure_const_vec = |op: &Op| -> bool {
+        matches!(op, Op::ConstVec(els)
+            if els.iter().all(|e| const_float_ids.contains(&e.id)))
+    };
+    let mut disqualified: std::collections::HashSet<ValueId> =
+        std::collections::HashSet::new();
+    for inst in &flat_insts {
+        let friendly = pure_const_vec(&inst.op)
+            || vecvec_fp_binop(&inst.op).is_some()
+            || matches!(&inst.op,
+                Op::Store { value, .. } if is_vec4(&value.ty));
+        if friendly { continue; }
+        // Non-friendly op: every vec4 it defines or reads is
+        // tainted.
+        if let Some(r) = inst.result.as_ref() {
+            if is_vec4(&r.ty) { disqualified.insert(r.id); }
+        }
+        for vid in &vec4_ids {
+            if op_reads(&inst.op, *vid) { disqualified.insert(*vid); }
+        }
+    }
+    // Fixed-point: a vec×vec FP binop's result and both
+    // operands must agree — taint all three if any is.
+    loop {
+        let mut changed = false;
+        for inst in &flat_insts {
+            if let Some((l, r)) = vecvec_fp_binop(&inst.op) {
+                let res = inst.result.as_ref().map(|x| x.id);
+                let any = disqualified.contains(&l)
+                    || disqualified.contains(&r)
+                    || res.is_some_and(|x| disqualified.contains(&x));
+                if any {
+                    changed |= disqualified.insert(l);
+                    changed |= disqualified.insert(r);
+                    if let Some(x) = res {
+                        changed |= disqualified.insert(x);
+                    }
+                }
+            }
+        }
+        if !changed { break; }
+    }
+    let packed_ids: std::collections::HashSet<ValueId> =
+        vec4_ids.difference(&disqualified).copied().collect();
 
     // ── Linear-scan register allocator ─────────────────────────
     //
@@ -953,7 +1058,24 @@ fn emit_function(
                             "ConstVec lane {:?} not in scalars", el.id)));
                     }
                 }
-                vectors.insert(result.id, elements.clone());
+                if packed_ids.contains(&result.id) {
+                    // NEON-packed: assemble the four lane
+                    // S-regs into one Q-register via per-lane
+                    // `ins`. The lane S-regs die right after
+                    // (their last_use is this ConstVec).
+                    let q = alloc_vreg(&mut free_pool, &mut owners,
+                        &mut used_callee_saved_v, result.id)?;
+                    for (lane_i, el) in elements.iter().enumerate() {
+                        let s = *scalars.get(&el.id).ok_or_else(||
+                            BackendError::Internal(format!(
+                                "ConstVec lane {:?} not in scalars",
+                                el.id)))?;
+                        a.emit(asm::ins_v_s(q, lane_i as u8, s, 0));
+                    }
+                    packed.insert(result.id, q);
+                } else {
+                    vectors.insert(result.id, elements.clone());
+                }
             }
             // Float compares → Bool (i32 0/1 in a W-reg).
             Op::FOrdEq(a_v, b_v) => emit_fcmp_to_bool(
@@ -1092,26 +1214,32 @@ fn emit_function(
                 scalars.insert(result.id, acc);
             }
             Op::FAdd(a_v, b_v) => emit_fp_binop_poly(
-                &mut a, &mut scalars, &mut vectors,
+                &mut a, &mut scalars, &mut vectors, &mut packed, &packed_ids,
                 &mut free_pool, &mut owners, &mut used_callee_saved_v,&mut next_synth_id,
-                coalesce_dest.as_ref(), inst, a_v, b_v, asm::fadd_s)?,
+                coalesce_dest.as_ref(), inst, a_v, b_v, asm::fadd_s, asm::fadd_v_4s)?,
             Op::FSub(a_v, b_v) => emit_fp_binop_poly(
-                &mut a, &mut scalars, &mut vectors,
+                &mut a, &mut scalars, &mut vectors, &mut packed, &packed_ids,
                 &mut free_pool, &mut owners, &mut used_callee_saved_v,&mut next_synth_id,
-                coalesce_dest.as_ref(), inst, a_v, b_v, asm::fsub_s)?,
+                coalesce_dest.as_ref(), inst, a_v, b_v, asm::fsub_s, asm::fsub_v_4s)?,
             Op::FMul(a_v, b_v) => emit_fp_binop_poly(
-                &mut a, &mut scalars, &mut vectors,
+                &mut a, &mut scalars, &mut vectors, &mut packed, &packed_ids,
                 &mut free_pool, &mut owners, &mut used_callee_saved_v,&mut next_synth_id,
-                coalesce_dest.as_ref(), inst, a_v, b_v, asm::fmul_s)?,
+                coalesce_dest.as_ref(), inst, a_v, b_v, asm::fmul_s, asm::fmul_v_4s)?,
             Op::FDiv(a_v, b_v) => emit_fp_binop_poly(
-                &mut a, &mut scalars, &mut vectors,
+                &mut a, &mut scalars, &mut vectors, &mut packed, &packed_ids,
                 &mut free_pool, &mut owners, &mut used_callee_saved_v,&mut next_synth_id,
-                coalesce_dest.as_ref(), inst, a_v, b_v, asm::fdiv_s)?,
+                coalesce_dest.as_ref(), inst, a_v, b_v, asm::fdiv_s, asm::fdiv_v_4s)?,
             Op::Store { ptr, value } => {
                 match &ptr.ty {
                     Type::Pointer(StorageClass::Output, _) => {}
                     other => return Err(BackendError::Unsupported(format!(
                         "Store target {other:?} not supported"))),
+                }
+                // NEON-packed value: one 128-bit store of
+                // the whole Q-register.
+                if let Some(&q) = packed.get(&value.id) {
+                    a.emit(asm::str_q_offset(q, x_out, 0));
+                    continue;
                 }
                 let lanes = vectors.get(&value.id).ok_or_else(||
                     BackendError::Unsupported(format!(
@@ -2237,14 +2365,17 @@ fn compute_last_use_flat(
 /// * vec   × scalar  → broadcast scalar to every lane.
 /// * scalar × vec    → same, symmetric.
 ///
-/// Result is stored in `scalars` (scalar shape) or
-/// `vectors` (vec shape).
+/// Result is stored in `scalars` (scalar shape), `packed`
+/// (NEON-packed vec4 — one `.4s` op), or `vectors` (per-
+/// lane vec shape).
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn emit_fp_binop_poly(
     a: &mut asm::Asm,
     scalars: &mut HashMap<ValueId, asm::Vreg>,
     vectors: &mut HashMap<ValueId, Vec<Value>>,
+    packed: &mut HashMap<ValueId, asm::Vreg>,
+    packed_ids: &std::collections::HashSet<ValueId>,
     free_pool: &mut Vec<u8>,
     owners: &mut HashMap<u8, ValueId>,
     used_callee_saved_v: &mut bool,
@@ -2254,6 +2385,7 @@ fn emit_fp_binop_poly(
     lhs: &Value,
     rhs: &Value,
     make_inst: fn(asm::Vreg, asm::Vreg, asm::Vreg) -> u32,
+    make_inst_v4s: fn(asm::Vreg, asm::Vreg, asm::Vreg) -> u32,
 ) -> Result<(), BackendError> {
     let mut fresh_synth = || {
         let id = ValueId(*next_synth_id);
@@ -2262,6 +2394,26 @@ fn emit_fp_binop_poly(
     };
     let result = inst.result.as_ref().ok_or_else(||
         BackendError::Internal("fp binop without result".into()))?;
+
+    // NEON-packed vec4 path: the classifier proved this
+    // result and both operands live in single Q-registers,
+    // so the whole binop is one `.4s` instruction. (A
+    // packed result is never also a Phi coalesce target —
+    // a Phi-bearing component is disqualified from packing
+    // — so `coalesce` is irrelevant here.)
+    if packed_ids.contains(&result.id) {
+        let l = *packed.get(&lhs.id).ok_or_else(||
+            BackendError::Internal(format!(
+                "packed fp binop lhs {:?} not packed", lhs.id)))?;
+        let r = *packed.get(&rhs.id).ok_or_else(||
+            BackendError::Internal(format!(
+                "packed fp binop rhs {:?} not packed", rhs.id)))?;
+        let d = alloc_vreg(free_pool, owners, used_callee_saved_v,
+            result.id)?;
+        a.emit(make_inst_v4s(d, l, r));
+        packed.insert(result.id, d);
+        return Ok(());
+    }
 
     // Scalar coalesce target (Float Phi) and per-lane
     // coalesce targets (Vec Phi). A Vec Phi's lane regs are

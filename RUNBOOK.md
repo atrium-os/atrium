@@ -2690,14 +2690,35 @@ over almost verbatim — a packed Phi is *one* never-
 expired Q-reg, the coalesced binop writes it in place.
 
 **Phasing.**
-0. pptk: `.4s` FP arith + `dup` + `ld1`-from-pool (or
-   per-lane `ins` build) encodings, with unit tests.
-1. packed representation + classifier + the packed↔lanes
-   bridge; vec FP binop emits `.4s` for packed values,
-   falls back to per-lane otherwise. Gate: the existing
-   differential vec tests stay bit-exact (`-ffp-contract
-   =off`, so `.4s` non-FMA arithmetic is still
-   bit-identical) + in-VM.
+0. **✅ done** (`d132773`). pptk: `.4s` FP arith
+   (`fadd/fsub/fmul/fdiv_v_4s`) + `dup_v_4s_from_s0/_w`
+   encoders, one spot-test each. Constant vec4s build via
+   per-lane `ins` (already in pptk); no `ld1`-from-pool
+   needed yet.
+1. **✅ done.** Packed representation + classifier. Added
+   `packed: HashMap<ValueId, Vreg>` alongside the per-lane
+   `vectors`; a vec4 ValueId lives in exactly one. The
+   classifier seeds `disqualified` from every vec4 touched
+   by a non-pack-friendly op (Shuffle/Extract/Dot/Phi/
+   Select/Composite/Insert/AccessChain) then fixed-point
+   propagates across vec×vec FP-binop cliques. Pack-
+   friendly producers: a *pure* `ConstVec` (all lanes are
+   genuine `ConstFloat`s — a `CompositeConstruct` of
+   computed/extracted scalars stays per-lane, since
+   assembling its aliased element regs into a fresh Q-reg
+   can clobber a still-live source) and vec×vec FP binops;
+   pack-friendly sink: a whole-vector `Store`. No bridge
+   needed yet — the classifier is whole-component, so a
+   packed value is *only* ever consumed by packed ops.
+   `emit_fp_binop_poly` grew a packed path (one `.4s`
+   instruction); `ConstVec` builds the Q-reg via per-lane
+   `ins`; `Store` of a packed value is one `str q`.
+   Disasm-confirmed on `vecarith`: 12 scalar ops + 4 lane
+   stores → `fadd.4s` + `fsub.4s` + `fmul.4s` + `str q`.
+   Gate met: full differential 26/26 (caught + fixed the
+   `CompositeConstruct`-ConstVec aliasing bug — `cextract`
+   now correctly stays per-lane) + in-VM 19/19, `vecarith`
+   packed and bit-exact on FreeBSD aarch64.
 2. packed vec Phi + carry phase-2 coalescing to the Q-reg
    form. Gate: `three_way_heavyvec` + in-VM `heavyvec`.
 3. re-bench `heavyvec` vs `clang -O2`; expect bespoke to
