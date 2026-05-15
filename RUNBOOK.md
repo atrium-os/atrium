@@ -1844,6 +1844,125 @@ diffs as branches.
 from a setup misstep. Delete via the web UI when convenient — needs
 `delete_repo` scope which `gh auth refresh` can grant.)
 
+### Live kernel debug — kgdb workflow
+
+For interactive kernel-side debugging (single-step, breakpoints,
+struct inspection), the VM exposes a gdb stub via QEMU's `-s` flag
+and a cross-gdb on the host attaches to it.
+
+One-time setup on the host:
+```sh
+brew install aarch64-elf-gdb
+```
+
+Start the VM with the stub enabled:
+```sh
+~/src/bsd/scripts/run-vm.sh --kgdb
+```
+
+This adds `-s` to QEMU (gdb stub on `127.0.0.1:1234`).  The script
+also auto-sends `cont` to QMP because QEMU 10.x + HVF + `-s` starts
+the guest paused (undocumented, differs from KVM); without the
+auto-cont the boot wouldn't proceed.  Boot is otherwise identical
+to a normal `run-vm.sh` invocation; the stub is dormant until gdb
+attaches.
+
+In a second terminal, attach gdb:
+```sh
+~/src/bsd/scripts/kgdb-attach.sh                  # default: LAMINAR-DEV
+~/src/bsd/scripts/kgdb-attach.sh GENERIC          # another kernconf
+~/src/bsd/scripts/kgdb-attach.sh /full/path.full  # explicit symbol file
+KGDB_REFRESH=1 ~/src/bsd/scripts/kgdb-attach.sh   # force re-copy after rebuild
+```
+
+The script fetches the matching `kernel.full` (debug symbols) from
+the VM's `/usr/obj` to the host via the 9p share, then runs
+`aarch64-elf-gdb` against it with `target remote 127.0.0.1:1234`.
+First attach copies ~90 MB; subsequent attaches reuse the cached
+copy in `vm/kgdb-symbols/`.
+
+When gdb pauses, ALL vCPUs halt.  When you `c` or `detach`, the
+guest resumes.
+
+Useful commands inside gdb:
+```
+(gdb) info threads                       # vCPUs as gdb threads
+(gdb) bt                                 # backtrace
+(gdb) b sched_laminar_setcpu             # set breakpoint
+(gdb) b /usr/src/sys/kern/sched_laminar.c:342
+(gdb) c                                  # continue
+(gdb) p curthread->td_critnest           # FreeBSD pcpu-aware deref
+(gdb) si / ni                            # single-step instr / next
+(gdb) info reg                           # ARM64 registers
+(gdb) detach                             # resume guest, leave gdb
+(gdb) Ctrl-C                             # interrupt running guest
+```
+
+Note: gdb's `curthread` lookup works only after a breakpoint hits
+in kernel code (per-CPU resolution).  Source file references like
+`sched_laminar.c:905` show as "No such file or directory" warnings
+because gdb is on the host and source lives in the VM; the
+breakpoint line numbers still work.  Add `directory
+~/src/bsd/freebsd-src/usr/src/sys` inside gdb to fetch source via
+the host clone if needed.
+
+Common diagnostic recipes:
+
+1. **Witness panic / critnest leak**: set a breakpoint at the
+   function suspected of leaking, on entry inspect
+   `curthread->td_critnest`, single-step the dance, watch the
+   counter on each spinlock_enter/exit / mtx acquire.
+
+2. **Sched-state inspection at a panic**:
+   ```
+   (gdb) target remote 127.0.0.1:1234
+   (gdb) bt
+   (gdb) up                              # walk up the stack
+   (gdb) info locals
+   (gdb) p ((struct laminar_tdq *)PCPU_GET(sched))->ltdq_load
+   ```
+
+3. **Conditional breakpoint on specific thread**:
+   ```
+   (gdb) b sched_laminar_add if td->td_proc->p_pid == 1234
+   ```
+
+Trade-offs vs ddb:
+- **gdb pro**: source-level, conditional breakpoints, hardware
+  watchpoints (HVF passes them through), persistent across boots.
+- **gdb con**: pauses ALL CPUs on attach; less aware of kernel
+  thread state than the in-tree `kgdb` post-mortem tool.
+- **ddb pro**: in-kernel, knows kernel structs natively, can run
+  while other CPUs continue.  Already enabled in this kernel.
+- **ddb con**: text-only, no breakpoints, scripting via DDB
+  scripts is awkward.
+
+Recommended split: ddb for post-panic forensics ("show alllocks",
+"show pcpu", "ps", "bt"), gdb for stepping through a live bug.
+
+### crash dumps for post-mortem analysis
+
+For panics that leave the kernel in DDB, `dump` writes a minidump
+to the configured dump device.  Then `kgdb /boot/<kernel>/kernel
+/var/crash/vmcore.N` reads it back symbolically.
+
+Set up dump device once (kernel config already enables
+`debug.minidump=1`):
+```sh
+~/src/bsd/scripts/vssh "swapinfo | head -3"
+~/src/bsd/scripts/vssh "dumpon /dev/vtbd0p2"   # adjust device
+~/src/bsd/scripts/vssh "sysrc dumpdev=/dev/vtbd0p2"
+```
+
+After a panic at DDB prompt: `dump`, then `reboot`.  On next boot
+savecore extracts to `/var/crash/`.  Then in the VM:
+```sh
+kgdb /boot/laminar/kernel /var/crash/vmcore.0
+(kgdb) bt
+(kgdb) thread N
+(kgdb) print td_critnest
+```
+
 ---
 
 ## 11. Dev VM rebuild — ZFS root (2026-05-09)
