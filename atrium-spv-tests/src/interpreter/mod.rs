@@ -91,6 +91,11 @@ pub struct ShaderInputs {
     /// `(set, binding)` and calls
     /// `atrium_spv_runtime::atrium_tex_sample_2d`.
     pub textures: Vec<TextureBinding>,
+    /// Per-invocation packed vertex-attribute bytes for
+    /// the vertex stage. `run_vertex` walks the function
+    /// once per entry. Empty = single invocation with no
+    /// attribute reads (the constant-position smoke case).
+    pub vertex_attributes_per_invocation: Vec<Vec<u8>>,
 }
 
 impl Default for ShaderInputs {
@@ -100,6 +105,7 @@ impl Default for ShaderInputs {
             push_constants: [0u8; 128],
             varyings_per_invocation: Vec::new(),
             textures: Vec::new(),
+            vertex_attributes_per_invocation: Vec::new(),
         }
     }
 }
@@ -114,6 +120,17 @@ pub struct ShaderOutputs {
     /// Single-element for the phase-0 single-invocation
     /// case.
     pub pixels: Vec<RgbaF32>,
+}
+
+/// Vertex-stage outputs. One position per invocation —
+/// `gl_Position` written via `OpStore` through an
+/// `OpAccessChain` into the gl_PerVertex block. Varyings
+/// follow in a later phase.
+#[derive(Debug, Clone, Default)]
+pub struct VertexOutputs {
+    /// One `vec4` position per invocation, in the order
+    /// `vertex_attributes_per_invocation` lists them.
+    pub positions: Vec<[f32; 4]>,
 }
 
 /// Interpreter errors.
@@ -166,6 +183,9 @@ pub struct Interpreter {
     var_binding: HashMap<Word, (u32, u32)>,
     /// Entry point declared with ExecutionModel::Fragment.
     fragment_entry: Option<Word>,
+    /// Entry point declared with ExecutionModel::Vertex.
+    /// `run_vertex` dispatches off this id.
+    vertex_entry: Option<Word>,
 }
 
 /// Information about a SPIR-V type.
@@ -254,6 +274,7 @@ impl Interpreter {
             struct_layouts: HashMap::new(),
             var_binding: HashMap::new(),
             fragment_entry: None,
+            vertex_entry: None,
         };
         interp.index()?;
         Ok(interp)
@@ -279,6 +300,31 @@ impl Interpreter {
         Ok(ShaderOutputs { pixels })
     }
 
+    /// Run the Vertex entry-point once per
+    /// `vertex_attributes_per_invocation` entry (or once
+    /// with no inputs if the vector is empty), collecting
+    /// one `vec4` position per invocation. v1 finds the
+    /// position by scanning post-execution `storage` for a
+    /// 4-lane vector value (the gl_Position store) — fine
+    /// for the constant-position smoke shape; richer
+    /// extraction (multiple outputs, location-tagged
+    /// varyings, AccessChain → BuiltIn Position lookup)
+    /// lands in a later phase.
+    pub fn run_vertex(
+        &self,
+        inputs: &ShaderInputs,
+    ) -> Result<VertexOutputs, InterpError> {
+        let entry = self.vertex_entry
+            .ok_or(InterpError::NoEntryPoint("Vertex"))?;
+        let n = inputs.vertex_attributes_per_invocation.len().max(1);
+        let mut positions = Vec::with_capacity(n);
+        for _ in 0..n {
+            let pos = self.eval_vertex_invocation(entry, inputs)?;
+            positions.push(pos);
+        }
+        Ok(VertexOutputs { positions })
+    }
+
     /// Build the type / constant / variable / entry-point
     /// indices from `self.module`. Called once at `new()`.
     fn index(&mut self) -> Result<(), InterpError> {
@@ -288,10 +334,16 @@ impl Interpreter {
             // Name string, [interface ids...].
             if ep.class.opcode != Op::EntryPoint { continue; }
             if let Some(Operand::ExecutionModel(model)) = ep.operands.first() {
-                if *model == rspirv::spirv::ExecutionModel::Fragment {
-                    if let Some(Operand::IdRef(id)) = ep.operands.get(1) {
-                        self.fragment_entry = Some(*id);
-                    }
+                let id = match ep.operands.get(1) {
+                    Some(Operand::IdRef(id)) => Some(*id),
+                    _ => None,
+                };
+                match *model {
+                    rspirv::spirv::ExecutionModel::Fragment =>
+                        self.fragment_entry = id,
+                    rspirv::spirv::ExecutionModel::Vertex =>
+                        self.vertex_entry = id,
+                    _ => {}
                 }
             }
         }
@@ -651,6 +703,122 @@ impl Interpreter {
                 "Output variable was never stored to".to_string(),
             ))?;
         constant_to_rgba(stored)
+    }
+
+    /// Walk a Vertex entry-point function for one
+    /// invocation; return the stored `gl_Position` as a
+    /// `[f32; 4]`. v1 implementation: same block-walker as
+    /// the fragment path, but the post-execution extraction
+    /// scans `storage` for a 4-lane `ConstantValue::Vec` (the
+    /// gl_Position store via OpAccessChain). The smoke
+    /// shader writes exactly one such value.
+    fn eval_vertex_invocation(
+        &self,
+        entry: Word,
+        inputs: &ShaderInputs,
+    ) -> Result<[f32; 4], InterpError> {
+        let func = self.module.functions.iter()
+            .find(|f| f.def.as_ref().and_then(|d| d.result_id) == Some(entry))
+            .ok_or(InterpError::NoEntryPoint("Vertex (function body missing)"))?;
+
+        let mut values: HashMap<Word, ConstantValue> = HashMap::new();
+        let mut storage: HashMap<Word, ConstantValue> = HashMap::new();
+        let mut current_idx: usize = 0;
+        let mut prev_label: Option<Word> = None;
+        let mut hops: u32 = 0;
+        const MAX_HOPS: u32 = 1024;
+        loop {
+            if hops >= MAX_HOPS {
+                return Err(InterpError::UnsupportedControlFlow(format!(
+                    "vertex exceeded {MAX_HOPS} block-hops (loop?)")));
+            }
+            hops += 1;
+            let block = func.blocks.get(current_idx).ok_or_else(||
+                InterpError::UnsupportedControlFlow(format!(
+                    "block index {current_idx} out of range")))?;
+            let current_label = block.label.as_ref()
+                .and_then(|l| l.result_id);
+            let mut phi_count = 0;
+            for inst in &block.instructions {
+                if inst.class.opcode != Op::Phi { break; }
+                let result_id = inst.result_id.ok_or_else(||
+                    InterpError::BadConstant(0))?;
+                let mut chosen: Option<ConstantValue> = None;
+                let mut j = 0;
+                while j + 1 < inst.operands.len() {
+                    let val_id = op_id(&inst.operands, j)?;
+                    let parent  = op_id(&inst.operands, j+1)?;
+                    if Some(parent) == prev_label {
+                        chosen = Some(self.lookup_value(val_id, &values)?);
+                        break;
+                    }
+                    j += 2;
+                }
+                let chosen = chosen.ok_or_else(||
+                    InterpError::UnsupportedControlFlow(format!(
+                        "OpPhi in block {current_label:?} has no arm \
+                         matching prev block {prev_label:?}")))?;
+                values.insert(result_id, chosen);
+                phi_count += 1;
+            }
+            let last_idx = block.instructions.len().saturating_sub(1);
+            for (i, inst) in block.instructions.iter().enumerate() {
+                if i < phi_count { continue; }
+                if i == last_idx { break; }
+                self.eval_inst(inst, &mut values, &mut storage, inputs)?;
+            }
+            let term = block.instructions.last().ok_or_else(||
+                InterpError::UnsupportedControlFlow(
+                    "empty block".into()))?;
+            match term.class.opcode {
+                Op::Return => break,
+                Op::Branch => {
+                    let target = op_id(&term.operands, 0)?;
+                    prev_label = current_label;
+                    current_idx = self.find_block_index(func, target)?;
+                }
+                Op::BranchConditional => {
+                    let cond_id = op_id(&term.operands, 0)?;
+                    let t_label = op_id(&term.operands, 1)?;
+                    let f_label = op_id(&term.operands, 2)?;
+                    let cond = self.lookup_value(cond_id, &values)?;
+                    let taken = match cond {
+                        ConstantValue::Bool(b) => b,
+                        ConstantValue::Int(n) => n != 0,
+                        other => return Err(InterpError::UnsupportedOpcode(
+                            format!("BranchConditional cond: {other:?}"))),
+                    };
+                    let target = if taken { t_label } else { f_label };
+                    prev_label = current_label;
+                    current_idx = self.find_block_index(func, target)?;
+                }
+                other => return Err(InterpError::UnsupportedControlFlow(
+                    format!("unsupported terminator {other:?} in vertex"))),
+            }
+        }
+
+        // Scan `storage` for any stored 4-lane vector value;
+        // that's the gl_Position write. (The smoke shader
+        // writes exactly one.)
+        for (_ptr_id, v) in &storage {
+            if let ConstantValue::Vec(lanes) = v {
+                if lanes.len() == 4 {
+                    let mut out = [0.0f32; 4];
+                    for (i, lane) in lanes.iter().enumerate() {
+                        out[i] = match lane {
+                            ConstantValue::F32(x) => *x,
+                            ConstantValue::F64(x) => *x as f32,
+                            ConstantValue::Int(n) => *n as f32,
+                            other => return Err(InterpError::UnsupportedOutput(
+                                format!("non-numeric vertex lane {i}: {other:?}"))),
+                        };
+                    }
+                    return Ok(out);
+                }
+            }
+        }
+        Err(InterpError::UnsupportedOutput(
+            "vertex shader didn't store a 4-lane vec to any output".into()))
     }
 
     fn eval_inst(

@@ -3173,11 +3173,31 @@ So the door is open; the work is wiring through.
    gl_PerVertex anyway, so this isn't a real
    compatibility constraint, just an assertion in the
    test setup.
-1. Interpreter vertex path: `Interpreter::run_vertex(inputs)`
-   parallel to `run_fragment`. Reads attributes from the
-   ShaderInputs (a new `vertex_attributes_per_invocation:
-   Vec<Vec<u8>>` field, mirroring `varyings_per_invocation`),
-   produces an output struct (position vec4 + varyings).
+1. **✅ partial.** Interpreter vertex path. Added
+   `Interpreter::run_vertex(inputs)` parallel to
+   `run_fragment`; `VertexOutputs { positions: Vec<[f32;4]> }`;
+   `ShaderInputs.vertex_attributes_per_invocation:
+   Vec<Vec<u8>>`; `vertex_entry: Option<Word>` populated
+   from `OpEntryPoint`. The block walker is a near-copy
+   of the fragment one (block-stepper + Phi resolver +
+   eval_inst per non-terminator); the post-execution
+   output extraction scans `storage` for any 4-lane
+   `ConstantValue::Vec` — the gl_Position store via
+   `OpAccessChain` lands there. Two new tests
+   (`tests/vertex_constant.rs`):
+   `interpreter_run_vertex_constant_position` (writes
+   `[0.25, 0.5, 0.75, 1.0]` to gl_Position, asserts
+   exact match) and
+   `interpreter_run_vertex_one_invocation_per_attribute_entry`
+   (three attribute entries → three identical positions).
+
+   **Deferred to phase 1b:** `OpLoad` from
+   `StorageClass::Input` (the per-vertex attribute
+   read). The current `load_from_storage` doesn't
+   handle `Input` and doesn't take an invocation index;
+   adding both is a small mechanical change but lands
+   when the differential test actually needs to read
+   attributes (the constant-position smoke does not).
 2. Cranelift vertex codegen: the signature exists;
    wire `resolve_pointer_param` for Vertex storage
    classes that the existing OpStore/OpLoad code paths
