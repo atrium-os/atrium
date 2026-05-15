@@ -3236,9 +3236,32 @@ So the door is open; the work is wiring through.
 
    **First-ever vertex shader compiled through a
    backend and producing correct gl_Position on host.**
-3. Bespoke vertex codegen: same — extend
-   `resolve_pointer_param` (and the equivalent of x_out
-   for vertex's `out_position` / `out_varyings`).
+3. **✅ done.** Bespoke vertex codegen. Three small
+   changes:
+   * Lift the `func.stage != Fragment` early-return at
+     `emit_function`'s top to allow `Vertex` too.
+   * Make `x_out` (the primary-output register) stage-
+     dependent: Fragment → `X4` (out_color), Vertex →
+     `X6` (out_position).
+   * Extend `resolve_or_make_pointer` to take
+     `stage: ShaderStage` and dispatch on `(stage,
+     storage_class)`, matching the AAPCS64 splits per
+     `docs/spec/tier2-renderer.md` §4.1 (Vertex:
+     X0/X1=in_attributes/strides, X2=uniforms,
+     X3=push_constants, X6=out_position).
+   * Same v1 single-Output-mapping limitation as
+     Cranelift — gl_Position only; mixed varyings need
+     phase 4+ richer dispatch.
+
+   Both `bespoke_constant_position_vertex` and
+   `bespoke_passthrough_vertex` pass alongside their
+   Cranelift twins in `tests/vertex_constant.rs` (4
+   tests total now: 2 backends × 2 shapes). The in-VM
+   suite stays at 20/20 — bespoke vertex codegen
+   doesn't disturb fragment paths.
+
+   **First vertex shader compiled through the bespoke
+   backend producing correct gl_Position on host.**
 4. Differential `three_way_passthrough_vertex` —
    interpreter + Cranelift + bespoke agree on the output
    position + varyings for a triangle's three vertices.

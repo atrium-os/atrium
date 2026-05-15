@@ -251,7 +251,8 @@ pub fn compile_blob(module: &Module, target: Target)
 fn emit_function(
     func: &Function,
 ) -> Result<(Vec<u8>, Vec<(u32, u32)>), BackendError> {
-    if func.stage != ShaderStage::Fragment {
+    // Fragment + Vertex are supported; Compute lands later.
+    if !matches!(func.stage, ShaderStage::Fragment | ShaderStage::Vertex) {
         return Err(BackendError::Unsupported(format!(
             "stage {:?} not yet supported", func.stage)));
     }
@@ -301,9 +302,17 @@ fn emit_function(
     let mut ints: HashMap<ValueId, asm::Wreg> = HashMap::new();
     let mut int_pool = IntPool::new();
 
-    // X4 holds out_color. Scratch X9/W9 for constant
-    // materialisation + fmov bridging.
-    let x_out = asm::Xreg(4);
+    // Stage-specific "primary output pointer" register
+    // (the AAPCS64 slot the shader writes its main result
+    // through). Fragment: X4 holds `out_color`. Vertex:
+    // X6 holds `out_position` (per the vertex ABI in
+    // docs/spec/tier2-renderer.md §4.1). Scratch X9/W9
+    // for constant materialisation + fmov bridging.
+    let x_out = match func.stage {
+        ShaderStage::Fragment => asm::Xreg(4),
+        ShaderStage::Vertex   => asm::Xreg(6),
+        ShaderStage::Compute  => asm::Xreg(0), // unreachable here
+    };
     let w_tmp = asm::Wreg(9);
 
     // Synthetic-id counter for per-lane Values that need a
@@ -1403,7 +1412,7 @@ fn emit_function(
                     BackendError::Internal(
                         "AccessChain without result".into()))?;
                 let (param, base_off) =
-                    resolve_or_make_pointer(base, &mut pointers)?;
+                    resolve_or_make_pointer(base, &mut pointers, func.stage)?;
                 let new_off = base_off.saturating_add(*byte_offset as i32);
                 pointers.insert(result.id, (param, new_off));
             }
@@ -1411,7 +1420,7 @@ fn emit_function(
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal("Load without result".into()))?;
                 let (param, off) =
-                    resolve_or_make_pointer(ptr, &mut pointers)?;
+                    resolve_or_make_pointer(ptr, &mut pointers, func.stage)?;
                 let pointee = match &ptr.ty {
                     Type::Pointer(_, inner) => (**inner).clone(),
                     other => return Err(BackendError::Unsupported(format!(
@@ -2104,11 +2113,27 @@ fn emit_function(
 /// repr for a pointer-typed Value. If the Value already
 /// has a repr (set by a prior AccessChain), return it.
 /// Otherwise it must be a Variable: derive the base
-/// register from its storage class per the fragment-
-/// shader AAPCS64 split.
+/// register from its storage class per the *stage's*
+/// AAPCS64 split — fragment + vertex have different
+/// register assignments (see docs/spec/tier2-renderer.md
+/// §4.1):
+///
+///   Fragment:
+///     X0 in_varyings, X1 uniforms, X2 push_constants,
+///     X4 out_color, X5 out_depth.
+///   Vertex:
+///     X0 in_attributes, X1 in_attr_strides, X2 uniforms,
+///     X3 push_constants, W4 vertex_index, W5 instance_index,
+///     X6 out_position, X7 out_varyings, X8 out_clip_distance.
+///
+/// v1 maps Vertex Output → X6 (out_position) on the
+/// assumption the shader only writes gl_Position; mirrors
+/// the Cranelift backend's v1 mapping. Richer dispatch
+/// (BuiltIn vs Location) lands in a later phase.
 fn resolve_or_make_pointer(
     v: &Value,
     pointers: &mut HashMap<ValueId, (asm::Xreg, i32)>,
+    stage: ShaderStage,
 ) -> Result<(asm::Xreg, i32), BackendError> {
     if let Some(p) = pointers.get(&v.id) { return Ok(*p); }
     let storage = match &v.ty {
@@ -2116,13 +2141,20 @@ fn resolve_or_make_pointer(
         other => return Err(BackendError::Unsupported(format!(
             "pointer Value is not Pointer-typed: {other:?}"))),
     };
-    let param = match storage {
-        StorageClass::Input        => asm::Xreg(0), // in_varyings
-        StorageClass::Uniform      => asm::Xreg(1),
-        StorageClass::PushConstant => asm::Xreg(2),
-        StorageClass::Output       => asm::Xreg(4),
-        other => return Err(BackendError::Unsupported(format!(
-            "storage class {other:?} not mapped to an ABI register"))),
+    let param = match (stage, storage) {
+        (ShaderStage::Fragment, StorageClass::Input)        => asm::Xreg(0),
+        (ShaderStage::Fragment, StorageClass::Uniform)      => asm::Xreg(1),
+        (ShaderStage::Fragment, StorageClass::PushConstant) => asm::Xreg(2),
+        (ShaderStage::Fragment, StorageClass::Output)       => asm::Xreg(4),
+
+        (ShaderStage::Vertex,   StorageClass::Input)        => asm::Xreg(0),
+        (ShaderStage::Vertex,   StorageClass::Uniform)      => asm::Xreg(2),
+        (ShaderStage::Vertex,   StorageClass::PushConstant) => asm::Xreg(3),
+        (ShaderStage::Vertex,   StorageClass::Output)       => asm::Xreg(6),
+
+        (stage, other) => return Err(BackendError::Unsupported(format!(
+            "stage={stage:?} storage class={other:?} not mapped to an \
+             ABI register"))),
     };
     let repr = (param, 0);
     pointers.insert(v.id, repr);

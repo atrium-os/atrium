@@ -6,6 +6,8 @@
 //! No bespoke runner yet — that lands in phase 3. The
 //! vertex-stage three-way differential lands in phase 4.
 
+#![allow(dead_code)]
+
 use atrium_spv_tests::interpreter::{Interpreter, ShaderInputs};
 
 fn build_constant_position_vertex_shader(p: [f32; 4]) -> Vec<u8> {
@@ -54,19 +56,29 @@ fn build_constant_position_vertex_shader(p: [f32; 4]) -> Vec<u8> {
     bytes
 }
 
-/// Compile through Cranelift, cc -shared, dlopen
-/// atrium_vs_main, invoke once, return the position vec4.
-/// (Not on the ShaderRunner trait — vertex has a different
-/// ABI; this is the test-local equivalent of the
-/// fragment-side run_via_dlopen.)
-fn run_vertex_via_cranelift(spirv: &[u8]) -> [f32; 4] {
-    use atrium_spv_backend_cranelift::{compile, Target};
-    let module = atrium_spv_frontend::translate(spirv).unwrap();
-    let out = compile(&module, Target::host()).unwrap();
+/// One of the two production backends.
+#[derive(Copy, Clone, Debug)]
+enum Backend { Cranelift, Bespoke }
 
+fn compile_to_object(spirv: &[u8], backend: Backend) -> Vec<u8> {
+    let module = atrium_spv_frontend::translate(spirv).unwrap();
+    match backend {
+        Backend::Cranelift => atrium_spv_backend_cranelift::compile(
+            &module, atrium_spv_backend_cranelift::Target::host()).unwrap().object,
+        Backend::Bespoke => atrium_spv_backend_bespoke::compile(
+            &module, atrium_spv_backend_bespoke::Target::host()).unwrap().object,
+    }
+}
+
+fn run_vertex_const(spirv: &[u8], backend: Backend) -> [f32; 4] {
+    let object = compile_to_object(spirv, backend);
+    run_object_const(&object)
+}
+
+fn run_object_const(object: &[u8]) -> [f32; 4] {
     let dir = tempfile::tempdir().unwrap();
     let obj_path = dir.path().join("shader.o");
-    std::fs::write(&obj_path, &out.object).unwrap();
+    std::fs::write(&obj_path, object).unwrap();
     let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
     let lib_path = dir.path().join(format!("shader.{ext}"));
     let flag = if cfg!(target_os = "macos") { "-dynamiclib" } else { "-shared" };
@@ -152,16 +164,10 @@ fn build_passthrough_vertex_shader() -> Vec<u8> {
     bytes
 }
 
-/// Like `run_vertex_via_cranelift` but takes a packed
-/// attribute buffer; passes it as `in_attributes` (X0).
-fn run_passthrough_via_cranelift(spirv: &[u8], attr: &[u8]) -> [f32; 4] {
-    use atrium_spv_backend_cranelift::{compile, Target};
-    let module = atrium_spv_frontend::translate(spirv).unwrap();
-    let out = compile(&module, Target::host()).unwrap();
-
+fn run_object_passthrough(object: &[u8], attr: &[u8]) -> [f32; 4] {
     let dir = tempfile::tempdir().unwrap();
     let obj_path = dir.path().join("shader.o");
-    std::fs::write(&obj_path, &out.object).unwrap();
+    std::fs::write(&obj_path, object).unwrap();
     let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
     let lib_path = dir.path().join(format!("shader.{ext}"));
     let flag = if cfg!(target_os = "macos") { "-dynamiclib" } else { "-shared" };
@@ -193,41 +199,15 @@ fn run_passthrough_via_cranelift(spirv: &[u8], attr: &[u8]) -> [f32; 4] {
     pos
 }
 
-#[test]
-fn cranelift_passthrough_vertex() {
-    let spirv = build_passthrough_vertex_shader();
-    let expected_pos = [0.25_f32, -0.5, 0.75];
-    let mut attr = Vec::with_capacity(12);
-    for f in expected_pos { attr.extend_from_slice(&f.to_le_bytes()); }
-
-    // Interpreter oracle.
-    use atrium_spv_tests::interpreter::Interpreter;
-    let interp = Interpreter::new(&spirv).unwrap();
-    let inputs = ShaderInputs {
-        vertex_attributes_per_invocation: vec![attr.clone()],
-        ..ShaderInputs::default()
-    };
-    let interp_pos = interp.run_vertex(&inputs).unwrap().positions[0];
-
-    // Cranelift.
-    let pos = run_passthrough_via_cranelift(&spirv, &attr);
-    for k in 0..4 {
-        assert!((pos[k] - interp_pos[k]).abs() < 1e-6,
-            "cranelift lane {k}: {} vs interpreter {}", pos[k], interp_pos[k]);
-    }
-    let expected_full = [expected_pos[0], expected_pos[1], expected_pos[2], 1.0];
-    for k in 0..4 {
-        assert!((pos[k] - expected_full[k]).abs() < 1e-6,
-            "cranelift lane {k}: {} vs expected {}", pos[k], expected_full[k]);
-    }
+fn run_passthrough(spirv: &[u8], attr: &[u8], backend: Backend) -> [f32; 4] {
+    let object = compile_to_object(spirv, backend);
+    run_object_passthrough(&object, attr)
 }
 
-#[test]
-fn cranelift_constant_position_vertex() {
+fn assert_constant_position(backend: Backend) {
     let expected = [0.25_f32, 0.5, 0.75, 1.0];
     let spirv = build_constant_position_vertex_shader(expected);
-
-    // Sanity-check via interpreter first.
+    // Sanity-check via interpreter.
     let interp = Interpreter::new(&spirv).unwrap();
     let interp_pos = interp.run_vertex(&ShaderInputs::default()).unwrap()
         .positions[0];
@@ -235,11 +215,35 @@ fn cranelift_constant_position_vertex() {
         assert!((interp_pos[k] - expected[k]).abs() < 1e-6,
             "interpreter lane {k}: {} vs {}", interp_pos[k], expected[k]);
     }
-
-    // Now Cranelift.
-    let pos = run_vertex_via_cranelift(&spirv);
+    let pos = run_vertex_const(&spirv, backend);
     for k in 0..4 {
         assert!((pos[k] - expected[k]).abs() < 1e-6,
-            "cranelift lane {k}: {} vs {}", pos[k], expected[k]);
+            "{backend:?} lane {k}: {} vs {}", pos[k], expected[k]);
     }
 }
+
+fn assert_passthrough(backend: Backend) {
+    let spirv = build_passthrough_vertex_shader();
+    let expected_pos = [0.25_f32, -0.5, 0.75];
+    let mut attr = Vec::with_capacity(12);
+    for f in expected_pos { attr.extend_from_slice(&f.to_le_bytes()); }
+
+    let interp = Interpreter::new(&spirv).unwrap();
+    let inputs = ShaderInputs {
+        vertex_attributes_per_invocation: vec![attr.clone()],
+        ..ShaderInputs::default()
+    };
+    let interp_pos = interp.run_vertex(&inputs).unwrap().positions[0];
+
+    let pos = run_passthrough(&spirv, &attr, backend);
+    for k in 0..4 {
+        assert!((pos[k] - interp_pos[k]).abs() < 1e-6,
+            "{backend:?} lane {k}: {} vs interpreter {}",
+            pos[k], interp_pos[k]);
+    }
+}
+
+#[test] fn cranelift_constant_position_vertex() { assert_constant_position(Backend::Cranelift); }
+#[test] fn cranelift_passthrough_vertex()       { assert_passthrough(Backend::Cranelift); }
+#[test] fn bespoke_constant_position_vertex()   { assert_constant_position(Backend::Bespoke); }
+#[test] fn bespoke_passthrough_vertex()         { assert_passthrough(Backend::Bespoke); }
