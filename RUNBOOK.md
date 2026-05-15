@@ -2825,6 +2825,111 @@ still wants the existing per-S-reg path.
    loop-amortised `heavyvec` shape was never going to
    move much from this lever.
 
+#### Next arc — scoped: texture/sampler support, end to end
+
+The last large unmeasured shader category. The Atrium-Tier-2
+IR declares `ImageSampleImplicitLod`, `ImageSampleExplicitLod`,
+and `ImageFetch` ops (their doc-comment says they "lower to
+calls into atrium-spv-runtime"), but right now **nothing
+in the stack implements them**: no frontend lowering from
+SPIR-V `OpImage*`, no interpreter, no runtime crate, no
+backend codegen — only the IR variants exist. Bespoke
+returning `Unsupported` is actually shared-absent across
+all three runners; this is a *coverage* gap, not a *perf*
+gap, and it blocks the renderer from handling almost any
+real-world shader.
+
+**Design — runtime-call lowering.** Sampling lowers to a
+C-ABI helper call (per the IR doc-comment), not inline
+NEON. Inline NEON for bilinear + wrap-mode + format-decode
+is its own substantial perf arc; runtime calls are the
+correct first step (and the fast-tier perf bar — clang's
+`-O2` on a software texture sampler is itself ~hundreds of
+instructions, so a single call site is a comparable
+ceiling).
+
+**ABI sketch.**
+
+```c
+struct atrium_tex_desc {
+    const void *data;           // texel array, row-major
+    uint32_t width, height;
+    uint32_t stride_bytes;
+    uint32_t format;            // RGBA8/BGRA8/R8/RG16F/...
+};
+struct atrium_sampler_desc {
+    uint32_t mag_filter;        // 0=nearest 1=linear
+    uint32_t min_filter;
+    uint32_t wrap_s, wrap_t;    // 0=clamp 1=repeat 2=mirror
+};
+void atrium_tex_sample_2d(
+    const struct atrium_tex_desc *tex,
+    const struct atrium_sampler_desc *samp,
+    float u, float v,
+    float out_rgba[4]);
+void atrium_tex_fetch_2d(
+    const struct atrium_tex_desc *tex,
+    int32_t x, int32_t y, int32_t lod,
+    float out_rgba[4]);
+```
+
+The fragment-shader AAPCS64 already passes `uniforms` in
+X1; descriptor sets live there as an array of
+`{tex_desc*, samp_desc*}` pairs indexed by SPIR-V binding
+number. Backends emit one of these as a small load
+sequence (descriptor pointer from uniforms[binding*16],
+then `bl atrium_tex_sample_2d` with the resolved args).
+
+**Risk — calling convention from JIT-emitted code.** A
+`bl <runtime helper>` from a `MAP_JIT` / `PROT_EXEC` blob
+to a libc-mapped function needs the loader to resolve the
+runtime helper address and either patch a relocation or
+load-through-pointer. The JIT-emit path was deliberately
+designed reloc-free; the cleanest path is `adrp + ldr` of
+a function-pointer slot the loader fills in before mapping
+(one slot per helper, baked into each blob's header). This
+extends the `atrium-spv-blob` format slightly — a
+"runtime imports" table — but the change is bounded.
+
+**Phasing.**
+0. New `atrium-spv-runtime` crate (or extend
+   `atrium-spv-loader`). C-ABI helpers above + a few
+   format decoders (RGBA8/BGRA8 unorm → f32; nearest +
+   bilinear; clamp + repeat wrap). Unit tests against a
+   hand-built `tex_desc` over a 4×4 checkerboard.
+1. Frontend: SPIR-V `OpTypeImage`/`OpTypeSampler`/
+   `OpTypeSampledImage`/`OpSampledImage`/`OpImage*` →
+   the existing IR Op variants. Binding metadata: each
+   SPIR-V variable's binding number flows through into
+   the IR so backends know which descriptor slot to
+   load.
+2. Interpreter (in `atrium-spv-tests`): a sampler-aware
+   `ImageSampleImplicitLod`/`ImageFetch` handler that
+   reads descriptors from a host-side `ShaderInputs`
+   slot and calls the runtime helpers directly. This
+   gives the differential a working oracle without
+   needing any backend codegen yet.
+3. Differential: a `three_way_texture_sample` test
+   using a 4×4 texture + a Bilinear/Clamp sampler + a
+   shader that returns a sampled pixel. Initially
+   interpreter-only (skip Cranelift + bespoke as
+   `Unsupported`), then enable each backend as it
+   gains support.
+4. Cranelift backend: emit the AAPCS64 call sequence,
+   wiring through a runtime-helper relocation. The
+   easier of the two — cranelift-module already does
+   relocations.
+5. Bespoke backend: same call shape, but the JIT-emit
+   blob path needs the new "runtime imports" table in
+   `atrium-spv-blob` + a loader-time pointer patch.
+   The object-path (`compile()` → ELF/Mach-O) already
+   produces a normal symbol-relocated `BL` via `pptk`'s
+   existing emit pipeline, so that path is cheap; the
+   JIT-emit path is the substantive work.
+6. In-VM: a `tex_sample` shader added to `run-in-vm.sh`
+   with a host-shipped texture blob. The first real-
+   shader-shape end-to-end test on FreeBSD aarch64.
+
 #### `heavyvec` tail inquiry — loop rotation is the lever
 
 Disassembled `clang -O2 -ffp-contract=off` of
