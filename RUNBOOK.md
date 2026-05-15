@@ -3120,6 +3120,96 @@ extends the `atrium-spv-blob` format slightly — a
    Cranelift, bespoke, in-VM gate) handles image-sample
    correctly under the same v1 ABI.
 
+#### Next big arc — scoped: matrix ops + MVP transform
+
+The vertex stage compiles, the uniform-block reads agree
+across all three runners — but a real vertex shader's
+job is `gl_Position = mvp * vec4(in_pos, 1.0)`, and
+`mat4 * vec4` is the missing piece. Everything below
+the matrix multiply already exists.
+
+**Design.**
+
+* IR `Type::Mat4(VecElement)` — opaque at the type level
+  (the IR doesn't need to know it's 4 columns under the
+  hood; the backend lowers).
+* IR `Op::MatrixTimesVector { matrix, vector }` —
+  matrix-times-column-vector per SPIR-V semantics:
+  ```
+  result[i] = Σ matrix[j][i] * vector[j]
+  ```
+  Column-major; the SPIR-V `OpMatrixTimesVector`
+  operand order is `(matrix, vector)`.
+* Frontend: translate `OpTypeMatrix` → `Type::Mat4`,
+  `OpMatrixTimesVector` → the IR op. `OpAccessChain`
+  into a uniform struct's `Mat4` member produces a
+  `Pointer(Uniform, Mat4)`; the resulting `OpLoad` —
+  *here's the wrinkle* — returns a `Mat4` value the
+  backend has to materialise as 4 column vec4s.
+* Backend lowering: `MatrixTimesVector` desugars to
+  ```
+  c0 = column[0] * vector.x
+  c1 = column[1] * vector.y
+  c2 = column[2] * vector.z
+  c3 = column[3] * vector.w
+  result = c0 + c1 + c2 + c3
+  ```
+  = 4 vec×scalar broadcasts (`FMul`) + 3 vec+vec adds
+  (`FAdd`). All ops already exist + are tested. Cranelift
+  + bespoke can both lower this generically; the NEON
+  pack classifier should pick `result` up as packed (4
+  vec×vec FMul/FAdd on a closed component) and the
+  bespoke backend should emit `.4s` ops automatically.
+* Interpreter: a single `Op::MatrixTimesVector` handler
+  evaluating the same dot-product expression.
+
+**Phasing.**
+0. **✅ done.** IR: added `Type::Mat4(VecElement)` +
+   `Op::MatrixTimesVector { matrix, vector }`. All
+   downstream crates rebuild cleanly (existing matches
+   use `_` arms / specific variants — new variants don't
+   break dispatch).
+1. **✅ done (frontend).** Translate `OpTypeMatrix` →
+   `Type::Mat4` with v1 validation (4-column / vec4
+   element only — mat2/mat3 wait for a real shader that
+   needs them). Translate `OpMatrixTimesVector` → the
+   IR op via the existing `emit_binop_float` plumbing
+   (operand order: matrix-then-vector, per SPIR-V
+   `M *cv v`).
+
+   *Still pending in phase 1:* `OpAccessChain` stepping
+   into a Mat4 member + `OpLoad` materialising a matrix
+   value. Those come once the test exercises the path
+   end-to-end (i.e., once interpreter + backends handle
+   `Op::MatrixTimesVector` and we wire a uniform-mat4
+   shader).
+2. Interpreter: walk the matrix×vec dot products.
+3. Cranelift: lower `Op::MatrixTimesVector` to 4
+   broadcasts + 3 adds + 1 add of the four columns.
+   No new code-generator surface — reuses existing
+   FMul/FAdd paths.
+4. Bespoke: same lowering. Verify the NEON pack
+   classifier sees the chain and emits `.4s` ops.
+5. Differential `three_way_mvp_transform` — uniform
+   mat4 + vec3 attribute → gl_Position. All three
+   runners agree.
+6. In-VM gate: a `vertex_mvp` shader added to
+   `run-in-vm.sh` driven by the existing
+   `vertex_harness`.
+
+**Risk — Mat4 as a value type.** The IR's pointer-
+indexing model (`Op::AccessChain { base, byte_offset }`)
+makes column access trivial (offset += 16 * index). But
+loading a Mat4 as a *value* (without indexing) needs the
+backend to materialise it as 4 column vec4s — multiple
+V-regs / packed Q-regs at once. The simplest model:
+forbid `OpLoad` of a Mat4 directly; require shaders to
+do `OpMatrixTimesVector` (which feeds straight from the
+pointer with column-access desugared). GLSL/HLSL→SPIR-V
+producers don't typically emit "load a whole matrix then
+use it" — they pass matrix pointers around and only
+materialise at use sites.
+
 #### Next big arc — scoped: vertex stage
 
 Texture/sampler closes the fragment-shader functionality

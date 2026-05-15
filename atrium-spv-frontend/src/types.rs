@@ -37,7 +37,8 @@ impl TypeContext {
             // variables are processed by other passes.
             match inst.class.opcode {
                 Op::TypeVoid | Op::TypeBool | Op::TypeInt | Op::TypeFloat
-                | Op::TypeVector | Op::TypePointer | Op::TypeFunction
+                | Op::TypeVector | Op::TypeMatrix | Op::TypePointer
+                | Op::TypeFunction
                 | Op::TypeImage | Op::TypeSampler | Op::TypeSampledImage => {
                     ctx.raw.insert(id, inst.clone());
                     let ty = ctx.translate_inst(inst)?;
@@ -127,6 +128,31 @@ impl TypeContext {
                         "vector length {other} not supported (need 2/3/4)",
                     ))),
                 }
+            }
+            Op::TypeMatrix => {
+                // OpTypeMatrix column_type column_count.
+                // v1 supports only 4-column f32 matrices
+                // (mat4) since that's the canonical MVP /
+                // model-view-projection shape; mat2/mat3
+                // need their own type variants when a real
+                // shader demands them.
+                let column_type_id = read_id(&inst.operands, 0)?;
+                let column_count = read_lit(&inst.operands, 1)?;
+                let col_ty = self.types.get(&column_type_id).ok_or_else(||
+                    FrontendError::Malformed(format!(
+                        "TypeMatrix column type {column_type_id} unknown")))?;
+                let elem = match col_ty {
+                    Type::Vec4(VecElement::F32) => VecElement::F32,
+                    other => return Err(FrontendError::Unsupported(format!(
+                        "TypeMatrix column type {other:?} not supported \
+                         (v1: vec4<f32> only)"))),
+                };
+                if column_count != 4 {
+                    return Err(FrontendError::Unsupported(format!(
+                        "TypeMatrix with {column_count} columns not supported \
+                         (v1: 4-column only)")));
+                }
+                Ok(Type::Mat4(elem))
             }
             Op::TypePointer => {
                 let storage = read_storage(&inst.operands, 0)?;

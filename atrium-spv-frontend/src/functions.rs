@@ -586,6 +586,17 @@ fn translate_inst(
             |a, b| Op::Dot(a, b),
         ),
 
+        // OpMatrixTimesVector: matrix on the left, vector
+        // on the right (column-major, per SPIR-V's
+        // "M *cv v" semantics). Backends lower this into
+        // 4 broadcast-mul-adds — every op below is in the
+        // existing tested set.
+        SpvOp::MatrixTimesVector => emit_binop_float(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |m, v| Op::MatrixTimesVector { matrix: m, vector: v },
+        ),
+
         // Float comparisons → Bool (i32 0/1). All 12
         // variants map 1:1 to Op::FOrd* / FUnord*.
         SpvOp::FOrdEqual => emit_binop_float(

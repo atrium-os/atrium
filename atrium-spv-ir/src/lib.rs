@@ -122,6 +122,11 @@ pub enum Type {
     Vec3(VecElement),
     /// Four-lane vector.
     Vec4(VecElement),
+    /// 4×4 matrix, column-major (SPIR-V's
+    /// `OpTypeMatrix 4 (OpTypeVector elem 4)`). Backends
+    /// lower a `Mat4` value into four column vec4s; the
+    /// matrix never has its own register file.
+    Mat4(VecElement),
     /// Typed offset into a flat storage block. Box keeps Type
     /// finite-sized.
     Pointer(StorageClass, Box<Type>),
@@ -311,6 +316,24 @@ pub enum Op {
     FRem(Value, Value),
     /// `result = -a`.
     FNeg(Value),
+    /// `result = matrix * vector` — SPIR-V
+    /// `OpMatrixTimesVector`, column-major: each result
+    /// lane `i` is `Σ matrix[j][i] * vector[j]`. The
+    /// backend lowers this to 4 vec×scalar broadcasts
+    /// (`matrix.column[j] * vector[j]`) followed by 3
+    /// vec+vec adds — every op below it already exists
+    /// + is tested. The IR carries the op so the
+    /// frontend's `OpAccessChain` into a struct's mat4
+    /// member resolves cleanly through `Type::Mat4`.
+    MatrixTimesVector {
+        /// `Mat4`-typed Value (or pointer to one, in
+        /// which case the backend reads the four columns
+        /// at byte_offset 0, 16, 32, 48 of the matrix's
+        /// storage).
+        matrix: Value,
+        /// Vec4-typed Value.
+        vector: Value,
+    },
 
     // ── Bitwise / shift ────────────────────────────────────────
 
