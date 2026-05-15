@@ -501,11 +501,22 @@ fn emit_function(
         matches!(op, Op::ConstVec(els)
             if els.iter().all(|e| const_float_ids.contains(&e.id)))
     };
+    // A vec4 Phi is a *propagating* clique like a vec×vec
+    // FP binop — its result and every arm value share a
+    // fate. Returns (result_id, arm_ids) when it matches.
+    let vec4_phi = |inst: &atrium_spv_ir::Inst| -> Option<(ValueId, Vec<ValueId>)> {
+        match (&inst.op, inst.result.as_ref()) {
+            (Op::Phi(arms), Some(r)) if is_vec4(&r.ty) =>
+                Some((r.id, arms.iter().map(|a| a.value.id).collect())),
+            _ => None,
+        }
+    };
     let mut disqualified: std::collections::HashSet<ValueId> =
         std::collections::HashSet::new();
     for inst in &flat_insts {
         let friendly = pure_const_vec(&inst.op)
             || vecvec_fp_binop(&inst.op).is_some()
+            || vec4_phi(inst).is_some()
             || matches!(&inst.op,
                 Op::Store { value, .. } if is_vec4(&value.ty));
         if friendly { continue; }
@@ -519,7 +530,8 @@ fn emit_function(
         }
     }
     // Fixed-point: a vec×vec FP binop's result and both
-    // operands must agree — taint all three if any is.
+    // operands must agree — taint all if any. A vec4 Phi
+    // propagates the same way across {result, all arms}.
     loop {
         let mut changed = false;
         for inst in &flat_insts {
@@ -533,6 +545,16 @@ fn emit_function(
                     changed |= disqualified.insert(r);
                     if let Some(x) = res {
                         changed |= disqualified.insert(x);
+                    }
+                }
+            }
+            if let Some((res, arms)) = vec4_phi(inst) {
+                let any = disqualified.contains(&res)
+                    || arms.iter().any(|a| disqualified.contains(a));
+                if any {
+                    changed |= disqualified.insert(res);
+                    for a in arms {
+                        changed |= disqualified.insert(a);
                     }
                 }
             }
@@ -647,6 +669,21 @@ fn emit_function(
                 // PhiDest::Vec. Phi-move emission copies
                 // lane-by-lane. No coalescing yet (vec-Phi
                 // coalescing is a later phase).
+                Type::Vec2(_) | Type::Vec3(_) | Type::Vec4(_)
+                    if packed_ids.contains(&result.id) =>
+                {
+                    // NEON-packed vec4 Phi: one never-expired
+                    // Q-reg. Phi-moves are `mov v.16b`; a
+                    // coalesced .4s binop arm writes the
+                    // Q-reg in place.
+                    let n = free_pool.pop().ok_or_else(||
+                        BackendError::Unsupported(
+                            "out of V-regs allocating packed vec Phi dest".into()))?;
+                    if n < 16 { used_callee_saved_v = true; }
+                    let q = asm::Vreg(n);
+                    packed.insert(result.id, q);
+                    PhiDest::Packed(q)
+                }
                 Type::Vec2(_) | Type::Vec3(_) | Type::Vec4(_) => {
                     let lane_count = match &result.ty {
                         Type::Vec2(_) => 2usize,
@@ -738,6 +775,9 @@ fn emit_function(
                         | Op::BitAnd(..) | Op::BitOr(..) | Op::BitXor(..)
                         | Op::Shl(..) | Op::LShr(..) | Op::AShr(..)),
                     PhiDest::Vec(_) => matches!(&p.op,
+                        Op::FAdd(..) | Op::FSub(..)
+                        | Op::FMul(..) | Op::FDiv(..)),
+                    PhiDest::Packed(_) => matches!(&p.op,
                         Op::FAdd(..) | Op::FSub(..)
                         | Op::FMul(..) | Op::FDiv(..)),
                 };
@@ -1451,6 +1491,20 @@ fn emit_function(
                                         src_id)))?;
                                 a.emit(asm::mov_w(*dw, src));
                             }
+                            PhiDest::Packed(dq) => {
+                                // NEON-packed vec4 Phi: the
+                                // source value's whole vector
+                                // lives in one Q-reg too. One
+                                // `mov v.16b` carries 128
+                                // bits — rename-eliminated on
+                                // target cores, like the
+                                // scalar Float case.
+                                let src = *packed.get(src_id).ok_or_else(||
+                                    BackendError::Internal(format!(
+                                        "Phi packed source {:?} not in packed",
+                                        src_id)))?;
+                                a.emit(asm::mov_v_16b(*dq, src));
+                            }
                             PhiDest::Vec(lane_regs) => {
                                 // The arm's source is a vector
                                 // value — copy each lane's
@@ -1772,6 +1826,11 @@ enum PhiDest {
     Float(asm::Vreg),
     Int(asm::Wreg),
     Vec(Vec<asm::Vreg>),
+    /// NEON-packed vec4 Phi: the whole vector in a single
+    /// Q-register. Phi-move is one `mov v.16b`; a packed
+    /// vec×vec FP-binop arm coalesces by writing the .4s
+    /// result straight into this Q-reg.
+    Packed(asm::Vreg),
 }
 
 /// Linear-scan allocator for the integer W-reg pool
@@ -2397,10 +2456,10 @@ fn emit_fp_binop_poly(
 
     // NEON-packed vec4 path: the classifier proved this
     // result and both operands live in single Q-registers,
-    // so the whole binop is one `.4s` instruction. (A
-    // packed result is never also a Phi coalesce target —
-    // a Phi-bearing component is disqualified from packing
-    // — so `coalesce` is irrelevant here.)
+    // so the whole binop is one `.4s` instruction. If this
+    // result is a coalesced packed-Phi arm, write straight
+    // into the Phi's Q-reg (the vec analogue of opt #4 +
+    // the vec-Phi phase-2 coalescing).
     if packed_ids.contains(&result.id) {
         let l = *packed.get(&lhs.id).ok_or_else(||
             BackendError::Internal(format!(
@@ -2408,8 +2467,11 @@ fn emit_fp_binop_poly(
         let r = *packed.get(&rhs.id).ok_or_else(||
             BackendError::Internal(format!(
                 "packed fp binop rhs {:?} not packed", rhs.id)))?;
-        let d = alloc_vreg(free_pool, owners, used_callee_saved_v,
-            result.id)?;
+        let d = match coalesce {
+            Some(PhiDest::Packed(q)) => *q,
+            _ => alloc_vreg(free_pool, owners, used_callee_saved_v,
+                result.id)?,
+        };
         a.emit(make_inst_v4s(d, l, r));
         packed.insert(result.id, d);
         return Ok(());

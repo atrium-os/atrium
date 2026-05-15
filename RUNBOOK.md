@@ -2719,12 +2719,38 @@ expired Q-reg, the coalesced binop writes it in place.
    `CompositeConstruct`-ConstVec aliasing bug — `cextract`
    now correctly stays per-lane) + in-VM 19/19, `vecarith`
    packed and bit-exact on FreeBSD aarch64.
-2. packed vec Phi + carry phase-2 coalescing to the Q-reg
-   form. Gate: `three_way_heavyvec` + in-VM `heavyvec`.
-3. re-bench `heavyvec` vs `clang -O2`; expect bespoke to
-   move from 0.62× toward ~1× (clang's `.4s` loop is the
-   target). Also extend to `vecarith` and a new
-   wider-vec bench if the gap warrants.
+2. **✅ done.** Packed vec Phi + coalescing carry-over.
+   `PhiDest` grew a `Packed(Vreg)` variant — one never-
+   expired Q-reg, allocated by the Phi pre-pass when the
+   classifier marks the Phi result packed. The classifier
+   itself now treats a vec4 Phi as a *propagating* clique
+   (result + every arm value share a fate), so the
+   heavyvec loop's `{v0, v_phi, scaled, v_next, store}`
+   resolves to a single packed component. The Phi-move
+   emission gained a `PhiDest::Packed` arm (one
+   `mov v.16b`); `emit_fp_binop_poly`'s packed path
+   honours a `Some(PhiDest::Packed(q))` coalesce target
+   (the vec analogue of opt #4). Disasm-confirmed on
+   `heavyvec`: the loop body collapsed from 9 scalar/
+   per-lane instructions to **4** —
+   `fmul v.4s` + `fadd v.4s` + `add` + back-edge `b`,
+   with the `fadd` coalesced straight into the packed Phi
+   Q-reg. Gate met: `three_way_heavyvec` + full
+   differential 26/26 + in-VM 19/19 bit-exact on FreeBSD
+   aarch64.
+3. **✅ done.** Re-bench. In-VM `heavyvec`:
+   bespoke **274 ns** (was 349 ns — **21% faster**),
+   Cranelift 331 ns, `clang -O2` 217 ns. The gap to
+   native moved from **0.62× → 0.79×** (1.61× behind →
+   1.27× behind). Bespoke now also *beats* Cranelift on
+   this shape (274 vs 331 ns) — Cranelift still
+   lane-walks. The residual ~57 ns gap to native is
+   per-call setup (12 `ins` ops materialising 3 ConstVecs
+   in the prologue, one entry-edge `mov v.16b`); the loop
+   body itself is at parity with the `clang -O2`
+   `.4s`-unfused form. A literal-pool path for ConstVec
+   prologue would chase it, but that's a separate small
+   arc — closing the per-iter NEON gap was the goal here.
 
 **Risk — FMA.** `clang -O2` (non-`-ffp-contract=off`)
 fuses `mul`+`add` into `fmla.4s`; that changes results
