@@ -2892,11 +2892,18 @@ extends the `atrium-spv-blob` format slightly — a
 "runtime imports" table — but the change is bounded.
 
 **Phasing.**
-0. New `atrium-spv-runtime` crate (or extend
-   `atrium-spv-loader`). C-ABI helpers above + a few
-   format decoders (RGBA8/BGRA8 unorm → f32; nearest +
-   bilinear; clamp + repeat wrap). Unit tests against a
-   hand-built `tex_desc` over a 4×4 checkerboard.
+0. **✅ done** (`42fcbe8`). New `atrium-spv-runtime`
+   crate. `#[repr(C)]` `TexDesc` / `SamplerDesc` + two
+   `extern "C"` entry points (`atrium_tex_sample_2d`,
+   `atrium_tex_fetch_2d`). Format support (v1):
+   RGBA8Unorm, BGRA8Unorm (matches the Atrium scanout
+   buffer), R8Unorm. Filter: Nearest, Linear (bilinear).
+   Wrap: ClampToEdge, Repeat, Mirror. 8 unit tests
+   covering corner fetches, nearest-at-centre, bilinear
+   at the four-texel meeting point, BGRA channel swap,
+   R8 replication, and all three wrap modes (positive +
+   negative + full period). No dependencies (pure compute
+   over raw byte buffers).
 1. Frontend: SPIR-V `OpTypeImage`/`OpTypeSampler`/
    `OpTypeSampledImage`/`OpSampledImage`/`OpImage*` →
    the existing IR Op variants. Binding metadata: each
