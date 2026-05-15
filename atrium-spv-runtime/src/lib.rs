@@ -145,6 +145,45 @@ pub unsafe extern "C" fn atrium_tex_fetch_2d(
     out.copy_from_slice(&rgba);
 }
 
+// ── Safe Rust wrappers ────────────────────────────────────
+//
+// The `extern "C"` entry points above are what compiled
+// shaders call (via the C ABI). Rust callers — including
+// the atrium-spv-tests interpreter — get a safe entry that
+// borrows the descriptors and `data` as slices, so consumers
+// can stay `#![forbid(unsafe_code)]`.
+
+/// Safe wrapper around [`atrium_tex_sample_2d`]. Borrows
+/// `data`, `tex`, and `samp`; never inspects bytes past
+/// `tex.height * tex.stride_bytes`.
+pub fn sample_2d(
+    data: &[u8],
+    tex: &TexDesc,
+    samp: &SamplerDesc,
+    u: f32, v: f32,
+) -> [f32; 4] {
+    debug_assert!(data.len() >= (tex.height as usize) * (tex.stride_bytes as usize),
+        "TexDesc dimensions overrun the data slice");
+    let mut t = *tex;
+    t.data = data.as_ptr();
+    sample_2d_impl(&t, samp, u, v)
+}
+
+/// Safe wrapper around [`atrium_tex_fetch_2d`]. Caller is
+/// responsible for `(x, y) ∈ [0, width) × [0, height)` —
+/// out-of-range falls back to edge-clamp behaviour.
+pub fn fetch_2d(
+    data: &[u8],
+    tex: &TexDesc,
+    x: i32, y: i32, _lod: i32,
+) -> [f32; 4] {
+    debug_assert!(data.len() >= (tex.height as usize) * (tex.stride_bytes as usize),
+        "TexDesc dimensions overrun the data slice");
+    let mut t = *tex;
+    t.data = data.as_ptr();
+    fetch_texel_impl(&t, x as u32, y as u32)
+}
+
 // ── Implementation (safe Rust, called from the FFI wrappers) ──
 
 fn sample_2d_impl(t: &TexDesc, s: &SamplerDesc, u: f32, v: f32) -> [f32; 4] {

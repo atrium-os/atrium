@@ -2927,12 +2927,33 @@ extends the `atrium-spv-blob` format slightly — a
    variable identity, not yet through an explicit
    binding-number IR field — phase 4/5 will surface that
    when backends need it.
-2. Interpreter (in `atrium-spv-tests`): a sampler-aware
-   `ImageSampleImplicitLod`/`ImageFetch` handler that
-   reads descriptors from a host-side `ShaderInputs`
-   slot and calls the runtime helpers directly. This
-   gives the differential a working oracle without
-   needing any backend codegen yet.
+2. **✅ done.** Interpreter (in `atrium-spv-tests`):
+   sampler-aware `OpImageSampleImplicitLod` /
+   `OpImageSampleExplicitLod` + `OpSampledImage`
+   handlers. `ShaderInputs` grew a `textures:
+   Vec<TextureBinding>` field; the interpreter indexes
+   `OpDecorate DescriptorSet/Binding` annotations into a
+   `var_binding: HashMap<Word, (u32,u32)>` and indexes
+   `OpTypeImage` / `OpTypeSampler` / `OpTypeSampledImage`
+   into `TypeInfo`. `OpLoad` of an image/sampler/sampled-
+   image variable short-circuits the byte-buffer load
+   and produces a `ConstantValue::Texture { set, binding }`
+   handle; `OpImageSample*` looks up the matching
+   `TextureBinding` and calls `atrium_spv_runtime::
+   sample_2d` (the safe Rust wrapper added alongside
+   so the interpreter crate stays
+   `#![forbid(unsafe_code)]`). The interpreter shares the
+   *exact* sampler implementation the production backends
+   will FFI-call, so the differential checks pipeline
+   correctness (frontend + backend codegen), not the
+   sampler — the sampler is independently unit-tested in
+   the runtime crate. Gate: a new
+   `interpreter_bilinear_centre_of_rgbw_checker` test
+   builds a 2×2 RGBW texture + a sampler2D shader,
+   samples at u=v=0.5, asserts the pixel equals
+   `(0.5, 0.5, 0.5, 1.0)` — the four-texel mean. Plus
+   regression: all 10 atrium-spv-tests tests, 8 runtime
+   tests, 26/26 differential.
 3. Differential: a `three_way_texture_sample` test
    using a 4×4 texture + a Bilinear/Clamp sampler + a
    shader that returns a sampled pixel. Initially

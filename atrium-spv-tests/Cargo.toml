@@ -17,6 +17,16 @@ path = "src/lib.rs"
 # bugs in the shared frontend would silently agree with the
 # production backends and slip past the diff harness.
 rspirv = "0.13"
+# The texture-sampling runtime: the interpreter's
+# ImageSample handler calls the same atrium_tex_sample_2d
+# the production backends will call, so the differential
+# tests the *pipeline* (frontend + backend codegen),
+# leaving the sampler implementation itself to the
+# runtime crate's own unit tests. This is the only
+# Atrium-spv crate the interpreter is permitted to depend
+# on (constraint F1 forbids sharing the frontend; the
+# sampler is a separate concern, like libm).
+atrium-spv-runtime = { path = "../atrium-spv-runtime" }
 
 [dev-dependencies]
 # Tests sometimes build SPIR-V by hand. Plus a few small

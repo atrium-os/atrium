@@ -39,9 +39,36 @@
 use std::collections::HashMap;
 
 use rspirv::dr::{Instruction, Module, Operand};
-use rspirv::spirv::{Op, StorageClass, Word};
+use rspirv::spirv::{Decoration, Dim, Op, StorageClass, Word};
 
 use crate::pixels::RgbaF32;
+
+/// A texture descriptor + sampler bound at a `(set, binding)`
+/// slot, for the interpreter's `OpImageSample*` handler.
+///
+/// Designed to be cheap to construct in test code: hand-
+/// pack a byte buffer for `data`, fill in the dims +
+/// format, and pass an array of these in
+/// [`ShaderInputs::textures`].
+#[derive(Debug, Clone)]
+pub struct TextureBinding {
+    /// SPIR-V `DescriptorSet` decoration value.
+    pub set: u32,
+    /// SPIR-V `Binding` decoration value.
+    pub binding: u32,
+    /// Row-major texel data (size `>= height * stride_bytes`).
+    pub data: Vec<u8>,
+    /// Image width in texels.
+    pub width: u32,
+    /// Image height in texels.
+    pub height: u32,
+    /// Bytes per row (≥ `width * bytes_per_texel(format)`).
+    pub stride_bytes: u32,
+    /// `atrium_spv_runtime::TexFormat` as `u32`.
+    pub format: u32,
+    /// Sampler configuration (filter + wrap modes).
+    pub sampler: atrium_spv_runtime::SamplerDesc,
+}
 
 /// Per-shader inputs (uniforms, push constants, varyings).
 ///
@@ -58,6 +85,12 @@ pub struct ShaderInputs {
     /// fragment-shader invocations the harness drives.
     /// One entry per invocation.
     pub varyings_per_invocation: Vec<Vec<u8>>,
+    /// Image / sampler descriptors bound at SPIR-V
+    /// `(DescriptorSet, Binding)` slots. The interpreter's
+    /// `OpImageSample*` handler looks up the texture by
+    /// `(set, binding)` and calls
+    /// `atrium_spv_runtime::atrium_tex_sample_2d`.
+    pub textures: Vec<TextureBinding>,
 }
 
 impl Default for ShaderInputs {
@@ -66,6 +99,7 @@ impl Default for ShaderInputs {
             uniforms: Vec::new(),
             push_constants: [0u8; 128],
             varyings_per_invocation: Vec::new(),
+            textures: Vec::new(),
         }
     }
 }
@@ -125,6 +159,11 @@ pub struct Interpreter {
     /// OpMemberDecorate Offset. Used by OpAccessChain to
     /// resolve member-index chains to a byte offset.
     struct_layouts: HashMap<Word, Vec<(u32, Word)>>,
+    /// Variable id → (DescriptorSet, Binding) from
+    /// OpDecorate annotations. Used by the image-sample
+    /// path to find the matching `TextureBinding` in the
+    /// caller's `ShaderInputs`.
+    var_binding: HashMap<Word, (u32, u32)>,
     /// Entry point declared with ExecutionModel::Fragment.
     fragment_entry: Option<Word>,
 }
@@ -157,6 +196,18 @@ enum TypeInfo {
     Pointer { storage: StorageClass, pointee: Word },
     /// `OpTypeFunction return_type [param_types]`.
     Function { return_ty: Word, params: Vec<Word> },
+    /// `OpTypeImage` — only the dim matters for the
+    /// interpreter; sampler/format/MS/etc. are baked
+    /// into the host-side `TextureBinding`.
+    Image { dim: Dim },
+    /// `OpTypeSampler` — a sampler is just an opaque
+    /// handle in the interpreter; the actual filter/wrap
+    /// config lives in the bound `TextureBinding`.
+    Sampler,
+    /// `OpTypeSampledImage` — same lifetime as the image
+    /// type it wraps; carries the dim through for
+    /// validation.
+    SampledImage { dim: Dim },
     /// Anything else, kept for diagnostic when we error.
     Other(Op),
 }
@@ -178,6 +229,13 @@ enum ConstantValue {
     /// into that storage block. Produced by OpAccessChain;
     /// consumed by OpLoad / OpStore.
     Ptr { var_id: Word, byte_offset: u32 },
+    /// A texture / sampler / sampled-image handle: the
+    /// `(set, binding)` that selects which
+    /// `TextureBinding` in `ShaderInputs` to sample from.
+    /// Produced by `OpLoad` of an image/sampler variable
+    /// or by `OpSampledImage` combining two such loads;
+    /// consumed by `OpImageSample*` / `OpImageFetch`.
+    Texture { set: u32, binding: u32 },
 }
 
 impl Interpreter {
@@ -194,6 +252,7 @@ impl Interpreter {
             constants: HashMap::new(),
             variables: HashMap::new(),
             struct_layouts: HashMap::new(),
+            var_binding: HashMap::new(),
             fragment_entry: None,
         };
         interp.index()?;
@@ -244,6 +303,36 @@ impl Interpreter {
         let globals = self.module.types_global_values.clone();
         for inst in &globals {
             self.index_global_inst(inst)?;
+        }
+
+        // OpDecorate DescriptorSet / Binding → var_binding.
+        // Two passes: collect both values per id then commit
+        // a pair once both are seen (a SPIR-V image/sampler
+        // variable must have both decorations, but they're
+        // emitted as separate OpDecorate instructions).
+        let mut sets: HashMap<Word, u32> = HashMap::new();
+        let mut bindings: HashMap<Word, u32> = HashMap::new();
+        for inst in &self.module.annotations.clone() {
+            if inst.class.opcode != Op::Decorate { continue; }
+            let target = op_id(&inst.operands, 0)?;
+            let kind = match inst.operands.get(1) {
+                Some(Operand::Decoration(d)) => *d,
+                _ => continue,
+            };
+            let lit = match inst.operands.get(2) {
+                Some(Operand::LiteralBit32(v)) => *v,
+                _ => continue,
+            };
+            match kind {
+                Decoration::DescriptorSet => { sets.insert(target, lit); }
+                Decoration::Binding       => { bindings.insert(target, lit); }
+                _ => {}
+            }
+        }
+        for (id, set) in &sets {
+            if let Some(b) = bindings.get(id) {
+                self.var_binding.insert(*id, (*set, *b));
+            }
         }
 
         // OpMemberDecorate Offset → struct_layouts.
@@ -318,6 +407,24 @@ impl Interpreter {
                     params.push(op_id(&inst.operands, i)?);
                 }
                 self.types.insert(result_id, TypeInfo::Function { return_ty, params });
+            }
+            Op::TypeImage => {
+                let dim = match inst.operands.get(1) {
+                    Some(Operand::Dim(d)) => *d,
+                    _ => return Err(InterpError::BadType(result_id)),
+                };
+                self.types.insert(result_id, TypeInfo::Image { dim });
+            }
+            Op::TypeSampler => {
+                self.types.insert(result_id, TypeInfo::Sampler);
+            }
+            Op::TypeSampledImage => {
+                let img_id = op_id(&inst.operands, 0)?;
+                let dim = match self.types.get(&img_id) {
+                    Some(TypeInfo::Image { dim }) => *dim,
+                    _ => return Err(InterpError::BadType(result_id)),
+                };
+                self.types.insert(result_id, TypeInfo::SampledImage { dim });
             }
             Op::Constant => {
                 let ty = inst.result_type.ok_or(InterpError::BadConstant(result_id))?;
@@ -843,6 +950,27 @@ impl Interpreter {
                     .ok_or_else(|| InterpError::UnsupportedOpcode(format!(
                         "Load of unknown variable id {var_id}",
                     )))?;
+                // Image / sampler / sampled-image load: not
+                // a value-bearing memory access — it's a
+                // descriptor handle. Resolve the variable's
+                // (set, binding) and produce a Texture
+                // value the OpImageSample* path will look up.
+                let result_ty = self.types.get(&result_type_id).cloned();
+                if matches!(result_ty,
+                    Some(TypeInfo::Image { .. })
+                    | Some(TypeInfo::Sampler)
+                    | Some(TypeInfo::SampledImage { .. }))
+                {
+                    let (set, binding) = self.var_binding.get(&var_id)
+                        .copied()
+                        .ok_or_else(|| InterpError::UnsupportedOpcode(format!(
+                            "Load of image/sampler variable {var_id} has no \
+                             DescriptorSet+Binding decorations",
+                        )))?;
+                    values.insert(result_id,
+                        ConstantValue::Texture { set, binding });
+                    return Ok(());
+                }
                 let value = self.load_from_storage(
                     storage_class, off, result_type_id, inputs)?;
                 values.insert(result_id, value);
@@ -908,6 +1036,90 @@ impl Interpreter {
                         "CompositeExtract of non-vector: {other:?}"))),
                 };
                 values.insert(result_id, lane);
+                Ok(())
+            }
+            // OpSampledImage: combine an image handle and a
+            // sampler handle. The interpreter's v1 model
+            // keeps sampler config inside each
+            // `TextureBinding`, so we propagate the image's
+            // (set, binding) and ignore the sampler operand's
+            // — the host-side test pairs them correctly.
+            Op::SampledImage => {
+                let result_id = inst.result_id.ok_or_else(||
+                    InterpError::BadConstant(0))?;
+                let img_id = op_id(&inst.operands, 0)?;
+                let img = self.lookup_value(img_id, values)?;
+                let handle = match img {
+                    ConstantValue::Texture { set, binding } =>
+                        ConstantValue::Texture { set, binding },
+                    _ => return Err(InterpError::UnsupportedOpcode(format!(
+                        "SampledImage image operand is not a Texture handle: \
+                         {img:?}"))),
+                };
+                values.insert(result_id, handle);
+                Ok(())
+            }
+            // OpImageSampleImplicitLod / ExplicitLod: filtered
+            // texture sample. The sampled-image operand must be
+            // a `Texture` handle; the coord operand must be a
+            // vec2<f32>. Calls `atrium_spv_runtime::
+            // atrium_tex_sample_2d` to keep the *exact same*
+            // sampler implementation the production backends
+            // will use — the differential tests the pipeline,
+            // not the sampler.
+            Op::ImageSampleImplicitLod | Op::ImageSampleExplicitLod => {
+                let result_id = inst.result_id.ok_or_else(||
+                    InterpError::BadConstant(0))?;
+                let si_id = op_id(&inst.operands, 0)?;
+                let coord_id = op_id(&inst.operands, 1)?;
+                let handle = self.lookup_value(si_id, values)?;
+                let (set, binding) = match handle {
+                    ConstantValue::Texture { set, binding } => (set, binding),
+                    _ => return Err(InterpError::UnsupportedOpcode(format!(
+                        "ImageSample sampled-image operand is not a Texture handle: \
+                         {handle:?}"))),
+                };
+                let coord = self.lookup_value(coord_id, values)?;
+                let (u, v) = match coord {
+                    ConstantValue::Vec(ref lanes) if lanes.len() >= 2 => {
+                        let u = match &lanes[0] {
+                            ConstantValue::F32(x) => *x,
+                            other => return Err(InterpError::UnsupportedOpcode(
+                                format!("ImageSample coord lane 0 not f32: {other:?}"))),
+                        };
+                        let v = match &lanes[1] {
+                            ConstantValue::F32(x) => *x,
+                            other => return Err(InterpError::UnsupportedOpcode(
+                                format!("ImageSample coord lane 1 not f32: {other:?}"))),
+                        };
+                        (u, v)
+                    }
+                    other => return Err(InterpError::UnsupportedOpcode(format!(
+                        "ImageSample coord operand not a vec2<f32>: {other:?}"))),
+                };
+                let tex = inputs.textures.iter()
+                    .find(|t| t.set == set && t.binding == binding)
+                    .ok_or_else(|| InterpError::UnsupportedOpcode(format!(
+                        "ImageSample: no TextureBinding for (set={set}, binding={binding})")))?;
+                // Safe Rust wrapper — keeps the interpreter
+                // crate `#![forbid(unsafe_code)]` clean while
+                // sharing the *exact* sampler implementation
+                // the production backends will FFI-call.
+                let tex_desc = atrium_spv_runtime::TexDesc {
+                    data:         std::ptr::null(),
+                    width:        tex.width,
+                    height:       tex.height,
+                    stride_bytes: tex.stride_bytes,
+                    format:       tex.format,
+                };
+                let out = atrium_spv_runtime::sample_2d(
+                    &tex.data, &tex_desc, &tex.sampler, u, v);
+                values.insert(result_id, ConstantValue::Vec(vec![
+                    ConstantValue::F32(out[0]),
+                    ConstantValue::F32(out[1]),
+                    ConstantValue::F32(out[2]),
+                    ConstantValue::F32(out[3]),
+                ]));
                 Ok(())
             }
             other => Err(InterpError::UnsupportedOpcode(format!("{:?}", other))),
@@ -1415,6 +1627,9 @@ fn constant_to_rgba(v: &ConstantValue) -> Result<RgbaF32, InterpError> {
                     )),
                     ConstantValue::Ptr { .. } => return Err(InterpError::UnsupportedOutput(
                         "pointer in output".to_string(),
+                    )),
+                    ConstantValue::Texture { .. } => return Err(InterpError::UnsupportedOutput(
+                        "texture handle in output".to_string(),
                     )),
                 };
             }
