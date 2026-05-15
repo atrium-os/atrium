@@ -45,8 +45,8 @@ use atrium_spv_ir::{
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{
-    AbiParam, Function as ClifFunction, InstBuilder, MemFlags, Signature, UserFuncName,
-    Value as ClifValue,
+    AbiParam, Function as ClifFunction, InstBuilder, MemFlags, Signature,
+    StackSlotData, StackSlotKind, UserFuncName, Value as ClifValue,
 };
 use cranelift_codegen::ir::types as clif_types;
 use cranelift_codegen::isa::CallConv;
@@ -365,6 +365,7 @@ fn emit_function(
             vectors: HashMap::new(),
             pointers: HashMap::new(),
             block_map,
+            image_handles: HashMap::new(),
         };
 
         // Walk every IR block in id order, switching the
@@ -633,6 +634,13 @@ struct FnTranslator {
     /// every IR block so terminators can branch freely.
     block_map: HashMap<atrium_spv_ir::BlockId,
                        cranelift_codegen::ir::Block>,
+    /// IR Value (image / sampler / sampled-image handle) →
+    /// the SPIR-V `(DescriptorSet, Binding)` it represents.
+    /// Set by `Op::ImageHandle`; propagated unchanged by
+    /// `Op::CombineSampledImage`; consumed by `Op::ImageSample*`
+    /// + `Op::ImageFetch` to compute the descriptor-table
+    /// offset.
+    image_handles: HashMap<ValueId, (u32, u32)>,
 }
 
 impl FnTranslator {
@@ -1104,6 +1112,117 @@ impl FnTranslator {
                     BackendError::Internal(
                         "Dot without result Value".to_string()))?;
                 self.scalars.insert(result.id, acc);
+                Ok(())
+            }
+            // ── Image / sampler ────────────────────────────
+            //
+            // ImageHandle and CombineSampledImage emit zero
+            // native instructions — they're metadata moves
+            // tracking which descriptor slot a Value points
+            // at, so the eventual ImageSample call site can
+            // compute the right uniforms offset.
+            Op::ImageHandle { set, binding } => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "ImageHandle without result Value".to_string()))?;
+                self.image_handles.insert(result.id, (*set, *binding));
+                Ok(())
+            }
+            Op::CombineSampledImage { image, sampler: _ } => {
+                // v1 keeps sampler config inside each
+                // TextureBinding (one descriptor slot per
+                // combined sampler+image), so we propagate
+                // the image operand's (set, binding) and
+                // ignore the sampler operand's — the
+                // descriptor slot at this binding carries
+                // both `tex_desc*` and `samp_desc*` already.
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "CombineSampledImage without result Value".to_string()))?;
+                let h = self.image_handles.get(&image.id).copied()
+                    .ok_or_else(|| BackendError::Internal(format!(
+                        "CombineSampledImage image operand {:?} not an \
+                         ImageHandle", image.id)))?;
+                self.image_handles.insert(result.id, h);
+                Ok(())
+            }
+            // ImageSampleImplicitLod: emit the four-instruction
+            // call-via-pointer sequence the v1 descriptor ABI
+            // specifies (atrium-spv-runtime
+            // `UNIFORMS_HELPERS_BASE` / `UNIFORMS_DESC_BASE`):
+            //   x_fn   = *(uniforms + 0)
+            //   x_tex  = *(uniforms + 16 + B*16 + 0)
+            //   x_samp = *(uniforms + 16 + B*16 + 8)
+            //   blr  x_fn  (call atrium_tex_sample_2d via fn-ptr)
+            // plus a 16-byte stack slot for the out_rgba
+            // pixel, which we then load lane-by-lane.
+            Op::ImageSampleImplicitLod { sampled_image, coord } => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "ImageSampleImplicitLod without result".to_string()))?;
+                let (_, binding) = self.image_handles.get(&sampled_image.id)
+                    .copied()
+                    .ok_or_else(|| BackendError::Internal(format!(
+                        "ImageSampleImplicitLod sampled_image {:?} not an \
+                         ImageHandle", sampled_image.id)))?;
+                let coord_lanes = self.vectors.get(&coord.id).cloned()
+                    .ok_or_else(|| BackendError::Internal(format!(
+                        "ImageSampleImplicitLod coord {:?} not a vector",
+                        coord.id)))?;
+                if coord_lanes.len() < 2 {
+                    return Err(BackendError::Unsupported(format!(
+                        "ImageSampleImplicitLod 2D coord must have ≥2 lanes, \
+                         got {}", coord_lanes.len())));
+                }
+                let u = coord_lanes[0];
+                let v = coord_lanes[1];
+
+                let pointer_type = builder.func.dfg
+                    .value_type(self.params[1]); // uniforms ptr
+                let uniforms = self.params[1];
+
+                // Load helper fn pointer + descriptor slot
+                // pointers from the uniforms buffer at the
+                // v1-ABI offsets.
+                let desc_off: i32 = 16 + (binding as i32) * 16;
+                let fn_ptr = builder.ins().load(
+                    pointer_type, MemFlags::new(), uniforms, 0);
+                let tex_ptr = builder.ins().load(
+                    pointer_type, MemFlags::new(), uniforms, desc_off);
+                let samp_ptr = builder.ins().load(
+                    pointer_type, MemFlags::new(), uniforms, desc_off + 8);
+
+                // 16-byte stack slot for the out_rgba pixel
+                // (4 f32 lanes, 4-byte aligned is the f32
+                // requirement; 16 is over-aligned but
+                // matches the Q-register convention the
+                // bespoke backend uses).
+                let slot = builder.create_sized_stack_slot(
+                    StackSlotData::new(StackSlotKind::ExplicitSlot, 16, 4));
+                let out_ptr = builder.ins().stack_addr(pointer_type, slot, 0);
+
+                // void atrium_tex_sample_2d(
+                //   const TexDesc*, const SamplerDesc*,
+                //   f32 u, f32 v, f32 *out_rgba);
+                let mut call_sig = Signature::new(CallConv::SystemV);
+                call_sig.params.push(AbiParam::new(pointer_type));
+                call_sig.params.push(AbiParam::new(pointer_type));
+                call_sig.params.push(AbiParam::new(clif_types::F32));
+                call_sig.params.push(AbiParam::new(clif_types::F32));
+                call_sig.params.push(AbiParam::new(pointer_type));
+                let sig_ref = builder.import_signature(call_sig);
+                builder.ins().call_indirect(
+                    sig_ref, fn_ptr,
+                    &[tex_ptr, samp_ptr, u, v, out_ptr]);
+
+                // Read the four pixel lanes back out as f32s.
+                let mut lanes = Vec::with_capacity(4);
+                for i in 0..4i32 {
+                    let l = builder.ins().load(
+                        clif_types::F32, MemFlags::new(), out_ptr, i * 4);
+                    lanes.push(l);
+                }
+                self.vectors.insert(result.id, lanes);
                 Ok(())
             }
             other => Err(BackendError::Unsupported(format!(

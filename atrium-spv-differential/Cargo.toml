@@ -19,3 +19,4 @@ tempfile                     = "3"
 
 [dev-dependencies]
 rspirv                       = "0.13"
+atrium-spv-runtime           = { path = "../atrium-spv-runtime" }

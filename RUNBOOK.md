@@ -2963,10 +2963,30 @@ extends the `atrium-spv-blob` format slightly — a
    phase 2's gate). The real differential gates land
    with phase 4 (interpreter + Cranelift) and phase 5
    (+ bespoke).
-4. Cranelift backend: emit the AAPCS64 call sequence,
-   wiring through a runtime-helper relocation. The
-   easier of the two — `cranelift-module` already does
-   relocations.
+4. **✅ done.** Cranelift backend: emits the four-
+   instruction descriptor + indirect-call sequence
+   against the v1 ABI. `FnTranslator` grew an
+   `image_handles: HashMap<ValueId, (u32, u32)>` side-
+   table that `Op::ImageHandle` populates and
+   `Op::CombineSampledImage` propagates (image binding
+   wins; sampler binding ignored — both descriptors live
+   in the same v1 slot). `Op::ImageSampleImplicitLod`
+   reads the binding off `image_handles`, loads the
+   helper fn-pointer + tex/samp descriptor pointers from
+   the uniforms buffer at the ABI offsets, allocates a
+   16-byte stack slot for the result pixel, builds the
+   C-ABI signature `(*const TexDesc, *const SamplerDesc,
+   f32, f32, *mut f32) → ()` and calls indirect through
+   the loaded fn-ptr. Result lanes load back out as four
+   `f32`s into `self.vectors`. **Reloc-free** (no
+   external symbol used). New differential test
+   `tests/texture_sample.rs::texture_sample_centre_rgbw`
+   — 2×2 RGBW + sampler2D shader at u=v=0.5; interpreter
+   and Cranelift both report `(0.5, 0.5, 0.5, 1.0)` and
+   agree under a 1e-6 absolute tolerance. The whole
+   pipeline works end-to-end: frontend → IR Ops →
+   Cranelift codegen → object → cc → dlopen → call into
+   a host-resident `atrium_tex_sample_2d`.
 
    **Descriptor ABI (v1, reloc-free)** — how compiled
    shader code finds bound textures + samplers + the
