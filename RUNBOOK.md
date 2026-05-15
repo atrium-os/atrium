@@ -2614,7 +2614,24 @@ the bespoke path can take.
    phi-move; HashMap-order-dependent, so it passed on the
    macOS host and failed only in-VM (lane 2 of the vec4
    came out as `bias.x` instead of `v0.z`).
-2. extend opt-#4 coalescing to vec-Phi lanes.
+2. **✅ done.** extend opt-#4 coalescing to vec-Phi lanes.
+   `emit_fp_binop_poly` now takes the whole `PhiDest`: a
+   `PhiDest::Vec` coalesce target makes each lane of an
+   FP binop write straight into the Phi's per-lane reg,
+   and the back-edge per-lane phi-moves drop out. The
+   pre-pass `op_ok` accepts a vec FP binop (`FAdd/FSub/
+   FMul/FDiv`) as a coalescable producer; the
+   case1/case2 dominance + single-use + no-read-between
+   guards are unchanged (they already key on the vec
+   value id). Per-lane in-place is hazard-free: the Phi
+   lane regs are never-expired and distinct, and
+   `make_inst` reads both operands before writing the
+   dest. Disasm-confirmed on `heavyvec`: the loop body
+   is 9 instructions (4 `fmul` + 4 `fadd` + `add` +
+   back-edge `b`) with zero in-loop `mov v.16b`; the
+   only vector moves left are the entry-edge inits.
+   Gate: full differential 26/26 + in-VM 19/19 still
+   bit-exact.
 3. add a vector-heavy bench shader + `native/` C ref;
    measure the bespoke-vs-`clang -O2` gap on the shape
    that should finally expose one.

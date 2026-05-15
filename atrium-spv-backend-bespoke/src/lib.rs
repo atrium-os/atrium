@@ -614,12 +614,14 @@ fn emit_function(
                                     Some(Op::Branch(t)) if *t == arm.from)
                         });
                 if !(case1 || case2) { continue; }
-                // P must be a scalar binary op whose result
-                // type matches the Phi register class, and
-                // it must go through a coalesce-aware emit
-                // path (emit_fp_binop_poly / emit_int_binop).
-                // Vec Phis don't coalesce yet — a later
-                // phase.
+                // P must be a binary op whose result type
+                // matches the Phi register class, and it
+                // must go through a coalesce-aware emit path
+                // (emit_fp_binop_poly / emit_int_binop). A
+                // Vec Phi coalesces an FP binop whose result
+                // is the same-shaped vector: emit_fp_binop_poly
+                // writes each lane straight into the Phi's
+                // per-lane reg.
                 let op_ok = match &dest {
                     PhiDest::Float(_) => matches!(&p.op,
                         Op::FAdd(..) | Op::FSub(..)
@@ -630,7 +632,9 @@ fn emit_function(
                         | Op::SMod(..) | Op::UMod(..)
                         | Op::BitAnd(..) | Op::BitOr(..) | Op::BitXor(..)
                         | Op::Shl(..) | Op::LShr(..) | Op::AShr(..)),
-                    PhiDest::Vec(_) => false,
+                    PhiDest::Vec(_) => matches!(&p.op,
+                        Op::FAdd(..) | Op::FSub(..)
+                        | Op::FMul(..) | Op::FDiv(..)),
                 };
                 if !op_ok { continue; }
                 // `src` single-use (only the phi-move reads it).
@@ -774,10 +778,10 @@ fn emit_function(
         // the two binop emit helpers expect.
         let coalesce_dest: Option<PhiDest> = inst.result.as_ref()
             .and_then(|r| coalesce_into.get(&r.id).cloned());
-        let coalesce_v: Option<asm::Vreg> = match &coalesce_dest {
-            Some(PhiDest::Float(v)) => Some(*v),
-            _ => None,
-        };
+        // The FP binop helper takes the whole `PhiDest` (it
+        // handles both `Float` scalar coalescing and `Vec`
+        // per-lane coalescing); the int helper still wants
+        // the bare W-reg.
         let coalesce_w: Option<asm::Wreg> = match &coalesce_dest {
             Some(PhiDest::Int(w)) => Some(*w),
             _ => None,
@@ -1090,19 +1094,19 @@ fn emit_function(
             Op::FAdd(a_v, b_v) => emit_fp_binop_poly(
                 &mut a, &mut scalars, &mut vectors,
                 &mut free_pool, &mut owners, &mut used_callee_saved_v,&mut next_synth_id,
-                coalesce_v, inst, a_v, b_v, asm::fadd_s)?,
+                coalesce_dest.as_ref(), inst, a_v, b_v, asm::fadd_s)?,
             Op::FSub(a_v, b_v) => emit_fp_binop_poly(
                 &mut a, &mut scalars, &mut vectors,
                 &mut free_pool, &mut owners, &mut used_callee_saved_v,&mut next_synth_id,
-                coalesce_v, inst, a_v, b_v, asm::fsub_s)?,
+                coalesce_dest.as_ref(), inst, a_v, b_v, asm::fsub_s)?,
             Op::FMul(a_v, b_v) => emit_fp_binop_poly(
                 &mut a, &mut scalars, &mut vectors,
                 &mut free_pool, &mut owners, &mut used_callee_saved_v,&mut next_synth_id,
-                coalesce_v, inst, a_v, b_v, asm::fmul_s)?,
+                coalesce_dest.as_ref(), inst, a_v, b_v, asm::fmul_s)?,
             Op::FDiv(a_v, b_v) => emit_fp_binop_poly(
                 &mut a, &mut scalars, &mut vectors,
                 &mut free_pool, &mut owners, &mut used_callee_saved_v,&mut next_synth_id,
-                coalesce_v, inst, a_v, b_v, asm::fdiv_s)?,
+                coalesce_dest.as_ref(), inst, a_v, b_v, asm::fdiv_s)?,
             Op::Store { ptr, value } => {
                 match &ptr.ty {
                     Type::Pointer(StorageClass::Output, _) => {}
@@ -2245,7 +2249,7 @@ fn emit_fp_binop_poly(
     owners: &mut HashMap<u8, ValueId>,
     used_callee_saved_v: &mut bool,
     next_synth_id: &mut u32,
-    coalesce: Option<asm::Vreg>,
+    coalesce: Option<&PhiDest>,
     inst: &atrium_spv_ir::Inst,
     lhs: &Value,
     rhs: &Value,
@@ -2258,6 +2262,22 @@ fn emit_fp_binop_poly(
     };
     let result = inst.result.as_ref().ok_or_else(||
         BackendError::Internal("fp binop without result".into()))?;
+
+    // Scalar coalesce target (Float Phi) and per-lane
+    // coalesce targets (Vec Phi). A Vec Phi's lane regs are
+    // never-expired and distinct per lane, so writing lane
+    // `li`'s result straight into `coalesce_lanes[li]` is
+    // safe: `make_inst` reads both operands before writing
+    // the dest, and the only register the dest can alias is
+    // that same lane's own operand.
+    let coalesce_scalar: Option<asm::Vreg> = match coalesce {
+        Some(PhiDest::Float(v)) => Some(*v),
+        _ => None,
+    };
+    let coalesce_lanes: Option<&[asm::Vreg]> = match coalesce {
+        Some(PhiDest::Vec(lr)) => Some(lr.as_slice()),
+        _ => None,
+    };
 
     let lhs_is_vec = vectors.contains_key(&lhs.id);
     let rhs_is_vec = vectors.contains_key(&rhs.id);
@@ -2276,7 +2296,7 @@ fn emit_fp_binop_poly(
             // single-use Phi arm (see opt #4). ARM reads
             // both operands before writing the dest, so
             // coalescing into a source register is correct.
-            let d = match coalesce {
+            let d = match coalesce_scalar {
                 Some(d) => d,
                 None => alloc_vreg(free_pool, owners, used_callee_saved_v,result.id)?,
             };
@@ -2304,7 +2324,10 @@ fn emit_fp_binop_poly(
                         rl.id)))?;
                 // Synthetic per-lane result ValueId.
                 let synth = fresh_synth();
-                let d = alloc_vreg(free_pool, owners, used_callee_saved_v,synth)?;
+                let d = match coalesce_lanes {
+                    Some(lr) => lr[li],
+                    None => alloc_vreg(free_pool, owners, used_callee_saved_v,synth)?,
+                };
                 a.emit(make_inst(d, l, r));
                 scalars.insert(synth, d);
                 out_lanes.push(Value {
@@ -2325,7 +2348,10 @@ fn emit_fp_binop_poly(
                     BackendError::Internal(format!(
                         "vec×scalar lane {li} lhs missing")))?;
                 let synth = fresh_synth();
-                let d = alloc_vreg(free_pool, owners, used_callee_saved_v,synth)?;
+                let d = match coalesce_lanes {
+                    Some(lr) => lr[li],
+                    None => alloc_vreg(free_pool, owners, used_callee_saved_v,synth)?,
+                };
                 a.emit(make_inst(d, l, r));
                 scalars.insert(synth, d);
                 out_lanes.push(Value { id: synth, ty: ll.ty.clone() });
@@ -2344,7 +2370,10 @@ fn emit_fp_binop_poly(
                     BackendError::Internal(format!(
                         "scalar×vec lane {li} rhs missing")))?;
                 let synth = fresh_synth();
-                let d = alloc_vreg(free_pool, owners, used_callee_saved_v,synth)?;
+                let d = match coalesce_lanes {
+                    Some(lr) => lr[li],
+                    None => alloc_vreg(free_pool, owners, used_callee_saved_v,synth)?,
+                };
                 a.emit(make_inst(d, l, r));
                 scalars.insert(synth, d);
                 out_lanes.push(Value { id: synth, ty: rl.ty.clone() });
