@@ -3059,9 +3059,34 @@ extends the `atrium-spv-blob` format slightly — a
    `blr` clobbers them. The test shader doesn't have
    values live across the call so the present codegen
    works; a real shader with V-reg values live across an
-   `ImageSample` needs proper save/restore or a regalloc
-   that forces V8..V15 across calls. Scoped as a follow-
-   on when a non-trivial textured shader trips it.
+   `ImageSample` needs proper save/restore.
+
+   **Update (follow-on landed):** the bespoke
+   `ImageSampleImplicitLod` codegen now snapshots
+   `owners.keys()` before allocating result lanes,
+   spills each one as a full 128-bit `str q` to the
+   call's stack frame, and reloads with `ldr q` after
+   the call. Stack frame grows by `16 * N` where N is
+   the live count; SP stays 16-aligned. Conservative
+   (saves coord lanes that are consumed by this very
+   op) but correct. **`n_spill = 0`** for both
+   `texture_sample_centre_rgbw` and the in-VM
+   `texsample` so the existing gates pass identically
+   on the simple shape.
+
+   A staged test `texture_sample_tinted` (a `sampler2D`
+   shader that multiplies the sampled pixel by a tint
+   vec4 — tint's V-regs are live across the
+   `ImageSample` and exercise `n_spill = 4`) exposed a
+   *separate, pre-existing* regalloc bug: a hoisted
+   ConstFloat gets its V-reg reallocated to a second
+   ConstFloat while the first is still live, so the
+   sample's u/v end up reading a clobbered constant.
+   The bug is independent of the cross-call work (it
+   reproduces without the spill code too — the spill
+   code itself disasm-verifies correct). Tracked as a
+   follow-on; the tinted test is `#[ignore]`-staged so
+   it lights up the moment regalloc is fixed.
 6. **✅ done.** In-VM `texsample` shader added to
    `run-in-vm.sh`. The harness's `texsample` mode builds
    a 2×2 RGBW texture + Nearest/Clamp sampler in C,

@@ -1828,11 +1828,31 @@ fn emit_function(
                     BackendError::Internal(format!(
                         "ImageSampleImplicitLod coord lane 1 {:?} not in scalars",
                         coord_lanes[1].id)))?;
-                // Allocate four result-lane V-regs *before*
-                // emitting the call. They're caller-saved
-                // (V16..V31) but not live until we write
-                // them with the post-call ldr/fmov, so the
-                // clobber-by-blr is harmless.
+
+                // Snapshot every currently-owned V-reg
+                // *before* allocating the result lanes —
+                // these are the values live across the `blr`
+                // (caller-saved V16..V31 + V8..V15 upper-64
+                // bits are clobbered per AAPCS64). We spill
+                // each as a full 128-bit Q-reg so packed
+                // vec4 values (from the NEON arc) survive
+                // intact, even though most live values only
+                // need 32 bits. Reload after the call.
+                //
+                // Conservatively saves coord lanes too even
+                // though they're consumed by this very op;
+                // their last_use would expire at the next
+                // inst anyway, so the extra ldr_q is just
+                // dead bytes — not incorrect.
+                let mut live_vregs: Vec<u8> = owners.keys().copied().collect();
+                live_vregs.sort();
+
+                // Allocate four result-lane V-regs *after*
+                // the snapshot. They're caller-saved (V16..
+                // V31) but not live until we write them with
+                // the post-call ldr/fmov, so the clobber by
+                // `blr` is harmless and we don't need to
+                // spill them.
                 let mut lane_regs: Vec<asm::Vreg> = Vec::with_capacity(4);
                 let mut lane_vals: Vec<Value> = Vec::with_capacity(4);
                 for _ in 0..4 {
@@ -1855,25 +1875,34 @@ fn emit_function(
                 let v0 = asm::Vreg(0);
                 let v1 = asm::Vreg(1);
                 let v2 = asm::Vreg(2); // parallel-copy temp
+                let lr = asm::Xreg(30);
                 let desc_off: u16 = 16 + (binding as u16) * 16;
 
-                // Reserve stack:
+                // Stack layout (16-byte aligned; each region
+                // is 16 bytes):
                 //   [sp +  0..16]: out_rgba result slot
                 //   [sp + 16..24]: saved X4 (out_color)
                 //   [sp + 24..32]: saved X30 (link register)
-                // SP stays 16-byte aligned. LR save is
+                //   [sp + 32..32+N*16]: saved V-regs (Q view)
+                // SP stays 16-byte aligned (32 + N*16 is a
+                // multiple of 16 for any N). LR save is
                 // critical: `blr` clobbers X30, and the
                 // function's eventual `ret` reads it; without
-                // this the function returns to a stale LR
-                // and segfaults at the caller boundary. The
+                // it the function returns to a stale LR and
+                // segfaults at the caller boundary. The
                 // bespoke backend's existing prologue doesn't
                 // save LR because non-image shaders make no
                 // function calls — image sample is the first
                 // op that does.
-                let lr = asm::Xreg(30);
-                a.emit(asm::sub_imm_x(sp, sp, 32));
+                let n_spill = live_vregs.len() as u16;
+                let frame_bytes: u16 = 32 + n_spill * 16;
+                a.emit(asm::sub_imm_x(sp, sp, frame_bytes));
                 a.emit(asm::str_x_offset(x_out, sp, 16));
                 a.emit(asm::str_x_offset(lr, sp, 24));
+                for (i, n) in live_vregs.iter().enumerate() {
+                    a.emit(asm::str_q_offset(
+                        asm::Vreg(*n), sp, 32 + (i as u16) * 16));
+                }
 
                 // Load descriptor pointers + helper.
                 a.emit(asm::ldr_x_offset(x9, x1, 0));
@@ -1906,10 +1935,16 @@ fn emit_function(
                     a.emit(asm::fmov_s_from_w(*lane, w_tmp));
                 }
 
+                // Reload spilled V-regs (clobbered by `blr`).
+                for (i, n) in live_vregs.iter().enumerate() {
+                    a.emit(asm::ldr_q_offset(
+                        asm::Vreg(*n), sp, 32 + (i as u16) * 16));
+                }
+
                 // Restore X4 (out_color) + X30 (LR); drop stack.
                 a.emit(asm::ldr_x_offset(x_out, sp, 16));
                 a.emit(asm::ldr_x_offset(lr, sp, 24));
-                a.emit(asm::add_imm_x(sp, sp, 32));
+                a.emit(asm::add_imm_x(sp, sp, frame_bytes));
 
                 vectors.insert(result.id, lane_vals);
             }
