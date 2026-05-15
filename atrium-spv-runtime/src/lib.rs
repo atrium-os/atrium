@@ -99,6 +99,63 @@ pub struct SamplerDesc {
     pub wrap_t:     u32,
 }
 
+// ── Descriptor table ──────────────────────────────────────
+//
+// How a compiled shader finds its bound textures + samplers
+// at runtime. The Atrium-Tier-2 fragment-shader AAPCS64
+// split passes a `uniforms` pointer in X1 (per
+// docs/spec/tier2-renderer.md §4.1). v1 of the texture
+// path *overlays* the uniforms buffer's first
+// `count * DESC_SLOT_BYTES` bytes with a flat array of
+// descriptor-pointer pairs, indexed by SPIR-V `Binding`
+// number (single descriptor set assumed). A backend that
+// sees an `ImageSample` against binding `B` emits:
+//
+//     ldr  x_tex,  [X1, #B*16 + 0]   ; tex_desc*
+//     ldr  x_samp, [X1, #B*16 + 8]   ; samp_desc*
+//     bl   atrium_tex_sample_2d
+//
+// Shaders that *also* read a uniform block must arrange
+// for that block to live past the descriptor table (set
+// the buffer's binding offsets accordingly). Multi-set
+// support + a dedicated descriptor-table register (X6)
+// land later when a real shader needs both.
+
+/// Bytes per descriptor slot in the table. Two 64-bit
+/// pointers packed back-to-back — `tex_desc*` then
+/// `samp_desc*`.
+pub const DESC_SLOT_BYTES: usize = 16;
+
+/// Build the uniforms-buffer prefix for `count` descriptor
+/// slots. Caller writes `slot * DESC_SLOT_BYTES` to set the
+/// pair for binding `slot`. Returns a zero-initialised
+/// buffer of exactly `count * DESC_SLOT_BYTES` bytes.
+pub fn descriptor_table_buffer(count: usize) -> Vec<u8> {
+    vec![0u8; count * DESC_SLOT_BYTES]
+}
+
+/// Write a `(tex_desc, samp_desc)` pointer pair at binding
+/// slot `slot` in a descriptor-table buffer. The buffer
+/// must be `>= (slot + 1) * DESC_SLOT_BYTES` long.
+///
+/// # Safety
+/// The host pointers must outlive every shader invocation
+/// that reads them through this table.
+pub unsafe fn write_descriptor_slot(
+    buf: &mut [u8],
+    slot: usize,
+    tex: *const TexDesc,
+    samp: *const SamplerDesc,
+) {
+    let base = slot * DESC_SLOT_BYTES;
+    assert!(buf.len() >= base + DESC_SLOT_BYTES,
+        "descriptor-table buffer too small for slot {slot}");
+    let tex_bytes  = (tex as usize as u64).to_le_bytes();
+    let samp_bytes = (samp as usize as u64).to_le_bytes();
+    buf[base    .. base +  8].copy_from_slice(&tex_bytes);
+    buf[base + 8.. base + 16].copy_from_slice(&samp_bytes);
+}
+
 // ── Helpers ───────────────────────────────────────────────
 
 /// Sample a 2D image at normalised UV coordinates with
@@ -444,6 +501,52 @@ mod tests {
         // And negative side: c=-1 → 0, c=-4 → 3, c=-5 → 3.
         assert_eq!(apply_wrap(-1, n, WrapMode::Mirror), 0);
         assert_eq!(apply_wrap(-4, n, WrapMode::Mirror), 3);
+    }
+
+    #[test]
+    fn descriptor_table_layout_round_trips() {
+        // Two slots: binding 0 → (tex_a, samp_a), binding 1
+        // → (tex_b, samp_b). After writing, decode each
+        // 8-byte field as a u64 and verify it matches the
+        // original pointer's `as usize` value.
+        let (pixels, mut tex_a) = checker();
+        // Suppress unused warnings — we hand `pixels` alive
+        // through the borrow on tex_a.data.
+        let _ = &pixels;
+        let mut tex_b = tex_a;
+        tex_b.width = 99; // make the descriptors distinguishable
+        let samp_a = SamplerDesc {
+            mag_filter: FilterMode::Nearest as u32,
+            min_filter: FilterMode::Nearest as u32,
+            wrap_s: WrapMode::ClampToEdge as u32,
+            wrap_t: WrapMode::ClampToEdge as u32,
+        };
+        let mut samp_b = samp_a;
+        samp_b.mag_filter = FilterMode::Linear as u32;
+
+        // Mutate-then-take-pointer so the addresses are
+        // stable for the rest of the test.
+        let tex_a_ptr  = &tex_a  as *const TexDesc;
+        let tex_b_ptr  = &tex_b  as *const TexDesc;
+        let samp_a_ptr = &samp_a as *const SamplerDesc;
+        let samp_b_ptr = &samp_b as *const SamplerDesc;
+        // `tex_a` / `samp_*` aren't actually mutated past
+        // this point — silence the `mut` lint.
+        let _ = &mut tex_a;
+
+        let mut buf = descriptor_table_buffer(2);
+        assert_eq!(buf.len(), 2 * DESC_SLOT_BYTES);
+        unsafe {
+            write_descriptor_slot(&mut buf, 0, tex_a_ptr, samp_a_ptr);
+            write_descriptor_slot(&mut buf, 1, tex_b_ptr, samp_b_ptr);
+        }
+
+        let read_u64 = |off: usize| u64::from_le_bytes(
+            buf[off..off + 8].try_into().unwrap());
+        assert_eq!(read_u64(0),  tex_a_ptr  as usize as u64);
+        assert_eq!(read_u64(8),  samp_a_ptr as usize as u64);
+        assert_eq!(read_u64(16), tex_b_ptr  as usize as u64);
+        assert_eq!(read_u64(24), samp_b_ptr as usize as u64);
     }
 
     #[test]

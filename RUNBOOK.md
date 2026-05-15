@@ -2954,16 +2954,41 @@ extends the `atrium-spv-blob` format slightly — a
    `(0.5, 0.5, 0.5, 1.0)` — the four-texel mean. Plus
    regression: all 10 atrium-spv-tests tests, 8 runtime
    tests, 26/26 differential.
-3. Differential: a `three_way_texture_sample` test
-   using a 4×4 texture + a Bilinear/Clamp sampler + a
-   shader that returns a sampled pixel. Initially
-   interpreter-only (skip Cranelift + bespoke as
-   `Unsupported`), then enable each backend as it
-   gains support.
+3. **Folded into phase 4.** The original plan ("interpreter-
+   only differential test") doesn't work standalone:
+   `assert_shader_agrees` requires ≥2 successful runners,
+   so a one-runner differential just fails the harness.
+   The interpreter self-check is already in place
+   (`interpreter_bilinear_centre_of_rgbw_checker` —
+   phase 2's gate). The real differential gates land
+   with phase 4 (interpreter + Cranelift) and phase 5
+   (+ bespoke).
 4. Cranelift backend: emit the AAPCS64 call sequence,
    wiring through a runtime-helper relocation. The
-   easier of the two — cranelift-module already does
+   easier of the two — `cranelift-module` already does
    relocations.
+
+   **Descriptor ABI (v1)** — how compiled shader code
+   finds bound textures + samplers at runtime. The
+   AAPCS64 split passes `uniforms` in X1; v1 *overlays*
+   the buffer's first `count * DESC_SLOT_BYTES` bytes
+   with a flat array of descriptor-pointer pairs (two
+   64-bit pointers per slot: `tex_desc*`, `samp_desc*`),
+   indexed by SPIR-V `Binding`. A backend that sees an
+   `ImageSample` against binding `B` emits:
+   ```
+   ldr  x_tex,  [X1, #B*16 + 0]   ; tex_desc*
+   ldr  x_samp, [X1, #B*16 + 8]   ; samp_desc*
+   bl   atrium_tex_sample_2d
+   ```
+   `atrium-spv-runtime` exposes a `descriptor_table_buffer`
+   helper + a `write_descriptor_slot` unsafe writer so
+   the harness can pack the prefix; the unit test
+   `descriptor_table_layout_round_trips` pins the byte
+   layout. Multi-set support + a dedicated descriptor-
+   table register (X6) land later when a real shader
+   needs both descriptors and a regular uniform block in
+   the same invocation.
 5. Bespoke backend: same call shape, but the JIT-emit
    blob path needs the new "runtime imports" table in
    `atrium-spv-blob` + a loader-time pointer patch.
