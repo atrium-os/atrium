@@ -2557,11 +2557,14 @@ loop}.c`), in-VM (FreeBSD/aarch64), ns/call:
 So the honest picture: bespoke is at the `clang -O2` bar
 for straight scalar-FP work, at *both* shapes measured
 (2- and 4-accumulator loops), and matches Cranelift on
-all three. The one large remaining gap to a full
-optimiser — `loop` — is loop-idiom recognition, a
-category Cranelift skips too. Still unmeasured: vector-
-heavy loops (blocked — bespoke has no vec Phi yet) and
-texture/sampler-heavy shaders.
+all three. Two large gaps to a full optimiser remain,
+both *shared-absent in Cranelift too* — not bespoke
+deficiencies: `loop` is loop-idiom recognition (~35×),
+and `heavyvec` is NEON vectorisation of vec FP binops
+(0.62× native — see the vec-Phi arc and the NEON
+vectoriser scoping below; vec Phi landed and unblocked
+this measurement). Still unmeasured: texture/sampler-
+heavy shaders.
 
 #### Next arc — scoped: vec Phi in the bespoke backend
 
@@ -2648,6 +2651,68 @@ the bespoke path can take.
    lanes are independent and emit the `.4s` form) — its
    own future arc, shared with Cranelift, not a bespoke
    deficiency.
+
+#### Next arc — scoped: NEON vectoriser for vec FP binops
+
+`heavyvec` (phase 3 above) is the standing measured gap:
+bespoke/Cranelift **0.62×** `clang -O2`, purely because
+both lane-walk a `vec4` FP binop as four scalar `.s` ops
+where clang emits one `.4s`. Closing it means keeping a
+`vecN` in a *single* Q-register and emitting packed NEON.
+
+**Why it's a real arc, not a peephole.** The bespoke
+backend models a vector as `vectors: HashMap<ValueId,
+Vec<Value>>` — four *independent* scalar `Value`s, each
+in its own V-reg. `.4s` ops act on lanes 0..3 of *one*
+Q-reg; you cannot `.4s` across four separate registers.
+So this needs a parallel *packed* representation, not a
+late instruction-swap.
+
+**Missing toolchain piece.** `pptk-codegen-arm64::asm`
+has scalar `.s`/`.d` FP ops, `mov_v_16b`, `ins_v_s/_d`
+lane inserts, `fmov_w_from_s`/`_s_from_w` — but *no*
+`.4s` arithmetic (`fmul/fadd/fsub/fdiv v.4s`), no `ld1`,
+no `dup`. Those encodings are phase 0, in pptk.
+
+**Design — hybrid representation (recommended).** Add
+`packed: HashMap<ValueId, asm::Vreg>` alongside the
+per-lane `vectors`. A value is *packed-eligible* when
+every producer and consumer on its chain is pack-friendly
+(vec FP binop, vec Phi, whole-vector Store, vec×scalar
+broadcast via `dup`); anything lane-addressed (shuffle,
+CompositeExtract/Construct, Dot) forces the per-lane
+form. A pre-pass classifies each vec `ValueId`; packed
+values get one Q-reg + `.4s` ops, and a packed↔lanes
+bridge (`mov s, v.s[i]` / `ins v.s[i]`) materialises at
+the boundary when a packed value meets a lane-only
+consumer. vec Phi and the phase-2 coalescing both carry
+over almost verbatim — a packed Phi is *one* never-
+expired Q-reg, the coalesced binop writes it in place.
+
+**Phasing.**
+0. pptk: `.4s` FP arith + `dup` + `ld1`-from-pool (or
+   per-lane `ins` build) encodings, with unit tests.
+1. packed representation + classifier + the packed↔lanes
+   bridge; vec FP binop emits `.4s` for packed values,
+   falls back to per-lane otherwise. Gate: the existing
+   differential vec tests stay bit-exact (`-ffp-contract
+   =off`, so `.4s` non-FMA arithmetic is still
+   bit-identical) + in-VM.
+2. packed vec Phi + carry phase-2 coalescing to the Q-reg
+   form. Gate: `three_way_heavyvec` + in-VM `heavyvec`.
+3. re-bench `heavyvec` vs `clang -O2`; expect bespoke to
+   move from 0.62× toward ~1× (clang's `.4s` loop is the
+   target). Also extend to `vecarith` and a new
+   wider-vec bench if the gap warrants.
+
+**Risk — FMA.** `clang -O2` (non-`-ffp-contract=off`)
+fuses `mul`+`add` into `fmla.4s`; that changes results
+bit-for-bit (skips the intermediate rounding), so an
+`fmla`-emitting bespoke would break the bit-exact
+differential. Keep `.4s` arithmetic *unfused* for
+correctness parity with the interpreter oracle; the
+`native/fma` bench column stays the separate, explicitly
+non-bit-exact ceiling.
 
 #### Compile-pipeline phase breakdown — `cc` is the cost
 
