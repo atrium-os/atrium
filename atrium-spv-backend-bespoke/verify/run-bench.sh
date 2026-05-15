@@ -56,6 +56,7 @@ phi|phi|0.2|
 unordcmp|unordcmp|0.2|
 heavy|heavy|512 int|native/heavy.c
 heavy4|heavy4|256 int|native/heavy4.c
+heavyvec|heavyvec|256 int|native/heavyvec.c
 '
 
 echo "==> building bench_driver (host release + FreeBSD aarch64 cross)"

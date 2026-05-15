@@ -2632,9 +2632,22 @@ the bespoke path can take.
    only vector moves left are the entry-edge inits.
    Gate: full differential 26/26 + in-VM 19/19 still
    bit-exact.
-3. add a vector-heavy bench shader + `native/` C ref;
-   measure the bespoke-vs-`clang -O2` gap on the shape
-   that should finally expose one.
+3. **✅ done.** added the `heavyvec` bench shader +
+   `native/heavyvec.c` C ref. This is the first shader
+   where native clearly beats both fast-tier backends at
+   runtime: in-VM `heavyvec` runs bespoke **348.9 ns**,
+   Cranelift 348.9 ns, `clang -O2` **216.2 ns** — bespoke
+   is **0.62×** native (native ~1.6× faster). The gap is
+   exactly the expected one: clang SIMD-packs the four
+   independent lanes into one `fmul.4s` + one `fadd.4s`
+   per iteration, where both fast-tier backends lane-walk
+   four scalar `fmul` + four scalar `fadd`. vec-Phi got
+   the bespoke path correct + call-overhead-free and at
+   parity with Cranelift; closing the gap to native means
+   a NEON vectoriser (recognise that a vec FP binop's
+   lanes are independent and emit the `.4s` form) — its
+   own future arc, shared with Cranelift, not a bespoke
+   deficiency.
 
 #### Compile-pipeline phase breakdown — `cc` is the cost
 
