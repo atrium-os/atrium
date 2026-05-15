@@ -17,7 +17,7 @@ use atrium_spv_tests::harness::{
 use atrium_spv_tests::interpreter::{ShaderInputs, TextureBinding};
 use atrium_spv_tests::pixels::ColorTolerance;
 
-use atrium_spv_differential::CraneliftRunner;
+use atrium_spv_differential::{BespokeRunner, CraneliftRunner};
 
 fn build_image_fetch_shader() -> Vec<u8> {
     use rspirv::binary::Assemble;
@@ -116,9 +116,10 @@ fn image_fetch_at_one_zero() {
         ..ShaderInputs::default()
     };
     let spirv = build_image_fetch_shader();
-    let runners: [Box<dyn ShaderRunner>; 2] = [
+    let runners: [Box<dyn ShaderRunner>; 3] = [
         Box::new(InterpreterRunner),
         Box::new(CraneliftRunner::default()),
+        Box::new(BespokeRunner::default()),
     ];
     let refs: Vec<&dyn ShaderRunner> = runners.iter().map(|b| b.as_ref()).collect();
     let tol = ColorTolerance::AbsEpsilon { eps: 1e-6 };

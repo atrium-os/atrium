@@ -1217,11 +1217,18 @@ fn emit_function(
                     packed.insert(result.id, q);
                 } else {
                     // Per-lane representation: each lane
-                    // must already exist in `scalars`.
+                    // must already exist either in
+                    // `scalars` (f32 lane → V-reg) or in
+                    // `ints` (i32/u32 lane → W-reg). The
+                    // latter is what an `ivec2` coord for
+                    // `OpImageFetch` looks like.
                     for el in elements {
-                        if !scalars.contains_key(&el.id) {
+                        let in_scalars = scalars.contains_key(&el.id);
+                        let in_ints    = ints.contains_key(&el.id);
+                        if !(in_scalars || in_ints) {
                             return Err(BackendError::Unsupported(format!(
-                                "ConstVec lane {:?} not in scalars", el.id)));
+                                "ConstVec lane {:?} not in scalars or ints",
+                                el.id)));
                         }
                     }
                     vectors.insert(result.id, elements.clone());
@@ -1945,6 +1952,131 @@ fn emit_function(
                 }
 
                 // Reload spilled V-regs (clobbered by `blr`).
+                for (i, n) in live_vregs.iter().enumerate() {
+                    a.emit(asm::ldr_q_offset(
+                        asm::Vreg(*n), sp, 32 + (i as u16) * 16));
+                }
+
+                // Restore X4 (out_color) + X30 (LR); drop stack.
+                a.emit(asm::ldr_x_offset(x_out, sp, 16));
+                a.emit(asm::ldr_x_offset(lr, sp, 24));
+                a.emit(asm::add_imm_x(sp, sp, frame_bytes));
+
+                vectors.insert(result.id, lane_vals);
+            }
+            // ImageFetch — same v1-ABI call shape as
+            // ImageSampleImplicitLod, but: helper fn ptr
+            // lives at `uniforms[8]` (the *fetch* slot,
+            // not sample); no sampler descriptor; args
+            // are (tex_desc*, x:i32, y:i32, lod:i32,
+            // out_rgba*) so W1/W2/W3 carry the ivec2 coord
+            // + lod and X4 carries out_rgba (AAPCS64
+            // assigns the 5th int/ptr arg to X4 — same
+            // slot that holds the shader's out_color, so
+            // it gets saved/restored across the call as
+            // before).
+            Op::ImageFetch { image, coord, lod } => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "ImageFetch without result".into()))?;
+                let (_, binding) = image_handles.get(&image.id)
+                    .copied()
+                    .ok_or_else(|| BackendError::Internal(format!(
+                        "ImageFetch image {:?} not an ImageHandle",
+                        image.id)))?;
+                let coord_lanes = vectors.get(&coord.id).cloned()
+                    .ok_or_else(|| BackendError::Internal(format!(
+                        "ImageFetch coord {:?} not a vector",
+                        coord.id)))?;
+                if coord_lanes.len() < 2 {
+                    return Err(BackendError::Unsupported(format!(
+                        "ImageFetch 2D coord must have ≥2 lanes, got {}",
+                        coord_lanes.len())));
+                }
+                let x_w = *ints.get(&coord_lanes[0].id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "ImageFetch coord lane 0 {:?} not in ints",
+                        coord_lanes[0].id)))?;
+                let y_w = *ints.get(&coord_lanes[1].id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "ImageFetch coord lane 1 {:?} not in ints",
+                        coord_lanes[1].id)))?;
+                let lod_w_opt: Option<asm::Wreg> = match lod {
+                    Some(lv) => Some(*ints.get(&lv.id).ok_or_else(||
+                        BackendError::Internal(format!(
+                            "ImageFetch lod {:?} not in ints",
+                            lv.id)))?),
+                    None => None,
+                };
+
+                // Snapshot owned V-regs to spill, then
+                // allocate 4 result-lane V-regs (same
+                // mechanism as ImageSampleImplicitLod).
+                let mut live_vregs: Vec<u8> = owners.keys().copied().collect();
+                live_vregs.sort();
+                let mut lane_regs: Vec<asm::Vreg> = Vec::with_capacity(4);
+                let mut lane_vals: Vec<Value> = Vec::with_capacity(4);
+                for _ in 0..4 {
+                    let synth = ValueId(next_synth_id);
+                    next_synth_id += 1;
+                    let r = alloc_vreg(&mut free_pool, &mut owners,
+                        &mut used_callee_saved_v, synth)?;
+                    scalars.insert(synth, r);
+                    lane_regs.push(r);
+                    lane_vals.push(Value { id: synth, ty: Type::F32 });
+                }
+
+                let sp = asm::Xreg(31);
+                let x0 = asm::Xreg(0);
+                let x1 = asm::Xreg(1);
+                let x4 = asm::Xreg(4);  // becomes out_rgba ptr
+                let x9 = asm::Xreg(9);
+                let x10 = asm::Xreg(10);
+                let lr = asm::Xreg(30);
+                let w1 = asm::Wreg(1);
+                let w2 = asm::Wreg(2);
+                let w3 = asm::Wreg(3);
+                let desc_off: u16 = 16 + (binding as u16) * 16;
+
+                let n_spill = live_vregs.len() as u16;
+                let frame_bytes: u16 = 32 + n_spill * 16;
+                a.emit(asm::sub_imm_x(sp, sp, frame_bytes));
+                a.emit(asm::str_x_offset(x_out, sp, 16));
+                a.emit(asm::str_x_offset(lr, sp, 24));
+                for (i, n) in live_vregs.iter().enumerate() {
+                    a.emit(asm::str_q_offset(
+                        asm::Vreg(*n), sp, 32 + (i as u16) * 16));
+                }
+
+                // Load helper fn ptr + tex_desc pointer
+                // from the uniforms buffer at the v1
+                // offsets. helper slot is +8 (fetch);
+                // tex_desc at the descriptor table base
+                // for this binding.
+                a.emit(asm::ldr_x_offset(x9, x1, 8));
+                a.emit(asm::ldr_x_offset(x10, x1, desc_off));
+
+                // Set up args. The ivec2 coord lanes are
+                // already in W-regs; copy them into W1/W2.
+                // Lod: explicit W-reg if supplied, else 0.
+                a.emit(asm::mov_x(x0, x10));
+                a.emit(asm::mov_w(w1, x_w));
+                a.emit(asm::mov_w(w2, y_w));
+                match lod_w_opt {
+                    Some(lw) => a.emit(asm::mov_w(w3, lw)),
+                    None     => a.emit(asm::movz_w(w3, 0, 0)),
+                }
+                a.emit(asm::add_imm_x(x4, sp, 0));
+                a.emit(asm::blr_x(x9));
+
+                // Read result lanes back out of the stack
+                // slot.
+                for (i, lane) in lane_regs.iter().enumerate() {
+                    a.emit(asm::ldr_w_offset(w_tmp, sp, (i as u16) * 4));
+                    a.emit(asm::fmov_s_from_w(*lane, w_tmp));
+                }
+
+                // Reload spilled V-regs.
                 for (i, n) in live_vregs.iter().enumerate() {
                     a.emit(asm::ldr_q_offset(
                         asm::Vreg(*n), sp, 32 + (i as u16) * 16));
