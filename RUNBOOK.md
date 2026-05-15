@@ -3120,6 +3120,91 @@ extends the `atrium-spv-blob` format slightly — a
    Cranelift, bespoke, in-VM gate) handles image-sample
    correctly under the same v1 ABI.
 
+#### Next big arc — scoped: vertex stage
+
+Texture/sampler closes the fragment-shader functionality
+story. The renderer's largest remaining feature gap is
+the **vertex stage** — without it, no pipeline; without
+a pipeline, no rasterized triangles. Scoping it here
+before commitment so the path is visible.
+
+**What exists.** Scaffolding-level support across the
+stack: `ShaderStage::Vertex`, frontend translates
+`ExecutionModel::Vertex`, both backends export
+`atrium_vs_main` as the symbol, and the Cranelift
+backend already declares a full Vertex `Signature`
+(per the spec'd AAPCS64 layout):
+
+```
+atrium_vs_main(
+    in_attributes:    *const u8,    // X0
+    in_attr_strides:  *const u8,    // X1
+    uniforms:         *const u8,    // X2
+    push_constants:   *const u8,    // X3
+    vertex_index:     u32,          // W4
+    instance_index:   u32,          // W5
+    out_position:     *mut f32,     // X6 (vec4)
+    out_varyings:     *mut u8,      // X7
+    out_clip_distance:*mut f32,     // X8 (struct-return slot)
+)
+```
+
+The bespoke backend's `resolve_pointer_param` does NOT
+yet have a Vertex mapping (only Fragment does); same
+for the in-VM harness (`harness.c` only loads
+`atrium_fs_main`). No vertex differential test exists.
+So the door is open; the work is wiring through.
+
+**Phasing.**
+0. **✅ done.** Frontend smoke gate
+   (`tests/passthrough_vertex.rs`). Hand-built SPIR-V
+   vertex shader: vec3 `Location=0` attribute → loads
+   `pos`, extracts x/y/z, constructs `vec4(pos, 1.0)`,
+   stores it via OpAccessChain into the gl_PerVertex
+   block's `gl_Position` member. The frontend produces
+   a single function with `stage = Vertex`, one entry
+   point, and one vertex input at location 0 of
+   `Vec3(F32)`. One minor wrinkle: the gl_PerVertex
+   struct member needs an `Offset` annotation alongside
+   the `BuiltIn Position` one — the frontend's
+   AccessChain walker keys struct member layouts on
+   `OpMemberDecorate Offset`, and SPIR-V producers
+   that target Vulkan typically emit Offset for
+   gl_PerVertex anyway, so this isn't a real
+   compatibility constraint, just an assertion in the
+   test setup.
+1. Interpreter vertex path: `Interpreter::run_vertex(inputs)`
+   parallel to `run_fragment`. Reads attributes from the
+   ShaderInputs (a new `vertex_attributes_per_invocation:
+   Vec<Vec<u8>>` field, mirroring `varyings_per_invocation`),
+   produces an output struct (position vec4 + varyings).
+2. Cranelift vertex codegen: the signature exists;
+   wire `resolve_pointer_param` for Vertex storage
+   classes that the existing OpStore/OpLoad code paths
+   already handle for Fragment.
+3. Bespoke vertex codegen: same — extend
+   `resolve_pointer_param` (and the equivalent of x_out
+   for vertex's `out_position` / `out_varyings`).
+4. Differential `three_way_passthrough_vertex` —
+   interpreter + Cranelift + bespoke agree on the output
+   position + varyings for a triangle's three vertices.
+5. In-VM vertex shader: an `atrium_vertex_harness.c`
+   parallel to the fragment harness, driven by a new
+   `run-in-vm.sh` entry.
+6. Rasterizer integration (the bridge that turns a
+   vertex-stage + fragment-stage pair into pixel
+   output): out of scope for this arc — a separate
+   substantial arc once both stages individually pass
+   their gates.
+
+**Risk — matrix types + per-vertex inputs.** Real
+vertex shaders need `mat4 * vec4` and per-vertex
+attribute interpolation. Matrix types are vec4×4 with
+column-major layout in SPIR-V; lowering them sanely is
+its own sub-arc. Phase 0 limits the smoke shader to a
+passthrough (no matrix) so the ABI plumbing can land
+first; matrix support comes in a follow-on.
+
 #### `heavyvec` tail inquiry — loop rotation is the lever
 
 Disassembled `clang -O2 -ffp-contract=off` of
