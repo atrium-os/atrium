@@ -2595,9 +2595,25 @@ graceful degradation, but it caps how heavy a vec shader
 the bespoke path can take.
 
 **Phasing.**
-1. vec Phi in the pre-pass + per-lane phi-move emission
-   (no coalescing). Gate: a new `three_way` vec-loop test
-   (interpreter + Cranelift + bespoke bit-exact) + in-VM.
+1. **✅ done.** vec Phi in the pre-pass + per-lane phi-move
+   emission (no coalescing). `PhiDest` grew a
+   `Vec(Vec<Vreg>)` variant; the Phi pre-pass decomposes a
+   `Type::Vec2/3/4` result into N never-expired V-regs +
+   synthetic per-lane `Value`s registered in `vectors`;
+   the Branch-terminator phi-move emits N per-lane
+   `mov_v_16b`. Gate met: `three_way_heavyvec` (interp +
+   Cranelift + bespoke bit-exact, n=16 vec4 loop) + the
+   in-VM `heavyvec` shader, both green on FreeBSD aarch64.
+   One bug found+fixed during bring-up: a vector phi arm
+   (e.g. a `ConstVec` initial value on the entry edge)
+   doesn't own a reg itself — its per-lane scalar values
+   do — so `compute_last_use_flat` must extend each
+   *lane's* live range to the predecessor terminator, not
+   just the composite's. Without it the linear-scan
+   recycled a lane's constant reg before the entry→header
+   phi-move; HashMap-order-dependent, so it passed on the
+   macOS host and failed only in-VM (lane 2 of the vec4
+   came out as `bias.x` instead of `v0.z`).
 2. extend opt-#4 coalescing to vec-Phi lanes.
 3. add a vector-heavy bench shader + `native/` C ref;
    measure the bespoke-vs-`clang -O2` gap on the shape

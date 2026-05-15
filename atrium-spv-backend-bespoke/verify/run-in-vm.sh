@@ -58,6 +58,10 @@
 #     file's caller-saved tier (V16..V31) and forces the
 #     callee-saved V8..V15 — exercises the opt #5 FP
 #     `stp d`/`ldp d` prologue+epilogue on the real target.
+#   * heavyvec — vec4 Phi loop (`v = v*0.99 + bias`). The
+#     loop-carried value is a vec4, so the bespoke pre-pass
+#     decomposes it into four per-lane scalar Phis and emits
+#     four per-lane `mov v.16b` phi-moves on the back-edge.
 #
 # Prereqs: the dev VM is up (scripts/run-vm.sh) and
 # reachable on localhost:2222 with the fresco_bsd key.
@@ -146,6 +150,7 @@ verify "shuffle"      ""        shuffle
 verify "cextract"     ""        cextract
 verify "dot"          ""        dot
 verify "heavy4 n=32"  "32 int"  heavy4 32
+verify "heavyvec n=16" "16 int" heavyvec 16
 
 if [ "$FAILED" = "0" ]; then
   echo "==> PASS — bespoke ELF + AAPCS64 codegen verified on FreeBSD aarch64"

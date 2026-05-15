@@ -25,6 +25,8 @@
 //!                                          (2 coupled accumulators)
 //!   emit_freebsd_obj <out.o> heavy4 <n> -- register-pressure variant
 //!                                          (4 accumulators; needs V8-V15)
+//!   emit_freebsd_obj <out.o> heavyvec <n> -- vec4 Phi loop (per-lane
+//!                                            phi-move emission)
 //!
 //! Prefix any kind with `spirv` to write the raw SPIR-V
 //! module instead of a compiled object (for the end-to-end
@@ -1010,6 +1012,102 @@ fn eval_heavy4(n: i32) -> [f32; 4] {
     [a, b, c, d]
 }
 
+/// Vector-carrying loop: a `vec4` accumulator threaded
+/// through the loop's `OpPhi` — the shape that exercises
+/// the bespoke backend's vec-Phi support (a vecN Phi
+/// decomposed into N per-lane scalar Phis). `n` from an
+/// i32 push-constant. `v = v*0.99 + bias` per iteration,
+/// contractive so every lane stays bounded.
+fn build_heavyvec_spirv() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, LoopControl, MemoryModel,
+        StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let f32_ty = b.type_float(32, None);
+    let i32_ty = b.type_int(32, 1);
+    let bool_ty = b.type_bool();
+    let vec4 = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let pc_struct = b.type_struct(vec![i32_ty]);
+    b.member_decorate(pc_struct, 0, Decoration::Offset,
+                      vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(pc_struct, Decoration::Block, vec![]);
+    let ptr_pc_struct = b.type_pointer(None, StorageClass::PushConstant, pc_struct);
+    let ptr_pc_i32    = b.type_pointer(None, StorageClass::PushConstant, i32_ty);
+    let ptr_out       = b.type_pointer(None, StorageClass::Output, vec4);
+    let zero_i = b.constant_bit32(i32_ty, 0u32);
+    let one_i  = b.constant_bit32(i32_ty, 1u32);
+    let cf = |b: &mut rspirv::dr::Builder, x: f32|
+        b.constant_bit32(f32_ty, x.to_bits());
+    let v0x = cf(&mut b, 0.5);   let v0y = cf(&mut b, 0.25);
+    let v0z = cf(&mut b, 0.125); let v0w = cf(&mut b, 0.0625);
+    let v0 = b.constant_composite(vec4, vec![v0x, v0y, v0z, v0w]);
+    let k99 = cf(&mut b, 0.99);
+    let kvec = b.constant_composite(vec4, vec![k99, k99, k99, k99]);
+    let bx = cf(&mut b, 0.001); let by = cf(&mut b, 0.002);
+    let bz = cf(&mut b, 0.003); let bw = cf(&mut b, 0.004);
+    let bias = b.constant_composite(vec4, vec![bx, by, bz, bw]);
+    let pc_var = b.variable(ptr_pc_struct, None, StorageClass::PushConstant, None);
+    let out = b.variable(ptr_out, None, StorageClass::Output, None);
+    b.decorate(out, Decoration::Location,
+               vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    let entry_id  = b.id();
+    let header_id = b.id();
+    let body_id   = b.id();
+    let cont_id   = b.id();
+    let merge_id  = b.id();
+    let i_next = b.id();
+    let v_next = b.id();
+    b.begin_block(Some(entry_id)).unwrap();
+    let p = b.access_chain(ptr_pc_i32, None, pc_var, vec![zero_i]).unwrap();
+    let n = b.load(i32_ty, None, p, None, vec![]).unwrap();
+    b.branch(header_id).unwrap();
+    b.begin_block(Some(header_id)).unwrap();
+    let i_phi = b.phi(i32_ty, None,
+        vec![(zero_i, entry_id), (i_next, cont_id)]).unwrap();
+    let v_phi = b.phi(vec4, None,
+        vec![(v0, entry_id), (v_next, cont_id)]).unwrap();
+    let cond = b.s_less_than(bool_ty, None, i_phi, n).unwrap();
+    b.loop_merge(merge_id, cont_id, LoopControl::NONE, vec![]).unwrap();
+    b.branch_conditional(cond, body_id, merge_id, vec![]).unwrap();
+    b.begin_block(Some(body_id)).unwrap();
+    let scaled = b.f_mul(vec4, None, v_phi, kvec).unwrap();
+    let _v_n   = b.f_add(vec4, Some(v_next), scaled, bias).unwrap();
+    b.branch(cont_id).unwrap();
+    b.begin_block(Some(cont_id)).unwrap();
+    b.i_add(i32_ty, Some(i_next), i_phi, one_i).unwrap();
+    b.branch(header_id).unwrap();
+    b.begin_block(Some(merge_id)).unwrap();
+    b.store(out, v_phi, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![out]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+fn eval_heavyvec(n: i32) -> [f32; 4] {
+    let mut v = [0.5f32, 0.25, 0.125, 0.0625];
+    let bias = [0.001f32, 0.002, 0.003, 0.004];
+    let mut i = 0i32;
+    while i < n {
+        for k in 0..4 { v[k] = v[k] * 0.99 + bias[k]; }
+        i += 1;
+    }
+    v
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let path = args.next()
@@ -1141,6 +1239,15 @@ fn main() {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(256);
             (build_heavy4_spirv(), eval_heavy4(n))
+        }
+        "heavyvec" => {
+            // vec4 Phi loop — exercises the vec-Phi pre-pass
+            // and per-lane phi-move emission in the bespoke
+            // backend (4 lanes carried across the back-edge).
+            let n: i32 = args.next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(256);
+            (build_heavyvec_spirv(), eval_heavyvec(n))
         }
         "unordcmp" => {
             // Same pixels as `ifelse` for finite inputs,

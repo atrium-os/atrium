@@ -533,6 +533,39 @@ fn emit_function(
                     ints.insert(result.id, w);
                     PhiDest::Int(w)
                 }
+                // A vecN-f32 Phi is N per-lane scalar Phis
+                // travelling together. Allocate one V-reg
+                // per lane (never expired, like a scalar
+                // Phi dest), register the result as a
+                // vector of synthetic per-lane scalar
+                // Values, and carry the lane regs in
+                // PhiDest::Vec. Phi-move emission copies
+                // lane-by-lane. No coalescing yet (vec-Phi
+                // coalescing is a later phase).
+                Type::Vec2(_) | Type::Vec3(_) | Type::Vec4(_) => {
+                    let lane_count = match &result.ty {
+                        Type::Vec2(_) => 2usize,
+                        Type::Vec3(_) => 3usize,
+                        Type::Vec4(_) => 4usize,
+                        _ => unreachable!(),
+                    };
+                    let mut lane_regs = Vec::with_capacity(lane_count);
+                    let mut lane_vals = Vec::with_capacity(lane_count);
+                    for _ in 0..lane_count {
+                        let n = free_pool.pop().ok_or_else(||
+                            BackendError::Unsupported(
+                                "out of V-regs allocating vec Phi dest".into()))?;
+                        if n < 16 { used_callee_saved_v = true; }
+                        let v = asm::Vreg(n);
+                        let synth = ValueId(next_synth_id);
+                        next_synth_id += 1;
+                        scalars.insert(synth, v);
+                        lane_regs.push(v);
+                        lane_vals.push(Value { id: synth, ty: Type::F32 });
+                    }
+                    vectors.insert(result.id, lane_vals);
+                    PhiDest::Vec(lane_regs)
+                }
                 other => return Err(BackendError::Unsupported(format!(
                     "Phi of type {other:?} not supported"))),
             };
@@ -540,7 +573,7 @@ fn emit_function(
             for arm in arms {
                 phi_moves.entry((arm.from, *bid))
                     .or_default()
-                    .push((dest, arm.value.id));
+                    .push((dest.clone(), arm.value.id));
 
                 // Decide coalescing for this arm.
                 let src = arm.value.id;
@@ -585,7 +618,9 @@ fn emit_function(
                 // type matches the Phi register class, and
                 // it must go through a coalesce-aware emit
                 // path (emit_fp_binop_poly / emit_int_binop).
-                let op_ok = match dest {
+                // Vec Phis don't coalesce yet — a later
+                // phase.
+                let op_ok = match &dest {
                     PhiDest::Float(_) => matches!(&p.op,
                         Op::FAdd(..) | Op::FSub(..)
                         | Op::FMul(..) | Op::FDiv(..)),
@@ -595,6 +630,7 @@ fn emit_function(
                         | Op::SMod(..) | Op::UMod(..)
                         | Op::BitAnd(..) | Op::BitOr(..) | Op::BitXor(..)
                         | Op::Shl(..) | Op::LShr(..) | Op::AShr(..)),
+                    PhiDest::Vec(_) => false,
                 };
                 if !op_ok { continue; }
                 // `src` single-use (only the phi-move reads it).
@@ -616,7 +652,7 @@ fn emit_function(
                 let read_between = (p_idx + 1..=back_edge_idx)
                     .any(|fi| op_reads(&flat_insts[fi].op, phi_id));
                 if read_between { continue; }
-                coalesce_into.insert(src, dest);
+                coalesce_into.insert(src, dest.clone());
             }
         }
     }
@@ -737,13 +773,13 @@ fn emit_function(
         // dropped below. Split into the V-reg / W-reg forms
         // the two binop emit helpers expect.
         let coalesce_dest: Option<PhiDest> = inst.result.as_ref()
-            .and_then(|r| coalesce_into.get(&r.id).copied());
-        let coalesce_v: Option<asm::Vreg> = match coalesce_dest {
-            Some(PhiDest::Float(v)) => Some(v),
+            .and_then(|r| coalesce_into.get(&r.id).cloned());
+        let coalesce_v: Option<asm::Vreg> = match &coalesce_dest {
+            Some(PhiDest::Float(v)) => Some(*v),
             _ => None,
         };
-        let coalesce_w: Option<asm::Wreg> = match coalesce_dest {
-            Some(PhiDest::Int(w)) => Some(w),
+        let coalesce_w: Option<asm::Wreg> = match &coalesce_dest {
+            Some(PhiDest::Int(w)) => Some(*w),
             _ => None,
         };
 
@@ -1283,6 +1319,35 @@ fn emit_function(
                                         src_id)))?;
                                 a.emit(asm::mov_w(*dw, src));
                             }
+                            PhiDest::Vec(lane_regs) => {
+                                // The arm's source is a vector
+                                // value — copy each lane's
+                                // S-reg into the matching Phi
+                                // lane reg. Same `mov vd.16b`
+                                // per lane as the scalar Float
+                                // case.
+                                let src_lanes = vectors.get(src_id)
+                                    .cloned().ok_or_else(||
+                                    BackendError::Internal(format!(
+                                        "Phi vec source {:?} not in vectors",
+                                        src_id)))?;
+                                if src_lanes.len() != lane_regs.len() {
+                                    return Err(BackendError::Internal(format!(
+                                        "Phi vec arm lane mismatch: {} dest \
+                                         vs {} src", lane_regs.len(),
+                                        src_lanes.len())));
+                                }
+                                for (dv, lane) in lane_regs.iter()
+                                    .zip(src_lanes.iter())
+                                {
+                                    let src = *scalars.get(&lane.id)
+                                        .ok_or_else(||
+                                        BackendError::Internal(format!(
+                                            "Phi vec lane {:?} not in scalars",
+                                            lane.id)))?;
+                                    a.emit(asm::mov_v_16b(*dv, src));
+                                }
+                            }
                         }
                     }
                 }
@@ -1558,14 +1623,23 @@ fn emit_load_f32_offset(
     Ok(())
 }
 
-/// Bump-allocate one W-reg from the int pool (W13..W17).
-/// Destination register for a Phi node. f32 Phis land in
-/// a V-reg (moved with `fmov_s`); i32/u32 Phis land in a
-/// W-reg (moved with `mov_w`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Destination register(s) for a Phi node.
+///
+/// * `Float` — an f32 Phi: one V-reg, moved with the
+///   vector `mov vd.16b` (rename-eliminated; see the
+///   heavy4 fix).
+/// * `Int` — an i32/u32 Phi: one W-reg, moved with `mov w`.
+/// * `Vec` — a vecN-f32 Phi: N V-regs, one per lane,
+///   moved per-lane (the backend stores a vector as a
+///   list of per-lane scalar values, so a vec Phi is just
+///   N scalar Phis travelling together). Not `Copy`
+///   because of the `Vec`; `Clone` + the handful of
+///   `.clone()`s at the build sites is the cost.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum PhiDest {
     Float(asm::Vreg),
     Int(asm::Wreg),
+    Vec(Vec<asm::Vreg>),
 }
 
 /// Linear-scan allocator for the integer W-reg pool
@@ -2090,6 +2164,22 @@ fn compute_last_use_flat(
             last_use.entry(value_id)
                 .and_modify(|e| *e = (*e).max(term))
                 .or_insert(term);
+            // A vector phi arm (e.g. a `ConstVec` initial
+            // value on the entry edge) doesn't own a reg
+            // itself — its per-lane scalar values do. The
+            // vec-Phi phi-move reads each lane reg at the
+            // predecessor's terminator, so each lane's live
+            // range must reach there too; without this the
+            // linear-scan recycles a lane's constant reg
+            // before the entry→header phi-move copies it.
+            if let Some(lanes) = vec_lanes.get(&value_id).cloned() {
+                for lid in lanes {
+                    *use_counts.entry(lid).or_insert(0) += 1;
+                    last_use.entry(lid)
+                        .and_modify(|e| *e = (*e).max(term))
+                        .or_insert(term);
+                }
+            }
         }
     }
 

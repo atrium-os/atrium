@@ -816,6 +816,98 @@ fn build_heavy4_shader() -> Vec<u8> {
     bytes
 }
 
+/// Vector-carrying loop: a `vec4` accumulator threaded
+/// through a counted loop's `OpPhi`.
+///
+///   v = vec4(0.5, 0.25, 0.125, 0.0625);
+///   for i in 0..n: v = v * 0.99 + bias;   // bias = (.001,.002,.003,.004)
+///   out = v;
+///
+/// This is the shape the bespoke backend's vec-Phi support
+/// unlocks — before it, any loop carrying a vector value
+/// fell back to Cranelift wholesale. The contractive
+/// `v*0.99 + bias` keeps every lane bounded for any `n`.
+/// Three-way bit-exact gates the per-lane phi-move codegen
+/// against the interpreter oracle.
+fn build_heavyvec_shader() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, LoopControl, MemoryModel,
+        StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let f32_ty = b.type_float(32, None);
+    let i32_ty = b.type_int(32, 1);
+    let bool_ty = b.type_bool();
+    let vec4 = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let pc_struct = b.type_struct(vec![i32_ty]);
+    b.member_decorate(pc_struct, 0, Decoration::Offset,
+                      vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(pc_struct, Decoration::Block, vec![]);
+    let ptr_pc_struct = b.type_pointer(None, StorageClass::PushConstant, pc_struct);
+    let ptr_pc_i32    = b.type_pointer(None, StorageClass::PushConstant, i32_ty);
+    let ptr_out       = b.type_pointer(None, StorageClass::Output, vec4);
+    let zero_i = b.constant_bit32(i32_ty, 0u32);
+    let one_i  = b.constant_bit32(i32_ty, 1u32);
+    let f = |b: &mut rspirv::dr::Builder, x: f32|
+        b.constant_bit32(f32_ty, x.to_bits());
+    let v0_x = f(&mut b, 0.5);   let v0_y = f(&mut b, 0.25);
+    let v0_z = f(&mut b, 0.125); let v0_w = f(&mut b, 0.0625);
+    let v0 = b.constant_composite(vec4, vec![v0_x, v0_y, v0_z, v0_w]);
+    let k99 = f(&mut b, 0.99);
+    let kvec = b.constant_composite(vec4, vec![k99, k99, k99, k99]);
+    let b_x = f(&mut b, 0.001); let b_y = f(&mut b, 0.002);
+    let b_z = f(&mut b, 0.003); let b_w = f(&mut b, 0.004);
+    let bias = b.constant_composite(vec4, vec![b_x, b_y, b_z, b_w]);
+    let pc_var = b.variable(ptr_pc_struct, None, StorageClass::PushConstant, None);
+    let out = b.variable(ptr_out, None, StorageClass::Output, None);
+    b.decorate(out, Decoration::Location,
+               vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    let entry_id  = b.id();
+    let header_id = b.id();
+    let body_id   = b.id();
+    let cont_id   = b.id();
+    let merge_id  = b.id();
+    let i_next = b.id();
+    let v_next = b.id();
+    b.begin_block(Some(entry_id)).unwrap();
+    let p = b.access_chain(ptr_pc_i32, None, pc_var, vec![zero_i]).unwrap();
+    let n = b.load(i32_ty, None, p, None, vec![]).unwrap();
+    b.branch(header_id).unwrap();
+    b.begin_block(Some(header_id)).unwrap();
+    let i_phi = b.phi(i32_ty, None,
+        vec![(zero_i, entry_id), (i_next, cont_id)]).unwrap();
+    let v_phi = b.phi(vec4, None,
+        vec![(v0, entry_id), (v_next, cont_id)]).unwrap();
+    let cond = b.s_less_than(bool_ty, None, i_phi, n).unwrap();
+    b.loop_merge(merge_id, cont_id, LoopControl::NONE, vec![]).unwrap();
+    b.branch_conditional(cond, body_id, merge_id, vec![]).unwrap();
+    b.begin_block(Some(body_id)).unwrap();
+    let scaled = b.f_mul(vec4, None, v_phi, kvec).unwrap();
+    let _v_n   = b.f_add(vec4, Some(v_next), scaled, bias).unwrap();
+    b.branch(cont_id).unwrap();
+    b.begin_block(Some(cont_id)).unwrap();
+    b.i_add(i32_ty, Some(i_next), i_phi, one_i).unwrap();
+    b.branch(header_id).unwrap();
+    b.begin_block(Some(merge_id)).unwrap();
+    b.store(out, v_phi, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![out]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
 /// OpSelect with scalar cond + vec4 t/f operands.
 /// out = (scale < 0.5) ? red_vec : blue_vec
 fn build_vec_select_shader() -> Vec<u8> {
@@ -1302,6 +1394,22 @@ fn three_way_heavy4() {
     let spirv = build_heavy4_shader();
     let mut inputs = ShaderInputs::default();
     let n: i32 = 32;
+    inputs.push_constants[..4].copy_from_slice(&n.to_le_bytes());
+    let rs = runners();
+    let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
+    assert_shader_agrees_all(&spirv, &inputs, ColorTolerance::Exact, &refs);
+}
+
+#[test]
+fn three_way_heavyvec() {
+    // A `vec4` accumulator carried through a counted loop's
+    // OpPhi — the shape the bespoke backend's vec-Phi
+    // support unlocks (before it, any vector-carrying loop
+    // fell back to Cranelift). All three runners must agree
+    // bit-exact, gating the per-lane phi-move codegen.
+    let spirv = build_heavyvec_shader();
+    let mut inputs = ShaderInputs::default();
+    let n: i32 = 16;
     inputs.push_constants[..4].copy_from_slice(&n.to_le_bytes());
     let rs = runners();
     let refs: Vec<&dyn ShaderRunner> = rs.iter().map(|b| b.as_ref()).collect();
