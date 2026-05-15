@@ -2823,11 +2823,64 @@ still wants the existing per-S-reg path.
    the arc closes the *categorical* per-call setup cost
    cleanly (proved by `vecarith` + disasm); the
    loop-amortised `heavyvec` shape was never going to
-   move much from this lever. Closing the `heavyvec` 23%
-   tail is a separate (small) inquiry — likely the entry-
-   edge `mov v.16b` for the initial Phi value, since the
-   loop body itself is already at clang's unfused
-   `.4s` 4-instruction shape.
+   move much from this lever.
+
+#### `heavyvec` tail inquiry — loop rotation is the lever
+
+Disassembled `clang -O2 -ffp-contract=off` of
+`native/heavyvec.c` to see exactly what shape we're
+chasing. The body:
+
+```
+loop:
+  fmul v0.4s, v0.4s, v1.4s
+  subs w8, w8, #1            ; combined sub + flag-set
+  fadd v0.4s, v0.4s, v2.4s
+  b.ne loop
+```
+
+**4 instructions per iteration.** Bespoke's loop body is
+6:
+
+```
+  cmp  w13, w15              ; top-tested compare-against-n
+  b.lt body
+  b    exit
+body:
+  fmul v.4s
+  fadd v.4s
+  add  w13, w13, #1          ; increment counter
+  b    loop                  ; back-edge
+```
+
+Three structural differences:
+1. **Bottom-tested vs top-tested.** clang puts the branch
+   at the end of the body; bespoke puts the compare at
+   the top + an unconditional back-edge. Two-versus-one
+   branch per iter, plus the loop-entry skip-check (bespoke
+   even adds an unconditional `b exit` after the `b.lt`,
+   though that one runs only once).
+2. **`subs` instead of `add` + `cmp`.** clang decrements
+   the counter *to zero* and uses the flag side-effect of
+   `subs` to drive `b.ne`. Bespoke increments and
+   separately compares against `n`. Saves one instruction
+   per iter.
+3. **No 9-NOP prologue.** clang's preamble has 0 NOPs
+   because it knows it uses no callee-saved regs. Bespoke
+   reserves the prologue NOP slots before knowing whether
+   any callee-saved bank will get touched; for `heavyvec`
+   (V16-V19 only — all caller-saved) the 9 NOPs stay as
+   NOPs, ~9 free-but-not-free cycles per call.
+
+The 2-instruction-per-iter delta × 256 iters explains the
+gap. So the residual `heavyvec` tail is **loop rotation +
+loop-counter strength-reduction to a `subs`-driven
+countdown**. Not a peephole — a structural codegen
+change. Shared-absent in Cranelift too (bespoke matches
+its 6-inst body), so closing this is another category-
+shared optimisation, like loop-idiom recognition. Scoped
+as a *separate* arc when it becomes the bottleneck on a
+real shader workload, not chased speculatively.
 
 #### Compile-pipeline phase breakdown — `cc` is the cost
 
