@@ -253,21 +253,14 @@ fn build_tinted_sample_shader() -> Vec<u8> {
     bytes
 }
 
-// `texture_sample_tinted` — the cross-call save/restore
-// gate — is staged but currently disabled because it
-// exposes an *unrelated* pre-existing regalloc bug:
-// `V16` gets reallocated to a second constant while the
-// first is still live, which only matters when a shader
-// has multiple constants live across an ImageSample. The
-// cross-call save/restore code in the bespoke backend
-// is itself correct — the simple `texture_sample_centre_rgbw`
-// + the in-VM `texsample` shader both exercise it
-// (with `n_spill = 0`) — but until the regalloc bug is
-// resolved the tinted shader fails non-deterministically.
-// Tracked as a follow-on.
-#[ignore = "exposes a pre-existing regalloc bug (V-reg \
-            re-allocation across hoisted constants); unblock \
-            once that's fixed, then re-enable"]
+/// `texture_sample_tinted` — exercises the cross-call
+/// save/restore by carrying a tint vec4 across the
+/// `ImageSample`. The tint lanes are live across `blr` to
+/// `atrium_tex_sample_2d`; the bespoke spill/reload
+/// preserves them. Also covers the `last_use` fix for
+/// ImageSample's coord-lane propagation — without it
+/// `c_quarter`'s V-reg would be recycled before the
+/// sample reads it, clobbering the uv argument.
 #[test]
 fn texture_sample_tinted() {
     // Same 2x2 RGBW checker + Nearest/Clamp sampler. At

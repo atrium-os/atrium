@@ -2680,6 +2680,45 @@ fn compute_last_use_flat(
                     for lid in &lane_ids { mark(*lid); }
                 }
             }
+            // Image sample / fetch: the coord operand (a
+            // vec) is read at this op's index; propagate to
+            // its per-lane scalars so the lane V-regs don't
+            // expire early. Without this, a ConstFloat that
+            // only feeds a `texture()` call's coord
+            // (e.g. `c_quarter` shared by both `uv`'s lanes)
+            // would have its `last_use` set only to the
+            // *ConstVec*'s index — leaving the regalloc free
+            // to reuse its V-reg from the *next* inst on,
+            // even though `ImageSample` still needs to read
+            // it. (The bug `texture_sample_tinted` was
+            // staged to catch.)
+            Op::ImageSampleImplicitLod { sampled_image, coord } => {
+                mark(sampled_image.id);
+                mark(coord.id);
+                if let Some(lane_ids) = vec_lanes.get(&coord.id).cloned() {
+                    for lid in &lane_ids { mark(*lid); }
+                }
+            }
+            Op::ImageSampleExplicitLod { sampled_image, coord, lod } => {
+                mark(sampled_image.id);
+                mark(coord.id);
+                mark(lod.id);
+                if let Some(lane_ids) = vec_lanes.get(&coord.id).cloned() {
+                    for lid in &lane_ids { mark(*lid); }
+                }
+            }
+            Op::ImageFetch { image, coord, lod } => {
+                mark(image.id);
+                mark(coord.id);
+                if let Some(l) = lod { mark(l.id); }
+                if let Some(lane_ids) = vec_lanes.get(&coord.id).cloned() {
+                    for lid in &lane_ids { mark(*lid); }
+                }
+            }
+            Op::CombineSampledImage { image, sampler } => {
+                mark(image.id);
+                mark(sampler.id);
+            }
             _ => {}
         }
     }

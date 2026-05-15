@@ -147,23 +147,6 @@ fn translate_one(
     {
         // Collect ids first to avoid borrowing `constants`
         // while we recurse into resolve_value.
-        //
-        // NOTE: iteration order is non-deterministic
-        // (`constants` is a `HashMap`). For shaders with
-        // arithmetic that uses a constant *after* an
-        // `OpImageSampleImplicitLod`, the resulting
-        // V-reg-allocation order in the bespoke backend can
-        // race in ways that visibly fail. Sorting by id
-        // *or* preserving insertion order (an `IndexMap`)
-        // is the obvious fix; both surface the same
-        // dormant regalloc bug — V-reg `V16` getting
-        // reallocated to a second constant while the first
-        // is still live — which the test
-        // `texture_sample_tinted` exposed. Tracked as a
-        // follow-on so the texture arc itself stays
-        // committable; flakiness here was bypassed for the
-        // committed corpus by carefully constructing
-        // shaders whose dependency shape doesn't trip it.
         let const_ids: Vec<Word> = constants.iter().map(|(id, _)| *id).collect();
         for cid in const_ids {
             // Use offset 0 — these instructions don't map

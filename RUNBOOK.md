@@ -3082,11 +3082,25 @@ extends the `atrium-spv-blob` format slightly — a
    ConstFloat gets its V-reg reallocated to a second
    ConstFloat while the first is still live, so the
    sample's u/v end up reading a clobbered constant.
-   The bug is independent of the cross-call work (it
-   reproduces without the spill code too — the spill
-   code itself disasm-verifies correct). Tracked as a
-   follow-on; the tinted test is `#[ignore]`-staged so
-   it lights up the moment regalloc is fixed.
+
+   **Fix landed.** Root cause: `compute_last_use_flat`'s
+   catch-all `_ => {}` arm captured `Op::ImageSample*` /
+   `Op::ImageFetch` / `Op::CombineSampledImage`, so the
+   coord operand's *per-lane scalars* — the V-regs the
+   sample call site actually reads via
+   `scalars[coord_lane.id]` — were never marked at the
+   ImageSample's index. A ConstFloat that only fed a
+   sampler's `uv` (like `c_quarter` shared between
+   `uv`'s two lanes) had its `last_use` set only at the
+   ConstVec emit, so the linear-scan recycled its V-reg
+   on the very next inst, even though `ImageSample`
+   downstream still needed it. Added explicit arms for
+   the four image ops that mark `coord.id`, propagate to
+   `vec_lanes[coord]`, and mark `sampled_image.id` /
+   `lod.id` / `image.id` / `sampler.id` where present.
+   `texture_sample_tinted` re-enabled and now passes
+   5/5 across parallel runs alongside the 26-shader
+   three_way diff.
 6. **✅ done.** In-VM `texsample` shader added to
    `run-in-vm.sh`. The harness's `texsample` mode builds
    a 2×2 RGBW texture + Nearest/Clamp sampler in C,
