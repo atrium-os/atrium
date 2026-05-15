@@ -270,6 +270,13 @@ fn emit_function(
     // in *either* `vectors` (per-lane) or `packed`, never
     // both — the NEON-pack classifier (below) decides.
     let mut packed: HashMap<ValueId, asm::Vreg> = HashMap::new();
+    // IR Value (image / sampler / sampled-image handle) →
+    // the SPIR-V `(DescriptorSet, Binding)` it represents.
+    // Set by `Op::ImageHandle`; propagated unchanged by
+    // `Op::CombineSampledImage`; consumed by image-sample
+    // codegen to compute the v1-ABI descriptor-table offset
+    // (matches the side-table the Cranelift backend uses).
+    let mut image_handles: HashMap<ValueId, (u32, u32)> = HashMap::new();
     // Pointer-typed Values: (base X-reg, byte offset).
     let mut pointers: HashMap<ValueId, (asm::Xreg, i32)> = HashMap::new();
     // Bool-typed Values (results of FOrd*/FUnord*): held
@@ -1731,6 +1738,180 @@ fn emit_function(
                     a.emit(asm::b(0));
                     branch_relocs.push((patch_f, *f_block));
                 }
+            }
+            // ── Image / sampler ────────────────────────────
+            //
+            // ImageHandle / CombineSampledImage emit zero
+            // native instructions — they're metadata-only,
+            // tracking the (set, binding) so the eventual
+            // ImageSample call site can compute the v1-ABI
+            // descriptor-table offset.
+            Op::ImageHandle { set, binding } => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "ImageHandle without result".into()))?;
+                image_handles.insert(result.id, (*set, *binding));
+            }
+            Op::CombineSampledImage { image, sampler: _ } => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "CombineSampledImage without result".into()))?;
+                let h = image_handles.get(&image.id).copied()
+                    .ok_or_else(|| BackendError::Internal(format!(
+                        "CombineSampledImage image operand {:?} not an \
+                         ImageHandle", image.id)))?;
+                image_handles.insert(result.id, h);
+            }
+            // ImageSampleImplicitLod: emit the v1-ABI call
+            // sequence into atrium_tex_sample_2d. The shader
+            // ABI keeps `uniforms` in X1; the v1 descriptor
+            // table puts the helper fn-ptr at [X1, #0] and
+            // the descriptor pair for binding B at
+            // [X1, #UNIFORMS_DESC_BASE + B*16 + {0,8}].
+            //
+            //   sub  sp, sp, #32         ; reserve 16 for
+            //                            ; out_rgba + 16 for
+            //                            ; saved X4 (the call
+            //                            ; is AAPCS64 — X4 is
+            //                            ; caller-saved and
+            //                            ; X4 is the shader's
+            //                            ; out_color pointer
+            //                            ; which Store needs
+            //                            ; later).
+            //   str  x4, [sp, #16]
+            //   ldr  x9,  [x1, #0]       ; helper fn ptr
+            //   ldr  x10, [x1, #16+B*16] ; tex_desc*
+            //   ldr  x11, [x1, #...+8]   ; samp_desc*
+            //   <move u, v into V2,V1 then into V0,V1 in
+            //    parallel-copy-safe order>
+            //   mov  x0, x10
+            //   mov  x1, x11             ; clobbers uniforms
+            //                            ; (only out_color is
+            //                            ; needed after)
+            //   mov  x2, sp              ; out_rgba ptr
+            //   blr  x9
+            //   ldr  w9, [sp, #0..#12]   ; lane bytes
+            //     + fmov_s_from_w into each lane V-reg
+            //   ldr  x4, [sp, #16]       ; restore out_color
+            //   add  sp, sp, #32
+            //
+            // v1 limitation — V-regs are caller-saved per
+            // AAPCS64 (V16..V31; V8..V15 lower 64 bits are
+            // callee-saved) and the call clobbers them. The
+            // test shader here doesn't have other live V-reg
+            // values across the call so this works; a real
+            // shader with values live across an ImageSample
+            // needs proper save/restore (a later phase).
+            Op::ImageSampleImplicitLod { sampled_image, coord } => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "ImageSampleImplicitLod without result".into()))?;
+                let (_, binding) = image_handles.get(&sampled_image.id)
+                    .copied()
+                    .ok_or_else(|| BackendError::Internal(format!(
+                        "ImageSampleImplicitLod sampled_image {:?} not an \
+                         ImageHandle", sampled_image.id)))?;
+                let coord_lanes = vectors.get(&coord.id).cloned()
+                    .ok_or_else(|| BackendError::Internal(format!(
+                        "ImageSampleImplicitLod coord {:?} not a vector",
+                        coord.id)))?;
+                if coord_lanes.len() < 2 {
+                    return Err(BackendError::Unsupported(format!(
+                        "ImageSampleImplicitLod 2D coord must have ≥2 lanes, \
+                         got {}", coord_lanes.len())));
+                }
+                let u_v = *scalars.get(&coord_lanes[0].id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "ImageSampleImplicitLod coord lane 0 {:?} not in scalars",
+                        coord_lanes[0].id)))?;
+                let v_v = *scalars.get(&coord_lanes[1].id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "ImageSampleImplicitLod coord lane 1 {:?} not in scalars",
+                        coord_lanes[1].id)))?;
+                // Allocate four result-lane V-regs *before*
+                // emitting the call. They're caller-saved
+                // (V16..V31) but not live until we write
+                // them with the post-call ldr/fmov, so the
+                // clobber-by-blr is harmless.
+                let mut lane_regs: Vec<asm::Vreg> = Vec::with_capacity(4);
+                let mut lane_vals: Vec<Value> = Vec::with_capacity(4);
+                for _ in 0..4 {
+                    let synth = ValueId(next_synth_id);
+                    next_synth_id += 1;
+                    let r = alloc_vreg(&mut free_pool, &mut owners,
+                        &mut used_callee_saved_v, synth)?;
+                    scalars.insert(synth, r);
+                    lane_regs.push(r);
+                    lane_vals.push(Value { id: synth, ty: Type::F32 });
+                }
+
+                let sp = asm::Xreg(31);
+                let x0 = asm::Xreg(0);
+                let x1 = asm::Xreg(1);
+                let x2 = asm::Xreg(2);
+                let x9 = asm::Xreg(9);
+                let x10 = asm::Xreg(10);
+                let x11 = asm::Xreg(11);
+                let v0 = asm::Vreg(0);
+                let v1 = asm::Vreg(1);
+                let v2 = asm::Vreg(2); // parallel-copy temp
+                let desc_off: u16 = 16 + (binding as u16) * 16;
+
+                // Reserve stack:
+                //   [sp +  0..16]: out_rgba result slot
+                //   [sp + 16..24]: saved X4 (out_color)
+                //   [sp + 24..32]: saved X30 (link register)
+                // SP stays 16-byte aligned. LR save is
+                // critical: `blr` clobbers X30, and the
+                // function's eventual `ret` reads it; without
+                // this the function returns to a stale LR
+                // and segfaults at the caller boundary. The
+                // bespoke backend's existing prologue doesn't
+                // save LR because non-image shaders make no
+                // function calls — image sample is the first
+                // op that does.
+                let lr = asm::Xreg(30);
+                a.emit(asm::sub_imm_x(sp, sp, 32));
+                a.emit(asm::str_x_offset(x_out, sp, 16));
+                a.emit(asm::str_x_offset(lr, sp, 24));
+
+                // Load descriptor pointers + helper.
+                a.emit(asm::ldr_x_offset(x9, x1, 0));
+                a.emit(asm::ldr_x_offset(x10, x1, desc_off));
+                a.emit(asm::ldr_x_offset(x11, x1, desc_off + 8));
+
+                // u, v → V0, V1, parallel-copy safe via V2
+                // (a fresh caller-saved scratch outside our
+                // pool). Equivalent to:
+                //   tmp = u; v1 = v; v0 = tmp
+                a.emit(asm::mov_v_16b(v2, u_v));
+                a.emit(asm::mov_v_16b(v1, v_v));
+                a.emit(asm::mov_v_16b(v0, v2));
+
+                // Pointer args + call. Note: `mov` from SP
+                // is a different ARM64 alias than reg→reg
+                // (the plain `MOV` alias is `ORR <Xd>, XZR,
+                // <Xm>`, which treats reg 31 as XZR not SP).
+                // For `x2 = sp` we use `add x2, sp, #0` —
+                // the canonical SP-friendly MOV alias.
+                a.emit(asm::mov_x(x0, x10));
+                a.emit(asm::mov_x(x1, x11));
+                a.emit(asm::add_imm_x(x2, sp, 0));
+                a.emit(asm::blr_x(x9));
+
+                // Read result lanes back out of the stack
+                // slot (`ldr w9, [sp, #off]; fmov s_lane, w9`).
+                for (i, lane) in lane_regs.iter().enumerate() {
+                    a.emit(asm::ldr_w_offset(w_tmp, sp, (i as u16) * 4));
+                    a.emit(asm::fmov_s_from_w(*lane, w_tmp));
+                }
+
+                // Restore X4 (out_color) + X30 (LR); drop stack.
+                a.emit(asm::ldr_x_offset(x_out, sp, 16));
+                a.emit(asm::ldr_x_offset(lr, sp, 24));
+                a.emit(asm::add_imm_x(sp, sp, 32));
+
+                vectors.insert(result.id, lane_vals);
             }
             other => {
                 return Err(BackendError::Unsupported(format!(

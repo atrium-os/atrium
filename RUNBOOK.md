@@ -3025,13 +3025,43 @@ extends the `atrium-spv-blob` format slightly — a
    descriptor-table register (X6) land later when a real
    shader needs both descriptors and a regular uniform
    block in the same invocation.
-5. Bespoke backend: same call shape, but the JIT-emit
-   blob path needs the new "runtime imports" table in
-   `atrium-spv-blob` + a loader-time pointer patch.
-   The object-path (`compile()` → ELF/Mach-O) already
-   produces a normal symbol-relocated `BL` via `pptk`'s
-   existing emit pipeline, so that path is cheap; the
-   JIT-emit path is the substantive work.
+5. **✅ done.** Bespoke backend. Same v1 ABI as Cranelift:
+   `image_handles` side table populated by `Op::ImageHandle`
+   + propagated by `Op::CombineSampledImage`;
+   `Op::ImageSampleImplicitLod` emits the descriptor +
+   indirect-call sequence directly (sub sp, str x4, str x30,
+   ldr x9/x10/x11, parallel-copy u/v through V2→V0/V1,
+   mov x0/x1, add x2,sp,#0, blr x9, ldr lanes from stack,
+   restore x4/x30, add sp). Because the descriptor ABI is
+   already reloc-free (call-via-pointer), no
+   `atrium-spv-blob` runtime-imports table was needed —
+   the same byte pattern works for both the
+   `compile()`-object path and the JIT-emit blob path.
+
+   One bug found+fixed during bring-up: the bespoke
+   backend's existing prologue doesn't save the link
+   register (X30) because no prior shader made a function
+   call. ImageSampleImplicitLod is the first op that does,
+   and `blr` clobbers X30; the eventual `ret` reads it
+   back as the return address, so without saving LR the
+   function returns to a stale address and segfaults at
+   the caller boundary. Fix: save+restore X30 alongside
+   X4 in the call's stack frame.
+
+   Gate: `texture_sample_centre_rgbw` now passes with all
+   three runners (interpreter, Cranelift, bespoke) bit-
+   tolerant agreeing on `(0.5, 0.5, 0.5, 1.0)`. Full diff
+   26/26 + bespoke unit 7+4 + new texture diff 1, all
+   green.
+
+   *v1 limitation* — V-regs are caller-saved per AAPCS64
+   (V16..V31; V8..V15 lower 64 bits callee-saved) and
+   `blr` clobbers them. The test shader doesn't have
+   values live across the call so the present codegen
+   works; a real shader with V-reg values live across an
+   `ImageSample` needs proper save/restore or a regalloc
+   that forces V8..V15 across calls. Scoped as a follow-
+   on when a non-trivial textured shader trips it.
 6. In-VM: a `tex_sample` shader added to `run-in-vm.sh`
    with a host-shipped texture blob. The first real-
    shader-shape end-to-end test on FreeBSD aarch64.

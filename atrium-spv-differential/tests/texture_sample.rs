@@ -25,7 +25,7 @@ use atrium_spv_tests::harness::{
 };
 use atrium_spv_tests::interpreter::{ShaderInputs, TextureBinding};
 
-use atrium_spv_differential::CraneliftRunner;
+use atrium_spv_differential::{BespokeRunner, CraneliftRunner};
 
 fn build_sample_centre_shader() -> Vec<u8> {
     use rspirv::binary::Assemble;
@@ -145,9 +145,11 @@ fn texture_sample_centre_rgbw() {
     };
 
     let spirv = build_sample_centre_shader();
-    let runners: [Box<dyn ShaderRunner>; 2] = [
+
+    let runners: [Box<dyn ShaderRunner>; 3] = [
         Box::new(InterpreterRunner),
         Box::new(CraneliftRunner::default()),
+        Box::new(BespokeRunner::default()),
     ];
     let refs: Vec<&dyn ShaderRunner> =
         runners.iter().map(|b| b.as_ref()).collect();
