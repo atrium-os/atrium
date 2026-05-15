@@ -976,6 +976,106 @@ fn translate_inst(
             Ok(())
         }
 
+        // OpSampledImage: bundle an already-loaded image
+        // value and an already-loaded sampler value into a
+        // SampledImage value (no native instructions; the
+        // backend just tracks the pair). The result type
+        // must be a Type::SampledImage(dim).
+        SpvOp::SampledImage => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed(
+                    "SampledImage without result id".to_string()))?;
+            let result_type_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed(
+                    "SampledImage without result type".to_string()))?;
+            let result_ty = types.get(result_type_id)?.clone();
+            let img_id = expect_id(&spv_inst.operands, 0)?;
+            let samp_id = expect_id(&spv_inst.operands, 1)?;
+            let image = id_map.get(&img_id).cloned().ok_or_else(||
+                FrontendError::Malformed(format!(
+                    "SampledImage image operand id {img_id} not yet defined")))?;
+            let sampler = id_map.get(&samp_id).cloned().ok_or_else(||
+                FrontendError::Malformed(format!(
+                    "SampledImage sampler operand id {samp_id} not yet defined")))?;
+            let result = alloc_or_get_result(result_id, result_ty, id_map, next_value_id);
+            insts.push(Inst {
+                op: Op::CombineSampledImage { image, sampler },
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
+
+        // OpImageSampleImplicitLod / ExplicitLod: filtered
+        // texture sample. The first operand is a
+        // SampledImage value (produced by OpSampledImage),
+        // the second is the UV coord; ExplicitLod takes a
+        // mip-level as operand 2.
+        SpvOp::ImageSampleImplicitLod | SpvOp::ImageSampleExplicitLod => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed(
+                    "ImageSample without result id".to_string()))?;
+            let result_type_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed(
+                    "ImageSample without result type".to_string()))?;
+            let result_ty = types.get(result_type_id)?.clone();
+            let si_id = expect_id(&spv_inst.operands, 0)?;
+            let coord_id = expect_id(&spv_inst.operands, 1)?;
+            let sampled_image = id_map.get(&si_id).cloned().ok_or_else(||
+                FrontendError::Malformed(format!(
+                    "ImageSample sampled_image id {si_id} not yet defined")))?;
+            let coord = id_map.get(&coord_id).cloned().ok_or_else(||
+                FrontendError::Malformed(format!(
+                    "ImageSample coord id {coord_id} not yet defined")))?;
+            let op = if spv_inst.class.opcode == SpvOp::ImageSampleExplicitLod {
+                let lod_id = expect_id(&spv_inst.operands, 2)?;
+                let lod = id_map.get(&lod_id).cloned().ok_or_else(||
+                    FrontendError::Malformed(format!(
+                        "ImageSampleExplicitLod lod id {lod_id} not yet defined")))?;
+                Op::ImageSampleExplicitLod { sampled_image, coord, lod }
+            } else {
+                Op::ImageSampleImplicitLod { sampled_image, coord }
+            };
+            let result = alloc_or_get_result(result_id, result_ty, id_map, next_value_id);
+            insts.push(Inst { op, result: Some(result), source_spirv_offset });
+            Ok(())
+        }
+
+        // OpImageFetch: unfiltered integer-coord texel
+        // load. First operand is an image (not a sampled-
+        // image — fetch doesn't use the sampler), second is
+        // the integer coord. Optional Lod via the Image
+        // Operands mask is read from operand index 2+.
+        SpvOp::ImageFetch => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed(
+                    "ImageFetch without result id".to_string()))?;
+            let result_type_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed(
+                    "ImageFetch without result type".to_string()))?;
+            let result_ty = types.get(result_type_id)?.clone();
+            let img_id = expect_id(&spv_inst.operands, 0)?;
+            let coord_id = expect_id(&spv_inst.operands, 1)?;
+            let image = id_map.get(&img_id).cloned().ok_or_else(||
+                FrontendError::Malformed(format!(
+                    "ImageFetch image id {img_id} not yet defined")))?;
+            let coord = id_map.get(&coord_id).cloned().ok_or_else(||
+                FrontendError::Malformed(format!(
+                    "ImageFetch coord id {coord_id} not yet defined")))?;
+            // ImageFetch operand 2 (if present) is an Image
+            // Operands mask; we don't decode it yet — the
+            // runtime helper ignores `lod` in v1, so we pass
+            // None unconditionally.
+            let lod = None;
+            let result = alloc_or_get_result(result_id, result_ty, id_map, next_value_id);
+            insts.push(Inst {
+                op: Op::ImageFetch { image, coord, lod },
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
+
         other => Err(FrontendError::Unsupported(format!(
             "opcode {other:?} not supported in phase 1 v3",
         ))),

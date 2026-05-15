@@ -2904,12 +2904,29 @@ extends the `atrium-spv-blob` format slightly — a
    R8 replication, and all three wrap modes (positive +
    negative + full period). No dependencies (pure compute
    over raw byte buffers).
-1. Frontend: SPIR-V `OpTypeImage`/`OpTypeSampler`/
-   `OpTypeSampledImage`/`OpSampledImage`/`OpImage*` →
-   the existing IR Op variants. Binding metadata: each
-   SPIR-V variable's binding number flows through into
-   the IR so backends know which descriptor slot to
-   load.
+1. **✅ done.** Frontend: SPIR-V `OpSampledImage` /
+   `OpImageSampleImplicitLod` / `OpImageSampleExplicitLod`
+   / `OpImageFetch` lower into IR `Op` variants. Added
+   `Op::CombineSampledImage { image, sampler }` (the IR
+   was missing the combiner — only the sample/fetch ops
+   existed). Added `StorageClass::UniformConstant` for
+   image/sampler descriptor variables. The image/sampler
+   `OpLoad`s flow through the existing `Op::Load` path
+   opaquely — backends resolve descriptor handles from
+   the variable identity at the sample call site, not
+   from any loaded "value" (the load is a no-op handle
+   alias in this model). Two frontend tests
+   (`tests/image_sample.rs`): GLSL-style combined
+   `sampler2D` shape (single `OpTypeSampledImage`
+   variable + `OpLoad` of the sampled-image) and the
+   Vulkan-native split shape (separate `image2D` +
+   `sampler` variables joined via `OpSampledImage` at
+   the use site). Both lower to `Op::ImageSampleImplicitLod`;
+   the split form additionally produces
+   `Op::CombineSampledImage`. Bindings flow through
+   variable identity, not yet through an explicit
+   binding-number IR field — phase 4/5 will surface that
+   when backends need it.
 2. Interpreter (in `atrium-spv-tests`): a sampler-aware
    `ImageSampleImplicitLod`/`ImageFetch` handler that
    reads descriptors from a host-side `ShaderInputs`

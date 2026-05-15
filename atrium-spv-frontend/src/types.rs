@@ -236,6 +236,7 @@ pub(crate) fn translate_storage(sc: SpvStorageClass) -> Result<StorageClass, Fro
         SpvStorageClass::Input         => Ok(StorageClass::Input),
         SpvStorageClass::Output        => Ok(StorageClass::Output),
         SpvStorageClass::Uniform       => Ok(StorageClass::Uniform),
+        SpvStorageClass::UniformConstant => Ok(StorageClass::UniformConstant),
         SpvStorageClass::StorageBuffer => Ok(StorageClass::StorageBuffer),
         SpvStorageClass::PushConstant  => Ok(StorageClass::PushConstant),
         SpvStorageClass::Function      => Ok(StorageClass::Function),

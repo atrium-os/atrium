@@ -161,6 +161,12 @@ pub enum StorageClass {
     Output,
     /// Uniform descriptor block.
     Uniform,
+    /// Read-only descriptor binding for "opaque" handles
+    /// (images, samplers, sampled-images). SPIR-V's
+    /// `UniformConstant` — these don't carry block data;
+    /// the pointer is a descriptor reference resolved by
+    /// the runtime, not a loadable memory address.
+    UniformConstant,
     /// Storage descriptor block (read-write).
     StorageBuffer,
     /// Push-constant block (capped at 128 bytes).
@@ -532,6 +538,20 @@ pub enum Op {
     // backend emits the call sequence; the runtime kernel
     // does the actual filtered sample.
 
+    /// Combine an image binding and a sampler binding into
+    /// a sampled-image value (SPIR-V `OpSampledImage`).
+    /// Both operands are descriptor references — produced
+    /// by `Op::Load` through an image/sampler variable —
+    /// and the result is a `Type::SampledImage(dim)` that
+    /// feeds `ImageSample*`. No native instructions are
+    /// emitted: a backend just tracks the pair so it can
+    /// resolve both descriptors at the sample call site.
+    CombineSampledImage {
+        /// Image binding (descriptor reference).
+        image: Value,
+        /// Sampler binding (descriptor reference).
+        sampler: Value,
+    },
     /// Sample an image with implicit LOD computation from
     /// fragment derivatives (fragment shader only).
     ImageSampleImplicitLod {
