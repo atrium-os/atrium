@@ -293,8 +293,8 @@ impl Interpreter {
 
         let n = inputs.varyings_per_invocation.len().max(1);
         let mut pixels = Vec::with_capacity(n);
-        for _ in 0..n {
-            let pixel = self.eval_fragment_invocation(entry, inputs)?;
+        for i in 0..n {
+            let pixel = self.eval_fragment_invocation(entry, inputs, i)?;
             pixels.push(pixel);
         }
         Ok(ShaderOutputs { pixels })
@@ -318,8 +318,8 @@ impl Interpreter {
             .ok_or(InterpError::NoEntryPoint("Vertex"))?;
         let n = inputs.vertex_attributes_per_invocation.len().max(1);
         let mut positions = Vec::with_capacity(n);
-        for _ in 0..n {
-            let pos = self.eval_vertex_invocation(entry, inputs)?;
+        for i in 0..n {
+            let pos = self.eval_vertex_invocation(entry, inputs, i)?;
             positions.push(pos);
         }
         Ok(VertexOutputs { positions })
@@ -558,6 +558,7 @@ impl Interpreter {
         &self,
         entry: Word,
         inputs: &ShaderInputs,
+        inv_idx: usize,
     ) -> Result<RgbaF32, InterpError> {
         let func = self.module.functions.iter()
             .find(|f| f.def.as_ref().and_then(|d| d.result_id) == Some(entry))
@@ -625,7 +626,7 @@ impl Interpreter {
             for (i, inst) in block.instructions.iter().enumerate() {
                 if i < phi_count { continue; }
                 if i == last_idx { break; }
-                self.eval_inst(inst, &mut values, &mut storage, inputs)?;
+                self.eval_inst(inst, &mut values, &mut storage, inputs, inv_idx)?;
             }
             let term = block.instructions.last().ok_or_else(||
                 InterpError::UnsupportedControlFlow(
@@ -716,6 +717,7 @@ impl Interpreter {
         &self,
         entry: Word,
         inputs: &ShaderInputs,
+        inv_idx: usize,
     ) -> Result<[f32; 4], InterpError> {
         let func = self.module.functions.iter()
             .find(|f| f.def.as_ref().and_then(|d| d.result_id) == Some(entry))
@@ -765,7 +767,7 @@ impl Interpreter {
             for (i, inst) in block.instructions.iter().enumerate() {
                 if i < phi_count { continue; }
                 if i == last_idx { break; }
-                self.eval_inst(inst, &mut values, &mut storage, inputs)?;
+                self.eval_inst(inst, &mut values, &mut storage, inputs, inv_idx)?;
             }
             let term = block.instructions.last().ok_or_else(||
                 InterpError::UnsupportedControlFlow(
@@ -827,6 +829,7 @@ impl Interpreter {
         values: &mut HashMap<Word, ConstantValue>,
         storage: &mut HashMap<Word, ConstantValue>,
         inputs: &ShaderInputs,
+        inv_idx: usize,
     ) -> Result<(), InterpError> {
         match inst.class.opcode {
             Op::Store => {
@@ -1140,7 +1143,7 @@ impl Interpreter {
                     return Ok(());
                 }
                 let value = self.load_from_storage(
-                    storage_class, off, result_type_id, inputs)?;
+                    storage_class, off, result_type_id, inputs, inv_idx)?;
                 values.insert(result_id, value);
                 Ok(())
             }
@@ -1447,12 +1450,24 @@ impl Interpreter {
         byte_offset: u32,
         type_id: Word,
         inputs: &ShaderInputs,
+        inv_idx: usize,
     ) -> Result<ConstantValue, InterpError> {
         // Pick the source buffer.
+        let empty: [u8; 0] = [];
         let buf: &[u8] = match storage_class {
             StorageClass::PushConstant => &inputs.push_constants[..],
             StorageClass::Uniform | StorageClass::UniformConstant
             | StorageClass::StorageBuffer => &inputs.uniforms[..],
+            // Per-vertex / per-fragment attribute reads
+            // index into the current invocation's packed
+            // attribute bytes. (Fragment-stage varyings will
+            // share this path when wired through; for the
+            // vertex stage `inv_idx` is the vertex index.)
+            StorageClass::Input => inputs
+                .vertex_attributes_per_invocation
+                .get(inv_idx)
+                .map(|v| v.as_slice())
+                .unwrap_or(&empty),
             other => return Err(InterpError::UnsupportedOpcode(format!(
                 "Load from storage class {other:?} not supported",
             ))),
@@ -1484,7 +1499,7 @@ impl Interpreter {
                 for i in 0..count {
                     let off = byte_offset.saturating_add(i * elem_size);
                     let v = self.load_from_storage(
-                        storage_class, off, element, inputs)?;
+                        storage_class, off, element, inputs, inv_idx)?;
                     lanes.push(v);
                 }
                 Ok(ConstantValue::Vec(lanes))

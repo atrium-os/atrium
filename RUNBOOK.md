@@ -3191,13 +3191,20 @@ So the door is open; the work is wiring through.
    `interpreter_run_vertex_one_invocation_per_attribute_entry`
    (three attribute entries → three identical positions).
 
-   **Deferred to phase 1b:** `OpLoad` from
-   `StorageClass::Input` (the per-vertex attribute
-   read). The current `load_from_storage` doesn't
-   handle `Input` and doesn't take an invocation index;
-   adding both is a small mechanical change but lands
-   when the differential test actually needs to read
-   attributes (the constant-position smoke does not).
+   **Phase 1b (✅ done).** `OpLoad` from
+   `StorageClass::Input` + invocation-index threading.
+   `eval_inst` + `load_from_storage` gained an
+   `inv_idx: usize` parameter; `eval_fragment_invocation`
+   + `eval_vertex_invocation` both thread the loop
+   counter through, and `load_from_storage`'s Input arm
+   reads from
+   `inputs.vertex_attributes_per_invocation[inv_idx]`.
+   Two new tests (`tests/vertex_passthrough.rs`):
+   `interpreter_passthrough_vertex_single_invocation`
+   (vec3 (0.25, 0.5, -0.75) → vec4(..., 1.0)) and
+   `interpreter_passthrough_vertex_three_vertices`
+   (distinct attribute per vertex → distinct positions
+   per invocation; gates the inv_idx threading).
 2. Cranelift vertex codegen: the signature exists;
    wire `resolve_pointer_param` for Vertex storage
    classes that the existing OpStore/OpLoad code paths
