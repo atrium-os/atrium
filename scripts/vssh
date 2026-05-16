@@ -1,7 +1,15 @@
 #!/bin/sh
 # Convenience: ssh into the running FreeBSD VM.
+#
+# ConnectTimeout=3 + ServerAliveInterval=3 keep reboot-polling loops
+# snappy.  Without these, ssh's default ~75s TCP-level timeout makes
+# every probe-while-VM-is-down burn over a minute before the loop
+# can notice the VM is actually back.
 exec ssh -i /Users/girivs/.ssh/fresco_bsd_ed25519 \
     -o StrictHostKeyChecking=no \
     -o UserKnownHostsFile=/dev/null \
     -o LogLevel=ERROR \
+    -o ConnectTimeout=3 \
+    -o ServerAliveInterval=3 \
+    -o ServerAliveCountMax=2 \
     -p 2222 root@localhost "$@"
