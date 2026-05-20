@@ -96,6 +96,28 @@ pub struct Tier2Backend {
     /// recent `dispatch_draw`. Exposed for D.4 testing; D.5
     /// turns this into the input of `fill_image_triangle`.
     last_assembled_vertices: Mutex<Option<AssembledVertices>>,
+    /// Per-surface "most recently presented" frame: snapshot
+    /// of the source image's pixels at the time the present
+    /// envelope arrived, keyed by surface_id. The WSI bring-
+    /// up shape -- a real Fresco hook-up forwards these bytes
+    /// onto the compositor; tests read them back to verify
+    /// the present wire worked.
+    presented_frames: Mutex<HashMap<u64, PresentedFrame>>,
+}
+
+/// One presented frame's snapshot (width, height, RGBA8 pixels)
+/// plus the frame_id from `vkQueuePresentKHR`.
+#[derive(Debug, Clone)]
+pub struct PresentedFrame {
+    /// Source image width in pixels.
+    pub width: u32,
+    /// Source image height in pixels.
+    pub height: u32,
+    /// Tightly-packed RGBA8 pixels (length = width * height * 4).
+    pub pixels: Vec<u8>,
+    /// Frame id from the present envelope (Vulkan
+    /// `pImageIndices` value).
+    pub frame_id: u64,
 }
 
 /// Output of [`Tier2Backend::assemble_vertices`]: per-vertex
@@ -206,6 +228,7 @@ impl Tier2Backend {
             pipeline_layouts: Mutex::new(HashMap::new()),
             pipeline_raster: Mutex::new(HashMap::new()),
             last_assembled_vertices: Mutex::new(None),
+            presented_frames: Mutex::new(HashMap::new()),
             submissions: AtomicU64::new(0),
             presents:    AtomicU64::new(0),
             draws_executed: AtomicU64::new(0),
@@ -360,6 +383,14 @@ impl Tier2Backend {
     pub fn pipeline_layout(&self, pipeline_id: ResourceId) -> Option<VertexInputState> {
         self.pipeline_layouts.lock().unwrap()
             .get(&pipeline_id.raw()).cloned()
+    }
+
+    /// Most recent presented frame for a given Fresco
+    /// surface_id (typically a window-id). `None` if nothing
+    /// has been presented to that surface in this session.
+    pub fn last_presented_frame(&self, surface_id: u64) -> Option<PresentedFrame> {
+        self.presented_frames.lock().unwrap()
+            .get(&surface_id).cloned()
     }
 
     /// Read back a registered image's RGBA8 pixels.
@@ -963,11 +994,31 @@ impl Backend for Tier2Backend {
 
     fn present(
         &self,
-        _image_id: ResourceId,
-        _surface_id: u64,
-        _frame_id: u64,
+        image_id: ResourceId,
+        surface_id: u64,
+        frame_id: u64,
     ) {
         self.presents.fetch_add(1, Ordering::Relaxed);
+
+        // Snapshot the source image's pixels into the per-
+        // surface presented-frames map. In a wired-up
+        // deployment this is where the tier-2 backend would
+        // forward the pixels onto the Fresco compositor; here
+        // it's the test-friendly bring-up shape.
+        let snap = {
+            let images = self.images.lock().unwrap();
+            images.get(&(image_id.raw() as u64)).map(|img| PresentedFrame {
+                width: img.width, height: img.height,
+                pixels: img.pixels.clone(),
+                frame_id,
+            })
+        };
+        if let Some(frame) = snap {
+            self.presented_frames.lock().unwrap().insert(surface_id, frame);
+        } else {
+            log::warn!("Tier2Backend::present: image {image_id} not in storage; \
+                        skipping snapshot for surface {surface_id}");
+        }
     }
 
     fn bind_pipeline_tier2(
