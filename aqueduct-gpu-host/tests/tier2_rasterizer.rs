@@ -16,7 +16,10 @@
 
 use std::path::PathBuf;
 
-use aqueduct_gpu_host::{DrawTriangle, Tier2Registry};
+use aqueduct_gpu_host::{
+    BlendFactor, BlendFactorPair, BlendOp, BlendState, ColorWriteMask,
+    DrawTriangle, Tier2Registry,
+};
 use atrium_spv_loader::LoaderConfig;
 use tempfile::TempDir;
 
@@ -782,6 +785,206 @@ fn rasterizer_r4_fully_beyond_far_is_culled() {
     assert!(!lit,
         "triangle past far plane painted pixels — far-plane \
          reject must be a no-op");
+}
+
+/// R.5 acceptance: alpha-over.  Pre-clear the image to
+/// green, then draw a red triangle with src.a = 0.5 using
+/// `BlendState::alpha_over()`.  Expected result inside the
+/// triangle:
+///   src = (1.0, 0.0, 0.0, 0.5)
+///   dst = (0.0, 1.0, 0.0, 1.0)
+///   result.rgb = src.rgb * src.a + dst.rgb * (1 - src.a)
+///              = (0.5, 0, 0) + (0, 0.5, 0) = (0.5, 0.5, 0)
+///   result.a   = src.a + dst.a * (1 - src.a) = 0.5 + 0.5 = 1.0
+///   u8:        (128, 128, 0, 255)   (with 0.5 → 128 rounding)
+/// Outside the triangle, the green background is untouched.
+#[test]
+fn rasterizer_r5_alpha_over_red_on_green() {
+    let cache_dir = TempDir::new().unwrap();
+    let config = LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    };
+    let registry = Tier2Registry::new(config);
+
+    let vs_id = registry.register(&build_passthrough_vs()).unwrap();
+    let fs_id = registry.register(&build_passthrough_color_fs()).unwrap();
+
+    let v0 = pack_vec3([-0.75, -0.75, 0.0]);
+    let v1 = pack_vec3([ 0.75, -0.75, 0.0]);
+    let v2 = pack_vec3([ 0.00,  0.75, 0.0]);
+
+    // Source colour: red with alpha 0.5.
+    let red_a05 = pack_vec4([1.0, 0.0, 0.0, 0.5]);
+
+    // Pre-fill with opaque green.
+    let mut pixels = vec![0u8; 16 * 16 * 4];
+    for chunk in pixels.chunks_mut(4) {
+        chunk[0] = 0;
+        chunk[1] = 255;
+        chunk[2] = 0;
+        chunk[3] = 255;
+    }
+
+    let draw = DrawTriangle {
+        vertex_attrs: [&v0, &v1, &v2],
+        varyings_per_vertex: [&red_a05, &red_a05, &red_a05],
+        varying_f32_count: 4,
+        blend_state: BlendState::alpha_over(),
+        ..Default::default()
+    };
+    registry.fill_image_triangle(
+        vs_id, fs_id, &draw, 16, 16, &mut pixels, None,
+    ).expect("alpha-over rasterise");
+
+    let px = |x: usize, y: usize| -> [u8; 4] {
+        let idx = (y * 16 + x) * 4;
+        [pixels[idx], pixels[idx+1], pixels[idx+2], pixels[idx+3]]
+    };
+
+    // Interior pixel — alpha-over result, with f32→u8
+    // quantisation tolerance of ±1.
+    let interior = px(8, 6);
+    for (channel_name, k, expected) in [
+        ("r", 0, 128u8),
+        ("g", 1, 128u8),
+        ("b", 2, 0u8),
+        ("a", 3, 255u8),
+    ] {
+        let got = interior[k];
+        let diff = (got as i32 - expected as i32).abs();
+        assert!(diff <= 1,
+            "interior {channel_name}: expected ~{expected}, got {got} \
+             (full {interior:?})");
+    }
+
+    // Outside pixel — green background untouched.
+    let outside = px(0, 0);
+    assert_eq!(outside, [0, 255, 0, 255],
+        "outside pixel should be unchanged green: {outside:?}");
+}
+
+/// R.5 acceptance: colour write mask.  Draw an opaque-blue
+/// triangle (1.0 in B, 1.0 alpha) over green, but with the
+/// blue write bit disabled.  Without the mask the triangle
+/// would paint pure blue; with the mask the interior pixels'
+/// blue byte must stay at the background's 0, and the OTHER
+/// channels (R, G, A) get the source's values.
+#[test]
+fn rasterizer_r5_write_mask_blocks_blue() {
+    let cache_dir = TempDir::new().unwrap();
+    let config = LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    };
+    let registry = Tier2Registry::new(config);
+
+    let vs_id = registry.register(&build_passthrough_vs()).unwrap();
+    let fs_id = registry.register(&build_passthrough_color_fs()).unwrap();
+
+    let v0 = pack_vec3([-0.75, -0.75, 0.0]);
+    let v1 = pack_vec3([ 0.75, -0.75, 0.0]);
+    let v2 = pack_vec3([ 0.00,  0.75, 0.0]);
+    let blue = pack_vec4([0.0, 0.0, 1.0, 1.0]);
+
+    let mut pixels = vec![0u8; 16 * 16 * 4];
+    // Background: solid green again so we can see the mask
+    // preserve the existing blue=0 byte.
+    for chunk in pixels.chunks_mut(4) {
+        chunk[0] = 0; chunk[1] = 255; chunk[2] = 0; chunk[3] = 255;
+    }
+
+    let blend = BlendState {
+        write_mask: ColorWriteMask { r: true, g: true, b: false, a: true },
+        ..Default::default()
+    };
+    let draw = DrawTriangle {
+        vertex_attrs: [&v0, &v1, &v2],
+        varyings_per_vertex: [&blue, &blue, &blue],
+        varying_f32_count: 4,
+        blend_state: blend,
+        ..Default::default()
+    };
+    registry.fill_image_triangle(
+        vs_id, fs_id, &draw, 16, 16, &mut pixels, None,
+    ).expect("write-masked rasterise");
+
+    let interior = {
+        let idx = (6 * 16 + 8) * 4;
+        [pixels[idx], pixels[idx+1], pixels[idx+2], pixels[idx+3]]
+    };
+    // R + G channels got the source's (0, 0).  B was masked,
+    // so it stays at the background's 0.  A got the source's
+    // 255.  The full interior pixel ends up (0, 0, 0, 255).
+    assert_eq!(interior, [0, 0, 0, 255],
+        "write-mask blocked blue + everything else fired from src: \
+         got {interior:?}");
+}
+
+/// R.5 sanity: blend disabled is identical to "src replaces
+/// dst" (the R.1-R.4 behaviour), independent of the factor
+/// fields' contents.  Regression-pins the default path's
+/// fast skip-the-read branch.
+#[test]
+fn rasterizer_r5_blend_disabled_is_source_replace() {
+    let cache_dir = TempDir::new().unwrap();
+    let config = LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    };
+    let registry = Tier2Registry::new(config);
+
+    let vs_id = registry.register(&build_passthrough_vs()).unwrap();
+    let fs_id = registry.register(&build_passthrough_color_fs()).unwrap();
+
+    let v0 = pack_vec3([-0.75, -0.75, 0.0]);
+    let v1 = pack_vec3([ 0.75, -0.75, 0.0]);
+    let v2 = pack_vec3([ 0.00,  0.75, 0.0]);
+    let src = pack_vec4([0.3, 0.7, 0.1, 0.4]);   // arbitrary RGBA
+
+    let mut pixels = vec![0u8; 16 * 16 * 4];
+    for chunk in pixels.chunks_mut(4) {
+        chunk[0] = 200; chunk[1] = 200; chunk[2] = 200; chunk[3] = 200;
+    }
+
+    // Plausible-looking blend factors, but enable=false.
+    // The factor / op fields must be ignored.
+    let blend = BlendState {
+        enable: false,
+        color: BlendFactorPair { src: BlendFactor::SrcAlpha, dst: BlendFactor::OneMinusSrcAlpha },
+        alpha: BlendFactorPair { src: BlendFactor::SrcAlpha, dst: BlendFactor::OneMinusSrcAlpha },
+        color_op: BlendOp::Add,
+        alpha_op: BlendOp::Add,
+        write_mask: ColorWriteMask::ALL,
+    };
+    let draw = DrawTriangle {
+        vertex_attrs: [&v0, &v1, &v2],
+        varyings_per_vertex: [&src, &src, &src],
+        varying_f32_count: 4,
+        blend_state: blend,
+        ..Default::default()
+    };
+    registry.fill_image_triangle(
+        vs_id, fs_id, &draw, 16, 16, &mut pixels, None,
+    ).expect("disabled-blend rasterise");
+
+    // Inside the triangle, the source colour replaces the dst.
+    // 0.3 → ~76, 0.7 → ~178, 0.1 → ~26, 0.4 → ~102.
+    let interior = {
+        let idx = (6 * 16 + 8) * 4;
+        [pixels[idx], pixels[idx+1], pixels[idx+2], pixels[idx+3]]
+    };
+    for (k, ef) in [(0, 0.3f32), (1, 0.7), (2, 0.1), (3, 0.4)] {
+        let expected = (ef * 255.0 + 0.5) as u8;
+        let got = interior[k];
+        let diff = (got as i32 - expected as i32).abs();
+        assert!(diff <= 1,
+            "blend-disabled channel {k}: expected ~{expected}, got {got} \
+             (full {interior:?})");
+    }
 }
 
 /// Variant of the passthrough VS that reads a vec4

@@ -480,10 +480,39 @@ impl Tier2Registry {
                         );
                     }
                     let idx = pixel_lin * 4;
-                    pixels[idx]     = f32_to_u8(out_color[0]);
-                    pixels[idx + 1] = f32_to_u8(out_color[1]);
-                    pixels[idx + 2] = f32_to_u8(out_color[2]);
-                    pixels[idx + 3] = f32_to_u8(out_color[3]);
+
+                    // R.5 — blend + write-mask.
+                    // When blending is enabled we need the
+                    // existing pixel value as `dst`; the
+                    // shader's `out_color` is `src`.  Convert
+                    // dst from u8 to f32 (the same way the
+                    // initial pixel write would have done in
+                    // reverse), run the blend equation, then
+                    // u8-quantise the result.  Disabled blend
+                    // (the default) skips the read and writes
+                    // src verbatim.
+                    //
+                    // The write mask is independent of blend
+                    // enable: it gates which of the four
+                    // bytes in `pixels[idx..idx+4]` actually
+                    // get touched.
+                    let bs = &draw.blend_state;
+                    let final_color = if bs.enable {
+                        let dst = [
+                            pixels[idx]     as f32 / 255.0,
+                            pixels[idx + 1] as f32 / 255.0,
+                            pixels[idx + 2] as f32 / 255.0,
+                            pixels[idx + 3] as f32 / 255.0,
+                        ];
+                        apply_blend(bs, out_color, dst)
+                    } else {
+                        out_color
+                    };
+                    let m = bs.write_mask;
+                    if m.r { pixels[idx]     = f32_to_u8(final_color[0]); }
+                    if m.g { pixels[idx + 1] = f32_to_u8(final_color[1]); }
+                    if m.b { pixels[idx + 2] = f32_to_u8(final_color[2]); }
+                    if m.a { pixels[idx + 3] = f32_to_u8(final_color[3]); }
                 }
             }
         }
@@ -601,6 +630,213 @@ pub struct DrawTriangle<'a> {
     /// invocations.  Layout per the shaders' `PushConstant`
     /// declarations.  Empty → null.
     pub push_constants: &'a [u8],
+
+    /// Per-attachment blend + colour-write state.  R.5.
+    /// Default is `enable: false` (source replace) +
+    /// all-channels write mask, which preserves the R.1-R.4
+    /// behaviour for callers that don't care about blending.
+    pub blend_state: BlendState,
+}
+
+/// Vulkan-shaped per-attachment colour-blend + write-mask
+/// state.  Maps onto `VkPipelineColorBlendAttachmentState`
+/// minus the rarely-used MIN/MAX/SUBTRACT blend ops (R.5 v1
+/// supports ADD only).
+#[derive(Debug, Clone, Copy)]
+pub struct BlendState {
+    /// When `false`, the source colour is written verbatim
+    /// (mod the write mask).  The factor / op fields are
+    /// ignored.  This is the default — R.1-R.4 behaviour.
+    pub enable: bool,
+    /// Colour-channel blend factors (RGB).
+    pub color: BlendFactorPair,
+    /// Alpha-channel blend factors (A).
+    pub alpha: BlendFactorPair,
+    /// Colour-channel blend op.  R.5 v1: ADD only.
+    pub color_op: BlendOp,
+    /// Alpha-channel blend op.  R.5 v1: ADD only.
+    pub alpha_op: BlendOp,
+    /// Per-channel write enable.  When a channel's flag is
+    /// `false`, that byte of `pixels` is NOT touched by the
+    /// draw.  Independent of blend enable.
+    pub write_mask: ColorWriteMask,
+}
+
+impl Default for BlendState {
+    fn default() -> Self {
+        // Source-replace + all-channels write mask: the
+        // implicit R.1-R.4 behaviour.
+        Self {
+            enable: false,
+            color: BlendFactorPair { src: BlendFactor::One, dst: BlendFactor::Zero },
+            alpha: BlendFactorPair { src: BlendFactor::One, dst: BlendFactor::Zero },
+            color_op: BlendOp::Add,
+            alpha_op: BlendOp::Add,
+            write_mask: ColorWriteMask::ALL,
+        }
+    }
+}
+
+impl BlendState {
+    /// Convenience constructor for the standard alpha-over
+    /// (a.k.a. premultiplied-source-over after a multiply,
+    /// or straight-alpha-over otherwise) compositing rule:
+    ///   `result.rgb = src.rgb * src.a + dst.rgb * (1 - src.a)`
+    ///   `result.a   = src.a + dst.a * (1 - src.a)`
+    /// All-channels write mask.
+    pub fn alpha_over() -> Self {
+        Self {
+            enable: true,
+            color: BlendFactorPair {
+                src: BlendFactor::SrcAlpha,
+                dst: BlendFactor::OneMinusSrcAlpha,
+            },
+            alpha: BlendFactorPair {
+                src: BlendFactor::One,
+                dst: BlendFactor::OneMinusSrcAlpha,
+            },
+            color_op: BlendOp::Add,
+            alpha_op: BlendOp::Add,
+            write_mask: ColorWriteMask::ALL,
+        }
+    }
+}
+
+/// `(src_factor, dst_factor)` pair for one channel group
+/// (colour or alpha).
+#[derive(Debug, Clone, Copy)]
+pub struct BlendFactorPair {
+    /// Factor multiplied by the FS-output colour/alpha.
+    pub src: BlendFactor,
+    /// Factor multiplied by the existing-pixel colour/alpha.
+    pub dst: BlendFactor,
+}
+
+/// Per-channel blend factor, matching the subset of Vulkan
+/// `VkBlendFactor` values that aren't dual-source or
+/// constant-colour (those land later if a real shader needs
+/// them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlendFactor {
+    /// 0 (multiplies the operand away)
+    Zero,
+    /// 1 (multiplies the operand through unchanged)
+    One,
+    /// (src.r, src.g, src.b)  / src.a  (alpha-side)
+    SrcColor,
+    /// (1 - src.rgb)  / (1 - src.a)  (alpha-side)
+    OneMinusSrcColor,
+    /// (dst.r, dst.g, dst.b)  / dst.a  (alpha-side)
+    DstColor,
+    /// (1 - dst.rgb)  / (1 - dst.a)  (alpha-side)
+    OneMinusDstColor,
+    /// (src.a, src.a, src.a)  / src.a  (alpha-side)
+    SrcAlpha,
+    /// (1 - src.a) per channel
+    OneMinusSrcAlpha,
+    /// (dst.a, dst.a, dst.a)  / dst.a  (alpha-side)
+    DstAlpha,
+    /// (1 - dst.a) per channel
+    OneMinusDstAlpha,
+}
+
+/// Blend equation: `result = factor_op(src*src_factor,
+/// dst*dst_factor)`.  R.5 v1 supports `Add` only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlendOp {
+    /// `a + b`
+    Add,
+}
+
+/// Per-channel write enable.  When all 4 flags are `true`
+/// (the default), the entire RGBA pixel is written; when a
+/// flag is `false`, that channel's byte in `pixels` is left
+/// untouched even when blending says it should change.
+#[derive(Debug, Clone, Copy)]
+pub struct ColorWriteMask {
+    /// Write enable for the red channel.
+    pub r: bool,
+    /// Write enable for the green channel.
+    pub g: bool,
+    /// Write enable for the blue channel.
+    pub b: bool,
+    /// Write enable for the alpha channel.
+    pub a: bool,
+}
+
+impl ColorWriteMask {
+    /// All 4 channels writable (the default).
+    pub const ALL: Self = Self { r: true, g: true, b: true, a: true };
+    /// No channel writable (effectively skips colour write
+    /// altogether — depth/stencil are still updated per
+    /// their own flags).
+    pub const NONE: Self = Self { r: false, g: false, b: false, a: false };
+}
+
+/// Evaluate a colour-side `BlendFactor` against the given
+/// `src` and `dst` RGBA values.  Returns a 3-vector of
+/// per-channel weights matching the Vulkan spec.
+fn color_factor(f: BlendFactor, src: [f32; 4], dst: [f32; 4]) -> [f32; 3] {
+    match f {
+        BlendFactor::Zero =>
+            [0.0; 3],
+        BlendFactor::One =>
+            [1.0; 3],
+        BlendFactor::SrcColor =>
+            [src[0], src[1], src[2]],
+        BlendFactor::OneMinusSrcColor =>
+            [1.0 - src[0], 1.0 - src[1], 1.0 - src[2]],
+        BlendFactor::DstColor =>
+            [dst[0], dst[1], dst[2]],
+        BlendFactor::OneMinusDstColor =>
+            [1.0 - dst[0], 1.0 - dst[1], 1.0 - dst[2]],
+        BlendFactor::SrcAlpha =>
+            [src[3]; 3],
+        BlendFactor::OneMinusSrcAlpha =>
+            [1.0 - src[3]; 3],
+        BlendFactor::DstAlpha =>
+            [dst[3]; 3],
+        BlendFactor::OneMinusDstAlpha =>
+            [1.0 - dst[3]; 3],
+    }
+}
+
+/// Evaluate an alpha-side `BlendFactor`.  Returns a scalar
+/// — Vulkan reduces colour-typed factors to their alpha
+/// component when applied to the alpha channel.
+fn alpha_factor(f: BlendFactor, src: [f32; 4], dst: [f32; 4]) -> f32 {
+    match f {
+        BlendFactor::Zero => 0.0,
+        BlendFactor::One => 1.0,
+        BlendFactor::SrcColor | BlendFactor::SrcAlpha => src[3],
+        BlendFactor::OneMinusSrcColor | BlendFactor::OneMinusSrcAlpha =>
+            1.0 - src[3],
+        BlendFactor::DstColor | BlendFactor::DstAlpha => dst[3],
+        BlendFactor::OneMinusDstColor | BlendFactor::OneMinusDstAlpha =>
+            1.0 - dst[3],
+    }
+}
+
+/// Apply a `BlendOp` to a pair of weighted operands.
+fn blend_op(op: BlendOp, a: f32, b: f32) -> f32 {
+    match op {
+        BlendOp::Add => a + b,
+    }
+}
+
+/// Full blend equation for one pixel.  `src` = FS output,
+/// `dst` = existing pixel; returns the post-blend colour.
+fn apply_blend(state: &BlendState, src: [f32; 4], dst: [f32; 4]) -> [f32; 4] {
+    let sc = color_factor(state.color.src, src, dst);
+    let dc = color_factor(state.color.dst, src, dst);
+    let sa = alpha_factor(state.alpha.src, src, dst);
+    let da = alpha_factor(state.alpha.dst, src, dst);
+    [
+        blend_op(state.color_op, sc[0] * src[0], dc[0] * dst[0]),
+        blend_op(state.color_op, sc[1] * src[1], dc[1] * dst[1]),
+        blend_op(state.color_op, sc[2] * src[2], dc[2] * dst[2]),
+        blend_op(state.alpha_op, sa    * src[3], da    * dst[3]),
+    ]
 }
 
 /// Saturating float-to-u8 conversion matching the standard
