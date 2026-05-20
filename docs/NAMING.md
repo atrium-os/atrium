@@ -12,6 +12,7 @@ Canonical vocabulary for the Atrium platform. Every component in this table has 
 | **IPC substrate** | **Aqueduct** | Roman water-distribution structure | OS-agnostic envelope + class registry + CAS upload that all Atrium services ride; portable across BSDs / Linux / non-POSIX |
 | **Content-addressed filesystem** | **Tessera** | a single mosaic tile | per-file content-addressed dedup |
 | **Kernel/userspace GPU ABI** | (unnamed; just "Atrium GPU ABI") | — | the boundary the Fresco server uses to talk to native FreeBSD GPU drivers |
+| **Third-party app platform** | **Insula** | Roman multi-unit apartment building | the contract + services third-party apps target; umbrella over Limen / Tabellarius / Loculus / Concursus / Nomenclator |
 
 ## System services (daemons)
 
@@ -28,6 +29,11 @@ Canonical vocabulary for the Atrium platform. Every component in this table has 
 | **File manager** | **Scrinium** | document chest | jailed file picker + browser |
 | **Shell (wallpaper + statusbar + dock)** | **Forum** | public plaza | the visible desktop chrome |
 | **Persistent session service** | **Stoa** | (Greek) covered colonnade — public gathering space where people came and went | long-lived shell sessions on the host; clients attach/detach/roam, scrollback persists in Tessera; subsumes terminal emulator + remote-shell client |
+| **Embed broker** | **Limen** | threshold, doorway | mediates cross-jail Fresco surface composition (Insula's iframe replacement); typed embed roles, capability-gated launch |
+| **Push broker** | **Tabellarius** | Roman courier / letter-carrier | device-wide push relay; decrypts remote pushes, delivers via Aqueduct to target Insula app |
+| **Wallet** | **Loculus** | small carried purse / box for valuables | user-curated data items (addresses, payment methods, profiles); powerbox autofill — apps see only items the user picked |
+| **Peer broker** | **Concursus** | a coming-together | symmetric device-to-device channel broker; STUN/TURN-equivalent + signaling + typed role messages |
+| **Name resolver** | **Nomenclator** | the Roman servant who whispered names to his master | resolves `atrium-doc://` / `atrium-app://` names through publisher manifests to content hashes |
 
 ## Foundation apps
 
@@ -55,6 +61,7 @@ The user-facing display name can be unprefixed ("Edit", "Term", "Files"); the bi
 | `/var/run/atrium/portcullisd.sock` | Portcullis | jail-management IPC |
 | `/var/run/atrium/castellumd.sock` | Castellum | bus admin |
 | `/var/run/atrium/{lyrad,tabulad,praecod,opifexd,curiad,scriniumd,vestibulumd,stoad}.sock` | respective services | service-specific |
+| `/var/run/atrium/{limend,tabellariusd,loculusd,concursusd,nomenclatord}.sock` | Insula services | service-specific (planned) |
 | `/var/db/atrium/stoa/<user>/<sess>/` | Stoa | per-session metadata + WAL pointers (blobs live in Tessera) |
 | `~/.local/share/atrium/apps/*.toml` | user | installed-app manifests |
 | `/var/lib/tessera/cas/*` | Tessera | content-addressed blob store |
@@ -105,6 +112,8 @@ GitHub org: **`atrium-os`**. Repo names mirror service names where applicable.
 | `atrium-os/forum` | shell |
 | `atrium-os/tessera` | CAS-FS userspace tooling |
 | `atrium-os/atrium-edit`, `-term`, etc. | foundation apps |
+| `atrium-os/insula` | Insula umbrella: shared `libatrium.so`, contract docs, conformance tests |
+| `atrium-os/limen`, `tabellarius`, `loculus`, `concursus`, `nomenclator` | Insula services |
 | `atrium-os/freebsd-ports` | fork with Atrium ports added |
 
 ## Style guide
@@ -113,7 +122,7 @@ GitHub org: **`atrium-os`**. Repo names mirror service names where applicable.
 - **User-facing apps use plain descriptive names with `atrium-` prefix.** Avoids PATH collisions, doesn't burden users with vocabulary.
 - **Cdevs and ioctls use `atrium-` / `ATRIUM_*` prefix.** They're platform-level, not protocol-level.
 - **Fresco stays "Fresco" — it's the protocol, not the OS.** When in doubt, ask: is this about how apps render, or how the platform is configured? Rendering = Fresco, platform = Atrium.
-- **Daemons end in `d`.** `portcullisd`, `castellumd`, `lyrad`, `tabulad`, `praecod`, `opifexd`, `curiad`, `scriniumd`, `vestibulumd`, `stoad`. The dock is a UI app, no `d` suffix needed for `forum`.
+- **Daemons end in `d`.** `portcullisd`, `castellumd`, `lyrad`, `tabulad`, `praecod`, `opifexd`, `curiad`, `scriniumd`, `vestibulumd`, `stoad`, `limend`, `tabellariusd`, `loculusd`, `concursusd`, `nomenclatord`. The dock is a UI app, no `d` suffix needed for `forum`.
 
 ## How this reads to a user
 

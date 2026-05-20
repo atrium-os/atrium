@@ -1,0 +1,1967 @@
+# Insula — third-party application platform
+
+Status: design sketch (pre-D-phase). Not yet on the roadmap.
+Last updated: 2026-05-21.
+
+**Insula** is Atrium's app-platform layer: the contract,
+manifest conventions, and supporting services that third-
+party applications target. The Atrium metaphor extends
+naturally — *Atrium* is the central courtyard of the Roman
+townhouse (the platform's core), and *insulae* were the
+multi-unit apartment buildings filling the rest of the city
+(where the population — third-party apps — lives, each in
+its own walled-off unit).
+
+Insula is a layer, not a single daemon. It comprises:
+
+- A **contract** — what apps see when targeting Atrium
+  (manifest extensions, syscall allowlist, `libatrium.so`
+  ABI, capability vocabulary, embed roles, addressing).
+- **New services** introduced specifically for the app-
+  platform role: **Limen** (cross-jail composition),
+  **Tabellarius** (push delivery), **Loculus** (wallet /
+  autofill), **Concursus** (peer-to-peer channels),
+  **Nomenclator** (name resolution).
+- **Existing-service conventions** for app-platform use:
+  Portcullis manifests, Vestibulum per-app sign-in,
+  Praeco delivery, Opifex bundles, Scrinium pickers, Tabula
+  clipboard.
+
+This document covers what the web calls "client-side
+scripting" but executed under Atrium's kernel-enforced
+sandbox rather than an in-process browser runtime. The
+premise: with Portcullis providing kernel-level isolation,
+we do not need an interpreted/verified bytecode runtime in
+the V8/WASM-sandbox sense. Apps ship as native binaries
+(or as portable IR for cross-arch), execute in jails, and
+reach the system only through capability-gated Aqueduct
+services.
+
+## 0. Position relative to existing technology
+
+The browser web stack solves a specific problem: run untrusted
+code from any URL in a shared address space (the renderer
+process) without compromising the host. Every constraint
+follows from that — JS / WASM as verifiable bytecode, same-
+origin policy, CSP, the DOM-as-platform-API, the permission
+prompt UX, the lack of real syscalls. V8 *is* the sandbox, so
+V8 owns the language, the memory model, and the API surface.
+
+Atrium does not have that constraint. The sandbox is a
+FreeBSD jail managed by Portcullis. The kernel + MMU + jail
+infrastructure enforce isolation; the code on the inside can
+be arbitrary native ELF. This collapses the whole web-platform
+stack to its first-principles shape:
+
+- Distribution: signed, content-addressed bundle in Tessera.
+- Execution: native ELF in a Portcullis jail.
+- Sandbox: kernel-enforced, capability-shaped.
+- API: a frozen C-ABI platform library + Aqueduct services.
+- UI: native toolkit (Pergola), not a DOM.
+
+WASM does not appear in this design. The browser needed it
+because the sandbox was in-process; Atrium does not have that
+problem. WASM may still be useful as a *distribution format*
+for cross-arch portability (§3), but it is never the runtime.
+
+## 1. Architectural overview
+
+```
+publisher                target device
+─────────                ─────────────
+edit source              receive bundle
+  │                        │
+  ▼                        ▼
+compile (LLVM)           verify signature
+  │                        │
+  ▼                        ▼
+sign bundle              [AOT compile if IR]
+  │                        │
+  ▼                        ▼
+Tessera CAS              register manifest
+  │                        │
+  └────── publish ─────────┤
+                           ▼
+                         launch:
+                           Portcullis builds jail
+                           jail execs native ELF
+                           ELF dlopens libatrium.so
+                           opens fresco / aqueduct
+                           ...
+```
+
+The runtime form is **always** a native ELF in a jail linking
+against `libatrium.so`. The distribution form may be native or
+IR; both converge at the runtime.
+
+## 2. ABI
+
+### 2.1 Calling convention
+
+Standard System V PCS for the target architecture. No new ABI.
+Stock `clang`, `rustc`, `zig cc`, etc. emit binaries that
+target Atrium with no modification beyond linking against the
+platform headers and library.
+
+### 2.2 Syscall surface
+
+The jail restricts available syscalls to a Capsicum-shaped
+allowlist. Roughly:
+
+| Allowed directly | Proxied via Aqueduct | Forbidden |
+|---|---|---|
+| `read`, `write` on existing fds | `open`, `connect`, `bind` | `mount`, `kld*`, `jail_*` |
+| `mmap`, `munmap`, `mprotect` | DNS resolution | `ptrace` |
+| `kevent`, `kqueue` | filesystem traversal beyond namespace | raw sockets (unless capability) |
+| `clock_gettime`, `nanosleep` | network connections | most `sysctl` |
+| futex-equivalent, condvar primitives | timers, notifications | `setuid` and friends |
+| `_exit`, signal primitives | clipboard, picker, share | `chroot`, `jail` |
+
+Apps that call a forbidden syscall get `ECAPMODE` (Capsicum-
+style), not a hidden translation. The allowlist is versioned
+and frozen as part of the platform ABI; new entries follow the
+same semver discipline as the platform library.
+
+### 2.3 Platform library (`libatrium.so`)
+
+A C-ABI shared object provided by the system. Wraps the
+Aqueduct services that scripts can reach. Sketch of the
+surface:
+
+- **`atrium_fresco_*`** — open a window, present a frame,
+  receive input events. Pergola sits on top of this.
+- **`atrium_storage_*`** — read/write within the app's
+  Tessera namespace.
+- **`atrium_net_*`** — connect to a hostname:port allowed by
+  the manifest. Resolves via the network broker (§4).
+- **`atrium_picker_*`** — invoke a system file/share/...
+  picker to obtain a one-shot capability (§5.2).
+- **`atrium_clipboard_*`**, **`atrium_notify_*`**,
+  **`atrium_timer_*`**, ...
+
+Public SDKs (Rust, C) are thin wrappers over `libatrium.so`.
+Third-party SDKs (Zig, Swift, Go, ...) are community.
+
+### 2.4 Versioning
+
+`libatrium.so` versions follow `MAJOR.MINOR`. Manifest declares
+the minimum `sdk-version` the app needs. The launcher refuses
+to start an app whose declared version exceeds the installed
+platform's version. Backward-compatible additions only within
+a MAJOR.
+
+## 3. Distribution
+
+### 3.1 Bundle shape
+
+A signed bundle in Tessera, content-addressed by its root
+hash:
+
+```
+my-app/
+  manifest.toml         # see §5
+  signature             # publisher signature over manifest+contents
+  bin/
+    my-app              # native ELF, or IR artifact (§3.3)
+  assets/
+    ...
+```
+
+Install = verify signature, resolve through Tessera CAS,
+register manifest with Portcullis. The same bundle is byte-
+identical on every device that has it.
+
+### 3.2 Native distribution (default)
+
+Publishers compile to native ELF for each supported Atrium
+architecture and ship the binaries in the bundle. Trivially
+the best path:
+
+- Smallest install action: verify + register only.
+- Best runtime quality: publisher controls optimization level.
+- Smallest cold start: no AOT step.
+
+Cost: one ELF per architecture (or one fat binary).
+
+### 3.3 IR distribution (optional)
+
+For cross-arch portability, publishers may ship a portable IR
+artifact instead. The realistic format is **WASM** — not as a
+sandbox, but as a stable, well-toolchained, language-agnostic
+portable assembly:
+
+- Stable bytecode format across versions.
+- Clang/Rustc/Zig/TinyGo/etc. all emit it.
+- Cranelift natively consumes it (wasmtime backend).
+- The browser's WASI / sandboxing model is *not* used; the
+  jail is the sandbox. WASM modules link (at AOT time)
+  against `libatrium.so` via a thin import-shim. Output is a
+  normal native ELF.
+
+Cranelift produces ~70% of LLVM's runtime quality at ~5–10×
+faster compile. That is the right tradeoff for install-time
+AOT: the resulting native artifact is then mmap'd on every
+launch.
+
+The bespoke SPIR-V backend (atrium-spv-backend-bespoke) is
+**not** used in this path. It is a specialized shader backend
+and inappropriate for general-purpose code.
+
+### 3.4 Install caching
+
+The AOT result for a given (IR-bundle-hash, target-arch,
+sdk-version) tuple is cached in Tessera, keyed by the tuple.
+Subsequent installs of the same bundle skip the AOT step.
+
+## 4. Sandbox and network capability
+
+### 4.1 Jail shape
+
+Each app instance runs in its own Portcullis jail with:
+
+- A private Tessera namespace mounted at a known path.
+- A devfs-restricted view (no raw `/dev/*` access except what
+  the manifest declares).
+- A vnet jail with no default route.
+- Access to Aqueduct sockets allowed by the manifest.
+- `rctl` limits on CPU / RSS / wall time / fds.
+
+The jail is the security boundary, *not* the platform library.
+A compromised `libatrium.so` does not let an app escape; only
+the kernel can.
+
+### 4.2 Network model
+
+The web's CORS / CSP / SOP / fetch story is replaced by a
+**network capability broker**:
+
+- The vnet jail has no direct network access.
+- `atrium_net_connect("api.example.com", 443)` goes to the
+  broker over a unix socket.
+- The broker checks the manifest (§5.1), resolves DNS itself,
+  opens the underlying connection, and hands the resulting
+  fd back to the jail.
+- Per-request policy (allowed methods, TLS pinning, allowed
+  paths) lives in the manifest, enforced by the broker.
+
+For tools genuinely needing raw network access, a
+`raw-network` capability bypasses the broker but is loudly
+disclosed in the install-time consent UI.
+
+Cost: ~500 µs per `connect`. Invisible against TCP+TLS.
+
+## 5. Manifest and capabilities
+
+### 5.1 Static capabilities (declared)
+
+Capabilities declared at install time, enforced by Portcullis:
+
+```toml
+[app]
+name = "example.com.weather"
+version = "1.2.3"
+sdk-version = "1.x"
+
+[bundle]
+form = "native"                # or "wasm"
+arches = ["aarch64-freebsd"]
+entry = "bin/weather"
+
+[render]
+fresco = true                  # opens its own windows
+
+[input]
+keyboard = "focus"             # only when window is focused
+pointer = "focus"
+
+[network]
+hosts = [
+  { name = "api.weather.example.com", port = 443, proto = "tcp" },
+]
+
+[storage]
+namespace = "example.com.weather"
+quota = "100MB"
+
+[ipc]
+services = ["fresco-protocol", "clipboard"]
+
+[compute]
+cpu = "100ms/s"
+rss = "256MB"
+wall = "unbounded"
+```
+
+User sees the capability list **once**, at install time. No
+ambient runtime permission prompts.
+
+### 5.2 Dynamic capabilities (powerbox)
+
+Capabilities the app cannot declare upfront are minted at
+use-time by *system-trusted UI* (Scrinium file picker,
+share sheet,
+device picker) running outside the jail. The picker hands the
+jail a fresh fd / capability for the specific resource the
+user pointed at — never ambient access to all files.
+
+This is the KeyKOS / Capsicum-lineage "powerbox" pattern.
+
+Sketches the right answer to the "allow access to all your
+photos forever?" disaster: that prompt never happens because
+the app cannot ask. The user *points* at a photo and the
+system *gives* the app that one photo.
+
+### 5.3 Capability shape
+
+| Capability | Lifetime | Mint by |
+|---|---|---|
+| Network host | install | manifest |
+| Persistent storage | install | manifest |
+| IPC service | install | manifest |
+| Specific file fd | one session | picker |
+| Share target fd | one operation | share sheet |
+| Device fd | one session | device picker |
+| Clipboard read | one paste | clipboard service |
+
+## 6. Source language
+
+Polyglot at the ABI; the platform owns the contract, not the
+language.
+
+### 6.1 First-party SDKs
+
+- **Rust** — idiomatic wrapper crate over `libatrium.so`,
+  shipped with the Atrium SDK. Primary language.
+- **C** — headers + `libatrium.so`, shipped with the SDK.
+
+### 6.2 Community languages
+
+Any language that emits ELF (Zig, Swift, Go, Crystal, Nim, …)
+or has a WASM target (TinyGo, AssemblyScript, …) can target
+Atrium. Bindings are not blessed by the platform.
+
+### 6.3 Scripting languages
+
+Python, Lua, JavaScript-as-a-language, etc. are *user-space
+choices*, not platform-blessed runtimes. A Python interpreter
+is a regular Atrium app (jailed, native-compiled CPython);
+`.py` files are its inputs. The capability boundary is around
+the interpreter; users accepting "the interpreter enforces my
+script's intent" is a separate, weaker trust statement.
+
+The platform does not ship a language. Browsers shipped JS
+because they had to; Atrium does not have to.
+
+## 7. Codegen split
+
+| Backend | Used for | Notes |
+|---|---|---|
+| LLVM | publisher-side native build | Production -O3. Runs on dev machines, not target. |
+| Cranelift | install-time AOT of IR bundles | ~70% LLVM quality at ~5–10× faster compile. |
+| `atrium-spv-backend-bespoke` | shaders (tier-2 Vulkan) | Not used in app scripting. Different IR, different shape. |
+| Interpreters | user-chosen scripting languages | Shipped as regular apps. |
+
+The bespoke shader codegen has **no role** in app execution.
+The temptation to reuse it for scripting is misleading — its
+IR (atrium-spv-ir) is shader-shaped and inappropriate for
+general-purpose code.
+
+## 8. Cold-start budget
+
+Component costs (rough, aarch64 FreeBSD):
+
+| Step | Cost |
+|---|---|
+| fork | ~50 µs |
+| exec + dynamic link | ~1–2 ms |
+| jail attach + cred setup | ~100–500 µs |
+| broker handshake | ~500 µs |
+| First Fresco connect | ~200 µs |
+| First frame paint | ~16 ms (frame-cadence-bound) |
+| **Total cold launch → first pixel** | **~20 ms** |
+
+Already inside "feels instant." A small pool of ~8 pre-jailed
+empty processes (~8 MB resident total) cuts the launch path
+to ~200 µs for the case where hover-preview UX needs it. No
+process resurrection / CRIU equivalent required.
+
+Persistence of *compiled state* is automatic via Tessera CAS:
+once AOT-compiled, the native artifact is mmap'd on every
+launch. The browser's tiered JIT warmup has no analogue
+because there is no JIT.
+
+## 9. Dev iteration
+
+The honest tradeoff vs. browser F5: with native compile, the
+inner loop is bounded by compile time, not platform overhead.
+
+### 9.1 Where time goes (Rust, incremental)
+
+| Step | Cost |
+|---|---|
+| Edit save | 0 |
+| `cargo build` incremental | ~2 s |
+| Re-sign + repackage (or skipped in dev) | ~10 ms / 0 |
+| Re-install (Tessera CAS + manifest update) | ~50 ms |
+| Re-launch (fork+exec+jail from pool) | ~200 µs |
+| First frame after relaunch | ~16 ms |
+| **Total** | **~2.1 s** |
+
+Compile dominates. **Compile time is a language-toolchain
+property, not a platform property.**
+
+### 9.2 `portcullis dev` mode
+
+A first-class dev workflow:
+
+```
+$ portcullis dev ./my-app/
+[watch]   source tree
+[build]   incremental rebuild on save
+[install] Tessera CAS + manifest update
+[launch]  killing previous instance, spawning in jail 'dev-…'
+[ready]   window opened, stderr streaming to terminal
+```
+
+Dev mode:
+
+- Skips publisher-grade signing (uses a dev signing key the
+  system trusts only when launched via `portcullis dev`).
+- Includes debug symbols.
+- Opens broader capabilities for tooling: lldb attach,
+  dtrace USDT probes pass through, broker logs requests.
+
+### 9.3 State preservation across relaunch
+
+The platform offers a `state` capability — a stable KV in the
+app's Tessera namespace, flushed on SIGTERM, restored on
+launch. Apps written with explicit suspend/resume semantics
+get HMR-feel for free; the dev relaunch *feels* like a hot-
+reload even though it is a real cold start.
+
+Same design works for production (crash recovery, OS updates,
+suspend/resume). Two birds.
+
+### 9.4 Faster dev backends
+
+For developers who want F5-grade iteration on Rust, the
+`rustc_codegen_cranelift` backend (already known in the
+ecosystem) shaves a real chunk off `cargo build` for dev
+profile. Production builds still use LLVM.
+
+### 9.5 Interpreted-language option
+
+For projects where the F5 loop matters more than runtime perf,
+the right answer is "use an interpreted language for that
+project." Python / Lua / Tcl scripts on Atrium reload in
+milliseconds because the interpreter is a long-lived jailed
+process; reloading is sending it a new source buffer.
+
+### 9.6 DevTools / introspection
+
+The Atrium equivalent of browser DevTools exists for free as
+soon as one builds the UI — every observation surface is
+already present:
+
+- Fresco knows the full scene tree.
+- Aqueduct knows every IPC message.
+- The network broker knows every request.
+- The kernel exposes syscall traffic via `truss` / dtrace.
+- The bespoke / Cranelift backends emit a PC-map sidecar so
+  native PCs map back to source.
+
+A "DevTools" Atrium app subscribes to these and presents
+scene tree, IPC log, network log, capability access log, perf
+counters, stack samples. Engine = dtrace; UI = an app.
+Production builds opt out of inspection; dev builds always
+allow.
+
+## 10. UI model — no DOM
+
+The DOM conflates two things: a structured text-document
+data model and a shared retained-mode UI tree mutated by code.
+Native binaries separate them cleanly.
+
+### 10.1 Apps
+
+Every "website" that is *actually an application* (Gmail,
+Figma, Notion, Slack, GitHub UI, ...) becomes a native Atrium
+app. Renders via Pergola windows over Fresco. No HTML, no CSS,
+no DOM. The toolkit ships with the platform; the app does not
+redownload React-shaped runtime per visit.
+
+### 10.2 Documents
+
+Documents (Wikipedia, blogs, news articles, papers) are
+content, not programs. A **document viewer app** parses some
+text-document format (HTML+CSS, Markdown, or a cleaner
+format) and renders via Pergola. The viewer is one app among
+many; users can swap it.
+
+### 10.3 Cross-app composition
+
+The browser got the *idea* of `<iframe>` right (embed
+renderable content from a different trust domain) and the
+*implementation* wrong (in-process sandbox, SOP-as-trust-
+boundary, untyped `postMessage`). Atrium keeps the idea and
+discards the constraints.
+
+**The shape:** a parent app's window contains a rectangular
+slot rendered by a child app in a separate jail. The
+compositor stitches the result; input within the slot routes
+to the child; communication is a typed message channel.
+
+#### 10.3.1 Launch model — Limen
+
+The parent does **not** launch the child directly. A trusted
+system service, **Limen** (Latin: *threshold* — the boundary
+across which app surfaces meet), mediates:
+
+1. Parent: `request_embed(role)`.
+2. Limen looks up the user's preferred app for that role
+   (or platform default).
+3. Limen asks Portcullis to launch the selected app in
+   embed mode, with capabilities from *its own* manifest.
+4. Limen wires up a Fresco slot and a typed message
+   channel between parent and child.
+5. Both ends get `attached`.
+
+**Why broker-mediated.** Parent declares *intent* ("I need
+a doc-viewer"), not *implementation* ("launch this binary").
+The child's capabilities come from its own manifest, not
+the parent's. Neither side has authority over the other.
+This is the powerbox pattern (§5.2) applied to rendering.
+
+#### 10.3.2 Embed roles — typed contracts
+
+Each embed has a declared role (string identifier). A role
+defines a typed protocol both sides speak. Initial set:
+
+| Role | Parent → Child | Child → Parent |
+|---|---|---|
+| `doc-viewer` | `load(url)`, `set_theme(...)` | `loaded`, `error(...)`, `link_clicked(url)`, `selection(...)` |
+| `media-player` | `play`, `pause`, `seek(t)` | `time_update(t)`, `ended`, `error` |
+| `picker` | `open(filter)` | `picked(fd)`, `cancelled` |
+| `payment` | `start(amount, currency, ref)` | `completed(receipt)`, `cancelled` |
+| `map` | `set_view(...)`, `add_marker(...)` | `marker_clicked(id)`, `zoom_changed(...)` |
+| `share-target` | `share(content)` | `accepted`, `declined` |
+
+Roles are platform-defined, versioned, frozen with the
+platform ABI. Apps declare which roles they implement
+(child side) or request (parent side) in their manifest.
+
+The system enforces well-typed messages on the channel — a
+parent cannot send arbitrary bytes to a child, only
+messages from the role's protocol. Eliminates the
+postMessage-as-untyped-RPC bug class.
+
+#### 10.3.3 Rendering — Fresco surface slots
+
+- Parent creates a slot: `(rect, role, options)`.
+- Compositor reserves the region; broker hands the slot ID
+  to the child.
+- Child renders into the slot like any other Fresco
+  surface; full Pergola access on its side.
+- Composition: parent and child surfaces stitched in
+  z-order. Parent can layer overlays *above* the slot but
+  **never mutate or read** the slot's contents.
+
+**Pixel readback is disallowed.** The compositor never
+gives the parent access to the child's rendered bytes.
+This blocks the attack class where a malicious parent
+embeds a trusted child to harvest displayed content
+(banking, addresses, …). Strictly stronger than the web's
+`<canvas>` taint rules, which are partial and retrofitted.
+
+#### 10.3.4 Input routing
+
+- Pointer events within slot → child. Outside → parent.
+- Keyboard events when child has focus → child. Otherwise →
+  parent's focused widget. System chords → WM.
+- Scroll within child → child.
+- Drag-and-drop across the boundary → mediated by system
+  DnD service (powerbox: one-shot capability grant from
+  user gesture).
+
+Parent can request `EMBED_INPUT_NONE` for decorative slots;
+child can declare itself read-only.
+
+#### 10.3.5 Lifecycle
+
+State machine observable from the parent:
+
+- `attached` — child rendering, channel open.
+- `child_lost` — crash or kill. Compositor shows last frame
+  or placeholder. Parent decides whether to ask broker to
+  relaunch.
+- `detached` — orderly shutdown.
+
+**A child crash cannot affect the parent.** Resource
+accounting per-jail (`rctl`); the child's consumption
+counts against its own quota.
+
+#### 10.3.6 Side channels
+
+| Channel | Mitigation |
+|---|---|
+| Pixel readback | Compositor never gives parent the bytes. |
+| Render-completion timing | Only role-level events surface to parent; compositor coalesces. |
+| Shared GPU caches (Spectre-class) | Per-jail GPU contexts. Tier-1 GPU isolation is a separate spec; this design piggybacks. |
+| Audio capture | Separate capability, default-deny. Embedded children do not get parent's audio context. |
+| Storage / network sharing | Each jail has its own; embedding does not connect them. |
+
+#### 10.3.7 Accessibility
+
+The AX tree spans the boundary (§10.4 decision 4). The
+`atrium-ax` service stitches the child's AX subtree into
+the parent's tree at the slot position. Screen readers see
+one coherent tree. The slot is a tree node with
+`role=embedded-content`; descendants come from the child.
+
+Strictly better than browser cross-origin iframes, where
+SOP blocks AX traversal entirely.
+
+#### 10.3.8 API sketch
+
+Parent:
+
+```c
+atrium_embed_t slot = atrium_embed_request(
+    window, rect, "doc-viewer",
+    .input = EMBED_INPUT_FULL,
+    .audio = EMBED_AUDIO_NONE,
+    .transparency = EMBED_TRANSPARENCY_OPAQUE
+);
+atrium_embed_send(slot, "load", "atrium-doc://abc123");
+
+while (atrium_embed_poll(slot, &ev)) {
+    switch (ev.kind) {
+    case EMBED_ATTACHED: break;
+    case EMBED_MESSAGE:
+        if (streq(ev.msg.name, "link_clicked"))
+            handle_link(ev.msg.payload);
+        break;
+    case EMBED_LOST:
+        placeholder(); break;
+    }
+}
+```
+
+Child (launched in embed mode by broker):
+
+```c
+atrium_embed_self_t self = atrium_embed_self_attach();
+
+while (atrium_embed_self_poll(self, &msg)) {
+    if (streq(msg.name, "load"))
+        load_and_render(msg.payload);
+}
+
+atrium_embed_self_emit(self, "link_clicked", clicked_url);
+```
+
+Both sides see only role-typed messages. Neither sees the
+other's process, surface, or capabilities.
+
+### 10.4 Accessibility (the genuine regression risk)
+
+Browsers give screen readers a structured tree from the DOM
+for free. Native toolkits historically botch a11y because
+each rolls its own. The web's strength was *not duplication*:
+the DOM **is** the a11y tree, so apps cannot accidentally
+bypass it. Atrium has the same opportunity if Pergola is
+designed correctly from the start, and the matching
+vulnerability if it is not.
+
+**Locked decisions for this design:**
+
+1. **The AX tree IS the widget tree, not a sidecar.** Every
+   Pergola widget has a role (`button`, `heading`,
+   `text-input`, `region`, `landmark`, …), accessible name,
+   state (focused, disabled, selected, expanded, …), and
+   parent-child structure. Apps do not populate a separate
+   AX API — using a Pergola widget *is* declaring its AX
+   semantics.
+
+2. **Custom-drawn UIs must declare a shadow AX tree.**
+   Apps drawing their own UI (canvas-equivalent, custom
+   visualization widgets) must publish an AX shadow tree
+   describing what they drew. The inspector app surfaces
+   "regions with no AX coverage" so this is visible at
+   build time, not silent at runtime.
+
+3. **`atrium-ax` is a first-class platform Aqueduct
+   service**, not optional, not an add-on. The capability is
+   granted to assistive-tech apps: screen readers, voice
+   control, switch control, magnifiers. The service
+   publishes:
+   - Tree snapshot on request.
+   - Incremental updates as widgets mutate (subscribe model
+     with politeness levels for live regions).
+   - Focus changes.
+   - Activation requests inbound ("assistive tech asks to
+     click button X").
+
+   This is the AT-SPI / UIA shape, done as a first-party
+   Aqueduct service from day one instead of bolted onto an
+   existing toolkit.
+
+4. **AX composes across jail boundaries.** Cross-app
+   composition (§10.3) means a single visual UI may span
+   multiple jailed processes. The AX service stitches the
+   tree across jails — assistive tech sees one coherent
+   tree. Capability gate is the same as Fresco composition.
+   Strictly better than browser cross-origin iframes, where
+   SOP blocks screen reader traversal and a11y degrades
+   silently.
+
+5. **AX coverage is a publish-time gate.** App
+   signing / certification refuses bundles whose AX coverage
+   falls below a threshold. The same introspection surface
+   the inspector app uses computes the metric. A11y is a
+   build-time concern, not a "we'll fix it later" concern.
+
+6. **Document viewer's AX bridge is platform-class.** The
+   document viewer (§10.2) is the place text-document
+   semantics (headings, lists, links, tables, captions)
+   must survive into the AX tree. One reference viewer with
+   strong AX is platform-blessed; community viewers are
+   permitted but warned to users when their AX coverage is
+   weaker.
+
+**Genuinely hard sub-problems (open):**
+
+- **Live regions / politeness levels.** "New message
+  arrived" should be announced; "cursor moved" should not.
+  Pergola needs explicit primitives for live regions and
+  the politeness scale, matching ARIA-live semantics but
+  without ARIA's syntactic awkwardness.
+- **Spatial vs. structural order.** Visual reading order may
+  not match widget-tree order (sidebars, floating panels).
+  The AX tree must expose both, and the assistive tech
+  picks.
+- **i18n of accessible names.** AX names follow the same
+  locale path as visible text. The AX layer must be locale-
+  aware, not English-as-default.
+- **Subscription throttling.** A widget that mutates every
+  frame must not produce an event per frame on the AX
+  stream. Coalescing rules need design; web browsers
+  learned this the hard way.
+
+These are queued for the Pergola spec proper, not resolved
+here.
+
+### 10.5 Inspector
+
+The "view source / inspect element" property is recovered by
+an inspector app that connects to Pergola's introspection
+API. Production apps can opt out of inspection in release
+builds; dev builds always allow.
+
+### 10.6 The document viewer
+
+The document-shaped subset of the web (Wikipedia, blogs,
+news, papers, READMEs, PDFs, docs sites) is served by a
+platform-class **document viewer app**. One Atrium app among
+many, with no special runtime privileges, but blessed as the
+reference renderer.
+
+**Why it deserves dedicated design:**
+
+- Documents are declarative content, not code. The jail
+  rendering a document needs *zero* network/storage/IPC
+  capabilities beyond rendering. The viewer is the trust
+  boundary; documents are inert.
+- Users read many documents per day. Friction has to be
+  near-zero — this is what tempts platforms to keep a
+  browser. We keep the experience without the architecture.
+
+**Format strategy:** ship multiple, parsers are pluggable
+modules in one viewer, all emit the same internal Pergola-
+shaped IR with AX semantics baked in.
+
+- **Canonical authoring format:** a Markdown superset with
+  explicit AX-aware extensions (figure/figcaption, semantic
+  block roles, named regions, table headers). This is what
+  people write.
+- **HTML+CSS subset:** for legacy web content. A sanitizer
+  strips JS, normalizes CSS to a bounded layout-primitive
+  set, feeds the same IR. 95% of legacy documents work;
+  broken 5% degrade visibly (no silent broken renders).
+- **PDF:** another backend in the same viewer, or a sibling
+  viewer app.
+
+**Network model:**
+
+- The viewer has a broad `[network]` capability (it's a
+  general-purpose reader).
+- Fetched bytes are loaded into a **fresh inner sub-jail**
+  with zero network. The viewer mediates; the document is
+  inert.
+- Per-document state (scroll position, bookmarks) is the
+  *viewer's* storage. Documents have no persistent state.
+
+This is strictly cleaner than browser SOP. The browser's
+origin-as-trust-boundary forced same-origin policy because
+pages execute. Inert documents don't need SOP.
+
+**Addressing — content-addressed by default:**
+
+- Document URLs are content addresses: `atrium-doc://<hash>`.
+- A layer of human-readable indirection (DNS-equivalent +
+  signed publisher manifest) resolves "the current version
+  of this article" to a hash, then content-addresses the
+  document.
+- Documents are **cacheable forever** because the hash is
+  the address. Offline reading falls out for free.
+- Link rot is a *publisher* problem (rotating the
+  human-readable indirection), not an archival catastrophe.
+
+This is the part of the web that should have always been
+content-addressed.
+
+**Deep links:** `atrium-doc://<hash>#section-id`. Document
+structural anchors (heading IDs, named regions) are
+addressable; the viewer scrolls and announces ("jumped to
+section: Introduction") to assistive tech.
+
+**Embedding inside apps:** apps frequently need to render
+documents (README in a code editor, article in a news app,
+help text anywhere). Pattern is cross-jail Fresco
+composition (§10.3): the parent app embeds the viewer's
+rendered surface as a child. Parent never sees the
+document's raw bytes, only the rendered surface. This is
+what `<iframe srcdoc>` should have been.
+
+**Why the canonical authoring format isn't HTML:** HTML+CSS
+is technically a programming language at this point
+(container queries, anchor positioning, CSS-in-JS, layout
+algorithms that can't be statically analyzed). The "CSS
+subset" line is endlessly contested. A clean format
+designed-for-AX-from-the-start is the right thing to write
+new content in; HTML+CSS support is the migration path, not
+the destination.
+
+### 10.7 Declarative UI
+
+A React / SwiftUI / Compose-shaped declarative API is
+available as a *library* on top of Pergola, not a platform
+mandate. The choice is at the app level, not the platform
+level — the inverse of the browser's situation.
+
+## 11. Background tasks
+
+The web's background-execution story is three overlapping
+APIs (Service Workers, Web Workers, Background Sync / Push)
+plus opaque OS-enforced budgets. Atrium has one model
+because background work is just a jailed process without a
+window.
+
+### 11.1 Lifecycle classes
+
+| Class | Lives | Scheduled by | Web analogue |
+|---|---|---|---|
+| Foreground | While user has a window open | User interaction | Normal page JS |
+| Resident background | Continuously, low priority | Always-running jail | Service worker (kind of) |
+| Triggered | Briefly, on event | System scheduler | Background Sync, Push |
+
+A single app can declare any subset. All three use the same
+primitive (`exec` in a jail); only scheduling discipline
+differs.
+
+### 11.2 Manifest declaration
+
+```toml
+[background.resident]
+entry = "bin/sync-daemon"
+priority = "low"
+max-rss = "32MB"
+
+[background.triggered]
+entry = "bin/handle-event"
+events = ["push", "alarm", "network-resume",
+          "tessera-changed:/inbox"]
+max-runtime = "30s"
+max-invocations-per-hour = 12
+```
+
+`max-invocations-per-hour` is the equivalent of browsers'
+opaque "background sync may run sometime" rules — except it
+is published and the user sees it at install.
+
+### 11.3 Resident background
+
+A long-lived jailed process surviving foreground close.
+Examples: chat-app connection holder, sync daemon, music
+player.
+
+- Launched lazily on first need.
+- Killed on resource pressure (LRU within quota class, or
+  rss/cpu cap exceeded).
+- Restarted on schedule if `always-resident`.
+
+Foreground UI talks to resident background via the same
+Aqueduct mechanism the rest of the system uses — they are
+just two processes in the same jail (or sibling jails). No
+"service worker" programming model: it is a normal process
+with a normal main loop. The reason service workers needed
+weird semantics (no DOM, no global state) was that they ran
+inside the browser process; that constraint is gone.
+
+### 11.4 Triggered background
+
+System delivers named events; app declares the entry point
+to exec on each.
+
+| Event | Source |
+|---|---|
+| `push` | Push notification via system Tabellarius (§11.5) |
+| `alarm` | Scheduled time the app registered |
+| `network-resume` | Connectivity returned |
+| `tessera-changed:/path` | Watched namespace path mutated |
+| `system-idle` | Device idle and charging |
+| `boot-complete` | System finished booting |
+
+System spawns a fresh jail, execs the declared entry,
+delivers the event payload, waits up to `max-runtime`,
+SIGKILL on exceed. No persistent state survives between
+invocations except via the app's Tessera namespace.
+
+This is `cron` + `inotify` + push handler unified into one
+mechanism.
+
+### 11.5 Tabellarius — the Tabellarius
+
+A device-wide push relay daemon. **Tabellarius** (Latin:
+*courier / letter-carrier*) is one daemon, all apps.
+
+- App registers a public key with its publisher at install.
+- Publisher's server pushes to the system's chosen relay,
+  addressed by app identity + public key.
+- Tabellarius decrypts, identifies the target app, **delivers
+  via Aqueduct** as a typed `push` message:
+  - If a resident background is running for the app, it
+    sends the message on the app's existing Aqueduct
+    connection. `SCM_CREDS` proves it came from Tabellarius.
+  - Otherwise, it asks Portcullis to spawn the triggered-bg
+    process per manifest (§11.4), then delivers once it is
+    up.
+- Tabellarius enforces isolation: app sees only its own
+  pushes.
+
+Delivery is **not** over per-jail loopback IPs even though
+vnet jails have their own IPs. Per-jail IPs exist for
+external networking (LAN discovery, server ports). Push is
+local IPC and rides on Aqueduct, which already provides
+faster transport, kernel-attested peer identity, and
+typed-message framing.
+
+Tabellarius is distinct from **Praeco** (user-facing
+notification toasts + history): Tabellarius is the
+*delivery* layer (remote → local app); Praeco is the
+*display* layer (local app → user). Apps typically receive
+a push via Tabellarius, then post a notification via
+Praeco. Either can happen without the other.
+
+The push relay is a network capability the user grants
+**once**, at OS setup. Apps do not pick their own relay —
+that is how the web ended up with N TCP connections per
+device.
+
+Strictly cleaner than Web Push: no per-app endpoint URLs,
+no Google-as-default-routing, no per-app TCP fan-out.
+
+### 11.6 Resource discipline
+
+Background execution must not drain battery, disk, network
+quota, or foreground responsiveness.
+
+| Knob | Mechanism |
+|---|---|
+| CPU / RSS | `rctl` per jail |
+| Network bytes | Broker (§4) meters and throttles |
+| Disk | Tessera namespace quota |
+| Scheduling priority | Scheduler `idle`-class by default for resident bg |
+
+The manifest's declared limits intersect with system hard
+limits; the *stricter* wins. The user sees aggregate
+per-app energy/data dashboards (kernel accounting + broker
+logs feed an Atrium app analogous to iOS's "Battery"
+screen).
+
+### 11.7 What this replaces from the web
+
+| Web mechanism | Atrium equivalent |
+|---|---|
+| Service Worker `fetch` interception | Document viewer mediates network. |
+| Service Worker `install`/`activate` | Normal app install/update flow. |
+| Service Worker background sync | Triggered bg with `alarm` or `network-resume`. |
+| Push API | Triggered bg with `push` via system broker. |
+| Web Worker | Another process in the same jail. |
+| SharedArrayBuffer / Atomics | Per-jail shared-memory capability (opt-in). |
+| Notifications API | `atrium_notify_*` in platform library. |
+| Wake Lock API | Foreground apps stay running while windowed; resident bg has its own lifecycle. |
+| Periodic Background Sync | `alarm` event with declared cadence. |
+
+Nine APIs collapse to "an app may have a resident process
+and/or be wakeable by named events."
+
+## 12. Addressing — names, manifests, content
+
+Content addressing (`atrium-doc://<hash>`) gives integrity,
+cacheability, archival. It does not give memorable names or
+publisher iteration. **Nomenclator** (Latin: the Roman
+household servant who whispered names to his master so he
+could greet visitors) is the name-resolution service that
+bridges the gap.
+
+### 12.1 Three-layer resolution
+
+```
+example.com / weather                     ← human-readable
+        ▼  (DNS-equivalent → publisher manifest URL + key)
+publisher manifest, signed                ← stable contract
+        ▼  (path lookup → current content hash)
+atrium-doc://<hash>                       ← content-addressed
+        ▼  (Tessera)
+the bytes                                 ← integrity-verified
+```
+
+Three layers, each doing one thing.
+
+### 12.2 Layer 1 — the name
+
+Reuse DNS. Names like `weather.example.com` resolve via a
+`TXT` record (or `_atrium.<name>` subdomain) pointing at:
+- Publisher manifest URL.
+- Publisher signing key fingerprint.
+
+```
+weather.example.com  TXT  "atrium-manifest=https://example.com/.well-known/atrium key=ed25519:abc..."
+```
+
+Replacing DNS is a separate problem outside this spec.
+Inheriting it is the right v0 call.
+
+### 12.3 Layer 2 — the publisher manifest
+
+Signed CBOR (small, less footgun than JSON). Sketch:
+
+```toml
+publisher  = "example.com"
+key        = "ed25519:abc..."
+signed-at  = "2026-05-21T..."
+expires-at = "2026-05-22T..."
+
+[content]
+"weather"                       = "atrium-doc://8f2a...c401"
+"weather/seattle"               = "atrium-doc://3b71...91ef"
+"weather/seattle?d=2026-05-20"  = "atrium-doc://5c12...7790"
+
+[archive]
+"weather" = ["atrium-doc://prev1...", "atrium-doc://prev2..."]
+```
+
+Manifest is itself content-addressed and cached.
+Nomenclator fetches the current manifest per freshness
+policy and verifies the signature.
+
+Properties:
+- **Verifiable** — publisher signs; tamper-detectable.
+- **Replayable** — every named URL resolves to a specific
+  hash; archival is structural.
+- **Atomic rollover** — single signed manifest moves any
+  number of paths at once.
+- **Forever-cacheable bytes** — only the resolution
+  invalidates, never the content.
+
+### 12.4 Layer 3 — content
+
+Resolved hash → Tessera → bytes. Already specified.
+
+### 12.5 Link traversal
+
+1. User activates `atrium-doc://example.com/weather`.
+2. Nomenclator: DNS TXT for `example.com`, manifest URL +
+   key.
+3. Fetch manifest if not cached fresh.
+4. Verify signature against key.
+5. Look up `weather` path → content hash.
+6. Tessera lookup. If absent, fetch *from anywhere*
+   (publisher CDN, peer device, P2P), verify hash on
+   receipt.
+7. Document viewer renders.
+
+**Step 6 is the win.** Because the address is the hash,
+bytes can come from any source. HTTPS-as-trust-anchor is
+not needed at the content layer; the publisher's signature
+on the manifest is the trust anchor.
+
+### 12.6 Properties that fall out
+
+- **Same name, different bytes over time.** Publisher
+  updates manifest. Old hashes remain valid; offline-cached
+  clients still render the older version.
+- **Specific historical content.**
+  `atrium-doc://example.com/weather?at=2026-05-20` resolves
+  through the manifest's `archive` section. Time-travel by
+  design.
+- **Publisher disappears.** Content survives in any cache
+  that has it. The name resolves to "no current manifest,
+  archived versions follow." Wayback-machine-as-default.
+
+### 12.7 App URLs
+
+Same structure, different scheme:
+
+```
+atrium-app://example.com/photos?path=/2026/sunset.jpg
+```
+
+Manifest entry resolves to "installed `com.example.photos`
+app at entry-point Y." Uninstalled apps prompt for install
+(after capability-manifest consent UI).
+
+App manifest declares entry-point patterns:
+
+```toml
+[entry-points]
+"/photos/album/{id}" = "open_album"
+"/photos/photo/{id}" = "open_photo"
+"/share-target"      = "receive_share"
+```
+
+Multiple apps may claim the same shape — user picks default,
+same model as iOS Universal Links / Android intent filters.
+
+### 12.8 What this does not solve
+
+- **DNS itself.** Centralized, vulnerable to seizure.
+  Replacing DNS is out of scope.
+- **Discovery.** "Find articles about X" is search, an app
+  problem, not an addressing problem. The platform does not
+  ship search; the web's accidental search-as-default-UX is
+  a URL-bar artifact we do not reproduce.
+- **Phishing.** Visual confusables (`examp1e.com`) still
+  work against a signed-manifest model. Hostname display
+  and security indicators are a UI problem, not an
+  addressing problem.
+
+## 13. Identity and sign-in
+
+### 13.1 First principles
+
+Three concerns the web conflated:
+
+1. **Authentication** — proving identity to a service.
+2. **Identification** — a stable handle.
+3. **Authorization scope** — what may be done on the user's
+   behalf.
+
+Browsers smashed these together because there was no
+platform identity layer. Atrium has one.
+
+### 13.2 OS as custodian, not identity provider
+
+Atrium **deliberately does not run a federated OS account**
+(no "Atrium ID" analogous to Apple ID / Google Account).
+That class of system evolves into a rent-extraction surface
+and lock-in mechanism.
+
+The OS provides a **keychain** — a system service holding
+cryptographic keys. Apps mint, use, and rotate keys via
+capability-gated API. The user manages identities through
+system UI. Federation, when it happens, is between
+*services*, not via the OS.
+
+Closer to `ssh-agent` / GPG than to the smartphone account
+model.
+
+### 13.3 Per-service keypairs
+
+Each service the user signs into gets a **fresh keypair**,
+minted on first sign-in:
+
+1. Service requests sign-in via the Limen
+   `sign-in` role (§10.3).
+2. Vestibulum's sign-in UI (outside the app's jail) walks the
+   user through persona choice, biometric/passcode, scope
+   review.
+3. Keychain mints ed25519 keypair specific to
+   (persona, service).
+4. Public key registered with the service; private key
+   stays in keychain, never exposed to the app.
+5. Subsequent sign-ins are challenge-response.
+
+This is WebAuthn / passkeys done right: per-service keypair,
+hardware-backed where available, no implicit shared identity.
+
+### 13.4 Federated sign-in with unlinkable pseudonyms
+
+For "sign in with $PROVIDER" patterns:
+
+1. App A requests identity from provider P via Limen.
+2. System UI: "Sign in to App A with P? P will see:
+   <claims>".
+3. User authorizes.
+4. P issues a signed claim about the user, scoped to App A.
+5. App A verifies P's signature against P's published key.
+
+**Crucial property: the user's identity at P is not
+exposed to App A as a stable cross-service identifier.**
+P issues a per-relying-party pseudonym (BBS+ /
+deterministic hash of `persona-id || service-id`). App A
+gets a handle stable in its own context that does not link
+the user across services.
+
+Cross-service tracking via federated sign-in becomes
+structurally impossible, not merely policy-restricted. The
+web has the cryptographic primitives but does not ship the
+unlinkable form by default because the federators benefit
+from linkability. Atrium ships it as the default.
+
+### 13.5 Sessions
+
+Long-lived authenticated broker connections (§4) carry
+session state; the keychain provides periodic
+re-attestation. Sessions are first-class connection state,
+not header bytes.
+
+For REST-shaped APIs that need short-lived tokens, the
+keychain mints scoped tokens on request (capability-typed:
+"read /api/v1/foo until T"). Macaroon-style but minted
+locally.
+
+### 13.6 Multiple personas
+
+A user has N personas (work, personal, throwaway). Each is
+a separate keychain bundle. Vestibulum's sign-in UI prompts
+persona on first interaction with a new service.
+
+Persona switching is at the **system** level, not per-app,
+because cross-persona linkage is the exact threat being
+prevented.
+
+This is what private browsing should have been: a real
+separate identity, not a cookie-jar half-measure.
+
+### 13.7 Recovery
+
+Device-bound keys can be lost. Atrium's answer is honest:
+
+- **Backup:** keychain encrypted with passphrase +
+  biometric + recovery key, stored in the user's Tessera
+  namespace.
+- **Multi-device sync:** opt-in paired-devices model; no
+  cloud account required, but the user may add a cloud
+  relay as a sync path.
+- **Recovery key:** printed/written at setup. Loss of all
+  devices + loss of recovery key = identity lost.
+
+The web pretends otherwise via email-based recovery — which
+means the user's identity is actually their email
+provider's identity. Atrium does not pretend.
+
+### 13.8 What this replaces from the web
+
+| Web mechanism | Atrium equivalent |
+|---|---|
+| Session cookies | Long-lived authenticated broker connections |
+| OAuth 2.0 | `sign-in` embed role with unlinkable pseudonyms |
+| OpenID Connect | Same, with claims via signed assertions |
+| WebAuthn / passkeys | Default — per-service keypair, hardware-backed |
+| "Sign in with Google" et al. | One option among many; OS pushes none |
+| SOP for credentials | Per-service keychain entry; no cross-origin leakage by construction |
+| `<input type="password">` | Vestibulum's sign-in UI handles credential entry; apps never see passwords |
+| Third-party cookies | Do not exist. Cross-service tracking requires explicit consent. |
+
+## 14. Updates and versioning
+
+### 14.1 Mechanism
+
+An update is a new signed bundle in Tessera. The publisher
+manifest (§12) points at the new content hash. Install
+flow:
+
+1. Resolver notices the manifest pointer changed.
+2. Fetch the new bundle by content hash.
+3. Verify signature against the publisher's installed key.
+4. Diff capability manifest against installed version
+   (§14.2).
+5. Atomic swap: app's installed-root pointer updates to
+   the new bundle hash.
+6. Resident background processes get SIGTERM with grace
+   period; next launch uses the new binaries.
+
+Steps 5–6 leverage Tessera's CAS shape: both versions exist
+on disk simultaneously during the swap. No half-installed
+state. Rollback is changing one pointer.
+
+### 14.2 Capability diff consent
+
+The user consented to a specific capability manifest at
+install. An update that *adds* capabilities must re-prompt;
+an update that drops or narrows them does not.
+
+- **Auto-accept** strict subsets of the previous manifest.
+- **Prompt** for additions, showing exactly what is new.
+- **Refuse** updates that fail signed-by-same-publisher.
+
+Enforced by content addressing: an update that lies about
+its capabilities cannot install because the manifest is
+part of the signed bundle.
+
+### 14.3 Update timing classes
+
+- **Automatic, in background** — trusted publisher, narrow
+  diff, low-impact app.
+- **Notified, deferred** — user sees diff, picks when to
+  apply.
+- **Required for next launch** — security update or
+  capability change forces it before next run.
+
+Publisher declares the *minimum* class; user can override
+toward *more conservative* but never less. An app that
+prefers frequent silent updates against the user's
+preference simply does not update on their device until
+they relent or uninstall.
+
+### 14.4 Resident-app hot swap
+
+Resident background processes update via graceful restart,
+not in-process module swap. State flushed to Tessera,
+process restarted, state restored. Same state-preserving
+suspend/resume machinery as dev iteration (§9.3).
+
+In-process hot module reload introduces version-skew
+complexity (old state, new code) and is deliberately not
+the production model.
+
+### 14.5 Rollback
+
+Trivial: change one pointer in the local install registry
+back to the previous bundle hash. Bytes are still on disk
+(Tessera CAS-FS does not reclaim until GC; user-installed
+version is a pin). User-facing "revert to previous version"
+is a real operation.
+
+### 14.6 Publisher key rotation
+
+The publisher manifest declares the signing key (§12.3).
+Rotation:
+
+- Publisher signs the new manifest with both old and new
+  keys for a transition period.
+- Resolver verifies either; clients see both keys until
+  the old one expires.
+- Old-key-signed manifests stop validating past the expiry.
+
+For high-risk publishers (payment, identity providers), the
+platform can pin a stable key; pinning changes require user
+consent, same as capability additions.
+
+## 15. Storage model
+
+Each app has a Tessera namespace mounted at a known path in
+its jail. This is the only persistent storage the app can
+write to.
+
+### 15.1 Sub-areas
+
+```
+/app                       — read-only, the installed bundle
+/data                      — read-write, persistent, backed up
+/cache                     — read-write, evictable, not backed up
+/tmp                       — tmpfs, gone at shutdown
+/shared/<channel>          — read-write, shared with other apps (cap-gated)
+```
+
+- `/app` — the bundle, mmap'd from Tessera CAS.
+- `/data` — what the user cares about losing.
+- `/cache` — performance-only; OS will evict under pressure.
+- `/tmp` — ephemeral, per-process or per-session.
+- `/shared/<channel>` — opt-in cross-app data sharing
+  (§15.4).
+
+### 15.2 Quotas
+
+Declared in the manifest (§5.1):
+
+```toml
+[storage]
+data  = "100MB"   # backed up
+cache = "1GB"     # evictable
+```
+
+Enforced by Tessera namespace quotas. The OS *will* evict
+`/cache` on disk pressure; apps must treat it as a soft
+hint.
+
+### 15.3 Backup
+
+`/data` is included in backups; `/cache` and `/tmp` are
+not. Apps do not manage backup themselves — they place data
+correctly, the OS handles backup against the user's chosen
+target. Declarative analogue of iOS's
+`NSURLIsExcludedFromBackupKey`.
+
+### 15.4 Cross-app sharing — named channels
+
+The web ties storage scope to identity (cookies / localStorage
+per origin), which breaks for many cases (multiple apps from
+one publisher; apps that should share data without sharing
+identity).
+
+Atrium answer: explicit named channels.
+
+```toml
+[shared.export]
+"com.example.photos.library" = { mode = "read-write" }
+
+[shared.import]
+"com.example.photos.library" = { mode = "read" }
+```
+
+App A exports; App B imports. The system mediates: B sees
+A's exported subtree at `/shared/com.example.photos.library`.
+Capability-gated; user consents to the link at install or
+via powerbox runtime grant.
+
+No origin-as-trust-boundary, no "same publisher" tests.
+User controls who sees what.
+
+### 15.5 Sync
+
+Opt-in capability per app:
+
+```toml
+[sync]
+enabled = true
+target  = "user-default"
+```
+
+System sync service handles replication; app's `/data`
+becomes the synced subtree. Apps do not implement sync
+themselves.
+
+Conflict resolution: CRDT-based at the Tessera level where
+possible; per-app conflict-resolution capability for cases
+where structure matters (calendar collisions, document
+concurrent edits).
+
+### 15.6 What this replaces from the web
+
+| Web mechanism | Atrium equivalent |
+|---|---|
+| Cookies | Per-service keychain entries (§13); no app data in headers |
+| `localStorage` | `/data` |
+| `sessionStorage` | `/tmp` or process memory |
+| IndexedDB | `/data` + SQLite-or-similar in the platform library |
+| Cache API | `/cache`, evictable |
+| File System Access API | Scrinium grants per-file fds |
+| Origin Private File System | `/data` — already origin-equivalent by jail |
+| Shared Web Workers | Resident background process |
+| BroadcastChannel | Aqueduct pub/sub |
+| Storage Access API (third-party cookies) | Named shared channels with explicit consent |
+
+## 16. Forms and autofill
+
+The web has decades of "autofill" pain: every site rolls its
+own form layout, browser heuristically guesses which input is
+"first name," password managers fight with site JavaScript,
+saved credit card numbers leak across origins.
+
+Atrium answer: extend powerbox (§5.2) to **data items**.
+
+### 16.1 Loculus — the wallet service
+
+**Loculus** (Latin: *small carried purse / box for
+valuables*) is a system service holding user-curated data
+items:
+
+- Addresses (with labels: Home, Work, …).
+- Payment methods (card or device-bound payment token).
+- Saved form profiles.
+- Generated identities (for one-off "create account" flows).
+
+Loculus UI is system-trusted, outside any app's jail.
+
+### 16.2 Autofill flow
+
+1. App requests `autofill` via Limen with a type
+   filter (`address`, `payment`, …).
+2. Loculus overlays the app's window (Pergola surface
+   owned by Loculus, not the app).
+3. User picks one item.
+4. **Only the picked item** is delivered to the app via a
+   typed message; the rest of Loculus remains invisible.
+
+The app never reads Loculus. The app never sees items the
+user did not pick. Same trust shape as Scrinium (file
+picker).
+
+### 16.3 Credentials are not in Loculus
+
+Passwords and passkeys live in the keychain (§13), not in
+Loculus. Sign-in flows go through Vestibulum's sign-in UI
+(§13.3), which never reveals credentials to the app.
+
+The split (credentials in keychain managed by Vestibulum;
+structured user data in Loculus) keeps the highest-risk
+data on its own management path.
+
+## 17. Media, codecs, DRM
+
+### 17.1 Codec capability
+
+Common codecs (H.264, H.265, AV1, VP9, Opus, AAC, FLAC) are
+a platform service accessible by all apps via the platform
+library. Hardware-decode where the device supports it; CPU
+fallback otherwise.
+
+Exotic codecs are libraries the app links into its bundle.
+Decode runs in the app's jail; no platform involvement.
+
+### 17.2 DRM — opt-in capability, not platform mandate
+
+DRM (hardware-attested decryption for protected content) is
+an explicit capability requiring a signed publisher → device
+attestation chain. Apps that genuinely need it (streaming
+services with content-licensing constraints) declare:
+
+```toml
+[capabilities]
+drm-attestation = ["widevine-l1", "fairplay"]
+```
+
+The capability gates access to a hardware-backed crypto
+service. The service performs the attestation handshake and
+returns a decrypted stream the app can render but not
+reroute.
+
+**The platform does not mandate DRM.** Atrium does not ship
+an EME-equivalent that every browser must support. Apps
+without the capability simply cannot decrypt DRM-protected
+streams; apps that need it install the capability and the
+chain at publisher discretion.
+
+The honest position: DRM is a service some apps want and
+some users tolerate. The OS provides the mechanism; the
+ecosystem chooses whether to use it.
+
+### 17.3 Encrypted-media playback
+
+The standard pipeline for the (rare) DRM case:
+
+```
+publisher's CDN → encrypted bytes → app
+                                     │
+                                     ▼
+              hardware crypto service (attested)
+                                     │
+                                     ▼
+              composited surface (no app readback)
+```
+
+The decrypted bytes never appear in app memory; only in the
+hardware path through to the compositor's secure-surface
+slot. Pixel-readback rules from §10.3.3 apply.
+
+## 18. Device access
+
+Camera, microphone, geolocation, accelerometer, ambient
+light, etc.
+
+All powerbox-mediated. No ambient "this app may use the
+camera at any time" capability.
+
+### 18.1 Capture devices (camera, microphone)
+
+System UI presents a "record" affordance overlaid on the
+app's window (Pergola surface owned by the system, like
+autofill in §16.2). User taps to start; an fd to the
+capture stream is delivered to the app. Stopping is
+system-mediated; the indicator (recording icon, system
+sound) is non-spoofable.
+
+Session-bounded: closing the affordance terminates the
+stream. Background capture requires a separate, loudly
+disclosed capability and shows a persistent system
+indicator.
+
+### 18.2 Geolocation
+
+Two flows:
+
+- **One-shot share:** user invokes system location picker,
+  optionally adjusts pin, confirms. App receives one
+  location.
+- **Session grant:** for navigation-shaped apps. User
+  authorizes a session with a visible system indicator and
+  an explicit timer. Session ends on app close or timer
+  expiry; no "always" tier without manifest declaration +
+  install-time consent.
+
+### 18.3 Sensors
+
+Accelerometer / gyroscope / barometer / etc. — fall into
+two classes:
+
+- **High-rate motion sensors** require a capability,
+  because they leak surrounding activity (keystrokes,
+  speech, location via dead reckoning).
+- **Coarse-resolution sensors** (ambient light, battery,
+  etc.) are available by default; rate-limited.
+
+The platform classifies; manifests declare; powerbox
+mediates for runtime sensitive grants.
+
+## 19. Peer-to-peer networking — Concursus
+
+WebRTC's value is browser-mediated peer connections with
+NAT traversal and signaling consent. Insula's answer:
+**Concursus** (Latin: *a coming-together*), a system service
+analogous to Tabellarius (§11.5) but for symmetric
+device-to-device channels.
+
+### 19.1 Architecture
+
+```
+app A (device 1)    Concursus       Concursus    app B (device 2)
+       │              (system)        (system)             │
+       │  request_peer(role=…, B's pub-key)               │
+       ├─────────────►                                    │
+       │              │  signaling via known relay        │
+       │              ├──────────────────────────────────►│
+       │              │                                   │
+       │              │  STUN/TURN-equivalent             │
+       │              │  NAT traversal                    │
+       │              │                                   │
+       │  channel established (typed role)                │
+       │◄═════════════╪══════════════════════════════════►│
+```
+
+### 19.2 Capability shape
+
+Apps declare peer roles in manifest:
+
+```toml
+[peer.implements]
+"file-share" = "..."
+
+[peer.requests]
+"file-share" = "..."
+```
+
+Concursus matches roles; both sides must declare the role
+to establish a peer.
+
+### 19.3 Trust and consent
+
+User-visible consent prompt at peer establishment time —
+"Connect to <peer identity> for <role>?" The connecting
+peer's identity is the device's attested identity (§13.2);
+unknown peers prompt loudly.
+
+Channels carry typed role messages, same shape as embed
+roles (§10.3.2). No raw byte streams unless `raw-peer`
+capability is declared and consented to.
+
+### 19.4 Signaling and relays
+
+Signaling rides on a system-chosen relay (analogous to the
+push relay). User picks at setup; defaults to a public
+free-tier relay; can be self-hosted.
+
+The relay sees encrypted signaling traffic only — it cannot
+read peer messages, which are end-to-end encrypted with
+per-channel keys derived from device identities.
+
+## 20. Notifications — Praeco
+
+User-visible notifications are handled by **Praeco** (the
+existing Atrium notifications service — see NAMING.md).
+Insula's contribution is the contract Insula apps use when
+calling Praeco, and the interaction with Tabellarius (§11.5)
+for push-driven notifications.
+
+### 20.1 Posting
+
+App posts a typed notification via Praeco:
+
+```c
+atrium_praeco_post(.title=..., .body=..., .actions=[...],
+                   .urgency=PRAECO_URGENCY_DEFAULT,
+                   .group=..., .replaces_id=...);
+```
+
+`actions` are declared in the manifest and resolve to
+triggered-bg events or deep-link entry points (§12.7).
+
+### 20.2 User interaction
+
+Tap on notification → activates declared action. The
+foreground app launches at the declared deep-link, or the
+triggered-bg event fires. Notification dismissal is a
+silent system event the app may subscribe to.
+
+### 20.3 User control
+
+System UI shows per-app notification settings: urgency
+filters, group muting, do-not-disturb interactions, quiet
+hours. App-level controls live outside the app.
+
+Standard mobile-OS shape; nothing exotic.
+
+## 21. Internationalization
+
+Locale, layout direction, font fallback, calendar, and
+number formatting are **system-wide settings** inherited by
+all apps via the platform library and Pergola.
+
+- Apps query the current locale; layout primitives in
+  Pergola handle RTL/LTR mirroring without per-widget
+  opt-in.
+- Font fallback walks a system-managed font stack; missing-
+  glyph rendering never produces tofu silently in a
+  certified app (Pergola flags it).
+- AX names (§10.4) follow the same locale path as visible
+  text.
+
+Detail lives in the Pergola spec; this design only commits
+to "locale is a system property apps inherit," not to the
+specific Pergola API.
+
+## 22. Scale and dedup
+
+The "I have 500 apps installed" question. The web's answer:
+every site re-downloads its JS/CSS/assets, partially saved
+by HTTP caching that misses constantly. Native app
+ecosystems (iOS, Android) are better — but still pay full
+size per app.
+
+Atrium's answer is **Tessera's content-addressed dedup**:
+
+- Chunk-level dedup: same library shipped by two apps
+  shares its bytes on disk.
+- `tessera-binsplit` (function-level dedup, on the
+  roadmap): same function compiled by two apps shares
+  bytes even if surrounding code differs.
+- Shared assets (system fonts, common icons) are pulled
+  from a system-namespace once, used by all apps.
+
+Per-app marginal install cost is dominated by the truly-
+unique bytes, not the package size. 500 apps on Atrium take
+substantially less disk than 500 apps on a non-dedup OS.
+
+The user-facing surface: install-size reports show *unique
+bytes* and *shared bytes*, so the user understands the
+actual cost of an install.
+
+## 23. Threat model
+
+What follows is the explicit "what can attackers do, what
+they can't, what's residual risk" pass. Spec hardening, not
+new design.
+
+### 23.1 Adversary classes
+
+| Class | Capability |
+|---|---|
+| Malicious publisher | Authors a signed bundle they intend to misuse |
+| Compromised publisher | Legitimate signing key stolen, attacker pushes malicious update |
+| Network adversary | Observes / tampers with traffic between device and publisher |
+| Co-resident app | Other installed app on the same device |
+| Local user with physical access | Has device in hand |
+| Hardware attacker | Side channels, fault injection, supply chain |
+
+### 23.2 What the design defends against
+
+**Malicious publisher** — limited by capabilities. App can
+only do what the manifest declared and the user accepted at
+install. Powerbox confines the rest. Damage is bounded.
+
+**Compromised publisher** — capability-diff consent (§14.2)
+blocks silent expansion. Update introducing new caps stops
+on the user's review. Key pinning (§14.6) protects
+high-risk apps. Damage is detectable and reversible
+(rollback, §14.5).
+
+**Network adversary** — content-addressed bundles + signed
+publisher manifests (§12) mean tampering is detectable.
+Confidentiality of in-transit content is the publisher's
+TLS responsibility; the platform's trust anchor is the
+publisher's signing key, not the CA system.
+
+**Co-resident app** — jail boundary (§4.1) is the security
+boundary. Cross-jail composition (§10.3) preserves
+isolation; pixel readback prohibited; AX composition
+mediated. Cross-service tracking prevented by per-service
+keypairs (§13.3) and unlinkable federated pseudonyms
+(§13.4). Side channels (timing, cache) bounded by §10.3.6
+mitigations and per-jail GPU contexts.
+
+**Local user with physical access** — outside this spec's
+scope. Disk encryption, screen-lock, biometric, recovery
+keys are platform concerns covered elsewhere.
+
+**Hardware attacker** — out of scope. Atrium relies on the
+underlying FreeBSD + hardware security primitives.
+
+### 23.3 What the design does NOT defend against
+
+Honesty matters more than reassurance:
+
+- **Phishing** at the name layer (visual-confusable hosts,
+  §12.8). UI mitigations help; cryptography does not.
+- **Social engineering** through powerbox prompts — a user
+  who clicks "yes" on every prompt can be tricked. UI
+  design and prompt phrasing matter; the model is "make it
+  obvious," not "make it impossible."
+- **Side channels we have not enumerated.** Timing,
+  cache, power, EM, acoustic — Atrium does what current
+  best practice requires (per-jail GPU contexts, no
+  shared-CPU SMT siblings between jails when feasible)
+  but cannot promise immunity.
+- **Implementation bugs.** Any of the trusted system
+  services (Portcullis, Limen, Tabellarius, Concursus,
+  Loculus, Vestibulum, Nomenclator, Praeco, compositor) is
+  a source of vulnerability if implemented incorrectly.
+  Threat model design must be backed by implementation
+  rigor; this spec does not promise the latter.
+
+### 23.4 Trusted system surface
+
+The trusted-computing-base for this design:
+
+- FreeBSD kernel.
+- Atrium-specific kernel modules (jail extensions, GPU
+  ABI).
+- Portcullis daemons.
+- Aqueduct + Castellum.
+- Fresco compositor.
+- Pergola toolkit (only for AX correctness and embed slot
+  policies; apps that use other toolkits are still
+  sandboxed correctly).
+- Insula services: Limen, Tabellarius, Loculus, Concursus,
+  Nomenclator.
+- Adjacent Atrium services Insula leans on: Vestibulum
+  (sign-in + keychain), Praeco (notifications), Scrinium
+  (pickers), Opifex (bundle install/update), Tabula
+  (clipboard).
+- Network capability broker (`atrium-netd`).
+
+Anything outside this list is untrusted. App code is
+untrusted regardless of language, signature, or publisher.
+
+### 23.5 Capability hygiene principles
+
+For each capability the platform might add:
+
+1. **Default-deny.** Manifest must declare; install must
+   consent.
+2. **Powerbox for intermittent grants.** Don't ask the user
+   for ambient authority; mint per-use capabilities at
+   point of use.
+3. **Loud indicators for ambient grants.** If a capability
+   is in effect (recording, location), the system indicator
+   must be visible and non-spoofable.
+4. **Scope to the smallest useful unit.** Per-host network,
+   per-file storage, per-service identity.
+5. **Time-bound where possible.** Sessions expire;
+   re-grants are cheap; "forever" requires explicit
+   manifest declaration.
+6. **No reach-through.** A capability granted to an app
+   does not transitively grant it to embedded children;
+   each jail's caps are its own.
+
+## 24. Open questions
+
+- **Name.** Working title only. Needs to slot into the
+  Atrium architectural vocabulary.
+- **IR format precise choice.** WASM is the realistic pick;
+  the exact link-shim shape between WASM module imports and
+  `libatrium.so` needs spec work.
+- **A11y wire format.** §10.4 locks the structural decisions;
+  the wire-level Aqueduct message format for tree snapshots,
+  subscription updates, and inbound activation requests
+  still needs spec work. Likely lives in a sibling
+  `docs/spec/atrium-ax.md`.
+- **Document authoring-format details.** §10.6 fixes the
+  multi-format strategy; the precise Markdown-superset
+  extensions and the HTML+CSS subset's bounded layout-
+  primitive set need spec work.
+- **App deep-link / URL equivalent.** Need a stable
+  addressing scheme for "open this app at this position."
+  (Documents have it via content-addressed
+  `atrium-doc://<hash>#anchor`; apps need an analogue.)
+  Manifest-declared entry points are the obvious shape;
+  details pending.
+- **Publisher-manifest CBOR schema (Nomenclator).** §12
+  fixes the three-layer resolution shape; the precise CBOR
+  field layout, freshness rules, and key-rotation semantics
+  need spec work. Likely lives in a sibling
+  `docs/spec/nomenclator.md`.
+- **Limen role catalogue.** §10.3 fixes the architecture;
+  the initial role catalogue, the wire format for typed
+  messages, and Limen's manifest surface still need spec
+  work. Likely a sibling `docs/spec/limen.md`.
+- **Tabellarius wire / relay protocol.** §11.5 fixes the
+  delivery semantics; the wire format between publisher
+  server → relay → Tabellarius and the relay-discovery /
+  user-choice UX need spec work. Likely
+  `docs/spec/tabellarius.md`.
+- **Loculus item schema.** §16 fixes the data-item powerbox
+  pattern; the concrete item schemas (address, payment,
+  profile) need spec work. Likely
+  `docs/spec/loculus.md`.
+- **Concursus signaling / NAT-traversal.** §19 fixes the
+  shape; the actual STUN/TURN-equivalent protocol and
+  relay-discovery story need spec work. Likely
+  `docs/spec/concursus.md`.
+- **Keychain naming.** Currently described descriptively as
+  part of Vestibulum's responsibility (§13). Open question
+  whether it deserves its own Latin name (candidate:
+  *Clavarium*) or stays an internal aspect of Vestibulum.
+- **Network broker policy expressiveness.** Hostname + port +
+  proto is the floor; TLS pinning, allowed methods, allowed
+  paths are reasonable additions; the line between policy and
+  app-internal logic needs to be drawn.
+- **Cross-arch fat-binary tooling.** If publishers ship native
+  for multiple arches, bundle format needs a slice picker
+  analogous to Mach-O fat headers.
+
+## 25. References
+
+### Atrium services Insula depends on
+
+- `docs/NAMING.md` — canonical naming reference for the
+  Atrium platform.
+- `docs/spec/portcullis.md` — jail launcher and capability
+  enforcement (this spec's enforcement layer).
+- `docs/spec/pergola.md` — toolkit (this spec's UI layer).
+- `docs/spec/fresco-rendering-stack.md` — compositor.
+- `docs/spec/aqueduct.md` — IPC substrate.
+- `docs/spec/stoa.md` — persistent session service.
+- `docs/spec/tessera-fs.md` — content-addressed FS.
+- `docs/spec/atrium-pkg.md`,
+  `docs/spec/atrium-pkg-registry.md` — Opifex packaging and
+  registry (overlap with §3 / §14 to be reconciled).
+- `docs/spec/atrium-netd.md` — network capability broker.
+
+### Sibling Insula component specs (planned, not yet written)
+
+- `docs/spec/limen.md` — embed broker + role catalogue.
+- `docs/spec/tabellarius.md` — push delivery protocol.
+- `docs/spec/loculus.md` — wallet schema.
+- `docs/spec/concursus.md` — peer signaling.
+- `docs/spec/nomenclator.md` — name resolution protocol.
+- `docs/spec/atrium-ax.md` — accessibility wire format
+  (referenced from §10.4).
+
+### Explicitly NOT used by Insula
+
+- `docs/spec/tier2-renderer.md`,
+  `docs/spec/tier2-shader-codegen-constraints.md` — bespoke
+  shader codegen (specialized for shaders; not an app-
+  scripting backend).
