@@ -24,6 +24,10 @@ aqueduct-gpu-client = { path = "../aqueduct-gpu-client" }
 # lines of error-prone hand-defined Vk* structs.
 ash             = { version = "0.38", default-features = false }
 sha2            = "0.10"
+# Postcard-encoding the Tier2PipelineStateBlob carried inside
+# OP_GPU_PIPELINE_CREATE state_blob. The aqueduct-gpu wire types
+# already serde-derive; this just gives us the encoder.
+postcard        = { version = "1", features = ["use-std"] }
 
 [dev-dependencies]
 aqueduct-gpu-host = { path = "../aqueduct-gpu-host" }

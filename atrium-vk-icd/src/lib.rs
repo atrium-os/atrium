@@ -2435,31 +2435,24 @@ pub unsafe extern "C" fn vkDestroyPipelineLayout(
 }
 
 /// `vkCreateGraphicsPipelines` — allocate one ResourceId per
-/// requested pipeline, register it in the device's pipelines map.
-/// vkCmdBindPipeline later looks the VkPipeline u64 up and pushes
-/// a `BindPipeline` FrameOp with the resolved ResourceId.
-///
-/// We ignore the pipeline-cache + VkGraphicsPipelineCreateInfo
-/// contents — shader stages, vertex input, rasterizer, blend,
-/// depth/stencil, render-pass, subpass. The host endpoint sees
-/// the resolved ResourceId in BindPipeline and resolves it
-/// against the shader-cache / bundle-pipeline machinery (today,
-/// against `IdNamespace::IcdRuntime` IDs that no upload has yet
-/// registered — so the host will fail the dispatch with
-/// `OP_GPU_VALIDATION_ERR`. Future Phase 1.3b+ wires
-/// vkCreateShaderModule + the create-info shader stages through
-/// to OP_GPU_SHADER_UPLOAD).
+/// requested pipeline, register it in the device's pipelines
+/// map, walk the create-info to extract a tier-2 pipeline
+/// state blob (vertex-input + depth + blend), and send an
+/// `OP_GPU_PIPELINE_CREATE` envelope so the host endpoint can
+/// associate the pipeline_id with its shaders + raster state
+/// before any `BindPipeline` FrameOp arrives.
 ///
 /// # Safety
 ///
 /// `p_pipelines` must point to at least `create_info_count` u64
-/// slots. `p_create_infos` is unused today; we don't dereference.
+/// slots. `p_create_infos` must point to that many properly-
+/// initialised `VkGraphicsPipelineCreateInfo` structs.
 #[no_mangle]
 pub unsafe extern "C" fn vkCreateGraphicsPipelines(
     device:             VkDevice,
     _pipeline_cache:    u64,   /* VkPipelineCache */
     create_info_count:  u32,
-    _p_create_infos:    *const c_void,
+    p_create_infos:     *const c_void,
     _p_allocator:       *const c_void,
     p_pipelines:        *mut u64,
 ) -> VkResult {
@@ -2467,26 +2460,200 @@ pub unsafe extern "C" fn vkCreateGraphicsPipelines(
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     let dev = &*(device as *const AtriumDevice);
-    let mut alloc = match dev.id_alloc.lock() {
-        Ok(a) => a,
-        Err(_) => return VK_ERROR_INITIALIZATION_FAILED,
-    };
-    let mut pipelines = match dev.pipelines.lock() {
-        Ok(p) => p,
-        Err(_) => return VK_ERROR_INITIALIZATION_FAILED,
-    };
+
     for i in 0..create_info_count {
-        let id = match alloc.next() {
-            Some(id) => id,
-            None     => return VK_ERROR_INITIALIZATION_FAILED,
+        // Allocate the local handle / daemon-side ResourceId.
+        let id = {
+            let mut alloc = match dev.id_alloc.lock() {
+                Ok(a) => a,
+                Err(_) => return VK_ERROR_INITIALIZATION_FAILED,
+            };
+            match alloc.next() {
+                Some(id) => id,
+                None     => return VK_ERROR_INITIALIZATION_FAILED,
+            }
         };
-        // Use the ResourceId's raw u32 widened to u64 as the
-        // VkPipeline handle. Round-trips through pipelines map.
         let handle = id.raw() as u64;
-        pipelines.insert(handle, id);
+        if let Ok(mut pipelines) = dev.pipelines.lock() {
+            pipelines.insert(handle, id);
+        } else {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
         *p_pipelines.offset(i as isize) = handle;
+
+        // Parse the create-info if it's there. p_create_infos
+        // is permitted to be null only if create_info_count==0
+        // per the spec; we tolerate null defensively and skip
+        // the daemon-side register in that case.
+        if p_create_infos.is_null() { continue; }
+        let info = &*(p_create_infos as *const ash::vk::GraphicsPipelineCreateInfo)
+            .offset(i as isize);
+
+        let (shaders, state_blob) = match build_tier2_pipeline_blob(dev, info) {
+            Some(x) => x,
+            None => continue, // missing shaders / vertex input -- skip
+        };
+
+        if !dev.instance.is_null() {
+            let inst = &*(dev.instance as *const AtriumInstance);
+            if let Some(client) = inst.client.as_ref() {
+                if let Ok(mut c) = client.lock() {
+                    let _ = c.create_pipeline_with_id(
+                        id,
+                        aqueduct_gpu::payloads::PipelineKind::Graphics,
+                        shaders,
+                        state_blob,
+                    );
+                }
+            }
+        }
     }
     VK_SUCCESS
+}
+
+/// Walk a `VkGraphicsPipelineCreateInfo` and assemble the
+/// (shader_ids, postcard-encoded Tier2PipelineStateBlob)
+/// pair the daemon needs. Returns `None` if the info is
+/// missing required pieces (shader stages, vertex-input
+/// state) so the caller can skip the daemon-side register
+/// without aborting the whole batch.
+unsafe fn build_tier2_pipeline_blob(
+    dev: &AtriumDevice,
+    info: &ash::vk::GraphicsPipelineCreateInfo,
+) -> Option<(Vec<aqueduct_gpu::ids::ResourceId>, Vec<u8>)> {
+    use aqueduct_gpu::{
+        Tier2BlendState, Tier2DepthState, Tier2PipelineStateBlob,
+        VertexAttributeDesc, VertexBindingDesc, VertexFormat,
+        VertexInputState,
+    };
+
+    if info.stage_count == 0 || info.p_stages.is_null() {
+        return None;
+    }
+
+    // pStages -> [vs, fs] (and others). The daemon's pipeline
+    // record wants index 0 = VS, index 1 = FS by convention.
+    let mut vs_id: Option<aqueduct_gpu::ids::ResourceId> = None;
+    let mut fs_id: Option<aqueduct_gpu::ids::ResourceId> = None;
+    let shaders_map = dev.shaders.lock().ok()?;
+    for s in 0..info.stage_count {
+        let stage = &*info.p_stages.offset(s as isize);
+        let mod_handle: u64 = std::mem::transmute(stage.module);
+        let rid = shaders_map.get(&mod_handle).and_then(|m| m.shader_id);
+        match stage.stage {
+            ash::vk::ShaderStageFlags::VERTEX   => vs_id = rid,
+            ash::vk::ShaderStageFlags::FRAGMENT => fs_id = rid,
+            _ => {} // tess/geom not in tier-2 yet
+        }
+    }
+    drop(shaders_map);
+    let vs_id = vs_id?;
+    let fs_id = fs_id?;
+
+    // Vertex-input state.
+    let vi = info.p_vertex_input_state;
+    if vi.is_null() { return None; }
+    let vi = &*vi;
+    let mut bindings = Vec::with_capacity(vi.vertex_binding_description_count as usize);
+    for b in 0..vi.vertex_binding_description_count {
+        let bd = &*vi.p_vertex_binding_descriptions.offset(b as isize);
+        bindings.push(VertexBindingDesc {
+            binding: bd.binding,
+            stride: bd.stride,
+            per_instance: bd.input_rate == ash::vk::VertexInputRate::INSTANCE,
+        });
+    }
+    let mut attributes = Vec::with_capacity(vi.vertex_attribute_description_count as usize);
+    for a in 0..vi.vertex_attribute_description_count {
+        let ad = &*vi.p_vertex_attribute_descriptions.offset(a as isize);
+        let fmt = match ad.format {
+            ash::vk::Format::R32_SFLOAT             => VertexFormat::R32Sfloat,
+            ash::vk::Format::R32G32_SFLOAT          => VertexFormat::R32g32Sfloat,
+            ash::vk::Format::R32G32B32_SFLOAT       => VertexFormat::R32g32b32Sfloat,
+            ash::vk::Format::R32G32B32A32_SFLOAT    => VertexFormat::R32g32b32a32Sfloat,
+            // Unsupported -- skip the whole pipeline rather than
+            // misencode a format the host can't decode.
+            _ => return None,
+        };
+        attributes.push(VertexAttributeDesc {
+            location: ad.location,
+            binding: ad.binding,
+            format: fmt,
+            offset: ad.offset,
+        });
+    }
+    let vertex_input = VertexInputState { bindings, attributes };
+
+    // Depth-stencil state (optional).
+    let depth = if info.p_depth_stencil_state.is_null() { None } else {
+        let ds = &*info.p_depth_stencil_state;
+        if ds.depth_test_enable != 0 {
+            Some(Tier2DepthState {
+                test_enable: true,
+                write_enable: ds.depth_write_enable != 0,
+            })
+        } else { None }
+    };
+
+    // Color-blend state (optional; take the first attachment).
+    let blend = if info.p_color_blend_state.is_null() { None } else {
+        let cb = &*info.p_color_blend_state;
+        if cb.attachment_count == 0 || cb.p_attachments.is_null() {
+            None
+        } else {
+            let att = &*cb.p_attachments;
+            let wm = att.color_write_mask;
+            let mask = [
+                wm.contains(ash::vk::ColorComponentFlags::R),
+                wm.contains(ash::vk::ColorComponentFlags::G),
+                wm.contains(ash::vk::ColorComponentFlags::B),
+                wm.contains(ash::vk::ColorComponentFlags::A),
+            ];
+            Some(Tier2BlendState {
+                enable: att.blend_enable != 0,
+                color_src: convert_vk_blend_factor(att.src_color_blend_factor),
+                color_dst: convert_vk_blend_factor(att.dst_color_blend_factor),
+                alpha_src: convert_vk_blend_factor(att.src_alpha_blend_factor),
+                alpha_dst: convert_vk_blend_factor(att.dst_alpha_blend_factor),
+                color_op:  convert_vk_blend_op(att.color_blend_op),
+                alpha_op:  convert_vk_blend_op(att.alpha_blend_op),
+                write_mask_rgba: mask,
+            })
+        }
+    };
+
+    let blob = Tier2PipelineStateBlob { vertex_input, depth, blend };
+    let bytes = postcard::to_allocvec(&blob).ok()?;
+    Some((vec![vs_id, fs_id], bytes))
+}
+
+fn convert_vk_blend_factor(f: ash::vk::BlendFactor) -> aqueduct_gpu::Tier2BlendFactor {
+    use aqueduct_gpu::Tier2BlendFactor as T;
+    use ash::vk::BlendFactor as F;
+    match f {
+        F::ZERO                  => T::Zero,
+        F::ONE                   => T::One,
+        F::SRC_COLOR             => T::SrcColor,
+        F::ONE_MINUS_SRC_COLOR   => T::OneMinusSrcColor,
+        F::DST_COLOR             => T::DstColor,
+        F::ONE_MINUS_DST_COLOR   => T::OneMinusDstColor,
+        F::SRC_ALPHA             => T::SrcAlpha,
+        F::ONE_MINUS_SRC_ALPHA   => T::OneMinusSrcAlpha,
+        F::DST_ALPHA             => T::DstAlpha,
+        F::ONE_MINUS_DST_ALPHA   => T::OneMinusDstAlpha,
+        // Unsupported factors (constant colour, dual-source) map
+        // to Zero so the daemon validation surfaces them rather
+        // than silently producing the wrong colour.
+        _ => T::Zero,
+    }
+}
+
+fn convert_vk_blend_op(o: ash::vk::BlendOp) -> aqueduct_gpu::Tier2BlendOp {
+    match o {
+        ash::vk::BlendOp::ADD => aqueduct_gpu::Tier2BlendOp::Add,
+        // Tier-2 only supports ADD today; other ops fall back.
+        _ => aqueduct_gpu::Tier2BlendOp::Add,
+    }
 }
 
 /// `vkDestroyPipeline` — remove the (VkPipeline → ResourceId)

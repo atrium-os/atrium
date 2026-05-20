@@ -300,6 +300,23 @@ impl GpuClient {
         Ok(pipeline_id)
     }
 
+    /// Variant of [`Client::create_pipeline`] that takes a caller-
+    /// supplied pre-allocated ResourceId rather than allocating
+    /// one itself. The ICD uses this because pipeline IDs double
+    /// as VkPipeline handles -- the ID is allocated up-front by
+    /// the device's own pool, and the daemon-side registration
+    /// just needs to be told about it.
+    pub fn create_pipeline_with_id(
+        &mut self,
+        pipeline_id: ResourceId,
+        kind: PipelineKind,
+        shaders: Vec<ResourceId>,
+        state_blob: Vec<u8>,
+    ) -> GpuClientResult<()> {
+        let req = PipelineCreatePayload { pipeline_id, kind, shaders, state_blob };
+        self.send(OP_GPU_PIPELINE_CREATE, 0, &req)
+    }
+
     /// Destroy a pipeline.
     pub fn destroy_pipeline(&mut self, pipeline_id: ResourceId) -> GpuClientResult<()> {
         let req = PipelineDestroyPayload { pipeline_id };
