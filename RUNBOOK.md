@@ -3908,7 +3908,7 @@ for the existing FS-validation tests).
 | R.4 v2 side-plane clip (left/right/top/bottom) | landed   | clip-space Sutherland-Hodgman, +2 tests |
 | R.5 blending + colour write mask | ✅ landed | 06a7667 |
 | R.6 tiled pixel loop (8×8) | ✅ landed | bb9348e |
-| R.6 v2 per-tile edge-function trivial reject | deferred | — |
+| R.6 v2 per-tile edge-function trivial reject | landed   | tile-corner edge test before per-pixel loop |
 | R.7 per-stripe parallelism (rayon) | ✅ landed | b72da8a |
 | **R.8 SIMD pixel quads** | **deferred — see below** | — |
 

@@ -648,6 +648,44 @@ fn rasterize_stripe(
         let t_max_y = ((tile_y + 1) * TILE_SIZE - 1).min(setup.max_y);
         if t_min_x > t_max_x || t_min_y > t_max_y { continue; }
 
+        // R.6 v2 — per-tile trivial reject.  Each Pineda edge
+        // function is linear in (x, y), so its extrema over an
+        // axis-aligned rectangle are attained at the corners.
+        // If every corner of the tile is on the outside of
+        // some single edge, no pixel in the tile can be inside
+        // the triangle → skip the entire per-pixel loop.  This
+        // is the standard tile-rasterizer trivial reject; it's
+        // a pure perf opt (the per-pixel test that follows is
+        // the same one).
+        let corners: [(f32, f32); 4] = [
+            (t_min_x as f32 + 0.5, t_min_y as f32 + 0.5),
+            (t_max_x as f32 + 0.5, t_min_y as f32 + 0.5),
+            (t_min_x as f32 + 0.5, t_max_y as f32 + 0.5),
+            (t_max_x as f32 + 0.5, t_max_y as f32 + 0.5),
+        ];
+        let e0: [f32; 4] = corners.map(|p| edge_fn(b, c, p));
+        let e1: [f32; 4] = corners.map(|p| edge_fn(c, a, p));
+        let e2: [f32; 4] = corners.map(|p| edge_fn(a, b, p));
+        // For a CCW triangle (total_edge > 0) a pixel is inside
+        // when every edge is >= 0; the tile is trivially out
+        // when some edge has max < 0 across all 4 corners.  For
+        // CW (total_edge < 0) the inside test flips, so the
+        // trivial-reject flips too.
+        let tile_rejected = if setup.total_edge > 0.0 {
+            e0.iter().copied().fold(f32::NEG_INFINITY, f32::max) < 0.0
+            || e1.iter().copied().fold(f32::NEG_INFINITY, f32::max) < 0.0
+            || e2.iter().copied().fold(f32::NEG_INFINITY, f32::max) < 0.0
+        } else if setup.total_edge < 0.0 {
+            e0.iter().copied().fold(f32::INFINITY, f32::min) > 0.0
+            || e1.iter().copied().fold(f32::INFINITY, f32::min) > 0.0
+            || e2.iter().copied().fold(f32::INFINITY, f32::min) > 0.0
+        } else {
+            // Degenerate (zero-area) triangle: per-pixel loop
+            // already early-outs on total_edge == 0.
+            true
+        };
+        if tile_rejected { continue; }
+
         for py in t_min_y..=t_max_y {
             for px in t_min_x..=t_max_x {
                 let cx = px as f32 + 0.5;
