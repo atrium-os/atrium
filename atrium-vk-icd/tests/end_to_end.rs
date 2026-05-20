@@ -1712,13 +1712,15 @@ fn vertex_index_buffer_bind_and_draw_indexed_records() {
     unsafe { vkEndCommandBuffer(cb); }
 
     let bytes = cmdbuf_recorded_bytes(cb);
-    // Three records: BindVertexBuf (8+16=24), BindIndexBuf (8+20=28),
-    // DrawIndexed (8+20=28). Total 80.
-    assert_eq!(bytes.len(), 80, "expected 80 bytes, got {}", bytes.len());
+    // Three records: BindVertexBuf (8+16=24), BindIndexBuf (8+16=24),
+    // DrawIndexed (8+20=28). Total 76. (BindIndexBuf shrank from
+    // 28 to 24 when the ICD migrated from a hand-rolled 20-byte
+    // body to the typed BindIndexBufCmd shape -- see D-arc.)
+    assert_eq!(bytes.len(), 76, "expected 76 bytes, got {}", bytes.len());
 
     let op0 = u16::from_le_bytes([bytes[ 0], bytes[ 1]]);
     let op1 = u16::from_le_bytes([bytes[24], bytes[25]]);
-    let op2 = u16::from_le_bytes([bytes[52], bytes[53]]);
+    let op2 = u16::from_le_bytes([bytes[48], bytes[49]]);
     assert_eq!(op0, 0x0022, "BindVertexBuf");
     assert_eq!(op1, 0x0023, "BindIndexBuf");
     assert_eq!(op2, 0x0041, "DrawIndexed");

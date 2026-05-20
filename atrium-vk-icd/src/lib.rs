@@ -2863,14 +2863,11 @@ pub unsafe extern "C" fn vkCmdSetViewport(
     if p_viewports.is_null() { return; }
     for i in 0..viewport_count {
         let vp = &*p_viewports.offset(i as isize);
-        let mut body = [0u8; 24];
-        body[ 0.. 4].copy_from_slice(&vp.x.to_le_bytes());
-        body[ 4.. 8].copy_from_slice(&vp.y.to_le_bytes());
-        body[ 8..12].copy_from_slice(&vp.width.to_le_bytes());
-        body[12..16].copy_from_slice(&vp.height.to_le_bytes());
-        body[16..20].copy_from_slice(&vp.min_depth.to_le_bytes());
-        body[20..24].copy_from_slice(&vp.max_depth.to_le_bytes());
-        let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::SetViewport, &body);
+        let _ = cb.frame.push_set_viewport(aqueduct_gpu::frame::SetViewportCmd {
+            x: vp.x, y: vp.y,
+            width: vp.width, height: vp.height,
+            min_depth: vp.min_depth, max_depth: vp.max_depth,
+        });
     }
 }
 
@@ -3028,12 +3025,9 @@ pub unsafe extern "C" fn vkCmdDraw(
     first_instance: u32,
 ) {
     let Some(cb) = cmdbuf_recording(command_buffer) else { return };
-    let mut body = [0u8; 16];
-    body[ 0.. 4].copy_from_slice(&vertex_count.to_le_bytes());
-    body[ 4.. 8].copy_from_slice(&instance_count.to_le_bytes());
-    body[ 8..12].copy_from_slice(&first_vertex.to_le_bytes());
-    body[12..16].copy_from_slice(&first_instance.to_le_bytes());
-    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::Draw, &body);
+    let _ = cb.frame.push_draw(aqueduct_gpu::frame::DrawCmd {
+        vertex_count, instance_count, first_vertex, first_instance,
+    });
 }
 
 /// Helper: resolve a VkBuffer u64 to its daemon-side ResourceId via
@@ -3071,17 +3065,21 @@ pub unsafe extern "C" fn vkCmdBindVertexBuffers(
         let buffer_handle = *p_buffers.offset(i as isize);
         let offset        = *p_offsets.offset(i as isize);
         let rid = resolve_buffer(cb, buffer_handle);
-        let mut body = [0u8; 16];
-        body[ 0.. 4].copy_from_slice(&(first_binding + i).to_le_bytes());
-        body[ 4.. 8].copy_from_slice(&rid.raw().to_le_bytes());
-        body[ 8..16].copy_from_slice(&offset.to_le_bytes());
-        let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::BindVertexBuf, &body);
+        let _ = cb.frame.push_bind_vertex_buf(aqueduct_gpu::frame::BindVertexBufCmd {
+            binding: first_binding + i,
+            buffer_id: rid.raw(),
+            offset,
+        });
     }
 }
 
-/// `vkCmdBindIndexBuffer` — one `BindIndexBuf` FrameOp.
-/// Body: { buffer_id: u32, _pad: u32, offset: u64, index_type: u32 }
-/// — 20 bytes. index_type: 0=UINT16, 1=UINT32 (VkIndexType enum).
+/// `vkCmdBindIndexBuffer` — one `BindIndexBuf` FrameOp using the
+/// typed [`aqueduct_gpu::frame::BindIndexBufCmd`] body (16 B):
+/// `{ buffer_id: u32, index_type: u32, offset: u64 }`. VkIndexType
+/// values 0 (UINT16) and 1 (UINT32) map straight onto
+/// [`aqueduct_gpu::frame::IndexType`]; other values surface as
+/// `OP_GPU_VALIDATION_ERR` on the host (we still push to keep
+/// errors deferred and observable).
 #[no_mangle]
 pub unsafe extern "C" fn vkCmdBindIndexBuffer(
     command_buffer: VkCommandBuffer,
@@ -3091,11 +3089,19 @@ pub unsafe extern "C" fn vkCmdBindIndexBuffer(
 ) {
     let Some(cb) = cmdbuf_recording(command_buffer) else { return };
     let rid = resolve_buffer(cb, buffer);
-    let mut body = [0u8; 20];
-    body[ 0.. 4].copy_from_slice(&rid.raw().to_le_bytes());
-    body[ 8..16].copy_from_slice(&offset.to_le_bytes());
-    body[16..20].copy_from_slice(&index_type.to_le_bytes());
-    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::BindIndexBuf, &body);
+    let it = match index_type {
+        0 => aqueduct_gpu::frame::IndexType::Uint16,
+        // Treat anything other than UINT16 as UINT32 -- the
+        // tier-2 path rejects non-{0,1} index_type at decode
+        // time anyway, and dropping the record here would mask
+        // the error.
+        _ => aqueduct_gpu::frame::IndexType::Uint32,
+    };
+    let _ = cb.frame.push_bind_index_buf(aqueduct_gpu::frame::BindIndexBufCmd {
+        buffer_id: rid.raw(),
+        index_type: it,
+        offset,
+    });
 }
 
 /// `vkCmdDrawIndexed` — like vkCmdDraw but with an index-buffer
@@ -3111,13 +3117,10 @@ pub unsafe extern "C" fn vkCmdDrawIndexed(
     first_instance: u32,
 ) {
     let Some(cb) = cmdbuf_recording(command_buffer) else { return };
-    let mut body = [0u8; 20];
-    body[ 0.. 4].copy_from_slice(&index_count.to_le_bytes());
-    body[ 4.. 8].copy_from_slice(&instance_count.to_le_bytes());
-    body[ 8..12].copy_from_slice(&first_index.to_le_bytes());
-    body[12..16].copy_from_slice(&(vertex_offset as u32).to_le_bytes());
-    body[16..20].copy_from_slice(&first_instance.to_le_bytes());
-    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::DrawIndexed, &body);
+    let _ = cb.frame.push_draw_indexed(aqueduct_gpu::frame::DrawIndexedCmd {
+        index_count, instance_count, first_index,
+        vertex_offset, first_instance,
+    });
 }
 
 /// `vkCreateImage` — record an AtriumImage. The memory binding
