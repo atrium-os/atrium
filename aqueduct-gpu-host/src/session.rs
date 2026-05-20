@@ -458,6 +458,13 @@ impl Session {
         // Tier-2 default-no-op on `bind_pipeline_tier2`.
         use aqueduct_gpu::payloads::PipelineKind;
         if matches!(req.kind, PipelineKind::Graphics) {
+            if let Some(vs_sid) = req.shaders.first().copied() {
+                if let Some(rec) = self.table.get_shader(vs_sid) {
+                    if let Some(tier2) = rec.tier2_id {
+                        self.backend.bind_pipeline_tier2_vs(req.pipeline_id, tier2);
+                    }
+                }
+            }
             if let Some(frag_id) = req.shaders.get(1).copied() {
                 if let Some(rec) = self.table.get_shader(frag_id) {
                     if let Some(tier2) = rec.tier2_id {

@@ -677,3 +677,150 @@ fn tier2_backend_dispatch_first_vertex_offset() {
     let v2 = f32::from_le_bytes(asm.bytes[8..12].try_into().unwrap());
     assert_eq!((v0, v1, v2), (20.0, 30.0, 40.0));
 }
+
+// ---- D.5: hello-triangle end-to-end through the wire ----
+
+fn build_passthrough_vs_d5() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, ExecutionModel,
+        FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+
+    let void = b.type_void();
+    let f32_ty = b.type_float(32, None);
+    let i32_ty = b.type_int(32, 1);
+    let vec3 = b.type_vector(f32_ty, 3);
+    let vec4 = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+
+    let per_vertex = b.type_struct(vec![vec4]);
+    b.member_decorate(per_vertex, 0, Decoration::BuiltIn,
+        vec![rspirv::dr::Operand::BuiltIn(BuiltIn::Position)]);
+    b.member_decorate(per_vertex, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(per_vertex, Decoration::Block, vec![]);
+
+    let ptr_pv = b.type_pointer(None, StorageClass::Output, per_vertex);
+    let ptr_out_vec4 = b.type_pointer(None, StorageClass::Output, vec4);
+    let ptr_in_vec3  = b.type_pointer(None, StorageClass::Input, vec3);
+
+    let in_pos = b.variable(ptr_in_vec3, None, StorageClass::Input, None);
+    b.decorate(in_pos, Decoration::Location,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let pv_var = b.variable(ptr_pv, None, StorageClass::Output, None);
+    let c_zero  = b.constant_bit32(i32_ty, 0u32);
+    let c_one_f = b.constant_bit32(f32_ty, 1.0f32.to_bits());
+
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let pos = b.load(vec3, None, in_pos, None, vec![]).unwrap();
+    let x = b.composite_extract(f32_ty, None, pos, vec![0]).unwrap();
+    let y = b.composite_extract(f32_ty, None, pos, vec![1]).unwrap();
+    let z = b.composite_extract(f32_ty, None, pos, vec![2]).unwrap();
+    let pos4 = b.composite_construct(vec4, None, vec![x, y, z, c_one_f]).unwrap();
+    let dst = b.access_chain(ptr_out_vec4, None, pv_var, vec![c_zero]).unwrap();
+    b.store(dst, pos4, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Vertex, main, "main", vec![in_pos, pv_var]);
+
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn tier2_backend_d5_hello_triangle_through_wire() {
+    use aqueduct_gpu::frame::{BindVertexBufCmd, DrawCmd, FrameBuilder, SetViewportCmd};
+    use aqueduct_gpu::opcodes::FrameOp;
+    use aqueduct_gpu::{
+        VertexAttributeDesc, VertexBindingDesc, VertexFormat, VertexInputState,
+    };
+
+    let cache_dir = TempDir::new().unwrap();
+    let registry = Arc::new(Tier2Registry::new(LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    }));
+
+    let vs_id = registry.register(&build_passthrough_vs_d5()).expect("vs");
+    let fs_id = registry.register(&build_constant_color_spirv([1.0, 0.2, 0.2, 1.0]))
+        .expect("fs");
+    let backend = Tier2Backend::new(registry);
+
+    let image_id    = ResourceId::new(IdNamespace::IcdRuntime, 0xF001);
+    let pipeline_id = ResourceId::new(IdNamespace::IcdRuntime, 0xF002);
+    let vbuf_id     = ResourceId::new(IdNamespace::IcdRuntime, 0xF003);
+
+    backend.image_created(image_id, 8, 8);
+    backend.bind_pipeline_vs(pipeline_id, vs_id);
+    backend.bind_pipeline(pipeline_id, fs_id);
+    backend.bind_layout(pipeline_id, VertexInputState {
+        bindings: vec![VertexBindingDesc {
+            binding: 0, stride: 12, per_instance: false,
+        }],
+        attributes: vec![VertexAttributeDesc {
+            location: 0, binding: 0,
+            format: VertexFormat::R32g32b32Sfloat, offset: 0,
+        }],
+    });
+
+    // Same NDC triangle as rasterizer_r1_hello_triangle.
+    let mut src = Vec::<u8>::with_capacity(36);
+    for v in [[-0.5_f32, -0.5, 0.0], [0.5, -0.5, 0.0], [0.0, 0.5, 0.0]] {
+        for f in v { src.extend_from_slice(&f.to_le_bytes()); }
+    }
+    backend.buffer_created(vbuf_id, 36);
+    backend.buffer_write_bytes(vbuf_id, 0, &src).unwrap();
+
+    let mut fb = FrameBuilder::new(4096);
+    let mut begin = [0u8; 12];
+    begin[..4].copy_from_slice(&image_id.raw().to_le_bytes());
+    begin[4..8].copy_from_slice(&8u32.to_le_bytes());
+    begin[8..12].copy_from_slice(&8u32.to_le_bytes());
+    fb.push(FrameOp::BeginRenderPass, &begin).unwrap();
+    fb.push(FrameOp::BindPipeline, &pipeline_id.raw().to_le_bytes()).unwrap();
+    fb.push_set_viewport(SetViewportCmd {
+        x: 0.0, y: 0.0, width: 8.0, height: 8.0,
+        min_depth: 0.0, max_depth: 1.0,
+    }).unwrap();
+    fb.push_bind_vertex_buf(BindVertexBufCmd {
+        binding: 0, buffer_id: vbuf_id.raw(), offset: 0,
+    }).unwrap();
+    fb.push_draw(DrawCmd {
+        vertex_count: 3, instance_count: 1,
+        first_vertex: 0, first_instance: 0,
+    }).unwrap();
+    fb.push(FrameOp::EndRenderPass, &[]).unwrap();
+
+    let fence = ResourceId::new(IdNamespace::IcdRuntime, 0xF004);
+    backend.submit_frame(fence, 1, fb.as_bytes());
+
+    assert_eq!(backend.draw_count(), 1);
+
+    let pixels = backend.read_image_pixels(image_id).unwrap();
+    let px = |x: usize, y: usize| -> [u8; 4] {
+        let i = (y * 8 + x) * 4;
+        [pixels[i], pixels[i+1], pixels[i+2], pixels[i+3]]
+    };
+    let red = [255u8, 51, 51, 255];
+
+    // Interior pixels of the same triangle the rasterizer
+    // unit test verified.
+    assert_eq!(px(2, 2), red, "inside (2,2): {:?}", px(2, 2));
+    assert_eq!(px(4, 2), red, "inside (4,2): {:?}", px(4, 2));
+    assert_eq!(px(3, 3), red, "inside (3,3): {:?}", px(3, 3));
+    assert_eq!(px(4, 4), red, "inside (4,4): {:?}", px(4, 4));
+
+    // Outside pixels stay at cleared (0,0,0,0).
+    assert_eq!(px(0, 0), [0, 0, 0, 0]);
+    assert_eq!(px(7, 7), [0, 0, 0, 0]);
+    assert_eq!(px(4, 0), [0, 0, 0, 0]);
+}

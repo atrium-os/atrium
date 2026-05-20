@@ -156,6 +156,17 @@ pub trait Backend: Send + Sync {
         _tier2_shader_id: crate::Tier2ShaderId,
     ) {}
 
+    /// Associate a pipeline with its Tier-2 *vertex* shader.
+    /// Mirrors [`Backend::bind_pipeline_tier2`] (which carries
+    /// the fragment shader). The session calls this when
+    /// `PipelineCreatePayload::shaders[0]` resolves to a
+    /// Tier-2-compiled vertex shader. Default no-op.
+    fn bind_pipeline_tier2_vs(
+        &self,
+        _pipeline_id: ResourceId,
+        _tier2_shader_id: crate::Tier2ShaderId,
+    ) {}
+
     /// Associate a vertex-input layout with a pipeline. Called
     /// by the session when `PipelineCreatePayload::state_blob`
     /// decodes as a [`aqueduct_gpu::Tier2PipelineStateBlob`].

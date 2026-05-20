@@ -55,6 +55,11 @@ pub struct Tier2Backend {
     /// shader to fire for each `FrameOp::BindPipeline`
     /// record it walks.
     pipeline_shaders: Mutex<HashMap<u32, Tier2ShaderId>>,
+    /// Per-pipeline Tier-2 vertex shader (mirror of
+    /// `pipeline_shaders` for VS). Populated by
+    /// [`Tier2Backend::bind_pipeline_vs`] when the session
+    /// processes a Tier-2 graphics pipeline create.
+    pipeline_vs_shaders: Mutex<HashMap<u32, Tier2ShaderId>>,
     /// Vertex-input layout keyed by pipeline ResourceId.raw().
     /// Populated by [`Tier2Backend::bind_pipeline_layout`] when
     /// the session decodes a `Tier2PipelineStateBlob`. The
@@ -113,6 +118,8 @@ struct PassState {
     /// Tier-2 fragment shader bound to the current pipeline,
     /// looked up via `pipeline_shaders` at BindPipeline time.
     tier2_shader: Option<Tier2ShaderId>,
+    /// Tier-2 vertex shader bound to the current pipeline.
+    tier2_vs_shader: Option<Tier2ShaderId>,
     /// Vertex-buffer bindings keyed by slot number.
     vertex_buffers: HashMap<u32, BoundVertexBuffer>,
     /// Currently-bound index buffer.
@@ -171,6 +178,7 @@ impl Tier2Backend {
             images: Mutex::new(HashMap::new()),
             buffers: Mutex::new(HashMap::new()),
             pipeline_shaders: Mutex::new(HashMap::new()),
+            pipeline_vs_shaders: Mutex::new(HashMap::new()),
             pipeline_layouts: Mutex::new(HashMap::new()),
             last_assembled_vertices: Mutex::new(None),
             submissions: AtomicU64::new(0),
@@ -212,6 +220,18 @@ impl Tier2Backend {
         shader_id: Tier2ShaderId,
     ) {
         self.pipeline_shaders.lock().unwrap()
+            .insert(pipeline_id.raw(), shader_id);
+    }
+
+    /// Associate a pipeline ResourceId with its Tier-2 vertex
+    /// shader. The frame-walker uses both the VS + FS bindings
+    /// when dispatching a `Draw` against `fill_image_triangle`.
+    pub fn bind_pipeline_vs(
+        &self,
+        pipeline_id: ResourceId,
+        shader_id: Tier2ShaderId,
+    ) {
+        self.pipeline_vs_shaders.lock().unwrap()
             .insert(pipeline_id.raw(), shader_id);
     }
 
@@ -282,7 +302,8 @@ impl Tier2Backend {
     /// existing integration tests; D.5+ migrates them to real
     /// Draw records).
     fn execute_pass(&self, target_id: ResourceId, pass_bytes: &[u8]) {
-        let pipeline_shaders = self.pipeline_shaders.lock().unwrap().clone();
+        let pipeline_shaders    = self.pipeline_shaders.lock().unwrap().clone();
+        let pipeline_vs_shaders = self.pipeline_vs_shaders.lock().unwrap().clone();
         let mut state = PassState::default();
         let mut decoder = FrameDecoder::new(pass_bytes);
 
@@ -303,8 +324,9 @@ impl Tier2Backend {
                         let raw = u32::from_le_bytes([
                             body[0], body[1], body[2], body[3]
                         ]);
-                        state.pipeline_raw  = Some(raw);
-                        state.tier2_shader  = pipeline_shaders.get(&raw).copied();
+                        state.pipeline_raw    = Some(raw);
+                        state.tier2_shader    = pipeline_shaders.get(&raw).copied();
+                        state.tier2_vs_shader = pipeline_vs_shaders.get(&raw).copied();
                     } else {
                         log::warn!("BindPipeline body too short ({} bytes)", body.len());
                     }
@@ -424,13 +446,62 @@ impl Tier2Backend {
             }
         };
 
-        *self.last_assembled_vertices.lock().unwrap() = Some(assembled);
+        *self.last_assembled_vertices.lock().unwrap() = Some(assembled.clone());
         self.draws_executed.fetch_add(1, Ordering::Relaxed);
-        log::debug!("Draw target={target_id} verts={} inst={} first_vert={} \
-                     attrs={} stride={}",
-                    cmd.vertex_count, cmd.instance_count, cmd.first_vertex,
-                    layout.attributes.len(),
-                    layout.bindings.iter().map(|b| b.stride).sum::<u32>());
+
+        // D.5: if a Tier-2 VS is bound, treat the assembled
+        // bytes as a triangle list and call fill_image_triangle
+        // for each triangle. With no VS bound (i.e. only an FS
+        // -- the legacy "fullscreen FS fill" pattern), the
+        // post-loop fallback in execute_pass handles it.
+        let Some(vs_shader_id) = state.tier2_vs_shader else { return };
+        let Some(fs_shader_id) = state.tier2_shader else { return };
+
+        if assembled.vertex_count % 3 != 0 {
+            log::warn!("Draw target={target_id}: vertex_count {} is not a \
+                        multiple of 3; non-triangle topologies aren't \
+                        supported by tier-2 yet",
+                       assembled.vertex_count);
+            return;
+        }
+
+        let stride = assembled.stride as usize;
+        let tri_count = (assembled.vertex_count / 3) as usize;
+
+        // Lock the image storage for the duration of all
+        // triangles in this Draw. Each fill_image_triangle
+        // call mutates the target's pixel buffer; we hold the
+        // map lock to avoid the map being reshaped under us.
+        let mut images = self.images.lock().unwrap();
+        let img = match images.get_mut(&(target_id.raw() as u64)) {
+            Some(i) => i,
+            None => {
+                log::warn!("Draw target={target_id}: target image not registered");
+                return;
+            }
+        };
+        let width = img.width;
+        let height = img.height;
+        let pixels = &mut img.pixels[..];
+
+        for t in 0..tri_count {
+            let v0 = &assembled.bytes[(3*t)*stride   .. (3*t+1)*stride];
+            let v1 = &assembled.bytes[(3*t+1)*stride .. (3*t+2)*stride];
+            let v2 = &assembled.bytes[(3*t+2)*stride .. (3*t+3)*stride];
+            let dt = crate::tier2_registry::DrawTriangle {
+                vertex_attrs: [v0, v1, v2],
+                push_constants: &state.push_constants,
+                ..Default::default()
+            };
+            if let Err(e) = self.registry.fill_image_triangle(
+                vs_shader_id, fs_shader_id,
+                &dt, width, height, pixels, None,
+            ) {
+                log::warn!("Draw target={target_id}: triangle {t}/{tri_count} \
+                            fill_image_triangle failed: {e}");
+                return;
+            }
+        }
     }
 
     /// Gather per-vertex attribute bytes for `vertex_count`
@@ -638,6 +709,14 @@ impl Backend for Tier2Backend {
         tier2_shader_id: Tier2ShaderId,
     ) {
         self.bind_pipeline(pipeline_id, tier2_shader_id);
+    }
+
+    fn bind_pipeline_tier2_vs(
+        &self,
+        pipeline_id: ResourceId,
+        tier2_shader_id: Tier2ShaderId,
+    ) {
+        self.bind_pipeline_vs(pipeline_id, tier2_shader_id);
     }
 
     fn bind_pipeline_layout(
