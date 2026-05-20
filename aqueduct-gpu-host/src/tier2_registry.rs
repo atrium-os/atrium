@@ -354,12 +354,43 @@ impl Tier2Registry {
             ClipVertex { pos: clip_positions[i], varyings }
         }).collect();
 
-        // Near plane: cz >= 0 (Vulkan convention).
+        // R.4 v1 — near plane: cz >= 0 (Vulkan convention).
         polygon = clip_polygon_plane(&polygon, |v| v.pos[2]);
         if polygon.is_empty() { return Ok(()); }
-        // Far plane: cz <= cw  ⇔  cw - cz >= 0.
+        // R.4 v1 — far plane: cz <= cw  ⇔  cw - cz >= 0.
         polygon = clip_polygon_plane(&polygon, |v| v.pos[3] - v.pos[2]);
         if polygon.is_empty() { return Ok(()); }
+
+        // R.4 v2 — side planes.  Each side plane has a clip-
+        // space signed-distance function vanishing on the
+        // plane, positive on the visible side.  Per Vulkan's
+        // [-w, w] cube convention:
+        //
+        //   left   plane: cx >= -cw  ⇔  cx + cw >= 0
+        //   right  plane: cx <=  cw  ⇔  cw - cx >= 0
+        //   bottom plane: cy >= -cw  ⇔  cy + cw >= 0
+        //   top    plane: cy <=  cw  ⇔  cw - cy >= 0
+        //
+        // Without these the rasterizer relied on screen-space
+        // bbox clamping after perspective divide, which is fine
+        // for orthographic projection + on-screen geometry but
+        // breaks down when a triangle straddles a side edge:
+        // the perspective divide and barycentric interpolation
+        // produce values outside the [0,1] interpolation range
+        // on the clamped side.  R.4 v2 trims the geometry
+        // before perspective divide, so every fragment the
+        // rasterizer sees has barycentrics in the canonical
+        // [0,1] range and per-vertex varyings interpolate
+        // correctly.
+        polygon = clip_polygon_plane(&polygon, |v| v.pos[0] + v.pos[3]);
+        if polygon.is_empty() { return Ok(()); }
+        polygon = clip_polygon_plane(&polygon, |v| v.pos[3] - v.pos[0]);
+        if polygon.is_empty() { return Ok(()); }
+        polygon = clip_polygon_plane(&polygon, |v| v.pos[1] + v.pos[3]);
+        if polygon.is_empty() { return Ok(()); }
+        polygon = clip_polygon_plane(&polygon, |v| v.pos[3] - v.pos[1]);
+        if polygon.is_empty() { return Ok(()); }
+
         // Polygon needs at least 3 vertices to triangulate.
         if polygon.len() < 3 { return Ok(()); }
 

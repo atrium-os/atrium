@@ -1293,3 +1293,110 @@ fn rasterizer_r1_degenerate_triangle_covers_only_line_pixels() {
          triangles whose pixel centres don't lie exactly on the \
          degenerate line)");
 }
+
+/// R.4 v2 acceptance: a triangle straddling the right side
+/// plane gets clipped before perspective divide. Without
+/// side-plane clipping the rasterizer relied on screen-space
+/// bbox clamping, which is correct only for orthographic
+/// projection -- under perspective the clamped fragments end
+/// up with barycentric weights outside [0,1] and varying
+/// interpolation produces values outside the per-vertex range.
+///
+/// This test draws a triangle with v0 far outside the right
+/// side, v1, v2 inside; uses a colour varying that ranges
+/// from red at v0 to blue at v1/v2; and confirms that every
+/// painted pixel has interpolated colour values within the
+/// per-vertex range [0, 1]. Without R.4 v2 the painted pixels
+/// off the right edge of the bbox (but on-screen after clamp)
+/// would carry extrapolated colour values < 0 or > 1.
+#[test]
+fn rasterizer_r4v2_right_side_plane_clips_off_screen_vertex() {
+    let cache_dir = TempDir::new().unwrap();
+    let config = LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    };
+    let registry = Tier2Registry::new(config);
+    let vs_id = registry.register(&build_vec4_position_vs()).unwrap();
+    let fs_id = registry.register(&build_passthrough_color_fs()).unwrap();
+
+    // v0 well off the right (clip x = 3.0, w = 1.0 -> NDC x = 3.0).
+    // v1, v2 well inside.
+    let v0 = pack_vec4([ 3.0, -0.5, 0.0, 1.0]);
+    let v1 = pack_vec4([-0.5, -0.5, 0.0, 1.0]);
+    let v2 = pack_vec4([-0.5,  0.5, 0.0, 1.0]);
+    let c0 = pack_vec4([1.0, 0.0, 0.0, 1.0]); // red @ v0 (off-screen)
+    let c1 = pack_vec4([0.0, 0.0, 1.0, 1.0]); // blue @ v1
+    let c2 = pack_vec4([0.0, 0.0, 1.0, 1.0]); // blue @ v2
+
+    let mut pixels = vec![0u8; 16 * 16 * 4];
+    let draw = DrawTriangle {
+        vertex_attrs: [&v0, &v1, &v2],
+        varyings_per_vertex: [&c0, &c1, &c2],
+        varying_f32_count: 4,
+        ..Default::default()
+    };
+    registry.fill_image_triangle(
+        vs_id, fs_id, &draw, 16, 16, &mut pixels, None,
+    ).expect("clip + rasterise");
+
+    let mut painted = 0usize;
+    for chunk in pixels.chunks_exact(4) {
+        if chunk == [0, 0, 0, 0] { continue; }
+        painted += 1;
+        // Every painted pixel's R + B should sum to <= 255 + 1
+        // (allowing u8 quantisation rounding). Extrapolated
+        // barycentrics would produce out-of-range values which
+        // saturate to 255 in both channels.
+        let r = chunk[0] as u32;
+        let g = chunk[1] as u32;
+        let b = chunk[2] as u32;
+        assert!(r + b <= 256,
+            "pixel with R={r} B={b} (sum {}) suggests extrapolated \
+             barycentrics (clip-space clipping isn't trimming the \
+             right side plane)", r + b);
+        assert_eq!(g, 0, "G channel should stay 0 (no green vertex)");
+    }
+    assert!(painted > 0,
+        "no pixels painted -- side-plane clip culled too much");
+}
+
+/// R.4 v2 acceptance: triangle fully off-screen to one side
+/// (right plane) is culled to nothing. Without side-plane
+/// clipping the screen-space bbox would also clip it away,
+/// but only by coincidence; the cleaner contract is
+/// "side-plane clip drops it before rasterization."
+#[test]
+fn rasterizer_r4v2_fully_off_right_side_culled() {
+    let cache_dir = TempDir::new().unwrap();
+    let config = LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    };
+    let registry = Tier2Registry::new(config);
+    let vs_id = registry.register(&build_vec4_position_vs()).unwrap();
+    let fs_id = registry.register(&build_passthrough_color_fs()).unwrap();
+
+    // All 3 vertices have cx > cw (right of the right plane).
+    let v0 = pack_vec4([2.0, -0.5, 0.0, 1.0]);
+    let v1 = pack_vec4([3.0, -0.5, 0.0, 1.0]);
+    let v2 = pack_vec4([2.5,  0.5, 0.0, 1.0]);
+    let red = pack_vec4([1.0, 0.0, 0.0, 1.0]);
+
+    let mut pixels = vec![0u8; 16 * 16 * 4];
+    let draw = DrawTriangle {
+        vertex_attrs: [&v0, &v1, &v2],
+        varyings_per_vertex: [&red, &red, &red],
+        varying_f32_count: 4,
+        ..Default::default()
+    };
+    registry.fill_image_triangle(
+        vs_id, fs_id, &draw, 16, 16, &mut pixels, None,
+    ).expect("clip + rasterise");
+
+    assert!(pixels.iter().all(|&b| b == 0),
+        "fully-right-of-right-plane triangle painted pixels -- \
+         R.4 v2 side-plane clip should have culled it");
+}

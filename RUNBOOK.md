@@ -3905,7 +3905,7 @@ for the existing FS-validation tests).
 | R.2 perspective-correct varying interpolation | ✅ landed | 96f5e82 |
 | R.3 depth buffer (LESS + write) | ✅ landed | 1739d55 |
 | R.4 near/far Sutherland-Hodgman clip | ✅ landed | 0f3f8cd |
-| R.4 v2 side-plane clip (left/right/top/bottom) | deferred | — |
+| R.4 v2 side-plane clip (left/right/top/bottom) | landed   | clip-space Sutherland-Hodgman, +2 tests |
 | R.5 blending + colour write mask | ✅ landed | 06a7667 |
 | R.6 tiled pixel loop (8×8) | ✅ landed | bb9348e |
 | R.6 v2 per-tile edge-function trivial reject | deferred | — |
