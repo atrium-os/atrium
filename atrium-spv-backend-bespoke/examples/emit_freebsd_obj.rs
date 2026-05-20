@@ -1026,6 +1026,85 @@ fn eval_heavy4(n: i32) -> [f32; 4] {
 /// `vec4(in_pos.xyz, 1.0)`, stores into
 /// `gl_Position`. On-target gate for the vertex-stage
 /// arc — same shader the host differential gates.
+/// gl_Position = mvp * vec4(in_pos, 1.0).  Reads a 4x4 column-major
+/// matrix from descriptor set 0 binding 0 (member 0 of the uniform
+/// block, MatrixStride=16, ColMajor) and a vec3 attribute at location 0.
+/// Matrix arc phase 6 — in-VM gate for the full Mat4 lowering chain.
+fn build_vertex_mvp_spirv() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, ExecutionModel,
+        FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+
+    let void = b.type_void();
+    let f32_ty = b.type_float(32, None);
+    let i32_ty = b.type_int(32, 1);
+    let vec3 = b.type_vector(f32_ty, 3);
+    let vec4 = b.type_vector(f32_ty, 4);
+    let mat4 = b.type_matrix(vec4, 4);
+    let void_fn = b.type_function(void, vec![]);
+
+    let per_vertex_struct = b.type_struct(vec![vec4]);
+    b.member_decorate(per_vertex_struct, 0, Decoration::BuiltIn,
+                      vec![rspirv::dr::Operand::BuiltIn(BuiltIn::Position)]);
+    b.member_decorate(per_vertex_struct, 0, Decoration::Offset,
+                      vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(per_vertex_struct, Decoration::Block, vec![]);
+
+    let ub_struct = b.type_struct(vec![mat4]);
+    b.member_decorate(ub_struct, 0, Decoration::Offset,
+                      vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.member_decorate(ub_struct, 0, Decoration::MatrixStride,
+                      vec![rspirv::dr::Operand::LiteralBit32(16)]);
+    b.member_decorate(ub_struct, 0, Decoration::ColMajor, vec![]);
+    b.decorate(ub_struct, Decoration::Block, vec![]);
+
+    let ptr_pv_struct = b.type_pointer(None, StorageClass::Output, per_vertex_struct);
+    let ptr_out_vec4  = b.type_pointer(None, StorageClass::Output, vec4);
+    let ptr_ub_struct = b.type_pointer(None, StorageClass::Uniform, ub_struct);
+    let ptr_ub_mat4   = b.type_pointer(None, StorageClass::Uniform, mat4);
+    let ptr_in_vec3   = b.type_pointer(None, StorageClass::Input, vec3);
+
+    let in_pos = b.variable(ptr_in_vec3, None, StorageClass::Input, None);
+    b.decorate(in_pos, Decoration::Location,
+               vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let pv_var = b.variable(ptr_pv_struct, None, StorageClass::Output, None);
+    let ub = b.variable(ptr_ub_struct, None, StorageClass::Uniform, None);
+    b.decorate(ub, Decoration::DescriptorSet,
+               vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ub, Decoration::Binding,
+               vec![rspirv::dr::Operand::LiteralBit32(0)]);
+
+    let c_zero  = b.constant_bit32(i32_ty, 0u32);
+    let c_one_f = b.constant_bit32(f32_ty, 1.0f32.to_bits());
+
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let pos3 = b.load(vec3, None, in_pos, None, vec![]).unwrap();
+    let x = b.composite_extract(f32_ty, None, pos3, vec![0]).unwrap();
+    let y = b.composite_extract(f32_ty, None, pos3, vec![1]).unwrap();
+    let z = b.composite_extract(f32_ty, None, pos3, vec![2]).unwrap();
+    let pos4 = b.composite_construct(vec4, None, vec![x, y, z, c_one_f]).unwrap();
+    let mvp_ptr = b.access_chain(ptr_ub_mat4, None, ub, vec![c_zero]).unwrap();
+    let mvp = b.load(mat4, None, mvp_ptr, None, vec![]).unwrap();
+    let transformed = b.matrix_times_vector(vec4, None, mvp, pos4).unwrap();
+    let dst_ptr = b.access_chain(ptr_out_vec4, None, pv_var, vec![c_zero]).unwrap();
+    b.store(dst_ptr, transformed, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Vertex, main, "main", vec![in_pos, pv_var, ub]);
+
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
 fn build_vertex_passthrough_spirv() -> Vec<u8> {
     use rspirv::binary::Assemble;
     use rspirv::spirv::{
@@ -1397,6 +1476,35 @@ fn main() {
             // — the harness diffs against this string.
             (build_vertex_passthrough_spirv(),
              [0.25, -0.5, 0.75, 1.0])
+        }
+        "vertex_mvp" => {
+            // gl_Position = mvp * vec4(in_pos, 1.0).
+            // Arg order: x y z m00 m01 m02 m03 m10 m11 m12 m13 m20 m21 m22 m23 m30 m31 m32 m33
+            // (column-major; m_jk = column j, lane k -- so
+            //  the 16 floats are written in the same order
+            //  the uniform-block packer lays them out).
+            let mut next_f32 = || -> f32 {
+                args.next().and_then(|s| s.parse().ok())
+                    .expect("vertex_mvp: insufficient args (need x y z + 16 mat4 floats)")
+            };
+            let x = next_f32();
+            let y = next_f32();
+            let z = next_f32();
+            let mut mvp = [[0.0f32; 4]; 4];
+            for c in 0..4 {
+                for k in 0..4 {
+                    mvp[c][k] = next_f32();
+                }
+            }
+            // result[i] = Σ_j mvp[j][i] * v[j],  v = (x, y, z, 1)
+            let v = [x, y, z, 1.0f32];
+            let mut expected = [0.0f32; 4];
+            for i in 0..4 {
+                for j in 0..4 {
+                    expected[i] += mvp[j][i] * v[j];
+                }
+            }
+            (build_vertex_mvp_spirv(), expected)
         }
         "unordcmp" => {
             // Same pixels as `ifelse` for finite inputs,

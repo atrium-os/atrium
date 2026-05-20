@@ -7,9 +7,16 @@
  *
  * Usage:
  *   vertex_harness <so> <x> <y> <z>
- *     -- single vertex with packed vec3 attribute
- *        (x, y, z) at location 0. Output: position
- *        printed via %.9g %.9g %.9g %.9g.
+ *     -- passthrough: vec3 attribute (x, y, z) at
+ *        location 0; null uniforms.
+ *   vertex_harness <so> <x> <y> <z> <m00> <m01> ... <m33>
+ *     -- MVP: same vec3 attribute, plus a column-major
+ *        mat4 uniform at (set=0, binding=0) packed into
+ *        a 64-byte uniform buffer (16 floats in column-
+ *        major order, same shape the bespoke / cranelift
+ *        emit_freebsd_obj `vertex_mvp` writes).
+ *
+ * Output: gl_Position printed via %.9g %.9g %.9g %.9g.
  *
  * The shader ABI (docs/spec/tier2-renderer.md §4.1):
  *   atrium_vs_main(
@@ -22,12 +29,7 @@
  *     out_position,     // X6 (vec4)
  *     out_varyings,     // X7
  *     out_clip_distance // X8
- *   )
- *
- * v1 only exercises the passthrough shape — vec3
- * attribute → gl_Position. Future shaders that take
- * multiple attributes or write varyings need a richer
- * harness signature. */
+ *   ) */
 #include <dlfcn.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -46,8 +48,11 @@ typedef void (*vs_main_t)(
     float *out_clip_distance);
 
 int main(int argc, char **argv) {
-    if (argc < 5) {
-        fprintf(stderr, "usage: %s <so> <x> <y> <z>\n", argv[0]);
+    if (argc != 5 && argc != 5 + 16) {
+        fprintf(stderr,
+            "usage: %s <so> <x> <y> <z> [<m00> ... <m33>]\n"
+            "       4 floats = passthrough; 4+16 = MVP with uniform mat4\n",
+            argv[0]);
         return 2;
     }
     void *h = dlopen(argv[1], RTLD_NOW);
@@ -63,10 +68,24 @@ int main(int argc, char **argv) {
     unsigned char attr[12];
     memcpy(attr, xyz, sizeof attr);
 
+    /* Optional uniform block: 64-byte mat4 in column-major
+     * order.  When present, argv[5..20] are 16 f32 lanes
+     * matching the layout the host packer (pack_mat4 in
+     * the differential tests + the example) lays down. */
+    unsigned char *ubo_ptr = NULL;
+    unsigned char ubo_buf[64];
+    if (argc == 5 + 16) {
+        float mvp[16];
+        for (int i = 0; i < 16; i++)
+            mvp[i] = (float)atof(argv[5 + i]);
+        memcpy(ubo_buf, mvp, sizeof ubo_buf);
+        ubo_ptr = ubo_buf;
+    }
+
     float pos[4] = {0, 0, 0, 0};
     unsigned char varyings[256] = {0};
     float clip[8] = {0};
-    vs(attr, NULL, NULL, NULL, 0u, 0u, pos, varyings, clip);
+    vs(attr, NULL, ubo_ptr, NULL, 0u, 0u, pos, varyings, clip);
 
     /* Same `%.9g` rule as the fragment harness — exact
      * round-trip for power-of-two-derived f32s. */

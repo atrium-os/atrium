@@ -181,6 +181,45 @@ verify_vertex() {
   fi
 }
 
+# verify_vertex_mvp <label> <x> <y> <z> <m00> <m01> ... <m33>
+#   MVP variant of verify_vertex: forwards the 3-float
+#   position AND the 16 column-major mat4 floats to both
+#   the host emitter (for the expected gl_Position) and the
+#   on-target vertex harness (which packs them into a 64-
+#   byte uniform buffer at descriptor (0, 0)).  Matrix arc
+#   phase 6 — on-target gate for OpMatrixTimesVector.
+verify_vertex_mvp() {
+  label=$1; x=$2; y=$3; z=$4; shift 4
+  # The remaining 16 args are the mat4 lanes.
+  m=$@
+  expected=$(cd "$CRATE" && cargo run --quiet --example emit_freebsd_obj "$OBJ" vertex_mvp $x $y $z $m 2>/dev/null)
+  if [ -z "$expected" ]; then
+    echo "  FAIL  $label  (host emit produced no output)"
+    FAILED=1; return
+  fi
+  if ! scp -i "$KEY" $SSHOPTS -P 2222 "$OBJ" root@localhost:"$OBJ" >/dev/null 2>&1; then
+    echo "  FAIL  $label  (scp to VM failed — is the VM up + idle?)"
+    FAILED=1; return
+  fi
+  got=$(ssh -i "$KEY" $SSHOPTS -p 2222 root@localhost \
+    "cd /tmp && cc -shared -o atrium_vs.so atrium_fs_freebsd.o \
+     && ./atrium_vertex_harness ./atrium_vs.so $x $y $z $m" 2>/dev/null)
+  if awk -v a="$expected" -v b="$got" 'BEGIN {
+        na = split(a, ea, " "); nb = split(b, eb, " ");
+        if (na != 4 || nb != 4) exit 1;
+        for (i = 1; i <= 4; i++) {
+          d = ea[i] - eb[i]; if (d < 0) d = -d;
+          if (d > 1e-6) exit 1;
+        }
+        exit 0
+      }'; then
+    echo "  PASS  $label  -> [$got]"
+  else
+    echo "  FAIL  $label  expected [$expected] got [$got]"
+    FAILED=1
+  fi
+}
+
 echo "==> in-VM verification (FreeBSD aarch64, localhost:2222)"
 verify "const"        ""        const
 verify "ifelse then"  "0.2"     ifelse 0.2
@@ -204,6 +243,13 @@ verify "heavy4 n=32"  "32 int"  heavy4 32
 verify "heavyvec n=16" "16 int" heavyvec 16
 verify "texsample"    "texsample" texsample
 verify_vertex "vertex_passthrough"  0.25 -0.5 0.75  vertex_passthrough
+# Matrix arc phase 6 — gl_Position = mvp * vec4(in_pos, 1.0).  Args:
+#   x y z m00 m01 m02 m03 m10 m11 m12 m13 m20 m21 m22 m23 m30 m31 m32 m33
+# (column-major; m_jk = column j lane k).
+verify_vertex_mvp "vertex_mvp translation"  0.5 1.5 2.5 \
+    1 0 0 0  0 1 0 0  0 0 1 0  10 20 30 1
+verify_vertex_mvp "vertex_mvp scale"  0.25 0.5 -0.75 \
+    2 0 0 0  0 3 0 0  0 0 4 0  0 0 0 1
 
 if [ "$FAILED" = "0" ]; then
   echo "==> PASS — bespoke ELF + AAPCS64 codegen verified on FreeBSD aarch64"
