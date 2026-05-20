@@ -3895,4 +3895,74 @@ of jumping to `fill_image_fragment`.  `fill_image_fragment`
 stays for the fullscreen-quad case as a fast path (and
 for the existing FS-validation tests).
 
-**Status: scoped, R.1 next.**
+**Status: scoped.**
+
+#### Tier-2 rasterizer — implementation status (2026-05-21)
+
+| Sub-phase | Status                | Commit |
+|-----------|-----------------------|--------|
+| R.1 hello triangle | ✅ landed | c76357e |
+| R.2 perspective-correct varying interpolation | ✅ landed | 96f5e82 |
+| R.3 depth buffer (LESS + write) | ✅ landed | 1739d55 |
+| R.4 near/far Sutherland-Hodgman clip | ✅ landed | 0f3f8cd |
+| R.4 v2 side-plane clip (left/right/top/bottom) | deferred | — |
+| R.5 blending + colour write mask | ✅ landed | 06a7667 |
+| R.6 tiled pixel loop (8×8) | ✅ landed | bb9348e |
+| R.6 v2 per-tile edge-function trivial reject | deferred | — |
+| R.7 per-stripe parallelism (rayon) | ✅ landed | b72da8a |
+| **R.8 SIMD pixel quads** | **deferred — see below** | — |
+
+The arc is functionally complete at R.7.  The deferred items
+(R.4 v2 side-plane clip, R.6 v2 trivial reject, R.8 SIMD) are
+real perf / robustness wins but each has its own arc-shape and
+none block the next stage (the draw-walker integration that
+finally wires Tier2Backend::submit_frame through
+fill_image_triangle).
+
+##### R.8 — why deferred
+
+R.8 requires changes well outside the rasterizer itself.  Doing
+it properly is bigger than R.1–R.7 combined.  Dependencies, in
+likely landing order:
+
+1. **A new vectorised FS ABI.**  `atrium_fs_main_q4(...)` taking
+   4-wide arrays of `FragCoord` / varyings / `out_color`, plus a
+   flag in `atrium-spv-blob`'s header saying whether the shader
+   has this entry point alongside the scalar one.
+2. **Vectorised codegen — Cranelift.**  Every scalar IR op
+   (`FAdd`, `FMul`, `Dot`, `MatrixTimesVector`, `Load`, `Store`,
+   the comparison family, the BranchCond mask path, ...) needs
+   a 4-wide variant lowering to NEON / SSE intrinsics.  Mostly
+   mechanical but a lot of surface area.
+3. **Vectorised codegen — bespoke.**  Same, hand-emitting NEON
+   `.4s` (or `.8h` for half-pre cision experiments) on values
+   the pack classifier doesn't yet promote.
+4. **SPIR-V → vectorised IR.**  Either a second IR-rewrite pass
+   (scalar → SIMD lifting) or per-backend scalar → SIMD lifting.
+   Need to handle vertex-position-derived divergent control
+   flow with a mask register.
+5. **Rasterizer pixel-quad gather.**  Process 2×2 pixel blocks
+   aligned to even `(px, py)`, with a per-lane mask for partial
+   coverage at triangle edges (so a fragment on the outside of
+   any edge becomes a masked-off lane that still feeds the FS
+   for derivative-correctness but doesn't write pixels).
+
+Each item is a real arc.  Scoping any one of them properly
+needs a benchmark-driven motivation — "is the FS the bottleneck
+on workloads we actually care about?"  Right now (no real Vulkan
+apps running on tier-2 yet) the answer is unknown.  Defer until
+profiling on the integrated draw-walker path shows the per-pixel
+FS call dominating.
+
+##### What's next after R.7
+
+The natural follow-up is **the draw-walker integration**:
+`Tier2Backend::submit_frame` currently still calls
+`fill_image_fragment` (whole-image FS fill, no geometry) — the
+new `fill_image_triangle` API exists but is only exercised by
+unit tests.  Wire `FrameOp::Draw` opcodes through to per-
+primitive `fill_image_triangle` calls; plumb vertex / index
+buffers from the wire protocol; respect the bound pipeline's
+viewport + scissor + raster / depth / blend state.  That's the
+piece that turns the rasterizer from "tested in isolation" into
+"actually drives a Vulkan app through tier-2."
