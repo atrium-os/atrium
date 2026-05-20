@@ -110,6 +110,95 @@ impl VertexInputState {
     }
 }
 
+/// Depth-test state (subset of `VkPipelineDepthStencilStateCreateInfo`).
+/// D.6 honors `test_enable` + `write_enable`; compare op is
+/// hardcoded LESS in the tier-2 rasterizer (fill_image_triangle
+/// R.3 spec).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tier2DepthState {
+    /// When true, fragments only pass if their depth is less
+    /// than the existing depth-buffer value.
+    pub test_enable: bool,
+    /// When true (and test_enable is true), passing fragments
+    /// overwrite the depth-buffer slot.
+    pub write_enable: bool,
+}
+
+/// Per-channel blend factor; mirror of the tier-2 rasterizer's
+/// internal `BlendFactor`. Subset of Vulkan `VkBlendFactor`.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Tier2BlendFactor {
+    /// `VK_BLEND_FACTOR_ZERO`.
+    Zero              = 0,
+    /// `VK_BLEND_FACTOR_ONE`.
+    One               = 1,
+    /// `VK_BLEND_FACTOR_SRC_COLOR`.
+    SrcColor          = 2,
+    /// `VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR`.
+    OneMinusSrcColor  = 3,
+    /// `VK_BLEND_FACTOR_DST_COLOR`.
+    DstColor          = 4,
+    /// `VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR`.
+    OneMinusDstColor  = 5,
+    /// `VK_BLEND_FACTOR_SRC_ALPHA`.
+    SrcAlpha          = 6,
+    /// `VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA`.
+    OneMinusSrcAlpha  = 7,
+    /// `VK_BLEND_FACTOR_DST_ALPHA`.
+    DstAlpha          = 8,
+    /// `VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA`.
+    OneMinusDstAlpha  = 9,
+}
+
+/// Blend equation. R.5 v1 supports `Add` only.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Tier2BlendOp {
+    /// `VK_BLEND_OP_ADD`.
+    Add = 0,
+}
+
+/// Per-attachment colour-blend + write-mask state (mirror of
+/// `VkPipelineColorBlendAttachmentState`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tier2BlendState {
+    /// When false, the source colour replaces the destination
+    /// verbatim (modulo write_mask). Factor / op fields ignored.
+    pub enable: bool,
+    /// Source factor for the colour channels (RGB).
+    pub color_src: Tier2BlendFactor,
+    /// Destination factor for the colour channels (RGB).
+    pub color_dst: Tier2BlendFactor,
+    /// Source factor for the alpha channel.
+    pub alpha_src: Tier2BlendFactor,
+    /// Destination factor for the alpha channel.
+    pub alpha_dst: Tier2BlendFactor,
+    /// Colour-channel blend op.
+    pub color_op: Tier2BlendOp,
+    /// Alpha-channel blend op.
+    pub alpha_op: Tier2BlendOp,
+    /// Per-channel write enables (R, G, B, A).
+    pub write_mask_rgba: [bool; 4],
+}
+
+impl Default for Tier2BlendState {
+    /// Source-replace + all-channel write mask (the implicit
+    /// pre-blend behaviour).
+    fn default() -> Self {
+        Self {
+            enable: false,
+            color_src: Tier2BlendFactor::One,
+            color_dst: Tier2BlendFactor::Zero,
+            alpha_src: Tier2BlendFactor::One,
+            alpha_dst: Tier2BlendFactor::Zero,
+            color_op: Tier2BlendOp::Add,
+            alpha_op: Tier2BlendOp::Add,
+            write_mask_rgba: [true; 4],
+        }
+    }
+}
+
 /// Tier-2 pipeline state blob — postcard-encoded inside
 /// [`super::payloads::PipelineCreatePayload::state_blob`] when
 /// the target backend is the tier-2 software renderer.
@@ -121,6 +210,14 @@ impl VertexInputState {
 pub struct Tier2PipelineStateBlob {
     /// Vertex-input layout for the bound vertex shader.
     pub vertex_input: VertexInputState,
+    /// Depth-test state. `None` means "disabled" -- the draw
+    /// runs with no depth attachment.
+    #[serde(default)]
+    pub depth: Option<Tier2DepthState>,
+    /// Colour-blend state. `None` is equivalent to the default
+    /// (source replace + all-channel write mask).
+    #[serde(default)]
+    pub blend: Option<Tier2BlendState>,
 }
 
 #[cfg(test)]
@@ -188,9 +285,36 @@ mod tests {
                     },
                 ],
             },
+            depth: None,
+            blend: None,
         };
         let bytes = postcard::to_allocvec(&blob).unwrap();
         let back: Tier2PipelineStateBlob = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(back.vertex_input, blob.vertex_input);
+        assert_eq!(back.depth, blob.depth);
+    }
+
+    #[test]
+    fn tier2_pipeline_state_blob_with_depth_and_blend_roundtrip() {
+        let blob = Tier2PipelineStateBlob {
+            vertex_input: VertexInputState::default(),
+            depth: Some(Tier2DepthState {
+                test_enable: true, write_enable: true,
+            }),
+            blend: Some(Tier2BlendState {
+                enable: true,
+                color_src: Tier2BlendFactor::SrcAlpha,
+                color_dst: Tier2BlendFactor::OneMinusSrcAlpha,
+                alpha_src: Tier2BlendFactor::One,
+                alpha_dst: Tier2BlendFactor::Zero,
+                color_op: Tier2BlendOp::Add,
+                alpha_op: Tier2BlendOp::Add,
+                write_mask_rgba: [true, true, true, false],
+            }),
+        };
+        let bytes = postcard::to_allocvec(&blob).unwrap();
+        let back: Tier2PipelineStateBlob = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back.depth, blob.depth);
+        assert_eq!(back.blend, blob.blend);
     }
 }

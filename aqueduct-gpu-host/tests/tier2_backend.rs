@@ -824,3 +824,211 @@ fn tier2_backend_d5_hello_triangle_through_wire() {
     assert_eq!(px(7, 7), [0, 0, 0, 0]);
     assert_eq!(px(4, 0), [0, 0, 0, 0]);
 }
+
+#[test]
+fn tier2_backend_d6_depth_test_rejects_farther_fragments() {
+    use aqueduct_gpu::frame::{BindVertexBufCmd, DrawCmd, FrameBuilder, SetViewportCmd};
+    use aqueduct_gpu::opcodes::FrameOp;
+    use aqueduct_gpu::{
+        Tier2DepthState, VertexAttributeDesc, VertexBindingDesc,
+        VertexFormat, VertexInputState,
+    };
+
+    let cache_dir = TempDir::new().unwrap();
+    let registry = Arc::new(Tier2Registry::new(LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    }));
+
+    // Same VS, two FSs (red, blue), two pipelines with
+    // identical depth + layout state. Triangle 1 (red) draws
+    // at z=0.3; triangle 2 (blue) draws at z=0.7 covering the
+    // same pixels. With LESS depth test, triangle 2's pixels
+    // fail (0.7 < 0.3 false), so pixels stay red.
+    let vs_id      = registry.register(&build_passthrough_vs_d5()).expect("vs");
+    let fs_red_id  = registry.register(&build_constant_color_spirv([1.0, 0.0, 0.0, 1.0])).unwrap();
+    let fs_blue_id = registry.register(&build_constant_color_spirv([0.0, 0.0, 1.0, 1.0])).unwrap();
+    let backend = Tier2Backend::new(registry);
+
+    let image_id     = ResourceId::new(IdNamespace::IcdRuntime, 0x10001);
+    let pipe_red_id  = ResourceId::new(IdNamespace::IcdRuntime, 0x10002);
+    let pipe_blue_id = ResourceId::new(IdNamespace::IcdRuntime, 0x10003);
+    let vbuf_red_id  = ResourceId::new(IdNamespace::IcdRuntime, 0x10004);
+    let vbuf_blue_id = ResourceId::new(IdNamespace::IcdRuntime, 0x10005);
+    backend.image_created(image_id, 8, 8);
+
+    let layout = VertexInputState {
+        bindings: vec![VertexBindingDesc {
+            binding: 0, stride: 12, per_instance: false,
+        }],
+        attributes: vec![VertexAttributeDesc {
+            location: 0, binding: 0,
+            format: VertexFormat::R32g32b32Sfloat, offset: 0,
+        }],
+    };
+    let depth_on = Some(Tier2DepthState {
+        test_enable: true, write_enable: true,
+    });
+
+    for (pipe, fs) in [(pipe_red_id, fs_red_id), (pipe_blue_id, fs_blue_id)] {
+        backend.bind_pipeline_vs(pipe, vs_id);
+        backend.bind_pipeline(pipe, fs);
+        backend.bind_layout(pipe, layout.clone());
+        backend.bind_raster_state(pipe, depth_on, None);
+    }
+
+    // Same NDC triangle at two different z values.
+    fn write_triangle(buf: &mut Vec<u8>, z: f32) {
+        for v in [[-0.5_f32, -0.5, z], [0.5, -0.5, z], [0.0, 0.5, z]] {
+            for f in v { buf.extend_from_slice(&f.to_le_bytes()); }
+        }
+    }
+    let mut red_src = Vec::new();
+    write_triangle(&mut red_src, 0.3);
+    let mut blue_src = Vec::new();
+    write_triangle(&mut blue_src, 0.7);
+    backend.buffer_created(vbuf_red_id,  36);
+    backend.buffer_created(vbuf_blue_id, 36);
+    backend.buffer_write_bytes(vbuf_red_id,  0, &red_src).unwrap();
+    backend.buffer_write_bytes(vbuf_blue_id, 0, &blue_src).unwrap();
+
+    let mut fb = FrameBuilder::new(8192);
+    let mut begin = [0u8; 12];
+    begin[..4].copy_from_slice(&image_id.raw().to_le_bytes());
+    begin[4..8].copy_from_slice(&8u32.to_le_bytes());
+    begin[8..12].copy_from_slice(&8u32.to_le_bytes());
+    fb.push(FrameOp::BeginRenderPass, &begin).unwrap();
+    fb.push_set_viewport(SetViewportCmd {
+        x: 0.0, y: 0.0, width: 8.0, height: 8.0,
+        min_depth: 0.0, max_depth: 1.0,
+    }).unwrap();
+    // Red first @ z=0.3.
+    fb.push(FrameOp::BindPipeline, &pipe_red_id.raw().to_le_bytes()).unwrap();
+    fb.push_bind_vertex_buf(BindVertexBufCmd {
+        binding: 0, buffer_id: vbuf_red_id.raw(), offset: 0,
+    }).unwrap();
+    fb.push_draw(DrawCmd {
+        vertex_count: 3, instance_count: 1, first_vertex: 0, first_instance: 0,
+    }).unwrap();
+    // Blue second @ z=0.7 -- must lose to depth-test.
+    fb.push(FrameOp::BindPipeline, &pipe_blue_id.raw().to_le_bytes()).unwrap();
+    fb.push_bind_vertex_buf(BindVertexBufCmd {
+        binding: 0, buffer_id: vbuf_blue_id.raw(), offset: 0,
+    }).unwrap();
+    fb.push_draw(DrawCmd {
+        vertex_count: 3, instance_count: 1, first_vertex: 0, first_instance: 0,
+    }).unwrap();
+    fb.push(FrameOp::EndRenderPass, &[]).unwrap();
+
+    let fence = ResourceId::new(IdNamespace::IcdRuntime, 0x10006);
+    backend.submit_frame(fence, 1, fb.as_bytes());
+
+    let pixels = backend.read_image_pixels(image_id).unwrap();
+    let px = |x: usize, y: usize| -> [u8; 4] {
+        let i = (y * 8 + x) * 4;
+        [pixels[i], pixels[i+1], pixels[i+2], pixels[i+3]]
+    };
+    // Interior pixels must still be red (255, 0, 0, 255),
+    // proving the deeper blue draw was rejected by depth test.
+    assert_eq!(px(3, 3), [255, 0, 0, 255], "(3,3) = {:?}", px(3, 3));
+    assert_eq!(px(4, 3), [255, 0, 0, 255], "(4,3) = {:?}", px(4, 3));
+    assert_eq!(px(4, 4), [255, 0, 0, 255], "(4,4) = {:?}", px(4, 4));
+}
+
+#[test]
+fn tier2_backend_d6_depth_disabled_means_later_wins() {
+    // Control: same setup but depth disabled => later (blue)
+    // draw wins, proving the D.6 plumbing is actually
+    // depth-test-conditional rather than always-on.
+    use aqueduct_gpu::frame::{BindVertexBufCmd, DrawCmd, FrameBuilder, SetViewportCmd};
+    use aqueduct_gpu::opcodes::FrameOp;
+    use aqueduct_gpu::{
+        VertexAttributeDesc, VertexBindingDesc, VertexFormat, VertexInputState,
+    };
+
+    let cache_dir = TempDir::new().unwrap();
+    let registry = Arc::new(Tier2Registry::new(LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    }));
+    let vs_id      = registry.register(&build_passthrough_vs_d5()).unwrap();
+    let fs_red_id  = registry.register(&build_constant_color_spirv([1.0, 0.0, 0.0, 1.0])).unwrap();
+    let fs_blue_id = registry.register(&build_constant_color_spirv([0.0, 0.0, 1.0, 1.0])).unwrap();
+    let backend = Tier2Backend::new(registry);
+
+    let image_id     = ResourceId::new(IdNamespace::IcdRuntime, 0x11001);
+    let pipe_red_id  = ResourceId::new(IdNamespace::IcdRuntime, 0x11002);
+    let pipe_blue_id = ResourceId::new(IdNamespace::IcdRuntime, 0x11003);
+    let vbuf_red_id  = ResourceId::new(IdNamespace::IcdRuntime, 0x11004);
+    let vbuf_blue_id = ResourceId::new(IdNamespace::IcdRuntime, 0x11005);
+    backend.image_created(image_id, 8, 8);
+
+    let layout = VertexInputState {
+        bindings: vec![VertexBindingDesc {
+            binding: 0, stride: 12, per_instance: false,
+        }],
+        attributes: vec![VertexAttributeDesc {
+            location: 0, binding: 0,
+            format: VertexFormat::R32g32b32Sfloat, offset: 0,
+        }],
+    };
+    for (pipe, fs) in [(pipe_red_id, fs_red_id), (pipe_blue_id, fs_blue_id)] {
+        backend.bind_pipeline_vs(pipe, vs_id);
+        backend.bind_pipeline(pipe, fs);
+        backend.bind_layout(pipe, layout.clone());
+        backend.bind_raster_state(pipe, None, None); // depth OFF
+    }
+
+    let mut red_src = Vec::new();
+    let mut blue_src = Vec::new();
+    for v in [[-0.5_f32, -0.5, 0.3], [0.5, -0.5, 0.3], [0.0, 0.5, 0.3]] {
+        for f in v { red_src.extend_from_slice(&f.to_le_bytes()); }
+    }
+    for v in [[-0.5_f32, -0.5, 0.7], [0.5, -0.5, 0.7], [0.0, 0.5, 0.7]] {
+        for f in v { blue_src.extend_from_slice(&f.to_le_bytes()); }
+    }
+    backend.buffer_created(vbuf_red_id,  36);
+    backend.buffer_created(vbuf_blue_id, 36);
+    backend.buffer_write_bytes(vbuf_red_id,  0, &red_src).unwrap();
+    backend.buffer_write_bytes(vbuf_blue_id, 0, &blue_src).unwrap();
+
+    let mut fb = FrameBuilder::new(8192);
+    let mut begin = [0u8; 12];
+    begin[..4].copy_from_slice(&image_id.raw().to_le_bytes());
+    begin[4..8].copy_from_slice(&8u32.to_le_bytes());
+    begin[8..12].copy_from_slice(&8u32.to_le_bytes());
+    fb.push(FrameOp::BeginRenderPass, &begin).unwrap();
+    fb.push_set_viewport(SetViewportCmd {
+        x: 0.0, y: 0.0, width: 8.0, height: 8.0,
+        min_depth: 0.0, max_depth: 1.0,
+    }).unwrap();
+    fb.push(FrameOp::BindPipeline, &pipe_red_id.raw().to_le_bytes()).unwrap();
+    fb.push_bind_vertex_buf(BindVertexBufCmd {
+        binding: 0, buffer_id: vbuf_red_id.raw(), offset: 0,
+    }).unwrap();
+    fb.push_draw(DrawCmd {
+        vertex_count: 3, instance_count: 1, first_vertex: 0, first_instance: 0,
+    }).unwrap();
+    fb.push(FrameOp::BindPipeline, &pipe_blue_id.raw().to_le_bytes()).unwrap();
+    fb.push_bind_vertex_buf(BindVertexBufCmd {
+        binding: 0, buffer_id: vbuf_blue_id.raw(), offset: 0,
+    }).unwrap();
+    fb.push_draw(DrawCmd {
+        vertex_count: 3, instance_count: 1, first_vertex: 0, first_instance: 0,
+    }).unwrap();
+    fb.push(FrameOp::EndRenderPass, &[]).unwrap();
+
+    let fence = ResourceId::new(IdNamespace::IcdRuntime, 0x11006);
+    backend.submit_frame(fence, 1, fb.as_bytes());
+
+    let pixels = backend.read_image_pixels(image_id).unwrap();
+    let px = |x: usize, y: usize| -> [u8; 4] {
+        let i = (y * 8 + x) * 4;
+        [pixels[i], pixels[i+1], pixels[i+2], pixels[i+3]]
+    };
+    // Blue wins because depth test is off and blue was last.
+    assert_eq!(px(3, 3), [0, 0, 255, 255], "(3,3) = {:?}", px(3, 3));
+    assert_eq!(px(4, 4), [0, 0, 255, 255], "(4,4) = {:?}", px(4, 4));
+}

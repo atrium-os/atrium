@@ -178,6 +178,18 @@ pub trait Backend: Send + Sync {
         _pipeline_id: ResourceId,
         _layout: aqueduct_gpu::VertexInputState,
     ) {}
+
+    /// Associate raster state (depth + blend) with a pipeline.
+    /// Called alongside [`Backend::bind_pipeline_layout`] when
+    /// the state_blob decodes; either field may be `None` to
+    /// keep that aspect at its default (no depth attachment /
+    /// source-replace blending). Default no-op.
+    fn bind_pipeline_raster_state(
+        &self,
+        _pipeline_id: ResourceId,
+        _depth: Option<aqueduct_gpu::Tier2DepthState>,
+        _blend: Option<aqueduct_gpu::Tier2BlendState>,
+    ) {}
 }
 
 /// Protocol-correct backend that does no GPU work.

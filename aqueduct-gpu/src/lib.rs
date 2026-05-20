@@ -80,6 +80,7 @@ pub use opcodes::{
 };
 pub use payloads::*;
 pub use pipeline::{
+    Tier2BlendFactor, Tier2BlendOp, Tier2BlendState, Tier2DepthState,
     Tier2PipelineStateBlob, VertexAttributeDesc, VertexBindingDesc,
     VertexFormat, VertexInputState,
 };

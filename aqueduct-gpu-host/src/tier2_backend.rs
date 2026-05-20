@@ -25,14 +25,22 @@ use aqueduct_gpu::ids::ResourceId;
 use aqueduct_gpu::backends::{BackendId, GpuVendor};
 
 use crate::backend::Backend;
-use crate::tier2_registry::{Tier2ExecError, Tier2Registry, Tier2ShaderId};
+use crate::tier2_registry::{
+    BlendFactor, BlendFactorPair, BlendOp, BlendState, ColorWriteMask,
+    DrawTriangle, Tier2ExecError, Tier2Registry, Tier2ShaderId,
+};
 
 use aqueduct_gpu::frame::{
     BindIndexBufCmd, BindVertexBufCmd, DrawCmd, DrawIndexedCmd,
     FrameDecoder, IndexType, SetViewportCmd,
 };
 use aqueduct_gpu::opcodes::FrameOp;
-use aqueduct_gpu::VertexInputState;
+use aqueduct_gpu::{
+    Tier2BlendFactor as WireBlendFactor,
+    Tier2BlendOp as WireBlendOp,
+    Tier2BlendState as WireBlendState,
+    Tier2DepthState, VertexInputState,
+};
 
 /// Backend that routes draws through Tier-2 compiled
 /// fragment shaders. Image storage lives in this backend
@@ -66,6 +74,10 @@ pub struct Tier2Backend {
     /// frame-walker consults this map at Draw time to slice
     /// bound vertex buffers into per-vertex attribute bytes.
     pipeline_layouts: Mutex<HashMap<u32, VertexInputState>>,
+    /// Per-pipeline raster state (depth + blend). Populated by
+    /// [`Tier2Backend::bind_raster_state`] when the session
+    /// decodes a `Tier2PipelineStateBlob`.
+    pipeline_raster: Mutex<HashMap<u32, PipelineRasterState>>,
     submissions: AtomicU64,
     presents:    AtomicU64,
     /// Total Draw / DrawIndexed records the frame-walker has
@@ -120,6 +132,9 @@ struct PassState {
     tier2_shader: Option<Tier2ShaderId>,
     /// Tier-2 vertex shader bound to the current pipeline.
     tier2_vs_shader: Option<Tier2ShaderId>,
+    /// Pipeline raster state (depth + blend), resolved at
+    /// BindPipeline. `None` = no pipeline bound yet.
+    raster: Option<PipelineRasterState>,
     /// Vertex-buffer bindings keyed by slot number.
     vertex_buffers: HashMap<u32, BoundVertexBuffer>,
     /// Currently-bound index buffer.
@@ -134,6 +149,16 @@ struct PassState {
     /// Used to gate the legacy "BindPipeline alone implies a
     /// fullscreen FS fill" fallback at EndRenderPass.
     draws_in_pass: u32,
+}
+
+/// Per-pipeline raster state assembled at pipeline-create
+/// time and consulted at Draw time. Defaults match the
+/// implicit pre-D.6 behaviour: no depth attachment +
+/// source-replace blend.
+#[derive(Debug, Clone, Copy, Default)]
+struct PipelineRasterState {
+    depth: Option<Tier2DepthState>,
+    blend: BlendState,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -180,6 +205,7 @@ impl Tier2Backend {
             pipeline_shaders: Mutex::new(HashMap::new()),
             pipeline_vs_shaders: Mutex::new(HashMap::new()),
             pipeline_layouts: Mutex::new(HashMap::new()),
+            pipeline_raster: Mutex::new(HashMap::new()),
             last_assembled_vertices: Mutex::new(None),
             submissions: AtomicU64::new(0),
             presents:    AtomicU64::new(0),
@@ -276,6 +302,22 @@ impl Tier2Backend {
             .insert(pipeline_id.raw(), layout);
     }
 
+    /// Associate a pipeline with its depth + blend raster
+    /// state. Either field is `None` to keep the default
+    /// (no depth attachment / source-replace blending).
+    pub fn bind_raster_state(
+        &self,
+        pipeline_id: ResourceId,
+        depth: Option<Tier2DepthState>,
+        blend: Option<WireBlendState>,
+    ) {
+        let blend = blend.map(convert_blend_state).unwrap_or_default();
+        self.pipeline_raster.lock().unwrap().insert(
+            pipeline_id.raw(),
+            PipelineRasterState { depth, blend },
+        );
+    }
+
     /// Snapshot of the per-vertex bytes the most recent Draw
     /// assembled. `None` if no Draw has dispatched yet (or the
     /// last Draw was rejected before assembly).
@@ -304,7 +346,12 @@ impl Tier2Backend {
     fn execute_pass(&self, target_id: ResourceId, pass_bytes: &[u8]) {
         let pipeline_shaders    = self.pipeline_shaders.lock().unwrap().clone();
         let pipeline_vs_shaders = self.pipeline_vs_shaders.lock().unwrap().clone();
+        let pipeline_raster     = self.pipeline_raster.lock().unwrap().clone();
         let mut state = PassState::default();
+        // D.6: depth buffer is per-pass, allocated lazily on
+        // first draw with depth-test enabled. Cleared to +inf
+        // so any in-range fragment wins the first LESS test.
+        let mut depth_buffer: Option<Vec<f32>> = None;
         let mut decoder = FrameDecoder::new(pass_bytes);
 
         loop {
@@ -327,6 +374,7 @@ impl Tier2Backend {
                         state.pipeline_raw    = Some(raw);
                         state.tier2_shader    = pipeline_shaders.get(&raw).copied();
                         state.tier2_vs_shader = pipeline_vs_shaders.get(&raw).copied();
+                        state.raster          = pipeline_raster.get(&raw).copied();
                     } else {
                         log::warn!("BindPipeline body too short ({} bytes)", body.len());
                     }
@@ -361,7 +409,7 @@ impl Tier2Backend {
                 FrameOp::Draw => match DrawCmd::from_bytes(body) {
                     Ok(cmd) => {
                         state.draws_in_pass = state.draws_in_pass.saturating_add(1);
-                        self.dispatch_draw(target_id, &state, cmd);
+                        self.dispatch_draw(target_id, &state, cmd, &mut depth_buffer);
                     }
                     Err(e) => log::warn!("malformed Draw: {e}"),
                 },
@@ -408,6 +456,7 @@ impl Tier2Backend {
         target_id: ResourceId,
         state: &PassState,
         cmd: DrawCmd,
+        depth_buffer: &mut Option<Vec<f32>>,
     ) {
         if state.tier2_shader.is_none() {
             self.draws_skipped.fetch_add(1, Ordering::Relaxed);
@@ -484,18 +533,37 @@ impl Tier2Backend {
         let height = img.height;
         let pixels = &mut img.pixels[..];
 
+        // D.6: raster state -> per-draw blend + depth.
+        let raster = state.raster.unwrap_or_default();
+        let depth_enabled = raster.depth.map(|d| d.test_enable).unwrap_or(false);
+        if depth_enabled && depth_buffer.is_none() {
+            *depth_buffer = Some(vec![
+                f32::INFINITY;
+                (width as usize) * (height as usize)
+            ]);
+        }
+        // SAFETY note: when depth_enabled is false we pass
+        // None to fill_image_triangle even if the buffer was
+        // allocated by a previous draw in the same pass --
+        // matches Vulkan's "depth attachment optional per
+        // pipeline" model rather than per-render-pass.
+
         for t in 0..tri_count {
             let v0 = &assembled.bytes[(3*t)*stride   .. (3*t+1)*stride];
             let v1 = &assembled.bytes[(3*t+1)*stride .. (3*t+2)*stride];
             let v2 = &assembled.bytes[(3*t+2)*stride .. (3*t+3)*stride];
-            let dt = crate::tier2_registry::DrawTriangle {
+            let dt = DrawTriangle {
                 vertex_attrs: [v0, v1, v2],
                 push_constants: &state.push_constants,
+                blend_state: raster.blend,
                 ..Default::default()
             };
+            let db_ref = if depth_enabled {
+                depth_buffer.as_deref_mut()
+            } else { None };
             if let Err(e) = self.registry.fill_image_triangle(
                 vs_shader_id, fs_shader_id,
-                &dt, width, height, pixels, None,
+                &dt, width, height, pixels, db_ref,
             ) {
                 log::warn!("Draw target={target_id}: triangle {t}/{tri_count} \
                             fill_image_triangle failed: {e}");
@@ -725,5 +793,55 @@ impl Backend for Tier2Backend {
         layout: VertexInputState,
     ) {
         self.bind_layout(pipeline_id, layout);
+    }
+
+    fn bind_pipeline_raster_state(
+        &self,
+        pipeline_id: ResourceId,
+        depth: Option<Tier2DepthState>,
+        blend: Option<WireBlendState>,
+    ) {
+        self.bind_raster_state(pipeline_id, depth, blend);
+    }
+}
+
+fn convert_blend_factor(f: WireBlendFactor) -> BlendFactor {
+    match f {
+        WireBlendFactor::Zero             => BlendFactor::Zero,
+        WireBlendFactor::One              => BlendFactor::One,
+        WireBlendFactor::SrcColor         => BlendFactor::SrcColor,
+        WireBlendFactor::OneMinusSrcColor => BlendFactor::OneMinusSrcColor,
+        WireBlendFactor::DstColor         => BlendFactor::DstColor,
+        WireBlendFactor::OneMinusDstColor => BlendFactor::OneMinusDstColor,
+        WireBlendFactor::SrcAlpha         => BlendFactor::SrcAlpha,
+        WireBlendFactor::OneMinusSrcAlpha => BlendFactor::OneMinusSrcAlpha,
+        WireBlendFactor::DstAlpha         => BlendFactor::DstAlpha,
+        WireBlendFactor::OneMinusDstAlpha => BlendFactor::OneMinusDstAlpha,
+    }
+}
+
+fn convert_blend_op(o: WireBlendOp) -> BlendOp {
+    match o {
+        WireBlendOp::Add => BlendOp::Add,
+    }
+}
+
+fn convert_blend_state(s: WireBlendState) -> BlendState {
+    BlendState {
+        enable: s.enable,
+        color: BlendFactorPair {
+            src: convert_blend_factor(s.color_src),
+            dst: convert_blend_factor(s.color_dst),
+        },
+        alpha: BlendFactorPair {
+            src: convert_blend_factor(s.alpha_src),
+            dst: convert_blend_factor(s.alpha_dst),
+        },
+        color_op: convert_blend_op(s.color_op),
+        alpha_op: convert_blend_op(s.alpha_op),
+        write_mask: ColorWriteMask {
+            r: s.write_mask_rgba[0], g: s.write_mask_rgba[1],
+            b: s.write_mask_rgba[2], a: s.write_mask_rgba[3],
+        },
     }
 }

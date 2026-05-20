@@ -489,6 +489,8 @@ impl Session {
                     } else {
                         self.backend.bind_pipeline_layout(
                             req.pipeline_id, blob.vertex_input);
+                        self.backend.bind_pipeline_raster_state(
+                            req.pipeline_id, blob.depth, blob.blend);
                     }
                 }
             }
