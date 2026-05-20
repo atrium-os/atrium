@@ -157,6 +157,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-spv-blob"
+version = "0.1.0"
+
+[[package]]
 name = "atrium-spv-ir"
 version = "0.1.0"
 
@@ -164,7 +168,9 @@ version = "0.1.0"
 name = "atrium-spv-loader"
 version = "0.1.0"
 dependencies = [
+ "atrium-spv-blob",
  "atrium-spv-pcmap",
+ "libc",
  "libloading",
  "sha2",
 ]
