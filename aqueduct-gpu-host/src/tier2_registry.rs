@@ -422,9 +422,51 @@ impl Tier2Registry {
             };
             let total_edge = edge(a.0, a.1, b.0, b.1, c.0, c.1);
 
-            // Step 7: pixel loop.
-            for py in min_y..=max_y {
-                for px in min_x..=max_x {
+            // Step 7: tiled pixel loop (R.6).
+            //
+            // The triangle's screen-space bbox is partitioned
+            // into TILE_SIZE x TILE_SIZE tiles in viewport-
+            // aligned coordinates.  Inner py/px iterates only
+            // within the *intersection* of each tile and the
+            // triangle bbox, so pixels outside the bbox aren't
+            // visited even when the triangle is small relative
+            // to a tile.
+            //
+            // R.6 v1 is purely structural — no per-tile edge-
+            // function trivial reject yet (that's R.6 v2;
+            // gives a real win for sparse-coverage triangles).
+            // The point is to set up R.7 (each tile becomes a
+            // parallel task) and R.8 (per-tile SIMD lane state)
+            // without changing per-pixel semantics.  Existing
+            // R.1..R.5 tests pass unchanged.
+            const TILE_SIZE: i32 = 8;
+            // Tile coordinates that overlap the triangle bbox.
+            // Use floor-div for tile_min, ceil-div for tile_max
+            // via the standard `(x + TILE_SIZE - 1) / TILE_SIZE`
+            // form -- but min_x / max_x are already
+            // non-negative (clamped to viewport above), so
+            // plain integer division suffices.
+            let tile_min_x = min_x / TILE_SIZE;
+            let tile_max_x = max_x / TILE_SIZE;
+            let tile_min_y = min_y / TILE_SIZE;
+            let tile_max_y = max_y / TILE_SIZE;
+            for tile_y in tile_min_y..=tile_max_y {
+                for tile_x in tile_min_x..=tile_max_x {
+                    // Intersect tile with triangle bbox.
+                    let t_min_x =
+                        (tile_x * TILE_SIZE).max(min_x);
+                    let t_max_x =
+                        ((tile_x + 1) * TILE_SIZE - 1).min(max_x);
+                    let t_min_y =
+                        (tile_y * TILE_SIZE).max(min_y);
+                    let t_max_y =
+                        ((tile_y + 1) * TILE_SIZE - 1).min(max_y);
+                    // Empty intersection ⇒ skip the tile.
+                    if t_min_x > t_max_x || t_min_y > t_max_y {
+                        continue;
+                    }
+            for py in t_min_y..=t_max_y {
+                for px in t_min_x..=t_max_x {
                     let cx = px as f32 + 0.5;
                     let cy = py as f32 + 0.5;
                     let we0 = edge(b.0, b.1, c.0, c.1, cx, cy);
@@ -513,6 +555,8 @@ impl Tier2Registry {
                     if m.g { pixels[idx + 1] = f32_to_u8(final_color[1]); }
                     if m.b { pixels[idx + 2] = f32_to_u8(final_color[2]); }
                     if m.a { pixels[idx + 3] = f32_to_u8(final_color[3]); }
+                }
+            }
                 }
             }
         }

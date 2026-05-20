@@ -987,6 +987,100 @@ fn rasterizer_r5_blend_disabled_is_source_replace() {
     }
 }
 
+/// R.6 acceptance: a triangle whose screen-space bbox
+/// straddles multiple 8×8 tiles is rasterised identically
+/// to what the un-tiled loop would have produced.  Spot-
+/// checks pixels at (and just past) the tile-boundary
+/// columns x=8 and x=16 — exactly where a tile-loop bug
+/// would manifest as off-by-one or skipped pixels.
+///
+/// Setup: 24×24 image.  Triangle vertices in NDC pick a
+/// nice symmetric shape that crosses 9 tiles
+/// (3×3 grid of 8×8 tiles).  Bary-linear interp paints a
+/// gradient varying so the boundary checks ALSO verify the
+/// interpolated colour matches across tile seams.
+#[test]
+fn rasterizer_r6_tiles_24x24_spanning_9_tiles() {
+    let cache_dir = TempDir::new().unwrap();
+    let config = LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    };
+    let registry = Tier2Registry::new(config);
+    let vs_id = registry.register(&build_passthrough_vs()).unwrap();
+    let fs_id = registry.register(&build_passthrough_color_fs()).unwrap();
+
+    // NDC vertices forming a triangle that nearly fills the
+    // 24x24 image -- crossing all 9 tiles in the 3x3 grid.
+    //   (-1+1)*0.5*24 =  0      (+1+1)*0.5*24 = 24
+    let v0 = pack_vec3([-0.9, -0.9, 0.0]);   // screen (1.2, 1.2)
+    let v1 = pack_vec3([ 0.9, -0.9, 0.0]);   // screen (22.8, 1.2)
+    let v2 = pack_vec3([ 0.0,  0.9, 0.0]);   // screen (12, 22.8)
+    let red   = pack_vec4([1.0, 0.0, 0.0, 1.0]);
+    let green = pack_vec4([0.0, 1.0, 0.0, 1.0]);
+    let blue  = pack_vec4([0.0, 0.0, 1.0, 1.0]);
+
+    let mut pixels = vec![0u8; 24 * 24 * 4];
+    let draw = DrawTriangle {
+        vertex_attrs: [&v0, &v1, &v2],
+        varyings_per_vertex: [&red, &green, &blue],
+        varying_f32_count: 4,
+        ..Default::default()
+    };
+    registry.fill_image_triangle(
+        vs_id, fs_id, &draw, 24, 24, &mut pixels, None,
+    ).expect("tiled rasterise");
+
+    let px = |x: usize, y: usize| -> [u8; 4] {
+        let idx = (y * 24 + x) * 4;
+        [pixels[idx], pixels[idx+1], pixels[idx+2], pixels[idx+3]]
+    };
+
+    // Tile-boundary spot checks at y=12 (deep inside the
+    // triangle — its x-span at that row is [6.6, 17.4], so
+    // pixels 7, 8, 15, 16 are all well inside).  x=8 and
+    // x=16 are exactly the tile-boundary columns on an 8-pixel
+    // tile grid; a tile-loop bug would show as off-by-one
+    // pixel skips or visible seams in colour interpolation
+    // exactly here.
+    let y = 12usize;
+    for x in [7usize, 8, 15, 16] {
+        let p = px(x, y);
+        assert_ne!(p, [0, 0, 0, 0],
+            "pixel ({x}, {y}) at/near a tile boundary is \
+             unpainted, but should be inside the triangle: {p:?}");
+        assert_eq!(p[3], 255,
+            "pixel ({x}, {y}) alpha drifted at tile boundary: {p:?}");
+    }
+    // Adjacent-pair difference within a tolerance per channel.
+    // Bary interpolation across an 8-wide tile span shouldn't
+    // introduce visible seams.
+    let p7 = px(7, y);
+    let p8 = px(8, y);
+    for k in 0..3 {
+        let d = (p7[k] as i32 - p8[k] as i32).abs();
+        assert!(d <= 30,
+            "tile boundary x=7..8, y={y}, channel {k}: \
+             delta {d} > 30 (p7={p7:?}, p8={p8:?})");
+    }
+    let p15 = px(15, y);
+    let p16 = px(16, y);
+    for k in 0..3 {
+        let d = (p15[k] as i32 - p16[k] as i32).abs();
+        assert!(d <= 30,
+            "tile boundary x=15..16, y={y}, channel {k}: \
+             delta {d} > 30 (p15={p15:?}, p16={p16:?})");
+    }
+
+    // Pixels well outside the triangle (e.g., the corners
+    // of the 24x24 grid) stay cleared.
+    assert_eq!(px(0, 0), [0, 0, 0, 0]);
+    assert_eq!(px(23, 0), [0, 0, 0, 0]);
+    assert_eq!(px(0, 23), [0, 0, 0, 0]);
+    assert_eq!(px(23, 23), [0, 0, 0, 0]);
+}
+
 /// Variant of the passthrough VS that reads a vec4
 /// attribute (xyz + w) and writes gl_Position = that vec4
 /// directly.  Lets the test feed a custom w per vertex so
