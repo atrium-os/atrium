@@ -44,12 +44,27 @@ use aqueduct_gpu_host::{PresentCallback, PresentedFrame};
 use fresco_client::Connection;
 use fresco_protocol::TextureFormat;
 
+/// Per-surface routing entry. Tells the bridge which Fresco
+/// window + texture slot a `Tier2Backend::present` for
+/// `surface_id` should land on.
+#[derive(Debug, Clone, Copy)]
+pub struct SurfaceRoute {
+    /// Target Fresco window-id.
+    pub window_id: u32,
+    /// Target per-connection texture slot id.
+    pub slot_id: u32,
+}
+
 /// Adapter from `Tier2Backend::PresentCallback` to a Fresco
 /// compositor connection. Holds the connection behind a
-/// `Mutex` so concurrent presents serialise.
+/// `Mutex` so concurrent presents serialise. A surface->route
+/// table dispatches each incoming present to the right
+/// (window_id, slot_id) pair, so multi-window apps drive a
+/// single bridge instead of one per window.
 #[derive(Clone)]
 pub struct Tier2FrescoBridge {
     conn: Arc<Mutex<Connection>>,
+    routes: Arc<Mutex<std::collections::HashMap<u64, SurfaceRoute>>>,
 }
 
 impl Tier2FrescoBridge {
@@ -58,7 +73,10 @@ impl Tier2FrescoBridge {
     /// `connect`ed already (or `wrap`ped around an established
     /// `UnixStream`).
     pub fn new(conn: Connection) -> Self {
-        Self { conn: Arc::new(Mutex::new(conn)) }
+        Self {
+            conn: Arc::new(Mutex::new(conn)),
+            routes: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        }
     }
 
     /// Borrow the inner connection for scene-setup calls
@@ -69,23 +87,64 @@ impl Tier2FrescoBridge {
         self.conn.clone()
     }
 
-    /// Produce a `PresentCallback` wired to forward each
-    /// presented frame to the given `(window_id, slot_id)`.
-    /// The Tier2Backend's incoming `surface_id` is ignored --
-    /// the consumer chooses up front which Fresco window to
-    /// drive.  Multi-window apps register multiple bridges.
+    /// Register (or replace) the route for a Fresco surface.
+    /// The `surface_id` is the value the Tier2Backend receives
+    /// in its `present` call -- typically the Fresco window-id
+    /// the guest's `VkSurfaceKHR` resolves to. The route's
+    /// `window_id` is the Fresco window the bridge will
+    /// `window_present` against, and `slot_id` is where the
+    /// texture lives.
     ///
-    /// Errors at any step (upload, slot_set, present) are
-    /// logged + swallowed; the bridge can't propagate them
-    /// upstream past the `PresentCallback` boundary (which is
-    /// fire-and-forget).
-    pub fn present_callback(
-        &self,
-        window_id: u32,
-        slot_id: u32,
-    ) -> PresentCallback {
+    /// Most apps register exactly once at window-create time;
+    /// re-registering with the same `surface_id` is allowed
+    /// and silently replaces the prior route (useful for
+    /// swapchain recreation).
+    pub fn register_surface(&self, surface_id: u64, route: SurfaceRoute) {
+        if let Ok(mut r) = self.routes.lock() {
+            r.insert(surface_id, route);
+        }
+    }
+
+    /// Drop a previously-registered surface route. Presents
+    /// for an unregistered surface get a warn-and-skip; the
+    /// connection itself isn't touched.
+    pub fn unregister_surface(&self, surface_id: u64) -> Option<SurfaceRoute> {
+        self.routes.lock().ok().and_then(|mut r| r.remove(&surface_id))
+    }
+
+    /// Look up a surface's current route, if any.
+    pub fn route_for(&self, surface_id: u64) -> Option<SurfaceRoute> {
+        self.routes.lock().ok().and_then(|r| r.get(&surface_id).copied())
+    }
+
+    /// Produce a `PresentCallback` that dispatches by
+    /// `surface_id` through the bridge's registered routes.
+    /// Presents for unknown surfaces log a warn and return
+    /// without touching the connection.
+    ///
+    /// Errors at any wire step (upload, slot_set, present)
+    /// are logged + swallowed; the bridge can't propagate
+    /// them upstream past the `PresentCallback` boundary
+    /// (which is fire-and-forget).
+    pub fn present_callback(&self) -> PresentCallback {
         let conn = self.conn.clone();
-        Box::new(move |_surface_id: u64, frame: &PresentedFrame| {
+        let routes = self.routes.clone();
+        Box::new(move |surface_id: u64, frame: &PresentedFrame| {
+            let route = match routes.lock() {
+                Ok(r) => match r.get(&surface_id) {
+                    Some(rt) => *rt,
+                    None => {
+                        log::warn!("Tier2FrescoBridge: present on \
+                                    unregistered surface {surface_id}");
+                        return;
+                    }
+                },
+                Err(_) => {
+                    log::warn!("Tier2FrescoBridge: routes mutex poisoned");
+                    return;
+                }
+            };
+
             let mut c = match conn.lock() {
                 Ok(g) => g,
                 Err(_) => {
@@ -101,13 +160,13 @@ impl Tier2FrescoBridge {
                 }
             };
             if let Err(e) = c.slot_set_texture(
-                slot_id, hash, frame.width, frame.height,
+                route.slot_id, hash, frame.width, frame.height,
                 TextureFormat::Rgba8UnormSrgb,
             ) {
                 log::warn!("Tier2FrescoBridge: slot_set_texture failed: {e}");
                 return;
             }
-            if let Err(e) = c.window_present(window_id) {
+            if let Err(e) = c.window_present(route.window_id) {
                 log::warn!("Tier2FrescoBridge: window_present failed: {e}");
             }
         })
@@ -180,7 +239,10 @@ mod tests {
 
         let client = Connection::wrap(client_s).expect("client wrap");
         let bridge = Tier2FrescoBridge::new(client);
-        let cb = bridge.present_callback(0xAAAA, 0x0001);
+        bridge.register_surface(0xBEEF, SurfaceRoute {
+            window_id: 0xAAAA, slot_id: 0x0001,
+        });
+        let cb = bridge.present_callback();
 
         let frame = PresentedFrame {
             width: 4, height: 4,
@@ -241,5 +303,125 @@ mod tests {
     fn bridge_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Tier2FrescoBridge>();
+    }
+
+    #[test]
+    fn two_surfaces_route_to_distinct_windows() {
+        let (client_s, server_s) = UnixStream::pair().unwrap();
+        server_s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        client_s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+
+        // Drain 4 visible messages (2 presents x {SLOT_SET,
+        // WINDOW_PRESENT}). For each, capture (op, decoded
+        // window_id for WINDOW_PRESENT, decoded slot_id for
+        // SLOT_SET).
+        let (tx, rx) = mpsc::channel::<(u16, u32)>();
+        let server_thread = thread::spawn(move || {
+            let mut s = AqConn::wrap(server_s).expect("server wrap");
+            for _ in 0..4 {
+                match s.recv_message() {
+                    Ok(m) => {
+                        let id = if m.op == fresco_protocol::control::OP_SLOT_SET {
+                            fresco_protocol::decode::<
+                                fresco_protocol::SlotSetPayload>(&m.payload)
+                                .map(|p| p.slot_id).unwrap_or(u32::MAX)
+                        } else if m.op == fresco_protocol::control::OP_WINDOW_PRESENT {
+                            fresco_protocol::decode::<
+                                fresco_protocol::WindowPresentPayload>(&m.payload)
+                                .map(|p| p.window_id).unwrap_or(u32::MAX)
+                        } else { u32::MAX };
+                        let _ = tx.send((m.op, id));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let client = Connection::wrap(client_s).expect("client wrap");
+        let bridge = Tier2FrescoBridge::new(client);
+        bridge.register_surface(100, SurfaceRoute {
+            window_id: 0xAA01, slot_id: 1,
+        });
+        bridge.register_surface(200, SurfaceRoute {
+            window_id: 0xAA02, slot_id: 2,
+        });
+        assert_eq!(bridge.route_for(100).unwrap().window_id, 0xAA01);
+
+        let cb = bridge.present_callback();
+        let f1 = PresentedFrame { width: 2, height: 2,
+            pixels: vec![1; 16], frame_id: 1 };
+        let f2 = PresentedFrame { width: 2, height: 2,
+            pixels: vec![2; 16], frame_id: 2 };
+        cb(100, &f1);
+        cb(200, &f2);
+
+        // Order: SLOT_SET(slot=1), WINDOW_PRESENT(win=0xAA01),
+        //        SLOT_SET(slot=2), WINDOW_PRESENT(win=0xAA02).
+        let msgs: Vec<(u16, u32)> = (0..4)
+            .map(|_| rx.recv_timeout(Duration::from_secs(2))
+                       .expect("wire msg"))
+            .collect();
+        assert_eq!(msgs[0].0, fresco_protocol::control::OP_SLOT_SET);
+        assert_eq!(msgs[0].1, 1);
+        assert_eq!(msgs[1].0, fresco_protocol::control::OP_WINDOW_PRESENT);
+        assert_eq!(msgs[1].1, 0xAA01);
+        assert_eq!(msgs[2].0, fresco_protocol::control::OP_SLOT_SET);
+        assert_eq!(msgs[2].1, 2);
+        assert_eq!(msgs[3].0, fresco_protocol::control::OP_WINDOW_PRESENT);
+        assert_eq!(msgs[3].1, 0xAA02);
+
+        drop(bridge);
+        let _ = server_thread.join();
+    }
+
+    #[test]
+    fn unregistered_surface_skips_silently() {
+        let (client_s, server_s) = UnixStream::pair().unwrap();
+        server_s.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        client_s.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+
+        let (tx, rx) = mpsc::channel::<u16>();
+        let server_thread = thread::spawn(move || {
+            let mut s = AqConn::wrap(server_s).expect("server wrap");
+            // Drain anything that comes (should be nothing).
+            while let Ok(m) = s.recv_message() {
+                let _ = tx.send(m.op);
+            }
+        });
+
+        let client = Connection::wrap(client_s).expect("client wrap");
+        let bridge = Tier2FrescoBridge::new(client);
+        // Do NOT register surface 999.
+        let cb = bridge.present_callback();
+        let frame = PresentedFrame { width: 1, height: 1,
+            pixels: vec![9, 9, 9, 9], frame_id: 1 };
+        cb(999, &frame);
+
+        // Unregistered surface must not emit anything. Wait the
+        // server's read timeout to be sure.
+        let got = rx.recv_timeout(Duration::from_millis(400));
+        assert!(got.is_err(),
+            "unregistered surface should not produce wire traffic, \
+             got op {:?}", got);
+
+        drop(bridge);
+        let _ = server_thread.join();
+    }
+
+    #[test]
+    fn unregister_removes_route() {
+        let bridge = {
+            // Just need a Connection, even a dead-ended one --
+            // we never fire a present in this test.
+            let (a, _b) = UnixStream::pair().unwrap();
+            Tier2FrescoBridge::new(Connection::wrap(a).unwrap())
+        };
+        bridge.register_surface(7, SurfaceRoute { window_id: 1, slot_id: 1 });
+        assert!(bridge.route_for(7).is_some());
+        let dropped = bridge.unregister_surface(7);
+        assert!(dropped.is_some());
+        assert!(bridge.route_for(7).is_none());
+        // Unregistering again is a no-op (returns None).
+        assert!(bridge.unregister_surface(7).is_none());
     }
 }
