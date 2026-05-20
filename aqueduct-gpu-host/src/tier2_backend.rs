@@ -324,6 +324,34 @@ impl Tier2Backend {
         self.last_assembled_vertices.lock().unwrap().clone()
     }
 
+    /// Tier-2 vertex shader currently bound to `pipeline_id`,
+    /// or `None` if no VS has been bound.
+    pub fn pipeline_vs_shader(&self, pipeline_id: ResourceId) -> Option<Tier2ShaderId> {
+        self.pipeline_vs_shaders.lock().unwrap()
+            .get(&pipeline_id.raw()).copied()
+    }
+
+    /// Tier-2 fragment shader currently bound to `pipeline_id`.
+    pub fn pipeline_fs_shader(&self, pipeline_id: ResourceId) -> Option<Tier2ShaderId> {
+        self.pipeline_shaders.lock().unwrap()
+            .get(&pipeline_id.raw()).copied()
+    }
+
+    /// True if a vertex-input layout has been registered for
+    /// the given pipeline.
+    pub fn pipeline_has_layout(&self, pipeline_id: ResourceId) -> bool {
+        self.pipeline_layouts.lock().unwrap()
+            .contains_key(&pipeline_id.raw())
+    }
+
+    /// Vertex-input layout currently bound to `pipeline_id`,
+    /// cloned for inspection. `None` if no layout has been
+    /// bound to this pipeline.
+    pub fn pipeline_layout(&self, pipeline_id: ResourceId) -> Option<VertexInputState> {
+        self.pipeline_layouts.lock().unwrap()
+            .get(&pipeline_id.raw()).cloned()
+    }
+
     /// Read back a registered image's RGBA8 pixels.
     /// `None` if the image isn't registered.
     pub fn read_image_pixels(&self, image_id: ResourceId) -> Option<Vec<u8>> {

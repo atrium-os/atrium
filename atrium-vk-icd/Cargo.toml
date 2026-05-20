@@ -31,6 +31,10 @@ postcard        = { version = "1", features = ["use-std"] }
 
 [dev-dependencies]
 aqueduct-gpu-host = { path = "../aqueduct-gpu-host" }
+atrium-spv-loader = { path = "../atrium-spv-loader" }
+atrium-spv-ir     = { path = "../atrium-spv-ir" }
+rspirv            = "0.13"
+tempfile          = "3"
 
 # Example binaries that drive the ICD through its C ABI without
 # the Khronos Vulkan loader.
