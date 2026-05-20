@@ -78,6 +78,12 @@ pub const OP_GPU_IMAGE_WRITE_REGION: u16 = 0x0113;
 pub const OP_GPU_BUFFER_CREATE:   u16 = 0x0120;
 /// Destroy a buffer.
 pub const OP_GPU_BUFFER_DESTROY:  u16 = 0x0121;
+/// Inline write into a buffer. Mirrors `OP_GPU_IMAGE_WRITE`'s
+/// shape: a `BufferWritePayload` carries the target buffer id,
+/// the byte offset, and the bytes to copy. Used during bring-up
+/// before guest memory-region import is wired; ICDs will move
+/// to mapped backing regions in D5+.
+pub const OP_GPU_BUFFER_WRITE:    u16 = 0x0122;
 
 /// Allocate a sampler.
 pub const OP_GPU_SAMPLER_CREATE:  u16 = 0x0130;

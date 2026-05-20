@@ -127,6 +127,7 @@ impl Session {
             OP_GPU_IMAGE_WRITE_REGION => self.handle_image_write_region(m),
             OP_GPU_BUFFER_CREATE      => self.handle_buffer_create(m),
             OP_GPU_BUFFER_DESTROY     => self.handle_buffer_destroy(m),
+            OP_GPU_BUFFER_WRITE       => self.handle_buffer_write(m),
             OP_GPU_SAMPLER_CREATE     => self.handle_sampler_create(m),
             OP_GPU_SAMPLER_DESTROY    => self.handle_sampler_destroy(m),
             OP_GPU_SHADER_RESOLVE     => self.handle_shader_resolve(m),
@@ -264,12 +265,31 @@ impl Session {
         self.table.insert_buffer(req.buffer_id, BufferRecord {
             backing_region: req.backing_region, size: req.size,
         });
+        self.backend.buffer_created(req.buffer_id, req.size);
         Ok(())
     }
 
     fn handle_buffer_destroy(&mut self, m: Message) -> Result<()> {
         let req: BufferDestroyPayload = postcard::from_bytes(&m.payload)?;
         self.table.remove_buffer(req.buffer_id);
+        self.backend.buffer_destroyed(req.buffer_id);
+        Ok(())
+    }
+
+    fn handle_buffer_write(&mut self, m: Message) -> Result<()> {
+        let req: BufferWritePayload = postcard::from_bytes(&m.payload)?;
+        if self.table.get_buffer(req.buffer_id).is_none() {
+            self.send_validation_err(
+                OP_GPU_BUFFER_WRITE, Some(req.buffer_id),
+                "buffer not created on this session",
+            )?;
+            return Ok(());
+        }
+        if let Err(diag) = self.backend.buffer_write_bytes(
+            req.buffer_id, req.offset, &req.bytes,
+        ) {
+            self.send_validation_err(OP_GPU_BUFFER_WRITE, Some(req.buffer_id), &diag)?;
+        }
         Ok(())
     }
 

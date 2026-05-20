@@ -265,6 +265,19 @@ pub struct BufferDestroyPayload {
     pub buffer_id: ResourceId,
 }
 
+/// Inline buffer-content write. Used during bring-up to seed
+/// vertex / index data without going through guest memory
+/// region import.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BufferWritePayload {
+    /// Target buffer.
+    pub buffer_id: ResourceId,
+    /// Byte offset within the buffer.
+    pub offset: u64,
+    /// Bytes to copy.
+    pub bytes: Vec<u8>,
+}
+
 // ───── Samplers ───────────────────────────────────────────────────
 
 /// Client → server: create a sampler. ID pre-assigned; no response.

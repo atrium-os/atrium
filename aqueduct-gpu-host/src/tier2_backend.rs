@@ -35,6 +35,11 @@ use crate::tier2_registry::{Tier2ExecError, Tier2Registry, Tier2ShaderId};
 pub struct Tier2Backend {
     registry: Arc<Tier2Registry>,
     images:   Mutex<HashMap<u64, ImageStorage>>,
+    /// Per-buffer byte storage keyed by `ResourceId.raw()`.
+    /// Populated on `buffer_created`; filled by
+    /// `buffer_write_bytes`. The draw-walker (D.3+) reads
+    /// vertex / index data out of here.
+    buffers:  Mutex<HashMap<u32, BufferStorage>>,
     /// Pipeline ResourceId.raw() → bound Tier-2 fragment
     /// shader. Populated by [`Tier2Backend::bind_pipeline`]
     /// (called by the Session when it processes
@@ -81,6 +86,16 @@ struct ImageStorage {
     pixels: Vec<u8>,
 }
 
+/// Per-buffer byte storage owned by the backend. `size` is the
+/// declared capacity from `OP_GPU_BUFFER_CREATE`; `bytes` is
+/// pre-zeroed to that size so partial writes via
+/// `OP_GPU_BUFFER_WRITE` land at the right offsets without
+/// needing growth.
+struct BufferStorage {
+    size: u64,
+    bytes: Vec<u8>,
+}
+
 impl Tier2Backend {
     /// Construct a fresh Tier2Backend backed by the given
     /// registry. The registry can be shared across
@@ -89,10 +104,19 @@ impl Tier2Backend {
         Self {
             registry,
             images: Mutex::new(HashMap::new()),
+            buffers: Mutex::new(HashMap::new()),
             pipeline_shaders: Mutex::new(HashMap::new()),
             submissions: AtomicU64::new(0),
             presents:    AtomicU64::new(0),
         }
+    }
+
+    /// Read back a buffer's bytes (clone). Returns `None` if
+    /// the buffer isn't registered. Used by tests + by the
+    /// D.3 draw-walker to source vertex / index data.
+    pub fn read_buffer_bytes(&self, buffer_id: ResourceId) -> Option<Vec<u8>> {
+        let buffers = self.buffers.lock().unwrap();
+        buffers.get(&buffer_id.raw()).map(|b| b.bytes.clone())
     }
 
     /// Associate a pipeline ResourceId with a Tier-2
@@ -179,6 +203,46 @@ impl Backend for Tier2Backend {
 
     fn image_destroyed(&self, image_id: ResourceId) {
         self.images.lock().unwrap().remove(&(image_id.raw() as u64));
+    }
+
+    fn buffer_created(&self, buffer_id: ResourceId, size: u64) {
+        // Cap at 256 MiB to bound a misbehaving guest. Real
+        // limits are negotiated via OP_GPU_HANDSHAKE in a
+        // later phase; this is a safety floor for bring-up.
+        const MAX_BYTES: u64 = 256 * 1024 * 1024;
+        if size == 0 || size > MAX_BYTES {
+            log::warn!("Tier2Backend::buffer_created: buffer {buffer_id} \
+                        size {size} out of range (max {MAX_BYTES})");
+            return;
+        }
+        self.buffers.lock().unwrap().insert(buffer_id.raw(), BufferStorage {
+            size, bytes: vec![0u8; size as usize],
+        });
+    }
+
+    fn buffer_destroyed(&self, buffer_id: ResourceId) {
+        self.buffers.lock().unwrap().remove(&buffer_id.raw());
+    }
+
+    fn buffer_write_bytes(
+        &self,
+        buffer_id: ResourceId,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        let mut buffers = self.buffers.lock().unwrap();
+        let buf = buffers.get_mut(&buffer_id.raw())
+            .ok_or_else(|| format!("buffer {buffer_id} not registered"))?;
+        let end = offset.checked_add(bytes.len() as u64)
+            .ok_or_else(|| "buffer write offset+len overflows u64".to_string())?;
+        if end > buf.size {
+            return Err(format!(
+                "buffer write end {end} exceeds size {}", buf.size,
+            ));
+        }
+        let off = offset as usize;
+        buf.bytes[off..off + bytes.len()].copy_from_slice(bytes);
+        Ok(())
     }
 
     fn submit_frame(

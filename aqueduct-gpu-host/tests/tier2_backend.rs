@@ -309,3 +309,58 @@ fn tier2_backend_submit_frame_counts() {
     assert!(signalled);
     assert_eq!(backend.submission_count(), 1);
 }
+
+#[test]
+fn tier2_backend_buffer_storage_roundtrip() {
+    let cache_dir = TempDir::new().unwrap();
+    let registry = Arc::new(Tier2Registry::new(LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    }));
+    let backend = Tier2Backend::new(registry);
+
+    let buf_id = ResourceId::new(IdNamespace::IcdRuntime, 0xB001);
+    backend.buffer_created(buf_id, 64);
+
+    // Initial read sees zeroed bytes.
+    let got = backend.read_buffer_bytes(buf_id).unwrap();
+    assert_eq!(got.len(), 64);
+    assert!(got.iter().all(|&b| b == 0));
+
+    // Inline write at offset 8.
+    backend.buffer_write_bytes(buf_id, 8, &[0xAA, 0xBB, 0xCC, 0xDD]).unwrap();
+    let got = backend.read_buffer_bytes(buf_id).unwrap();
+    assert_eq!(&got[8..12], &[0xAA, 0xBB, 0xCC, 0xDD]);
+    assert!(got[..8].iter().all(|&b| b == 0));
+    assert!(got[12..].iter().all(|&b| b == 0));
+
+    // Out-of-range write rejected.
+    let r = backend.buffer_write_bytes(buf_id, 60, &[0; 8]);
+    assert!(r.is_err(), "write past end must error: {:?}", r);
+
+    // Unknown-buffer write rejected.
+    let other = ResourceId::new(IdNamespace::IcdRuntime, 0xBEEF);
+    let r = backend.buffer_write_bytes(other, 0, &[1, 2, 3]);
+    assert!(r.is_err(), "write to unknown buffer must error");
+
+    // Destroy frees the storage.
+    backend.buffer_destroyed(buf_id);
+    assert!(backend.read_buffer_bytes(buf_id).is_none());
+}
+
+#[test]
+fn tier2_backend_buffer_oversize_rejected() {
+    let cache_dir = TempDir::new().unwrap();
+    let registry = Arc::new(Tier2Registry::new(LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    }));
+    let backend = Tier2Backend::new(registry);
+
+    let buf_id = ResourceId::new(IdNamespace::IcdRuntime, 0xB002);
+    // 1 GiB > 256 MiB cap: silently rejected (logged, not registered).
+    backend.buffer_created(buf_id, 1 << 30);
+    assert!(backend.read_buffer_bytes(buf_id).is_none());
+}

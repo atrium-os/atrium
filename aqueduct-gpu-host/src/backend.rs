@@ -99,6 +99,27 @@ pub trait Backend: Send + Sync {
         Err("backend does not support inline image write_region".into())
     }
 
+    /// Notify the backend a buffer was created. Default no-op.
+    /// SW backends override this to allocate per-buffer byte
+    /// storage so vertex / index data can be sourced at draw
+    /// time without going through guest memory-region import.
+    fn buffer_created(&self, _buffer_id: ResourceId, _size: u64) {}
+
+    /// Notify the backend a buffer was destroyed. Default no-op.
+    fn buffer_destroyed(&self, _buffer_id: ResourceId) {}
+
+    /// Inline write into a previously-created buffer. Called by
+    /// the session when it processes `OP_GPU_BUFFER_WRITE`.
+    /// Default rejects (backends without inline-write support).
+    fn buffer_write_bytes(
+        &self,
+        _buffer_id: ResourceId,
+        _offset: u64,
+        _bytes: &[u8],
+    ) -> Result<(), String> {
+        Err("backend does not support inline buffer write".into())
+    }
+
     /// Submit a frame command stream. Returns `true` if the fence
     /// should be signalled now, `false` if signaling is deferred.
     fn submit_frame(
