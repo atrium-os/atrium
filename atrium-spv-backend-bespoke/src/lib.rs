@@ -266,6 +266,18 @@ fn emit_function(
     // scalars[id] = Vreg holding the live f32 (S-reg view).
     let mut scalars: HashMap<ValueId, asm::Vreg> = HashMap::new();
     let mut vectors: HashMap<ValueId, Vec<Value>> = HashMap::new();
+    // Mat4 values: deferred lazy load.  Op::Load of a Mat4
+    // does NOT materialise the 16 lane scalars (would burn
+    // 16 V-regs across a long live range covering the rest
+    // of the function and exhaust the 24-V-reg pool when
+    // combined with vec3 inputs + constant + 4
+    // accumulators).  Instead we just remember the (base
+    // X-reg, byte offset) of the matrix; Op::MatrixTimesVector
+    // loads each column lane on demand into a single
+    // recycled temp V-reg.  16 ldr_w / fmov pairs + 4
+    // accumulator V-regs + 1 temp V-reg = 5 V-regs
+    // simultaneous, comfortably under the budget.
+    let mut matrices_ptr: HashMap<ValueId, (asm::Xreg, i32)> = HashMap::new();
     // NEON-packed vec4 values: the whole vector in one
     // Q-register, driven with `.4s` ops. A vec4 ValueId is
     // in *either* `vectors` (per-lane) or `packed`, never
@@ -1370,6 +1382,123 @@ fn emit_function(
                 }
                 scalars.insert(result.id, acc);
             }
+            // OpMatrixTimesVector — column-major:
+            //   result[i] = Σ_j matrix[j][i] * vector[j]
+            // Phase 4 v1 emits the per-lane scalar chain
+            // (4 fmul + 12 fmul/fadd pairs).  Lanes are
+            // loaded on demand into a single recycled temp
+            // V-reg so the matrix doesn't burn 16 V-regs
+            // of live range covering the rest of the
+            // function.  4 accumulator V-regs (one per
+            // result lane) + 1 col-load temp + 1 mul temp
+            // = 6 V-regs simultaneously, well under budget.
+            //
+            // Phase 4 v2 will extend the NEON-pack
+            // classifier to recognise this chain and emit
+            // `fmul.4s / fmla.4s` instead.
+            Op::MatrixTimesVector { matrix, vector } => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "MatrixTimesVector without result".into()))?;
+                let (mat_param, mat_off) = matrices_ptr.get(&matrix.id)
+                    .copied()
+                    .ok_or_else(|| BackendError::Unsupported(format!(
+                        "MatrixTimesVector matrix {:?} not in matrices_ptr",
+                        matrix.id)))?;
+                let vec_lanes = vectors.get(&vector.id).cloned().ok_or_else(||
+                    BackendError::Unsupported(format!(
+                        "MatrixTimesVector vector {:?} not in vectors",
+                        vector.id)))?;
+                // v1: hard-coded 4-column Mat4 × 4-lane Vec4.
+                // mat2/mat3 wait for a real shader that needs them.
+                if vec_lanes.len() != 4 {
+                    return Err(BackendError::Unsupported(format!(
+                        "MatrixTimesVector: phase 4 v1 supports vec4 only \
+                         ({}-lane given)", vec_lanes.len())));
+                }
+                let n_lanes = 4usize;
+                let n_cols  = 4usize;
+                // Helper to materialise one Mat4 lane into a
+                // temp V-reg, do the work, then free the reg.
+                // Closure-style would borrow `&mut a`, which
+                // makes the borrow checker unhappy mid-loop,
+                // so inline the load + free.
+                let load_mat_lane = |a: &mut asm::Asm,
+                                    free_pool: &mut Vec<u8>,
+                                    owners: &mut HashMap<u8, ValueId>,
+                                    used_csv: &mut bool,
+                                    next_synth_id: &mut u32,
+                                    col: usize, lane: usize|
+                    -> Result<(asm::Vreg, u8), BackendError>
+                {
+                    let synth = ValueId(*next_synth_id);
+                    *next_synth_id += 1;
+                    let v = alloc_vreg(free_pool, owners, used_csv, synth)?;
+                    let off = mat_off
+                        .saturating_add((col * 16) as i32)
+                        .saturating_add((lane * 4) as i32);
+                    emit_load_f32_offset(a, w_tmp, mat_param, off, v)?;
+                    Ok((v, v.0))
+                };
+
+                // 1) Initial broadcast: out[i] = col[0][i] * vec[0].
+                //    Allocate 4 accumulators; load col[0][i] into a
+                //    temp, do fmul into the acc, free the temp.
+                let v0 = *scalars.get(&vec_lanes[0].id)
+                    .ok_or_else(|| BackendError::Internal(format!(
+                        "MatrixTimesVector vec[0] {:?} missing",
+                        vec_lanes[0].id)))?;
+                let mut out_lanes: Vec<Value> = Vec::with_capacity(n_lanes);
+                for i in 0..n_lanes {
+                    let acc_id = ValueId(next_synth_id);
+                    next_synth_id += 1;
+                    let acc = alloc_vreg(
+                        &mut free_pool, &mut owners,
+                        &mut used_callee_saved_v, acc_id)?;
+                    let (mat_v, mat_n) = load_mat_lane(
+                        &mut a, &mut free_pool, &mut owners,
+                        &mut used_callee_saved_v, &mut next_synth_id,
+                        0, i)?;
+                    a.emit(asm::fmul_s(acc, mat_v, v0));
+                    // Free mat lane V-reg; its synth_id will
+                    // never expire from last_use (not in map),
+                    // but we don't need the data anymore.
+                    free_pool.push(mat_n);
+                    owners.remove(&mat_n);
+                    scalars.insert(acc_id, acc);
+                    out_lanes.push(Value { id: acc_id, ty: Type::F32 });
+                }
+                // 2) Accumulate remaining columns: out[i] += col[j][i] * vec[j].
+                for j in 1..n_cols {
+                    let vj = *scalars.get(&vec_lanes[j].id)
+                        .ok_or_else(|| BackendError::Internal(format!(
+                            "MatrixTimesVector vec[{j}] {:?} missing",
+                            vec_lanes[j].id)))?;
+                    for i in 0..n_lanes {
+                        let acc = *scalars.get(&out_lanes[i].id)
+                            .ok_or_else(|| BackendError::Internal(format!(
+                                "MatrixTimesVector acc lane {i} missing")))?;
+                        let (mat_v, mat_n) = load_mat_lane(
+                            &mut a, &mut free_pool, &mut owners,
+                            &mut used_callee_saved_v, &mut next_synth_id,
+                            j, i)?;
+                        // tmp = mat_v * vj; acc += tmp.
+                        let tmp_synth = ValueId(next_synth_id);
+                        next_synth_id += 1;
+                        let tmp = alloc_vreg(
+                            &mut free_pool, &mut owners,
+                            &mut used_callee_saved_v, tmp_synth)?;
+                        a.emit(asm::fmul_s(tmp, mat_v, vj));
+                        a.emit(asm::fadd_s(acc, acc, tmp));
+                        // Free both temps.
+                        free_pool.push(tmp.0);
+                        owners.remove(&tmp.0);
+                        free_pool.push(mat_n);
+                        owners.remove(&mat_n);
+                    }
+                }
+                vectors.insert(result.id, out_lanes);
+            }
             Op::FAdd(a_v, b_v) => emit_fp_binop_poly(
                 &mut a, &mut scalars, &mut vectors, &mut packed, &packed_ids,
                 &mut free_pool, &mut owners, &mut used_callee_saved_v,&mut next_synth_id,
@@ -1480,6 +1609,13 @@ fn emit_function(
                             });
                         }
                         vectors.insert(result.id, lanes);
+                    }
+                    Type::Mat4(_) => {
+                        // Deferred: just record (param, off);
+                        // MatrixTimesVector loads on demand
+                        // to keep the V-reg working set
+                        // small.  See `matrices_ptr` decl.
+                        matrices_ptr.insert(result.id, (param, off));
                     }
                     other => return Err(BackendError::Unsupported(format!(
                         "Op::Load of {other:?} not supported"))),
@@ -2664,6 +2800,8 @@ fn op_reads(op: &Op, id: ValueId) -> bool {
         VectorExtract { vector, .. } => vector.id == id,
         VectorInsert { vector, scalar, .. } =>
             vector.id == id || scalar.id == id,
+        MatrixTimesVector { matrix, vector } =>
+            matrix.id == id || vector.id == id,
         AccessChain { base, .. } => base.id == id,
         Store { ptr, value } => ptr.id == id || value.id == id,
         Select { cond, t_val, f_val } =>
@@ -2758,6 +2896,22 @@ fn compute_last_use_flat(
                     for lid in &lanes { mark(*lid); }
                 }
                 if let Some(lanes) = vec_lanes.get(&r.id).cloned() {
+                    for lid in &lanes { mark(*lid); }
+                }
+            }
+            Op::MatrixTimesVector { matrix, vector } => {
+                // Mat4 lane scalars are backend-synth IDs allocated
+                // inside emit_function and never appear in this
+                // pre-pass — they stay alive forever via the
+                // unwrap_or(MAX) fallback in the expiry test.  But
+                // the vector lane Values DO exist in the IR (e.g. a
+                // ConstFloat fed through a ConstVec), and without
+                // this propagation the linear-scan reclaims their
+                // V-regs right after ConstVec — the Mat4 Load then
+                // re-uses those regs and clobbers the lane data the
+                // MatrixTimesVector still needs to read.
+                mark(matrix.id); mark(vector.id);
+                if let Some(lanes) = vec_lanes.get(&vector.id).cloned() {
                     for lid in &lanes { mark(*lid); }
                 }
             }
