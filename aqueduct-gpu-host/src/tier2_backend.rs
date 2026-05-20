@@ -234,6 +234,16 @@ impl Tier2Backend {
         buffers.get(&buffer_id.raw()).map(|b| b.bytes.clone())
     }
 
+    /// Snapshot of every registered buffer's (id, bytes).
+    /// Convenience for integration tests that don't know the
+    /// guest's pre-allocated ResourceId up front (the ICD
+    /// path allocates buffer IDs on the daemon side).
+    pub fn all_buffer_bytes(&self) -> Vec<(ResourceId, Vec<u8>)> {
+        self.buffers.lock().unwrap().iter()
+            .map(|(raw, b)| (ResourceId(*raw), b.bytes.clone()))
+            .collect()
+    }
+
     /// Associate a pipeline ResourceId with a Tier-2
     /// fragment shader. When `submit_frame` later sees a
     /// `BindPipeline` of this id followed by a draw, it

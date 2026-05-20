@@ -210,6 +210,22 @@ impl GpuClient {
         self.send(OP_GPU_BUFFER_DESTROY, 0, &req)
     }
 
+    /// Inline buffer-content write. The ICD calls this on
+    /// vkUnmapMemory (per buffer bound to the unmapped region)
+    /// to sync host writes through to the daemon-side buffer
+    /// storage.
+    pub fn write_buffer(
+        &mut self,
+        buffer_id: ResourceId,
+        offset: u64,
+        bytes: Vec<u8>,
+    ) -> GpuClientResult<()> {
+        let req = aqueduct_gpu::payloads::BufferWritePayload {
+            buffer_id, offset, bytes,
+        };
+        self.send(aqueduct_gpu::opcodes::OP_GPU_BUFFER_WRITE, 0, &req)
+    }
+
     /// Create a sampler. ID is pre-assigned. Returns it.
     pub fn create_sampler(&mut self, mut params: SamplerCreatePayload) -> GpuClientResult<ResourceId> {
         params.sampler_id = self.alloc_id()?;

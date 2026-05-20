@@ -2794,16 +2794,61 @@ pub unsafe extern "C" fn vkMapMemory(
     VK_SUCCESS
 }
 
-/// `vkUnmapMemory` — no-op today. Storage is always host-mapped
-/// (HOST_VISIBLE | HOST_COHERENT — see
-/// `vkGetPhysicalDeviceMemoryProperties`), so unmap is a logical
-/// boundary not a kernel-VA reclamation. Future tier-2 backends
-/// would munmap here.
+/// `vkUnmapMemory` — local storage is HOST_VISIBLE|COHERENT so
+/// there's no kernel-VA reclamation to do, but the unmap *is* a
+/// natural sync point: walk every AtriumBuffer bound to this
+/// memory and push its current bytes through `OP_GPU_BUFFER_WRITE`
+/// so the daemon's per-buffer storage matches what the app just
+/// wrote via the mapped pointer.
+///
+/// This is the bring-up shape -- D5+ moves to shared backing
+/// regions where guest writes are visible without an explicit
+/// upload op.
 #[no_mangle]
 pub unsafe extern "C" fn vkUnmapMemory(
-    _device: VkDevice,
-    _memory: u64,
+    device: VkDevice,
+    memory: u64,
 ) {
+    if device.is_null() || memory == 0 { return; }
+    let dev = &*(device as *const AtriumDevice);
+
+    // Collect (buffer_id, offset_in_memory, size) for every
+    // bound buffer that has a daemon-side mirror. Hold the
+    // buffers lock only to take the snapshot; release before
+    // we lock the client (avoids any cross-lock surprises).
+    let bufs: Vec<(aqueduct_gpu::ids::ResourceId, u64, u64)> = match dev.buffers.lock() {
+        Ok(b) => b.values()
+            .filter_map(|buf| {
+                if buf.memory == Some(memory) {
+                    buf.buffer_id.map(|id| (id, buf.memory_offset, buf.size))
+                } else { None }
+            })
+            .collect(),
+        Err(_) => return,
+    };
+    if bufs.is_empty() { return; }
+
+    // Read the memory bytes into per-buffer copies.
+    let copies: Vec<(aqueduct_gpu::ids::ResourceId, Vec<u8>)> = match dev.memories.lock() {
+        Ok(m) => match m.get(&memory) {
+            Some(am) => bufs.iter().filter_map(|(id, off, size)| {
+                let start = *off as usize;
+                let end = start.checked_add(*size as usize)?;
+                if end > am.storage.len() { return None; }
+                Some((*id, am.storage[start..end].to_vec()))
+            }).collect(),
+            None => return,
+        },
+        Err(_) => return,
+    };
+
+    if dev.instance.is_null() { return; }
+    let inst = &*(dev.instance as *const AtriumInstance);
+    let Some(client) = inst.client.as_ref() else { return };
+    let Ok(mut c) = client.lock() else { return };
+    for (id, bytes) in copies {
+        let _ = c.write_buffer(id, 0, bytes);
+    }
 }
 
 /// `vkCreateBuffer` — record an AtriumBuffer for the requested

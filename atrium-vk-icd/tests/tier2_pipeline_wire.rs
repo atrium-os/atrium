@@ -364,3 +364,88 @@ fn vk_create_graphics_pipelines_lands_tier2_state_on_backend() {
     let _ = server_thread;
     let _ = std::fs::remove_file(&sock);
 }
+
+#[test]
+fn vk_unmap_memory_syncs_buffer_writes_to_daemon() {
+    use atrium_vk_icd::{
+        vkAllocateMemory, vkBindBufferMemory, vkCreateBuffer,
+        vkDestroyInstance, vkMapMemory, vkUnmapMemory,
+    };
+
+    let sock = tmp_socket("buf_sync");
+    let cache_dir = TempDir::new().unwrap();
+    let registry = Arc::new(Tier2Registry::new(LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    }));
+    let tier2_backend = Arc::new(Tier2Backend::new(registry.clone()));
+    let backend_for_listener: Arc<dyn Backend> = tier2_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap()
+        .with_tier2_registry(registry.clone());
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+
+    let _env = EnvLock::set(&sock);
+
+    let mut instance: VkInstance = std::ptr::null_mut();
+    unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
+    let mut pds: [VkPhysicalDevice; 1] = [std::ptr::null_mut(); 1];
+    let mut cap: u32 = 1;
+    unsafe { vkEnumeratePhysicalDevices(instance, &mut cap, pds.as_mut_ptr()); }
+    let mut device: VkDevice = std::ptr::null_mut();
+    unsafe { vkCreateDevice(pds[0], std::ptr::null(), std::ptr::null(), &mut device); }
+
+    // VkBufferCreateInfo: sType@0, size@24, usage@32. The ICD
+    // reads only size+usage; everything else can be zero.
+    let mut bi = [0u8; 56];
+    bi[ 0.. 4].copy_from_slice(&12u32.to_le_bytes()); // sType
+    bi[24..32].copy_from_slice(&(64u64).to_le_bytes()); // 64 bytes
+    bi[32..36].copy_from_slice(&0x80u32.to_le_bytes()); // VERTEX_BUFFER
+    let mut buf: u64 = 0;
+    unsafe {
+        vkCreateBuffer(device, bi.as_ptr() as *const _,
+                       std::ptr::null(), &mut buf);
+    }
+    assert!(buf != 0);
+
+    // VkMemoryAllocateInfo: sType@0, allocationSize@16.
+    let mut ai = [0u8; 32];
+    ai[ 0.. 4].copy_from_slice(&5u32.to_le_bytes());
+    ai[16..24].copy_from_slice(&(64u64).to_le_bytes());
+    let mut mem: u64 = 0;
+    unsafe {
+        vkAllocateMemory(device, ai.as_ptr() as *const _,
+                         std::ptr::null(), &mut mem);
+    }
+    assert!(mem != 0);
+    unsafe { vkBindBufferMemory(device, buf, mem, 0); }
+
+    // Map, write a recognisable pattern, unmap. The ICD must
+    // forward the pattern through OP_GPU_BUFFER_WRITE.
+    let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+    unsafe { vkMapMemory(device, mem, 0, u64::MAX, 0, &mut p); }
+    assert!(!p.is_null());
+    let slice = unsafe { std::slice::from_raw_parts_mut(p as *mut u8, 64) };
+    for (i, b) in slice.iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(7).wrapping_add(13);
+    }
+    unsafe { vkUnmapMemory(device, mem); }
+
+    // Async round-trip.
+    thread::sleep(Duration::from_millis(150));
+
+    let bufs = tier2_backend.all_buffer_bytes();
+    assert_eq!(bufs.len(), 1,
+        "exactly one buffer should be registered with the daemon");
+    let (_, bytes) = &bufs[0];
+    assert_eq!(bytes.len(), 64);
+    for (i, &b) in bytes.iter().enumerate() {
+        assert_eq!(b, (i as u8).wrapping_mul(7).wrapping_add(13),
+            "byte {i} not synced: got {b}");
+    }
+
+    unsafe { vkDestroyInstance(instance, std::ptr::null()); }
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
