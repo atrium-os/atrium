@@ -188,44 +188,51 @@ impl Tier2Registry {
     /// Rasterise a single triangle through a VS+FS pair into
     /// the supplied RGBA8 image buffer.
     ///
-    /// Tier-2 rasterizer **phase R.1** — the minimum viable
-    /// pipeline that drives geometric input through the
-    /// compiled shaders.  Per `docs/spec/tier2-renderer.md`
-    /// §8 and `RUNBOOK.md` "Next big arc — scoped: tier-2
-    /// rasterizer":
+    /// Tier-2 rasterizer phases R.1 (geometry → pixels) and
+    /// R.2 (perspective-correct varying interpolation).  Per
+    /// `docs/spec/tier2-renderer.md` §8 and `RUNBOOK.md`
+    /// "Next big arc — scoped: tier-2 rasterizer":
     ///
-    /// * Index/draw walker: 3 indices, hardcoded.
-    /// * Vertex shading: call `atrium_vs_main` once per
-    ///   vertex with the vertex's attribute buffer; collect
-    ///   3 `gl_Position`s.
-    /// * Triangle setup: NDC → screen via Vulkan-convention
-    ///   viewport mapping (y not flipped); compute bbox.
-    /// * Pixel loop: Pineda edge functions at each pixel
-    ///   centre `(px+0.5, py+0.5)`; pixel inside iff all
-    ///   three edges have the same sign (handles both
-    ///   windings).  On inside, call `atrium_fs_main` with
-    ///   `gl_FragCoord = (cx, cy, 0, 1)` and *no* varyings
-    ///   (R.2 adds perspective-correct interpolation).
-    /// * No depth, no clipping, no blend.  R.1's scope.
+    /// * **Vertex shading** — call `atrium_vs_main` once per
+    ///   vertex with that vertex's attribute buffer; collect
+    ///   3 clip-space `gl_Position`s.
+    /// * **Perspective divide** — NDC = (x/w, y/w, z/w);
+    ///   cache `1/w` for perspective-correct interpolation.
+    /// * **Viewport mapping** — Vulkan convention (y NOT
+    ///   flipped); NDC → screen.
+    /// * **Pineda edge functions + bbox**.  Pixel is inside
+    ///   iff all three edge values have the same sign
+    ///   (handles both windings — we don't bother with a
+    ///   winding convention here).
+    /// * **Perspective-correct varying interpolation** —
+    ///   given the caller's `varyings_per_vertex` buffers
+    ///   (an array of `varying_f32_count` `f32` lanes per
+    ///   vertex), compute at each inside pixel:
+    ///       v(P) = Σ_i b_i * (v_i / w_i)   /   Σ_i b_i * (1 / w_i)
+    ///   where `b_i` are normalised barycentric coordinates
+    ///   (`edge_i / total_edge_sum`).
+    /// * **Fragment shading** — call `atrium_fs_main` with
+    ///   the interpolated varying buffer + `gl_FragCoord =
+    ///   (cx, cy, interp_z, 1/interp_inv_w)`.
     ///
-    /// The triangle MUST be in NDC (gl_Position.w == 1
-    /// effectively); no perspective divide is done.  R.2
-    /// will add it.
+    /// R.3+ adds depth test, clipping, blending.
     ///
-    /// `vertex_attrs[i]` is the per-vertex attribute buffer
-    /// for vertex `i` (typically 12 bytes for a `vec3`
-    /// position attribute; the layout is per the vertex
-    /// shader's SPIR-V `Input` variables).  `pixels` is RGBA8
-    /// row-major, length `width * height * 4`; pixels
-    /// outside the triangle are left untouched, so the
-    /// caller controls the background.
+    /// `varyings_per_vertex` is **caller-supplied**, not
+    /// captured from the VS's `out_varyings` write.  That's
+    /// a temporary scaffolding: the backends today route
+    /// every Vertex Output `OpStore` to `out_position`
+    /// (cranelift `src/lib.rs:1648`, bespoke `src/lib.rs:2412`)
+    /// because the dispatch on `BuiltIn` vs `Location`
+    /// decoration is queued as "vertex phase 4+" backend
+    /// work.  Once that lands, a production path will
+    /// capture each VS invocation's `out_varyings` buffer
+    /// and drop the caller-supplied parameter; the
+    /// interpolation math here is unchanged.
     pub fn fill_image_triangle(
         &self,
         vs_shader_id: Tier2ShaderId,
         fs_shader_id: Tier2ShaderId,
-        vertex_attrs: [&[u8]; 3],
-        uniforms: &[u8],
-        push_constants: &[u8],
+        draw: &DrawTriangle<'_>,
         width: u32,
         height: u32,
         pixels: &mut [u8],
@@ -237,6 +244,16 @@ impl Tier2Registry {
                 got: pixels.len(),
             });
         }
+        let varying_bytes = draw.varying_f32_count * 4;
+        for i in 0..3 {
+            if draw.varyings_per_vertex[i].len() != varying_bytes {
+                return Err(Tier2ExecError::BadVaryingBufferLen {
+                    vertex: i,
+                    expected: varying_bytes,
+                    got: draw.varyings_per_vertex[i].len(),
+                });
+            }
+        }
         let vs_loaded = self.get(vs_shader_id)
             .ok_or(Tier2ExecError::UnknownShader(vs_shader_id))?;
         let vs_main = vs_loaded.entry_points.vs_main
@@ -246,25 +263,21 @@ impl Tier2Registry {
         let fs_main = fs_loaded.entry_points.fs_main
             .ok_or(Tier2ExecError::NotAFragmentShader)?;
 
-        let uni_ptr = if uniforms.is_empty() {
+        let uni_ptr = if draw.uniforms.is_empty() {
             std::ptr::null()
-        } else { uniforms.as_ptr() };
-        let pc_ptr = if push_constants.is_empty() {
+        } else { draw.uniforms.as_ptr() };
+        let pc_ptr = if draw.push_constants.is_empty() {
             std::ptr::null()
-        } else { push_constants.as_ptr() };
+        } else { draw.push_constants.as_ptr() };
 
         // ── Step 1: vertex shading.  3 invocations.
-        // out_varyings / out_clip_distance are R.2+ work; the
-        // shader writes into the scratch buffer but R.1 ignores
-        // its content (the pixel-loop FS call passes null
-        // varyings).
         let mut clip_positions: [[f32; 4]; 3] = [[0.0; 4]; 3];
         let mut vary_scratch = [0u8; 256];
         let mut clip_dist = [0.0f32; 8];
         for i in 0..3 {
-            let attr_ptr = if vertex_attrs[i].is_empty() {
+            let attr_ptr = if draw.vertex_attrs[i].is_empty() {
                 std::ptr::null()
-            } else { vertex_attrs[i].as_ptr() };
+            } else { draw.vertex_attrs[i].as_ptr() };
             // SAFETY: vs_main is a dlopened C-ABI function;
             // the ShaderRecord guarantees its signature
             // matches VsMain (atrium-spv-loader checked it at
@@ -284,22 +297,63 @@ impl Tier2Registry {
             }
         }
 
-        // ── Step 2: viewport mapping (NDC → screen).
-        // R.1 assumes positions are already in NDC (effectively
-        // w == 1); R.2 will divide x/y/z by w first.
-        // Vulkan convention: y is NOT flipped, so screen y=0
+        // ── Step 2: perspective divide + cache 1/w per vertex.
+        // R.2's first deliverable.  After this, ndc[i] holds
+        // (x/w, y/w, z/w) and inv_w[i] holds 1/w_i.
+        //
+        // Guard against w == 0 (degenerate / behind-camera);
+        // any such vertex collapses the triangle, which the
+        // edge-function inside test will catch as
+        // zero-area, so we treat 1/0 as 0 and continue.
+        let mut ndc: [[f32; 3]; 3] = [[0.0; 3]; 3];
+        let mut inv_w: [f32; 3] = [0.0; 3];
+        for i in 0..3 {
+            let w = clip_positions[i][3];
+            let iw = if w == 0.0 { 0.0 } else { 1.0 / w };
+            inv_w[i] = iw;
+            ndc[i][0] = clip_positions[i][0] * iw;
+            ndc[i][1] = clip_positions[i][1] * iw;
+            ndc[i][2] = clip_positions[i][2] * iw;
+        }
+
+        // ── Step 3: viewport mapping (NDC → screen).
+        // Vulkan convention: y NOT flipped, so screen y=0
         // corresponds to NDC y=-1.
         let fw = width as f32;
         let fh = height as f32;
         let mut screen: [(f32, f32); 3] = [(0.0, 0.0); 3];
         for i in 0..3 {
             screen[i] = (
-                (clip_positions[i][0] + 1.0) * 0.5 * fw,
-                (clip_positions[i][1] + 1.0) * 0.5 * fh,
+                (ndc[i][0] + 1.0) * 0.5 * fw,
+                (ndc[i][1] + 1.0) * 0.5 * fh,
             );
         }
 
-        // ── Step 3: screen-space bbox, clamped to viewport.
+        // ── Step 4: pre-compute attr/w per vertex for every
+        // varying lane.  Done once per triangle so the inner
+        // pixel loop does only the barycentric weighting +
+        // final divide by interpolated (1/w).
+        let n = draw.varying_f32_count;
+        let mut varying_over_w: [Vec<f32>; 3] = [
+            vec![0.0f32; n],
+            vec![0.0f32; n],
+            vec![0.0f32; n],
+        ];
+        for i in 0..3 {
+            for k in 0..n {
+                let off = k * 4;
+                let bytes = [
+                    draw.varyings_per_vertex[i][off],
+                    draw.varyings_per_vertex[i][off + 1],
+                    draw.varyings_per_vertex[i][off + 2],
+                    draw.varyings_per_vertex[i][off + 3],
+                ];
+                let f = f32::from_le_bytes(bytes);
+                varying_over_w[i][k] = f * inv_w[i];
+            }
+        }
+
+        // ── Step 5: screen-space bbox, clamped to viewport.
         let min_x = screen.iter().map(|p| p.0)
             .fold(f32::INFINITY, f32::min).max(0.0).floor() as i32;
         let max_x = screen.iter().map(|p| p.0)
@@ -312,39 +366,80 @@ impl Tier2Registry {
             return Ok(());     // triangle fully off-screen
         }
 
-        // ── Step 4: Pineda edge functions.
-        //   e(A, B, P) > 0  ⇔  P is on one specific side of
-        //                      directed edge A → B.
-        // Pixel is inside the triangle iff the three edge
-        // values have the same sign (handles both windings —
-        // we don't bother with a winding convention in R.1).
+        // ── Step 6: Pineda edge functions.  Pre-compute
+        // total triangle area for barycentric normalisation;
+        // the three edge values at any pixel sum to this
+        // constant.
         let (a, b, c) = (screen[0], screen[1], screen[2]);
         let edge = |ax: f32, ay: f32, bx: f32, by: f32, px: f32, py: f32| -> f32 {
             (bx - ax) * (py - ay) - (by - ay) * (px - ax)
         };
+        // Total signed 2-area of triangle (A, B, C).  Zero
+        // for degenerate triangles; bary normalisation skips
+        // the divide when total is 0.
+        let total_edge = edge(a.0, a.1, b.0, b.1, c.0, c.1);
 
-        // ── Step 5: pixel loop.
+        // ── Step 7: pixel loop.
+        let mut interp_buf: Vec<u8> = vec![0u8; varying_bytes];
         for py in min_y..=max_y {
             for px in min_x..=max_x {
                 let cx = px as f32 + 0.5;
                 let cy = py as f32 + 0.5;
-                let w0 = edge(b.0, b.1, c.0, c.1, cx, cy);
-                let w1 = edge(c.0, c.1, a.0, a.1, cx, cy);
-                let w2 = edge(a.0, a.1, b.0, b.1, cx, cy);
-                let inside_pos = w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0;
-                let inside_neg = w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0;
+                let we0 = edge(b.0, b.1, c.0, c.1, cx, cy);
+                let we1 = edge(c.0, c.1, a.0, a.1, cx, cy);
+                let we2 = edge(a.0, a.1, b.0, b.1, cx, cy);
+                let inside_pos = we0 >= 0.0 && we1 >= 0.0 && we2 >= 0.0;
+                let inside_neg = we0 <= 0.0 && we1 <= 0.0 && we2 <= 0.0;
                 if !(inside_pos || inside_neg) { continue; }
+
+                // Normalised barycentrics.  Skip on degenerate
+                // triangles; the edge-function inside test
+                // above only fires for zero-area triangles
+                // when a pixel centre happens to lie exactly
+                // on the collinear edge, which is mostly
+                // moot.
+                if total_edge == 0.0 { continue; }
+                let b0 = we0 / total_edge;
+                let b1 = we1 / total_edge;
+                let b2 = we2 / total_edge;
+
+                // Perspective-correct interpolation.
+                //   interp_inv_w = Σ b_i * (1/w_i)
+                //   interp(attr) = Σ b_i * (attr_i/w_i)  /  interp_inv_w
+                let interp_inv_w =
+                    b0 * inv_w[0] + b1 * inv_w[1] + b2 * inv_w[2];
+                // Divide once per pixel, not once per lane.
+                let one_over_interp_inv_w = if interp_inv_w == 0.0 {
+                    0.0
+                } else {
+                    1.0 / interp_inv_w
+                };
+                for k in 0..n {
+                    let sow = b0 * varying_over_w[0][k]
+                            + b1 * varying_over_w[1][k]
+                            + b2 * varying_over_w[2][k];
+                    let v = sow * one_over_interp_inv_w;
+                    interp_buf[k*4 .. k*4 + 4]
+                        .copy_from_slice(&v.to_le_bytes());
+                }
+                // Interpolated depth (for FsMain's
+                // gl_FragCoord.z; R.3 hooks the depth test
+                // here).
+                let interp_z =
+                    b0 * ndc[0][2] + b1 * ndc[1][2] + b2 * ndc[2][2];
 
                 let mut out_color = [0.0f32; 4];
                 let mut out_depth = 0.0f32;
-                // SAFETY: same as VS above.  R.1 passes null
-                // varyings; R.2 will pass an interpolated buffer.
+                let in_varyings_ptr = if n == 0 {
+                    std::ptr::null()
+                } else { interp_buf.as_ptr() };
+                // SAFETY: same as VS above.
                 unsafe {
                     fs_main(
-                        std::ptr::null(),       // in_varyings
+                        in_varyings_ptr,
                         uni_ptr,
                         pc_ptr,
-                        cx, cy, 0.0, 1.0,
+                        cx, cy, interp_z, one_over_interp_inv_w,
                         0,
                         out_color.as_mut_ptr(),
                         &mut out_depth,
@@ -360,6 +455,48 @@ impl Tier2Registry {
         }
         Ok(())
     }
+}
+
+/// Draw-call parameters for [`Tier2Registry::fill_image_triangle`].
+///
+/// Bundling these into a struct so future rasterizer phases
+/// (R.3 depth, R.4 clipping, R.5 blending, ...) can grow
+/// fields without breaking every caller's argument order.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DrawTriangle<'a> {
+    /// Per-vertex attribute buffers fed to the vertex shader.
+    /// Layout is dictated by the VS's SPIR-V `Input`
+    /// variables (typically a 12-byte `vec3` position at
+    /// `Location=0`, contiguous f32 lanes for later
+    /// locations).  Empty slices map to a null
+    /// `in_attributes` parameter into `atrium_vs_main`.
+    pub vertex_attrs: [&'a [u8]; 3],
+
+    /// Per-vertex varying buffers consumed by the
+    /// rasterizer's interpolator and fed to the FS as
+    /// `in_varyings`.  See `fill_image_triangle`'s docstring
+    /// for the temporary-scaffolding rationale (the
+    /// backends' VS Output dispatch needs to learn the
+    /// BuiltIn-vs-Location split before these can be
+    /// captured from `out_varyings` directly).  Each slice
+    /// must be exactly `varying_f32_count * 4` bytes long.
+    pub varyings_per_vertex: [&'a [u8]; 3],
+
+    /// Number of `f32` lanes in each per-vertex varying
+    /// buffer.  The interpolator treats the buffer as that
+    /// many contiguous little-endian `f32`s; the FS reads
+    /// them via its `Input` `Location=N` decorations.
+    pub varying_f32_count: usize,
+
+    /// Uniform buffer shared across VS + FS invocations.
+    /// Layout per the shaders' `Uniform`-storage
+    /// declarations.  Empty → null.
+    pub uniforms: &'a [u8],
+
+    /// Push-constant buffer shared across VS + FS
+    /// invocations.  Layout per the shaders' `PushConstant`
+    /// declarations.  Empty → null.
+    pub push_constants: &'a [u8],
 }
 
 /// Saturating float-to-u8 conversion matching the standard
@@ -394,4 +531,15 @@ pub enum Tier2ExecError {
     /// it's a fragment or compute shader).
     #[error("shader has no atrium_vs_main entry point")]
     NotAVertexShader,
+    /// A per-vertex varying buffer's byte length didn't
+    /// match `varying_f32_count * 4`.
+    #[error("varyings_per_vertex[{vertex}] length {got} != expected {expected}")]
+    BadVaryingBufferLen {
+        /// Which of the 3 vertex buffers was wrong.
+        vertex: usize,
+        /// Required length (`varying_f32_count * 4`).
+        expected: usize,
+        /// Caller-supplied length.
+        got: usize,
+    },
 }
