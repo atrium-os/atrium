@@ -3791,3 +3791,108 @@ unchanged. `dlopen.rs` stays as the legacy reader for any
 pre-existing `.so` cache entries; nothing produces `.so`
 anymore. 25/25 differential + 3/3 in-VM scripts pass on
 the FreeBSD target throughout.
+
+#### Next big arc — scoped: tier-2 rasterizer
+
+The shader-compile pipeline is complete (frontend, both
+backends, blob, mmap, .pcmap, JIT-emit).  The matrix arc
+gave us a real `gl_Position = mvp * vec4(in_pos, 1.0)`
+vertex shader.  The piece still missing between a
+*compiled vertex+fragment shader pair* and *pixels on the
+target image* is the rasterizer — the driver that walks a
+draw call, calls the VS per vertex, assembles primitives,
+clips, rasterises, and calls the FS per fragment.
+
+Currently `Tier2Backend::submit_frame`
+(`aqueduct-gpu-host/src/tier2_backend.rs`) just calls
+`Tier2Registry::fill_image_fragment` once per pass — a
+fullscreen `for y in 0..h { for x in 0..w { fs_main(...) } }`
+loop.  Geometry is ignored entirely.  This is fine for
+the fullscreen-quad demos used to validate the FS
+codegen, but no real Vulkan draw can ride it.
+
+Spec reference: `docs/spec/tier2-renderer.md` §8.
+
+**Phasing.**  Eight sub-phases, in the order each unlocks
+the next one's tests.  Each is gated on the differential +
+in-VM suites staying green.
+
+1. **R.1 — hello triangle.**
+   * Index/draw walker (just 3 indices for now).
+   * Vertex shading: call `atrium_vs_main` 3× with each
+     vertex's attribute buffer; collect 3 `gl_Position`s.
+   * Triangle setup: assume positions already in NDC
+     (skip perspective divide), map NDC → screen via
+     viewport, compute Pineda edge-function coefficients
+     for the 3 edges.
+   * Pixel loop over the screen-space bbox: pixel inside
+     iff all three edge functions have the same sign
+     (front-face winding); on inside, call `atrium_fs_main`
+     with a constant set of varying values (R.2's job to
+     interpolate them).
+   * No depth, no blend, no clipping (positions must be
+     in-bounds), no varyings.
+   * Gates the entire pipeline shape.  Pixels written by
+     the bespoke and Cranelift FS through real geometry.
+
+2. **R.2 — perspective-correct varying interpolation.**
+   * Add `1/w` per-vertex, interpolate `attr/w` and `1/w`
+     barycentrically, recover `attr = (attr/w)/(1/w)` per
+     pixel.
+   * Perspective divide and viewport mapping go here.
+   * Test: pass `vec3 colour` as a varying — gradient
+     across the triangle.
+
+3. **R.3 — depth buffer.**
+   * Allocate a per-image `Vec<f32>` depth buffer parallel
+     to the colour buffer.
+   * Interpolate `gl_FragCoord.z`; depth test (default
+     `LESS`); depth write.
+   * Test: two overlapping triangles, the nearer one wins
+     in the overlap region.
+
+4. **R.4 — clipping.**
+   * Guard-band clipping or full Sutherland-Hodgman against
+     the 6 view-frustum planes.
+   * Test: triangle with one vertex outside the NDC cube.
+
+5. **R.5 — blending + colour mask.**
+   * Alpha-over, alpha-blend factors, fixed-pipeline blend
+     state matching Vulkan's `VkPipelineColorBlendAttachmentState`.
+   * Test: red triangle with `α=0.5` over a green background.
+
+6. **R.6 — tiled raster.**
+   * 8×8 or 16×16 tiles; per-tile bbox cull; iterate inside-
+     bbox pixels.
+   * Single-threaded first; no perf change expected.
+   * Test: existing tests still pass.
+
+7. **R.7 — multi-thread tiles.**
+   * Each tile a `rayon` (or hand-rolled) task.
+   * Test: same tests, faster.  Add a stress-test scene
+     and assert linear-ish scaling up to memory bandwidth.
+
+8. **R.8 — SIMD pixel quads.**
+   * Process 4 (or 8) pixels per FS call using `std::simd`.
+   * Bespoke + Cranelift fragment shaders need a SIMD entry
+     point variant; deferred work in the FS ABI.
+   * Aspirational, blocked on the FS-ABI side.
+
+**Sub-phase boundaries vs ABI changes.**  R.1-R.3 need
+zero ABI changes — they fit inside the existing
+`atrium_vs_main` / `atrium_fs_main` signatures.  R.5
+needs the host to know blend state (a `RasterState`
+struct).  R.8 needs an FS-side ABI change (vectorised
+entry point).  R.4 and R.6/R.7 are internal-only.
+
+**Where the code goes.**  A new
+`aqueduct-gpu-host/src/tier2_rasterizer.rs` mirroring
+the design in spec §7 (`Rasterizer` struct).  `Tier2Backend`
+gains a `rasterizer: Mutex<Rasterizer>` field; `submit_frame`
+walks the frame buffer for `FrameOp::Draw`, builds a
+`DrawCall`, and dispatches through the rasterizer instead
+of jumping to `fill_image_fragment`.  `fill_image_fragment`
+stays for the fullscreen-quad case as a fast path (and
+for the existing FS-validation tests).
+
+**Status: scoped, R.1 next.**
