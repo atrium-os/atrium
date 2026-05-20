@@ -32,6 +32,7 @@ use aqueduct_gpu::frame::{
     FrameDecoder, IndexType, SetViewportCmd,
 };
 use aqueduct_gpu::opcodes::FrameOp;
+use aqueduct_gpu::VertexInputState;
 
 /// Backend that routes draws through Tier-2 compiled
 /// fragment shaders. Image storage lives in this backend
@@ -54,6 +55,12 @@ pub struct Tier2Backend {
     /// shader to fire for each `FrameOp::BindPipeline`
     /// record it walks.
     pipeline_shaders: Mutex<HashMap<u32, Tier2ShaderId>>,
+    /// Vertex-input layout keyed by pipeline ResourceId.raw().
+    /// Populated by [`Tier2Backend::bind_pipeline_layout`] when
+    /// the session decodes a `Tier2PipelineStateBlob`. The
+    /// frame-walker consults this map at Draw time to slice
+    /// bound vertex buffers into per-vertex attribute bytes.
+    pipeline_layouts: Mutex<HashMap<u32, VertexInputState>>,
     submissions: AtomicU64,
     presents:    AtomicU64,
     /// Total Draw / DrawIndexed records the frame-walker has
@@ -68,6 +75,30 @@ pub struct Tier2Backend {
     /// (e.g. a guest that submits geometry against a non-Tier-2
     /// pipeline). Observable for diagnostics.
     draws_skipped: AtomicU64,
+    /// Per-vertex packed attribute bytes assembled by the most
+    /// recent `dispatch_draw`. Exposed for D.4 testing; D.5
+    /// turns this into the input of `fill_image_triangle`.
+    last_assembled_vertices: Mutex<Option<AssembledVertices>>,
+}
+
+/// Output of [`Tier2Backend::assemble_vertices`]: per-vertex
+/// attribute bytes laid out by (location, format). Lengths:
+/// `attribute_offsets.len() == layout.attributes.len() + 1`,
+/// `bytes.len() == vertex_count * stride_per_vertex` where the
+/// total stride is `attribute_offsets.last()`.
+#[derive(Debug, Clone)]
+pub struct AssembledVertices {
+    /// Number of vertices packed.
+    pub vertex_count: u32,
+    /// Per-vertex stride in bytes (sum of all attribute sizes,
+    /// densely packed in shader-`location` order).
+    pub stride: u32,
+    /// Byte offset of each attribute within one vertex; final
+    /// entry equals `stride` (so `[i..i+1]` gives the i-th
+    /// attribute's range).
+    pub attribute_offsets: Vec<u32>,
+    /// Packed bytes: `vertex_count` records of `stride` bytes.
+    pub bytes: Vec<u8>,
 }
 
 /// Per-render-pass bound state assembled by the frame walker.
@@ -140,6 +171,8 @@ impl Tier2Backend {
             images: Mutex::new(HashMap::new()),
             buffers: Mutex::new(HashMap::new()),
             pipeline_shaders: Mutex::new(HashMap::new()),
+            pipeline_layouts: Mutex::new(HashMap::new()),
+            last_assembled_vertices: Mutex::new(None),
             submissions: AtomicU64::new(0),
             presents:    AtomicU64::new(0),
             draws_executed: AtomicU64::new(0),
@@ -214,6 +247,20 @@ impl Tier2Backend {
             img.width, img.height,
             &mut img.pixels,
         )
+    }
+
+    /// Associate a pipeline ResourceId with a vertex-input
+    /// layout (mirrors `bind_pipeline` but for geometry state).
+    pub fn bind_layout(&self, pipeline_id: ResourceId, layout: VertexInputState) {
+        self.pipeline_layouts.lock().unwrap()
+            .insert(pipeline_id.raw(), layout);
+    }
+
+    /// Snapshot of the per-vertex bytes the most recent Draw
+    /// assembled. `None` if no Draw has dispatched yet (or the
+    /// last Draw was rejected before assembly).
+    pub fn last_assembled_vertices(&self) -> Option<AssembledVertices> {
+        self.last_assembled_vertices.lock().unwrap().clone()
     }
 
     /// Read back a registered image's RGBA8 pixels.
@@ -328,10 +375,12 @@ impl Tier2Backend {
         }
     }
 
-    /// Dispatch a `Draw` against the current pass state. D.3
-    /// stub: validates Tier-2 binding + increments counters.
-    /// D.4 turns the assembled state + vertex-input layout into
-    /// per-primitive `fill_image_triangle` calls.
+    /// Dispatch a `Draw` against the current pass state. D.4:
+    /// looks up the bound pipeline's vertex-input layout, gathers
+    /// per-vertex attribute bytes from each bound vertex buffer
+    /// per the layout, packs them densely (location-order) into
+    /// `last_assembled_vertices`. D.5 turns the packed bytes into
+    /// `fill_image_triangle` calls.
     fn dispatch_draw(
         &self,
         target_id: ResourceId,
@@ -347,12 +396,107 @@ impl Tier2Backend {
             log::debug!("Draw on target {target_id} skipped: vertex_count=0");
             return;
         }
+
+        let pipeline_raw = match state.pipeline_raw {
+            Some(p) => p,
+            None => {
+                log::warn!("Draw on target {target_id}: tier2 shader bound but \
+                            no pipeline id recorded (impossible state)");
+                return;
+            }
+        };
+        let layout = match self.pipeline_layouts.lock().unwrap().get(&pipeline_raw).cloned() {
+            Some(l) => l,
+            None => {
+                log::warn!("Draw on target {target_id}: pipeline {pipeline_raw:#x} \
+                            has no vertex-input layout; skipping");
+                return;
+            }
+        };
+
+        let assembled = match self.assemble_vertices(
+            &layout, &state.vertex_buffers, cmd.first_vertex, cmd.vertex_count,
+        ) {
+            Ok(a) => a,
+            Err(e) => {
+                log::warn!("Draw on target {target_id}: vertex assembly failed: {e}");
+                return;
+            }
+        };
+
+        *self.last_assembled_vertices.lock().unwrap() = Some(assembled);
         self.draws_executed.fetch_add(1, Ordering::Relaxed);
-        log::debug!("Draw target={target_id} verts={} inst={} \
-                     first_vert={} bindings={} viewport={}",
+        log::debug!("Draw target={target_id} verts={} inst={} first_vert={} \
+                     attrs={} stride={}",
                     cmd.vertex_count, cmd.instance_count, cmd.first_vertex,
-                    state.vertex_buffers.len(),
-                    state.viewport.is_some());
+                    layout.attributes.len(),
+                    layout.bindings.iter().map(|b| b.stride).sum::<u32>());
+    }
+
+    /// Gather per-vertex attribute bytes for `vertex_count`
+    /// vertices starting at `first_vertex`, sourcing each
+    /// attribute from the bound buffer at `attr.binding`,
+    /// offset `vertex_buffers[binding].offset + first_vertex *
+    /// binding_stride + attr.offset`. The output packs attributes
+    /// in shader-location order with no padding between them.
+    fn assemble_vertices(
+        &self,
+        layout: &VertexInputState,
+        vertex_buffers: &HashMap<u32, BoundVertexBuffer>,
+        first_vertex: u32,
+        vertex_count: u32,
+    ) -> Result<AssembledVertices, String> {
+        // Order attributes by shader location so the packed
+        // record is shader-input-order (varying-friendly).
+        let mut attrs: Vec<_> = layout.attributes.iter().collect();
+        attrs.sort_by_key(|a| a.location);
+
+        let mut out_offsets = Vec::with_capacity(attrs.len() + 1);
+        let mut out_stride: u32 = 0;
+        for a in &attrs {
+            out_offsets.push(out_stride);
+            out_stride += a.format.byte_size() as u32;
+        }
+        out_offsets.push(out_stride);
+
+        // Per-binding source data.
+        let buffers = self.buffers.lock().unwrap();
+        let mut bytes = vec![0u8; (vertex_count as usize) * (out_stride as usize)];
+
+        for v in 0..vertex_count {
+            let global_v = first_vertex + v;
+            let out_base = (v as usize) * (out_stride as usize);
+            for (ai, a) in attrs.iter().enumerate() {
+                let bind = layout.bindings.iter().find(|b| b.binding == a.binding)
+                    .ok_or_else(|| format!(
+                        "no binding desc for slot {}", a.binding))?;
+                let slot = vertex_buffers.get(&a.binding)
+                    .ok_or_else(|| format!(
+                        "vertex buffer not bound at slot {}", a.binding))?;
+                let src = buffers.get(&slot.buffer_raw).ok_or_else(|| format!(
+                    "vertex buffer {:#x} not in backend storage", slot.buffer_raw))?;
+                let src_off = (slot.offset as usize)
+                    + (global_v as usize) * (bind.stride as usize)
+                    + (a.offset as usize);
+                let size = a.format.byte_size();
+                let src_end = src_off + size;
+                if src_end > src.bytes.len() {
+                    return Err(format!(
+                        "attribute @location {} (vertex {}) reads bytes \
+                         {}..{} past buffer end {}",
+                        a.location, global_v, src_off, src_end,
+                        src.bytes.len()));
+                }
+                let out_off = out_base + (out_offsets[ai] as usize);
+                bytes[out_off..out_off + size]
+                    .copy_from_slice(&src.bytes[src_off..src_end]);
+            }
+        }
+
+        Ok(AssembledVertices {
+            vertex_count, stride: out_stride,
+            attribute_offsets: out_offsets, bytes,
+        })
     }
 
     /// Dispatch a `DrawIndexed` against the current pass state.
@@ -494,5 +638,13 @@ impl Backend for Tier2Backend {
         tier2_shader_id: Tier2ShaderId,
     ) {
         self.bind_pipeline(pipeline_id, tier2_shader_id);
+    }
+
+    fn bind_pipeline_layout(
+        &self,
+        pipeline_id: ResourceId,
+        layout: VertexInputState,
+    ) {
+        self.bind_layout(pipeline_id, layout);
     }
 }

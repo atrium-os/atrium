@@ -155,6 +155,18 @@ pub trait Backend: Send + Sync {
         _pipeline_id: ResourceId,
         _tier2_shader_id: crate::Tier2ShaderId,
     ) {}
+
+    /// Associate a vertex-input layout with a pipeline. Called
+    /// by the session when `PipelineCreatePayload::state_blob`
+    /// decodes as a [`aqueduct_gpu::Tier2PipelineStateBlob`].
+    /// The tier-2 backend uses this to slice bound vertex
+    /// buffers into per-vertex attribute bytes at Draw time.
+    /// Default no-op.
+    fn bind_pipeline_layout(
+        &self,
+        _pipeline_id: ResourceId,
+        _layout: aqueduct_gpu::VertexInputState,
+    ) {}
 }
 
 /// Protocol-correct backend that does no GPU work.

@@ -386,6 +386,15 @@ fn tier2_backend_draw_walker_increments_draw_count() {
     let vbuf_id    = ResourceId::new(IdNamespace::IcdRuntime, 0xD003);
     backend.image_created(image_id, 8, 8);
     backend.bind_pipeline(pipeline_id, shader_id);
+    backend.bind_layout(pipeline_id, aqueduct_gpu::VertexInputState {
+        bindings: vec![aqueduct_gpu::VertexBindingDesc {
+            binding: 0, stride: 4, per_instance: false,
+        }],
+        attributes: vec![aqueduct_gpu::VertexAttributeDesc {
+            location: 0, binding: 0,
+            format: aqueduct_gpu::VertexFormat::R32Sfloat, offset: 0,
+        }],
+    });
     backend.buffer_created(vbuf_id, 256);
 
     let mut fb = FrameBuilder::new(4096);
@@ -496,4 +505,175 @@ fn tier2_backend_legacy_fullscreen_path_still_fires() {
     let b = (expected[2] * 255.0 + 0.5) as u8;
     assert_eq!(&pixels[..4], &[r, g, b, 255]);
     assert_eq!(backend.draw_count(), 0);
+}
+
+#[test]
+fn tier2_backend_dispatch_assembles_vertex_bytes() {
+    use aqueduct_gpu::frame::{BindVertexBufCmd, DrawCmd, FrameBuilder};
+    use aqueduct_gpu::opcodes::FrameOp;
+    use aqueduct_gpu::{
+        VertexAttributeDesc, VertexBindingDesc, VertexFormat, VertexInputState,
+    };
+
+    let cache_dir = TempDir::new().unwrap();
+    let registry = Arc::new(Tier2Registry::new(LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    }));
+    let spirv = build_constant_color_spirv([0.1, 0.2, 0.3, 1.0]);
+    let shader_id = registry.register(&spirv).unwrap();
+    let backend = Tier2Backend::new(registry);
+
+    let image_id    = ResourceId::new(IdNamespace::IcdRuntime, 0xE001);
+    let pipeline_id = ResourceId::new(IdNamespace::IcdRuntime, 0xE002);
+    let vbuf_id     = ResourceId::new(IdNamespace::IcdRuntime, 0xE003);
+    backend.image_created(image_id, 4, 4);
+    backend.bind_pipeline(pipeline_id, shader_id);
+
+    // Two attributes per vertex: vec3 position @0, vec2 uv @1.
+    // Stride = 12 + 8 = 20 bytes; D.4 packs densely in
+    // location order so packed_stride == 20 too.
+    backend.bind_layout(pipeline_id, VertexInputState {
+        bindings: vec![VertexBindingDesc {
+            binding: 0, stride: 20, per_instance: false,
+        }],
+        attributes: vec![
+            VertexAttributeDesc {
+                location: 0, binding: 0,
+                format: VertexFormat::R32g32b32Sfloat, offset: 0,
+            },
+            VertexAttributeDesc {
+                location: 1, binding: 0,
+                format: VertexFormat::R32g32Sfloat, offset: 12,
+            },
+        ],
+    });
+
+    // 3 vertices: (pos=(1,2,3), uv=(0.5,0.25)),
+    //              (pos=(4,5,6), uv=(0.75,0.0)),
+    //              (pos=(7,8,9), uv=(1.0,1.0)).
+    let mut src = Vec::<u8>::with_capacity(60);
+    let verts: [(f32,f32,f32,f32,f32); 3] = [
+        (1.0, 2.0, 3.0, 0.5, 0.25),
+        (4.0, 5.0, 6.0, 0.75, 0.0),
+        (7.0, 8.0, 9.0, 1.0, 1.0),
+    ];
+    for (x,y,z,u,v) in verts {
+        src.extend_from_slice(&x.to_le_bytes());
+        src.extend_from_slice(&y.to_le_bytes());
+        src.extend_from_slice(&z.to_le_bytes());
+        src.extend_from_slice(&u.to_le_bytes());
+        src.extend_from_slice(&v.to_le_bytes());
+    }
+    backend.buffer_created(vbuf_id, src.len() as u64);
+    backend.buffer_write_bytes(vbuf_id, 0, &src).unwrap();
+
+    let mut fb = FrameBuilder::new(4096);
+    let mut begin = [0u8; 12];
+    begin[..4].copy_from_slice(&image_id.raw().to_le_bytes());
+    begin[4..8].copy_from_slice(&4u32.to_le_bytes());
+    begin[8..12].copy_from_slice(&4u32.to_le_bytes());
+    fb.push(FrameOp::BeginRenderPass, &begin).unwrap();
+    fb.push(FrameOp::BindPipeline, &pipeline_id.raw().to_le_bytes()).unwrap();
+    fb.push_bind_vertex_buf(BindVertexBufCmd {
+        binding: 0, buffer_id: vbuf_id.raw(), offset: 0,
+    }).unwrap();
+    fb.push_draw(DrawCmd {
+        vertex_count: 3, instance_count: 1,
+        first_vertex: 0, first_instance: 0,
+    }).unwrap();
+    fb.push(FrameOp::EndRenderPass, &[]).unwrap();
+
+    let fence = ResourceId::new(IdNamespace::IcdRuntime, 0xE004);
+    backend.submit_frame(fence, 1, fb.as_bytes());
+
+    assert_eq!(backend.draw_count(), 1);
+    let asm = backend.last_assembled_vertices().expect("vertices assembled");
+    assert_eq!(asm.vertex_count, 3);
+    assert_eq!(asm.stride, 20);
+    assert_eq!(asm.attribute_offsets, vec![0, 12, 20]);
+    assert_eq!(asm.bytes.len(), 60);
+
+    // Decode each vertex and verify it round-trips.
+    for (i, (x, y, z, u, v)) in verts.iter().enumerate() {
+        let base = i * 20;
+        let gx = f32::from_le_bytes(asm.bytes[base..base+4].try_into().unwrap());
+        let gy = f32::from_le_bytes(asm.bytes[base+4..base+8].try_into().unwrap());
+        let gz = f32::from_le_bytes(asm.bytes[base+8..base+12].try_into().unwrap());
+        let gu = f32::from_le_bytes(asm.bytes[base+12..base+16].try_into().unwrap());
+        let gv = f32::from_le_bytes(asm.bytes[base+16..base+20].try_into().unwrap());
+        assert_eq!((gx,gy,gz,gu,gv), (*x,*y,*z,*u,*v),
+                   "vertex {i} mismatch");
+    }
+}
+
+#[test]
+fn tier2_backend_dispatch_first_vertex_offset() {
+    use aqueduct_gpu::frame::{BindVertexBufCmd, DrawCmd, FrameBuilder};
+    use aqueduct_gpu::opcodes::FrameOp;
+    use aqueduct_gpu::{
+        VertexAttributeDesc, VertexBindingDesc, VertexFormat, VertexInputState,
+    };
+
+    let cache_dir = TempDir::new().unwrap();
+    let registry = Arc::new(Tier2Registry::new(LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    }));
+    let spirv = build_constant_color_spirv([0.0, 0.0, 0.0, 1.0]);
+    let shader_id = registry.register(&spirv).unwrap();
+    let backend = Tier2Backend::new(registry);
+
+    let image_id    = ResourceId::new(IdNamespace::IcdRuntime, 0xE101);
+    let pipeline_id = ResourceId::new(IdNamespace::IcdRuntime, 0xE102);
+    let vbuf_id     = ResourceId::new(IdNamespace::IcdRuntime, 0xE103);
+    backend.image_created(image_id, 4, 4);
+    backend.bind_pipeline(pipeline_id, shader_id);
+    backend.bind_layout(pipeline_id, VertexInputState {
+        bindings: vec![VertexBindingDesc {
+            binding: 0, stride: 4, per_instance: false,
+        }],
+        attributes: vec![VertexAttributeDesc {
+            location: 0, binding: 0,
+            format: VertexFormat::R32Sfloat, offset: 0,
+        }],
+    });
+
+    // 5 vertices with values [0, 10, 20, 30, 40].
+    let mut src = Vec::<u8>::with_capacity(20);
+    for i in 0..5 {
+        src.extend_from_slice(&((i as f32) * 10.0).to_le_bytes());
+    }
+    backend.buffer_created(vbuf_id, src.len() as u64);
+    backend.buffer_write_bytes(vbuf_id, 0, &src).unwrap();
+
+    let mut fb = FrameBuilder::new(4096);
+    let mut begin = [0u8; 12];
+    begin[..4].copy_from_slice(&image_id.raw().to_le_bytes());
+    begin[4..8].copy_from_slice(&4u32.to_le_bytes());
+    begin[8..12].copy_from_slice(&4u32.to_le_bytes());
+    fb.push(FrameOp::BeginRenderPass, &begin).unwrap();
+    fb.push(FrameOp::BindPipeline, &pipeline_id.raw().to_le_bytes()).unwrap();
+    fb.push_bind_vertex_buf(BindVertexBufCmd {
+        binding: 0, buffer_id: vbuf_id.raw(), offset: 0,
+    }).unwrap();
+    // Draw vertices [2..5) -- expect 20, 30, 40.
+    fb.push_draw(DrawCmd {
+        vertex_count: 3, instance_count: 1,
+        first_vertex: 2, first_instance: 0,
+    }).unwrap();
+    fb.push(FrameOp::EndRenderPass, &[]).unwrap();
+
+    let fence = ResourceId::new(IdNamespace::IcdRuntime, 0xE104);
+    backend.submit_frame(fence, 1, fb.as_bytes());
+
+    let asm = backend.last_assembled_vertices().unwrap();
+    assert_eq!(asm.vertex_count, 3);
+    assert_eq!(asm.stride, 4);
+    let v0 = f32::from_le_bytes(asm.bytes[0..4].try_into().unwrap());
+    let v1 = f32::from_le_bytes(asm.bytes[4..8].try_into().unwrap());
+    let v2 = f32::from_le_bytes(asm.bytes[8..12].try_into().unwrap());
+    assert_eq!((v0, v1, v2), (20.0, 30.0, 40.0));
 }

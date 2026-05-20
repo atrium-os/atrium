@@ -51,6 +51,7 @@ pub mod frame;
 pub mod ids;
 pub mod opcodes;
 pub mod payloads;
+pub mod pipeline;
 
 pub use backends::{BackendId, GpuVendor};
 pub use frame::{
@@ -78,6 +79,10 @@ pub use opcodes::{
     FrameOp,
 };
 pub use payloads::*;
+pub use pipeline::{
+    Tier2PipelineStateBlob, VertexAttributeDesc, VertexBindingDesc,
+    VertexFormat, VertexInputState,
+};
 
 /// Re-exported from `aqueduct` for convenience: GPU dispatch class.
 pub const CLASS_GPU: u8 = aqueduct::classes::CLASS_GPU;

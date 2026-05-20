@@ -465,6 +465,26 @@ impl Session {
                     }
                 }
             }
+
+            // Opportunistically decode the state_blob as a
+            // tier-2 pipeline blob. Failure means the guest
+            // didn't supply tier-2 state -- not an error;
+            // other backends carry their own state shapes.
+            if !req.state_blob.is_empty() {
+                if let Ok(blob) = postcard::from_bytes::<
+                    aqueduct_gpu::Tier2PipelineStateBlob>(&req.state_blob)
+                {
+                    if let Err(diag) = blob.vertex_input.validate() {
+                        self.send_validation_err(
+                            OP_GPU_PIPELINE_CREATE, Some(req.pipeline_id),
+                            &format!("vertex_input invalid: {diag}"),
+                        )?;
+                    } else {
+                        self.backend.bind_pipeline_layout(
+                            req.pipeline_id, blob.vertex_input);
+                    }
+                }
+            }
         }
         Ok(())
     }
