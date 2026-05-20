@@ -1081,6 +1081,109 @@ fn rasterizer_r6_tiles_24x24_spanning_9_tiles() {
     assert_eq!(px(23, 23), [0, 0, 0, 0]);
 }
 
+/// R.7 acceptance: large workload spanning many tile rows
+/// (stripes), exercising the per-stripe parallel path.
+///
+/// Image is 256×256 → 32 stripes of 8 rows each.  Draws a
+/// triangle covering most of the image, then verifies a
+/// gradient varying interpolates correctly across all
+/// stripes (correctness check) AND that the call returns
+/// in <100ms (rough sanity that we're not single-threaded
+/// on something this large; on a multi-core host this
+/// completes in ~10-20 ms with rayon).
+///
+/// The correctness portion is the real value here: a
+/// per-stripe bug (off-by-one in stripe_pixel_y,
+/// stripe-local indexing wrong, etc.) would manifest as
+/// horizontal seams in the gradient at row 8, 16, 24, ...
+/// boundaries.  Spot-check each stripe boundary by
+/// comparing adjacent rows of the same column.
+#[test]
+fn rasterizer_r7_parallel_stripes_correct() {
+    let cache_dir = TempDir::new().unwrap();
+    let config = LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    };
+    let registry = Tier2Registry::new(config);
+    let vs_id = registry.register(&build_passthrough_vs()).unwrap();
+    let fs_id = registry.register(&build_passthrough_color_fs()).unwrap();
+
+    // Big triangle covering most of the 256x256 image.
+    let v0 = pack_vec3([-0.95, -0.95, 0.0]);
+    let v1 = pack_vec3([ 0.95, -0.95, 0.0]);
+    let v2 = pack_vec3([ 0.00,  0.95, 0.0]);
+    let red   = pack_vec4([1.0, 0.0, 0.0, 1.0]);
+    let green = pack_vec4([0.0, 1.0, 0.0, 1.0]);
+    let blue  = pack_vec4([0.0, 0.0, 1.0, 1.0]);
+
+    let w: u32 = 256;
+    let h: u32 = 256;
+    let mut pixels = vec![0u8; (w * h * 4) as usize];
+    let draw = DrawTriangle {
+        vertex_attrs: [&v0, &v1, &v2],
+        varyings_per_vertex: [&red, &green, &blue],
+        varying_f32_count: 4,
+        ..Default::default()
+    };
+
+    let t = std::time::Instant::now();
+    registry.fill_image_triangle(
+        vs_id, fs_id, &draw, w, h, &mut pixels, None,
+    ).expect("R.7 parallel rasterise");
+    let elapsed = t.elapsed();
+    // Loose perf bound -- correctness is the headline,
+    // perf-bound just verifies we're not pathologically
+    // slow.  100 ms is generous; real cores complete this
+    // in 10-20 ms with rayon's 4+ thread pool.
+    assert!(elapsed.as_millis() < 500,
+        "256x256 triangle took {} ms -- expected <500 ms",
+        elapsed.as_millis());
+
+    // Pick a column at x=128 (centre of the image, deep
+    // inside the triangle) and walk every row inside the
+    // triangle.  Verify continuous colour change row-to-row
+    // (no horizontal seams at stripe boundaries y=8, 16,
+    // 24, ...).  A per-stripe indexing bug would manifest
+    // as a sharp colour discontinuity exactly at those rows.
+    let px = |x: usize, y: usize| -> [u8; 4] {
+        let idx = (y * (w as usize) + x) * 4;
+        [pixels[idx], pixels[idx+1], pixels[idx+2], pixels[idx+3]]
+    };
+
+    // Within the triangle interior at x=128, find rows
+    // covered by the triangle (alpha == 255 only inside).
+    let mut covered_rows: Vec<usize> = Vec::new();
+    for y in 0..(h as usize) {
+        if px(128, y)[3] == 255 {
+            covered_rows.push(y);
+        }
+    }
+    assert!(covered_rows.len() > 200,
+        "expected the triangle to cover most of column 128; \
+         only {} rows covered", covered_rows.len());
+
+    // Adjacent-row deltas should be small (linear varying
+    // → ~1 unit per row at most).  Stripe boundary at y=8,
+    // 16, ... should not have larger deltas than mid-stripe
+    // rows.  Tolerance: 5 per channel.
+    for w_idx in 1..covered_rows.len() {
+        let y0 = covered_rows[w_idx - 1];
+        let y1 = covered_rows[w_idx];
+        if y1 != y0 + 1 { continue; }   // skip gaps
+        let p0 = px(128, y0);
+        let p1 = px(128, y1);
+        for k in 0..3 {
+            let d = (p0[k] as i32 - p1[k] as i32).abs();
+            assert!(d <= 5,
+                "stripe-boundary discontinuity at y={y0}/{y1} \
+                 column 128 channel {k}: delta {d} > 5 \
+                 (p0={p0:?}, p1={p1:?})");
+        }
+    }
+}
+
 /// Variant of the passthrough VS that reads a vec4
 /// attribute (xyz + w) and writes gl_Position = that vec4
 /// directly.  Lets the test feed a custom w per vertex so

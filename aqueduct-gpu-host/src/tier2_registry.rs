@@ -23,6 +23,14 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use atrium_spv_loader::{LoadError, LoaderConfig, LoadedShader, ShaderCache};
+use rayon::prelude::*;
+
+/// Rasterizer tile size in pixels (R.6+).  8x8 tiles fit 64
+/// pixels per tile, comfortably in L1 even with depth +
+/// varying + colour state; matches common software-
+/// rasterizer choices (Mesa llvmpipe, WARP).  Also the
+/// per-stripe height used by R.7's per-stripe parallelism.
+const TILE_SIZE: i32 = 8;
 
 /// Daemon-side id for a registered Tier-2 shader.
 ///
@@ -361,7 +369,6 @@ impl Tier2Registry {
         // (verts[0], verts[i], verts[i+1]) for i in 1..n-1.
         let fw = width as f32;
         let fh = height as f32;
-        let mut interp_buf: Vec<u8> = vec![0u8; varying_bytes];
         for i in 1..polygon.len() - 1 {
             let tri_verts: [&ClipVertex; 3] = [
                 &polygon[0],
@@ -417,150 +424,280 @@ impl Tier2Registry {
 
             // Step 6: edges.
             let (a, b, c) = (screen[0], screen[1], screen[2]);
-            let edge = |ax: f32, ay: f32, bx: f32, by: f32, px: f32, py: f32| -> f32 {
-                (bx - ax) * (py - ay) - (by - ay) * (px - ax)
-            };
-            let total_edge = edge(a.0, a.1, b.0, b.1, c.0, c.1);
+            let total_edge = edge_fn(a, b, c);
 
-            // Step 7: tiled pixel loop (R.6).
-            //
-            // The triangle's screen-space bbox is partitioned
-            // into TILE_SIZE x TILE_SIZE tiles in viewport-
-            // aligned coordinates.  Inner py/px iterates only
-            // within the *intersection* of each tile and the
-            // triangle bbox, so pixels outside the bbox aren't
-            // visited even when the triangle is small relative
-            // to a tile.
-            //
-            // R.6 v1 is purely structural — no per-tile edge-
-            // function trivial reject yet (that's R.6 v2;
-            // gives a real win for sparse-coverage triangles).
-            // The point is to set up R.7 (each tile becomes a
-            // parallel task) and R.8 (per-tile SIMD lane state)
-            // without changing per-pixel semantics.  Existing
-            // R.1..R.5 tests pass unchanged.
-            const TILE_SIZE: i32 = 8;
             // Tile coordinates that overlap the triangle bbox.
-            // Use floor-div for tile_min, ceil-div for tile_max
-            // via the standard `(x + TILE_SIZE - 1) / TILE_SIZE`
-            // form -- but min_x / max_x are already
-            // non-negative (clamped to viewport above), so
-            // plain integer division suffices.
             let tile_min_x = min_x / TILE_SIZE;
             let tile_max_x = max_x / TILE_SIZE;
             let tile_min_y = min_y / TILE_SIZE;
             let tile_max_y = max_y / TILE_SIZE;
-            for tile_y in tile_min_y..=tile_max_y {
-                for tile_x in tile_min_x..=tile_max_x {
-                    // Intersect tile with triangle bbox.
-                    let t_min_x =
-                        (tile_x * TILE_SIZE).max(min_x);
-                    let t_max_x =
-                        ((tile_x + 1) * TILE_SIZE - 1).min(max_x);
-                    let t_min_y =
-                        (tile_y * TILE_SIZE).max(min_y);
-                    let t_max_y =
-                        ((tile_y + 1) * TILE_SIZE - 1).min(max_y);
-                    // Empty intersection ⇒ skip the tile.
-                    if t_min_x > t_max_x || t_min_y > t_max_y {
-                        continue;
-                    }
-            for py in t_min_y..=t_max_y {
-                for px in t_min_x..=t_max_x {
-                    let cx = px as f32 + 0.5;
-                    let cy = py as f32 + 0.5;
-                    let we0 = edge(b.0, b.1, c.0, c.1, cx, cy);
-                    let we1 = edge(c.0, c.1, a.0, a.1, cx, cy);
-                    let we2 = edge(a.0, a.1, b.0, b.1, cx, cy);
-                    let inside_pos = we0 >= 0.0 && we1 >= 0.0 && we2 >= 0.0;
-                    let inside_neg = we0 <= 0.0 && we1 <= 0.0 && we2 <= 0.0;
-                    if !(inside_pos || inside_neg) { continue; }
 
-                    if total_edge == 0.0 { continue; }
-                    let b0 = we0 / total_edge;
-                    let b1 = we1 / total_edge;
-                    let b2 = we2 / total_edge;
+            // ── R.7: stripe-level parallelism.  Pre-split
+            // pixels (and optionally depth) into chunks of
+            // TILE_SIZE rows; each chunk is contiguous in
+            // row-major memory and disjoint from the others,
+            // so `chunks_mut` gives us safe per-stripe
+            // `&mut` borrows.  Wrap each chunk + its global
+            // stripe index in a `StripeWork`; rayon's
+            // `par_iter_mut` distributes tasks across the
+            // global thread pool.
+            //
+            // Triangle setup (a, b, c, total_edge, ndc,
+            // inv_w, varying_over_w) is shared via `&`; each
+            // task allocates its own `interp_buf` since
+            // that's mutated per-pixel.  Function pointers
+            // (`fs_main`) and slice references are Send +
+            // Sync, so the closure captures them without
+            // additional wrapping.
+            let setup = TriangleSetup {
+                a, b, c, total_edge,
+                ndc, inv_w,
+                varying_over_w: &varying_over_w,
+                n, varying_bytes,
+                min_x, max_x, min_y, max_y,
+                tile_min_x, tile_max_x,
+                width,
+            };
 
-                    let interp_inv_w =
-                        b0 * inv_w[0] + b1 * inv_w[1] + b2 * inv_w[2];
-                    let one_over_interp_inv_w = if interp_inv_w == 0.0 {
-                        0.0
-                    } else { 1.0 / interp_inv_w };
-                    for k in 0..n {
-                        let sow = b0 * varying_over_w[0][k]
-                                + b1 * varying_over_w[1][k]
-                                + b2 * varying_over_w[2][k];
-                        let v = sow * one_over_interp_inv_w;
-                        interp_buf[k*4 .. k*4 + 4]
-                            .copy_from_slice(&v.to_le_bytes());
-                    }
-                    let interp_z =
-                        b0 * ndc[0][2] + b1 * ndc[1][2] + b2 * ndc[2][2];
+            let pixel_stripe_bytes =
+                (TILE_SIZE as usize) * (width as usize) * 4;
+            let depth_stripe_elems =
+                (TILE_SIZE as usize) * (width as usize);
 
-                    let pixel_lin = (py as usize) * (width as usize)
-                        + (px as usize);
-                    if let Some(db) = depth_buffer.as_mut() {
-                        if interp_z >= db[pixel_lin] { continue; }
-                        db[pixel_lin] = interp_z;
-                    }
+            // Build per-stripe tasks.  Skip stripes that
+            // don't overlap the triangle bbox (so rayon
+            // doesn't get spammed with no-op tasks).  Iterate
+            // pixel_chunks + depth_chunks in lock-step.
+            let pixel_chunks: Vec<&mut [u8]> =
+                pixels.chunks_mut(pixel_stripe_bytes).collect();
+            let depth_chunks: Vec<Option<&mut [f32]>> =
+                match depth_buffer.as_deref_mut() {
+                    Some(db) => db
+                        .chunks_mut(depth_stripe_elems)
+                        .map(Some)
+                        .collect(),
+                    None => (0..pixel_chunks.len())
+                        .map(|_| None)
+                        .collect(),
+                };
+            let mut tasks: Vec<StripeWork> = pixel_chunks
+                .into_iter()
+                .zip(depth_chunks.into_iter())
+                .enumerate()
+                .filter(|(s, _)| {
+                    let tile_y = *s as i32;
+                    tile_y >= tile_min_y && tile_y <= tile_max_y
+                })
+                .map(|(s, (px, dp))| StripeWork {
+                    stripe_y: s as i32,
+                    pixels: px,
+                    depth: dp,
+                })
+                .collect();
 
-                    let mut out_color = [0.0f32; 4];
-                    let mut out_depth = 0.0f32;
-                    let in_varyings_ptr = if n == 0 {
-                        std::ptr::null()
-                    } else { interp_buf.as_ptr() };
-                    // SAFETY: same as VS above.
-                    unsafe {
-                        fs_main(
-                            in_varyings_ptr,
-                            uni_ptr,
-                            pc_ptr,
-                            cx, cy, interp_z, one_over_interp_inv_w,
-                            0,
-                            out_color.as_mut_ptr(),
-                            &mut out_depth,
-                        );
-                    }
-                    let idx = pixel_lin * 4;
-
-                    // R.5 — blend + write-mask.
-                    // When blending is enabled we need the
-                    // existing pixel value as `dst`; the
-                    // shader's `out_color` is `src`.  Convert
-                    // dst from u8 to f32 (the same way the
-                    // initial pixel write would have done in
-                    // reverse), run the blend equation, then
-                    // u8-quantise the result.  Disabled blend
-                    // (the default) skips the read and writes
-                    // src verbatim.
-                    //
-                    // The write mask is independent of blend
-                    // enable: it gates which of the four
-                    // bytes in `pixels[idx..idx+4]` actually
-                    // get touched.
-                    let bs = &draw.blend_state;
-                    let final_color = if bs.enable {
-                        let dst = [
-                            pixels[idx]     as f32 / 255.0,
-                            pixels[idx + 1] as f32 / 255.0,
-                            pixels[idx + 2] as f32 / 255.0,
-                            pixels[idx + 3] as f32 / 255.0,
-                        ];
-                        apply_blend(bs, out_color, dst)
-                    } else {
-                        out_color
-                    };
-                    let m = bs.write_mask;
-                    if m.r { pixels[idx]     = f32_to_u8(final_color[0]); }
-                    if m.g { pixels[idx + 1] = f32_to_u8(final_color[1]); }
-                    if m.b { pixels[idx + 2] = f32_to_u8(final_color[2]); }
-                    if m.a { pixels[idx + 3] = f32_to_u8(final_color[3]); }
-                }
-            }
-                }
-            }
+            // Parallel rasterise.  Each task writes only into
+            // its own pixel + depth slice — disjoint by
+            // construction, so no synchronisation is needed.
+            tasks.par_iter_mut().for_each(|task| {
+                rasterize_stripe(task, &setup, draw, fs_main);
+            });
         }
         Ok(())
+    }
+}
+
+/// Pineda edge function: signed 2-area of the triangle
+/// formed by points A, B, P.  Positive on one side of
+/// directed edge A→B, negative on the other, zero on the
+/// edge itself.
+#[inline]
+fn edge_fn(a: (f32, f32), b: (f32, f32), p: (f32, f32)) -> f32 {
+    (b.0 - a.0) * (p.1 - a.1) - (b.1 - a.1) * (p.0 - a.0)
+}
+
+/// Read-only per-triangle setup shared across all
+/// parallel stripe tasks (R.7).  All fields are Send +
+/// Sync.
+struct TriangleSetup<'s> {
+    a: (f32, f32),
+    b: (f32, f32),
+    c: (f32, f32),
+    /// Total signed 2-area of the triangle (sum of the
+    /// three Pineda edge functions at any point).
+    total_edge: f32,
+    /// NDC positions for perspective-correct varying
+    /// interpolation and gl_FragCoord.z computation.
+    ndc: [[f32; 3]; 3],
+    /// 1/w per vertex for the perspective denominator.
+    inv_w: [f32; 3],
+    /// Pre-divided varying lanes: varying_over_w[i][k] =
+    /// varying_per_vertex[i][k] / w[i].
+    varying_over_w: &'s [Vec<f32>; 3],
+    /// Number of f32 varying lanes per vertex.
+    n: usize,
+    /// Bytes per varying lane group (`n * 4`).
+    varying_bytes: usize,
+    /// Triangle bbox in screen pixels.
+    min_x: i32,
+    max_x: i32,
+    min_y: i32,
+    max_y: i32,
+    /// Tile-grid bbox X range (in tile units of
+    /// `TILE_SIZE` pixels).  Y range is handled by the
+    /// per-stripe task filter at the call site (each task
+    /// already knows its own `stripe_y`).
+    tile_min_x: i32,
+    tile_max_x: i32,
+    /// Image width in pixels (for row-major indexing).
+    width: u32,
+}
+
+/// One stripe's mutable working set for R.7's per-stripe
+/// parallelism.  A stripe is `TILE_SIZE` rows of pixels
+/// (and depth, when present) — a contiguous slice in
+/// row-major memory.  Different stripes are disjoint, so
+/// rayon can hand each task its own `&mut` borrow without
+/// synchronisation.
+struct StripeWork<'p, 'd> {
+    /// Stripe index (= tile row in tile-grid units).
+    stripe_y: i32,
+    /// `TILE_SIZE * width * 4` bytes (last stripe may be
+    /// shorter when height isn't a multiple of TILE_SIZE).
+    pixels: &'p mut [u8],
+    /// `TILE_SIZE * width` f32 elements, or `None` when
+    /// the caller didn't supply a depth buffer.
+    depth: Option<&'d mut [f32]>,
+}
+
+/// Per-stripe pixel loop.  Walks the tile columns that
+/// overlap the triangle within this stripe; for each tile,
+/// iterates the (tile ∩ triangle bbox) pixel rectangle and
+/// runs the existing edge-function inside test +
+/// perspective-correct varying interpolation + depth test
+/// + FS call + blend + write-mask path.
+///
+/// All writes go through `task.pixels` / `task.depth` in
+/// **stripe-local** coordinates (`py - stripe_y *
+/// TILE_SIZE`) so the slice indexing matches the chunk's
+/// length.
+fn rasterize_stripe(
+    task: &mut StripeWork<'_, '_>,
+    setup: &TriangleSetup<'_>,
+    draw: &DrawTriangle<'_>,
+    fs_main: atrium_spv_loader::FsMain,
+) {
+    let tile_y = task.stripe_y;
+    let stripe_pixel_y = tile_y * TILE_SIZE;
+
+    // Reconstruct uniform / push-constant raw pointers
+    // inside the task.  Storing them in `TriangleSetup`
+    // would require a `Send + Sync` wrapper around the raw
+    // `*const u8`; deriving them here from the (Sync)
+    // slices is simpler.
+    let uni_ptr = if draw.uniforms.is_empty() {
+        std::ptr::null()
+    } else { draw.uniforms.as_ptr() };
+    let pc_ptr = if draw.push_constants.is_empty() {
+        std::ptr::null()
+    } else { draw.push_constants.as_ptr() };
+
+    // Per-stripe scratch for the interpolated varying
+    // buffer (mutated per pixel; can't be shared across
+    // tasks).
+    let mut interp_buf: Vec<u8> = vec![0u8; setup.varying_bytes];
+
+    let (a, b, c) = (setup.a, setup.b, setup.c);
+    let bs = &draw.blend_state;
+    let m = bs.write_mask;
+
+    for tile_x in setup.tile_min_x..=setup.tile_max_x {
+        let t_min_x = (tile_x * TILE_SIZE).max(setup.min_x);
+        let t_max_x = ((tile_x + 1) * TILE_SIZE - 1).min(setup.max_x);
+        let t_min_y = (tile_y * TILE_SIZE).max(setup.min_y);
+        let t_max_y = ((tile_y + 1) * TILE_SIZE - 1).min(setup.max_y);
+        if t_min_x > t_max_x || t_min_y > t_max_y { continue; }
+
+        for py in t_min_y..=t_max_y {
+            for px in t_min_x..=t_max_x {
+                let cx = px as f32 + 0.5;
+                let cy = py as f32 + 0.5;
+                let we0 = edge_fn(b, c, (cx, cy));
+                let we1 = edge_fn(c, a, (cx, cy));
+                let we2 = edge_fn(a, b, (cx, cy));
+                let inside_pos = we0 >= 0.0 && we1 >= 0.0 && we2 >= 0.0;
+                let inside_neg = we0 <= 0.0 && we1 <= 0.0 && we2 <= 0.0;
+                if !(inside_pos || inside_neg) { continue; }
+                if setup.total_edge == 0.0 { continue; }
+
+                let b0 = we0 / setup.total_edge;
+                let b1 = we1 / setup.total_edge;
+                let b2 = we2 / setup.total_edge;
+
+                let interp_inv_w = b0 * setup.inv_w[0]
+                    + b1 * setup.inv_w[1]
+                    + b2 * setup.inv_w[2];
+                let one_over_interp_inv_w = if interp_inv_w == 0.0 {
+                    0.0
+                } else { 1.0 / interp_inv_w };
+                for k in 0..setup.n {
+                    let sow = b0 * setup.varying_over_w[0][k]
+                        + b1 * setup.varying_over_w[1][k]
+                        + b2 * setup.varying_over_w[2][k];
+                    let v = sow * one_over_interp_inv_w;
+                    interp_buf[k*4 .. k*4 + 4]
+                        .copy_from_slice(&v.to_le_bytes());
+                }
+                let interp_z = b0 * setup.ndc[0][2]
+                    + b1 * setup.ndc[1][2]
+                    + b2 * setup.ndc[2][2];
+
+                // Stripe-local indexing.
+                let py_local = (py - stripe_pixel_y) as usize;
+                let pixel_lin_local =
+                    py_local * (setup.width as usize) + (px as usize);
+
+                if let Some(db) = task.depth.as_mut() {
+                    if interp_z >= db[pixel_lin_local] { continue; }
+                    db[pixel_lin_local] = interp_z;
+                }
+
+                let mut out_color = [0.0f32; 4];
+                let mut out_depth = 0.0f32;
+                let in_varyings_ptr = if setup.n == 0 {
+                    std::ptr::null()
+                } else { interp_buf.as_ptr() };
+                // SAFETY: fs_main is a dlopened C-ABI
+                // function whose signature was checked at
+                // open time; all pointers are valid for the
+                // lifetime of this call.  Disjoint per-stripe
+                // pixel ownership means concurrent calls
+                // from different tasks don't race.
+                unsafe {
+                    fs_main(
+                        in_varyings_ptr, uni_ptr, pc_ptr,
+                        cx, cy, interp_z, one_over_interp_inv_w,
+                        0,
+                        out_color.as_mut_ptr(),
+                        &mut out_depth,
+                    );
+                }
+                let idx = pixel_lin_local * 4;
+
+                let final_color = if bs.enable {
+                    let dst = [
+                        task.pixels[idx]     as f32 / 255.0,
+                        task.pixels[idx + 1] as f32 / 255.0,
+                        task.pixels[idx + 2] as f32 / 255.0,
+                        task.pixels[idx + 3] as f32 / 255.0,
+                    ];
+                    apply_blend(bs, out_color, dst)
+                } else { out_color };
+                if m.r { task.pixels[idx]     = f32_to_u8(final_color[0]); }
+                if m.g { task.pixels[idx + 1] = f32_to_u8(final_color[1]); }
+                if m.b { task.pixels[idx + 2] = f32_to_u8(final_color[2]); }
+                if m.a { task.pixels[idx + 3] = f32_to_u8(final_color[3]); }
+            }
+        }
     }
 }
 

@@ -48,6 +48,13 @@ tiny-skia      = "0.11"
 # it directly here makes the dep explicit.
 sha2           = "0.10"
 
+# Tier-2 rasterizer phase R.7: per-stripe parallel rasterisation
+# in fill_image_triangle.  Rayon's global thread pool avoids
+# per-draw thread-spawn overhead (a draw can cover hundreds of
+# stripes on a 1080p surface) and `par_iter_mut` on a `Vec` of
+# pre-split stripe slices Just Works in safe Rust.
+rayon          = "1"
+
 # Phase 2.9: shader_tool `verify-bundle` parses bundle manifest.json
 # files. serde_json is the standard light JSON parser; adds <100 KB
 # to the binary.
