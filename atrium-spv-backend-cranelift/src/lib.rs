@@ -366,6 +366,7 @@ fn emit_function(
             pointers: HashMap::new(),
             block_map,
             image_handles: HashMap::new(),
+            matrices: HashMap::new(),
         };
 
         // Walk every IR block in id order, switching the
@@ -641,6 +642,11 @@ struct FnTranslator {
     /// + `Op::ImageFetch` to compute the descriptor-table
     /// offset.
     image_handles: HashMap<ValueId, (u32, u32)>,
+    /// IR Value (`Mat4`-typed) → its four column vec4s,
+    /// each stored as 4 lane `ClifValue`s. Populated by
+    /// `Op::Load` of a Mat4; consumed by
+    /// `Op::MatrixTimesVector`.
+    matrices: HashMap<ValueId, Vec<Vec<ClifValue>>>,
 }
 
 impl FnTranslator {
@@ -774,6 +780,29 @@ impl FnTranslator {
                             lanes.push(v);
                         }
                         self.vectors.insert(result.id, lanes);
+                    }
+                    Type::Mat4(_) => {
+                        // Materialise the matrix as 4 column
+                        // vec4s stored in the matrices side
+                        // table. 16-byte column stride per
+                        // SPIR-V's canonical std140-ish
+                        // layout (also matches the v1
+                        // host-side packing convention).
+                        let mut columns = Vec::with_capacity(4);
+                        for c in 0..4usize {
+                            let col_base = off.saturating_add((c * 16) as i32);
+                            let mut lanes = Vec::with_capacity(4);
+                            for i in 0..4usize {
+                                let lane_off = col_base
+                                    .saturating_add((i * 4) as i32);
+                                let v = builder.ins().load(
+                                    clif_types::F32, MemFlags::new(),
+                                    param, lane_off);
+                                lanes.push(v);
+                            }
+                            columns.push(lanes);
+                        }
+                        self.matrices.insert(result.id, columns);
                     }
                     other => return Err(BackendError::Unsupported(format!(
                         "Op::Load of pointee type {other:?} not supported",
@@ -1234,6 +1263,47 @@ impl FnTranslator {
             //     const TexDesc*,
             //     int32_t x, int32_t y, int32_t lod,
             //     float *out_rgba);
+            // OpMatrixTimesVector — column-major: each
+            // result lane `i = Σ matrix[j][i] * vector[j]`.
+            // Lowered to 4 vec×scalar broadcasts + 3 vec
+            // adds, all using existing FMul/FAdd Cranelift
+            // ops. The matrix value lives in `matrices`
+            // (4 column vec4s); the vector in `vectors`
+            // (4 f32 lanes).
+            Op::MatrixTimesVector { matrix, vector } => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "MatrixTimesVector without result".to_string()))?;
+                let columns = self.matrices.get(&matrix.id).cloned()
+                    .ok_or_else(|| BackendError::Internal(format!(
+                        "MatrixTimesVector matrix {:?} not in matrices",
+                        matrix.id)))?;
+                let vec_lanes = self.vectors.get(&vector.id).cloned()
+                    .ok_or_else(|| BackendError::Internal(format!(
+                        "MatrixTimesVector vector {:?} not in vectors",
+                        vector.id)))?;
+                if columns.len() != vec_lanes.len() {
+                    return Err(BackendError::Unsupported(format!(
+                        "MatrixTimesVector: {} columns × {}-lane vector",
+                        columns.len(), vec_lanes.len())));
+                }
+                let n_lanes = columns[0].len();
+                let mut out_lanes: Vec<ClifValue> = (0..n_lanes)
+                    .map(|i| {
+                        let m = columns[0][i];
+                        builder.ins().fmul(m, vec_lanes[0])
+                    })
+                    .collect();
+                for j in 1..columns.len() {
+                    let vj = vec_lanes[j];
+                    for i in 0..n_lanes {
+                        let prod = builder.ins().fmul(columns[j][i], vj);
+                        out_lanes[i] = builder.ins().fadd(out_lanes[i], prod);
+                    }
+                }
+                self.vectors.insert(result.id, out_lanes);
+                Ok(())
+            }
             Op::ImageFetch { image, coord, lod } => {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal(
