@@ -230,6 +230,315 @@ impl<'a> FrameDecoder<'a> {
     }
 }
 
+// --------------------------------------------------------------
+// Typed body layouts (D.1).
+//
+// Each frame-op body is a packed little-endian C-style struct.
+// Layouts mirror the Vulkan command shape so the ICD can encode
+// in one memcpy. Bodies grow only at the end; new fields land
+// behind a protocol-version bump negotiated in OP_GPU_HANDSHAKE.
+// --------------------------------------------------------------
+
+/// Body of [`FrameOp::Draw`] — mirrors `vkCmdDraw`. 16 bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrawCmd {
+    /// Number of vertices to draw.
+    pub vertex_count: u32,
+    /// Number of instances to draw (1 for non-instanced).
+    pub instance_count: u32,
+    /// Index of the first vertex within the bound vertex buffer.
+    pub first_vertex: u32,
+    /// Instance ID of the first instance.
+    pub first_instance: u32,
+}
+
+impl DrawCmd {
+    /// Serialised body length in bytes.
+    pub const SIZE: usize = 16;
+
+    /// Encode into a fixed-size little-endian byte array.
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut b = [0u8; Self::SIZE];
+        b[0..4].copy_from_slice(&self.vertex_count.to_le_bytes());
+        b[4..8].copy_from_slice(&self.instance_count.to_le_bytes());
+        b[8..12].copy_from_slice(&self.first_vertex.to_le_bytes());
+        b[12..16].copy_from_slice(&self.first_instance.to_le_bytes());
+        b
+    }
+
+    /// Decode from a body slice. Errors on length mismatch.
+    pub fn from_bytes(body: &[u8]) -> Result<Self, FrameBodyError> {
+        if body.len() != Self::SIZE {
+            return Err(FrameBodyError::WrongLength {
+                op: "Draw", expected: Self::SIZE, got: body.len(),
+            });
+        }
+        Ok(Self {
+            vertex_count:   u32::from_le_bytes(body[0..4].try_into().unwrap()),
+            instance_count: u32::from_le_bytes(body[4..8].try_into().unwrap()),
+            first_vertex:   u32::from_le_bytes(body[8..12].try_into().unwrap()),
+            first_instance: u32::from_le_bytes(body[12..16].try_into().unwrap()),
+        })
+    }
+}
+
+/// Body of [`FrameOp::DrawIndexed`] — mirrors `vkCmdDrawIndexed`.
+/// 20 bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrawIndexedCmd {
+    /// Number of indices to consume from the bound index buffer.
+    pub index_count: u32,
+    /// Number of instances to draw.
+    pub instance_count: u32,
+    /// Offset (in indices) into the bound index buffer.
+    pub first_index: u32,
+    /// Signed value added to each index before vertex fetch.
+    pub vertex_offset: i32,
+    /// Instance ID of the first instance.
+    pub first_instance: u32,
+}
+
+impl DrawIndexedCmd {
+    /// Serialised body length in bytes.
+    pub const SIZE: usize = 20;
+
+    /// Encode into a fixed-size little-endian byte array.
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut b = [0u8; Self::SIZE];
+        b[0..4].copy_from_slice(&self.index_count.to_le_bytes());
+        b[4..8].copy_from_slice(&self.instance_count.to_le_bytes());
+        b[8..12].copy_from_slice(&self.first_index.to_le_bytes());
+        b[12..16].copy_from_slice(&self.vertex_offset.to_le_bytes());
+        b[16..20].copy_from_slice(&self.first_instance.to_le_bytes());
+        b
+    }
+
+    /// Decode from a body slice. Errors on length mismatch.
+    pub fn from_bytes(body: &[u8]) -> Result<Self, FrameBodyError> {
+        if body.len() != Self::SIZE {
+            return Err(FrameBodyError::WrongLength {
+                op: "DrawIndexed", expected: Self::SIZE, got: body.len(),
+            });
+        }
+        Ok(Self {
+            index_count:    u32::from_le_bytes(body[0..4].try_into().unwrap()),
+            instance_count: u32::from_le_bytes(body[4..8].try_into().unwrap()),
+            first_index:    u32::from_le_bytes(body[8..12].try_into().unwrap()),
+            vertex_offset:  i32::from_le_bytes(body[12..16].try_into().unwrap()),
+            first_instance: u32::from_le_bytes(body[16..20].try_into().unwrap()),
+        })
+    }
+}
+
+/// Body of [`FrameOp::BindVertexBuf`] — mirrors
+/// `vkCmdBindVertexBuffers` for a single binding slot. 16 bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BindVertexBufCmd {
+    /// Vertex input binding slot to update.
+    pub binding: u32,
+    /// Resource ID of the vertex buffer.
+    pub buffer_id: u32,
+    /// Byte offset into the buffer for the start of vertex data.
+    pub offset: u64,
+}
+
+impl BindVertexBufCmd {
+    /// Serialised body length in bytes.
+    pub const SIZE: usize = 16;
+
+    /// Encode into a fixed-size little-endian byte array.
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut b = [0u8; Self::SIZE];
+        b[0..4].copy_from_slice(&self.binding.to_le_bytes());
+        b[4..8].copy_from_slice(&self.buffer_id.to_le_bytes());
+        b[8..16].copy_from_slice(&self.offset.to_le_bytes());
+        b
+    }
+
+    /// Decode from a body slice. Errors on length mismatch.
+    pub fn from_bytes(body: &[u8]) -> Result<Self, FrameBodyError> {
+        if body.len() != Self::SIZE {
+            return Err(FrameBodyError::WrongLength {
+                op: "BindVertexBuf", expected: Self::SIZE, got: body.len(),
+            });
+        }
+        Ok(Self {
+            binding:   u32::from_le_bytes(body[0..4].try_into().unwrap()),
+            buffer_id: u32::from_le_bytes(body[4..8].try_into().unwrap()),
+            offset:    u64::from_le_bytes(body[8..16].try_into().unwrap()),
+        })
+    }
+}
+
+/// Index element width for [`BindIndexBufCmd::index_type`].
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexType {
+    /// 16-bit unsigned indices (`VK_INDEX_TYPE_UINT16`).
+    Uint16 = 0,
+    /// 32-bit unsigned indices (`VK_INDEX_TYPE_UINT32`).
+    Uint32 = 1,
+}
+
+impl IndexType {
+    /// Decode the wire tag.
+    pub fn from_u32(v: u32) -> Option<Self> {
+        match v {
+            0 => Some(IndexType::Uint16),
+            1 => Some(IndexType::Uint32),
+            _ => None,
+        }
+    }
+}
+
+/// Body of [`FrameOp::BindIndexBuf`] — mirrors `vkCmdBindIndexBuffer`.
+/// 16 bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BindIndexBufCmd {
+    /// Resource ID of the index buffer.
+    pub buffer_id: u32,
+    /// Index element type.
+    pub index_type: IndexType,
+    /// Byte offset into the buffer for the start of index data.
+    pub offset: u64,
+}
+
+impl BindIndexBufCmd {
+    /// Serialised body length in bytes.
+    pub const SIZE: usize = 16;
+
+    /// Encode into a fixed-size little-endian byte array.
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut b = [0u8; Self::SIZE];
+        b[0..4].copy_from_slice(&self.buffer_id.to_le_bytes());
+        b[4..8].copy_from_slice(&(self.index_type as u32).to_le_bytes());
+        b[8..16].copy_from_slice(&self.offset.to_le_bytes());
+        b
+    }
+
+    /// Decode from a body slice.
+    pub fn from_bytes(body: &[u8]) -> Result<Self, FrameBodyError> {
+        if body.len() != Self::SIZE {
+            return Err(FrameBodyError::WrongLength {
+                op: "BindIndexBuf", expected: Self::SIZE, got: body.len(),
+            });
+        }
+        let buffer_id = u32::from_le_bytes(body[0..4].try_into().unwrap());
+        let it_raw    = u32::from_le_bytes(body[4..8].try_into().unwrap());
+        let offset    = u64::from_le_bytes(body[8..16].try_into().unwrap());
+        let index_type = IndexType::from_u32(it_raw)
+            .ok_or(FrameBodyError::BadIndexType(it_raw))?;
+        Ok(Self { buffer_id, index_type, offset })
+    }
+}
+
+/// Body of [`FrameOp::SetViewport`] — mirrors a single
+/// `VkViewport` entry. 24 bytes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SetViewportCmd {
+    /// Viewport upper-left x in framebuffer pixels.
+    pub x: f32,
+    /// Viewport upper-left y in framebuffer pixels.
+    pub y: f32,
+    /// Viewport width in pixels.
+    pub width: f32,
+    /// Viewport height in pixels.
+    pub height: f32,
+    /// Minimum depth value (typically 0.0).
+    pub min_depth: f32,
+    /// Maximum depth value (typically 1.0).
+    pub max_depth: f32,
+}
+
+impl SetViewportCmd {
+    /// Serialised body length in bytes.
+    pub const SIZE: usize = 24;
+
+    /// Encode into a fixed-size little-endian byte array.
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut b = [0u8; Self::SIZE];
+        b[0..4].copy_from_slice(&self.x.to_le_bytes());
+        b[4..8].copy_from_slice(&self.y.to_le_bytes());
+        b[8..12].copy_from_slice(&self.width.to_le_bytes());
+        b[12..16].copy_from_slice(&self.height.to_le_bytes());
+        b[16..20].copy_from_slice(&self.min_depth.to_le_bytes());
+        b[20..24].copy_from_slice(&self.max_depth.to_le_bytes());
+        b
+    }
+
+    /// Decode from a body slice.
+    pub fn from_bytes(body: &[u8]) -> Result<Self, FrameBodyError> {
+        if body.len() != Self::SIZE {
+            return Err(FrameBodyError::WrongLength {
+                op: "SetViewport", expected: Self::SIZE, got: body.len(),
+            });
+        }
+        Ok(Self {
+            x:         f32::from_le_bytes(body[0..4].try_into().unwrap()),
+            y:         f32::from_le_bytes(body[4..8].try_into().unwrap()),
+            width:     f32::from_le_bytes(body[8..12].try_into().unwrap()),
+            height:    f32::from_le_bytes(body[12..16].try_into().unwrap()),
+            min_depth: f32::from_le_bytes(body[16..20].try_into().unwrap()),
+            max_depth: f32::from_le_bytes(body[20..24].try_into().unwrap()),
+        })
+    }
+}
+
+/// Errors raised by typed body decoders.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum FrameBodyError {
+    /// The body slice was not the size the decoder expects.
+    #[error("body for {op} has wrong length: expected {expected}, got {got}")]
+    WrongLength {
+        /// Op name (e.g. "Draw").
+        op: &'static str,
+        /// Required size in bytes.
+        expected: usize,
+        /// Actual size in bytes.
+        got: usize,
+    },
+    /// `BindIndexBufCmd::index_type` was not a recognised tag.
+    #[error("unknown index type {0}")]
+    BadIndexType(u32),
+}
+
+// Convenience push_* methods for FrameBuilder. Each just encodes
+// the body and forwards to push().
+impl FrameBuilder {
+    /// Encode and append a [`FrameOp::Draw`] record.
+    pub fn push_draw(&mut self, cmd: DrawCmd) -> Result<(), FrameDecodeError> {
+        self.push(FrameOp::Draw, &cmd.to_bytes())
+    }
+
+    /// Encode and append a [`FrameOp::DrawIndexed`] record.
+    pub fn push_draw_indexed(&mut self, cmd: DrawIndexedCmd)
+        -> Result<(), FrameDecodeError>
+    {
+        self.push(FrameOp::DrawIndexed, &cmd.to_bytes())
+    }
+
+    /// Encode and append a [`FrameOp::BindVertexBuf`] record.
+    pub fn push_bind_vertex_buf(&mut self, cmd: BindVertexBufCmd)
+        -> Result<(), FrameDecodeError>
+    {
+        self.push(FrameOp::BindVertexBuf, &cmd.to_bytes())
+    }
+
+    /// Encode and append a [`FrameOp::BindIndexBuf`] record.
+    pub fn push_bind_index_buf(&mut self, cmd: BindIndexBufCmd)
+        -> Result<(), FrameDecodeError>
+    {
+        self.push(FrameOp::BindIndexBuf, &cmd.to_bytes())
+    }
+
+    /// Encode and append a [`FrameOp::SetViewport`] record.
+    pub fn push_set_viewport(&mut self, cmd: SetViewportCmd)
+        -> Result<(), FrameDecodeError>
+    {
+        self.push(FrameOp::SetViewport, &cmd.to_bytes())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,6 +618,126 @@ mod tests {
         let mut d = FrameDecoder::new(&buf);
         let r = d.next();
         assert!(matches!(r, Err(FrameDecodeError::UnknownOp(0xFFFF, 0))));
+    }
+
+    #[test]
+    fn draw_cmd_roundtrip() {
+        let cmd = DrawCmd {
+            vertex_count: 3, instance_count: 1,
+            first_vertex: 0, first_instance: 0,
+        };
+        let bytes = cmd.to_bytes();
+        assert_eq!(bytes.len(), DrawCmd::SIZE);
+        assert_eq!(DrawCmd::from_bytes(&bytes).unwrap(), cmd);
+
+        let cmd2 = DrawCmd {
+            vertex_count: 0xDEAD_BEEF, instance_count: 7,
+            first_vertex: 42, first_instance: 0xCAFE,
+        };
+        assert_eq!(DrawCmd::from_bytes(&cmd2.to_bytes()).unwrap(), cmd2);
+    }
+
+    #[test]
+    fn draw_indexed_cmd_roundtrip() {
+        let cmd = DrawIndexedCmd {
+            index_count: 36, instance_count: 1,
+            first_index: 12, vertex_offset: -8, first_instance: 0,
+        };
+        let bytes = cmd.to_bytes();
+        assert_eq!(bytes.len(), DrawIndexedCmd::SIZE);
+        assert_eq!(DrawIndexedCmd::from_bytes(&bytes).unwrap(), cmd);
+    }
+
+    #[test]
+    fn bind_vertex_buf_cmd_roundtrip() {
+        let cmd = BindVertexBufCmd {
+            binding: 2, buffer_id: 0x1000_0042,
+            offset: 0x0000_0001_2345_6789,
+        };
+        let bytes = cmd.to_bytes();
+        assert_eq!(bytes.len(), BindVertexBufCmd::SIZE);
+        assert_eq!(BindVertexBufCmd::from_bytes(&bytes).unwrap(), cmd);
+    }
+
+    #[test]
+    fn bind_index_buf_cmd_roundtrip() {
+        for it in [IndexType::Uint16, IndexType::Uint32] {
+            let cmd = BindIndexBufCmd {
+                buffer_id: 0x2000_0007, index_type: it, offset: 4096,
+            };
+            let bytes = cmd.to_bytes();
+            assert_eq!(bytes.len(), BindIndexBufCmd::SIZE);
+            assert_eq!(BindIndexBufCmd::from_bytes(&bytes).unwrap(), cmd);
+        }
+    }
+
+    #[test]
+    fn bind_index_buf_cmd_bad_index_type() {
+        let mut bytes = BindIndexBufCmd {
+            buffer_id: 1, index_type: IndexType::Uint16, offset: 0,
+        }.to_bytes();
+        bytes[4..8].copy_from_slice(&99u32.to_le_bytes());
+        let r = BindIndexBufCmd::from_bytes(&bytes);
+        assert_eq!(r, Err(FrameBodyError::BadIndexType(99)));
+    }
+
+    #[test]
+    fn set_viewport_cmd_roundtrip() {
+        let cmd = SetViewportCmd {
+            x: 0.0, y: 0.0, width: 1920.0, height: 1080.0,
+            min_depth: 0.0, max_depth: 1.0,
+        };
+        let bytes = cmd.to_bytes();
+        assert_eq!(bytes.len(), SetViewportCmd::SIZE);
+        assert_eq!(SetViewportCmd::from_bytes(&bytes).unwrap(), cmd);
+    }
+
+    #[test]
+    fn body_decoder_rejects_wrong_length() {
+        assert!(matches!(
+            DrawCmd::from_bytes(&[0u8; 12]),
+            Err(FrameBodyError::WrongLength { op: "Draw", expected: 16, got: 12 }),
+        ));
+        assert!(matches!(
+            DrawIndexedCmd::from_bytes(&[0u8; 16]),
+            Err(FrameBodyError::WrongLength { op: "DrawIndexed", .. }),
+        ));
+    }
+
+    #[test]
+    fn builder_push_typed_helpers() {
+        let mut b = FrameBuilder::new(1024);
+        b.push_bind_vertex_buf(BindVertexBufCmd {
+            binding: 0, buffer_id: 7, offset: 0,
+        }).unwrap();
+        b.push_set_viewport(SetViewportCmd {
+            x: 0.0, y: 0.0, width: 800.0, height: 600.0,
+            min_depth: 0.0, max_depth: 1.0,
+        }).unwrap();
+        b.push_draw(DrawCmd {
+            vertex_count: 3, instance_count: 1,
+            first_vertex: 0, first_instance: 0,
+        }).unwrap();
+        let buf = b.into_buf();
+
+        let mut d = FrameDecoder::new(&buf);
+        let (op, body) = d.next().unwrap().unwrap();
+        assert_eq!(op, FrameOp::BindVertexBuf);
+        let bv = BindVertexBufCmd::from_bytes(body).unwrap();
+        assert_eq!(bv.binding, 0);
+        assert_eq!(bv.buffer_id, 7);
+
+        let (op, body) = d.next().unwrap().unwrap();
+        assert_eq!(op, FrameOp::SetViewport);
+        let vp = SetViewportCmd::from_bytes(body).unwrap();
+        assert_eq!(vp.width, 800.0);
+
+        let (op, body) = d.next().unwrap().unwrap();
+        assert_eq!(op, FrameOp::Draw);
+        let dr = DrawCmd::from_bytes(body).unwrap();
+        assert_eq!(dr.vertex_count, 3);
+
+        assert!(d.next().unwrap().is_none());
     }
 
     #[test]

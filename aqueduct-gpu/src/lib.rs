@@ -53,7 +53,12 @@ pub mod opcodes;
 pub mod payloads;
 
 pub use backends::{BackendId, GpuVendor};
-pub use frame::{FrameBuilder, FrameDecoder, FrameDecodeError};
+pub use frame::{
+    FrameBuilder, FrameDecoder, FrameDecodeError,
+    FrameBodyError,
+    DrawCmd, DrawIndexedCmd, BindVertexBufCmd, BindIndexBufCmd,
+    IndexType, SetViewportCmd,
+};
 pub use ids::{IdNamespace, ResourceId, BUNDLE_NAMESPACE_RANGE,
                BUILTIN_NAMESPACE, ICD_RUNTIME_NAMESPACE};
 pub use opcodes::{
