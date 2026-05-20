@@ -310,49 +310,29 @@ impl Tier2Registry {
             }
         }
 
-        // ── Step 2: perspective divide + cache 1/w per vertex.
-        // R.2's first deliverable.  After this, ndc[i] holds
-        // (x/w, y/w, z/w) and inv_w[i] holds 1/w_i.
+        // ── R.4 — clip-space clipping against the near +
+        // far planes BEFORE perspective divide.
         //
-        // Guard against w == 0 (degenerate / behind-camera);
-        // any such vertex collapses the triangle, which the
-        // edge-function inside test will catch as
-        // zero-area, so we treat 1/0 as 0 and continue.
-        let mut ndc: [[f32; 3]; 3] = [[0.0; 3]; 3];
-        let mut inv_w: [f32; 3] = [0.0; 3];
-        for i in 0..3 {
-            let w = clip_positions[i][3];
-            let iw = if w == 0.0 { 0.0 } else { 1.0 / w };
-            inv_w[i] = iw;
-            ndc[i][0] = clip_positions[i][0] * iw;
-            ndc[i][1] = clip_positions[i][1] * iw;
-            ndc[i][2] = clip_positions[i][2] * iw;
-        }
-
-        // ── Step 3: viewport mapping (NDC → screen).
-        // Vulkan convention: y NOT flipped, so screen y=0
-        // corresponds to NDC y=-1.
-        let fw = width as f32;
-        let fh = height as f32;
-        let mut screen: [(f32, f32); 3] = [(0.0, 0.0); 3];
-        for i in 0..3 {
-            screen[i] = (
-                (ndc[i][0] + 1.0) * 0.5 * fw,
-                (ndc[i][1] + 1.0) * 0.5 * fh,
-            );
-        }
-
-        // ── Step 4: pre-compute attr/w per vertex for every
-        // varying lane.  Done once per triangle so the inner
-        // pixel loop does only the barycentric weighting +
-        // final divide by interpolated (1/w).
+        // Side planes (left/right/top/bottom) are deferred to
+        // R.4 v2; the screen-space bbox clamp later already
+        // handles them visibly for "vertex slightly off-
+        // screen, w > 0" cases.  Near + far are the
+        // must-have planes because perspective divide
+        // produces garbage for w ≤ 0 (behind-camera) vertices,
+        // and depth-buffer values outside [0, 1] don't have
+        // sensible semantics.
+        //
+        // Algorithm: Sutherland-Hodgman.  Walk the polygon's
+        // edges; emit each inside-vertex; at every inside-
+        // outside transition, emit an interpolated vertex
+        // exactly on the plane.  Then triangulate by fanning
+        // from vertex 0 (works for convex polygons, which
+        // these always are).
         let n = draw.varying_f32_count;
-        let mut varying_over_w: [Vec<f32>; 3] = [
-            vec![0.0f32; n],
-            vec![0.0f32; n],
-            vec![0.0f32; n],
-        ];
-        for i in 0..3 {
+        // Build initial 3-vertex polygon from the VS output +
+        // caller-supplied varyings.
+        let mut polygon: Vec<ClipVertex> = (0..3).map(|i| {
+            let mut varyings = vec![0.0f32; n];
             for k in 0..n {
                 let off = k * 4;
                 let bytes = [
@@ -361,130 +341,224 @@ impl Tier2Registry {
                     draw.varyings_per_vertex[i][off + 2],
                     draw.varyings_per_vertex[i][off + 3],
                 ];
-                let f = f32::from_le_bytes(bytes);
-                varying_over_w[i][k] = f * inv_w[i];
+                varyings[k] = f32::from_le_bytes(bytes);
             }
-        }
+            ClipVertex { pos: clip_positions[i], varyings }
+        }).collect();
 
-        // ── Step 5: screen-space bbox, clamped to viewport.
-        let min_x = screen.iter().map(|p| p.0)
-            .fold(f32::INFINITY, f32::min).max(0.0).floor() as i32;
-        let max_x = screen.iter().map(|p| p.0)
-            .fold(f32::NEG_INFINITY, f32::max).min(fw - 1.0).ceil() as i32;
-        let min_y = screen.iter().map(|p| p.1)
-            .fold(f32::INFINITY, f32::min).max(0.0).floor() as i32;
-        let max_y = screen.iter().map(|p| p.1)
-            .fold(f32::NEG_INFINITY, f32::max).min(fh - 1.0).ceil() as i32;
-        if min_x > max_x || min_y > max_y {
-            return Ok(());     // triangle fully off-screen
-        }
+        // Near plane: cz >= 0 (Vulkan convention).
+        polygon = clip_polygon_plane(&polygon, |v| v.pos[2]);
+        if polygon.is_empty() { return Ok(()); }
+        // Far plane: cz <= cw  ⇔  cw - cz >= 0.
+        polygon = clip_polygon_plane(&polygon, |v| v.pos[3] - v.pos[2]);
+        if polygon.is_empty() { return Ok(()); }
+        // Polygon needs at least 3 vertices to triangulate.
+        if polygon.len() < 3 { return Ok(()); }
 
-        // ── Step 6: Pineda edge functions.  Pre-compute
-        // total triangle area for barycentric normalisation;
-        // the three edge values at any pixel sum to this
-        // constant.
-        let (a, b, c) = (screen[0], screen[1], screen[2]);
-        let edge = |ax: f32, ay: f32, bx: f32, by: f32, px: f32, py: f32| -> f32 {
-            (bx - ax) * (py - ay) - (by - ay) * (px - ax)
-        };
-        // Total signed 2-area of triangle (A, B, C).  Zero
-        // for degenerate triangles; bary normalisation skips
-        // the divide when total is 0.
-        let total_edge = edge(a.0, a.1, b.0, b.1, c.0, c.1);
-
-        // ── Step 7: pixel loop.
+        // ── Per-clipped-triangle rasterization.
+        // Triangulate by fanning from vertex 0: for an
+        // n-vertex polygon, emit (n-2) triangles
+        // (verts[0], verts[i], verts[i+1]) for i in 1..n-1.
+        let fw = width as f32;
+        let fh = height as f32;
         let mut interp_buf: Vec<u8> = vec![0u8; varying_bytes];
-        for py in min_y..=max_y {
-            for px in min_x..=max_x {
-                let cx = px as f32 + 0.5;
-                let cy = py as f32 + 0.5;
-                let we0 = edge(b.0, b.1, c.0, c.1, cx, cy);
-                let we1 = edge(c.0, c.1, a.0, a.1, cx, cy);
-                let we2 = edge(a.0, a.1, b.0, b.1, cx, cy);
-                let inside_pos = we0 >= 0.0 && we1 >= 0.0 && we2 >= 0.0;
-                let inside_neg = we0 <= 0.0 && we1 <= 0.0 && we2 <= 0.0;
-                if !(inside_pos || inside_neg) { continue; }
+        for i in 1..polygon.len() - 1 {
+            let tri_verts: [&ClipVertex; 3] = [
+                &polygon[0],
+                &polygon[i],
+                &polygon[i + 1],
+            ];
 
-                // Normalised barycentrics.  Skip on degenerate
-                // triangles; the edge-function inside test
-                // above only fires for zero-area triangles
-                // when a pixel centre happens to lie exactly
-                // on the collinear edge, which is mostly
-                // moot.
-                if total_edge == 0.0 { continue; }
-                let b0 = we0 / total_edge;
-                let b1 = we1 / total_edge;
-                let b2 = we2 / total_edge;
+            // Step 2: perspective divide.  Each vertex's clip
+            // space (cx, cy, cz, cw) -> NDC (x/w, y/w, z/w).
+            // R.4 has already filtered out cw <= 0 (a behind-
+            // camera vertex would have been on the outside of
+            // the near plane and clipped away), so iw is
+            // finite here.  We still guard against w == 0 in
+            // case the clip produced an edge-on vertex.
+            let mut ndc = [[0.0f32; 3]; 3];
+            let mut inv_w = [0.0f32; 3];
+            for j in 0..3 {
+                let w = tri_verts[j].pos[3];
+                let iw = if w == 0.0 { 0.0 } else { 1.0 / w };
+                inv_w[j] = iw;
+                ndc[j][0] = tri_verts[j].pos[0] * iw;
+                ndc[j][1] = tri_verts[j].pos[1] * iw;
+                ndc[j][2] = tri_verts[j].pos[2] * iw;
+            }
 
-                // Perspective-correct interpolation.
-                //   interp_inv_w = Σ b_i * (1/w_i)
-                //   interp(attr) = Σ b_i * (attr_i/w_i)  /  interp_inv_w
-                let interp_inv_w =
-                    b0 * inv_w[0] + b1 * inv_w[1] + b2 * inv_w[2];
-                // Divide once per pixel, not once per lane.
-                let one_over_interp_inv_w = if interp_inv_w == 0.0 {
-                    0.0
-                } else {
-                    1.0 / interp_inv_w
-                };
+            // Step 3: viewport mapping.
+            let screen: [(f32, f32); 3] = [
+                ((ndc[0][0] + 1.0) * 0.5 * fw, (ndc[0][1] + 1.0) * 0.5 * fh),
+                ((ndc[1][0] + 1.0) * 0.5 * fw, (ndc[1][1] + 1.0) * 0.5 * fh),
+                ((ndc[2][0] + 1.0) * 0.5 * fw, (ndc[2][1] + 1.0) * 0.5 * fh),
+            ];
+
+            // Step 4: attr/w per varying lane.
+            let mut varying_over_w: [Vec<f32>; 3] = [
+                vec![0.0f32; n], vec![0.0f32; n], vec![0.0f32; n],
+            ];
+            for j in 0..3 {
                 for k in 0..n {
-                    let sow = b0 * varying_over_w[0][k]
-                            + b1 * varying_over_w[1][k]
-                            + b2 * varying_over_w[2][k];
-                    let v = sow * one_over_interp_inv_w;
-                    interp_buf[k*4 .. k*4 + 4]
-                        .copy_from_slice(&v.to_le_bytes());
+                    varying_over_w[j][k] = tri_verts[j].varyings[k] * inv_w[j];
                 }
-                // Interpolated depth (NDC z).
-                let interp_z =
-                    b0 * ndc[0][2] + b1 * ndc[1][2] + b2 * ndc[2][2];
+            }
 
-                // R.3 — depth test + write.  Default
-                // comparison is LESS (incoming fragment passes
-                // iff its z is strictly less than the stored
-                // value, i.e. closer to the near plane in
-                // Vulkan NDC where z ∈ [0, 1] with 0 = near).
-                // On pass: write the new z and continue to
-                // shading; on fail: skip the FS call entirely
-                // (early-z elision -- the FS shouldn't run
-                // for occluded pixels in R.3's simple opaque
-                // pipeline).  R.5's blending arc revisits the
-                // "shade-then-test" vs "test-then-shade" order
-                // for shaders that write `discard` or
-                // depth-replace.
-                let pixel_lin = (py as usize) * (width as usize)
-                    + (px as usize);
-                if let Some(db) = depth_buffer.as_mut() {
-                    if interp_z >= db[pixel_lin] { continue; }
-                    db[pixel_lin] = interp_z;
-                }
+            // Step 5: bbox.
+            let min_x = screen.iter().map(|p| p.0)
+                .fold(f32::INFINITY, f32::min).max(0.0).floor() as i32;
+            let max_x = screen.iter().map(|p| p.0)
+                .fold(f32::NEG_INFINITY, f32::max).min(fw - 1.0).ceil() as i32;
+            let min_y = screen.iter().map(|p| p.1)
+                .fold(f32::INFINITY, f32::min).max(0.0).floor() as i32;
+            let max_y = screen.iter().map(|p| p.1)
+                .fold(f32::NEG_INFINITY, f32::max).min(fh - 1.0).ceil() as i32;
+            if min_x > max_x || min_y > max_y { continue; }
 
-                let mut out_color = [0.0f32; 4];
-                let mut out_depth = 0.0f32;
-                let in_varyings_ptr = if n == 0 {
-                    std::ptr::null()
-                } else { interp_buf.as_ptr() };
-                // SAFETY: same as VS above.
-                unsafe {
-                    fs_main(
-                        in_varyings_ptr,
-                        uni_ptr,
-                        pc_ptr,
-                        cx, cy, interp_z, one_over_interp_inv_w,
-                        0,
-                        out_color.as_mut_ptr(),
-                        &mut out_depth,
-                    );
+            // Step 6: edges.
+            let (a, b, c) = (screen[0], screen[1], screen[2]);
+            let edge = |ax: f32, ay: f32, bx: f32, by: f32, px: f32, py: f32| -> f32 {
+                (bx - ax) * (py - ay) - (by - ay) * (px - ax)
+            };
+            let total_edge = edge(a.0, a.1, b.0, b.1, c.0, c.1);
+
+            // Step 7: pixel loop.
+            for py in min_y..=max_y {
+                for px in min_x..=max_x {
+                    let cx = px as f32 + 0.5;
+                    let cy = py as f32 + 0.5;
+                    let we0 = edge(b.0, b.1, c.0, c.1, cx, cy);
+                    let we1 = edge(c.0, c.1, a.0, a.1, cx, cy);
+                    let we2 = edge(a.0, a.1, b.0, b.1, cx, cy);
+                    let inside_pos = we0 >= 0.0 && we1 >= 0.0 && we2 >= 0.0;
+                    let inside_neg = we0 <= 0.0 && we1 <= 0.0 && we2 <= 0.0;
+                    if !(inside_pos || inside_neg) { continue; }
+
+                    if total_edge == 0.0 { continue; }
+                    let b0 = we0 / total_edge;
+                    let b1 = we1 / total_edge;
+                    let b2 = we2 / total_edge;
+
+                    let interp_inv_w =
+                        b0 * inv_w[0] + b1 * inv_w[1] + b2 * inv_w[2];
+                    let one_over_interp_inv_w = if interp_inv_w == 0.0 {
+                        0.0
+                    } else { 1.0 / interp_inv_w };
+                    for k in 0..n {
+                        let sow = b0 * varying_over_w[0][k]
+                                + b1 * varying_over_w[1][k]
+                                + b2 * varying_over_w[2][k];
+                        let v = sow * one_over_interp_inv_w;
+                        interp_buf[k*4 .. k*4 + 4]
+                            .copy_from_slice(&v.to_le_bytes());
+                    }
+                    let interp_z =
+                        b0 * ndc[0][2] + b1 * ndc[1][2] + b2 * ndc[2][2];
+
+                    let pixel_lin = (py as usize) * (width as usize)
+                        + (px as usize);
+                    if let Some(db) = depth_buffer.as_mut() {
+                        if interp_z >= db[pixel_lin] { continue; }
+                        db[pixel_lin] = interp_z;
+                    }
+
+                    let mut out_color = [0.0f32; 4];
+                    let mut out_depth = 0.0f32;
+                    let in_varyings_ptr = if n == 0 {
+                        std::ptr::null()
+                    } else { interp_buf.as_ptr() };
+                    // SAFETY: same as VS above.
+                    unsafe {
+                        fs_main(
+                            in_varyings_ptr,
+                            uni_ptr,
+                            pc_ptr,
+                            cx, cy, interp_z, one_over_interp_inv_w,
+                            0,
+                            out_color.as_mut_ptr(),
+                            &mut out_depth,
+                        );
+                    }
+                    let idx = pixel_lin * 4;
+                    pixels[idx]     = f32_to_u8(out_color[0]);
+                    pixels[idx + 1] = f32_to_u8(out_color[1]);
+                    pixels[idx + 2] = f32_to_u8(out_color[2]);
+                    pixels[idx + 3] = f32_to_u8(out_color[3]);
                 }
-                let idx = pixel_lin * 4;
-                pixels[idx]     = f32_to_u8(out_color[0]);
-                pixels[idx + 1] = f32_to_u8(out_color[1]);
-                pixels[idx + 2] = f32_to_u8(out_color[2]);
-                pixels[idx + 3] = f32_to_u8(out_color[3]);
             }
         }
         Ok(())
     }
+}
+
+/// A clip-space vertex carried through Sutherland-Hodgman:
+/// 4D homogeneous position + the same `varying_f32_count`
+/// varying lanes that ride alongside through the clipper.
+#[derive(Debug, Clone)]
+struct ClipVertex {
+    pos: [f32; 4],
+    varyings: Vec<f32>,
+}
+
+/// Clip a convex polygon against a half-space defined by
+/// `signed_distance >= 0`.  Sutherland-Hodgman: walks the
+/// polygon edges; emits each inside vertex; at every
+/// inside→outside or outside→inside transition emits an
+/// interpolated vertex exactly on the plane.
+///
+/// `dist(v)` returns the signed perpendicular distance from
+/// `v` to the plane (positive ⇒ inside half-space).  For
+/// clip-space plane equations:
+///   near plane (Vulkan):  dist = v.z
+///   far  plane:           dist = v.w - v.z
+///   left:                 dist = v.w + v.x
+///   right:                dist = v.w - v.x
+///   bottom:               dist = v.w + v.y
+///   top:                  dist = v.w - v.y
+///
+/// The output polygon has 0..=2*input vertices.  Varyings
+/// (and the position itself) interpolate linearly along the
+/// cut edge — this is correct for clip-space coordinates
+/// (the perspective divide happens AFTER clipping).
+fn clip_polygon_plane<F>(
+    poly: &[ClipVertex],
+    dist: F,
+) -> Vec<ClipVertex>
+where F: Fn(&ClipVertex) -> f32 {
+    if poly.is_empty() { return Vec::new(); }
+    let mut out = Vec::with_capacity(poly.len() * 2);
+    for i in 0..poly.len() {
+        let curr = &poly[i];
+        let next = &poly[(i + 1) % poly.len()];
+        let d_curr = dist(curr);
+        let d_next = dist(next);
+        let curr_in = d_curr >= 0.0;
+        let next_in = d_next >= 0.0;
+        if curr_in {
+            out.push(curr.clone());
+        }
+        if curr_in != next_in {
+            // Edge crosses the plane.  Parameter t at which
+            // the cut happens: 0 at curr, 1 at next.
+            //   t = d_curr / (d_curr - d_next)
+            // Division by (d_curr - d_next) is safe: one of
+            // d_curr / d_next is strictly positive and the
+            // other is strictly negative (otherwise the
+            // curr_in != next_in test would have held false),
+            // so the denominator is non-zero.
+            let denom = d_curr - d_next;
+            let t = if denom == 0.0 { 0.0 } else { d_curr / denom };
+            let mut interp_pos = [0.0f32; 4];
+            for k in 0..4 {
+                interp_pos[k] = curr.pos[k] + t * (next.pos[k] - curr.pos[k]);
+            }
+            let interp_vary: Vec<f32> = (0..curr.varyings.len()).map(|k|
+                curr.varyings[k] + t * (next.varyings[k] - curr.varyings[k])
+            ).collect();
+            out.push(ClipVertex { pos: interp_pos, varyings: interp_vary });
+        }
+    }
+    out
 }
 
 /// Draw-call parameters for [`Tier2Registry::fill_image_triangle`].

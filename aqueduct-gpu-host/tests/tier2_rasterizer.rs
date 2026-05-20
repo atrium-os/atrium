@@ -630,6 +630,160 @@ fn rasterizer_r3_depth_test_accepts_nearer_triangle() {
          and A is nearer ({red_pixels} red, {blue_pixels} blue)");
 }
 
+/// R.4 acceptance: a triangle with one vertex strictly
+/// behind the near plane (cz < 0) is correctly clipped.
+/// Without clipping, the perspective divide would map a
+/// negative-z vertex to an arbitrary NDC z and the
+/// rasterizer would paint pixels with bogus depth values.
+/// With Sutherland-Hodgman in clip space, the offending
+/// vertex is replaced by an interpolated vertex on cz = 0
+/// and the visible portion renders cleanly.
+///
+/// Setup: vertices v0 and v1 in front of the near plane;
+/// v2 well behind (cz = -1.0).  We clip → quad → 2 sub-
+/// triangles.  Their union covers the *upper* part of the
+/// original triangle (the part with positive interpolated
+/// z), nothing else.
+///
+/// Hard assertions:
+///   * No pixel has negative interpolated z written to the
+///     depth buffer (depth buffer values are all in
+///     [0, 1] or equal to the clear value 1.0).
+///   * The clipped polygon paints a non-empty pixel set
+///     (it shouldn't be culled outright).
+#[test]
+fn rasterizer_r4_near_plane_clips_behind_camera_vertex() {
+    let cache_dir = TempDir::new().unwrap();
+    let config = LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    };
+    let registry = Tier2Registry::new(config);
+    let vs_id = registry.register(&build_vec4_position_vs()).unwrap();
+    let fs_id = registry.register(&build_passthrough_color_fs()).unwrap();
+
+    // v0, v1 in front (cz=0.5), v2 behind near (cz=-1.0).
+    // All have cw=1.0 so perspective divide is trivial.
+    let v0 = pack_vec4([-0.75, -0.75,  0.5, 1.0]);
+    let v1 = pack_vec4([ 0.75, -0.75,  0.5, 1.0]);
+    let v2 = pack_vec4([ 0.00,  0.75, -1.0, 1.0]);
+    let red = pack_vec4([1.0, 0.0, 0.0, 1.0]);
+
+    let mut pixels = vec![0u8; 16 * 16 * 4];
+    let mut depth  = vec![1.0f32; 16 * 16];
+    let draw = DrawTriangle {
+        vertex_attrs: [&v0, &v1, &v2],
+        varyings_per_vertex: [&red, &red, &red],
+        varying_f32_count: 4,
+        ..Default::default()
+    };
+    registry.fill_image_triangle(
+        vs_id, fs_id, &draw, 16, 16, &mut pixels, Some(&mut depth),
+    ).expect("clip + rasterise");
+
+    // No depth value below 0.0 — without clipping the
+    // interpolated z would have ranged from -1.0 (near v2)
+    // to 0.5 (near v0/v1), splashing negative depth values
+    // across the upper portion of the triangle.
+    let mut painted_pixels = 0usize;
+    for (i, &z) in depth.iter().enumerate() {
+        assert!(z >= 0.0,
+            "depth[{i}] = {z} -- clipping should have prevented \
+             any cz < 0 fragment from being painted");
+        if z < 1.0 - 1e-6 { painted_pixels += 1; }
+    }
+    assert!(painted_pixels > 0,
+        "clipped polygon painted zero pixels — the near-plane \
+         clip culled too much (or the clip is broken)");
+
+    // And confirm the polygon DID paint *something* on the
+    // colour side too (clipper shouldn't have emptied it).
+    let lit = pixels.chunks(4).any(|p| p != [0, 0, 0, 0]);
+    assert!(lit, "clipped polygon produced no coloured pixels");
+}
+
+/// R.4 acceptance: a triangle fully behind the near plane
+/// is rejected outright; no pixels painted, no depth values
+/// written.
+#[test]
+fn rasterizer_r4_fully_behind_near_is_culled() {
+    let cache_dir = TempDir::new().unwrap();
+    let config = LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    };
+    let registry = Tier2Registry::new(config);
+    let vs_id = registry.register(&build_vec4_position_vs()).unwrap();
+    let fs_id = registry.register(&build_passthrough_color_fs()).unwrap();
+
+    // All 3 vertices have cz < 0.
+    let v0 = pack_vec4([-0.5, -0.5, -0.5, 1.0]);
+    let v1 = pack_vec4([ 0.5, -0.5, -0.5, 1.0]);
+    let v2 = pack_vec4([ 0.0,  0.5, -0.5, 1.0]);
+    let green = pack_vec4([0.0, 1.0, 0.0, 1.0]);
+
+    let mut pixels = vec![0u8; 16 * 16 * 4];
+    let mut depth  = vec![1.0f32; 16 * 16];
+    let draw = DrawTriangle {
+        vertex_attrs: [&v0, &v1, &v2],
+        varyings_per_vertex: [&green, &green, &green],
+        varying_f32_count: 4,
+        ..Default::default()
+    };
+    registry.fill_image_triangle(
+        vs_id, fs_id, &draw, 16, 16, &mut pixels, Some(&mut depth),
+    ).expect("fully-clipped rasterise");
+
+    let lit = pixels.chunks(4).any(|p| p != [0, 0, 0, 0]);
+    assert!(!lit,
+        "triangle fully behind near plane painted pixels — \
+         near-plane reject must be a no-op");
+    let touched = depth.iter().any(|&z| z < 1.0 - 1e-6);
+    assert!(!touched,
+        "triangle fully behind near plane wrote to depth buffer");
+}
+
+/// R.4 acceptance: a triangle fully past the far plane
+/// is also culled.  Same shape as the previous test, but
+/// crossing the cz = cw boundary instead of cz = 0.
+#[test]
+fn rasterizer_r4_fully_beyond_far_is_culled() {
+    let cache_dir = TempDir::new().unwrap();
+    let config = LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    };
+    let registry = Tier2Registry::new(config);
+    let vs_id = registry.register(&build_vec4_position_vs()).unwrap();
+    let fs_id = registry.register(&build_passthrough_color_fs()).unwrap();
+
+    // cz > cw (= 1.0) for every vertex — beyond far plane.
+    let v0 = pack_vec4([-0.5, -0.5, 1.5, 1.0]);
+    let v1 = pack_vec4([ 0.5, -0.5, 1.5, 1.0]);
+    let v2 = pack_vec4([ 0.0,  0.5, 1.5, 1.0]);
+    let blue = pack_vec4([0.0, 0.0, 1.0, 1.0]);
+
+    let mut pixels = vec![0u8; 16 * 16 * 4];
+    let mut depth  = vec![1.0f32; 16 * 16];
+    let draw = DrawTriangle {
+        vertex_attrs: [&v0, &v1, &v2],
+        varyings_per_vertex: [&blue, &blue, &blue],
+        varying_f32_count: 4,
+        ..Default::default()
+    };
+    registry.fill_image_triangle(
+        vs_id, fs_id, &draw, 16, 16, &mut pixels, Some(&mut depth),
+    ).expect("far-clipped rasterise");
+
+    let lit = pixels.chunks(4).any(|p| p != [0, 0, 0, 0]);
+    assert!(!lit,
+        "triangle past far plane painted pixels — far-plane \
+         reject must be a no-op");
+}
+
 /// Variant of the passthrough VS that reads a vec4
 /// attribute (xyz + w) and writes gl_Position = that vec4
 /// directly.  Lets the test feed a custom w per vertex so
