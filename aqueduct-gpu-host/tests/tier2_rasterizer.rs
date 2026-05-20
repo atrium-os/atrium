@@ -187,6 +187,7 @@ fn rasterizer_r1_hello_triangle() {
         &draw,
         8, 8,
         &mut pixels,
+        None,
     ).expect("rasterise");
 
     // Helper: extract one RGBA pixel.
@@ -314,7 +315,7 @@ fn rasterizer_r2_varying_color_gradient() {
         ..Default::default()
     };
     registry.fill_image_triangle(
-        vs_id, fs_id, &draw, 16, 16, &mut pixels,
+        vs_id, fs_id, &draw, 16, 16, &mut pixels, None,
     ).expect("rasterise gradient");
 
     let px = |x: usize, y: usize| -> [u8; 4] {
@@ -411,7 +412,7 @@ fn rasterizer_r2_perspective_correct_varies_with_w() {
         ..Default::default()
     };
     registry.fill_image_triangle(
-        vs_id, fs_id, &draw, 16, 16, &mut pixels,
+        vs_id, fs_id, &draw, 16, 16, &mut pixels, None,
     ).expect("rasterise PC");
 
     let px = |x: usize, y: usize| -> [u8; 4] {
@@ -442,6 +443,191 @@ fn rasterizer_r2_perspective_correct_varies_with_w() {
     assert!(pmid[0] + pmid[1] > pmid[2] * 2,
         "perspective-correct: red+green at centroid should \
          far outweigh blue; got {pmid:?}");
+}
+
+/// R.3 acceptance: depth-test ordering.  Two overlapping
+/// triangles, the *closer* one drawn FIRST.  With the LESS
+/// depth test, the second (further) triangle must be
+/// rejected in the overlap region — without depth, it would
+/// trivially overwrite.  Distinguishes "depth test working"
+/// from "last draw wins".
+///
+/// Setup (16×16 image):
+///   triangle A:  z = 0.0 (near plane), red
+///                screen verts (2, 2), (14, 2), (8, 14)
+///   triangle B:  z = 0.5 (mid),         blue
+///                same screen footprint
+///
+/// Expected:
+///   * overlap region                 → RED (A passed, B rejected)
+///   * NO pixel is blue anywhere     (B's whole shape is covered
+///                                    by A in this test)
+///   * outside both triangles        → zero (cleared background)
+#[test]
+fn rasterizer_r3_depth_test_rejects_farther_triangle() {
+    let cache_dir = TempDir::new().unwrap();
+    let config = LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    };
+    let registry = Tier2Registry::new(config);
+
+    let vs_id = registry.register(&build_vec4_position_vs()).unwrap();
+    let fs_id = registry.register(&build_passthrough_color_fs()).unwrap();
+
+    // Triangle A — close, red.
+    let a0 = pack_vec4([-0.75, -0.75, 0.0, 1.0]);
+    let a1 = pack_vec4([ 0.75, -0.75, 0.0, 1.0]);
+    let a2 = pack_vec4([ 0.00,  0.75, 0.0, 1.0]);
+    let red = pack_vec4([1.0, 0.0, 0.0, 1.0]);
+
+    // Triangle B — far, blue.  Same shape, deeper z.
+    let b0 = pack_vec4([-0.75, -0.75, 0.5, 1.0]);
+    let b1 = pack_vec4([ 0.75, -0.75, 0.5, 1.0]);
+    let b2 = pack_vec4([ 0.00,  0.75, 0.5, 1.0]);
+    let blue = pack_vec4([0.0, 0.0, 1.0, 1.0]);
+
+    let mut pixels = vec![0u8; 16 * 16 * 4];
+    let mut depth  = vec![1.0f32; 16 * 16];   // clear to far
+
+    // Draw A first.
+    let draw_a = DrawTriangle {
+        vertex_attrs: [&a0, &a1, &a2],
+        varyings_per_vertex: [&red, &red, &red],
+        varying_f32_count: 4,
+        ..Default::default()
+    };
+    registry.fill_image_triangle(
+        vs_id, fs_id, &draw_a, 16, 16, &mut pixels, Some(&mut depth),
+    ).expect("draw A");
+
+    // Draw B second.  Its depth (0.5) is greater than A's
+    // (0.0) in the overlap, so LESS depth test fails and B
+    // is fully rejected.
+    let draw_b = DrawTriangle {
+        vertex_attrs: [&b0, &b1, &b2],
+        varyings_per_vertex: [&blue, &blue, &blue],
+        varying_f32_count: 4,
+        ..Default::default()
+    };
+    registry.fill_image_triangle(
+        vs_id, fs_id, &draw_b, 16, 16, &mut pixels, Some(&mut depth),
+    ).expect("draw B");
+
+    // Scan the whole image: no pixel should be blue.  Pixels
+    // inside the triangle footprint should all be red; pixels
+    // outside should be cleared.
+    let mut blue_pixels = 0usize;
+    let mut red_pixels  = 0usize;
+    let mut clear_pixels = 0usize;
+    for py in 0..16 {
+        for px in 0..16 {
+            let idx = (py * 16 + px) * 4;
+            let p = [pixels[idx], pixels[idx+1], pixels[idx+2], pixels[idx+3]];
+            if p[2] >= 200 && p[0] < 50 {
+                blue_pixels += 1;
+            } else if p[0] >= 200 && p[2] < 50 {
+                red_pixels += 1;
+            } else if p == [0, 0, 0, 0] {
+                clear_pixels += 1;
+            }
+        }
+    }
+    assert_eq!(blue_pixels, 0,
+        "depth test failed: {blue_pixels} blue pixels survived \
+         after the far triangle should have been rejected");
+    assert!(red_pixels > 20,
+        "depth test maybe over-eager: only {red_pixels} red pixels \
+         survived from triangle A (expected the triangle's interior)");
+    // Sanity: most of the 16x16 = 256 pixels are outside the
+    // triangle, so should be cleared.
+    assert!(clear_pixels > 150,
+        "too few cleared pixels: {clear_pixels} (expected the bulk \
+         of the 256 outside the triangle footprint)");
+
+    // Depth buffer should hold 0.0 at red pixels (A's depth)
+    // and 1.0 (the initial clear value) elsewhere.  Spot-check
+    // an interior pixel + a corner.
+    let depth_at = |x: usize, y: usize| depth[y * 16 + x];
+    assert!((depth_at(8, 6) - 0.0).abs() < 1e-6,
+        "depth at red interior: {} (expected 0.0)", depth_at(8, 6));
+    assert!((depth_at(0, 0) - 1.0).abs() < 1e-6,
+        "depth at cleared corner: {} (expected 1.0)", depth_at(0, 0));
+}
+
+/// R.3 acceptance: reverse ordering — same two triangles
+/// but the FAR one drawn first, then the NEAR one.  Depth
+/// test should ACCEPT the near one (its z=0.0 < the stored
+/// z=0.5), so the final image is blue.  Confirms the
+/// comparison is LESS-not-GREATER (no flipped polarity bug).
+#[test]
+fn rasterizer_r3_depth_test_accepts_nearer_triangle() {
+    let cache_dir = TempDir::new().unwrap();
+    let config = LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    };
+    let registry = Tier2Registry::new(config);
+    let vs_id = registry.register(&build_vec4_position_vs()).unwrap();
+    let fs_id = registry.register(&build_passthrough_color_fs()).unwrap();
+
+    // Same A & B as the previous test, but B drawn first
+    // (it's the FAR one; its z=0.5 lands in the depth buffer
+    // where the triangle covers).  Then A (z=0.0) — LESS
+    // test: 0.0 < 0.5 → pass → A's red overwrites + writes
+    // depth 0.0.
+    let a0 = pack_vec4([-0.75, -0.75, 0.0, 1.0]);
+    let a1 = pack_vec4([ 0.75, -0.75, 0.0, 1.0]);
+    let a2 = pack_vec4([ 0.00,  0.75, 0.0, 1.0]);
+    let red = pack_vec4([1.0, 0.0, 0.0, 1.0]);
+    let b0 = pack_vec4([-0.75, -0.75, 0.5, 1.0]);
+    let b1 = pack_vec4([ 0.75, -0.75, 0.5, 1.0]);
+    let b2 = pack_vec4([ 0.00,  0.75, 0.5, 1.0]);
+    let blue = pack_vec4([0.0, 0.0, 1.0, 1.0]);
+
+    let mut pixels = vec![0u8; 16 * 16 * 4];
+    let mut depth  = vec![1.0f32; 16 * 16];
+
+    // Draw B (far) first.
+    let draw_b = DrawTriangle {
+        vertex_attrs: [&b0, &b1, &b2],
+        varyings_per_vertex: [&blue, &blue, &blue],
+        varying_f32_count: 4,
+        ..Default::default()
+    };
+    registry.fill_image_triangle(
+        vs_id, fs_id, &draw_b, 16, 16, &mut pixels, Some(&mut depth),
+    ).expect("draw B first");
+
+    // Draw A (near) second.  Should overwrite.
+    let draw_a = DrawTriangle {
+        vertex_attrs: [&a0, &a1, &a2],
+        varyings_per_vertex: [&red, &red, &red],
+        varying_f32_count: 4,
+        ..Default::default()
+    };
+    registry.fill_image_triangle(
+        vs_id, fs_id, &draw_a, 16, 16, &mut pixels, Some(&mut depth),
+    ).expect("draw A second");
+
+    let mut blue_pixels = 0usize;
+    let mut red_pixels  = 0usize;
+    for py in 0..16 {
+        for px in 0..16 {
+            let idx = (py * 16 + px) * 4;
+            let p = [pixels[idx], pixels[idx+1], pixels[idx+2], pixels[idx+3]];
+            if p[2] >= 200 && p[0] < 50 { blue_pixels += 1; }
+            if p[0] >= 200 && p[2] < 50 { red_pixels  += 1; }
+        }
+    }
+    assert!(red_pixels > 20,
+        "near triangle should win the overlap: red_pixels={red_pixels}, \
+         blue_pixels={blue_pixels}");
+    assert_eq!(blue_pixels, 0,
+        "no blue should survive — A & B share screen footprint \
+         and A is nearer ({red_pixels} red, {blue_pixels} blue)");
 }
 
 /// Variant of the passthrough VS that reads a vec4
@@ -537,6 +723,7 @@ fn rasterizer_r1_degenerate_triangle_covers_only_line_pixels() {
         &draw,
         8, 8,
         &mut pixels,
+        None,
     ).expect("degenerate rasterise");
 
     // Pixel centres at y=4.5 are on a horizontal line in NDC y=0

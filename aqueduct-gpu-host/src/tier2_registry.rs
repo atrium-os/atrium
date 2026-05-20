@@ -236,6 +236,7 @@ impl Tier2Registry {
         width: u32,
         height: u32,
         pixels: &mut [u8],
+        mut depth_buffer: Option<&mut [f32]>,
     ) -> Result<(), Tier2ExecError> {
         let expected_len = (width as usize) * (height as usize) * 4;
         if pixels.len() != expected_len {
@@ -243,6 +244,18 @@ impl Tier2Registry {
                 expected: expected_len,
                 got: pixels.len(),
             });
+        }
+        // R.3 — depth buffer.  Caller-allocated parallel to
+        // `pixels`; length is exactly `width * height` f32s.
+        // None ⇒ no depth test or write (R.1 / R.2 behaviour).
+        let pixel_count = (width as usize) * (height as usize);
+        if let Some(db) = depth_buffer.as_deref() {
+            if db.len() != pixel_count {
+                return Err(Tier2ExecError::BadDepthBufferLen {
+                    expected: pixel_count,
+                    got: db.len(),
+                });
+            }
         }
         let varying_bytes = draw.varying_f32_count * 4;
         for i in 0..3 {
@@ -422,11 +435,29 @@ impl Tier2Registry {
                     interp_buf[k*4 .. k*4 + 4]
                         .copy_from_slice(&v.to_le_bytes());
                 }
-                // Interpolated depth (for FsMain's
-                // gl_FragCoord.z; R.3 hooks the depth test
-                // here).
+                // Interpolated depth (NDC z).
                 let interp_z =
                     b0 * ndc[0][2] + b1 * ndc[1][2] + b2 * ndc[2][2];
+
+                // R.3 — depth test + write.  Default
+                // comparison is LESS (incoming fragment passes
+                // iff its z is strictly less than the stored
+                // value, i.e. closer to the near plane in
+                // Vulkan NDC where z ∈ [0, 1] with 0 = near).
+                // On pass: write the new z and continue to
+                // shading; on fail: skip the FS call entirely
+                // (early-z elision -- the FS shouldn't run
+                // for occluded pixels in R.3's simple opaque
+                // pipeline).  R.5's blending arc revisits the
+                // "shade-then-test" vs "test-then-shade" order
+                // for shaders that write `discard` or
+                // depth-replace.
+                let pixel_lin = (py as usize) * (width as usize)
+                    + (px as usize);
+                if let Some(db) = depth_buffer.as_mut() {
+                    if interp_z >= db[pixel_lin] { continue; }
+                    db[pixel_lin] = interp_z;
+                }
 
                 let mut out_color = [0.0f32; 4];
                 let mut out_depth = 0.0f32;
@@ -445,8 +476,7 @@ impl Tier2Registry {
                         &mut out_depth,
                     );
                 }
-                let idx = ((py as usize) * (width as usize)
-                    + (px as usize)) * 4;
+                let idx = pixel_lin * 4;
                 pixels[idx]     = f32_to_u8(out_color[0]);
                 pixels[idx + 1] = f32_to_u8(out_color[1]);
                 pixels[idx + 2] = f32_to_u8(out_color[2]);
@@ -538,6 +568,15 @@ pub enum Tier2ExecError {
         /// Which of the 3 vertex buffers was wrong.
         vertex: usize,
         /// Required length (`varying_f32_count * 4`).
+        expected: usize,
+        /// Caller-supplied length.
+        got: usize,
+    },
+    /// The supplied depth buffer's length didn't match
+    /// `width * height` (one `f32` per pixel).
+    #[error("depth_buffer length {got} != expected {expected}")]
+    BadDepthBufferLen {
+        /// Required length (`width * height`).
         expected: usize,
         /// Caller-supplied length.
         got: usize,
