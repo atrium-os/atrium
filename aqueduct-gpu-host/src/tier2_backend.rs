@@ -27,6 +27,12 @@ use aqueduct_gpu::backends::{BackendId, GpuVendor};
 use crate::backend::Backend;
 use crate::tier2_registry::{Tier2ExecError, Tier2Registry, Tier2ShaderId};
 
+use aqueduct_gpu::frame::{
+    BindIndexBufCmd, BindVertexBufCmd, DrawCmd, DrawIndexedCmd,
+    FrameDecoder, IndexType, SetViewportCmd,
+};
+use aqueduct_gpu::opcodes::FrameOp;
+
 /// Backend that routes draws through Tier-2 compiled
 /// fragment shaders. Image storage lives in this backend
 /// (one RGBA8 buffer per registered image) so calls to
@@ -50,33 +56,61 @@ pub struct Tier2Backend {
     pipeline_shaders: Mutex<HashMap<u32, Tier2ShaderId>>,
     submissions: AtomicU64,
     presents:    AtomicU64,
+    /// Total Draw / DrawIndexed records the frame-walker has
+    /// dispatched against a Tier-2-bound pipeline. The D.3
+    /// dispatch path is a stub — D.4 turns each dispatch into
+    /// per-primitive `fill_image_triangle` calls — but the
+    /// counter is observable now so the wire walker has unit
+    /// tests of its own.
+    draws_executed: AtomicU64,
+    /// Draws / DrawIndexeds the walker decoded but skipped
+    /// because no Tier-2 pipeline was bound at that point
+    /// (e.g. a guest that submits geometry against a non-Tier-2
+    /// pipeline). Observable for diagnostics.
+    draws_skipped: AtomicU64,
 }
 
-/// Walk a renderpass's bytes looking for the most recent
-/// `FrameOp::BindPipeline` whose pipeline id has been
-/// Tier-2-bound. Returns the bound Tier2ShaderId, or
-/// `None` if no recognised pipeline was bound (in which
-/// case the pass is a no-op for Tier2Backend).
-fn find_bound_tier2_shader(
-    pass_bytes: &[u8],
-    pipeline_shaders: &HashMap<u32, Tier2ShaderId>,
-) -> Option<Tier2ShaderId> {
-    use aqueduct_gpu::frame::FrameDecoder;
-    use aqueduct_gpu::opcodes::FrameOp;
+/// Per-render-pass bound state assembled by the frame walker.
+///
+/// One instance per `BeginRenderPass ... EndRenderPass` span.
+/// Mutated as the walker visits each frame op; consumed by
+/// `Draw` / `DrawIndexed` dispatch.
+#[derive(Debug, Default)]
+struct PassState {
+    /// Currently-bound pipeline ResourceId.raw(), if any.
+    pipeline_raw: Option<u32>,
+    /// Tier-2 fragment shader bound to the current pipeline,
+    /// looked up via `pipeline_shaders` at BindPipeline time.
+    tier2_shader: Option<Tier2ShaderId>,
+    /// Vertex-buffer bindings keyed by slot number.
+    vertex_buffers: HashMap<u32, BoundVertexBuffer>,
+    /// Currently-bound index buffer.
+    index_buffer: Option<BoundIndexBuffer>,
+    /// Current viewport (may be unset for a malformed frame; the
+    /// walker tolerates it but a real draw would error in D.4+).
+    viewport: Option<SetViewportCmd>,
+    /// Latest push-constants block; tier-2 shaders consume it
+    /// as their uniform area.
+    push_constants: Vec<u8>,
+    /// Number of Draw / DrawIndexed records issued in this pass.
+    /// Used to gate the legacy "BindPipeline alone implies a
+    /// fullscreen FS fill" fallback at EndRenderPass.
+    draws_in_pass: u32,
+}
 
-    let mut decoder = FrameDecoder::new(pass_bytes);
-    let mut active: Option<Tier2ShaderId> = None;
-    while let Ok(Some((op, body))) = decoder.next() {
-        if let FrameOp::BindPipeline = op {
-            if body.len() >= 4 {
-                let raw = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
-                if let Some(sid) = pipeline_shaders.get(&raw) {
-                    active = Some(*sid);
-                }
-            }
-        }
-    }
-    active
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // fields consumed by D.4+ vertex layout path
+struct BoundVertexBuffer {
+    buffer_raw: u32,
+    offset: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // fields consumed by D.8 indexed-draw path
+struct BoundIndexBuffer {
+    buffer_raw: u32,
+    offset: u64,
+    index_type: IndexType,
 }
 
 /// Per-image RGBA8 storage owned by the backend.
@@ -108,7 +142,22 @@ impl Tier2Backend {
             pipeline_shaders: Mutex::new(HashMap::new()),
             submissions: AtomicU64::new(0),
             presents:    AtomicU64::new(0),
+            draws_executed: AtomicU64::new(0),
+            draws_skipped:  AtomicU64::new(0),
         }
+    }
+
+    /// Cumulative count of Draw / DrawIndexed records executed
+    /// against a Tier-2-bound pipeline by the frame walker.
+    pub fn draw_count(&self) -> u64 {
+        self.draws_executed.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative count of Draw / DrawIndexed records the
+    /// walker decoded but skipped because no Tier-2 pipeline
+    /// was bound.
+    pub fn draws_skipped(&self) -> u64 {
+        self.draws_skipped.load(Ordering::Relaxed)
     }
 
     /// Read back a buffer's bytes (clone). Returns `None` if
@@ -172,6 +221,166 @@ impl Tier2Backend {
     pub fn read_image_pixels(&self, image_id: ResourceId) -> Option<Vec<u8>> {
         let images = self.images.lock().unwrap();
         images.get(&(image_id.raw() as u64)).map(|img| img.pixels.clone())
+    }
+
+    /// Run the per-pass state machine over `pass_bytes`. Walks
+    /// every FrameOp record between BeginRenderPass and
+    /// EndRenderPass, maintains bound state, and dispatches
+    /// Draw / DrawIndexed against the bound Tier-2 shader.
+    ///
+    /// Legacy compat: if a Tier-2 pipeline is bound but no
+    /// Draw is issued in this pass, fall back to a fullscreen
+    /// FS fill at EndRenderPass (preserves the pre-D.3
+    /// "BindPipeline implies fullscreen" shape used by
+    /// existing integration tests; D.5+ migrates them to real
+    /// Draw records).
+    fn execute_pass(&self, target_id: ResourceId, pass_bytes: &[u8]) {
+        let pipeline_shaders = self.pipeline_shaders.lock().unwrap().clone();
+        let mut state = PassState::default();
+        let mut decoder = FrameDecoder::new(pass_bytes);
+
+        loop {
+            let rec = match decoder.next() {
+                Ok(Some(r)) => r,
+                Ok(None) => break,
+                Err(e) => {
+                    log::warn!("Tier2Backend::execute_pass: \
+                                decoder error on target {target_id}: {e}");
+                    break;
+                }
+            };
+            let (op, body) = rec;
+            match op {
+                FrameOp::BindPipeline => {
+                    if body.len() >= 4 {
+                        let raw = u32::from_le_bytes([
+                            body[0], body[1], body[2], body[3]
+                        ]);
+                        state.pipeline_raw  = Some(raw);
+                        state.tier2_shader  = pipeline_shaders.get(&raw).copied();
+                    } else {
+                        log::warn!("BindPipeline body too short ({} bytes)", body.len());
+                    }
+                }
+                FrameOp::BindVertexBuf => match BindVertexBufCmd::from_bytes(body) {
+                    Ok(cmd) => {
+                        state.vertex_buffers.insert(cmd.binding, BoundVertexBuffer {
+                            buffer_raw: cmd.buffer_id,
+                            offset: cmd.offset,
+                        });
+                    }
+                    Err(e) => log::warn!("malformed BindVertexBuf: {e}"),
+                },
+                FrameOp::BindIndexBuf => match BindIndexBufCmd::from_bytes(body) {
+                    Ok(cmd) => {
+                        state.index_buffer = Some(BoundIndexBuffer {
+                            buffer_raw: cmd.buffer_id,
+                            offset: cmd.offset,
+                            index_type: cmd.index_type,
+                        });
+                    }
+                    Err(e) => log::warn!("malformed BindIndexBuf: {e}"),
+                },
+                FrameOp::SetViewport => match SetViewportCmd::from_bytes(body) {
+                    Ok(cmd) => state.viewport = Some(cmd),
+                    Err(e) => log::warn!("malformed SetViewport: {e}"),
+                },
+                FrameOp::PushConstants => {
+                    state.push_constants.clear();
+                    state.push_constants.extend_from_slice(body);
+                }
+                FrameOp::Draw => match DrawCmd::from_bytes(body) {
+                    Ok(cmd) => {
+                        state.draws_in_pass = state.draws_in_pass.saturating_add(1);
+                        self.dispatch_draw(target_id, &state, cmd);
+                    }
+                    Err(e) => log::warn!("malformed Draw: {e}"),
+                },
+                FrameOp::DrawIndexed => match DrawIndexedCmd::from_bytes(body) {
+                    Ok(cmd) => {
+                        state.draws_in_pass = state.draws_in_pass.saturating_add(1);
+                        self.dispatch_draw_indexed(target_id, &state, cmd);
+                    }
+                    Err(e) => log::warn!("malformed DrawIndexed: {e}"),
+                },
+                FrameOp::EndRenderPass => break,
+                // Ops we don't yet act on: SetScissor, BindDescriptors,
+                // CopyBufToImg, CopyImgToBuf, Blit, PipelineBarrier,
+                // Dispatch{,Indirect}, DrawIndirect, BeginRenderPass
+                // (handled by the outer partition step). These will
+                // grow handlers in later phases as needed.
+                _ => {}
+            }
+        }
+
+        // Legacy fallback: pre-D.3 tests bind a Tier-2 pipeline
+        // and expect a fullscreen FS fill with no Draw. Preserve
+        // that until D.5+ migrates them to real Draw records.
+        if state.draws_in_pass == 0 {
+            if let Some(shader_id) = state.tier2_shader {
+                if let Err(e) = self.run_fragment_shader_into(
+                    target_id, shader_id, &state.push_constants, &[])
+                {
+                    log::warn!("Tier2Backend: legacy fullscreen FS fill \
+                                into {target_id} failed: {e}");
+                }
+            }
+        }
+    }
+
+    /// Dispatch a `Draw` against the current pass state. D.3
+    /// stub: validates Tier-2 binding + increments counters.
+    /// D.4 turns the assembled state + vertex-input layout into
+    /// per-primitive `fill_image_triangle` calls.
+    fn dispatch_draw(
+        &self,
+        target_id: ResourceId,
+        state: &PassState,
+        cmd: DrawCmd,
+    ) {
+        if state.tier2_shader.is_none() {
+            self.draws_skipped.fetch_add(1, Ordering::Relaxed);
+            log::debug!("Draw on target {target_id} skipped: no Tier-2 pipeline bound");
+            return;
+        }
+        if cmd.vertex_count == 0 {
+            log::debug!("Draw on target {target_id} skipped: vertex_count=0");
+            return;
+        }
+        self.draws_executed.fetch_add(1, Ordering::Relaxed);
+        log::debug!("Draw target={target_id} verts={} inst={} \
+                     first_vert={} bindings={} viewport={}",
+                    cmd.vertex_count, cmd.instance_count, cmd.first_vertex,
+                    state.vertex_buffers.len(),
+                    state.viewport.is_some());
+    }
+
+    /// Dispatch a `DrawIndexed` against the current pass state.
+    /// D.3 stub; same shape as `dispatch_draw`. D.8 wires the
+    /// index buffer slice.
+    fn dispatch_draw_indexed(
+        &self,
+        target_id: ResourceId,
+        state: &PassState,
+        cmd: DrawIndexedCmd,
+    ) {
+        if state.tier2_shader.is_none() {
+            self.draws_skipped.fetch_add(1, Ordering::Relaxed);
+            log::debug!("DrawIndexed on target {target_id} skipped: no Tier-2 pipeline bound");
+            return;
+        }
+        if cmd.index_count == 0 {
+            return;
+        }
+        if state.index_buffer.is_none() {
+            log::warn!("DrawIndexed on target {target_id}: no index buffer bound");
+            return;
+        }
+        self.draws_executed.fetch_add(1, Ordering::Relaxed);
+        log::debug!("DrawIndexed target={target_id} idx={} inst={} first_idx={} \
+                     vertex_offset={} bindings={}",
+                    cmd.index_count, cmd.instance_count, cmd.first_index,
+                    cmd.vertex_offset, state.vertex_buffers.len());
     }
 }
 
@@ -264,22 +473,8 @@ impl Backend for Tier2Backend {
         };
 
         for pass in &passes {
-            // For each pass, walk its body and find the
-            // bound pipeline (the most recent BindPipeline
-            // before any Draw / End). If we recognise it
-            // as one we've Tier-2-bound, fire the shader
-            // into the pass's target image.
             let pass_bytes = &frame_buf[pass.byte_range.clone()];
-            let active_shader = find_bound_tier2_shader(
-                pass_bytes, &self.pipeline_shaders.lock().unwrap());
-            let Some(shader_id) = active_shader else { continue };
-
-            if let Err(e) = self.run_fragment_shader_into(
-                pass.target_id, shader_id, &[], &[])
-            {
-                log::warn!("Tier2Backend: shader exec into {} failed: {e}",
-                           pass.target_id);
-            }
+            self.execute_pass(pass.target_id, pass_bytes);
         }
         true
     }

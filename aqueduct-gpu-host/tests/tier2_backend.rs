@@ -364,3 +364,136 @@ fn tier2_backend_buffer_oversize_rejected() {
     backend.buffer_created(buf_id, 1 << 30);
     assert!(backend.read_buffer_bytes(buf_id).is_none());
 }
+
+#[test]
+fn tier2_backend_draw_walker_increments_draw_count() {
+    use aqueduct_gpu::frame::{BindVertexBufCmd, DrawCmd, FrameBuilder, SetViewportCmd};
+    use aqueduct_gpu::opcodes::FrameOp;
+
+    let cache_dir = TempDir::new().unwrap();
+    let registry = Arc::new(Tier2Registry::new(LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    }));
+
+    let spirv = build_constant_color_spirv([0.2, 0.3, 0.4, 1.0]);
+    let shader_id = registry.register(&spirv).unwrap();
+    let backend = Tier2Backend::new(registry);
+
+    let image_id   = ResourceId::new(IdNamespace::IcdRuntime, 0xD001);
+    let pipeline_id = ResourceId::new(IdNamespace::IcdRuntime, 0xD002);
+    let vbuf_id    = ResourceId::new(IdNamespace::IcdRuntime, 0xD003);
+    backend.image_created(image_id, 8, 8);
+    backend.bind_pipeline(pipeline_id, shader_id);
+    backend.buffer_created(vbuf_id, 256);
+
+    let mut fb = FrameBuilder::new(4096);
+    let mut begin = [0u8; 12];
+    begin[..4].copy_from_slice(&image_id.raw().to_le_bytes());
+    begin[4..8].copy_from_slice(&8u32.to_le_bytes());
+    begin[8..12].copy_from_slice(&8u32.to_le_bytes());
+    fb.push(FrameOp::BeginRenderPass, &begin).unwrap();
+    fb.push(FrameOp::BindPipeline, &pipeline_id.raw().to_le_bytes()).unwrap();
+    fb.push_bind_vertex_buf(BindVertexBufCmd {
+        binding: 0, buffer_id: vbuf_id.raw(), offset: 0,
+    }).unwrap();
+    fb.push_set_viewport(SetViewportCmd {
+        x: 0.0, y: 0.0, width: 8.0, height: 8.0,
+        min_depth: 0.0, max_depth: 1.0,
+    }).unwrap();
+    fb.push_draw(DrawCmd {
+        vertex_count: 3, instance_count: 1,
+        first_vertex: 0, first_instance: 0,
+    }).unwrap();
+    fb.push_draw(DrawCmd {
+        vertex_count: 6, instance_count: 1,
+        first_vertex: 0, first_instance: 0,
+    }).unwrap();
+    fb.push(FrameOp::EndRenderPass, &[]).unwrap();
+
+    let fence = ResourceId::new(IdNamespace::IcdRuntime, 0xD004);
+    backend.submit_frame(fence, 1, fb.as_bytes());
+
+    assert_eq!(backend.draw_count(), 2);
+    assert_eq!(backend.draws_skipped(), 0);
+}
+
+#[test]
+fn tier2_backend_draw_without_pipeline_skipped() {
+    use aqueduct_gpu::frame::{DrawCmd, FrameBuilder};
+    use aqueduct_gpu::opcodes::FrameOp;
+
+    let cache_dir = TempDir::new().unwrap();
+    let registry = Arc::new(Tier2Registry::new(LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    }));
+    let backend = Tier2Backend::new(registry);
+
+    let image_id = ResourceId::new(IdNamespace::IcdRuntime, 0xD101);
+    backend.image_created(image_id, 4, 4);
+
+    let mut fb = FrameBuilder::new(1024);
+    let mut begin = [0u8; 12];
+    begin[..4].copy_from_slice(&image_id.raw().to_le_bytes());
+    begin[4..8].copy_from_slice(&4u32.to_le_bytes());
+    begin[8..12].copy_from_slice(&4u32.to_le_bytes());
+    fb.push(FrameOp::BeginRenderPass, &begin).unwrap();
+    fb.push_draw(DrawCmd {
+        vertex_count: 3, instance_count: 1,
+        first_vertex: 0, first_instance: 0,
+    }).unwrap();
+    fb.push(FrameOp::EndRenderPass, &[]).unwrap();
+
+    let fence = ResourceId::new(IdNamespace::IcdRuntime, 0xD102);
+    backend.submit_frame(fence, 1, fb.as_bytes());
+
+    assert_eq!(backend.draw_count(), 0);
+    assert_eq!(backend.draws_skipped(), 1);
+}
+
+#[test]
+fn tier2_backend_legacy_fullscreen_path_still_fires() {
+    // BindPipeline followed by EndRenderPass with NO Draw
+    // must still fire the legacy fullscreen FS fill (pre-D.3
+    // wire-format shape used by integration tests).
+    use aqueduct_gpu::frame::FrameBuilder;
+    use aqueduct_gpu::opcodes::FrameOp;
+
+    let cache_dir = TempDir::new().unwrap();
+    let registry = Arc::new(Tier2Registry::new(LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    }));
+    let expected = [0.7, 0.2, 0.5, 1.0];
+    let spirv = build_constant_color_spirv(expected);
+    let shader_id = registry.register(&spirv).unwrap();
+    let backend = Tier2Backend::new(registry);
+
+    let image_id    = ResourceId::new(IdNamespace::IcdRuntime, 0xD201);
+    let pipeline_id = ResourceId::new(IdNamespace::IcdRuntime, 0xD202);
+    backend.image_created(image_id, 2, 2);
+    backend.bind_pipeline(pipeline_id, shader_id);
+
+    let mut fb = FrameBuilder::new(1024);
+    let mut begin = [0u8; 12];
+    begin[..4].copy_from_slice(&image_id.raw().to_le_bytes());
+    begin[4..8].copy_from_slice(&2u32.to_le_bytes());
+    begin[8..12].copy_from_slice(&2u32.to_le_bytes());
+    fb.push(FrameOp::BeginRenderPass, &begin).unwrap();
+    fb.push(FrameOp::BindPipeline, &pipeline_id.raw().to_le_bytes()).unwrap();
+    fb.push(FrameOp::EndRenderPass, &[]).unwrap();
+
+    let fence = ResourceId::new(IdNamespace::IcdRuntime, 0xD203);
+    backend.submit_frame(fence, 1, fb.as_bytes());
+
+    let pixels = backend.read_image_pixels(image_id).unwrap();
+    let r = (expected[0] * 255.0 + 0.5) as u8;
+    let g = (expected[1] * 255.0 + 0.5) as u8;
+    let b = (expected[2] * 255.0 + 0.5) as u8;
+    assert_eq!(&pixels[..4], &[r, g, b, 255]);
+    assert_eq!(backend.draw_count(), 0);
+}
