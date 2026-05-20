@@ -169,7 +169,6 @@ struct BoundVertexBuffer {
 }
 
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)] // fields consumed by D.8 indexed-draw path
 struct BoundIndexBuffer {
     buffer_raw: u32,
     offset: u64,
@@ -416,7 +415,8 @@ impl Tier2Backend {
                 FrameOp::DrawIndexed => match DrawIndexedCmd::from_bytes(body) {
                     Ok(cmd) => {
                         state.draws_in_pass = state.draws_in_pass.saturating_add(1);
-                        self.dispatch_draw_indexed(target_id, &state, cmd);
+                        self.dispatch_draw_indexed(
+                            target_id, &state, cmd, &mut depth_buffer);
                     }
                     Err(e) => log::warn!("malformed DrawIndexed: {e}"),
                 },
@@ -585,6 +585,21 @@ impl Tier2Backend {
         first_vertex: u32,
         vertex_count: u32,
     ) -> Result<AssembledVertices, String> {
+        let indices: Vec<u32> = (0..vertex_count)
+            .map(|v| first_vertex + v).collect();
+        self.assemble_vertices_by_index(layout, vertex_buffers, &indices)
+    }
+
+    /// Same as `assemble_vertices` but gathers vertices by an
+    /// explicit per-output-slot vertex-index list. `Draw` uses
+    /// a contiguous range; `DrawIndexed` builds the list by
+    /// walking the bound index buffer + applying `vertex_offset`.
+    fn assemble_vertices_by_index(
+        &self,
+        layout: &VertexInputState,
+        vertex_buffers: &HashMap<u32, BoundVertexBuffer>,
+        indices: &[u32],
+    ) -> Result<AssembledVertices, String> {
         // Order attributes by shader location so the packed
         // record is shader-input-order (varying-friendly).
         let mut attrs: Vec<_> = layout.attributes.iter().collect();
@@ -598,13 +613,12 @@ impl Tier2Backend {
         }
         out_offsets.push(out_stride);
 
-        // Per-binding source data.
+        let vertex_count = indices.len() as u32;
         let buffers = self.buffers.lock().unwrap();
         let mut bytes = vec![0u8; (vertex_count as usize) * (out_stride as usize)];
 
-        for v in 0..vertex_count {
-            let global_v = first_vertex + v;
-            let out_base = (v as usize) * (out_stride as usize);
+        for (v, &global_v) in indices.iter().enumerate() {
+            let out_base = v * (out_stride as usize);
             for (ai, a) in attrs.iter().enumerate() {
                 let bind = layout.bindings.iter().find(|b| b.binding == a.binding)
                     .ok_or_else(|| format!(
@@ -638,6 +652,61 @@ impl Tier2Backend {
         })
     }
 
+    /// Read `count` indices from the bound index buffer at
+    /// (offset + first_index * index_size), apply
+    /// `vertex_offset` (signed add, saturating clamped), and
+    /// return the resolved per-output-slot vertex indices.
+    fn gather_indices(
+        &self,
+        bound: &BoundIndexBuffer,
+        first_index: u32,
+        count: u32,
+        vertex_offset: i32,
+    ) -> Result<Vec<u32>, String> {
+        let buffers = self.buffers.lock().unwrap();
+        let src = buffers.get(&bound.buffer_raw)
+            .ok_or_else(|| format!(
+                "index buffer {:#x} not in backend storage",
+                bound.buffer_raw))?;
+        let elem_size: usize = match bound.index_type {
+            IndexType::Uint16 => 2,
+            IndexType::Uint32 => 4,
+        };
+        let base = (bound.offset as usize)
+            + (first_index as usize) * elem_size;
+        let end = base + (count as usize) * elem_size;
+        if end > src.bytes.len() {
+            return Err(format!(
+                "index buffer read {base}..{end} exceeds buffer size {}",
+                src.bytes.len()));
+        }
+        let mut out = Vec::with_capacity(count as usize);
+        for i in 0..count as usize {
+            let off = base + i * elem_size;
+            let idx_raw: u32 = match bound.index_type {
+                IndexType::Uint16 => u16::from_le_bytes(
+                    src.bytes[off..off+2].try_into().unwrap()) as u32,
+                IndexType::Uint32 => u32::from_le_bytes(
+                    src.bytes[off..off+4].try_into().unwrap()),
+            };
+            // Signed add (saturating): vkCmdDrawIndexed treats
+            // the result as a u32 vertex index.
+            let signed = idx_raw as i64 + vertex_offset as i64;
+            if signed < 0 {
+                return Err(format!(
+                    "index {idx_raw} + vertex_offset {vertex_offset} \
+                     wraps below 0"));
+            }
+            if signed > u32::MAX as i64 {
+                return Err(format!(
+                    "index {idx_raw} + vertex_offset {vertex_offset} \
+                     exceeds u32::MAX"));
+            }
+            out.push(signed as u32);
+        }
+        Ok(out)
+    }
+
     /// Dispatch a `DrawIndexed` against the current pass state.
     /// D.3 stub; same shape as `dispatch_draw`. D.8 wires the
     /// index buffer slice.
@@ -646,24 +715,116 @@ impl Tier2Backend {
         target_id: ResourceId,
         state: &PassState,
         cmd: DrawIndexedCmd,
+        depth_buffer: &mut Option<Vec<f32>>,
     ) {
         if state.tier2_shader.is_none() {
             self.draws_skipped.fetch_add(1, Ordering::Relaxed);
             log::debug!("DrawIndexed on target {target_id} skipped: no Tier-2 pipeline bound");
             return;
         }
-        if cmd.index_count == 0 {
-            return;
-        }
-        if state.index_buffer.is_none() {
-            log::warn!("DrawIndexed on target {target_id}: no index buffer bound");
-            return;
-        }
+        if cmd.index_count == 0 { return; }
+        let bound_idx = match state.index_buffer {
+            Some(b) => b,
+            None => {
+                log::warn!("DrawIndexed on target {target_id}: no index buffer bound");
+                return;
+            }
+        };
+
+        let pipeline_raw = match state.pipeline_raw {
+            Some(p) => p,
+            None => return,
+        };
+        let layout = match self.pipeline_layouts.lock().unwrap()
+            .get(&pipeline_raw).cloned()
+        {
+            Some(l) => l,
+            None => {
+                log::warn!("DrawIndexed on target {target_id}: pipeline \
+                            {pipeline_raw:#x} has no vertex-input layout");
+                return;
+            }
+        };
+
+        // Read indices from the bound index buffer, applying
+        // vertex_offset.
+        let indices = match self.gather_indices(
+            &bound_idx, cmd.first_index, cmd.index_count, cmd.vertex_offset,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("DrawIndexed target={target_id}: index gather: {e}");
+                return;
+            }
+        };
+
+        let assembled = match self.assemble_vertices_by_index(
+            &layout, &state.vertex_buffers, &indices,
+        ) {
+            Ok(a) => a,
+            Err(e) => {
+                log::warn!("DrawIndexed target={target_id}: vertex assembly: {e}");
+                return;
+            }
+        };
+
+        *self.last_assembled_vertices.lock().unwrap() = Some(assembled.clone());
         self.draws_executed.fetch_add(1, Ordering::Relaxed);
-        log::debug!("DrawIndexed target={target_id} idx={} inst={} first_idx={} \
-                     vertex_offset={} bindings={}",
-                    cmd.index_count, cmd.instance_count, cmd.first_index,
-                    cmd.vertex_offset, state.vertex_buffers.len());
+
+        let Some(vs_shader_id) = state.tier2_vs_shader else { return };
+        let Some(fs_shader_id) = state.tier2_shader else { return };
+
+        if assembled.vertex_count % 3 != 0 {
+            log::warn!("DrawIndexed target={target_id}: index_count {} \
+                        is not a multiple of 3", assembled.vertex_count);
+            return;
+        }
+        let stride = assembled.stride as usize;
+        let tri_count = (assembled.vertex_count / 3) as usize;
+
+        let mut images = self.images.lock().unwrap();
+        let img = match images.get_mut(&(target_id.raw() as u64)) {
+            Some(i) => i,
+            None => {
+                log::warn!("DrawIndexed target={target_id}: target image not registered");
+                return;
+            }
+        };
+        let width = img.width;
+        let height = img.height;
+        let pixels = &mut img.pixels[..];
+
+        let raster = state.raster.unwrap_or_default();
+        let depth_enabled = raster.depth.map(|d| d.test_enable).unwrap_or(false);
+        if depth_enabled && depth_buffer.is_none() {
+            *depth_buffer = Some(vec![
+                f32::INFINITY;
+                (width as usize) * (height as usize)
+            ]);
+        }
+
+        for t in 0..tri_count {
+            let v0 = &assembled.bytes[(3*t)*stride   .. (3*t+1)*stride];
+            let v1 = &assembled.bytes[(3*t+1)*stride .. (3*t+2)*stride];
+            let v2 = &assembled.bytes[(3*t+2)*stride .. (3*t+3)*stride];
+            let dt = DrawTriangle {
+                vertex_attrs: [v0, v1, v2],
+                push_constants: &state.push_constants,
+                blend_state: raster.blend,
+                ..Default::default()
+            };
+            let db_ref = if depth_enabled {
+                depth_buffer.as_deref_mut()
+            } else { None };
+            if let Err(e) = self.registry.fill_image_triangle(
+                vs_shader_id, fs_shader_id,
+                &dt, width, height, pixels, db_ref,
+            ) {
+                log::warn!("DrawIndexed target={target_id}: triangle {t}/{tri_count} \
+                            fill_image_triangle failed: {e}");
+                return;
+            }
+        }
     }
 }
 

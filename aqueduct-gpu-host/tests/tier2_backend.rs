@@ -1117,3 +1117,193 @@ fn tier2_backend_d7_multi_primitive_quad_in_one_draw() {
         }
     }
 }
+
+#[test]
+fn tier2_backend_d8_draw_indexed_uint16_hello_triangle() {
+    use aqueduct_gpu::frame::{
+        BindIndexBufCmd, BindVertexBufCmd, DrawIndexedCmd, FrameBuilder,
+        IndexType, SetViewportCmd,
+    };
+    use aqueduct_gpu::opcodes::FrameOp;
+    use aqueduct_gpu::{
+        VertexAttributeDesc, VertexBindingDesc, VertexFormat, VertexInputState,
+    };
+
+    let cache_dir = TempDir::new().unwrap();
+    let registry = Arc::new(Tier2Registry::new(LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    }));
+
+    let vs_id = registry.register(&build_passthrough_vs_d5()).unwrap();
+    let fs_id = registry.register(&build_constant_color_spirv([1.0, 0.2, 0.2, 1.0])).unwrap();
+    let backend = Tier2Backend::new(registry);
+
+    let image_id    = ResourceId::new(IdNamespace::IcdRuntime, 0x13001);
+    let pipeline_id = ResourceId::new(IdNamespace::IcdRuntime, 0x13002);
+    let vbuf_id     = ResourceId::new(IdNamespace::IcdRuntime, 0x13003);
+    let ibuf_id     = ResourceId::new(IdNamespace::IcdRuntime, 0x13004);
+    backend.image_created(image_id, 8, 8);
+    backend.bind_pipeline_vs(pipeline_id, vs_id);
+    backend.bind_pipeline(pipeline_id, fs_id);
+    backend.bind_layout(pipeline_id, VertexInputState {
+        bindings: vec![VertexBindingDesc {
+            binding: 0, stride: 12, per_instance: false,
+        }],
+        attributes: vec![VertexAttributeDesc {
+            location: 0, binding: 0,
+            format: VertexFormat::R32g32b32Sfloat, offset: 0,
+        }],
+    });
+
+    // Same NDC vertices as the D.5 hello-triangle, but with
+    // an extra unused vertex at the front to prove indices
+    // are honoured (not just sequential).
+    let mut vsrc = Vec::<u8>::new();
+    for v in [
+        [9.0_f32, 9.0, 9.0],     // index 0: dummy, never referenced
+        [-0.5,   -0.5, 0.0],     // index 1
+        [ 0.5,   -0.5, 0.0],     // index 2
+        [ 0.0,    0.5, 0.0],     // index 3
+    ] {
+        for f in v { vsrc.extend_from_slice(&f.to_le_bytes()); }
+    }
+    backend.buffer_created(vbuf_id, vsrc.len() as u64);
+    backend.buffer_write_bytes(vbuf_id, 0, &vsrc).unwrap();
+
+    // uint16 index buffer: [1, 2, 3] -- skip the dummy.
+    let idx: [u16; 3] = [1, 2, 3];
+    let isrc: Vec<u8> = idx.iter().flat_map(|i| i.to_le_bytes()).collect();
+    backend.buffer_created(ibuf_id, isrc.len() as u64);
+    backend.buffer_write_bytes(ibuf_id, 0, &isrc).unwrap();
+
+    let mut fb = FrameBuilder::new(4096);
+    let mut begin = [0u8; 12];
+    begin[..4].copy_from_slice(&image_id.raw().to_le_bytes());
+    begin[4..8].copy_from_slice(&8u32.to_le_bytes());
+    begin[8..12].copy_from_slice(&8u32.to_le_bytes());
+    fb.push(FrameOp::BeginRenderPass, &begin).unwrap();
+    fb.push(FrameOp::BindPipeline, &pipeline_id.raw().to_le_bytes()).unwrap();
+    fb.push_set_viewport(SetViewportCmd {
+        x: 0.0, y: 0.0, width: 8.0, height: 8.0,
+        min_depth: 0.0, max_depth: 1.0,
+    }).unwrap();
+    fb.push_bind_vertex_buf(BindVertexBufCmd {
+        binding: 0, buffer_id: vbuf_id.raw(), offset: 0,
+    }).unwrap();
+    fb.push_bind_index_buf(BindIndexBufCmd {
+        buffer_id: ibuf_id.raw(), index_type: IndexType::Uint16, offset: 0,
+    }).unwrap();
+    fb.push_draw_indexed(DrawIndexedCmd {
+        index_count: 3, instance_count: 1, first_index: 0,
+        vertex_offset: 0, first_instance: 0,
+    }).unwrap();
+    fb.push(FrameOp::EndRenderPass, &[]).unwrap();
+
+    let fence = ResourceId::new(IdNamespace::IcdRuntime, 0x13005);
+    backend.submit_frame(fence, 1, fb.as_bytes());
+
+    let pixels = backend.read_image_pixels(image_id).unwrap();
+    let px = |x: usize, y: usize| -> [u8; 4] {
+        let i = (y * 8 + x) * 4;
+        [pixels[i], pixels[i+1], pixels[i+2], pixels[i+3]]
+    };
+    let red = [255u8, 51, 51, 255];
+    assert_eq!(px(2, 2), red);
+    assert_eq!(px(4, 2), red);
+    assert_eq!(px(3, 3), red);
+    assert_eq!(px(4, 4), red);
+    assert_eq!(px(0, 0), [0, 0, 0, 0]);
+    assert_eq!(px(7, 7), [0, 0, 0, 0]);
+}
+
+#[test]
+fn tier2_backend_d8_draw_indexed_uint32_with_vertex_offset() {
+    use aqueduct_gpu::frame::{
+        BindIndexBufCmd, BindVertexBufCmd, DrawIndexedCmd, FrameBuilder,
+        IndexType, SetViewportCmd,
+    };
+    use aqueduct_gpu::opcodes::FrameOp;
+    use aqueduct_gpu::{
+        VertexAttributeDesc, VertexBindingDesc, VertexFormat, VertexInputState,
+    };
+
+    let cache_dir = TempDir::new().unwrap();
+    let registry = Arc::new(Tier2Registry::new(LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    }));
+    let vs_id = registry.register(&build_passthrough_vs_d5()).unwrap();
+    let fs_id = registry.register(&build_constant_color_spirv([0.2, 0.2, 1.0, 1.0])).unwrap();
+    let backend = Tier2Backend::new(registry);
+
+    let image_id    = ResourceId::new(IdNamespace::IcdRuntime, 0x14001);
+    let pipeline_id = ResourceId::new(IdNamespace::IcdRuntime, 0x14002);
+    let vbuf_id     = ResourceId::new(IdNamespace::IcdRuntime, 0x14003);
+    let ibuf_id     = ResourceId::new(IdNamespace::IcdRuntime, 0x14004);
+    backend.image_created(image_id, 8, 8);
+    backend.bind_pipeline_vs(pipeline_id, vs_id);
+    backend.bind_pipeline(pipeline_id, fs_id);
+    backend.bind_layout(pipeline_id, VertexInputState {
+        bindings: vec![VertexBindingDesc {
+            binding: 0, stride: 12, per_instance: false,
+        }],
+        attributes: vec![VertexAttributeDesc {
+            location: 0, binding: 0,
+            format: VertexFormat::R32g32b32Sfloat, offset: 0,
+        }],
+    });
+
+    // Real triangle at vertex slots 5..7. Indices = [0, 1, 2]
+    // + vertex_offset = 5 -> slots 5, 6, 7.
+    let mut vsrc = Vec::<u8>::new();
+    // Slots 0..4: dummies.
+    for _ in 0..5 {
+        for f in [9.0_f32, 9.0, 9.0] {
+            vsrc.extend_from_slice(&f.to_le_bytes());
+        }
+    }
+    for v in [[-0.5_f32, -0.5, 0.0], [0.5, -0.5, 0.0], [0.0, 0.5, 0.0]] {
+        for f in v { vsrc.extend_from_slice(&f.to_le_bytes()); }
+    }
+    backend.buffer_created(vbuf_id, vsrc.len() as u64);
+    backend.buffer_write_bytes(vbuf_id, 0, &vsrc).unwrap();
+
+    let idx: [u32; 3] = [0, 1, 2];
+    let isrc: Vec<u8> = idx.iter().flat_map(|i| i.to_le_bytes()).collect();
+    backend.buffer_created(ibuf_id, isrc.len() as u64);
+    backend.buffer_write_bytes(ibuf_id, 0, &isrc).unwrap();
+
+    let mut fb = FrameBuilder::new(4096);
+    let mut begin = [0u8; 12];
+    begin[..4].copy_from_slice(&image_id.raw().to_le_bytes());
+    begin[4..8].copy_from_slice(&8u32.to_le_bytes());
+    begin[8..12].copy_from_slice(&8u32.to_le_bytes());
+    fb.push(FrameOp::BeginRenderPass, &begin).unwrap();
+    fb.push(FrameOp::BindPipeline, &pipeline_id.raw().to_le_bytes()).unwrap();
+    fb.push_set_viewport(SetViewportCmd {
+        x: 0.0, y: 0.0, width: 8.0, height: 8.0,
+        min_depth: 0.0, max_depth: 1.0,
+    }).unwrap();
+    fb.push_bind_vertex_buf(BindVertexBufCmd {
+        binding: 0, buffer_id: vbuf_id.raw(), offset: 0,
+    }).unwrap();
+    fb.push_bind_index_buf(BindIndexBufCmd {
+        buffer_id: ibuf_id.raw(), index_type: IndexType::Uint32, offset: 0,
+    }).unwrap();
+    fb.push_draw_indexed(DrawIndexedCmd {
+        index_count: 3, instance_count: 1, first_index: 0,
+        vertex_offset: 5, first_instance: 0,
+    }).unwrap();
+    fb.push(FrameOp::EndRenderPass, &[]).unwrap();
+
+    let fence = ResourceId::new(IdNamespace::IcdRuntime, 0x14005);
+    backend.submit_frame(fence, 1, fb.as_bytes());
+
+    let pixels = backend.read_image_pixels(image_id).unwrap();
+    let blue = [51u8, 51, 255, 255];
+    let i = (3 * 8 + 3) * 4;
+    assert_eq!(&pixels[i..i+4], &blue[..], "(3,3) = {:?}", &pixels[i..i+4]);
+}

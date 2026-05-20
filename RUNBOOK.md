@@ -4039,4 +4039,15 @@ through D.8 round out the Vulkan-shape draw semantics.  After
 D.8, tier-2 is genuinely a Vulkan executor for the subset of
 opcodes we've defined.
 
-**Status: scoped, D.1 next.**
+**Status: D.1-D.8 landed (commits b464167..D.8).**  The
+tier-2 software renderer is now a Vulkan-shape draw executor
+for the wire opcodes we've defined: typed bodies, buffer
+storage, frame-walker state machine, vertex-input layout +
+assembly, hello-triangle through the wire, depth + blend
+from pipeline state, multi-primitive Draws, and DrawIndexed
+(uint16 + uint32, with `vertex_offset`).  Aqueduct-gpu lib
+has 28 tests; the host's tier2_backend integration test
+file is 19.  Next steps belong to a different arc: tier-2 R
+deferred items (R.4 v2 side-plane clipping, R.6 v2 tile
+trivial reject, R.8 SIMD pixel quads), or atrium-vk-icd
+migration to consume this wire shape.
