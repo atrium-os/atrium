@@ -3963,6 +3963,80 @@ new `fill_image_triangle` API exists but is only exercised by
 unit tests.  Wire `FrameOp::Draw` opcodes through to per-
 primitive `fill_image_triangle` calls; plumb vertex / index
 buffers from the wire protocol; respect the bound pipeline's
-viewport + scissor + raster / depth / blend state.  That's the
-piece that turns the rasterizer from "tested in isolation" into
-"actually drives a Vulkan app through tier-2."
+viewport + scissor + raster / depth / blend state.
+
+#### Next big arc — scoped: tier-2 draw-walker integration
+
+Today `Tier2Backend::submit_frame` walks the frame stream
+looking only for `FrameOp::BindPipeline` and treats every
+matched pass as a "fullscreen FS fill" via
+`fill_image_fragment`.  Geometry opcodes (`BindVertexBuf`,
+`BindIndexBuf`, `Draw`, `DrawIndexed`, `SetViewport`) are
+ignored — their wire bodies aren't even *defined* yet (the
+`FrameBuilder::push(FrameOp::Draw, &[0xCC; 16])` tests in
+`aqueduct-gpu/src/frame.rs` only round-trip arbitrary bytes).
+
+Tier-1's `SoftwareBackend` is in the same boat: it returns
+`UnsupportedFrameOp` for everything beyond `BeginRenderPass /
+EndRenderPass / BindPipeline / PushConstants / SetScissor /
+Draw`.  Tier-1's `Draw` is a "clear-the-image-with-the-bound-
+colour" hack — no vertices, no rasterization.
+
+So this arc has TWO consumers (tier-1 and tier-2) and the
+wire-format work is **the contract** between guest, daemon,
+and renderers.  Scoping carefully so the format choices are
+forwards-compatible with the real Vulkan-shape we want
+long-term.
+
+**Phasing.**
+
+* **D.1 — Wire body layouts.**  Define typed structs for
+  `BindVertexBuf` (binding, buffer_id, offset), `BindIndexBuf`
+  (buffer_id, offset, index_type), `Draw` (vertex_count,
+  instance_count, first_vertex, first_instance) and
+  `DrawIndexed` (index_count, instance_count, first_index,
+  vertex_offset, first_instance), plus `SetViewport`
+  (x, y, width, height, min_depth, max_depth).  Each gets
+  `to_bytes`/`from_bytes` helpers in `aqueduct-gpu/src/frame.rs`
+  + round-trip tests.  No execution wiring; just the contract.
+* **D.2 — Buffer storage on `Tier2Backend`.**  Mirror the
+  existing `image_created` / `image_destroyed` pattern for
+  vertex / index buffers.  A `buffers: Mutex<HashMap<ResourceId,
+  Vec<u8>>>` field; hooks into the existing
+  `OP_GPU_BUFFER_CREATE` / `OP_GPU_BUFFER_WRITE` session
+  opcodes.
+* **D.3 — Frame-walker state machine.**  `submit_frame` walks
+  the decoded ops and maintains per-pass state: bound pipeline,
+  bound vertex buffer slots (with offsets), bound index buffer,
+  viewport, scissor.  On `Draw` / `DrawIndexed`, the assembled
+  state plus the bound `Tier2ShaderId`-pair fires
+  `fill_image_triangle` per primitive.
+* **D.4 — Vertex input layout from the pipeline.**  Each
+  `Tier2Pipeline` carries a `VertexInputState` describing the
+  per-binding stride + attribute (location, format, offset)
+  table.  D.3's frame-walker slices the bound vertex buffers
+  into per-vertex attribute bytes per the layout.
+* **D.5 — Hello-triangle through the wire.**  End-to-end test:
+  build a SPIR-V VS + FS pair, register via `Tier2Registry`,
+  create vertex buffer + pipeline via wire opcodes, drive a
+  3-vertex `Draw` through `submit_frame`, read back the pixel
+  buffer.  This is what proves the integration works for a
+  real guest path (atrium-vk-icd + frescod) without unit-test
+  scaffolding.
+* **D.6 — Pipeline state plumbing.**  Map the pipeline's
+  raster state (depth test on/off, blend state, write mask)
+  into `DrawTriangle.depth_buffer` and `DrawTriangle.blend_state`.
+  Optional `depth_buffer` allocation per render-target.
+* **D.7 — Multi-primitive draws.**  D.5's hello-triangle is
+  one primitive (3 verts).  Real meshes do `vertex_count = N*3`
+  for a triangle list.  Iterate primitives within `Draw`;
+  same for `DrawIndexed`.
+* **D.8 — DrawIndexed.**  Wire the index buffer slicing + per-
+  primitive vertex gather.
+
+Roughly D.1-D.5 are the path to a first end-to-end pixel; D.6
+through D.8 round out the Vulkan-shape draw semantics.  After
+D.8, tier-2 is genuinely a Vulkan executor for the subset of
+opcodes we've defined.
+
+**Status: scoped, D.1 next.**
