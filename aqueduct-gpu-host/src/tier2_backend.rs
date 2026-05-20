@@ -103,7 +103,22 @@ pub struct Tier2Backend {
     /// onto the compositor; tests read them back to verify
     /// the present wire worked.
     presented_frames: Mutex<HashMap<u64, PresentedFrame>>,
+    /// Optional callback invoked on every successful
+    /// `present`. The Tier2Backend's own snapshot still
+    /// updates `presented_frames`; the callback is the push
+    /// hook a downstream consumer (atrium-compositor's
+    /// Fresco bridge, a screen-recorder, a test tap) plugs
+    /// into to forward frames anywhere.
+    present_callback: Mutex<Option<PresentCallback>>,
 }
+
+/// Boxed callback fired by `Tier2Backend::present`. Arguments
+/// are `(surface_id, &PresentedFrame)`. Mutex-guarded; held
+/// only across the per-frame dispatch, so taking the lock
+/// inside the callback (e.g. to forward through another
+/// Mutex-protected resource) is fine.
+pub type PresentCallback =
+    Box<dyn Fn(u64, &PresentedFrame) + Send + Sync + 'static>;
 
 /// One presented frame's snapshot (width, height, RGBA8 pixels)
 /// plus the frame_id from `vkQueuePresentKHR`.
@@ -229,6 +244,7 @@ impl Tier2Backend {
             pipeline_raster: Mutex::new(HashMap::new()),
             last_assembled_vertices: Mutex::new(None),
             presented_frames: Mutex::new(HashMap::new()),
+            present_callback: Mutex::new(None),
             submissions: AtomicU64::new(0),
             presents:    AtomicU64::new(0),
             draws_executed: AtomicU64::new(0),
@@ -391,6 +407,21 @@ impl Tier2Backend {
     pub fn last_presented_frame(&self, surface_id: u64) -> Option<PresentedFrame> {
         self.presented_frames.lock().unwrap()
             .get(&surface_id).cloned()
+    }
+
+    /// Install (or replace) the per-frame present callback.
+    /// The callback fires synchronously inside `present`
+    /// after the per-surface snapshot is updated; consumers
+    /// that need to keep up with display refresh should
+    /// dispatch the actual blit through a channel from
+    /// within the callback rather than blocking here.
+    pub fn set_present_callback(&self, cb: PresentCallback) {
+        *self.present_callback.lock().unwrap() = Some(cb);
+    }
+
+    /// Remove a previously-installed present callback.
+    pub fn clear_present_callback(&self) {
+        *self.present_callback.lock().unwrap() = None;
     }
 
     /// Read back a registered image's RGBA8 pixels.
@@ -1014,7 +1045,16 @@ impl Backend for Tier2Backend {
             })
         };
         if let Some(frame) = snap {
-            self.presented_frames.lock().unwrap().insert(surface_id, frame);
+            self.presented_frames.lock().unwrap()
+                .insert(surface_id, frame.clone());
+            // Fire the registered callback (if any).  The
+            // callback runs synchronously; downstream consumers
+            // that can't keep up should hand work off through a
+            // channel.
+            let cb = self.present_callback.lock().unwrap();
+            if let Some(f) = cb.as_ref() {
+                f(surface_id, &frame);
+            }
         } else {
             log::warn!("Tier2Backend::present: image {image_id} not in storage; \
                         skipping snapshot for surface {surface_id}");

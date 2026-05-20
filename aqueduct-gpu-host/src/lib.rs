@@ -75,7 +75,9 @@ pub mod tier2_backend;
 pub mod tier2_registry;
 
 pub use backend::{Backend, SoftwareBackend, StubBackend};
-pub use tier2_backend::{AssembledVertices, PresentedFrame, Tier2Backend};
+pub use tier2_backend::{
+    AssembledVertices, PresentCallback, PresentedFrame, Tier2Backend,
+};
 pub use tier2_registry::{
     BlendFactor, BlendFactorPair, BlendOp, BlendState, ColorWriteMask,
     DrawTriangle, Tier2Registry, Tier2ShaderId,

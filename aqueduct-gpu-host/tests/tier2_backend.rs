@@ -1307,3 +1307,81 @@ fn tier2_backend_d8_draw_indexed_uint32_with_vertex_offset() {
     let i = (3 * 8 + 3) * 4;
     assert_eq!(&pixels[i..i+4], &blue[..], "(3,3) = {:?}", &pixels[i..i+4]);
 }
+
+#[test]
+fn tier2_backend_present_invokes_callback() {
+    use std::sync::Mutex as StdMutex;
+
+    let cache_dir = TempDir::new().unwrap();
+    let registry = Arc::new(Tier2Registry::new(LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    }));
+    let backend = Tier2Backend::new(registry);
+
+    let image_id = ResourceId::new(IdNamespace::IcdRuntime, 0x20001);
+    backend.image_created(image_id, 4, 4);
+
+    // Capture all (surface_id, w, h, frame_id, first_4_pixel_bytes)
+    // tuples the callback receives.
+    let captured: Arc<StdMutex<Vec<(u64, u32, u32, u64, [u8; 4])>>> =
+        Arc::new(StdMutex::new(Vec::new()));
+    let captured_cb = captured.clone();
+    backend.set_present_callback(Box::new(move |surface_id, frame| {
+        let mut head = [0u8; 4];
+        head.copy_from_slice(&frame.pixels[..4]);
+        captured_cb.lock().unwrap().push((
+            surface_id, frame.width, frame.height, frame.frame_id, head,
+        ));
+    }));
+
+    backend.present(image_id, 999, 7);
+    backend.present(image_id, 999, 8);
+    backend.present(image_id, 1000, 9);
+
+    let got = captured.lock().unwrap().clone();
+    assert_eq!(got.len(), 3, "callback should fire once per present");
+    assert_eq!(got[0].0, 999); assert_eq!(got[0].3, 7);
+    assert_eq!(got[1].0, 999); assert_eq!(got[1].3, 8);
+    assert_eq!(got[2].0, 1000); assert_eq!(got[2].3, 9);
+    for (_, w, h, _, _) in &got {
+        assert_eq!(*w, 4);
+        assert_eq!(*h, 4);
+    }
+
+    // Clear hook -> further presents don't append.
+    backend.clear_present_callback();
+    backend.present(image_id, 999, 10);
+    assert_eq!(captured.lock().unwrap().len(), 3,
+        "callback should not fire after clear");
+
+    // last_presented_frame still tracks (callback is push, the
+    // accessor is the pull mirror).
+    let f = backend.last_presented_frame(999).unwrap();
+    assert_eq!(f.frame_id, 10);
+}
+
+#[test]
+fn tier2_backend_present_skips_callback_when_image_missing() {
+    let cache_dir = TempDir::new().unwrap();
+    let registry = Arc::new(Tier2Registry::new(LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    }));
+    let backend = Tier2Backend::new(registry);
+
+    let fired = Arc::new(std::sync::Mutex::new(0u32));
+    let fired_cb = fired.clone();
+    backend.set_present_callback(Box::new(move |_, _| {
+        *fired_cb.lock().unwrap() += 1;
+    }));
+
+    // Image was never registered -- present should warn-and-skip.
+    let bogus = ResourceId::new(IdNamespace::IcdRuntime, 0x20099);
+    backend.present(bogus, 5, 1);
+
+    assert_eq!(*fired.lock().unwrap(), 0,
+        "callback must not fire for a present whose source image is unknown");
+}
