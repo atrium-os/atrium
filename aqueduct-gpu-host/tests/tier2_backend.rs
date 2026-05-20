@@ -1032,3 +1032,88 @@ fn tier2_backend_d6_depth_disabled_means_later_wins() {
     assert_eq!(px(3, 3), [0, 0, 255, 255], "(3,3) = {:?}", px(3, 3));
     assert_eq!(px(4, 4), [0, 0, 255, 255], "(4,4) = {:?}", px(4, 4));
 }
+
+#[test]
+fn tier2_backend_d7_multi_primitive_quad_in_one_draw() {
+    // Draw{vertex_count: 6} as two triangles (a quad covering
+    // the full 8x8 image), to prove the walker iterates all
+    // tri_count primitives in a single Draw record.
+    use aqueduct_gpu::frame::{BindVertexBufCmd, DrawCmd, FrameBuilder, SetViewportCmd};
+    use aqueduct_gpu::opcodes::FrameOp;
+    use aqueduct_gpu::{
+        VertexAttributeDesc, VertexBindingDesc, VertexFormat, VertexInputState,
+    };
+
+    let cache_dir = TempDir::new().unwrap();
+    let registry = Arc::new(Tier2Registry::new(LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    }));
+    let vs_id = registry.register(&build_passthrough_vs_d5()).unwrap();
+    let fs_id = registry.register(&build_constant_color_spirv([0.0, 1.0, 0.0, 1.0])).unwrap();
+    let backend = Tier2Backend::new(registry);
+
+    let image_id    = ResourceId::new(IdNamespace::IcdRuntime, 0x12001);
+    let pipeline_id = ResourceId::new(IdNamespace::IcdRuntime, 0x12002);
+    let vbuf_id     = ResourceId::new(IdNamespace::IcdRuntime, 0x12003);
+    backend.image_created(image_id, 8, 8);
+    backend.bind_pipeline_vs(pipeline_id, vs_id);
+    backend.bind_pipeline(pipeline_id, fs_id);
+    backend.bind_layout(pipeline_id, VertexInputState {
+        bindings: vec![VertexBindingDesc {
+            binding: 0, stride: 12, per_instance: false,
+        }],
+        attributes: vec![VertexAttributeDesc {
+            location: 0, binding: 0,
+            format: VertexFormat::R32g32b32Sfloat, offset: 0,
+        }],
+    });
+
+    // Full-screen NDC quad as 2 triangles (6 vertices):
+    //   tri 1: (-1,-1), (1,-1), (-1, 1)
+    //   tri 2: (1,-1), (1, 1), (-1, 1)
+    let mut src = Vec::<u8>::new();
+    let verts = [
+        [-1.0f32, -1.0, 0.0], [ 1.0, -1.0, 0.0], [-1.0,  1.0, 0.0],
+        [ 1.0,    -1.0, 0.0], [ 1.0,  1.0, 0.0], [-1.0,  1.0, 0.0],
+    ];
+    for v in verts { for f in v { src.extend_from_slice(&f.to_le_bytes()); } }
+    backend.buffer_created(vbuf_id, 72);
+    backend.buffer_write_bytes(vbuf_id, 0, &src).unwrap();
+
+    let mut fb = FrameBuilder::new(4096);
+    let mut begin = [0u8; 12];
+    begin[..4].copy_from_slice(&image_id.raw().to_le_bytes());
+    begin[4..8].copy_from_slice(&8u32.to_le_bytes());
+    begin[8..12].copy_from_slice(&8u32.to_le_bytes());
+    fb.push(FrameOp::BeginRenderPass, &begin).unwrap();
+    fb.push(FrameOp::BindPipeline, &pipeline_id.raw().to_le_bytes()).unwrap();
+    fb.push_set_viewport(SetViewportCmd {
+        x: 0.0, y: 0.0, width: 8.0, height: 8.0,
+        min_depth: 0.0, max_depth: 1.0,
+    }).unwrap();
+    fb.push_bind_vertex_buf(BindVertexBufCmd {
+        binding: 0, buffer_id: vbuf_id.raw(), offset: 0,
+    }).unwrap();
+    fb.push_draw(DrawCmd {
+        vertex_count: 6, instance_count: 1, first_vertex: 0, first_instance: 0,
+    }).unwrap();
+    fb.push(FrameOp::EndRenderPass, &[]).unwrap();
+
+    let fence = ResourceId::new(IdNamespace::IcdRuntime, 0x12004);
+    backend.submit_frame(fence, 1, fb.as_bytes());
+
+    let pixels = backend.read_image_pixels(image_id).unwrap();
+    let green = [0u8, 255, 0, 255];
+    // Every pixel of the 8x8 should be green (the quad covers
+    // the whole NDC space). If only one triangle ran the
+    // diagonal pixels on the wrong side would be cleared.
+    for y in 0..8 {
+        for x in 0..8 {
+            let i = (y * 8 + x) * 4;
+            assert_eq!(&pixels[i..i+4], &green[..],
+                "pixel ({x},{y}) = {:?}", &pixels[i..i+4]);
+        }
+    }
+}
