@@ -1696,6 +1696,59 @@ fn translate_inst(
                         "GLSL.std.450 FSign not supported yet \
                          (compare-to-bool-to-float lowering queued)".into()));
                 }
+                66 => {
+                    // Length(v) ≡ sqrt(dot(v, v)).  Result is
+                    // f32; arg is vec.
+                    let v_id = expect_id(&spv_inst.operands, 2)?;
+                    let v = resolve_value(v_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let dot_vv = {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let val = Value { id, ty: result_ty.clone() };
+                        insts.push(Inst {
+                            op: Op::Dot(v.clone(), v),
+                            result: Some(val.clone()),
+                            source_spirv_offset,
+                        });
+                        val
+                    };
+                    Op::FSqrt(dot_vv)
+                }
+                67 => {
+                    // Distance(p0, p1) ≡ length(p1 - p0)
+                    //                  ≡ sqrt(dot(d, d)) where d = p1-p0.
+                    let p0_id = expect_id(&spv_inst.operands, 2)?;
+                    let p1_id = expect_id(&spv_inst.operands, 3)?;
+                    let p0 = resolve_value(p0_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let p1 = resolve_value(p1_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let diff = {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        // Diff has the SAME type as p0/p1 (a vec).
+                        let val = Value { id, ty: p0.ty.clone() };
+                        insts.push(Inst {
+                            op: Op::FSub(p1, p0),
+                            result: Some(val.clone()),
+                            source_spirv_offset,
+                        });
+                        val
+                    };
+                    let dot_dd = {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let val = Value { id, ty: result_ty.clone() };
+                        insts.push(Inst {
+                            op: Op::Dot(diff.clone(), diff),
+                            result: Some(val.clone()),
+                            source_spirv_offset,
+                        });
+                        val
+                    };
+                    Op::FSqrt(dot_dd)
+                }
                 10 => {
                     // Fract(x) ≡ x - floor(x).  Synthesise inline
                     // using the existing Op::FFloor + Op::FSub.
