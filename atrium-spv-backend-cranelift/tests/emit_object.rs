@@ -49,6 +49,7 @@ fn build_minimal_fragment_module() -> Module {
         return_type: Type::Void,
         entry_block,
         blocks,
+        local_size: None,
     };
     Module {
         functions: vec![func],

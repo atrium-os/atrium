@@ -251,24 +251,17 @@ pub fn compile_blob(module: &Module, target: Target)
 fn emit_function(
     func: &Function,
 ) -> Result<(Vec<u8>, Vec<(u32, u32)>), BackendError> {
-    // Fragment + Vertex are supported.  Compute returns
-    // `BackendError::Unsupported` -- atrium-spv-compile's
-    // bespoke-first / Cranelift-fallback dispatch catches
-    // this and routes Compute through Cranelift instead.
-    // Implementing native bespoke compute is a perf-only
-    // arc (correctness already lives in Cranelift): it
-    // requires the AAPCS64 9-param Compute signature
-    // (uniforms, push_constants, out_buffer, wg_id[3],
-    // local_id[3] with the 9th arg on the stack),
-    // Op::LoadBuiltin codegen reading from XR3..XR8 + the
-    // stack slot, and a (Compute, StorageBuffer) ->
-    // out_buffer mapping for SSBO stores.  Queued as a
-    // future ARM64 codegen sub-project.
-    if !matches!(func.stage, ShaderStage::Fragment | ShaderStage::Vertex) {
-        return Err(BackendError::Unsupported(format!(
-            "stage {:?} not yet supported by bespoke backend; \
-             routed through Cranelift fallback", func.stage)));
-    }
+    // Compute is enabled with the AAPCS64 9-param signature
+    // (uniforms@X0, push_constants@X1, out_buffer@X2,
+    // wg_id[xyz]@W3..W5, local_id[xy]@W6..W7, local_id[z]
+    // at [SP+0]). Storage class mapping for Compute and the
+    // Op::LoadBuiltin codegen for the wg/lid builtins are
+    // wired below; ops the bespoke compute path can't yet
+    // emit (OpCompositeExtract on uvec3, scalar StorageBuffer
+    // stores, etc.) still return BackendError::Unsupported
+    // and atrium-spv-compile falls back to Cranelift for
+    // that shader -- the foundation gets us closer
+    // incrementally without breaking existing behaviour.
 
     let mut a = asm::Asm::new();
     // PC-map entries: (body-relative host byte offset,
@@ -336,7 +329,11 @@ fn emit_function(
     let x_out = match func.stage {
         ShaderStage::Fragment => asm::Xreg(4),
         ShaderStage::Vertex   => asm::Xreg(6),
-        ShaderStage::Compute  => asm::Xreg(0), // unreachable here
+        // Compute's primary writable pointer is the SSBO
+        // out_buffer at X2 (3rd AAPCS64 arg, after uniforms
+        // + push_constants).  Op::Store through a
+        // StorageBuffer pointer routes here.
+        ShaderStage::Compute  => asm::Xreg(2),
     };
     let w_tmp = asm::Wreg(9);
 
@@ -2432,6 +2429,13 @@ fn resolve_or_make_pointer(
         (ShaderStage::Vertex,   StorageClass::Uniform)      => asm::Xreg(2),
         (ShaderStage::Vertex,   StorageClass::PushConstant) => asm::Xreg(3),
         (ShaderStage::Vertex,   StorageClass::Output)       => asm::Xreg(6),
+
+        // Compute: AAPCS64 9-param signature.  uniforms@X0,
+        // push_constants@X1, out_buffer@X2 = the SSBO the
+        // shader writes through via StorageBuffer pointers.
+        (ShaderStage::Compute,  StorageClass::Uniform)       => asm::Xreg(0),
+        (ShaderStage::Compute,  StorageClass::PushConstant)  => asm::Xreg(1),
+        (ShaderStage::Compute,  StorageClass::StorageBuffer) => asm::Xreg(2),
 
         (stage, other) => return Err(BackendError::Unsupported(format!(
             "stage={stage:?} storage class={other:?} not mapped to an \

@@ -165,6 +165,7 @@ fn empty_module_still_produces_valid_object() {
             return_type: Type::Void,
             entry_block,
             blocks,
+            local_size: None,
         }],
         entry_points: vec![EntryPoint {
             stage: ShaderStage::Fragment,

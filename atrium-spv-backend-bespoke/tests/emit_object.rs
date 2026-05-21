@@ -28,6 +28,7 @@ fn empty_fragment_module() -> Module {
             return_type: Type::Void,
             entry_block,
             blocks,
+            local_size: None,
         }],
         entry_points: vec![EntryPoint {
             stage: ShaderStage::Fragment,
@@ -158,6 +159,7 @@ fn unsupported_op_falls_back_with_unsupported_error() {
             return_type: Type::Void,
             entry_block,
             blocks,
+            local_size: None,
         }],
         entry_points: vec![EntryPoint {
             stage: ShaderStage::Fragment,

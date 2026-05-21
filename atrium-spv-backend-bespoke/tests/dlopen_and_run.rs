@@ -352,6 +352,7 @@ fn bespoke_shader_runs_two_block_branch() {
             return_type: Type::Void,
             entry_block: BlockId(0),
             blocks,
+            local_size: None,
         }],
         entry_points: vec![EntryPoint {
             stage: ShaderStage::Fragment,
