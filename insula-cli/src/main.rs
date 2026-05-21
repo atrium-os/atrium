@@ -138,6 +138,9 @@ Flags:
                           verification (development only).
   --accept-changes        Pass to `install` to accept widened
                           capability grants on re-install.
+  --link                  Pass to `install` to symlink the source
+                          bundle directory instead of copying
+                          (dev iteration; bundle dir only).
 
 Install root: $INSULA_INSTALL_ROOT (or ~/Library/Application Support/atrium-insula/)"
     );
@@ -165,14 +168,16 @@ fn resolve_install_root() -> PathBuf {
 // -----------------------------------------------------
 
 fn cmd_install(args: &[String], install_root: &Path) -> Result<(), String> {
-    // Parse: <bundle-dir-or-archive> [--allow-unsigned] [--accept-changes]
+    // Parse: <bundle-dir-or-archive> [--allow-unsigned] [--accept-changes] [--link]
     let mut src: Option<&str> = None;
     let mut allow_unsigned = false;
     let mut accept_changes = false;
+    let mut link = false;
     for a in args {
         match a.as_str() {
             "--allow-unsigned" => allow_unsigned = true,
             "--accept-changes" => accept_changes = true,
+            "--link" => link = true,
             other if !other.starts_with("--") => src = Some(other),
             other => {
                 return Err(format!("install: unknown flag '{}'", other));
@@ -189,6 +194,15 @@ fn cmd_install(args: &[String], install_root: &Path) -> Result<(), String> {
     // install completes (host::install copies the
     // bundle into the install root, so the tempdir's
     // lifetime only needs to cover this function).
+    // --link only makes sense against a bundle
+    // directory — a symlink to a unpacked tempdir
+    // that disappears at function exit would dangle.
+    if link && archive::path_looks_like_archive(Path::new(src)) {
+        return Err(
+            "install --link works on bundle directories only; \
+             unpack the .insula archive first".to_string()
+        );
+    }
     let _extract_guard: Option<TempDir>;
     let bundle_dir_path: PathBuf = if archive::path_looks_like_archive(Path::new(src)) {
         let tmp = TempDir::new("insula-extract")
@@ -272,10 +286,18 @@ fn cmd_install(args: &[String], install_root: &Path) -> Result<(), String> {
         }
     }
 
-    let app = host::install(&bundle, install_root)
+    let mode = if link {
+        host::InstallMode::Link
+    } else {
+        host::InstallMode::Copy
+    };
+    let app = host::install_with_mode(&bundle, install_root, mode)
         .map_err(|e| format!("installing {}: {}", bundle.app_id(), e))?;
 
     println!("Installed {} v{}", app.app_id, app.manifest.app.version);
+    if link {
+        println!("  mode:      link (dev — bundle/ symlinks the source)");
+    }
     println!("  bundle:    {}", app.binary_path.parent().unwrap().parent().unwrap().display());
     println!("  binary:    {}", app.binary_path.display());
     println!("  container: {}", app.container_dir.display());

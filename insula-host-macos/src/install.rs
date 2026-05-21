@@ -68,29 +68,100 @@ pub fn install(
     bundle: &InsulaBundle,
     install_root: &Path,
 ) -> Result<InstalledApp, Error> {
+    install_with_mode(bundle, install_root, InstallMode::Copy)
+}
+
+/// How the bundle directory is materialized under the
+/// install root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallMode {
+    /// Production semantics: recursively copy the bundle
+    /// tree into `<install_root>/apps/<id>/bundle/`.
+    /// Subsequent edits to the source dir do NOT affect
+    /// what the installed app runs.
+    Copy,
+    /// Dev semantics: symlink
+    /// `<install_root>/apps/<id>/bundle` -> the source
+    /// directory's canonical absolute path. Subsequent
+    /// edits to the source ARE reflected on the next
+    /// launch (no reinstall needed).
+    ///
+    /// Only valid for bundle directories, never archives.
+    /// The `insula install --link` CLI flag picks this.
+    Link,
+}
+
+/// Most-general install entry: behaves like `install`
+/// but lets the caller choose between Copy (production)
+/// and Link (dev iteration) modes.
+pub fn install_with_mode(
+    bundle: &InsulaBundle,
+    install_root: &Path,
+    mode: InstallMode,
+) -> Result<InstalledApp, Error> {
     let app_id = bundle.app_id();
     let app_root = install_root.join("apps").join(app_id);
     let bundle_dst = app_root.join("bundle");
     let container_dir = app_root.join("container");
 
     // Remove any prior bundle/ (preserve container/).
-    if bundle_dst.exists() {
-        std::fs::remove_dir_all(&bundle_dst)
-            .map_err(|e| Error::UnsupportedFeature(format!(
-                "removing prior bundle at {}: {}", bundle_dst.display(), e
-            )))?;
+    // For Link mode, `remove_dir_all` correctly removes
+    // a symlink without following it (it deletes the
+    // link, not the target).
+    if bundle_dst.exists() || bundle_dst.is_symlink() {
+        if bundle_dst.is_symlink() {
+            std::fs::remove_file(&bundle_dst)
+                .map_err(|e| Error::UnsupportedFeature(format!(
+                    "removing prior bundle symlink at {}: {}",
+                    bundle_dst.display(), e
+                )))?;
+        } else {
+            std::fs::remove_dir_all(&bundle_dst)
+                .map_err(|e| Error::UnsupportedFeature(format!(
+                    "removing prior bundle at {}: {}",
+                    bundle_dst.display(), e
+                )))?;
+        }
     }
 
-    std::fs::create_dir_all(&bundle_dst)
-        .map_err(|e| Error::UnsupportedFeature(format!(
-            "mkdir bundle/ at {}: {}", bundle_dst.display(), e
-        )))?;
     std::fs::create_dir_all(&container_dir)
         .map_err(|e| Error::UnsupportedFeature(format!(
             "mkdir container/ at {}: {}", container_dir.display(), e
         )))?;
+    // Ensure the parent (`apps/<id>/`) exists; we'll
+    // create the bundle entry itself below per-mode.
+    if let Some(parent) = bundle_dst.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Error::UnsupportedFeature(format!(
+                "mkdir {}: {}", parent.display(), e
+            )))?;
+    }
 
-    copy_dir_recursive(&bundle.root, &bundle_dst)?;
+    match mode {
+        InstallMode::Copy => {
+            std::fs::create_dir_all(&bundle_dst)
+                .map_err(|e| Error::UnsupportedFeature(format!(
+                    "mkdir bundle/ at {}: {}", bundle_dst.display(), e
+                )))?;
+            copy_dir_recursive(&bundle.root, &bundle_dst)?;
+        }
+        InstallMode::Link => {
+            let src_abs = bundle.root.canonicalize()
+                .map_err(|e| Error::UnsupportedFeature(format!(
+                    "canonicalize {}: {}", bundle.root.display(), e
+                )))?;
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&src_abs, &bundle_dst)
+                .map_err(|e| Error::UnsupportedFeature(format!(
+                    "symlink {} -> {}: {}",
+                    bundle_dst.display(), src_abs.display(), e
+                )))?;
+            #[cfg(not(unix))]
+            return Err(Error::UnsupportedFeature(
+                "InstallMode::Link is unix-only".to_string()
+            ));
+        }
+    }
 
     let binary_path = bundle_dst.join(&bundle.manifest.bundle.entry);
 
