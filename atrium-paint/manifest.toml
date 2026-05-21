@@ -1,0 +1,18 @@
+# Insula manifest for atrium-paint.
+#
+# First sample to declare windowed UI. The host adapter
+# threads $ATRIUM_FRESCO_SOCKET into the sandboxed child
+# when the [render] section is present.
+
+[app]
+name = "com.atrium-os.atrium-paint"
+version = "0.1.0"
+sdk-version = "1.x"
+
+[bundle]
+form = "native"
+arches = ["aarch64-darwin"]
+entry = "bin/atrium-paint"
+
+[render]
+fresco = true

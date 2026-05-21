@@ -26,6 +26,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-paint"
+version = "0.1.0"
+dependencies = [
+ "aqueduct",
+ "fresco-protocol",
+ "libatrium",
+ "postcard",
+ "tempfile",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -302,15 +313,6 @@ dependencies = [
  "embedded-io 0.6.1",
  "heapless",
  "serde",
-]
-
-[[package]]
-name = "praeco-macos"
-version = "0.1.0"
-dependencies = [
- "aqueduct",
- "libatrium",
- "tempfile",
 ]
 
 [[package]]

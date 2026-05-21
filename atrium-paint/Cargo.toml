@@ -1,0 +1,20 @@
+[package]
+name        = "atrium-paint"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+description = "Fourth sample Insula app — the first to use the Pergola path. Opens a top-level window via atrium_window_open, fills it with a solid color via atrium_window_fill_rect, polls atrium_window_poll_event in a loop, and exits cleanly on CLOSE_REQUESTED. Demonstrates the full open -> paint -> poll -> destroy lifecycle against any Fresco-shaped scene server."
+publish     = false
+
+[[bin]]
+name = "atrium-paint"
+path = "src/main.rs"
+
+[dependencies]
+libatrium = { path = "../libatrium" }
+
+[dev-dependencies]
+aqueduct        = { path = "../aqueduct" }
+fresco-protocol = { path = "../fresco-protocol" }
+postcard        = { version = "1", features = ["use-std"] }
+tempfile        = "3"
