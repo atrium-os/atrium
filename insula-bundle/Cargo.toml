@@ -1,0 +1,18 @@
+[package]
+name        = "insula-bundle"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+description = "On-disk Insula bundle reader. Validates layout (manifest.toml + bin/ + assets/), parses + cross-checks the manifest against the binary it references. Platform-neutral; consumed by every Insula host adapter (macOS today, Linux/Windows/Atrium later) and by Opifex's install pipeline."
+publish     = false
+
+[lib]
+name = "insula_bundle"
+path = "src/lib.rs"
+
+[dependencies]
+insula-manifest = { path = "../insula-manifest" }
+thiserror       = "1"
+
+[dev-dependencies]
+tempfile = "3"

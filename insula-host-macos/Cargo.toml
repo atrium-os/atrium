@@ -12,6 +12,7 @@ path = "src/lib.rs"
 
 [dependencies]
 insula-manifest = { path = "../insula-manifest" }
+insula-bundle   = { path = "../insula-bundle" }
 thiserror       = "1"
 tempfile        = "3"
 

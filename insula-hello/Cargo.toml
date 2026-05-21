@@ -16,4 +16,5 @@ libatrium = { path = "../libatrium" }
 [dev-dependencies]
 insula-host-macos = { path = "../insula-host-macos" }
 insula-manifest   = { path = "../insula-manifest" }
+insula-bundle     = { path = "../insula-bundle" }
 tempfile          = "3"

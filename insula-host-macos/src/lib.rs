@@ -27,8 +27,10 @@
 
 pub mod entitlements;
 mod error;
+pub mod install;
 pub mod launch;
 pub mod sbpl;
 
 pub use error::Error;
+pub use install::{install, launch_installed, InstalledApp};
 pub use launch::{launch, LaunchOptions, SandboxedChild};

@@ -105,15 +105,6 @@ name = "insula-bundle"
 version = "0.1.0"
 dependencies = [
  "insula-manifest",
- "thiserror",
-]
-
-[[package]]
-name = "insula-host-macos"
-version = "0.1.0"
-dependencies = [
- "insula-bundle",
- "insula-manifest",
  "tempfile",
  "thiserror",
 ]
