@@ -20,7 +20,8 @@
 
 use atrium::{
     atrium_container_path, atrium_exit, atrium_init, atrium_log,
-    atrium_storage_open, ATRIUM_LOG_INFO, ATRIUM_STORAGE_WRITE,
+    atrium_net_connect, atrium_storage_open, ATRIUM_LOG_INFO,
+    ATRIUM_NET_TCP, ATRIUM_STORAGE_WRITE,
 };
 use std::ffi::CString;
 use std::io::Write;
@@ -91,6 +92,30 @@ fn main() {
                 "atrium_storage_open returned {}", fd
             )).unwrap();
             unsafe { atrium_log(2, err.as_ptr()); }
+        }
+    }
+
+    // Optional network call — gated on
+    // ATRIUM_NET_TEST_HOST=host:port. Used by the
+    // per-app netd enforcement integration test; in
+    // normal demo runs this env var is unset and the
+    // block is skipped.
+    if let Ok(host_port) = std::env::var("ATRIUM_NET_TEST_HOST") {
+        if let Some((host, port_str)) = host_port.split_once(':') {
+            if let Ok(port) = port_str.parse::<u16>() {
+                let host_c = CString::new(host).unwrap();
+                let fd = unsafe {
+                    atrium_net_connect(host_c.as_ptr(), port, ATRIUM_NET_TCP)
+                };
+                let line = if fd >= 0 {
+                    unsafe { libc::close(fd); }
+                    format!("net-connect OK to {}:{} (fd was {})", host, port, fd)
+                } else {
+                    format!("net-connect FAIL to {}:{} (code {})", host, port, fd)
+                };
+                let cstr = CString::new(line).unwrap();
+                unsafe { atrium_log(ATRIUM_LOG_INFO, cstr.as_ptr()); }
+            }
         }
     }
 

@@ -172,6 +172,7 @@ dependencies = [
  "insula-host-macos",
  "insula-manifest",
  "libatrium",
+ "libc",
  "tempfile",
 ]
 

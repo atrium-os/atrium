@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 libatrium = { path = "../libatrium" }
+libc      = "0.2"
 
 [dev-dependencies]
 insula-host-macos = { path = "../insula-host-macos" }
