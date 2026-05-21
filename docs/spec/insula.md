@@ -1765,7 +1765,202 @@ The relay sees encrypted signaling traffic only — it cannot
 read peer messages, which are end-to-end encrypted with
 per-channel keys derived from device identities.
 
-## 20. Notifications — Praeco
+## 20. Distributed apps and remote rendering
+
+The web's "server-side" story is several distinct things
+mashed together. Insula separates them, and one of them —
+remote app execution with local rendering — becomes a
+first-class capability of Aqueduct + Fresco rather than
+needing a separate protocol stack (X11, RDP, VNC, Citrix).
+
+### 20.1 What "server-side" actually contains
+
+| Web concept | What it really is | Insula's answer |
+|---|---|---|
+| Server-rendered HTML (PHP, Rails) | Avoid shipping JS to do first paint | Does not apply — no JS to ship, no HTML to render; AOT native code mmap's instantly |
+| Hybrid SSR + hydration (Next.js, Leptos SSR) | Bridge between document and app modes of the web | Does not apply — apps-vs-documents split is clean (§0.5); hybrid is unnecessary |
+| Remote app execution (X11, RDP, Citrix) | Run code on machine A, show UI on machine B | First-class (§20.2). Aqueduct is already a network-transparent substrate. |
+| Server-side business logic (any backend) | Hold data + serve API | Just an Aqueduct service over the network (§20.5) |
+
+The first two are properties of the web's document/app
+mongrel shape, deleted in §0.5. The third and fourth are
+the substantive ones.
+
+### 20.2 Remote app execution — X11 done right
+
+Aqueduct is OS-agnostic and network-transparent by design.
+Fresco is a retained-mode scenegraph protocol. Together,
+they support **remote app execution as a normal Insula
+deployment shape**:
+
+- The remote app is a normal Insula app, running in a
+  Portcullis jail on the server.
+- Its Aqueduct client connects to *the user's* compositor
+  via a network-traversing Aqueduct.
+- Fresco scenegraph commands flow over the network instead
+  of via unix socket.
+- The local compositor renders them.
+- Input events flow back the other way.
+
+The user sees a window on their desktop. The window is
+backed by:
+- A server in the closet, or
+- A datacenter VM, or
+- Their phone (continuity-style hand-off), or
+- A friend's machine (collaborative session).
+
+This is **strictly cleaner than X11 / RDP / Citrix**:
+
+- The scenegraph protocol (Fresco) is designed for IPC
+  compression and content-addressed assets, not pixel
+  bashing. Textures and meshes Tessera-dedup across the
+  network so cold first frame is the only worst case;
+  subsequent frames are scenegraph deltas.
+- The transport (Aqueduct) is designed for this — not a
+  layer-violating retrofit like X11-over-SSH.
+- Jail boundaries + capabilities transfer cleanly — the
+  remote app's manifest is checked against what the user
+  authorized for *remote* execution; the consent UI shows
+  remote-execution as its own dimension.
+- Identity via Vestibulum's per-service keypairs (§13)
+  means the remote app authenticates to the user and the
+  user to the remote app using the same machinery as a
+  local app — no SSH-key / VNC-password split.
+
+### 20.3 Trust and consent for remote execution
+
+Running an app remotely is a **separate trust statement**
+from "I installed this app locally." The remote-execution
+consent prompt shows:
+
+- Identity of the remote host (Vestibulum-attested).
+- What capabilities the remote app holds *on the server*
+  (its own jail manifest), distinct from what the user
+  grants for the rendering session.
+- What the user shares with it during the session (input
+  events, clipboard, any attached fds).
+
+Capability flow is asymmetric:
+- The remote app **does not** automatically receive the
+  user's local capabilities (storage, peripherals,
+  contacts).
+- The user can choose to grant specific local capabilities
+  to the remote session via powerbox (e.g., "share this
+  file with the remote session" via Scrinium).
+
+This is iOS Universal Control / Continuity-style design,
+generalized.
+
+### 20.4 Costs and limits
+
+Honest tradeoffs:
+
+| Concern | Effect | Mitigation |
+|---|---|---|
+| Latency | Local Fresco is sub-ms; network adds RTT. ~20 ms is fine; ~100 ms felt; ~300 ms breaks interactivity | LAN deployments work great; transatlantic interactive is painful (same as any thin-client) |
+| Bandwidth | First frame cold = full asset upload | Tessera dedup; assets pinned and reused on subsequent frames |
+| Reliability | Network partition → app appears frozen | Compositor surfaces `child_lost`-equivalent state (cf. §10.3.5) with last-frame-stale or placeholder |
+| Trust | User trusts server with whatever the app handles | Distinct consent dimension (§20.3); per-session capability grants via powerbox |
+
+### 20.5 Server-side business logic — just network IPC
+
+A traditional PHP / Rails / Django / Node backend is "a
+stateful server that holds data and serves requests." On
+Insula:
+
+- The server runs Atrium (or any OS that ships Aqueduct).
+- The "backend" is an Aqueduct service in a Portcullis
+  jail.
+- Clients connect over the network; same `atrium_net_*`
+  plumbing (§2.3, §4) as any network call.
+- Data lives in Tessera, which works identically server-
+  side and client-side.
+
+The serialization boundary — HTTP + JSON + the
+TypeScript/Python/Ruby polyglot mismatch — **disappears**.
+Client and server speak Aqueduct typed messages; one
+program can have parts in both places, in the same
+language, talking over typed channels.
+
+The "REST API" layer becomes optional: use it for interop
+with non-Atrium services; do not use it as the universal
+coordination model.
+
+### 20.6 Specific framework collapses
+
+- **PHP / Rails / Django** — their job (template-driven
+  HTML generation) does not exist in Insula. Authors write
+  an Insula Aqueduct service that responds with typed
+  data; clients render via Pergola. No HTML in the
+  pipeline.
+- **Next.js / Remix / SvelteKit** — exist to paper over
+  the document/app mongrel. Insula's clean split (§0.5)
+  removes the problem; these frameworks have no analogue
+  because they have nothing to bridge.
+- **Leptos SSR / Phoenix LiveView / similar hybrids** —
+  interesting because they already approached the
+  "one-language-both-sides" vision. On Insula the
+  SSR/hydration dance collapses entirely: one program,
+  parts on the server, parts on the client, talking via
+  Aqueduct in the same language. The framework gets
+  *simpler*, not more complex.
+- **GraphQL / REST schema layers** — replaced by Aqueduct
+  typed messages (same role: define the wire shape between
+  client and server).
+- **WebSocket / SSE / long-polling** — replaced by Aqueduct
+  pub/sub on a network-traversing connection.
+
+### 20.7 What does NOT collapse
+
+The web's client/server split was a workaround for two
+distinct things:
+
+1. **You cannot run untrusted code on the client** → run
+   it on the server.
+2. **The client cannot be trusted with shared data** →
+   keep the data on the server.
+
+Insula changes (1) — you *can* run untrusted code locally,
+because it is jailed. Insula does **not** change (2) for
+*shared* data. A social network's posts, a payment ledger,
+a global search index, a multiplayer game's state — these
+inherently live on a server because they are not the
+property of any one user. They remain server-shaped in
+Insula; they just speak Aqueduct over the network instead
+of HTTP+JSON.
+
+So the right framing is:
+
+- **Single-user data** (your photos, your notes, your
+  documents) — lives locally in Tessera. Sync (§15.5) is
+  opt-in.
+- **Multi-user / platform-owned data** (social graph,
+  global index, shared game state) — lives on a server.
+  Accessed via Aqueduct over network.
+
+The "server" never goes away for the multi-user case. It
+stops being a *language boundary* or a *rendering boundary*
+— it is just a *trust-and-data-location* boundary.
+
+### 20.8 Implications for Aqueduct itself
+
+The properties this section assumes:
+
+- Aqueduct authenticates remote peers via Vestibulum-
+  attested device identities + per-service keypairs (§13).
+- Aqueduct provides TLS-class confidentiality and
+  integrity on network hops.
+- Aqueduct connection establishment surfaces "remote
+  endpoint" cleanly to the user (no transparent-but-
+  surprising network calls).
+- Aqueduct error / disconnect signaling is rich enough for
+  the compositor to render meaningful UX on partition.
+
+These are properties Aqueduct must commit to; they are
+already part of its stated design but worth pinning here so
+the Insula spec's dependency is explicit.
+
+## 21. Notifications — Praeco
 
 User-visible notifications are handled by **Praeco** (the
 existing Atrium notifications service — see NAMING.md).
@@ -1801,7 +1996,7 @@ hours. App-level controls live outside the app.
 
 Standard mobile-OS shape; nothing exotic.
 
-## 21. Internationalization
+## 22. Internationalization
 
 Locale, layout direction, font fallback, calendar, and
 number formatting are **system-wide settings** inherited by
@@ -1820,7 +2015,7 @@ Detail lives in the Pergola spec; this design only commits
 to "locale is a system property apps inherit," not to the
 specific Pergola API.
 
-## 22. Scale and dedup
+## 23. Scale and dedup
 
 The "I have 500 apps installed" question. The web's answer:
 every site re-downloads its JS/CSS/assets, partially saved
@@ -1846,13 +2041,13 @@ The user-facing surface: install-size reports show *unique
 bytes* and *shared bytes*, so the user understands the
 actual cost of an install.
 
-## 23. Threat model
+## 24. Threat model
 
 What follows is the explicit "what can attackers do, what
 they can't, what's residual risk" pass. Spec hardening, not
 new design.
 
-### 23.1 Adversary classes
+### 24.1 Adversary classes
 
 | Class | Capability |
 |---|---|
@@ -1863,7 +2058,7 @@ new design.
 | Local user with physical access | Has device in hand |
 | Hardware attacker | Side channels, fault injection, supply chain |
 
-### 23.2 What the design defends against
+### 24.2 What the design defends against
 
 **Malicious publisher** — limited by capabilities. App can
 only do what the manifest declared and the user accepted at
@@ -1896,7 +2091,7 @@ keys are platform concerns covered elsewhere.
 **Hardware attacker** — out of scope. Atrium relies on the
 underlying FreeBSD + hardware security primitives.
 
-### 23.3 What the design does NOT defend against
+### 24.3 What the design does NOT defend against
 
 Honesty matters more than reassurance:
 
@@ -1918,7 +2113,7 @@ Honesty matters more than reassurance:
   Threat model design must be backed by implementation
   rigor; this spec does not promise the latter.
 
-### 23.4 Trusted system surface
+### 24.4 Trusted system surface
 
 The trusted-computing-base for this design:
 
@@ -1942,7 +2137,7 @@ The trusted-computing-base for this design:
 Anything outside this list is untrusted. App code is
 untrusted regardless of language, signature, or publisher.
 
-### 23.5 Capability hygiene principles
+### 24.5 Capability hygiene principles
 
 For each capability the platform might add:
 
@@ -1963,7 +2158,7 @@ For each capability the platform might add:
    does not transitively grant it to embedded children;
    each jail's caps are its own.
 
-## 24. Open questions
+## 25. Open questions
 
 - **Name.** Working title only. Needs to slot into the
   Atrium architectural vocabulary.
@@ -2019,7 +2214,7 @@ For each capability the platform might add:
   for multiple arches, bundle format needs a slice picker
   analogous to Mach-O fat headers.
 
-## 25. References
+## 26. References
 
 ### Atrium services Insula depends on
 
