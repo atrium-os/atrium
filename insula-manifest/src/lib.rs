@@ -47,8 +47,8 @@ mod sections;
 
 pub use error::Error;
 pub use sections::{
-    ComputeSection, InputPolicy, InputSection, IpcSection, RenderSection,
-    StorageSection,
+    ComputeSection, HostEntry, InputPolicy, InputSection, IpcSection,
+    NetworkProto, NetworkSection, RenderSection, StorageSection,
 };
 
 /// Parsed Insula app manifest.
@@ -76,6 +76,10 @@ pub struct Manifest {
     /// Optional. Aqueduct services the app may reach.
     #[serde(default)]
     pub ipc: Option<IpcSection>,
+
+    /// Optional. Outbound network endpoints + policy.
+    #[serde(default)]
+    pub network: Option<NetworkSection>,
 
     /// Optional. Persistent / cache storage configuration
     /// + quotas.

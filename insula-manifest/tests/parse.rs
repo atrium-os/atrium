@@ -4,7 +4,7 @@
 //! preserves unknown sections in `extra`, roundtrips
 //! cleanly.
 
-use insula_manifest::{BundleForm, Error, InputPolicy, Manifest};
+use insula_manifest::{BundleForm, Error, InputPolicy, Manifest, NetworkProto};
 
 const EXAMPLE_NATIVE: &str = r#"
 [app]
@@ -41,10 +41,8 @@ arches = ["aarch64-freebsd"]
 entry = "bin/weather"
 
 # A section not yet typed — should land in `extra`.
-[network]
-hosts = [
-  { name = "api.weather.example.com", port = 443, proto = "tcp" },
-]
+[capabilities]
+attach-mount = true
 "#;
 
 const EXAMPLE_FULL_TYPED_SECTIONS: &str = r#"
@@ -118,7 +116,7 @@ fn permissive_mode_preserves_unknown_sections() {
     // The not-yet-typed sections are preserved verbatim.
     // (As more sections get promoted to typed fields,
     // this test's example will shrink accordingly.)
-    assert!(m.extra.contains_key("network"));
+    assert!(m.extra.contains_key("capabilities"));
     assert_eq!(m.extra.len(), 1);
 }
 
@@ -127,7 +125,7 @@ fn strict_mode_rejects_unknown_sections() {
     let result = Manifest::parse_strict(EXAMPLE_WITH_EXTRA_SECTIONS);
     match result {
         Err(Error::UnknownSections(sections)) => {
-            assert!(sections.contains(&"network".to_string()));
+            assert!(sections.contains(&"capabilities".to_string()));
         }
         other => panic!("expected UnknownSections error, got {:?}", other),
     }
@@ -199,6 +197,68 @@ fn parses_all_typed_sections() {
     assert!(m.extra.is_empty(),
             "expected no extra sections, got: {:?}",
             m.extra.keys().collect::<Vec<_>>());
+}
+
+#[test]
+fn parses_network_section_with_hosts() {
+    let manifest = r#"
+[app]
+name = "com.example.weather"
+version = "1.0.0"
+sdk-version = "1.x"
+
+[bundle]
+form = "native"
+arches = ["aarch64-freebsd"]
+entry = "bin/x"
+
+[network]
+hosts = [
+  { name = "api.example.com", port = 443, proto = "tcp" },
+  { name = "dns.example.com", port = 53, proto = "udp" },
+  { name = "pinned.example.com", port = 443, proto = "tcp", tls_pin = "sha256:abc123...", methods = ["GET", "POST"], paths = ["/api/v1/"] },
+]
+"#;
+    let m = Manifest::parse(manifest).expect("network manifest should parse");
+    let net = m.network.as_ref().expect("[network] should be present");
+
+    assert_eq!(net.hosts.len(), 3);
+    assert!(!net.raw_network);
+
+    assert_eq!(net.hosts[0].name, "api.example.com");
+    assert_eq!(net.hosts[0].port, 443);
+    assert_eq!(net.hosts[0].proto, NetworkProto::Tcp);
+    assert!(net.hosts[0].tls_pin.is_none());
+    assert!(net.hosts[0].methods.is_empty());
+
+    assert_eq!(net.hosts[1].proto, NetworkProto::Udp);
+
+    let pinned = &net.hosts[2];
+    assert_eq!(pinned.tls_pin.as_deref(), Some("sha256:abc123..."));
+    assert_eq!(pinned.methods, vec!["GET", "POST"]);
+    assert_eq!(pinned.paths, vec!["/api/v1/"]);
+}
+
+#[test]
+fn raw_network_flag_parses() {
+    let manifest = r#"
+[app]
+name = "com.example.vpn"
+version = "1.0.0"
+sdk-version = "1.x"
+
+[bundle]
+form = "native"
+arches = ["aarch64-freebsd"]
+entry = "bin/vpn"
+
+[network]
+raw-network = true
+"#;
+    let m = Manifest::parse(manifest).unwrap();
+    let net = m.network.as_ref().unwrap();
+    assert!(net.raw_network);
+    assert!(net.hosts.is_empty());
 }
 
 #[test]

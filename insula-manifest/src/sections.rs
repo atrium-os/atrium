@@ -120,6 +120,94 @@ pub struct StorageSection {
     pub namespace: Option<String>,
 }
 
+/// `[network].hosts[*].proto` — wire protocol of an
+/// allowed network host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NetworkProto {
+    /// TCP — the common case (HTTPS, etc.).
+    Tcp,
+    /// UDP — DNS, QUIC, voice/video, gaming.
+    Udp,
+}
+
+/// One entry in `[network].hosts` — an outbound
+/// destination the app is permitted to reach.
+///
+/// ```toml
+/// { name = "api.weather.example.com", port = 443, proto = "tcp" }
+/// ```
+///
+/// Per `insula.md` §4.2 the network capability broker
+/// (a userspace daemon on top of atrium-netd, *not* the
+/// existing atrium-netd itself per the spec's §4.2
+/// status caveat) is responsible for enforcing this
+/// allowlist at connect time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostEntry {
+    /// Hostname. Must be a literal name (e.g.
+    /// `api.example.com`), not a wildcard or an IP
+    /// range. The broker resolves this at use time.
+    pub name: String,
+
+    /// TCP / UDP port.
+    pub port: u16,
+
+    /// Wire protocol.
+    pub proto: NetworkProto,
+
+    /// Optional: TLS certificate-fingerprint pinning.
+    /// The broker rejects TLS handshakes whose server
+    /// certificate does not chain to / match the pinned
+    /// fingerprint. Per `insula.md` §4.2 enrichment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_pin: Option<String>,
+
+    /// Optional: HTTP methods the broker will allow
+    /// (when proto = tcp + traffic is HTTP-shaped on
+    /// port 80/443). Empty / absent = no method
+    /// filtering.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<String>,
+
+    /// Optional: URL-path prefixes the broker will
+    /// allow (HTTP-shaped traffic only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+}
+
+/// `[network]` — declared outbound network endpoints.
+///
+/// ```toml
+/// [network]
+/// hosts = [
+///   { name = "api.weather.example.com", port = 443, proto = "tcp" },
+/// ]
+/// raw-network = false
+/// ```
+///
+/// Per `insula.md` §4.2. v0 specifies the data shape;
+/// enforcement is the network broker's job (a
+/// platform-side userspace daemon, currently
+/// unimplemented per the §4.2 status caveat — Insula
+/// adds this on top of atrium-netd's existing coarse
+/// per-jail policy).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NetworkSection {
+    /// Hosts the app is permitted to reach. Empty = no
+    /// outbound network at all (the app does not need
+    /// network).
+    #[serde(default)]
+    pub hosts: Vec<HostEntry>,
+
+    /// Raw-network capability — bypass the broker
+    /// entirely (for tools / VPN clients / things that
+    /// need direct socket access). Loudly disclosed at
+    /// install per the spec; defaults to `false`.
+    #[serde(default, rename = "raw-network")]
+    pub raw_network: bool,
+}
+
 /// `[compute]` — CPU / RAM / wall-time limits.
 ///
 /// ```toml
