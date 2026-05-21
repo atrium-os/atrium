@@ -136,10 +136,56 @@ fn handle_client(
             let _ = f.flush();
         }
 
+        // Optionally deliver to the macOS Notification
+        // Center via osascript. Off by default —
+        // existing tests + headless usage rely on the
+        // log-only path.
+        if std::env::var_os("INSULA_PRAECOD_BACKEND")
+            .as_deref().map(|v| v == "osascript") == Some(true)
+        {
+            deliver_osascript(&title, &body);
+        }
+
         if write_response(&mut stream, POST_STATUS_OK, id).is_err() {
             return;
         }
     }
+}
+
+/// Surface a notification through macOS's
+/// NotificationCenter using `osascript`. Per-process
+/// override env var: `INSULA_PRAECOD_OSASCRIPT_BIN`
+/// lets tests point at a stub.
+///
+/// osascript escapes: inside an `"..."` literal, AppleScript
+/// uses `\"` for embedded quotes and `\\` for backslashes;
+/// it does not interpret other backslash escapes (so a
+/// stray `\n` in the body shows up literally). For v0 we
+/// just sanitize: replace `"` with `'` and drop control
+/// chars, then wrap.
+fn deliver_osascript(title: &str, body: &str) {
+    let bin = std::env::var("INSULA_PRAECOD_OSASCRIPT_BIN")
+        .unwrap_or_else(|_| "/usr/bin/osascript".to_string());
+    let safe_title = sanitize_for_osa(title);
+    let safe_body = sanitize_for_osa(body);
+    let script = format!(
+        "display notification \"{}\" with title \"{}\"",
+        safe_body, safe_title,
+    );
+    let _ = std::process::Command::new(bin)
+        .arg("-e").arg(&script)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+fn sanitize_for_osa(s: &str) -> String {
+    s.chars().filter_map(|c| match c {
+        '"' => Some('\''),
+        '\\' => Some('/'),
+        c if c.is_control() => None,
+        c => Some(c),
+    }).collect()
 }
 
 fn decode_post(payload: &[u8]) -> Option<(&'static str, String, String)> {
@@ -271,6 +317,9 @@ requests and appends each notification to a log file.
 
 Environment:
   INSULA_PRAECOD_SOCKET     listen path
-  INSULA_PRAECOD_LOG_FILE   output log file"
+  INSULA_PRAECOD_LOG_FILE   output log file
+  INSULA_PRAECOD_BACKEND    'file' (default) or 'osascript' (delivers
+                            to macOS NotificationCenter via osascript)
+  INSULA_PRAECOD_OSASCRIPT_BIN override path to osascript (tests)"
     );
 }
