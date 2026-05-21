@@ -1603,6 +1603,39 @@ fn translate_inst(
                         next_value_id, insts, source_spirv_offset)?;
                     Op::FAbs(x)
                 }
+                5 => {
+                    // SAbs(x) -- integer absolute value.
+                    // Standard branchless idiom:
+                    //   m = x >> 31  (arithmetic; all-bits-set if x<0, 0 if x>=0)
+                    //   result = (x ^ m) - m
+                    // Synthesised via existing IR ops.
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let push = |op: Op, ty: Type,
+                                insts: &mut Vec<Inst>,
+                                next_value_id: &mut u32| -> Value {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let v = Value { id, ty };
+                        insts.push(Inst { op, result: Some(v.clone()),
+                            source_spirv_offset });
+                        v
+                    };
+                    let c31 = push(
+                        Op::ConstInt {
+                            value: 31,
+                            kind: atrium_spv_ir::IntKind::U32,
+                        },
+                        Type::U32, insts, next_value_id);
+                    let mask = push(
+                        Op::AShr(x.clone(), c31), result_ty.clone(),
+                        insts, next_value_id);
+                    let xored = push(
+                        Op::BitXor(x, mask.clone()), result_ty.clone(),
+                        insts, next_value_id);
+                    Op::ISub(xored, mask)
+                }
                 8 => {
                     let x_id = expect_id(&spv_inst.operands, 2)?;
                     let x = resolve_value(x_id, types, constants, id_map,

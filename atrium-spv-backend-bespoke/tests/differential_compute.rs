@@ -1933,6 +1933,67 @@ fn differential_glsl_length_and_distance() {
 }
 
 #[test]
+fn differential_glsl_sabs() {
+    // sabs(-5) = 5; sabs(7) = 7; sabs(0) = 0.
+    // Synthesised via (x XOR (x>>31)) - (x>>31).
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let std_450 = b.ext_inst_import("GLSL.std.450");
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let void_fn = b.type_function(void, vec![]);
+    let rt_arr = b.type_runtime_array(u32_ty);
+    b.decorate(rt_arr, Decoration::ArrayStride, vec![rspirv::dr::Operand::LiteralBit32(4)]);
+    let s = b.type_struct(vec![rt_arr]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_u = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+    let ssbo  = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    // -5 as u32: 0xFFFFFFFB.  +7 unchanged.
+    let c_neg5 = b.constant_bit32(u32_ty, (-5i32) as u32);
+    let c_pos7 = b.constant_bit32(u32_ty, 7);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let abs_neg5 = b.ext_inst(u32_ty, None, std_450, 5,
+        vec![rspirv::dr::Operand::IdRef(c_neg5)]).unwrap();
+    let abs_pos7 = b.ext_inst(u32_ty, None, std_450, 5,
+        vec![rspirv::dr::Operand::IdRef(c_pos7)]).unwrap();
+    let d0 = b.access_chain(ptr_u, None, ssbo, vec![c_zero, c_zero]).unwrap();
+    b.store(d0, abs_neg5, None, vec![]).unwrap();
+    let c_one = b.constant_bit32(u32_ty, 1);
+    let d1 = b.access_chain(ptr_u, None, ssbo, vec![c_zero, c_one]).unwrap();
+    b.store(d1, abs_pos7, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spv = Vec::with_capacity(words.len() * 4);
+    for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+    let dir = TempDir::new().unwrap();
+    let mut b_buf = vec![0u8; 16];
+    let mut c_buf = vec![0u8; 16];
+    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    assert_eq!(b_buf, c_buf, "diverge on sabs");
+    let v0 = u32::from_le_bytes(b_buf[0..4].try_into().unwrap());
+    let v1 = u32::from_le_bytes(b_buf[4..8].try_into().unwrap());
+    assert_eq!(v0, 5, "sabs(-5) = 5");
+    assert_eq!(v1, 7, "sabs(7)  = 7");
+}
+
+#[test]
 fn differential_glsl_inversesqrt() {
     // inverseSqrt(4.0) = 1/2 = 0.5.
     use rspirv::binary::Assemble;
