@@ -18,6 +18,60 @@
 
 use atrium_spv_backend_bespoke::{compile_blob, Target};
 use atrium_spv_frontend::translate;
+use std::path::PathBuf;
+use std::process::Command;
+
+/// Locate the just-built atrium-spv-compile binary alongside
+/// this test's deps/ dir.
+fn locate_spv_compile() -> PathBuf {
+    let here = std::env::current_exe().expect("current_exe");
+    let mut p = here;
+    p.pop(); p.pop(); p.pop(); p.pop(); p.pop();
+    p.push("atrium-spv-compile");
+    p.push("target");
+    p.push("debug");
+    p.push("atrium-spv-compile");
+    assert!(p.exists(), "atrium-spv-compile not at {}", p.display());
+    p
+}
+
+/// Invoke atrium-spv-compile against `spv` bytes and parse
+/// the JSON report's backend field.  Returns Err on
+/// compilation failure (which atrium-spv-compile would
+/// surface to the daemon as a fallback signal too).
+fn invoked_backend(spv: &[u8]) -> Result<String, String> {
+    let tmp = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let input_path = tmp.path().join("in.spv");
+    std::fs::write(&input_path, spv).map_err(|e| e.to_string())?;
+    let target = if cfg!(target_os = "macos") {
+        "aarch64-apple-darwin"
+    } else {
+        "aarch64-unknown-freebsd"
+    };
+    let out = Command::new(locate_spv_compile())
+        .arg("--input").arg(&input_path)
+        .arg("--output-dir").arg(tmp.path())
+        .arg("--target").arg(target)
+        .arg("--hash").arg("deadbeef")
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(format!("atrium-spv-compile exit code {:?}: stderr={} stdout={}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr),
+            String::from_utf8_lossy(&out.stdout)));
+    }
+    // The JSON report goes to stderr (per main.rs G7 metrics
+    // convention).  Hand-parse for `"backend":"NAME"`.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let needle = "\"backend\":\"";
+    let i = stderr.find(needle).ok_or_else(||
+        format!("no backend field in stderr: {stderr}"))?;
+    let rest = &stderr[i + needle.len()..];
+    let end = rest.find('"').ok_or_else(||
+        "unterminated backend field".to_string())?;
+    Ok(rest[..end].to_string())
+}
 
 fn build_empty_cs() -> Vec<u8> {
     use rspirv::binary::Assemble;
@@ -253,6 +307,34 @@ fn bespoke_compiles_gid_with_local_size_4() {
                  with LocalSize=4 -- exercises the mul+add path that folds \
                  LocalSize into the GID formula");
     assert!(!out.blob.is_empty());
+}
+
+#[test]
+fn spv_compile_picks_bespoke_for_supported_compute_shaders() {
+    // Production selection logic: atrium-spv-compile tries
+    // bespoke first, falls back to Cranelift on Unsupported.
+    // After the bespoke compute foundation + Op::LoadBuiltin
+    // + Op::Store + GID-with-LocalSize + lid.z patch series,
+    // these shaders all compile through bespoke directly.
+    // This test invokes the real production binary and parses
+    // its JSON report.
+
+    // Skip on non-aarch64 hosts: bespoke is ARM64-only.
+    if !cfg!(target_arch = "aarch64") {
+        return;
+    }
+
+    for (name, spv) in [
+        ("empty",      build_empty_cs()),
+        ("ssbo_vec4",  build_ssbo_vec4_cs([1.0, 2.0, 3.0, 4.0])),
+        ("lid_mul",    build_lid_mul_cs()),
+        ("gid_ls4",    build_gid_cs(4)),
+    ] {
+        let backend = invoked_backend(&spv)
+            .unwrap_or_else(|e| panic!("compile failed for {name}: {e}"));
+        assert_eq!(backend, "bespoke",
+            "{name} should compile through bespoke, got {backend}");
+    }
 }
 
 #[test]
