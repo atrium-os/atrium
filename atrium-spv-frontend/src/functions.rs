@@ -1655,192 +1655,45 @@ fn translate_inst(
                     Op::FTrunc(x)
                 }
                 13 => {
-                    // Sin(x): 7-term Horner-form polynomial
-                    // approximation accurate to ~6 ULPs on
-                    // [-π/2, π/2].  Outside that range,
-                    // accuracy degrades quickly -- callers
-                    // should range-reduce.  A full domain-
-                    // reduction lowering (x_reduced = ...,
-                    // sign tracking) is a follow-up.
-                    //
-                    //   x2 = x*x
-                    //   p  = -1/5040
-                    //   p  = p*x2 + 1/120
-                    //   p  = p*x2 - 1/6
-                    //   p  = p*x2 + 1
-                    //   sin = p * x
+                    // Sin(x): range-reduce to [-π/2, π/2] then
+                    // evaluate 4-term Horner Taylor polynomial
+                    // and apply parity sign.  See
+                    // synth_trig_reduce / synth_sin_poly.
                     let x_id = expect_id(&spv_inst.operands, 2)?;
                     let x = resolve_value(x_id, types, constants, id_map,
                         next_value_id, insts, source_spirv_offset)?;
-                    let push = |op: Op, ty: Type,
-                                insts: &mut Vec<Inst>,
-                                next_value_id: &mut u32| -> Value {
-                        let id = ValueId(*next_value_id);
-                        *next_value_id += 1;
-                        let v = Value { id, ty };
-                        insts.push(Inst { op, result: Some(v.clone()),
-                            source_spirv_offset });
-                        v
-                    };
-                    let kfp = atrium_spv_ir::FloatKind::F32;
-                    let cf = |val: f64, insts: &mut Vec<Inst>, next_value_id: &mut u32|
-                                 -> Value {
-                        let id = ValueId(*next_value_id);
-                        *next_value_id += 1;
-                        let v = Value { id, ty: Type::F32 };
-                        insts.push(Inst {
-                            op: Op::ConstFloat { value: val, kind: kfp },
-                            result: Some(v.clone()),
-                            source_spirv_offset,
-                        });
-                        v
-                    };
-                    let x2 = push(Op::FMul(x.clone(), x.clone()),
-                        Type::F32, insts, next_value_id);
-                    let c_inv5040 = cf(-1.0 / 5040.0, insts, next_value_id);
-                    let c_inv120  = cf( 1.0 /  120.0, insts, next_value_id);
-                    let c_neg_inv6 = cf(-1.0 / 6.0, insts, next_value_id);
-                    let c_one  = cf(1.0, insts, next_value_id);
-                    // p = c_inv5040 * x2 + c_inv120
-                    let p1 = push(Op::FMul(c_inv5040, x2.clone()),
-                        Type::F32, insts, next_value_id);
-                    let p2 = push(Op::FAdd(p1, c_inv120),
-                        Type::F32, insts, next_value_id);
-                    // p = p * x2 + c_neg_inv6
-                    let p3 = push(Op::FMul(p2, x2.clone()),
-                        Type::F32, insts, next_value_id);
-                    let p4 = push(Op::FAdd(p3, c_neg_inv6),
-                        Type::F32, insts, next_value_id);
-                    // p = p * x2 + 1
-                    let p5 = push(Op::FMul(p4, x2),
-                        Type::F32, insts, next_value_id);
-                    let p6 = push(Op::FAdd(p5, c_one),
-                        Type::F32, insts, next_value_id);
-                    // sin = p * x
-                    Op::FMul(p6, x)
+                    let (x_red, sign) = synth_trig_reduce(
+                        x, source_spirv_offset, insts, next_value_id);
+                    let sin = synth_sin_poly(
+                        x_red, source_spirv_offset, insts, next_value_id);
+                    Op::FMul(sin, sign)
                 }
                 15 => {
-                    // Tan(x) ≡ sin(x) / cos(x).  Frontend
-                    // emits Sin via the enum-13 arm pattern,
-                    // Cos via enum-14, then FDiv.  To avoid
-                    // duplicating the polynomial code, we
-                    // inline the Sin and Cos expansions here
-                    // sharing the x² compute.
+                    // Tan(x) ≡ sin(x_red) / cos(x_red).  Parity
+                    // signs cancel in the quotient, so the
+                    // reduction's sign output is discarded.
                     let x_id = expect_id(&spv_inst.operands, 2)?;
                     let x = resolve_value(x_id, types, constants, id_map,
                         next_value_id, insts, source_spirv_offset)?;
-                    let push = |op: Op, ty: Type,
-                                insts: &mut Vec<Inst>,
-                                next_value_id: &mut u32| -> Value {
-                        let id = ValueId(*next_value_id);
-                        *next_value_id += 1;
-                        let v = Value { id, ty };
-                        insts.push(Inst { op, result: Some(v.clone()),
-                            source_spirv_offset });
-                        v
-                    };
-                    let kfp = atrium_spv_ir::FloatKind::F32;
-                    let cf = |val: f64, insts: &mut Vec<Inst>, next_value_id: &mut u32|
-                                 -> Value {
-                        let id = ValueId(*next_value_id);
-                        *next_value_id += 1;
-                        let v = Value { id, ty: Type::F32 };
-                        insts.push(Inst {
-                            op: Op::ConstFloat { value: val, kind: kfp },
-                            result: Some(v.clone()),
-                            source_spirv_offset,
-                        });
-                        v
-                    };
-                    let x2 = push(Op::FMul(x.clone(), x.clone()),
-                        Type::F32, insts, next_value_id);
-                    // Sin Horner
-                    let c_inv5040 = cf(-1.0 / 5040.0, insts, next_value_id);
-                    let c_inv120  = cf( 1.0 /  120.0, insts, next_value_id);
-                    let c_neg_inv6 = cf(-1.0 / 6.0, insts, next_value_id);
-                    let c_one_s  = cf(1.0, insts, next_value_id);
-                    let s1 = push(Op::FMul(c_inv5040, x2.clone()), Type::F32, insts, next_value_id);
-                    let s2 = push(Op::FAdd(s1, c_inv120),           Type::F32, insts, next_value_id);
-                    let s3 = push(Op::FMul(s2, x2.clone()),         Type::F32, insts, next_value_id);
-                    let s4 = push(Op::FAdd(s3, c_neg_inv6),         Type::F32, insts, next_value_id);
-                    let s5 = push(Op::FMul(s4, x2.clone()),         Type::F32, insts, next_value_id);
-                    let s6 = push(Op::FAdd(s5, c_one_s),            Type::F32, insts, next_value_id);
-                    let sin = push(Op::FMul(s6, x),                 Type::F32, insts, next_value_id);
-                    // Cos Horner
-                    let c_inv40320 = cf(1.0 / 40320.0, insts, next_value_id);
-                    let c_neg_inv720 = cf(-1.0 / 720.0, insts, next_value_id);
-                    let c_inv24 = cf(1.0 / 24.0, insts, next_value_id);
-                    let c_neg_half = cf(-0.5, insts, next_value_id);
-                    let c_one_c = cf(1.0, insts, next_value_id);
-                    let k1 = push(Op::FMul(c_inv40320, x2.clone()), Type::F32, insts, next_value_id);
-                    let k2 = push(Op::FAdd(k1, c_neg_inv720),       Type::F32, insts, next_value_id);
-                    let k3 = push(Op::FMul(k2, x2.clone()),         Type::F32, insts, next_value_id);
-                    let k4 = push(Op::FAdd(k3, c_inv24),            Type::F32, insts, next_value_id);
-                    let k5 = push(Op::FMul(k4, x2.clone()),         Type::F32, insts, next_value_id);
-                    let k6 = push(Op::FAdd(k5, c_neg_half),         Type::F32, insts, next_value_id);
-                    let k7 = push(Op::FMul(k6, x2),                 Type::F32, insts, next_value_id);
-                    let cos = push(Op::FAdd(k7, c_one_c),           Type::F32, insts, next_value_id);
+                    let (x_red, _sign) = synth_trig_reduce(
+                        x, source_spirv_offset, insts, next_value_id);
+                    let sin = synth_sin_poly(
+                        x_red.clone(), source_spirv_offset, insts, next_value_id);
+                    let cos = synth_cos_poly(
+                        x_red, source_spirv_offset, insts, next_value_id);
                     Op::FDiv(sin, cos)
                 }
                 14 => {
-                    // Cos(x): 8-term Horner-form polynomial
-                    // accurate to ~6 ULPs on [-π/2, π/2].
-                    //
-                    //   x2 = x*x
-                    //   p  = 1/40320
-                    //   p  = p*x2 - 1/720
-                    //   p  = p*x2 + 1/24
-                    //   p  = p*x2 - 1/2
-                    //   p  = p*x2 + 1
-                    //   cos = p
+                    // Cos(x): range-reduce + 5-term Horner Taylor
+                    // polynomial + parity sign.
                     let x_id = expect_id(&spv_inst.operands, 2)?;
                     let x = resolve_value(x_id, types, constants, id_map,
                         next_value_id, insts, source_spirv_offset)?;
-                    let push = |op: Op, ty: Type,
-                                insts: &mut Vec<Inst>,
-                                next_value_id: &mut u32| -> Value {
-                        let id = ValueId(*next_value_id);
-                        *next_value_id += 1;
-                        let v = Value { id, ty };
-                        insts.push(Inst { op, result: Some(v.clone()),
-                            source_spirv_offset });
-                        v
-                    };
-                    let kfp = atrium_spv_ir::FloatKind::F32;
-                    let cf = |val: f64, insts: &mut Vec<Inst>, next_value_id: &mut u32|
-                                 -> Value {
-                        let id = ValueId(*next_value_id);
-                        *next_value_id += 1;
-                        let v = Value { id, ty: Type::F32 };
-                        insts.push(Inst {
-                            op: Op::ConstFloat { value: val, kind: kfp },
-                            result: Some(v.clone()),
-                            source_spirv_offset,
-                        });
-                        v
-                    };
-                    let x2 = push(Op::FMul(x.clone(), x),
-                        Type::F32, insts, next_value_id);
-                    let c_inv40320 = cf(1.0 / 40320.0, insts, next_value_id);
-                    let c_neg_inv720 = cf(-1.0 / 720.0, insts, next_value_id);
-                    let c_inv24 = cf(1.0 / 24.0, insts, next_value_id);
-                    let c_neg_half = cf(-0.5, insts, next_value_id);
-                    let c_one = cf(1.0, insts, next_value_id);
-                    let p1 = push(Op::FMul(c_inv40320, x2.clone()),
-                        Type::F32, insts, next_value_id);
-                    let p2 = push(Op::FAdd(p1, c_neg_inv720),
-                        Type::F32, insts, next_value_id);
-                    let p3 = push(Op::FMul(p2, x2.clone()),
-                        Type::F32, insts, next_value_id);
-                    let p4 = push(Op::FAdd(p3, c_inv24),
-                        Type::F32, insts, next_value_id);
-                    let p5 = push(Op::FMul(p4, x2.clone()),
-                        Type::F32, insts, next_value_id);
-                    let p6 = push(Op::FAdd(p5, c_neg_half),
-                        Type::F32, insts, next_value_id);
-                    let p7 = push(Op::FMul(p6, x2),
-                        Type::F32, insts, next_value_id);
-                    Op::FAdd(p7, c_one)
+                    let (x_red, sign) = synth_trig_reduce(
+                        x, source_spirv_offset, insts, next_value_id);
+                    let cos = synth_cos_poly(
+                        x_red, source_spirv_offset, insts, next_value_id);
+                    Op::FMul(cos, sign)
                 }
                 31 => {
                     let x_id = expect_id(&spv_inst.operands, 2)?;
@@ -2664,6 +2517,138 @@ fn fresh_value(ty: Type, next_value_id: &mut u32) -> Value {
     let id = ValueId(*next_value_id);
     *next_value_id += 1;
     Value { id, ty }
+}
+
+/// Push a new instruction producing an f32 result.
+fn push_f32(
+    op: Op,
+    source_spirv_offset: u32,
+    insts: &mut Vec<Inst>,
+    next_value_id: &mut u32,
+) -> Value {
+    let id = ValueId(*next_value_id);
+    *next_value_id += 1;
+    let v = Value { id, ty: Type::F32 };
+    insts.push(Inst { op, result: Some(v.clone()), source_spirv_offset });
+    v
+}
+
+/// Emit an f32 ConstFloat.
+fn push_cf(
+    val: f64,
+    source_spirv_offset: u32,
+    insts: &mut Vec<Inst>,
+    next_value_id: &mut u32,
+) -> Value {
+    push_f32(
+        Op::ConstFloat { value: val, kind: atrium_spv_ir::FloatKind::F32 },
+        source_spirv_offset, insts, next_value_id,
+    )
+}
+
+/// Range-reduce x to x_red ∈ [-π/2, π/2] for trig polynomials.
+///
+/// Returns (x_red, sign) where:
+///   k     = floor(x/π + 0.5)        // round-to-nearest integer
+///   x_red = x - k*π                 // ∈ [-π/2, π/2]
+///   sign  = (-1)^k                  // 1.0 or -1.0
+///
+/// sin(x) = sin(x_red) * sign;  cos(x) = cos(x_red) * sign.
+/// For tan, signs cancel in the quotient.
+fn synth_trig_reduce(
+    x: Value,
+    source_spirv_offset: u32,
+    insts: &mut Vec<Inst>,
+    next_value_id: &mut u32,
+) -> (Value, Value) {
+    use std::f64::consts::PI;
+    let c_inv_pi = push_cf(1.0 / PI, source_spirv_offset, insts, next_value_id);
+    let c_pi     = push_cf(PI,        source_spirv_offset, insts, next_value_id);
+    let c_half   = push_cf(0.5,       source_spirv_offset, insts, next_value_id);
+    let c_neg_two = push_cf(-2.0,     source_spirv_offset, insts, next_value_id);
+    let c_one    = push_cf(1.0,       source_spirv_offset, insts, next_value_id);
+    let c_neg_two_b = push_cf(-2.0,   source_spirv_offset, insts, next_value_id);
+    let c_half_b = push_cf(0.5,       source_spirv_offset, insts, next_value_id);
+    // x_over_pi = x * (1/π)
+    let x_over_pi = push_f32(Op::FMul(x.clone(), c_inv_pi),
+        source_spirv_offset, insts, next_value_id);
+    // shifted = x_over_pi + 0.5
+    let shifted = push_f32(Op::FAdd(x_over_pi, c_half),
+        source_spirv_offset, insts, next_value_id);
+    // k = floor(shifted)
+    let k = push_f32(Op::FFloor(shifted),
+        source_spirv_offset, insts, next_value_id);
+    // k_pi = k * π
+    let k_pi = push_f32(Op::FMul(k.clone(), c_pi),
+        source_spirv_offset, insts, next_value_id);
+    // x_red = x - k_pi
+    let x_red = push_f32(Op::FSub(x, k_pi),
+        source_spirv_offset, insts, next_value_id);
+    // half_k = floor(k * 0.5)
+    let half_k_in = push_f32(Op::FMul(k.clone(), c_half_b),
+        source_spirv_offset, insts, next_value_id);
+    let half_k = push_f32(Op::FFloor(half_k_in),
+        source_spirv_offset, insts, next_value_id);
+    // parity = k - 2*half_k  ∈ {0.0, 1.0}
+    let two_half_k = push_f32(Op::FMul(half_k, c_neg_two),
+        source_spirv_offset, insts, next_value_id);
+    // FAdd(k, -2*half_k)  ≡  k - 2*half_k
+    let parity = push_f32(Op::FAdd(k, two_half_k),
+        source_spirv_offset, insts, next_value_id);
+    // sign = 1 - 2*parity = 1 + (-2)*parity
+    let neg_two_parity = push_f32(Op::FMul(parity, c_neg_two_b),
+        source_spirv_offset, insts, next_value_id);
+    let sign = push_f32(Op::FAdd(c_one, neg_two_parity),
+        source_spirv_offset, insts, next_value_id);
+    (x_red, sign)
+}
+
+/// 4-term Horner-form sin Taylor polynomial on x ∈ [-π/2, π/2].
+///   p = -1/5040, then p = p*x²+1/120, p = p*x²-1/6, p = p*x²+1
+///   sin = p * x
+fn synth_sin_poly(
+    x: Value,
+    source_spirv_offset: u32,
+    insts: &mut Vec<Inst>,
+    next_value_id: &mut u32,
+) -> Value {
+    let x2 = push_f32(Op::FMul(x.clone(), x.clone()),
+        source_spirv_offset, insts, next_value_id);
+    let c_inv5040 = push_cf(-1.0 / 5040.0, source_spirv_offset, insts, next_value_id);
+    let c_inv120  = push_cf( 1.0 /  120.0, source_spirv_offset, insts, next_value_id);
+    let c_neg_inv6 = push_cf(-1.0 / 6.0,    source_spirv_offset, insts, next_value_id);
+    let c_one     = push_cf(1.0,            source_spirv_offset, insts, next_value_id);
+    let p1 = push_f32(Op::FMul(c_inv5040, x2.clone()), source_spirv_offset, insts, next_value_id);
+    let p2 = push_f32(Op::FAdd(p1, c_inv120),          source_spirv_offset, insts, next_value_id);
+    let p3 = push_f32(Op::FMul(p2, x2.clone()),        source_spirv_offset, insts, next_value_id);
+    let p4 = push_f32(Op::FAdd(p3, c_neg_inv6),        source_spirv_offset, insts, next_value_id);
+    let p5 = push_f32(Op::FMul(p4, x2),                source_spirv_offset, insts, next_value_id);
+    let p6 = push_f32(Op::FAdd(p5, c_one),             source_spirv_offset, insts, next_value_id);
+    push_f32(Op::FMul(p6, x), source_spirv_offset, insts, next_value_id)
+}
+
+/// 5-term Horner-form cos Taylor polynomial on x ∈ [-π/2, π/2].
+///   p = 1/40320, then p = p*x²-1/720, p = p*x²+1/24, p = p*x²-1/2, p = p*x²+1
+fn synth_cos_poly(
+    x: Value,
+    source_spirv_offset: u32,
+    insts: &mut Vec<Inst>,
+    next_value_id: &mut u32,
+) -> Value {
+    let x2 = push_f32(Op::FMul(x.clone(), x), source_spirv_offset, insts, next_value_id);
+    let c_inv40320   = push_cf( 1.0 / 40320.0, source_spirv_offset, insts, next_value_id);
+    let c_neg_inv720 = push_cf(-1.0 /   720.0, source_spirv_offset, insts, next_value_id);
+    let c_inv24      = push_cf( 1.0 /    24.0, source_spirv_offset, insts, next_value_id);
+    let c_neg_half   = push_cf(-0.5,           source_spirv_offset, insts, next_value_id);
+    let c_one        = push_cf( 1.0,           source_spirv_offset, insts, next_value_id);
+    let p1 = push_f32(Op::FMul(c_inv40320, x2.clone()), source_spirv_offset, insts, next_value_id);
+    let p2 = push_f32(Op::FAdd(p1, c_neg_inv720),       source_spirv_offset, insts, next_value_id);
+    let p3 = push_f32(Op::FMul(p2, x2.clone()),         source_spirv_offset, insts, next_value_id);
+    let p4 = push_f32(Op::FAdd(p3, c_inv24),            source_spirv_offset, insts, next_value_id);
+    let p5 = push_f32(Op::FMul(p4, x2.clone()),         source_spirv_offset, insts, next_value_id);
+    let p6 = push_f32(Op::FAdd(p5, c_neg_half),         source_spirv_offset, insts, next_value_id);
+    let p7 = push_f32(Op::FMul(p6, x2),                 source_spirv_offset, insts, next_value_id);
+    push_f32(Op::FAdd(p7, c_one), source_spirv_offset, insts, next_value_id)
 }
 
 fn expect_id(operands: &[Operand], i: usize) -> Result<Word, FrontendError> {

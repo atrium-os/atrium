@@ -2201,6 +2201,104 @@ fn differential_glsl_sin_cos() {
 }
 
 #[test]
+fn differential_glsl_sin_cos_extended_range() {
+    // Range-reduction validation: sin/cos at arguments well
+    // outside the polynomial's native [-π/2, π/2] domain.
+    // The frontend reduces x to x_red ∈ [-π/2, π/2] modulo π
+    // and flips sign on odd quadrants.
+    //
+    //   sin(π)     ≈  0       cos(π)     = -1
+    //   sin(3π/2)  ≈ -1       cos(2π)    ≈  1
+    //   sin(2π)    ≈  0       cos(5π/2)  ≈  0
+    //   sin(-π/2)  = -1       cos(-π)    = -1
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let std_450 = b.ext_inst_import("GLSL.std.450");
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let f32_ty = b.type_float(32, None);
+    let void_fn = b.type_function(void, vec![]);
+    let rt_arr = b.type_runtime_array(f32_ty);
+    b.decorate(rt_arr, Decoration::ArrayStride, vec![rspirv::dr::Operand::LiteralBit32(4)]);
+    let s = b.type_struct(vec![rt_arr]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_f = b.type_pointer(None, StorageClass::StorageBuffer, f32_ty);
+    let ssbo  = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    use std::f32::consts::PI;
+    let inputs = [
+        PI,            // sin op + cos op
+        3.0 * PI / 2.0,
+        2.0 * PI,
+        5.0 * PI / 2.0,
+        -PI / 2.0,
+        -PI,
+    ];
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let mut results: Vec<u32> = Vec::new();
+    for &val in &inputs {
+        let c = b.constant_bit32(f32_ty, val.to_bits());
+        let s = b.ext_inst(f32_ty, None, std_450, 13,
+            vec![rspirv::dr::Operand::IdRef(c)]).unwrap();
+        let cs = b.ext_inst(f32_ty, None, std_450, 14,
+            vec![rspirv::dr::Operand::IdRef(c)]).unwrap();
+        results.push(s);
+        results.push(cs);
+    }
+    for (i, v) in results.iter().enumerate() {
+        let ci = b.constant_bit32(u32_ty, i as u32);
+        let d = b.access_chain(ptr_f, None, ssbo, vec![c_zero, ci]).unwrap();
+        b.store(d, *v, None, vec![]).unwrap();
+    }
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spv = Vec::with_capacity(words.len() * 4);
+    for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+    let dir = TempDir::new().unwrap();
+    let n = inputs.len() * 2;
+    let mut b_buf = vec![0u8; n * 4];
+    let mut c_buf = vec![0u8; n * 4];
+    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    assert_eq!(b_buf, c_buf, "diverge on sin/cos extended range");
+    let read = |i: usize| -> f32 {
+        f32::from_le_bytes(b_buf[i*4..i*4+4].try_into().unwrap())
+    };
+    let tol = 2e-3;
+    let expected = [
+        (PI,            0.0,  -1.0),
+        (3.0*PI/2.0,   -1.0,   0.0),
+        (2.0*PI,        0.0,   1.0),
+        (5.0*PI/2.0,    1.0,   0.0),
+        (-PI/2.0,      -1.0,   0.0),
+        (-PI,           0.0,  -1.0),
+    ];
+    for (i, (x, esin, ecos)) in expected.iter().enumerate() {
+        let got_s = read(i*2);
+        let got_c = read(i*2 + 1);
+        assert!((got_s - esin).abs() < tol,
+            "sin({}) ≈ {} (got {})", x, esin, got_s);
+        assert!((got_c - ecos).abs() < tol,
+            "cos({}) ≈ {} (got {})", x, ecos, got_c);
+    }
+}
+
+#[test]
 fn differential_glsl_inversesqrt() {
     // inverseSqrt(4.0) = 1/2 = 0.5.
     use rspirv::binary::Assemble;

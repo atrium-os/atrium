@@ -972,9 +972,11 @@ specifically supports:
   Ceil, Trunc, Fract, FSign, FMod, Sqrt, InverseSqrt,
   FMin, FMax, FClamp, FMix, Step, SmoothStep, Length,
   Distance, Normalize, Reflect, Cross, Sin, Cos, Tan
-  (Sin/Cos/Tan via Horner-form Taylor polynomial accurate
-  on [-π/2, π/2]; range reduction is the caller's
-  responsibility today).  Exp/log queued.
+  (Sin/Cos/Tan via Horner-form Taylor polynomial on a
+  range-reduced argument: frontend reduces x to
+  x_red ∈ [-π/2, π/2] modulo π and applies the (-1)^k
+  parity sign, so the full real line is accepted at ~6
+  ULPs near the reduced domain).  Exp/log queued.
 
 **Bespoke backend (atrium-spv-backend-bespoke):**
 
