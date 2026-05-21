@@ -18,6 +18,7 @@
 //! ```
 
 mod daemons;
+mod push;
 mod signing;
 use daemons::Daemon;
 
@@ -47,6 +48,7 @@ fn main() -> ExitCode {
         "sign" => signing::cmd_sign(&args[2..]),
         "publishers" => signing::cmd_publishers(&args[2..], &install_root),
         "bundle" => cmd_bundle(&args[2..]),
+        "push" => push::cmd_push(&args[2..], &install_root),
         "help" | "-h" | "--help" => {
             print_usage();
             Ok(())
@@ -89,6 +91,9 @@ Commands:
   publishers remove <id>           Remove a trusted publisher.
   bundle <src-dir> <out.insula>    Pack a bundle directory into a
                                    single-file `.insula` archive.
+  push subscribe <purpose>         Subscribe to push delivery.
+  push list                        Show active push subscriptions.
+  push unsubscribe <key_id>        Remove a push subscription.
   help                    Show this help.
 
 Flags:

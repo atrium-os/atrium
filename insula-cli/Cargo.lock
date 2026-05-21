@@ -9,6 +9,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "aqueduct"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "sha2",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -227,6 +235,7 @@ dependencies = [
 name = "insula-cli"
 version = "0.1.0"
 dependencies = [
+ "aqueduct",
  "ed25519-dalek",
  "insula-bundle",
  "insula-host-macos",

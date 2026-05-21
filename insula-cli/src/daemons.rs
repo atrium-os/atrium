@@ -245,3 +245,24 @@ pub fn socket_if_running(install_root: &Path, d: Daemon) -> Option<PathBuf> {
         None
     }
 }
+
+/// Make sure the daemon is running, starting it if not.
+/// Returns the socket path on success, `None` if the
+/// daemon binary couldn't be located or failed to spawn.
+///
+/// Used by subcommands that want to talk to a daemon
+/// directly (e.g. `insula push subscribe`) without
+/// imposing a "you must run `insula daemons up` first"
+/// step on the user.
+pub fn ensure_started(install_root: &Path, d: Daemon) -> Option<PathBuf> {
+    if let Some(p) = socket_if_running(install_root, d) {
+        return Some(p);
+    }
+    start(install_root, d).ok()?;
+    let paths = paths_for(install_root, d);
+    if paths.socket.exists() {
+        Some(paths.socket)
+    } else {
+        None
+    }
+}
