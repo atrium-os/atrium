@@ -4,7 +4,7 @@
 //! preserves unknown sections in `extra`, roundtrips
 //! cleanly.
 
-use insula_manifest::{BundleForm, Error, Manifest};
+use insula_manifest::{BundleForm, Error, InputPolicy, Manifest};
 
 const EXAMPLE_NATIVE: &str = r#"
 [app]
@@ -40,19 +40,43 @@ form = "native"
 arches = ["aarch64-freebsd"]
 entry = "bin/weather"
 
-# Sections not yet typed in this v0 — preserved in `extra`.
-
-[render]
-fresco = true
-
+# A section not yet typed — should land in `extra`.
 [network]
 hosts = [
   { name = "api.weather.example.com", port = 443, proto = "tcp" },
 ]
+"#;
+
+const EXAMPLE_FULL_TYPED_SECTIONS: &str = r#"
+[app]
+name = "com.example.weather"
+version = "1.2.3"
+sdk-version = "1.x"
+
+[bundle]
+form = "native"
+arches = ["aarch64-freebsd"]
+entry = "bin/weather"
+
+[render]
+fresco = true
+
+[input]
+keyboard = "focus"
+pointer = "always"
+
+[ipc]
+services = ["fresco-protocol", "clipboard"]
 
 [storage]
+data = "100MB"
+cache = "1GB"
 namespace = "com.example.weather"
-quota = "100MB"
+
+[compute]
+cpu = "100ms/s"
+rss = "256MB"
+wall = "unbounded"
 "#;
 
 #[test]
@@ -91,11 +115,11 @@ fn permissive_mode_preserves_unknown_sections() {
     assert_eq!(m.app.name, "com.example.weather");
     assert_eq!(m.bundle.form, BundleForm::Native);
 
-    // The unknown sections are preserved verbatim.
-    assert!(m.extra.contains_key("render"));
+    // The not-yet-typed sections are preserved verbatim.
+    // (As more sections get promoted to typed fields,
+    // this test's example will shrink accordingly.)
     assert!(m.extra.contains_key("network"));
-    assert!(m.extra.contains_key("storage"));
-    assert_eq!(m.extra.len(), 3);
+    assert_eq!(m.extra.len(), 1);
 }
 
 #[test]
@@ -103,9 +127,7 @@ fn strict_mode_rejects_unknown_sections() {
     let result = Manifest::parse_strict(EXAMPLE_WITH_EXTRA_SECTIONS);
     match result {
         Err(Error::UnknownSections(sections)) => {
-            assert!(sections.contains(&"render".to_string()));
             assert!(sections.contains(&"network".to_string()));
-            assert!(sections.contains(&"storage".to_string()));
         }
         other => panic!("expected UnknownSections error, got {:?}", other),
     }
@@ -146,6 +168,58 @@ version = "1.0.0"
 sdk-version = "1.x"
 "#;
     assert!(Manifest::parse(bad).is_err());
+}
+
+#[test]
+fn parses_all_typed_sections() {
+    let m = Manifest::parse(EXAMPLE_FULL_TYPED_SECTIONS)
+        .expect("manifest with all typed sections should parse");
+
+    let render = m.render.as_ref().expect("[render] should be present");
+    assert!(render.fresco);
+
+    let input = m.input.as_ref().expect("[input] should be present");
+    assert_eq!(input.keyboard, InputPolicy::Focus);
+    assert_eq!(input.pointer, InputPolicy::Always);
+
+    let ipc = m.ipc.as_ref().expect("[ipc] should be present");
+    assert_eq!(ipc.services, vec!["fresco-protocol", "clipboard"]);
+
+    let storage = m.storage.as_ref().expect("[storage] should be present");
+    assert_eq!(storage.data.as_deref(), Some("100MB"));
+    assert_eq!(storage.cache.as_deref(), Some("1GB"));
+    assert_eq!(storage.namespace.as_deref(), Some("com.example.weather"));
+
+    let compute = m.compute.as_ref().expect("[compute] should be present");
+    assert_eq!(compute.cpu.as_deref(), Some("100ms/s"));
+    assert_eq!(compute.rss.as_deref(), Some("256MB"));
+    assert_eq!(compute.wall.as_deref(), Some("unbounded"));
+
+    // All typed sections moved out of `extra`.
+    assert!(m.extra.is_empty(),
+            "expected no extra sections, got: {:?}",
+            m.extra.keys().collect::<Vec<_>>());
+}
+
+#[test]
+fn input_policy_default_is_focus() {
+    let manifest_no_input = r#"
+[app]
+name = "com.example.x"
+version = "1.0.0"
+sdk-version = "1.x"
+
+[bundle]
+form = "native"
+arches = ["aarch64-freebsd"]
+entry = "bin/x"
+
+[input]
+"#;
+    let m = Manifest::parse(manifest_no_input).unwrap();
+    let input = m.input.unwrap();
+    assert_eq!(input.keyboard, InputPolicy::Focus);
+    assert_eq!(input.pointer, InputPolicy::Focus);
 }
 
 #[test]

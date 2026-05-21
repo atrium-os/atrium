@@ -43,7 +43,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 mod error;
+mod sections;
+
 pub use error::Error;
+pub use sections::{
+    ComputeSection, InputPolicy, InputSection, IpcSection, RenderSection,
+    StorageSection,
+};
 
 /// Parsed Insula app manifest.
 ///
@@ -58,6 +64,27 @@ pub struct Manifest {
 
     /// Required. Bundle layout + binary form.
     pub bundle: BundleSection,
+
+    /// Optional. Rendering / windowing intent.
+    #[serde(default)]
+    pub render: Option<RenderSection>,
+
+    /// Optional. Keyboard / pointer input policy.
+    #[serde(default)]
+    pub input: Option<InputSection>,
+
+    /// Optional. Aqueduct services the app may reach.
+    #[serde(default)]
+    pub ipc: Option<IpcSection>,
+
+    /// Optional. Persistent / cache storage configuration
+    /// + quotas.
+    #[serde(default)]
+    pub storage: Option<StorageSection>,
+
+    /// Optional. CPU / RAM / wall-time limits.
+    #[serde(default)]
+    pub compute: Option<ComputeSection>,
 
     /// All other top-level tables, preserved verbatim.
     /// Will shrink as subsequent commits promote known
