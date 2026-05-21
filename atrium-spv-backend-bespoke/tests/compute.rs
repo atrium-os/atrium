@@ -745,6 +745,85 @@ fn bespoke_compiles_float_vec4_arith_compute() {
     assert!(!out.blob.is_empty());
 }
 
+/// Compute SPIR-V with two SSBO bindings:
+///   layout(set=0,binding=0) buffer In  { uint a; };
+///   layout(set=0,binding=1) buffer Out { uint b; };
+///   void main() { b = a + 7; }
+///
+/// Today bespoke maps ALL StorageBuffer variables to X2 --
+/// this test exists to document the gap.  It's #[ignore]d
+/// so it doesn't fail the suite, and serves as a TODO marker
+/// for the multi-binding SSBO arc.
+fn build_two_ssbo_cs() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let void_fn = b.type_function(void, vec![]);
+    let in_struct = b.type_struct(vec![u32_ty]);
+    b.decorate(in_struct, Decoration::Block, vec![]);
+    b.member_decorate(in_struct, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let out_struct = b.type_struct(vec![u32_ty]);
+    b.decorate(out_struct, Decoration::Block, vec![]);
+    b.member_decorate(out_struct, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_in_struct  = b.type_pointer(None, StorageClass::StorageBuffer, in_struct);
+    let ptr_out_struct = b.type_pointer(None, StorageClass::StorageBuffer, out_struct);
+    let ptr_ssbo_u32   = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+    let in_var = b.variable(ptr_in_struct, None, StorageClass::StorageBuffer, None);
+    b.decorate(in_var, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(in_var, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let out_var = b.variable(ptr_out_struct, None, StorageClass::StorageBuffer, None);
+    b.decorate(out_var, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(out_var, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(1)]);
+    let c_zero  = b.constant_bit32(u32_ty, 0);
+    let c_seven = b.constant_bit32(u32_ty, 7);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let src = b.access_chain(ptr_ssbo_u32, None, in_var,  vec![c_zero]).unwrap();
+    let v   = b.load(u32_ty, None, src, None, vec![]).unwrap();
+    let s   = b.i_add(u32_ty, None, v, c_seven).unwrap();
+    let dst = b.access_chain(ptr_ssbo_u32, None, out_var, vec![c_zero]).unwrap();
+    b.store(dst, s, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![in_var, out_var]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+#[ignore = "multi-binding SSBO not yet wired in bespoke -- see arc"]
+fn bespoke_multi_binding_ssbo_not_yet_supported() {
+    let spv = build_two_ssbo_cs();
+    let module = translate(&spv).expect("frontend");
+    let target = if cfg!(target_os = "macos") {
+        Target::Aarch64Darwin
+    } else {
+        Target::Aarch64FreeBSD
+    };
+    // Document the current state: compile may succeed (both
+    // SSBOs alias X2 -- wrong codegen) or fail.  When the
+    // multi-binding arc lands, flip this to a real
+    // correctness test.
+    let _ = compile_blob(&module, target);
+}
+
 #[test]
 fn bespoke_compiles_empty_compute_shader() {
     let spv = build_empty_cs();
