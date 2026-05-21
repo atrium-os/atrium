@@ -1651,34 +1651,48 @@ fn emit_function(
                 let new_off = base_off.saturating_add(*byte_offset as i32);
                 pointers.insert(result.id, (param, new_off));
             }
-            Op::AtomicIAdd { ptr, value } => {
+            Op::AtomicIAdd { ptr, value }
+            | Op::AtomicAnd { ptr, value }
+            | Op::AtomicOr  { ptr, value }
+            | Op::AtomicXor { ptr, value }
+            | Op::AtomicExchange { ptr, value } => {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal(
-                        "AtomicIAdd without result".into()))?;
+                        "Atomic op without result".into()))?;
                 // Tier-2 serial dispatcher: lower to a non-
-                // atomic load + add + store sequence.  The
-                // old value is what the spec returns.  True
-                // atomic codegen (LDADD or ldxr/stxr) lands
-                // when the dispatcher parallelises.
+                // atomic load + op + store sequence.  Old
+                // value is what the spec returns.  True
+                // atomic codegen (LDADD / LDSET / SWP /
+                // ldxr-stxr) lands when the dispatcher
+                // parallelises.
                 let (x_base, base_off) =
                     resolve_or_make_pointer(ptr, &mut pointers, func.stage)?;
                 if base_off < 0 || base_off > u16::MAX as i32 {
                     return Err(BackendError::Unsupported(format!(
-                        "AtomicIAdd ptr offset {base_off} outside ldr/str imm12 range")));
+                        "Atomic ptr offset {base_off} outside ldr/str imm12 range")));
                 }
-                let w_addend = *ints.get(&value.id).ok_or_else(||
+                let w_value = *ints.get(&value.id).ok_or_else(||
                     BackendError::Internal(format!(
-                        "AtomicIAdd value {:?} not in ints", value.id)))?;
+                        "Atomic value {:?} not in ints", value.id)))?;
                 let w_old = int_pool.alloc(result.id)?;
                 a.emit(asm::ldr_w_offset(w_old, x_base, base_off as u16));
-                // Scratch for the post-add value -- one
-                // throwaway W-reg.  Use w_old as scratch
-                // for the sum (kills the old value early);
-                // we need to keep the old value as the
-                // result.  So allocate a temp instead.
-                let w_sum = asm::Wreg(9);
-                a.emit(asm::add_w(w_sum, w_old, w_addend));
-                a.emit(asm::str_w_offset(w_sum, x_base, base_off as u16));
+                let w_new = asm::Wreg(9); // scratch
+                let new_inst = match &inst.op {
+                    Op::AtomicIAdd { .. } => asm::add_w(w_new, w_old, w_value),
+                    Op::AtomicAnd  { .. } => asm::and_w(w_new, w_old, w_value),
+                    Op::AtomicOr   { .. } => asm::orr_w(w_new, w_old, w_value),
+                    Op::AtomicXor  { .. } => asm::eor_w(w_new, w_old, w_value),
+                    // Exchange writes the addend directly --
+                    // no arithmetic.  Just str w_value.
+                    Op::AtomicExchange { .. } => {
+                        a.emit(asm::str_w_offset(w_value, x_base, base_off as u16));
+                        ints.insert(result.id, w_old);
+                        continue;
+                    }
+                    _ => unreachable!(),
+                };
+                a.emit(new_inst);
+                a.emit(asm::str_w_offset(w_new, x_base, base_off as u16));
                 ints.insert(result.id, w_old);
             }
             Op::PtrOffsetDynamic { base, index, stride } => {
@@ -3401,7 +3415,11 @@ fn compute_last_use_flat(
                 // IntPool keeps the W-reg live until this op.
                 mark(index.id);
             }
-            Op::AtomicIAdd { ptr: _, value } => {
+            Op::AtomicIAdd { ptr: _, value }
+            | Op::AtomicAnd { ptr: _, value }
+            | Op::AtomicOr  { ptr: _, value }
+            | Op::AtomicXor { ptr: _, value }
+            | Op::AtomicExchange { ptr: _, value } => {
                 // value is an int scalar; mark for IntPool.
                 mark(value.id);
             }

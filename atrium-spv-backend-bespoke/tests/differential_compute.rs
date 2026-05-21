@@ -554,6 +554,126 @@ fn differential_atomic_iadd_accumulator() {
         "atomic counter should equal sum(0..8) = 28, got {v}");
 }
 
+/// Builds a CS with the named atomic opcode applied to
+/// ssbo.counter with the per-invocation gid_x as the
+/// addend.  `op` is one of: AtomicIAdd, AtomicAnd, AtomicOr,
+/// AtomicXor, AtomicExchange.
+fn build_atomic_op_cs(op: rspirv::spirv::Op) -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, Op as SpvOp, StorageClass,
+        MemorySemantics, Scope,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let uvec3  = b.type_vector(u32_ty, 3);
+    let void_fn = b.type_function(void, vec![]);
+    let s = b.type_struct(vec![u32_ty]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_u = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+    let ssbo = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_in_uvec3 = b.type_pointer(None, StorageClass::Input, uvec3);
+    let gid_var = b.variable(ptr_in_uvec3, None, StorageClass::Input, None);
+    b.decorate(gid_var, Decoration::BuiltIn,
+        vec![rspirv::dr::Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    let c_scope = b.constant_bit32(u32_ty, Scope::Device as u32);
+    let c_sem   = b.constant_bit32(u32_ty,
+        MemorySemantics::ATOMIC_COUNTER_MEMORY.bits());
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let gid = b.load(uvec3, None, gid_var, None, vec![]).unwrap();
+    let gid_x = b.composite_extract(u32_ty, None, gid, vec![0]).unwrap();
+    let dst = b.access_chain(ptr_u, None, ssbo, vec![c_zero]).unwrap();
+    let _ = match op {
+        SpvOp::AtomicIAdd     => b.atomic_i_add (u32_ty, None, dst, c_scope, c_sem, gid_x),
+        SpvOp::AtomicAnd      => b.atomic_and   (u32_ty, None, dst, c_scope, c_sem, gid_x),
+        SpvOp::AtomicOr       => b.atomic_or    (u32_ty, None, dst, c_scope, c_sem, gid_x),
+        SpvOp::AtomicXor      => b.atomic_xor   (u32_ty, None, dst, c_scope, c_sem, gid_x),
+        SpvOp::AtomicExchange => b.atomic_exchange(u32_ty, None, dst, c_scope, c_sem, gid_x),
+        _ => panic!("unsupported test op {op:?}"),
+    }.unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![gid_var, ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+fn run_atomic_diff(op: rspirv::spirv::Op, prefill: u32, gids_range: u32) -> u32 {
+    let spv = build_atomic_op_cs(op);
+    let dir = TempDir::new().unwrap();
+    let mut b_buf = vec![0u8; 16];
+    let mut c_buf = vec![0u8; 16];
+    b_buf[..4].copy_from_slice(&prefill.to_le_bytes());
+    c_buf[..4].copy_from_slice(&prefill.to_le_bytes());
+    let gids: Vec<(u32, u32, u32)> = (0..gids_range).map(|i| (i, 0, 0)).collect();
+    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &gids);
+    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &gids);
+    assert_eq!(b_buf, c_buf,
+        "bespoke vs cranelift diverge on {op:?}:\n  \
+         bespoke   = {b_buf:?}\n  cranelift = {c_buf:?}");
+    u32::from_le_bytes(b_buf[0..4].try_into().unwrap())
+}
+
+#[test]
+fn differential_atomic_or_sets_bits_across_invocations() {
+    // Pre-fill 0; gid_x in 0..4 sets bits 0..3 via atomicOr.
+    use rspirv::spirv::Op as SpvOp;
+    let got = run_atomic_diff(SpvOp::AtomicOr, 0, 4);
+    // gid_x = 0 OR's 0 (no-op), 1 sets bit 0, 2 sets bit 1, 3 sets bits 0+1.
+    // OR is idempotent + commutative: result = 0|0|1|2|3 = 3.
+    assert_eq!(got, 0 | 0 | 1 | 2 | 3, "got {got:#x}");
+}
+
+#[test]
+fn differential_atomic_and_clears_bits() {
+    // Pre-fill 0x0F (= bits 0..3 set); gid_x in 0..4 AND-masks.
+    // After: 0x0F & 0 & 1 & 2 & 3 = 0 (any AND with 0 clears all).
+    use rspirv::spirv::Op as SpvOp;
+    let got = run_atomic_diff(SpvOp::AtomicAnd, 0x0F, 4);
+    assert_eq!(got, 0, "got {got:#x}");
+}
+
+#[test]
+fn differential_atomic_xor_toggles() {
+    // Pre-fill 0; gid_x in 1..5 XORs in 1,2,3,4 = 1^2^3^4 = 4.
+    use rspirv::spirv::Op as SpvOp;
+    let spv = build_atomic_op_cs(SpvOp::AtomicXor);
+    let dir = TempDir::new().unwrap();
+    let mut b_buf = vec![0u8; 16];
+    let mut c_buf = vec![0u8; 16];
+    let gids: Vec<(u32, u32, u32)> = (1..5).map(|i| (i, 0, 0)).collect();
+    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &gids);
+    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &gids);
+    assert_eq!(b_buf, c_buf);
+    let got = u32::from_le_bytes(b_buf[0..4].try_into().unwrap());
+    assert_eq!(got, 1u32 ^ 2 ^ 3 ^ 4, "got {got:#x}");
+}
+
+#[test]
+fn differential_atomic_exchange_replaces() {
+    // Pre-fill 0xDEAD; gid_x in 0..3 exchanges -> final = 2 (last write wins).
+    use rspirv::spirv::Op as SpvOp;
+    let got = run_atomic_diff(SpvOp::AtomicExchange, 0xDEAD, 3);
+    assert_eq!(got, 2, "exchange should leave the last gid_x; got {got:#x}");
+}
+
 #[test]
 fn differential_six_binding_constant_store() {
     let spv = build_n_binding_constants(6);

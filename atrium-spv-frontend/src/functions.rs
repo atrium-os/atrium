@@ -1233,17 +1233,27 @@ fn translate_inst(
         // the Tier-2 serial dispatcher executes invocations
         // one at a time, so the non-atomic load+add+store
         // lowering is semantically equivalent.
-        SpvOp::AtomicIAdd => {
+        // OpAtomic{IAdd,And,Or,Xor,Exchange}: same operand
+        // layout per the SPIR-V spec --
+        //   <result_type> <result_id> <pointer>
+        //   <memory_scope> <memory_semantics> <value>
+        // -- so handled by a shared resolution path, then
+        // dispatched to the appropriate IR op constructor.
+        // Memory scope + semantics are ignored on the serial
+        // dispatcher (see Op::AtomicIAdd comment in spv-ir).
+        SpvOp::AtomicIAdd
+        | SpvOp::AtomicAnd | SpvOp::AtomicOr | SpvOp::AtomicXor
+        | SpvOp::AtomicExchange => {
             let result_id = spv_inst.result_id.ok_or_else(||
                 FrontendError::Malformed(
-                    "AtomicIAdd without result id".to_string()))?;
+                    "Atomic op without result id".to_string()))?;
             let result_type_id = spv_inst.result_type.ok_or_else(||
                 FrontendError::Malformed(
-                    "AtomicIAdd without result type".to_string()))?;
+                    "Atomic op without result type".to_string()))?;
             let result_ty = types.get(result_type_id)?.clone();
             let ptr_id = expect_id(&spv_inst.operands, 0)?;
-            // Operands 1 and 2 are memory_scope + memory_semantics
-            // (both id-refs to scalar int constants); skipped.
+            // Operands 1 + 2: scope + semantics (id-refs to
+            // scalar int constants); skipped.
             let value_id = expect_id(&spv_inst.operands, 3)?;
 
             let ptr_value = match resolve_variable(
@@ -1252,7 +1262,7 @@ fn translate_inst(
                 Some(v) => v,
                 None => id_map.get(&ptr_id).cloned().ok_or_else(||
                     FrontendError::Malformed(format!(
-                        "AtomicIAdd pointer id {ptr_id} not a Variable \
+                        "Atomic pointer id {ptr_id} not a Variable \
                          and not in id_map (no prior AccessChain)",
                     )))?,
             };
@@ -1262,8 +1272,16 @@ fn translate_inst(
             )?;
             let result = alloc_or_get_result(
                 result_id, result_ty, id_map, next_value_id);
+            let op = match spv_inst.class.opcode {
+                SpvOp::AtomicIAdd     => Op::AtomicIAdd     { ptr: ptr_value, value },
+                SpvOp::AtomicAnd      => Op::AtomicAnd      { ptr: ptr_value, value },
+                SpvOp::AtomicOr       => Op::AtomicOr       { ptr: ptr_value, value },
+                SpvOp::AtomicXor      => Op::AtomicXor      { ptr: ptr_value, value },
+                SpvOp::AtomicExchange => Op::AtomicExchange { ptr: ptr_value, value },
+                _ => unreachable!(),
+            };
             insts.push(Inst {
-                op: Op::AtomicIAdd { ptr: ptr_value, value },
+                op,
                 result: Some(result),
                 source_spirv_offset,
             });

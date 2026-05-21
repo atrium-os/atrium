@@ -782,21 +782,32 @@ impl FnTranslator {
                 self.pointers.insert(result.id, (param, new_off));
                 Ok(())
             }
-            Op::AtomicIAdd { ptr, value } => {
+            Op::AtomicIAdd { ptr, value }
+            | Op::AtomicAnd { ptr, value }
+            | Op::AtomicOr  { ptr, value }
+            | Op::AtomicXor { ptr, value }
+            | Op::AtomicExchange { ptr, value } => {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal(
-                        "AtomicIAdd without result".to_string()))?;
+                        "Atomic op without result".to_string()))?;
                 let (ptr_v, ptr_off) = self.resolve_or_make_pointer(ptr)?;
-                let addend = *self.scalars.get(&value.id).ok_or_else(||
+                let val = *self.scalars.get(&value.id).ok_or_else(||
                     BackendError::Internal(format!(
-                        "AtomicIAdd value {:?} not in scalars",
+                        "Atomic value {:?} not in scalars",
                         value.id)))?;
                 let mflags = cranelift_codegen::ir::MemFlags::new();
                 let old = builder.ins().load(
                     clif_types::I32, mflags, ptr_v, ptr_off);
-                let sum = builder.ins().iadd(old, addend);
-                builder.ins().store(mflags, sum, ptr_v, ptr_off);
-                // Spec returns the OLD value as the result.
+                let new_val = match &inst.op {
+                    Op::AtomicIAdd { .. } => builder.ins().iadd(old, val),
+                    Op::AtomicAnd  { .. } => builder.ins().band(old, val),
+                    Op::AtomicOr   { .. } => builder.ins().bor(old, val),
+                    Op::AtomicXor  { .. } => builder.ins().bxor(old, val),
+                    Op::AtomicExchange { .. } => val, // write addend as-is
+                    _ => unreachable!(),
+                };
+                builder.ins().store(mflags, new_val, ptr_v, ptr_off);
+                // SPIR-V returns the OLD value.
                 self.scalars.insert(result.id, old);
                 Ok(())
             }
