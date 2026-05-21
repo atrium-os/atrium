@@ -75,15 +75,37 @@ pub fn render_profile_with(
     render_profile_with_sockets(manifest, log_socket, None, None, log_socket)
 }
 
-/// As [`render_profile_with`] but supports the three
-/// Insula daemon sockets the launcher may pass through:
-/// log, vestibulum, netd. `any_socket` gates the broad
-/// `network-outbound` grant when at least one is set.
+/// As [`render_profile_with`] but supports three
+/// daemon sockets (log, vestibulum, netd). Delegates
+/// to [`render_profile_full`] with no praeco socket.
 pub fn render_profile_with_sockets(
     manifest: &Manifest,
     log_socket: Option<&Path>,
     vestibulum_socket: Option<&Path>,
     netd_socket: Option<&Path>,
+    any_socket: Option<&Path>,
+) -> String {
+    render_profile_full(
+        manifest,
+        log_socket,
+        vestibulum_socket,
+        netd_socket,
+        None,
+        any_socket,
+    )
+}
+
+/// Full SBPL renderer with all four Insula daemon
+/// sockets the launcher may pass through: log,
+/// vestibulum, netd, praeco. `any_socket` gates the
+/// broad `network-outbound` grant when at least one is
+/// set.
+pub fn render_profile_full(
+    manifest: &Manifest,
+    log_socket: Option<&Path>,
+    vestibulum_socket: Option<&Path>,
+    netd_socket: Option<&Path>,
+    praeco_socket: Option<&Path>,
     any_socket: Option<&Path>,
 ) -> String {
     let mut out = String::new();
@@ -163,6 +185,15 @@ pub fn render_profile_with_sockets(
     }
     if let Some(sock) = netd_socket {
         let _ = writeln!(out, ";; atrium-netd-macos socket: {}", sock.display());
+        let _ = writeln!(
+            out,
+            "(allow file-read* file-write* (literal \"{}\"))",
+            sock.display()
+        );
+        let _ = writeln!(out);
+    }
+    if let Some(sock) = praeco_socket {
+        let _ = writeln!(out, ";; praeco-macos socket: {}", sock.display());
         let _ = writeln!(
             out,
             "(allow file-read* file-write* (literal \"{}\"))",

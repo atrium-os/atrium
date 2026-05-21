@@ -1,0 +1,18 @@
+[package]
+name        = "praeco-macos"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+description = "macOS adapter for Praeco, the Atrium notifications service. Listens on a unix socket for CLASS_NOTIFY POST_NOTIFICATION requests, mints a notification id, appends a record to a notifications log file. v0 routes to a file rather than the native macOS Notification Center; the wire shape is the same as a real Praeco would consume."
+publish     = false
+
+[[bin]]
+name = "praeco-macos"
+path = "src/main.rs"
+
+[dependencies]
+aqueduct = { path = "../aqueduct" }
+
+[dev-dependencies]
+libatrium = { path = "../libatrium" }
+tempfile  = "3"

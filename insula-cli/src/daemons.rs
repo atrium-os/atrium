@@ -27,6 +27,8 @@ pub enum Daemon {
     Vestibulum,
     /// `atrium-netd-macos` — network broker.
     Netd,
+    /// `praeco-macos` — notifications.
+    Praeco,
 }
 
 impl Daemon {
@@ -36,6 +38,7 @@ impl Daemon {
             Daemon::Logd => "insula-logd",
             Daemon::Vestibulum => "vestibulum-macos",
             Daemon::Netd => "atrium-netd-macos",
+            Daemon::Praeco => "praeco-macos",
         }
     }
 
@@ -46,6 +49,7 @@ impl Daemon {
             Daemon::Logd => "insula-logd",
             Daemon::Vestibulum => "vestibulum-macos",
             Daemon::Netd => "atrium-netd-macos",
+            Daemon::Praeco => "praeco-macos",
         }
     }
 
@@ -56,16 +60,18 @@ impl Daemon {
             Daemon::Logd => "INSULA_LOGD_SOCKET",
             Daemon::Vestibulum => "INSULA_VESTIBULUMD_SOCKET",
             Daemon::Netd => "INSULA_NETD_SOCKET",
+            Daemon::Praeco => "INSULA_PRAECOD_SOCKET",
         }
     }
 
     /// Optional env var the daemon respects for its
-    /// log file (logd only).
+    /// log file (logd + praeco currently).
     pub fn log_env(self) -> Option<&'static str> {
         match self {
             Daemon::Logd => Some("INSULA_LOGD_LOG_FILE"),
             Daemon::Vestibulum => None,
             Daemon::Netd => None,
+            Daemon::Praeco => Some("INSULA_PRAECOD_LOG_FILE"),
         }
     }
 
@@ -77,11 +83,12 @@ impl Daemon {
             Daemon::Logd => "INSULA_LOGD_BIN",
             Daemon::Vestibulum => "INSULA_VESTIBULUMD_BIN",
             Daemon::Netd => "INSULA_NETD_BIN",
+            Daemon::Praeco => "INSULA_PRAECOD_BIN",
         }
     }
 
-    pub const ALL: [Daemon; 3] =
-        [Daemon::Logd, Daemon::Vestibulum, Daemon::Netd];
+    pub const ALL: [Daemon; 4] =
+        [Daemon::Logd, Daemon::Vestibulum, Daemon::Netd, Daemon::Praeco];
 }
 
 /// All paths the CLI cares about for one daemon under

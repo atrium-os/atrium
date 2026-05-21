@@ -35,7 +35,7 @@ use std::os::raw::{c_char, c_int, c_uint};
 use std::sync::Mutex;
 
 use aqueduct::Connection;
-use aqueduct::classes::{CLASS_LOG, CLASS_NET, CLASS_VESTIBULUM};
+use aqueduct::classes::{CLASS_LOG, CLASS_NET, CLASS_NOTIFY, CLASS_VESTIBULUM};
 use aqueduct::envelope::{flag, Header};
 
 /// Lazily-initialized platform connection. None until
@@ -459,6 +459,118 @@ pub unsafe extern "C" fn atrium_keychain_pubkey(
     }
     std::ptr::copy_nonoverlapping(resp.as_ptr(), out, ATRIUM_KEYCHAIN_PUBKEY_LEN);
     ATRIUM_KEYCHAIN_PUBKEY_LEN as c_int
+}
+
+// =====================================================
+// Notifications — POST to Praeco daemon.
+// =====================================================
+
+/// Urgency level for [`atrium_notify_post`].
+pub const ATRIUM_NOTIFY_LOW: c_uint = 0;
+/// Normal urgency (default for foreground apps).
+pub const ATRIUM_NOTIFY_NORMAL: c_uint = 1;
+/// High urgency — interrupts even Do-Not-Disturb-ish UX.
+pub const ATRIUM_NOTIFY_HIGH: c_uint = 2;
+
+/// Praeco daemon unreachable.
+pub const ATRIUM_ERR_NO_PRAECO: c_int = -30;
+/// Praeco responded but the response was malformed.
+pub const ATRIUM_ERR_PRAECO_RPC: c_int = -31;
+
+/// Post a notification via the Praeco daemon. Returns
+/// a positive notification id on success, or a
+/// negative error code.
+///
+/// `title` and `body` are NUL-terminated UTF-8.
+/// `urgency` is one of `ATRIUM_NOTIFY_LOW` /
+/// `_NORMAL` / `_HIGH`.
+///
+/// v0 surface — actions / groups / replaces_id from
+/// the spec are not exposed yet.
+///
+/// # Safety
+///
+/// `title` and `body` must be valid NUL-terminated
+/// pointers.
+#[no_mangle]
+pub unsafe extern "C" fn atrium_notify_post(
+    title: *const c_char,
+    body: *const c_char,
+    urgency: c_uint,
+) -> i64 {
+    if title.is_null() || body.is_null() {
+        return ATRIUM_ERR_INVALID_PATH as i64;
+    }
+    let title_str = match CStr::from_ptr(title).to_str() {
+        Ok(s) => s,
+        Err(_) => return ATRIUM_ERR_INVALID_PATH as i64,
+    };
+    let body_str = match CStr::from_ptr(body).to_str() {
+        Ok(s) => s,
+        Err(_) => return ATRIUM_ERR_INVALID_PATH as i64,
+    };
+    if title_str.len() > u16::MAX as usize || body_str.len() > u16::MAX as usize {
+        return ATRIUM_ERR_INVALID_PATH as i64;
+    }
+    let urgency_byte: u8 = match urgency {
+        ATRIUM_NOTIFY_LOW => 0,
+        ATRIUM_NOTIFY_NORMAL => 1,
+        ATRIUM_NOTIFY_HIGH => 2,
+        _ => return ATRIUM_ERR_INVALID_MODE as i64,
+    };
+
+    let Some(sock_path) = std::env::var_os("ATRIUM_PRAECO_SOCKET") else {
+        return ATRIUM_ERR_NO_PRAECO as i64;
+    };
+    let mut conn =
+        match Connection::connect(std::path::Path::new(&sock_path)) {
+            Ok(c) => c,
+            Err(_) => return ATRIUM_ERR_NO_PRAECO as i64,
+        };
+
+    // payload: u8 urgency | u16 title_len | title | u16 body_len | body
+    let mut payload = Vec::with_capacity(
+        1 + 2 + title_str.len() + 2 + body_str.len()
+    );
+    payload.push(urgency_byte);
+    payload.extend_from_slice(&(title_str.len() as u16).to_le_bytes());
+    payload.extend_from_slice(title_str.as_bytes());
+    payload.extend_from_slice(&(body_str.len() as u16).to_le_bytes());
+    payload.extend_from_slice(body_str.as_bytes());
+
+    if conn.send_message(
+        CLASS_NOTIFY,
+        0, // OP_POST_NOTIFICATION
+        flag::RESPONSE_EXPECTED,
+        &payload,
+    )
+    .is_err()
+    {
+        return ATRIUM_ERR_PRAECO_RPC as i64;
+    }
+
+    // Filter to matching response.
+    loop {
+        let msg = match conn.recv_message() {
+            Ok(m) => m,
+            Err(_) => return ATRIUM_ERR_PRAECO_RPC as i64,
+        };
+        if msg.opcode_class == CLASS_NOTIFY
+            && msg.op == 0
+            && (msg.flags & flag::IS_RESPONSE) != 0
+        {
+            // Response: u8 status | u64 id LE
+            if msg.payload.len() < 9 {
+                return ATRIUM_ERR_PRAECO_RPC as i64;
+            }
+            let status = msg.payload[0];
+            let id = u64::from_le_bytes(msg.payload[1..9].try_into().unwrap());
+            if status != 0 {
+                return ATRIUM_ERR_PRAECO_RPC as i64;
+            }
+            return id as i64;
+        }
+    }
 }
 
 // =====================================================

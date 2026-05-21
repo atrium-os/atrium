@@ -119,6 +119,23 @@ int32_t atrium_keychain_sign(
  * read(2) / write(2) / close(2). Negative on error. */
 int32_t atrium_net_connect(const char* host, uint16_t port, uint32_t proto);
 
+/* -----------------------------------------------------------
+ * Notifications — POST to Praeco daemon.
+ * -----------------------------------------------------------
+ */
+
+#define ATRIUM_NOTIFY_LOW       0u
+#define ATRIUM_NOTIFY_NORMAL    1u
+#define ATRIUM_NOTIFY_HIGH      2u
+
+#define ATRIUM_ERR_NO_PRAECO    -30
+#define ATRIUM_ERR_PRAECO_RPC   -31
+
+/* Post a notification. Returns the assigned notification id
+ * on success (positive int64_t), or a negative error code. */
+int64_t atrium_notify_post(
+    const char* title, const char* body, uint32_t urgency);
+
 #ifdef __cplusplus
 }
 #endif

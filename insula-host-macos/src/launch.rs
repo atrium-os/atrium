@@ -75,6 +75,12 @@ pub struct LaunchOptions<'a> {
     /// wiring shape: passes through as
     /// `$ATRIUM_NETD_SOCKET` + SBPL grant.
     pub netd_socket: Option<&'a Path>,
+
+    /// Optional: path to a `praeco-macos` socket the
+    /// app reaches for `atrium_notify_post`. Same
+    /// wiring shape: passes through as
+    /// `$ATRIUM_PRAECO_SOCKET` + SBPL grant.
+    pub praeco_socket: Option<&'a Path>,
 }
 
 impl<'a> LaunchOptions<'a> {
@@ -88,6 +94,7 @@ impl<'a> LaunchOptions<'a> {
             log_socket: None,
             vestibulum_socket: None,
             netd_socket: None,
+            praeco_socket: None,
         }
     }
 }
@@ -149,18 +156,21 @@ pub fn launch(
     let log_socket_canon = opts.log_socket.map(canon_socket);
     let vest_socket_canon = opts.vestibulum_socket.map(canon_socket);
     let netd_socket_canon = opts.netd_socket.map(canon_socket);
+    let praeco_socket_canon = opts.praeco_socket.map(canon_socket);
 
     // SBPL grant covers any combination of unix sockets
     // by switching on network-outbound once if any are
     // present.
     let any_unix_socket = log_socket_canon.as_deref()
         .or(vest_socket_canon.as_deref())
-        .or(netd_socket_canon.as_deref());
-    let profile = sbpl::render_profile_with_sockets(
+        .or(netd_socket_canon.as_deref())
+        .or(praeco_socket_canon.as_deref());
+    let profile = sbpl::render_profile_full(
         manifest,
         log_socket_canon.as_deref(),
         vest_socket_canon.as_deref(),
         netd_socket_canon.as_deref(),
+        praeco_socket_canon.as_deref(),
         any_unix_socket,
     );
 
@@ -204,6 +214,9 @@ pub fn launch(
     }
     if let Some(sock) = netd_socket_canon.as_deref() {
         cmd.env("ATRIUM_NETD_SOCKET", sock);
+    }
+    if let Some(sock) = praeco_socket_canon.as_deref() {
+        cmd.env("ATRIUM_PRAECO_SOCKET", sock);
     }
 
     if opts.capture_output {
