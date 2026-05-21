@@ -21,12 +21,21 @@ fn vestibulum_binary() -> PathBuf {
 }
 
 fn spawn_daemon(socket: &std::path::Path) -> Child {
-    Command::new(vestibulum_binary())
-        .env("INSULA_VESTIBULUMD_SOCKET", socket)
+    spawn_daemon_with_keystore(socket, None)
+}
+
+fn spawn_daemon_with_keystore(
+    socket: &std::path::Path,
+    keystore_dir: Option<&std::path::Path>,
+) -> Child {
+    let mut cmd = Command::new(vestibulum_binary());
+    cmd.env("INSULA_VESTIBULUMD_SOCKET", socket)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn vestibulum-macos")
+        .stderr(Stdio::null());
+    if let Some(ks) = keystore_dir {
+        cmd.env("INSULA_VESTIBULUMD_KEYSTORE", ks);
+    }
+    cmd.spawn().expect("spawn vestibulum-macos")
 }
 
 fn wait_for_socket(p: &std::path::Path, timeout: Duration) {
@@ -147,6 +156,65 @@ fn pubkey_call_without_daemon_returns_no_vestibulum() {
         atrium::atrium_keychain_pubkey(service.as_ptr(), pubkey.as_mut_ptr(), 32)
     };
     assert_eq!(n, atrium::ATRIUM_ERR_NO_VESTIBULUM);
+}
+
+#[test]
+fn keys_survive_daemon_restart() {
+    let _g = ENV_LOCK.lock().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("vest.sock");
+    let keystore = tmp.path().join("keys");
+
+    // Run 1: start daemon, mint a key, get pubkey, kill daemon.
+    let mut daemon = spawn_daemon_with_keystore(&socket, Some(&keystore));
+    wait_for_socket(&socket, Duration::from_secs(3));
+    std::env::set_var("ATRIUM_VESTIBULUM_SOCKET", &socket);
+
+    let service = CString::new("com.example.weather").unwrap();
+    let mut pk_before = [0u8; 32];
+    unsafe {
+        atrium::atrium_keychain_pubkey(service.as_ptr(), pk_before.as_mut_ptr(), 32);
+    }
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    // Brief moment for OS to fully clean up.
+    let _ = std::fs::remove_file(&socket);
+
+    // Run 2: start fresh daemon process pointing at the SAME
+    // keystore dir, ask for the same service, expect the same
+    // pubkey.
+    let mut daemon2 = spawn_daemon_with_keystore(&socket, Some(&keystore));
+    wait_for_socket(&socket, Duration::from_secs(3));
+
+    let mut pk_after = [0u8; 32];
+    unsafe {
+        atrium::atrium_keychain_pubkey(service.as_ptr(), pk_after.as_mut_ptr(), 32);
+    }
+
+    assert_eq!(pk_before, pk_after,
+               "key minted by first daemon process should be loaded by second");
+
+    // And a signature from run 2 should still verify under
+    // run 1's pubkey (proving the secret key, not just the
+    // pubkey, was preserved).
+    let challenge = b"signs-with-restored-key";
+    let mut sig = [0u8; 64];
+    unsafe {
+        atrium::atrium_keychain_sign(
+            service.as_ptr(),
+            challenge.as_ptr(),
+            challenge.len(),
+            sig.as_mut_ptr(),
+            sig.len(),
+        );
+    }
+    let vk = VerifyingKey::from_bytes(&pk_before).unwrap();
+    vk.verify(challenge, &Signature::from_bytes(&sig))
+        .expect("signature from restored key verifies under original pubkey");
+
+    std::env::remove_var("ATRIUM_VESTIBULUM_SOCKET");
+    let _ = daemon2.kill();
+    let _ = daemon2.wait();
 }
 
 #[test]

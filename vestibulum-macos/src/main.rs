@@ -23,12 +23,13 @@
 //!   `$TMPDIR/vestibulum-macos.sock` or
 //!   `/tmp/vestibulum-macos.sock`.
 
+mod keystore;
+use keystore::{resolve_keystore_path, Keystore};
+
 use aqueduct::classes::CLASS_VESTIBULUM;
 use aqueduct::envelope::flag;
 use aqueduct::Connection;
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use rand::rngs::OsRng;
-use std::collections::HashMap;
+use ed25519_dalek::{Signature, Signer, VerifyingKey};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -38,8 +39,8 @@ use std::thread;
 const OP_PUBKEY_REQUEST: u16 = 0;
 const OP_SIGN_REQUEST: u16 = 1;
 
-/// Shared key store. Maps "service.persona" -> keypair.
-type KeyStore = Arc<Mutex<HashMap<String, SigningKey>>>;
+/// Shared disk-backed key store.
+type SharedKeystore = Arc<Mutex<Keystore>>;
 
 fn main() -> ExitCode {
     if std::env::args().any(|a| a == "-h" || a == "--help") {
@@ -61,9 +62,25 @@ fn main() -> ExitCode {
         }
     };
 
-    eprintln!("vestibulum-macos: listening on {}", socket_path.display());
+    let keystore_dir = resolve_keystore_path();
+    let keystore = match Keystore::open(keystore_dir.clone()) {
+        Ok(ks) => ks,
+        Err(e) => {
+            eprintln!(
+                "vestibulum-macos: cannot open keystore at {}: {}",
+                keystore_dir.display(),
+                e
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!(
+        "vestibulum-macos: listening on {} (keystore at {})",
+        socket_path.display(),
+        keystore_dir.display()
+    );
 
-    let store: KeyStore = Arc::new(Mutex::new(HashMap::new()));
+    let store: SharedKeystore = Arc::new(Mutex::new(keystore));
 
     for stream in listener.incoming() {
         let stream = match stream {
@@ -79,7 +96,7 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn handle_connection(stream: UnixStream, store: KeyStore) {
+fn handle_connection(stream: UnixStream, store: SharedKeystore) {
     let mut conn = match Connection::wrap(stream) {
         Ok(c) => c,
         Err(e) => {
@@ -106,9 +123,9 @@ fn handle_connection(stream: UnixStream, store: KeyStore) {
                     Ok(s) => s.to_string(),
                     Err(_) => continue,
                 };
-                let pk = {
+                let pk: VerifyingKey = {
                     let mut s = store.lock().unwrap();
-                    pubkey_for_service(&mut s, &service)
+                    s.get_or_mint(&service).verifying_key()
                 };
                 let _ = conn.send_message(
                     CLASS_VESTIBULUM,
@@ -138,7 +155,7 @@ fn handle_connection(stream: UnixStream, store: KeyStore) {
 
                 let sig: Signature = {
                     let mut s = store.lock().unwrap();
-                    let sk = mint_if_needed(&mut s, &service);
+                    let sk = s.get_or_mint(&service);
                     sk.sign(challenge)
                 };
                 let _ = conn.send_message(
@@ -153,23 +170,6 @@ fn handle_connection(stream: UnixStream, store: KeyStore) {
             }
         }
     }
-}
-
-fn pubkey_for_service(
-    store: &mut HashMap<String, SigningKey>,
-    service: &str,
-) -> VerifyingKey {
-    let sk = mint_if_needed(store, service);
-    sk.verifying_key()
-}
-
-fn mint_if_needed<'a>(
-    store: &'a mut HashMap<String, SigningKey>,
-    service: &str,
-) -> &'a SigningKey {
-    store
-        .entry(service.to_string())
-        .or_insert_with(|| SigningKey::generate(&mut OsRng))
 }
 
 fn resolve_socket_path() -> PathBuf {
@@ -192,10 +192,13 @@ Listens on a unix socket and serves CLASS_VESTIBULUM ops:
                        response = 64B signature
 
 Environment:
-  INSULA_VESTIBULUMD_SOCKET   listen path (default:
-                              $XDG_RUNTIME_DIR/vestibulum-macos.sock)
+  INSULA_VESTIBULUMD_SOCKET     listen path (default:
+                                $XDG_RUNTIME_DIR/vestibulum-macos.sock)
+  INSULA_VESTIBULUMD_KEYSTORE   keystore dir (default:
+                                $XDG_RUNTIME_DIR/vestibulum-macos/keys/)
 
-v0: in-memory keystore (lost on restart). Persistent storage via
-macOS Keychain Services is future work."
+Keystore is **file-backed** (one .key file per service, raw
+32-byte ed25519 secret -- v0 is plaintext on disk; macOS Keychain
+Services wrapping is future work). Keys survive daemon restart."
     );
 }
