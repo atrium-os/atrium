@@ -782,6 +782,50 @@ impl FnTranslator {
                 self.pointers.insert(result.id, (param, new_off));
                 Ok(())
             }
+            Op::AtomicLoad(ptr) => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "AtomicLoad without result".to_string()))?;
+                let (ptr_v, ptr_off) = self.resolve_or_make_pointer(ptr)?;
+                let mflags = cranelift_codegen::ir::MemFlags::new();
+                let v = builder.ins().load(
+                    clif_types::I32, mflags, ptr_v, ptr_off);
+                self.scalars.insert(result.id, v);
+                Ok(())
+            }
+            Op::AtomicStore { ptr, value } => {
+                let (ptr_v, ptr_off) = self.resolve_or_make_pointer(ptr)?;
+                let val = *self.scalars.get(&value.id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "AtomicStore value {:?} not in scalars", value.id)))?;
+                let mflags = cranelift_codegen::ir::MemFlags::new();
+                builder.ins().store(mflags, val, ptr_v, ptr_off);
+                Ok(())
+            }
+            Op::AtomicCompareExchange { ptr, expected, desired } => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "AtomicCompareExchange without result".to_string()))?;
+                let (ptr_v, ptr_off) = self.resolve_or_make_pointer(ptr)?;
+                let exp = *self.scalars.get(&expected.id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "AtomicCompareExchange expected {:?} not in scalars",
+                        expected.id)))?;
+                let des = *self.scalars.get(&desired.id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "AtomicCompareExchange desired {:?} not in scalars",
+                        desired.id)))?;
+                let mflags = cranelift_codegen::ir::MemFlags::new();
+                let old = builder.ins().load(
+                    clif_types::I32, mflags, ptr_v, ptr_off);
+                // new = (old == exp) ? des : old
+                let cmp = builder.ins().icmp(
+                    cranelift_codegen::ir::condcodes::IntCC::Equal, old, exp);
+                let new_val = builder.ins().select(cmp, des, old);
+                builder.ins().store(mflags, new_val, ptr_v, ptr_off);
+                self.scalars.insert(result.id, old);
+                Ok(())
+            }
             Op::AtomicIAdd { ptr, value }
             | Op::AtomicAnd { ptr, value }
             | Op::AtomicOr  { ptr, value }

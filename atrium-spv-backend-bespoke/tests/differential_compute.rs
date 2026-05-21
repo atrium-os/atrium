@@ -674,6 +674,170 @@ fn differential_atomic_exchange_replaces() {
     assert_eq!(got, 2, "exchange should leave the last gid_x; got {got:#x}");
 }
 
+/// CS: `ssbo.b = atomicLoad(ssbo.a)` -- proves AtomicLoad
+/// reads the prefill correctly and AtomicStore writes it.
+/// Uses a struct { uint a; uint b; } so we can verify both
+/// stay correct.
+fn build_atomic_load_store_cs() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+        MemorySemantics, Scope,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let void_fn = b.type_function(void, vec![]);
+    let s = b.type_struct(vec![u32_ty, u32_ty]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.member_decorate(s, 1, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(4)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_u = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+    let ssbo = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    let c_one  = b.constant_bit32(u32_ty, 1);
+    let c_scope = b.constant_bit32(u32_ty, Scope::Device as u32);
+    let c_sem   = b.constant_bit32(u32_ty,
+        MemorySemantics::ATOMIC_COUNTER_MEMORY.bits());
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let src = b.access_chain(ptr_u, None, ssbo, vec![c_zero]).unwrap();
+    let v = b.atomic_load(u32_ty, None, src, c_scope, c_sem).unwrap();
+    let dst = b.access_chain(ptr_u, None, ssbo, vec![c_one]).unwrap();
+    b.atomic_store(dst, c_scope, c_sem, v).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn differential_atomic_load_then_store() {
+    let spv = build_atomic_load_store_cs();
+    let dir = TempDir::new().unwrap();
+    let mut b_buf = vec![0u8; 16];
+    let mut c_buf = vec![0u8; 16];
+    // Pre-fill a = 0x12345678; b stays 0.
+    b_buf[0..4].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+    c_buf[0..4].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    assert_eq!(b_buf, c_buf, "diverge on atomicLoad/Store");
+    let a = u32::from_le_bytes(b_buf[0..4].try_into().unwrap());
+    let b = u32::from_le_bytes(b_buf[4..8].try_into().unwrap());
+    assert_eq!(a, 0x1234_5678, "a should still hold the prefill");
+    assert_eq!(b, 0x1234_5678, "b should have received the loaded value");
+}
+
+/// CS doing CAS: if (ssbo.a == comparator) ssbo.a = desired.
+/// Result is the old value.  Tests both the success and
+/// failure paths by varying the prefill.
+fn build_atomic_cas_cs() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+        MemorySemantics, Scope,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let void_fn = b.type_function(void, vec![]);
+    let s = b.type_struct(vec![u32_ty, u32_ty]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.member_decorate(s, 1, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(4)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_u = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+    let ssbo = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let c_zero    = b.constant_bit32(u32_ty, 0);
+    let c_one     = b.constant_bit32(u32_ty, 1);
+    let c_42      = b.constant_bit32(u32_ty, 42);
+    let c_99      = b.constant_bit32(u32_ty, 99);
+    let c_scope   = b.constant_bit32(u32_ty, Scope::Device as u32);
+    let c_sem     = b.constant_bit32(u32_ty,
+        MemorySemantics::ATOMIC_COUNTER_MEMORY.bits());
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let dst_a = b.access_chain(ptr_u, None, ssbo, vec![c_zero]).unwrap();
+    // CAS(ssbo.a, comparator=42, desired=99) -> old value
+    let old = b.atomic_compare_exchange(
+        u32_ty, None, dst_a, c_scope, c_sem, c_sem, c_99, c_42).unwrap();
+    // ssbo.b = old value returned by CAS
+    let dst_b = b.access_chain(ptr_u, None, ssbo, vec![c_one]).unwrap();
+    b.store(dst_b, old, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn differential_atomic_cas_success_path() {
+    // Prefill ssbo.a = 42 (matches comparator).
+    // Expect: ssbo.a = 99 (swap succeeded), ssbo.b = 42 (old).
+    let spv = build_atomic_cas_cs();
+    let dir = TempDir::new().unwrap();
+    let mut b_buf = vec![0u8; 16];
+    let mut c_buf = vec![0u8; 16];
+    b_buf[0..4].copy_from_slice(&42u32.to_le_bytes());
+    c_buf[0..4].copy_from_slice(&42u32.to_le_bytes());
+    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    assert_eq!(b_buf, c_buf, "diverge on CAS success");
+    assert_eq!(u32::from_le_bytes(b_buf[0..4].try_into().unwrap()), 99,
+        "CAS success should write desired (99)");
+    assert_eq!(u32::from_le_bytes(b_buf[4..8].try_into().unwrap()), 42,
+        "CAS should return old value (42)");
+}
+
+#[test]
+fn differential_atomic_cas_failure_path() {
+    // Prefill ssbo.a = 7 (does NOT match comparator=42).
+    // Expect: ssbo.a unchanged at 7, ssbo.b = 7 (returned old).
+    let spv = build_atomic_cas_cs();
+    let dir = TempDir::new().unwrap();
+    let mut b_buf = vec![0u8; 16];
+    let mut c_buf = vec![0u8; 16];
+    b_buf[0..4].copy_from_slice(&7u32.to_le_bytes());
+    c_buf[0..4].copy_from_slice(&7u32.to_le_bytes());
+    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    assert_eq!(b_buf, c_buf, "diverge on CAS failure");
+    assert_eq!(u32::from_le_bytes(b_buf[0..4].try_into().unwrap()), 7,
+        "CAS failure should leave value unchanged");
+    assert_eq!(u32::from_le_bytes(b_buf[4..8].try_into().unwrap()), 7,
+        "CAS should return the old value even on failure");
+}
+
 #[test]
 fn differential_six_binding_constant_store() {
     let spv = build_n_binding_constants(6);

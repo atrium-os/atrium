@@ -1651,6 +1651,65 @@ fn emit_function(
                 let new_off = base_off.saturating_add(*byte_offset as i32);
                 pointers.insert(result.id, (param, new_off));
             }
+            Op::AtomicLoad(ptr) => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "AtomicLoad without result".into()))?;
+                let (x_base, base_off) =
+                    resolve_or_make_pointer(ptr, &mut pointers, func.stage)?;
+                if base_off < 0 || base_off > u16::MAX as i32 {
+                    return Err(BackendError::Unsupported(format!(
+                        "AtomicLoad ptr offset {base_off} outside imm12 range")));
+                }
+                let w_dst = int_pool.alloc(result.id)?;
+                a.emit(asm::ldr_w_offset(w_dst, x_base, base_off as u16));
+                ints.insert(result.id, w_dst);
+            }
+            Op::AtomicStore { ptr, value } => {
+                let (x_base, base_off) =
+                    resolve_or_make_pointer(ptr, &mut pointers, func.stage)?;
+                if base_off < 0 || base_off > u16::MAX as i32 {
+                    return Err(BackendError::Unsupported(format!(
+                        "AtomicStore ptr offset {base_off} outside imm12 range")));
+                }
+                let w_val = *ints.get(&value.id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "AtomicStore value {:?} not in ints", value.id)))?;
+                a.emit(asm::str_w_offset(w_val, x_base, base_off as u16));
+            }
+            Op::AtomicCompareExchange { ptr, expected, desired } => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "AtomicCompareExchange without result".into()))?;
+                let (x_base, base_off) =
+                    resolve_or_make_pointer(ptr, &mut pointers, func.stage)?;
+                if base_off < 0 || base_off > u16::MAX as i32 {
+                    return Err(BackendError::Unsupported(format!(
+                        "AtomicCompareExchange ptr offset {base_off} outside imm12 range")));
+                }
+                let w_exp = *ints.get(&expected.id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "AtomicCompareExchange expected {:?} not in ints",
+                        expected.id)))?;
+                let w_des = *ints.get(&desired.id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "AtomicCompareExchange desired {:?} not in ints",
+                        desired.id)))?;
+                // Lower:
+                //   ldr  w_old, [base, #off]
+                //   cmp  w_old, w_exp
+                //   csel w_new, w_des, w_old, eq   ; (old==exp) ? des : old
+                //   str  w_new, [base, #off]
+                // Result = w_old.
+                let w_old = int_pool.alloc(result.id)?;
+                a.emit(asm::ldr_w_offset(w_old, x_base, base_off as u16));
+                a.emit(asm::cmp_w(w_old, w_exp));
+                let w_new = asm::Wreg(9);
+                // csel_w_eq writes desired if EQ, else old.
+                a.emit(asm::csel_w(w_new, w_des, w_old, asm::Cond::Eq));
+                a.emit(asm::str_w_offset(w_new, x_base, base_off as u16));
+                ints.insert(result.id, w_old);
+            }
             Op::AtomicIAdd { ptr, value }
             | Op::AtomicAnd { ptr, value }
             | Op::AtomicOr  { ptr, value }
@@ -3419,9 +3478,17 @@ fn compute_last_use_flat(
             | Op::AtomicAnd { ptr: _, value }
             | Op::AtomicOr  { ptr: _, value }
             | Op::AtomicXor { ptr: _, value }
-            | Op::AtomicExchange { ptr: _, value } => {
+            | Op::AtomicExchange { ptr: _, value }
+            | Op::AtomicStore { ptr: _, value } => {
                 // value is an int scalar; mark for IntPool.
                 mark(value.id);
+            }
+            Op::AtomicCompareExchange { ptr: _, expected, desired } => {
+                mark(expected.id);
+                mark(desired.id);
+            }
+            Op::AtomicLoad(_) => {
+                // No int operand to mark; result is fresh.
             }
             Op::Load(_) => {
                 // The result may produce a vec4; if so,

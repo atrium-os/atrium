@@ -1241,6 +1241,111 @@ fn translate_inst(
         // dispatched to the appropriate IR op constructor.
         // Memory scope + semantics are ignored on the serial
         // dispatcher (see Op::AtomicIAdd comment in spv-ir).
+        // OpAtomicLoad: <result_type> <result_id> <pointer>
+        //               <scope> <semantics>
+        // No value operand.  Lowers to a plain load on the
+        // serial dispatcher.
+        SpvOp::AtomicLoad => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed(
+                    "AtomicLoad without result id".to_string()))?;
+            let result_type_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed(
+                    "AtomicLoad without result type".to_string()))?;
+            let result_ty = types.get(result_type_id)?.clone();
+            let ptr_id = expect_id(&spv_inst.operands, 0)?;
+            let ptr_value = match resolve_variable(
+                ptr_id, types, iface, id_map, next_value_id,
+            )? {
+                Some(v) => v,
+                None => id_map.get(&ptr_id).cloned().ok_or_else(||
+                    FrontendError::Malformed(format!(
+                        "AtomicLoad pointer id {ptr_id} not resolvable",
+                    )))?,
+            };
+            let result = alloc_or_get_result(
+                result_id, result_ty, id_map, next_value_id);
+            insts.push(Inst {
+                op: Op::AtomicLoad(ptr_value),
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
+
+        // OpAtomicStore: <pointer> <scope> <semantics> <value>
+        // No result.  Lowers to a plain store.
+        SpvOp::AtomicStore => {
+            let ptr_id = expect_id(&spv_inst.operands, 0)?;
+            let value_id = expect_id(&spv_inst.operands, 3)?;
+            let ptr_value = match resolve_variable(
+                ptr_id, types, iface, id_map, next_value_id,
+            )? {
+                Some(v) => v,
+                None => id_map.get(&ptr_id).cloned().ok_or_else(||
+                    FrontendError::Malformed(format!(
+                        "AtomicStore pointer id {ptr_id} not resolvable",
+                    )))?,
+            };
+            let value = resolve_value(
+                value_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset,
+            )?;
+            insts.push(Inst {
+                op: Op::AtomicStore { ptr: ptr_value, value },
+                result: None,
+                source_spirv_offset,
+            });
+            Ok(())
+        }
+
+        // OpAtomicCompareExchange:
+        //   <result_type> <result_id> <pointer>
+        //   <scope> <equal_semantics> <unequal_semantics>
+        //   <value> <comparator>
+        // Returns the OLD value at the pointer.  If the old
+        // value equals `comparator`, writes `value`.
+        SpvOp::AtomicCompareExchange => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed(
+                    "AtomicCompareExchange without result id".to_string()))?;
+            let result_type_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed(
+                    "AtomicCompareExchange without result type".to_string()))?;
+            let result_ty = types.get(result_type_id)?.clone();
+            let ptr_id      = expect_id(&spv_inst.operands, 0)?;
+            // 1..4 = scope, equal_sem, unequal_sem -- ignored.
+            let value_id    = expect_id(&spv_inst.operands, 4)?;
+            let cmp_id      = expect_id(&spv_inst.operands, 5)?;
+            let ptr_value = match resolve_variable(
+                ptr_id, types, iface, id_map, next_value_id,
+            )? {
+                Some(v) => v,
+                None => id_map.get(&ptr_id).cloned().ok_or_else(||
+                    FrontendError::Malformed(format!(
+                        "AtomicCompareExchange pointer id {ptr_id} not resolvable",
+                    )))?,
+            };
+            let desired = resolve_value(
+                value_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset,
+            )?;
+            let expected = resolve_value(
+                cmp_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset,
+            )?;
+            let result = alloc_or_get_result(
+                result_id, result_ty, id_map, next_value_id);
+            insts.push(Inst {
+                op: Op::AtomicCompareExchange {
+                    ptr: ptr_value, expected, desired,
+                },
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
+
         SpvOp::AtomicIAdd
         | SpvOp::AtomicAnd | SpvOp::AtomicOr | SpvOp::AtomicXor
         | SpvOp::AtomicExchange => {
