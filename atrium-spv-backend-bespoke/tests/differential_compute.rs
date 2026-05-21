@@ -1985,6 +1985,86 @@ fn differential_glsl_fract() {
     assert_eq!(v, 0.75, "fract(3.75) = 0.75; got {v}");
 }
 
+/// vec4 floor / ceil / trunc -- single NEON .4S instruction
+/// when both operand and result are packed.
+fn build_glsl_vec4_round_cs() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let std_450 = b.ext_inst_import("GLSL.std.450");
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let f32_ty = b.type_float(32, None);
+    let vec4   = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let s = b.type_struct(vec![vec4, vec4, vec4]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.member_decorate(s, 1, Decoration::Offset, vec![rspirv::dr::Operand::LiteralBit32(16)]);
+    b.member_decorate(s, 2, Decoration::Offset, vec![rspirv::dr::Operand::LiteralBit32(32)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_v = b.type_pointer(None, StorageClass::StorageBuffer, vec4);
+    let ssbo  = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let c0 = b.constant_bit32(u32_ty, 0);
+    let c1 = b.constant_bit32(u32_ty, 1);
+    let c2 = b.constant_bit32(u32_ty, 2);
+    let mk_vec = |b: &mut rspirv::dr::Builder, v: [f32; 4]| {
+        let ls: Vec<_> = v.iter().map(|x| b.constant_bit32(f32_ty, x.to_bits())).collect();
+        b.constant_composite(vec4, ls)
+    };
+    let v_in = mk_vec(&mut b, [3.7, -2.3, 0.5, -0.5]);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let fl = b.ext_inst(vec4, None, std_450, 8,
+        vec![rspirv::dr::Operand::IdRef(v_in)]).unwrap();
+    let ce = b.ext_inst(vec4, None, std_450, 9,
+        vec![rspirv::dr::Operand::IdRef(v_in)]).unwrap();
+    let tr = b.ext_inst(vec4, None, std_450, 3,
+        vec![rspirv::dr::Operand::IdRef(v_in)]).unwrap();
+    let d0 = b.access_chain(ptr_v, None, ssbo, vec![c0]).unwrap();
+    b.store(d0, fl, None, vec![]).unwrap();
+    let d1 = b.access_chain(ptr_v, None, ssbo, vec![c1]).unwrap();
+    b.store(d1, ce, None, vec![]).unwrap();
+    let d2 = b.access_chain(ptr_v, None, ssbo, vec![c2]).unwrap();
+    b.store(d2, tr, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn differential_glsl_vec4_floor_ceil_trunc() {
+    let spv = build_glsl_vec4_round_cs();
+    let dir = TempDir::new().unwrap();
+    let mut b_buf = vec![0u8; 64];
+    let mut c_buf = vec![0u8; 64];
+    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    assert_eq!(b_buf, c_buf, "diverge on vec4 floor/ceil/trunc");
+    let read = |off: usize| -> f32 {
+        f32::from_le_bytes(b_buf[off..off+4].try_into().unwrap())
+    };
+    // floor((3.7, -2.3, 0.5, -0.5)) -> (3, -3, 0, -1)
+    assert_eq!([read(0), read(4), read(8), read(12)], [3.0, -3.0, 0.0, -1.0]);
+    // ceil  -> (4, -2, 1, 0)
+    assert_eq!([read(16), read(20), read(24), read(28)], [4.0, -2.0, 1.0, 0.0]);
+    // trunc -> (3, -2, 0, 0)
+    assert_eq!([read(32), read(36), read(40), read(44)], [3.0, -2.0, 0.0, 0.0]);
+}
+
 #[test]
 fn differential_glsl_floor_ceil_trunc() {
     let spv = build_glsl_floor_ceil_trunc_cs();

@@ -526,6 +526,7 @@ fn emit_function(
     let vec_fp_unop = |op: &Op| -> Option<ValueId> {
         match op {
             Op::FAbs(x) | Op::FSqrt(x) | Op::FNeg(x)
+            | Op::FFloor(x) | Op::FCeil(x) | Op::FTrunc(x)
                 if is_vec4(&x.ty) =>
                 Some(x.id),
             _ => None,
@@ -1699,35 +1700,62 @@ fn emit_function(
                     "Op::Store value {:?} not in packed/vectors/ints/scalars",
                     value.id)));
             }
-            // GLSL.std.450 math (scalar f32 + NEON vec4f).
-            // Scalar Floor/Ceil/Trunc only (no NEON .4S
-            // FRINT* helpers added yet -- the per-lane and
-            // packed-vec4 cases would need the F-unary code
-            // generalised over emit fn pointers, just like
-            // emit_fp_binop_poly is over (scalar_fn, v4s_fn);
-            // queued).
+            // GLSL.std.450 math (scalar f32 + NEON vec4f + per-lane vec).
             Op::FFloor(x) | Op::FCeil(x) | Op::FTrunc(x) => {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal("FRINT* without result".into()))?;
-                if !matches!(result.ty, Type::F32) {
-                    return Err(BackendError::Unsupported(format!(
-                        "FRINT* on non-scalar result {:?} not yet supported",
-                        result.ty)));
-                }
-                let v_src = *scalars.get(&x.id).ok_or_else(||
-                    BackendError::Internal(format!(
-                        "FRINT* source {:?} not in scalars", x.id)))?;
-                let v_dst = alloc_vreg(
-                    &mut free_pool, &mut owners,
-                    &mut used_callee_saved_v, result.id)?;
-                let enc = match &inst.op {
-                    Op::FFloor(_) => asm::frintm_s(v_dst, v_src),
-                    Op::FCeil(_)  => asm::frintp_s(v_dst, v_src),
-                    Op::FTrunc(_) => asm::frintz_s(v_dst, v_src),
+                let pick_v4s = |op: &Op, d, s| match op {
+                    Op::FFloor(_) => asm::frintm_v_4s(d, s),
+                    Op::FCeil(_)  => asm::frintp_v_4s(d, s),
+                    Op::FTrunc(_) => asm::frintz_v_4s(d, s),
                     _ => unreachable!(),
                 };
-                a.emit(enc);
-                scalars.insert(result.id, v_dst);
+                let pick_s = |op: &Op, d, s| match op {
+                    Op::FFloor(_) => asm::frintm_s(d, s),
+                    Op::FCeil(_)  => asm::frintp_s(d, s),
+                    Op::FTrunc(_) => asm::frintz_s(d, s),
+                    _ => unreachable!(),
+                };
+                if packed_ids.contains(&result.id) {
+                    let v_src = *packed.get(&x.id).ok_or_else(||
+                        BackendError::Internal(format!(
+                            "FRINT* packed source {:?} not packed", x.id)))?;
+                    let v_dst = alloc_vreg(
+                        &mut free_pool, &mut owners,
+                        &mut used_callee_saved_v, result.id)?;
+                    a.emit(pick_v4s(&inst.op, v_dst, v_src));
+                    packed.insert(result.id, v_dst);
+                } else if matches!(result.ty, Type::F32) {
+                    let v_src = *scalars.get(&x.id).ok_or_else(||
+                        BackendError::Internal(format!(
+                            "FRINT* source {:?} not in scalars", x.id)))?;
+                    let v_dst = alloc_vreg(
+                        &mut free_pool, &mut owners,
+                        &mut used_callee_saved_v, result.id)?;
+                    a.emit(pick_s(&inst.op, v_dst, v_src));
+                    scalars.insert(result.id, v_dst);
+                } else if let Some(lanes) = vectors.get(&x.id).cloned() {
+                    let mut out_lanes = Vec::with_capacity(lanes.len());
+                    for lane in &lanes {
+                        let src = *scalars.get(&lane.id).ok_or_else(||
+                            BackendError::Internal(format!(
+                                "FRINT* lane source {:?} not in scalars",
+                                lane.id)))?;
+                        let synth = ValueId(next_synth_id);
+                        next_synth_id += 1;
+                        let v_dst = alloc_vreg(
+                            &mut free_pool, &mut owners,
+                            &mut used_callee_saved_v, synth)?;
+                        a.emit(pick_s(&inst.op, v_dst, src));
+                        scalars.insert(synth, v_dst);
+                        out_lanes.push(Value { id: synth, ty: lane.ty.clone() });
+                    }
+                    vectors.insert(result.id, out_lanes);
+                } else {
+                    return Err(BackendError::Unsupported(format!(
+                        "FRINT* on {:?} -- value not in scalars/packed/vectors",
+                        result.ty)));
+                }
             }
             Op::FAbs(x) | Op::FSqrt(x) => {
                 let result = inst.result.as_ref().ok_or_else(||
@@ -3681,6 +3709,9 @@ fn compute_last_use_flat(
             }
             Op::FFloor(x) | Op::FCeil(x) | Op::FTrunc(x) => {
                 mark(x.id);
+                if let Some(lanes) = vec_lanes.get(&x.id).cloned() {
+                    for lid in &lanes { mark(*lid); }
+                }
             }
             Op::FAbs(x) | Op::FSqrt(x) => {
                 mark(x.id);
