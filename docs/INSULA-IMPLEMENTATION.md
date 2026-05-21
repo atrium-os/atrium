@@ -344,12 +344,21 @@ commits don't trigger it.
   unsigned installs require explicit `--allow-unsigned`.
   E2E-tested: trusted-publisher install, tampered-bundle
   rejection, wrong-publisher rejection.
-- **Vestibulum keystore is plaintext on disk.** Keys
-  survive daemon restart (real persistence) but the
-  `.key` files are unencrypted ed25519 secrets. macOS
-  Keychain Services wrapping is `vestibulum.md` §3.1
-  future work. Marked with `TODO(vestibulum-secure-
-  storage)` at every write site.
+- **~~Vestibulum keystore is plaintext on disk.~~**
+  Done. Per-installation 32-byte master key at
+  `<keystore>/master.key` (0o600) wraps every per-
+  service `.key` file via XChaCha20-Poly1305 — file
+  layout `[24B nonce | 32B ciphertext | 16B tag]`.
+  Master.key itself is plaintext on disk (an attacker
+  with full directory read gets everything anyway),
+  but the wrapping defends against partial-backup
+  scenarios: someone gets a few `.key` files via
+  accidental sync or backup tooling but not
+  master.key — those bytes are useless. Hardware-
+  backed wrapping (macOS Keychain Services / Secure
+  Enclave) is future work; tabellarius's substore
+  could grow the same encryption scheme on the same
+  schedule.
 - **`sandbox-exec` not `sandbox_init_with_parameters`.**
   Using Apple's supported CLI tool avoids private-SPI
   coupling. Per-unix-socket SBPL grants don't work via
