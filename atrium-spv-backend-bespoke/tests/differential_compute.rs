@@ -1316,6 +1316,85 @@ fn differential_workgroup_size_materialises_localsize() {
     assert_eq!(got, vec![7, 5, 3], "got {got:?}");
 }
 
+/// CS: writes [fabs(x), sqrt(y), fmin(x,y), fmax(x,y)]
+/// where x = -2.5 and y = 4.0 (both as constants).
+/// Exercises the GLSL.std.450 dispatch path for the four
+/// scalar f32 math ops that just landed.
+fn build_glsl_math_cs() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let std_450 = b.ext_inst_import("GLSL.std.450");
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let f32_ty = b.type_float(32, None);
+    let void_fn = b.type_function(void, vec![]);
+    let rt_arr = b.type_runtime_array(f32_ty);
+    b.decorate(rt_arr, Decoration::ArrayStride,
+        vec![rspirv::dr::Operand::LiteralBit32(4)]);
+    let s = b.type_struct(vec![rt_arr]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_f = b.type_pointer(None, StorageClass::StorageBuffer, f32_ty);
+    let ssbo = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let c_zero  = b.constant_bit32(u32_ty, 0);
+    let cx = b.constant_bit32(f32_ty, (-2.5f32).to_bits());
+    let cy = b.constant_bit32(f32_ty, 4.0f32.to_bits());
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let abs_x  = b.ext_inst(f32_ty, None, std_450, 4,  vec![rspirv::dr::Operand::IdRef(cx)]).unwrap();
+    let sqrt_y = b.ext_inst(f32_ty, None, std_450, 31, vec![rspirv::dr::Operand::IdRef(cy)]).unwrap();
+    let min_xy = b.ext_inst(f32_ty, None, std_450, 37,
+        vec![rspirv::dr::Operand::IdRef(cx), rspirv::dr::Operand::IdRef(cy)]).unwrap();
+    let max_xy = b.ext_inst(f32_ty, None, std_450, 40,
+        vec![rspirv::dr::Operand::IdRef(cx), rspirv::dr::Operand::IdRef(cy)]).unwrap();
+    let values = [abs_x, sqrt_y, min_xy, max_xy];
+    for (i, v) in values.iter().enumerate() {
+        let c_i = b.constant_bit32(u32_ty, i as u32);
+        let dst = b.access_chain(ptr_f, None, ssbo, vec![c_zero, c_i]).unwrap();
+        b.store(dst, *v, None, vec![]).unwrap();
+    }
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn differential_glsl_std_450_scalar_math() {
+    let spv = build_glsl_math_cs();
+    let dir = TempDir::new().unwrap();
+    let mut b_buf = vec![0u8; 16];
+    let mut c_buf = vec![0u8; 16];
+    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    assert_eq!(b_buf, c_buf,
+        "bespoke vs cranelift diverge on GLSL.std.450 scalar math");
+    let read = |i: usize| -> f32 {
+        f32::from_le_bytes(b_buf[i*4..i*4+4].try_into().unwrap())
+    };
+    assert_eq!(read(0), 2.5,  "fabs(-2.5) should be 2.5");
+    assert_eq!(read(1), 2.0,  "sqrt(4.0) should be 2.0");
+    assert_eq!(read(2), -2.5, "fmin(-2.5, 4.0) should be -2.5");
+    assert_eq!(read(3), 4.0,  "fmax(-2.5, 4.0) should be 4.0");
+}
+
 #[test]
 fn differential_local_invocation_index_linearises() {
     let spv = build_local_index_cs();

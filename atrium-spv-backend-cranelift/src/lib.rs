@@ -1250,6 +1250,18 @@ impl FnTranslator {
             Op::FNeg(a) => self.emit_float_unop(
                 builder, &inst.result, a, |b, x| b.ins().fneg(x),
             ),
+            Op::FAbs(a) => self.emit_float_unop(
+                builder, &inst.result, a, |b, x| b.ins().fabs(x),
+            ),
+            Op::FSqrt(a) => self.emit_float_unop(
+                builder, &inst.result, a, |b, x| b.ins().sqrt(x),
+            ),
+            Op::FMin(a, b) => self.emit_float_binop(
+                builder, &inst.result, a, b, |b, x, y| b.ins().fmin(x, y),
+            ),
+            Op::FMax(a, b) => self.emit_float_binop(
+                builder, &inst.result, a, b, |b, x, y| b.ins().fmax(x, y),
+            ),
             // Float comparisons (constraint B4: result
             // is i32 0/1). Cranelift's fcmp produces an
             // I8 boolean; we uextend to I32 to match our

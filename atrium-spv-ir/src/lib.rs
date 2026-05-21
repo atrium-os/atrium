@@ -493,6 +493,15 @@ pub enum Op {
 
     // ── Type conversions ───────────────────────────────────────
 
+    /// `abs(x)` for f32 scalars and vectors (GLSL.std.450 FAbs).
+    FAbs(Value),
+    /// `sqrt(x)` for f32 scalars and vectors (GLSL.std.450 Sqrt).
+    FSqrt(Value),
+    /// `min(a, b)` for f32 scalars/vectors (GLSL.std.450 FMin).
+    FMin(Value, Value),
+    /// `max(a, b)` for f32 scalars/vectors (GLSL.std.450 FMax).
+    FMax(Value, Value),
+
     /// Signed int → float.
     ConvertSToF(Value),
     /// Float → signed int (truncation toward zero per SPIR-V).

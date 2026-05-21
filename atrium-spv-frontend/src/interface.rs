@@ -76,6 +76,12 @@ pub struct InterfaceContext {
     /// in IR so the backend can fold it into
     /// `gl_GlobalInvocationID` codegen.
     pub local_sizes: HashMap<Word, (u32, u32, u32)>,
+    /// SPIR-V OpExtInstImport result ids that map to the
+    /// GLSL.std.450 extended instruction set.  Used by the
+    /// function translator to distinguish OpExtInst calls
+    /// into GLSL.std.450 (which we handle) from other sets
+    /// (which we reject).
+    pub glsl_std_450_imports: std::collections::HashSet<Word>,
 }
 
 /// One member of an `OpTypeStruct` annotated with an
@@ -96,6 +102,21 @@ impl InterfaceContext {
         types: &TypeContext,
     ) -> Result<Self, FrontendError> {
         let mut ctx = InterfaceContext::default();
+
+        // OpExtInstImport: record result_ids whose set name
+        // is "GLSL.std.450" so the function translator can
+        // dispatch OpExtInst calls against the right set.
+        for inst in &module.ext_inst_imports {
+            if inst.class.opcode != SpvOp::ExtInstImport { continue; }
+            let Some(result_id) = inst.result_id else { continue };
+            let name = match inst.operands.first() {
+                Some(Operand::LiteralString(s)) => s.clone(),
+                _ => continue,
+            };
+            if name == "GLSL.std.450" {
+                ctx.glsl_std_450_imports.insert(result_id);
+            }
+        }
 
         // Entry points.
         for inst in &module.entry_points {

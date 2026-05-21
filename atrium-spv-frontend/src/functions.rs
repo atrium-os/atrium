@@ -1561,6 +1561,80 @@ fn translate_inst(
             Ok(())
         }
 
+        // OpExtInst: <result_type> <result_id> <set_id> <inst_enum> <operands...>
+        // We support a subset of GLSL.std.450 math functions
+        // -- the inst_enum value identifies which one.
+        // Enums per the GLSL.std.450 spec.
+        SpvOp::ExtInst => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed(
+                    "ExtInst without result id".to_string()))?;
+            let result_type_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed(
+                    "ExtInst without result type".to_string()))?;
+            let result_ty = types.get(result_type_id)?.clone();
+            let set_id = expect_id(&spv_inst.operands, 0)?;
+            if !iface.glsl_std_450_imports.contains(&set_id) {
+                return Err(FrontendError::Unsupported(format!(
+                    "ExtInst with set_id {set_id} not GLSL.std.450",
+                )));
+            }
+            let inst_enum = match spv_inst.operands.get(1) {
+                Some(Operand::LiteralExtInstInteger(n)) => *n,
+                other => return Err(FrontendError::Malformed(format!(
+                    "ExtInst missing inst_enum (got {other:?})",
+                ))),
+            };
+            // GLSL.std.450 enums we handle:
+            //   4 = FAbs    arg: x
+            //   31 = Sqrt   arg: x
+            //   37 = FMin   args: x, y
+            //   40 = FMax   args: x, y
+            let op = match inst_enum {
+                4 => {
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    Op::FAbs(x)
+                }
+                31 => {
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    Op::FSqrt(x)
+                }
+                37 => {
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let y_id = expect_id(&spv_inst.operands, 3)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let y = resolve_value(y_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    Op::FMin(x, y)
+                }
+                40 => {
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let y_id = expect_id(&spv_inst.operands, 3)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let y = resolve_value(y_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    Op::FMax(x, y)
+                }
+                other => return Err(FrontendError::Unsupported(format!(
+                    "GLSL.std.450 instruction enum {other} not yet supported",
+                ))),
+            };
+            let result = alloc_or_get_result(
+                result_id, result_ty, id_map, next_value_id);
+            insts.push(Inst {
+                op,
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
+
         other => Err(FrontendError::Unsupported(format!(
             "opcode {other:?} not supported in phase 1 v3",
         ))),
