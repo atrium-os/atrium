@@ -699,31 +699,36 @@ impl FnTranslator {
                 Ok(())
             }
             Op::Store { ptr, value } => {
-                // Resolve pointer: only Output / Input /
-                // Uniform / PushConstant pointers from
-                // the SPIR-V are valid in phase 2 v2;
-                // they reroute to the corresponding
-                // function parameter.
-                let ptr_param = self.resolve_pointer_param(&ptr.ty)?;
-                // Resolve value: it must be a vector for
-                // the constant-color case (vec4<f32>).
-                let lanes = self.vectors.get(&value.id).cloned().ok_or_else(||
-                    BackendError::Unsupported(format!(
-                        "Op::Store value is not a vector in scalars/vectors maps; \
-                         only vec stores supported in phase 2 v2 (value id {:?})",
-                        value.id,
-                    )))?;
-                // Emit one store per lane at consecutive
-                // 4-byte offsets. Per constraint B3 we
-                // write all lanes (including vec3's high
-                // lane is undefined and we don't have
-                // vec3 in phase 2 v2 anyway).
-                let bytes_per_lane = 4;
-                for (i, lane) in lanes.iter().enumerate() {
-                    let offset = (i as i32) * (bytes_per_lane as i32);
-                    builder.ins().store(MemFlags::new(), *lane, ptr_param, offset);
+                // Resolve pointer: any prior OpAccessChain has
+                // landed (param, byte_offset) in self.pointers,
+                // so use resolve_or_make_pointer to honour the
+                // chain's offset rather than always writing at
+                // the base.  Bare-Variable pointers (no chain)
+                // fall through to offset 0.
+                let (ptr_param, base_off) = self.resolve_or_make_pointer(ptr)?;
+                // Vector value: emit one store per lane at
+                // consecutive 4-byte offsets.
+                if let Some(lanes) = self.vectors.get(&value.id).cloned() {
+                    let bytes_per_lane = 4;
+                    for (i, lane) in lanes.iter().enumerate() {
+                        let lane_off = base_off
+                            .saturating_add((i as i32) * (bytes_per_lane as i32));
+                        builder.ins().store(MemFlags::new(), *lane, ptr_param, lane_off);
+                    }
+                    return Ok(());
                 }
-                Ok(())
+                // Scalar value: one store sized to the pointee
+                // type (f32 / i32 / u32 / bool all land as a
+                // 4-byte little-endian store via Cranelift's
+                // type-sized i.store insn).
+                if let Some(s) = self.scalars.get(&value.id).copied() {
+                    builder.ins().store(MemFlags::new(), s, ptr_param, base_off);
+                    return Ok(());
+                }
+                Err(BackendError::Unsupported(format!(
+                    "Op::Store value {:?} not in vectors or scalars maps",
+                    value.id,
+                )))
             }
             // OpAccessChain: produce a (param, offset)
             // pointer repr by adding the IR's resolved

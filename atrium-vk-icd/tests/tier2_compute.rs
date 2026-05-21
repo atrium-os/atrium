@@ -1,6 +1,6 @@
 //! Compute pipeline + dispatch end-to-end through tier-2.
 //!
-//! Two tests:
+//! Three tests:
 //!
 //!   * `vk_app_compute_dispatch_drives_cs_main_per_invocation`
 //!     -- empty CS, asserts cs_invocation_count matches
@@ -8,12 +8,16 @@
 //!     (SPIR-V LocalSize extraction, Tier2ComputeStateBlob
 //!     round-trip, dispatcher's invocation loop) is correct.
 //!   * `vk_app_compute_ssbo_write_lands_in_output_buffer` --
-//!     CS writes a vec4 to a StorageBuffer SSBO; asserts the
-//!     bytes land in Tier2Backend::compute_output_bytes().
-//!     Proves the CsMain `out_buffer` pointer is wired through
-//!     to the dispatcher's per-dispatch SSBO and that the
-//!     Cranelift backend maps `(Compute, StorageBuffer)` ->
-//!     the out_buffer parameter correctly.
+//!     CS writes a vec4 to a StorageBuffer SSBO.
+//!   * `vk_app_compute_ssbo_scalar_write` -- CS writes a u32
+//!     to ssbo[0]. Exercises the Cranelift Op::Store
+//!     scalar-path that landed alongside this test.
+//!
+//! Together the SSBO tests prove the CsMain `out_buffer`
+//! pointer is wired through to the dispatcher's per-dispatch
+//! SSBO and that the Cranelift backend maps `(Compute,
+//! StorageBuffer)` -> the out_buffer parameter for both
+//! vector and scalar OpStore paths.
 
 mod common;
 
@@ -360,6 +364,162 @@ fn vk_app_compute_ssbo_write_lands_in_output_buffer() {
     // the buffer before invocations).
     assert!(out[16..].iter().all(|&b| b == 0),
         "buffer past offset 16 should be zero, got {:?}", &out[16..32.min(out.len())]);
+
+    unsafe { atrium_vk_icd::vkDestroyInstance(instance, std::ptr::null()); }
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
+
+/// Compute SPIR-V that writes a u32 constant to the first
+/// slot of an SSBO -- exercising the scalar-store path the
+/// Cranelift backend just gained.  Pre-fix this would have
+/// failed with "Op::Store value is not a vector".
+fn build_ssbo_scalar_write_cs(value: u32) -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode, ExecutionModel,
+        FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let void_fn = b.type_function(void, vec![]);
+
+    let ssbo_struct = b.type_struct(vec![u32_ty]);
+    b.decorate(ssbo_struct, Decoration::Block, vec![]);
+    b.member_decorate(ssbo_struct, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+
+    let ptr_ssbo_struct = b.type_pointer(None, StorageClass::StorageBuffer, ssbo_struct);
+    let ptr_ssbo_u32    = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+    let ssbo_var = b.variable(ptr_ssbo_struct, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo_var, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo_var, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+
+    let c_zero  = b.constant_bit32(u32_ty, 0);
+    let c_value = b.constant_bit32(u32_ty, value);
+
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let dst = b.access_chain(ptr_ssbo_u32, None, ssbo_var, vec![c_zero]).unwrap();
+    b.store(dst, c_value, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo_var]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn vk_app_compute_ssbo_scalar_write() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let sock = tmp_socket("compute_ssbo_scalar");
+    let cache_dir = TempDir::new().unwrap();
+    let registry = Arc::new(Tier2Registry::new(LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    }));
+    let tier2_backend = Arc::new(Tier2Backend::new(registry.clone()));
+    let backend_for_listener: Arc<dyn Backend> = tier2_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap()
+        .with_tier2_registry(registry.clone());
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+
+    let _env = EnvLock::set(&sock);
+
+    let mut instance: VkInstance = std::ptr::null_mut();
+    unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
+    let mut pds: [VkPhysicalDevice; 1] = [std::ptr::null_mut(); 1];
+    let mut cap: u32 = 1;
+    unsafe { vkEnumeratePhysicalDevices(instance, &mut cap, pds.as_mut_ptr()); }
+    let mut device: VkDevice = std::ptr::null_mut();
+    unsafe { vkCreateDevice(pds[0], std::ptr::null(), std::ptr::null(), &mut device); }
+    let mut queue: VkQueue = std::ptr::null_mut();
+    unsafe { vkGetDeviceQueue(device, 0, 0, &mut queue); }
+
+    let cs_spv = build_ssbo_scalar_write_cs(0xCAFE_BABE);
+    let cs_mod = make_shader_module(device, &cs_spv);
+
+    use ash::vk;
+    use ash::vk::Handle;
+    let stage = vk::PipelineShaderStageCreateInfo {
+        s_type: vk::StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
+        p_next: std::ptr::null(),
+        flags: vk::PipelineShaderStageCreateFlags::empty(),
+        stage: vk::ShaderStageFlags::COMPUTE,
+        module: vk::ShaderModule::from_raw(cs_mod),
+        p_name: b"main\0".as_ptr() as *const i8,
+        p_specialization_info: std::ptr::null(),
+        _marker: std::marker::PhantomData,
+    };
+    let info = vk::ComputePipelineCreateInfo {
+        s_type: vk::StructureType::COMPUTE_PIPELINE_CREATE_INFO,
+        p_next: std::ptr::null(),
+        flags: vk::PipelineCreateFlags::empty(),
+        stage,
+        layout: vk::PipelineLayout::null(),
+        base_pipeline_handle: vk::Pipeline::null(),
+        base_pipeline_index: 0,
+        _marker: std::marker::PhantomData,
+    };
+    let infos = [info];
+    let mut pipeline: u64 = 0;
+    unsafe {
+        vkCreateComputePipelines(
+            device, 0, 1,
+            infos.as_ptr() as *const std::ffi::c_void,
+            std::ptr::null(), &mut pipeline,
+        );
+    }
+    assert!(pipeline != 0);
+    thread::sleep(Duration::from_millis(200));
+
+    let pid = aqueduct_gpu::ids::ResourceId(pipeline as u32);
+    assert!(tier2_backend.pipeline_compute(pid).is_some(),
+        "scalar-write CS should compile + bind after the Op::Store \
+         scalar-path landed");
+
+    let mut pool: u64 = 0;
+    unsafe { vkCreateCommandPool(device, std::ptr::null(), std::ptr::null(), &mut pool); }
+    let mut cb_info = [0u8; 40];
+    cb_info[0..4].copy_from_slice(&40u32.to_le_bytes());
+    cb_info[16..24].copy_from_slice(&pool.to_le_bytes());
+    cb_info[28..32].copy_from_slice(&1u32.to_le_bytes());
+    let mut cbs: [VkCommandBuffer; 1] = [std::ptr::null_mut(); 1];
+    unsafe { vkAllocateCommandBuffers(device, cb_info.as_ptr() as *const _, cbs.as_mut_ptr()); }
+    let cb = cbs[0];
+
+    unsafe { vkBeginCommandBuffer(cb, std::ptr::null()); }
+    unsafe { vkCmdBindPipeline(cb, 1, pipeline); }
+    unsafe { vkCmdDispatch(cb, 1, 1, 1); }
+    unsafe { vkEndCommandBuffer(cb); }
+
+    let mut submit = [0u8; 72];
+    submit[0..4].copy_from_slice(&4u32.to_le_bytes());
+    submit[40..44].copy_from_slice(&1u32.to_le_bytes());
+    let cb_arr = [cb];
+    submit[48..56].copy_from_slice(&(cb_arr.as_ptr() as u64).to_le_bytes());
+    unsafe {
+        vkQueueSubmit(queue, 1, submit.as_ptr() as *const _, std::ptr::null_mut());
+    }
+    thread::sleep(Duration::from_millis(300));
+
+    let out = tier2_backend.compute_output_bytes().expect("output");
+    let got = u32::from_le_bytes(out[0..4].try_into().unwrap());
+    assert_eq!(got, 0xCAFE_BABE,
+        "expected 0xCAFEBABE in ssbo[0], got {got:#x}");
 
     unsafe { atrium_vk_icd::vkDestroyInstance(instance, std::ptr::null()); }
     let _ = server_thread;
