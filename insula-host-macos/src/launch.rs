@@ -87,6 +87,12 @@ pub struct LaunchOptions<'a> {
     /// wiring shape: passes through as
     /// `$ATRIUM_TABELLARIUS_SOCKET` + SBPL grant.
     pub tabellarius_socket: Option<&'a Path>,
+
+    /// Optional: path to a Fresco scene-server socket
+    /// (frescod / fresco-scene-server) the app reaches
+    /// for `atrium_window_*`. Passes through as
+    /// `$ATRIUM_FRESCO_SOCKET` + SBPL grant.
+    pub fresco_socket: Option<&'a Path>,
 }
 
 impl<'a> LaunchOptions<'a> {
@@ -102,6 +108,7 @@ impl<'a> LaunchOptions<'a> {
             netd_socket: None,
             praeco_socket: None,
             tabellarius_socket: None,
+            fresco_socket: None,
         }
     }
 }
@@ -165,6 +172,7 @@ pub fn launch(
     let netd_socket_canon = opts.netd_socket.map(canon_socket);
     let praeco_socket_canon = opts.praeco_socket.map(canon_socket);
     let tabellarius_socket_canon = opts.tabellarius_socket.map(canon_socket);
+    let fresco_socket_canon = opts.fresco_socket.map(canon_socket);
 
     // SBPL grant covers any combination of unix sockets
     // by switching on network-outbound once if any are
@@ -173,7 +181,8 @@ pub fn launch(
         .or(vest_socket_canon.as_deref())
         .or(netd_socket_canon.as_deref())
         .or(praeco_socket_canon.as_deref())
-        .or(tabellarius_socket_canon.as_deref());
+        .or(tabellarius_socket_canon.as_deref())
+        .or(fresco_socket_canon.as_deref());
     let profile = sbpl::render_profile_full(
         manifest,
         log_socket_canon.as_deref(),
@@ -181,6 +190,7 @@ pub fn launch(
         netd_socket_canon.as_deref(),
         praeco_socket_canon.as_deref(),
         tabellarius_socket_canon.as_deref(),
+        fresco_socket_canon.as_deref(),
         any_unix_socket,
     );
 
@@ -230,6 +240,9 @@ pub fn launch(
     }
     if let Some(sock) = tabellarius_socket_canon.as_deref() {
         cmd.env("ATRIUM_TABELLARIUS_SOCKET", sock);
+    }
+    if let Some(sock) = fresco_socket_canon.as_deref() {
+        cmd.env("ATRIUM_FRESCO_SOCKET", sock);
     }
 
     if opts.capture_output {

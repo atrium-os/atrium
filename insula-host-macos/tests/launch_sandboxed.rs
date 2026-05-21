@@ -53,6 +53,7 @@ fn launches_echo_inside_sandbox() {
         netd_socket: None,
         praeco_socket: None,
         tabellarius_socket: None,
+        fresco_socket: None,
     };
 
     let mut child = launch(&manifest, &opts)
@@ -108,6 +109,7 @@ fn sandbox_actually_constrains_writes_outside_container() {
         netd_socket: None,
         praeco_socket: None,
         tabellarius_socket: None,
+        fresco_socket: None,
     };
 
     let mut child = launch(&manifest, &opts)

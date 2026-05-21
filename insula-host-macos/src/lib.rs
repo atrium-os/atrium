@@ -34,6 +34,7 @@ pub mod sbpl;
 pub use error::Error;
 pub use install::{
     install, launch_installed, launch_installed_all, launch_installed_full,
-    launch_installed_v2, launch_installed_v3, launch_installed_with_log, InstalledApp,
+    launch_installed_v2, launch_installed_v3, launch_installed_v4,
+    launch_installed_with_log, InstalledApp,
 };
 pub use launch::{launch, LaunchOptions, SandboxedChild};

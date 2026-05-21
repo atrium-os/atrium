@@ -604,10 +604,15 @@ fn cmd_launch(args: &[String], install_root: &Path) -> Result<(), String> {
         Daemon::Tabellarius,
         "INSULA_TABELLARIUSD_SOCKET",
     );
+    // Fresco is externally managed (not auto-spawned),
+    // so we only honor an explicit env override here.
+    // No platform-default discovery path yet.
+    let fresco_socket: Option<PathBuf> =
+        std::env::var_os("INSULA_FRESCO_SOCKET").map(PathBuf::from);
 
     // Inherit stdio for `insula launch`; the user wants
     // to see the app's output.
-    let mut child = host::launch_installed_v3(
+    let mut child = host::launch_installed_v4(
         &installed,
         &app_args_raw,
         false,
@@ -616,6 +621,7 @@ fn cmd_launch(args: &[String], install_root: &Path) -> Result<(), String> {
         netd_socket.as_deref(),
         praeco_socket.as_deref(),
         tabellarius_socket.as_deref(),
+        fresco_socket.as_deref(),
     )
     .map_err(|e| format!("launch: {}", e))?;
 
