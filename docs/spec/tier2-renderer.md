@@ -971,8 +971,8 @@ specifically supports:
 - GLSL.std.450 ExtInst dispatch for: FAbs, SAbs, Floor,
   Ceil, Trunc, Fract, FSign, FMod, Sqrt, InverseSqrt,
   FMin, FMax, FClamp, FMix, Step, SmoothStep, Length,
-  Distance, Normalize, Reflect.  Sin/cos/exp/log queued
-  (need polynomial approximations or libcall).
+  Distance, Normalize, Reflect, Cross.  Sin/cos/exp/log
+  queued (need polynomial approximations or libcall).
 
 **Bespoke backend (atrium-spv-backend-bespoke):**
 
