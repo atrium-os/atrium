@@ -965,6 +965,9 @@ specifically supports:
 - Atomic ops: AtomicIAdd, ISub, IIncrement, IDecrement,
   And, Or, Xor, Exchange, Load, Store,
   CompareExchange, SMin/SMax/UMin/UMax.
+- Core bitwise ops: BitwiseAnd/Or/Xor, Not,
+  ShiftLeft/RightLogical/RightArithmetic, BitReverse,
+  BitCount (SWAR popcount synthesised at IR level).
 - Barriers (ControlBarrier, MemoryBarrier) — no-ops on
   the serial dispatcher, queued for a real lowering when
   invocations parallelise.

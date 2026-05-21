@@ -554,6 +554,73 @@ fn translate_inst(
             spv_inst, types, constants, iface,
             id_map, next_value_id, insts, source_spirv_offset,
             |a, b| Op::AShr(a, b)),
+        SpvOp::BitReverse => emit_unop_int(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            Op::Rbit),
+        SpvOp::BitCount => {
+            // SWAR popcount on u32:
+            //   x = x - ((x >> 1) & 0x55555555)
+            //   x = (x & 0x33333333) + ((x >> 2) & 0x33333333)
+            //   x = (x + (x >> 4)) & 0x0F0F0F0F
+            //   x = (x * 0x01010101) >> 24
+            // All ops already lowered on both backends.
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed("BitCount without result id".into()))?;
+            let result_ty_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed("BitCount without result type".into()))?;
+            let result_ty = types.get(result_ty_id)?.clone();
+            let x_id = expect_id(&spv_inst.operands, 0)?;
+            let x = resolve_value(x_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            // s1 = x >> 1
+            let c1 = push_ci32(1, source_spirv_offset, insts, next_value_id);
+            let s1 = push_i32(Op::LShr(x.clone(), c1),
+                source_spirv_offset, insts, next_value_id);
+            let m_5 = push_ci32(0x5555_5555, source_spirv_offset, insts, next_value_id);
+            let s1_m = push_i32(Op::BitAnd(s1, m_5),
+                source_spirv_offset, insts, next_value_id);
+            let x1 = push_i32(Op::ISub(x, s1_m),
+                source_spirv_offset, insts, next_value_id);
+            // m_3 = 0x33333333
+            let c2 = push_ci32(2, source_spirv_offset, insts, next_value_id);
+            let m_3a = push_ci32(0x3333_3333, source_spirv_offset, insts, next_value_id);
+            let m_3b = push_ci32(0x3333_3333, source_spirv_offset, insts, next_value_id);
+            let s2 = push_i32(Op::LShr(x1.clone(), c2),
+                source_spirv_offset, insts, next_value_id);
+            let s2_m = push_i32(Op::BitAnd(s2, m_3a),
+                source_spirv_offset, insts, next_value_id);
+            let x1_m = push_i32(Op::BitAnd(x1, m_3b),
+                source_spirv_offset, insts, next_value_id);
+            let x2 = push_i32(Op::IAdd(x1_m, s2_m),
+                source_spirv_offset, insts, next_value_id);
+            // x = (x + (x >> 4)) & 0x0F0F0F0F
+            let c4 = push_ci32(4, source_spirv_offset, insts, next_value_id);
+            let s4 = push_i32(Op::LShr(x2.clone(), c4),
+                source_spirv_offset, insts, next_value_id);
+            let xs4 = push_i32(Op::IAdd(x2, s4),
+                source_spirv_offset, insts, next_value_id);
+            let m_f = push_ci32(0x0F0F_0F0F, source_spirv_offset, insts, next_value_id);
+            let x3 = push_i32(Op::BitAnd(xs4, m_f),
+                source_spirv_offset, insts, next_value_id);
+            // x = (x * 0x01010101) >> 24
+            let m_1 = push_ci32(0x0101_0101, source_spirv_offset, insts, next_value_id);
+            let xm = push_i32(Op::IMul(x3, m_1),
+                source_spirv_offset, insts, next_value_id);
+            let c24 = push_ci32(24, source_spirv_offset, insts, next_value_id);
+            let result = Value {
+                id: ValueId(*next_value_id),
+                ty: result_ty,
+            };
+            *next_value_id += 1;
+            id_map.insert(result_id, result.clone());
+            insts.push(Inst {
+                op: Op::LShr(xm, c24),
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
         // Int↔float conversions.
         SpvOp::ConvertSToF => emit_unop_int(
             spv_inst, types, constants, iface,
