@@ -213,5 +213,7 @@ fn info_on_uninstalled_app_fails() {
     let out = run_insula(install_root.path(), &["info", "com.nope.notinstalled"]);
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("not installed"));
+    // Error wording covers all three info-arg shapes now
+    // (installed-app / bundle-dir / archive).
+    assert!(stderr.contains("not found"), "stderr: {}", stderr);
 }

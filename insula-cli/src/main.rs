@@ -7,7 +7,7 @@
 //! Commands:
 //!   install <bundle-dir>    Install an Insula bundle from disk.
 //!   list                    Show installed apps.
-//!   info <app-id>           Show details for one installed app.
+//!   info <app|dir|insula>  Show details for app-id, bundle dir, or archive.
 //!   launch <app-id> [args]  Launch an installed app (inherits stdio).
 //!   uninstall <app-id>      Remove an installed app + its container.
 //!   help                    Show this help.
@@ -84,7 +84,10 @@ fn print_usage() {
 Commands:
   install <bundle-dir>    Install an Insula bundle from disk.
   list                    Show installed apps.
-  info <app-id>           Show details for one installed app.
+  info <app-id|bundle|insula>
+                          Show capability surface + signature for an
+                          installed app, a bundle directory, or a
+                          `.insula` archive.
   launch <app-id> [args]  Launch an installed app (inherits stdio).
                           Auto-spawns missing daemons.
   uninstall <app-id>      Remove an installed app + its container.
@@ -309,31 +312,66 @@ fn cmd_list(install_root: &Path) -> Result<(), String> {
 // -----------------------------------------------------
 
 fn cmd_info(args: &[String], install_root: &Path) -> Result<(), String> {
-    let app_id = args.first().ok_or_else(|| {
-        "info: missing <app-id> argument".to_string()
+    let arg = args.first().ok_or_else(|| {
+        "info: missing <app-id|bundle-dir|archive> argument".to_string()
     })?;
 
-    let app_root = install_root.join("apps").join(app_id);
-    let bundle_root = app_root.join("bundle");
+    // Resolve the manifest source three ways:
+    //
+    //   1. arg is an installed app-id under <install_root>/apps/
+    //   2. arg is a `.insula` archive (magic-detected)
+    //   3. arg is a bundle directory containing manifest.toml
+    //
+    // The pre-install paths (2 + 3) don't get a
+    // container directory; the printed "container:"
+    // line is suppressed for those.
+    let arg_path = Path::new(arg);
+    let _extract_guard: Option<TempDir>;
+    let (bundle_root, app_root, mode_label): (PathBuf, Option<PathBuf>, &str) =
+        if arg_path.is_file() && archive::path_looks_like_archive(arg_path) {
+            let tmp = TempDir::new("insula-info")
+                .map_err(|e| format!("create temp dir: {}", e))?;
+            archive::unpack_into(arg, tmp.path())
+                .map_err(|e| format!("unpack archive: {}", e))?;
+            let root = tmp.path().to_path_buf();
+            _extract_guard = Some(tmp);
+            (root, None, "archive")
+        } else if arg_path.is_dir() && arg_path.join("manifest.toml").is_file() {
+            _extract_guard = None;
+            (arg_path.to_path_buf(), None, "bundle-dir")
+        } else {
+            _extract_guard = None;
+            let app_root = install_root.join("apps").join(arg);
+            let bundle_root = app_root.join("bundle");
+            if !bundle_root.join("manifest.toml").is_file() {
+                return Err(format!(
+                    "not found as installed app, bundle directory, or archive: {}",
+                    arg
+                ));
+            }
+            (bundle_root, Some(app_root), "installed")
+        };
     let manifest_path = bundle_root.join("manifest.toml");
     let src = std::fs::read_to_string(&manifest_path)
-        .map_err(|_| format!("app not installed: {}", app_id))?;
+        .map_err(|e| format!("read {}: {}", manifest_path.display(), e))?;
     let m = insula_manifest::Manifest::parse(&src)
         .map_err(|e| format!("parse manifest: {}", e))?;
 
     println!("{}", m.app.name);
     println!("  version:     {}", m.app.version);
     println!("  sdk version: {}", m.app.sdk_version);
+    println!("  source:      {}", mode_label);
     println!(
         "  bundle:      form={:?}, arches={:?}, entry={}",
         m.bundle.form, m.bundle.arches, m.bundle.entry
     );
 
     // Filesystem layout.
-    let container_dir = app_root.join("container");
     println!("  paths:");
     println!("    bundle:    {}", bundle_root.display());
-    println!("    container: {}", container_dir.display());
+    if let Some(ref ar) = app_root {
+        println!("    container: {}", ar.join("container").display());
+    }
 
     // Signature info, if any.
     let sig_path = bundle_root.join("signature");
@@ -348,8 +386,10 @@ fn cmd_info(args: &[String], install_root: &Path) -> Result<(), String> {
                 println!("  signature:   present but unreadable ({})", e);
             }
         }
-    } else {
+    } else if app_root.is_some() {
         println!("  signature:   (unsigned — installed with --allow-unsigned)");
+    } else {
+        println!("  signature:   (unsigned — sign with `insula sign` before publishing)");
     }
 
     // Capability sections — these are what the user
