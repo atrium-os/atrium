@@ -71,6 +71,22 @@ pub const CLASS_GPU:       u8 = 9;
 /// observability schema is settled.
 pub const CLASS_LOG:       u8 = 10;
 
+/// Vestibulum keychain — libatrium clients ask the vestibulumd
+/// daemon for per-(service, persona) keypair management +
+/// signing. The private key never leaves the daemon; apps see
+/// only pubkeys and signatures. Per `docs/spec/vestibulum.md`
+/// §3.2 / `docs/spec/insula.md` §13.3.
+///
+/// Ops:
+///   0 = PUBKEY_REQUEST
+///       payload: utf8 service name
+///       response: 32-byte ed25519 public key
+///   1 = SIGN_REQUEST
+///       payload: [u16 service_name_len | service_name |
+///                challenge_bytes]
+///       response: 64-byte ed25519 signature
+pub const CLASS_VESTIBULUM: u8 = 11;
+
 /// Smoke-test / fuzzing service. Not part of the production
 /// surface; used by aqueduct-echo and unit tests.
 pub const CLASS_ECHO:      u8 = 63;
@@ -93,6 +109,7 @@ pub fn class_name(c: u8) -> &'static str {
         CLASS_STOA       => "stoa",
         CLASS_GPU        => "gpu",
         CLASS_LOG        => "log",
+        CLASS_VESTIBULUM => "vestibulum",
         CLASS_ECHO       => "echo",
         c if c >= CLASS_VENDOR_BASE => "vendor",
         _ => "reserved",

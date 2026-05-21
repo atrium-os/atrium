@@ -230,20 +230,23 @@ fn cmd_launch(args: &[String], install_root: &Path) -> Result<(), String> {
         manifest,
     };
 
-    // If a logd socket is configured, route the app's
-    // log forwarding to it (libatrium will pick this
-    // up from $ATRIUM_LOG_SOCKET in the child env;
-    // SBPL grants access to the socket path).
+    // If sockets for system services are configured,
+    // route them through to the child:
+    //   - INSULA_LOGD_SOCKET        -> log forwarding
+    //   - INSULA_VESTIBULUMD_SOCKET -> keychain
     let log_socket = std::env::var_os("INSULA_LOGD_SOCKET")
+        .map(PathBuf::from);
+    let vestibulum_socket = std::env::var_os("INSULA_VESTIBULUMD_SOCKET")
         .map(PathBuf::from);
 
     // Inherit stdio for `insula launch`; the user wants
     // to see the app's output.
-    let mut child = host::launch_installed_with_log(
+    let mut child = host::launch_installed_full(
         &installed,
         &app_args_raw,
         false,
         log_socket.as_deref(),
+        vestibulum_socket.as_deref(),
     )
     .map_err(|e| format!("launch: {}", e))?;
 

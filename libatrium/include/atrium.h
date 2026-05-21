@@ -68,6 +68,35 @@ int32_t atrium_container_path(char* buf, size_t buf_len);
  * read/write/close, or a negative ATRIUM_ERR_*. */
 int32_t atrium_storage_open(const char* path, uint32_t mode);
 
+/* -----------------------------------------------------------
+ * Keychain — per-(service, persona) ed25519 keypairs managed
+ * by Vestibulum. Private keys never cross this boundary.
+ * -----------------------------------------------------------
+ */
+
+#define ATRIUM_KEYCHAIN_PUBKEY_LEN  32
+#define ATRIUM_KEYCHAIN_SIG_LEN     64
+
+#define ATRIUM_ERR_NO_VESTIBULUM   -10
+#define ATRIUM_ERR_VESTIBULUM_RPC  -11
+
+/* Write the 32-byte ed25519 public key for `service` into
+ * `out` (which must have room for ATRIUM_KEYCHAIN_PUBKEY_LEN).
+ * Mints the keypair on first call. Returns
+ * ATRIUM_KEYCHAIN_PUBKEY_LEN on success, negative on error. */
+int32_t atrium_keychain_pubkey(
+    const char* service,
+    uint8_t* out, size_t out_len);
+
+/* Sign `challenge_len` bytes at `challenge` under `service`'s
+ * keypair; write the 64-byte ed25519 signature into `sig_out`.
+ * Returns ATRIUM_KEYCHAIN_SIG_LEN on success, negative on
+ * error. */
+int32_t atrium_keychain_sign(
+    const char* service,
+    const uint8_t* challenge, size_t challenge_len,
+    uint8_t* sig_out, size_t sig_out_len);
+
 #ifdef __cplusplus
 }
 #endif

@@ -62,6 +62,13 @@ pub struct LaunchOptions<'a> {
     ///    for the socket path (otherwise App Sandbox
     ///    blocks the unix-socket connect).
     pub log_socket: Option<&'a Path>,
+
+    /// Optional: path to a `vestibulum-macos` socket
+    /// the app should reach for atrium_keychain_*
+    /// calls. Same wiring shape as `log_socket`:
+    /// passes through as `$ATRIUM_VESTIBULUM_SOCKET`
+    /// in the child env and gets an SBPL grant.
+    pub vestibulum_socket: Option<&'a Path>,
 }
 
 impl<'a> LaunchOptions<'a> {
@@ -73,6 +80,7 @@ impl<'a> LaunchOptions<'a> {
             args: &[],
             capture_output: false,
             log_socket: None,
+            vestibulum_socket: None,
         }
     }
 }
@@ -122,11 +130,7 @@ pub fn launch(
         .unwrap_or_else(|_| opts.container_dir.to_path_buf());
     let binary_canon = opts.binary_path.canonicalize()
         .unwrap_or_else(|_| opts.binary_path.to_path_buf());
-    let log_socket_canon = opts.log_socket.map(|p| {
-        // Sockets sometimes don't canonicalize cleanly
-        // before they're bound. Fall back to the
-        // parent dir's canonical form + the basename
-        // so the grant still maps to the right file.
+    let canon_socket = |p: &Path| {
         p.canonicalize().unwrap_or_else(|_| {
             if let (Some(parent), Some(name)) = (p.parent(), p.file_name()) {
                 parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf()).join(name)
@@ -134,9 +138,20 @@ pub fn launch(
                 p.to_path_buf()
             }
         })
-    });
+    };
+    let log_socket_canon = opts.log_socket.map(canon_socket);
+    let vest_socket_canon = opts.vestibulum_socket.map(canon_socket);
 
-    let profile = sbpl::render_profile_with(manifest, log_socket_canon.as_deref());
+    // SBPL grant covers any combination of unix sockets
+    // by switching on network-outbound once if any are
+    // present.
+    let any_unix_socket = log_socket_canon.as_deref().or(vest_socket_canon.as_deref());
+    let profile = sbpl::render_profile_with_sockets(
+        manifest,
+        log_socket_canon.as_deref(),
+        vest_socket_canon.as_deref(),
+        any_unix_socket,
+    );
 
     let mut profile_file = tempfile::Builder::new()
         .prefix("insula-")
@@ -172,6 +187,9 @@ pub fn launch(
 
     if let Some(sock) = log_socket_canon.as_deref() {
         cmd.env("ATRIUM_LOG_SOCKET", sock);
+    }
+    if let Some(sock) = vest_socket_canon.as_deref() {
+        cmd.env("ATRIUM_VESTIBULUM_SOCKET", sock);
     }
 
     if opts.capture_output {

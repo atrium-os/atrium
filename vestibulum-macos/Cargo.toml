@@ -1,0 +1,20 @@
+[package]
+name        = "vestibulum-macos"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+description = "macOS adapter for Vestibulum's keychain role (docs/spec/vestibulum.md). v0 daemon that listens on a unix socket, serves CLASS_VESTIBULUM ops, manages per-(service, persona) ed25519 keypairs, signs challenges. Private keys never leave this daemon; apps see only pubkeys + signatures via libatrium's atrium_keychain_* surface. v0 stores keys in memory (lost on restart); persistent storage backed by macOS Keychain Services is future work."
+publish     = false
+
+[[bin]]
+name = "vestibulum-macos"
+path = "src/main.rs"
+
+[dependencies]
+aqueduct      = { path = "../aqueduct" }
+ed25519-dalek = { version = "2", default-features = false, features = ["rand_core"] }
+rand          = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+
+[dev-dependencies]
+libatrium = { path = "../libatrium" }
+tempfile  = "3"

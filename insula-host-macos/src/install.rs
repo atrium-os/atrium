@@ -123,12 +123,26 @@ pub fn launch_installed_with_log(
     capture_output: bool,
     log_socket: Option<&std::path::Path>,
 ) -> Result<SandboxedChild, Error> {
+    launch_installed_full(app, args, capture_output, log_socket, None)
+}
+
+/// Most-general launch entry: threads both the logd
+/// and vestibulum sockets through to the child via
+/// env + SBPL grant. Pass `None` for either to skip.
+pub fn launch_installed_full(
+    app: &InstalledApp,
+    args: &[&str],
+    capture_output: bool,
+    log_socket: Option<&std::path::Path>,
+    vestibulum_socket: Option<&std::path::Path>,
+) -> Result<SandboxedChild, Error> {
     let opts = LaunchOptions {
         binary_path: &app.binary_path,
         container_dir: &app.container_dir,
         args,
         capture_output,
         log_socket,
+        vestibulum_socket,
     };
     launch(&app.manifest, &opts)
 }

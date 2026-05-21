@@ -35,7 +35,7 @@ use std::os::raw::{c_char, c_int, c_uint};
 use std::sync::Mutex;
 
 use aqueduct::Connection;
-use aqueduct::classes::CLASS_LOG;
+use aqueduct::classes::{CLASS_LOG, CLASS_VESTIBULUM};
 use aqueduct::envelope::flag;
 
 /// Lazily-initialized platform connection. None until
@@ -351,6 +351,173 @@ pub unsafe extern "C" fn atrium_storage_open(
 fn container_dir() -> Option<std::path::PathBuf> {
     std::env::var_os("ATRIUM_CONTAINER_DIR")
         .map(std::path::PathBuf::from)
+}
+
+// =====================================================
+// Keychain — per-service ed25519 keypairs managed by
+// Vestibulum. The private key never crosses this
+// boundary; apps obtain only public keys + signatures.
+// =====================================================
+
+/// ed25519 public key length.
+pub const ATRIUM_KEYCHAIN_PUBKEY_LEN: usize = 32;
+/// ed25519 signature length.
+pub const ATRIUM_KEYCHAIN_SIG_LEN: usize = 64;
+
+/// Vestibulum daemon is unreachable (env var unset,
+/// connect refused, or RPC failure).
+pub const ATRIUM_ERR_NO_VESTIBULUM: c_int = -10;
+/// Daemon responded but the response was malformed
+/// (e.g. wrong byte length).
+pub const ATRIUM_ERR_VESTIBULUM_RPC: c_int = -11;
+
+/// Open a fresh connection to the Vestibulum daemon if
+/// `$ATRIUM_VESTIBULUM_SOCKET` is set. Each call opens
+/// a new connection — keychain ops are infrequent and
+/// the overhead is dwarfed by the signature work
+/// itself; pooling can come later.
+fn vestibulum_connect() -> Option<Connection> {
+    let path = std::env::var_os("ATRIUM_VESTIBULUM_SOCKET")?;
+    Connection::connect(std::path::Path::new(&path)).ok()
+}
+
+/// Send a CLASS_VESTIBULUM request, receive the
+/// matching response. Filters out incidental traffic
+/// (e.g. async events) and ignores responses to a
+/// different op.
+fn vestibulum_rpc(
+    conn: &mut Connection,
+    op: u16,
+    request_payload: &[u8],
+) -> Option<Vec<u8>> {
+    conn.send_message(
+        CLASS_VESTIBULUM,
+        op,
+        flag::RESPONSE_EXPECTED,
+        request_payload,
+    )
+    .ok()?;
+
+    loop {
+        let msg = conn.recv_message().ok()?;
+        if msg.opcode_class == CLASS_VESTIBULUM
+            && msg.op == op
+            && (msg.flags & flag::IS_RESPONSE) != 0
+        {
+            return Some(msg.payload);
+        }
+        // Otherwise ignore and keep reading.
+    }
+}
+
+/// Fetch the public key for `service`, minting on the
+/// daemon side if no keypair yet exists for the
+/// (service, default-persona) pair.
+///
+/// Writes the 32-byte ed25519 public key into `out`.
+/// Returns:
+///   - `ATRIUM_KEYCHAIN_PUBKEY_LEN` (32) on success.
+///   - [`ATRIUM_ERR_INVALID_PATH`] if `service` is
+///     NULL or invalid UTF-8 (the parameter name
+///     "path" is a misnomer for this call — kept
+///     for the shared error vocabulary).
+///   - [`ATRIUM_ERR_BUF_TOO_SMALL`] if `out_len <
+///     ATRIUM_KEYCHAIN_PUBKEY_LEN`.
+///   - [`ATRIUM_ERR_NO_VESTIBULUM`] if the daemon
+///     can't be reached.
+///   - [`ATRIUM_ERR_VESTIBULUM_RPC`] if the daemon's
+///     response is malformed.
+///
+/// # Safety
+///
+/// `service` must be a valid NUL-terminated UTF-8
+/// string. `out` must be valid for `out_len` writes.
+#[no_mangle]
+pub unsafe extern "C" fn atrium_keychain_pubkey(
+    service: *const c_char,
+    out: *mut u8,
+    out_len: usize,
+) -> c_int {
+    if service.is_null() {
+        return ATRIUM_ERR_INVALID_PATH;
+    }
+    let svc_str = match CStr::from_ptr(service).to_str() {
+        Ok(s) => s,
+        Err(_) => return ATRIUM_ERR_INVALID_PATH,
+    };
+    if out_len < ATRIUM_KEYCHAIN_PUBKEY_LEN {
+        return ATRIUM_ERR_BUF_TOO_SMALL;
+    }
+    let Some(mut conn) = vestibulum_connect() else {
+        return ATRIUM_ERR_NO_VESTIBULUM;
+    };
+    let Some(resp) = vestibulum_rpc(&mut conn, 0, svc_str.as_bytes()) else {
+        return ATRIUM_ERR_VESTIBULUM_RPC;
+    };
+    if resp.len() != ATRIUM_KEYCHAIN_PUBKEY_LEN {
+        return ATRIUM_ERR_VESTIBULUM_RPC;
+    }
+    std::ptr::copy_nonoverlapping(resp.as_ptr(), out, ATRIUM_KEYCHAIN_PUBKEY_LEN);
+    ATRIUM_KEYCHAIN_PUBKEY_LEN as c_int
+}
+
+/// Sign `challenge` (`challenge_len` bytes) under the
+/// keypair for `service`. The private key never
+/// leaves the Vestibulum daemon — only the resulting
+/// signature comes back.
+///
+/// Writes the 64-byte ed25519 signature into `sig_out`.
+/// Returns:
+///   - `ATRIUM_KEYCHAIN_SIG_LEN` (64) on success.
+///   - error codes as in [`atrium_keychain_pubkey`].
+///
+/// # Safety
+///
+/// `service` is a NUL-terminated UTF-8 string.
+/// `challenge` is valid for `challenge_len` reads.
+/// `sig_out` is valid for `sig_out_len` writes.
+#[no_mangle]
+pub unsafe extern "C" fn atrium_keychain_sign(
+    service: *const c_char,
+    challenge: *const u8,
+    challenge_len: usize,
+    sig_out: *mut u8,
+    sig_out_len: usize,
+) -> c_int {
+    if service.is_null() || challenge.is_null() {
+        return ATRIUM_ERR_INVALID_PATH;
+    }
+    let svc_str = match CStr::from_ptr(service).to_str() {
+        Ok(s) => s,
+        Err(_) => return ATRIUM_ERR_INVALID_PATH,
+    };
+    if sig_out_len < ATRIUM_KEYCHAIN_SIG_LEN {
+        return ATRIUM_ERR_BUF_TOO_SMALL;
+    }
+    if svc_str.len() > u16::MAX as usize {
+        return ATRIUM_ERR_INVALID_PATH;
+    }
+    let Some(mut conn) = vestibulum_connect() else {
+        return ATRIUM_ERR_NO_VESTIBULUM;
+    };
+
+    // Build the SIGN_REQUEST payload: [u16 LE name_len
+    // | name | challenge_bytes].
+    let challenge_slice = std::slice::from_raw_parts(challenge, challenge_len);
+    let mut payload =
+        Vec::with_capacity(2 + svc_str.len() + challenge_len);
+    payload.extend_from_slice(&(svc_str.len() as u16).to_le_bytes());
+    payload.extend_from_slice(svc_str.as_bytes());
+    payload.extend_from_slice(challenge_slice);
+
+    let Some(resp) = vestibulum_rpc(&mut conn, 1, &payload) else {
+        return ATRIUM_ERR_VESTIBULUM_RPC;
+    };
+    if resp.len() != ATRIUM_KEYCHAIN_SIG_LEN {
+        return ATRIUM_ERR_VESTIBULUM_RPC;
+    }
+    std::ptr::copy_nonoverlapping(resp.as_ptr(), sig_out, ATRIUM_KEYCHAIN_SIG_LEN);
+    ATRIUM_KEYCHAIN_SIG_LEN as c_int
 }
 
 // ---------------------------------------------------------
