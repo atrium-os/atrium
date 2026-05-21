@@ -905,6 +905,16 @@ pub enum BuiltinKind {
     /// `gl_GlobalInvocationID` (Compute only).  uvec3.
     /// Equal to `WorkgroupId * gl_WorkGroupSize + LocalInvocationID`.
     GlobalInvocationId,
+    /// `gl_LocalInvocationIndex` (Compute only).  uint.
+    /// Linearised index of the invocation within its
+    /// workgroup, formed as
+    ///   lid.z * (LocalSize.x * LocalSize.y)
+    /// + lid.y *  LocalSize.x
+    /// + lid.x
+    /// Backends fold the LocalSize constants in -- the
+    /// formula collapses to a single mov when LocalSize is
+    /// (N, 1, 1).
+    LocalInvocationIndex,
     /// `gl_VertexIndex` (Vertex only).  uint.
     VertexIndex,
     /// `gl_InstanceIndex` (Vertex only).  uint.

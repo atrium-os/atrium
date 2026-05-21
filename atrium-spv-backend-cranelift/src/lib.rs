@@ -954,6 +954,38 @@ impl FnTranslator {
                         }).collect();
                         self.vectors.insert(result.id, lanes);
                     }
+                    (ShaderStage::Compute, BK::LocalInvocationIndex) => {
+                        // index = lz * (sx*sy) + ly * sx + lx
+                        // (lid.x@params[6], lid.y@params[7], lid.z@params[8])
+                        let ls = self.local_size.unwrap_or((1, 1, 1));
+                        let sx = ls.0;
+                        let sy = ls.1;
+                        let sxsy = sx.saturating_mul(sy);
+                        let lx = self.params[6];
+                        let ly = self.params[7];
+                        let lz = self.params[8];
+                        let v = if sx == 1 && sy == 1 {
+                            // lid.x = 0 always (LocalSize.x=1
+                            // means there's only one x lane);
+                            // index = lid.z.
+                            lz
+                        } else if sy == 1 {
+                            let sx_c = builder.ins().iconst(
+                                clif_types::I32, sx as i64);
+                            let lz_scaled = builder.ins().imul(lz, sx_c);
+                            builder.ins().iadd(lz_scaled, lx)
+                        } else {
+                            let sxsy_c = builder.ins().iconst(
+                                clif_types::I32, sxsy as i64);
+                            let sx_c = builder.ins().iconst(
+                                clif_types::I32, sx as i64);
+                            let lz_term = builder.ins().imul(lz, sxsy_c);
+                            let ly_term = builder.ins().imul(ly, sx_c);
+                            let partial = builder.ins().iadd(lz_term, ly_term);
+                            builder.ins().iadd(partial, lx)
+                        };
+                        self.scalars.insert(result.id, v);
+                    }
                     (ShaderStage::Vertex, BK::VertexIndex) => {
                         // Scalar uint from params[4].
                         self.scalars.insert(result.id, self.params[4]);

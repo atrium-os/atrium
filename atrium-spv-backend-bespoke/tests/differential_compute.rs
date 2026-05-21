@@ -1191,6 +1191,131 @@ fn build_histogram_one_ssbo_cs() -> Vec<u8> {
     bytes
 }
 
+/// CS: `ssbo.data[gl_LocalInvocationIndex] = gl_LocalInvocationIndex`.
+/// With LocalSize=(4,2,1), a single workgroup produces 8
+/// invocations whose indices linearise as
+///   ly=0,lx=0..3 -> 0..3
+///   ly=1,lx=0..3 -> 4..7
+/// so the buffer should hold [0..7].
+fn build_local_index_cs() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let void_fn = b.type_function(void, vec![]);
+    let rt_arr = b.type_runtime_array(u32_ty);
+    b.decorate(rt_arr, Decoration::ArrayStride,
+        vec![rspirv::dr::Operand::LiteralBit32(4)]);
+    let s = b.type_struct(vec![rt_arr]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_u = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+    let ssbo = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_in_u32 = b.type_pointer(None, StorageClass::Input, u32_ty);
+    let li_var = b.variable(ptr_in_u32, None, StorageClass::Input, None);
+    b.decorate(li_var, Decoration::BuiltIn,
+        vec![rspirv::dr::Operand::BuiltIn(BuiltIn::LocalInvocationIndex)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let li = b.load(u32_ty, None, li_var, None, vec![]).unwrap();
+    let dst = b.access_chain(ptr_u, None, ssbo, vec![c_zero, li]).unwrap();
+    b.store(dst, li, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![li_var, ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [4u32, 2, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn differential_local_invocation_index_linearises() {
+    let spv = build_local_index_cs();
+    let dir = TempDir::new().unwrap();
+    // 8 invocations: (lx, ly) over (0..4, 0..2).  Dispatch
+    // loop nests lx innermost.
+    let mut b_buf = vec![0u8; 64];
+    let mut c_buf = vec![0u8; 64];
+    let mut gids = Vec::new();
+    for ly in 0..2u32 {
+        for lx in 0..4u32 {
+            gids.push((lx, ly, 0u32));
+        }
+    }
+    // We invoke directly, so the gid_x/gid_y supplied here
+    // become lx/ly (workgroup_id is 0).  The shader uses
+    // LocalInvocationIndex which depends on the (lx, ly, lz)
+    // params passed through cs_main's W6/W7/[SP+0] slots.
+    // But our invoke_with_gids helper passes the FIRST 3 args
+    // as workgroup_id and the LAST 3 as lid.  So we need a
+    // different helper -- or use the existing one with lid in
+    // the right slots.  Use the existing helper -- its 4th-6th
+    // args ARE lid (per the cs_main signature).
+    let lid_tuples: Vec<(u32, u32, u32)> = gids;
+    invoke_cs_main_with_lids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &lid_tuples);
+    invoke_cs_main_with_lids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &lid_tuples);
+    assert_eq!(b_buf, c_buf,
+        "bespoke vs cranelift diverge on LocalInvocationIndex");
+    for i in 0..8u32 {
+        let v = u32::from_le_bytes(b_buf[(i as usize)*4..(i as usize)*4+4]
+            .try_into().unwrap());
+        assert_eq!(v, i, "slot {i} should hold {i}; got {v}");
+    }
+}
+
+/// Same as invoke_with_gids but the tuple is (lid_x, lid_y,
+/// lid_z) -- the LAST three cs_main args.  Workgroup is
+/// always (0,0,0) here.  Used by tests that need to drive
+/// the lid lanes directly.
+fn invoke_cs_main_with_lids(spv: &[u8], use_bespoke: bool, dir: &Path, name: &str,
+                            out_ptr: *mut u8, lids: &[(u32, u32, u32)]) {
+    let module = translate(spv).expect("frontend");
+    let obj = if use_bespoke {
+        let t = if cfg!(target_os = "macos") {
+            BespokeTarget::Aarch64Darwin
+        } else { BespokeTarget::Aarch64FreeBSD };
+        bespoke_compile(&module, t).expect("bespoke compile").object
+    } else {
+        cranelift_compile(&module, CraneliftTarget::host())
+            .expect("cranelift compile").object
+    };
+    let obj_path = dir.join(format!("{name}.o"));
+    std::fs::write(&obj_path, &obj).unwrap();
+    let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
+    let lib_path = dir.join(format!("{name}.{ext}"));
+    link_to_shared_library(&obj_path, &lib_path).expect("link");
+    let lib = unsafe { libloading::Library::new(&lib_path) }
+        .expect("dlopen");
+    let cs_main: libloading::Symbol<CsMain> = unsafe {
+        lib.get(b"atrium_cs_main").expect("atrium_cs_main symbol")
+    };
+    for &(lx, ly, lz) in lids {
+        unsafe {
+            cs_main(
+                std::ptr::null(), std::ptr::null(), out_ptr,
+                0, 0, 0,  // workgroup id
+                lx, ly, lz,
+            );
+        }
+    }
+}
+
 #[test]
 fn differential_histogram_one_binding() {
     let spv = build_histogram_one_ssbo_cs();

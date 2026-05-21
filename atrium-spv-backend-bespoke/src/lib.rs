@@ -1987,6 +1987,100 @@ fn emit_function(
                         }
                         vectors.insert(result.id, lanes);
                     }
+                    BK::LocalInvocationIndex => {
+                        // index = lz * (sx*sy) + ly * sx + lx
+                        // Folds:
+                        //  - sx*sy == 1: index = lx
+                        //  - sy == 1 && sx*sy != 1: index = lz*sxsy + lx
+                        //    (no ly term since LocalSize.y=1 -> ly=0)
+                        //  - sx == 1: similar simplifications
+                        //  General: full 5-op sequence.
+                        let ls = func.local_size.unwrap_or((1, 1, 1));
+                        let sx = ls.0;
+                        let sy = ls.1;
+                        let sxsy = sx.saturating_mul(sy);
+                        let w_dst = int_pool.alloc(result.id)?;
+                        if sx == 1 && sy == 1 {
+                            // index = lz only (since lx=0,
+                            // ly=0).  Materialise lz into w_dst
+                            // directly.  Use the same lid.z
+                            // load patch as LocalInvocationId.
+                            let off = a.len();
+                            a.emit(asm::ldr_w_offset(w_dst, asm::Xreg(31), 0));
+                            lid_z_load_patches.push((off, w_dst));
+                        } else if sxsy == 1 {
+                            // Unreachable since sxsy==1 implies
+                            // sx==1 && sy==1 (handled above) --
+                            // kept defensively.
+                            a.emit(asm::mov_w(w_dst, asm::Wreg(6)));
+                        } else if sy == 1 {
+                            // index = lz * sx + lx
+                            // (no ly term since ly is always 0).
+                            // Load lz, multiply by sx, add lx.
+                            let lz_synth = ValueId(next_synth_id);
+                            next_synth_id += 1;
+                            let w_lz = int_pool.alloc(lz_synth)?;
+                            let off = a.len();
+                            a.emit(asm::ldr_w_offset(w_lz, asm::Xreg(31), 0));
+                            lid_z_load_patches.push((off, w_lz));
+                            // Materialise sx into a scratch.
+                            let sx_synth = ValueId(next_synth_id);
+                            next_synth_id += 1;
+                            let w_sx = int_pool.alloc(sx_synth)?;
+                            let lo = (sx & 0xFFFF) as u16;
+                            let hi = ((sx >> 16) & 0xFFFF) as u16;
+                            a.emit(asm::movz_w(w_sx, lo, 0));
+                            if hi != 0 { a.emit(asm::movk_w(w_sx, hi, 16)); }
+                            // w_dst = w_lz * w_sx
+                            a.emit(asm::mul_w(w_dst, w_lz, w_sx));
+                            // w_dst += W6 (lx)
+                            a.emit(asm::add_w(w_dst, w_dst, asm::Wreg(6)));
+                            int_pool.free(w_lz);
+                            int_pool.free(w_sx);
+                        } else {
+                            // General case: lz*sxsy + ly*sx + lx.
+                            let lz_synth = ValueId(next_synth_id);
+                            next_synth_id += 1;
+                            let w_lz = int_pool.alloc(lz_synth)?;
+                            let off = a.len();
+                            a.emit(asm::ldr_w_offset(w_lz, asm::Xreg(31), 0));
+                            lid_z_load_patches.push((off, w_lz));
+                            // Materialise sxsy.
+                            let sxsy_synth = ValueId(next_synth_id);
+                            next_synth_id += 1;
+                            let w_sxsy = int_pool.alloc(sxsy_synth)?;
+                            a.emit(asm::movz_w(w_sxsy, (sxsy & 0xFFFF) as u16, 0));
+                            if (sxsy >> 16) != 0 {
+                                a.emit(asm::movk_w(
+                                    w_sxsy, ((sxsy >> 16) & 0xFFFF) as u16, 16));
+                            }
+                            // w_dst = lz * sxsy
+                            a.emit(asm::mul_w(w_dst, w_lz, w_sxsy));
+                            int_pool.free(w_lz);
+                            int_pool.free(w_sxsy);
+                            // Materialise sx.
+                            let sx_synth = ValueId(next_synth_id);
+                            next_synth_id += 1;
+                            let w_sx = int_pool.alloc(sx_synth)?;
+                            a.emit(asm::movz_w(w_sx, (sx & 0xFFFF) as u16, 0));
+                            if (sx >> 16) != 0 {
+                                a.emit(asm::movk_w(
+                                    w_sx, ((sx >> 16) & 0xFFFF) as u16, 16));
+                            }
+                            // ly_scaled = ly * sx
+                            let lys_synth = ValueId(next_synth_id);
+                            next_synth_id += 1;
+                            let w_lys = int_pool.alloc(lys_synth)?;
+                            a.emit(asm::mul_w(w_lys, asm::Wreg(7), w_sx));
+                            int_pool.free(w_sx);
+                            // w_dst += ly_scaled
+                            a.emit(asm::add_w(w_dst, w_dst, w_lys));
+                            int_pool.free(w_lys);
+                            // w_dst += lx (W6)
+                            a.emit(asm::add_w(w_dst, w_dst, asm::Wreg(6)));
+                        }
+                        ints.insert(result.id, w_dst);
+                    }
                     other => return Err(BackendError::Unsupported(format!(
                         "LoadBuiltin({other:?}) not supported in compute \
                          bespoke path"))),
