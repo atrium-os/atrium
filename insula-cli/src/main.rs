@@ -18,6 +18,7 @@
 //! ```
 
 mod daemons;
+mod doctor;
 mod keychain;
 mod notify;
 mod push;
@@ -53,6 +54,7 @@ fn main() -> ExitCode {
         "push" => push::cmd_push(&args[2..], &install_root),
         "keychain" => keychain::cmd_keychain(&args[2..], &install_root),
         "notify" => notify::cmd_notify(&args[2..], &install_root),
+        "doctor" => doctor::cmd_doctor(&args[2..], &install_root),
         "help" | "-h" | "--help" => {
             print_usage();
             Ok(())
@@ -103,6 +105,7 @@ Commands:
   keychain sign <service> <hex>    Sign a hex-encoded challenge.
   notify <title> <body> [--urgency low|normal|high]
                                    Post a notification (prints assigned id).
+  doctor                           Run a health check across the install.
   help                    Show this help.
 
 Flags:
