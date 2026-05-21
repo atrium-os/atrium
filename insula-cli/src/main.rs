@@ -18,6 +18,7 @@
 //! ```
 
 mod daemons;
+mod keychain;
 mod push;
 mod signing;
 use daemons::Daemon;
@@ -49,6 +50,7 @@ fn main() -> ExitCode {
         "publishers" => signing::cmd_publishers(&args[2..], &install_root),
         "bundle" => cmd_bundle(&args[2..]),
         "push" => push::cmd_push(&args[2..], &install_root),
+        "keychain" => keychain::cmd_keychain(&args[2..], &install_root),
         "help" | "-h" | "--help" => {
             print_usage();
             Ok(())
@@ -94,6 +96,8 @@ Commands:
   push subscribe <purpose>         Subscribe to push delivery.
   push list                        Show active push subscriptions.
   push unsubscribe <key_id>        Remove a push subscription.
+  keychain pubkey <service>        Print the ed25519 pubkey for a service.
+  keychain sign <service> <hex>    Sign a hex-encoded challenge.
   help                    Show this help.
 
 Flags:
