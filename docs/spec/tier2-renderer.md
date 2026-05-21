@@ -969,10 +969,10 @@ specifically supports:
   the serial dispatcher, queued for a real lowering when
   invocations parallelise.
 - GLSL.std.450 ExtInst dispatch for: FAbs, Floor, Ceil,
-  Trunc, Fract, FSign, Sqrt, FMin, FMax, FClamp, FMix,
-  Step, SmoothStep, Length, Distance, Normalize, Reflect.
-  Sin/cos/exp/log queued (need polynomial approximations
-  or libcall).
+  Trunc, Fract, FSign, FMod, Sqrt, InverseSqrt, FMin,
+  FMax, FClamp, FMix, Step, SmoothStep, Length, Distance,
+  Normalize, Reflect.  Sin/cos/exp/log queued (need
+  polynomial approximations or libcall).
 
 **Bespoke backend (atrium-spv-backend-bespoke):**
 
@@ -986,7 +986,9 @@ specifically supports:
   serial dispatcher; LSE LDADD path queued for when the
   dispatcher parallelises).
 - GLSL.std.450 math listed above; vec4 NEON path for
-  FAbs/FSqrt/FMin/FMax, scalar f32 for the rest.
+  FAbs/FSqrt/FMin/FMax/FFloor/FCeil/FTrunc, scalar f32 for
+  the rest (the synthesised ones ride through the
+  underlying primitive ops' existing vec dispatch).
 - Architectural perf wins: unused-prologue-NOP truncation
   (–36 bytes per function header in the common case),
   identity-Phi-move peephole, classifier extensions for
@@ -1032,8 +1034,6 @@ specifically supports:
 - V-pool exhaustion on chains of 5+ vec4 ops that share
   Load-synth lanes (single ignored differential test;
   needs synth-lane lifetime tracking).
-- vec4 NEON path for FRINT* (floor/ceil/trunc) -- scalar
-  only today.
 - The bespoke bool W-pool is 3 slots (W10..W12) with
   recycle-on-ConvertUToF; arbitrary-hole free-list lands
   if real workloads exceed the eager-free pattern.
