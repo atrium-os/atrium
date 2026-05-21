@@ -11,7 +11,7 @@
 
 #![cfg(unix)]
 
-use aqueduct::classes::CLASS_ECHO;
+use aqueduct::classes::CLASS_LOG;
 use aqueduct::envelope::{self, Header};
 use std::ffi::CString;
 use std::io::Read;
@@ -107,11 +107,11 @@ fn atrium_log_routes_through_aqueduct_when_socket_is_set() {
     // chatter from CLASS_CORE if it appears; the
     // envelope crate may send connection-level traffic).
     let log_msgs: Vec<_> = messages.iter()
-        .filter(|m| m.opcode_class == CLASS_ECHO)
+        .filter(|m| m.opcode_class == CLASS_LOG)
         .collect();
 
     assert_eq!(log_msgs.len(), 1,
-               "expected one CLASS_ECHO message; got: {:?}", messages);
+               "expected one CLASS_LOG message; got: {:?}", messages);
     let m = log_msgs[0];
     assert_eq!(m.op, 0, "log-forward op");
 

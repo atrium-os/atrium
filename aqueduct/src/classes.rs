@@ -64,6 +64,13 @@ pub const CLASS_STOA:      u8 = 8;
 /// at `docs/spec/aqueduct-gpu.md`.
 pub const CLASS_GPU:       u8 = 9;
 
+/// Insula log forwarding — libatrium clients (every Insula app)
+/// send `atrium_log()` calls over this class to the insula-logd
+/// daemon. Op 0 carries `[level_u8 | utf8 message bytes]`.
+/// Future ops will carry structured-field log records once an
+/// observability schema is settled.
+pub const CLASS_LOG:       u8 = 10;
+
 /// Smoke-test / fuzzing service. Not part of the production
 /// surface; used by aqueduct-echo and unit tests.
 pub const CLASS_ECHO:      u8 = 63;
@@ -85,6 +92,7 @@ pub fn class_name(c: u8) -> &'static str {
         CLASS_INPUT      => "input",
         CLASS_STOA       => "stoa",
         CLASS_GPU        => "gpu",
+        CLASS_LOG        => "log",
         CLASS_ECHO       => "echo",
         c if c >= CLASS_VENDOR_BASE => "vendor",
         _ => "reserved",

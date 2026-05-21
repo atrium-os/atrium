@@ -35,7 +35,7 @@ use std::os::raw::{c_char, c_int, c_uint};
 use std::sync::Mutex;
 
 use aqueduct::Connection;
-use aqueduct::classes::CLASS_ECHO;
+use aqueduct::classes::CLASS_LOG;
 use aqueduct::envelope::flag;
 
 /// Lazily-initialized platform connection. None until
@@ -44,10 +44,9 @@ use aqueduct::envelope::flag;
 /// `ATRIUM_LOG_SOCKET`; stays `None` otherwise (in which
 /// case [`atrium_log`] falls back to stderr).
 ///
-/// v0 routes log messages over [`CLASS_ECHO`] (Aqueduct's
-/// smoke-test class). When a real log service exists in
-/// the Atrium registry, this will switch to that class
-/// without an ABI change.
+/// Log messages route over [`CLASS_LOG`] (the dedicated
+/// log-forwarding opcode class registered in the
+/// Aqueduct class registry).
 static PLATFORM_CONN: Mutex<Option<Connection>> = Mutex::new(None);
 
 /// Log severity. Matches syslog ordering: lower = more
@@ -184,8 +183,8 @@ pub unsafe extern "C" fn atrium_log(
             payload_bytes.push(level as u8);
             payload_bytes.extend_from_slice(payload.as_bytes());
             let _ = conn.send_message(
-                CLASS_ECHO,
-                0,                 // op = 0 (log forward)
+                CLASS_LOG,
+                0,                 // op = 0 (log forward; [level_u8 | utf8])
                 flag::ASYNC_EVENT, // fire-and-forget; no reply expected
                 &payload_bytes,
             );

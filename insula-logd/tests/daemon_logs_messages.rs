@@ -4,7 +4,7 @@
 
 #![cfg(unix)]
 
-use aqueduct::classes::CLASS_ECHO;
+use aqueduct::classes::CLASS_LOG;
 use aqueduct::envelope::flag;
 use aqueduct::Connection;
 use std::path::PathBuf;
@@ -46,7 +46,7 @@ fn send_log_via_aqueduct(socket: &std::path::Path, level: u8, msg: &str) {
     let mut payload = Vec::with_capacity(msg.len() + 1);
     payload.push(level);
     payload.extend_from_slice(msg.as_bytes());
-    conn.send_message(CLASS_ECHO, 0, flag::ASYNC_EVENT, &payload)
+    conn.send_message(CLASS_LOG, 0, flag::ASYNC_EVENT, &payload)
         .expect("send_message");
     // Connection drops at end of fn; daemon sees EOF and
     // the per-connection thread exits cleanly.
@@ -105,11 +105,11 @@ fn daemon_drops_messages_for_unknown_opcodes() {
     let mut daemon = spawn_daemon(&socket, &log_file);
     wait_for_socket(&socket, Duration::from_secs(3));
 
-    // Send a CLASS_ECHO op=99 message — daemon should
+    // Send a CLASS_LOG op=99 message — daemon should
     // ignore.
     {
         let mut conn = Connection::connect(&socket).unwrap();
-        conn.send_message(CLASS_ECHO, 99, flag::ASYNC_EVENT, b"\x02ignored")
+        conn.send_message(CLASS_LOG, 99, flag::ASYNC_EVENT, b"\x02ignored")
             .unwrap();
     }
     // And a valid op=0.

@@ -30,7 +30,7 @@
 //! main accept loop and the process; in-flight messages
 //! finish before the worker threads die.
 
-use aqueduct::classes::CLASS_ECHO;
+use aqueduct::classes::CLASS_LOG;
 use aqueduct::Connection;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -133,11 +133,11 @@ fn handle_connection(
     loop {
         match conn.recv_message() {
             Ok(msg) => {
-                // Only handle CLASS_ECHO op=0 (the
+                // Only handle CLASS_LOG op=0 (the
                 // libatrium log-forward shape). Anything
                 // else gets dropped silently — this
                 // daemon is single-purpose.
-                if msg.opcode_class != CLASS_ECHO || msg.op != 0 {
+                if msg.opcode_class != CLASS_LOG || msg.op != 0 {
                     continue;
                 }
                 if let Err(e) = write_log_line(&msg.payload, &log, also_stderr) {
