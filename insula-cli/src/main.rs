@@ -94,6 +94,7 @@ Commands:
   uninstall <app-id>      Remove an installed app + its container.
   daemons up              Start all platform daemons.
   daemons down            Stop them.
+  daemons restart [name]  Stop + start one (or 'all').
   daemons status          Show daemon state.
   daemons logs <daemon>   Print a daemon's log file.
   keygen <id> <out-dir>   Generate an ed25519 keypair for signing.
@@ -732,9 +733,36 @@ fn cmd_daemons(args: &[String], install_root: &Path) -> Result<(), String> {
             std::io::stdout().write_all(contents.as_bytes())
                 .map_err(|e| format!("stdout: {}", e))?;
         }
+        "restart" => {
+            // `insula daemons restart [name]` — stops
+            // the named daemon (or all if omitted)
+            // then starts it again. Useful after a
+            // config change or to recover from a
+            // wedged socket.
+            let target = args.get(1).map(String::as_str).unwrap_or("all");
+            let daemons_to_restart: Vec<Daemon> = if target == "all" {
+                Daemon::ALL.to_vec()
+            } else {
+                let d = Daemon::ALL.iter().find(|d| d.slug() == target)
+                    .ok_or_else(|| format!(
+                        "daemons restart: unknown daemon {:?} (use 'all' or \
+                         one of: insula-logd, vestibulum-macos, \
+                         atrium-netd-macos, praeco-macos, tabellarius-macos)",
+                        target
+                    ))?;
+                vec![*d]
+            };
+            for d in daemons_to_restart {
+                daemons::stop(install_root, d)?;
+                match daemons::start(install_root, d) {
+                    Ok(pid) => println!("{}: restarted (pid {})", d.slug(), pid),
+                    Err(e) => println!("{}: ERROR {}", d.slug(), e),
+                }
+            }
+        }
         other => {
             return Err(format!(
-                "daemons: unknown subcommand '{}' (use up|down|status|logs)",
+                "daemons: unknown subcommand '{}' (use up|down|restart|status|logs)",
                 other
             ));
         }
