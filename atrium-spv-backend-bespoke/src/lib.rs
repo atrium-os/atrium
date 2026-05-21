@@ -1664,32 +1664,60 @@ fn emit_function(
                         vectors.insert(result.id, vec![lx, ly, lz]);
                     }
                     BK::GlobalInvocationId => {
-                        // For now treat WorkGroupSize as
-                        // (1, 1, 1) -- folding func.local_size
-                        // into the multiply requires a
-                        // dedicated mul+add lowering that
-                        // matches Cranelift's path.  Queued.
+                        // GID[i] = WorkgroupID[i] * LocalSize[i] + LocalInvocationID[i].
+                        // LocalSize comes from func.local_size (the SPIR-V
+                        // OpExecutionMode literal); default (1,1,1) folds
+                        // the multiply away.  Lane i=2 reads lid.z from
+                        // the stack slot at [SP+0].
                         let ls = func.local_size.unwrap_or((1, 1, 1));
-                        if ls != (1, 1, 1) {
-                            return Err(BackendError::Unsupported(format!(
-                                "LoadBuiltin(GlobalInvocationId) with non-unit \
-                                 LocalSize={ls:?} not yet supported by bespoke; \
-                                 Cranelift fallback handles it")));
-                        }
-                        // GID = WG + LID when LocalSize=(1,1,1)
-                        // -- but we have separate W-regs in
-                        // the int pool, so emit an add per
-                        // lane.
+                        let ls_arr = [ls.0, ls.1, ls.2];
                         let mut lanes = Vec::with_capacity(3);
                         for i in 0..3 {
                             let synth = ValueId(next_synth_id);
                             next_synth_id += 1;
-                            let w = int_pool.alloc(synth)?;
-                            a.emit(asm::add_w(
-                                w,
-                                asm::Wreg(3 + i),   // wg_id[i]
-                                asm::Wreg(6 + i))); // local_id[i] (skips lid.z on stack)
-                            ints.insert(synth, w);
+                            let w_dst = int_pool.alloc(synth)?;
+                            let w_wg = asm::Wreg(3 + i as u8);
+
+                            // Load lid[i] into a scratch W-reg.
+                            // Lanes 0,1 live in W6/W7; lane 2
+                            // lives at [SP+0] (the 9th AAPCS64
+                            // arg).
+                            let scratch_synth = ValueId(next_synth_id);
+                            next_synth_id += 1;
+                            let w_lid = int_pool.alloc(scratch_synth)?;
+                            if i < 2 {
+                                a.emit(asm::mov_w(w_lid, asm::Wreg(6 + i as u8)));
+                            } else {
+                                a.emit(asm::ldr_w_offset(w_lid, asm::Xreg(31), 0));
+                            }
+
+                            if ls_arr[i] == 1 {
+                                // GID[i] = WG[i] + LID[i].
+                                a.emit(asm::add_w(w_dst, w_wg, w_lid));
+                            } else {
+                                // scaled = WG[i] * LocalSize[i]
+                                // GID[i] = scaled + LID[i]
+                                let scaled_synth = ValueId(next_synth_id);
+                                next_synth_id += 1;
+                                let w_scaled = int_pool.alloc(scaled_synth)?;
+
+                                // Materialise LocalSize[i] as
+                                // a u32 constant in a temp W-reg
+                                // (movz + optional movk for >16 bits).
+                                let ls_synth = ValueId(next_synth_id);
+                                next_synth_id += 1;
+                                let w_ls = int_pool.alloc(ls_synth)?;
+                                let lo = (ls_arr[i] & 0xFFFF) as u16;
+                                let hi = ((ls_arr[i] >> 16) & 0xFFFF) as u16;
+                                a.emit(asm::movz_w(w_ls, lo, 0));
+                                if hi != 0 {
+                                    a.emit(asm::movk_w(w_ls, hi, 16));
+                                }
+                                a.emit(asm::mul_w(w_scaled, w_wg, w_ls));
+                                a.emit(asm::add_w(w_dst, w_scaled, w_lid));
+                            }
+
+                            ints.insert(synth, w_dst);
                             lanes.push(Value { id: synth, ty: Type::U32 });
                         }
                         vectors.insert(result.id, lanes);

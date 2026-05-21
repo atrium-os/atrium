@@ -187,6 +187,74 @@ fn bespoke_compiles_lid_mul_ssbo_write() {
     assert!(!out.blob.is_empty());
 }
 
+/// Compute SPIR-V that reads gl_GlobalInvocationID.x and
+/// writes it to ssbo[0].  With LocalSize=(4,1,1) the
+/// codegen has to materialise LocalSize as a runtime
+/// constant + emit mul_w + add_w per lane, exercising the
+/// non-unit-LocalSize branch of GlobalInvocationId codegen.
+fn build_gid_cs(local_size_x: u32) -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let uvec3  = b.type_vector(u32_ty, 3);
+    let void_fn = b.type_function(void, vec![]);
+    let ptr_in_uvec3 = b.type_pointer(None, StorageClass::Input, uvec3);
+    let gid_var = b.variable(ptr_in_uvec3, None, StorageClass::Input, None);
+    b.decorate(gid_var, Decoration::BuiltIn,
+        vec![rspirv::dr::Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+    let ssbo_struct = b.type_struct(vec![u32_ty]);
+    b.decorate(ssbo_struct, Decoration::Block, vec![]);
+    b.member_decorate(ssbo_struct, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_ssbo_struct = b.type_pointer(None, StorageClass::StorageBuffer, ssbo_struct);
+    let ptr_ssbo_u32    = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+    let ssbo_var = b.variable(ptr_ssbo_struct, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo_var, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo_var, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let gid = b.load(uvec3, None, gid_var, None, vec![]).unwrap();
+    let gid_x = b.composite_extract(u32_ty, None, gid, vec![0]).unwrap();
+    let dst = b.access_chain(ptr_ssbo_u32, None, ssbo_var, vec![c_zero]).unwrap();
+    b.store(dst, gid_x, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main",
+        vec![gid_var, ssbo_var]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [local_size_x, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn bespoke_compiles_gid_with_local_size_4() {
+    let spv = build_gid_cs(4);
+    let module = translate(&spv).expect("frontend");
+    let target = if cfg!(target_os = "macos") {
+        Target::Aarch64Darwin
+    } else {
+        Target::Aarch64FreeBSD
+    };
+    let out = compile_blob(&module, target)
+        .expect("bespoke should compile a CS reading gl_GlobalInvocationID \
+                 with LocalSize=4 -- exercises the mul+add path that folds \
+                 LocalSize into the GID formula");
+    assert!(!out.blob.is_empty());
+}
+
 #[test]
 fn bespoke_compiles_empty_compute_shader() {
     let spv = build_empty_cs();
