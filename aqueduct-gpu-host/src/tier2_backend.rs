@@ -83,9 +83,14 @@ pub struct Tier2Backend {
     /// processes a Compute-kind pipeline create.
     pipeline_compute: Mutex<HashMap<u32, (Tier2ShaderId, Tier2ComputeStateBlob)>>,
     /// Cumulative count of `cs_main` invocations the walker
-    /// has driven. Observable for tests since the existing
-    /// `CsMain` ABI is side-effect-free.
+    /// has driven. Observable for tests + diagnostics.
     cs_invocations: AtomicU64,
+    /// Last-dispatch SSBO snapshot (the bytes the shader
+    /// wrote into the `out_buffer` parameter through its
+    /// `StorageBuffer` storage-class variable).
+    last_compute_output: Mutex<Option<Vec<u8>>>,
+    /// Per-dispatch SSBO size in bytes.  Default 4 KiB.
+    compute_output_capacity: std::sync::atomic::AtomicUsize,
     submissions: AtomicU64,
     presents:    AtomicU64,
     /// Total Draw / DrawIndexed records the frame-walker has
@@ -256,6 +261,8 @@ impl Tier2Backend {
             pipeline_raster: Mutex::new(HashMap::new()),
             pipeline_compute: Mutex::new(HashMap::new()),
             cs_invocations: AtomicU64::new(0),
+            last_compute_output: Mutex::new(None),
+            compute_output_capacity: std::sync::atomic::AtomicUsize::new(4096),
             last_assembled_vertices: Mutex::new(None),
             presented_frames: Mutex::new(HashMap::new()),
             present_callback: Mutex::new(None),
@@ -436,11 +443,28 @@ impl Tier2Backend {
     }
 
     /// Cumulative count of `cs_main` invocations driven by
-    /// the frame-walker's Dispatch handler. Since the
-    /// existing tier-2 CsMain ABI has only read-only inputs,
-    /// this is the load-bearing observable for compute tests.
+    /// the frame-walker's Dispatch handler.  Sums to
+    /// groupCount[xyz] * local_size[xyz] across the dispatch's
+    /// lifetime.
     pub fn cs_invocation_count(&self) -> u64 {
         self.cs_invocations.load(Ordering::Relaxed)
+    }
+
+    /// Snapshot of the per-dispatch output buffer the most
+    /// recent `dispatch_compute` filled (cloned).  Shaders
+    /// write into this buffer via SSBOs (the `StorageBuffer`
+    /// SPIR-V storage class); the backend dispatcher zeroes
+    /// it before each dispatch.  Default capacity 4096 bytes;
+    /// override via [`Tier2Backend::set_compute_output_capacity`].
+    pub fn compute_output_bytes(&self) -> Option<Vec<u8>> {
+        self.last_compute_output.lock().unwrap().clone()
+    }
+
+    /// Set the per-dispatch output-buffer capacity (bytes).
+    /// Applied to subsequent dispatches; in-flight ones keep
+    /// the prior size.
+    pub fn set_compute_output_capacity(&self, capacity: usize) {
+        self.compute_output_capacity.store(capacity, Ordering::Relaxed);
     }
 
     /// Most recent presented frame for a given Fresco
@@ -915,6 +939,13 @@ impl Tier2Backend {
             return;
         }
 
+        // SSBO output buffer for this dispatch.  Zeroed at the
+        // start, mutated by `cs_main` invocations through the
+        // `StorageBuffer` storage class.
+        let cap = self.compute_output_capacity.load(Ordering::Relaxed);
+        let mut out_buffer = vec![0u8; cap];
+        let out_ptr = out_buffer.as_mut_ptr();
+
         for gz in 0..cmd.group_count_z {
             for gy in 0..cmd.group_count_y {
                 for gx in 0..cmd.group_count_x {
@@ -926,9 +957,12 @@ impl Tier2Backend {
                                 // matches CsMain (checked at
                                 // open time); all pointers are
                                 // valid for at least this call.
+                                // out_buffer lives across the
+                                // whole loop so out_ptr is
+                                // valid throughout.
                                 unsafe {
                                     cs_main(
-                                        uni_ptr, pc_ptr,
+                                        uni_ptr, pc_ptr, out_ptr,
                                         gx, gy, gz,
                                         lx, ly, lz,
                                     );
@@ -939,6 +973,7 @@ impl Tier2Backend {
                 }
             }
         }
+        *self.last_compute_output.lock().unwrap() = Some(out_buffer);
         self.cs_invocations.fetch_add(total_invocations, Ordering::Relaxed);
         self.draws_executed.fetch_add(1, Ordering::Relaxed);
     }

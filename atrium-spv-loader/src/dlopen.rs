@@ -128,9 +128,19 @@ pub type FsMain = unsafe extern "C" fn(
 );
 
 /// Compute-shader entry. Signature per spec §4.1.
+///
+/// `out_buffer` is a single per-dispatch storage region the
+/// shader can write through. Compute SPIR-V binds it via the
+/// SSBO storage class (`StorageBuffer`); backends map any
+/// access to such a variable onto this pointer. Reading from
+/// it is permitted; writing is the typical use case. The
+/// dispatcher (`Tier2Backend::dispatch_compute`) zeroes the
+/// region before the first invocation and exposes its bytes
+/// after the dispatch via `Tier2Backend::compute_output_bytes`.
 pub type CsMain = unsafe extern "C" fn(
     uniforms:        *const u8,
     push_constants:  *const u8,
+    out_buffer:      *mut u8,
     workgroup_id_x:  u32,
     workgroup_id_y:  u32,
     workgroup_id_z:  u32,

@@ -1648,9 +1648,11 @@ impl FnTranslator {
             // out_position vs out_varyings); landing that
             // is queued for vertex phase 4+.
             (ShaderStage::Vertex, StorageClass::Output) => Ok(self.params[6]),
-            // Compute (params: uniforms, push, workgroup_id*3, local_id*3)
+            // Compute (params: uniforms, push, out_buffer,
+            //          workgroup_id*3, local_id*3)
             (ShaderStage::Compute, StorageClass::Uniform) => Ok(self.params[0]),
             (ShaderStage::Compute, StorageClass::PushConstant) => Ok(self.params[1]),
+            (ShaderStage::Compute, StorageClass::StorageBuffer) => Ok(self.params[2]),
             (stage, sc) => Err(BackendError::Unsupported(format!(
                 "no param mapping for stage={stage:?}, storage={sc:?}",
             ))),
@@ -1712,9 +1714,11 @@ fn build_signature(
         }
         ShaderStage::Compute => {
             // atrium_cs_main(uniforms, push_constants,
+            //                out_buffer,
             //                workgroup_id[3], local_id[3])
             params.push(AbiParam::new(pointer_type)); // uniforms
             params.push(AbiParam::new(pointer_type)); // push_constants
+            params.push(AbiParam::new(pointer_type)); // out_buffer (SSBO)
             // workgroup_id as three u32 (the C struct is
             // [u32; 3]; on the SystemV ABI it's passed
             // either by value in regs or as a pointer; we

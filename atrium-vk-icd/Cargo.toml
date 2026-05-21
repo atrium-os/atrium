@@ -35,6 +35,7 @@ atrium-spv-loader = { path = "../atrium-spv-loader" }
 atrium-spv-ir     = { path = "../atrium-spv-ir" }
 rspirv            = "0.13"
 tempfile          = "3"
+env_logger        = "0.11"
 
 # Example binaries that drive the ICD through its C ABI without
 # the Khronos Vulkan loader.
