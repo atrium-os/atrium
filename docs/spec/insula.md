@@ -2780,6 +2780,8 @@ Written:
   resolution protocol (sketched from §12 of this spec).
 - [`docs/spec/tabellarius.md`](tabellarius.md) — push
   delivery protocol (sketched from §11.5 of this spec).
+- [`docs/spec/loculus.md`](loculus.md) — wallet and
+  autofill service (sketched from §16 of this spec).
 
 Planned, not yet written:
 - `docs/spec/loculus.md` — wallet schema.
