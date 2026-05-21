@@ -371,6 +371,117 @@ fn differential_dynamic_rmw_with_prefill() {
     }
 }
 
+/// CS combining multi-binding + dynamic index:
+///   ssbo_out.data[gid_x] = ssbo_in.data[gid_x] * 2
+/// Two SSBOs, both with RuntimeArray<u32>, both indexed by
+/// the same gid_x.  Exercises the X16/X17 descriptor-table
+/// prologue + Op::PtrOffsetDynamic on each binding +
+/// IMul on the loaded value.
+fn build_copy_double_two_ssbos_cs() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let uvec3  = b.type_vector(u32_ty, 3);
+    let void_fn = b.type_function(void, vec![]);
+    let rt_arr = b.type_runtime_array(u32_ty);
+    b.decorate(rt_arr, Decoration::ArrayStride,
+        vec![rspirv::dr::Operand::LiteralBit32(4)]);
+    let mk_block = |b: &mut rspirv::dr::Builder| {
+        let s = b.type_struct(vec![rt_arr]);
+        b.decorate(s, Decoration::Block, vec![]);
+        b.member_decorate(s, 0, Decoration::Offset,
+            vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        s
+    };
+    let s_in  = mk_block(&mut b);
+    let s_out = mk_block(&mut b);
+    let ptr_s_in  = b.type_pointer(None, StorageClass::StorageBuffer, s_in);
+    let ptr_s_out = b.type_pointer(None, StorageClass::StorageBuffer, s_out);
+    let ptr_u     = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+    let v_in  = b.variable(ptr_s_in,  None, StorageClass::StorageBuffer, None);
+    b.decorate(v_in, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(v_in, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let v_out = b.variable(ptr_s_out, None, StorageClass::StorageBuffer, None);
+    b.decorate(v_out, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(v_out, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(1)]);
+    let ptr_in_uvec3 = b.type_pointer(None, StorageClass::Input, uvec3);
+    let gid_var = b.variable(ptr_in_uvec3, None, StorageClass::Input, None);
+    b.decorate(gid_var, Decoration::BuiltIn,
+        vec![rspirv::dr::Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    let c_two  = b.constant_bit32(u32_ty, 2);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let gid = b.load(uvec3, None, gid_var, None, vec![]).unwrap();
+    let gid_x = b.composite_extract(u32_ty, None, gid, vec![0]).unwrap();
+    let src = b.access_chain(ptr_u, None, v_in,  vec![c_zero, gid_x]).unwrap();
+    let val = b.load(u32_ty, None, src, None, vec![]).unwrap();
+    let doubled = b.i_mul(u32_ty, None, val, c_two).unwrap();
+    let dst = b.access_chain(ptr_u, None, v_out, vec![c_zero, gid_x]).unwrap();
+    b.store(dst, doubled, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![gid_var, v_in, v_out]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn differential_multi_binding_plus_dynamic_index() {
+    let spv = build_copy_double_two_ssbos_cs();
+    let dir = TempDir::new().unwrap();
+    // Per-binding 64-byte buffers; pre-fill binding 0 with
+    // a known sequence so the doubling is observable.
+    let prefill: Vec<u8> = [7u32, 13, 21, 30]
+        .iter().flat_map(|v| v.to_le_bytes()).collect();
+    let make_bufs = || -> Vec<Vec<u8>> {
+        let mut b0 = vec![0u8; 64]; b0[..16].copy_from_slice(&prefill);
+        let b1 = vec![0u8; 64];
+        vec![b0, b1]
+    };
+    let mut b_bufs = make_bufs();
+    let mut c_bufs = make_bufs();
+    let b_table: Vec<u64> = b_bufs.iter_mut().map(|b| b.as_mut_ptr() as u64).collect();
+    let c_table: Vec<u64> = c_bufs.iter_mut().map(|b| b.as_mut_ptr() as u64).collect();
+    let gids: Vec<(u32, u32, u32)> = (0..4).map(|i| (i, 0, 0)).collect();
+    invoke_with_gids(&spv, true,  dir.path(), "b",
+        b_table.as_ptr() as *mut u8, &gids);
+    invoke_with_gids(&spv, false, dir.path(), "c",
+        c_table.as_ptr() as *mut u8, &gids);
+    assert_eq!(b_bufs, c_bufs,
+        "bespoke vs cranelift diverge on multi-binding + dynamic:\n  \
+         bespoke   in={:?} out={:?}\n  \
+         cranelift in={:?} out={:?}",
+        &b_bufs[0][..16], &b_bufs[1][..16],
+        &c_bufs[0][..16], &c_bufs[1][..16]);
+    // Sanity: binding 0 unchanged, binding 1 has doubled values.
+    let in_expected  = [7u32, 13, 21, 30];
+    let out_expected = [14u32, 26, 42, 60];
+    for i in 0..4 {
+        let in_v  = u32::from_le_bytes(b_bufs[0][i*4..i*4+4].try_into().unwrap());
+        let out_v = u32::from_le_bytes(b_bufs[1][i*4..i*4+4].try_into().unwrap());
+        assert_eq!(in_v,  in_expected[i],
+            "binding 0 slot {i} should be {} (unchanged), got {in_v}", in_expected[i]);
+        assert_eq!(out_v, out_expected[i],
+            "binding 1 slot {i} should be {} (= in * 2), got {out_v}", out_expected[i]);
+    }
+}
+
 #[test]
 fn differential_six_binding_constant_store() {
     let spv = build_n_binding_constants(6);
