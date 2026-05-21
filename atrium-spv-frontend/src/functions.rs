@@ -1883,6 +1883,68 @@ fn translate_inst(
                     };
                     Op::FDiv(v, length_v)
                 }
+                68 => {
+                    // Cross(a, b):
+                    //   r.x = a.y*b.z - a.z*b.y
+                    //   r.y = a.z*b.x - a.x*b.z
+                    //   r.z = a.x*b.y - a.y*b.x
+                    // a, b are vec3 (or vec4 with .xyz used).
+                    // Result is vec3 matching result_ty.
+                    let a_id = expect_id(&spv_inst.operands, 2)?;
+                    let b_id = expect_id(&spv_inst.operands, 3)?;
+                    let a_v = resolve_value(a_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let b_v = resolve_value(b_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let push = |op: Op, ty: Type,
+                                insts: &mut Vec<Inst>,
+                                next_value_id: &mut u32| -> Value {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let v = Value { id, ty };
+                        insts.push(Inst { op, result: Some(v.clone()),
+                            source_spirv_offset });
+                        v
+                    };
+                    let extract = |idx: u32, src: &Value,
+                                   insts: &mut Vec<Inst>,
+                                   next_value_id: &mut u32| -> Value {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let v = Value { id, ty: Type::F32 };
+                        insts.push(Inst {
+                            op: Op::VectorExtract { vector: src.clone(), index: idx },
+                            result: Some(v.clone()),
+                            source_spirv_offset,
+                        });
+                        v
+                    };
+                    let ax = extract(0, &a_v, insts, next_value_id);
+                    let ay = extract(1, &a_v, insts, next_value_id);
+                    let az = extract(2, &a_v, insts, next_value_id);
+                    let bx = extract(0, &b_v, insts, next_value_id);
+                    let by = extract(1, &b_v, insts, next_value_id);
+                    let bz = extract(2, &b_v, insts, next_value_id);
+                    let aybz = push(Op::FMul(ay.clone(), bz.clone()),
+                        Type::F32, insts, next_value_id);
+                    let azby = push(Op::FMul(az.clone(), by.clone()),
+                        Type::F32, insts, next_value_id);
+                    let rx = push(Op::FSub(aybz, azby),
+                        Type::F32, insts, next_value_id);
+                    let azbx = push(Op::FMul(az, bx.clone()),
+                        Type::F32, insts, next_value_id);
+                    let axbz = push(Op::FMul(ax.clone(), bz),
+                        Type::F32, insts, next_value_id);
+                    let ry = push(Op::FSub(azbx, axbz),
+                        Type::F32, insts, next_value_id);
+                    let axby = push(Op::FMul(ax, by),
+                        Type::F32, insts, next_value_id);
+                    let aybx = push(Op::FMul(ay, bx),
+                        Type::F32, insts, next_value_id);
+                    let rz = push(Op::FSub(axby, aybx),
+                        Type::F32, insts, next_value_id);
+                    Op::ConstVec(vec![rx, ry, rz])
+                }
                 66 => {
                     // Length(v) ≡ sqrt(dot(v, v)).  Result is
                     // f32; arg is vec.

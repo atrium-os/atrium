@@ -1115,9 +1115,21 @@ fn emit_function(
                 for lane in lanes {
                     if let Some(&vreg) = scalars.get(&lane.id) {
                         if owners.get(&vreg.0) == Some(&lane.id) {
-                            owners.remove(&vreg.0);
-                            free_pool.push(vreg.0);
-                            scalars.remove(&lane.id);
+                            // Constants are routinely shared
+                            // across multiple ConstVecs (e.g.
+                            // vec4(0) and vec3(0) both pin
+                            // ConstFloat 0.0).  If any OTHER
+                            // still-live entry in `vectors`
+                            // still references this lane.id,
+                            // freeing would break it.  Scan
+                            // the remaining live vectors.
+                            let still_referenced = vectors.values()
+                                .any(|ls| ls.iter().any(|v| v.id == lane.id));
+                            if !still_referenced {
+                                owners.remove(&vreg.0);
+                                free_pool.push(vreg.0);
+                                scalars.remove(&lane.id);
+                            }
                         }
                     }
                 }

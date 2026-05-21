@@ -1863,6 +1863,75 @@ fn differential_glsl_normalize() {
 }
 
 #[test]
+fn differential_glsl_cross() {
+    // cross(x_axis, y_axis) = z_axis: (1,0,0) × (0,1,0) = (0,0,1)
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let std_450 = b.ext_inst_import("GLSL.std.450");
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let f32_ty = b.type_float(32, None);
+    let vec3   = b.type_vector(f32_ty, 3);
+    let void_fn = b.type_function(void, vec![]);
+    // Three-element vector store layout: tightly packed at
+    // byte offsets 0, 4, 8.
+    let rt_arr = b.type_runtime_array(f32_ty);
+    b.decorate(rt_arr, Decoration::ArrayStride, vec![rspirv::dr::Operand::LiteralBit32(4)]);
+    let s = b.type_struct(vec![rt_arr]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_f = b.type_pointer(None, StorageClass::StorageBuffer, f32_ty);
+    let ssbo  = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    let c_one_f  = b.constant_bit32(f32_ty, 1.0f32.to_bits());
+    let c_zero_f = b.constant_bit32(f32_ty, 0.0f32.to_bits());
+    let v_x = b.constant_composite(vec3, vec![c_one_f, c_zero_f, c_zero_f]);
+    let v_y = b.constant_composite(vec3, vec![c_zero_f, c_one_f, c_zero_f]);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let cr = b.ext_inst(vec3, None, std_450, 68,
+        vec![rspirv::dr::Operand::IdRef(v_x),
+             rspirv::dr::Operand::IdRef(v_y)]).unwrap();
+    // Store the three lanes individually since vec3 doesn't have
+    // a pack-to-12-bytes form -- extract + store each.
+    for i in 0..3u32 {
+        let ci = b.constant_bit32(u32_ty, i);
+        let lane = b.composite_extract(f32_ty, None, cr, vec![i]).unwrap();
+        let d = b.access_chain(ptr_f, None, ssbo, vec![c_zero, ci]).unwrap();
+        b.store(d, lane, None, vec![]).unwrap();
+    }
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spv = Vec::with_capacity(words.len() * 4);
+    for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+    let dir = TempDir::new().unwrap();
+    let mut b_buf = vec![0u8; 16];
+    let mut c_buf = vec![0u8; 16];
+    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    assert_eq!(b_buf, c_buf, "diverge on cross");
+    let read = |i: usize| -> f32 {
+        f32::from_le_bytes(b_buf[i*4..i*4+4].try_into().unwrap())
+    };
+    // x_axis × y_axis = z_axis
+    assert_eq!([read(0), read(1), read(2)], [0.0, 0.0, 1.0],
+        "(1,0,0) × (0,1,0) = (0,0,1)");
+}
+
+#[test]
 fn differential_glsl_length_and_distance() {
     use rspirv::binary::Assemble;
     use rspirv::spirv::{
