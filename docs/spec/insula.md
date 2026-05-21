@@ -2769,8 +2769,13 @@ For each capability the platform might add:
   registry (overlap with §3 / §14 to be reconciled).
 - `docs/spec/atrium-netd.md` — network capability broker.
 
-### Sibling Insula component specs (planned, not yet written)
+### Sibling Insula component specs
 
+Written:
+- [`docs/spec/artifex.md`](artifex.md) — reference IDE
+  (sketched from §10.9 of this spec).
+
+Planned, not yet written:
 - `docs/spec/limen.md` — embed broker + role catalogue.
 - `docs/spec/tabellarius.md` — push delivery protocol.
 - `docs/spec/loculus.md` — wallet schema.
@@ -2778,6 +2783,8 @@ For each capability the platform might add:
 - `docs/spec/nomenclator.md` — name resolution protocol.
 - `docs/spec/atrium-ax.md` — accessibility wire format
   (referenced from §10.4).
+- `docs/spec/insula-host-macos.md` — macOS host adapter
+  (referenced from §0.7).
 
 ### Explicitly NOT used by Insula
 
