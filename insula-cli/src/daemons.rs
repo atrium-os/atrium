@@ -29,6 +29,8 @@ pub enum Daemon {
     Netd,
     /// `praeco-macos` — notifications.
     Praeco,
+    /// `tabellarius-macos` — push delivery.
+    Tabellarius,
 }
 
 impl Daemon {
@@ -39,6 +41,7 @@ impl Daemon {
             Daemon::Vestibulum => "vestibulum-macos",
             Daemon::Netd => "atrium-netd-macos",
             Daemon::Praeco => "praeco-macos",
+            Daemon::Tabellarius => "tabellarius-macos",
         }
     }
 
@@ -50,6 +53,7 @@ impl Daemon {
             Daemon::Vestibulum => "vestibulum-macos",
             Daemon::Netd => "atrium-netd-macos",
             Daemon::Praeco => "praeco-macos",
+            Daemon::Tabellarius => "tabellarius-macos",
         }
     }
 
@@ -61,6 +65,7 @@ impl Daemon {
             Daemon::Vestibulum => "INSULA_VESTIBULUMD_SOCKET",
             Daemon::Netd => "INSULA_NETD_SOCKET",
             Daemon::Praeco => "INSULA_PRAECOD_SOCKET",
+            Daemon::Tabellarius => "INSULA_TABELLARIUSD_SOCKET",
         }
     }
 
@@ -72,6 +77,7 @@ impl Daemon {
             Daemon::Vestibulum => None,
             Daemon::Netd => None,
             Daemon::Praeco => Some("INSULA_PRAECOD_LOG_FILE"),
+            Daemon::Tabellarius => None,
         }
     }
 
@@ -84,11 +90,14 @@ impl Daemon {
             Daemon::Vestibulum => "INSULA_VESTIBULUMD_BIN",
             Daemon::Netd => "INSULA_NETD_BIN",
             Daemon::Praeco => "INSULA_PRAECOD_BIN",
+            Daemon::Tabellarius => "INSULA_TABELLARIUSD_BIN",
         }
     }
 
-    pub const ALL: [Daemon; 4] =
-        [Daemon::Logd, Daemon::Vestibulum, Daemon::Netd, Daemon::Praeco];
+    pub const ALL: [Daemon; 5] = [
+        Daemon::Logd, Daemon::Vestibulum, Daemon::Netd,
+        Daemon::Praeco, Daemon::Tabellarius,
+    ];
 }
 
 /// All paths the CLI cares about for one daemon under

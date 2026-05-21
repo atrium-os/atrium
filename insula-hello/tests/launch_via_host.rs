@@ -63,6 +63,7 @@ fn launches_insula_hello_sandboxed_and_observes_expected_stderr() {
         vestibulum_socket: None,
         netd_socket: None,
         praeco_socket: None,
+        tabellarius_socket: None,
     };
 
     let child = launch(&manifest, &opts)

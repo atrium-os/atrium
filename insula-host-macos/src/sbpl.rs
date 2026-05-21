@@ -91,21 +91,23 @@ pub fn render_profile_with_sockets(
         vestibulum_socket,
         netd_socket,
         None,
+        None,
         any_socket,
     )
 }
 
-/// Full SBPL renderer with all four Insula daemon
+/// Full SBPL renderer with all five Insula daemon
 /// sockets the launcher may pass through: log,
-/// vestibulum, netd, praeco. `any_socket` gates the
-/// broad `network-outbound` grant when at least one is
-/// set.
+/// vestibulum, netd, praeco, tabellarius. `any_socket`
+/// gates the broad `network-outbound` grant when at
+/// least one is set.
 pub fn render_profile_full(
     manifest: &Manifest,
     log_socket: Option<&Path>,
     vestibulum_socket: Option<&Path>,
     netd_socket: Option<&Path>,
     praeco_socket: Option<&Path>,
+    tabellarius_socket: Option<&Path>,
     any_socket: Option<&Path>,
 ) -> String {
     let mut out = String::new();
@@ -194,6 +196,15 @@ pub fn render_profile_full(
     }
     if let Some(sock) = praeco_socket {
         let _ = writeln!(out, ";; praeco-macos socket: {}", sock.display());
+        let _ = writeln!(
+            out,
+            "(allow file-read* file-write* (literal \"{}\"))",
+            sock.display()
+        );
+        let _ = writeln!(out);
+    }
+    if let Some(sock) = tabellarius_socket {
+        let _ = writeln!(out, ";; tabellarius-macos socket: {}", sock.display());
         let _ = writeln!(
             out,
             "(allow file-read* file-write* (literal \"{}\"))",

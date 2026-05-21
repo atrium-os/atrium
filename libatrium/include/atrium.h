@@ -136,6 +136,37 @@ int32_t atrium_net_connect(const char* host, uint16_t port, uint32_t proto);
 int64_t atrium_notify_post(
     const char* title, const char* body, uint32_t urgency);
 
+/* -----------------------------------------------------------
+ * Tabellarius — push delivery (subscribe / unsubscribe / count).
+ * Phase A surface; relay traffic + wake-on-push are Phase B.
+ * -----------------------------------------------------------
+ */
+
+#define ATRIUM_TABELLARIUS_PUBKEY_LEN  32
+#define ATRIUM_TABELLARIUS_KEY_ID_MAX  64
+
+#define ATRIUM_ERR_NO_TABELLARIUS        -40
+#define ATRIUM_ERR_TABELLARIUS_RPC       -41
+#define ATRIUM_ERR_TABELLARIUS_UNKNOWN_KEY -42
+
+/* Subscribe under `purpose` (e.g. "primary"). Writes the
+ * caller-visible key_id (NUL-terminated, up to key_id_cap-1
+ * chars) and the 32-byte pubkey to publish to the app's
+ * backend. Returns the key_id length on success, negative
+ * on error. */
+int32_t atrium_tabellarius_subscribe(
+    const char* purpose,
+    char* key_id_out, size_t key_id_cap,
+    uint8_t* pubkey_out);
+
+/* Unsubscribe by key_id. Returns 0 on success,
+ * ATRIUM_ERR_TABELLARIUS_UNKNOWN_KEY if no such sub. */
+int32_t atrium_tabellarius_unsubscribe(const char* key_id);
+
+/* How many subscriptions are active on this device.
+ * Returns the count on success, negative on error. */
+int32_t atrium_tabellarius_count(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -35,7 +35,7 @@ use std::os::raw::{c_char, c_int, c_uint};
 use std::sync::Mutex;
 
 use aqueduct::Connection;
-use aqueduct::classes::{CLASS_LOG, CLASS_NET, CLASS_NOTIFY, CLASS_VESTIBULUM};
+use aqueduct::classes::{CLASS_LOG, CLASS_NET, CLASS_NOTIFY, CLASS_TABELLARIUS, CLASS_VESTIBULUM};
 use aqueduct::envelope::{flag, Header};
 
 /// Lazily-initialized platform connection. None until
@@ -775,6 +775,177 @@ pub unsafe extern "C" fn atrium_keychain_sign(
     }
     std::ptr::copy_nonoverlapping(resp.as_ptr(), sig_out, ATRIUM_KEYCHAIN_SIG_LEN);
     ATRIUM_KEYCHAIN_SIG_LEN as c_int
+}
+
+// =====================================================
+// Tabellarius — push delivery (subscribe / unsubscribe / list).
+// Connects to the tabellarius-macos daemon over Aqueduct
+// CLASS_TABELLARIUS. v0 covers the subscribe-side ABI;
+// actual relay traffic + wake-on-push delivery are
+// daemon-side Phase B work (see tabellarius.md §11.2).
+// =====================================================
+
+/// Subscription pubkey length (32 bytes ed25519, same
+/// shape vestibulum exposes — Tabellarius's relay layer
+/// will convert to X25519 in Phase B).
+pub const ATRIUM_TABELLARIUS_PUBKEY_LEN: usize = 32;
+
+/// Maximum supported key_id length in bytes.
+pub const ATRIUM_TABELLARIUS_KEY_ID_MAX: usize = 64;
+
+/// Tabellarius daemon unreachable.
+pub const ATRIUM_ERR_NO_TABELLARIUS: c_int = -40;
+/// Tabellarius responded but the response was malformed.
+pub const ATRIUM_ERR_TABELLARIUS_RPC: c_int = -41;
+/// Unknown key_id passed to atrium_tabellarius_unsubscribe.
+pub const ATRIUM_ERR_TABELLARIUS_UNKNOWN_KEY: c_int = -42;
+
+fn tabellarius_connect() -> Option<Connection> {
+    let path = std::env::var_os("ATRIUM_TABELLARIUS_SOCKET")?;
+    Connection::connect(std::path::Path::new(&path)).ok()
+}
+
+fn tabellarius_rpc(conn: &mut Connection, op: u16, payload: &[u8])
+    -> Option<Vec<u8>>
+{
+    conn.send_message(
+        CLASS_TABELLARIUS, op,
+        flag::RESPONSE_EXPECTED, payload,
+    ).ok()?;
+    loop {
+        let msg = conn.recv_message().ok()?;
+        if msg.opcode_class == CLASS_TABELLARIUS
+            && msg.op == op
+            && (msg.flags & flag::IS_RESPONSE) != 0
+        {
+            return Some(msg.payload);
+        }
+    }
+}
+
+/// Subscribe to push delivery under the given `purpose`
+/// (e.g. `"primary"`, `"secondary"`). Mints a fresh
+/// keypair on the daemon side, persists it, returns the
+/// caller-visible `key_id` plus the 32-byte pubkey the
+/// caller should publish to their own backend so push
+/// senders can encrypt for this device.
+///
+/// Wire shape (per CLASS_TABELLARIUS doc):
+///   request:  utf-8 purpose
+///   response: [u8 key_id_len | key_id UTF-8 | 32B pubkey]
+///
+/// On success the function writes:
+///   - up to `key_id_cap - 1` bytes of key_id into
+///     `key_id_out` followed by a NUL terminator.
+///   - exactly `ATRIUM_TABELLARIUS_PUBKEY_LEN` bytes
+///     into `pubkey_out` (which must be at least that
+///     large).
+/// Returns the length of the key_id (not counting the
+/// terminator) on success, or a negative error code.
+///
+/// # Safety
+///
+/// `purpose` must be NUL-terminated UTF-8. `key_id_out`
+/// must be writable for `key_id_cap` bytes; `pubkey_out`
+/// for `ATRIUM_TABELLARIUS_PUBKEY_LEN` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn atrium_tabellarius_subscribe(
+    purpose: *const c_char,
+    key_id_out: *mut c_char,
+    key_id_cap: usize,
+    pubkey_out: *mut u8,
+) -> c_int {
+    if purpose.is_null() || key_id_out.is_null() || pubkey_out.is_null() {
+        return ATRIUM_ERR_INVALID_PATH;
+    }
+    let purpose_s = match CStr::from_ptr(purpose).to_str() {
+        Ok(s) => s,
+        Err(_) => return ATRIUM_ERR_INVALID_PATH,
+    };
+    if key_id_cap == 0 {
+        return ATRIUM_ERR_BUF_TOO_SMALL;
+    }
+
+    let Some(mut conn) = tabellarius_connect() else {
+        return ATRIUM_ERR_NO_TABELLARIUS;
+    };
+    let Some(resp) = tabellarius_rpc(&mut conn, 0, purpose_s.as_bytes()) else {
+        return ATRIUM_ERR_TABELLARIUS_RPC;
+    };
+    if resp.is_empty() {
+        return ATRIUM_ERR_TABELLARIUS_RPC;
+    }
+    let id_len = resp[0] as usize;
+    if resp.len() != 1 + id_len + ATRIUM_TABELLARIUS_PUBKEY_LEN {
+        return ATRIUM_ERR_TABELLARIUS_RPC;
+    }
+    if id_len + 1 > key_id_cap {
+        return ATRIUM_ERR_BUF_TOO_SMALL;
+    }
+    let id_bytes = &resp[1..1 + id_len];
+    let pk_bytes = &resp[1 + id_len..];
+
+    std::ptr::copy_nonoverlapping(id_bytes.as_ptr(), key_id_out as *mut u8, id_len);
+    *key_id_out.add(id_len) = 0;
+    std::ptr::copy_nonoverlapping(pk_bytes.as_ptr(), pubkey_out, ATRIUM_TABELLARIUS_PUBKEY_LEN);
+    id_len as c_int
+}
+
+/// Unsubscribe by `key_id`. Returns 0 on success,
+/// `ATRIUM_ERR_TABELLARIUS_UNKNOWN_KEY` if no such
+/// subscription exists, or a negative I/O error code.
+///
+/// # Safety
+///
+/// `key_id` must be NUL-terminated UTF-8.
+#[no_mangle]
+pub unsafe extern "C" fn atrium_tabellarius_unsubscribe(
+    key_id: *const c_char,
+) -> c_int {
+    if key_id.is_null() {
+        return ATRIUM_ERR_INVALID_PATH;
+    }
+    let id = match CStr::from_ptr(key_id).to_str() {
+        Ok(s) => s,
+        Err(_) => return ATRIUM_ERR_INVALID_PATH,
+    };
+    let Some(mut conn) = tabellarius_connect() else {
+        return ATRIUM_ERR_NO_TABELLARIUS;
+    };
+    let Some(resp) = tabellarius_rpc(&mut conn, 1, id.as_bytes()) else {
+        return ATRIUM_ERR_TABELLARIUS_RPC;
+    };
+    if resp.len() != 1 {
+        return ATRIUM_ERR_TABELLARIUS_RPC;
+    }
+    if resp[0] == 0 { 0 } else { ATRIUM_ERR_TABELLARIUS_UNKNOWN_KEY }
+}
+
+/// Count the number of active subscriptions on this
+/// device.
+///
+/// Listing the actual key_ids + pubkeys is the daemon's
+/// `tabellarius list` CLI command; apps usually only
+/// care about their own subscriptions, which they keep
+/// in their own state. The library surface exposes the
+/// count to support "did my subscribe call actually
+/// register?" style checks without needing to round-trip
+/// the full list across the FFI boundary.
+///
+/// Returns the count on success or a negative error code.
+#[no_mangle]
+pub extern "C" fn atrium_tabellarius_count() -> c_int {
+    let Some(mut conn) = tabellarius_connect() else {
+        return ATRIUM_ERR_NO_TABELLARIUS;
+    };
+    let Some(resp) = tabellarius_rpc(&mut conn, 2, &[]) else {
+        return ATRIUM_ERR_TABELLARIUS_RPC;
+    };
+    if resp.len() < 2 {
+        return ATRIUM_ERR_TABELLARIUS_RPC;
+    }
+    let n = u16::from_le_bytes([resp[0], resp[1]]);
+    n as c_int
 }
 
 // ---------------------------------------------------------

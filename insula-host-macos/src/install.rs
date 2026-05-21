@@ -156,9 +156,8 @@ pub fn launch_installed_all(
     )
 }
 
-/// Most-general launch entry: threads all four Insula
-/// daemon sockets through to the child via env + SBPL
-/// grant. Pass `None` for any to skip.
+/// Source-compat shim: launch with up to four sockets
+/// (logd / vestibulum / netd / praeco).
 pub fn launch_installed_v2(
     app: &InstalledApp,
     args: &[&str],
@@ -167,6 +166,25 @@ pub fn launch_installed_v2(
     vestibulum_socket: Option<&std::path::Path>,
     netd_socket: Option<&std::path::Path>,
     praeco_socket: Option<&std::path::Path>,
+) -> Result<SandboxedChild, Error> {
+    launch_installed_v3(
+        app, args, capture_output, log_socket, vestibulum_socket,
+        netd_socket, praeco_socket, None,
+    )
+}
+
+/// Most-general launch entry: threads all five Insula
+/// daemon sockets through to the child via env + SBPL
+/// grant. Pass `None` for any to skip.
+pub fn launch_installed_v3(
+    app: &InstalledApp,
+    args: &[&str],
+    capture_output: bool,
+    log_socket: Option<&std::path::Path>,
+    vestibulum_socket: Option<&std::path::Path>,
+    netd_socket: Option<&std::path::Path>,
+    praeco_socket: Option<&std::path::Path>,
+    tabellarius_socket: Option<&std::path::Path>,
 ) -> Result<SandboxedChild, Error> {
     let opts = LaunchOptions {
         binary_path: &app.binary_path,
@@ -177,6 +195,7 @@ pub fn launch_installed_v2(
         vestibulum_socket,
         netd_socket,
         praeco_socket,
+        tabellarius_socket,
     };
     launch(&app.manifest, &opts)
 }

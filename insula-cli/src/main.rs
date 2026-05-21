@@ -384,10 +384,15 @@ fn cmd_launch(args: &[String], install_root: &Path) -> Result<(), String> {
         Daemon::Praeco,
         "INSULA_PRAECOD_SOCKET",
     );
+    let tabellarius_socket = resolve_daemon_socket(
+        install_root,
+        Daemon::Tabellarius,
+        "INSULA_TABELLARIUSD_SOCKET",
+    );
 
     // Inherit stdio for `insula launch`; the user wants
     // to see the app's output.
-    let mut child = host::launch_installed_v2(
+    let mut child = host::launch_installed_v3(
         &installed,
         &app_args_raw,
         false,
@@ -395,6 +400,7 @@ fn cmd_launch(args: &[String], install_root: &Path) -> Result<(), String> {
         vestibulum_socket.as_deref(),
         netd_socket.as_deref(),
         praeco_socket.as_deref(),
+        tabellarius_socket.as_deref(),
     )
     .map_err(|e| format!("launch: {}", e))?;
 

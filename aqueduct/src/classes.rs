@@ -107,6 +107,23 @@ pub const CLASS_VESTIBULUM: u8 = 11;
 ///       only used for the initial CONNECT handshake.
 pub const CLASS_NET:       u8 = 12;
 
+/// Insula push delivery — the Tabellarius daemon's app-facing
+/// Aqueduct surface. Per `docs/spec/tabellarius.md` §9.1.
+///
+/// v0 ops (subscribe / unsubscribe / list — relay traffic is
+/// future work):
+///   0 = SUBSCRIBE_REQUEST
+///       payload: utf8 purpose ("primary", "secondary", …)
+///       response: [u8 key_id_len | key_id UTF-8 | 32-byte pubkey]
+///   1 = UNSUBSCRIBE_REQUEST
+///       payload: utf8 key_id
+///       response: 1-byte status (0 = removed, 1 = unknown key)
+///   2 = LIST_REQUEST
+///       payload: (empty)
+///       response: [u16 n_entries LE | for each entry:
+///                 u8 key_id_len | key_id UTF-8 | 32-byte pubkey]
+pub const CLASS_TABELLARIUS: u8 = 13;
+
 /// Smoke-test / fuzzing service. Not part of the production
 /// surface; used by aqueduct-echo and unit tests.
 pub const CLASS_ECHO:      u8 = 63;
@@ -131,6 +148,7 @@ pub fn class_name(c: u8) -> &'static str {
         CLASS_LOG        => "log",
         CLASS_VESTIBULUM => "vestibulum",
         CLASS_NET        => "net",
+        CLASS_TABELLARIUS => "tabellarius",
         CLASS_ECHO       => "echo",
         c if c >= CLASS_VENDOR_BASE => "vendor",
         _ => "reserved",
