@@ -203,6 +203,24 @@ int32_t atrium_window_frame_path(
     uint32_t node_id,
     float cx, float cy, float length, float width, float angle,
     float r, float g, float b, float a);
+
+/* Texture format selectors for atrium_window_upload_texture. */
+#define ATRIUM_TEX_FORMAT_RGBA8_SRGB  0
+#define ATRIUM_TEX_FORMAT_R8_UNORM    1
+
+/* Upload pixel data to the scene server's CAS + bind to
+ * `slot_id` for `window_id`. Returns 0 on success. */
+int32_t atrium_window_upload_texture(
+    uint32_t window_id, uint32_t slot_id,
+    const uint8_t* bytes, size_t len,
+    uint32_t width, uint32_t height, uint32_t format);
+
+/* Emit a texture node referencing a previously-uploaded
+ * slot. Must be called between frame_begin / frame_end. */
+int32_t atrium_window_frame_texture(
+    uint32_t node_id, uint32_t slot_id,
+    float x, float y, float w, float h);
+
 int32_t atrium_window_frame_end(void);
 
 /* Window event kinds (mirror fresco_protocol::control::EV_*). */

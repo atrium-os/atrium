@@ -1267,6 +1267,120 @@ pub extern "C" fn atrium_window_frame_rect(
     })
 }
 
+/// Texture format selector for [`atrium_window_upload_texture`].
+pub const ATRIUM_TEX_FORMAT_RGBA8_SRGB: u32 = 0;
+/// Texture format selector for [`atrium_window_upload_texture`].
+pub const ATRIUM_TEX_FORMAT_R8_UNORM: u32 = 1;
+
+/// Upload texture bytes into the Fresco scene server's
+/// CAS + bind them to `slot_id` for the given window.
+/// After this call, scene nodes can reference
+/// `slot_id` in [`atrium_window_frame_texture`].
+///
+/// `bytes` is the raw pixel data, `len` bytes long.
+/// For `RGBA8_SRGB`, expect `width * height * 4` bytes;
+/// for `R8_UNORM`, `width * height`.
+///
+/// Slot IDs are per-(connection, window); apps pick
+/// them, the same convention they use for node_ids.
+/// Returns 0 on success, negative on error.
+///
+/// # Safety
+///
+/// `bytes` must point to `len` valid bytes.
+#[no_mangle]
+pub unsafe extern "C" fn atrium_window_upload_texture(
+    window_id: u32,
+    slot_id: u32,
+    bytes: *const u8,
+    len: usize,
+    width: u32,
+    height: u32,
+    format: u32,
+) -> c_int {
+    if bytes.is_null() {
+        return ATRIUM_ERR_INVALID_PATH;
+    }
+    let format = match format {
+        ATRIUM_TEX_FORMAT_RGBA8_SRGB => {
+            fresco_protocol::TextureFormat::Rgba8UnormSrgb
+        }
+        ATRIUM_TEX_FORMAT_R8_UNORM => {
+            fresco_protocol::TextureFormat::R8Unorm
+        }
+        _ => return ATRIUM_ERR_INVALID_PATH,
+    };
+    let buf = std::slice::from_raw_parts(bytes, len);
+    let flags = window_id as u16;
+    with_fresco_conn(|conn| {
+        let hash = match conn.upload_blob(buf) {
+            Ok(h) => h,
+            Err(_) => return ATRIUM_ERR_FRESCO_RPC,
+        };
+        let payload = fresco_protocol::SlotSetPayload {
+            slot_id,
+            hash,
+            kind: fresco_protocol::SlotKind::Texture(
+                fresco_protocol::TextureDesc { width, height, format },
+            ),
+        };
+        let encoded = match postcard::to_stdvec(&payload) {
+            Ok(v) => v,
+            Err(_) => return ATRIUM_ERR_FRESCO_RPC,
+        };
+        if conn.send_message(
+            CLASS_DISPLAY,
+            fresco_protocol::control::OP_SLOT_SET,
+            flags, &encoded,
+        ).is_err() {
+            return ATRIUM_ERR_FRESCO_RPC;
+        }
+        0
+    })
+}
+
+/// Emit a texture node into the in-progress frame,
+/// referencing a previously-uploaded slot.
+///
+/// Must be called between [`atrium_window_frame_begin`]
+/// and [`atrium_window_frame_end`].
+#[no_mangle]
+pub extern "C" fn atrium_window_frame_texture(
+    node_id: u32,
+    slot_id: u32,
+    x: f32, y: f32, w: f32, h: f32,
+) -> c_int {
+    let window_id = match *FRESCO_FRAME_WINDOW.lock().unwrap() {
+        Some(w) => w,
+        None => return ATRIUM_ERR_FRESCO_RPC,
+    };
+    let flags = window_id as u16;
+    let tex_bytes = match postcard::to_stdvec(&fresco_protocol::TextureParams {
+        x, y, w, h, slot_id,
+    }) {
+        Ok(v) => v,
+        Err(_) => return ATRIUM_ERR_FRESCO_RPC,
+    };
+    let node = match postcard::to_stdvec(&fresco_protocol::SceneNodeSetPayload {
+        node_id,
+        op_id: fresco_protocol::scene_ops::ATRIUM_CORE_TEXTURE,
+        params: tex_bytes,
+    }) {
+        Ok(v) => v,
+        Err(_) => return ATRIUM_ERR_FRESCO_RPC,
+    };
+    with_fresco_conn(|conn| {
+        if conn.send_message(
+            CLASS_DISPLAY,
+            fresco_protocol::control::OP_SCENE_NODE_SET,
+            flags, &node,
+        ).is_err() {
+            return ATRIUM_ERR_FRESCO_RPC;
+        }
+        0
+    })
+}
+
 /// Emit a rotated-quad path node into the in-progress
 /// frame. `(cx, cy)` is the rotation pivot; `length` is
 /// the size along the rotation axis, `width`
