@@ -172,7 +172,7 @@ $INSULA daemons down
 
 ## Testing
 
-83 tests pass across all 10 crates on this macOS host.
+94 tests pass across all 10 crates on this macOS host.
 
 ```sh
 for c in insula-manifest insula-bundle libatrium \
@@ -191,11 +191,11 @@ Test distribution:
 | insula-bundle | 5 | Bundle layout validation incl. malformed cases |
 | libatrium | 11 | C ABI surface tests + Aqueduct routing + storage |
 | insula-host-macos | 16 | SBPL gen + actual sandboxed launch + install layout |
-| insula-hello | 3 | Bundle parses; install+run via host adapter |
+| insula-hello | 5 | Bundle parses; install+run via host adapter; per-app netd enforcement E2E (allow + deny) |
 | insula-cli | 11 | All subcommands + auto-spawn + logd integration |
 | insula-logd | 3 | Daemon decodes Aqueduct messages + writes log file |
 | vestibulum-macos | 10 | ed25519 keychain roundtrip incl. signature verify, persistence across restart |
-| atrium-netd-macos | 4 | Real TCP-bridge through broker, allowlist denial, graceful degraded |
+| atrium-netd-macos | 13 | Per-app manifest enforcement (8 unit) + broker behavior (5 integration) |
 | praeco-macos | 3 | Notification posts log + monotonic ids + degraded |
 
 The *load-bearing* integration tests (the ones that prove
@@ -239,6 +239,14 @@ the design isn't just on paper):
   daemon assigns an id, returns it, and appends the
   structured record.
 
+- `insula-hello/tests/per_app_netd.rs::manifest_allowing_host_lets_app_connect`
+  + `::manifest_denying_host_blocks_app_connect` — full E2E
+  proof of per-app `[network]` enforcement: vary insula-hello's
+  bundle manifest, launch through the CLI, observe the broker's
+  manifest-driven verdict in the auto-spawned daemon's log file.
+  Closes the loop on SO_PEERPID + proc_pidpath + manifest lookup
+  + verdict — the whole chain proven on real bytes.
+
 ## v0 limitations (documented)
 
 - **No bundle signing.** Bundles are unsigned in v0;
@@ -260,14 +268,14 @@ the design isn't just on paper):
   `(allow network-outbound)` is the workable grant.
   Tighter posture lives behind direct `sandbox_init`
   (private SPI), post-v0.
-- **Network broker is broker-wide, not per-app.**
-  `atrium-netd-macos` reads `$INSULA_NETD_ALLOWED_HOSTS`
-  at startup and applies it to every connection. The
-  spec intends per-app enforcement keyed off the app's
-  `[network]` manifest section. Closing this gap
-  requires kernel-attested peer identification
-  (SO_PEERCRED / LOCAL_PEERPID on macOS) + manifest
-  lookup keyed by executable path.
+- **~~Network broker is broker-wide, not per-app.~~** Done.
+  The broker uses `getsockopt(LOCAL_PEERPID)` for kernel-
+  attested peer identification, `libc::proc_pidpath` to
+  resolve the executable, walks `<install_root>/apps/*/
+  bundle/` to match an installed app, loads its manifest,
+  and enforces `[network].hosts` per-connection. Broker-
+  wide `$INSULA_NETD_ALLOWED_HOSTS` is the fallback for
+  unidentified peers. E2E-tested with insula-hello.
 - **UDP unsupported in the broker.** TCP only; the
   ABI accepts `ATRIUM_NET_UDP` but the daemon returns
   PROTO_UNSUPPORTED.
@@ -301,9 +309,12 @@ none of them invalidates the current shape.
 
 ## Commit history of the implementation effort
 
-22 commits, oldest at the bottom:
+25 implementation commits, oldest at the bottom:
 
 ```
+5e0505f insula-hello: optional net-connect + E2E per-app netd enforcement test
+4725305 atrium-netd-macos: per-app manifest enforcement (SO_PEERPID + proc_pidpath)
+f2b10da docs/INSULA-IMPLEMENTATION: reflect 5-ABI / 4-daemon state
 2dd0a93 praeco-macos: notifications daemon + atrium_notify_post
 06866a7 insula-cli + host-macos: auto-spawn atrium-netd-macos too
 b79da55 atrium-netd-macos: network broker daemon + atrium_net_connect ABI
@@ -346,17 +357,21 @@ b651f13 insula-manifest: initial skeleton -- parse [app] + [bundle]
 
 1. **Pergola wire emission** (the M1C blocker, per ROADMAP-INSULA §1.3).
    Until this lands, no Insula app can open a window.
-2. **Per-app netd enforcement** — close the broker-wide-
-   allowlist v0 limitation by identifying the calling app
-   via SO_PEERCRED → executable path → manifest lookup,
-   then enforce the app's `[network]` section.
-3. **Persistent vestibulum keystore encryption** — wrap
-   the `.key` files via macOS Keychain Services per
-   `vestibulum.md` §3.1.
-4. **Bundle signing** — minisign-style as a first pass per
-   `atrium-pkg.md`.
-5. **Tabellarius push delivery** — `insula.md` §11.5 isn't
-   started; pattern is well-established now.
+2. **macOS-Keychain-Services-backed vestibulum keystore**
+   — wrap the `.key` files via SecItemAdd. Closes the
+   "plaintext on disk" caveat. Depends on the
+   `security-framework` crate or raw libc bindings.
+3. **Bundle signing** — minisign / ed25519-style as a first
+   pass per `atrium-pkg.md`. Adds an `insula sign` CLI
+   subcommand and verification at install time.
+4. **Tabellarius push delivery** — `insula.md` §11.5 isn't
+   started; pattern is well-established now (sixth daemon
+   following the established shape).
+5. **More sample apps** — the platform supports the
+   primitives but only one app (insula-hello) exercises
+   them. A second app (e.g. an atrium-fetch tool that
+   uses atrium_net_connect with structured output) would
+   show breadth.
 
 Each of these is one or two commits given the current
 shape; the foundation underneath is in place.
