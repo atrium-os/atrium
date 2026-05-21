@@ -34,6 +34,7 @@ Canonical vocabulary for the Atrium platform. Every component in this table has 
 | **Wallet** | **Loculus** | small carried purse / box for valuables | user-curated data items (addresses, payment methods, profiles); powerbox autofill — apps see only items the user picked |
 | **Peer broker** | **Concursus** | a coming-together | symmetric device-to-device channel broker; STUN/TURN-equivalent + signaling + typed role messages |
 | **Name resolver** | **Nomenclator** | the Roman servant who whispered names to his master | resolves `atrium-doc://` / `atrium-app://` names through publisher manifests to content hashes |
+| **IDE (reference dev environment)** | **Artifex** | skilled artisan / maker — "one who makes," paired with Opifex (the maker of packages) | reference Insula IDE — native Pergola app, Limen-extension model, LSP/DAP host, Stoa-embedded terminal; flagship demonstrator of the no-Electron pitch (§10.9 of insula spec) |
 
 ## Foundation apps
 
@@ -44,10 +45,19 @@ User-facing apps don't take Latin names — they keep plain descriptive names wi
 - `atrium-files` — file browser (built atop Scrinium)
 - `atrium-image` — image viewer
 - `atrium-pdf` — PDF viewer
+- `atrium-doc` — document viewer (HTML/Markdown/PDF) — see [`spec/insula.md`](spec/insula.md) §10.6
 - `atrium-clock` — clock widget
 - ...
 
 The user-facing display name can be unprefixed ("Edit", "Term", "Files"); the binary and package always use the prefix to avoid PATH collisions with traditional Unix tools.
+
+**Exception — platform-demonstrator apps take Latin names.** A user-facing app that is also a *reference implementation / flagship demonstrator* for platform primitives is elevated and gets a Latin name. Current members:
+
+- **Forum** — shell / dock / statusbar (demonstrates Pergola at the chrome layer).
+- **Stoa** — persistent sessions (demonstrates long-lived service shape).
+- **Artifex** — Insula reference IDE (demonstrates Limen extensions, LSP/DAP-as-Aqueduct, native dev experience without Electron).
+
+These are tagged in the system-services table above; the Latin name signals their dual role as platform-load-bearing applications.
 
 ## Cdevs and well-known paths
 
@@ -114,6 +124,7 @@ GitHub org: **`atrium-os`**. Repo names mirror service names where applicable.
 | `atrium-os/atrium-edit`, `-term`, etc. | foundation apps |
 | `atrium-os/insula` | Insula umbrella: shared `libatrium.so`, contract docs, conformance tests |
 | `atrium-os/limen`, `tabellarius`, `loculus`, `concursus`, `nomenclator` | Insula services |
+| `atrium-os/artifex` | reference Insula IDE |
 | `atrium-os/freebsd-ports` | fork with Atrium ports added |
 
 ## Style guide

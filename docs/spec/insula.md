@@ -384,7 +384,7 @@ everything else compiles and runs.
 
 | Phase | Target | Goal |
 |---|---|---|
-| 1 | **macOS** | Reference SDK, reference IDE (§10.9), sample apps, Limen + Tabellarius + Loculus + Concursus + Nomenclator running on the macOS host adapter. Prove the contract end-to-end. |
+| 1 | **macOS** | Reference SDK, **Artifex** (reference IDE — §10.9), sample apps, Limen + Tabellarius + Loculus + Concursus + Nomenclator running on the macOS host adapter. Prove the contract end-to-end. |
 | 2 | **Linux** | Second host adapter (Landlock + seccomp + namespaces). Proves the contract is really portable, not "Apple-Unix-only." Adds the second-largest desktop user base. |
 | 3 | **Windows** | Third host adapter (AppContainer + Job objects). Three-OS coverage = developers stop worrying about platform availability. |
 | 4 | **Atrium** | Purpose-built Insula host. All the existing FreeBSD work culminates here. Atrium becomes "the OS that does Insula natively, with kernel-enforced jails + native GPU + native CAS-FS dedup." Best Insula experience, not the only one. |
@@ -1328,7 +1328,7 @@ the design *is* the content — and arguably belong to the
 document-viewer authoring format (§10.6), not the apps
 layer.
 
-### 10.9 Dev tools and the Electron alternative
+### 10.9 Artifex — the reference IDE (Electron alternative)
 
 VS Code is currently the dominant developer environment,
 and it is built on Electron — desktop-class apps built with
@@ -1337,11 +1337,18 @@ we deliver an IDE that matches VS Code's developer
 experience without inheriting Electron's costs (web-tech-
 as-desktop-substrate is the wrong direction)?
 
+The reference IDE is named **Artifex** (Latin: *skilled
+artisan, maker*) — paired with **Opifex** (the platform's
+existing package manager, *the craftsman who makes the
+package*) via the "-fex" suffix ("one who makes"). Opifex
+makes and distributes artifacts; Artifex is the workshop
+where they are made.
+
 This section is partly a demonstration that Insula's
 existing primitives — Pergola + Limen + Aqueduct + Stoa —
-already compose into a better answer than Electron, and
-partly a checklist of what the Insula reference IDE will
-need to lock in adoption.
+compose into a better answer than Electron, and partly a
+checklist of what Artifex needs to ship to lock in
+developer adoption.
 
 #### 10.9.1 What Electron got right (and we keep)
 
@@ -1374,14 +1381,14 @@ contracts. They could run on anything. Microsoft chose
 Electron because it was the path of least resistance, not
 because it was the right substrate.
 
-#### 10.9.3 The Insula IDE composition
+#### 10.9.3 Artifex composition
 
-The IDE is a *demonstration* of Insula's claims, not a
+Artifex is a *demonstration* of Insula's claims, not a
 special case. Most pieces already exist:
 
 | Component | Insula answer |
 |---|---|
-| Editor itself | Native Pergola app — `atrium-edit`'s production-grade descendant, or a sibling editor app |
+| Editor surface | Native Pergola app (sibling to `atrium-edit`; Artifex is the IDE, `atrium-edit` stays the simple foundation editor) |
 | Language services | **LSP** — already external-process; fits Aqueduct directly as a typed message protocol |
 | Debugger | **DAP** — same shape as LSP, fits Aqueduct directly |
 | Terminal | **Stoa embedded via Limen** — already a foundation service |
@@ -1433,7 +1440,7 @@ Concrete improvements over VS Code:
 
 #### 10.9.5 Performance targets
 
-| Metric | VS Code (Electron) | Insula IDE target |
+| Metric | VS Code (Electron) | Artifex target |
 |---|---|---|
 | Cold start | 2–5 s | <100 ms |
 | Idle RAM | 200–500 MB | 20–50 MB |
@@ -1447,13 +1454,14 @@ between the user and the work.
 
 #### 10.9.6 Strategic angle
 
-The IDE is the single most effective adoption argument
+Artifex is the single most effective adoption argument
 because developers care about their tools more than almost
-anything else. A reference IDE that is *demonstrably
-better* than VS Code on every developer-perceivable axis
-(startup, RAM, big-file responsiveness, battery,
-extensibility safety) is the trojan horse that gets Insula
-into developers' hands.
+anything else. An IDE that is *demonstrably better* than
+VS Code on every developer-perceivable axis (startup, RAM,
+big-file responsiveness, battery, extensibility safety) is
+the trojan horse that gets Insula into developers' hands —
+and developers using Artifex are the population most likely
+to *build the next generation of Insula apps* in turn.
 
 It also closes a loop with §0.6.4: VS Code's "web version"
 (vscode.dev) is the canonical example of where this design
