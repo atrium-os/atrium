@@ -35,7 +35,7 @@ use std::os::raw::{c_char, c_int, c_uint};
 use std::sync::Mutex;
 
 use aqueduct::Connection;
-use aqueduct::classes::{CLASS_LOG, CLASS_NET, CLASS_NOTIFY, CLASS_TABELLARIUS, CLASS_VESTIBULUM};
+use aqueduct::classes::{CLASS_DISPLAY, CLASS_LOG, CLASS_NET, CLASS_NOTIFY, CLASS_TABELLARIUS, CLASS_VESTIBULUM};
 use aqueduct::envelope::{flag, Header};
 
 /// Lazily-initialized platform connection. None until
@@ -946,6 +946,122 @@ pub extern "C" fn atrium_tabellarius_count() -> c_int {
     }
     let n = u16::from_le_bytes([resp[0], resp[1]]);
     n as c_int
+}
+
+// =====================================================
+// Fresco — window-management (open / destroy a top-level
+// window via the scene server). The first Pergola-shaped
+// piece: opens the path from Insula apps to a real
+// drawable surface. Subsequent slices add scene-graph
+// emission for actually painting into the window.
+// =====================================================
+
+/// Fresco scene server unreachable.
+pub const ATRIUM_ERR_NO_FRESCO: c_int = -50;
+/// Fresco responded but the response was malformed.
+pub const ATRIUM_ERR_FRESCO_RPC: c_int = -51;
+
+fn fresco_connect() -> Option<Connection> {
+    let path = std::env::var_os("ATRIUM_FRESCO_SOCKET")?;
+    Connection::connect(std::path::Path::new(&path)).ok()
+}
+
+/// Open a top-level window via the Fresco scene
+/// server.
+///
+/// Returns the assigned `window_id` on success
+/// (positive, never zero), or a negative error code:
+///   - [`ATRIUM_ERR_NO_FRESCO`] if `$ATRIUM_FRESCO_SOCKET`
+///     isn't set or the connect fails.
+///   - [`ATRIUM_ERR_FRESCO_RPC`] if the server
+///     response is malformed.
+///   - [`ATRIUM_ERR_INVALID_PATH`] if `title` is NULL
+///     or non-UTF-8.
+///
+/// v0 hints: no modal flag, no parent window — both
+/// derivable from the manifest in future slices.
+///
+/// # Safety
+///
+/// `title` must be a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn atrium_window_open(
+    title: *const c_char,
+    width: u32,
+    height: u32,
+) -> c_int {
+    if title.is_null() {
+        return ATRIUM_ERR_INVALID_PATH;
+    }
+    let title_s = match CStr::from_ptr(title).to_str() {
+        Ok(s) => s.to_string(),
+        Err(_) => return ATRIUM_ERR_INVALID_PATH,
+    };
+    let Some(mut conn) = fresco_connect() else {
+        return ATRIUM_ERR_NO_FRESCO;
+    };
+    let payload = fresco_protocol::WindowCreatePayload {
+        width,
+        height,
+        title: title_s,
+        hints: fresco_protocol::WindowHints::default(),
+        parent_window_id: 0,
+    };
+    let bytes = match postcard::to_stdvec(&payload) {
+        Ok(b) => b,
+        Err(_) => return ATRIUM_ERR_FRESCO_RPC,
+    };
+    if conn.send_message(
+        CLASS_DISPLAY,
+        fresco_protocol::control::OP_WINDOW_CREATE,
+        flag::RESPONSE_EXPECTED,
+        &bytes,
+    ).is_err() {
+        return ATRIUM_ERR_FRESCO_RPC;
+    }
+    loop {
+        let msg = match conn.recv_message() {
+            Ok(m) => m,
+            Err(_) => return ATRIUM_ERR_FRESCO_RPC,
+        };
+        if msg.opcode_class == CLASS_DISPLAY
+            && msg.op == fresco_protocol::control::OP_WINDOW_CREATE
+            && (msg.flags & flag::IS_RESPONSE) != 0
+        {
+            let id: u32 = match postcard::from_bytes(&msg.payload) {
+                Ok(v) => v,
+                Err(_) => return ATRIUM_ERR_FRESCO_RPC,
+            };
+            return id as c_int;
+        }
+    }
+}
+
+/// Destroy a previously-opened window. Returns 0 on
+/// success, negative on error.
+///
+/// After this call the `window_id` is invalid;
+/// subsequent ops referring to it will fail at the
+/// server.
+#[no_mangle]
+pub extern "C" fn atrium_window_destroy(window_id: u32) -> c_int {
+    let Some(mut conn) = fresco_connect() else {
+        return ATRIUM_ERR_NO_FRESCO;
+    };
+    let payload = fresco_protocol::WindowDestroyPayload { window_id };
+    let bytes = match postcard::to_stdvec(&payload) {
+        Ok(b) => b,
+        Err(_) => return ATRIUM_ERR_FRESCO_RPC,
+    };
+    if conn.send_message(
+        CLASS_DISPLAY,
+        fresco_protocol::control::OP_WINDOW_DESTROY,
+        0,
+        &bytes,
+    ).is_err() {
+        return ATRIUM_ERR_FRESCO_RPC;
+    }
+    0
 }
 
 // ---------------------------------------------------------

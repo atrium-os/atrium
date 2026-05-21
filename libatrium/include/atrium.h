@@ -167,6 +167,23 @@ int32_t atrium_tabellarius_unsubscribe(const char* key_id);
  * Returns the count on success, negative on error. */
 int32_t atrium_tabellarius_count(void);
 
+/* -----------------------------------------------------------
+ * Window — open / destroy a top-level window via Fresco.
+ * v0 surface: scene-graph emission for painting into the
+ * window lands in subsequent slices.
+ * -----------------------------------------------------------
+ */
+
+#define ATRIUM_ERR_NO_FRESCO    -50
+#define ATRIUM_ERR_FRESCO_RPC   -51
+
+/* Open a top-level window. Returns the assigned window_id
+ * (positive) on success, negative on error. */
+int32_t atrium_window_open(const char* title, uint32_t width, uint32_t height);
+
+/* Destroy a previously-opened window. */
+int32_t atrium_window_destroy(uint32_t window_id);
+
 #ifdef __cplusplus
 }
 #endif
