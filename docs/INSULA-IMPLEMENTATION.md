@@ -2,7 +2,7 @@
 
 **Branch:** `claude/romantic-rubin-42085b`
 **Last updated:** 2026-05-21
-**Phase:** M1A (Foundation) complete; M1B (service catalogue MVP minus Pergola) substantially complete — six libatrium ABI surfaces, five backing daemons, bundle signing + single-file archive packaging end-to-end, capability-diff consent on re-install, direct CLI surfaces for all four user-facing daemons (`insula push`, `insula keychain`, `insula notify`, `insula daemons logs`), composite sample app demonstrating ABI composition.
+**Phase:** M1A (Foundation) + M1B (service-catalogue MVP) + M1C (Pergola path) complete at the ABI level. The libatrium surface now spans nine ABI families — init/log/exit, storage, keychain, network, notify, tabellarius, **window-open + paint + event-loop**, plus the in-process `atrium_init` handshake. Six platform sockets thread through the host adapter into sandboxed children (the original five daemons + the externally-managed Fresco scene server). Four sample apps each demonstrate a distinct slice of the surface, one of them windowed.
 
 This document orients a reader landing fresh in the
 branch. For the design corpus see [`spec/insula.md`](spec/insula.md)
@@ -62,19 +62,20 @@ What this exercises end-to-end:
 
 ## Crate layout
 
-Thirteen crates at the repo root. Each is its own `Cargo.toml`;
+Fourteen crates at the repo root. Each is its own `Cargo.toml`;
 the repo has no top-level workspace by convention.
 
 | Crate | Purpose | LoC (src + tests) |
 |---|---|---|
 | [`insula-manifest`](../insula-manifest/) | TOML parser + capability-diff for the full Insula manifest spec | ~1000 |
 | [`insula-bundle`](../insula-bundle/) | On-disk bundle reader + signing + `.insula` archive container | ~800 |
-| [`libatrium`](../libatrium/) | Platform C ABI (cdylib + rlib + staticlib) | ~1300 |
-| [`insula-host-macos`](../insula-host-macos/) | macOS host adapter: SBPL gen, install, launch | ~1000 |
-| [`insula-hello`](../insula-hello/) | Demo Insula app + manifest | ~200 |
+| [`libatrium`](../libatrium/) | Platform C ABI (cdylib + rlib + staticlib) — nine ABI families incl. windowing | ~2200 |
+| [`insula-host-macos`](../insula-host-macos/) | macOS host adapter: SBPL gen, install, launch (six platform sockets threaded) | ~1100 |
+| [`insula-hello`](../insula-hello/) | Demo Insula app + manifest | ~250 |
 | [`atrium-fetch`](../atrium-fetch/) | Sample app — HTTP GET via the platform ABI | ~150 |
 | [`atrium-mon`](../atrium-mon/) | Composite sample — net probe + notification (proves ABI composition) | ~120 |
-| [`insula-cli`](../insula-cli/) | `insula install / launch / list / info / uninstall / daemons {up,down,status,logs} / keygen / sign / publishers / bundle / push / keychain / notify` | ~2000 |
+| [`atrium-paint`](../atrium-paint/) | Windowed sample — first to use the Pergola path (open / paint / poll / destroy) | ~130 |
+| [`insula-cli`](../insula-cli/) | `insula install / launch / run / list / info / uninstall / daemons {up,down,status,logs} / keygen / sign / publishers / bundle / push / keychain / notify / doctor / init` | ~2700 |
 | [`insula-logd`](../insula-logd/) | Aqueduct log-forwarding daemon | ~300 |
 | [`vestibulum-macos`](../vestibulum-macos/) | ed25519 keychain daemon (disk-backed) | ~450 |
 | [`atrium-netd-macos`](../atrium-netd-macos/) | Network broker (allowlist + byte proxy + SO_PEERPID per-app enforcement) | ~400 |
@@ -97,9 +98,10 @@ the repo has no top-level workspace by convention.
 | `insula.md` §3.1 (bundle archive format) | `insula-bundle/src/archive.rs` (`INSB` v1) + `insula bundle` CLI |
 | `insula.md` §5.4 (capability-diff consent) | `insula-manifest::diff::CapabilityDiff` + `insula install --accept-changes` |
 | `tabellarius.md` §9.1 + §11.1 (Phase A subscribe/unsubscribe) | `tabellarius-macos/src/main.rs` + libatrium `atrium_tabellarius_*` |
+| `insula.md` §6 (windowed UI / Pergola) | libatrium `atrium_window_*` (open/destroy/fill_rect/frame_begin/frame_rect/frame_end/poll_event) → CLASS_DISPLAY → external Fresco scene server (frescod) |
 | `insula-host-macos.md` §2 (SBPL generation) | `insula-host-macos/src/sbpl.rs` |
 | `insula-host-macos.md` §10 (bundle format on macOS) | `insula-host-macos/src/install.rs` (no `.app` wrapping yet) |
-| `aqueduct.md` opcode-class registry | `aqueduct/src/classes.rs` — `CLASS_LOG=10`, `CLASS_VESTIBULUM=11`, `CLASS_NET=12`, `CLASS_TABELLARIUS=13` added; `CLASS_NOTIFY=3` reused |
+| `aqueduct.md` opcode-class registry | `aqueduct/src/classes.rs` — `CLASS_LOG=10`, `CLASS_VESTIBULUM=11`, `CLASS_NET=12`, `CLASS_TABELLARIUS=13` added; `CLASS_NOTIFY=3` + `CLASS_DISPLAY=1` reused |
 
 ## Architecture realized
 
@@ -178,12 +180,12 @@ $INSULA daemons down
 
 ## Testing
 
-155 tests pass across all 13 crates on this macOS host.
+192 tests pass across all 14 crates on this macOS host.
 
 ```sh
 for c in insula-manifest insula-bundle libatrium \
          insula-host-macos insula-hello atrium-fetch \
-         atrium-mon insula-cli insula-logd \
+         atrium-mon atrium-paint insula-cli insula-logd \
          vestibulum-macos atrium-netd-macos \
          praeco-macos tabellarius-macos; do
   cargo test --manifest-path "$c/Cargo.toml"
@@ -196,12 +198,13 @@ Test distribution:
 |---|---|---|
 | insula-manifest | 24 | Full coverage of manifest sections + roundtrip + 7 capability-diff cases |
 | insula-bundle | 18 | Bundle layout + ed25519 sign/verify + `.insula` archive (roundtrip, deterministic, unsafe-path refused) |
-| libatrium | 11 | C ABI surface tests + Aqueduct routing + storage |
-| insula-host-macos | 16 | SBPL gen + actual sandboxed launch + install layout |
+| libatrium | 22 | C ABI surface tests + Aqueduct routing + storage + window create/fill/poll-event/multi-node frame (decoded via canonical fresco_protocol) |
+| insula-host-macos | 16 | SBPL gen + actual sandboxed launch + install layout (six platform sockets threaded) |
 | insula-hello | 6 | Bundle parses; install+run via host adapter; per-app netd E2E (allow + deny); per-app tabellarius E2E |
 | atrium-fetch | 1 | Bundle + manifest parse for the HTTP-GET sample |
 | atrium-mon | 2 | Net probe + notification compose end-to-end (reachable + unreachable cases) |
-| insula-cli | 41 | All subcommands; auto-spawn; signing/archive/diff E2E; push + keychain + notify + daemons-logs subcommand E2E |
+| atrium-paint | 3 | Pergola path E2E (stub fresco server) — open / paint / poll / destroy, standalone and via `insula launch` |
+| insula-cli | 64 | All subcommands; auto-spawn; signing/archive/diff E2E; push + keychain + notify + daemons-logs + doctor + init + run + info-with-verify E2E |
 | insula-logd | 3 | Daemon decodes Aqueduct messages + writes log file |
 | vestibulum-macos | 10 | ed25519 keychain roundtrip incl. signature verify, persistence across restart |
 | atrium-netd-macos | 13 | Per-app manifest enforcement (8 unit) + broker behavior (5 integration) |
@@ -266,13 +269,16 @@ loop:
 **App lifecycle**
 | Command | Purpose |
 |---|---|
+| `insula init <dir> [--name <id>]` | Scaffold a new app skeleton |
 | `insula install <bundle\|.insula>` | Install from directory or archive |
 | `insula install ... --allow-unsigned` | Skip signature check (dev only) |
 | `insula install ... --accept-changes` | Accept widened capability grants on re-install |
 | `insula list` | Show installed apps |
-| `insula info <app-id>` | Show full capability surface + signature + paths |
-| `insula launch <app-id> [args]` | Run a sandboxed app (auto-spawns daemons) |
+| `insula info <app\|dir\|insula>` | Show capability surface + signature (with verify) + paths; works on installed apps, bundle dirs, or `.insula` archives |
+| `insula launch <app-id> [args]` | Run a sandboxed app (auto-spawns daemons; threads `$INSULA_FRESCO_SOCKET` through for windowed apps) |
+| `insula run <bundle> [args]` | Install + launch in one shot (dev iteration; auto-applies `--allow-unsigned` + `--accept-changes`) |
 | `insula uninstall <app-id>` | Remove an app + its container |
+| `insula doctor` | Health check across the install (install-root / daemons / publishers / app layouts) |
 
 **Publish-side tooling**
 | Command | Purpose |
@@ -342,11 +348,19 @@ overrides.
 - **Praeco routes to a file, not to UserNotifications.**
   Wire shape is correct; backend swap to the macOS
   Notification Center is future polish.
-- **No Pergola wire emission.** The Pergola crate exists
-  with view/node/layout, but wire emission to a Fresco
-  server is phase-4 work in Pergola itself. Insula apps
-  cannot open windows yet through libatrium. **This is
-  now the single remaining M1B/M1C blocker.**
+- **~~No Pergola wire emission.~~** Done at the ABI
+  level. libatrium exposes a complete window surface
+  (`atrium_window_open` / `atrium_window_fill_rect` /
+  `atrium_window_frame_begin` / `_frame_rect` / `_frame_end`
+  / `atrium_window_poll_event` / `atrium_window_destroy`)
+  on top of CLASS_DISPLAY + `fresco_protocol`. The host
+  adapter threads `$ATRIUM_FRESCO_SOCKET` into sandboxed
+  children + emits an SBPL grant for the socket path.
+  Sample app `atrium-paint` proves the full open / paint /
+  poll / destroy lifecycle end-to-end against a stub
+  Fresco server, both standalone and via `insula launch`.
+  A real visual demo against frescod is the remaining
+  piece, and is bring-up work rather than design.
 - **~~No bundle update / capability-diff consent flow.~~**
   Done. The CLI computes a structured diff between the
   previously-installed manifest and the incoming one
@@ -451,17 +465,24 @@ fa75556 insula-manifest: add [render] [input] [ipc] [storage] [compute]
 
 ## What to build next, in order
 
-1. **Pergola wire emission** (the M1C blocker, per ROADMAP-INSULA §1.3).
-   Until this lands, no Insula app can open a window. Now the
-   single remaining gap between this branch's "service
-   catalogue MVP" and the "windowed Insula app" demo.
-2. **macOS-Keychain-Services-backed vestibulum + tabellarius
+1. **Visual demo against a real frescod**. The ABI + host
+   adapter are done; what's missing is running the
+   externally-managed Fresco scene server (which already
+   exists in this tree at `fresco-scene-server`) and
+   launching `atrium-paint` against it. This is bring-up
+   work, not new code.
+2. **Richer scene-graph emission** — texture nodes (slot
+   upload + `atrium_window_frame_texture`), path nodes
+   (rotated quads via `ATRIUM_CORE_PATH`), glyph runs for
+   text. Each one is a small slice following the same
+   shape as the rect builder.
+3. **macOS-Keychain-Services-backed vestibulum + tabellarius
    keystores** — wrap the `.key` and `.sub` files via
    SecItemAdd. Closes the "plaintext on disk" caveat for
    both daemons in one slice (they share the same shape).
    Depends on the `security-framework` crate or raw libc
    bindings.
-3. **Tabellarius Phase B — relay traffic + wake-on-push**.
+4. **Tabellarius Phase B — relay traffic + wake-on-push**.
    Phase A subscribe/unsubscribe ABI shipped; Phase B is
    the actual relay connection lifecycle, decryption via
    the vestibulum keychain ABI, and waking
