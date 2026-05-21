@@ -16,3 +16,7 @@ path       = "src/lib.rs"
 crate-type = ["cdylib", "rlib", "staticlib"]
 
 [dependencies]
+aqueduct = { path = "../aqueduct" }
+
+[dev-dependencies]
+tempfile = "3"

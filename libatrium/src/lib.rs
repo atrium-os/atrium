@@ -32,6 +32,23 @@
 
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_uint};
+use std::sync::Mutex;
+
+use aqueduct::Connection;
+use aqueduct::classes::CLASS_ECHO;
+use aqueduct::envelope::flag;
+
+/// Lazily-initialized platform connection. None until
+/// [`atrium_init`] runs; populated to `Some(conn)` if the
+/// environment exposes a socket path via
+/// `ATRIUM_LOG_SOCKET`; stays `None` otherwise (in which
+/// case [`atrium_log`] falls back to stderr).
+///
+/// v0 routes log messages over [`CLASS_ECHO`] (Aqueduct's
+/// smoke-test class). When a real log service exists in
+/// the Atrium registry, this will switch to that class
+/// without an ABI change.
+static PLATFORM_CONN: Mutex<Option<Connection>> = Mutex::new(None);
 
 /// Log severity. Matches syslog ordering: lower = more
 /// verbose.
@@ -71,7 +88,14 @@ pub const ATRIUM_ERR_PLATFORM_UNREACHABLE: c_int = -2;
 ///   broken install or a jail without the required
 ///   capabilities.
 ///
-/// v0 simply logs the call and returns `ATRIUM_OK`.
+/// v0 logs the call to stderr and tries to open a
+/// connection to the platform log service if
+/// `ATRIUM_LOG_SOCKET` is set in the environment. Any
+/// connect failure falls back to stderr-only mode and
+/// still returns `ATRIUM_OK` — failed-to-connect is a
+/// degraded mode, not a hard error (matches the
+/// principle that an app should always be able to
+/// initialize and log).
 #[no_mangle]
 pub extern "C" fn atrium_init(
     sdk_major: c_uint,
@@ -81,6 +105,30 @@ pub extern "C" fn atrium_init(
         "[insula][libatrium] atrium_init(sdk={}.{})",
         sdk_major, sdk_minor
     );
+
+    // Try to open the platform connection. Best-effort:
+    // failure here just keeps us in stderr-only mode.
+    if let Ok(path) = std::env::var("ATRIUM_LOG_SOCKET") {
+        match Connection::connect(&path) {
+            Ok(conn) => {
+                if let Ok(mut guard) = PLATFORM_CONN.lock() {
+                    *guard = Some(conn);
+                }
+                eprintln!(
+                    "[insula][libatrium] connected to platform log at {}",
+                    path
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "[insula][libatrium] could not open ATRIUM_LOG_SOCKET={}: {} \
+                     (falling back to stderr-only)",
+                    path, e
+                );
+            }
+        }
+    }
+
     ATRIUM_OK
 }
 
@@ -119,7 +167,30 @@ pub unsafe extern "C" fn atrium_log(
         CStr::from_ptr(msg).to_string_lossy()
     };
 
+    // Always emit to stderr — it's the universal floor
+    // and useful for development.
     eprintln!("[insula][{}] {}", level_str, payload);
+
+    // If a platform connection is up, also forward over
+    // Aqueduct. Best-effort: a failed send leaves the
+    // stderr line as the surviving log.
+    //
+    // v0 wire payload: [u8 level | utf8 message bytes].
+    // This is the smoke-test shape over CLASS_ECHO;
+    // the real log service will define a typed schema.
+    if let Ok(mut guard) = PLATFORM_CONN.lock() {
+        if let Some(conn) = guard.as_mut() {
+            let mut payload_bytes = Vec::with_capacity(payload.len() + 1);
+            payload_bytes.push(level as u8);
+            payload_bytes.extend_from_slice(payload.as_bytes());
+            let _ = conn.send_message(
+                CLASS_ECHO,
+                0,                 // op = 0 (log forward)
+                flag::ASYNC_EVENT, // fire-and-forget; no reply expected
+                &payload_bytes,
+            );
+        }
+    }
 }
 
 /// Cleanly terminate the Insula app.
