@@ -115,6 +115,7 @@ dependencies = [
  "insula-bundle",
  "insula-host-macos",
  "insula-manifest",
+ "libc",
  "tempfile",
 ]
 

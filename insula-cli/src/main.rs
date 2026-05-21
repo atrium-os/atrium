@@ -17,6 +17,9 @@
 //! and can be overridden with $INSULA_INSTALL_ROOT.
 //! ```
 
+mod daemons;
+use daemons::Daemon;
+
 use insula_bundle::InsulaBundle;
 use insula_host_macos as host;
 use std::path::{Path, PathBuf};
@@ -38,6 +41,7 @@ fn main() -> ExitCode {
         "info" => cmd_info(&args[2..], &install_root),
         "launch" => cmd_launch(&args[2..], &install_root),
         "uninstall" => cmd_uninstall(&args[2..], &install_root),
+        "daemons" => cmd_daemons(&args[2..], &install_root),
         "help" | "-h" | "--help" => {
             print_usage();
             Ok(())
@@ -67,7 +71,11 @@ Commands:
   list                    Show installed apps.
   info <app-id>           Show details for one installed app.
   launch <app-id> [args]  Launch an installed app (inherits stdio).
+                          Auto-spawns missing daemons.
   uninstall <app-id>      Remove an installed app + its container.
+  daemons up              Start insula-logd + vestibulum-macos.
+  daemons down            Stop them.
+  daemons status          Show daemon state.
   help                    Show this help.
 
 Install root: $INSULA_INSTALL_ROOT (or ~/Library/Application Support/atrium-insula/)"
@@ -230,14 +238,26 @@ fn cmd_launch(args: &[String], install_root: &Path) -> Result<(), String> {
         manifest,
     };
 
-    // If sockets for system services are configured,
-    // route them through to the child:
-    //   - INSULA_LOGD_SOCKET        -> log forwarding
-    //   - INSULA_VESTIBULUMD_SOCKET -> keychain
-    let log_socket = std::env::var_os("INSULA_LOGD_SOCKET")
-        .map(PathBuf::from);
-    let vestibulum_socket = std::env::var_os("INSULA_VESTIBULUMD_SOCKET")
-        .map(PathBuf::from);
+    // Daemon socket resolution:
+    //   1. If an explicit env var is set, use that.
+    //      (Tests + power users override this way.)
+    //   2. Otherwise, auto-spawn the daemon under
+    //      <install_root>/run/ and use that socket.
+    //
+    // The auto-spawn is best-effort — if the daemon
+    // binary isn't on $PATH (and no override env var
+    // is set), the launch still proceeds without the
+    // service, just without log routing / keychain.
+    let log_socket = resolve_daemon_socket(
+        install_root,
+        Daemon::Logd,
+        "INSULA_LOGD_SOCKET",
+    );
+    let vestibulum_socket = resolve_daemon_socket(
+        install_root,
+        Daemon::Vestibulum,
+        "INSULA_VESTIBULUMD_SOCKET",
+    );
 
     // Inherit stdio for `insula launch`; the user wants
     // to see the app's output.
@@ -267,6 +287,76 @@ fn cmd_launch(args: &[String], install_root: &Path) -> Result<(), String> {
 // -----------------------------------------------------
 // uninstall
 // -----------------------------------------------------
+
+// -----------------------------------------------------
+// daemons + helpers
+// -----------------------------------------------------
+
+/// Resolve the socket path for one daemon: explicit
+/// env-var override wins; otherwise auto-spawn under
+/// install_root and use the resulting socket.
+fn resolve_daemon_socket(
+    install_root: &Path,
+    daemon: Daemon,
+    explicit_env: &str,
+) -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os(explicit_env) {
+        return Some(PathBuf::from(p));
+    }
+    match daemons::start(install_root, daemon) {
+        Ok(_) => daemons::socket_if_running(install_root, daemon),
+        Err(e) => {
+            // Spawn failure is non-fatal — the app still
+            // runs, just without this service.
+            eprintln!(
+                "insula: warning — could not auto-spawn {}: {} \
+                 (proceeding without)",
+                daemon.binary_name(),
+                e
+            );
+            None
+        }
+    }
+}
+
+fn cmd_daemons(args: &[String], install_root: &Path) -> Result<(), String> {
+    let sub = args.first().map(String::as_str).unwrap_or("status");
+    match sub {
+        "up" | "start" => {
+            for d in Daemon::ALL {
+                match daemons::start(install_root, d) {
+                    Ok(pid) => println!("{}: started (pid {})", d.slug(), pid),
+                    Err(e) => println!("{}: ERROR {}", d.slug(), e),
+                }
+            }
+        }
+        "down" | "stop" => {
+            for d in Daemon::ALL {
+                daemons::stop(install_root, d)?;
+                println!("{}: stopped", d.slug());
+            }
+        }
+        "status" => {
+            for d in Daemon::ALL {
+                let (running, pid, sock) = daemons::status(install_root, d);
+                println!(
+                    "{}: {} pid={:?} socket={}",
+                    d.slug(),
+                    if running { "running" } else { "stopped" },
+                    pid,
+                    if sock { "ok" } else { "missing" }
+                );
+            }
+        }
+        other => {
+            return Err(format!(
+                "daemons: unknown subcommand '{}' (use up|down|status)",
+                other
+            ));
+        }
+    }
+    Ok(())
+}
 
 fn cmd_uninstall(args: &[String], install_root: &Path) -> Result<(), String> {
     let app_id = args.first().ok_or_else(|| {
