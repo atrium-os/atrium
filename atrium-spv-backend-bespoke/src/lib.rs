@@ -2025,9 +2025,9 @@ fn emit_function(
                         "AtomicCompareExchange without result".into()))?;
                 let (x_base, base_off) =
                     resolve_or_make_pointer(ptr, &mut pointers, func.stage)?;
-                if base_off < 0 || base_off > u16::MAX as i32 {
+                if base_off < 0 {
                     return Err(BackendError::Unsupported(format!(
-                        "AtomicCompareExchange ptr offset {base_off} outside imm12 range")));
+                        "AtomicCompareExchange ptr offset {base_off} negative")));
                 }
                 let w_exp = *ints.get(&expected.id).ok_or_else(||
                     BackendError::Internal(format!(
@@ -2037,20 +2037,39 @@ fn emit_function(
                     BackendError::Internal(format!(
                         "AtomicCompareExchange desired {:?} not in ints",
                         desired.id)))?;
-                // Lower:
-                //   ldr  w_old, [base, #off]
-                //   cmp  w_old, w_exp
-                //   csel w_new, w_des, w_old, eq   ; (old==exp) ? des : old
-                //   str  w_new, [base, #off]
-                // Result = w_old.
+                // Lower with CASAL Ws, Wt, [Xn] (LSE):
+                //   tmp = *Xn; if tmp == Ws { *Xn = Wt }; Ws = tmp.
+                // Caveat: CASAL overwrites Ws with the original
+                // value -- if w_exp is still live downstream we
+                // must not clobber it.  Copy expected into W9
+                // scratch, then mov the result into a fresh
+                // int-pool reg for the IR result.
+                let w_scratch = asm::Wreg(9);
+                let addr_x = if base_off == 0 {
+                    x_base
+                } else {
+                    // We need W9 for both the address computation
+                    // AND the cas scratch.  Compute address first
+                    // into a int-pool temp, then reuse W9 for cas.
+                    let temp = int_pool.alloc(ValueId(u32::MAX - inst.result.as_ref().map(|r| r.id.0).unwrap_or(0)))?;
+                    materialise_u32_into_w(&mut a, temp, base_off as u32);
+                    let temp_x = asm::Xreg(temp.0);
+                    a.emit(asm::add_x(temp_x, x_base, temp_x));
+                    // We'll free temp at the end manually.
+                    temp_x
+                };
+                a.emit(asm::mov_w(w_scratch, w_exp));
+                a.emit(asm::casal_w(w_scratch, w_des, addr_x));
                 let w_old = int_pool.alloc(result.id)?;
-                a.emit(asm::ldr_w_offset(w_old, x_base, base_off as u16));
-                a.emit(asm::cmp_w(w_old, w_exp));
-                let w_new = asm::Wreg(9);
-                // csel_w_eq writes desired if EQ, else old.
-                a.emit(asm::csel_w(w_new, w_des, w_old, asm::Cond::Eq));
-                a.emit(asm::str_w_offset(w_new, x_base, base_off as u16));
+                a.emit(asm::mov_w(w_old, w_scratch));
                 ints.insert(result.id, w_old);
+                // (If we allocated a temp for address, it's now
+                // dead -- but the int_pool's linear-scan expiry
+                // won't reclaim it since the synth ValueId isn't
+                // in last_use.  Free explicitly.)
+                if base_off != 0 {
+                    int_pool.free(asm::Wreg(addr_x.0));
+                }
             }
             Op::AtomicIAdd { ptr, value }
             | Op::AtomicAnd { ptr, value }
@@ -2064,65 +2083,86 @@ fn emit_function(
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal(
                         "Atomic op without result".into()))?;
-                // Tier-2 serial dispatcher: lower to a non-
-                // atomic load + op + store sequence.  Old
-                // value is what the spec returns.  True
-                // atomic codegen (LDADD / LDSET / SWP /
-                // ldxr-stxr) lands when the dispatcher
-                // parallelises.
                 let (x_base, base_off) =
                     resolve_or_make_pointer(ptr, &mut pointers, func.stage)?;
-                if base_off < 0 || base_off > u16::MAX as i32 {
+                if base_off < 0 {
                     return Err(BackendError::Unsupported(format!(
-                        "Atomic ptr offset {base_off} outside ldr/str imm12 range")));
+                        "Atomic ptr offset {base_off} negative")));
                 }
                 let w_value = *ints.get(&value.id).ok_or_else(||
                     BackendError::Internal(format!(
                         "Atomic value {:?} not in ints", value.id)))?;
-                let w_old = int_pool.alloc(result.id)?;
-                a.emit(asm::ldr_w_offset(w_old, x_base, base_off as u16));
-                let w_new = asm::Wreg(9); // scratch
-                let single_inst: Option<u32> = match &inst.op {
-                    Op::AtomicIAdd { .. } => Some(asm::add_w(w_new, w_old, w_value)),
-                    Op::AtomicAnd  { .. } => Some(asm::and_w(w_new, w_old, w_value)),
-                    Op::AtomicOr   { .. } => Some(asm::orr_w(w_new, w_old, w_value)),
-                    Op::AtomicXor  { .. } => Some(asm::eor_w(w_new, w_old, w_value)),
-                    // Min/Max: compare + csel.  Pick the
-                    // condition based on signed vs unsigned
-                    // and Min vs Max.  csel writes the
-                    // FIRST operand when the condition
-                    // holds, otherwise the second.
-                    //
-                    //   SMin: cmp old, val; csel new, old, val, LT (signed)
-                    //   SMax: cmp old, val; csel new, old, val, GT (signed)
-                    //   UMin: cmp old, val; csel new, old, val, CC (unsigned LT == HS aka LO)
-                    //   UMax: cmp old, val; csel new, old, val, HI (unsigned GT)
-                    Op::AtomicSMin { .. } | Op::AtomicSMax { .. }
-                    | Op::AtomicUMin { .. } | Op::AtomicUMax { .. } => {
-                        let cond = match &inst.op {
-                            Op::AtomicSMin { .. } => asm::Cond::Lt,
-                            Op::AtomicSMax { .. } => asm::Cond::Gt,
-                            Op::AtomicUMin { .. } => asm::Cond::Cc, // unsigned <
-                            Op::AtomicUMax { .. } => asm::Cond::Hi, // unsigned >
-                            _ => unreachable!(),
-                        };
-                        a.emit(asm::cmp_w(w_old, w_value));
-                        a.emit(asm::csel_w(w_new, w_old, w_value, cond));
-                        a.emit(asm::str_w_offset(w_new, x_base, base_off as u16));
-                        ints.insert(result.id, w_old);
-                        continue;
-                    }
-                    // Exchange writes the addend directly --
-                    // no arithmetic.  Just str w_value.
-                    Op::AtomicExchange { .. } => {
-                        a.emit(asm::str_w_offset(w_value, x_base, base_off as u16));
-                        ints.insert(result.id, w_old);
-                        continue;
-                    }
-                    _ => unreachable!(),
+                // LSE atomic instructions take a register-only
+                // address operand: build Xn = x_base + base_off
+                // (or just reuse x_base when base_off==0).
+                let addr_x = if base_off == 0 {
+                    x_base
+                } else {
+                    // Use Xreg(9) as scratch -- same scratch
+                    // ConstFloat materialisation uses.  Lifetime
+                    // is the single LSE instruction below; no
+                    // overlap with W9-as-int-scratch since
+                    // atomic codegen here never touches the int
+                    // arithmetic path.
+                    let scratch_x = asm::Xreg(9);
+                    materialise_u32_into_w(&mut a, asm::Wreg(9), base_off as u32);
+                    a.emit(asm::add_x(scratch_x, x_base, scratch_x));
+                    scratch_x
                 };
-                a.emit(single_inst.unwrap());
-                a.emit(asm::str_w_offset(w_new, x_base, base_off as u16));
+                let w_old = int_pool.alloc(result.id)?;
+                // For AtomicAnd we need to invert the operand
+                // because ARM's LDCLR does *X &= ~Rs.  Use the
+                // scratch W9 as the inverted value holder.
+                // Note: when base_off != 0 above we've already
+                // overwritten W9 with the offset and then used
+                // it; the add_x above sets X9 (the same reg).
+                // For And we still need W9 for the inversion --
+                // safe because by this point the address is in
+                // X9 (used only by the LDCLR below); but we'd
+                // overwrite X9 if we MVN to it.  Use a
+                // different temporary: the W_value source then
+                // MVN through W9 only if there's no conflict.
+                // Simpler: do MVN before computing addr_x so
+                // the scratch is reusable.  But for clarity,
+                // when AND requires inversion AND base_off!=0,
+                // we just bail to load-op-store (rare case).
+                let is_and = matches!(&inst.op, Op::AtomicAnd { .. });
+                if is_and && base_off != 0 {
+                    // Conflict: scratch W9 is taken by address.
+                    // Fall back to non-atomic seq (legacy path).
+                    let w_new = asm::Wreg(9);
+                    a.emit(asm::ldr_w_offset(w_old, x_base, base_off as u16));
+                    a.emit(asm::and_w(w_new, w_old, w_value));
+                    a.emit(asm::str_w_offset(w_new, x_base, base_off as u16));
+                    ints.insert(result.id, w_old);
+                    continue;
+                }
+                match &inst.op {
+                    Op::AtomicIAdd { .. } =>
+                        a.emit(asm::ldaddal_w(w_value, w_old, addr_x)),
+                    Op::AtomicOr   { .. } =>
+                        a.emit(asm::ldsetal_w(w_value, w_old, addr_x)),
+                    Op::AtomicXor  { .. } =>
+                        a.emit(asm::ldeoral_w(w_value, w_old, addr_x)),
+                    Op::AtomicAnd  { .. } => {
+                        // LDCLR does &= ~Rs; we want &= Rs, so
+                        // invert first into W9 (the scratch).
+                        let inv = asm::Wreg(9);
+                        a.emit(asm::mvn_w(inv, w_value));
+                        a.emit(asm::ldclral_w(inv, w_old, addr_x));
+                    }
+                    Op::AtomicSMin { .. } =>
+                        a.emit(asm::ldsminal_w(w_value, w_old, addr_x)),
+                    Op::AtomicSMax { .. } =>
+                        a.emit(asm::ldsmaxal_w(w_value, w_old, addr_x)),
+                    Op::AtomicUMin { .. } =>
+                        a.emit(asm::lduminal_w(w_value, w_old, addr_x)),
+                    Op::AtomicUMax { .. } =>
+                        a.emit(asm::ldumaxal_w(w_value, w_old, addr_x)),
+                    Op::AtomicExchange { .. } =>
+                        a.emit(asm::swpal_w(w_value, w_old, addr_x)),
+                    _ => unreachable!(),
+                }
                 ints.insert(result.id, w_old);
             }
             Op::PtrOffsetDynamic { base, index, stride } => {

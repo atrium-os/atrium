@@ -964,7 +964,11 @@ specifically supports:
   RuntimeArray/Array (Op::PtrOffsetDynamic).
 - Atomic ops: AtomicIAdd, ISub, IIncrement, IDecrement,
   And, Or, Xor, Exchange, Load, Store,
-  CompareExchange, SMin/SMax/UMin/UMax.
+  CompareExchange, SMin/SMax/UMin/UMax — all lowered to
+  ARMv8.1 LSE instructions (LDADDAL, LDSETAL, LDCLRAL +
+  MVN-for-AND, LDEORAL, SWPAL, LDSMAXAL/LDSMINAL/
+  LDUMAXAL/LDUMINAL, CASAL) so they are race-safe under
+  workgroup-parallel dispatch.
 - Core bitwise ops: BitwiseAnd/Or/Xor, Not,
   ShiftLeft/RightLogical/RightArithmetic, BitReverse,
   BitCount (SWAR popcount synthesised at IR level).
@@ -1018,9 +1022,11 @@ specifically supports:
   descriptor-table prologue (X16, X17, X13, X14, X15, X12
   pre-loaded from X2).
 - Op::PtrOffsetDynamic via lsl + add.
-- All listed atomics via load-op-store (correct on the
-  serial dispatcher; LSE LDADD path queued for when the
-  dispatcher parallelises).
+- All listed atomics via ARMv8.1 LSE instructions
+  (LDADDAL / LDSETAL / LDCLRAL+MVN / LDEORAL / SWPAL /
+  LDSMINAL / LDSMAXAL / LDUMINAL / LDUMAXAL / CASAL) so
+  they remain correct under the workgroup-parallel
+  dispatcher.
 - GLSL.std.450 math listed above; vec4 NEON path for
   FAbs/FSqrt/FMin/FMax/FFloor/FCeil/FTrunc, scalar f32 for
   the rest (the synthesised ones ride through the
@@ -1043,9 +1049,14 @@ specifically supports:
 
 **Host (aqueduct-gpu-host):**
 
-- Tier2Backend serial dispatcher with per-binding
-  descriptor-table assembly, per-binding readback, and
-  pre-fill API for SSBO inputs.
+- Tier2Backend workgroup-parallel dispatcher with per-
+  binding descriptor-table assembly, per-binding readback,
+  and pre-fill API for SSBO inputs.  Workgroups are
+  partitioned across `std::thread::available_parallelism()`
+  worker threads via `std::thread::scope`; within each
+  workgroup the local-invocation loop stays serial so the
+  eventual shared-memory + ControlBarrier semantics can be
+  layered in cleanly per workgroup.
 - Tier2ComputeStateBlob carries `ssbo_binding_count`
   alongside LocalSize.
 

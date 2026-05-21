@@ -1147,34 +1147,76 @@ impl Tier2Backend {
         };
         let _ = descriptor_table;
 
-        for gz in 0..cmd.group_count_z {
-            for gy in 0..cmd.group_count_y {
-                for gx in 0..cmd.group_count_x {
-                    for lz in 0..cs_state.local_size_z {
-                        for ly in 0..cs_state.local_size_y {
-                            for lx in 0..cs_state.local_size_x {
-                                // SAFETY: cs_main is a dlopened
-                                // C-ABI function whose signature
-                                // matches CsMain (checked at
-                                // open time); all pointers are
-                                // valid for at least this call.
-                                // The output buffer(s) live in
-                                // per_binding (and the descriptor
-                                // table in descriptor_table)
-                                // across the whole loop.
-                                unsafe {
-                                    cs_main(
-                                        uni_ptr, pc_ptr, out_ptr,
-                                        gx, gy, gz,
-                                        lx, ly, lz,
-                                    );
+        // Workgroup-parallel dispatch.  Workgroups are
+        // independent by Vulkan semantics (no cross-workgroup
+        // synchronisation), so we partition the gz/gy/gx grid
+        // across worker threads.  Within a workgroup the
+        // lz/ly/lx loop stays serial so future shared-memory
+        // and ControlBarrier semantics are preserved per
+        // workgroup.
+        //
+        // Note: atomics across workgroups currently lower to
+        // load-op-store on the bespoke backend, which races
+        // under this parallel path.  Real LSE atomics
+        // (LDADD/SWP etc.) are queued; until then,
+        // cross-workgroup atomics may produce racy results.
+        // Single-workgroup dispatches and same-workgroup
+        // atomics remain correct.
+        let total_workgroups = (cmd.group_count_x as u64)
+            * (cmd.group_count_y as u64)
+            * (cmd.group_count_z as u64);
+        let n_threads = std::thread::available_parallelism()
+            .map(|n| n.get()).unwrap_or(1).min(total_workgroups as usize).max(1);
+        let out_addr = out_ptr as usize;
+        let uni_addr = uni_ptr as *const u8 as usize;
+        let pc_addr  = pc_ptr  as *const u8 as usize;
+        let gx_n = cmd.group_count_x;
+        let gy_n = cmd.group_count_y;
+        let gz_n = cmd.group_count_z;
+        let lx_n = cs_state.local_size_x;
+        let ly_n = cs_state.local_size_y;
+        let lz_n = cs_state.local_size_z;
+        let chunk = total_workgroups.div_ceil(n_threads as u64);
+        std::thread::scope(|s| {
+            for t in 0..n_threads {
+                let lo = (t as u64) * chunk;
+                let hi = ((t as u64 + 1) * chunk).min(total_workgroups);
+                if lo >= hi { continue; }
+                s.spawn(move || {
+                    let out_ptr = out_addr as *mut u8;
+                    let uni_ptr = uni_addr as *const u8;
+                    let pc_ptr  = pc_addr  as *const u8;
+                    for widx in lo..hi {
+                        // Delinearise widx into (gx, gy, gz).
+                        let gx = (widx % gx_n as u64) as u32;
+                        let gy = ((widx / gx_n as u64) % gy_n as u64) as u32;
+                        let gz = (widx / (gx_n as u64 * gy_n as u64)) as u32;
+                        let _ = gz_n;
+                        for lz in 0..lz_n {
+                            for ly in 0..ly_n {
+                                for lx in 0..lx_n {
+                                    // SAFETY: cs_main is a dlopened
+                                    // C-ABI function whose signature
+                                    // matches CsMain (checked at
+                                    // open time); the output buffer
+                                    // and descriptor table outlive
+                                    // this scope; cross-workgroup
+                                    // races are the shader's
+                                    // responsibility per Vulkan.
+                                    unsafe {
+                                        cs_main(
+                                            uni_ptr, pc_ptr, out_ptr,
+                                            gx, gy, gz,
+                                            lx, ly, lz,
+                                        );
+                                    }
                                 }
                             }
                         }
                     }
-                }
+                });
             }
-        }
+        });
         if n_bindings >= 2 {
             *self.last_compute_output.lock().unwrap() = None;
             *self.last_compute_outputs_by_binding.lock().unwrap() = per_binding;

@@ -2321,6 +2321,94 @@ fn differential_glsl_nan_min_max_clamp() {
 }
 
 #[test]
+fn lse_atomics_are_race_safe_under_concurrent_threads() {
+    // Compile a shader that does `ssbo[0] = atomicAdd(ssbo[0], 1)`
+    // then spawn N OS threads each running cs_main once, all
+    // racing on the same output buffer.  With LSE atomics
+    // (LDADDAL), the final counter must equal N.  With the old
+    // load-op-store sequence the counter would lose updates.
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, Scope,
+        StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let void_fn = b.type_function(void, vec![]);
+    let rt = b.type_runtime_array(u32_ty);
+    b.decorate(rt, Decoration::ArrayStride, vec![rspirv::dr::Operand::LiteralBit32(4)]);
+    let s = b.type_struct(vec![rt]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_u = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+    let ssbo = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    let c_one  = b.constant_bit32(u32_ty, 1);
+    let scope_dev = b.constant_bit32(u32_ty, Scope::Device as u32);
+    let sem_rel = b.constant_bit32(u32_ty, 0);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let p = b.access_chain(ptr_u, None, ssbo, vec![c_zero, c_zero]).unwrap();
+    let _ = b.atomic_i_add(u32_ty, None, p, scope_dev, sem_rel, c_one).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spv = Vec::with_capacity(words.len() * 4);
+    for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+
+    let dir = TempDir::new().unwrap();
+    let module = translate(&spv).expect("frontend");
+    let target = if cfg!(target_os = "macos") {
+        BespokeTarget::Aarch64Darwin
+    } else { BespokeTarget::Aarch64FreeBSD };
+    let obj = bespoke_compile(&module, target).expect("compile").object;
+    let obj_path = dir.path().join("atomic_race.o");
+    std::fs::write(&obj_path, &obj).unwrap();
+    let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
+    let lib_path = dir.path().join(format!("atomic_race.{ext}"));
+    link_to_shared_library(&obj_path, &lib_path).expect("link");
+    let lib = unsafe { libloading::Library::new(&lib_path) }.expect("dlopen");
+    let cs_main: libloading::Symbol<CsMain> = unsafe {
+        lib.get(b"atrium_cs_main").expect("atrium_cs_main")
+    };
+    // We need a stable function pointer for the threads; copy
+    // the C function pointer out of the libloading::Symbol.
+    let cs_fn: CsMain = *cs_main;
+
+    const N_THREADS: usize = 32;
+    const N_ITERS_PER_THREAD: usize = 100;
+    let mut buf = vec![0u8; 4];
+    let addr = buf.as_mut_ptr() as usize;
+    std::thread::scope(|scope| {
+        for _ in 0..N_THREADS {
+            scope.spawn(move || {
+                let p = addr as *mut u8;
+                for _ in 0..N_ITERS_PER_THREAD {
+                    unsafe {
+                        cs_fn(std::ptr::null(), std::ptr::null(), p,
+                              0, 0, 0, 0, 0, 0);
+                    }
+                }
+            });
+        }
+    });
+    let counter = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+    let expected = (N_THREADS * N_ITERS_PER_THREAD) as u32;
+    assert_eq!(counter, expected,
+        "LSE atomic counter raced: got {counter}, want {expected}");
+}
+
+#[test]
 fn differential_op_bit_count_and_reverse() {
     // OpBitCount (SWAR popcount in IR) and OpBitReverse
     // (Op::Rbit / Cranelift bitrev).  These are SPIR-V core
