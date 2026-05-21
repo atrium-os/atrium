@@ -337,6 +337,74 @@ fn spv_compile_picks_bespoke_for_supported_compute_shaders() {
     }
 }
 
+/// Compute SPIR-V that reads ssbo.a (offset 0), adds a
+/// constant, writes the result to ssbo.b (offset 4).  Tests
+/// the read side of the StorageBuffer codegen -- OpLoad
+/// through an SSBO pointer at a non-zero AccessChain offset.
+fn build_ssbo_rmw_cs() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let void_fn = b.type_function(void, vec![]);
+
+    // struct SSBO { uint a; uint b; };
+    let ssbo_struct = b.type_struct(vec![u32_ty, u32_ty]);
+    b.decorate(ssbo_struct, Decoration::Block, vec![]);
+    b.member_decorate(ssbo_struct, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.member_decorate(ssbo_struct, 1, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(4)]);
+    let ptr_ssbo_struct = b.type_pointer(None, StorageClass::StorageBuffer, ssbo_struct);
+    let ptr_ssbo_u32    = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+    let ssbo_var = b.variable(ptr_ssbo_struct, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo_var, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo_var, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+
+    let c_zero  = b.constant_bit32(u32_ty, 0);
+    let c_one   = b.constant_bit32(u32_ty, 1);
+    let c_seven = b.constant_bit32(u32_ty, 7);
+
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let src = b.access_chain(ptr_ssbo_u32, None, ssbo_var, vec![c_zero]).unwrap();
+    let loaded = b.load(u32_ty, None, src, None, vec![]).unwrap();
+    let sum = b.i_add(u32_ty, None, loaded, c_seven).unwrap();
+    let dst = b.access_chain(ptr_ssbo_u32, None, ssbo_var, vec![c_one]).unwrap();
+    b.store(dst, sum, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo_var]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn bespoke_compiles_ssbo_read_modify_write() {
+    let spv = build_ssbo_rmw_cs();
+    let module = translate(&spv).expect("frontend");
+    let target = if cfg!(target_os = "macos") {
+        Target::Aarch64Darwin
+    } else {
+        Target::Aarch64FreeBSD
+    };
+    let out = compile_blob(&module, target)
+        .expect("bespoke should compile a CS that reads SSBO[a]+7 -> SSBO[b]");
+    assert!(!out.blob.is_empty());
+}
+
 #[test]
 fn bespoke_compiles_empty_compute_shader() {
     let spv = build_empty_cs();
