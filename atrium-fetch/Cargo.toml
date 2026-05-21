@@ -1,0 +1,21 @@
+[package]
+name        = "atrium-fetch"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+description = "A second sample Insula app. Demonstrates the network ABI (atrium_net_connect) end-to-end through the broker. Takes 'host:port' as an argument, opens a TCP connection via libatrium, sends a configurable HTTP GET, prints the response to stderr (libatrium logs intermediate progress to the platform log)."
+publish     = false
+
+[[bin]]
+name = "atrium-fetch"
+path = "src/main.rs"
+
+[dependencies]
+libatrium = { path = "../libatrium" }
+libc      = "0.2"
+
+[dev-dependencies]
+insula-host-macos = { path = "../insula-host-macos" }
+insula-manifest   = { path = "../insula-manifest" }
+insula-bundle     = { path = "../insula-bundle" }
+tempfile          = "3"

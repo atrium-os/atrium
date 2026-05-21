@@ -261,20 +261,38 @@ fn write_status(s: &mut UnixStream, status: u8) -> std::io::Result<()> {
     s.flush()
 }
 
-/// Bidirectional proxy. Reads bytes from the unix
-/// stream and forwards to TCP, and vice versa. Either
-/// EOF terminates the proxy.
+/// Bidirectional proxy with half-close on EOF.
+///
+/// Two pipes (unix→tcp and tcp→unix) run concurrently.
+/// When one direction sees EOF, the corresponding write
+/// half of the *other* socket is shut down — without
+/// this, the peer can block forever waiting for an EOF
+/// signal that never arrives (common pattern: an HTTP
+/// client writes a request, then reads the response; if
+/// the server closes its TCP write but our unix→tcp
+/// pump is still alive waiting for more client bytes,
+/// the client never sees EOF on its unix read).
 fn proxy_bytes(unix: UnixStream, tcp: TcpStream) {
+    use std::net::Shutdown;
     let unix_for_a = unix.try_clone().expect("clone unix");
     let tcp_for_a = tcp.try_clone().expect("clone tcp");
+    let unix_for_close = unix.try_clone().expect("clone unix for close");
+    let tcp_for_close = tcp.try_clone().expect("clone tcp for close");
 
     // unix -> tcp
     let a = thread::spawn(move || {
         let _ = pipe(unix_for_a, tcp_for_a);
+        // No more bytes will arrive from the client;
+        // let the server see EOF on its read side so
+        // it can close cleanly.
+        let _ = tcp_for_close.shutdown(Shutdown::Write);
     });
     // tcp -> unix
     let b = thread::spawn(move || {
         let _ = pipe(tcp, unix);
+        // No more bytes will arrive from the server;
+        // let the client see EOF on its read side.
+        let _ = unix_for_close.shutdown(Shutdown::Write);
     });
     let _ = a.join();
     let _ = b.join();
