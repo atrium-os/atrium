@@ -2201,6 +2201,89 @@ fn differential_glsl_sin_cos() {
 }
 
 #[test]
+fn differential_glsl_atan2() {
+    // Atan2(y, x): four-quadrant arctangent.
+    //   atan2(0, 1)   = 0
+    //   atan2(1, 1)   = π/4
+    //   atan2(1, 0)   = π/2
+    //   atan2(1, -1)  = 3π/4
+    //   atan2(-1, -1) = -3π/4
+    //   atan2(-1, 0)  = -π/2
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let std_450 = b.ext_inst_import("GLSL.std.450");
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let f32_ty = b.type_float(32, None);
+    let void_fn = b.type_function(void, vec![]);
+    let rt_arr = b.type_runtime_array(f32_ty);
+    b.decorate(rt_arr, Decoration::ArrayStride, vec![rspirv::dr::Operand::LiteralBit32(4)]);
+    let s = b.type_struct(vec![rt_arr]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_f = b.type_pointer(None, StorageClass::StorageBuffer, f32_ty);
+    let ssbo  = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    let inputs: [(f32, f32); 6] = [
+        (0.0,  1.0),
+        (1.0,  1.0),
+        (1.0,  0.0),
+        (1.0, -1.0),
+        (-1.0, -1.0),
+        (-1.0,  0.0),
+    ];
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let mut results: Vec<u32> = Vec::new();
+    for &(y, x) in &inputs {
+        let cy = b.constant_bit32(f32_ty, y.to_bits());
+        let cx = b.constant_bit32(f32_ty, x.to_bits());
+        let r = b.ext_inst(f32_ty, None, std_450, 25,
+            vec![rspirv::dr::Operand::IdRef(cy), rspirv::dr::Operand::IdRef(cx)]).unwrap();
+        results.push(r);
+    }
+    for (i, v) in results.iter().enumerate() {
+        let ci = b.constant_bit32(u32_ty, i as u32);
+        let d = b.access_chain(ptr_f, None, ssbo, vec![c_zero, ci]).unwrap();
+        b.store(d, *v, None, vec![]).unwrap();
+    }
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spv = Vec::with_capacity(words.len() * 4);
+    for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+    let dir = TempDir::new().unwrap();
+    let n = results.len();
+    let mut b_buf = vec![0u8; n * 4];
+    let mut c_buf = vec![0u8; n * 4];
+    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    assert_eq!(b_buf, c_buf, "diverge on atan2");
+    let read = |i: usize| -> f32 {
+        f32::from_le_bytes(b_buf[i*4..i*4+4].try_into().unwrap())
+    };
+    let tol = 5e-4_f32;
+    for (i, &(y, x)) in inputs.iter().enumerate() {
+        let want = y.atan2(x);
+        let got = read(i);
+        assert!((got - want).abs() < tol,
+            "atan2({}, {}) = {} (want {})", y, x, got, want);
+    }
+}
+
+#[test]
 fn differential_glsl_atan_asin_acos() {
     // Atan(x): full real line, reciprocal range reduction.
     //   atan(0)=0, atan(1)=π/4, atan(-1)=-π/4,

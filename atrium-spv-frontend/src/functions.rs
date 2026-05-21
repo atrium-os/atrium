@@ -1755,6 +1755,40 @@ fn translate_inst(
                     let c_one = push_cf(1.0, source_spirv_offset, insts, next_value_id);
                     Op::FMul(a, c_one)
                 }
+                25 => {
+                    // Atan2(y, x): four-quadrant arctangent.
+                    //   base = atan(y / x)   (atan handles ±Inf
+                    //                         when x=0 via its
+                    //                         reciprocal branch)
+                    //   bias = x<0 ? (y<0 ? -π : π) : 0
+                    //   result = base + bias
+                    let y_id = expect_id(&spv_inst.operands, 2)?;
+                    let x_id = expect_id(&spv_inst.operands, 3)?;
+                    let y = resolve_value(y_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let ratio = push_f32(Op::FDiv(y.clone(), x.clone()),
+                        source_spirv_offset, insts, next_value_id);
+                    let base = synth_atan(ratio,
+                        source_spirv_offset, insts, next_value_id);
+                    let zero = push_cf(0.0, source_spirv_offset, insts, next_value_id);
+                    let is_x_neg = push_bool(Op::FOrdLt(x, zero.clone()),
+                        source_spirv_offset, insts, next_value_id);
+                    let is_y_neg = push_bool(Op::FOrdLt(y, zero.clone()),
+                        source_spirv_offset, insts, next_value_id);
+                    let c_pi = push_cf( std::f64::consts::PI,
+                        source_spirv_offset, insts, next_value_id);
+                    let c_neg_pi = push_cf(-std::f64::consts::PI,
+                        source_spirv_offset, insts, next_value_id);
+                    let bias_neg = push_f32(Op::Select {
+                        cond: is_y_neg, t_val: c_neg_pi, f_val: c_pi,
+                    }, source_spirv_offset, insts, next_value_id);
+                    let bias = push_f32(Op::Select {
+                        cond: is_x_neg, t_val: bias_neg, f_val: zero,
+                    }, source_spirv_offset, insts, next_value_id);
+                    Op::FAdd(base, bias)
+                }
                 16 => {
                     // Asin(x) = Atan(x / sqrt(1 - x²)).
                     let x_id = expect_id(&spv_inst.operands, 2)?;

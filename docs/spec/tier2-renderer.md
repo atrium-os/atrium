@@ -972,7 +972,7 @@ specifically supports:
   Ceil, Trunc, Fract, FSign, FMod, Sqrt, InverseSqrt,
   FMin, FMax, FClamp, FMix, Step, SmoothStep, Length,
   Distance, Normalize, Reflect, Cross, Sin, Cos, Tan,
-  Exp, Exp2, Log, Log2, Pow, Atan, Asin, Acos.
+  Exp, Exp2, Log, Log2, Pow, Atan, Asin, Acos, Atan2.
   Sin/Cos/Tan use Horner-form Taylor on a range-reduced
   argument (x → x_red ∈ [-π/2, π/2] mod π, with (-1)^k
   parity sign), so the full real line is accepted at ~6
@@ -987,6 +987,9 @@ specifically supports:
   reduction (sign(x)*π/2 - atan(1/x) when |x|>1), so
   the full real line is accepted at ~5e-7.  Asin =
   Atan(x / sqrt(1-x²)); Acos = π/2 - Asin.
+  Atan2(y, x) = Atan(y/x) + quadrant bias (±π or 0
+  selected on sign(x) × sign(y) via Op::Select); the
+  x=0 case rides through Atan's reciprocal branch.
 
 **Bespoke backend (atrium-spv-backend-bespoke):**
 
