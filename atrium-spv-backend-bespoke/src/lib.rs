@@ -514,8 +514,20 @@ fn emit_function(
         match op {
             Op::FAdd(l, r) | Op::FSub(l, r)
             | Op::FMul(l, r) | Op::FDiv(l, r)
+            | Op::FMin(l, r) | Op::FMax(l, r)
                 if is_vec4(&l.ty) && is_vec4(&r.ty) =>
                 Some((l.id, r.id)),
+            _ => None,
+        }
+    };
+    // Unary FP ops over a vec4: result and operand share
+    // the same NEON-packed fate.  Returns the operand id
+    // when it matches.
+    let vec_fp_unop = |op: &Op| -> Option<ValueId> {
+        match op {
+            Op::FAbs(x) | Op::FSqrt(x) | Op::FNeg(x)
+                if is_vec4(&x.ty) =>
+                Some(x.id),
             _ => None,
         }
     };
@@ -554,6 +566,7 @@ fn emit_function(
     for inst in &flat_insts {
         let friendly = pure_const_vec(&inst.op)
             || vecvec_fp_binop(&inst.op).is_some()
+            || vec_fp_unop(&inst.op).is_some()
             || vec4_phi(inst).is_some()
             || matches!(&inst.op,
                 Op::Store { value, .. } if is_vec4(&value.ty));
@@ -581,6 +594,17 @@ fn emit_function(
                 if any {
                     changed |= disqualified.insert(l);
                     changed |= disqualified.insert(r);
+                    if let Some(x) = res {
+                        changed |= disqualified.insert(x);
+                    }
+                }
+            }
+            if let Some(operand) = vec_fp_unop(&inst.op) {
+                let res = inst.result.as_ref().map(|x| x.id);
+                let any = disqualified.contains(&operand)
+                    || res.is_some_and(|x| disqualified.contains(&x));
+                if any {
+                    changed |= disqualified.insert(operand);
                     if let Some(x) = res {
                         changed |= disqualified.insert(x);
                     }
@@ -1642,54 +1666,53 @@ fn emit_function(
                     "Op::Store value {:?} not in packed/vectors/ints/scalars",
                     value.id)));
             }
-            // GLSL.std.450 math: scalar f32 path only here.
-            // Vector variants fall through to the catch-all
-            // until per-lane wiring lands.
+            // GLSL.std.450 math (scalar f32 + NEON vec4f).
             Op::FAbs(x) | Op::FSqrt(x) => {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal("F-unary without result".into()))?;
-                if !matches!(result.ty, Type::F32) {
+                // Packed vec4 (single Q-reg) path.
+                if packed_ids.contains(&result.id) {
+                    let v_src = *packed.get(&x.id).ok_or_else(||
+                        BackendError::Internal(format!(
+                            "F-unary packed source {:?} not packed", x.id)))?;
+                    let v_dst = alloc_vreg(
+                        &mut free_pool, &mut owners,
+                        &mut used_callee_saved_v, result.id)?;
+                    let enc = match &inst.op {
+                        Op::FAbs(_)  => asm::fabs_v_4s(v_dst, v_src),
+                        Op::FSqrt(_) => asm::fsqrt_v_4s(v_dst, v_src),
+                        _ => unreachable!(),
+                    };
+                    a.emit(enc);
+                    packed.insert(result.id, v_dst);
+                } else if matches!(result.ty, Type::F32) {
+                    let v_src = *scalars.get(&x.id).ok_or_else(||
+                        BackendError::Internal(format!(
+                            "F-unary source {:?} not in scalars", x.id)))?;
+                    let v_dst = alloc_vreg(
+                        &mut free_pool, &mut owners,
+                        &mut used_callee_saved_v, result.id)?;
+                    let enc = match &inst.op {
+                        Op::FAbs(_)  => asm::fabs_s(v_dst, v_src),
+                        Op::FSqrt(_) => asm::fsqrt_s(v_dst, v_src),
+                        _ => unreachable!(),
+                    };
+                    a.emit(enc);
+                    scalars.insert(result.id, v_dst);
+                } else {
                     return Err(BackendError::Unsupported(format!(
-                        "F-unary on non-scalar f32 result type {:?}", result.ty)));
+                        "F-unary on unpacked vector result type {:?}",
+                        result.ty)));
                 }
-                let v_src = *scalars.get(&x.id).ok_or_else(||
-                    BackendError::Internal(format!(
-                        "F-unary source {:?} not in scalars", x.id)))?;
-                let v_dst = alloc_vreg(
-                    &mut free_pool, &mut owners,
-                    &mut used_callee_saved_v, result.id)?;
-                let enc = match &inst.op {
-                    Op::FAbs(_)  => asm::fabs_s(v_dst, v_src),
-                    Op::FSqrt(_) => asm::fsqrt_s(v_dst, v_src),
-                    _ => unreachable!(),
-                };
-                a.emit(enc);
-                scalars.insert(result.id, v_dst);
             }
-            Op::FMin(x, y) | Op::FMax(x, y) => {
-                let result = inst.result.as_ref().ok_or_else(||
-                    BackendError::Internal("F-binop without result".into()))?;
-                if !matches!(result.ty, Type::F32) {
-                    return Err(BackendError::Unsupported(format!(
-                        "F-binop on non-scalar f32 result type {:?}", result.ty)));
-                }
-                let vx = *scalars.get(&x.id).ok_or_else(||
-                    BackendError::Internal(format!(
-                        "F-binop x {:?} not in scalars", x.id)))?;
-                let vy = *scalars.get(&y.id).ok_or_else(||
-                    BackendError::Internal(format!(
-                        "F-binop y {:?} not in scalars", y.id)))?;
-                let v_dst = alloc_vreg(
-                    &mut free_pool, &mut owners,
-                    &mut used_callee_saved_v, result.id)?;
-                let enc = match &inst.op {
-                    Op::FMin(..) => asm::fmin_s(v_dst, vx, vy),
-                    Op::FMax(..) => asm::fmax_s(v_dst, vx, vy),
-                    _ => unreachable!(),
-                };
-                a.emit(enc);
-                scalars.insert(result.id, v_dst);
-            }
+            Op::FMin(a_v, b_v) => emit_fp_binop_poly(
+                &mut a, &mut scalars, &mut vectors, &mut packed, &packed_ids,
+                &mut free_pool, &mut owners, &mut used_callee_saved_v, &mut next_synth_id,
+                coalesce_dest.as_ref(), inst, a_v, b_v, asm::fmin_s, asm::fmin_v_4s)?,
+            Op::FMax(a_v, b_v) => emit_fp_binop_poly(
+                &mut a, &mut scalars, &mut vectors, &mut packed, &packed_ids,
+                &mut free_pool, &mut owners, &mut used_callee_saved_v, &mut next_synth_id,
+                coalesce_dest.as_ref(), inst, a_v, b_v, asm::fmax_s, asm::fmax_v_4s)?,
             Op::AccessChain { base, byte_offset } => {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal(
