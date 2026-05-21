@@ -2686,3 +2686,179 @@ fn vk_app_compute_lambert_lighting_end_to_end() {
     let _ = server_thread;
     let _ = std::fs::remove_file(&sock);
 }
+
+/// CS: long vec4 chain via the production daemon.  Previously
+/// would have hit the V-pool exhaustion before the
+/// VectorExtract-copy + synth-lane expire fix in 8fca521.
+///
+///   c       = ssbo_in.data[gid_x]                  (vec4 load)
+///   n       = normalize(c)                          (vec4)
+///   scaled  = n * vec4(10)                          (vec4)
+///   floored = floor(scaled)                          (vec4)
+///   ssbo_out.data[gid_x] = floored
+fn build_vec4_long_chain_cs() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let std_450 = b.ext_inst_import("GLSL.std.450");
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let f32_ty = b.type_float(32, None);
+    let uvec3  = b.type_vector(u32_ty, 3);
+    let vec4   = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let rt_vec4 = b.type_runtime_array(vec4);
+    b.decorate(rt_vec4, Decoration::ArrayStride,
+        vec![rspirv::dr::Operand::LiteralBit32(16)]);
+    let s_in = b.type_struct(vec![rt_vec4]);
+    b.decorate(s_in, Decoration::Block, vec![]);
+    b.member_decorate(s_in, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let s_out = b.type_struct(vec![rt_vec4]);
+    b.decorate(s_out, Decoration::Block, vec![]);
+    b.member_decorate(s_out, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s_in  = b.type_pointer(None, StorageClass::StorageBuffer, s_in);
+    let ptr_s_out = b.type_pointer(None, StorageClass::StorageBuffer, s_out);
+    let ptr_v     = b.type_pointer(None, StorageClass::StorageBuffer, vec4);
+    let v_in  = b.variable(ptr_s_in, None, StorageClass::StorageBuffer, None);
+    b.decorate(v_in, Decoration::DescriptorSet, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(v_in, Decoration::Binding, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let v_out = b.variable(ptr_s_out, None, StorageClass::StorageBuffer, None);
+    b.decorate(v_out, Decoration::DescriptorSet, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(v_out, Decoration::Binding, vec![rspirv::dr::Operand::LiteralBit32(1)]);
+    let ptr_in_uvec3 = b.type_pointer(None, StorageClass::Input, uvec3);
+    let gid_var = b.variable(ptr_in_uvec3, None, StorageClass::Input, None);
+    b.decorate(gid_var, Decoration::BuiltIn,
+        vec![rspirv::dr::Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    let l10 = b.constant_bit32(f32_ty, 10.0f32.to_bits());
+    let v_ten = b.constant_composite(vec4, vec![l10, l10, l10, l10]);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let gid = b.load(uvec3, None, gid_var, None, vec![]).unwrap();
+    let gid_x = b.composite_extract(u32_ty, None, gid, vec![0]).unwrap();
+    let in_ptr = b.access_chain(ptr_v, None, v_in, vec![c_zero, gid_x]).unwrap();
+    let c = b.load(vec4, None, in_ptr, None, vec![]).unwrap();
+    let n = b.ext_inst(vec4, None, std_450, 69,
+        vec![rspirv::dr::Operand::IdRef(c)]).unwrap();
+    let scaled = b.f_mul(vec4, None, n, v_ten).unwrap();
+    let floored = b.ext_inst(vec4, None, std_450, 8,
+        vec![rspirv::dr::Operand::IdRef(scaled)]).unwrap();
+    let out_ptr = b.access_chain(ptr_v, None, v_out, vec![c_zero, gid_x]).unwrap();
+    b.store(out_ptr, floored, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![gid_var, v_in, v_out]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn vk_app_compute_long_vec4_chain_end_to_end() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let sock = tmp_socket("c_long_chain");
+    let cache_dir = TempDir::new().unwrap();
+    let registry = Arc::new(Tier2Registry::new(LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    }));
+    let tier2_backend = Arc::new(Tier2Backend::new(registry.clone()));
+    let backend_for_listener: Arc<dyn Backend> = tier2_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap()
+        .with_tier2_registry(registry.clone());
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+    let _env = EnvLock::set(&sock);
+
+    let mut instance: VkInstance = std::ptr::null_mut();
+    unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
+    let mut pds: [VkPhysicalDevice; 1] = [std::ptr::null_mut(); 1];
+    let mut cap: u32 = 1;
+    unsafe { vkEnumeratePhysicalDevices(instance, &mut cap, pds.as_mut_ptr()); }
+    let mut device: VkDevice = std::ptr::null_mut();
+    unsafe { vkCreateDevice(pds[0], std::ptr::null(), std::ptr::null(), &mut device); }
+    let mut queue: VkQueue = std::ptr::null_mut();
+    unsafe { vkGetDeviceQueue(device, 0, 0, &mut queue); }
+
+    let cs_spv = build_vec4_long_chain_cs();
+    let cs_mod = make_shader_module(device, &cs_spv);
+    use ash::vk;
+    use ash::vk::Handle;
+    let stage = vk::PipelineShaderStageCreateInfo {
+        s_type: vk::StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
+        p_next: std::ptr::null(), flags: vk::PipelineShaderStageCreateFlags::empty(),
+        stage: vk::ShaderStageFlags::COMPUTE,
+        module: vk::ShaderModule::from_raw(cs_mod),
+        p_name: b"main\0".as_ptr() as *const i8,
+        p_specialization_info: std::ptr::null(), _marker: std::marker::PhantomData,
+    };
+    let info = vk::ComputePipelineCreateInfo {
+        s_type: vk::StructureType::COMPUTE_PIPELINE_CREATE_INFO,
+        p_next: std::ptr::null(), flags: vk::PipelineCreateFlags::empty(),
+        stage, layout: vk::PipelineLayout::null(),
+        base_pipeline_handle: vk::Pipeline::null(),
+        base_pipeline_index: 0, _marker: std::marker::PhantomData,
+    };
+    let infos = [info];
+    let mut pipeline: u64 = 0;
+    unsafe {
+        vkCreateComputePipelines(device, 0, 1,
+            infos.as_ptr() as *const std::ffi::c_void,
+            std::ptr::null(), &mut pipeline,
+        );
+    }
+    assert!(pipeline != 0);
+    thread::sleep(Duration::from_millis(200));
+
+    // Input vec4(3, 4, 0, 0): length = 5, normalize -> (0.6, 0.8, 0, 0)
+    // scale by 10: (6, 8, 0, 0).  floor: (6, 8, 0, 0).
+    let mut in_buf = vec![0u8; 16];
+    for (j, x) in [3.0f32, 4.0, 0.0, 0.0].iter().enumerate() {
+        in_buf[j*4..j*4+4].copy_from_slice(&x.to_le_bytes());
+    }
+    tier2_backend.set_compute_input_for_binding(0, in_buf);
+
+    let mut pool: u64 = 0;
+    unsafe { vkCreateCommandPool(device, std::ptr::null(), std::ptr::null(), &mut pool); }
+    let mut cb_info = [0u8; 40];
+    cb_info[0..4].copy_from_slice(&40u32.to_le_bytes());
+    cb_info[16..24].copy_from_slice(&pool.to_le_bytes());
+    cb_info[28..32].copy_from_slice(&1u32.to_le_bytes());
+    let mut cbs: [VkCommandBuffer; 1] = [std::ptr::null_mut(); 1];
+    unsafe { vkAllocateCommandBuffers(device, cb_info.as_ptr() as *const _, cbs.as_mut_ptr()); }
+    let cb = cbs[0];
+    unsafe { vkBeginCommandBuffer(cb, std::ptr::null()); }
+    unsafe { vkCmdBindPipeline(cb, 1, pipeline); }
+    unsafe { vkCmdDispatch(cb, 1, 1, 1); }
+    unsafe { vkEndCommandBuffer(cb); }
+    let mut submit = [0u8; 72];
+    submit[0..4].copy_from_slice(&4u32.to_le_bytes());
+    submit[40..44].copy_from_slice(&1u32.to_le_bytes());
+    let cb_arr = [cb];
+    submit[48..56].copy_from_slice(&(cb_arr.as_ptr() as u64).to_le_bytes());
+    unsafe { vkQueueSubmit(queue, 1, submit.as_ptr() as *const _, std::ptr::null_mut()); }
+    thread::sleep(Duration::from_millis(300));
+
+    let out = tier2_backend.compute_output_bytes_for_binding(1).expect("output");
+    let expected = [6.0f32, 8.0, 0.0, 0.0];
+    for i in 0..4 {
+        let v = f32::from_le_bytes(out[i*4..i*4+4].try_into().unwrap());
+        assert!((v - expected[i]).abs() < 1e-5,
+            "lane {i}: expected {}, got {v}", expected[i]);
+    }
+
+    unsafe { atrium_vk_icd::vkDestroyInstance(instance, std::ptr::null()); }
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
