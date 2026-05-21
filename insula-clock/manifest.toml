@@ -1,0 +1,12 @@
+[app]
+name = "com.atrium-os.insula-clock"
+version = "0.1.0"
+sdk-version = "1.x"
+
+[bundle]
+form = "native"
+arches = ["aarch64-darwin"]
+entry = "bin/insula-clock"
+
+[render]
+fresco = true
