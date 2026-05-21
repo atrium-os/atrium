@@ -1256,6 +1256,15 @@ impl FnTranslator {
             Op::FSqrt(a) => self.emit_float_unop(
                 builder, &inst.result, a, |b, x| b.ins().sqrt(x),
             ),
+            Op::FFloor(a) => self.emit_float_unop(
+                builder, &inst.result, a, |b, x| b.ins().floor(x),
+            ),
+            Op::FCeil(a) => self.emit_float_unop(
+                builder, &inst.result, a, |b, x| b.ins().ceil(x),
+            ),
+            Op::FTrunc(a) => self.emit_float_unop(
+                builder, &inst.result, a, |b, x| b.ins().trunc(x),
+            ),
             Op::FMin(a, b) => self.emit_float_binop(
                 builder, &inst.result, a, b, |b, x, y| b.ins().fmin(x, y),
             ),

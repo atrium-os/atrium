@@ -1667,6 +1667,35 @@ fn emit_function(
                     value.id)));
             }
             // GLSL.std.450 math (scalar f32 + NEON vec4f).
+            // Scalar Floor/Ceil/Trunc only (no NEON .4S
+            // FRINT* helpers added yet -- the per-lane and
+            // packed-vec4 cases would need the F-unary code
+            // generalised over emit fn pointers, just like
+            // emit_fp_binop_poly is over (scalar_fn, v4s_fn);
+            // queued).
+            Op::FFloor(x) | Op::FCeil(x) | Op::FTrunc(x) => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal("FRINT* without result".into()))?;
+                if !matches!(result.ty, Type::F32) {
+                    return Err(BackendError::Unsupported(format!(
+                        "FRINT* on non-scalar result {:?} not yet supported",
+                        result.ty)));
+                }
+                let v_src = *scalars.get(&x.id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "FRINT* source {:?} not in scalars", x.id)))?;
+                let v_dst = alloc_vreg(
+                    &mut free_pool, &mut owners,
+                    &mut used_callee_saved_v, result.id)?;
+                let enc = match &inst.op {
+                    Op::FFloor(_) => asm::frintm_s(v_dst, v_src),
+                    Op::FCeil(_)  => asm::frintp_s(v_dst, v_src),
+                    Op::FTrunc(_) => asm::frintz_s(v_dst, v_src),
+                    _ => unreachable!(),
+                };
+                a.emit(enc);
+                scalars.insert(result.id, v_dst);
+            }
             Op::FAbs(x) | Op::FSqrt(x) => {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal("F-unary without result".into()))?;
@@ -3616,6 +3645,9 @@ fn compute_last_use_flat(
                 if let Some(r) = inst.result.as_ref() {
                     vec_lanes.insert(r.id, lane_ids);
                 }
+            }
+            Op::FFloor(x) | Op::FCeil(x) | Op::FTrunc(x) => {
+                mark(x.id);
             }
             Op::FAbs(x) | Op::FSqrt(x) => {
                 mark(x.id);

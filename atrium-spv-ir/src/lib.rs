@@ -493,6 +493,12 @@ pub enum Op {
 
     // ── Type conversions ───────────────────────────────────────
 
+    /// `floor(x)` (GLSL.std.450 Floor) — round toward -inf.
+    FFloor(Value),
+    /// `ceil(x)`  (GLSL.std.450 Ceil)  — round toward +inf.
+    FCeil(Value),
+    /// `trunc(x)` (GLSL.std.450 Trunc) — round toward zero.
+    FTrunc(Value),
     /// `abs(x)` for f32 scalars and vectors (GLSL.std.450 FAbs).
     FAbs(Value),
     /// `sqrt(x)` for f32 scalars and vectors (GLSL.std.450 Sqrt).

@@ -1587,6 +1587,9 @@ fn translate_inst(
             };
             // GLSL.std.450 enums we handle:
             //   4 = FAbs    arg: x
+            //   8 = Floor   arg: x
+            //   9 = Ceil    arg: x
+            //   3 = Trunc   arg: x
             //   31 = Sqrt   arg: x
             //   37 = FMin   args: x, y
             //   40 = FMax   args: x, y
@@ -1599,6 +1602,24 @@ fn translate_inst(
                     let x = resolve_value(x_id, types, constants, id_map,
                         next_value_id, insts, source_spirv_offset)?;
                     Op::FAbs(x)
+                }
+                8 => {
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    Op::FFloor(x)
+                }
+                9 => {
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    Op::FCeil(x)
+                }
+                3 => {
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    Op::FTrunc(x)
                 }
                 31 => {
                     let x_id = expect_id(&spv_inst.operands, 2)?;
