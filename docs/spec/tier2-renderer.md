@@ -968,11 +968,11 @@ specifically supports:
 - Barriers (ControlBarrier, MemoryBarrier) — no-ops on
   the serial dispatcher, queued for a real lowering when
   invocations parallelise.
-- GLSL.std.450 ExtInst dispatch for: FAbs, Floor, Ceil,
-  Trunc, Fract, FSign, FMod, Sqrt, InverseSqrt, FMin,
-  FMax, FClamp, FMix, Step, SmoothStep, Length, Distance,
-  Normalize, Reflect.  Sin/cos/exp/log queued (need
-  polynomial approximations or libcall).
+- GLSL.std.450 ExtInst dispatch for: FAbs, SAbs, Floor,
+  Ceil, Trunc, Fract, FSign, FMod, Sqrt, InverseSqrt,
+  FMin, FMax, FClamp, FMix, Step, SmoothStep, Length,
+  Distance, Normalize, Reflect.  Sin/cos/exp/log queued
+  (need polynomial approximations or libcall).
 
 **Bespoke backend (atrium-spv-backend-bespoke):**
 
