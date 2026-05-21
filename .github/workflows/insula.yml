@@ -1,0 +1,85 @@
+# CI for the Insula app platform layer. Runs every
+# push + pull request touching any Insula-related
+# path. The 15 crates are the macOS-host bring-up of
+# Atrium's app platform; that's the platform we test
+# under (the broader repo also targets FreeBSD, but
+# Insula's host adapter is macos-only today).
+#
+# Workflow:
+#   1. Build the CLI + every daemon + every sample
+#      via scripts/build-insula.sh
+#   2. Run the full regression via scripts/test-insula.sh
+#   3. As a smoke test, walk the end-to-end demo via
+#      scripts/insula-demo.sh
+#
+# `--quick` is *not* used in CI — the heavy windowed
+# E2Es (atrium-paint, insula-clock) need real coverage
+# in the regression bucket.
+
+name: insula
+
+on:
+  push:
+    paths:
+      - 'insula-*/**'
+      - 'libatrium/**'
+      - 'vestibulum-macos/**'
+      - 'atrium-netd-macos/**'
+      - 'praeco-macos/**'
+      - 'tabellarius-macos/**'
+      - 'atrium-fetch/**'
+      - 'atrium-mon/**'
+      - 'atrium-paint/**'
+      - 'scripts/test-insula.sh'
+      - 'scripts/build-insula.sh'
+      - 'scripts/insula-demo.sh'
+      - '.github/workflows/insula.yml'
+  pull_request:
+    paths:
+      - 'insula-*/**'
+      - 'libatrium/**'
+      - 'vestibulum-macos/**'
+      - 'atrium-netd-macos/**'
+      - 'praeco-macos/**'
+      - 'tabellarius-macos/**'
+      - 'atrium-fetch/**'
+      - 'atrium-mon/**'
+      - 'atrium-paint/**'
+      - 'scripts/test-insula.sh'
+      - 'scripts/build-insula.sh'
+      - 'scripts/insula-demo.sh'
+      - '.github/workflows/insula.yml'
+
+jobs:
+  test:
+    name: build + test + demo (macos-14)
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry + per-crate target dirs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            **/target
+          key: insula-cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            insula-cargo-${{ runner.os }}-
+
+      - name: Show toolchain
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Build all Insula crates (debug profile)
+        run: scripts/build-insula.sh --debug
+
+      - name: Run the full regression
+        run: scripts/test-insula.sh
+
+      - name: End-to-end demo (smoke test)
+        run: scripts/insula-demo.sh
