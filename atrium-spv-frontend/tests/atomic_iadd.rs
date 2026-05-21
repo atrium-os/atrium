@@ -72,3 +72,67 @@ fn frontend_emits_atomic_i_add() {
     }
     assert!(saw, "expected Op::AtomicIAdd in the entry block");
 }
+
+#[test]
+fn frontend_accepts_barriers_as_noops() {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+        MemorySemantics, Scope,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let void_fn = b.type_function(void, vec![]);
+    let s = b.type_struct(vec![u32_ty]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_u = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+    let ssbo = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let c_zero  = b.constant_bit32(u32_ty, 0);
+    let c_scope = b.constant_bit32(u32_ty, Scope::Workgroup as u32);
+    let c_sem   = b.constant_bit32(u32_ty,
+        MemorySemantics::WORKGROUP_MEMORY.bits()
+        | MemorySemantics::ACQUIRE_RELEASE.bits());
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    // Memory barrier
+    b.memory_barrier(c_scope, c_sem).unwrap();
+    // Atomic load
+    let src = b.access_chain(ptr_u, None, ssbo, vec![c_zero]).unwrap();
+    let _v = b.atomic_load(u32_ty, None, src, c_scope, c_sem).unwrap();
+    // Control barrier (execution + memory)
+    b.control_barrier(c_scope, c_scope, c_sem).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [4u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    let module = translate(&bytes).expect("frontend should accept barriers");
+    // Barriers should not produce IR instructions on the
+    // serial dispatcher.  The function should contain just
+    // the AccessChain + AtomicLoad + Return.
+    let func = &module.functions[0];
+    let entry = func.blocks.get(&func.entry_block).expect("entry");
+    let mut saw_barrier_inst = false;
+    for inst in &entry.insts {
+        let dbg = format!("{:?}", inst.op);
+        if dbg.contains("Barrier") {
+            saw_barrier_inst = true;
+        }
+    }
+    assert!(!saw_barrier_inst,
+        "barriers should be no-ops -- no Op::Barrier should appear in IR");
+}

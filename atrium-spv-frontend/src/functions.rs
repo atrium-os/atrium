@@ -1241,6 +1241,19 @@ fn translate_inst(
         // dispatched to the appropriate IR op constructor.
         // Memory scope + semantics are ignored on the serial
         // dispatcher (see Op::AtomicIAdd comment in spv-ir).
+        // OpControlBarrier / OpMemoryBarrier: synchronisation
+        // primitives that the SPIR-V spec defines for parallel
+        // invocations.  On Tier-2's serial dispatcher there is
+        // nothing to synchronise -- invocations run to
+        // completion one at a time, so both barriers are
+        // semantic no-ops.  Translate to nothing (no IR Inst
+        // is pushed).  When the dispatcher parallelises, this
+        // arm needs to emit a real Op::Barrier that the
+        // backends lower to dmb / dsb / isb on ARM64.
+        SpvOp::ControlBarrier | SpvOp::MemoryBarrier => {
+            Ok(())
+        }
+
         // OpAtomicIIncrement / OpAtomicIDecrement: no value
         // operand -- shorthand for IAdd with implicit +/-1.
         // Synthesise the +1 / -1 constant inline so the IR
