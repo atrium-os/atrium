@@ -3250,9 +3250,17 @@ pub unsafe extern "C" fn vkCmdSetStencilOp(
 /// `vkCmdPushConstants` — record push-constant bytes.
 ///
 /// Vk passes (layout, stageFlags, offset, size, pValues). Atrium's
-/// PushConstants body is (stage_mask: u32, offset: u32) + payload.
-/// We drop `layout` (Atrium's push-constants are pipeline-global)
-/// and pack the rest in a 4-byte header + payload bytes.
+/// `FrameOp::PushConstants` body layout (canonical -- this is what
+/// tier-1's renderer + the tier-2 frame walker both consume):
+///
+///   offset 0: stage_mask u8 (truncated from VkShaderStageFlags;
+///             low byte is enough for VS|FS|CS bits)
+///   offset 1: offset u8 (truncated from Vk's u32; push-constants
+///             are <=128 B per spec so a byte suffices)
+///   offset 2: reserved u16
+///   offset 4: payload bytes
+///
+/// `layout` is dropped -- atrium push-constants are pipeline-global.
 #[no_mangle]
 pub unsafe extern "C" fn vkCmdPushConstants(
     command_buffer: VkCommandBuffer,
@@ -3264,12 +3272,10 @@ pub unsafe extern "C" fn vkCmdPushConstants(
 ) {
     let Some(cb) = cmdbuf_recording(command_buffer) else { return };
     if p_values.is_null() || size == 0 { return; }
-    // 4-byte header (stage_mask | offset packed into u32 pair via
-    // 2-u16; we don't have a stable header yet so use a simple
-    // layout: stage_flags u32 | offset u32 in 8 bytes).
-    let mut body = Vec::with_capacity(8 + size as usize);
-    body.extend_from_slice(&stage_flags.to_le_bytes());
-    body.extend_from_slice(&offset.to_le_bytes());
+    let mut body = Vec::with_capacity(4 + size as usize);
+    body.push(stage_flags as u8);
+    body.push(offset as u8);
+    body.push(0); body.push(0); // reserved u16
     let payload = std::slice::from_raw_parts(p_values as *const u8, size as usize);
     body.extend_from_slice(payload);
     let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::PushConstants, &body);

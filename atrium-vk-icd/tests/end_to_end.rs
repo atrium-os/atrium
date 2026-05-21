@@ -483,11 +483,14 @@ fn cmdbuf_records_frame_ops_through_vkcmd_apis() {
     // header + body bytes. The four ops are:
     //   SetViewport    (0x0030, body 24 bytes) → 8 + 24 = 32 bytes
     //   SetScissor     (0x0031, body 16 bytes) → 8 + 16 = 24 bytes
-    //   PushConstants  (0x0032, body 8 hdr + 8 payload = 16) → 24 bytes
+    //   PushConstants  (0x0032, body 4 hdr + 8 payload = 12) → 20 bytes
     //   Draw           (0x0040, body 16 bytes) → 24 bytes
-    //   Total: 104 bytes.
+    //   Total: 100 bytes.
+    // (PushConstants header shrank from 8 to 4 bytes when the ICD
+    // migrated to the canonical wire shape that tier-1's renderer
+    // already expected; see vkCmdPushConstants docstring.)
     let bytes = cmdbuf_recorded_bytes(cb);
-    assert_eq!(bytes.len(), 104, "expected 104 bytes recorded, got {}", bytes.len());
+    assert_eq!(bytes.len(), 100, "expected 100 bytes recorded, got {}", bytes.len());
 
     // Verify the first two opcodes are SetViewport, SetScissor.
     let op0 = u16::from_le_bytes([bytes[0], bytes[1]]);

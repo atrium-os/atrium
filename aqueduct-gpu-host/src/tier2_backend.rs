@@ -570,8 +570,21 @@ impl Tier2Backend {
                     Err(e) => log::warn!("malformed SetViewport: {e}"),
                 },
                 FrameOp::PushConstants => {
-                    state.push_constants.clear();
-                    state.push_constants.extend_from_slice(body);
+                    // Body shape: 4-byte header (stage_mask u8 +
+                    // offset u8 + reserved u16) followed by the
+                    // payload bytes. Tier-2 ignores stage_mask
+                    // and offset for now (the bound shader's
+                    // SPIR-V dictates layout already) -- strip
+                    // the header so the FS / CS reads its data
+                    // from offset 0.
+                    if body.len() < 4 {
+                        log::warn!("PushConstants body too short \
+                                    ({} bytes; need >=4 for header)",
+                                   body.len());
+                    } else {
+                        state.push_constants.clear();
+                        state.push_constants.extend_from_slice(&body[4..]);
+                    }
                 }
                 FrameOp::Draw => match DrawCmd::from_bytes(body) {
                     Ok(cmd) => {
@@ -1013,8 +1026,21 @@ impl Tier2Backend {
                     }
                 }
                 FrameOp::PushConstants => {
-                    state.push_constants.clear();
-                    state.push_constants.extend_from_slice(body);
+                    // Body shape: 4-byte header (stage_mask u8 +
+                    // offset u8 + reserved u16) followed by the
+                    // payload bytes. Tier-2 ignores stage_mask
+                    // and offset for now (the bound shader's
+                    // SPIR-V dictates layout already) -- strip
+                    // the header so the FS / CS reads its data
+                    // from offset 0.
+                    if body.len() < 4 {
+                        log::warn!("PushConstants body too short \
+                                    ({} bytes; need >=4 for header)",
+                                   body.len());
+                    } else {
+                        state.push_constants.clear();
+                        state.push_constants.extend_from_slice(&body[4..]);
+                    }
                 }
                 FrameOp::Dispatch => match DispatchCmd::from_bytes(body) {
                     Ok(cmd) => self.dispatch_compute(&state, cmd),
