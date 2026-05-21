@@ -331,6 +331,8 @@ fn spv_compile_picks_bespoke_for_supported_compute_shaders() {
         ("gid_ls4",    build_gid_cs(4)),
         ("cond",       build_cond_cs()),
         ("loop",       build_loop_cs()),
+        ("f_scalar",   build_float_arith_cs()),
+        ("f_vec4",     build_float_vec4_arith_cs()),
     ] {
         let backend = invoked_backend(&spv)
             .unwrap_or_else(|e| panic!("compile failed for {name}: {e}"));
@@ -593,6 +595,153 @@ fn bespoke_compiles_loop_compute() {
     let out = compile_blob(&module, target)
         .expect("bespoke should compile a counted-loop CS -- exercises \
                  the loop-header + back-edge + Phi-as-loop-carried path");
+    assert!(!out.blob.is_empty());
+}
+
+/// Compute SPIR-V doing scalar float arithmetic:
+///   ssbo[0] = float(gid.x) * 1.5 + 2.0
+///
+/// Exercises Op::ConvertUToF + Op::FMul + Op::FAdd + scalar
+/// float store through StorageBuffer, end-to-end in compute.
+fn build_float_arith_cs() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let f32_ty = b.type_float(32, None);
+    let uvec3  = b.type_vector(u32_ty, 3);
+    let void_fn = b.type_function(void, vec![]);
+    let ptr_in_uvec3 = b.type_pointer(None, StorageClass::Input, uvec3);
+    let gid_var = b.variable(ptr_in_uvec3, None, StorageClass::Input, None);
+    b.decorate(gid_var, Decoration::BuiltIn,
+        vec![rspirv::dr::Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+    let ssbo_struct = b.type_struct(vec![f32_ty]);
+    b.decorate(ssbo_struct, Decoration::Block, vec![]);
+    b.member_decorate(ssbo_struct, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_ssbo_struct = b.type_pointer(None, StorageClass::StorageBuffer, ssbo_struct);
+    let ptr_ssbo_f32    = b.type_pointer(None, StorageClass::StorageBuffer, f32_ty);
+    let ssbo_var = b.variable(ptr_ssbo_struct, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo_var, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo_var, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let c_zero  = b.constant_bit32(u32_ty, 0);
+    let c_1p5   = b.constant_bit32(f32_ty, 1.5f32.to_bits());
+    let c_2p0   = b.constant_bit32(f32_ty, 2.0f32.to_bits());
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let gid = b.load(uvec3, None, gid_var, None, vec![]).unwrap();
+    let gid_x = b.composite_extract(u32_ty, None, gid, vec![0]).unwrap();
+    let f = b.convert_u_to_f(f32_ty, None, gid_x).unwrap();
+    let scaled = b.f_mul(f32_ty, None, f, c_1p5).unwrap();
+    let biased = b.f_add(f32_ty, None, scaled, c_2p0).unwrap();
+    let dst = b.access_chain(ptr_ssbo_f32, None, ssbo_var, vec![c_zero]).unwrap();
+    b.store(dst, biased, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main",
+        vec![gid_var, ssbo_var]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn bespoke_compiles_float_arith_compute() {
+    let spv = build_float_arith_cs();
+    let module = translate(&spv).expect("frontend");
+    let target = if cfg!(target_os = "macos") {
+        Target::Aarch64Darwin
+    } else {
+        Target::Aarch64FreeBSD
+    };
+    let out = compile_blob(&module, target)
+        .expect("bespoke should compile a CS doing scalar float arith \
+                 -- exercises Op::ConvertUToF + Op::FMul + Op::FAdd + \
+                 scalar f32 SSBO store through the compute path");
+    assert!(!out.blob.is_empty());
+}
+
+/// Compute SPIR-V doing vec4 float arithmetic:
+///   ssbo[0] = vec4(1,2,3,4) * vec4(0.5) + vec4(10)
+///
+/// Exercises FMul + FAdd on the SIMD/NEON lane path through
+/// compute, complementing the scalar float test.
+fn build_float_vec4_arith_cs() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let f32_ty = b.type_float(32, None);
+    let vec4   = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let ssbo_struct = b.type_struct(vec![vec4]);
+    b.decorate(ssbo_struct, Decoration::Block, vec![]);
+    b.member_decorate(ssbo_struct, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_ssbo_struct = b.type_pointer(None, StorageClass::StorageBuffer, ssbo_struct);
+    let ptr_ssbo_vec4   = b.type_pointer(None, StorageClass::StorageBuffer, vec4);
+    let ssbo_var = b.variable(ptr_ssbo_struct, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo_var, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo_var, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    let cs_a: Vec<_> = [1.0f32, 2.0, 3.0, 4.0].iter()
+        .map(|x| b.constant_bit32(f32_ty, x.to_bits())).collect();
+    let vec_a = b.constant_composite(vec4, cs_a);
+    let cs_b: Vec<_> = [0.5f32; 4].iter()
+        .map(|x| b.constant_bit32(f32_ty, x.to_bits())).collect();
+    let vec_b = b.constant_composite(vec4, cs_b);
+    let cs_c: Vec<_> = [10.0f32; 4].iter()
+        .map(|x| b.constant_bit32(f32_ty, x.to_bits())).collect();
+    let vec_c = b.constant_composite(vec4, cs_c);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let prod = b.f_mul(vec4, None, vec_a, vec_b).unwrap();
+    let sum  = b.f_add(vec4, None, prod, vec_c).unwrap();
+    let dst = b.access_chain(ptr_ssbo_vec4, None, ssbo_var, vec![c_zero]).unwrap();
+    b.store(dst, sum, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo_var]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn bespoke_compiles_float_vec4_arith_compute() {
+    let spv = build_float_vec4_arith_cs();
+    let module = translate(&spv).expect("frontend");
+    let target = if cfg!(target_os = "macos") {
+        Target::Aarch64Darwin
+    } else {
+        Target::Aarch64FreeBSD
+    };
+    let out = compile_blob(&module, target)
+        .expect("bespoke should compile a CS doing vec4 float arith \
+                 -- exercises FMul + FAdd on the NEON SIMD path \
+                 through compute");
     assert!(!out.blob.is_empty());
 }
 
