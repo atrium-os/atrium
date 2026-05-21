@@ -3910,7 +3910,7 @@ for the existing FS-validation tests).
 | R.6 tiled pixel loop (8×8) | ✅ landed | bb9348e |
 | R.6 v2 per-tile edge-function trivial reject | landed   | tile-corner edge test before per-pixel loop |
 | R.7 per-stripe parallelism (rayon) | ✅ landed | b72da8a |
-| **R.8 SIMD pixel quads** | **deferred — see below** | — |
+| **R.8 SIMD pixel quads** | **deferred — scoped in rasterize_stripe docstring** | — |
 
 The arc is functionally complete at R.7.  The deferred items
 (R.4 v2 side-plane clip, R.6 v2 trivial reject, R.8 SIMD) are

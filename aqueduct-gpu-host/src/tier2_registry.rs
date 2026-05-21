@@ -611,6 +611,47 @@ struct StripeWork<'p, 'd> {
 /// **stripe-local** coordinates (`py - stripe_y *
 /// TILE_SIZE`) so the slice indexing matches the chunk's
 /// length.
+///
+/// # R.8 deferred -- SIMD pixel quads
+///
+/// The current loop calls `fs_main` once per pixel.  Real
+/// GPUs dispatch the FS in 2x2 pixel quads so derivatives
+/// (`dFdx` / `dFdy`) work and lanewise SIMD is natural.
+/// R.8 would change this in a coordinated way across four
+/// places:
+///
+///   1. **FS ABI** (atrium-spv-loader::FsMain): take per-
+///      input arrays sized 4 instead of scalar values
+///      (e.g.  `varyings: *const [u8; 4]` for a 2x2 quad
+///      worth of varyings), with a 4-bit lane-mask
+///      indicating which lanes are inside the triangle.
+///      out_color becomes `[[f32; 4]; 4]`; out_depth
+///      becomes `[f32; 4]`.
+///   2. **rasterize_stripe**: iterate in 2x2 chunks rather
+///      than 1x1; pack the 4 pixel-centre coordinates into
+///      the per-quad call; un-pack out_color back into
+///      the stripe pixel buffer per lane mask.
+///   3. **Cranelift backend** (atrium-spv-backend-cranelift):
+///      lift every scalar Op to a 4-lane operation when the
+///      stage is Fragment.  Either via Cranelift's first-
+///      class SIMD ISel or by manually emitting 4 scalar
+///      copies (the conservative path).  AccessChain +
+///      Load + Store stay scalar (the per-lane gather/scatter
+///      is what produces the SIMD pattern).
+///   4. **Bespoke backend** (atrium-spv-backend-bespoke):
+///      same lifting in the ARM64 emitter.  NEON's
+///      `V0..V31` per-lane registers map naturally.  This
+///      is the load-bearing perf win since each FS call
+///      goes from "8 instructions per pixel" to "8
+///      instructions per quad".
+///
+/// Together these would roughly 4x throughput on FS-bound
+/// scenes (the rasterizer already does tile-level reject,
+/// so vector lanes near-fully-utilised inside the triangle).
+/// The arc is bounded but cross-cutting -- queued behind
+/// the bespoke-compute work since both need the bespoke
+/// backend's instruction scheduler to grow new patterns,
+/// and doing them together avoids two ABI-break rebuilds.
 fn rasterize_stripe(
     task: &mut StripeWork<'_, '_>,
     setup: &TriangleSetup<'_>,
