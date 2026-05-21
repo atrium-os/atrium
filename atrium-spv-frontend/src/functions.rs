@@ -1977,6 +1977,63 @@ fn translate_inst(
                         next_value_id, insts, source_spirv_offset)?;
                     Op::FMin(x, y)
                 }
+                75 => {
+                    // FindUMsb(x): bit index of highest set
+                    // bit, or -1 if x==0.
+                    //   clz_v = Clz(x)          // 0..32
+                    //   msb   = 31 - clz_v
+                    // When x=0: clz=32, msb=-1.
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let clz_v = push_i32(Op::Clz(x),
+                        source_spirv_offset, insts, next_value_id);
+                    let c31 = push_ci32(31, source_spirv_offset, insts, next_value_id);
+                    Op::ISub(c31, clz_v)
+                }
+                73 => {
+                    // FindILsb(x): bit index of lowest set bit,
+                    // or -1 if x==0.
+                    //   r     = Rbit(x)
+                    //   clz_v = Clz(r)          // 0..32
+                    //   lsb   = (x==0) ? -1 : clz_v
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let r = push_i32(Op::Rbit(x.clone()),
+                        source_spirv_offset, insts, next_value_id);
+                    let clz_v = push_i32(Op::Clz(r),
+                        source_spirv_offset, insts, next_value_id);
+                    let c0 = push_ci32(0, source_spirv_offset, insts, next_value_id);
+                    let is_zero = push_bool(Op::IEq(x, c0),
+                        source_spirv_offset, insts, next_value_id);
+                    let c_neg1 = push_ci32(-1, source_spirv_offset, insts, next_value_id);
+                    Op::Select {
+                        cond: is_zero, t_val: c_neg1, f_val: clz_v,
+                    }
+                }
+                74 => {
+                    // FindSMsb(x): bit index of highest 0 bit if
+                    // x<0, else of highest 1 bit.  -1 if x==0 or
+                    // x==-1.
+                    //   y  = (x<0) ? ~x : x
+                    //   r  = FindUMsb(y)
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let c0 = push_ci32(0, source_spirv_offset, insts, next_value_id);
+                    let is_neg = push_bool(Op::SLt(x.clone(), c0),
+                        source_spirv_offset, insts, next_value_id);
+                    let not_x = push_i32(Op::BitNot(x.clone()),
+                        source_spirv_offset, insts, next_value_id);
+                    let y = push_i32(Op::Select {
+                        cond: is_neg, t_val: not_x, f_val: x,
+                    }, source_spirv_offset, insts, next_value_id);
+                    let clz_v = push_i32(Op::Clz(y),
+                        source_spirv_offset, insts, next_value_id);
+                    let c31 = push_ci32(31, source_spirv_offset, insts, next_value_id);
+                    Op::ISub(c31, clz_v)
+                }
                 // SMin(38) / UMin(39) / SMax(42) / UMax(41):
                 // synth via Select on a signed/unsigned compare.
                 38 | 39 | 41 | 42 => {

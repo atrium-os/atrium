@@ -2252,6 +2252,39 @@ fn build_int_glsl_shader(ext_op: u32, signed: bool, args: &[u32]) -> Vec<u8> {
 }
 
 #[test]
+fn differential_glsl_int_bit_scan() {
+    // FindILsb(73) / FindSMsb(74) / FindUMsb(75) lower onto
+    // Op::Clz + Op::Rbit (new IR variants) with edge-case
+    // selects for x==0 / x<0.
+    let cases: &[(&str, u32, bool, &[u32], i32)] = &[
+        ("findumsb(1)",     75, false, &[1],          0),
+        ("findumsb(0x80)",  75, false, &[0x80],       7),
+        ("findumsb(0x8000_0000)", 75, false, &[0x8000_0000], 31),
+        ("findumsb(0)",     75, false, &[0],         -1),
+        ("findilsb(1)",     73, true,  &[1],          0),
+        ("findilsb(0x80)",  73, true,  &[0x80],       7),
+        ("findilsb(0x8000_0000)", 73, true, &[0x8000_0000], 31),
+        ("findilsb(0)",     73, true,  &[0],         -1),
+        ("findsmsb(1)",     74, true,  &[1],          0),
+        ("findsmsb(-1)",    74, true,  &[-1i32 as u32], -1),
+        ("findsmsb(-2)",    74, true,  &[-2i32 as u32], 0),
+        ("findsmsb(0x7FFF_FFFF)", 74, true, &[0x7FFF_FFFF], 30),
+    ];
+    for &(label, ext_op, signed, args, expected) in cases {
+        let spv = build_int_glsl_shader(ext_op, signed, args);
+        let dir = TempDir::new().unwrap();
+        let mut b_buf = vec![0u8; 4];
+        let mut c_buf = vec![0u8; 4];
+        invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
+        invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+        assert_eq!(b_buf, c_buf, "{label}: bespoke vs cranelift diverge");
+        let got = i32::from_le_bytes(b_buf[0..4].try_into().unwrap());
+        assert_eq!(got, expected,
+            "{label}: got {}, want {}", got, expected);
+    }
+}
+
+#[test]
 fn differential_glsl_int_min_max_clamp() {
     // SMin/UMin/SMax/UMax/SClamp/UClamp lower to Select on
     // SLt/ULt/SGt/UGt.  Each op gets its own tiny shader to

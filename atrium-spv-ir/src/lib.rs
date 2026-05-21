@@ -345,6 +345,12 @@ pub enum Op {
     BitXor(Value, Value),
     /// Bitwise NOT.
     BitNot(Value),
+    /// Count leading zeros (32-bit).  CLZ on ARM64; cls/clz
+    /// on Cranelift.  Returns 32 if input is 0.
+    Clz(Value),
+    /// Bit-reverse a 32-bit integer.  RBIT on ARM64;
+    /// bitreverse on Cranelift.
+    Rbit(Value),
     /// Left shift.
     Shl(Value, Value),
     /// Logical right shift (unsigned).

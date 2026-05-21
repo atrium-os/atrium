@@ -1164,6 +1164,26 @@ impl FnTranslator {
                 self.scalars.insert(result.id, v);
                 Ok(())
             }
+            Op::Clz(a) => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal("Clz without result".into()))?;
+                let av = self.scalars.get(&a.id).copied().ok_or_else(||
+                    BackendError::Internal(format!(
+                        "Clz operand {:?} not in scalars", a.id)))?;
+                let v = builder.ins().clz(av);
+                self.scalars.insert(result.id, v);
+                Ok(())
+            }
+            Op::Rbit(a) => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal("Rbit without result".into()))?;
+                let av = self.scalars.get(&a.id).copied().ok_or_else(||
+                    BackendError::Internal(format!(
+                        "Rbit operand {:?} not in scalars", a.id)))?;
+                let v = builder.ins().bitrev(av);
+                self.scalars.insert(result.id, v);
+                Ok(())
+            }
             Op::Shl(a, b) => self.emit_int_binop(
                 builder, &inst.result, a, b, |b, x, y| b.ins().ishl(x, y)),
             Op::LShr(a, b) => self.emit_int_binop(

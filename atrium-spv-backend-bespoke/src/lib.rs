@@ -1279,6 +1279,26 @@ fn emit_function(
                 a.emit(asm::mvn_w(d_w, s_w));
                 ints.insert(result.id, d_w);
             }
+            Op::Clz(s) => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal("Clz without result".into()))?;
+                let s_w = *ints.get(&s.id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "Clz operand {:?} not in ints", s.id)))?;
+                let d_w = alloc_int_w(&mut int_pool, result.id)?;
+                a.emit(asm::clz_w(d_w, s_w));
+                ints.insert(result.id, d_w);
+            }
+            Op::Rbit(s) => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal("Rbit without result".into()))?;
+                let s_w = *ints.get(&s.id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "Rbit operand {:?} not in ints", s.id)))?;
+                let d_w = alloc_int_w(&mut int_pool, result.id)?;
+                a.emit(asm::rbit_w(d_w, s_w));
+                ints.insert(result.id, d_w);
+            }
             // Integer comparisons → Bool W-reg.
             Op::IEq(l, r) => emit_icmp_to_bool(
                 &mut a, &ints, &mut bools, &mut bool_owners, &mut bool_free,
@@ -3785,6 +3805,7 @@ fn op_reads(op: &Op, id: ValueId) -> bool {
         | Dot(l, r) =>
             l.id == id || r.id == id,
         INeg(s) | FNeg(s) | BitNot(s)
+        | Clz(s) | Rbit(s)
         | ConvertSToF(s) | ConvertFToS(s)
         | ConvertUToF(s) | ConvertFToU(s)
         | SConvert(s, _) | UConvert(s, _) | FConvert(s, _)
@@ -3912,6 +3933,7 @@ fn compute_last_use_flat(
                 mark(l.id); mark(r.id);
             }
             Op::INeg(s) | Op::BitNot(s)
+            | Op::Clz(s) | Op::Rbit(s)
             | Op::ConvertSToF(s) | Op::ConvertUToF(s)
             | Op::ConvertFToS(s) | Op::ConvertFToU(s) => mark(s.id),
             Op::Bitcast(s, _) => mark(s.id),
