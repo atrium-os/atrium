@@ -202,6 +202,157 @@ pub extern "C" fn atrium_exit(code: c_int) -> ! {
     std::process::exit(code);
 }
 
+// =====================================================
+// Storage — access to the app's sandbox container.
+// =====================================================
+
+/// Returned by [`atrium_storage_open`] on success: the
+/// raw OS file descriptor the app uses with standard
+/// `read(2)` / `write(2)` / `close(2)`.
+pub type AtriumFd = c_int;
+
+/// Open mode: read-only.
+pub const ATRIUM_STORAGE_READ: c_uint = 0;
+/// Open mode: write-only, truncate existing.
+pub const ATRIUM_STORAGE_WRITE: c_uint = 1;
+/// Open mode: write-only, append to existing.
+pub const ATRIUM_STORAGE_APPEND: c_uint = 2;
+
+/// Open-failure error codes (returned as negative fds).
+pub const ATRIUM_ERR_NO_CONTAINER: c_int = -1;
+/// The buffer passed to [`atrium_container_path`] was
+/// too small for the container path; the function
+/// writes nothing in this case and returns this code.
+pub const ATRIUM_ERR_BUF_TOO_SMALL: c_int = -2;
+/// File I/O failed; libc errno-equivalent.
+pub const ATRIUM_ERR_IO: c_int = -3;
+/// Invalid mode passed to [`atrium_storage_open`].
+pub const ATRIUM_ERR_INVALID_MODE: c_int = -4;
+/// `path` argument was NULL or not valid UTF-8 / NUL-
+/// terminated.
+pub const ATRIUM_ERR_INVALID_PATH: c_int = -5;
+
+/// Write the absolute path of this app's container
+/// directory into `buf` (up to `buf_len` bytes
+/// including a trailing NUL). Returns:
+///
+/// - The path length **excluding** the NUL on success.
+/// - [`ATRIUM_ERR_NO_CONTAINER`] if no container has
+///   been provisioned (i.e. `$ATRIUM_CONTAINER_DIR` is
+///   unset — typical when an app is run outside the
+///   host adapter).
+/// - [`ATRIUM_ERR_BUF_TOO_SMALL`] if `buf` cannot hold
+///   the path + NUL.
+///
+/// # Safety
+///
+/// `buf` must be valid for writes up to `buf_len`
+/// bytes.
+#[no_mangle]
+pub unsafe extern "C" fn atrium_container_path(
+    buf: *mut c_char,
+    buf_len: usize,
+) -> c_int {
+    let path = match container_dir() {
+        Some(p) => p,
+        None => return ATRIUM_ERR_NO_CONTAINER,
+    };
+    let bytes = path.as_os_str().as_encoded_bytes();
+    let needed = bytes.len() + 1; // + NUL
+    if buf.is_null() || needed > buf_len {
+        return ATRIUM_ERR_BUF_TOO_SMALL;
+    }
+    // SAFETY: caller's contract — buf valid for buf_len
+    // writes; we've checked needed <= buf_len above.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr() as *const c_char,
+            buf,
+            bytes.len(),
+        );
+        *buf.add(bytes.len()) = 0;
+    }
+    bytes.len() as c_int
+}
+
+/// Open a file at `path` (NUL-terminated UTF-8,
+/// relative to the app's container directory) with
+/// `mode` ∈ {[`ATRIUM_STORAGE_READ`],
+/// [`ATRIUM_STORAGE_WRITE`], [`ATRIUM_STORAGE_APPEND`]}.
+/// Returns the OS file descriptor on success or a
+/// negative error code.
+///
+/// The app uses the returned fd with normal libc
+/// `read(2)` / `write(2)` / `close(2)`.
+///
+/// # Safety
+///
+/// `path` must be either NULL or a valid pointer to a
+/// NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn atrium_storage_open(
+    path: *const c_char,
+    mode: c_uint,
+) -> c_int {
+    if path.is_null() {
+        return ATRIUM_ERR_INVALID_PATH;
+    }
+    let cstr = unsafe { CStr::from_ptr(path) };
+    let rel = match cstr.to_str() {
+        Ok(s) => s,
+        Err(_) => return ATRIUM_ERR_INVALID_PATH,
+    };
+
+    let container = match container_dir() {
+        Some(p) => p,
+        None => return ATRIUM_ERR_NO_CONTAINER,
+    };
+
+    // Trivial path-traversal guard: reject leading `/`
+    // (would escape via absolute path) and any `..`
+    // component. The sandbox would deny the access
+    // anyway, but failing fast is friendlier to apps.
+    if rel.starts_with('/') {
+        return ATRIUM_ERR_INVALID_PATH;
+    }
+    if rel.split('/').any(|seg| seg == "..") {
+        return ATRIUM_ERR_INVALID_PATH;
+    }
+
+    let full = container.join(rel);
+
+    let mut opts = std::fs::OpenOptions::new();
+    match mode {
+        ATRIUM_STORAGE_READ => {
+            opts.read(true);
+        }
+        ATRIUM_STORAGE_WRITE => {
+            opts.write(true).create(true).truncate(true);
+        }
+        ATRIUM_STORAGE_APPEND => {
+            opts.write(true).create(true).append(true);
+        }
+        _ => return ATRIUM_ERR_INVALID_MODE,
+    }
+
+    match opts.open(&full) {
+        Ok(file) => {
+            use std::os::fd::IntoRawFd;
+            file.into_raw_fd() as c_int
+        }
+        Err(_) => ATRIUM_ERR_IO,
+    }
+}
+
+/// Resolve the container directory from
+/// `$ATRIUM_CONTAINER_DIR`. Re-read each call —
+/// cheap, and lets tests vary the env per case
+/// without process-wide caching.
+fn container_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("ATRIUM_CONTAINER_DIR")
+        .map(std::path::PathBuf::from)
+}
+
 // ---------------------------------------------------------
 // Unit tests — pure-functional pieces only; the FFI
 // surface is exercised end-to-end by insula-hello.

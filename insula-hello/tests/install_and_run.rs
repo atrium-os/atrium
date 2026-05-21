@@ -86,4 +86,15 @@ fn install_and_run_insula_hello() {
     assert!(stderr.contains("atrium_init"));
     assert!(stderr.contains("[INFO] hello from Insula"));
     assert!(stderr.contains("atrium_exit(0)"));
+
+    // The app called atrium_storage_open + wrote a
+    // marker file into the container. Verify it
+    // landed in the right place.
+    let marker = app.container_dir.join("hello-from-insula.txt");
+    assert!(marker.exists(),
+            "expected marker file at {} after install_and_run",
+            marker.display());
+    let contents = std::fs::read_to_string(&marker).unwrap();
+    assert!(contents.starts_with("Hello from insula-hello"),
+            "marker file contents: {:?}", contents);
 }

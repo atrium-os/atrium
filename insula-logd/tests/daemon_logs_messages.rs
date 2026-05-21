@@ -43,13 +43,17 @@ fn wait_for_socket(socket: &std::path::Path, timeout: Duration) {
 
 fn send_log_via_aqueduct(socket: &std::path::Path, level: u8, msg: &str) {
     let mut conn = Connection::connect(socket).expect("client connect");
+    send_one(&mut conn, level, msg);
+    // Connection drops at end of fn; daemon sees EOF and
+    // the per-connection thread exits cleanly.
+}
+
+fn send_one(conn: &mut Connection, level: u8, msg: &str) {
     let mut payload = Vec::with_capacity(msg.len() + 1);
     payload.push(level);
     payload.extend_from_slice(msg.as_bytes());
     conn.send_message(CLASS_LOG, 0, flag::ASYNC_EVENT, &payload)
         .expect("send_message");
-    // Connection drops at end of fn; daemon sees EOF and
-    // the per-connection thread exits cleanly.
 }
 
 #[test]
@@ -61,11 +65,17 @@ fn daemon_writes_log_lines_for_each_received_message() {
     let mut daemon = spawn_daemon(&socket, &log_file);
     wait_for_socket(&socket, Duration::from_secs(3));
 
-    // Send three log lines via the same aqueduct shape
-    // libatrium uses.
-    send_log_via_aqueduct(&socket, 2, "first INFO line");
-    send_log_via_aqueduct(&socket, 4, "an ERROR happened");
-    send_log_via_aqueduct(&socket, 1, "DEBUG noise");
+    // Send three log lines on ONE connection so the
+    // daemon sees them in order (per-connection thread,
+    // single recv loop). Using three separate
+    // connections gave three threads → no order
+    // guarantee on the resulting file.
+    {
+        let mut conn = Connection::connect(&socket).expect("client connect");
+        send_one(&mut conn, 2, "first INFO line");
+        send_one(&mut conn, 4, "an ERROR happened");
+        send_one(&mut conn, 1, "DEBUG noise");
+    }
 
     // Give the daemon's worker threads a beat to flush.
     thread::sleep(Duration::from_millis(150));

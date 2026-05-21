@@ -38,6 +38,36 @@ void atrium_log(uint32_t level, const char* msg);
 /* Cleanly exit the process. */
 void atrium_exit(int32_t code) __attribute__((noreturn));
 
+/* -----------------------------------------------------------
+ * Storage — access to the app's sandbox container.
+ * -----------------------------------------------------------
+ */
+
+/* Storage open modes. */
+#define ATRIUM_STORAGE_READ    0u
+#define ATRIUM_STORAGE_WRITE   1u  /* truncate-on-open */
+#define ATRIUM_STORAGE_APPEND  2u
+
+/* Negative return codes from atrium_container_path /
+ * atrium_storage_open. */
+#define ATRIUM_ERR_NO_CONTAINER    -1
+#define ATRIUM_ERR_BUF_TOO_SMALL   -2
+#define ATRIUM_ERR_IO              -3
+#define ATRIUM_ERR_INVALID_MODE    -4
+#define ATRIUM_ERR_INVALID_PATH    -5
+
+#include <stddef.h>
+
+/* Write the absolute path of the app's container into `buf`
+ * (NUL-terminated). Returns the path length (excluding NUL)
+ * on success, or a negative ATRIUM_ERR_*. */
+int32_t atrium_container_path(char* buf, size_t buf_len);
+
+/* Open a file at container-relative `path` with the given
+ * mode. Returns a normal file descriptor for use with libc
+ * read/write/close, or a negative ATRIUM_ERR_*. */
+int32_t atrium_storage_open(const char* path, uint32_t mode);
+
 #ifdef __cplusplus
 }
 #endif

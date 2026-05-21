@@ -113,7 +113,30 @@ pub fn launch(
     manifest: &Manifest,
     opts: &LaunchOptions,
 ) -> Result<SandboxedChild, Error> {
-    let profile = sbpl::render_profile_with(manifest, opts.log_socket);
+    // macOS `/var/folders/...` is a symlink to
+    // `/private/var/folders/...`; SBPL `subpath` does
+    // not follow the symlink, so the container path
+    // must be the canonical (resolved) one for
+    // sandbox-exec to match writes inside it.
+    let container_canon = opts.container_dir.canonicalize()
+        .unwrap_or_else(|_| opts.container_dir.to_path_buf());
+    let binary_canon = opts.binary_path.canonicalize()
+        .unwrap_or_else(|_| opts.binary_path.to_path_buf());
+    let log_socket_canon = opts.log_socket.map(|p| {
+        // Sockets sometimes don't canonicalize cleanly
+        // before they're bound. Fall back to the
+        // parent dir's canonical form + the basename
+        // so the grant still maps to the right file.
+        p.canonicalize().unwrap_or_else(|_| {
+            if let (Some(parent), Some(name)) = (p.parent(), p.file_name()) {
+                parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf()).join(name)
+            } else {
+                p.to_path_buf()
+            }
+        })
+    });
+
+    let profile = sbpl::render_profile_with(manifest, log_socket_canon.as_deref());
 
     let mut profile_file = tempfile::Builder::new()
         .prefix("insula-")
@@ -134,14 +157,20 @@ pub fn launch(
 
     let mut cmd = Command::new("sandbox-exec");
     cmd.arg("-f").arg(profile_file.path());
-    cmd.arg("-D").arg(format!("CONTAINER_DIR={}", opts.container_dir.display()));
-    cmd.arg("-D").arg(format!("BINARY_PATH={}", opts.binary_path.display()));
-    cmd.arg(opts.binary_path);
+    cmd.arg("-D").arg(format!("CONTAINER_DIR={}", container_canon.display()));
+    cmd.arg("-D").arg(format!("BINARY_PATH={}", binary_canon.display()));
+    cmd.arg(&binary_canon);
     for a in opts.args {
         cmd.arg(a);
     }
 
-    if let Some(sock) = opts.log_socket {
+    // Always expose the container directory so
+    // libatrium's atrium_storage_* surface can resolve
+    // relative paths. Use the canonical path so what
+    // libatrium sees matches what the SBPL grants.
+    cmd.env("ATRIUM_CONTAINER_DIR", &container_canon);
+
+    if let Some(sock) = log_socket_canon.as_deref() {
         cmd.env("ATRIUM_LOG_SOCKET", sock);
     }
 
