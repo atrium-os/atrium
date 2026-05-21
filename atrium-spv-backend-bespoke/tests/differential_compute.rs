@@ -1878,7 +1878,6 @@ fn differential_load_fadd_const_store_vec4() {
 /// path and the all-packed-vec4 FMin/FMax path both
 /// work.
 #[test]
-#[ignore = "bespoke per-lane FMax of loaded vec + const vec -- pending bug investigation"]
 fn differential_tonemap_with_direct_fmax() {
     use rspirv::binary::Assemble;
     use rspirv::spirv::{
@@ -2023,7 +2022,7 @@ fn differential_tonemap_without_clamp() {
 }
 
 #[test]
-#[ignore = "depends on per-lane FMax/FMin of loaded vec -- see differential_tonemap_with_direct_fmax"]
+#[ignore = "V-pool exhaustion -- codegen-synth lanes don't participate in last_use (broader RA issue, not specific to GLSL math)"]
 fn differential_tonemap_per_pixel_vec4() {
     let spv = build_tonemap_cs();
     let dir = TempDir::new().unwrap();

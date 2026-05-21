@@ -3619,9 +3619,25 @@ fn compute_last_use_flat(
             }
             Op::FAbs(x) | Op::FSqrt(x) => {
                 mark(x.id);
+                // Propagate lane-liveness for vector operands
+                // -- per-lane emit reads each element's V-reg
+                // at this inst's index, so the lanes must
+                // stay alive too.  Without this, the linear-
+                // scan reclaims element V-regs after the
+                // ConstVec inst that owns them and reassigns
+                // to later defs, producing stale data.
+                if let Some(lanes) = vec_lanes.get(&x.id).cloned() {
+                    for lid in &lanes { mark(*lid); }
+                }
             }
             Op::FMin(l, r) | Op::FMax(l, r) => {
                 mark(l.id); mark(r.id);
+                if let Some(lanes) = vec_lanes.get(&l.id).cloned() {
+                    for lid in &lanes { mark(*lid); }
+                }
+                if let Some(lanes) = vec_lanes.get(&r.id).cloned() {
+                    for lid in &lanes { mark(*lid); }
+                }
             }
             Op::FAdd(l, r) | Op::FSub(l, r)
             | Op::FMul(l, r) | Op::FDiv(l, r) => {
