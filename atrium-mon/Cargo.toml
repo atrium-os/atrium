@@ -1,0 +1,21 @@
+[package]
+name        = "atrium-mon"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+description = "Third sample Insula app, and the first that *composes* two platform ABIs. atrium-mon does a TCP probe against the host given on the command line (atrium_net_connect), then posts a notification with the result (atrium_notify_post). Demonstrates the platform shape: an app threading a real outbound network call through the broker AND surfacing structured user-visible output via the notification daemon, end-to-end in one binary."
+publish     = false
+
+[[bin]]
+name = "atrium-mon"
+path = "src/main.rs"
+
+[dependencies]
+libatrium = { path = "../libatrium" }
+libc      = "0.2"
+
+[dev-dependencies]
+insula-host-macos = { path = "../insula-host-macos" }
+insula-manifest   = { path = "../insula-manifest" }
+insula-bundle     = { path = "../insula-bundle" }
+tempfile          = "3"

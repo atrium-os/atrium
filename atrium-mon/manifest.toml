@@ -1,0 +1,29 @@
+# Insula manifest for atrium-mon.
+#
+# This sample composes the network and notification
+# ABIs: TCP-probe a host, then post the result as a
+# notification. The manifest declares both
+# capabilities — proves the install flow accepts a
+# multi-capability ask, and the per-app netd
+# enforcement still works when the app *also* talks to
+# praeco.
+
+[app]
+name = "com.atrium-os.atrium-mon"
+version = "0.1.0"
+sdk-version = "1.x"
+
+[bundle]
+form = "native"
+arches = ["aarch64-darwin"]
+entry = "bin/atrium-mon"
+
+[storage]
+data = "1MB"
+
+# raw-network so the sample can be pointed at arbitrary
+# host:port (e.g. local TCP echo servers in tests).
+# Real monitoring apps would scope [network].hosts to
+# the exact endpoints they monitor.
+[network]
+raw-network = true
