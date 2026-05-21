@@ -94,6 +94,8 @@ Commands:
 Flags:
   --allow-unsigned        Pass to `install` to skip signature
                           verification (development only).
+  --accept-changes        Pass to `install` to accept widened
+                          capability grants on re-install.
 
 Install root: $INSULA_INSTALL_ROOT (or ~/Library/Application Support/atrium-insula/)"
     );
@@ -121,12 +123,14 @@ fn resolve_install_root() -> PathBuf {
 // -----------------------------------------------------
 
 fn cmd_install(args: &[String], install_root: &Path) -> Result<(), String> {
-    // Parse: <bundle-dir-or-archive> [--allow-unsigned]
+    // Parse: <bundle-dir-or-archive> [--allow-unsigned] [--accept-changes]
     let mut src: Option<&str> = None;
     let mut allow_unsigned = false;
+    let mut accept_changes = false;
     for a in args {
         match a.as_str() {
             "--allow-unsigned" => allow_unsigned = true,
+            "--accept-changes" => accept_changes = true,
             other if !other.starts_with("--") => src = Some(other),
             other => {
                 return Err(format!("install: unknown flag '{}'", other));
@@ -183,6 +187,47 @@ fn cmd_install(args: &[String], install_root: &Path) -> Result<(), String> {
              --allow-unsigned for dev installs."
                 .to_string(),
         );
+    }
+
+    // Capability-diff consent on re-install. If the app
+    // is already installed, compute the diff between
+    // the old manifest and the new one. Widening grants
+    // require --accept-changes to proceed.
+    let existing_manifest_path = install_root
+        .join("apps")
+        .join(bundle.app_id())
+        .join("bundle")
+        .join("manifest.toml");
+    if existing_manifest_path.is_file() {
+        let old_src = std::fs::read_to_string(&existing_manifest_path)
+            .map_err(|e| format!(
+                "read existing manifest {}: {}",
+                existing_manifest_path.display(), e
+            ))?;
+        let old_manifest = insula_manifest::Manifest::parse(&old_src)
+            .map_err(|e| format!("parse existing manifest: {}", e))?;
+        let diff = insula_manifest::CapabilityDiff::between(
+            &old_manifest, &bundle.manifest,
+        );
+        if diff.is_widening() {
+            if accept_changes {
+                println!(
+                    "accepting widened capabilities ({} -> {}):",
+                    old_manifest.app.version, bundle.manifest.app.version,
+                );
+                println!("{}", diff.human_summary());
+            } else {
+                let mut msg = String::from(
+                    "this re-install widens capabilities the user has not consented to.\n",
+                );
+                msg.push_str(&diff.human_summary());
+                msg.push_str(
+                    "\n\nPass --accept-changes to proceed, or uninstall the existing \
+                     app first if you want a clean slate.",
+                );
+                return Err(msg);
+            }
+        }
     }
 
     let app = host::install(&bundle, install_root)

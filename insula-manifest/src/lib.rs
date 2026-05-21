@@ -42,9 +42,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+pub mod diff;
 mod error;
 mod sections;
 
+pub use diff::CapabilityDiff;
 pub use error::Error;
 pub use sections::{
     BackgroundPriority, BackgroundSection, CapabilitiesSection,
