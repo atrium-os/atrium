@@ -1250,9 +1250,17 @@ fn emit_function(
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal(
                         "ConvertUToF without result".into()))?;
-                let s_w = *ints.get(&s.id).ok_or_else(||
-                    BackendError::Internal(format!(
-                        "ConvertUToF operand {:?} not in ints", s.id)))?;
+                // Accept either an int W-reg (regular u32) or
+                // a bool W-reg (i32 0/1 from a float compare).
+                // Both live in W-regs and ucvtf treats them
+                // identically.  This enables synthesised
+                // lowerings like FSign / FStep which feed
+                // float-compare results into FConvert.
+                let s_w = ints.get(&s.id).copied()
+                    .or_else(|| bools.get(&s.id).copied())
+                    .ok_or_else(|| BackendError::Internal(format!(
+                        "ConvertUToF operand {:?} not in ints or bools",
+                        s.id)))?;
                 let d_v = alloc_vreg(&mut free_pool, &mut owners, &mut used_callee_saved_v,result.id)?;
                 a.emit(asm::ucvtf_s_from_w(d_v, s_w));
                 scalars.insert(result.id, d_v);

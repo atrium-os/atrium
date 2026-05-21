@@ -1600,6 +1600,78 @@ fn build_glsl_floor_ceil_trunc_cs() -> Vec<u8> {
 }
 
 #[test]
+fn differential_glsl_sign_and_step() {
+    // sign(-2.5) = -1, step(0.5, 0.7) = 1.
+    // Limited to one sign + one step because bespoke's bool
+    // W-pool is only W10..W12 (3 slots, non-recycling) and
+    // each sign consumes 2 bools (FOrdGt + FOrdLt).
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let std_450 = b.ext_inst_import("GLSL.std.450");
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let f32_ty = b.type_float(32, None);
+    let void_fn = b.type_function(void, vec![]);
+    let rt_arr = b.type_runtime_array(f32_ty);
+    b.decorate(rt_arr, Decoration::ArrayStride,
+        vec![rspirv::dr::Operand::LiteralBit32(4)]);
+    let s = b.type_struct(vec![rt_arr]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_f = b.type_pointer(None, StorageClass::StorageBuffer, f32_ty);
+    let ssbo  = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    let c_neg2_5 = b.constant_bit32(f32_ty, (-2.5f32).to_bits());
+    let c_zero_f = b.constant_bit32(f32_ty,  0.0f32.to_bits());
+    let c_three  = b.constant_bit32(f32_ty,  3.0f32.to_bits());
+    let c_half   = b.constant_bit32(f32_ty,  0.5f32.to_bits());
+    let c_0_3    = b.constant_bit32(f32_ty,  0.3f32.to_bits());
+    let c_0_7    = b.constant_bit32(f32_ty,  0.7f32.to_bits());
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let s_neg = b.ext_inst(f32_ty, None, std_450, 6,
+        vec![rspirv::dr::Operand::IdRef(c_neg2_5)]).unwrap();
+    let step_hi = b.ext_inst(f32_ty, None, std_450, 48,
+        vec![rspirv::dr::Operand::IdRef(c_half),
+             rspirv::dr::Operand::IdRef(c_0_7)]).unwrap();
+    let _ = (c_zero_f, c_three, c_0_3); // unused in trimmed test
+    let vs = [s_neg, step_hi];
+    for (i, v) in vs.iter().enumerate() {
+        let ci = b.constant_bit32(u32_ty, i as u32);
+        let d = b.access_chain(ptr_f, None, ssbo, vec![c_zero, ci]).unwrap();
+        b.store(d, *v, None, vec![]).unwrap();
+    }
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spv = Vec::with_capacity(words.len() * 4);
+    for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+    let dir = TempDir::new().unwrap();
+    let mut b_buf = vec![0u8; 32];
+    let mut c_buf = vec![0u8; 32];
+    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    assert_eq!(b_buf, c_buf, "diverge on sign/step");
+    let read = |i: usize| -> f32 {
+        f32::from_le_bytes(b_buf[i*4..i*4+4].try_into().unwrap())
+    };
+    assert_eq!(read(0), -1.0, "sign(-2.5) = -1");
+    assert_eq!(read(1),  1.0, "step(0.5, 0.7) = 1");
+}
+
+#[test]
 fn differential_glsl_reflect() {
     use rspirv::binary::Assemble;
     use rspirv::spirv::{

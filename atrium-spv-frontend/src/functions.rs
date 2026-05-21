@@ -1673,28 +1673,43 @@ fn translate_inst(
                     Op::FMin(mid, hi)
                 }
                 6 => {
-                    // FSign(x) ≡ x == 0 ? 0 : (x < 0 ? -1 : 1)
-                    //          ≡ clamp(x*1e30, -1, 1) is one trick;
-                    //          easier: max(-1, min(1, x)) doesn't
-                    //          work for x near zero.
-                    //          Cleanest synthesis: (x>0)-(x<0) via
-                    //          two FOrd compares -> u32 bool -> f32.
-                    //
-                    // For initial scope, synthesise as:
-                    //   gt = x > 0 ? 1.0 : 0.0
-                    //   lt = x < 0 ? 1.0 : 0.0
-                    //   sign = gt - lt
-                    // This handles +0 and -0 as 0 (per GLSL spec).
-                    // But our backends don't expose FOrd-to-float
-                    // cheaply yet -- skip until needed.  For now
-                    // synthesise the simpler:
-                    //   sign = clamp(x * BIG, -1, 1)
-                    // which is correct for normal inputs but
-                    // would mis-handle inf/NaN.  Bigger arc;
-                    // unsupported for now.
-                    return Err(FrontendError::Unsupported(
-                        "GLSL.std.450 FSign not supported yet \
-                         (compare-to-bool-to-float lowering queued)".into()));
+                    // FSign(x) ≡ (x > 0) - (x < 0).  Cleanly
+                    // handles +/-0 (both yield 0) and normal
+                    // signed values.  Synthesised as:
+                    //   gt    = FOrdGt(x, 0.0)       // i32 0/1
+                    //   lt    = FOrdLt(x, 0.0)       // i32 0/1
+                    //   gt_f  = ConvertUToF(gt)      // 0.0 or 1.0
+                    //   lt_f  = ConvertUToF(lt)      // 0.0 or 1.0
+                    //   sign  = FSub(gt_f, lt_f)     // -1.0, 0.0, +1.0
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let push_inst = |op: Op, ty: Type,
+                                     insts: &mut Vec<Inst>,
+                                     next_value_id: &mut u32| -> Value {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let val = Value { id, ty };
+                        insts.push(Inst {
+                            op, result: Some(val.clone()),
+                            source_spirv_offset,
+                        });
+                        val
+                    };
+                    let zero = push_inst(
+                        Op::ConstFloat { value: 0.0, kind: atrium_spv_ir::FloatKind::F32 },
+                        Type::F32, insts, next_value_id);
+                    let gt = push_inst(
+                        Op::FOrdGt(x.clone(), zero.clone()),
+                        Type::U32, insts, next_value_id);
+                    let lt = push_inst(
+                        Op::FOrdLt(x, zero),
+                        Type::U32, insts, next_value_id);
+                    let gt_f = push_inst(
+                        Op::ConvertUToF(gt), Type::F32, insts, next_value_id);
+                    let lt_f = push_inst(
+                        Op::ConvertUToF(lt), Type::F32, insts, next_value_id);
+                    Op::FSub(gt_f, lt_f)
                 }
                 71 => {
                     // Reflect(I, N) ≡ I - 2 * dot(N, I) * N
@@ -1879,10 +1894,26 @@ fn translate_inst(
                     Op::FSub(x, floor_x)
                 }
                 48 => {
-                    // Step(edge, x) ≡ x < edge ? 0.0 : 1.0.
-                    // Without FOrd-to-float lowering: skip for now.
-                    return Err(FrontendError::Unsupported(
-                        "GLSL.std.450 Step not supported yet".into()));
+                    // Step(edge, x) ≡ x < edge ? 0.0 : 1.0
+                    //              ≡ float(x >= edge).
+                    let edge_id = expect_id(&spv_inst.operands, 2)?;
+                    let x_id    = expect_id(&spv_inst.operands, 3)?;
+                    let edge = resolve_value(edge_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let ge = {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let val = Value { id, ty: Type::U32 };
+                        insts.push(Inst {
+                            op: Op::FOrdGe(x, edge),
+                            result: Some(val.clone()),
+                            source_spirv_offset,
+                        });
+                        val
+                    };
+                    Op::ConvertUToF(ge)
                 }
                 46 => {
                     // FMix(x, y, a) ≡ x + a*(y - x).
