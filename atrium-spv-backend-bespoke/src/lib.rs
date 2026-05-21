@@ -251,10 +251,23 @@ pub fn compile_blob(module: &Module, target: Target)
 fn emit_function(
     func: &Function,
 ) -> Result<(Vec<u8>, Vec<(u32, u32)>), BackendError> {
-    // Fragment + Vertex are supported; Compute lands later.
+    // Fragment + Vertex are supported.  Compute returns
+    // `BackendError::Unsupported` -- atrium-spv-compile's
+    // bespoke-first / Cranelift-fallback dispatch catches
+    // this and routes Compute through Cranelift instead.
+    // Implementing native bespoke compute is a perf-only
+    // arc (correctness already lives in Cranelift): it
+    // requires the AAPCS64 9-param Compute signature
+    // (uniforms, push_constants, out_buffer, wg_id[3],
+    // local_id[3] with the 9th arg on the stack),
+    // Op::LoadBuiltin codegen reading from XR3..XR8 + the
+    // stack slot, and a (Compute, StorageBuffer) ->
+    // out_buffer mapping for SSBO stores.  Queued as a
+    // future ARM64 codegen sub-project.
     if !matches!(func.stage, ShaderStage::Fragment | ShaderStage::Vertex) {
         return Err(BackendError::Unsupported(format!(
-            "stage {:?} not yet supported", func.stage)));
+            "stage {:?} not yet supported by bespoke backend; \
+             routed through Cranelift fallback", func.stage)));
     }
 
     let mut a = asm::Asm::new();
