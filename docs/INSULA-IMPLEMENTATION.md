@@ -2,7 +2,7 @@
 
 **Branch:** `claude/romantic-rubin-42085b`
 **Last updated:** 2026-05-21
-**Phase:** M1A (Foundation) complete; early M1B (platform services + auto-spawn UX) substantial.
+**Phase:** M1A (Foundation) complete; M1B (service catalogue MVP minus Pergola) substantially complete — five libatrium ABI surfaces, four backing daemons.
 
 This document orients a reader landing fresh in the
 branch. For the design corpus see [`spec/insula.md`](spec/insula.md)
@@ -37,35 +37,46 @@ What this exercises end-to-end:
 - **App** (a real Rust binary) statically links **libatrium**
   and calls its C ABI: `atrium_init`, `atrium_log`,
   `atrium_container_path`, `atrium_storage_open`,
-  `atrium_exit`.
+  `atrium_exit` — plus `atrium_keychain_pubkey`,
+  `atrium_keychain_sign`, `atrium_net_connect`,
+  `atrium_notify_post` available for apps that need them.
 - **libatrium** routes `atrium_log` via real **Aqueduct**
   framing on `CLASS_LOG=10` to **insula-logd** running in
   the background.
 - **insula-logd** decodes the envelope, writes an
   ISO-8601-stamped line into its log file.
-- **vestibulum-macos** is ready alongside on
-  `CLASS_VESTIBULUM=11`, mints ed25519 keypairs on demand,
-  signs challenges; its signature verifies under the
-  matching public key (test-asserted).
-- **insula-cli** auto-spawns both daemons under
+- **vestibulum-macos** on `CLASS_VESTIBULUM=11` mints
+  ed25519 keypairs on demand, signs challenges; signatures
+  verify under returned pubkeys (test-asserted), keys
+  persist across daemon restart.
+- **atrium-netd-macos** on `CLASS_NET=12` accepts CONNECT
+  requests, validates against an allowlist, resolves DNS,
+  opens TCP, byte-proxies between the app's local socket
+  and the upstream.
+- **praeco-macos** on `CLASS_NOTIFY=3` accepts
+  POST_NOTIFICATION, mints monotonic ids, appends to its
+  notifications log.
+- **insula-cli** auto-spawns all four daemons under
   `<install_root>/run/`, manages their pid files, threads
   the socket paths into the launched child's environment.
 
 ## Crate layout
 
-Eight crates at the repo root. Each is its own `Cargo.toml`;
+Ten crates at the repo root. Each is its own `Cargo.toml`;
 the repo has no top-level workspace by convention.
 
 | Crate | Purpose | LoC (src + tests) |
 |---|---|---|
 | [`insula-manifest`](../insula-manifest/) | TOML parser for the full Insula manifest spec | ~700 |
 | [`insula-bundle`](../insula-bundle/) | On-disk bundle reader + validator | ~250 |
-| [`libatrium`](../libatrium/) | Platform C ABI (cdylib + rlib + staticlib) | ~700 |
-| [`insula-host-macos`](../insula-host-macos/) | macOS host adapter: SBPL gen, install, launch | ~900 |
-| [`insula-hello`](../insula-hello/) | Demo Insula app + manifest | ~150 |
-| [`insula-cli`](../insula-cli/) | `insula install / launch / list / info / uninstall / daemons` | ~700 |
+| [`libatrium`](../libatrium/) | Platform C ABI (cdylib + rlib + staticlib) | ~1100 |
+| [`insula-host-macos`](../insula-host-macos/) | macOS host adapter: SBPL gen, install, launch | ~950 |
+| [`insula-hello`](../insula-hello/) | Demo Insula app + manifest | ~200 |
+| [`insula-cli`](../insula-cli/) | `insula install / launch / list / info / uninstall / daemons` | ~750 |
 | [`insula-logd`](../insula-logd/) | Aqueduct log-forwarding daemon | ~300 |
-| [`vestibulum-macos`](../vestibulum-macos/) | ed25519 keychain daemon | ~250 |
+| [`vestibulum-macos`](../vestibulum-macos/) | ed25519 keychain daemon (disk-backed) | ~450 |
+| [`atrium-netd-macos`](../atrium-netd-macos/) | Network broker (allowlist + byte proxy) | ~400 |
+| [`praeco-macos`](../praeco-macos/) | Notifications daemon | ~300 |
 
 ## Spec → implementation mapping
 
@@ -75,12 +86,14 @@ the repo has no top-level workspace by convention.
 | `insula.md` §3.1 (bundle format) | `insula-bundle/src/lib.rs` |
 | `insula.md` §4 (sandbox + network) | `insula-host-macos/src/sbpl.rs` + `src/launch.rs` |
 | `insula.md` §5.1 (manifest schema) | `insula-manifest/src/lib.rs` + `src/sections.rs` |
+| `insula.md` §4.2 (network broker) | `atrium-netd-macos/src/main.rs` + libatrium `atrium_net_connect` |
 | `insula.md` §11.5 (push delivery) | (no — deferred) |
 | `insula.md` §13.3 (per-service keypairs) | `vestibulum-macos/src/main.rs` + libatrium `atrium_keychain_*` |
 | `insula.md` §15.2 (per-app storage) | libatrium `atrium_container_path` + `atrium_storage_open`; container provisioning in `insula-host-macos/src/install.rs` |
+| `insula.md` §20 (notifications) | `praeco-macos/src/main.rs` + libatrium `atrium_notify_post` |
 | `insula-host-macos.md` §2 (SBPL generation) | `insula-host-macos/src/sbpl.rs` |
 | `insula-host-macos.md` §10 (bundle format on macOS) | `insula-host-macos/src/install.rs` (no `.app` wrapping yet) |
-| `aqueduct.md` opcode-class registry | `aqueduct/src/classes.rs` — `CLASS_LOG=10`, `CLASS_VESTIBULUM=11` added |
+| `aqueduct.md` opcode-class registry | `aqueduct/src/classes.rs` — `CLASS_LOG=10`, `CLASS_VESTIBULUM=11`, `CLASS_NET=12` added; `CLASS_NOTIFY=3` reused |
 
 ## Architecture realized
 
@@ -92,23 +105,28 @@ the repo has no top-level workspace by convention.
         │                          │                       │
         ▼ install                   ▼ launch                ▼ daemons
 ┌──────────────────┐    ┌────────────────────────┐    auto-spawn:
-│ insula-bundle    │    │  insula-host-macos     │   ┌──────────────┐
-│ + insula-manifest│    │  - SBPL gen            │   │ insula-logd  │
-└──────────────────┘    │  - install + launch    │   ├──────────────┤
-                        │  - canonical paths     │   │ vestibulum-  │
-                        └────────────────────────┘   │ macos        │
-                                    │                └──────────────┘
+│ insula-bundle    │    │  insula-host-macos     │   ┌─────────────────┐
+│ + insula-manifest│    │  - SBPL gen            │   │ insula-logd     │
+└──────────────────┘    │  - install + launch    │   │ vestibulum-     │
+                        │  - canonical paths     │   │   macos         │
+                        │  - 4 daemon sockets    │   │ atrium-netd-    │
+                        │    threaded into env   │   │   macos         │
+                        └────────────────────────┘   │ praeco-macos    │
+                                    │                └─────────────────┘
                             ┌───────┴───────┐                ▲
                             ▼   sandbox-exec │                │
                         ┌───────────────────┐│  Aqueduct      │
-                        │   Insula app      ││  CLASS_LOG     │
-                        │   (insula-hello)  ││  CLASS_VESTIBULUM
-                        │                   ││                │
-                        │ ┌───────────────┐ │└────────────────┘
-                        │ │  libatrium    │─┘
-                        │ │ (init/log/    │
-                        │ │  exit/storage │
-                        │ │ /keychain)    │
+                        │   Insula app      ││  CLASS_LOG=10  │
+                        │   (insula-hello)  ││  CLASS_VESTIBULUM=11
+                        │                   ││  CLASS_NET=12  │
+                        │ ┌───────────────┐ ││  CLASS_NOTIFY=3│
+                        │ │  libatrium    │─┘└────────────────┘
+                        │ │ init / log /  │
+                        │ │ exit          │
+                        │ │ storage       │ (in-process; container fd)
+                        │ │ keychain      │  → vestibulum-macos
+                        │ │ net           │  → atrium-netd-macos
+                        │ │ notify        │  → praeco-macos
                         │ └───────────────┘
                         └───────────────────┘
                           sandboxed by App Sandbox
@@ -154,12 +172,13 @@ $INSULA daemons down
 
 ## Testing
 
-71 tests pass across all 8 crates on this macOS host.
+83 tests pass across all 10 crates on this macOS host.
 
 ```sh
 for c in insula-manifest insula-bundle libatrium \
          insula-host-macos insula-hello insula-cli \
-         insula-logd vestibulum-macos; do
+         insula-logd vestibulum-macos \
+         atrium-netd-macos praeco-macos; do
   cargo test --manifest-path "$c/Cargo.toml"
 done
 ```
@@ -175,7 +194,9 @@ Test distribution:
 | insula-hello | 3 | Bundle parses; install+run via host adapter |
 | insula-cli | 11 | All subcommands + auto-spawn + logd integration |
 | insula-logd | 3 | Daemon decodes Aqueduct messages + writes log file |
-| vestibulum-macos | 5 | ed25519 keychain roundtrip incl. signature verify |
+| vestibulum-macos | 10 | ed25519 keychain roundtrip incl. signature verify, persistence across restart |
+| atrium-netd-macos | 4 | Real TCP-bridge through broker, allowlist denial, graceful degraded |
+| praeco-macos | 3 | Notification posts log + monotonic ids + degraded |
 
 The *load-bearing* integration tests (the ones that prove
 the design isn't just on paper):
@@ -201,15 +222,35 @@ the design isn't just on paper):
   via libatrium; verifies the returned signature under the
   returned pubkey using ed25519-dalek's `Verifier` trait.
 
+- `vestibulum-macos/tests/keychain_roundtrip.rs::keys_survive_daemon_restart`
+  — spawn daemon, mint key, KILL the daemon process,
+  spawn fresh daemon on same keystore, sign with the
+  same service; signature must verify under the
+  ORIGINAL pubkey. The persistence load-bearer.
+
+- `atrium-netd-macos/tests/network_roundtrip.rs::connect_through_broker_reaches_tcp_echo_server`
+  — spawn broker, spawn local TCP echo server, call
+  `atrium_net_connect` via libatrium, use the returned fd
+  as a TcpStream, bytes round-trip end-to-end. Proves the
+  byte-proxy actually proxies.
+
+- `praeco-macos/tests/notification_roundtrip.rs::post_returns_id_and_logs_record`
+  — call `atrium_notify_post` via libatrium, verify the
+  daemon assigns an id, returns it, and appends the
+  structured record.
+
 ## v0 limitations (documented)
 
 - **No bundle signing.** Bundles are unsigned in v0;
   `manifest.signature` is unused. Per spec §3.1 and
   `insula-host-macos.md` §10.3 — signing + notarization
   are Phase 1C work.
-- **In-memory vestibulum keystore.** Keys lost on daemon
-  restart. Persistent storage via macOS Keychain Services
-  is `vestibulum.md` §3.1 future work.
+- **Vestibulum keystore is plaintext on disk.** Keys
+  survive daemon restart (real persistence) but the
+  `.key` files are unencrypted ed25519 secrets. macOS
+  Keychain Services wrapping is `vestibulum.md` §3.1
+  future work. Marked with `TODO(vestibulum-secure-
+  storage)` at every write site.
 - **`sandbox-exec` not `sandbox_init_with_parameters`.**
   Using Apple's supported CLI tool avoids private-SPI
   coupling. Per-unix-socket SBPL grants don't work via
@@ -219,12 +260,20 @@ the design isn't just on paper):
   `(allow network-outbound)` is the workable grant.
   Tighter posture lives behind direct `sandbox_init`
   (private SPI), post-v0.
-- **Network broker absent.** `[network]` host allowlist
-  is in the manifest format but no daemon enforces it.
-  `atrium_net_connect` ABI not yet defined. Per
-  `insula.md` §4.2 status caveat.
-- **No notifications.** Praeco-shim daemon not yet
-  written; `atrium_notify_*` ABI not yet defined.
+- **Network broker is broker-wide, not per-app.**
+  `atrium-netd-macos` reads `$INSULA_NETD_ALLOWED_HOSTS`
+  at startup and applies it to every connection. The
+  spec intends per-app enforcement keyed off the app's
+  `[network]` manifest section. Closing this gap
+  requires kernel-attested peer identification
+  (SO_PEERCRED / LOCAL_PEERPID on macOS) + manifest
+  lookup keyed by executable path.
+- **UDP unsupported in the broker.** TCP only; the
+  ABI accepts `ATRIUM_NET_UDP` but the daemon returns
+  PROTO_UNSUPPORTED.
+- **Praeco routes to a file, not to UserNotifications.**
+  Wire shape is correct; backend swap to the macOS
+  Notification Center is future polish.
 - **No Pergola wire emission.** The Pergola crate exists
   with view/node/layout, but wire emission to a Fresco
   server is phase-4 work in Pergola itself. Insula apps
@@ -252,7 +301,14 @@ none of them invalidates the current shape.
 
 ## Commit history of the implementation effort
 
+22 commits, oldest at the bottom:
+
 ```
+2dd0a93 praeco-macos: notifications daemon + atrium_notify_post
+06866a7 insula-cli + host-macos: auto-spawn atrium-netd-macos too
+b79da55 atrium-netd-macos: network broker daemon + atrium_net_connect ABI
+0ffbe19 vestibulum-macos: disk-backed keystore -- keys survive daemon restart
+108e18e docs/INSULA-IMPLEMENTATION: status doc for the implementation work
 ffc6fac insula-cli: auto-spawn daemons + daemons up/down/status
 5c5f83f vestibulum-macos: ed25519 keychain daemon + atrium_keychain_* ABI
 2ba7205 libatrium + host-macos: atrium_container_path + atrium_storage_open + canonical-path fix
@@ -278,25 +334,29 @@ b651f13 insula-manifest: initial skeleton -- parse [app] + [bundle]
   capability shape derived from a TOML manifest.
 - **§7.2 "is Artifex compelling?"** — not yet attempted.
   Pergola wire emission is the blocker.
-- **§7.3 "is the platform real?"** — partial. Two real
-  daemons run real Aqueduct traffic. Real ed25519 signatures
-  exchanged. Real sandboxed file I/O. The platform shape is
-  proven at the smallest scope; "real" in the
-  developer-beta sense needs the Pergola path.
+- **§7.3 "is the platform real?"** — substantially yes.
+  Four daemons running real Aqueduct traffic. Real ed25519
+  signatures, real TCP byte-proxy, real notification ids,
+  real sandboxed file I/O, real key persistence across
+  daemon restart. The platform shape is proven at the
+  smallest scope; "real" in the developer-beta sense
+  still needs the Pergola path for windowed UI.
 
 ## What to build next, in order
 
 1. **Pergola wire emission** (the M1C blocker, per ROADMAP-INSULA §1.3).
    Until this lands, no Insula app can open a window.
-2. **Network broker** — close `insula.md` §4.2 status caveat
-   with a real daemon that enforces hostname allowlists.
-3. **`atrium_notify_*` + Praeco-shim** — third platform
-   service; pattern is repeatable now that the
-   logd/vestibulum-macos shape exists.
-4. **Persistent vestibulum keystore** — file-backed or
-   macOS-Keychain-backed.
-5. **Bundle signing** — minisign-style as a first pass per
+2. **Per-app netd enforcement** — close the broker-wide-
+   allowlist v0 limitation by identifying the calling app
+   via SO_PEERCRED → executable path → manifest lookup,
+   then enforce the app's `[network]` section.
+3. **Persistent vestibulum keystore encryption** — wrap
+   the `.key` files via macOS Keychain Services per
+   `vestibulum.md` §3.1.
+4. **Bundle signing** — minisign-style as a first pass per
    `atrium-pkg.md`.
+5. **Tabellarius push delivery** — `insula.md` §11.5 isn't
+   started; pattern is well-established now.
 
 Each of these is one or two commits given the current
 shape; the foundation underneath is in place.
