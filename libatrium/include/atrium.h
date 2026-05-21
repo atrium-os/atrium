@@ -97,6 +97,28 @@ int32_t atrium_keychain_sign(
     const uint8_t* challenge, size_t challenge_len,
     uint8_t* sig_out, size_t sig_out_len);
 
+/* -----------------------------------------------------------
+ * Network — outbound connections via the broker
+ * (atrium-netd-macos). Returned fd is byte-proxied by the
+ * broker to an upstream TCP socket.
+ * -----------------------------------------------------------
+ */
+
+#define ATRIUM_NET_TCP   0u
+#define ATRIUM_NET_UDP   1u  /* reserved; v0 broker does not yet implement */
+
+#define ATRIUM_ERR_NO_NETD       -20
+#define ATRIUM_ERR_NETD_DENIED   -21
+#define ATRIUM_ERR_NETD_DNS      -22
+#define ATRIUM_ERR_NETD_CONNECT  -23
+#define ATRIUM_ERR_NETD_RPC      -24
+
+/* Open an outbound connection to host:port via the broker.
+ * Returns the OS file descriptor (a unix socket byte-proxied
+ * to the upstream TCP connection by the daemon), suitable for
+ * read(2) / write(2) / close(2). Negative on error. */
+int32_t atrium_net_connect(const char* host, uint16_t port, uint32_t proto);
+
 #ifdef __cplusplus
 }
 #endif

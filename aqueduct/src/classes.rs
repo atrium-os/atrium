@@ -87,6 +87,26 @@ pub const CLASS_LOG:       u8 = 10;
 ///       response: 64-byte ed25519 signature
 pub const CLASS_VESTIBULUM: u8 = 11;
 
+/// Insula network broker — the Insula-introduced layer above
+/// atrium-netd's coarse per-jail policy (see
+/// `docs/spec/insula.md` §4.2 status caveat). Apps call
+/// CONNECT through libatrium's `atrium_net_connect`; the
+/// broker enforces hostname-level policy from the app's
+/// manifest, resolves DNS, and bridges bytes between the
+/// app's local socket and the TCP connection.
+///
+/// Ops:
+///   0 = CONNECT_REQUEST
+///       payload: [u8 proto (0=TCP, 1=UDP) | u16 port LE |
+///                utf8 hostname]
+///       response: 1-byte status (0 = OK, !=0 = error code)
+///       After OK, the same Aqueduct connection switches to
+///       byte-proxy mode: subsequent bytes the app writes are
+///       forwarded to the underlying TCP, bytes from the TCP
+///       are forwarded to the app. The Aqueduct envelope is
+///       only used for the initial CONNECT handshake.
+pub const CLASS_NET:       u8 = 12;
+
 /// Smoke-test / fuzzing service. Not part of the production
 /// surface; used by aqueduct-echo and unit tests.
 pub const CLASS_ECHO:      u8 = 63;
@@ -110,6 +130,7 @@ pub fn class_name(c: u8) -> &'static str {
         CLASS_GPU        => "gpu",
         CLASS_LOG        => "log",
         CLASS_VESTIBULUM => "vestibulum",
+        CLASS_NET        => "net",
         CLASS_ECHO       => "echo",
         c if c >= CLASS_VENDOR_BASE => "vendor",
         _ => "reserved",

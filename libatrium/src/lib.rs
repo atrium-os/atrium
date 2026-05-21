@@ -35,8 +35,8 @@ use std::os::raw::{c_char, c_int, c_uint};
 use std::sync::Mutex;
 
 use aqueduct::Connection;
-use aqueduct::classes::{CLASS_LOG, CLASS_VESTIBULUM};
-use aqueduct::envelope::flag;
+use aqueduct::classes::{CLASS_LOG, CLASS_NET, CLASS_VESTIBULUM};
+use aqueduct::envelope::{flag, Header};
 
 /// Lazily-initialized platform connection. None until
 /// [`atrium_init`] runs; populated to `Some(conn)` if the
@@ -459,6 +459,151 @@ pub unsafe extern "C" fn atrium_keychain_pubkey(
     }
     std::ptr::copy_nonoverlapping(resp.as_ptr(), out, ATRIUM_KEYCHAIN_PUBKEY_LEN);
     ATRIUM_KEYCHAIN_PUBKEY_LEN as c_int
+}
+
+// =====================================================
+// Network — outbound connections via the broker
+// (atrium-netd-macos). The connection returned to the
+// app is a unix-domain socket that byte-proxies to the
+// underlying TCP; the daemon manages the actual TCP
+// socket. The app uses the returned fd with normal
+// libc read(2) / write(2) / close(2).
+// =====================================================
+
+/// Network protocol: TCP.
+pub const ATRIUM_NET_TCP: c_uint = 0;
+/// Network protocol: UDP. (v0 broker does not yet
+/// implement UDP; the constant is reserved.)
+pub const ATRIUM_NET_UDP: c_uint = 1;
+
+/// Errors specific to the network broker.
+pub const ATRIUM_ERR_NO_NETD: c_int = -20;
+/// Broker rejected the request (denied, protocol
+/// unsupported, malformed, etc.). Detail in the broker's log.
+pub const ATRIUM_ERR_NETD_DENIED: c_int = -21;
+/// DNS resolution failed at the broker.
+pub const ATRIUM_ERR_NETD_DNS: c_int = -22;
+/// Upstream TCP connect failed at the broker.
+pub const ATRIUM_ERR_NETD_CONNECT: c_int = -23;
+/// Broker responded but the response was malformed.
+pub const ATRIUM_ERR_NETD_RPC: c_int = -24;
+
+/// Open an outbound network connection to `host:port`
+/// via the network broker.
+///
+/// Returns an OS file descriptor on success — the same
+/// shape `socket(2)` would return — usable with libc
+/// `read(2)` / `write(2)` / `close(2)`. Under the hood
+/// the fd is a unix-domain socket that the broker
+/// proxies to a real TCP connection; the app never
+/// sees the raw TCP socket.
+///
+/// `proto` is `ATRIUM_NET_TCP` or `ATRIUM_NET_UDP`.
+/// v0 broker supports TCP only.
+///
+/// Returns:
+///   - The fd on success.
+///   - `ATRIUM_ERR_NO_NETD` if no broker is reachable
+///     (`$ATRIUM_NETD_SOCKET` unset or connect refused).
+///   - `ATRIUM_ERR_NETD_DENIED` if the broker rejected
+///     the request (hostname not allowlisted, etc.).
+///   - `ATRIUM_ERR_NETD_DNS` / `_CONNECT` for upstream
+///     failures.
+///   - `ATRIUM_ERR_INVALID_PATH` if `host` is NULL or
+///     not valid UTF-8.
+///
+/// # Safety
+///
+/// `host` must be either NULL or a valid NUL-terminated
+/// UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn atrium_net_connect(
+    host: *const c_char,
+    port: u16,
+    proto: c_uint,
+) -> c_int {
+    if host.is_null() {
+        return ATRIUM_ERR_INVALID_PATH;
+    }
+    let host_str = match CStr::from_ptr(host).to_str() {
+        Ok(s) => s,
+        Err(_) => return ATRIUM_ERR_INVALID_PATH,
+    };
+    if proto != ATRIUM_NET_TCP && proto != ATRIUM_NET_UDP {
+        return ATRIUM_ERR_INVALID_PATH;
+    }
+
+    let Some(sock_path) = std::env::var_os("ATRIUM_NETD_SOCKET") else {
+        return ATRIUM_ERR_NO_NETD;
+    };
+
+    // Open the unix socket connection to the broker.
+    // We use std::os::unix::net::UnixStream directly
+    // rather than aqueduct::Connection because once
+    // CONNECT succeeds the channel switches to byte-
+    // proxy mode (no more aqueduct framing). We just
+    // hand-roll the envelope encode/decode for the
+    // single handshake.
+    use std::os::unix::net::UnixStream;
+    use std::io::{Read, Write};
+    use std::os::fd::IntoRawFd;
+
+    let mut stream =
+        match UnixStream::connect(std::path::Path::new(&sock_path)) {
+            Ok(s) => s,
+            Err(_) => return ATRIUM_ERR_NO_NETD,
+        };
+
+    // Build CONNECT_REQUEST payload: [u8 proto |
+    // u16 port LE | utf8 host].
+    let proto_byte: u8 = if proto == ATRIUM_NET_UDP { 1 } else { 0 };
+    let mut payload = Vec::with_capacity(3 + host_str.len());
+    payload.push(proto_byte);
+    payload.extend_from_slice(&port.to_le_bytes());
+    payload.extend_from_slice(host_str.as_bytes());
+
+    let header = Header::new(
+        CLASS_NET,
+        0, // OP_CONNECT_REQUEST
+        flag::RESPONSE_EXPECTED,
+        payload.len() as u32,
+    );
+    if stream.write_all(&header.encode()).is_err() {
+        return ATRIUM_ERR_NETD_RPC;
+    }
+    if stream.write_all(&payload).is_err() {
+        return ATRIUM_ERR_NETD_RPC;
+    }
+    // Don't flush on Mac — write_all already pushes.
+
+    // Read the response envelope.
+    let mut hdr_buf = [0u8; aqueduct::HEADER_LEN];
+    if stream.read_exact(&mut hdr_buf).is_err() {
+        return ATRIUM_ERR_NETD_RPC;
+    }
+    let resp_hdr = match Header::decode(&hdr_buf) {
+        Ok(h) => h,
+        Err(_) => return ATRIUM_ERR_NETD_RPC,
+    };
+    if resp_hdr.length != 1 {
+        return ATRIUM_ERR_NETD_RPC;
+    }
+    let mut status_byte = [0u8; 1];
+    if stream.read_exact(&mut status_byte).is_err() {
+        return ATRIUM_ERR_NETD_RPC;
+    }
+    match status_byte[0] {
+        0 => {
+            // OK — the broker is now byte-proxying.
+            // Hand the unix-socket fd to the caller;
+            // they use it as their network connection.
+            stream.into_raw_fd() as c_int
+        }
+        2 => ATRIUM_ERR_NETD_DENIED,
+        3 => ATRIUM_ERR_NETD_DNS,
+        4 => ATRIUM_ERR_NETD_CONNECT,
+        _ => ATRIUM_ERR_NETD_DENIED, // 1 / 5 / unknown
+    }
 }
 
 /// Sign `challenge` (`challenge_len` bytes) under the
