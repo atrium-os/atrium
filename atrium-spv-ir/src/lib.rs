@@ -796,6 +796,14 @@ pub struct Function {
     pub entry_block: BlockId,
     /// Block storage, keyed by id.
     pub blocks: HashMap<BlockId, Block>,
+    /// Compute-shader workgroup size (`LocalSize` SPIR-V
+    /// execution mode).  `None` for non-compute functions
+    /// and for compute functions that left LocalSize at its
+    /// implicit default; backends should treat `None` as
+    /// `(1, 1, 1)`.  Used by Op::LoadBuiltin to compute
+    /// `gl_GlobalInvocationID = WorkgroupId * LocalSize +
+    /// LocalInvocationID` at codegen time.
+    pub local_size: Option<(u32, u32, u32)>,
 }
 
 /// Shader stage.

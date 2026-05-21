@@ -356,6 +356,7 @@ fn emit_function(
 
         let mut translator = FnTranslator {
             stage: func.stage,
+            local_size: func.local_size,
             entry_block: entry,
             // Cache the param-index → Cranelift value
             // mapping once; ip-walk reads it for ptr-arg
@@ -620,6 +621,13 @@ fn collect_phi_args(
 /// SIMD ISel concerns.
 struct FnTranslator {
     stage: ShaderStage,
+    /// Compute `LocalSize` (workgroup size) from the SPIR-V
+    /// `OpExecutionMode`, threaded through by the frontend.
+    /// `None` for non-compute and for compute functions that
+    /// left LocalSize implicit; the backend folds this into
+    /// `gl_GlobalInvocationID` codegen (multiplying
+    /// WorkgroupId by LocalSize before adding LocalInvocationID).
+    local_size: Option<(u32, u32, u32)>,
     #[allow(dead_code)]
     entry_block: cranelift_codegen::ir::Block,
     params: Vec<ClifValue>,
@@ -774,19 +782,29 @@ impl FnTranslator {
                         ]);
                     }
                     (ShaderStage::Compute, BK::GlobalInvocationId) => {
-                        // gl_GlobalInvocationID = gl_WorkgroupID *
-                        // gl_WorkGroupSize + gl_LocalInvocationID.
-                        // We don't carry WorkGroupSize in the
-                        // current Compute ABI (it's a SPIR-V
-                        // ExecutionMode literal, not a runtime
-                        // param). For now compose without it,
-                        // i.e. treat WorkGroupSize as (1,1,1);
-                        // shaders that rely on a non-unit
-                        // WorkGroupSize need this to be threaded
-                        // through later.
+                        // gl_GlobalInvocationID =
+                        //   WorkgroupID * WorkGroupSize + LocalInvocationID
+                        //
+                        // WorkGroupSize comes from the SPIR-V
+                        // OpExecutionMode LocalSize, which the
+                        // frontend stamps onto func.local_size and
+                        // we cached on the FnTranslator. Missing
+                        // (non-compute, or compute that left
+                        // LocalSize implicit) -> default (1,1,1)
+                        // which folds the multiply away.
+                        let ls = self.local_size.unwrap_or((1, 1, 1));
+                        let ls_arr = [ls.0, ls.1, ls.2];
                         let lanes = (0..3).map(|i| {
-                            builder.ins().iadd(
-                                self.params[3 + i], self.params[6 + i])
+                            let wg = self.params[3 + i];
+                            let li = self.params[6 + i];
+                            if ls_arr[i] == 1 {
+                                builder.ins().iadd(wg, li)
+                            } else {
+                                let ls_c = builder.ins().iconst(
+                                    clif_types::I32, ls_arr[i] as i64);
+                                let scaled = builder.ins().imul(wg, ls_c);
+                                builder.ins().iadd(scaled, li)
+                            }
                         }).collect();
                         self.vectors.insert(result.id, lanes);
                     }

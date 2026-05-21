@@ -214,6 +214,8 @@ fn translate_one(
         .copied()
         .unwrap_or(BlockId(0));
 
+    let local_size = iface.local_sizes.get(&fn_id).copied();
+
     Ok(Function {
         name,
         stage,
@@ -221,6 +223,7 @@ fn translate_one(
         return_type,
         entry_block: entry_block_id,
         blocks,
+        local_size,
     })
 }
 

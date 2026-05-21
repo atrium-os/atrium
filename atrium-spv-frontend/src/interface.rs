@@ -69,6 +69,13 @@ pub struct InterfaceContext {
     /// of these variables into `Op::LoadBuiltin(kind)` rather
     /// than going through memory.
     pub builtin_vars: HashMap<Word, atrium_spv_ir::BuiltinKind>,
+    /// Per-function `LocalSize` SPIR-V execution mode, if
+    /// declared. Compute shaders set this via `OpExecutionMode
+    /// %main LocalSize x y z`; other stages don't have it.
+    /// The Function translator stamps this on each Function
+    /// in IR so the backend can fold it into
+    /// `gl_GlobalInvocationID` codegen.
+    pub local_sizes: HashMap<Word, (u32, u32, u32)>,
 }
 
 /// One member of an `OpTypeStruct` annotated with an
@@ -104,6 +111,33 @@ impl InterfaceContext {
             };
             ctx.entry_function_ids.insert(fn_id, ctx.entry_points.len());
             ctx.entry_points.push(entry);
+        }
+
+        // Execution modes -- pull LocalSize for compute
+        // entry points so the backend can fold it into
+        // gl_GlobalInvocationID codegen.
+        for inst in &module.execution_modes {
+            if inst.class.opcode != SpvOp::ExecutionMode { continue; }
+            let fn_id = read_id_ref(&inst.operands, 0)?;
+            let mode = match inst.operands.get(1) {
+                Some(Operand::ExecutionMode(m)) => *m,
+                _ => continue,
+            };
+            if mode == rspirv::spirv::ExecutionMode::LocalSize {
+                let x = match inst.operands.get(2) {
+                    Some(Operand::LiteralBit32(v)) => *v,
+                    _ => continue,
+                };
+                let y = match inst.operands.get(3) {
+                    Some(Operand::LiteralBit32(v)) => *v,
+                    _ => continue,
+                };
+                let z = match inst.operands.get(4) {
+                    Some(Operand::LiteralBit32(v)) => *v,
+                    _ => continue,
+                };
+                ctx.local_sizes.insert(fn_id, (x, y, z));
+            }
         }
 
         // Variables. Walk types_global_values for
