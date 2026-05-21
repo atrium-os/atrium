@@ -283,6 +283,94 @@ fn differential_dynamic_ssbo_index_writes_per_lane() {
     }
 }
 
+/// CS: `ssbo.data[gid_x + 4] = ssbo.data[gid_x] + 100`.
+/// With a pre-filled input of [10, 20, 30, 40] and gid_x in
+/// 0..4, both backends should produce identical buffers:
+/// input slice unchanged, output slice = [110, 120, 130, 140].
+/// Exercises Op::PtrOffsetDynamic on both the LOAD and STORE
+/// sides plus IAdd on the dynamic index.
+fn build_dyn_rmw_diff_cs() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let uvec3  = b.type_vector(u32_ty, 3);
+    let void_fn = b.type_function(void, vec![]);
+    let rt_arr = b.type_runtime_array(u32_ty);
+    b.decorate(rt_arr, Decoration::ArrayStride,
+        vec![rspirv::dr::Operand::LiteralBit32(4)]);
+    let s = b.type_struct(vec![rt_arr]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_u = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+    let ssbo = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_in_uvec3 = b.type_pointer(None, StorageClass::Input, uvec3);
+    let gid_var = b.variable(ptr_in_uvec3, None, StorageClass::Input, None);
+    b.decorate(gid_var, Decoration::BuiltIn,
+        vec![rspirv::dr::Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    let c_four = b.constant_bit32(u32_ty, 4);
+    let c_100  = b.constant_bit32(u32_ty, 100);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let gid = b.load(uvec3, None, gid_var, None, vec![]).unwrap();
+    let gid_x = b.composite_extract(u32_ty, None, gid, vec![0]).unwrap();
+    let src = b.access_chain(ptr_u, None, ssbo, vec![c_zero, gid_x]).unwrap();
+    let v = b.load(u32_ty, None, src, None, vec![]).unwrap();
+    let v_plus = b.i_add(u32_ty, None, v, c_100).unwrap();
+    let idx_out = b.i_add(u32_ty, None, gid_x, c_four).unwrap();
+    let dst = b.access_chain(ptr_u, None, ssbo, vec![c_zero, idx_out]).unwrap();
+    b.store(dst, v_plus, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![gid_var, ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn differential_dynamic_rmw_with_prefill() {
+    let spv = build_dyn_rmw_diff_cs();
+    let dir = TempDir::new().unwrap();
+    let prefill: Vec<u8> = [10u32, 20, 30, 40]
+        .iter().flat_map(|v| v.to_le_bytes()).collect();
+    let mut b_buf = vec![0u8; 64];
+    let mut c_buf = vec![0u8; 64];
+    b_buf[..16].copy_from_slice(&prefill);
+    c_buf[..16].copy_from_slice(&prefill);
+    let gids: Vec<(u32, u32, u32)> = (0..4).map(|i| (i, 0, 0)).collect();
+    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &gids);
+    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &gids);
+    assert_eq!(b_buf, c_buf,
+        "bespoke vs cranelift diverge on dynamic RMW:\n  \
+         bespoke   = {b_buf:?}\n  \
+         cranelift = {c_buf:?}");
+    // Sanity-check the actual computation result too.
+    let expected_out = [110u32, 120, 130, 140];
+    for i in 0..4 {
+        let off = (i + 4) * 4;
+        let v = u32::from_le_bytes(b_buf[off..off+4].try_into().unwrap());
+        assert_eq!(v, expected_out[i],
+            "slot {} should hold {}, got {v}", i + 4, expected_out[i]);
+    }
+}
+
 #[test]
 fn differential_six_binding_constant_store() {
     let spv = build_n_binding_constants(6);
