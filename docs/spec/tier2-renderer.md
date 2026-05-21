@@ -1031,18 +1031,17 @@ specifically supports:
 
 **Known gaps:**
 
-- V-pool exhaustion on chains of 5+ vec4 ops that share
-  Load-synth lanes (single ignored differential test).
-  Root cause traced (2026-05-21): OpVectorExtract aliases
-  the source vec's synth-lane V-reg into the result's
-  `scalars` entry, but doesn't transfer ownership in
-  `owners`.  An eager-expire on the source vec's lanes
-  would invalidate the alias.  Fix is either to copy the
-  lane value via `fmov_s` at extract time (one extra
-  instruction per extract; simple) or to extend the
-  liveness pre-pass so the source vec's last_use covers
-  every transitive use of its extracted lanes (more
-  complex, no extra instruction).
+- (closed 2026-05-21) V-pool exhaustion on chains of 5+
+  vec4 ops that share Load-synth lanes.  Fixed via the
+  copy-on-extract approach: OpVectorExtract now emits one
+  `mov v.16b` (f32) or `mov w` (i32) to copy into a fresh
+  register owned by the extract result, removing the
+  V-reg aliasing that previously prevented the source
+  vec's lanes from expiring.  The copy uses an ORR-form
+  move that target cores rename-eliminate (zero-latency),
+  so the runtime cost is approximately zero.  The
+  vec-lane synth-liveness expire pass then reclaims lane
+  V-regs when their TOP Value's last_use has passed.
 - The bespoke bool W-pool is 3 slots (W10..W12) with
   recycle-on-ConvertUToF; arbitrary-hole free-list lands
   if real workloads exceed the eager-free pattern.
