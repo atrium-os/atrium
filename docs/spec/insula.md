@@ -235,29 +235,74 @@ All of this is *better* than today's web version, and none
 of it requires the vendor to maintain a separate web
 codebase.
 
-### 0.6.4 The remaining edge case
+### 0.6.4 Vendor-hosted web access — the loop closes
 
-Honest accounting — one case where a "web version" still
-has some value:
+The cleanest answer for "I need to access my app from a
+non-Atrium machine I do not own" is **not** a separate web
+version of the app. It is a **website that serves a remote-
+rendered native session**.
 
-- **Genuinely transient access on a non-Atrium machine with
-  no Atrium-rendering client installed** — a library
-  computer, a hotel business center, a Chromebook the user
-  does not own.
+Mechanism:
 
-The mitigation: a **single, thin "Atrium remote viewer"
-web app** is a reasonable bridge for this case. It is *one*
-web codebase (a thin scenegraph renderer + input
-forwarder), not *N* (one per app). The user navigates to
-this one viewer, signs in, and connects to a remote Insula
-session running their actual apps.
+- The vendor compiles their app once for Atrium.
+- The vendor hosts Atrium servers running the real app.
+- The vendor's website (`excel.microsoft.com`, etc.) serves
+  a thin Atrium scenegraph renderer that runs in a browser
+  — a WASM/JS implementation of the Fresco rendering side
+  plus an input forwarder.
+- Visiting the URL: browser-side renderer connects to a
+  remote Insula session running the real native app on the
+  vendor's infrastructure.
 
-This collapses the industry's "every vendor ships a web
-version" pattern to "the platform ships one viewer for the
-no-Atrium-anywhere case." Same web technology, ~1000× less
-of it.
+What the user sees: "Excel in a browser tab." What
+Microsoft maintains: one native Excel codebase plus a
+hosting fleet — no second app to write.
 
-### 0.6.5 Why this matters beyond the design
+The web becomes a *transport for the Atrium experience*,
+not a *platform that competes with Atrium*.
+
+This is the Citrix Receiver / VMware Horizon model, but
+open, vendor-neutral, default for the platform, and
+integrated with Vestibulum identity for transparent sign-in.
+
+### 0.6.5 The "one codebase serves everywhere" pattern
+
+A single vendor binary reaches the entire user universe via
+three deployment topologies, all sharing the same code path
+underneath:
+
+| Topology | Renderer | Compute | Used for |
+|---|---|---|---|
+| Local | Local Fresco compositor | Local device | Daily use on the user's Atrium devices |
+| Remote → Atrium device | Remote Atrium device's compositor | Remote Atrium machine | User on their phone connecting to their desktop; thin client; collaborative session |
+| Remote → non-Atrium device | Browser-side scenegraph renderer (the web viewer) | Vendor server or user's home server | Library kiosk; friend's Chromebook; hotel business center |
+
+ONE codebase. The web becomes one of the renderers, not a
+parallel platform.
+
+Who hosts the remote-render backend is independent of who
+builds the app — three clean options:
+
+- **Vendor-hosted.** Microsoft hosts Atrium-Excel servers
+  behind `excel.microsoft.com`. Vendor pays compute,
+  controls update cadence. Closest to today's Office
+  Online.
+- **User-hosted.** User's home Atrium machine runs the
+  real app; the vendor's website (or any compatible web
+  viewer) is just a bootstrap that connects to the user's
+  own server. User pays effectively nothing; data never
+  leaves their network.
+- **Third-party cloud.** A separate provider rents
+  Atrium-server slices as a service ("your apps,
+  accessible from anywhere"). User picks their host; the
+  app's vendor is not involved.
+
+The user's *data location* is orthogonal to the *compute
+location*: data lives wherever the user keeps it (local
+Tessera, their cloud storage, the vendor's storage). The
+web conflates these; Insula does not.
+
+### 0.6.6 Why this matters beyond the design
 
 This is the strongest *pragmatic* (not aesthetic, not
 safety) argument for Insula:
