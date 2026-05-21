@@ -108,6 +108,14 @@ pub struct Tier2Backend {
     /// arc).  For the single-binding legacy path, this stays
     /// empty and callers read `last_compute_output` instead.
     last_compute_outputs_by_binding: Mutex<Vec<Vec<u8>>>,
+    /// Optional pre-fill bytes per binding, used by the
+    /// next dispatch.  The dispatcher copies these into the
+    /// freshly-allocated buffer for the matching binding
+    /// before invoking cs_main; missing entries (or shorter
+    /// ones than the buffer) leave the rest zeroed.  Used
+    /// by tests that need to verify the shader's read path
+    /// (RMW, parallel reductions, etc.).
+    compute_input_by_binding: Mutex<HashMap<u32, Vec<u8>>>,
     /// Per-dispatch SSBO size in bytes.  Default 4 KiB.
     compute_output_capacity: std::sync::atomic::AtomicUsize,
     submissions: AtomicU64,
@@ -301,6 +309,7 @@ impl Tier2Backend {
             cs_invocations: AtomicU64::new(0),
             last_compute_output: Mutex::new(None),
             last_compute_outputs_by_binding: Mutex::new(Vec::new()),
+            compute_input_by_binding: Mutex::new(HashMap::new()),
             compute_output_capacity: std::sync::atomic::AtomicUsize::new(4096),
             last_assembled_vertices: Mutex::new(None),
             presented_frames: Mutex::new(HashMap::new()),
@@ -507,6 +516,20 @@ impl Tier2Backend {
     pub fn compute_output_bytes_for_binding(&self, b: u32) -> Option<Vec<u8>> {
         let g = self.last_compute_outputs_by_binding.lock().unwrap();
         g.get(b as usize).cloned()
+    }
+
+    /// Stash bytes the next dispatch should pre-fill into
+    /// binding `b`'s output buffer before invoking
+    /// `cs_main`.  Multiple calls accumulate (one per
+    /// binding); the stash is *consumed* by the next
+    /// dispatch (cleared so a follow-up dispatch starts
+    /// from zero again).
+    ///
+    /// `bytes.len()` may be less than the dispatch capacity;
+    /// the remainder stays zero.  Bytes past the dispatch
+    /// capacity are silently truncated.
+    pub fn set_compute_input_for_binding(&self, b: u32, bytes: Vec<u8>) {
+        self.compute_input_by_binding.lock().unwrap().insert(b, bytes);
     }
 
     /// Set the per-dispatch output-buffer capacity (bytes).
@@ -1100,13 +1123,26 @@ impl Tier2Backend {
         // descriptor_table must outlive the dispatch loop --
         // out_ptr borrows from it for the multi-binding case.
         let mut descriptor_table: Vec<u64> = Vec::new();
+        let n_buffers_to_alloc = n_bindings.max(1) as usize;
+        per_binding = (0..n_buffers_to_alloc).map(|_| vec![0u8; cap]).collect();
+        // Apply pre-fill stash: copy bytes for each binding
+        // that has a registered input, then clear the stash
+        // so the next dispatch starts clean.
+        {
+            let mut stash = self.compute_input_by_binding.lock().unwrap();
+            for (binding, bytes) in stash.drain() {
+                let i = binding as usize;
+                if let Some(buf) = per_binding.get_mut(i) {
+                    let n = bytes.len().min(buf.len());
+                    buf[..n].copy_from_slice(&bytes[..n]);
+                }
+            }
+        }
         let out_ptr: *mut u8 = if n_bindings >= 2 {
-            per_binding = (0..n_bindings).map(|_| vec![0u8; cap]).collect();
             descriptor_table = per_binding.iter_mut()
                 .map(|buf| buf.as_mut_ptr() as u64).collect();
             descriptor_table.as_mut_ptr() as *mut u8
         } else {
-            per_binding = vec![vec![0u8; cap]];
             per_binding[0].as_mut_ptr()
         };
         let _ = descriptor_table;
