@@ -1696,6 +1696,73 @@ fn translate_inst(
                         "GLSL.std.450 FSign not supported yet \
                          (compare-to-bool-to-float lowering queued)".into()));
                 }
+                71 => {
+                    // Reflect(I, N) ≡ I - 2 * dot(N, I) * N
+                    // I and N are both vectors of the result type.
+                    let i_id = expect_id(&spv_inst.operands, 2)?;
+                    let n_id = expect_id(&spv_inst.operands, 3)?;
+                    let i_v = resolve_value(i_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let n_v = resolve_value(n_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    // dot(N, I) is a scalar matching result's
+                    // element type.
+                    use atrium_spv_ir::VecElement;
+                    let scalar_ty = match &result_ty {
+                        atrium_spv_ir::Type::Vec2(VecElement::F32)
+                        | atrium_spv_ir::Type::Vec3(VecElement::F32)
+                        | atrium_spv_ir::Type::Vec4(VecElement::F32) => Type::F32,
+                        other => return Err(FrontendError::Unsupported(format!(
+                            "Reflect with non-f32-vec result type {other:?}"))),
+                    };
+                    let d = {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let val = Value { id, ty: scalar_ty.clone() };
+                        insts.push(Inst {
+                            op: Op::Dot(n_v.clone(), i_v.clone()),
+                            result: Some(val.clone()),
+                            source_spirv_offset,
+                        });
+                        val
+                    };
+                    // 2.0 constant
+                    let two = {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let val = Value { id, ty: scalar_ty.clone() };
+                        insts.push(Inst {
+                            op: Op::ConstFloat { value: 2.0, kind: atrium_spv_ir::FloatKind::F32 },
+                            result: Some(val.clone()),
+                            source_spirv_offset,
+                        });
+                        val
+                    };
+                    let two_d = {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let val = Value { id, ty: scalar_ty };
+                        insts.push(Inst {
+                            op: Op::FMul(two, d),
+                            result: Some(val.clone()),
+                            source_spirv_offset,
+                        });
+                        val
+                    };
+                    // two_d * N (scalar * vec broadcast).
+                    let scaled_n = {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let val = Value { id, ty: result_ty.clone() };
+                        insts.push(Inst {
+                            op: Op::FMul(n_v, two_d),
+                            result: Some(val.clone()),
+                            source_spirv_offset,
+                        });
+                        val
+                    };
+                    Op::FSub(i_v, scaled_n)
+                }
                 69 => {
                     // Normalize(v) ≡ v / length(v).  Result has
                     // the same type as v (a vec).  This needs a
