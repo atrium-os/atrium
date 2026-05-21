@@ -782,6 +782,24 @@ impl FnTranslator {
                 self.pointers.insert(result.id, (param, new_off));
                 Ok(())
             }
+            Op::AtomicIAdd { ptr, value } => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "AtomicIAdd without result".to_string()))?;
+                let (ptr_v, ptr_off) = self.resolve_or_make_pointer(ptr)?;
+                let addend = *self.scalars.get(&value.id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "AtomicIAdd value {:?} not in scalars",
+                        value.id)))?;
+                let mflags = cranelift_codegen::ir::MemFlags::new();
+                let old = builder.ins().load(
+                    clif_types::I32, mflags, ptr_v, ptr_off);
+                let sum = builder.ins().iadd(old, addend);
+                builder.ins().store(mflags, sum, ptr_v, ptr_off);
+                // Spec returns the OLD value as the result.
+                self.scalars.insert(result.id, old);
+                Ok(())
+            }
             Op::PtrOffsetDynamic { base, index, stride } => {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal(

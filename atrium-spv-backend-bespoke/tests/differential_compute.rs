@@ -482,6 +482,78 @@ fn differential_multi_binding_plus_dynamic_index() {
     }
 }
 
+/// CS: atomicAdd(ssbo.counter, gid_x).  Per-invocation
+/// load-add-store sequence on the serial dispatcher --
+/// invoking with gid_x in 0..N should leave the counter
+/// at sum(0..N) = N*(N-1)/2.
+fn build_atomic_counter_diff_cs() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+        MemorySemantics, Scope,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let uvec3 = b.type_vector(u32_ty, 3);
+    let void_fn = b.type_function(void, vec![]);
+    let s = b.type_struct(vec![u32_ty]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_u = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+    let ssbo = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_in_uvec3 = b.type_pointer(None, StorageClass::Input, uvec3);
+    let gid_var = b.variable(ptr_in_uvec3, None, StorageClass::Input, None);
+    b.decorate(gid_var, Decoration::BuiltIn,
+        vec![rspirv::dr::Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    let c_scope = b.constant_bit32(u32_ty, Scope::Device as u32);
+    let c_sem   = b.constant_bit32(u32_ty,
+        MemorySemantics::ATOMIC_COUNTER_MEMORY.bits());
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let gid = b.load(uvec3, None, gid_var, None, vec![]).unwrap();
+    let gid_x = b.composite_extract(u32_ty, None, gid, vec![0]).unwrap();
+    let dst = b.access_chain(ptr_u, None, ssbo, vec![c_zero]).unwrap();
+    let _ = b.atomic_i_add(u32_ty, None, dst, c_scope, c_sem, gid_x).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![gid_var, ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn differential_atomic_iadd_accumulator() {
+    let spv = build_atomic_counter_diff_cs();
+    let dir = TempDir::new().unwrap();
+    let mut b_buf = vec![0u8; 16];
+    let mut c_buf = vec![0u8; 16];
+    let gids: Vec<(u32, u32, u32)> = (0..8).map(|i| (i, 0, 0)).collect();
+    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &gids);
+    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &gids);
+    assert_eq!(b_buf, c_buf,
+        "bespoke vs cranelift diverge on atomicAdd:\n  \
+         bespoke   = {b_buf:?}\n  \
+         cranelift = {c_buf:?}");
+    let v = u32::from_le_bytes(b_buf[0..4].try_into().unwrap());
+    assert_eq!(v, (0..8).sum(),
+        "atomic counter should equal sum(0..8) = 28, got {v}");
+}
+
 #[test]
 fn differential_six_binding_constant_store() {
     let spv = build_n_binding_constants(6);
