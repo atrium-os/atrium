@@ -52,6 +52,7 @@ fn main() -> ExitCode {
         "sign" => signing::cmd_sign(&args[2..]),
         "publishers" => signing::cmd_publishers(&args[2..], &install_root),
         "bundle" => cmd_bundle(&args[2..]),
+        "release" => cmd_release(&args[2..]),
         "push" => push::cmd_push(&args[2..], &install_root),
         "keychain" => keychain::cmd_keychain(&args[2..], &install_root),
         "notify" => notify::cmd_notify(&args[2..], &install_root),
@@ -105,6 +106,9 @@ Commands:
   publishers remove <id>           Remove a trusted publisher.
   bundle <src-dir> <out.insula>    Pack a bundle directory into a
                                    single-file `.insula` archive.
+  release <src-dir> <out.insula> --key <sk> [--key-id <id>]
+                                   Sign + pack in one shot
+                                   (publish-ready artifact).
   push subscribe <purpose>         Subscribe to push delivery.
   push list                        Show active push subscriptions.
   push unsubscribe <key_id>        Remove a push subscription.
@@ -882,6 +886,75 @@ fn cmd_bundle(args: &[String]) -> Result<(), String> {
     } else {
         println!("  signature: (none — sign first with `insula sign`)");
     }
+    Ok(())
+}
+
+// -----------------------------------------------------
+// release (sign + pack in one shot, publish flow)
+// -----------------------------------------------------
+
+fn cmd_release(args: &[String]) -> Result<(), String> {
+    // Parse: <src-dir> <out.insula> --key <sk> [--key-id <id>]
+    let mut src: Option<&str> = None;
+    let mut out: Option<&str> = None;
+    let mut key: Option<&str> = None;
+    let mut key_id: Option<&str> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--key" => {
+                key = args.get(i + 1).map(|s| s.as_str());
+                i += 2;
+            }
+            "--key-id" => {
+                key_id = args.get(i + 1).map(|s| s.as_str());
+                i += 2;
+            }
+            other if !other.starts_with("--") => {
+                if src.is_none() { src = Some(other); }
+                else if out.is_none() { out = Some(other); }
+                else {
+                    return Err(format!(
+                        "release: unexpected extra argument {:?}", other
+                    ));
+                }
+                i += 1;
+            }
+            other => return Err(format!("release: unknown flag {:?}", other)),
+        }
+    }
+    let src = src.ok_or_else(|| "release: missing <src-dir>".to_string())?;
+    let out = out.ok_or_else(|| "release: missing <out.insula>".to_string())?;
+    let key = key.ok_or_else(|| "release: --key <sk> is required".to_string())?;
+
+    // Sanity-check the bundle directory before doing
+    // anything (so we fail fast on bad inputs without
+    // half-signing).
+    let bundle = InsulaBundle::read(src)
+        .map_err(|e| format!("source {} is not a valid bundle: {}", src, e))?;
+    let app_id = bundle.app_id().to_string();
+    println!("release: signing {} as a publish-ready artifact", app_id);
+
+    // 1. Sign (writes <src>/signature).
+    let mut sign_args = vec![src.to_string(), "--key".to_string(), key.to_string()];
+    if let Some(id) = key_id {
+        sign_args.push("--key-id".to_string());
+        sign_args.push(id.to_string());
+    }
+    signing::cmd_sign(&sign_args)
+        .map_err(|e| format!("release: sign step failed: {}", e))?;
+
+    // 2. Bundle (pack <src> into <out>).
+    let bundle_args = vec![src.to_string(), out.to_string()];
+    cmd_bundle(&bundle_args)
+        .map_err(|e| format!("release: bundle step failed: {}", e))?;
+
+    println!();
+    println!("release complete: {} -> {}", app_id, out);
+    println!("Ship this file. Recipients can `insula install {}`",
+             Path::new(out).file_name()
+                 .map(|s| s.to_string_lossy().into_owned())
+                 .unwrap_or_else(|| out.to_string()));
     Ok(())
 }
 
