@@ -2137,3 +2137,210 @@ fn vk_app_compute_atomic_iadd_accumulates_per_lane() {
     let _ = server_thread;
     let _ = std::fs::remove_file(&sock);
 }
+
+fn build_histogram_cs() -> Vec<u8> {
+    // Real-world-shaped CS: each invocation reads a sample
+    // from the input array, computes a bucket index (sample %
+    // 4 here), and atomicAdds 1 into the bucket counter.
+    //
+    //   uint sample = in.data[gid_x];
+    //   uint bucket = sample & 3;     // 4 buckets
+    //   atomicAdd(out.bins[bucket], 1);
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+        MemorySemantics, Scope,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let uvec3  = b.type_vector(u32_ty, 3);
+    let void_fn = b.type_function(void, vec![]);
+    let rt_arr = b.type_runtime_array(u32_ty);
+    b.decorate(rt_arr, Decoration::ArrayStride,
+        vec![rspirv::dr::Operand::LiteralBit32(4)]);
+    // struct In  { uint data[]; };
+    let s_in  = b.type_struct(vec![rt_arr]);
+    b.decorate(s_in, Decoration::Block, vec![]);
+    b.member_decorate(s_in, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    // struct Out { uint bins[]; };
+    let s_out = b.type_struct(vec![rt_arr]);
+    b.decorate(s_out, Decoration::Block, vec![]);
+    b.member_decorate(s_out, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s_in  = b.type_pointer(None, StorageClass::StorageBuffer, s_in);
+    let ptr_s_out = b.type_pointer(None, StorageClass::StorageBuffer, s_out);
+    let ptr_u     = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+    let v_in  = b.variable(ptr_s_in,  None, StorageClass::StorageBuffer, None);
+    b.decorate(v_in, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(v_in, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let v_out = b.variable(ptr_s_out, None, StorageClass::StorageBuffer, None);
+    b.decorate(v_out, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(v_out, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(1)]);
+    let ptr_in_uvec3 = b.type_pointer(None, StorageClass::Input, uvec3);
+    let gid_var = b.variable(ptr_in_uvec3, None, StorageClass::Input, None);
+    b.decorate(gid_var, Decoration::BuiltIn,
+        vec![rspirv::dr::Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    let c_three = b.constant_bit32(u32_ty, 3);
+    let c_one   = b.constant_bit32(u32_ty, 1);
+    let c_scope = b.constant_bit32(u32_ty, Scope::Device as u32);
+    let c_sem   = b.constant_bit32(u32_ty,
+        MemorySemantics::ATOMIC_COUNTER_MEMORY.bits());
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let gid = b.load(uvec3, None, gid_var, None, vec![]).unwrap();
+    let gid_x = b.composite_extract(u32_ty, None, gid, vec![0]).unwrap();
+    // sample = in.data[gid_x]
+    let in_ptr = b.access_chain(ptr_u, None, v_in, vec![c_zero, gid_x]).unwrap();
+    let sample = b.load(u32_ty, None, in_ptr, None, vec![]).unwrap();
+    // bucket = sample & 3
+    let bucket = b.bitwise_and(u32_ty, None, sample, c_three).unwrap();
+    // atomicAdd(out.bins[bucket], 1)
+    let out_ptr = b.access_chain(ptr_u, None, v_out, vec![c_zero, bucket]).unwrap();
+    let _ = b.atomic_i_add(u32_ty, None, out_ptr, c_scope, c_sem, c_one).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![gid_var, v_in, v_out]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn vk_app_compute_histogram_end_to_end() {
+    // Real-world compute primitive: histogram into 4 buckets
+    // mod-4 over an 8-element input array.  Touches every
+    // major feature landed in the session:
+    //   - multi-binding SSBO (in@0, out@1) via descriptor table
+    //   - dynamic AccessChain (in.data[gid_x], out.bins[bucket])
+    //   - atomic IAdd into a dynamically-indexed slot
+    //   - IAnd for the mod-4 computation
+    let _ = env_logger::builder().is_test(true).try_init();
+    let sock = tmp_socket("c_hist");
+    let cache_dir = TempDir::new().unwrap();
+    let registry = Arc::new(Tier2Registry::new(LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    }));
+    let tier2_backend = Arc::new(Tier2Backend::new(registry.clone()));
+    let backend_for_listener: Arc<dyn Backend> = tier2_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap()
+        .with_tier2_registry(registry.clone());
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+
+    let _env = EnvLock::set(&sock);
+
+    let mut instance: VkInstance = std::ptr::null_mut();
+    unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
+    let mut pds: [VkPhysicalDevice; 1] = [std::ptr::null_mut(); 1];
+    let mut cap: u32 = 1;
+    unsafe { vkEnumeratePhysicalDevices(instance, &mut cap, pds.as_mut_ptr()); }
+    let mut device: VkDevice = std::ptr::null_mut();
+    unsafe { vkCreateDevice(pds[0], std::ptr::null(), std::ptr::null(), &mut device); }
+    let mut queue: VkQueue = std::ptr::null_mut();
+    unsafe { vkGetDeviceQueue(device, 0, 0, &mut queue); }
+
+    let cs_spv = build_histogram_cs();
+    let cs_mod = make_shader_module(device, &cs_spv);
+
+    use ash::vk;
+    use ash::vk::Handle;
+    let stage = vk::PipelineShaderStageCreateInfo {
+        s_type: vk::StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
+        p_next: std::ptr::null(),
+        flags: vk::PipelineShaderStageCreateFlags::empty(),
+        stage: vk::ShaderStageFlags::COMPUTE,
+        module: vk::ShaderModule::from_raw(cs_mod),
+        p_name: b"main\0".as_ptr() as *const i8,
+        p_specialization_info: std::ptr::null(),
+        _marker: std::marker::PhantomData,
+    };
+    let info = vk::ComputePipelineCreateInfo {
+        s_type: vk::StructureType::COMPUTE_PIPELINE_CREATE_INFO,
+        p_next: std::ptr::null(),
+        flags: vk::PipelineCreateFlags::empty(),
+        stage, layout: vk::PipelineLayout::null(),
+        base_pipeline_handle: vk::Pipeline::null(),
+        base_pipeline_index: 0,
+        _marker: std::marker::PhantomData,
+    };
+    let infos = [info];
+    let mut pipeline: u64 = 0;
+    unsafe {
+        vkCreateComputePipelines(
+            device, 0, 1,
+            infos.as_ptr() as *const std::ffi::c_void,
+            std::ptr::null(), &mut pipeline,
+        );
+    }
+    assert!(pipeline != 0);
+    thread::sleep(Duration::from_millis(200));
+
+    // Input: 8 samples [3, 1, 4, 1, 5, 9, 2, 6] -- a classic.
+    // Buckets are sample & 3:
+    //   3->3, 1->1, 4->0, 1->1, 5->1, 9->1, 2->2, 6->2
+    // Expected histogram: [1, 4, 2, 1]
+    let samples = [3u32, 1, 4, 1, 5, 9, 2, 6];
+    let mut prefill = vec![0u8; samples.len() * 4];
+    for (i, v) in samples.iter().enumerate() {
+        prefill[i*4..i*4+4].copy_from_slice(&v.to_le_bytes());
+    }
+    tier2_backend.set_compute_input_for_binding(0, prefill);
+
+    let mut pool: u64 = 0;
+    unsafe { vkCreateCommandPool(device, std::ptr::null(), std::ptr::null(), &mut pool); }
+    let mut cb_info = [0u8; 40];
+    cb_info[0..4].copy_from_slice(&40u32.to_le_bytes());
+    cb_info[16..24].copy_from_slice(&pool.to_le_bytes());
+    cb_info[28..32].copy_from_slice(&1u32.to_le_bytes());
+    let mut cbs: [VkCommandBuffer; 1] = [std::ptr::null_mut(); 1];
+    unsafe { vkAllocateCommandBuffers(device, cb_info.as_ptr() as *const _, cbs.as_mut_ptr()); }
+    let cb = cbs[0];
+    unsafe { vkBeginCommandBuffer(cb, std::ptr::null()); }
+    unsafe { vkCmdBindPipeline(cb, 1, pipeline); }
+    // Dispatch 8 workgroups of 1 invocation each = 8 invocations
+    // (one per sample).  Could also be 1 wg of 8 lanes; same
+    // total invocation count, but the test's LocalSize=1 makes
+    // gid_x equal the workgroup id which is what the host
+    // iterates.
+    unsafe { vkCmdDispatch(cb, 8, 1, 1); }
+    unsafe { vkEndCommandBuffer(cb); }
+    let mut submit = [0u8; 72];
+    submit[0..4].copy_from_slice(&4u32.to_le_bytes());
+    submit[40..44].copy_from_slice(&1u32.to_le_bytes());
+    let cb_arr = [cb];
+    submit[48..56].copy_from_slice(&(cb_arr.as_ptr() as u64).to_le_bytes());
+    unsafe { vkQueueSubmit(queue, 1, submit.as_ptr() as *const _, std::ptr::null_mut()); }
+    thread::sleep(Duration::from_millis(300));
+
+    let bins = tier2_backend.compute_output_bytes_for_binding(1)
+        .expect("histogram output");
+    let counts: Vec<u32> = (0..4)
+        .map(|i| u32::from_le_bytes(bins[i*4..i*4+4].try_into().unwrap()))
+        .collect();
+    // 3, 1, 4, 1, 5, 9, 2, 6  ->  buckets: 3,1,0,1,1,1,2,2
+    //   bucket 0: 1 (sample 4)
+    //   bucket 1: 4 (samples 1, 1, 5, 9)
+    //   bucket 2: 2 (samples 2, 6)
+    //   bucket 3: 1 (sample 3)
+    assert_eq!(counts, vec![1, 4, 2, 1],
+        "histogram bins should be [1,4,2,1]; got {counts:?}");
+
+    unsafe { atrium_vk_icd::vkDestroyInstance(instance, std::ptr::null()); }
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
