@@ -152,7 +152,127 @@ a user who knows where they are going types the name. The
 two are different actions with different UX, not a single
 mystery box that sometimes guesses wrong.
 
-## 1. Architectural overview
+## 0.6 The "web version" disappears
+
+The most economically consequential consequence of §0.5.
+Worth calling out explicitly because the entire SaaS
+industry has organized itself around solving a problem that
+disappears in this model.
+
+### 0.6.1 What "web version" actually is
+
+Every major desktop app has a parallel web version: Office
+365 web, Photoshop Web, Figma (web-only), Slack and Discord
+and Notion (all Electron — desktop apps shipping a browser
+to run their own web app). These exist not because anyone
+wanted a web app, but because the web was the lowest-
+common-denominator delivery mechanism that solved four
+distinct problems:
+
+| Problem | Why the web solved it | Insula's answer |
+|---|---|---|
+| Cross-platform delivery | Browser is universal | Aqueduct + the Insula contract are OS-agnostic by design; one codebase runs on every Atrium device |
+| Zero install friction | Just visit a URL | Opifex install is one consent prompt (§3, §14); trial-launch (§0.5.3) is one tap with reduced caps |
+| Automatic updates | Server pushes new code per request | Content-addressed signed updates via Opifex, atomic, no per-launch download (§14) |
+| Works from any device (kiosks, friends' machines) | No install needed | Remote rendering via Aqueduct + Fresco (§20.2); trial-launch for ephemeral use |
+
+All four of the web's "killer features" in this category
+have direct Insula equivalents — and Insula's are better on
+every axis except one genuine edge case (§0.6.4).
+
+### 0.6.2 The hidden engineering tax
+
+The cost of maintaining web versions of desktop apps is
+**enormous and largely invisible**. Industry examples:
+
+- Microsoft maintains Excel for Windows, Excel for Mac,
+  Excel for iOS, Excel for Android, Excel Online, and
+  Excel for the web in Teams — six codebases with subtly
+  different feature coverage. The web version is famously
+  the most limited and the most expensive per-feature to
+  extend, because every interaction must be re-implemented
+  in browser idioms.
+- Figma ships only a web version, but it took years and
+  ~30 MB of WebAssembly to make it remotely fast. A native
+  Figma on Insula is a fraction of that size and faster.
+- Slack / Discord / Notion are Electron — desktop apps
+  that ship a browser to run their own web app. Each user
+  has effectively installed a copy of Chromium per
+  installed Electron app.
+
+Half the engineering at modern productivity companies is
+duplicating desktop functionality on the web. Eliminate
+that duplication and the same teams ship *features* instead
+of *parity*. This is a multi-billion-dollar industry-wide
+opportunity cost that vanishes here.
+
+### 0.6.3 The user-facing flow that replaces "web version"
+
+A user encountering an `.xlsx` attachment on a non-Atrium
+world today: open browser → navigate to Excel Online → sign
+in → upload → edit → download → attach back. Many minutes,
+poor fidelity, server round-trip per keystroke for
+collaboration features.
+
+On Insula:
+
+- **App installed locally:** attachment opens in the local
+  app. Saving writes back wherever the user's data lives.
+- **App not installed:** the attachment handler offers (a)
+  install with capability-consent review, or (b) trial-
+  launch (§0.5.3) with reduced caps for a one-time view/
+  edit session.
+- **User on a friend's Atrium machine:** trial-launch lets
+  them edit; saving writes to their cloud-backed storage,
+  bound to their Vestibulum identity (§13). No "log in to
+  Excel Online" ceremony.
+- **User on a non-Atrium device:** remote rendering
+  (§20.2) — the user's home Atrium machine or a rented
+  Atrium cloud instance runs the app and renders to a thin
+  Atrium-rendering client on the non-Atrium device.
+
+All of this is *better* than today's web version, and none
+of it requires the vendor to maintain a separate web
+codebase.
+
+### 0.6.4 The remaining edge case
+
+Honest accounting — one case where a "web version" still
+has some value:
+
+- **Genuinely transient access on a non-Atrium machine with
+  no Atrium-rendering client installed** — a library
+  computer, a hotel business center, a Chromebook the user
+  does not own.
+
+The mitigation: a **single, thin "Atrium remote viewer"
+web app** is a reasonable bridge for this case. It is *one*
+web codebase (a thin scenegraph renderer + input
+forwarder), not *N* (one per app). The user navigates to
+this one viewer, signs in, and connects to a remote Insula
+session running their actual apps.
+
+This collapses the industry's "every vendor ships a web
+version" pattern to "the platform ships one viewer for the
+no-Atrium-anywhere case." Same web technology, ~1000× less
+of it.
+
+### 0.6.5 Why this matters beyond the design
+
+This is the strongest *pragmatic* (not aesthetic, not
+safety) argument for Insula:
+
+- It is the argument that resonates with industry readers
+  who would otherwise dismiss this as "another desktop
+  platform fighting the web."
+- It maps to a real economic problem (multi-billion-dollar
+  duplication cost) that vendors privately acknowledge but
+  publicly cannot escape because the web is the floor.
+- It implies a different go-to-market story than "convince
+  users to switch": *vendors* benefit first by eliminating
+  their web-version maintenance burden, and users benefit
+  downstream from getting the better (desktop-class)
+  experience.
 
 ```
 publisher                target device
