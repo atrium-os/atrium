@@ -59,6 +59,7 @@ fn main() -> ExitCode {
         "doctor" => doctor::cmd_doctor(&args[2..], &install_root),
         "init" => init::cmd_init(&args[2..]),
         "run" => cmd_run(&args[2..], &install_root),
+        "clean" => cmd_clean(&args[2..], &install_root),
         "help" | "-h" | "--help" => {
             print_usage();
             Ok(())
@@ -120,6 +121,8 @@ Commands:
   notify <title> <body> [--urgency low|normal|high]
                                    Post a notification (prints assigned id).
   doctor                           Run a health check across the install.
+  clean [--all]                    Remove ephemeral state (daemons + run/);
+                                   `--all` also wipes apps + trust store.
   version [--verbose]              Print the insula CLI version.
   --version / -V                   Same as `version`.
   init <dir> [--name <id>] [--entry <path>]
@@ -894,6 +897,56 @@ fn cmd_uninstall(args: &[String], install_root: &Path) -> Result<(), String> {
         .map_err(|e| format!("removing {}: {}", app_root.display(), e))?;
 
     println!("Uninstalled {}", target);
+    Ok(())
+}
+
+// -----------------------------------------------------
+// clean
+// -----------------------------------------------------
+
+fn cmd_clean(args: &[String], install_root: &Path) -> Result<(), String> {
+    let all = args.iter().any(|a| a == "--all");
+    for a in args {
+        if a != "--all" {
+            return Err(format!("clean: unknown argument {:?}", a));
+        }
+    }
+
+    // Stop daemons first so their files aren't getting
+    // recreated while we remove them.
+    for d in Daemon::ALL {
+        let _ = daemons::stop(install_root, d);
+    }
+
+    let run_dir = install_root.join("run");
+    if run_dir.is_dir() {
+        std::fs::remove_dir_all(&run_dir)
+            .map_err(|e| format!("remove {}: {}", run_dir.display(), e))?;
+        println!("removed {}", run_dir.display());
+    } else {
+        println!("(no run/ directory)");
+    }
+
+    if all {
+        for sub in ["apps", "trusted-publishers"] {
+            let dir = install_root.join(sub);
+            if dir.is_dir() {
+                std::fs::remove_dir_all(&dir)
+                    .map_err(|e| format!("remove {}: {}", dir.display(), e))?;
+                println!("removed {}", dir.display());
+            } else {
+                println!("(no {}/ directory)", sub);
+            }
+        }
+    }
+
+    if all {
+        println!();
+        println!("install root reset to a clean state");
+    } else {
+        println!();
+        println!("daemon state cleared (apps + trust store preserved)");
+    }
     Ok(())
 }
 
