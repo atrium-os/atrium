@@ -1984,14 +1984,24 @@ fn emit_function(
                                 // Cranelift picks differently,
                                 // and the heavy4 gap to
                                 // Cranelift narrows to it.)
-                                a.emit(asm::mov_v_16b(*dv, src));
+                                // Peephole: drop identity move
+                                // (same src + dst reg).  These
+                                // can survive the coalesce pass
+                                // when a Phi arm is force-
+                                // allocated into the same V-reg
+                                // the source already lives in.
+                                if dv.0 != src.0 {
+                                    a.emit(asm::mov_v_16b(*dv, src));
+                                }
                             }
                             PhiDest::Int(dw) => {
                                 let src = *ints.get(src_id).ok_or_else(||
                                     BackendError::Internal(format!(
                                         "Phi int source {:?} not in ints",
                                         src_id)))?;
-                                a.emit(asm::mov_w(*dw, src));
+                                if dw.0 != src.0 {
+                                    a.emit(asm::mov_w(*dw, src));
+                                }
                             }
                             PhiDest::Packed(dq) => {
                                 // NEON-packed vec4 Phi: the
@@ -2005,7 +2015,9 @@ fn emit_function(
                                     BackendError::Internal(format!(
                                         "Phi packed source {:?} not in packed",
                                         src_id)))?;
-                                a.emit(asm::mov_v_16b(*dq, src));
+                                if dq.0 != src.0 {
+                                    a.emit(asm::mov_v_16b(*dq, src));
+                                }
                             }
                             PhiDest::Vec(lane_regs) => {
                                 // The arm's source is a vector
@@ -2033,7 +2045,9 @@ fn emit_function(
                                         BackendError::Internal(format!(
                                             "Phi vec lane {:?} not in scalars",
                                             lane.id)))?;
-                                    a.emit(asm::mov_v_16b(*dv, src));
+                                    if dv.0 != src.0 {
+                                        a.emit(asm::mov_v_16b(*dv, src));
+                                    }
                                 }
                             }
                         }
