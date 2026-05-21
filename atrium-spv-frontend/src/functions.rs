@@ -1672,6 +1672,55 @@ fn translate_inst(
                     };
                     Op::FMin(mid, hi)
                 }
+                6 => {
+                    // FSign(x) ≡ x == 0 ? 0 : (x < 0 ? -1 : 1)
+                    //          ≡ clamp(x*1e30, -1, 1) is one trick;
+                    //          easier: max(-1, min(1, x)) doesn't
+                    //          work for x near zero.
+                    //          Cleanest synthesis: (x>0)-(x<0) via
+                    //          two FOrd compares -> u32 bool -> f32.
+                    //
+                    // For initial scope, synthesise as:
+                    //   gt = x > 0 ? 1.0 : 0.0
+                    //   lt = x < 0 ? 1.0 : 0.0
+                    //   sign = gt - lt
+                    // This handles +0 and -0 as 0 (per GLSL spec).
+                    // But our backends don't expose FOrd-to-float
+                    // cheaply yet -- skip until needed.  For now
+                    // synthesise the simpler:
+                    //   sign = clamp(x * BIG, -1, 1)
+                    // which is correct for normal inputs but
+                    // would mis-handle inf/NaN.  Bigger arc;
+                    // unsupported for now.
+                    return Err(FrontendError::Unsupported(
+                        "GLSL.std.450 FSign not supported yet \
+                         (compare-to-bool-to-float lowering queued)".into()));
+                }
+                10 => {
+                    // Fract(x) ≡ x - floor(x).  Synthesise inline
+                    // using the existing Op::FFloor + Op::FSub.
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let floor_x = {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let v = Value { id, ty: result_ty.clone() };
+                        insts.push(Inst {
+                            op: Op::FFloor(x.clone()),
+                            result: Some(v.clone()),
+                            source_spirv_offset,
+                        });
+                        v
+                    };
+                    Op::FSub(x, floor_x)
+                }
+                48 => {
+                    // Step(edge, x) ≡ x < edge ? 0.0 : 1.0.
+                    // Without FOrd-to-float lowering: skip for now.
+                    return Err(FrontendError::Unsupported(
+                        "GLSL.std.450 Step not supported yet".into()));
+                }
                 46 => {
                     // FMix(x, y, a) ≡ x + a*(y - x).
                     let x_id = expect_id(&spv_inst.operands, 2)?;
