@@ -1651,6 +1651,50 @@ fn emit_function(
                 let new_off = base_off.saturating_add(*byte_offset as i32);
                 pointers.insert(result.id, (param, new_off));
             }
+            Op::PtrOffsetDynamic { base, index, stride } => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "PtrOffsetDynamic without result".into()))?;
+                let (x_base, base_off) =
+                    resolve_or_make_pointer(base, &mut pointers, func.stage)?;
+                let w_index = *ints.get(&index.id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "PtrOffsetDynamic index {:?} not in ints",
+                        index.id)))?;
+                // Stride must be a power of two for the
+                // shift-and-add lowering; non-pow2 strides
+                // would need a madd via a materialised
+                // constant, queued as follow-up.
+                if !stride.is_power_of_two() {
+                    return Err(BackendError::Unsupported(format!(
+                        "PtrOffsetDynamic stride {stride} is not a power of \
+                         two (madd-based lowering not implemented yet)")));
+                }
+                let log2 = stride.trailing_zeros() as u8;
+                if log2 > 63 {
+                    return Err(BackendError::Unsupported(format!(
+                        "PtrOffsetDynamic stride 2^{log2} too large")));
+                }
+                // Allocate a fresh int reg for the resulting
+                // address.  Use the IntPool so the lifetime
+                // tracks the result Value the normal way.
+                let dst_w = int_pool.alloc(result.id)?;
+                let dst_x = asm::Xreg(dst_w.0);
+                let idx_x = asm::Xreg(w_index.0);
+                if log2 == 0 {
+                    // stride == 1: just add.
+                    a.emit(asm::add_x(dst_x, x_base, idx_x));
+                } else {
+                    // stride == 2^log2: shift then add.
+                    a.emit(asm::lsl_imm_x(dst_x, idx_x, log2));
+                    a.emit(asm::add_x(dst_x, x_base, dst_x));
+                }
+                // Result pointer: base = dst_x, byte_off
+                // carries the constant prefix the
+                // AccessChain accumulated (the load/store
+                // imm12 will fold it).
+                pointers.insert(result.id, (dst_x, base_off));
+            }
             Op::LoadBuiltin(kind) => {
                 use atrium_spv_ir::BuiltinKind as BK;
                 let result = inst.result.as_ref().ok_or_else(||
@@ -3321,6 +3365,11 @@ fn compute_last_use_flat(
             Op::AccessChain { base: _, byte_offset: _ } => {
                 // Base is a pointer Value, not a scalar —
                 // no V-reg liveness implication.
+            }
+            Op::PtrOffsetDynamic { base: _, index, stride: _ } => {
+                // index is an int scalar -- mark it so the
+                // IntPool keeps the W-reg live until this op.
+                mark(index.id);
             }
             Op::Load(_) => {
                 // The result may produce a vec4; if so,

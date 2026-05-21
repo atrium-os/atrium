@@ -782,6 +782,42 @@ impl FnTranslator {
                 self.pointers.insert(result.id, (param, new_off));
                 Ok(())
             }
+            Op::PtrOffsetDynamic { base, index, stride } => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "PtrOffsetDynamic without result".to_string()))?;
+                let (base_ptr, base_off) = self.resolve_or_make_pointer(base)?;
+                let idx = *self.scalars.get(&index.id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "PtrOffsetDynamic index {:?} not in scalars",
+                        index.id)))?;
+                // Widen the 32-bit index to 64-bit so the
+                // address arithmetic doesn't truncate.
+                // Cranelift's pointer type on aarch64 is I64.
+                let idx_ext = builder.ins().uextend(clif_types::I64, idx);
+                // Scale by stride.  Use shift for power-of-
+                // two; imul otherwise (matches bespoke's
+                // shift-or-madd plan).
+                let scaled = if stride.is_power_of_two() {
+                    let log2 = stride.trailing_zeros() as i64;
+                    if log2 == 0 {
+                        idx_ext
+                    } else {
+                        builder.ins().ishl_imm(idx_ext, log2)
+                    }
+                } else {
+                    let s = builder.ins().iconst(
+                        clif_types::I64, *stride as i64);
+                    builder.ins().imul(idx_ext, s)
+                };
+                let addr = builder.ins().iadd(base_ptr, scaled);
+                // Stash as a pointer with the residual
+                // constant offset; downstream Load/Store
+                // applies base_off as the load-offset
+                // operand.
+                self.pointers.insert(result.id, (addr, base_off));
+                Ok(())
+            }
             // Op::LoadBuiltin: pull a stage built-in value
             // (WorkgroupId, LocalInvocationId, GlobalInvocationId,
             // VertexIndex, InstanceIndex) from the appropriate
