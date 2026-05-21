@@ -64,6 +64,94 @@ because the sandbox was in-process; Atrium does not have that
 problem. WASM may still be useful as a *distribution format*
 for cross-arch portability (§3), but it is never the runtime.
 
+## 0.5 Category collapse — "app" is the only category
+
+A direct consequence of the design that is worth making
+explicit, because readers from a web background will look
+for distinctions that no longer exist.
+
+### 0.5.1 What goes away
+
+The web's three-way split — **native app / PWA / website** —
+exists for historical reasons that do not apply to Insula:
+
+| Web split | Why it existed | Insula's answer |
+|---|---|---|
+| Native vs. webapp | Native has full system access; webapps must be sandboxed | Both fully sandboxed by the same jail model; native speed for both |
+| Webapp vs. website | Webapps are "installed" PWAs; websites are pages | Apps install via Opifex (§3); documents are content rendered by `atrium-doc` (§10.6) |
+| App store vs. open web | Curated vs. uncurated distribution | One distribution mechanism — content-addressed signed bundles + Nomenclator names; the user picks any registry they trust |
+
+In Insula there is **one category — "app"** — distinguished
+only by what capabilities the manifest declares and the user
+consented to at install time. A "weather widget," a "video
+editor," and what would have been a "weather website" are
+the same kind of thing: a Pergola app in a Portcullis jail.
+Their differences live in the capability manifest, not the
+deployment model.
+
+### 0.5.2 What survives — documents are not apps
+
+The clean separation is between **programs** (apps, which
+are inert without execution) and **content** (documents,
+which are inert without a viewer). Insula draws this line
+sharply where the web blurred it:
+
+- Apps run code. They require install consent because they
+  receive capabilities.
+- Documents are bytes. They receive no capabilities; the
+  viewer (`atrium-doc`) renders them in a doubly-jailed
+  inner context with zero ambient authority.
+
+The casual-browsing UX the web was best at — "follow a
+link, see content, follow another link" — survives
+*completely*, for documents. Wikipedia, news, blogs,
+papers, recipes, search results, READMEs: zero install
+ceremony, just rendering. This covers the bulk of what
+people actually casually "browse."
+
+### 0.5.3 What changes — apps require an install moment
+
+What the web *also* allowed — "follow a link, accidentally
+end up running a webapp that accumulates trust" — is gone.
+Apps require explicit install consent (the capability
+manifest displayed for review). This is good from a safety
+standpoint and is the explicit design intent.
+
+For apps whose authors genuinely want frictionless
+onboarding, a **trial-launch** pattern is supported:
+
+- Manifest declares `[trial]` mode with a reduced
+  capability set (typically: no persistent storage, no
+  network beyond a declared host, time-limited session).
+- The launcher offers "Try" alongside "Install."
+- Trial mode runs in a jail with the reduced caps; expires
+  after the declared session.
+- User explicitly upgrades to install for the full manifest
+  if they want to keep using the app.
+
+This is the App Clip / Instant App pattern from mobile OSes,
+made first-class. It preserves the "try without committing"
+property while making the trust escalation a deliberate user
+action.
+
+### 0.5.4 Launcher implications
+
+Forum (the dock / launcher) becomes the user's view of
+**every program-shaped thing on the system**. There is no
+separate "browser bookmarks," no "open recent websites" —
+those concepts dissolve. Pinned items are apps. Recents are
+apps and documents. The single mental model replaces a
+half-dozen historically-accreted ones.
+
+A user's URL-bar-equivalent is just a name input that goes
+to Nomenclator. It does *not* magic-dispatch between
+"search" and "navigate" — that conflation is a web
+accident. **Search is its own app.** A user who wants to
+search picks the search app (or its launcher integration);
+a user who knows where they are going types the name. The
+two are different actions with different UX, not a single
+mystery box that sometimes guesses wrong.
+
 ## 1. Architectural overview
 
 ```
