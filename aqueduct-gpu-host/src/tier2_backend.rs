@@ -31,7 +31,7 @@ use crate::tier2_registry::{
 };
 
 use aqueduct_gpu::frame::{
-    BindIndexBufCmd, BindVertexBufCmd, DrawCmd, DrawIndexedCmd,
+    BindIndexBufCmd, BindVertexBufCmd, DispatchCmd, DrawCmd, DrawIndexedCmd,
     FrameDecoder, IndexType, SetViewportCmd,
 };
 use aqueduct_gpu::opcodes::FrameOp;
@@ -39,7 +39,7 @@ use aqueduct_gpu::{
     Tier2BlendFactor as WireBlendFactor,
     Tier2BlendOp as WireBlendOp,
     Tier2BlendState as WireBlendState,
-    Tier2DepthState, VertexInputState,
+    Tier2ComputeStateBlob, Tier2DepthState, VertexInputState,
 };
 
 /// Backend that routes draws through Tier-2 compiled
@@ -78,6 +78,14 @@ pub struct Tier2Backend {
     /// [`Tier2Backend::bind_raster_state`] when the session
     /// decodes a `Tier2PipelineStateBlob`.
     pipeline_raster: Mutex<HashMap<u32, PipelineRasterState>>,
+    /// Per-pipeline compute-shader binding: Tier-2 shader id
+    /// + workgroup local-size. Populated when the session
+    /// processes a Compute-kind pipeline create.
+    pipeline_compute: Mutex<HashMap<u32, (Tier2ShaderId, Tier2ComputeStateBlob)>>,
+    /// Cumulative count of `cs_main` invocations the walker
+    /// has driven. Observable for tests since the existing
+    /// `CsMain` ABI is side-effect-free.
+    cs_invocations: AtomicU64,
     submissions: AtomicU64,
     presents:    AtomicU64,
     /// Total Draw / DrawIndexed records the frame-walker has
@@ -172,6 +180,10 @@ struct PassState {
     /// Pipeline raster state (depth + blend), resolved at
     /// BindPipeline. `None` = no pipeline bound yet.
     raster: Option<PipelineRasterState>,
+    /// Tier-2 compute binding (shader + workgroup size) for
+    /// the currently-bound pipeline. `None` if the bound
+    /// pipeline is graphics (or nothing's bound).
+    tier2_compute: Option<(Tier2ShaderId, Tier2ComputeStateBlob)>,
     /// Vertex-buffer bindings keyed by slot number.
     vertex_buffers: HashMap<u32, BoundVertexBuffer>,
     /// Currently-bound index buffer.
@@ -242,6 +254,8 @@ impl Tier2Backend {
             pipeline_vs_shaders: Mutex::new(HashMap::new()),
             pipeline_layouts: Mutex::new(HashMap::new()),
             pipeline_raster: Mutex::new(HashMap::new()),
+            pipeline_compute: Mutex::new(HashMap::new()),
+            cs_invocations: AtomicU64::new(0),
             last_assembled_vertices: Mutex::new(None),
             presented_frames: Mutex::new(HashMap::new()),
             present_callback: Mutex::new(None),
@@ -401,6 +415,34 @@ impl Tier2Backend {
             .get(&pipeline_id.raw()).cloned()
     }
 
+    /// Associate a pipeline with its Tier-2 compute shader +
+    /// workgroup local-size state.
+    pub fn bind_compute_pipeline(
+        &self,
+        pipeline_id: ResourceId,
+        shader_id: Tier2ShaderId,
+        compute_state: Tier2ComputeStateBlob,
+    ) {
+        self.pipeline_compute.lock().unwrap()
+            .insert(pipeline_id.raw(), (shader_id, compute_state));
+    }
+
+    /// Look up a pipeline's compute binding, if any.
+    pub fn pipeline_compute(&self, pipeline_id: ResourceId)
+        -> Option<(Tier2ShaderId, Tier2ComputeStateBlob)>
+    {
+        self.pipeline_compute.lock().unwrap()
+            .get(&pipeline_id.raw()).copied()
+    }
+
+    /// Cumulative count of `cs_main` invocations driven by
+    /// the frame-walker's Dispatch handler. Since the
+    /// existing tier-2 CsMain ABI has only read-only inputs,
+    /// this is the load-bearing observable for compute tests.
+    pub fn cs_invocation_count(&self) -> u64 {
+        self.cs_invocations.load(Ordering::Relaxed)
+    }
+
     /// Most recent presented frame for a given Fresco
     /// surface_id (typically a window-id). `None` if nothing
     /// has been presented to that surface in this session.
@@ -446,6 +488,7 @@ impl Tier2Backend {
         let pipeline_shaders    = self.pipeline_shaders.lock().unwrap().clone();
         let pipeline_vs_shaders = self.pipeline_vs_shaders.lock().unwrap().clone();
         let pipeline_raster     = self.pipeline_raster.lock().unwrap().clone();
+        let pipeline_compute    = self.pipeline_compute.lock().unwrap().clone();
         let mut state = PassState::default();
         // D.6: depth buffer is per-pass, allocated lazily on
         // first draw with depth-test enabled. Cleared to +inf
@@ -474,6 +517,7 @@ impl Tier2Backend {
                         state.tier2_shader    = pipeline_shaders.get(&raw).copied();
                         state.tier2_vs_shader = pipeline_vs_shaders.get(&raw).copied();
                         state.raster          = pipeline_raster.get(&raw).copied();
+                        state.tier2_compute   = pipeline_compute.get(&raw).copied();
                     } else {
                         log::warn!("BindPipeline body too short ({} bytes)", body.len());
                     }
@@ -519,6 +563,20 @@ impl Tier2Backend {
                             target_id, &state, cmd, &mut depth_buffer);
                     }
                     Err(e) => log::warn!("malformed DrawIndexed: {e}"),
+                },
+                FrameOp::Dispatch => match DispatchCmd::from_bytes(body) {
+                    Ok(cmd) => {
+                        // Vulkan allows Dispatch outside a render
+                        // pass; the walker tolerates that -- the
+                        // outer partition_renderpasses iteration
+                        // visits each pass body individually, so
+                        // a compute-only command buffer arrives
+                        // here through partition's "no Begin/End"
+                        // pass slice.
+                        state.draws_in_pass = state.draws_in_pass.saturating_add(1);
+                        self.dispatch_compute(&state, cmd);
+                    }
+                    Err(e) => log::warn!("malformed Dispatch: {e}"),
                 },
                 FrameOp::EndRenderPass => break,
                 // Ops we don't yet act on: SetScissor, BindDescriptors,
@@ -807,6 +865,131 @@ impl Tier2Backend {
         Ok(out)
     }
 
+    /// Dispatch a `vkCmdDispatch` against the bound compute
+    /// pipeline. Drives `cs_main` once per (workgroup_id,
+    /// local_id) pair, i.e. groupCount[xyz] * local_size[xyz]
+    /// total invocations.  Pipeline must be Tier-2-compute-bound
+    /// (graphics pipeline bound + Dispatch is a guest bug; we
+    /// log and skip).
+    fn dispatch_compute(&self, state: &PassState, cmd: DispatchCmd) {
+        let Some((shader_id, cs_state)) = state.tier2_compute else {
+            self.draws_skipped.fetch_add(1, Ordering::Relaxed);
+            log::debug!("Dispatch skipped: no Tier-2 compute pipeline bound");
+            return;
+        };
+        if cmd.group_count_x == 0 || cmd.group_count_y == 0 || cmd.group_count_z == 0 {
+            return;
+        }
+        let loaded = match self.registry.get(shader_id) {
+            Some(l) => l,
+            None => {
+                log::warn!("Dispatch: shader {shader_id:?} not in registry");
+                return;
+            }
+        };
+        let cs_main = match loaded.entry_points.cs_main {
+            Some(f) => f,
+            None => {
+                log::warn!("Dispatch: bound shader {shader_id:?} has no cs_main");
+                return;
+            }
+        };
+
+        let uni_ptr = std::ptr::null();
+        let pc_ptr = if state.push_constants.is_empty() {
+            std::ptr::null()
+        } else { state.push_constants.as_ptr() };
+
+        let total_invocations = (cmd.group_count_x as u64)
+            * (cmd.group_count_y as u64) * (cmd.group_count_z as u64)
+            * (cs_state.local_size_x as u64)
+            * (cs_state.local_size_y as u64) * (cs_state.local_size_z as u64);
+        // Soft cap: a 1024^3 dispatch with 32^3 local size is 2^35
+        // invocations -- would lock the daemon for minutes.  Cap
+        // at 2^24 (16M) for bring-up; real workloads will need
+        // a proper async-dispatch path anyway.
+        const MAX_INVOCATIONS: u64 = 1 << 24;
+        if total_invocations > MAX_INVOCATIONS {
+            log::warn!("Dispatch: {total_invocations} invocations exceeds \
+                        bring-up cap {MAX_INVOCATIONS}; rejecting");
+            return;
+        }
+
+        for gz in 0..cmd.group_count_z {
+            for gy in 0..cmd.group_count_y {
+                for gx in 0..cmd.group_count_x {
+                    for lz in 0..cs_state.local_size_z {
+                        for ly in 0..cs_state.local_size_y {
+                            for lx in 0..cs_state.local_size_x {
+                                // SAFETY: cs_main is a dlopened
+                                // C-ABI function whose signature
+                                // matches CsMain (checked at
+                                // open time); all pointers are
+                                // valid for at least this call.
+                                unsafe {
+                                    cs_main(
+                                        uni_ptr, pc_ptr,
+                                        gx, gy, gz,
+                                        lx, ly, lz,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.cs_invocations.fetch_add(total_invocations, Ordering::Relaxed);
+        self.draws_executed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Walk the full frame buffer, but only act on ops that
+    /// arrive OUTSIDE any render pass: BindPipeline (resolves
+    /// to a compute pipeline -> stored), PushConstants
+    /// (forwarded into compute uniforms), Dispatch (drives
+    /// `dispatch_compute`).  Graphics ops are handled by the
+    /// per-pass walker in `execute_pass`.
+    fn execute_compute_ops(&self, frame_buf: &[u8]) {
+        let pipeline_compute = self.pipeline_compute.lock().unwrap().clone();
+        let mut state = PassState::default();
+        let mut rp_depth: u32 = 0;
+        let mut decoder = FrameDecoder::new(frame_buf);
+        while let Ok(Some((op, body))) = decoder.next() {
+            match op {
+                FrameOp::BeginRenderPass => rp_depth += 1,
+                FrameOp::EndRenderPass => {
+                    rp_depth = rp_depth.saturating_sub(1);
+                    // A render pass ends -- any previous
+                    // compute-pipeline bind is conventionally
+                    // still valid until the next BindPipeline.
+                    // No state reset.
+                }
+                _ if rp_depth > 0 => {
+                    // Inside a render pass -- handled by
+                    // execute_pass.
+                }
+                FrameOp::BindPipeline => {
+                    if body.len() >= 4 {
+                        let raw = u32::from_le_bytes([
+                            body[0], body[1], body[2], body[3],
+                        ]);
+                        state.pipeline_raw = Some(raw);
+                        state.tier2_compute = pipeline_compute.get(&raw).copied();
+                    }
+                }
+                FrameOp::PushConstants => {
+                    state.push_constants.clear();
+                    state.push_constants.extend_from_slice(body);
+                }
+                FrameOp::Dispatch => match DispatchCmd::from_bytes(body) {
+                    Ok(cmd) => self.dispatch_compute(&state, cmd),
+                    Err(e) => log::warn!("malformed Dispatch: {e}"),
+                },
+                _ => {}
+            }
+        }
+    }
+
     /// Dispatch a `DrawIndexed` against the current pass state.
     /// D.3 stub; same shape as `dispatch_draw`. D.8 wires the
     /// index buffer slice.
@@ -1020,6 +1203,13 @@ impl Backend for Tier2Backend {
             let pass_bytes = &frame_buf[pass.byte_range.clone()];
             self.execute_pass(pass.target_id, pass_bytes);
         }
+        // Compute ops live OUTSIDE render passes -- partition
+        // doesn't produce slices for them, so a separate pass
+        // over the whole buffer handles BindPipeline +
+        // PushConstants + Dispatch when we're between
+        // EndRenderPass and the next BeginRenderPass (or
+        // before the first / after the last RP).
+        self.execute_compute_ops(frame_buf);
         true
     }
 
@@ -1092,6 +1282,15 @@ impl Backend for Tier2Backend {
         blend: Option<WireBlendState>,
     ) {
         self.bind_raster_state(pipeline_id, depth, blend);
+    }
+
+    fn bind_pipeline_tier2_compute(
+        &self,
+        pipeline_id: ResourceId,
+        tier2_shader_id: Tier2ShaderId,
+        compute_state: Tier2ComputeStateBlob,
+    ) {
+        self.bind_compute_pipeline(pipeline_id, tier2_shader_id, compute_state);
     }
 }
 

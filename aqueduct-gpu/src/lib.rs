@@ -58,7 +58,7 @@ pub use frame::{
     FrameBuilder, FrameDecoder, FrameDecodeError,
     FrameBodyError,
     DrawCmd, DrawIndexedCmd, BindVertexBufCmd, BindIndexBufCmd,
-    IndexType, SetViewportCmd,
+    DispatchCmd, IndexType, SetViewportCmd,
 };
 pub use ids::{IdNamespace, ResourceId, BUNDLE_NAMESPACE_RANGE,
                BUILTIN_NAMESPACE, ICD_RUNTIME_NAMESPACE};
@@ -80,7 +80,8 @@ pub use opcodes::{
 };
 pub use payloads::*;
 pub use pipeline::{
-    Tier2BlendFactor, Tier2BlendOp, Tier2BlendState, Tier2DepthState,
+    Tier2BlendFactor, Tier2BlendOp, Tier2BlendState,
+    Tier2ComputeStateBlob, Tier2DepthState,
     Tier2PipelineStateBlob, VertexAttributeDesc, VertexBindingDesc,
     VertexFormat, VertexInputState,
 };

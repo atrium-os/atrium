@@ -199,6 +199,31 @@ impl Default for Tier2BlendState {
     }
 }
 
+/// Tier-2 compute pipeline state blob — postcard-encoded
+/// inside `PipelineCreatePayload::state_blob` when the
+/// pipeline kind is `Compute`. Carries the SPIR-V
+/// `LocalSize` (workgroup dimensions) since the Tier-2
+/// dispatcher needs it to drive the (groupCount ×
+/// local_size) invocation loop without re-parsing SPIR-V.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tier2ComputeStateBlob {
+    /// `local_size_x` from the SPIR-V `LocalSize` execution
+    /// mode (or `LocalSizeId` for spec-constant sizing).
+    pub local_size_x: u32,
+    /// `local_size_y`.
+    pub local_size_y: u32,
+    /// `local_size_z`.
+    pub local_size_z: u32,
+}
+
+impl Default for Tier2ComputeStateBlob {
+    /// Vulkan's spec default: 1x1x1 if a shader doesn't
+    /// declare `LocalSize`. Apps should override.
+    fn default() -> Self {
+        Self { local_size_x: 1, local_size_y: 1, local_size_z: 1 }
+    }
+}
+
 /// Tier-2 pipeline state blob — postcard-encoded inside
 /// [`super::payloads::PipelineCreatePayload::state_blob`] when
 /// the target backend is the tier-2 software renderer.

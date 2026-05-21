@@ -494,6 +494,27 @@ impl Session {
                     }
                 }
             }
+        } else if matches!(req.kind, PipelineKind::Compute) {
+            // Compute pipelines: shaders[0] is the CS; the
+            // state_blob (if present) is a Tier2ComputeStateBlob
+            // carrying the workgroup local-size triple.
+            if let Some(cs_sid) = req.shaders.first().copied() {
+                if let Some(rec) = self.table.get_shader(cs_sid) {
+                    if let Some(tier2) = rec.tier2_id {
+                        // Default workgroup size 1x1x1 if the
+                        // guest didn't send a blob.
+                        let cs_state = if req.state_blob.is_empty() {
+                            aqueduct_gpu::Tier2ComputeStateBlob::default()
+                        } else {
+                            postcard::from_bytes::<
+                                aqueduct_gpu::Tier2ComputeStateBlob,
+                            >(&req.state_blob).unwrap_or_default()
+                        };
+                        self.backend.bind_pipeline_tier2_compute(
+                            req.pipeline_id, tier2, cs_state);
+                    }
+                }
+            }
         }
         Ok(())
     }

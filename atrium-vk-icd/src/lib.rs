@@ -391,6 +391,58 @@ struct AtriumShaderModule {
     shader_id: Option<aqueduct_gpu::ids::ResourceId>,
     /// sha-256 of the SPIR-V bytecode at create time.
     bytecode_hash: [u8; 32],
+    /// `LocalSize` execution mode (x, y, z) extracted from
+    /// the SPIR-V at shader-module-create time, if any.
+    /// Compute pipelines (vkCreateComputePipelines) propagate
+    /// this onto the Tier2ComputeStateBlob so the host
+    /// dispatcher iterates the right local-invocation count.
+    /// `None` for shaders without `LocalSize` (vertex,
+    /// fragment, and compute shaders that use spec-constant
+    /// `LocalSizeId` -- the latter falls back to 1x1x1).
+    local_size: Option<(u32, u32, u32)>,
+}
+
+/// Scan SPIR-V bytecode for the `LocalSize` execution mode
+/// and return `(x, y, z)` if present. Hand-rolled: no
+/// dependency on rspirv from the lib (only tests pull it in).
+///
+/// SPIR-V layout: 5-word header followed by 32-bit-word
+/// instructions where each instruction's first word is
+/// `(word_count << 16) | opcode`. We're looking for
+/// `OpExecutionMode` (opcode 16) with `mode = LocalSize`
+/// (17), whose operand layout is
+/// `[target_id, mode, x, y, z]`.
+fn scan_spirv_local_size(spirv: &[u8]) -> Option<(u32, u32, u32)> {
+    if spirv.len() < 20 || spirv.len() % 4 != 0 { return None; }
+    // Validate magic.
+    let magic = u32::from_le_bytes(spirv[0..4].try_into().unwrap());
+    if magic != 0x07230203 { return None; }
+    let mut cursor = 20; // skip 5-word header
+    while cursor + 4 <= spirv.len() {
+        let head = u32::from_le_bytes(spirv[cursor..cursor + 4].try_into().unwrap());
+        let word_count = (head >> 16) as usize;
+        let opcode = (head & 0xFFFF) as u16;
+        if word_count == 0 { return None; } // malformed
+        let instr_bytes = word_count * 4;
+        if cursor + instr_bytes > spirv.len() { return None; }
+        // OpExecutionMode = 16, with mode operand at word index 2.
+        if opcode == 16 && word_count >= 6 {
+            let mode = u32::from_le_bytes(
+                spirv[cursor + 8..cursor + 12].try_into().unwrap());
+            // LocalSize = 17.
+            if mode == 17 {
+                let x = u32::from_le_bytes(
+                    spirv[cursor + 12..cursor + 16].try_into().unwrap());
+                let y = u32::from_le_bytes(
+                    spirv[cursor + 16..cursor + 20].try_into().unwrap());
+                let z = u32::from_le_bytes(
+                    spirv[cursor + 20..cursor + 24].try_into().unwrap());
+                return Some((x, y, z));
+            }
+        }
+        cursor += instr_bytes;
+    }
+    None
 }
 
 /// ICD-side state for a `VkImage`. Created by vkCreateImage;
@@ -3550,6 +3602,9 @@ pub unsafe extern "C" fn vkCreateShaderModule(
     hasher.update(&bytes);
     let bytecode_hash: [u8; 32] = hasher.finalize().into();
 
+    // Extract LocalSize before upload_shader consumes `bytes`.
+    let local_size = scan_spirv_local_size(&bytes);
+
     // Resolve-or-upload against the daemon. Failure (no live
     // client, validation rejection) leaves shader_id=None — the
     // module exists locally; downstream pipeline creation will
@@ -3570,7 +3625,9 @@ pub unsafe extern "C" fn vkCreateShaderModule(
     let handle = dev.next_shader_id.get();
     dev.next_shader_id.set(handle + 1);
     if let Ok(mut s) = dev.shaders.lock() {
-        s.insert(handle, AtriumShaderModule { shader_id, bytecode_hash });
+        s.insert(handle, AtriumShaderModule {
+            shader_id, bytecode_hash, local_size,
+        });
     } else {
         return VK_ERROR_INITIALIZATION_FAILED;
     }
@@ -4653,7 +4710,7 @@ pub unsafe extern "C" fn vkCreateComputePipelines(
     device:             VkDevice,
     _pipeline_cache:    u64,
     create_info_count:  u32,
-    _p_create_infos:    *const c_void,
+    p_create_infos:     *const c_void,
     _p_allocator:       *const c_void,
     p_pipelines:        *mut u64,
 ) -> VkResult {
@@ -4661,22 +4718,65 @@ pub unsafe extern "C" fn vkCreateComputePipelines(
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     let dev = &*(device as *const AtriumDevice);
-    let mut alloc = match dev.id_alloc.lock() {
-        Ok(a) => a,
-        Err(_) => return VK_ERROR_INITIALIZATION_FAILED,
-    };
-    let mut pipelines = match dev.pipelines.lock() {
-        Ok(p) => p,
-        Err(_) => return VK_ERROR_INITIALIZATION_FAILED,
-    };
+
     for i in 0..create_info_count {
-        let id = match alloc.next() {
-            Some(id) => id,
-            None     => return VK_ERROR_INITIALIZATION_FAILED,
+        let id = {
+            let mut alloc = match dev.id_alloc.lock() {
+                Ok(a) => a,
+                Err(_) => return VK_ERROR_INITIALIZATION_FAILED,
+            };
+            match alloc.next() {
+                Some(id) => id,
+                None     => return VK_ERROR_INITIALIZATION_FAILED,
+            }
         };
         let handle = id.raw() as u64;
-        pipelines.insert(handle, id);
+        if let Ok(mut pipelines) = dev.pipelines.lock() {
+            pipelines.insert(handle, id);
+        } else {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
         *p_pipelines.offset(i as isize) = handle;
+
+        if p_create_infos.is_null() { continue; }
+
+        // VkComputePipelineCreateInfo's `stage` field is an
+        // embedded VkPipelineShaderStageCreateInfo carrying
+        // the CS module handle. Resolve the module to its
+        // Tier-2 shader_id + local_size, build a
+        // Tier2ComputeStateBlob, send the wire envelope.
+        let info = &*(p_create_infos as *const ash::vk::ComputePipelineCreateInfo)
+            .offset(i as isize);
+        let mod_handle: u64 = std::mem::transmute(info.stage.module);
+        let (cs_rid, local_size) = match dev.shaders.lock() {
+            Ok(m) => match m.get(&mod_handle) {
+                Some(am) => (am.shader_id, am.local_size),
+                None => (None, None),
+            },
+            Err(_) => continue,
+        };
+        let Some(cs_rid) = cs_rid else { continue };
+
+        let blob = aqueduct_gpu::Tier2ComputeStateBlob {
+            local_size_x: local_size.map(|(x, _, _)| x).unwrap_or(1),
+            local_size_y: local_size.map(|(_, y, _)| y).unwrap_or(1),
+            local_size_z: local_size.map(|(_, _, z)| z).unwrap_or(1),
+        };
+        let Ok(bytes) = postcard::to_allocvec(&blob) else { continue };
+
+        if !dev.instance.is_null() {
+            let inst = &*(dev.instance as *const AtriumInstance);
+            if let Some(client) = inst.client.as_ref() {
+                if let Ok(mut c) = client.lock() {
+                    let _ = c.create_pipeline_with_id(
+                        id,
+                        aqueduct_gpu::payloads::PipelineKind::Compute,
+                        vec![cs_rid],
+                        bytes,
+                    );
+                }
+            }
+        }
     }
     VK_SUCCESS
 }
@@ -4691,11 +4791,9 @@ pub unsafe extern "C" fn vkCmdDispatch(
     group_count_z:  u32,
 ) {
     let Some(cb) = cmdbuf_recording(command_buffer) else { return };
-    let mut body = [0u8; 12];
-    body[ 0.. 4].copy_from_slice(&group_count_x.to_le_bytes());
-    body[ 4.. 8].copy_from_slice(&group_count_y.to_le_bytes());
-    body[ 8..12].copy_from_slice(&group_count_z.to_le_bytes());
-    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::Dispatch, &body);
+    let _ = cb.frame.push_dispatch(aqueduct_gpu::frame::DispatchCmd {
+        group_count_x, group_count_y, group_count_z,
+    });
 }
 
 /// `vkCmdNextSubpass` — no-op today. Atrium's render-pass model

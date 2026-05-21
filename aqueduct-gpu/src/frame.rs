@@ -432,6 +432,46 @@ impl BindIndexBufCmd {
     }
 }
 
+/// Body of [`FrameOp::Dispatch`] — mirrors `vkCmdDispatch`.
+/// 12 bytes (`groupCountX/Y/Z` as three little-endian u32s).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DispatchCmd {
+    /// Number of compute workgroups in X.
+    pub group_count_x: u32,
+    /// Number of compute workgroups in Y.
+    pub group_count_y: u32,
+    /// Number of compute workgroups in Z.
+    pub group_count_z: u32,
+}
+
+impl DispatchCmd {
+    /// Serialised body length in bytes.
+    pub const SIZE: usize = 12;
+
+    /// Encode into a fixed-size little-endian byte array.
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut b = [0u8; Self::SIZE];
+        b[0..4].copy_from_slice(&self.group_count_x.to_le_bytes());
+        b[4..8].copy_from_slice(&self.group_count_y.to_le_bytes());
+        b[8..12].copy_from_slice(&self.group_count_z.to_le_bytes());
+        b
+    }
+
+    /// Decode from a body slice. Errors on length mismatch.
+    pub fn from_bytes(body: &[u8]) -> Result<Self, FrameBodyError> {
+        if body.len() != Self::SIZE {
+            return Err(FrameBodyError::WrongLength {
+                op: "Dispatch", expected: Self::SIZE, got: body.len(),
+            });
+        }
+        Ok(Self {
+            group_count_x: u32::from_le_bytes(body[0..4].try_into().unwrap()),
+            group_count_y: u32::from_le_bytes(body[4..8].try_into().unwrap()),
+            group_count_z: u32::from_le_bytes(body[8..12].try_into().unwrap()),
+        })
+    }
+}
+
 /// Body of [`FrameOp::SetViewport`] — mirrors a single
 /// `VkViewport` entry. 24 bytes.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -536,6 +576,13 @@ impl FrameBuilder {
         -> Result<(), FrameDecodeError>
     {
         self.push(FrameOp::SetViewport, &cmd.to_bytes())
+    }
+
+    /// Encode and append a [`FrameOp::Dispatch`] record.
+    pub fn push_dispatch(&mut self, cmd: DispatchCmd)
+        -> Result<(), FrameDecodeError>
+    {
+        self.push(FrameOp::Dispatch, &cmd.to_bytes())
     }
 }
 
@@ -679,6 +726,14 @@ mod tests {
         bytes[4..8].copy_from_slice(&99u32.to_le_bytes());
         let r = BindIndexBufCmd::from_bytes(&bytes);
         assert_eq!(r, Err(FrameBodyError::BadIndexType(99)));
+    }
+
+    #[test]
+    fn dispatch_cmd_roundtrip() {
+        let cmd = DispatchCmd { group_count_x: 8, group_count_y: 4, group_count_z: 1 };
+        let b = cmd.to_bytes();
+        assert_eq!(b.len(), DispatchCmd::SIZE);
+        assert_eq!(DispatchCmd::from_bytes(&b).unwrap(), cmd);
     }
 
     #[test]

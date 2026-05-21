@@ -190,6 +190,18 @@ pub trait Backend: Send + Sync {
         _depth: Option<aqueduct_gpu::Tier2DepthState>,
         _blend: Option<aqueduct_gpu::Tier2BlendState>,
     ) {}
+
+    /// Associate a compute pipeline with its Tier-2 shader +
+    /// workgroup-size state. Mirror of
+    /// [`Backend::bind_pipeline_tier2_vs`] /
+    /// [`Backend::bind_pipeline_layout`] for the compute kind.
+    /// Default no-op.
+    fn bind_pipeline_tier2_compute(
+        &self,
+        _pipeline_id: ResourceId,
+        _tier2_shader_id: crate::Tier2ShaderId,
+        _compute_state: aqueduct_gpu::Tier2ComputeStateBlob,
+    ) {}
 }
 
 /// Protocol-correct backend that does no GPU work.
