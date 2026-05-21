@@ -920,18 +920,66 @@ fn translate_inst(
                     "AccessChain base var {base_id} not in iface.variables",
                 )))?;
 
+            // Captured dynamic step (if any).  Today we
+            // support exactly ONE non-constant index, and it
+            // must be the LAST index, stepping into a
+            // RuntimeArray member.  This matches the
+            // canonical `ssbo.data[i]` shape; richer dynamic
+            // chains land as needed.
             let mut byte_offset: u32 = 0;
-            for op in spv_inst.operands.iter().skip(1) {
+            let mut dynamic_step: Option<(Word, u32)> = None;
+            let operands: Vec<&Operand> = spv_inst.operands.iter().skip(1).collect();
+            for (step_i, op) in operands.iter().enumerate() {
+                let is_last = step_i == operands.len() - 1;
                 let idx_id = match op {
                     Operand::IdRef(id) => *id,
                     other => return Err(FrontendError::Malformed(format!(
                         "AccessChain expected IdRef index, got {other:?}",
                     ))),
                 };
-                let idx_const = constants.get(idx_id).ok_or_else(||
+                let idx_const_opt = constants.get(idx_id);
+                if idx_const_opt.is_none() && is_last {
+                    // Dynamic last-index path.  Step through
+                    // a RuntimeArray (or sized Array) pointee:
+                    // record (element_type, stride) so the
+                    // dynamic op can pick the right address
+                    // arithmetic.
+                    let raw = types.get_raw(current_pointee_id)
+                        .map_err(|_| FrontendError::Unsupported(format!(
+                            "dynamic AccessChain index but pointee \
+                             type {current_pointee_id} is not an array \
+                             (no raw type info)",
+                        )))?;
+                    let elem_type_id = match raw.class.opcode {
+                        rspirv::spirv::Op::TypeRuntimeArray
+                        | rspirv::spirv::Op::TypeArray => match raw.operands.first() {
+                            Some(Operand::IdRef(id)) => *id,
+                            other => return Err(FrontendError::Malformed(format!(
+                                "Array type missing element id: {other:?}",
+                            ))),
+                        },
+                        other => return Err(FrontendError::Unsupported(format!(
+                            "dynamic AccessChain through non-array pointee \
+                             (opcode {other:?}) not supported",
+                        ))),
+                    };
+                    let stride = crate::interface::ir_type_size_bytes_for(
+                        &types.types, elem_type_id);
+                    if stride == 0 {
+                        return Err(FrontendError::Unsupported(format!(
+                            "dynamic AccessChain element type {elem_type_id} \
+                             has no IR size (struct/aggregate elements not \
+                             supported yet)",
+                        )));
+                    }
+                    dynamic_step = Some((idx_id, stride));
+                    let _ = elem_type_id; // pointee no longer needed; break exits loop
+                    break;
+                }
+                let idx_const = idx_const_opt.ok_or_else(||
                     FrontendError::Unsupported(format!(
-                        "AccessChain index id {idx_id} is not a constant \
-                         (constraint B5 requires constant indices)",
+                        "AccessChain non-constant index id {idx_id} not in \
+                         last position or not stepping into a RuntimeArray",
                     )))?;
                 let idx_val: u32 = match &idx_const.kind {
                     ConstantKind::Scalar(Op::ConstInt { value, .. }) =>
@@ -962,12 +1010,43 @@ fn translate_inst(
                 }
             }
 
-            let result = alloc_or_get_result(result_id, result_ty, id_map, next_value_id);
-            insts.push(Inst {
-                op: Op::AccessChain { base, byte_offset },
-                result: Some(result),
-                source_spirv_offset,
-            });
+            let result = alloc_or_get_result(result_id, result_ty.clone(),
+                id_map, next_value_id);
+            if let Some((dyn_idx_id, stride)) = dynamic_step {
+                // Two-step emission: constant prefix
+                // AccessChain produces an intermediate
+                // pointer Value with the same result type;
+                // PtrOffsetDynamic adds index*stride to it.
+                let prefix_value = Value {
+                    id: ValueId(*next_value_id),
+                    ty: result_ty.clone(),
+                };
+                *next_value_id += 1;
+                insts.push(Inst {
+                    op: Op::AccessChain { base, byte_offset },
+                    result: Some(prefix_value.clone()),
+                    source_spirv_offset,
+                });
+                let dyn_idx_val = resolve_value(
+                    dyn_idx_id, types, constants, id_map,
+                    next_value_id, insts, source_spirv_offset,
+                )?;
+                insts.push(Inst {
+                    op: Op::PtrOffsetDynamic {
+                        base: prefix_value,
+                        index: dyn_idx_val,
+                        stride,
+                    },
+                    result: Some(result),
+                    source_spirv_offset,
+                });
+            } else {
+                insts.push(Inst {
+                    op: Op::AccessChain { base, byte_offset },
+                    result: Some(result),
+                    source_spirv_offset,
+                });
+            }
             Ok(())
         }
 

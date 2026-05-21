@@ -414,7 +414,7 @@ fn read_string(operands: &[Operand], i: usize) -> Result<String, FrontendError> 
 /// from the TypeContext's type map. Used to compute push-
 /// constant block totals from struct-member offsets +
 /// trailing-member size. Unknown types return 0.
-fn ir_type_size_bytes_for(
+pub(crate) fn ir_type_size_bytes_for(
     types: &HashMap<Word, atrium_spv_ir::Type>,
     id: Word,
 ) -> u32 {

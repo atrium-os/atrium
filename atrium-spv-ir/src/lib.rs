@@ -468,6 +468,28 @@ pub enum Op {
         /// Byte offset from `base` to the leaf pointee.
         byte_offset: u32,
     },
+    /// Dynamic pointer offset.  Produces `base + index *
+    /// stride`, used by the frontend when an SPIR-V
+    /// OpAccessChain index isn't a compile-time constant
+    /// (e.g. `ssbo.data[gid.x]`).  The frontend emits this
+    /// AFTER any constant-prefix `AccessChain` that walked
+    /// through enclosing struct members.
+    ///
+    /// `base` must be a Pointer-typed Value (a Variable or
+    /// the result of an AccessChain); the result has the
+    /// same Pointer type.  `index` is a u32/i32 Value;
+    /// `stride` is the element size in bytes (typically 4
+    /// for `u32`/`f32`, 16 for `vec4<f32>`).
+    PtrOffsetDynamic {
+        /// Base pointer (post any constant AccessChain).
+        base: Value,
+        /// Dynamic 32-bit integer index.
+        index: Value,
+        /// Element size in bytes.  Backends pick between
+        /// shift-by-log2 (power-of-two stride) and madd
+        /// (general case).
+        stride: u32,
+    },
 
     // ── Type conversions ───────────────────────────────────────
 
