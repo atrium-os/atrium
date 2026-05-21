@@ -1385,3 +1385,223 @@ fn tier2_backend_present_skips_callback_when_image_missing() {
     assert_eq!(*fired.lock().unwrap(), 0,
         "callback must not fire for a present whose source image is unknown");
 }
+
+#[test]
+fn tier2_backend_depth_attachment_persists_across_draws() {
+    use aqueduct_gpu::frame::{
+        BindDepthAttachmentCmd, BindVertexBufCmd, DrawCmd, FrameBuilder,
+        SetViewportCmd,
+    };
+    use aqueduct_gpu::opcodes::FrameOp;
+    use aqueduct_gpu::{
+        Tier2DepthState, VertexAttributeDesc, VertexBindingDesc,
+        VertexFormat, VertexInputState,
+    };
+
+    let cache_dir = TempDir::new().unwrap();
+    let registry = Arc::new(Tier2Registry::new(LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    }));
+    let vs_id = registry.register(&build_passthrough_vs_d5()).expect("vs");
+    let fs_red  = registry.register(&build_constant_color_spirv([1.0, 0.0, 0.0, 1.0])).unwrap();
+    let fs_blue = registry.register(&build_constant_color_spirv([0.0, 0.0, 1.0, 1.0])).unwrap();
+    let backend = Tier2Backend::new(registry);
+
+    let color_id  = ResourceId::new(IdNamespace::IcdRuntime, 0x40001);
+    let depth_id  = ResourceId::new(IdNamespace::IcdRuntime, 0x40002);
+    let pipe_red  = ResourceId::new(IdNamespace::IcdRuntime, 0x40003);
+    let pipe_blue = ResourceId::new(IdNamespace::IcdRuntime, 0x40004);
+    let vbuf_red  = ResourceId::new(IdNamespace::IcdRuntime, 0x40005);
+    let vbuf_blue = ResourceId::new(IdNamespace::IcdRuntime, 0x40006);
+
+    backend.image_created(color_id, 8, 8);
+    backend.register_depth_image(depth_id, 8, 8);
+
+    let layout = VertexInputState {
+        bindings: vec![VertexBindingDesc {
+            binding: 0, stride: 12, per_instance: false,
+        }],
+        attributes: vec![VertexAttributeDesc {
+            location: 0, binding: 0,
+            format: VertexFormat::R32g32b32Sfloat, offset: 0,
+        }],
+    };
+    let depth_on = Some(Tier2DepthState {
+        test_enable: true, write_enable: true,
+    });
+    for (pipe, fs) in [(pipe_red, fs_red), (pipe_blue, fs_blue)] {
+        backend.bind_pipeline_vs(pipe, vs_id);
+        backend.bind_pipeline(pipe, fs);
+        backend.bind_layout(pipe, layout.clone());
+        backend.bind_raster_state(pipe, depth_on, None);
+    }
+
+    // Red @ z=0.3 first, blue @ z=0.7 second.  LESS depth
+    // test makes blue lose: red pixels stay AND the depth
+    // image's pixels reflect z=0.3 in the triangle's interior.
+    let mut red_src = Vec::new();
+    let mut blue_src = Vec::new();
+    for v in [[-0.5_f32, -0.5, 0.3], [0.5, -0.5, 0.3], [0.0, 0.5, 0.3]] {
+        for f in v { red_src.extend_from_slice(&f.to_le_bytes()); }
+    }
+    for v in [[-0.5_f32, -0.5, 0.7], [0.5, -0.5, 0.7], [0.0, 0.5, 0.7]] {
+        for f in v { blue_src.extend_from_slice(&f.to_le_bytes()); }
+    }
+    backend.buffer_created(vbuf_red,  36);
+    backend.buffer_created(vbuf_blue, 36);
+    backend.buffer_write_bytes(vbuf_red,  0, &red_src).unwrap();
+    backend.buffer_write_bytes(vbuf_blue, 0, &blue_src).unwrap();
+
+    let mut fb = FrameBuilder::new(4096);
+    let mut begin = [0u8; 12];
+    begin[..4].copy_from_slice(&color_id.raw().to_le_bytes());
+    begin[4..8].copy_from_slice(&8u32.to_le_bytes());
+    begin[8..12].copy_from_slice(&8u32.to_le_bytes());
+    fb.push(FrameOp::BeginRenderPass, &begin).unwrap();
+    fb.push_bind_depth_attachment(BindDepthAttachmentCmd {
+        image_id: depth_id.raw(), clear_value: 1.0,
+    }).unwrap();
+    fb.push_set_viewport(SetViewportCmd {
+        x: 0.0, y: 0.0, width: 8.0, height: 8.0,
+        min_depth: 0.0, max_depth: 1.0,
+    }).unwrap();
+    // Red @ z=0.3
+    fb.push(FrameOp::BindPipeline, &pipe_red.raw().to_le_bytes()).unwrap();
+    fb.push_bind_vertex_buf(BindVertexBufCmd {
+        binding: 0, buffer_id: vbuf_red.raw(), offset: 0,
+    }).unwrap();
+    fb.push_draw(DrawCmd {
+        vertex_count: 3, instance_count: 1, first_vertex: 0, first_instance: 0,
+    }).unwrap();
+    // Blue @ z=0.7 -- loses to depth test
+    fb.push(FrameOp::BindPipeline, &pipe_blue.raw().to_le_bytes()).unwrap();
+    fb.push_bind_vertex_buf(BindVertexBufCmd {
+        binding: 0, buffer_id: vbuf_blue.raw(), offset: 0,
+    }).unwrap();
+    fb.push_draw(DrawCmd {
+        vertex_count: 3, instance_count: 1, first_vertex: 0, first_instance: 0,
+    }).unwrap();
+    fb.push(FrameOp::EndRenderPass, &[]).unwrap();
+
+    let fence = ResourceId::new(IdNamespace::IcdRuntime, 0x40007);
+    backend.submit_frame(fence, 1, fb.as_bytes());
+
+    // Color: interior pixels stay red (blue rejected by depth).
+    let pixels = backend.read_image_pixels(color_id).unwrap();
+    let px = |x: usize, y: usize| -> [u8; 4] {
+        let i = (y * 8 + x) * 4;
+        [pixels[i], pixels[i+1], pixels[i+2], pixels[i+3]]
+    };
+    assert_eq!(px(3, 3), [255, 0, 0, 255]);
+    assert_eq!(px(4, 4), [255, 0, 0, 255]);
+
+    // Depth image was written: interior pixels show z=0.3
+    // (the red draw's value), background pixels still at the
+    // BindDepthAttachment's clear_value (1.0).
+    let depth = backend.read_depth_image_pixels(depth_id).unwrap();
+    let dz = |x: usize, y: usize| -> f32 { depth[y * 8 + x] };
+    assert!((dz(3, 3) - 0.3).abs() < 1e-5,
+            "(3,3) depth = {}, expected 0.3", dz(3, 3));
+    assert!((dz(4, 4) - 0.3).abs() < 1e-5,
+            "(4,4) depth = {}, expected 0.3", dz(4, 4));
+    assert!((dz(0, 0) - 1.0).abs() < 1e-5,
+            "(0,0) depth = {}, expected 1.0 (cleared)", dz(0, 0));
+    assert!((dz(7, 7) - 1.0).abs() < 1e-5,
+            "(7,7) depth = {}, expected 1.0 (cleared)", dz(7, 7));
+}
+
+#[test]
+fn tier2_backend_depth_attachment_persists_across_passes() {
+    // Two render passes back-to-back against the same depth
+    // image. The cleared depth image from pass 1 should be
+    // re-cleared at the start of pass 2 (Vulkan's default
+    // LoadOp = Clear semantics).
+    use aqueduct_gpu::frame::{
+        BindDepthAttachmentCmd, BindVertexBufCmd, DrawCmd, FrameBuilder,
+        SetViewportCmd,
+    };
+    use aqueduct_gpu::opcodes::FrameOp;
+    use aqueduct_gpu::{
+        Tier2DepthState, VertexAttributeDesc, VertexBindingDesc,
+        VertexFormat, VertexInputState,
+    };
+
+    let cache_dir = TempDir::new().unwrap();
+    let registry = Arc::new(Tier2Registry::new(LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    }));
+    let vs_id = registry.register(&build_passthrough_vs_d5()).unwrap();
+    let fs_id = registry.register(&build_constant_color_spirv([0.0, 1.0, 0.0, 1.0])).unwrap();
+    let backend = Tier2Backend::new(registry);
+
+    let color_id = ResourceId::new(IdNamespace::IcdRuntime, 0x41001);
+    let depth_id = ResourceId::new(IdNamespace::IcdRuntime, 0x41002);
+    let pipe_id  = ResourceId::new(IdNamespace::IcdRuntime, 0x41003);
+    let vbuf_id  = ResourceId::new(IdNamespace::IcdRuntime, 0x41004);
+    backend.image_created(color_id, 8, 8);
+    backend.register_depth_image(depth_id, 8, 8);
+    backend.bind_pipeline_vs(pipe_id, vs_id);
+    backend.bind_pipeline(pipe_id, fs_id);
+    backend.bind_layout(pipe_id, VertexInputState {
+        bindings: vec![VertexBindingDesc {
+            binding: 0, stride: 12, per_instance: false,
+        }],
+        attributes: vec![VertexAttributeDesc {
+            location: 0, binding: 0,
+            format: VertexFormat::R32g32b32Sfloat, offset: 0,
+        }],
+    });
+    backend.bind_raster_state(pipe_id,
+        Some(Tier2DepthState { test_enable: true, write_enable: true }),
+        None);
+
+    let mut src = Vec::new();
+    for v in [[-0.5_f32, -0.5, 0.5], [0.5, -0.5, 0.5], [0.0, 0.5, 0.5]] {
+        for f in v { src.extend_from_slice(&f.to_le_bytes()); }
+    }
+    backend.buffer_created(vbuf_id, 36);
+    backend.buffer_write_bytes(vbuf_id, 0, &src).unwrap();
+
+    // Build a frame with TWO render passes: each binds the same
+    // depth image with clear=1.0, draws the triangle at z=0.5.
+    let mut fb = FrameBuilder::new(8192);
+    for _pass in 0..2 {
+        let mut begin = [0u8; 12];
+        begin[..4].copy_from_slice(&color_id.raw().to_le_bytes());
+        begin[4..8].copy_from_slice(&8u32.to_le_bytes());
+        begin[8..12].copy_from_slice(&8u32.to_le_bytes());
+        fb.push(FrameOp::BeginRenderPass, &begin).unwrap();
+        fb.push_bind_depth_attachment(BindDepthAttachmentCmd {
+            image_id: depth_id.raw(), clear_value: 1.0,
+        }).unwrap();
+        fb.push_set_viewport(SetViewportCmd {
+            x: 0.0, y: 0.0, width: 8.0, height: 8.0,
+            min_depth: 0.0, max_depth: 1.0,
+        }).unwrap();
+        fb.push(FrameOp::BindPipeline, &pipe_id.raw().to_le_bytes()).unwrap();
+        fb.push_bind_vertex_buf(BindVertexBufCmd {
+            binding: 0, buffer_id: vbuf_id.raw(), offset: 0,
+        }).unwrap();
+        fb.push_draw(DrawCmd {
+            vertex_count: 3, instance_count: 1, first_vertex: 0, first_instance: 0,
+        }).unwrap();
+        fb.push(FrameOp::EndRenderPass, &[]).unwrap();
+    }
+
+    let fence = ResourceId::new(IdNamespace::IcdRuntime, 0x41005);
+    backend.submit_frame(fence, 1, fb.as_bytes());
+
+    // Both passes drew the same triangle at z=0.5; final depth
+    // image's interior is 0.5 (regardless of which pass won
+    // the LESS test -- both equal-z passes from a freshly-
+    // cleared depth buffer write 0.5).
+    let depth = backend.read_depth_image_pixels(depth_id).unwrap();
+    let dz = |x: usize, y: usize| -> f32 { depth[y * 8 + x] };
+    assert!((dz(3, 3) - 0.5).abs() < 1e-5);
+    assert!((dz(0, 0) - 1.0).abs() < 1e-5,
+            "background still cleared after both passes; got {}", dz(0, 0));
+}

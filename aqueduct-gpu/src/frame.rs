@@ -432,6 +432,51 @@ impl BindIndexBufCmd {
     }
 }
 
+/// Body of [`FrameOp::BindDepthAttachment`] — wires a
+/// previously-created depth image into the current render
+/// pass. 8 bytes: `{ image_id: u32, clear_value: f32 }`.
+///
+/// Tier-2 stores the bytes per-image (not per-pass) so the
+/// depth values persist across draws within a pass and
+/// across passes that reuse the same image (e.g. shadow-map
+/// → forward render). `clear_value` is what the depth buffer
+/// gets seeded to on the first draw after the bind --
+/// typically `1.0` (the far-plane Z).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BindDepthAttachmentCmd {
+    /// Daemon-side ResourceId of the depth-format image.
+    pub image_id: u32,
+    /// Initial depth value used to clear the image when the
+    /// render pass starts (Vulkan's `VkClearValue.depth`).
+    pub clear_value: f32,
+}
+
+impl BindDepthAttachmentCmd {
+    /// Serialised body length in bytes.
+    pub const SIZE: usize = 8;
+
+    /// Encode into a fixed-size little-endian byte array.
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut b = [0u8; Self::SIZE];
+        b[0..4].copy_from_slice(&self.image_id.to_le_bytes());
+        b[4..8].copy_from_slice(&self.clear_value.to_le_bytes());
+        b
+    }
+
+    /// Decode from a body slice.
+    pub fn from_bytes(body: &[u8]) -> Result<Self, FrameBodyError> {
+        if body.len() != Self::SIZE {
+            return Err(FrameBodyError::WrongLength {
+                op: "BindDepthAttachment", expected: Self::SIZE, got: body.len(),
+            });
+        }
+        Ok(Self {
+            image_id:    u32::from_le_bytes(body[0..4].try_into().unwrap()),
+            clear_value: f32::from_le_bytes(body[4..8].try_into().unwrap()),
+        })
+    }
+}
+
 /// Body of [`FrameOp::Dispatch`] — mirrors `vkCmdDispatch`.
 /// 12 bytes (`groupCountX/Y/Z` as three little-endian u32s).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -584,6 +629,13 @@ impl FrameBuilder {
     {
         self.push(FrameOp::Dispatch, &cmd.to_bytes())
     }
+
+    /// Encode and append a [`FrameOp::BindDepthAttachment`] record.
+    pub fn push_bind_depth_attachment(&mut self, cmd: BindDepthAttachmentCmd)
+        -> Result<(), FrameDecodeError>
+    {
+        self.push(FrameOp::BindDepthAttachment, &cmd.to_bytes())
+    }
 }
 
 #[cfg(test)]
@@ -726,6 +778,16 @@ mod tests {
         bytes[4..8].copy_from_slice(&99u32.to_le_bytes());
         let r = BindIndexBufCmd::from_bytes(&bytes);
         assert_eq!(r, Err(FrameBodyError::BadIndexType(99)));
+    }
+
+    #[test]
+    fn bind_depth_attachment_cmd_roundtrip() {
+        let cmd = BindDepthAttachmentCmd {
+            image_id: 0x1234_5678, clear_value: 1.0,
+        };
+        let b = cmd.to_bytes();
+        assert_eq!(b.len(), BindDepthAttachmentCmd::SIZE);
+        assert_eq!(BindDepthAttachmentCmd::from_bytes(&b).unwrap(), cmd);
     }
 
     #[test]

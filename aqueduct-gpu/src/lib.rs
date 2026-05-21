@@ -57,8 +57,8 @@ pub use backends::{BackendId, GpuVendor};
 pub use frame::{
     FrameBuilder, FrameDecoder, FrameDecodeError,
     FrameBodyError,
-    DrawCmd, DrawIndexedCmd, BindVertexBufCmd, BindIndexBufCmd,
-    DispatchCmd, IndexType, SetViewportCmd,
+    DrawCmd, DrawIndexedCmd, BindDepthAttachmentCmd, BindVertexBufCmd,
+    BindIndexBufCmd, DispatchCmd, IndexType, SetViewportCmd,
 };
 pub use ids::{IdNamespace, ResourceId, BUNDLE_NAMESPACE_RANGE,
                BUILTIN_NAMESPACE, ICD_RUNTIME_NAMESPACE};

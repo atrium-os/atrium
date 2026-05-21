@@ -66,6 +66,18 @@ pub trait Backend: Send + Sync {
     /// Notify the backend an image was destroyed. Default no-op.
     fn image_destroyed(&self, _image_id: ResourceId) {}
 
+    /// Notify the backend a depth-format image was created.
+    /// Parallel to `image_created` but for `D32_SFLOAT`-style
+    /// images that need per-pixel `f32` storage instead of
+    /// RGBA8.  ICDs call this in vkBindImageMemory when the
+    /// bound image's format is a depth format.  Default no-op.
+    fn depth_image_created(
+        &self, _image_id: ResourceId, _width: u32, _height: u32,
+    ) {}
+
+    /// Notify the backend a depth image was destroyed.
+    fn depth_image_destroyed(&self, _image_id: ResourceId) {}
+
     /// Inline pixel write into an image. Called by the session when
     /// it processes `OP_GPU_IMAGE_WRITE`. SW backends copy into their
     /// per-image Pixmap; GPU backends stage through a transient

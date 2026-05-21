@@ -31,8 +31,8 @@ use crate::tier2_registry::{
 };
 
 use aqueduct_gpu::frame::{
-    BindIndexBufCmd, BindVertexBufCmd, DispatchCmd, DrawCmd, DrawIndexedCmd,
-    FrameDecoder, IndexType, SetViewportCmd,
+    BindDepthAttachmentCmd, BindIndexBufCmd, BindVertexBufCmd, DispatchCmd,
+    DrawCmd, DrawIndexedCmd, FrameDecoder, IndexType, SetViewportCmd,
 };
 use aqueduct_gpu::opcodes::FrameOp;
 use aqueduct_gpu::{
@@ -50,6 +50,19 @@ use aqueduct_gpu::{
 pub struct Tier2Backend {
     registry: Arc<Tier2Registry>,
     images:   Mutex<HashMap<u64, ImageStorage>>,
+    /// Depth-format image storage. Distinct map from `images`
+    /// (RGBA8 colour) because depth lives as `Vec<f32>` and
+    /// fill_image_triangle's depth_buffer parameter expects
+    /// `&mut [f32]`. Populated by `image_created_depth`;
+    /// referenced via `BindDepthAttachment` in the wire.
+    depth_images: Mutex<HashMap<u32, DepthImageStorage>>,
+    /// Per-(image_id) flag: has this depth image been
+    /// cleared yet in the current render pass?  The walker
+    /// resets it on EndRenderPass; a fresh BindDepthAttachment
+    /// inside a pass triggers a one-shot fill_with(clear_value).
+    /// Avoids re-clearing on every BindDepthAttachment when an
+    /// app re-issues it mid-pass.
+    depth_clear_cleared: Mutex<HashMap<u32, bool>>,
     /// Per-buffer byte storage keyed by `ResourceId.raw()`.
     /// Populated on `buffer_created`; filled by
     /// `buffer_write_bytes`. The draw-walker (D.3+) reads
@@ -189,6 +202,11 @@ struct PassState {
     /// the currently-bound pipeline. `None` if the bound
     /// pipeline is graphics (or nothing's bound).
     tier2_compute: Option<(Tier2ShaderId, Tier2ComputeStateBlob)>,
+    /// Depth attachment image_id for the current render
+    /// pass (set by FrameOp::BindDepthAttachment). `None`
+    /// means draws fall back to the per-pass scratch depth
+    /// buffer.
+    depth_attachment: Option<u32>,
     /// Vertex-buffer bindings keyed by slot number.
     vertex_buffers: HashMap<u32, BoundVertexBuffer>,
     /// Currently-bound index buffer.
@@ -236,6 +254,18 @@ struct ImageStorage {
     pixels: Vec<u8>,
 }
 
+/// Per-image depth (`D32_SFLOAT`-equivalent) storage.  One
+/// `f32` per pixel.  Persists across draws and across
+/// render passes -- the only reset point is an explicit
+/// `BindDepthAttachment` whose `clear_value` re-fills the
+/// buffer, and only the first time per pass.
+#[allow(dead_code)] // width / height are debug-only for now
+struct DepthImageStorage {
+    width: u32,
+    height: u32,
+    pixels: Vec<f32>,
+}
+
 /// Per-buffer byte storage owned by the backend. `size` is the
 /// declared capacity from `OP_GPU_BUFFER_CREATE`; `bytes` is
 /// pre-zeroed to that size so partial writes via
@@ -254,6 +284,8 @@ impl Tier2Backend {
         Self {
             registry,
             images: Mutex::new(HashMap::new()),
+            depth_images: Mutex::new(HashMap::new()),
+            depth_clear_cleared: Mutex::new(HashMap::new()),
             buffers: Mutex::new(HashMap::new()),
             pipeline_shaders: Mutex::new(HashMap::new()),
             pipeline_vs_shaders: Mutex::new(HashMap::new()),
@@ -497,6 +529,37 @@ impl Tier2Backend {
         images.get(&(image_id.raw() as u64)).map(|img| img.pixels.clone())
     }
 
+    /// Register a depth-format image. Called by the session
+    /// when `OP_GPU_IMAGE_CREATE` arrives with a depth-aspect
+    /// format (the existing `image_created` hook is RGBA8-
+    /// only; depth needs `Vec<f32>` storage).
+    pub fn register_depth_image(
+        &self, image_id: ResourceId, width: u32, height: u32,
+    ) {
+        if width == 0 || height == 0 { return; }
+        const MAX_DIM: u32 = 16 * 1024;
+        if width > MAX_DIM || height > MAX_DIM { return; }
+        let pixels = vec![f32::INFINITY;
+            (width as usize) * (height as usize)];
+        self.depth_images.lock().unwrap().insert(image_id.raw(),
+            DepthImageStorage { width, height, pixels });
+    }
+
+    /// Drop a depth image's storage.
+    pub fn unregister_depth_image(&self, image_id: ResourceId) {
+        self.depth_images.lock().unwrap().remove(&image_id.raw());
+        self.depth_clear_cleared.lock().unwrap().remove(&image_id.raw());
+    }
+
+    /// Snapshot of a depth image's f32 pixels.  Used by tests
+    /// to verify depth was actually written / cleared.
+    pub fn read_depth_image_pixels(&self, image_id: ResourceId)
+        -> Option<Vec<f32>>
+    {
+        self.depth_images.lock().unwrap()
+            .get(&image_id.raw()).map(|d| d.pixels.clone())
+    }
+
     /// Run the per-pass state machine over `pass_bytes`. Walks
     /// every FrameOp record between BeginRenderPass and
     /// EndRenderPass, maintains bound state, and dispatches
@@ -569,6 +632,33 @@ impl Tier2Backend {
                     Ok(cmd) => state.viewport = Some(cmd),
                     Err(e) => log::warn!("malformed SetViewport: {e}"),
                 },
+                FrameOp::BindDepthAttachment => {
+                    match BindDepthAttachmentCmd::from_bytes(body) {
+                        Ok(cmd) => {
+                            // Clear the depth image's pixels on the
+                            // first bind of this render pass; later
+                            // re-binds of the same image inside the
+                            // pass leave existing depth alone (lets
+                            // apps re-issue the bind without
+                            // wiping work-in-progress).
+                            let already_cleared = self.depth_clear_cleared
+                                .lock().unwrap()
+                                .get(&cmd.image_id).copied().unwrap_or(false);
+                            if !already_cleared {
+                                if let Some(d) = self.depth_images
+                                    .lock().unwrap()
+                                    .get_mut(&cmd.image_id)
+                                {
+                                    d.pixels.fill(cmd.clear_value);
+                                }
+                                self.depth_clear_cleared.lock().unwrap()
+                                    .insert(cmd.image_id, true);
+                            }
+                            state.depth_attachment = Some(cmd.image_id);
+                        }
+                        Err(e) => log::warn!("malformed BindDepthAttachment: {e}"),
+                    }
+                }
                 FrameOp::PushConstants => {
                     // Body shape: 4-byte header (stage_mask u8 +
                     // offset u8 + reserved u16) followed by the
@@ -615,7 +705,17 @@ impl Tier2Backend {
                     }
                     Err(e) => log::warn!("malformed Dispatch: {e}"),
                 },
-                FrameOp::EndRenderPass => break,
+                FrameOp::EndRenderPass => {
+                    // Mark this pass's depth attachment as
+                    // "needs clear next pass". Vulkan's
+                    // default LoadOp is Clear, so the next
+                    // pass that binds the same depth image
+                    // expects fresh `clear_value` pixels.
+                    if let Some(id) = state.depth_attachment {
+                        self.depth_clear_cleared.lock().unwrap().remove(&id);
+                    }
+                    break;
+                }
                 // Ops we don't yet act on: SetScissor, BindDescriptors,
                 // CopyBufToImg, CopyImgToBuf, Blit, PipelineBarrier,
                 // Dispatch{,Indirect}, DrawIndirect, BeginRenderPass
@@ -731,17 +831,27 @@ impl Tier2Backend {
         // D.6: raster state -> per-draw blend + depth.
         let raster = state.raster.unwrap_or_default();
         let depth_enabled = raster.depth.map(|d| d.test_enable).unwrap_or(false);
-        if depth_enabled && depth_buffer.is_none() {
+
+        // Depth source priority:
+        //   1) Persisted depth attachment (BindDepthAttachment)
+        //      -> hold depth_images lock for the loop, use the
+        //         image's f32 pixels directly.
+        //   2) Per-pass scratch buffer (depth-test enabled but
+        //      no attachment bound) -- preserves the pre-
+        //      attachment behaviour for tests that don't wire
+        //      a depth image.
+        //   3) None (depth-test disabled).
+        let mut depth_lock = if depth_enabled {
+            state.depth_attachment.and_then(|id|
+                self.depth_images.lock().ok().map(|g| (id, g)))
+        } else { None };
+
+        if depth_enabled && depth_lock.is_none() && depth_buffer.is_none() {
             *depth_buffer = Some(vec![
                 f32::INFINITY;
                 (width as usize) * (height as usize)
             ]);
         }
-        // SAFETY note: when depth_enabled is false we pass
-        // None to fill_image_triangle even if the buffer was
-        // allocated by a previous draw in the same pass --
-        // matches Vulkan's "depth attachment optional per
-        // pipeline" model rather than per-render-pass.
 
         for t in 0..tri_count {
             let v0 = &assembled.bytes[(3*t)*stride   .. (3*t+1)*stride];
@@ -753,9 +863,13 @@ impl Tier2Backend {
                 blend_state: raster.blend,
                 ..Default::default()
             };
-            let db_ref = if depth_enabled {
+            let db_ref: Option<&mut [f32]> = if !depth_enabled {
+                None
+            } else if let Some((id, ref mut guard)) = depth_lock {
+                guard.get_mut(&id).map(|d| &mut d.pixels[..])
+            } else {
                 depth_buffer.as_deref_mut()
-            } else { None };
+            };
             if let Err(e) = self.registry.fill_image_triangle(
                 vs_shader_id, fs_shader_id,
                 &dt, width, height, pixels, db_ref,
@@ -1200,6 +1314,14 @@ impl Backend for Tier2Backend {
 
     fn image_destroyed(&self, image_id: ResourceId) {
         self.images.lock().unwrap().remove(&(image_id.raw() as u64));
+    }
+
+    fn depth_image_created(&self, image_id: ResourceId, width: u32, height: u32) {
+        self.register_depth_image(image_id, width, height);
+    }
+
+    fn depth_image_destroyed(&self, image_id: ResourceId) {
+        self.unregister_depth_image(image_id);
     }
 
     fn buffer_created(&self, buffer_id: ResourceId, size: u64) {

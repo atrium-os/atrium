@@ -206,6 +206,15 @@ pub enum FrameOp {
     BeginRenderPass = 0x0010,
     /// End the current render pass.
     EndRenderPass   = 0x0011,
+    /// Bind a depth attachment for the current render pass.
+    /// Optional follow-up to `BeginRenderPass` -- the guest's
+    /// framebuffer carries a depth attachment as
+    /// `attachments[1]` and the ICD emits this op after the
+    /// color BeginRenderPass to wire it in. Body is
+    /// `{ image_id: u32, clear_value: f32 }` (8 bytes).
+    /// Tier-1 ignores unknown ops; tier-2 consumes this to
+    /// persist depth across draws within and across passes.
+    BindDepthAttachment = 0x0012,
 
     /// Bind a pipeline (graphics or compute) by its resolved ID.
     BindPipeline    = 0x0020,
@@ -254,6 +263,7 @@ impl FrameOp {
         Some(match v {
             0x0010 => FrameOp::BeginRenderPass,
             0x0011 => FrameOp::EndRenderPass,
+            0x0012 => FrameOp::BindDepthAttachment,
             0x0020 => FrameOp::BindPipeline,
             0x0021 => FrameOp::BindDescriptors,
             0x0022 => FrameOp::BindVertexBuf,
@@ -288,6 +298,7 @@ mod tests {
     fn frame_op_roundtrip() {
         for op in [
             FrameOp::BeginRenderPass, FrameOp::EndRenderPass,
+            FrameOp::BindDepthAttachment,
             FrameOp::BindPipeline, FrameOp::BindDescriptors,
             FrameOp::BindVertexBuf, FrameOp::BindIndexBuf,
             FrameOp::SetViewport, FrameOp::SetScissor,
