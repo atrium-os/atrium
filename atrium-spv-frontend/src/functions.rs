@@ -1227,6 +1227,49 @@ fn translate_inst(
             Ok(())
         }
 
+        // OpAtomicIAdd: <result_type> <result_id> <pointer>
+        //               <memory_scope> <memory_semantics> <value>
+        // Memory scope + semantics are parsed but ignored:
+        // the Tier-2 serial dispatcher executes invocations
+        // one at a time, so the non-atomic load+add+store
+        // lowering is semantically equivalent.
+        SpvOp::AtomicIAdd => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed(
+                    "AtomicIAdd without result id".to_string()))?;
+            let result_type_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed(
+                    "AtomicIAdd without result type".to_string()))?;
+            let result_ty = types.get(result_type_id)?.clone();
+            let ptr_id = expect_id(&spv_inst.operands, 0)?;
+            // Operands 1 and 2 are memory_scope + memory_semantics
+            // (both id-refs to scalar int constants); skipped.
+            let value_id = expect_id(&spv_inst.operands, 3)?;
+
+            let ptr_value = match resolve_variable(
+                ptr_id, types, iface, id_map, next_value_id,
+            )? {
+                Some(v) => v,
+                None => id_map.get(&ptr_id).cloned().ok_or_else(||
+                    FrontendError::Malformed(format!(
+                        "AtomicIAdd pointer id {ptr_id} not a Variable \
+                         and not in id_map (no prior AccessChain)",
+                    )))?,
+            };
+            let value = resolve_value(
+                value_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset,
+            )?;
+            let result = alloc_or_get_result(
+                result_id, result_ty, id_map, next_value_id);
+            insts.push(Inst {
+                op: Op::AtomicIAdd { ptr: ptr_value, value },
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
+
         other => Err(FrontendError::Unsupported(format!(
             "opcode {other:?} not supported in phase 1 v3",
         ))),
