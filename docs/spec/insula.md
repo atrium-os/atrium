@@ -2786,10 +2786,8 @@ Written:
   channel broker (sketched from §19 of this spec).
 - [`docs/spec/atrium-ax.md`](atrium-ax.md) — accessibility
   tree composition (sketched from §10.4 of this spec).
-
-Planned, not yet written:
-- `docs/spec/insula-host-macos.md` — macOS host adapter
-  (referenced from §0.7).
+- [`docs/spec/insula-host-macos.md`](insula-host-macos.md)
+  — macOS host adapter (sketched from §0.7 of this spec).
 
 ### Explicitly NOT used by Insula
 
