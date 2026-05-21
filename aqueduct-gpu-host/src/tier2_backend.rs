@@ -102,6 +102,12 @@ pub struct Tier2Backend {
     /// wrote into the `out_buffer` parameter through its
     /// `StorageBuffer` storage-class variable).
     last_compute_output: Mutex<Option<Vec<u8>>>,
+    /// Last-dispatch per-binding SSBO snapshots.  Index =
+    /// binding number.  Populated when the bound compute
+    /// pipeline declares >= 2 SSBO bindings (multi-binding
+    /// arc).  For the single-binding legacy path, this stays
+    /// empty and callers read `last_compute_output` instead.
+    last_compute_outputs_by_binding: Mutex<Vec<Vec<u8>>>,
     /// Per-dispatch SSBO size in bytes.  Default 4 KiB.
     compute_output_capacity: std::sync::atomic::AtomicUsize,
     submissions: AtomicU64,
@@ -294,6 +300,7 @@ impl Tier2Backend {
             pipeline_compute: Mutex::new(HashMap::new()),
             cs_invocations: AtomicU64::new(0),
             last_compute_output: Mutex::new(None),
+            last_compute_outputs_by_binding: Mutex::new(Vec::new()),
             compute_output_capacity: std::sync::atomic::AtomicUsize::new(4096),
             last_assembled_vertices: Mutex::new(None),
             presented_frames: Mutex::new(HashMap::new()),
@@ -490,6 +497,16 @@ impl Tier2Backend {
     /// override via [`Tier2Backend::set_compute_output_capacity`].
     pub fn compute_output_bytes(&self) -> Option<Vec<u8>> {
         self.last_compute_output.lock().unwrap().clone()
+    }
+
+    /// Snapshot of the per-binding output buffer for binding
+    /// `b` from the most recent multi-binding dispatch.
+    /// Returns `None` if the last dispatch was single-binding
+    /// (use [`Tier2Backend::compute_output_bytes`] for that)
+    /// or if `b` is out of range.
+    pub fn compute_output_bytes_for_binding(&self, b: u32) -> Option<Vec<u8>> {
+        let g = self.last_compute_outputs_by_binding.lock().unwrap();
+        g.get(b as usize).cloned()
     }
 
     /// Set the per-dispatch output-buffer capacity (bytes).
@@ -1066,12 +1083,33 @@ impl Tier2Backend {
             return;
         }
 
-        // SSBO output buffer for this dispatch.  Zeroed at the
-        // start, mutated by `cs_main` invocations through the
-        // `StorageBuffer` storage class.
+        // SSBO output buffer(s) for this dispatch.  Zeroed
+        // at the start, mutated by `cs_main` invocations
+        // through the `StorageBuffer` storage class.
+        //
+        // Single-binding (legacy):
+        //   X2 = pointer to a single output buffer.
+        // Multi-binding (ssbo_binding_count >= 2):
+        //   X2 = pointer to a descriptor table -- an array
+        //   of u64 pointers, one per binding.  Each binding's
+        //   buffer is allocated separately so per-binding
+        //   readback works.
         let cap = self.compute_output_capacity.load(Ordering::Relaxed);
-        let mut out_buffer = vec![0u8; cap];
-        let out_ptr = out_buffer.as_mut_ptr();
+        let n_bindings = cs_state.ssbo_binding_count;
+        let mut per_binding: Vec<Vec<u8>>;
+        // descriptor_table must outlive the dispatch loop --
+        // out_ptr borrows from it for the multi-binding case.
+        let mut descriptor_table: Vec<u64> = Vec::new();
+        let out_ptr: *mut u8 = if n_bindings >= 2 {
+            per_binding = (0..n_bindings).map(|_| vec![0u8; cap]).collect();
+            descriptor_table = per_binding.iter_mut()
+                .map(|buf| buf.as_mut_ptr() as u64).collect();
+            descriptor_table.as_mut_ptr() as *mut u8
+        } else {
+            per_binding = vec![vec![0u8; cap]];
+            per_binding[0].as_mut_ptr()
+        };
+        let _ = descriptor_table;
 
         for gz in 0..cmd.group_count_z {
             for gy in 0..cmd.group_count_y {
@@ -1084,9 +1122,10 @@ impl Tier2Backend {
                                 // matches CsMain (checked at
                                 // open time); all pointers are
                                 // valid for at least this call.
-                                // out_buffer lives across the
-                                // whole loop so out_ptr is
-                                // valid throughout.
+                                // The output buffer(s) live in
+                                // per_binding (and the descriptor
+                                // table in descriptor_table)
+                                // across the whole loop.
                                 unsafe {
                                     cs_main(
                                         uni_ptr, pc_ptr, out_ptr,
@@ -1100,7 +1139,13 @@ impl Tier2Backend {
                 }
             }
         }
-        *self.last_compute_output.lock().unwrap() = Some(out_buffer);
+        if n_bindings >= 2 {
+            *self.last_compute_output.lock().unwrap() = None;
+            *self.last_compute_outputs_by_binding.lock().unwrap() = per_binding;
+        } else {
+            *self.last_compute_output.lock().unwrap() = Some(per_binding.remove(0));
+            self.last_compute_outputs_by_binding.lock().unwrap().clear();
+        }
         self.cs_invocations.fetch_add(total_invocations, Ordering::Relaxed);
         self.draws_executed.fetch_add(1, Ordering::Relaxed);
     }

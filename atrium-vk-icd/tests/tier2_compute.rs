@@ -1193,3 +1193,179 @@ fn vk_app_compute_ssbo_read_modify_write() {
     let _ = server_thread;
     let _ = std::fs::remove_file(&sock);
 }
+
+/// Compute SPIR-V with TWO SSBO bindings -- writes the
+/// constant 0xBADF00D to binding 0 and 0xDEADBEEF to
+/// binding 1.  Exercises the multi-binding descriptor-table
+/// path end-to-end: ICD scans the binding count, blobs it
+/// onto Tier2ComputeStateBlob, host builds a descriptor
+/// table at dispatch + bespoke pre-loads X16=tbl[0] /
+/// X17=tbl[1].  If the table mapping is wrong (e.g.
+/// bindings swapped, or both alias the same buffer), the
+/// per-binding readback will catch it.
+fn build_two_binding_constants_cs() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let void_fn = b.type_function(void, vec![]);
+    let s0 = b.type_struct(vec![u32_ty]);
+    b.decorate(s0, Decoration::Block, vec![]);
+    b.member_decorate(s0, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let s1 = b.type_struct(vec![u32_ty]);
+    b.decorate(s1, Decoration::Block, vec![]);
+    b.member_decorate(s1, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let p0 = b.type_pointer(None, StorageClass::StorageBuffer, s0);
+    let p1 = b.type_pointer(None, StorageClass::StorageBuffer, s1);
+    let pu = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+    let v0 = b.variable(p0, None, StorageClass::StorageBuffer, None);
+    b.decorate(v0, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(v0, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let v1 = b.variable(p1, None, StorageClass::StorageBuffer, None);
+    b.decorate(v1, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(v1, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(1)]);
+    let c_zero    = b.constant_bit32(u32_ty, 0);
+    let c_badfood = b.constant_bit32(u32_ty, 0x0BADF00D);
+    let c_dead    = b.constant_bit32(u32_ty, 0xDEADBEEF);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let d0 = b.access_chain(pu, None, v0, vec![c_zero]).unwrap();
+    b.store(d0, c_badfood, None, vec![]).unwrap();
+    let d1 = b.access_chain(pu, None, v1, vec![c_zero]).unwrap();
+    b.store(d1, c_dead, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![v0, v1]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn vk_app_compute_multi_binding_ssbo_routes_to_correct_buffers() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let sock = tmp_socket("compute_multi_binding");
+    let cache_dir = TempDir::new().unwrap();
+    let registry = Arc::new(Tier2Registry::new(LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    }));
+    let tier2_backend = Arc::new(Tier2Backend::new(registry.clone()));
+    let backend_for_listener: Arc<dyn Backend> = tier2_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap()
+        .with_tier2_registry(registry.clone());
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+
+    let _env = EnvLock::set(&sock);
+
+    let mut instance: VkInstance = std::ptr::null_mut();
+    unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
+    let mut pds: [VkPhysicalDevice; 1] = [std::ptr::null_mut(); 1];
+    let mut cap: u32 = 1;
+    unsafe { vkEnumeratePhysicalDevices(instance, &mut cap, pds.as_mut_ptr()); }
+    let mut device: VkDevice = std::ptr::null_mut();
+    unsafe { vkCreateDevice(pds[0], std::ptr::null(), std::ptr::null(), &mut device); }
+    let mut queue: VkQueue = std::ptr::null_mut();
+    unsafe { vkGetDeviceQueue(device, 0, 0, &mut queue); }
+
+    let cs_spv = build_two_binding_constants_cs();
+    let cs_mod = make_shader_module(device, &cs_spv);
+
+    use ash::vk;
+    use ash::vk::Handle;
+    let stage = vk::PipelineShaderStageCreateInfo {
+        s_type: vk::StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
+        p_next: std::ptr::null(),
+        flags: vk::PipelineShaderStageCreateFlags::empty(),
+        stage: vk::ShaderStageFlags::COMPUTE,
+        module: vk::ShaderModule::from_raw(cs_mod),
+        p_name: b"main\0".as_ptr() as *const i8,
+        p_specialization_info: std::ptr::null(),
+        _marker: std::marker::PhantomData,
+    };
+    let info = vk::ComputePipelineCreateInfo {
+        s_type: vk::StructureType::COMPUTE_PIPELINE_CREATE_INFO,
+        p_next: std::ptr::null(),
+        flags: vk::PipelineCreateFlags::empty(),
+        stage,
+        layout: vk::PipelineLayout::null(),
+        base_pipeline_handle: vk::Pipeline::null(),
+        base_pipeline_index: 0,
+        _marker: std::marker::PhantomData,
+    };
+    let infos = [info];
+    let mut pipeline: u64 = 0;
+    unsafe {
+        vkCreateComputePipelines(
+            device, 0, 1,
+            infos.as_ptr() as *const std::ffi::c_void,
+            std::ptr::null(), &mut pipeline,
+        );
+    }
+    assert!(pipeline != 0);
+    thread::sleep(Duration::from_millis(200));
+
+    let pid = aqueduct_gpu::ids::ResourceId(pipeline as u32);
+    let (_sid, cs_state) = tier2_backend.pipeline_compute(pid)
+        .expect("compute pipeline bound");
+    assert_eq!(cs_state.ssbo_binding_count, 2,
+        "ICD should detect 2 SSBO bindings; got {}",
+        cs_state.ssbo_binding_count);
+
+    let mut pool: u64 = 0;
+    unsafe { vkCreateCommandPool(device, std::ptr::null(), std::ptr::null(), &mut pool); }
+    let mut cb_info = [0u8; 40];
+    cb_info[0..4].copy_from_slice(&40u32.to_le_bytes());
+    cb_info[16..24].copy_from_slice(&pool.to_le_bytes());
+    cb_info[28..32].copy_from_slice(&1u32.to_le_bytes());
+    let mut cbs: [VkCommandBuffer; 1] = [std::ptr::null_mut(); 1];
+    unsafe { vkAllocateCommandBuffers(device, cb_info.as_ptr() as *const _, cbs.as_mut_ptr()); }
+    let cb = cbs[0];
+
+    unsafe { vkBeginCommandBuffer(cb, std::ptr::null()); }
+    unsafe { vkCmdBindPipeline(cb, 1, pipeline); }
+    unsafe { vkCmdDispatch(cb, 1, 1, 1); }
+    unsafe { vkEndCommandBuffer(cb); }
+
+    let mut submit = [0u8; 72];
+    submit[0..4].copy_from_slice(&4u32.to_le_bytes());
+    submit[40..44].copy_from_slice(&1u32.to_le_bytes());
+    let cb_arr = [cb];
+    submit[48..56].copy_from_slice(&(cb_arr.as_ptr() as u64).to_le_bytes());
+    unsafe {
+        vkQueueSubmit(queue, 1, submit.as_ptr() as *const _, std::ptr::null_mut());
+    }
+    thread::sleep(Duration::from_millis(300));
+
+    let b0 = tier2_backend.compute_output_bytes_for_binding(0)
+        .expect("binding 0 buffer");
+    let b1 = tier2_backend.compute_output_bytes_for_binding(1)
+        .expect("binding 1 buffer");
+    let got0 = u32::from_le_bytes(b0[0..4].try_into().unwrap());
+    let got1 = u32::from_le_bytes(b1[0..4].try_into().unwrap());
+    assert_eq!(got0, 0x0BADF00D,
+        "binding 0 should be 0x0BADF00D, got {got0:#x}");
+    assert_eq!(got1, 0xDEADBEEF,
+        "binding 1 should be 0xDEADBEEF, got {got1:#x}");
+
+    unsafe { atrium_vk_icd::vkDestroyInstance(instance, std::ptr::null()); }
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
