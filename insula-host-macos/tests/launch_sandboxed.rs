@@ -48,6 +48,7 @@ fn launches_echo_inside_sandbox() {
         container_dir: &container,
         args: &["hello-from-sandboxed-insula"],
         capture_output: true,
+        log_socket: None,
     };
 
     let mut child = launch(&manifest, &opts)
@@ -98,6 +99,7 @@ fn sandbox_actually_constrains_writes_outside_container() {
             outside_path, outside_path
         )],
         capture_output: true,
+        log_socket: None,
     };
 
     let mut child = launch(&manifest, &opts)

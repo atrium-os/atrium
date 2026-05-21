@@ -110,11 +110,25 @@ pub fn launch_installed(
     args: &[&str],
     capture_output: bool,
 ) -> Result<SandboxedChild, Error> {
+    launch_installed_with_log(app, args, capture_output, None)
+}
+
+/// As [`launch_installed`] but also threads through an
+/// `insula-logd` socket path. The launched app will
+/// have `$ATRIUM_LOG_SOCKET` set in its environment and
+/// an SBPL grant for the socket path.
+pub fn launch_installed_with_log(
+    app: &InstalledApp,
+    args: &[&str],
+    capture_output: bool,
+    log_socket: Option<&std::path::Path>,
+) -> Result<SandboxedChild, Error> {
     let opts = LaunchOptions {
         binary_path: &app.binary_path,
         container_dir: &app.container_dir,
         args,
         capture_output,
+        log_socket,
     };
     launch(&app.manifest, &opts)
 }

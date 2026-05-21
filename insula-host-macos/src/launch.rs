@@ -51,6 +51,30 @@ pub struct LaunchOptions<'a> {
     /// Whether to capture child stdout/stderr (`true`)
     /// or inherit from the parent (`false`).
     pub capture_output: bool,
+
+    /// Optional: path to an `insula-logd` socket the
+    /// app should route its log forwarding to. When
+    /// set, the launcher:
+    ///
+    /// 1. Sets `$ATRIUM_LOG_SOCKET` in the child's env
+    ///    so libatrium opens it during `atrium_init`.
+    /// 2. Emits an SBPL grant in the generated profile
+    ///    for the socket path (otherwise App Sandbox
+    ///    blocks the unix-socket connect).
+    pub log_socket: Option<&'a Path>,
+}
+
+impl<'a> LaunchOptions<'a> {
+    /// Convenience constructor with sensible defaults.
+    pub fn new(binary_path: &'a Path, container_dir: &'a Path) -> Self {
+        Self {
+            binary_path,
+            container_dir,
+            args: &[],
+            capture_output: false,
+            log_socket: None,
+        }
+    }
 }
 
 /// A spawned sandboxed Insula app.
@@ -89,7 +113,7 @@ pub fn launch(
     manifest: &Manifest,
     opts: &LaunchOptions,
 ) -> Result<SandboxedChild, Error> {
-    let profile = sbpl::render_profile(manifest);
+    let profile = sbpl::render_profile_with(manifest, opts.log_socket);
 
     let mut profile_file = tempfile::Builder::new()
         .prefix("insula-")
@@ -115,6 +139,10 @@ pub fn launch(
     cmd.arg(opts.binary_path);
     for a in opts.args {
         cmd.arg(a);
+    }
+
+    if let Some(sock) = opts.log_socket {
+        cmd.env("ATRIUM_LOG_SOCKET", sock);
     }
 
     if opts.capture_output {
