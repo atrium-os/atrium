@@ -830,6 +830,10 @@ impl FnTranslator {
             | Op::AtomicAnd { ptr, value }
             | Op::AtomicOr  { ptr, value }
             | Op::AtomicXor { ptr, value }
+            | Op::AtomicSMin { ptr, value }
+            | Op::AtomicSMax { ptr, value }
+            | Op::AtomicUMin { ptr, value }
+            | Op::AtomicUMax { ptr, value }
             | Op::AtomicExchange { ptr, value } => {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal(
@@ -847,6 +851,10 @@ impl FnTranslator {
                     Op::AtomicAnd  { .. } => builder.ins().band(old, val),
                     Op::AtomicOr   { .. } => builder.ins().bor(old, val),
                     Op::AtomicXor  { .. } => builder.ins().bxor(old, val),
+                    Op::AtomicSMin { .. } => builder.ins().smin(old, val),
+                    Op::AtomicSMax { .. } => builder.ins().smax(old, val),
+                    Op::AtomicUMin { .. } => builder.ins().umin(old, val),
+                    Op::AtomicUMax { .. } => builder.ins().umax(old, val),
                     Op::AtomicExchange { .. } => val, // write addend as-is
                     _ => unreachable!(),
                 };

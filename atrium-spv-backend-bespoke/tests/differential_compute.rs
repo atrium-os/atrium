@@ -598,10 +598,14 @@ fn build_atomic_op_cs(op: rspirv::spirv::Op) -> Vec<u8> {
     let gid_x = b.composite_extract(u32_ty, None, gid, vec![0]).unwrap();
     let dst = b.access_chain(ptr_u, None, ssbo, vec![c_zero]).unwrap();
     let _ = match op {
-        SpvOp::AtomicIAdd     => b.atomic_i_add (u32_ty, None, dst, c_scope, c_sem, gid_x),
-        SpvOp::AtomicAnd      => b.atomic_and   (u32_ty, None, dst, c_scope, c_sem, gid_x),
-        SpvOp::AtomicOr       => b.atomic_or    (u32_ty, None, dst, c_scope, c_sem, gid_x),
-        SpvOp::AtomicXor      => b.atomic_xor   (u32_ty, None, dst, c_scope, c_sem, gid_x),
+        SpvOp::AtomicIAdd     => b.atomic_i_add  (u32_ty, None, dst, c_scope, c_sem, gid_x),
+        SpvOp::AtomicAnd      => b.atomic_and    (u32_ty, None, dst, c_scope, c_sem, gid_x),
+        SpvOp::AtomicOr       => b.atomic_or     (u32_ty, None, dst, c_scope, c_sem, gid_x),
+        SpvOp::AtomicXor      => b.atomic_xor    (u32_ty, None, dst, c_scope, c_sem, gid_x),
+        SpvOp::AtomicSMin     => b.atomic_s_min  (u32_ty, None, dst, c_scope, c_sem, gid_x),
+        SpvOp::AtomicSMax     => b.atomic_s_max  (u32_ty, None, dst, c_scope, c_sem, gid_x),
+        SpvOp::AtomicUMin     => b.atomic_u_min  (u32_ty, None, dst, c_scope, c_sem, gid_x),
+        SpvOp::AtomicUMax     => b.atomic_u_max  (u32_ty, None, dst, c_scope, c_sem, gid_x),
         SpvOp::AtomicExchange => b.atomic_exchange(u32_ty, None, dst, c_scope, c_sem, gid_x),
         _ => panic!("unsupported test op {op:?}"),
     }.unwrap();
@@ -836,6 +840,55 @@ fn differential_atomic_cas_failure_path() {
         "CAS failure should leave value unchanged");
     assert_eq!(u32::from_le_bytes(b_buf[4..8].try_into().unwrap()), 7,
         "CAS should return the old value even on failure");
+}
+
+#[test]
+fn differential_atomic_umin_finds_smallest() {
+    // Prefill 100; gid_x in 0..6 atomicMin's it.  Result =
+    // min(100, 0, 1, 2, 3, 4, 5) = 0.
+    use rspirv::spirv::Op as SpvOp;
+    let got = run_atomic_diff(SpvOp::AtomicUMin, 100, 6);
+    assert_eq!(got, 0, "umin should reduce to 0; got {got}");
+}
+
+#[test]
+fn differential_atomic_umax_finds_largest() {
+    // Prefill 0; gid_x in 0..6 atomicMax's it.  Result =
+    // max(0, 0, 1, 2, 3, 4, 5) = 5.
+    use rspirv::spirv::Op as SpvOp;
+    let got = run_atomic_diff(SpvOp::AtomicUMax, 0, 6);
+    assert_eq!(got, 5, "umax should reduce to 5; got {got}");
+}
+
+#[test]
+fn differential_atomic_smin_signed_negatives() {
+    // Prefill 0x8000_0000 (= -2^31, smallest signed); gid_x
+    // in 0..4 SMin's it -- those are tiny POSITIVE values
+    // as signed, so the prefill stays the minimum.
+    use rspirv::spirv::Op as SpvOp;
+    let got = run_atomic_diff(SpvOp::AtomicSMin, 0x8000_0000, 4);
+    assert_eq!(got, 0x8000_0000,
+        "smin should keep the most-negative prefill; got {got:#x}");
+}
+
+#[test]
+fn differential_atomic_smax_keeps_positive_over_negative() {
+    // Prefill 0xFFFF_FFFF (= -1 signed); gid_x in 1..5 are
+    // 1..4 (positive signed).  SMax should bump the value
+    // up to 4.
+    use rspirv::spirv::Op as SpvOp;
+    let spv = build_atomic_op_cs(SpvOp::AtomicSMax);
+    let dir = TempDir::new().unwrap();
+    let mut b_buf = vec![0u8; 16];
+    let mut c_buf = vec![0u8; 16];
+    b_buf[0..4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+    c_buf[0..4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+    let gids: Vec<(u32, u32, u32)> = (1..5).map(|i| (i, 0, 0)).collect();
+    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &gids);
+    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &gids);
+    assert_eq!(b_buf, c_buf, "diverge on smax");
+    let got = u32::from_le_bytes(b_buf[0..4].try_into().unwrap());
+    assert_eq!(got, 4, "smax should leave 4; got {got}");
 }
 
 #[test]

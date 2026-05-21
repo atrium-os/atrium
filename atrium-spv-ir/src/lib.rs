@@ -576,6 +576,34 @@ pub enum Op {
         /// Value to write if comparison succeeds.
         desired: Value,
     },
+    /// `*ptr = min(*ptr, value)` (signed); returns old value.
+    AtomicSMin {
+        /// Pointer.
+        ptr: Value,
+        /// Comparand.
+        value: Value,
+    },
+    /// `*ptr = max(*ptr, value)` (signed); returns old value.
+    AtomicSMax {
+        /// Pointer.
+        ptr: Value,
+        /// Comparand.
+        value: Value,
+    },
+    /// `*ptr = min(*ptr, value)` (unsigned); returns old value.
+    AtomicUMin {
+        /// Pointer.
+        ptr: Value,
+        /// Comparand.
+        value: Value,
+    },
+    /// `*ptr = max(*ptr, value)` (unsigned); returns old value.
+    AtomicUMax {
+        /// Pointer.
+        ptr: Value,
+        /// Comparand.
+        value: Value,
+    },
     /// Atomic unconditional swap. Returns previous value.
     AtomicExchange {
         /// Pointer.

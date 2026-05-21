@@ -1348,6 +1348,8 @@ fn translate_inst(
 
         SpvOp::AtomicIAdd
         | SpvOp::AtomicAnd | SpvOp::AtomicOr | SpvOp::AtomicXor
+        | SpvOp::AtomicSMin | SpvOp::AtomicSMax
+        | SpvOp::AtomicUMin | SpvOp::AtomicUMax
         | SpvOp::AtomicExchange => {
             let result_id = spv_inst.result_id.ok_or_else(||
                 FrontendError::Malformed(
@@ -1382,6 +1384,10 @@ fn translate_inst(
                 SpvOp::AtomicAnd      => Op::AtomicAnd      { ptr: ptr_value, value },
                 SpvOp::AtomicOr       => Op::AtomicOr       { ptr: ptr_value, value },
                 SpvOp::AtomicXor      => Op::AtomicXor      { ptr: ptr_value, value },
+                SpvOp::AtomicSMin     => Op::AtomicSMin     { ptr: ptr_value, value },
+                SpvOp::AtomicSMax     => Op::AtomicSMax     { ptr: ptr_value, value },
+                SpvOp::AtomicUMin     => Op::AtomicUMin     { ptr: ptr_value, value },
+                SpvOp::AtomicUMax     => Op::AtomicUMax     { ptr: ptr_value, value },
                 SpvOp::AtomicExchange => Op::AtomicExchange { ptr: ptr_value, value },
                 _ => unreachable!(),
             };

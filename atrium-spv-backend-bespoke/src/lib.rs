@@ -1714,6 +1714,10 @@ fn emit_function(
             | Op::AtomicAnd { ptr, value }
             | Op::AtomicOr  { ptr, value }
             | Op::AtomicXor { ptr, value }
+            | Op::AtomicSMin { ptr, value }
+            | Op::AtomicSMax { ptr, value }
+            | Op::AtomicUMin { ptr, value }
+            | Op::AtomicUMax { ptr, value }
             | Op::AtomicExchange { ptr, value } => {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal(
@@ -1736,11 +1740,36 @@ fn emit_function(
                 let w_old = int_pool.alloc(result.id)?;
                 a.emit(asm::ldr_w_offset(w_old, x_base, base_off as u16));
                 let w_new = asm::Wreg(9); // scratch
-                let new_inst = match &inst.op {
-                    Op::AtomicIAdd { .. } => asm::add_w(w_new, w_old, w_value),
-                    Op::AtomicAnd  { .. } => asm::and_w(w_new, w_old, w_value),
-                    Op::AtomicOr   { .. } => asm::orr_w(w_new, w_old, w_value),
-                    Op::AtomicXor  { .. } => asm::eor_w(w_new, w_old, w_value),
+                let single_inst: Option<u32> = match &inst.op {
+                    Op::AtomicIAdd { .. } => Some(asm::add_w(w_new, w_old, w_value)),
+                    Op::AtomicAnd  { .. } => Some(asm::and_w(w_new, w_old, w_value)),
+                    Op::AtomicOr   { .. } => Some(asm::orr_w(w_new, w_old, w_value)),
+                    Op::AtomicXor  { .. } => Some(asm::eor_w(w_new, w_old, w_value)),
+                    // Min/Max: compare + csel.  Pick the
+                    // condition based on signed vs unsigned
+                    // and Min vs Max.  csel writes the
+                    // FIRST operand when the condition
+                    // holds, otherwise the second.
+                    //
+                    //   SMin: cmp old, val; csel new, old, val, LT (signed)
+                    //   SMax: cmp old, val; csel new, old, val, GT (signed)
+                    //   UMin: cmp old, val; csel new, old, val, CC (unsigned LT == HS aka LO)
+                    //   UMax: cmp old, val; csel new, old, val, HI (unsigned GT)
+                    Op::AtomicSMin { .. } | Op::AtomicSMax { .. }
+                    | Op::AtomicUMin { .. } | Op::AtomicUMax { .. } => {
+                        let cond = match &inst.op {
+                            Op::AtomicSMin { .. } => asm::Cond::Lt,
+                            Op::AtomicSMax { .. } => asm::Cond::Gt,
+                            Op::AtomicUMin { .. } => asm::Cond::Cc, // unsigned <
+                            Op::AtomicUMax { .. } => asm::Cond::Hi, // unsigned >
+                            _ => unreachable!(),
+                        };
+                        a.emit(asm::cmp_w(w_old, w_value));
+                        a.emit(asm::csel_w(w_new, w_old, w_value, cond));
+                        a.emit(asm::str_w_offset(w_new, x_base, base_off as u16));
+                        ints.insert(result.id, w_old);
+                        continue;
+                    }
                     // Exchange writes the addend directly --
                     // no arithmetic.  Just str w_value.
                     Op::AtomicExchange { .. } => {
@@ -1750,7 +1779,7 @@ fn emit_function(
                     }
                     _ => unreachable!(),
                 };
-                a.emit(new_inst);
+                a.emit(single_inst.unwrap());
                 a.emit(asm::str_w_offset(w_new, x_base, base_off as u16));
                 ints.insert(result.id, w_old);
             }
@@ -3478,6 +3507,10 @@ fn compute_last_use_flat(
             | Op::AtomicAnd { ptr: _, value }
             | Op::AtomicOr  { ptr: _, value }
             | Op::AtomicXor { ptr: _, value }
+            | Op::AtomicSMin { ptr: _, value }
+            | Op::AtomicSMax { ptr: _, value }
+            | Op::AtomicUMin { ptr: _, value }
+            | Op::AtomicUMax { ptr: _, value }
             | Op::AtomicExchange { ptr: _, value }
             | Op::AtomicStore { ptr: _, value } => {
                 // value is an int scalar; mark for IntPool.
