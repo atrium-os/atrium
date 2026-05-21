@@ -319,6 +319,123 @@ safety) argument for Insula:
   downstream from getting the better (desktop-class)
   experience.
 
+## 0.7 Portability and bring-up strategy
+
+Insula's contract is OS-agnostic by construction —
+Aqueduct, Pergola, the manifest format, the userspace
+services (Limen, Tabellarius, Loculus, Concursus,
+Nomenclator) are portable. Only a per-OS **host adapter**
+is platform-specific. Insula is meant to ship on macOS,
+Linux, and Windows alongside Atrium, not as an
+Atrium-exclusive layer.
+
+### 0.7.1 macOS-first bring-up
+
+Four reasons stacked:
+
+1. **Adoption pre-Atrium.** macOS has developers and users;
+   Atrium has neither yet. Insula on macOS lets the model
+   accumulate evidence — real apps, real users, real
+   friction — before betting on the OS. De-risks the
+   platform claim by proving it works without the
+   platform.
+2. **Forces clean portability.** Building FreeBSD-first
+   bakes in FreeBSD-isms invisibly (jail, devfs, rctl,
+   Capsicum). macOS-first surfaces the abstractions from
+   day one. macOS is a *good* portability test: Unix-
+   shaped enough to feel familiar, different-enough
+   sandbox / IPC / process primitives to keep contracts
+   honest.
+3. **Validates "Aqueduct/Pergola are portable substrates."**
+   The claim is theoretical until macOS makes it concrete.
+   A working Insula-on-macOS *is* the evidence.
+4. **Lowers activation energy by orders of magnitude.**
+   `brew install insula-sdk` and a developer is building
+   their first app in 10 minutes. The alternative ("first
+   install this experimental OS in a VM") is a friction
+   wall most developers will not cross. Once apps exist
+   on macOS, porting to Atrium becomes "another supported
+   target," not "a leap of faith."
+
+### 0.7.2 The host-adapter abstraction
+
+Insula's contract is OS-agnostic. The bottom of the stack
+is host-specific. The boundary:
+
+| Insula concept | Atrium implementation | macOS implementation | Linux implementation | Windows implementation |
+|---|---|---|---|---|
+| Sandbox boundary | Portcullis (FreeBSD jail) | App Sandbox / Sandbox.kext + entitlements | Landlock + seccomp + namespaces (bubblewrap-shape) | AppContainer + Job objects |
+| Service launch | jaild + portcullisd | launchd + sandbox profiles | systemd + cgroups, or standalone supervisor | Service Control Manager / WinRT |
+| Capability enforcement | jail manifest + Capsicum allowlist | sandbox profile + entitlements | seccomp filter + Landlock ruleset | AppContainer capabilities + WinRT brokers |
+| Per-app networking | vnet jail + atrium-netd | Network Extension / Network.framework + broker | netns + nftables + broker | WFP + broker |
+| Identity / keychain | Vestibulum (native) | macOS Keychain wrapped behind Vestibulum API | Secret Service / libsecret wrapped | Credential Manager wrapped |
+| Resource limits | rctl | sandbox limits + posix `setrlimit` | cgroups v2 | Job Object limits |
+
+**Userspace services (Limen, Tabellarius, Loculus,
+Concursus, Nomenclator) are the same code on every host.**
+The host adapter is the only per-OS piece.
+
+This means the engineering effort to port Insula to a new
+OS is bounded — write one host adapter (~5–10K LoC, mostly
+sandbox + service launch + a thin networking shim) and
+everything else compiles and runs.
+
+### 0.7.3 Bring-up phases
+
+| Phase | Target | Goal |
+|---|---|---|
+| 1 | **macOS** | Reference SDK, reference IDE (§10.9), sample apps, Limen + Tabellarius + Loculus + Concursus + Nomenclator running on the macOS host adapter. Prove the contract end-to-end. |
+| 2 | **Linux** | Second host adapter (Landlock + seccomp + namespaces). Proves the contract is really portable, not "Apple-Unix-only." Adds the second-largest desktop user base. |
+| 3 | **Windows** | Third host adapter (AppContainer + Job objects). Three-OS coverage = developers stop worrying about platform availability. |
+| 4 | **Atrium** | Purpose-built Insula host. All the existing FreeBSD work culminates here. Atrium becomes "the OS that does Insula natively, with kernel-enforced jails + native GPU + native CAS-FS dedup." Best Insula experience, not the only one. |
+
+### 0.7.4 What is already in place
+
+Significant macOS-host work already exists in the broader
+Atrium codebase as part of the D0–D1 bring-up:
+
+- **Fresco runs on macOS** via venus → MoltenVK → Metal
+  (validated 2026-05-10, Cocoa window painted from Atrium
+  scenegraph).
+- **Aqueduct charter** explicitly mentions OS-agnostic
+  portability across BSDs / Linux / non-POSIX.
+- **macOS-host cross-compile workflow** is already the
+  daily-iteration shape (rust-lld + sysroot CRT in
+  `~/src/bsd/.cargo/config.toml`).
+- **kqueue is the event multiplexer** by design — and
+  macOS has kqueue natively.
+
+Insula on macOS reuses this foundation; only the new
+Insula-specific services (Limen, Tabellarius, etc.) and
+the macOS host adapter are net-new work.
+
+### 0.7.5 Atrium's repositioned pitch
+
+The phasing changes how Atrium is sold:
+
+- **Old framing:** "Switch to this new OS to run these new apps."
+- **New framing:** "Insula apps run on your Mac/Linux/Windows
+  today. Atrium is the OS purpose-built for Insula — best
+  performance, best security, kernel-enforced sandbox,
+  content-addressed FS — for users who want the maximum
+  experience."
+
+The OS becomes a *destination*, not a *prerequisite*. Users
+encounter Insula apps long before they encounter Atrium.
+Atrium then has a real value proposition for the users
+who graduate to it (security, perf, native primitives)
+rather than competing for cold-start adoption.
+
+### 0.7.6 What this means for the spec body
+
+The rest of this spec uses **Atrium-canonical terminology**
+(Portcullis, FreeBSD jail, Capsicum, rctl, vnet) because
+Atrium is the reference implementation. Where the spec
+says "Portcullis," read "Portcullis on Atrium; the host-
+adapter equivalent on macOS / Linux / Windows." The
+*Insula contract* is the same regardless of host; the
+*implementation primitive* varies per the table in §0.7.2.
+
 ```
 publisher                target device
 ─────────                ─────────────
@@ -467,6 +584,13 @@ sdk-version) tuple is cached in Tessera, keyed by the tuple.
 Subsequent installs of the same bundle skip the AOT step.
 
 ## 4. Sandbox and network capability
+
+> *Per §0.7.6, this section describes the Atrium-canonical
+> implementation. On macOS / Linux / Windows, the same
+> guarantees are provided by the host adapter — App
+> Sandbox, Landlock+seccomp, AppContainer respectively —
+> with equivalent capability shape but per-OS primitives.
+> See §0.7.2 for the mapping table.*
 
 ### 4.1 Jail shape
 
@@ -2531,8 +2655,13 @@ For each capability the platform might add:
 
 ## 25. Open questions
 
-- **Name.** Working title only. Needs to slot into the
-  Atrium architectural vocabulary.
+- **macOS host adapter scope and design.** §0.7 fixes
+  the strategy (macOS-first bring-up) and the abstraction
+  (host adapter). The actual implementation of the macOS
+  host adapter — sandbox profile generation from manifests,
+  launchd integration, Network.framework broker, Keychain
+  bridge to Vestibulum — needs its own spec. Likely
+  `docs/spec/insula-host-macos.md`.
 - **IR format precise choice.** WASM is the realistic pick;
   the exact link-shim shape between WASM module imports and
   `libatrium.so` needs spec work.
