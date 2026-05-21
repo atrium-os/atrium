@@ -134,7 +134,7 @@ fn fetch_reaches_mock_http_server_through_broker() {
 
     // install
     let out = run_insula(install_root.path(),
-                         &["install", bundle.path().to_str().unwrap()]);
+                         &["install", bundle.path().to_str().unwrap(), "--allow-unsigned"]);
     assert!(out.status.success(),
             "install failed: {}", String::from_utf8_lossy(&out.stderr));
 

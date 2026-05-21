@@ -18,6 +18,7 @@
 //! ```
 
 mod daemons;
+mod signing;
 use daemons::Daemon;
 
 use insula_bundle::InsulaBundle;
@@ -42,6 +43,9 @@ fn main() -> ExitCode {
         "launch" => cmd_launch(&args[2..], &install_root),
         "uninstall" => cmd_uninstall(&args[2..], &install_root),
         "daemons" => cmd_daemons(&args[2..], &install_root),
+        "keygen" => signing::cmd_keygen(&args[2..]),
+        "sign" => signing::cmd_sign(&args[2..]),
+        "publishers" => signing::cmd_publishers(&args[2..], &install_root),
         "help" | "-h" | "--help" => {
             print_usage();
             Ok(())
@@ -73,10 +77,20 @@ Commands:
   launch <app-id> [args]  Launch an installed app (inherits stdio).
                           Auto-spawns missing daemons.
   uninstall <app-id>      Remove an installed app + its container.
-  daemons up              Start insula-logd + vestibulum-macos.
+  daemons up              Start all platform daemons.
   daemons down            Stop them.
   daemons status          Show daemon state.
+  keygen <id> <out-dir>   Generate an ed25519 keypair for signing.
+  sign <bundle> --key <f> [--key-id <id>]
+                          Sign a bundle in place.
+  publishers add <id> <pub-file>   Add a trusted publisher.
+  publishers list                  Show trusted publishers.
+  publishers remove <id>           Remove a trusted publisher.
   help                    Show this help.
+
+Flags:
+  --allow-unsigned        Pass to `install` to skip signature
+                          verification (development only).
 
 Install root: $INSULA_INSTALL_ROOT (or ~/Library/Application Support/atrium-insula/)"
     );
@@ -104,7 +118,19 @@ fn resolve_install_root() -> PathBuf {
 // -----------------------------------------------------
 
 fn cmd_install(args: &[String], install_root: &Path) -> Result<(), String> {
-    let bundle_dir = args.first().ok_or_else(|| {
+    // Parse: <bundle-dir> [--allow-unsigned]
+    let mut bundle_dir: Option<&str> = None;
+    let mut allow_unsigned = false;
+    for a in args {
+        match a.as_str() {
+            "--allow-unsigned" => allow_unsigned = true,
+            other if !other.starts_with("--") => bundle_dir = Some(other),
+            other => {
+                return Err(format!("install: unknown flag '{}'", other));
+            }
+        }
+    }
+    let bundle_dir = bundle_dir.ok_or_else(|| {
         "install: missing <bundle-dir> argument".to_string()
     })?;
 
@@ -113,6 +139,28 @@ fn cmd_install(args: &[String], install_root: &Path) -> Result<(), String> {
 
     std::fs::create_dir_all(install_root)
         .map_err(|e| format!("create install root {}: {}", install_root.display(), e))?;
+
+    // Signature verification.
+    let sig_path = bundle.root.join("signature");
+    if sig_path.exists() {
+        let sig = signing::verify_bundle_signature(&bundle, install_root)
+            .map_err(|e| format!("signature check: {}", e))?;
+        println!(
+            "signature verified (key_id = {})",
+            sig.key_id
+        );
+    } else if allow_unsigned {
+        eprintln!(
+            "WARNING: installing unsigned bundle (--allow-unsigned set). \
+             Don't use this in production."
+        );
+    } else {
+        return Err(
+            "bundle is unsigned. Sign it with `insula sign`, or pass \
+             --allow-unsigned for dev installs."
+                .to_string(),
+        );
+    }
 
     let app = host::install(&bundle, install_root)
         .map_err(|e| format!("installing {}: {}", bundle.app_id(), e))?;

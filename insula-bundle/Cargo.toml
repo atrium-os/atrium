@@ -13,6 +13,9 @@ path = "src/lib.rs"
 [dependencies]
 insula-manifest = { path = "../insula-manifest" }
 thiserror       = "1"
+ed25519-dalek   = { version = "2", default-features = false, features = ["rand_core"] }
+sha2            = "0.10"
 
 [dev-dependencies]
 tempfile = "3"
+rand     = { version = "0.8", default-features = false, features = ["std", "std_rng"] }

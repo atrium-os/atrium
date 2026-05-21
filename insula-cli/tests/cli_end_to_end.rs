@@ -78,6 +78,7 @@ fn install_then_list_shows_app() {
     let out = run_insula(install_root.path(), &[
         "install",
         bundle_dir.path().to_str().unwrap(),
+        "--allow-unsigned",
     ]);
     assert!(out.status.success(),
             "install should succeed; stderr: {}",
@@ -112,6 +113,7 @@ fn info_prints_manifest_summary() {
     run_insula(install_root.path(), &[
         "install",
         bundle_dir.path().to_str().unwrap(),
+        "--allow-unsigned",
     ]);
 
     let out = run_insula(install_root.path(), &[
@@ -141,6 +143,7 @@ fn launch_runs_installed_app() {
     run_insula(install_root.path(), &[
         "install",
         bundle_dir.path().to_str().unwrap(),
+        "--allow-unsigned",
     ]);
 
     let out = run_insula(install_root.path(), &[
@@ -166,6 +169,7 @@ fn uninstall_removes_app() {
     run_insula(install_root.path(), &[
         "install",
         bundle_dir.path().to_str().unwrap(),
+        "--allow-unsigned",
     ]);
 
     let out = run_insula(install_root.path(), &[

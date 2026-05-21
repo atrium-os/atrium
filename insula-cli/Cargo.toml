@@ -14,7 +14,9 @@ path = "src/main.rs"
 insula-bundle     = { path = "../insula-bundle" }
 insula-host-macos = { path = "../insula-host-macos" }
 insula-manifest   = { path = "../insula-manifest" }
+ed25519-dalek     = { version = "2", default-features = false, features = ["rand_core"] }
 libc              = "0.2"
+rand              = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
 
 [dev-dependencies]
 tempfile = "3"

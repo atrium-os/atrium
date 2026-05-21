@@ -166,7 +166,7 @@ fn manifest_allowing_host_lets_app_connect() {
 
     // install
     let out = run_insula(install_root.path(), &workspace_root, &[],
-                         &["install", bundle_src.path().to_str().unwrap()]);
+                         &["install", bundle_src.path().to_str().unwrap(), "--allow-unsigned"]);
     assert!(out.status.success(), "install failed: {}",
             String::from_utf8_lossy(&out.stderr));
 
@@ -224,7 +224,7 @@ fn manifest_denying_host_blocks_app_connect() {
     build_hello_bundle(bundle_src.path(), &hello_bin, net_toml);
 
     let out = run_insula(install_root.path(), &workspace_root, &[],
-                         &["install", bundle_src.path().to_str().unwrap()]);
+                         &["install", bundle_src.path().to_str().unwrap(), "--allow-unsigned"]);
     assert!(out.status.success(), "install failed: {}",
             String::from_utf8_lossy(&out.stderr));
 

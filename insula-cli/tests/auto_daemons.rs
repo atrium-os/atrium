@@ -157,7 +157,7 @@ fn launch_auto_spawns_logd_and_routes_to_it() {
 
     // install
     let out = run_insula(install_root.path(), &logd_bin, &vest_bin,
-                         &["install", bundle.to_str().unwrap()]);
+                         &["install", bundle.to_str().unwrap(), "--allow-unsigned"]);
     assert!(out.status.success(),
             "install failed: {}", String::from_utf8_lossy(&out.stderr));
 

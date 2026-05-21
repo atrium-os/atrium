@@ -118,6 +118,7 @@ fn launch_with_logd_socket_routes_to_daemon() {
         .env("INSULA_INSTALL_ROOT", &install_root)
         .arg("install")
         .arg(&bundle)
+        .arg("--allow-unsigned")
         .output()
         .expect("insula install");
     assert!(out.status.success(),
