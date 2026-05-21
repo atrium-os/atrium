@@ -1726,6 +1726,79 @@ fn differential_load_sqrt_store_vec4() {
     assert_eq!(read(&b_buf, 7), 5.0);
 }
 
+/// FMax with TWO loaded vec4s (no constant) -- isolates
+/// whether the bug is in const-vec broadcast vs in
+/// per-lane FMax itself.
+#[test]
+fn differential_load_fmax_loaded_store_vec4() {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let std_450 = b.ext_inst_import("GLSL.std.450");
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let f32_ty = b.type_float(32, None);
+    let uvec3  = b.type_vector(u32_ty, 3);
+    let vec4   = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let s = b.type_struct(vec![vec4, vec4, vec4]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.member_decorate(s, 1, Decoration::Offset, vec![rspirv::dr::Operand::LiteralBit32(16)]);
+    b.member_decorate(s, 2, Decoration::Offset, vec![rspirv::dr::Operand::LiteralBit32(32)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_v = b.type_pointer(None, StorageClass::StorageBuffer, vec4);
+    let ssbo  = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_in_uvec3 = b.type_pointer(None, StorageClass::Input, uvec3);
+    let gid_var = b.variable(ptr_in_uvec3, None, StorageClass::Input, None);
+    b.decorate(gid_var, Decoration::BuiltIn,
+        vec![rspirv::dr::Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+    let c0 = b.constant_bit32(u32_ty, 0);
+    let c1 = b.constant_bit32(u32_ty, 1);
+    let c2 = b.constant_bit32(u32_ty, 2);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let _gid = b.load(uvec3, None, gid_var, None, vec![]).unwrap();
+    let a_ptr = b.access_chain(ptr_v, None, ssbo, vec![c0]).unwrap();
+    let av = b.load(vec4, None, a_ptr, None, vec![]).unwrap();
+    let b_ptr = b.access_chain(ptr_v, None, ssbo, vec![c1]).unwrap();
+    let bv = b.load(vec4, None, b_ptr, None, vec![]).unwrap();
+    let r = b.ext_inst(vec4, None, std_450, 40,
+        vec![rspirv::dr::Operand::IdRef(av),
+             rspirv::dr::Operand::IdRef(bv)]).unwrap();
+    let out_ptr = b.access_chain(ptr_v, None, ssbo, vec![c2]).unwrap();
+    b.store(out_ptr, r, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![gid_var, ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spv = Vec::with_capacity(words.len() * 4);
+    for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+    let dir = TempDir::new().unwrap();
+    let mut b_buf = vec![0u8; 80];
+    let mut c_buf = vec![0u8; 80];
+    for (j, x) in [-2.0f32, 5.0, -1.0, 8.0].iter().enumerate() {
+        b_buf[j*4..j*4+4].copy_from_slice(&x.to_le_bytes());
+        c_buf[j*4..j*4+4].copy_from_slice(&x.to_le_bytes());
+    }
+    for (j, x) in [3.0f32, 2.0, -3.0, 4.0].iter().enumerate() {
+        b_buf[16+j*4..16+j*4+4].copy_from_slice(&x.to_le_bytes());
+        c_buf[16+j*4..16+j*4+4].copy_from_slice(&x.to_le_bytes());
+    }
+    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    assert_eq!(b_buf, c_buf, "diverge on fmax(loaded, loaded)");
+}
+
 /// Same shape but with FAdd instead of FMax -- tests
 /// whether this is a pre-existing bespoke per-lane bug or
 /// specific to FMax/FMin.
