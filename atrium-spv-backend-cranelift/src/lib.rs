@@ -1214,6 +1214,24 @@ impl FnTranslator {
                 self.scalars.insert(result.id, v);
                 Ok(())
             }
+            Op::Bitcast(a, target_ty) => {
+                // Pure reinterpret between I32 and F32 in the
+                // Cranelift IR (single `bitcast` opcode).
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal("Bitcast without result".into()))?;
+                let av = self.scalars.get(&a.id).copied().ok_or_else(||
+                    BackendError::Internal(format!(
+                        "Bitcast operand {:?} not in scalars", a.id)))?;
+                let to = match target_ty {
+                    Type::F32 => clif_types::F32,
+                    Type::I32 | Type::U32 => clif_types::I32,
+                    other => return Err(BackendError::Internal(format!(
+                        "Bitcast: unsupported target type {:?}", other))),
+                };
+                let v = builder.ins().bitcast(to, MemFlags::new(), av);
+                self.scalars.insert(result.id, v);
+                Ok(())
+            }
             // Integer comparisons → Bool (i32 0/1 per B4).
             Op::IEq(a, b) => self.emit_icmp(
                 builder, &inst.result, a, b, IntCC::Equal),

@@ -2201,6 +2201,98 @@ fn differential_glsl_sin_cos() {
 }
 
 #[test]
+fn differential_glsl_exp_exp2() {
+    // Exp2: 2^0 = 1, 2^1 = 2, 2^3 = 8, 2^-2 = 0.25, 2^10 = 1024.
+    // Exp:  e^0 = 1, e^1 ≈ 2.71828, e^-1 ≈ 0.3679,
+    //       e^5 ≈ 148.413.
+    // Both lower to synth_exp2 with IEEE-754 exponent
+    // reconstruction (requires Op::Bitcast lowering).
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let std_450 = b.ext_inst_import("GLSL.std.450");
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let f32_ty = b.type_float(32, None);
+    let void_fn = b.type_function(void, vec![]);
+    let rt_arr = b.type_runtime_array(f32_ty);
+    b.decorate(rt_arr, Decoration::ArrayStride, vec![rspirv::dr::Operand::LiteralBit32(4)]);
+    let s = b.type_struct(vec![rt_arr]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_f = b.type_pointer(None, StorageClass::StorageBuffer, f32_ty);
+    let ssbo  = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    // Exp2 inputs at indices 0..5, Exp inputs at 5..10.
+    let exp2_inputs: [f32; 5] = [0.0, 1.0, 3.0, -2.0, 10.0];
+    let exp_inputs:  [f32; 5] = [0.0, 1.0, -1.0, 5.0, 2.5];
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let mut results: Vec<u32> = Vec::new();
+    for &val in &exp2_inputs {
+        let c = b.constant_bit32(f32_ty, val.to_bits());
+        let r = b.ext_inst(f32_ty, None, std_450, 29,
+            vec![rspirv::dr::Operand::IdRef(c)]).unwrap();
+        results.push(r);
+    }
+    for &val in &exp_inputs {
+        let c = b.constant_bit32(f32_ty, val.to_bits());
+        let r = b.ext_inst(f32_ty, None, std_450, 27,
+            vec![rspirv::dr::Operand::IdRef(c)]).unwrap();
+        results.push(r);
+    }
+    for (i, v) in results.iter().enumerate() {
+        let ci = b.constant_bit32(u32_ty, i as u32);
+        let d = b.access_chain(ptr_f, None, ssbo, vec![c_zero, ci]).unwrap();
+        b.store(d, *v, None, vec![]).unwrap();
+    }
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spv = Vec::with_capacity(words.len() * 4);
+    for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+    let dir = TempDir::new().unwrap();
+    let n = results.len();
+    let mut b_buf = vec![0u8; n * 4];
+    let mut c_buf = vec![0u8; n * 4];
+    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    assert_eq!(b_buf, c_buf, "diverge on exp/exp2");
+    let read = |i: usize| -> f32 {
+        f32::from_le_bytes(b_buf[i*4..i*4+4].try_into().unwrap())
+    };
+    // 5-term Taylor in [-0.5, 0.5] has relative error ~3e-5,
+    // amplified slightly by the 2^k multiply.  Use relative
+    // tolerance of 1e-3 to cover the full domain.
+    let rel = |got: f32, want: f32| -> f32 {
+        if want == 0.0 { got.abs() } else { (got - want).abs() / want.abs() }
+    };
+    for (i, &x) in exp2_inputs.iter().enumerate() {
+        let want = 2.0f32.powf(x);
+        let got = read(i);
+        assert!(rel(got, want) < 1e-3,
+            "exp2({}) = {} (want {})", x, got, want);
+    }
+    for (i, &x) in exp_inputs.iter().enumerate() {
+        let want = x.exp();
+        let got = read(5 + i);
+        assert!(rel(got, want) < 1e-3,
+            "exp({}) = {} (want {})", x, got, want);
+    }
+}
+
+#[test]
 fn differential_glsl_sin_cos_extended_range() {
     // Range-reduction validation: sin/cos at arguments well
     // outside the polynomial's native [-π/2, π/2] domain.

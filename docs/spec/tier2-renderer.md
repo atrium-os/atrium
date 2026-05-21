@@ -971,12 +971,16 @@ specifically supports:
 - GLSL.std.450 ExtInst dispatch for: FAbs, SAbs, Floor,
   Ceil, Trunc, Fract, FSign, FMod, Sqrt, InverseSqrt,
   FMin, FMax, FClamp, FMix, Step, SmoothStep, Length,
-  Distance, Normalize, Reflect, Cross, Sin, Cos, Tan
-  (Sin/Cos/Tan via Horner-form Taylor polynomial on a
-  range-reduced argument: frontend reduces x to
-  x_red ∈ [-π/2, π/2] modulo π and applies the (-1)^k
-  parity sign, so the full real line is accepted at ~6
-  ULPs near the reduced domain).  Exp/log queued.
+  Distance, Normalize, Reflect, Cross, Sin, Cos, Tan,
+  Exp, Exp2.
+  Sin/Cos/Tan use Horner-form Taylor on a range-reduced
+  argument (x → x_red ∈ [-π/2, π/2] mod π, with (-1)^k
+  parity sign), so the full real line is accepted at ~6
+  ULPs near the reduced domain.  Exp/Exp2 use 5-term
+  Horner-form Taylor on a fractional residual (r ∈
+  [-0.5, 0.5]) combined with IEEE-754 exponent
+  reconstruction (Op::Bitcast f32↔i32 + Op::Shl).
+  Log/Pow queued.
 
 **Bespoke backend (atrium-spv-backend-bespoke):**
 

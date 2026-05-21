@@ -1365,6 +1365,33 @@ fn emit_function(
                 a.emit(asm::fcvtzu_w_from_s(d_w, s_v));
                 ints.insert(result.id, d_w);
             }
+            Op::Bitcast(s, target_ty) => {
+                // Pure reinterpret between i32/u32 and f32.
+                // Same bit pattern, just moves between W-reg
+                // (int) and S-lane of V-reg (float).
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "Bitcast without result".into()))?;
+                let to_float = matches!(target_ty, Type::F32);
+                if to_float {
+                    let s_w = *ints.get(&s.id).ok_or_else(||
+                        BackendError::Internal(format!(
+                            "Bitcast int→f32 operand {:?} not in ints",
+                            s.id)))?;
+                    let d_v = alloc_vreg(&mut free_pool, &mut owners,
+                        &mut used_callee_saved_v, result.id)?;
+                    a.emit(asm::fmov_s_from_w(d_v, s_w));
+                    scalars.insert(result.id, d_v);
+                } else {
+                    let s_v = *scalars.get(&s.id).ok_or_else(||
+                        BackendError::Internal(format!(
+                            "Bitcast f32→int operand {:?} not in scalars",
+                            s.id)))?;
+                    let d_w = alloc_int_w(&mut int_pool, result.id)?;
+                    a.emit(asm::fmov_w_from_s(d_w, s_v));
+                    ints.insert(result.id, d_w);
+                }
+            }
             Op::ConstFloat { value, kind: FloatKind::F32 } => {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal("ConstFloat without result".into()))?;
@@ -3846,6 +3873,7 @@ fn compute_last_use_flat(
             Op::INeg(s) | Op::BitNot(s)
             | Op::ConvertSToF(s) | Op::ConvertUToF(s)
             | Op::ConvertFToS(s) | Op::ConvertFToU(s) => mark(s.id),
+            Op::Bitcast(s, _) => mark(s.id),
             Op::Dot(l, r) => {
                 mark(l.id); mark(r.id);
                 if let Some(lanes) = vec_lanes.get(&l.id).cloned() {

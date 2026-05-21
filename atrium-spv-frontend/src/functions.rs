@@ -1701,6 +1701,32 @@ fn translate_inst(
                         next_value_id, insts, source_spirv_offset)?;
                     Op::FSqrt(x)
                 }
+                29 => {
+                    // Exp2(x): synth via Horner Taylor + IEEE-754
+                    // exponent reconstruction.  See synth_exp2.
+                    // Returns the final value; we wrap as a
+                    // no-op FMul by 1.0 to fit the arm-returns-Op
+                    // shape (cheap; constant-folded by codegen).
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let e = synth_exp2(x, source_spirv_offset, insts, next_value_id);
+                    let c_one = push_cf(1.0, source_spirv_offset, insts, next_value_id);
+                    Op::FMul(e, c_one)
+                }
+                27 => {
+                    // Exp(x) = Exp2(x * log2(e)).
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let c_log2e = push_cf(std::f64::consts::LOG2_E,
+                        source_spirv_offset, insts, next_value_id);
+                    let x_scaled = push_f32(Op::FMul(x, c_log2e),
+                        source_spirv_offset, insts, next_value_id);
+                    let e = synth_exp2(x_scaled, source_spirv_offset, insts, next_value_id);
+                    let c_one = push_cf(1.0, source_spirv_offset, insts, next_value_id);
+                    Op::FMul(e, c_one)
+                }
                 32 => {
                     // InverseSqrt(x) ≡ 1.0 / sqrt(x).  Real
                     // ARM64 has FRSQRTE (estimate) + FRSQRTS
@@ -2601,6 +2627,101 @@ fn synth_trig_reduce(
     let sign = push_f32(Op::FAdd(c_one, neg_two_parity),
         source_spirv_offset, insts, next_value_id);
     (x_red, sign)
+}
+
+/// Push an i32 ConstInt.
+fn push_ci32(
+    val: i64,
+    source_spirv_offset: u32,
+    insts: &mut Vec<Inst>,
+    next_value_id: &mut u32,
+) -> Value {
+    let id = ValueId(*next_value_id);
+    *next_value_id += 1;
+    let v = Value { id, ty: Type::I32 };
+    insts.push(Inst {
+        op: Op::ConstInt { value: val, kind: atrium_spv_ir::IntKind::I32 },
+        result: Some(v.clone()),
+        source_spirv_offset,
+    });
+    v
+}
+
+/// Push an integer-typed instruction (I32).
+fn push_i32(
+    op: Op,
+    source_spirv_offset: u32,
+    insts: &mut Vec<Inst>,
+    next_value_id: &mut u32,
+) -> Value {
+    let id = ValueId(*next_value_id);
+    *next_value_id += 1;
+    let v = Value { id, ty: Type::I32 };
+    insts.push(Inst { op, result: Some(v.clone()), source_spirv_offset });
+    v
+}
+
+/// Synthesise Exp2(x) over the safe f32 range.
+///
+/// Strategy:
+///   x_clamped = clamp(x, -126.0, 127.0)   // avoids denormals / Inf
+///   k_float   = floor(x_clamped + 0.5)    // round-to-nearest
+///   r         = x_clamped - k_float       // ∈ [-0.5, 0.5]
+///   exp2_r    = Horner(r, 5 terms of 2^r Taylor)
+///   k_int     = (int)k_float
+///   pow2k     = bitcast<f32>((127 + k_int) << 23)
+///   result    = exp2_r * pow2k
+fn synth_exp2(
+    x: Value,
+    source_spirv_offset: u32,
+    insts: &mut Vec<Inst>,
+    next_value_id: &mut u32,
+) -> Value {
+    // Clamp x to a safe range.
+    let c_lo = push_cf(-126.0, source_spirv_offset, insts, next_value_id);
+    let c_hi = push_cf( 127.0, source_spirv_offset, insts, next_value_id);
+    let x_lo = push_f32(Op::FMax(x, c_lo), source_spirv_offset, insts, next_value_id);
+    let x_clamped = push_f32(Op::FMin(x_lo, c_hi), source_spirv_offset, insts, next_value_id);
+    // k_float = floor(x + 0.5)
+    let c_half = push_cf(0.5, source_spirv_offset, insts, next_value_id);
+    let shifted = push_f32(Op::FAdd(x_clamped.clone(), c_half),
+        source_spirv_offset, insts, next_value_id);
+    let k_float = push_f32(Op::FFloor(shifted),
+        source_spirv_offset, insts, next_value_id);
+    // r = x - k_float
+    let r = push_f32(Op::FSub(x_clamped, k_float.clone()),
+        source_spirv_offset, insts, next_value_id);
+    // Horner: ((((c5*r + c4)*r + c3)*r + c2)*r + c1)*r + c0
+    // 2^r Taylor coefficients at 0.
+    let c0 = push_cf(1.0,               source_spirv_offset, insts, next_value_id);
+    let c1 = push_cf(0.6931471805599453,source_spirv_offset, insts, next_value_id);
+    let c2 = push_cf(0.2402265069591007,source_spirv_offset, insts, next_value_id);
+    let c3 = push_cf(0.0555041086648216,source_spirv_offset, insts, next_value_id);
+    let c4 = push_cf(0.0096181291076285,source_spirv_offset, insts, next_value_id);
+    let c5 = push_cf(0.0013333558146428,source_spirv_offset, insts, next_value_id);
+    let p1 = push_f32(Op::FMul(c5, r.clone()),       source_spirv_offset, insts, next_value_id);
+    let p2 = push_f32(Op::FAdd(p1, c4),              source_spirv_offset, insts, next_value_id);
+    let p3 = push_f32(Op::FMul(p2, r.clone()),       source_spirv_offset, insts, next_value_id);
+    let p4 = push_f32(Op::FAdd(p3, c3),              source_spirv_offset, insts, next_value_id);
+    let p5 = push_f32(Op::FMul(p4, r.clone()),       source_spirv_offset, insts, next_value_id);
+    let p6 = push_f32(Op::FAdd(p5, c2),              source_spirv_offset, insts, next_value_id);
+    let p7 = push_f32(Op::FMul(p6, r.clone()),       source_spirv_offset, insts, next_value_id);
+    let p8 = push_f32(Op::FAdd(p7, c1),              source_spirv_offset, insts, next_value_id);
+    let p9 = push_f32(Op::FMul(p8, r),               source_spirv_offset, insts, next_value_id);
+    let exp2_r = push_f32(Op::FAdd(p9, c0),          source_spirv_offset, insts, next_value_id);
+    // pow2k = bitcast((127 + k_int) << 23)
+    let k_int = push_i32(Op::ConvertFToS(k_float),
+        source_spirv_offset, insts, next_value_id);
+    let c_bias = push_ci32(127, source_spirv_offset, insts, next_value_id);
+    let biased = push_i32(Op::IAdd(k_int, c_bias),
+        source_spirv_offset, insts, next_value_id);
+    let c_shift = push_ci32(23, source_spirv_offset, insts, next_value_id);
+    let shifted_bits = push_i32(Op::Shl(biased, c_shift),
+        source_spirv_offset, insts, next_value_id);
+    let pow2k = push_f32(Op::Bitcast(shifted_bits, Type::F32),
+        source_spirv_offset, insts, next_value_id);
+    push_f32(Op::FMul(exp2_r, pow2k),
+        source_spirv_offset, insts, next_value_id)
 }
 
 /// 4-term Horner-form sin Taylor polynomial on x ∈ [-π/2, π/2].
