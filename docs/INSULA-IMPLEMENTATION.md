@@ -1,8 +1,8 @@
 # Insula — implementation status
 
 **Branch:** `claude/romantic-rubin-42085b`
-**Last updated:** 2026-05-21
-**Phase:** M1A (Foundation) + M1B (service-catalogue MVP) + M1C (Pergola path) complete at the ABI level. The libatrium window surface covers every canonical fresco-protocol scene-node primitive — RECT, PATH (rotated quad), TEXTURE (with CAS upload), GLYPH_RUN. Six platform sockets thread through the host adapter into sandboxed children. Five sample apps, two of them windowed, exercise distinct slices of the surface.
+**Last updated:** 2026-05-22
+**Phase:** M1A (Foundation) + M1B (service-catalogue MVP) + M1C (Pergola path) complete at the ABI level. Beyond the ABI: full publish-side toolchain (`keygen` / `sign` / `bundle` / `release` / `publishers`), dev-iteration tooling (`init` / `run` / `install --link` / `doctor` / `clean`), four convenience scripts (`test-insula.sh` / `build-insula.sh` / `install-insula.sh` / `insula-demo.sh`), GitHub Actions CI on macos-14, and an opt-in macOS NotificationCenter backend for praeco. Five sample apps cover all four scene-node primitives. 230 tests across 15 crates.
 
 This document orients a reader landing fresh in the
 branch. For the design corpus see [`spec/insula.md`](spec/insula.md)
@@ -181,16 +181,14 @@ $INSULA daemons down
 
 ## Testing
 
-209 tests pass across all 15 crates on this macOS host.
+230 tests pass across all 15 crates on this macOS host.
 
 ```sh
-for c in insula-manifest insula-bundle libatrium \
-         insula-host-macos insula-hello atrium-fetch \
-         atrium-mon atrium-paint insula-clock \
-         insula-cli insula-logd vestibulum-macos \
-         atrium-netd-macos praeco-macos tabellarius-macos; do
-  cargo test --manifest-path "$c/Cargo.toml"
-done
+# One-line runner: scripts/test-insula.sh
+# Or in CI: .github/workflows/insula.yml
+
+scripts/test-insula.sh           # full regression
+scripts/test-insula.sh --quick   # skips heavy windowed E2Es
 ```
 
 Test distribution:
@@ -200,17 +198,17 @@ Test distribution:
 | insula-manifest | 24 | Full coverage of manifest sections + roundtrip + 7 capability-diff cases |
 | insula-bundle | 18 | Bundle layout + ed25519 sign/verify + `.insula` archive (roundtrip, deterministic, unsafe-path refused) |
 | libatrium | 32 | C ABI tests + Aqueduct routing + storage + the full window ABI: open / fill_rect / poll_event / multi-node frame builder / PATH / TEXTURE (incl. CAS upload state machine) / GLYPH_RUN (decoded via canonical fresco_protocol) |
-| insula-host-macos | 16 | SBPL gen + actual sandboxed launch + install layout (six platform sockets threaded) |
+| insula-host-macos | 16 | SBPL gen + actual sandboxed launch + install layout (six platform sockets threaded; copy + link install modes) |
 | insula-hello | 6 | Bundle parses; install+run via host adapter; per-app netd E2E (allow + deny); per-app tabellarius E2E |
 | atrium-fetch | 1 | Bundle + manifest parse for the HTTP-GET sample |
 | atrium-mon | 2 | Net probe + notification compose end-to-end (reachable + unreachable cases) |
 | atrium-paint | 3 | Pergola path E2E (stub fresco server) — open / paint / poll / destroy, standalone and via `insula launch` |
 | insula-clock | 1 | Multi-primitive frame E2E — startup CAS upload + per-frame composition (1 RECT + 14 PATHs + 1 TEXTURE) via stub fresco server |
-| insula-cli | 70 | All subcommands; auto-spawn; signing/archive/diff E2E; push + keychain + notify + daemons-logs + daemons-restart + doctor + init + run + info-with-verify E2E; list table with per-app capability tags |
+| insula-cli | 88 | All subcommands; signing/archive/diff E2E; push + keychain + notify + daemons {restart,logs} + doctor + init + run + clean + release + version + uninstall --all + install --link + info-with-verify E2E; list table with per-app capability tags |
+| praeco-macos | 6 | Notification posts log + monotonic ids + degraded + opt-in osascript backend (NotificationCenter delivery) |
 | insula-logd | 3 | Daemon decodes Aqueduct messages + writes log file |
 | vestibulum-macos | 10 | ed25519 keychain roundtrip incl. signature verify, persistence across restart |
 | atrium-netd-macos | 13 | Per-app manifest enforcement (8 unit) + broker behavior (5 integration) |
-| praeco-macos | 3 | Notification posts log + monotonic ids + degraded |
 | tabellarius-macos | 7 | substore unit (4) + subscribe/unsubscribe/count via libatrium + persistence across daemon restart |
 
 The *load-bearing* integration tests (the ones that prove
@@ -275,19 +273,23 @@ loop:
 | `insula install <bundle\|.insula>` | Install from directory or archive |
 | `insula install ... --allow-unsigned` | Skip signature check (dev only) |
 | `insula install ... --accept-changes` | Accept widened capability grants on re-install |
-| `insula list` | Show installed apps |
+| `insula install ... --link` | Symlink the source dir instead of copying (dev iteration) |
+| `insula list` | Show installed apps as a table with capability tags + sig status |
 | `insula info <app\|dir\|insula>` | Show capability surface + signature (with verify) + paths; works on installed apps, bundle dirs, or `.insula` archives |
 | `insula launch <app-id> [args]` | Run a sandboxed app (auto-spawns daemons; threads `$INSULA_FRESCO_SOCKET` through for windowed apps) |
 | `insula run <bundle> [args]` | Install + launch in one shot (dev iteration; auto-applies `--allow-unsigned` + `--accept-changes`) |
-| `insula uninstall <app-id>` | Remove an app + its container |
+| `insula uninstall <app\|--all>` | Remove one app or every installed app |
 | `insula doctor` | Health check across the install (install-root / daemons / publishers / app layouts) |
+| `insula clean [--all]` | Drop ephemeral state (run/); `--all` also wipes apps + trust store |
+| `insula version [--verbose]` | Print version (and ABI-family enumeration with `--verbose`) |
 
 **Publish-side tooling**
 | Command | Purpose |
 |---|---|
-| `insula bundle <src> <out.insula>` | Pack a bundle directory into a single-file archive |
 | `insula keygen <id> <out-dir>` | Generate a publisher ed25519 keypair |
 | `insula sign <bundle> --key <f>` | Sign a bundle in place |
+| `insula bundle <src> <out.insula>` | Pack a bundle directory into a single-file archive |
+| `insula release <src> <out.insula> --key <sk>` | Sign + pack in one shot (publish-ready artifact) |
 | `insula publishers add\|list\|remove` | Manage the install-time trust store |
 
 **Daemon ops**
@@ -310,6 +312,26 @@ if it isn't running yet (via the shared
 `daemons::ensure_started` helper) and honor the
 `INSULA_<NAME>_SOCKET` env vars for test / power-user
 overrides.
+
+## Scripts + CI
+
+Four shell scripts under `scripts/` wrap the common
+loops. All POSIX `/bin/sh` so they run on macOS and
+FreeBSD alike (no bash extensions).
+
+| Script | Purpose |
+|---|---|
+| [`scripts/test-insula.sh`](../scripts/test-insula.sh) | Run `cargo test` across every Insula crate; aligned summary table. `--quick` skips the heavy windowed E2Es. |
+| [`scripts/build-insula.sh`](../scripts/build-insula.sh) | Build every crate (release by default) into `./dist/{bin,lib,include}` for shipping. `--debug` for fast iteration. |
+| [`scripts/install-insula.sh`](../scripts/install-insula.sh) | Install `./dist/` to a prefix (default `~/.local`). `--prefix /opt` overrides. `--uninstall` reverses. |
+| [`scripts/insula-demo.sh`](../scripts/insula-demo.sh) | End-to-end walkthrough — builds, then runs init→keygen→publishers add→release→info→install→list→doctor→uninstall in one go. Doubles as a smoke test. |
+
+[`.github/workflows/insula.yml`](../.github/workflows/insula.yml)
+wires the first three together on macos-14 — `build` →
+`test` (full, no `--quick`) → `demo` for every Insula-
+touching push or PR. Path filters scope the workflow
+so unrelated atrium-vk-icd / fresco-rs / tessera
+commits don't trigger it.
 
 ## v0 limitations (documented)
 
@@ -348,9 +370,15 @@ overrides.
 - **UDP unsupported in the broker.** TCP only; the
   ABI accepts `ATRIUM_NET_UDP` but the daemon returns
   PROTO_UNSUPPORTED.
-- **Praeco routes to a file, not to UserNotifications.**
-  Wire shape is correct; backend swap to the macOS
-  Notification Center is future polish.
+- **~~Praeco routes to a file, not to UserNotifications.~~**
+  Done opt-in. Setting `INSULA_PRAECOD_BACKEND=osascript`
+  delivers via `/usr/bin/osascript` (`display notification`)
+  in addition to the structured log record. Default is
+  still file-only so tests + headless workflows are
+  unchanged. The osascript path was chosen over
+  UNUserNotificationCenter because the modern framework
+  requires an app bundle + entitlement, which the daemon
+  doesn't have; osascript works without entitlements.
 - **~~No Pergola wire emission.~~** Done at the ABI
   level. libatrium exposes a complete window surface
   (`atrium_window_open` / `atrium_window_fill_rect` /
