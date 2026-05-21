@@ -14,6 +14,7 @@
 //!   - delegate to the host adapter to translate.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// `[render]` — rendering / windowing intent.
 ///
@@ -207,6 +208,233 @@ pub struct NetworkSection {
     #[serde(default, rename = "raw-network")]
     pub raw_network: bool,
 }
+
+/// `[background.resident]` — long-lived background
+/// process declaration.
+///
+/// ```toml
+/// [background.resident]
+/// entry = "bin/sync-daemon"
+/// priority = "low"
+/// max-rss = "32MB"
+/// ```
+///
+/// Per `insula.md` §11.3. The platform spawns this
+/// process lazily on first need and keeps it alive
+/// across foreground app close, subject to LRU /
+/// resource-pressure reaping.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResidentBackgroundSection {
+    /// Bundle-relative entry point.
+    pub entry: String,
+
+    /// Scheduler priority class.
+    #[serde(default)]
+    pub priority: BackgroundPriority,
+
+    /// Optional RSS cap. Size string.
+    #[serde(default, rename = "max-rss")]
+    pub max_rss: Option<String>,
+
+    /// If `true`, the platform restarts the process
+    /// after reaping (treats it as
+    /// always-want-it-running). Default `false`
+    /// (start-on-demand).
+    #[serde(default, rename = "always-resident")]
+    pub always_resident: bool,
+}
+
+/// `[background.resident].priority` — scheduling band.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackgroundPriority {
+    /// `idle` class — runs when nothing else needs the
+    /// CPU. The default.
+    Low,
+    /// Normal interactive priority. Use only if the
+    /// app genuinely needs it (e.g., a music player
+    /// keeping a low-latency audio thread alive).
+    Normal,
+}
+
+impl Default for BackgroundPriority {
+    fn default() -> Self {
+        BackgroundPriority::Low
+    }
+}
+
+/// `[background.triggered]` — wake-on-event background
+/// process declaration.
+///
+/// ```toml
+/// [background.triggered]
+/// entry = "bin/handle-event"
+/// events = ["push", "alarm", "network-resume"]
+/// max-runtime = "30s"
+/// max-invocations-per-hour = 12
+/// ```
+///
+/// Per `insula.md` §11.4. The platform spawns a fresh
+/// jail when an event fires, runs the entry, kills it
+/// after `max_runtime`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TriggeredBackgroundSection {
+    /// Bundle-relative entry point.
+    pub entry: String,
+
+    /// Events that wake this entry. See `insula.md`
+    /// §11.4 for the canonical event vocabulary.
+    pub events: Vec<String>,
+
+    /// Per-invocation wall-time cap. Duration string.
+    #[serde(default, rename = "max-runtime")]
+    pub max_runtime: Option<String>,
+
+    /// Rate-limit cap.
+    #[serde(default, rename = "max-invocations-per-hour")]
+    pub max_invocations_per_hour: Option<u32>,
+}
+
+/// `[background]` — both resident and triggered sub-sections.
+///
+/// At least one of `resident` / `triggered` is present
+/// when the app declares background behavior; a manifest
+/// without `[background]` at all means a strictly
+/// foreground-only app.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BackgroundSection {
+    #[serde(default)]
+    pub resident: Option<ResidentBackgroundSection>,
+    #[serde(default)]
+    pub triggered: Option<TriggeredBackgroundSection>,
+}
+
+/// One entry in `[role.implements]` — declares that this
+/// app implements a Limen embed role.
+///
+/// ```toml
+/// [role.implements]
+/// "doc-viewer" = { schema = "1.x" }
+/// ```
+///
+/// Per `limen.md` §3.1.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RoleImplSpec {
+    /// Schema-version requirement string the role
+    /// accepts (e.g. `"1.x"`, `">=1.2"`).
+    #[serde(default)]
+    pub schema: Option<String>,
+
+    /// Role-specific extra config preserved verbatim
+    /// (e.g. MIME types for `share-target`).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, toml::Value>,
+}
+
+/// One entry in `[role.requires]` — declares that this
+/// app may request a Limen embed of the named role.
+///
+/// ```toml
+/// [role.requires]
+/// "doc-viewer" = { schema = "1.x" }
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RoleReqSpec {
+    /// Required schema-version range.
+    #[serde(default)]
+    pub schema: Option<String>,
+
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, toml::Value>,
+}
+
+/// `[role]` — Limen embed-role declarations.
+///
+/// Per `limen.md` §3.1.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RoleSection {
+    #[serde(default)]
+    pub implements: BTreeMap<String, RoleImplSpec>,
+    #[serde(default)]
+    pub requires: BTreeMap<String, RoleReqSpec>,
+}
+
+/// `[peer]` — Concursus peer-channel role declarations.
+///
+/// ```toml
+/// [peer.implements]
+/// "file-share" = { schema = "1.x" }
+///
+/// [peer.requests]
+/// "file-share" = { schema = "1.x" }
+/// ```
+///
+/// Per `concursus.md` §6.2 / `insula.md` §19.2. Structurally
+/// the same shape as `[role]` (typed role contracts), but
+/// distinct in semantics: `[role]` is local intra-device
+/// composition via Limen; `[peer]` is symmetric inter-
+/// device channels via Concursus.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PeerSection {
+    #[serde(default)]
+    pub implements: BTreeMap<String, RoleImplSpec>,
+    #[serde(default)]
+    pub requests: BTreeMap<String, RoleReqSpec>,
+}
+
+/// `[sync]` — opt-in synchronization of the app's `/data`
+/// across the user's devices.
+///
+/// ```toml
+/// [sync]
+/// enabled = true
+/// target = "user-default"
+/// ```
+///
+/// Per `insula.md` §15.5.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SyncSection {
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Sync target — `"user-default"`, a paired-device
+    /// identifier, or a cloud-relay identifier. Format
+    /// TBD; treat as opaque string for now.
+    #[serde(default)]
+    pub target: Option<String>,
+}
+
+/// `[entry-points]` — pattern → handler map for
+/// `atrium-app://` deep-link resolution.
+///
+/// ```toml
+/// [entry-points]
+/// "/photos/album/{id}" = "open_album"
+/// "/share-target"      = "receive_share"
+/// ```
+///
+/// Per `nomenclator.md` §12.7. The launcher matches
+/// incoming app URLs against installed apps'
+/// entry-point patterns; the handler name is a
+/// callable inside the app's binary.
+///
+/// Stored as a `BTreeMap<String, String>` — the table's
+/// keys are patterns, values are handler names.
+pub type EntryPointsSection = BTreeMap<String, String>;
+
+/// `[capabilities]` — catch-all for capabilities not
+/// otherwise typed.
+///
+/// Per `insula.md` §5.1 + extensions (DRM attestation
+/// in §17.2, device access in §18, sandbox-bypass
+/// raw-network in §4.2 — but the latter lives in
+/// [`NetworkSection`] above).
+///
+/// The shape varies wildly across capability types
+/// (booleans, strings, lists, structured), so v0
+/// preserves the table verbatim as `toml::Value`. A
+/// future typed wrapper per capability is possible.
+pub type CapabilitiesSection = BTreeMap<String, toml::Value>;
 
 /// `[compute]` — CPU / RAM / wall-time limits.
 ///

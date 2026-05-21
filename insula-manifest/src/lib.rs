@@ -47,8 +47,11 @@ mod sections;
 
 pub use error::Error;
 pub use sections::{
-    ComputeSection, HostEntry, InputPolicy, InputSection, IpcSection,
-    NetworkProto, NetworkSection, RenderSection, StorageSection,
+    BackgroundPriority, BackgroundSection, CapabilitiesSection,
+    ComputeSection, EntryPointsSection, HostEntry, InputPolicy, InputSection,
+    IpcSection, NetworkProto, NetworkSection, PeerSection, RenderSection,
+    ResidentBackgroundSection, RoleImplSpec, RoleReqSpec, RoleSection,
+    StorageSection, SyncSection, TriggeredBackgroundSection,
 };
 
 /// Parsed Insula app manifest.
@@ -89,6 +92,33 @@ pub struct Manifest {
     /// Optional. CPU / RAM / wall-time limits.
     #[serde(default)]
     pub compute: Option<ComputeSection>,
+
+    /// Optional. Resident + triggered background tasks.
+    #[serde(default)]
+    pub background: Option<BackgroundSection>,
+
+    /// Optional. Limen role implementations / requirements.
+    #[serde(default)]
+    pub role: Option<RoleSection>,
+
+    /// Optional. Concursus peer-channel role declarations.
+    #[serde(default)]
+    pub peer: Option<PeerSection>,
+
+    /// Optional. Synchronization configuration.
+    #[serde(default)]
+    pub sync: Option<SyncSection>,
+
+    /// Optional. `atrium-app://` deep-link entry-point
+    /// patterns.
+    #[serde(default, rename = "entry-points")]
+    pub entry_points: Option<EntryPointsSection>,
+
+    /// Optional. Catch-all for capabilities not typed
+    /// in the structured sections above (e.g. DRM
+    /// attestation, sensor classes, etc.).
+    #[serde(default)]
+    pub capabilities: Option<CapabilitiesSection>,
 
     /// All other top-level tables, preserved verbatim.
     /// Will shrink as subsequent commits promote known

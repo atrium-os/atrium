@@ -4,7 +4,10 @@
 //! preserves unknown sections in `extra`, roundtrips
 //! cleanly.
 
-use insula_manifest::{BundleForm, Error, InputPolicy, Manifest, NetworkProto};
+use insula_manifest::{
+    BackgroundPriority, BundleForm, Error, InputPolicy, Manifest,
+    NetworkProto,
+};
 
 const EXAMPLE_NATIVE: &str = r#"
 [app]
@@ -40,9 +43,10 @@ form = "native"
 arches = ["aarch64-freebsd"]
 entry = "bin/weather"
 
-# A section not yet typed — should land in `extra`.
-[capabilities]
-attach-mount = true
+# A vendor-specific section that is not in the Insula
+# spec — should land in `extra` rather than failing.
+[vendor-example-extension]
+hint = "anything"
 "#;
 
 const EXAMPLE_FULL_TYPED_SECTIONS: &str = r#"
@@ -116,7 +120,7 @@ fn permissive_mode_preserves_unknown_sections() {
     // The not-yet-typed sections are preserved verbatim.
     // (As more sections get promoted to typed fields,
     // this test's example will shrink accordingly.)
-    assert!(m.extra.contains_key("capabilities"));
+    assert!(m.extra.contains_key("vendor-example-extension"));
     assert_eq!(m.extra.len(), 1);
 }
 
@@ -125,7 +129,7 @@ fn strict_mode_rejects_unknown_sections() {
     let result = Manifest::parse_strict(EXAMPLE_WITH_EXTRA_SECTIONS);
     match result {
         Err(Error::UnknownSections(sections)) => {
-            assert!(sections.contains(&"capabilities".to_string()));
+            assert!(sections.contains(&"vendor-example-extension".to_string()));
         }
         other => panic!("expected UnknownSections error, got {:?}", other),
     }
@@ -259,6 +263,161 @@ raw-network = true
     let net = m.network.as_ref().unwrap();
     assert!(net.raw_network);
     assert!(net.hosts.is_empty());
+}
+
+#[test]
+fn parses_background_resident_and_triggered() {
+    let manifest = r#"
+[app]
+name = "com.example.chat"
+version = "1.0.0"
+sdk-version = "1.x"
+
+[bundle]
+form = "native"
+arches = ["aarch64-freebsd"]
+entry = "bin/chat"
+
+[background.resident]
+entry = "bin/chat-bg"
+priority = "low"
+max-rss = "32MB"
+
+[background.triggered]
+entry = "bin/chat-handle-push"
+events = ["push", "network-resume"]
+max-runtime = "30s"
+max-invocations-per-hour = 60
+"#;
+    let m = Manifest::parse(manifest).expect("background manifest should parse");
+    let bg = m.background.as_ref().expect("[background] should be present");
+
+    let resident = bg.resident.as_ref().expect("resident should be present");
+    assert_eq!(resident.entry, "bin/chat-bg");
+    assert_eq!(resident.priority, BackgroundPriority::Low);
+    assert_eq!(resident.max_rss.as_deref(), Some("32MB"));
+    assert!(!resident.always_resident);
+
+    let triggered = bg.triggered.as_ref().expect("triggered should be present");
+    assert_eq!(triggered.entry, "bin/chat-handle-push");
+    assert_eq!(triggered.events, vec!["push", "network-resume"]);
+    assert_eq!(triggered.max_runtime.as_deref(), Some("30s"));
+    assert_eq!(triggered.max_invocations_per_hour, Some(60));
+}
+
+#[test]
+fn parses_role_section() {
+    let manifest = r#"
+[app]
+name = "com.example.docviewer"
+version = "1.0.0"
+sdk-version = "1.x"
+
+[bundle]
+form = "native"
+arches = ["aarch64-freebsd"]
+entry = "bin/viewer"
+
+[role.implements]
+"doc-viewer" = { schema = "1.x" }
+"share-target" = { schema = "1.x", mime = ["text/*"] }
+
+[role.requires]
+"picker" = { schema = "1.x" }
+"#;
+    let m = Manifest::parse(manifest).expect("role manifest should parse");
+    let role = m.role.as_ref().expect("[role] should be present");
+
+    assert_eq!(role.implements.len(), 2);
+    assert_eq!(
+        role.implements["doc-viewer"].schema.as_deref(),
+        Some("1.x")
+    );
+    // Role-specific extra config (mime) preserved on share-target.
+    assert!(role.implements["share-target"].extra.contains_key("mime"));
+
+    assert_eq!(role.requires.len(), 1);
+    assert!(role.requires.contains_key("picker"));
+}
+
+#[test]
+fn parses_peer_section() {
+    let manifest = r#"
+[app]
+name = "com.example.fileshare"
+version = "1.0.0"
+sdk-version = "1.x"
+
+[bundle]
+form = "native"
+arches = ["aarch64-freebsd"]
+entry = "bin/x"
+
+[peer.implements]
+"file-share" = { schema = "1.x" }
+
+[peer.requests]
+"file-share" = { schema = "1.x" }
+"#;
+    let m = Manifest::parse(manifest).unwrap();
+    let peer = m.peer.as_ref().unwrap();
+    assert!(peer.implements.contains_key("file-share"));
+    assert!(peer.requests.contains_key("file-share"));
+}
+
+#[test]
+fn parses_sync_and_entry_points() {
+    let manifest = r#"
+[app]
+name = "com.example.notes"
+version = "1.0.0"
+sdk-version = "1.x"
+
+[bundle]
+form = "native"
+arches = ["aarch64-freebsd"]
+entry = "bin/notes"
+
+[sync]
+enabled = true
+target = "user-default"
+
+[entry-points]
+"/notes/{id}" = "open_note"
+"/share-target" = "receive_share"
+"#;
+    let m = Manifest::parse(manifest).unwrap();
+
+    let sync = m.sync.as_ref().unwrap();
+    assert!(sync.enabled);
+    assert_eq!(sync.target.as_deref(), Some("user-default"));
+
+    let entry_points = m.entry_points.as_ref().unwrap();
+    assert_eq!(entry_points["/notes/{id}"], "open_note");
+    assert_eq!(entry_points["/share-target"], "receive_share");
+}
+
+#[test]
+fn parses_freeform_capabilities() {
+    let manifest = r#"
+[app]
+name = "com.example.streaming"
+version = "1.0.0"
+sdk-version = "1.x"
+
+[bundle]
+form = "native"
+arches = ["aarch64-freebsd"]
+entry = "bin/stream"
+
+[capabilities]
+drm-attestation = ["widevine-l1", "fairplay"]
+microphone = "session"
+"#;
+    let m = Manifest::parse(manifest).unwrap();
+    let caps = m.capabilities.as_ref().unwrap();
+    assert!(caps.contains_key("drm-attestation"));
+    assert!(caps.contains_key("microphone"));
 }
 
 #[test]
