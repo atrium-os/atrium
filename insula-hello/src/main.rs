@@ -20,8 +20,9 @@
 
 use atrium::{
     atrium_container_path, atrium_exit, atrium_init, atrium_log,
-    atrium_net_connect, atrium_storage_open, ATRIUM_LOG_INFO,
-    ATRIUM_NET_TCP, ATRIUM_STORAGE_WRITE,
+    atrium_net_connect, atrium_storage_open,
+    atrium_tabellarius_subscribe, atrium_tabellarius_unsubscribe,
+    ATRIUM_LOG_INFO, ATRIUM_NET_TCP, ATRIUM_STORAGE_WRITE,
 };
 use std::ffi::CString;
 use std::io::Write;
@@ -116,6 +117,49 @@ fn main() {
                 let cstr = CString::new(line).unwrap();
                 unsafe { atrium_log(ATRIUM_LOG_INFO, cstr.as_ptr()); }
             }
+        }
+    }
+
+    // Optional push-delivery probe — gated on
+    // ATRIUM_TABELLARIUS_TEST_PURPOSE. Subscribes,
+    // logs the returned key_id + pubkey-prefix, then
+    // unsubscribes to leave the keystore clean. The
+    // tabellarius E2E test sets the env var; normal
+    // demo runs leave the block dormant.
+    if let Ok(purpose) = std::env::var("ATRIUM_TABELLARIUS_TEST_PURPOSE") {
+        let purpose_c = CString::new(purpose.clone()).unwrap();
+        let mut key_id = [0i8; 64];
+        let mut pubkey = [0u8; 32];
+        let n = unsafe {
+            atrium_tabellarius_subscribe(
+                purpose_c.as_ptr(),
+                key_id.as_mut_ptr(),
+                key_id.len(),
+                pubkey.as_mut_ptr(),
+            )
+        };
+        if n > 0 {
+            let id_bytes: Vec<u8> = key_id[..n as usize]
+                .iter().map(|b| *b as u8).collect();
+            let id_str = std::str::from_utf8(&id_bytes).unwrap_or("?");
+            let pk_prefix: String = pubkey[..4]
+                .iter().map(|b| format!("{:02x}", b)).collect();
+            let line = CString::new(format!(
+                "tabellarius-subscribe OK purpose={} key_id={} pk={}…",
+                purpose, id_str, pk_prefix
+            )).unwrap();
+            unsafe { atrium_log(ATRIUM_LOG_INFO, line.as_ptr()); }
+
+            // Tidy up — unsubscribe so repeated test
+            // runs don't pile up state.
+            let id_c = CString::new(id_str).unwrap();
+            let _ = unsafe { atrium_tabellarius_unsubscribe(id_c.as_ptr()) };
+        } else {
+            let line = CString::new(format!(
+                "tabellarius-subscribe FAIL purpose={} code={}",
+                purpose, n
+            )).unwrap();
+            unsafe { atrium_log(ATRIUM_LOG_INFO, line.as_ptr()); }
         }
     }
 
