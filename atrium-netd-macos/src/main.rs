@@ -39,8 +39,12 @@
 //!   (A coarse first cut at enforcement, applied
 //!   broker-wide rather than per-app.)
 
+mod peer;
+use peer::{check_against_manifest, identify, PeerInfo, Verdict};
+
 use aqueduct::classes::CLASS_NET;
 use aqueduct::envelope::{self, flag, Header};
+use insula_manifest::NetworkProto;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -81,16 +85,24 @@ fn main() -> ExitCode {
     };
 
     let allowlist = parse_allowlist();
+    let install_root: Option<PathBuf> =
+        std::env::var_os("INSULA_INSTALL_ROOT").map(PathBuf::from);
+
     eprintln!(
-        "atrium-netd-macos: listening on {} (allowlist: {})",
+        "atrium-netd-macos: listening on {} (allowlist: {}, install root: {})",
         socket_path.display(),
         match &allowlist {
             None => "unrestricted".to_string(),
             Some(set) => format!("{} hosts", set.len()),
+        },
+        match &install_root {
+            None => "<unset; broker-wide policy only>".to_string(),
+            Some(p) => p.display().to_string(),
         }
     );
 
     let allowlist = Arc::new(allowlist);
+    let install_root = Arc::new(install_root);
 
     for stream in listener.incoming() {
         let stream = match stream {
@@ -101,7 +113,8 @@ fn main() -> ExitCode {
             }
         };
         let al = allowlist.clone();
-        thread::spawn(move || handle_client(stream, al));
+        let ir = install_root.clone();
+        thread::spawn(move || handle_client(stream, al, ir));
     }
     ExitCode::SUCCESS
 }
@@ -109,7 +122,13 @@ fn main() -> ExitCode {
 fn handle_client(
     mut stream: UnixStream,
     allowlist: Arc<Option<std::collections::HashSet<String>>>,
+    install_root: Arc<Option<PathBuf>>,
 ) {
+    // Identify the peer (best-effort) so per-app
+    // enforcement can apply if the install root is
+    // configured.
+    let peer = identify(&stream, install_root.as_ref().as_deref());
+
     // Step 1: read the CONNECT request envelope.
     let req = match read_envelope(&mut stream) {
         Ok(r) => r,
@@ -125,7 +144,7 @@ fn handle_client(
         let _ = write_status(&mut stream, NET_STATUS_MALFORMED_REQUEST);
         return;
     }
-    let proto = req.payload[0];
+    let proto_byte = req.payload[0];
     let port = u16::from_le_bytes([req.payload[1], req.payload[2]]);
     let host = match std::str::from_utf8(&req.payload[3..]) {
         Ok(s) => s,
@@ -136,17 +155,32 @@ fn handle_client(
     };
 
     // v0 supports TCP only.
-    if proto != 0 {
+    if proto_byte != 0 {
         let _ = write_status(&mut stream, NET_STATUS_PROTO_UNSUPPORTED);
         return;
     }
 
-    // Coarse allowlist check (broker-wide; per-app
-    // enforcement is the next slice).
-    if let Some(set) = allowlist.as_ref().as_ref() {
-        if !set.contains(host) {
-            let _ = write_status(&mut stream, NET_STATUS_HOST_DENIED);
-            return;
+    // Per-connection policy:
+    //   1. If we identified the peer as an Insula app
+    //      with a manifest, enforce its [network]
+    //      hosts allowlist exactly. (Higher-precision
+    //      policy: app authors declared what they
+    //      need, we enforce it.)
+    //   2. Otherwise fall through to the broker-wide
+    //      $INSULA_NETD_ALLOWED_HOSTS allowlist.
+    //   3. If neither has a policy, allow (v0 default
+    //      = unrestricted broker).
+    if !apply_per_app_policy(&peer, host, port) {
+        let _ = write_status(&mut stream, NET_STATUS_HOST_DENIED);
+        return;
+    }
+    if peer.manifest.is_none() {
+        // No manifest -> consult broker-wide list.
+        if let Some(set) = allowlist.as_ref().as_ref() {
+            if !set.contains(host) {
+                let _ = write_status(&mut stream, NET_STATUS_HOST_DENIED);
+                return;
+            }
         }
     }
 
@@ -254,6 +288,24 @@ fn pipe<R: Read, W: Write>(mut r: R, mut w: W) -> std::io::Result<()> {
             return Ok(());
         }
         w.write_all(&buf[..n])?;
+    }
+}
+
+/// Apply the per-app policy from the peer's manifest
+/// if one was identified. Returns `true` if the
+/// connection should proceed (either explicitly
+/// allowed by manifest, or the peer is unidentified
+/// and the caller should consult the broker-wide
+/// allowlist).
+fn apply_per_app_policy(peer: &PeerInfo, host: &str, port: u16) -> bool {
+    let Some(manifest) = peer.manifest.as_ref() else {
+        // Not an identified Insula app — fall through.
+        return true;
+    };
+    match check_against_manifest(manifest, host, port, NetworkProto::Tcp) {
+        Verdict::AllowedByManifest => true,
+        Verdict::DeniedByManifest => false,
+        Verdict::FallThrough => true,
     }
 }
 

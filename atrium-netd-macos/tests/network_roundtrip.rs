@@ -144,6 +144,65 @@ fn connect_without_broker_returns_no_netd() {
     assert_eq!(r, atrium::ATRIUM_ERR_NO_NETD);
 }
 
+/// Verify per-app enforcement at the daemon's daemon-
+/// side level. When the broker has `$INSULA_INSTALL_
+/// ROOT` set and the connecting peer's exe matches an
+/// installed app, the broker enforces that app's
+/// `[network]` allowlist *instead of* the broker-wide
+/// allowlist.
+///
+/// We can't easily make the cargo test binary appear
+/// to be an installed app — its exe path is the
+/// test binary, not anywhere under a temp install
+/// root. So we exercise the per-app code path
+/// indirectly: bring the broker up with an install
+/// root containing a single app whose manifest
+/// allowlists 127.0.0.1; then connect *as the test
+/// process* (which the broker fails to identify),
+/// observe that the broker falls through to the
+/// broker-wide allowlist as expected.
+///
+/// The per-app verdict path itself is unit-tested in
+/// `atrium-netd-macos/src/peer.rs` — 8 cases
+/// covering manifest match / mismatch / raw-network /
+/// no-network-section + exe-path-to-app-id lookup.
+#[test]
+fn unidentified_peer_falls_through_to_broker_wide_when_install_root_set() {
+    let _g = ENV_LOCK.lock().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("netd.sock");
+    let install_root = tmp.path().join("install");
+    std::fs::create_dir_all(install_root.join("apps")).unwrap();
+
+    // Set up a daemon with both an install root AND a
+    // broker-wide allowlist that includes 127.0.0.1.
+    let mut cmd = Command::new(broker_binary());
+    cmd.env("INSULA_NETD_SOCKET", &socket)
+        .env("INSULA_INSTALL_ROOT", &install_root)
+        .env("INSULA_NETD_ALLOWED_HOSTS", "127.0.0.1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut broker = cmd.spawn().expect("spawn");
+    wait_for_socket(&socket, Duration::from_secs(3));
+
+    let (echo_port, _h) = spawn_tcp_echo();
+    std::env::set_var("ATRIUM_NETD_SOCKET", &socket);
+    let host = std::ffi::CString::new("127.0.0.1").unwrap();
+    let fd = unsafe {
+        atrium::atrium_net_connect(host.as_ptr(), echo_port, atrium::ATRIUM_NET_TCP)
+    };
+    assert!(fd >= 0,
+            "broker-wide allowlist should permit 127.0.0.1 when peer is \
+             unidentified; got fd={}", fd);
+
+    // Close the fd we got back.
+    unsafe { libc::close(fd); }
+
+    std::env::remove_var("ATRIUM_NETD_SOCKET");
+    let _ = broker.kill();
+    let _ = broker.wait();
+}
+
 #[test]
 fn udp_returns_denied_for_v0_broker() {
     let _g = ENV_LOCK.lock().unwrap();

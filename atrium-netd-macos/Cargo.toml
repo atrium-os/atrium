@@ -11,8 +11,11 @@ name = "atrium-netd-macos"
 path = "src/main.rs"
 
 [dependencies]
-aqueduct = { path = "../aqueduct" }
+aqueduct        = { path = "../aqueduct" }
+insula-manifest = { path = "../insula-manifest" }
+libc            = "0.2"
 
 [dev-dependencies]
 libatrium = { path = "../libatrium" }
+libc      = "0.2"
 tempfile  = "3"
