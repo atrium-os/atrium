@@ -1965,7 +1965,22 @@ fn emit_function(
                                 }
                                 a.emit(asm::mul_w(w_scaled, w_wg, w_ls));
                                 a.emit(asm::add_w(w_dst, w_scaled, w_lid));
+                                // The LocalSize constant and the
+                                // intermediate scaled WG product
+                                // are both dead the instant the
+                                // add reads them.  Manually
+                                // return their W-regs to the
+                                // pool -- their synth ValueIds
+                                // aren't in the IR's last_use
+                                // map, so the linear-scan expire
+                                // pass would never reclaim them.
+                                int_pool.free(w_ls);
+                                int_pool.free(w_scaled);
                             }
+                            // Same reasoning for w_lid: a
+                            // scratch consumed by the final
+                            // add_w.  Free it back to the pool.
+                            int_pool.free(w_lid);
 
                             ints.insert(synth, w_dst);
                             lanes.push(Value { id: synth, ty: Type::U32 });
@@ -3031,6 +3046,16 @@ impl IntPool {
         if n >= 19 { self.used_callee_saved = true; }
         self.owners.insert(n, owner);
         Ok(asm::Wreg(n))
+    }
+
+    /// Manually free a W-reg the caller knows is dead --
+    /// useful for codegen-synthesised intermediates that
+    /// don't appear in the IR's last_use map, so the
+    /// linear-scan expire pass won't reclaim them.
+    fn free(&mut self, reg: asm::Wreg) {
+        if self.owners.remove(&reg.0).is_some() {
+            self.free.push(reg.0);
+        }
     }
 
     /// Return W-regs whose owner's last_use < `before`.

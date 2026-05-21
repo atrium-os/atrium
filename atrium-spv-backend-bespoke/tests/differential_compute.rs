@@ -1223,7 +1223,6 @@ fn differential_histogram_one_binding() {
 }
 
 #[test]
-#[ignore = "bespoke W-reg pressure -- vk-icd test still validates via Cranelift fallback"]
 fn differential_histogram_integration() {
     let spv = build_histogram_diff_cs();
     let dir = TempDir::new().unwrap();
