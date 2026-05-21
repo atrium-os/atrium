@@ -126,15 +126,32 @@ pub fn launch_installed_with_log(
     launch_installed_full(app, args, capture_output, log_socket, None)
 }
 
-/// Most-general launch entry: threads both the logd
-/// and vestibulum sockets through to the child via
-/// env + SBPL grant. Pass `None` for either to skip.
+/// As [`launch_installed_with_log`] but also accepts a
+/// vestibulum socket (deprecated; prefer
+/// [`launch_installed_all`]).
 pub fn launch_installed_full(
     app: &InstalledApp,
     args: &[&str],
     capture_output: bool,
     log_socket: Option<&std::path::Path>,
     vestibulum_socket: Option<&std::path::Path>,
+) -> Result<SandboxedChild, Error> {
+    launch_installed_all(
+        app, args, capture_output, log_socket, vestibulum_socket, None,
+    )
+}
+
+/// Most-general launch entry: threads all three Insula
+/// daemon sockets (log / vestibulum / netd) through to
+/// the child via env + SBPL grant. Pass `None` for any
+/// to skip.
+pub fn launch_installed_all(
+    app: &InstalledApp,
+    args: &[&str],
+    capture_output: bool,
+    log_socket: Option<&std::path::Path>,
+    vestibulum_socket: Option<&std::path::Path>,
+    netd_socket: Option<&std::path::Path>,
 ) -> Result<SandboxedChild, Error> {
     let opts = LaunchOptions {
         binary_path: &app.binary_path,
@@ -143,6 +160,7 @@ pub fn launch_installed_full(
         capture_output,
         log_socket,
         vestibulum_socket,
+        netd_socket,
     };
     launch(&app.manifest, &opts)
 }

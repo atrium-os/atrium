@@ -18,13 +18,15 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-/// One of the two daemons we manage.
+/// One of the daemons we manage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Daemon {
     /// `insula-logd` — log forwarding.
     Logd,
     /// `vestibulum-macos` — keychain.
     Vestibulum,
+    /// `atrium-netd-macos` — network broker.
+    Netd,
 }
 
 impl Daemon {
@@ -33,6 +35,7 @@ impl Daemon {
         match self {
             Daemon::Logd => "insula-logd",
             Daemon::Vestibulum => "vestibulum-macos",
+            Daemon::Netd => "atrium-netd-macos",
         }
     }
 
@@ -42,6 +45,7 @@ impl Daemon {
         match self {
             Daemon::Logd => "insula-logd",
             Daemon::Vestibulum => "vestibulum-macos",
+            Daemon::Netd => "atrium-netd-macos",
         }
     }
 
@@ -51,6 +55,7 @@ impl Daemon {
         match self {
             Daemon::Logd => "INSULA_LOGD_SOCKET",
             Daemon::Vestibulum => "INSULA_VESTIBULUMD_SOCKET",
+            Daemon::Netd => "INSULA_NETD_SOCKET",
         }
     }
 
@@ -60,6 +65,7 @@ impl Daemon {
         match self {
             Daemon::Logd => Some("INSULA_LOGD_LOG_FILE"),
             Daemon::Vestibulum => None,
+            Daemon::Netd => None,
         }
     }
 
@@ -70,10 +76,12 @@ impl Daemon {
         match self {
             Daemon::Logd => "INSULA_LOGD_BIN",
             Daemon::Vestibulum => "INSULA_VESTIBULUMD_BIN",
+            Daemon::Netd => "INSULA_NETD_BIN",
         }
     }
 
-    pub const ALL: [Daemon; 2] = [Daemon::Logd, Daemon::Vestibulum];
+    pub const ALL: [Daemon; 3] =
+        [Daemon::Logd, Daemon::Vestibulum, Daemon::Netd];
 }
 
 /// All paths the CLI cares about for one daemon under

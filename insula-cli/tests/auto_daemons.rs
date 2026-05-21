@@ -58,14 +58,17 @@ fn run_insula(
     vest_bin: &std::path::Path,
     args: &[&str],
 ) -> std::process::Output {
+    let netd_bin = build_neighbor("atrium-netd-macos", "atrium-netd-macos");
     Command::new(insula_binary())
         .env("INSULA_INSTALL_ROOT", install_root)
         .env("INSULA_LOGD_BIN", logd_bin)
         .env("INSULA_VESTIBULUMD_BIN", vest_bin)
+        .env("INSULA_NETD_BIN", &netd_bin)
         // Make sure the test doesn't pick up the
         // user's running daemons / env.
         .env_remove("INSULA_LOGD_SOCKET")
         .env_remove("INSULA_VESTIBULUMD_SOCKET")
+        .env_remove("INSULA_NETD_SOCKET")
         .args(args)
         .output()
         .expect("insula binary should be runnable")
@@ -83,6 +86,7 @@ fn daemons_up_down_status_lifecycle() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("insula-logd: stopped"), "got: {}", stdout);
     assert!(stdout.contains("vestibulum-macos: stopped"));
+    assert!(stdout.contains("atrium-netd-macos: stopped"));
 
     // up
     let out = run_insula(install_root.path(), &logd_bin, &vest_bin, &["daemons", "up"]);
@@ -90,6 +94,7 @@ fn daemons_up_down_status_lifecycle() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("insula-logd: started"));
     assert!(stdout.contains("vestibulum-macos: started"));
+    assert!(stdout.contains("atrium-netd-macos: started"));
 
     // status reflects it
     thread::sleep(Duration::from_millis(150));
@@ -97,6 +102,7 @@ fn daemons_up_down_status_lifecycle() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("insula-logd: running"), "got: {}", stdout);
     assert!(stdout.contains("vestibulum-macos: running"));
+    assert!(stdout.contains("atrium-netd-macos: running"));
 
     // up is idempotent
     let out = run_insula(install_root.path(), &logd_bin, &vest_bin, &["daemons", "up"]);

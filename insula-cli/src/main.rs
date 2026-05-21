@@ -258,15 +258,21 @@ fn cmd_launch(args: &[String], install_root: &Path) -> Result<(), String> {
         Daemon::Vestibulum,
         "INSULA_VESTIBULUMD_SOCKET",
     );
+    let netd_socket = resolve_daemon_socket(
+        install_root,
+        Daemon::Netd,
+        "INSULA_NETD_SOCKET",
+    );
 
     // Inherit stdio for `insula launch`; the user wants
     // to see the app's output.
-    let mut child = host::launch_installed_full(
+    let mut child = host::launch_installed_all(
         &installed,
         &app_args_raw,
         false,
         log_socket.as_deref(),
         vestibulum_socket.as_deref(),
+        netd_socket.as_deref(),
     )
     .map_err(|e| format!("launch: {}", e))?;
 

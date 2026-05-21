@@ -69,6 +69,12 @@ pub struct LaunchOptions<'a> {
     /// passes through as `$ATRIUM_VESTIBULUM_SOCKET`
     /// in the child env and gets an SBPL grant.
     pub vestibulum_socket: Option<&'a Path>,
+
+    /// Optional: path to an `atrium-netd-macos` socket
+    /// the app reaches for `atrium_net_connect`. Same
+    /// wiring shape: passes through as
+    /// `$ATRIUM_NETD_SOCKET` + SBPL grant.
+    pub netd_socket: Option<&'a Path>,
 }
 
 impl<'a> LaunchOptions<'a> {
@@ -81,6 +87,7 @@ impl<'a> LaunchOptions<'a> {
             capture_output: false,
             log_socket: None,
             vestibulum_socket: None,
+            netd_socket: None,
         }
     }
 }
@@ -141,15 +148,19 @@ pub fn launch(
     };
     let log_socket_canon = opts.log_socket.map(canon_socket);
     let vest_socket_canon = opts.vestibulum_socket.map(canon_socket);
+    let netd_socket_canon = opts.netd_socket.map(canon_socket);
 
     // SBPL grant covers any combination of unix sockets
     // by switching on network-outbound once if any are
     // present.
-    let any_unix_socket = log_socket_canon.as_deref().or(vest_socket_canon.as_deref());
+    let any_unix_socket = log_socket_canon.as_deref()
+        .or(vest_socket_canon.as_deref())
+        .or(netd_socket_canon.as_deref());
     let profile = sbpl::render_profile_with_sockets(
         manifest,
         log_socket_canon.as_deref(),
         vest_socket_canon.as_deref(),
+        netd_socket_canon.as_deref(),
         any_unix_socket,
     );
 
@@ -190,6 +201,9 @@ pub fn launch(
     }
     if let Some(sock) = vest_socket_canon.as_deref() {
         cmd.env("ATRIUM_VESTIBULUM_SOCKET", sock);
+    }
+    if let Some(sock) = netd_socket_canon.as_deref() {
+        cmd.env("ATRIUM_NETD_SOCKET", sock);
     }
 
     if opts.capture_output {
