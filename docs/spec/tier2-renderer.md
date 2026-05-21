@@ -975,7 +975,8 @@ specifically supports:
   Exp, Exp2, Log, Log2, Pow, Atan, Asin, Acos, Atan2,
   Sinh, Cosh, Tanh, Asinh, Acosh, Atanh,
   SMin, UMin, SMax, UMax, SClamp, UClamp,
-  FindILsb, FindSMsb, FindUMsb.
+  FindILsb, FindSMsb, FindUMsb,
+  NMin, NMax, NClamp.
   Sin/Cos/Tan use Horner-form Taylor on a range-reduced
   argument (x → x_red ∈ [-π/2, π/2] mod π, with (-1)^k
   parity sign), so the full real line is accepted at ~6
@@ -1001,6 +1002,10 @@ specifically supports:
   FindILsb/FindSMsb/FindUMsb lower to new IR Op::Clz +
   Op::Rbit (ARM64 CLZ/RBIT, Cranelift clz/bitrev) with
   Select guards for the x=0 and x<0 corner cases.
+  NMin/NMax/NClamp alias to FMin/FMax/FClamp; the IEEE
+  754-2008 NaN-suppression semantic (NMin(NaN, x) = x)
+  is deferred -- workloads that need it can lower to
+  FMINNM/FMAXNM in a follow-up.
 
 **Bespoke backend (atrium-spv-backend-bespoke):**
 

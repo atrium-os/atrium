@@ -2252,6 +2252,75 @@ fn build_int_glsl_shader(ext_op: u32, signed: bool, args: &[u32]) -> Vec<u8> {
 }
 
 #[test]
+fn differential_glsl_nan_min_max_clamp() {
+    // NMin(79) / NMax(80) / NClamp(81) currently alias to
+    // FMin / FMax / FClamp.  The IEEE 754-2008 NaN-
+    // suppressing semantics are deferred (ARM FMINNM /
+    // FMAXNM would provide them).  These tests assert the
+    // common case (no NaN inputs) lowers identically.
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let cases: &[(&str, u32, &[f32], f32)] = &[
+        ("nmin(3,7)",    79, &[3.0, 7.0], 3.0),
+        ("nmin(-1,2)",   79, &[-1.0, 2.0], -1.0),
+        ("nmax(3,7)",    80, &[3.0, 7.0], 7.0),
+        ("nclamp(5,1,3)",81, &[5.0, 1.0, 3.0], 3.0),
+        ("nclamp(-1,0,1)",81, &[-1.0, 0.0, 1.0], 0.0),
+    ];
+    for &(label, ext_op, args, expected) in cases {
+        let mut b = rspirv::dr::Builder::new();
+        b.set_version(1, 3);
+        b.capability(Capability::Shader);
+        b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+        let std_450 = b.ext_inst_import("GLSL.std.450");
+        let void   = b.type_void();
+        let u32_ty = b.type_int(32, 0);
+        let f32_ty = b.type_float(32, None);
+        let void_fn = b.type_function(void, vec![]);
+        let rt = b.type_runtime_array(f32_ty);
+        b.decorate(rt, Decoration::ArrayStride, vec![rspirv::dr::Operand::LiteralBit32(4)]);
+        let s = b.type_struct(vec![rt]);
+        b.decorate(s, Decoration::Block, vec![]);
+        b.member_decorate(s, 0, Decoration::Offset, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+        let ptr_f = b.type_pointer(None, StorageClass::StorageBuffer, f32_ty);
+        let ssbo = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+        b.decorate(ssbo, Decoration::DescriptorSet, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        b.decorate(ssbo, Decoration::Binding, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        let c_zero = b.constant_bit32(u32_ty, 0);
+        let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+        b.begin_block(None).unwrap();
+        let cs: Vec<u32> = args.iter()
+            .map(|&v| b.constant_bit32(f32_ty, v.to_bits()))
+            .collect();
+        let operands: Vec<rspirv::dr::Operand> = cs.iter()
+            .map(|&c| rspirv::dr::Operand::IdRef(c)).collect();
+        let r = b.ext_inst(f32_ty, None, std_450, ext_op, operands).unwrap();
+        let d = b.access_chain(ptr_f, None, ssbo, vec![c_zero, c_zero]).unwrap();
+        b.store(d, r, None, vec![]).unwrap();
+        b.ret().unwrap();
+        b.end_function().unwrap();
+        b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+        b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+        let words: Vec<u32> = b.module().assemble();
+        let mut spv = Vec::with_capacity(words.len() * 4);
+        for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+        let dir = TempDir::new().unwrap();
+        let mut b_buf = vec![0u8; 4];
+        let mut c_buf = vec![0u8; 4];
+        invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
+        invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+        assert_eq!(b_buf, c_buf, "{label}: bespoke vs cranelift diverge");
+        let got = f32::from_le_bytes(b_buf[0..4].try_into().unwrap());
+        assert!((got - expected).abs() < 1e-6,
+            "{label}: got {}, want {}", got, expected);
+    }
+}
+
+#[test]
 fn differential_glsl_int_bit_scan() {
     // FindILsb(73) / FindSMsb(74) / FindUMsb(75) lower onto
     // Op::Clz + Op::Rbit (new IR variants) with edge-case

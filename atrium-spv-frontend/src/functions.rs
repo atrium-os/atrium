@@ -1977,6 +1977,52 @@ fn translate_inst(
                         next_value_id, insts, source_spirv_offset)?;
                     Op::FMin(x, y)
                 }
+                79 => {
+                    // NMin(x, y) = FMin (NaN-suppression
+                    // semantics deferred; documented in
+                    // tier2-renderer.md).
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let y_id = expect_id(&spv_inst.operands, 3)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let y = resolve_value(y_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    Op::FMin(x, y)
+                }
+                80 => {
+                    // NMax(x, y) = FMax.
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let y_id = expect_id(&spv_inst.operands, 3)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let y = resolve_value(y_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    Op::FMax(x, y)
+                }
+                81 => {
+                    // NClamp(x, lo, hi) = FMin(FMax(x, lo), hi).
+                    let x_id  = expect_id(&spv_inst.operands, 2)?;
+                    let lo_id = expect_id(&spv_inst.operands, 3)?;
+                    let hi_id = expect_id(&spv_inst.operands, 4)?;
+                    let x  = resolve_value(x_id,  types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let lo = resolve_value(lo_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let hi = resolve_value(hi_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let mid = {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let v = Value { id, ty: result_ty.clone() };
+                        insts.push(Inst {
+                            op: Op::FMax(x, lo),
+                            result: Some(v.clone()),
+                            source_spirv_offset,
+                        });
+                        v
+                    };
+                    Op::FMin(mid, hi)
+                }
                 75 => {
                     // FindUMsb(x): bit index of highest set
                     // bit, or -1 if x==0.
