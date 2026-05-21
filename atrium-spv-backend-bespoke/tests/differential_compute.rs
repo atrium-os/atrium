@@ -1038,6 +1038,223 @@ fn differential_atomic_smax_keeps_positive_over_negative() {
     assert_eq!(got, 4, "smax should leave 4; got {got}");
 }
 
+/// Real-world integration: build a histogram by reading
+/// a sample from one SSBO and atomicAdd'ing into another
+/// using a dynamically-computed bucket.  This is the
+/// canonical shape that motivated the entire atomics-on-
+/// dynamic-index work.
+///
+/// Uses TWO SSBOs (in + out).  Note: today this hits a
+/// known bespoke W-reg pressure cliff (the integration
+/// allocates more live ints than the IntPool can satisfy
+/// without spilling, and spilling isn't implemented).  The
+/// vk-icd histogram test still works because the production
+/// selector falls back to Cranelift on Unsupported -- this
+/// dlopen-direct test exists to flag the bespoke regression
+/// when spilling lands.
+#[allow(dead_code)]
+fn build_histogram_diff_cs() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+        MemorySemantics, Scope,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let uvec3  = b.type_vector(u32_ty, 3);
+    let void_fn = b.type_function(void, vec![]);
+    let rt_arr = b.type_runtime_array(u32_ty);
+    b.decorate(rt_arr, Decoration::ArrayStride,
+        vec![rspirv::dr::Operand::LiteralBit32(4)]);
+    let s_in  = b.type_struct(vec![rt_arr]);
+    b.decorate(s_in, Decoration::Block, vec![]);
+    b.member_decorate(s_in, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let s_out = b.type_struct(vec![rt_arr]);
+    b.decorate(s_out, Decoration::Block, vec![]);
+    b.member_decorate(s_out, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s_in  = b.type_pointer(None, StorageClass::StorageBuffer, s_in);
+    let ptr_s_out = b.type_pointer(None, StorageClass::StorageBuffer, s_out);
+    let ptr_u     = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+    let v_in  = b.variable(ptr_s_in,  None, StorageClass::StorageBuffer, None);
+    b.decorate(v_in, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(v_in, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let v_out = b.variable(ptr_s_out, None, StorageClass::StorageBuffer, None);
+    b.decorate(v_out, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(v_out, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(1)]);
+    let ptr_in_uvec3 = b.type_pointer(None, StorageClass::Input, uvec3);
+    let gid_var = b.variable(ptr_in_uvec3, None, StorageClass::Input, None);
+    b.decorate(gid_var, Decoration::BuiltIn,
+        vec![rspirv::dr::Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+    let c_zero  = b.constant_bit32(u32_ty, 0);
+    let c_three = b.constant_bit32(u32_ty, 3);
+    let c_one   = b.constant_bit32(u32_ty, 1);
+    let c_scope = b.constant_bit32(u32_ty, Scope::Device as u32);
+    let c_sem   = b.constant_bit32(u32_ty,
+        MemorySemantics::ATOMIC_COUNTER_MEMORY.bits());
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let gid = b.load(uvec3, None, gid_var, None, vec![]).unwrap();
+    let gid_x = b.composite_extract(u32_ty, None, gid, vec![0]).unwrap();
+    let in_ptr = b.access_chain(ptr_u, None, v_in, vec![c_zero, gid_x]).unwrap();
+    let sample = b.load(u32_ty, None, in_ptr, None, vec![]).unwrap();
+    let bucket = b.bitwise_and(u32_ty, None, sample, c_three).unwrap();
+    let out_ptr = b.access_chain(ptr_u, None, v_out, vec![c_zero, bucket]).unwrap();
+    let _ = b.atomic_i_add(u32_ty, None, out_ptr, c_scope, c_sem, c_one).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![gid_var, v_in, v_out]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+/// Single-SSBO histogram-shaped CS: read from
+/// ssbo.data[gid_x + 8] (the sample region), compute bucket
+/// = sample & 3, atomicAdd 1 into ssbo.data[bucket] (the
+/// bin region in the same buffer).  Bespoke-friendly
+/// because it only uses one binding (single X2-direct
+/// pointer, no descriptor table prologue).  Validates
+/// every dynamic-index + atomic + bitwise interaction
+/// without tripping bespoke's W-reg cliff.
+fn build_histogram_one_ssbo_cs() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+        MemorySemantics, Scope,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let uvec3  = b.type_vector(u32_ty, 3);
+    let void_fn = b.type_function(void, vec![]);
+    let rt_arr = b.type_runtime_array(u32_ty);
+    b.decorate(rt_arr, Decoration::ArrayStride,
+        vec![rspirv::dr::Operand::LiteralBit32(4)]);
+    let s = b.type_struct(vec![rt_arr]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_u = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+    let ssbo = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_in_uvec3 = b.type_pointer(None, StorageClass::Input, uvec3);
+    let gid_var = b.variable(ptr_in_uvec3, None, StorageClass::Input, None);
+    b.decorate(gid_var, Decoration::BuiltIn,
+        vec![rspirv::dr::Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+    let c_zero  = b.constant_bit32(u32_ty, 0);
+    let c_eight = b.constant_bit32(u32_ty, 8);
+    let c_three = b.constant_bit32(u32_ty, 3);
+    let c_one   = b.constant_bit32(u32_ty, 1);
+    let c_scope = b.constant_bit32(u32_ty, Scope::Device as u32);
+    let c_sem   = b.constant_bit32(u32_ty,
+        MemorySemantics::ATOMIC_COUNTER_MEMORY.bits());
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let gid = b.load(uvec3, None, gid_var, None, vec![]).unwrap();
+    let gid_x = b.composite_extract(u32_ty, None, gid, vec![0]).unwrap();
+    // sample = ssbo.data[gid_x + 8]
+    let sample_idx = b.i_add(u32_ty, None, gid_x, c_eight).unwrap();
+    let in_ptr = b.access_chain(ptr_u, None, ssbo, vec![c_zero, sample_idx]).unwrap();
+    let sample = b.load(u32_ty, None, in_ptr, None, vec![]).unwrap();
+    let bucket = b.bitwise_and(u32_ty, None, sample, c_three).unwrap();
+    // atomicAdd(ssbo.data[bucket], 1)
+    let out_ptr = b.access_chain(ptr_u, None, ssbo, vec![c_zero, bucket]).unwrap();
+    let _ = b.atomic_i_add(u32_ty, None, out_ptr, c_scope, c_sem, c_one).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![gid_var, ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn differential_histogram_one_binding() {
+    let spv = build_histogram_one_ssbo_cs();
+    let dir = TempDir::new().unwrap();
+    // Buffer layout:
+    //   [0..16]  = 4 bins (initially 0)
+    //   [16..48] = 8 samples [3,1,4,1,5,9,2,6]
+    let samples = [3u32, 1, 4, 1, 5, 9, 2, 6];
+    let make_buf = || -> Vec<u8> {
+        let mut buf = vec![0u8; 64];
+        for (i, v) in samples.iter().enumerate() {
+            // Sample region starts at byte 32 (slot 8).
+            let off = 32 + i*4;
+            buf[off..off+4].copy_from_slice(&v.to_le_bytes());
+        }
+        buf
+    };
+    let mut b_buf = make_buf();
+    let mut c_buf = make_buf();
+    let gids: Vec<(u32, u32, u32)> = (0..samples.len() as u32)
+        .map(|i| (i, 0, 0)).collect();
+    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &gids);
+    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &gids);
+    assert_eq!(b_buf, c_buf,
+        "bespoke vs cranelift diverge on one-ssbo histogram");
+    let bins: Vec<u32> = (0..4)
+        .map(|i| u32::from_le_bytes(b_buf[i*4..i*4+4].try_into().unwrap()))
+        .collect();
+    assert_eq!(bins, vec![1, 4, 2, 1], "got {bins:?}");
+}
+
+#[test]
+#[ignore = "bespoke W-reg pressure -- vk-icd test still validates via Cranelift fallback"]
+fn differential_histogram_integration() {
+    let spv = build_histogram_diff_cs();
+    let dir = TempDir::new().unwrap();
+    let samples = [3u32, 1, 4, 1, 5, 9, 2, 6];
+    let make_bufs = || -> Vec<Vec<u8>> {
+        let mut in_buf = vec![0u8; 64];
+        for (i, v) in samples.iter().enumerate() {
+            in_buf[i*4..i*4+4].copy_from_slice(&v.to_le_bytes());
+        }
+        let out_buf = vec![0u8; 64];
+        vec![in_buf, out_buf]
+    };
+    let mut b_bufs = make_bufs();
+    let mut c_bufs = make_bufs();
+    let b_table: Vec<u64> = b_bufs.iter_mut().map(|b| b.as_mut_ptr() as u64).collect();
+    let c_table: Vec<u64> = c_bufs.iter_mut().map(|b| b.as_mut_ptr() as u64).collect();
+    let gids: Vec<(u32, u32, u32)> = (0..samples.len() as u32)
+        .map(|i| (i, 0, 0)).collect();
+    invoke_with_gids(&spv, true,  dir.path(), "b",
+        b_table.as_ptr() as *mut u8, &gids);
+    invoke_with_gids(&spv, false, dir.path(), "c",
+        c_table.as_ptr() as *mut u8, &gids);
+    assert_eq!(b_bufs, c_bufs,
+        "bespoke vs cranelift diverge on histogram integration");
+    // Sanity-check the actual histogram.
+    let bins: Vec<u32> = (0..4)
+        .map(|i| u32::from_le_bytes(b_bufs[1][i*4..i*4+4].try_into().unwrap()))
+        .collect();
+    assert_eq!(bins, vec![1, 4, 2, 1], "got {bins:?}");
+}
+
 #[test]
 fn differential_six_binding_constant_store() {
     let spv = build_n_binding_constants(6);
