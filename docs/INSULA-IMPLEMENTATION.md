@@ -2,7 +2,7 @@
 
 **Branch:** `claude/romantic-rubin-42085b`
 **Last updated:** 2026-05-21
-**Phase:** M1A (Foundation) complete; M1B (service catalogue MVP minus Pergola) substantially complete — six libatrium ABI surfaces, five backing daemons, bundle signing + single-file archive packaging end-to-end, capability-diff consent on re-install.
+**Phase:** M1A (Foundation) complete; M1B (service catalogue MVP minus Pergola) substantially complete — six libatrium ABI surfaces, five backing daemons, bundle signing + single-file archive packaging end-to-end, capability-diff consent on re-install, direct CLI surfaces for all four user-facing daemons (`insula push`, `insula keychain`, `insula notify`, `insula daemons logs`), composite sample app demonstrating ABI composition.
 
 This document orients a reader landing fresh in the
 branch. For the design corpus see [`spec/insula.md`](spec/insula.md)
@@ -62,7 +62,7 @@ What this exercises end-to-end:
 
 ## Crate layout
 
-Twelve crates at the repo root. Each is its own `Cargo.toml`;
+Thirteen crates at the repo root. Each is its own `Cargo.toml`;
 the repo has no top-level workspace by convention.
 
 | Crate | Purpose | LoC (src + tests) |
@@ -72,8 +72,9 @@ the repo has no top-level workspace by convention.
 | [`libatrium`](../libatrium/) | Platform C ABI (cdylib + rlib + staticlib) | ~1300 |
 | [`insula-host-macos`](../insula-host-macos/) | macOS host adapter: SBPL gen, install, launch | ~1000 |
 | [`insula-hello`](../insula-hello/) | Demo Insula app + manifest | ~200 |
-| [`atrium-fetch`](../atrium-fetch/) | Second sample app — HTTP GET via the platform ABI | ~150 |
-| [`insula-cli`](../insula-cli/) | `insula install / launch / list / info / uninstall / daemons / keygen / sign / publishers / bundle` | ~1400 |
+| [`atrium-fetch`](../atrium-fetch/) | Sample app — HTTP GET via the platform ABI | ~150 |
+| [`atrium-mon`](../atrium-mon/) | Composite sample — net probe + notification (proves ABI composition) | ~120 |
+| [`insula-cli`](../insula-cli/) | `insula install / launch / list / info / uninstall / daemons {up,down,status,logs} / keygen / sign / publishers / bundle / push / keychain / notify` | ~2000 |
 | [`insula-logd`](../insula-logd/) | Aqueduct log-forwarding daemon | ~300 |
 | [`vestibulum-macos`](../vestibulum-macos/) | ed25519 keychain daemon (disk-backed) | ~450 |
 | [`atrium-netd-macos`](../atrium-netd-macos/) | Network broker (allowlist + byte proxy + SO_PEERPID per-app enforcement) | ~400 |
@@ -177,14 +178,14 @@ $INSULA daemons down
 
 ## Testing
 
-136 tests pass across all 12 crates on this macOS host.
+155 tests pass across all 13 crates on this macOS host.
 
 ```sh
 for c in insula-manifest insula-bundle libatrium \
          insula-host-macos insula-hello atrium-fetch \
-         insula-cli insula-logd vestibulum-macos \
-         atrium-netd-macos praeco-macos \
-         tabellarius-macos; do
+         atrium-mon insula-cli insula-logd \
+         vestibulum-macos atrium-netd-macos \
+         praeco-macos tabellarius-macos; do
   cargo test --manifest-path "$c/Cargo.toml"
 done
 ```
@@ -197,9 +198,10 @@ Test distribution:
 | insula-bundle | 18 | Bundle layout + ed25519 sign/verify + `.insula` archive (roundtrip, deterministic, unsafe-path refused) |
 | libatrium | 11 | C ABI surface tests + Aqueduct routing + storage |
 | insula-host-macos | 16 | SBPL gen + actual sandboxed launch + install layout |
-| insula-hello | 5 | Bundle parses; install+run via host adapter; per-app netd enforcement E2E (allow + deny) |
+| insula-hello | 6 | Bundle parses; install+run via host adapter; per-app netd E2E (allow + deny); per-app tabellarius E2E |
 | atrium-fetch | 1 | Bundle + manifest parse for the HTTP-GET sample |
-| insula-cli | 25 | Subcommands incl. keygen / sign / publishers / bundle + auto-spawn + 3 archive E2E + 5 capability-diff E2E |
+| atrium-mon | 2 | Net probe + notification compose end-to-end (reachable + unreachable cases) |
+| insula-cli | 41 | All subcommands; auto-spawn; signing/archive/diff E2E; push + keychain + notify + daemons-logs subcommand E2E |
 | insula-logd | 3 | Daemon decodes Aqueduct messages + writes log file |
 | vestibulum-macos | 10 | ed25519 keychain roundtrip incl. signature verify, persistence across restart |
 | atrium-netd-macos | 13 | Per-app manifest enforcement (8 unit) + broker behavior (5 integration) |
@@ -254,6 +256,51 @@ the design isn't just on paper):
   manifest-driven verdict in the auto-spawned daemon's log file.
   Closes the loop on SO_PEERPID + proc_pidpath + manifest lookup
   + verdict — the whole chain proven on real bytes.
+
+## CLI surface
+
+After the M1B daemon work + the recent ergonomics
+pass, the `insula` CLI exposes a complete operator
+loop:
+
+**App lifecycle**
+| Command | Purpose |
+|---|---|
+| `insula install <bundle\|.insula>` | Install from directory or archive |
+| `insula install ... --allow-unsigned` | Skip signature check (dev only) |
+| `insula install ... --accept-changes` | Accept widened capability grants on re-install |
+| `insula list` | Show installed apps |
+| `insula info <app-id>` | Show full capability surface + signature + paths |
+| `insula launch <app-id> [args]` | Run a sandboxed app (auto-spawns daemons) |
+| `insula uninstall <app-id>` | Remove an app + its container |
+
+**Publish-side tooling**
+| Command | Purpose |
+|---|---|
+| `insula bundle <src> <out.insula>` | Pack a bundle directory into a single-file archive |
+| `insula keygen <id> <out-dir>` | Generate a publisher ed25519 keypair |
+| `insula sign <bundle> --key <f>` | Sign a bundle in place |
+| `insula publishers add\|list\|remove` | Manage the install-time trust store |
+
+**Daemon ops**
+| Command | Purpose |
+|---|---|
+| `insula daemons up\|down\|status` | Lifecycle for all five platform daemons |
+| `insula daemons logs <name>` | Print a daemon's log file to stdout |
+
+**Direct daemon surfaces** — handy for development /
+debugging without writing an app:
+| Command | Daemon |
+|---|---|
+| `insula push subscribe\|list\|unsubscribe` | tabellarius |
+| `insula keychain pubkey\|sign` | vestibulum |
+| `insula notify <title> <body> [--urgency]` | praeco |
+
+All daemon-talking subcommands auto-spawn the daemon
+if it isn't running yet (via the shared
+`daemons::ensure_started` helper) and honor the
+`INSULA_<NAME>_SOCKET` env vars for test / power-user
+overrides.
 
 ## v0 limitations (documented)
 
@@ -342,10 +389,18 @@ none of them invalidates the current shape.
 
 ## Commit history of the implementation effort
 
-30+ implementation commits on this branch (latest first; see
+40+ implementation commits on this branch (latest first; see
 `git log` for the full history):
 
 ```
+atrium-mon: composite sample app — TCP probe + notification
+insula-cli: `insula daemons logs <name>` + log path in status
+insula-cli: `insula notify` subcommand — direct praeco wrapper
+insula-cli: `insula keychain pubkey / sign` subcommand
+insula-cli: expand `insula info` to show full capability surface
+insula-cli: `insula push subscribe / list / unsubscribe` subcommand
+insula-hello: optional tabellarius-subscribe + E2E test through insula launch
+docs/INSULA-IMPLEMENTATION: refresh for archive + diff + tabellarius
 66a31cc tabellarius-macos: push-delivery daemon + atrium_tabellarius_* ABI
 84d2cf6 insula-manifest + insula-cli: capability-diff consent on re-install
 2665e4f insula-bundle + insula-cli: single-file .insula archive packaging
@@ -411,10 +466,6 @@ fa75556 insula-manifest: add [render] [input] [ipc] [storage] [compute]
    the actual relay connection lifecycle, decryption via
    the vestibulum keychain ABI, and waking
    triggered-background entry points on incoming push.
-4. **Atrium-fetch as a real consumer of Tabellarius** —
-   the sample already proves the network broker; a
-   third sample using `atrium_tabellarius_subscribe`
-   would exercise the push-side ABI surface end-to-end.
 
 Each of these is one or two commits given the current
 shape; the foundation underneath is in place.
