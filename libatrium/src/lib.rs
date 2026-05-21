@@ -1037,6 +1037,89 @@ pub unsafe extern "C" fn atrium_window_open(
     }
 }
 
+/// Emit a single-rect frame into `window_id`. The
+/// frame consists of `OP_SCENE_FRAME_BEGIN`, one
+/// `OP_SCENE_NODE_SET` carrying a `RectParams` under
+/// node id 1, and `OP_SCENE_FRAME_END`. All three
+/// envelopes go down the same connection so the
+/// scene server treats them as a single frame
+/// commit.
+///
+/// Coordinates are screen-pixel space, top-left
+/// origin; color is straight RGBA in `[0, 1]`.
+///
+/// This is the first-pixel API — a convenience for
+/// "fill the window with a solid color and present".
+/// Richer scene-graph emission (multiple nodes,
+/// textures, paths, glyph runs) lands in subsequent
+/// slices via a session-style API.
+///
+/// Returns 0 on success, negative on error.
+#[no_mangle]
+pub extern "C" fn atrium_window_fill_rect(
+    window_id: u32,
+    x: f32, y: f32, w: f32, h: f32,
+    r: f32, g: f32, b: f32, a: f32,
+) -> c_int {
+    let Some(mut conn) = fresco_connect() else {
+        return ATRIUM_ERR_NO_FRESCO;
+    };
+    let flags = window_id as u16;
+
+    // 1. SCENE_FRAME_BEGIN
+    let begin = match postcard::to_stdvec(&fresco_protocol::SceneFrameBeginPayload::default()) {
+        Ok(b) => b,
+        Err(_) => return ATRIUM_ERR_FRESCO_RPC,
+    };
+    if conn.send_message(
+        CLASS_DISPLAY,
+        fresco_protocol::control::OP_SCENE_FRAME_BEGIN,
+        flags,
+        &begin,
+    ).is_err() {
+        return ATRIUM_ERR_FRESCO_RPC;
+    }
+
+    // 2. SCENE_NODE_SET with a RECT node under id 1.
+    let rect_bytes = match postcard::to_stdvec(&fresco_protocol::RectParams {
+        x, y, w, h, r, g, b, a,
+    }) {
+        Ok(v) => v,
+        Err(_) => return ATRIUM_ERR_FRESCO_RPC,
+    };
+    let node = match postcard::to_stdvec(&fresco_protocol::SceneNodeSetPayload {
+        node_id: 1,
+        op_id: fresco_protocol::scene_ops::ATRIUM_CORE_RECT,
+        params: rect_bytes,
+    }) {
+        Ok(v) => v,
+        Err(_) => return ATRIUM_ERR_FRESCO_RPC,
+    };
+    if conn.send_message(
+        CLASS_DISPLAY,
+        fresco_protocol::control::OP_SCENE_NODE_SET,
+        flags,
+        &node,
+    ).is_err() {
+        return ATRIUM_ERR_FRESCO_RPC;
+    }
+
+    // 3. SCENE_FRAME_END
+    let end = match postcard::to_stdvec(&fresco_protocol::SceneFrameEndPayload::default()) {
+        Ok(b) => b,
+        Err(_) => return ATRIUM_ERR_FRESCO_RPC,
+    };
+    if conn.send_message(
+        CLASS_DISPLAY,
+        fresco_protocol::control::OP_SCENE_FRAME_END,
+        flags,
+        &end,
+    ).is_err() {
+        return ATRIUM_ERR_FRESCO_RPC;
+    }
+    0
+}
+
 /// Destroy a previously-opened window. Returns 0 on
 /// success, negative on error.
 ///

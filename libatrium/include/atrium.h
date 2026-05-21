@@ -184,6 +184,13 @@ int32_t atrium_window_open(const char* title, uint32_t width, uint32_t height);
 /* Destroy a previously-opened window. */
 int32_t atrium_window_destroy(uint32_t window_id);
 
+/* Single-call convenience: emit a frame containing one
+ * RECT node into window_id and present. First-pixel API. */
+int32_t atrium_window_fill_rect(
+    uint32_t window_id,
+    float x, float y, float w, float h,
+    float r, float g, float b, float a);
+
 #ifdef __cplusplus
 }
 #endif
