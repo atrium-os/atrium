@@ -2,6 +2,9 @@
 **/target/
 **/Cargo.lock.bak
 
+# Insula release-artifact staging from scripts/build-insula.sh.
+/dist/
+
 # Rust analyzer caches.
 **/.rustc_info.json
 
