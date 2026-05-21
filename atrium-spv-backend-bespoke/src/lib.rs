@@ -990,13 +990,34 @@ fn emit_function(
         let mut sorted: Vec<(u32, (u32, u32))> = func.ssbo_bindings.iter()
             .map(|(vid, sb)| (*vid, *sb)).collect();
         sorted.sort_by_key(|(_, (_, binding))| *binding);
-        if sorted.len() > 2 {
+        // Caller-saved scratch regs that don't overlap the
+        // regalloc int pool (X19..X28) or the AAPCS64 arg
+        // regs (X0..X7) or platform-reserved X18.  X16/X17
+        // are AAPCS64 IP0/IP1 (intra-procedure-call scratch);
+        // X12..X15 are general caller-saved temps.  X9..X11
+        // are also caller-saved but are touched contextually
+        // by the image-sample helper, so left out of this
+        // pool.  Six slots = practical ceiling for the
+        // pre-materialize strategy; shaders needing more
+        // bindings would need the per-access indirect-load
+        // model.
+        const SSBO_BASE_REGS: [u8; 6] = [16, 17, 13, 14, 15, 12];
+        if sorted.len() > SSBO_BASE_REGS.len() {
             return Err(BackendError::Unsupported(format!(
-                "bespoke compute supports at most 2 SSBO bindings today \
-                 (got {})", sorted.len())));
+                "bespoke compute supports at most {} SSBO bindings (got {})",
+                SSBO_BASE_REGS.len(), sorted.len())));
+        }
+        // Reserve the SSBO base regs from IntPool: those
+        // physical registers (W13..W17 are the same as
+        // X13..X17) overlap the int regalloc's primary
+        // caller-saved tier.  Without this reservation the
+        // body's regalloc would hand them out for arithmetic
+        // and overwrite the SSBO pointers we just loaded.
+        for &n in &SSBO_BASE_REGS[..sorted.len()] {
+            int_pool.free.retain(|&r| r != n);
         }
         for (i, (vid, (_set, binding))) in sorted.iter().enumerate() {
-            let dst = asm::Xreg(16 + i as u8);
+            let dst = asm::Xreg(SSBO_BASE_REGS[i]);
             a.emit(asm::ldr_x_offset(dst, asm::Xreg(2), (binding * 8) as u16));
             pointers.insert(ValueId(*vid), (dst, 0));
         }

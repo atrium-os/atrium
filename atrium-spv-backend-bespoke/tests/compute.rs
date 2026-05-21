@@ -807,6 +807,72 @@ fn build_two_ssbo_cs() -> Vec<u8> {
     bytes
 }
 
+/// CS that writes a distinct constant to each of four
+/// SSBO bindings.  Exercises the extended (X16, X17, X12,
+/// X13) binding-pool layout that lifted the original
+/// 2-binding cap.
+fn build_four_ssbo_cs() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let void_fn = b.type_function(void, vec![]);
+    let pu = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+    let mut vars = Vec::new();
+    for i in 0..4 {
+        let s = b.type_struct(vec![u32_ty]);
+        b.decorate(s, Decoration::Block, vec![]);
+        b.member_decorate(s, 0, Decoration::Offset,
+            vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        let p = b.type_pointer(None, StorageClass::StorageBuffer, s);
+        let v = b.variable(p, None, StorageClass::StorageBuffer, None);
+        b.decorate(v, Decoration::DescriptorSet,
+            vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        b.decorate(v, Decoration::Binding,
+            vec![rspirv::dr::Operand::LiteralBit32(i)]);
+        vars.push(v);
+    }
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    let consts: Vec<_> = [0x1111_1111u32, 0x2222_2222, 0x3333_3333, 0x4444_4444]
+        .iter().map(|x| b.constant_bit32(u32_ty, *x)).collect();
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    for (i, v) in vars.iter().enumerate() {
+        let d = b.access_chain(pu, None, *v, vec![c_zero]).unwrap();
+        b.store(d, consts[i], None, vec![]).unwrap();
+    }
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vars);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn bespoke_compiles_four_binding_ssbo() {
+    let spv = build_four_ssbo_cs();
+    let module = translate(&spv).expect("frontend");
+    let target = if cfg!(target_os = "macos") {
+        Target::Aarch64Darwin
+    } else {
+        Target::Aarch64FreeBSD
+    };
+    let out = compile_blob(&module, target)
+        .expect("bespoke should compile a CS with 4 SSBO bindings -- \
+                 exercises the X12-X17 binding-register pool");
+    assert!(!out.blob.is_empty());
+}
+
 #[test]
 fn bespoke_compiles_multi_binding_ssbo() {
     let spv = build_two_ssbo_cs();
