@@ -81,6 +81,7 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 #[test]
 fn fill_rect_emits_begin_node_end_with_window_flags() {
     let _guard = ENV_LOCK.lock().unwrap();
+    atrium::atrium_window_disconnect();
     let tmp = tempfile::tempdir().unwrap();
     let sock = tmp.path().join("fresco.sock");
     let cap = spawn_stub(sock.clone());
@@ -127,6 +128,7 @@ fn fill_rect_emits_begin_node_end_with_window_flags() {
 #[test]
 fn fill_rect_with_no_socket_returns_no_fresco() {
     let _guard = ENV_LOCK.lock().unwrap();
+    atrium::atrium_window_disconnect();
     std::env::remove_var("ATRIUM_FRESCO_SOCKET");
     let r = atrium::atrium_window_fill_rect(
         1, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0,

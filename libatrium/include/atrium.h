@@ -191,6 +191,28 @@ int32_t atrium_window_fill_rect(
     float x, float y, float w, float h,
     float r, float g, float b, float a);
 
+/* Window event kinds (mirror fresco_protocol::control::EV_*). */
+#define ATRIUM_EV_WINDOW_RESIZED         0x0580
+#define ATRIUM_EV_WINDOW_FOCUS_CHANGED   0x0581
+#define ATRIUM_EV_WINDOW_CLOSE_REQUESTED 0x0582
+
+typedef struct {
+    uint16_t kind;
+    uint16_t _pad;
+    uint32_t window_id;
+    uint32_t arg1;        /* width / gained */
+    uint32_t arg2;        /* height */
+} atrium_window_event_t;
+
+/* Non-blocking poll for the next window event.
+ * Returns 1 if an event was written to *out, 0 if none,
+ * negative on error. */
+int32_t atrium_window_poll_event(atrium_window_event_t* out);
+
+/* Drop the persistent Fresco connection (test helper /
+ * shutdown). */
+void atrium_window_disconnect(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -96,6 +96,7 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 #[test]
 fn window_open_encodes_postcard_payload_and_parses_reply() {
     let _guard = ENV_LOCK.lock().unwrap();
+    atrium::atrium_window_disconnect();
     let tmp = tempfile::tempdir().unwrap();
     let sock = tmp.path().join("fresco.sock");
     let captured = spawn_stub(sock.clone(), 42);
@@ -128,6 +129,7 @@ fn window_open_encodes_postcard_payload_and_parses_reply() {
 #[test]
 fn window_open_with_no_socket_returns_no_fresco() {
     let _guard = ENV_LOCK.lock().unwrap();
+    atrium::atrium_window_disconnect();
     std::env::remove_var("ATRIUM_FRESCO_SOCKET");
     let title = CString::new("x").unwrap();
     let r = unsafe { atrium::atrium_window_open(title.as_ptr(), 1, 1) };
@@ -137,6 +139,7 @@ fn window_open_with_no_socket_returns_no_fresco() {
 #[test]
 fn window_open_with_null_title_errors() {
     let _guard = ENV_LOCK.lock().unwrap();
+    atrium::atrium_window_disconnect();
     let r = unsafe { atrium::atrium_window_open(std::ptr::null(), 1, 1) };
     assert_eq!(r, atrium::ATRIUM_ERR_INVALID_PATH);
 }
