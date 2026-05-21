@@ -1526,32 +1526,53 @@ fn emit_function(
                 &mut free_pool, &mut owners, &mut used_callee_saved_v,&mut next_synth_id,
                 coalesce_dest.as_ref(), inst, a_v, b_v, asm::fdiv_s, asm::fdiv_v_4s)?,
             Op::Store { ptr, value } => {
-                match &ptr.ty {
-                    Type::Pointer(StorageClass::Output, _) => {}
-                    other => return Err(BackendError::Unsupported(format!(
-                        "Store target {other:?} not supported"))),
-                }
+                // Accept any writable storage class -- the
+                // resolve_or_make_pointer storage-class table
+                // is the source of truth for what's writable.
+                // It returns (param_xreg, byte_offset); the
+                // byte_offset honours any prior OpAccessChain
+                // (compute SSBO writes flow through this
+                // path, as do fragment/vertex Output stores).
+                let (ptr_param, base_off) =
+                    resolve_or_make_pointer(ptr, &mut pointers, func.stage)?;
+                let base_off_u16: u16 = u16::try_from(base_off)
+                    .map_err(|_| BackendError::Unsupported(format!(
+                        "Op::Store byte offset {base_off} out of u16 range")))?;
                 // NEON-packed value: one 128-bit store of
                 // the whole Q-register.
                 if let Some(&q) = packed.get(&value.id) {
-                    a.emit(asm::str_q_offset(q, x_out, 0));
+                    a.emit(asm::str_q_offset(q, ptr_param, base_off_u16));
                     continue;
                 }
-                let lanes = vectors.get(&value.id).ok_or_else(||
-                    BackendError::Unsupported(format!(
-                        "Op::Store value {:?} is not a vector", value.id)))?;
-                if lanes.len() > 4 {
-                    return Err(BackendError::Unsupported(format!(
-                        "Store of {}-lane vector not supported", lanes.len())));
+                if let Some(lanes) = vectors.get(&value.id) {
+                    if lanes.len() > 4 {
+                        return Err(BackendError::Unsupported(format!(
+                            "Store of {}-lane vector not supported", lanes.len())));
+                    }
+                    for (lane_i, lane) in lanes.iter().enumerate() {
+                        let sreg = *scalars.get(&lane.id).ok_or_else(||
+                            BackendError::Internal(format!(
+                                "lane {:?} not in scalars", lane.id)))?;
+                        a.emit(asm::fmov_w_from_s(w_tmp, sreg));
+                        let offset_bytes = base_off_u16 + (lane_i as u16) * 4;
+                        a.emit(asm::str_w_offset(w_tmp, ptr_param, offset_bytes));
+                    }
+                    continue;
                 }
-                for (lane_i, lane) in lanes.iter().enumerate() {
-                    let sreg = *scalars.get(&lane.id).ok_or_else(||
-                        BackendError::Internal(format!(
-                            "lane {:?} not in scalars", lane.id)))?;
+                // Scalar int store (u32/i32 SSBO write).
+                if let Some(&w) = ints.get(&value.id) {
+                    a.emit(asm::str_w_offset(w, ptr_param, base_off_u16));
+                    continue;
+                }
+                // Scalar f32 store.
+                if let Some(&sreg) = scalars.get(&value.id) {
                     a.emit(asm::fmov_w_from_s(w_tmp, sreg));
-                    let offset_bytes = (lane_i as u16) * 4;
-                    a.emit(asm::str_w_offset(w_tmp, x_out, offset_bytes));
+                    a.emit(asm::str_w_offset(w_tmp, ptr_param, base_off_u16));
+                    continue;
                 }
+                return Err(BackendError::Unsupported(format!(
+                    "Op::Store value {:?} not in packed/vectors/ints/scalars",
+                    value.id)));
             }
             Op::AccessChain { base, byte_offset } => {
                 let result = inst.result.as_ref().ok_or_else(||
