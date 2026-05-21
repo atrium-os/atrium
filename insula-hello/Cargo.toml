@@ -1,0 +1,19 @@
+[package]
+name        = "insula-hello"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+description = "Hello-world Insula app. Demonstrates the minimum loop: parse manifest, launch via host adapter, app links libatrium, calls atrium_init / atrium_log / atrium_exit. End-to-end sanity check for the macOS host adapter."
+publish     = false
+
+[[bin]]
+name = "insula-hello"
+path = "src/main.rs"
+
+[dependencies]
+libatrium = { path = "../libatrium" }
+
+[dev-dependencies]
+insula-host-macos = { path = "../insula-host-macos" }
+insula-manifest   = { path = "../insula-manifest" }
+tempfile          = "3"

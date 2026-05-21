@@ -1,0 +1,22 @@
+# Insula manifest for insula-hello.
+#
+# This is what would ship in the Insula bundle alongside
+# the binary. The macOS host adapter reads this to
+# generate the SBPL sandbox profile + entitlements XML.
+
+[app]
+name = "com.atrium-os.insula-hello"
+version = "0.1.0"
+sdk-version = "1.x"
+
+[bundle]
+form = "native"
+arches = ["aarch64-darwin"]
+entry = "bin/insula-hello"
+
+# Bare-minimum capabilities. insula-hello needs nothing
+# beyond a sandbox and the ability to write to stderr.
+# No network, no IPC, no rendering, no background.
+
+[storage]
+data = "1MB"

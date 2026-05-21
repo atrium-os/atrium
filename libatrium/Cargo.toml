@@ -1,0 +1,18 @@
+[package]
+name        = "libatrium"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+description = "The Insula platform library -- C-ABI surface third-party apps link against on every Insula host. Per docs/spec/insula.md §2.3, libatrium wraps the Aqueduct services exposed to apps (Fresco, Vestibulum, Praeco, Loculus, Limen, ...). v0 ships the minimum-viable surface (init / log / exit) so the manifest+host-adapter+app loop can demonstrate end-to-end; subsequent slices add the real Aqueduct-backed calls."
+publish     = false
+
+[lib]
+name       = "atrium"
+path       = "src/lib.rs"
+# cdylib: ship as libatrium.dylib (the real deployment artifact).
+# rlib:   so Rust apps depending on it for v0 demos can link
+#         statically without the dynamic-load dance.
+# staticlib: for C apps that want to embed.
+crate-type = ["cdylib", "rlib", "staticlib"]
+
+[dependencies]

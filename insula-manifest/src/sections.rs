@@ -68,8 +68,13 @@ impl Default for InputPolicy {
 /// `[capabilities]`, not here.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InputSection {
+    /// Keyboard subscription policy. Defaults to
+    /// [`InputPolicy::Focus`].
     #[serde(default)]
     pub keyboard: InputPolicy,
+
+    /// Pointer (mouse / touch / pen) subscription
+    /// policy. Defaults to [`InputPolicy::Focus`].
     #[serde(default)]
     pub pointer: InputPolicy,
 }
@@ -88,6 +93,9 @@ pub struct InputSection {
 /// accessible to the app's jail.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IpcSection {
+    /// Aqueduct service names the app is permitted to
+    /// reach (e.g. `"fresco-protocol"`, `"clipboard"`,
+    /// `"vestibulum"`).
     #[serde(default)]
     pub services: Vec<String>,
 }
@@ -303,8 +311,13 @@ pub struct TriggeredBackgroundSection {
 /// foreground-only app.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BackgroundSection {
+    /// Long-lived background process declaration (see
+    /// [`ResidentBackgroundSection`]).
     #[serde(default)]
     pub resident: Option<ResidentBackgroundSection>,
+
+    /// Wake-on-event background entry-point declaration
+    /// (see [`TriggeredBackgroundSection`]).
     #[serde(default)]
     pub triggered: Option<TriggeredBackgroundSection>,
 }
@@ -344,6 +357,7 @@ pub struct RoleReqSpec {
     #[serde(default)]
     pub schema: Option<String>,
 
+    /// Role-specific extra config preserved verbatim.
     #[serde(flatten)]
     pub extra: BTreeMap<String, toml::Value>,
 }
@@ -353,8 +367,15 @@ pub struct RoleReqSpec {
 /// Per `limen.md` §3.1.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RoleSection {
+    /// Roles this app implements; the launcher / Limen
+    /// can route requests-for-role-X from other apps to
+    /// this one.
     #[serde(default)]
     pub implements: BTreeMap<String, RoleImplSpec>,
+
+    /// Roles this app may request via Limen. Apps that
+    /// embed a `doc-viewer`, `picker`, `payment` etc.
+    /// declare here.
     #[serde(default)]
     pub requires: BTreeMap<String, RoleReqSpec>,
 }
@@ -376,8 +397,14 @@ pub struct RoleSection {
 /// device channels via Concursus.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PeerSection {
+    /// Peer roles this app can be the *responder* for
+    /// when another device initiates.
     #[serde(default)]
     pub implements: BTreeMap<String, RoleImplSpec>,
+
+    /// Peer roles this app may *initiate* to other
+    /// devices. Concursus uses this to know which apps
+    /// can connect outbound.
     #[serde(default)]
     pub requests: BTreeMap<String, RoleReqSpec>,
 }
@@ -394,6 +421,8 @@ pub struct PeerSection {
 /// Per `insula.md` §15.5.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SyncSection {
+    /// `true` opts the app's `/data` into the sync
+    /// subsystem; `false` (default) keeps it local-only.
     #[serde(default)]
     pub enabled: bool,
 
