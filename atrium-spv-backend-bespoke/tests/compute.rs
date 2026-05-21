@@ -808,8 +808,7 @@ fn build_two_ssbo_cs() -> Vec<u8> {
 }
 
 #[test]
-#[ignore = "multi-binding SSBO not yet wired in bespoke -- see arc"]
-fn bespoke_multi_binding_ssbo_not_yet_supported() {
+fn bespoke_compiles_multi_binding_ssbo() {
     let spv = build_two_ssbo_cs();
     let module = translate(&spv).expect("frontend");
     let target = if cfg!(target_os = "macos") {
@@ -817,11 +816,16 @@ fn bespoke_multi_binding_ssbo_not_yet_supported() {
     } else {
         Target::Aarch64FreeBSD
     };
-    // Document the current state: compile may succeed (both
-    // SSBOs alias X2 -- wrong codegen) or fail.  When the
-    // multi-binding arc lands, flip this to a real
-    // correctness test.
-    let _ = compile_blob(&module, target);
+    // The bespoke compute path now distinguishes SSBO
+    // bindings: X2 holds a descriptor table base, and the
+    // emitted prologue pre-loads X16=tbl[0] (binding 0
+    // pointer) and X17=tbl[1] (binding 1 pointer).
+    // Subsequent SSBO accesses route through the per-binding
+    // X-reg rather than aliasing X2.
+    let out = compile_blob(&module, target)
+        .expect("bespoke should compile a CS with 2 SSBO bindings -- \
+                 exercises the multi-binding descriptor-table path");
+    assert!(!out.blob.is_empty());
 }
 
 #[test]

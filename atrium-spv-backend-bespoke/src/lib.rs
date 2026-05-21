@@ -973,6 +973,35 @@ fn emit_function(
     // of the ldr_w_offset inst, dest W-reg).
     let mut lid_z_load_patches: Vec<(usize, asm::Wreg)> = Vec::new();
 
+    // Multi-binding SSBO prologue.  When a compute shader
+    // declares >1 StorageBuffer, X2 is no longer a direct
+    // SSBO pointer -- it points to a descriptor table where
+    // entry B holds the pointer for binding B (8 bytes each,
+    // single descriptor set assumed).  Pre-load each
+    // binding's pointer into X16/X17 (AAPCS64 IP0/IP1 --
+    // caller-saved and unused by the regalloc int pool
+    // X19..X28) and pre-populate `pointers` so subsequent
+    // resolve_or_make_pointer calls return the cached reg.
+    //
+    // Single-SSBO compute shaders keep the legacy X2-direct
+    // mapping so the host (atrium-vk-icd / tier2 backend)
+    // doesn't have to build a table for the common case.
+    if func.stage == ShaderStage::Compute && func.ssbo_bindings.len() >= 2 {
+        let mut sorted: Vec<(u32, (u32, u32))> = func.ssbo_bindings.iter()
+            .map(|(vid, sb)| (*vid, *sb)).collect();
+        sorted.sort_by_key(|(_, (_, binding))| *binding);
+        if sorted.len() > 2 {
+            return Err(BackendError::Unsupported(format!(
+                "bespoke compute supports at most 2 SSBO bindings today \
+                 (got {})", sorted.len())));
+        }
+        for (i, (vid, (_set, binding))) in sorted.iter().enumerate() {
+            let dst = asm::Xreg(16 + i as u8);
+            a.emit(asm::ldr_x_offset(dst, asm::Xreg(2), (binding * 8) as u16));
+            pointers.insert(ValueId(*vid), (dst, 0));
+        }
+    }
+
     let mut flat_i: usize = 0;
     for (block_pos, bid) in block_order.iter().enumerate() {
         let block = func.blocks.get(bid).unwrap();
