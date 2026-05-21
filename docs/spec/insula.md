@@ -2782,13 +2782,12 @@ Written:
   delivery protocol (sketched from §11.5 of this spec).
 - [`docs/spec/loculus.md`](loculus.md) — wallet and
   autofill service (sketched from §16 of this spec).
+- [`docs/spec/concursus.md`](concursus.md) — peer-to-peer
+  channel broker (sketched from §19 of this spec).
+- [`docs/spec/atrium-ax.md`](atrium-ax.md) — accessibility
+  tree composition (sketched from §10.4 of this spec).
 
 Planned, not yet written:
-- `docs/spec/loculus.md` — wallet schema.
-- `docs/spec/concursus.md` — peer signaling.
-- `docs/spec/nomenclator.md` — name resolution protocol.
-- `docs/spec/atrium-ax.md` — accessibility wire format
-  (referenced from §10.4).
 - `docs/spec/insula-host-macos.md` — macOS host adapter
   (referenced from §0.7).
 
