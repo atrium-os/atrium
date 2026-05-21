@@ -2039,16 +2039,28 @@ data  = "100MB"   # backed up
 cache = "1GB"     # evictable
 ```
 
-**Enforcement is at the jail boundary**, not at the
-Tessera filesystem layer. Tessera (`tessera-fs.md`) does
-not enforce per-app storage quotas — it provides the
-content-addressed store + automatic cross-app dedup. Per-
-jail disk-quota enforcement is **Portcullis + `rctl`**
-(jail-level disk limit on the app's container path); on
-non-Atrium host adapters it is the equivalent host
-mechanism (e.g., quota policy at the App Sandbox
-container layer on macOS). The OS *will* evict `/cache`
-on disk pressure; apps must treat it as a soft hint.
+**Enforcement is at the filesystem layer via Tessera +
+atrium-volumes** (see `tessera-quotas.md`). The flow:
+
+- The app's manifest declares storage limits, which
+  Portcullis translates into `size_max` fields on the
+  app's `[[volumes]]` entries.
+- `atrium-volumes` provisions a Tessera-backed volume
+  per jail with the requested limit.
+- Tessera enforces the quota per directory tree
+  (CAS-dedup-aware: counts *logical* bytes, not
+  physical, per `tessera-quotas.md` §3.2); writes that
+  would exceed `size_max` return `EDQUOT`
+  synchronously.
+
+This means the platform-side disk quota is real and
+enforced in-kernel, not advisory. On non-Atrium host
+adapters the equivalent host mechanism enforces (App
+Sandbox container limits on macOS, project quotas via
+XFS / btrfs subvolumes on Linux, NTFS quota on Windows
+— each is per-jail granular). The OS *will* evict
+`/cache` on disk pressure; apps must treat it as a soft
+hint.
 
 ### 15.3 Backup
 
