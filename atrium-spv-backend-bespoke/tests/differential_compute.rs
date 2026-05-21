@@ -1244,6 +1244,78 @@ fn build_local_index_cs() -> Vec<u8> {
     bytes
 }
 
+/// CS: writes the three components of gl_WorkGroupSize
+/// into ssbo.data[0..3].  Verifies both backends materialise
+/// the LocalSize constants in matching order.
+fn build_workgroup_size_cs() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let uvec3  = b.type_vector(u32_ty, 3);
+    let void_fn = b.type_function(void, vec![]);
+    let rt_arr = b.type_runtime_array(u32_ty);
+    b.decorate(rt_arr, Decoration::ArrayStride,
+        vec![rspirv::dr::Operand::LiteralBit32(4)]);
+    let s = b.type_struct(vec![rt_arr]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_u = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+    let ssbo = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_in_uvec3 = b.type_pointer(None, StorageClass::Input, uvec3);
+    let ws_var = b.variable(ptr_in_uvec3, None, StorageClass::Input, None);
+    b.decorate(ws_var, Decoration::BuiltIn,
+        vec![rspirv::dr::Operand::BuiltIn(BuiltIn::WorkgroupSize)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let ws = b.load(uvec3, None, ws_var, None, vec![]).unwrap();
+    for i in 0..3u32 {
+        let c_i = b.constant_bit32(u32_ty, i);
+        let lane = b.composite_extract(u32_ty, None, ws, vec![i]).unwrap();
+        let dst = b.access_chain(ptr_u, None, ssbo, vec![c_zero, c_i]).unwrap();
+        b.store(dst, lane, None, vec![]).unwrap();
+    }
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ws_var, ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [7u32, 5, 3]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn differential_workgroup_size_materialises_localsize() {
+    let spv = build_workgroup_size_cs();
+    let dir = TempDir::new().unwrap();
+    let mut b_buf = vec![0u8; 16];
+    let mut c_buf = vec![0u8; 16];
+    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    assert_eq!(b_buf, c_buf,
+        "bespoke vs cranelift diverge on gl_WorkGroupSize");
+    // LocalSize=(7,5,3) -> slots 0,1,2 should hold 7,5,3.
+    let got: Vec<u32> = (0..3)
+        .map(|i| u32::from_le_bytes(b_buf[i*4..i*4+4].try_into().unwrap()))
+        .collect();
+    assert_eq!(got, vec![7, 5, 3], "got {got:?}");
+}
+
 #[test]
 fn differential_local_invocation_index_linearises() {
     let spv = build_local_index_cs();

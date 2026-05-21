@@ -954,6 +954,16 @@ impl FnTranslator {
                         }).collect();
                         self.vectors.insert(result.id, lanes);
                     }
+                    (ShaderStage::Compute, BK::WorkgroupSize) => {
+                        // uvec3 from func.local_size --
+                        // pure compile-time constants.
+                        let ls = self.local_size.unwrap_or((1, 1, 1));
+                        let lanes: Vec<ClifValue> = [ls.0, ls.1, ls.2].iter()
+                            .map(|v| builder.ins().iconst(
+                                clif_types::I32, *v as i64))
+                            .collect();
+                        self.vectors.insert(result.id, lanes);
+                    }
                     (ShaderStage::Compute, BK::LocalInvocationIndex) => {
                         // index = lz * (sx*sy) + ly * sx + lx
                         // (lid.x@params[6], lid.y@params[7], lid.z@params[8])

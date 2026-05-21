@@ -989,10 +989,13 @@ fn translate_inst(
                     ))),
                 };
 
-                // Step through the pointee. If it's a
-                // struct we know about, descend via the
-                // recorded layout; otherwise we don't
-                // support deeper chains yet.
+                // Step through the pointee.  Three cases:
+                //   - Struct: descend via the recorded
+                //     member layout.
+                //   - RuntimeArray / Array: this is a
+                //     constant-index step into an array;
+                //     compute idx * element_size and add.
+                //   - other: unsupported.
                 if let Some(layout) = iface.struct_layouts.get(&current_pointee_id) {
                     let member = layout.get(idx_val as usize).ok_or_else(||
                         FrontendError::Malformed(format!(
@@ -1002,10 +1005,37 @@ fn translate_inst(
                         )))?;
                     byte_offset = byte_offset.saturating_add(member.byte_offset);
                     current_pointee_id = member.type_id;
+                } else if let Ok(raw) = types.get_raw(current_pointee_id) {
+                    match raw.class.opcode {
+                        rspirv::spirv::Op::TypeRuntimeArray
+                        | rspirv::spirv::Op::TypeArray => {
+                            let elem_type_id = match raw.operands.first() {
+                                Some(Operand::IdRef(id)) => *id,
+                                other => return Err(FrontendError::Malformed(format!(
+                                    "Array type missing element id: {other:?}",
+                                ))),
+                            };
+                            let stride = crate::interface::ir_type_size_bytes_for(
+                                &types.types, elem_type_id);
+                            if stride == 0 {
+                                return Err(FrontendError::Unsupported(format!(
+                                    "constant AccessChain into Array of \
+                                     non-leaf element type {elem_type_id}",
+                                )));
+                            }
+                            byte_offset = byte_offset
+                                .saturating_add(idx_val.saturating_mul(stride));
+                            current_pointee_id = elem_type_id;
+                        }
+                        other => return Err(FrontendError::Unsupported(format!(
+                            "AccessChain constant step through non-struct \
+                             non-array pointee (opcode {other:?}) not supported",
+                        ))),
+                    }
                 } else {
                     return Err(FrontendError::Unsupported(format!(
-                        "AccessChain step through non-struct pointee \
-                         (type id {current_pointee_id}) not supported yet",
+                        "AccessChain step through pointee {current_pointee_id} \
+                         with no struct layout or raw type info",
                     )));
                 }
             }

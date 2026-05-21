@@ -263,6 +263,8 @@ impl InterfaceContext {
                                 Some(atrium_spv_ir::BuiltinKind::GlobalInvocationId),
                             SpvBuiltIn::LocalInvocationIndex =>
                                 Some(atrium_spv_ir::BuiltinKind::LocalInvocationIndex),
+                            SpvBuiltIn::WorkgroupSize =>
+                                Some(atrium_spv_ir::BuiltinKind::WorkgroupSize),
                             SpvBuiltIn::VertexIndex =>
                                 Some(atrium_spv_ir::BuiltinKind::VertexIndex),
                             SpvBuiltIn::InstanceIndex =>

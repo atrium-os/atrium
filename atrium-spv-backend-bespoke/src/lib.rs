@@ -1987,6 +1987,30 @@ fn emit_function(
                         }
                         vectors.insert(result.id, lanes);
                     }
+                    BK::WorkgroupSize => {
+                        // uvec3 of the SPIR-V LocalSize
+                        // literal -- a compile-time constant.
+                        // Materialise each lane as a u32 in
+                        // its own W-reg, mirroring how the
+                        // other uvec3 builtins land in
+                        // `vectors`.
+                        let ls = func.local_size.unwrap_or((1, 1, 1));
+                        let ls_arr = [ls.0, ls.1, ls.2];
+                        let mut lanes = Vec::with_capacity(3);
+                        for v in ls_arr {
+                            let synth = ValueId(next_synth_id);
+                            next_synth_id += 1;
+                            let w = int_pool.alloc(synth)?;
+                            a.emit(asm::movz_w(w, (v & 0xFFFF) as u16, 0));
+                            if (v >> 16) != 0 {
+                                a.emit(asm::movk_w(
+                                    w, ((v >> 16) & 0xFFFF) as u16, 16));
+                            }
+                            ints.insert(synth, w);
+                            lanes.push(Value { id: synth, ty: Type::U32 });
+                        }
+                        vectors.insert(result.id, lanes);
+                    }
                     BK::LocalInvocationIndex => {
                         // index = lz * (sx*sy) + ly * sx + lx
                         // Folds:

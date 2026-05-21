@@ -905,6 +905,11 @@ pub enum BuiltinKind {
     /// `gl_GlobalInvocationID` (Compute only).  uvec3.
     /// Equal to `WorkgroupId * gl_WorkGroupSize + LocalInvocationID`.
     GlobalInvocationId,
+    /// `gl_WorkGroupSize` (Compute only).  uvec3.  Equal to
+    /// the SPIR-V OpExecutionMode LocalSize -- so this is
+    /// effectively a compile-time constant the backends fold
+    /// in from `func.local_size`.
+    WorkgroupSize,
     /// `gl_LocalInvocationIndex` (Compute only).  uint.
     /// Linearised index of the invocation within its
     /// workgroup, formed as
