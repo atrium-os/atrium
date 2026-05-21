@@ -1874,6 +1874,37 @@ fn translate_inst(
                     };
                     Op::FSqrt(dot_dd)
                 }
+                35 => {
+                    // FMod(x, y) ≡ x - y * floor(x / y).
+                    // Common idiom in glsl shaders for
+                    // periodic / wrap-around behaviour.
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let y_id = expect_id(&spv_inst.operands, 3)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let y = resolve_value(y_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let push = |op: Op, ty: Type,
+                                insts: &mut Vec<Inst>,
+                                next_value_id: &mut u32| -> Value {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let v = Value { id, ty };
+                        insts.push(Inst { op, result: Some(v.clone()),
+                            source_spirv_offset });
+                        v
+                    };
+                    let q = push(
+                        Op::FDiv(x.clone(), y.clone()),
+                        result_ty.clone(), insts, next_value_id);
+                    let fl = push(
+                        Op::FFloor(q), result_ty.clone(),
+                        insts, next_value_id);
+                    let yfl = push(
+                        Op::FMul(y, fl), result_ty.clone(),
+                        insts, next_value_id);
+                    Op::FSub(x, yfl)
+                }
                 10 => {
                     // Fract(x) ≡ x - floor(x).  Synthesise inline
                     // using the existing Op::FFloor + Op::FSub.
