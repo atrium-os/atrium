@@ -1256,14 +1256,39 @@ fn emit_function(
                 // identically.  This enables synthesised
                 // lowerings like FSign / FStep which feed
                 // float-compare results into FConvert.
+                let from_bools = bools.get(&s.id).copied();
                 let s_w = ints.get(&s.id).copied()
-                    .or_else(|| bools.get(&s.id).copied())
+                    .or(from_bools)
                     .ok_or_else(|| BackendError::Internal(format!(
                         "ConvertUToF operand {:?} not in ints or bools",
                         s.id)))?;
                 let d_v = alloc_vreg(&mut free_pool, &mut owners, &mut used_callee_saved_v,result.id)?;
                 a.emit(asm::ucvtf_s_from_w(d_v, s_w));
                 scalars.insert(result.id, d_v);
+                // Eager-free the bool W-reg if the bool was
+                // the source.  ConvertUToF is the canonical
+                // last-and-only consumer of synthesised
+                // FSign/FStep bool intermediates -- without
+                // this targeted recycle, those bools pile up
+                // in the 3-slot W10..W12 pool and exhaust it
+                // (e.g. 2 sign + 2 step = 6 bools, but only
+                // 3 slots).  Reset next_bool_w so subsequent
+                // bool allocs reuse the lowest freed slot.
+                if from_bools.is_some() {
+                    if let Some(w_freed) = bools.remove(&s.id) {
+                        if w_freed.0 < next_bool_w {
+                            // Reset to the freed slot only if
+                            // no later bool is still live (the
+                            // simple bump-counter doesn't track
+                            // arbitrary holes).  Cheap conservative
+                            // check: if `bools` is now empty,
+                            // reset all the way.
+                            if bools.is_empty() {
+                                next_bool_w = 10;
+                            }
+                        }
+                    }
+                }
             }
             Op::ConvertFToS(s) => {
                 let result = inst.result.as_ref().ok_or_else(||

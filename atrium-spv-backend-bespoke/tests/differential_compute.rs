@@ -1659,10 +1659,11 @@ fn differential_glsl_smoothstep() {
 
 #[test]
 fn differential_glsl_sign_and_step() {
-    // sign(-2.5) = -1, step(0.5, 0.7) = 1.
-    // Limited to one sign + one step because bespoke's bool
-    // W-pool is only W10..W12 (3 slots, non-recycling) and
-    // each sign consumes 2 bools (FOrdGt + FOrdLt).
+    // sign(-2.5) = -1, sign(0) = 0, sign(3) = 1
+    // step(0.5, 0.3) = 0, step(0.5, 0.7) = 1
+    // The 3-bool W-pool would normally exhaust here; works
+    // because ConvertUToF eagerly frees its bool input
+    // after consumption.
     use rspirv::binary::Assemble;
     use rspirv::spirv::{
         AddressingModel, Capability, Decoration, ExecutionMode,
@@ -1699,11 +1700,17 @@ fn differential_glsl_sign_and_step() {
     b.begin_block(None).unwrap();
     let s_neg = b.ext_inst(f32_ty, None, std_450, 6,
         vec![rspirv::dr::Operand::IdRef(c_neg2_5)]).unwrap();
+    let s_zero = b.ext_inst(f32_ty, None, std_450, 6,
+        vec![rspirv::dr::Operand::IdRef(c_zero_f)]).unwrap();
+    let s_pos = b.ext_inst(f32_ty, None, std_450, 6,
+        vec![rspirv::dr::Operand::IdRef(c_three)]).unwrap();
+    let step_lo = b.ext_inst(f32_ty, None, std_450, 48,
+        vec![rspirv::dr::Operand::IdRef(c_half),
+             rspirv::dr::Operand::IdRef(c_0_3)]).unwrap();
     let step_hi = b.ext_inst(f32_ty, None, std_450, 48,
         vec![rspirv::dr::Operand::IdRef(c_half),
              rspirv::dr::Operand::IdRef(c_0_7)]).unwrap();
-    let _ = (c_zero_f, c_three, c_0_3); // unused in trimmed test
-    let vs = [s_neg, step_hi];
+    let vs = [s_neg, s_zero, s_pos, step_lo, step_hi];
     for (i, v) in vs.iter().enumerate() {
         let ci = b.constant_bit32(u32_ty, i as u32);
         let d = b.access_chain(ptr_f, None, ssbo, vec![c_zero, ci]).unwrap();
@@ -1726,7 +1733,10 @@ fn differential_glsl_sign_and_step() {
         f32::from_le_bytes(b_buf[i*4..i*4+4].try_into().unwrap())
     };
     assert_eq!(read(0), -1.0, "sign(-2.5) = -1");
-    assert_eq!(read(1),  1.0, "step(0.5, 0.7) = 1");
+    assert_eq!(read(1),  0.0, "sign(0) = 0");
+    assert_eq!(read(2),  1.0, "sign(3) = 1");
+    assert_eq!(read(3),  0.0, "step(0.5, 0.3) = 0");
+    assert_eq!(read(4),  1.0, "step(0.5, 0.7) = 1");
 }
 
 #[test]
