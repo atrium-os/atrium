@@ -2190,6 +2190,73 @@ fn differential_glsl_floor_ceil_trunc() {
 }
 
 #[test]
+fn differential_glsl_vec4_mix() {
+    // mix(vec4(0), vec4(100), 0.25) = vec4(25).
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let std_450 = b.ext_inst_import("GLSL.std.450");
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let f32_ty = b.type_float(32, None);
+    let vec4   = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let s = b.type_struct(vec![vec4]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_v = b.type_pointer(None, StorageClass::StorageBuffer, vec4);
+    let ssbo  = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    let mk_vec = |b: &mut rspirv::dr::Builder, v: [f32; 4]| {
+        let ls: Vec<_> = v.iter().map(|x| b.constant_bit32(f32_ty, x.to_bits())).collect();
+        b.constant_composite(vec4, ls)
+    };
+    let v_lo = mk_vec(&mut b, [0.0, 10.0, 0.0, 0.0]);
+    let v_hi = mk_vec(&mut b, [100.0, 20.0, 50.0, 1.0]);
+    let v_t  = mk_vec(&mut b, [0.25, 0.5, 0.75, 1.0]);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let r = b.ext_inst(vec4, None, std_450, 46,
+        vec![rspirv::dr::Operand::IdRef(v_lo),
+             rspirv::dr::Operand::IdRef(v_hi),
+             rspirv::dr::Operand::IdRef(v_t)]).unwrap();
+    let d = b.access_chain(ptr_v, None, ssbo, vec![c_zero]).unwrap();
+    b.store(d, r, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spv = Vec::with_capacity(words.len() * 4);
+    for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+    let dir = TempDir::new().unwrap();
+    let mut b_buf = vec![0u8; 16];
+    let mut c_buf = vec![0u8; 16];
+    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    assert_eq!(b_buf, c_buf, "diverge on vec4 mix");
+    let read = |off: usize| -> f32 {
+        f32::from_le_bytes(b_buf[off..off+4].try_into().unwrap())
+    };
+    // mix(lo, hi, t) = lo + t*(hi - lo)
+    // x: mix(0, 100, 0.25) = 25
+    // y: mix(10, 20, 0.5)  = 15
+    // z: mix(0, 50, 0.75)  = 37.5
+    // w: mix(0, 1, 1.0)    = 1
+    assert_eq!([read(0), read(4), read(8), read(12)],
+        [25.0, 15.0, 37.5, 1.0]);
+}
+
+#[test]
 fn differential_glsl_clamp_and_mix() {
     let spv = build_glsl_clamp_mix_cs();
     let dir = TempDir::new().unwrap();
