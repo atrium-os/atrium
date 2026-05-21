@@ -1,0 +1,17 @@
+[package]
+name        = "insula-host-macos"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+description = "macOS host adapter for Insula. Translates Insula manifests (insula-manifest) into macOS App Sandbox profiles (SBPL) + entitlements XML; launches sandboxed Insula apps via posix_spawn + sandbox_init. Implementation of docs/spec/insula-host-macos.md. Pure-functional profile generation in this crate is platform-neutral; the launch path uses macOS APIs and is gated behind cfg(target_os = \"macos\")."
+publish     = false
+
+[lib]
+name = "insula_host_macos"
+path = "src/lib.rs"
+
+[dependencies]
+insula-manifest = { path = "../insula-manifest" }
+thiserror       = "1"
+
+[dev-dependencies]
