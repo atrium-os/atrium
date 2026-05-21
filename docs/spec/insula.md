@@ -409,22 +409,51 @@ Insula on macOS reuses this foundation; only the new
 Insula-specific services (Limen, Tabellarius, etc.) and
 the macOS host adapter are net-new work.
 
-### 0.7.5 Atrium's repositioned pitch
+### 0.7.5 What this means for Atrium's adoption story
 
-The phasing changes how Atrium is sold:
+A clarification on positioning: **Insula is one component
+of Atrium, not Atrium's purpose.** Atrium is a complete OS
+with several independently-valuable subsystems:
 
-- **Old framing:** "Switch to this new OS to run these new apps."
-- **New framing:** "Insula apps run on your Mac/Linux/Windows
-  today. Atrium is the OS purpose-built for Insula — best
-  performance, best security, kernel-enforced sandbox,
-  content-addressed FS — for users who want the maximum
-  experience."
+- **Laminar** — kernel scheduler designed around RLC-shaped
+  control theory; ships as Atrium's default.
+- **Fresco** — retained-mode scenegraph display protocol +
+  compositor with native GPU drivers, modern out of the
+  box (no X11/Wayland legacy).
+- **Tessera** — content-addressed FS with dedup,
+  snapshots, integrity-by-construction, function-level
+  binary dedup (tessera-binsplit).
+- **Portcullis** — capability-manifest jail launcher
+  on FreeBSD's native primitives.
+- **Atrium GPU ABI + native drivers** — replacement for
+  linuxkpi + drm-kmod; clean kernel/userspace boundary.
+- **Pergola** — first-class native UI toolkit with AX as a
+  structural property.
+- **Aqueduct + Castellum** — typed-message IPC substrate.
+- **The foundation apps** — atrium-edit, atrium-term,
+  atrium-files, Stoa-based persistent sessions, etc.
+- **Insula** — this spec.
 
-The OS becomes a *destination*, not a *prerequisite*. Users
-encounter Insula apps long before they encounter Atrium.
-Atrium then has a real value proposition for the users
-who graduate to it (security, perf, native primitives)
-rather than competing for cold-start adoption.
+Each of these has value on its own. A user who cares about
+filesystem dedup or scheduler determinism gets benefits from
+Atrium that have nothing to do with Insula. The Insula bring-
+up sequence (§0.7.3) decouples app-platform adoption from OS
+adoption — but Atrium does not need Insula to justify
+itself, and Atrium's pitch should not collapse to "the OS
+for Insula apps."
+
+The two adoption paths are independent and complementary:
+
+- A developer / user picks up Insula on macOS because the
+  app-platform model solves problems they have today.
+- A user picks up Atrium because they want a coherent
+  modern OS with Laminar / Fresco / Tessera / Portcullis /
+  the native GPU stack — Insula is one of the things they
+  also get.
+
+Some users arrive via path 1 and graduate; some arrive via
+path 2 and pick up Insula along the way; some only want one
+end or the other. All three are valid.
 
 ### 0.7.6 What this means for the spec body
 
