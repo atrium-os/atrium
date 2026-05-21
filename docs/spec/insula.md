@@ -2774,9 +2774,10 @@ For each capability the platform might add:
 Written:
 - [`docs/spec/artifex.md`](artifex.md) — reference IDE
   (sketched from §10.9 of this spec).
+- [`docs/spec/limen.md`](limen.md) — embed broker + role
+  catalogue (sketched from §10.3 of this spec).
 
 Planned, not yet written:
-- `docs/spec/limen.md` — embed broker + role catalogue.
 - `docs/spec/tabellarius.md` — push delivery protocol.
 - `docs/spec/loculus.md` — wallet schema.
 - `docs/spec/concursus.md` — peer signaling.
