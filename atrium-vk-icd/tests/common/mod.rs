@@ -23,12 +23,35 @@ pub type VkPhysicalDevice = *mut std::ffi::c_void;
 /// other's setting.
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-pub struct EnvLock { _g: std::sync::MutexGuard<'static, ()> }
+pub struct EnvLock {
+    _g: std::sync::MutexGuard<'static, ()>,
+    force_backend_was_set: bool,
+}
 impl EnvLock {
     pub fn set(sock: &std::path::Path) -> Self {
         let g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         std::env::set_var("ATRIUM_VK_ICD_SOCKET", sock);
-        EnvLock { _g: g }
+        EnvLock { _g: g, force_backend_was_set: false }
+    }
+
+    /// Like `set`, but also pins atrium-spv-compile to a
+    /// specific backend via ATRIUM_SPV_FORCE_BACKEND.  The
+    /// var is cleared on Drop so the next test starts clean.
+    pub fn set_with_force_backend(
+        sock: &std::path::Path,
+        backend: &str,
+    ) -> Self {
+        let g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("ATRIUM_VK_ICD_SOCKET", sock);
+        std::env::set_var("ATRIUM_SPV_FORCE_BACKEND", backend);
+        EnvLock { _g: g, force_backend_was_set: true }
+    }
+}
+impl Drop for EnvLock {
+    fn drop(&mut self) {
+        if self.force_backend_was_set {
+            std::env::remove_var("ATRIUM_SPV_FORCE_BACKEND");
+        }
     }
 }
 
