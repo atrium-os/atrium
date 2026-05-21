@@ -1241,6 +1241,125 @@ fn translate_inst(
         // dispatched to the appropriate IR op constructor.
         // Memory scope + semantics are ignored on the serial
         // dispatcher (see Op::AtomicIAdd comment in spv-ir).
+        // OpAtomicIIncrement / OpAtomicIDecrement: no value
+        // operand -- shorthand for IAdd with implicit +/-1.
+        // Synthesise the +1 / -1 constant inline so the IR
+        // can reuse the existing Op::AtomicIAdd lowering.
+        SpvOp::AtomicIIncrement | SpvOp::AtomicIDecrement => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed(
+                    "AtomicI{Increment,Decrement} without result id".to_string()))?;
+            let result_type_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed(
+                    "AtomicI{Increment,Decrement} without result type".to_string()))?;
+            let result_ty = types.get(result_type_id)?.clone();
+            let ptr_id = expect_id(&spv_inst.operands, 0)?;
+            let ptr_value = match resolve_variable(
+                ptr_id, types, iface, id_map, next_value_id,
+            )? {
+                Some(v) => v,
+                None => id_map.get(&ptr_id).cloned().ok_or_else(||
+                    FrontendError::Malformed(format!(
+                        "AtomicI{{Increment,Decrement}} pointer id {ptr_id} not resolvable",
+                    )))?,
+            };
+            // Materialise the +1 or -1 constant inline.
+            // For Decrement we use the wrapping 0xFFFFFFFF
+            // (= -1 in two's complement) so the same IAdd
+            // path produces the subtraction.
+            let const_val: i64 = if spv_inst.class.opcode == SpvOp::AtomicIIncrement {
+                1
+            } else {
+                -1
+            };
+            let synth_value = {
+                let id = ValueId(*next_value_id);
+                *next_value_id += 1;
+                let v = Value { id, ty: result_ty.clone() };
+                insts.push(Inst {
+                    op: Op::ConstInt {
+                        value: const_val,
+                        kind: atrium_spv_ir::IntKind::U32,
+                    },
+                    result: Some(v.clone()),
+                    source_spirv_offset,
+                });
+                v
+            };
+            let result = alloc_or_get_result(
+                result_id, result_ty, id_map, next_value_id);
+            insts.push(Inst {
+                op: Op::AtomicIAdd { ptr: ptr_value, value: synth_value },
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
+
+        // OpAtomicISub: same operand layout as IAdd but the
+        // value is subtracted.  We don't add Op::AtomicISub
+        // (would duplicate codegen); instead negate the value
+        // in the frontend (ISub a, b ≡ IAdd a, -b on two's
+        // complement u32) and reuse Op::AtomicIAdd.
+        SpvOp::AtomicISub => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed(
+                    "AtomicISub without result id".to_string()))?;
+            let result_type_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed(
+                    "AtomicISub without result type".to_string()))?;
+            let result_ty = types.get(result_type_id)?.clone();
+            let ptr_id = expect_id(&spv_inst.operands, 0)?;
+            let value_id = expect_id(&spv_inst.operands, 3)?;
+            let ptr_value = match resolve_variable(
+                ptr_id, types, iface, id_map, next_value_id,
+            )? {
+                Some(v) => v,
+                None => id_map.get(&ptr_id).cloned().ok_or_else(||
+                    FrontendError::Malformed(format!(
+                        "AtomicISub pointer id {ptr_id} not resolvable",
+                    )))?,
+            };
+            let value = resolve_value(
+                value_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset,
+            )?;
+            // Negate the value: synth ISub(0, value).
+            let zero = {
+                let id = ValueId(*next_value_id);
+                *next_value_id += 1;
+                let v = Value { id, ty: result_ty.clone() };
+                insts.push(Inst {
+                    op: Op::ConstInt {
+                        value: 0,
+                        kind: atrium_spv_ir::IntKind::U32,
+                    },
+                    result: Some(v.clone()),
+                    source_spirv_offset,
+                });
+                v
+            };
+            let neg_value = {
+                let id = ValueId(*next_value_id);
+                *next_value_id += 1;
+                let v = Value { id, ty: result_ty.clone() };
+                insts.push(Inst {
+                    op: Op::ISub(zero, value),
+                    result: Some(v.clone()),
+                    source_spirv_offset,
+                });
+                v
+            };
+            let result = alloc_or_get_result(
+                result_id, result_ty, id_map, next_value_id);
+            insts.push(Inst {
+                op: Op::AtomicIAdd { ptr: ptr_value, value: neg_value },
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
+
         // OpAtomicLoad: <result_type> <result_id> <pointer>
         //               <scope> <semantics>
         // No value operand.  Lowers to a plain load on the

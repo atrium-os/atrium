@@ -842,6 +842,153 @@ fn differential_atomic_cas_failure_path() {
         "CAS should return the old value even on failure");
 }
 
+/// CS: `atomicIncrement(ssbo.counter)` per invocation.
+/// Frontend lowers to AtomicIAdd with synth +1; here we
+/// verify the synthesis actually produces +1 (not 0 or -1).
+fn build_atomic_increment_cs(decrement: bool) -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+        MemorySemantics, Scope,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let void_fn = b.type_function(void, vec![]);
+    let s = b.type_struct(vec![u32_ty]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_u = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+    let ssbo = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let c_zero  = b.constant_bit32(u32_ty, 0);
+    let c_scope = b.constant_bit32(u32_ty, Scope::Device as u32);
+    let c_sem   = b.constant_bit32(u32_ty,
+        MemorySemantics::ATOMIC_COUNTER_MEMORY.bits());
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let dst = b.access_chain(ptr_u, None, ssbo, vec![c_zero]).unwrap();
+    let _ = if decrement {
+        b.atomic_i_decrement(u32_ty, None, dst, c_scope, c_sem)
+    } else {
+        b.atomic_i_increment(u32_ty, None, dst, c_scope, c_sem)
+    }.unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn differential_atomic_iincrement_counts_invocations() {
+    // Prefill 0; 5 invocations of atomicIncrement -> counter = 5.
+    let spv = build_atomic_increment_cs(false);
+    let dir = TempDir::new().unwrap();
+    let mut b_buf = vec![0u8; 16];
+    let mut c_buf = vec![0u8; 16];
+    let gids: Vec<(u32, u32, u32)> = (0..5).map(|i| (i, 0, 0)).collect();
+    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &gids);
+    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &gids);
+    assert_eq!(b_buf, c_buf);
+    let v = u32::from_le_bytes(b_buf[0..4].try_into().unwrap());
+    assert_eq!(v, 5, "5 increments should leave counter at 5; got {v}");
+}
+
+#[test]
+fn differential_atomic_idecrement_counts_down() {
+    // Prefill 10; 4 invocations of atomicDecrement -> counter = 6.
+    let spv = build_atomic_increment_cs(true);
+    let dir = TempDir::new().unwrap();
+    let mut b_buf = vec![0u8; 16];
+    let mut c_buf = vec![0u8; 16];
+    b_buf[0..4].copy_from_slice(&10u32.to_le_bytes());
+    c_buf[0..4].copy_from_slice(&10u32.to_le_bytes());
+    let gids: Vec<(u32, u32, u32)> = (0..4).map(|i| (i, 0, 0)).collect();
+    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &gids);
+    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &gids);
+    assert_eq!(b_buf, c_buf);
+    let v = u32::from_le_bytes(b_buf[0..4].try_into().unwrap());
+    assert_eq!(v, 6, "10 - 4 decrements should leave 6; got {v}");
+}
+
+#[test]
+fn differential_atomic_isub_subtracts() {
+    // Same scaffolding as iadd but with OpAtomicISub.  Prefill 100;
+    // gid_x in 1..5 subtracts 1,2,3,4 -> result = 100-10 = 90.
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+        MemorySemantics, Scope,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let uvec3 = b.type_vector(u32_ty, 3);
+    let void_fn = b.type_function(void, vec![]);
+    let s = b.type_struct(vec![u32_ty]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_u = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+    let ssbo = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_in_uvec3 = b.type_pointer(None, StorageClass::Input, uvec3);
+    let gid_var = b.variable(ptr_in_uvec3, None, StorageClass::Input, None);
+    b.decorate(gid_var, Decoration::BuiltIn,
+        vec![rspirv::dr::Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+    let c_zero  = b.constant_bit32(u32_ty, 0);
+    let c_scope = b.constant_bit32(u32_ty, Scope::Device as u32);
+    let c_sem   = b.constant_bit32(u32_ty,
+        MemorySemantics::ATOMIC_COUNTER_MEMORY.bits());
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let gid = b.load(uvec3, None, gid_var, None, vec![]).unwrap();
+    let gid_x = b.composite_extract(u32_ty, None, gid, vec![0]).unwrap();
+    let dst = b.access_chain(ptr_u, None, ssbo, vec![c_zero]).unwrap();
+    let _ = b.atomic_i_sub(u32_ty, None, dst, c_scope, c_sem, gid_x).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![gid_var, ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spv = Vec::with_capacity(words.len() * 4);
+    for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+
+    let dir = TempDir::new().unwrap();
+    let mut b_buf = vec![0u8; 16];
+    let mut c_buf = vec![0u8; 16];
+    b_buf[0..4].copy_from_slice(&100u32.to_le_bytes());
+    c_buf[0..4].copy_from_slice(&100u32.to_le_bytes());
+    let gids: Vec<(u32, u32, u32)> = (1..5).map(|i| (i, 0, 0)).collect();
+    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &gids);
+    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &gids);
+    assert_eq!(b_buf, c_buf, "diverge on isub");
+    let v = u32::from_le_bytes(b_buf[0..4].try_into().unwrap());
+    assert_eq!(v, 100 - (1 + 2 + 3 + 4),
+        "100 - sum(1..4) should be 90; got {v}");
+}
+
 #[test]
 fn differential_atomic_umin_finds_smallest() {
     // Prefill 100; gid_x in 0..6 atomicMin's it.  Result =
