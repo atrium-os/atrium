@@ -9,7 +9,7 @@
 //!   list                    Show installed apps.
 //!   info <app|dir|insula>  Show details for app-id, bundle dir, or archive.
 //!   launch <app-id> [args]  Launch an installed app (inherits stdio).
-//!   uninstall <app-id>      Remove an installed app + its container.
+//!   uninstall <app|--all>   Remove an installed app (or every installed app).
 //!   help                    Show this help.
 //!
 //! Install root defaults to
@@ -92,7 +92,7 @@ Commands:
                           `.insula` archive.
   launch <app-id> [args]  Launch an installed app (inherits stdio).
                           Auto-spawns missing daemons.
-  uninstall <app-id>      Remove an installed app + its container.
+  uninstall <app|--all>   Remove an installed app (or every installed app).
   daemons up              Start all platform daemons.
   daemons down            Stop them.
   daemons restart [name]  Stop + start one (or 'all').
@@ -842,19 +842,53 @@ fn cmd_daemons(args: &[String], install_root: &Path) -> Result<(), String> {
 }
 
 fn cmd_uninstall(args: &[String], install_root: &Path) -> Result<(), String> {
-    let app_id = args.first().ok_or_else(|| {
-        "uninstall: missing <app-id> argument".to_string()
+    let target = args.first().ok_or_else(|| {
+        "uninstall: missing <app-id|--all> argument".to_string()
     })?;
 
-    let app_root = install_root.join("apps").join(app_id);
+    if target == "--all" {
+        let apps_dir = install_root.join("apps");
+        if !apps_dir.is_dir() {
+            println!("(no apps installed)");
+            return Ok(());
+        }
+        let mut removed = 0usize;
+        for entry in std::fs::read_dir(&apps_dir)
+            .map_err(|e| format!("read_dir {}: {}", apps_dir.display(), e))?
+        {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let p = entry.path();
+            // Use the directory name as the id (matches
+            // how install lays things out).
+            let id = p.file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("<unknown>")
+                .to_string();
+            if let Err(e) = std::fs::remove_dir_all(&p) {
+                eprintln!("uninstall: removing {}: {}", p.display(), e);
+                continue;
+            }
+            println!("Uninstalled {}", id);
+            removed += 1;
+        }
+        if removed == 0 {
+            println!("(no apps to uninstall)");
+        } else {
+            println!();
+            println!("Uninstalled {} app(s)", removed);
+        }
+        return Ok(());
+    }
+
+    let app_root = install_root.join("apps").join(target);
     if !app_root.is_dir() {
-        return Err(format!("app not installed: {}", app_id));
+        return Err(format!("app not installed: {}", target));
     }
 
     std::fs::remove_dir_all(&app_root)
         .map_err(|e| format!("removing {}: {}", app_root.display(), e))?;
 
-    println!("Uninstalled {}", app_id);
+    println!("Uninstalled {}", target);
     Ok(())
 }
 
