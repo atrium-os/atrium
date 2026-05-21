@@ -1696,6 +1696,49 @@ fn translate_inst(
                         "GLSL.std.450 FSign not supported yet \
                          (compare-to-bool-to-float lowering queued)".into()));
                 }
+                69 => {
+                    // Normalize(v) ≡ v / length(v).  Result has
+                    // the same type as v (a vec).  This needs a
+                    // vec/scalar FDiv, which the backend's
+                    // existing emit_fp_binop_poly handles via
+                    // the (true, false) "vec × scalar" arm.
+                    let v_id = expect_id(&spv_inst.operands, 2)?;
+                    let v = resolve_value(v_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    // Length: float scalar, even though v is a vec.
+                    use atrium_spv_ir::VecElement;
+                    let scalar_ty = match &v.ty {
+                        atrium_spv_ir::Type::Vec2(VecElement::F32)
+                        | atrium_spv_ir::Type::Vec3(VecElement::F32)
+                        | atrium_spv_ir::Type::Vec4(VecElement::F32) => Type::F32,
+                        other => return Err(FrontendError::Unsupported(format!(
+                            "Normalize on non-f32-vector type {other:?}",
+                        ))),
+                    };
+                    let dot_vv = {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let val = Value { id, ty: scalar_ty.clone() };
+                        insts.push(Inst {
+                            op: Op::Dot(v.clone(), v.clone()),
+                            result: Some(val.clone()),
+                            source_spirv_offset,
+                        });
+                        val
+                    };
+                    let length_v = {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let val = Value { id, ty: scalar_ty };
+                        insts.push(Inst {
+                            op: Op::FSqrt(dot_vv),
+                            result: Some(val.clone()),
+                            source_spirv_offset,
+                        });
+                        val
+                    };
+                    Op::FDiv(v, length_v)
+                }
                 66 => {
                     // Length(v) ≡ sqrt(dot(v, v)).  Result is
                     // f32; arg is vec.
