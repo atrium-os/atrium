@@ -299,11 +299,14 @@ fn emit_function(
     // Pointer-typed Values: (base X-reg, byte offset).
     let mut pointers: HashMap<ValueId, (asm::Xreg, i32)> = HashMap::new();
     // Bool-typed Values (results of FOrd*/FUnord*): held
-    // in a W-reg as i32 0/1 per constraint B4. Allocated
-    // from a tiny separate pool W10..W15 — bools are rare
-    // and short-lived, so no reuse needed yet.
+    // in a W-reg as i32 0/1 per constraint B4.  Pool is
+    // W10..W12 (3 slots, separate from the int pool which
+    // starts at W13).  Linear-scan-style ownership with
+    // expiration on last_use < i; alloc pops from
+    // bool_free, expire pushes back.
     let mut bools: HashMap<ValueId, asm::Wreg> = HashMap::new();
-    let mut next_bool_w: u8 = 10;
+    let mut bool_owners: HashMap<u8, ValueId> = HashMap::new();
+    let mut bool_free: Vec<u8> = vec![12, 11, 10]; // pop hands out W10 first
     // Set by a comparison whose result feeds only the
     // block's BranchCond terminator (compare→branch
     // fusion): `(comparison result id, condition code)`.
@@ -1137,6 +1140,20 @@ fn emit_function(
         }
         // Same expiry pass for the integer W-reg pool.
         int_pool.expire(i, &last_use);
+        // And for the bool W-pool: free slots whose owner's
+        // last_use is in the past.
+        let dead_bools: Vec<u8> = bool_owners.iter()
+            .filter_map(|(n, id)|
+                if last_use.get(id).copied().unwrap_or(usize::MAX) < i {
+                    Some(*n)
+                } else { None })
+            .collect();
+        for n in dead_bools {
+            if let Some(id) = bool_owners.remove(&n) {
+                bools.remove(&id);
+                bool_free.push(n);
+            }
+        }
 
         // ── compare→branch fusion eligibility ───────────────
         //
@@ -1256,34 +1273,34 @@ fn emit_function(
             }
             // Integer comparisons → Bool W-reg.
             Op::IEq(l, r) => emit_icmp_to_bool(
-                &mut a, &ints, &mut bools, &mut next_bool_w,
+                &mut a, &ints, &mut bools, &mut bool_owners, &mut bool_free,
                 &mut fused_branch, fuse_eligible, inst, l, r, asm::Cond::Eq)?,
             Op::INe(l, r) => emit_icmp_to_bool(
-                &mut a, &ints, &mut bools, &mut next_bool_w,
+                &mut a, &ints, &mut bools, &mut bool_owners, &mut bool_free,
                 &mut fused_branch, fuse_eligible, inst, l, r, asm::Cond::Ne)?,
             Op::SLt(l, r) => emit_icmp_to_bool(
-                &mut a, &ints, &mut bools, &mut next_bool_w,
+                &mut a, &ints, &mut bools, &mut bool_owners, &mut bool_free,
                 &mut fused_branch, fuse_eligible, inst, l, r, asm::Cond::Lt)?,
             Op::SLe(l, r) => emit_icmp_to_bool(
-                &mut a, &ints, &mut bools, &mut next_bool_w,
+                &mut a, &ints, &mut bools, &mut bool_owners, &mut bool_free,
                 &mut fused_branch, fuse_eligible, inst, l, r, asm::Cond::Le)?,
             Op::SGt(l, r) => emit_icmp_to_bool(
-                &mut a, &ints, &mut bools, &mut next_bool_w,
+                &mut a, &ints, &mut bools, &mut bool_owners, &mut bool_free,
                 &mut fused_branch, fuse_eligible, inst, l, r, asm::Cond::Gt)?,
             Op::SGe(l, r) => emit_icmp_to_bool(
-                &mut a, &ints, &mut bools, &mut next_bool_w,
+                &mut a, &ints, &mut bools, &mut bool_owners, &mut bool_free,
                 &mut fused_branch, fuse_eligible, inst, l, r, asm::Cond::Ge)?,
             Op::ULt(l, r) => emit_icmp_to_bool(
-                &mut a, &ints, &mut bools, &mut next_bool_w,
+                &mut a, &ints, &mut bools, &mut bool_owners, &mut bool_free,
                 &mut fused_branch, fuse_eligible, inst, l, r, asm::Cond::Cc)?,
             Op::ULe(l, r) => emit_icmp_to_bool(
-                &mut a, &ints, &mut bools, &mut next_bool_w,
+                &mut a, &ints, &mut bools, &mut bool_owners, &mut bool_free,
                 &mut fused_branch, fuse_eligible, inst, l, r, asm::Cond::Ls)?,
             Op::UGt(l, r) => emit_icmp_to_bool(
-                &mut a, &ints, &mut bools, &mut next_bool_w,
+                &mut a, &ints, &mut bools, &mut bool_owners, &mut bool_free,
                 &mut fused_branch, fuse_eligible, inst, l, r, asm::Cond::Hi)?,
             Op::UGe(l, r) => emit_icmp_to_bool(
-                &mut a, &ints, &mut bools, &mut next_bool_w,
+                &mut a, &ints, &mut bools, &mut bool_owners, &mut bool_free,
                 &mut fused_branch, fuse_eligible, inst, l, r, asm::Cond::Cs)?,
             Op::INeg(s) => {
                 let result = inst.result.as_ref().ok_or_else(||
@@ -1332,21 +1349,12 @@ fn emit_function(
                 // this targeted recycle, those bools pile up
                 // in the 3-slot W10..W12 pool and exhaust it
                 // (e.g. 2 sign + 2 step = 6 bools, but only
-                // 3 slots).  Reset next_bool_w so subsequent
-                // bool allocs reuse the lowest freed slot.
+                // 3 slots).  Return the slot to bool_free
+                // so subsequent allocs reuse it.
                 if from_bools.is_some() {
                     if let Some(w_freed) = bools.remove(&s.id) {
-                        if w_freed.0 < next_bool_w {
-                            // Reset to the freed slot only if
-                            // no later bool is still live (the
-                            // simple bump-counter doesn't track
-                            // arbitrary holes).  Cheap conservative
-                            // check: if `bools` is now empty,
-                            // reset all the way.
-                            if bools.is_empty() {
-                                next_bool_w = 10;
-                            }
-                        }
+                        bool_owners.remove(&w_freed.0);
+                        bool_free.push(w_freed.0);
                     }
                 }
             }
@@ -1461,22 +1469,22 @@ fn emit_function(
             }
             // Float compares → Bool (i32 0/1 in a W-reg).
             Op::FOrdEq(a_v, b_v) => emit_fcmp_to_bool(
-                &mut a, &scalars, &mut bools, &mut next_bool_w,
+                &mut a, &scalars, &mut bools, &mut bool_owners, &mut bool_free,
                 &mut fused_branch, fuse_eligible, inst, a_v, b_v, asm::Cond::Eq)?,
             Op::FOrdNe(a_v, b_v) => emit_fcmp_to_bool(
-                &mut a, &scalars, &mut bools, &mut next_bool_w,
+                &mut a, &scalars, &mut bools, &mut bool_owners, &mut bool_free,
                 &mut fused_branch, fuse_eligible, inst, a_v, b_v, asm::Cond::Ne)?,
             Op::FOrdLt(a_v, b_v) => emit_fcmp_to_bool(
-                &mut a, &scalars, &mut bools, &mut next_bool_w,
+                &mut a, &scalars, &mut bools, &mut bool_owners, &mut bool_free,
                 &mut fused_branch, fuse_eligible, inst, a_v, b_v, asm::Cond::Mi)?,
             Op::FOrdLe(a_v, b_v) => emit_fcmp_to_bool(
-                &mut a, &scalars, &mut bools, &mut next_bool_w,
+                &mut a, &scalars, &mut bools, &mut bool_owners, &mut bool_free,
                 &mut fused_branch, fuse_eligible, inst, a_v, b_v, asm::Cond::Ls)?,
             Op::FOrdGt(a_v, b_v) => emit_fcmp_to_bool(
-                &mut a, &scalars, &mut bools, &mut next_bool_w,
+                &mut a, &scalars, &mut bools, &mut bool_owners, &mut bool_free,
                 &mut fused_branch, fuse_eligible, inst, a_v, b_v, asm::Cond::Gt)?,
             Op::FOrdGe(a_v, b_v) => emit_fcmp_to_bool(
-                &mut a, &scalars, &mut bools, &mut next_bool_w,
+                &mut a, &scalars, &mut bools, &mut bool_owners, &mut bool_free,
                 &mut fused_branch, fuse_eligible, inst, a_v, b_v, asm::Cond::Ge)?,
             // OpVectorShuffle: produce a new vector by
             // picking per-output-lane indices into
@@ -3613,7 +3621,8 @@ fn emit_icmp_to_bool(
     a: &mut asm::Asm,
     ints: &HashMap<ValueId, asm::Wreg>,
     bools: &mut HashMap<ValueId, asm::Wreg>,
-    next_bool_w: &mut u8,
+    bool_owners: &mut HashMap<u8, ValueId>,
+    bool_free: &mut Vec<u8>,
     fused_branch: &mut Option<(ValueId, asm::Cond)>,
     fuse_eligible: bool,
     inst: &atrium_spv_ir::Inst,
@@ -3634,17 +3643,13 @@ fn emit_icmp_to_bool(
         *fused_branch = Some((result.id, cond));
         return Ok(());
     }
-    if *next_bool_w >= 13 {
-        // W10..W12 are bool pool (3 slots); W13..W17 are
-        // the int pool. The ranges must not overlap.
-        return Err(BackendError::Unsupported(
-            "ran out of Bool W-regs (W10..W12 exhausted)".into()));
-    }
-    let w_bool = asm::Wreg(*next_bool_w);
-    *next_bool_w += 1;
+    let n = bool_free.pop().ok_or_else(|| BackendError::Unsupported(
+        "ran out of Bool W-regs (W10..W12 exhausted)".into()))?;
+    let w_bool = asm::Wreg(n);
     a.emit(asm::cmp_w(l, r));
     a.emit(asm::cset_w(w_bool, cond));
     bools.insert(result.id, w_bool);
+    bool_owners.insert(n, result.id);
     Ok(())
 }
 
@@ -3657,7 +3662,8 @@ fn emit_fcmp_to_bool(
     a: &mut asm::Asm,
     scalars: &HashMap<ValueId, asm::Vreg>,
     bools: &mut HashMap<ValueId, asm::Wreg>,
-    next_bool_w: &mut u8,
+    bool_owners: &mut HashMap<u8, ValueId>,
+    bool_free: &mut Vec<u8>,
     fused_branch: &mut Option<(ValueId, asm::Cond)>,
     fuse_eligible: bool,
     inst: &atrium_spv_ir::Inst,
@@ -3676,17 +3682,13 @@ fn emit_fcmp_to_bool(
         *fused_branch = Some((result.id, cond));
         return Ok(());
     }
-    if *next_bool_w >= 13 {
-        // W10..W12 are bool pool (3 slots); the int pool
-        // starts at W13 so the ranges must not overlap.
-        return Err(BackendError::Unsupported(
-            "ran out of Bool W-regs (W10..W12 exhausted)".into()));
-    }
-    let w_bool = asm::Wreg(*next_bool_w);
-    *next_bool_w += 1;
+    let n = bool_free.pop().ok_or_else(|| BackendError::Unsupported(
+        "ran out of Bool W-regs (W10..W12 exhausted)".into()))?;
+    let w_bool = asm::Wreg(n);
     a.emit(asm::fcmp_s(l, r));
     a.emit(asm::cset_w(w_bool, cond));
     bools.insert(result.id, w_bool);
+    bool_owners.insert(n, result.id);
     Ok(())
 }
 

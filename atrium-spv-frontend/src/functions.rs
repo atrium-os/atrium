@@ -1746,6 +1746,34 @@ fn translate_inst(
                         source_spirv_offset, insts, next_value_id);
                     Op::FMul(l, c_ln2)
                 }
+                18 => {
+                    // Atan(x): full real line via reciprocal range reduction.
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let a = synth_atan(x, source_spirv_offset, insts, next_value_id);
+                    let c_one = push_cf(1.0, source_spirv_offset, insts, next_value_id);
+                    Op::FMul(a, c_one)
+                }
+                16 => {
+                    // Asin(x) = Atan(x / sqrt(1 - x²)).
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let a = synth_asin(x, source_spirv_offset, insts, next_value_id);
+                    let c_one = push_cf(1.0, source_spirv_offset, insts, next_value_id);
+                    Op::FMul(a, c_one)
+                }
+                17 => {
+                    // Acos(x) = π/2 - Asin(x).
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let a = synth_asin(x, source_spirv_offset, insts, next_value_id);
+                    let c_half_pi = push_cf(std::f64::consts::FRAC_PI_2,
+                        source_spirv_offset, insts, next_value_id);
+                    Op::FSub(c_half_pi, a)
+                }
                 26 => {
                     // Pow(x, y) = Exp2(y * Log2(x)).
                     let x_id = expect_id(&spv_inst.operands, 2)?;
@@ -2771,6 +2799,122 @@ fn synth_exp2(
 ///
 /// Max relative error ≈ 4e-4 for positive x; undefined for x ≤ 0
 /// (caller's responsibility, matching GLSL spec).
+///
+/// Push a bool-typed instruction (Type::Bool).
+fn push_bool(
+    op: Op,
+    source_spirv_offset: u32,
+    insts: &mut Vec<Inst>,
+    next_value_id: &mut u32,
+) -> Value {
+    let id = ValueId(*next_value_id);
+    *next_value_id += 1;
+    let v = Value { id, ty: Type::Bool };
+    insts.push(Inst { op, result: Some(v.clone()), source_spirv_offset });
+    v
+}
+
+/// 6-coefficient minimax Horner polynomial approximation of
+/// atan(x) on x ∈ [-1, 1]. Max error ≈ 5e-7.
+fn synth_atan_poly(
+    x: Value,
+    source_spirv_offset: u32,
+    insts: &mut Vec<Inst>,
+    next_value_id: &mut u32,
+) -> Value {
+    let x2 = push_f32(Op::FMul(x.clone(), x.clone()),
+        source_spirv_offset, insts, next_value_id);
+    let c0 = push_cf( 0.99997726, source_spirv_offset, insts, next_value_id);
+    let c1 = push_cf(-0.33262347, source_spirv_offset, insts, next_value_id);
+    let c2 = push_cf( 0.19354346, source_spirv_offset, insts, next_value_id);
+    let c3 = push_cf(-0.11643287, source_spirv_offset, insts, next_value_id);
+    let c4 = push_cf( 0.05265332, source_spirv_offset, insts, next_value_id);
+    let c5 = push_cf(-0.01172120, source_spirv_offset, insts, next_value_id);
+    let p1 = push_f32(Op::FMul(c5, x2.clone()),  source_spirv_offset, insts, next_value_id);
+    let p2 = push_f32(Op::FAdd(p1, c4),          source_spirv_offset, insts, next_value_id);
+    let p3 = push_f32(Op::FMul(p2, x2.clone()),  source_spirv_offset, insts, next_value_id);
+    let p4 = push_f32(Op::FAdd(p3, c3),          source_spirv_offset, insts, next_value_id);
+    let p5 = push_f32(Op::FMul(p4, x2.clone()),  source_spirv_offset, insts, next_value_id);
+    let p6 = push_f32(Op::FAdd(p5, c2),          source_spirv_offset, insts, next_value_id);
+    let p7 = push_f32(Op::FMul(p6, x2.clone()),  source_spirv_offset, insts, next_value_id);
+    let p8 = push_f32(Op::FAdd(p7, c1),          source_spirv_offset, insts, next_value_id);
+    let p9 = push_f32(Op::FMul(p8, x2),          source_spirv_offset, insts, next_value_id);
+    let p10 = push_f32(Op::FAdd(p9, c0),         source_spirv_offset, insts, next_value_id);
+    push_f32(Op::FMul(p10, x), source_spirv_offset, insts, next_value_id)
+}
+
+/// Synthesise Atan(x) over the full real line.
+///
+/// For |x| ≤ 1: direct polynomial.
+/// For |x| > 1: sign(x)*π/2 - polynomial(1/x).
+fn synth_atan(
+    x: Value,
+    source_spirv_offset: u32,
+    insts: &mut Vec<Inst>,
+    next_value_id: &mut u32,
+) -> Value {
+    let abs_x = push_f32(Op::FAbs(x.clone()),
+        source_spirv_offset, insts, next_value_id);
+    let one = push_cf(1.0, source_spirv_offset, insts, next_value_id);
+    let is_big = push_bool(Op::FOrdGt(abs_x, one.clone()),
+        source_spirv_offset, insts, next_value_id);
+    // safe denom: x if |x|>1 else 1.0  (avoids 1/0 when x=0)
+    let one2 = push_cf(1.0, source_spirv_offset, insts, next_value_id);
+    let denom = push_f32(Op::Select {
+        cond: is_big.clone(),
+        t_val: x.clone(),
+        f_val: one2,
+    }, source_spirv_offset, insts, next_value_id);
+    let one3 = push_cf(1.0, source_spirv_offset, insts, next_value_id);
+    let inv = push_f32(Op::FDiv(one3, denom),
+        source_spirv_offset, insts, next_value_id);
+    let arg = push_f32(Op::Select {
+        cond: is_big.clone(),
+        t_val: inv,
+        f_val: x.clone(),
+    }, source_spirv_offset, insts, next_value_id);
+    let p = synth_atan_poly(arg, source_spirv_offset, insts, next_value_id);
+    // half_pi_signed = sign(x) * π/2
+    let zero = push_cf(0.0, source_spirv_offset, insts, next_value_id);
+    let is_neg = push_bool(Op::FOrdLt(x, zero),
+        source_spirv_offset, insts, next_value_id);
+    let half_pi_pos = push_cf( std::f64::consts::FRAC_PI_2,
+        source_spirv_offset, insts, next_value_id);
+    let half_pi_neg = push_cf(-std::f64::consts::FRAC_PI_2,
+        source_spirv_offset, insts, next_value_id);
+    let half_pi_signed = push_f32(Op::Select {
+        cond: is_neg, t_val: half_pi_neg, f_val: half_pi_pos,
+    }, source_spirv_offset, insts, next_value_id);
+    let big_branch = push_f32(Op::FSub(half_pi_signed, p.clone()),
+        source_spirv_offset, insts, next_value_id);
+    let _ = one;
+    push_f32(Op::Select {
+        cond: is_big, t_val: big_branch, f_val: p,
+    }, source_spirv_offset, insts, next_value_id)
+}
+
+/// Synthesise Asin(x) on x ∈ (-1, 1) via
+/// asin(x) = atan(x / sqrt(1 - x²)).  At the endpoints
+/// ±1 the sqrt is 0, division yields ±Inf, and atan's
+/// |arg|>1 branch correctly returns ±π/2.
+fn synth_asin(
+    x: Value,
+    source_spirv_offset: u32,
+    insts: &mut Vec<Inst>,
+    next_value_id: &mut u32,
+) -> Value {
+    let x2 = push_f32(Op::FMul(x.clone(), x.clone()),
+        source_spirv_offset, insts, next_value_id);
+    let one = push_cf(1.0, source_spirv_offset, insts, next_value_id);
+    let one_minus_x2 = push_f32(Op::FSub(one, x2),
+        source_spirv_offset, insts, next_value_id);
+    let denom = push_f32(Op::FSqrt(one_minus_x2),
+        source_spirv_offset, insts, next_value_id);
+    let arg = push_f32(Op::FDiv(x, denom),
+        source_spirv_offset, insts, next_value_id);
+    synth_atan(arg, source_spirv_offset, insts, next_value_id)
+}
+
 fn synth_log2(
     x: Value,
     source_spirv_offset: u32,

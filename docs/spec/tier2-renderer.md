@@ -972,7 +972,7 @@ specifically supports:
   Ceil, Trunc, Fract, FSign, FMod, Sqrt, InverseSqrt,
   FMin, FMax, FClamp, FMix, Step, SmoothStep, Length,
   Distance, Normalize, Reflect, Cross, Sin, Cos, Tan,
-  Exp, Exp2, Log, Log2, Pow.
+  Exp, Exp2, Log, Log2, Pow, Atan, Asin, Acos.
   Sin/Cos/Tan use Horner-form Taylor on a range-reduced
   argument (x → x_red ∈ [-π/2, π/2] mod π, with (-1)^k
   parity sign), so the full real line is accepted at ~6
@@ -982,7 +982,11 @@ specifically supports:
   reconstruction (Op::Bitcast f32↔i32 + Op::Shl).
   Log/Log2 use Mineiro-style mantissa-split + 1 FDiv
   rational approximation (~4e-4 relative error). Pow
-  is just Exp2(y * Log2(x)).
+  is just Exp2(y * Log2(x)).  Atan uses a 6-coefficient
+  Horner minimax on [-1, 1] with reciprocal range
+  reduction (sign(x)*π/2 - atan(1/x) when |x|>1), so
+  the full real line is accepted at ~5e-7.  Asin =
+  Atan(x / sqrt(1-x²)); Acos = π/2 - Asin.
 
 **Bespoke backend (atrium-spv-backend-bespoke):**
 
