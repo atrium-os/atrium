@@ -297,8 +297,9 @@ fn cmd_info(args: &[String], install_root: &Path) -> Result<(), String> {
         "info: missing <app-id> argument".to_string()
     })?;
 
-    let manifest_path = install_root.join("apps").join(app_id)
-        .join("bundle").join("manifest.toml");
+    let app_root = install_root.join("apps").join(app_id);
+    let bundle_root = app_root.join("bundle");
+    let manifest_path = bundle_root.join("manifest.toml");
     let src = std::fs::read_to_string(&manifest_path)
         .map_err(|_| format!("app not installed: {}", app_id))?;
     let m = insula_manifest::Manifest::parse(&src)
@@ -311,22 +312,101 @@ fn cmd_info(args: &[String], install_root: &Path) -> Result<(), String> {
         "  bundle:      form={:?}, arches={:?}, entry={}",
         m.bundle.form, m.bundle.arches, m.bundle.entry
     );
+
+    // Filesystem layout.
+    let container_dir = app_root.join("container");
+    println!("  paths:");
+    println!("    bundle:    {}", bundle_root.display());
+    println!("    container: {}", container_dir.display());
+
+    // Signature info, if any.
+    let sig_path = bundle_root.join("signature");
+    if sig_path.exists() {
+        match insula_bundle::signing::read_signature(&bundle_root) {
+            Ok(sig) => {
+                let pk_prefix: String = sig.pubkey[..8].iter()
+                    .map(|b| format!("{:02x}", b)).collect();
+                println!("  signature:   key_id={} pk={}…", sig.key_id, pk_prefix);
+            }
+            Err(e) => {
+                println!("  signature:   present but unreadable ({})", e);
+            }
+        }
+    } else {
+        println!("  signature:   (unsigned — installed with --allow-unsigned)");
+    }
+
+    // Capability sections — these are what the user
+    // consented to at install time.
+    println!();
+    println!("  capabilities:");
     if let Some(r) = &m.render {
-        println!("  render:      fresco={}", r.fresco);
+        println!("    render:     fresco={}", r.fresco);
+    }
+    if let Some(input) = &m.input {
+        println!("    input:      keyboard={:?} pointer={:?}",
+                 input.keyboard, input.pointer);
     }
     if let Some(net) = &m.network {
-        println!("  network:     {} host(s), raw-network={}",
+        println!("    network:    {} host(s), raw-network={}",
                  net.hosts.len(), net.raw_network);
         for h in &net.hosts {
-            println!("    - {} {}:{:?}", h.name, h.port, h.proto);
+            print!("      - {}:{} ({:?})", h.name, h.port, h.proto);
+            if h.tls_pin.is_some() {
+                print!(" [tls-pinned]");
+            }
+            if !h.methods.is_empty() {
+                print!(" methods={:?}", h.methods);
+            }
+            println!();
         }
     }
     if let Some(s) = &m.storage {
-        println!("  storage:     data={:?}, cache={:?}",
+        println!("    storage:    data={:?}, cache={:?}",
                  s.data, s.cache);
     }
     if let Some(ipc) = &m.ipc {
-        println!("  ipc services: {}", ipc.services.join(", "));
+        if !ipc.services.is_empty() {
+            println!("    ipc:        {}", ipc.services.join(", "));
+        }
+    }
+    if let Some(c) = &m.compute {
+        println!("    compute:    cpu={:?}, rss={:?}, wall={:?}",
+                 c.cpu, c.rss, c.wall);
+    }
+    if let Some(bg) = &m.background {
+        if let Some(r) = &bg.resident {
+            println!("    background.resident: entry={} priority={:?}",
+                     r.entry, r.priority);
+        }
+        if let Some(t) = &bg.triggered {
+            println!("    background.triggered: entry={} events={:?}",
+                     t.entry, t.events);
+        }
+    }
+    if let Some(p) = &m.peer {
+        if !p.implements.is_empty() {
+            let keys: Vec<&str> = p.implements.keys().map(String::as_str).collect();
+            println!("    peer.implements: {:?}", keys);
+        }
+        if !p.requests.is_empty() {
+            let keys: Vec<&str> = p.requests.keys().map(String::as_str).collect();
+            println!("    peer.requests:   {:?}", keys);
+        }
+    }
+    if let Some(ep) = &m.entry_points {
+        if !ep.is_empty() {
+            let schemes: Vec<&str> = ep.keys().map(String::as_str).collect();
+            println!("    entry-points: {:?}", schemes);
+        }
+    }
+    if let Some(caps) = &m.capabilities {
+        for (k, v) in caps {
+            println!("    {}: {}", k, v);
+        }
+    }
+    if let Some(sync) = &m.sync {
+        println!("    sync:       enabled={} target={:?}", sync.enabled, sync.target);
     }
     Ok(())
 }
