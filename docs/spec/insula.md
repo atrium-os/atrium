@@ -1175,6 +1175,139 @@ the design *is* the content — and arguably belong to the
 document-viewer authoring format (§10.6), not the apps
 layer.
 
+### 10.9 Dev tools and the Electron alternative
+
+VS Code is currently the dominant developer environment,
+and it is built on Electron — desktop-class apps built with
+web technology. The strategic question for Insula: how do
+we deliver an IDE that matches VS Code's developer
+experience without inheriting Electron's costs (web-tech-
+as-desktop-substrate is the wrong direction)?
+
+This section is partly a demonstration that Insula's
+existing primitives — Pergola + Limen + Aqueduct + Stoa —
+already compose into a better answer than Electron, and
+partly a checklist of what the Insula reference IDE will
+need to lock in adoption.
+
+#### 10.9.1 What Electron got right (and we keep)
+
+Electron's win was not technical; it was alignment of four
+features:
+
+| Electron strength | Insula equivalent |
+|---|---|
+| One UI codebase across OSes | Aqueduct + Insula contract are OS-agnostic by design |
+| Modern UI fidelity (animation, GPU text, custom layout) | Pergola |
+| Easy extensibility in a popular language | Polyglot ABI (§6) + Limen `editor-extension` role |
+| Familiar mental model for contributors | "Extensions are just Insula apps" — generalizes beyond JS |
+
+#### 10.9.2 What Electron got wrong (and we do not repeat)
+
+| Cost | Cause |
+|---|---|
+| 200–500 MB RAM idle | Each Electron app ships a full Chromium |
+| 2–5 s cold start | Chromium init + V8 warmup + JS parse |
+| Janky scroll, weak keyboard handling, broken a11y | Web-tech is fundamentally not a desktop interaction model; Electron papers over but never fixes |
+| "Feels like a website" | Because it is one, in a chrome-less window |
+| Battery drain | Always-running V8 + GPU compositing for trivial UI |
+| Per-app Chromium duplication | Three Electron apps = three Chromiums in RAM |
+
+The damning observation: **VS Code's strength is not
+Electron, it is everything Microsoft built on top of
+Electron** — LSP, DAP, tree-sitter integration, the
+extension API. Those are language-agnostic protocols and
+contracts. They could run on anything. Microsoft chose
+Electron because it was the path of least resistance, not
+because it was the right substrate.
+
+#### 10.9.3 The Insula IDE composition
+
+The IDE is a *demonstration* of Insula's claims, not a
+special case. Most pieces already exist:
+
+| Component | Insula answer |
+|---|---|
+| Editor itself | Native Pergola app — `atrium-edit`'s production-grade descendant, or a sibling editor app |
+| Language services | **LSP** — already external-process; fits Aqueduct directly as a typed message protocol |
+| Debugger | **DAP** — same shape as LSP, fits Aqueduct directly |
+| Terminal | **Stoa embedded via Limen** — already a foundation service |
+| Syntax / structure | Tree-sitter — native Rust/C library |
+| Search | ripgrep-shaped, native |
+| VCS | git via Stoa or direct, integrated UI |
+| Extensions | **Limen role `editor-extension`** — extensions are jailed Insula processes embedded as UI regions or background services |
+| AI assist (Copilot-shape) | LSP extension or first-party assist service; runs as a separate jailed process |
+
+LSP and DAP being external-process protocols was already
+the right shape for Atrium. Microsoft accidentally invented
+the protocol they would have wanted for Insula.
+
+#### 10.9.4 The extension model
+
+VS Code's extension API is *constrained* by Electron:
+extensions run in a separate Node process because Electron
+cannot trust them inside the renderer; they communicate via
+IPC against a defined API. Insula generalizes this cleanly:
+
+- An extension is **a normal Insula app** declaring the
+  `editor-extension` Limen role.
+- The editor reserves typed slots: sidebar panels, status-
+  bar segments, command-palette entries, gutter
+  decorations, hover providers, formatter handlers, code-
+  action providers.
+- Extensions declare capabilities in their manifest (read
+  workspace files, run shell commands, access LSP, talk to
+  the network) and are subject to install-time consent +
+  capability-diff updates (§14.2).
+- The editor host **cannot tamper** with extension UI; the
+  extension **cannot tamper** with the host UI. Both go
+  through Limen surface composition (§10.3).
+
+Concrete improvements over VS Code:
+
+- **Extensions in any language.** Rust for performance,
+  Python for scripting, Zig for low-level tooling, Go,
+  Crystal, whatever. Not "JavaScript or transpile to it."
+- **Sandboxed by default**, capability-shaped. No "trust
+  this extension to do anything" prompt — the manifest
+  declares exactly what it can access.
+- **Crash / slow / malicious extension cannot affect the
+  editor.** Separate jail, separate process, `rctl`-bounded.
+  VS Code's "an extension is making the editor slow" mode
+  is impossible.
+- **Extensions update independently** of the editor via
+  Opifex.
+
+#### 10.9.5 Performance targets
+
+| Metric | VS Code (Electron) | Insula IDE target |
+|---|---|---|
+| Cold start | 2–5 s | <100 ms |
+| Idle RAM | 200–500 MB | 20–50 MB |
+| Open 100 MB log | chokes | instant (mmap) |
+| Battery while idle | non-trivial | near-zero |
+| Spin up an extension | 100s of ms | ~5 ms (from jail pool, §8) |
+
+These are not aspirational; they are what native code on
+modern hardware does when no JavaScript runtime is layered
+between the user and the work.
+
+#### 10.9.6 Strategic angle
+
+The IDE is the single most effective adoption argument
+because developers care about their tools more than almost
+anything else. A reference IDE that is *demonstrably
+better* than VS Code on every developer-perceivable axis
+(startup, RAM, big-file responsiveness, battery,
+extensibility safety) is the trojan horse that gets Insula
+into developers' hands.
+
+It also closes a loop with §0.6.4: VS Code's "web version"
+(vscode.dev) is the canonical example of where this design
+ends up — a thin web renderer connecting to a remote native
+session. Microsoft already accidentally built it. They just
+do not have the platform primitives to do it cleanly.
+
 ## 11. Background tasks
 
 The web's background-execution story is three overlapping
