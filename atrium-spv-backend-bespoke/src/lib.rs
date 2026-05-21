@@ -718,12 +718,19 @@ fn emit_function(
     //     prologue+epilogue, exactly like the W19..W28
     //     integer overflow tier — so they're the overflow
     //     tier, popped only once V16..V31 is exhausted.
+    //   * V0..V7   — also caller-saved per AAPCS64, normally
+    //     used for FP/SIMD argument passing.  The compute
+    //     calling convention passes no V-reg args (uniforms
+    //     and pointers ride X0..X2; wg/lid ride W3..W7), so
+    //     V0..V7 are free for our use with no prologue cost.
     // `pop` takes from the end, so the vec is ordered
-    // [V15..V8, V31..V16] → V16 first, V8..V15 last.
+    // [V15..V8, V7..V0, V31..V16] → V16..V31 first,
+    // V0..V7 next, V8..V15 last (callee-saved overflow tier).
     // At each inst i, before defining any new value, expire
     // scalars whose last_use < i and return their V-regs to
     // the pool. Then allocate from the pool for new defs.
     let mut free_pool: Vec<u8> = (8..16).rev().collect();
+    free_pool.extend((0..8).rev());
     free_pool.extend((16..32).rev());
     let mut owners: HashMap<u8, ValueId> = HashMap::new();
     // Set once any V8..V15 reg is handed out — drives the
@@ -1414,6 +1421,15 @@ fn emit_function(
                 // which read the literal pool instead. Skip
                 // the materialise to drop the prologue cost.
                 if dead_const_floats.contains(&result.id) { continue; }
+                // Orphan ConstFloat (no consumer reaches it,
+                // e.g. a pre-materialised entry-block constant
+                // whose only "use" was inlined by codegen): a
+                // last_use=None pins the V-reg forever, so
+                // skip materialisation.  Mirrors the orphan-
+                // ConstInt skip a few arms up.
+                if use_counts.get(&result.id).copied().unwrap_or(0) == 0 {
+                    continue;
+                }
                 let bits = (*value as f32).to_bits();
                 let v = alloc_vreg(&mut free_pool, &mut owners, &mut used_callee_saved_v,result.id)?;
                 materialise_u32_into_w(&mut a, w_tmp, bits);

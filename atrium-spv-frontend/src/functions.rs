@@ -1755,6 +1755,122 @@ fn translate_inst(
                     let c_one = push_cf(1.0, source_spirv_offset, insts, next_value_id);
                     Op::FMul(a, c_one)
                 }
+                19 => {
+                    // Sinh(x) = (Exp(x) - Exp(-x)) / 2
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let c_log2e = push_cf(std::f64::consts::LOG2_E,
+                        source_spirv_offset, insts, next_value_id);
+                    let xl = push_f32(Op::FMul(x.clone(), c_log2e.clone()),
+                        source_spirv_offset, insts, next_value_id);
+                    let neg_xl = push_f32(Op::FMul(x, push_cf(-std::f64::consts::LOG2_E,
+                        source_spirv_offset, insts, next_value_id)),
+                        source_spirv_offset, insts, next_value_id);
+                    let ex = synth_exp2(xl, source_spirv_offset, insts, next_value_id);
+                    let enx = synth_exp2(neg_xl, source_spirv_offset, insts, next_value_id);
+                    let diff = push_f32(Op::FSub(ex, enx),
+                        source_spirv_offset, insts, next_value_id);
+                    let c_half = push_cf(0.5, source_spirv_offset, insts, next_value_id);
+                    let _ = c_log2e;
+                    Op::FMul(diff, c_half)
+                }
+                20 => {
+                    // Cosh(x) = (Exp(x) + Exp(-x)) / 2
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let c_log2e = push_cf(std::f64::consts::LOG2_E,
+                        source_spirv_offset, insts, next_value_id);
+                    let xl = push_f32(Op::FMul(x.clone(), c_log2e),
+                        source_spirv_offset, insts, next_value_id);
+                    let c_neg_log2e = push_cf(-std::f64::consts::LOG2_E,
+                        source_spirv_offset, insts, next_value_id);
+                    let neg_xl = push_f32(Op::FMul(x, c_neg_log2e),
+                        source_spirv_offset, insts, next_value_id);
+                    let ex = synth_exp2(xl, source_spirv_offset, insts, next_value_id);
+                    let enx = synth_exp2(neg_xl, source_spirv_offset, insts, next_value_id);
+                    let sum = push_f32(Op::FAdd(ex, enx),
+                        source_spirv_offset, insts, next_value_id);
+                    let c_half = push_cf(0.5, source_spirv_offset, insts, next_value_id);
+                    Op::FMul(sum, c_half)
+                }
+                21 => {
+                    // Tanh(x) = (Exp(x) - Exp(-x)) / (Exp(x) + Exp(-x))
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let c_log2e = push_cf(std::f64::consts::LOG2_E,
+                        source_spirv_offset, insts, next_value_id);
+                    let xl = push_f32(Op::FMul(x.clone(), c_log2e),
+                        source_spirv_offset, insts, next_value_id);
+                    let c_neg_log2e = push_cf(-std::f64::consts::LOG2_E,
+                        source_spirv_offset, insts, next_value_id);
+                    let neg_xl = push_f32(Op::FMul(x, c_neg_log2e),
+                        source_spirv_offset, insts, next_value_id);
+                    let ex = synth_exp2(xl, source_spirv_offset, insts, next_value_id);
+                    let enx = synth_exp2(neg_xl, source_spirv_offset, insts, next_value_id);
+                    let num = push_f32(Op::FSub(ex.clone(), enx.clone()),
+                        source_spirv_offset, insts, next_value_id);
+                    let den = push_f32(Op::FAdd(ex, enx),
+                        source_spirv_offset, insts, next_value_id);
+                    Op::FDiv(num, den)
+                }
+                22 => {
+                    // Asinh(x) = Log(x + sqrt(x² + 1)).
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let x2 = push_f32(Op::FMul(x.clone(), x.clone()),
+                        source_spirv_offset, insts, next_value_id);
+                    let one = push_cf(1.0, source_spirv_offset, insts, next_value_id);
+                    let x2p1 = push_f32(Op::FAdd(x2, one),
+                        source_spirv_offset, insts, next_value_id);
+                    let s = push_f32(Op::FSqrt(x2p1),
+                        source_spirv_offset, insts, next_value_id);
+                    let arg = push_f32(Op::FAdd(x, s),
+                        source_spirv_offset, insts, next_value_id);
+                    let l = synth_log2(arg, source_spirv_offset, insts, next_value_id);
+                    let c_ln2 = push_cf(std::f64::consts::LN_2,
+                        source_spirv_offset, insts, next_value_id);
+                    Op::FMul(l, c_ln2)
+                }
+                23 => {
+                    // Acosh(x) = Log(x + sqrt(x² - 1)), x ≥ 1.
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let x2 = push_f32(Op::FMul(x.clone(), x.clone()),
+                        source_spirv_offset, insts, next_value_id);
+                    let one = push_cf(1.0, source_spirv_offset, insts, next_value_id);
+                    let x2m1 = push_f32(Op::FSub(x2, one),
+                        source_spirv_offset, insts, next_value_id);
+                    let s = push_f32(Op::FSqrt(x2m1),
+                        source_spirv_offset, insts, next_value_id);
+                    let arg = push_f32(Op::FAdd(x, s),
+                        source_spirv_offset, insts, next_value_id);
+                    let l = synth_log2(arg, source_spirv_offset, insts, next_value_id);
+                    let c_ln2 = push_cf(std::f64::consts::LN_2,
+                        source_spirv_offset, insts, next_value_id);
+                    Op::FMul(l, c_ln2)
+                }
+                24 => {
+                    // Atanh(x) = 0.5 * Log((1+x)/(1-x)),  x ∈ (-1, 1).
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let one = push_cf(1.0, source_spirv_offset, insts, next_value_id);
+                    let num = push_f32(Op::FAdd(one.clone(), x.clone()),
+                        source_spirv_offset, insts, next_value_id);
+                    let den = push_f32(Op::FSub(one, x),
+                        source_spirv_offset, insts, next_value_id);
+                    let ratio = push_f32(Op::FDiv(num, den),
+                        source_spirv_offset, insts, next_value_id);
+                    let l = synth_log2(ratio, source_spirv_offset, insts, next_value_id);
+                    let c_half_ln2 = push_cf(0.5 * std::f64::consts::LN_2,
+                        source_spirv_offset, insts, next_value_id);
+                    Op::FMul(l, c_half_ln2)
+                }
                 25 => {
                     // Atan2(y, x): four-quadrant arctangent.
                     //   base = atan(y / x)   (atan handles ±Inf

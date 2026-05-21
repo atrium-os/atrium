@@ -2201,6 +2201,99 @@ fn differential_glsl_sin_cos() {
 }
 
 #[test]
+fn differential_glsl_hyperbolic() {
+    // Sinh / Cosh / Tanh / Asinh / Acosh / Atanh.
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let std_450 = b.ext_inst_import("GLSL.std.450");
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let f32_ty = b.type_float(32, None);
+    let void_fn = b.type_function(void, vec![]);
+    let rt_arr = b.type_runtime_array(f32_ty);
+    b.decorate(rt_arr, Decoration::ArrayStride, vec![rspirv::dr::Operand::LiteralBit32(4)]);
+    let s = b.type_struct(vec![rt_arr]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_f = b.type_pointer(None, StorageClass::StorageBuffer, f32_ty);
+    let ssbo  = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    // Each row: (op_enum, input, host_fn_result).
+    let sinh_in:  [f32; 3] = [0.0, 1.0, -2.0];
+    let cosh_in:  [f32; 3] = [0.0, 1.0,  2.0];
+    let tanh_in:  [f32; 3] = [0.0, 1.0, -3.0];
+    let asinh_in: [f32; 3] = [0.0, 1.0, -2.0];
+    let acosh_in: [f32; 3] = [1.0, 2.0, 10.0];
+    let atanh_in: [f32; 3] = [0.0, 0.5, -0.9];
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let mut results: Vec<u32> = Vec::new();
+    let mut emit_one = |ext_op: u32, inputs: &[f32], b: &mut rspirv::dr::Builder, results: &mut Vec<u32>| {
+        for &val in inputs {
+            let c = b.constant_bit32(f32_ty, val.to_bits());
+            let r = b.ext_inst(f32_ty, None, std_450, ext_op,
+                vec![rspirv::dr::Operand::IdRef(c)]).unwrap();
+            results.push(r);
+        }
+    };
+    emit_one(19, &sinh_in,  &mut b, &mut results);
+    emit_one(20, &cosh_in,  &mut b, &mut results);
+    emit_one(21, &tanh_in,  &mut b, &mut results);
+    emit_one(22, &asinh_in, &mut b, &mut results);
+    emit_one(23, &acosh_in, &mut b, &mut results);
+    emit_one(24, &atanh_in, &mut b, &mut results);
+    for (i, v) in results.iter().enumerate() {
+        let ci = b.constant_bit32(u32_ty, i as u32);
+        let d = b.access_chain(ptr_f, None, ssbo, vec![c_zero, ci]).unwrap();
+        b.store(d, *v, None, vec![]).unwrap();
+    }
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spv = Vec::with_capacity(words.len() * 4);
+    for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+    let dir = TempDir::new().unwrap();
+    let n = results.len();
+    let mut b_buf = vec![0u8; n * 4];
+    let mut c_buf = vec![0u8; n * 4];
+    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    assert_eq!(b_buf, c_buf, "diverge on hyperbolic");
+    let read = |i: usize| -> f32 {
+        f32::from_le_bytes(b_buf[i*4..i*4+4].try_into().unwrap())
+    };
+    // Approximations stack exp+log errors; allow ~1% rel.
+    let rel_tol = 1e-2_f32;
+    let abs_tol = 5e-3_f32;
+    let mut idx = 0;
+    let check = |idx: usize, x: f32, want: f32, name: &str| {
+        let got = read(idx);
+        let err = (got - want).abs();
+        let rel = err / want.abs().max(1e-3);
+        assert!(err < abs_tol || rel < rel_tol,
+            "{}({}) = {} (want {}, abs_err {}, rel_err {})", name, x, got, want, err, rel);
+    };
+    for &x in &sinh_in  { check(idx, x, x.sinh(),  "sinh");  idx += 1; }
+    for &x in &cosh_in  { check(idx, x, x.cosh(),  "cosh");  idx += 1; }
+    for &x in &tanh_in  { check(idx, x, x.tanh(),  "tanh");  idx += 1; }
+    for &x in &asinh_in { check(idx, x, x.asinh(), "asinh"); idx += 1; }
+    for &x in &acosh_in { check(idx, x, x.acosh(), "acosh"); idx += 1; }
+    for &x in &atanh_in { check(idx, x, x.atanh(), "atanh"); idx += 1; }
+}
+
+#[test]
 fn differential_glsl_atan2() {
     // Atan2(y, x): four-quadrant arctangent.
     //   atan2(0, 1)   = 0
