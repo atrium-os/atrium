@@ -87,6 +87,7 @@ Commands:
   daemons up              Start all platform daemons.
   daemons down            Stop them.
   daemons status          Show daemon state.
+  daemons logs <daemon>   Print a daemon's log file.
   keygen <id> <out-dir>   Generate an ed25519 keypair for signing.
   sign <bundle> --key <f> [--key-id <id>]
                           Sign a bundle in place.
@@ -566,18 +567,47 @@ fn cmd_daemons(args: &[String], install_root: &Path) -> Result<(), String> {
         "status" => {
             for d in Daemon::ALL {
                 let (running, pid, sock) = daemons::status(install_root, d);
+                let paths = daemons::paths_for(install_root, d);
                 println!(
-                    "{}: {} pid={:?} socket={}",
+                    "{}: {} pid={:?} socket={} log={}",
                     d.slug(),
                     if running { "running" } else { "stopped" },
                     pid,
-                    if sock { "ok" } else { "missing" }
+                    if sock { "ok" } else { "missing" },
+                    paths.log_file.display(),
                 );
             }
         }
+        "logs" => {
+            let name = args.get(1).ok_or_else(|| {
+                "daemons logs: missing <daemon> argument (one of: \
+                 insula-logd, vestibulum-macos, atrium-netd-macos, \
+                 praeco-macos, tabellarius-macos)".to_string()
+            })?;
+            let d = Daemon::ALL.iter().find(|d| d.slug() == name)
+                .ok_or_else(|| format!(
+                    "daemons logs: unknown daemon {:?}", name
+                ))?;
+            let log_path = daemons::paths_for(install_root, *d).log_file;
+            if !log_path.exists() {
+                return Err(format!(
+                    "no log file at {} (has the daemon ever run under \
+                     this install root?)",
+                    log_path.display()
+                ));
+            }
+            let contents = std::fs::read_to_string(&log_path)
+                .map_err(|e| format!("read {}: {}", log_path.display(), e))?;
+            // Stream straight to stdout, no extra
+            // framing — the caller may want to pipe to
+            // `grep` / `jq` / etc.
+            use std::io::Write;
+            std::io::stdout().write_all(contents.as_bytes())
+                .map_err(|e| format!("stdout: {}", e))?;
+        }
         other => {
             return Err(format!(
-                "daemons: unknown subcommand '{}' (use up|down|status)",
+                "daemons: unknown subcommand '{}' (use up|down|status|logs)",
                 other
             ));
         }
