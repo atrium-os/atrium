@@ -2293,6 +2293,107 @@ fn differential_glsl_exp_exp2() {
 }
 
 #[test]
+fn differential_glsl_log_log2_pow() {
+    // Log2: 1 → 0, 2 → 1, 8 → 3, 0.25 → -2, 1024 → 10.
+    // Log:  e → 1, 1 → 0, 100 → 4.6052, 0.5 → -0.6931.
+    // Pow:  2^3 = 8, 10^2 = 100, 2^0.5 = √2, 0.5^2 = 0.25.
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let std_450 = b.ext_inst_import("GLSL.std.450");
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let f32_ty = b.type_float(32, None);
+    let void_fn = b.type_function(void, vec![]);
+    let rt_arr = b.type_runtime_array(f32_ty);
+    b.decorate(rt_arr, Decoration::ArrayStride, vec![rspirv::dr::Operand::LiteralBit32(4)]);
+    let s = b.type_struct(vec![rt_arr]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_f = b.type_pointer(None, StorageClass::StorageBuffer, f32_ty);
+    let ssbo  = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    let log2_inputs: [f32; 5] = [1.0, 2.0, 8.0, 0.25, 1024.0];
+    let log_inputs:  [f32; 4] = [std::f32::consts::E, 1.0, 100.0, 0.5];
+    let pow_inputs:  [(f32, f32); 4] = [(2.0, 3.0), (10.0, 2.0), (2.0, 0.5), (0.5, 2.0)];
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let mut results: Vec<u32> = Vec::new();
+    for &val in &log2_inputs {
+        let c = b.constant_bit32(f32_ty, val.to_bits());
+        let r = b.ext_inst(f32_ty, None, std_450, 30,
+            vec![rspirv::dr::Operand::IdRef(c)]).unwrap();
+        results.push(r);
+    }
+    for &val in &log_inputs {
+        let c = b.constant_bit32(f32_ty, val.to_bits());
+        let r = b.ext_inst(f32_ty, None, std_450, 28,
+            vec![rspirv::dr::Operand::IdRef(c)]).unwrap();
+        results.push(r);
+    }
+    for &(x, y) in &pow_inputs {
+        let cx = b.constant_bit32(f32_ty, x.to_bits());
+        let cy = b.constant_bit32(f32_ty, y.to_bits());
+        let r = b.ext_inst(f32_ty, None, std_450, 26,
+            vec![rspirv::dr::Operand::IdRef(cx), rspirv::dr::Operand::IdRef(cy)]).unwrap();
+        results.push(r);
+    }
+    for (i, v) in results.iter().enumerate() {
+        let ci = b.constant_bit32(u32_ty, i as u32);
+        let d = b.access_chain(ptr_f, None, ssbo, vec![c_zero, ci]).unwrap();
+        b.store(d, *v, None, vec![]).unwrap();
+    }
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spv = Vec::with_capacity(words.len() * 4);
+    for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+    let dir = TempDir::new().unwrap();
+    let n = results.len();
+    let mut b_buf = vec![0u8; n * 4];
+    let mut c_buf = vec![0u8; n * 4];
+    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    assert_eq!(b_buf, c_buf, "diverge on log/log2/pow");
+    let read = |i: usize| -> f32 {
+        f32::from_le_bytes(b_buf[i*4..i*4+4].try_into().unwrap())
+    };
+    // Mineiro-style log2 has max relative error ~4e-4 on its
+    // own; pow stacks log2 + exp2 errors so allow a bit more.
+    let abs_tol = 5e-3_f32;
+    for (i, &x) in log2_inputs.iter().enumerate() {
+        let want = x.log2();
+        let got = read(i);
+        assert!((got - want).abs() < abs_tol,
+            "log2({}) = {} (want {})", x, got, want);
+    }
+    for (i, &x) in log_inputs.iter().enumerate() {
+        let want = x.ln();
+        let got = read(5 + i);
+        assert!((got - want).abs() < abs_tol,
+            "log({}) = {} (want {})", x, got, want);
+    }
+    for (i, &(x, y)) in pow_inputs.iter().enumerate() {
+        let want = x.powf(y);
+        let got = read(9 + i);
+        let rel = (got - want).abs() / want.abs().max(1e-6);
+        assert!(rel < 1e-2,
+            "pow({}, {}) = {} (want {}, rel {})", x, y, got, want, rel);
+    }
+}
+
+#[test]
 fn differential_glsl_sin_cos_extended_range() {
     // Range-reduction validation: sin/cos at arguments well
     // outside the polynomial's native [-π/2, π/2] domain.

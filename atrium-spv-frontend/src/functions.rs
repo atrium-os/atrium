@@ -1727,6 +1727,40 @@ fn translate_inst(
                     let c_one = push_cf(1.0, source_spirv_offset, insts, next_value_id);
                     Op::FMul(e, c_one)
                 }
+                30 => {
+                    // Log2(x): mantissa-split + rational approx.
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let l = synth_log2(x, source_spirv_offset, insts, next_value_id);
+                    let c_one = push_cf(1.0, source_spirv_offset, insts, next_value_id);
+                    Op::FMul(l, c_one)
+                }
+                28 => {
+                    // Log(x) = Log2(x) * ln(2).
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let l = synth_log2(x, source_spirv_offset, insts, next_value_id);
+                    let c_ln2 = push_cf(std::f64::consts::LN_2,
+                        source_spirv_offset, insts, next_value_id);
+                    Op::FMul(l, c_ln2)
+                }
+                26 => {
+                    // Pow(x, y) = Exp2(y * Log2(x)).
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let y_id = expect_id(&spv_inst.operands, 3)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let y = resolve_value(y_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let lx = synth_log2(x, source_spirv_offset, insts, next_value_id);
+                    let ylx = push_f32(Op::FMul(y, lx),
+                        source_spirv_offset, insts, next_value_id);
+                    let e = synth_exp2(ylx, source_spirv_offset, insts, next_value_id);
+                    let c_one = push_cf(1.0, source_spirv_offset, insts, next_value_id);
+                    Op::FMul(e, c_one)
+                }
                 32 => {
                     // InverseSqrt(x) ≡ 1.0 / sqrt(x).  Real
                     // ARM64 has FRSQRTE (estimate) + FRSQRTS
@@ -2721,6 +2755,63 @@ fn synth_exp2(
     let pow2k = push_f32(Op::Bitcast(shifted_bits, Type::F32),
         source_spirv_offset, insts, next_value_id);
     push_f32(Op::FMul(exp2_r, pow2k),
+        source_spirv_offset, insts, next_value_id)
+}
+
+/// Synthesise Log2(x) for x > 0 using mantissa-split + 4-term
+/// rational approximation (Mineiro-style).
+///
+///   bits = bitcast<i32>(x)
+///   y    = (float)bits * (1/2^23)        // linear approx of log2(x)+offset
+///   mant_bits = (bits & 0x007FFFFF) | 0x3f000000
+///   m    = bitcast<f32>(mant_bits)       // m ∈ [0.5, 1.0)
+///   log2(x) ≈ y - 124.22551499
+///                - 1.498030302 * m
+///                - 1.72587999 / (0.3520887068 + m)
+///
+/// Max relative error ≈ 4e-4 for positive x; undefined for x ≤ 0
+/// (caller's responsibility, matching GLSL spec).
+fn synth_log2(
+    x: Value,
+    source_spirv_offset: u32,
+    insts: &mut Vec<Inst>,
+    next_value_id: &mut u32,
+) -> Value {
+    // bits = bitcast<i32>(x)
+    let bits = push_i32(Op::Bitcast(x, Type::I32),
+        source_spirv_offset, insts, next_value_id);
+    // y_int_as_float = (float)bits
+    let bits_f = push_f32(Op::ConvertSToF(bits.clone()),
+        source_spirv_offset, insts, next_value_id);
+    let c_inv_2pow23 = push_cf(1.0 / 8388608.0, source_spirv_offset, insts, next_value_id);
+    let y = push_f32(Op::FMul(bits_f, c_inv_2pow23),
+        source_spirv_offset, insts, next_value_id);
+    // mant_bits = (bits & 0x007FFFFF) | 0x3f000000
+    let c_mant_mask = push_ci32(0x007FFFFF, source_spirv_offset, insts, next_value_id);
+    let c_exp_half  = push_ci32(0x3f000000, source_spirv_offset, insts, next_value_id);
+    let mant_only = push_i32(Op::BitAnd(bits, c_mant_mask),
+        source_spirv_offset, insts, next_value_id);
+    let mant_bits = push_i32(Op::BitOr(mant_only, c_exp_half),
+        source_spirv_offset, insts, next_value_id);
+    let m = push_f32(Op::Bitcast(mant_bits, Type::F32),
+        source_spirv_offset, insts, next_value_id);
+    // term1 = 1.498030302 * m
+    let c_a = push_cf(1.498030302, source_spirv_offset, insts, next_value_id);
+    let term1 = push_f32(Op::FMul(c_a, m.clone()),
+        source_spirv_offset, insts, next_value_id);
+    // term2 = 1.72587999 / (0.3520887068 + m)
+    let c_b = push_cf(0.3520887068, source_spirv_offset, insts, next_value_id);
+    let denom = push_f32(Op::FAdd(c_b, m), source_spirv_offset, insts, next_value_id);
+    let c_c = push_cf(1.72587999, source_spirv_offset, insts, next_value_id);
+    let term2 = push_f32(Op::FDiv(c_c, denom),
+        source_spirv_offset, insts, next_value_id);
+    // result = y - 124.22551499 - term1 - term2
+    let c_offset = push_cf(124.22551499, source_spirv_offset, insts, next_value_id);
+    let s1 = push_f32(Op::FSub(y, c_offset),
+        source_spirv_offset, insts, next_value_id);
+    let s2 = push_f32(Op::FSub(s1, term1),
+        source_spirv_offset, insts, next_value_id);
+    push_f32(Op::FSub(s2, term2),
         source_spirv_offset, insts, next_value_id)
 }
 

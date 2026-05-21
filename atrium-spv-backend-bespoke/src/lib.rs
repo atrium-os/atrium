@@ -1204,6 +1204,13 @@ fn emit_function(
                 // materialisation.
                 if fold_const.contains(&result.id) {
                     // nothing to emit
+                } else if use_counts.get(&result.id).copied().unwrap_or(0) == 0 {
+                    // Orphan ConstInt -- typically an AccessChain
+                    // index pre-materialised by the frontend's
+                    // entry-block prelude that the codegen
+                    // resolves inline.  Without this skip the
+                    // orphan pins a W-reg forever (its last_use
+                    // is None, so linear-scan never reclaims).
                 } else if let Ok(w) = alloc_int_w(&mut int_pool, result.id) {
                     materialise_u32_into_w(&mut a, w, *value as i32 as u32);
                     ints.insert(result.id, w);
