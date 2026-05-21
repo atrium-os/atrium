@@ -90,6 +90,19 @@ the *broker* — it does the introducing.
 A **role** is a typed contract between parent and child.
 Initial roles, expanded from `insula.md` §10.3.2:
 
+> **A note on layering.** Insula's "typed message
+> channels" are a library-layer convention over
+> Aqueduct's opcode substrate, not an Aqueduct primitive.
+> Each role registers an Aqueduct opcode class; role
+> messages are CBOR payloads validated against the role's
+> CDDL schema. The Aqueduct substrate sees opcodes +
+> opaque bytes; the Limen SDK presents typed message
+> structs to app code. This layering keeps Aqueduct
+> minimal (right for substrate use cases like Fresco's
+> per-frame scene-graph deltas) while giving app
+> developers compile-time-checked messaging (right for
+> app-level protocols).
+
 ### 2.1 `doc-viewer`
 
 Renders a document URL into the slot. Read-only by
@@ -216,6 +229,15 @@ An app declares which roles it implements:
 Limen indexes this at install time; the index lives in
 Curia (system settings) as a (role, schema-version) →
 [apps] map.
+
+> **Status.** Curia exists in NAMING.md as the
+> system-settings store but does not yet have its own
+> spec. The "Limen indexes role-implementations in
+> Curia" claim assumes Curia's eventual key/value API.
+> Until Curia ships, Limen's index can live in a
+> dedicated `~/Library/Application Support/atrium/limen/
+> roles.db` (macOS) / equivalent local store — semantics
+> unchanged.
 
 ### 3.2 Default-app selection
 

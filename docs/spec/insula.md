@@ -656,6 +656,23 @@ disclosed in the install-time consent UI.
 
 Cost: ~500 µs per `connect`. Invisible against TCP+TLS.
 
+> **Status caveat.** Today's `atrium-netd` (see
+> `atrium-netd.md`) does **coarse-grained per-jail
+> network policy** — pf-anchor synthesis from manifest
+> declarations of `network.outbound = "none" | "loopback"
+> | "any"` + intra-host peer rules. **Hostname-level
+> allowlisting, TLS pinning, per-host policy described
+> here are Insula-introduced extensions, not currently
+> implemented.** They live as a *userspace broker* on top
+> of (or alongside) atrium-netd's coarse layer — a
+> sibling daemon that intercepts `atrium_net_connect`,
+> does the DNS resolution, and policy-enforces before
+> handing back an fd. Spec'ing this extension is an
+> Atrium-side prerequisite; v1 Insula apps that need
+> hostname enforcement run against this broker, apps that
+> can live with coarse-grained network use the existing
+> atrium-netd path directly.
+
 ## 5. Manifest and capabilities
 
 ### 5.1 Static capabilities (declared)
@@ -1391,7 +1408,7 @@ special case. Most pieces already exist:
 | Editor surface | Native Pergola app (sibling to `atrium-edit`; Artifex is the IDE, `atrium-edit` stays the simple foundation editor) |
 | Language services | **LSP** — already external-process; fits Aqueduct directly as a typed message protocol |
 | Debugger | **DAP** — same shape as LSP, fits Aqueduct directly |
-| Terminal | **Stoa embedded via Limen** — already a foundation service |
+| Terminal | **`stoactl-gui` (Stoa's graphical client) launched as a Limen-embedded child** — uses existing Limen + Stoa mechanisms; no Stoa-protocol extension required |
 | Syntax / structure | Tree-sitter — native Rust/C library |
 | Search | ripgrep-shaped, native |
 | VCS | git via Stoa or direct, integrated UI |
@@ -1931,6 +1948,15 @@ Enforced by content addressing: an update that lies about
 its capabilities cannot install because the manifest is
 part of the signed bundle.
 
+> **Status.** Portcullis's first-launch capability prompt
+> (`portcullis.md` D2.5 Phase 5) is specified as a *simple
+> yes/no on new capabilities* — no diff visualization.
+> The diff-UI described here is an **Insula-introduced
+> extension** to that prompt. The capability-diff
+> *computation* (compare old manifest vs new) is
+> straightforward; the *rendering* (a Pergola-rendered
+> prompt that surfaces the diff) is the new piece.
+
 ### 14.3 Update timing classes
 
 - **Automatic, in background** — trusted publisher, narrow
@@ -2013,9 +2039,16 @@ data  = "100MB"   # backed up
 cache = "1GB"     # evictable
 ```
 
-Enforced by Tessera namespace quotas. The OS *will* evict
-`/cache` on disk pressure; apps must treat it as a soft
-hint.
+**Enforcement is at the jail boundary**, not at the
+Tessera filesystem layer. Tessera (`tessera-fs.md`) does
+not enforce per-app storage quotas — it provides the
+content-addressed store + automatic cross-app dedup. Per-
+jail disk-quota enforcement is **Portcullis + `rctl`**
+(jail-level disk limit on the app's container path); on
+non-Atrium host adapters it is the equivalent host
+mechanism (e.g., quota policy at the App Sandbox
+container layer on macOS). The OS *will* evict `/cache`
+on disk pressure; apps must treat it as a soft hint.
 
 ### 15.3 Backup
 
@@ -2311,7 +2344,7 @@ needing a separate protocol stack (X11, RDP, VNC, Citrix).
 |---|---|---|
 | Server-rendered HTML (PHP, Rails) | Avoid shipping JS to do first paint | Does not apply — no JS to ship, no HTML to render; AOT native code mmap's instantly |
 | Hybrid SSR + hydration (Next.js, Leptos SSR) | Bridge between document and app modes of the web | Does not apply — apps-vs-documents split is clean (§0.5); hybrid is unnecessary |
-| Remote app execution (X11, RDP, Citrix) | Run code on machine A, show UI on machine B | First-class (§20.2). Aqueduct is already a network-transparent substrate. |
+| Remote app execution (X11, RDP, Citrix) | Run code on machine A, show UI on machine B | First-class *target* (§20.2). Aqueduct's wire envelope is transport-agnostic by design, but the substrate's authenticated network-traversing mode (`OP_AQUEDUCT_HANDSHAKE`) is a future addition to Atrium that Insula's distributed-apps story depends on. Today's Aqueduct is local-only (`SO_PEERCRED`-authenticated). |
 | Server-side business logic (any backend) | Hold data + serve API | Just an Aqueduct service over the network (§20.5) |
 
 The first two are properties of the web's document/app
@@ -2320,10 +2353,14 @@ the substantive ones.
 
 ### 20.2 Remote app execution — X11 done right
 
-Aqueduct is OS-agnostic and network-transparent by design.
-Fresco is a retained-mode scenegraph protocol. Together,
-they support **remote app execution as a normal Insula
-deployment shape**:
+Aqueduct's envelope is OS-agnostic and transport-agnostic
+by design; Fresco is a retained-mode scenegraph protocol.
+**Once Atrium ships authenticated network-traversing
+Aqueduct** (see `aqueduct.md` §7.2 — currently scoped to
+"run Aqueduct over SSH/WireGuard tunnel," with the
+in-substrate `OP_AQUEDUCT_HANDSHAKE` for mTLS-style auth
+as a future addition), they together support **remote
+app execution as a normal Insula deployment shape**:
 
 - The remote app is a normal Insula app, running in a
   Portcullis jail on the server.
@@ -2404,15 +2441,22 @@ Insula:
 - The "backend" is an Aqueduct service in a Portcullis
   jail.
 - Clients connect over the network; same `atrium_net_*`
-  plumbing (§2.3, §4) as any network call.
+  plumbing (§2.3, §4) as any network call — once
+  network-traversing Aqueduct lands (§20.2 caveat), this
+  becomes a typed-message channel rather than an HTTP+JSON
+  round-trip.
 - Data lives in Tessera, which works identically server-
   side and client-side.
 
 The serialization boundary — HTTP + JSON + the
-TypeScript/Python/Ruby polyglot mismatch — **disappears**.
-Client and server speak Aqueduct typed messages; one
-program can have parts in both places, in the same
-language, talking over typed channels.
+TypeScript/Python/Ruby polyglot mismatch — **disappears**
+once Atrium ships authenticated network Aqueduct.
+Client and server speak Aqueduct opcode-class messages
+with library-layer typing; one program can have parts in
+both places, in the same language. Until that lands,
+Insula apps can still reach traditional REST APIs via the
+`atrium_net_*` path; what's deferred is the typed-channel
+shape across the network.
 
 The "REST API" layer becomes optional: use it for interop
 with non-Atrium services; do not use it as the universal
@@ -2488,9 +2532,13 @@ The properties this section assumes:
 - Aqueduct error / disconnect signaling is rich enough for
   the compositor to render meaningful UX on partition.
 
-These are properties Aqueduct must commit to; they are
-already part of its stated design but worth pinning here so
-the Insula spec's dependency is explicit.
+These are properties Aqueduct must commit to. Per
+`aqueduct.md` §7.2 the envelope is transport-agnostic but
+the **authenticated network-traversing path is not yet
+designed** (only "run Aqueduct over SSH/WireGuard tunnel"
+is in scope today). Specifying `OP_AQUEDUCT_HANDSHAKE`
+and the mTLS-shaped auth is an Atrium-side prerequisite
+for Insula's distributed-apps story.
 
 ## 21. Notifications — Praeco
 

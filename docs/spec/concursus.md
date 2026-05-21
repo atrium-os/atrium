@@ -82,8 +82,10 @@ trust anchor for peer channels.
 ## 2. Roles for peer channels
 
 Concursus carries roles in the same typed-message shape
-as Limen embed roles (`limen.md` §2). Initial peer
-roles:
+as Limen embed roles (`limen.md` §2) — a library-layer
+convention over Aqueduct's opcode substrate, with role-
+specific CBOR schemas, not an Aqueduct primitive. Initial
+peer roles:
 
 ### 2.1 `file-share`
 

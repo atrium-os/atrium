@@ -362,11 +362,38 @@ acceleration paths, the works.
   Atrium implementation. Mostly mechanical given the
   abstraction was already designed.
 
-**Dependencies:** Atrium D-phases through D5 at minimum.
+**Dependencies:** Atrium D-phases through D5 at minimum
+(Portcullis ships at D2.5; Insula on Atrium needs this).
 
-**Estimate:** ~12 months focused, but spread across the
-Atrium D-phase timeline (which has its own multi-year
-schedule per `ROADMAP.md`).
+### 4.1 Atrium-side prerequisites Insula adds
+
+Distinct from "Atrium D-phases Insula depends on" —
+these are **new Atrium-side work** that the Insula
+design introduces and that must land *in Atrium* (not
+inside Insula sibling specs) before the full Insula
+contract is realized:
+
+| Atrium-side prerequisite | Surface | Currently |
+|---|---|---|
+| Authenticated network-traversing Aqueduct | `OP_AQUEDUCT_HANDSHAKE`, mTLS-shaped peer auth | Deferred per `aqueduct.md` §7.2 ("run over SSH/WireGuard tunnel" today) |
+| Hostname-allowlist network broker | Userspace sibling to atrium-netd; DNS-aware policy enforcement | Not designed; `atrium-netd.md` does coarse-grained pf-anchor policy only |
+| Stoa embed protocol extension (optional) | Direct `stoad` session embed without a `stoactl-gui` intermediary | Not designed; today Insula uses the launch-`stoactl-gui`-as-Limen-child pattern |
+| Portcullis capability-diff prompt UI | Rendered diff at update time | `portcullis.md` D2.5 Phase 5 specifies yes/no only |
+| Pergola+AX wire-format freeze | Frozen Aqueduct opcode class + CDDL for the AX subscription stream | Pergola has AX as first-class architecturally; the wire format is sketched in `atrium-ax.md` but needs Atrium-side spec freeze |
+| Per-jail GPU context isolation | Atrium GPU ABI guarantees | Architecturally committed in `gpu-abi.md`; implementation tracks Atrium D-phases |
+
+These prerequisites are *not* blockers for Phase 1
+(macOS), because the macOS host adapter provides
+equivalent guarantees via macOS-native mechanisms (App
+Sandbox, Network.framework, Keychain, LocalAuth). They
+*are* prerequisites for the Atrium-native Phase 4
+experience to match the Insula contract end-to-end.
+
+**Estimate:** ~12 months focused for Insula's own work
+on Atrium, spread across the Atrium D-phase timeline.
+The Atrium-side prerequisites add separately to the
+Atrium roadmap (each is its own scope; collectively
+maybe 6–12 months of incremental Atrium-side work).
 
 ## 5. Risks across phases
 

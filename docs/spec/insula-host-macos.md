@@ -232,6 +232,18 @@ the underlying primitive is different.
 `atrium-netd-macos` is the macOS-specific implementation
 of the network broker (`insula.md` §4.2).
 
+> **Cross-host note.** Per `insula.md` §4.2's status
+> caveat, hostname-level enforcement is an *Insula-
+> introduced extension* on top of (or alongside)
+> Atrium's coarse-grained network policy. On macOS the
+> coarse layer is provided by macOS itself (no need for
+> a pf-equivalent — App Sandbox + Network.framework
+> handles per-app network admittance); the hostname
+> layer is `atrium-netd-macos`. On Atrium proper the
+> coarse layer is the existing `atrium-netd` (pf
+> anchors) and the hostname layer is the new broker
+> daemon sketched in `insula.md` §4.2.
+
 ### 4.1 No raw sockets
 
 App Sandbox apps cannot create raw sockets. The broker

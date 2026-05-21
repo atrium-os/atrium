@@ -207,25 +207,43 @@ stack, watch expressions, REPL via the DAP `evaluate`
 request. Pergola widgets; no special platform support
 required.
 
-## 5. Terminal — Stoa embed
+## 5. Terminal — Stoa via stoactl-gui
 
-A Stoa persistent session embedded via Limen as a child
-surface. Concretely:
+A Stoa persistent session presented inside Artifex via
+the Limen embed mechanism. Stoa itself does not have a
+direct "embed me" mode (it is designed for
+attach/detach), so the mechanism is:
 
 - Artifex requests `request_embed("terminal", rect, ...)`.
-- Limen routes to Stoa's `terminal` role implementation.
-- Stoa serves a session attached to the workspace
-  directory.
-- Session is persistent — survives Artifex restart, can
-  be reattached from `atrium-term` for headless access.
+- Limen launches **`stoactl-gui`** (Stoa's existing
+  graphical client; per `stoa.md` Phase S6) as a normal
+  jailed Insula app in embed mode.
+- `stoactl-gui` attaches to a Stoa session scoped to
+  Artifex's workspace and renders the terminal surface
+  into Limen's allocated slot via Pergola + Fresco
+  ExternalSurface.
+- Input routes via Limen's standard policy (§10.3.4 of
+  `insula.md`).
+- Session is persistent — survives both Artifex restart
+  *and* `stoactl-gui` restart, since the session state
+  lives in `stoad`.
 
 Multiple terminal tabs = multiple Limen embeds → multiple
-Stoa sessions.
+`stoactl-gui` instances → multiple Stoa sessions (or
+multiple attachments to the same session if the user
+prefers).
+
+This design **does not require Stoa-protocol changes**;
+it uses the existing stoactl-gui client and the
+existing Limen pattern that any Insula app can be
+embedded. Direct embed of a `stoad` session inside
+another app's window is a possible Stoa protocol
+extension but not required by Artifex.
 
 The user gets full shell access in the workspace, with
 all the Atrium tooling (`atrium-info`, etc.) reachable
-because the terminal's capabilities include "workspace
-fd + shell access."
+because `stoactl-gui`'s manifest includes "workspace
+fd + shell access" for the session.
 
 ## 6. VCS
 
@@ -324,12 +342,21 @@ commands = ["rainbow-brackets.toggle"]
 
 [capabilities]
 workspace-read = true        # implicit for editor-extension
+pergola = true               # implicit — extension renders into Limen slot via Pergola/Fresco
 network = false              # explicit
 shell = false                # explicit
 ```
 
 Network-requiring extensions (e.g., a Copilot-shaped AI
 assist) declare hosts; the user sees them at install.
+
+The `pergola = true` capability is implicit for any
+`editor-extension`-role extension because the role
+contract requires the extension to render its own
+surface into Artifex's allocated Limen slot. Portcullis
+must grant the extension jail access to the Fresco
+socket; the Insula SDK abstracts this so extension
+authors do not declare it manually.
 
 ### 7.5 Extension performance and isolation
 

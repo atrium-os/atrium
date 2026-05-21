@@ -123,6 +123,15 @@ Tabellarius is compromised, push contents to apps it
 has not been explicitly given decryption capability for
 are still confidential. Defense in depth.
 
+### 2.4 Typed `push` message on Aqueduct
+
+Delivery from Tabellarius to the app rides Aqueduct as a
+typed `push` message in Tabellarius's opcode class —
+library-layer typing over Aqueduct's opcode substrate
+(same pattern as Limen roles; see `limen.md` §2). The
+substrate sees an opcode + opaque ciphertext payload;
+the app's Insula SDK presents a typed message struct.
+
 ## 3. Relay protocol
 
 ### 3.1 Relay selection
