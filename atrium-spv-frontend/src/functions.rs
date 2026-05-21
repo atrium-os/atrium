@@ -1627,6 +1627,35 @@ fn translate_inst(
                         next_value_id, insts, source_spirv_offset)?;
                     Op::FSqrt(x)
                 }
+                32 => {
+                    // InverseSqrt(x) ≡ 1.0 / sqrt(x).  Real
+                    // ARM64 has FRSQRTE (estimate) + FRSQRTS
+                    // (refinement), but for now lower via
+                    // existing primitives -- correct to
+                    // f32 ULPs at the cost of two extra
+                    // instructions (movz/movk/fmov for 1.0
+                    // + fdiv).
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let push = |op: Op, ty: Type,
+                                insts: &mut Vec<Inst>,
+                                next_value_id: &mut u32| -> Value {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let v = Value { id, ty };
+                        insts.push(Inst { op, result: Some(v.clone()),
+                            source_spirv_offset });
+                        v
+                    };
+                    let sq = push(
+                        Op::FSqrt(x), result_ty.clone(),
+                        insts, next_value_id);
+                    let one = push(
+                        Op::ConstFloat { value: 1.0, kind: atrium_spv_ir::FloatKind::F32 },
+                        result_ty.clone(), insts, next_value_id);
+                    Op::FDiv(one, sq)
+                }
                 37 => {
                     let x_id = expect_id(&spv_inst.operands, 2)?;
                     let y_id = expect_id(&spv_inst.operands, 3)?;
