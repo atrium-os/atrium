@@ -963,6 +963,15 @@ fn emit_function(
     // ret. Mirror-image layout: 4 FP slots then 5 int slots
     // (restores run in reverse of the prologue's saves).
     let mut epilogue_offs: Vec<usize> = Vec::new();
+    // Byte offsets of `ldr_w wreg, [sp, #0]` instructions
+    // that load LocalInvocationId.z (the 9th AAPCS64 arg).
+    // Patched at the end of body emission with the actual
+    // frame-byte shift the prologue introduced -- the SP-
+    // relative offset of the lid.z slot is +frame_bytes
+    // *after* the prologue's `stp ..., [sp, #-16]!`
+    // instructions push SP down.  Each entry: (byte offset
+    // of the ldr_w_offset inst, dest W-reg).
+    let mut lid_z_load_patches: Vec<(usize, asm::Wreg)> = Vec::new();
 
     let mut flat_i: usize = 0;
     for (block_pos, bid) in block_order.iter().enumerate() {
@@ -1622,17 +1631,25 @@ fn emit_function(
                     ints.insert(synth, w);
                     Ok(Value { id: synth, ty: Type::U32 })
                 };
-                let load_lane_from_sp = |a: &mut asm::Asm,
-                                          ints: &mut HashMap<ValueId, asm::Wreg>,
-                                          int_pool: &mut IntPool,
-                                          next_synth_id: &mut u32,
-                                          stack_off: u16|
+                // Load lid.z (the 9th AAPCS64 arg, [SP+0] at
+                // function entry).  Records the patch site
+                // so the actual stack offset can be filled in
+                // once we know the prologue's frame shift.
+                let load_lid_z = |a: &mut asm::Asm,
+                                   ints: &mut HashMap<ValueId, asm::Wreg>,
+                                   int_pool: &mut IntPool,
+                                   next_synth_id: &mut u32,
+                                   patches: &mut Vec<(usize, asm::Wreg)>|
                     -> Result<Value, BackendError>
                 {
                     let synth = ValueId(*next_synth_id);
                     *next_synth_id += 1;
                     let w = int_pool.alloc(synth)?;
-                    a.emit(asm::ldr_w_offset(w, asm::Xreg(31), stack_off));
+                    let off = a.len();
+                    // Placeholder offset 0 -- patched at end
+                    // of emit_function to (frame_bytes >> 0).
+                    a.emit(asm::ldr_w_offset(w, asm::Xreg(31), 0));
+                    patches.push((off, w));
                     ints.insert(synth, w);
                     Ok(Value { id: synth, ty: Type::U32 })
                 };
@@ -1651,16 +1668,16 @@ fn emit_function(
                             &mut a, &mut ints, &mut int_pool, &mut next_synth_id, 6)?;
                         let ly = load_lane_from_w(
                             &mut a, &mut ints, &mut int_pool, &mut next_synth_id, 7)?;
-                        // local_id[z] is the 9th AAPCS64 arg
-                        // -- on the stack at [SP+0] before
-                        // any prologue (callee-saved regs
-                        // saved later would shift this).
-                        // Bespoke today doesn't insert a
-                        // prologue for compute (no callee-
-                        // saved use yet); leaving stack
-                        // offset at 0 works.
-                        let lz = load_lane_from_sp(
-                            &mut a, &mut ints, &mut int_pool, &mut next_synth_id, 0)?;
+                        // lid.z is the 9th AAPCS64 arg --
+                        // [SP+0] at function entry, but
+                        // shifts up by frame_bytes if the
+                        // prologue's stp_x_pre / stp_d_pre
+                        // pushed SP down for callee-saved
+                        // saves.  Defer the offset to a
+                        // post-body patch.
+                        let lz = load_lid_z(
+                            &mut a, &mut ints, &mut int_pool,
+                            &mut next_synth_id, &mut lid_z_load_patches)?;
                         vectors.insert(result.id, vec![lx, ly, lz]);
                     }
                     BK::GlobalInvocationId => {
@@ -1688,7 +1705,14 @@ fn emit_function(
                             if i < 2 {
                                 a.emit(asm::mov_w(w_lid, asm::Wreg(6 + i as u8)));
                             } else {
+                                // lid.z stack load -- record
+                                // a patch site so the offset
+                                // gets filled in after the
+                                // prologue's frame size is
+                                // known.
+                                let off = a.len();
                                 a.emit(asm::ldr_w_offset(w_lid, asm::Xreg(31), 0));
+                                lid_z_load_patches.push((off, w_lid));
                             }
 
                             if ls_arr[i] == 1 {
@@ -2546,6 +2570,24 @@ fn emit_function(
                 a.patch(ep + i * 4,
                         asm::ldp_d_post(*a_reg, *b_reg, asm::Xreg(31), 16));
             }
+        }
+    }
+
+    // lid.z stack-load patches.  The prologue's stp_x_pre /
+    // stp_d_pre instructions each push SP down by 16 bytes;
+    // the original [SP+0] slot ends up at [SP + frame_bytes]
+    // by the time the body runs.  Compute the shift and
+    // rewrite the placeholder ldr_w offsets.
+    if !lid_z_load_patches.is_empty() {
+        let int_pairs_count = if int_pool.used_callee_saved {
+            PROLOGUE_INT_INSTS
+        } else { 0 };
+        let fp_pairs_count = if used_callee_saved_v {
+            PROLOGUE_FP_INSTS
+        } else { 0 };
+        let frame_bytes = (int_pairs_count + fp_pairs_count) as u16 * 16;
+        for (off, wreg) in &lid_z_load_patches {
+            a.patch(*off, asm::ldr_w_offset(*wreg, asm::Xreg(31), frame_bytes));
         }
     }
 

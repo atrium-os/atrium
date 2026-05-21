@@ -21,6 +21,14 @@
 //!     Proves the frontend extracts LocalSize from the SPIR-V
 //!     OpExecutionMode and the Cranelift backend folds it
 //!     into the GlobalInvocationId codegen.
+//!   * `vk_app_compute_global_invocation_id_z_via_stack` --
+//!     CS reads gl_GlobalInvocationID.z (lane 2). On bespoke
+//!     this exercises the lid.z stack-load path: lid.z is
+//!     the 9th AAPCS64 arg and lives at [SP + frame_bytes]
+//!     *after* the prologue's stp_x_pre instructions push
+//!     SP down for callee-saved register saves. A wrong
+//!     offset would produce garbage; the test catches it
+//!     by asserting the expected value 3.
 
 mod common;
 
@@ -862,6 +870,170 @@ fn vk_app_compute_global_invocation_id_folds_local_size() {
     assert_eq!(got, 7,
         "GlobalInvocationID.x should = workgroup_id.x * 4 + local_id.x; \
          last invocation (gx=1, lx=3) -> 7, got {got}");
+
+    unsafe { atrium_vk_icd::vkDestroyInstance(instance, std::ptr::null()); }
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
+
+/// Compute SPIR-V that reads gl_GlobalInvocationID.z and
+/// writes it to ssbo[0]. With LocalSize=(1,1,4) and
+/// Dispatch=(1,1,1), the dispatcher fires 4 invocations
+/// (lz iterates 0..3 with lx=ly=0); the last invocation
+/// has gid.z = wg.z*1 + lid.z = 0 + 3 = 3.
+///
+/// Exercises the LID.z stack-load path AND the post-prologue
+/// patch logic.  If the bespoke backend's prologue accidentally
+/// shifted SP without updating the lid.z offset, this test
+/// would observe a stale / garbage value.
+fn build_gid_z_cs() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let uvec3  = b.type_vector(u32_ty, 3);
+    let void_fn = b.type_function(void, vec![]);
+    let ptr_in_uvec3 = b.type_pointer(None, StorageClass::Input, uvec3);
+    let gid_var = b.variable(ptr_in_uvec3, None, StorageClass::Input, None);
+    b.decorate(gid_var, Decoration::BuiltIn,
+        vec![rspirv::dr::Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+    let ssbo_struct = b.type_struct(vec![u32_ty]);
+    b.decorate(ssbo_struct, Decoration::Block, vec![]);
+    b.member_decorate(ssbo_struct, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_ssbo_struct = b.type_pointer(None, StorageClass::StorageBuffer, ssbo_struct);
+    let ptr_ssbo_u32    = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+    let ssbo_var = b.variable(ptr_ssbo_struct, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo_var, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo_var, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+
+    let c_zero = b.constant_bit32(u32_ty, 0);
+
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let gid = b.load(uvec3, None, gid_var, None, vec![]).unwrap();
+    // Extract lane 2 (z) -- exercises lid.z stack-load path.
+    let gid_z = b.composite_extract(u32_ty, None, gid, vec![2]).unwrap();
+    let dst = b.access_chain(ptr_ssbo_u32, None, ssbo_var, vec![c_zero]).unwrap();
+    b.store(dst, gid_z, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main",
+        vec![gid_var, ssbo_var]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 4]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn vk_app_compute_global_invocation_id_z_via_stack() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let sock = tmp_socket("compute_gid_z");
+    let cache_dir = TempDir::new().unwrap();
+    let registry = Arc::new(Tier2Registry::new(LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    }));
+    let tier2_backend = Arc::new(Tier2Backend::new(registry.clone()));
+    let backend_for_listener: Arc<dyn Backend> = tier2_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap()
+        .with_tier2_registry(registry.clone());
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+
+    let _env = EnvLock::set(&sock);
+
+    let mut instance: VkInstance = std::ptr::null_mut();
+    unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
+    let mut pds: [VkPhysicalDevice; 1] = [std::ptr::null_mut(); 1];
+    let mut cap: u32 = 1;
+    unsafe { vkEnumeratePhysicalDevices(instance, &mut cap, pds.as_mut_ptr()); }
+    let mut device: VkDevice = std::ptr::null_mut();
+    unsafe { vkCreateDevice(pds[0], std::ptr::null(), std::ptr::null(), &mut device); }
+    let mut queue: VkQueue = std::ptr::null_mut();
+    unsafe { vkGetDeviceQueue(device, 0, 0, &mut queue); }
+
+    let cs_spv = build_gid_z_cs();
+    let cs_mod = make_shader_module(device, &cs_spv);
+
+    use ash::vk;
+    use ash::vk::Handle;
+    let stage = vk::PipelineShaderStageCreateInfo {
+        s_type: vk::StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
+        p_next: std::ptr::null(),
+        flags: vk::PipelineShaderStageCreateFlags::empty(),
+        stage: vk::ShaderStageFlags::COMPUTE,
+        module: vk::ShaderModule::from_raw(cs_mod),
+        p_name: b"main\0".as_ptr() as *const i8,
+        p_specialization_info: std::ptr::null(),
+        _marker: std::marker::PhantomData,
+    };
+    let info = vk::ComputePipelineCreateInfo {
+        s_type: vk::StructureType::COMPUTE_PIPELINE_CREATE_INFO,
+        p_next: std::ptr::null(),
+        flags: vk::PipelineCreateFlags::empty(),
+        stage,
+        layout: vk::PipelineLayout::null(),
+        base_pipeline_handle: vk::Pipeline::null(),
+        base_pipeline_index: 0,
+        _marker: std::marker::PhantomData,
+    };
+    let infos = [info];
+    let mut pipeline: u64 = 0;
+    unsafe {
+        vkCreateComputePipelines(
+            device, 0, 1,
+            infos.as_ptr() as *const std::ffi::c_void,
+            std::ptr::null(), &mut pipeline,
+        );
+    }
+    thread::sleep(Duration::from_millis(200));
+
+    let mut pool: u64 = 0;
+    unsafe { vkCreateCommandPool(device, std::ptr::null(), std::ptr::null(), &mut pool); }
+    let mut cb_info = [0u8; 40];
+    cb_info[0..4].copy_from_slice(&40u32.to_le_bytes());
+    cb_info[16..24].copy_from_slice(&pool.to_le_bytes());
+    cb_info[28..32].copy_from_slice(&1u32.to_le_bytes());
+    let mut cbs: [VkCommandBuffer; 1] = [std::ptr::null_mut(); 1];
+    unsafe { vkAllocateCommandBuffers(device, cb_info.as_ptr() as *const _, cbs.as_mut_ptr()); }
+    let cb = cbs[0];
+
+    unsafe { vkBeginCommandBuffer(cb, std::ptr::null()); }
+    unsafe { vkCmdBindPipeline(cb, 1, pipeline); }
+    unsafe { vkCmdDispatch(cb, 1, 1, 1); }
+    unsafe { vkEndCommandBuffer(cb); }
+
+    let mut submit = [0u8; 72];
+    submit[0..4].copy_from_slice(&4u32.to_le_bytes());
+    submit[40..44].copy_from_slice(&1u32.to_le_bytes());
+    let cb_arr = [cb];
+    submit[48..56].copy_from_slice(&(cb_arr.as_ptr() as u64).to_le_bytes());
+    unsafe {
+        vkQueueSubmit(queue, 1, submit.as_ptr() as *const _, std::ptr::null_mut());
+    }
+    thread::sleep(Duration::from_millis(300));
+
+    let out = tier2_backend.compute_output_bytes().expect("output");
+    let got = u32::from_le_bytes(out[0..4].try_into().unwrap());
+    // Last invocation has gid.z = 3.  If the lid.z stack
+    // load read the wrong offset (e.g. into garbage memory
+    // after the prologue shifted SP), this would be some
+    // wrong value -- the test catches that.
+    assert_eq!(got, 3,
+        "gid.z = wg.z*1 + lid.z; last invocation lz=3, expected 3, got {got}");
 
     unsafe { atrium_vk_icd::vkDestroyInstance(instance, std::ptr::null()); }
     let _ = server_thread;
