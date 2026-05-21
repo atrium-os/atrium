@@ -1,0 +1,19 @@
+[package]
+name        = "insula-cli"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+description = "Command-line frontend to the Insula host adapter on macOS. `insula install <bundle>`, `insula launch <app-id>`, `insula list`, `insula uninstall`, `insula info`. The thin user-facing wrapper around insula-bundle + insula-host-macos."
+publish     = false
+
+[[bin]]
+name = "insula"
+path = "src/main.rs"
+
+[dependencies]
+insula-bundle     = { path = "../insula-bundle" }
+insula-host-macos = { path = "../insula-host-macos" }
+insula-manifest   = { path = "../insula-manifest" }
+
+[dev-dependencies]
+tempfile = "3"
