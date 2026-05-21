@@ -19,6 +19,7 @@
 
 mod daemons;
 mod doctor;
+mod init;
 mod keychain;
 mod notify;
 mod push;
@@ -55,6 +56,7 @@ fn main() -> ExitCode {
         "keychain" => keychain::cmd_keychain(&args[2..], &install_root),
         "notify" => notify::cmd_notify(&args[2..], &install_root),
         "doctor" => doctor::cmd_doctor(&args[2..], &install_root),
+        "init" => init::cmd_init(&args[2..]),
         "help" | "-h" | "--help" => {
             print_usage();
             Ok(())
@@ -106,6 +108,8 @@ Commands:
   notify <title> <body> [--urgency low|normal|high]
                                    Post a notification (prints assigned id).
   doctor                           Run a health check across the install.
+  init <dir> [--name <id>] [--entry <path>]
+                                   Scaffold a new Insula app skeleton.
   help                    Show this help.
 
 Flags:
