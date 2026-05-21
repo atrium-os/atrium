@@ -2655,6 +2655,64 @@ fn emit_function(
         }
     }
 
+    // Drop unused prologue NOP slots.  When a callee-saved
+    // tier was not touched by the body, its 5 (int) or 4
+    // (FP) prologue slots are NOPs that nothing branches
+    // into and that hold no useful instructions.  The
+    // prologue sits at the function start, so dropping any
+    // contiguous prefix region shifts source + target of
+    // every PC-relative reference (branches, ldr-literal
+    // pool loads) uniformly, leaving the encoded relative
+    // delta unchanged.  Only requirement: fix up the pcmap
+    // entries (absolute byte offsets recorded during emit).
+    //
+    // Epilogue NOPs at each ret site are NOT dropped: they
+    // sit mid-function, and removing them would invalidate
+    // any PC-relative ref that bridged the dropped range
+    // (e.g. a ldr-q-literal pointing forward to the post-
+    // function literal pool).  Reclaiming those bytes would
+    // need a relocation pass that re-encodes every patch
+    // site -- queued as follow-up if it matters.
+    //
+    // Layout: int slots 0..5 (20 bytes), FP slots 5..9
+    // (16 bytes).  Drop FP slots first so the int-slot
+    // offset doesn't need shifting.
+    let drop_fp_prologue =
+        !used_callee_saved_v && PROLOGUE_FP_INSTS > 0;
+    let drop_int_prologue =
+        !int_pool.used_callee_saved && PROLOGUE_INT_INSTS > 0;
+    if drop_fp_prologue || drop_int_prologue {
+        let mut bytes = a.into_bytes();
+        let fp_range = (
+            prologue_off + PROLOGUE_INT_INSTS * 4,
+            prologue_off + (PROLOGUE_INT_INSTS + PROLOGUE_FP_INSTS) * 4,
+        );
+        let int_range = (
+            prologue_off,
+            prologue_off + PROLOGUE_INT_INSTS * 4,
+        );
+        // Drain higher range first so the lower range's
+        // coordinates stay valid.
+        if drop_fp_prologue {
+            bytes.drain(fp_range.0..fp_range.1);
+        }
+        if drop_int_prologue {
+            bytes.drain(int_range.0..int_range.1);
+        }
+        // Shift pcmap entries that point past the dropped
+        // region(s).  Body emission begins after the
+        // prologue, so every pcmap offset is >= the FP
+        // range's end.
+        let total_drop =
+            (if drop_fp_prologue { PROLOGUE_FP_INSTS } else { 0 }
+             + if drop_int_prologue { PROLOGUE_INT_INSTS } else { 0 })
+            * 4;
+        for (off, _) in pcmap_entries.iter_mut() {
+            *off -= total_drop as u32;
+        }
+        return Ok((bytes, pcmap_entries));
+    }
+
     Ok((a.into_bytes(), pcmap_entries))
 }
 
