@@ -2800,7 +2800,6 @@ fn differential_tonemap_without_clamp() {
 }
 
 #[test]
-#[ignore = "V-pool exhaustion -- codegen-synth lanes don't participate in last_use (broader RA issue, not specific to GLSL math)"]
 fn differential_tonemap_per_pixel_vec4() {
     let spv = build_tonemap_cs();
     let dir = TempDir::new().unwrap();

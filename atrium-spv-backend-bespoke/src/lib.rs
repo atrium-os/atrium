@@ -1083,6 +1083,46 @@ fn emit_function(
             owners.remove(&n);
             free_pool.push(n);
         }
+        // Vec-lane synth liveness:  Op::Load(vec4) and the
+        // per-lane FAdd/FSub/FMul/FDiv/FAbs/FSqrt/FMin/FMax/
+        // FRINT* emits all allocate per-lane V-regs under
+        // synthetic ValueIds that aren't in the IR-driven
+        // last_use map.  Without explicit reclamation they
+        // live forever -- a long vec chain (Load -> FAdd ->
+        // FDiv -> FSqrt -> FMax -> FMin -> Store) accumulates
+        // 6 * 4 = 24 V-regs, which exhausts the 24-slot pool.
+        //
+        // Tie synth-lane V-regs to their TOP Value's last_use.
+        // When the top expires, the lanes are unreachable
+        // (only `vectors[top]` could route to them, and that
+        // entry is removed here too).
+        //
+        // Safe now that OpVectorExtract copies via mov_v_16b
+        // / mov_w instead of aliasing the source lane's
+        // V-reg.  Without the copy, freeing a source vec's
+        // synth-lane V-reg here would invalidate any extract
+        // result that aliased the same V-reg (the matrix
+        // tests were the canary -- pre-copy, this expire
+        // corrupted MatrixTimesVector accumulators).
+        let dead_vecs: Vec<ValueId> = vectors.iter()
+            .filter_map(|(top, _)|
+                if last_use.get(top).copied().unwrap_or(usize::MAX) < i {
+                    Some(*top)
+                } else { None })
+            .collect();
+        for top in dead_vecs {
+            if let Some(lanes) = vectors.remove(&top) {
+                for lane in lanes {
+                    if let Some(&vreg) = scalars.get(&lane.id) {
+                        if owners.get(&vreg.0) == Some(&lane.id) {
+                            owners.remove(&vreg.0);
+                            free_pool.push(vreg.0);
+                            scalars.remove(&lane.id);
+                        }
+                    }
+                }
+            }
+        }
         // Same expiry pass for the integer W-reg pool.
         int_pool.expire(i, &last_use);
 
@@ -1442,13 +1482,30 @@ fn emit_function(
                 }
                 vectors.insert(result.id, out_lanes);
             }
-            // OpVectorExtract: alias lane `index`'s register
-            // Value into the scalar result. No instruction
-            // emitted — pure aliasing, like VectorShuffle.
-            // The lane's value lives in either the scalars
-            // map (f32 -> S-reg) or the ints map (i32/u32 ->
-            // W-reg); we look up by the lane's Type to know
-            // which map to mirror the entry into.
+            // OpVectorExtract: copy lane `index`'s register
+            // value into a FRESH register owned by `result.id`.
+            //
+            // Earlier this op aliased the lane's V-reg into
+            // the result's scalars/ints entry, which was
+            // ~free but had a structural problem: the source
+            // vec's synth-lane V-regs and the result's V-reg
+            // shared physical registers but different owner
+            // ValueIds.  Any V-pool expire driven by the
+            // source vec's last_use would free the V-reg
+            // while the extract result was still live --
+            // corrupting downstream reads.
+            //
+            // Fix: copy via `mov v.16b` (f32) or `mov w` (i32).
+            // Both forms are ORR-aliases that target cores
+            // rename-eliminate (zero-latency on Apple
+            // Firestorm/Avalanche, Cortex-A715, etc.) -- so
+            // the apparent +1 instruction is approximately
+            // free at runtime, but the result NOW owns a
+            // distinct V-reg and the source vec's lanes can
+            // expire independently.  This unblocks the
+            // vec-lane synth-liveness expire pass that
+            // closes the V-pool exhaustion seen on long vec
+            // chains (5+ ops sharing Load-synth lanes).
             Op::VectorExtract { vector, index } => {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal(
@@ -1461,9 +1518,14 @@ fn emit_function(
                         "VectorExtract index {index} out of range \
                          ({} lanes)", lanes.len())))?;
                 if let Some(s) = scalars.get(&lane.id).copied() {
-                    scalars.insert(result.id, s);
+                    let d = alloc_vreg(&mut free_pool, &mut owners,
+                        &mut used_callee_saved_v, result.id)?;
+                    a.emit(asm::mov_v_16b(d, s));
+                    scalars.insert(result.id, d);
                 } else if let Some(w) = ints.get(&lane.id).copied() {
-                    ints.insert(result.id, w);
+                    let d = int_pool.alloc(result.id)?;
+                    a.emit(asm::mov_w(d, w));
+                    ints.insert(result.id, d);
                 } else {
                     return Err(BackendError::Internal(format!(
                         "VectorExtract lane {:?} not in scalars or ints",
