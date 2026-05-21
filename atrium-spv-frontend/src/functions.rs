@@ -1893,6 +1893,78 @@ fn translate_inst(
                     };
                     Op::FSub(x, floor_x)
                 }
+                49 => {
+                    // SmoothStep(e0, e1, x):
+                    //   t = clamp((x - e0) / (e1 - e0), 0, 1)
+                    //   return t * t * (3 - 2*t)
+                    // Hermite interpolation -- branchless
+                    // ramp.  Heavily used for ramps/masks
+                    // in fragment shaders.
+                    let e0_id = expect_id(&spv_inst.operands, 2)?;
+                    let e1_id = expect_id(&spv_inst.operands, 3)?;
+                    let x_id  = expect_id(&spv_inst.operands, 4)?;
+                    let e0 = resolve_value(e0_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let e1 = resolve_value(e1_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let x  = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let push = |op: Op, ty: Type,
+                                insts: &mut Vec<Inst>,
+                                next_value_id: &mut u32| -> Value {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let v = Value { id, ty };
+                        insts.push(Inst { op, result: Some(v.clone()),
+                            source_spirv_offset });
+                        v
+                    };
+                    let scalar_ty = result_ty.clone();
+                    let x_minus_e0 = push(
+                        Op::FSub(x, e0.clone()), scalar_ty.clone(),
+                        insts, next_value_id);
+                    let e1_minus_e0 = push(
+                        Op::FSub(e1, e0), scalar_ty.clone(),
+                        insts, next_value_id);
+                    let t_raw = push(
+                        Op::FDiv(x_minus_e0, e1_minus_e0), scalar_ty.clone(),
+                        insts, next_value_id);
+                    // clamp(t_raw, 0, 1)
+                    let zero = push(
+                        Op::ConstFloat { value: 0.0,
+                            kind: atrium_spv_ir::FloatKind::F32 },
+                        scalar_ty.clone(), insts, next_value_id);
+                    let one = push(
+                        Op::ConstFloat { value: 1.0,
+                            kind: atrium_spv_ir::FloatKind::F32 },
+                        scalar_ty.clone(), insts, next_value_id);
+                    let t_lo = push(
+                        Op::FMax(t_raw, zero), scalar_ty.clone(),
+                        insts, next_value_id);
+                    let t = push(
+                        Op::FMin(t_lo, one.clone()), scalar_ty.clone(),
+                        insts, next_value_id);
+                    // 3 - 2*t
+                    let two = push(
+                        Op::ConstFloat { value: 2.0,
+                            kind: atrium_spv_ir::FloatKind::F32 },
+                        scalar_ty.clone(), insts, next_value_id);
+                    let three = push(
+                        Op::ConstFloat { value: 3.0,
+                            kind: atrium_spv_ir::FloatKind::F32 },
+                        scalar_ty.clone(), insts, next_value_id);
+                    let two_t = push(
+                        Op::FMul(two, t.clone()), scalar_ty.clone(),
+                        insts, next_value_id);
+                    let three_minus_2t = push(
+                        Op::FSub(three, two_t), scalar_ty.clone(),
+                        insts, next_value_id);
+                    let t_squared = push(
+                        Op::FMul(t.clone(), t), scalar_ty,
+                        insts, next_value_id);
+                    let _ = one;
+                    Op::FMul(t_squared, three_minus_2t)
+                }
                 48 => {
                     // Step(edge, x) ≡ x < edge ? 0.0 : 1.0
                     //              ≡ float(x >= edge).
