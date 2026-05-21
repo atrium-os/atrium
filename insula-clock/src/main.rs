@@ -21,10 +21,11 @@ use atrium::{
     atrium_exit, atrium_init, atrium_log,
     atrium_window_destroy, atrium_window_frame_begin,
     atrium_window_frame_end, atrium_window_frame_path,
-    atrium_window_frame_rect, atrium_window_open,
-    atrium_window_poll_event, AtriumWindowEvent,
+    atrium_window_frame_rect, atrium_window_frame_texture,
+    atrium_window_open, atrium_window_poll_event,
+    atrium_window_upload_texture, AtriumWindowEvent,
     ATRIUM_ERR_NO_FRESCO, ATRIUM_EV_WINDOW_CLOSE_REQUESTED,
-    ATRIUM_LOG_ERROR, ATRIUM_LOG_INFO,
+    ATRIUM_LOG_ERROR, ATRIUM_LOG_INFO, ATRIUM_TEX_FORMAT_RGBA8_SRGB,
 };
 use std::ffi::CString;
 use std::f32::consts::PI;
@@ -34,6 +35,32 @@ const W: f32 = 400.0;
 const H: f32 = 400.0;
 const CX: f32 = W * 0.5;
 const CY: f32 = H * 0.5;
+
+/// Slot we bind the procedural hub texture to. Stable
+/// across the app's lifetime — uploaded once at
+/// startup, referenced every frame.
+const HUB_TEXTURE_SLOT: u32 = 100;
+/// Hub texture dimensions (square, RGBA8).
+const HUB_DIM: u32 = 32;
+
+/// Generate a 32x32 RGBA8 checkerboard for the dial
+/// center. White cells alternate with a warm orange so
+/// the texture is visually distinct from any of the
+/// solid-color rect/path nodes around it.
+fn checkerboard(dim: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity((dim * dim * 4) as usize);
+    for y in 0..dim {
+        for x in 0..dim {
+            let cell = ((x / 4) + (y / 4)) & 1;
+            if cell == 0 {
+                out.extend_from_slice(&[0xff, 0xff, 0xff, 0xff]);
+            } else {
+                out.extend_from_slice(&[0xff, 0x88, 0x22, 0xff]);
+            }
+        }
+    }
+    out
+}
 
 fn log_info(msg: &str) {
     let c = CString::new(msg).unwrap();
@@ -103,6 +130,18 @@ fn paint_frame(window_id: u32, h: u32, m: u32, s: u32) -> i32 {
         0.95, 0.95, 0.95, 1.0,
     );
 
+    // Textured center hub — references the texture
+    // uploaded once at startup to HUB_TEXTURE_SLOT. The
+    // slot binding survives across all frames; we only
+    // emit the node reference here.
+    let hub_size = 28.0;
+    atrium_window_frame_texture(
+        node(),
+        HUB_TEXTURE_SLOT,
+        CX - hub_size * 0.5, CY - hub_size * 0.5,
+        hub_size, hub_size,
+    );
+
     atrium_window_frame_end()
 }
 
@@ -137,6 +176,24 @@ fn main() {
     }
     let window_id = id as u32;
     log_info(&format!("insula-clock: opened window id={}", window_id));
+
+    // One-shot texture upload for the dial hub.
+    let pixels = checkerboard(HUB_DIM);
+    let r = unsafe {
+        atrium_window_upload_texture(
+            window_id, HUB_TEXTURE_SLOT,
+            pixels.as_ptr(), pixels.len(),
+            HUB_DIM, HUB_DIM,
+            ATRIUM_TEX_FORMAT_RGBA8_SRGB,
+        )
+    };
+    if r != 0 {
+        log_error(&format!("insula-clock: upload_texture failed: {}", r));
+        // Keep going — frames will still paint without
+        // the hub; frame_texture will silently fail.
+    } else {
+        log_info("insula-clock: uploaded 32x32 checkerboard to hub slot");
+    }
 
     let deadline = Instant::now() + Duration::from_millis(max_ms);
     let mut frames: u64 = 0;
