@@ -21,7 +21,7 @@ mod daemons;
 mod signing;
 use daemons::Daemon;
 
-use insula_bundle::InsulaBundle;
+use insula_bundle::{archive, InsulaBundle};
 use insula_host_macos as host;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -46,6 +46,7 @@ fn main() -> ExitCode {
         "keygen" => signing::cmd_keygen(&args[2..]),
         "sign" => signing::cmd_sign(&args[2..]),
         "publishers" => signing::cmd_publishers(&args[2..], &install_root),
+        "bundle" => cmd_bundle(&args[2..]),
         "help" | "-h" | "--help" => {
             print_usage();
             Ok(())
@@ -86,6 +87,8 @@ Commands:
   publishers add <id> <pub-file>   Add a trusted publisher.
   publishers list                  Show trusted publishers.
   publishers remove <id>           Remove a trusted publisher.
+  bundle <src-dir> <out.insula>    Pack a bundle directory into a
+                                   single-file `.insula` archive.
   help                    Show this help.
 
 Flags:
@@ -118,24 +121,44 @@ fn resolve_install_root() -> PathBuf {
 // -----------------------------------------------------
 
 fn cmd_install(args: &[String], install_root: &Path) -> Result<(), String> {
-    // Parse: <bundle-dir> [--allow-unsigned]
-    let mut bundle_dir: Option<&str> = None;
+    // Parse: <bundle-dir-or-archive> [--allow-unsigned]
+    let mut src: Option<&str> = None;
     let mut allow_unsigned = false;
     for a in args {
         match a.as_str() {
             "--allow-unsigned" => allow_unsigned = true,
-            other if !other.starts_with("--") => bundle_dir = Some(other),
+            other if !other.starts_with("--") => src = Some(other),
             other => {
                 return Err(format!("install: unknown flag '{}'", other));
             }
         }
     }
-    let bundle_dir = bundle_dir.ok_or_else(|| {
-        "install: missing <bundle-dir> argument".to_string()
+    let src = src.ok_or_else(|| {
+        "install: missing <bundle-dir|archive> argument".to_string()
     })?;
 
-    let bundle = InsulaBundle::read(bundle_dir)
-        .map_err(|e| format!("reading bundle at {}: {}", bundle_dir, e))?;
+    // If the path looks like a .insula archive, extract
+    // to a temp directory and install from there. The
+    // _extract_guard's Drop removes the tempdir once
+    // install completes (host::install copies the
+    // bundle into the install root, so the tempdir's
+    // lifetime only needs to cover this function).
+    let _extract_guard: Option<TempDir>;
+    let bundle_dir_path: PathBuf = if archive::path_looks_like_archive(Path::new(src)) {
+        let tmp = TempDir::new("insula-extract")
+            .map_err(|e| format!("create temp dir: {}", e))?;
+        archive::unpack_into(src, tmp.path())
+            .map_err(|e| format!("unpacking archive {}: {}", src, e))?;
+        let p = tmp.path().to_path_buf();
+        _extract_guard = Some(tmp);
+        p
+    } else {
+        _extract_guard = None;
+        PathBuf::from(src)
+    };
+
+    let bundle = InsulaBundle::read(&bundle_dir_path)
+        .map_err(|e| format!("reading bundle at {}: {}", bundle_dir_path.display(), e))?;
 
     std::fs::create_dir_all(install_root)
         .map_err(|e| format!("create install root {}: {}", install_root.display(), e))?;
@@ -433,4 +456,80 @@ fn cmd_uninstall(args: &[String], install_root: &Path) -> Result<(), String> {
 
     println!("Uninstalled {}", app_id);
     Ok(())
+}
+
+// -----------------------------------------------------
+// bundle (pack a directory into a .insula archive)
+// -----------------------------------------------------
+
+fn cmd_bundle(args: &[String]) -> Result<(), String> {
+    let src = args.first().ok_or_else(|| {
+        "bundle: missing <src-dir> argument".to_string()
+    })?;
+    let out = args.get(1).ok_or_else(|| {
+        "bundle: missing <out.insula> argument".to_string()
+    })?;
+
+    // Validate the directory is actually a bundle
+    // before packing — fail fast on bad inputs.
+    let bundle = InsulaBundle::read(src)
+        .map_err(|e| format!("source {} is not a valid bundle: {}", src, e))?;
+
+    archive::pack_dir(src, out)
+        .map_err(|e| format!("packing {} -> {}: {}", src, out, e))?;
+
+    println!("packed {} -> {}", bundle.app_id(), out);
+    println!("  manifest:  {}/manifest.toml", src);
+    println!("  entry:     {}", bundle.binary_path().display());
+    if Path::new(src).join("signature").exists() {
+        println!("  signature: included");
+    } else {
+        println!("  signature: (none — sign first with `insula sign`)");
+    }
+    Ok(())
+}
+
+// -----------------------------------------------------
+// Tiny self-contained TempDir.
+//
+// We avoid promoting the `tempfile` crate from dev-dep
+// to runtime-dep just to extract a `.insula` archive
+// during install. The Drop best-effort-removes the
+// directory; failures there are not fatal (cleanup is
+// a hygiene concern, not a correctness one).
+// -----------------------------------------------------
+
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new(prefix: &str) -> std::io::Result<Self> {
+        use rand::RngCore;
+        let mut rng = rand::thread_rng();
+        for _ in 0..16 {
+            let suffix: u64 = rng.next_u64();
+            let candidate = std::env::temp_dir()
+                .join(format!("{}-{:016x}", prefix, suffix));
+            match std::fs::create_dir(&candidate) {
+                Ok(()) => return Ok(TempDir { path: candidate }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not find a free temp directory",
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
 }

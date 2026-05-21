@@ -26,6 +26,7 @@ use insula_manifest::Manifest;
 use std::path::{Path, PathBuf};
 
 mod error;
+pub mod archive;
 pub mod signing;
 
 pub use error::Error;
