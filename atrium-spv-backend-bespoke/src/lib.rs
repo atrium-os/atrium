@@ -1699,10 +1699,38 @@ fn emit_function(
                     };
                     a.emit(enc);
                     scalars.insert(result.id, v_dst);
+                } else if let Some(lanes) = vectors.get(&x.id).cloned() {
+                    // Per-lane vec path (loaded vec4 not in
+                    // the packed clique): synthesise lane
+                    // result Values, emit one scalar inst
+                    // per lane.
+                    let mut out_lanes = Vec::with_capacity(lanes.len());
+                    for lane in &lanes {
+                        let src = *scalars.get(&lane.id).ok_or_else(||
+                            BackendError::Internal(format!(
+                                "F-unary lane source {:?} not in scalars",
+                                lane.id)))?;
+                        let synth = ValueId(next_synth_id);
+                        next_synth_id += 1;
+                        let v_dst = alloc_vreg(
+                            &mut free_pool, &mut owners,
+                            &mut used_callee_saved_v, synth)?;
+                        let enc = match &inst.op {
+                            Op::FAbs(_)  => asm::fabs_s(v_dst, src),
+                            Op::FSqrt(_) => asm::fsqrt_s(v_dst, src),
+                            _ => unreachable!(),
+                        };
+                        a.emit(enc);
+                        scalars.insert(synth, v_dst);
+                        out_lanes.push(Value {
+                            id: synth, ty: lane.ty.clone(),
+                        });
+                    }
+                    vectors.insert(result.id, out_lanes);
                 } else {
                     return Err(BackendError::Unsupported(format!(
-                        "F-unary on unpacked vector result type {:?}",
-                        result.ty)));
+                        "F-unary on {:?} -- value not in scalars, packed, \
+                         or vectors map", result.ty)));
                 }
             }
             Op::FMin(a_v, b_v) => emit_fp_binop_poly(

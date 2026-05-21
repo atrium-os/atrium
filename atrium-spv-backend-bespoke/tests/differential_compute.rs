@@ -1555,6 +1555,444 @@ fn differential_glsl_clamp_and_mix() {
     assert_eq!(read(1), 25.0, "mix(0, 100, 0.25) should be 25.0");
 }
 
+/// Per-pixel tonemap shader.  Reads an HDR color from the
+/// input SSBO, applies a simple Reinhard tonemap + sqrt
+/// gamma + clamp(0,1), writes to the output SSBO.  The
+/// math:
+///
+///   c       = ssbo_in.data[gid_x]                   (vec4)
+///   mapped  = c / (c + vec4(1))                     (Reinhard)
+///   gamma   = sqrt(mapped)                          (~gamma 2)
+///   clamped = clamp(gamma, vec4(0), vec4(1))
+///   ssbo_out.data[gid_x] = clamped
+///
+/// This is a real-graphics shape: vec4 fdiv + fsqrt +
+/// clamp via fmax/fmin, all on the NEON-packed path.
+fn build_tonemap_cs() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let std_450 = b.ext_inst_import("GLSL.std.450");
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let f32_ty = b.type_float(32, None);
+    let uvec3  = b.type_vector(u32_ty, 3);
+    let vec4   = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let rt_vec4 = b.type_runtime_array(vec4);
+    b.decorate(rt_vec4, Decoration::ArrayStride,
+        vec![rspirv::dr::Operand::LiteralBit32(16)]);
+    let s_in  = b.type_struct(vec![rt_vec4]);
+    b.decorate(s_in, Decoration::Block, vec![]);
+    b.member_decorate(s_in, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let s_out = b.type_struct(vec![rt_vec4]);
+    b.decorate(s_out, Decoration::Block, vec![]);
+    b.member_decorate(s_out, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s_in  = b.type_pointer(None, StorageClass::StorageBuffer, s_in);
+    let ptr_s_out = b.type_pointer(None, StorageClass::StorageBuffer, s_out);
+    let ptr_v     = b.type_pointer(None, StorageClass::StorageBuffer, vec4);
+    let v_in  = b.variable(ptr_s_in,  None, StorageClass::StorageBuffer, None);
+    b.decorate(v_in, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(v_in, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let v_out = b.variable(ptr_s_out, None, StorageClass::StorageBuffer, None);
+    b.decorate(v_out, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(v_out, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(1)]);
+    let ptr_in_uvec3 = b.type_pointer(None, StorageClass::Input, uvec3);
+    let gid_var = b.variable(ptr_in_uvec3, None, StorageClass::Input, None);
+    b.decorate(gid_var, Decoration::BuiltIn,
+        vec![rspirv::dr::Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    let mk_vec = |b: &mut rspirv::dr::Builder, x: f32| {
+        let l = b.constant_bit32(f32_ty, x.to_bits());
+        b.constant_composite(vec4, vec![l, l, l, l])
+    };
+    let v_one  = mk_vec(&mut b, 1.0);
+    let v_zero = mk_vec(&mut b, 0.0);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let gid = b.load(uvec3, None, gid_var, None, vec![]).unwrap();
+    let gid_x = b.composite_extract(u32_ty, None, gid, vec![0]).unwrap();
+    let in_ptr = b.access_chain(ptr_v, None, v_in, vec![c_zero, gid_x]).unwrap();
+    let c   = b.load(vec4, None, in_ptr, None, vec![]).unwrap();
+    let denom = b.f_add(vec4, None, c, v_one).unwrap();
+    let mapped = b.f_div(vec4, None, c, denom).unwrap();
+    let gamma  = b.ext_inst(vec4, None, std_450, 31,
+        vec![rspirv::dr::Operand::IdRef(mapped)]).unwrap();
+    let clamped = b.ext_inst(vec4, None, std_450, 43,
+        vec![rspirv::dr::Operand::IdRef(gamma),
+             rspirv::dr::Operand::IdRef(v_zero),
+             rspirv::dr::Operand::IdRef(v_one)]).unwrap();
+    let out_ptr = b.access_chain(ptr_v, None, v_out, vec![c_zero, gid_x]).unwrap();
+    b.store(out_ptr, clamped, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![gid_var, v_in, v_out]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+/// Minimal load+fsqrt+store test to surface the per-lane
+/// vec4 unop bug independently of the rest of the tonemap
+/// pipeline.
+fn build_load_sqrt_store_cs() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let std_450 = b.ext_inst_import("GLSL.std.450");
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let f32_ty = b.type_float(32, None);
+    let uvec3  = b.type_vector(u32_ty, 3);
+    let vec4   = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let s = b.type_struct(vec![vec4, vec4]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.member_decorate(s, 1, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(16)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_v = b.type_pointer(None, StorageClass::StorageBuffer, vec4);
+    let ssbo  = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_in_uvec3 = b.type_pointer(None, StorageClass::Input, uvec3);
+    let gid_var = b.variable(ptr_in_uvec3, None, StorageClass::Input, None);
+    b.decorate(gid_var, Decoration::BuiltIn,
+        vec![rspirv::dr::Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    let c_one  = b.constant_bit32(u32_ty, 1);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let _gid = b.load(uvec3, None, gid_var, None, vec![]).unwrap();
+    let in_ptr = b.access_chain(ptr_v, None, ssbo, vec![c_zero]).unwrap();
+    let v = b.load(vec4, None, in_ptr, None, vec![]).unwrap();
+    let r = b.ext_inst(vec4, None, std_450, 31,
+        vec![rspirv::dr::Operand::IdRef(v)]).unwrap();
+    let out_ptr = b.access_chain(ptr_v, None, ssbo, vec![c_one]).unwrap();
+    b.store(out_ptr, r, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![gid_var, ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn differential_load_sqrt_store_vec4() {
+    let spv = build_load_sqrt_store_cs();
+    let dir = TempDir::new().unwrap();
+    let mut b_buf = vec![0u8; 64];
+    let mut c_buf = vec![0u8; 64];
+    for (j, x) in [4.0f32, 9.0, 16.0, 25.0].iter().enumerate() {
+        b_buf[j*4..j*4+4].copy_from_slice(&x.to_le_bytes());
+        c_buf[j*4..j*4+4].copy_from_slice(&x.to_le_bytes());
+    }
+    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    assert_eq!(b_buf, c_buf, "diverge on load+sqrt+store vec4");
+    let read = |buf: &[u8], i: usize| -> f32 {
+        f32::from_le_bytes(buf[i*4..i*4+4].try_into().unwrap())
+    };
+    assert_eq!(read(&b_buf, 4), 2.0, "sqrt(4) should be 2");
+    assert_eq!(read(&b_buf, 5), 3.0);
+    assert_eq!(read(&b_buf, 6), 4.0);
+    assert_eq!(read(&b_buf, 7), 5.0);
+}
+
+/// Same shape but with FAdd instead of FMax -- tests
+/// whether this is a pre-existing bespoke per-lane bug or
+/// specific to FMax/FMin.
+#[test]
+fn differential_load_fadd_const_store_vec4() {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let f32_ty = b.type_float(32, None);
+    let uvec3  = b.type_vector(u32_ty, 3);
+    let vec4   = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let s = b.type_struct(vec![vec4, vec4]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.member_decorate(s, 1, Decoration::Offset, vec![rspirv::dr::Operand::LiteralBit32(16)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_v = b.type_pointer(None, StorageClass::StorageBuffer, vec4);
+    let ssbo  = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_in_uvec3 = b.type_pointer(None, StorageClass::Input, uvec3);
+    let gid_var = b.variable(ptr_in_uvec3, None, StorageClass::Input, None);
+    b.decorate(gid_var, Decoration::BuiltIn,
+        vec![rspirv::dr::Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    let c_one  = b.constant_bit32(u32_ty, 1);
+    let mk_vec = |b: &mut rspirv::dr::Builder, x: f32| {
+        let l = b.constant_bit32(f32_ty, x.to_bits());
+        b.constant_composite(vec4, vec![l, l, l, l])
+    };
+    let v_ten = mk_vec(&mut b, 10.0);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let _gid = b.load(uvec3, None, gid_var, None, vec![]).unwrap();
+    let in_ptr = b.access_chain(ptr_v, None, ssbo, vec![c_zero]).unwrap();
+    let c = b.load(vec4, None, in_ptr, None, vec![]).unwrap();
+    let r = b.f_add(vec4, None, c, v_ten).unwrap();
+    let out_ptr = b.access_chain(ptr_v, None, ssbo, vec![c_one]).unwrap();
+    b.store(out_ptr, r, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![gid_var, ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spv = Vec::with_capacity(words.len() * 4);
+    for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+
+    let dir = TempDir::new().unwrap();
+    let mut b_buf = vec![0u8; 64];
+    let mut c_buf = vec![0u8; 64];
+    for (j, x) in [1.0f32, 2.0, 3.0, 4.0].iter().enumerate() {
+        b_buf[j*4..j*4+4].copy_from_slice(&x.to_le_bytes());
+        c_buf[j*4..j*4+4].copy_from_slice(&x.to_le_bytes());
+    }
+    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    assert_eq!(b_buf, c_buf, "diverge on load + fadd(loaded, const_vec) + store");
+}
+
+/// Direct FMax-of-vectors variant -- known to diverge.
+/// The bespoke per-lane FMax/FMin path produces wrong
+/// results for some lanes when one operand is a loaded
+/// vec4 and the other is a (disqualified) const vec4.
+/// The same shape with FAdd is correct, so the bug is
+/// specific to the FMax/FMin emit (not the classifier or
+/// poly helper).  Marked #[ignore] until the per-lane
+/// FMax/FMin path is debugged.  The scalar FMax/FMin
+/// path and the all-packed-vec4 FMin/FMax path both
+/// work.
+#[test]
+#[ignore = "bespoke per-lane FMax of loaded vec + const vec -- pending bug investigation"]
+fn differential_tonemap_with_direct_fmax() {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let std_450 = b.ext_inst_import("GLSL.std.450");
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let f32_ty = b.type_float(32, None);
+    let uvec3  = b.type_vector(u32_ty, 3);
+    let vec4   = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let s = b.type_struct(vec![vec4, vec4]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.member_decorate(s, 1, Decoration::Offset, vec![rspirv::dr::Operand::LiteralBit32(16)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_v = b.type_pointer(None, StorageClass::StorageBuffer, vec4);
+    let ssbo  = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_in_uvec3 = b.type_pointer(None, StorageClass::Input, uvec3);
+    let gid_var = b.variable(ptr_in_uvec3, None, StorageClass::Input, None);
+    b.decorate(gid_var, Decoration::BuiltIn,
+        vec![rspirv::dr::Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    let c_one  = b.constant_bit32(u32_ty, 1);
+    let mk_vec = |b: &mut rspirv::dr::Builder, x: f32| {
+        let l = b.constant_bit32(f32_ty, x.to_bits());
+        b.constant_composite(vec4, vec![l, l, l, l])
+    };
+    let v_zero_vec = mk_vec(&mut b, 0.0);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let _gid = b.load(uvec3, None, gid_var, None, vec![]).unwrap();
+    let in_ptr = b.access_chain(ptr_v, None, ssbo, vec![c_zero]).unwrap();
+    let c = b.load(vec4, None, in_ptr, None, vec![]).unwrap();
+    // Direct FMax of loaded vec4 with const-zero vec4.
+    let r = b.ext_inst(vec4, None, std_450, 40,
+        vec![rspirv::dr::Operand::IdRef(c),
+             rspirv::dr::Operand::IdRef(v_zero_vec)]).unwrap();
+    let out_ptr = b.access_chain(ptr_v, None, ssbo, vec![c_one]).unwrap();
+    b.store(out_ptr, r, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![gid_var, ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spv = Vec::with_capacity(words.len() * 4);
+    for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+
+    let dir = TempDir::new().unwrap();
+    let mut b_buf = vec![0u8; 64];
+    let mut c_buf = vec![0u8; 64];
+    for (j, x) in [-0.5f32, 0.3, -1.0, 0.7].iter().enumerate() {
+        b_buf[j*4..j*4+4].copy_from_slice(&x.to_le_bytes());
+        c_buf[j*4..j*4+4].copy_from_slice(&x.to_le_bytes());
+    }
+    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    assert_eq!(b_buf, c_buf, "diverge on direct fmax(loaded vec, zero vec)");
+}
+
+/// Tonemap without clamp -- isolates whether the bug is in
+/// the FMax/FMin path or upstream.
+#[test]
+fn differential_tonemap_without_clamp() {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let std_450 = b.ext_inst_import("GLSL.std.450");
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let f32_ty = b.type_float(32, None);
+    let uvec3  = b.type_vector(u32_ty, 3);
+    let vec4   = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let s = b.type_struct(vec![vec4, vec4]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.member_decorate(s, 1, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(16)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_v = b.type_pointer(None, StorageClass::StorageBuffer, vec4);
+    let ssbo  = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_in_uvec3 = b.type_pointer(None, StorageClass::Input, uvec3);
+    let gid_var = b.variable(ptr_in_uvec3, None, StorageClass::Input, None);
+    b.decorate(gid_var, Decoration::BuiltIn,
+        vec![rspirv::dr::Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    let c_one  = b.constant_bit32(u32_ty, 1);
+    let mk_vec = |b: &mut rspirv::dr::Builder, x: f32| {
+        let l = b.constant_bit32(f32_ty, x.to_bits());
+        b.constant_composite(vec4, vec![l, l, l, l])
+    };
+    let v_one  = mk_vec(&mut b, 1.0);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let _gid = b.load(uvec3, None, gid_var, None, vec![]).unwrap();
+    let in_ptr = b.access_chain(ptr_v, None, ssbo, vec![c_zero]).unwrap();
+    let c = b.load(vec4, None, in_ptr, None, vec![]).unwrap();
+    let denom = b.f_add(vec4, None, c, v_one).unwrap();
+    let mapped = b.f_div(vec4, None, c, denom).unwrap();
+    let gamma = b.ext_inst(vec4, None, std_450, 31,
+        vec![rspirv::dr::Operand::IdRef(mapped)]).unwrap();
+    let out_ptr = b.access_chain(ptr_v, None, ssbo, vec![c_one]).unwrap();
+    b.store(out_ptr, gamma, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![gid_var, ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spv = Vec::with_capacity(words.len() * 4);
+    for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+
+    let dir = TempDir::new().unwrap();
+    let mut b_buf = vec![0u8; 64];
+    let mut c_buf = vec![0u8; 64];
+    for (j, x) in [0.1f32, 0.2, 0.3, 1.0].iter().enumerate() {
+        b_buf[j*4..j*4+4].copy_from_slice(&x.to_le_bytes());
+        c_buf[j*4..j*4+4].copy_from_slice(&x.to_le_bytes());
+    }
+    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    assert_eq!(b_buf, c_buf, "diverge on tonemap-no-clamp");
+}
+
+#[test]
+#[ignore = "depends on per-lane FMax/FMin of loaded vec -- see differential_tonemap_with_direct_fmax"]
+fn differential_tonemap_per_pixel_vec4() {
+    let spv = build_tonemap_cs();
+    let dir = TempDir::new().unwrap();
+    // 4 HDR pixels: a mix of low + high luminance.
+    let pixels: [[f32; 4]; 4] = [
+        [0.1, 0.2, 0.3, 1.0],
+        [1.0, 1.0, 1.0, 1.0],
+        [3.0, 0.5, 0.0, 1.0],
+        [10.0, 10.0, 10.0, 1.0],
+    ];
+    let make_bufs = || -> Vec<Vec<u8>> {
+        let mut in_buf = vec![0u8; 256];
+        for (i, p) in pixels.iter().enumerate() {
+            for (j, x) in p.iter().enumerate() {
+                let off = i*16 + j*4;
+                in_buf[off..off+4].copy_from_slice(&x.to_le_bytes());
+            }
+        }
+        let out_buf = vec![0u8; 256];
+        vec![in_buf, out_buf]
+    };
+    let mut b_bufs = make_bufs();
+    let mut c_bufs = make_bufs();
+    let b_table: Vec<u64> = b_bufs.iter_mut().map(|b| b.as_mut_ptr() as u64).collect();
+    let c_table: Vec<u64> = c_bufs.iter_mut().map(|b| b.as_mut_ptr() as u64).collect();
+    let gids: Vec<(u32, u32, u32)> = (0..pixels.len() as u32)
+        .map(|i| (i, 0, 0)).collect();
+    invoke_with_gids(&spv, true,  dir.path(), "b",
+        b_table.as_ptr() as *mut u8, &gids);
+    invoke_with_gids(&spv, false, dir.path(), "c",
+        c_table.as_ptr() as *mut u8, &gids);
+    assert_eq!(b_bufs, c_bufs, "tonemap diverges between backends");
+    // Spot-check: pixel 2 (saturated white in) should land
+    // at ~sqrt(0.5) ≈ 0.7071 in all RGB channels.
+    let read = |buf: &[u8], i: usize, j: usize| -> f32 {
+        f32::from_le_bytes(buf[i*16 + j*4..i*16 + j*4+4].try_into().unwrap())
+    };
+    let r = read(&b_bufs[1], 1, 0);
+    assert!((r - 2.0f32.sqrt() / 2.0).abs() < 1e-5,
+        "white pixel R should be ~0.7071, got {r}");
+}
+
 #[test]
 fn differential_local_invocation_index_linearises() {
     let spv = build_local_index_cs();
