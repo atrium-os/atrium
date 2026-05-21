@@ -63,6 +63,12 @@ pub struct InterfaceContext {
     /// memory load, since descriptor-bound resources aren't
     /// loadable byte regions.
     pub var_binding: HashMap<Word, (u32, u32)>,
+    /// SPIR-V variable id → recognised stage built-in.  Set
+    /// from `OpDecorate <var> BuiltIn <kind>`; consumed by
+    /// function translation to lower an `OpLoad` through one
+    /// of these variables into `Op::LoadBuiltin(kind)` rather
+    /// than going through memory.
+    pub builtin_vars: HashMap<Word, atrium_spv_ir::BuiltinKind>,
 }
 
 /// One member of an `OpTypeStruct` annotated with an
@@ -211,6 +217,28 @@ impl InterfaceContext {
                         d.location = Some(*v);
                     }
                 }
+                Decoration::BuiltIn => {
+                    if let Some(Operand::BuiltIn(b)) = inst.operands.get(2) {
+                        use rspirv::spirv::BuiltIn as SpvBuiltIn;
+                        let mapped = match b {
+                            SpvBuiltIn::WorkgroupId =>
+                                Some(atrium_spv_ir::BuiltinKind::WorkgroupId),
+                            SpvBuiltIn::LocalInvocationId =>
+                                Some(atrium_spv_ir::BuiltinKind::LocalInvocationId),
+                            SpvBuiltIn::GlobalInvocationId =>
+                                Some(atrium_spv_ir::BuiltinKind::GlobalInvocationId),
+                            SpvBuiltIn::VertexIndex =>
+                                Some(atrium_spv_ir::BuiltinKind::VertexIndex),
+                            SpvBuiltIn::InstanceIndex =>
+                                Some(atrium_spv_ir::BuiltinKind::InstanceIndex),
+                            // Other builtins (Position, FragCoord, etc.)
+                            // already flow through the existing
+                            // varying / output paths; skip.
+                            _ => None,
+                        };
+                        if let Some(kind) = mapped { d.builtin = Some(kind); }
+                    }
+                }
                 _ => {}
             }
         }
@@ -224,6 +252,15 @@ impl InterfaceContext {
         for (var_id, (storage, pointee_id)) in &ctx.variables {
             let deco = decorations.get(var_id);
             let pointee_ty = types.get(*pointee_id).ok().cloned();
+            // BuiltIn variables short-circuit: they're handled
+            // by `Op::LoadBuiltin` at function translation, no
+            // memory-binding interface entry needed.
+            if let Some(d) = deco {
+                if let Some(kind) = d.builtin {
+                    ctx.builtin_vars.insert(*var_id, kind);
+                    continue;
+                }
+            }
             match storage {
                 SpvStorageClass::Uniform | SpvStorageClass::UniformConstant => {
                     if let Some(d) = deco {
@@ -296,6 +333,11 @@ struct VarDecorations {
     descriptor_set: Option<u32>,
     binding: Option<u32>,
     location: Option<u32>,
+    /// `Decoration::BuiltIn <kind>`; only the kinds in
+    /// `atrium_spv_ir::BuiltinKind` are recognised, the rest
+    /// stay `None` and the variable falls through to the
+    /// regular Input/Output path.
+    builtin: Option<atrium_spv_ir::BuiltinKind>,
 }
 
 fn read_execution_model(operands: &[Operand], i: usize) -> Result<ExecutionModel, FrontendError> {

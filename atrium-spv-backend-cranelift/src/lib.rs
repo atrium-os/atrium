@@ -745,6 +745,67 @@ impl FnTranslator {
                 self.pointers.insert(result.id, (param, new_off));
                 Ok(())
             }
+            // Op::LoadBuiltin: pull a stage built-in value
+            // (WorkgroupId, LocalInvocationId, GlobalInvocationId,
+            // VertexIndex, InstanceIndex) from the appropriate
+            // stage-ABI parameter slot rather than from memory.
+            // Param layout per build_signature:
+            //   Vertex   params: in_attributes, in_attr_strides,
+            //                    uniforms, push_constants,
+            //                    vertex_index, instance_index, ...
+            //   Compute  params: uniforms, push_constants, out_buffer,
+            //                    workgroup_id[0..2], local_id[0..2]
+            Op::LoadBuiltin(kind) => {
+                use atrium_spv_ir::BuiltinKind as BK;
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "LoadBuiltin without result Value".to_string()))?;
+                match (self.stage, kind) {
+                    (ShaderStage::Compute, BK::WorkgroupId) => {
+                        // Vec3<uint> from params[3..6].
+                        self.vectors.insert(result.id, vec![
+                            self.params[3], self.params[4], self.params[5],
+                        ]);
+                    }
+                    (ShaderStage::Compute, BK::LocalInvocationId) => {
+                        // Vec3<uint> from params[6..9].
+                        self.vectors.insert(result.id, vec![
+                            self.params[6], self.params[7], self.params[8],
+                        ]);
+                    }
+                    (ShaderStage::Compute, BK::GlobalInvocationId) => {
+                        // gl_GlobalInvocationID = gl_WorkgroupID *
+                        // gl_WorkGroupSize + gl_LocalInvocationID.
+                        // We don't carry WorkGroupSize in the
+                        // current Compute ABI (it's a SPIR-V
+                        // ExecutionMode literal, not a runtime
+                        // param). For now compose without it,
+                        // i.e. treat WorkGroupSize as (1,1,1);
+                        // shaders that rely on a non-unit
+                        // WorkGroupSize need this to be threaded
+                        // through later.
+                        let lanes = (0..3).map(|i| {
+                            builder.ins().iadd(
+                                self.params[3 + i], self.params[6 + i])
+                        }).collect();
+                        self.vectors.insert(result.id, lanes);
+                    }
+                    (ShaderStage::Vertex, BK::VertexIndex) => {
+                        // Scalar uint from params[4].
+                        self.scalars.insert(result.id, self.params[4]);
+                    }
+                    (ShaderStage::Vertex, BK::InstanceIndex) => {
+                        // Scalar uint from params[5].
+                        self.scalars.insert(result.id, self.params[5]);
+                    }
+                    (stage, kind) => {
+                        return Err(BackendError::Unsupported(format!(
+                            "LoadBuiltin({kind:?}) not supported for stage {stage:?}",
+                        )));
+                    }
+                }
+                Ok(())
+            }
             // OpLoad: read a leaf value through a pointer.
             // The result type is the Pointer's pointee
             // recorded on the result Value.

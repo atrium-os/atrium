@@ -997,6 +997,21 @@ fn translate_inst(
                 return Ok(());
             }
 
+            // Built-in variable load: short-circuit to
+            // `Op::LoadBuiltin`.  Backends produce the result
+            // from stage-ABI parameters rather than a memory
+            // load.
+            if let Some(kind) = iface.builtin_vars.get(&ptr_id).copied() {
+                let result = alloc_or_get_result(
+                    result_id, result_ty, id_map, next_value_id);
+                insts.push(Inst {
+                    op: Op::LoadBuiltin(kind),
+                    result: Some(result),
+                    source_spirv_offset,
+                });
+                return Ok(());
+            }
+
             // Try variable first; fall back to id_map (set
             // by a prior AccessChain).
             let ptr_value = match resolve_variable(

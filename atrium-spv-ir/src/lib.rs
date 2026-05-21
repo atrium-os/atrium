@@ -440,6 +440,13 @@ pub enum Op {
 
     /// Load a value through a pointer.
     Load(Value),
+    /// Load the value of a stage built-in (e.g.
+    /// `gl_LocalInvocationID`).  The frontend recognises an
+    /// OpLoad whose source variable has a `BuiltIn`
+    /// decoration and emits this op instead of `Op::Load`;
+    /// the backend produces the value from the appropriate
+    /// stage-ABI parameters rather than from memory.
+    LoadBuiltin(BuiltinKind),
     /// Store a value through a pointer.
     Store {
         /// Pointer to store into.
@@ -804,6 +811,34 @@ pub enum ShaderStage {
     Fragment,
     /// Compute stage (per-workgroup-invocation).
     Compute,
+}
+
+/// SPIR-V stage built-ins recognised by atrium-spv-ir.
+///
+/// The frontend identifies these by their `Decoration::BuiltIn`
+/// annotation on a SPIR-V `OpVariable`; uses of such variables
+/// lower to `Op::LoadBuiltin(kind)` instead of going through
+/// memory.  Each backend maps a builtin onto whichever stage-
+/// ABI parameter carries that value (e.g. WorkgroupId on
+/// Compute → params[3..6]).
+///
+/// Vector-typed builtins (WorkgroupId, LocalInvocationId,
+/// GlobalInvocationId) load as a 3-lane `uint` vector;
+/// scalar builtins (VertexIndex, InstanceIndex) load as a
+/// single `uint`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltinKind {
+    /// `gl_WorkgroupID` (Compute only).  uvec3.
+    WorkgroupId,
+    /// `gl_LocalInvocationID` (Compute only).  uvec3.
+    LocalInvocationId,
+    /// `gl_GlobalInvocationID` (Compute only).  uvec3.
+    /// Equal to `WorkgroupId * gl_WorkGroupSize + LocalInvocationID`.
+    GlobalInvocationId,
+    /// `gl_VertexIndex` (Vertex only).  uint.
+    VertexIndex,
+    /// `gl_InstanceIndex` (Vertex only).  uint.
+    InstanceIndex,
 }
 
 // ── Module ──────────────────────────────────────────────────────
