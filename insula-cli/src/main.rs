@@ -57,6 +57,7 @@ fn main() -> ExitCode {
         "notify" => notify::cmd_notify(&args[2..], &install_root),
         "doctor" => doctor::cmd_doctor(&args[2..], &install_root),
         "init" => init::cmd_init(&args[2..]),
+        "run" => cmd_run(&args[2..], &install_root),
         "help" | "-h" | "--help" => {
             print_usage();
             Ok(())
@@ -113,6 +114,10 @@ Commands:
   doctor                           Run a health check across the install.
   init <dir> [--name <id>] [--entry <path>]
                                    Scaffold a new Insula app skeleton.
+  run <bundle|insula> [app-args...]
+                                   Install + launch in one shot (dev
+                                   iteration). Passes --allow-unsigned
+                                   and --accept-changes through.
   help                    Show this help.
 
 Flags:
@@ -708,6 +713,65 @@ fn cmd_bundle(args: &[String]) -> Result<(), String> {
         println!("  signature: (none — sign first with `insula sign`)");
     }
     Ok(())
+}
+
+// -----------------------------------------------------
+// run (install + launch in one shot, dev iteration)
+// -----------------------------------------------------
+
+fn cmd_run(args: &[String], install_root: &Path) -> Result<(), String> {
+    // First positional = bundle path / archive; rest =
+    // app args. No --flags accepted at run's level —
+    // it's a dev convenience that always uses
+    // --allow-unsigned + --accept-changes under the
+    // hood.
+    let bundle_arg = args.first().ok_or_else(|| {
+        "run: missing <bundle|archive> argument".to_string()
+    })?;
+    let app_args: Vec<String> = args[1..].to_vec();
+
+    // Read the manifest to learn the app-id we'll
+    // launch under. Need this *before* install
+    // because the install path consumes the bundle.
+    // Handle both bundle dir + archive: extract once
+    // here, then point install at the same staging
+    // location so we don't unpack twice.
+    let _extract_guard: Option<TempDir>;
+    let staged: PathBuf = if archive::path_looks_like_archive(Path::new(bundle_arg)) {
+        let tmp = TempDir::new("insula-run").map_err(|e| {
+            format!("create temp dir: {}", e)
+        })?;
+        archive::unpack_into(bundle_arg, tmp.path())
+            .map_err(|e| format!("unpack archive {}: {}", bundle_arg, e))?;
+        let p = tmp.path().to_path_buf();
+        _extract_guard = Some(tmp);
+        p
+    } else {
+        _extract_guard = None;
+        PathBuf::from(bundle_arg)
+    };
+
+    let bundle = InsulaBundle::read(&staged)
+        .map_err(|e| format!("read bundle at {}: {}", staged.display(), e))?;
+    let app_id = bundle.app_id().to_string();
+
+    // Install with both dev-flags on. Re-build the
+    // install argv from the staged path (which is the
+    // unpacked tempdir for archives).
+    let staged_str = staged.to_string_lossy().into_owned();
+    let install_args = vec![
+        staged_str,
+        "--allow-unsigned".to_string(),
+        "--accept-changes".to_string(),
+    ];
+    cmd_install(&install_args, install_root)
+        .map_err(|e| format!("run: install failed: {}", e))?;
+
+    // Launch with the app args propagated.
+    let mut launch_args = Vec::with_capacity(1 + app_args.len());
+    launch_args.push(app_id);
+    launch_args.extend(app_args);
+    cmd_launch(&launch_args, install_root)
 }
 
 // -----------------------------------------------------
