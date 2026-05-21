@@ -50,6 +50,7 @@ fn build_minimal_fragment_module() -> Module {
         entry_block,
         blocks,
         local_size: None,
+        ssbo_bindings: std::collections::HashMap::new(),
     };
     Module {
         functions: vec![func],

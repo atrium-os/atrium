@@ -345,6 +345,15 @@ impl InterfaceContext {
                         ctx.push_constants_size = total;
                     }
                 }
+                SpvStorageClass::StorageBuffer => {
+                    if let Some(d) = deco {
+                        if let (Some(set), Some(binding)) =
+                            (d.descriptor_set, d.binding)
+                        {
+                            ctx.var_binding.insert(*var_id, (set, binding));
+                        }
+                    }
+                }
                 SpvStorageClass::Output => {
                     if let Some(d) = deco {
                         if let (Some(location), Some(ty)) = (d.location, pointee_ty) {

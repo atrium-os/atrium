@@ -804,6 +804,18 @@ pub struct Function {
     /// `gl_GlobalInvocationID = WorkgroupId * LocalSize +
     /// LocalInvocationID` at codegen time.
     pub local_size: Option<(u32, u32, u32)>,
+    /// Per-variable descriptor bindings: ValueId of a
+    /// Variable in this function -> (set, binding) from the
+    /// SPIR-V `DescriptorSet` / `Binding` decorations.
+    ///
+    /// Today populated for StorageBuffer variables only (the
+    /// multi-binding compute arc).  Uniform/UniformConstant
+    /// bindings are flattened into `Module::uniforms` with
+    /// pre-resolved offsets and don't need per-variable
+    /// lookup at codegen.  Image/sampler descriptors are
+    /// resolved via `Op::ImageHandle { set, binding }` which
+    /// carries the binding inline.
+    pub ssbo_bindings: HashMap<u32, (u32, u32)>,
 }
 
 /// Shader stage.

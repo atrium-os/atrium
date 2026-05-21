@@ -353,6 +353,7 @@ fn bespoke_shader_runs_two_block_branch() {
             entry_block: BlockId(0),
             blocks,
             local_size: None,
+            ssbo_bindings: std::collections::HashMap::new(),
         }],
         entry_points: vec![EntryPoint {
             stage: ShaderStage::Fragment,

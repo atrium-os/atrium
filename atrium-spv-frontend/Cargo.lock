@@ -16,9 +16,14 @@ name = "atrium-spv-ir"
 version = "0.1.0"
 
 [[package]]
+name = "atrium-spv-runtime"
+version = "0.1.0"
+
+[[package]]
 name = "atrium-spv-tests"
 version = "0.1.0"
 dependencies = [
+ "atrium-spv-runtime",
  "rspirv",
 ]
 

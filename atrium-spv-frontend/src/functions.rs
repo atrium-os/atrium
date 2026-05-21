@@ -216,6 +216,18 @@ fn translate_one(
 
     let local_size = iface.local_sizes.get(&fn_id).copied();
 
+    // Surface (set, binding) for any SSBO Variables this
+    // function references.  Variables get a stable ValueId
+    // through `resolve_variable`; we re-walk the same
+    // mapping here so the backend can look up the binding
+    // by ValueId without needing the SPIR-V Word.
+    let mut ssbo_bindings: HashMap<u32, (u32, u32)> = HashMap::new();
+    for (spv_var_id, value) in &id_map {
+        if let Some(&(set, binding)) = iface.var_binding.get(spv_var_id) {
+            ssbo_bindings.insert(value.id.0, (set, binding));
+        }
+    }
+
     Ok(Function {
         name,
         stage,
@@ -224,6 +236,7 @@ fn translate_one(
         entry_block: entry_block_id,
         blocks,
         local_size,
+        ssbo_bindings,
     })
 }
 

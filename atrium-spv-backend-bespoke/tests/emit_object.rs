@@ -29,6 +29,7 @@ fn empty_fragment_module() -> Module {
             entry_block,
             blocks,
             local_size: None,
+            ssbo_bindings: std::collections::HashMap::new(),
         }],
         entry_points: vec![EntryPoint {
             stage: ShaderStage::Fragment,
@@ -160,6 +161,7 @@ fn unsupported_op_falls_back_with_unsupported_error() {
             entry_block,
             blocks,
             local_size: None,
+            ssbo_bindings: std::collections::HashMap::new(),
         }],
         entry_points: vec![EntryPoint {
             stage: ShaderStage::Fragment,
