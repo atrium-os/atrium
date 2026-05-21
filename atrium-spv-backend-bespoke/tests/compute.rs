@@ -40,6 +40,10 @@ fn locate_spv_compile() -> PathBuf {
 /// compilation failure (which atrium-spv-compile would
 /// surface to the daemon as a fallback signal too).
 fn invoked_backend(spv: &[u8]) -> Result<String, String> {
+    invoked_backend_with(spv, &[])
+}
+
+fn invoked_backend_with(spv: &[u8], extra_args: &[&str]) -> Result<String, String> {
     let tmp = tempfile::tempdir().map_err(|e| e.to_string())?;
     let input_path = tmp.path().join("in.spv");
     std::fs::write(&input_path, spv).map_err(|e| e.to_string())?;
@@ -53,6 +57,7 @@ fn invoked_backend(spv: &[u8]) -> Result<String, String> {
         .arg("--output-dir").arg(tmp.path())
         .arg("--target").arg(target)
         .arg("--hash").arg("deadbeef")
+        .args(extra_args)
         .output()
         .map_err(|e| e.to_string())?;
     if !out.status.success() {
@@ -307,6 +312,29 @@ fn bespoke_compiles_gid_with_local_size_4() {
                  with LocalSize=4 -- exercises the mul+add path that folds \
                  LocalSize into the GID formula");
     assert!(!out.blob.is_empty());
+}
+
+#[test]
+fn spv_compile_force_backend_cli_flag_overrides_selection() {
+    if !cfg!(target_arch = "aarch64") {
+        return;
+    }
+    // A shader that would normally land on bespoke -- force
+    // cranelift via the CLI flag and verify the report.
+    let spv = build_empty_cs();
+    let backend = invoked_backend_with(&spv,
+        &["--force-backend", "cranelift"])
+        .expect("force-cranelift should compile");
+    assert_eq!(backend, "cranelift",
+        "--force-backend=cranelift should route to cranelift, \
+         got {backend}");
+    // And the converse: force bespoke explicitly.
+    let backend = invoked_backend_with(&spv,
+        &["--force-backend", "bespoke"])
+        .expect("force-bespoke should compile");
+    assert_eq!(backend, "bespoke",
+        "--force-backend=bespoke should route to bespoke, \
+         got {backend}");
 }
 
 #[test]

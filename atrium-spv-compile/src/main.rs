@@ -122,13 +122,25 @@ struct Args {
     /// daemon's caching policy per §2 of the renderer
     /// spec).
     hash_override: Option<String>,
+    /// Override the production "try bespoke, fall back to
+    /// Cranelift on Unsupported" selection.  None = default
+    /// selection.  Some(Bespoke) = bespoke only, error if
+    /// it can't handle.  Some(Cranelift) = skip bespoke,
+    /// go straight to Cranelift.  Used for debugging and
+    /// tests that want to exercise a specific backend
+    /// without the selection logic getting in the way.
+    force_backend: Option<ForceBackend>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForceBackend { Bespoke, Cranelift }
 
 fn parse_args() -> Result<Args, String> {
     let mut input: Option<PathBuf> = None;
     let mut output_dir: Option<PathBuf> = None;
     let mut target: Option<Target> = None;
     let mut hash_override: Option<String> = None;
+    let mut force_backend: Option<ForceBackend> = None;
 
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -146,6 +158,16 @@ fn parse_args() -> Result<Args, String> {
             "--hash" => hash_override = Some(
                 it.next().ok_or("--hash needs a value")?,
             ),
+            "--force-backend" => {
+                let v = it.next().ok_or(
+                    "--force-backend needs bespoke|cranelift")?;
+                force_backend = Some(match v.as_str() {
+                    "bespoke"   => ForceBackend::Bespoke,
+                    "cranelift" => ForceBackend::Cranelift,
+                    other => return Err(format!(
+                        "unknown --force-backend value: {other}")),
+                });
+            }
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -153,11 +175,25 @@ fn parse_args() -> Result<Args, String> {
             other => return Err(format!("unknown argument: {other}")),
         }
     }
+    // Env var fallback: tests + daemons can force a backend
+    // without rewriting their argv.  CLI --force-backend
+    // takes precedence over the env var.
+    if force_backend.is_none() {
+        if let Ok(v) = std::env::var("ATRIUM_SPV_FORCE_BACKEND") {
+            force_backend = Some(match v.as_str() {
+                "bespoke"   => ForceBackend::Bespoke,
+                "cranelift" => ForceBackend::Cranelift,
+                other => return Err(format!(
+                    "ATRIUM_SPV_FORCE_BACKEND={other} (expected bespoke|cranelift)")),
+            });
+        }
+    }
     Ok(Args {
         input: input.ok_or("--input is required")?,
         output_dir: output_dir.ok_or("--output-dir is required")?,
         target: target.unwrap_or_else(Target::host),
         hash_override,
+        force_backend,
     })
 }
 
@@ -272,15 +308,36 @@ fn run(args: &Args) -> Result<CompileReport, CompileError> {
 
     let t_backend = Instant::now();
     let (blob, pcmap, backend_name): (Vec<u8>, Vec<u8>, &'static str) =
-        match bespoke_target {
-            Some(bt) => match bespoke_compile_blob(&module, bt) {
+        match (args.force_backend, bespoke_target) {
+            // --force-backend=cranelift: skip bespoke probe.
+            (Some(ForceBackend::Cranelift), _) => cranelift_path()?,
+            // --force-backend=bespoke: bespoke or bust (no
+            // Cranelift fallback).  Errors out if the target
+            // doesn't have a bespoke port or bespoke can't
+            // handle the shader.
+            (Some(ForceBackend::Bespoke), Some(bt)) =>
+                match bespoke_compile_blob(&module, bt) {
+                    Ok(o) => (o.blob, o.pcmap, "bespoke"),
+                    Err(BespokeError::Unsupported(m)) =>
+                        return Err(CompileError::Unsupported(
+                            format!("bespoke (forced): {m}"))),
+                    Err(BespokeError::Internal(m)) =>
+                        return Err(CompileError::Internal(
+                            format!("bespoke: {m}"))),
+                },
+            (Some(ForceBackend::Bespoke), None) =>
+                return Err(CompileError::Unsupported(
+                    "--force-backend=bespoke but target has no bespoke port".into())),
+            // Default selection: try bespoke, fall back to
+            // Cranelift on Unsupported.
+            (None, Some(bt)) => match bespoke_compile_blob(&module, bt) {
                 Ok(o) => (o.blob, o.pcmap, "bespoke"),
                 Err(BespokeError::Unsupported(_)) => cranelift_path()?,
                 Err(BespokeError::Internal(m)) =>
                     return Err(CompileError::Internal(
                         format!("bespoke: {m}"))),
             },
-            None => cranelift_path()?,
+            (None, None) => cranelift_path()?,
         };
     // Includes the bespoke probe-then-fallback when it
     // happens — that's the real production cost, so time
