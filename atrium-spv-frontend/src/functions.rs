@@ -1719,6 +1719,69 @@ fn translate_inst(
                     // sin = p * x
                     Op::FMul(p6, x)
                 }
+                15 => {
+                    // Tan(x) ≡ sin(x) / cos(x).  Frontend
+                    // emits Sin via the enum-13 arm pattern,
+                    // Cos via enum-14, then FDiv.  To avoid
+                    // duplicating the polynomial code, we
+                    // inline the Sin and Cos expansions here
+                    // sharing the x² compute.
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let push = |op: Op, ty: Type,
+                                insts: &mut Vec<Inst>,
+                                next_value_id: &mut u32| -> Value {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let v = Value { id, ty };
+                        insts.push(Inst { op, result: Some(v.clone()),
+                            source_spirv_offset });
+                        v
+                    };
+                    let kfp = atrium_spv_ir::FloatKind::F32;
+                    let cf = |val: f64, insts: &mut Vec<Inst>, next_value_id: &mut u32|
+                                 -> Value {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let v = Value { id, ty: Type::F32 };
+                        insts.push(Inst {
+                            op: Op::ConstFloat { value: val, kind: kfp },
+                            result: Some(v.clone()),
+                            source_spirv_offset,
+                        });
+                        v
+                    };
+                    let x2 = push(Op::FMul(x.clone(), x.clone()),
+                        Type::F32, insts, next_value_id);
+                    // Sin Horner
+                    let c_inv5040 = cf(-1.0 / 5040.0, insts, next_value_id);
+                    let c_inv120  = cf( 1.0 /  120.0, insts, next_value_id);
+                    let c_neg_inv6 = cf(-1.0 / 6.0, insts, next_value_id);
+                    let c_one_s  = cf(1.0, insts, next_value_id);
+                    let s1 = push(Op::FMul(c_inv5040, x2.clone()), Type::F32, insts, next_value_id);
+                    let s2 = push(Op::FAdd(s1, c_inv120),           Type::F32, insts, next_value_id);
+                    let s3 = push(Op::FMul(s2, x2.clone()),         Type::F32, insts, next_value_id);
+                    let s4 = push(Op::FAdd(s3, c_neg_inv6),         Type::F32, insts, next_value_id);
+                    let s5 = push(Op::FMul(s4, x2.clone()),         Type::F32, insts, next_value_id);
+                    let s6 = push(Op::FAdd(s5, c_one_s),            Type::F32, insts, next_value_id);
+                    let sin = push(Op::FMul(s6, x),                 Type::F32, insts, next_value_id);
+                    // Cos Horner
+                    let c_inv40320 = cf(1.0 / 40320.0, insts, next_value_id);
+                    let c_neg_inv720 = cf(-1.0 / 720.0, insts, next_value_id);
+                    let c_inv24 = cf(1.0 / 24.0, insts, next_value_id);
+                    let c_neg_half = cf(-0.5, insts, next_value_id);
+                    let c_one_c = cf(1.0, insts, next_value_id);
+                    let k1 = push(Op::FMul(c_inv40320, x2.clone()), Type::F32, insts, next_value_id);
+                    let k2 = push(Op::FAdd(k1, c_neg_inv720),       Type::F32, insts, next_value_id);
+                    let k3 = push(Op::FMul(k2, x2.clone()),         Type::F32, insts, next_value_id);
+                    let k4 = push(Op::FAdd(k3, c_inv24),            Type::F32, insts, next_value_id);
+                    let k5 = push(Op::FMul(k4, x2.clone()),         Type::F32, insts, next_value_id);
+                    let k6 = push(Op::FAdd(k5, c_neg_half),         Type::F32, insts, next_value_id);
+                    let k7 = push(Op::FMul(k6, x2),                 Type::F32, insts, next_value_id);
+                    let cos = push(Op::FAdd(k7, c_one_c),           Type::F32, insts, next_value_id);
+                    Op::FDiv(sin, cos)
+                }
                 14 => {
                     // Cos(x): 8-term Horner-form polynomial
                     // accurate to ~6 ULPs on [-π/2, π/2].
