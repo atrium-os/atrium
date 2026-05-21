@@ -1325,9 +1325,13 @@ fn emit_function(
                 }
                 vectors.insert(result.id, out_lanes);
             }
-            // OpVectorExtract: alias lane `index`'s S-reg
+            // OpVectorExtract: alias lane `index`'s register
             // Value into the scalar result. No instruction
             // emitted — pure aliasing, like VectorShuffle.
+            // The lane's value lives in either the scalars
+            // map (f32 -> S-reg) or the ints map (i32/u32 ->
+            // W-reg); we look up by the lane's Type to know
+            // which map to mirror the entry into.
             Op::VectorExtract { vector, index } => {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal(
@@ -1339,10 +1343,15 @@ fn emit_function(
                     BackendError::Unsupported(format!(
                         "VectorExtract index {index} out of range \
                          ({} lanes)", lanes.len())))?;
-                let s = *scalars.get(&lane.id).ok_or_else(||
-                    BackendError::Internal(format!(
-                        "VectorExtract lane {:?} not in scalars", lane.id)))?;
-                scalars.insert(result.id, s);
+                if let Some(s) = scalars.get(&lane.id).copied() {
+                    scalars.insert(result.id, s);
+                } else if let Some(w) = ints.get(&lane.id).copied() {
+                    ints.insert(result.id, w);
+                } else {
+                    return Err(BackendError::Internal(format!(
+                        "VectorExtract lane {:?} not in scalars or ints",
+                        lane.id)));
+                }
             }
             // OpDot: scalar = Σ a_i * b_i. Lowers to one
             // fmul_s for the first lane + (fmul_s + fadd_s)
@@ -1582,6 +1591,113 @@ fn emit_function(
                     resolve_or_make_pointer(base, &mut pointers, func.stage)?;
                 let new_off = base_off.saturating_add(*byte_offset as i32);
                 pointers.insert(result.id, (param, new_off));
+            }
+            Op::LoadBuiltin(kind) => {
+                use atrium_spv_ir::BuiltinKind as BK;
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "LoadBuiltin without result".into()))?;
+                if !matches!(func.stage, ShaderStage::Compute) {
+                    return Err(BackendError::Unsupported(format!(
+                        "LoadBuiltin({kind:?}) only supported for compute \
+                         in bespoke today (stage={:?})", func.stage)));
+                }
+                // Materialise uvec3 lanes via int W-regs in
+                // the int_pool.  Source registers per the
+                // Compute AAPCS64 sig:
+                //   WorkgroupId       -> W3, W4, W5
+                //   LocalInvocationId -> W6, W7, [SP+0]
+                //   GlobalInvocationId -> wg[i]*LocalSize[i] + lid[i]
+                let load_lane_from_w = |a: &mut asm::Asm,
+                                        ints: &mut HashMap<ValueId, asm::Wreg>,
+                                        int_pool: &mut IntPool,
+                                        next_synth_id: &mut u32,
+                                        src_w: u8|
+                    -> Result<Value, BackendError>
+                {
+                    let synth = ValueId(*next_synth_id);
+                    *next_synth_id += 1;
+                    let w = int_pool.alloc(synth)?;
+                    a.emit(asm::mov_w(w, asm::Wreg(src_w)));
+                    ints.insert(synth, w);
+                    Ok(Value { id: synth, ty: Type::U32 })
+                };
+                let load_lane_from_sp = |a: &mut asm::Asm,
+                                          ints: &mut HashMap<ValueId, asm::Wreg>,
+                                          int_pool: &mut IntPool,
+                                          next_synth_id: &mut u32,
+                                          stack_off: u16|
+                    -> Result<Value, BackendError>
+                {
+                    let synth = ValueId(*next_synth_id);
+                    *next_synth_id += 1;
+                    let w = int_pool.alloc(synth)?;
+                    a.emit(asm::ldr_w_offset(w, asm::Xreg(31), stack_off));
+                    ints.insert(synth, w);
+                    Ok(Value { id: synth, ty: Type::U32 })
+                };
+                match kind {
+                    BK::WorkgroupId => {
+                        let lx = load_lane_from_w(
+                            &mut a, &mut ints, &mut int_pool, &mut next_synth_id, 3)?;
+                        let ly = load_lane_from_w(
+                            &mut a, &mut ints, &mut int_pool, &mut next_synth_id, 4)?;
+                        let lz = load_lane_from_w(
+                            &mut a, &mut ints, &mut int_pool, &mut next_synth_id, 5)?;
+                        vectors.insert(result.id, vec![lx, ly, lz]);
+                    }
+                    BK::LocalInvocationId => {
+                        let lx = load_lane_from_w(
+                            &mut a, &mut ints, &mut int_pool, &mut next_synth_id, 6)?;
+                        let ly = load_lane_from_w(
+                            &mut a, &mut ints, &mut int_pool, &mut next_synth_id, 7)?;
+                        // local_id[z] is the 9th AAPCS64 arg
+                        // -- on the stack at [SP+0] before
+                        // any prologue (callee-saved regs
+                        // saved later would shift this).
+                        // Bespoke today doesn't insert a
+                        // prologue for compute (no callee-
+                        // saved use yet); leaving stack
+                        // offset at 0 works.
+                        let lz = load_lane_from_sp(
+                            &mut a, &mut ints, &mut int_pool, &mut next_synth_id, 0)?;
+                        vectors.insert(result.id, vec![lx, ly, lz]);
+                    }
+                    BK::GlobalInvocationId => {
+                        // For now treat WorkGroupSize as
+                        // (1, 1, 1) -- folding func.local_size
+                        // into the multiply requires a
+                        // dedicated mul+add lowering that
+                        // matches Cranelift's path.  Queued.
+                        let ls = func.local_size.unwrap_or((1, 1, 1));
+                        if ls != (1, 1, 1) {
+                            return Err(BackendError::Unsupported(format!(
+                                "LoadBuiltin(GlobalInvocationId) with non-unit \
+                                 LocalSize={ls:?} not yet supported by bespoke; \
+                                 Cranelift fallback handles it")));
+                        }
+                        // GID = WG + LID when LocalSize=(1,1,1)
+                        // -- but we have separate W-regs in
+                        // the int pool, so emit an add per
+                        // lane.
+                        let mut lanes = Vec::with_capacity(3);
+                        for i in 0..3 {
+                            let synth = ValueId(next_synth_id);
+                            next_synth_id += 1;
+                            let w = int_pool.alloc(synth)?;
+                            a.emit(asm::add_w(
+                                w,
+                                asm::Wreg(3 + i),   // wg_id[i]
+                                asm::Wreg(6 + i))); // local_id[i] (skips lid.z on stack)
+                            ints.insert(synth, w);
+                            lanes.push(Value { id: synth, ty: Type::U32 });
+                        }
+                        vectors.insert(result.id, lanes);
+                    }
+                    other => return Err(BackendError::Unsupported(format!(
+                        "LoadBuiltin({other:?}) not supported in compute \
+                         bespoke path"))),
+                }
             }
             Op::Load(ptr) => {
                 let result = inst.result.as_ref().ok_or_else(||
