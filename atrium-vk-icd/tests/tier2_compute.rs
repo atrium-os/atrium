@@ -14,7 +14,8 @@
 //! Real compute workloads need an output-buffer pointer added
 //! to the CsMain ABI -- separate cross-backend arc.
 
-use std::path::PathBuf;
+mod common;
+
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -25,48 +26,19 @@ use atrium_vk_icd::{
     vkAllocateCommandBuffers, vkBeginCommandBuffer,
     vkCmdBindPipeline, vkCmdDispatch, vkCreateCommandPool,
     vkCreateComputePipelines, vkCreateDevice, vkCreateInstance,
-    vkCreateShaderModule, vkDestroyInstance, vkEndCommandBuffer,
+    vkDestroyInstance, vkEndCommandBuffer,
     vkEnumeratePhysicalDevices, vkGetDeviceQueue, vkQueueSubmit,
 };
 use tempfile::TempDir;
 
-type VkInstance       = *mut std::ffi::c_void;
-type VkDevice         = *mut std::ffi::c_void;
-type VkQueue          = *mut std::ffi::c_void;
-type VkCommandBuffer  = *mut std::ffi::c_void;
-type VkPhysicalDevice = *mut std::ffi::c_void;
-
-static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-struct EnvLock { _g: std::sync::MutexGuard<'static, ()> }
-impl EnvLock {
-    fn set(sock: &std::path::Path) -> Self {
-        let g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        std::env::set_var("ATRIUM_VK_ICD_SOCKET", sock);
-        EnvLock { _g: g }
-    }
-}
-
-fn tmp_socket(name: &str) -> PathBuf {
-    let mut p = std::env::temp_dir();
-    p.push(format!("atrium-vk-icd-tier2-{}-{}.sock",
-                   std::process::id(), name));
-    p
-}
-
-fn locate_compile_binary() -> PathBuf {
-    let here = std::env::current_exe().expect("current_exe");
-    let mut p = here;
-    p.pop(); p.pop(); p.pop(); p.pop(); p.pop();
-    p.push("atrium-spv-compile");
-    p.push("target");
-    p.push("debug");
-    p.push("atrium-spv-compile");
-    assert!(p.exists(), "atrium-spv-compile not at {}", p.display());
-    p
-}
+use common::{
+    EnvLock, VkCommandBuffer, VkDevice, VkInstance, VkPhysicalDevice, VkQueue,
+    locate_compile_binary, make_shader_module, tmp_socket,
+};
 
 /// Minimal compute SPIR-V: GLCompute entry point with
-/// `LocalSize = (4, 1, 1)`, empty body.
+/// `LocalSize = (4, 1, 1)`, empty body.  Local to this file
+/// since other ICD tests don't need a compute shader.
 fn build_empty_cs_local_4() -> Vec<u8> {
     use rspirv::binary::Assemble;
     use rspirv::spirv::{
@@ -91,20 +63,6 @@ fn build_empty_cs_local_4() -> Vec<u8> {
     let mut bytes = Vec::with_capacity(words.len() * 4);
     for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
     bytes
-}
-
-fn make_shader_module(device: VkDevice, spv: &[u8]) -> u64 {
-    let mut info = [0u8; 40];
-    info[ 0.. 4].copy_from_slice(&16u32.to_le_bytes());
-    info[24..32].copy_from_slice(&(spv.len() as u64).to_le_bytes());
-    info[32..40].copy_from_slice(&(spv.as_ptr() as u64).to_le_bytes());
-    let mut sm: u64 = 0;
-    unsafe {
-        vkCreateShaderModule(device, info.as_ptr() as *const _,
-                             std::ptr::null(), &mut sm);
-    }
-    assert!(sm != 0);
-    sm
 }
 
 #[test]
