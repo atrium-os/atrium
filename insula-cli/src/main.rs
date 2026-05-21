@@ -378,14 +378,83 @@ fn cmd_info(args: &[String], install_root: &Path) -> Result<(), String> {
         println!("    container: {}", ar.join("container").display());
     }
 
-    // Signature info, if any.
+    // Signature info, if any. Three outcomes:
+    //   VALID + trusted   — signature verifies AND the
+    //                       embedded pubkey matches the
+    //                       caller's trusted-publishers
+    //                       entry for the key_id
+    //   VALID + untrusted — signature verifies (the
+    //                       file is not tampered) but
+    //                       the publisher is not in
+    //                       the local trust store
+    //   INVALID           — signature digest mismatch
+    //                       (the bundle has been
+    //                       modified since sign-time)
     let sig_path = bundle_root.join("signature");
     if sig_path.exists() {
         match insula_bundle::signing::read_signature(&bundle_root) {
             Ok(sig) => {
                 let pk_prefix: String = sig.pubkey[..8].iter()
                     .map(|b| format!("{:02x}", b)).collect();
-                println!("  signature:   key_id={} pk={}…", sig.key_id, pk_prefix);
+                // Verify the signature against the
+                // pubkey embedded in the signature file
+                // (catches tampering — the embedded
+                // pubkey is the sign-time pubkey, not
+                // necessarily the trusted one).
+                let bundle_for_verify = insula_bundle::InsulaBundle::read(&bundle_root);
+                let self_consistent = match &bundle_for_verify {
+                    Ok(b) => {
+                        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+                        match VerifyingKey::from_bytes(&sig.pubkey) {
+                            Ok(vk) => {
+                                let dgst = insula_bundle::signing::compute_digest(b);
+                                match dgst {
+                                    Ok(d) => {
+                                        let s = Signature::from_bytes(&sig.signature);
+                                        vk.verify(&d, &s).is_ok()
+                                    }
+                                    Err(_) => false,
+                                }
+                            }
+                            Err(_) => false,
+                        }
+                    }
+                    Err(_) => false,
+                };
+
+                if !self_consistent {
+                    println!("  signature:   INVALID — key_id={} pk={}… \
+                              (bundle modified after sign)", sig.key_id, pk_prefix);
+                } else {
+                    // Self-consistent. Now check whether
+                    // the publisher is locally trusted.
+                    let trust_outcome = signing::load_trusted_publisher(
+                        install_root, &sig.key_id
+                    );
+                    match trust_outcome {
+                        Ok(trusted_vk) => {
+                            if trusted_vk.to_bytes() == sig.pubkey {
+                                println!("  signature:   VALID (trusted) \
+                                          key_id={} pk={}…",
+                                         sig.key_id, pk_prefix);
+                            } else {
+                                println!("  signature:   VALID but \
+                                          MISMATCHED — key_id={} signed by \
+                                          pk={}… but the trusted publisher \
+                                          for this key_id has a different \
+                                          pubkey",
+                                         sig.key_id, pk_prefix);
+                            }
+                        }
+                        Err(_) => {
+                            println!("  signature:   VALID (untrusted publisher) \
+                                      key_id={} pk={}… \
+                                      (run `insula publishers add {} <pubfile>` \
+                                      to trust)",
+                                     sig.key_id, pk_prefix, sig.key_id);
+                        }
+                    }
+                }
             }
             Err(e) => {
                 println!("  signature:   present but unreadable ({})", e);
