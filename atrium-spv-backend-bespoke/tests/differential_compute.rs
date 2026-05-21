@@ -2200,6 +2200,93 @@ fn differential_glsl_sin_cos() {
         "cos(π/2) ≈ 0 (Taylor tolerance); got {}", read(3));
 }
 
+// Build a small single-binding compute shader that runs
+// `ext_op` (a GLSL.std.450 enum) on either two (binop=true)
+// or three (binop=false) constant int operands and stores
+// the result at ssbo[0].  `signed=true` selects i32_ty, else
+// u32_ty.  Returns the assembled SPIR-V blob.
+fn build_int_glsl_shader(ext_op: u32, signed: bool, args: &[u32]) -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let std_450 = b.ext_inst_import("GLSL.std.450");
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let int_ty = if signed { b.type_int(32, 1) } else { u32_ty };
+    let void_fn = b.type_function(void, vec![]);
+    let rt = b.type_runtime_array(int_ty);
+    b.decorate(rt, Decoration::ArrayStride, vec![rspirv::dr::Operand::LiteralBit32(4)]);
+    let s = b.type_struct(vec![rt]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_x = b.type_pointer(None, StorageClass::StorageBuffer, int_ty);
+    let ssbo = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let consts: Vec<u32> = args.iter()
+        .map(|&a| b.constant_bit32(int_ty, a))
+        .collect();
+    let operands: Vec<rspirv::dr::Operand> = consts.iter()
+        .map(|&c| rspirv::dr::Operand::IdRef(c)).collect();
+    let r = b.ext_inst(int_ty, None, std_450, ext_op, operands).unwrap();
+    let d = b.access_chain(ptr_x, None, ssbo, vec![c_zero, c_zero]).unwrap();
+    b.store(d, r, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spv = Vec::with_capacity(words.len() * 4);
+    for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+    spv
+}
+
+#[test]
+fn differential_glsl_int_min_max_clamp() {
+    // SMin/UMin/SMax/UMax/SClamp/UClamp lower to Select on
+    // SLt/ULt/SGt/UGt.  Each op gets its own tiny shader to
+    // keep entry-block constant pre-materialisation under
+    // the bespoke int W-pool budget; verify the output
+    // matches host behaviour and bespoke/cranelift produce
+    // byte-identical SSBO buffers.
+    let cases: &[(&str, u32, bool, &[u32], u32)] = &[
+        // (label, ext_op, signed, args, expected)
+        ("umin(3,7)",        39, false, &[3, 7],            3),
+        ("umin(10,2)",       39, false, &[10, 2],           2),
+        ("umax(3,7)",        41, false, &[3, 7],            7),
+        ("umax(0,0xFFFFFFFF)",41,false, &[0, 0xFFFF_FFFF],  0xFFFF_FFFF),
+        ("uclamp(15,1,10)",  44, false, &[15, 1, 10],       10),
+        ("uclamp(5,1,10)",   44, false, &[5,  1, 10],       5),
+        ("smin(3,-7)",       38, true,  &[3u32, -7i32 as u32], -7i32 as u32),
+        ("smax(-5,5)",       42, true,  &[-5i32 as u32, 5], 5),
+        ("sclamp(-50,-10,10)",45,true,  &[-50i32 as u32, -10i32 as u32, 10], -10i32 as u32),
+        ("sclamp(-3,-10,10)",45, true,  &[-3i32 as u32, -10i32 as u32, 10], -3i32 as u32),
+    ];
+    for &(label, ext_op, signed, args, expected) in cases {
+        let spv = build_int_glsl_shader(ext_op, signed, args);
+        let dir = TempDir::new().unwrap();
+        let mut b_buf = vec![0u8; 4];
+        let mut c_buf = vec![0u8; 4];
+        invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
+        invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+        assert_eq!(b_buf, c_buf, "{label}: bespoke vs cranelift diverge");
+        let got = u32::from_le_bytes(b_buf[0..4].try_into().unwrap());
+        assert_eq!(got, expected,
+            "{label}: got {:#x}, want {:#x}", got, expected);
+    }
+}
+
+
 #[test]
 fn differential_glsl_hyperbolic() {
     // Sinh / Cosh / Tanh / Asinh / Acosh / Atanh.

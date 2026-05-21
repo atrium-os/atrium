@@ -973,7 +973,8 @@ specifically supports:
   FMin, FMax, FClamp, FMix, Step, SmoothStep, Length,
   Distance, Normalize, Reflect, Cross, Sin, Cos, Tan,
   Exp, Exp2, Log, Log2, Pow, Atan, Asin, Acos, Atan2,
-  Sinh, Cosh, Tanh, Asinh, Acosh, Atanh.
+  Sinh, Cosh, Tanh, Asinh, Acosh, Atanh,
+  SMin, UMin, SMax, UMax, SClamp, UClamp.
   Sin/Cos/Tan use Horner-form Taylor on a range-reduced
   argument (x → x_red ∈ [-π/2, π/2] mod π, with (-1)^k
   parity sign), so the full real line is accepted at ~6
@@ -993,7 +994,9 @@ specifically supports:
   x=0 case rides through Atan's reciprocal branch.
   Sinh/Cosh/Tanh decompose into Exp(x) ± Exp(-x);
   Asinh/Acosh/Atanh into Log(x + sqrt(x²±1)) or
-  0.5·Log((1+x)/(1-x)).
+  0.5·Log((1+x)/(1-x)).  SMin/UMin/SMax/UMax/SClamp/UClamp
+  lower to Op::Select on the corresponding signed or
+  unsigned ordered compare (SLt/ULt/SGt/UGt).
 
 **Bespoke backend (atrium-spv-backend-bespoke):**
 

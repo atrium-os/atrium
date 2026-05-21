@@ -1235,7 +1235,8 @@ fn emit_function(
                     // resolves inline.  Without this skip the
                     // orphan pins a W-reg forever (its last_use
                     // is None, so linear-scan never reclaims).
-                } else if let Ok(w) = alloc_int_w(&mut int_pool, result.id) {
+                } else {
+                    let w = alloc_int_w(&mut int_pool, result.id)?;
                     materialise_u32_into_w(&mut a, w, *value as i32 as u32);
                     ints.insert(result.id, w);
                 }
@@ -2528,6 +2529,17 @@ fn emit_function(
                         a.emit(asm::fcsel_s(s_d, s_t, s_f, asm::Cond::Ne));
                         scalars.insert(result.id, s_d);
                     }
+                    Type::I32 | Type::U32 => {
+                        let w_t = *ints.get(&t_val.id).ok_or_else(||
+                            BackendError::Internal(format!(
+                                "int Select t {:?} not in ints", t_val.id)))?;
+                        let w_f = *ints.get(&f_val.id).ok_or_else(||
+                            BackendError::Internal(format!(
+                                "int Select f {:?} not in ints", f_val.id)))?;
+                        let w_d = alloc_int_w(&mut int_pool, result.id)?;
+                        a.emit(asm::csel_w(w_d, w_t, w_f, asm::Cond::Ne));
+                        ints.insert(result.id, w_d);
+                    }
                     Type::Vec2(_) | Type::Vec3(_) | Type::Vec4(_) => {
                         let t_lanes = vectors.get(&t_val.id).cloned().ok_or_else(||
                             BackendError::Internal(format!(
@@ -3473,6 +3485,10 @@ impl IntPool {
         // then W19..W28 (callee-saved — using these forces
         // a prologue, so they're the overflow tier). Vec
         // end is W13 so `pop` hands out caller-saved first.
+        // Note: W8 and W9 look free per AAPCS64 but the
+        // bespoke codegen uses W9 as a global scratch
+        // (`w_tmp`) for ConstFloat materialisation etc., so
+        // they MUST stay out of the regalloc pool.
         let mut free: Vec<u8> = (19..29).rev().collect();
         free.extend((13..18).rev());
         Self { free, owners: HashMap::new(), used_callee_saved: false }

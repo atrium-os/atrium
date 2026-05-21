@@ -1977,6 +1977,67 @@ fn translate_inst(
                         next_value_id, insts, source_spirv_offset)?;
                     Op::FMin(x, y)
                 }
+                // SMin(38) / UMin(39) / SMax(42) / UMax(41):
+                // synth via Select on a signed/unsigned compare.
+                38 | 39 | 41 | 42 => {
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let y_id = expect_id(&spv_inst.operands, 3)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let y = resolve_value(y_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let cmp_op = match inst_enum {
+                        38 => Op::SLt(x.clone(), y.clone()), // SMin
+                        39 => Op::ULt(x.clone(), y.clone()), // UMin
+                        41 => Op::UGt(x.clone(), y.clone()), // UMax
+                        42 => Op::SGt(x.clone(), y.clone()), // SMax
+                        _ => unreachable!(),
+                    };
+                    let cond = push_bool(cmp_op,
+                        source_spirv_offset, insts, next_value_id);
+                    Op::Select { cond, t_val: x, f_val: y }
+                }
+                // SClamp(45) / UClamp(44): nested min(max(...)).
+                44 | 45 => {
+                    let x_id  = expect_id(&spv_inst.operands, 2)?;
+                    let lo_id = expect_id(&spv_inst.operands, 3)?;
+                    let hi_id = expect_id(&spv_inst.operands, 4)?;
+                    let x  = resolve_value(x_id,  types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let lo = resolve_value(lo_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let hi = resolve_value(hi_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let signed = inst_enum == 45;
+                    // mid = max(x, lo)
+                    let cmp_max = if signed {
+                        Op::SGt(x.clone(), lo.clone())
+                    } else {
+                        Op::UGt(x.clone(), lo.clone())
+                    };
+                    let cond_max = push_bool(cmp_max,
+                        source_spirv_offset, insts, next_value_id);
+                    let mid = {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let v = Value { id, ty: result_ty.clone() };
+                        insts.push(Inst {
+                            op: Op::Select { cond: cond_max, t_val: x, f_val: lo },
+                            result: Some(v.clone()),
+                            source_spirv_offset,
+                        });
+                        v
+                    };
+                    // result = min(mid, hi)
+                    let cmp_min = if signed {
+                        Op::SLt(mid.clone(), hi.clone())
+                    } else {
+                        Op::ULt(mid.clone(), hi.clone())
+                    };
+                    let cond_min = push_bool(cmp_min,
+                        source_spirv_offset, insts, next_value_id);
+                    Op::Select { cond: cond_min, t_val: mid, f_val: hi }
+                }
                 40 => {
                     let x_id = expect_id(&spv_inst.operands, 2)?;
                     let y_id = expect_id(&spv_inst.operands, 3)?;
