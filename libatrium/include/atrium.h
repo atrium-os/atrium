@@ -191,6 +191,16 @@ int32_t atrium_window_fill_rect(
     float x, float y, float w, float h,
     float r, float g, float b, float a);
 
+/* Multi-node frame builder. Apps that paint more than
+ * a single rect bracket their per-frame work between
+ * frame_begin / frame_end calls. */
+int32_t atrium_window_frame_begin(uint32_t window_id);
+int32_t atrium_window_frame_rect(
+    uint32_t node_id,
+    float x, float y, float w, float h,
+    float r, float g, float b, float a);
+int32_t atrium_window_frame_end(void);
+
 /* Window event kinds (mirror fresco_protocol::control::EV_*). */
 #define ATRIUM_EV_WINDOW_RESIZED         0x0580
 #define ATRIUM_EV_WINDOW_FOCUS_CHANGED   0x0581

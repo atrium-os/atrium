@@ -1168,6 +1168,134 @@ pub extern "C" fn atrium_window_destroy(window_id: u32) -> c_int {
     })
 }
 
+// =====================================================
+// Multi-node frame builder.
+//
+// Apps that want more than the single-rect fill use:
+//
+//   atrium_window_frame_begin(window_id)
+//   atrium_window_frame_rect(node_id=1, ...)
+//   atrium_window_frame_rect(node_id=2, ...)
+//   ...
+//   atrium_window_frame_end()
+//
+// State (the active window_id) lives behind a Mutex so
+// concurrent calls from one app don't interleave frame
+// boundaries. The single-rect atrium_window_fill_rect
+// uses these primitives under the hood, but stays the
+// recommended path for "just fill the canvas".
+// =====================================================
+
+static FRESCO_FRAME_WINDOW: Mutex<Option<u32>> = Mutex::new(None);
+
+/// Begin building a frame for `window_id`. Subsequent
+/// `atrium_window_frame_*` calls go to this window
+/// until [`atrium_window_frame_end`] is called.
+///
+/// Returns 0 on success, negative on error. Calling
+/// begin twice without an intervening end returns
+/// [`ATRIUM_ERR_FRESCO_RPC`] — the caller must close
+/// the prior frame first.
+#[no_mangle]
+pub extern "C" fn atrium_window_frame_begin(window_id: u32) -> c_int {
+    let mut guard = FRESCO_FRAME_WINDOW.lock().unwrap();
+    if guard.is_some() {
+        return ATRIUM_ERR_FRESCO_RPC;
+    }
+    let begin = match postcard::to_stdvec(&fresco_protocol::SceneFrameBeginPayload::default()) {
+        Ok(b) => b,
+        Err(_) => return ATRIUM_ERR_FRESCO_RPC,
+    };
+    let flags = window_id as u16;
+    let rc = with_fresco_conn(|conn| {
+        if conn.send_message(
+            CLASS_DISPLAY,
+            fresco_protocol::control::OP_SCENE_FRAME_BEGIN,
+            flags, &begin,
+        ).is_err() {
+            return ATRIUM_ERR_FRESCO_RPC;
+        }
+        0
+    });
+    if rc == 0 {
+        *guard = Some(window_id);
+    }
+    rc
+}
+
+/// Emit a rectangular node into the in-progress
+/// frame. `node_id` selects which scene slot the rect
+/// occupies; reusing an id across frames updates the
+/// same slot.
+///
+/// Must be called between [`atrium_window_frame_begin`]
+/// and [`atrium_window_frame_end`].
+#[no_mangle]
+pub extern "C" fn atrium_window_frame_rect(
+    node_id: u32,
+    x: f32, y: f32, w: f32, h: f32,
+    r: f32, g: f32, b: f32, a: f32,
+) -> c_int {
+    let window_id = match *FRESCO_FRAME_WINDOW.lock().unwrap() {
+        Some(w) => w,
+        None => return ATRIUM_ERR_FRESCO_RPC,
+    };
+    let flags = window_id as u16;
+    let rect_bytes = match postcard::to_stdvec(&fresco_protocol::RectParams {
+        x, y, w, h, r, g, b, a,
+    }) {
+        Ok(v) => v,
+        Err(_) => return ATRIUM_ERR_FRESCO_RPC,
+    };
+    let node = match postcard::to_stdvec(&fresco_protocol::SceneNodeSetPayload {
+        node_id,
+        op_id: fresco_protocol::scene_ops::ATRIUM_CORE_RECT,
+        params: rect_bytes,
+    }) {
+        Ok(v) => v,
+        Err(_) => return ATRIUM_ERR_FRESCO_RPC,
+    };
+    with_fresco_conn(|conn| {
+        if conn.send_message(
+            CLASS_DISPLAY,
+            fresco_protocol::control::OP_SCENE_NODE_SET,
+            flags, &node,
+        ).is_err() {
+            return ATRIUM_ERR_FRESCO_RPC;
+        }
+        0
+    })
+}
+
+/// Commit the in-progress frame. The server presents
+/// the accumulated nodes.
+///
+/// Returns 0 on success. Calling end without a prior
+/// begin returns [`ATRIUM_ERR_FRESCO_RPC`].
+#[no_mangle]
+pub extern "C" fn atrium_window_frame_end() -> c_int {
+    let mut guard = FRESCO_FRAME_WINDOW.lock().unwrap();
+    let window_id = match guard.take() {
+        Some(w) => w,
+        None => return ATRIUM_ERR_FRESCO_RPC,
+    };
+    let end = match postcard::to_stdvec(&fresco_protocol::SceneFrameEndPayload::default()) {
+        Ok(b) => b,
+        Err(_) => return ATRIUM_ERR_FRESCO_RPC,
+    };
+    let flags = window_id as u16;
+    with_fresco_conn(|conn| {
+        if conn.send_message(
+            CLASS_DISPLAY,
+            fresco_protocol::control::OP_SCENE_FRAME_END,
+            flags, &end,
+        ).is_err() {
+            return ATRIUM_ERR_FRESCO_RPC;
+        }
+        0
+    })
+}
+
 /// Window event kinds returned by [`atrium_window_poll_event`].
 /// Values match the corresponding `fresco_protocol::control::EV_*`
 /// constants so toolkits can compare against either.
