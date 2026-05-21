@@ -937,6 +937,79 @@ available as a *library* on top of Pergola, not a platform
 mandate. The choice is at the app level, not the platform
 level — the inverse of the browser's situation.
 
+### 10.8 Visual identity vs. interaction conventions
+
+A predictable reaction from web-shaped readers: "if every
+app is a Pergola app, they will all look the same — that
+loses the brand-expression freedom the web is famous for."
+The honest answer is that Pergola opinionates one layer and
+leaves the other free, and the layer it opinionates is the
+one the web abused.
+
+**Pergola is opinionated about *interaction primitives*:**
+
+| Property | Pergola guarantee |
+|---|---|
+| Input model | Standard — predictable across apps |
+| Focus / keyboard navigation | Always works, AX-traversable |
+| Accessibility tree | Structural property of the widget tree (§10.4) |
+| System gestures (back, quit, switch, screenshot) | OS-mediated; apps cannot capture |
+| Hit areas, target sizes, click semantics | Defaults; certification gates outliers |
+| Scroll behavior, momentum, edge bounce | System-consistent; no "scroll-jacking" |
+| Right-click / context menus | System-mediated, predictable shape |
+
+The web's "freedom" in these areas was *mostly* abused —
+popups, scroll-jacking, fake back buttons, hidden close
+affordances, dark patterns. Insula apps recovering them is
+a real win for users even if it constrains designers.
+
+**Pergola is liberal about *visual presentation*:**
+
+| Property | Free to customize? |
+|---|---|
+| Color palette, brand colors | Yes — fully |
+| Typography (within a11y limits) | Yes — fully |
+| Custom illustrations, iconography | Yes — fully |
+| Layout, composition, whitespace | Yes — fully |
+| Custom-drawn regions (creative tools, viz, games) | Yes, with shadow AX tree (§10.4 decision 2) |
+| Animation, micro-interactions | Yes — Pergola is GPU-accelerated |
+| Card / list / timeline / immersive layouts | Yes |
+| Background, hero imagery, atmospheric design | Yes |
+
+The shape is closer to SwiftUI / Compose than to legacy
+Win32 / GTK: opinionated about interaction, liberal about
+presentation. A weather app can be a beautiful immersive
+thing with motion graphics and still be 100% Pergola. A
+Figma-shaped creative tool wraps a custom-drawn canvas
+widget with an AX shadow tree inside otherwise-Pergola
+chrome.
+
+**The honest tradeoffs:**
+
+What designers lose:
+- The "reinvent every interaction" freedom. A bespoke 200px
+  custom-physics dropdown that fights muscle memory cannot
+  exist.
+- The "look completely unlike anything else" feel. Some
+  family resemblance through standard primitives is
+  unavoidable.
+
+What designers gain:
+- Stop spending 60% of design+engineering time
+  reimplementing scrollbars, date pickers, modals,
+  comboboxes. Spend it on content, brand voice, micro-
+  interactions, the genuinely differentiating parts.
+- "Feels native" — historically a moat for native apps
+  over webapps — becomes the default.
+
+**The category that loses most:** "interaction-art" sites
+where the interaction itself is the design statement
+(custom scroll experiences as branding, navigation as
+puzzle). These are documents at heart — the rendering of
+the design *is* the content — and arguably belong to the
+document-viewer authoring format (§10.6), not the apps
+layer.
+
 ## 11. Background tasks
 
 The web's background-execution story is three overlapping
