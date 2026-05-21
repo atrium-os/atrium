@@ -221,6 +221,24 @@ int32_t atrium_window_frame_texture(
     uint32_t node_id, uint32_t slot_id,
     float x, float y, float w, float h);
 
+/* One pre-shaped glyph instance for atrium_window_frame_glyph_run. */
+typedef struct {
+    float    dx, dy;
+    uint32_t atlas_u, atlas_v, atlas_w, atlas_h;
+    float    bearing_x, bearing_y;
+} atrium_glyph_t;
+
+/* Emit a glyph-run node. atlas_slot_id must be a slot
+ * uploaded with R8_UNORM (typical for glyph coverage
+ * atlases). Apps provide pre-shaped glyphs; libatrium
+ * does not depend on any shaping library. */
+int32_t atrium_window_frame_glyph_run(
+    uint32_t node_id,
+    uint32_t atlas_slot_id, uint32_t atlas_width, uint32_t atlas_height,
+    float x, float y,
+    float r, float g, float b, float a,
+    const atrium_glyph_t* glyphs, size_t n_glyphs);
+
 int32_t atrium_window_frame_end(void);
 
 /* Window event kinds (mirror fresco_protocol::control::EV_*). */

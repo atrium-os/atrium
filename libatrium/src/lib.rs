@@ -1426,6 +1426,107 @@ pub extern "C" fn atrium_window_frame_path(
     })
 }
 
+/// One glyph instance in an
+/// [`atrium_window_frame_glyph_run`] call. Mirrors
+/// `fresco_protocol::GlyphInstance` 1:1 on the wire.
+///
+/// `dx` / `dy` are the glyph's pen-position offset from
+/// the run origin; `(atlas_u, atlas_v, atlas_w,
+/// atlas_h)` is the source rect in atlas pixels;
+/// `bearing_x` shifts the glyph right of the pen and
+/// `bearing_y` is the baseline-to-top distance.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct AtriumGlyph {
+    pub dx: f32,
+    pub dy: f32,
+    pub atlas_u: u32,
+    pub atlas_v: u32,
+    pub atlas_w: u32,
+    pub atlas_h: u32,
+    pub bearing_x: f32,
+    pub bearing_y: f32,
+}
+
+/// Emit a glyph-run node into the in-progress frame.
+/// The atlas texture must already be uploaded as
+/// `atlas_slot_id` (typically via
+/// [`atrium_window_upload_texture`] with
+/// `ATRIUM_TEX_FORMAT_R8_UNORM`).
+///
+/// `glyphs` points to `n_glyphs` consecutive
+/// [`AtriumGlyph`] entries; libatrium copies them into
+/// the postcard payload.
+///
+/// Libatrium stays at the wire level here — apps that
+/// want full shaping (rustybuzz / swash) compose their
+/// own pre-shaped glyph data and call this. Future
+/// helper crates can layer shaping on top without
+/// changing this surface.
+///
+/// # Safety
+///
+/// `glyphs` must point to `n_glyphs` valid
+/// [`AtriumGlyph`] entries.
+#[no_mangle]
+pub unsafe extern "C" fn atrium_window_frame_glyph_run(
+    node_id: u32,
+    atlas_slot_id: u32, atlas_width: u32, atlas_height: u32,
+    x: f32, y: f32,
+    r: f32, g: f32, b: f32, a: f32,
+    glyphs: *const AtriumGlyph,
+    n_glyphs: usize,
+) -> c_int {
+    let window_id = match *FRESCO_FRAME_WINDOW.lock().unwrap() {
+        Some(w) => w,
+        None => return ATRIUM_ERR_FRESCO_RPC,
+    };
+    if glyphs.is_null() && n_glyphs > 0 {
+        return ATRIUM_ERR_INVALID_PATH;
+    }
+    let src = if n_glyphs == 0 {
+        &[][..]
+    } else {
+        std::slice::from_raw_parts(glyphs, n_glyphs)
+    };
+    let glyph_vec: Vec<fresco_protocol::GlyphInstance> = src.iter().map(|g| {
+        fresco_protocol::GlyphInstance {
+            dx: g.dx, dy: g.dy,
+            atlas_u: g.atlas_u, atlas_v: g.atlas_v,
+            atlas_w: g.atlas_w, atlas_h: g.atlas_h,
+            bearing_x: g.bearing_x, bearing_y: g.bearing_y,
+        }
+    }).collect();
+    let flags = window_id as u16;
+    let run_bytes = match postcard::to_stdvec(&fresco_protocol::GlyphRunParams {
+        x, y,
+        atlas_slot_id, atlas_width, atlas_height,
+        r, g, b, a,
+        glyphs: glyph_vec,
+    }) {
+        Ok(v) => v,
+        Err(_) => return ATRIUM_ERR_FRESCO_RPC,
+    };
+    let node = match postcard::to_stdvec(&fresco_protocol::SceneNodeSetPayload {
+        node_id,
+        op_id: fresco_protocol::scene_ops::ATRIUM_TEXT_GLYPH_RUN,
+        params: run_bytes,
+    }) {
+        Ok(v) => v,
+        Err(_) => return ATRIUM_ERR_FRESCO_RPC,
+    };
+    with_fresco_conn(|conn| {
+        if conn.send_message(
+            CLASS_DISPLAY,
+            fresco_protocol::control::OP_SCENE_NODE_SET,
+            flags, &node,
+        ).is_err() {
+            return ATRIUM_ERR_FRESCO_RPC;
+        }
+        0
+    })
+}
+
 /// Commit the in-progress frame. The server presents
 /// the accumulated nodes.
 ///
