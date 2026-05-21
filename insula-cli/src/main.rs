@@ -281,12 +281,15 @@ fn cmd_list(install_root: &Path) -> Result<(), String> {
         return Ok(());
     }
 
-    let mut found = 0usize;
+    // Collect first so we can compute column widths.
+    let mut rows: Vec<(String, String, String, String)> = Vec::new();
     for entry in std::fs::read_dir(&apps_dir)
         .map_err(|e| format!("read_dir {}: {}", apps_dir.display(), e))?
     {
         let entry = entry.map_err(|e| e.to_string())?;
-        let manifest_path = entry.path().join("bundle").join("manifest.toml");
+        let app_root = entry.path();
+        let bundle_root = app_root.join("bundle");
+        let manifest_path = bundle_root.join("manifest.toml");
         if !manifest_path.is_file() {
             continue;
         }
@@ -298,17 +301,81 @@ fn cmd_list(install_root: &Path) -> Result<(), String> {
             Ok(m) => m,
             Err(_) => continue,
         };
-        println!(
-            "{}  {}  (entry: {})",
-            manifest.app.name,
-            manifest.app.version,
-            manifest.bundle.entry
-        );
-        found += 1;
+
+        // Build a one-line capability summary as a
+        // sparse tags list — only sections that are
+        // present produce a tag.
+        let mut tags: Vec<String> = Vec::new();
+        if let Some(net) = &manifest.network {
+            if net.raw_network {
+                tags.push("net:raw".to_string());
+            } else if !net.hosts.is_empty() {
+                tags.push(format!("net:{}", net.hosts.len()));
+            }
+        }
+        if manifest.storage.is_some() {
+            tags.push("storage".to_string());
+        }
+        if manifest.render.as_ref().map(|r| r.fresco).unwrap_or(false) {
+            tags.push("window".to_string());
+        }
+        if let Some(bg) = &manifest.background {
+            if bg.resident.is_some()   { tags.push("bg:resident".to_string()); }
+            if bg.triggered.is_some()  { tags.push("bg:triggered".to_string()); }
+        }
+        if let Some(ipc) = &manifest.ipc {
+            if !ipc.services.is_empty() {
+                tags.push(format!("ipc:{}", ipc.services.len()));
+            }
+        }
+        if let Some(p) = &manifest.peer {
+            if !p.implements.is_empty() || !p.requests.is_empty() {
+                tags.push("peer".to_string());
+            }
+        }
+        if let Some(caps) = &manifest.capabilities {
+            if !caps.is_empty() {
+                tags.push(format!("caps:{}", caps.len()));
+            }
+        }
+        let sig_marker = if bundle_root.join("signature").is_file() {
+            "signed"
+        } else {
+            "unsigned"
+        };
+
+        rows.push((
+            manifest.app.name.clone(),
+            manifest.app.version.clone(),
+            sig_marker.to_string(),
+            if tags.is_empty() {
+                "(no capabilities declared)".to_string()
+            } else {
+                tags.join(" ")
+            },
+        ));
     }
 
-    if found == 0 {
+    if rows.is_empty() {
         println!("(no apps installed)");
+        return Ok(());
+    }
+
+    let id_w = rows.iter().map(|r| r.0.len()).max().unwrap().max(7);
+    let ver_w = rows.iter().map(|r| r.1.len()).max().unwrap().max(7);
+    let sig_w = rows.iter().map(|r| r.2.len()).max().unwrap().max(6);
+
+    println!(
+        "{:<id_w$}  {:<ver_w$}  {:<sig_w$}  capabilities",
+        "APP-ID", "VERSION", "SIG",
+        id_w = id_w, ver_w = ver_w, sig_w = sig_w,
+    );
+    for (id, ver, sig, tags) in &rows {
+        println!(
+            "{:<id_w$}  {:<ver_w$}  {:<sig_w$}  {}",
+            id, ver, sig, tags,
+            id_w = id_w, ver_w = ver_w, sig_w = sig_w,
+        );
     }
     Ok(())
 }
