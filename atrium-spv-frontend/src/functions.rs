@@ -1590,6 +1590,9 @@ fn translate_inst(
             //   31 = Sqrt   arg: x
             //   37 = FMin   args: x, y
             //   40 = FMax   args: x, y
+            //   43 = FClamp args: x, lo, hi   (lowers to FMax+FMin)
+            //   46 = FMix   args: x, y, a    (lowers to a*y + (1-a)*x;
+            //                                  here as x + a*(y-x))
             let op = match inst_enum {
                 4 => {
                     let x_id = expect_id(&spv_inst.operands, 2)?;
@@ -1620,6 +1623,68 @@ fn translate_inst(
                     let y = resolve_value(y_id, types, constants, id_map,
                         next_value_id, insts, source_spirv_offset)?;
                     Op::FMax(x, y)
+                }
+                43 => {
+                    // FClamp(x, lo, hi) ≡ FMin(FMax(x, lo), hi).
+                    // Synthesise the intermediate FMax inline so
+                    // the IR carries only the two leaf primitive
+                    // ops -- backends don't need a clamp variant.
+                    let x_id  = expect_id(&spv_inst.operands, 2)?;
+                    let lo_id = expect_id(&spv_inst.operands, 3)?;
+                    let hi_id = expect_id(&spv_inst.operands, 4)?;
+                    let x  = resolve_value(x_id,  types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let lo = resolve_value(lo_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let hi = resolve_value(hi_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let mid = {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let v = Value { id, ty: result_ty.clone() };
+                        insts.push(Inst {
+                            op: Op::FMax(x, lo),
+                            result: Some(v.clone()),
+                            source_spirv_offset,
+                        });
+                        v
+                    };
+                    Op::FMin(mid, hi)
+                }
+                46 => {
+                    // FMix(x, y, a) ≡ x + a*(y - x).
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let y_id = expect_id(&spv_inst.operands, 3)?;
+                    let a_id = expect_id(&spv_inst.operands, 4)?;
+                    let x  = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let y  = resolve_value(y_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let a  = resolve_value(a_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let diff = {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let v = Value { id, ty: result_ty.clone() };
+                        insts.push(Inst {
+                            op: Op::FSub(y, x.clone()),
+                            result: Some(v.clone()),
+                            source_spirv_offset,
+                        });
+                        v
+                    };
+                    let scaled = {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let v = Value { id, ty: result_ty.clone() };
+                        insts.push(Inst {
+                            op: Op::FMul(a, diff),
+                            result: Some(v.clone()),
+                            source_spirv_offset,
+                        });
+                        v
+                    };
+                    Op::FAdd(x, scaled)
                 }
                 other => return Err(FrontendError::Unsupported(format!(
                     "GLSL.std.450 instruction enum {other} not yet supported",
