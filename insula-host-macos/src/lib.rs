@@ -27,6 +27,8 @@
 
 pub mod entitlements;
 mod error;
+pub mod launch;
 pub mod sbpl;
 
 pub use error::Error;
+pub use launch::{launch, LaunchOptions, SandboxedChild};

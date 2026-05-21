@@ -69,29 +69,25 @@ pub fn render_profile(manifest: &Manifest) -> String {
     // even a printf-and-exit program fails.
     let _ = writeln!(out, ";; Process internals (always required)");
     let _ = writeln!(out, "(allow process-fork)");
-    let _ = writeln!(out, "(allow process-exec (literal (param \"BINARY_PATH\")))");
+    let _ = writeln!(out, "(allow process-exec)");
     let _ = writeln!(out, "(allow signal (target self))");
     let _ = writeln!(out, "(allow sysctl-read)");
     let _ = writeln!(out, "(allow mach-per-user-lookup)");
     let _ = writeln!(out, "(allow ipc-posix-shm)");
-    let _ = writeln!(out, "(allow file-read-metadata)");
     let _ = writeln!(out);
 
-    // Container access (always-granted: the app's own
-    // sandbox root).
-    let _ = writeln!(out, ";; Container directory");
+    // **Read-most-things, write-only-in-container** is
+    // the App-Sandbox-shaped posture. Dyld + libc +
+    // system fonts + locale data + an enormous number
+    // of files outside `/usr/lib` need to be readable
+    // for even printf-and-exit to work. The security
+    // boundary lives on writes, not reads.
+    let _ = writeln!(out, ";; File access");
+    let _ = writeln!(out, "(allow file-read*)");
     let _ = writeln!(
         out,
         "(allow file* (subpath (param \"CONTAINER_DIR\")))"
     );
-    let _ = writeln!(out);
-
-    // System libraries and frameworks for dyld + libc.
-    let _ = writeln!(out, ";; System libraries (for dyld + libc)");
-    let _ = writeln!(out, "(allow file-read*");
-    let _ = writeln!(out, "  (subpath \"/usr/lib\")");
-    let _ = writeln!(out, "  (subpath \"/System/Library\")");
-    let _ = writeln!(out, "  (subpath \"/Library/Apple\"))");
     let _ = writeln!(out);
 
     // [ipc] services → mach-lookup whitelist.

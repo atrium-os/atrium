@@ -52,7 +52,9 @@ fn sbpl_for_hello_insula() {
     assert!(sb.contains("(deny default)"));
     assert!(sb.contains("(allow process-exec"));
     assert!(sb.contains("(allow file* (subpath (param \"CONTAINER_DIR\")))"));
-    assert!(sb.contains("(subpath \"/usr/lib\")"));
+    // Read-anywhere is the App-Sandbox-shaped default;
+    // writes are scoped to the container.
+    assert!(sb.contains("(allow file-read*)"));
 
     // hello-insula has no IPC or network, so those
     // sections should be absent.
