@@ -947,27 +947,100 @@ tier-2 on macOS dev hosts outside the VM.
 
 ## 15. Status / next steps
 
-This is the design doc, v2. No code yet.
+Phases 0–7 landed; the stack runs end-to-end through
+both backends.  As of 2026-05-21 the compute path
+specifically supports:
 
-If approved, phase 0 starts. The three concrete v0
-deliverables are:
+**Frontend (atrium-spv-frontend):**
 
-1. **`atrium-spv-ir` crate skeleton** — types only, no
-   methods. Just the IR shape locked in.
-2. **`atrium-spv-tests::interpreter`** — walks SPIR-V
-   directly, produces outputs for the differential
-   harness. Test-only, never ships.
-3. **`docs/spec/tier2-shader-codegen-constraints.md`** —
-   lifted from PPTK's `CONSTRAINTS.md`, adapted for
-   SPIR-V → ARM64. The "things to not get wrong"
-   catalogue.
+- Full SPIR-V interface discovery (entry points, uniforms,
+  push-constants, vertex inputs, varyings, descriptor
+  bindings).
+- BuiltIn dispatch for WorkgroupId, LocalInvocationId,
+  GlobalInvocationId, LocalInvocationIndex, WorkgroupSize,
+  VertexIndex, InstanceIndex.
+- AccessChain with constant-index struct + array walks
+  and a single trailing dynamic index into
+  RuntimeArray/Array (Op::PtrOffsetDynamic).
+- Atomic ops: AtomicIAdd, ISub, IIncrement, IDecrement,
+  And, Or, Xor, Exchange, Load, Store,
+  CompareExchange, SMin/SMax/UMin/UMax.
+- Barriers (ControlBarrier, MemoryBarrier) — no-ops on
+  the serial dispatcher, queued for a real lowering when
+  invocations parallelise.
+- GLSL.std.450 ExtInst dispatch for: FAbs, Floor, Ceil,
+  Trunc, Fract, FSign, Sqrt, FMin, FMax, FClamp, FMix,
+  Step, SmoothStep, Length, Distance, Normalize, Reflect.
+  Sin/cos/exp/log queued (need polynomial approximations
+  or libcall).
 
-Phase 0 also includes the differential test harness
-itself, the PC-map sidecar format, and the cache
-directory layout. All before any real codegen.
+**Bespoke backend (atrium-spv-backend-bespoke):**
 
-Phase 1 (frontend) and phase 2 (Cranelift backend) then
-land in series; phase 6 (Tier2Backend + plumbing) and
-phase 7 (rasterizer) can land in parallel with phase 3
-(bespoke skeleton). The bespoke perf work (phases 3, 8,
-9) is iterative thereafter.
+- Single-pass ISel + linear-scan regalloc, scalar f32 +
+  i32 + NEON-packed vec4f.
+- Compute calling convention with 1–6 SSBO bindings via a
+  descriptor-table prologue (X16, X17, X13, X14, X15, X12
+  pre-loaded from X2).
+- Op::PtrOffsetDynamic via lsl + add.
+- All listed atomics via load-op-store (correct on the
+  serial dispatcher; LSE LDADD path queued for when the
+  dispatcher parallelises).
+- GLSL.std.450 math listed above; vec4 NEON path for
+  FAbs/FSqrt/FMin/FMax, scalar f32 for the rest.
+- Architectural perf wins: unused-prologue-NOP truncation
+  (–36 bytes per function header in the common case),
+  identity-Phi-move peephole, classifier extensions for
+  the unary math ops.
+
+**Cranelift backend (atrium-spv-backend-cranelift):**
+
+- Mirror of the bespoke feature set for the fallback
+  path; per-lane vec4 via the existing emit_float_unop /
+  emit_float_binop helpers.
+- Cross-backend differential test framework
+  (atrium-spv-backend-bespoke/tests/differential_compute.rs)
+  exercises 41 distinct shader shapes for byte-identical
+  output, including a real-world histogram and a
+  reflect/normalize lighting kernel.
+
+**Host (aqueduct-gpu-host):**
+
+- Tier2Backend serial dispatcher with per-binding
+  descriptor-table assembly, per-binding readback, and
+  pre-fill API for SSBO inputs.
+- Tier2ComputeStateBlob carries `ssbo_binding_count`
+  alongside LocalSize.
+
+**ICD (atrium-vk-icd):**
+
+- vkCreateComputePipelines threads LocalSize + SSBO
+  binding count from a SPIR-V scan onto the compute
+  state blob.
+- `ATRIUM_SPV_FORCE_BACKEND` env var pins a specific
+  backend for testing + bisecting cross-backend drift.
+
+**Verified workloads end-to-end:**
+
+- Empty + constant-store compute (the floor case).
+- Per-pixel parallel writes via gid_x indexing.
+- Histogram (atomicAdd into a dynamically-indexed bin).
+- Lighting math (length, normalize, reflect, smoothstep).
+- Multi-binding SSBO routing across 1–6 bindings.
+
+**Known gaps:**
+
+- V-pool exhaustion on chains of 5+ vec4 ops that share
+  Load-synth lanes (single ignored differential test;
+  needs synth-lane lifetime tracking).
+- vec4 NEON path for FRINT* (floor/ceil/trunc) -- scalar
+  only today.
+- The bespoke bool W-pool is 3 slots (W10..W12) with
+  recycle-on-ConvertUToF; arbitrary-hole free-list lands
+  if real workloads exceed the eager-free pattern.
+- Multi-binding cap is 6 (driven by the spare-X-reg
+  count); shaders needing 7+ bindings fall back to
+  Cranelift.
+
+Phases 8–9 (peephole + perf polish) are iterative; the
+next concrete arcs are listed in the Known gaps + section
+9.6 (encoder gaps).
