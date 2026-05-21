@@ -1,0 +1,16 @@
+[package]
+name        = "insula-manifest"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+description = "Parser + types for the Insula app manifest (TOML extension of atrium.toml, per docs/spec/insula.md §5.1). The contract third-party Insula apps declare at install time — capability manifest, bundle layout, role implementations, background-task discipline. Pure Rust, no platform deps; consumed by Insula host adapters, Limen, Opifex, and Insula's SDK."
+publish     = false
+
+[lib]
+name = "insula_manifest"
+path = "src/lib.rs"
+
+[dependencies]
+serde     = { version = "1", features = ["derive"] }
+toml      = "0.8"
+thiserror = "1"
