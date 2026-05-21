@@ -214,13 +214,24 @@ pub struct Tier2ComputeStateBlob {
     pub local_size_y: u32,
     /// `local_size_z`.
     pub local_size_z: u32,
+    /// Number of distinct StorageBuffer bindings the shader
+    /// declares (across set 0; multi-set isn't modeled yet).
+    /// When `<= 1`, the dispatcher passes a single SSBO
+    /// pointer in X2 (legacy path).  When `>= 2`, X2 becomes
+    /// a descriptor-table base: an array of `ssbo_binding_count`
+    /// u64 pointers, one per binding.  Populated by the ICD
+    /// at vkCreateComputePipelines from a SPIR-V scan.
+    pub ssbo_binding_count: u32,
 }
 
 impl Default for Tier2ComputeStateBlob {
     /// Vulkan's spec default: 1x1x1 if a shader doesn't
     /// declare `LocalSize`. Apps should override.
     fn default() -> Self {
-        Self { local_size_x: 1, local_size_y: 1, local_size_z: 1 }
+        Self {
+            local_size_x: 1, local_size_y: 1, local_size_z: 1,
+            ssbo_binding_count: 0,
+        }
     }
 }
 

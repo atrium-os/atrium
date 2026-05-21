@@ -400,6 +400,90 @@ struct AtriumShaderModule {
     /// fragment, and compute shaders that use spec-constant
     /// `LocalSizeId` -- the latter falls back to 1x1x1).
     local_size: Option<(u32, u32, u32)>,
+    /// Distinct StorageBuffer bindings declared in the
+    /// SPIR-V, counted at shader-module-create time. Drives
+    /// the multi-binding compute dispatch path (see
+    /// `Tier2ComputeStateBlob::ssbo_binding_count`).
+    ssbo_binding_count: u32,
+}
+
+/// Count distinct StorageBuffer variables in `spirv` that
+/// carry a `Binding` decoration.  Multi-set isn't modeled
+/// (set is recorded but ignored downstream today).  Same
+/// hand-rolled SPIR-V walk style as `scan_spirv_local_size`
+/// -- avoids pulling rspirv into the runtime lib path.
+///
+/// Algorithm: two passes over the SPIR-V word stream.
+///   1. Build set of `OpTypePointer` result-ids whose
+///      StorageClass is `StorageBuffer` (12).
+///   2. Walk `OpVariable` instructions; if their result-type
+///      is in the StorageBuffer-pointer set, remember the
+///      variable id.  Then walk `OpDecorate` for `Binding`
+///      (33) on those variables -- count the matches.
+fn scan_spirv_ssbo_binding_count(spirv: &[u8]) -> u32 {
+    if spirv.len() < 20 || spirv.len() % 4 != 0 { return 0; }
+    let magic = u32::from_le_bytes(spirv[0..4].try_into().unwrap());
+    if magic != 0x07230203 { return 0; }
+    let mut ssbo_ptr_type_ids: std::collections::HashSet<u32>
+        = std::collections::HashSet::new();
+    let mut ssbo_var_ids: std::collections::HashSet<u32>
+        = std::collections::HashSet::new();
+    // Word at given byte offset.
+    let word_at = |off: usize| -> u32 {
+        u32::from_le_bytes(spirv[off..off + 4].try_into().unwrap())
+    };
+    // Pass 1: pointer-type + variable ids.
+    let mut cursor = 20;
+    while cursor + 4 <= spirv.len() {
+        let head = word_at(cursor);
+        let word_count = (head >> 16) as usize;
+        let opcode = (head & 0xFFFF) as u16;
+        if word_count == 0 { return 0; }
+        let instr_bytes = word_count * 4;
+        if cursor + instr_bytes > spirv.len() { return 0; }
+        // OpTypePointer = 32: <result_id, storage_class, type_id>
+        if opcode == 32 && word_count >= 4 {
+            let result_id = word_at(cursor + 4);
+            let storage = word_at(cursor + 8);
+            // StorageClass StorageBuffer = 12.
+            if storage == 12 {
+                ssbo_ptr_type_ids.insert(result_id);
+            }
+        }
+        // OpVariable = 59: <result_type, result_id, storage_class>
+        if opcode == 59 && word_count >= 4 {
+            let result_type = word_at(cursor + 4);
+            let result_id   = word_at(cursor + 8);
+            if ssbo_ptr_type_ids.contains(&result_type) {
+                ssbo_var_ids.insert(result_id);
+            }
+        }
+        cursor += instr_bytes;
+    }
+    // Pass 2: count Binding-decorated SSBO variables.
+    let mut count = 0u32;
+    let mut seen: std::collections::HashSet<u32>
+        = std::collections::HashSet::new();
+    let mut cursor = 20;
+    while cursor + 4 <= spirv.len() {
+        let head = word_at(cursor);
+        let word_count = (head >> 16) as usize;
+        let opcode = (head & 0xFFFF) as u16;
+        if word_count == 0 { break; }
+        let instr_bytes = word_count * 4;
+        if cursor + instr_bytes > spirv.len() { break; }
+        // OpDecorate = 71: <target_id, decoration, operands...>
+        if opcode == 71 && word_count >= 4 {
+            let target = word_at(cursor + 4);
+            let deco   = word_at(cursor + 8);
+            // Decoration Binding = 33.
+            if deco == 33 && ssbo_var_ids.contains(&target) && seen.insert(target) {
+                count += 1;
+            }
+        }
+        cursor += instr_bytes;
+    }
+    count
 }
 
 /// Scan SPIR-V bytecode for the `LocalSize` execution mode
@@ -3608,8 +3692,10 @@ pub unsafe extern "C" fn vkCreateShaderModule(
     hasher.update(&bytes);
     let bytecode_hash: [u8; 32] = hasher.finalize().into();
 
-    // Extract LocalSize before upload_shader consumes `bytes`.
+    // Extract LocalSize + SSBO binding count before
+    // upload_shader consumes `bytes`.
     let local_size = scan_spirv_local_size(&bytes);
+    let ssbo_binding_count = scan_spirv_ssbo_binding_count(&bytes);
 
     // Resolve-or-upload against the daemon. Failure (no live
     // client, validation rejection) leaves shader_id=None — the
@@ -3632,7 +3718,7 @@ pub unsafe extern "C" fn vkCreateShaderModule(
     dev.next_shader_id.set(handle + 1);
     if let Ok(mut s) = dev.shaders.lock() {
         s.insert(handle, AtriumShaderModule {
-            shader_id, bytecode_hash, local_size,
+            shader_id, bytecode_hash, local_size, ssbo_binding_count,
         });
     } else {
         return VK_ERROR_INITIALIZATION_FAILED;
@@ -4779,10 +4865,10 @@ pub unsafe extern "C" fn vkCreateComputePipelines(
         let info = &*(p_create_infos as *const ash::vk::ComputePipelineCreateInfo)
             .offset(i as isize);
         let mod_handle: u64 = std::mem::transmute(info.stage.module);
-        let (cs_rid, local_size) = match dev.shaders.lock() {
+        let (cs_rid, local_size, ssbo_binding_count) = match dev.shaders.lock() {
             Ok(m) => match m.get(&mod_handle) {
-                Some(am) => (am.shader_id, am.local_size),
-                None => (None, None),
+                Some(am) => (am.shader_id, am.local_size, am.ssbo_binding_count),
+                None => (None, None, 0),
             },
             Err(_) => continue,
         };
@@ -4792,6 +4878,7 @@ pub unsafe extern "C" fn vkCreateComputePipelines(
             local_size_x: local_size.map(|(x, _, _)| x).unwrap_or(1),
             local_size_y: local_size.map(|(_, y, _)| y).unwrap_or(1),
             local_size_z: local_size.map(|(_, _, z)| z).unwrap_or(1),
+            ssbo_binding_count,
         };
         let Ok(bytes) = postcard::to_allocvec(&blob) else { continue };
 
@@ -8724,6 +8811,91 @@ mod tests {
         let destroy: unsafe extern "C" fn(VkInstance, *const c_void) =
             unsafe { std::mem::transmute(f_destroy) };
         unsafe { destroy(inst, std::ptr::null()); }
+    }
+
+    fn build_n_ssbo_cs(n: u32) -> Vec<u8> {
+        use rspirv::binary::Assemble;
+        use rspirv::spirv::{
+            AddressingModel, Capability, Decoration, ExecutionMode,
+            ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+        };
+        let mut b = rspirv::dr::Builder::new();
+        b.set_version(1, 3);
+        b.capability(Capability::Shader);
+        b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+        let void   = b.type_void();
+        let u32_ty = b.type_int(32, 0);
+        let void_fn = b.type_function(void, vec![]);
+        let mut vars = Vec::new();
+        for i in 0..n {
+            let s = b.type_struct(vec![u32_ty]);
+            b.decorate(s, Decoration::Block, vec![]);
+            b.member_decorate(s, 0, Decoration::Offset,
+                vec![rspirv::dr::Operand::LiteralBit32(0)]);
+            let ptr = b.type_pointer(None, StorageClass::StorageBuffer, s);
+            let v = b.variable(ptr, None, StorageClass::StorageBuffer, None);
+            b.decorate(v, Decoration::DescriptorSet,
+                vec![rspirv::dr::Operand::LiteralBit32(0)]);
+            b.decorate(v, Decoration::Binding,
+                vec![rspirv::dr::Operand::LiteralBit32(i)]);
+            vars.push(v);
+        }
+        let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+        b.begin_block(None).unwrap();
+        b.ret().unwrap();
+        b.end_function().unwrap();
+        b.entry_point(ExecutionModel::GLCompute, main, "main", vars);
+        b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+        let words: Vec<u32> = b.module().assemble();
+        let mut bytes = Vec::with_capacity(words.len() * 4);
+        for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+        bytes
+    }
+
+    #[test]
+    fn ssbo_scanner_counts_distinct_bindings() {
+        assert_eq!(scan_spirv_ssbo_binding_count(&build_n_ssbo_cs(0)), 0);
+        assert_eq!(scan_spirv_ssbo_binding_count(&build_n_ssbo_cs(1)), 1);
+        assert_eq!(scan_spirv_ssbo_binding_count(&build_n_ssbo_cs(2)), 2);
+        assert_eq!(scan_spirv_ssbo_binding_count(&build_n_ssbo_cs(4)), 4);
+    }
+
+    #[test]
+    fn ssbo_scanner_ignores_uniform_bindings() {
+        // A shader with one Uniform binding (not StorageBuffer)
+        // should return 0 -- only StorageBuffer counts.
+        use rspirv::binary::Assemble;
+        use rspirv::spirv::{
+            AddressingModel, Capability, Decoration, ExecutionMode,
+            ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+        };
+        let mut b = rspirv::dr::Builder::new();
+        b.set_version(1, 3);
+        b.capability(Capability::Shader);
+        b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+        let void   = b.type_void();
+        let u32_ty = b.type_int(32, 0);
+        let void_fn = b.type_function(void, vec![]);
+        let s = b.type_struct(vec![u32_ty]);
+        b.decorate(s, Decoration::Block, vec![]);
+        b.member_decorate(s, 0, Decoration::Offset,
+            vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        let ptr = b.type_pointer(None, StorageClass::Uniform, s);
+        let v = b.variable(ptr, None, StorageClass::Uniform, None);
+        b.decorate(v, Decoration::DescriptorSet,
+            vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        b.decorate(v, Decoration::Binding,
+            vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+        b.begin_block(None).unwrap();
+        b.ret().unwrap();
+        b.end_function().unwrap();
+        b.entry_point(ExecutionModel::GLCompute, main, "main", vec![v]);
+        b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+        let words: Vec<u32> = b.module().assemble();
+        let mut bytes = Vec::with_capacity(words.len() * 4);
+        for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+        assert_eq!(scan_spirv_ssbo_binding_count(&bytes), 0);
     }
 
     #[test]
