@@ -44,6 +44,16 @@ type CsMain = unsafe extern "C" fn(
 /// a descriptor-table base, depending on the shader).
 fn invoke(spv: &[u8], use_bespoke: bool, dir: &Path, name: &str,
           out_ptr: *mut u8) {
+    invoke_with_gids(spv, use_bespoke, dir, name, out_ptr, &[(0, 0, 0)]);
+}
+
+/// Same as `invoke`, but calls `cs_main` once per entry in
+/// `gids`, simulating the per-invocation dispatch loop the
+/// host runs for real workgroups.  Each tuple is
+/// `(gid_x, gid_y, gid_z)`; local-invocation lanes are kept
+/// at 0 since these tests don't exercise lid math.
+fn invoke_with_gids(spv: &[u8], use_bespoke: bool, dir: &Path, name: &str,
+                    out_ptr: *mut u8, gids: &[(u32, u32, u32)]) {
     let module = translate(spv).expect("frontend");
     let obj = if use_bespoke {
         let t = if cfg!(target_os = "macos") {
@@ -64,11 +74,13 @@ fn invoke(spv: &[u8], use_bespoke: bool, dir: &Path, name: &str,
     let cs_main: libloading::Symbol<CsMain> = unsafe {
         lib.get(b"atrium_cs_main").expect("atrium_cs_main symbol")
     };
-    unsafe {
-        cs_main(
-            std::ptr::null(), std::ptr::null(), out_ptr,
-            0, 0, 0, 0, 0, 0,
-        );
+    for &(gx, gy, gz) in gids {
+        unsafe {
+            cs_main(
+                std::ptr::null(), std::ptr::null(), out_ptr,
+                gx, gy, gz, 0, 0, 0,
+            );
+        }
     }
 }
 
@@ -191,6 +203,83 @@ fn differential_four_binding_constant_store() {
     for i in 0..4 {
         let v = u32::from_le_bytes(b[i][0..4].try_into().unwrap());
         assert_eq!(v, 0xCAFE_0000 | (i as u32));
+    }
+}
+
+/// CS: `ssbo.data[gid_x] = gid_x`.  Driving this with
+/// gid_x in 0..N writes the identity permutation into the
+/// first N u32 slots.  Validates Op::PtrOffsetDynamic
+/// produces matching results in both backends.
+fn build_dyn_ssbo_identity() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let uvec3  = b.type_vector(u32_ty, 3);
+    let void_fn = b.type_function(void, vec![]);
+    let rt_arr = b.type_runtime_array(u32_ty);
+    b.decorate(rt_arr, Decoration::ArrayStride,
+        vec![rspirv::dr::Operand::LiteralBit32(4)]);
+    let s = b.type_struct(vec![rt_arr]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_u = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+    let ssbo = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_in_uvec3 = b.type_pointer(None, StorageClass::Input, uvec3);
+    let gid_var = b.variable(ptr_in_uvec3, None, StorageClass::Input, None);
+    b.decorate(gid_var, Decoration::BuiltIn,
+        vec![rspirv::dr::Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let gid = b.load(uvec3, None, gid_var, None, vec![]).unwrap();
+    let gid_x = b.composite_extract(u32_ty, None, gid, vec![0]).unwrap();
+    let dst = b.access_chain(ptr_u, None, ssbo, vec![c_zero, gid_x]).unwrap();
+    b.store(dst, gid_x, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main",
+        vec![gid_var, ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn differential_dynamic_ssbo_index_writes_per_lane() {
+    let spv = build_dyn_ssbo_identity();
+    let dir = TempDir::new().unwrap();
+    // Allocate a 64-byte buffer (16 u32 slots) -- plenty
+    // for 8 invocations.
+    let mut b_buf = vec![0u8; 64];
+    let mut c_buf = vec![0u8; 64];
+    let gids: Vec<(u32, u32, u32)> = (0..8).map(|i| (i, 0, 0)).collect();
+    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &gids);
+    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &gids);
+    assert_eq!(b_buf, c_buf,
+        "bespoke and cranelift diverge on dynamic SSBO index:\n  \
+         bespoke   = {b_buf:?}\n  \
+         cranelift = {c_buf:?}");
+    // Sanity-check the actual values too.
+    for i in 0..8usize {
+        let v = u32::from_le_bytes(b_buf[i*4..i*4+4].try_into().unwrap());
+        assert_eq!(v, i as u32,
+            "slot {i} should hold {i}, got {v}");
     }
 }
 
