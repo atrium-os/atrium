@@ -2455,3 +2455,234 @@ fn vk_app_compute_histogram_via_cranelift_force() {
     let _ = server_thread;
     let _ = std::fs::remove_file(&sock);
 }
+
+/// Per-vertex Lambert lighting CS.  Reads two vec4 SSBO
+/// inputs (normal, light_dir), normalises both, dot-products,
+/// max-with-zero clamps, writes the resulting per-vertex
+/// diffuse intensity (scalar f32) to an output SSBO.
+fn build_lambert_cs() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let std_450 = b.ext_inst_import("GLSL.std.450");
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let f32_ty = b.type_float(32, None);
+    let uvec3  = b.type_vector(u32_ty, 3);
+    let vec4   = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let rt_vec4 = b.type_runtime_array(vec4);
+    b.decorate(rt_vec4, Decoration::ArrayStride,
+        vec![rspirv::dr::Operand::LiteralBit32(16)]);
+    let rt_f32 = b.type_runtime_array(f32_ty);
+    b.decorate(rt_f32, Decoration::ArrayStride,
+        vec![rspirv::dr::Operand::LiteralBit32(4)]);
+    let s_n  = b.type_struct(vec![rt_vec4]);
+    b.decorate(s_n, Decoration::Block, vec![]);
+    b.member_decorate(s_n, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let s_l  = b.type_struct(vec![rt_vec4]);
+    b.decorate(s_l, Decoration::Block, vec![]);
+    b.member_decorate(s_l, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let s_out = b.type_struct(vec![rt_f32]);
+    b.decorate(s_out, Decoration::Block, vec![]);
+    b.member_decorate(s_out, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_sn   = b.type_pointer(None, StorageClass::StorageBuffer, s_n);
+    let ptr_sl   = b.type_pointer(None, StorageClass::StorageBuffer, s_l);
+    let ptr_sout = b.type_pointer(None, StorageClass::StorageBuffer, s_out);
+    let ptr_v    = b.type_pointer(None, StorageClass::StorageBuffer, vec4);
+    let ptr_f    = b.type_pointer(None, StorageClass::StorageBuffer, f32_ty);
+    let v_n  = b.variable(ptr_sn,   None, StorageClass::StorageBuffer, None);
+    b.decorate(v_n, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(v_n, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let v_l  = b.variable(ptr_sl,   None, StorageClass::StorageBuffer, None);
+    b.decorate(v_l, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(v_l, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(1)]);
+    let v_out = b.variable(ptr_sout, None, StorageClass::StorageBuffer, None);
+    b.decorate(v_out, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(v_out, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(2)]);
+    let ptr_in_uvec3 = b.type_pointer(None, StorageClass::Input, uvec3);
+    let gid_var = b.variable(ptr_in_uvec3, None, StorageClass::Input, None);
+    b.decorate(gid_var, Decoration::BuiltIn,
+        vec![rspirv::dr::Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    let c_zero_f = b.constant_bit32(f32_ty, 0.0f32.to_bits());
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let gid = b.load(uvec3, None, gid_var, None, vec![]).unwrap();
+    let gid_x = b.composite_extract(u32_ty, None, gid, vec![0]).unwrap();
+    let n_ptr = b.access_chain(ptr_v, None, v_n, vec![c_zero, gid_x]).unwrap();
+    let n = b.load(vec4, None, n_ptr, None, vec![]).unwrap();
+    let l_ptr = b.access_chain(ptr_v, None, v_l, vec![c_zero, gid_x]).unwrap();
+    let l = b.load(vec4, None, l_ptr, None, vec![]).unwrap();
+    let n_norm = b.ext_inst(vec4, None, std_450, 69,
+        vec![rspirv::dr::Operand::IdRef(n)]).unwrap();
+    let l_norm = b.ext_inst(vec4, None, std_450, 69,
+        vec![rspirv::dr::Operand::IdRef(l)]).unwrap();
+    let d = b.dot(f32_ty, None, n_norm, l_norm).unwrap();
+    let lit = b.ext_inst(f32_ty, None, std_450, 40,
+        vec![rspirv::dr::Operand::IdRef(d),
+             rspirv::dr::Operand::IdRef(c_zero_f)]).unwrap();
+    let out_ptr = b.access_chain(ptr_f, None, v_out, vec![c_zero, gid_x]).unwrap();
+    b.store(out_ptr, lit, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main",
+        vec![gid_var, v_n, v_l, v_out]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn vk_app_compute_lambert_lighting_end_to_end() {
+    // Per-vertex Lambert via the full production daemon path.
+    // Three SSBO bindings (normals, light dirs, output
+    // intensity).  Each invocation:
+    //   - loads a normal + light vec4
+    //   - normalises both
+    //   - dot-products
+    //   - max(0, dot) for one-sided lighting
+    //   - writes scalar f32 intensity
+    let _ = env_logger::builder().is_test(true).try_init();
+    let sock = tmp_socket("c_lambert");
+    let cache_dir = TempDir::new().unwrap();
+    let registry = Arc::new(Tier2Registry::new(LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    }));
+    let tier2_backend = Arc::new(Tier2Backend::new(registry.clone()));
+    let backend_for_listener: Arc<dyn Backend> = tier2_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap()
+        .with_tier2_registry(registry.clone());
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+
+    let _env = EnvLock::set(&sock);
+
+    let mut instance: VkInstance = std::ptr::null_mut();
+    unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
+    let mut pds: [VkPhysicalDevice; 1] = [std::ptr::null_mut(); 1];
+    let mut cap: u32 = 1;
+    unsafe { vkEnumeratePhysicalDevices(instance, &mut cap, pds.as_mut_ptr()); }
+    let mut device: VkDevice = std::ptr::null_mut();
+    unsafe { vkCreateDevice(pds[0], std::ptr::null(), std::ptr::null(), &mut device); }
+    let mut queue: VkQueue = std::ptr::null_mut();
+    unsafe { vkGetDeviceQueue(device, 0, 0, &mut queue); }
+
+    let cs_spv = build_lambert_cs();
+    let cs_mod = make_shader_module(device, &cs_spv);
+
+    use ash::vk;
+    use ash::vk::Handle;
+    let stage = vk::PipelineShaderStageCreateInfo {
+        s_type: vk::StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
+        p_next: std::ptr::null(),
+        flags: vk::PipelineShaderStageCreateFlags::empty(),
+        stage: vk::ShaderStageFlags::COMPUTE,
+        module: vk::ShaderModule::from_raw(cs_mod),
+        p_name: b"main\0".as_ptr() as *const i8,
+        p_specialization_info: std::ptr::null(),
+        _marker: std::marker::PhantomData,
+    };
+    let info = vk::ComputePipelineCreateInfo {
+        s_type: vk::StructureType::COMPUTE_PIPELINE_CREATE_INFO,
+        p_next: std::ptr::null(),
+        flags: vk::PipelineCreateFlags::empty(),
+        stage, layout: vk::PipelineLayout::null(),
+        base_pipeline_handle: vk::Pipeline::null(),
+        base_pipeline_index: 0,
+        _marker: std::marker::PhantomData,
+    };
+    let infos = [info];
+    let mut pipeline: u64 = 0;
+    unsafe {
+        vkCreateComputePipelines(
+            device, 0, 1,
+            infos.as_ptr() as *const std::ffi::c_void,
+            std::ptr::null(), &mut pipeline,
+        );
+    }
+    assert!(pipeline != 0);
+    thread::sleep(Duration::from_millis(200));
+
+    // Three normals + three light dirs.  Expected dots:
+    //   (0,1,0,0) · (0,1,0,0)   = 1   (face directly lit)
+    //   (0,1,0,0) · (1,0,0,0)   = 0   (perpendicular -- dark edge)
+    //   (1,0,0,0) · (-1,0,0,0)  = -1  (backface; clamped to 0)
+    let normals: [[f32; 4]; 3] = [
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0, 0.0],
+    ];
+    let lights: [[f32; 4]; 3] = [
+        [0.0,  1.0, 0.0, 0.0],
+        [1.0,  0.0, 0.0, 0.0],
+        [-1.0, 0.0, 0.0, 0.0],
+    ];
+    let mut n_buf = vec![0u8; 64];
+    let mut l_buf = vec![0u8; 64];
+    for (i, v) in normals.iter().enumerate() {
+        for (j, x) in v.iter().enumerate() {
+            n_buf[i*16 + j*4..i*16 + j*4+4].copy_from_slice(&x.to_le_bytes());
+        }
+    }
+    for (i, v) in lights.iter().enumerate() {
+        for (j, x) in v.iter().enumerate() {
+            l_buf[i*16 + j*4..i*16 + j*4+4].copy_from_slice(&x.to_le_bytes());
+        }
+    }
+    tier2_backend.set_compute_input_for_binding(0, n_buf);
+    tier2_backend.set_compute_input_for_binding(1, l_buf);
+
+    let mut pool: u64 = 0;
+    unsafe { vkCreateCommandPool(device, std::ptr::null(), std::ptr::null(), &mut pool); }
+    let mut cb_info = [0u8; 40];
+    cb_info[0..4].copy_from_slice(&40u32.to_le_bytes());
+    cb_info[16..24].copy_from_slice(&pool.to_le_bytes());
+    cb_info[28..32].copy_from_slice(&1u32.to_le_bytes());
+    let mut cbs: [VkCommandBuffer; 1] = [std::ptr::null_mut(); 1];
+    unsafe { vkAllocateCommandBuffers(device, cb_info.as_ptr() as *const _, cbs.as_mut_ptr()); }
+    let cb = cbs[0];
+    unsafe { vkBeginCommandBuffer(cb, std::ptr::null()); }
+    unsafe { vkCmdBindPipeline(cb, 1, pipeline); }
+    unsafe { vkCmdDispatch(cb, 3, 1, 1); }
+    unsafe { vkEndCommandBuffer(cb); }
+    let mut submit = [0u8; 72];
+    submit[0..4].copy_from_slice(&4u32.to_le_bytes());
+    submit[40..44].copy_from_slice(&1u32.to_le_bytes());
+    let cb_arr = [cb];
+    submit[48..56].copy_from_slice(&(cb_arr.as_ptr() as u64).to_le_bytes());
+    unsafe { vkQueueSubmit(queue, 1, submit.as_ptr() as *const _, std::ptr::null_mut()); }
+    thread::sleep(Duration::from_millis(300));
+
+    let out = tier2_backend.compute_output_bytes_for_binding(2)
+        .expect("lambert output");
+    let expected = [1.0f32, 0.0, 0.0];
+    for i in 0..3 {
+        let v = f32::from_le_bytes(out[i*4..i*4+4].try_into().unwrap());
+        assert!((v - expected[i]).abs() < 1e-5,
+            "vertex {i}: expected {}, got {v}", expected[i]);
+    }
+
+    unsafe { atrium_vk_icd::vkDestroyInstance(instance, std::ptr::null()); }
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
