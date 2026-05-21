@@ -2778,9 +2778,10 @@ Written:
   catalogue (sketched from §10.3 of this spec).
 - [`docs/spec/nomenclator.md`](nomenclator.md) — name
   resolution protocol (sketched from §12 of this spec).
+- [`docs/spec/tabellarius.md`](tabellarius.md) — push
+  delivery protocol (sketched from §11.5 of this spec).
 
 Planned, not yet written:
-- `docs/spec/tabellarius.md` — push delivery protocol.
 - `docs/spec/loculus.md` — wallet schema.
 - `docs/spec/concursus.md` — peer signaling.
 - `docs/spec/nomenclator.md` — name resolution protocol.
