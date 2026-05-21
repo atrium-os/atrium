@@ -204,17 +204,33 @@ impl Session {
             format: req.format,
         });
         // Hand to the backend so it can allocate its per-image
-        // state (SW backend: tiny_skia::Pixmap; GPU backend:
-        // typically no-op, allocation happens via vkBindImageMemory
-        // equivalents).
-        self.backend.image_created(req.image_id, req.width, req.height);
+        // state. Depth-format images go through the depth hook
+        // (Vec<f32> storage); colour formats go through the
+        // standard image_created hook (RGBA8 storage).
+        // VkFormat depth/stencil values: D16_UNORM=124,
+        // X8_D24_UNORM_PACK32=125, D32_SFLOAT=126, S8_UINT=127,
+        // D16_UNORM_S8_UINT=128, D24_UNORM_S8_UINT=129,
+        // D32_SFLOAT_S8_UINT=130.
+        let is_depth_format = (124..=130).contains(&req.format);
+        if is_depth_format {
+            self.backend.depth_image_created(req.image_id, req.width, req.height);
+        } else {
+            self.backend.image_created(req.image_id, req.width, req.height);
+        }
         Ok(())
     }
 
     fn handle_image_destroy(&mut self, m: Message) -> Result<()> {
         let req: ImageDestroyPayload = postcard::from_bytes(&m.payload)?;
+        // Try both color + depth removal hooks; backends that
+        // didn't allocate for this image no-op either way.
+        let format = self.table.get_image(req.image_id).map(|r| r.format);
         self.table.remove_image(req.image_id);
-        self.backend.image_destroyed(req.image_id);
+        if matches!(format, Some(f) if (124..=130).contains(&f)) {
+            self.backend.depth_image_destroyed(req.image_id);
+        } else {
+            self.backend.image_destroyed(req.image_id);
+        }
         Ok(())
     }
 

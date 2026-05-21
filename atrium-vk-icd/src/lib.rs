@@ -3882,19 +3882,30 @@ pub unsafe extern "C" fn vkCmdBeginRenderPass(
     let clear_count = std::ptr::read_unaligned(b.add(48) as *const u32);
     let p_clears    = std::ptr::read_unaligned(b.add(56) as *const *const u8);
 
-    // Resolve framebuffer → first attachment → image → image_id.
-    let fb_first_view = dev.framebuffers.lock().ok()
-        .and_then(|f| f.get(&framebuffer).and_then(|fb| fb.attachments.first().copied()));
-    let image = fb_first_view.and_then(|view| {
-        dev.image_views.lock().ok().and_then(|v| v.get(&view).copied())
-    });
-    let image_id = image.and_then(|img| {
+    // Resolve framebuffer → attachments + walk for color +
+    // (optional) depth image_ids.  Convention: attachments[0]
+    // is the colour target, attachments[1] (if present) is
+    // the depth target.  Real Vulkan apps put them in this
+    // order in the renderpass + framebuffer attachment lists.
+    let attachments = dev.framebuffers.lock().ok()
+        .and_then(|f| f.get(&framebuffer).map(|fb| fb.attachments.clone()))
+        .unwrap_or_default();
+    let resolve_image_id = |view: u64| -> Option<aqueduct_gpu::ids::ResourceId> {
+        let img = dev.image_views.lock().ok()
+            .and_then(|v| v.get(&view).copied())?;
         dev.images.lock().ok()
             .and_then(|m| m.get(&img).and_then(|x| x.image_id))
-    });
+    };
+    let color_image_id = attachments.first().copied().and_then(resolve_image_id);
+    let depth_image_id = attachments.get(1).copied().and_then(resolve_image_id);
 
-    // Clear color: read 4 f32, quantize to RGBA8.
+    // Clear color: read 4 f32, quantize to RGBA8.  Clear
+    // values are laid out per attachment in the same order:
+    // pClearValues[0] is the colour clear, pClearValues[1] is
+    // the depth clear (VkClearValue.depthStencil.depth at
+    // offset 0 of the 16-byte union).
     let mut clear_rgba8 = [0u8, 0, 0, 255];
+    let mut depth_clear: f32 = 1.0;
     if clear_count > 0 && !p_clears.is_null() {
         let r = std::ptr::read_unaligned(p_clears as *const f32);
         let g = std::ptr::read_unaligned(p_clears.add(4) as *const f32);
@@ -3906,16 +3917,30 @@ pub unsafe extern "C" fn vkCmdBeginRenderPass(
             (bl.clamp(0.0, 1.0) * 255.0) as u8,
             (a.clamp(0.0, 1.0) * 255.0) as u8,
         ];
+        if clear_count > 1 {
+            depth_clear = std::ptr::read_unaligned(p_clears.add(16) as *const f32);
+        }
     }
 
     // BeginRenderPass body: 12 bytes (target_image_id u32 +
     // clear_color_rgba8 [u8;4] + flags u32). flags=0 today.
     let mut body = [0u8; 12];
-    let tid = image_id.map(|i| i.raw()).unwrap_or(0);
+    let tid = color_image_id.map(|i| i.raw()).unwrap_or(0);
     body[ 0.. 4].copy_from_slice(&tid.to_le_bytes());
     body[ 4.. 8].copy_from_slice(&clear_rgba8);
     // flags @ 8..12 already zero.
     let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::BeginRenderPass, &body);
+
+    // Optional follow-up: depth attachment.  Tier-1 ignores
+    // this op; tier-2 wires it into the persistent depth-
+    // image storage for the duration of this render pass.
+    if let Some(did) = depth_image_id {
+        let _ = cb.frame.push_bind_depth_attachment(
+            aqueduct_gpu::frame::BindDepthAttachmentCmd {
+                image_id: did.raw(),
+                clear_value: depth_clear,
+            });
+    }
 }
 
 /// `vkCmdEndRenderPass` — push `EndRenderPass`.
