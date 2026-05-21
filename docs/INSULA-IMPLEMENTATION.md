@@ -2,7 +2,7 @@
 
 **Branch:** `claude/romantic-rubin-42085b`
 **Last updated:** 2026-05-21
-**Phase:** M1A (Foundation) complete; M1B (service catalogue MVP minus Pergola) substantially complete — five libatrium ABI surfaces, four backing daemons.
+**Phase:** M1A (Foundation) complete; M1B (service catalogue MVP minus Pergola) substantially complete — five libatrium ABI surfaces, four backing daemons, bundle signing end-to-end.
 
 This document orients a reader landing fresh in the
 branch. For the design corpus see [`spec/insula.md`](spec/insula.md)
@@ -62,17 +62,18 @@ What this exercises end-to-end:
 
 ## Crate layout
 
-Ten crates at the repo root. Each is its own `Cargo.toml`;
+Eleven crates at the repo root. Each is its own `Cargo.toml`;
 the repo has no top-level workspace by convention.
 
 | Crate | Purpose | LoC (src + tests) |
 |---|---|---|
 | [`insula-manifest`](../insula-manifest/) | TOML parser for the full Insula manifest spec | ~700 |
-| [`insula-bundle`](../insula-bundle/) | On-disk bundle reader + validator | ~250 |
+| [`insula-bundle`](../insula-bundle/) | On-disk bundle reader + signing + validator | ~550 |
 | [`libatrium`](../libatrium/) | Platform C ABI (cdylib + rlib + staticlib) | ~1100 |
 | [`insula-host-macos`](../insula-host-macos/) | macOS host adapter: SBPL gen, install, launch | ~950 |
 | [`insula-hello`](../insula-hello/) | Demo Insula app + manifest | ~200 |
-| [`insula-cli`](../insula-cli/) | `insula install / launch / list / info / uninstall / daemons` | ~750 |
+| [`atrium-fetch`](../atrium-fetch/) | Second sample app — HTTP GET via the platform ABI | ~150 |
+| [`insula-cli`](../insula-cli/) | `insula install / launch / list / info / uninstall / daemons / keygen / sign / publishers` | ~1100 |
 | [`insula-logd`](../insula-logd/) | Aqueduct log-forwarding daemon | ~300 |
 | [`vestibulum-macos`](../vestibulum-macos/) | ed25519 keychain daemon (disk-backed) | ~450 |
 | [`atrium-netd-macos`](../atrium-netd-macos/) | Network broker (allowlist + byte proxy) | ~400 |
@@ -172,12 +173,12 @@ $INSULA daemons down
 
 ## Testing
 
-94 tests pass across all 10 crates on this macOS host.
+108 tests pass across all 11 crates on this macOS host.
 
 ```sh
 for c in insula-manifest insula-bundle libatrium \
-         insula-host-macos insula-hello insula-cli \
-         insula-logd vestibulum-macos \
+         insula-host-macos insula-hello atrium-fetch \
+         insula-cli insula-logd vestibulum-macos \
          atrium-netd-macos praeco-macos; do
   cargo test --manifest-path "$c/Cargo.toml"
 done
@@ -188,11 +189,12 @@ Test distribution:
 | Crate | Tests | Notable |
 |---|---|---|
 | insula-manifest | 17 | Full coverage of manifest sections + roundtrip |
-| insula-bundle | 5 | Bundle layout validation incl. malformed cases |
+| insula-bundle | 12 | Bundle layout validation + ed25519 sign/verify wire format |
 | libatrium | 11 | C ABI surface tests + Aqueduct routing + storage |
 | insula-host-macos | 16 | SBPL gen + actual sandboxed launch + install layout |
 | insula-hello | 5 | Bundle parses; install+run via host adapter; per-app netd enforcement E2E (allow + deny) |
-| insula-cli | 11 | All subcommands + auto-spawn + logd integration |
+| atrium-fetch | 1 | Bundle + manifest parse for the HTTP-GET sample |
+| insula-cli | 17 | All subcommands incl. keygen / sign / publishers + auto-spawn + logd integration + signed-install E2E |
 | insula-logd | 3 | Daemon decodes Aqueduct messages + writes log file |
 | vestibulum-macos | 10 | ed25519 keychain roundtrip incl. signature verify, persistence across restart |
 | atrium-netd-macos | 13 | Per-app manifest enforcement (8 unit) + broker behavior (5 integration) |
@@ -249,10 +251,15 @@ the design isn't just on paper):
 
 ## v0 limitations (documented)
 
-- **No bundle signing.** Bundles are unsigned in v0;
-  `manifest.signature` is unused. Per spec §3.1 and
-  `insula-host-macos.md` §10.3 — signing + notarization
-  are Phase 1C work.
+- **~~No bundle signing.~~** Done. ed25519 signatures with
+  an "INSL" v1 wire format (key_id + pubkey + signature
+  over `SHA256(manifest.toml) || SHA256(entry binary)`).
+  CLI subcommands `insula keygen`, `insula sign`,
+  `insula publishers {add,list,remove}`. Verification at
+  install time against `<install_root>/trusted-publishers/<key-id>.pub`;
+  unsigned installs require explicit `--allow-unsigned`.
+  E2E-tested: trusted-publisher install, tampered-bundle
+  rejection, wrong-publisher rejection.
 - **Vestibulum keystore is plaintext on disk.** Keys
   survive daemon restart (real persistence) but the
   `.key` files are unencrypted ed25519 secrets. macOS
@@ -309,33 +316,36 @@ none of them invalidates the current shape.
 
 ## Commit history of the implementation effort
 
-25 implementation commits, oldest at the bottom:
+27 implementation commits on this branch, oldest at the bottom:
 
 ```
-5e0505f insula-hello: optional net-connect + E2E per-app netd enforcement test
-4725305 atrium-netd-macos: per-app manifest enforcement (SO_PEERPID + proc_pidpath)
-f2b10da docs/INSULA-IMPLEMENTATION: reflect 5-ABI / 4-daemon state
-2dd0a93 praeco-macos: notifications daemon + atrium_notify_post
-06866a7 insula-cli + host-macos: auto-spawn atrium-netd-macos too
-b79da55 atrium-netd-macos: network broker daemon + atrium_net_connect ABI
-0ffbe19 vestibulum-macos: disk-backed keystore -- keys survive daemon restart
-108e18e docs/INSULA-IMPLEMENTATION: status doc for the implementation work
-ffc6fac insula-cli: auto-spawn daemons + daemons up/down/status
-5c5f83f vestibulum-macos: ed25519 keychain daemon + atrium_keychain_* ABI
-2ba7205 libatrium + host-macos: atrium_container_path + atrium_storage_open + canonical-path fix
-3b2d179 aqueduct: register CLASS_LOG=10; libatrium + insula-logd migrate
-daccfb9 insula-cli + host-macos: thread logd socket through launch
-0e08120 insula-logd: daemon that catches libatrium log forwarding
-bcb1df2 libatrium: route atrium_log over real Aqueduct when socket available
-338c10c insula-cli: user-facing command-line frontend
-c94c125 insula-bundle + install pathway: install once, launch by app-id
-029530b libatrium + insula-hello: end-to-end bring-up loop closed
-c9a91f4 insula-host-macos: launch path via sandbox-exec + integration tests
-af39721 insula-host-macos: SBPL + entitlements generation from manifest
-2d4fa17 insula-manifest: add [background] [role] [peer] [sync] [entry-points] [capabilities]
-1f076b7 insula-manifest: add [network] with host-allowlist shape
-42448cd insula-manifest: add [render] [input] [ipc] [storage] [compute]
-b651f13 insula-manifest: initial skeleton -- parse [app] + [bundle]
+cd82a5b insula-bundle + insula-cli: ed25519 bundle signing + install verification
+a5810d4 atrium-fetch: second sample app + half-close fix in netd broker
+988b972 docs/INSULA-IMPLEMENTATION: bump to 94 tests + per-app E2E story
+6204649 insula-hello: optional net-connect + E2E per-app netd enforcement test
+bc0826c atrium-netd-macos: per-app manifest enforcement (SO_PEERPID + proc_pidpath)
+3a695e3 docs/INSULA-IMPLEMENTATION: reflect 5-ABI / 4-daemon state
+c69111c praeco-macos: notifications daemon + atrium_notify_post
+0d3c6f9 insula-cli + host-macos: auto-spawn atrium-netd-macos too
+2614fec atrium-netd-macos: network broker daemon + atrium_net_connect ABI
+6dfbdc2 vestibulum-macos: disk-backed keystore -- keys survive daemon restart
+564d7f8 docs/INSULA-IMPLEMENTATION: status doc for the implementation work
+5ba3e4a insula-cli: auto-spawn daemons + daemons up/down/status subcommand
+da073d3 vestibulum-macos: ed25519 keychain daemon + atrium_keychain_* ABI
+ae5af97 libatrium + host-macos: atrium_container_path + atrium_storage_open + canonical-path fix
+55ce71d aqueduct: register CLASS_LOG=10; libatrium + insula-logd migrate
+063eee0 insula-cli + host-macos: thread logd socket through launch
+88fe51c insula-logd: daemon that catches libatrium log forwarding
+2f1b212 libatrium: route atrium_log over real Aqueduct when socket available
+1039fd9 insula-cli: user-facing command-line frontend
+8959808 insula-bundle + install pathway: install once, launch by app-id
+fa24f87 libatrium + insula-hello: end-to-end bring-up loop closed
+559bda1 insula-host-macos: launch path via sandbox-exec + integration tests
+5ef075b insula-host-macos: SBPL + entitlements generation from manifest
+8197907 insula-manifest: add [background] [role] [peer] [sync] [entry-points] [capabilities]
+6240143 insula-manifest: add [network] with host-allowlist shape
+fa75556 insula-manifest: add [render] [input] [ipc] [storage] [compute]
+5d68af9 insula-manifest: initial skeleton -- parse [app] + [bundle]
 ```
 
 ## Strategic checkpoints from ROADMAP-INSULA
@@ -361,17 +371,18 @@ b651f13 insula-manifest: initial skeleton -- parse [app] + [bundle]
    — wrap the `.key` files via SecItemAdd. Closes the
    "plaintext on disk" caveat. Depends on the
    `security-framework` crate or raw libc bindings.
-3. **Bundle signing** — minisign / ed25519-style as a first
-   pass per `atrium-pkg.md`. Adds an `insula sign` CLI
-   subcommand and verification at install time.
-4. **Tabellarius push delivery** — `insula.md` §11.5 isn't
+3. **Tabellarius push delivery** — `insula.md` §11.5 isn't
    started; pattern is well-established now (sixth daemon
    following the established shape).
-5. **More sample apps** — the platform supports the
-   primitives but only one app (insula-hello) exercises
-   them. A second app (e.g. an atrium-fetch tool that
-   uses atrium_net_connect with structured output) would
-   show breadth.
+4. **`insula bundle <dir>` packaging command** — today a
+   bundle is "a directory containing manifest.toml + bin/".
+   A single-file `.insula` archive (deterministic tar +
+   detached signature) would round out the publish story
+   per `insula.md` §3.1.
+5. **Capability-diff consent flow on re-install** — re-
+   install currently replaces `bundle/` silently. The
+   design calls for diffing manifest capabilities and
+   prompting on widening grants.
 
 Each of these is one or two commits given the current
 shape; the foundation underneath is in place.
