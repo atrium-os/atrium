@@ -199,6 +199,10 @@ int32_t atrium_window_frame_rect(
     uint32_t node_id,
     float x, float y, float w, float h,
     float r, float g, float b, float a);
+int32_t atrium_window_frame_path(
+    uint32_t node_id,
+    float cx, float cy, float length, float width, float angle,
+    float r, float g, float b, float a);
 int32_t atrium_window_frame_end(void);
 
 /* Window event kinds (mirror fresco_protocol::control::EV_*). */

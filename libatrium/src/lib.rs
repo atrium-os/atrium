@@ -1267,6 +1267,51 @@ pub extern "C" fn atrium_window_frame_rect(
     })
 }
 
+/// Emit a rotated-quad path node into the in-progress
+/// frame. `(cx, cy)` is the rotation pivot; `length` is
+/// the size along the rotation axis, `width`
+/// perpendicular; `angle` is radians CCW. Color is
+/// straight RGBA in `[0, 1]`.
+///
+/// Must be called between [`atrium_window_frame_begin`]
+/// and [`atrium_window_frame_end`].
+#[no_mangle]
+pub extern "C" fn atrium_window_frame_path(
+    node_id: u32,
+    cx: f32, cy: f32, length: f32, width: f32, angle: f32,
+    r: f32, g: f32, b: f32, a: f32,
+) -> c_int {
+    let window_id = match *FRESCO_FRAME_WINDOW.lock().unwrap() {
+        Some(w) => w,
+        None => return ATRIUM_ERR_FRESCO_RPC,
+    };
+    let flags = window_id as u16;
+    let path_bytes = match postcard::to_stdvec(&fresco_protocol::PathParams {
+        cx, cy, length, width, angle, r, g, b, a,
+    }) {
+        Ok(v) => v,
+        Err(_) => return ATRIUM_ERR_FRESCO_RPC,
+    };
+    let node = match postcard::to_stdvec(&fresco_protocol::SceneNodeSetPayload {
+        node_id,
+        op_id: fresco_protocol::scene_ops::ATRIUM_CORE_PATH,
+        params: path_bytes,
+    }) {
+        Ok(v) => v,
+        Err(_) => return ATRIUM_ERR_FRESCO_RPC,
+    };
+    with_fresco_conn(|conn| {
+        if conn.send_message(
+            CLASS_DISPLAY,
+            fresco_protocol::control::OP_SCENE_NODE_SET,
+            flags, &node,
+        ).is_err() {
+            return ATRIUM_ERR_FRESCO_RPC;
+        }
+        0
+    })
+}
+
 /// Commit the in-progress frame. The server presents
 /// the accumulated nodes.
 ///
