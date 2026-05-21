@@ -63,6 +63,9 @@ fn main() -> ExitCode {
             print_usage();
             Ok(())
         }
+        "version" | "-V" | "--version" => {
+            cmd_version(&args[2..])
+        }
         other => {
             eprintln!("insula: unknown command: {}", other);
             print_usage();
@@ -117,6 +120,8 @@ Commands:
   notify <title> <body> [--urgency low|normal|high]
                                    Post a notification (prints assigned id).
   doctor                           Run a health check across the install.
+  version [--verbose]              Print the insula CLI version.
+  --version / -V                   Same as `version`.
   init <dir> [--name <id>] [--entry <path>]
                                    Scaffold a new Insula app skeleton.
   run <bundle|insula> [app-args...]
@@ -889,6 +894,35 @@ fn cmd_uninstall(args: &[String], install_root: &Path) -> Result<(), String> {
         .map_err(|e| format!("removing {}: {}", app_root.display(), e))?;
 
     println!("Uninstalled {}", target);
+    Ok(())
+}
+
+// -----------------------------------------------------
+// version
+// -----------------------------------------------------
+
+fn cmd_version(args: &[String]) -> Result<(), String> {
+    let verbose = args.iter().any(|a| a == "--verbose" || a == "-v");
+    let version = env!("CARGO_PKG_VERSION");
+    if !verbose {
+        println!("insula {}", version);
+        return Ok(());
+    }
+    // Multi-line build report useful for bug filings.
+    println!("insula                 {}", version);
+    println!("  build profile        {}",
+             if cfg!(debug_assertions) { "debug" } else { "release" });
+    println!("  target               {}-{}",
+             std::env::consts::ARCH, std::env::consts::OS);
+    println!("  sdk-version          1.x");
+    // Capability summary by ABI family — answers "what
+    // surfaces does this binary's libatrium know about?".
+    // Static list rather than runtime probe so the
+    // output is reproducible.
+    println!("  libatrium surfaces   init, log, exit, storage,");
+    println!("                       keychain, network, notify, tabellarius,");
+    println!("                       window (open / fill / frame_begin / rect /");
+    println!("                       path / texture / glyph_run / poll_event)");
     Ok(())
 }
 
