@@ -357,6 +357,7 @@ fn emit_function(
         let mut translator = FnTranslator {
             stage: func.stage,
             local_size: func.local_size,
+            ssbo_var_ptr: HashMap::new(),
             entry_block: entry,
             // Cache the param-index → Cranelift value
             // mapping once; ip-walk reads it for ptr-arg
@@ -369,6 +370,28 @@ fn emit_function(
             image_handles: HashMap::new(),
             matrices: HashMap::new(),
         };
+
+        // Multi-binding compute SSBO prologue.  When
+        // ssbo_bindings declares 2+ StorageBuffer variables,
+        // params[2] is a descriptor-table base (an array of
+        // u64 pointers).  Load each binding's pointer into a
+        // fresh SSA value at function entry, keyed by the
+        // variable's IR ValueId; `resolve_pointer_param`
+        // consults `ssbo_var_ptr` before falling back to the
+        // legacy params[2]-direct path.
+        if func.stage == ShaderStage::Compute && func.ssbo_bindings.len() >= 2 {
+            builder.switch_to_block(entry);
+            let table_base = translator.params[2];
+            for (&vid, &(_set, binding)) in &func.ssbo_bindings {
+                let p = builder.ins().load(
+                    pointer_type,
+                    cranelift_codegen::ir::MemFlags::new(),
+                    table_base,
+                    (binding as i32) * 8,
+                );
+                translator.ssbo_var_ptr.insert(vid, p);
+            }
+        }
 
         // Walk every IR block in id order, switching the
         // builder to the Cranelift block for each. The
@@ -628,6 +651,12 @@ struct FnTranslator {
     /// `gl_GlobalInvocationID` codegen (multiplying
     /// WorkgroupId by LocalSize before adding LocalInvocationID).
     local_size: Option<(u32, u32, u32)>,
+    /// Multi-binding compute: variable ValueId -> Cranelift
+    /// pointer value loaded from the descriptor table.  Empty
+    /// when the shader is single-binding (legacy params[2]
+    /// path).  Populated by the entry-block prologue when
+    /// `func.ssbo_bindings.len() >= 2`.
+    ssbo_var_ptr: HashMap<u32, ClifValue>,
     #[allow(dead_code)]
     entry_block: cranelift_codegen::ir::Block,
     params: Vec<ClifValue>,
@@ -1677,7 +1706,7 @@ impl FnTranslator {
         v: &atrium_spv_ir::Value,
     ) -> Result<(ClifValue, i32), BackendError> {
         if let Some(p) = self.pointers.get(&v.id) { return Ok(*p); }
-        let param = self.resolve_pointer_param(&v.ty)?;
+        let param = self.resolve_pointer_param(&v.ty, v.id.0)?;
         self.pointers.insert(v.id, (param, 0));
         Ok((param, 0))
     }
@@ -1685,8 +1714,18 @@ impl FnTranslator {
     /// Map a storage-class pointer type to its Cranelift
     /// function-parameter value. The shader-ABI per stage
     /// puts the per-storage pointer at a fixed param
-    /// index.
-    fn resolve_pointer_param(&self, ty: &Type) -> Result<ClifValue, BackendError> {
+    /// index.  `var_id` is the IR ValueId of the underlying
+    /// Variable; for multi-binding compute (where SSBO
+    /// pointers were pre-loaded by the entry-block prologue
+    /// into `ssbo_var_ptr`) this picks the right per-binding
+    /// loaded pointer instead of the params[2] direct path.
+    fn resolve_pointer_param(&self, ty: &Type, var_id: u32) -> Result<ClifValue, BackendError> {
+        // Multi-binding compute SSBO short-circuit.
+        if matches!(self.stage, ShaderStage::Compute) {
+            if let Some(p) = self.ssbo_var_ptr.get(&var_id) {
+                return Ok(*p);
+            }
+        }
         let storage = match ty {
             Type::Pointer(sc, _) => sc,
             other => return Err(BackendError::Unsupported(format!(
