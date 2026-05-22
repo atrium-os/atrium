@@ -48,6 +48,59 @@ pub enum TexFormat {
     R8Unorm    = 2,
 }
 
+/// Storage-image texel formats the read/write helpers
+/// understand.  Distinct from [`TexFormat`] (sampling): the
+/// compute storage-image path needs float formats for
+/// general-purpose work.  Stable wire-form values.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageFormat {
+    /// 4×u8 unorm, channel order R,G,B,A.  4 bytes/texel.
+    Rgba8Unorm   = 0,
+    /// 1×f32, replicated to R on read; G=B=0, A=1.
+    /// 4 bytes/texel.
+    R32Float     = 1,
+    /// 4×f32, channel order R,G,B,A.  16 bytes/texel.
+    Rgba32Float  = 2,
+}
+
+impl StorageFormat {
+    /// Bytes occupied by one texel in this format.
+    pub fn bytes_per_texel(self) -> u32 {
+        match self {
+            StorageFormat::Rgba8Unorm  => 4,
+            StorageFormat::R32Float    => 4,
+            StorageFormat::Rgba32Float => 16,
+        }
+    }
+}
+
+#[inline]
+fn storage_format_from_u32(v: u32) -> StorageFormat {
+    match v {
+        1 => StorageFormat::R32Float,
+        2 => StorageFormat::Rgba32Float,
+        // 0 and anything malformed -> Rgba8Unorm.
+        _ => StorageFormat::Rgba8Unorm,
+    }
+}
+
+/// A 2D storage-image binding (`image2D`).  Unlike
+/// [`TexDesc`], `data` is `*mut` — `OpImageWrite` mutates it.
+/// Texels are addressed by pure integer arithmetic
+/// (`data + y*stride_bytes + x*bytes_per_texel`); there is no
+/// sampler and no filtering.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ImageDesc {
+    pub data:         *mut u8,
+    pub width:        u32,
+    pub height:       u32,
+    pub stride_bytes: u32,
+    /// `StorageFormat` as `u32` for C-ABI portability.
+    pub format:       u32,
+}
+
 /// Sampler filter modes. Wire-form values are stable.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,6 +212,75 @@ pub const DESC_SLOT_BYTES: usize = 16;
 /// [`write_descriptor_slot`].
 pub fn descriptor_table_buffer(count: usize) -> Vec<u8> {
     vec![0u8; UNIFORMS_DESC_BASE + count * DESC_SLOT_BYTES]
+}
+
+// ── Compute storage-image descriptor table ────────────────
+//
+// Compute shaders that use `image2D` storage images get a
+// SEPARATE descriptor table, passed in the X0 slot (which
+// the compute calling convention otherwise leaves null).
+// Layout:
+//
+//   bytes  0..16 : runtime-helper pointers
+//                  ( 0:  atrium_img_read_2d
+//                    8:  atrium_img_write_2d )
+//   bytes 16..   : descriptor table — slot `B` at byte
+//                  `IMG_TABLE_DESC_BASE + B*IMG_DESC_SLOT_BYTES`,
+//                  holding a single `ImageDesc*`.
+//
+// Storage images have no sampler, so each slot is one
+// pointer (8 bytes) rather than the texture table's pair.
+
+/// Offset of the descriptor table within the compute
+/// storage-image table buffer.
+pub const IMG_TABLE_DESC_BASE: usize = 16;
+
+/// Bytes per storage-image descriptor slot — one
+/// `ImageDesc*`.
+pub const IMG_DESC_SLOT_BYTES: usize = 8;
+
+/// Build a compute storage-image table buffer sized for
+/// `count` image bindings, including the 16-byte helper
+/// header.  Fill helpers with [`write_image_helper_pointers`]
+/// and slots with [`write_image_descriptor_slot`].
+pub fn image_table_buffer(count: usize) -> Vec<u8> {
+    vec![0u8; IMG_TABLE_DESC_BASE + count * IMG_DESC_SLOT_BYTES]
+}
+
+/// Write the `atrium_img_read_2d` / `atrium_img_write_2d`
+/// helper pointers into a compute storage-image table.
+///
+/// # Safety
+/// The function pointers must outlive every shader
+/// invocation that uses this buffer.
+pub unsafe fn write_image_helper_pointers(
+    buf: &mut [u8],
+    read_2d:  unsafe extern "C" fn(*const ImageDesc, i32, i32, *mut f32),
+    write_2d: unsafe extern "C" fn(*const ImageDesc, i32, i32, *const f32),
+) {
+    assert!(buf.len() >= IMG_TABLE_DESC_BASE,
+        "image table buffer too small for the helper header");
+    let r = (read_2d  as usize as u64).to_le_bytes();
+    let w = (write_2d as usize as u64).to_le_bytes();
+    buf[0..8].copy_from_slice(&r);
+    buf[8..16].copy_from_slice(&w);
+}
+
+/// Write an `ImageDesc*` at binding slot `slot`.
+///
+/// # Safety
+/// `img` must outlive every shader invocation using this
+/// buffer.
+pub unsafe fn write_image_descriptor_slot(
+    buf: &mut [u8],
+    slot: usize,
+    img: *const ImageDesc,
+) {
+    let base = IMG_TABLE_DESC_BASE + slot * IMG_DESC_SLOT_BYTES;
+    assert!(buf.len() >= base + IMG_DESC_SLOT_BYTES,
+        "image table buffer too small for slot {slot}");
+    let bytes = (img as usize as u64).to_le_bytes();
+    buf[base..base + 8].copy_from_slice(&bytes);
 }
 
 /// Write the runtime-helper function-pointer header.
@@ -291,6 +413,145 @@ pub fn fetch_2d(
     let mut t = *tex;
     t.data = data.as_ptr();
     fetch_texel_impl(&t, x as u32, y as u32)
+}
+
+// ── Storage-image read / write (compute) ──────────────────
+//
+// `OpImageRead` / `OpImageWrite` on an `image2D`.  No
+// sampler, no filtering — the texel address is
+// `data + y*stride_bytes + x*bytes_per_texel`.  Out-of-range
+// coordinates are clamped to the edge (defensive: Vulkan
+// leaves them undefined, but UB in a software path is worse).
+
+/// Unpack one storage-image texel to RGBA32F.
+fn image_read_impl(img: &ImageDesc, x: u32, y: u32) -> [f32; 4] {
+    let fmt = storage_format_from_u32(img.format);
+    let xc = x.min(img.width.saturating_sub(1));
+    let yc = y.min(img.height.saturating_sub(1));
+    let row_off = yc as usize * img.stride_bytes as usize;
+    let bpt = fmt.bytes_per_texel() as usize;
+    unsafe {
+        let p = (img.data as *const u8).add(row_off + xc as usize * bpt);
+        match fmt {
+            StorageFormat::Rgba8Unorm => [
+                u8_to_unorm(*p.add(0)), u8_to_unorm(*p.add(1)),
+                u8_to_unorm(*p.add(2)), u8_to_unorm(*p.add(3)),
+            ],
+            StorageFormat::R32Float => {
+                let r = f32::from_le_bytes([
+                    *p.add(0), *p.add(1), *p.add(2), *p.add(3)]);
+                [r, 0.0, 0.0, 1.0]
+            }
+            StorageFormat::Rgba32Float => {
+                let mut out = [0.0f32; 4];
+                for (k, o) in out.iter_mut().enumerate() {
+                    let b = p.add(k * 4);
+                    *o = f32::from_le_bytes([
+                        *b.add(0), *b.add(1), *b.add(2), *b.add(3)]);
+                }
+                out
+            }
+        }
+    }
+}
+
+/// Pack an RGBA32F texel into a storage image.
+fn image_write_impl(img: &ImageDesc, x: u32, y: u32, rgba: [f32; 4]) {
+    let fmt = storage_format_from_u32(img.format);
+    let xc = x.min(img.width.saturating_sub(1));
+    let yc = y.min(img.height.saturating_sub(1));
+    let row_off = yc as usize * img.stride_bytes as usize;
+    let bpt = fmt.bytes_per_texel() as usize;
+    unsafe {
+        let p = img.data.add(row_off + xc as usize * bpt);
+        match fmt {
+            StorageFormat::Rgba8Unorm => {
+                for k in 0..4 {
+                    *p.add(k) = unorm_to_u8(rgba[k]);
+                }
+            }
+            StorageFormat::R32Float => {
+                let b = rgba[0].to_le_bytes();
+                for k in 0..4 { *p.add(k) = b[k]; }
+            }
+            StorageFormat::Rgba32Float => {
+                for c in 0..4 {
+                    let b = rgba[c].to_le_bytes();
+                    for k in 0..4 { *p.add(c * 4 + k) = b[k]; }
+                }
+            }
+        }
+    }
+}
+
+/// `OpImageRead`: read a texel from a storage image at
+/// integer coords.  Writes RGBA32F into `out_rgba[0..4]`.
+///
+/// # Safety
+/// * `img` must be valid; `img.data` must point at
+///   `>= img.height * img.stride_bytes` readable bytes.
+/// * `out_rgba` must point at `>= 16` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn atrium_img_read_2d(
+    img: *const ImageDesc,
+    x: i32, y: i32,
+    out_rgba: *mut f32,
+) {
+    let rgba = image_read_impl(&*img, x as u32, y as u32);
+    let out = std::slice::from_raw_parts_mut(out_rgba, 4);
+    out.copy_from_slice(&rgba);
+}
+
+/// `OpImageWrite`: write a texel to a storage image at
+/// integer coords.  `in_rgba[0..4]` is the RGBA32F value;
+/// narrower formats drop the unused lanes.
+///
+/// # Safety
+/// * `img` must be valid; `img.data` must point at
+///   `>= img.height * img.stride_bytes` writable bytes.
+/// * `in_rgba` must point at `>= 16` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn atrium_img_write_2d(
+    img: *const ImageDesc,
+    x: i32, y: i32,
+    in_rgba: *const f32,
+) {
+    let src = std::slice::from_raw_parts(in_rgba, 4);
+    let rgba = [src[0], src[1], src[2], src[3]];
+    image_write_impl(&*img, x as u32, y as u32, rgba);
+}
+
+/// Safe wrapper around [`atrium_img_read_2d`].
+pub fn image_read_2d(
+    data: &[u8],
+    img: &ImageDesc,
+    x: i32, y: i32,
+) -> [f32; 4] {
+    debug_assert!(data.len() >= (img.height as usize) * (img.stride_bytes as usize),
+        "ImageDesc dimensions overrun the data slice");
+    let mut i = *img;
+    i.data = data.as_ptr() as *mut u8;
+    image_read_impl(&i, x as u32, y as u32)
+}
+
+/// Safe wrapper around [`atrium_img_write_2d`].
+pub fn image_write_2d(
+    data: &mut [u8],
+    img: &ImageDesc,
+    x: i32, y: i32,
+    rgba: [f32; 4],
+) {
+    debug_assert!(data.len() >= (img.height as usize) * (img.stride_bytes as usize),
+        "ImageDesc dimensions overrun the data slice");
+    let mut i = *img;
+    i.data = data.as_mut_ptr();
+    image_write_impl(&i, x as u32, y as u32, rgba);
+}
+
+#[inline]
+fn unorm_to_u8(f: f32) -> u8 {
+    // Clamp to [0,1] then round-to-nearest.
+    (f.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
 }
 
 // ── Implementation (safe Rust, called from the FFI wrappers) ──
@@ -622,5 +883,91 @@ mod tests {
         assert!((p[0] - 200.0 / 255.0).abs() < 1e-6);
         assert!(p[1] == 0.0 && p[2] == 0.0);
         assert!((p[3] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn storage_image_rgba8_write_then_read_roundtrips() {
+        // 2×2 Rgba8Unorm image.
+        let mut data = vec![0u8; 2 * 2 * 4];
+        let img = ImageDesc {
+            data: data.as_mut_ptr(),
+            width: 2, height: 2, stride_bytes: 8,
+            format: StorageFormat::Rgba8Unorm as u32,
+        };
+        // Write a distinct colour at (1,1).
+        image_write_impl(&img, 1, 1, [1.0, 0.5, 0.25, 0.0]);
+        let got = image_read_impl(&img, 1, 1);
+        // u8 round-trip: 0.5 -> 128/255, 0.25 -> 64/255.
+        assert!((got[0] - 1.0).abs() < 1e-6);
+        assert!((got[1] - 128.0 / 255.0).abs() < 1e-6);
+        assert!((got[2] -  64.0 / 255.0).abs() < 1e-6);
+        assert!(got[3] == 0.0);
+        // Untouched texel (0,0) stays zero.
+        assert_eq!(image_read_impl(&img, 0, 0), [0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn storage_image_rgba32f_is_exact() {
+        let mut data = vec![0u8; 1 * 1 * 16];
+        let img = ImageDesc {
+            data: data.as_mut_ptr(),
+            width: 1, height: 1, stride_bytes: 16,
+            format: StorageFormat::Rgba32Float as u32,
+        };
+        let v = [3.14159_f32, -2.71828, 1e9, -0.0];
+        image_write_impl(&img, 0, 0, v);
+        assert_eq!(image_read_impl(&img, 0, 0), v);
+    }
+
+    #[test]
+    fn storage_image_r32f_keeps_red_only() {
+        let mut data = vec![0u8; 4];
+        let img = ImageDesc {
+            data: data.as_mut_ptr(),
+            width: 1, height: 1, stride_bytes: 4,
+            format: StorageFormat::R32Float as u32,
+        };
+        image_write_impl(&img, 0, 0, [42.5, 99.0, 99.0, 99.0]);
+        let got = image_read_impl(&img, 0, 0);
+        assert_eq!(got[0], 42.5);
+        assert_eq!(got[1], 0.0);
+        assert_eq!(got[2], 0.0);
+        assert_eq!(got[3], 1.0);
+    }
+
+    #[test]
+    fn storage_image_read_clamps_out_of_range() {
+        let mut data = vec![0u8; 2 * 2 * 4];
+        let img = ImageDesc {
+            data: data.as_mut_ptr(),
+            width: 2, height: 2, stride_bytes: 8,
+            format: StorageFormat::Rgba8Unorm as u32,
+        };
+        image_write_impl(&img, 1, 1, [1.0, 1.0, 1.0, 1.0]);
+        // (5, 5) clamps to (1, 1).
+        assert_eq!(image_read_impl(&img, 5, 5), image_read_impl(&img, 1, 1));
+    }
+
+    #[test]
+    fn image_table_builder_round_trips() {
+        let mut img = ImageDesc {
+            data: std::ptr::null_mut(),
+            width: 8, height: 8, stride_bytes: 32,
+            format: StorageFormat::Rgba8Unorm as u32,
+        };
+        let mut buf = image_table_buffer(2);
+        assert_eq!(buf.len(), IMG_TABLE_DESC_BASE + 2 * IMG_DESC_SLOT_BYTES);
+        unsafe {
+            write_image_helper_pointers(
+                &mut buf, atrium_img_read_2d, atrium_img_write_2d);
+            write_image_descriptor_slot(&mut buf, 1, &mut img as *const _);
+        }
+        let read_u64 = |off: usize| -> u64 {
+            u64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
+        };
+        assert_eq!(read_u64(0), atrium_img_read_2d as usize as u64);
+        assert_eq!(read_u64(8), atrium_img_write_2d as usize as u64);
+        assert_eq!(read_u64(IMG_TABLE_DESC_BASE + IMG_DESC_SLOT_BYTES),
+            &img as *const ImageDesc as usize as u64);
     }
 }

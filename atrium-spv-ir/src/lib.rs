@@ -692,6 +692,27 @@ pub enum Op {
         /// Mip level (or 0).
         lod: Option<Value>,
     },
+    /// Read a texel from a storage image (`OpImageRead`).
+    /// Unfiltered, no sampler — the texel address is pure
+    /// integer arithmetic.  Result is always a vec4 (the
+    /// shader may extract a narrower vector).
+    ImageRead {
+        /// Storage-image descriptor handle.
+        image: Value,
+        /// Integer coords (ivec2 / uvec2 for a 2D image).
+        coord: Value,
+    },
+    /// Write a texel to a storage image (`OpImageWrite`).
+    /// No result.  `texel` is a vec4; narrower image
+    /// formats drop the unused lanes in the runtime helper.
+    ImageWrite {
+        /// Storage-image descriptor handle.
+        image: Value,
+        /// Integer coords.
+        coord: Value,
+        /// vec4 texel value to store.
+        texel: Value,
+    },
 
     // ── Fragment derivatives ───────────────────────────────────
     //
