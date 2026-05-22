@@ -1388,6 +1388,56 @@ fn translate_inst(
             Ok(())
         }
 
+        // OpImageRead: unfiltered texel read from a storage
+        // image.  Operands: [image, coord, (image-operands
+        // mask...)].  Result is a vec4.
+        SpvOp::ImageRead => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed(
+                    "ImageRead without result id".to_string()))?;
+            let result_type_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed(
+                    "ImageRead without result type".to_string()))?;
+            let result_ty = types.get(result_type_id)?.clone();
+            let img_id   = expect_id(&spv_inst.operands, 0)?;
+            let coord_id = expect_id(&spv_inst.operands, 1)?;
+            let image = id_map.get(&img_id).cloned().ok_or_else(||
+                FrontendError::Malformed(format!(
+                    "ImageRead image id {img_id} not yet defined")))?;
+            let coord = resolve_value(coord_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            let result = alloc_or_get_result(
+                result_id, result_ty, id_map, next_value_id);
+            insts.push(Inst {
+                op: Op::ImageRead { image, coord },
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
+
+        // OpImageWrite: unfiltered texel write to a storage
+        // image.  Operands: [image, coord, texel,
+        // (image-operands mask...)].  No result.
+        SpvOp::ImageWrite => {
+            let img_id   = expect_id(&spv_inst.operands, 0)?;
+            let coord_id = expect_id(&spv_inst.operands, 1)?;
+            let texel_id = expect_id(&spv_inst.operands, 2)?;
+            let image = id_map.get(&img_id).cloned().ok_or_else(||
+                FrontendError::Malformed(format!(
+                    "ImageWrite image id {img_id} not yet defined")))?;
+            let coord = resolve_value(coord_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            let texel = resolve_value(texel_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            insts.push(Inst {
+                op: Op::ImageWrite { image, coord, texel },
+                result: None,
+                source_spirv_offset,
+            });
+            Ok(())
+        }
+
         // OpAtomicIAdd: <result_type> <result_id> <pointer>
         //               <memory_scope> <memory_semantics> <value>
         // Memory scope + semantics are parsed but ignored:
