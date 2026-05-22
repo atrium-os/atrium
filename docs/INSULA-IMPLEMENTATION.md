@@ -2,7 +2,7 @@
 
 **Branch:** `claude/romantic-rubin-42085b`
 **Last updated:** 2026-05-22
-**Phase:** M1A (Foundation) + M1B (service-catalogue MVP) + M1C (Pergola path) complete at the ABI level. Beyond the ABI: full publish-side toolchain (`keygen` / `sign` / `bundle` / `release` / `publishers`), dev-iteration tooling (`init` / `run` / `install --link` / `doctor` / `clean`), four convenience scripts (`test-insula.sh` / `build-insula.sh` / `install-insula.sh` / `insula-demo.sh`), GitHub Actions CI on macos-14, and an opt-in macOS NotificationCenter backend for praeco. Five sample apps cover all four scene-node primitives. 236 tests across 15 crates.
+**Phase:** M1A (Foundation) + M1B (service-catalogue MVP) + M1C (Pergola path) complete. **Tabellarius Phase B (push relay + wake-on-push) complete** — the full path publisher → relay → device daemon → {queue, wake the owning app} works end-to-end. Beyond the ABI: full publish-side toolchain (`keygen` / `sign` / `bundle` / `release` / `publishers`), dev-iteration tooling (`init` / `run` / `install --link` / `doctor` / `clean`), four convenience scripts, GitHub Actions CI on macos-14, opt-in macOS NotificationCenter backend, encryption-at-rest for both keystores. Five sample apps cover all four scene-node primitives. 256 tests across 16 crates.
 
 This document orients a reader landing fresh in the
 branch. For the design corpus see [`spec/insula.md`](spec/insula.md)
@@ -62,7 +62,7 @@ What this exercises end-to-end:
 
 ## Crate layout
 
-Fifteen crates at the repo root. Each is its own `Cargo.toml`;
+Sixteen crates at the repo root. Each is its own `Cargo.toml`;
 the repo has no top-level workspace by convention.
 
 | Crate | Purpose | LoC (src + tests) |
@@ -81,7 +81,8 @@ the repo has no top-level workspace by convention.
 | [`vestibulum-macos`](../vestibulum-macos/) | ed25519 keychain daemon (disk-backed) | ~450 |
 | [`atrium-netd-macos`](../atrium-netd-macos/) | Network broker (allowlist + byte proxy + SO_PEERPID per-app enforcement) | ~400 |
 | [`praeco-macos`](../praeco-macos/) | Notifications daemon | ~300 |
-| [`tabellarius-macos`](../tabellarius-macos/) | Push-delivery daemon (Phase A: subscribe/unsubscribe/list) | ~400 |
+| [`tabellarius-macos`](../tabellarius-macos/) | Push-delivery daemon — subscribe/list + relay client + GET_PUSH + wake-on-push | ~750 |
+| [`tabellarius-relay`](../tabellarius-relay/) | Standalone push relay — routing core + TCP daemon (publisher → device fan-out) | ~600 |
 
 ## Spec → implementation mapping
 
@@ -92,13 +93,15 @@ the repo has no top-level workspace by convention.
 | `insula.md` §4 (sandbox + network) | `insula-host-macos/src/sbpl.rs` + `src/launch.rs` |
 | `insula.md` §5.1 (manifest schema) | `insula-manifest/src/lib.rs` + `src/sections.rs` |
 | `insula.md` §4.2 (network broker) | `atrium-netd-macos/src/main.rs` + libatrium `atrium_net_connect` |
-| `insula.md` §11.5 (push delivery) | `tabellarius-macos` Phase A (subscribe/list); relay traffic + wake-on-push are Phase B |
+| `insula.md` §11.5 (push delivery) | `tabellarius-macos` + `tabellarius-relay` — subscribe/list, relay fan-out, GET_PUSH, wake-on-push (Phase A + B complete) |
 | `insula.md` §13.3 (per-service keypairs) | `vestibulum-macos/src/main.rs` + libatrium `atrium_keychain_*` |
 | `insula.md` §15.2 (per-app storage) | libatrium `atrium_container_path` + `atrium_storage_open`; container provisioning in `insula-host-macos/src/install.rs` |
 | `insula.md` §20 (notifications) | `praeco-macos/src/main.rs` + libatrium `atrium_notify_post` |
 | `insula.md` §3.1 (bundle archive format) | `insula-bundle/src/archive.rs` (`INSB` v1) + `insula bundle` CLI |
 | `insula.md` §5.4 (capability-diff consent) | `insula-manifest::diff::CapabilityDiff` + `insula install --accept-changes` |
-| `tabellarius.md` §9.1 + §11.1 (Phase A subscribe/unsubscribe) | `tabellarius-macos/src/main.rs` + libatrium `atrium_tabellarius_*` |
+| `tabellarius.md` §9.1 (subscribe/list/get-push ABI) | `tabellarius-macos/src/main.rs` + libatrium `atrium_tabellarius_*` |
+| `tabellarius.md` §3 (relay protocol) | `tabellarius-relay` (v0: postcard-over-plaintext-TCP; spec's CBOR-over-mTLS is a follow-up) |
+| `tabellarius.md` §4.2 (wake-on-push) | `tabellarius-macos/src/relay_client.rs` — `$INSULA_TABELLARIUSD_WAKE_CMD` hook |
 | `insula.md` §6 (windowed UI / Pergola) | libatrium `atrium_window_*` (open/destroy/fill_rect/frame_begin/frame_rect/frame_end/poll_event) → CLASS_DISPLAY → external Fresco scene server (frescod) |
 | `insula-host-macos.md` §2 (SBPL generation) | `insula-host-macos/src/sbpl.rs` |
 | `insula-host-macos.md` §10 (bundle format on macOS) | `insula-host-macos/src/install.rs` (no `.app` wrapping yet) |
@@ -181,7 +184,7 @@ $INSULA daemons down
 
 ## Testing
 
-236 tests pass across all 15 crates on this macOS host.
+256 tests pass across all 16 crates on this macOS host.
 
 ```sh
 # One-line runner: scripts/test-insula.sh
@@ -209,7 +212,8 @@ Test distribution:
 | insula-logd | 3 | Daemon decodes Aqueduct messages + writes log file |
 | vestibulum-macos | 13 | ed25519 keychain roundtrip + signature verify + persistence; XChaCha20-Poly1305 encryption-at-rest (on-disk-not-raw, master-key-governs-decrypt, legacy plaintext compat) |
 | atrium-netd-macos | 13 | Per-app manifest enforcement (8 unit) + broker behavior (5 integration) |
-| tabellarius-macos | 10 | substore unit + subscribe/unsubscribe/count via libatrium + persistence; XChaCha20-Poly1305 encryption-at-rest (3 cases) |
+| tabellarius-macos | 16 | substore unit + encryption-at-rest + subscribe/unsubscribe/count via libatrium + relay-delivery E2E (publisher→relay→daemon→GET_PUSH, libatrium ABI drain, wake-on-push fires / doesn't-fire) |
+| tabellarius-relay | 14 | wire-protocol round-trips + routing core (subscribe/fan-out/unsubscribe/dedup) + TCP daemon E2E |
 
 The *load-bearing* integration tests (the ones that prove
 the design isn't just on paper):
@@ -418,11 +422,19 @@ commits don't trigger it.
   leading magic and extracts to a self-cleaning tempdir
   before continuing the install flow. Signature
   pipeline preserved end-to-end through the archive.
-- **Tabellarius is Phase A only.** Subscribe/unsubscribe/
-  list ABI surface works; persistence across daemon
-  restart works. Actual relay traffic, wake-on-push for
-  triggered-bg apps, and per-app rate limits are Phase
-  B (see `tabellarius.md` §11.2).
+- **~~Tabellarius is Phase A only.~~** Phase B done.
+  `tabellarius-relay` is a standalone relay (routing
+  core + TCP daemon); the device daemon connects, an-
+  nounces its subscription pubkeys, queues inbound
+  pushes for `GET_PUSH` / `atrium_tabellarius_get_push`,
+  and fires a wake hook for the owning app. v0 wire is
+  postcard-over-plaintext-TCP; the spec's CBOR-over-
+  mutual-TLS (`tabellarius.md` §3.2) is the hardening
+  follow-up. Wake-on-push trusts the app's self-reported
+  `$ATRIUM_CONTAINER_DIR` for identity — kernel-attested
+  identity (SO_PEERPID, the atrium-netd pattern) is the
+  next layer. Per-app rate limiting + at-least-once
+  retry are also follow-ups (`tabellarius.md` §11.2).
 
 Each of these is a slice that can land independently;
 none of them invalidates the current shape.
@@ -520,17 +532,20 @@ fa75556 insula-manifest: add [render] [input] [ipc] [storage] [compute]
    rustybuzz + swash are the obvious deps; a bitmap-font
    alternative is possible if pulling those in is too
    heavy.
-3. **macOS-Keychain-Services-backed vestibulum + tabellarius
-   keystores** — wrap the `.key` and `.sub` files via
-   SecItemAdd. Closes the "plaintext on disk" caveat for
-   both daemons in one slice (they share the same shape).
-   Depends on the `security-framework` crate or raw libc
-   bindings.
-4. **Tabellarius Phase B — relay traffic + wake-on-push**.
-   Phase A subscribe/unsubscribe ABI shipped; Phase B is
-   the actual relay connection lifecycle, decryption via
-   the vestibulum keychain ABI, and waking
-   triggered-background entry points on incoming push.
+3. **Hardening pass**, in rough priority order:
+   - Hardware-backed keystore wrapping (macOS Keychain
+     Services / Secure Enclave) on top of the
+     XChaCha20-Poly1305 file encryption already in
+     place for vestibulum + tabellarius.
+   - Kernel-attested app identity for tabellarius
+     wake-on-push (SO_PEERPID + proc_pidpath, the
+     atrium-netd pattern) replacing the app's
+     self-reported `$ATRIUM_CONTAINER_DIR`.
+   - CBOR-over-mutual-TLS for the device↔relay wire
+     (`tabellarius.md` §3.2), replacing v0's
+     postcard-over-plaintext-TCP.
+   - Tighter SBPL via `sandbox_init_with_parameters`
+     (private SPI) for per-socket grants.
 
-Each of these is one or two commits given the current
-shape; the foundation underneath is in place.
+Each of these is a self-contained slice; none
+invalidates the current shape.
