@@ -14,6 +14,8 @@
 
 pub mod proto;
 pub mod relay;
+pub mod tls;
 
 pub use proto::{ClientMsg, PushKey, RelayMsg, read_msg, write_msg};
 pub use relay::{ConnId, Relay};
+pub use tls::Identity;
