@@ -42,6 +42,7 @@ vestibulum-macos:vestibulum-macos
 atrium-netd-macos:atrium-netd-macos
 praeco-macos:praeco-macos
 tabellarius-macos:tabellarius-macos
+tabellarius-relay:tabellarius-relay
 insula-hello:insula-hello
 atrium-fetch:atrium-fetch
 atrium-mon:atrium-mon

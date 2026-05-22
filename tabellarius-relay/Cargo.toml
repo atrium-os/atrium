@@ -1,0 +1,22 @@
+[package]
+name        = "tabellarius-relay"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+description = "Tabellarius push relay (docs/spec/tabellarius.md §3). The store-and-forward hop between publishers and devices: devices open a long-lived connection and announce the subscription pubkeys they care about; publishers submit encrypted blobs addressed to a pubkey; the relay fans each blob out to every device subscribed to that key. v0 is plaintext TCP + postcard framing (the spec's eventual wire is CBOR-over-mutual-TLS; both ends are ours during bring-up so the simpler framing is a deliberate shortcut). Ships a lib (wire protocol + routing core) + a daemon bin."
+publish     = false
+
+[lib]
+name = "tabellarius_relay"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tabellarius-relay"
+path = "src/main.rs"
+
+[dependencies]
+serde    = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+
+[dev-dependencies]
+tempfile = "3"

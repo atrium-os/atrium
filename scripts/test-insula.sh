@@ -28,6 +28,7 @@ vestibulum-macos
 atrium-netd-macos
 praeco-macos
 tabellarius-macos
+tabellarius-relay
 insula-hello
 atrium-fetch
 atrium-mon

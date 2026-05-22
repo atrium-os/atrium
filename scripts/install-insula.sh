@@ -63,8 +63,8 @@ if [ ! -d "dist" ]; then
 fi
 
 BINS="insula insula-logd vestibulum-macos atrium-netd-macos \
-      praeco-macos tabellarius-macos insula-hello atrium-fetch \
-      atrium-mon atrium-paint insula-clock"
+      praeco-macos tabellarius-macos tabellarius-relay insula-hello \
+      atrium-fetch atrium-mon atrium-paint insula-clock"
 LIBS="libatrium.dylib libatrium.so libatrium.a"
 HEADERS="atrium.h"
 
