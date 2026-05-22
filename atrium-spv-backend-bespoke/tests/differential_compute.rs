@@ -4066,8 +4066,8 @@ fn differential_workgroup_shared_memory_accumulator() {
 /// `img_data` is the storage image's row-major pixel buffer.
 fn invoke_compute_image(
     spv: &[u8], use_bespoke: bool, dir: &Path, name: &str,
-    img_data: &mut [u8], width: u32, height: u32, format: u32,
-    gids: &[(u32, u32, u32)],
+    img_data: &mut [u8], width: u32, height: u32, depth: u32,
+    format: u32, gids: &[(u32, u32, u32)],
 ) {
     use atrium_spv_runtime::{
         ImageDesc, image_table_buffer, write_image_helper_pointers,
@@ -4098,6 +4098,8 @@ fn invoke_compute_image(
         width, height,
         stride_bytes: width * bpt,
         format,
+        depth,
+        slice_bytes: width * height * bpt,
     };
     let mut table = image_table_buffer(1);
     unsafe {
@@ -4183,9 +4185,9 @@ fn differential_storage_image_write() {
     let mut b_img = vec![0u8; (w * h * 16) as usize];
     let mut c_img = vec![0u8; (w * h * 16) as usize];
     invoke_compute_image(&spv, true,  dir.path(), "b",
-        &mut b_img, w, h, 2, &gids);
+        &mut b_img, w, h, 1, 2, &gids);
     invoke_compute_image(&spv, false, dir.path(), "c",
-        &mut c_img, w, h, 2, &gids);
+        &mut c_img, w, h, 1, 2, &gids);
     assert_eq!(b_img, c_img, "storage-image write diverges between backends");
     // Verify each texel.
     let read = |buf: &[u8], x: u32, y: u32, c: usize| -> f32 {
@@ -4283,9 +4285,9 @@ fn differential_storage_image_atomic_add() {
         }
     }
     let dir = TempDir::new().unwrap();
-    // format=1 (R32) -> 4 bytes/texel.
+    // format=1 (R32) -> 4 bytes/texel; depth=1 (2D).
     invoke_compute_image(&spv, true, dir.path(), "b",
-        &mut img, w, h, 1, &gids);
+        &mut img, w, h, 1, 1, &gids);
     for y in 0..h {
         for x in 0..w {
             let off = ((y * w + x) * 4) as usize;
@@ -4294,6 +4296,100 @@ fn differential_storage_image_atomic_add() {
             let want = y * w + x + 3;
             assert_eq!(got, want,
                 "texel ({x},{y}): got {got}, want {want}");
+        }
+    }
+}
+
+#[test]
+fn differential_storage_image_3d_atomic_add() {
+    // image3D imageAtomicAdd: a 2×2×2 R32 storage image,
+    // texel pointer formed via OpImageTexelPointer with a
+    // 3-lane coord (gid.x, gid.y, gid.z).  The bespoke
+    // codegen folds in z*slice_bytes off the ImageDesc.
+    // Each texel is visited twice -> final = initial + 2.
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, Dim,
+        ExecutionMode, ExecutionModel, FunctionControl, ImageFormat,
+        MemoryModel, MemorySemantics, Scope, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let v3u    = b.type_vector(u32_ty, 3);
+    let void_fn = b.type_function(void, vec![]);
+    // Storage image: 3D, u32 sampled type, sampled=2, R32ui.
+    let img_ty = b.type_image(u32_ty, Dim::Dim3D, 0, 0, 0, 2,
+        ImageFormat::R32ui, None);
+    let ptr_img = b.type_pointer(None, StorageClass::UniformConstant, img_ty);
+    let img_var = b.variable(ptr_img, None, StorageClass::UniformConstant, None);
+    b.decorate(img_var, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(img_var, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_texel = b.type_pointer(None, StorageClass::Image, u32_ty);
+    let ptr_v3u_in = b.type_pointer(None, StorageClass::Input, v3u);
+    let gid_var = b.variable(ptr_v3u_in, None, StorageClass::Input, None);
+    b.decorate(gid_var, Decoration::BuiltIn,
+        vec![rspirv::dr::Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+    let c_zero  = b.constant_bit32(u32_ty, 0);
+    let c_one   = b.constant_bit32(u32_ty, 1);
+    let c_scope = b.constant_bit32(u32_ty, Scope::Device as u32);
+    let c_sem   = b.constant_bit32(u32_ty,
+        MemorySemantics::ATOMIC_COUNTER_MEMORY.bits());
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let gid = b.load(v3u, None, gid_var, None, vec![]).unwrap();
+    // 3-lane coord -> the texel-pointer codegen sees an image3D.
+    let texel_ptr = b.image_texel_pointer(ptr_texel, None,
+        img_var, gid, c_zero).unwrap();
+    let _ = b.atomic_i_add(u32_ty, None, texel_ptr,
+        c_scope, c_sem, c_one).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main",
+        vec![img_var, gid_var]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spv = Vec::with_capacity(words.len() * 4);
+    for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+
+    let (w, h, d) = (2u32, 2u32, 2u32);
+    // Each texel visited twice.
+    let mut gids: Vec<(u32, u32, u32)> = Vec::new();
+    for _ in 0..2 {
+        for z in 0..d { for y in 0..h { for x in 0..w {
+            gids.push((x, y, z));
+        }}}
+    }
+    // Prefill: texel(x,y,z) = z*w*h + y*w + x.
+    let mut img = vec![0u8; (w * h * d * 4) as usize];
+    for z in 0..d {
+        for y in 0..h {
+            for x in 0..w {
+                let idx = z * w * h + y * w + x;
+                let off = (idx * 4) as usize;
+                img[off..off + 4].copy_from_slice(&idx.to_le_bytes());
+            }
+        }
+    }
+    let dir = TempDir::new().unwrap();
+    invoke_compute_image(&spv, true, dir.path(), "b",
+        &mut img, w, h, d, 1, &gids);
+    for z in 0..d {
+        for y in 0..h {
+            for x in 0..w {
+                let idx = z * w * h + y * w + x;
+                let off = (idx * 4) as usize;
+                let got = u32::from_le_bytes(
+                    img[off..off + 4].try_into().unwrap());
+                let want = idx + 2;
+                assert_eq!(got, want,
+                    "texel ({x},{y},{z}): got {got}, want {want}");
+            }
         }
     }
 }

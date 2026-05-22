@@ -1013,8 +1013,23 @@ specifically supports:
   image-helper `blr` clobbers them, so the lowering
   re-loads each from the descriptor table (X2, itself
   saved/restored) after every image call.
-  MVP scope: 2D single-mip, Rgba8Unorm / R32Float /
-  Rgba32Float; atomic image ops and 3D/mip/array images
+- Atomic storage-image ops: `OpImageTexelPointer` forms a
+  raw byte pointer to one texel
+  (`data + z*slice_bytes + y*stride_bytes + x*4`, computed
+  inline off the X19-anchored `ImageDesc` — no helper call);
+  a following `OpAtomic*` then read-modify-writes it with an
+  ARMv8.1 LSE instruction.  `imageAtomicAdd` and friends on
+  R32 storage images work this way.  Bespoke-only: Cranelift's
+  aarch64 backend can't form the `StorageClass::Image`
+  pointer.
+- 3D storage images: `image3D` works through the
+  `OpImageTexelPointer` path — a 3-lane coord makes the
+  codegen fold in `z*slice_bytes`.  `ImageDesc` carries
+  `depth` + `slice_bytes` (appended after the v1 2D fields,
+  so 2D-only backends stay binary-compatible).
+  MVP scope: single-mip, Rgba8Unorm / R32Float /
+  Rgba32Float.  General `OpImageRead` / `OpImageWrite` on
+  `image3D` (3-coord helper calls) and mip/array images
   are deferred.
 - GLSL.std.450 ExtInst dispatch for: FAbs, SAbs, Floor,
   Ceil, Trunc, Fract, FSign, FMod, Sqrt, InverseSqrt,

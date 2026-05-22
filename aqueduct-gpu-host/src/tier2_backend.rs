@@ -1191,6 +1191,9 @@ impl Tier2Backend {
                         // ImageStorage is RGBA8 (4 B/texel).
                         format: atrium_spv_runtime::StorageFormat::Rgba8Unorm
                             as u32,
+                        // 2D image: single slice.
+                        depth: 1,
+                        slice_bytes: img.width * img.height * 4,
                     });
                     slot_of[binding as usize] = Some(idx);
                 }

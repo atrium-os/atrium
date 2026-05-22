@@ -3320,11 +3320,15 @@ fn emit_function(
             // to a storage-image texel so a subsequent atomic
             // op can read-modify-write it in place.  No helper
             // call: the address is computed inline from the
-            // X19-anchored ImageDesc (data @0, stride @16):
-            //   texel_addr = data + y*stride_bytes + x*4
-            // The result Value is registered in `pointers` as
-            // (Xreg, 0); the LSE atomic arm then resolves it
-            // via resolve_or_make_pointer with no relocation.
+            // X19-anchored ImageDesc (data @0, stride @16,
+            // slice_bytes @28):
+            //   texel_addr = data + z*slice_bytes
+            //                     + y*stride_bytes + x*4
+            // A 2-lane coord is a 2D image (z term skipped);
+            // a 3-lane coord is an image3D.  The result Value
+            // is registered in `pointers` as (Xreg, 0); the
+            // LSE atomic arm then resolves it via
+            // resolve_or_make_pointer with no relocation.
             Op::ImageTexelPointer { image, coord } => {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal(
@@ -3340,7 +3344,7 @@ fn emit_function(
                         coord.id)))?;
                 if coord_lanes.len() < 2 {
                     return Err(BackendError::Unsupported(format!(
-                        "ImageTexelPointer 2D coord must have ≥2 lanes, \
+                        "ImageTexelPointer coord must have ≥2 lanes, \
                          got {}", coord_lanes.len())));
                 }
                 let x_w = *ints.get(&coord_lanes[0].id).ok_or_else(||
@@ -3351,6 +3355,14 @@ fn emit_function(
                     BackendError::Internal(format!(
                         "ImageTexelPointer coord lane 1 {:?} not in ints",
                         coord_lanes[1].id)))?;
+                // 3-lane coord -> image3D: also fold in
+                // z*slice_bytes.
+                let z_w = if coord_lanes.len() >= 3 {
+                    Some(*ints.get(&coord_lanes[2].id).ok_or_else(||
+                        BackendError::Internal(format!(
+                            "ImageTexelPointer coord lane 2 {:?} not \
+                             in ints", coord_lanes[2].id)))?)
+                } else { None };
                 // ImageDesc* lives at [X19, #16 + binding*8].
                 let desc_off: u16 = 16 + (binding as u16) * 8;
                 let dst_w = int_pool.alloc(result.id)?;
@@ -3363,6 +3375,12 @@ fn emit_function(
                 a.emit(asm::ldr_x_offset(x9, asm::Xreg(19), desc_off));
                 // dst = data pointer (ImageDesc.data @ #0)
                 a.emit(asm::ldr_x_offset(dst_x, x9, 0));
+                // image3D: dst += z * slice_bytes (field @28).
+                if let Some(z_w) = z_w {
+                    a.emit(asm::ldr_w_offset(w10, x9, 28));
+                    a.emit(asm::mul_w(w10, z_w, w10));
+                    a.emit(asm::add_x(dst_x, dst_x, x10));
+                }
                 // w10 = stride_bytes (ImageDesc.stride_bytes @ #16)
                 a.emit(asm::ldr_w_offset(w10, x9, 16));
                 // w10 = y * stride_bytes

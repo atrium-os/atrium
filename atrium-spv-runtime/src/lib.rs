@@ -85,11 +85,17 @@ fn storage_format_from_u32(v: u32) -> StorageFormat {
     }
 }
 
-/// A 2D storage-image binding (`image2D`).  Unlike
+/// A storage-image binding (`image2D` / `image3D`).  Unlike
 /// [`TexDesc`], `data` is `*mut` — `OpImageWrite` mutates it.
 /// Texels are addressed by pure integer arithmetic
-/// (`data + y*stride_bytes + x*bytes_per_texel`); there is no
-/// sampler and no filtering.
+/// (`data + z*slice_bytes + y*stride_bytes + x*bytes_per_texel`);
+/// there is no sampler and no filtering.
+///
+/// The first five fields (`data`..`format`, bytes 0..24) are
+/// the original v1 2D layout — backends that only read those
+/// offsets stay binary-compatible.  `depth` / `slice_bytes`
+/// were appended for `image3D`: a 2D image sets `depth = 1`
+/// and `slice_bytes = 0`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct ImageDesc {
@@ -99,6 +105,11 @@ pub struct ImageDesc {
     pub stride_bytes: u32,
     /// `StorageFormat` as `u32` for C-ABI portability.
     pub format:       u32,
+    /// Number of Z slices (1 for a 2D image).
+    pub depth:        u32,
+    /// Byte stride between consecutive Z slices.  Ignored
+    /// when `depth == 1`; conventionally `height * stride_bytes`.
+    pub slice_bytes:  u32,
 }
 
 /// Sampler filter modes. Wire-form values are stable.
@@ -893,6 +904,7 @@ mod tests {
             data: data.as_mut_ptr(),
             width: 2, height: 2, stride_bytes: 8,
             format: StorageFormat::Rgba8Unorm as u32,
+            depth: 1, slice_bytes: 0,
         };
         // Write a distinct colour at (1,1).
         image_write_impl(&img, 1, 1, [1.0, 0.5, 0.25, 0.0]);
@@ -913,6 +925,7 @@ mod tests {
             data: data.as_mut_ptr(),
             width: 1, height: 1, stride_bytes: 16,
             format: StorageFormat::Rgba32Float as u32,
+            depth: 1, slice_bytes: 0,
         };
         let v = [3.14159_f32, -2.71828, 1e9, -0.0];
         image_write_impl(&img, 0, 0, v);
@@ -926,6 +939,7 @@ mod tests {
             data: data.as_mut_ptr(),
             width: 1, height: 1, stride_bytes: 4,
             format: StorageFormat::R32Float as u32,
+            depth: 1, slice_bytes: 0,
         };
         image_write_impl(&img, 0, 0, [42.5, 99.0, 99.0, 99.0]);
         let got = image_read_impl(&img, 0, 0);
@@ -942,6 +956,7 @@ mod tests {
             data: data.as_mut_ptr(),
             width: 2, height: 2, stride_bytes: 8,
             format: StorageFormat::Rgba8Unorm as u32,
+            depth: 1, slice_bytes: 0,
         };
         image_write_impl(&img, 1, 1, [1.0, 1.0, 1.0, 1.0]);
         // (5, 5) clamps to (1, 1).
@@ -954,6 +969,7 @@ mod tests {
             data: std::ptr::null_mut(),
             width: 8, height: 8, stride_bytes: 32,
             format: StorageFormat::Rgba8Unorm as u32,
+            depth: 1, slice_bytes: 0,
         };
         let mut buf = image_table_buffer(2);
         assert_eq!(buf.len(), IMG_TABLE_DESC_BASE + 2 * IMG_DESC_SLOT_BYTES);
