@@ -53,19 +53,68 @@ impl Identity {
             key_der: certified.key_pair.serialize_der(),
         })
     }
+
+    /// Serialize to the on-disk identity-file format:
+    /// `[u32 cert_len LE | cert_der | key_der]`.
+    pub fn to_file_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + self.cert_der.len() + self.key_der.len());
+        out.extend_from_slice(&(self.cert_der.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.cert_der);
+        out.extend_from_slice(&self.key_der);
+        out
+    }
+
+    /// Parse the on-disk identity-file format.
+    pub fn from_file_bytes(bytes: &[u8]) -> Result<Identity, String> {
+        if bytes.len() < 4 {
+            return Err("identity file too short".into());
+        }
+        let cert_len = u32::from_le_bytes(
+            [bytes[0], bytes[1], bytes[2], bytes[3]]
+        ) as usize;
+        if bytes.len() < 4 + cert_len {
+            return Err("identity file truncated".into());
+        }
+        Ok(Identity {
+            cert_der: bytes[4..4 + cert_len].to_vec(),
+            key_der: bytes[4 + cert_len..].to_vec(),
+        })
+    }
+
+    /// Write the identity to `path` (mode 0o600 — it
+    /// holds a private key).
+    pub fn write_to(&self, path: &std::path::Path) -> std::io::Result<()> {
+        std::fs::write(path, self.to_file_bytes())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(path)?.permissions();
+            perms.set_mode(0o600);
+            let _ = std::fs::set_permissions(path, perms);
+        }
+        Ok(())
+    }
+
+    /// Load an identity written by [`Identity::write_to`].
+    pub fn read_from(path: &std::path::Path) -> Result<Identity, String> {
+        let bytes = std::fs::read(path)
+            .map_err(|e| format!("read identity {}: {e}", path.display()))?;
+        Identity::from_file_bytes(&bytes)
+    }
 }
 
-/// Verifier that accepts exactly one pinned peer cert.
-/// Used for both directions — the server pins the
-/// device cert, the client pins the relay cert.
+/// Verifier that accepts any cert in a pinned set.
+/// The client side pins a single relay cert; the
+/// server (relay) side pins a set — it serves multiple
+/// peers (the device + any publishers).
 #[derive(Debug)]
 struct Pinned {
-    expected: Vec<u8>,
+    expected: Vec<Vec<u8>>,
     provider: Arc<rustls::crypto::CryptoProvider>,
 }
 
 impl Pinned {
-    fn new(expected: Vec<u8>) -> Self {
+    fn new(expected: Vec<Vec<u8>>) -> Self {
         Pinned {
             expected,
             provider: Arc::new(rustls::crypto::ring::default_provider()),
@@ -73,11 +122,11 @@ impl Pinned {
     }
 
     fn check_pin(&self, end_entity: &CertificateDer<'_>) -> Result<(), Error> {
-        if end_entity.as_ref() == self.expected.as_slice() {
+        if self.expected.iter().any(|e| e.as_slice() == end_entity.as_ref()) {
             Ok(())
         } else {
             Err(Error::General(
-                "peer certificate does not match the pinned key".into(),
+                "peer certificate does not match any pinned key".into(),
             ))
         }
     }
@@ -179,12 +228,13 @@ fn identity_pair(me: &Identity)
 }
 
 /// Build a `ServerConfig` (relay side): present `me`'s
-/// cert, require + pin the client (device) cert.
-pub fn server_config(me: &Identity, pinned_peer_cert: &[u8])
+/// cert, require a client cert that matches one of
+/// `pinned_peers` (the device + any publishers).
+pub fn server_config(me: &Identity, pinned_peers: &[Vec<u8>])
     -> Result<Arc<rustls::ServerConfig>, String>
 {
     let (chain, key) = identity_pair(me)?;
-    let verifier = Arc::new(Pinned::new(pinned_peer_cert.to_vec()));
+    let verifier = Arc::new(Pinned::new(pinned_peers.to_vec()));
     let cfg = rustls::ServerConfig::builder()
         .with_client_cert_verifier(verifier)
         .with_single_cert(chain, key)
@@ -192,13 +242,13 @@ pub fn server_config(me: &Identity, pinned_peer_cert: &[u8])
     Ok(Arc::new(cfg))
 }
 
-/// Build a `ClientConfig` (device side): present `me`'s
-/// cert, pin the server (relay) cert.
-pub fn client_config(me: &Identity, pinned_peer_cert: &[u8])
+/// Build a `ClientConfig` (device / publisher side):
+/// present `me`'s cert, pin the one relay cert.
+pub fn client_config(me: &Identity, pinned_relay_cert: &[u8])
     -> Result<Arc<rustls::ClientConfig>, String>
 {
     let (chain, key) = identity_pair(me)?;
-    let verifier = Arc::new(Pinned::new(pinned_peer_cert.to_vec()));
+    let verifier = Arc::new(Pinned::new(vec![pinned_relay_cert.to_vec()]));
     let cfg = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(verifier)
@@ -223,7 +273,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let s_cfg = server_config(server_id, server_pins)?;
+        let s_cfg = server_config(server_id, &[server_pins.to_vec()])?;
         let c_cfg = client_config(client_id, client_pins)?;
 
         let server = thread::spawn(move || -> Result<(), String> {
@@ -300,5 +350,67 @@ mod tests {
         let b = Identity::generate().unwrap();
         assert_ne!(a.cert_der, b.cert_der);
         assert_ne!(a.key_der, b.key_der);
+    }
+
+    #[test]
+    fn server_accepts_any_peer_in_the_pinned_set() {
+        // A relay pinning a SET — both a device and a
+        // publisher identity — accepts a handshake from
+        // either.
+        let relay = Identity::generate().unwrap();
+        let device = Identity::generate().unwrap();
+        let publisher = Identity::generate().unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let pins = vec![device.cert_der.clone(), publisher.cert_der.clone()];
+        let s_cfg = server_config(&relay, &pins).unwrap();
+
+        // The relay accepts two connections in turn.
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (tcp, _) = listener.accept().unwrap();
+                let conn = rustls::ServerConnection::new(s_cfg.clone()).unwrap();
+                let mut tls = rustls::StreamOwned::new(conn, tcp);
+                let mut b = [0u8; 1];
+                if tls.read_exact(&mut b).is_ok() {
+                    let _ = tls.write_all(&[b[0]]);
+                    let _ = tls.flush();
+                }
+            }
+        });
+
+        // Publisher connects with its identity — pinned.
+        for who in [&device, &publisher] {
+            let c_cfg = client_config(who, &relay.cert_der).unwrap();
+            let tcp = TcpStream::connect(addr).unwrap();
+            let name = ServerName::try_from("localhost").unwrap();
+            let conn = rustls::ClientConnection::new(c_cfg, name).unwrap();
+            let mut tls = rustls::StreamOwned::new(conn, tcp);
+            tls.write_all(&[7u8]).unwrap();
+            tls.flush().unwrap();
+            let mut got = [0u8; 1];
+            tls.read_exact(&mut got)
+                .expect("a pinned-set member should handshake fine");
+            assert_eq!(got[0], 7);
+        }
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn identity_file_round_trip() {
+        let id = Identity::generate().unwrap();
+        let bytes = id.to_file_bytes();
+        let back = Identity::from_file_bytes(&bytes).unwrap();
+        assert_eq!(back.cert_der, id.cert_der);
+        assert_eq!(back.key_der, id.key_der);
+
+        // And a real file write/read round-trips too,
+        // including the cert remaining usable as a pin.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("id.bin");
+        id.write_to(&path).unwrap();
+        let loaded = Identity::read_from(&path).unwrap();
+        assert_eq!(loaded.cert_der, id.cert_der);
     }
 }

@@ -1,31 +1,48 @@
 //! `tabellarius-relay` daemon — TCP front end for the
 //! [`tabellarius_relay::Relay`] routing core.
 //!
-//! Each accepted connection gets a reader thread (decodes
-//! `ClientMsg` frames → `relay.on_msg`) and a writer
-//! thread (drains the connection's `RelayMsg` channel →
-//! the socket). When the reader sees EOF it removes the
-//! connection from the relay, which drops the channel's
-//! sender and unblocks the writer to exit.
+//! Each accepted connection runs on one thread in a
+//! poll loop: drain the connection's outbound
+//! `RelayMsg` channel, then read whatever bytes are
+//! available (a [`FrameReader`] buffers partial
+//! frames so a timed-out read can't desync), decode
+//! `ClientMsg` frames, dispatch to `relay.on_msg`.
 //!
-//! v0 transport: plaintext TCP. Mutual-auth TLS (spec
-//! §3.2) is a follow-up.
+//! Single-threaded-per-connection is what lets the
+//! same loop serve a plaintext `TcpStream` and a
+//! `rustls` TLS stream uniformly — a TLS connection's
+//! state is single-owner and can't be split across a
+//! reader + writer thread the way a `try_clone`'d TCP
+//! socket can.
 //!
 //! # Configuration
 //!
 //! - `INSULA_TABELLARIUS_RELAY_ADDR` — bind address.
-//!   Default `127.0.0.1:0` (ephemeral port). The actual
-//!   bound address is printed to stdout as
-//!   `relay listening on <addr>` so a test harness /
-//!   supervisor can discover an ephemeral port.
+//!   Default `127.0.0.1:0` (ephemeral). The bound
+//!   address is printed as `relay listening on <addr>`.
+//! - `INSULA_TABELLARIUS_RELAY_TLS_IDENTITY` — path to
+//!   the relay's TLS identity file (see
+//!   `tabellarius_relay::tls`). When set together with
+//!   the pin below, every connection is mutual-TLS.
+//! - `INSULA_TABELLARIUS_RELAY_TLS_PEER_PIN` — path to
+//!   the pinned device certificate (raw DER). v0 is a
+//!   1:1 relay↔device pin; multi-device registration
+//!   is future work.
 
-use std::io::BufReader;
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::thread;
-use tabellarius_relay::proto::{read_msg, write_msg, ClientMsg};
+use std::time::Duration;
+use tabellarius_relay::proto::{decode_payload, encode_frame, ClientMsg, FrameReader};
+use tabellarius_relay::tls::Identity;
 use tabellarius_relay::Relay;
+
+/// Poll-loop read timeout. Bounds outbound-push latency
+/// (a push waits at most this long for the next loop
+/// turn) without busy-spinning.
+const POLL_TIMEOUT: Duration = Duration::from_millis(20);
 
 fn main() -> ExitCode {
     if std::env::args().any(|a| a == "-h" || a == "--help") {
@@ -46,9 +63,19 @@ fn main() -> ExitCode {
     let bound = listener.local_addr()
         .map(|a| a.to_string())
         .unwrap_or_else(|_| addr.clone());
-    // Single-line, parseable: harnesses read this to
-    // discover an ephemeral port.
     println!("relay listening on {bound}");
+
+    // Optional TLS: identity + a pinned device cert.
+    let tls = match load_tls_config() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("tabellarius-relay: TLS config error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if tls.is_some() {
+        eprintln!("tabellarius-relay: mutual-TLS enabled");
+    }
 
     let relay = Arc::new(Relay::new());
 
@@ -61,50 +88,137 @@ fn main() -> ExitCode {
             }
         };
         let relay = relay.clone();
-        thread::spawn(move || handle_connection(stream, relay));
+        let tls = tls.clone();
+        thread::spawn(move || dispatch(stream, relay, tls));
     }
     ExitCode::SUCCESS
 }
 
-fn handle_connection(stream: TcpStream, relay: Arc<Relay>) {
-    let writer_stream = match stream.try_clone() {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("tabellarius-relay: try_clone: {e}");
-            return;
-        }
+/// Loaded relay-side TLS config, when configured.
+type TlsServer = Arc<rustls::ServerConfig>;
+
+fn load_tls_config() -> Result<Option<TlsServer>, String> {
+    let id_path = std::env::var_os("INSULA_TABELLARIUS_RELAY_TLS_IDENTITY");
+    let pin_path = std::env::var_os("INSULA_TABELLARIUS_RELAY_TLS_PEER_PIN");
+    let (id_path, pin_path) = match (id_path, pin_path) {
+        (Some(i), Some(p)) => (i, p),
+        (None, None) => return Ok(None),
+        _ => return Err(
+            "set both INSULA_TABELLARIUS_RELAY_TLS_IDENTITY and \
+             _TLS_PEER_PIN, or neither".into()
+        ),
     };
+    let identity = Identity::read_from(std::path::Path::new(&id_path))?;
+    let pins = load_pin_set(std::path::Path::new(&pin_path))?;
+    if pins.is_empty() {
+        return Err(format!(
+            "no pinned peer certs found at {}", pin_path.to_string_lossy()
+        ));
+    }
+    let cfg = tabellarius_relay::tls::server_config(&identity, &pins)?;
+    Ok(Some(cfg))
+}
 
-    let (conn_id, rx) = relay.add_connection();
-
-    // Writer thread: drain the connection's RelayMsg
-    // channel onto the socket. Exits when the channel's
-    // sender is dropped (which the reader does via
-    // remove_connection on EOF).
-    let writer = thread::spawn(move || {
-        let mut w = writer_stream;
-        while let Ok(msg) = rx.recv() {
-            if write_msg(&mut w, &msg).is_err() {
-                break;
+/// Load the pinned peer-cert set. `path` may be a
+/// single DER file (one pin) or a directory — every
+/// `*.der` inside it is a pin. A directory lets one
+/// relay trust several peers (the device + publishers)
+/// under v0's self-signed-cert pinning model.
+fn load_pin_set(path: &std::path::Path) -> Result<Vec<Vec<u8>>, String> {
+    if path.is_dir() {
+        let mut pins = Vec::new();
+        for entry in std::fs::read_dir(path)
+            .map_err(|e| format!("read pin dir: {e}"))?
+        {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let p = entry.path();
+            if p.extension().and_then(|s| s.to_str()) == Some("der") {
+                pins.push(std::fs::read(&p)
+                    .map_err(|e| format!("read {}: {e}", p.display()))?);
             }
         }
-    });
+        Ok(pins)
+    } else {
+        Ok(vec![std::fs::read(path)
+            .map_err(|e| format!("read peer pin: {e}"))?])
+    }
+}
 
-    // Reader loop on this thread.
-    let mut reader = BufReader::new(stream);
-    loop {
-        let msg: ClientMsg = match read_msg(&mut reader) {
-            Ok(m) => m,
-            Err(_) => break, // EOF or malformed — done.
-        };
-        relay.on_msg(conn_id, msg);
+/// Set the read timeout, then wrap in TLS if configured
+/// and hand off to the generic poll loop.
+fn dispatch(tcp: TcpStream, relay: Arc<Relay>, tls: Option<TlsServer>) {
+    if tcp.set_read_timeout(Some(POLL_TIMEOUT)).is_err() {
+        return;
+    }
+    match tls {
+        Some(cfg) => {
+            let conn = match rustls::ServerConnection::new(cfg) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("tabellarius-relay: TLS server conn: {e}");
+                    return;
+                }
+            };
+            serve(rustls::StreamOwned::new(conn, tcp), relay);
+        }
+        None => serve(tcp, relay),
+    }
+}
+
+/// Generic per-connection poll loop. Works over a
+/// plaintext `TcpStream` or a `rustls::StreamOwned`
+/// alike — both impl `Read + Write`.
+fn serve<S: Read + Write>(mut stream: S, relay: Arc<Relay>) {
+    let (conn_id, rx) = relay.add_connection();
+    let mut fr = FrameReader::new();
+    let mut scratch = [0u8; 8192];
+
+    'conn: loop {
+        // 1. Drain outbound RelayMsgs to the wire.
+        loop {
+            match rx.try_recv() {
+                Ok(msg) => {
+                    let Ok(bytes) = encode_frame(&msg) else { continue };
+                    if stream.write_all(&bytes).is_err() {
+                        break 'conn;
+                    }
+                }
+                Err(_) => break, // empty or disconnected
+            }
+        }
+        if stream.flush().is_err() {
+            break;
+        }
+
+        // 2. Read whatever is available; feed the frame
+        //    buffer; dispatch every complete frame.
+        match stream.read(&mut scratch) {
+            Ok(0) => break, // EOF
+            Ok(n) => {
+                fr.feed(&scratch[..n]);
+                loop {
+                    match fr.next_frame() {
+                        Ok(Some(payload)) => {
+                            if let Ok(msg) =
+                                decode_payload::<ClientMsg>(&payload)
+                            {
+                                relay.on_msg(conn_id, msg);
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(_) => break 'conn, // malformed length prefix
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut => {
+                // Idle tick — nothing to read this turn.
+            }
+            Err(_) => break,
+        }
     }
 
-    // Reader done: tear down. remove_connection drops
-    // the channel sender, so the writer's rx.recv()
-    // returns Err and it exits.
     relay.remove_connection(conn_id);
-    let _ = writer.join();
 }
 
 fn print_usage() {
@@ -116,11 +230,13 @@ publishers submit blobs addressed to a pubkey, the relay fans
 each blob out to subscribed devices.
 
 Environment:
-  INSULA_TABELLARIUS_RELAY_ADDR  bind address
-                                 (default 127.0.0.1:0 — ephemeral)
+  INSULA_TABELLARIUS_RELAY_ADDR          bind address
+                                         (default 127.0.0.1:0)
+  INSULA_TABELLARIUS_RELAY_TLS_IDENTITY  relay TLS identity file
+  INSULA_TABELLARIUS_RELAY_TLS_PEER_PIN  pinned device cert (DER)
 
-On startup prints `relay listening on <addr>` so a harness can
-discover an ephemeral port. v0 transport is plaintext TCP +
-postcard framing; mutual-auth TLS is future work."
+Setting both TLS vars enables mutual-auth TLS (self-signed +
+key pinning). Wire is CBOR frames either way. Prints
+`relay listening on <addr>` for ephemeral-port discovery."
     );
 }

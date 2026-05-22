@@ -1,24 +1,40 @@
 //! Device-side relay client.
 //!
 //! When `$INSULA_TABELLARIUSD_RELAY` is set, the daemon
-//! opens a long-lived TCP connection to a
+//! opens a long-lived connection to a
 //! `tabellarius-relay`, announces every subscription
-//! pubkey it holds, and spawns a reader thread that
-//! turns inbound `RelayMsg::Push` frames into entries
-//! on a shared received-push queue. Apps drain that
-//! queue via the GET_PUSH op.
+//! pubkey it holds, and runs a poll loop that turns
+//! inbound `RelayMsg::Push` frames into entries on a
+//! shared received-push queue (drained by GET_PUSH) and
+//! fires the wake-on-push hook.
 //!
-//! v0 transport is plaintext TCP + postcard framing
-//! (see `tabellarius-relay`'s `proto` module). Mutual-
-//! auth TLS is a follow-up.
+//! One poll-loop thread owns the stream. Announce /
+//! retract from other threads go through an outbound
+//! channel the loop drains — there is no second writer
+//! thread, because a TLS stream's state is single-owner
+//! and can't be split the way a `try_clone`'d TCP
+//! socket can.
+//!
+//! Transport is CBOR frames over TCP, optionally
+//! wrapped in mutual-auth TLS (self-signed + key
+//! pinning) when `$INSULA_TABELLARIUSD_TLS_IDENTITY` +
+//! `_TLS_PEER_PIN` are set.
 
 use crate::substore::SubStore;
 use std::collections::VecDeque;
-use std::io::BufReader;
+use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::path::Path;
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use tabellarius_relay::proto::{read_msg, write_msg, ClientMsg, PushKey, RelayMsg};
+use std::time::Duration;
+use tabellarius_relay::proto::{decode_payload, encode_frame, ClientMsg, FrameReader, PushKey, RelayMsg};
+use tabellarius_relay::tls::Identity;
+
+/// Poll-loop read timeout — bounds how long an
+/// announce/retract waits to reach the wire.
+const POLL_TIMEOUT: Duration = Duration::from_millis(20);
 
 /// One push the device received from the relay,
 /// resolved against the local substore so the app sees
@@ -33,26 +49,19 @@ pub struct ReceivedPush {
 /// FIFO of pushes waiting to be drained by GET_PUSH.
 pub type PushQueue = Arc<Mutex<VecDeque<ReceivedPush>>>;
 
-/// A live connection to the relay. Holds the write
-/// half so the daemon can announce newly-minted
-/// subscriptions incrementally.
+/// A live connection to the relay. Announce / retract
+/// hand a `ClientMsg` to the poll loop via the channel.
 pub struct RelayClient {
-    writer: Mutex<TcpStream>,
+    out: Sender<ClientMsg>,
 }
 
 impl RelayClient {
     /// Connect to `addr`, announce `initial_keys`, and
-    /// spawn the reader thread. The reader resolves
-    /// each inbound push's `to_key` against `substore`
-    /// and appends a [`ReceivedPush`] to `queue`.
-    ///
-    /// `wake_cmd`, when set, is the wake-on-push hook:
-    /// for every push that lands for a subscription with
-    /// a known owning app, the reader spawns
-    /// `<wake_cmd> <app_id> <key_id>`. In production
-    /// that command launches the app's
-    /// `[background.triggered]` entry point; tests point
-    /// it at a stub.
+    /// spawn the poll-loop thread. The loop resolves
+    /// each inbound push's `to_key` against `substore`,
+    /// appends a [`ReceivedPush`] to `queue`, and (when
+    /// `wake_cmd` is set + the subscription has a known
+    /// owning app) spawns `<wake_cmd> <app_id> <key_id>`.
     pub fn connect(
         addr: &str,
         initial_keys: Vec<PushKey>,
@@ -60,96 +69,165 @@ impl RelayClient {
         queue: PushQueue,
         wake_cmd: Option<String>,
     ) -> std::io::Result<RelayClient> {
-        let stream = TcpStream::connect(addr)?;
-        let mut writer = stream.try_clone()?;
+        let tcp = TcpStream::connect(addr)?;
+        tcp.set_read_timeout(Some(POLL_TIMEOUT))?;
 
-        // Announce everything we already hold.
-        write_msg(&mut writer, &ClientMsg::Subscribe { keys: initial_keys })?;
+        let (tx, rx) = mpsc::channel::<ClientMsg>();
+        // Queue the opening announce; the loop writes it
+        // on its first turn.
+        let _ = tx.send(ClientMsg::Subscribe { keys: initial_keys });
 
-        let reader_stream = stream;
-        thread::spawn(move || {
-            let mut r = BufReader::new(reader_stream);
-            loop {
-                let msg: RelayMsg = match read_msg(&mut r) {
-                    Ok(m) => m,
-                    Err(_) => break, // relay closed / error
-                };
-                match msg {
-                    RelayMsg::Push { to_key, ts, blob, .. } => {
-                        // Resolve to_key -> the key_id +
-                        // owning app the local substore
-                        // records.
-                        let resolved: Option<(String, Option<String>)> = {
-                            let s = substore.lock().unwrap();
-                            let found = s.iter()
-                                .find(|sub| sub.pubkey_bytes() == to_key)
-                                .map(|sub| {
-                                    (sub.key_id.clone(), sub.app_id.clone())
-                                });
-                            found
-                        };
-                        match resolved {
-                            Some((key_id, app_id)) => {
-                                queue.lock().unwrap().push_back(ReceivedPush {
-                                    key_id: key_id.clone(), ts, blob,
-                                });
-                                // Wake-on-push: if the
-                                // subscription has a
-                                // known owner and a hook
-                                // is configured, fire it.
-                                if let (Some(cmd), Some(app)) =
-                                    (&wake_cmd, &app_id)
-                                {
-                                    fire_wake(cmd, app, &key_id);
-                                }
-                            }
-                            None => {
-                                // Push for a key we don't
-                                // hold — relay routing
-                                // glitch. Drop it.
-                                eprintln!(
-                                    "tabellarius-macos: dropped push for \
-                                     unknown key"
-                                );
-                            }
-                        }
-                    }
-                    RelayMsg::Pong => {}
-                    // PublishAccepted / PublishRejected are
-                    // publisher-side; a device shouldn't
-                    // see them. Ignore defensively.
-                    _ => {}
-                }
+        // Optional mutual-TLS wrap.
+        let tls = load_tls_config()
+            .map_err(|e| std::io::Error::new(
+                std::io::ErrorKind::Other, e))?;
+
+        match tls {
+            Some(cfg) => {
+                let server_name =
+                    rustls::pki_types::ServerName::try_from("localhost")
+                        .map_err(|e| std::io::Error::new(
+                            std::io::ErrorKind::Other, e.to_string()))?;
+                let conn = rustls::ClientConnection::new(cfg, server_name)
+                    .map_err(|e| std::io::Error::new(
+                        std::io::ErrorKind::Other, e.to_string()))?;
+                let stream = rustls::StreamOwned::new(conn, tcp);
+                thread::spawn(move || {
+                    poll_loop(stream, rx, substore, queue, wake_cmd);
+                });
             }
-        });
+            None => {
+                thread::spawn(move || {
+                    poll_loop(tcp, rx, substore, queue, wake_cmd);
+                });
+            }
+        }
 
-        Ok(RelayClient { writer: Mutex::new(writer) })
+        Ok(RelayClient { out: tx })
     }
 
     /// Announce additional subscription pubkeys to the
     /// relay (called when a new subscription is minted).
     pub fn announce(&self, keys: Vec<PushKey>) -> std::io::Result<()> {
-        let mut w = self.writer.lock().unwrap();
-        write_msg(&mut *w, &ClientMsg::Subscribe { keys })
+        self.out.send(ClientMsg::Subscribe { keys })
+            .map_err(|_| std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "relay poll loop gone"))
     }
 
     /// Drop interest in a pubkey (called on unsubscribe).
     pub fn retract(&self, key: PushKey) -> std::io::Result<()> {
-        let mut w = self.writer.lock().unwrap();
-        write_msg(&mut *w, &ClientMsg::Unsubscribe { keys: vec![key] })
+        self.out.send(ClientMsg::Unsubscribe { keys: vec![key] })
+            .map_err(|_| std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "relay poll loop gone"))
+    }
+}
+
+/// The single per-connection poll loop. Generic over
+/// the transport so plaintext `TcpStream` and
+/// `rustls::StreamOwned` share one path.
+fn poll_loop<S: Read + Write>(
+    mut stream: S,
+    rx: mpsc::Receiver<ClientMsg>,
+    substore: Arc<Mutex<SubStore>>,
+    queue: PushQueue,
+    wake_cmd: Option<String>,
+) {
+    let mut fr = FrameReader::new();
+    let mut scratch = [0u8; 8192];
+
+    'conn: loop {
+        // 1. Drain outbound ClientMsgs (announce /
+        //    retract / the opening Subscribe).
+        loop {
+            match rx.try_recv() {
+                Ok(msg) => {
+                    let Ok(bytes) = encode_frame(&msg) else { continue };
+                    if stream.write_all(&bytes).is_err() {
+                        break 'conn;
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // RelayClient dropped — nothing more
+                    // to send, but keep reading pushes.
+                    break;
+                }
+            }
+        }
+        if stream.flush().is_err() {
+            break;
+        }
+
+        // 2. Read available bytes; dispatch frames.
+        match stream.read(&mut scratch) {
+            Ok(0) => break, // relay closed
+            Ok(n) => {
+                fr.feed(&scratch[..n]);
+                loop {
+                    match fr.next_frame() {
+                        Ok(Some(payload)) => {
+                            if let Ok(msg) =
+                                decode_payload::<RelayMsg>(&payload)
+                            {
+                                handle_relay_msg(
+                                    msg, &substore, &queue, &wake_cmd,
+                                );
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(_) => break 'conn,
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut => {
+                // Idle tick.
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+fn handle_relay_msg(
+    msg: RelayMsg,
+    substore: &Arc<Mutex<SubStore>>,
+    queue: &PushQueue,
+    wake_cmd: &Option<String>,
+) {
+    let RelayMsg::Push { to_key, ts, blob, .. } = msg else {
+        // Pong / publisher-side variants — ignore.
+        return;
+    };
+    // Resolve to_key -> (key_id, owning app).
+    let resolved: Option<(String, Option<String>)> = {
+        let s = substore.lock().unwrap();
+        let found = s.iter()
+            .find(|sub| sub.pubkey_bytes() == to_key)
+            .map(|sub| (sub.key_id.clone(), sub.app_id.clone()));
+        found
+    };
+    match resolved {
+        Some((key_id, app_id)) => {
+            queue.lock().unwrap().push_back(ReceivedPush {
+                key_id: key_id.clone(), ts, blob,
+            });
+            if let (Some(cmd), Some(app)) = (wake_cmd, &app_id) {
+                fire_wake(cmd, app, &key_id);
+            }
+        }
+        None => {
+            eprintln!("tabellarius-macos: dropped push for unknown key");
+        }
     }
 }
 
 /// Spawn the wake-on-push hook: `<cmd> <app_id> <key_id>`.
-/// Detached + fire-and-forget — the reader thread must
-/// not block on the woken process. Failures are logged,
-/// not fatal (a missing hook just means no wake).
 fn fire_wake(cmd: &str, app_id: &str, key_id: &str) {
-    // Invoke as `/bin/sh <cmd> <app_id> <key_id>` rather
-    // than exec'ing <cmd> directly: directly spawning a
-    // script by its shebang via posix_spawn hangs on
-    // macOS for freshly-written temp-dir scripts. Going
-    // through /bin/sh sidesteps the shebang-exec path.
+    // Invoke via `/bin/sh <cmd> ...` rather than exec'ing
+    // <cmd> directly: posix_spawn of a freshly-written
+    // temp-dir shebang script hangs on macOS.
     let child = std::process::Command::new("/bin/sh")
         .arg(cmd)
         .arg(app_id)
@@ -160,12 +238,7 @@ fn fire_wake(cmd: &str, app_id: &str, key_id: &str) {
         .spawn();
     match child {
         Ok(mut child) => {
-            // Reap on a detached thread so a slow wake
-            // hook can't stall the reader (and the
-            // process doesn't linger as a zombie).
-            thread::spawn(move || {
-                let _ = child.wait();
-            });
+            thread::spawn(move || { let _ = child.wait(); });
         }
         Err(e) => {
             eprintln!(
@@ -174,6 +247,27 @@ fn fire_wake(cmd: &str, app_id: &str, key_id: &str) {
             );
         }
     }
+}
+
+/// Build the device-side TLS client config when
+/// `$INSULA_TABELLARIUSD_TLS_IDENTITY` + `_TLS_PEER_PIN`
+/// are both set. `None` = plaintext.
+fn load_tls_config() -> Result<Option<Arc<rustls::ClientConfig>>, String> {
+    let id_path = std::env::var_os("INSULA_TABELLARIUSD_TLS_IDENTITY");
+    let pin_path = std::env::var_os("INSULA_TABELLARIUSD_TLS_PEER_PIN");
+    let (id_path, pin_path) = match (id_path, pin_path) {
+        (Some(i), Some(p)) => (i, p),
+        (None, None) => return Ok(None),
+        _ => return Err(
+            "set both INSULA_TABELLARIUSD_TLS_IDENTITY and \
+             _TLS_PEER_PIN, or neither".into()
+        ),
+    };
+    let identity = Identity::read_from(Path::new(&id_path))?;
+    let pin = std::fs::read(&pin_path)
+        .map_err(|e| format!("read peer pin: {e}"))?;
+    let cfg = tabellarius_relay::tls::client_config(&identity, &pin)?;
+    Ok(Some(cfg))
 }
 
 /// Resolve the relay address from the environment.

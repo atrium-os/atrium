@@ -102,6 +102,81 @@ pub fn read_msg<R: Read, T: serde::de::DeserializeOwned>(r: &mut R)
             format!("cbor decode: {e}")))
 }
 
+/// Encode a message into one length-prefixed CBOR
+/// frame (the bytes [`write_msg`] would put on the
+/// wire). Useful when the caller drives I/O itself —
+/// e.g. a poll loop that batches writes.
+pub fn encode_frame<T: Serialize>(msg: &T) -> io::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    ciborium::into_writer(msg, &mut body)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData,
+            format!("cbor encode: {e}")))?;
+    if body.len() > MAX_FRAME_LEN {
+        return Err(io::Error::new(io::ErrorKind::InvalidData,
+            "frame exceeds MAX_FRAME_LEN"));
+    }
+    let mut out = Vec::with_capacity(4 + body.len());
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
+/// Decode one CBOR frame payload (the bytes *after*
+/// the 4-byte length prefix).
+pub fn decode_payload<T: serde::de::DeserializeOwned>(payload: &[u8])
+    -> io::Result<T>
+{
+    ciborium::from_reader(payload)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData,
+            format!("cbor decode: {e}")))
+}
+
+/// Incremental, buffering frame parser.
+///
+/// A poll loop reading from a socket with a read
+/// timeout can return mid-frame — a plain `read_exact`
+/// would consume + lose those partial bytes and
+/// desync the stream. `FrameReader` buffers every byte
+/// fed to it and only yields *complete* frames, so a
+/// timeout between reads is harmless.
+#[derive(Debug, Default)]
+pub struct FrameReader {
+    buf: Vec<u8>,
+}
+
+impl FrameReader {
+    pub fn new() -> Self {
+        FrameReader { buf: Vec::new() }
+    }
+
+    /// Append bytes just read off the wire.
+    pub fn feed(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+    }
+
+    /// Pop the next complete frame's payload, if one is
+    /// fully buffered. `Ok(None)` means "need more
+    /// bytes"; `Err` means a malformed length prefix.
+    pub fn next_frame(&mut self) -> io::Result<Option<Vec<u8>>> {
+        if self.buf.len() < 4 {
+            return Ok(None);
+        }
+        let len = u32::from_le_bytes(
+            [self.buf[0], self.buf[1], self.buf[2], self.buf[3]]
+        ) as usize;
+        if len > MAX_FRAME_LEN {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                format!("frame len {len} exceeds MAX_FRAME_LEN")));
+        }
+        if self.buf.len() < 4 + len {
+            return Ok(None);
+        }
+        let payload = self.buf[4..4 + len].to_vec();
+        self.buf.drain(..4 + len);
+        Ok(Some(payload))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,6 +221,52 @@ mod tests {
             let back: RelayMsg = read_msg(&mut cur).unwrap();
             assert_eq!(back, msg);
         }
+    }
+
+    #[test]
+    fn frame_reader_yields_complete_frames_only() {
+        let msg = ClientMsg::Ack { id: 7 };
+        let frame = encode_frame(&msg).unwrap();
+
+        let mut fr = FrameReader::new();
+        // Feed one byte at a time — no frame until the
+        // very last byte completes it.
+        for (i, b) in frame.iter().enumerate() {
+            fr.feed(&[*b]);
+            let got = fr.next_frame().unwrap();
+            if i + 1 == frame.len() {
+                let payload = got.expect("last byte completes the frame");
+                let back: ClientMsg = decode_payload(&payload).unwrap();
+                assert_eq!(back, msg);
+            } else {
+                assert!(got.is_none(), "partial frame must not yield");
+            }
+        }
+    }
+
+    #[test]
+    fn frame_reader_splits_a_coalesced_two_frame_buffer() {
+        let a = encode_frame(&ClientMsg::Ping).unwrap();
+        let b = encode_frame(&ClientMsg::Ack { id: 99 }).unwrap();
+        let mut both = a.clone();
+        both.extend_from_slice(&b);
+
+        let mut fr = FrameReader::new();
+        fr.feed(&both);
+        let f1: ClientMsg = decode_payload(
+            &fr.next_frame().unwrap().unwrap()).unwrap();
+        let f2: ClientMsg = decode_payload(
+            &fr.next_frame().unwrap().unwrap()).unwrap();
+        assert_eq!(f1, ClientMsg::Ping);
+        assert_eq!(f2, ClientMsg::Ack { id: 99 });
+        assert!(fr.next_frame().unwrap().is_none());
+    }
+
+    #[test]
+    fn frame_reader_rejects_oversized_prefix() {
+        let mut fr = FrameReader::new();
+        fr.feed(&(1u32 << 30).to_le_bytes());
+        assert!(fr.next_frame().is_err());
     }
 
     #[test]

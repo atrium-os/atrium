@@ -26,6 +26,7 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 use tabellarius_relay::proto::{read_msg, write_msg, ClientMsg, RelayMsg};
+use tabellarius_relay::tls::Identity;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -526,6 +527,123 @@ fn push_with_no_owning_app_does_not_fire_wake() {
     let _ = daemon.wait();
     let _ = relay.kill();
     let _ = relay.wait();
+}
+
+#[test]
+fn push_flows_over_mutual_tls() {
+    // The whole Phase B path, but every hop is mutual-
+    // TLS: relay <-> device daemon, and publisher <->
+    // relay. Three identities; the relay pins a SET
+    // (device + publisher), each client pins the relay.
+    let _guard = ENV_LOCK.lock().unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let relay_id = Identity::generate().unwrap();
+    let device_id = Identity::generate().unwrap();
+    let publisher_id = Identity::generate().unwrap();
+
+    // Relay identity file + pin-dir holding the device
+    // and publisher certs.
+    let relay_id_file = tmp.path().join("relay.id");
+    relay_id.write_to(&relay_id_file).unwrap();
+    let pin_dir = tmp.path().join("relay-pins");
+    std::fs::create_dir_all(&pin_dir).unwrap();
+    std::fs::write(pin_dir.join("device.der"), &device_id.cert_der).unwrap();
+    std::fs::write(pin_dir.join("publisher.der"), &publisher_id.cert_der).unwrap();
+
+    // Device daemon identity file + pinned relay cert.
+    let device_id_file = tmp.path().join("device.id");
+    device_id.write_to(&device_id_file).unwrap();
+    let relay_pin_file = tmp.path().join("relay.der");
+    std::fs::write(&relay_pin_file, &relay_id.cert_der).unwrap();
+
+    // Spawn the relay with TLS configured.
+    let relay_bin = build_neighbor("tabellarius-relay");
+    let mut relay = {
+        let mut child = Command::new(relay_bin)
+            .env("INSULA_TABELLARIUS_RELAY_ADDR", "127.0.0.1:0")
+            .env("INSULA_TABELLARIUS_RELAY_TLS_IDENTITY", &relay_id_file)
+            .env("INSULA_TABELLARIUS_RELAY_TLS_PEER_PIN", &pin_dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn relay");
+        let stdout = child.stdout.take().unwrap();
+        let line = BufReader::new(stdout).lines().next()
+            .expect("relay line").expect("readable");
+        let addr = line.strip_prefix("relay listening on ")
+            .unwrap().to_string();
+        (child, addr)
+    };
+    let relay_addr = relay.1.clone();
+
+    // Spawn the device daemon with TLS configured.
+    let sock = tmp.path().join("tbd.sock");
+    let store = tmp.path().join("subs");
+    let mut daemon = Command::new(tabellarius_binary())
+        .env("INSULA_TABELLARIUSD_SOCKET", &sock)
+        .env("INSULA_TABELLARIUSD_STORE", &store)
+        .env("INSULA_TABELLARIUSD_RELAY", &relay_addr)
+        .env("INSULA_TABELLARIUSD_TLS_IDENTITY", &device_id_file)
+        .env("INSULA_TABELLARIUSD_TLS_PEER_PIN", &relay_pin_file)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn daemon");
+    wait_for_socket(&sock, Duration::from_secs(3));
+
+    // Subscribe via libatrium.
+    std::env::set_var("ATRIUM_TABELLARIUS_SOCKET", &sock);
+    let purpose = CString::new("tls").unwrap();
+    let mut key_id_buf = [0i8; 64];
+    let mut pubkey = [0u8; 32];
+    let n = unsafe {
+        atrium::atrium_tabellarius_subscribe(
+            purpose.as_ptr(),
+            key_id_buf.as_mut_ptr(), key_id_buf.len(),
+            pubkey.as_mut_ptr(),
+        )
+    };
+    assert!(n > 0);
+    std::env::remove_var("ATRIUM_TABELLARIUS_SOCKET");
+    thread::sleep(Duration::from_millis(300));
+
+    // Publisher: connect to the relay over TLS, publish.
+    let pub_cfg = tabellarius_relay::tls::client_config(
+        &publisher_id, &relay_id.cert_der,
+    ).unwrap();
+    let tcp = TcpStream::connect(&relay_addr).unwrap();
+    let server_name =
+        rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let conn = rustls::ClientConnection::new(pub_cfg, server_name).unwrap();
+    let mut tls = rustls::StreamOwned::new(conn, tcp);
+
+    let blob = b"tls-protected-push".to_vec();
+    write_msg(&mut tls, &ClientMsg::Publish {
+        to_key: pubkey, blob: blob.clone(), ttl_secs: 60,
+    }).unwrap();
+    match read_msg::<_, RelayMsg>(&mut tls).expect("publish reply") {
+        RelayMsg::PublishAccepted { delivered, .. } => {
+            assert_eq!(delivered, 1, "the TLS device should be subscribed");
+        }
+        other => panic!("expected PublishAccepted, got {other:?}"),
+    }
+
+    thread::sleep(Duration::from_millis(400));
+
+    // Drain via GET_PUSH — the blob made it through two
+    // TLS hops.
+    let resp = get_push(&sock);
+    assert_eq!(resp.first().copied(), Some(0u8),
+               "expected a push to have been delivered over TLS");
+    let id_len = resp[1] as usize;
+    let blob_off = 2 + id_len + 8;
+    assert_eq!(&resp[blob_off..], blob.as_slice());
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    let _ = relay.0.kill();
+    let _ = relay.0.wait();
 }
 
 #[test]
