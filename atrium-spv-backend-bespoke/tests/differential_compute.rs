@@ -4059,6 +4059,149 @@ fn differential_workgroup_shared_memory_accumulator() {
     }
 }
 
+/// Run a compute shader that uses storage images.  Builds a
+/// v1 image descriptor table (helper pointers + one
+/// `ImageDesc` slot) and calls `cs_main` once per workgroup
+/// id with the table base in the X0 (`uniforms`) slot.
+/// `img_data` is the storage image's row-major pixel buffer.
+fn invoke_compute_image(
+    spv: &[u8], use_bespoke: bool, dir: &Path, name: &str,
+    img_data: &mut [u8], width: u32, height: u32, format: u32,
+    gids: &[(u32, u32, u32)],
+) {
+    use atrium_spv_runtime::{
+        ImageDesc, image_table_buffer, write_image_helper_pointers,
+        write_image_descriptor_slot, atrium_img_read_2d, atrium_img_write_2d,
+    };
+    let module = translate(spv).expect("frontend");
+    let obj = if use_bespoke {
+        let t = if cfg!(target_os = "macos") {
+            BespokeTarget::Aarch64Darwin
+        } else { BespokeTarget::Aarch64FreeBSD };
+        bespoke_compile(&module, t).expect("bespoke compile").object
+    } else {
+        cranelift_compile(&module, CraneliftTarget::host())
+            .expect("cranelift compile").object
+    };
+    let obj_path = dir.join(format!("{name}.o"));
+    std::fs::write(&obj_path, &obj).unwrap();
+    let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
+    let lib_path = dir.join(format!("{name}.{ext}"));
+    link_to_shared_library(&obj_path, &lib_path).expect("link");
+    let lib = unsafe { libloading::Library::new(&lib_path) }.expect("dlopen");
+    let cs_main: libloading::Symbol<CsMain> = unsafe {
+        lib.get(b"atrium_cs_main").expect("atrium_cs_main symbol")
+    };
+    let bpt = match format { 2 => 16, _ => 4 }; // Rgba32Float=16
+    let img = ImageDesc {
+        data: img_data.as_mut_ptr(),
+        width, height,
+        stride_bytes: width * bpt,
+        format,
+    };
+    let mut table = image_table_buffer(1);
+    unsafe {
+        write_image_helper_pointers(
+            &mut table, atrium_img_read_2d, atrium_img_write_2d);
+        write_image_descriptor_slot(&mut table, 0, &img as *const _);
+    }
+    let table_base = table.as_ptr() as *const u8;
+    for &(gx, gy, gz) in gids {
+        unsafe {
+            cs_main(table_base, std::ptr::null(), std::ptr::null_mut(),
+                    gx, gy, gz, 0, 0, 0, std::ptr::null_mut());
+        }
+    }
+}
+
+#[test]
+fn differential_storage_image_write() {
+    // A compute shader that writes
+    //   img[gid.x, gid.y] = vec4(gid.x, gid.y, 0.5, 1.0)
+    // to a 3×2 Rgba32Float storage image.  One invocation
+    // per texel; verify the buffer and that bespoke vs
+    // cranelift produce byte-identical results.
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, Dim,
+        ExecutionMode, ExecutionModel, FunctionControl, ImageFormat,
+        MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let f32_ty = b.type_float(32, None);
+    let v3u    = b.type_vector(u32_ty, 3);
+    let v2u    = b.type_vector(u32_ty, 2);
+    let v4f    = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    // Storage image: 2D, f32 sampled type, sampled=2, Rgba32f.
+    let img_ty = b.type_image(f32_ty, Dim::Dim2D, 0, 0, 0, 2,
+        ImageFormat::Rgba32f, None);
+    let ptr_img = b.type_pointer(None, StorageClass::UniformConstant, img_ty);
+    let img_var = b.variable(ptr_img, None, StorageClass::UniformConstant, None);
+    b.decorate(img_var, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(img_var, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    // GlobalInvocationId.
+    let ptr_v3u_in = b.type_pointer(None, StorageClass::Input, v3u);
+    let gid_var = b.variable(ptr_v3u_in, None, StorageClass::Input, None);
+    b.decorate(gid_var, Decoration::BuiltIn,
+        vec![rspirv::dr::Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+    let c_half = b.constant_bit32(f32_ty, 0.5f32.to_bits());
+    let c_one  = b.constant_bit32(f32_ty, 1.0f32.to_bits());
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let gid = b.load(v3u, None, gid_var, None, vec![]).unwrap();
+    let gx = b.composite_extract(u32_ty, None, gid, vec![0]).unwrap();
+    let gy = b.composite_extract(u32_ty, None, gid, vec![1]).unwrap();
+    let coord = b.composite_construct(v2u, None, vec![gx, gy]).unwrap();
+    let fx = b.convert_u_to_f(f32_ty, None, gx).unwrap();
+    let fy = b.convert_u_to_f(f32_ty, None, gy).unwrap();
+    let texel = b.composite_construct(v4f, None,
+        vec![fx, fy, c_half, c_one]).unwrap();
+    let img = b.load(img_ty, None, img_var, None, vec![]).unwrap();
+    b.image_write(img, coord, texel, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main",
+        vec![img_var, gid_var]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spv = Vec::with_capacity(words.len() * 4);
+    for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+
+    let (w, h) = (3u32, 2u32);
+    let gids: Vec<(u32, u32, u32)> = (0..h)
+        .flat_map(|y| (0..w).map(move |x| (x, y, 0u32)))
+        .collect();
+    let dir = TempDir::new().unwrap();
+    let mut b_img = vec![0u8; (w * h * 16) as usize];
+    let mut c_img = vec![0u8; (w * h * 16) as usize];
+    invoke_compute_image(&spv, true,  dir.path(), "b",
+        &mut b_img, w, h, 2, &gids);
+    invoke_compute_image(&spv, false, dir.path(), "c",
+        &mut c_img, w, h, 2, &gids);
+    assert_eq!(b_img, c_img, "storage-image write diverges between backends");
+    // Verify each texel.
+    let read = |buf: &[u8], x: u32, y: u32, c: usize| -> f32 {
+        let off = ((y * w + x) as usize) * 16 + c * 4;
+        f32::from_le_bytes(buf[off..off+4].try_into().unwrap())
+    };
+    for y in 0..h {
+        for x in 0..w {
+            assert_eq!(read(&b_img, x, y, 0), x as f32, "texel ({x},{y}).r");
+            assert_eq!(read(&b_img, x, y, 1), y as f32, "texel ({x},{y}).g");
+            assert_eq!(read(&b_img, x, y, 2), 0.5,      "texel ({x},{y}).b");
+            assert_eq!(read(&b_img, x, y, 3), 1.0,      "texel ({x},{y}).a");
+        }
+    }
+}
+
 #[test]
 fn differential_op_isnan_isinf() {
     // OpIsNan / OpIsInf are core SPIR-V ops.  The shader

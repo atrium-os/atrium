@@ -1080,6 +1080,24 @@ fn emit_function(
         }
     }
 
+    // Storage-image prologue.  A compute shader that does
+    // OpImageRead / OpImageWrite calls into the runtime
+    // (atrium_img_read_2d / atrium_img_write_2d) via the v1
+    // descriptor-table ABI.  Those calls clobber the
+    // caller-saved registers, so the image-table base (which
+    // arrives in X0) is stashed once into X19 -- a callee-
+    // saved register the runtime helper preserves.  Reserving
+    // X19 forces the callee-saved int prologue (stp/ldp),
+    // which saves the caller's X19 before our `mov x19, x0`.
+    let uses_storage_image = func.blocks.values().any(|b|
+        b.insts.iter().any(|i| matches!(&i.op,
+            Op::ImageRead { .. } | Op::ImageWrite { .. })));
+    if uses_storage_image {
+        int_pool.free.retain(|&r| r != 19);
+        int_pool.used_callee_saved = true;
+        a.emit(asm::mov_x(asm::Xreg(19), asm::Xreg(0)));
+    }
+
     let mut flat_i: usize = 0;
     for (block_pos, bid) in block_order.iter().enumerate() {
         let block = func.blocks.get(bid).unwrap();
@@ -3220,6 +3238,171 @@ fn emit_function(
 
                 vectors.insert(result.id, lane_vals);
             }
+            // OpImageRead / OpImageWrite — storage-image
+            // access in a compute shader.  v1-ABI call via
+            // the X19-anchored image descriptor table:
+            //   helper ptr   at [X19, #0]  (read) / #8 (write)
+            //   ImageDesc*   at [X19, #16 + binding*8]
+            // Helper signature (both):
+            //   (ImageDesc*, x:i32, y:i32, rgba:*f32)
+            // -> X0=desc, W1=x, W2=y, X3=rgba stack slot.
+            // The call clobbers caller-saved regs, so live
+            // V-regs and live caller-saved int W-regs (W13..
+            // W17) are spilled across it; X19 (image table)
+            // and X2 (SSBO out_buffer) are callee-preserved /
+            // explicitly saved.
+            Op::ImageRead { image, coord }
+            | Op::ImageWrite { image, coord, .. } => {
+                let is_write = matches!(&inst.op, Op::ImageWrite { .. });
+                let (_, binding) = image_handles.get(&image.id)
+                    .copied()
+                    .ok_or_else(|| BackendError::Internal(format!(
+                        "Image op image {:?} not an ImageHandle",
+                        image.id)))?;
+                let coord_lanes = vectors.get(&coord.id).cloned()
+                    .ok_or_else(|| BackendError::Internal(format!(
+                        "Image op coord {:?} not a vector", coord.id)))?;
+                if coord_lanes.len() < 2 {
+                    return Err(BackendError::Unsupported(format!(
+                        "Image op 2D coord must have ≥2 lanes, got {}",
+                        coord_lanes.len())));
+                }
+                let x_w = *ints.get(&coord_lanes[0].id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "Image op coord lane 0 {:?} not in ints",
+                        coord_lanes[0].id)))?;
+                let y_w = *ints.get(&coord_lanes[1].id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "Image op coord lane 1 {:?} not in ints",
+                        coord_lanes[1].id)))?;
+                // For a write, grab the 4 texel lane V-regs
+                // up front (they get spilled below, but we
+                // need to copy them into the rgba stack slot
+                // *before* the call).
+                let texel_lanes: Option<[asm::Vreg; 4]> = if is_write {
+                    let tv = match &inst.op {
+                        Op::ImageWrite { texel, .. } => texel,
+                        _ => unreachable!(),
+                    };
+                    let lanes = vectors.get(&tv.id).cloned().ok_or_else(||
+                        BackendError::Internal(format!(
+                            "ImageWrite texel {:?} not a vector", tv.id)))?;
+                    if lanes.len() < 4 {
+                        return Err(BackendError::Unsupported(format!(
+                            "ImageWrite texel must be vec4, got {} lanes",
+                            lanes.len())));
+                    }
+                    let mut regs = [asm::Vreg(0); 4];
+                    for (i, r) in regs.iter_mut().enumerate() {
+                        *r = *scalars.get(&lanes[i].id).ok_or_else(||
+                            BackendError::Internal(format!(
+                                "ImageWrite texel lane {i} not in scalars")))?;
+                    }
+                    Some(regs)
+                } else { None };
+
+                // Spill sets: all owned V-regs, plus owned
+                // caller-saved int W-regs (W13..W17).
+                let mut live_vregs: Vec<u8> = owners.keys().copied().collect();
+                live_vregs.sort();
+                let mut live_iregs: Vec<u8> = int_pool.owners.keys()
+                    .copied().filter(|&n| (13..=17).contains(&n)).collect();
+                live_iregs.sort();
+
+                // Result lanes (read only): 4 fresh V-regs.
+                let mut lane_regs: Vec<asm::Vreg> = Vec::with_capacity(4);
+                let mut lane_vals: Vec<Value> = Vec::with_capacity(4);
+                if !is_write {
+                    for _ in 0..4 {
+                        let synth = ValueId(next_synth_id);
+                        next_synth_id += 1;
+                        let r = alloc_vreg(&mut free_pool, &mut owners,
+                            &mut used_callee_saved_v, synth)?;
+                        scalars.insert(synth, r);
+                        lane_regs.push(r);
+                        lane_vals.push(Value { id: synth, ty: Type::F32 });
+                    }
+                }
+
+                let sp = asm::Xreg(31);
+                let x0 = asm::Xreg(0);
+                let x2 = asm::Xreg(2);
+                let x3 = asm::Xreg(3);
+                let x9 = asm::Xreg(9);
+                let x10 = asm::Xreg(10);
+                let x19 = asm::Xreg(19);
+                let lr = asm::Xreg(30);
+                let w1 = asm::Wreg(1);
+                let w2 = asm::Wreg(2);
+                // image table: helper @ #0/#8, desc @ #16+B*8.
+                let helper_off: u16 = if is_write { 8 } else { 0 };
+                let desc_off: u16 = 16 + (binding as u16) * 8;
+
+                // Frame: [0..16] rgba scratch, [16] x_out
+                // save, [24] LR save, [32..] V spills, then
+                // int spills.
+                let n_v = live_vregs.len() as u16;
+                let n_i = live_iregs.len() as u16;
+                let iregs_base: u16 = 32 + n_v * 16;
+                let raw = iregs_base + n_i * 8;
+                let frame_bytes: u16 = (raw + 15) & !15;
+                a.emit(asm::sub_imm_x(sp, sp, frame_bytes));
+                a.emit(asm::str_x_offset(x_out, sp, 16));
+                a.emit(asm::str_x_offset(lr, sp, 24));
+                for (i, n) in live_vregs.iter().enumerate() {
+                    a.emit(asm::str_q_offset(
+                        asm::Vreg(*n), sp, 32 + (i as u16) * 16));
+                }
+                for (i, n) in live_iregs.iter().enumerate() {
+                    a.emit(asm::str_w_offset(
+                        asm::Wreg(*n), sp, iregs_base + (i as u16) * 4));
+                }
+                // For a write, pack the texel lanes into the
+                // rgba scratch slot now (before spills clobber
+                // nothing -- the texel V-regs are read here).
+                if let Some(tregs) = texel_lanes {
+                    for (i, r) in tregs.iter().enumerate() {
+                        a.emit(asm::fmov_w_from_s(w_tmp, *r));
+                        a.emit(asm::str_w_offset(w_tmp, sp, (i as u16) * 4));
+                    }
+                }
+
+                // Load helper fn ptr + ImageDesc ptr from the
+                // X19-anchored image table.
+                a.emit(asm::ldr_x_offset(x9, x19, helper_off));
+                a.emit(asm::ldr_x_offset(x10, x19, desc_off));
+                a.emit(asm::mov_x(x0, x10));
+                a.emit(asm::mov_w(w1, x_w));
+                a.emit(asm::mov_w(w2, y_w));
+                a.emit(asm::add_imm_x(x3, sp, 0));   // rgba scratch
+                a.emit(asm::blr_x(x9));
+
+                // Read result lanes back (read op only).
+                for (i, lane) in lane_regs.iter().enumerate() {
+                    a.emit(asm::ldr_w_offset(w_tmp, sp, (i as u16) * 4));
+                    a.emit(asm::fmov_s_from_w(*lane, w_tmp));
+                }
+                // Reload spills.
+                for (i, n) in live_vregs.iter().enumerate() {
+                    a.emit(asm::ldr_q_offset(
+                        asm::Vreg(*n), sp, 32 + (i as u16) * 16));
+                }
+                for (i, n) in live_iregs.iter().enumerate() {
+                    a.emit(asm::ldr_w_offset(
+                        asm::Wreg(*n), sp, iregs_base + (i as u16) * 4));
+                }
+                a.emit(asm::ldr_x_offset(x_out, sp, 16));
+                let _ = x2;
+                a.emit(asm::ldr_x_offset(lr, sp, 24));
+                a.emit(asm::add_imm_x(sp, sp, frame_bytes));
+
+                if !is_write {
+                    let result = inst.result.as_ref().ok_or_else(||
+                        BackendError::Internal(
+                            "ImageRead without result".into()))?;
+                    vectors.insert(result.id, lane_vals);
+                }
+            }
             other => {
                 return Err(BackendError::Unsupported(format!(
                     "op {other:?} not supported")));
@@ -4182,6 +4365,24 @@ fn compute_last_use_flat(
                 mark(coord.id);
                 if let Some(l) = lod { mark(l.id); }
                 if let Some(lane_ids) = vec_lanes.get(&coord.id).cloned() {
+                    for lid in &lane_ids { mark(*lid); }
+                }
+            }
+            Op::ImageRead { image, coord } => {
+                mark(image.id);
+                mark(coord.id);
+                if let Some(lane_ids) = vec_lanes.get(&coord.id).cloned() {
+                    for lid in &lane_ids { mark(*lid); }
+                }
+            }
+            Op::ImageWrite { image, coord, texel } => {
+                mark(image.id);
+                mark(coord.id);
+                mark(texel.id);
+                if let Some(lane_ids) = vec_lanes.get(&coord.id).cloned() {
+                    for lid in &lane_ids { mark(*lid); }
+                }
+                if let Some(lane_ids) = vec_lanes.get(&texel.id).cloned() {
                     for lid in &lane_ids { mark(*lid); }
                 }
             }

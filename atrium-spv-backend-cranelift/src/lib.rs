@@ -1712,6 +1712,88 @@ impl FnTranslator {
                 self.vectors.insert(result.id, lanes);
                 Ok(())
             }
+            // OpImageRead / OpImageWrite — storage-image
+            // access (compute).  The image descriptor table
+            // is a SEPARATE table in params[0] (the compute
+            // `uniforms` slot, otherwise null): helper ptr at
+            // [tbl, #0] (read) / #8 (write), ImageDesc* at
+            // [tbl, #16 + binding*8].  Helper signature:
+            //   (ImageDesc*, x:i32, y:i32, rgba:*f32)
+            // Cranelift's call_indirect handles caller-saved
+            // spilling around the call automatically.
+            Op::ImageRead { image, coord }
+            | Op::ImageWrite { image, coord, .. } => {
+                let is_write = matches!(&inst.op, Op::ImageWrite { .. });
+                let (_, binding) = self.image_handles.get(&image.id)
+                    .copied()
+                    .ok_or_else(|| BackendError::Internal(format!(
+                        "Image op image {:?} not an ImageHandle",
+                        image.id)))?;
+                let coord_lanes = self.vectors.get(&coord.id).cloned()
+                    .ok_or_else(|| BackendError::Internal(format!(
+                        "Image op coord {:?} not a vector", coord.id)))?;
+                if coord_lanes.len() < 2 {
+                    return Err(BackendError::Unsupported(format!(
+                        "Image op 2D coord must have ≥2 lanes, got {}",
+                        coord_lanes.len())));
+                }
+                let x = coord_lanes[0];
+                let y = coord_lanes[1];
+                let pointer_type = builder.func.dfg
+                    .value_type(self.params[0]);
+                let img_table = self.params[0];
+                let helper_off: i32 = if is_write { 8 } else { 0 };
+                let desc_off: i32 = 16 + (binding as i32) * 8;
+                let fn_ptr = builder.ins().load(
+                    pointer_type, MemFlags::new(), img_table, helper_off);
+                let desc_ptr = builder.ins().load(
+                    pointer_type, MemFlags::new(), img_table, desc_off);
+                // 16-byte rgba scratch slot.
+                let slot = builder.create_sized_stack_slot(
+                    StackSlotData::new(StackSlotKind::ExplicitSlot, 16, 4));
+                let rgba_ptr = builder.ins().stack_addr(pointer_type, slot, 0);
+                let mut call_sig = Signature::new(CallConv::SystemV);
+                call_sig.params.push(AbiParam::new(pointer_type));
+                call_sig.params.push(AbiParam::new(clif_types::I32));
+                call_sig.params.push(AbiParam::new(clif_types::I32));
+                call_sig.params.push(AbiParam::new(pointer_type));
+                let sig_ref = builder.import_signature(call_sig);
+                if is_write {
+                    // Pack the 4 texel lanes into the slot.
+                    let texel = match &inst.op {
+                        Op::ImageWrite { texel, .. } => texel,
+                        _ => unreachable!(),
+                    };
+                    let lanes = self.vectors.get(&texel.id).cloned()
+                        .ok_or_else(|| BackendError::Internal(format!(
+                            "ImageWrite texel {:?} not a vector", texel.id)))?;
+                    if lanes.len() < 4 {
+                        return Err(BackendError::Unsupported(format!(
+                            "ImageWrite texel must be vec4, got {} lanes",
+                            lanes.len())));
+                    }
+                    for (i, l) in lanes.iter().enumerate().take(4) {
+                        builder.ins().store(
+                            MemFlags::new(), *l, rgba_ptr, (i as i32) * 4);
+                    }
+                    builder.ins().call_indirect(
+                        sig_ref, fn_ptr, &[desc_ptr, x, y, rgba_ptr]);
+                    Ok(())
+                } else {
+                    builder.ins().call_indirect(
+                        sig_ref, fn_ptr, &[desc_ptr, x, y, rgba_ptr]);
+                    let result = inst.result.as_ref().ok_or_else(||
+                        BackendError::Internal(
+                            "ImageRead without result".to_string()))?;
+                    let mut lanes = Vec::with_capacity(4);
+                    for i in 0..4i32 {
+                        lanes.push(builder.ins().load(
+                            clif_types::F32, MemFlags::new(), rgba_ptr, i * 4));
+                    }
+                    self.vectors.insert(result.id, lanes);
+                    Ok(())
+                }
+            }
             other => Err(BackendError::Unsupported(format!(
                 "Op {other:?} not supported in phase 2 v6",
             ))),

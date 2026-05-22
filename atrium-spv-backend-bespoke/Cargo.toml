@@ -20,6 +20,7 @@ thiserror           = "1"
 [dev-dependencies]
 atrium-spv-frontend           = { path = "../atrium-spv-frontend" }
 atrium-spv-backend-cranelift  = { path = "../atrium-spv-backend-cranelift" }
+atrium-spv-runtime            = { path = "../atrium-spv-runtime" }
 rspirv              = "0.13"
 tempfile            = "3"
 libloading          = "0.8"
