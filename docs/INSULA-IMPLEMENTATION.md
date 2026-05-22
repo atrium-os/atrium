@@ -2,7 +2,7 @@
 
 **Branch:** `claude/romantic-rubin-42085b`
 **Last updated:** 2026-05-22
-**Phase:** M1A (Foundation) + M1B (service-catalogue MVP) + M1C (Pergola path) complete. **Tabellarius Phase B (push relay + wake-on-push) complete** — the full path publisher → relay → device daemon → {queue, wake the owning app} works end-to-end. Beyond the ABI: full publish-side toolchain (`keygen` / `sign` / `bundle` / `release` / `publishers`), dev-iteration tooling (`init` / `run` / `install --link` / `doctor` / `clean`), four convenience scripts, GitHub Actions CI on macos-14, opt-in macOS NotificationCenter backend, encryption-at-rest for both keystores. Five sample apps cover all four scene-node primitives. 256 tests across 16 crates.
+**Phase:** M1A (Foundation) + M1B (service-catalogue MVP) + M1C (Pergola path) complete. **Tabellarius Phase B (push relay + wake-on-push) complete** — the full path publisher → relay → device daemon → {queue, wake the owning app} works end-to-end, with kernel-attested app identity and opt-in CBOR-over-mutual-TLS on the relay wire. Beyond the ABI: full publish-side toolchain (`keygen` / `sign` / `bundle` / `release` / `publishers`), dev-iteration tooling (`init` / `run` / `install --link` / `doctor` / `clean`), four convenience scripts, GitHub Actions CI on macos-14, opt-in macOS NotificationCenter backend, encryption-at-rest for both keystores. Five sample apps cover all four scene-node primitives. 271 tests across 16 crates.
 
 This document orients a reader landing fresh in the
 branch. For the design corpus see [`spec/insula.md`](spec/insula.md)
@@ -100,7 +100,7 @@ the repo has no top-level workspace by convention.
 | `insula.md` §3.1 (bundle archive format) | `insula-bundle/src/archive.rs` (`INSB` v1) + `insula bundle` CLI |
 | `insula.md` §5.4 (capability-diff consent) | `insula-manifest::diff::CapabilityDiff` + `insula install --accept-changes` |
 | `tabellarius.md` §9.1 (subscribe/list/get-push ABI) | `tabellarius-macos/src/main.rs` + libatrium `atrium_tabellarius_*` |
-| `tabellarius.md` §3 (relay protocol) | `tabellarius-relay` — CBOR frames over TCP; mutual-auth TLS module (`tls.rs`: rustls + self-signed certs + key pinning) built + tested, daemon wiring is the remaining slice |
+| `tabellarius.md` §3 (relay protocol) | `tabellarius-relay` — CBOR frames over TCP, opt-in mutual-auth TLS (rustls + self-signed certs + public-key pinning), live end-to-end through both daemons |
 | `tabellarius.md` §4.2 (wake-on-push) | `tabellarius-macos/src/relay_client.rs` — `$INSULA_TABELLARIUSD_WAKE_CMD` hook |
 | `insula.md` §6 (windowed UI / Pergola) | libatrium `atrium_window_*` (open/destroy/fill_rect/frame_begin/frame_rect/frame_end/poll_event) → CLASS_DISPLAY → external Fresco scene server (frescod) |
 | `insula-host-macos.md` §2 (SBPL generation) | `insula-host-macos/src/sbpl.rs` |
@@ -184,7 +184,7 @@ $INSULA daemons down
 
 ## Testing
 
-256 tests pass across all 16 crates on this macOS host.
+271 tests pass across all 16 crates on this macOS host.
 
 ```sh
 # One-line runner: scripts/test-insula.sh
@@ -212,8 +212,8 @@ Test distribution:
 | insula-logd | 3 | Daemon decodes Aqueduct messages + writes log file |
 | vestibulum-macos | 13 | ed25519 keychain roundtrip + signature verify + persistence; XChaCha20-Poly1305 encryption-at-rest (on-disk-not-raw, master-key-governs-decrypt, legacy plaintext compat) |
 | atrium-netd-macos | 13 | Per-app manifest enforcement (8 unit) + broker behavior (5 integration) |
-| tabellarius-macos | 16 | substore unit + encryption-at-rest + subscribe/unsubscribe/count via libatrium + relay-delivery E2E (publisher→relay→daemon→GET_PUSH, libatrium ABI drain, wake-on-push fires / doesn't-fire) |
-| tabellarius-relay | 14 | wire-protocol round-trips + routing core (subscribe/fan-out/unsubscribe/dedup) + TCP daemon E2E |
+| tabellarius-macos | 22 | substore + encryption-at-rest + peer attestation + subscribe/unsubscribe/count via libatrium + relay-delivery E2E (GET_PUSH, libatrium-ABI drain, wake-on-push, mutual-TLS hop-to-hop) |
+| tabellarius-relay | 23 | wire round-trips + FrameReader + routing core + TLS (mutual handshake, wrong-pin rejection, pinned-set) + TCP daemon E2E |
 
 The *load-bearing* integration tests (the ones that prove
 the design isn't just on paper):
@@ -431,10 +431,12 @@ commits don't trigger it.
   identity is kernel-attested (SO_PEERPID + proc_pidpath
   → install-root match), so an app can't be woken on
   another app's pushes by lying. The relay wire is CBOR
-  frames (spec §3.2) over plaintext TCP; mutual-auth TLS
-  is the remaining transport-hardening item. Per-app
-  rate limiting + at-least-once retry are also follow-
-  ups (`tabellarius.md` §11.2).
+  frames over TCP with opt-in mutual-auth TLS (rustls,
+  self-signed certs + public-key pinning) — the full
+  `tabellarius.md` §3.2 shape. A real Vestibulum-rooted
+  CA (vs self-signed pinning), per-app rate limiting,
+  and at-least-once retry are the remaining follow-ups
+  (`tabellarius.md` §11.2).
 
 Each of these is a slice that can land independently;
 none of them invalidates the current shape.
@@ -537,21 +539,16 @@ fa75556 insula-manifest: add [render] [input] [ipc] [storage] [compute]
      Services / Secure Enclave) on top of the
      XChaCha20-Poly1305 file encryption already in
      place for vestibulum + tabellarius.
-   - Mutual-auth TLS for the device↔relay wire — *in
-     progress*. The `tabellarius-relay::tls` module
-     (rustls, self-signed certs, public-key pinning) is
-     built + tested; the remaining slice wires it into
-     the relay daemon + device daemon, which requires
-     converting both connection handlers from the
-     `try_clone`-based reader/writer-thread split to a
-     single-threaded poll loop (a single TLS stream
-     can't be split across two threads).
+   - A real Vestibulum-rooted CA for the relay TLS
+     identities, replacing v0's self-signed certs +
+     public-key pinning (the TLS transport itself is
+     done).
    - Tighter SBPL via `sandbox_init_with_parameters`
      (private SPI) for per-socket grants.
 
-   (Kernel-attested wake-on-push identity and the CBOR
-   relay wire — both formerly on this list — have
-   landed.)
+   (Kernel-attested wake-on-push identity, the CBOR
+   relay wire, and opt-in mutual-auth TLS — all
+   formerly on this list — have landed.)
 
 Each of these is a self-contained slice; none
 invalidates the current shape.
