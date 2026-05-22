@@ -222,6 +222,12 @@ pub struct Tier2ComputeStateBlob {
     /// u64 pointers, one per binding.  Populated by the ICD
     /// at vkCreateComputePipelines from a SPIR-V scan.
     pub ssbo_binding_count: u32,
+    /// Total byte size of the per-workgroup scratch buffer the
+    /// shader needs for `StorageClass::Workgroup` variables
+    /// (0 if it declares none).  The dispatcher allocates a
+    /// buffer of this size per worker thread and passes its
+    /// base pointer as the 10th cs_main argument.
+    pub workgroup_size: u32,
 }
 
 impl Default for Tier2ComputeStateBlob {
@@ -231,6 +237,7 @@ impl Default for Tier2ComputeStateBlob {
         Self {
             local_size_x: 1, local_size_y: 1, local_size_z: 1,
             ssbo_binding_count: 0,
+            workgroup_size: 0,
         }
     }
 }

@@ -710,10 +710,11 @@ fn vk_app_compute_local_invocation_id_visible_to_shader() {
 }
 
 /// Compute SPIR-V that reads gl_GlobalInvocationID.x and
-/// writes it to ssbo[0]. With LocalSize=4 and Dispatch(2,1,1),
-/// the dispatcher fires 8 invocations. The (gx, lx) iteration
-/// order is gx outermost, lx innermost; last invocation
-/// (gx=1, lx=3) has gid.x = 1*4 + 3 = 7.
+/// writes it to `ssbo[gid.x]`.  With LocalSize=4 and
+/// Dispatch(2,1,1), the dispatcher fires 8 invocations with
+/// gid.x = 0..8.  Each writes its own slot, so the result is
+/// independent of workgroup execution order -- correct under
+/// the workgroup-parallel dispatcher.
 fn build_gid_write_cs() -> Vec<u8> {
     use rspirv::binary::Assemble;
     use rspirv::spirv::{
@@ -735,7 +736,12 @@ fn build_gid_write_cs() -> Vec<u8> {
     b.decorate(gid_var, Decoration::BuiltIn,
         vec![rspirv::dr::Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
 
-    let ssbo_struct = b.type_struct(vec![u32_ty]);
+    // Runtime-array SSBO so each invocation writes its own
+    // slot (ssbo[gid.x]) -- no cross-workgroup write race.
+    let rt_arr = b.type_runtime_array(u32_ty);
+    b.decorate(rt_arr, Decoration::ArrayStride,
+        vec![rspirv::dr::Operand::LiteralBit32(4)]);
+    let ssbo_struct = b.type_struct(vec![rt_arr]);
     b.decorate(ssbo_struct, Decoration::Block, vec![]);
     b.member_decorate(ssbo_struct, 0, Decoration::Offset,
         vec![rspirv::dr::Operand::LiteralBit32(0)]);
@@ -753,7 +759,9 @@ fn build_gid_write_cs() -> Vec<u8> {
     b.begin_block(None).unwrap();
     let gid = b.load(uvec3, None, gid_var, None, vec![]).unwrap();
     let gid_x = b.composite_extract(u32_ty, None, gid, vec![0]).unwrap();
-    let dst = b.access_chain(ptr_ssbo_u32, None, ssbo_var, vec![c_zero]).unwrap();
+    // ssbo[gid_x] = gid_x
+    let dst = b.access_chain(ptr_ssbo_u32, None, ssbo_var,
+        vec![c_zero, gid_x]).unwrap();
     b.store(dst, gid_x, None, vec![]).unwrap();
     b.ret().unwrap();
     b.end_function().unwrap();
@@ -866,10 +874,16 @@ fn vk_app_compute_global_invocation_id_folds_local_size() {
     thread::sleep(Duration::from_millis(300));
 
     let out = tier2_backend.compute_output_bytes().expect("output");
-    let got = u32::from_le_bytes(out[0..4].try_into().unwrap());
-    assert_eq!(got, 7,
-        "GlobalInvocationID.x should = workgroup_id.x * 4 + local_id.x; \
-         last invocation (gx=1, lx=3) -> 7, got {got}");
+    // Each invocation wrote ssbo[gid.x] = gid.x, so slots
+    // 0..8 must each hold their own index -- order-independent
+    // under the workgroup-parallel dispatcher.
+    for i in 0..8u32 {
+        let got = u32::from_le_bytes(
+            out[(i as usize)*4..(i as usize)*4+4].try_into().unwrap());
+        assert_eq!(got, i,
+            "GlobalInvocationID.x folds workgroup*localsize: \
+             ssbo[{i}] should hold {i}, got {got}");
+    }
 
     unsafe { atrium_vk_icd::vkDestroyInstance(instance, std::ptr::null()); }
     let _ = server_thread;

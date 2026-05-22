@@ -354,6 +354,8 @@ fn bespoke_shader_runs_two_block_branch() {
             blocks,
             local_size: None,
             ssbo_bindings: std::collections::HashMap::new(),
+            workgroup_size: 0,
+            workgroup_var_offset: std::collections::HashMap::new(),
         }],
         entry_points: vec![EntryPoint {
             stage: ShaderStage::Fragment,

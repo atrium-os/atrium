@@ -972,9 +972,19 @@ specifically supports:
 - Core bitwise ops: BitwiseAnd/Or/Xor, Not,
   ShiftLeft/RightLogical/RightArithmetic, BitReverse,
   BitCount (SWAR popcount synthesised at IR level).
-- Barriers (ControlBarrier, MemoryBarrier) — no-ops on
-  the serial dispatcher, queued for a real lowering when
-  invocations parallelise.
+- Workgroup-shared memory: `StorageClass::Workgroup`
+  OpVariables (scalar + vector pointees) are packed into a
+  per-workgroup scratch buffer; the frontend records each
+  var's byte offset (`Function::workgroup_var_offset`) and
+  the total size (`Function::workgroup_size`).  The
+  dispatcher allocates one buffer per worker thread, zeroes
+  it per workgroup, and passes its base as the 10th cs_main
+  argument (`workgroup_buf`, AAPCS64 stack slot SP+8).
+  Arrays/structs in Workgroup storage are a documented gap.
+- Barriers (ControlBarrier, MemoryBarrier) — no-ops: the
+  dispatcher runs a workgroup's invocations serially on one
+  thread, so the causal order is already total within a
+  workgroup and a barrier needs no codegen.
 - GLSL.std.450 ExtInst dispatch for: FAbs, SAbs, Floor,
   Ceil, Trunc, Fract, FSign, FMod, Sqrt, InverseSqrt,
   FMin, FMax, FClamp, FMix, Step, SmoothStep, Length,

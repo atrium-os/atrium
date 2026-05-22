@@ -36,7 +36,7 @@ fn link_to_shared_library(obj: &Path, out: &Path) -> Result<(), String> {
 
 type CsMain = unsafe extern "C" fn(
     *const u8, *const u8, *mut u8,
-    u32, u32, u32, u32, u32, u32);
+    u32, u32, u32, u32, u32, u32, *mut u8);
 
 /// Compile `spv` via `compile_fn`, link to .so in `dir`,
 /// dlopen, then invoke atrium_cs_main with the given
@@ -55,6 +55,10 @@ fn invoke(spv: &[u8], use_bespoke: bool, dir: &Path, name: &str,
 fn invoke_with_gids(spv: &[u8], use_bespoke: bool, dir: &Path, name: &str,
                     out_ptr: *mut u8, gids: &[(u32, u32, u32)]) {
     let module = translate(spv).expect("frontend");
+    // Per-workgroup shared-memory scratch size (0 for shaders
+    // that declare no Workgroup-storage variables).
+    let wg_bytes = module.functions.first()
+        .map(|f| f.workgroup_size as usize).unwrap_or(0);
     let obj = if use_bespoke {
         let t = if cfg!(target_os = "macos") {
             BespokeTarget::Aarch64Darwin
@@ -74,11 +78,17 @@ fn invoke_with_gids(spv: &[u8], use_bespoke: bool, dir: &Path, name: &str,
     let cs_main: libloading::Symbol<CsMain> = unsafe {
         lib.get(b"atrium_cs_main").expect("atrium_cs_main symbol")
     };
+    let mut wg_buf: Vec<u8> = vec![0u8; wg_bytes];
     for &(gx, gy, gz) in gids {
+        // Fresh shared memory per workgroup.
+        for b in wg_buf.iter_mut() { *b = 0; }
+        let wg_ptr = if wg_bytes == 0 {
+            std::ptr::null_mut()
+        } else { wg_buf.as_mut_ptr() };
         unsafe {
             cs_main(
                 std::ptr::null(), std::ptr::null(), out_ptr,
-                gx, gy, gz, 0, 0, 0,
+                gx, gy, gz, 0, 0, 0, wg_ptr,
             );
         }
     }
@@ -2396,7 +2406,7 @@ fn lse_atomics_are_race_safe_under_concurrent_threads() {
                 for _ in 0..N_ITERS_PER_THREAD {
                     unsafe {
                         cs_fn(std::ptr::null(), std::ptr::null(), p,
-                              0, 0, 0, 0, 0, 0);
+                              0, 0, 0, 0, 0, 0, std::ptr::null_mut());
                     }
                 }
             });
@@ -3965,6 +3975,91 @@ fn differential_tonemap_per_pixel_vec4() {
 }
 
 #[test]
+fn differential_workgroup_shared_memory_accumulator() {
+    // `shared uint acc;` -- each invocation in a workgroup
+    // does `acc = acc + 1; ssbo[lid.x] = acc;`.  Because
+    // invocations within a workgroup run serially, invocation
+    // k (0-indexed) observes acc == k+1, so ssbo ends up
+    // [1, 2, 3, 4] for a 4-wide workgroup.  This exercises:
+    //  - StorageClass::Workgroup OpVariable allocation,
+    //  - the workgroup_buf ABI slot (10th cs_main arg),
+    //  - shared-memory persistence across invocations.
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration,
+        ExecutionMode, ExecutionModel, FunctionControl,
+        MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let v3u    = b.type_vector(u32_ty, 3);
+    let void_fn = b.type_function(void, vec![]);
+    // SSBO output.
+    let rt = b.type_runtime_array(u32_ty);
+    b.decorate(rt, Decoration::ArrayStride, vec![rspirv::dr::Operand::LiteralBit32(4)]);
+    let s = b.type_struct(vec![rt]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_u_ssbo = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+    let ssbo = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    // Workgroup-shared accumulator.
+    let ptr_u_wg = b.type_pointer(None, StorageClass::Workgroup, u32_ty);
+    let acc = b.variable(ptr_u_wg, None, StorageClass::Workgroup, None);
+    // LocalInvocationId builtin.
+    let ptr_v3u_in = b.type_pointer(None, StorageClass::Input, v3u);
+    let lid_var = b.variable(ptr_v3u_in, None, StorageClass::Input, None);
+    b.decorate(lid_var, Decoration::BuiltIn,
+        vec![rspirv::dr::Operand::BuiltIn(BuiltIn::LocalInvocationId)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    let c_one  = b.constant_bit32(u32_ty, 1);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    // acc = acc + 1
+    let cur = b.load(u32_ty, None, acc, None, vec![]).unwrap();
+    let next = b.i_add(u32_ty, None, cur, c_one).unwrap();
+    b.store(acc, next, None, vec![]).unwrap();
+    // lid_x = LocalInvocationId.x -- load the whole vec3
+    // builtin, then composite-extract lane 0 (the frontend
+    // lowers OpLoad of a builtin var to Op::LoadBuiltin).
+    let lid_vec = b.load(v3u, None, lid_var, None, vec![]).unwrap();
+    let lid_x = b.composite_extract(u32_ty, None, lid_vec, vec![0]).unwrap();
+    // ssbo[lid_x] = acc
+    let dst = b.access_chain(ptr_u_ssbo, None, ssbo, vec![c_zero, lid_x]).unwrap();
+    b.store(dst, next, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo, acc, lid_var]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [4u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spv = Vec::with_capacity(words.len() * 4);
+    for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+
+    let dir = TempDir::new().unwrap();
+    let mut b_buf = vec![0u8; 16];
+    let mut c_buf = vec![0u8; 16];
+    // Four local invocations of a single workgroup.
+    let lids: Vec<(u32, u32, u32)> =
+        (0..4u32).map(|i| (i, 0, 0)).collect();
+    invoke_cs_main_with_lids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &lids);
+    invoke_cs_main_with_lids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &lids);
+    assert_eq!(b_buf, c_buf,
+        "bespoke vs cranelift diverge on workgroup shared memory");
+    for i in 0..4u32 {
+        let v = u32::from_le_bytes(
+            b_buf[(i as usize)*4..(i as usize)*4+4].try_into().unwrap());
+        assert_eq!(v, i + 1,
+            "ssbo[{i}] should hold {} (serial accumulation); got {v}", i + 1);
+    }
+}
+
+#[test]
 fn differential_local_invocation_index_linearises() {
     let spv = build_local_index_cs();
     let dir = TempDir::new().unwrap();
@@ -4025,12 +4120,21 @@ fn invoke_cs_main_with_lids(spv: &[u8], use_bespoke: bool, dir: &Path, name: &st
     let cs_main: libloading::Symbol<CsMain> = unsafe {
         lib.get(b"atrium_cs_main").expect("atrium_cs_main symbol")
     };
+    // All `lids` belong to one workgroup (wg id 0,0,0), so a
+    // single shared-memory scratch buffer spans the loop.
+    let wg_bytes = module.functions.first()
+        .map(|f| f.workgroup_size as usize).unwrap_or(0);
+    let mut wg_buf: Vec<u8> = vec![0u8; wg_bytes];
+    let wg_ptr = if wg_bytes == 0 {
+        std::ptr::null_mut()
+    } else { wg_buf.as_mut_ptr() };
     for &(lx, ly, lz) in lids {
         unsafe {
             cs_main(
                 std::ptr::null(), std::ptr::null(), out_ptr,
                 0, 0, 0,  // workgroup id
                 lx, ly, lz,
+                wg_ptr,
             );
         }
     }

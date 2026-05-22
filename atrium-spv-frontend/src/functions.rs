@@ -222,11 +222,24 @@ fn translate_one(
     // mapping here so the backend can look up the binding
     // by ValueId without needing the SPIR-V Word.
     let mut ssbo_bindings: HashMap<u32, (u32, u32)> = HashMap::new();
+    let mut workgroup_var_offset: HashMap<ValueId, u32> = HashMap::new();
     for (spv_var_id, value) in &id_map {
         if let Some(&(set, binding)) = iface.var_binding.get(spv_var_id) {
             ssbo_bindings.insert(value.id.0, (set, binding));
         }
+        if let Some(&off) = iface.workgroup_var_offset.get(spv_var_id) {
+            workgroup_var_offset.insert(value.id, off);
+        }
     }
+    // Workgroup vars that were referenced (via OpLoad/OpStore
+    // or OpAccessChain through resolve_variable) are in id_map.
+    // Vars declared but never used by this entry point still
+    // need a slot reserved so the buffer-size matches what the
+    // frontend computed; copy any missing entries by allocating
+    // fresh ValueIds for them.  (Single-block compute shaders
+    // typically use every declared workgroup var, so this is
+    // rare; left in for spec-correctness.)
+    let workgroup_size = iface.workgroup_size;
 
     Ok(Function {
         name,
@@ -237,6 +250,8 @@ fn translate_one(
         blocks,
         local_size,
         ssbo_bindings,
+        workgroup_size,
+        workgroup_var_offset,
     })
 }
 

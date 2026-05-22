@@ -1058,6 +1058,28 @@ fn emit_function(
         }
     }
 
+    // Workgroup-shared memory prologue.  When the compute
+    // shader declares StorageClass::Workgroup variables, the
+    // 10th cs_main argument (`workgroup_buf`, AAPCS64 stack
+    // slot SP+8) points at a per-workgroup scratch buffer.
+    // Load it once into X8 (AAPCS64 indirect-result reg,
+    // unused by the compute calling convention) and pre-
+    // populate `pointers` so every Workgroup OpVariable
+    // resolves to (X8, var_offset).  The SP+8 offset shifts
+    // by frame_bytes after the prologue pushes callee-saved
+    // pairs, so the load is a placeholder patched at the end.
+    let mut workgroup_buf_load_patch: Option<usize> = None;
+    if func.workgroup_size > 0 && !func.workgroup_var_offset.is_empty() {
+        let off = a.len();
+        // Placeholder: ldr X8, [SP, #0] -- patched to
+        // [SP, #(frame_bytes + 8)] post-body.
+        a.emit(asm::ldr_x_offset(asm::Xreg(8), asm::Xreg(31), 0));
+        workgroup_buf_load_patch = Some(off);
+        for (&vid, &voff) in &func.workgroup_var_offset {
+            pointers.insert(vid, (asm::Xreg(8), voff as i32));
+        }
+    }
+
     let mut flat_i: usize = 0;
     for (block_pos, bid) in block_order.iter().enumerate() {
         let block = func.blocks.get(bid).unwrap();
@@ -3344,7 +3366,7 @@ fn emit_function(
     // the original [SP+0] slot ends up at [SP + frame_bytes]
     // by the time the body runs.  Compute the shift and
     // rewrite the placeholder ldr_w offsets.
-    if !lid_z_load_patches.is_empty() {
+    if !lid_z_load_patches.is_empty() || workgroup_buf_load_patch.is_some() {
         let int_pairs_count = if int_pool.used_callee_saved {
             PROLOGUE_INT_INSTS
         } else { 0 };
@@ -3354,6 +3376,13 @@ fn emit_function(
         let frame_bytes = (int_pairs_count + fp_pairs_count) as u16 * 16;
         for (off, wreg) in &lid_z_load_patches {
             a.patch(*off, asm::ldr_w_offset(*wreg, asm::Xreg(31), frame_bytes));
+        }
+        // workgroup_buf is the 10th arg, at SP+8 (lid.z is the
+        // 9th, at SP+0); both shift up by frame_bytes once the
+        // prologue pushes callee-saved pairs.
+        if let Some(off) = workgroup_buf_load_patch {
+            a.patch(off, asm::ldr_x_offset(
+                asm::Xreg(8), asm::Xreg(31), frame_bytes + 8));
         }
     }
 

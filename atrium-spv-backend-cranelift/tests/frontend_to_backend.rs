@@ -167,6 +167,8 @@ fn empty_module_still_produces_valid_object() {
             blocks,
             local_size: None,
             ssbo_bindings: std::collections::HashMap::new(),
+            workgroup_size: 0,
+            workgroup_var_offset: std::collections::HashMap::new(),
         }],
         entry_points: vec![EntryPoint {
             stage: ShaderStage::Fragment,

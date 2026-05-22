@@ -123,7 +123,7 @@ fn cranelift_two_binding_ssbo_writes_correct_buffers() {
         .expect("dlopen");
     type CsMain = unsafe extern "C" fn(
         *const u8, *const u8, *mut u8,
-        u32, u32, u32, u32, u32, u32);
+        u32, u32, u32, u32, u32, u32, *mut u8);
     let cs_main: libloading::Symbol<CsMain> = unsafe {
         lib.get(b"atrium_cs_main").expect("atrium_cs_main symbol")
     };
@@ -141,6 +141,7 @@ fn cranelift_two_binding_ssbo_writes_correct_buffers() {
             table.as_ptr() as *mut u8,         // out_buffer = descriptor-table base
             0, 0, 0,                            // wg_id
             0, 0, 0,                            // lid
+            std::ptr::null_mut(),               // workgroup_buf
         );
     }
 

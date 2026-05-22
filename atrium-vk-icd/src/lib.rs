@@ -405,6 +405,12 @@ struct AtriumShaderModule {
     /// the multi-binding compute dispatch path (see
     /// `Tier2ComputeStateBlob::ssbo_binding_count`).
     ssbo_binding_count: u32,
+    /// Total byte size of the shader's `Workgroup`-storage
+    /// variables, scanned at module-create time.  Compute
+    /// pipelines propagate this onto the Tier2ComputeStateBlob
+    /// so the dispatcher allocates a per-workgroup scratch
+    /// buffer.  0 if the shader declares no workgroup memory.
+    workgroup_size: u32,
 }
 
 /// Count distinct StorageBuffer variables in `spirv` that
@@ -484,6 +490,88 @@ fn scan_spirv_ssbo_binding_count(spirv: &[u8]) -> u32 {
         cursor += instr_bytes;
     }
     count
+}
+
+/// Scan SPIR-V bytecode for the total byte size of all
+/// `Workgroup`-storage variables -- the per-workgroup
+/// scratch buffer the dispatcher must allocate.
+///
+/// Mirrors the frontend's `ir_type_size_bytes_for` +
+/// workgroup-var packing in `interface.rs`: scalar and
+/// vector pointees are sized; arrays/structs (size 0 in the
+/// frontend today) contribute nothing.  Offsets are packed
+/// with each var aligned to `size.min(16).max(4)`.
+fn scan_spirv_workgroup_size(spirv: &[u8]) -> u32 {
+    if spirv.len() < 20 || spirv.len() % 4 != 0 { return 0; }
+    let magic = u32::from_le_bytes(spirv[0..4].try_into().unwrap());
+    if magic != 0x07230203 { return 0; }
+    let word_at = |off: usize| -> u32 {
+        u32::from_le_bytes(spirv[off..off + 4].try_into().unwrap())
+    };
+    // type id -> byte size (scalar/vector only).
+    let mut type_size: std::collections::HashMap<u32, u32> =
+        std::collections::HashMap::new();
+    // Workgroup pointer type id -> pointee type id.
+    let mut wg_ptr_pointee: std::collections::HashMap<u32, u32> =
+        std::collections::HashMap::new();
+    let mut total: u32 = 0;
+    let mut cursor = 20;
+    while cursor + 4 <= spirv.len() {
+        let head = word_at(cursor);
+        let word_count = (head >> 16) as usize;
+        let opcode = (head & 0xFFFF) as u16;
+        if word_count == 0 { break; }
+        let instr_bytes = word_count * 4;
+        if cursor + instr_bytes > spirv.len() { break; }
+        match opcode {
+            // OpTypeInt = 21: <id, width, signedness>
+            21 if word_count >= 4 => {
+                let id = word_at(cursor + 4);
+                let width = word_at(cursor + 8);
+                type_size.insert(id, (width / 8).max(4));
+            }
+            // OpTypeFloat = 22: <id, width>
+            22 if word_count >= 3 => {
+                let id = word_at(cursor + 4);
+                let width = word_at(cursor + 8);
+                type_size.insert(id, (width / 8).max(4));
+            }
+            // OpTypeVector = 23: <id, component_type, count>
+            23 if word_count >= 4 => {
+                let id = word_at(cursor + 4);
+                let comp = word_at(cursor + 8);
+                let count = word_at(cursor + 12);
+                if let Some(&cs) = type_size.get(&comp) {
+                    type_size.insert(id, cs * count);
+                }
+            }
+            // OpTypePointer = 32: <id, storage_class, type_id>
+            32 if word_count >= 4 => {
+                let id = word_at(cursor + 4);
+                let storage = word_at(cursor + 8);
+                let pointee = word_at(cursor + 12);
+                // StorageClass Workgroup = 4.
+                if storage == 4 {
+                    wg_ptr_pointee.insert(id, pointee);
+                }
+            }
+            // OpVariable = 59: <result_type, result_id, storage>
+            59 if word_count >= 4 => {
+                let result_type = word_at(cursor + 4);
+                if let Some(&pointee) = wg_ptr_pointee.get(&result_type) {
+                    let size = type_size.get(&pointee).copied().unwrap_or(0);
+                    if size > 0 {
+                        let align = size.min(16).max(4);
+                        let aligned = (total + align - 1) & !(align - 1);
+                        total = aligned + size;
+                    }
+                }
+            }
+            _ => {}
+        }
+        cursor += instr_bytes;
+    }
+    total
 }
 
 /// Scan SPIR-V bytecode for the `LocalSize` execution mode
@@ -3696,6 +3784,7 @@ pub unsafe extern "C" fn vkCreateShaderModule(
     // upload_shader consumes `bytes`.
     let local_size = scan_spirv_local_size(&bytes);
     let ssbo_binding_count = scan_spirv_ssbo_binding_count(&bytes);
+    let workgroup_size = scan_spirv_workgroup_size(&bytes);
 
     // Resolve-or-upload against the daemon. Failure (no live
     // client, validation rejection) leaves shader_id=None — the
@@ -3719,6 +3808,7 @@ pub unsafe extern "C" fn vkCreateShaderModule(
     if let Ok(mut s) = dev.shaders.lock() {
         s.insert(handle, AtriumShaderModule {
             shader_id, bytecode_hash, local_size, ssbo_binding_count,
+            workgroup_size,
         });
     } else {
         return VK_ERROR_INITIALIZATION_FAILED;
@@ -4865,10 +4955,12 @@ pub unsafe extern "C" fn vkCreateComputePipelines(
         let info = &*(p_create_infos as *const ash::vk::ComputePipelineCreateInfo)
             .offset(i as isize);
         let mod_handle: u64 = std::mem::transmute(info.stage.module);
-        let (cs_rid, local_size, ssbo_binding_count) = match dev.shaders.lock() {
+        let (cs_rid, local_size, ssbo_binding_count, workgroup_size)
+            = match dev.shaders.lock() {
             Ok(m) => match m.get(&mod_handle) {
-                Some(am) => (am.shader_id, am.local_size, am.ssbo_binding_count),
-                None => (None, None, 0),
+                Some(am) => (am.shader_id, am.local_size,
+                             am.ssbo_binding_count, am.workgroup_size),
+                None => (None, None, 0, 0),
             },
             Err(_) => continue,
         };
@@ -4879,6 +4971,7 @@ pub unsafe extern "C" fn vkCreateComputePipelines(
             local_size_y: local_size.map(|(_, y, _)| y).unwrap_or(1),
             local_size_z: local_size.map(|(_, _, z)| z).unwrap_or(1),
             ssbo_binding_count,
+            workgroup_size,
         };
         let Ok(bytes) = postcard::to_allocvec(&blob) else { continue };
 
@@ -8858,6 +8951,58 @@ mod tests {
         assert_eq!(scan_spirv_ssbo_binding_count(&build_n_ssbo_cs(1)), 1);
         assert_eq!(scan_spirv_ssbo_binding_count(&build_n_ssbo_cs(2)), 2);
         assert_eq!(scan_spirv_ssbo_binding_count(&build_n_ssbo_cs(4)), 4);
+    }
+
+    #[test]
+    fn workgroup_size_scanner_sums_shared_vars() {
+        use rspirv::binary::Assemble;
+        use rspirv::spirv::{
+            AddressingModel, Capability, ExecutionMode, ExecutionModel,
+            FunctionControl, MemoryModel, StorageClass,
+        };
+        // Build a CS with `kinds` workgroup variables of the
+        // given (component_count) shapes and assert the
+        // scanner sums their byte sizes with alignment.
+        let build = |shapes: &[u32]| -> Vec<u8> {
+            let mut b = rspirv::dr::Builder::new();
+            b.set_version(1, 3);
+            b.capability(Capability::Shader);
+            b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+            let void   = b.type_void();
+            let u32_ty = b.type_int(32, 0);
+            let void_fn = b.type_function(void, vec![]);
+            for &comps in shapes {
+                let ty = if comps == 1 {
+                    u32_ty
+                } else {
+                    b.type_vector(u32_ty, comps)
+                };
+                let ptr = b.type_pointer(None, StorageClass::Workgroup, ty);
+                b.variable(ptr, None, StorageClass::Workgroup, None);
+            }
+            let main = b.begin_function(
+                void, None, FunctionControl::NONE, void_fn).unwrap();
+            b.begin_block(None).unwrap();
+            b.ret().unwrap();
+            b.end_function().unwrap();
+            b.entry_point(ExecutionModel::GLCompute, main, "main", vec![]);
+            b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+            let words: Vec<u32> = b.module().assemble();
+            let mut bytes = Vec::with_capacity(words.len() * 4);
+            for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+            bytes
+        };
+        // No workgroup vars -> 0.
+        assert_eq!(scan_spirv_workgroup_size(&build(&[])), 0);
+        // One scalar uint -> 4 bytes.
+        assert_eq!(scan_spirv_workgroup_size(&build(&[1])), 4);
+        // Two scalars -> 8 bytes.
+        assert_eq!(scan_spirv_workgroup_size(&build(&[1, 1])), 8);
+        // One uvec4 -> 16 bytes.
+        assert_eq!(scan_spirv_workgroup_size(&build(&[4])), 16);
+        // scalar (4) then uvec4 (aligned to 16) -> 4 padded
+        // to 16, + 16 = 32.
+        assert_eq!(scan_spirv_workgroup_size(&build(&[1, 4])), 32);
     }
 
     #[test]

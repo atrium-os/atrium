@@ -887,6 +887,20 @@ pub struct Function {
     /// resolved via `Op::ImageHandle { set, binding }` which
     /// carries the binding inline.
     pub ssbo_bindings: HashMap<u32, (u32, u32)>,
+    /// Total byte size of the per-workgroup scratch buffer
+    /// this compute function needs, computed at frontend time
+    /// from the sum of its `StorageClass::Workgroup` OpVariable
+    /// sizes (aligned).  Zero if the shader declares no
+    /// workgroup-shared memory.  The host dispatcher
+    /// allocates a buffer of this size per worker thread and
+    /// passes its base pointer as the `workgroup_buf` ABI
+    /// slot (10th cs_main argument, at SP+8).
+    pub workgroup_size: u32,
+    /// Per-variable byte offsets inside the workgroup
+    /// scratch buffer.  Indexed by the variable's IR
+    /// ValueId; codegen resolves Workgroup-storage OpVariable
+    /// to `(workgroup_buf_ptr, offset)`.
+    pub workgroup_var_offset: HashMap<ValueId, u32>,
 }
 
 /// Shader stage.

@@ -147,6 +147,11 @@ pub type CsMain = unsafe extern "C" fn(
     local_id_x:      u32,
     local_id_y:      u32,
     local_id_z:      u32,
+    // 10th arg (AAPCS64: passed on stack at SP+8): pointer to
+    // a per-workgroup scratch buffer used for OpVariable in
+    // StorageClass::Workgroup.  May be null when the shader
+    // declares no workgroup-shared memory.
+    workgroup_buf:   *mut u8,
 );
 
 /// Open a compiled shader `.so` (or `.dylib`) and resolve

@@ -56,6 +56,16 @@ pub struct InterfaceContext {
     /// block, if any. SPIR-V allows at most one such
     /// variable per entry point.
     pub push_constant_var: Option<Word>,
+    /// Workgroup-storage variables in this module.  Each maps
+    /// to its byte offset within the per-workgroup scratch
+    /// buffer that the dispatcher allocates and passes via the
+    /// `workgroup_buf` ABI slot.  Offsets are assigned in
+    /// declaration order, packed (no padding beyond the
+    /// natural alignment of each type's size).
+    pub workgroup_var_offset: HashMap<Word, u32>,
+    /// Total size of the per-workgroup scratch buffer in
+    /// bytes (sum of all workgroup-storage variables).
+    pub workgroup_size: u32,
     /// SPIR-V variable id → `(set, binding)` from `OpDecorate`
     /// `DescriptorSet`/`Binding`. Function translation uses
     /// this for image/sampler `OpLoad` — those become
@@ -378,6 +388,21 @@ impl InterfaceContext {
                             ctx.var_binding.insert(*var_id, (set, binding));
                         }
                     }
+                }
+                SpvStorageClass::Workgroup => {
+                    // Each Workgroup variable consumes its
+                    // type's byte size in a per-workgroup
+                    // scratch buffer.  Offsets are assigned
+                    // in declaration order with each var
+                    // aligned to its natural size.
+                    let size = ir_type_size_bytes_for(&types.types, *pointee_id);
+                    // Align to the larger of 4 bytes or
+                    // size (capped at 16 for vec4-shaped
+                    // arrays/structs).
+                    let align = size.min(16).max(4);
+                    let aligned = (ctx.workgroup_size + align - 1) & !(align - 1);
+                    ctx.workgroup_var_offset.insert(*var_id, aligned);
+                    ctx.workgroup_size = aligned + size;
                 }
                 SpvStorageClass::Output => {
                     if let Some(d) = deco {

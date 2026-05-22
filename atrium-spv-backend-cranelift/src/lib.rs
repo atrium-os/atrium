@@ -393,6 +393,20 @@ fn emit_function(
             }
         }
 
+        // Workgroup-shared memory: the 10th compute param
+        // (params[9]) is the per-workgroup scratch buffer.
+        // Pre-populate `pointers` for every Workgroup OpVariable
+        // so resolve_or_make_pointer returns (workgroup_buf,
+        // var_offset) straight from the cache.
+        if func.stage == ShaderStage::Compute
+            && !func.workgroup_var_offset.is_empty()
+        {
+            let wg_buf = translator.params[9];
+            for (&vid, &off) in &func.workgroup_var_offset {
+                translator.pointers.insert(vid, (wg_buf, off as i32));
+            }
+        }
+
         // Walk every IR block in id order, switching the
         // builder to the Cranelift block for each. The
         // terminator (Branch / BranchCond / Return) is
@@ -2056,7 +2070,8 @@ fn build_signature(
         ShaderStage::Compute => {
             // atrium_cs_main(uniforms, push_constants,
             //                out_buffer,
-            //                workgroup_id[3], local_id[3])
+            //                workgroup_id[3], local_id[3],
+            //                workgroup_buf)
             params.push(AbiParam::new(pointer_type)); // uniforms
             params.push(AbiParam::new(pointer_type)); // push_constants
             params.push(AbiParam::new(pointer_type)); // out_buffer (SSBO)
@@ -2071,6 +2086,10 @@ fn build_signature(
             params.push(AbiParam::new(types::I32));   // local_id[0]
             params.push(AbiParam::new(types::I32));   // local_id[1]
             params.push(AbiParam::new(types::I32));   // local_id[2]
+            // workgroup_buf: per-workgroup scratch for
+            // StorageClass::Workgroup variables; null when
+            // the shader declares no workgroup-shared memory.
+            params.push(AbiParam::new(pointer_type)); // workgroup_buf
         }
     }
 

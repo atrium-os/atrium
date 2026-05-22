@@ -1151,17 +1151,15 @@ impl Tier2Backend {
         // independent by Vulkan semantics (no cross-workgroup
         // synchronisation), so we partition the gz/gy/gx grid
         // across worker threads.  Within a workgroup the
-        // lz/ly/lx loop stays serial so future shared-memory
-        // and ControlBarrier semantics are preserved per
-        // workgroup.
+        // lz/ly/lx loop stays serial so shared-memory and
+        // ControlBarrier semantics are preserved per workgroup.
         //
-        // Note: atomics across workgroups currently lower to
-        // load-op-store on the bespoke backend, which races
-        // under this parallel path.  Real LSE atomics
-        // (LDADD/SWP etc.) are queued; until then,
-        // cross-workgroup atomics may produce racy results.
-        // Single-workgroup dispatches and same-workgroup
-        // atomics remain correct.
+        // Atomics lower to ARMv8.1 LSE instructions and are
+        // race-safe across workgroups.  Each workgroup gets
+        // its own zeroed slice of the per-thread workgroup
+        // scratch buffer; since invocations within a workgroup
+        // run serially on one thread, ControlBarrier is a
+        // no-op (the causal order is already total).
         let total_workgroups = (cmd.group_count_x as u64)
             * (cmd.group_count_y as u64)
             * (cmd.group_count_z as u64);
@@ -1176,6 +1174,10 @@ impl Tier2Backend {
         let lx_n = cs_state.local_size_x;
         let ly_n = cs_state.local_size_y;
         let lz_n = cs_state.local_size_z;
+        // Per-workgroup shared-memory scratch size.  Each
+        // worker thread owns one buffer of this size, zeroed
+        // before every workgroup it runs.
+        let wg_bytes = cs_state.workgroup_size as usize;
         let chunk = total_workgroups.div_ceil(n_threads as u64);
         std::thread::scope(|s| {
             for t in 0..n_threads {
@@ -1186,12 +1188,21 @@ impl Tier2Backend {
                     let out_ptr = out_addr as *mut u8;
                     let uni_ptr = uni_addr as *const u8;
                     let pc_ptr  = pc_addr  as *const u8;
+                    // This thread's private workgroup scratch.
+                    let mut wg_buf: Vec<u8> = vec![0u8; wg_bytes];
                     for widx in lo..hi {
                         // Delinearise widx into (gx, gy, gz).
                         let gx = (widx % gx_n as u64) as u32;
                         let gy = ((widx / gx_n as u64) % gy_n as u64) as u32;
                         let gz = (widx / (gx_n as u64 * gy_n as u64)) as u32;
                         let _ = gz_n;
+                        // Fresh shared memory per workgroup.
+                        for b in wg_buf.iter_mut() { *b = 0; }
+                        let wg_ptr = if wg_bytes == 0 {
+                            std::ptr::null_mut()
+                        } else {
+                            wg_buf.as_mut_ptr()
+                        };
                         for lz in 0..lz_n {
                             for ly in 0..ly_n {
                                 for lx in 0..lx_n {
@@ -1200,14 +1211,14 @@ impl Tier2Backend {
                                     // matches CsMain (checked at
                                     // open time); the output buffer
                                     // and descriptor table outlive
-                                    // this scope; cross-workgroup
-                                    // races are the shader's
-                                    // responsibility per Vulkan.
+                                    // this scope; wg_buf outlives
+                                    // the inner loop.
                                     unsafe {
                                         cs_main(
                                             uni_ptr, pc_ptr, out_ptr,
                                             gx, gy, gz,
                                             lx, ly, lz,
+                                            wg_ptr,
                                         );
                                     }
                                 }
