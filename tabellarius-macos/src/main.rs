@@ -25,11 +25,14 @@
 //! - `INSULA_TABELLARIUSD_STORE` — substore dir. Default:
 //!   under `$XDG_RUNTIME_DIR/tabellarius-macos/subs/`.
 
+mod relay_client;
 mod substore;
 
 use aqueduct::classes::CLASS_TABELLARIUS;
 use aqueduct::envelope::flag;
 use aqueduct::Connection;
+use relay_client::{resolve_relay_addr, PushQueue, RelayClient};
+use std::collections::VecDeque;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -40,8 +43,22 @@ use substore::{resolve_substore_path, SubStore};
 const OP_SUBSCRIBE_REQUEST: u16 = 0;
 const OP_UNSUBSCRIBE_REQUEST: u16 = 1;
 const OP_LIST_REQUEST: u16 = 2;
+const OP_GET_PUSH_REQUEST: u16 = 3;
 
 type SharedStore = Arc<Mutex<SubStore>>;
+
+/// Shared daemon state threaded into each connection
+/// handler.
+#[derive(Clone)]
+struct Ctx {
+    store: SharedStore,
+    /// Set when `$INSULA_TABELLARIUSD_RELAY` is
+    /// configured; `None` means relay delivery is off.
+    relay: Option<Arc<RelayClient>>,
+    /// Pushes received from the relay, waiting for an
+    /// app to drain them via GET_PUSH.
+    queue: PushQueue,
+}
 
 fn main() -> ExitCode {
     if std::env::args().any(|a| a == "-h" || a == "--help") {
@@ -81,6 +98,37 @@ fn main() -> ExitCode {
     );
 
     let store: SharedStore = Arc::new(Mutex::new(store));
+    let queue: PushQueue = Arc::new(Mutex::new(VecDeque::new()));
+
+    // Relay client — only when an address is configured.
+    let relay: Option<Arc<RelayClient>> = match resolve_relay_addr() {
+        Some(addr) => {
+            // Announce every pubkey we already hold.
+            let initial_keys: Vec<[u8; 32]> = {
+                let s = store.lock().unwrap();
+                s.iter().map(|sub| sub.pubkey_bytes()).collect()
+            };
+            match RelayClient::connect(
+                &addr, initial_keys, store.clone(), queue.clone(),
+            ) {
+                Ok(rc) => {
+                    eprintln!("tabellarius-macos: connected to relay {}", addr);
+                    Some(Arc::new(rc))
+                }
+                Err(e) => {
+                    eprintln!(
+                        "tabellarius-macos: WARNING — relay {} unreachable: {} \
+                         (subscribe/list still work; no push delivery)",
+                        addr, e
+                    );
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+
+    let ctx = Ctx { store, relay, queue };
 
     for stream in listener.incoming() {
         let stream = match stream {
@@ -90,13 +138,14 @@ fn main() -> ExitCode {
                 continue;
             }
         };
-        let store = store.clone();
-        thread::spawn(move || handle_connection(stream, store));
+        let ctx = ctx.clone();
+        thread::spawn(move || handle_connection(stream, ctx));
     }
     ExitCode::SUCCESS
 }
 
-fn handle_connection(stream: UnixStream, store: SharedStore) {
+fn handle_connection(stream: UnixStream, ctx: Ctx) {
+    let store = &ctx.store;
     let mut conn = match Connection::wrap(stream) {
         Ok(c) => c,
         Err(e) => {
@@ -131,6 +180,16 @@ fn handle_connection(stream: UnixStream, store: SharedStore) {
                     }
                 };
 
+                // Announce the new pubkey to the relay
+                // so pushes for it start flowing.
+                if let Some(relay) = &ctx.relay {
+                    if let Err(e) = relay.announce(vec![pubkey]) {
+                        eprintln!(
+                            "tabellarius-macos: relay announce failed: {}", e
+                        );
+                    }
+                }
+
                 // Wire: [u8 key_id_len | key_id UTF-8 | 32B pubkey]
                 let mut out = Vec::with_capacity(1 + key_id.len() + 32);
                 out.push(key_id.len() as u8);
@@ -148,10 +207,24 @@ fn handle_connection(stream: UnixStream, store: SharedStore) {
                     Ok(s) => s.to_string(),
                     Err(_) => continue,
                 };
-                let removed = {
+                // Capture the pubkey before removal so
+                // we can retract it from the relay.
+                let (removed, pubkey) = {
                     let mut s = store.lock().unwrap();
-                    s.remove(&key_id)
+                    let pk = s.iter()
+                        .find(|sub| sub.key_id == key_id)
+                        .map(|sub| sub.pubkey_bytes());
+                    (s.remove(&key_id), pk)
                 };
+                if removed {
+                    if let (Some(relay), Some(pk)) = (&ctx.relay, pubkey) {
+                        if let Err(e) = relay.retract(pk) {
+                            eprintln!(
+                                "tabellarius-macos: relay retract failed: {}", e
+                            );
+                        }
+                    }
+                }
                 let status: u8 = if removed { 0 } else { 1 };
                 let _ = conn.send_message(
                     CLASS_TABELLARIUS,
@@ -183,6 +256,31 @@ fn handle_connection(stream: UnixStream, store: SharedStore) {
                     &out,
                 );
             }
+            OP_GET_PUSH_REQUEST => {
+                // Pop the oldest queued push, if any.
+                let next = ctx.queue.lock().unwrap().pop_front();
+                let out: Vec<u8> = match next {
+                    Some(push) => {
+                        // [0 | u8 id_len | key_id | u64 ts LE | blob]
+                        let mut v = Vec::with_capacity(
+                            1 + 1 + push.key_id.len() + 8 + push.blob.len(),
+                        );
+                        v.push(0u8); // status: a push follows
+                        v.push(push.key_id.len() as u8);
+                        v.extend_from_slice(push.key_id.as_bytes());
+                        v.extend_from_slice(&push.ts.to_le_bytes());
+                        v.extend_from_slice(&push.blob);
+                        v
+                    }
+                    None => vec![1u8], // status: queue empty
+                };
+                let _ = conn.send_message(
+                    CLASS_TABELLARIUS,
+                    OP_GET_PUSH_REQUEST,
+                    flag::IS_RESPONSE,
+                    &out,
+                );
+            }
             _ => {}
         }
     }
@@ -209,15 +307,20 @@ Listens on a unix socket and serves CLASS_TABELLARIUS ops:
                              response = 1B status (0=ok, 1=unknown)
   op 2 LIST_REQUEST        : payload = (empty)
                              response = [u16 n|for each: u8 id_len|id|32B pk]
+  op 3 GET_PUSH_REQUEST    : payload = (empty)
+                             response = 1B status (0=push follows, 1=empty)
 
 Environment:
   INSULA_TABELLARIUSD_SOCKET  listen path (default:
                               $XDG_RUNTIME_DIR/tabellarius-macos.sock)
   INSULA_TABELLARIUSD_STORE   substore dir (default:
                               $XDG_RUNTIME_DIR/tabellarius-macos/subs/)
+  INSULA_TABELLARIUSD_RELAY   relay address (host:port). When set,
+                              the daemon connects, announces every
+                              subscription pubkey, and queues inbound
+                              pushes for GET_PUSH. Unset = no relay.
 
-Substore is file-backed; subscriptions survive daemon restart.
-Plaintext on disk (v0); Keychain-Services wrapping is shared
-future work with the vestibulum daemon."
+Substore is XChaCha20-Poly1305-encrypted at rest under a per-
+installation master key; subscriptions survive daemon restart."
     );
 }

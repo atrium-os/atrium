@@ -21,6 +21,7 @@ use std::path::Path;
 const OP_SUBSCRIBE: u16 = 0;
 const OP_UNSUBSCRIBE: u16 = 1;
 const OP_LIST: u16 = 2;
+const OP_GET_PUSH: u16 = 3;
 
 pub fn cmd_push(args: &[String], install_root: &Path) -> Result<(), String> {
     let sub = args.first().map(String::as_str).unwrap_or("list");
@@ -28,8 +29,10 @@ pub fn cmd_push(args: &[String], install_root: &Path) -> Result<(), String> {
         "subscribe" => push_subscribe(&args[1..], install_root),
         "list" => push_list(install_root),
         "unsubscribe" => push_unsubscribe(&args[1..], install_root),
+        "pending" => push_pending(install_root),
         other => Err(format!(
-            "push: unknown subcommand '{}' (use subscribe|list|unsubscribe)",
+            "push: unknown subcommand '{}' \
+             (use subscribe|list|unsubscribe|pending)",
             other
         )),
     }
@@ -151,4 +154,56 @@ fn push_unsubscribe(args: &[String], install_root: &Path) -> Result<(), String> 
     } else {
         Err(format!("no subscription with key_id {}", key_id))
     }
+}
+
+/// `insula push pending` — drain the device's
+/// received-push queue, printing one line per push.
+/// Each GET_PUSH op pops the oldest push; we loop
+/// until the daemon reports the queue empty.
+fn push_pending(install_root: &Path) -> Result<(), String> {
+    let mut conn = connect_tabellarius(install_root)?;
+    let mut count = 0usize;
+    loop {
+        let resp = rpc(&mut conn, OP_GET_PUSH, &[])?;
+        if resp.is_empty() {
+            return Err("push pending: empty response from daemon".to_string());
+        }
+        match resp[0] {
+            1 => break, // queue empty
+            0 => {
+                // [0 | u8 id_len | key_id | u64 ts LE | blob]
+                if resp.len() < 2 {
+                    return Err("push pending: truncated response".to_string());
+                }
+                let id_len = resp[1] as usize;
+                if resp.len() < 2 + id_len + 8 {
+                    return Err("push pending: truncated response".to_string());
+                }
+                let key_id = std::str::from_utf8(&resp[2..2 + id_len])
+                    .map_err(|e| format!("push pending: non-utf8 key_id: {}", e))?;
+                let ts_off = 2 + id_len;
+                let ts = u64::from_le_bytes(
+                    resp[ts_off..ts_off + 8].try_into().unwrap()
+                );
+                let blob = &resp[ts_off + 8..];
+                println!(
+                    "push  key_id={}  ts={}  {} byte(s)",
+                    key_id, ts, blob.len()
+                );
+                count += 1;
+            }
+            other => {
+                return Err(format!(
+                    "push pending: unknown status byte {}", other
+                ));
+            }
+        }
+    }
+    if count == 0 {
+        println!("(no pending pushes)");
+    } else {
+        println!();
+        println!("drained {} push(es)", count);
+    }
+    Ok(())
 }

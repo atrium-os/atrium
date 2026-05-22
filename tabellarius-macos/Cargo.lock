@@ -648,7 +648,16 @@ dependencies = [
  "ed25519-dalek",
  "libatrium",
  "rand",
+ "tabellarius-relay",
  "tempfile",
+]
+
+[[package]]
+name = "tabellarius-relay"
+version = "0.1.0"
+dependencies = [
+ "postcard",
+ "serde",
 ]
 
 [[package]]

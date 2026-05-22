@@ -122,6 +122,13 @@ pub const CLASS_NET:       u8 = 12;
 ///       payload: (empty)
 ///       response: [u16 n_entries LE | for each entry:
 ///                 u8 key_id_len | key_id UTF-8 | 32-byte pubkey]
+///   3 = GET_PUSH_REQUEST  (Phase B)
+///       payload: (empty)
+///       response: 1-byte status —
+///         0 = a push follows:
+///             [0 | u8 key_id_len | key_id UTF-8 |
+///              u64 ts LE | blob bytes (rest of payload)]
+///         1 = the device's received-push queue is empty
 pub const CLASS_TABELLARIUS: u8 = 13;
 
 /// Smoke-test / fuzzing service. Not part of the production

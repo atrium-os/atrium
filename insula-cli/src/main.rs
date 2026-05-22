@@ -116,6 +116,7 @@ Commands:
   push subscribe <purpose>         Subscribe to push delivery.
   push list                        Show active push subscriptions.
   push unsubscribe <key_id>        Remove a push subscription.
+  push pending                     Drain queued pushes from the relay.
   keychain pubkey <service>        Print the ed25519 pubkey for a service.
   keychain sign <service> <hex>    Sign a hex-encoded challenge.
   notify <title> <body> [--urgency low|normal|high]
