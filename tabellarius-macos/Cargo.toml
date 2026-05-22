@@ -3,7 +3,7 @@ name        = "tabellarius-macos"
 version     = "0.1.0"
 edition     = "2021"
 license     = "MIT OR Apache-2.0"
-description = "macOS adapter for Tabellarius's push-delivery role (docs/spec/tabellarius.md). v0 daemon that serves CLASS_TABELLARIUS subscribe/unsubscribe/list ops over Aqueduct. Mints per-subscription keypairs, persists them to disk so apps see stable pub keys across daemon restart. Actual relay connection + wake-on-push are Phase B work; v0 closes the libatrium ABI shape so apps can publish their pubkeys to their own backends and have the keypair survive."
+description = "macOS adapter for Tabellarius's push-delivery role (docs/spec/tabellarius.md). Daemon that serves CLASS_TABELLARIUS subscribe/unsubscribe/list ops over Aqueduct. Mints per-subscription keypairs, persists them to disk so apps see stable pub keys across daemon restart. Substore files are XChaCha20-Poly1305-wrapped under a per-installation master key — same shape as vestibulum's keystore. Actual relay connection + wake-on-push are Phase B work."
 publish     = false
 
 [[bin]]
@@ -11,9 +11,10 @@ name = "tabellarius-macos"
 path = "src/main.rs"
 
 [dependencies]
-aqueduct      = { path = "../aqueduct" }
-ed25519-dalek = { version = "2", default-features = false, features = ["rand_core"] }
-rand          = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+aqueduct          = { path = "../aqueduct" }
+ed25519-dalek     = { version = "2", default-features = false, features = ["rand_core"] }
+rand              = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+chacha20poly1305  = { version = "0.10", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 libatrium = { path = "../libatrium" }

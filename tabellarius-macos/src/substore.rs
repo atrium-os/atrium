@@ -11,10 +11,22 @@
 //! keystore; integration with macOS Keychain Services is
 //! future polish, shared with the vestibulum work.
 
+use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use rand::RngCore;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+/// Length of the master encryption key (same shape as
+/// the vestibulum keystore — see that crate for the
+/// threat model).
+const MASTER_KEY_LEN: usize = 32;
+/// XChaCha20-Poly1305 nonce length.
+const NONCE_LEN: usize = 24;
+/// AEAD authentication-tag length.
+const TAG_LEN: usize = 16;
 
 /// Length of a subscription key_id in hex characters.
 /// 16 hex chars = 8 bytes of pubkey-prefix, enough to be
@@ -40,13 +52,15 @@ impl Subscription {
 /// In-memory mirror of the on-disk subscription store.
 pub struct SubStore {
     dir: PathBuf,
+    master: [u8; MASTER_KEY_LEN],
     by_id: BTreeMap<String, Subscription>,
 }
 
 impl SubStore {
     /// Open (or create) a subscription store rooted at
-    /// `dir`. Loads any existing `.sub` files into
-    /// memory.
+    /// `dir`. Loads existing `.sub` files (encrypted or
+    /// legacy plaintext) into memory. Master key is
+    /// created on first open if missing.
     pub fn open(dir: PathBuf) -> std::io::Result<Self> {
         std::fs::create_dir_all(&dir)?;
         #[cfg(unix)]
@@ -56,6 +70,8 @@ impl SubStore {
             perms.set_mode(0o700);
             let _ = std::fs::set_permissions(&dir, perms);
         }
+        let master = load_or_create_master(&dir)?;
+        let cipher = XChaCha20Poly1305::new((&master).into());
 
         let mut by_id = BTreeMap::new();
         for entry in std::fs::read_dir(&dir)? {
@@ -65,25 +81,56 @@ impl SubStore {
                 continue;
             }
             let bytes = std::fs::read(&path)?;
-            // Format: [1B purpose_len | purpose | 32B sk]
             if bytes.is_empty() {
                 continue;
             }
-            let purpose_len = bytes[0] as usize;
-            if bytes.len() < 1 + purpose_len + 32 {
+
+            // Try encrypted format first (starts with a
+            // 24-byte nonce; minimum total is nonce +
+            // tag + 1B payload = 41 bytes). If decrypt
+            // fails AND the file matches the legacy
+            // shape, accept as plaintext and re-encrypt
+            // on next write.
+            let payload: Vec<u8> = if bytes.len() > NONCE_LEN + TAG_LEN {
+                let nonce = XNonce::from_slice(&bytes[..NONCE_LEN]);
+                match cipher.decrypt(nonce, &bytes[NONCE_LEN..]) {
+                    Ok(plain) => plain,
+                    Err(_) => {
+                        // Maybe legacy plaintext.
+                        if looks_like_legacy_sub(&bytes) {
+                            bytes.clone()
+                        } else {
+                            eprintln!(
+                                "tabellarius: decrypt failed for {}: \
+                                 master.key changed, or file corrupted",
+                                path.display(),
+                            );
+                            continue;
+                        }
+                    }
+                }
+            } else if looks_like_legacy_sub(&bytes) {
+                bytes.clone()
+            } else {
+                continue;
+            };
+
+            // Format (post-decrypt or legacy):
+            //   [1B purpose_len | purpose | 32B sk]
+            let purpose_len = payload[0] as usize;
+            if payload.len() < 1 + purpose_len + 32 {
                 continue;
             }
-            let purpose = match std::str::from_utf8(&bytes[1..1 + purpose_len]) {
+            let purpose = match std::str::from_utf8(&payload[1..1 + purpose_len]) {
                 Ok(s) => s.to_string(),
                 Err(_) => continue,
             };
             let mut sk_bytes = [0u8; 32];
-            sk_bytes.copy_from_slice(&bytes[1 + purpose_len..1 + purpose_len + 32]);
+            sk_bytes.copy_from_slice(&payload[1 + purpose_len..1 + purpose_len + 32]);
             let signing_key = SigningKey::from_bytes(&sk_bytes);
             let key_id = key_id_for(&signing_key.verifying_key().to_bytes());
 
-            // Skip files whose name doesn't match the key_id
-            // (corrupted / hand-edited). Don't crash.
+            // File-name sanity check.
             let expected = format!("{}.sub", key_id);
             if path.file_name().and_then(|s| s.to_str()) != Some(expected.as_str()) {
                 continue;
@@ -95,30 +142,39 @@ impl SubStore {
             );
         }
 
-        Ok(SubStore { dir, by_id })
+        Ok(SubStore { dir, master, by_id })
     }
 
     /// Mint a new subscription with the given purpose.
-    /// Persists to disk before returning, so the caller
-    /// can publish the returned pubkey knowing the
-    /// keypair survives daemon restart.
+    /// Encrypted before persistence — the disk file is
+    /// `[24B nonce | ciphertext | 16B tag]`.
     pub fn mint(&mut self, purpose: &str) -> std::io::Result<&Subscription> {
         let sk = SigningKey::generate(&mut OsRng);
         let pk_bytes = sk.verifying_key().to_bytes();
         let key_id = key_id_for(&pk_bytes);
 
-        // On collision (astronomically unlikely), just
-        // return the existing entry — they'd be the same
-        // pubkey so the caller is none the wiser.
         if self.by_id.contains_key(&key_id) {
             return Ok(self.by_id.get(&key_id).unwrap());
         }
 
-        let mut bytes = Vec::with_capacity(1 + purpose.len() + 32);
+        // Inner payload: [1B purpose_len | purpose | 32B sk].
+        let mut inner = Vec::with_capacity(1 + purpose.len() + 32);
         let plen: u8 = purpose.len().try_into().unwrap_or(255);
-        bytes.push(plen);
-        bytes.extend_from_slice(&purpose.as_bytes()[..plen as usize]);
-        bytes.extend_from_slice(sk.as_bytes());
+        inner.push(plen);
+        inner.extend_from_slice(&purpose.as_bytes()[..plen as usize]);
+        inner.extend_from_slice(sk.as_bytes());
+
+        let cipher = XChaCha20Poly1305::new((&self.master).into());
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        OsRng.fill_bytes(&mut nonce_bytes);
+        let nonce = XNonce::from_slice(&nonce_bytes);
+        let ciphertext = cipher.encrypt(nonce, inner.as_slice())
+            .map_err(|_| std::io::Error::new(
+                std::io::ErrorKind::Other, "encrypt failed",
+            ))?;
+        let mut bytes = Vec::with_capacity(NONCE_LEN + ciphertext.len());
+        bytes.extend_from_slice(&nonce_bytes);
+        bytes.extend_from_slice(&ciphertext);
 
         let path = self.dir.join(format!("{}.sub", key_id));
         std::fs::write(&path, &bytes)?;
@@ -153,6 +209,55 @@ impl SubStore {
     pub fn iter(&self) -> impl Iterator<Item = &Subscription> {
         self.by_id.values()
     }
+}
+
+/// Read `master.key` from `dir` or create it (32 random
+/// bytes, mode 0o600) on first call.
+fn load_or_create_master(dir: &Path)
+    -> std::io::Result<[u8; MASTER_KEY_LEN]>
+{
+    let path = dir.join("master.key");
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut new_master = [0u8; MASTER_KEY_LEN];
+            OsRng.fill_bytes(&mut new_master);
+            std::fs::write(&path, new_master)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&path)?.permissions();
+                perms.set_mode(0o600);
+                let _ = std::fs::set_permissions(&path, perms);
+            }
+            return Ok(new_master);
+        }
+        Err(e) => return Err(e),
+    };
+    if bytes.len() != MASTER_KEY_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "master.key has wrong length: expected {} bytes, got {}",
+                MASTER_KEY_LEN, bytes.len(),
+            ),
+        ));
+    }
+    let mut arr = [0u8; MASTER_KEY_LEN];
+    arr.copy_from_slice(&bytes);
+    Ok(arr)
+}
+
+/// Heuristic: does `bytes` look like the legacy
+/// pre-encryption format `[1B plen | purpose | 32B sk]`?
+/// The trailing 32 bytes have no fixed signature, so we
+/// can only check structural constraints (length +
+/// purpose UTF-8 validity).
+fn looks_like_legacy_sub(bytes: &[u8]) -> bool {
+    if bytes.is_empty() { return false; }
+    let plen = bytes[0] as usize;
+    if bytes.len() != 1 + plen + 32 { return false; }
+    std::str::from_utf8(&bytes[1..1 + plen]).is_ok()
 }
 
 fn key_id_for(pubkey: &[u8; 32]) -> String {
@@ -223,5 +328,80 @@ mod tests {
         let expected: String = pk[..KEY_ID_HEX_LEN / 2]
             .iter().map(|b| format!("{:02x}", b)).collect();
         assert_eq!(sub.key_id, expected);
+    }
+
+    #[test]
+    fn on_disk_files_are_encrypted_not_raw_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = SubStore::open(dir.path().to_path_buf()).unwrap();
+        let sub = s.mint("primary").unwrap();
+        let sk_bytes = sub.signing_key.to_bytes();
+        let purpose = sub.purpose.clone();
+        let key_id = sub.key_id.clone();
+
+        let path = dir.path().join(format!("{}.sub", key_id));
+        let bytes = std::fs::read(&path).unwrap();
+
+        // Expect: nonce (24) + ciphertext (1 + len(purpose) + 32) + tag (16).
+        let expected_len = NONCE_LEN + 1 + purpose.len() + 32 + TAG_LEN;
+        assert_eq!(bytes.len(), expected_len,
+                   "encrypted sub file should be {} bytes; got {}",
+                   expected_len, bytes.len());
+
+        // The raw secret must not appear in the file.
+        for window in bytes.windows(32) {
+            assert!(window != sk_bytes,
+                    "raw secret bytes leaked into the on-disk file");
+        }
+        // The purpose string must not appear in cleartext.
+        assert!(!bytes.windows(purpose.len())
+                    .any(|w| w == purpose.as_bytes()),
+                "purpose string leaked into the on-disk file");
+    }
+
+    #[test]
+    fn master_key_governs_decryption() {
+        let dir = tempfile::tempdir().unwrap();
+        let pk_first = {
+            let mut s = SubStore::open(dir.path().to_path_buf()).unwrap();
+            s.mint("master-test").unwrap().pubkey_bytes()
+        };
+
+        // Tamper with master.key.
+        let mut bogus = [0u8; 32];
+        bogus[0] = 0xff;
+        std::fs::write(dir.path().join("master.key"), bogus).unwrap();
+
+        let s = SubStore::open(dir.path().to_path_buf()).unwrap();
+        assert_eq!(s.iter().count(), 0,
+                   "wrong master should drop the entry, not panic");
+        // pk_first is unrecoverable now, which is the
+        // whole point.
+        let _ = pk_first;
+    }
+
+    #[test]
+    fn legacy_plaintext_files_are_accepted_on_read() {
+        // Backward compat: a pre-encryption .sub file
+        // [1B plen | purpose | 32B sk] should still load.
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_sk = SigningKey::generate(&mut OsRng);
+        let legacy_pk = legacy_sk.verifying_key().to_bytes();
+        let key_id = key_id_for(&legacy_pk);
+
+        let purpose = "legacy-purpose";
+        let mut bytes = Vec::new();
+        bytes.push(purpose.len() as u8);
+        bytes.extend_from_slice(purpose.as_bytes());
+        bytes.extend_from_slice(&legacy_sk.to_bytes());
+
+        std::fs::write(dir.path().join(format!("{}.sub", key_id)), &bytes).unwrap();
+
+        let s = SubStore::open(dir.path().to_path_buf()).unwrap();
+        assert_eq!(s.iter().count(), 1, "legacy file should load");
+        let loaded = s.iter().next().unwrap();
+        assert_eq!(loaded.key_id, key_id);
+        assert_eq!(loaded.purpose, purpose);
+        assert_eq!(loaded.signing_key.to_bytes(), legacy_sk.to_bytes());
     }
 }
