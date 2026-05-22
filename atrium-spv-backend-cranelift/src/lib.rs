@@ -1198,6 +1198,13 @@ impl FnTranslator {
                 self.scalars.insert(result.id, v);
                 Ok(())
             }
+            // PackHalf2x16 / UnpackHalf2x16 are bespoke-only:
+            // they need f32<->f16 conversion, and Cranelift's
+            // aarch64 backend doesn't ISLE-lower fdemote.f16 /
+            // fpromote.f16.  The bespoke backend uses the
+            // hardware FCVT instructions; a shader using these
+            // ops therefore runs on the bespoke path only.
+            // (Falls through to the Unsupported catch-all.)
             Op::Shl(a, b) => self.emit_int_binop(
                 builder, &inst.result, a, b, |b, x, y| b.ins().ishl(x, y)),
             Op::LShr(a, b) => self.emit_int_binop(

@@ -557,6 +557,27 @@ fn translate_inst(
             spv_inst, types, constants, iface,
             id_map, next_value_id, insts, source_spirv_offset,
             Op::BitNot),
+        // OpBitcast: reinterpret the bits of a value as the
+        // result type (f32 <-> i32/u32).  Maps directly to
+        // Op::Bitcast, which both backends already lower.
+        SpvOp::Bitcast => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed("Bitcast without result id".into()))?;
+            let result_ty_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed("Bitcast without result type".into()))?;
+            let result_ty = types.get(result_ty_id)?.clone();
+            let src_id = expect_id(&spv_inst.operands, 0)?;
+            let src = resolve_value(src_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            let result = alloc_or_get_result(
+                result_id, result_ty.clone(), id_map, next_value_id);
+            insts.push(Inst {
+                op: Op::Bitcast(src, result_ty),
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
         SpvOp::ShiftLeftLogical => emit_binop_int(
             spv_inst, types, constants, iface,
             id_map, next_value_id, insts, source_spirv_offset,
@@ -2051,6 +2072,20 @@ fn translate_inst(
                     let c_half_ln2 = push_cf(0.5 * std::f64::consts::LN_2,
                         source_spirv_offset, insts, next_value_id);
                     Op::FMul(l, c_half_ln2)
+                }
+                58 => {
+                    // PackHalf2x16(vec2) -> u32.
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    Op::PackHalf2x16(x)
+                }
+                62 => {
+                    // UnpackHalf2x16(u32) -> vec2.
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    Op::UnpackHalf2x16(x)
                 }
                 25 => {
                     // Atan2(y, x): four-quadrant arctangent.

@@ -4203,6 +4203,95 @@ fn differential_storage_image_write() {
 }
 
 #[test]
+fn differential_glsl_pack_unpack_half2x16() {
+    // packHalf2x16(vec2(a,b)) -> u32, then unpackHalf2x16
+    // back to vec2.  Inputs chosen exactly representable in
+    // f16 so the round-trip is bit-exact:
+    //   1.0 -> 0x3C00, 0.5 -> 0x3800, -1.5 -> 0xBE00, 2.0 -> 0x4000
+    // ssbo[0] = packHalf2x16(1.0, 0.5)            (expect 0x38003C00)
+    // ssbo[1] = unpack(...).x                     (expect 1.0)
+    // ssbo[2] = unpack(...).y                     (expect 0.5)
+    // ssbo[3] = packHalf2x16(-1.5, 2.0)           (expect 0x4000BE00)
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let std_450 = b.ext_inst_import("GLSL.std.450");
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let f32_ty = b.type_float(32, None);
+    let v2f    = b.type_vector(f32_ty, 2);
+    let void_fn = b.type_function(void, vec![]);
+    let rt = b.type_runtime_array(u32_ty);
+    b.decorate(rt, Decoration::ArrayStride, vec![rspirv::dr::Operand::LiteralBit32(4)]);
+    let s = b.type_struct(vec![rt]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_u = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+    let ssbo  = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    let c_1    = b.constant_bit32(u32_ty, 1);
+    let c_2    = b.constant_bit32(u32_ty, 2);
+    let c_3    = b.constant_bit32(u32_ty, 3);
+    let f_1    = b.constant_bit32(f32_ty, 1.0f32.to_bits());
+    let f_half = b.constant_bit32(f32_ty, 0.5f32.to_bits());
+    let f_n15  = b.constant_bit32(f32_ty, (-1.5f32).to_bits());
+    let f_2    = b.constant_bit32(f32_ty, 2.0f32.to_bits());
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    // p = packHalf2x16(vec2(1.0, 0.5))
+    let v = b.composite_construct(v2f, None, vec![f_1, f_half]).unwrap();
+    let p = b.ext_inst(u32_ty, None, std_450, 58,
+        vec![rspirv::dr::Operand::IdRef(v)]).unwrap();
+    // u = unpackHalf2x16(p)
+    let u = b.ext_inst(v2f, None, std_450, 62,
+        vec![rspirv::dr::Operand::IdRef(p)]).unwrap();
+    let ux = b.composite_extract(f32_ty, None, u, vec![0]).unwrap();
+    let uy = b.composite_extract(f32_ty, None, u, vec![1]).unwrap();
+    let ux_bits = b.bitcast(u32_ty, None, ux).unwrap();
+    let uy_bits = b.bitcast(u32_ty, None, uy).unwrap();
+    // p2 = packHalf2x16(vec2(-1.5, 2.0))
+    let v2 = b.composite_construct(v2f, None, vec![f_n15, f_2]).unwrap();
+    let p2 = b.ext_inst(u32_ty, None, std_450, 58,
+        vec![rspirv::dr::Operand::IdRef(v2)]).unwrap();
+    for (slot, val) in [(c_zero, p), (c_1, ux_bits), (c_2, uy_bits), (c_3, p2)] {
+        let d = b.access_chain(ptr_u, None, ssbo, vec![c_zero, slot]).unwrap();
+        b.store(d, val, None, vec![]).unwrap();
+    }
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spv = Vec::with_capacity(words.len() * 4);
+    for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+    let dir = TempDir::new().unwrap();
+    // Bespoke-only: PackHalf2x16/UnpackHalf2x16 use the ARM
+    // FCVT half-precision instructions; Cranelift's aarch64
+    // backend can't lower f16 conversion, so this op is
+    // bespoke-path-only.  The hand-computed f16 bit patterns
+    // below are the correctness oracle.
+    let mut b_buf = vec![0u8; 16];
+    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    let u32_at = |i: usize| -> u32 {
+        u32::from_le_bytes(b_buf[i*4..i*4+4].try_into().unwrap())
+    };
+    let f32_at = |i: usize| -> f32 { f32::from_bits(u32_at(i)) };
+    assert_eq!(u32_at(0), 0x3800_3C00, "packHalf2x16(1.0,0.5)");
+    assert_eq!(f32_at(1), 1.0, "unpack .x");
+    assert_eq!(f32_at(2), 0.5, "unpack .y");
+    assert_eq!(u32_at(3), 0x4000_BE00, "packHalf2x16(-1.5,2.0)");
+}
+
+#[test]
 fn differential_op_isnan_isinf() {
     // OpIsNan / OpIsInf are core SPIR-V ops.  The shader
     // applies one of them to a constant f32, OpSelects the

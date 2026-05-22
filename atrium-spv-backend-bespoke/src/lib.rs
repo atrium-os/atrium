@@ -1349,6 +1349,73 @@ fn emit_function(
                 a.emit(asm::rbit_w(d_w, s_w));
                 ints.insert(result.id, d_w);
             }
+            Op::PackHalf2x16(v) => {
+                // vec2<f32> -> u32.  fcvt each lane to f16
+                // (low 16 of a V-reg, fmov bridges to a W),
+                // then result = lane0 | (lane1 << 16).
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal("PackHalf2x16 without result".into()))?;
+                let lanes = vectors.get(&v.id).cloned().ok_or_else(||
+                    BackendError::Internal(format!(
+                        "PackHalf2x16 operand {:?} not a vector", v.id)))?;
+                if lanes.len() < 2 {
+                    return Err(BackendError::Unsupported(format!(
+                        "PackHalf2x16 needs a vec2, got {} lanes", lanes.len())));
+                }
+                let s0 = *scalars.get(&lanes[0].id).ok_or_else(||
+                    BackendError::Internal("PackHalf2x16 lane 0 missing".into()))?;
+                let s1 = *scalars.get(&lanes[1].id).ok_or_else(||
+                    BackendError::Internal("PackHalf2x16 lane 1 missing".into()))?;
+                let synth = ValueId(next_synth_id);
+                next_synth_id += 1;
+                let tv = alloc_vreg(&mut free_pool, &mut owners,
+                    &mut used_callee_saved_v, synth)?;
+                let d_w = alloc_int_w(&mut int_pool, result.id)?;
+                // lane 0 -> d_w (fcvt zeroes the upper 16).
+                a.emit(asm::fcvt_h_from_s(tv, s0));
+                a.emit(asm::fmov_w_from_s(d_w, tv));
+                // lane 1 -> w_tmp, shift up, or in.
+                a.emit(asm::fcvt_h_from_s(tv, s1));
+                a.emit(asm::fmov_w_from_s(w_tmp, tv));
+                a.emit(asm::lsl_imm_w(w_tmp, w_tmp, 16));
+                a.emit(asm::orr_w(d_w, d_w, w_tmp));
+                owners.remove(&tv.0);
+                free_pool.push(tv.0);
+                ints.insert(result.id, d_w);
+            }
+            Op::UnpackHalf2x16(v) => {
+                // u32 -> vec2<f32>.  Bridge low / high 16
+                // bits into a V-reg, fcvt each from f16.
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal("UnpackHalf2x16 without result".into()))?;
+                let s_w = *ints.get(&v.id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "UnpackHalf2x16 operand {:?} not in ints", v.id)))?;
+                let synth0 = ValueId(next_synth_id); next_synth_id += 1;
+                let v0 = alloc_vreg(&mut free_pool, &mut owners,
+                    &mut used_callee_saved_v, synth0)?;
+                let synth1 = ValueId(next_synth_id); next_synth_id += 1;
+                let v1 = alloc_vreg(&mut free_pool, &mut owners,
+                    &mut used_callee_saved_v, synth1)?;
+                let synth_t = ValueId(next_synth_id); next_synth_id += 1;
+                let tv = alloc_vreg(&mut free_pool, &mut owners,
+                    &mut used_callee_saved_v, synth_t)?;
+                // lane 0: fcvt reads the low 16 of the bridge.
+                a.emit(asm::fmov_s_from_w(tv, s_w));
+                a.emit(asm::fcvt_s_from_h(v0, tv));
+                // lane 1: high 16 shifted down first.
+                a.emit(asm::lsr_imm_w(w_tmp, s_w, 16));
+                a.emit(asm::fmov_s_from_w(tv, w_tmp));
+                a.emit(asm::fcvt_s_from_h(v1, tv));
+                owners.remove(&tv.0);
+                free_pool.push(tv.0);
+                scalars.insert(synth0, v0);
+                scalars.insert(synth1, v1);
+                vectors.insert(result.id, vec![
+                    Value { id: synth0, ty: Type::F32 },
+                    Value { id: synth1, ty: Type::F32 },
+                ]);
+            }
             // Integer comparisons → Bool W-reg.
             Op::IEq(l, r) => emit_icmp_to_bool(
                 &mut a, &ints, &mut bools, &mut bool_owners, &mut bool_free,
@@ -4215,6 +4282,14 @@ fn compute_last_use_flat(
             | Op::ConvertSToF(s) | Op::ConvertUToF(s)
             | Op::ConvertFToS(s) | Op::ConvertFToU(s) => mark(s.id),
             Op::Bitcast(s, _) => mark(s.id),
+            Op::UnpackHalf2x16(s) => mark(s.id),
+            Op::PackHalf2x16(s) => {
+                mark(s.id);
+                // vec2 operand -- keep both lane scalars live.
+                if let Some(lanes) = vec_lanes.get(&s.id).cloned() {
+                    for lid in &lanes { mark(*lid); }
+                }
+            }
             Op::Dot(l, r) => {
                 mark(l.id); mark(r.id);
                 if let Some(lanes) = vec_lanes.get(&l.id).cloned() {

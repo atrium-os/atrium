@@ -1024,7 +1024,12 @@ specifically supports:
   Sinh, Cosh, Tanh, Asinh, Acosh, Atanh,
   SMin, UMin, SMax, UMax, SClamp, UClamp,
   FindILsb, FindSMsb, FindUMsb,
-  NMin, NMax, NClamp.
+  NMin, NMax, NClamp, PackHalf2x16, UnpackHalf2x16.
+  PackHalf2x16/UnpackHalf2x16 lower to the ARM FCVT
+  half-precision instructions on the bespoke backend
+  (f16 is internal to the op — never an IR type); they
+  are bespoke-only, since Cranelift's aarch64 backend does
+  not ISLE-lower f16 conversion.
   Sin/Cos/Tan use Horner-form Taylor on a range-reduced
   argument (x → x_red ∈ [-π/2, π/2] mod π, with (-1)^k
   parity sign), so the full real line is accepted at ~6

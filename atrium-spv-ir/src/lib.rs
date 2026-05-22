@@ -345,6 +345,14 @@ pub enum Op {
     BitXor(Value, Value),
     /// Bitwise NOT.
     BitNot(Value),
+    /// Pack a vec2 of f32 into a u32 as two f16 halves
+    /// (`packHalf2x16`): lane 0 → low 16 bits, lane 1 → high
+    /// 16.  f16 is internal to the lowering — it never
+    /// appears as an IR type.
+    PackHalf2x16(Value),
+    /// Unpack a u32 into a vec2 of f32, treating the low /
+    /// high 16 bits as two f16 values (`unpackHalf2x16`).
+    UnpackHalf2x16(Value),
     /// Count leading zeros (32-bit).  CLZ on ARM64; cls/clz
     /// on Cranelift.  Returns 32 if input is 0.
     Clz(Value),
