@@ -4060,6 +4060,79 @@ fn differential_workgroup_shared_memory_accumulator() {
 }
 
 #[test]
+fn differential_op_isnan_isinf() {
+    // OpIsNan / OpIsInf are core SPIR-V ops.  The shader
+    // applies one of them to a constant f32, OpSelects the
+    // bool result to 1u/0u, and stores to ssbo[0].
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    // (label, opcode "nan"|"inf", input, expected)
+    let cases: &[(&str, &str, f32, u32)] = &[
+        ("isnan(0)",    "nan", 0.0,                0),
+        ("isnan(1)",    "nan", 1.0,                0),
+        ("isnan(inf)",  "nan", f32::INFINITY,      0),
+        ("isnan(nan)",  "nan", f32::NAN,           1),
+        ("isinf(0)",    "inf", 0.0,                0),
+        ("isinf(1)",    "inf", 1.0,                0),
+        ("isinf(inf)",  "inf", f32::INFINITY,      1),
+        ("isinf(-inf)", "inf", f32::NEG_INFINITY,  1),
+        ("isinf(nan)",  "inf", f32::NAN,           0),
+    ];
+    for &(label, op, input, expected) in cases {
+        let mut b = rspirv::dr::Builder::new();
+        b.set_version(1, 3);
+        b.capability(Capability::Shader);
+        b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+        let void   = b.type_void();
+        let u32_ty = b.type_int(32, 0);
+        let f32_ty = b.type_float(32, None);
+        let bool_ty = b.type_bool();
+        let void_fn = b.type_function(void, vec![]);
+        let rt = b.type_runtime_array(u32_ty);
+        b.decorate(rt, Decoration::ArrayStride, vec![rspirv::dr::Operand::LiteralBit32(4)]);
+        let s = b.type_struct(vec![rt]);
+        b.decorate(s, Decoration::Block, vec![]);
+        b.member_decorate(s, 0, Decoration::Offset, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+        let ptr_u = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+        let ssbo = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+        b.decorate(ssbo, Decoration::DescriptorSet, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        b.decorate(ssbo, Decoration::Binding, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        let c_zero = b.constant_bit32(u32_ty, 0);
+        let c_one  = b.constant_bit32(u32_ty, 1);
+        let c_in   = b.constant_bit32(f32_ty, input.to_bits());
+        let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+        b.begin_block(None).unwrap();
+        let cond = if op == "nan" {
+            b.is_nan(bool_ty, None, c_in).unwrap()
+        } else {
+            b.is_inf(bool_ty, None, c_in).unwrap()
+        };
+        let sel = b.select(u32_ty, None, cond, c_one, c_zero).unwrap();
+        let d = b.access_chain(ptr_u, None, ssbo, vec![c_zero, c_zero]).unwrap();
+        b.store(d, sel, None, vec![]).unwrap();
+        b.ret().unwrap();
+        b.end_function().unwrap();
+        b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+        b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+        let words: Vec<u32> = b.module().assemble();
+        let mut spv = Vec::with_capacity(words.len() * 4);
+        for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+        let dir = TempDir::new().unwrap();
+        let mut b_buf = vec![0u8; 4];
+        let mut c_buf = vec![0u8; 4];
+        invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
+        invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+        assert_eq!(b_buf, c_buf, "{label}: bespoke vs cranelift diverge");
+        let got = u32::from_le_bytes(b_buf[0..4].try_into().unwrap());
+        assert_eq!(got, expected, "{label}: got {got}, want {expected}");
+    }
+}
+
+#[test]
 fn differential_workgroup_shared_array() {
     // `shared uint tile[4];` -- each invocation writes
     // `tile[lid] = lid + 1`, then `ssbo[lid] = tile[lid] +

@@ -972,6 +972,9 @@ specifically supports:
 - Core bitwise ops: BitwiseAnd/Or/Xor, Not,
   ShiftLeft/RightLogical/RightArithmetic, BitReverse,
   BitCount (SWAR popcount synthesised at IR level).
+- Float classification: IsNan (FUnordNe(x, x)) and IsInf
+  (FOrdEq(|x|, +∞)) — both synthesised onto the existing
+  compare ops.
 - Workgroup-shared memory: `StorageClass::Workgroup`
   OpVariables are packed into a per-workgroup scratch
   buffer; the frontend records each var's byte offset

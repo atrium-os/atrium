@@ -1545,6 +1545,14 @@ fn emit_function(
             Op::FOrdGe(a_v, b_v) => emit_fcmp_to_bool(
                 &mut a, &scalars, &mut bools, &mut bool_owners, &mut bool_free,
                 &mut fused_branch, fuse_eligible, inst, a_v, b_v, asm::Cond::Ge)?,
+            // FUnordNe (a != b, true when either is NaN):
+            // after `fcmp`, Z is set only on an ordered-equal
+            // result, so `NE` (Z==0) is exactly "unordered or
+            // not-equal".  This is the lowering OpIsNan rides
+            // (IsNan(x) == FUnordNe(x, x)).
+            Op::FUnordNe(a_v, b_v) => emit_fcmp_to_bool(
+                &mut a, &scalars, &mut bools, &mut bool_owners, &mut bool_free,
+                &mut fused_branch, fuse_eligible, inst, a_v, b_v, asm::Cond::Ne)?,
             // OpVectorShuffle: produce a new vector by
             // picking per-output-lane indices into
             // src1 ++ src2. With our per-lane S-reg
@@ -4054,7 +4062,10 @@ fn compute_last_use_flat(
             }
             Op::FOrdEq(l, r) | Op::FOrdNe(l, r)
             | Op::FOrdLt(l, r) | Op::FOrdLe(l, r)
-            | Op::FOrdGt(l, r) | Op::FOrdGe(l, r) => {
+            | Op::FOrdGt(l, r) | Op::FOrdGe(l, r)
+            | Op::FUnordEq(l, r) | Op::FUnordNe(l, r)
+            | Op::FUnordLt(l, r) | Op::FUnordLe(l, r)
+            | Op::FUnordGt(l, r) | Op::FUnordGe(l, r) => {
                 mark(l.id); mark(r.id);
             }
             Op::BranchCond { cond, .. } => mark(cond.id),

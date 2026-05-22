@@ -758,6 +758,55 @@ fn translate_inst(
             |a, b| Op::FUnordGe(a, b),
         ),
 
+        // OpIsNan(x): x is NaN  ≡  x != x under unordered
+        // compare (FUnordNe is true whenever either operand
+        // is NaN; with both operands equal to x it isolates
+        // exactly the NaN case).
+        SpvOp::IsNan => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed("IsNan without result id".into()))?;
+            let result_ty_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed("IsNan without result type".into()))?;
+            let result_ty = types.get(result_ty_id)?.clone();
+            let x_id = expect_id(&spv_inst.operands, 0)?;
+            let x = resolve_value(x_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            let result = alloc_or_get_result(
+                result_id, result_ty, id_map, next_value_id);
+            insts.push(Inst {
+                op: Op::FUnordNe(x.clone(), x),
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
+        // OpIsInf(x): |x| == +∞.  Synthesised as
+        // FOrdEq(FAbs(x), ConstFloat(+inf)) -- the ordered
+        // compare is false for NaN, matching the spec
+        // (IsInf is false on NaN input).
+        SpvOp::IsInf => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed("IsInf without result id".into()))?;
+            let result_ty_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed("IsInf without result type".into()))?;
+            let result_ty = types.get(result_ty_id)?.clone();
+            let x_id = expect_id(&spv_inst.operands, 0)?;
+            let x = resolve_value(x_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            let abs_x = push_f32(Op::FAbs(x),
+                source_spirv_offset, insts, next_value_id);
+            let inf = push_cf(f64::INFINITY,
+                source_spirv_offset, insts, next_value_id);
+            let result = alloc_or_get_result(
+                result_id, result_ty, id_map, next_value_id);
+            insts.push(Inst {
+                op: Op::FOrdEq(abs_x, inf),
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
+
         // OpSelect: cond ? t_val : f_val. cond is Bool
         // (scalar) or vec<Bool> (per-lane). Operands:
         //   0  cond
