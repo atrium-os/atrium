@@ -298,6 +298,45 @@ struct BufferStorage {
     bytes: Vec<u8>,
 }
 
+/// `VK_DESCRIPTOR_TYPE_STORAGE_IMAGE`.
+const DESCRIPTOR_TYPE_STORAGE_IMAGE: u32 = 3;
+
+/// Bytes per descriptor write in a `FrameOp::BindDescriptors`
+/// body.  The ICD's `vkCmdBindDescriptorSets` emits, per
+/// write, `{ binding u32, type u32, buffer_id u32,
+/// image_id u32, sampler_id u32, offset u64, range u64 }` =
+/// 5×4 + 2×8 = 36 bytes.  (The ICD's own comment says "32 B"
+/// -- that is stale; the real layout is 36.)
+const BIND_DESCRIPTORS_WRITE_BYTES: usize = 36;
+
+/// Parse a `FrameOp::BindDescriptors` body and return the
+/// `(binding, image_id)` pairs whose descriptor type is
+/// `STORAGE_IMAGE`.  Body layout: an 8-byte header
+/// `{ set_index u32, write_count u32 }` followed by
+/// `write_count` 36-byte writes (see
+/// `BIND_DESCRIPTORS_WRITE_BYTES`).  Non-storage-image
+/// writes (SSBOs, samplers, UBOs) and writes with a zero
+/// image id are skipped.
+fn parse_bind_descriptors_storage_images(body: &[u8]) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    if body.len() < 8 { return out; }
+    let u32_at = |o: usize| -> u32 {
+        u32::from_le_bytes(body[o..o + 4].try_into().unwrap())
+    };
+    let write_count = u32_at(4) as usize;
+    for w in 0..write_count {
+        let off = 8 + w * BIND_DESCRIPTORS_WRITE_BYTES;
+        if off + BIND_DESCRIPTORS_WRITE_BYTES > body.len() { break; }
+        let binding  = u32_at(off);
+        let dtype    = u32_at(off + 4);
+        let image_id = u32_at(off + 12);
+        if dtype == DESCRIPTOR_TYPE_STORAGE_IMAGE && image_id != 0 {
+            out.push((binding, image_id));
+        }
+    }
+    out
+}
+
 impl Tier2Backend {
     /// Construct a fresh Tier2Backend backed by the given
     /// registry. The registry can be shared across
@@ -777,7 +816,21 @@ impl Tier2Backend {
                     }
                     break;
                 }
-                // Ops we don't yet act on: SetScissor, BindDescriptors,
+                FrameOp::BindDescriptors => {
+                    // Storage-image descriptor writes feed the
+                    // compute image table.  A vkCmdBindDescriptorSets
+                    // arrives before the Dispatch it applies to, so
+                    // recording here lands the bindings before
+                    // dispatch_compute drains them.  SSBO / sampler
+                    // / UBO writes are left to other paths.
+                    for (binding, image_raw)
+                        in parse_bind_descriptors_storage_images(body)
+                    {
+                        self.bind_compute_storage_image(
+                            binding, ResourceId(image_raw));
+                    }
+                }
+                // Ops we don't yet act on: SetScissor,
                 // CopyBufToImg, CopyImgToBuf, Blit, PipelineBarrier,
                 // Dispatch{,Indirect}, DrawIndirect, BeginRenderPass
                 // (handled by the outer partition step). These will
@@ -1732,5 +1785,59 @@ fn convert_blend_state(s: WireBlendState) -> BlendState {
             r: s.write_mask_rgba[0], g: s.write_mask_rgba[1],
             b: s.write_mask_rgba[2], a: s.write_mask_rgba[3],
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_bind_descriptors_storage_images;
+
+    /// Build a BindDescriptors body: 8-byte header + 32-byte
+    /// writes `{binding, type, buffer_id, image_id,
+    /// sampler_id, offset u64, range u64}`.
+    fn body(writes: &[(u32, u32, u32)]) -> Vec<u8> {
+        // each write tuple = (binding, descriptor_type, image_id)
+        let mut v = Vec::new();
+        v.extend_from_slice(&0u32.to_le_bytes());                 // set_index
+        v.extend_from_slice(&(writes.len() as u32).to_le_bytes()); // write_count
+        for &(binding, dtype, image_id) in writes {
+            v.extend_from_slice(&binding.to_le_bytes());
+            v.extend_from_slice(&dtype.to_le_bytes());
+            v.extend_from_slice(&0u32.to_le_bytes());   // buffer_id
+            v.extend_from_slice(&image_id.to_le_bytes());
+            v.extend_from_slice(&0u32.to_le_bytes());   // sampler_id
+            v.extend_from_slice(&0u64.to_le_bytes());   // offset
+            v.extend_from_slice(&0u64.to_le_bytes());   // range
+        }
+        v
+    }
+
+    #[test]
+    fn bind_descriptors_picks_only_storage_images() {
+        // type 3 = STORAGE_IMAGE, 7 = STORAGE_BUFFER, 1 = sampler.
+        let b = body(&[
+            (0, 7, 100),   // SSBO -- ignored
+            (1, 3, 200),   // storage image -- kept
+            (2, 1, 300),   // sampler -- ignored
+            (5, 3, 400),   // storage image -- kept
+        ]);
+        let got = parse_bind_descriptors_storage_images(&b);
+        assert_eq!(got, vec![(1, 200), (5, 400)]);
+    }
+
+    #[test]
+    fn bind_descriptors_skips_zero_image_id() {
+        let b = body(&[(0, 3, 0)]);
+        assert!(parse_bind_descriptors_storage_images(&b).is_empty());
+    }
+
+    #[test]
+    fn bind_descriptors_tolerates_short_and_empty_bodies() {
+        assert!(parse_bind_descriptors_storage_images(&[]).is_empty());
+        assert!(parse_bind_descriptors_storage_images(&[0u8; 3]).is_empty());
+        // Header claims 2 writes but only one is present.
+        let mut b = body(&[(1, 3, 200)]);
+        b[4..8].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(parse_bind_descriptors_storage_images(&b), vec![(1, 200)]);
     }
 }
