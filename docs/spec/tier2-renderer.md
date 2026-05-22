@@ -1002,7 +1002,12 @@ specifically supports:
   caller-saved regs) and spills live V-regs + caller-saved
   int regs across the call; Cranelift's call_indirect
   handles spilling itself.  The dispatcher builds the
-  table from images bound via `bind_compute_storage_image`.
+  table from images bound either via the direct
+  `bind_compute_storage_image` API or via the real Vulkan
+  descriptor path (`vkCreateImage` + `vkBindImageMemory` +
+  `vkCreateImageView` + `vkUpdateDescriptorSets` +
+  `vkCmdBindDescriptorSets` → the `BindDescriptors` FrameOp,
+  parsed in `execute_compute_ops` for STORAGE_IMAGE writes).
   Multi-binding SSBO + storage-image co-use works: the
   SSBO base registers (X12..X17) are caller-saved and the
   image-helper `blr` clobbers them, so the lowering

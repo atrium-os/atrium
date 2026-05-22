@@ -816,25 +816,13 @@ impl Tier2Backend {
                     }
                     break;
                 }
-                FrameOp::BindDescriptors => {
-                    // Storage-image descriptor writes feed the
-                    // compute image table.  A vkCmdBindDescriptorSets
-                    // arrives before the Dispatch it applies to, so
-                    // recording here lands the bindings before
-                    // dispatch_compute drains them.  SSBO / sampler
-                    // / UBO writes are left to other paths.
-                    for (binding, image_raw)
-                        in parse_bind_descriptors_storage_images(body)
-                    {
-                        self.bind_compute_storage_image(
-                            binding, ResourceId(image_raw));
-                    }
-                }
                 // Ops we don't yet act on: SetScissor,
-                // CopyBufToImg, CopyImgToBuf, Blit, PipelineBarrier,
-                // Dispatch{,Indirect}, DrawIndirect, BeginRenderPass
-                // (handled by the outer partition step). These will
-                // grow handlers in later phases as needed.
+                // BindDescriptors (compute-only; handled by
+                // execute_compute_ops), CopyBufToImg, CopyImgToBuf,
+                // Blit, PipelineBarrier, Dispatch{,Indirect},
+                // DrawIndirect, BeginRenderPass (handled by the
+                // outer partition step). These will grow handlers
+                // in later phases as needed.
                 _ => {}
             }
         }
@@ -1424,6 +1412,17 @@ impl Tier2Backend {
                     } else {
                         state.push_constants.clear();
                         state.push_constants.extend_from_slice(&body[4..]);
+                    }
+                }
+                FrameOp::BindDescriptors => {
+                    // Storage-image descriptor writes feed the
+                    // compute image table.  vkCmdBindDescriptorSets
+                    // arrives before the Dispatch it applies to.
+                    for (binding, image_raw)
+                        in parse_bind_descriptors_storage_images(body)
+                    {
+                        self.bind_compute_storage_image(
+                            binding, ResourceId(image_raw));
                     }
                 }
                 FrameOp::Dispatch => match DispatchCmd::from_bytes(body) {

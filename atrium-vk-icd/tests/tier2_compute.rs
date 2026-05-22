@@ -3630,3 +3630,201 @@ fn vk_app_compute_storage_image_read_roundtrip() {
     let _ = server_thread;
     let _ = std::fs::remove_file(&sock);
 }
+
+#[test]
+fn vk_app_compute_storage_image_via_descriptor_set() {
+    // The P6 path: a storage image reaches the compute
+    // dispatch through the real Vulkan descriptor-set API --
+    // vkCreateImage + vkBindImageMemory (registers the image
+    // with the daemon) + vkCreateImageView +
+    // vkCreateDescriptorSetLayout/Pool +
+    // vkAllocateDescriptorSets + vkUpdateDescriptorSets
+    // (STORAGE_IMAGE write) + vkCmdBindDescriptorSets -- with
+    // no direct `bind_compute_storage_image` call.  The
+    // shader (build_image_roundtrip_cs) imageStores then
+    // imageLoads texel x and writes the result to out[x];
+    // the image is at descriptor binding 1.
+    use atrium_vk_icd::{
+        vkAllocateDescriptorSets, vkAllocateMemory, vkBindImageMemory,
+        vkCmdBindDescriptorSets, vkCreateDescriptorPool,
+        vkCreateDescriptorSetLayout, vkCreateImage, vkCreateImageView,
+        vkGetImageMemoryRequirements, vkUpdateDescriptorSets,
+    };
+    let _ = env_logger::builder().is_test(true).try_init();
+    let sock = tmp_socket("c_imgdesc");
+    let cache_dir = TempDir::new().unwrap();
+    let registry = Arc::new(Tier2Registry::new(LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    }));
+    let tier2_backend = Arc::new(Tier2Backend::new(registry.clone()));
+    let backend_for_listener: Arc<dyn Backend> = tier2_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap()
+        .with_tier2_registry(registry.clone());
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+    let _env = EnvLock::set(&sock);
+
+    let mut instance: VkInstance = std::ptr::null_mut();
+    unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
+    let mut pds: [VkPhysicalDevice; 1] = [std::ptr::null_mut(); 1];
+    let mut cap: u32 = 1;
+    unsafe { vkEnumeratePhysicalDevices(instance, &mut cap, pds.as_mut_ptr()); }
+    let mut device: VkDevice = std::ptr::null_mut();
+    unsafe { vkCreateDevice(pds[0], std::ptr::null(), std::ptr::null(), &mut device); }
+    let mut queue: VkQueue = std::ptr::null_mut();
+    unsafe { vkGetDeviceQueue(device, 0, 0, &mut queue); }
+
+    let cs_spv = build_image_roundtrip_cs();
+    let cs_mod = make_shader_module(device, &cs_spv);
+    use ash::vk;
+    use ash::vk::Handle;
+    let stage = vk::PipelineShaderStageCreateInfo {
+        s_type: vk::StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
+        p_next: std::ptr::null(),
+        flags: vk::PipelineShaderStageCreateFlags::empty(),
+        stage: vk::ShaderStageFlags::COMPUTE,
+        module: vk::ShaderModule::from_raw(cs_mod),
+        p_name: b"main\0".as_ptr() as *const i8,
+        p_specialization_info: std::ptr::null(),
+        _marker: std::marker::PhantomData,
+    };
+    let info = vk::ComputePipelineCreateInfo {
+        s_type: vk::StructureType::COMPUTE_PIPELINE_CREATE_INFO,
+        p_next: std::ptr::null(),
+        flags: vk::PipelineCreateFlags::empty(),
+        stage, layout: vk::PipelineLayout::null(),
+        base_pipeline_handle: vk::Pipeline::null(),
+        base_pipeline_index: 0,
+        _marker: std::marker::PhantomData,
+    };
+    let infos = [info];
+    let mut pipeline: u64 = 0;
+    unsafe {
+        vkCreateComputePipelines(device, 0, 1,
+            infos.as_ptr() as *const std::ffi::c_void,
+            std::ptr::null(), &mut pipeline);
+    }
+    assert!(pipeline != 0);
+    thread::sleep(Duration::from_millis(200));
+
+    // --- VkImage: 4×1 R8G8B8A8_UNORM, STORAGE usage ---
+    // VkImageCreateInfo (88 B): sType@0=14, format@24,
+    // width@28, height@32, depth@36, mip@40, layers@44,
+    // usage@56.
+    let mut img_info = [0u8; 88];
+    img_info[ 0.. 4].copy_from_slice(&14u32.to_le_bytes());
+    img_info[24..28].copy_from_slice(&37u32.to_le_bytes()); // R8G8B8A8_UNORM
+    img_info[28..32].copy_from_slice(&4u32.to_le_bytes());
+    img_info[32..36].copy_from_slice(&1u32.to_le_bytes());
+    img_info[36..40].copy_from_slice(&1u32.to_le_bytes());
+    img_info[40..44].copy_from_slice(&1u32.to_le_bytes());
+    img_info[44..48].copy_from_slice(&1u32.to_le_bytes());
+    img_info[56..60].copy_from_slice(&0x06u32.to_le_bytes()); // STORAGE|TRANSFER_DST
+    let mut image: u64 = 0;
+    unsafe { vkCreateImage(device, img_info.as_ptr() as *const _,
+        std::ptr::null(), &mut image); }
+    assert!(image != 0);
+    let mut req = ash::vk::MemoryRequirements::default();
+    unsafe { vkGetImageMemoryRequirements(device, image, &mut req); }
+    // VkMemoryAllocateInfo (32 B): sType@0=5, size@16.
+    let mut alloc = [0u8; 32];
+    alloc[0..4].copy_from_slice(&5u32.to_le_bytes());
+    alloc[16..24].copy_from_slice(&req.size.to_le_bytes());
+    let mut mem: u64 = 0;
+    unsafe { vkAllocateMemory(device, alloc.as_ptr() as *const _,
+        std::ptr::null(), &mut mem); }
+    // Binding memory is what registers the image with the daemon.
+    unsafe { vkBindImageMemory(device, image, mem, 0); }
+    thread::sleep(Duration::from_millis(30));
+
+    // VkImageViewCreateInfo (80 B): sType@0=15, image@24.
+    let mut view_info = [0u8; 80];
+    view_info[ 0.. 4].copy_from_slice(&15u32.to_le_bytes());
+    view_info[24..32].copy_from_slice(&image.to_le_bytes());
+    let mut view: u64 = 0;
+    unsafe { vkCreateImageView(device, view_info.as_ptr() as *const _,
+        std::ptr::null(), &mut view); }
+    assert!(view != 0);
+
+    // --- Descriptor set: layout + pool + allocate ---
+    let mut layout: u64 = 0;
+    unsafe { vkCreateDescriptorSetLayout(device, std::ptr::null(),
+        std::ptr::null(), &mut layout); }
+    let mut pool: u64 = 0;
+    unsafe { vkCreateDescriptorPool(device, std::ptr::null(),
+        std::ptr::null(), &mut pool); }
+    // VkDescriptorSetAllocateInfo (40 B): sType@0=34, pool@16,
+    // count@24, pSetLayouts@32.
+    let mut da = [0u8; 40];
+    da[ 0.. 4].copy_from_slice(&34u32.to_le_bytes());
+    da[16..24].copy_from_slice(&pool.to_le_bytes());
+    da[24..28].copy_from_slice(&1u32.to_le_bytes());
+    let layouts_arr = [layout];
+    da[32..40].copy_from_slice(&(layouts_arr.as_ptr() as u64).to_le_bytes());
+    let mut sets: [u64; 1] = [0];
+    unsafe { vkAllocateDescriptorSets(device, da.as_ptr() as *const _,
+        sets.as_mut_ptr()); }
+    assert!(sets[0] != 0);
+
+    // VkWriteDescriptorSet (64 B): sType@0=35, dstSet@16,
+    // dstBinding@24=1, descriptorCount@32=1, type@36=3
+    // (STORAGE_IMAGE), pImageInfo@40.
+    // VkDescriptorImageInfo (24 B): sampler@0, imageView@8,
+    // imageLayout@16.
+    let mut image_info = [0u8; 24];
+    image_info[8..16].copy_from_slice(&view.to_le_bytes());
+    let mut write = [0u8; 64];
+    write[ 0.. 4].copy_from_slice(&35u32.to_le_bytes());
+    write[16..24].copy_from_slice(&sets[0].to_le_bytes());
+    write[24..28].copy_from_slice(&1u32.to_le_bytes());      // binding 1
+    write[32..36].copy_from_slice(&1u32.to_le_bytes());      // count
+    write[36..40].copy_from_slice(&3u32.to_le_bytes());      // STORAGE_IMAGE
+    write[40..48].copy_from_slice(&(image_info.as_ptr() as u64).to_le_bytes());
+    unsafe { vkUpdateDescriptorSets(device, 1, write.as_ptr() as *const _,
+        0, std::ptr::null()); }
+
+    // --- Command buffer ---
+    let mut cpool: u64 = 0;
+    unsafe { vkCreateCommandPool(device, std::ptr::null(), std::ptr::null(), &mut cpool); }
+    let mut cb_info = [0u8; 40];
+    cb_info[0..4].copy_from_slice(&40u32.to_le_bytes());
+    cb_info[16..24].copy_from_slice(&cpool.to_le_bytes());
+    cb_info[28..32].copy_from_slice(&1u32.to_le_bytes());
+    let mut cbs: [VkCommandBuffer; 1] = [std::ptr::null_mut(); 1];
+    unsafe { vkAllocateCommandBuffers(device, cb_info.as_ptr() as *const _, cbs.as_mut_ptr()); }
+    let cb = cbs[0];
+    unsafe { vkBeginCommandBuffer(cb, std::ptr::null()); }
+    unsafe { vkCmdBindPipeline(cb, 1, pipeline); }
+    unsafe {
+        vkCmdBindDescriptorSets(cb, 1, layout, 0, 1, sets.as_ptr(),
+            0, std::ptr::null());
+    }
+    unsafe { vkCmdDispatch(cb, 4, 1, 1); }
+    unsafe { vkEndCommandBuffer(cb); }
+    let mut submit = [0u8; 72];
+    submit[0..4].copy_from_slice(&4u32.to_le_bytes());
+    submit[40..44].copy_from_slice(&1u32.to_le_bytes());
+    let cb_arr = [cb];
+    submit[48..56].copy_from_slice(&(cb_arr.as_ptr() as u64).to_le_bytes());
+    unsafe { vkQueueSubmit(queue, 1, submit.as_ptr() as *const _, std::ptr::null_mut()); }
+    thread::sleep(Duration::from_millis(300));
+
+    // out[x] = imageLoad-after-store of x*0.25, RGBA8-quantised.
+    let out = tier2_backend.compute_output_bytes()
+        .expect("dispatch should have produced an output buffer");
+    let q = |f: f32| -> u8 { (f.clamp(0.0, 1.0) * 255.0 + 0.5) as u8 };
+    for x in 0..4u32 {
+        let got = f32::from_le_bytes(out[x as usize*4..x as usize*4+4]
+            .try_into().unwrap());
+        let want = q(x as f32 * 0.25) as f32 / 255.0;
+        assert!((got - want).abs() < 1e-6,
+            "out[{x}]: storage image via descriptor set should give \
+             {want}, got {got}");
+    }
+
+    unsafe { atrium_vk_icd::vkDestroyInstance(instance, std::ptr::null()); }
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}
