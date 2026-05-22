@@ -25,6 +25,7 @@
 //! - `INSULA_TABELLARIUSD_STORE` — substore dir. Default:
 //!   under `$XDG_RUNTIME_DIR/tabellarius-macos/subs/`.
 
+mod peer;
 mod relay_client;
 mod substore;
 
@@ -58,6 +59,9 @@ struct Ctx {
     /// Pushes received from the relay, waiting for an
     /// app to drain them via GET_PUSH.
     queue: PushQueue,
+    /// `$INSULA_INSTALL_ROOT`, when set — enables
+    /// kernel-attested peer identification on subscribe.
+    install_root: Option<std::path::PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -129,7 +133,10 @@ fn main() -> ExitCode {
         None => None,
     };
 
-    let ctx = Ctx { store, relay, queue };
+    let ctx = Ctx {
+        store, relay, queue,
+        install_root: peer::resolve_install_root(),
+    };
 
     for stream in listener.incoming() {
         let stream = match stream {
@@ -147,6 +154,15 @@ fn main() -> ExitCode {
 
 fn handle_connection(stream: UnixStream, ctx: Ctx) {
     let store = &ctx.store;
+
+    // Kernel-attested peer identification, done once
+    // per connection before the stream is consumed by
+    // the Aqueduct wrapper. `None` when the peer isn't
+    // an installed app (e.g. the `insula` CLI) or the
+    // install root is unset.
+    let attested_app_id =
+        peer::attest_app_id(&stream, ctx.install_root.as_deref());
+
     let mut conn = match Connection::wrap(stream) {
         Ok(c) => c,
         Err(e) => {
@@ -176,7 +192,7 @@ fn handle_connection(stream: UnixStream, ctx: Ctx) {
                 if msg.payload.len() < 1 + alen {
                     continue;
                 }
-                let app_id: Option<String> =
+                let reported_app_id: Option<String> =
                     std::str::from_utf8(&msg.payload[1..1 + alen])
                         .ok()
                         .filter(|s| !s.is_empty())
@@ -185,6 +201,28 @@ fn handle_connection(stream: UnixStream, ctx: Ctx) {
                     Ok(s) => s.to_string(),
                     Err(_) => continue,
                 };
+
+                // Kernel-attested identity wins over the
+                // app's self-reported one — an app that
+                // lies in its SUBSCRIBE payload is
+                // overruled by what proc_pidpath says.
+                // Fall back to the reported id only when
+                // attestation produced nothing (peer not
+                // an installed app, install root unset).
+                if let (Some(att), Some(rep)) =
+                    (&attested_app_id, &reported_app_id)
+                {
+                    if att != rep {
+                        eprintln!(
+                            "tabellarius-macos: subscribe app-id mismatch — \
+                             reported {:?}, kernel-attested {:?}; using attested",
+                            rep, att
+                        );
+                    }
+                }
+                let app_id: Option<String> = attested_app_id
+                    .clone()
+                    .or_else(|| reported_app_id.clone());
                 let (key_id, pubkey) = {
                     let mut s = store.lock().unwrap();
                     match s.mint(&purpose, app_id.as_deref()) {

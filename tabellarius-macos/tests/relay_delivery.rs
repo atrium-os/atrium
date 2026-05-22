@@ -378,6 +378,90 @@ fn push_for_an_app_fires_the_wake_hook() {
 }
 
 #[test]
+fn wake_falls_back_to_reported_id_when_peer_not_attestable() {
+    // The daemon has $INSULA_INSTALL_ROOT set, so it
+    // runs kernel attestation on the subscribe
+    // connection. The subscriber here is the test
+    // binary — its exe is NOT under that install root,
+    // so attestation yields nothing and the daemon
+    // falls back to the app's self-reported id. The
+    // wake hook must still fire. Guards against the
+    // attestation code path breaking the fallback.
+    let _guard = ENV_LOCK.lock().unwrap();
+
+    let (mut relay, relay_addr) = spawn_relay();
+    let tmp = tempfile::tempdir().unwrap();
+    let sock = tmp.path().join("tbd.sock");
+    let store = tmp.path().join("subs");
+    // An install root with an apps/ dir but nothing
+    // matching the test binary.
+    let inst = tmp.path().join("inst");
+    std::fs::create_dir_all(inst.join("apps")).unwrap();
+
+    let hook = tmp.path().join("wake-hook.sh");
+    let marker = tmp.path().join("woke.txt");
+    std::fs::write(&hook, format!(
+        "#!/bin/sh\nprintf '%s %s\\n' \"$1\" \"$2\" >> {}\n",
+        marker.display(),
+    )).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let mut p = std::fs::metadata(&hook).unwrap().permissions();
+    p.set_mode(0o755);
+    std::fs::set_permissions(&hook, p).unwrap();
+
+    let mut daemon = Command::new(tabellarius_binary())
+        .env("INSULA_TABELLARIUSD_SOCKET", &sock)
+        .env("INSULA_TABELLARIUSD_STORE", &store)
+        .env("INSULA_TABELLARIUSD_RELAY", &relay_addr)
+        .env("INSULA_TABELLARIUSD_WAKE_CMD", &hook)
+        .env("INSULA_INSTALL_ROOT", &inst)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn tabellarius-macos");
+    wait_for_socket(&sock, Duration::from_secs(3));
+
+    let app_id = "com.example.reported";
+    let container = inst.join("apps").join(app_id).join("container");
+    std::env::set_var("ATRIUM_TABELLARIUS_SOCKET", &sock);
+    std::env::set_var("ATRIUM_CONTAINER_DIR", &container);
+    let purpose = CString::new("primary").unwrap();
+    let mut key_id_buf = [0i8; 64];
+    let mut pubkey = [0u8; 32];
+    let n = unsafe {
+        atrium::atrium_tabellarius_subscribe(
+            purpose.as_ptr(),
+            key_id_buf.as_mut_ptr(), key_id_buf.len(),
+            pubkey.as_mut_ptr(),
+        )
+    };
+    assert!(n > 0);
+    std::env::remove_var("ATRIUM_CONTAINER_DIR");
+    std::env::remove_var("ATRIUM_TABELLARIUS_SOCKET");
+
+    thread::sleep(Duration::from_millis(250));
+
+    let mut publisher = TcpStream::connect(&relay_addr).unwrap();
+    write_msg(&mut publisher, &ClientMsg::Publish {
+        to_key: pubkey, blob: b"x".to_vec(), ttl_secs: 60,
+    }).unwrap();
+    let mut pr = BufReader::new(publisher.try_clone().unwrap());
+    let _ = read_msg::<_, RelayMsg>(&mut pr);
+
+    thread::sleep(Duration::from_millis(400));
+
+    let woke = std::fs::read_to_string(&marker).unwrap_or_default();
+    assert!(woke.contains(app_id),
+            "wake should fall back to the reported app id when the \
+             peer isn't kernel-attestable; marker: {:?}", woke);
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    let _ = relay.kill();
+    let _ = relay.wait();
+}
+
+#[test]
 fn push_with_no_owning_app_does_not_fire_wake() {
     let _guard = ENV_LOCK.lock().unwrap();
 

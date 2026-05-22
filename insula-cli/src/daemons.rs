@@ -165,10 +165,12 @@ pub fn start(install_root: &Path, d: Daemon) -> Result<i32, String> {
     if let Some(log_env) = d.log_env() {
         cmd.env(log_env, &paths.log_file);
     }
-    // The network broker needs to know the install
-    // root to resolve peer pid → app id → manifest
-    // for per-app `[network]` enforcement.
-    if matches!(d, Daemon::Netd) {
+    // The network broker resolves peer pid → app id →
+    // manifest for per-app `[network]` enforcement; the
+    // push daemon resolves peer pid → app id for
+    // kernel-attested wake-on-push identity. Both need
+    // the install root.
+    if matches!(d, Daemon::Netd | Daemon::Tabellarius) {
         cmd.env("INSULA_INSTALL_ROOT", install_root);
     }
     cmd.stdout(Stdio::null());
