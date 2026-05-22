@@ -3219,3 +3219,219 @@ fn vk_app_compute_storage_image_write_end_to_end() {
     let _ = server_thread;
     let _ = std::fs::remove_file(&sock);
 }
+
+/// Compute SPIR-V exercising storage-image + multi-binding
+/// SSBO co-use:
+///   float v = in.data[gid.x];                 // SSBO bind 0
+///   imageStore(img, ivec2(gid.x,0),           // image bind 2
+///              vec4(v, 0, 0, 1));
+///   out.data[gid.x] = in.data[gid.x] * 2.0;   // SSBO bind 0 + 1
+/// The second SSBO touch happens AFTER the image-helper call,
+/// so the multi-binding SSBO base registers (X16/X17) must
+/// survive it.
+fn build_ssbo_image_couse_cs() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, Dim,
+        ExecutionMode, ExecutionModel, FunctionControl, ImageFormat,
+        MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let f32_ty = b.type_float(32, None);
+    let v3u    = b.type_vector(u32_ty, 3);
+    let v2u    = b.type_vector(u32_ty, 2);
+    let v4f    = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    // SSBO in @ binding 0, out @ binding 1 (f32 runtime arrays).
+    let mk_ssbo = |b: &mut rspirv::dr::Builder, binding: u32| -> (u32, u32) {
+        let rt = b.type_runtime_array(f32_ty);
+        b.decorate(rt, Decoration::ArrayStride,
+            vec![rspirv::dr::Operand::LiteralBit32(4)]);
+        let s = b.type_struct(vec![rt]);
+        b.decorate(s, Decoration::Block, vec![]);
+        b.member_decorate(s, 0, Decoration::Offset,
+            vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+        let ptr_f = b.type_pointer(None, StorageClass::StorageBuffer, f32_ty);
+        let var = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+        b.decorate(var, Decoration::DescriptorSet,
+            vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        b.decorate(var, Decoration::Binding,
+            vec![rspirv::dr::Operand::LiteralBit32(binding)]);
+        (var, ptr_f)
+    };
+    let (in_var,  ptr_in_f)  = mk_ssbo(&mut b, 0);
+    let (out_var, ptr_out_f) = mk_ssbo(&mut b, 1);
+    // Storage image @ binding 2.
+    let img_ty = b.type_image(f32_ty, Dim::Dim2D, 0, 0, 0, 2,
+        ImageFormat::Rgba32f, None);
+    let ptr_img = b.type_pointer(None, StorageClass::UniformConstant, img_ty);
+    let img_var = b.variable(ptr_img, None, StorageClass::UniformConstant, None);
+    b.decorate(img_var, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(img_var, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(2)]);
+    let ptr_v3u_in = b.type_pointer(None, StorageClass::Input, v3u);
+    let gid_var = b.variable(ptr_v3u_in, None, StorageClass::Input, None);
+    b.decorate(gid_var, Decoration::BuiltIn,
+        vec![rspirv::dr::Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    let c_zero_f = b.constant_bit32(f32_ty, 0.0f32.to_bits());
+    let c_one_f  = b.constant_bit32(f32_ty, 1.0f32.to_bits());
+    let c_two_f  = b.constant_bit32(f32_ty, 2.0f32.to_bits());
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let gid = b.load(v3u, None, gid_var, None, vec![]).unwrap();
+    let gx = b.composite_extract(u32_ty, None, gid, vec![0]).unwrap();
+    // v = in.data[gx]
+    let in_p = b.access_chain(ptr_in_f, None, in_var, vec![c_zero, gx]).unwrap();
+    let v = b.load(f32_ty, None, in_p, None, vec![]).unwrap();
+    // imageStore(img, (gx,0), vec4(v,0,0,1))  -- clobbers X16/X17
+    let coord = b.composite_construct(v2u, None, vec![gx, c_zero]).unwrap();
+    let texel = b.composite_construct(v4f, None,
+        vec![v, c_zero_f, c_zero_f, c_one_f]).unwrap();
+    let img = b.load(img_ty, None, img_var, None, vec![]).unwrap();
+    b.image_write(img, coord, texel, None, vec![]).unwrap();
+    // out.data[gx] = in.data[gx] * 2.0  -- SSBO touch AFTER the call
+    let in_p2 = b.access_chain(ptr_in_f, None, in_var, vec![c_zero, gx]).unwrap();
+    let v2 = b.load(f32_ty, None, in_p2, None, vec![]).unwrap();
+    let doubled = b.f_mul(f32_ty, None, v2, c_two_f).unwrap();
+    let out_p = b.access_chain(ptr_out_f, None, out_var, vec![c_zero, gx]).unwrap();
+    b.store(out_p, doubled, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main",
+        vec![in_var, out_var, img_var, gid_var]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn vk_app_compute_storage_image_plus_ssbo_couse() {
+    // A compute shader that reads SSBO in@0, writes a storage
+    // image @binding 2, then writes SSBO out@1 -- the out
+    // store happens AFTER the image-helper call, so the
+    // multi-binding SSBO base registers must survive it.
+    use aqueduct_gpu::ids::ResourceId;
+    let _ = env_logger::builder().is_test(true).try_init();
+    let sock = tmp_socket("c_couse");
+    let cache_dir = TempDir::new().unwrap();
+    let registry = Arc::new(Tier2Registry::new(LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    }));
+    let tier2_backend = Arc::new(Tier2Backend::new(registry.clone()));
+    let backend_for_listener: Arc<dyn Backend> = tier2_backend.clone();
+    let listener = Listener::bind(&sock, backend_for_listener).unwrap()
+        .with_tier2_registry(registry.clone());
+    let server_thread = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+    let _env = EnvLock::set(&sock);
+
+    let mut instance: VkInstance = std::ptr::null_mut();
+    unsafe { vkCreateInstance(std::ptr::null(), std::ptr::null(), &mut instance); }
+    let mut pds: [VkPhysicalDevice; 1] = [std::ptr::null_mut(); 1];
+    let mut cap: u32 = 1;
+    unsafe { vkEnumeratePhysicalDevices(instance, &mut cap, pds.as_mut_ptr()); }
+    let mut device: VkDevice = std::ptr::null_mut();
+    unsafe { vkCreateDevice(pds[0], std::ptr::null(), std::ptr::null(), &mut device); }
+    let mut queue: VkQueue = std::ptr::null_mut();
+    unsafe { vkGetDeviceQueue(device, 0, 0, &mut queue); }
+
+    let cs_spv = build_ssbo_image_couse_cs();
+    let cs_mod = make_shader_module(device, &cs_spv);
+    use ash::vk;
+    use ash::vk::Handle;
+    let stage = vk::PipelineShaderStageCreateInfo {
+        s_type: vk::StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
+        p_next: std::ptr::null(),
+        flags: vk::PipelineShaderStageCreateFlags::empty(),
+        stage: vk::ShaderStageFlags::COMPUTE,
+        module: vk::ShaderModule::from_raw(cs_mod),
+        p_name: b"main\0".as_ptr() as *const i8,
+        p_specialization_info: std::ptr::null(),
+        _marker: std::marker::PhantomData,
+    };
+    let info = vk::ComputePipelineCreateInfo {
+        s_type: vk::StructureType::COMPUTE_PIPELINE_CREATE_INFO,
+        p_next: std::ptr::null(),
+        flags: vk::PipelineCreateFlags::empty(),
+        stage, layout: vk::PipelineLayout::null(),
+        base_pipeline_handle: vk::Pipeline::null(),
+        base_pipeline_index: 0,
+        _marker: std::marker::PhantomData,
+    };
+    let infos = [info];
+    let mut pipeline: u64 = 0;
+    unsafe {
+        vkCreateComputePipelines(device, 0, 1,
+            infos.as_ptr() as *const std::ffi::c_void,
+            std::ptr::null(), &mut pipeline);
+    }
+    assert!(pipeline != 0);
+    thread::sleep(Duration::from_millis(200));
+
+    // Input: 4 floats in [0,1].
+    let inputs = [0.0f32, 0.25, 0.5, 1.0];
+    let mut prefill = vec![0u8; inputs.len() * 4];
+    for (i, v) in inputs.iter().enumerate() {
+        prefill[i*4..i*4+4].copy_from_slice(&v.to_bits().to_le_bytes());
+    }
+    tier2_backend.set_compute_input_for_binding(0, prefill);
+    // 4×1 storage image at binding 2.
+    let image_id = ResourceId(0x0000_9200);
+    tier2_backend.image_created(image_id, 4, 1);
+    tier2_backend.bind_compute_storage_image(2, image_id);
+
+    let mut pool: u64 = 0;
+    unsafe { vkCreateCommandPool(device, std::ptr::null(), std::ptr::null(), &mut pool); }
+    let mut cb_info = [0u8; 40];
+    cb_info[0..4].copy_from_slice(&40u32.to_le_bytes());
+    cb_info[16..24].copy_from_slice(&pool.to_le_bytes());
+    cb_info[28..32].copy_from_slice(&1u32.to_le_bytes());
+    let mut cbs: [VkCommandBuffer; 1] = [std::ptr::null_mut(); 1];
+    unsafe { vkAllocateCommandBuffers(device, cb_info.as_ptr() as *const _, cbs.as_mut_ptr()); }
+    let cb = cbs[0];
+    unsafe { vkBeginCommandBuffer(cb, std::ptr::null()); }
+    unsafe { vkCmdBindPipeline(cb, 1, pipeline); }
+    unsafe { vkCmdDispatch(cb, 4, 1, 1); }
+    unsafe { vkEndCommandBuffer(cb); }
+    let mut submit = [0u8; 72];
+    submit[0..4].copy_from_slice(&4u32.to_le_bytes());
+    submit[40..44].copy_from_slice(&1u32.to_le_bytes());
+    let cb_arr = [cb];
+    submit[48..56].copy_from_slice(&(cb_arr.as_ptr() as u64).to_le_bytes());
+    unsafe { vkQueueSubmit(queue, 1, submit.as_ptr() as *const _, std::ptr::null_mut()); }
+    thread::sleep(Duration::from_millis(300));
+
+    // out.data[x] should be in[x] * 2 -- proves the SSBO base
+    // register survived the image-helper call.
+    let out = tier2_backend.compute_output_bytes_for_binding(1)
+        .expect("out SSBO");
+    for (x, &iv) in inputs.iter().enumerate() {
+        let got = f32::from_le_bytes(out[x*4..x*4+4].try_into().unwrap());
+        assert_eq!(got, iv * 2.0,
+            "out[{x}] should be {} (= in*2); got {got}", iv * 2.0);
+    }
+    // The image got the raw input values (Rgba8-quantised).
+    let pixels = tier2_backend.read_image_pixels(image_id)
+        .expect("storage image");
+    let q = |f: f32| -> u8 { (f.clamp(0.0, 1.0) * 255.0 + 0.5) as u8 };
+    for (x, &iv) in inputs.iter().enumerate() {
+        assert_eq!(pixels[x*4], q(iv),
+            "image[{x}].r should be {} ; got {}", q(iv), pixels[x*4]);
+    }
+
+    unsafe { atrium_vk_icd::vkDestroyInstance(instance, std::ptr::null()); }
+    let _ = server_thread;
+    let _ = std::fs::remove_file(&sock);
+}

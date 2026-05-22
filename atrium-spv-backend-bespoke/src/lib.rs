@@ -1008,6 +1008,15 @@ fn emit_function(
     // of the ldr_w_offset inst, dest W-reg).
     let mut lid_z_load_patches: Vec<(usize, asm::Wreg)> = Vec::new();
 
+    // Multi-binding SSBO base registers that an image-helper
+    // `blr` would clobber (X12..X17 are caller-saved): each
+    // entry is (base reg, descriptor-table binding).  After
+    // an ImageRead/ImageWrite call the lowering re-loads
+    // these from X2 (which is itself saved/restored across
+    // the call), so a shader can both read SSBOs and touch
+    // storage images.
+    let mut ssbo_base_reloads: Vec<(asm::Xreg, u32)> = Vec::new();
+
     // Multi-binding SSBO prologue.  When a compute shader
     // declares >1 StorageBuffer, X2 is no longer a direct
     // SSBO pointer -- it points to a descriptor table where
@@ -1055,6 +1064,7 @@ fn emit_function(
             let dst = asm::Xreg(SSBO_BASE_REGS[i]);
             a.emit(asm::ldr_x_offset(dst, asm::Xreg(2), (binding * 8) as u16));
             pointers.insert(ValueId(*vid), (dst, 0));
+            ssbo_base_reloads.push((dst, *binding));
         }
     }
 
@@ -3392,9 +3402,17 @@ fn emit_function(
                         asm::Wreg(*n), sp, iregs_base + (i as u16) * 4));
                 }
                 a.emit(asm::ldr_x_offset(x_out, sp, 16));
-                let _ = x2;
                 a.emit(asm::ldr_x_offset(lr, sp, 24));
                 a.emit(asm::add_imm_x(sp, sp, frame_bytes));
+                // Re-establish the multi-binding SSBO base
+                // pointers: the helper `blr` clobbered the
+                // caller-saved X12..X17 they live in, but X2
+                // (the descriptor-table base) was just
+                // restored, so re-load each binding from it.
+                for &(base_reg, binding) in &ssbo_base_reloads {
+                    a.emit(asm::ldr_x_offset(
+                        base_reg, x2, (binding * 8) as u16));
+                }
 
                 if !is_write {
                     let result = inst.result.as_ref().ok_or_else(||

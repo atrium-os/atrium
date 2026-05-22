@@ -1003,9 +1003,14 @@ specifically supports:
   int regs across the call; Cranelift's call_indirect
   handles spilling itself.  The dispatcher builds the
   table from images bound via `bind_compute_storage_image`.
+  Multi-binding SSBO + storage-image co-use works: the
+  SSBO base registers (X12..X17) are caller-saved and the
+  image-helper `blr` clobbers them, so the lowering
+  re-loads each from the descriptor table (X2, itself
+  saved/restored) after every image call.
   MVP scope: 2D single-mip, Rgba8Unorm / R32Float /
-  Rgba32Float; image + multi-binding-SSBO co-use and
-  atomic image ops are deferred.
+  Rgba32Float; atomic image ops and 3D/mip/array images
+  are deferred.
 - GLSL.std.450 ExtInst dispatch for: FAbs, SAbs, Floor,
   Ceil, Trunc, Fract, FSign, FMod, Sqrt, InverseSqrt,
   FMin, FMax, FClamp, FMix, Step, SmoothStep, Length,
