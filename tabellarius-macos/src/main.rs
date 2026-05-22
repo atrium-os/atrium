@@ -31,7 +31,7 @@ mod substore;
 use aqueduct::classes::CLASS_TABELLARIUS;
 use aqueduct::envelope::flag;
 use aqueduct::Connection;
-use relay_client::{resolve_relay_addr, PushQueue, RelayClient};
+use relay_client::{resolve_relay_addr, resolve_wake_cmd, PushQueue, RelayClient};
 use std::collections::VecDeque;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -110,6 +110,7 @@ fn main() -> ExitCode {
             };
             match RelayClient::connect(
                 &addr, initial_keys, store.clone(), queue.clone(),
+                resolve_wake_cmd(),
             ) {
                 Ok(rc) => {
                     eprintln!("tabellarius-macos: connected to relay {}", addr);
@@ -165,13 +166,28 @@ fn handle_connection(stream: UnixStream, ctx: Ctx) {
 
         match msg.op {
             OP_SUBSCRIBE_REQUEST => {
-                let purpose = match std::str::from_utf8(&msg.payload) {
+                // Payload: [u8 app_id_len | app_id | purpose].
+                // app_id_len = 0 when the caller isn't a
+                // sandboxed app (e.g. the `insula` CLI).
+                if msg.payload.is_empty() {
+                    continue;
+                }
+                let alen = msg.payload[0] as usize;
+                if msg.payload.len() < 1 + alen {
+                    continue;
+                }
+                let app_id: Option<String> =
+                    std::str::from_utf8(&msg.payload[1..1 + alen])
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string());
+                let purpose = match std::str::from_utf8(&msg.payload[1 + alen..]) {
                     Ok(s) => s.to_string(),
                     Err(_) => continue,
                 };
                 let (key_id, pubkey) = {
                     let mut s = store.lock().unwrap();
-                    match s.mint(&purpose) {
+                    match s.mint(&purpose, app_id.as_deref()) {
                         Ok(sub) => (sub.key_id.clone(), sub.pubkey_bytes()),
                         Err(e) => {
                             eprintln!("tabellarius-macos: mint: {}", e);
@@ -319,6 +335,12 @@ Environment:
                               the daemon connects, announces every
                               subscription pubkey, and queues inbound
                               pushes for GET_PUSH. Unset = no relay.
+  INSULA_TABELLARIUSD_WAKE_CMD  wake-on-push hook. When set, every
+                              push that lands for a subscription with
+                              a known owning app runs
+                              `<cmd> <app_id> <key_id>` (production:
+                              launch the app's [background.triggered]
+                              entry). Unset = no wake.
 
 Substore is XChaCha20-Poly1305-encrypted at rest under a per-
 installation master key; subscriptions survive daemon restart."

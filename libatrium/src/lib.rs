@@ -805,6 +805,24 @@ fn tabellarius_connect() -> Option<Connection> {
     Connection::connect(std::path::Path::new(&path)).ok()
 }
 
+/// Derive the running app's id from `$ATRIUM_CONTAINER_DIR`.
+///
+/// The host adapter sets that env var to
+/// `<install_root>/apps/<app_id>/container` for every
+/// sandboxed launch — the app id is the name of the
+/// directory two levels up. Returns `None` when the env
+/// var is unset (non-sandboxed caller) or the path
+/// doesn't have the expected shape.
+fn tabellarius_app_id() -> Option<String> {
+    let container = std::env::var_os("ATRIUM_CONTAINER_DIR")?;
+    let p = std::path::Path::new(&container);
+    // .../apps/<app_id>/container  ->  parent = .../apps/<app_id>
+    p.parent()?
+        .file_name()?
+        .to_str()
+        .map(|s| s.to_string())
+}
+
 fn tabellarius_rpc(conn: &mut Connection, op: u16, payload: &[u8])
     -> Option<Vec<u8>>
 {
@@ -869,7 +887,24 @@ pub unsafe extern "C" fn atrium_tabellarius_subscribe(
     let Some(mut conn) = tabellarius_connect() else {
         return ATRIUM_ERR_NO_TABELLARIUS;
     };
-    let Some(resp) = tabellarius_rpc(&mut conn, 0, purpose_s.as_bytes()) else {
+
+    // SUBSCRIBE payload: [u8 app_id_len | app_id | purpose].
+    // The app id is derived from $ATRIUM_CONTAINER_DIR
+    // (`<install_root>/apps/<app_id>/container`), set by
+    // the host adapter when it launches a sandboxed app.
+    // Lets the daemon's wake-on-push fire the right app's
+    // triggered-background entry. An empty app_id (the
+    // env var unset — e.g. a non-sandboxed caller) means
+    // "no owning app".
+    let app_id = tabellarius_app_id().unwrap_or_default();
+    let mut payload = Vec::with_capacity(
+        1 + app_id.len() + purpose_s.len(),
+    );
+    payload.push(app_id.len().min(255) as u8);
+    payload.extend_from_slice(&app_id.as_bytes()[..app_id.len().min(255)]);
+    payload.extend_from_slice(purpose_s.as_bytes());
+
+    let Some(resp) = tabellarius_rpc(&mut conn, 0, &payload) else {
         return ATRIUM_ERR_TABELLARIUS_RPC;
     };
     if resp.is_empty() {

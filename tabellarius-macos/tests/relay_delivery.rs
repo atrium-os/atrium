@@ -288,6 +288,163 @@ fn get_push_abi_with_no_socket_errors() {
 }
 
 #[test]
+fn push_for_an_app_fires_the_wake_hook() {
+    let _guard = ENV_LOCK.lock().unwrap();
+
+    let (mut relay, relay_addr) = spawn_relay();
+    let tmp = tempfile::tempdir().unwrap();
+    let sock = tmp.path().join("tbd.sock");
+    let store = tmp.path().join("subs");
+
+    // Wake-hook stub: a script that records `$1 $2`
+    // (app_id key_id) to a marker file, one push per
+    // line.
+    let hook = tmp.path().join("wake-hook.sh");
+    let marker = tmp.path().join("woke.txt");
+    std::fs::write(&hook, format!(
+        "#!/bin/sh\nprintf '%s %s\\n' \"$1\" \"$2\" >> {}\n",
+        marker.display(),
+    )).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let mut p = std::fs::metadata(&hook).unwrap().permissions();
+    p.set_mode(0o755);
+    std::fs::set_permissions(&hook, p).unwrap();
+
+    let mut daemon = Command::new(tabellarius_binary())
+        .env("INSULA_TABELLARIUSD_SOCKET", &sock)
+        .env("INSULA_TABELLARIUSD_STORE", &store)
+        .env("INSULA_TABELLARIUSD_RELAY", &relay_addr)
+        .env("INSULA_TABELLARIUSD_WAKE_CMD", &hook)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn tabellarius-macos");
+    wait_for_socket(&sock, Duration::from_secs(3));
+
+    // Subscribe AS an app — libatrium derives the app_id
+    // from $ATRIUM_CONTAINER_DIR
+    // (`<root>/apps/<app_id>/container`).
+    let app_id = "com.example.waketest";
+    let container = tmp.path()
+        .join("inst").join("apps").join(app_id).join("container");
+    std::env::set_var("ATRIUM_TABELLARIUS_SOCKET", &sock);
+    std::env::set_var("ATRIUM_CONTAINER_DIR", &container);
+
+    let purpose = CString::new("primary").unwrap();
+    let mut key_id_buf = [0i8; 64];
+    let mut pubkey = [0u8; 32];
+    let n = unsafe {
+        atrium::atrium_tabellarius_subscribe(
+            purpose.as_ptr(),
+            key_id_buf.as_mut_ptr(), key_id_buf.len(),
+            pubkey.as_mut_ptr(),
+        )
+    };
+    assert!(n > 0);
+    let key_id = unsafe {
+        std::ffi::CStr::from_ptr(key_id_buf.as_ptr())
+    }.to_string_lossy().into_owned();
+    std::env::remove_var("ATRIUM_CONTAINER_DIR");
+    std::env::remove_var("ATRIUM_TABELLARIUS_SOCKET");
+
+    thread::sleep(Duration::from_millis(250));
+
+    // Publish — should fan out to the daemon, queue the
+    // push, AND fire the wake hook.
+    let mut publisher = TcpStream::connect(&relay_addr).unwrap();
+    write_msg(&mut publisher, &ClientMsg::Publish {
+        to_key: pubkey, blob: b"wakeup".to_vec(), ttl_secs: 60,
+    }).unwrap();
+    let mut pr = BufReader::new(publisher.try_clone().unwrap());
+    assert!(matches!(
+        read_msg::<_, RelayMsg>(&mut pr).unwrap(),
+        RelayMsg::PublishAccepted { delivered: 1, .. }
+    ));
+
+    // Give the daemon's reader thread + the spawned
+    // hook a beat.
+    thread::sleep(Duration::from_millis(400));
+
+    let woke = std::fs::read_to_string(&marker).unwrap_or_default();
+    assert!(woke.contains(app_id),
+            "wake hook should have run with the app_id; marker: {:?}", woke);
+    assert!(woke.contains(&key_id),
+            "wake hook should have run with the key_id; marker: {:?}", woke);
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    let _ = relay.kill();
+    let _ = relay.wait();
+}
+
+#[test]
+fn push_with_no_owning_app_does_not_fire_wake() {
+    let _guard = ENV_LOCK.lock().unwrap();
+
+    let (mut relay, relay_addr) = spawn_relay();
+    let tmp = tempfile::tempdir().unwrap();
+    let sock = tmp.path().join("tbd.sock");
+    let store = tmp.path().join("subs");
+
+    let hook = tmp.path().join("wake-hook.sh");
+    let marker = tmp.path().join("woke.txt");
+    std::fs::write(&hook, format!(
+        "#!/bin/sh\nprintf 'fired\\n' >> {}\n", marker.display(),
+    )).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let mut p = std::fs::metadata(&hook).unwrap().permissions();
+    p.set_mode(0o755);
+    std::fs::set_permissions(&hook, p).unwrap();
+
+    let mut daemon = Command::new(tabellarius_binary())
+        .env("INSULA_TABELLARIUSD_SOCKET", &sock)
+        .env("INSULA_TABELLARIUSD_STORE", &store)
+        .env("INSULA_TABELLARIUSD_RELAY", &relay_addr)
+        .env("INSULA_TABELLARIUSD_WAKE_CMD", &hook)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn");
+    wait_for_socket(&sock, Duration::from_secs(3));
+
+    // Subscribe WITHOUT $ATRIUM_CONTAINER_DIR — no
+    // owning app id. The wake hook must not fire.
+    std::env::set_var("ATRIUM_TABELLARIUS_SOCKET", &sock);
+    std::env::remove_var("ATRIUM_CONTAINER_DIR");
+    let purpose = CString::new("orphan").unwrap();
+    let mut key_id_buf = [0i8; 64];
+    let mut pubkey = [0u8; 32];
+    let n = unsafe {
+        atrium::atrium_tabellarius_subscribe(
+            purpose.as_ptr(),
+            key_id_buf.as_mut_ptr(), key_id_buf.len(),
+            pubkey.as_mut_ptr(),
+        )
+    };
+    assert!(n > 0);
+    std::env::remove_var("ATRIUM_TABELLARIUS_SOCKET");
+
+    thread::sleep(Duration::from_millis(250));
+
+    let mut publisher = TcpStream::connect(&relay_addr).unwrap();
+    write_msg(&mut publisher, &ClientMsg::Publish {
+        to_key: pubkey, blob: b"x".to_vec(), ttl_secs: 60,
+    }).unwrap();
+    let mut pr = BufReader::new(publisher.try_clone().unwrap());
+    let _ = read_msg::<_, RelayMsg>(&mut pr);
+
+    thread::sleep(Duration::from_millis(400));
+
+    assert!(!marker.exists(),
+            "wake hook must not fire for a subscription with no owning app");
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    let _ = relay.kill();
+    let _ = relay.wait();
+}
+
+#[test]
 fn get_push_on_empty_queue_reports_empty() {
     let _guard = ENV_LOCK.lock().unwrap();
 

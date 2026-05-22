@@ -76,7 +76,13 @@ fn push_subscribe(args: &[String], install_root: &Path) -> Result<(), String> {
         "push subscribe: missing <purpose> argument".to_string()
     })?;
     let mut conn = connect_tabellarius(install_root)?;
-    let resp = rpc(&mut conn, OP_SUBSCRIBE, purpose.as_bytes())?;
+    // SUBSCRIBE payload: [u8 app_id_len | app_id | purpose].
+    // The CLI is not a sandboxed app, so app_id is empty
+    // (app_id_len = 0).
+    let mut payload = Vec::with_capacity(1 + purpose.len());
+    payload.push(0u8);
+    payload.extend_from_slice(purpose.as_bytes());
+    let resp = rpc(&mut conn, OP_SUBSCRIBE, &payload)?;
 
     // Wire: [u8 key_id_len | key_id UTF-8 | 32B pubkey]
     if resp.is_empty() {

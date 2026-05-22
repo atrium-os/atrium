@@ -40,6 +40,14 @@ pub const KEY_ID_HEX_LEN: usize = 16;
 pub struct Subscription {
     pub key_id: String,
     pub purpose: String,
+    /// The Insula app that owns this subscription, when
+    /// known. Set from the app's `$ATRIUM_CONTAINER_DIR`
+    /// at subscribe time (see libatrium); `None` for
+    /// subscriptions minted by the `insula` CLI or any
+    /// other non-sandboxed caller. Used by wake-on-push
+    /// to decide whose triggered-background entry to
+    /// spawn.
+    pub app_id: Option<String>,
     pub signing_key: SigningKey,
 }
 
@@ -115,8 +123,12 @@ impl SubStore {
                 continue;
             };
 
-            // Format (post-decrypt or legacy):
-            //   [1B purpose_len | purpose | 32B sk]
+            // Inner payload formats:
+            //   v1 (legacy): [1B plen | purpose | 32B sk]
+            //   v2:          [1B plen | purpose |
+            //                 1B alen | app_id | 32B sk]
+            // After `purpose`, v1 has exactly 32 bytes
+            // left; v2 has >= 33 (the alen byte + sk).
             let purpose_len = payload[0] as usize;
             if payload.len() < 1 + purpose_len + 32 {
                 continue;
@@ -125,8 +137,24 @@ impl SubStore {
                 Ok(s) => s.to_string(),
                 Err(_) => continue,
             };
+            let after_purpose = &payload[1 + purpose_len..];
+            let (app_id, sk_slice) = if after_purpose.len() == 32 {
+                // v1 legacy — no app_id.
+                (None, after_purpose)
+            } else {
+                // v2 — [1B alen | app_id | 32B sk].
+                let alen = after_purpose[0] as usize;
+                if after_purpose.len() != 1 + alen + 32 {
+                    continue;
+                }
+                let app_id = std::str::from_utf8(&after_purpose[1..1 + alen])
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
+                (app_id, &after_purpose[1 + alen..])
+            };
             let mut sk_bytes = [0u8; 32];
-            sk_bytes.copy_from_slice(&payload[1 + purpose_len..1 + purpose_len + 32]);
+            sk_bytes.copy_from_slice(sk_slice);
             let signing_key = SigningKey::from_bytes(&sk_bytes);
             let key_id = key_id_for(&signing_key.verifying_key().to_bytes());
 
@@ -138,17 +166,20 @@ impl SubStore {
 
             by_id.insert(
                 key_id.clone(),
-                Subscription { key_id, purpose, signing_key },
+                Subscription { key_id, purpose, app_id, signing_key },
             );
         }
 
         Ok(SubStore { dir, master, by_id })
     }
 
-    /// Mint a new subscription with the given purpose.
-    /// Encrypted before persistence — the disk file is
+    /// Mint a new subscription with the given purpose
+    /// and (optionally) the owning app's id. Encrypted
+    /// before persistence — the disk file is
     /// `[24B nonce | ciphertext | 16B tag]`.
-    pub fn mint(&mut self, purpose: &str) -> std::io::Result<&Subscription> {
+    pub fn mint(&mut self, purpose: &str, app_id: Option<&str>)
+        -> std::io::Result<&Subscription>
+    {
         let sk = SigningKey::generate(&mut OsRng);
         let pk_bytes = sk.verifying_key().to_bytes();
         let key_id = key_id_for(&pk_bytes);
@@ -157,11 +188,18 @@ impl SubStore {
             return Ok(self.by_id.get(&key_id).unwrap());
         }
 
-        // Inner payload: [1B purpose_len | purpose | 32B sk].
-        let mut inner = Vec::with_capacity(1 + purpose.len() + 32);
+        // Inner payload (v2):
+        //   [1B plen | purpose | 1B alen | app_id | 32B sk]
+        let app_id_str = app_id.unwrap_or("");
+        let mut inner = Vec::with_capacity(
+            1 + purpose.len() + 1 + app_id_str.len() + 32,
+        );
         let plen: u8 = purpose.len().try_into().unwrap_or(255);
         inner.push(plen);
         inner.extend_from_slice(&purpose.as_bytes()[..plen as usize]);
+        let alen: u8 = app_id_str.len().try_into().unwrap_or(255);
+        inner.push(alen);
+        inner.extend_from_slice(&app_id_str.as_bytes()[..alen as usize]);
         inner.extend_from_slice(sk.as_bytes());
 
         let cipher = XChaCha20Poly1305::new((&self.master).into());
@@ -191,6 +229,7 @@ impl SubStore {
             Subscription {
                 key_id: key_id.clone(),
                 purpose: purpose.to_string(),
+                app_id: app_id.map(|s| s.to_string()),
                 signing_key: sk,
             },
         );
@@ -286,7 +325,7 @@ mod tests {
     fn mint_persists_and_reload_finds() {
         let dir = tempfile::tempdir().unwrap();
         let mut s1 = SubStore::open(dir.path().to_path_buf()).unwrap();
-        let sub = s1.mint("primary").unwrap();
+        let sub = s1.mint("primary", None).unwrap();
         let key_id = sub.key_id.clone();
         let pk_before = sub.pubkey_bytes();
 
@@ -302,7 +341,7 @@ mod tests {
     fn remove_drops_from_disk_and_memory() {
         let dir = tempfile::tempdir().unwrap();
         let mut s = SubStore::open(dir.path().to_path_buf()).unwrap();
-        let key_id = s.mint("p").unwrap().key_id.clone();
+        let key_id = s.mint("p", None).unwrap().key_id.clone();
 
         assert!(s.remove(&key_id));
         assert!(s.iter().next().is_none());
@@ -323,7 +362,7 @@ mod tests {
     fn key_id_matches_pubkey_prefix() {
         let dir = tempfile::tempdir().unwrap();
         let mut s = SubStore::open(dir.path().to_path_buf()).unwrap();
-        let sub = s.mint("x").unwrap();
+        let sub = s.mint("x", None).unwrap();
         let pk = sub.pubkey_bytes();
         let expected: String = pk[..KEY_ID_HEX_LEN / 2]
             .iter().map(|b| format!("{:02x}", b)).collect();
@@ -334,7 +373,7 @@ mod tests {
     fn on_disk_files_are_encrypted_not_raw_payload() {
         let dir = tempfile::tempdir().unwrap();
         let mut s = SubStore::open(dir.path().to_path_buf()).unwrap();
-        let sub = s.mint("primary").unwrap();
+        let sub = s.mint("primary", None).unwrap();
         let sk_bytes = sub.signing_key.to_bytes();
         let purpose = sub.purpose.clone();
         let key_id = sub.key_id.clone();
@@ -343,7 +382,11 @@ mod tests {
         let bytes = std::fs::read(&path).unwrap();
 
         // Expect: nonce (24) + ciphertext (1 + len(purpose) + 32) + tag (16).
-        let expected_len = NONCE_LEN + 1 + purpose.len() + 32 + TAG_LEN;
+        // Inner v2 payload: 1B plen | purpose | 1B alen
+        // (=0, no app_id) | 32B sk. Encrypted = nonce +
+        // inner + tag.
+        let expected_len =
+            NONCE_LEN + (1 + purpose.len() + 1 + 0 + 32) + TAG_LEN;
         assert_eq!(bytes.len(), expected_len,
                    "encrypted sub file should be {} bytes; got {}",
                    expected_len, bytes.len());
@@ -364,7 +407,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pk_first = {
             let mut s = SubStore::open(dir.path().to_path_buf()).unwrap();
-            s.mint("master-test").unwrap().pubkey_bytes()
+            s.mint("master-test", None).unwrap().pubkey_bytes()
         };
 
         // Tamper with master.key.
