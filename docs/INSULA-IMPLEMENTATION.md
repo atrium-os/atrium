@@ -2,7 +2,7 @@
 
 **Branch:** `claude/romantic-rubin-42085b`
 **Last updated:** 2026-05-22
-**Phase:** M1A (Foundation) + M1B (service-catalogue MVP) + M1C (Pergola path) complete at the ABI level. Beyond the ABI: full publish-side toolchain (`keygen` / `sign` / `bundle` / `release` / `publishers`), dev-iteration tooling (`init` / `run` / `install --link` / `doctor` / `clean`), four convenience scripts (`test-insula.sh` / `build-insula.sh` / `install-insula.sh` / `insula-demo.sh`), GitHub Actions CI on macos-14, and an opt-in macOS NotificationCenter backend for praeco. Five sample apps cover all four scene-node primitives. 230 tests across 15 crates.
+**Phase:** M1A (Foundation) + M1B (service-catalogue MVP) + M1C (Pergola path) complete at the ABI level. Beyond the ABI: full publish-side toolchain (`keygen` / `sign` / `bundle` / `release` / `publishers`), dev-iteration tooling (`init` / `run` / `install --link` / `doctor` / `clean`), four convenience scripts (`test-insula.sh` / `build-insula.sh` / `install-insula.sh` / `insula-demo.sh`), GitHub Actions CI on macos-14, and an opt-in macOS NotificationCenter backend for praeco. Five sample apps cover all four scene-node primitives. 236 tests across 15 crates.
 
 This document orients a reader landing fresh in the
 branch. For the design corpus see [`spec/insula.md`](spec/insula.md)
@@ -92,7 +92,7 @@ the repo has no top-level workspace by convention.
 | `insula.md` §4 (sandbox + network) | `insula-host-macos/src/sbpl.rs` + `src/launch.rs` |
 | `insula.md` §5.1 (manifest schema) | `insula-manifest/src/lib.rs` + `src/sections.rs` |
 | `insula.md` §4.2 (network broker) | `atrium-netd-macos/src/main.rs` + libatrium `atrium_net_connect` |
-| `insula.md` §11.5 (push delivery) | (no — deferred) |
+| `insula.md` §11.5 (push delivery) | `tabellarius-macos` Phase A (subscribe/list); relay traffic + wake-on-push are Phase B |
 | `insula.md` §13.3 (per-service keypairs) | `vestibulum-macos/src/main.rs` + libatrium `atrium_keychain_*` |
 | `insula.md` §15.2 (per-app storage) | libatrium `atrium_container_path` + `atrium_storage_open`; container provisioning in `insula-host-macos/src/install.rs` |
 | `insula.md` §20 (notifications) | `praeco-macos/src/main.rs` + libatrium `atrium_notify_post` |
@@ -181,7 +181,7 @@ $INSULA daemons down
 
 ## Testing
 
-230 tests pass across all 15 crates on this macOS host.
+236 tests pass across all 15 crates on this macOS host.
 
 ```sh
 # One-line runner: scripts/test-insula.sh
@@ -207,9 +207,9 @@ Test distribution:
 | insula-cli | 88 | All subcommands; signing/archive/diff E2E; push + keychain + notify + daemons {restart,logs} + doctor + init + run + clean + release + version + uninstall --all + install --link + info-with-verify E2E; list table with per-app capability tags |
 | praeco-macos | 6 | Notification posts log + monotonic ids + degraded + opt-in osascript backend (NotificationCenter delivery) |
 | insula-logd | 3 | Daemon decodes Aqueduct messages + writes log file |
-| vestibulum-macos | 10 | ed25519 keychain roundtrip incl. signature verify, persistence across restart |
+| vestibulum-macos | 13 | ed25519 keychain roundtrip + signature verify + persistence; XChaCha20-Poly1305 encryption-at-rest (on-disk-not-raw, master-key-governs-decrypt, legacy plaintext compat) |
 | atrium-netd-macos | 13 | Per-app manifest enforcement (8 unit) + broker behavior (5 integration) |
-| tabellarius-macos | 7 | substore unit (4) + subscribe/unsubscribe/count via libatrium + persistence across daemon restart |
+| tabellarius-macos | 10 | substore unit + subscribe/unsubscribe/count via libatrium + persistence; XChaCha20-Poly1305 encryption-at-rest (3 cases) |
 
 The *load-bearing* integration tests (the ones that prove
 the design isn't just on paper):
