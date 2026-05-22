@@ -116,6 +116,14 @@ pub struct Tier2Backend {
     /// by tests that need to verify the shader's read path
     /// (RMW, parallel reductions, etc.).
     compute_input_by_binding: Mutex<HashMap<u32, Vec<u8>>>,
+    /// Storage-image bindings for the next compute dispatch:
+    /// descriptor binding -> image_id.raw().  The dispatcher
+    /// builds an `ImageDesc` table from these (looking each
+    /// image up in `images`) and passes its base in the X0
+    /// (`uniforms`) cs_main slot.  Populated by
+    /// `bind_compute_storage_image`; consumed (drained) per
+    /// dispatch.
+    compute_image_by_binding: Mutex<HashMap<u32, u64>>,
     /// Per-dispatch SSBO size in bytes.  Default 4 KiB.
     compute_output_capacity: std::sync::atomic::AtomicUsize,
     submissions: AtomicU64,
@@ -310,6 +318,7 @@ impl Tier2Backend {
             last_compute_output: Mutex::new(None),
             last_compute_outputs_by_binding: Mutex::new(Vec::new()),
             compute_input_by_binding: Mutex::new(HashMap::new()),
+            compute_image_by_binding: Mutex::new(HashMap::new()),
             compute_output_capacity: std::sync::atomic::AtomicUsize::new(4096),
             last_assembled_vertices: Mutex::new(None),
             presented_frames: Mutex::new(HashMap::new()),
@@ -530,6 +539,18 @@ impl Tier2Backend {
     /// capacity are silently truncated.
     pub fn set_compute_input_for_binding(&self, b: u32, bytes: Vec<u8>) {
         self.compute_input_by_binding.lock().unwrap().insert(b, bytes);
+    }
+
+    /// Bind a storage image (a previously `image_created`
+    /// resource) to compute descriptor binding `b` for the
+    /// next dispatch.  The dispatcher builds an `ImageDesc`
+    /// table from these bindings and passes its base in the
+    /// X0 cs_main slot, so `OpImageRead` / `OpImageWrite` in
+    /// the shader reach the image's pixel storage.  Consumed
+    /// (drained) per dispatch.
+    pub fn bind_compute_storage_image(&self, b: u32, image_id: ResourceId) {
+        self.compute_image_by_binding.lock().unwrap()
+            .insert(b, image_id.raw() as u64);
     }
 
     /// Set the per-dispatch output-buffer capacity (bytes).
@@ -1086,10 +1107,72 @@ impl Tier2Backend {
             }
         };
 
-        let uni_ptr = std::ptr::null();
         let pc_ptr = if state.push_constants.is_empty() {
             std::ptr::null()
         } else { state.push_constants.as_ptr() };
+
+        // Storage-image descriptor table.  When the next
+        // dispatch has images bound (via
+        // `bind_compute_storage_image`), build an
+        // `ImageDesc` table and pass its base in the X0
+        // (`uniforms`) cs_main slot.  The `images` lock is
+        // held for the whole dispatch so the pixel buffers
+        // the ImageDescs point into stay put; `image_descs`
+        // must not reallocate after the table references it,
+        // so it is filled fully before the table is built.
+        let img_bindings: Vec<(u32, u64)> = {
+            let mut m = self.compute_image_by_binding.lock().unwrap();
+            m.drain().collect()
+        };
+        let images_guard;
+        let mut image_descs: Vec<atrium_spv_runtime::ImageDesc> = Vec::new();
+        let mut image_table: Vec<u8>;
+        let uni_ptr: *const u8 = if img_bindings.is_empty() {
+            std::ptr::null()
+        } else {
+            images_guard = self.images.lock().unwrap();
+            // Highest binding index decides the table size.
+            let max_binding = img_bindings.iter()
+                .map(|(b, _)| *b).max().unwrap_or(0);
+            image_descs.reserve((max_binding as usize) + 1);
+            // Build one ImageDesc per binding (in binding
+            // order so slot N lands at index N).
+            let mut slot_of: Vec<Option<usize>> =
+                vec![None; (max_binding as usize) + 1];
+            for &(binding, image_raw) in &img_bindings {
+                if let Some(img) = images_guard.get(&image_raw) {
+                    let idx = image_descs.len();
+                    image_descs.push(atrium_spv_runtime::ImageDesc {
+                        data: img.pixels.as_ptr() as *mut u8,
+                        width: img.width,
+                        height: img.height,
+                        stride_bytes: img.width * 4,
+                        // ImageStorage is RGBA8 (4 B/texel).
+                        format: atrium_spv_runtime::StorageFormat::Rgba8Unorm
+                            as u32,
+                    });
+                    slot_of[binding as usize] = Some(idx);
+                }
+            }
+            image_table = atrium_spv_runtime::image_table_buffer(
+                (max_binding as usize) + 1);
+            // SAFETY: the helper fn pointers are in this
+            // process; image_descs outlives the dispatch.
+            unsafe {
+                atrium_spv_runtime::write_image_helper_pointers(
+                    &mut image_table,
+                    atrium_spv_runtime::atrium_img_read_2d,
+                    atrium_spv_runtime::atrium_img_write_2d);
+                for (binding, maybe_idx) in slot_of.iter().enumerate() {
+                    if let Some(idx) = maybe_idx {
+                        atrium_spv_runtime::write_image_descriptor_slot(
+                            &mut image_table, binding,
+                            &image_descs[*idx] as *const _);
+                    }
+                }
+            }
+            image_table.as_ptr()
+        };
 
         let total_invocations = (cmd.group_count_x as u64)
             * (cmd.group_count_y as u64) * (cmd.group_count_z as u64)

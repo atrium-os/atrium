@@ -65,6 +65,9 @@ serde_json     = "1"
 # it in a Tier-2 shader registry that the eventual Tier2Backend will
 # consume.
 atrium-spv-loader = { path = "../atrium-spv-loader" }
+# Storage-image runtime helpers + descriptor-table builders,
+# used by the compute dispatcher to wire OpImageRead/Write.
+atrium-spv-runtime = { path = "../atrium-spv-runtime" }
 
 
 [dev-dependencies]
