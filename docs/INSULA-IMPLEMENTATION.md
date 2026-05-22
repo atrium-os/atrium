@@ -100,7 +100,7 @@ the repo has no top-level workspace by convention.
 | `insula.md` §3.1 (bundle archive format) | `insula-bundle/src/archive.rs` (`INSB` v1) + `insula bundle` CLI |
 | `insula.md` §5.4 (capability-diff consent) | `insula-manifest::diff::CapabilityDiff` + `insula install --accept-changes` |
 | `tabellarius.md` §9.1 (subscribe/list/get-push ABI) | `tabellarius-macos/src/main.rs` + libatrium `atrium_tabellarius_*` |
-| `tabellarius.md` §3 (relay protocol) | `tabellarius-relay` (v0: postcard-over-plaintext-TCP; spec's CBOR-over-mTLS is a follow-up) |
+| `tabellarius.md` §3 (relay protocol) | `tabellarius-relay` — CBOR frames over plaintext TCP; mutual-auth TLS is the remaining §3.2 hardening item |
 | `tabellarius.md` §4.2 (wake-on-push) | `tabellarius-macos/src/relay_client.rs` — `$INSULA_TABELLARIUSD_WAKE_CMD` hook |
 | `insula.md` §6 (windowed UI / Pergola) | libatrium `atrium_window_*` (open/destroy/fill_rect/frame_begin/frame_rect/frame_end/poll_event) → CLASS_DISPLAY → external Fresco scene server (frescod) |
 | `insula-host-macos.md` §2 (SBPL generation) | `insula-host-macos/src/sbpl.rs` |
@@ -427,14 +427,14 @@ commits don't trigger it.
   core + TCP daemon); the device daemon connects, an-
   nounces its subscription pubkeys, queues inbound
   pushes for `GET_PUSH` / `atrium_tabellarius_get_push`,
-  and fires a wake hook for the owning app. v0 wire is
-  postcard-over-plaintext-TCP; the spec's CBOR-over-
-  mutual-TLS (`tabellarius.md` §3.2) is the hardening
-  follow-up. Wake-on-push trusts the app's self-reported
-  `$ATRIUM_CONTAINER_DIR` for identity — kernel-attested
-  identity (SO_PEERPID, the atrium-netd pattern) is the
-  next layer. Per-app rate limiting + at-least-once
-  retry are also follow-ups (`tabellarius.md` §11.2).
+  and fires a wake hook for the owning app. Wake-on-push
+  identity is kernel-attested (SO_PEERPID + proc_pidpath
+  → install-root match), so an app can't be woken on
+  another app's pushes by lying. The relay wire is CBOR
+  frames (spec §3.2) over plaintext TCP; mutual-auth TLS
+  is the remaining transport-hardening item. Per-app
+  rate limiting + at-least-once retry are also follow-
+  ups (`tabellarius.md` §11.2).
 
 Each of these is a slice that can land independently;
 none of them invalidates the current shape.
@@ -537,15 +537,17 @@ fa75556 insula-manifest: add [render] [input] [ipc] [storage] [compute]
      Services / Secure Enclave) on top of the
      XChaCha20-Poly1305 file encryption already in
      place for vestibulum + tabellarius.
-   - Kernel-attested app identity for tabellarius
-     wake-on-push (SO_PEERPID + proc_pidpath, the
-     atrium-netd pattern) replacing the app's
-     self-reported `$ATRIUM_CONTAINER_DIR`.
-   - CBOR-over-mutual-TLS for the device↔relay wire
-     (`tabellarius.md` §3.2), replacing v0's
-     postcard-over-plaintext-TCP.
+   - Mutual-auth TLS for the device↔relay wire. The
+     wire is already CBOR (`tabellarius.md` §3.2); the
+     transport is still plaintext TCP — adding TLS
+     needs a device-identity cert (Vestibulum-attested)
+     and is the remaining §3.2 item.
    - Tighter SBPL via `sandbox_init_with_parameters`
      (private SPI) for per-socket grants.
+
+   (Kernel-attested wake-on-push identity and the CBOR
+   relay wire — both formerly on this list — have
+   landed.)
 
 Each of these is a self-contained slice; none
 invalidates the current shape.

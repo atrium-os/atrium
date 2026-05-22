@@ -1,13 +1,12 @@
 //! Device/publisher ↔ relay wire protocol.
 //!
-//! v0 framing: a 4-byte little-endian length prefix
-//! followed by a postcard-encoded message. The spec
-//! (`tabellarius.md` §3.2) calls for CBOR-over-mutual-
-//! TLS; v0 uses postcard because both the relay and the
-//! tabellarius daemon are ours during bring-up. The
-//! message structs below are the contract — swapping
-//! the codec later is a mechanical change confined to
-//! [`read_msg`] / [`write_msg`].
+//! Framing: a 4-byte little-endian length prefix
+//! followed by a CBOR-encoded message — the wire shape
+//! `tabellarius.md` §3.2 specifies, chosen so a
+//! third-party relay or device written in any language
+//! can interoperate. (The transport is still plaintext
+//! TCP in v0; mutual-auth TLS is the remaining §3.2
+//! hardening item.)
 //!
 //! Connection roles are implicit: a connection that
 //! sends [`ClientMsg::Subscribe`] is a *device*
@@ -70,11 +69,12 @@ pub enum RelayMsg {
 /// push blob.
 pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 
-/// Write one length-prefixed postcard frame.
+/// Write one length-prefixed CBOR frame.
 pub fn write_msg<W: Write, T: Serialize>(w: &mut W, msg: &T) -> io::Result<()> {
-    let bytes = postcard::to_stdvec(msg)
+    let mut bytes = Vec::new();
+    ciborium::into_writer(msg, &mut bytes)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData,
-            format!("encode: {e}")))?;
+            format!("cbor encode: {e}")))?;
     if bytes.len() > MAX_FRAME_LEN {
         return Err(io::Error::new(io::ErrorKind::InvalidData,
             "frame exceeds MAX_FRAME_LEN"));
@@ -84,7 +84,7 @@ pub fn write_msg<W: Write, T: Serialize>(w: &mut W, msg: &T) -> io::Result<()> {
     w.flush()
 }
 
-/// Read one length-prefixed postcard frame.
+/// Read one length-prefixed CBOR frame.
 pub fn read_msg<R: Read, T: serde::de::DeserializeOwned>(r: &mut R)
     -> io::Result<T>
 {
@@ -97,9 +97,9 @@ pub fn read_msg<R: Read, T: serde::de::DeserializeOwned>(r: &mut R)
     }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
-    postcard::from_bytes(&buf)
+    ciborium::from_reader(&buf[..])
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData,
-            format!("decode: {e}")))
+            format!("cbor decode: {e}")))
 }
 
 #[cfg(test)]
