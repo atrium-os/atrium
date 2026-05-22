@@ -100,7 +100,7 @@ the repo has no top-level workspace by convention.
 | `insula.md` §3.1 (bundle archive format) | `insula-bundle/src/archive.rs` (`INSB` v1) + `insula bundle` CLI |
 | `insula.md` §5.4 (capability-diff consent) | `insula-manifest::diff::CapabilityDiff` + `insula install --accept-changes` |
 | `tabellarius.md` §9.1 (subscribe/list/get-push ABI) | `tabellarius-macos/src/main.rs` + libatrium `atrium_tabellarius_*` |
-| `tabellarius.md` §3 (relay protocol) | `tabellarius-relay` — CBOR frames over plaintext TCP; mutual-auth TLS is the remaining §3.2 hardening item |
+| `tabellarius.md` §3 (relay protocol) | `tabellarius-relay` — CBOR frames over TCP; mutual-auth TLS module (`tls.rs`: rustls + self-signed certs + key pinning) built + tested, daemon wiring is the remaining slice |
 | `tabellarius.md` §4.2 (wake-on-push) | `tabellarius-macos/src/relay_client.rs` — `$INSULA_TABELLARIUSD_WAKE_CMD` hook |
 | `insula.md` §6 (windowed UI / Pergola) | libatrium `atrium_window_*` (open/destroy/fill_rect/frame_begin/frame_rect/frame_end/poll_event) → CLASS_DISPLAY → external Fresco scene server (frescod) |
 | `insula-host-macos.md` §2 (SBPL generation) | `insula-host-macos/src/sbpl.rs` |
@@ -537,11 +537,15 @@ fa75556 insula-manifest: add [render] [input] [ipc] [storage] [compute]
      Services / Secure Enclave) on top of the
      XChaCha20-Poly1305 file encryption already in
      place for vestibulum + tabellarius.
-   - Mutual-auth TLS for the device↔relay wire. The
-     wire is already CBOR (`tabellarius.md` §3.2); the
-     transport is still plaintext TCP — adding TLS
-     needs a device-identity cert (Vestibulum-attested)
-     and is the remaining §3.2 item.
+   - Mutual-auth TLS for the device↔relay wire — *in
+     progress*. The `tabellarius-relay::tls` module
+     (rustls, self-signed certs, public-key pinning) is
+     built + tested; the remaining slice wires it into
+     the relay daemon + device daemon, which requires
+     converting both connection handlers from the
+     `try_clone`-based reader/writer-thread split to a
+     single-threaded poll loop (a single TLS stream
+     can't be split across two threads).
    - Tighter SBPL via `sandbox_init_with_parameters`
      (private SPI) for per-socket grants.
 
