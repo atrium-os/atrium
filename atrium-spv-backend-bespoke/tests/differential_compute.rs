@@ -4060,6 +4060,97 @@ fn differential_workgroup_shared_memory_accumulator() {
 }
 
 #[test]
+fn differential_workgroup_shared_array() {
+    // `shared uint tile[4];` -- each invocation writes
+    // `tile[lid] = lid + 1`, then `ssbo[lid] = tile[lid] +
+    // tile[0]`.  Serial execution means invocation 0 sets
+    // tile[0]=1 first, so every later invocation's tile[0]
+    // read sees 1.  Result: ssbo == [2, 3, 4, 5].  Exercises
+    // a workgroup-storage ARRAY (dynamic + constant index).
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration,
+        ExecutionMode, ExecutionModel, FunctionControl,
+        MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let v3u    = b.type_vector(u32_ty, 3);
+    let void_fn = b.type_function(void, vec![]);
+    // SSBO output (runtime array).
+    let rt = b.type_runtime_array(u32_ty);
+    b.decorate(rt, Decoration::ArrayStride, vec![rspirv::dr::Operand::LiteralBit32(4)]);
+    let s = b.type_struct(vec![rt]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_u_ssbo = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+    let ssbo = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    // Workgroup-shared uint[4].
+    let c_four = b.constant_bit32(u32_ty, 4);
+    let arr_ty = b.type_array(u32_ty, c_four);
+    let ptr_arr_wg = b.type_pointer(None, StorageClass::Workgroup, arr_ty);
+    let tile = b.variable(ptr_arr_wg, None, StorageClass::Workgroup, None);
+    let ptr_u_wg = b.type_pointer(None, StorageClass::Workgroup, u32_ty);
+    // LocalInvocationId builtin.
+    let ptr_v3u_in = b.type_pointer(None, StorageClass::Input, v3u);
+    let lid_var = b.variable(ptr_v3u_in, None, StorageClass::Input, None);
+    b.decorate(lid_var, Decoration::BuiltIn,
+        vec![rspirv::dr::Operand::BuiltIn(BuiltIn::LocalInvocationId)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    let c_one  = b.constant_bit32(u32_ty, 1);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    // lid_x
+    let lid_vec = b.load(v3u, None, lid_var, None, vec![]).unwrap();
+    let lid_x = b.composite_extract(u32_ty, None, lid_vec, vec![0]).unwrap();
+    // tile[lid_x] = lid_x + 1
+    let lidp1 = b.i_add(u32_ty, None, lid_x, c_one).unwrap();
+    let tile_k = b.access_chain(ptr_u_wg, None, tile, vec![lid_x]).unwrap();
+    b.store(tile_k, lidp1, None, vec![]).unwrap();
+    // v_k = tile[lid_x]
+    let tile_k2 = b.access_chain(ptr_u_wg, None, tile, vec![lid_x]).unwrap();
+    let v_k = b.load(u32_ty, None, tile_k2, None, vec![]).unwrap();
+    // v_0 = tile[0]
+    let tile_0 = b.access_chain(ptr_u_wg, None, tile, vec![c_zero]).unwrap();
+    let v_0 = b.load(u32_ty, None, tile_0, None, vec![]).unwrap();
+    // sum = v_k + v_0
+    let sum = b.i_add(u32_ty, None, v_k, v_0).unwrap();
+    // ssbo[lid_x] = sum
+    let dst = b.access_chain(ptr_u_ssbo, None, ssbo, vec![c_zero, lid_x]).unwrap();
+    b.store(dst, sum, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo, tile, lid_var]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [4u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spv = Vec::with_capacity(words.len() * 4);
+    for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+
+    let dir = TempDir::new().unwrap();
+    let mut b_buf = vec![0u8; 16];
+    let mut c_buf = vec![0u8; 16];
+    let lids: Vec<(u32, u32, u32)> =
+        (0..4u32).map(|i| (i, 0, 0)).collect();
+    invoke_cs_main_with_lids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &lids);
+    invoke_cs_main_with_lids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &lids);
+    assert_eq!(b_buf, c_buf,
+        "bespoke vs cranelift diverge on workgroup shared array");
+    for i in 0..4u32 {
+        let v = u32::from_le_bytes(
+            b_buf[(i as usize)*4..(i as usize)*4+4].try_into().unwrap());
+        assert_eq!(v, i + 2,
+            "ssbo[{i}] = tile[{i}]+tile[0] should be {}; got {v}", i + 2);
+    }
+}
+
+#[test]
 fn differential_local_invocation_index_linearises() {
     let spv = build_local_index_cs();
     let dir = TempDir::new().unwrap();

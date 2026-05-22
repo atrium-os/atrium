@@ -973,14 +973,17 @@ specifically supports:
   ShiftLeft/RightLogical/RightArithmetic, BitReverse,
   BitCount (SWAR popcount synthesised at IR level).
 - Workgroup-shared memory: `StorageClass::Workgroup`
-  OpVariables (scalar + vector pointees) are packed into a
-  per-workgroup scratch buffer; the frontend records each
-  var's byte offset (`Function::workgroup_var_offset`) and
-  the total size (`Function::workgroup_size`).  The
-  dispatcher allocates one buffer per worker thread, zeroes
-  it per workgroup, and passes its base as the 10th cs_main
-  argument (`workgroup_buf`, AAPCS64 stack slot SP+8).
-  Arrays/structs in Workgroup storage are a documented gap.
+  OpVariables are packed into a per-workgroup scratch
+  buffer; the frontend records each var's byte offset
+  (`Function::workgroup_var_offset`) and the total size
+  (`Function::workgroup_size`).  `aggregate_type_size`
+  sizes scalars, vectors, arrays, matrices and structs
+  recursively (array lengths resolved from their OpConstant).
+  The dispatcher allocates one buffer per worker thread,
+  zeroes it per workgroup, and passes its base as the 10th
+  cs_main argument (`workgroup_buf`, AAPCS64 stack slot
+  SP+8).  Array indexing rides the existing AccessChain +
+  Op::PtrOffsetDynamic path.
 - Barriers (ControlBarrier, MemoryBarrier) — no-ops: the
   dispatcher runs a workgroup's invocations serially on one
   thread, so the causal order is already total within a

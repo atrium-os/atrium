@@ -496,11 +496,12 @@ fn scan_spirv_ssbo_binding_count(spirv: &[u8]) -> u32 {
 /// `Workgroup`-storage variables -- the per-workgroup
 /// scratch buffer the dispatcher must allocate.
 ///
-/// Mirrors the frontend's `ir_type_size_bytes_for` +
-/// workgroup-var packing in `interface.rs`: scalar and
-/// vector pointees are sized; arrays/structs (size 0 in the
-/// frontend today) contribute nothing.  Offsets are packed
-/// with each var aligned to `size.min(16).max(4)`.
+/// Mirrors the frontend's `aggregate_type_size` +
+/// workgroup-var packing in `interface.rs`: scalar, vector,
+/// array, matrix and struct pointees are all sized via a
+/// single forward pass (SPIR-V requires types + constants to
+/// be defined before use).  Offsets are packed with each var
+/// aligned to `size.min(16).max(4)`.
 fn scan_spirv_workgroup_size(spirv: &[u8]) -> u32 {
     if spirv.len() < 20 || spirv.len() % 4 != 0 { return 0; }
     let magic = u32::from_le_bytes(spirv[0..4].try_into().unwrap());
@@ -508,8 +509,11 @@ fn scan_spirv_workgroup_size(spirv: &[u8]) -> u32 {
     let word_at = |off: usize| -> u32 {
         u32::from_le_bytes(spirv[off..off + 4].try_into().unwrap())
     };
-    // type id -> byte size (scalar/vector only).
+    // type id -> byte size (scalar/vector/array/matrix/struct).
     let mut type_size: std::collections::HashMap<u32, u32> =
+        std::collections::HashMap::new();
+    // OpConstant id -> integer literal value (array lengths).
+    let mut const_val: std::collections::HashMap<u32, u32> =
         std::collections::HashMap::new();
     // Workgroup pointer type id -> pointee type id.
     let mut wg_ptr_pointee: std::collections::HashMap<u32, u32> =
@@ -544,6 +548,43 @@ fn scan_spirv_workgroup_size(spirv: &[u8]) -> u32 {
                 if let Some(&cs) = type_size.get(&comp) {
                     type_size.insert(id, cs * count);
                 }
+            }
+            // OpTypeMatrix = 24: <id, column_type, count>
+            24 if word_count >= 4 => {
+                let id = word_at(cursor + 4);
+                let col = word_at(cursor + 8);
+                let count = word_at(cursor + 12);
+                if let Some(&cs) = type_size.get(&col) {
+                    type_size.insert(id, cs * count);
+                }
+            }
+            // OpTypeArray = 28: <id, element_type, length_id>
+            28 if word_count >= 4 => {
+                let id = word_at(cursor + 4);
+                let elem = word_at(cursor + 8);
+                let len_id = word_at(cursor + 12);
+                if let (Some(&es), Some(&n)) =
+                    (type_size.get(&elem), const_val.get(&len_id))
+                {
+                    type_size.insert(id, es.saturating_mul(n));
+                }
+            }
+            // OpTypeStruct = 30: <id, member0, member1, ...>
+            30 if word_count >= 2 => {
+                let id = word_at(cursor + 4);
+                let mut sum = 0u32;
+                for w in 2..word_count {
+                    let member = word_at(cursor + w * 4);
+                    sum = sum.saturating_add(
+                        type_size.get(&member).copied().unwrap_or(0));
+                }
+                type_size.insert(id, sum);
+            }
+            // OpConstant = 43: <result_type, result_id, value>
+            43 if word_count >= 4 => {
+                let id = word_at(cursor + 8);
+                let val = word_at(cursor + 12);
+                const_val.insert(id, val);
             }
             // OpTypePointer = 32: <id, storage_class, type_id>
             32 if word_count >= 4 => {
@@ -9003,6 +9044,43 @@ mod tests {
         // scalar (4) then uvec4 (aligned to 16) -> 4 padded
         // to 16, + 16 = 32.
         assert_eq!(scan_spirv_workgroup_size(&build(&[1, 4])), 32);
+    }
+
+    #[test]
+    fn workgroup_size_scanner_handles_arrays() {
+        use rspirv::binary::Assemble;
+        use rspirv::spirv::{
+            AddressingModel, Capability, ExecutionMode, ExecutionModel,
+            FunctionControl, MemoryModel, StorageClass,
+        };
+        // `shared uint tile[n];` -> 4*n bytes.
+        let build = |n: u32| -> Vec<u8> {
+            let mut b = rspirv::dr::Builder::new();
+            b.set_version(1, 3);
+            b.capability(Capability::Shader);
+            b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+            let void   = b.type_void();
+            let u32_ty = b.type_int(32, 0);
+            let void_fn = b.type_function(void, vec![]);
+            let c_n = b.constant_bit32(u32_ty, n);
+            let arr = b.type_array(u32_ty, c_n);
+            let ptr = b.type_pointer(None, StorageClass::Workgroup, arr);
+            b.variable(ptr, None, StorageClass::Workgroup, None);
+            let main = b.begin_function(
+                void, None, FunctionControl::NONE, void_fn).unwrap();
+            b.begin_block(None).unwrap();
+            b.ret().unwrap();
+            b.end_function().unwrap();
+            b.entry_point(ExecutionModel::GLCompute, main, "main", vec![]);
+            b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+            let words: Vec<u32> = b.module().assemble();
+            let mut bytes = Vec::with_capacity(words.len() * 4);
+            for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+            bytes
+        };
+        assert_eq!(scan_spirv_workgroup_size(&build(4)), 16);
+        assert_eq!(scan_spirv_workgroup_size(&build(64)), 256);
+        assert_eq!(scan_spirv_workgroup_size(&build(1)), 4);
     }
 
     #[test]

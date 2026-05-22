@@ -392,13 +392,12 @@ impl InterfaceContext {
                 SpvStorageClass::Workgroup => {
                     // Each Workgroup variable consumes its
                     // type's byte size in a per-workgroup
-                    // scratch buffer.  Offsets are assigned
-                    // in declaration order with each var
-                    // aligned to its natural size.
-                    let size = ir_type_size_bytes_for(&types.types, *pointee_id);
-                    // Align to the larger of 4 bytes or
-                    // size (capped at 16 for vec4-shaped
-                    // arrays/structs).
+                    // scratch buffer.  `aggregate_type_size`
+                    // handles scalars, vectors, arrays,
+                    // matrices and structs.  Offsets are
+                    // assigned in declaration order, each var
+                    // aligned to min(size,16).max(4).
+                    let size = aggregate_type_size(module, types, *pointee_id);
                     let align = size.min(16).max(4);
                     let aligned = (ctx.workgroup_size + align - 1) & !(align - 1);
                     ctx.workgroup_var_offset.insert(*var_id, aligned);
@@ -476,6 +475,83 @@ pub(crate) fn ir_type_size_bytes_for(
         Some(Type::Vec2(_)) => 8,
         Some(Type::Vec3(_)) => 12,
         Some(Type::Vec4(_)) => 16,
+        _ => 0,
+    }
+}
+
+/// Look up an `OpConstant`'s integer literal value by its
+/// result id.  Scans `module.types_global_values` (constants
+/// and types share that section).  Returns `None` for
+/// non-integer or non-constant ids.
+fn constant_u32_value(module: &Module, id: Word) -> Option<u32> {
+    for inst in &module.types_global_values {
+        if inst.class.opcode != SpvOp::Constant { continue; }
+        if inst.result_id != Some(id) { continue; }
+        // OpConstant operand 0 is the literal value.
+        return match inst.operands.first() {
+            Some(Operand::LiteralBit32(v)) => Some(*v),
+            Some(Operand::LiteralBit64(v)) => Some(*v as u32),
+            _ => None,
+        };
+    }
+    None
+}
+
+/// Recursively compute the byte size of an arbitrary SPIR-V
+/// type for workgroup-storage layout.  Handles scalars and
+/// vectors (via [`ir_type_size_bytes_for`]) plus aggregates:
+///   - `OpTypeArray`: element_size × constant length,
+///   - `OpTypeMatrix`: column_size × column count,
+///   - `OpTypeStruct`: sum of member sizes (packed; matches
+///     the workgroup buffer's no-padding layout).
+/// Returns 0 for `OpTypeRuntimeArray` (unsized -- not valid
+/// in Workgroup storage) and anything unrecognised.
+pub(crate) fn aggregate_type_size(
+    module: &Module,
+    types: &TypeContext,
+    type_id: Word,
+) -> u32 {
+    // Scalar / vector fast path.
+    let leaf = ir_type_size_bytes_for(&types.types, type_id);
+    if leaf > 0 { return leaf; }
+    // Aggregate: consult the raw OpType* instruction.
+    let raw = match types.get_raw(type_id) { Ok(r) => r, Err(_) => return 0 };
+    match raw.class.opcode {
+        SpvOp::TypeArray => {
+            // operands: [element_type_id, length_const_id]
+            let elem = match raw.operands.first() {
+                Some(Operand::IdRef(id)) => *id,
+                _ => return 0,
+            };
+            let len_id = match raw.operands.get(1) {
+                Some(Operand::IdRef(id)) => *id,
+                _ => return 0,
+            };
+            let count = constant_u32_value(module, len_id).unwrap_or(0);
+            aggregate_type_size(module, types, elem).saturating_mul(count)
+        }
+        SpvOp::TypeMatrix => {
+            // operands: [column_type_id, column_count]
+            let col = match raw.operands.first() {
+                Some(Operand::IdRef(id)) => *id,
+                _ => return 0,
+            };
+            let count = match raw.operands.get(1) {
+                Some(Operand::LiteralBit32(c)) => *c,
+                _ => return 0,
+            };
+            aggregate_type_size(module, types, col).saturating_mul(count)
+        }
+        SpvOp::TypeStruct => {
+            let mut total = 0u32;
+            for op in &raw.operands {
+                if let Operand::IdRef(member_ty) = op {
+                    total = total.saturating_add(
+                        aggregate_type_size(module, types, *member_ty));
+                }
+            }
+            total
+        }
         _ => 0,
     }
 }
