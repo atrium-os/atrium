@@ -948,6 +948,107 @@ pub extern "C" fn atrium_tabellarius_count() -> c_int {
     n as c_int
 }
 
+/// Recommended minimum size for the `ciphertext_out`
+/// buffer passed to [`atrium_tabellarius_get_push`].
+/// Push blobs above this are unusual; an app that
+/// passes a smaller buffer risks a truncated read.
+pub const ATRIUM_TABELLARIUS_MAX_PUSH: usize = 65536;
+
+/// Header populated by [`atrium_tabellarius_get_push`].
+///
+/// `key_id` is the NUL-terminated subscription id the
+/// push is addressed to (the same id
+/// `atrium_tabellarius_subscribe` returned).
+/// `ciphertext_len` is the *true* blob length even when
+/// it exceeds the caller's buffer — a caller seeing
+/// `ciphertext_len > cap` knows the read was truncated.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct AtriumPushHeader {
+    pub key_id: [c_char; 64],
+    pub timestamp: u64,
+    pub ciphertext_len: u32,
+}
+
+/// Drain the next queued push for this device.
+///
+/// Returns:
+///   - `1`  — a push was written: `*hdr` is populated
+///     and up to `ciphertext_cap` bytes of the blob are
+///     copied into `ciphertext_out`.
+///   - `0`  — the device's push queue is empty.
+///   - [`ATRIUM_ERR_NO_TABELLARIUS`] — daemon unreachable.
+///   - [`ATRIUM_ERR_TABELLARIUS_RPC`] — malformed reply.
+///   - [`ATRIUM_ERR_INVALID_PATH`] — `hdr` or
+///     `ciphertext_out` is NULL.
+///
+/// Each call pops one push (at-most-once — see
+/// `tabellarius.md` §3.2; retry-on-no-ack is future
+/// work). Decryption is the app's job: hand
+/// `key_id` + the ciphertext to
+/// `atrium_keychain_*` / Vestibulum.
+///
+/// # Safety
+///
+/// `hdr` must be a writable [`AtriumPushHeader`];
+/// `ciphertext_out` must be writable for
+/// `ciphertext_cap` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn atrium_tabellarius_get_push(
+    hdr: *mut AtriumPushHeader,
+    ciphertext_out: *mut u8,
+    ciphertext_cap: usize,
+) -> c_int {
+    if hdr.is_null() || ciphertext_out.is_null() {
+        return ATRIUM_ERR_INVALID_PATH;
+    }
+    let Some(mut conn) = tabellarius_connect() else {
+        return ATRIUM_ERR_NO_TABELLARIUS;
+    };
+    let Some(resp) = tabellarius_rpc(&mut conn, 3, &[]) else {
+        return ATRIUM_ERR_TABELLARIUS_RPC;
+    };
+    if resp.is_empty() {
+        return ATRIUM_ERR_TABELLARIUS_RPC;
+    }
+    match resp[0] {
+        1 => 0, // queue empty
+        0 => {
+            // [0 | u8 id_len | key_id | u64 ts LE | blob]
+            if resp.len() < 2 {
+                return ATRIUM_ERR_TABELLARIUS_RPC;
+            }
+            let id_len = resp[1] as usize;
+            if id_len >= 64 || resp.len() < 2 + id_len + 8 {
+                return ATRIUM_ERR_TABELLARIUS_RPC;
+            }
+            let key_id = &resp[2..2 + id_len];
+            let ts_off = 2 + id_len;
+            let ts = u64::from_le_bytes(
+                resp[ts_off..ts_off + 8].try_into().unwrap()
+            );
+            let blob = &resp[ts_off + 8..];
+
+            let mut header = AtriumPushHeader {
+                key_id: [0; 64],
+                timestamp: ts,
+                ciphertext_len: blob.len() as u32,
+            };
+            for (i, b) in key_id.iter().enumerate() {
+                header.key_id[i] = *b as c_char;
+            }
+            // key_id is < 64 (checked above), so index
+            // id_len is in range and stays 0 = NUL.
+            std::ptr::write(hdr, header);
+
+            let n = blob.len().min(ciphertext_cap);
+            std::ptr::copy_nonoverlapping(blob.as_ptr(), ciphertext_out, n);
+            1
+        }
+        _ => ATRIUM_ERR_TABELLARIUS_RPC,
+    }
+}
+
 // =====================================================
 // Fresco — window-management (open / destroy a top-level
 // window via the scene server). The first Pergola-shaped

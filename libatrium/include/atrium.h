@@ -167,6 +167,23 @@ int32_t atrium_tabellarius_unsubscribe(const char* key_id);
  * Returns the count on success, negative on error. */
 int32_t atrium_tabellarius_count(void);
 
+/* Recommended minimum ciphertext buffer size. */
+#define ATRIUM_TABELLARIUS_MAX_PUSH  65536
+
+typedef struct {
+    char     key_id[64];      /* NUL-terminated */
+    uint64_t timestamp;
+    uint32_t ciphertext_len;  /* true length, even if > cap */
+} atrium_push_header_t;
+
+/* Drain the next queued push. Returns 1 (push written),
+ * 0 (queue empty), or negative on error. On 1, *hdr is
+ * filled and up to ciphertext_cap blob bytes are copied
+ * to ciphertext_out. */
+int32_t atrium_tabellarius_get_push(
+    atrium_push_header_t* hdr,
+    uint8_t* ciphertext_out, size_t ciphertext_cap);
+
 /* -----------------------------------------------------------
  * Window — open / destroy a top-level window via Fresco.
  * v0 surface: scene-graph emission for painting into the

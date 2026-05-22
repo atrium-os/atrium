@@ -186,6 +186,108 @@ fn push_flows_relay_to_daemon_to_get_push() {
 }
 
 #[test]
+fn push_drains_through_libatrium_get_push_abi() {
+    let _guard = ENV_LOCK.lock().unwrap();
+
+    let (mut relay, relay_addr) = spawn_relay();
+    let tmp = tempfile::tempdir().unwrap();
+    let sock = tmp.path().join("tbd.sock");
+    let store = tmp.path().join("subs");
+
+    let mut daemon = Command::new(tabellarius_binary())
+        .env("INSULA_TABELLARIUSD_SOCKET", &sock)
+        .env("INSULA_TABELLARIUSD_STORE", &store)
+        .env("INSULA_TABELLARIUSD_RELAY", &relay_addr)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn tabellarius-macos");
+    wait_for_socket(&sock, Duration::from_secs(3));
+
+    std::env::set_var("ATRIUM_TABELLARIUS_SOCKET", &sock);
+
+    // Subscribe.
+    let purpose = CString::new("abi-test").unwrap();
+    let mut key_id_buf = [0i8; 64];
+    let mut pubkey = [0u8; 32];
+    let n = unsafe {
+        atrium::atrium_tabellarius_subscribe(
+            purpose.as_ptr(),
+            key_id_buf.as_mut_ptr(), key_id_buf.len(),
+            pubkey.as_mut_ptr(),
+        )
+    };
+    assert!(n > 0);
+    let key_id = unsafe {
+        std::ffi::CStr::from_ptr(key_id_buf.as_ptr())
+    }.to_string_lossy().into_owned();
+
+    thread::sleep(Duration::from_millis(250));
+
+    // Publish.
+    let mut publisher = TcpStream::connect(&relay_addr).unwrap();
+    let blob = b"abi-delivered-ciphertext".to_vec();
+    write_msg(&mut publisher, &ClientMsg::Publish {
+        to_key: pubkey, blob: blob.clone(), ttl_secs: 60,
+    }).unwrap();
+    let mut pr = BufReader::new(publisher.try_clone().unwrap());
+    assert!(matches!(
+        read_msg::<_, RelayMsg>(&mut pr).unwrap(),
+        RelayMsg::PublishAccepted { delivered: 1, .. }
+    ));
+
+    thread::sleep(Duration::from_millis(250));
+
+    // Drain via the libatrium ABI rather than raw aqueduct.
+    let mut hdr = atrium::AtriumPushHeader {
+        key_id: [0; 64], timestamp: 0, ciphertext_len: 0,
+    };
+    let mut buf = vec![0u8; atrium::ATRIUM_TABELLARIUS_MAX_PUSH];
+    let rc = unsafe {
+        atrium::atrium_tabellarius_get_push(
+            &mut hdr, buf.as_mut_ptr(), buf.len(),
+        )
+    };
+    assert_eq!(rc, 1, "expected a push from the ABI; got {}", rc);
+
+    let got_key_id = unsafe {
+        std::ffi::CStr::from_ptr(hdr.key_id.as_ptr())
+    }.to_string_lossy().into_owned();
+    assert_eq!(got_key_id, key_id);
+    assert_eq!(hdr.ciphertext_len as usize, blob.len());
+    assert!(hdr.timestamp > 0, "push should carry a timestamp");
+    assert_eq!(&buf[..blob.len()], blob.as_slice());
+
+    // Second call: queue empty -> 0.
+    let rc2 = unsafe {
+        atrium::atrium_tabellarius_get_push(
+            &mut hdr, buf.as_mut_ptr(), buf.len(),
+        )
+    };
+    assert_eq!(rc2, 0, "second get_push should report empty");
+
+    std::env::remove_var("ATRIUM_TABELLARIUS_SOCKET");
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    let _ = relay.kill();
+    let _ = relay.wait();
+}
+
+#[test]
+fn get_push_abi_with_no_socket_errors() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    std::env::remove_var("ATRIUM_TABELLARIUS_SOCKET");
+    let mut hdr = atrium::AtriumPushHeader {
+        key_id: [0; 64], timestamp: 0, ciphertext_len: 0,
+    };
+    let mut buf = [0u8; 64];
+    let rc = unsafe {
+        atrium::atrium_tabellarius_get_push(&mut hdr, buf.as_mut_ptr(), buf.len())
+    };
+    assert_eq!(rc, atrium::ATRIUM_ERR_NO_TABELLARIUS);
+}
+
+#[test]
 fn get_push_on_empty_queue_reports_empty() {
     let _guard = ENV_LOCK.lock().unwrap();
 
