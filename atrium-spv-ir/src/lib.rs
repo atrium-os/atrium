@@ -182,6 +182,10 @@ pub enum StorageClass {
     Private,
     /// Compute-shader workgroup-shared.
     Workgroup,
+    /// Pointer into a storage-image texel, produced by
+    /// `OpImageTexelPointer`. The pointee is one image
+    /// texel; the only legal consumers are atomic ops.
+    Image,
 }
 
 /// Image dimensionality. Maps to SPIR-V's `Dim` operand.
@@ -720,6 +724,19 @@ pub enum Op {
         coord: Value,
         /// vec4 texel value to store.
         texel: Value,
+    },
+    /// Compute a pointer to a single texel of a storage
+    /// image (`OpImageTexelPointer`).  The result is a
+    /// pointer Value that `Atomic*` ops then operate on --
+    /// this is how `imageAtomicAdd` / `imageAtomicExchange`
+    /// etc. are expressed.  The texel is treated as a 32-bit
+    /// integer cell (the only width SPIR-V allows for image
+    /// atomics).
+    ImageTexelPointer {
+        /// Storage-image descriptor handle.
+        image: Value,
+        /// Integer coords (ivec2 / uvec2 for a 2D image).
+        coord: Value,
     },
 
     // ── Fragment derivatives ───────────────────────────────────

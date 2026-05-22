@@ -1459,6 +1459,68 @@ fn translate_inst(
             Ok(())
         }
 
+        // OpImageTexelPointer: form a pointer to a single
+        // storage-image texel so a subsequent atomic op can
+        // read-modify-write it.  Operands:
+        //   <result_type> <result_id> <image> <coord> <sample>
+        // Per the SPIR-V spec the `image` operand is the image
+        // *variable* (an OpTypePointer to OpTypeImage), not a
+        // loaded image — so unlike ImageRead/Write we must
+        // synthesise the `Op::ImageHandle` here from the
+        // variable's (set, binding).  (A loaded image already
+        // in `id_map` is also accepted for robustness.)
+        // `sample` is 0 for non-MSAA images and ignored.
+        SpvOp::ImageTexelPointer => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed(
+                    "ImageTexelPointer without result id".to_string()))?;
+            let result_type_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed(
+                    "ImageTexelPointer without result type".to_string()))?;
+            let result_ty = types.get(result_type_id)?.clone();
+            let img_id   = expect_id(&spv_inst.operands, 0)?;
+            let coord_id = expect_id(&spv_inst.operands, 1)?;
+            let image = match id_map.get(&img_id).cloned() {
+                Some(v) => v,
+                None => {
+                    let (set, binding) = iface.var_binding.get(&img_id)
+                        .copied()
+                        .ok_or_else(|| FrontendError::Malformed(format!(
+                            "ImageTexelPointer image variable {img_id} \
+                             missing DescriptorSet+Binding decorations")))?;
+                    // Result type of the synthetic ImageHandle is
+                    // the variable's pointee (OpTypeImage) type.
+                    let img_ty = iface.variables.get(&img_id)
+                        .and_then(|(_, pointee)|
+                            types.get(*pointee).ok().cloned())
+                        .ok_or_else(|| FrontendError::Malformed(format!(
+                            "ImageTexelPointer image variable {img_id} \
+                             type not found")))?;
+                    let handle = Value {
+                        id: ValueId(*next_value_id),
+                        ty: img_ty,
+                    };
+                    *next_value_id += 1;
+                    insts.push(Inst {
+                        op: Op::ImageHandle { set, binding },
+                        result: Some(handle.clone()),
+                        source_spirv_offset,
+                    });
+                    handle
+                }
+            };
+            let coord = resolve_value(coord_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            let result = alloc_or_get_result(
+                result_id, result_ty, id_map, next_value_id);
+            insts.push(Inst {
+                op: Op::ImageTexelPointer { image, coord },
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
+
         // OpAtomicIAdd: <result_type> <result_id> <pointer>
         //               <memory_scope> <memory_semantics> <value>
         // Memory scope + semantics are parsed but ignored:

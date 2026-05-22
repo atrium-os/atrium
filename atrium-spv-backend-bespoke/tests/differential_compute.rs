@@ -4203,6 +4203,102 @@ fn differential_storage_image_write() {
 }
 
 #[test]
+fn differential_storage_image_atomic_add() {
+    // imageAtomicAdd: each invocation forms a texel pointer
+    // via OpImageTexelPointer into an R32 storage image and
+    // atomicAdd's 1 into it.  Every texel of a 2×2 image is
+    // visited 3 times, so each ends at (initial + 3).  The
+    // OpImageTexelPointer path is bespoke-only (Cranelift's
+    // aarch64 backend can't form the Image-class pointer), so
+    // the oracle is the hand-computed final buffer.
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, Dim,
+        ExecutionMode, ExecutionModel, FunctionControl, ImageFormat,
+        MemoryModel, MemorySemantics, Scope, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let v3u    = b.type_vector(u32_ty, 3);
+    let v2u    = b.type_vector(u32_ty, 2);
+    let void_fn = b.type_function(void, vec![]);
+    // Storage image: 2D, u32 sampled type, sampled=2, R32ui.
+    let img_ty = b.type_image(u32_ty, Dim::Dim2D, 0, 0, 0, 2,
+        ImageFormat::R32ui, None);
+    let ptr_img = b.type_pointer(None, StorageClass::UniformConstant, img_ty);
+    let img_var = b.variable(ptr_img, None, StorageClass::UniformConstant, None);
+    b.decorate(img_var, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(img_var, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    // Pointer-to-texel type (StorageClass Image).
+    let ptr_texel = b.type_pointer(None, StorageClass::Image, u32_ty);
+    // GlobalInvocationId.
+    let ptr_v3u_in = b.type_pointer(None, StorageClass::Input, v3u);
+    let gid_var = b.variable(ptr_v3u_in, None, StorageClass::Input, None);
+    b.decorate(gid_var, Decoration::BuiltIn,
+        vec![rspirv::dr::Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+    let c_zero  = b.constant_bit32(u32_ty, 0);
+    let c_one   = b.constant_bit32(u32_ty, 1);
+    let c_scope = b.constant_bit32(u32_ty, Scope::Device as u32);
+    let c_sem   = b.constant_bit32(u32_ty,
+        MemorySemantics::ATOMIC_COUNTER_MEMORY.bits());
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let gid = b.load(v3u, None, gid_var, None, vec![]).unwrap();
+    let gx = b.composite_extract(u32_ty, None, gid, vec![0]).unwrap();
+    let gy = b.composite_extract(u32_ty, None, gid, vec![1]).unwrap();
+    let coord = b.composite_construct(v2u, None, vec![gx, gy]).unwrap();
+    // ptr = OpImageTexelPointer(img_var, coord, sample=0)
+    let texel_ptr = b.image_texel_pointer(ptr_texel, None,
+        img_var, coord, c_zero).unwrap();
+    // atomicAdd(*ptr, 1)
+    let _ = b.atomic_i_add(u32_ty, None, texel_ptr,
+        c_scope, c_sem, c_one).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main",
+        vec![img_var, gid_var]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spv = Vec::with_capacity(words.len() * 4);
+    for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+
+    let (w, h) = (2u32, 2u32);
+    // Each texel visited 3 times.
+    let mut gids: Vec<(u32, u32, u32)> = Vec::new();
+    for _ in 0..3 {
+        for y in 0..h { for x in 0..w { gids.push((x, y, 0)); } }
+    }
+    // Prefill: texel(x,y) = y*w + x.
+    let mut img = vec![0u8; (w * h * 4) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            let off = ((y * w + x) * 4) as usize;
+            img[off..off + 4].copy_from_slice(&(y * w + x).to_le_bytes());
+        }
+    }
+    let dir = TempDir::new().unwrap();
+    // format=1 (R32) -> 4 bytes/texel.
+    invoke_compute_image(&spv, true, dir.path(), "b",
+        &mut img, w, h, 1, &gids);
+    for y in 0..h {
+        for x in 0..w {
+            let off = ((y * w + x) * 4) as usize;
+            let got = u32::from_le_bytes(
+                img[off..off + 4].try_into().unwrap());
+            let want = y * w + x + 3;
+            assert_eq!(got, want,
+                "texel ({x},{y}): got {got}, want {want}");
+        }
+    }
+}
+
+#[test]
 fn differential_glsl_pack_unpack_half2x16() {
     // packHalf2x16(vec2(a,b)) -> u32, then unpackHalf2x16
     // back to vec2.  Inputs chosen exactly representable in

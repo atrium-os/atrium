@@ -1101,7 +1101,8 @@ fn emit_function(
     // which saves the caller's X19 before our `mov x19, x0`.
     let uses_storage_image = func.blocks.values().any(|b|
         b.insts.iter().any(|i| matches!(&i.op,
-            Op::ImageRead { .. } | Op::ImageWrite { .. })));
+            Op::ImageRead { .. } | Op::ImageWrite { .. }
+            | Op::ImageTexelPointer { .. })));
     if uses_storage_image {
         int_pool.free.retain(|&r| r != 19);
         int_pool.used_callee_saved = true;
@@ -3315,6 +3316,65 @@ fn emit_function(
 
                 vectors.insert(result.id, lane_vals);
             }
+            // OpImageTexelPointer — produce a raw byte pointer
+            // to a storage-image texel so a subsequent atomic
+            // op can read-modify-write it in place.  No helper
+            // call: the address is computed inline from the
+            // X19-anchored ImageDesc (data @0, stride @16):
+            //   texel_addr = data + y*stride_bytes + x*4
+            // The result Value is registered in `pointers` as
+            // (Xreg, 0); the LSE atomic arm then resolves it
+            // via resolve_or_make_pointer with no relocation.
+            Op::ImageTexelPointer { image, coord } => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "ImageTexelPointer without result".into()))?;
+                let (_, binding) = image_handles.get(&image.id)
+                    .copied()
+                    .ok_or_else(|| BackendError::Internal(format!(
+                        "ImageTexelPointer image {:?} not an ImageHandle",
+                        image.id)))?;
+                let coord_lanes = vectors.get(&coord.id).cloned()
+                    .ok_or_else(|| BackendError::Internal(format!(
+                        "ImageTexelPointer coord {:?} not a vector",
+                        coord.id)))?;
+                if coord_lanes.len() < 2 {
+                    return Err(BackendError::Unsupported(format!(
+                        "ImageTexelPointer 2D coord must have ≥2 lanes, \
+                         got {}", coord_lanes.len())));
+                }
+                let x_w = *ints.get(&coord_lanes[0].id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "ImageTexelPointer coord lane 0 {:?} not in ints",
+                        coord_lanes[0].id)))?;
+                let y_w = *ints.get(&coord_lanes[1].id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "ImageTexelPointer coord lane 1 {:?} not in ints",
+                        coord_lanes[1].id)))?;
+                // ImageDesc* lives at [X19, #16 + binding*8].
+                let desc_off: u16 = 16 + (binding as u16) * 8;
+                let dst_w = int_pool.alloc(result.id)?;
+                let dst_x = asm::Xreg(dst_w.0);
+                let x9 = asm::Xreg(9);
+                let w9 = asm::Wreg(9);
+                let w10 = asm::Wreg(10);
+                let x10 = asm::Xreg(10);
+                // x9 = ImageDesc*
+                a.emit(asm::ldr_x_offset(x9, asm::Xreg(19), desc_off));
+                // dst = data pointer (ImageDesc.data @ #0)
+                a.emit(asm::ldr_x_offset(dst_x, x9, 0));
+                // w10 = stride_bytes (ImageDesc.stride_bytes @ #16)
+                a.emit(asm::ldr_w_offset(w10, x9, 16));
+                // w10 = y * stride_bytes
+                a.emit(asm::mul_w(w10, y_w, w10));
+                // w9 = x * 4 (one rgba8/r32 texel is 4 bytes)
+                a.emit(asm::lsl_imm_w(w9, x_w, 2));
+                // w10 = y*stride + x*4 (32-bit op zero-extends X10)
+                a.emit(asm::add_w(w10, w10, w9));
+                // dst += offset
+                a.emit(asm::add_x(dst_x, dst_x, x10));
+                pointers.insert(result.id, (dst_x, 0));
+            }
             // OpImageRead / OpImageWrite — storage-image
             // access in a compute shader.  v1-ABI call via
             // the X19-anchored image descriptor table:
@@ -4476,6 +4536,13 @@ fn compute_last_use_flat(
                     for lid in &lane_ids { mark(*lid); }
                 }
                 if let Some(lane_ids) = vec_lanes.get(&texel.id).cloned() {
+                    for lid in &lane_ids { mark(*lid); }
+                }
+            }
+            Op::ImageTexelPointer { image, coord } => {
+                mark(image.id);
+                mark(coord.id);
+                if let Some(lane_ids) = vec_lanes.get(&coord.id).cloned() {
                     for lid in &lane_ids { mark(*lid); }
                 }
             }

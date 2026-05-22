@@ -268,6 +268,7 @@ pub(crate) fn translate_storage(sc: SpvStorageClass) -> Result<StorageClass, Fro
         SpvStorageClass::Function      => Ok(StorageClass::Function),
         SpvStorageClass::Private       => Ok(StorageClass::Private),
         SpvStorageClass::Workgroup     => Ok(StorageClass::Workgroup),
+        SpvStorageClass::Image         => Ok(StorageClass::Image),
         other => Err(FrontendError::Unsupported(format!(
             "storage class {other:?} not supported",
         ))),
