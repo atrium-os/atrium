@@ -1657,6 +1657,39 @@ fn translate_inst(
             Ok(())
         }
 
+        // OpImageQueryLevels: count of mip levels in a
+        // sampled image.  Atrium's Tier-2 sampled-image path
+        // is single-mip in v1, so the result is a constant 1
+        // regardless of which binding is queried.  No IR op
+        // needed; emit a ConstInt and bind it to the result
+        // id.  (Storage-image mip levels are queried via
+        // OpImageQuerySize on the underlying ImageDesc;
+        // sampled-image mip counts live behind the sampler
+        // helpers which v1 doesn't yet pipe mip metadata
+        // through.)
+        SpvOp::ImageQueryLevels => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed(
+                    "ImageQueryLevels without result id".to_string()))?;
+            let result_type_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed(
+                    "ImageQueryLevels without result type".to_string()))?;
+            let result_ty = types.get(result_type_id)?.clone();
+            // i32 or u32 result -- both lower the same.
+            let kind = match result_ty {
+                Type::U32 => atrium_spv_ir::IntKind::U32,
+                _ => atrium_spv_ir::IntKind::I32,
+            };
+            let result = alloc_or_get_result(
+                result_id, result_ty, id_map, next_value_id);
+            insts.push(Inst {
+                op: Op::ConstInt { value: 1, kind },
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
+
         // OpImageTexelPointer: form a pointer to a single
         // storage-image texel so a subsequent atomic op can
         // read-modify-write it.  Operands:

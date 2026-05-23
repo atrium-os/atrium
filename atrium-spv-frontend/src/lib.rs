@@ -129,7 +129,9 @@ pub fn translate_with_spec_overrides(
                 | C::GroupNonUniformShuffle
                 | C::GroupNonUniformShuffleRelative
                 | C::GroupNonUniformClustered
-                | C::GroupNonUniformQuad);
+                | C::GroupNonUniformQuad
+                // textureQueryLevels / textureSize etc.
+                | C::ImageQuery);
             if !accepted {
                 return Err(FrontendError::Unsupported(format!(
                     "capability {cap:?} not supported in phase-1 v1",
