@@ -2317,6 +2317,186 @@ fn translate_inst(
                         source_spirv_offset, insts, next_value_id);
                     Op::FMul(l, c_half_ln2)
                 }
+                70 => {
+                    // FaceForward(N, I, Nref):
+                    //   return N if dot(Nref, I) < 0, else -N.
+                    // Vectors N / I / Nref share the result's
+                    // (vector) type.  Synthesised as:
+                    //   d        = Dot(Nref, I)          (scalar)
+                    //   cond     = d < 0.0               (bool)
+                    //   neg_N    = N * -1.0              (vec × scalar)
+                    //   result   = cond ? N : neg_N      (vec Select)
+                    use atrium_spv_ir::VecElement;
+                    let n_id = expect_id(&spv_inst.operands, 2)?;
+                    let i_id = expect_id(&spv_inst.operands, 3)?;
+                    let r_id = expect_id(&spv_inst.operands, 4)?;
+                    let n_v = resolve_value(n_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let i_v = resolve_value(i_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let r_v = resolve_value(r_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let scalar_ty = match &result_ty {
+                        Type::Vec2(VecElement::F32)
+                        | Type::Vec3(VecElement::F32)
+                        | Type::Vec4(VecElement::F32) => Type::F32,
+                        other => return Err(FrontendError::Unsupported(format!(
+                            "FaceForward with non-f32-vec result type {other:?}"))),
+                    };
+                    let d = {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let v = Value { id, ty: scalar_ty.clone() };
+                        insts.push(Inst {
+                            op: Op::Dot(r_v, i_v),
+                            result: Some(v.clone()),
+                            source_spirv_offset,
+                        });
+                        v
+                    };
+                    let zero = push_cf(0.0,
+                        source_spirv_offset, insts, next_value_id);
+                    let cond = {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let v = Value { id, ty: Type::Bool };
+                        insts.push(Inst {
+                            op: Op::FOrdLt(d, zero),
+                            result: Some(v.clone()),
+                            source_spirv_offset,
+                        });
+                        v
+                    };
+                    let neg_one = push_cf(-1.0,
+                        source_spirv_offset, insts, next_value_id);
+                    let neg_n = {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let v = Value { id, ty: result_ty.clone() };
+                        insts.push(Inst {
+                            op: Op::FMul(n_v.clone(), neg_one),
+                            result: Some(v.clone()),
+                            source_spirv_offset,
+                        });
+                        v
+                    };
+                    Op::Select {
+                        cond,
+                        t_val: n_v,
+                        f_val: neg_n,
+                    }
+                }
+                72 => {
+                    // Refract(I, N, eta):
+                    //   d  = dot(N, I)
+                    //   k  = 1 - eta² * (1 - d²)
+                    //   k<0 -> return vec(0)
+                    //   k>=0 -> return eta*I - (eta*d + sqrt(k))*N
+                    // I, N share the vec result type; eta is a
+                    // scalar f32.
+                    use atrium_spv_ir::VecElement;
+                    let i_id   = expect_id(&spv_inst.operands, 2)?;
+                    let n_id   = expect_id(&spv_inst.operands, 3)?;
+                    let eta_id = expect_id(&spv_inst.operands, 4)?;
+                    let i_v = resolve_value(i_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let n_v = resolve_value(n_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let eta = resolve_value(eta_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let lane_count = match &result_ty {
+                        Type::Vec2(VecElement::F32) => 2,
+                        Type::Vec3(VecElement::F32) => 3,
+                        Type::Vec4(VecElement::F32) => 4,
+                        other => return Err(FrontendError::Unsupported(format!(
+                            "Refract with non-f32-vec result type {other:?}"))),
+                    };
+                    let scalar_ty = Type::F32;
+                    let push_scalar = |op: Op,
+                                        insts: &mut Vec<Inst>,
+                                        next_value_id: &mut u32| -> Value {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let v = Value { id, ty: scalar_ty.clone() };
+                        insts.push(Inst {
+                            op, result: Some(v.clone()),
+                            source_spirv_offset,
+                        });
+                        v
+                    };
+                    let push_vec = |op: Op,
+                                     insts: &mut Vec<Inst>,
+                                     next_value_id: &mut u32| -> Value {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let v = Value { id, ty: result_ty.clone() };
+                        insts.push(Inst {
+                            op, result: Some(v.clone()),
+                            source_spirv_offset,
+                        });
+                        v
+                    };
+                    let d = push_scalar(
+                        Op::Dot(n_v.clone(), i_v.clone()),
+                        insts, next_value_id);
+                    let one = push_cf(1.0,
+                        source_spirv_offset, insts, next_value_id);
+                    let d_sq = push_scalar(
+                        Op::FMul(d.clone(), d.clone()), insts, next_value_id);
+                    let one_minus_d_sq = push_scalar(
+                        Op::FSub(one.clone(), d_sq), insts, next_value_id);
+                    let eta_sq = push_scalar(
+                        Op::FMul(eta.clone(), eta.clone()),
+                        insts, next_value_id);
+                    let prod = push_scalar(
+                        Op::FMul(eta_sq, one_minus_d_sq),
+                        insts, next_value_id);
+                    let k = push_scalar(
+                        Op::FSub(one, prod), insts, next_value_id);
+                    let zero_s = push_cf(0.0,
+                        source_spirv_offset, insts, next_value_id);
+                    let k_negative = {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let v = Value { id, ty: Type::Bool };
+                        insts.push(Inst {
+                            op: Op::FOrdLt(k.clone(), zero_s.clone()),
+                            result: Some(v.clone()),
+                            source_spirv_offset,
+                        });
+                        v
+                    };
+                    let sqrt_k = push_scalar(
+                        Op::FSqrt(k), insts, next_value_id);
+                    let eta_d = push_scalar(
+                        Op::FMul(eta.clone(), d), insts, next_value_id);
+                    let sum = push_scalar(
+                        Op::FAdd(eta_d, sqrt_k), insts, next_value_id);
+                    let scaled_n = push_vec(
+                        Op::FMul(n_v, sum), insts, next_value_id);
+                    let eta_i = push_vec(
+                        Op::FMul(i_v, eta), insts, next_value_id);
+                    let refr = push_vec(
+                        Op::FSub(eta_i, scaled_n), insts, next_value_id);
+                    // zero_vec = ConstVec[zero_s × lane_count]
+                    let zero_vec = {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let v = Value { id, ty: result_ty.clone() };
+                        let lanes = vec![zero_s; lane_count];
+                        insts.push(Inst {
+                            op: Op::ConstVec(lanes),
+                            result: Some(v.clone()),
+                            source_spirv_offset,
+                        });
+                        v
+                    };
+                    Op::Select {
+                        cond: k_negative,
+                        t_val: zero_vec,
+                        f_val: refr,
+                    }
+                }
                 1 => {
                     // Round(x): round-half-away-from-zero.
                     //   absx       = FAbs(x)

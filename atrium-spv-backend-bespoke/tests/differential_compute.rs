@@ -5246,6 +5246,210 @@ fn differential_spec_constants_default_values() {
 }
 
 #[test]
+fn differential_glsl_face_forward() {
+    // FaceForward(N, I, Nref):
+    //   dot(Nref, I) < 0 -> N (positively oriented)
+    //   dot(Nref, I) >= 0 -> -N (flip)
+    // Test both branches.  Result type vec3.
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    // (label, N, I, Nref, expected)
+    let cases: &[(&str, [f32; 3], [f32; 3], [f32; 3], [f32; 3])] = &[
+        ("dot_pos_flip",
+            [0.0, 1.0, 0.0], [0.0, -1.0, 0.0], [0.0, -1.0, 0.0],
+            [0.0, -1.0, 0.0]),  // dot = 1, flip
+        ("dot_neg_keep",
+            [0.0, 1.0, 0.0], [0.0, -1.0, 0.0], [0.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0]),   // dot = -1, keep
+        ("nontrivial",
+            [1.0, 2.0, 3.0], [0.5, 0.0, 0.0], [1.0, 0.0, 0.0],
+            [-1.0, -2.0, -3.0]),  // dot = 0.5, flip
+    ];
+    for &(label, n, i, nref, expected) in cases {
+        let mut b = rspirv::dr::Builder::new();
+        b.set_version(1, 3);
+        b.capability(Capability::Shader);
+        b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+        let std_450 = b.ext_inst_import("GLSL.std.450");
+        let void   = b.type_void();
+        let u32_ty = b.type_int(32, 0);
+        let f32_ty = b.type_float(32, None);
+        let v3f    = b.type_vector(f32_ty, 3);
+        let void_fn = b.type_function(void, vec![]);
+        let rt = b.type_runtime_array(f32_ty);
+        b.decorate(rt, Decoration::ArrayStride,
+            vec![rspirv::dr::Operand::LiteralBit32(4)]);
+        let s = b.type_struct(vec![rt]);
+        b.decorate(s, Decoration::Block, vec![]);
+        b.member_decorate(s, 0, Decoration::Offset,
+            vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+        let ptr_f = b.type_pointer(None, StorageClass::StorageBuffer, f32_ty);
+        let ssbo = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+        b.decorate(ssbo, Decoration::DescriptorSet,
+            vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        b.decorate(ssbo, Decoration::Binding,
+            vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        let c_zero = b.constant_bit32(u32_ty, 0);
+        let c_one  = b.constant_bit32(u32_ty, 1);
+        let c_two  = b.constant_bit32(u32_ty, 2);
+        let mk_v3 = |b: &mut rspirv::dr::Builder, v: [f32; 3]| -> u32 {
+            let c0 = b.constant_bit32(f32_ty, v[0].to_bits());
+            let c1 = b.constant_bit32(f32_ty, v[1].to_bits());
+            let c2 = b.constant_bit32(f32_ty, v[2].to_bits());
+            b.constant_composite(v3f, vec![c0, c1, c2])
+        };
+        let nv = mk_v3(&mut b, n);
+        let iv = mk_v3(&mut b, i);
+        let rv = mk_v3(&mut b, nref);
+        let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+        b.begin_block(None).unwrap();
+        let ff = b.ext_inst(v3f, None, std_450, 70,
+            vec![
+                rspirv::dr::Operand::IdRef(nv),
+                rspirv::dr::Operand::IdRef(iv),
+                rspirv::dr::Operand::IdRef(rv),
+            ]).unwrap();
+        let lx = b.composite_extract(f32_ty, None, ff, vec![0]).unwrap();
+        let ly = b.composite_extract(f32_ty, None, ff, vec![1]).unwrap();
+        let lz = b.composite_extract(f32_ty, None, ff, vec![2]).unwrap();
+        let p0 = b.access_chain(ptr_f, None, ssbo, vec![c_zero, c_zero]).unwrap();
+        b.store(p0, lx, None, vec![]).unwrap();
+        let p1 = b.access_chain(ptr_f, None, ssbo, vec![c_zero, c_one]).unwrap();
+        b.store(p1, ly, None, vec![]).unwrap();
+        let p2 = b.access_chain(ptr_f, None, ssbo, vec![c_zero, c_two]).unwrap();
+        b.store(p2, lz, None, vec![]).unwrap();
+        b.ret().unwrap();
+        b.end_function().unwrap();
+        b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+        b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+        let words: Vec<u32> = b.module().assemble();
+        let mut spv = Vec::with_capacity(words.len() * 4);
+        for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+        let dir = TempDir::new().unwrap();
+        let mut b_buf = vec![0u8; 12];
+        let mut c_buf = vec![0u8; 12];
+        invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
+        invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+        assert_eq!(b_buf, c_buf, "{label}: FaceForward diverges");
+        let f32_at = |i: usize| f32::from_le_bytes(
+            b_buf[i*4..i*4+4].try_into().unwrap());
+        for k in 0..3 {
+            assert!((f32_at(k) - expected[k]).abs() < 1e-5,
+                "{label}: lane {k}: got {}, want {}", f32_at(k), expected[k]);
+        }
+    }
+}
+
+#[test]
+fn differential_glsl_refract() {
+    // Refract(I, N, eta):
+    //   d = dot(N, I)
+    //   k = 1 - eta² (1 - d²)
+    //   k < 0 -> 0
+    //   else  -> eta*I - (eta*d + sqrt(k))*N
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    // (label, I, N, eta, expected)
+    // I=(1,0), N=(0,1), eta=1: d=0, k=1, sum=1, ret=(1,0)-(0,1)=(1,-1)
+    // wait re-derive: d=0, k=1, sqrt_k=1, sum=1*0+1=1, scaled_N=(0,1)*1=(0,1),
+    // eta_I=(1,0)*1=(1,0), result=(1,0)-(0,1)=(1,-1)
+    // I=(1,0), N=(0,1), eta=2: d=0, k=1-4*1=-3 < 0 -> (0,0)
+    // I=(0.6,-0.8), N=(0,1), eta=0.5: d=-0.8, k=1-0.25*(1-0.64)=1-0.09=0.91
+    //   sqrt_k≈0.9539, sum=0.5*-0.8+0.9539=0.5539
+    //   eta_I=(0.3,-0.4); scaled_N=(0,0.5539); res=(0.3,-0.9539)
+    let cases: &[(&str, [f32; 2], [f32; 2], f32, [f32; 2])] = &[
+        ("normal_incidence_eta_1",
+            // I parallel to surface; no normal component to
+            // refract away.  d=0, k=1, sum=0 -> result = I.
+            [1.0, 0.0], [0.0, 1.0], 1.0, [1.0, 0.0]),
+        ("total_internal_reflection",
+            [1.0, 0.0], [0.0, 1.0], 2.0, [0.0, 0.0]),
+        ("glass_air_like",
+            [0.6, -0.8], [0.0, 1.0], 0.5,
+            [0.3, -0.9539392]),
+    ];
+    for &(label, i, n, eta, expected) in cases {
+        let mut b = rspirv::dr::Builder::new();
+        b.set_version(1, 3);
+        b.capability(Capability::Shader);
+        b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+        let std_450 = b.ext_inst_import("GLSL.std.450");
+        let void   = b.type_void();
+        let u32_ty = b.type_int(32, 0);
+        let f32_ty = b.type_float(32, None);
+        let v2f    = b.type_vector(f32_ty, 2);
+        let void_fn = b.type_function(void, vec![]);
+        let rt = b.type_runtime_array(f32_ty);
+        b.decorate(rt, Decoration::ArrayStride,
+            vec![rspirv::dr::Operand::LiteralBit32(4)]);
+        let s = b.type_struct(vec![rt]);
+        b.decorate(s, Decoration::Block, vec![]);
+        b.member_decorate(s, 0, Decoration::Offset,
+            vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+        let ptr_f = b.type_pointer(None, StorageClass::StorageBuffer, f32_ty);
+        let ssbo = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+        b.decorate(ssbo, Decoration::DescriptorSet,
+            vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        b.decorate(ssbo, Decoration::Binding,
+            vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        let c_zero = b.constant_bit32(u32_ty, 0);
+        let c_one  = b.constant_bit32(u32_ty, 1);
+        let mk_v2 = |b: &mut rspirv::dr::Builder, v: [f32; 2]| -> u32 {
+            let c0 = b.constant_bit32(f32_ty, v[0].to_bits());
+            let c1 = b.constant_bit32(f32_ty, v[1].to_bits());
+            b.constant_composite(v2f, vec![c0, c1])
+        };
+        let iv = mk_v2(&mut b, i);
+        let nv = mk_v2(&mut b, n);
+        let eta_c = b.constant_bit32(f32_ty, eta.to_bits());
+        let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+        b.begin_block(None).unwrap();
+        let r = b.ext_inst(v2f, None, std_450, 72,
+            vec![
+                rspirv::dr::Operand::IdRef(iv),
+                rspirv::dr::Operand::IdRef(nv),
+                rspirv::dr::Operand::IdRef(eta_c),
+            ]).unwrap();
+        let lx = b.composite_extract(f32_ty, None, r, vec![0]).unwrap();
+        let ly = b.composite_extract(f32_ty, None, r, vec![1]).unwrap();
+        let p0 = b.access_chain(ptr_f, None, ssbo, vec![c_zero, c_zero]).unwrap();
+        b.store(p0, lx, None, vec![]).unwrap();
+        let p1 = b.access_chain(ptr_f, None, ssbo, vec![c_zero, c_one]).unwrap();
+        b.store(p1, ly, None, vec![]).unwrap();
+        b.ret().unwrap();
+        b.end_function().unwrap();
+        b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+        b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+        let words: Vec<u32> = b.module().assemble();
+        let mut spv = Vec::with_capacity(words.len() * 4);
+        for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+        let dir = TempDir::new().unwrap();
+        let mut b_buf = vec![0u8; 8];
+        let mut c_buf = vec![0u8; 8];
+        invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
+        invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+        assert_eq!(b_buf, c_buf, "{label}: Refract diverges");
+        let f32_at = |i: usize| f32::from_le_bytes(
+            b_buf[i*4..i*4+4].try_into().unwrap());
+        for k in 0..2 {
+            let want = expected[k];
+            let got = f32_at(k);
+            let tol = (want.abs() * 1e-3).max(1e-4);
+            assert!((got - want).abs() <= tol,
+                "{label}: lane {k}: got {got}, want {want}");
+        }
+    }
+}
+
+#[test]
 fn differential_glsl_round_ssign_fma() {
     // GLSL.std.450 Round (#1) round-half-away-from-zero,
     // SSign (#7) integer sign, Fma (#50) fused multiply-add.
