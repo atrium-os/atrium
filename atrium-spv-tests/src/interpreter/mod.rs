@@ -1252,7 +1252,9 @@ impl Interpreter {
             // sampler implementation the production backends
             // will use — the differential tests the pipeline,
             // not the sampler.
-            Op::ImageSampleImplicitLod | Op::ImageSampleExplicitLod => {
+            Op::ImageSampleImplicitLod | Op::ImageSampleExplicitLod
+            | Op::ImageSampleProjImplicitLod
+            | Op::ImageSampleProjExplicitLod => {
                 let result_id = inst.result_id.ok_or_else(||
                     InterpError::BadConstant(0))?;
                 let si_id = op_id(&inst.operands, 0)?;
@@ -1265,22 +1267,31 @@ impl Interpreter {
                          {handle:?}"))),
                 };
                 let coord = self.lookup_value(coord_id, values)?;
+                let is_proj = matches!(inst.class.opcode,
+                    Op::ImageSampleProjImplicitLod
+                    | Op::ImageSampleProjExplicitLod);
                 let (u, v) = match coord {
                     ConstantValue::Vec(ref lanes) if lanes.len() >= 2 => {
-                        let u = match &lanes[0] {
-                            ConstantValue::F32(x) => *x,
-                            other => return Err(InterpError::UnsupportedOpcode(
-                                format!("ImageSample coord lane 0 not f32: {other:?}"))),
+                        let f = |i: usize| -> Result<f32, InterpError> {
+                            match &lanes[i] {
+                                ConstantValue::F32(x) => Ok(*x),
+                                other => Err(InterpError::UnsupportedOpcode(
+                                    format!("ImageSample coord lane {i} not f32: \
+                                             {other:?}"))),
+                            }
                         };
-                        let v = match &lanes[1] {
-                            ConstantValue::F32(x) => *x,
-                            other => return Err(InterpError::UnsupportedOpcode(
-                                format!("ImageSample coord lane 1 not f32: {other:?}"))),
-                        };
-                        (u, v)
+                        let s = f(0)?;
+                        let t = f(1)?;
+                        if is_proj {
+                            // Last lane is `q`; divide first N-1 by it.
+                            let q = f(lanes.len() - 1)?;
+                            (s / q, t / q)
+                        } else {
+                            (s, t)
+                        }
                     }
                     other => return Err(InterpError::UnsupportedOpcode(format!(
-                        "ImageSample coord operand not a vec2<f32>: {other:?}"))),
+                        "ImageSample coord operand not a vec<f32>: {other:?}"))),
                 };
                 let tex = inputs.textures.iter()
                     .find(|t| t.set == set && t.binding == binding)

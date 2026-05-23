@@ -8,7 +8,8 @@
 use std::collections::HashMap;
 
 use atrium_spv_ir::{
-    Block, BlockId, BlockKind, Function, Inst, Op, ShaderStage, Type, Value, ValueId,
+    Block, BlockId, BlockKind, Function, Inst, Op, ShaderStage, Type, Value,
+    ValueId, VecElement,
 };
 use rspirv::dr::{Function as SpvFunction, Instruction, Module, Operand};
 use rspirv::spirv::{Op as SpvOp, Word};
@@ -1348,7 +1349,9 @@ fn translate_inst(
         // SampledImage value (produced by OpSampledImage),
         // the second is the UV coord; ExplicitLod takes a
         // mip-level as operand 2.
-        SpvOp::ImageSampleImplicitLod | SpvOp::ImageSampleExplicitLod => {
+        SpvOp::ImageSampleImplicitLod | SpvOp::ImageSampleExplicitLod
+        | SpvOp::ImageSampleProjImplicitLod
+        | SpvOp::ImageSampleProjExplicitLod => {
             let result_id = spv_inst.result_id.ok_or_else(||
                 FrontendError::Malformed(
                     "ImageSample without result id".to_string()))?;
@@ -1361,10 +1364,74 @@ fn translate_inst(
             let sampled_image = id_map.get(&si_id).cloned().ok_or_else(||
                 FrontendError::Malformed(format!(
                     "ImageSample sampled_image id {si_id} not yet defined")))?;
-            let coord = id_map.get(&coord_id).cloned().ok_or_else(||
+            let raw_coord = id_map.get(&coord_id).cloned().ok_or_else(||
                 FrontendError::Malformed(format!(
                     "ImageSample coord id {coord_id} not yet defined")))?;
-            let op = if spv_inst.class.opcode == SpvOp::ImageSampleExplicitLod {
+            // Arc 37: ImageSampleProj{Implicit,Explicit}Lod
+            // -- projective texturing.  The coord is one lane
+            // wider than the non-Proj variant (e.g. vec3 for
+            // 2D); the last lane is the projection denominator
+            // `q`.  Lower at the frontend by emitting per-lane
+            // FDiv + a CompositeConstruct of the divided lanes,
+            // then dispatch as a normal sample with the new
+            // coord.  No backend changes needed.
+            let is_proj = matches!(spv_inst.class.opcode,
+                SpvOp::ImageSampleProjImplicitLod
+                | SpvOp::ImageSampleProjExplicitLod);
+            let coord = if is_proj {
+                let n = match &raw_coord.ty {
+                    Type::Vec2(_) => 2,
+                    Type::Vec3(_) => 3,
+                    Type::Vec4(_) => 4,
+                    other => return Err(FrontendError::Unsupported(format!(
+                        "ImageSampleProj* coord must be a vector, got {other:?}"))),
+                };
+                if n < 2 {
+                    return Err(FrontendError::Unsupported(format!(
+                        "ImageSampleProj* coord needs ≥2 lanes, got {n}")));
+                }
+                // Pull each lane out and divide by lane n-1 (q).
+                let mut lanes_div: Vec<Value> = Vec::with_capacity(n - 1);
+                // Extract q first; reused as RHS for every divide.
+                let q_val = push_extract_lane(
+                    raw_coord.clone(), (n - 1) as u32,
+                    source_spirv_offset, insts, next_value_id)?;
+                for i in 0..n - 1 {
+                    let lane_i = push_extract_lane(
+                        raw_coord.clone(), i as u32,
+                        source_spirv_offset, insts, next_value_id)?;
+                    let id = ValueId(*next_value_id);
+                    *next_value_id += 1;
+                    let div = Value { id, ty: Type::F32 };
+                    insts.push(Inst {
+                        op: Op::FDiv(lane_i, q_val.clone()),
+                        result: Some(div.clone()),
+                        source_spirv_offset,
+                    });
+                    lanes_div.push(div);
+                }
+                // Build new coord = vec(n-1) of the divided lanes.
+                let id = ValueId(*next_value_id);
+                *next_value_id += 1;
+                let new_ty = match n - 1 {
+                    2 => Type::Vec2(VecElement::F32),
+                    3 => Type::Vec3(VecElement::F32),
+                    other => return Err(FrontendError::Unsupported(format!(
+                        "ImageSampleProj* unsupported divided lane count {other}"))),
+                };
+                let new_coord = Value { id, ty: new_ty };
+                insts.push(Inst {
+                    op: Op::ConstVec(lanes_div),
+                    result: Some(new_coord.clone()),
+                    source_spirv_offset,
+                });
+                new_coord
+            } else {
+                raw_coord
+            };
+            let op = if spv_inst.class.opcode == SpvOp::ImageSampleExplicitLod
+                || spv_inst.class.opcode == SpvOp::ImageSampleProjExplicitLod
+            {
                 let lod_id = expect_id(&spv_inst.operands, 2)?;
                 let lod = id_map.get(&lod_id).cloned().ok_or_else(||
                     FrontendError::Malformed(format!(
@@ -4708,6 +4775,28 @@ fn extract_image_operand_bias(
         other => Err(FrontendError::Malformed(format!(
             "Image-Operands::Bias expected IdRef after mask, got {other:?}"))),
     }
+}
+
+/// Synthesize an `Op::VectorExtract` on `vector` at lane
+/// `index`, returning the F32 lane Value.  Used by the
+/// `ImageSampleProj*` lowering to peel apart the (s, t, [r,]
+/// q) coord before dividing by `q`.
+fn push_extract_lane(
+    vector: Value,
+    index: u32,
+    source_spirv_offset: u32,
+    insts: &mut Vec<Inst>,
+    next_value_id: &mut u32,
+) -> Result<Value, FrontendError> {
+    let id = ValueId(*next_value_id);
+    *next_value_id += 1;
+    let lane = Value { id, ty: Type::F32 };
+    insts.push(Inst {
+        op: Op::VectorExtract { vector, index },
+        result: Some(lane.clone()),
+        source_spirv_offset,
+    });
+    Ok(lane)
 }
 
 /// Emit a u32-typed instruction; returns the result Value.

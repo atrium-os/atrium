@@ -1157,6 +1157,14 @@ specifically supports:
   carrying the bias as the lod operand; the existing
   `sample_2d_lod` (#16) helper handles the rest.  No new
   helpers; no backend changes.
+  Projective texturing (Arc 37): `OpImageSampleProjImplicitLod`
+  / `OpImageSampleProjExplicitLod` lower at the frontend with
+  `Op::VectorExtract` (per-lane peel) + `Op::FDiv` (per-lane
+  divide by the last lane `q`) + `Op::ConstVec` (rebuild the
+  smaller coord), then dispatch as a normal sample.  Interpreter
+  mirrors the divide.  No new helpers, no backend changes.
+  Currently 2D-Proj only (vec3→vec2 coord); cube/3D-Proj
+  paths are gated by the unsupported divided-lane-count error.
   `textureSize(sampler2D, lod)` (Arc 34): a new IR op
   `Op::SampledImageQuerySizeLod { image, lod }` is emitted
   by the frontend for `OpImageQuerySizeLod`.  Both backends
