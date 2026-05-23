@@ -2317,6 +2317,163 @@ fn translate_inst(
                         source_spirv_offset, insts, next_value_id);
                     Op::FMul(l, c_half_ln2)
                 }
+                56 => {
+                    // PackSnorm2x16(v):  vec2 in [-1, 1] -> u32.
+                    //   fixed_x = round(clamp(v.x, -1, 1) * 32767)
+                    //   fixed_y = round(clamp(v.y, -1, 1) * 32767)
+                    //   result  = (fixed_x & 0xFFFF) |
+                    //             ((fixed_y & 0xFFFF) << 16)
+                    // Round via `(int)(scaled + copysign(0.5, scaled))`,
+                    // implemented as `s + sign(s)*0.5` where
+                    // sign(s) is the FSign synthesis (-1, 0, +1).
+                    let v_id = expect_id(&spv_inst.operands, 2)?;
+                    let v = resolve_value(v_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let push = |op: Op, ty: Type,
+                                insts: &mut Vec<Inst>,
+                                next_value_id: &mut u32| -> Value {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let val = Value { id, ty };
+                        insts.push(Inst {
+                            op, result: Some(val.clone()),
+                            source_spirv_offset,
+                        });
+                        val
+                    };
+                    let lane_x = push(
+                        Op::VectorExtract { vector: v.clone(), index: 0 },
+                        Type::F32, insts, next_value_id);
+                    let lane_y = push(
+                        Op::VectorExtract { vector: v, index: 1 },
+                        Type::F32, insts, next_value_id);
+                    let c_neg1 = push_cf(-1.0,
+                        source_spirv_offset, insts, next_value_id);
+                    let c_one_f = push_cf(1.0,
+                        source_spirv_offset, insts, next_value_id);
+                    let c_zero_f = push_cf(0.0,
+                        source_spirv_offset, insts, next_value_id);
+                    let c_32767_f = push_cf(32767.0,
+                        source_spirv_offset, insts, next_value_id);
+                    let c_half_pos = push_cf(0.5,
+                        source_spirv_offset, insts, next_value_id);
+                    let c_half_neg = push_cf(-0.5,
+                        source_spirv_offset, insts, next_value_id);
+                    let c_mask = push_ci(0xFFFF, atrium_spv_ir::IntKind::U32,
+                        source_spirv_offset, insts, next_value_id);
+                    let c_16 = push_ci(16, atrium_spv_ir::IntKind::U32,
+                        source_spirv_offset, insts, next_value_id);
+                    // quantise one lane:
+                    //   c   = clamp(lane, -1, 1) * 32767
+                    //   bias = (c >= 0) ? +0.5 : -0.5
+                    //   r    = (i32)(c + bias)   (truncate-to-zero)
+                    //   pack = r & 0xFFFF
+                    let quantise = |
+                        lane: Value,
+                        neg1: &Value, one: &Value, zero: &Value,
+                        scale: &Value, hp: &Value, hn: &Value,
+                        mask: &Value,
+                        insts: &mut Vec<Inst>,
+                        next_value_id: &mut u32,
+                    | -> Value {
+                        let hi = push(
+                            Op::FMin(lane, one.clone()),
+                            Type::F32, insts, next_value_id);
+                        let cl = push(
+                            Op::FMax(hi, neg1.clone()),
+                            Type::F32, insts, next_value_id);
+                        let scaled = push(
+                            Op::FMul(cl, scale.clone()),
+                            Type::F32, insts, next_value_id);
+                        let is_neg = push(
+                            Op::FOrdLt(scaled.clone(), zero.clone()),
+                            Type::Bool, insts, next_value_id);
+                        let bias = push(
+                            Op::Select {
+                                cond: is_neg,
+                                t_val: hn.clone(),
+                                f_val: hp.clone(),
+                            },
+                            Type::F32, insts, next_value_id);
+                        let biased = push(
+                            Op::FAdd(scaled, bias),
+                            Type::F32, insts, next_value_id);
+                        let as_i32 = push(
+                            Op::ConvertFToS(biased),
+                            Type::I32, insts, next_value_id);
+                        push(
+                            Op::BitAnd(as_i32, mask.clone()),
+                            Type::U32, insts, next_value_id)
+                    };
+                    let fx = quantise(lane_x, &c_neg1, &c_one_f, &c_zero_f,
+                        &c_32767_f, &c_half_pos, &c_half_neg, &c_mask,
+                        insts, next_value_id);
+                    let fy = quantise(lane_y, &c_neg1, &c_one_f, &c_zero_f,
+                        &c_32767_f, &c_half_pos, &c_half_neg, &c_mask,
+                        insts, next_value_id);
+                    let hi_shifted = push(
+                        Op::Shl(fy, c_16),
+                        Type::U32, insts, next_value_id);
+                    Op::BitOr(fx, hi_shifted)
+                }
+                60 => {
+                    // UnpackSnorm2x16(u): u32 -> vec2 in [-1, 1].
+                    //   low_i  = sign-extended low 16 bits of u
+                    //          = (u << 16) >> 16   (arithmetic)
+                    //   high_i = sign-extended high 16 bits
+                    //          = u >> 16          (arithmetic)
+                    //   lane_x = max(low_i / 32767, -1)
+                    //   lane_y = max(high_i / 32767, -1)
+                    let u_id = expect_id(&spv_inst.operands, 2)?;
+                    let u = resolve_value(u_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let push = |op: Op, ty: Type,
+                                insts: &mut Vec<Inst>,
+                                next_value_id: &mut u32| -> Value {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let val = Value { id, ty };
+                        insts.push(Inst {
+                            op, result: Some(val.clone()),
+                            source_spirv_offset,
+                        });
+                        val
+                    };
+                    let c_16 = push_ci(16, atrium_spv_ir::IntKind::U32,
+                        source_spirv_offset, insts, next_value_id);
+                    let c_32767_f = push_cf(32767.0,
+                        source_spirv_offset, insts, next_value_id);
+                    let c_neg1 = push_cf(-1.0,
+                        source_spirv_offset, insts, next_value_id);
+                    let shifted_up = push(
+                        Op::Shl(u.clone(), c_16.clone()),
+                        Type::I32, insts, next_value_id);
+                    let low_i = push(
+                        Op::AShr(shifted_up, c_16.clone()),
+                        Type::I32, insts, next_value_id);
+                    let high_i = push(
+                        Op::AShr(u, c_16),
+                        Type::I32, insts, next_value_id);
+                    let low_f = push(
+                        Op::ConvertSToF(low_i),
+                        Type::F32, insts, next_value_id);
+                    let high_f = push(
+                        Op::ConvertSToF(high_i),
+                        Type::F32, insts, next_value_id);
+                    let raw_x = push(
+                        Op::FDiv(low_f, c_32767_f.clone()),
+                        Type::F32, insts, next_value_id);
+                    let raw_y = push(
+                        Op::FDiv(high_f, c_32767_f),
+                        Type::F32, insts, next_value_id);
+                    let lane_x = push(
+                        Op::FMax(raw_x, c_neg1.clone()),
+                        Type::F32, insts, next_value_id);
+                    let lane_y = push(
+                        Op::FMax(raw_y, c_neg1),
+                        Type::F32, insts, next_value_id);
+                    Op::ConstVec(vec![lane_x, lane_y])
+                }
                 57 => {
                     // PackUnorm2x16(v):  vec2 in [0,1] -> u32.
                     //   fixed_x = round(clamp(v.x, 0, 1) * 65535)

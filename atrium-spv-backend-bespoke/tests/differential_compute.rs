@@ -5246,6 +5246,108 @@ fn differential_spec_constants_default_values() {
 }
 
 #[test]
+fn differential_glsl_pack_unpack_snorm2x16() {
+    // PackSnorm2x16(vec2(a,b)) -> u32 with sign quantisation.
+    // UnpackSnorm2x16(u32) -> vec2 in [-1, 1].
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let std_450 = b.ext_inst_import("GLSL.std.450");
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let f32_ty = b.type_float(32, None);
+    let v2f    = b.type_vector(f32_ty, 2);
+    let void_fn = b.type_function(void, vec![]);
+    let rt = b.type_runtime_array(u32_ty);
+    b.decorate(rt, Decoration::ArrayStride, vec![rspirv::dr::Operand::LiteralBit32(4)]);
+    let s = b.type_struct(vec![rt]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_u = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+    let ssbo  = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding,       vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let c0_u = b.constant_bit32(u32_ty, 0);
+    let c1_u = b.constant_bit32(u32_ty, 1);
+    let c2_u = b.constant_bit32(u32_ty, 2);
+    let c3_u = b.constant_bit32(u32_ty, 3);
+    let c4_u = b.constant_bit32(u32_ty, 4);
+    let f_neg1 = b.constant_bit32(f32_ty, (-1.0f32).to_bits());
+    let f_pos1 = b.constant_bit32(f32_ty, 1.0f32.to_bits());
+    let f_zero = b.constant_bit32(f32_ty, 0.0f32.to_bits());
+    let f_neg2 = b.constant_bit32(f32_ty, (-2.0f32).to_bits()); // saturate -> -1
+    let f_pos2 = b.constant_bit32(f32_ty, 2.0f32.to_bits());   // saturate -> +1
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    // (-1, +1): low = round(-1*32767) = -32767 = 0x8001
+    //           high = round(+1*32767) = +32767 = 0x7FFF
+    //   result = 0x8001 | (0x7FFF << 16) = 0x7FFF8001
+    let v_endpoints = b.composite_construct(v2f, None, vec![f_neg1, f_pos1]).unwrap();
+    let p_ends = b.ext_inst(u32_ty, None, std_450, 56,
+        vec![rspirv::dr::Operand::IdRef(v_endpoints)]).unwrap();
+    // (0, 0): both lanes 0 -> 0x00000000.
+    let v_zero = b.composite_construct(v2f, None, vec![f_zero, f_zero]).unwrap();
+    let p_zero = b.ext_inst(u32_ty, None, std_450, 56,
+        vec![rspirv::dr::Operand::IdRef(v_zero)]).unwrap();
+    // Out-of-range saturation: (-2, +2) -> (-32767, +32767) -> 0x7FFF8001
+    let v_sat = b.composite_construct(v2f, None, vec![f_neg2, f_pos2]).unwrap();
+    let p_sat = b.ext_inst(u32_ty, None, std_450, 56,
+        vec![rspirv::dr::Operand::IdRef(v_sat)]).unwrap();
+    // Round-trip through Unpack: Unpack(Pack((-1, +1))) should
+    // give exactly (-1, +1) (the endpoints are bit-exact).
+    let unpacked = b.ext_inst(v2f, None, std_450, 60,
+        vec![rspirv::dr::Operand::IdRef(p_ends)]).unwrap();
+    let ux = b.composite_extract(f32_ty, None, unpacked, vec![0]).unwrap();
+    let uy = b.composite_extract(f32_ty, None, unpacked, vec![1]).unwrap();
+    let ux_u = b.bitcast(u32_ty, None, ux).unwrap();
+    let uy_u = b.bitcast(u32_ty, None, uy).unwrap();
+    let pp0 = b.access_chain(ptr_u, None, ssbo, vec![c0_u, c0_u]).unwrap();
+    b.store(pp0, p_ends, None, vec![]).unwrap();
+    let pp1 = b.access_chain(ptr_u, None, ssbo, vec![c0_u, c1_u]).unwrap();
+    b.store(pp1, p_zero, None, vec![]).unwrap();
+    let pp2 = b.access_chain(ptr_u, None, ssbo, vec![c0_u, c2_u]).unwrap();
+    b.store(pp2, p_sat, None, vec![]).unwrap();
+    let pp3 = b.access_chain(ptr_u, None, ssbo, vec![c0_u, c3_u]).unwrap();
+    b.store(pp3, ux_u, None, vec![]).unwrap();
+    let pp4 = b.access_chain(ptr_u, None, ssbo, vec![c0_u, c4_u]).unwrap();
+    b.store(pp4, uy_u, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spv = Vec::with_capacity(words.len() * 4);
+    for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+    let dir = TempDir::new().unwrap();
+    let mut b_buf = vec![0u8; 20];
+    let mut c_buf = vec![0u8; 20];
+    invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
+    invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+    assert_eq!(b_buf, c_buf,
+        "Pack/UnpackSnorm2x16 diverges between backends");
+    let u_at = |i: usize| u32::from_le_bytes(
+        b_buf[i*4..i*4+4].try_into().unwrap());
+    let f_at = |i: usize| f32::from_bits(u_at(i));
+    assert_eq!(u_at(0), 0x7FFF_8001,
+        "Pack((-1,+1)): want 0x7FFF8001, got {:#010x}", u_at(0));
+    assert_eq!(u_at(1), 0x0000_0000,
+        "Pack((0,0)): want 0, got {:#010x}", u_at(1));
+    assert_eq!(u_at(2), 0x7FFF_8001,
+        "Pack((-2,+2)) saturate: want 0x7FFF8001, got {:#010x}", u_at(2));
+    assert!((f_at(3) - (-1.0)).abs() < 1e-6,
+        "Unpack(Pack(-1)).x: got {}, want -1.0", f_at(3));
+    assert!((f_at(4) -   1.0).abs() < 1e-6,
+        "Unpack(Pack(+1)).y: got {}, want  1.0", f_at(4));
+}
+
+#[test]
 fn differential_glsl_pack_unpack_unorm2x16() {
     // PackUnorm2x16(vec2(a, b)) -> u32 quantised packing.
     // UnpackUnorm2x16(u32) -> vec2 in [0, 1].
