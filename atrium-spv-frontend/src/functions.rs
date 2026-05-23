@@ -2317,6 +2317,141 @@ fn translate_inst(
                         source_spirv_offset, insts, next_value_id);
                     Op::FMul(l, c_half_ln2)
                 }
+                57 => {
+                    // PackUnorm2x16(v):  vec2 in [0,1] -> u32.
+                    //   fixed_x = round(clamp(v.x, 0, 1) * 65535)
+                    //   fixed_y = round(clamp(v.y, 0, 1) * 65535)
+                    //   result  = (fixed_x & 0xFFFF) |
+                    //             ((fixed_y & 0xFFFF) << 16)
+                    // GLSL.std.450 round-to-nearest-even is not
+                    // expressible without FRINTN; we use the
+                    // `floor(x + 0.5)` round-half-away-from-zero
+                    // approximation, which is bit-exact for all
+                    // representable [0, 65535.5) inputs (no
+                    // ties land on .5 within unorm precision).
+                    let v_id = expect_id(&spv_inst.operands, 2)?;
+                    let v = resolve_value(v_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let push = |op: Op, ty: Type,
+                                insts: &mut Vec<Inst>,
+                                next_value_id: &mut u32| -> Value {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let val = Value { id, ty };
+                        insts.push(Inst {
+                            op, result: Some(val.clone()),
+                            source_spirv_offset,
+                        });
+                        val
+                    };
+                    let lane_x = push(
+                        Op::VectorExtract { vector: v.clone(), index: 0 },
+                        Type::F32, insts, next_value_id);
+                    let lane_y = push(
+                        Op::VectorExtract { vector: v, index: 1 },
+                        Type::F32, insts, next_value_id);
+                    let c_zero_f = push_cf(0.0,
+                        source_spirv_offset, insts, next_value_id);
+                    let c_one_f = push_cf(1.0,
+                        source_spirv_offset, insts, next_value_id);
+                    let c_65535_f = push_cf(65535.0,
+                        source_spirv_offset, insts, next_value_id);
+                    let c_half = push_cf(0.5,
+                        source_spirv_offset, insts, next_value_id);
+                    let c_mask = push_ci(0xFFFF, atrium_spv_ir::IntKind::U32,
+                        source_spirv_offset, insts, next_value_id);
+                    let c_16 = push_ci(16, atrium_spv_ir::IntKind::U32,
+                        source_spirv_offset, insts, next_value_id);
+                    // Per-lane quantise helper.
+                    let quantise = |
+                        lane: Value,
+                        zero: &Value,
+                        one: &Value,
+                        scale: &Value,
+                        half: &Value,
+                        mask: &Value,
+                        insts: &mut Vec<Inst>,
+                        next_value_id: &mut u32,
+                    | -> Value {
+                        let lo = push(
+                            Op::FMax(lane, zero.clone()),
+                            Type::F32, insts, next_value_id);
+                        let cl = push(
+                            Op::FMin(lo, one.clone()),
+                            Type::F32, insts, next_value_id);
+                        let scaled = push(
+                            Op::FMul(cl, scale.clone()),
+                            Type::F32, insts, next_value_id);
+                        let plus_half = push(
+                            Op::FAdd(scaled, half.clone()),
+                            Type::F32, insts, next_value_id);
+                        let floored = push(
+                            Op::FFloor(plus_half),
+                            Type::F32, insts, next_value_id);
+                        let as_u32 = push(
+                            Op::ConvertFToU(floored),
+                            Type::U32, insts, next_value_id);
+                        push(
+                            Op::BitAnd(as_u32, mask.clone()),
+                            Type::U32, insts, next_value_id)
+                    };
+                    let fx = quantise(lane_x, &c_zero_f, &c_one_f,
+                        &c_65535_f, &c_half, &c_mask,
+                        insts, next_value_id);
+                    let fy = quantise(lane_y, &c_zero_f, &c_one_f,
+                        &c_65535_f, &c_half, &c_mask,
+                        insts, next_value_id);
+                    let hi_shifted = push(
+                        Op::Shl(fy, c_16),
+                        Type::U32, insts, next_value_id);
+                    Op::BitOr(fx, hi_shifted)
+                }
+                61 => {
+                    // UnpackUnorm2x16(u): u32 -> vec2 in [0, 1].
+                    //   low_u  = u & 0xFFFF
+                    //   high_u = u >> 16
+                    //   vec2(low_u / 65535.0, high_u / 65535.0)
+                    let u_id = expect_id(&spv_inst.operands, 2)?;
+                    let u = resolve_value(u_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let push = |op: Op, ty: Type,
+                                insts: &mut Vec<Inst>,
+                                next_value_id: &mut u32| -> Value {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let val = Value { id, ty };
+                        insts.push(Inst {
+                            op, result: Some(val.clone()),
+                            source_spirv_offset,
+                        });
+                        val
+                    };
+                    let c_mask = push_ci(0xFFFF, atrium_spv_ir::IntKind::U32,
+                        source_spirv_offset, insts, next_value_id);
+                    let c_16 = push_ci(16, atrium_spv_ir::IntKind::U32,
+                        source_spirv_offset, insts, next_value_id);
+                    let c_65535_f = push_cf(65535.0,
+                        source_spirv_offset, insts, next_value_id);
+                    let low_u = push(
+                        Op::BitAnd(u.clone(), c_mask),
+                        Type::U32, insts, next_value_id);
+                    let high_u = push(
+                        Op::LShr(u, c_16),
+                        Type::U32, insts, next_value_id);
+                    let low_f = push(
+                        Op::ConvertUToF(low_u),
+                        Type::F32, insts, next_value_id);
+                    let high_f = push(
+                        Op::ConvertUToF(high_u),
+                        Type::F32, insts, next_value_id);
+                    let lane_x = push(
+                        Op::FDiv(low_f, c_65535_f.clone()),
+                        Type::F32, insts, next_value_id);
+                    let lane_y = push(
+                        Op::FDiv(high_f, c_65535_f),
+                        Type::F32, insts, next_value_id);
+                    Op::ConstVec(vec![lane_x, lane_y])
+                }
                 53 => {
                     // Ldexp(x, n) = x * 2^n  (f32, scalar).
                     // Synthesise 2^n via the IEEE-754 exponent
