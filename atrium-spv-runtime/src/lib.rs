@@ -168,6 +168,13 @@ pub struct TexDesc {
     /// `0..mip_count`; mirrors `ImageDesc.mip_descs`.  May
     /// be null when `mip_count <= 1`.
     pub mip_descs:    *const TexDesc,
+    /// Number of array layers (1 for a non-array texture).
+    /// Appended in Arc 30 for `sampler2DArray` support.
+    pub depth:        u32,
+    /// Byte stride between consecutive array layers.
+    /// Conventionally `height * stride_bytes`; ignored when
+    /// `depth == 1`.
+    pub slice_bytes:  u32,
 }
 
 /// A sampler binding. Independent of any specific image,
@@ -193,11 +200,12 @@ pub struct SamplerDesc {
 // in X1 (per docs/spec/tier2-renderer.md §4.1). v1 of the
 // texture path overlays the buffer's prefix with:
 //
-//   bytes  0..24 : runtime-helper function pointers
+//   bytes  0..32 : runtime-helper function pointers
 //                  ( 0:  atrium_tex_sample_2d
 //                    8:  atrium_tex_fetch_2d
-//                   16:  atrium_tex_sample_2d_lod )
-//   bytes 24..   : flat descriptor table — slot `B` at
+//                   16:  atrium_tex_sample_2d_lod
+//                   24:  atrium_tex_sample_2d_array )
+//   bytes 32..   : flat descriptor table — slot `B` at
 //                  byte `UNIFORMS_DESC_BASE + B*16`,
 //                  carrying ( 0: tex_desc*, 8: samp_desc* )
 //
@@ -233,8 +241,9 @@ pub const UNIFORMS_HELPERS_BASE: usize = 0;
 /// Offset of the descriptor table within the uniforms
 /// buffer. Slot `B` lives at `UNIFORMS_DESC_BASE + B * DESC_SLOT_BYTES`.
 /// Grew from 16 to 24 when `atrium_tex_sample_2d_lod` was
-/// added (Arc 29).
-pub const UNIFORMS_DESC_BASE: usize = 24;
+/// added (Arc 29), then to 32 with
+/// `atrium_tex_sample_2d_array` (Arc 30).
+pub const UNIFORMS_DESC_BASE: usize = 32;
 
 /// Bytes per descriptor slot in the table. Two 64-bit
 /// pointers packed back-to-back — `tex_desc*` then
@@ -354,11 +363,12 @@ pub unsafe fn write_image_descriptor_slot(
     buf[base..base + 8].copy_from_slice(&bytes);
 }
 
-/// Write the runtime-helper function-pointer header.  Three
+/// Write the runtime-helper function-pointer header.  Four
 /// helpers: `atrium_tex_sample_2d` (implicit-LOD; always
-/// mip 0), `atrium_tex_fetch_2d` (texel-fetch with LOD), and
+/// mip 0), `atrium_tex_fetch_2d` (texel-fetch with LOD),
 /// `atrium_tex_sample_2d_lod` (explicit-LOD with mip
-/// selection via `TexDesc.mip_descs`).
+/// selection), and `atrium_tex_sample_2d_array` (implicit-
+/// LOD `sampler2DArray` with a `layer: f32` arg, mip 0).
 ///
 /// # Safety
 /// The function pointers must remain valid for the lifetime
@@ -371,15 +381,19 @@ pub unsafe fn write_helper_pointers(
         *const TexDesc, i32, i32, i32, *mut f32),
     sample_2d_lod: unsafe extern "C" fn(
         *const TexDesc, *const SamplerDesc, f32, f32, f32, *mut f32),
+    sample_2d_array: unsafe extern "C" fn(
+        *const TexDesc, *const SamplerDesc, f32, f32, f32, *mut f32),
 ) {
     assert!(buf.len() >= UNIFORMS_DESC_BASE,
         "uniforms buffer too small for the helper header");
-    let s  = (sample_2d     as usize as u64).to_le_bytes();
-    let f  = (fetch_2d      as usize as u64).to_le_bytes();
-    let sl = (sample_2d_lod as usize as u64).to_le_bytes();
+    let s  = (sample_2d       as usize as u64).to_le_bytes();
+    let f  = (fetch_2d        as usize as u64).to_le_bytes();
+    let sl = (sample_2d_lod   as usize as u64).to_le_bytes();
+    let sa = (sample_2d_array as usize as u64).to_le_bytes();
     buf[ 0.. 8].copy_from_slice(&s);
     buf[ 8..16].copy_from_slice(&f);
     buf[16..24].copy_from_slice(&sl);
+    buf[24..32].copy_from_slice(&sa);
 }
 
 /// Write a `(tex_desc, samp_desc)` pointer pair at binding
@@ -467,6 +481,35 @@ pub unsafe extern "C" fn atrium_tex_fetch_2d(
 ) {
     let t = pick_tex_mip(&*tex, lod);
     let rgba = fetch_texel_impl(t, x as u32, y as u32);
+    let out = std::slice::from_raw_parts_mut(out_rgba, 4);
+    out.copy_from_slice(&rgba);
+}
+
+/// Sample one layer of a `sampler2DArray` (implicit LOD,
+/// always mip 0).  The layer index is `round(layer)`,
+/// clamped to `[0, tex.depth - 1]`.  Per-layer data sits at
+/// `tex.data + layer * tex.slice_bytes`.
+///
+/// # Safety
+/// As for `atrium_tex_sample_2d`; additionally `tex.depth`
+/// must accurately count layers and `tex.slice_bytes` the
+/// per-layer byte stride.
+#[no_mangle]
+pub unsafe extern "C" fn atrium_tex_sample_2d_array(
+    tex: *const TexDesc,
+    samp: *const SamplerDesc,
+    u: f32, v: f32, layer: f32,
+    out_rgba: *mut f32,
+) {
+    let t_base = &*tex;
+    let layers = t_base.depth.max(1);
+    let l_idx = (layer.round() as i32)
+        .clamp(0, (layers as i32) - 1) as u32;
+    let slice_off = (l_idx as usize) * (t_base.slice_bytes as usize);
+    let mut t = *t_base;
+    t.data = t_base.data.add(slice_off);
+    let s = &*samp;
+    let rgba = sample_2d_impl(&t, s, u, v);
     let out = std::slice::from_raw_parts_mut(out_rgba, 4);
     out.copy_from_slice(&rgba);
 }
@@ -981,6 +1024,7 @@ mod tests {
             data: pixels.as_ptr(),
             width: 2, height: 2, stride_bytes: 8,
             format: TexFormat::Rgba8Unorm as u32,
+            depth: 1, slice_bytes: 0,
             mip_count: 0, mip_descs: std::ptr::null(),
         };
         (pixels, desc)
@@ -1050,6 +1094,7 @@ mod tests {
             data: pixels.as_ptr(),
             width: 2, height: 2, stride_bytes: 8,
             format: TexFormat::Bgra8Unorm as u32,
+            depth: 1, slice_bytes: 0,
             mip_count: 0, mip_descs: std::ptr::null(),
         };
         let p0 = fetch_texel_impl(&desc, 0, 0);
@@ -1102,12 +1147,14 @@ mod tests {
                 data: mip0_pixels.as_ptr(),
                 width: 1, height: 1, stride_bytes: 4,
                 format: TexFormat::Rgba8Unorm as u32,
+                depth: 1, slice_bytes: 0,
                 mip_count: 0, mip_descs: std::ptr::null(),
             },
             TexDesc {
                 data: mip1_pixels.as_ptr(),
                 width: 1, height: 1, stride_bytes: 4,
                 format: TexFormat::Rgba8Unorm as u32,
+                depth: 1, slice_bytes: 0,
                 mip_count: 0, mip_descs: std::ptr::null(),
             },
         ];
@@ -1115,6 +1162,7 @@ mod tests {
             data: mip0_pixels.as_ptr(),
             width: 1, height: 1, stride_bytes: 4,
             format: TexFormat::Rgba8Unorm as u32,
+            depth: 1, slice_bytes: 0,
             mip_count: 2,
             mip_descs: mip_array.as_ptr(),
         };
@@ -1183,7 +1231,8 @@ mod tests {
         unsafe {
             write_helper_pointers(&mut buf,
                 atrium_tex_sample_2d, atrium_tex_fetch_2d,
-                atrium_tex_sample_2d_lod);
+                atrium_tex_sample_2d_lod,
+                atrium_tex_sample_2d_array);
             write_descriptor_slot(&mut buf, 0, tex_a_ptr, samp_a_ptr);
             write_descriptor_slot(&mut buf, 1, tex_b_ptr, samp_b_ptr);
         }
@@ -1210,6 +1259,7 @@ mod tests {
             data: pixels.as_ptr(),
             width: 4, height: 1, stride_bytes: 4,
             format: TexFormat::R8Unorm as u32,
+            depth: 1, slice_bytes: 0,
             mip_count: 0, mip_descs: std::ptr::null(),
         };
         let p = fetch_texel_impl(&desc, 1, 0);

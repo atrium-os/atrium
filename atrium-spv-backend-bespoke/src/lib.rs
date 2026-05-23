@@ -3124,6 +3124,25 @@ fn emit_function(
                     BackendError::Internal(format!(
                         "ImageSampleImplicitLod coord lane 1 {:?} not in scalars",
                         coord_lanes[1].id)))?;
+                // sampler2DArray: a 3-lane coord (u, v, layer)
+                // routes to atrium_tex_sample_2d_array (helper
+                // @ #24) with layer (f32) passed as V2.  Combo
+                // with ExplicitLod is rejected (no _array_lod
+                // helper yet).
+                let is_array = coord_lanes.len() >= 3;
+                let layer_v: Option<asm::Vreg> = if is_array {
+                    Some(*scalars.get(&coord_lanes[2].id).ok_or_else(||
+                        BackendError::Internal(format!(
+                            "ImageSampleImplicitLod array coord lane 2 \
+                             {:?} not in scalars", coord_lanes[2].id)))?)
+                } else { None };
+                if is_array && matches!(&inst.op,
+                    Op::ImageSampleExplicitLod { .. })
+                {
+                    return Err(BackendError::Unsupported(
+                        "sampler2DArray with explicit-LOD not yet \
+                         supported".to_string()));
+                }
 
                 // Snapshot every currently-owned V-reg
                 // *before* allocating the result lanes —
@@ -3173,9 +3192,11 @@ fn emit_function(
                 let v2 = asm::Vreg(2); // parallel-copy temp / LOD slot
                 let v3 = asm::Vreg(3); // LOD hold across u/v copy
                 let lr = asm::Xreg(30);
-                // ExplicitLod uses `atrium_tex_sample_2d_lod`
-                // at helper-table offset #16; ImplicitLod uses
-                // `atrium_tex_sample_2d` at #0.
+                // Helper-table layout:
+                //   #0  sample_2d        (ImplicitLod, 2D)
+                //   #8  fetch_2d
+                //   #16 sample_2d_lod    (ExplicitLod, 2D)
+                //   #24 sample_2d_array  (ImplicitLod, 2DArray)
                 let (helper_off, lod_v): (u16, Option<asm::Vreg>) =
                     match &inst.op {
                         Op::ImageSampleExplicitLod { lod, .. } => {
@@ -3185,9 +3206,17 @@ fn emit_function(
                                      in scalars", lod.id)))?;
                             (16u16, Some(lv))
                         }
+                        _ if is_array => (24u16, None),
                         _ => (0u16, None),
                     };
-                let desc_off: u16 = 24 + (binding as u16) * 16;
+                // For sampler2DArray, the layer (f32) is the
+                // extra param in V2 -- same slot the LOD goes
+                // into for the ExplicitLod path.  We use V3
+                // as the hold register to survive the u/v
+                // parallel-copy.  (LOD and array paths share
+                // V3 since they're mutually exclusive.)
+                let extra_v: Option<asm::Vreg> = lod_v.or(layer_v);
+                let desc_off: u16 = 32 + (binding as u16) * 16;
 
                 // Stack layout (16-byte aligned; each region
                 // is 16 bytes):
@@ -3222,21 +3251,19 @@ fn emit_function(
                 a.emit(asm::ldr_x_offset(x10, x1, desc_off));
                 a.emit(asm::ldr_x_offset(x11, x1, desc_off + 8));
 
-                // ExplicitLod: stash LOD in V3 across the u/v
-                // parallel copy (V0/V1/V2 may collide with the
-                // lod V-reg).  After the copy, move V3 -> V2
-                // so the helper sees LOD in V2 (its 3rd float
-                // arg slot).  All V-regs in the V0..V7 range
-                // are caller-saved + already spilled above,
-                // so freely scribbling V3 here is safe.
-                if let Some(lv) = lod_v {
-                    a.emit(asm::mov_v_16b(v3, lv));
+                // ExplicitLod / sampler2DArray: stash the
+                // extra float arg (LOD or layer) in V3 across
+                // the u/v parallel copy, then move it into V2
+                // for the helper call.  V3 is caller-saved
+                // and already spilled by the earlier dump.
+                if let Some(ev) = extra_v {
+                    a.emit(asm::mov_v_16b(v3, ev));
                 }
                 // u, v → V0, V1, parallel-copy safe via V2.
                 a.emit(asm::mov_v_16b(v2, u_v));
                 a.emit(asm::mov_v_16b(v1, v_v));
                 a.emit(asm::mov_v_16b(v0, v2));
-                if lod_v.is_some() {
+                if extra_v.is_some() {
                     a.emit(asm::mov_v_16b(v2, v3));
                 }
 
@@ -3343,7 +3370,7 @@ fn emit_function(
                 let w1 = asm::Wreg(1);
                 let w2 = asm::Wreg(2);
                 let w3 = asm::Wreg(3);
-                let desc_off: u16 = 24 + (binding as u16) * 16;
+                let desc_off: u16 = 32 + (binding as u16) * 16;
 
                 let n_spill = live_vregs.len() as u16;
                 let frame_bytes: u16 = 32 + n_spill * 16;

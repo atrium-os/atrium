@@ -87,6 +87,7 @@ fn image_fetch_at_one_zero() {
         data: pixels.as_ptr(),
         width: 2, height: 2, stride_bytes: 8,
         format: TexFormat::Rgba8Unorm as u32,
+        depth: 1, slice_bytes: 0,
             mip_count: 0, mip_descs: std::ptr::null(),
     };
     let samp_desc = SamplerDesc {
@@ -101,7 +102,8 @@ fn image_fetch_at_one_zero() {
         write_helper_pointers(&mut uniforms,
             atrium_spv_runtime::atrium_tex_sample_2d,
             atrium_spv_runtime::atrium_tex_fetch_2d,
-            atrium_spv_runtime::atrium_tex_sample_2d_lod);
+            atrium_spv_runtime::atrium_tex_sample_2d_lod,
+            atrium_spv_runtime::atrium_tex_sample_2d_array);
         write_descriptor_slot(&mut uniforms, 0,
             &tex_desc as *const _, &samp_desc as *const _);
     }

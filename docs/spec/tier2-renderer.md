@@ -1119,6 +1119,12 @@ specifically supports:
   backends route `OpImageSampleExplicitLod` through the
   new helper with the LOD passed in V2 (bespoke) or as
   an extra `f32` call arg (Cranelift).
+  `sampler2DArray` (Arc 30) sampling: 3-lane coord routes
+  to `atrium_tex_sample_2d_array` (helper @ #24) with the
+  layer `f32` in V2 / extra-arg position.  `TexDesc` gains
+  `depth` + `slice_bytes` for per-layer addressing.
+  `UNIFORMS_DESC_BASE` grew 24 → 32.  Array + ExplicitLod
+  is deferred (would need an `_array_lod` helper).
   MVP scope: Rgba8Unorm / R32Float / Rgba32Float.  Mip-
   level storage images are supported via `OpImageRead` /
   `OpImageWrite` with `Image-Operands::Lod`: the runtime

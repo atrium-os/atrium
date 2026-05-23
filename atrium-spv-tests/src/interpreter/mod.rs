@@ -1298,6 +1298,8 @@ impl Interpreter {
                     format:       tex.format,
                     mip_count:    0,
                     mip_descs:    std::ptr::null(),
+                    depth:        1,
+                    slice_bytes:  0,
                 };
                 let out = atrium_spv_runtime::sample_2d(
                     &tex.data, &tex_desc, &tex.sampler, u, v);
@@ -1358,6 +1360,8 @@ impl Interpreter {
                     format:       tex.format,
                     mip_count:    0,
                     mip_descs:    std::ptr::null(),
+                    depth:        1,
+                    slice_bytes:  0,
                 };
                 // v1: lod ignored. If the SPIR-V supplies a
                 // Lod via Image Operands we still pass 0 —
