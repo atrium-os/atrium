@@ -57,14 +57,67 @@ pub struct ConstantContext {
 }
 
 impl ConstantContext {
-    /// Walk OpConstant* in declaration order.
+    /// Walk OpConstant* in declaration order, applying no
+    /// spec-constant overrides (each `OpSpecConstant*` keeps
+    /// its SPIR-V-declared default).  Convenience wrapper
+    /// around [`Self::build_with_spec_overrides`].
     pub fn build(
         module: &Module,
         types: &TypeContext,
     ) -> Result<Self, FrontendError> {
+        Self::build_with_spec_overrides(
+            module, types, &std::collections::HashMap::new())
+    }
+
+    /// Walk OpConstant* / OpSpecConstant* in declaration
+    /// order.  `spec_overrides` maps an `OpSpecConstant*`
+    /// result id to its host-supplied 32-bit override value
+    /// (the value's bit-encoding for f32; non-zero=`true` for
+    /// bool).  Missing entries fall through to the
+    /// SPIR-V-declared default.
+    pub fn build_with_spec_overrides(
+        module: &Module,
+        types: &TypeContext,
+        spec_overrides: &std::collections::HashMap<rspirv::spirv::Word, u32>,
+    ) -> Result<Self, FrontendError> {
         let mut ctx = ConstantContext::default();
         for inst in &module.types_global_values {
             let id = match inst.result_id { Some(id) => id, None => continue };
+            // Apply spec-constant override if present: rewrite
+            // the OpSpecConstant{,True,False}'s payload bytes
+            // to the host-supplied value, then fall through to
+            // the regular constant decoder.  Composites carry
+            // no SpecId of their own — only their scalar
+            // operands do, so they need no special handling.
+            let mut inst_owned: Option<rspirv::dr::Instruction>;
+            let inst: &rspirv::dr::Instruction =
+                if let Some(value) = spec_overrides.get(&id).copied() {
+                    inst_owned = Some(inst.clone());
+                    let cloned = inst_owned.as_mut().unwrap();
+                    use rspirv::dr::Operand;
+                    use rspirv::spirv::Op as SpvOp;
+                    match cloned.class.opcode {
+                        SpvOp::SpecConstant => {
+                            // Replace the first literal operand.
+                            if let Some(slot) = cloned.operands.first_mut() {
+                                *slot = Operand::LiteralBit32(value);
+                            }
+                            // Re-tag as a plain Constant so the
+                            // dispatch below decodes it.
+                            cloned.class = rspirv::grammar::INSTRUCTION_TABLE.get(
+                                SpvOp::Constant);
+                        }
+                        SpvOp::SpecConstantTrue | SpvOp::SpecConstantFalse => {
+                            cloned.class = rspirv::grammar::INSTRUCTION_TABLE.get(
+                                if value != 0 { SpvOp::ConstantTrue }
+                                else { SpvOp::ConstantFalse });
+                        }
+                        _ => {}
+                    }
+                    cloned
+                } else {
+                    inst
+                };
             let constant = match inst.class.opcode {
                 // OpSpecConstant{,True,False,Composite} share
                 // the exact wire encoding of their OpConstant

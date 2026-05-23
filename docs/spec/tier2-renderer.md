@@ -978,13 +978,20 @@ specifically supports:
   multiple invocations per "subgroup" with cross-invocation
   buffering).
 - Specialization constants: `OpSpecConstant{,True,False,
-  Composite}` are translated to regular constants using the
-  SPIR-V-declared default values.  `VkSpecializationInfo`
-  plumbing (host-supplied overrides at pipeline-create time)
-  is deferred; the common case of shaders that use spec
-  constants only for compile-time defaults works.
-  `OpSpecConstantOp` (constant expressions on spec constants)
-  is also deferred.
+  Composite}` are translated to regular constants.  The
+  frontend exposes both `translate(spv)` (uses declared
+  defaults) and `translate_with_spec_overrides(spv,
+  &SpecOverrides)` where `SpecOverrides` is a
+  `HashMap<u32 /* SpecId */, u32 /* 32-bit bit pattern */>`.
+  Overrides are applied by rewriting the matching
+  `OpSpecConstant*` instruction in place and re-tagging it
+  as a plain `OpConstant*` before the constants pass.
+  `VkSpecializationInfo` parsing in the vk-icd, daemon
+  cache-key extension, and atrium-spv-compile CLI exposure
+  are still deferred — the IR-level mechanism works end-
+  to-end and is unit-tested.
+  `OpSpecConstantOp` (constant expressions on spec
+  constants) is also deferred.
 - Atomic ops: AtomicIAdd, ISub, IIncrement, IDecrement,
   And, Or, Xor, Exchange, Load, Store,
   CompareExchange, SMin/SMax/UMin/UMax — all lowered to

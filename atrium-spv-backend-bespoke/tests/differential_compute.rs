@@ -4845,6 +4845,126 @@ fn differential_subgroup_ops_size1_degenerate() {
 }
 
 #[test]
+fn differential_spec_constants_host_overrides() {
+    // Same shader shape as differential_spec_constants_default_values,
+    // but compiled with translate_with_spec_overrides({0: 99, 1: 0}).
+    // -> ssbo[0] = 99           (overrides default 7)
+    //    ssbo[1] = 0            (SpecConstantTrue overridden to false)
+    //    ssbo[2] = 99 * 2 = 198 (override flows through IMul)
+    use atrium_spv_frontend::SpecOverrides;
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let i32_ty = b.type_int(32, 1);
+    let bool_ty = b.type_bool();
+    let void_fn = b.type_function(void, vec![]);
+    let rt = b.type_runtime_array(u32_ty);
+    b.decorate(rt, Decoration::ArrayStride,
+        vec![rspirv::dr::Operand::LiteralBit32(4)]);
+    let s = b.type_struct(vec![rt]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_u = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+    let ssbo = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let sc_int = b.spec_constant_bit32(i32_ty, 7u32);
+    b.decorate(sc_int, Decoration::SpecId,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let sc_bool = b.spec_constant_true(bool_ty);
+    b.decorate(sc_bool, Decoration::SpecId,
+        vec![rspirv::dr::Operand::LiteralBit32(1)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    let c_one  = b.constant_bit32(u32_ty, 1);
+    let c_two_u = b.constant_bit32(u32_ty, 2);
+    let c_two_i = b.constant_bit32(i32_ty, 2u32);
+    let c_zero_u = b.constant_bit32(u32_ty, 0);
+    let c_one_u  = b.constant_bit32(u32_ty, 1);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let sc_u = b.bitcast(u32_ty, None, sc_int).unwrap();
+    let p0 = b.access_chain(ptr_u, None, ssbo, vec![c_zero, c_zero]).unwrap();
+    b.store(p0, sc_u, None, vec![]).unwrap();
+    let sel = b.select(u32_ty, None, sc_bool, c_one_u, c_zero_u).unwrap();
+    let p1 = b.access_chain(ptr_u, None, ssbo, vec![c_zero, c_one]).unwrap();
+    b.store(p1, sel, None, vec![]).unwrap();
+    let prod = b.i_mul(i32_ty, None, sc_int, c_two_i).unwrap();
+    let prod_u = b.bitcast(u32_ty, None, prod).unwrap();
+    let p2 = b.access_chain(ptr_u, None, ssbo, vec![c_zero, c_two_u]).unwrap();
+    b.store(p2, prod_u, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spv = Vec::with_capacity(words.len() * 4);
+    for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+
+    // Override SpecId 0 -> 99, SpecId 1 -> 0 (false).
+    let mut overrides = SpecOverrides::new();
+    overrides.insert(0, 99);
+    overrides.insert(1, 0);
+
+    // Compile through both backends using the overrides path,
+    // then dlopen + run inline.  Mirrors invoke()'s shape.
+    let run_one = |use_bespoke: bool, name: &str,
+                   out_ptr: *mut u8| {
+        let dir = TempDir::new().unwrap();
+        let module = atrium_spv_frontend::translate_with_spec_overrides(
+            &spv, &overrides).expect("frontend");
+        let obj = if use_bespoke {
+            let t = if cfg!(target_os = "macos") {
+                BespokeTarget::Aarch64Darwin
+            } else { BespokeTarget::Aarch64FreeBSD };
+            bespoke_compile(&module, t).expect("bespoke compile").object
+        } else {
+            cranelift_compile(&module, CraneliftTarget::host())
+                .expect("cranelift compile").object
+        };
+        let obj_path = dir.path().join(format!("{name}.o"));
+        std::fs::write(&obj_path, &obj).unwrap();
+        let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
+        let lib_path = dir.path().join(format!("{name}.{ext}"));
+        link_to_shared_library(&obj_path, &lib_path).expect("link");
+        let lib = unsafe { libloading::Library::new(&lib_path) }
+            .expect("dlopen");
+        let cs_main: libloading::Symbol<CsMain> = unsafe {
+            lib.get(b"atrium_cs_main").expect("atrium_cs_main symbol")
+        };
+        unsafe {
+            cs_main(std::ptr::null(), std::ptr::null(), out_ptr,
+                0, 0, 0, 0, 0, 0, std::ptr::null_mut());
+        }
+        // Drop in order: lib must outlive cs_main use.
+        drop(cs_main);
+        drop(lib);
+    };
+    let mut b_buf = vec![0u8; 12];
+    let mut c_buf = vec![0u8; 12];
+    run_one(true,  "b_ov", b_buf.as_mut_ptr());
+    run_one(false, "c_ov", c_buf.as_mut_ptr());
+    assert_eq!(b_buf, c_buf,
+        "spec-constant overrides diverge between backends");
+    let at = |i: usize| u32::from_le_bytes(
+        b_buf[i*4..i*4+4].try_into().unwrap());
+    assert_eq!(at(0),  99, "scalar SpecConstant override");
+    assert_eq!(at(1),   0, "SpecConstantTrue overridden to false");
+    assert_eq!(at(2), 198, "override flows through IMul: 99*2");
+}
+
+#[test]
 fn differential_spec_constants_default_values() {
     // OpSpecConstant{,True,False,Composite} -- when no
     // VkSpecializationInfo is supplied, Tier-2 v1 uses the

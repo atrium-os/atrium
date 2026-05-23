@@ -74,7 +74,33 @@ use rspirv::dr;
 /// [`atrium_spv_ir::Module`]. Validates SPIR-V structural
 /// invariants along the way; rejects unstructured CFGs
 /// per constraint A1.
+/// Per-SpecId override values supplied by the host (the
+/// SPIR-V-side mirror of `VkSpecializationInfo`).  Each entry
+/// maps the SPIR-V `SpecId` decoration's integer constant to
+/// the raw 32-bit override value.  Boolean spec constants
+/// interpret a non-zero override as `true`; i32 / u32 / f32
+/// spec constants use the bit pattern directly (so an f32
+/// override is `f32::to_bits(v)`).  Spec constants without an
+/// override entry retain their SPIR-V-declared default.
+pub type SpecOverrides = std::collections::HashMap<u32, u32>;
+
+/// Translate SPIR-V to the IR using the SPIR-V-declared
+/// default values for every spec constant.  Convenience
+/// wrapper around [`translate_with_spec_overrides`].
 pub fn translate(spirv: &[u8]) -> Result<Module, FrontendError> {
+    translate_with_spec_overrides(spirv, &SpecOverrides::default())
+}
+
+/// Translate SPIR-V to the IR, applying host-supplied
+/// spec-constant overrides.  `overrides` maps a SPIR-V
+/// `SpecId` (the integer literal of the `Decoration::SpecId`
+/// annotation on an `OpSpecConstant*`) to its replacement
+/// 32-bit value.  Unmatched spec constants keep their
+/// declared defaults.
+pub fn translate_with_spec_overrides(
+    spirv: &[u8],
+    overrides: &SpecOverrides,
+) -> Result<Module, FrontendError> {
     // ── 0. Build the byte-offset table for source-position
     //       preservation through the IR (constraint A2).
     let offsets = OffsetTable::build(spirv)?;
@@ -114,7 +140,34 @@ pub fn translate(spirv: &[u8]) -> Result<Module, FrontendError> {
 
     // ── 3. Index types + constants + variables ──────────────
     let type_ctx = types::TypeContext::build(&rspirv_module)?;
-    let const_ctx = constants::ConstantContext::build(&rspirv_module, &type_ctx)?;
+    // Resolve VkSpecializationInfo-style overrides: walk
+    // OpDecorate * SpecId N to build a result_id -> override
+    // map, then feed it into the constants pass so each
+    // OpSpecConstant* sees the host-supplied value (if any)
+    // in place of its SPIR-V-declared default.
+    let mut spec_id_overrides: std::collections::HashMap<rspirv::spirv::Word, u32>
+        = std::collections::HashMap::new();
+    for inst in &rspirv_module.annotations {
+        if inst.class.opcode != rspirv::spirv::Op::Decorate { continue; }
+        let target = match inst.operands.first() {
+            Some(rspirv::dr::Operand::IdRef(id)) => *id,
+            _ => continue,
+        };
+        let kind = match inst.operands.get(1) {
+            Some(rspirv::dr::Operand::Decoration(d)) => *d,
+            _ => continue,
+        };
+        if kind != rspirv::spirv::Decoration::SpecId { continue; }
+        let spec_id = match inst.operands.get(2) {
+            Some(rspirv::dr::Operand::LiteralBit32(v)) => *v,
+            _ => continue,
+        };
+        if let Some(value) = overrides.get(&spec_id).copied() {
+            spec_id_overrides.insert(target, value);
+        }
+    }
+    let const_ctx = constants::ConstantContext::build_with_spec_overrides(
+        &rspirv_module, &type_ctx, &spec_id_overrides)?;
     let iface_ctx = interface::InterfaceContext::build(
         &rspirv_module, &type_ctx,
     )?;
