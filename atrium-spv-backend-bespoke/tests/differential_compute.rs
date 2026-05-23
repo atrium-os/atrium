@@ -5246,6 +5246,91 @@ fn differential_spec_constants_default_values() {
 }
 
 #[test]
+fn differential_glsl_ldexp() {
+    // Ldexp(x, n) = x * 2^n.  Verified against f32 truth
+    // (libm computes the same value via the same exponent
+    // injection trick).
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    // (x, n, expected)
+    let cases: &[(f32, i32, f32)] = &[
+        (1.0, 0, 1.0),
+        (1.0, 3, 8.0),
+        (1.0, -2, 0.25),
+        (3.5, 2, 14.0),
+        (-7.5, 1, -15.0),
+        (0.0, 5, 0.0),
+        (1.5, 10, 1.5 * 1024.0),
+    ];
+    for &(x, n, want) in cases {
+        let mut b = rspirv::dr::Builder::new();
+        b.set_version(1, 3);
+        b.capability(Capability::Shader);
+        b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+        let std_450 = b.ext_inst_import("GLSL.std.450");
+        let void   = b.type_void();
+        let u32_ty = b.type_int(32, 0);
+        let i32_ty = b.type_int(32, 1);
+        let f32_ty = b.type_float(32, None);
+        let void_fn = b.type_function(void, vec![]);
+        let rt = b.type_runtime_array(u32_ty);
+        b.decorate(rt, Decoration::ArrayStride,
+            vec![rspirv::dr::Operand::LiteralBit32(4)]);
+        let s = b.type_struct(vec![rt]);
+        b.decorate(s, Decoration::Block, vec![]);
+        b.member_decorate(s, 0, Decoration::Offset,
+            vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+        let ptr_u = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+        let ssbo = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+        b.decorate(ssbo, Decoration::DescriptorSet,
+            vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        b.decorate(ssbo, Decoration::Binding,
+            vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        let c_zero = b.constant_bit32(u32_ty, 0);
+        let x_c = b.constant_bit32(f32_ty, x.to_bits());
+        let n_c = b.constant_bit32(i32_ty, n as u32);
+        let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+        b.begin_block(None).unwrap();
+        let r = b.ext_inst(f32_ty, None, std_450, 53,
+            vec![
+                rspirv::dr::Operand::IdRef(x_c),
+                rspirv::dr::Operand::IdRef(n_c),
+            ]).unwrap();
+        let r_u = b.bitcast(u32_ty, None, r).unwrap();
+        let p = b.access_chain(ptr_u, None, ssbo, vec![c_zero, c_zero]).unwrap();
+        b.store(p, r_u, None, vec![]).unwrap();
+        b.ret().unwrap();
+        b.end_function().unwrap();
+        b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+        b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+        let words: Vec<u32> = b.module().assemble();
+        let mut spv = Vec::with_capacity(words.len() * 4);
+        for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+        let dir = TempDir::new().unwrap();
+        let mut b_buf = vec![0u8; 4];
+        let mut c_buf = vec![0u8; 4];
+        invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
+        invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+        assert_eq!(b_buf, c_buf,
+            "Ldexp({x}, {n}) diverges between backends");
+        let got = f32::from_bits(u32::from_le_bytes(
+            b_buf[0..4].try_into().unwrap()));
+        if want == 0.0 {
+            assert_eq!(got, 0.0,
+                "Ldexp({x}, {n}): got {got}, want 0.0");
+        } else {
+            let tol = want.abs() * 1e-6;
+            assert!((got - want).abs() <= tol,
+                "Ldexp({x}, {n}): got {got}, want {want}");
+        }
+    }
+}
+
+#[test]
 fn differential_glsl_face_forward() {
     // FaceForward(N, I, Nref):
     //   dot(Nref, I) < 0 -> N (positively oriented)

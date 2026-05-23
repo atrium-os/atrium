@@ -2317,6 +2317,59 @@ fn translate_inst(
                         source_spirv_offset, insts, next_value_id);
                     Op::FMul(l, c_half_ln2)
                 }
+                53 => {
+                    // Ldexp(x, n) = x * 2^n  (f32, scalar).
+                    // Synthesise 2^n via the IEEE-754 exponent
+                    // bias trick: a normal f32 with sign=0,
+                    // exponent=127+n, mantissa=0 has the value
+                    // 2^n.  No subnormal / overflow handling
+                    // -- callers staying in the [-126, 127]
+                    // exponent range get exact results.
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let n_id = expect_id(&spv_inst.operands, 3)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let n = resolve_value(n_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let c_127 = push_ci(127, atrium_spv_ir::IntKind::I32,
+                        source_spirv_offset, insts, next_value_id);
+                    let c_23 = push_ci(23, atrium_spv_ir::IntKind::U32,
+                        source_spirv_offset, insts, next_value_id);
+                    let biased = {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let v = Value { id, ty: Type::I32 };
+                        insts.push(Inst {
+                            op: Op::IAdd(c_127, n),
+                            result: Some(v.clone()),
+                            source_spirv_offset,
+                        });
+                        v
+                    };
+                    let bits = {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let v = Value { id, ty: Type::I32 };
+                        insts.push(Inst {
+                            op: Op::Shl(biased, c_23),
+                            result: Some(v.clone()),
+                            source_spirv_offset,
+                        });
+                        v
+                    };
+                    let two_n = {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let v = Value { id, ty: Type::F32 };
+                        insts.push(Inst {
+                            op: Op::Bitcast(bits, Type::F32),
+                            result: Some(v.clone()),
+                            source_spirv_offset,
+                        });
+                        v
+                    };
+                    Op::FMul(x, two_n)
+                }
                 70 => {
                     // FaceForward(N, I, Nref):
                     //   return N if dot(Nref, I) < 0, else -N.
