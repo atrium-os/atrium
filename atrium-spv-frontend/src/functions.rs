@@ -2161,6 +2161,24 @@ fn translate_inst(
                         source_spirv_offset, insts, next_value_id);
                     Op::FMul(l, c_half_ln2)
                 }
+                11 => {
+                    // Radians(deg) = deg * (π/180).
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let c = push_cf(std::f64::consts::PI / 180.0,
+                        source_spirv_offset, insts, next_value_id);
+                    Op::FMul(x, c)
+                }
+                12 => {
+                    // Degrees(rad) = rad * (180/π).
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let c = push_cf(180.0 / std::f64::consts::PI,
+                        source_spirv_offset, insts, next_value_id);
+                    Op::FMul(x, c)
+                }
                 58 => {
                     // PackHalf2x16(vec2) -> u32.
                     let x_id = expect_id(&spv_inst.operands, 2)?;

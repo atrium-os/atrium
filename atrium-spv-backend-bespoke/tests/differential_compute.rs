@@ -4563,6 +4563,77 @@ fn differential_storage_image_atomic_add() {
 }
 
 #[test]
+fn differential_storage_image_atomic_cas() {
+    // imageAtomicCompareSwap via the OpImageTexelPointer +
+    // OpAtomicCompareExchange chain.  2x1 R32 image; texel
+    // (0,0) prefilled with 42 (CAS matches -> swap to 99),
+    // texel (1,0) prefilled with 7 (CAS mismatches -> stays).
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, Dim,
+        ExecutionMode, ExecutionModel, FunctionControl, ImageFormat,
+        MemoryModel, MemorySemantics, Scope, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let v3u    = b.type_vector(u32_ty, 3);
+    let void_fn = b.type_function(void, vec![]);
+    let img_ty = b.type_image(u32_ty, Dim::Dim2D, 0, 0, 0, 2,
+        ImageFormat::R32ui, None);
+    let ptr_img = b.type_pointer(None, StorageClass::UniformConstant, img_ty);
+    let img_var = b.variable(ptr_img, None, StorageClass::UniformConstant, None);
+    b.decorate(img_var, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(img_var, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_texel = b.type_pointer(None, StorageClass::Image, u32_ty);
+    let ptr_v3u_in = b.type_pointer(None, StorageClass::Input, v3u);
+    let gid_var = b.variable(ptr_v3u_in, None, StorageClass::Input, None);
+    b.decorate(gid_var, Decoration::BuiltIn,
+        vec![rspirv::dr::Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+    let c_zero   = b.constant_bit32(u32_ty, 0);
+    let c_42     = b.constant_bit32(u32_ty, 42);
+    let c_99     = b.constant_bit32(u32_ty, 99);
+    let c_scope  = b.constant_bit32(u32_ty, Scope::Device as u32);
+    let c_sem    = b.constant_bit32(u32_ty,
+        MemorySemantics::ATOMIC_COUNTER_MEMORY.bits());
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let gid = b.load(v3u, None, gid_var, None, vec![]).unwrap();
+    let texel_ptr = b.image_texel_pointer(ptr_texel, None,
+        img_var, gid, c_zero).unwrap();
+    // CAS(*ptr, comparator=42, desired=99) — succeeds only
+    // where the texel is exactly 42.
+    let _ = b.atomic_compare_exchange(u32_ty, None, texel_ptr,
+        c_scope, c_sem, c_sem, c_99, c_42).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main",
+        vec![img_var, gid_var]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spv = Vec::with_capacity(words.len() * 4);
+    for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+
+    let (w, h) = (2u32, 1u32);
+    let mut img = vec![0u8; (w * h * 4) as usize];
+    img[0..4].copy_from_slice(&42u32.to_le_bytes()); // (0,0) -> 42 (match)
+    img[4..8].copy_from_slice(&7u32.to_le_bytes());  // (1,0) -> 7  (no match)
+    let gids = [(0u32, 0u32, 0u32), (1u32, 0u32, 0u32)];
+    let dir = TempDir::new().unwrap();
+    invoke_compute_image(&spv, true, dir.path(), "b",
+        &mut img, w, h, 1, 1, &gids);
+    let got0 = u32::from_le_bytes(img[0..4].try_into().unwrap());
+    let got1 = u32::from_le_bytes(img[4..8].try_into().unwrap());
+    assert_eq!(got0, 99, "CAS hit: 42 -> 99");
+    assert_eq!(got1,  7, "CAS miss: 7 stays");
+}
+
+#[test]
 fn differential_storage_image_3d_atomic_add() {
     // image3D imageAtomicAdd: a 2×2×2 R32 storage image,
     // texel pointer formed via OpImageTexelPointer with a
@@ -4653,6 +4724,91 @@ fn differential_storage_image_3d_atomic_add() {
                     "texel ({x},{y},{z}): got {got}, want {want}");
             }
         }
+    }
+}
+
+#[test]
+fn differential_glsl_radians_degrees() {
+    // Radians(180) ≈ π; Degrees(π) ≈ 180.  Round-trip a few
+    // angles through both and compare to f32 truth.
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    // Each invocation reads ssbo[i*2], applies Radians then
+    // Degrees (round-trip), and writes to ssbo[i*2+1].
+    let cases: &[f32] = &[0.0, 45.0, 90.0, 180.0, 270.0, -123.5];
+    for &deg in cases {
+        let mut b = rspirv::dr::Builder::new();
+        b.set_version(1, 3);
+        b.capability(Capability::Shader);
+        b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+        let std_450 = b.ext_inst_import("GLSL.std.450");
+        let void   = b.type_void();
+        let u32_ty = b.type_int(32, 0);
+        let f32_ty = b.type_float(32, None);
+        let void_fn = b.type_function(void, vec![]);
+        let rt = b.type_runtime_array(f32_ty);
+        b.decorate(rt, Decoration::ArrayStride,
+            vec![rspirv::dr::Operand::LiteralBit32(4)]);
+        let s = b.type_struct(vec![rt]);
+        b.decorate(s, Decoration::Block, vec![]);
+        b.member_decorate(s, 0, Decoration::Offset,
+            vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+        let ptr_f = b.type_pointer(None, StorageClass::StorageBuffer, f32_ty);
+        let ssbo = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+        b.decorate(ssbo, Decoration::DescriptorSet,
+            vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        b.decorate(ssbo, Decoration::Binding,
+            vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        let c_zero = b.constant_bit32(u32_ty, 0);
+        let c_one  = b.constant_bit32(u32_ty, 1);
+        let c_two  = b.constant_bit32(u32_ty, 2);
+        let c_in = b.constant_bit32(f32_ty, deg.to_bits());
+        let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+        b.begin_block(None).unwrap();
+        // r = Radians(deg)
+        let r = b.ext_inst(f32_ty, None, std_450, 11,
+            vec![rspirv::dr::Operand::IdRef(c_in)]).unwrap();
+        // d = Degrees(r)
+        let d = b.ext_inst(f32_ty, None, std_450, 12,
+            vec![rspirv::dr::Operand::IdRef(r)]).unwrap();
+        // ssbo[0] = r; ssbo[1] = d; ssbo[2] = deg (oracle).
+        let p0 = b.access_chain(ptr_f, None, ssbo, vec![c_zero, c_zero]).unwrap();
+        b.store(p0, r, None, vec![]).unwrap();
+        let p1 = b.access_chain(ptr_f, None, ssbo, vec![c_zero, c_one]).unwrap();
+        b.store(p1, d, None, vec![]).unwrap();
+        let p2 = b.access_chain(ptr_f, None, ssbo, vec![c_zero, c_two]).unwrap();
+        b.store(p2, c_in, None, vec![]).unwrap();
+        b.ret().unwrap();
+        b.end_function().unwrap();
+        b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+        b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+        let words: Vec<u32> = b.module().assemble();
+        let mut spv = Vec::with_capacity(words.len() * 4);
+        for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+        let dir = TempDir::new().unwrap();
+        let mut b_buf = vec![0u8; 12];
+        let mut c_buf = vec![0u8; 12];
+        invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
+        invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+        assert_eq!(b_buf, c_buf,
+            "Radians/Degrees diverges for deg={deg}");
+        let f32_at = |buf: &[u8], i: usize| -> f32 {
+            f32::from_le_bytes(buf[i*4..i*4+4].try_into().unwrap())
+        };
+        let want_rad = deg * (std::f32::consts::PI / 180.0);
+        let want_deg = want_rad * (180.0 / std::f32::consts::PI);
+        let got_rad = f32_at(&b_buf, 0);
+        let got_deg = f32_at(&b_buf, 1);
+        let tol = (deg.abs() * 1e-5).max(1e-5);
+        assert!((got_rad - want_rad).abs() <= tol,
+            "Radians({deg}): got {got_rad}, want {want_rad}");
+        assert!((got_deg - deg).abs() <= tol,
+            "Degrees(Radians({deg})): got {got_deg}, want {deg}");
+        let _ = want_deg;
     }
 }
 
