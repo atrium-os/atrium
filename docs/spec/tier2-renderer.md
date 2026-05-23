@@ -1100,6 +1100,15 @@ specifically supports:
   directly off the `ImageDesc` (fields @ #8 / #12 / #24) —
   no helper call; returns uvec2 for image2D, uvec3 for
   image3D.  Both backends.
+- `image2DArray` storage images share the image3D code
+  path: a 3-lane coord routes to the 3D helper / texel-
+  pointer arithmetic, with the `ImageDesc.depth` field
+  carrying the layer count and `slice_bytes` the per-
+  layer byte stride.  No additional IR or backend work
+  was required — verified end-to-end by a differential
+  test that writes (x, y, layer, 1.0) per invocation on
+  a 2×2×3 array and reads back identical bytes from both
+  backends.
   MVP scope: single-mip, Rgba8Unorm / R32Float /
   Rgba32Float.  Mip / array images are deferred.
 - GLSL.std.450 ExtInst dispatch for: FAbs, SAbs, Floor,
