@@ -4665,6 +4665,115 @@ fn differential_storage_image_atomic_add() {
 }
 
 #[test]
+fn differential_storage_image_atomic_full_coverage() {
+    // Verifies that the full OpAtomic* set composes with
+    // OpImageTexelPointer end-to-end -- no new IR / backend
+    // code, just a test that documents what actually works.
+    // One tiny shader per atomic variant (the bespoke int RA
+    // pool would otherwise saturate if we packed eight
+    // atomics into one shader).  Op variants exercised:
+    //   And / Or / Xor / SMin / SMax / UMin / UMax / Exchange
+    // (Add and CompareExchange already have their own tests.)
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, Dim,
+        ExecutionMode, ExecutionModel, FunctionControl, ImageFormat,
+        MemoryModel, MemorySemantics, Op as SpvOp, Scope, StorageClass,
+    };
+    // Each tuple: (label, atomic-op, initial, operand, expected)
+    let cases: &[(&str, SpvOp, u32, u32, u32)] = &[
+        ("And",      SpvOp::AtomicAnd,      0xFF0F, 0x0FF0, 0x0F00),
+        ("Or",       SpvOp::AtomicOr,       0x000F, 0x0FF0, 0x0FFF),
+        ("Xor",      SpvOp::AtomicXor,      0xFFFF, 0x00FF, 0xFF00),
+        ("SMin_pos", SpvOp::AtomicSMin,         9,     17,      9),
+        ("SMax_pos", SpvOp::AtomicSMax,         9,     17,     17),
+        ("UMin",     SpvOp::AtomicUMin,        50,     30,     30),
+        ("UMax",     SpvOp::AtomicUMax,        50,     30,     50),
+        ("Exchange", SpvOp::AtomicExchange, 0xDEAD, 0xBEEF, 0xBEEF),
+    ];
+    let build_spv = |op: SpvOp, operand: u32| -> Vec<u8> {
+        let mut b = rspirv::dr::Builder::new();
+        b.set_version(1, 3);
+        b.capability(Capability::Shader);
+        b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+        let void   = b.type_void();
+        let u32_ty = b.type_int(32, 0);
+        let v3u    = b.type_vector(u32_ty, 3);
+        let void_fn = b.type_function(void, vec![]);
+        let img_ty = b.type_image(u32_ty, Dim::Dim2D, 0, 0, 0, 2,
+            ImageFormat::R32ui, None);
+        let ptr_img = b.type_pointer(None,
+            StorageClass::UniformConstant, img_ty);
+        let img_var = b.variable(ptr_img, None,
+            StorageClass::UniformConstant, None);
+        b.decorate(img_var, Decoration::DescriptorSet,
+            vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        b.decorate(img_var, Decoration::Binding,
+            vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        let ptr_texel = b.type_pointer(None, StorageClass::Image, u32_ty);
+        let ptr_v3u_in = b.type_pointer(None, StorageClass::Input, v3u);
+        let gid_var = b.variable(ptr_v3u_in, None, StorageClass::Input, None);
+        b.decorate(gid_var, Decoration::BuiltIn,
+            vec![rspirv::dr::Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+        let c_zero  = b.constant_bit32(u32_ty, 0);
+        let c_op    = b.constant_bit32(u32_ty, operand);
+        let c_scope = b.constant_bit32(u32_ty, Scope::Device as u32);
+        let c_sem   = b.constant_bit32(u32_ty,
+            MemorySemantics::ATOMIC_COUNTER_MEMORY.bits());
+        let main = b.begin_function(void, None,
+            FunctionControl::NONE, void_fn).unwrap();
+        b.begin_block(None).unwrap();
+        let gid = b.load(v3u, None, gid_var, None, vec![]).unwrap();
+        let texel_ptr = b.image_texel_pointer(ptr_texel, None,
+            img_var, gid, c_zero).unwrap();
+        let _ = match op {
+            SpvOp::AtomicAnd  => b.atomic_and(u32_ty, None, texel_ptr,
+                c_scope, c_sem, c_op),
+            SpvOp::AtomicOr   => b.atomic_or(u32_ty, None, texel_ptr,
+                c_scope, c_sem, c_op),
+            SpvOp::AtomicXor  => b.atomic_xor(u32_ty, None, texel_ptr,
+                c_scope, c_sem, c_op),
+            SpvOp::AtomicSMin => b.atomic_s_min(u32_ty, None, texel_ptr,
+                c_scope, c_sem, c_op),
+            SpvOp::AtomicSMax => b.atomic_s_max(u32_ty, None, texel_ptr,
+                c_scope, c_sem, c_op),
+            SpvOp::AtomicUMin => b.atomic_u_min(u32_ty, None, texel_ptr,
+                c_scope, c_sem, c_op),
+            SpvOp::AtomicUMax => b.atomic_u_max(u32_ty, None, texel_ptr,
+                c_scope, c_sem, c_op),
+            SpvOp::AtomicExchange => b.atomic_exchange(u32_ty, None,
+                texel_ptr, c_scope, c_sem, c_op),
+            _ => unreachable!(),
+        }.unwrap();
+        b.ret().unwrap();
+        b.end_function().unwrap();
+        b.entry_point(ExecutionModel::GLCompute, main, "main",
+            vec![img_var, gid_var]);
+        b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+        let words: Vec<u32> = b.module().assemble();
+        let mut bytes = Vec::with_capacity(words.len() * 4);
+        for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+        bytes
+    };
+    for &(label, op, initial, operand, expected) in cases {
+        let spv = build_spv(op, operand);
+        let mut b_img = initial.to_le_bytes().to_vec();
+        let mut c_img = b_img.clone();
+        let dir = TempDir::new().unwrap();
+        invoke_compute_image(&spv, true,  dir.path(), "b",
+            &mut b_img, 1, 1, 1, 1, &[(0, 0, 0)]);
+        invoke_compute_image(&spv, false, dir.path(), "c",
+            &mut c_img, 1, 1, 1, 1, &[(0, 0, 0)]);
+        assert_eq!(b_img, c_img,
+            "{label}: image atomic {op:?} diverges between backends");
+        let got = u32::from_le_bytes(
+            b_img[0..4].try_into().unwrap());
+        assert_eq!(got, expected,
+            "{label}: image{op:?}({initial:#x}, {operand:#x}) = {got:#x}, want {expected:#x}");
+    }
+}
+
+#[test]
 fn differential_storage_image_atomic_cas() {
     // imageAtomicCompareSwap via the OpImageTexelPointer +
     // OpAtomicCompareExchange chain.  2x1 R32 image; texel
