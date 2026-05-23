@@ -5246,6 +5246,107 @@ fn differential_spec_constants_default_values() {
 }
 
 #[test]
+fn differential_glsl_round_ssign_fma() {
+    // GLSL.std.450 Round (#1) round-half-away-from-zero,
+    // SSign (#7) integer sign, Fma (#50) fused multiply-add.
+    // ssbo[0] = bitcast(Round(in_f))
+    // ssbo[1] = bitcast(SSign(in_i))
+    // ssbo[2] = bitcast(Fma(a, b, c))
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    // (label, in_f, in_i, fma_abc, exp_round, exp_ssign, exp_fma)
+    let cases: &[(&str, f32, i32, [f32; 3], f32, i32, f32)] = &[
+        ("zero",   0.0,   0, [0.0, 0.0, 0.0],   0.0,   0, 0.0),
+        ("half_p", 0.5,   5, [2.0, 3.0, 1.0],   1.0,   1, 7.0),
+        ("half_n",-0.5,  -5, [2.0, 3.0,-1.0],  -1.0,  -1, 5.0),
+        ("frac_p", 1.4,   1, [0.5, 0.5, 0.25],  1.0,   1, 0.5),
+        ("frac_n",-1.6, -42, [10.0,-3.0, 4.0], -2.0,  -1,-26.0),
+    ];
+    for &(label, in_f, in_i, abc, exp_r, exp_s, exp_f) in cases {
+        let mut b = rspirv::dr::Builder::new();
+        b.set_version(1, 3);
+        b.capability(Capability::Shader);
+        b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+        let std_450 = b.ext_inst_import("GLSL.std.450");
+        let void   = b.type_void();
+        let u32_ty = b.type_int(32, 0);
+        let i32_ty = b.type_int(32, 1);
+        let f32_ty = b.type_float(32, None);
+        let void_fn = b.type_function(void, vec![]);
+        let rt = b.type_runtime_array(u32_ty);
+        b.decorate(rt, Decoration::ArrayStride,
+            vec![rspirv::dr::Operand::LiteralBit32(4)]);
+        let s = b.type_struct(vec![rt]);
+        b.decorate(s, Decoration::Block, vec![]);
+        b.member_decorate(s, 0, Decoration::Offset,
+            vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+        let ptr_u = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+        let ssbo = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+        b.decorate(ssbo, Decoration::DescriptorSet,
+            vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        b.decorate(ssbo, Decoration::Binding,
+            vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        let c_zero = b.constant_bit32(u32_ty, 0);
+        let c_one  = b.constant_bit32(u32_ty, 1);
+        let c_two  = b.constant_bit32(u32_ty, 2);
+        let in_f_c = b.constant_bit32(f32_ty, in_f.to_bits());
+        let in_i_c = b.constant_bit32(i32_ty, in_i as u32);
+        let a_c = b.constant_bit32(f32_ty, abc[0].to_bits());
+        let b_c = b.constant_bit32(f32_ty, abc[1].to_bits());
+        let c_c = b.constant_bit32(f32_ty, abc[2].to_bits());
+        let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+        b.begin_block(None).unwrap();
+        let round_v = b.ext_inst(f32_ty, None, std_450, 1,
+            vec![rspirv::dr::Operand::IdRef(in_f_c)]).unwrap();
+        let ssign_v = b.ext_inst(i32_ty, None, std_450, 7,
+            vec![rspirv::dr::Operand::IdRef(in_i_c)]).unwrap();
+        let fma_v = b.ext_inst(f32_ty, None, std_450, 50,
+            vec![
+                rspirv::dr::Operand::IdRef(a_c),
+                rspirv::dr::Operand::IdRef(b_c),
+                rspirv::dr::Operand::IdRef(c_c),
+            ]).unwrap();
+        let round_u = b.bitcast(u32_ty, None, round_v).unwrap();
+        let ssign_u = b.bitcast(u32_ty, None, ssign_v).unwrap();
+        let fma_u = b.bitcast(u32_ty, None, fma_v).unwrap();
+        let p0 = b.access_chain(ptr_u, None, ssbo, vec![c_zero, c_zero]).unwrap();
+        b.store(p0, round_u, None, vec![]).unwrap();
+        let p1 = b.access_chain(ptr_u, None, ssbo, vec![c_zero, c_one]).unwrap();
+        b.store(p1, ssign_u, None, vec![]).unwrap();
+        let p2 = b.access_chain(ptr_u, None, ssbo, vec![c_zero, c_two]).unwrap();
+        b.store(p2, fma_u, None, vec![]).unwrap();
+        b.ret().unwrap();
+        b.end_function().unwrap();
+        b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+        b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+        let words: Vec<u32> = b.module().assemble();
+        let mut spv = Vec::with_capacity(words.len() * 4);
+        for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+        let dir = TempDir::new().unwrap();
+        let mut b_buf = vec![0u8; 12];
+        let mut c_buf = vec![0u8; 12];
+        invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
+        invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+        assert_eq!(b_buf, c_buf, "{label}: Round/SSign/Fma diverges");
+        let f32_at = |i: usize| f32::from_le_bytes(
+            b_buf[i*4..i*4+4].try_into().unwrap());
+        let i32_at = |i: usize| i32::from_le_bytes(
+            b_buf[i*4..i*4+4].try_into().unwrap());
+        assert!((f32_at(0) - exp_r).abs() < 1e-5,
+            "{label}: Round({in_f}) -> {}, want {exp_r}", f32_at(0));
+        assert_eq!(i32_at(1), exp_s,
+            "{label}: SSign({in_i}) -> {}, want {exp_s}", i32_at(1));
+        assert!((f32_at(2) - exp_f).abs() < 1e-5,
+            "{label}: Fma({},{},{}) -> {}, want {exp_f}",
+            abc[0], abc[1], abc[2], f32_at(2));
+    }
+}
+
+#[test]
 fn differential_glsl_radians_degrees() {
     // Radians(180) ≈ π; Degrees(π) ≈ 180.  Round-trip a few
     // angles through both and compare to f32 truth.

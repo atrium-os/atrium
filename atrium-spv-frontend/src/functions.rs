@@ -2317,6 +2317,124 @@ fn translate_inst(
                         source_spirv_offset, insts, next_value_id);
                     Op::FMul(l, c_half_ln2)
                 }
+                1 => {
+                    // Round(x): round-half-away-from-zero.
+                    //   absx       = FAbs(x)
+                    //   sum        = absx + 0.5
+                    //   floored    = Floor(sum)
+                    //   is_neg     = x < 0.0
+                    //   neg_floor  = -floored
+                    //   result     = is_neg ? neg_floor : floored
+                    // Matches glslang's GL_OES_standard_derivatives
+                    // round-half-away-from-zero semantics (Round(0.5)
+                    // = 1, Round(-0.5) = -1).
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let absx = push_f32(Op::FAbs(x.clone()),
+                        source_spirv_offset, insts, next_value_id);
+                    let half = push_cf(0.5,
+                        source_spirv_offset, insts, next_value_id);
+                    let sum = push_f32(Op::FAdd(absx, half),
+                        source_spirv_offset, insts, next_value_id);
+                    let floored = push_f32(Op::FFloor(sum),
+                        source_spirv_offset, insts, next_value_id);
+                    let zero = push_cf(0.0,
+                        source_spirv_offset, insts, next_value_id);
+                    // FSub(0, floored) -- avoids FNeg (which
+                    // the bespoke backend doesn't lower today).
+                    let neg_floor = push_f32(
+                        Op::FSub(zero.clone(), floored.clone()),
+                        source_spirv_offset, insts, next_value_id);
+                    let is_neg = {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let v = Value { id, ty: Type::Bool };
+                        insts.push(Inst {
+                            op: Op::FOrdLt(x, zero),
+                            result: Some(v.clone()),
+                            source_spirv_offset,
+                        });
+                        v
+                    };
+                    Op::Select {
+                        cond: is_neg,
+                        t_val: neg_floor,
+                        f_val: floored,
+                    }
+                }
+                7 => {
+                    // SSign(x): -1 for x<0, 0 for x==0, +1 for x>0.
+                    // Branchless bit-twiddle (no Select / no
+                    // bool conversions):
+                    //   neg_mask = x >> 31     (arithmetic
+                    //                           shift; -1 if
+                    //                           x<0, else 0)
+                    //   pos_mask = (0 - x) >> 31   (logical
+                    //                               shift; 1 if
+                    //                               x>0, else 0)
+                    //   result   = neg_mask | pos_mask
+                    //              -> -1, 0, or 1
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let c_zero = push_ci(0, atrium_spv_ir::IntKind::I32,
+                        source_spirv_offset, insts, next_value_id);
+                    let c31 = push_ci(31, atrium_spv_ir::IntKind::U32,
+                        source_spirv_offset, insts, next_value_id);
+                    let neg_x = {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let v = Value { id, ty: Type::I32 };
+                        insts.push(Inst {
+                            op: Op::ISub(c_zero, x.clone()),
+                            result: Some(v.clone()),
+                            source_spirv_offset,
+                        });
+                        v
+                    };
+                    let neg_mask = {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let v = Value { id, ty: Type::I32 };
+                        insts.push(Inst {
+                            op: Op::AShr(x, c31.clone()),
+                            result: Some(v.clone()),
+                            source_spirv_offset,
+                        });
+                        v
+                    };
+                    let pos_mask = {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let v = Value { id, ty: Type::I32 };
+                        insts.push(Inst {
+                            op: Op::LShr(neg_x, c31),
+                            result: Some(v.clone()),
+                            source_spirv_offset,
+                        });
+                        v
+                    };
+                    Op::BitOr(neg_mask, pos_mask)
+                }
+                50 => {
+                    // Fma(a, b, c) = a*b + c.  No fused
+                    // multiply-add IR op (the bespoke backend
+                    // can fold this into ARM's FMADD when it
+                    // wants); express as two FMul/FAdd ops.
+                    let a_id = expect_id(&spv_inst.operands, 2)?;
+                    let b_id = expect_id(&spv_inst.operands, 3)?;
+                    let c_id = expect_id(&spv_inst.operands, 4)?;
+                    let a = resolve_value(a_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let b = resolve_value(b_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let c = resolve_value(c_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let prod = push_f32(Op::FMul(a, b),
+                        source_spirv_offset, insts, next_value_id);
+                    Op::FAdd(prod, c)
+                }
                 11 => {
                     // Radians(deg) = deg * (π/180).
                     let x_id = expect_id(&spv_inst.operands, 2)?;

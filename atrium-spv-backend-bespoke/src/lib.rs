@@ -1568,14 +1568,30 @@ fn emit_function(
                         ints.insert(result.id, d_w);
                     }
                     (false, true, false) => {
-                        // int -> int: alias (no codegen).
+                        // int -> int: copy into a fresh W-reg.
+                        // Aliasing (sharing the source's Wreg
+                        // under the result's ValueId) looks
+                        // attractive but breaks once the
+                        // source's last_use triggers the
+                        // int_pool to reclaim the Wreg --
+                        // any later use of the result then
+                        // reads a clobbered register.  A
+                        // single `mov w_dst, w_src` keeps the
+                        // result's lifetime independent.
                         let s_w = *ints.get(&s.id).unwrap();
-                        ints.insert(result.id, s_w);
+                        let d_w = alloc_int_w(&mut int_pool, result.id)?;
+                        a.emit(asm::mov_w(d_w, s_w));
+                        ints.insert(result.id, d_w);
                     }
                     (true, false, true) => {
-                        // f32 -> f32 (degenerate but legal): alias.
+                        // f32 -> f32 (degenerate but legal):
+                        // copy via fmov rather than alias for
+                        // the same liveness-correctness reason.
                         let s_v = *scalars.get(&s.id).unwrap();
-                        scalars.insert(result.id, s_v);
+                        let d_v = alloc_vreg(&mut free_pool, &mut owners,
+                            &mut used_callee_saved_v, result.id)?;
+                        a.emit(asm::fmov_s(d_v, s_v));
+                        scalars.insert(result.id, d_v);
                     }
                     _ => return Err(BackendError::Internal(format!(
                         "Bitcast: operand {:?} not in ints or scalars",
