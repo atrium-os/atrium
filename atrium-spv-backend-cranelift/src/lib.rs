@@ -1565,21 +1565,26 @@ impl FnTranslator {
                 }
                 let u = coord_lanes[0];
                 let v = coord_lanes[1];
-                let is_array = coord_lanes.len() >= 3;
-                let layer_arg: Option<ClifValue> = if is_array {
-                    Some(coord_lanes[2])
-                } else { None };
-                if is_array && matches!(&inst.op,
+                let is_cube = matches!(sampled_image.ty,
+                    atrium_spv_ir::Type::SampledImage(
+                        atrium_spv_ir::ImageDimensionality::Cube));
+                let is_array = !is_cube && coord_lanes.len() >= 3;
+                let third_arg: Option<ClifValue> =
+                    if is_cube || is_array {
+                        Some(coord_lanes[2])
+                    } else { None };
+                if (is_array || is_cube) && matches!(&inst.op,
                     Op::ImageSampleExplicitLod { .. })
                 {
                     return Err(BackendError::Unsupported(
-                        "sampler2DArray with explicit-LOD not yet \
-                         supported".to_string()));
+                        "sampler{2DArray,Cube} with explicit-LOD \
+                         not yet supported".to_string()));
                 }
                 // Helper-table layout (see runtime):
                 //   #0  sample_2d        (ImplicitLod, 2D)
                 //   #16 sample_2d_lod    (ExplicitLod, 2D)
                 //   #24 sample_2d_array  (ImplicitLod, 2DArray)
+                //   #32 sample_cube      (ImplicitLod, Cube)
                 let (helper_off, lod_arg): (i32, Option<ClifValue>) =
                     match &inst.op {
                         Op::ImageSampleExplicitLod { lod, .. } => {
@@ -1589,7 +1594,8 @@ impl FnTranslator {
                                      in scalars", lod.id)))?;
                             (16, Some(lv))
                         }
-                        _ if is_array => (24, layer_arg),
+                        _ if is_cube  => (32, third_arg),
+                        _ if is_array => (24, third_arg),
                         _ => (0, None),
                     };
 
@@ -1601,7 +1607,7 @@ impl FnTranslator {
                 // pointers from the uniforms buffer at the
                 // v1-ABI offsets.  ExplicitLod selects the
                 // sample_2d_lod helper at #16.
-                let desc_off: i32 = 32 + (binding as i32) * 16;
+                let desc_off: i32 = 40 + (binding as i32) * 16;
                 let fn_ptr = builder.ins().load(
                     pointer_type, MemFlags::new(), uniforms, helper_off);
                 let tex_ptr = builder.ins().load(
@@ -1726,7 +1732,7 @@ impl FnTranslator {
                     .value_type(self.params[1]);
                 let uniforms = self.params[1];
 
-                let desc_off: i32 = 32 + (binding as i32) * 16;
+                let desc_off: i32 = 40 + (binding as i32) * 16;
                 let fn_ptr = builder.ins().load(
                     pointer_type, MemFlags::new(), uniforms, 8); // fetch slot
                 let tex_ptr = builder.ins().load(

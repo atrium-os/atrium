@@ -200,12 +200,13 @@ pub struct SamplerDesc {
 // in X1 (per docs/spec/tier2-renderer.md §4.1). v1 of the
 // texture path overlays the buffer's prefix with:
 //
-//   bytes  0..32 : runtime-helper function pointers
+//   bytes  0..40 : runtime-helper function pointers
 //                  ( 0:  atrium_tex_sample_2d
 //                    8:  atrium_tex_fetch_2d
 //                   16:  atrium_tex_sample_2d_lod
-//                   24:  atrium_tex_sample_2d_array )
-//   bytes 32..   : flat descriptor table — slot `B` at
+//                   24:  atrium_tex_sample_2d_array
+//                   32:  atrium_tex_sample_cube )
+//   bytes 40..   : flat descriptor table — slot `B` at
 //                  byte `UNIFORMS_DESC_BASE + B*16`,
 //                  carrying ( 0: tex_desc*, 8: samp_desc* )
 //
@@ -240,10 +241,9 @@ pub const UNIFORMS_HELPERS_BASE: usize = 0;
 
 /// Offset of the descriptor table within the uniforms
 /// buffer. Slot `B` lives at `UNIFORMS_DESC_BASE + B * DESC_SLOT_BYTES`.
-/// Grew from 16 to 24 when `atrium_tex_sample_2d_lod` was
-/// added (Arc 29), then to 32 with
-/// `atrium_tex_sample_2d_array` (Arc 30).
-pub const UNIFORMS_DESC_BASE: usize = 32;
+/// Grew from 16 → 24 (Arc 29 sample_2d_lod) → 32 (Arc 30
+/// sample_2d_array) → 40 (Arc 31 sample_cube).
+pub const UNIFORMS_DESC_BASE: usize = 40;
 
 /// Bytes per descriptor slot in the table. Two 64-bit
 /// pointers packed back-to-back — `tex_desc*` then
@@ -373,6 +373,7 @@ pub unsafe fn write_image_descriptor_slot(
 /// # Safety
 /// The function pointers must remain valid for the lifetime
 /// of every shader invocation that uses this buffer.
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn write_helper_pointers(
     buf: &mut [u8],
     sample_2d: unsafe extern "C" fn(
@@ -383,6 +384,8 @@ pub unsafe fn write_helper_pointers(
         *const TexDesc, *const SamplerDesc, f32, f32, f32, *mut f32),
     sample_2d_array: unsafe extern "C" fn(
         *const TexDesc, *const SamplerDesc, f32, f32, f32, *mut f32),
+    sample_cube: unsafe extern "C" fn(
+        *const TexDesc, *const SamplerDesc, f32, f32, f32, *mut f32),
 ) {
     assert!(buf.len() >= UNIFORMS_DESC_BASE,
         "uniforms buffer too small for the helper header");
@@ -390,10 +393,12 @@ pub unsafe fn write_helper_pointers(
     let f  = (fetch_2d        as usize as u64).to_le_bytes();
     let sl = (sample_2d_lod   as usize as u64).to_le_bytes();
     let sa = (sample_2d_array as usize as u64).to_le_bytes();
+    let sc = (sample_cube     as usize as u64).to_le_bytes();
     buf[ 0.. 8].copy_from_slice(&s);
     buf[ 8..16].copy_from_slice(&f);
     buf[16..24].copy_from_slice(&sl);
     buf[24..32].copy_from_slice(&sa);
+    buf[32..40].copy_from_slice(&sc);
 }
 
 /// Write a `(tex_desc, samp_desc)` pointer pair at binding
@@ -481,6 +486,60 @@ pub unsafe extern "C" fn atrium_tex_fetch_2d(
 ) {
     let t = pick_tex_mip(&*tex, lod);
     let rgba = fetch_texel_impl(t, x as u32, y as u32);
+    let out = std::slice::from_raw_parts_mut(out_rgba, 4);
+    out.copy_from_slice(&rgba);
+}
+
+/// Sample a `samplerCube` with a vec3 direction.  The
+/// helper performs the standard cubemap face selection:
+/// the major axis (largest `|component|`) names the face;
+/// the other two components, divided by the major and
+/// remapped to `[0, 1]`, become the (u, v) coords of that
+/// face's 2D image.  Per-face data sits at
+/// `tex.data + face * tex.slice_bytes` (i.e. `tex.depth`
+/// should be 6 and `slice_bytes` should describe one face's
+/// byte stride).
+///
+/// Face order matches GL_KHR_storage_cube_compatible /
+/// Vulkan's array-of-faces convention:
+///   0 = +X, 1 = -X, 2 = +Y, 3 = -Y, 4 = +Z, 5 = -Z.
+///
+/// # Safety
+/// As for `atrium_tex_sample_2d`; additionally `tex.depth`
+/// must be ≥ 6 and `tex.slice_bytes` the per-face stride.
+#[no_mangle]
+pub unsafe extern "C" fn atrium_tex_sample_cube(
+    tex: *const TexDesc,
+    samp: *const SamplerDesc,
+    x: f32, y: f32, z: f32,
+    out_rgba: *mut f32,
+) {
+    let t_base = &*tex;
+    let ax = x.abs();
+    let ay = y.abs();
+    let az = z.abs();
+    // Pick major axis -> face index + (sc, tc, ma).  Tie-
+    // breaking matches the Vulkan reference order.
+    let (face, sc, tc, ma) = if ax >= ay && ax >= az {
+        if x >= 0.0 { (0u32, -z, -y, ax) } // +X
+        else        { (1u32,  z, -y, ax) } // -X
+    } else if ay >= az {
+        if y >= 0.0 { (2u32,  x,  z, ay) } // +Y
+        else        { (3u32,  x, -z, ay) } // -Y
+    } else if z >= 0.0 {
+        (4u32,  x, -y, az)                 // +Z
+    } else {
+        (5u32, -x, -y, az)                 // -Z
+    };
+    // Avoid divide-by-zero on a (0, 0, 0) direction.
+    let inv_ma = if ma == 0.0 { 0.0 } else { 1.0 / ma };
+    let u = 0.5 * (sc * inv_ma + 1.0);
+    let v = 0.5 * (tc * inv_ma + 1.0);
+    let slice_off = (face as usize) * (t_base.slice_bytes as usize);
+    let mut face_tex = *t_base;
+    face_tex.data = t_base.data.add(slice_off);
+    let s = &*samp;
+    let rgba = sample_2d_impl(&face_tex, s, u, v);
     let out = std::slice::from_raw_parts_mut(out_rgba, 4);
     out.copy_from_slice(&rgba);
 }
@@ -1134,6 +1193,55 @@ mod tests {
     }
 
     #[test]
+    fn sample_cube_picks_right_face() {
+        // 6 distinct 1x1 RGBA8 faces packed contiguously
+        // (slice_bytes = 4 each):
+        //   face 0 (+X) = red,   face 1 (-X) = green
+        //   face 2 (+Y) = blue,  face 3 (-Y) = yellow
+        //   face 4 (+Z) = cyan,  face 5 (-Z) = magenta
+        let face_pixels: Vec<u8> = vec![
+            255,   0,   0, 255,   // +X red
+              0, 255,   0, 255,   // -X green
+              0,   0, 255, 255,   // +Y blue
+            255, 255,   0, 255,   // -Y yellow
+              0, 255, 255, 255,   // +Z cyan
+            255,   0, 255, 255,   // -Z magenta
+        ];
+        let tex = TexDesc {
+            data: face_pixels.as_ptr(),
+            width: 1, height: 1, stride_bytes: 4,
+            format: TexFormat::Rgba8Unorm as u32,
+            mip_count: 0, mip_descs: std::ptr::null(),
+            depth: 6, slice_bytes: 4,
+        };
+        let samp = SamplerDesc {
+            mag_filter: FilterMode::Nearest as u32,
+            min_filter: FilterMode::Nearest as u32,
+            wrap_s: WrapMode::ClampToEdge as u32,
+            wrap_t: WrapMode::ClampToEdge as u32,
+        };
+        // Direction vectors pointing along each principal axis.
+        let cases: &[([f32; 3], [f32; 4])] = &[
+            ([ 1.0,  0.0,  0.0], [1.0, 0.0, 0.0, 1.0]), // +X -> red
+            ([-1.0,  0.0,  0.0], [0.0, 1.0, 0.0, 1.0]), // -X -> green
+            ([ 0.0,  1.0,  0.0], [0.0, 0.0, 1.0, 1.0]), // +Y -> blue
+            ([ 0.0, -1.0,  0.0], [1.0, 1.0, 0.0, 1.0]), // -Y -> yellow
+            ([ 0.0,  0.0,  1.0], [0.0, 1.0, 1.0, 1.0]), // +Z -> cyan
+            ([ 0.0,  0.0, -1.0], [1.0, 0.0, 1.0, 1.0]), // -Z -> magenta
+        ];
+        for &(dir, want) in cases {
+            let mut got = [0.0f32; 4];
+            unsafe {
+                atrium_tex_sample_cube(
+                    &tex as *const _, &samp as *const _,
+                    dir[0], dir[1], dir[2], got.as_mut_ptr());
+            }
+            assert_eq!(got, want,
+                "cube dir {dir:?}: got {got:?}, want {want:?}");
+        }
+    }
+
+    #[test]
     fn sample_2d_lod_indirects_through_mip_descs() {
         // Two distinct 1×1 RGBA8 mip levels: mip 0 = red,
         // mip 1 = blue.  Build a base TexDesc with mip_count
@@ -1232,7 +1340,8 @@ mod tests {
             write_helper_pointers(&mut buf,
                 atrium_tex_sample_2d, atrium_tex_fetch_2d,
                 atrium_tex_sample_2d_lod,
-                atrium_tex_sample_2d_array);
+                atrium_tex_sample_2d_array,
+                atrium_tex_sample_cube);
             write_descriptor_slot(&mut buf, 0, tex_a_ptr, samp_a_ptr);
             write_descriptor_slot(&mut buf, 1, tex_b_ptr, samp_b_ptr);
         }

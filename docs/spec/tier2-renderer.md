@@ -1123,8 +1123,14 @@ specifically supports:
   to `atrium_tex_sample_2d_array` (helper @ #24) with the
   layer `f32` in V2 / extra-arg position.  `TexDesc` gains
   `depth` + `slice_bytes` for per-layer addressing.
-  `UNIFORMS_DESC_BASE` grew 24 → 32.  Array + ExplicitLod
-  is deferred (would need an `_array_lod` helper).
+  `samplerCube` (Arc 31) sampling: 3-lane direction routes
+  to `atrium_tex_sample_cube` (helper @ #32); the helper
+  does the standard major-axis face selection (+X/-X/+Y/
+  -Y/+Z/-Z) and (sc/ma, tc/ma) remap.  Cube/array dispatch
+  is by `sampled_image.ty`'s `ImageDimensionality::Cube`
+  flag rather than coord-lane count.  `UNIFORMS_DESC_BASE`
+  grew 24 → 32 → 40.  Array/Cube + ExplicitLod combos are
+  deferred (would need `_array_lod` / `_cube_lod` helpers).
   MVP scope: Rgba8Unorm / R32Float / Rgba32Float.  Mip-
   level storage images are supported via `OpImageRead` /
   `OpImageWrite` with `Image-Operands::Lod`: the runtime

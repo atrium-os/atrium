@@ -3124,24 +3124,30 @@ fn emit_function(
                     BackendError::Internal(format!(
                         "ImageSampleImplicitLod coord lane 1 {:?} not in scalars",
                         coord_lanes[1].id)))?;
-                // sampler2DArray: a 3-lane coord (u, v, layer)
-                // routes to atrium_tex_sample_2d_array (helper
-                // @ #24) with layer (f32) passed as V2.  Combo
-                // with ExplicitLod is rejected (no _array_lod
-                // helper yet).
-                let is_array = coord_lanes.len() >= 3;
-                let layer_v: Option<asm::Vreg> = if is_array {
-                    Some(*scalars.get(&coord_lanes[2].id).ok_or_else(||
-                        BackendError::Internal(format!(
-                            "ImageSampleImplicitLod array coord lane 2 \
-                             {:?} not in scalars", coord_lanes[2].id)))?)
-                } else { None };
-                if is_array && matches!(&inst.op,
+                // Three-lane coord paths:
+                //   samplerCube         -> sample_cube (#32)
+                //   sampler2DArray (2D) -> sample_2d_array (#24)
+                // Disambiguated by sampled_image.ty's
+                // ImageDimensionality (Cube vs Dim2D).
+                let is_cube = matches!(sampled_image.ty,
+                    Type::SampledImage(atrium_spv_ir::ImageDimensionality::Cube));
+                let is_array = !is_cube && coord_lanes.len() >= 3;
+                let third_v: Option<asm::Vreg> =
+                    if is_cube || is_array {
+                        Some(*scalars.get(&coord_lanes[2].id).ok_or_else(||
+                            BackendError::Internal(format!(
+                                "ImageSample 3-lane coord lane 2 {:?} \
+                                 not in scalars", coord_lanes[2].id)))?)
+                    } else { None };
+                let layer_v = third_v;  // legacy name kept for the
+                                        // helper_off match below
+                let _ = layer_v;
+                if (is_array || is_cube) && matches!(&inst.op,
                     Op::ImageSampleExplicitLod { .. })
                 {
                     return Err(BackendError::Unsupported(
-                        "sampler2DArray with explicit-LOD not yet \
-                         supported".to_string()));
+                        "sampler{2DArray,Cube} with explicit-LOD \
+                         not yet supported".to_string()));
                 }
 
                 // Snapshot every currently-owned V-reg
@@ -3197,6 +3203,7 @@ fn emit_function(
                 //   #8  fetch_2d
                 //   #16 sample_2d_lod    (ExplicitLod, 2D)
                 //   #24 sample_2d_array  (ImplicitLod, 2DArray)
+                //   #32 sample_cube      (ImplicitLod, Cube)
                 let (helper_off, lod_v): (u16, Option<asm::Vreg>) =
                     match &inst.op {
                         Op::ImageSampleExplicitLod { lod, .. } => {
@@ -3206,17 +3213,17 @@ fn emit_function(
                                      in scalars", lod.id)))?;
                             (16u16, Some(lv))
                         }
+                        _ if is_cube  => (32u16, None),
                         _ if is_array => (24u16, None),
                         _ => (0u16, None),
                     };
-                // For sampler2DArray, the layer (f32) is the
-                // extra param in V2 -- same slot the LOD goes
-                // into for the ExplicitLod path.  We use V3
-                // as the hold register to survive the u/v
-                // parallel-copy.  (LOD and array paths share
-                // V3 since they're mutually exclusive.)
-                let extra_v: Option<asm::Vreg> = lod_v.or(layer_v);
-                let desc_off: u16 = 32 + (binding as u16) * 16;
+                // The third float arg is either the
+                // ExplicitLod LOD (-> V2), the array layer
+                // (-> V2), or the cube z component (-> V2).
+                // All three paths share V2; we stash via V3
+                // across the u/v parallel-copy.
+                let extra_v: Option<asm::Vreg> = lod_v.or(third_v);
+                let desc_off: u16 = 40 + (binding as u16) * 16;
 
                 // Stack layout (16-byte aligned; each region
                 // is 16 bytes):
@@ -3370,7 +3377,7 @@ fn emit_function(
                 let w1 = asm::Wreg(1);
                 let w2 = asm::Wreg(2);
                 let w3 = asm::Wreg(3);
-                let desc_off: u16 = 32 + (binding as u16) * 16;
+                let desc_off: u16 = 40 + (binding as u16) * 16;
 
                 let n_spill = live_vregs.len() as u16;
                 let frame_bytes: u16 = 32 + n_spill * 16;
