@@ -986,10 +986,13 @@ specifically supports:
   Overrides are applied by rewriting the matching
   `OpSpecConstant*` instruction in place and re-tagging it
   as a plain `OpConstant*` before the constants pass.
-  `VkSpecializationInfo` parsing in the vk-icd, daemon
-  cache-key extension, and atrium-spv-compile CLI exposure
-  are still deferred — the IR-level mechanism works end-
-  to-end and is unit-tested.
+  `atrium-spv-compile` exposes the mechanism via
+  `--spec-const SPECID=VALUE` (repeatable; accepts decimal,
+  hex `0x...`, signed `-N`, or float `f:N.N` literals) and
+  mixes the overrides into the cache hash when present so
+  specialised builds don't collide with the default-value
+  build in the cache.  `VkSpecializationInfo` parsing in the
+  vk-icd and daemon-side hash extension are still deferred.
   `OpSpecConstantOp` is folded at frontend constant-context
   build time: the sub-opcode + operand-id list is evaluated
   in Rust against the already-resolved constants, and the

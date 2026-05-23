@@ -63,7 +63,10 @@ use atrium_spv_backend_bespoke::{
 use atrium_spv_backend_cranelift::{
     compile_blob as cranelift_compile_blob, Target,
 };
-use atrium_spv_frontend::translate as frontend_translate;
+use atrium_spv_frontend::{
+    translate_with_spec_overrides as frontend_translate_with_overrides,
+    SpecOverrides,
+};
 use sha2::{Digest, Sha256};
 
 const EXIT_OK: u8 = 0;
@@ -130,6 +133,14 @@ struct Args {
     /// tests that want to exercise a specific backend
     /// without the selection logic getting in the way.
     force_backend: Option<ForceBackend>,
+    /// VkSpecializationInfo-style overrides, parsed from
+    /// repeated `--spec-const SPECID=VALUE` flags.  Empty
+    /// map means "use SPIR-V-declared defaults".
+    /// VALUE is parsed as either a u32 decimal/hex literal
+    /// (`0x...`) for int / bool spec constants, or as an f32
+    /// when prefixed with `f:` (e.g. `--spec-const 2=f:3.14`).
+    /// Boolean spec constants accept 0 / 1.
+    spec_overrides: SpecOverrides,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +152,35 @@ fn parse_args() -> Result<Args, String> {
     let mut target: Option<Target> = None;
     let mut hash_override: Option<String> = None;
     let mut force_backend: Option<ForceBackend> = None;
+    let mut spec_overrides: SpecOverrides = SpecOverrides::new();
+
+    let parse_spec_const = |raw: &str,
+                             out: &mut SpecOverrides| -> Result<(), String> {
+        let (id_str, val_str) = raw.split_once('=').ok_or_else(||
+            format!("--spec-const expects SPECID=VALUE, got `{raw}`"))?;
+        let spec_id: u32 = id_str.parse().map_err(|e|
+            format!("--spec-const SPECID `{id_str}` not a u32: {e}"))?;
+        // `f:` prefix: parse VALUE as f32, store its bit pattern.
+        let value: u32 = if let Some(rest) = val_str.strip_prefix("f:") {
+            let f: f32 = rest.parse().map_err(|e|
+                format!("--spec-const f:value `{rest}` not an f32: {e}"))?;
+            f.to_bits()
+        } else if let Some(hex) = val_str.strip_prefix("0x")
+            .or_else(|| val_str.strip_prefix("0X")) {
+            u32::from_str_radix(hex, 16).map_err(|e|
+                format!("--spec-const hex `{val_str}` not a u32: {e}"))?
+        } else if let Some(neg) = val_str.strip_prefix('-') {
+            // Signed-int literal: parse as i32, store bit pattern.
+            let n: i32 = format!("-{neg}").parse().map_err(|e|
+                format!("--spec-const signed `{val_str}` not an i32: {e}"))?;
+            n as u32
+        } else {
+            val_str.parse::<u32>().map_err(|e|
+                format!("--spec-const dec `{val_str}` not a u32: {e}"))?
+        };
+        out.insert(spec_id, value);
+        Ok(())
+    };
 
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -158,6 +198,11 @@ fn parse_args() -> Result<Args, String> {
             "--hash" => hash_override = Some(
                 it.next().ok_or("--hash needs a value")?,
             ),
+            "--spec-const" => {
+                let raw = it.next().ok_or(
+                    "--spec-const needs SPECID=VALUE")?;
+                parse_spec_const(&raw, &mut spec_overrides)?;
+            }
             "--force-backend" => {
                 let v = it.next().ok_or(
                     "--force-backend needs bespoke|cranelift")?;
@@ -194,6 +239,7 @@ fn parse_args() -> Result<Args, String> {
         target: target.unwrap_or_else(Target::host),
         hash_override,
         force_backend,
+        spec_overrides,
     })
 }
 
@@ -212,7 +258,17 @@ fn print_usage() {
            --input <SPIR-V file> \\\n  \
            --output-dir <cache dir> \\\n  \
            [--target <aarch64-unknown-freebsd|aarch64-apple-darwin|x86_64-unknown-freebsd>] \\\n  \
-           [--hash <override sha256 hex>]"
+           [--hash <override sha256 hex>] \\\n  \
+           [--spec-const SPECID=VALUE]... \\\n  \
+           [--force-backend bespoke|cranelift]\n\
+         \n  \
+         --spec-const overrides the SPIR-V OpSpecConstant\n  \
+         with the matching SpecId decoration.  VALUE may be:\n    \
+           NNNN          (decimal u32)\n    \
+           -NNNN         (decimal i32, stored as bit pattern)\n    \
+           0xNNNN        (hex u32)\n    \
+           f:N.N         (f32, stored as bit pattern)\n    \
+           0 / 1         (bool)"
     );
 }
 
@@ -252,16 +308,38 @@ fn run(args: &Args) -> Result<CompileReport, CompileError> {
             "reading {}: {e}", args.input.display(),
         )))?;
 
-    // 2. Hash for cache key.
+    // 2. Hash for cache key.  When no host-supplied hash is
+    // given, hash the SPIR-V bytes.  If spec-constant
+    // overrides are present, mix them into the hash too: two
+    // builds of the same SPIR-V with different overrides
+    // must map to different cache outputs.  The mix is only
+    // applied when `--spec-const` was supplied, so the no-
+    // override case keeps the historical pure-SPIR-V hash
+    // (preserves existing callers' cache keys).
     let hash = args.hash_override.clone().unwrap_or_else(|| {
         let mut hasher = Sha256::new();
         hasher.update(&spirv);
+        if !args.spec_overrides.is_empty() {
+            // Sort by SpecId for stability across HashMap
+            // iteration order.
+            let mut entries: Vec<(u32, u32)> =
+                args.spec_overrides.iter().map(|(k, v)| (*k, *v)).collect();
+            entries.sort_by_key(|(k, _)| *k);
+            hasher.update(b"\x00spec\x00");
+            for (k, v) in entries {
+                hasher.update(k.to_le_bytes());
+                hasher.update(v.to_le_bytes());
+            }
+        }
         format!("{:x}", hasher.finalize())
     });
 
-    // 3. Frontend: SPIR-V → atrium-spv-ir.
+    // 3. Frontend: SPIR-V → atrium-spv-ir, applying spec
+    // overrides (no-op when --spec-const wasn't passed).
     let t_frontend = Instant::now();
-    let module = frontend_translate(&spirv).map_err(|e| match e {
+    let module = frontend_translate_with_overrides(
+        &spirv, &args.spec_overrides,
+    ).map_err(|e| match e {
         atrium_spv_frontend::FrontendError::Unsupported(m) =>
             CompileError::Unsupported(m),
         other => CompileError::Internal(format!("frontend: {other}")),

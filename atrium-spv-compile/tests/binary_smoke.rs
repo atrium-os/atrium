@@ -164,6 +164,103 @@ fn binary_exits_unsupported_on_capability_we_dont_handle() {
 }
 
 #[test]
+fn binary_spec_const_changes_cache_key() {
+    // Two compiles of the same SPIR-V with different
+    // --spec-const values must produce different cache
+    // filenames (otherwise specialised builds collide in
+    // the cache).  Also verifies the binary accepts the
+    // --spec-const flag and doesn't error.
+    use rspirv::binary::Assemble;
+    use rspirv::dr::Operand;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let i32_ty = b.type_int(32, 1);
+    let void_fn = b.type_function(void, vec![]);
+    let rt = b.type_runtime_array(u32_ty);
+    b.decorate(rt, Decoration::ArrayStride,
+        vec![Operand::LiteralBit32(4)]);
+    let s = b.type_struct(vec![rt]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset,
+        vec![Operand::LiteralBit32(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_u = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+    let ssbo = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet,
+        vec![Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding,
+        vec![Operand::LiteralBit32(0)]);
+    let sc_n = b.spec_constant_bit32(i32_ty, 7u32);
+    b.decorate(sc_n, Decoration::SpecId,
+        vec![Operand::LiteralBit32(0)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let n_u = b.bitcast(u32_ty, None, sc_n).unwrap();
+    let p = b.access_chain(ptr_u, None, ssbo, vec![c_zero, c_zero]).unwrap();
+    b.store(p, n_u, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spirv = Vec::with_capacity(words.len() * 4);
+    for w in words { spirv.extend_from_slice(&w.to_le_bytes()); }
+
+    let dir = TempDir::new().unwrap();
+    let input_path = dir.path().join("in.spv");
+    std::fs::write(&input_path, &spirv).unwrap();
+    let cache_a = dir.path().join("cache_a");
+    let cache_b = dir.path().join("cache_b");
+    let cache_default = dir.path().join("cache_default");
+
+    let run = |out_dir: &std::path::Path, extra: &[&str]| {
+        let mut cmd = Command::new(binary_path());
+        cmd.arg("--input").arg(&input_path)
+            .arg("--output-dir").arg(out_dir);
+        for a in extra { cmd.arg(a); }
+        let status = cmd.status().expect("spawn atrium-spv-compile");
+        assert!(status.success(),
+            "atrium-spv-compile failed with extras {extra:?}: {status}");
+    };
+    run(&cache_default, &[]);
+    run(&cache_a, &["--spec-const", "0=42"]);
+    run(&cache_b, &["--spec-const", "0=99"]);
+
+    let blob_name_in = |d: &std::path::Path| -> String {
+        let entries: Vec<_> = std::fs::read_dir(d).unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension()
+                .map(|x| x == "afblob").unwrap_or(false))
+            .map(|e| e.file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(entries.len(), 1,
+            "expected one .afblob in {}, got {:?}", d.display(), entries);
+        entries.into_iter().next().unwrap()
+    };
+    let d = blob_name_in(&cache_default);
+    let a = blob_name_in(&cache_a);
+    let b_ = blob_name_in(&cache_b);
+    assert_ne!(d, a, "default vs --spec-const 0=42 collided");
+    assert_ne!(a, b_, "--spec-const 0=42 vs 0=99 collided");
+    assert_ne!(d, b_, "default vs --spec-const 0=99 collided");
+
+    // Rerunning with the SAME overrides must hit the SAME hash.
+    let cache_a2 = dir.path().join("cache_a2");
+    run(&cache_a2, &["--spec-const", "0=42"]);
+    assert_eq!(blob_name_in(&cache_a2), a,
+        "same --spec-const should be deterministic");
+}
+
+#[test]
 fn binary_emits_metrics_json_on_stderr() {
     let spirv = build_constant_color_spirv([0.7, 0.6, 0.5, 1.0]);
     let dir = TempDir::new().unwrap();
