@@ -1370,6 +1370,19 @@ fn translate_inst(
                     FrontendError::Malformed(format!(
                         "ImageSampleExplicitLod lod id {lod_id} not yet defined")))?;
                 Op::ImageSampleExplicitLod { sampled_image, coord, lod }
+            } else if let Some(bias_id) =
+                extract_image_operand_bias(&spv_inst.operands, 2)?
+            {
+                // Arc 36: Image-Operands::Bias on implicit-LOD.
+                // Our implicit LOD collapses to mip 0 (no quad
+                // dispatch), so the bias *is* the effective
+                // LOD.  Route through the ExplicitLod path and
+                // let the existing `sample_2d_lod` / array /
+                // cube helpers handle it.
+                let bias = id_map.get(&bias_id).cloned().ok_or_else(||
+                    FrontendError::Malformed(format!(
+                        "ImageSampleImplicitLod bias id {bias_id} not yet defined")))?;
+                Op::ImageSampleExplicitLod { sampled_image, coord, lod: bias }
             } else {
                 Op::ImageSampleImplicitLod { sampled_image, coord }
             };
@@ -4667,6 +4680,33 @@ fn extract_image_operand_lod(
         Some(Operand::IdRef(id)) => Ok(Some(*id)),
         other => Err(FrontendError::Malformed(format!(
             "Image-Operands::Lod expected IdRef after mask, got {other:?}"))),
+    }
+}
+
+/// If the SPIR-V operand list at `start` begins with an
+/// `Image-Operands` mask whose `Bias` bit is set, return the
+/// Bias `IdRef` that follows.  Returns `None` when there is no
+/// mask or the Bias bit is clear.  Bias is bit 0 of the mask
+/// (`0x1`); its argument is the first parameter after the mask
+/// since lower bits come first in the parameter list (SPIR-V
+/// spec, §3.14).
+fn extract_image_operand_bias(
+    operands: &[Operand],
+    start: usize,
+) -> Result<Option<Word>, FrontendError> {
+    use rspirv::spirv::ImageOperands as IO;
+    let Some(first) = operands.get(start) else { return Ok(None); };
+    let mask = match first {
+        Operand::ImageOperands(m) => *m,
+        _ => return Ok(None),
+    };
+    if !mask.contains(IO::BIAS) {
+        return Ok(None);
+    }
+    match operands.get(start + 1) {
+        Some(Operand::IdRef(id)) => Ok(Some(*id)),
+        other => Err(FrontendError::Malformed(format!(
+            "Image-Operands::Bias expected IdRef after mask, got {other:?}"))),
     }
 }
 

@@ -1149,6 +1149,14 @@ specifically supports:
   with two `f32` arg slots.  `texture(sampler2DArray,
   vec3(u, v, layer), lod)` and `texture(samplerCube,
   vec3(dir), lod)` now compile through both backends.
+  `Image-Operands::Bias` (Arc 36): GLSL `texture(sampler2D,
+  uv, bias)` lowers to `OpImageSampleImplicitLod` with the
+  `Bias` image-operand.  Tier-2's implicit-LOD collapses to
+  mip 0 (no 2×2 quad), so the bias *is* the effective LOD.
+  Frontend translates Bias to an `Op::ImageSampleExplicitLod`
+  carrying the bias as the lod operand; the existing
+  `sample_2d_lod` (#16) helper handles the rest.  No new
+  helpers; no backend changes.
   `textureSize(sampler2D, lod)` (Arc 34): a new IR op
   `Op::SampledImageQuerySizeLod { image, lod }` is emitted
   by the frontend for `OpImageQuerySizeLod`.  Both backends
