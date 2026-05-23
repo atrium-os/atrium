@@ -725,6 +725,20 @@ pub enum Op {
         /// vec4 texel value to store.
         texel: Value,
     },
+    /// Gather a 2×2 footprint of one channel
+    /// (`OpImageGather`).  Returns a `vec4` whose elements
+    /// are the chosen channel from each of the four texels
+    /// around the sample coordinate (per GLSL ordering:
+    /// (0,1), (1,1), (1,0), (0,0)).  `component` is the
+    /// channel index 0..3 (RGBA).
+    ImageGather {
+        /// SampledImage value.
+        sampled_image: Value,
+        /// Sample coordinate (vec2 for 2D).
+        coord: Value,
+        /// i32 channel selector (0=R, 1=G, 2=B, 3=A).
+        component: Value,
+    },
     /// Read a texel from a specific mip level of a storage
     /// image (`OpImageRead` with `Image-Operands::Lod`).
     /// Same shape as [`Self::ImageRead`] but with an extra

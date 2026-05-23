@@ -1128,8 +1128,16 @@ specifically supports:
   does the standard major-axis face selection (+X/-X/+Y/
   -Y/+Z/-Z) and (sc/ma, tc/ma) remap.  Cube/array dispatch
   is by `sampled_image.ty`'s `ImageDimensionality::Cube`
-  flag rather than coord-lane count.  `UNIFORMS_DESC_BASE`
-  grew 24 → 32 → 40.  Array/Cube + ExplicitLod combos are
+  flag rather than coord-lane count.
+  `textureGather(sampler2D, uv, component)` (Arc 32):
+  `OpImageGather` lowers to a new `Op::ImageGather`
+  emitted by the frontend; both backends route through
+  `atrium_tex_gather_2d` (helper @ #40) which fetches the
+  four texels around the bilinear footprint and packs the
+  chosen channel into a vec4 in GLSL order `{(0,1),(1,1),
+  (1,0),(0,0)}`.  Wrap modes honoured; component clamped
+  `0..3`.  `UNIFORMS_DESC_BASE` grew 24 → 32 → 40 → 48.
+  Array/Cube + ExplicitLod combos are
   deferred (would need `_array_lod` / `_cube_lod` helpers).
   MVP scope: Rgba8Unorm / R32Float / Rgba32Float.  Mip-
   level storage images are supported via `OpImageRead` /

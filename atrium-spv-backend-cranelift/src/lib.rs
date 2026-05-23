@@ -1607,7 +1607,7 @@ impl FnTranslator {
                 // pointers from the uniforms buffer at the
                 // v1-ABI offsets.  ExplicitLod selects the
                 // sample_2d_lod helper at #16.
-                let desc_off: i32 = 40 + (binding as i32) * 16;
+                let desc_off: i32 = 48 + (binding as i32) * 16;
                 let fn_ptr = builder.ins().load(
                     pointer_type, MemFlags::new(), uniforms, helper_off);
                 let tex_ptr = builder.ins().load(
@@ -1699,6 +1699,65 @@ impl FnTranslator {
                 self.vectors.insert(result.id, out_lanes);
                 Ok(())
             }
+            // OpImageGather (Arc 32) -- 2x2 footprint fetch
+            // of one channel via `atrium_tex_gather_2d`
+            // (helper @ #40).  Call signature:
+            //   (tex, samp, u, v, component:i32, out_rgba).
+            Op::ImageGather { sampled_image, coord, component } => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "ImageGather without result".to_string()))?;
+                let (_, binding) = self.image_handles.get(&sampled_image.id)
+                    .copied()
+                    .ok_or_else(|| BackendError::Internal(format!(
+                        "ImageGather sampled_image {:?} not an \
+                         ImageHandle", sampled_image.id)))?;
+                let coord_lanes = self.vectors.get(&coord.id).cloned()
+                    .ok_or_else(|| BackendError::Internal(format!(
+                        "ImageGather coord {:?} not a vector", coord.id)))?;
+                if coord_lanes.len() < 2 {
+                    return Err(BackendError::Unsupported(format!(
+                        "ImageGather 2D coord must have ≥2 lanes, \
+                         got {}", coord_lanes.len())));
+                }
+                let u = coord_lanes[0];
+                let v = coord_lanes[1];
+                let comp = *self.scalars.get(&component.id)
+                    .ok_or_else(|| BackendError::Internal(format!(
+                        "ImageGather component {:?} not in scalars",
+                        component.id)))?;
+                let pointer_type = builder.func.dfg
+                    .value_type(self.params[1]);
+                let uniforms = self.params[1];
+                let desc_off: i32 = 48 + (binding as i32) * 16;
+                let fn_ptr = builder.ins().load(
+                    pointer_type, MemFlags::new(), uniforms, 40);
+                let tex_ptr = builder.ins().load(
+                    pointer_type, MemFlags::new(), uniforms, desc_off);
+                let samp_ptr = builder.ins().load(
+                    pointer_type, MemFlags::new(), uniforms, desc_off + 8);
+                let slot = builder.create_sized_stack_slot(
+                    StackSlotData::new(StackSlotKind::ExplicitSlot, 16, 4));
+                let out_ptr = builder.ins().stack_addr(pointer_type, slot, 0);
+                let mut call_sig = Signature::new(CallConv::SystemV);
+                call_sig.params.push(AbiParam::new(pointer_type));
+                call_sig.params.push(AbiParam::new(pointer_type));
+                call_sig.params.push(AbiParam::new(clif_types::F32));
+                call_sig.params.push(AbiParam::new(clif_types::F32));
+                call_sig.params.push(AbiParam::new(clif_types::I32));
+                call_sig.params.push(AbiParam::new(pointer_type));
+                let sig_ref = builder.import_signature(call_sig);
+                builder.ins().call_indirect(
+                    sig_ref, fn_ptr,
+                    &[tex_ptr, samp_ptr, u, v, comp, out_ptr]);
+                let mut lanes = Vec::with_capacity(4);
+                for i in 0..4i32 {
+                    lanes.push(builder.ins().load(
+                        clif_types::F32, MemFlags::new(), out_ptr, i * 4));
+                }
+                self.vectors.insert(result.id, lanes);
+                Ok(())
+            }
             Op::ImageFetch { image, coord, lod } => {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal(
@@ -1732,7 +1791,7 @@ impl FnTranslator {
                     .value_type(self.params[1]);
                 let uniforms = self.params[1];
 
-                let desc_off: i32 = 40 + (binding as i32) * 16;
+                let desc_off: i32 = 48 + (binding as i32) * 16;
                 let fn_ptr = builder.ins().load(
                     pointer_type, MemFlags::new(), uniforms, 8); // fetch slot
                 let tex_ptr = builder.ins().load(

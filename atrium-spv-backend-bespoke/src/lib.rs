@@ -3223,7 +3223,7 @@ fn emit_function(
                 // All three paths share V2; we stash via V3
                 // across the u/v parallel-copy.
                 let extra_v: Option<asm::Vreg> = lod_v.or(third_v);
-                let desc_off: u16 = 40 + (binding as u16) * 16;
+                let desc_off: u16 = 48 + (binding as u16) * 16;
 
                 // Stack layout (16-byte aligned; each region
                 // is 16 bytes):
@@ -3305,6 +3305,114 @@ fn emit_function(
 
                 vectors.insert(result.id, lane_vals);
             }
+            // OpImageGather (Arc 32) -- 2x2 footprint fetch
+            // of one channel.  Helper @ #40
+            // (`atrium_tex_gather_2d`); signature is
+            // (tex, samp, u, v, component:i32, out_rgba).
+            // AAPCS64 register schedule:
+            //   X0=tex, X1=samp, V0=u, V1=v, W2=component,
+            //   X3=out_rgba slot.
+            // The output pointer shifts from X2 (sample) to
+            // X3 because `component` consumes the W2 int
+            // slot; everything else (V-reg spill window,
+            // 4-lane result load) follows the sample arm.
+            Op::ImageGather { sampled_image, coord, component } => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "ImageGather without result".into()))?;
+                let (_, binding) = image_handles.get(&sampled_image.id)
+                    .copied()
+                    .ok_or_else(|| BackendError::Internal(format!(
+                        "ImageGather sampled_image {:?} not an \
+                         ImageHandle", sampled_image.id)))?;
+                let coord_lanes = vectors.get(&coord.id).cloned()
+                    .ok_or_else(|| BackendError::Internal(format!(
+                        "ImageGather coord {:?} not a vector",
+                        coord.id)))?;
+                if coord_lanes.len() < 2 {
+                    return Err(BackendError::Unsupported(format!(
+                        "ImageGather 2D coord must have ≥2 lanes, \
+                         got {}", coord_lanes.len())));
+                }
+                let u_v = *scalars.get(&coord_lanes[0].id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "ImageGather coord lane 0 {:?} not in scalars",
+                        coord_lanes[0].id)))?;
+                let v_v = *scalars.get(&coord_lanes[1].id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "ImageGather coord lane 1 {:?} not in scalars",
+                        coord_lanes[1].id)))?;
+                let comp_w = *ints.get(&component.id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "ImageGather component {:?} not in ints",
+                        component.id)))?;
+
+                // Spill V-regs + allocate 4 result lanes,
+                // same pattern as ImageSampleImplicitLod.
+                let mut live_vregs: Vec<u8> = owners.keys().copied().collect();
+                live_vregs.sort();
+                let mut lane_regs: Vec<asm::Vreg> = Vec::with_capacity(4);
+                let mut lane_vals: Vec<Value> = Vec::with_capacity(4);
+                for _ in 0..4 {
+                    let synth = ValueId(next_synth_id);
+                    next_synth_id += 1;
+                    let r = alloc_vreg(&mut free_pool, &mut owners,
+                        &mut used_callee_saved_v, synth)?;
+                    scalars.insert(synth, r);
+                    lane_regs.push(r);
+                    lane_vals.push(Value { id: synth, ty: Type::F32 });
+                }
+                let sp = asm::Xreg(31);
+                let x0 = asm::Xreg(0);
+                let x1 = asm::Xreg(1);
+                let x3 = asm::Xreg(3);
+                let x9 = asm::Xreg(9);
+                let x10 = asm::Xreg(10);
+                let x11 = asm::Xreg(11);
+                let v0 = asm::Vreg(0);
+                let v1 = asm::Vreg(1);
+                let v2 = asm::Vreg(2); // u/v parallel-copy temp
+                let w2 = asm::Wreg(2);
+                let lr = asm::Xreg(30);
+                let desc_off: u16 = 48 + (binding as u16) * 16;
+                let n_spill = live_vregs.len() as u16;
+                let frame_bytes: u16 = 32 + n_spill * 16;
+                a.emit(asm::sub_imm_x(sp, sp, frame_bytes));
+                a.emit(asm::str_x_offset(x_out, sp, 16));
+                a.emit(asm::str_x_offset(lr, sp, 24));
+                for (i, n) in live_vregs.iter().enumerate() {
+                    a.emit(asm::str_q_offset(
+                        asm::Vreg(*n), sp, 32 + (i as u16) * 16));
+                }
+                // Helper + descriptor pointer loads (gather_2d
+                // helper @ #40).
+                a.emit(asm::ldr_x_offset(x9, asm::Xreg(1), 40));
+                a.emit(asm::ldr_x_offset(x10, asm::Xreg(1), desc_off));
+                a.emit(asm::ldr_x_offset(x11, asm::Xreg(1), desc_off + 8));
+                // u, v -> V0, V1 (parallel-safe via V2).
+                a.emit(asm::mov_v_16b(v2, u_v));
+                a.emit(asm::mov_v_16b(v1, v_v));
+                a.emit(asm::mov_v_16b(v0, v2));
+                // Tex + samp ptrs + component + rgba slot.
+                a.emit(asm::mov_x(x0, x10));
+                a.emit(asm::mov_x(x1, x11));
+                a.emit(asm::mov_w(w2, comp_w));
+                a.emit(asm::add_imm_x(x3, sp, 0));
+                a.emit(asm::blr_x(x9));
+                // Load 4 result lanes back.
+                for (i, lane) in lane_regs.iter().enumerate() {
+                    a.emit(asm::ldr_w_offset(w_tmp, sp, (i as u16) * 4));
+                    a.emit(asm::fmov_s_from_w(*lane, w_tmp));
+                }
+                for (i, n) in live_vregs.iter().enumerate() {
+                    a.emit(asm::ldr_q_offset(
+                        asm::Vreg(*n), sp, 32 + (i as u16) * 16));
+                }
+                a.emit(asm::ldr_x_offset(x_out, sp, 16));
+                a.emit(asm::ldr_x_offset(lr, sp, 24));
+                a.emit(asm::add_imm_x(sp, sp, frame_bytes));
+                vectors.insert(result.id, lane_vals);
+            }
             // ImageFetch — same v1-ABI call shape as
             // ImageSampleImplicitLod, but: helper fn ptr
             // lives at `uniforms[8]` (the *fetch* slot,
@@ -3377,7 +3485,7 @@ fn emit_function(
                 let w1 = asm::Wreg(1);
                 let w2 = asm::Wreg(2);
                 let w3 = asm::Wreg(3);
-                let desc_off: u16 = 40 + (binding as u16) * 16;
+                let desc_off: u16 = 48 + (binding as u16) * 16;
 
                 let n_spill = live_vregs.len() as u16;
                 let frame_bytes: u16 = 32 + n_spill * 16;
@@ -4759,6 +4867,14 @@ fn compute_last_use_flat(
                 mark(sampled_image.id);
                 mark(coord.id);
                 mark(lod.id);
+                if let Some(lane_ids) = vec_lanes.get(&coord.id).cloned() {
+                    for lid in &lane_ids { mark(*lid); }
+                }
+            }
+            Op::ImageGather { sampled_image, coord, component } => {
+                mark(sampled_image.id);
+                mark(coord.id);
+                mark(component.id);
                 if let Some(lane_ids) = vec_lanes.get(&coord.id).cloned() {
                     for lid in &lane_ids { mark(*lid); }
                 }

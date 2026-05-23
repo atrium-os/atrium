@@ -1383,6 +1383,41 @@ fn translate_inst(
         // image — fetch doesn't use the sampler), second is
         // the integer coord. Optional Lod via the Image
         // Operands mask is read from operand index 2+.
+        // OpImageGather: textureGather(sampler, coord,
+        // component).  Operands: [sampled_image, coord,
+        // component, (image-operands mask...)].
+        // We translate the basic 3-operand form (no
+        // Image-Operands::ConstOffset/Offsets refinement
+        // yet -- those would adjust the gather footprint by
+        // constant texel offsets, deferred).
+        SpvOp::ImageGather => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed(
+                    "ImageGather without result id".to_string()))?;
+            let result_type_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed(
+                    "ImageGather without result type".to_string()))?;
+            let result_ty = types.get(result_type_id)?.clone();
+            let img_id  = expect_id(&spv_inst.operands, 0)?;
+            let coord_id = expect_id(&spv_inst.operands, 1)?;
+            let comp_id  = expect_id(&spv_inst.operands, 2)?;
+            let sampled_image = id_map.get(&img_id).cloned()
+                .ok_or_else(|| FrontendError::Malformed(format!(
+                    "ImageGather image id {img_id} not yet defined")))?;
+            let coord = resolve_value(coord_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            let component = resolve_value(comp_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            let result = alloc_or_get_result(
+                result_id, result_ty, id_map, next_value_id);
+            insts.push(Inst {
+                op: Op::ImageGather { sampled_image, coord, component },
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
+
         SpvOp::ImageFetch => {
             let result_id = spv_inst.result_id.ok_or_else(||
                 FrontendError::Malformed(

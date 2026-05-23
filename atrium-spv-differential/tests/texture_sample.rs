@@ -125,7 +125,8 @@ fn texture_sample_centre_rgbw() {
             atrium_spv_runtime::atrium_tex_fetch_2d,
             atrium_spv_runtime::atrium_tex_sample_2d_lod,
             atrium_spv_runtime::atrium_tex_sample_2d_array,
-            atrium_spv_runtime::atrium_tex_sample_cube);
+            atrium_spv_runtime::atrium_tex_sample_cube,
+            atrium_spv_runtime::atrium_tex_gather_2d);
         write_descriptor_slot(&mut uniforms, 0,
             &tex_desc as *const _, &samp_desc as *const _);
     }
@@ -299,7 +300,8 @@ fn texture_sample_tinted() {
             atrium_spv_runtime::atrium_tex_fetch_2d,
             atrium_spv_runtime::atrium_tex_sample_2d_lod,
             atrium_spv_runtime::atrium_tex_sample_2d_array,
-            atrium_spv_runtime::atrium_tex_sample_cube);
+            atrium_spv_runtime::atrium_tex_sample_cube,
+            atrium_spv_runtime::atrium_tex_gather_2d);
         write_descriptor_slot(&mut uniforms, 0,
             &tex_desc as *const _, &samp_desc as *const _);
     }

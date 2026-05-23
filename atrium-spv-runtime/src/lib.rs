@@ -200,13 +200,14 @@ pub struct SamplerDesc {
 // in X1 (per docs/spec/tier2-renderer.md §4.1). v1 of the
 // texture path overlays the buffer's prefix with:
 //
-//   bytes  0..40 : runtime-helper function pointers
+//   bytes  0..48 : runtime-helper function pointers
 //                  ( 0:  atrium_tex_sample_2d
 //                    8:  atrium_tex_fetch_2d
 //                   16:  atrium_tex_sample_2d_lod
 //                   24:  atrium_tex_sample_2d_array
-//                   32:  atrium_tex_sample_cube )
-//   bytes 40..   : flat descriptor table — slot `B` at
+//                   32:  atrium_tex_sample_cube
+//                   40:  atrium_tex_gather_2d )
+//   bytes 48..   : flat descriptor table — slot `B` at
 //                  byte `UNIFORMS_DESC_BASE + B*16`,
 //                  carrying ( 0: tex_desc*, 8: samp_desc* )
 //
@@ -242,8 +243,9 @@ pub const UNIFORMS_HELPERS_BASE: usize = 0;
 /// Offset of the descriptor table within the uniforms
 /// buffer. Slot `B` lives at `UNIFORMS_DESC_BASE + B * DESC_SLOT_BYTES`.
 /// Grew from 16 → 24 (Arc 29 sample_2d_lod) → 32 (Arc 30
-/// sample_2d_array) → 40 (Arc 31 sample_cube).
-pub const UNIFORMS_DESC_BASE: usize = 40;
+/// sample_2d_array) → 40 (Arc 31 sample_cube) → 48 (Arc 32
+/// gather_2d).
+pub const UNIFORMS_DESC_BASE: usize = 48;
 
 /// Bytes per descriptor slot in the table. Two 64-bit
 /// pointers packed back-to-back — `tex_desc*` then
@@ -386,6 +388,8 @@ pub unsafe fn write_helper_pointers(
         *const TexDesc, *const SamplerDesc, f32, f32, f32, *mut f32),
     sample_cube: unsafe extern "C" fn(
         *const TexDesc, *const SamplerDesc, f32, f32, f32, *mut f32),
+    gather_2d: unsafe extern "C" fn(
+        *const TexDesc, *const SamplerDesc, f32, f32, i32, *mut f32),
 ) {
     assert!(buf.len() >= UNIFORMS_DESC_BASE,
         "uniforms buffer too small for the helper header");
@@ -394,11 +398,13 @@ pub unsafe fn write_helper_pointers(
     let sl = (sample_2d_lod   as usize as u64).to_le_bytes();
     let sa = (sample_2d_array as usize as u64).to_le_bytes();
     let sc = (sample_cube     as usize as u64).to_le_bytes();
+    let g  = (gather_2d       as usize as u64).to_le_bytes();
     buf[ 0.. 8].copy_from_slice(&s);
     buf[ 8..16].copy_from_slice(&f);
     buf[16..24].copy_from_slice(&sl);
     buf[24..32].copy_from_slice(&sa);
     buf[32..40].copy_from_slice(&sc);
+    buf[40..48].copy_from_slice(&g);
 }
 
 /// Write a `(tex_desc, samp_desc)` pointer pair at binding
@@ -488,6 +494,59 @@ pub unsafe extern "C" fn atrium_tex_fetch_2d(
     let rgba = fetch_texel_impl(t, x as u32, y as u32);
     let out = std::slice::from_raw_parts_mut(out_rgba, 4);
     out.copy_from_slice(&rgba);
+}
+
+/// `textureGather(sampler2D, vec2, int component)`:
+/// fetch one channel from each texel of the 2×2 footprint
+/// around `(u, v)` and pack into a vec4 per the GLSL
+/// element ordering:
+///   out[0] = texel(i,   j+1).component   // (0, 1)
+///   out[1] = texel(i+1, j+1).component   // (1, 1)
+///   out[2] = texel(i+1, j  ).component   // (1, 0)
+///   out[3] = texel(i,   j  ).component   // (0, 0)
+/// where `(i, j)` is the lower-left corner of the bilinear
+/// footprint (`floor(u*w - 0.5)`, `floor(v*h - 0.5)`) and
+/// each fetched coordinate is wrapped per the sampler's
+/// wrap modes (matching the Vulkan
+/// "VK_KHR_image_format_list" cubemap-compatible Gather
+/// shape).  `component` is the channel index 0..3.
+///
+/// # Safety
+/// As for `atrium_tex_sample_2d`.
+#[no_mangle]
+pub unsafe extern "C" fn atrium_tex_gather_2d(
+    tex: *const TexDesc,
+    samp: *const SamplerDesc,
+    u: f32, v: f32, component: i32,
+    out_rgba: *mut f32,
+) {
+    let t = &*tex;
+    let s = &*samp;
+    let ws = wrap_from_u32(s.wrap_s);
+    let wt = wrap_from_u32(s.wrap_t);
+    // Same continuous coordinate convention as sample_2d:
+    // u'=u*w-0.5, v'=v*h-0.5.  The footprint corner `(i, j)`
+    // is `floor(u', v')`.
+    let x = u * t.width as f32 - 0.5;
+    let y = v * t.height as f32 - 0.5;
+    let i0 = x.floor() as i32;
+    let j0 = y.floor() as i32;
+    let i1 = i0 + 1;
+    let j1 = j0 + 1;
+    let iw0 = apply_wrap(i0, t.width  as i32, ws) as u32;
+    let iw1 = apply_wrap(i1, t.width  as i32, ws) as u32;
+    let jw0 = apply_wrap(j0, t.height as i32, wt) as u32;
+    let jw1 = apply_wrap(j1, t.height as i32, wt) as u32;
+    let t00 = fetch_texel_impl(t, iw0, jw0);
+    let t10 = fetch_texel_impl(t, iw1, jw0);
+    let t11 = fetch_texel_impl(t, iw1, jw1);
+    let t01 = fetch_texel_impl(t, iw0, jw1);
+    let c = (component.max(0) as usize).min(3);
+    let out = std::slice::from_raw_parts_mut(out_rgba, 4);
+    out[0] = t01[c]; // (0, 1)
+    out[1] = t11[c]; // (1, 1)
+    out[2] = t10[c]; // (1, 0)
+    out[3] = t00[c]; // (0, 0)
 }
 
 /// Sample a `samplerCube` with a vec3 direction.  The
@@ -1193,6 +1252,53 @@ mod tests {
     }
 
     #[test]
+    fn gather_2d_returns_2x2_footprint() {
+        // 2x2 RGBA8 image:
+        //   (0, 0) red   (1, 0) green
+        //   (0, 1) blue  (1, 1) white
+        // textureGather centred at u=v=0.5 with the standard
+        // GLSL ordering: { (0,1), (1,1), (1,0), (0,0) }.
+        // Component 0 (R) -> { 0, 1, 0, 1 }
+        // Component 1 (G) -> { 0, 1, 1, 0 }
+        // Component 2 (B) -> { 1, 1, 0, 0 }
+        let pixels: Vec<u8> = vec![
+            255,   0,   0, 255,   // (0, 0) red
+              0, 255,   0, 255,   // (1, 0) green
+              0,   0, 255, 255,   // (0, 1) blue
+            255, 255, 255, 255,   // (1, 1) white
+        ];
+        let tex = TexDesc {
+            data: pixels.as_ptr(),
+            width: 2, height: 2, stride_bytes: 8,
+            format: TexFormat::Rgba8Unorm as u32,
+            mip_count: 0, mip_descs: std::ptr::null(),
+            depth: 1, slice_bytes: 0,
+        };
+        let samp = SamplerDesc {
+            mag_filter: FilterMode::Nearest as u32,
+            min_filter: FilterMode::Nearest as u32,
+            wrap_s: WrapMode::ClampToEdge as u32,
+            wrap_t: WrapMode::ClampToEdge as u32,
+        };
+        let cases: &[(i32, [f32; 4])] = &[
+            (0, [0.0, 1.0, 0.0, 1.0]),  // R
+            (1, [0.0, 1.0, 1.0, 0.0]),  // G
+            (2, [1.0, 1.0, 0.0, 0.0]),  // B
+            (3, [1.0, 1.0, 1.0, 1.0]),  // A
+        ];
+        for &(component, want) in cases {
+            let mut got = [0.0f32; 4];
+            unsafe {
+                atrium_tex_gather_2d(
+                    &tex as *const _, &samp as *const _,
+                    0.5, 0.5, component, got.as_mut_ptr());
+            }
+            assert_eq!(got, want,
+                "gather component {component}: got {got:?}, want {want:?}");
+        }
+    }
+
+    #[test]
     fn sample_cube_picks_right_face() {
         // 6 distinct 1x1 RGBA8 faces packed contiguously
         // (slice_bytes = 4 each):
@@ -1341,7 +1447,8 @@ mod tests {
                 atrium_tex_sample_2d, atrium_tex_fetch_2d,
                 atrium_tex_sample_2d_lod,
                 atrium_tex_sample_2d_array,
-                atrium_tex_sample_cube);
+                atrium_tex_sample_cube,
+                atrium_tex_gather_2d);
             write_descriptor_slot(&mut buf, 0, tex_a_ptr, samp_a_ptr);
             write_descriptor_slot(&mut buf, 1, tex_b_ptr, samp_b_ptr);
         }
