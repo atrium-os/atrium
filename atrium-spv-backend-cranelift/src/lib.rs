@@ -1857,6 +1857,43 @@ impl FnTranslator {
                 self.vectors.insert(result.id, lanes);
                 Ok(())
             }
+            // OpImageQuerySizeLod on a sampled image -- reads
+            // TexDesc.width/height off the X1-anchored
+            // uniforms table.  LOD operand captured but
+            // ignored at codegen (Tier-2 v1 is single-mip
+            // for the sampler).
+            Op::SampledImageQuerySizeLod { image, lod: _ } => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "SampledImageQuerySizeLod without result".into()))?;
+                let lane_count = match &result.ty {
+                    atrium_spv_ir::Type::Vec2(_) => 2,
+                    atrium_spv_ir::Type::Vec3(_) => 3,
+                    other => return Err(BackendError::Unsupported(format!(
+                        "SampledImageQuerySizeLod result must be \
+                         vec2/vec3, got {other:?}"))),
+                };
+                let (_, binding) = self.image_handles.get(&image.id)
+                    .copied()
+                    .ok_or_else(|| BackendError::Internal(format!(
+                        "SampledImageQuerySizeLod image {:?} not an \
+                         ImageHandle", image.id)))?;
+                let pointer_type = builder.func.dfg
+                    .value_type(self.params[1]);
+                let uniforms = self.params[1];
+                let desc_off: i32 = 48 + (binding as i32) * 16;
+                let desc_ptr = builder.ins().load(
+                    pointer_type, MemFlags::new(), uniforms, desc_off);
+                let field_offs: [i32; 2] = [8, 12]; // width, height
+                let mut lanes = Vec::with_capacity(lane_count);
+                for i in 0..lane_count.min(2) {
+                    lanes.push(builder.ins().load(
+                        clif_types::I32, MemFlags::new(),
+                        desc_ptr, field_offs[i]));
+                }
+                self.vectors.insert(result.id, lanes);
+                Ok(())
+            }
             // OpImageTexelPointer — form a raw byte pointer
             // to a single storage-image texel, computed inline
             // off the image descriptor table just like the

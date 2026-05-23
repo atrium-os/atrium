@@ -3652,6 +3652,46 @@ fn emit_function(
                 }
                 vectors.insert(result.id, lanes);
             }
+            // OpImageQuerySizeLod on a sampled image -- reads
+            // TexDesc.width/height off the X1-anchored
+            // uniforms table.  LOD operand is captured for
+            // liveness but ignored at codegen (Tier-2 v1 is
+            // single-mip from the sampler's perspective).
+            Op::SampledImageQuerySizeLod { image, lod: _ } => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "SampledImageQuerySizeLod without result".into()))?;
+                let lane_count = match &result.ty {
+                    Type::Vec2(_) => 2,
+                    Type::Vec3(_) => 3,
+                    other => return Err(BackendError::Unsupported(format!(
+                        "SampledImageQuerySizeLod result must be \
+                         vec2/vec3, got {other:?}"))),
+                };
+                let (_, binding) = image_handles.get(&image.id)
+                    .copied()
+                    .ok_or_else(|| BackendError::Internal(format!(
+                        "SampledImageQuerySizeLod image {:?} not an \
+                         ImageHandle", image.id)))?;
+                // Sampled-image descriptor table sits at X1
+                // anchored, with slot pitch 16 (tex+samp) and
+                // base offset UNIFORMS_DESC_BASE (= 48).
+                let desc_off: u16 = 48 + (binding as u16) * 16;
+                let x9 = asm::Xreg(9);
+                a.emit(asm::ldr_x_offset(x9, asm::Xreg(1), desc_off));
+                // TexDesc field offsets: width @8, height @12.
+                let field_offs: [u16; 3] = [8, 12, 0];
+                let mut lanes: Vec<Value> = Vec::with_capacity(lane_count);
+                for i in 0..lane_count.min(2) {
+                    let synth = ValueId(next_synth_id);
+                    next_synth_id += 1;
+                    let w = int_pool.alloc(synth)?;
+                    a.emit(asm::ldr_w_offset(w, x9, field_offs[i]));
+                    ints.insert(synth, w);
+                    lanes.push(Value { id: synth, ty: Type::U32 });
+                }
+                vectors.insert(result.id, lanes);
+            }
             // OpImageRead / OpImageWrite — storage-image
             // access in a compute shader.  v1-ABI call via
             // the X19-anchored image descriptor table:
@@ -4878,6 +4918,10 @@ fn compute_last_use_flat(
                 if let Some(lane_ids) = vec_lanes.get(&coord.id).cloned() {
                     for lid in &lane_ids { mark(*lid); }
                 }
+            }
+            Op::SampledImageQuerySizeLod { image, lod } => {
+                mark(image.id);
+                mark(lod.id);
             }
             Op::ImageFetch { image, coord, lod } => {
                 mark(image.id);

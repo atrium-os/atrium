@@ -1758,6 +1758,39 @@ fn translate_inst(
             Ok(())
         }
 
+        // OpImageQuerySizeLod: textureSize(sampler, lod).
+        // Operand 0 is an OpTypeImage value (typically
+        // extracted from a sampled image via OpImage, or a
+        // direct image load).  Operand 1 is the integer LOD.
+        // We emit Op::SampledImageQuerySizeLod which both
+        // backends lower to direct width/height reads off
+        // the TexDesc; the LOD is captured but ignored in v1
+        // (single-mip TexDescs always read the base).
+        SpvOp::ImageQuerySizeLod => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed(
+                    "ImageQuerySizeLod without result id".to_string()))?;
+            let result_type_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed(
+                    "ImageQuerySizeLod without result type".to_string()))?;
+            let result_ty = types.get(result_type_id)?.clone();
+            let img_id = expect_id(&spv_inst.operands, 0)?;
+            let lod_id = expect_id(&spv_inst.operands, 1)?;
+            let image = id_map.get(&img_id).cloned().ok_or_else(||
+                FrontendError::Malformed(format!(
+                    "ImageQuerySizeLod image id {img_id} not yet defined")))?;
+            let lod = resolve_value(lod_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            let result = alloc_or_get_result(
+                result_id, result_ty, id_map, next_value_id);
+            insts.push(Inst {
+                op: Op::SampledImageQuerySizeLod { image, lod },
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
+
         // OpImageQueryLevels: count of mip levels in a
         // sampled image.  Atrium's Tier-2 sampled-image path
         // is single-mip in v1, so the result is a constant 1

@@ -1139,6 +1139,14 @@ specifically supports:
   `0..3`.  `UNIFORMS_DESC_BASE` grew 24 → 32 → 40 → 48.
   Array/Cube + ExplicitLod combos are
   deferred (would need `_array_lod` / `_cube_lod` helpers).
+  `textureSize(sampler2D, lod)` (Arc 34): a new IR op
+  `Op::SampledImageQuerySizeLod { image, lod }` is emitted
+  by the frontend for `OpImageQuerySizeLod`.  Both backends
+  read TexDesc.width @ #8 / height @ #12 directly off the
+  X1-anchored uniforms table -- no helper call.  The LOD
+  operand is captured for liveness but ignored at codegen
+  (single-mip TexDesc); real multi-mip would indirect
+  through `mip_descs[lod]`.
   Pixel-quad derivatives (Arc 33): `OpDPdx` / `OpDPdy` /
   `OpFwidth` (+ Fine / Coarse variants) lower at the frontend
   to a zero of the result type (no 2×2 quad in the

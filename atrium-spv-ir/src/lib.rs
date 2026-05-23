@@ -725,6 +725,19 @@ pub enum Op {
         /// vec4 texel value to store.
         texel: Value,
     },
+    /// Query the dimensions of a sampled image at a given
+    /// mip level (`OpImageQuerySizeLod`).  Result is a uvec2
+    /// for 2D images (width, height).  Distinct from
+    /// [`Self::ImageQuerySize`] which queries storage images
+    /// via the X19-anchored ImageDesc table; this op reads
+    /// off the X1-anchored TexDesc table.  In v1 the LOD
+    /// operand is captured but ignored at codegen (we read
+    /// the base TexDesc's width/height); real multi-mip
+    /// query would indirect through `mip_descs[lod]`.
+    SampledImageQuerySizeLod {
+        image: Value,
+        lod:   Value,
+    },
     /// Gather a 2×2 footprint of one channel
     /// (`OpImageGather`).  Returns a `vec4` whose elements
     /// are the chosen channel from each of the four texels
