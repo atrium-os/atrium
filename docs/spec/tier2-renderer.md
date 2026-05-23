@@ -1109,6 +1109,16 @@ specifically supports:
   test that writes (x, y, layer, 1.0) per invocation on
   a 2×2×3 array and reads back identical bytes from both
   backends.
+  Mip-level *sampling* (the sampler-side counterpart of
+  the storage-image work below) is also wired: `TexDesc`
+  carries the same `mip_count` + `mip_descs` shape;
+  `atrium_tex_sample_2d_lod(tex, samp, u, v, lod, out)` is
+  the new helper (uniforms-table slot #16); the
+  `atrium_tex_fetch_2d` helper now also honours its `lod`
+  parameter.  `UNIFORMS_DESC_BASE` grew 16 → 24.  Both
+  backends route `OpImageSampleExplicitLod` through the
+  new helper with the LOD passed in V2 (bespoke) or as
+  an extra `f32` call arg (Cranelift).
   MVP scope: Rgba8Unorm / R32Float / Rgba32Float.  Mip-
   level storage images are supported via `OpImageRead` /
   `OpImageWrite` with `Image-Operands::Lod`: the runtime

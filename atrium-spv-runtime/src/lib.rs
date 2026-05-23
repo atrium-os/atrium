@@ -148,6 +148,11 @@ pub enum WrapMode {
 /// buffer of `height` rows, each `stride_bytes` long; the
 /// pixel format determines bytes-per-texel within a row.
 /// The shader sees this as a `texture2D` / `image2D`.
+///
+/// `mip_count` / `mip_descs` were appended for multi-mip
+/// sampling (Arc 29).  Single-mip callers set them to 0 /
+/// null; the `*_lod` helpers fall back to the base
+/// descriptor when `lod` is out of range.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct TexDesc {
@@ -157,6 +162,12 @@ pub struct TexDesc {
     pub stride_bytes: u32,
     /// `TexFormat` as `u32` for C-ABI portability.
     pub format:       u32,
+    /// Number of mip levels (0 or 1 means single-level).
+    pub mip_count:    u32,
+    /// Pointer to an array of per-mip `TexDesc`s indexed
+    /// `0..mip_count`; mirrors `ImageDesc.mip_descs`.  May
+    /// be null when `mip_count <= 1`.
+    pub mip_descs:    *const TexDesc,
 }
 
 /// A sampler binding. Independent of any specific image,
@@ -182,10 +193,11 @@ pub struct SamplerDesc {
 // in X1 (per docs/spec/tier2-renderer.md §4.1). v1 of the
 // texture path overlays the buffer's prefix with:
 //
-//   bytes  0..16 : runtime-helper function pointers
+//   bytes  0..24 : runtime-helper function pointers
 //                  ( 0:  atrium_tex_sample_2d
-//                    8:  atrium_tex_fetch_2d )
-//   bytes 16..   : flat descriptor table — slot `B` at
+//                    8:  atrium_tex_fetch_2d
+//                   16:  atrium_tex_sample_2d_lod )
+//   bytes 24..   : flat descriptor table — slot `B` at
 //                  byte `UNIFORMS_DESC_BASE + B*16`,
 //                  carrying ( 0: tex_desc*, 8: samp_desc* )
 //
@@ -220,7 +232,9 @@ pub const UNIFORMS_HELPERS_BASE: usize = 0;
 
 /// Offset of the descriptor table within the uniforms
 /// buffer. Slot `B` lives at `UNIFORMS_DESC_BASE + B * DESC_SLOT_BYTES`.
-pub const UNIFORMS_DESC_BASE: usize = 16;
+/// Grew from 16 to 24 when `atrium_tex_sample_2d_lod` was
+/// added (Arc 29).
+pub const UNIFORMS_DESC_BASE: usize = 24;
 
 /// Bytes per descriptor slot in the table. Two 64-bit
 /// pointers packed back-to-back — `tex_desc*` then
@@ -340,11 +354,11 @@ pub unsafe fn write_image_descriptor_slot(
     buf[base..base + 8].copy_from_slice(&bytes);
 }
 
-/// Write the runtime-helper function-pointer header.
-/// Pass the actual `atrium_tex_sample_2d` /
-/// `atrium_tex_fetch_2d` function addresses; the shader's
-/// emitted code reads them with a plain `ldr [X1, #0/+8]`
-/// and `blr`s through.
+/// Write the runtime-helper function-pointer header.  Three
+/// helpers: `atrium_tex_sample_2d` (implicit-LOD; always
+/// mip 0), `atrium_tex_fetch_2d` (texel-fetch with LOD), and
+/// `atrium_tex_sample_2d_lod` (explicit-LOD with mip
+/// selection via `TexDesc.mip_descs`).
 ///
 /// # Safety
 /// The function pointers must remain valid for the lifetime
@@ -355,13 +369,17 @@ pub unsafe fn write_helper_pointers(
         *const TexDesc, *const SamplerDesc, f32, f32, *mut f32),
     fetch_2d: unsafe extern "C" fn(
         *const TexDesc, i32, i32, i32, *mut f32),
+    sample_2d_lod: unsafe extern "C" fn(
+        *const TexDesc, *const SamplerDesc, f32, f32, f32, *mut f32),
 ) {
     assert!(buf.len() >= UNIFORMS_DESC_BASE,
         "uniforms buffer too small for the helper header");
-    let s = (sample_2d as usize as u64).to_le_bytes();
-    let f = (fetch_2d  as usize as u64).to_le_bytes();
-    buf[0..8].copy_from_slice(&s);
-    buf[8..16].copy_from_slice(&f);
+    let s  = (sample_2d     as usize as u64).to_le_bytes();
+    let f  = (fetch_2d      as usize as u64).to_le_bytes();
+    let sl = (sample_2d_lod as usize as u64).to_le_bytes();
+    buf[ 0.. 8].copy_from_slice(&s);
+    buf[ 8..16].copy_from_slice(&f);
+    buf[16..24].copy_from_slice(&sl);
 }
 
 /// Write a `(tex_desc, samp_desc)` pointer pair at binding
@@ -414,21 +432,67 @@ pub unsafe extern "C" fn atrium_tex_sample_2d(
     out.copy_from_slice(&rgba);
 }
 
+/// Resolve a `(base TexDesc, lod)` pair to the descriptor
+/// that holds the texel data for that mip level.  Falls
+/// back to the base descriptor when `lod` is out of range
+/// (or `mip_descs` is null), keeping behaviour well-defined
+/// for single-mip bindings.
+#[inline]
+unsafe fn pick_tex_mip<'a>(tex: &'a TexDesc, lod: i32) -> &'a TexDesc {
+    if lod <= 0 || tex.mip_count <= 1 || tex.mip_descs.is_null() {
+        return tex;
+    }
+    let l = lod as u32;
+    if l >= tex.mip_count {
+        return tex;
+    }
+    &*tex.mip_descs.add(l as usize)
+}
+
 /// Fetch a single texel by integer coordinates (no
 /// filtering, no wrap — the caller is responsible for
-/// keeping `(x, y)` in range). `lod` is ignored in v1.
+/// keeping `(x, y)` in range).  `lod` selects the mip
+/// level via `TexDesc.mip_descs[lod]` when in range;
+/// otherwise the base descriptor is used.
 ///
 /// # Safety
 /// As for `atrium_tex_sample_2d`. Additionally, `x` and
-/// `y` must be in `[0, tex.width)` × `[0, tex.height)`.
+/// `y` must be in `[0, tex.width)` × `[0, tex.height)` of
+/// the selected mip level.
 #[no_mangle]
 pub unsafe extern "C" fn atrium_tex_fetch_2d(
     tex: *const TexDesc,
-    x: i32, y: i32, _lod: i32,
+    x: i32, y: i32, lod: i32,
     out_rgba: *mut f32,
 ) {
-    let t = &*tex;
+    let t = pick_tex_mip(&*tex, lod);
     let rgba = fetch_texel_impl(t, x as u32, y as u32);
+    let out = std::slice::from_raw_parts_mut(out_rgba, 4);
+    out.copy_from_slice(&rgba);
+}
+
+/// Sample a 2D image with explicit LOD.  `lod` is rounded
+/// to the nearest integer mip level and the descriptor for
+/// that mip is selected via `TexDesc.mip_descs[lod]`;
+/// out-of-range `lod` falls back to the base descriptor.
+/// Within the picked mip, sampling proceeds exactly as
+/// [`atrium_tex_sample_2d`].
+///
+/// # Safety
+/// As for `atrium_tex_sample_2d`.
+#[no_mangle]
+pub unsafe extern "C" fn atrium_tex_sample_2d_lod(
+    tex: *const TexDesc,
+    samp: *const SamplerDesc,
+    u: f32, v: f32, lod: f32,
+    out_rgba: *mut f32,
+) {
+    // Round-to-nearest int LOD for mip selection (single-
+    // level fallback when out of range).
+    let lod_i = lod.round() as i32;
+    let t = pick_tex_mip(&*tex, lod_i);
+    let s = &*samp;
+    let rgba = sample_2d_impl(t, s, u, v);
     let out = std::slice::from_raw_parts_mut(out_rgba, 4);
     out.copy_from_slice(&rgba);
 }
@@ -917,6 +981,7 @@ mod tests {
             data: pixels.as_ptr(),
             width: 2, height: 2, stride_bytes: 8,
             format: TexFormat::Rgba8Unorm as u32,
+            mip_count: 0, mip_descs: std::ptr::null(),
         };
         (pixels, desc)
     }
@@ -985,6 +1050,7 @@ mod tests {
             data: pixels.as_ptr(),
             width: 2, height: 2, stride_bytes: 8,
             format: TexFormat::Bgra8Unorm as u32,
+            mip_count: 0, mip_descs: std::ptr::null(),
         };
         let p0 = fetch_texel_impl(&desc, 0, 0);
         assert!(p0[0] == 0.0 && p0[2] == 1.0, "BGRA swap (0,0): {p0:?}");
@@ -1023,6 +1089,65 @@ mod tests {
     }
 
     #[test]
+    fn sample_2d_lod_indirects_through_mip_descs() {
+        // Two distinct 1×1 RGBA8 mip levels: mip 0 = red,
+        // mip 1 = blue.  Build a base TexDesc with mip_count
+        // = 2 + mip_descs pointing at the per-mip array, then
+        // call atrium_tex_sample_2d_lod at LOD=0 and LOD=1
+        // and assert the right mip is selected.
+        let mip0_pixels: Vec<u8> = vec![255, 0, 0, 255];
+        let mip1_pixels: Vec<u8> = vec![0, 0, 255, 255];
+        let mip_array: Vec<TexDesc> = vec![
+            TexDesc {
+                data: mip0_pixels.as_ptr(),
+                width: 1, height: 1, stride_bytes: 4,
+                format: TexFormat::Rgba8Unorm as u32,
+                mip_count: 0, mip_descs: std::ptr::null(),
+            },
+            TexDesc {
+                data: mip1_pixels.as_ptr(),
+                width: 1, height: 1, stride_bytes: 4,
+                format: TexFormat::Rgba8Unorm as u32,
+                mip_count: 0, mip_descs: std::ptr::null(),
+            },
+        ];
+        let base = TexDesc {
+            data: mip0_pixels.as_ptr(),
+            width: 1, height: 1, stride_bytes: 4,
+            format: TexFormat::Rgba8Unorm as u32,
+            mip_count: 2,
+            mip_descs: mip_array.as_ptr(),
+        };
+        let samp = SamplerDesc {
+            mag_filter: FilterMode::Nearest as u32,
+            min_filter: FilterMode::Nearest as u32,
+            wrap_s: WrapMode::ClampToEdge as u32,
+            wrap_t: WrapMode::ClampToEdge as u32,
+        };
+        let mut out_mip0 = [0.0f32; 4];
+        let mut out_mip1 = [0.0f32; 4];
+        unsafe {
+            atrium_tex_sample_2d_lod(
+                &base as *const _, &samp as *const _,
+                0.5, 0.5, 0.0, out_mip0.as_mut_ptr());
+            atrium_tex_sample_2d_lod(
+                &base as *const _, &samp as *const _,
+                0.5, 0.5, 1.0, out_mip1.as_mut_ptr());
+        }
+        assert_eq!(out_mip0, [1.0, 0.0, 0.0, 1.0], "LOD 0 -> red");
+        assert_eq!(out_mip1, [0.0, 0.0, 1.0, 1.0], "LOD 1 -> blue");
+        // LOD out of range falls back to base.
+        let mut out_oob = [0.0f32; 4];
+        unsafe {
+            atrium_tex_sample_2d_lod(
+                &base as *const _, &samp as *const _,
+                0.5, 0.5, 5.0, out_oob.as_mut_ptr());
+        }
+        assert_eq!(out_oob, [1.0, 0.0, 0.0, 1.0],
+            "out-of-range LOD falls back to base (red)");
+    }
+
+    #[test]
     fn descriptor_table_layout_round_trips() {
         // Two slots: binding 0 → (tex_a, samp_a), binding 1
         // → (tex_b, samp_b). After writing, decode each
@@ -1057,7 +1182,8 @@ mod tests {
         assert_eq!(buf.len(), UNIFORMS_DESC_BASE + 2 * DESC_SLOT_BYTES);
         unsafe {
             write_helper_pointers(&mut buf,
-                atrium_tex_sample_2d, atrium_tex_fetch_2d);
+                atrium_tex_sample_2d, atrium_tex_fetch_2d,
+                atrium_tex_sample_2d_lod);
             write_descriptor_slot(&mut buf, 0, tex_a_ptr, samp_a_ptr);
             write_descriptor_slot(&mut buf, 1, tex_b_ptr, samp_b_ptr);
         }
@@ -1084,6 +1210,7 @@ mod tests {
             data: pixels.as_ptr(),
             width: 4, height: 1, stride_bytes: 4,
             format: TexFormat::R8Unorm as u32,
+            mip_count: 0, mip_descs: std::ptr::null(),
         };
         let p = fetch_texel_impl(&desc, 1, 0);
         assert!((p[0] - 200.0 / 255.0).abs() < 1e-6);

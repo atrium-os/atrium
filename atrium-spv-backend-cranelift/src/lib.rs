@@ -1538,11 +1538,12 @@ impl FnTranslator {
             // plus a 16-byte stack slot for the out_rgba
             // pixel, which we then load lane-by-lane.
             //
-            // ImageSampleExplicitLod shares this arm: with
-            // single-mip TexDesc the LOD is ignored (the
-            // helper always samples mip 0).  Real multi-mip
-            // sampling is deferred (mirrors Arc 26 storage-
-            // image Lod work for the sampler side).
+            // ImageSampleExplicitLod shares this arm but
+            // routes through `atrium_tex_sample_2d_lod`
+            // (helper @ #16) and passes the LOD scalar as an
+            // additional f32 call arg.  Mip selection happens
+            // inside the helper via `TexDesc.mip_descs[lod]`
+            // (Arc 29).
             Op::ImageSampleImplicitLod { sampled_image, coord }
             | Op::ImageSampleExplicitLod { sampled_image, coord, .. } => {
                 let result = inst.result.as_ref().ok_or_else(||
@@ -1564,6 +1565,17 @@ impl FnTranslator {
                 }
                 let u = coord_lanes[0];
                 let v = coord_lanes[1];
+                let (helper_off, lod_arg): (i32, Option<ClifValue>) =
+                    match &inst.op {
+                        Op::ImageSampleExplicitLod { lod, .. } => {
+                            let lv = *self.scalars.get(&lod.id).ok_or_else(||
+                                BackendError::Internal(format!(
+                                    "ImageSampleExplicitLod lod {:?} not \
+                                     in scalars", lod.id)))?;
+                            (16, Some(lv))
+                        }
+                        _ => (0, None),
+                    };
 
                 let pointer_type = builder.func.dfg
                     .value_type(self.params[1]); // uniforms ptr
@@ -1571,37 +1583,39 @@ impl FnTranslator {
 
                 // Load helper fn pointer + descriptor slot
                 // pointers from the uniforms buffer at the
-                // v1-ABI offsets.
-                let desc_off: i32 = 16 + (binding as i32) * 16;
+                // v1-ABI offsets.  ExplicitLod selects the
+                // sample_2d_lod helper at #16.
+                let desc_off: i32 = 24 + (binding as i32) * 16;
                 let fn_ptr = builder.ins().load(
-                    pointer_type, MemFlags::new(), uniforms, 0);
+                    pointer_type, MemFlags::new(), uniforms, helper_off);
                 let tex_ptr = builder.ins().load(
                     pointer_type, MemFlags::new(), uniforms, desc_off);
                 let samp_ptr = builder.ins().load(
                     pointer_type, MemFlags::new(), uniforms, desc_off + 8);
 
-                // 16-byte stack slot for the out_rgba pixel
-                // (4 f32 lanes, 4-byte aligned is the f32
-                // requirement; 16 is over-aligned but
-                // matches the Q-register convention the
-                // bespoke backend uses).
+                // 16-byte stack slot for the out_rgba pixel.
                 let slot = builder.create_sized_stack_slot(
                     StackSlotData::new(StackSlotKind::ExplicitSlot, 16, 4));
                 let out_ptr = builder.ins().stack_addr(pointer_type, slot, 0);
 
-                // void atrium_tex_sample_2d(
-                //   const TexDesc*, const SamplerDesc*,
-                //   f32 u, f32 v, f32 *out_rgba);
+                // Implicit: (tex, samp, u, v, out)
+                // Explicit: (tex, samp, u, v, lod, out)
                 let mut call_sig = Signature::new(CallConv::SystemV);
                 call_sig.params.push(AbiParam::new(pointer_type));
                 call_sig.params.push(AbiParam::new(pointer_type));
                 call_sig.params.push(AbiParam::new(clif_types::F32));
                 call_sig.params.push(AbiParam::new(clif_types::F32));
+                if lod_arg.is_some() {
+                    call_sig.params.push(AbiParam::new(clif_types::F32));
+                }
                 call_sig.params.push(AbiParam::new(pointer_type));
                 let sig_ref = builder.import_signature(call_sig);
+                let mut call_args: Vec<ClifValue> =
+                    vec![tex_ptr, samp_ptr, u, v];
+                if let Some(lv) = lod_arg { call_args.push(lv); }
+                call_args.push(out_ptr);
                 builder.ins().call_indirect(
-                    sig_ref, fn_ptr,
-                    &[tex_ptr, samp_ptr, u, v, out_ptr]);
+                    sig_ref, fn_ptr, &call_args);
 
                 // Read the four pixel lanes back out as f32s.
                 let mut lanes = Vec::with_capacity(4);
@@ -1696,7 +1710,7 @@ impl FnTranslator {
                     .value_type(self.params[1]);
                 let uniforms = self.params[1];
 
-                let desc_off: i32 = 16 + (binding as i32) * 16;
+                let desc_off: i32 = 24 + (binding as i32) * 16;
                 let fn_ptr = builder.ins().load(
                     pointer_type, MemFlags::new(), uniforms, 8); // fetch slot
                 let tex_ptr = builder.ins().load(

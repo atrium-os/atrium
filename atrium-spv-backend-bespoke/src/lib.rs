@@ -3092,12 +3092,11 @@ fn emit_function(
             // shader with values live across an ImageSample
             // needs proper save/restore (a later phase).
             //
-            // ImageSampleExplicitLod shares this arm: in the
-            // single-mip TexDesc world the LOD operand is
-            // ignored (the helper always samples mip 0).
-            // Real multi-mip sampling would extend the helper
-            // signature + table layout, mirroring Arc 26's
-            // storage-image Lod plumbing; deferred.
+            // ImageSampleExplicitLod shares this arm but
+            // routes through `atrium_tex_sample_2d_lod`
+            // (helper @ #16) and passes the LOD scalar in V2.
+            // Mip selection happens inside the helper via
+            // `TexDesc.mip_descs[lod]` (Arc 29).
             Op::ImageSampleImplicitLod { sampled_image, coord }
             | Op::ImageSampleExplicitLod { sampled_image, coord, .. } => {
                 let result = inst.result.as_ref().ok_or_else(||
@@ -3171,9 +3170,24 @@ fn emit_function(
                 let x11 = asm::Xreg(11);
                 let v0 = asm::Vreg(0);
                 let v1 = asm::Vreg(1);
-                let v2 = asm::Vreg(2); // parallel-copy temp
+                let v2 = asm::Vreg(2); // parallel-copy temp / LOD slot
+                let v3 = asm::Vreg(3); // LOD hold across u/v copy
                 let lr = asm::Xreg(30);
-                let desc_off: u16 = 16 + (binding as u16) * 16;
+                // ExplicitLod uses `atrium_tex_sample_2d_lod`
+                // at helper-table offset #16; ImplicitLod uses
+                // `atrium_tex_sample_2d` at #0.
+                let (helper_off, lod_v): (u16, Option<asm::Vreg>) =
+                    match &inst.op {
+                        Op::ImageSampleExplicitLod { lod, .. } => {
+                            let lv = *scalars.get(&lod.id).ok_or_else(||
+                                BackendError::Internal(format!(
+                                    "ImageSampleExplicitLod lod {:?} not \
+                                     in scalars", lod.id)))?;
+                            (16u16, Some(lv))
+                        }
+                        _ => (0u16, None),
+                    };
+                let desc_off: u16 = 24 + (binding as u16) * 16;
 
                 // Stack layout (16-byte aligned; each region
                 // is 16 bytes):
@@ -3201,18 +3215,30 @@ fn emit_function(
                         asm::Vreg(*n), sp, 32 + (i as u16) * 16));
                 }
 
-                // Load descriptor pointers + helper.
-                a.emit(asm::ldr_x_offset(x9, x1, 0));
+                // Load descriptor pointers + helper.  For
+                // ExplicitLod, `helper_off` is #16, pointing
+                // at `atrium_tex_sample_2d_lod`.
+                a.emit(asm::ldr_x_offset(x9, x1, helper_off));
                 a.emit(asm::ldr_x_offset(x10, x1, desc_off));
                 a.emit(asm::ldr_x_offset(x11, x1, desc_off + 8));
 
-                // u, v → V0, V1, parallel-copy safe via V2
-                // (a fresh caller-saved scratch outside our
-                // pool). Equivalent to:
-                //   tmp = u; v1 = v; v0 = tmp
+                // ExplicitLod: stash LOD in V3 across the u/v
+                // parallel copy (V0/V1/V2 may collide with the
+                // lod V-reg).  After the copy, move V3 -> V2
+                // so the helper sees LOD in V2 (its 3rd float
+                // arg slot).  All V-regs in the V0..V7 range
+                // are caller-saved + already spilled above,
+                // so freely scribbling V3 here is safe.
+                if let Some(lv) = lod_v {
+                    a.emit(asm::mov_v_16b(v3, lv));
+                }
+                // u, v → V0, V1, parallel-copy safe via V2.
                 a.emit(asm::mov_v_16b(v2, u_v));
                 a.emit(asm::mov_v_16b(v1, v_v));
                 a.emit(asm::mov_v_16b(v0, v2));
+                if lod_v.is_some() {
+                    a.emit(asm::mov_v_16b(v2, v3));
+                }
 
                 // Pointer args + call. Note: `mov` from SP
                 // is a different ARM64 alias than reg→reg
@@ -3317,7 +3343,7 @@ fn emit_function(
                 let w1 = asm::Wreg(1);
                 let w2 = asm::Wreg(2);
                 let w3 = asm::Wreg(3);
-                let desc_off: u16 = 16 + (binding as u16) * 16;
+                let desc_off: u16 = 24 + (binding as u16) * 16;
 
                 let n_spill = live_vregs.len() as u16;
                 let frame_bytes: u16 = 32 + n_spill * 16;
