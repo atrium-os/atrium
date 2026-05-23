@@ -95,7 +95,8 @@ fn storage_format_from_u32(v: u32) -> StorageFormat {
 /// the original v1 2D layout — backends that only read those
 /// offsets stay binary-compatible.  `depth` / `slice_bytes`
 /// were appended for `image3D`: a 2D image sets `depth = 1`
-/// and `slice_bytes = 0`.
+/// and `slice_bytes = 0`.  `mip_count` / `mip_descs` were
+/// appended for mip-level storage images (Arc 26).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct ImageDesc {
@@ -110,6 +111,16 @@ pub struct ImageDesc {
     /// Byte stride between consecutive Z slices.  Ignored
     /// when `depth == 1`; conventionally `height * stride_bytes`.
     pub slice_bytes:  u32,
+    /// Number of mip levels.  `0` or `1` means single-level
+    /// (the base `data`/`width`/`height`/etc. describe the
+    /// only mip); the `*_lod` helpers ignore `mip_descs` in
+    /// that case and operate on this `ImageDesc` directly.
+    pub mip_count:    u32,
+    /// Pointer to an array of per-mip `ImageDesc`s, indexed
+    /// `0..mip_count`.  Slot `i` holds the descriptor for
+    /// mip level `i`: distinct `data` pointer + dimensions
+    /// per level.  May be null when `mip_count <= 1`.
+    pub mip_descs:    *const ImageDesc,
 }
 
 /// Sampler filter modes. Wire-form values are stable.
@@ -232,12 +243,16 @@ pub fn descriptor_table_buffer(count: usize) -> Vec<u8> {
 // slot (which the compute calling convention otherwise leaves
 // null).  Layout:
 //
-//   bytes  0..32 : runtime-helper pointers
+//   bytes  0..64 : runtime-helper pointers
 //                  ( 0:  atrium_img_read_2d
 //                    8:  atrium_img_write_2d
 //                   16:  atrium_img_read_3d
-//                   24:  atrium_img_write_3d )
-//   bytes 32..   : descriptor table — slot `B` at byte
+//                   24:  atrium_img_write_3d
+//                   32:  atrium_img_read_2d_lod
+//                   40:  atrium_img_write_2d_lod
+//                   48:  atrium_img_read_3d_lod
+//                   56:  atrium_img_write_3d_lod )
+//   bytes 64..   : descriptor table — slot `B` at byte
 //                  `IMG_TABLE_DESC_BASE + B*IMG_DESC_SLOT_BYTES`,
 //                  holding a single `ImageDesc*`.
 //
@@ -245,8 +260,9 @@ pub fn descriptor_table_buffer(count: usize) -> Vec<u8> {
 // pointer (8 bytes) rather than the texture table's pair.
 
 /// Offset of the descriptor table within the compute
-/// storage-image table buffer.
-pub const IMG_TABLE_DESC_BASE: usize = 32;
+/// storage-image table buffer.  Grew from 32 to 64 when the
+/// four `_lod` mip-aware helpers were added in Arc 26.
+pub const IMG_TABLE_DESC_BASE: usize = 64;
 
 /// Bytes per storage-image descriptor slot — one
 /// `ImageDesc*`.
@@ -260,13 +276,16 @@ pub fn image_table_buffer(count: usize) -> Vec<u8> {
     vec![0u8; IMG_TABLE_DESC_BASE + count * IMG_DESC_SLOT_BYTES]
 }
 
-/// Write the four storage-image helper pointers
-/// (2D read / 2D write / 3D read / 3D write) into a compute
-/// storage-image table.
+/// Write the eight storage-image helper pointers
+/// (2D / 3D × read / write × base / lod) into a compute
+/// storage-image table.  The four `_lod` helpers take an
+/// extra `lod: i32` argument and indirect through
+/// `ImageDesc.mip_descs[lod]` when `lod < mip_count`.
 ///
 /// # Safety
 /// The function pointers must outlive every shader
 /// invocation that uses this buffer.
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn write_image_helper_pointers(
     buf: &mut [u8],
     read_2d:  unsafe extern "C" fn(*const ImageDesc, i32, i32, *mut f32),
@@ -275,17 +294,33 @@ pub unsafe fn write_image_helper_pointers(
         *const ImageDesc, i32, i32, i32, *mut f32),
     write_3d: unsafe extern "C" fn(
         *const ImageDesc, i32, i32, i32, *const f32),
+    read_2d_lod: unsafe extern "C" fn(
+        *const ImageDesc, i32, i32, i32, *mut f32),
+    write_2d_lod: unsafe extern "C" fn(
+        *const ImageDesc, i32, i32, i32, *const f32),
+    read_3d_lod: unsafe extern "C" fn(
+        *const ImageDesc, i32, i32, i32, i32, *mut f32),
+    write_3d_lod: unsafe extern "C" fn(
+        *const ImageDesc, i32, i32, i32, i32, *const f32),
 ) {
     assert!(buf.len() >= IMG_TABLE_DESC_BASE,
         "image table buffer too small for the helper header");
-    let r2 = (read_2d  as usize as u64).to_le_bytes();
-    let w2 = (write_2d as usize as u64).to_le_bytes();
-    let r3 = (read_3d  as usize as u64).to_le_bytes();
-    let w3 = (write_3d as usize as u64).to_le_bytes();
+    let r2  = (read_2d      as usize as u64).to_le_bytes();
+    let w2  = (write_2d     as usize as u64).to_le_bytes();
+    let r3  = (read_3d      as usize as u64).to_le_bytes();
+    let w3  = (write_3d     as usize as u64).to_le_bytes();
+    let r2l = (read_2d_lod  as usize as u64).to_le_bytes();
+    let w2l = (write_2d_lod as usize as u64).to_le_bytes();
+    let r3l = (read_3d_lod  as usize as u64).to_le_bytes();
+    let w3l = (write_3d_lod as usize as u64).to_le_bytes();
     buf[ 0.. 8].copy_from_slice(&r2);
     buf[ 8..16].copy_from_slice(&w2);
     buf[16..24].copy_from_slice(&r3);
     buf[24..32].copy_from_slice(&w3);
+    buf[32..40].copy_from_slice(&r2l);
+    buf[40..48].copy_from_slice(&w2l);
+    buf[48..56].copy_from_slice(&r3l);
+    buf[56..64].copy_from_slice(&w3l);
 }
 
 /// Write an `ImageDesc*` at binding slot `slot`.
@@ -604,6 +639,92 @@ pub unsafe extern "C" fn atrium_img_write_3d(
     let rgba = [src[0], src[1], src[2], src[3]];
     image_write_impl_3d(
         &*img, x as u32, y as u32, z as u32, rgba);
+}
+
+/// Resolve a `(base ImageDesc, lod)` pair to the descriptor
+/// that actually holds the texel data for that mip level.
+/// Falls back to the base descriptor when `lod` is out of
+/// range (or `mip_descs` is null), keeping behaviour
+/// well-defined for ill-formed bindings.
+#[inline]
+unsafe fn pick_mip<'a>(img: &'a ImageDesc, lod: i32) -> &'a ImageDesc {
+    if lod <= 0 || img.mip_count <= 1 || img.mip_descs.is_null() {
+        return img;
+    }
+    let l = lod as u32;
+    if l >= img.mip_count {
+        return img;
+    }
+    &*img.mip_descs.add(l as usize)
+}
+
+/// `OpImageRead` with `Image-Operands::Lod` on an `image2D`.
+///
+/// # Safety
+/// As for [`atrium_img_read_2d`]; additionally, when `lod > 0`,
+/// `img.mip_descs[lod]` must be a valid `ImageDesc` for the
+/// chosen mip level.
+#[no_mangle]
+pub unsafe extern "C" fn atrium_img_read_2d_lod(
+    img: *const ImageDesc,
+    x: i32, y: i32, lod: i32,
+    out_rgba: *mut f32,
+) {
+    let m = pick_mip(&*img, lod);
+    let rgba = image_read_impl(m, x as u32, y as u32);
+    let out = std::slice::from_raw_parts_mut(out_rgba, 4);
+    out.copy_from_slice(&rgba);
+}
+
+/// `OpImageWrite` with `Image-Operands::Lod` on an `image2D`.
+///
+/// # Safety
+/// As for [`atrium_img_write_2d`]; additionally, when `lod > 0`,
+/// the descriptor at `img.mip_descs[lod]` is mutated.
+#[no_mangle]
+pub unsafe extern "C" fn atrium_img_write_2d_lod(
+    img: *const ImageDesc,
+    x: i32, y: i32, lod: i32,
+    in_rgba: *const f32,
+) {
+    let m = pick_mip(&*img, lod);
+    let src = std::slice::from_raw_parts(in_rgba, 4);
+    let rgba = [src[0], src[1], src[2], src[3]];
+    image_write_impl(m, x as u32, y as u32, rgba);
+}
+
+/// `OpImageRead` with `Image-Operands::Lod` on an `image3D`.
+///
+/// # Safety
+/// As for [`atrium_img_read_3d`]; mip-level selection mirrors
+/// the 2D Lod helper.
+#[no_mangle]
+pub unsafe extern "C" fn atrium_img_read_3d_lod(
+    img: *const ImageDesc,
+    x: i32, y: i32, z: i32, lod: i32,
+    out_rgba: *mut f32,
+) {
+    let m = pick_mip(&*img, lod);
+    let rgba = image_read_impl_3d(m, x as u32, y as u32, z as u32);
+    let out = std::slice::from_raw_parts_mut(out_rgba, 4);
+    out.copy_from_slice(&rgba);
+}
+
+/// `OpImageWrite` with `Image-Operands::Lod` on an `image3D`.
+///
+/// # Safety
+/// As for [`atrium_img_write_3d`]; mip-level selection mirrors
+/// the 2D Lod helper.
+#[no_mangle]
+pub unsafe extern "C" fn atrium_img_write_3d_lod(
+    img: *const ImageDesc,
+    x: i32, y: i32, z: i32, lod: i32,
+    in_rgba: *const f32,
+) {
+    let m = pick_mip(&*img, lod);
+    let src = std::slice::from_raw_parts(in_rgba, 4);
+    let rgba = [src[0], src[1], src[2], src[3]];
+    image_write_impl_3d(m, x as u32, y as u32, z as u32, rgba);
 }
 
 /// Safe wrapper around [`atrium_img_read_2d`].
@@ -979,6 +1100,7 @@ mod tests {
             width: 2, height: 2, stride_bytes: 8,
             format: StorageFormat::Rgba8Unorm as u32,
             depth: 1, slice_bytes: 0,
+            mip_count: 0, mip_descs: std::ptr::null(),
         };
         // Write a distinct colour at (1,1).
         image_write_impl(&img, 1, 1, [1.0, 0.5, 0.25, 0.0]);
@@ -1000,6 +1122,7 @@ mod tests {
             width: 1, height: 1, stride_bytes: 16,
             format: StorageFormat::Rgba32Float as u32,
             depth: 1, slice_bytes: 0,
+            mip_count: 0, mip_descs: std::ptr::null(),
         };
         let v = [3.14159_f32, -2.71828, 1e9, -0.0];
         image_write_impl(&img, 0, 0, v);
@@ -1014,6 +1137,7 @@ mod tests {
             width: 1, height: 1, stride_bytes: 4,
             format: StorageFormat::R32Float as u32,
             depth: 1, slice_bytes: 0,
+            mip_count: 0, mip_descs: std::ptr::null(),
         };
         image_write_impl(&img, 0, 0, [42.5, 99.0, 99.0, 99.0]);
         let got = image_read_impl(&img, 0, 0);
@@ -1031,6 +1155,7 @@ mod tests {
             width: 2, height: 2, stride_bytes: 8,
             format: StorageFormat::Rgba8Unorm as u32,
             depth: 1, slice_bytes: 0,
+            mip_count: 0, mip_descs: std::ptr::null(),
         };
         image_write_impl(&img, 1, 1, [1.0, 1.0, 1.0, 1.0]);
         // (5, 5) clamps to (1, 1).
@@ -1049,6 +1174,7 @@ mod tests {
             width: w, height: h, stride_bytes: w * 4,
             format: StorageFormat::R32Float as u32,
             depth: d, slice_bytes: w * h * 4,
+            mip_count: 0, mip_descs: std::ptr::null(),
         };
         for z in 0..d {
             for y in 0..h {
@@ -1078,6 +1204,7 @@ mod tests {
             width: 8, height: 8, stride_bytes: 32,
             format: StorageFormat::Rgba8Unorm as u32,
             depth: 1, slice_bytes: 0,
+            mip_count: 0, mip_descs: std::ptr::null(),
         };
         let mut buf = image_table_buffer(2);
         assert_eq!(buf.len(), IMG_TABLE_DESC_BASE + 2 * IMG_DESC_SLOT_BYTES);
@@ -1085,7 +1212,9 @@ mod tests {
             write_image_helper_pointers(
                 &mut buf,
                 atrium_img_read_2d, atrium_img_write_2d,
-                atrium_img_read_3d, atrium_img_write_3d);
+                atrium_img_read_3d, atrium_img_write_3d,
+                atrium_img_read_2d_lod, atrium_img_write_2d_lod,
+                atrium_img_read_3d_lod, atrium_img_write_3d_lod);
             write_image_descriptor_slot(&mut buf, 1, &mut img as *const _);
         }
         let read_u64 = |off: usize| -> u64 {
@@ -1095,6 +1224,10 @@ mod tests {
         assert_eq!(read_u64( 8), atrium_img_write_2d as usize as u64);
         assert_eq!(read_u64(16), atrium_img_read_3d  as usize as u64);
         assert_eq!(read_u64(24), atrium_img_write_3d as usize as u64);
+        assert_eq!(read_u64(32), atrium_img_read_2d_lod  as usize as u64);
+        assert_eq!(read_u64(40), atrium_img_write_2d_lod as usize as u64);
+        assert_eq!(read_u64(48), atrium_img_read_3d_lod  as usize as u64);
+        assert_eq!(read_u64(56), atrium_img_write_3d_lod as usize as u64);
         assert_eq!(read_u64(IMG_TABLE_DESC_BASE + IMG_DESC_SLOT_BYTES),
             &img as *const ImageDesc as usize as u64);
     }

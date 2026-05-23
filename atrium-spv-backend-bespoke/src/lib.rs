@@ -1102,6 +1102,7 @@ fn emit_function(
     let uses_storage_image = func.blocks.values().any(|b|
         b.insts.iter().any(|i| matches!(&i.op,
             Op::ImageRead { .. } | Op::ImageWrite { .. }
+            | Op::ImageReadLod { .. } | Op::ImageWriteLod { .. }
             | Op::ImageTexelPointer { .. }
             | Op::ImageQuerySize(_))));
     if uses_storage_image {
@@ -3410,7 +3411,7 @@ fn emit_function(
                 } else { None };
                 // ImageDesc* lives at [X19, #32 + binding*8]
                 // (the helper header is 32 B: 2D r/w + 3D r/w).
-                let desc_off: u16 = 32 + (binding as u16) * 8;
+                let desc_off: u16 = 64 + (binding as u16) * 8;
                 let dst_w = int_pool.alloc(result.id)?;
                 let dst_x = asm::Xreg(dst_w.0);
                 let x9 = asm::Xreg(9);
@@ -3458,7 +3459,7 @@ fn emit_function(
                     .ok_or_else(|| BackendError::Internal(format!(
                         "ImageQuerySize image {:?} not an ImageHandle",
                         image.id)))?;
-                let desc_off: u16 = 32 + (binding as u16) * 8;
+                let desc_off: u16 = 64 + (binding as u16) * 8;
                 let x9 = asm::Xreg(9);
                 a.emit(asm::ldr_x_offset(x9, asm::Xreg(19), desc_off));
                 // ImageDesc field offsets: width @8, height @12,
@@ -3482,21 +3483,34 @@ fn emit_function(
             //                  [X19, #8]  (write_2d)
             //                  [X19, #16] (read_3d)
             //                  [X19, #24] (write_3d)
-            //   ImageDesc*   at [X19, #32 + binding*8]
+            //                  [X19, #32] (read_2d_lod)
+            //                  [X19, #40] (write_2d_lod)
+            //                  [X19, #48] (read_3d_lod)
+            //                  [X19, #56] (write_3d_lod)
+            //   ImageDesc*   at [X19, #64 + binding*8]
             // 2D helper signature: (ImageDesc*, x, y, rgba*)
             //   -> X0=desc, W1=x, W2=y, X3=rgba stack slot.
             // 3D helper signature: (ImageDesc*, x, y, z, rgba*)
             //   -> X0=desc, W1=x, W2=y, W3=z, X4=rgba slot.
-            // The 2-vs-3 routing is by coord-lane count: a
-            // 2-lane coord is image2D, 3-lane is image3D.
+            // 2D Lod helper: (ImageDesc*, x, y, lod, rgba*)
+            //   -> X0=desc, W1=x, W2=y, W3=lod, X4=rgba.
+            // 3D Lod helper: (ImageDesc*, x, y, z, lod, rgba*)
+            //   -> X0=desc, W1=x, W2=y, W3=z, W4=lod, X5=rgba.
+            // The 2-vs-3 routing is by coord-lane count; the
+            // Lod-vs-base routing is by op variant.
             // The call clobbers caller-saved regs, so live
             // V-regs and live caller-saved int W-regs (W13..
             // W17) are spilled across it; X19 (image table)
             // and X2 (SSBO out_buffer) are callee-preserved /
             // explicitly saved.
             Op::ImageRead { image, coord }
-            | Op::ImageWrite { image, coord, .. } => {
-                let is_write = matches!(&inst.op, Op::ImageWrite { .. });
+            | Op::ImageWrite { image, coord, .. }
+            | Op::ImageReadLod { image, coord, .. }
+            | Op::ImageWriteLod { image, coord, .. } => {
+                let is_write = matches!(&inst.op,
+                    Op::ImageWrite { .. } | Op::ImageWriteLod { .. });
+                let is_lod = matches!(&inst.op,
+                    Op::ImageReadLod { .. } | Op::ImageWriteLod { .. });
                 let (_, binding) = image_handles.get(&image.id)
                     .copied()
                     .ok_or_else(|| BackendError::Internal(format!(
@@ -3525,6 +3539,19 @@ fn emit_function(
                             "Image op coord lane 2 {:?} not in ints",
                             coord_lanes[2].id)))?)
                 } else { None };
+                // Lod scalar lives in `ints` (i32).  Resolve
+                // ahead of the call so its W-reg is captured
+                // before we spill caller-saved ints across
+                // the blr.
+                let lod_w: Option<asm::Wreg> = match &inst.op {
+                    Op::ImageReadLod { lod, .. }
+                    | Op::ImageWriteLod { lod, .. } => Some(
+                        *ints.get(&lod.id).ok_or_else(||
+                            BackendError::Internal(format!(
+                                "Image Lod op lod {:?} not in ints",
+                                lod.id)))?),
+                    _ => None,
+                };
                 // For a write, grab the 4 texel lane V-regs
                 // up front (they get spilled below, but we
                 // need to copy them into the rgba stack slot
@@ -3532,6 +3559,7 @@ fn emit_function(
                 let texel_lanes: Option<[asm::Vreg; 4]> = if is_write {
                     let tv = match &inst.op {
                         Op::ImageWrite { texel, .. } => texel,
+                        Op::ImageWriteLod { texel, .. } => texel,
                         _ => unreachable!(),
                     };
                     let lanes = vectors.get(&tv.id).cloned().ok_or_else(||
@@ -3579,6 +3607,7 @@ fn emit_function(
                 let x2 = asm::Xreg(2);
                 let x3 = asm::Xreg(3);
                 let x4 = asm::Xreg(4);
+                let x5 = asm::Xreg(5);
                 let x9 = asm::Xreg(9);
                 let x10 = asm::Xreg(10);
                 let x19 = asm::Xreg(19);
@@ -3586,17 +3615,33 @@ fn emit_function(
                 let w1 = asm::Wreg(1);
                 let w2 = asm::Wreg(2);
                 let w3 = asm::Wreg(3);
-                // image table: helpers @ #0..32, desc @ #32+B*8.
-                // 2D: read=#0,  write=#8.  3D: read=#16, write=#24.
-                let helper_off: u16 = match (is_3d, is_write) {
-                    (false, false) => 0,
-                    (false, true)  => 8,
-                    (true,  false) => 16,
-                    (true,  true)  => 24,
+                let w4 = asm::Wreg(4);
+                // image table layout (Arc 26):
+                //   #0..32  base helpers (no Lod)
+                //   #32..64 _lod variants
+                //   #64+B*8 descriptor pointers
+                // Within each block: 2D-read, 2D-write,
+                // 3D-read, 3D-write at +0/+8/+16/+24.
+                let helper_off: u16 = {
+                    let block_base: u16 = if is_lod { 32 } else { 0 };
+                    let within: u16 = match (is_3d, is_write) {
+                        (false, false) => 0,
+                        (false, true)  => 8,
+                        (true,  false) => 16,
+                        (true,  true)  => 24,
+                    };
+                    block_base + within
                 };
-                let desc_off: u16 = 32 + (binding as u16) * 8;
-                // rgba pointer reg: X3 for 2D, X4 for 3D.
-                let rgba_reg = if is_3d { x4 } else { x3 };
+                let desc_off: u16 = 64 + (binding as u16) * 8;
+                // rgba pointer register: X3 (2D), X4 (3D or
+                // 2D Lod), X5 (3D Lod).  Each extra arg in
+                // the helper signature shifts the rgba slot
+                // up by one register.
+                let rgba_reg = match (is_3d, is_lod) {
+                    (false, false) => x3,
+                    (false, true)  | (true, false) => x4,
+                    (true,  true)  => x5,
+                };
 
                 // Frame: [0..16] rgba scratch, [16] x_out
                 // save, [24] LR save, [32..] V spills, then
@@ -3634,8 +3679,19 @@ fn emit_function(
                 a.emit(asm::mov_x(x0, x10));
                 a.emit(asm::mov_w(w1, x_w));
                 a.emit(asm::mov_w(w2, y_w));
+                // The integer-arg register sequence after
+                // (desc, x, y) is conditional:
+                //   2D no-lod:  (rgba in X3)
+                //   2D lod:     W3=lod, rgba in X4
+                //   3D no-lod:  W3=z,   rgba in X4
+                //   3D lod:     W3=z, W4=lod, rgba in X5
                 if let Some(z_w) = z_w {
                     a.emit(asm::mov_w(w3, z_w));
+                    if let Some(lod_w) = lod_w {
+                        a.emit(asm::mov_w(w4, lod_w));
+                    }
+                } else if let Some(lod_w) = lod_w {
+                    a.emit(asm::mov_w(w3, lod_w));
                 }
                 a.emit(asm::add_imm_x(rgba_reg, sp, 0)); // rgba scratch
                 a.emit(asm::blr_x(x9));
@@ -4658,6 +4714,26 @@ fn compute_last_use_flat(
                 mark(image.id);
                 mark(coord.id);
                 mark(texel.id);
+                if let Some(lane_ids) = vec_lanes.get(&coord.id).cloned() {
+                    for lid in &lane_ids { mark(*lid); }
+                }
+                if let Some(lane_ids) = vec_lanes.get(&texel.id).cloned() {
+                    for lid in &lane_ids { mark(*lid); }
+                }
+            }
+            Op::ImageReadLod { image, coord, lod } => {
+                mark(image.id);
+                mark(coord.id);
+                mark(lod.id);
+                if let Some(lane_ids) = vec_lanes.get(&coord.id).cloned() {
+                    for lid in &lane_ids { mark(*lid); }
+                }
+            }
+            Op::ImageWriteLod { image, coord, texel, lod } => {
+                mark(image.id);
+                mark(coord.id);
+                mark(texel.id);
+                mark(lod.id);
                 if let Some(lane_ids) = vec_lanes.get(&coord.id).cloned() {
                     for lid in &lane_ids { mark(*lid); }
                 }

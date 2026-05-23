@@ -1415,7 +1415,10 @@ fn translate_inst(
 
         // OpImageRead: unfiltered texel read from a storage
         // image.  Operands: [image, coord, (image-operands
-        // mask...)].  Result is a vec4.
+        // mask, args...)].  Result is a vec4.
+        // When `Image-Operands::Lod` is set we lift the Lod id
+        // out and emit `Op::ImageReadLod` instead; otherwise
+        // emit `Op::ImageRead`.
         SpvOp::ImageRead => {
             let result_id = spv_inst.result_id.ok_or_else(||
                 FrontendError::Malformed(
@@ -1431,19 +1434,24 @@ fn translate_inst(
                     "ImageRead image id {img_id} not yet defined")))?;
             let coord = resolve_value(coord_id, types, constants, id_map,
                 next_value_id, insts, source_spirv_offset)?;
+            let lod_id = extract_image_operand_lod(&spv_inst.operands, 2)?;
             let result = alloc_or_get_result(
                 result_id, result_ty, id_map, next_value_id);
-            insts.push(Inst {
-                op: Op::ImageRead { image, coord },
-                result: Some(result),
-                source_spirv_offset,
-            });
+            let op = if let Some(lid) = lod_id {
+                let lod = resolve_value(lid, types, constants, id_map,
+                    next_value_id, insts, source_spirv_offset)?;
+                Op::ImageReadLod { image, coord, lod }
+            } else {
+                Op::ImageRead { image, coord }
+            };
+            insts.push(Inst { op, result: Some(result), source_spirv_offset });
             Ok(())
         }
 
         // OpImageWrite: unfiltered texel write to a storage
         // image.  Operands: [image, coord, texel,
-        // (image-operands mask...)].  No result.
+        // (image-operands mask, args...)].  No result.
+        // Same Lod treatment as ImageRead.
         SpvOp::ImageWrite => {
             let img_id   = expect_id(&spv_inst.operands, 0)?;
             let coord_id = expect_id(&spv_inst.operands, 1)?;
@@ -1455,11 +1463,15 @@ fn translate_inst(
                 next_value_id, insts, source_spirv_offset)?;
             let texel = resolve_value(texel_id, types, constants, id_map,
                 next_value_id, insts, source_spirv_offset)?;
-            insts.push(Inst {
-                op: Op::ImageWrite { image, coord, texel },
-                result: None,
-                source_spirv_offset,
-            });
+            let lod_id = extract_image_operand_lod(&spv_inst.operands, 3)?;
+            let op = if let Some(lid) = lod_id {
+                let lod = resolve_value(lid, types, constants, id_map,
+                    next_value_id, insts, source_spirv_offset)?;
+                Op::ImageWriteLod { image, coord, texel, lod }
+            } else {
+                Op::ImageWrite { image, coord, texel }
+            };
+            insts.push(Inst { op, result: None, source_spirv_offset });
             Ok(())
         }
 
@@ -4449,6 +4461,46 @@ fn push_cf(
         Op::ConstFloat { value: val, kind: atrium_spv_ir::FloatKind::F32 },
         source_spirv_offset, insts, next_value_id,
     )
+}
+
+/// If the SPIR-V operand list at `start` begins with an
+/// `Image-Operands` mask whose `Lod` bit is set, return the
+/// LOD `IdRef` that follows it.  Returns `None` when no mask
+/// is present or the Lod bit is clear.  Bails on unsupported
+/// other mask bits (Bias / Grad / etc.) for storage-image
+/// ops — those aren't legal on `OpImageRead` / `OpImageWrite`
+/// per the SPIR-V spec.
+fn extract_image_operand_lod(
+    operands: &[Operand],
+    start: usize,
+) -> Result<Option<Word>, FrontendError> {
+    use rspirv::spirv::ImageOperands as IO;
+    let Some(first) = operands.get(start) else { return Ok(None); };
+    let mask = match first {
+        Operand::ImageOperands(m) => *m,
+        // No mask -> no Lod.  Operand after coord/texel may
+        // also be unrelated (some encodings skip the mask).
+        _ => return Ok(None),
+    };
+    if !mask.contains(IO::LOD) {
+        return Ok(None);
+    }
+    // Per the SPIR-V spec, image-operand parameters follow
+    // the mask in lowest-bit-first order.  Lod has bit 1
+    // (mask 0x2); anything below it is Bias (bit 0, mask
+    // 0x1) which storage-image ops don't allow, so when
+    // present we can require Lod is the first parameter.
+    if mask.contains(IO::BIAS) {
+        return Err(FrontendError::Unsupported(
+            "Image-Operands::Bias on storage-image read/write \
+             is illegal per SPIR-V spec".to_string()));
+    }
+    // Lod's arg sits at start+1.
+    match operands.get(start + 1) {
+        Some(Operand::IdRef(id)) => Ok(Some(*id)),
+        other => Err(FrontendError::Malformed(format!(
+            "Image-Operands::Lod expected IdRef after mask, got {other:?}"))),
+    }
 }
 
 /// Emit a u32-typed instruction; returns the result Value.

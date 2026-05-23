@@ -725,6 +725,28 @@ pub enum Op {
         /// vec4 texel value to store.
         texel: Value,
     },
+    /// Read a texel from a specific mip level of a storage
+    /// image (`OpImageRead` with `Image-Operands::Lod`).
+    /// Same shape as [`Self::ImageRead`] but with an extra
+    /// `lod: Value` scalar selecting the mip level.  Lowers
+    /// to the runtime's `atrium_img_read_2d_lod` /
+    /// `atrium_img_read_3d_lod` helpers (selected by coord
+    /// lane count) on both backends.
+    ImageReadLod {
+        image: Value,
+        coord: Value,
+        lod:   Value,
+    },
+    /// Write a texel to a specific mip level of a storage
+    /// image (`OpImageWrite` with `Image-Operands::Lod`).
+    /// Same shape as [`Self::ImageWrite`] plus a `lod`
+    /// scalar; lowers to the `_lod` helpers.
+    ImageWriteLod {
+        image: Value,
+        coord: Value,
+        texel: Value,
+        lod:   Value,
+    },
     /// Compute a pointer to a single texel of a storage
     /// image (`OpImageTexelPointer`).  The result is a
     /// pointer Value that `Atomic*` ops then operate on --

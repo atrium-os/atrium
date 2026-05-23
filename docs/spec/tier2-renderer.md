@@ -1109,8 +1109,17 @@ specifically supports:
   test that writes (x, y, layer, 1.0) per invocation on
   a 2×2×3 array and reads back identical bytes from both
   backends.
-  MVP scope: single-mip, Rgba8Unorm / R32Float /
-  Rgba32Float.  Mip / array images are deferred.
+  MVP scope: Rgba8Unorm / R32Float / Rgba32Float.  Mip-
+  level storage images are supported via `OpImageRead` /
+  `OpImageWrite` with `Image-Operands::Lod`: the runtime
+  carries `mip_count` + `mip_descs` (pointer to a per-mip
+  `ImageDesc` array) on the base descriptor; four new
+  helpers (`atrium_img_read_2d_lod` / `..._write_2d_lod` /
+  `..._read_3d_lod` / `..._write_3d_lod`) indirect through
+  `mip_descs[lod]` when `lod < mip_count`.  The image-table
+  helper header grew 32 → 64 B; both backends emit the
+  shifted helper-offsets + extra Lod register
+  (W3 / W4 / X4 / X5 depending on dim × lod).
 - GLSL.std.450 ExtInst dispatch for: FAbs, SAbs, Floor,
   Ceil, Trunc, Fract, FSign, FMod, Sqrt, InverseSqrt,
   FMin, FMax, FClamp, FMix, Step, SmoothStep, Length,

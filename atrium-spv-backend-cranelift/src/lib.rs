@@ -1741,7 +1741,7 @@ impl FnTranslator {
                 let pointer_type = builder.func.dfg
                     .value_type(self.params[0]);
                 let img_table = self.params[0];
-                let desc_off: i32 = 32 + (binding as i32) * 8;
+                let desc_off: i32 = 64 + (binding as i32) * 8;
                 let desc_ptr = builder.ins().load(
                     pointer_type, MemFlags::new(), img_table, desc_off);
                 // ImageDesc fields: width @8, height @12, depth @24.
@@ -1788,7 +1788,7 @@ impl FnTranslator {
                 let pointer_type = builder.func.dfg
                     .value_type(self.params[0]);
                 let img_table = self.params[0];
-                let desc_off: i32 = 32 + (binding as i32) * 8;
+                let desc_off: i32 = 64 + (binding as i32) * 8;
                 let desc_ptr = builder.ins().load(
                     pointer_type, MemFlags::new(), img_table, desc_off);
                 // data ptr @ #0
@@ -1832,8 +1832,13 @@ impl FnTranslator {
             // Cranelift's call_indirect handles caller-saved
             // spilling around the call automatically.
             Op::ImageRead { image, coord }
-            | Op::ImageWrite { image, coord, .. } => {
-                let is_write = matches!(&inst.op, Op::ImageWrite { .. });
+            | Op::ImageWrite { image, coord, .. }
+            | Op::ImageReadLod { image, coord, .. }
+            | Op::ImageWriteLod { image, coord, .. } => {
+                let is_write = matches!(&inst.op,
+                    Op::ImageWrite { .. } | Op::ImageWriteLod { .. });
+                let is_lod = matches!(&inst.op,
+                    Op::ImageReadLod { .. } | Op::ImageWriteLod { .. });
                 let (_, binding) = self.image_handles.get(&image.id)
                     .copied()
                     .ok_or_else(|| BackendError::Internal(format!(
@@ -1851,21 +1856,33 @@ impl FnTranslator {
                 let x = coord_lanes[0];
                 let y = coord_lanes[1];
                 let z = if is_3d { Some(coord_lanes[2]) } else { None };
+                let lod_v: Option<ClifValue> = match &inst.op {
+                    Op::ImageReadLod { lod, .. }
+                    | Op::ImageWriteLod { lod, .. } =>
+                        Some(*self.scalars.get(&lod.id).ok_or_else(||
+                            BackendError::Internal(format!(
+                                "Image Lod op lod {:?} not in scalars",
+                                lod.id)))?),
+                    _ => None,
+                };
                 let pointer_type = builder.func.dfg
                     .value_type(self.params[0]);
                 let img_table = self.params[0];
-                let helper_off: i32 = match (is_3d, is_write) {
-                    (false, false) => 0,
-                    (false, true)  => 8,
-                    (true,  false) => 16,
-                    (true,  true)  => 24,
+                let helper_off: i32 = {
+                    let block_base: i32 = if is_lod { 32 } else { 0 };
+                    let within: i32 = match (is_3d, is_write) {
+                        (false, false) => 0,
+                        (false, true)  => 8,
+                        (true,  false) => 16,
+                        (true,  true)  => 24,
+                    };
+                    block_base + within
                 };
-                let desc_off: i32 = 32 + (binding as i32) * 8;
+                let desc_off: i32 = 64 + (binding as i32) * 8;
                 let fn_ptr = builder.ins().load(
                     pointer_type, MemFlags::new(), img_table, helper_off);
                 let desc_ptr = builder.ins().load(
                     pointer_type, MemFlags::new(), img_table, desc_off);
-                // 16-byte rgba scratch slot.
                 let slot = builder.create_sized_stack_slot(
                     StackSlotData::new(StackSlotKind::ExplicitSlot, 16, 4));
                 let rgba_ptr = builder.ins().stack_addr(pointer_type, slot, 0);
@@ -1876,15 +1893,19 @@ impl FnTranslator {
                 if is_3d {
                     call_sig.params.push(AbiParam::new(clif_types::I32));
                 }
+                if is_lod {
+                    call_sig.params.push(AbiParam::new(clif_types::I32));
+                }
                 call_sig.params.push(AbiParam::new(pointer_type));
                 let sig_ref = builder.import_signature(call_sig);
                 let mut call_args: Vec<ClifValue> = vec![desc_ptr, x, y];
                 if let Some(z) = z { call_args.push(z); }
+                if let Some(lod) = lod_v { call_args.push(lod); }
                 call_args.push(rgba_ptr);
                 if is_write {
-                    // Pack the 4 texel lanes into the slot.
                     let texel = match &inst.op {
                         Op::ImageWrite { texel, .. } => texel,
+                        Op::ImageWriteLod { texel, .. } => texel,
                         _ => unreachable!(),
                     };
                     let lanes = self.vectors.get(&texel.id).cloned()

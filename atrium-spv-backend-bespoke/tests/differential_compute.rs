@@ -4074,6 +4074,8 @@ fn invoke_compute_image(
         write_image_descriptor_slot,
         atrium_img_read_2d, atrium_img_write_2d,
         atrium_img_read_3d, atrium_img_write_3d,
+        atrium_img_read_2d_lod, atrium_img_write_2d_lod,
+        atrium_img_read_3d_lod, atrium_img_write_3d_lod,
     };
     let module = translate(spv).expect("frontend");
     let obj = if use_bespoke {
@@ -4102,13 +4104,17 @@ fn invoke_compute_image(
         format,
         depth,
         slice_bytes: width * height * bpt,
+        mip_count: 0,
+        mip_descs: std::ptr::null(),
     };
     let mut table = image_table_buffer(1);
     unsafe {
         write_image_helper_pointers(
             &mut table,
             atrium_img_read_2d, atrium_img_write_2d,
-            atrium_img_read_3d, atrium_img_write_3d);
+            atrium_img_read_3d, atrium_img_write_3d,
+            atrium_img_read_2d_lod, atrium_img_write_2d_lod,
+            atrium_img_read_3d_lod, atrium_img_write_3d_lod);
         write_image_descriptor_slot(&mut table, 0, &img as *const _);
     }
     let table_base = table.as_ptr() as *const u8;
@@ -4468,6 +4474,183 @@ fn differential_storage_image_2d_array_write() {
         assert_eq!(read(&b_img, x, y, l, 2), l as f32);
         assert_eq!(read(&b_img, x, y, l, 3), 1.0);
     }}}
+}
+
+#[test]
+fn differential_storage_image_mip_lod_read_write() {
+    // Mip-level OpImageWrite / OpImageRead via Image-Operands::Lod
+    // (Arc 26).  Build an ImageDesc that points to two
+    // distinct per-mip data buffers, then dispatch a shader
+    // that writes (lod_value) to mip `gid.z` and reads back
+    // immediately, asserting each mip got its own value.
+    //
+    // The shader does (per invocation):
+    //   imageStore(img, ivec2(gid.x, gid.y), lod=gid.z,
+    //              vec4(100 + gid.z, 0, 0, 1))
+    //   ssbo[gid.z] = bitcast<u32>(
+    //       imageLoad(img, ivec2(gid.x, gid.y), lod=gid.z).r)
+    // With LocalSize=1 and a 1x1 image per mip + 2 mips,
+    // mip0 ends at 100.0, mip1 at 101.0.
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, Dim,
+        ExecutionMode, ExecutionModel, FunctionControl, ImageFormat,
+        ImageOperands, MemoryModel, StorageClass,
+    };
+    use rspirv::dr::{Instruction, Operand};
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let f32_ty = b.type_float(32, None);
+    let v3u    = b.type_vector(u32_ty, 3);
+    let v2u    = b.type_vector(u32_ty, 2);
+    let v4f    = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let img_ty = b.type_image(f32_ty, Dim::Dim2D, 0, 0, 0, 2,
+        ImageFormat::R32f, None);
+    let ptr_img = b.type_pointer(None, StorageClass::UniformConstant, img_ty);
+    let img_var = b.variable(ptr_img, None, StorageClass::UniformConstant, None);
+    b.decorate(img_var, Decoration::DescriptorSet, vec![Operand::LiteralBit32(0)]);
+    b.decorate(img_var, Decoration::Binding,       vec![Operand::LiteralBit32(0)]);
+    let ptr_v3u_in = b.type_pointer(None, StorageClass::Input, v3u);
+    let gid_var = b.variable(ptr_v3u_in, None, StorageClass::Input, None);
+    b.decorate(gid_var, Decoration::BuiltIn,
+        vec![Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+    let c_zero_f = b.constant_bit32(f32_ty, 0.0f32.to_bits());
+    let c_one_f  = b.constant_bit32(f32_ty, 1.0f32.to_bits());
+    let c_100_f  = b.constant_bit32(f32_ty, 100.0f32.to_bits());
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let gid = b.load(v3u, None, gid_var, None, vec![]).unwrap();
+    let gx = b.composite_extract(u32_ty, None, gid, vec![0]).unwrap();
+    let gy = b.composite_extract(u32_ty, None, gid, vec![1]).unwrap();
+    let gz = b.composite_extract(u32_ty, None, gid, vec![2]).unwrap();
+    let coord = b.composite_construct(v2u, None, vec![gx, gy]).unwrap();
+    let gz_f = b.convert_u_to_f(f32_ty, None, gz).unwrap();
+    let val = b.f_add(f32_ty, None, c_100_f, gz_f).unwrap();
+    let texel = b.composite_construct(v4f, None,
+        vec![val, c_zero_f, c_zero_f, c_one_f]).unwrap();
+    let img = b.load(img_ty, None, img_var, None, vec![]).unwrap();
+    // OpImageWrite with Image-Operands::Lod = gz.  rspirv's
+    // builder appends additional_params after the mask, so
+    // we have to construct the instruction by hand.
+    let img_write = Instruction::new(
+        rspirv::spirv::Op::ImageWrite, None, None,
+        vec![
+            Operand::IdRef(img),
+            Operand::IdRef(coord),
+            Operand::IdRef(texel),
+            Operand::ImageOperands(ImageOperands::LOD),
+            Operand::IdRef(gz),
+        ]);
+    b.insert_into_block(rspirv::dr::InsertPoint::End, img_write).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main",
+        vec![img_var, gid_var]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spv = Vec::with_capacity(words.len() * 4);
+    for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+
+    // Build a multi-mip ImageDesc by hand: 2 levels, each
+    // 1x1 R32f.  The base ImageDesc's data points at level 0
+    // (so non-Lod ops, if any, still work); mip_descs[0] is
+    // the same level 0 desc; mip_descs[1] is the level 1 desc.
+    use atrium_spv_runtime::{
+        ImageDesc, StorageFormat,
+        image_table_buffer, write_image_helper_pointers,
+        write_image_descriptor_slot,
+        atrium_img_read_2d, atrium_img_write_2d,
+        atrium_img_read_3d, atrium_img_write_3d,
+        atrium_img_read_2d_lod, atrium_img_write_2d_lod,
+        atrium_img_read_3d_lod, atrium_img_write_3d_lod,
+    };
+    let run_one = |use_bespoke: bool, name: &str| -> [f32; 2] {
+        let dir = TempDir::new().unwrap();
+        let module = translate(&spv).expect("frontend");
+        let obj = if use_bespoke {
+            let t = if cfg!(target_os = "macos") {
+                BespokeTarget::Aarch64Darwin
+            } else { BespokeTarget::Aarch64FreeBSD };
+            bespoke_compile(&module, t).expect("bespoke compile").object
+        } else {
+            cranelift_compile(&module, CraneliftTarget::host())
+                .expect("cranelift compile").object
+        };
+        let obj_path = dir.path().join(format!("{name}.o"));
+        std::fs::write(&obj_path, &obj).unwrap();
+        let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
+        let lib_path = dir.path().join(format!("{name}.{ext}"));
+        link_to_shared_library(&obj_path, &lib_path).expect("link");
+        let lib = unsafe { libloading::Library::new(&lib_path) }.expect("dlopen");
+        let cs_main: libloading::Symbol<CsMain> = unsafe {
+            lib.get(b"atrium_cs_main").expect("atrium_cs_main symbol")
+        };
+        // Per-mip storage: 1x1 R32f each.
+        let mut mip0_data = [0u8; 4];
+        let mut mip1_data = [0u8; 4];
+        let mut mips: Vec<ImageDesc> = vec![
+            ImageDesc {
+                data: mip0_data.as_mut_ptr(),
+                width: 1, height: 1, stride_bytes: 4,
+                format: StorageFormat::R32Float as u32,
+                depth: 1, slice_bytes: 0,
+                mip_count: 0, mip_descs: std::ptr::null(),
+            },
+            ImageDesc {
+                data: mip1_data.as_mut_ptr(),
+                width: 1, height: 1, stride_bytes: 4,
+                format: StorageFormat::R32Float as u32,
+                depth: 1, slice_bytes: 0,
+                mip_count: 0, mip_descs: std::ptr::null(),
+            },
+        ];
+        let img = ImageDesc {
+            data: mip0_data.as_mut_ptr(),
+            width: 1, height: 1, stride_bytes: 4,
+            format: StorageFormat::R32Float as u32,
+            depth: 1, slice_bytes: 0,
+            mip_count: 2,
+            mip_descs: mips.as_ptr(),
+        };
+        let mut table = image_table_buffer(1);
+        unsafe {
+            write_image_helper_pointers(
+                &mut table,
+                atrium_img_read_2d, atrium_img_write_2d,
+                atrium_img_read_3d, atrium_img_write_3d,
+                atrium_img_read_2d_lod, atrium_img_write_2d_lod,
+                atrium_img_read_3d_lod, atrium_img_write_3d_lod);
+            write_image_descriptor_slot(&mut table, 0, &img as *const _);
+        }
+        // Dispatch (0,0,0) writes mip0; (0,0,1) writes mip1.
+        for gz in 0..2u32 {
+            unsafe {
+                cs_main(
+                    table.as_ptr() as *const u8,
+                    std::ptr::null(), std::ptr::null_mut(),
+                    0, 0, gz, 0, 0, 0, std::ptr::null_mut());
+            }
+        }
+        // We've kept `mips` alive across cs_main; once dispatched,
+        // read back mip_data values.
+        let mip0 = f32::from_le_bytes(mip0_data);
+        let mip1 = f32::from_le_bytes(mip1_data);
+        // Touch `mips` so the borrow-checker keeps it alive
+        // through the dispatch.
+        let _ = &mut mips;
+        [mip0, mip1]
+    };
+    let b_vals = run_one(true,  "b");
+    let c_vals = run_one(false, "c");
+    assert_eq!(b_vals, c_vals,
+        "mip read/write diverges between backends");
+    assert_eq!(b_vals[0], 100.0, "mip 0 should be 100, got {}", b_vals[0]);
+    assert_eq!(b_vals[1], 101.0, "mip 1 should be 101, got {}", b_vals[1]);
 }
 
 #[test]

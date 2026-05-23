@@ -1194,6 +1194,10 @@ impl Tier2Backend {
                         // 2D image: single slice.
                         depth: 1,
                         slice_bytes: img.width * img.height * 4,
+                        // Single-mip; mip_descs is null for
+                        // the no-Lod path.
+                        mip_count: 0,
+                        mip_descs: std::ptr::null(),
                     });
                     slot_of[binding as usize] = Some(idx);
                 }
@@ -1208,7 +1212,11 @@ impl Tier2Backend {
                     atrium_spv_runtime::atrium_img_read_2d,
                     atrium_spv_runtime::atrium_img_write_2d,
                     atrium_spv_runtime::atrium_img_read_3d,
-                    atrium_spv_runtime::atrium_img_write_3d);
+                    atrium_spv_runtime::atrium_img_write_3d,
+                    atrium_spv_runtime::atrium_img_read_2d_lod,
+                    atrium_spv_runtime::atrium_img_write_2d_lod,
+                    atrium_spv_runtime::atrium_img_read_3d_lod,
+                    atrium_spv_runtime::atrium_img_write_3d_lod);
                 for (binding, maybe_idx) in slot_of.iter().enumerate() {
                     if let Some(idx) = maybe_idx {
                         atrium_spv_runtime::write_image_descriptor_slot(
