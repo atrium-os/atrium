@@ -154,6 +154,13 @@ impl ConstantContext {
                 },
                 SpvOp::ConstantComposite | SpvOp::SpecConstantComposite =>
                     translate_constant_composite(inst, &ctx)?,
+                // OpSpecConstantOp: constant expression on
+                // previously-resolved spec/regular constants.
+                // Operand layout: <opcode-literal> <id>...
+                // Evaluate at compile time against ctx; the
+                // result enters ctx as if it were an OpConstant.
+                SpvOp::SpecConstantOp => translate_spec_constant_op(
+                    inst, types, &ctx)?,
                 _ => continue,
             };
             ctx.constants.insert(id, constant);
@@ -269,6 +276,205 @@ fn translate_op_constant(
             "OpConstant for type {other:?} not supported",
         ))),
     }
+}
+
+/// Evaluate `OpSpecConstantOp` at compile time.
+///
+/// SPIR-V operand layout:
+///   <result_type> <result_id> <sub_opcode:LiteralBit32>
+///   <operand_id> [<operand_id>...]
+///
+/// The sub_opcode literal names another SPIR-V opcode whose
+/// operands must already be constants (regular or spec).  We
+/// look each operand up in `ctx.constants`, evaluate the
+/// expression in Rust, and return the resulting StoredConstant.
+///
+/// Supported sub-opcodes (the set glslang typically emits for
+/// arithmetic on spec constants):
+///   IAdd, ISub, IMul, SDiv, UDiv, SMod, UMod, SNegate
+///   BitwiseAnd, BitwiseOr, BitwiseXor
+///   ShiftLeftLogical, ShiftRightLogical, ShiftRightArithmetic
+///   IEqual, INotEqual,
+///   SLessThan, ULessThan, SLessThanEqual, ULessThanEqual,
+///   SGreaterThan, UGreaterThan, SGreaterThanEqual,
+///   UGreaterThanEqual
+///   LogicalNot, LogicalAnd, LogicalOr, LogicalEqual,
+///   LogicalNotEqual
+///   Select
+fn translate_spec_constant_op(
+    inst: &Instruction,
+    types: &TypeContext,
+    ctx: &ConstantContext,
+) -> Result<StoredConstant, FrontendError> {
+    let type_id = inst.result_type.ok_or_else(|| FrontendError::Malformed(
+        "SpecConstantOp without result type".to_string()))?;
+    let result_ty = types.get(type_id)?;
+    let sub_op = match inst.operands.first() {
+        Some(Operand::LiteralSpecConstantOpInteger(op)) => *op,
+        Some(Operand::LiteralBit32(v)) => {
+            use rspirv::spirv::Op as SpvOp;
+            // Map u32 -> SpvOp.  Only the opcodes we evaluate
+            // need to round-trip; unknown ones fall through to
+            // the Unsupported error below.
+            match *v {
+                128 => SpvOp::IAdd,
+                130 => SpvOp::ISub,
+                132 => SpvOp::IMul,
+                134 => SpvOp::SDiv,
+                133 => SpvOp::UDiv,
+                139 => SpvOp::SMod,
+                137 => SpvOp::UMod,
+                126 => SpvOp::SNegate,
+                199 => SpvOp::BitwiseAnd,
+                197 => SpvOp::BitwiseOr,
+                198 => SpvOp::BitwiseXor,
+                196 => SpvOp::ShiftLeftLogical,
+                195 => SpvOp::ShiftRightLogical,
+                194 => SpvOp::ShiftRightArithmetic,
+                170 => SpvOp::IEqual,
+                171 => SpvOp::INotEqual,
+                177 => SpvOp::SLessThan,
+                176 => SpvOp::ULessThan,
+                179 => SpvOp::SLessThanEqual,
+                178 => SpvOp::ULessThanEqual,
+                173 => SpvOp::SGreaterThan,
+                172 => SpvOp::UGreaterThan,
+                175 => SpvOp::SGreaterThanEqual,
+                174 => SpvOp::UGreaterThanEqual,
+                168 => SpvOp::LogicalAnd,
+                166 => SpvOp::LogicalOr,
+                167 => SpvOp::LogicalEqual,
+                165 => SpvOp::LogicalNotEqual,
+                169 => SpvOp::LogicalNot,
+                169_169 => SpvOp::Select, // never hit; see below
+                _ => return Err(FrontendError::Unsupported(format!(
+                    "SpecConstantOp sub-opcode literal {v} not recognised"))),
+            }
+        }
+        other => return Err(FrontendError::Malformed(format!(
+            "SpecConstantOp expected opcode literal, got {other:?}"))),
+    };
+    // Pull operand id refs (everything after the opcode literal).
+    let mut operand_ids: Vec<Word> = Vec::with_capacity(inst.operands.len());
+    for op in inst.operands.iter().skip(1) {
+        if let Operand::IdRef(id) = op {
+            operand_ids.push(*id);
+        }
+    }
+    let load_i64 = |id: Word| -> Result<i64, FrontendError> {
+        let sc = ctx.constants.get(&id).ok_or_else(||
+            FrontendError::Malformed(format!(
+                "SpecConstantOp operand {id} not a resolved constant")))?;
+        match &sc.kind {
+            ConstantKind::Scalar(Op::ConstInt { value, .. }) => Ok(*value),
+            other => Err(FrontendError::Unsupported(format!(
+                "SpecConstantOp expected integer operand, got {other:?}"))),
+        }
+    };
+    let kind_from_ty = |ty: &Type| match ty {
+        Type::I32 | Type::Bool => IntKind::I32,
+        Type::U32 => IntKind::U32,
+        Type::I64 => IntKind::I64,
+        Type::U64 => IntKind::U64,
+        _ => IntKind::I32,
+    };
+    use rspirv::spirv::Op as SpvOp;
+    let kind = kind_from_ty(&result_ty);
+    // Helper to wrap a computed i64 into a StoredConstant.
+    let wrap = |v: i64, k: IntKind| StoredConstant {
+        type_id,
+        kind: ConstantKind::Scalar(Op::ConstInt { value: v, kind: k }),
+    };
+    // Binary integer ops: load two operands then evaluate.
+    let bin_int = |f: &dyn Fn(i64, i64) -> i64|
+        -> Result<StoredConstant, FrontendError>
+    {
+        if operand_ids.len() < 2 {
+            return Err(FrontendError::Malformed(format!(
+                "SpecConstantOp {sub_op:?} needs ≥2 operands, got {}",
+                operand_ids.len())));
+        }
+        let a = load_i64(operand_ids[0])?;
+        let b = load_i64(operand_ids[1])?;
+        Ok(wrap(f(a, b), kind))
+    };
+    // Comparison: produce bool (StoredConstant carries i32 1/0).
+    let cmp = |f: &dyn Fn(i64, i64) -> bool|
+        -> Result<StoredConstant, FrontendError>
+    {
+        if operand_ids.len() < 2 {
+            return Err(FrontendError::Malformed(format!(
+                "SpecConstantOp {sub_op:?} needs ≥2 operands, got {}",
+                operand_ids.len())));
+        }
+        let a = load_i64(operand_ids[0])?;
+        let b = load_i64(operand_ids[1])?;
+        Ok(wrap(if f(a, b) { 1 } else { 0 }, IntKind::I32))
+    };
+    let result = match sub_op {
+        SpvOp::IAdd => bin_int(&|a, b| (a as i32).wrapping_add(b as i32) as i64)?,
+        SpvOp::ISub => bin_int(&|a, b| (a as i32).wrapping_sub(b as i32) as i64)?,
+        SpvOp::IMul => bin_int(&|a, b| (a as i32).wrapping_mul(b as i32) as i64)?,
+        SpvOp::SDiv => bin_int(&|a, b|
+            if b == 0 { 0 } else { (a as i32).wrapping_div(b as i32) as i64 })?,
+        SpvOp::UDiv => bin_int(&|a, b|
+            if b == 0 { 0 } else { ((a as u32) / (b as u32)) as i64 })?,
+        SpvOp::SMod => bin_int(&|a, b|
+            if b == 0 { 0 } else { (a as i32).wrapping_rem(b as i32) as i64 })?,
+        SpvOp::UMod => bin_int(&|a, b|
+            if b == 0 { 0 } else { ((a as u32) % (b as u32)) as i64 })?,
+        SpvOp::SNegate => {
+            let a = load_i64(operand_ids[0])?;
+            wrap((a as i32).wrapping_neg() as i64, kind)
+        }
+        SpvOp::BitwiseAnd => bin_int(&|a, b| (a as u32 & b as u32) as i64)?,
+        SpvOp::BitwiseOr  => bin_int(&|a, b| (a as u32 | b as u32) as i64)?,
+        SpvOp::BitwiseXor => bin_int(&|a, b| (a as u32 ^ b as u32) as i64)?,
+        SpvOp::ShiftLeftLogical => bin_int(&|a, b|
+            ((a as u32).wrapping_shl((b as u32) & 31)) as i64)?,
+        SpvOp::ShiftRightLogical => bin_int(&|a, b|
+            ((a as u32).wrapping_shr((b as u32) & 31)) as i64)?,
+        SpvOp::ShiftRightArithmetic => bin_int(&|a, b|
+            ((a as i32).wrapping_shr((b as u32) & 31)) as i64)?,
+        SpvOp::IEqual    => cmp(&|a, b| (a as u32) == (b as u32))?,
+        SpvOp::INotEqual => cmp(&|a, b| (a as u32) != (b as u32))?,
+        SpvOp::SLessThan        => cmp(&|a, b| (a as i32) <  (b as i32))?,
+        SpvOp::SLessThanEqual   => cmp(&|a, b| (a as i32) <= (b as i32))?,
+        SpvOp::SGreaterThan     => cmp(&|a, b| (a as i32) >  (b as i32))?,
+        SpvOp::SGreaterThanEqual=> cmp(&|a, b| (a as i32) >= (b as i32))?,
+        SpvOp::ULessThan        => cmp(&|a, b| (a as u32) <  (b as u32))?,
+        SpvOp::ULessThanEqual   => cmp(&|a, b| (a as u32) <= (b as u32))?,
+        SpvOp::UGreaterThan     => cmp(&|a, b| (a as u32) >  (b as u32))?,
+        SpvOp::UGreaterThanEqual=> cmp(&|a, b| (a as u32) >= (b as u32))?,
+        SpvOp::LogicalAnd => cmp(&|a, b| (a != 0) && (b != 0))?,
+        SpvOp::LogicalOr  => cmp(&|a, b| (a != 0) || (b != 0))?,
+        SpvOp::LogicalEqual    => cmp(&|a, b| (a != 0) == (b != 0))?,
+        SpvOp::LogicalNotEqual => cmp(&|a, b| (a != 0) != (b != 0))?,
+        SpvOp::LogicalNot => {
+            let a = load_i64(operand_ids[0])?;
+            wrap(if a == 0 { 1 } else { 0 }, IntKind::I32)
+        }
+        SpvOp::Select => {
+            if operand_ids.len() < 3 {
+                return Err(FrontendError::Malformed(
+                    "SpecConstantOp Select needs 3 operands".into()));
+            }
+            let cond = load_i64(operand_ids[0])?;
+            let pick = if cond != 0 {
+                operand_ids[1]
+            } else {
+                operand_ids[2]
+            };
+            // Clone the picked constant under our result type.
+            let sc = ctx.constants.get(&pick).ok_or_else(||
+                FrontendError::Malformed(format!(
+                    "SpecConstantOp Select operand {pick} not resolved")))?;
+            StoredConstant { type_id, kind: sc.kind.clone() }
+        }
+        other => return Err(FrontendError::Unsupported(format!(
+            "SpecConstantOp sub-opcode {other:?} not supported"))),
+    };
+    Ok(result)
 }
 
 fn translate_constant_composite(

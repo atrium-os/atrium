@@ -4872,6 +4872,172 @@ fn differential_subgroup_ops_size1_degenerate() {
 }
 
 #[test]
+fn differential_spec_constant_op() {
+    // OpSpecConstantOp: constant expressions on spec
+    // constants.  Build a shader that exercises IAdd, IMul,
+    // SGreaterThan, and Select against `OpSpecConstant int
+    // N=4`, then verify the frontend folds them at compile
+    // time (so the bespoke and Cranelift backends just see
+    // regular OpConstant values).
+    use rspirv::binary::Assemble;
+    use rspirv::dr::{Builder, InsertPoint, Instruction, Operand};
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, Op as SpvOp,
+        StorageClass,
+    };
+    let mut b = Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let i32_ty = b.type_int(32, 1);
+    let bool_ty = b.type_bool();
+    let void_fn = b.type_function(void, vec![]);
+    let rt = b.type_runtime_array(u32_ty);
+    b.decorate(rt, Decoration::ArrayStride,
+        vec![Operand::LiteralBit32(4)]);
+    let s = b.type_struct(vec![rt]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset,
+        vec![Operand::LiteralBit32(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_u = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+    let ssbo = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet, vec![Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding,       vec![Operand::LiteralBit32(0)]);
+    let sc_n = b.spec_constant_bit32(i32_ty, 4u32);
+    b.decorate(sc_n, Decoration::SpecId, vec![Operand::LiteralBit32(0)]);
+    let c_3_i = b.constant_bit32(i32_ty, 3u32);
+    let c_2_i = b.constant_bit32(i32_ty, 2u32);
+    let c_0_i = b.constant_bit32(i32_ty, 0u32);
+    let c_zero_u = b.constant_bit32(u32_ty, 0);
+    let c_one_u  = b.constant_bit32(u32_ty, 1);
+    let c_two_u  = b.constant_bit32(u32_ty, 2);
+    let c_three_u = b.constant_bit32(u32_ty, 3);
+
+    // Build OpSpecConstantOp instructions manually since the
+    // rspirv builder helper only emits the opcode literal --
+    // we need the operand IdRefs too.
+    let mk_spec_op = |b: &mut Builder, result_ty: u32, sub: SpvOp,
+                      operands: &[u32]| -> u32 {
+        let id = b.id();
+        let mut ops = vec![Operand::LiteralSpecConstantOpInteger(sub)];
+        for o in operands { ops.push(Operand::IdRef(*o)); }
+        let inst = Instruction::new(
+            SpvOp::SpecConstantOp,
+            Some(result_ty),
+            Some(id),
+            ops,
+        );
+        b.insert_types_global_values(InsertPoint::End, inst);
+        id
+    };
+    // N + 3   -> i32
+    let n_add_3 = mk_spec_op(&mut b, i32_ty, SpvOp::IAdd,
+        &[sc_n, c_3_i]);
+    // N * 2   -> i32
+    let n_mul_2 = mk_spec_op(&mut b, i32_ty, SpvOp::IMul,
+        &[sc_n, c_2_i]);
+    // N > 2   -> bool
+    let n_gt_2 = mk_spec_op(&mut b, bool_ty, SpvOp::SGreaterThan,
+        &[sc_n, c_2_i]);
+    // Select(N>2, N+3, 0)  -> i32 -- pick value via spec-const op
+    let pick = mk_spec_op(&mut b, i32_ty, SpvOp::Select,
+        &[n_gt_2, n_add_3, c_0_i]);
+
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    // ssbo[0] = bitcast<u32>(N + 3)         -> 7
+    // ssbo[1] = bitcast<u32>(N * 2)         -> 8
+    // ssbo[2] = (N > 2) ? 1u : 0u           -> 1
+    // ssbo[3] = bitcast<u32>(pick)          -> 7
+    let v0 = b.bitcast(u32_ty, None, n_add_3).unwrap();
+    let p0 = b.access_chain(ptr_u, None, ssbo, vec![c_zero_u, c_zero_u]).unwrap();
+    b.store(p0, v0, None, vec![]).unwrap();
+    let v1 = b.bitcast(u32_ty, None, n_mul_2).unwrap();
+    let p1 = b.access_chain(ptr_u, None, ssbo, vec![c_zero_u, c_one_u]).unwrap();
+    b.store(p1, v1, None, vec![]).unwrap();
+    let v2 = b.select(u32_ty, None, n_gt_2, c_one_u, c_zero_u).unwrap();
+    let p2 = b.access_chain(ptr_u, None, ssbo, vec![c_zero_u, c_two_u]).unwrap();
+    b.store(p2, v2, None, vec![]).unwrap();
+    let v3 = b.bitcast(u32_ty, None, pick).unwrap();
+    let p3 = b.access_chain(ptr_u, None, ssbo, vec![c_zero_u, c_three_u]).unwrap();
+    b.store(p3, v3, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spv = Vec::with_capacity(words.len() * 4);
+    for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+
+    let dir = TempDir::new().unwrap();
+    let mut b_buf = vec![0u8; 16];
+    let mut c_buf = vec![0u8; 16];
+    invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
+    invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+    assert_eq!(b_buf, c_buf,
+        "SpecConstantOp folding diverges between backends");
+    let at = |i: usize| u32::from_le_bytes(
+        b_buf[i*4..i*4+4].try_into().unwrap());
+    assert_eq!(at(0), 7, "N+3 with N=4");
+    assert_eq!(at(1), 8, "N*2 with N=4");
+    assert_eq!(at(2), 1, "(N>2) with N=4");
+    assert_eq!(at(3), 7, "Select((N>2), N+3, 0) with N=4");
+
+    // Now compile with override {0: 1} so N=1 -> all values flip:
+    //   N+3 = 4, N*2 = 2, N>2 = false, Select picks 0.
+    use atrium_spv_frontend::SpecOverrides;
+    let mut overrides = SpecOverrides::new();
+    overrides.insert(0, 1);
+    let run_one = |use_bespoke: bool, name: &str,
+                   out_ptr: *mut u8| {
+        let dir = TempDir::new().unwrap();
+        let module = atrium_spv_frontend::translate_with_spec_overrides(
+            &spv, &overrides).expect("frontend");
+        let obj = if use_bespoke {
+            let t = if cfg!(target_os = "macos") {
+                BespokeTarget::Aarch64Darwin
+            } else { BespokeTarget::Aarch64FreeBSD };
+            bespoke_compile(&module, t).expect("bespoke compile").object
+        } else {
+            cranelift_compile(&module, CraneliftTarget::host())
+                .expect("cranelift compile").object
+        };
+        let obj_path = dir.path().join(format!("{name}.o"));
+        std::fs::write(&obj_path, &obj).unwrap();
+        let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
+        let lib_path = dir.path().join(format!("{name}.{ext}"));
+        link_to_shared_library(&obj_path, &lib_path).expect("link");
+        let lib = unsafe { libloading::Library::new(&lib_path) }
+            .expect("dlopen");
+        let cs_main: libloading::Symbol<CsMain> = unsafe {
+            lib.get(b"atrium_cs_main").expect("atrium_cs_main symbol")
+        };
+        unsafe {
+            cs_main(std::ptr::null(), std::ptr::null(), out_ptr,
+                0, 0, 0, 0, 0, 0, std::ptr::null_mut());
+        }
+        drop(cs_main);
+        drop(lib);
+    };
+    let mut b2 = vec![0u8; 16];
+    let mut c2 = vec![0u8; 16];
+    run_one(true,  "b_ov", b2.as_mut_ptr());
+    run_one(false, "c_ov", c2.as_mut_ptr());
+    assert_eq!(b2, c2,
+        "SpecConstantOp under override diverges between backends");
+    let at2 = |i: usize| u32::from_le_bytes(
+        b2[i*4..i*4+4].try_into().unwrap());
+    assert_eq!(at2(0), 4, "N+3 with override N=1");
+    assert_eq!(at2(1), 2, "N*2 with override N=1");
+    assert_eq!(at2(2), 0, "(N>2) with override N=1 -> false");
+    assert_eq!(at2(3), 0, "Select with override -> 0 branch");
+}
+
+#[test]
 fn differential_spec_constants_host_overrides() {
     // Same shader shape as differential_spec_constants_default_values,
     // but compiled with translate_with_spec_overrides({0: 99, 1: 0}).

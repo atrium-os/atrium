@@ -990,8 +990,16 @@ specifically supports:
   cache-key extension, and atrium-spv-compile CLI exposure
   are still deferred — the IR-level mechanism works end-
   to-end and is unit-tested.
-  `OpSpecConstantOp` (constant expressions on spec
-  constants) is also deferred.
+  `OpSpecConstantOp` is folded at frontend constant-context
+  build time: the sub-opcode + operand-id list is evaluated
+  in Rust against the already-resolved constants, and the
+  result enters the constants map as a regular constant.
+  Supported sub-opcodes cover the set glslang emits for
+  arithmetic / bitwise / shift / compare / Select on integer
+  spec constants (IAdd, ISub, IMul, S/UDiv, S/UMod, SNegate,
+  Bitwise{And,Or,Xor}, Shift{Left,Right{Logical,Arithmetic}},
+  IEqual, INotEqual, S/ULessThan{,Equal}, S/UGreaterThan{,Equal},
+  Logical{And,Or,Equal,NotEqual,Not}, Select).
 - Atomic ops: AtomicIAdd, ISub, IIncrement, IDecrement,
   And, Or, Xor, Exchange, Load, Store,
   CompareExchange, SMin/SMax/UMin/UMax — all lowered to
