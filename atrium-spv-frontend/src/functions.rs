@@ -1459,6 +1459,162 @@ fn translate_inst(
             Ok(())
         }
 
+        // ── Subgroup / cooperative-group ops ──────────────
+        //
+        // Tier-2 runs each workgroup serially on one CPU
+        // thread, so every workgroup contains exactly one
+        // subgroup of size 1.  Every `OpGroupNonUniform*`
+        // collapses to a trivial expression:
+        //
+        //   Elect / AllEqual                -> ConstantTrue
+        //   All / Any / Broadcast{,First}   -> source value
+        //   Shuffle / ShuffleXor / ShuffleUp / Down -> source
+        //   Ballot(p)                       -> uvec4(p?1:0,0,0,0)
+        //   InverseBallot(b)                -> (b.x & 1) != 0
+        //   <op> Reduce / InclusiveScan     -> source value
+        //   <op> ExclusiveScan              -> identity element
+        //
+        // The Execution-scope operand is not validated; the
+        // SPIR-V spec requires it to be Subgroup (3), which
+        // matches our subgroupSize=1 dispatch.  ClusteredReduce
+        // is rejected (no cluster semantics with size 1).
+
+        SpvOp::GroupNonUniformElect | SpvOp::GroupNonUniformAllEqual => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed(
+                    "GroupNonUniformElect/AllEqual without result id".into()))?;
+            let result_type_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed(
+                    "GroupNonUniformElect/AllEqual without result type".into()))?;
+            let result_ty = types.get(result_type_id)?.clone();
+            let result = alloc_or_get_result(
+                result_id, result_ty, id_map, next_value_id);
+            // ConstInt 1 with result.ty == Bool registers in
+            // both `ints` and `bools` per the bespoke Bitcast/
+            // ConstInt fix.
+            insts.push(Inst {
+                op: Op::ConstInt { value: 1,
+                    kind: atrium_spv_ir::IntKind::I32 },
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
+        SpvOp::GroupNonUniformAll
+        | SpvOp::GroupNonUniformAny
+        | SpvOp::GroupNonUniformBroadcast
+        | SpvOp::GroupNonUniformBroadcastFirst
+        | SpvOp::GroupNonUniformShuffle
+        | SpvOp::GroupNonUniformShuffleXor
+        | SpvOp::GroupNonUniformShuffleUp
+        | SpvOp::GroupNonUniformShuffleDown => {
+            // Source value lives at operand index 1 (after the
+            // Execution-scope at index 0).
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed(
+                    "GroupNonUniform alias-op without result id".into()))?;
+            let src_id = expect_id(&spv_inst.operands, 1)?;
+            let src = resolve_value(src_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            id_map.insert(result_id, src);
+            Ok(())
+        }
+        SpvOp::GroupNonUniformBallot => {
+            // Ballot(p) at subgroup-size 1 -> uvec4(p?1:0, 0, 0, 0).
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed(
+                    "GroupNonUniformBallot without result id".into()))?;
+            let result_type_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed(
+                    "GroupNonUniformBallot without result type".into()))?;
+            let result_ty = types.get(result_type_id)?.clone();
+            let pred_id = expect_id(&spv_inst.operands, 1)?;
+            let pred = resolve_value(pred_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            let c_zero_u = push_ci(0, atrium_spv_ir::IntKind::U32,
+                source_spirv_offset, insts, next_value_id);
+            let c_one_u  = push_ci(1, atrium_spv_ir::IntKind::U32,
+                source_spirv_offset, insts, next_value_id);
+            // lane0 = pred ? 1u : 0u
+            let lane0 = push_u32(
+                Op::Select { cond: pred, t_val: c_one_u.clone(),
+                    f_val: c_zero_u.clone() },
+                source_spirv_offset, insts, next_value_id);
+            let result = alloc_or_get_result(
+                result_id, result_ty, id_map, next_value_id);
+            insts.push(Inst {
+                op: Op::ConstVec(vec![lane0,
+                    c_zero_u.clone(), c_zero_u.clone(), c_zero_u]),
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
+        SpvOp::GroupNonUniformIAdd
+        | SpvOp::GroupNonUniformFAdd
+        | SpvOp::GroupNonUniformIMul
+        | SpvOp::GroupNonUniformFMul
+        | SpvOp::GroupNonUniformSMin
+        | SpvOp::GroupNonUniformUMin
+        | SpvOp::GroupNonUniformFMin
+        | SpvOp::GroupNonUniformSMax
+        | SpvOp::GroupNonUniformUMax
+        | SpvOp::GroupNonUniformFMax
+        | SpvOp::GroupNonUniformBitwiseAnd
+        | SpvOp::GroupNonUniformBitwiseOr
+        | SpvOp::GroupNonUniformBitwiseXor
+        | SpvOp::GroupNonUniformLogicalAnd
+        | SpvOp::GroupNonUniformLogicalOr
+        | SpvOp::GroupNonUniformLogicalXor => {
+            // Operand layout: <scope> <operation> <value> [<cluster>]
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed(
+                    "GroupNonUniform reduce/scan without result id".into()))?;
+            let result_type_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed(
+                    "GroupNonUniform reduce/scan without result type".into()))?;
+            let result_ty = types.get(result_type_id)?.clone();
+            let group_op = match spv_inst.operands.get(1) {
+                Some(Operand::GroupOperation(op)) => *op as u32,
+                Some(Operand::LiteralBit32(v)) => *v,
+                other => return Err(FrontendError::Malformed(format!(
+                    "GroupNonUniform reduce/scan operand[1] expected \
+                     group-operation literal, got {other:?}"))),
+            };
+            let src_id = expect_id(&spv_inst.operands, 2)?;
+            let src = resolve_value(src_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            // 0 = Reduce, 1 = InclusiveScan, 2 = ExclusiveScan,
+            // 3 = ClusteredReduce.  At subgroupSize=1:
+            //   Reduce / InclusiveScan -> source value (alias).
+            //   ExclusiveScan          -> identity element.
+            match group_op {
+                0 | 1 => {
+                    id_map.insert(result_id, src);
+                }
+                2 => {
+                    // ExclusiveScan: emit the identity element
+                    // appropriate to the result type + opcode.
+                    let result = alloc_or_get_result(
+                        result_id, result_ty.clone(), id_map,
+                        next_value_id);
+                    let id_op = identity_for_group_op(
+                        spv_inst.class.opcode, &result_ty)?;
+                    insts.push(Inst {
+                        op: id_op,
+                        result: Some(result),
+                        source_spirv_offset,
+                    });
+                }
+                3 => return Err(FrontendError::Unsupported(
+                    "GroupNonUniform ClusteredReduce not supported \
+                     at subgroupSize=1".into())),
+                other => return Err(FrontendError::Malformed(format!(
+                    "GroupNonUniform unknown group operation {other}"))),
+            }
+            Ok(())
+        }
+
         // OpImageQuerySize: read width / height [/ depth]
         // off the ImageDesc.  The Image operand is a loaded
         // image (its result is an ImageHandle value already
@@ -3268,6 +3424,89 @@ fn push_cf(
         Op::ConstFloat { value: val, kind: atrium_spv_ir::FloatKind::F32 },
         source_spirv_offset, insts, next_value_id,
     )
+}
+
+/// Emit a u32-typed instruction; returns the result Value.
+fn push_u32(
+    op: Op,
+    source_spirv_offset: u32,
+    insts: &mut Vec<Inst>,
+    next_value_id: &mut u32,
+) -> Value {
+    let id = ValueId(*next_value_id);
+    *next_value_id += 1;
+    let v = Value { id, ty: Type::U32 };
+    insts.push(Inst { op, result: Some(v.clone()), source_spirv_offset });
+    v
+}
+
+/// Emit an integer ConstInt with the given value/kind.
+fn push_ci(
+    value: i64,
+    kind: atrium_spv_ir::IntKind,
+    source_spirv_offset: u32,
+    insts: &mut Vec<Inst>,
+    next_value_id: &mut u32,
+) -> Value {
+    let ty = match kind {
+        atrium_spv_ir::IntKind::I32 => Type::I32,
+        atrium_spv_ir::IntKind::U32 => Type::U32,
+        atrium_spv_ir::IntKind::I64 => Type::I64,
+        atrium_spv_ir::IntKind::U64 => Type::U64,
+    };
+    let id = ValueId(*next_value_id);
+    *next_value_id += 1;
+    let v = Value { id, ty };
+    insts.push(Inst {
+        op: Op::ConstInt { value, kind },
+        result: Some(v.clone()),
+        source_spirv_offset,
+    });
+    v
+}
+
+/// Identity element for an OpGroupNonUniform<Op> reduce
+/// applied to a single invocation (subgroupSize=1).
+/// Returns the IR Op that materialises the identity at
+/// `result_ty` (used for ExclusiveScan, which yields the
+/// reduction of the empty prefix).
+fn identity_for_group_op(
+    spv_op: rspirv::spirv::Op,
+    result_ty: &Type,
+) -> Result<Op, FrontendError> {
+    use rspirv::spirv::Op as SpvOp;
+    let kind = match result_ty {
+        Type::I32 => atrium_spv_ir::IntKind::I32,
+        Type::U32 => atrium_spv_ir::IntKind::U32,
+        _ => atrium_spv_ir::IntKind::I32, // unused for float
+    };
+    let int_id = |v: i64| Op::ConstInt { value: v, kind };
+    let f32_id = |v: f64| Op::ConstFloat {
+        value: v, kind: atrium_spv_ir::FloatKind::F32 };
+    Ok(match spv_op {
+        SpvOp::GroupNonUniformIAdd
+        | SpvOp::GroupNonUniformBitwiseOr
+        | SpvOp::GroupNonUniformBitwiseXor
+        | SpvOp::GroupNonUniformLogicalOr
+        | SpvOp::GroupNonUniformLogicalXor => int_id(0),
+        SpvOp::GroupNonUniformIMul => int_id(1),
+        SpvOp::GroupNonUniformBitwiseAnd
+        | SpvOp::GroupNonUniformLogicalAnd => int_id(-1), // ~0
+        SpvOp::GroupNonUniformSMin => int_id(i32::MAX as i64),
+        SpvOp::GroupNonUniformSMax => int_id(i32::MIN as i64),
+        SpvOp::GroupNonUniformUMin =>
+            Op::ConstInt { value: u32::MAX as i64,
+                kind: atrium_spv_ir::IntKind::U32 },
+        SpvOp::GroupNonUniformUMax =>
+            Op::ConstInt { value: 0,
+                kind: atrium_spv_ir::IntKind::U32 },
+        SpvOp::GroupNonUniformFAdd => f32_id(0.0),
+        SpvOp::GroupNonUniformFMul => f32_id(1.0),
+        SpvOp::GroupNonUniformFMin => f32_id(f64::INFINITY),
+        SpvOp::GroupNonUniformFMax => f32_id(f64::NEG_INFINITY),
+        other => return Err(FrontendError::Unsupported(format!(
+            "no identity defined for {other:?}"))),
+    })
 }
 
 /// Range-reduce x to x_red ∈ [-π/2, π/2] for trig polynomials.

@@ -92,7 +92,19 @@ pub fn translate(spirv: &[u8]) -> Result<Module, FrontendError> {
     // baseline Vulkan capability).
     for cap_inst in &rspirv_module.capabilities {
         if let Some(rspirv::dr::Operand::Capability(cap)) = cap_inst.operands.first() {
-            if *cap != rspirv::spirv::Capability::Shader {
+            use rspirv::spirv::Capability as C;
+            let accepted = matches!(*cap,
+                C::Shader
+                // Subgroup ops lower trivially at subgroupSize=1.
+                | C::GroupNonUniform
+                | C::GroupNonUniformVote
+                | C::GroupNonUniformArithmetic
+                | C::GroupNonUniformBallot
+                | C::GroupNonUniformShuffle
+                | C::GroupNonUniformShuffleRelative
+                | C::GroupNonUniformClustered
+                | C::GroupNonUniformQuad);
+            if !accepted {
                 return Err(FrontendError::Unsupported(format!(
                     "capability {cap:?} not supported in phase-1 v1",
                 )));

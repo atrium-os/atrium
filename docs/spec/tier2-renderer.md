@@ -962,6 +962,21 @@ specifically supports:
 - AccessChain with constant-index struct + array walks
   and a single trailing dynamic index into
   RuntimeArray/Array (Op::PtrOffsetDynamic).
+- Subgroup ops at `subgroupSize=1`: each workgroup runs
+  serially on one CPU thread, so every workgroup contains
+  exactly one subgroup of size 1.  All `OpGroupNonUniform*`
+  ops lower to trivial expressions at frontend time:
+  `Elect`/`AllEqual` → ConstantTrue; `All`/`Any`/`Broadcast`
+  /`BroadcastFirst`/`Shuffle*` → source value;
+  `Ballot(p)` → uvec4(p?1:0, 0, 0, 0); arithmetic/bitwise/
+  logical reductions with `Reduce` or `InclusiveScan` →
+  source value; with `ExclusiveScan` → the operation's
+  identity element (0 for Add/Or/Xor, 1 for Mul, ~0 for
+  And, INT_MAX/MIN for SMin/SMax, +∞/-∞ for FMin/FMax, etc).
+  `ClusteredReduce` is rejected.  Real parallelism for these
+  ops is a separate later arc (would require dispatching
+  multiple invocations per "subgroup" with cross-invocation
+  buffering).
 - Specialization constants: `OpSpecConstant{,True,False,
   Composite}` are translated to regular constants using the
   SPIR-V-declared default values.  `VkSpecializationInfo`

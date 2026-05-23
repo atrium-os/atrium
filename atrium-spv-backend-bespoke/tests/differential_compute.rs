@@ -4728,6 +4728,123 @@ fn differential_storage_image_3d_atomic_add() {
 }
 
 #[test]
+fn differential_subgroup_ops_size1_degenerate() {
+    // Tier-2 runs each workgroup serially on one CPU thread,
+    // so subgroupSize=1 and every OpGroupNonUniform* lowers
+    // to a trivial expression at frontend time:
+    //   subgroupElect()                -> true
+    //   subgroupBroadcastFirst(x)      -> x
+    //   subgroupAdd(x) [Reduce]        -> x
+    //   subgroupExclusiveAdd(x)        -> 0  (identity)
+    //   subgroupBallot(true)           -> uvec4(1,0,0,0)
+    // Stores to ssbo[0..5] for cross-backend byte-compare.
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, GroupOperation, MemoryModel,
+        Scope, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.capability(Capability::GroupNonUniform);
+    b.capability(Capability::GroupNonUniformArithmetic);
+    b.capability(Capability::GroupNonUniformBallot);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let v4u    = b.type_vector(u32_ty, 4);
+    let bool_ty = b.type_bool();
+    let void_fn = b.type_function(void, vec![]);
+    let rt = b.type_runtime_array(u32_ty);
+    b.decorate(rt, Decoration::ArrayStride,
+        vec![rspirv::dr::Operand::LiteralBit32(4)]);
+    let s = b.type_struct(vec![rt]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_u = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+    let ssbo = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let c0_u = b.constant_bit32(u32_ty, 0);
+    let c1_u = b.constant_bit32(u32_ty, 1);
+    let c2_u = b.constant_bit32(u32_ty, 2);
+    let c3_u = b.constant_bit32(u32_ty, 3);
+    let c4_u = b.constant_bit32(u32_ty, 4);
+    let c5_u = b.constant_bit32(u32_ty, 5);
+    let c6_u = b.constant_bit32(u32_ty, 6);
+    let c7_u = b.constant_bit32(u32_ty, 7);
+    let c42_u = b.constant_bit32(u32_ty, 42);
+    let c_true = b.constant_true(bool_ty);
+    let c_scope = b.constant_bit32(u32_ty, Scope::Subgroup as u32);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    // ssbo[0] = subgroupElect() ? 1 : 0   -> 1
+    let elect = b.group_non_uniform_elect(bool_ty, None, c_scope).unwrap();
+    let sel0 = b.select(u32_ty, None, elect, c1_u, c0_u).unwrap();
+    let p0 = b.access_chain(ptr_u, None, ssbo, vec![c0_u, c0_u]).unwrap();
+    b.store(p0, sel0, None, vec![]).unwrap();
+    // ssbo[1] = subgroupBroadcastFirst(42)   -> 42
+    let bf = b.group_non_uniform_broadcast_first(
+        u32_ty, None, c_scope, c42_u).unwrap();
+    let p1 = b.access_chain(ptr_u, None, ssbo, vec![c0_u, c1_u]).unwrap();
+    b.store(p1, bf, None, vec![]).unwrap();
+    // ssbo[2] = subgroupAdd(42) [Reduce]     -> 42
+    let red = b.group_non_uniform_i_add(
+        u32_ty, None, c_scope, GroupOperation::Reduce, c42_u, None).unwrap();
+    let p2 = b.access_chain(ptr_u, None, ssbo, vec![c0_u, c2_u]).unwrap();
+    b.store(p2, red, None, vec![]).unwrap();
+    // ssbo[3] = subgroupExclusiveAdd(42)     -> 0 (identity)
+    let exc = b.group_non_uniform_i_add(
+        u32_ty, None, c_scope, GroupOperation::ExclusiveScan,
+        c42_u, None).unwrap();
+    let p3 = b.access_chain(ptr_u, None, ssbo, vec![c0_u, c3_u]).unwrap();
+    b.store(p3, exc, None, vec![]).unwrap();
+    // ssbo[4..8] = subgroupBallot(true)      -> (1,0,0,0)
+    let bal = b.group_non_uniform_ballot(v4u, None, c_scope, c_true).unwrap();
+    let bal0 = b.composite_extract(u32_ty, None, bal, vec![0]).unwrap();
+    let bal1 = b.composite_extract(u32_ty, None, bal, vec![1]).unwrap();
+    let bal2 = b.composite_extract(u32_ty, None, bal, vec![2]).unwrap();
+    let bal3 = b.composite_extract(u32_ty, None, bal, vec![3]).unwrap();
+    let p4 = b.access_chain(ptr_u, None, ssbo, vec![c0_u, c4_u]).unwrap();
+    b.store(p4, bal0, None, vec![]).unwrap();
+    let p5 = b.access_chain(ptr_u, None, ssbo, vec![c0_u, c5_u]).unwrap();
+    b.store(p5, bal1, None, vec![]).unwrap();
+    let p6 = b.access_chain(ptr_u, None, ssbo, vec![c0_u, c6_u]).unwrap();
+    b.store(p6, bal2, None, vec![]).unwrap();
+    let p7 = b.access_chain(ptr_u, None, ssbo, vec![c0_u, c7_u]).unwrap();
+    b.store(p7, bal3, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spv = Vec::with_capacity(words.len() * 4);
+    for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+    let dir = TempDir::new().unwrap();
+    let mut b_buf = vec![0u8; 32];
+    let mut c_buf = vec![0u8; 32];
+    invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
+    invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+    assert_eq!(b_buf, c_buf,
+        "subgroup-op lowering diverges between backends");
+    let at = |i: usize| u32::from_le_bytes(
+        b_buf[i*4..i*4+4].try_into().unwrap());
+    assert_eq!(at(0), 1, "subgroupElect");
+    assert_eq!(at(1), 42, "subgroupBroadcastFirst(42)");
+    assert_eq!(at(2), 42, "subgroupAdd(42) Reduce");
+    assert_eq!(at(3), 0,  "subgroupExclusiveAdd(42)");
+    assert_eq!(at(4), 1,  "subgroupBallot(true).x");
+    assert_eq!(at(5), 0,  "subgroupBallot(true).y");
+    assert_eq!(at(6), 0,  "subgroupBallot(true).z");
+    assert_eq!(at(7), 0,  "subgroupBallot(true).w");
+}
+
+#[test]
 fn differential_spec_constants_default_values() {
     // OpSpecConstant{,True,False,Composite} -- when no
     // VkSpecializationInfo is supplied, Tier-2 v1 uses the
