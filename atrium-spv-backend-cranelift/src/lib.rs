@@ -1755,6 +1755,69 @@ impl FnTranslator {
                 self.vectors.insert(result.id, lanes);
                 Ok(())
             }
+            // OpImageTexelPointer — form a raw byte pointer
+            // to a single storage-image texel, computed inline
+            // off the image descriptor table just like the
+            // bespoke backend.  The result lands in
+            // `self.pointers` so the existing atomic arms (the
+            // only legal consumers per the SPIR-V spec) pick
+            // it up through resolve_or_make_pointer.  Texel
+            // address: data + z*slice_bytes + y*stride + x*4.
+            Op::ImageTexelPointer { image, coord } => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "ImageTexelPointer without result".into()))?;
+                let (_, binding) = self.image_handles.get(&image.id)
+                    .copied()
+                    .ok_or_else(|| BackendError::Internal(format!(
+                        "ImageTexelPointer image {:?} not an ImageHandle",
+                        image.id)))?;
+                let coord_lanes = self.vectors.get(&coord.id).cloned()
+                    .ok_or_else(|| BackendError::Internal(format!(
+                        "ImageTexelPointer coord {:?} not a vector",
+                        coord.id)))?;
+                if coord_lanes.len() < 2 {
+                    return Err(BackendError::Unsupported(format!(
+                        "ImageTexelPointer coord must have ≥2 lanes, \
+                         got {}", coord_lanes.len())));
+                }
+                let x = coord_lanes[0];
+                let y = coord_lanes[1];
+                let z = if coord_lanes.len() >= 3 {
+                    Some(coord_lanes[2]) } else { None };
+                let pointer_type = builder.func.dfg
+                    .value_type(self.params[0]);
+                let img_table = self.params[0];
+                let desc_off: i32 = 32 + (binding as i32) * 8;
+                let desc_ptr = builder.ins().load(
+                    pointer_type, MemFlags::new(), img_table, desc_off);
+                // data ptr @ #0
+                let mut addr = builder.ins().load(
+                    pointer_type, MemFlags::new(), desc_ptr, 0);
+                // image3D: addr += z * slice_bytes (field @28).
+                if let Some(z) = z {
+                    let slice = builder.ins().load(
+                        clif_types::I32, MemFlags::new(), desc_ptr, 28);
+                    let z_off = builder.ins().imul(z, slice);
+                    let z_off64 = builder.ins().uextend(
+                        clif_types::I64, z_off);
+                    addr = builder.ins().iadd(addr, z_off64);
+                }
+                // y * stride_bytes (field @16)
+                let stride = builder.ins().load(
+                    clif_types::I32, MemFlags::new(), desc_ptr, 16);
+                let row_off = builder.ins().imul(y, stride);
+                let row_off64 = builder.ins().uextend(
+                    clif_types::I64, row_off);
+                addr = builder.ins().iadd(addr, row_off64);
+                // x * 4 (one 32-bit texel)
+                let x_off = builder.ins().ishl_imm(x, 2);
+                let x_off64 = builder.ins().uextend(
+                    clif_types::I64, x_off);
+                addr = builder.ins().iadd(addr, x_off64);
+                self.pointers.insert(result.id, (addr, 0));
+                Ok(())
+            }
             // OpImageRead / OpImageWrite — storage-image
             // access (compute).  The image descriptor table
             // is a SEPARATE table in params[0] (the compute

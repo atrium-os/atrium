@@ -1046,12 +1046,14 @@ specifically supports:
 - Atomic storage-image ops: `OpImageTexelPointer` forms a
   raw byte pointer to one texel
   (`data + z*slice_bytes + y*stride_bytes + x*4`, computed
-  inline off the X19-anchored `ImageDesc` — no helper call);
-  a following `OpAtomic*` then read-modify-writes it with an
-  ARMv8.1 LSE instruction.  `imageAtomicAdd` and friends on
-  R32 storage images work this way.  Bespoke-only: Cranelift's
-  aarch64 backend can't form the `StorageClass::Image`
-  pointer.
+  inline off the descriptor table — no helper call); a
+  following `OpAtomic*` then read-modify-writes it.
+  `imageAtomicAdd` / `imageAtomicCompareSwap` and friends on
+  R32 storage images work this way.  Cross-backend: bespoke
+  uses ARMv8.1 LSE for race safety under workgroup-parallel
+  dispatch, Cranelift's path lowers to a non-atomic
+  load+op+store on the same address (same as its SSBO
+  atomics — single-threaded under the Cranelift dispatcher).
 - 3D storage images: `image3D` `OpImageRead` /
   `OpImageWrite` route to dedicated 3D helpers
   (`atrium_img_read_3d` / `atrium_img_write_3d`), selected

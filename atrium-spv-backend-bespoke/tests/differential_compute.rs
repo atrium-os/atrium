@@ -4548,18 +4548,31 @@ fn differential_storage_image_atomic_add() {
     }
     let dir = TempDir::new().unwrap();
     // format=1 (R32) -> 4 bytes/texel; depth=1 (2D).
-    invoke_compute_image(&spv, true, dir.path(), "b",
-        &mut img, w, h, 1, 1, &gids);
+    // Cross-backend differential: run from a fresh prefill on
+    // each side so the bespoke writes don't leak into the
+    // Cranelift run.  Cranelift's atomic-image path computes
+    // the same texel address inline (Op::ImageTexelPointer
+    // lowering) and then uses its existing AtomicIAdd arm.
+    let prefill = img.clone();
+    let mut b_img = prefill.clone();
+    let mut c_img = prefill;
+    invoke_compute_image(&spv, true,  dir.path(), "b",
+        &mut b_img, w, h, 1, 1, &gids);
+    invoke_compute_image(&spv, false, dir.path(), "c",
+        &mut c_img, w, h, 1, 1, &gids);
+    assert_eq!(b_img, c_img,
+        "imageAtomicAdd 2D diverges between backends");
     for y in 0..h {
         for x in 0..w {
             let off = ((y * w + x) * 4) as usize;
             let got = u32::from_le_bytes(
-                img[off..off + 4].try_into().unwrap());
+                b_img[off..off + 4].try_into().unwrap());
             let want = y * w + x + 3;
             assert_eq!(got, want,
                 "texel ({x},{y}): got {got}, want {want}");
         }
     }
+    let _ = img;
 }
 
 #[test]
@@ -4620,15 +4633,21 @@ fn differential_storage_image_atomic_cas() {
     for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
 
     let (w, h) = (2u32, 1u32);
-    let mut img = vec![0u8; (w * h * 4) as usize];
-    img[0..4].copy_from_slice(&42u32.to_le_bytes()); // (0,0) -> 42 (match)
-    img[4..8].copy_from_slice(&7u32.to_le_bytes());  // (1,0) -> 7  (no match)
+    let mut prefill = vec![0u8; (w * h * 4) as usize];
+    prefill[0..4].copy_from_slice(&42u32.to_le_bytes());
+    prefill[4..8].copy_from_slice(&7u32.to_le_bytes());
     let gids = [(0u32, 0u32, 0u32), (1u32, 0u32, 0u32)];
     let dir = TempDir::new().unwrap();
-    invoke_compute_image(&spv, true, dir.path(), "b",
-        &mut img, w, h, 1, 1, &gids);
-    let got0 = u32::from_le_bytes(img[0..4].try_into().unwrap());
-    let got1 = u32::from_le_bytes(img[4..8].try_into().unwrap());
+    let mut b_img = prefill.clone();
+    let mut c_img = prefill;
+    invoke_compute_image(&spv, true,  dir.path(), "b",
+        &mut b_img, w, h, 1, 1, &gids);
+    invoke_compute_image(&spv, false, dir.path(), "c",
+        &mut c_img, w, h, 1, 1, &gids);
+    assert_eq!(b_img, c_img,
+        "imageAtomicCompareSwap diverges between backends");
+    let got0 = u32::from_le_bytes(b_img[0..4].try_into().unwrap());
+    let got1 = u32::from_le_bytes(b_img[4..8].try_into().unwrap());
     assert_eq!(got0, 99, "CAS hit: 42 -> 99");
     assert_eq!(got1,  7, "CAS miss: 7 stays");
 }
@@ -4710,8 +4729,16 @@ fn differential_storage_image_3d_atomic_add() {
         }
     }
     let dir = TempDir::new().unwrap();
-    invoke_compute_image(&spv, true, dir.path(), "b",
-        &mut img, w, h, d, 1, &gids);
+    let prefill = img.clone();
+    let mut b_img = prefill.clone();
+    let mut c_img = prefill;
+    invoke_compute_image(&spv, true,  dir.path(), "b",
+        &mut b_img, w, h, d, 1, &gids);
+    invoke_compute_image(&spv, false, dir.path(), "c",
+        &mut c_img, w, h, d, 1, &gids);
+    assert_eq!(b_img, c_img,
+        "image3D imageAtomicAdd diverges between backends");
+    let img = b_img;  // alias for the verification loop below
     for z in 0..d {
         for y in 0..h {
             for x in 0..w {
