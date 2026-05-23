@@ -4728,6 +4728,94 @@ fn differential_storage_image_3d_atomic_add() {
 }
 
 #[test]
+fn differential_spec_constants_default_values() {
+    // OpSpecConstant{,True,False,Composite} -- when no
+    // VkSpecializationInfo is supplied, Tier-2 v1 uses the
+    // SPIR-V-declared default value.  This test declares a
+    // scalar i32 spec const (default=7), a scalar bool spec
+    // const (default=true), and writes:
+    //   ssbo[0] = scalar_int_default   (expect 7)
+    //   ssbo[1] = scalar_bool_default ? 1 : 0   (expect 1)
+    //   ssbo[2] = scalar_int_default * 2  (regular OpIMul on
+    //             the spec constant + a plain constant 2)
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let i32_ty = b.type_int(32, 1);
+    let bool_ty = b.type_bool();
+    let void_fn = b.type_function(void, vec![]);
+    let rt = b.type_runtime_array(u32_ty);
+    b.decorate(rt, Decoration::ArrayStride,
+        vec![rspirv::dr::Operand::LiteralBit32(4)]);
+    let s = b.type_struct(vec![rt]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_u = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+    let ssbo = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    // Spec constants -- declared with default values.
+    let sc_int = b.spec_constant_bit32(i32_ty, 7u32);
+    b.decorate(sc_int, Decoration::SpecId,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let sc_bool = b.spec_constant_true(bool_ty);
+    b.decorate(sc_bool, Decoration::SpecId,
+        vec![rspirv::dr::Operand::LiteralBit32(1)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    let c_one  = b.constant_bit32(u32_ty, 1);
+    let c_two_u = b.constant_bit32(u32_ty, 2);
+    let c_two_i = b.constant_bit32(i32_ty, 2u32);
+    let c_zero_u = b.constant_bit32(u32_ty, 0);
+    let c_one_u  = b.constant_bit32(u32_ty, 1);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    // ssbo[0] = bitcast<u32>(sc_int)  (i32 7 -> u32 7)
+    let sc_u = b.bitcast(u32_ty, None, sc_int).unwrap();
+    let p0 = b.access_chain(ptr_u, None, ssbo, vec![c_zero, c_zero]).unwrap();
+    b.store(p0, sc_u, None, vec![]).unwrap();
+    // ssbo[1] = sc_bool ? 1u : 0u
+    let sel = b.select(u32_ty, None, sc_bool, c_one_u, c_zero_u).unwrap();
+    let p1 = b.access_chain(ptr_u, None, ssbo, vec![c_zero, c_one]).unwrap();
+    b.store(p1, sel, None, vec![]).unwrap();
+    // ssbo[2] = bitcast<u32>(sc_int * 2)
+    let prod = b.i_mul(i32_ty, None, sc_int, c_two_i).unwrap();
+    let prod_u = b.bitcast(u32_ty, None, prod).unwrap();
+    let p2 = b.access_chain(ptr_u, None, ssbo, vec![c_zero, c_two_u]).unwrap();
+    b.store(p2, prod_u, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spv = Vec::with_capacity(words.len() * 4);
+    for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+    let dir = TempDir::new().unwrap();
+    let mut b_buf = vec![0u8; 12];
+    let mut c_buf = vec![0u8; 12];
+    invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
+    invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+    assert_eq!(b_buf, c_buf,
+        "spec-constant default-values diverge between backends");
+    let at = |i: usize| u32::from_le_bytes(
+        b_buf[i*4..i*4+4].try_into().unwrap());
+    assert_eq!(at(0),  7, "scalar SpecConstant int default");
+    assert_eq!(at(1),  1, "SpecConstantTrue -> 1");
+    assert_eq!(at(2), 14, "SpecConstant int * 2 = 14");
+}
+
+#[test]
 fn differential_glsl_radians_degrees() {
     // Radians(180) ≈ π; Degrees(π) ≈ 180.  Round-trip a few
     // angles through both and compare to f32 truth.

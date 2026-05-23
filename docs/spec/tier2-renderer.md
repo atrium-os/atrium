@@ -962,6 +962,14 @@ specifically supports:
 - AccessChain with constant-index struct + array walks
   and a single trailing dynamic index into
   RuntimeArray/Array (Op::PtrOffsetDynamic).
+- Specialization constants: `OpSpecConstant{,True,False,
+  Composite}` are translated to regular constants using the
+  SPIR-V-declared default values.  `VkSpecializationInfo`
+  plumbing (host-supplied overrides at pipeline-create time)
+  is deferred; the common case of shaders that use spec
+  constants only for compile-time defaults works.
+  `OpSpecConstantOp` (constant expressions on spec constants)
+  is also deferred.
 - Atomic ops: AtomicIAdd, ISub, IIncrement, IDecrement,
   And, Or, Xor, Exchange, Load, Store,
   CompareExchange, SMin/SMax/UMin/UMax — all lowered to

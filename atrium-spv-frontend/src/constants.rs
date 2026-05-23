@@ -66,15 +66,28 @@ impl ConstantContext {
         for inst in &module.types_global_values {
             let id = match inst.result_id { Some(id) => id, None => continue };
             let constant = match inst.class.opcode {
-                SpvOp::Constant => translate_op_constant(inst, types)?,
-                SpvOp::ConstantTrue => StoredConstant {
+                // OpSpecConstant{,True,False,Composite} share
+                // the exact wire encoding of their OpConstant
+                // counterparts -- the only difference is that
+                // a Vulkan API caller MAY override the value
+                // via VkSpecializationInfo at pipeline-create
+                // time.  Tier-2 v1 uses the SPIR-V-declared
+                // default value (no VkSpecializationInfo
+                // plumbing yet); this covers the common case
+                // where the shader's compile-time default
+                // matches the host's intent.  Folded here so
+                // any later operand resolution treats the
+                // spec constant as a regular constant.
+                SpvOp::Constant | SpvOp::SpecConstant =>
+                    translate_op_constant(inst, types)?,
+                SpvOp::ConstantTrue | SpvOp::SpecConstantTrue => StoredConstant {
                     type_id: inst.result_type.ok_or_else(|| FrontendError::Malformed(
                         "ConstantTrue without result type".to_string()))?,
                     kind: ConstantKind::Scalar(Op::ConstInt {
                         value: 1, kind: IntKind::I32,
                     }),
                 },
-                SpvOp::ConstantFalse => StoredConstant {
+                SpvOp::ConstantFalse | SpvOp::SpecConstantFalse => StoredConstant {
                     type_id: inst.result_type.ok_or_else(|| FrontendError::Malformed(
                         "ConstantFalse without result type".to_string()))?,
                     kind: ConstantKind::Scalar(Op::ConstInt {
@@ -86,9 +99,8 @@ impl ConstantContext {
                         "ConstantNull without result type".to_string()))?,
                     kind: ConstantKind::Null,
                 },
-                SpvOp::ConstantComposite => translate_constant_composite(
-                    inst, &ctx,
-                )?,
+                SpvOp::ConstantComposite | SpvOp::SpecConstantComposite =>
+                    translate_constant_composite(inst, &ctx)?,
                 _ => continue,
             };
             ctx.constants.insert(id, constant);

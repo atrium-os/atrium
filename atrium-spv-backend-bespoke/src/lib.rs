@@ -1291,6 +1291,14 @@ fn emit_function(
                     let w = alloc_int_w(&mut int_pool, result.id)?;
                     materialise_u32_into_w(&mut a, w, *value as i32 as u32);
                     ints.insert(result.id, w);
+                    // OpConstantTrue / OpConstantFalse (and the
+                    // SpecConstant variants) lower to a ConstInt
+                    // with result.ty == Bool.  Bool consumers
+                    // (Select, BranchCond) read the `bools` map,
+                    // so also register the W-reg there.
+                    if matches!(result.ty, Type::Bool) {
+                        bools.insert(result.id, w);
+                    }
                 }
             }
             Op::ConstNull => {
@@ -1529,29 +1537,49 @@ fn emit_function(
             }
             Op::Bitcast(s, target_ty) => {
                 // Pure reinterpret between i32/u32 and f32.
-                // Same bit pattern, just moves between W-reg
-                // (int) and S-lane of V-reg (float).
+                // Three cases:
+                //   - int -> f32:  fmov_s_from_w  (W-reg -> V-reg S-lane)
+                //   - f32 -> int:  fmov_w_from_s  (V-reg S-lane -> W-reg)
+                //   - int -> int:  alias the same W-reg (i32 <-> u32
+                //                  is a no-op at the hardware level).
+                // The frontend translates SPIR-V OpBitcast for every
+                // {int,float} <-> {int,float} pairing, including the
+                // identity-shaped int<->int from `bitcast(u32, i32)`
+                // that real shaders emit when reinterpreting a signed
+                // index as an unsigned one (or vice versa).
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal(
                         "Bitcast without result".into()))?;
                 let to_float = matches!(target_ty, Type::F32);
-                if to_float {
-                    let s_w = *ints.get(&s.id).ok_or_else(||
-                        BackendError::Internal(format!(
-                            "Bitcast int→f32 operand {:?} not in ints",
-                            s.id)))?;
-                    let d_v = alloc_vreg(&mut free_pool, &mut owners,
-                        &mut used_callee_saved_v, result.id)?;
-                    a.emit(asm::fmov_s_from_w(d_v, s_w));
-                    scalars.insert(result.id, d_v);
-                } else {
-                    let s_v = *scalars.get(&s.id).ok_or_else(||
-                        BackendError::Internal(format!(
-                            "Bitcast f32→int operand {:?} not in scalars",
-                            s.id)))?;
-                    let d_w = alloc_int_w(&mut int_pool, result.id)?;
-                    a.emit(asm::fmov_w_from_s(d_w, s_v));
-                    ints.insert(result.id, d_w);
+                let src_in_ints = ints.contains_key(&s.id);
+                let src_in_scalars = scalars.contains_key(&s.id);
+                match (to_float, src_in_ints, src_in_scalars) {
+                    (true, true, _) => {
+                        let s_w = *ints.get(&s.id).unwrap();
+                        let d_v = alloc_vreg(&mut free_pool, &mut owners,
+                            &mut used_callee_saved_v, result.id)?;
+                        a.emit(asm::fmov_s_from_w(d_v, s_w));
+                        scalars.insert(result.id, d_v);
+                    }
+                    (false, _, true) => {
+                        let s_v = *scalars.get(&s.id).unwrap();
+                        let d_w = alloc_int_w(&mut int_pool, result.id)?;
+                        a.emit(asm::fmov_w_from_s(d_w, s_v));
+                        ints.insert(result.id, d_w);
+                    }
+                    (false, true, false) => {
+                        // int -> int: alias (no codegen).
+                        let s_w = *ints.get(&s.id).unwrap();
+                        ints.insert(result.id, s_w);
+                    }
+                    (true, false, true) => {
+                        // f32 -> f32 (degenerate but legal): alias.
+                        let s_v = *scalars.get(&s.id).unwrap();
+                        scalars.insert(result.id, s_v);
+                    }
+                    _ => return Err(BackendError::Internal(format!(
+                        "Bitcast: operand {:?} not in ints or scalars",
+                        s.id))),
                 }
             }
             Op::ConstFloat { value, kind: FloatKind::F32 } => {
