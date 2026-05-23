@@ -1537,7 +1537,14 @@ impl FnTranslator {
             //   blr  x_fn  (call atrium_tex_sample_2d via fn-ptr)
             // plus a 16-byte stack slot for the out_rgba
             // pixel, which we then load lane-by-lane.
-            Op::ImageSampleImplicitLod { sampled_image, coord } => {
+            //
+            // ImageSampleExplicitLod shares this arm: with
+            // single-mip TexDesc the LOD is ignored (the
+            // helper always samples mip 0).  Real multi-mip
+            // sampling is deferred (mirrors Arc 26 storage-
+            // image Lod work for the sampler side).
+            Op::ImageSampleImplicitLod { sampled_image, coord }
+            | Op::ImageSampleExplicitLod { sampled_image, coord, .. } => {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal(
                         "ImageSampleImplicitLod without result".to_string()))?;

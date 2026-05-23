@@ -3091,7 +3091,15 @@ fn emit_function(
             // values across the call so this works; a real
             // shader with values live across an ImageSample
             // needs proper save/restore (a later phase).
-            Op::ImageSampleImplicitLod { sampled_image, coord } => {
+            //
+            // ImageSampleExplicitLod shares this arm: in the
+            // single-mip TexDesc world the LOD operand is
+            // ignored (the helper always samples mip 0).
+            // Real multi-mip sampling would extend the helper
+            // signature + table layout, mirroring Arc 26's
+            // storage-image Lod plumbing; deferred.
+            Op::ImageSampleImplicitLod { sampled_image, coord }
+            | Op::ImageSampleExplicitLod { sampled_image, coord, .. } => {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal(
                         "ImageSampleImplicitLod without result".into()))?;
