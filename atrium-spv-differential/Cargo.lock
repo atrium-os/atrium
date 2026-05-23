@@ -64,6 +64,7 @@ dependencies = [
  "atrium-spv-backend-bespoke",
  "atrium-spv-backend-cranelift",
  "atrium-spv-frontend",
+ "atrium-spv-runtime",
  "atrium-spv-tests",
  "libloading",
  "rspirv",
@@ -87,9 +88,14 @@ name = "atrium-spv-pcmap"
 version = "0.1.0"
 
 [[package]]
+name = "atrium-spv-runtime"
+version = "0.1.0"
+
+[[package]]
 name = "atrium-spv-tests"
 version = "0.1.0"
 dependencies = [
+ "atrium-spv-runtime",
  "rspirv",
 ]
 

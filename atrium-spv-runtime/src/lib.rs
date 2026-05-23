@@ -200,14 +200,16 @@ pub struct SamplerDesc {
 // in X1 (per docs/spec/tier2-renderer.md §4.1). v1 of the
 // texture path overlays the buffer's prefix with:
 //
-//   bytes  0..48 : runtime-helper function pointers
+//   bytes  0..64 : runtime-helper function pointers
 //                  ( 0:  atrium_tex_sample_2d
 //                    8:  atrium_tex_fetch_2d
 //                   16:  atrium_tex_sample_2d_lod
 //                   24:  atrium_tex_sample_2d_array
 //                   32:  atrium_tex_sample_cube
-//                   40:  atrium_tex_gather_2d )
-//   bytes 48..   : flat descriptor table — slot `B` at
+//                   40:  atrium_tex_gather_2d
+//                   48:  atrium_tex_sample_2d_array_lod
+//                   56:  atrium_tex_sample_cube_lod )
+//   bytes 64..   : flat descriptor table — slot `B` at
 //                  byte `UNIFORMS_DESC_BASE + B*16`,
 //                  carrying ( 0: tex_desc*, 8: samp_desc* )
 //
@@ -244,8 +246,8 @@ pub const UNIFORMS_HELPERS_BASE: usize = 0;
 /// buffer. Slot `B` lives at `UNIFORMS_DESC_BASE + B * DESC_SLOT_BYTES`.
 /// Grew from 16 → 24 (Arc 29 sample_2d_lod) → 32 (Arc 30
 /// sample_2d_array) → 40 (Arc 31 sample_cube) → 48 (Arc 32
-/// gather_2d).
-pub const UNIFORMS_DESC_BASE: usize = 48;
+/// gather_2d) → 64 (Arc 35 array_lod + cube_lod).
+pub const UNIFORMS_DESC_BASE: usize = 64;
 
 /// Bytes per descriptor slot in the table. Two 64-bit
 /// pointers packed back-to-back — `tex_desc*` then
@@ -390,6 +392,12 @@ pub unsafe fn write_helper_pointers(
         *const TexDesc, *const SamplerDesc, f32, f32, f32, *mut f32),
     gather_2d: unsafe extern "C" fn(
         *const TexDesc, *const SamplerDesc, f32, f32, i32, *mut f32),
+    sample_2d_array_lod: unsafe extern "C" fn(
+        *const TexDesc, *const SamplerDesc,
+        f32, f32, f32, f32, *mut f32),
+    sample_cube_lod: unsafe extern "C" fn(
+        *const TexDesc, *const SamplerDesc,
+        f32, f32, f32, f32, *mut f32),
 ) {
     assert!(buf.len() >= UNIFORMS_DESC_BASE,
         "uniforms buffer too small for the helper header");
@@ -398,13 +406,17 @@ pub unsafe fn write_helper_pointers(
     let sl = (sample_2d_lod   as usize as u64).to_le_bytes();
     let sa = (sample_2d_array as usize as u64).to_le_bytes();
     let sc = (sample_cube     as usize as u64).to_le_bytes();
-    let g  = (gather_2d       as usize as u64).to_le_bytes();
+    let g  = (gather_2d           as usize as u64).to_le_bytes();
+    let sal = (sample_2d_array_lod as usize as u64).to_le_bytes();
+    let scl = (sample_cube_lod     as usize as u64).to_le_bytes();
     buf[ 0.. 8].copy_from_slice(&s);
     buf[ 8..16].copy_from_slice(&f);
     buf[16..24].copy_from_slice(&sl);
     buf[24..32].copy_from_slice(&sa);
     buf[32..40].copy_from_slice(&sc);
     buf[40..48].copy_from_slice(&g);
+    buf[48..56].copy_from_slice(&sal);
+    buf[56..64].copy_from_slice(&scl);
 }
 
 /// Write a `(tex_desc, samp_desc)` pointer pair at binding
@@ -547,6 +559,66 @@ pub unsafe extern "C" fn atrium_tex_gather_2d(
     out[1] = t11[c]; // (1, 1)
     out[2] = t10[c]; // (1, 0)
     out[3] = t00[c]; // (0, 0)
+}
+
+/// Sample one layer of a `sampler2DArray` with an explicit
+/// LOD.  Combines the Arc 29 `pick_tex_mip()` mip selection
+/// with the Arc 30 array-layer selection.
+///
+/// # Safety
+/// As for `atrium_tex_sample_2d_array`; LOD selects a mip
+/// via `TexDesc.mip_descs[lod]`.
+#[no_mangle]
+pub unsafe extern "C" fn atrium_tex_sample_2d_array_lod(
+    tex: *const TexDesc,
+    samp: *const SamplerDesc,
+    u: f32, v: f32, layer: f32, lod: f32,
+    out_rgba: *mut f32,
+) {
+    let mip = pick_tex_mip(&*tex, lod.round() as i32);
+    let layers = mip.depth.max(1);
+    let l_idx = (layer.round() as i32)
+        .clamp(0, (layers as i32) - 1) as u32;
+    let slice_off = (l_idx as usize) * (mip.slice_bytes as usize);
+    let mut t = *mip;
+    t.data = mip.data.add(slice_off);
+    let s = &*samp;
+    let rgba = sample_2d_impl(&t, s, u, v);
+    let out = std::slice::from_raw_parts_mut(out_rgba, 4);
+    out.copy_from_slice(&rgba);
+}
+
+/// Sample a `samplerCube` with an explicit LOD.  Picks the
+/// mip via `TexDesc.mip_descs[lod]` and then proceeds with
+/// the standard face selection / (u, v) remap.
+///
+/// # Safety
+/// As for `atrium_tex_sample_cube`; LOD selects a mip via
+/// `TexDesc.mip_descs[lod]`.
+#[no_mangle]
+pub unsafe extern "C" fn atrium_tex_sample_cube_lod(
+    tex: *const TexDesc,
+    samp: *const SamplerDesc,
+    x: f32, y: f32, z: f32, lod: f32,
+    out_rgba: *mut f32,
+) {
+    let mip = pick_tex_mip(&*tex, lod.round() as i32);
+    let ax = x.abs(); let ay = y.abs(); let az = z.abs();
+    let (face, sc, tc, ma) = if ax >= ay && ax >= az {
+        if x >= 0.0 { (0u32, -z, -y, ax) } else { (1u32, z, -y, ax) }
+    } else if ay >= az {
+        if y >= 0.0 { (2u32, x, z, ay) } else { (3u32, x, -z, ay) }
+    } else if z >= 0.0 { (4u32, x, -y, az) } else { (5u32, -x, -y, az) };
+    let inv_ma = if ma == 0.0 { 0.0 } else { 1.0 / ma };
+    let u = 0.5 * (sc * inv_ma + 1.0);
+    let v = 0.5 * (tc * inv_ma + 1.0);
+    let slice_off = (face as usize) * (mip.slice_bytes as usize);
+    let mut face_tex = *mip;
+    face_tex.data = mip.data.add(slice_off);
+    let s = &*samp;
+    let rgba = sample_2d_impl(&face_tex, s, u, v);
+    let out = std::slice::from_raw_parts_mut(out_rgba, 4);
+    out.copy_from_slice(&rgba);
 }
 
 /// Sample a `samplerCube` with a vec3 direction.  The
@@ -1448,7 +1520,9 @@ mod tests {
                 atrium_tex_sample_2d_lod,
                 atrium_tex_sample_2d_array,
                 atrium_tex_sample_cube,
-                atrium_tex_gather_2d);
+                atrium_tex_gather_2d,
+                atrium_tex_sample_2d_array_lod,
+                atrium_tex_sample_cube_lod);
             write_descriptor_slot(&mut buf, 0, tex_a_ptr, samp_a_ptr);
             write_descriptor_slot(&mut buf, 1, tex_b_ptr, samp_b_ptr);
         }
@@ -1623,5 +1697,106 @@ mod tests {
         assert_eq!(read_u64(56), atrium_img_write_3d_lod as usize as u64);
         assert_eq!(read_u64(IMG_TABLE_DESC_BASE + IMG_DESC_SLOT_BYTES),
             &img as *const ImageDesc as usize as u64);
+    }
+
+    /// Arc 35: sample a 2-layer sampler2DArray with an explicit
+    /// LOD that selects mip 1 (a 1×1 distinct value per layer).
+    #[test]
+    fn sample_2d_array_lod_picks_mip_and_layer() {
+        // Layer 0 mip 0: 2×2 all 0x10.  Layer 1 mip 0: all 0x20.
+        // Layer 0 mip 1: 1×1 = 0x40.    Layer 1 mip 1: 1×1 = 0x80.
+        let mut m0 = vec![0u8; 2 * 2 * 4 * 2]; // 2 layers @ 16 B
+        for px in 0..4 { m0[px * 4..px * 4 + 4]
+            .copy_from_slice(&[0x10, 0, 0, 0xFF]); }
+        for px in 0..4 { m0[16 + px * 4..16 + px * 4 + 4]
+            .copy_from_slice(&[0x20, 0, 0, 0xFF]); }
+        let mut m1 = vec![0u8; 1 * 1 * 4 * 2]; // 2 layers @ 4 B
+        m1[0..4].copy_from_slice(&[0x40, 0, 0, 0xFF]);
+        m1[4..8].copy_from_slice(&[0x80, 0, 0, 0xFF]);
+        let mip0 = TexDesc {
+            data: m0.as_ptr(), width: 2, height: 2, stride_bytes: 8,
+            format: TexFormat::Rgba8Unorm as u32, depth: 2,
+            slice_bytes: 16, mip_count: 0, mip_descs: std::ptr::null(),
+        };
+        let mip1 = TexDesc {
+            data: m1.as_ptr(), width: 1, height: 1, stride_bytes: 4,
+            format: TexFormat::Rgba8Unorm as u32, depth: 2,
+            slice_bytes: 4, mip_count: 0, mip_descs: std::ptr::null(),
+        };
+        let mips = [mip0, mip1];
+        let tex = TexDesc {
+            data: m0.as_ptr(), width: 2, height: 2, stride_bytes: 8,
+            format: TexFormat::Rgba8Unorm as u32, depth: 2,
+            slice_bytes: 16, mip_count: 2, mip_descs: mips.as_ptr(),
+        };
+        let samp = SamplerDesc {
+            mag_filter: 0, min_filter: 0, wrap_s: 0, wrap_t: 0,
+        };
+        let mut rgba = [0f32; 4];
+        unsafe { atrium_tex_sample_2d_array_lod(
+            &tex, &samp, 0.5, 0.5, 0.0, 1.0, rgba.as_mut_ptr()); }
+        assert!((rgba[0] - 0x40 as f32 / 255.0).abs() < 1.0 / 256.0,
+            "layer 0 mip 1 -> 0x40, got {}", rgba[0]);
+        unsafe { atrium_tex_sample_2d_array_lod(
+            &tex, &samp, 0.5, 0.5, 1.0, 1.0, rgba.as_mut_ptr()); }
+        assert!((rgba[0] - 0x80 as f32 / 255.0).abs() < 1.0 / 256.0,
+            "layer 1 mip 1 -> 0x80, got {}", rgba[0]);
+        // LOD 0 selects mip 0: distinct values per layer.
+        unsafe { atrium_tex_sample_2d_array_lod(
+            &tex, &samp, 0.5, 0.5, 0.0, 0.0, rgba.as_mut_ptr()); }
+        assert!((rgba[0] - 0x10 as f32 / 255.0).abs() < 1.0 / 256.0);
+        unsafe { atrium_tex_sample_2d_array_lod(
+            &tex, &samp, 0.5, 0.5, 1.0, 0.0, rgba.as_mut_ptr()); }
+        assert!((rgba[0] - 0x20 as f32 / 255.0).abs() < 1.0 / 256.0);
+    }
+
+    /// Arc 35: sample a cube with explicit LOD; major axis
+    /// selection across mip levels.
+    #[test]
+    fn sample_cube_lod_picks_mip_and_face() {
+        // 6 faces × 1×1 per mip, two mips.  Face N at mip 0
+        // tagged with red=N*16; at mip 1 tagged with red=N*32.
+        let mut m0 = vec![0u8; 6 * 4];
+        let mut m1 = vec![0u8; 6 * 4];
+        for f in 0..6 {
+            m0[f * 4..f * 4 + 4]
+                .copy_from_slice(&[(f as u8) * 16, 0, 0, 0xFF]);
+            m1[f * 4..f * 4 + 4]
+                .copy_from_slice(&[(f as u8) * 32, 0, 0, 0xFF]);
+        }
+        let mip0 = TexDesc {
+            data: m0.as_ptr(), width: 1, height: 1, stride_bytes: 4,
+            format: TexFormat::Rgba8Unorm as u32, depth: 6,
+            slice_bytes: 4, mip_count: 0, mip_descs: std::ptr::null(),
+        };
+        let mip1 = TexDesc {
+            data: m1.as_ptr(), width: 1, height: 1, stride_bytes: 4,
+            format: TexFormat::Rgba8Unorm as u32, depth: 6,
+            slice_bytes: 4, mip_count: 0, mip_descs: std::ptr::null(),
+        };
+        let mips = [mip0, mip1];
+        let tex = TexDesc {
+            data: m0.as_ptr(), width: 1, height: 1, stride_bytes: 4,
+            format: TexFormat::Rgba8Unorm as u32, depth: 6,
+            slice_bytes: 4, mip_count: 2, mip_descs: mips.as_ptr(),
+        };
+        let samp = SamplerDesc {
+            mag_filter: 0, min_filter: 0, wrap_s: 0, wrap_t: 0,
+        };
+        let mut rgba = [0f32; 4];
+        // +X face (idx 0), mip 1 -> 0
+        unsafe { atrium_tex_sample_cube_lod(
+            &tex, &samp, 1.0, 0.0, 0.0, 1.0, rgba.as_mut_ptr()); }
+        assert!(rgba[0].abs() < 1.0 / 256.0, "+X mip 1 got {}", rgba[0]);
+        // +Y face (idx 2), mip 1 -> 64
+        unsafe { atrium_tex_sample_cube_lod(
+            &tex, &samp, 0.0, 1.0, 0.0, 1.0, rgba.as_mut_ptr()); }
+        assert!((rgba[0] - 64.0 / 255.0).abs() < 1.0 / 256.0,
+            "+Y mip 1 -> 64/255, got {}", rgba[0]);
+        // -Z face (idx 5), mip 0 -> 80
+        unsafe { atrium_tex_sample_cube_lod(
+            &tex, &samp, 0.0, 0.0, -1.0, 0.0, rgba.as_mut_ptr()); }
+        assert!((rgba[0] - 80.0 / 255.0).abs() < 1.0 / 256.0,
+            "-Z mip 0 -> 80/255, got {}", rgba[0]);
     }
 }

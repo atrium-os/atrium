@@ -35,6 +35,7 @@ dependencies = [
  "atrium-spv-frontend",
  "atrium-spv-ir",
  "atrium-spv-pcmap",
+ "atrium-spv-runtime",
  "libloading",
  "object 0.36.7",
  "pptk-codegen-arm64",
@@ -76,6 +77,10 @@ version = "0.1.0"
 
 [[package]]
 name = "atrium-spv-pcmap"
+version = "0.1.0"
+
+[[package]]
+name = "atrium-spv-runtime"
 version = "0.1.0"
 
 [[package]]

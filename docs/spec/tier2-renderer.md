@@ -1137,8 +1137,18 @@ specifically supports:
   chosen channel into a vec4 in GLSL order `{(0,1),(1,1),
   (1,0),(0,0)}`.  Wrap modes honoured; component clamped
   `0..3`.  `UNIFORMS_DESC_BASE` grew 24 → 32 → 40 → 48.
-  Array/Cube + ExplicitLod combos are
-  deferred (would need `_array_lod` / `_cube_lod` helpers).
+  Array/Cube + ExplicitLod combos (Arc 35): two new helpers
+  `atrium_tex_sample_2d_array_lod` (#48) and
+  `atrium_tex_sample_cube_lod` (#56) combine the Arc 29
+  `pick_tex_mip()` mip-indirection with the Arc 30 / Arc 31
+  layer-or-face selection.  Helper-table grew 48 → 64 B;
+  `UNIFORMS_DESC_BASE` grew 48 → 64.  Bespoke routes the
+  call with a four-source parallel copy (V0=u, V1=v,
+  V2=third, V3=lod) staged through scratch V4..V7;
+  Cranelift extends the existing `call_indirect` signature
+  with two `f32` arg slots.  `texture(sampler2DArray,
+  vec3(u, v, layer), lod)` and `texture(samplerCube,
+  vec3(dir), lod)` now compile through both backends.
   `textureSize(sampler2D, lod)` (Arc 34): a new IR op
   `Op::SampledImageQuerySizeLod { image, lod }` is emitted
   by the frontend for `OpImageQuerySizeLod`.  Both backends

@@ -1573,30 +1573,43 @@ impl FnTranslator {
                     if is_cube || is_array {
                         Some(coord_lanes[2])
                     } else { None };
-                if (is_array || is_cube) && matches!(&inst.op,
-                    Op::ImageSampleExplicitLod { .. })
-                {
-                    return Err(BackendError::Unsupported(
-                        "sampler{2DArray,Cube} with explicit-LOD \
-                         not yet supported".to_string()));
-                }
                 // Helper-table layout (see runtime):
-                //   #0  sample_2d        (ImplicitLod, 2D)
-                //   #16 sample_2d_lod    (ExplicitLod, 2D)
-                //   #24 sample_2d_array  (ImplicitLod, 2DArray)
-                //   #32 sample_cube      (ImplicitLod, Cube)
-                let (helper_off, lod_arg): (i32, Option<ClifValue>) =
-                    match &inst.op {
-                        Op::ImageSampleExplicitLod { lod, .. } => {
-                            let lv = *self.scalars.get(&lod.id).ok_or_else(||
-                                BackendError::Internal(format!(
-                                    "ImageSampleExplicitLod lod {:?} not \
-                                     in scalars", lod.id)))?;
-                            (16, Some(lv))
-                        }
-                        _ if is_cube  => (32, third_arg),
-                        _ if is_array => (24, third_arg),
-                        _ => (0, None),
+                //   #0  sample_2d            (ImplicitLod, 2D)
+                //   #16 sample_2d_lod        (ExplicitLod, 2D)
+                //   #24 sample_2d_array      (ImplicitLod, 2DArray)
+                //   #32 sample_cube          (ImplicitLod, Cube)
+                //   #48 sample_2d_array_lod  (ExplicitLod, 2DArray)
+                //   #56 sample_cube_lod      (ExplicitLod, Cube)
+                let explicit_lod: Option<ClifValue> = match &inst.op {
+                    Op::ImageSampleExplicitLod { lod, .. } => {
+                        let lv = *self.scalars.get(&lod.id).ok_or_else(||
+                            BackendError::Internal(format!(
+                                "ImageSampleExplicitLod lod {:?} not \
+                                 in scalars", lod.id)))?;
+                        Some(lv)
+                    }
+                    _ => None,
+                };
+                let helper_off: i32 = match (
+                    is_cube, is_array, explicit_lod.is_some(),
+                ) {
+                    (true,  _, true)  => 56, // cube  + lod
+                    (_, true,  true)  => 48, // array + lod
+                    (true,  _, false) => 32, // cube
+                    (_, true,  false) => 24, // array
+                    (_,    _, true)   => 16, // 2D    + lod
+                    _                 => 0,  // 2D
+                };
+                // Call signature: (tex, samp, u, v[, third][, lod], out)
+                // - third = layer (sampler2DArray) or z (samplerCube)
+                // - both extras present for Array+Lod / Cube+Lod
+                let (third_extra, lod_extra): (Option<ClifValue>, Option<ClifValue>) =
+                    match (is_cube || is_array, explicit_lod) {
+                        (true,  Some(lv)) => (third_arg, Some(lv)),
+                        (true,  None)    => (third_arg, None),
+                        (false, Some(lv)) => (Some(lv), None), // 2D+lod: lod goes
+                                                               // into "third" slot
+                        (false, None)    => (None, None),
                     };
 
                 let pointer_type = builder.func.dfg
@@ -1607,7 +1620,7 @@ impl FnTranslator {
                 // pointers from the uniforms buffer at the
                 // v1-ABI offsets.  ExplicitLod selects the
                 // sample_2d_lod helper at #16.
-                let desc_off: i32 = 48 + (binding as i32) * 16;
+                let desc_off: i32 = 64 + (binding as i32) * 16;
                 let fn_ptr = builder.ins().load(
                     pointer_type, MemFlags::new(), uniforms, helper_off);
                 let tex_ptr = builder.ins().load(
@@ -1620,21 +1633,30 @@ impl FnTranslator {
                     StackSlotData::new(StackSlotKind::ExplicitSlot, 16, 4));
                 let out_ptr = builder.ins().stack_addr(pointer_type, slot, 0);
 
-                // Implicit: (tex, samp, u, v, out)
-                // Explicit: (tex, samp, u, v, lod, out)
+                // Signature variants:
+                //   2D       (tex, samp, u, v, out)
+                //   2D+lod   (tex, samp, u, v, lod, out)
+                //   array    (tex, samp, u, v, layer, out)
+                //   cube     (tex, samp, x, y, z, out)
+                //   array+lod(tex, samp, u, v, layer, lod, out)
+                //   cube+lod (tex, samp, x, y, z, lod, out)
                 let mut call_sig = Signature::new(CallConv::SystemV);
                 call_sig.params.push(AbiParam::new(pointer_type));
                 call_sig.params.push(AbiParam::new(pointer_type));
                 call_sig.params.push(AbiParam::new(clif_types::F32));
                 call_sig.params.push(AbiParam::new(clif_types::F32));
-                if lod_arg.is_some() {
+                if third_extra.is_some() {
+                    call_sig.params.push(AbiParam::new(clif_types::F32));
+                }
+                if lod_extra.is_some() {
                     call_sig.params.push(AbiParam::new(clif_types::F32));
                 }
                 call_sig.params.push(AbiParam::new(pointer_type));
                 let sig_ref = builder.import_signature(call_sig);
                 let mut call_args: Vec<ClifValue> =
                     vec![tex_ptr, samp_ptr, u, v];
-                if let Some(lv) = lod_arg { call_args.push(lv); }
+                if let Some(t) = third_extra { call_args.push(t); }
+                if let Some(l) = lod_extra   { call_args.push(l); }
                 call_args.push(out_ptr);
                 builder.ins().call_indirect(
                     sig_ref, fn_ptr, &call_args);
@@ -1729,7 +1751,7 @@ impl FnTranslator {
                 let pointer_type = builder.func.dfg
                     .value_type(self.params[1]);
                 let uniforms = self.params[1];
-                let desc_off: i32 = 48 + (binding as i32) * 16;
+                let desc_off: i32 = 64 + (binding as i32) * 16;
                 let fn_ptr = builder.ins().load(
                     pointer_type, MemFlags::new(), uniforms, 40);
                 let tex_ptr = builder.ins().load(
@@ -1791,7 +1813,7 @@ impl FnTranslator {
                     .value_type(self.params[1]);
                 let uniforms = self.params[1];
 
-                let desc_off: i32 = 48 + (binding as i32) * 16;
+                let desc_off: i32 = 64 + (binding as i32) * 16;
                 let fn_ptr = builder.ins().load(
                     pointer_type, MemFlags::new(), uniforms, 8); // fetch slot
                 let tex_ptr = builder.ins().load(
@@ -1881,7 +1903,7 @@ impl FnTranslator {
                 let pointer_type = builder.func.dfg
                     .value_type(self.params[1]);
                 let uniforms = self.params[1];
-                let desc_off: i32 = 48 + (binding as i32) * 16;
+                let desc_off: i32 = 64 + (binding as i32) * 16;
                 let desc_ptr = builder.ins().load(
                     pointer_type, MemFlags::new(), uniforms, desc_off);
                 let field_offs: [i32; 2] = [8, 12]; // width, height

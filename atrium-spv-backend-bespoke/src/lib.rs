@@ -3142,13 +3142,6 @@ fn emit_function(
                 let layer_v = third_v;  // legacy name kept for the
                                         // helper_off match below
                 let _ = layer_v;
-                if (is_array || is_cube) && matches!(&inst.op,
-                    Op::ImageSampleExplicitLod { .. })
-                {
-                    return Err(BackendError::Unsupported(
-                        "sampler{2DArray,Cube} with explicit-LOD \
-                         not yet supported".to_string()));
-                }
 
                 // Snapshot every currently-owned V-reg
                 // *before* allocating the result lanes —
@@ -3195,35 +3188,50 @@ fn emit_function(
                 let x11 = asm::Xreg(11);
                 let v0 = asm::Vreg(0);
                 let v1 = asm::Vreg(1);
-                let v2 = asm::Vreg(2); // parallel-copy temp / LOD slot
-                let v3 = asm::Vreg(3); // LOD hold across u/v copy
+                let v2 = asm::Vreg(2); // third coord / LOD / layer slot
+                let v3 = asm::Vreg(3); // LOD slot for array+lod / cube+lod
+                let v4 = asm::Vreg(4); // u  hold across parallel copy
+                let v5 = asm::Vreg(5); // v  hold across parallel copy
+                let v6 = asm::Vreg(6); // third-coord hold (array+lod / cube+lod)
+                let v7 = asm::Vreg(7); // lod hold (array+lod / cube+lod)
                 let lr = asm::Xreg(30);
                 // Helper-table layout:
-                //   #0  sample_2d        (ImplicitLod, 2D)
+                //   #0  sample_2d            (ImplicitLod, 2D)
                 //   #8  fetch_2d
-                //   #16 sample_2d_lod    (ExplicitLod, 2D)
-                //   #24 sample_2d_array  (ImplicitLod, 2DArray)
-                //   #32 sample_cube      (ImplicitLod, Cube)
-                let (helper_off, lod_v): (u16, Option<asm::Vreg>) =
-                    match &inst.op {
-                        Op::ImageSampleExplicitLod { lod, .. } => {
-                            let lv = *scalars.get(&lod.id).ok_or_else(||
-                                BackendError::Internal(format!(
-                                    "ImageSampleExplicitLod lod {:?} not \
-                                     in scalars", lod.id)))?;
-                            (16u16, Some(lv))
-                        }
-                        _ if is_cube  => (32u16, None),
-                        _ if is_array => (24u16, None),
-                        _ => (0u16, None),
-                    };
-                // The third float arg is either the
-                // ExplicitLod LOD (-> V2), the array layer
-                // (-> V2), or the cube z component (-> V2).
-                // All three paths share V2; we stash via V3
-                // across the u/v parallel-copy.
-                let extra_v: Option<asm::Vreg> = lod_v.or(third_v);
-                let desc_off: u16 = 48 + (binding as u16) * 16;
+                //   #16 sample_2d_lod        (ExplicitLod, 2D)
+                //   #24 sample_2d_array      (ImplicitLod, 2DArray)
+                //   #32 sample_cube          (ImplicitLod, Cube)
+                //   #40 gather_2d
+                //   #48 sample_2d_array_lod  (ExplicitLod, 2DArray)
+                //   #56 sample_cube_lod      (ExplicitLod, Cube)
+                let explicit_lod_v: Option<asm::Vreg> = match &inst.op {
+                    Op::ImageSampleExplicitLod { lod, .. } => {
+                        let lv = *scalars.get(&lod.id).ok_or_else(||
+                            BackendError::Internal(format!(
+                                "ImageSampleExplicitLod lod {:?} not \
+                                 in scalars", lod.id)))?;
+                        Some(lv)
+                    }
+                    _ => None,
+                };
+                let helper_off: u16 = match (
+                    is_cube, is_array, explicit_lod_v.is_some(),
+                ) {
+                    (true,  _, true)  => 56, // cube  + lod
+                    (_, true,  true)  => 48, // array + lod
+                    (true,  _, false) => 32, // cube
+                    (_, true,  false) => 24, // array
+                    (_,    _, true)   => 16, // 2D    + lod
+                    _                 => 0,  // 2D
+                };
+                // For single-extra paths (one of {ExplicitLod, Array,
+                // Cube}), the third float arg lands in V2.  For the
+                // two-extra paths (Array+Lod, Cube+Lod), V2 carries
+                // the third coord and V3 carries the LOD.
+                let two_extra = explicit_lod_v.is_some() && (is_array || is_cube);
+                let extra_v: Option<asm::Vreg> =
+                    if two_extra { third_v } else { explicit_lod_v.or(third_v) };
+                let desc_off: u16 = 64 + (binding as u16) * 16;
 
                 // Stack layout (16-byte aligned; each region
                 // is 16 bytes):
@@ -3258,20 +3266,28 @@ fn emit_function(
                 a.emit(asm::ldr_x_offset(x10, x1, desc_off));
                 a.emit(asm::ldr_x_offset(x11, x1, desc_off + 8));
 
-                // ExplicitLod / sampler2DArray: stash the
-                // extra float arg (LOD or layer) in V3 across
-                // the u/v parallel copy, then move it into V2
-                // for the helper call.  V3 is caller-saved
-                // and already spilled by the earlier dump.
-                if let Some(ev) = extra_v {
-                    a.emit(asm::mov_v_16b(v3, ev));
+                // Parallel-copy of (u, v[, third[, lod]]) into
+                // (V0, V1[, V2[, V3]]).  Sources may live in
+                // any V-reg (including the dest set), so we
+                // first hold every source in V4..V7 (always
+                // safe scratch: caller-saved and either not
+                // owned, or already spilled by the dump above)
+                // and then assign down.
+                a.emit(asm::mov_v_16b(v4, u_v));
+                a.emit(asm::mov_v_16b(v5, v_v));
+                if two_extra {
+                    a.emit(asm::mov_v_16b(v6, third_v.unwrap()));
+                    a.emit(asm::mov_v_16b(v7, explicit_lod_v.unwrap()));
+                } else if let Some(ev) = extra_v {
+                    a.emit(asm::mov_v_16b(v6, ev));
                 }
-                // u, v → V0, V1, parallel-copy safe via V2.
-                a.emit(asm::mov_v_16b(v2, u_v));
-                a.emit(asm::mov_v_16b(v1, v_v));
-                a.emit(asm::mov_v_16b(v0, v2));
-                if extra_v.is_some() {
-                    a.emit(asm::mov_v_16b(v2, v3));
+                a.emit(asm::mov_v_16b(v0, v4));
+                a.emit(asm::mov_v_16b(v1, v5));
+                if two_extra {
+                    a.emit(asm::mov_v_16b(v2, v6));
+                    a.emit(asm::mov_v_16b(v3, v7));
+                } else if extra_v.is_some() {
+                    a.emit(asm::mov_v_16b(v2, v6));
                 }
 
                 // Pointer args + call. Note: `mov` from SP
@@ -3374,7 +3390,7 @@ fn emit_function(
                 let v2 = asm::Vreg(2); // u/v parallel-copy temp
                 let w2 = asm::Wreg(2);
                 let lr = asm::Xreg(30);
-                let desc_off: u16 = 48 + (binding as u16) * 16;
+                let desc_off: u16 = 64 + (binding as u16) * 16;
                 let n_spill = live_vregs.len() as u16;
                 let frame_bytes: u16 = 32 + n_spill * 16;
                 a.emit(asm::sub_imm_x(sp, sp, frame_bytes));
@@ -3485,7 +3501,7 @@ fn emit_function(
                 let w1 = asm::Wreg(1);
                 let w2 = asm::Wreg(2);
                 let w3 = asm::Wreg(3);
-                let desc_off: u16 = 48 + (binding as u16) * 16;
+                let desc_off: u16 = 64 + (binding as u16) * 16;
 
                 let n_spill = live_vregs.len() as u16;
                 let frame_bytes: u16 = 32 + n_spill * 16;
@@ -3675,8 +3691,8 @@ fn emit_function(
                          ImageHandle", image.id)))?;
                 // Sampled-image descriptor table sits at X1
                 // anchored, with slot pitch 16 (tex+samp) and
-                // base offset UNIFORMS_DESC_BASE (= 48).
-                let desc_off: u16 = 48 + (binding as u16) * 16;
+                // base offset UNIFORMS_DESC_BASE (= 64).
+                let desc_off: u16 = 64 + (binding as u16) * 16;
                 let x9 = asm::Xreg(9);
                 a.emit(asm::ldr_x_offset(x9, asm::Xreg(1), desc_off));
                 // TexDesc field offsets: width @8, height @12.
