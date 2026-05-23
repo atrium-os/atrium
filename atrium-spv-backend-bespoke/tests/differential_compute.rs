@@ -2595,7 +2595,7 @@ fn differential_glsl_hyperbolic() {
     let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
     b.begin_block(None).unwrap();
     let mut results: Vec<u32> = Vec::new();
-    let mut emit_one = |ext_op: u32, inputs: &[f32], b: &mut rspirv::dr::Builder, results: &mut Vec<u32>| {
+    let emit_one = |ext_op: u32, inputs: &[f32], b: &mut rspirv::dr::Builder, results: &mut Vec<u32>| {
         for &val in inputs {
             let c = b.constant_bit32(f32_ty, val.to_bits());
             let r = b.ext_inst(f32_ty, None, std_450, ext_op,

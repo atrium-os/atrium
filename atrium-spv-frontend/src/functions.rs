@@ -684,12 +684,16 @@ fn translate_inst(
             id_map, next_value_id, insts, source_spirv_offset,
             |a, b| Op::FSub(a, b),
         ),
-        // OpFMul + OpVectorTimesScalar both lower to
-        // Op::FMul; the backend's emit_float_binop
-        // dispatches on (scalar × scalar) / (vec × vec) /
-        // (vec × scalar with broadcast) by inspecting the
-        // operand storage.
-        SpvOp::FMul | SpvOp::VectorTimesScalar => emit_binop_float(
+        // OpFMul + OpVectorTimesScalar + OpMatrixTimesScalar
+        // all lower to Op::FMul; the backend's
+        // emit_float_binop dispatches on (scalar × scalar) /
+        // (vec × vec) / (vec × scalar with broadcast) by
+        // inspecting the operand storage.  Mat4 × scalar
+        // rides the existing per-column scalar-broadcast path
+        // since a Mat4 is stored as four column vec4s.
+        SpvOp::FMul
+        | SpvOp::VectorTimesScalar
+        | SpvOp::MatrixTimesScalar => emit_binop_float(
             spv_inst, types, constants, iface,
             id_map, next_value_id, insts, source_spirv_offset,
             |a, b| Op::FMul(a, b),
