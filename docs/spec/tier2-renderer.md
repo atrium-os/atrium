@@ -991,8 +991,18 @@ specifically supports:
   hex `0x...`, signed `-N`, or float `f:N.N` literals) and
   mixes the overrides into the cache hash when present so
   specialised builds don't collide with the default-value
-  build in the cache.  `VkSpecializationInfo` parsing in the
-  vk-icd and daemon-side hash extension are still deferred.
+  build in the cache.  `atrium-spv-loader::ShaderCache` and
+  `Tier2Registry` both expose `*_with_spec_overrides`
+  variants that route the overrides through to
+  `atrium-spv-compile --spec-const` and key the in-process
+  registry by the spec-aware hash, so two pipelines
+  specialising the same SPIR-V land on distinct
+  `Tier2ShaderId`s backed by distinct compiled artifacts.
+  Verified end-to-end by a test that runs the same fragment
+  shader at two override settings and observes the runtime
+  colour change.  Only `atrium-vk-icd`-side parsing of
+  `pSpecializationInfo` (turning the host's
+  `VkSpecializationInfo` into the override Vec) remains.
   `OpSpecConstantOp` is folded at frontend constant-context
   build time: the sub-opcode + operand-id list is evaluated
   in Rust against the already-resolved constants, and the

@@ -115,6 +115,113 @@ fn registry_compiles_and_runs_constant_color_shader() {
         "Tier2Registry shader produced {out_color:?}, expected {expected:?}");
 }
 
+/// Build a fragment shader whose red channel is an
+/// `OpSpecConstant float SpecId=0, default=0.25`.  The
+/// green/blue/alpha channels are hard-coded so we can verify
+/// the override flowed without ambiguity.
+fn build_spec_const_red_shader() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::dr::Operand;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let f32_ty = b.type_float(32, None);
+    let vec4_f32 = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let ptr_out = b.type_pointer(None, StorageClass::Output, vec4_f32);
+    let sc_red = b.spec_constant_bit32(f32_ty, 0.25f32.to_bits());
+    b.decorate(sc_red, Decoration::SpecId, vec![Operand::LiteralBit32(0)]);
+    let c_half = b.constant_bit32(f32_ty, 0.5f32.to_bits());
+    let c_zero = b.constant_bit32(f32_ty, 0.0f32.to_bits());
+    let c_one  = b.constant_bit32(f32_ty, 1.0f32.to_bits());
+    let out = b.variable(ptr_out, None, StorageClass::Output, None);
+    b.decorate(out, Decoration::Location, vec![Operand::LiteralBit32(0)]);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    // vec4(sc_red, 0.5, 0.0, 1.0) -- built in the body so we
+    // don't have to deal with OpSpecConstantComposite for
+    // a single-channel override.
+    let color = b.composite_construct(
+        vec4_f32, None, vec![sc_red, c_half, c_zero, c_one]).unwrap();
+    b.store(out, color, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![out]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn registry_spec_constant_override_flows_to_compiled_shader() {
+    // Same SPIR-V, two registrations:
+    //   - default (no overrides)         -> red = 0.25
+    //   - override SpecId 0 -> f:0.9     -> red = 0.9
+    // Verifies that:
+    //   (a) the override actually flows through the daemon-
+    //       side loader path (spawned atrium-spv-compile with
+    //       --spec-const) into runtime behaviour,
+    //   (b) the two registrations get DIFFERENT Tier2ShaderIds
+    //       and DIFFERENT cache hashes (no collision),
+    //   (c) re-registering with the same overrides is
+    //       idempotent (returns the same id).
+    let cache_dir = TempDir::new().unwrap();
+    let config = LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    };
+    let registry = Tier2Registry::new(config);
+    let spirv = build_spec_const_red_shader();
+
+    let id_default = registry.register(&spirv).expect("default register");
+    let red_override: u32 = 0.9f32.to_bits();
+    let id_ov = registry
+        .register_with_spec_overrides(&spirv, &[(0, red_override)])
+        .expect("override register");
+    let id_ov2 = registry
+        .register_with_spec_overrides(&spirv, &[(0, red_override)])
+        .expect("override re-register");
+    assert_ne!(id_default, id_ov,
+        "default and overridden must be distinct ids");
+    assert_eq!(id_ov, id_ov2,
+        "same overrides must be idempotent");
+
+    let run_red = |id: Tier2ShaderId| -> f32 {
+        let loaded = registry.get(id).expect("loaded");
+        let fs_main = loaded.entry_points.fs_main
+            .expect("spec-const-red is a fragment shader");
+        let mut out_color = [0.0f32; 4];
+        let mut out_depth = 0.0f32;
+        unsafe {
+            fs_main(
+                std::ptr::null(), std::ptr::null(), std::ptr::null(),
+                0.0, 0.0, 0.0, 0.0, 0,
+                out_color.as_mut_ptr(), &mut out_depth,
+            );
+        }
+        // sanity-check the un-overridden channels too
+        assert!((out_color[1] - 0.5).abs() < 1e-6, "green stayed 0.5");
+        assert_eq!(out_color[2], 0.0, "blue stayed 0.0");
+        assert_eq!(out_color[3], 1.0, "alpha stayed 1.0");
+        out_color[0]
+    };
+    let red_default = run_red(id_default);
+    let red_specialised = run_red(id_ov);
+    assert!((red_default - 0.25).abs() < 1e-6,
+        "default red should be 0.25, got {red_default}");
+    assert!((red_specialised - 0.9).abs() < 1e-6,
+        "overridden red should be 0.9, got {red_specialised}");
+}
+
 #[test]
 fn registry_idempotent_on_repeated_registration() {
     let cache_dir = TempDir::new().unwrap();

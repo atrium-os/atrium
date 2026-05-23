@@ -81,11 +81,25 @@ impl Tier2Registry {
     /// Idempotent: re-registering the same bytes returns
     /// the same id without recompiling.
     pub fn register(&self, spirv: &[u8]) -> Result<Tier2ShaderId, LoadError> {
-        let hash = ShaderCache::hash(spirv);
+        self.register_with_spec_overrides(spirv, &[])
+    }
+
+    /// Register a SPIR-V module specialised by `overrides`
+    /// (the `VkSpecializationInfo`-style host substitutions
+    /// for `OpSpecConstant`s).  Same (spirv, overrides)
+    /// returns the same id; different override sets get
+    /// distinct ids backed by distinct compiled artifacts.
+    pub fn register_with_spec_overrides(
+        &self,
+        spirv: &[u8],
+        overrides: &[(u32, u32)],
+    ) -> Result<Tier2ShaderId, LoadError> {
+        let hash = ShaderCache::hash_with_spec_overrides(spirv, overrides);
         if let Some(id) = self.by_hash.lock().unwrap().get(&hash).copied() {
             return Ok(id);
         }
-        let loaded = self.cache.load_or_compile(spirv)?;
+        let loaded = self.cache
+            .load_or_compile_with_spec_overrides(spirv, overrides)?;
         let id = {
             let mut n = self.next_id.lock().unwrap();
             let id = Tier2ShaderId(*n);

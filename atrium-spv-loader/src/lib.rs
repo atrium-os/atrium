@@ -135,6 +135,31 @@ impl ShaderCache {
         self.version_dir().join(format!("{hash}.pcmap"))
     }
 
+    /// Compute the content hash for a SPIR-V module *and* a
+    /// set of `VkSpecializationInfo`-style overrides.  The
+    /// override entries are sorted by SpecId for stability,
+    /// then mixed in with a `\0spec\0` separator.  When
+    /// `overrides` is empty this returns exactly the same
+    /// hash [`Self::hash`] would — preserving cache keys for
+    /// callers that don't use spec constants.
+    pub fn hash_with_spec_overrides(
+        spirv: &[u8],
+        overrides: &[(u32, u32)],
+    ) -> String {
+        let mut h = Sha256::new();
+        h.update(spirv);
+        if !overrides.is_empty() {
+            let mut entries = overrides.to_vec();
+            entries.sort_by_key(|(k, _)| *k);
+            h.update(b"\x00spec\x00");
+            for (k, v) in entries {
+                h.update(k.to_le_bytes());
+                h.update(v.to_le_bytes());
+            }
+        }
+        format!("{:x}", h.finalize())
+    }
+
     /// Get a loaded shader, compiling on cache miss.
     ///
     /// This is the load-bearing entry point. Concurrent
@@ -143,7 +168,26 @@ impl ShaderCache {
     pub fn load_or_compile(&self, spirv: &[u8])
         -> Result<Arc<LoadedShader>, LoadError>
     {
-        let hash = Self::hash(spirv);
+        self.load_or_compile_with_spec_overrides(spirv, &[])
+    }
+
+    /// Get a loaded shader, applying `VkSpecializationInfo`
+    /// overrides.  Each override is `(SpecId, value)` where
+    /// `value` is the 32-bit bit pattern the host wants to
+    /// substitute for the SPIR-V `OpSpecConstant`'s declared
+    /// default.  The cache key is hash(spirv) when
+    /// `overrides` is empty, otherwise it folds the
+    /// overrides in (matching `atrium-spv-compile`'s default
+    /// hashing rule) so that two pipelines using the same
+    /// SPIR-V with different overrides land on distinct
+    /// compiled artifacts.
+    pub fn load_or_compile_with_spec_overrides(
+        &self,
+        spirv: &[u8],
+        overrides: &[(u32, u32)],
+    ) -> Result<Arc<LoadedShader>, LoadError>
+    {
+        let hash = Self::hash_with_spec_overrides(spirv, overrides);
 
         // Fast path: already loaded in this process.
         {
@@ -163,7 +207,7 @@ impl ShaderCache {
         let so_path = self.so_path(&hash);
         let pcmap_path = self.pcmap_path(&hash);
         if !blob_path.exists() && !so_path.exists() {
-            self.compile(spirv, &hash)?;
+            self.compile(spirv, &hash, overrides)?;
             if !blob_path.exists() && !so_path.exists() {
                 return Err(LoadError::Internal(format!(
                     "atrium-spv-compile exited 0 but neither {} nor {} exists",
@@ -212,8 +256,16 @@ impl ShaderCache {
         }
     }
 
-    /// Run the compile binary as a subprocess.
-    fn compile(&self, spirv: &[u8], hash: &str) -> Result<(), LoadError> {
+    /// Run the compile binary as a subprocess.  When
+    /// `overrides` is non-empty, each entry is forwarded as a
+    /// `--spec-const SPECID=VALUE` arg (hex-encoded so the
+    /// shell quoting stays trivial).
+    fn compile(
+        &self,
+        spirv: &[u8],
+        hash: &str,
+        overrides: &[(u32, u32)],
+    ) -> Result<(), LoadError> {
         let version_dir = self.version_dir();
         std::fs::create_dir_all(&version_dir).map_err(|e|
             LoadError::Internal(format!(
@@ -230,11 +282,15 @@ impl ShaderCache {
                 "writing {}: {e}", in_path.display(),
             )))?;
 
-        let result = Command::new(&self.config.compile_binary)
-            .arg("--input").arg(&in_path)
+        let mut cmd = Command::new(&self.config.compile_binary);
+        cmd.arg("--input").arg(&in_path)
             .arg("--output-dir").arg(&version_dir)
-            .arg("--hash").arg(hash)
-            .output();
+            .arg("--hash").arg(hash);
+        for (spec_id, value) in overrides {
+            cmd.arg("--spec-const")
+                .arg(format!("{spec_id}=0x{value:08x}"));
+        }
+        let result = cmd.output();
 
         // Clean up the input tempfile regardless of compile
         // outcome.
