@@ -4282,6 +4282,68 @@ fn differential_image_query_levels() {
 }
 
 #[test]
+fn differential_image_query_samples() {
+    // OpImageQuerySamples (Arc 38): no-MSAA world -> constant
+    // 1.  Same shape as ImageQueryLevels above.
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, Dim,
+        ExecutionMode, ExecutionModel, FunctionControl, ImageFormat,
+        MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.capability(Capability::ImageQuery);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let f32_ty = b.type_float(32, None);
+    let v2u    = b.type_vector(u32_ty, 2);
+    let v4f    = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let img_ty = b.type_image(f32_ty, Dim::Dim2D, 0, 0, 0, 2,
+        ImageFormat::Rgba32f, None);
+    let ptr_img = b.type_pointer(None, StorageClass::UniformConstant, img_ty);
+    let img_var = b.variable(ptr_img, None, StorageClass::UniformConstant, None);
+    b.decorate(img_var, Decoration::DescriptorSet, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(img_var, Decoration::Binding,       vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let c_zero_u = b.constant_bit32(u32_ty, 0);
+    let c_zero_f = b.constant_bit32(f32_ty, 0.0f32.to_bits());
+    let c_one_f  = b.constant_bit32(f32_ty, 1.0f32.to_bits());
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let img = b.load(img_ty, None, img_var, None, vec![]).unwrap();
+    let samples = b.image_query_samples(u32_ty, None, img).unwrap();
+    let samples_f = b.convert_u_to_f(f32_ty, None, samples).unwrap();
+    let coord = b.composite_construct(v2u, None,
+        vec![c_zero_u, c_zero_u]).unwrap();
+    let texel = b.composite_construct(v4f, None,
+        vec![samples_f, c_zero_f, c_zero_f, c_one_f]).unwrap();
+    b.image_write(img, coord, texel, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main",
+        vec![img_var]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spv = Vec::with_capacity(words.len() * 4);
+    for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+    let (w, h) = (1u32, 1u32);
+    let mut b_img = vec![0u8; (w * h * 16) as usize];
+    let mut c_img = vec![0u8; (w * h * 16) as usize];
+    let dir = TempDir::new().unwrap();
+    invoke_compute_image(&spv, true,  dir.path(), "b",
+        &mut b_img, w, h, 1, 2, &[(0, 0, 0)]);
+    invoke_compute_image(&spv, false, dir.path(), "c",
+        &mut c_img, w, h, 1, 2, &[(0, 0, 0)]);
+    assert_eq!(b_img, c_img,
+        "OpImageQuerySamples diverges between backends");
+    let r = f32::from_le_bytes(b_img[0..4].try_into().unwrap());
+    assert_eq!(r, 1.0, "textureSamples(non-MSAA) should be 1, got {r}");
+}
+
+#[test]
 fn differential_storage_image_query_size_2d() {
     // imageSize on a 5x3 R32f image2D, then imageStore the
     // width into texel (0,0) and the height into texel (1,0).

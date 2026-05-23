@@ -1165,6 +1165,13 @@ specifically supports:
   mirrors the divide.  No new helpers, no backend changes.
   Currently 2D-Proj only (vec3→vec2 coord); cube/3D-Proj
   paths are gated by the unsupported divided-lane-count error.
+  `textureQueryLod` / `textureSamples` (Arc 38): both lower
+  at the frontend to constants — `OpImageQueryLod` →
+  `Op::ConstVec([0.0, 0.0])` (no derivatives, so lod = 0 and
+  clamped-lod = 0); `OpImageQuerySamples` → `Op::ConstInt(1)`
+  (no MSAA).  Interpreter adds matching `Op::ImageQueryLod`
+  + `Op::ImageQuerySamples` short-circuits so all three
+  runners agree.  No backend changes.
   `textureSize(sampler2D, lod)` (Arc 34): a new IR op
   `Op::SampledImageQuerySizeLod { image, lod }` is emitted
   by the frontend for `OpImageQuerySizeLod`.  Both backends

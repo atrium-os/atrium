@@ -1904,6 +1904,72 @@ fn translate_inst(
             Ok(())
         }
 
+        // OpImageQueryLod (Arc 38): textureQueryLod(sampler, uv).
+        // Returns a vec2(lod_from_derivatives, clamped_lod).
+        // Atrium's Tier-2 has no 2x2 quad dispatch so the
+        // derivatives are zero -> the LOD is zero too;
+        // clamped LOD is also zero (mip 0 is always in range).
+        // Both lanes lower to 0.0f.  No IR op needed.
+        SpvOp::ImageQueryLod => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed(
+                    "ImageQueryLod without result id".to_string()))?;
+            let result_type_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed(
+                    "ImageQueryLod without result type".to_string()))?;
+            let result_ty = types.get(result_type_id)?.clone();
+            // Synthesize the two f32 zero lanes.
+            let mut lanes = Vec::with_capacity(2);
+            for _ in 0..2 {
+                let id = ValueId(*next_value_id);
+                *next_value_id += 1;
+                let v = Value { id, ty: Type::F32 };
+                insts.push(Inst {
+                    op: Op::ConstFloat {
+                        value: 0.0,
+                        kind: atrium_spv_ir::FloatKind::F32,
+                    },
+                    result: Some(v.clone()),
+                    source_spirv_offset,
+                });
+                lanes.push(v);
+            }
+            let result = alloc_or_get_result(
+                result_id, result_ty, id_map, next_value_id);
+            insts.push(Inst {
+                op: Op::ConstVec(lanes),
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
+
+        // OpImageQuerySamples (Arc 38): textureSamples(image).
+        // Returns the sample count; v1 has no MSAA so the
+        // answer is the constant 1.  Same shape as the
+        // ImageQueryLevels lowering above.
+        SpvOp::ImageQuerySamples => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed(
+                    "ImageQuerySamples without result id".to_string()))?;
+            let result_type_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed(
+                    "ImageQuerySamples without result type".to_string()))?;
+            let result_ty = types.get(result_type_id)?.clone();
+            let kind = match result_ty {
+                Type::U32 => atrium_spv_ir::IntKind::U32,
+                _ => atrium_spv_ir::IntKind::I32,
+            };
+            let result = alloc_or_get_result(
+                result_id, result_ty, id_map, next_value_id);
+            insts.push(Inst {
+                op: Op::ConstInt { value: 1, kind },
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
+
         // OpImageTexelPointer: form a pointer to a single
         // storage-image texel so a subsequent atomic op can
         // read-modify-write it.  Operands:

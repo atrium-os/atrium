@@ -1329,6 +1329,24 @@ impl Interpreter {
             // Image Operands + Lod after; v1 ignores them
             // (the runtime's atrium_tex_fetch_2d takes lod
             // but doesn't read it yet).
+            // OpImageQueryLod (Arc 38): derivative-free Tier-2
+            // returns vec2(0, 0).
+            Op::ImageQueryLod => {
+                let result_id = inst.result_id.ok_or_else(||
+                    InterpError::BadConstant(0))?;
+                values.insert(result_id, ConstantValue::Vec(vec![
+                    ConstantValue::F32(0.0),
+                    ConstantValue::F32(0.0),
+                ]));
+                return Ok(());
+            }
+            // OpImageQuerySamples (Arc 38): no MSAA -> 1.
+            Op::ImageQuerySamples => {
+                let result_id = inst.result_id.ok_or_else(||
+                    InterpError::BadConstant(0))?;
+                values.insert(result_id, ConstantValue::Int(1));
+                return Ok(());
+            }
             Op::ImageFetch => {
                 let result_id = inst.result_id.ok_or_else(||
                     InterpError::BadConstant(0))?;
