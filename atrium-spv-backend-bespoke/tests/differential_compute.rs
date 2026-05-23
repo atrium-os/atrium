@@ -6173,6 +6173,88 @@ fn differential_glsl_pack_unpack_unorm2x16() {
 }
 
 #[test]
+fn differential_derivative_ops_return_zero() {
+    // OpDPdx / OpDPdy / OpFwidth (+ Fine / Coarse) collapse
+    // to zero in Tier-2 (no 2x2 quad in the dispatcher).
+    // ssbo[0] = bitcast<u32>(dFdx(7.5))   -> 0
+    // ssbo[1] = bitcast<u32>(dFdy(7.5))   -> 0
+    // ssbo[2] = bitcast<u32>(fwidth(7.5)) -> 0
+    use rspirv::binary::Assemble;
+    use rspirv::dr::{Instruction, Operand};
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, Op as SpvOp,
+        StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let f32_ty = b.type_float(32, None);
+    let void_fn = b.type_function(void, vec![]);
+    let rt = b.type_runtime_array(u32_ty);
+    b.decorate(rt, Decoration::ArrayStride, vec![Operand::LiteralBit32(4)]);
+    let s = b.type_struct(vec![rt]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset, vec![Operand::LiteralBit32(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_u = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+    let ssbo = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet, vec![Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding,       vec![Operand::LiteralBit32(0)]);
+    let c_zero  = b.constant_bit32(u32_ty, 0);
+    let c_one   = b.constant_bit32(u32_ty, 1);
+    let c_two   = b.constant_bit32(u32_ty, 2);
+    let c_x     = b.constant_bit32(f32_ty, 7.5f32.to_bits());
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    // Emit OpDPdx %f32 %r %x by raw instruction (rspirv
+    // builder method exists but constructing inline is
+    // explicit about the encoding).
+    let emit_derivative = |b: &mut rspirv::dr::Builder, op: SpvOp,
+                            x: u32| -> u32 {
+        let id = b.id();
+        let inst = Instruction::new(op, Some(f32_ty), Some(id),
+            vec![Operand::IdRef(x)]);
+        b.insert_into_block(rspirv::dr::InsertPoint::End, inst).unwrap();
+        id
+    };
+    let dx_id = emit_derivative(&mut b, SpvOp::DPdx,   c_x);
+    let dy_id = emit_derivative(&mut b, SpvOp::DPdy,   c_x);
+    let fw_id = emit_derivative(&mut b, SpvOp::Fwidth, c_x);
+    let dx_u = b.bitcast(u32_ty, None, dx_id).unwrap();
+    let dy_u = b.bitcast(u32_ty, None, dy_id).unwrap();
+    let fw_u = b.bitcast(u32_ty, None, fw_id).unwrap();
+    let p0 = b.access_chain(ptr_u, None, ssbo, vec![c_zero, c_zero]).unwrap();
+    b.store(p0, dx_u, None, vec![]).unwrap();
+    let p1 = b.access_chain(ptr_u, None, ssbo, vec![c_zero, c_one]).unwrap();
+    b.store(p1, dy_u, None, vec![]).unwrap();
+    let p2 = b.access_chain(ptr_u, None, ssbo, vec![c_zero, c_two]).unwrap();
+    b.store(p2, fw_u, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spv = Vec::with_capacity(words.len() * 4);
+    for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+    let dir = TempDir::new().unwrap();
+    let mut b_buf = vec![0u8; 12];
+    let mut c_buf = vec![0u8; 12];
+    invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
+    invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+    assert_eq!(b_buf, c_buf,
+        "derivative ops diverge between backends");
+    let at = |i: usize| f32::from_bits(u32::from_le_bytes(
+        b_buf[i*4..i*4+4].try_into().unwrap()));
+    assert_eq!(at(0), 0.0, "dFdx(7.5) should be 0");
+    assert_eq!(at(1), 0.0, "dFdy(7.5) should be 0");
+    assert_eq!(at(2), 0.0, "fwidth(7.5) should be 0");
+}
+
+#[test]
 fn differential_glsl_round_even() {
     // RoundEven (#2): round-half-to-even (banker's).
     // Ties go to the even neighbour; non-tie values round

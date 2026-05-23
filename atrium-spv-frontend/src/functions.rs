@@ -1383,6 +1383,72 @@ fn translate_inst(
         // image — fetch doesn't use the sampler), second is
         // the integer coord. Optional Lod via the Image
         // Operands mask is read from operand index 2+.
+        // OpDPdx / OpDPdy / OpFwidth (+ Fine / Coarse
+        // variants) -- pixel-quad derivatives.  Tier-2's
+        // dispatcher runs invocations serially (no 2×2
+        // quad), so no real derivative is computable.  We
+        // lower every derivative op to a zero of the result
+        // type so shaders that use them defensively still
+        // compile (with implicit-LOD sampling collapsing to
+        // mip 0, which already matches our sampler-side
+        // behaviour).  Real quad-dispatch is a dispatcher
+        // refactor, deferred.
+        SpvOp::DPdx | SpvOp::DPdy | SpvOp::Fwidth
+        | SpvOp::DPdxFine | SpvOp::DPdyFine | SpvOp::FwidthFine
+        | SpvOp::DPdxCoarse | SpvOp::DPdyCoarse | SpvOp::FwidthCoarse => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed(
+                    "derivative op without result id".to_string()))?;
+            let result_type_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed(
+                    "derivative op without result type".to_string()))?;
+            let result_ty = types.get(result_type_id)?.clone();
+            // Force the operand to materialise so its
+            // last-use bookkeeping doesn't think it's dead
+            // (the value is consumed even though the result
+            // discards it).
+            let x_id = expect_id(&spv_inst.operands, 0)?;
+            let _x = resolve_value(x_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            // Build a zero of result_ty.
+            let result = alloc_or_get_result(
+                result_id, result_ty.clone(), id_map, next_value_id);
+            let op = match &result_ty {
+                Type::F32 => Op::ConstFloat {
+                    value: 0.0,
+                    kind: atrium_spv_ir::FloatKind::F32 },
+                Type::Vec2(_) | Type::Vec3(_) | Type::Vec4(_) => {
+                    let n = match &result_ty {
+                        Type::Vec2(_) => 2,
+                        Type::Vec3(_) => 3,
+                        Type::Vec4(_) => 4,
+                        _ => unreachable!(),
+                    };
+                    let mut lanes = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let v = Value { id, ty: Type::F32 };
+                        insts.push(Inst {
+                            op: Op::ConstFloat {
+                                value: 0.0,
+                                kind: atrium_spv_ir::FloatKind::F32 },
+                            result: Some(v.clone()),
+                            source_spirv_offset,
+                        });
+                        lanes.push(v);
+                    }
+                    Op::ConstVec(lanes)
+                }
+                other => return Err(FrontendError::Unsupported(format!(
+                    "derivative op with non-float result type {other:?}"))),
+            };
+            insts.push(Inst {
+                op, result: Some(result), source_spirv_offset,
+            });
+            Ok(())
+        }
+
         // OpImageGather: textureGather(sampler, coord,
         // component).  Operands: [sampled_image, coord,
         // component, (image-operands mask...)].

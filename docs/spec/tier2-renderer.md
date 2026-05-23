@@ -1139,6 +1139,13 @@ specifically supports:
   `0..3`.  `UNIFORMS_DESC_BASE` grew 24 → 32 → 40 → 48.
   Array/Cube + ExplicitLod combos are
   deferred (would need `_array_lod` / `_cube_lod` helpers).
+  Pixel-quad derivatives (Arc 33): `OpDPdx` / `OpDPdy` /
+  `OpFwidth` (+ Fine / Coarse variants) lower at the frontend
+  to a zero of the result type (no 2×2 quad in the
+  dispatcher).  Shaders that defensively use derivatives
+  compile; sampler implicit-LOD continues to collapse to
+  mip 0.  Real quad dispatch is a dispatcher refactor and
+  is deferred.
   MVP scope: Rgba8Unorm / R32Float / Rgba32Float.  Mip-
   level storage images are supported via `OpImageRead` /
   `OpImageWrite` with `Image-Operands::Lod`: the runtime

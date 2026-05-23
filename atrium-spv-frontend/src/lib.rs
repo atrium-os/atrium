@@ -131,7 +131,10 @@ pub fn translate_with_spec_overrides(
                 | C::GroupNonUniformClustered
                 | C::GroupNonUniformQuad
                 // textureQueryLevels / textureSize etc.
-                | C::ImageQuery);
+                | C::ImageQuery
+                // dFdxFine / dFdyCoarse etc. -- lowered to
+                // zero (no quad dispatch), Arc 33.
+                | C::DerivativeControl);
             if !accepted {
                 return Err(FrontendError::Unsupported(format!(
                     "capability {cap:?} not supported in phase-1 v1",
