@@ -55,6 +55,11 @@ pub struct Tier2Registry {
     /// keep the dlopened library alive for the registry's
     /// lifetime.
     by_id: Mutex<HashMap<Tier2ShaderId, Arc<LoadedShader>>>,
+    /// Tier2ShaderId → raw SPIR-V bytes that produced it.
+    /// Used by the daemon to re-compile with
+    /// `VkSpecializationInfo`-style overrides at pipeline-
+    /// create time without re-uploading the module.
+    spirv_by_id: Mutex<HashMap<Tier2ShaderId, Arc<Vec<u8>>>>,
     /// Monotonic id allocator.
     next_id: Mutex<u64>,
 }
@@ -69,6 +74,7 @@ impl Tier2Registry {
             cache: Arc::new(ShaderCache::new(config)),
             by_hash: Mutex::new(HashMap::new()),
             by_id: Mutex::new(HashMap::new()),
+            spirv_by_id: Mutex::new(HashMap::new()),
             next_id: Mutex::new(1),
         }
     }
@@ -108,7 +114,18 @@ impl Tier2Registry {
         };
         self.by_hash.lock().unwrap().insert(hash, id);
         self.by_id.lock().unwrap().insert(id, loaded);
+        self.spirv_by_id.lock().unwrap()
+            .insert(id, Arc::new(spirv.to_vec()));
         Ok(id)
+    }
+
+    /// Retrieve the SPIR-V bytes that produced this shader
+    /// id, if still registered.  Used by the daemon at
+    /// pipeline-create time to specialise an already-uploaded
+    /// shader against host-supplied spec-constant overrides
+    /// without the ICD re-sending the module.
+    pub fn get_spirv(&self, id: Tier2ShaderId) -> Option<Arc<Vec<u8>>> {
+        self.spirv_by_id.lock().unwrap().get(&id).cloned()
     }
 
     /// Look up a registered shader. `None` if the id has
@@ -127,6 +144,7 @@ impl Tier2Registry {
             // because we don't index the other direction).
             let mut by_hash = self.by_hash.lock().unwrap();
             by_hash.retain(|_h, v| *v != id);
+            self.spirv_by_id.lock().unwrap().remove(&id);
         }
     }
 

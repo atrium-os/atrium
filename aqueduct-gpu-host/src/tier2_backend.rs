@@ -535,7 +535,7 @@ impl Tier2Backend {
         -> Option<(Tier2ShaderId, Tier2ComputeStateBlob)>
     {
         self.pipeline_compute.lock().unwrap()
-            .get(&pipeline_id.raw()).copied()
+            .get(&pipeline_id.raw()).cloned()
     }
 
     /// Cumulative count of `cs_main` invocations driven by
@@ -704,7 +704,7 @@ impl Tier2Backend {
                         state.tier2_shader    = pipeline_shaders.get(&raw).copied();
                         state.tier2_vs_shader = pipeline_vs_shaders.get(&raw).copied();
                         state.raster          = pipeline_raster.get(&raw).copied();
-                        state.tier2_compute   = pipeline_compute.get(&raw).copied();
+                        state.tier2_compute   = pipeline_compute.get(&raw).cloned();
                     } else {
                         log::warn!("BindPipeline body too short ({} bytes)", body.len());
                     }
@@ -1125,7 +1125,7 @@ impl Tier2Backend {
     /// (graphics pipeline bound + Dispatch is a guest bug; we
     /// log and skip).
     fn dispatch_compute(&self, state: &PassState, cmd: DispatchCmd) {
-        let Some((shader_id, cs_state)) = state.tier2_compute else {
+        let Some((shader_id, cs_state)) = state.tier2_compute.clone() else {
             self.draws_skipped.fetch_add(1, Ordering::Relaxed);
             log::debug!("Dispatch skipped: no Tier-2 compute pipeline bound");
             return;
@@ -1399,7 +1399,7 @@ impl Tier2Backend {
                             body[0], body[1], body[2], body[3],
                         ]);
                         state.pipeline_raw = Some(raw);
-                        state.tier2_compute = pipeline_compute.get(&raw).copied();
+                        state.tier2_compute = pipeline_compute.get(&raw).cloned();
                     }
                 }
                 FrameOp::PushConstants => {

@@ -513,7 +513,14 @@ impl Session {
         } else if matches!(req.kind, PipelineKind::Compute) {
             // Compute pipelines: shaders[0] is the CS; the
             // state_blob (if present) is a Tier2ComputeStateBlob
-            // carrying the workgroup local-size triple.
+            // carrying the workgroup local-size triple plus
+            // VkSpecializationInfo-style spec-constant
+            // overrides.  If the blob has non-empty
+            // spec_overrides, re-register the underlying
+            // SPIR-V through Tier2Registry::register_with_spec_overrides
+            // so the specialised compile lands a distinct
+            // Tier2ShaderId backed by the override-aware
+            // compiled artifact.
             if let Some(cs_sid) = req.shaders.first().copied() {
                 if let Some(rec) = self.table.get_shader(cs_sid) {
                     if let Some(tier2) = rec.tier2_id {
@@ -526,8 +533,45 @@ impl Session {
                                 aqueduct_gpu::Tier2ComputeStateBlob,
                             >(&req.state_blob).unwrap_or_default()
                         };
+                        let effective_tier2 = if cs_state.spec_overrides.is_empty() {
+                            tier2
+                        } else if let Some(registry) = &self.tier2_registry {
+                            // Look up the original SPIR-V by
+                            // the un-specialised id, then
+                            // produce / fetch the specialised
+                            // compile.  On any failure
+                            // (missing SPIR-V, compile error)
+                            // we fall back to the un-overridden
+                            // shader so the pipeline still
+                            // binds -- correctness will then
+                            // be wrong but the app gets a
+                            // visible degradation rather than
+                            // a silent skip.
+                            match registry.get_spirv(tier2) {
+                                Some(spv) => {
+                                    match registry.register_with_spec_overrides(
+                                        &spv, &cs_state.spec_overrides) {
+                                        Ok(specialised) => specialised,
+                                        Err(e) => {
+                                            log::warn!(
+                                                "spec-constant specialisation failed \
+                                                 ({e:?}); using un-specialised shader");
+                                            tier2
+                                        }
+                                    }
+                                }
+                                None => {
+                                    log::warn!(
+                                        "spec-constant override requested but \
+                                         original SPIR-V not retained for shader {tier2:?}");
+                                    tier2
+                                }
+                            }
+                        } else {
+                            tier2
+                        };
                         self.backend.bind_pipeline_tier2_compute(
-                            req.pipeline_id, tier2, cs_state);
+                            req.pipeline_id, effective_tier2, cs_state);
                     }
                 }
             }

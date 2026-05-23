@@ -5007,12 +5007,46 @@ pub unsafe extern "C" fn vkCreateComputePipelines(
         };
         let Some(cs_rid) = cs_rid else { continue };
 
+        // Parse VkSpecializationInfo if the host supplied one.
+        // Vulkan's SpecializationMapEntry { constantID, offset,
+        // size } slices the host's pData buffer.  Tier-2's
+        // compile pipeline accepts 32-bit overrides; sizes
+        // other than 1/2/4 fall back to a zero-padded read
+        // into a u32 LE bit pattern.  Bool spec constants
+        // accept any non-zero byte as `true`.
+        let mut spec_overrides: Vec<(u32, u32)> = Vec::new();
+        if !info.stage.p_specialization_info.is_null() {
+            let sp = &*info.stage.p_specialization_info;
+            if !sp.p_map_entries.is_null() && sp.map_entry_count > 0 {
+                let data_slice = if !sp.p_data.is_null() && sp.data_size > 0 {
+                    std::slice::from_raw_parts(
+                        sp.p_data as *const u8, sp.data_size)
+                } else {
+                    &[]
+                };
+                let entries = std::slice::from_raw_parts(
+                    sp.p_map_entries, sp.map_entry_count as usize);
+                for entry in entries {
+                    let off = entry.offset as usize;
+                    let sz = entry.size;
+                    if off > data_slice.len() {
+                        continue;
+                    }
+                    let avail = data_slice.len() - off;
+                    let take = sz.min(avail).min(4);
+                    let mut bytes = [0u8; 4];
+                    bytes[..take].copy_from_slice(&data_slice[off..off + take]);
+                    spec_overrides.push((entry.constant_id, u32::from_le_bytes(bytes)));
+                }
+            }
+        }
         let blob = aqueduct_gpu::Tier2ComputeStateBlob {
             local_size_x: local_size.map(|(x, _, _)| x).unwrap_or(1),
             local_size_y: local_size.map(|(_, y, _)| y).unwrap_or(1),
             local_size_z: local_size.map(|(_, _, z)| z).unwrap_or(1),
             ssbo_binding_count,
             workgroup_size,
+            spec_overrides,
         };
         let Ok(bytes) = postcard::to_allocvec(&blob) else { continue };
 

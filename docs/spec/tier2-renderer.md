@@ -1000,9 +1000,18 @@ specifically supports:
   `Tier2ShaderId`s backed by distinct compiled artifacts.
   Verified end-to-end by a test that runs the same fragment
   shader at two override settings and observes the runtime
-  colour change.  Only `atrium-vk-icd`-side parsing of
-  `pSpecializationInfo` (turning the host's
-  `VkSpecializationInfo` into the override Vec) remains.
+  colour change.  `atrium-vk-icd` now parses the `VkSpecializationInfo`
+  attached to `VkPipelineShaderStageCreateInfo` and forwards
+  every `(constantID, value)` entry on the pipeline-create
+  envelope (Tier2ComputeStateBlob's `spec_overrides` field).
+  The daemon's session handler retains the original SPIR-V
+  per `Tier2ShaderId` so it can call
+  `Tier2Registry::register_with_spec_overrides` at pipeline-
+  create time without the ICD re-uploading the module.  End-
+  to-end verified by a test that dispatches a shader writing
+  a `OpSpecConstant uint` to an SSBO under
+  `VkSpecializationInfo {0 -> 0xCAFEBABE}` and observes the
+  override value land in `ssbo[0]` (vs the SPIR-V default).
   `OpSpecConstantOp` is folded at frontend constant-context
   build time: the sub-opcode + operand-id list is evaluated
   in Rust against the already-resolved constants, and the

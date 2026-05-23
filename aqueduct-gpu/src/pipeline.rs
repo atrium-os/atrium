@@ -205,7 +205,7 @@ impl Default for Tier2BlendState {
 /// `LocalSize` (workgroup dimensions) since the Tier-2
 /// dispatcher needs it to drive the (groupCount ×
 /// local_size) invocation loop without re-parsing SPIR-V.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tier2ComputeStateBlob {
     /// `local_size_x` from the SPIR-V `LocalSize` execution
     /// mode (or `LocalSizeId` for spec-constant sizing).
@@ -228,6 +228,15 @@ pub struct Tier2ComputeStateBlob {
     /// buffer of this size per worker thread and passes its
     /// base pointer as the 10th cs_main argument.
     pub workgroup_size: u32,
+    /// `VkSpecializationInfo` overrides for this pipeline
+    /// stage: each `(SpecId, value)` substitutes the host's
+    /// 32-bit bit pattern for the SPIR-V `OpSpecConstant`'s
+    /// declared default.  Empty = no specialisation (the
+    /// SPIR-V defaults apply).  The daemon routes a non-
+    /// empty list through `Tier2Registry::register_with_spec_overrides`,
+    /// which produces a distinct compiled artifact + ID per
+    /// `(spirv, overrides)` pair.
+    pub spec_overrides: Vec<(u32, u32)>,
 }
 
 impl Default for Tier2ComputeStateBlob {
@@ -238,6 +247,7 @@ impl Default for Tier2ComputeStateBlob {
             local_size_x: 1, local_size_y: 1, local_size_z: 1,
             ssbo_binding_count: 0,
             workgroup_size: 0,
+            spec_overrides: Vec::new(),
         }
     }
 }
