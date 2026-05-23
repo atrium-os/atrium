@@ -4071,7 +4071,9 @@ fn invoke_compute_image(
 ) {
     use atrium_spv_runtime::{
         ImageDesc, image_table_buffer, write_image_helper_pointers,
-        write_image_descriptor_slot, atrium_img_read_2d, atrium_img_write_2d,
+        write_image_descriptor_slot,
+        atrium_img_read_2d, atrium_img_write_2d,
+        atrium_img_read_3d, atrium_img_write_3d,
     };
     let module = translate(spv).expect("frontend");
     let obj = if use_bespoke {
@@ -4104,7 +4106,9 @@ fn invoke_compute_image(
     let mut table = image_table_buffer(1);
     unsafe {
         write_image_helper_pointers(
-            &mut table, atrium_img_read_2d, atrium_img_write_2d);
+            &mut table,
+            atrium_img_read_2d, atrium_img_write_2d,
+            atrium_img_read_3d, atrium_img_write_3d);
         write_image_descriptor_slot(&mut table, 0, &img as *const _);
     }
     let table_base = table.as_ptr() as *const u8;
@@ -4202,6 +4206,91 @@ fn differential_storage_image_write() {
             assert_eq!(read(&b_img, x, y, 3), 1.0,      "texel ({x},{y}).a");
         }
     }
+}
+
+#[test]
+fn differential_storage_image_3d_write() {
+    // image3D imageStore via the 3D helper path: a 2×2×2
+    // Rgba32f storage image, one invocation per texel writes
+    // vec4(gid.x, gid.y, gid.z, 1.0).  Exercises the 3D
+    // helper call sequence — bespoke loads helper @ #16
+    // (read_3d) / #24 (write_3d) and passes z in W3, rgba
+    // in X4; Cranelift goes through the same table via
+    // call_indirect with the 5-arg signature.
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, Dim,
+        ExecutionMode, ExecutionModel, FunctionControl, ImageFormat,
+        MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let f32_ty = b.type_float(32, None);
+    let v3u    = b.type_vector(u32_ty, 3);
+    let v4f    = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    // 3D storage image, f32, sampled=2, Rgba32f.
+    let img_ty = b.type_image(f32_ty, Dim::Dim3D, 0, 0, 0, 2,
+        ImageFormat::Rgba32f, None);
+    let ptr_img = b.type_pointer(None, StorageClass::UniformConstant, img_ty);
+    let img_var = b.variable(ptr_img, None, StorageClass::UniformConstant, None);
+    b.decorate(img_var, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(img_var, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_v3u_in = b.type_pointer(None, StorageClass::Input, v3u);
+    let gid_var = b.variable(ptr_v3u_in, None, StorageClass::Input, None);
+    b.decorate(gid_var, Decoration::BuiltIn,
+        vec![rspirv::dr::Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+    let c_one_f = b.constant_bit32(f32_ty, 1.0f32.to_bits());
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let gid = b.load(v3u, None, gid_var, None, vec![]).unwrap();
+    let gx = b.composite_extract(u32_ty, None, gid, vec![0]).unwrap();
+    let gy = b.composite_extract(u32_ty, None, gid, vec![1]).unwrap();
+    let gz = b.composite_extract(u32_ty, None, gid, vec![2]).unwrap();
+    let fx = b.convert_u_to_f(f32_ty, None, gx).unwrap();
+    let fy = b.convert_u_to_f(f32_ty, None, gy).unwrap();
+    let fz = b.convert_u_to_f(f32_ty, None, gz).unwrap();
+    let texel = b.composite_construct(v4f, None,
+        vec![fx, fy, fz, c_one_f]).unwrap();
+    let img = b.load(img_ty, None, img_var, None, vec![]).unwrap();
+    b.image_write(img, gid, texel, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main",
+        vec![img_var, gid_var]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spv = Vec::with_capacity(words.len() * 4);
+    for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+
+    let (w, h, d) = (2u32, 2u32, 2u32);
+    let gids: Vec<(u32, u32, u32)> = (0..d).flat_map(|z|
+        (0..h).flat_map(move |y| (0..w).map(move |x| (x, y, z)))).collect();
+    let mut b_img = vec![0u8; (w * h * d * 16) as usize];
+    let mut c_img = vec![0u8; (w * h * d * 16) as usize];
+    let dir = TempDir::new().unwrap();
+    invoke_compute_image(&spv, true,  dir.path(), "b",
+        &mut b_img, w, h, d, 2, &gids);
+    invoke_compute_image(&spv, false, dir.path(), "c",
+        &mut c_img, w, h, d, 2, &gids);
+    assert_eq!(b_img, c_img,
+        "image3D write diverges between backends");
+    let read = |buf: &[u8], x: u32, y: u32, z: u32, c: usize| -> f32 {
+        let off = ((z * w * h + y * w + x) as usize) * 16 + c * 4;
+        f32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
+    };
+    for z in 0..d { for y in 0..h { for x in 0..w {
+        assert_eq!(read(&b_img, x, y, z, 0), x as f32);
+        assert_eq!(read(&b_img, x, y, z, 1), y as f32);
+        assert_eq!(read(&b_img, x, y, z, 2), z as f32);
+        assert_eq!(read(&b_img, x, y, z, 3), 1.0);
+    }}}
 }
 
 #[test]

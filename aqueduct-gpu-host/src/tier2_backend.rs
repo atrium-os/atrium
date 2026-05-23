@@ -1206,7 +1206,9 @@ impl Tier2Backend {
                 atrium_spv_runtime::write_image_helper_pointers(
                     &mut image_table,
                     atrium_spv_runtime::atrium_img_read_2d,
-                    atrium_spv_runtime::atrium_img_write_2d);
+                    atrium_spv_runtime::atrium_img_write_2d,
+                    atrium_spv_runtime::atrium_img_read_3d,
+                    atrium_spv_runtime::atrium_img_write_3d);
                 for (binding, maybe_idx) in slot_of.iter().enumerate() {
                     if let Some(idx) = maybe_idx {
                         atrium_spv_runtime::write_image_descriptor_slot(

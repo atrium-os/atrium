@@ -1722,10 +1722,14 @@ impl FnTranslator {
             // OpImageRead / OpImageWrite — storage-image
             // access (compute).  The image descriptor table
             // is a SEPARATE table in params[0] (the compute
-            // `uniforms` slot, otherwise null): helper ptr at
-            // [tbl, #0] (read) / #8 (write), ImageDesc* at
-            // [tbl, #16 + binding*8].  Helper signature:
-            //   (ImageDesc*, x:i32, y:i32, rgba:*f32)
+            // `uniforms` slot, otherwise null):
+            //   helper ptr  at [tbl, #0]  (read_2d)
+            //                  [tbl, #8]  (write_2d)
+            //                  [tbl, #16] (read_3d)
+            //                  [tbl, #24] (write_3d)
+            //   ImageDesc*  at [tbl, #32 + binding*8]
+            // 2D helper signature: (ImageDesc*, x, y, rgba*)
+            // 3D helper signature: (ImageDesc*, x, y, z, rgba*)
             // Cranelift's call_indirect handles caller-saved
             // spilling around the call automatically.
             Op::ImageRead { image, coord }
@@ -1741,16 +1745,23 @@ impl FnTranslator {
                         "Image op coord {:?} not a vector", coord.id)))?;
                 if coord_lanes.len() < 2 {
                     return Err(BackendError::Unsupported(format!(
-                        "Image op 2D coord must have ≥2 lanes, got {}",
+                        "Image op coord must have ≥2 lanes, got {}",
                         coord_lanes.len())));
                 }
+                let is_3d = coord_lanes.len() >= 3;
                 let x = coord_lanes[0];
                 let y = coord_lanes[1];
+                let z = if is_3d { Some(coord_lanes[2]) } else { None };
                 let pointer_type = builder.func.dfg
                     .value_type(self.params[0]);
                 let img_table = self.params[0];
-                let helper_off: i32 = if is_write { 8 } else { 0 };
-                let desc_off: i32 = 16 + (binding as i32) * 8;
+                let helper_off: i32 = match (is_3d, is_write) {
+                    (false, false) => 0,
+                    (false, true)  => 8,
+                    (true,  false) => 16,
+                    (true,  true)  => 24,
+                };
+                let desc_off: i32 = 32 + (binding as i32) * 8;
                 let fn_ptr = builder.ins().load(
                     pointer_type, MemFlags::new(), img_table, helper_off);
                 let desc_ptr = builder.ins().load(
@@ -1763,8 +1774,14 @@ impl FnTranslator {
                 call_sig.params.push(AbiParam::new(pointer_type));
                 call_sig.params.push(AbiParam::new(clif_types::I32));
                 call_sig.params.push(AbiParam::new(clif_types::I32));
+                if is_3d {
+                    call_sig.params.push(AbiParam::new(clif_types::I32));
+                }
                 call_sig.params.push(AbiParam::new(pointer_type));
                 let sig_ref = builder.import_signature(call_sig);
+                let mut call_args: Vec<ClifValue> = vec![desc_ptr, x, y];
+                if let Some(z) = z { call_args.push(z); }
+                call_args.push(rgba_ptr);
                 if is_write {
                     // Pack the 4 texel lanes into the slot.
                     let texel = match &inst.op {
@@ -1784,11 +1801,11 @@ impl FnTranslator {
                             MemFlags::new(), *l, rgba_ptr, (i as i32) * 4);
                     }
                     builder.ins().call_indirect(
-                        sig_ref, fn_ptr, &[desc_ptr, x, y, rgba_ptr]);
+                        sig_ref, fn_ptr, &call_args);
                     Ok(())
                 } else {
                     builder.ins().call_indirect(
-                        sig_ref, fn_ptr, &[desc_ptr, x, y, rgba_ptr]);
+                        sig_ref, fn_ptr, &call_args);
                     let result = inst.result.as_ref().ok_or_else(||
                         BackendError::Internal(
                             "ImageRead without result".to_string()))?;

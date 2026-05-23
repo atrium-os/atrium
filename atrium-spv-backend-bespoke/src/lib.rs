@@ -3363,8 +3363,9 @@ fn emit_function(
                             "ImageTexelPointer coord lane 2 {:?} not \
                              in ints", coord_lanes[2].id)))?)
                 } else { None };
-                // ImageDesc* lives at [X19, #16 + binding*8].
-                let desc_off: u16 = 16 + (binding as u16) * 8;
+                // ImageDesc* lives at [X19, #32 + binding*8]
+                // (the helper header is 32 B: 2D r/w + 3D r/w).
+                let desc_off: u16 = 32 + (binding as u16) * 8;
                 let dst_w = int_pool.alloc(result.id)?;
                 let dst_x = asm::Xreg(dst_w.0);
                 let x9 = asm::Xreg(9);
@@ -3396,11 +3397,17 @@ fn emit_function(
             // OpImageRead / OpImageWrite — storage-image
             // access in a compute shader.  v1-ABI call via
             // the X19-anchored image descriptor table:
-            //   helper ptr   at [X19, #0]  (read) / #8 (write)
-            //   ImageDesc*   at [X19, #16 + binding*8]
-            // Helper signature (both):
-            //   (ImageDesc*, x:i32, y:i32, rgba:*f32)
-            // -> X0=desc, W1=x, W2=y, X3=rgba stack slot.
+            //   helper ptr   at [X19, #0]  (read_2d)
+            //                  [X19, #8]  (write_2d)
+            //                  [X19, #16] (read_3d)
+            //                  [X19, #24] (write_3d)
+            //   ImageDesc*   at [X19, #32 + binding*8]
+            // 2D helper signature: (ImageDesc*, x, y, rgba*)
+            //   -> X0=desc, W1=x, W2=y, X3=rgba stack slot.
+            // 3D helper signature: (ImageDesc*, x, y, z, rgba*)
+            //   -> X0=desc, W1=x, W2=y, W3=z, X4=rgba slot.
+            // The 2-vs-3 routing is by coord-lane count: a
+            // 2-lane coord is image2D, 3-lane is image3D.
             // The call clobbers caller-saved regs, so live
             // V-regs and live caller-saved int W-regs (W13..
             // W17) are spilled across it; X19 (image table)
@@ -3419,9 +3426,10 @@ fn emit_function(
                         "Image op coord {:?} not a vector", coord.id)))?;
                 if coord_lanes.len() < 2 {
                     return Err(BackendError::Unsupported(format!(
-                        "Image op 2D coord must have ≥2 lanes, got {}",
+                        "Image op coord must have ≥2 lanes, got {}",
                         coord_lanes.len())));
                 }
+                let is_3d = coord_lanes.len() >= 3;
                 let x_w = *ints.get(&coord_lanes[0].id).ok_or_else(||
                     BackendError::Internal(format!(
                         "Image op coord lane 0 {:?} not in ints",
@@ -3430,6 +3438,12 @@ fn emit_function(
                     BackendError::Internal(format!(
                         "Image op coord lane 1 {:?} not in ints",
                         coord_lanes[1].id)))?;
+                let z_w: Option<asm::Wreg> = if is_3d {
+                    Some(*ints.get(&coord_lanes[2].id).ok_or_else(||
+                        BackendError::Internal(format!(
+                            "Image op coord lane 2 {:?} not in ints",
+                            coord_lanes[2].id)))?)
+                } else { None };
                 // For a write, grab the 4 texel lane V-regs
                 // up front (they get spilled below, but we
                 // need to copy them into the rgba stack slot
@@ -3483,15 +3497,25 @@ fn emit_function(
                 let x0 = asm::Xreg(0);
                 let x2 = asm::Xreg(2);
                 let x3 = asm::Xreg(3);
+                let x4 = asm::Xreg(4);
                 let x9 = asm::Xreg(9);
                 let x10 = asm::Xreg(10);
                 let x19 = asm::Xreg(19);
                 let lr = asm::Xreg(30);
                 let w1 = asm::Wreg(1);
                 let w2 = asm::Wreg(2);
-                // image table: helper @ #0/#8, desc @ #16+B*8.
-                let helper_off: u16 = if is_write { 8 } else { 0 };
-                let desc_off: u16 = 16 + (binding as u16) * 8;
+                let w3 = asm::Wreg(3);
+                // image table: helpers @ #0..32, desc @ #32+B*8.
+                // 2D: read=#0,  write=#8.  3D: read=#16, write=#24.
+                let helper_off: u16 = match (is_3d, is_write) {
+                    (false, false) => 0,
+                    (false, true)  => 8,
+                    (true,  false) => 16,
+                    (true,  true)  => 24,
+                };
+                let desc_off: u16 = 32 + (binding as u16) * 8;
+                // rgba pointer reg: X3 for 2D, X4 for 3D.
+                let rgba_reg = if is_3d { x4 } else { x3 };
 
                 // Frame: [0..16] rgba scratch, [16] x_out
                 // save, [24] LR save, [32..] V spills, then
@@ -3529,7 +3553,10 @@ fn emit_function(
                 a.emit(asm::mov_x(x0, x10));
                 a.emit(asm::mov_w(w1, x_w));
                 a.emit(asm::mov_w(w2, y_w));
-                a.emit(asm::add_imm_x(x3, sp, 0));   // rgba scratch
+                if let Some(z_w) = z_w {
+                    a.emit(asm::mov_w(w3, z_w));
+                }
+                a.emit(asm::add_imm_x(rgba_reg, sp, 0)); // rgba scratch
                 a.emit(asm::blr_x(x9));
 
                 // Read result lanes back (read op only).

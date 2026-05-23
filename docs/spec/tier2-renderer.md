@@ -1022,15 +1022,20 @@ specifically supports:
   R32 storage images work this way.  Bespoke-only: Cranelift's
   aarch64 backend can't form the `StorageClass::Image`
   pointer.
-- 3D storage images: `image3D` works through the
-  `OpImageTexelPointer` path — a 3-lane coord makes the
-  codegen fold in `z*slice_bytes`.  `ImageDesc` carries
-  `depth` + `slice_bytes` (appended after the v1 2D fields,
-  so 2D-only backends stay binary-compatible).
+- 3D storage images: `image3D` `OpImageRead` /
+  `OpImageWrite` route to dedicated 3D helpers
+  (`atrium_img_read_3d` / `atrium_img_write_3d`), selected
+  by coord-lane count (2 → image2D, 3 → image3D).  The
+  image-table helper header doubles to 32 B
+  (`read_2d @ #0`, `write_2d @ #8`, `read_3d @ #16`,
+  `write_3d @ #24`) and the descriptor base shifts to #32.
+  The 3D helper signature passes `z` in W3 and the rgba
+  scratch slot in X4 (vs X3 for 2D).  `OpImageTexelPointer`
+  with a 3-lane coord folds in `z*slice_bytes` for the
+  inline texel-address path.  `ImageDesc` carries `depth` +
+  `slice_bytes` (appended after the v1 2D fields).
   MVP scope: single-mip, Rgba8Unorm / R32Float /
-  Rgba32Float.  General `OpImageRead` / `OpImageWrite` on
-  `image3D` (3-coord helper calls) and mip/array images
-  are deferred.
+  Rgba32Float.  Mip / array images are deferred.
 - GLSL.std.450 ExtInst dispatch for: FAbs, SAbs, Floor,
   Ceil, Trunc, Fract, FSign, FMod, Sqrt, InverseSqrt,
   FMin, FMax, FClamp, FMix, Step, SmoothStep, Length,

@@ -227,15 +227,17 @@ pub fn descriptor_table_buffer(count: usize) -> Vec<u8> {
 
 // ── Compute storage-image descriptor table ────────────────
 //
-// Compute shaders that use `image2D` storage images get a
-// SEPARATE descriptor table, passed in the X0 slot (which
-// the compute calling convention otherwise leaves null).
-// Layout:
+// Compute shaders that use `image2D` / `image3D` storage
+// images get a SEPARATE descriptor table, passed in the X0
+// slot (which the compute calling convention otherwise leaves
+// null).  Layout:
 //
-//   bytes  0..16 : runtime-helper pointers
+//   bytes  0..32 : runtime-helper pointers
 //                  ( 0:  atrium_img_read_2d
-//                    8:  atrium_img_write_2d )
-//   bytes 16..   : descriptor table — slot `B` at byte
+//                    8:  atrium_img_write_2d
+//                   16:  atrium_img_read_3d
+//                   24:  atrium_img_write_3d )
+//   bytes 32..   : descriptor table — slot `B` at byte
 //                  `IMG_TABLE_DESC_BASE + B*IMG_DESC_SLOT_BYTES`,
 //                  holding a single `ImageDesc*`.
 //
@@ -244,7 +246,7 @@ pub fn descriptor_table_buffer(count: usize) -> Vec<u8> {
 
 /// Offset of the descriptor table within the compute
 /// storage-image table buffer.
-pub const IMG_TABLE_DESC_BASE: usize = 16;
+pub const IMG_TABLE_DESC_BASE: usize = 32;
 
 /// Bytes per storage-image descriptor slot — one
 /// `ImageDesc*`.
@@ -258,8 +260,9 @@ pub fn image_table_buffer(count: usize) -> Vec<u8> {
     vec![0u8; IMG_TABLE_DESC_BASE + count * IMG_DESC_SLOT_BYTES]
 }
 
-/// Write the `atrium_img_read_2d` / `atrium_img_write_2d`
-/// helper pointers into a compute storage-image table.
+/// Write the four storage-image helper pointers
+/// (2D read / 2D write / 3D read / 3D write) into a compute
+/// storage-image table.
 ///
 /// # Safety
 /// The function pointers must outlive every shader
@@ -268,13 +271,21 @@ pub unsafe fn write_image_helper_pointers(
     buf: &mut [u8],
     read_2d:  unsafe extern "C" fn(*const ImageDesc, i32, i32, *mut f32),
     write_2d: unsafe extern "C" fn(*const ImageDesc, i32, i32, *const f32),
+    read_3d:  unsafe extern "C" fn(
+        *const ImageDesc, i32, i32, i32, *mut f32),
+    write_3d: unsafe extern "C" fn(
+        *const ImageDesc, i32, i32, i32, *const f32),
 ) {
     assert!(buf.len() >= IMG_TABLE_DESC_BASE,
         "image table buffer too small for the helper header");
-    let r = (read_2d  as usize as u64).to_le_bytes();
-    let w = (write_2d as usize as u64).to_le_bytes();
-    buf[0..8].copy_from_slice(&r);
-    buf[8..16].copy_from_slice(&w);
+    let r2 = (read_2d  as usize as u64).to_le_bytes();
+    let w2 = (write_2d as usize as u64).to_le_bytes();
+    let r3 = (read_3d  as usize as u64).to_le_bytes();
+    let w3 = (write_3d as usize as u64).to_le_bytes();
+    buf[ 0.. 8].copy_from_slice(&r2);
+    buf[ 8..16].copy_from_slice(&w2);
+    buf[16..24].copy_from_slice(&r3);
+    buf[24..32].copy_from_slice(&w3);
 }
 
 /// Write an `ImageDesc*` at binding slot `slot`.
@@ -530,6 +541,69 @@ pub unsafe extern "C" fn atrium_img_write_2d(
     let src = std::slice::from_raw_parts(in_rgba, 4);
     let rgba = [src[0], src[1], src[2], src[3]];
     image_write_impl(&*img, x as u32, y as u32, rgba);
+}
+
+/// Unpack one image3D texel to RGBA32F.
+fn image_read_impl_3d(
+    img: &ImageDesc, x: u32, y: u32, z: u32,
+) -> [f32; 4] {
+    let zc = z.min(img.depth.saturating_sub(1));
+    let slice_off = zc as usize * img.slice_bytes as usize;
+    // Reuse the 2D impl by temporarily rebasing data to the
+    // start of the chosen Z slice.
+    let mut i = *img;
+    unsafe { i.data = img.data.add(slice_off); }
+    image_read_impl(&i, x, y)
+}
+
+/// Pack an RGBA32F texel into an image3D.
+fn image_write_impl_3d(
+    img: &ImageDesc, x: u32, y: u32, z: u32, rgba: [f32; 4],
+) {
+    let zc = z.min(img.depth.saturating_sub(1));
+    let slice_off = zc as usize * img.slice_bytes as usize;
+    let mut i = *img;
+    unsafe { i.data = img.data.add(slice_off); }
+    image_write_impl(&i, x, y, rgba);
+}
+
+/// `OpImageRead` on an `image3D`: read a texel from a 3D
+/// storage image at integer (x, y, z).  Writes RGBA32F into
+/// `out_rgba[0..4]`.
+///
+/// # Safety
+/// As for [`atrium_img_read_2d`]; additionally
+/// `img.slice_bytes` must be set and `img.data` must point
+/// at `>= img.depth * img.slice_bytes` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn atrium_img_read_3d(
+    img: *const ImageDesc,
+    x: i32, y: i32, z: i32,
+    out_rgba: *mut f32,
+) {
+    let rgba = image_read_impl_3d(
+        &*img, x as u32, y as u32, z as u32);
+    let out = std::slice::from_raw_parts_mut(out_rgba, 4);
+    out.copy_from_slice(&rgba);
+}
+
+/// `OpImageWrite` on an `image3D`: write a texel at integer
+/// (x, y, z).
+///
+/// # Safety
+/// As for [`atrium_img_write_2d`]; additionally
+/// `img.slice_bytes` must be set and `img.data` must point
+/// at `>= img.depth * img.slice_bytes` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn atrium_img_write_3d(
+    img: *const ImageDesc,
+    x: i32, y: i32, z: i32,
+    in_rgba: *const f32,
+) {
+    let src = std::slice::from_raw_parts(in_rgba, 4);
+    let rgba = [src[0], src[1], src[2], src[3]];
+    image_write_impl_3d(
+        &*img, x as u32, y as u32, z as u32, rgba);
 }
 
 /// Safe wrapper around [`atrium_img_read_2d`].
@@ -964,6 +1038,40 @@ mod tests {
     }
 
     #[test]
+    fn storage_image_3d_write_then_read_roundtrips() {
+        // 2x2x2 R32Float image: write a distinct value at
+        // each of the 8 texels, then read back through the
+        // 3D path and verify slice_bytes folding works.
+        let (w, h, d) = (2u32, 2u32, 2u32);
+        let mut data = vec![0u8; (w * h * d * 4) as usize];
+        let img = ImageDesc {
+            data: data.as_mut_ptr(),
+            width: w, height: h, stride_bytes: w * 4,
+            format: StorageFormat::R32Float as u32,
+            depth: d, slice_bytes: w * h * 4,
+        };
+        for z in 0..d {
+            for y in 0..h {
+                for x in 0..w {
+                    let v = (z * w * h + y * w + x) as f32 + 0.5;
+                    image_write_impl_3d(
+                        &img, x, y, z, [v, 0.0, 0.0, 0.0]);
+                }
+            }
+        }
+        for z in 0..d {
+            for y in 0..h {
+                for x in 0..w {
+                    let got = image_read_impl_3d(&img, x, y, z);
+                    let want = (z * w * h + y * w + x) as f32 + 0.5;
+                    assert_eq!(got[0], want,
+                        "texel ({x},{y},{z})");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn image_table_builder_round_trips() {
         let mut img = ImageDesc {
             data: std::ptr::null_mut(),
@@ -975,14 +1083,18 @@ mod tests {
         assert_eq!(buf.len(), IMG_TABLE_DESC_BASE + 2 * IMG_DESC_SLOT_BYTES);
         unsafe {
             write_image_helper_pointers(
-                &mut buf, atrium_img_read_2d, atrium_img_write_2d);
+                &mut buf,
+                atrium_img_read_2d, atrium_img_write_2d,
+                atrium_img_read_3d, atrium_img_write_3d);
             write_image_descriptor_slot(&mut buf, 1, &mut img as *const _);
         }
         let read_u64 = |off: usize| -> u64 {
             u64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
         };
-        assert_eq!(read_u64(0), atrium_img_read_2d as usize as u64);
-        assert_eq!(read_u64(8), atrium_img_write_2d as usize as u64);
+        assert_eq!(read_u64( 0), atrium_img_read_2d  as usize as u64);
+        assert_eq!(read_u64( 8), atrium_img_write_2d as usize as u64);
+        assert_eq!(read_u64(16), atrium_img_read_3d  as usize as u64);
+        assert_eq!(read_u64(24), atrium_img_write_3d as usize as u64);
         assert_eq!(read_u64(IMG_TABLE_DESC_BASE + IMG_DESC_SLOT_BYTES),
             &img as *const ImageDesc as usize as u64);
     }
