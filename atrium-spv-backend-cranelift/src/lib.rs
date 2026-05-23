@@ -1719,6 +1719,42 @@ impl FnTranslator {
                 self.vectors.insert(result.id, lanes);
                 Ok(())
             }
+            // OpImageQuerySize — read width / height [/ depth]
+            // off the ImageDesc at [img_table, #32+B*8].  Returns
+            // uvec2 (image2D) or uvec3 (image3D); lane count
+            // comes from the result Type variant.
+            Op::ImageQuerySize(image) => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "ImageQuerySize without result".into()))?;
+                let lane_count = match &result.ty {
+                    atrium_spv_ir::Type::Vec2(_) => 2,
+                    atrium_spv_ir::Type::Vec3(_) => 3,
+                    other => return Err(BackendError::Unsupported(format!(
+                        "ImageQuerySize result must be vec2/vec3, got {other:?}"))),
+                };
+                let (_, binding) = self.image_handles.get(&image.id)
+                    .copied()
+                    .ok_or_else(|| BackendError::Internal(format!(
+                        "ImageQuerySize image {:?} not an ImageHandle",
+                        image.id)))?;
+                let pointer_type = builder.func.dfg
+                    .value_type(self.params[0]);
+                let img_table = self.params[0];
+                let desc_off: i32 = 32 + (binding as i32) * 8;
+                let desc_ptr = builder.ins().load(
+                    pointer_type, MemFlags::new(), img_table, desc_off);
+                // ImageDesc fields: width @8, height @12, depth @24.
+                let field_offs: [i32; 3] = [8, 12, 24];
+                let mut lanes = Vec::with_capacity(lane_count);
+                for i in 0..lane_count {
+                    lanes.push(builder.ins().load(
+                        clif_types::I32, MemFlags::new(),
+                        desc_ptr, field_offs[i]));
+                }
+                self.vectors.insert(result.id, lanes);
+                Ok(())
+            }
             // OpImageRead / OpImageWrite — storage-image
             // access (compute).  The image descriptor table
             // is a SEPARATE table in params[0] (the compute

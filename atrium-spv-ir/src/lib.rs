@@ -738,6 +738,11 @@ pub enum Op {
         /// Integer coords (ivec2 / uvec2 for a 2D image).
         coord: Value,
     },
+    /// Query the dimensions of a storage image
+    /// (`OpImageQuerySize`).  Result is a uvec2 / uvec3
+    /// holding `(width, height [, depth])`, read directly
+    /// from the `ImageDesc`.  No helper call.
+    ImageQuerySize(Value),
 
     // ── Fragment derivatives ───────────────────────────────────
     //

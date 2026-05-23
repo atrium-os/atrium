@@ -1459,6 +1459,32 @@ fn translate_inst(
             Ok(())
         }
 
+        // OpImageQuerySize: read width / height [/ depth]
+        // off the ImageDesc.  The Image operand is a loaded
+        // image (its result is an ImageHandle value already
+        // in `id_map`, mirroring ImageRead/ImageWrite).
+        SpvOp::ImageQuerySize => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed(
+                    "ImageQuerySize without result id".to_string()))?;
+            let result_type_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed(
+                    "ImageQuerySize without result type".to_string()))?;
+            let result_ty = types.get(result_type_id)?.clone();
+            let img_id = expect_id(&spv_inst.operands, 0)?;
+            let image = id_map.get(&img_id).cloned().ok_or_else(||
+                FrontendError::Malformed(format!(
+                    "ImageQuerySize image id {img_id} not yet defined")))?;
+            let result = alloc_or_get_result(
+                result_id, result_ty, id_map, next_value_id);
+            insts.push(Inst {
+                op: Op::ImageQuerySize(image),
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
+
         // OpImageTexelPointer: form a pointer to a single
         // storage-image texel so a subsequent atomic op can
         // read-modify-write it.  Operands:

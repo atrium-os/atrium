@@ -1034,6 +1034,10 @@ specifically supports:
   with a 3-lane coord folds in `z*slice_bytes` for the
   inline texel-address path.  `ImageDesc` carries `depth` +
   `slice_bytes` (appended after the v1 2D fields).
+  `OpImageQuerySize` reads `(width, height [, depth])`
+  directly off the `ImageDesc` (fields @ #8 / #12 / #24) —
+  no helper call; returns uvec2 for image2D, uvec3 for
+  image3D.  Both backends.
   MVP scope: single-mip, Rgba8Unorm / R32Float /
   Rgba32Float.  Mip / array images are deferred.
 - GLSL.std.450 ExtInst dispatch for: FAbs, SAbs, Floor,
