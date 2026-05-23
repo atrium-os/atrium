@@ -2317,6 +2317,71 @@ fn translate_inst(
                         source_spirv_offset, insts, next_value_id);
                     Op::FMul(l, c_half_ln2)
                 }
+                2 => {
+                    // RoundEven(x): round-half-to-even (banker's
+                    // rounding).  ARM has FRINTN for this in one
+                    // instruction but it's not in the IR; we
+                    // synthesise the algorithm.
+                    //
+                    //   a       = x + 0.5
+                    //   r       = floor(a)            // round-half-up
+                    //   floor_x = floor(x)
+                    //   frac    = x - floor_x          // in [0, 1)
+                    //   is_tie  = (frac == 0.5)
+                    //   r_i     = (i32) r
+                    //   adj     = (is_tie ? (r_i & 1) : 0)
+                    //   result  = (f32) (r_i - adj)
+                    //
+                    // The trick: only adjust on exact tie, and
+                    // only when r_i is odd -- subtract 1 to
+                    // round down to the even neighbour.  Works
+                    // symmetrically for negatives (verified by
+                    // hand: -2.5 -> -2, -1.5 -> -2, -0.5 -> 0).
+                    let x_id = expect_id(&spv_inst.operands, 2)?;
+                    let x = resolve_value(x_id, types, constants, id_map,
+                        next_value_id, insts, source_spirv_offset)?;
+                    let push = |op: Op, ty: Type,
+                                insts: &mut Vec<Inst>,
+                                next_value_id: &mut u32| -> Value {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let val = Value { id, ty };
+                        insts.push(Inst {
+                            op, result: Some(val.clone()),
+                            source_spirv_offset,
+                        });
+                        val
+                    };
+                    let c_half = push_cf(0.5,
+                        source_spirv_offset, insts, next_value_id);
+                    let a = push(Op::FAdd(x.clone(), c_half.clone()),
+                        Type::F32, insts, next_value_id);
+                    let r = push(Op::FFloor(a),
+                        Type::F32, insts, next_value_id);
+                    let floor_x = push(Op::FFloor(x.clone()),
+                        Type::F32, insts, next_value_id);
+                    let frac = push(Op::FSub(x, floor_x),
+                        Type::F32, insts, next_value_id);
+                    let is_tie = push(Op::FOrdEq(frac, c_half),
+                        Type::Bool, insts, next_value_id);
+                    let r_i = push(Op::ConvertFToS(r),
+                        Type::I32, insts, next_value_id);
+                    let c_one_i = push_ci(1, atrium_spv_ir::IntKind::I32,
+                        source_spirv_offset, insts, next_value_id);
+                    let c_zero_i = push_ci(0, atrium_spv_ir::IntKind::I32,
+                        source_spirv_offset, insts, next_value_id);
+                    let r_low_bit = push(Op::BitAnd(r_i.clone(), c_one_i),
+                        Type::I32, insts, next_value_id);
+                    let adj = push(Op::Select {
+                            cond: is_tie,
+                            t_val: r_low_bit,
+                            f_val: c_zero_i,
+                        },
+                        Type::I32, insts, next_value_id);
+                    let r_adjusted_i = push(Op::ISub(r_i, adj),
+                        Type::I32, insts, next_value_id);
+                    Op::ConvertSToF(r_adjusted_i)
+                }
                 55 => {
                     // PackUnorm4x8(v):  vec4 in [0, 1] -> u32.
                     //   per-lane: floor(clamp(c, 0, 1) * 255 + 0.5) & 0xFF

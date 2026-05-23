@@ -5629,6 +5629,86 @@ fn differential_glsl_pack_unpack_unorm2x16() {
 }
 
 #[test]
+fn differential_glsl_round_even() {
+    // RoundEven (#2): round-half-to-even (banker's).
+    // Ties go to the even neighbour; non-tie values round
+    // to the nearest integer.  Verified against hand-
+    // computed truth for both signs.
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    // (input, expected RoundEven)
+    let cases: &[(f32, f32)] = &[
+        ( 0.0,   0.0),
+        ( 0.5,   0.0),  // tie -> even (0)
+        ( 1.5,   2.0),  // tie -> even (2)
+        ( 2.5,   2.0),  // tie -> even (2)
+        ( 3.5,   4.0),  // tie -> even (4)
+        ( 1.4,   1.0),  // non-tie -> nearest
+        ( 1.6,   2.0),  // non-tie -> nearest
+        (-0.5,   0.0),  // tie -> even (0)
+        (-1.5,  -2.0),  // tie -> even (-2)
+        (-2.5,  -2.0),  // tie -> even (-2)
+        (-1.4,  -1.0),  // non-tie -> nearest
+        (-1.6,  -2.0),  // non-tie -> nearest
+    ];
+    for &(x, want) in cases {
+        let mut b = rspirv::dr::Builder::new();
+        b.set_version(1, 3);
+        b.capability(Capability::Shader);
+        b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+        let std_450 = b.ext_inst_import("GLSL.std.450");
+        let void   = b.type_void();
+        let u32_ty = b.type_int(32, 0);
+        let f32_ty = b.type_float(32, None);
+        let void_fn = b.type_function(void, vec![]);
+        let rt = b.type_runtime_array(u32_ty);
+        b.decorate(rt, Decoration::ArrayStride,
+            vec![rspirv::dr::Operand::LiteralBit32(4)]);
+        let s = b.type_struct(vec![rt]);
+        b.decorate(s, Decoration::Block, vec![]);
+        b.member_decorate(s, 0, Decoration::Offset,
+            vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+        let ptr_u = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+        let ssbo  = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+        b.decorate(ssbo, Decoration::DescriptorSet,
+            vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        b.decorate(ssbo, Decoration::Binding,
+            vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        let c_zero = b.constant_bit32(u32_ty, 0);
+        let x_c = b.constant_bit32(f32_ty, x.to_bits());
+        let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+        b.begin_block(None).unwrap();
+        let r = b.ext_inst(f32_ty, None, std_450, 2,
+            vec![rspirv::dr::Operand::IdRef(x_c)]).unwrap();
+        let r_u = b.bitcast(u32_ty, None, r).unwrap();
+        let p = b.access_chain(ptr_u, None, ssbo, vec![c_zero, c_zero]).unwrap();
+        b.store(p, r_u, None, vec![]).unwrap();
+        b.ret().unwrap();
+        b.end_function().unwrap();
+        b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+        b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+        let words: Vec<u32> = b.module().assemble();
+        let mut spv = Vec::with_capacity(words.len() * 4);
+        for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+        let dir = TempDir::new().unwrap();
+        let mut b_buf = vec![0u8; 4];
+        let mut c_buf = vec![0u8; 4];
+        invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
+        invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+        assert_eq!(b_buf, c_buf,
+            "RoundEven({x}) diverges between backends");
+        let got = f32::from_bits(u32::from_le_bytes(
+            b_buf[0..4].try_into().unwrap()));
+        assert_eq!(got, want,
+            "RoundEven({x}): got {got}, want {want}");
+    }
+}
+
+#[test]
 fn differential_glsl_ldexp() {
     // Ldexp(x, n) = x * 2^n.  Verified against f32 truth
     // (libm computes the same value via the same exponent
