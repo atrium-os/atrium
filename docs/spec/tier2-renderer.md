@@ -1262,6 +1262,14 @@ specifically supports:
   computations (`>> 31` for sign bits, `r | -r` for nonzero
   detection) so the cond stays in the int/bool pipelines
   the bespoke already handles.
+  Runtime-indexed vector access (Arc 51):
+  `OpVectorExtractDynamic` and `OpVectorInsertDynamic`
+  compile via pure frontend lowering as chains of `Op::Select`
+  on statically-extracted lanes.
+    Extract(v, idx) → right-fold (idx == k) ? v[k] : acc.
+    Insert(v, val, idx) → per lane `new[k] = (idx == k) ? val : v[k]`,
+       rebuilt via `ConstVec`.
+  Only F32 / I32 / U32 lane types in v1.
   `textureSize(sampler2D, lod)` (Arc 34): a new IR op
   `Op::SampledImageQuerySizeLod { image, lod }` is emitted
   by the frontend for `OpImageQuerySizeLod`.  Both backends

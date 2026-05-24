@@ -1331,6 +1331,183 @@ fn translate_inst(
         // for nested aggregates; we support the single-
         // index vector case (the only one shaders hit —
         // GLSL `color.r` etc.). Deeper chains → Unsupported.
+        // Arc 51: OpVectorExtractDynamic / OpVectorInsertDynamic.
+        // Runtime-indexed vector access.  Lower at the frontend
+        // via a chain of `Op::Select` between statically-
+        // extracted lanes.  For an N-lane vector:
+        //
+        //   ExtractDynamic(v, idx):
+        //     cond_k  = (idx == k)  for k in 0..N-1
+        //     result  = cond_0 ? v[0] : (cond_1 ? v[1] : ...)
+        //
+        //   InsertDynamic(v, val, idx):
+        //     new_k   = (idx == k) ? val : v[k]   for each lane
+        //     result  = ConstVec(new_0, ..., new_{N-1})
+        SpvOp::VectorExtractDynamic => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed(
+                    "VectorExtractDynamic without result id".into()))?;
+            let result_ty_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed(
+                    "VectorExtractDynamic without result type".into()))?;
+            let result_ty = types.get(result_ty_id)?.clone();
+            let vec_id = expect_id(&spv_inst.operands, 0)?;
+            let idx_id = expect_id(&spv_inst.operands, 1)?;
+            let vec_val = resolve_value(vec_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            let idx = resolve_value(idx_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            let n = match &vec_val.ty {
+                Type::Vec2(_) => 2,
+                Type::Vec3(_) => 3,
+                Type::Vec4(_) => 4,
+                other => return Err(FrontendError::Unsupported(format!(
+                    "VectorExtractDynamic on non-vector type {other:?}"))),
+            };
+            // Statically extract each lane.
+            let mut lanes: Vec<Value> = Vec::with_capacity(n);
+            for i in 0..n {
+                let id = ValueId(*next_value_id);
+                *next_value_id += 1;
+                let v = Value { id, ty: result_ty.clone() };
+                insts.push(Inst {
+                    op: Op::VectorExtract {
+                        vector: vec_val.clone(), index: i as u32,
+                    },
+                    result: Some(v.clone()),
+                    source_spirv_offset,
+                });
+                lanes.push(v);
+            }
+            // Fold from the right: acc starts as the last lane,
+            // and each iteration picks cond_{k} ? lane[k] : acc.
+            let mut acc = lanes.pop().unwrap();
+            for k in (0..n - 1).rev() {
+                let kc = push_ci(k as i64,
+                    atrium_spv_ir::IntKind::U32,
+                    source_spirv_offset, insts, next_value_id);
+                let cond = push_bool(Op::IEq(idx.clone(), kc),
+                    source_spirv_offset, insts, next_value_id);
+                let id = ValueId(*next_value_id);
+                *next_value_id += 1;
+                let sel = Value { id, ty: result_ty.clone() };
+                insts.push(Inst {
+                    op: Op::Select {
+                        cond,
+                        t_val: lanes[k].clone(),
+                        f_val: acc,
+                    },
+                    result: Some(sel.clone()),
+                    source_spirv_offset,
+                });
+                acc = sel;
+            }
+            // Bind the result_id to acc by emitting an identity
+            // FAdd-with-0 / IAdd-with-0 based on result type.
+            // Simpler: use Select(true, acc, acc) — but that
+            // needs a true const.  Cleanest: copy via a no-op
+            // arithmetic identity.  For F32, add 0; for I32/U32,
+            // IAdd 0.
+            let result = alloc_or_get_result(
+                result_id, result_ty.clone(), id_map, next_value_id);
+            match result_ty {
+                Type::F32 => {
+                    let zero = ValueId(*next_value_id);
+                    *next_value_id += 1;
+                    let zero_v = Value { id: zero, ty: Type::F32 };
+                    insts.push(Inst {
+                        op: Op::ConstFloat { value: 0.0,
+                            kind: atrium_spv_ir::FloatKind::F32 },
+                        result: Some(zero_v.clone()),
+                        source_spirv_offset,
+                    });
+                    insts.push(Inst {
+                        op: Op::FAdd(acc, zero_v),
+                        result: Some(result),
+                        source_spirv_offset,
+                    });
+                }
+                Type::I32 | Type::U32 => {
+                    let zero = push_ci(0,
+                        atrium_spv_ir::IntKind::U32,
+                        source_spirv_offset, insts, next_value_id);
+                    insts.push(Inst {
+                        op: Op::IAdd(acc, zero),
+                        result: Some(result),
+                        source_spirv_offset,
+                    });
+                }
+                other => return Err(FrontendError::Unsupported(format!(
+                    "VectorExtractDynamic result type {other:?}"))),
+            }
+            Ok(())
+        }
+        SpvOp::VectorInsertDynamic => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed(
+                    "VectorInsertDynamic without result id".into()))?;
+            let result_ty_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed(
+                    "VectorInsertDynamic without result type".into()))?;
+            let result_ty = types.get(result_ty_id)?.clone();
+            let vec_id = expect_id(&spv_inst.operands, 0)?;
+            let val_id = expect_id(&spv_inst.operands, 1)?;
+            let idx_id = expect_id(&spv_inst.operands, 2)?;
+            let vec_val = resolve_value(vec_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            let val = resolve_value(val_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            let idx = resolve_value(idx_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            let n = match &vec_val.ty {
+                Type::Vec2(_) => 2,
+                Type::Vec3(_) => 3,
+                Type::Vec4(_) => 4,
+                other => return Err(FrontendError::Unsupported(format!(
+                    "VectorInsertDynamic on non-vector type {other:?}"))),
+            };
+            // For each lane k: new_lane = (idx == k) ? val : v[k].
+            let mut new_lanes: Vec<Value> = Vec::with_capacity(n);
+            for k in 0..n {
+                let v_lane_id = ValueId(*next_value_id);
+                *next_value_id += 1;
+                let v_lane = Value { id: v_lane_id, ty: val.ty.clone() };
+                insts.push(Inst {
+                    op: Op::VectorExtract {
+                        vector: vec_val.clone(), index: k as u32,
+                    },
+                    result: Some(v_lane.clone()),
+                    source_spirv_offset,
+                });
+                let kc = push_ci(k as i64,
+                    atrium_spv_ir::IntKind::U32,
+                    source_spirv_offset, insts, next_value_id);
+                let cond = push_bool(Op::IEq(idx.clone(), kc),
+                    source_spirv_offset, insts, next_value_id);
+                let sel_id = ValueId(*next_value_id);
+                *next_value_id += 1;
+                let sel = Value { id: sel_id, ty: val.ty.clone() };
+                insts.push(Inst {
+                    op: Op::Select {
+                        cond,
+                        t_val: val.clone(),
+                        f_val: v_lane,
+                    },
+                    result: Some(sel.clone()),
+                    source_spirv_offset,
+                });
+                new_lanes.push(sel);
+            }
+            let result = alloc_or_get_result(
+                result_id, result_ty, id_map, next_value_id);
+            insts.push(Inst {
+                op: Op::ConstVec(new_lanes),
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
+
         SpvOp::CompositeExtract => {
             let result_id = spv_inst.result_id.ok_or_else(||
                 FrontendError::Malformed(

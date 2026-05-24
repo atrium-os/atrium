@@ -2522,6 +2522,99 @@ fn differential_glsl_int_bit_scan() {
 }
 
 #[test]
+fn differential_vector_dynamic_index() {
+    // Arc 51: OpVectorExtractDynamic / OpVectorInsertDynamic
+    // on a vec4<f32>.  Sweep idx = 0..3 and verify the
+    // extracted lane / replaced-lane values.
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    // (label, idx, is_insert, expected: 4 values for the SSBO
+    //  -- for extract, only result[0] is meaningful; for
+    //  insert, the whole vec4 is what we wrote.)
+    let cases: &[(&str, u32, bool, [f32; 4])] = &[
+        ("extract idx=0", 0, false, [1.0, 0.0, 0.0, 0.0]),
+        ("extract idx=1", 1, false, [2.0, 0.0, 0.0, 0.0]),
+        ("extract idx=2", 2, false, [3.0, 0.0, 0.0, 0.0]),
+        ("extract idx=3", 3, false, [4.0, 0.0, 0.0, 0.0]),
+        ("insert idx=0",  0, true,  [9.0, 2.0, 3.0, 4.0]),
+        ("insert idx=1",  1, true,  [1.0, 9.0, 3.0, 4.0]),
+        ("insert idx=2",  2, true,  [1.0, 2.0, 9.0, 4.0]),
+        ("insert idx=3",  3, true,  [1.0, 2.0, 3.0, 9.0]),
+    ];
+    for &(label, idx, is_insert, expected) in cases {
+        let mut b = rspirv::dr::Builder::new();
+        b.set_version(1, 3);
+        b.capability(Capability::Shader);
+        b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+        let void   = b.type_void();
+        let u32_ty = b.type_int(32, 0);
+        let f32_ty = b.type_float(32, None);
+        let v4f    = b.type_vector(f32_ty, 4);
+        let void_fn = b.type_function(void, vec![]);
+        let rt = b.type_runtime_array(f32_ty);
+        b.decorate(rt, Decoration::ArrayStride, vec![rspirv::dr::Operand::LiteralBit32(4)]);
+        let s = b.type_struct(vec![rt]);
+        b.decorate(s, Decoration::Block, vec![]);
+        b.member_decorate(s, 0, Decoration::Offset, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+        let ptr_f = b.type_pointer(None, StorageClass::StorageBuffer, f32_ty);
+        let ssbo  = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+        b.decorate(ssbo, Decoration::DescriptorSet, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        b.decorate(ssbo, Decoration::Binding, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        let c_zero_u = b.constant_bit32(u32_ty, 0);
+        let c_one_u  = b.constant_bit32(u32_ty, 1);
+        let c_two_u  = b.constant_bit32(u32_ty, 2);
+        let c_three_u= b.constant_bit32(u32_ty, 3);
+        let c_idx    = b.constant_bit32(u32_ty, idx);
+        let c_1 = b.constant_bit32(f32_ty, 1.0f32.to_bits());
+        let c_2 = b.constant_bit32(f32_ty, 2.0f32.to_bits());
+        let c_3 = b.constant_bit32(f32_ty, 3.0f32.to_bits());
+        let c_4 = b.constant_bit32(f32_ty, 4.0f32.to_bits());
+        let c_9 = b.constant_bit32(f32_ty, 9.0f32.to_bits());
+        let vec_val = b.constant_composite(v4f, vec![c_1, c_2, c_3, c_4]);
+        let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+        b.begin_block(None).unwrap();
+        if is_insert {
+            let r = b.vector_insert_dynamic(v4f, None, vec_val, c_9, c_idx).unwrap();
+            for (i, &ci) in [c_zero_u, c_one_u, c_two_u, c_three_u].iter().enumerate() {
+                let lane = b.composite_extract(f32_ty, None, r, vec![i as u32]).unwrap();
+                let d = b.access_chain(ptr_f, None, ssbo, vec![c_zero_u, ci]).unwrap();
+                b.store(d, lane, None, vec![]).unwrap();
+            }
+        } else {
+            let r = b.vector_extract_dynamic(f32_ty, None, vec_val, c_idx).unwrap();
+            let d = b.access_chain(ptr_f, None, ssbo, vec![c_zero_u, c_zero_u]).unwrap();
+            b.store(d, r, None, vec![]).unwrap();
+        }
+        b.ret().unwrap();
+        b.end_function().unwrap();
+        b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+        b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+        let words: Vec<u32> = b.module().assemble();
+        let mut spv = Vec::with_capacity(words.len() * 4);
+        for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+        let dir = TempDir::new().unwrap();
+        let mut b_buf = vec![0u8; 16];
+        let mut c_buf = vec![0u8; 16];
+        invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
+        invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+        assert_eq!(b_buf, c_buf, "{label}: bespoke vs cranelift diverge");
+        let read = |buf: &[u8], i: usize| -> f32 {
+            f32::from_le_bytes(buf[i*4..i*4+4].try_into().unwrap())
+        };
+        for i in 0..4 {
+            let g = read(&b_buf, i);
+            let e = expected[i];
+            assert!((g - e).abs() < 1e-6,
+                "{label}: lane {i} got {g}, want {e}");
+        }
+    }
+}
+
+#[test]
 fn differential_op_srem_smod() {
     // Arc 49 + 50: OpSRem (truncated, same sign as x) and
     // OpSMod (floored, same sign as y).  Distinguishing cases:
