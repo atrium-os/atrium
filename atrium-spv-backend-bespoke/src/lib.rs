@@ -1181,14 +1181,27 @@ fn emit_function(
                             // Constants are routinely shared
                             // across multiple ConstVecs (e.g.
                             // vec4(0) and vec3(0) both pin
-                            // ConstFloat 0.0).  If any OTHER
-                            // still-live entry in `vectors`
-                            // still references this lane.id,
-                            // freeing would break it.  Scan
-                            // the remaining live vectors.
+                            // ConstFloat 0.0).  Two guards
+                            // prevent premature reclamation:
+                            //   (1) any OTHER still-live entry
+                            //       in `vectors` references the
+                            //       lane.id; OR
+                            //   (2) the lane's own last_use is
+                            //       still in the future (a
+                            //       downstream ConstVec hasn't
+                            //       emitted yet — Arc 42
+                            //       ProjDref pattern: c_one is
+                            //       consumed by both `uvq` and
+                            //       a later pixel-composite
+                            //       vec4, and when uvq dies the
+                            //       pixel ConstVec isn't yet in
+                            //       `vectors`).
                             let still_referenced = vectors.values()
                                 .any(|ls| ls.iter().any(|v| v.id == lane.id));
-                            if !still_referenced {
+                            let lane_alive = last_use.get(&lane.id)
+                                .copied()
+                                .unwrap_or(usize::MAX) >= i;
+                            if !(still_referenced || lane_alive) {
                                 owners.remove(&vreg.0);
                                 free_pool.push(vreg.0);
                                 scalars.remove(&lane.id);

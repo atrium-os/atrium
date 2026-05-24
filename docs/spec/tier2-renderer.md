@@ -1198,12 +1198,8 @@ specifically supports:
   Explicit}Lod` compose Arc 37 (proj divide) + Arc 40 (dref
   compare) at the frontend.  Coord lanes ÷ last lane, sample,
   extract R, FOrdLe vs dref, Select 1.0/0.0.  Interpreter
-  mirrors the divide + compare in one arm.  Bespoke backend
-  currently chokes on ConstVec rebuilt from FDiv lanes when
-  the new coord is later consumed by a downstream
-  VectorExtract (vs by ImageSample directly — Arc 37 path
-  works fine); tracked as a follow-up.  Interp + Cranelift
-  carry the test.
+  mirrors the divide + compare in one arm.  Bespoke also
+  passes after the Arc 44 regalloc fix below.
   ConstOffset / Offset on `OpImageRead` / `OpImageWrite`
   (Arc 43): same lane-decomposition pattern as Arc 41's
   `OpImageFetch` path.  Factored into a shared
@@ -1212,6 +1208,18 @@ specifically supports:
   both honor the offset; new
   `differential_image_write_const_offset` test verifies a
   `gid + ivec2(1, 0)` write produces a column-shifted output.
+  Bespoke dead-vector cleanup fix (Arc 44): the cleanup that
+  reclaims lane scalars when a `vectors` entry dies only
+  checked whether *another currently-live `vectors` entry*
+  referenced the lane.id; a downstream future ConstVec
+  consumer hadn't yet emitted, so its reference was missed and
+  the lane scalar was freed prematurely.  Added a
+  `last_use[lane.id] >= i` guard so any lane with a future
+  use stays alive.  Surfaced by the ProjDref pattern where
+  `c_one` is shared between a constant_composite `uvq` and a
+  later vec4 `pixel = vec4(compare, 0, 0, c_one)`: when uvq
+  died (post-extract), pixel hadn't been emitted yet, and
+  c_one got freed.
   `textureSize(sampler2D, lod)` (Arc 34): a new IR op
   `Op::SampledImageQuerySizeLod { image, lod }` is emitted
   by the frontend for `OpImageQuerySizeLod`.  Both backends

@@ -596,21 +596,17 @@ fn run_proj_dref_shader(dref_val: f32, expected: f32) {
     };
 
     let spirv = build_sample_proj_dref_shader(dref_val);
-    // BespokeRunner currently chokes on ConstVec rebuilt from
-    // FDiv results in the proj-divide path *when* the result
-    // is later consumed by VectorExtract (vs by ImageSample
-    // directly).  Tracked as a follow-up; interp + cranelift
-    // carry the agreement.
-    let runners: [Box<dyn ShaderRunner>; 2] = [
+    let runners: [Box<dyn ShaderRunner>; 3] = [
         Box::new(InterpreterRunner),
         Box::new(CraneliftRunner::default()),
+        Box::new(BespokeRunner::default()),
     ];
     let refs: Vec<&dyn ShaderRunner> =
         runners.iter().map(|b| b.as_ref()).collect();
     let tol = atrium_spv_tests::pixels::ColorTolerance::AbsEpsilon { eps: 1e-6 };
     assert_shader_agrees(&spirv, &inputs, tol, &refs);
 
-    let out = CraneliftRunner::default().run(&spirv, &inputs).unwrap();
+    let out = BespokeRunner::default().run(&spirv, &inputs).unwrap();
     let p = &out.pixels[0];
     assert!((p[0] - expected).abs() < 1e-6,
         "dref={dref_val} expected {expected}, got {} (full {:?})",
