@@ -1297,6 +1297,15 @@ specifically supports:
   helpers; no backend changes.  Interpreter still doesn't
   know the Dref-Gather opcode (it reports Unsupported), so
   the test runs bespoke + cranelift agreement only.
+  F16 round-trip quantization (Arc 55): `OpQuantizeToF16`
+  compiles via pure frontend lowering as
+  `Bitcast(u32, x) & 0xFFFFE000`, then `Bitcast(f32, ...)`.
+  Drops the bottom 13 bits of the f32 mantissa to match f16's
+  10-bit mantissa width.  Truncating round; IEEE 754 round-
+  to-nearest-even is not implemented.  Values outside f16
+  dynamic range are NOT clamped to ±Inf.  Real shaders use
+  QuantizeToF16 mostly for mediump round-trip compat, which
+  truncation already captures for in-range values.
   `textureSize(sampler2D, lod)` (Arc 34): a new IR op
   `Op::SampledImageQuerySizeLod { image, lod }` is emitted
   by the frontend for `OpImageQuerySizeLod`.  Both backends

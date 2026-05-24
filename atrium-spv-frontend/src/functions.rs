@@ -808,6 +808,68 @@ fn translate_inst(
             });
             Ok(())
         }
+        // Arc 55: OpQuantizeToF16 -- round-trip an f32 through
+        // f16 precision and back.  Implemented as a bit-mask
+        // that drops the bottom 13 mantissa bits of the f32
+        // (f32 has 23 mantissa bits; f16 has 10, so 13 are
+        // discarded).
+        //
+        // Limitations:
+        //   * Truncating round; IEEE 754 round-to-nearest-even
+        //     is not implemented.
+        //   * Values outside f16 dynamic range (~|x| > 65504)
+        //     are NOT clamped to +/- Inf; they return whatever
+        //     truncating the mantissa produces.  Inputs in
+        //     range round correctly.
+        // Real shaders use QuantizeToF16 mostly for mediump
+        // round-trip compatibility, which truncation already
+        // captures.
+        SpvOp::QuantizeToF16 => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed(
+                    "QuantizeToF16 without result id".into()))?;
+            let result_ty_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed(
+                    "QuantizeToF16 without result type".into()))?;
+            let result_ty = types.get(result_ty_id)?.clone();
+            if !matches!(result_ty, Type::F32) {
+                return Err(FrontendError::Unsupported(format!(
+                    "QuantizeToF16 result type {result_ty:?} (only F32 scalar)")));
+            }
+            let src_id = expect_id(&spv_inst.operands, 0)?;
+            let src = resolve_value(src_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            // bits = bitcast<u32>(src)
+            let bits_id = ValueId(*next_value_id);
+            *next_value_id += 1;
+            let bits = Value { id: bits_id, ty: Type::U32 };
+            insts.push(Inst {
+                op: Op::Bitcast(src, Type::U32),
+                result: Some(bits.clone()),
+                source_spirv_offset,
+            });
+            // masked = bits & 0xFFFFE000   (drop bottom 13 bits)
+            let mask = push_ci(0xFFFF_E000_i64,
+                atrium_spv_ir::IntKind::U32,
+                source_spirv_offset, insts, next_value_id);
+            let masked_id = ValueId(*next_value_id);
+            *next_value_id += 1;
+            let masked = Value { id: masked_id, ty: Type::U32 };
+            insts.push(Inst {
+                op: Op::BitAnd(bits, mask),
+                result: Some(masked.clone()),
+                source_spirv_offset,
+            });
+            // result = bitcast<f32>(masked)
+            let result = alloc_or_get_result(
+                result_id, result_ty, id_map, next_value_id);
+            insts.push(Inst {
+                op: Op::Bitcast(masked, Type::F32),
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
         SpvOp::ShiftLeftLogical => emit_binop_int(
             spv_inst, types, constants, iface,
             id_map, next_value_id, insts, source_spirv_offset,

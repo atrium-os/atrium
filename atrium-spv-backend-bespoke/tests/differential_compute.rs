@@ -2522,6 +2522,78 @@ fn differential_glsl_int_bit_scan() {
 }
 
 #[test]
+fn differential_op_quantize_to_f16() {
+    // Arc 55: OpQuantizeToF16.  Truncating quantization
+    // (mantissa low 13 bits dropped).  Inputs were chosen so
+    // either (a) they're exactly f16-representable -> output
+    // is identical to input, or (b) the bottom 13 mantissa
+    // bits are zero anyway -> identical result.  Cases that
+    // would require round-to-nearest-even are NOT tested
+    // here; truncation is documented as an approximation.
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    // (label, x, expected) -- expected = quantization result.
+    let cases: &[(&str, f32, f32)] = &[
+        ("zero",         0.0,     0.0),
+        ("one",          1.0,     1.0),
+        ("half",         0.5,     0.5),
+        ("two",          2.0,     2.0),
+        ("neg_one",     -1.0,    -1.0),
+        // 1.5 has mantissa 0x400000 -- only top bit set, low
+        // 13 bits all zero -> unchanged by mask.
+        ("one_point_five", 1.5,   1.5),
+        // 0.25 also has clean f16 representation.
+        ("quarter",      0.25,    0.25),
+    ];
+    for &(label, x, expected) in cases {
+        let mut b = rspirv::dr::Builder::new();
+        b.set_version(1, 3);
+        b.capability(Capability::Shader);
+        b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+        let void   = b.type_void();
+        let u32_ty = b.type_int(32, 0);
+        let f32_ty = b.type_float(32, None);
+        let void_fn = b.type_function(void, vec![]);
+        let rt = b.type_runtime_array(f32_ty);
+        b.decorate(rt, Decoration::ArrayStride, vec![rspirv::dr::Operand::LiteralBit32(4)]);
+        let s = b.type_struct(vec![rt]);
+        b.decorate(s, Decoration::Block, vec![]);
+        b.member_decorate(s, 0, Decoration::Offset, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+        let ptr_f = b.type_pointer(None, StorageClass::StorageBuffer, f32_ty);
+        let ssbo  = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+        b.decorate(ssbo, Decoration::DescriptorSet, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        b.decorate(ssbo, Decoration::Binding, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        let c_zero = b.constant_bit32(u32_ty, 0);
+        let cx = b.constant_bit32(f32_ty, x.to_bits());
+        let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+        b.begin_block(None).unwrap();
+        let r = b.quantize_to_f16(f32_ty, None, cx).unwrap();
+        let d = b.access_chain(ptr_f, None, ssbo, vec![c_zero, c_zero]).unwrap();
+        b.store(d, r, None, vec![]).unwrap();
+        b.ret().unwrap();
+        b.end_function().unwrap();
+        b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+        b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+        let words: Vec<u32> = b.module().assemble();
+        let mut spv = Vec::with_capacity(words.len() * 4);
+        for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+        let dir = TempDir::new().unwrap();
+        let mut b_buf = vec![0u8; 4];
+        let mut c_buf = vec![0u8; 4];
+        invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
+        invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+        assert_eq!(b_buf, c_buf, "{label}: bespoke vs cranelift diverge");
+        let got = f32::from_le_bytes(b_buf[0..4].try_into().unwrap());
+        assert_eq!(got, expected,
+            "{label}: got {got}, want {expected}");
+    }
+}
+
+#[test]
 fn differential_op_composite_insert_copy_undef() {
     // Arc 52: OpCompositeInsert + OpCopyObject + OpUndef.
     // One shader: take vec4{1,2,3,4}, CompositeInsert 9 at
