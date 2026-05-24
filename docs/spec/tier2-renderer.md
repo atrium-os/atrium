@@ -1270,6 +1270,16 @@ specifically supports:
     Insert(v, val, idx) → per lane `new[k] = (idx == k) ? val : v[k]`,
        rebuilt via `ConstVec`.
   Only F32 / I32 / U32 lane types in v1.
+  Static composite insert + alias ops (Arc 52):
+    `OpCompositeInsert(value, composite, index)` -- pure
+       frontend lowering: per-lane `VectorExtract` of the
+       source, replace lane `index` with `value`, rebuild via
+       `ConstVec`.  Single-level vector inserts only.
+    `OpCopyObject(src)` -- aliases the SPIR-V Result Id to
+       `src` directly via `id_map`.  No new IR Value, no new
+       instruction.
+    `OpUndef` -- materializes as `ConstFloat 0.0` / `ConstInt 0`
+       per the result type.  Bool maps to int 0.
   `textureSize(sampler2D, lod)` (Arc 34): a new IR op
   `Op::SampledImageQuerySizeLod { image, lod }` is emitted
   by the frontend for `OpImageQuerySizeLod`.  Both backends

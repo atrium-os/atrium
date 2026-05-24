@@ -1508,6 +1508,143 @@ fn translate_inst(
             Ok(())
         }
 
+        // Arc 52: OpCompositeInsert + OpCopyObject + OpUndef.
+        //
+        //   CompositeInsert(value, composite, index):
+        //     For vec<N>:  new[k] = (k == index) ? value : composite[k]
+        //     result = ConstVec(new[0..N])
+        //   Static index, single level (vector inserts only).
+        //
+        //   CopyObject(src) -> alias the result_id to src; emit
+        //   an identity copy via FAdd-0 / IAdd-0 so the bespoke
+        //   backend allocates a fresh dest reg.
+        //
+        //   Undef -> ConstFloat 0.0 / ConstInt 0 / ConstVec
+        //   of zeros, depending on result type.
+        SpvOp::CompositeInsert => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed(
+                    "CompositeInsert without result id".into()))?;
+            let result_ty_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed(
+                    "CompositeInsert without result type".into()))?;
+            let result_ty = types.get(result_ty_id)?.clone();
+            let object_id    = expect_id(&spv_inst.operands, 0)?;
+            let composite_id = expect_id(&spv_inst.operands, 1)?;
+            let indices: Vec<u32> = spv_inst.operands[2..].iter()
+                .filter_map(|o| match o {
+                    Operand::LiteralBit32(v) => Some(*v),
+                    _ => None,
+                })
+                .collect();
+            if indices.len() != 1 {
+                return Err(FrontendError::Unsupported(format!(
+                    "CompositeInsert with {} indices; only single-level \
+                     vector insert supported", indices.len())));
+            }
+            let index = indices[0] as usize;
+            let object = resolve_value(object_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            let composite = resolve_value(composite_id, types, constants,
+                id_map, next_value_id, insts, source_spirv_offset)?;
+            let n = match &composite.ty {
+                Type::Vec2(_) => 2,
+                Type::Vec3(_) => 3,
+                Type::Vec4(_) => 4,
+                other => return Err(FrontendError::Unsupported(format!(
+                    "CompositeInsert on non-vector type {other:?}"))),
+            };
+            if index >= n {
+                return Err(FrontendError::Unsupported(format!(
+                    "CompositeInsert index {index} out of bounds (n={n})")));
+            }
+            let mut new_lanes: Vec<Value> = Vec::with_capacity(n);
+            for k in 0..n {
+                if k == index {
+                    new_lanes.push(object.clone());
+                } else {
+                    let id = ValueId(*next_value_id);
+                    *next_value_id += 1;
+                    let v = Value { id, ty: object.ty.clone() };
+                    insts.push(Inst {
+                        op: Op::VectorExtract {
+                            vector: composite.clone(), index: k as u32,
+                        },
+                        result: Some(v.clone()),
+                        source_spirv_offset,
+                    });
+                    new_lanes.push(v);
+                }
+            }
+            let result = alloc_or_get_result(
+                result_id, result_ty, id_map, next_value_id);
+            insts.push(Inst {
+                op: Op::ConstVec(new_lanes),
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
+        SpvOp::CopyObject => {
+            // OpCopyObject(src): produce a new SSA Result Id
+            // with the same value.  We alias at the SPIR-V id
+            // level: no new IR Value, no new instruction.  The
+            // backends never see a separate op.
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed("CopyObject without result id".into()))?;
+            let src_id = expect_id(&spv_inst.operands, 0)?;
+            let src = resolve_value(src_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            id_map.insert(result_id, src);
+            Ok(())
+        }
+        SpvOp::Undef => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed("Undef without result id".into()))?;
+            let result_ty_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed("Undef without result type".into()))?;
+            let result_ty = types.get(result_ty_id)?.clone();
+            let result = alloc_or_get_result(
+                result_id, result_ty.clone(), id_map, next_value_id);
+            match result_ty {
+                Type::F32 => {
+                    insts.push(Inst {
+                        op: Op::ConstFloat { value: 0.0,
+                            kind: atrium_spv_ir::FloatKind::F32 },
+                        result: Some(result),
+                        source_spirv_offset,
+                    });
+                }
+                Type::I32 => {
+                    insts.push(Inst {
+                        op: Op::ConstInt { value: 0,
+                            kind: atrium_spv_ir::IntKind::I32 },
+                        result: Some(result),
+                        source_spirv_offset,
+                    });
+                }
+                Type::U32 => {
+                    insts.push(Inst {
+                        op: Op::ConstInt { value: 0,
+                            kind: atrium_spv_ir::IntKind::U32 },
+                        result: Some(result),
+                        source_spirv_offset,
+                    });
+                }
+                Type::Bool => {
+                    insts.push(Inst {
+                        op: Op::ConstInt { value: 0,
+                            kind: atrium_spv_ir::IntKind::I32 },
+                        result: Some(result),
+                        source_spirv_offset,
+                    });
+                }
+                other => return Err(FrontendError::Unsupported(format!(
+                    "Undef result type {other:?}"))),
+            }
+            Ok(())
+        }
+
         SpvOp::CompositeExtract => {
             let result_id = spv_inst.result_id.ok_or_else(||
                 FrontendError::Malformed(

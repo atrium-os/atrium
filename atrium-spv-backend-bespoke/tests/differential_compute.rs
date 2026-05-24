@@ -2522,6 +2522,93 @@ fn differential_glsl_int_bit_scan() {
 }
 
 #[test]
+fn differential_op_composite_insert_copy_undef() {
+    // Arc 52: OpCompositeInsert + OpCopyObject + OpUndef.
+    // One shader: take vec4{1,2,3,4}, CompositeInsert 9 at
+    // index 2, CopyObject the result, OR an Undef (treated as
+    // zero) into lane 0 via an extra IAdd.  Expected output:
+    //   lane 0 = 1 + 0 = 1 (Undef coerced to 0)
+    //   lane 1 = 2
+    //   lane 2 = 9 (inserted)
+    //   lane 3 = 4
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let f32_ty = b.type_float(32, None);
+    let v4f    = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let rt = b.type_runtime_array(f32_ty);
+    b.decorate(rt, Decoration::ArrayStride, vec![rspirv::dr::Operand::LiteralBit32(4)]);
+    let s = b.type_struct(vec![rt]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_f = b.type_pointer(None, StorageClass::StorageBuffer, f32_ty);
+    let ssbo  = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let c_zero_u = b.constant_bit32(u32_ty, 0);
+    let c_one_u  = b.constant_bit32(u32_ty, 1);
+    let c_two_u  = b.constant_bit32(u32_ty, 2);
+    let c_three_u= b.constant_bit32(u32_ty, 3);
+    let c_1 = b.constant_bit32(f32_ty, 1.0f32.to_bits());
+    let c_2 = b.constant_bit32(f32_ty, 2.0f32.to_bits());
+    let c_3 = b.constant_bit32(f32_ty, 3.0f32.to_bits());
+    let c_4 = b.constant_bit32(f32_ty, 4.0f32.to_bits());
+    let c_9 = b.constant_bit32(f32_ty, 9.0f32.to_bits());
+    let vec_init = b.constant_composite(v4f, vec![c_1, c_2, c_3, c_4]);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    // CompositeInsert(9 at index 2) -> {1, 2, 9, 4}.
+    let inserted = b.composite_insert(v4f, None, c_9, vec_init, vec![2]).unwrap();
+    // CopyObject -> same value, new SSA id.
+    let copied = b.copy_object(v4f, None, inserted).unwrap();
+    // Undef f32 (semantically arbitrary; our frontend lowers
+    // to ConstFloat 0).
+    let undef = b.undef(f32_ty, None);
+    let lane0 = b.composite_extract(f32_ty, None, copied, vec![0]).unwrap();
+    let lane0_p_undef = b.f_add(f32_ty, None, lane0, undef).unwrap();
+    let d0 = b.access_chain(ptr_f, None, ssbo, vec![c_zero_u, c_zero_u]).unwrap();
+    b.store(d0, lane0_p_undef, None, vec![]).unwrap();
+    for (i, &ci) in [c_one_u, c_two_u, c_three_u].iter().enumerate() {
+        let lane = b.composite_extract(f32_ty, None, copied, vec![(i + 1) as u32]).unwrap();
+        let d = b.access_chain(ptr_f, None, ssbo, vec![c_zero_u, ci]).unwrap();
+        b.store(d, lane, None, vec![]).unwrap();
+    }
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spv = Vec::with_capacity(words.len() * 4);
+    for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+    let dir = TempDir::new().unwrap();
+    let mut b_buf = vec![0u8; 16];
+    let mut c_buf = vec![0u8; 16];
+    invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
+    invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+    assert_eq!(b_buf, c_buf,
+        "CompositeInsert/CopyObject/Undef divergence");
+    let read = |buf: &[u8], i: usize| -> f32 {
+        f32::from_le_bytes(buf[i*4..i*4+4].try_into().unwrap())
+    };
+    let expected = [1.0_f32, 2.0, 9.0, 4.0];
+    for i in 0..4 {
+        let g = read(&b_buf, i);
+        assert!((g - expected[i]).abs() < 1e-6,
+            "lane {i}: got {g}, want {}", expected[i]);
+    }
+}
+
+#[test]
 fn differential_vector_dynamic_index() {
     // Arc 51: OpVectorExtractDynamic / OpVectorInsertDynamic
     // on a vec4<f32>.  Sweep idx = 0..3 and verify the
