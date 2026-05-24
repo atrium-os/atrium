@@ -1288,6 +1288,15 @@ specifically supports:
   `InterfaceContext::build_with_constants()` entry which the
   frontend's main pass uses; the no-constants path stays
   available for callers that don't yet have a constants ctx.
+  Shadow gather (Arc 54): `OpImageDrefGather` compiles as a
+  composition of Arc 32 (`OpImageGather`, component=0) +
+  Arc 40 (Dref compare per lane).  Fetches red channel of the
+  2×2 footprint via the existing `atrium_tex_gather_2d` helper,
+  then per-lane `FOrdLe(gather[k], dref)` + `Select(cond, 1.0,
+  0.0)`.  Result rebuilt via `ConstVec`.  No new runtime
+  helpers; no backend changes.  Interpreter still doesn't
+  know the Dref-Gather opcode (it reports Unsupported), so
+  the test runs bespoke + cranelift agreement only.
   `textureSize(sampler2D, lod)` (Arc 34): a new IR op
   `Op::SampledImageQuerySizeLod { image, lod }` is emitted
   by the frontend for `OpImageQuerySizeLod`.  Both backends

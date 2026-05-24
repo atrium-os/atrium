@@ -616,6 +616,144 @@ fn run_proj_dref_shader(dref_val: f32, expected: f32) {
 #[test]
 fn texture_sample_proj_dref_pass() { run_proj_dref_shader(0.8, 1.0); }
 
+/// Arc 54: shadow gather.  textureGather(sampler2DShadow,
+/// vec2(0.5, 0.5), dref) returns a vec4 of depth-compare
+/// results at the 2x2 footprint.  Texture is a 2x2 grid with
+/// R values (0.2, 0.5, 0.7, 1.0).  With dref=0.6, depth-le-
+/// dref is (true, true, false, false).  The exact lane order
+/// depends on gather's footprint convention; we just check
+/// the count of 1.0 lanes (must be 2) and that bespoke +
+/// cranelift produce identical output.
+fn build_sample_dref_gather_shader(dref_val: f32) -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, Dim, ExecutionMode,
+        ExecutionModel, FunctionControl, ImageFormat, MemoryModel,
+        StorageClass as SpvStorageClass,
+    };
+
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+
+    let void = b.type_void();
+    let f32_ty = b.type_float(32, None);
+    let vec2_f32 = b.type_vector(f32_ty, 2);
+    let vec4_f32 = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+
+    // Depth image: Dim2D + Depth=1.
+    let image_ty = b.type_image(
+        f32_ty, Dim::Dim2D, 1, 0, 0, 1, ImageFormat::Unknown, None);
+    let sampled_image_ty = b.type_sampled_image(image_ty);
+
+    let ptr_uc_si = b.type_pointer(
+        None, SpvStorageClass::UniformConstant, sampled_image_ty);
+    let ptr_out_vec4 = b.type_pointer(
+        None, SpvStorageClass::Output, vec4_f32);
+
+    let tex = b.variable(ptr_uc_si, None, SpvStorageClass::UniformConstant, None);
+    b.decorate(tex, Decoration::DescriptorSet,
+               vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(tex, Decoration::Binding,
+               vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let out = b.variable(ptr_out_vec4, None, SpvStorageClass::Output, None);
+    b.decorate(out, Decoration::Location,
+               vec![rspirv::dr::Operand::LiteralBit32(0)]);
+
+    let c_half = b.constant_bit32(f32_ty, 0.5f32.to_bits());
+    let c_dref = b.constant_bit32(f32_ty, dref_val.to_bits());
+    let uv = b.constant_composite(vec2_f32, vec![c_half, c_half]);
+
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let sampled = b.load(sampled_image_ty, None, tex, None, vec![]).unwrap();
+    let pixel = b.image_dref_gather(
+        vec4_f32, None, sampled, uv, c_dref, None, vec![]).unwrap();
+    b.store(out, pixel, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![tex, out]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn texture_dref_gather_counts_match() {
+    // 2x2 texture: R values 0.2, 0.5 / 0.7, 1.0 (as u8 / 255).
+    // dref = 0.6 → expect 2 lanes pass (0.2 and 0.5 are ≤ 0.6).
+    let pixels: Vec<u8> = vec![
+        ( 0.2 * 255.0) as u8, 0, 0, 255,
+        ( 0.5 * 255.0) as u8, 0, 0, 255,
+        ( 0.7 * 255.0) as u8, 0, 0, 255,
+        ( 1.0 * 255.0) as u8, 0, 0, 255,
+    ];
+    let tex_desc = TexDesc {
+        data: pixels.as_ptr(),
+        width: 2, height: 2, stride_bytes: 8,
+        format: TexFormat::Rgba8Unorm as u32,
+        depth: 1, slice_bytes: 0,
+        mip_count: 0, mip_descs: std::ptr::null(),
+    };
+    let samp_desc = SamplerDesc {
+        mag_filter: FilterMode::Nearest as u32,
+        min_filter: FilterMode::Nearest as u32,
+        wrap_s: WrapMode::ClampToEdge as u32,
+        wrap_t: WrapMode::ClampToEdge as u32,
+    };
+    let mut uniforms = descriptor_table_buffer(1);
+    unsafe {
+        write_helper_pointers(&mut uniforms,
+            atrium_spv_runtime::atrium_tex_sample_2d,
+            atrium_spv_runtime::atrium_tex_fetch_2d,
+            atrium_spv_runtime::atrium_tex_sample_2d_lod,
+            atrium_spv_runtime::atrium_tex_sample_2d_array,
+            atrium_spv_runtime::atrium_tex_sample_cube,
+            atrium_spv_runtime::atrium_tex_gather_2d,
+            atrium_spv_runtime::atrium_tex_sample_2d_array_lod,
+            atrium_spv_runtime::atrium_tex_sample_cube_lod);
+        write_descriptor_slot(&mut uniforms, 0,
+            &tex_desc as *const _, &samp_desc as *const _);
+    }
+    let texture = TextureBinding {
+        set: 0, binding: 0,
+        data: pixels.clone(),
+        width: 2, height: 2, stride_bytes: 8,
+        format: TexFormat::Rgba8Unorm as u32,
+        sampler: samp_desc,
+    };
+    let inputs = ShaderInputs {
+        textures: vec![texture],
+        uniforms,
+        ..ShaderInputs::default()
+    };
+
+    let spirv = build_sample_dref_gather_shader(0.6);
+    let runners: [Box<dyn ShaderRunner>; 2] = [
+        Box::new(CraneliftRunner::default()),
+        Box::new(BespokeRunner::default()),
+    ];
+    let refs: Vec<&dyn ShaderRunner> =
+        runners.iter().map(|b| b.as_ref()).collect();
+    let tol = atrium_spv_tests::pixels::ColorTolerance::AbsEpsilon { eps: 1e-6 };
+    assert_shader_agrees(&spirv, &inputs, tol, &refs);
+
+    // Pin via cranelift: must be exactly 2 lanes == 1.0 (the
+    // texels 0.2 and 0.5 satisfy ≤ 0.6).
+    let out = CraneliftRunner::default().run(&spirv, &inputs).unwrap();
+    let p = &out.pixels[0];
+    let count_one = p.iter().filter(|&&v| (v - 1.0).abs() < 1e-5).count();
+    let count_zero = p.iter().filter(|&&v| v.abs() < 1e-5).count();
+    assert_eq!(count_one, 2, "expected 2 lanes ≤ dref, got {p:?}");
+    assert_eq!(count_zero, 2, "expected 2 lanes > dref, got {p:?}");
+}
+
 #[test]
 fn texture_sample_proj_dref_fail() { run_proj_dref_shader(0.2, 0.0); }
 

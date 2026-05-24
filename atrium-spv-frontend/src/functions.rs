@@ -2470,6 +2470,109 @@ fn translate_inst(
             Ok(())
         }
 
+        // Arc 54: OpImageDrefGather -- shadow gather.
+        // textureGather(sampler2DShadow, P, refZ) returns a
+        // vec4 whose lanes are the depth-compare results at
+        // the four texels of the 2x2 footprint around P.
+        //
+        // Lower at the frontend by composing Arc 32 (ImageGather)
+        // + Arc 40 (Dref compare):
+        //   gather = ImageGather { component: 0 }(sampler, P)
+        //   for k in 0..4:
+        //     cond_k = FOrdLe(gather[k], dref)
+        //     out_k  = Select(cond_k, 1.0, 0.0)
+        //   result = ConstVec([out_0, out_1, out_2, out_3])
+        SpvOp::ImageDrefGather => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed(
+                    "ImageDrefGather without result id".to_string()))?;
+            let result_type_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed(
+                    "ImageDrefGather without result type".to_string()))?;
+            let result_ty = types.get(result_type_id)?.clone();
+            let img_id   = expect_id(&spv_inst.operands, 0)?;
+            let coord_id = expect_id(&spv_inst.operands, 1)?;
+            let dref_id  = expect_id(&spv_inst.operands, 2)?;
+            let sampled_image = id_map.get(&img_id).cloned()
+                .ok_or_else(|| FrontendError::Malformed(format!(
+                    "ImageDrefGather image id {img_id} not yet defined")))?;
+            let coord = resolve_value(coord_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            let dref = resolve_value(dref_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            // (1) gather red channel at the 2x2 footprint.
+            let component = push_ci(0, atrium_spv_ir::IntKind::I32,
+                source_spirv_offset, insts, next_value_id);
+            let gather_id = ValueId(*next_value_id);
+            *next_value_id += 1;
+            let gather_val = Value {
+                id: gather_id,
+                ty: Type::Vec4(VecElement::F32),
+            };
+            insts.push(Inst {
+                op: Op::ImageGather {
+                    sampled_image, coord, component,
+                },
+                result: Some(gather_val.clone()),
+                source_spirv_offset,
+            });
+            // (2) per-lane compare + select.
+            let one_val = {
+                let id = ValueId(*next_value_id);
+                *next_value_id += 1;
+                let v = Value { id, ty: Type::F32 };
+                insts.push(Inst {
+                    op: Op::ConstFloat { value: 1.0,
+                        kind: atrium_spv_ir::FloatKind::F32 },
+                    result: Some(v.clone()),
+                    source_spirv_offset,
+                });
+                v
+            };
+            let zero_val = {
+                let id = ValueId(*next_value_id);
+                *next_value_id += 1;
+                let v = Value { id, ty: Type::F32 };
+                insts.push(Inst {
+                    op: Op::ConstFloat { value: 0.0,
+                        kind: atrium_spv_ir::FloatKind::F32 },
+                    result: Some(v.clone()),
+                    source_spirv_offset,
+                });
+                v
+            };
+            let mut out_lanes: Vec<Value> = Vec::with_capacity(4);
+            for k in 0..4 {
+                let lane = push_extract_lane(
+                    gather_val.clone(), k as u32,
+                    source_spirv_offset, insts, next_value_id)?;
+                let cond = push_bool(
+                    Op::FOrdLe(lane, dref.clone()),
+                    source_spirv_offset, insts, next_value_id);
+                let sel_id = ValueId(*next_value_id);
+                *next_value_id += 1;
+                let sel = Value { id: sel_id, ty: Type::F32 };
+                insts.push(Inst {
+                    op: Op::Select {
+                        cond,
+                        t_val: one_val.clone(),
+                        f_val: zero_val.clone(),
+                    },
+                    result: Some(sel.clone()),
+                    source_spirv_offset,
+                });
+                out_lanes.push(sel);
+            }
+            let result = alloc_or_get_result(
+                result_id, result_ty, id_map, next_value_id);
+            insts.push(Inst {
+                op: Op::ConstVec(out_lanes),
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
+
         SpvOp::ImageFetch => {
             let result_id = spv_inst.result_id.ok_or_else(||
                 FrontendError::Malformed(
