@@ -116,6 +116,13 @@ impl TypeContext {
                     Type::F64 => VecElement::F64,
                     Type::I32 => VecElement::I32,
                     Type::U32 => VecElement::U32,
+                    // Arc 46: bvec<N> aliased to uvec<N>.
+                    // Bools are i32-backed (0 or 1) per
+                    // constraint B4, so the bit-level layout
+                    // is identical and Any/All/LogicalAnd/Or
+                    // can fold them with the existing
+                    // bitwise ops.
+                    Type::Bool => VecElement::U32,
                     other => return Err(FrontendError::Unsupported(format!(
                         "vector of {other:?} not supported",
                     ))),

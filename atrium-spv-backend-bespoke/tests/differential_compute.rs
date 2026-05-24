@@ -2522,6 +2522,91 @@ fn differential_glsl_int_bit_scan() {
 }
 
 #[test]
+fn differential_any_all_logical() {
+    // Arc 46: OpAny / OpAll / OpLogicalAnd / OpLogicalOr /
+    // OpLogicalNot.  Build a vec3<bool> from three bvecs and
+    // run reductions, comparing bespoke vs cranelift outputs.
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    // (label, lanes, op_kind, expected)
+    // op_kind: 0=any, 1=all, 2=logical_and(l0,l1), 3=logical_or, 4=logical_not(l0)
+    let cases: &[(&str, [bool; 3], u8, u32)] = &[
+        ("any(F,F,F)", [false, false, false], 0, 0),
+        ("any(F,T,F)", [false, true,  false], 0, 1),
+        ("all(T,T,T)", [true,  true,  true],  1, 1),
+        ("all(T,F,T)", [true,  false, true],  1, 0),
+        ("and(T,F,_)", [true,  false, false], 2, 0),
+        ("and(T,T,_)", [true,  true,  false], 2, 1),
+        ("or(F,T,_)",  [false, true,  false], 3, 1),
+        ("or(F,F,_)",  [false, false, false], 3, 0),
+        ("not(F,_,_)", [false, false, false], 4, 1),
+        ("not(T,_,_)", [true,  false, false], 4, 0),
+    ];
+    for &(label, lanes, op_kind, expected) in cases {
+        let mut b = rspirv::dr::Builder::new();
+        b.set_version(1, 3);
+        b.capability(Capability::Shader);
+        b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+        let void   = b.type_void();
+        let u32_ty = b.type_int(32, 0);
+        let bool_ty = b.type_bool();
+        let v3_bool = b.type_vector(bool_ty, 3);
+        let void_fn = b.type_function(void, vec![]);
+        let rt = b.type_runtime_array(u32_ty);
+        b.decorate(rt, Decoration::ArrayStride, vec![rspirv::dr::Operand::LiteralBit32(4)]);
+        let s = b.type_struct(vec![rt]);
+        b.decorate(s, Decoration::Block, vec![]);
+        b.member_decorate(s, 0, Decoration::Offset, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+        let ptr_u = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+        let ssbo  = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+        b.decorate(ssbo, Decoration::DescriptorSet, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        b.decorate(ssbo, Decoration::Binding, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        let c_zero = b.constant_bit32(u32_ty, 0);
+        let c_true  = b.constant_true(bool_ty);
+        let c_false = b.constant_false(bool_ty);
+        let lane_ids: Vec<u32> = lanes.iter()
+            .map(|&v| if v { c_true } else { c_false }).collect();
+        let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+        b.begin_block(None).unwrap();
+        let vec_b = b.composite_construct(v3_bool, None,
+            lane_ids.iter().map(|&i| i).collect::<Vec<_>>()).unwrap();
+        let r_bool = match op_kind {
+            0 => b.any(bool_ty, None, vec_b).unwrap(),
+            1 => b.all(bool_ty, None, vec_b).unwrap(),
+            2 => b.logical_and(bool_ty, None, lane_ids[0], lane_ids[1]).unwrap(),
+            3 => b.logical_or(bool_ty, None, lane_ids[0], lane_ids[1]).unwrap(),
+            4 => b.logical_not(bool_ty, None, lane_ids[0]).unwrap(),
+            _ => unreachable!(),
+        };
+        // Convert bool -> u32 via OpSelect(r, 1, 0).
+        let c_u_one  = b.constant_bit32(u32_ty, 1);
+        let c_u_zero = b.constant_bit32(u32_ty, 0);
+        let r_u = b.select(u32_ty, None, r_bool, c_u_one, c_u_zero).unwrap();
+        let d = b.access_chain(ptr_u, None, ssbo, vec![c_zero, c_zero]).unwrap();
+        b.store(d, r_u, None, vec![]).unwrap();
+        b.ret().unwrap();
+        b.end_function().unwrap();
+        b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+        b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+        let words: Vec<u32> = b.module().assemble();
+        let mut spv = Vec::with_capacity(words.len() * 4);
+        for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+        let dir = TempDir::new().unwrap();
+        let mut b_buf = vec![0u8; 4];
+        let mut c_buf = vec![0u8; 4];
+        invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
+        invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+        assert_eq!(b_buf, c_buf, "{label}: bespoke vs cranelift diverge");
+        let got = u32::from_le_bytes(b_buf[0..4].try_into().unwrap());
+        assert_eq!(got, expected, "{label}: got {got}, want {expected}");
+    }
+}
+
+#[test]
 fn differential_glsl_int_min_max_clamp() {
     // SMin/UMin/SMax/UMax/SClamp/UClamp lower to Select on
     // SLt/ULt/SGt/UGt.  Each op gets its own tiny shader to

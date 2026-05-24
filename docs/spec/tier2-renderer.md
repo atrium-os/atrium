@@ -1220,6 +1220,21 @@ specifically supports:
   later vec4 `pixel = vec4(compare, 0, 0, c_one)`: when uvq
   died (post-extract), pixel hadn't been emitted yet, and
   c_one got freed.
+  Logical / Any / All (Arc 46): five missing scalar logical
+  opcodes and the two vec-bool reductions now compile via
+  pure frontend lowering.
+    `OpLogicalAnd(a, b)`     → `INe(BitAnd(a, b), 0)`
+    `OpLogicalOr(a, b)`      → `INe(BitOr(a, b), 0)`
+    `OpLogicalEqual(a, b)`   → `IEq(a, b)`
+    `OpLogicalNotEqual(a, b)`→ `INe(a, b)`
+    `OpLogicalNot(b)`        → `IEq(b, 0)`
+    `OpAny(v)`               → `INe(fold BitOr  across lanes, 0)`
+    `OpAll(v)`               → `INe(fold BitAnd across lanes, 0)`
+  The final `INe/IEq` step lifts the i32-backed boolean into
+  the bespoke backend's `bools` map so a downstream `OpSelect`
+  or branch finds it.  `bvec<N>` types are now accepted in
+  `OpTypeVector` by aliasing element kind `Bool` to `U32` —
+  same bit layout, no separate bool-vec lane class needed.
   `textureSize(sampler2D, lod)` (Arc 34): a new IR op
   `Op::SampledImageQuerySizeLod { image, lod }` is emitted
   by the frontend for `OpImageQuerySizeLod`.  Both backends

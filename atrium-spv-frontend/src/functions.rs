@@ -558,6 +558,138 @@ fn translate_inst(
             spv_inst, types, constants, iface,
             id_map, next_value_id, insts, source_spirv_offset,
             Op::BitNot),
+
+        // Arc 46: Logical{And,Or,Not,Equal,NotEqual} + Any/All.
+        // Bools are i32-backed (0 or 1) per constraint B4.
+        // The downstream Bool consumers (Op::Select, Op::Branch
+        // conditions) require the value to live in the bespoke
+        // backend's `bools` map, which only happens for the
+        // dedicated compare ops (FOrd*, IEqual, INotEqual, ...).
+        // So the lowering pattern is:
+        //
+        //   LogicalAnd(a, b)     -> INotEqual(BitAnd(a, b), 0)
+        //   LogicalOr(a, b)      -> INotEqual(BitOr(a, b), 0)
+        //   LogicalEqual(a, b)   -> IEqual(a, b)
+        //   LogicalNotEqual(a, b)-> INotEqual(a, b)
+        //   LogicalNot(b)        -> IEqual(b, 0)
+        //   Any(vec_bool)        -> INotEqual(fold BitOr  across lanes, 0)
+        //   All(vec_bool)        -> INotEqual(fold BitAnd across lanes, 0)
+        SpvOp::LogicalAnd | SpvOp::LogicalOr => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed("LogicalAnd/Or without result id".into()))?;
+            let result_ty_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed("LogicalAnd/Or without result type".into()))?;
+            let result_ty = types.get(result_ty_id)?.clone();
+            let a_id = expect_id(&spv_inst.operands, 0)?;
+            let b_id = expect_id(&spv_inst.operands, 1)?;
+            let a = resolve_value(a_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            let b = resolve_value(b_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            let bit_id = ValueId(*next_value_id);
+            *next_value_id += 1;
+            let bit_v = Value { id: bit_id, ty: Type::U32 };
+            insts.push(Inst {
+                op: if matches!(spv_inst.class.opcode, SpvOp::LogicalAnd) {
+                    Op::BitAnd(a, b)
+                } else {
+                    Op::BitOr(a, b)
+                },
+                result: Some(bit_v.clone()),
+                source_spirv_offset,
+            });
+            let zero = push_ci(0, atrium_spv_ir::IntKind::U32,
+                source_spirv_offset, insts, next_value_id);
+            let result = alloc_or_get_result(
+                result_id, result_ty, id_map, next_value_id);
+            insts.push(Inst {
+                op: Op::INe(bit_v, zero),
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
+        SpvOp::LogicalEqual => emit_binop_int(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::IEq(a, b)),
+        SpvOp::LogicalNotEqual => emit_binop_int(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::INe(a, b)),
+        SpvOp::LogicalNot => {
+            // NOT b  ≡  b == 0.
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed("LogicalNot without result id".into()))?;
+            let result_ty_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed("LogicalNot without result type".into()))?;
+            let result_ty = types.get(result_ty_id)?.clone();
+            let b_id = expect_id(&spv_inst.operands, 0)?;
+            let b = resolve_value(b_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            let zero = push_ci(0, atrium_spv_ir::IntKind::U32,
+                source_spirv_offset, insts, next_value_id);
+            let result = alloc_or_get_result(
+                result_id, result_ty, id_map, next_value_id);
+            insts.push(Inst {
+                op: Op::IEq(b, zero),
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
+        SpvOp::Any | SpvOp::All => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed("Any/All without result id".into()))?;
+            let result_ty_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed("Any/All without result type".into()))?;
+            let result_ty = types.get(result_ty_id)?.clone();
+            let vec_id = expect_id(&spv_inst.operands, 0)?;
+            let vec_val = resolve_value(vec_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            let n = match &vec_val.ty {
+                Type::Vec2(_) => 2,
+                Type::Vec3(_) => 3,
+                Type::Vec4(_) => 4,
+                other => return Err(FrontendError::Unsupported(format!(
+                    "Any/All on non-vector type {other:?}"))),
+            };
+            // Extract every lane as i32, then fold BitOr (Any)
+            // or BitAnd (All) left to right.
+            let mut acc = push_extract_lane_i32(
+                vec_val.clone(), 0,
+                source_spirv_offset, insts, next_value_id)?;
+            let is_any = matches!(spv_inst.class.opcode, SpvOp::Any);
+            for i in 1..n {
+                let lane = push_extract_lane_i32(
+                    vec_val.clone(), i as u32,
+                    source_spirv_offset, insts, next_value_id)?;
+                let id = ValueId(*next_value_id);
+                *next_value_id += 1;
+                let v = Value { id, ty: Type::U32 };
+                insts.push(Inst {
+                    op: if is_any { Op::BitOr(acc, lane) }
+                        else      { Op::BitAnd(acc, lane) },
+                    result: Some(v.clone()),
+                    source_spirv_offset,
+                });
+                acc = v;
+            }
+            // `acc` is a u32 with the fold result (0 or 1+).
+            // Convert to Bool with INotEqual(acc, 0) so the
+            // backends' Select / compare-consumer paths see a
+            // properly-tagged bool in their `bools` maps.
+            let zero = push_ci(0, atrium_spv_ir::IntKind::U32,
+                source_spirv_offset, insts, next_value_id);
+            let result = alloc_or_get_result(
+                result_id, result_ty, id_map, next_value_id);
+            insts.push(Inst {
+                op: Op::INe(acc, zero),
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
         // OpBitcast: reinterpret the bits of a value as the
         // result type (f32 <-> i32/u32).  Maps directly to
         // Op::Bitcast, which both backends already lower.
@@ -5162,6 +5294,27 @@ fn lane_add_int_vec(
         source_spirv_offset,
     });
     Ok(new_coord)
+}
+
+/// Same as [`push_extract_lane`] but the returned Value is
+/// typed `Type::U32`.  Used by `OpAny` / `OpAll` lowerings
+/// where the vec lanes are bool/i32-backed.
+fn push_extract_lane_i32(
+    vector: Value,
+    index: u32,
+    source_spirv_offset: u32,
+    insts: &mut Vec<Inst>,
+    next_value_id: &mut u32,
+) -> Result<Value, FrontendError> {
+    let id = ValueId(*next_value_id);
+    *next_value_id += 1;
+    let lane = Value { id, ty: Type::U32 };
+    insts.push(Inst {
+        op: Op::VectorExtract { vector, index },
+        result: Some(lane.clone()),
+        source_spirv_offset,
+    });
+    Ok(lane)
 }
 
 /// Synthesize an `Op::VectorExtract` on `vector` at lane
