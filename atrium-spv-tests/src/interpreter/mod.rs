@@ -1360,7 +1360,7 @@ impl Interpreter {
                          {handle:?}"))),
                 };
                 let coord = self.lookup_value(coord_id, values)?;
-                let (x, y) = match coord {
+                let (mut x, mut y) = match coord {
                     ConstantValue::Vec(ref lanes) if lanes.len() >= 2 => {
                         let x = match &lanes[0] {
                             ConstantValue::Int(n) => *n as i32,
@@ -1377,6 +1377,36 @@ impl Interpreter {
                     other => return Err(InterpError::UnsupportedOpcode(format!(
                         "ImageFetch coord operand not an ivec2: {other:?}"))),
                 };
+                // Arc 41: Image-Operands::ConstOffset / Offset.
+                // Operand 2 (if present) is the mask; the
+                // offset id follows it.  Apply lane-wise.
+                if let Some(rspirv::dr::Operand::ImageOperands(mask)) =
+                    inst.operands.get(2)
+                {
+                    use rspirv::spirv::ImageOperands as IO;
+                    if mask.contains(IO::CONST_OFFSET) || mask.contains(IO::OFFSET) {
+                        // Skip past lower-bit args: Bias(+1), Lod(+1).
+                        let mut idx = 3;
+                        if mask.contains(IO::BIAS) { idx += 1; }
+                        if mask.contains(IO::LOD)  { idx += 1; }
+                        let off_id = match inst.operands.get(idx) {
+                            Some(rspirv::dr::Operand::IdRef(id)) => *id,
+                            other => return Err(InterpError::UnsupportedOpcode(
+                                format!("ImageFetch offset operand: {other:?}"))),
+                        };
+                        let off = self.lookup_value(off_id, values)?;
+                        if let ConstantValue::Vec(off_lanes) = off {
+                            if off_lanes.len() >= 2 {
+                                if let (ConstantValue::Int(ox), ConstantValue::Int(oy)) =
+                                    (&off_lanes[0], &off_lanes[1])
+                                {
+                                    x += *ox as i32;
+                                    y += *oy as i32;
+                                }
+                            }
+                        }
+                    }
+                }
                 let tex = inputs.textures.iter()
                     .find(|t| t.set == set && t.binding == binding)
                     .ok_or_else(|| InterpError::UnsupportedOpcode(format!(

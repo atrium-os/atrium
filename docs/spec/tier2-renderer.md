@@ -1184,6 +1184,16 @@ specifically supports:
   gated Unsupported for now.  Compare op is LESS-OR-EQUAL
   (the canonical shadow case); other compare modes need a
   SamplerDesc field — wire-format work, deferred.
+  ConstOffset / Offset on `OpImageFetch` (Arc 41): pure
+  frontend lowering.  `texelFetch(tex, coord, lod, offset)`
+  → decompose coord and offset into scalar lanes with
+  `Op::VectorExtract`, add lane-wise via `Op::IAdd`, rebuild
+  the integer coord with `Op::ConstVec`, then dispatch the
+  regular `Op::ImageFetch`.  Backends only know scalar IAdd
+  so the lane decomposition is mandatory.  Interpreter
+  mirrors the offset application.  Grad image-operand is
+  rejected (only for ImageSample anyway).  Sample (MSAA) +
+  Offset image operand for `OpImageSample*` are deferred.
   `textureSize(sampler2D, lod)` (Arc 34): a new IR op
   `Op::SampledImageQuerySizeLod { image, lod }` is emitted
   by the frontend for `OpImageQuerySizeLod`.  Both backends

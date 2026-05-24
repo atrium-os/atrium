@@ -1711,10 +1711,75 @@ fn translate_inst(
                 FrontendError::Malformed(format!(
                     "ImageFetch coord id {coord_id} not yet defined")))?;
             // ImageFetch operand 2 (if present) is an Image
-            // Operands mask; we don't decode it yet — the
-            // runtime helper ignores `lod` in v1, so we pass
-            // None unconditionally.
+            // Operands mask; we don't decode `lod` yet (the
+            // runtime helper ignores it in v1).  Arc 41 adds
+            // ConstOffset / Offset support: if present, lift
+            // the ivec2 offset id and emit per-lane IAdd to
+            // form a new integer coord before dispatching.
             let lod = None;
+            let offset_id = extract_image_operand_offset(&spv_inst.operands, 2)?;
+            let coord = if let Some(off_id) = offset_id {
+                let off = id_map.get(&off_id).cloned().ok_or_else(||
+                    FrontendError::Malformed(format!(
+                        "ImageFetch offset id {off_id} not yet defined")))?;
+                // Coord + offset are integer vectors; the
+                // backends only know scalar IAdd, so peel each
+                // lane apart with VectorExtract, add scalar-
+                // wise, and rebuild via ConstVec.
+                let n = match &coord.ty {
+                    Type::Vec2(_) => 2,
+                    Type::Vec3(_) => 3,
+                    Type::Vec4(_) => 4,
+                    other => return Err(FrontendError::Unsupported(format!(
+                        "ImageFetch coord+offset must be a vector, got {other:?}"))),
+                };
+                let mut sum_lanes: Vec<Value> = Vec::with_capacity(n);
+                for i in 0..n {
+                    // Lane i of coord (i32) and offset (i32).
+                    let cl_id = ValueId(*next_value_id);
+                    *next_value_id += 1;
+                    let cl = Value { id: cl_id, ty: Type::I32 };
+                    insts.push(Inst {
+                        op: Op::VectorExtract {
+                            vector: coord.clone(),
+                            index: i as u32,
+                        },
+                        result: Some(cl.clone()),
+                        source_spirv_offset,
+                    });
+                    let ol_id = ValueId(*next_value_id);
+                    *next_value_id += 1;
+                    let ol = Value { id: ol_id, ty: Type::I32 };
+                    insts.push(Inst {
+                        op: Op::VectorExtract {
+                            vector: off.clone(),
+                            index: i as u32,
+                        },
+                        result: Some(ol.clone()),
+                        source_spirv_offset,
+                    });
+                    let s_id = ValueId(*next_value_id);
+                    *next_value_id += 1;
+                    let s = Value { id: s_id, ty: Type::I32 };
+                    insts.push(Inst {
+                        op: Op::IAdd(cl, ol),
+                        result: Some(s.clone()),
+                        source_spirv_offset,
+                    });
+                    sum_lanes.push(s);
+                }
+                let id = ValueId(*next_value_id);
+                *next_value_id += 1;
+                let new_coord = Value { id, ty: coord.ty.clone() };
+                insts.push(Inst {
+                    op: Op::ConstVec(sum_lanes),
+                    result: Some(new_coord.clone()),
+                    source_spirv_offset,
+                });
+                new_coord
+            } else {
+                coord
+            };
             let result = alloc_or_get_result(result_id, result_ty, id_map, next_value_id);
             insts.push(Inst {
                 op: Op::ImageFetch { image, coord, lod },
@@ -4970,6 +5035,44 @@ fn extract_image_operand_bias(
         Some(Operand::IdRef(id)) => Ok(Some(*id)),
         other => Err(FrontendError::Malformed(format!(
             "Image-Operands::Bias expected IdRef after mask, got {other:?}"))),
+    }
+}
+
+/// If the SPIR-V operand list at `start` begins with an
+/// `Image-Operands` mask whose `ConstOffset` or `Offset` bit
+/// is set, return the offset `IdRef` that follows.  Returns
+/// `None` when no mask is present or neither bit is clear.
+/// Bails on combos we don't handle (Bias, Grad).
+///
+/// Bit order (lowest first) in the args list:
+///   Bias(0x1), Lod(0x2), Grad(0x4 — *2* args), ConstOffset(0x8),
+///   Offset(0x10), ConstOffsets(0x20), Sample(0x40), MinLod(0x80)
+fn extract_image_operand_offset(
+    operands: &[Operand],
+    start: usize,
+) -> Result<Option<Word>, FrontendError> {
+    use rspirv::spirv::ImageOperands as IO;
+    let Some(first) = operands.get(start) else { return Ok(None); };
+    let mask = match first {
+        Operand::ImageOperands(m) => *m,
+        _ => return Ok(None),
+    };
+    if mask.contains(IO::GRAD) {
+        return Err(FrontendError::Unsupported(
+            "Image-Operands::Grad not supported on ImageFetch".to_string()));
+    }
+    if !mask.contains(IO::CONST_OFFSET) && !mask.contains(IO::OFFSET) {
+        return Ok(None);
+    }
+    // Skip past lower-bit args.
+    let mut idx = start + 1;
+    if mask.contains(IO::BIAS) { idx += 1; }
+    if mask.contains(IO::LOD)  { idx += 1; }
+    // Grad would be +2 but we bailed above.
+    match operands.get(idx) {
+        Some(Operand::IdRef(id)) => Ok(Some(*id)),
+        other => Err(FrontendError::Malformed(format!(
+            "Image-Operands::ConstOffset expected IdRef at {idx}, got {other:?}"))),
     }
 }
 
