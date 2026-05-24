@@ -1255,9 +1255,13 @@ specifically supports:
   same sign as dividend) compiles via pure frontend lowering
   as `x - y * (x sdiv y)`, using the existing `Op::SDiv` /
   `Op::IMul` / `Op::ISub`.  `OpSMod` (floored; same sign as
-  divisor) is wired into the frontend but the bespoke
-  backend's `Op::SMod` path is incomplete — tracked as a
-  follow-up.
+  divisor) is also now lowered at the frontend (Arc 50)
+  rather than emitting `Op::SMod` and relying on the
+  bespoke's incomplete native arm.  The lowering applies
+  the standard sign-adjust on top of SRem, using bit-trick
+  computations (`>> 31` for sign bits, `r | -r` for nonzero
+  detection) so the cond stays in the int/bool pipelines
+  the bespoke already handles.
   `textureSize(sampler2D, lod)` (Arc 34): a new IR op
   `Op::SampledImageQuerySizeLod { image, lod }` is emitted
   by the frontend for `OpImageQuerySizeLod`.  Both backends

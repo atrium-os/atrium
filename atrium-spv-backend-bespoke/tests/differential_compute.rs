@@ -2522,28 +2522,31 @@ fn differential_glsl_int_bit_scan() {
 }
 
 #[test]
-fn differential_op_srem() {
-    // Arc 49: OpSRem (truncated, same sign as x) vs OpSMod
-    // (floored, same sign as y).  Distinguishing cases:
-    // negative dividend.
+fn differential_op_srem_smod() {
+    // Arc 49 + 50: OpSRem (truncated, same sign as x) and
+    // OpSMod (floored, same sign as y).  Distinguishing cases:
+    // negative dividend OR negative divisor.
     use rspirv::binary::Assemble;
     use rspirv::spirv::{
         AddressingModel, Capability, Decoration, ExecutionMode,
         ExecutionModel, FunctionControl, MemoryModel, StorageClass,
     };
-    // SRem only.  OpSMod is wired in the frontend but the
-    // bespoke backend's Op::SMod path is incomplete (needs a
-    // sign-adjust correction); tracked as a follow-up.
-    // (label, x, y, expected)
-    let cases: &[(&str, i32, i32, i32)] = &[
-        ("srem(7, 3)",   7,  3,  1),
-        ("srem(-7, 3)", -7,  3, -1),
-        ("srem(7, -3)",  7, -3,  1),
-        ("srem(-7, -3)",-7, -3, -1),
-        ("srem(0, 5)",   0,  5,  0),
-        ("srem(15, 7)", 15,  7,  1),
+    // (label, is_mod, x, y, expected)
+    let cases: &[(&str, bool, i32, i32, i32)] = &[
+        ("srem(7, 3)",   false,  7,  3,  1),
+        ("srem(-7, 3)",  false, -7,  3, -1),
+        ("srem(7, -3)",  false,  7, -3,  1),
+        ("srem(-7, -3)", false, -7, -3, -1),
+        ("srem(0, 5)",   false,  0,  5,  0),
+        ("srem(15, 7)",  false, 15,  7,  1),
+        ("smod(7, 3)",   true,   7,  3,  1),   // signs same -> SRem
+        ("smod(-7, 3)",  true,  -7,  3,  2),   // signs differ -> adjust
+        ("smod(7, -3)",  true,   7, -3, -2),
+        ("smod(-7, -3)", true,  -7, -3, -1),   // signs same -> SRem
+        ("smod(0, 5)",   true,   0,  5,  0),   // r==0, no adjust
+        ("smod(15, 7)",  true,  15,  7,  1),
     ];
-    for &(label, x, y, expected) in cases {
+    for &(label, is_mod, x, y, expected) in cases {
         let mut b = rspirv::dr::Builder::new();
         b.set_version(1, 3);
         b.capability(Capability::Shader);
@@ -2567,7 +2570,11 @@ fn differential_op_srem() {
         let cy = b.constant_bit32(i32_ty, y as u32);
         let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
         b.begin_block(None).unwrap();
-        let r = b.s_rem(i32_ty, None, cx, cy).unwrap();
+        let r = if is_mod {
+            b.s_mod(i32_ty, None, cx, cy).unwrap()
+        } else {
+            b.s_rem(i32_ty, None, cx, cy).unwrap()
+        };
         let d = b.access_chain(ptr_i, None, ssbo, vec![c_zero, c_zero]).unwrap();
         b.store(d, r, None, vec![]).unwrap();
         b.ret().unwrap();
