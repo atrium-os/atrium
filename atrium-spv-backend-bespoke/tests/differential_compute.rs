@@ -2531,13 +2531,13 @@ fn differential_glsl_int_min_max_clamp() {
     // byte-identical SSBO buffers.
     let cases: &[(&str, u32, bool, &[u32], u32)] = &[
         // (label, ext_op, signed, args, expected)
-        ("umin(3,7)",        39, false, &[3, 7],            3),
-        ("umin(10,2)",       39, false, &[10, 2],           2),
+        ("umin(3,7)",        38, false, &[3, 7],            3),
+        ("umin(10,2)",       38, false, &[10, 2],           2),
         ("umax(3,7)",        41, false, &[3, 7],            7),
         ("umax(0,0xFFFFFFFF)",41,false, &[0, 0xFFFF_FFFF],  0xFFFF_FFFF),
         ("uclamp(15,1,10)",  44, false, &[15, 1, 10],       10),
         ("uclamp(5,1,10)",   44, false, &[5,  1, 10],       5),
-        ("smin(3,-7)",       38, true,  &[3u32, -7i32 as u32], -7i32 as u32),
+        ("smin(3,-7)",       39, true,  &[3u32, -7i32 as u32], -7i32 as u32),
         ("smax(-5,5)",       42, true,  &[-5i32 as u32, 5], 5),
         ("sclamp(-50,-10,10)",45,true,  &[-50i32 as u32, -10i32 as u32, 10], -10i32 as u32),
         ("sclamp(-3,-10,10)",45, true,  &[-3i32 as u32, -10i32 as u32, 10], -3i32 as u32),

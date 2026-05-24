@@ -4129,8 +4129,11 @@ fn translate_inst(
                     let c31 = push_ci32(31, source_spirv_offset, insts, next_value_id);
                     Op::ISub(c31, clz_v)
                 }
-                // SMin(38) / UMin(39) / SMax(42) / UMax(41):
+                // UMin(38) / SMin(39) / UMax(41) / SMax(42):
                 // synth via Select on a signed/unsigned compare.
+                // (Arc 45: previously had 38/39 swapped against
+                // the GLSL.std.450 spec; matching test cases
+                // also corrected.)
                 38 | 39 | 41 | 42 => {
                     let x_id = expect_id(&spv_inst.operands, 2)?;
                     let y_id = expect_id(&spv_inst.operands, 3)?;
@@ -4139,8 +4142,8 @@ fn translate_inst(
                     let y = resolve_value(y_id, types, constants, id_map,
                         next_value_id, insts, source_spirv_offset)?;
                     let cmp_op = match inst_enum {
-                        38 => Op::SLt(x.clone(), y.clone()), // SMin
-                        39 => Op::ULt(x.clone(), y.clone()), // UMin
+                        38 => Op::ULt(x.clone(), y.clone()), // UMin
+                        39 => Op::SLt(x.clone(), y.clone()), // SMin
                         41 => Op::UGt(x.clone(), y.clone()), // UMax
                         42 => Op::SGt(x.clone(), y.clone()), // SMax
                         _ => unreachable!(),
