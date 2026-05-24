@@ -1316,6 +1316,13 @@ specifically supports:
   `LogicalAnd(false, false)` would previously dispatch to
   LogicalEqual and return 1 (wrong; expected 0).  Select via
   spec-const ternary was unreachable (mapped at `169169`).
+  Width-conversion ops (Arc 57): `OpSConvert` /
+  `OpUConvert` / `OpFConvert` are accepted at the frontend
+  via a zero-cost `id_map` alias when source and result
+  types match (v1 supports only 32-bit scalars, so this is
+  the only legal case here).  Width-changing conversions
+  (f16↔f32, i64↔i32) are rejected with a clear `Unsupported`
+  diagnostic rather than falling through the catchall.
   `textureSize(sampler2D, lod)` (Arc 34): a new IR op
   `Op::SampledImageQuerySizeLod { image, lod }` is emitted
   by the frontend for `OpImageQuerySizeLod`.  Both backends

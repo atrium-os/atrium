@@ -787,6 +787,32 @@ fn translate_inst(
             });
             Ok(())
         }
+        // Arc 57: OpSConvert / OpUConvert / OpFConvert --
+        // width-changing conversions.  Tier-2 v1 only supports
+        // 32-bit scalar/vector types, so for the common case
+        // where source and destination types match, these
+        // collapse to a zero-cost alias of the source id in
+        // the SPIR-V id_map.  Genuine widening / narrowing
+        // (e.g. f16->f32 or i64->i32) is gated as unsupported.
+        SpvOp::SConvert | SpvOp::UConvert | SpvOp::FConvert => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed(
+                    "[SUF]Convert without result id".into()))?;
+            let result_ty_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed(
+                    "[SUF]Convert without result type".into()))?;
+            let result_ty = types.get(result_ty_id)?.clone();
+            let src_id = expect_id(&spv_inst.operands, 0)?;
+            let src = resolve_value(src_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            if src.ty != result_ty {
+                return Err(FrontendError::Unsupported(format!(
+                    "[SUF]Convert {:?} -> {:?} (width change)",
+                    src.ty, result_ty)));
+            }
+            id_map.insert(result_id, src);
+            Ok(())
+        }
         // OpBitcast: reinterpret the bits of a value as the
         // result type (f32 <-> i32/u32).  Maps directly to
         // Op::Bitcast, which both backends already lower.
