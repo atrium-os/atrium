@@ -1172,6 +1172,18 @@ specifically supports:
   (no MSAA).  Interpreter adds matching `Op::ImageQueryLod`
   + `Op::ImageQuerySamples` short-circuits so all three
   runners agree.  No backend changes.
+  Shadow samplers (Arc 40): `OpImageSampleDref{Implicit,Explicit}Lod`
+  lower entirely at the frontend with no new runtime helpers
+  or backend changes.  The op decomposes into:
+    `r       = ImageSample{Implicit,Explicit}Lod(coord)`
+    `r0      = VectorExtract(r, 0)`
+    `cond    = FOrdLe(r0, dref)`
+    `result  = Select(cond, 1.0, 0.0)`
+  GLSL's `texture(sampler2DShadow, vec3(s, t, dref))` returns
+  scalar f32; vec4 results would require a splat and are
+  gated Unsupported for now.  Compare op is LESS-OR-EQUAL
+  (the canonical shadow case); other compare modes need a
+  SamplerDesc field — wire-format work, deferred.
   `textureSize(sampler2D, lod)` (Arc 34): a new IR op
   `Op::SampledImageQuerySizeLod { image, lod }` is emitted
   by the frontend for `OpImageQuerySizeLod`.  Both backends

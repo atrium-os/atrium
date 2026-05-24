@@ -1349,6 +1349,129 @@ fn translate_inst(
         // SampledImage value (produced by OpSampledImage),
         // the second is the UV coord; ExplicitLod takes a
         // mip-level as operand 2.
+        // OpImageSampleDref{Implicit,Explicit}Lod (Arc 40):
+        // shadow samplers.  GLSL `texture(sampler2DShadow,
+        // vec3(s, t, dref))` lowers in SPIR-V to:
+        //   <op> <result_type=f32> <result_id>
+        //        <sampled_image> <coord:vec2> <dref:f32>
+        //        [<image_operands> ...]
+        // We lower it entirely at the frontend as:
+        //   r       = ImageSample{Implicit,Explicit}Lod(coord)
+        //   r0      = VectorExtract(r, 0)
+        //   cond    = FOrdLe(r0, dref)
+        //   result  = Select(cond, 1.0, 0.0)
+        // No new helpers, no backend changes.  Result type
+        // must be F32 (the common shadow case); vec4 results
+        // bail Unsupported.
+        SpvOp::ImageSampleDrefImplicitLod
+        | SpvOp::ImageSampleDrefExplicitLod => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed(
+                    "ImageSampleDref without result id".to_string()))?;
+            let result_type_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed(
+                    "ImageSampleDref without result type".to_string()))?;
+            let result_ty = types.get(result_type_id)?.clone();
+            if !matches!(result_ty, Type::F32) {
+                return Err(FrontendError::Unsupported(format!(
+                    "ImageSampleDref result type {result_ty:?} \
+                     (only F32 supported)")));
+            }
+            let si_id    = expect_id(&spv_inst.operands, 0)?;
+            let coord_id = expect_id(&spv_inst.operands, 1)?;
+            let dref_id  = expect_id(&spv_inst.operands, 2)?;
+            let sampled_image = id_map.get(&si_id).cloned().ok_or_else(||
+                FrontendError::Malformed(format!(
+                    "ImageSampleDref sampled_image {si_id} not defined")))?;
+            let coord = id_map.get(&coord_id).cloned().ok_or_else(||
+                FrontendError::Malformed(format!(
+                    "ImageSampleDref coord {coord_id} not defined")))?;
+            let dref = id_map.get(&dref_id).cloned().ok_or_else(||
+                FrontendError::Malformed(format!(
+                    "ImageSampleDref dref {dref_id} not defined")))?;
+
+            // (1) Inner sample.  Optional ExplicitLod's LOD
+            // arrives via the Image Operands mask at index 3.
+            let inner_op = if spv_inst.class.opcode
+                == SpvOp::ImageSampleDrefExplicitLod
+            {
+                let lod_id = extract_image_operand_lod(&spv_inst.operands, 3)?
+                    .ok_or_else(|| FrontendError::Malformed(
+                        "ImageSampleDrefExplicitLod missing Image-Operands::Lod"
+                        .to_string()))?;
+                let lod = id_map.get(&lod_id).cloned().ok_or_else(||
+                    FrontendError::Malformed(format!(
+                        "ImageSampleDrefExplicitLod lod {lod_id} not defined")))?;
+                Op::ImageSampleExplicitLod { sampled_image, coord, lod }
+            } else {
+                Op::ImageSampleImplicitLod { sampled_image, coord }
+            };
+            let sample_id = ValueId(*next_value_id);
+            *next_value_id += 1;
+            let sample_val = Value {
+                id: sample_id,
+                ty: Type::Vec4(VecElement::F32),
+            };
+            insts.push(Inst {
+                op: inner_op,
+                result: Some(sample_val.clone()),
+                source_spirv_offset,
+            });
+
+            // (2) R = VectorExtract(sample, 0).
+            let r_val = push_extract_lane(
+                sample_val, 0,
+                source_spirv_offset, insts, next_value_id)?;
+
+            // (3) cond = FOrdLe(r, dref).
+            let cond_id = ValueId(*next_value_id);
+            *next_value_id += 1;
+            let cond_val = Value { id: cond_id, ty: Type::Bool };
+            insts.push(Inst {
+                op: Op::FOrdLe(r_val, dref),
+                result: Some(cond_val.clone()),
+                source_spirv_offset,
+            });
+
+            // (4) 1.0 / 0.0 constants.
+            let one_id = ValueId(*next_value_id);
+            *next_value_id += 1;
+            let one_val = Value { id: one_id, ty: Type::F32 };
+            insts.push(Inst {
+                op: Op::ConstFloat {
+                    value: 1.0,
+                    kind: atrium_spv_ir::FloatKind::F32,
+                },
+                result: Some(one_val.clone()),
+                source_spirv_offset,
+            });
+            let zero_id = ValueId(*next_value_id);
+            *next_value_id += 1;
+            let zero_val = Value { id: zero_id, ty: Type::F32 };
+            insts.push(Inst {
+                op: Op::ConstFloat {
+                    value: 0.0,
+                    kind: atrium_spv_ir::FloatKind::F32,
+                },
+                result: Some(zero_val.clone()),
+                source_spirv_offset,
+            });
+
+            // (5) result = Select(cond, 1.0, 0.0).
+            let result = alloc_or_get_result(
+                result_id, result_ty, id_map, next_value_id);
+            insts.push(Inst {
+                op: Op::Select {
+                    cond: cond_val,
+                    t_val: one_val,
+                    f_val: zero_val,
+                },
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
+
         SpvOp::ImageSampleImplicitLod | SpvOp::ImageSampleExplicitLod
         | SpvOp::ImageSampleProjImplicitLod
         | SpvOp::ImageSampleProjExplicitLod => {

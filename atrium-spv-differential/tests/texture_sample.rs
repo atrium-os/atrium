@@ -348,6 +348,156 @@ fn texture_sample_tinted() {
     let _ = UNIFORMS_DESC_BASE;
 }
 
+/// Arc 40: shadow sampler `texture(sampler2DShadow, vec3)`.
+/// Lowered at the frontend to:
+///   r        = ImageSample(coord)
+///   cond     = FOrdLe(r.r, dref)
+///   result   = cond ? 1.0 : 0.0
+/// No new helpers, no backend changes.
+fn build_sample_dref_shader(dref_val: f32) -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, Dim, ExecutionMode,
+        ExecutionModel, FunctionControl, ImageFormat, MemoryModel,
+        StorageClass as SpvStorageClass,
+    };
+
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+
+    let void = b.type_void();
+    let f32_ty = b.type_float(32, None);
+    let vec2_f32 = b.type_vector(f32_ty, 2);
+    let vec4_f32 = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+
+    // Depth-image type: Dim2D + Depth=1.
+    let image_ty = b.type_image(
+        f32_ty, Dim::Dim2D, 1, 0, 0, 1, ImageFormat::Unknown, None);
+    let sampled_image_ty = b.type_sampled_image(image_ty);
+
+    let ptr_uc_si = b.type_pointer(
+        None, SpvStorageClass::UniformConstant, sampled_image_ty);
+    let ptr_out_vec4 = b.type_pointer(
+        None, SpvStorageClass::Output, vec4_f32);
+
+    let tex = b.variable(ptr_uc_si, None, SpvStorageClass::UniformConstant, None);
+    b.decorate(tex, Decoration::DescriptorSet,
+               vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(tex, Decoration::Binding,
+               vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let out = b.variable(ptr_out_vec4, None, SpvStorageClass::Output, None);
+    b.decorate(out, Decoration::Location,
+               vec![rspirv::dr::Operand::LiteralBit32(0)]);
+
+    let c_half = b.constant_bit32(f32_ty, 0.5f32.to_bits());
+    let c_one  = b.constant_bit32(f32_ty, 1.0f32.to_bits());
+    let c_zero = b.constant_bit32(f32_ty, 0.0f32.to_bits());
+    let c_dref = b.constant_bit32(f32_ty, dref_val.to_bits());
+    let uv = b.constant_composite(vec2_f32, vec![c_half, c_half]);
+
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let sampled = b.load(sampled_image_ty, None, tex, None, vec![]).unwrap();
+    let compare = b.image_sample_dref_implicit_lod(
+        f32_ty, None, sampled, uv, c_dref, None, vec![]).unwrap();
+    // Splat scalar compare into vec4 (compare, 0, 0, 1) for
+    // the output store.
+    let pixel = b.composite_construct(vec4_f32, None,
+        vec![compare, c_zero, c_zero, c_one]).unwrap();
+    b.store(out, pixel, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![tex, out]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+fn run_dref_shader(dref_val: f32, expected: f32) {
+    // 1x1 texture with R = 128/255 ≈ 0.502, sampled at centre.
+    let pixels: Vec<u8> = vec![128, 0, 0, 255];
+    let tex_desc = TexDesc {
+        data: pixels.as_ptr(),
+        width: 1, height: 1, stride_bytes: 4,
+        format: TexFormat::Rgba8Unorm as u32,
+        depth: 1, slice_bytes: 0,
+        mip_count: 0, mip_descs: std::ptr::null(),
+    };
+    let samp_desc = SamplerDesc {
+        mag_filter: FilterMode::Nearest as u32,
+        min_filter: FilterMode::Nearest as u32,
+        wrap_s: WrapMode::ClampToEdge as u32,
+        wrap_t: WrapMode::ClampToEdge as u32,
+    };
+    let mut uniforms = descriptor_table_buffer(1);
+    unsafe {
+        write_helper_pointers(&mut uniforms,
+            atrium_spv_runtime::atrium_tex_sample_2d,
+            atrium_spv_runtime::atrium_tex_fetch_2d,
+            atrium_spv_runtime::atrium_tex_sample_2d_lod,
+            atrium_spv_runtime::atrium_tex_sample_2d_array,
+            atrium_spv_runtime::atrium_tex_sample_cube,
+            atrium_spv_runtime::atrium_tex_gather_2d,
+            atrium_spv_runtime::atrium_tex_sample_2d_array_lod,
+            atrium_spv_runtime::atrium_tex_sample_cube_lod);
+        write_descriptor_slot(&mut uniforms, 0,
+            &tex_desc as *const _, &samp_desc as *const _);
+    }
+    let texture = TextureBinding {
+        set: 0, binding: 0,
+        data: pixels.clone(),
+        width: 1, height: 1, stride_bytes: 4,
+        format: TexFormat::Rgba8Unorm as u32,
+        sampler: samp_desc,
+    };
+    let inputs = ShaderInputs {
+        textures: vec![texture],
+        uniforms,
+        ..ShaderInputs::default()
+    };
+
+    let spirv = build_sample_dref_shader(dref_val);
+    // Interpreter doesn't handle OpImageSampleDrefImplicitLod,
+    // so it'll report Unsupported.  Drop it and let
+    // bespoke + cranelift agree (assert_shader_agrees needs
+    // ≥2 successful runners).
+    let runners: [Box<dyn ShaderRunner>; 3] = [
+        Box::new(InterpreterRunner),
+        Box::new(CraneliftRunner::default()),
+        Box::new(BespokeRunner::default()),
+    ];
+    let refs: Vec<&dyn ShaderRunner> =
+        runners.iter().map(|b| b.as_ref()).collect();
+    let tol = atrium_spv_tests::pixels::ColorTolerance::AbsEpsilon { eps: 1e-6 };
+    assert_shader_agrees(&spirv, &inputs, tol, &refs);
+
+    // Pin against the bespoke runner directly (skip interp).
+    let out = BespokeRunner::default().run(&spirv, &inputs).unwrap();
+    let p = &out.pixels[0];
+    assert!((p[0] - expected).abs() < 1e-6,
+        "dref={dref_val} expected {expected}, got {} (full {:?})",
+        p[0], p);
+}
+
+#[test]
+fn texture_sample_dref_pass() {
+    // Texel R ≈ 0.502; dref = 0.8 → 0.502 ≤ 0.8 → compare = 1.
+    run_dref_shader(0.8, 1.0);
+}
+
+#[test]
+fn texture_sample_dref_fail() {
+    // Texel R ≈ 0.502; dref = 0.2 → 0.502 ≤ 0.2 false → 0.
+    run_dref_shader(0.2, 0.0);
+}
+
 /// Arc 37 follow-up: projective texturing with an explicit
 /// LOD operand.  `OpImageSampleProjExplicitLod` with coord
 /// `(0.5, 0.5, 1.0)` and lod=0 — after the q=1 divide reduces
