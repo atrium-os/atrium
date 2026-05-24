@@ -1364,7 +1364,9 @@ fn translate_inst(
         // must be F32 (the common shadow case); vec4 results
         // bail Unsupported.
         SpvOp::ImageSampleDrefImplicitLod
-        | SpvOp::ImageSampleDrefExplicitLod => {
+        | SpvOp::ImageSampleDrefExplicitLod
+        | SpvOp::ImageSampleProjDrefImplicitLod
+        | SpvOp::ImageSampleProjDrefExplicitLod => {
             let result_id = spv_inst.result_id.ok_or_else(||
                 FrontendError::Malformed(
                     "ImageSampleDref without result id".to_string()))?;
@@ -1383,18 +1385,73 @@ fn translate_inst(
             let sampled_image = id_map.get(&si_id).cloned().ok_or_else(||
                 FrontendError::Malformed(format!(
                     "ImageSampleDref sampled_image {si_id} not defined")))?;
-            let coord = id_map.get(&coord_id).cloned().ok_or_else(||
+            let raw_coord = id_map.get(&coord_id).cloned().ok_or_else(||
                 FrontendError::Malformed(format!(
                     "ImageSampleDref coord {coord_id} not defined")))?;
             let dref = id_map.get(&dref_id).cloned().ok_or_else(||
                 FrontendError::Malformed(format!(
                     "ImageSampleDref dref {dref_id} not defined")))?;
 
+            // ProjDref variant: divide coord by its last lane
+            // before sampling (same Proj math as Arc 37).
+            let is_proj = matches!(spv_inst.class.opcode,
+                SpvOp::ImageSampleProjDrefImplicitLod
+                | SpvOp::ImageSampleProjDrefExplicitLod);
+            let coord = if is_proj {
+                let n = match &raw_coord.ty {
+                    Type::Vec2(_) => 2,
+                    Type::Vec3(_) => 3,
+                    Type::Vec4(_) => 4,
+                    other => return Err(FrontendError::Unsupported(format!(
+                        "ImageSampleProjDref coord must be a vector, got {other:?}"))),
+                };
+                if n < 2 {
+                    return Err(FrontendError::Unsupported(format!(
+                        "ImageSampleProjDref coord needs ≥2 lanes, got {n}")));
+                }
+                let q_val = push_extract_lane(
+                    raw_coord.clone(), (n - 1) as u32,
+                    source_spirv_offset, insts, next_value_id)?;
+                let mut lanes_div: Vec<Value> = Vec::with_capacity(n - 1);
+                for i in 0..n - 1 {
+                    let lane_i = push_extract_lane(
+                        raw_coord.clone(), i as u32,
+                        source_spirv_offset, insts, next_value_id)?;
+                    let id = ValueId(*next_value_id);
+                    *next_value_id += 1;
+                    let div = Value { id, ty: Type::F32 };
+                    insts.push(Inst {
+                        op: Op::FDiv(lane_i, q_val.clone()),
+                        result: Some(div.clone()),
+                        source_spirv_offset,
+                    });
+                    lanes_div.push(div);
+                }
+                let new_ty = match n - 1 {
+                    2 => Type::Vec2(VecElement::F32),
+                    3 => Type::Vec3(VecElement::F32),
+                    other => return Err(FrontendError::Unsupported(format!(
+                        "ImageSampleProjDref unsupported divided lane count {other}"))),
+                };
+                let id = ValueId(*next_value_id);
+                *next_value_id += 1;
+                let new_coord = Value { id, ty: new_ty };
+                insts.push(Inst {
+                    op: Op::ConstVec(lanes_div),
+                    result: Some(new_coord.clone()),
+                    source_spirv_offset,
+                });
+                new_coord
+            } else {
+                raw_coord
+            };
+
             // (1) Inner sample.  Optional ExplicitLod's LOD
             // arrives via the Image Operands mask at index 3.
-            let inner_op = if spv_inst.class.opcode
-                == SpvOp::ImageSampleDrefExplicitLod
-            {
+            let is_explicit = matches!(spv_inst.class.opcode,
+                SpvOp::ImageSampleDrefExplicitLod
+                | SpvOp::ImageSampleProjDrefExplicitLod);
+            let inner_op = if is_explicit {
                 let lod_id = extract_image_operand_lod(&spv_inst.operands, 3)?
                     .ok_or_else(|| FrontendError::Malformed(
                         "ImageSampleDrefExplicitLod missing Image-Operands::Lod"

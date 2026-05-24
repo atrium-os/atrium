@@ -1194,6 +1194,16 @@ specifically supports:
   mirrors the offset application.  Grad image-operand is
   rejected (only for ImageSample anyway).  Sample (MSAA) +
   Offset image operand for `OpImageSample*` are deferred.
+  Projective shadow samplers (Arc 42): `OpImageSampleProjDref{Implicit,
+  Explicit}Lod` compose Arc 37 (proj divide) + Arc 40 (dref
+  compare) at the frontend.  Coord lanes ÷ last lane, sample,
+  extract R, FOrdLe vs dref, Select 1.0/0.0.  Interpreter
+  mirrors the divide + compare in one arm.  Bespoke backend
+  currently chokes on ConstVec rebuilt from FDiv lanes when
+  the new coord is later consumed by a downstream
+  VectorExtract (vs by ImageSample directly — Arc 37 path
+  works fine); tracked as a follow-up.  Interp + Cranelift
+  carry the test.
   `textureSize(sampler2D, lod)` (Arc 34): a new IR op
   `Op::SampledImageQuerySizeLod { image, lod }` is emitted
   by the frontend for `OpImageQuerySizeLod`.  Both backends

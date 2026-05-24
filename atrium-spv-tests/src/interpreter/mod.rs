@@ -1254,7 +1254,11 @@ impl Interpreter {
             // not the sampler.
             Op::ImageSampleImplicitLod | Op::ImageSampleExplicitLod
             | Op::ImageSampleProjImplicitLod
-            | Op::ImageSampleProjExplicitLod => {
+            | Op::ImageSampleProjExplicitLod
+            | Op::ImageSampleDrefImplicitLod
+            | Op::ImageSampleDrefExplicitLod
+            | Op::ImageSampleProjDrefImplicitLod
+            | Op::ImageSampleProjDrefExplicitLod => {
                 let result_id = inst.result_id.ok_or_else(||
                     InterpError::BadConstant(0))?;
                 let si_id = op_id(&inst.operands, 0)?;
@@ -1269,7 +1273,28 @@ impl Interpreter {
                 let coord = self.lookup_value(coord_id, values)?;
                 let is_proj = matches!(inst.class.opcode,
                     Op::ImageSampleProjImplicitLod
-                    | Op::ImageSampleProjExplicitLod);
+                    | Op::ImageSampleProjExplicitLod
+                    | Op::ImageSampleProjDrefImplicitLod
+                    | Op::ImageSampleProjDrefExplicitLod);
+                let is_dref = matches!(inst.class.opcode,
+                    Op::ImageSampleDrefImplicitLod
+                    | Op::ImageSampleDrefExplicitLod
+                    | Op::ImageSampleProjDrefImplicitLod
+                    | Op::ImageSampleProjDrefExplicitLod);
+                let dref_val: Option<f32> = if is_dref {
+                    // Dref's reference value is operand 2 (the
+                    // operand right after coord); for ProjDref
+                    // the same slot too -- SPIR-V puts it before
+                    // the optional image-operands mask.
+                    let d_id = op_id(&inst.operands, 2)?;
+                    match self.lookup_value(d_id, values)? {
+                        ConstantValue::F32(x) => Some(x),
+                        other => return Err(InterpError::UnsupportedOpcode(
+                            format!("Dref operand not f32: {other:?}"))),
+                    }
+                } else {
+                    None
+                };
                 let (u, v) = match coord {
                     ConstantValue::Vec(ref lanes) if lanes.len() >= 2 => {
                         let f = |i: usize| -> Result<f32, InterpError> {
@@ -1314,12 +1339,18 @@ impl Interpreter {
                 };
                 let out = atrium_spv_runtime::sample_2d(
                     &tex.data, &tex_desc, &tex.sampler, u, v);
-                values.insert(result_id, ConstantValue::Vec(vec![
-                    ConstantValue::F32(out[0]),
-                    ConstantValue::F32(out[1]),
-                    ConstantValue::F32(out[2]),
-                    ConstantValue::F32(out[3]),
-                ]));
+                if let Some(d) = dref_val {
+                    // Shadow compare: R <= dref -> 1.0 else 0.0.
+                    let cmp = if out[0] <= d { 1.0_f32 } else { 0.0_f32 };
+                    values.insert(result_id, ConstantValue::F32(cmp));
+                } else {
+                    values.insert(result_id, ConstantValue::Vec(vec![
+                        ConstantValue::F32(out[0]),
+                        ConstantValue::F32(out[1]),
+                        ConstantValue::F32(out[2]),
+                        ConstantValue::F32(out[3]),
+                    ]));
+                }
                 Ok(())
             }
             // OpImageFetch: unfiltered integer-coord texel
