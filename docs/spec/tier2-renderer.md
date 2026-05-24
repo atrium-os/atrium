@@ -1251,6 +1251,13 @@ specifically supports:
   for FRem and `FFloor` for FMod.  The backends never see a
   native `Op::FRem` from this path; everything goes through
   `FDiv` + `FTrunc/FFloor` + `FMul` + `FSub`.
+  Signed integer remainder (Arc 49): `OpSRem` (truncated;
+  same sign as dividend) compiles via pure frontend lowering
+  as `x - y * (x sdiv y)`, using the existing `Op::SDiv` /
+  `Op::IMul` / `Op::ISub`.  `OpSMod` (floored; same sign as
+  divisor) is wired into the frontend but the bespoke
+  backend's `Op::SMod` path is incomplete — tracked as a
+  follow-up.
   `textureSize(sampler2D, lod)` (Arc 34): a new IR op
   `Op::SampledImageQuerySizeLod { image, lod }` is emitted
   by the frontend for `OpImageQuerySizeLod`.  Both backends

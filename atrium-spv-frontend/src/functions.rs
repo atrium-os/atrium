@@ -475,6 +475,38 @@ fn translate_inst(
             id_map, next_value_id, insts, source_spirv_offset,
             |a, b| Op::UDiv(a, b),
         ),
+        // Arc 49: OpSRem -- signed integer truncated remainder.
+        // SPIR-V distinguishes SRem (same sign as dividend, via
+        // truncated division) from SMod (same sign as divisor,
+        // via floored division).  We already had SMod via
+        // Op::SMod; SRem lowers at the frontend as
+        //   x - y * (x sdiv y)
+        // using the existing Op::SDiv (truncated) + IMul + ISub.
+        SpvOp::SRem => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed("SRem without result id".into()))?;
+            let result_ty_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed("SRem without result type".into()))?;
+            let result_ty = types.get(result_ty_id)?.clone();
+            let x_id = expect_id(&spv_inst.operands, 0)?;
+            let y_id = expect_id(&spv_inst.operands, 1)?;
+            let x = resolve_value(x_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            let y = resolve_value(y_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            let q = push_i32(Op::SDiv(x.clone(), y.clone()),
+                source_spirv_offset, insts, next_value_id);
+            let prod = push_i32(Op::IMul(y, q),
+                source_spirv_offset, insts, next_value_id);
+            let result = alloc_or_get_result(
+                result_id, result_ty, id_map, next_value_id);
+            insts.push(Inst {
+                op: Op::ISub(x, prod),
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
         SpvOp::SMod => emit_binop_int(
             spv_inst, types, constants, iface,
             id_map, next_value_id, insts, source_spirv_offset,
