@@ -173,8 +173,8 @@ pub fn translate_with_spec_overrides(
     }
     let const_ctx = constants::ConstantContext::build_with_spec_overrides(
         &rspirv_module, &type_ctx, &spec_id_overrides)?;
-    let iface_ctx = interface::InterfaceContext::build(
-        &rspirv_module, &type_ctx,
+    let iface_ctx = interface::InterfaceContext::build_with_constants(
+        &rspirv_module, &type_ctx, Some(&const_ctx),
     )?;
 
     // Compute the OffsetTable index of each function's

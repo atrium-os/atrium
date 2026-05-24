@@ -1280,6 +1280,14 @@ specifically supports:
        instruction.
     `OpUndef` -- materializes as `ConstFloat 0.0` / `ConstInt 0`
        per the result type.  Bool maps to int 0.
+  Spec-constant LocalSize (Arc 53): `OpExecutionModeId` with
+  `LocalSizeId` mode reads three id-ref operands referencing
+  resolved specialization constants and folds them to the
+  literal `(x, y, z)` LocalSize tuple stored in
+  `InterfaceContext::local_sizes`.  Threaded through the new
+  `InterfaceContext::build_with_constants()` entry which the
+  frontend's main pass uses; the no-constants path stays
+  available for callers that don't yet have a constants ctx.
   `textureSize(sampler2D, lod)` (Arc 34): a new IR op
   `Op::SampledImageQuerySizeLod { image, lod }` is emitted
   by the frontend for `OpImageQuerySizeLod`.  Both backends

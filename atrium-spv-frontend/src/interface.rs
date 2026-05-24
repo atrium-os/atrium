@@ -111,6 +111,19 @@ impl InterfaceContext {
         module: &Module,
         types: &TypeContext,
     ) -> Result<Self, FrontendError> {
+        Self::build_with_constants(module, types, None)
+    }
+
+    /// Same as [`build`] but with an optional `ConstantContext`
+    /// so `OpExecutionModeId` can resolve `LocalSizeId` operand
+    /// ids to literal values.  When `constants` is `None` the
+    /// ExecutionModeId path is ignored (which matches the
+    /// pre-Arc-53 behaviour).
+    pub fn build_with_constants(
+        module: &Module,
+        types: &TypeContext,
+        constants: Option<&crate::constants::ConstantContext>,
+    ) -> Result<Self, FrontendError> {
         let mut ctx = InterfaceContext::default();
 
         // OpExtInstImport: record result_ids whose set name
@@ -147,27 +160,63 @@ impl InterfaceContext {
         // Execution modes -- pull LocalSize for compute
         // entry points so the backend can fold it into
         // gl_GlobalInvocationID codegen.
+        //
+        // Arc 53: also handle `OpExecutionModeId` with
+        // `LocalSizeId` (the spec-constant variant).  Three
+        // ID operands reference resolved constants; we look
+        // each one up in the constants context and read the
+        // i32 / u32 value out.  Without a constants context
+        // we silently skip the ExecutionModeId path -- matches
+        // the pre-Arc-53 behaviour.
         for inst in &module.execution_modes {
-            if inst.class.opcode != SpvOp::ExecutionMode { continue; }
             let fn_id = read_id_ref(&inst.operands, 0)?;
             let mode = match inst.operands.get(1) {
                 Some(Operand::ExecutionMode(m)) => *m,
                 _ => continue,
             };
-            if mode == rspirv::spirv::ExecutionMode::LocalSize {
-                let x = match inst.operands.get(2) {
-                    Some(Operand::LiteralBit32(v)) => *v,
-                    _ => continue,
-                };
-                let y = match inst.operands.get(3) {
-                    Some(Operand::LiteralBit32(v)) => *v,
-                    _ => continue,
-                };
-                let z = match inst.operands.get(4) {
-                    Some(Operand::LiteralBit32(v)) => *v,
-                    _ => continue,
-                };
-                ctx.local_sizes.insert(fn_id, (x, y, z));
+            match (inst.class.opcode, mode) {
+                (SpvOp::ExecutionMode, rspirv::spirv::ExecutionMode::LocalSize) => {
+                    let x = match inst.operands.get(2) {
+                        Some(Operand::LiteralBit32(v)) => *v,
+                        _ => continue,
+                    };
+                    let y = match inst.operands.get(3) {
+                        Some(Operand::LiteralBit32(v)) => *v,
+                        _ => continue,
+                    };
+                    let z = match inst.operands.get(4) {
+                        Some(Operand::LiteralBit32(v)) => *v,
+                        _ => continue,
+                    };
+                    ctx.local_sizes.insert(fn_id, (x, y, z));
+                }
+                (SpvOp::ExecutionModeId,
+                 rspirv::spirv::ExecutionMode::LocalSizeId) => {
+                    let constants = match constants {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    let resolve = |idx: usize| -> Option<u32> {
+                        let id = match inst.operands.get(idx) {
+                            Some(Operand::IdRef(id)) => *id,
+                            _ => return None,
+                        };
+                        let sc = constants.get(id)?;
+                        if let crate::constants::ConstantKind::Scalar(
+                            atrium_spv_ir::Op::ConstInt { value, .. }) = &sc.kind
+                        {
+                            Some(*value as u32)
+                        } else {
+                            None
+                        }
+                    };
+                    let (x, y, z) = match (resolve(2), resolve(3), resolve(4)) {
+                        (Some(x), Some(y), Some(z)) => (x, y, z),
+                        _ => continue,
+                    };
+                    ctx.local_sizes.insert(fn_id, (x, y, z));
+                }
+                _ => {}
             }
         }
 
