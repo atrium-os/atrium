@@ -1235,6 +1235,15 @@ specifically supports:
   or branch finds it.  `bvec<N>` types are now accepted in
   `OpTypeVector` by aliasing element kind `Bool` to `U32` —
   same bit layout, no separate bool-vec lane class needed.
+  Bit-field ops (Arc 47): `OpBitFieldUExtract`,
+  `OpBitFieldSExtract`, `OpBitFieldInsert` compile via pure
+  frontend lowering using the existing `LShr` / `Shl` / `AShr`
+  / `BitAnd` / `BitOr` / `BitNot` / `ISub` ops.  UExtract uses
+  `(base >> offset) & ((1 << count) - 1)`; SExtract uses
+  `(base << (32 - offset - count)) >> (32 - count)` with the
+  arithmetic right shift sign-extending; Insert uses the
+  standard mask-clear / mask-place / OR sequence.  Only 32-bit
+  operands in v1.
   `textureSize(sampler2D, lod)` (Arc 34): a new IR op
   `Op::SampledImageQuerySizeLod { image, lod }` is emitted
   by the frontend for `OpImageQuerySizeLod`.  Both backends

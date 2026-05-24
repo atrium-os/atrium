@@ -2522,6 +2522,82 @@ fn differential_glsl_int_bit_scan() {
 }
 
 #[test]
+fn differential_bit_field_ops() {
+    // Arc 47: OpBitFieldUExtract / SExtract / Insert.
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    // kind: 0=UExtract, 1=SExtract, 2=Insert.
+    // UExtract: extract count bits at offset from base.
+    // SExtract: same but sign-extended.
+    // Insert: replace count bits at offset of base with insert.
+    let cases: &[(&str, u8, u32 /*base*/, u32 /*ins/0*/,
+                  u32 /*off*/, u32 /*count*/, u32 /*expected*/)] = &[
+        ("uextract(0xFF00, 8, 4)",      0, 0xFF00, 0, 8,  4, 0xF),
+        ("uextract(0xDEADBEEF, 0, 8)",  0, 0xDEAD_BEEF, 0, 0, 8, 0xEF),
+        ("uextract(0xFFFFFFFF, 4, 8)",  0, 0xFFFF_FFFF, 0, 4, 8, 0xFF),
+        ("sextract(0x80, 7, 1)",        1, 0x80, 0, 7, 1, 0xFFFF_FFFF), // sign bit
+        ("sextract(0x80, 0, 8)",        1, 0x80, 0, 0, 8, 0xFFFF_FF80), // top bit of byte set
+        ("sextract(0x7F, 0, 8)",        1, 0x7F, 0, 0, 8, 0x7F),
+        ("insert(0xFF00, 0xA, 4, 4)",   2, 0xFF00, 0xA, 4, 4, 0xFFA0),
+        ("insert(0x0, 0xDE, 8, 8)",     2, 0,      0xDE, 8, 8, 0xDE00),
+        ("insert(0xFFFF, 0, 4, 4)",     2, 0xFFFF, 0,    4, 4, 0xFF0F),
+    ];
+    for &(label, kind, base, insert, off, count, expected) in cases {
+        let mut b = rspirv::dr::Builder::new();
+        b.set_version(1, 3);
+        b.capability(Capability::Shader);
+        b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+        let void   = b.type_void();
+        let u32_ty = b.type_int(32, 0);
+        let void_fn = b.type_function(void, vec![]);
+        let rt = b.type_runtime_array(u32_ty);
+        b.decorate(rt, Decoration::ArrayStride, vec![rspirv::dr::Operand::LiteralBit32(4)]);
+        let s = b.type_struct(vec![rt]);
+        b.decorate(s, Decoration::Block, vec![]);
+        b.member_decorate(s, 0, Decoration::Offset, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+        let ptr_u = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+        let ssbo  = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+        b.decorate(ssbo, Decoration::DescriptorSet, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        b.decorate(ssbo, Decoration::Binding, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        let c_zero = b.constant_bit32(u32_ty, 0);
+        let c_base   = b.constant_bit32(u32_ty, base);
+        let c_insert = b.constant_bit32(u32_ty, insert);
+        let c_off    = b.constant_bit32(u32_ty, off);
+        let c_count  = b.constant_bit32(u32_ty, count);
+        let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+        b.begin_block(None).unwrap();
+        let r = match kind {
+            0 => b.bit_field_u_extract(u32_ty, None, c_base, c_off, c_count).unwrap(),
+            1 => b.bit_field_s_extract(u32_ty, None, c_base, c_off, c_count).unwrap(),
+            2 => b.bit_field_insert(u32_ty, None, c_base, c_insert, c_off, c_count).unwrap(),
+            _ => unreachable!(),
+        };
+        let d = b.access_chain(ptr_u, None, ssbo, vec![c_zero, c_zero]).unwrap();
+        b.store(d, r, None, vec![]).unwrap();
+        b.ret().unwrap();
+        b.end_function().unwrap();
+        b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+        b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+        let words: Vec<u32> = b.module().assemble();
+        let mut spv = Vec::with_capacity(words.len() * 4);
+        for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+        let dir = TempDir::new().unwrap();
+        let mut b_buf = vec![0u8; 4];
+        let mut c_buf = vec![0u8; 4];
+        invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
+        invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+        assert_eq!(b_buf, c_buf, "{label}: bespoke vs cranelift diverge");
+        let got = u32::from_le_bytes(b_buf[0..4].try_into().unwrap());
+        assert_eq!(got, expected,
+            "{label}: got {:#x}, want {:#x}", got, expected);
+    }
+}
+
+#[test]
 fn differential_any_all_logical() {
     // Arc 46: OpAny / OpAll / OpLogicalAnd / OpLogicalOr /
     // OpLogicalNot.  Build a vec3<bool> from three bvecs and

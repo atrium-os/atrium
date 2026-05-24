@@ -727,6 +727,123 @@ fn translate_inst(
             spv_inst, types, constants, iface,
             id_map, next_value_id, insts, source_spirv_offset,
             Op::Rbit),
+
+        // Arc 47: bit-field extract / insert.
+        //
+        //   BitFieldUExtract(base, offset, count):
+        //     (base >> offset) & ((1 << count) - 1)
+        //   BitFieldSExtract(base, offset, count):
+        //     ((base << (32 - offset - count)) >> (32 - count))  -- arithmetic
+        //   BitFieldInsert(base, insert, offset, count):
+        //     mask    = ((1 << count) - 1) << offset
+        //     (base & ~mask) | ((insert << offset) & mask)
+        //
+        // All three only support 32-bit operands in v1.
+        SpvOp::BitFieldUExtract | SpvOp::BitFieldSExtract => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed("BitFieldExtract without result id".into()))?;
+            let result_ty_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed("BitFieldExtract without result type".into()))?;
+            let result_ty = types.get(result_ty_id)?.clone();
+            let base_id   = expect_id(&spv_inst.operands, 0)?;
+            let off_id    = expect_id(&spv_inst.operands, 1)?;
+            let count_id  = expect_id(&spv_inst.operands, 2)?;
+            let base  = resolve_value(base_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            let off   = resolve_value(off_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            let count = resolve_value(count_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            let signed = matches!(spv_inst.class.opcode, SpvOp::BitFieldSExtract);
+            let result = alloc_or_get_result(
+                result_id, result_ty.clone(), id_map, next_value_id);
+            if signed {
+                // shift_left  = 32 - offset - count
+                // shift_right = 32 - count
+                // tmp = base << shift_left
+                // result = tmp >> shift_right  (AShr)
+                let c32 = push_ci(32, atrium_spv_ir::IntKind::U32,
+                    source_spirv_offset, insts, next_value_id);
+                let sub1 = push_i32(Op::ISub(c32.clone(), off),
+                    source_spirv_offset, insts, next_value_id);
+                let shift_left = push_i32(Op::ISub(sub1, count.clone()),
+                    source_spirv_offset, insts, next_value_id);
+                let shift_right = push_i32(Op::ISub(c32, count),
+                    source_spirv_offset, insts, next_value_id);
+                let tmp = push_i32(Op::Shl(base, shift_left),
+                    source_spirv_offset, insts, next_value_id);
+                insts.push(Inst {
+                    op: Op::AShr(tmp, shift_right),
+                    result: Some(result),
+                    source_spirv_offset,
+                });
+            } else {
+                let shifted = push_i32(Op::LShr(base, off),
+                    source_spirv_offset, insts, next_value_id);
+                // mask = (1 << count) - 1
+                let c1 = push_ci(1, atrium_spv_ir::IntKind::U32,
+                    source_spirv_offset, insts, next_value_id);
+                let pow = push_i32(Op::Shl(c1.clone(), count),
+                    source_spirv_offset, insts, next_value_id);
+                let mask = push_i32(Op::ISub(pow, c1),
+                    source_spirv_offset, insts, next_value_id);
+                insts.push(Inst {
+                    op: Op::BitAnd(shifted, mask),
+                    result: Some(result),
+                    source_spirv_offset,
+                });
+            }
+            Ok(())
+        }
+        SpvOp::BitFieldInsert => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed("BitFieldInsert without result id".into()))?;
+            let result_ty_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed("BitFieldInsert without result type".into()))?;
+            let result_ty = types.get(result_ty_id)?.clone();
+            let base_id   = expect_id(&spv_inst.operands, 0)?;
+            let insert_id = expect_id(&spv_inst.operands, 1)?;
+            let off_id    = expect_id(&spv_inst.operands, 2)?;
+            let count_id  = expect_id(&spv_inst.operands, 3)?;
+            let base   = resolve_value(base_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            let insert = resolve_value(insert_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            let off    = resolve_value(off_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            let count  = resolve_value(count_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            // mask_low = (1 << count) - 1
+            let c1 = push_ci(1, atrium_spv_ir::IntKind::U32,
+                source_spirv_offset, insts, next_value_id);
+            let pow = push_i32(Op::Shl(c1.clone(), count),
+                source_spirv_offset, insts, next_value_id);
+            let mask_low = push_i32(Op::ISub(pow, c1),
+                source_spirv_offset, insts, next_value_id);
+            // mask = mask_low << offset
+            let mask = push_i32(Op::Shl(mask_low, off.clone()),
+                source_spirv_offset, insts, next_value_id);
+            // not_mask = ~mask
+            let not_mask = push_i32(Op::BitNot(mask.clone()),
+                source_spirv_offset, insts, next_value_id);
+            // cleared = base & not_mask
+            let cleared = push_i32(Op::BitAnd(base, not_mask),
+                source_spirv_offset, insts, next_value_id);
+            // shifted = insert << offset
+            let shifted = push_i32(Op::Shl(insert, off),
+                source_spirv_offset, insts, next_value_id);
+            // placed = shifted & mask
+            let placed = push_i32(Op::BitAnd(shifted, mask),
+                source_spirv_offset, insts, next_value_id);
+            let result = alloc_or_get_result(
+                result_id, result_ty, id_map, next_value_id);
+            insts.push(Inst {
+                op: Op::BitOr(cleared, placed),
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
         SpvOp::BitCount => {
             // SWAR popcount on u32:
             //   x = x - ((x >> 1) & 0x55555555)
