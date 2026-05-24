@@ -1432,7 +1432,14 @@ fn translate_inst(
             let op = if spv_inst.class.opcode == SpvOp::ImageSampleExplicitLod
                 || spv_inst.class.opcode == SpvOp::ImageSampleProjExplicitLod
             {
-                let lod_id = expect_id(&spv_inst.operands, 2)?;
+                // ExplicitLod's LOD arrives via the Image
+                // Operands mask at index 2 (mask) + index 3
+                // (LOD IdRef), per the SPIR-V spec.  The mask
+                // is required (Lod or Grad), so reach past it.
+                let lod_id = extract_image_operand_lod(&spv_inst.operands, 2)?
+                    .ok_or_else(|| FrontendError::Malformed(
+                        "ImageSampleExplicitLod missing Image-Operands::Lod"
+                        .to_string()))?;
                 let lod = id_map.get(&lod_id).cloned().ok_or_else(||
                     FrontendError::Malformed(format!(
                         "ImageSampleExplicitLod lod id {lod_id} not yet defined")))?;
