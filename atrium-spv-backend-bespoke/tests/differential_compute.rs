@@ -4215,6 +4215,103 @@ fn differential_storage_image_write() {
 }
 
 #[test]
+fn differential_image_write_const_offset() {
+    // Arc 43: OpImageWrite + Image-Operands::ConstOffset.
+    // Each invocation writes (gx, gy, 0.5, 1) to texel
+    // (gx, gy) + offset(1, 0).  Result: column 0 stays zero,
+    // columns 1..=w-1 carry (gx-1, gy, 0.5, 1).  Verifies
+    // the lane-add lowering for storage-image writes.
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, Dim,
+        ExecutionMode, ExecutionModel, FunctionControl, ImageFormat,
+        ImageOperands, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let i32_ty = b.type_int(32, 1);
+    let u32_ty = b.type_int(32, 0);
+    let f32_ty = b.type_float(32, None);
+    let v3u    = b.type_vector(u32_ty, 3);
+    let v2i    = b.type_vector(i32_ty, 2);
+    let v4f    = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let img_ty = b.type_image(f32_ty, Dim::Dim2D, 0, 0, 0, 2,
+        ImageFormat::Rgba32f, None);
+    let ptr_img = b.type_pointer(None, StorageClass::UniformConstant, img_ty);
+    let img_var = b.variable(ptr_img, None, StorageClass::UniformConstant, None);
+    b.decorate(img_var, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(img_var, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_v3u_in = b.type_pointer(None, StorageClass::Input, v3u);
+    let gid_var = b.variable(ptr_v3u_in, None, StorageClass::Input, None);
+    b.decorate(gid_var, Decoration::BuiltIn,
+        vec![rspirv::dr::Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+    let c_zero_i = b.constant_bit32(i32_ty, 0u32);
+    let c_one_i  = b.constant_bit32(i32_ty, 1u32);
+    let c_half   = b.constant_bit32(f32_ty, 0.5f32.to_bits());
+    let c_one_f  = b.constant_bit32(f32_ty, 1.0f32.to_bits());
+    // Offset = ivec2(1, 0).
+    let offset = b.constant_composite(v2i, vec![c_one_i, c_zero_i]);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let gid = b.load(v3u, None, gid_var, None, vec![]).unwrap();
+    let gx_u = b.composite_extract(u32_ty, None, gid, vec![0]).unwrap();
+    let gy_u = b.composite_extract(u32_ty, None, gid, vec![1]).unwrap();
+    let gx_i = b.bitcast(i32_ty, None, gx_u).unwrap();
+    let gy_i = b.bitcast(i32_ty, None, gy_u).unwrap();
+    let coord = b.composite_construct(v2i, None, vec![gx_i, gy_i]).unwrap();
+    let fx = b.convert_u_to_f(f32_ty, None, gx_u).unwrap();
+    let fy = b.convert_u_to_f(f32_ty, None, gy_u).unwrap();
+    let texel = b.composite_construct(v4f, None,
+        vec![fx, fy, c_half, c_one_f]).unwrap();
+    let img = b.load(img_ty, None, img_var, None, vec![]).unwrap();
+    b.image_write(img, coord, texel,
+        Some(ImageOperands::CONST_OFFSET),
+        vec![rspirv::dr::Operand::IdRef(offset)]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main",
+        vec![img_var, gid_var]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spv = Vec::with_capacity(words.len() * 4);
+    for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+
+    // Compute over a 2x2 region; offset shifts +1 in x.
+    // gid (0,0) writes to texel (1,0); gid (1,0) writes to
+    // texel (2,0) but our image is only 3 wide, fine.
+    // Image is 3 wide x 1 tall.
+    let (w, h) = (3u32, 1u32);
+    let gids: Vec<(u32, u32, u32)> = vec![(0, 0, 0), (1, 0, 0)];
+    let dir = TempDir::new().unwrap();
+    let mut b_img = vec![0u8; (w * h * 16) as usize];
+    let mut c_img = vec![0u8; (w * h * 16) as usize];
+    invoke_compute_image(&spv, true,  dir.path(), "b",
+        &mut b_img, w, h, 1, 2, &gids);
+    invoke_compute_image(&spv, false, dir.path(), "c",
+        &mut c_img, w, h, 1, 2, &gids);
+    assert_eq!(b_img, c_img,
+        "OpImageWrite + ConstOffset diverges between backends");
+    let read = |buf: &[u8], x: u32, y: u32, c: usize| -> f32 {
+        let off = ((y * w + x) as usize) * 16 + c * 4;
+        f32::from_le_bytes(buf[off..off+4].try_into().unwrap())
+    };
+    // texel (0, 0) untouched.
+    assert_eq!(read(&b_img, 0, 0, 0), 0.0, "texel (0,0) should be untouched");
+    // texel (1, 0) <- (gx=0, gy=0, 0.5, 1) from gid (0,0)+off(1,0).
+    assert_eq!(read(&b_img, 1, 0, 0), 0.0, "texel (1,0).r");
+    assert_eq!(read(&b_img, 1, 0, 2), 0.5, "texel (1,0).b");
+    // texel (2, 0) <- (gx=1, gy=0, 0.5, 1) from gid (1,0)+off(1,0).
+    assert_eq!(read(&b_img, 2, 0, 0), 1.0, "texel (2,0).r");
+    assert_eq!(read(&b_img, 2, 0, 2), 0.5, "texel (2,0).b");
+}
+
+#[test]
 fn differential_image_query_levels() {
     // OpImageQueryLevels: single-mip world -> constant 1.
     // The shader queries the level count of a bound storage

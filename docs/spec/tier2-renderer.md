@@ -1204,6 +1204,14 @@ specifically supports:
   VectorExtract (vs by ImageSample directly — Arc 37 path
   works fine); tracked as a follow-up.  Interp + Cranelift
   carry the test.
+  ConstOffset / Offset on `OpImageRead` / `OpImageWrite`
+  (Arc 43): same lane-decomposition pattern as Arc 41's
+  `OpImageFetch` path.  Factored into a shared
+  `lane_add_int_vec()` helper that all three storage-image
+  ops (Fetch / Read / Write) now share.  Bespoke + Cranelift
+  both honor the offset; new
+  `differential_image_write_const_offset` test verifies a
+  `gid + ivec2(1, 0)` write produces a column-shifted output.
   `textureSize(sampler2D, lod)` (Arc 34): a new IR op
   `Op::SampledImageQuerySizeLod { image, lod }` is emitted
   by the frontend for `OpImageQuerySizeLod`.  Both backends
