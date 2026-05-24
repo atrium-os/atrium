@@ -948,6 +948,65 @@ fn translate_inst(
             id_map, next_value_id, insts, source_spirv_offset,
             |a, b| Op::FMul(a, b),
         ),
+        // Arc 48: OpFRem and OpFMod -- core SPIR-V FP remainder
+        // operations.  Both lower at the frontend; the backends
+        // don't ship a native FRem yet.
+        //
+        //   FRem(x, y) -- truncated remainder; same sign as x.
+        //                 Lower as x - y * trunc(x / y).
+        //   FMod(x, y) -- floored  remainder; same sign as y.
+        //                 Lower as x - y * floor(x / y).
+        SpvOp::FRem | SpvOp::FMod => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed("FRem/FMod without result id".into()))?;
+            let result_ty_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed("FRem/FMod without result type".into()))?;
+            let result_ty = types.get(result_ty_id)?.clone();
+            let is_mod = matches!(spv_inst.class.opcode, SpvOp::FMod);
+            let x_id = expect_id(&spv_inst.operands, 0)?;
+            let y_id = expect_id(&spv_inst.operands, 1)?;
+            let x = resolve_value(x_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            let y = resolve_value(y_id, types, constants, id_map,
+                next_value_id, insts, source_spirv_offset)?;
+            // div = x / y
+            let div_id = ValueId(*next_value_id);
+            *next_value_id += 1;
+            let div_v = Value { id: div_id, ty: result_ty.clone() };
+            insts.push(Inst {
+                op: Op::FDiv(x.clone(), y.clone()),
+                result: Some(div_v.clone()),
+                source_spirv_offset,
+            });
+            // rounded = floor(div)  if FMod, trunc(div) if FRem.
+            let floor_id = ValueId(*next_value_id);
+            *next_value_id += 1;
+            let floor_v = Value { id: floor_id, ty: result_ty.clone() };
+            insts.push(Inst {
+                op: if is_mod { Op::FFloor(div_v) } else { Op::FTrunc(div_v) },
+                result: Some(floor_v.clone()),
+                source_spirv_offset,
+            });
+            // mul_v = y * floor_v
+            let mul_id = ValueId(*next_value_id);
+            *next_value_id += 1;
+            let mul_v = Value { id: mul_id, ty: result_ty.clone() };
+            insts.push(Inst {
+                op: Op::FMul(y, floor_v),
+                result: Some(mul_v.clone()),
+                source_spirv_offset,
+            });
+            // result = x - mul_v
+            let result = alloc_or_get_result(
+                result_id, result_ty, id_map, next_value_id);
+            insts.push(Inst {
+                op: Op::FSub(x, mul_v),
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
+
         SpvOp::FDiv => emit_binop_float(
             spv_inst, types, constants, iface,
             id_map, next_value_id, insts, source_spirv_offset,

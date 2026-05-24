@@ -1244,6 +1244,13 @@ specifically supports:
   arithmetic right shift sign-extending; Insert uses the
   standard mask-clear / mask-place / OR sequence.  Only 32-bit
   operands in v1.
+  Floating-point remainder (Arc 48): `OpFRem` (truncated,
+  same sign as `x`) and `OpFMod` (floored, same sign as `y`)
+  compile via pure frontend lowering.  Both expand to
+  `x - y * round(x / y)` where the rounding op is `FTrunc`
+  for FRem and `FFloor` for FMod.  The backends never see a
+  native `Op::FRem` from this path; everything goes through
+  `FDiv` + `FTrunc/FFloor` + `FMul` + `FSub`.
   `textureSize(sampler2D, lod)` (Arc 34): a new IR op
   `Op::SampledImageQuerySizeLod { image, lod }` is emitted
   by the frontend for `OpImageQuerySizeLod`.  Both backends

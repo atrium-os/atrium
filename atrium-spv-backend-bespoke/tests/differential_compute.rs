@@ -2522,6 +2522,77 @@ fn differential_glsl_int_bit_scan() {
 }
 
 #[test]
+fn differential_op_frem_fmod() {
+    // Arc 48: SPIR-V core OpFRem (truncated rem) and OpFMod
+    // (floored mod).  For y > 0 and x > 0 they agree; the
+    // distinguishing cases have negative x with positive y
+    // (FRem stays negative; FMod returns [0, y)).
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    // (label, op_is_mod, x, y, expected)
+    let cases: &[(&str, bool, f32, f32, f32)] = &[
+        ("frem(7, 3)",      false,  7.0,  3.0,  1.0),
+        ("frem(-7, 3)",     false, -7.0,  3.0, -1.0),
+        ("frem(7.5, 2)",    false,  7.5,  2.0,  1.5),
+        ("fmod(7, 3)",      true,   7.0,  3.0,  1.0),
+        ("fmod(-7, 3)",     true,  -7.0,  3.0,  2.0),
+        ("fmod(7.5, 2)",    true,   7.5,  2.0,  1.5),
+        ("fmod(-7.5, 2)",   true,  -7.5,  2.0,  0.5),
+    ];
+    for &(label, is_mod, x, y, expected) in cases {
+        let mut b = rspirv::dr::Builder::new();
+        b.set_version(1, 3);
+        b.capability(Capability::Shader);
+        b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+        let void   = b.type_void();
+        let u32_ty = b.type_int(32, 0);
+        let f32_ty = b.type_float(32, None);
+        let void_fn = b.type_function(void, vec![]);
+        let rt = b.type_runtime_array(f32_ty);
+        b.decorate(rt, Decoration::ArrayStride, vec![rspirv::dr::Operand::LiteralBit32(4)]);
+        let s = b.type_struct(vec![rt]);
+        b.decorate(s, Decoration::Block, vec![]);
+        b.member_decorate(s, 0, Decoration::Offset, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+        let ptr_f = b.type_pointer(None, StorageClass::StorageBuffer, f32_ty);
+        let ssbo  = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+        b.decorate(ssbo, Decoration::DescriptorSet, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        b.decorate(ssbo, Decoration::Binding, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+        let c_zero = b.constant_bit32(u32_ty, 0);
+        let cx = b.constant_bit32(f32_ty, x.to_bits());
+        let cy = b.constant_bit32(f32_ty, y.to_bits());
+        let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+        b.begin_block(None).unwrap();
+        let r = if is_mod {
+            b.f_mod(f32_ty, None, cx, cy).unwrap()
+        } else {
+            b.f_rem(f32_ty, None, cx, cy).unwrap()
+        };
+        let d = b.access_chain(ptr_f, None, ssbo, vec![c_zero, c_zero]).unwrap();
+        b.store(d, r, None, vec![]).unwrap();
+        b.ret().unwrap();
+        b.end_function().unwrap();
+        b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+        b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+        let words: Vec<u32> = b.module().assemble();
+        let mut spv = Vec::with_capacity(words.len() * 4);
+        for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+        let dir = TempDir::new().unwrap();
+        let mut b_buf = vec![0u8; 4];
+        let mut c_buf = vec![0u8; 4];
+        invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
+        invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+        assert_eq!(b_buf, c_buf, "{label}: bespoke vs cranelift diverge");
+        let got = f32::from_le_bytes(b_buf[0..4].try_into().unwrap());
+        assert!((got - expected).abs() < 1e-5,
+            "{label}: got {got}, want {expected}");
+    }
+}
+
+#[test]
 fn differential_bit_field_ops() {
     // Arc 47: OpBitFieldUExtract / SExtract / Insert.
     use rspirv::binary::Assemble;
