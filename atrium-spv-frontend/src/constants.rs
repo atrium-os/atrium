@@ -341,12 +341,21 @@ fn translate_spec_constant_op(
                 172 => SpvOp::UGreaterThan,
                 175 => SpvOp::SGreaterThanEqual,
                 174 => SpvOp::UGreaterThanEqual,
-                168 => SpvOp::LogicalAnd,
-                166 => SpvOp::LogicalOr,
-                167 => SpvOp::LogicalEqual,
+                // Arc 56: per SPIR-V spec the Logical/Select
+                // block runs 164..169.  Previous mapping had
+                // 167/168/169 shifted by one (LogicalEqual /
+                // LogicalAnd / LogicalNot), which made spec-
+                // const OpLogicalAnd evaluate as LogicalEqual
+                // ((a!=0) == (b!=0)) -- diverges from true AND
+                // semantics on (false, false): AND returns 0,
+                // Equal returns 1.  Mapping corrected; Select
+                // (169) now reachable.
+                164 => SpvOp::LogicalEqual,
                 165 => SpvOp::LogicalNotEqual,
-                169 => SpvOp::LogicalNot,
-                169_169 => SpvOp::Select, // never hit; see below
+                166 => SpvOp::LogicalOr,
+                167 => SpvOp::LogicalAnd,
+                168 => SpvOp::LogicalNot,
+                169 => SpvOp::Select,
                 _ => return Err(FrontendError::Unsupported(format!(
                     "SpecConstantOp sub-opcode literal {v} not recognised"))),
             }

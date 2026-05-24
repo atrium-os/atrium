@@ -1306,6 +1306,16 @@ specifically supports:
   dynamic range are NOT clamped to ±Inf.  Real shaders use
   QuantizeToF16 mostly for mediump round-trip compat, which
   truncation already captures for in-range values.
+  Spec-constant dispatcher fix (Arc 56): the
+  `translate_spec_constant_op()` sub-opcode literal table
+  had a one-off in the Logical/Select range — 167/168/169 were
+  mapped to LogicalEqual / LogicalAnd / LogicalNot.  Per the
+  SPIR-V spec the correct mapping is 164=LogicalEqual,
+  165=LogicalNotEqual, 166=LogicalOr, 167=LogicalAnd,
+  168=LogicalNot, 169=Select.  A spec-const
+  `LogicalAnd(false, false)` would previously dispatch to
+  LogicalEqual and return 1 (wrong; expected 0).  Select via
+  spec-const ternary was unreachable (mapped at `169169`).
   `textureSize(sampler2D, lod)` (Arc 34): a new IR op
   `Op::SampledImageQuerySizeLod { image, lod }` is emitted
   by the frontend for `OpImageQuerySizeLod`.  Both backends
