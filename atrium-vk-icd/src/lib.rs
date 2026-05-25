@@ -9487,6 +9487,15 @@ mod tests {
         // VkSubpassBeginInfo (vkCmdBeginRenderPass2 /
         // vkCmdNextSubpass2) -- Arc 107.
         assert_eq!(offset_of!(vk::SubpassBeginInfo, contents), 16);
+
+        // VkSubmitInfo (vkQueueSubmit) -- Arc 108.
+        // 72-byte stride between consecutive submit infos.
+        // Stride mismatch would walk off the submits array on
+        // multi-submit calls (real apps often submit multiple
+        // batches per frame).
+        assert_eq!(offset_of!(vk::SubmitInfo, command_buffer_count), 40);
+        assert_eq!(offset_of!(vk::SubmitInfo, p_command_buffers),    48);
+        assert_eq!(std::mem::size_of::<vk::SubmitInfo>(),            72);
     }
 
     /// Arc 73: pin the bytes-per-pixel table against the
