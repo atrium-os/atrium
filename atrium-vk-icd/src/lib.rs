@@ -2443,11 +2443,16 @@ pub unsafe extern "C" fn vkGetPhysicalDeviceImageFormatProperties(
     if !flags.is_empty() {
         return -11;
     }
-    // Format whitelist: R8G8B8A8_UNORM (37), B8G8R8A8_UNORM (44),
-    // R8G8B8A8_SRGB (43), B8G8R8A8_SRGB (50), D16 (124), D32_SFLOAT
-    // (126), D24_UNORM_S8_UINT (129), D32_SFLOAT_S8_UINT (130).
-    let f = format.as_raw();
-    let supported = matches!(f, 37 | 43 | 44 | 50 | 124 | 126 | 129 | 130);
+    // Format whitelist.  Arc 90: rewritten against
+    // `ash::vk::Format` constants (was a numeric-literal
+    // bitmask) to match the same symbolic style as
+    // vkGetPhysicalDeviceFormatProperties after Arc 89.
+    use ash::vk::Format as Fmt;
+    let supported = matches!(format,
+        Fmt::R8G8B8A8_UNORM | Fmt::R8G8B8A8_SRGB
+        | Fmt::B8G8R8A8_UNORM | Fmt::B8G8R8A8_SRGB
+        | Fmt::D16_UNORM | Fmt::D32_SFLOAT
+        | Fmt::D24_UNORM_S8_UINT | Fmt::D32_SFLOAT_S8_UINT);
     if !supported {
         return -11;
     }
