@@ -743,7 +743,24 @@ fn bpp_for_vk_format(format: u32) -> u32 {
         | F::D32_SFLOAT
         | F::X8_D24_UNORM_PACK32
         | F::D24_UNORM_S8_UINT
-        | F::D16_UNORM_S8_UINT => 4,
+        | F::D16_UNORM_S8_UINT
+        // 32-bit packed: A2R10G10B10 + A2B10G10R10 (HDR10
+        // surface formats); B10G11R11_UFLOAT_PACK32 + E5B9G9R9
+        // _UFLOAT_PACK32 (small HDR with shared exponent).
+        | F::A2R10G10B10_UNORM_PACK32
+        | F::A2R10G10B10_SNORM_PACK32
+        | F::A2R10G10B10_USCALED_PACK32
+        | F::A2R10G10B10_SSCALED_PACK32
+        | F::A2R10G10B10_UINT_PACK32
+        | F::A2R10G10B10_SINT_PACK32
+        | F::A2B10G10R10_UNORM_PACK32
+        | F::A2B10G10R10_SNORM_PACK32
+        | F::A2B10G10R10_USCALED_PACK32
+        | F::A2B10G10R10_SSCALED_PACK32
+        | F::A2B10G10R10_UINT_PACK32
+        | F::A2B10G10R10_SINT_PACK32
+        | F::B10G11R11_UFLOAT_PACK32
+        | F::E5B9G9R9_UFLOAT_PACK32 => 4,
 
         // 6 bytes per pixel (R16G16B16_*; usually padded to 8).
         F::R16G16B16_UNORM | F::R16G16B16_SNORM | F::R16G16B16_USCALED
@@ -9262,6 +9279,10 @@ mod tests {
             (F::D16_UNORM_S8_UINT,    4),
             (F::D24_UNORM_S8_UINT,    4),
             (F::D32_SFLOAT_S8_UINT,   8),
+            (F::A2R10G10B10_UNORM_PACK32, 4),  // Arc 88
+            (F::A2B10G10R10_UNORM_PACK32, 4),  // Arc 88 (HDR10 swapchain)
+            (F::B10G11R11_UFLOAT_PACK32,  4),  // Arc 88
+            (F::E5B9G9R9_UFLOAT_PACK32,   4),  // Arc 88
             (F::R16G16B16A16_SFLOAT,  8),
             (F::R32G32_SFLOAT,        8),
             (F::R32G32B32_SFLOAT,    12),
