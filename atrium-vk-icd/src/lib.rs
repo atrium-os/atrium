@@ -696,7 +696,8 @@ fn bpp_for_vk_format(format: u32) -> u32 {
     match f {
         // 1 byte per pixel.
         F::R8_UNORM | F::R8_SNORM | F::R8_USCALED | F::R8_SSCALED
-        | F::R8_UINT | F::R8_SINT | F::R8_SRGB => 1,
+        | F::R8_UINT | F::R8_SINT | F::R8_SRGB
+        | F::S8_UINT => 1,
 
         // 2 bytes per pixel.
         F::R8G8_UNORM | F::R8G8_SNORM | F::R8G8_USCALED | F::R8G8_SSCALED
@@ -725,7 +726,9 @@ fn bpp_for_vk_format(format: u32) -> u32 {
         | F::R16G16_SFLOAT
         | F::R32_UINT | F::R32_SINT | F::R32_SFLOAT
         | F::D32_SFLOAT
-        | F::D24_UNORM_S8_UINT => 4,
+        | F::X8_D24_UNORM_PACK32
+        | F::D24_UNORM_S8_UINT
+        | F::D16_UNORM_S8_UINT => 4,
 
         // 6 bytes per pixel (R16G16B16_*; usually padded to 8).
         F::R16G16B16_UNORM | F::R16G16B16_SNORM | F::R16G16B16_USCALED
@@ -737,7 +740,8 @@ fn bpp_for_vk_format(format: u32) -> u32 {
         | F::R16G16B16A16_USCALED | F::R16G16B16A16_SSCALED
         | F::R16G16B16A16_UINT | F::R16G16B16A16_SINT
         | F::R16G16B16A16_SFLOAT
-        | F::R32G32_UINT | F::R32G32_SINT | F::R32G32_SFLOAT => 8,
+        | F::R32G32_UINT | F::R32G32_SINT | F::R32G32_SFLOAT
+        | F::D32_SFLOAT_S8_UINT => 8,
 
         // 12 bytes per pixel (R32G32B32_*).
         F::R32G32B32_UINT | F::R32G32B32_SINT | F::R32G32B32_SFLOAT => 12,
@@ -9222,6 +9226,11 @@ mod tests {
             (F::R32_UINT,             4),  // was 8 pre-fix
             (F::R32_SFLOAT,           4),  // was 8 pre-fix
             (F::D32_SFLOAT,           4),
+            (F::S8_UINT,              1),  // Arc 85
+            (F::X8_D24_UNORM_PACK32,  4),
+            (F::D16_UNORM_S8_UINT,    4),
+            (F::D24_UNORM_S8_UINT,    4),
+            (F::D32_SFLOAT_S8_UINT,   8),
             (F::R16G16B16A16_SFLOAT,  8),
             (F::R32G32_SFLOAT,        8),
             (F::R32G32B32_SFLOAT,    12),
