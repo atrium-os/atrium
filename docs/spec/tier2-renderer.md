@@ -1354,6 +1354,16 @@ specifically supports:
   but every architecture we target (LSE CAS on ARM64; lock
   cmpxchg on x86_64) provides a strong CAS, so both opcodes
   route to the same `Op::AtomicCompareExchange` IR variant.
+  Fragment helper-invocation ops (Arc 65):
+    `OpDemoteToHelperInvocation` — no-op at the frontend.
+       (Real GLSL semantics keep the invocation running but
+       drop its writes; Tier-2 has no helper-invocation
+       pipeline state to model.)
+    `OpIsHelperInvocationEXT` — lowers to `Op::ConstInt 0`
+       (false; Tier-2 has no helpers in its serial
+       dispatcher).
+  Closes another catchall failure path for shaders that use
+  fragment-derivative-aware control flow.
   `Op::SampledImageQuerySizeLod { image, lod }` is emitted
   by the frontend for `OpImageQuerySizeLod`.  Both backends
   read TexDesc.width @ #8 / height @ #12 directly off the

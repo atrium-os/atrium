@@ -428,6 +428,39 @@ fn translate_inst(
         //   discard pipeline path; mapping to Return drops the
         //   shader's pending writes (caller-visible buffer
         //   contains whatever was written prior).
+        // Arc 65: OpDemoteToHelperInvocation acts like Kill but
+        // is *not* a block terminator -- the shader keeps
+        // executing afterwards, with the side effects of any
+        // subsequent stores quietly dropped.  Tier-2 has no
+        // helper-invocation pipeline state, so this op is just
+        // a no-op (the rest of the function body runs normally;
+        // subsequent stores still happen, but Tier-2 doesn't
+        // currently distinguish helper writes).  No IR
+        // emission needed.
+        SpvOp::DemoteToHelperInvocation => Ok(()),
+        // OpIsHelperInvocation returns false: no helpers in
+        // Tier-2's serial dispatcher.  Lower as ConstInt 0
+        // (Bool i32-backed).
+        SpvOp::IsHelperInvocationEXT => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed(
+                    "IsHelperInvocation without result id".into()))?;
+            let result_ty_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed(
+                    "IsHelperInvocation without result type".into()))?;
+            let result_ty = types.get(result_ty_id)?.clone();
+            let result = alloc_or_get_result(
+                result_id, result_ty, id_map, next_value_id);
+            insts.push(Inst {
+                op: Op::ConstInt {
+                    value: 0,
+                    kind: atrium_spv_ir::IntKind::I32,
+                },
+                result: Some(result),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
         SpvOp::Return
         | SpvOp::Unreachable
         | SpvOp::Kill
