@@ -262,6 +262,75 @@ fn texture_sample_rgba32f_exact_roundtrip() {
     assert_eq!(p[3],  1e-6);
 }
 
+/// Arc 81: end-to-end R8Unorm sampling.  Single-channel
+/// textures are common for masks, alpha-only data, and
+/// stencil-like overlays.  Spec semantics:
+///   r = byte / 255.0; g = b = 0; a = 1.
+/// Sampled at the centre of a 1×1 texel containing 200 (out
+/// of 255) → expected (200/255, 0, 0, 1).
+#[test]
+fn texture_sample_r8unorm_replicates_red_alpha_one() {
+    let pixels: Vec<u8> = vec![200];  // single texel.
+    let tex_desc = TexDesc {
+        data: pixels.as_ptr(),
+        width: 1, height: 1, stride_bytes: 1,
+        format: TexFormat::R8Unorm as u32,
+        depth: 1, slice_bytes: 0,
+        mip_count: 0, mip_descs: std::ptr::null(),
+    };
+    let samp_desc = SamplerDesc {
+        mag_filter: FilterMode::Linear as u32,
+        min_filter: FilterMode::Linear as u32,
+        wrap_s: WrapMode::ClampToEdge as u32,
+        wrap_t: WrapMode::ClampToEdge as u32,
+    };
+    let mut uniforms = descriptor_table_buffer(1);
+    unsafe {
+        write_helper_pointers(&mut uniforms,
+            atrium_spv_runtime::atrium_tex_sample_2d,
+            atrium_spv_runtime::atrium_tex_fetch_2d,
+            atrium_spv_runtime::atrium_tex_sample_2d_lod,
+            atrium_spv_runtime::atrium_tex_sample_2d_array,
+            atrium_spv_runtime::atrium_tex_sample_cube,
+            atrium_spv_runtime::atrium_tex_gather_2d,
+            atrium_spv_runtime::atrium_tex_sample_2d_array_lod,
+            atrium_spv_runtime::atrium_tex_sample_cube_lod);
+        write_descriptor_slot(&mut uniforms, 0,
+            &tex_desc as *const _, &samp_desc as *const _);
+    }
+    let texture = TextureBinding {
+        set: 0, binding: 0,
+        data: pixels.clone(),
+        width: 1, height: 1, stride_bytes: 1,
+        format: TexFormat::R8Unorm as u32,
+        sampler: samp_desc,
+    };
+    let inputs = ShaderInputs {
+        textures: vec![texture],
+        uniforms,
+        ..ShaderInputs::default()
+    };
+
+    let spirv = build_sample_centre_shader();
+    let runners: [Box<dyn ShaderRunner>; 3] = [
+        Box::new(InterpreterRunner),
+        Box::new(CraneliftRunner::default()),
+        Box::new(BespokeRunner::default()),
+    ];
+    let refs: Vec<&dyn ShaderRunner> =
+        runners.iter().map(|b| b.as_ref()).collect();
+    let tol = atrium_spv_tests::pixels::ColorTolerance::AbsEpsilon { eps: 1e-6 };
+    assert_shader_agrees(&spirv, &inputs, tol, &refs);
+
+    let out = BespokeRunner::default().run(&spirv, &inputs).unwrap();
+    let p = &out.pixels[0];
+    assert!((p[0] - 200.0 / 255.0).abs() < 1e-6,
+        "R: expected 200/255, got {}", p[0]);
+    assert_eq!(p[1], 0.0, "G should be 0");
+    assert_eq!(p[2], 0.0, "B should be 0");
+    assert_eq!(p[3], 1.0, "A should be 1");
+}
+
 /// Arc 77: end-to-end Rgba8Srgb sampling.  Mid-grey sRGB
 /// (R=G=B=128) decodes to ≈0.21586 linear; alpha stays
 /// linear at 200/255.  Verifies the sRGB→linear de-gamma
