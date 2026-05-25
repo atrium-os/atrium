@@ -9387,6 +9387,22 @@ mod tests {
         // If this drifts we'd be reading sType/pNext-low bits as
         // flags and mis-signaling fences out of the gate.
         assert_eq!(offset_of!(vk::FenceCreateInfo, flags), 16);
+
+        // Arc 113: the five remaining Vulkan 1.1 *2 query output
+        // wrappers. Each writes its inner block at offset 16 of
+        // the sType / pNext header.  A header shuffle would
+        // clobber sType / pNext and leave the *inner* (the bit
+        // the app actually reads back) silently empty.
+        assert_eq!(offset_of!(vk::PhysicalDeviceProperties2,
+            properties),               16);
+        assert_eq!(offset_of!(vk::PhysicalDeviceFeatures2,
+            features),                 16);
+        assert_eq!(offset_of!(vk::PhysicalDeviceMemoryProperties2,
+            memory_properties),        16);
+        assert_eq!(offset_of!(vk::FormatProperties2,
+            format_properties),        16);
+        assert_eq!(offset_of!(vk::QueueFamilyProperties2,
+            queue_family_properties),  16);
     }
 
     /// Arc 98: preemptive offset pins for the other VkCreateInfo
