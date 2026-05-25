@@ -71,6 +71,11 @@ const VK_MAX_DESCRIPTION_SIZE:    usize = 256;
 /// VK_ERROR_INITIALIZATION_FAILED — used when a caller hands us a
 /// null out-pointer where the spec requires one.
 const VK_ERROR_INITIALIZATION_FAILED: VkResult = -3;
+/// `VK_ERROR_INCOMPATIBLE_DRIVER` — returned from
+/// `vk_icdNegotiateLoaderICDInterfaceVersion` when the
+/// loader's version is incompatible with ours, so the
+/// loader skips this ICD entirely.  Arc 93.
+const VK_ERROR_INCOMPATIBLE_DRIVER: VkResult = -9;
 
 /// VK_ICD_LOADER_MAGIC — the value the Khronos loader expects at
 /// offset 0 of every dispatchable handle (VkInstance,
@@ -7225,7 +7230,10 @@ pub unsafe extern "C" fn vkEnumerateDeviceExtensionProperties(
     p_properties:     *mut VkExtensionProperties,
 ) -> VkResult {
     if p_property_count.is_null() {
-        return -7 /* VK_ERROR_INITIALIZATION_FAILED */;
+        // Arc 93: was `-7` with the same misleading comment as
+        // vkEnumerateInstanceExtensionProperties (Arc 92).
+        // Same fix: use the named const.
+        return VK_ERROR_INITIALIZATION_FAILED;
     }
     let n = ATRIUM_DEVICE_EXTENSIONS.len() as u32;
     if p_properties.is_null() {
@@ -7259,7 +7267,9 @@ pub unsafe extern "C" fn vkEnumerateInstanceLayerProperties(
     p_properties:     *mut VkLayerProperties,
 ) -> VkResult {
     if p_property_count.is_null() {
-        return -7 /* VK_ERROR_INITIALIZATION_FAILED */;
+        // Arc 93: was `-7` -- same INITIALIZATION_FAILED
+        // mislabel as Arc 92.
+        return VK_ERROR_INITIALIZATION_FAILED;
     }
     *p_property_count = 0;
     let _ = p_properties;
@@ -7284,7 +7294,16 @@ pub unsafe extern "C" fn vk_icdNegotiateLoaderICDInterfaceVersion(
     if p_version.is_null() {
         // Defensive — Khronos loader always provides this, but a
         // malicious or buggy caller might not.
-        return -8 /* VK_ERROR_INCOMPATIBLE_DRIVER */;
+        //
+        // Arc 93: was `-8`; per the spec
+        //   -8  VK_ERROR_FEATURE_NOT_PRESENT
+        //   -9  VK_ERROR_INCOMPATIBLE_DRIVER
+        // The comment had the right intent.  Use the named
+        // const so the loader sees the spec-correct value
+        // (and the failure mode -- "skip this ICD entirely"
+        // -- matches the documented `VK_ERROR_INCOMPATIBLE_DRIVER`
+        // contract in the function's outer comment block).
+        return VK_ERROR_INCOMPATIBLE_DRIVER;
     }
     let loader_version = *p_version;
     let agreed = loader_version.min(ATRIUM_LOADER_ICD_INTERFACE_VERSION_MAX);
