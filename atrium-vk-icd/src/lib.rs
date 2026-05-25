@@ -9462,6 +9462,27 @@ mod tests {
         assert_eq!(offset_of!(vk::PhysicalDeviceImageFormatInfo2, flags),  32);
         assert_eq!(offset_of!(vk::ImageFormatProperties2,
             image_format_properties), 16);
+
+        // VkWriteDescriptorSet (vkUpdateDescriptorSets) -- Arc 106.
+        // 64-byte stride; field layout matches the ICD's parser.
+        assert_eq!(offset_of!(vk::WriteDescriptorSet, dst_set),             16);
+        assert_eq!(offset_of!(vk::WriteDescriptorSet, dst_binding),         24);
+        assert_eq!(offset_of!(vk::WriteDescriptorSet, dst_array_element),   28);
+        assert_eq!(offset_of!(vk::WriteDescriptorSet, descriptor_count),    32);
+        assert_eq!(offset_of!(vk::WriteDescriptorSet, descriptor_type),     36);
+        assert_eq!(offset_of!(vk::WriteDescriptorSet, p_image_info),        40);
+        assert_eq!(offset_of!(vk::WriteDescriptorSet, p_buffer_info),       48);
+        assert_eq!(offset_of!(vk::WriteDescriptorSet, p_texel_buffer_view), 56);
+        assert_eq!(std::mem::size_of::<vk::WriteDescriptorSet>(),           64);
+
+        // VkDescriptorImageInfo / VkDescriptorBufferInfo
+        // (referenced from WriteDescriptorSet) -- Arc 106.
+        assert_eq!(offset_of!(vk::DescriptorImageInfo, sampler),      0);
+        assert_eq!(offset_of!(vk::DescriptorImageInfo, image_view),   8);
+        assert_eq!(offset_of!(vk::DescriptorImageInfo, image_layout), 16);
+        assert_eq!(offset_of!(vk::DescriptorBufferInfo, buffer),      0);
+        assert_eq!(offset_of!(vk::DescriptorBufferInfo, offset),      8);
+        assert_eq!(offset_of!(vk::DescriptorBufferInfo, range),       16);
     }
 
     /// Arc 73: pin the bytes-per-pixel table against the
