@@ -2341,7 +2341,7 @@ pub unsafe extern "C" fn vkGetPhysicalDeviceFormatProperties(
     //     bufferFeatures.
     //   - Everything else: zeroed (== FORMAT_NOT_SUPPORTED in
     //     the per-feature sense).
-    let f = format.as_raw();
+    use ash::vk::Format as Fmt;
     let mut props = ash::vk::FormatProperties::default();
 
     let color_features =
@@ -2361,27 +2361,32 @@ pub unsafe extern "C" fn vkGetPhysicalDeviceFormatProperties(
         | F::TRANSFER_SRC
         | F::TRANSFER_DST;
 
-    match f {
-        // R8G8B8A8_{UNORM,SRGB}, B8G8R8A8_{UNORM,SRGB} — tier-1
-        // composes natively in these.
-        37 | 43 | 44 | 50 => {
+    // Arc 89: rewritten against ash::vk::Format constants
+    // (was hand-typed numeric literals; comments listed UINT
+    // and SINT swapped for the R32_* family -- the *code*
+    // worked because it used a range, but a reader reaching
+    // for "what does 98 mean?" got the wrong answer).
+    match format {
+        // Tier-1 (tiny-skia) composes natively in these.
+        Fmt::R8G8B8A8_UNORM | Fmt::R8G8B8A8_SRGB
+        | Fmt::B8G8R8A8_UNORM | Fmt::B8G8R8A8_SRGB => {
             props.optimal_tiling_features = color_features;
             props.linear_tiling_features  = color_features;
             props.buffer_features         = F::VERTEX_BUFFER;
         }
-        // D16_UNORM, D32_SFLOAT, D24_UNORM_S8_UINT, D32_SFLOAT_S8_UINT.
-        124 | 126 | 129 | 130 => {
+        // Depth / depth-stencil attachment formats.
+        Fmt::D16_UNORM | Fmt::D32_SFLOAT
+        | Fmt::D24_UNORM_S8_UINT | Fmt::D32_SFLOAT_S8_UINT => {
             props.optimal_tiling_features = depth_features;
             props.linear_tiling_features  = depth_features;
         }
-        // Common numeric vertex formats — bufferFeatures only.
-        //   100 R32_SFLOAT, 103 R32G32_SFLOAT, 106 R32G32B32_SFLOAT,
-        //   109 R32G32B32A32_SFLOAT.
-        //    99 R32_UINT, 102 R32G32_UINT, 105 R32G32B32_UINT,
-        //   108 R32G32B32A32_UINT.
-        //    98 R32_SINT, 101 R32G32_SINT, 104 R32G32B32_SINT,
-        //   107 R32G32B32A32_SINT.
-        98..=109 => {
+        // Common 32-bit numeric vertex formats -- bufferFeatures
+        // only (sample/colour-attachment isn't expected here).
+        Fmt::R32_UINT       | Fmt::R32_SINT       | Fmt::R32_SFLOAT
+        | Fmt::R32G32_UINT  | Fmt::R32G32_SINT  | Fmt::R32G32_SFLOAT
+        | Fmt::R32G32B32_UINT | Fmt::R32G32B32_SINT | Fmt::R32G32B32_SFLOAT
+        | Fmt::R32G32B32A32_UINT | Fmt::R32G32B32A32_SINT
+        | Fmt::R32G32B32A32_SFLOAT => {
             props.buffer_features = F::VERTEX_BUFFER
                 | F::UNIFORM_TEXEL_BUFFER
                 | F::STORAGE_TEXEL_BUFFER;
