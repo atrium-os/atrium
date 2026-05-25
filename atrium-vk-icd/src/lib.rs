@@ -76,6 +76,12 @@ const VK_ERROR_INITIALIZATION_FAILED: VkResult = -3;
 /// loader's version is incompatible with ours, so the
 /// loader skips this ICD entirely.  Arc 93.
 const VK_ERROR_INCOMPATIBLE_DRIVER: VkResult = -9;
+/// `VK_NOT_READY` — returned by `vkGetFenceStatus` /
+/// `vkGetQueryPoolResults` when the resource is
+/// unsignalled / hasn't produced data yet.  Apps polling
+/// for a fence treat this as a non-error "try again
+/// later".  Arc 94.
+const VK_NOT_READY: VkResult = 1;
 
 /// VK_ICD_LOADER_MAGIC — the value the Khronos loader expects at
 /// offset 0 of every dispatchable handle (VkInstance,
@@ -4465,7 +4471,12 @@ pub unsafe extern "C" fn vkGetFenceStatus(
     let dev = &*(device as *const AtriumDevice);
     match dev.fences.lock().ok().and_then(|f| f.get(&fence).copied()) {
         Some(true)  => VK_SUCCESS,
-        Some(false) => 3, /* VK_NOT_READY */
+        // Arc 94: was `3 /* VK_NOT_READY */`, but per the
+        // Vulkan spec VK_NOT_READY = 1; 3 is VK_EVENT_SET.
+        // Apps polling vkGetFenceStatus look for SUCCESS
+        // or NOT_READY; the wrong value here could confuse
+        // robust callers.
+        Some(false) => VK_NOT_READY,
         None        => -4, /* VK_ERROR_DEVICE_LOST */
     }
 }
@@ -5510,7 +5521,9 @@ pub unsafe extern "C" fn vkGetQueryPoolResults(
     _stride:     u64,
     _flags:      u32,
 ) -> VkResult {
-    3 /* VK_NOT_READY */
+    // Arc 94: was `3 /* VK_NOT_READY */` -- same off-by-2
+    // bug as vkGetFenceStatus.  Per spec VK_NOT_READY = 1.
+    VK_NOT_READY
 }
 
 // ───── Events ───────────────────────────────────────────────────
