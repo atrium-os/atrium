@@ -9347,6 +9347,29 @@ mod tests {
         assert_eq!(offset_of!(vk::SwapchainCreateInfoKHR, image_usage),     56);
     }
 
+    /// Arc 100: preemptive offset pins for the output / info
+    /// structs the ICD writes to or reads from by raw byte
+    /// offset.  Cousin to Arcs 97 + 98, covering the
+    /// 1.1 pNext-chain query variants:
+    #[test]
+    fn vk_query_output_layouts_match_ash() {
+        use std::mem::offset_of;
+        use ash::vk;
+
+        assert_eq!(offset_of!(vk::BufferMemoryRequirementsInfo2, buffer), 16);
+        assert_eq!(offset_of!(vk::ImageMemoryRequirementsInfo2,  image),  16);
+        assert_eq!(offset_of!(vk::DeviceImageMemoryRequirements,
+            p_create_info), 16);
+        assert_eq!(offset_of!(vk::MemoryRequirements2,
+            memory_requirements), 16);
+        assert_eq!(offset_of!(vk::DescriptorSetLayoutSupport,
+            supported), 16);
+        assert_eq!(offset_of!(vk::DeviceGroupPresentCapabilitiesKHR,
+            present_mask), 16);
+        assert_eq!(offset_of!(vk::DeviceGroupPresentCapabilitiesKHR,
+            modes), 144);
+    }
+
     /// Arc 98: preemptive offset pins for the other VkCreateInfo
     /// structs the ICD reads by raw byte offset.  All were
     /// verified correct by hand during the Arc 97 audit; these
