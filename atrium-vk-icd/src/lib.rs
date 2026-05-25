@@ -9430,6 +9430,14 @@ mod tests {
         // VkMemoryAllocateInfo (vkAllocateMemory) -- Arc 102.
         assert_eq!(offset_of!(vk::MemoryAllocateInfo, allocation_size),   16);
         assert_eq!(offset_of!(vk::MemoryAllocateInfo, memory_type_index), 24);
+
+        // VkRenderingInfo + VkRenderingAttachmentInfo
+        // (vkCmdBeginRendering, Vulkan 1.3 dynamic rendering) -- Arc 103.
+        assert_eq!(offset_of!(vk::RenderingInfo, color_attachment_count), 44);
+        assert_eq!(offset_of!(vk::RenderingInfo, p_color_attachments),    48);
+        assert_eq!(offset_of!(vk::RenderingInfo, p_depth_attachment),     56);
+        assert_eq!(offset_of!(vk::RenderingAttachmentInfo, image_view),   16);
+        assert_eq!(offset_of!(vk::RenderingAttachmentInfo, clear_value),  52);
     }
 
     /// Arc 73: pin the bytes-per-pixel table against the
