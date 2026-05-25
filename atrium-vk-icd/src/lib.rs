@@ -7158,7 +7158,13 @@ pub unsafe extern "C" fn vkEnumerateInstanceExtensionProperties(
     p_properties:     *mut VkExtensionProperties,
 ) -> VkResult {
     if p_property_count.is_null() {
-        return -7 /* VK_ERROR_INITIALIZATION_FAILED */;
+        // Arc 92: was `-7` with a comment claiming
+        // VK_ERROR_INITIALIZATION_FAILED -- but -7 is
+        // VK_ERROR_EXTENSION_NOT_PRESENT per the Vulkan spec.
+        // The comment correctly identified the intent
+        // (parameter validation = INITIALIZATION_FAILED);
+        // the literal was wrong.  Use the named const.
+        return VK_ERROR_INITIALIZATION_FAILED;
     }
     let n = ATRIUM_INSTANCE_EXTENSIONS.len() as u32;
     if p_properties.is_null() {
