@@ -872,6 +872,86 @@ fn build_atomic_cas_weak_cs() -> Vec<u8> {
 }
 
 #[test]
+fn differential_storage_image_rgba16f_read_modify_write() {
+    // Arc 84: end-to-end test for Arc 71's Rgba16Float
+    // storage-image format.  Pre-fills the image with four
+    // exactly-f16-representable values, has the shader read,
+    // double each lane, write back.  Verifies the
+    // f16_to_f32 / f32_to_f16 wire round-trips through real
+    // shader codegen.
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, Dim,
+        ExecutionMode, ExecutionModel, FunctionControl, ImageFormat,
+        MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let f32_ty = b.type_float(32, None);
+    let v2u    = b.type_vector(u32_ty, 2);
+    let v4f    = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let img_ty = b.type_image(f32_ty, Dim::Dim2D, 0, 0, 0, 2,
+        ImageFormat::Rgba32f, None);
+    let ptr_img = b.type_pointer(None, StorageClass::UniformConstant, img_ty);
+    let img_var = b.variable(ptr_img, None, StorageClass::UniformConstant, None);
+    b.decorate(img_var, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(img_var, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let c_zero_u = b.constant_bit32(u32_ty, 0);
+    let c_two_f  = b.constant_bit32(f32_ty, 2.0f32.to_bits());
+    // texel = imageLoad(img, ivec2(0)) * vec4(2.0)
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let coord = b.composite_construct(v2u, None, vec![c_zero_u, c_zero_u]).unwrap();
+    let img = b.load(img_ty, None, img_var, None, vec![]).unwrap();
+    let loaded = b.image_read(v4f, None, img, coord, None, vec![]).unwrap();
+    let two_vec = b.composite_construct(v4f, None,
+        vec![c_two_f, c_two_f, c_two_f, c_two_f]).unwrap();
+    let doubled = b.f_mul(v4f, None, loaded, two_vec).unwrap();
+    b.image_write(img, coord, doubled, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![img_var]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spv = Vec::with_capacity(words.len() * 4);
+    for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+
+    // Prefill four exactly-f16-representable values:
+    //   1.0   = 0x3C00
+    //   2.0   = 0x4000
+    //  -0.5   = 0xB800
+    //   3.0   = 0x4200
+    // Doubled: 2.0, 4.0, -1.0, 6.0 — also exactly f16.
+    let prefill: Vec<u16> = vec![0x3C00, 0x4000, 0xB800, 0x4200];
+    let prefill_bytes: Vec<u8> = prefill.iter()
+        .flat_map(|h| h.to_le_bytes()).collect();
+    let mut b_img = prefill_bytes.clone();
+    let mut c_img = prefill_bytes.clone();
+    let dir = TempDir::new().unwrap();
+    // format = 4 (StorageFormat::Rgba16Float).
+    invoke_compute_image(&spv, true,  dir.path(), "b",
+        &mut b_img, 1, 1, 1, 4, &[(0, 0, 0)]);
+    invoke_compute_image(&spv, false, dir.path(), "c",
+        &mut c_img, 1, 1, 1, 4, &[(0, 0, 0)]);
+    assert_eq!(b_img, c_img,
+        "Rgba16Float read-modify-write diverges between backends");
+    // Expected: doubled values back as f16 (all exactly
+    // representable so no rounding error).
+    let want: Vec<u16> = vec![0x4000, 0x4400, 0xBC00, 0x4600];
+    let want_bytes: Vec<u8> = want.iter()
+        .flat_map(|h| h.to_le_bytes()).collect();
+    assert_eq!(b_img, want_bytes,
+        "post-doubling bytes don't match expected f16 patterns");
+}
+
+#[test]
 fn differential_storage_image_r32uint_read_modify_write() {
     // Arc 83: read-side counterpart to Arc 82.  Pre-fills the
     // R32Uint storage image with 0xDEADBEEF; the shader reads
