@@ -9368,6 +9368,25 @@ mod tests {
             present_mask), 16);
         assert_eq!(offset_of!(vk::DeviceGroupPresentCapabilitiesKHR,
             modes), 144);
+
+        // Arc 111: External*Properties output structs whose inner
+        // VkExternal*MemoryProperties block sits at offset 16.
+        // The ICD zeroes that block to advertise "handle type not
+        // supported".  A header shuffle that moved the inner up
+        // (e.g. via reordering pNext) would zero sType/pNext and
+        // leave bogus garbage in the actual feature bits.
+        assert_eq!(offset_of!(vk::ExternalBufferProperties,
+            external_memory_properties), 16);
+        assert_eq!(offset_of!(vk::ExternalFenceProperties,
+            export_from_imported_handle_types), 16);
+        assert_eq!(offset_of!(vk::ExternalSemaphoreProperties,
+            export_from_imported_handle_types), 16);
+
+        // VkFenceCreateInfo.flags (vkCreateFence): ICD reads u32
+        // at offset 16 and honors VK_FENCE_CREATE_SIGNALED_BIT.
+        // If this drifts we'd be reading sType/pNext-low bits as
+        // flags and mis-signaling fences out of the gate.
+        assert_eq!(offset_of!(vk::FenceCreateInfo, flags), 16);
     }
 
     /// Arc 98: preemptive offset pins for the other VkCreateInfo
