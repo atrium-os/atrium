@@ -2522,6 +2522,76 @@ fn differential_glsl_int_bit_scan() {
 }
 
 #[test]
+fn differential_op_unreachable_branch() {
+    // Arc 60: OpUnreachable as the terminator of a static-
+    // false branch.  Build a shader that does:
+    //   if (true) { ssbo[0] = 42; } else { unreachable; }
+    // and verify the result is 42, with bespoke and cranelift
+    // agreeing.
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, SelectionControl,
+        StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let bool_ty = b.type_bool();
+    let void_fn = b.type_function(void, vec![]);
+    let rt = b.type_runtime_array(u32_ty);
+    b.decorate(rt, Decoration::ArrayStride, vec![rspirv::dr::Operand::LiteralBit32(4)]);
+    let s = b.type_struct(vec![rt]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_u = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+    let ssbo  = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    let c_42   = b.constant_bit32(u32_ty, 42);
+    let c_true = b.constant_true(bool_ty);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    let entry = b.begin_block(None).unwrap();
+    let _ = entry;
+    let then_blk   = b.id();
+    let else_blk   = b.id();
+    let merge_blk  = b.id();
+    b.selection_merge(merge_blk, SelectionControl::NONE).unwrap();
+    b.branch_conditional(c_true, then_blk, else_blk, vec![]).unwrap();
+    // Then block: store 42.
+    b.begin_block(Some(then_blk)).unwrap();
+    let d = b.access_chain(ptr_u, None, ssbo, vec![c_zero, c_zero]).unwrap();
+    b.store(d, c_42, None, vec![]).unwrap();
+    b.branch(merge_blk).unwrap();
+    // Else block: unreachable terminator.
+    b.begin_block(Some(else_blk)).unwrap();
+    b.unreachable().unwrap();
+    // Merge block: return.
+    b.begin_block(Some(merge_blk)).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spv = Vec::with_capacity(words.len() * 4);
+    for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+    let dir = TempDir::new().unwrap();
+    let mut b_buf = vec![0u8; 4];
+    let mut c_buf = vec![0u8; 4];
+    invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
+    invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+    assert_eq!(b_buf, c_buf,
+        "OpUnreachable branch diverges between backends");
+    let got = u32::from_le_bytes(b_buf[0..4].try_into().unwrap());
+    assert_eq!(got, 42, "expected 42, got {got}");
+}
+
+#[test]
 fn differential_op_quantize_to_f16() {
     // Arc 55: OpQuantizeToF16.  Truncating quantization
     // (mantissa low 13 bits dropped).  Inputs were chosen so
