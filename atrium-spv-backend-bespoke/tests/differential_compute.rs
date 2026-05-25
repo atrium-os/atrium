@@ -872,6 +872,78 @@ fn build_atomic_cas_weak_cs() -> Vec<u8> {
 }
 
 #[test]
+fn differential_storage_image_r32uint_read_modify_write() {
+    // Arc 83: read-side counterpart to Arc 82.  Pre-fills the
+    // R32Uint storage image with 0xDEADBEEF; the shader reads
+    // it, bitcasts back to u32, adds 1, bitcasts to f32, and
+    // writes it back.  Verifies the read path round-trips
+    // u32 via f32::from_bits in image_read_impl.
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, Dim,
+        ExecutionMode, ExecutionModel, FunctionControl, ImageFormat,
+        MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let f32_ty = b.type_float(32, None);
+    let v2u    = b.type_vector(u32_ty, 2);
+    let v4f    = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let img_ty = b.type_image(f32_ty, Dim::Dim2D, 0, 0, 0, 2,
+        ImageFormat::Rgba32f, None);
+    let ptr_img = b.type_pointer(None, StorageClass::UniformConstant, img_ty);
+    let img_var = b.variable(ptr_img, None, StorageClass::UniformConstant, None);
+    b.decorate(img_var, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(img_var, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let c_zero_u = b.constant_bit32(u32_ty, 0);
+    let c_zero_f = b.constant_bit32(f32_ty, 0.0f32.to_bits());
+    let c_one_u  = b.constant_bit32(u32_ty, 1);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let coord = b.composite_construct(v2u, None, vec![c_zero_u, c_zero_u]).unwrap();
+    let img = b.load(img_ty, None, img_var, None, vec![]).unwrap();
+    // OpImageRead returns a vec4<f32>; lane 0 carries the
+    // u32 bit pattern from the R32Uint texel.
+    let loaded = b.image_read(v4f, None, img, coord, None, vec![]).unwrap();
+    let lane0_f = b.composite_extract(f32_ty, None, loaded, vec![0]).unwrap();
+    let lane0_u = b.bitcast(u32_ty, None, lane0_f).unwrap();
+    let incremented = b.i_add(u32_ty, None, lane0_u, c_one_u).unwrap();
+    let payload_f = b.bitcast(f32_ty, None, incremented).unwrap();
+    let texel = b.composite_construct(v4f, None,
+        vec![payload_f, c_zero_f, c_zero_f, c_zero_f]).unwrap();
+    b.image_write(img, coord, texel, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![img_var]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spv = Vec::with_capacity(words.len() * 4);
+    for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+
+    // Prefill: u32 0xDEADBEEF.
+    let mut b_img = 0xDEAD_BEEF_u32.to_le_bytes().to_vec();
+    let mut c_img = 0xDEAD_BEEF_u32.to_le_bytes().to_vec();
+    let dir = TempDir::new().unwrap();
+    invoke_compute_image(&spv, true,  dir.path(), "b",
+        &mut b_img, 1, 1, 1, 3, &[(0, 0, 0)]);
+    invoke_compute_image(&spv, false, dir.path(), "c",
+        &mut c_img, 1, 1, 1, 3, &[(0, 0, 0)]);
+    assert_eq!(b_img, c_img,
+        "R32Uint read-modify-write diverges between backends");
+    let stored = u32::from_le_bytes(b_img[0..4].try_into().unwrap());
+    assert_eq!(stored, 0xDEAD_BEEF_u32.wrapping_add(1),
+        "read-modify-write: got {:#x} want {:#x}",
+        stored, 0xDEAD_BEEF_u32.wrapping_add(1));
+}
+
+#[test]
 fn differential_storage_image_r32uint_write() {
     // Arc 82: end-to-end test for Arc 71's R32Uint storage
     // image format.  Compute shader bitcasts a u32 payload
