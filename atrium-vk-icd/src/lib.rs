@@ -9509,6 +9509,26 @@ mod tests {
         assert_eq!(std::mem::size_of::<vk::SubmitInfo2>(),                 64);
         assert_eq!(offset_of!(vk::CommandBufferSubmitInfo, command_buffer), 16);
         assert_eq!(std::mem::size_of::<vk::CommandBufferSubmitInfo>(),     32);
+
+        // VkBufferMemoryRequirementsInfo2 +
+        // VkImageMemoryRequirementsInfo2 (vkGetBuffer/Image-
+        // MemoryRequirements2) -- Arc 110.
+        // The ICD reads `buffer`/`image` at offset 16 of the
+        // pNext-chain wrapper; pin it against ash so a future
+        // Vulkan header shuffle surfaces as a test failure
+        // instead of returning bogus memory requirements.
+        assert_eq!(offset_of!(vk::BufferMemoryRequirementsInfo2, buffer), 16);
+        assert_eq!(offset_of!(vk::ImageMemoryRequirementsInfo2,  image),  16);
+
+        // VkClearValue / VkClearDepthStencilValue
+        // (vkCmdBeginRenderPass) -- Arc 110.
+        // ICD reads pClearValues as a 16-byte-stride array:
+        // entry 0 is the colour clear (4 f32 at 0/4/8/12),
+        // entry 1's depth f32 lives at byte 16 (= stride 16,
+        // depth at offset 0 of the depth/stencil union).
+        assert_eq!(std::mem::size_of::<vk::ClearValue>(),                 16);
+        assert_eq!(offset_of!(vk::ClearDepthStencilValue, depth),          0);
+        assert_eq!(offset_of!(vk::ClearDepthStencilValue, stencil),        4);
     }
 
     /// Arc 73: pin the bytes-per-pixel table against the
