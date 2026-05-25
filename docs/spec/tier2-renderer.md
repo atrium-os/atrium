@@ -395,7 +395,47 @@ many shaders are still on the Cranelift path vs bespoke
   cube variants) — a small Rust library tier-2 ships
   alongside the rasterizer.
 
-### 4.3 ABI versioning
+### 4.3 Texture format reference
+
+Both the sampler path (`TexFormat`) and the storage-image
+path (`StorageFormat`) carry a stable u32 wire value baked
+into compiled shaders, so any rebase of these enum
+discriminants is a wire-format break.  Current set as of
+Arc 73:
+
+**Sampler side — `atrium_spv_runtime::TexFormat`** (12 variants):
+
+| Value | Variant       | Bytes | Notes                                       |
+|-------|---------------|-------|---------------------------------------------|
+| 0     | Rgba8Unorm    | 4     | Channel order R,G,B,A.                      |
+| 1     | Bgra8Unorm    | 4     | Matches the Atrium scanout buffer layout.   |
+| 2     | R8Unorm       | 1     | Replicated to R; G=B=0, A=1.                |
+| 3     | R32Float      | 4     | HDR-friendly; no clamping. Arc 66.          |
+| 4     | Rgba32Float   | 16    | Exact f32 round-trip per channel. Arc 66.   |
+| 5     | Rg8Unorm      | 2     | Normal maps / motion vectors. Arc 67.       |
+| 6     | Rgba16Float   | 8     | HDR colour. f16↔f32 via inline. Arc 67.     |
+| 7     | Rgba8Srgb     | 4     | sRGB→linear on read; A linear. Arc 68.      |
+| 8     | Bgra8Srgb     | 4     | sRGB with BGRA swizzle. Arc 68.             |
+| 9     | R16Float      | 2     | Single-channel HDR / depth. Arc 69.         |
+| 10    | Rg16Float     | 4     | 2-channel HDR / motion vectors. Arc 69.     |
+| 11    | R16Unorm      | 2     | Classic 16-bit depth buffer. Arc 70.        |
+
+**Storage-image side — `atrium_spv_runtime::StorageFormat`** (5 variants):
+
+| Value | Variant       | Bytes | Notes                                       |
+|-------|---------------|-------|---------------------------------------------|
+| 0     | Rgba8Unorm    | 4     | u8 round-trip via unorm.                    |
+| 1     | R32Float      | 4     | Single-channel f32.                         |
+| 2     | Rgba32Float   | 16    | Exact f32 per channel.                      |
+| 3     | R32Uint       | 4     | Visibility / atomic. Bit-pattern via        |
+|       |               |       | `f32::from_bits`/`to_bits`. Arc 71.         |
+| 4     | Rgba16Float   | 8     | HDR intermediates. Round-to-nearest-even    |
+|       |               |       | via `f32_to_f16`. Arc 71.                   |
+
+Unrecognized wire values fall back to `Rgba8Unorm` defensively
+(better than UB on a malformed descriptor).
+
+### 4.4 ABI versioning
 
 `TIER2_SHADER_ABI_VERSION` is a build-time `u32` constant
 in both the daemon and every backend. Bumped when any of:
