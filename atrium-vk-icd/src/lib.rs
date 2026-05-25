@@ -9452,6 +9452,16 @@ mod tests {
         // VkPhysicalDeviceSurfaceInfo2KHR
         // (vkGetPhysicalDeviceSurfaceCapabilities2KHR etc.) -- Arc 104.
         assert_eq!(offset_of!(vk::PhysicalDeviceSurfaceInfo2KHR, surface), 16);
+
+        // VkPhysicalDeviceImageFormatInfo2 + VkImageFormatProperties2
+        // (vkGetPhysicalDeviceImageFormatProperties2) -- Arc 105.
+        assert_eq!(offset_of!(vk::PhysicalDeviceImageFormatInfo2, format), 16);
+        assert_eq!(offset_of!(vk::PhysicalDeviceImageFormatInfo2, ty),     20);
+        assert_eq!(offset_of!(vk::PhysicalDeviceImageFormatInfo2, tiling), 24);
+        assert_eq!(offset_of!(vk::PhysicalDeviceImageFormatInfo2, usage),  28);
+        assert_eq!(offset_of!(vk::PhysicalDeviceImageFormatInfo2, flags),  32);
+        assert_eq!(offset_of!(vk::ImageFormatProperties2,
+            image_format_properties), 16);
     }
 
     /// Arc 73: pin the bytes-per-pixel table against the
