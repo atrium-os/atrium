@@ -1420,6 +1420,24 @@ specifically supports:
     classic 16-bit depth-buffer format — common for shadow
     maps, depth-peeling intermediate buffers, and any pass
     that needs a tighter depth range than D24/D32 affords.
+  Storage-image formats expansion (Arc 71): two new
+  `StorageFormat` variants mirror common Vulkan compute uses.
+    `StorageFormat::R32Uint = 3` — 1×u32 (4 bytes/texel).
+       Read into R lane via `f32::from_bits`, write via
+       `to_bits` — the shader carries the integer through
+       `OpBitcast`.  Used for visibility buffers, atomic
+       counters, any 32-bit per-pixel integer storage.
+    `StorageFormat::Rgba16Float = 4` — 4×f16 (8 bytes/texel).
+       Round-trips through the same `f16_to_f32` /
+       `f32_to_f16` converters used by the sampler side.
+       Common for HDR intermediate render targets in compute
+       pipelines.
+  Adds `f32_to_f16` inline: round-to-nearest-even on the
+  dropped 13 mantissa bits, saturates out-of-range finite
+  values to ±Inf (matches GLSL `packHalf2x16`), flushes
+  denormals to zero, propagates Inf / NaN.
+  Three new unit tests pin u32 bit-pattern round-trip,
+  Rgba16f vec4 round-trip, and `f32_to_f16` boundary cases.
   `Op::SampledImageQuerySizeLod { image, lod }` is emitted
   by the frontend for `OpImageQuerySizeLod`.  Both backends
   read TexDesc.width @ #8 / height @ #12 directly off the

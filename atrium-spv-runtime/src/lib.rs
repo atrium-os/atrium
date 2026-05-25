@@ -108,6 +108,18 @@ pub enum StorageFormat {
     R32Float     = 1,
     /// 4×f32, channel order R,G,B,A.  16 bytes/texel.
     Rgba32Float  = 2,
+    /// 1×u32 (4 bytes/texel).  Read into the R lane bitwise
+    /// -- the runtime exposes the u32 via `f32::from_bits`
+    /// so the shader's `OpBitcast` recovers the integer.
+    /// Used for visibility buffers, atomic counters, and
+    /// any 32-bit per-pixel integer storage.  Added in
+    /// Arc 71.
+    R32Uint      = 3,
+    /// 4×f16 IEEE 754 (8 bytes/texel).  Round-trips through
+    /// the inline f16↔f32 converters.  Common for HDR
+    /// intermediate render targets in compute pipelines.
+    /// Added in Arc 71.
+    Rgba16Float  = 4,
 }
 
 impl StorageFormat {
@@ -117,6 +129,8 @@ impl StorageFormat {
             StorageFormat::Rgba8Unorm  => 4,
             StorageFormat::R32Float    => 4,
             StorageFormat::Rgba32Float => 16,
+            StorageFormat::R32Uint     => 4,
+            StorageFormat::Rgba16Float => 8,
         }
     }
 }
@@ -126,6 +140,8 @@ fn storage_format_from_u32(v: u32) -> StorageFormat {
     match v {
         1 => StorageFormat::R32Float,
         2 => StorageFormat::Rgba32Float,
+        3 => StorageFormat::R32Uint,
+        4 => StorageFormat::Rgba16Float,
         // 0 and anything malformed -> Rgba8Unorm.
         _ => StorageFormat::Rgba8Unorm,
     }
@@ -851,6 +867,22 @@ fn image_read_impl(img: &ImageDesc, x: u32, y: u32) -> [f32; 4] {
                 }
                 out
             }
+            StorageFormat::R32Uint => {
+                // Reinterpret the raw u32 bits as f32 so the
+                // shader can recover the integer via OpBitcast.
+                let u = u32::from_le_bytes([
+                    *p.add(0), *p.add(1), *p.add(2), *p.add(3)]);
+                [f32::from_bits(u), 0.0, 0.0, 1.0]
+            }
+            StorageFormat::Rgba16Float => {
+                let p16 = p as *const u16;
+                [
+                    f16_to_f32(*p16.add(0)),
+                    f16_to_f32(*p16.add(1)),
+                    f16_to_f32(*p16.add(2)),
+                    f16_to_f32(*p16.add(3)),
+                ]
+            }
         }
     }
 }
@@ -880,8 +912,71 @@ fn image_write_impl(img: &ImageDesc, x: u32, y: u32, rgba: [f32; 4]) {
                     for k in 0..4 { *p.add(c * 4 + k) = b[k]; }
                 }
             }
+            StorageFormat::R32Uint => {
+                // rgba[0] is an f32 carrying the u32 bit
+                // pattern (via OpBitcast on the shader side).
+                let u = rgba[0].to_bits();
+                let b = u.to_le_bytes();
+                for k in 0..4 { *p.add(k) = b[k]; }
+            }
+            StorageFormat::Rgba16Float => {
+                let p16 = p as *mut u16;
+                for c in 0..4 {
+                    *p16.add(c) = f32_to_f16(rgba[c]);
+                }
+            }
         }
     }
+}
+
+/// Round-to-nearest-even IEEE 754 single → half conversion.
+/// Used by storage-image writes for `Rgba16Float`.  Handles
+/// ±0, ±Inf, NaN; denormals flush to zero (matches the
+/// sampler-side `f16_to_f32` inverse and the common GPU
+/// mediump behaviour).  Out-of-f16-range finite values
+/// saturate to ±Inf, which is the GLSL `packHalf2x16`
+/// reference behaviour.
+#[inline]
+fn f32_to_f16(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let sign = ((bits >> 31) & 0x1) as u16;
+    let exp  = ((bits >> 23) & 0xFF) as i32;
+    let mant = bits & 0x7FFFFF;
+    if exp == 0xFF {
+        // Inf / NaN.  NaN: produce any non-zero mantissa;
+        // truncate to top 10 bits of the f32 mantissa.
+        let m16 = (mant >> 13) as u16;
+        let m16 = if mant != 0 && m16 == 0 { 0x200 } else { m16 };
+        return (sign << 15) | (0x1F << 10) | m16;
+    }
+    // Real exponent (unbiased).
+    let e = exp - 127;
+    if e < -14 {
+        // Underflow -> +/- 0 (denormals flushed).
+        return sign << 15;
+    }
+    if e > 15 {
+        // Overflow -> +/- Inf.
+        return (sign << 15) | (0x1F << 10);
+    }
+    // Rebias to f16 (bias 15) and shift mantissa.
+    let e16 = (e + 15) as u16;
+    // Round-to-nearest-even on the dropped 13 bits.
+    let half = 0x1000_u32;
+    let mant_round = mant + half - ((mant >> 13) & 0x1);
+    let mut m16 = (mant_round >> 13) as u16 & 0x3FF;
+    // Mantissa carried into the exponent (e.g. 0x7FF -> +1
+    // exp + 0x000 mantissa).  If we overflowed the exponent
+    // by this carry, saturate to Inf.
+    let mut e16 = e16;
+    if (mant_round >> 23) & 0x1 != 0 {
+        e16 += 1;
+        m16 = 0;
+        if e16 >= 0x1F {
+            return (sign << 15) | (0x1F << 10);
+        }
+    }
+    (sign << 15) | (e16 << 10) | m16
 }
 
 /// `OpImageRead`: read a texel from a storage image at
@@ -2004,6 +2099,68 @@ mod tests {
         assert_eq!(got[1], 0.0);
         assert_eq!(got[2], 0.0);
         assert_eq!(got[3], 1.0);
+    }
+
+    /// Arc 71: R32Uint storage image -- write a u32 bit
+    /// pattern carried via OpBitcast and read it back through
+    /// the same f32::from_bits / to_bits round-trip.
+    #[test]
+    fn storage_image_r32uint_roundtrip() {
+        let mut data = vec![0u8; 4];
+        let img = ImageDesc {
+            data: data.as_mut_ptr(),
+            width: 1, height: 1, stride_bytes: 4,
+            format: StorageFormat::R32Uint as u32,
+            depth: 1, slice_bytes: 0,
+            mip_count: 0, mip_descs: std::ptr::null(),
+        };
+        // Pass u32 0xDEADBEEF through the f32 wire.
+        let payload_u32 = 0xDEAD_BEEF_u32;
+        let as_f32 = f32::from_bits(payload_u32);
+        image_write_impl(&img, 0, 0, [as_f32, 0.0, 0.0, 0.0]);
+        let got = image_read_impl(&img, 0, 0);
+        assert_eq!(got[0].to_bits(), payload_u32,
+            "u32 round-trip: got bits {:#x}", got[0].to_bits());
+    }
+
+    /// Arc 71: Rgba16Float storage round-trip via the f16↔f32
+    /// converters.  Inputs chosen so each value is exactly
+    /// f16-representable (no rounding).
+    #[test]
+    fn storage_image_rgba16f_roundtrip() {
+        let mut data = vec![0u8; 8];
+        let img = ImageDesc {
+            data: data.as_mut_ptr(),
+            width: 1, height: 1, stride_bytes: 8,
+            format: StorageFormat::Rgba16Float as u32,
+            depth: 1, slice_bytes: 0,
+            mip_count: 0, mip_descs: std::ptr::null(),
+        };
+        image_write_impl(&img, 0, 0, [1.0, -2.0, 0.5, 0.0]);
+        let got = image_read_impl(&img, 0, 0);
+        assert_eq!(got, [1.0, -2.0, 0.5, 0.0]);
+    }
+
+    /// Arc 71: f32_to_f16 special cases -- saturate / round /
+    /// flush-to-zero behaviours.
+    #[test]
+    fn f32_to_f16_special_cases() {
+        // Round-trip a few representable values.
+        assert_eq!(f32_to_f16(0.0),    0x0000);
+        assert_eq!(f32_to_f16(-0.0),   0x8000);
+        assert_eq!(f32_to_f16(1.0),    0x3C00);
+        assert_eq!(f32_to_f16(-1.0),   0xBC00);
+        assert_eq!(f32_to_f16(2.0),    0x4000);
+        // Overflow saturates to +/- Inf.
+        assert_eq!(f32_to_f16(1.0e10),     0x7C00); // +Inf
+        assert_eq!(f32_to_f16(-1.0e10),    0xFC00); // -Inf
+        // Inf maps to Inf.
+        assert_eq!(f32_to_f16(f32::INFINITY),     0x7C00);
+        assert_eq!(f32_to_f16(f32::NEG_INFINITY), 0xFC00);
+        // NaN maps to a NaN (any non-zero mantissa).
+        let nan_bits = f32_to_f16(f32::NAN);
+        assert_eq!(nan_bits & 0x7C00, 0x7C00, "exp bits = all-1");
+        assert!(nan_bits & 0x03FF != 0, "mantissa != 0");
     }
 
     #[test]
