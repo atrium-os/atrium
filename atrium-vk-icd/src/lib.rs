@@ -87,6 +87,14 @@ const VK_NOT_READY: VkResult = 1;
 /// combination isn't representable on this implementation.
 /// Arc 95.
 const VK_ERROR_FORMAT_NOT_SUPPORTED: VkResult = -11;
+/// VkBool32 `VK_TRUE` / `VK_FALSE` named constants (Arc 96).
+/// `VkBool32` is a typedef of `u32`; values 1 / 0.
+const VK_TRUE:  u32 = 1;
+#[allow(dead_code)]
+const VK_FALSE: u32 = 0;
+/// `VK_PRESENT_MODE_FIFO_KHR` — the universally-supported
+/// "wait for vsync" present mode.  Arc 96.
+const VK_PRESENT_MODE_FIFO_KHR: u32 = 2;
 
 /// VK_ICD_LOADER_MAGIC — the value the Khronos loader expects at
 /// offset 0 of every dispatchable handle (VkInstance,
@@ -6519,7 +6527,7 @@ pub unsafe extern "C" fn vkGetDescriptorSetLayoutSupport(
     if p_support.is_null() { return; }
     let out = p_support as *mut u8;
     let out_p_next = std::ptr::read_unaligned(out.add(8) as *const *mut c_void);
-    std::ptr::write_unaligned(out.add(16) as *mut u32, 1 /* VK_TRUE */);
+    std::ptr::write_unaligned(out.add(16) as *mut u32, VK_TRUE);
     let _ = walk_p_next_chain(out_p_next);
 }
 
@@ -7520,7 +7528,7 @@ pub unsafe extern "C" fn vkGetPhysicalDeviceSurfaceSupportKHR(
     p_supported:          *mut u32,
 ) -> VkResult {
     if p_supported.is_null() { return VK_ERROR_INITIALIZATION_FAILED; }
-    *p_supported = 1; /* VK_TRUE */
+    *p_supported = VK_TRUE;
     VK_SUCCESS
 }
 
@@ -7751,7 +7759,7 @@ pub unsafe extern "C" fn vkGetPhysicalDeviceSurfacePresentModesKHR(
         return VK_SUCCESS;
     }
     if *p_present_mode_count == 0 { return VK_SUCCESS; }
-    *p_present_modes = 2; /* VK_PRESENT_MODE_FIFO_KHR */
+    *p_present_modes = VK_PRESENT_MODE_FIFO_KHR;
     *p_present_mode_count = 1;
     VK_SUCCESS
 }
