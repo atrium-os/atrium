@@ -1331,7 +1331,14 @@ specifically supports:
   *between* real instructions inside function blocks when
   glslang is invoked with `-g`; previously these would die
   in the catchall.
-  `textureSize(sampler2D, lod)` (Arc 34): a new IR op
+  Block terminators (Arc 60): `OpUnreachable`, `OpKill`,
+  `OpTerminateInvocation` all lower as `Op::Return`.
+  Unreachable was a real catchall failure for any shader with
+  an unreachable default case; Kill / TerminateInvocation
+  are fragment-discard ops we don't have a true pipeline
+  path for in v1, so a quiet Return is the pragmatic mapping
+  (the caller's output buffer contains whatever the shader
+  wrote prior to the discard).
   `Op::SampledImageQuerySizeLod { image, lod }` is emitted
   by the frontend for `OpImageQuerySizeLod`.  Both backends
   read TexDesc.width @ #8 / height @ #12 directly off the

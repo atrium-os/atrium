@@ -416,7 +416,22 @@ fn translate_inst(
             Ok(())
         }
 
-        SpvOp::Return => {
+        // Arc 60: OpUnreachable / OpKill / OpTerminateInvocation
+        // all act as block terminators that don't yield a
+        // value.  Lower as Op::Return (no value) so the block
+        // has a valid terminator and the caller sees a clean
+        // exit.
+        //   OpUnreachable -- compiler asserts this block is
+        //   not reached at run time; treat as Return.
+        //   OpKill / OpTerminateInvocation -- fragment shader
+        //   discards.  v1 Tier-2 doesn't have a separate
+        //   discard pipeline path; mapping to Return drops the
+        //   shader's pending writes (caller-visible buffer
+        //   contains whatever was written prior).
+        SpvOp::Return
+        | SpvOp::Unreachable
+        | SpvOp::Kill
+        | SpvOp::TerminateInvocation => {
             insts.push(Inst {
                 op: Op::Return,
                 result: None,
