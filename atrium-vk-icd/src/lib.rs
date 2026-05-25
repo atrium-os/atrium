@@ -673,6 +673,11 @@ struct AtriumImage {
     array_layers: u32,
     format:       u32, /* VkFormat */
     usage:        u32, /* VkImageUsageFlags */
+    /// `VK_IMAGE_TYPE_1D`, `_2D`, or `_3D` numeric value
+    /// (0, 1, or 2).  Captured at `vkCreateImage` so the
+    /// memory-requirements math can use the right per-level
+    /// shift (1 / 4 / 8 of the base for 1D / 2D / 3D).
+    image_type:   u32, /* VkImageType */
     memory:        Option<u64>,
     memory_offset: u64,
     /// Daemon-side ResourceId, populated by vkBindImageMemory.
@@ -3686,6 +3691,7 @@ pub unsafe extern "C" fn vkCreateImage(
     }
     let dev = &*(device as *const AtriumDevice);
     let b = p_create_info as *const u8;
+    let image_type   = std::ptr::read_unaligned(b.add(20) as *const u32);
     let format       = std::ptr::read_unaligned(b.add(24) as *const u32);
     let width        = std::ptr::read_unaligned(b.add(28) as *const u32);
     let height       = std::ptr::read_unaligned(b.add(32) as *const u32);
@@ -3702,7 +3708,8 @@ pub unsafe extern "C" fn vkCreateImage(
     if let Ok(mut i) = dev.images.lock() {
         i.insert(handle, AtriumImage {
             width, height, depth, mip_levels, array_layers,
-            format, usage, memory: None, memory_offset: 0,
+            format, usage, image_type,
+            memory: None, memory_offset: 0,
             image_id: None,
         });
     } else {
@@ -3744,13 +3751,23 @@ pub unsafe extern "C" fn vkGetImageMemoryRequirements(
         .and_then(|m| m.get(&image).copied())
         .map(|img| {
             let bpp = bpp_for_vk_format(img.format) as u64;
-            // Conservative mip + layer total — sum of per-level
-            // (w * h * depth * bpp) halved at each level, times
-            // array_layers. Real ICDs respect tiling-specific
-            // padding; for the skeleton we report a generous
-            // upper bound.
+            // Mip-level math: each level halves every spatial
+            // dimension.  For 1D the per-level size shrinks by
+            // 2 (>> 1); for 2D by 4 (>> 2); for 3D by 8 (>> 3).
+            // The pre-Arc 86 code unconditionally used `>> 2*l`,
+            // which under-allocates for 1D images (real size
+            // halves at each level but the formula thought
+            // it quartered).
+            //
+            // image_type literals:
+            //   VK_IMAGE_TYPE_1D = 0
+            //   VK_IMAGE_TYPE_2D = 1
+            //   VK_IMAGE_TYPE_3D = 2
+            // Per-level shift = (image_type + 1) (= 1 / 2 / 3).
+            let shift_per_level = (img.image_type + 1) as u32;
             let base = (img.width as u64) * (img.height as u64) * (img.depth as u64) * bpp;
-            let mips = (0..img.mip_levels as u32).map(|l| base >> (2 * l)).sum::<u64>();
+            let mips = (0..img.mip_levels as u32)
+                .map(|l| base >> (shift_per_level * l)).sum::<u64>();
             mips * (img.array_layers as u64)
         }).unwrap_or(0);
     *p_requirements = ash::vk::MemoryRequirements {
