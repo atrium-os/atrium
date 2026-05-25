@@ -1400,6 +1400,19 @@ specifically supports:
   compiler's vectoriser keep working.  Two new unit tests
   cover the curve at boundary (linear-piece) and mid-range
   values, plus the alpha-stays-linear guarantee.
+  Single / two-channel half-float (Arc 69):
+    `TexFormat::R16Float = 9` — 1×f16 (2 bytes/texel).
+       Decoded into R lane; G=B=0, A=1.  Common for depth-
+       buffer reads in tone mapping, low-precision masks,
+       per-pixel scalar HDR data.
+    `TexFormat::Rg16Float = 10` — 2×f16 (4 bytes/texel).
+       Decoded into R,G; B=0, A=1.  Common for motion
+       vectors, screen-space UV offsets, 2-channel HDR
+       data.
+  Both reuse the inline `f16_to_f32` converter from Arc 67.
+  Sampler-side `TexFormat` enum now covers 11 variants
+  (Rgba/Bgra/R 8-Unorm, R/Rgba 32-Float, Rg 8-Unorm, Rgba 16-
+  Float, Rgba/Bgra 8-Srgb, R/Rg 16-Float).
   `Op::SampledImageQuerySizeLod { image, lod }` is emitted
   by the frontend for `OpImageQuerySizeLod`.  Both backends
   read TexDesc.width @ #8 / height @ #12 directly off the

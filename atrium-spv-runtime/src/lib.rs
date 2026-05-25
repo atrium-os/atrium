@@ -76,6 +76,17 @@ pub enum TexFormat {
     /// curve as `Rgba8Srgb`; matches Vulkan's
     /// `VK_FORMAT_B8G8R8A8_SRGB`.  Added in Arc 68.
     Bgra8Srgb   = 8,
+    /// 1×f16 IEEE 754 (2 bytes/texel).  Decoded to f32 in
+    /// the R lane; G=B=0, A=1.  Common for depth-buffer
+    /// reads in tone-mapping passes, low-precision masks,
+    /// and per-pixel scalar data textures where storage is
+    /// at a premium.  Added in Arc 69.
+    R16Float    = 9,
+    /// 2×f16 IEEE 754 (4 bytes/texel).  Decoded to f32 for
+    /// R,G; B=0, A=1.  Common for motion vectors, screen-
+    /// space UV offsets, and 2-channel HDR data.  Added in
+    /// Arc 69.
+    Rg16Float   = 10,
 }
 
 /// Storage-image texel formats the read/write helpers
@@ -1223,6 +1234,18 @@ fn fetch_texel_impl(t: &TexDesc, x: u32, y: u32) -> [f32; 4] {
                     u8_to_unorm(*px_ptr.add(3)),    // A linear
                 ]
             }
+            TexFormat::R16Float => {
+                let px_ptr = row_ptr.add(xc as usize * 2) as *const u16;
+                [f16_to_f32(*px_ptr), 0.0, 0.0, 1.0]
+            }
+            TexFormat::Rg16Float => {
+                let px_ptr = row_ptr.add(xc as usize * 4) as *const u16;
+                [
+                    f16_to_f32(*px_ptr.add(0)),
+                    f16_to_f32(*px_ptr.add(1)),
+                    0.0, 1.0,
+                ]
+            }
         }
     }
 }
@@ -1302,6 +1325,8 @@ fn format_from_u32(v: u32) -> TexFormat {
         6 => TexFormat::Rgba16Float,
         7 => TexFormat::Rgba8Srgb,
         8 => TexFormat::Bgra8Srgb,
+        9 => TexFormat::R16Float,
+        10 => TexFormat::Rg16Float,
         // Defensive — a malformed descriptor falls back
         // to a recognisable garbage value rather than UB.
         _ => TexFormat::Rgba8Unorm,
@@ -1814,6 +1839,49 @@ mod tests {
         assert!((p[2] - (10.0/255.0)/12.92).abs() < 1e-6,
             "B linear-part: got {} want {}", p[2], (10.0/255.0)/12.92);
         assert!((p[3] - 1.0).abs() < 1e-6);
+    }
+
+    /// Arc 69: R16Float / Rg16Float -- single & two-channel
+    /// half-float samplers reuse the same f16_to_f32 path.
+    #[test]
+    fn r16float_loads_into_red() {
+        // f16 = 0xBE00 -> sign=1, exp=15, mant=0x200
+        // = -(1 + 0x200/1024) * 2^0 = -1.5.
+        let pixels: Vec<u16> = vec![0x3C00, 0xBE00];  // 1.0, -1.5
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                pixels.as_ptr() as *const u8, pixels.len() * 2)
+        };
+        let desc = TexDesc {
+            data: bytes.as_ptr(),
+            width: 2, height: 1, stride_bytes: 4,
+            format: TexFormat::R16Float as u32,
+            depth: 1, slice_bytes: 0,
+            mip_count: 0, mip_descs: std::ptr::null(),
+        };
+        let p0 = fetch_texel_impl(&desc, 0, 0);
+        assert_eq!(p0, [1.0, 0.0, 0.0, 1.0]);
+        let p1 = fetch_texel_impl(&desc, 1, 0);
+        assert_eq!(p1, [-1.5, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn rg16float_two_channel_decode() {
+        // (R=2.0, G=-0.5).  f16 2.0 = 0x4000; -0.5 = 0xB800.
+        let pixels: Vec<u16> = vec![0x4000, 0xB800];
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                pixels.as_ptr() as *const u8, pixels.len() * 2)
+        };
+        let desc = TexDesc {
+            data: bytes.as_ptr(),
+            width: 1, height: 1, stride_bytes: 4,
+            format: TexFormat::Rg16Float as u32,
+            depth: 1, slice_bytes: 0,
+            mip_count: 0, mip_descs: std::ptr::null(),
+        };
+        let p = fetch_texel_impl(&desc, 0, 0);
+        assert_eq!(p, [2.0, -0.5, 0.0, 1.0]);
     }
 
     /// Arc 67: f16->f32 directly, covering Inf and zero.
