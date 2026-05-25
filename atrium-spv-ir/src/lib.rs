@@ -735,7 +735,9 @@ pub enum Op {
     /// the base TexDesc's width/height); real multi-mip
     /// query would indirect through `mip_descs[lod]`.
     SampledImageQuerySizeLod {
+        /// SampledImage (or Image) value to query.
         image: Value,
+        /// Mip level (i32).  Captured but ignored in v1.
         lod:   Value,
     },
     /// Gather a 2×2 footprint of one channel
@@ -760,8 +762,11 @@ pub enum Op {
     /// `atrium_img_read_3d_lod` helpers (selected by coord
     /// lane count) on both backends.
     ImageReadLod {
+        /// Storage-image handle (`Op::ImageHandle`).
         image: Value,
+        /// Integer-coord vector (ivec2 for 2D, ivec3 for 3D).
         coord: Value,
+        /// i32 mip level (0 = base).
         lod:   Value,
     },
     /// Write a texel to a specific mip level of a storage
@@ -769,9 +774,13 @@ pub enum Op {
     /// Same shape as [`Self::ImageWrite`] plus a `lod`
     /// scalar; lowers to the `_lod` helpers.
     ImageWriteLod {
+        /// Storage-image handle (`Op::ImageHandle`).
         image: Value,
+        /// Integer-coord vector (ivec2 for 2D, ivec3 for 3D).
         coord: Value,
+        /// vec4 texel value to write.
         texel: Value,
+        /// i32 mip level (0 = base).
         lod:   Value,
     },
     /// Compute a pointer to a single texel of a storage
