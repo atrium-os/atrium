@@ -9340,6 +9340,61 @@ mod tests {
         assert_eq!(offset_of!(vk::SwapchainCreateInfoKHR, image_usage),     56);
     }
 
+    /// Arc 98: preemptive offset pins for the other VkCreateInfo
+    /// structs the ICD reads by raw byte offset.  All were
+    /// verified correct by hand during the Arc 97 audit; these
+    /// tests lock the assumption in so any future ash/Vulkan
+    /// layout drift gets caught immediately.
+    #[test]
+    fn vk_other_create_info_layouts_match_ash() {
+        use std::mem::offset_of;
+        use ash::vk;
+
+        // VkImageCreateInfo (vkCreateImage @ atrium-vk-icd line 3754)
+        assert_eq!(offset_of!(vk::ImageCreateInfo, image_type),     20);
+        assert_eq!(offset_of!(vk::ImageCreateInfo, format),         24);
+        assert_eq!(offset_of!(vk::ImageCreateInfo, extent),         28);
+        assert_eq!(offset_of!(vk::ImageCreateInfo, mip_levels),     40);
+        assert_eq!(offset_of!(vk::ImageCreateInfo, array_layers),   44);
+        assert_eq!(offset_of!(vk::ImageCreateInfo, usage),          56);
+
+        // VkBufferCreateInfo (vkCreateBuffer)
+        assert_eq!(offset_of!(vk::BufferCreateInfo, size),          24);
+        assert_eq!(offset_of!(vk::BufferCreateInfo, usage),         32);
+
+        // VkShaderModuleCreateInfo (vkCreateShaderModule)
+        assert_eq!(offset_of!(vk::ShaderModuleCreateInfo, code_size),  24);
+        assert_eq!(offset_of!(vk::ShaderModuleCreateInfo, p_code),     32);
+
+        // VkFramebufferCreateInfo (vkCreateFramebuffer)
+        assert_eq!(offset_of!(vk::FramebufferCreateInfo, attachment_count), 32);
+        assert_eq!(offset_of!(vk::FramebufferCreateInfo, p_attachments),    40);
+        assert_eq!(offset_of!(vk::FramebufferCreateInfo, width),            48);
+        assert_eq!(offset_of!(vk::FramebufferCreateInfo, height),           52);
+
+        // VkRenderPassBeginInfo (vkCmdBeginRenderPass)
+        assert_eq!(offset_of!(vk::RenderPassBeginInfo, framebuffer),       24);
+        assert_eq!(offset_of!(vk::RenderPassBeginInfo, clear_value_count), 48);
+        assert_eq!(offset_of!(vk::RenderPassBeginInfo, p_clear_values),    56);
+
+        // VkSamplerCreateInfo (vkCreateSampler)
+        assert_eq!(offset_of!(vk::SamplerCreateInfo, mag_filter),       20);
+        assert_eq!(offset_of!(vk::SamplerCreateInfo, min_filter),       24);
+        assert_eq!(offset_of!(vk::SamplerCreateInfo, mipmap_mode),      28);
+        assert_eq!(offset_of!(vk::SamplerCreateInfo, address_mode_u),   32);
+        assert_eq!(offset_of!(vk::SamplerCreateInfo, max_anisotropy),   52);
+        assert_eq!(offset_of!(vk::SamplerCreateInfo, min_lod),          64);
+        assert_eq!(offset_of!(vk::SamplerCreateInfo, max_lod),          68);
+
+        // VkDescriptorSetAllocateInfo (vkAllocateDescriptorSets)
+        assert_eq!(offset_of!(vk::DescriptorSetAllocateInfo,
+            descriptor_set_count), 24);
+
+        // VkDeviceQueueInfo2 (vkGetDeviceQueue2)
+        assert_eq!(offset_of!(vk::DeviceQueueInfo2, queue_family_index), 20);
+        assert_eq!(offset_of!(vk::DeviceQueueInfo2, queue_index),        24);
+    }
+
     /// Arc 73: pin the bytes-per-pixel table against the
     /// previous numeric-literal errors.
     #[test]
