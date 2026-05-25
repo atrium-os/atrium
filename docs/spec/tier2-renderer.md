@@ -1387,6 +1387,19 @@ specifically supports:
        behaviour).  Used for HDR colour render targets.
   Three new unit tests cover both formats end-to-end + the
   f16→f32 converter's special-case branches.
+  sRGB texture formats (Arc 68):
+    `TexFormat::Rgba8Srgb = 7` — 4×u8 sRGB.  Identical wire
+       layout to `Rgba8Unorm` but R/G/B go through the
+       sRGB→linear de-gamma curve on read; A stays linear.
+    `TexFormat::Bgra8Srgb = 8` — same but BGRA channel
+       order, matching Vulkan `VK_FORMAT_B8G8R8A8_SRGB`.
+  De-gamma uses the standard sRGB transfer function:
+    `c_lin = c / 12.92`              if `c ≤ 0.04045`
+    `      = ((c + 0.055) / 1.055)^2.4`   otherwise
+  Inline (no LUT) — branch-light and lets the shader
+  compiler's vectoriser keep working.  Two new unit tests
+  cover the curve at boundary (linear-piece) and mid-range
+  values, plus the alpha-stays-linear guarantee.
   `Op::SampledImageQuerySizeLod { image, lod }` is emitted
   by the frontend for `OpImageQuerySizeLod`.  Both backends
   read TexDesc.width @ #8 / height @ #12 directly off the

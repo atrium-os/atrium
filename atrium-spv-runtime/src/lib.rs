@@ -65,6 +65,17 @@ pub enum TexFormat {
     /// vectors, intermediate floating-point buffers.
     /// Added in Arc 67.
     Rgba16Float = 6,
+    /// 4×u8 sRGB (4 bytes/texel).  Identical wire layout to
+    /// `Rgba8Unorm` but the R, G, B channels go through the
+    /// sRGB→linear de-gamma curve on read; A stays linear.
+    /// Real shaders sample sRGB textures expecting linear
+    /// values; this format gives the right answer for the
+    /// common albedo/diffuse texture case.  Added in Arc 68.
+    Rgba8Srgb   = 7,
+    /// 4×u8 sRGB with BGRA channel order.  Same de-gamma
+    /// curve as `Rgba8Srgb`; matches Vulkan's
+    /// `VK_FORMAT_B8G8R8A8_SRGB`.  Added in Arc 68.
+    Bgra8Srgb   = 8,
 }
 
 /// Storage-image texel formats the read/write helpers
@@ -1194,7 +1205,43 @@ fn fetch_texel_impl(t: &TexDesc, x: u32, y: u32) -> [f32; 4] {
                     f16_to_f32(*px_ptr.add(3)),
                 ]
             }
+            TexFormat::Rgba8Srgb => {
+                let px_ptr = row_ptr.add(xc as usize * 4);
+                [
+                    srgb_to_linear(*px_ptr.add(0)),
+                    srgb_to_linear(*px_ptr.add(1)),
+                    srgb_to_linear(*px_ptr.add(2)),
+                    u8_to_unorm(*px_ptr.add(3)),  // A stays linear.
+                ]
+            }
+            TexFormat::Bgra8Srgb => {
+                let px_ptr = row_ptr.add(xc as usize * 4);
+                [
+                    srgb_to_linear(*px_ptr.add(2)), // R from byte 2
+                    srgb_to_linear(*px_ptr.add(1)), // G
+                    srgb_to_linear(*px_ptr.add(0)), // B from byte 0
+                    u8_to_unorm(*px_ptr.add(3)),    // A linear
+                ]
+            }
         }
+    }
+}
+
+/// Convert a sRGB-encoded u8 (perceptual gamma 2.4) to a
+/// linear f32 in [0, 1].  Standard sRGB transfer function:
+///   c_lin = c / 12.92                       if c <= 0.04045
+///         = ((c + 0.055) / 1.055) ^ 2.4    otherwise
+/// where `c` is the unorm value (byte / 255).  No table —
+/// the 256-entry LUT would be a perf win in tight loops but
+/// the inline form keeps the code path branch-light and the
+/// shader compiler's vectoriser still has room to work.
+#[inline]
+fn srgb_to_linear(b: u8) -> f32 {
+    let c = b as f32 / 255.0;
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
     }
 }
 
@@ -1253,6 +1300,8 @@ fn format_from_u32(v: u32) -> TexFormat {
         4 => TexFormat::Rgba32Float,
         5 => TexFormat::Rg8Unorm,
         6 => TexFormat::Rgba16Float,
+        7 => TexFormat::Rgba8Srgb,
+        8 => TexFormat::Bgra8Srgb,
         // Defensive — a malformed descriptor falls back
         // to a recognisable garbage value rather than UB.
         _ => TexFormat::Rgba8Unorm,
@@ -1710,6 +1759,61 @@ mod tests {
         assert_eq!(p[1],  1.0);
         assert_eq!(p[2], -1.0);
         assert_eq!(p[3],  2.0);
+    }
+
+    /// Arc 68: sRGB sampling applies the de-gamma curve to
+    /// R/G/B and keeps A linear.
+    #[test]
+    fn rgba8srgb_degammas_rgb_not_alpha() {
+        // 1×1 texel with R=G=B=128 (mid-grey in sRGB), A=200.
+        let pixels: Vec<u8> = vec![128, 128, 128, 200];
+        let desc = TexDesc {
+            data: pixels.as_ptr(),
+            width: 1, height: 1, stride_bytes: 4,
+            format: TexFormat::Rgba8Srgb as u32,
+            depth: 1, slice_bytes: 0,
+            mip_count: 0, mip_descs: std::ptr::null(),
+        };
+        let p = fetch_texel_impl(&desc, 0, 0);
+        // sRGB 128/255 ≈ 0.5019 -> linear ≈ 0.21586.  Spec
+        // tolerance is 1e-4 (the curve isn't a closed-form
+        // exact match, but ±1e-4 catches the difference
+        // between linear and de-gammaed).
+        assert!((p[0] - 0.21586).abs() < 1e-4,
+            "R sRGB->linear: got {} want ~0.21586", p[0]);
+        assert!((p[1] - 0.21586).abs() < 1e-4);
+        assert!((p[2] - 0.21586).abs() < 1e-4);
+        // Alpha is *not* de-gammaed: 200/255 ≈ 0.7843.
+        assert!((p[3] - 200.0 / 255.0).abs() < 1e-6,
+            "A should stay linear: got {}", p[3]);
+    }
+
+    /// Arc 68: Bgra8Srgb swizzles the same way Bgra8Unorm does
+    /// but applies the sRGB curve to the colour channels.
+    #[test]
+    fn bgra8srgb_swizzle_and_degamma() {
+        // BGRA = (10, 128, 200, 255).  R should come from byte
+        // 2 (200, de-gammaed); B from byte 0 (10, de-gammaed
+        // -- 10/255 ≈ 0.0392 < 0.04045 boundary, so uses the
+        // linear part of the curve).
+        let pixels: Vec<u8> = vec![10, 128, 200, 255];
+        let desc = TexDesc {
+            data: pixels.as_ptr(),
+            width: 1, height: 1, stride_bytes: 4,
+            format: TexFormat::Bgra8Srgb as u32,
+            depth: 1, slice_bytes: 0,
+            mip_count: 0, mip_descs: std::ptr::null(),
+        };
+        let p = fetch_texel_impl(&desc, 0, 0);
+        // R = de-gamma(200): ((200/255+0.055)/1.055)^2.4 ≈ 0.5775.
+        assert!((p[0] - 0.5775).abs() < 1e-3,
+            "R de-gamma(200/255): got {} want ~0.5775", p[0]);
+        // G = de-gamma(128) ≈ 0.21586 (same as previous test).
+        assert!((p[1] - 0.21586).abs() < 1e-4);
+        // B = de-gamma(10/255) -- linear part: 0.0392 / 12.92.
+        assert!((p[2] - (10.0/255.0)/12.92).abs() < 1e-6,
+            "B linear-part: got {} want {}", p[2], (10.0/255.0)/12.92);
+        assert!((p[3] - 1.0).abs() < 1e-6);
     }
 
     /// Arc 67: f16->f32 directly, covering Inf and zero.
