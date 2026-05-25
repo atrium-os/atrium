@@ -262,6 +262,85 @@ fn texture_sample_rgba32f_exact_roundtrip() {
     assert_eq!(p[3],  1e-6);
 }
 
+/// Arc 76: end-to-end Rgba16Float sampling.  Builds a 1×1
+/// HDR texture with values that are exactly f16-representable
+/// (so the round-trip is lossless), samples through compiled
+/// SPIR-V, asserts byte-identical output across all three
+/// runners.  Exercises the `f16_to_f32` decoder via the real
+/// runtime helper.
+#[test]
+fn texture_sample_rgba16f_exact_roundtrip() {
+    // f16 bit patterns:
+    //   0x3C00 =  1.0
+    //   0xBC00 = -1.0
+    //   0x4000 =  2.0
+    //   0xB800 = -0.5
+    let pixels: Vec<u16> = vec![0x3C00, 0xBC00, 0x4000, 0xB800];
+    let bytes: Vec<u8> = pixels.iter()
+        .flat_map(|h| h.to_le_bytes())
+        .collect();
+    let tex_desc = TexDesc {
+        data: bytes.as_ptr(),
+        width: 1, height: 1, stride_bytes: 8,
+        format: TexFormat::Rgba16Float as u32,
+        depth: 1, slice_bytes: 0,
+        mip_count: 0, mip_descs: std::ptr::null(),
+    };
+    let samp_desc = SamplerDesc {
+        mag_filter: FilterMode::Linear as u32,
+        min_filter: FilterMode::Linear as u32,
+        wrap_s: WrapMode::ClampToEdge as u32,
+        wrap_t: WrapMode::ClampToEdge as u32,
+    };
+    let mut uniforms = descriptor_table_buffer(1);
+    unsafe {
+        write_helper_pointers(&mut uniforms,
+            atrium_spv_runtime::atrium_tex_sample_2d,
+            atrium_spv_runtime::atrium_tex_fetch_2d,
+            atrium_spv_runtime::atrium_tex_sample_2d_lod,
+            atrium_spv_runtime::atrium_tex_sample_2d_array,
+            atrium_spv_runtime::atrium_tex_sample_cube,
+            atrium_spv_runtime::atrium_tex_gather_2d,
+            atrium_spv_runtime::atrium_tex_sample_2d_array_lod,
+            atrium_spv_runtime::atrium_tex_sample_cube_lod);
+        write_descriptor_slot(&mut uniforms, 0,
+            &tex_desc as *const _, &samp_desc as *const _);
+    }
+    let texture = TextureBinding {
+        set: 0, binding: 0,
+        data: bytes.clone(),
+        width: 1, height: 1, stride_bytes: 8,
+        format: TexFormat::Rgba16Float as u32,
+        sampler: samp_desc,
+    };
+    let inputs = ShaderInputs {
+        textures: vec![texture],
+        uniforms,
+        ..ShaderInputs::default()
+    };
+
+    let spirv = build_sample_centre_shader();
+    let runners: [Box<dyn ShaderRunner>; 3] = [
+        Box::new(InterpreterRunner),
+        Box::new(CraneliftRunner::default()),
+        Box::new(BespokeRunner::default()),
+    ];
+    let refs: Vec<&dyn ShaderRunner> =
+        runners.iter().map(|b| b.as_ref()).collect();
+    let tol = atrium_spv_tests::pixels::ColorTolerance::AbsEpsilon { eps: 1e-6 };
+    assert_shader_agrees(&spirv, &inputs, tol, &refs);
+
+    // Pin via bespoke (the f16 decoder ran via real
+    // function call); values are exactly f16-representable
+    // so no rounding error.
+    let out = BespokeRunner::default().run(&spirv, &inputs).unwrap();
+    let p = &out.pixels[0];
+    assert_eq!(p[0],  1.0);
+    assert_eq!(p[1], -1.0);
+    assert_eq!(p[2],  2.0);
+    assert_eq!(p[3], -0.5);
+}
+
 /// Same texture, but the shader also computes a tint
 /// vec4 *before* the sample and multiplies the sampled
 /// pixel by it. The tint's V-regs are loop-carried across
