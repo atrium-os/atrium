@@ -9426,6 +9426,10 @@ mod tests {
 
         // VkImageViewCreateInfo (vkCreateImageView) -- Arc 101.
         assert_eq!(offset_of!(vk::ImageViewCreateInfo, image),  24);
+
+        // VkMemoryAllocateInfo (vkAllocateMemory) -- Arc 102.
+        assert_eq!(offset_of!(vk::MemoryAllocateInfo, allocation_size),   16);
+        assert_eq!(offset_of!(vk::MemoryAllocateInfo, memory_type_index), 24);
     }
 
     /// Arc 73: pin the bytes-per-pixel table against the
