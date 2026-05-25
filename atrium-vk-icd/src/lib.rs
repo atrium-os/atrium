@@ -82,6 +82,11 @@ const VK_ERROR_INCOMPATIBLE_DRIVER: VkResult = -9;
 /// for a fence treat this as a non-error "try again
 /// later".  Arc 94.
 const VK_NOT_READY: VkResult = 1;
+/// `VK_ERROR_FORMAT_NOT_SUPPORTED` — returned by image-format
+/// validation paths when the (format, type, tiling, usage)
+/// combination isn't representable on this implementation.
+/// Arc 95.
+const VK_ERROR_FORMAT_NOT_SUPPORTED: VkResult = -11;
 
 /// VK_ICD_LOADER_MAGIC — the value the Khronos loader expects at
 /// offset 0 of every dispatchable handle (VkInstance,
@@ -2449,10 +2454,10 @@ pub unsafe extern "C" fn vkGetPhysicalDeviceImageFormatProperties(
     }
     // Only 2D supported in tier-1.
     if image_type != ash::vk::ImageType::TYPE_2D {
-        return -11 /* VK_ERROR_FORMAT_NOT_SUPPORTED */;
+        return VK_ERROR_FORMAT_NOT_SUPPORTED;
     }
     if !flags.is_empty() {
-        return -11;
+        return VK_ERROR_FORMAT_NOT_SUPPORTED;
     }
     // Format whitelist.  Arc 90: rewritten against
     // `ash::vk::Format` constants (was a numeric-literal
@@ -2465,7 +2470,7 @@ pub unsafe extern "C" fn vkGetPhysicalDeviceImageFormatProperties(
         | Fmt::D16_UNORM | Fmt::D32_SFLOAT
         | Fmt::D24_UNORM_S8_UINT | Fmt::D32_SFLOAT_S8_UINT);
     if !supported {
-        return -11;
+        return VK_ERROR_FORMAT_NOT_SUPPORTED;
     }
 
     let mut props = ash::vk::ImageFormatProperties::default();
@@ -7998,7 +8003,7 @@ pub unsafe extern "C" fn vkQueuePresentKHR(
         };
         let Some(image_id) = image_id else {
             if !p_results.is_null() {
-                *p_results.offset(i as isize) = -3 /* VK_ERROR_INITIALIZATION_FAILED */;
+                *p_results.offset(i as isize) = VK_ERROR_INITIALIZATION_FAILED;
             }
             continue;
         };
