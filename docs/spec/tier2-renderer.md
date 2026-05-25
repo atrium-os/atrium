@@ -1445,6 +1445,18 @@ specifically supports:
     25.5, 1e-6).  Exact bit-for-bit round-trip across all
     three runners — proves the new wire format value reaches
     end-to-end through compiled SPIR-V.
+  ICD `bpp_for_vk_format` fix (Arc 73): the existing
+  bytes-per-pixel table in `atrium-vk-icd` was a hand-typed
+  numeric-literal map with several errors — `100 => 8` but
+  `VK_FORMAT_R32_SFLOAT` is 4 bytes; `106 | 109..=124 => 16`
+  swept in formats as varied as `R16_SFLOAT` (2 bytes) and
+  `D32_SFLOAT_S8_UINT` (5 bytes).  Rewritten against
+  `ash::vk::Format` constants so the dispatch goes through
+  symbolic names; covers 1-, 2-, 3-, 4-, 6-, 8-, 12-, and
+  16-byte rows.  Pinned by a new unit test
+  `bpp_for_vk_format_matches_spec` that walks 18 formats
+  spanning the depth-stencil + sRGB + HDR families.  ICD
+  test count 36 → 37.
   `Op::SampledImageQuerySizeLod { image, lod }` is emitted
   by the frontend for `OpImageQuerySizeLod`.  Both backends
   read TexDesc.width @ #8 / height @ #12 directly off the

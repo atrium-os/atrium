@@ -679,26 +679,73 @@ struct AtriumImage {
     image_id: Option<aqueduct_gpu::ids::ResourceId>,
 }
 
-/// Bytes-per-pixel for the small subset of VkFormat values we need
-/// to size memory requirements. Real ICDs ship a full format-rules
-/// table (e.g. atrium-vk-icd will eventually reuse the
-/// aqueduct-gpu format-rules table). 0 = unknown — caller gets a
-/// best-effort (width × height × 4) sizing.
+/// Bytes-per-pixel for VkFormat values we need to size memory
+/// requirements.  0 = unknown — caller gets a best-effort
+/// (width × height × 4) sizing.
+///
+/// Arc 73: rewritten against `ash::vk::Format` constants after
+/// the previous numeric-literal table was found to have several
+/// errors (e.g. `100 => 8`, but `VK_FORMAT_R32_SFLOAT` is 4
+/// bytes; `106 | 109..=124 => 16` swept in formats as varied as
+/// `R16_SFLOAT` (2 bytes) and `D32_SFLOAT_S8_UINT` (5 bytes)).
 fn bpp_for_vk_format(format: u32) -> u32 {
-    // Vk numeric values, see VkFormat enum.
-    match format {
-        // 8-bit single-channel.
-        9 => 1,    // R8_UNORM
-        // 16-bit single-channel + 8-bit two-channel.
-        16 | 70 => 2,
-        // 24-bit (typically padded to 32 on most HW).
-        23 | 30 | 37 => 4,  // R8G8B8_UNORM / B8G8R8_UNORM / R8G8B8A8_UNORM
-        43 => 4,            // B8G8R8A8_UNORM
-        50 => 4,            // R8G8B8A8_SRGB
-        // 64-bit.
-        97 | 98 | 100 | 109 => 8,
-        // 128-bit.
-        106 | 109..=124 => 16,
+    use ash::vk::Format as F;
+    // Convert the raw u32 once; unknown values stay as the
+    // catchall.  ash's `Format::from_raw` is infallible.
+    let f = F::from_raw(format as i32);
+    match f {
+        // 1 byte per pixel.
+        F::R8_UNORM | F::R8_SNORM | F::R8_USCALED | F::R8_SSCALED
+        | F::R8_UINT | F::R8_SINT | F::R8_SRGB => 1,
+
+        // 2 bytes per pixel.
+        F::R8G8_UNORM | F::R8G8_SNORM | F::R8G8_USCALED | F::R8G8_SSCALED
+        | F::R8G8_UINT | F::R8G8_SINT | F::R8G8_SRGB
+        | F::R16_UNORM | F::R16_SNORM | F::R16_USCALED | F::R16_SSCALED
+        | F::R16_UINT | F::R16_SINT | F::R16_SFLOAT
+        | F::D16_UNORM => 2,
+
+        // 3 bytes per pixel (rare; most HW pads to 4).
+        F::R8G8B8_UNORM | F::R8G8B8_SNORM | F::R8G8B8_USCALED
+        | F::R8G8B8_SSCALED | F::R8G8B8_UINT | F::R8G8B8_SINT
+        | F::R8G8B8_SRGB
+        | F::B8G8R8_UNORM | F::B8G8R8_SNORM | F::B8G8R8_USCALED
+        | F::B8G8R8_SSCALED | F::B8G8R8_UINT | F::B8G8R8_SINT
+        | F::B8G8R8_SRGB => 3,
+
+        // 4 bytes per pixel.
+        F::R8G8B8A8_UNORM | F::R8G8B8A8_SNORM | F::R8G8B8A8_USCALED
+        | F::R8G8B8A8_SSCALED | F::R8G8B8A8_UINT | F::R8G8B8A8_SINT
+        | F::R8G8B8A8_SRGB
+        | F::B8G8R8A8_UNORM | F::B8G8R8A8_SNORM | F::B8G8R8A8_USCALED
+        | F::B8G8R8A8_SSCALED | F::B8G8R8A8_UINT | F::B8G8R8A8_SINT
+        | F::B8G8R8A8_SRGB
+        | F::R16G16_UNORM | F::R16G16_SNORM | F::R16G16_USCALED
+        | F::R16G16_SSCALED | F::R16G16_UINT | F::R16G16_SINT
+        | F::R16G16_SFLOAT
+        | F::R32_UINT | F::R32_SINT | F::R32_SFLOAT
+        | F::D32_SFLOAT
+        | F::D24_UNORM_S8_UINT => 4,
+
+        // 6 bytes per pixel (R16G16B16_*; usually padded to 8).
+        F::R16G16B16_UNORM | F::R16G16B16_SNORM | F::R16G16B16_USCALED
+        | F::R16G16B16_SSCALED | F::R16G16B16_UINT | F::R16G16B16_SINT
+        | F::R16G16B16_SFLOAT => 6,
+
+        // 8 bytes per pixel.
+        F::R16G16B16A16_UNORM | F::R16G16B16A16_SNORM
+        | F::R16G16B16A16_USCALED | F::R16G16B16A16_SSCALED
+        | F::R16G16B16A16_UINT | F::R16G16B16A16_SINT
+        | F::R16G16B16A16_SFLOAT
+        | F::R32G32_UINT | F::R32G32_SINT | F::R32G32_SFLOAT => 8,
+
+        // 12 bytes per pixel (R32G32B32_*).
+        F::R32G32B32_UINT | F::R32G32B32_SINT | F::R32G32B32_SFLOAT => 12,
+
+        // 16 bytes per pixel.
+        F::R32G32B32A32_UINT | F::R32G32B32A32_SINT
+        | F::R32G32B32A32_SFLOAT => 16,
+
         _ => 4, // best effort
     }
 }
@@ -9153,6 +9200,40 @@ mod tests {
         let mut bytes = Vec::with_capacity(words.len() * 4);
         for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
         assert_eq!(scan_spirv_ssbo_binding_count(&bytes), 0);
+    }
+
+    /// Arc 73: pin the bytes-per-pixel table against the
+    /// previous numeric-literal errors.
+    #[test]
+    fn bpp_for_vk_format_matches_spec() {
+        use ash::vk::Format as F;
+        // (format, expected bpp).
+        let cases: &[(F, u32)] = &[
+            (F::R8_UNORM,             1),
+            (F::R8G8_UNORM,           2),
+            (F::R16_UNORM,            2),
+            (F::R16_SFLOAT,           2),  // would have been 4 pre-fix
+            (F::D16_UNORM,            2),
+            (F::R8G8B8A8_UNORM,       4),
+            (F::B8G8R8A8_UNORM,       4),
+            (F::R8G8B8A8_SRGB,        4),
+            (F::B8G8R8A8_SRGB,        4),
+            (F::R16G16_SFLOAT,        4),  // would have been 4 pre-fix
+            (F::R32_UINT,             4),  // was 8 pre-fix
+            (F::R32_SFLOAT,           4),  // was 8 pre-fix
+            (F::D32_SFLOAT,           4),
+            (F::R16G16B16A16_SFLOAT,  8),
+            (F::R32G32_SFLOAT,        8),
+            (F::R32G32B32_SFLOAT,    12),
+            (F::R32G32B32A32_SFLOAT, 16),  // was 8 pre-fix
+            (F::R32G32B32A32_UINT,   16),
+        ];
+        for &(fmt, want) in cases {
+            let got = super::bpp_for_vk_format(fmt.as_raw() as u32);
+            assert_eq!(got, want,
+                "bpp({:?}={}) want {want}, got {got}",
+                fmt, fmt.as_raw());
+        }
     }
 
     #[test]
