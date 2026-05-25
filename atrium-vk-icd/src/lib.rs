@@ -6061,9 +6061,14 @@ pub unsafe extern "C" fn vkGetDeviceImageMemoryRequirements(
     let p_create = std::ptr::read_unaligned(info.add(16) as *const *const u8);
     let _ = walk_p_next_chain(info_p_next);
     let size = if p_create.is_null() { 0 } else {
-        // VkImageCreateInfo: format=24, width=28, height=32,
-        // depth=36, mipLevels=40, arrayLayers=44 (matches
-        // vkCreateImage's parser).
+        // VkImageCreateInfo: imageType=20, format=24,
+        // extent=28..40, mipLevels=40, arrayLayers=44 (matches
+        // vkCreateImage's parser).  Arc 99: also read
+        // imageType so the mip-level shift is dimension-
+        // correct -- same Arc 86 fix as vkGetImageMemoryRequirements
+        // (was unconditionally `>> 2*l`, which under-allocates
+        // for 1D images where each level halves linear size).
+        let image_type   = std::ptr::read_unaligned(p_create.add(20) as *const u32);
         let format       = std::ptr::read_unaligned(p_create.add(24) as *const u32);
         let width        = std::ptr::read_unaligned(p_create.add(28) as *const u32) as u64;
         let height       = std::ptr::read_unaligned(p_create.add(32) as *const u32) as u64;
@@ -6072,7 +6077,9 @@ pub unsafe extern "C" fn vkGetDeviceImageMemoryRequirements(
         let array_layers = (std::ptr::read_unaligned(p_create.add(44) as *const u32).max(1)) as u64;
         let bpp = bpp_for_vk_format(format) as u64;
         let base = width * height * depth * bpp;
-        let mips: u64 = (0..mip_levels).map(|l| base >> (2 * l)).sum();
+        let shift_per_level = image_type + 1;  // 1 / 2 / 3 for 1D / 2D / 3D
+        let mips: u64 = (0..mip_levels)
+            .map(|l| base >> (shift_per_level * l)).sum();
         mips * array_layers
     };
     let tmp = ash::vk::MemoryRequirements {
