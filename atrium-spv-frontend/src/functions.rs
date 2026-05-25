@@ -3410,7 +3410,15 @@ fn translate_inst(
         //   <value> <comparator>
         // Returns the OLD value at the pointer.  If the old
         // value equals `comparator`, writes `value`.
-        SpvOp::AtomicCompareExchange => {
+        // Arc 64: AtomicCompareExchangeWeak shares the exact
+        // operand layout with AtomicCompareExchange and the
+        // exact same semantics on every architecture we
+        // target -- the "weak" qualifier permits spurious
+        // failure (which we don't simulate; LSE CAS on ARM64
+        // and lock cmpxchg on x86_64 are both strong).  Route
+        // both opcodes to the same handler.
+        SpvOp::AtomicCompareExchange
+        | SpvOp::AtomicCompareExchangeWeak => {
             let result_id = spv_inst.result_id.ok_or_else(||
                 FrontendError::Malformed(
                     "AtomicCompareExchange without result id".to_string()))?;

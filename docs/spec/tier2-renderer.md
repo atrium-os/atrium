@@ -1348,6 +1348,12 @@ specifically supports:
   `Op::SMod` directly compute the correct floored result.
   Bespoke still has no native `Op::SMod` arm at all (relies
   on the frontend lowering); that's deferred.
+  `OpAtomicCompareExchangeWeak` (Arc 64): aliased to the
+  existing `OpAtomicCompareExchange` handler.  The "weak"
+  qualifier permits spurious CAS failure in SPIR-V semantics,
+  but every architecture we target (LSE CAS on ARM64; lock
+  cmpxchg on x86_64) provides a strong CAS, so both opcodes
+  route to the same `Op::AtomicCompareExchange` IR variant.
   `Op::SampledImageQuerySizeLod { image, lod }` is emitted
   by the frontend for `OpImageQuerySizeLod`.  Both backends
   read TexDesc.width @ #8 / height @ #12 directly off the
