@@ -813,6 +813,28 @@ fn translate_inst(
             id_map.insert(result_id, src);
             Ok(())
         }
+        // Arc 59: debug-info ops -- silently ignored.
+        //
+        // OpLine / OpNoLine carry source-location hints from
+        // glslang's `-g` mode and can appear *between* real
+        // instructions inside function blocks.  The other ops
+        // (OpName, OpMemberName, OpSource, OpSourceContinued,
+        // OpSourceExtension, OpString) are usually module-level
+        // and never reach the function translator, but we list
+        // them here too for resilience against unusual encoders.
+        //
+        // The catchall at the end would otherwise reject them
+        // with "opcode Line not supported in phase 1 v3".
+        SpvOp::Line
+        | SpvOp::NoLine
+        | SpvOp::Name
+        | SpvOp::MemberName
+        | SpvOp::Source
+        | SpvOp::SourceContinued
+        | SpvOp::SourceExtension
+        | SpvOp::String
+        | SpvOp::ModuleProcessed => Ok(()),
+
         // OpBitcast: reinterpret the bits of a value as the
         // result type (f32 <-> i32/u32).  Maps directly to
         // Op::Bitcast, which both backends already lower.

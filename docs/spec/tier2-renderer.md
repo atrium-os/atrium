@@ -1323,6 +1323,14 @@ specifically supports:
   the only legal case here).  Width-changing conversions
   (f16↔f32, i64↔i32) are rejected with a clear `Unsupported`
   diagnostic rather than falling through the catchall.
+  Debug-info opcodes (Arc 59): `OpLine`, `OpNoLine`,
+  `OpName`, `OpMemberName`, `OpSource{,Continued,Extension}`,
+  `OpString`, and `OpModuleProcessed` are now silently
+  ignored.  Most are module-level and never reach the
+  function translator, but `OpLine`/`OpNoLine` can appear
+  *between* real instructions inside function blocks when
+  glslang is invoked with `-g`; previously these would die
+  in the catchall.
   `textureSize(sampler2D, lod)` (Arc 34): a new IR op
   `Op::SampledImageQuerySizeLod { image, lod }` is emitted
   by the frontend for `OpImageQuerySizeLod`.  Both backends
