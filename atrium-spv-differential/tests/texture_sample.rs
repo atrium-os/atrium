@@ -262,6 +262,77 @@ fn texture_sample_rgba32f_exact_roundtrip() {
     assert_eq!(p[3],  1e-6);
 }
 
+/// Arc 77: end-to-end Rgba8Srgb sampling.  Mid-grey sRGB
+/// (R=G=B=128) decodes to ≈0.21586 linear; alpha stays
+/// linear at 200/255.  Verifies the sRGB→linear de-gamma
+/// curve fires through compiled SPIR-V via the real
+/// runtime helper.
+#[test]
+fn texture_sample_rgba8srgb_exact_roundtrip() {
+    let pixels: Vec<u8> = vec![128, 128, 128, 200];
+    let tex_desc = TexDesc {
+        data: pixels.as_ptr(),
+        width: 1, height: 1, stride_bytes: 4,
+        format: TexFormat::Rgba8Srgb as u32,
+        depth: 1, slice_bytes: 0,
+        mip_count: 0, mip_descs: std::ptr::null(),
+    };
+    let samp_desc = SamplerDesc {
+        mag_filter: FilterMode::Linear as u32,
+        min_filter: FilterMode::Linear as u32,
+        wrap_s: WrapMode::ClampToEdge as u32,
+        wrap_t: WrapMode::ClampToEdge as u32,
+    };
+    let mut uniforms = descriptor_table_buffer(1);
+    unsafe {
+        write_helper_pointers(&mut uniforms,
+            atrium_spv_runtime::atrium_tex_sample_2d,
+            atrium_spv_runtime::atrium_tex_fetch_2d,
+            atrium_spv_runtime::atrium_tex_sample_2d_lod,
+            atrium_spv_runtime::atrium_tex_sample_2d_array,
+            atrium_spv_runtime::atrium_tex_sample_cube,
+            atrium_spv_runtime::atrium_tex_gather_2d,
+            atrium_spv_runtime::atrium_tex_sample_2d_array_lod,
+            atrium_spv_runtime::atrium_tex_sample_cube_lod);
+        write_descriptor_slot(&mut uniforms, 0,
+            &tex_desc as *const _, &samp_desc as *const _);
+    }
+    let texture = TextureBinding {
+        set: 0, binding: 0,
+        data: pixels.clone(),
+        width: 1, height: 1, stride_bytes: 4,
+        format: TexFormat::Rgba8Srgb as u32,
+        sampler: samp_desc,
+    };
+    let inputs = ShaderInputs {
+        textures: vec![texture],
+        uniforms,
+        ..ShaderInputs::default()
+    };
+
+    let spirv = build_sample_centre_shader();
+    let runners: [Box<dyn ShaderRunner>; 3] = [
+        Box::new(InterpreterRunner),
+        Box::new(CraneliftRunner::default()),
+        Box::new(BespokeRunner::default()),
+    ];
+    let refs: Vec<&dyn ShaderRunner> =
+        runners.iter().map(|b| b.as_ref()).collect();
+    // sRGB curve is a `powf(2.4)` — pin tolerance to 1e-4.
+    let tol = atrium_spv_tests::pixels::ColorTolerance::AbsEpsilon { eps: 1e-4 };
+    assert_shader_agrees(&spirv, &inputs, tol, &refs);
+
+    // Pin the linear values: R/G/B de-gamma'd, A linear.
+    let out = BespokeRunner::default().run(&spirv, &inputs).unwrap();
+    let p = &out.pixels[0];
+    for k in 0..3 {
+        assert!((p[k] - 0.21586).abs() < 1e-4,
+            "lane {k}: expected ~0.21586 (sRGB 128 -> linear), got {}", p[k]);
+    }
+    assert!((p[3] - 200.0 / 255.0).abs() < 1e-6,
+        "A should stay linear: got {}", p[3]);
+}
+
 /// Arc 76: end-to-end Rgba16Float sampling.  Builds a 1×1
 /// HDR texture with values that are exactly f16-representable
 /// (so the round-trip is lossless), samples through compiled
