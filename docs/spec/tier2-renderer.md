@@ -1376,6 +1376,17 @@ specifically supports:
   Both formats bypass the u8-unorm clamping path entirely
   (negative + out-of-range values are preserved exactly).
   Two new runtime unit tests pin the round-trip.
+  Two-channel + HDR-half formats (Arc 67):
+    `TexFormat::Rg8Unorm = 5` — 2×u8 unorm (2 bytes/texel).
+       Channel order R,G; B=0, A=1.  Used for normal maps,
+       motion vectors, screen-space UVs.
+    `TexFormat::Rgba16Float = 6` — 4×f16 IEEE 754 (8 bytes
+       /texel).  Decoded to f32 on read via a tiny inline
+       converter that handles ±0, Inf, and NaN.  Denormals
+       flush to zero (matches the common GPU mediump
+       behaviour).  Used for HDR colour render targets.
+  Three new unit tests cover both formats end-to-end + the
+  f16→f32 converter's special-case branches.
   `Op::SampledImageQuerySizeLod { image, lod }` is emitted
   by the frontend for `OpImageQuerySizeLod`.  Both backends
   read TexDesc.width @ #8 / height @ #12 directly off the

@@ -55,6 +55,16 @@ pub enum TexFormat {
     /// colour buffers, intermediate render targets, and
     /// data textures.  Added in Arc 66.
     Rgba32Float = 4,
+    /// 2×u8 unorm (2 bytes/texel).  Channel order R,G;
+    /// B=0, A=1 on read.  Common for normal maps (R,G
+    /// encode the XY tangent-space normal; Z is
+    /// reconstructed in the shader).  Added in Arc 67.
+    Rg8Unorm    = 5,
+    /// 4×f16 IEEE 754 (8 bytes/texel).  Decoded to f32 on
+    /// read.  Common for HDR colour render targets, motion
+    /// vectors, intermediate floating-point buffers.
+    /// Added in Arc 67.
+    Rgba16Float = 6,
 }
 
 /// Storage-image texel formats the read/write helpers
@@ -1167,8 +1177,50 @@ fn fetch_texel_impl(t: &TexDesc, x: u32, y: u32) -> [f32; 4] {
                     *px_ptr.add(3),
                 ]
             }
+            TexFormat::Rg8Unorm => {
+                let px_ptr = row_ptr.add(xc as usize * 2);
+                [
+                    u8_to_unorm(*px_ptr.add(0)),
+                    u8_to_unorm(*px_ptr.add(1)),
+                    0.0, 1.0,
+                ]
+            }
+            TexFormat::Rgba16Float => {
+                let px_ptr = row_ptr.add(xc as usize * 8) as *const u16;
+                [
+                    f16_to_f32(*px_ptr.add(0)),
+                    f16_to_f32(*px_ptr.add(1)),
+                    f16_to_f32(*px_ptr.add(2)),
+                    f16_to_f32(*px_ptr.add(3)),
+                ]
+            }
         }
     }
+}
+
+/// IEEE 754 half-precision (1+5+10) to single-precision
+/// (1+8+23) conversion via straight bit-shifting.  Normal
+/// values: sign preserved, exponent rebiased (15 → 127, so
+/// add 112), mantissa left-shifted by 13.  Special cases:
+///   * Exp == 0 (zero/denormal) -> ±0.  (Denormals get
+///     flushed to zero; matches the common GPU mediump
+///     behaviour and is acceptable for HDR sampling
+///     purposes.)
+///   * Exp == 31 (Inf/NaN) -> propagate to f32 Inf/NaN with
+///     mantissa preserved.
+#[inline]
+fn f16_to_f32(h: u16) -> f32 {
+    let sign = ((h >> 15) as u32) & 0x1;
+    let exp  = ((h >> 10) as u32) & 0x1F;
+    let mant = (h as u32) & 0x3FF;
+    let bits = if exp == 0 {
+        sign << 31
+    } else if exp == 31 {
+        (sign << 31) | (0xFF << 23) | (mant << 13)
+    } else {
+        (sign << 31) | ((exp + 112) << 23) | (mant << 13)
+    };
+    f32::from_bits(bits)
 }
 
 #[inline] fn u8_to_unorm(b: u8) -> f32 { b as f32 / 255.0 }
@@ -1199,6 +1251,8 @@ fn format_from_u32(v: u32) -> TexFormat {
         2 => TexFormat::R8Unorm,
         3 => TexFormat::R32Float,
         4 => TexFormat::Rgba32Float,
+        5 => TexFormat::Rg8Unorm,
+        6 => TexFormat::Rgba16Float,
         // Defensive — a malformed descriptor falls back
         // to a recognisable garbage value rather than UB.
         _ => TexFormat::Rgba8Unorm,
@@ -1605,6 +1659,68 @@ mod tests {
         assert_eq!(p2[3], 1.0);
         let p0 = fetch_texel_impl(&desc, 0, 0);
         assert_eq!(p0[0], -2.5);   // negatives preserved.
+    }
+
+    /// Arc 67: Rg8Unorm sampling — 2 bytes/texel, R + G
+    /// channels decoded; B=0, A=1.
+    #[test]
+    fn rg8unorm_two_channel_load() {
+        // 2×1 image; texel (0,0) = (128, 64), (1,0) = (255, 0).
+        let pixels: Vec<u8> = vec![128, 64, 255, 0];
+        let desc = TexDesc {
+            data: pixels.as_ptr(),
+            width: 2, height: 1, stride_bytes: 4,
+            format: TexFormat::Rg8Unorm as u32,
+            depth: 1, slice_bytes: 0,
+            mip_count: 0, mip_descs: std::ptr::null(),
+        };
+        let p0 = fetch_texel_impl(&desc, 0, 0);
+        assert!((p0[0] - 128.0 / 255.0).abs() < 1e-6);
+        assert!((p0[1] -  64.0 / 255.0).abs() < 1e-6);
+        assert_eq!(p0[2], 0.0);
+        assert_eq!(p0[3], 1.0);
+        let p1 = fetch_texel_impl(&desc, 1, 0);
+        assert!((p1[0] - 1.0).abs() < 1e-6);
+        assert_eq!(p1[1], 0.0);
+    }
+
+    /// Arc 67: Rgba16Float sampling — round-trip f16 values
+    /// chosen so each one has a finite f32 exact equivalent.
+    #[test]
+    fn rgba16float_decodes_to_f32() {
+        // f16 bit patterns:
+        //   0.0  -> 0x0000
+        //   1.0  -> 0x3C00 (sign=0, exp=15, mant=0)
+        //  -1.0  -> 0xBC00
+        //   2.0  -> 0x4000
+        let pixels: Vec<u16> = vec![0x0000, 0x3C00, 0xBC00, 0x4000];
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                pixels.as_ptr() as *const u8, pixels.len() * 2)
+        };
+        let desc = TexDesc {
+            data: bytes.as_ptr(),
+            width: 1, height: 1, stride_bytes: 8,
+            format: TexFormat::Rgba16Float as u32,
+            depth: 1, slice_bytes: 0,
+            mip_count: 0, mip_descs: std::ptr::null(),
+        };
+        let p = fetch_texel_impl(&desc, 0, 0);
+        assert_eq!(p[0],  0.0);
+        assert_eq!(p[1],  1.0);
+        assert_eq!(p[2], -1.0);
+        assert_eq!(p[3],  2.0);
+    }
+
+    /// Arc 67: f16->f32 directly, covering Inf and zero.
+    #[test]
+    fn f16_to_f32_special_cases() {
+        assert_eq!(f16_to_f32(0x0000),  0.0);
+        assert_eq!(f16_to_f32(0x8000),  -0.0_f32);  // -0
+        assert_eq!(f16_to_f32(0x7C00),  f32::INFINITY);
+        assert_eq!(f16_to_f32(0xFC00),  f32::NEG_INFINITY);
+        assert!(f16_to_f32(0x7C01).is_nan());
+        assert_eq!(f16_to_f32(0x3C00),  1.0);
     }
 
     /// Arc 66: Rgba32Float sampling — 16 bytes/texel, exact
