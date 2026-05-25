@@ -9552,6 +9552,20 @@ mod tests {
         assert_eq!(offset_of!(vk::CommandBufferSubmitInfo, command_buffer), 16);
         assert_eq!(std::mem::size_of::<vk::CommandBufferSubmitInfo>(),     32);
 
+        // Arc 114: VkDependencyInfo + VkMemoryBarrier2
+        // (vkCmdPipelineBarrier2). 1.3 sync2 barrier path.
+        // The ICD reads four field offsets in DependencyInfo
+        // and two u64 stage-mask offsets in MemoryBarrier2.
+        // Both are 1.3-mandatory entry points used by every
+        // modern engine for inter-pass synchronization, so a
+        // header shuffle would silently corrupt every barrier.
+        assert_eq!(offset_of!(vk::DependencyInfo, memory_barrier_count),        20);
+        assert_eq!(offset_of!(vk::DependencyInfo, p_memory_barriers),           24);
+        assert_eq!(offset_of!(vk::DependencyInfo, buffer_memory_barrier_count), 32);
+        assert_eq!(offset_of!(vk::DependencyInfo, image_memory_barrier_count),  48);
+        assert_eq!(offset_of!(vk::MemoryBarrier2,  src_stage_mask),             16);
+        assert_eq!(offset_of!(vk::MemoryBarrier2,  dst_stage_mask),             32);
+
         // VkBufferMemoryRequirementsInfo2 +
         // VkImageMemoryRequirementsInfo2 (vkGetBuffer/Image-
         // MemoryRequirements2) -- Arc 110.
