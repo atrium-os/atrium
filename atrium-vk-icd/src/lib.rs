@@ -7769,15 +7769,19 @@ pub unsafe extern "C" fn vkGetPhysicalDeviceSurfacePresentModesKHR(
 /// with the same shape (format + extent) as a normal
 /// vkCreateImage; backed by ICD-owned memory.
 ///
-/// VkSwapchainCreateInfoKHR layout:
-///   0   sType, 8 pNext, 16 flags,
-///   20  surface (u64),
-///   28  minImageCount (u32),
-///   32  imageFormat (u32),
-///   36  imageColorSpace (u32),
-///   40  imageExtent (VkExtent2D),
-///   48  imageArrayLayers (u32),
-///   52  imageUsage (u32), ...
+/// VkSwapchainCreateInfoKHR layout (Arc 97 fix: prior
+/// comments were 4 bytes too low — forgot the natural
+/// padding before `surface`'s u64 8-byte alignment).
+///   0   sType (u32)
+///   8   pNext (ptr)
+///   16  flags (u32)
+///   24  surface (u64)          [pad 20..24 to 8-align]
+///   32  minImageCount (u32)
+///   36  imageFormat (u32)
+///   40  imageColorSpace (u32)
+///   44  imageExtent (VkExtent2D = u32,u32)
+///   52  imageArrayLayers (u32)
+///   56  imageUsage (u32), ...
 #[no_mangle]
 pub unsafe extern "C" fn vkCreateSwapchainKHR(
     device:           VkDevice,
@@ -7790,12 +7794,12 @@ pub unsafe extern "C" fn vkCreateSwapchainKHR(
     }
     let dev = &*(device as *const AtriumDevice);
     let b = p_create_info as *const u8;
-    let surface = std::ptr::read_unaligned(b.add(20) as *const u64);
-    let n       = std::ptr::read_unaligned(b.add(28) as *const u32).max(1).min(8);
-    let format  = std::ptr::read_unaligned(b.add(32) as *const u32);
-    let width   = std::ptr::read_unaligned(b.add(40) as *const u32);
-    let height  = std::ptr::read_unaligned(b.add(44) as *const u32);
-    let usage   = std::ptr::read_unaligned(b.add(52) as *const u32);
+    let surface = std::ptr::read_unaligned(b.add(24) as *const u64);
+    let n       = std::ptr::read_unaligned(b.add(32) as *const u32).max(1).min(8);
+    let format  = std::ptr::read_unaligned(b.add(36) as *const u32);
+    let width   = std::ptr::read_unaligned(b.add(44) as *const u32);
+    let height  = std::ptr::read_unaligned(b.add(48) as *const u32);
+    let usage   = std::ptr::read_unaligned(b.add(56) as *const u32);
 
     // Allocate the ring of swapchain images by piggybacking on
     // the existing vkCreateImage machinery.
@@ -9315,6 +9319,25 @@ mod tests {
         let mut bytes = Vec::with_capacity(words.len() * 4);
         for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
         assert_eq!(scan_spirv_ssbo_binding_count(&bytes), 0);
+    }
+
+    /// Arc 97 regression test: pin `VkSwapchainCreateInfoKHR`
+    /// field offsets against ash's authoritative layout.  The
+    /// ICD reads these fields by raw byte offset (the C struct
+    /// passed by Vulkan apps), so any drift between our
+    /// assumed offsets and the actual struct layout is silent
+    /// data corruption.  Pre-Arc-97 every field was 4 bytes
+    /// too early (forgot the natural padding for u64 alignment
+    /// before `surface`).
+    #[test]
+    fn vk_swapchain_create_info_layout_matches_ash() {
+        use std::mem::offset_of;
+        use ash::vk;
+        assert_eq!(offset_of!(vk::SwapchainCreateInfoKHR, surface),         24);
+        assert_eq!(offset_of!(vk::SwapchainCreateInfoKHR, min_image_count), 32);
+        assert_eq!(offset_of!(vk::SwapchainCreateInfoKHR, image_format),    36);
+        assert_eq!(offset_of!(vk::SwapchainCreateInfoKHR, image_extent),    44);
+        assert_eq!(offset_of!(vk::SwapchainCreateInfoKHR, image_usage),     56);
     }
 
     /// Arc 73: pin the bytes-per-pixel table against the
