@@ -87,6 +87,11 @@ pub enum TexFormat {
     /// space UV offsets, and 2-channel HDR data.  Added in
     /// Arc 69.
     Rg16Float   = 10,
+    /// 1×u16 unorm (2 bytes/texel).  Decoded as `r =
+    /// value / 65535.0` into the R lane; G=B=0, A=1.  The
+    /// classic 16-bit depth-buffer format -- a depth value
+    /// of 32768 reads as ≈0.5.  Added in Arc 70.
+    R16Unorm    = 11,
 }
 
 /// Storage-image texel formats the read/write helpers
@@ -1246,6 +1251,10 @@ fn fetch_texel_impl(t: &TexDesc, x: u32, y: u32) -> [f32; 4] {
                     0.0, 1.0,
                 ]
             }
+            TexFormat::R16Unorm => {
+                let px_ptr = row_ptr.add(xc as usize * 2) as *const u16;
+                [(*px_ptr as f32) / 65535.0, 0.0, 0.0, 1.0]
+            }
         }
     }
 }
@@ -1327,6 +1336,7 @@ fn format_from_u32(v: u32) -> TexFormat {
         8 => TexFormat::Bgra8Srgb,
         9 => TexFormat::R16Float,
         10 => TexFormat::Rg16Float,
+        11 => TexFormat::R16Unorm,
         // Defensive — a malformed descriptor falls back
         // to a recognisable garbage value rather than UB.
         _ => TexFormat::Rgba8Unorm,
@@ -1882,6 +1892,31 @@ mod tests {
         };
         let p = fetch_texel_impl(&desc, 0, 0);
         assert_eq!(p, [2.0, -0.5, 0.0, 1.0]);
+    }
+
+    /// Arc 70: R16Unorm -- classic 16-bit depth-buffer format.
+    /// 0x8000 = 32768 should decode to ≈0.5; 0xFFFF should
+    /// decode to exactly 1.0.
+    #[test]
+    fn r16unorm_depth_buffer_decode() {
+        let pixels: Vec<u16> = vec![0x0000, 0x8000, 0xFFFF];
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                pixels.as_ptr() as *const u8, pixels.len() * 2)
+        };
+        let desc = TexDesc {
+            data: bytes.as_ptr(),
+            width: 3, height: 1, stride_bytes: 6,
+            format: TexFormat::R16Unorm as u32,
+            depth: 1, slice_bytes: 0,
+            mip_count: 0, mip_descs: std::ptr::null(),
+        };
+        let p0 = fetch_texel_impl(&desc, 0, 0);
+        assert_eq!(p0, [0.0, 0.0, 0.0, 1.0]);
+        let p1 = fetch_texel_impl(&desc, 1, 0);
+        assert!((p1[0] - 32768.0 / 65535.0).abs() < 1e-6);
+        let p2 = fetch_texel_impl(&desc, 2, 0);
+        assert_eq!(p2[0], 1.0);
     }
 
     /// Arc 67: f16->f32 directly, covering Inf and zero.

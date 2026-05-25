@@ -1413,6 +1413,13 @@ specifically supports:
   Sampler-side `TexFormat` enum now covers 11 variants
   (Rgba/Bgra/R 8-Unorm, R/Rgba 32-Float, Rg 8-Unorm, Rgba 16-
   Float, Rgba/Bgra 8-Srgb, R/Rg 16-Float).
+  16-bit depth-buffer format (Arc 70):
+    `TexFormat::R16Unorm = 11` — 1×u16 unorm (2 bytes/texel).
+    Decoded as `r = value / 65535.0` into the R lane; G=B=0,
+    A=1.  0x8000 reads as ≈0.5, 0xFFFF as exactly 1.0.  The
+    classic 16-bit depth-buffer format — common for shadow
+    maps, depth-peeling intermediate buffers, and any pass
+    that needs a tighter depth range than D24/D32 affords.
   `Op::SampledImageQuerySizeLod { image, lod }` is emitted
   by the frontend for `OpImageQuerySizeLod`.  Both backends
   read TexDesc.width @ #8 / height @ #12 directly off the
