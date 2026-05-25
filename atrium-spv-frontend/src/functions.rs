@@ -881,7 +881,13 @@ fn translate_inst(
         | SpvOp::SourceContinued
         | SpvOp::SourceExtension
         | SpvOp::String
-        | SpvOp::ModuleProcessed => Ok(()),
+        | SpvOp::ModuleProcessed
+        // Arc 75: OpLifetimeStart / OpLifetimeStop are
+        // optimizer hints for stack-variable lifetimes.
+        // Tier-2 ignores them -- our IR has no equivalent
+        // marker and the backends never re-stack-allocate.
+        | SpvOp::LifetimeStart
+        | SpvOp::LifetimeStop => Ok(()),
 
         // OpBitcast: reinterpret the bits of a value as the
         // result type (f32 <-> i32/u32).  Maps directly to
