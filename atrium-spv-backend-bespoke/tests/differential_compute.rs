@@ -814,6 +814,84 @@ fn build_atomic_cas_cs() -> Vec<u8> {
     bytes
 }
 
+/// Arc 79: same shader shape as the CAS-success test, but
+/// uses `OpAtomicCompareExchangeWeak` instead of the strong
+/// `OpAtomicCompareExchange`.  Both opcodes are aliased to
+/// the same handler (Arc 64) since every target arch we
+/// support provides a strong CAS at the hardware level.
+/// The Weak variant should produce byte-identical results.
+fn build_atomic_cas_weak_cs() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+        MemorySemantics, Scope,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let void_fn = b.type_function(void, vec![]);
+    let s = b.type_struct(vec![u32_ty, u32_ty]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.member_decorate(s, 1, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(4)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_u = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+    let ssbo = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let c_zero  = b.constant_bit32(u32_ty, 0);
+    let c_one   = b.constant_bit32(u32_ty, 1);
+    let c_42    = b.constant_bit32(u32_ty, 42);
+    let c_99    = b.constant_bit32(u32_ty, 99);
+    let c_scope = b.constant_bit32(u32_ty, Scope::Device as u32);
+    let c_sem   = b.constant_bit32(u32_ty,
+        MemorySemantics::ATOMIC_COUNTER_MEMORY.bits());
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let dst_a = b.access_chain(ptr_u, None, ssbo, vec![c_zero]).unwrap();
+    let old = b.atomic_compare_exchange_weak(
+        u32_ty, None, dst_a, c_scope, c_sem, c_sem, c_99, c_42).unwrap();
+    let dst_b = b.access_chain(ptr_u, None, ssbo, vec![c_one]).unwrap();
+    b.store(dst_b, old, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn differential_atomic_cas_weak_success_path() {
+    // Prefill ssbo.a = 42 (matches comparator).  Expect the
+    // weak CAS to succeed (every arch we target has strong CAS):
+    //   ssbo.a = 99 (desired written)
+    //   ssbo.b = 42 (old value returned)
+    let spv = build_atomic_cas_weak_cs();
+    let dir = TempDir::new().unwrap();
+    let mut b_buf = vec![0u8; 16];
+    let mut c_buf = vec![0u8; 16];
+    b_buf[0..4].copy_from_slice(&42u32.to_le_bytes());
+    c_buf[0..4].copy_from_slice(&42u32.to_le_bytes());
+    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    assert_eq!(b_buf, c_buf, "diverge on CAS-weak success");
+    assert_eq!(u32::from_le_bytes(b_buf[0..4].try_into().unwrap()), 99,
+        "CAS-weak success should write desired (99)");
+    assert_eq!(u32::from_le_bytes(b_buf[4..8].try_into().unwrap()), 42,
+        "CAS-weak should return old value (42)");
+}
+
 #[test]
 fn differential_atomic_cas_success_path() {
     // Prefill ssbo.a = 42 (matches comparator).
