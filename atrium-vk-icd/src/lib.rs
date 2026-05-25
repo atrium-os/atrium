@@ -9423,6 +9423,9 @@ mod tests {
         // VkDeviceQueueInfo2 (vkGetDeviceQueue2)
         assert_eq!(offset_of!(vk::DeviceQueueInfo2, queue_family_index), 20);
         assert_eq!(offset_of!(vk::DeviceQueueInfo2, queue_index),        24);
+
+        // VkImageViewCreateInfo (vkCreateImageView) -- Arc 101.
+        assert_eq!(offset_of!(vk::ImageViewCreateInfo, image),  24);
     }
 
     /// Arc 73: pin the bytes-per-pixel table against the
