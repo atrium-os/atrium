@@ -702,14 +702,24 @@ fn bpp_for_vk_format(format: u32) -> u32 {
         // 1 byte per pixel.
         F::R8_UNORM | F::R8_SNORM | F::R8_USCALED | F::R8_SSCALED
         | F::R8_UINT | F::R8_SINT | F::R8_SRGB
-        | F::S8_UINT => 1,
+        | F::S8_UINT
+        // Packed 4-bit-per-channel into 8 bits.
+        | F::R4G4_UNORM_PACK8 => 1,
 
         // 2 bytes per pixel.
         F::R8G8_UNORM | F::R8G8_SNORM | F::R8G8_USCALED | F::R8G8_SSCALED
         | F::R8G8_UINT | F::R8G8_SINT | F::R8G8_SRGB
         | F::R16_UNORM | F::R16_SNORM | F::R16_USCALED | F::R16_SSCALED
         | F::R16_UINT | F::R16_SINT | F::R16_SFLOAT
-        | F::D16_UNORM => 2,
+        | F::D16_UNORM
+        // 16-bit packed (mobile-friendly).
+        | F::R4G4B4A4_UNORM_PACK16
+        | F::B4G4R4A4_UNORM_PACK16
+        | F::R5G6B5_UNORM_PACK16
+        | F::B5G6R5_UNORM_PACK16
+        | F::R5G5B5A1_UNORM_PACK16
+        | F::B5G5R5A1_UNORM_PACK16
+        | F::A1R5G5B5_UNORM_PACK16 => 2,
 
         // 3 bytes per pixel (rare; most HW pads to 4).
         F::R8G8B8_UNORM | F::R8G8B8_SNORM | F::R8G8B8_USCALED
@@ -9231,7 +9241,11 @@ mod tests {
         // (format, expected bpp).
         let cases: &[(F, u32)] = &[
             (F::R8_UNORM,             1),
+            (F::R4G4_UNORM_PACK8,     1),  // Arc 87
             (F::R8G8_UNORM,           2),
+            (F::R4G4B4A4_UNORM_PACK16, 2), // Arc 87
+            (F::R5G6B5_UNORM_PACK16,  2),  // Arc 87
+            (F::A1R5G5B5_UNORM_PACK16, 2), // Arc 87
             (F::R16_UNORM,            2),
             (F::R16_SFLOAT,           2),  // would have been 4 pre-fix
             (F::D16_UNORM,            2),
