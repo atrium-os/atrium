@@ -1339,6 +1339,15 @@ specifically supports:
   path for in v1, so a quiet Return is the pragmatic mapping
   (the caller's output buffer contains whatever the shader
   wrote prior to the discard).
+  Cranelift `Op::SMod` correctness (Arc 63): the dead-code
+  Cranelift backend path for `Op::SMod` was using `srem`
+  (truncated, same sign as dividend) — SRem semantics, not
+  SMod's floored remainder.  Effectively unreachable since
+  Arc 50 lowers OpSMod with the sign-adjust at the frontend,
+  but fixed in-place so hand-crafted IR modules that emit
+  `Op::SMod` directly compute the correct floored result.
+  Bespoke still has no native `Op::SMod` arm at all (relies
+  on the frontend lowering); that's deferred.
   `Op::SampledImageQuerySizeLod { image, lod }` is emitted
   by the frontend for `OpImageQuerySizeLod`.  Both backends
   read TexDesc.width @ #8 / height @ #12 directly off the

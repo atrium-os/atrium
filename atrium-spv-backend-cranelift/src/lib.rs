@@ -1144,8 +1144,40 @@ impl FnTranslator {
                 builder, &inst.result, a, b, |b, x, y| b.ins().sdiv(x, y)),
             Op::UDiv(a, b) => self.emit_int_binop(
                 builder, &inst.result, a, b, |b, x, y| b.ins().udiv(x, y)),
-            Op::SMod(a, b) => self.emit_int_binop(
-                builder, &inst.result, a, b, |b, x, y| b.ins().srem(x, y)),
+            Op::SMod(a, b) => {
+                // Arc 63: OpSMod is floored remainder (same
+                // sign as divisor), not truncated.  Cranelift's
+                // `srem` gives truncated; apply the sign-adjust
+                // correction:
+                //   r = srem(x, y)
+                //   need_adjust = (r != 0) && (sign(r) != sign(y))
+                //   result = need_adjust ? r + y : r
+                // The frontend lowers OpSMod with the same
+                // adjust before emission (Arc 50) so this path
+                // is effectively dead from real shaders -- but
+                // fixing it defends against hand-crafted IR
+                // modules that emit Op::SMod directly.
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal("SMod without result".into()))?;
+                let av = self.scalars.get(&a.id).copied().ok_or_else(||
+                    BackendError::Internal(format!(
+                        "SMod lhs {:?} not in scalars", a.id)))?;
+                let bv = self.scalars.get(&b.id).copied().ok_or_else(||
+                    BackendError::Internal(format!(
+                        "SMod rhs {:?} not in scalars", b.id)))?;
+                let r = builder.ins().srem(av, bv);
+                let zero = builder.ins().iconst(clif_types::I32, 0);
+                let signs_differ = {
+                    let xored = builder.ins().bxor(r, bv);
+                    builder.ins().icmp(IntCC::SignedLessThan, xored, zero)
+                };
+                let r_nonzero = builder.ins().icmp(IntCC::NotEqual, r, zero);
+                let need_adjust = builder.ins().band(signs_differ, r_nonzero);
+                let adjusted = builder.ins().iadd(r, bv);
+                let v = builder.ins().select(need_adjust, adjusted, r);
+                self.scalars.insert(result.id, v);
+                Ok(())
+            }
             Op::UMod(a, b) => self.emit_int_binop(
                 builder, &inst.result, a, b, |b, x, y| b.ins().urem(x, y)),
             Op::INeg(a) => {
