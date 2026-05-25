@@ -9566,6 +9566,44 @@ mod tests {
         assert_eq!(offset_of!(vk::MemoryBarrier2,  src_stage_mask),             16);
         assert_eq!(offset_of!(vk::MemoryBarrier2,  dst_stage_mask),             32);
 
+        // Arc 115: a sweep of remaining unpinned offsets the ICD
+        // reads / writes by raw byte index.
+
+        // VkCommandBufferAllocateInfo (vkAllocateCommandBuffers):
+        assert_eq!(offset_of!(vk::CommandBufferAllocateInfo, command_pool),         16);
+        assert_eq!(offset_of!(vk::CommandBufferAllocateInfo, command_buffer_count), 28);
+
+        // VkPhysicalDeviceGroupProperties
+        // (vkEnumeratePhysicalDeviceGroups): 288 B, ICD writes
+        // count @ 16, devices array @ 24 (32 slots), and
+        // subset_allocation @ 280.
+        assert_eq!(offset_of!(vk::PhysicalDeviceGroupProperties,
+            physical_device_count),                                                 16);
+        assert_eq!(offset_of!(vk::PhysicalDeviceGroupProperties,
+            physical_devices),                                                      24);
+        assert_eq!(offset_of!(vk::PhysicalDeviceGroupProperties,
+            subset_allocation),                                                    280);
+        assert_eq!(std::mem::size_of::<vk::PhysicalDeviceGroupProperties>(),       288);
+
+        // VkSurfaceFormat2KHR (vkGetPhysicalDeviceSurfaceFormats2KHR):
+        // 24 B stride; ICD writes surface_format (format,
+        // color_space pair) starting at offset 16.
+        assert_eq!(offset_of!(vk::SurfaceFormat2KHR, surface_format),               16);
+        assert_eq!(std::mem::size_of::<vk::SurfaceFormat2KHR>(),                    24);
+
+        // VkAcquireNextImageInfoKHR
+        // (vkAcquireNextImage2KHR, 1.1 device-group acquire):
+        assert_eq!(offset_of!(vk::AcquireNextImageInfoKHR, swapchain), 16);
+        assert_eq!(offset_of!(vk::AcquireNextImageInfoKHR, timeout),   24);
+        assert_eq!(offset_of!(vk::AcquireNextImageInfoKHR, semaphore), 32);
+        assert_eq!(offset_of!(vk::AcquireNextImageInfoKHR, fence),     40);
+
+        // VkPresentInfoKHR (vkQueuePresentKHR):
+        assert_eq!(offset_of!(vk::PresentInfoKHR, swapchain_count),  32);
+        assert_eq!(offset_of!(vk::PresentInfoKHR, p_swapchains),     40);
+        assert_eq!(offset_of!(vk::PresentInfoKHR, p_image_indices),  48);
+        assert_eq!(offset_of!(vk::PresentInfoKHR, p_results),        56);
+
         // VkBufferMemoryRequirementsInfo2 +
         // VkImageMemoryRequirementsInfo2 (vkGetBuffer/Image-
         // MemoryRequirements2) -- Arc 110.
