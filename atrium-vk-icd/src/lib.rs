@@ -9483,6 +9483,10 @@ mod tests {
         assert_eq!(offset_of!(vk::DescriptorBufferInfo, buffer),      0);
         assert_eq!(offset_of!(vk::DescriptorBufferInfo, offset),      8);
         assert_eq!(offset_of!(vk::DescriptorBufferInfo, range),       16);
+
+        // VkSubpassBeginInfo (vkCmdBeginRenderPass2 /
+        // vkCmdNextSubpass2) -- Arc 107.
+        assert_eq!(offset_of!(vk::SubpassBeginInfo, contents), 16);
     }
 
     /// Arc 73: pin the bytes-per-pixel table against the
