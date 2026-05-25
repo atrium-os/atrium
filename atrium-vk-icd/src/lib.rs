@@ -9438,6 +9438,20 @@ mod tests {
         assert_eq!(offset_of!(vk::RenderingInfo, p_depth_attachment),     56);
         assert_eq!(offset_of!(vk::RenderingAttachmentInfo, image_view),   16);
         assert_eq!(offset_of!(vk::RenderingAttachmentInfo, clear_value),  52);
+
+        // VkBindBufferMemoryInfo / VkBindImageMemoryInfo
+        // (vkBindBufferMemory2 / vkBindImageMemory2) -- Arc 104.
+        // 40-byte stride between consecutive bind infos.
+        assert_eq!(offset_of!(vk::BindBufferMemoryInfo, buffer),        16);
+        assert_eq!(offset_of!(vk::BindBufferMemoryInfo, memory),        24);
+        assert_eq!(offset_of!(vk::BindBufferMemoryInfo, memory_offset), 32);
+        assert_eq!(std::mem::size_of::<vk::BindBufferMemoryInfo>(),     40);
+        assert_eq!(offset_of!(vk::BindImageMemoryInfo,  image),         16);
+        assert_eq!(std::mem::size_of::<vk::BindImageMemoryInfo>(),      40);
+
+        // VkPhysicalDeviceSurfaceInfo2KHR
+        // (vkGetPhysicalDeviceSurfaceCapabilities2KHR etc.) -- Arc 104.
+        assert_eq!(offset_of!(vk::PhysicalDeviceSurfaceInfo2KHR, surface), 16);
     }
 
     /// Arc 73: pin the bytes-per-pixel table against the
