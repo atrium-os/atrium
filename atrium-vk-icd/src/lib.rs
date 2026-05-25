@@ -9496,6 +9496,19 @@ mod tests {
         assert_eq!(offset_of!(vk::SubmitInfo, command_buffer_count), 40);
         assert_eq!(offset_of!(vk::SubmitInfo, p_command_buffers),    48);
         assert_eq!(std::mem::size_of::<vk::SubmitInfo>(),            72);
+
+        // VkSubmitInfo2 + VkCommandBufferSubmitInfo
+        // (vkQueueSubmit2 / vkQueueSubmit2KHR) -- Arc 109.
+        // Vulkan 1.3 sync2 submit path.  Stride mismatch on
+        // either struct walks the submit array off into garbage
+        // on the second iteration, which is the common case for
+        // apps that batch compute + graphics submits separately
+        // through the sync2 entry point.
+        assert_eq!(offset_of!(vk::SubmitInfo2, command_buffer_info_count), 32);
+        assert_eq!(offset_of!(vk::SubmitInfo2, p_command_buffer_infos),    40);
+        assert_eq!(std::mem::size_of::<vk::SubmitInfo2>(),                 64);
+        assert_eq!(offset_of!(vk::CommandBufferSubmitInfo, command_buffer), 16);
+        assert_eq!(std::mem::size_of::<vk::CommandBufferSubmitInfo>(),     32);
     }
 
     /// Arc 73: pin the bytes-per-pixel table against the
