@@ -513,3 +513,62 @@ fn translate_constant_composite(
         kind: ConstantKind::Composite(element_ids),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rspirv::dr::Builder;
+
+    /// Arc 56 follow-up: cover the SpecConstantOp Logical /
+    /// Select sub-opcodes that the previous numeric-literal
+    /// mapping had off-by-one.  Builds a minimal module with
+    /// three spec constants and asserts the expression
+    /// `Select(LogicalAnd(true, false), 7, 11)` evaluates to
+    /// 11 (since true&&false = false, Select picks the false
+    /// arm).  Pre-fix this would have either dispatched
+    /// LogicalAnd as LogicalEqual (which returns 1 == 0 = false)
+    /// — happens to give the same answer here but a different
+    /// op semantics — or hit "sub-opcode literal 169 not
+    /// recognised" for Select.
+    #[test]
+    fn spec_constant_op_logical_and_select() {
+        let mut b = Builder::new();
+        b.set_version(1, 3);
+        b.memory_model(
+            rspirv::spirv::AddressingModel::Logical,
+            rspirv::spirv::MemoryModel::GLSL450,
+        );
+        let bool_ty = b.type_bool();
+        let i32_ty = b.type_int(32, 1);
+        let s_true  = b.spec_constant_true(bool_ty);
+        let s_false = b.spec_constant_false(bool_ty);
+        let s_7  = b.spec_constant_bit32(i32_ty, 7u32);
+        let s_11 = b.spec_constant_bit32(i32_ty, 11u32);
+        // a_and_b = LogicalAnd(true, false) -- should be false.
+        let a_and_b = b.spec_constant_op(bool_ty, SpvOp::LogicalAnd);
+        b.module_mut().types_global_values.last_mut().unwrap()
+            .operands.push(Operand::IdRef(s_true));
+        b.module_mut().types_global_values.last_mut().unwrap()
+            .operands.push(Operand::IdRef(s_false));
+        // pick = Select(a_and_b, 7, 11) -- false branch -> 11.
+        let pick = b.spec_constant_op(i32_ty, SpvOp::Select);
+        b.module_mut().types_global_values.last_mut().unwrap()
+            .operands.push(Operand::IdRef(a_and_b));
+        b.module_mut().types_global_values.last_mut().unwrap()
+            .operands.push(Operand::IdRef(s_7));
+        b.module_mut().types_global_values.last_mut().unwrap()
+            .operands.push(Operand::IdRef(s_11));
+
+        let module = b.module();
+        let types = TypeContext::build(&module).expect("types");
+        let ctx = ConstantContext::build(&module, &types).expect("constants");
+        let sc = ctx.get(pick).expect("pick should be resolved");
+        match &sc.kind {
+            ConstantKind::Scalar(Op::ConstInt { value, .. }) => {
+                assert_eq!(*value, 11,
+                    "expected Select(false, 7, 11) -> 11, got {value}");
+            }
+            other => panic!("expected ConstInt, got {other:?}"),
+        }
+    }
+}
