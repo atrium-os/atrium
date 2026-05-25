@@ -46,6 +46,15 @@ pub enum TexFormat {
     Bgra8Unorm = 1,
     /// 1×u8 unorm, replicated to R; G=B=0, A=1.
     R8Unorm    = 2,
+    /// 1×f32 IEEE 754 (4 bytes/texel).  Loaded into the R
+    /// lane; G=B=0, A=1.  Common for depth textures, HDR
+    /// single-channel data, and per-pixel scalar data
+    /// textures (e.g. masks).  Added in Arc 66.
+    R32Float   = 3,
+    /// 4×f32 IEEE 754 (16 bytes/texel).  Common for HDR
+    /// colour buffers, intermediate render targets, and
+    /// data textures.  Added in Arc 66.
+    Rgba32Float = 4,
 }
 
 /// Storage-image texel formats the read/write helpers
@@ -1145,6 +1154,19 @@ fn fetch_texel_impl(t: &TexDesc, x: u32, y: u32) -> [f32; 4] {
                 let r = u8_to_unorm(*row_ptr.add(xc as usize));
                 [r, 0.0, 0.0, 1.0]
             }
+            TexFormat::R32Float => {
+                let px_ptr = row_ptr.add(xc as usize * 4) as *const f32;
+                [*px_ptr, 0.0, 0.0, 1.0]
+            }
+            TexFormat::Rgba32Float => {
+                let px_ptr = row_ptr.add(xc as usize * 16) as *const f32;
+                [
+                    *px_ptr.add(0),
+                    *px_ptr.add(1),
+                    *px_ptr.add(2),
+                    *px_ptr.add(3),
+                ]
+            }
         }
     }
 }
@@ -1175,6 +1197,8 @@ fn format_from_u32(v: u32) -> TexFormat {
         0 => TexFormat::Rgba8Unorm,
         1 => TexFormat::Bgra8Unorm,
         2 => TexFormat::R8Unorm,
+        3 => TexFormat::R32Float,
+        4 => TexFormat::Rgba32Float,
         // Defensive — a malformed descriptor falls back
         // to a recognisable garbage value rather than UB.
         _ => TexFormat::Rgba8Unorm,
@@ -1556,6 +1580,51 @@ mod tests {
         assert!((p[0] - 200.0 / 255.0).abs() < 1e-6);
         assert!(p[1] == 0.0 && p[2] == 0.0);
         assert!((p[3] - 1.0).abs() < 1e-6);
+    }
+
+    /// Arc 66: R32Float sampling reads the f32 into the R lane;
+    /// G/B = 0, A = 1.  HDR-friendly (no clamp to [0, 1]).
+    #[test]
+    fn r32float_loads_into_red() {
+        let pixels: Vec<f32> = vec![-2.5, 3.14, 1.0e6, -0.0];
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                pixels.as_ptr() as *const u8, pixels.len() * 4)
+        };
+        let desc = TexDesc {
+            data: bytes.as_ptr(),
+            width: 4, height: 1, stride_bytes: 16,
+            format: TexFormat::R32Float as u32,
+            depth: 1, slice_bytes: 0,
+            mip_count: 0, mip_descs: std::ptr::null(),
+        };
+        let p2 = fetch_texel_impl(&desc, 2, 0);
+        assert_eq!(p2[0], 1.0e6);  // exact, no clamping.
+        assert_eq!(p2[1], 0.0);
+        assert_eq!(p2[2], 0.0);
+        assert_eq!(p2[3], 1.0);
+        let p0 = fetch_texel_impl(&desc, 0, 0);
+        assert_eq!(p0[0], -2.5);   // negatives preserved.
+    }
+
+    /// Arc 66: Rgba32Float sampling — 16 bytes/texel, exact
+    /// IEEE 754 round-trip per channel.
+    #[test]
+    fn rgba32float_exact_per_lane() {
+        let pixels: Vec<f32> = vec![1.5, -2.5, 3.14, 1e10];
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                pixels.as_ptr() as *const u8, pixels.len() * 4)
+        };
+        let desc = TexDesc {
+            data: bytes.as_ptr(),
+            width: 1, height: 1, stride_bytes: 16,
+            format: TexFormat::Rgba32Float as u32,
+            depth: 1, slice_bytes: 0,
+            mip_count: 0, mip_descs: std::ptr::null(),
+        };
+        let p = fetch_texel_impl(&desc, 0, 0);
+        assert_eq!(p, [1.5, -2.5, 3.14, 1e10]);
     }
 
     #[test]

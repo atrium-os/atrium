@@ -1364,6 +1364,18 @@ specifically supports:
        dispatcher).
   Closes another catchall failure path for shaders that use
   fragment-derivative-aware control flow.
+  Sampler-side HDR formats (Arc 66): two new `TexFormat`
+  variants are accepted by `fetch_texel_impl`:
+    `TexFormat::R32Float = 3` — single-channel f32; goes into
+       the R lane, G/B=0, A=1.  Common for depth textures,
+       HDR luminance, and scalar data textures.
+    `TexFormat::Rgba32Float = 4` — 4×f32 IEEE 754;
+       byte-exact round-trip per channel.  Common for HDR
+       colour render targets, intermediate buffers, and data
+       textures.
+  Both formats bypass the u8-unorm clamping path entirely
+  (negative + out-of-range values are preserved exactly).
+  Two new runtime unit tests pin the round-trip.
   `Op::SampledImageQuerySizeLod { image, lod }` is emitted
   by the frontend for `OpImageQuerySizeLod`.  Both backends
   read TexDesc.width @ #8 / height @ #12 directly off the
