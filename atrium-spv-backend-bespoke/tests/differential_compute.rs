@@ -872,6 +872,67 @@ fn build_atomic_cas_weak_cs() -> Vec<u8> {
 }
 
 #[test]
+fn differential_op_is_helper_invocation() {
+    // Arc 65 regression test: OpIsHelperInvocationEXT lowers
+    // to ConstInt 0 (Tier-2's serial dispatcher has no
+    // concept of helper invocations).  Wrap the result in a
+    // Select(is_helper, 42, 7) so a regression that returns
+    // a different constant for the bool would change the
+    // stored value.  Expected output: 7.
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.capability(Capability::DemoteToHelperInvocation);
+    b.extension("SPV_EXT_demote_to_helper_invocation");
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let bool_ty = b.type_bool();
+    let void_fn = b.type_function(void, vec![]);
+    let rt = b.type_runtime_array(u32_ty);
+    b.decorate(rt, Decoration::ArrayStride, vec![rspirv::dr::Operand::LiteralBit32(4)]);
+    let s = b.type_struct(vec![rt]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_u = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+    let ssbo  = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    let c_42 = b.constant_bit32(u32_ty, 42);
+    let c_7  = b.constant_bit32(u32_ty,  7);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let is_helper = b.is_helper_invocation_ext(bool_ty, None).unwrap();
+    let pick = b.select(u32_ty, None, is_helper, c_42, c_7).unwrap();
+    let d = b.access_chain(ptr_u, None, ssbo, vec![c_zero, c_zero]).unwrap();
+    b.store(d, pick, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spv = Vec::with_capacity(words.len() * 4);
+    for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+    let dir = TempDir::new().unwrap();
+    let mut b_buf = vec![0u8; 4];
+    let mut c_buf = vec![0u8; 4];
+    invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
+    invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+    assert_eq!(b_buf, c_buf,
+        "OpIsHelperInvocationEXT diverges between backends");
+    let got = u32::from_le_bytes(b_buf[0..4].try_into().unwrap());
+    assert_eq!(got, 7,
+        "IsHelperInvocation should be false -> Select picks 7");
+}
+
+#[test]
 fn differential_atomic_cas_weak_success_path() {
     // Prefill ssbo.a = 42 (matches comparator).  Expect the
     // weak CAS to succeed (every arch we target has strong CAS):

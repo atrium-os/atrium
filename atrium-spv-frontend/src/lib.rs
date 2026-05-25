@@ -134,7 +134,12 @@ pub fn translate_with_spec_overrides(
                 | C::ImageQuery
                 // dFdxFine / dFdyCoarse etc. -- lowered to
                 // zero (no quad dispatch), Arc 33.
-                | C::DerivativeControl);
+                | C::DerivativeControl
+                // OpDemoteToHelperInvocation / OpIsHelper-
+                // InvocationEXT, both no-ops since Tier-2's
+                // serial dispatcher has no helper concept
+                // (Arc 65).
+                | C::DemoteToHelperInvocation);
             if !accepted {
                 return Err(FrontendError::Unsupported(format!(
                     "capability {cap:?} not supported in phase-1 v1",
