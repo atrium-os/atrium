@@ -9431,6 +9431,13 @@ mod tests {
         assert_eq!(offset_of!(vk::SamplerCreateInfo, min_filter),       24);
         assert_eq!(offset_of!(vk::SamplerCreateInfo, mipmap_mode),      28);
         assert_eq!(offset_of!(vk::SamplerCreateInfo, address_mode_u),   32);
+        // Arc 112: previously-missing v/w address-mode pins.
+        // The ICD reads both as u32 at 36 / 40; drift here would
+        // silently wrap-as-clamp (or vice versa) on Y/Z axes
+        // while U on X kept working -- the kind of off-axis
+        // sampler bug that's painful to attribute.
+        assert_eq!(offset_of!(vk::SamplerCreateInfo, address_mode_v),   36);
+        assert_eq!(offset_of!(vk::SamplerCreateInfo, address_mode_w),   40);
         assert_eq!(offset_of!(vk::SamplerCreateInfo, max_anisotropy),   52);
         assert_eq!(offset_of!(vk::SamplerCreateInfo, min_lod),          64);
         assert_eq!(offset_of!(vk::SamplerCreateInfo, max_lod),          68);
