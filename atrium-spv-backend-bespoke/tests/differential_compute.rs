@@ -872,6 +872,78 @@ fn build_atomic_cas_weak_cs() -> Vec<u8> {
 }
 
 #[test]
+fn differential_storage_image_r32uint_write() {
+    // Arc 82: end-to-end test for Arc 71's R32Uint storage
+    // image format.  Compute shader bitcasts a u32 payload
+    // (0xDEADBEEF) to f32, packs into a vec4, and writes to
+    // texel (0,0) of an R32Uint storage image.  The runtime
+    // helper takes the first lane's bit pattern and stores
+    // it as u32.  Verifies the byte representation matches.
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, Dim,
+        ExecutionMode, ExecutionModel, FunctionControl, ImageFormat,
+        MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let f32_ty = b.type_float(32, None);
+    let v2u    = b.type_vector(u32_ty, 2);
+    let v4f    = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    // Declare the image as Rgba32f at the SPIR-V level (the
+    // host StorageFormat::R32Uint=3 only affects the runtime
+    // helper's encoding).
+    let img_ty = b.type_image(f32_ty, Dim::Dim2D, 0, 0, 0, 2,
+        ImageFormat::Rgba32f, None);
+    let ptr_img = b.type_pointer(None, StorageClass::UniformConstant, img_ty);
+    let img_var = b.variable(ptr_img, None, StorageClass::UniformConstant, None);
+    b.decorate(img_var, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(img_var, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let c_zero_u = b.constant_bit32(u32_ty, 0);
+    let c_zero_f = b.constant_bit32(f32_ty, 0.0f32.to_bits());
+    let c_payload_u = b.constant_bit32(u32_ty, 0xDEAD_BEEF);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    // Carry the u32 through the f32 lane via bitcast.
+    let payload_f = b.bitcast(f32_ty, None, c_payload_u).unwrap();
+    let coord = b.composite_construct(v2u, None, vec![c_zero_u, c_zero_u]).unwrap();
+    let texel = b.composite_construct(v4f, None,
+        vec![payload_f, c_zero_f, c_zero_f, c_zero_f]).unwrap();
+    let img = b.load(img_ty, None, img_var, None, vec![]).unwrap();
+    b.image_write(img, coord, texel, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![img_var]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut spv = Vec::with_capacity(words.len() * 4);
+    for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+
+    // 1x1 R32Uint image (4 bytes total).
+    let (w, h) = (1u32, 1u32);
+    let mut b_img = vec![0u8; 4];
+    let mut c_img = vec![0u8; 4];
+    let dir = TempDir::new().unwrap();
+    // format = 3 (StorageFormat::R32Uint).
+    invoke_compute_image(&spv, true,  dir.path(), "b",
+        &mut b_img, w, h, 1, 3, &[(0, 0, 0)]);
+    invoke_compute_image(&spv, false, dir.path(), "c",
+        &mut c_img, w, h, 1, 3, &[(0, 0, 0)]);
+    assert_eq!(b_img, c_img,
+        "R32Uint storage write diverges between backends");
+    let stored = u32::from_le_bytes(b_img[0..4].try_into().unwrap());
+    assert_eq!(stored, 0xDEAD_BEEF,
+        "stored u32 bit pattern should round-trip: got {:#x}", stored);
+}
+
+#[test]
 fn differential_op_is_helper_invocation() {
     // Arc 65 regression test: OpIsHelperInvocationEXT lowers
     // to ConstInt 0 (Tier-2's serial dispatcher has no
