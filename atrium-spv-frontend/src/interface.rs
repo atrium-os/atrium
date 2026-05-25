@@ -168,6 +168,15 @@ impl InterfaceContext {
         // i32 / u32 value out.  Without a constants context
         // we silently skip the ExecutionModeId path -- matches
         // the pre-Arc-53 behaviour.
+        //
+        // NOTE (Arc 78): the rspirv 0.13 loader currently
+        // refuses modules containing OpExecutionModeId
+        // (it's not in its dr::loader dispatch table -- only
+        // OpExecutionMode is).  So this branch is defensive:
+        // it lights up only if a future rspirv release admits
+        // OpExecutionModeId into `module.execution_modes`.
+        // A direct integration test would need to bypass
+        // rspirv's loader, or wait for the upstream fix.
         for inst in &module.execution_modes {
             let fn_id = read_id_ref(&inst.operands, 0)?;
             let mode = match inst.operands.get(1) {

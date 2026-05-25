@@ -1328,6 +1328,13 @@ specifically supports:
   `InterfaceContext::build_with_constants()` entry which the
   frontend's main pass uses; the no-constants path stays
   available for callers that don't yet have a constants ctx.
+  NOTE (Arc 78): the rspirv 0.13 loader currently refuses
+  modules containing `OpExecutionModeId` outright (its
+  dispatch table only knows `OpExecutionMode`).  The Arc 53
+  branch in `interface.rs` is therefore defensive — it
+  lights up only if a future rspirv release admits
+  `OpExecutionModeId` into `module.execution_modes`.  Direct
+  integration tests would need to bypass rspirv's loader.
   Shadow gather (Arc 54): `OpImageDrefGather` compiles as a
   composition of Arc 32 (`OpImageGather`, component=0) +
   Arc 40 (Dref compare per lane).  Fetches red channel of the
