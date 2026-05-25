@@ -1438,6 +1438,13 @@ specifically supports:
   denormals to zero, propagates Inf / NaN.
   Three new unit tests pin u32 bit-pattern round-trip,
   Rgba16f vec4 round-trip, and `f32_to_f16` boundary cases.
+  End-to-end Rgba32Float fragment-shader test (Arc 72):
+    `texture_sample_rgba32f_exact_roundtrip` builds the same
+    1-tap shader the centre-RGBW test uses but with a 1×1
+    `Rgba32Float` texture carrying HDR values (-3.14, 0,
+    25.5, 1e-6).  Exact bit-for-bit round-trip across all
+    three runners — proves the new wire format value reaches
+    end-to-end through compiled SPIR-V.
   `Op::SampledImageQuerySizeLod { image, lod }` is emitted
   by the frontend for `OpImageQuerySizeLod`.  Both backends
   read TexDesc.width @ #8 / height @ #12 directly off the
