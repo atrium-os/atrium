@@ -7562,11 +7562,17 @@ pub unsafe extern "C" fn vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
 ///
 /// (format, color_space): VkFormat numeric code +
 /// VK_COLOR_SPACE_SRGB_NONLINEAR_KHR (0).
+///
+/// Arc 91: sourced from `ash::vk::Format` constants so the
+/// numeric literals stay in sync with the spec without
+/// hand-checking.  The single colour-space slot is always 0
+/// (`VK_COLOR_SPACE_SRGB_NONLINEAR_KHR`), the universally-
+/// available default.
 const ATRIUM_SURFACE_FORMATS: &[(u32, u32)] = &[
-    (37, 0),  // R8G8B8A8_UNORM
-    (43, 0),  // R8G8B8A8_SRGB
-    (44, 0),  // B8G8R8A8_UNORM
-    (50, 0),  // B8G8R8A8_SRGB
+    (ash::vk::Format::R8G8B8A8_UNORM.as_raw() as u32, 0),
+    (ash::vk::Format::R8G8B8A8_SRGB.as_raw()  as u32, 0),
+    (ash::vk::Format::B8G8R8A8_UNORM.as_raw() as u32, 0),
+    (ash::vk::Format::B8G8R8A8_SRGB.as_raw()  as u32, 0),
 ];
 
 /// `vkGetPhysicalDeviceSurfaceFormatsKHR` — return our four
