@@ -1578,6 +1578,24 @@ mod tests {
         // And negative side: c=-1 → 0, c=-4 → 3, c=-5 → 3.
         assert_eq!(apply_wrap(-1, n, WrapMode::Mirror), 0);
         assert_eq!(apply_wrap(-4, n, WrapMode::Mirror), 3);
+
+        // Arc 120: pin Mirror's behaviour multiple periods back.
+        // The implementation does ((c % p) + p) % p with p=2n,
+        // which only "works" because Rust's % is truncated --
+        // a future Euclidean-rewrite needs to keep the right
+        // sign convention.  Spot-check one and two full periods
+        // back: c=-8 and c=-16 must alias to c=0 (period-2n).
+        assert_eq!(apply_wrap(-8,  n, WrapMode::Mirror), 0,
+            "c=-period must alias to c=0");
+        assert_eq!(apply_wrap(-9,  n, WrapMode::Mirror), 0,
+            "c=-period-1 must alias to c=-1 -> 0");
+        assert_eq!(apply_wrap(-16, n, WrapMode::Mirror), 0,
+            "c=-2*period must still alias to c=0");
+
+        // Repeat at multi-period extremes -- same risk.
+        assert_eq!(apply_wrap(-8,  n, WrapMode::Repeat), 0);
+        assert_eq!(apply_wrap(-9,  n, WrapMode::Repeat), 3);
+        assert_eq!(apply_wrap(-12, n, WrapMode::Repeat), 0);
     }
 
     #[test]
