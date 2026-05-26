@@ -7823,7 +7823,13 @@ pub unsafe extern "C" fn vkCreateSwapchainKHR(
     // the existing vkCreateImage machinery.
     let mut images = Vec::with_capacity(n as usize);
     let mut img_info = [0u8; 88];
-    img_info[ 0.. 4].copy_from_slice(&14u32.to_le_bytes());
+    // VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO = 14 (Arc 126).
+    // Pin against ash so a future Vulkan header re-numbering
+    // surfaces as a test failure instead of vkCreateImage
+    // silently rejecting the spoofed image-create-info as
+    // "wrong sType".
+    let s_type = ash::vk::StructureType::IMAGE_CREATE_INFO.as_raw() as u32;
+    img_info[ 0.. 4].copy_from_slice(&s_type.to_le_bytes());
     img_info[24..28].copy_from_slice(&format.to_le_bytes());
     img_info[28..32].copy_from_slice(&width.to_le_bytes());
     img_info[32..36].copy_from_slice(&height.to_le_bytes());
@@ -9398,6 +9404,13 @@ mod tests {
         // If this drifts we'd be reading sType/pNext-low bits as
         // flags and mis-signaling fences out of the gate.
         assert_eq!(offset_of!(vk::FenceCreateInfo, flags), 16);
+
+        // Arc 126: pin VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO = 14.
+        // vkCreateSwapchainKHR synthesises a VkImageCreateInfo on
+        // the fly and writes its sType field by raw u32; a header
+        // re-numbering would silently make every swapchain image
+        // fail creation as "wrong sType".
+        assert_eq!(vk::StructureType::IMAGE_CREATE_INFO.as_raw(), 14);
 
         // Arc 113: the five remaining Vulkan 1.1 *2 query output
         // wrappers. Each writes its inner block at offset 16 of
