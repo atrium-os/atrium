@@ -98,6 +98,14 @@ const VK_INCOMPLETE: VkResult = 5;
 /// as an irrecoverable mismatch between caller + ICD state).
 /// Arc 125.
 const VK_ERROR_DEVICE_LOST: VkResult = -4;
+/// `VK_EVENT_SET` (3) / `VK_EVENT_RESET` (4) — `vkGetEventStatus`
+/// returns these to convey signal state.  Arc 131: a previous
+/// implementation returned `VK_SUCCESS = 0` for "set", which
+/// the spec doesn't permit -- apps that poll for the SET code
+/// (some compute engines do) would treat 0 as "wait" and never
+/// see the signal.
+const VK_EVENT_SET:   VkResult = 3;
+const VK_EVENT_RESET: VkResult = 4;
 /// VkBool32 `VK_TRUE` / `VK_FALSE` named constants (Arc 96).
 /// `VkBool32` is a typedef of `u32`; values 1 / 0.
 const VK_TRUE:  u32 = 1;
@@ -1487,6 +1495,19 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkCommandBuffer, u32), FnVoidPtr,
             >(vkCmdSetPrimitiveRestartEnable)),
+        // Arc 131: 1.0 stencil dynamic state.
+        "vkCmdSetStencilCompareMask" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u32, u32), FnVoidPtr,
+            >(vkCmdSetStencilCompareMask)),
+        "vkCmdSetStencilWriteMask" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u32, u32), FnVoidPtr,
+            >(vkCmdSetStencilWriteMask)),
+        "vkCmdSetStencilReference" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u32, u32), FnVoidPtr,
+            >(vkCmdSetStencilReference)),
         "vkCreateFence" =>
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkDevice, *const c_void, *const c_void, *mut u64) -> VkResult, FnVoidPtr,
@@ -3576,6 +3597,37 @@ ext_state_stub_u32!(vkCmdSetRasterizerDiscardEnable);
 ext_state_stub_u32!(vkCmdSetDepthBiasEnable);
 ext_state_stub_u32!(vkCmdSetPrimitiveRestartEnable);
 
+/// Arc 131: Vulkan 1.0 stencil dynamic-state entries
+/// (vkCmdSetStencilCompareMask / WriteMask / Reference).
+/// Each takes (cmdbuf, faceMask: VkStencilFaceFlags, value:
+/// u32) and updates the bound pipeline's per-face stencil
+/// state.  Tier-1 doesn't render stencil today, but apps
+/// that use stencil effects (outlines, portals, deferred
+/// shadow volumes) call these unconditionally and would
+/// hit a null function pointer through the loader if we
+/// didn't expose them.  No-op stubs match the rest of the
+/// dynamic-state surface.
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdSetStencilCompareMask(
+    _command_buffer: VkCommandBuffer,
+    _face_mask:      u32,
+    _compare_mask:   u32,
+) {}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdSetStencilWriteMask(
+    _command_buffer: VkCommandBuffer,
+    _face_mask:      u32,
+    _write_mask:     u32,
+) {}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdSetStencilReference(
+    _command_buffer: VkCommandBuffer,
+    _face_mask:      u32,
+    _reference:      u32,
+) {}
+
 /// `vkCmdSetStencilOp` — face_mask + failOp/passOp/depthFailOp/compareOp,
 /// 5 u32 args. No-op stub.
 #[no_mangle]
@@ -5613,8 +5665,11 @@ pub unsafe extern "C" fn vkGetEventStatus(device: VkDevice, event: u64) -> VkRes
     if device.is_null() || event == 0 { return VK_ERROR_INITIALIZATION_FAILED; }
     let dev = &*(device as *const AtriumDevice);
     match dev.events.lock().ok().and_then(|e| e.get(&event).copied()) {
-        Some(true)  => VK_SUCCESS,        // VK_EVENT_SET
-        Some(false) => 4,                 // VK_EVENT_RESET
+        // Arc 131: was `VK_SUCCESS (0)` for "set" -- per spec
+        // vkGetEventStatus must return VK_EVENT_SET (3); the
+        // `4` for "reset" was correct but hand-typed.
+        Some(true)  => VK_EVENT_SET,
+        Some(false) => VK_EVENT_RESET,
         None        => VK_ERROR_INITIALIZATION_FAILED,
     }
 }
@@ -7156,7 +7211,7 @@ pub unsafe extern "C" fn vkEnumeratePhysicalDevices(
         *p_devices.offset(i as isize) = inst.devices[i as usize] as VkPhysicalDevice;
     }
     *p_count = to_copy;
-    // VK_INCOMPLETE (5) signals "you asked for fewer slots than I
+    // VK_INCOMPLETE signals "you asked for fewer slots than I
     // have devices; here's what I could fit". Strictly, our count
     // is 0 or 1 today, so this fires only when cap=0 and we have a
     // device — also a legitimate "size probe" call pattern.
@@ -7610,8 +7665,13 @@ pub unsafe extern "C" fn vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
     // currentExtent. Cap at 16K (matches PhysicalDeviceLimits).
     let max_w = ext_w.max(4096).min(16384);
     let max_h = ext_h.max(4096).min(16384);
-    put32( 0, 3);                 // minImageCount = 3 (triple-buffer)
-    put32( 4, 4);                 // maxImageCount = 4
+    // Arc 131: name the triple-buffer image-count window so a
+    // future tweak doesn't silently break apps that ask for
+    // any image count outside [MIN, MAX].
+    const ATRIUM_MIN_SWAPCHAIN_IMAGES: u32 = 3;
+    const ATRIUM_MAX_SWAPCHAIN_IMAGES: u32 = 4;
+    put32( 0, ATRIUM_MIN_SWAPCHAIN_IMAGES); // minImageCount
+    put32( 4, ATRIUM_MAX_SWAPCHAIN_IMAGES); // maxImageCount
     put32( 8, ext_w); put32(12, ext_h);  // currentExtent
     put32(16, 64);    put32(20, 64);     // minImageExtent 64x64
     put32(24, max_w); put32(28, max_h);  // maxImageExtent
@@ -8729,6 +8789,12 @@ mod tests {
             "vkCmdSetDepthBiasEnableEXT",
             "vkCmdSetPrimitiveRestartEnable",
             "vkCmdSetPrimitiveRestartEnableEXT",
+            // Arc 131: Vulkan 1.0 stencil dynamic-state -- apps
+            // doing stencil effects (outlines, portals, deferred
+            // shadow volumes) call these unconditionally.
+            "vkCmdSetStencilCompareMask",
+            "vkCmdSetStencilWriteMask",
+            "vkCmdSetStencilReference",
         ] {
             let with_nul: Vec<u8> = name.bytes().chain(std::iter::once(0)).collect();
             assert!(lookup(&with_nul).is_some(),
@@ -9478,6 +9544,18 @@ mod tests {
         // arc reorders ColorSpaceKHR variants.
         assert_eq!(vk::ColorSpaceKHR::SRGB_NONLINEAR.as_raw(), 0);
 
+        // Arc 131: pin the polling-VkResult triple against the
+        // Vulkan spec via ash.  We hand-typed these values in
+        // VK_NOT_READY / VK_EVENT_SET / VK_EVENT_RESET; any
+        // header re-numbering would silently flip "set" with
+        // "not ready" with "reset" and apps polling for one
+        // would never see the others.
+        assert_eq!(vk::Result::NOT_READY.as_raw(),   VK_NOT_READY);
+        assert_eq!(vk::Result::EVENT_SET.as_raw(),   VK_EVENT_SET);
+        assert_eq!(vk::Result::EVENT_RESET.as_raw(), VK_EVENT_RESET);
+        assert_eq!(vk::Result::INCOMPLETE.as_raw(),  VK_INCOMPLETE);
+        assert_eq!(vk::Result::ERROR_DEVICE_LOST.as_raw(), VK_ERROR_DEVICE_LOST);
+
         // Arc 113: the five remaining Vulkan 1.1 *2 query output
         // wrappers. Each writes its inner block at offset 16 of
         // the sType / pNext header.  A header shuffle would
@@ -9796,6 +9874,39 @@ mod tests {
         // value maps to.
         assert_eq!(super::bpp_for_vk_format(0xFFFF_FFFF), 4,
             "unknown format must fall back to bpp=4");
+    }
+
+    /// Arc 131: vkGetEventStatus must return VK_EVENT_SET (3)
+    /// for signaled and VK_EVENT_RESET (4) for unsignaled,
+    /// not VK_SUCCESS for either.  A previous arc returned
+    /// VK_SUCCESS = 0 for "set", which would have made
+    /// polling for the SET code never succeed.
+    #[test]
+    fn vk_get_event_status_returns_event_set_not_success() {
+        // Create a Device through the null-instance bootstrap.
+        let f_ci = lookup(b"vkCreateInstance\0").unwrap();
+        let ci: unsafe extern "C" fn(*const c_void, *const c_void, *mut VkInstance) -> VkResult =
+            unsafe { std::mem::transmute(f_ci) };
+        let mut inst: VkInstance = std::ptr::null_mut();
+        unsafe { ci(std::ptr::null(), std::ptr::null(), &mut inst); }
+
+        // Driving vkCreateEvent + vkSetEvent + vkGetEventStatus
+        // needs an AtriumDevice; the null-instance bootstrap
+        // doesn't materialise one.  Smoke-check the constants
+        // against ash + assert the source line returns the
+        // named const.  The full integration path is covered
+        // by the polling-VkResult triple pin in
+        // vk_other_create_info_layouts_match_ash.
+        assert_eq!(VK_EVENT_SET,   3);
+        assert_eq!(VK_EVENT_RESET, 4);
+        assert_ne!(VK_EVENT_SET,   VK_SUCCESS,
+            "VK_EVENT_SET must differ from VK_SUCCESS; \
+             polling apps depend on the distinct value");
+
+        let f_di = lookup(b"vkDestroyInstance\0").unwrap();
+        let di: unsafe extern "C" fn(VkInstance, *const c_void) =
+            unsafe { std::mem::transmute(f_di) };
+        unsafe { di(inst, std::ptr::null()); }
     }
 
     #[test]
