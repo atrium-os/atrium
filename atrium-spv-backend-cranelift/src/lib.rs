@@ -1897,7 +1897,7 @@ impl FnTranslator {
                 let pointer_type = builder.func.dfg
                     .value_type(self.params[0]);
                 let img_table = self.params[0];
-                let desc_off: i32 = 64 + (binding as i32) * 8;
+                let desc_off: i32 = 72 + (binding as i32) * 8;
                 let desc_ptr = builder.ins().load(
                     pointer_type, MemFlags::new(), img_table, desc_off);
                 // ImageDesc fields: width @8, height @12, depth @24.
@@ -1981,7 +1981,7 @@ impl FnTranslator {
                 let pointer_type = builder.func.dfg
                     .value_type(self.params[0]);
                 let img_table = self.params[0];
-                let desc_off: i32 = 64 + (binding as i32) * 8;
+                let desc_off: i32 = 72 + (binding as i32) * 8;
                 let desc_ptr = builder.ins().load(
                     pointer_type, MemFlags::new(), img_table, desc_off);
                 // data ptr @ #0
@@ -2071,7 +2071,7 @@ impl FnTranslator {
                     };
                     block_base + within
                 };
-                let desc_off: i32 = 64 + (binding as i32) * 8;
+                let desc_off: i32 = 72 + (binding as i32) * 8;
                 let fn_ptr = builder.ins().load(
                     pointer_type, MemFlags::new(), img_table, helper_off);
                 let desc_ptr = builder.ins().load(

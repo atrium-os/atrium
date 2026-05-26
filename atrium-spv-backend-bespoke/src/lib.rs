@@ -3616,7 +3616,7 @@ fn emit_function(
                 } else { None };
                 // ImageDesc* lives at [X19, #32 + binding*8]
                 // (the helper header is 32 B: 2D r/w + 3D r/w).
-                let desc_off: u16 = 64 + (binding as u16) * 8;
+                let desc_off: u16 = 72 + (binding as u16) * 8;
                 let dst_w = int_pool.alloc(result.id)?;
                 let dst_x = asm::Xreg(dst_w.0);
                 let x9 = asm::Xreg(9);
@@ -3664,7 +3664,7 @@ fn emit_function(
                     .ok_or_else(|| BackendError::Internal(format!(
                         "ImageQuerySize image {:?} not an ImageHandle",
                         image.id)))?;
-                let desc_off: u16 = 64 + (binding as u16) * 8;
+                let desc_off: u16 = 72 + (binding as u16) * 8;
                 let x9 = asm::Xreg(9);
                 a.emit(asm::ldr_x_offset(x9, asm::Xreg(19), desc_off));
                 // ImageDesc field offsets: width @8, height @12,
@@ -3732,7 +3732,7 @@ fn emit_function(
             //                  [X19, #40] (write_2d_lod)
             //                  [X19, #48] (read_3d_lod)
             //                  [X19, #56] (write_3d_lod)
-            //   ImageDesc*   at [X19, #64 + binding*8]
+            //   ImageDesc*   at [X19, #72 + binding*8]
             // 2D helper signature: (ImageDesc*, x, y, rgba*)
             //   -> X0=desc, W1=x, W2=y, X3=rgba stack slot.
             // 3D helper signature: (ImageDesc*, x, y, z, rgba*)
@@ -3877,7 +3877,7 @@ fn emit_function(
                     };
                     block_base + within
                 };
-                let desc_off: u16 = 64 + (binding as u16) * 8;
+                let desc_off: u16 = 72 + (binding as u16) * 8;
                 // rgba pointer register: X3 (2D), X4 (3D or
                 // 2D Lod), X5 (3D Lod).  Each extra arg in
                 // the helper signature shifts the rgba slot
