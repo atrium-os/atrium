@@ -87,6 +87,12 @@ const VK_NOT_READY: VkResult = 1;
 /// combination isn't representable on this implementation.
 /// Arc 95.
 const VK_ERROR_FORMAT_NOT_SUPPORTED: VkResult = -11;
+/// `VK_INCOMPLETE` — returned by enumeration entry points
+/// (`vkEnumerateInstance*ExtensionProperties`,
+/// `vkGetPhysicalDeviceSurfaceFormatsKHR`, etc.) when the
+/// caller's array capacity is smaller than the count we
+/// would otherwise report.  Arc 124.
+const VK_INCOMPLETE: VkResult = 5;
 /// VkBool32 `VK_TRUE` / `VK_FALSE` named constants (Arc 96).
 /// `VkBool32` is a typedef of `u32`; values 1 / 0.
 const VK_TRUE:  u32 = 1;
@@ -7146,7 +7152,7 @@ pub unsafe extern "C" fn vkEnumeratePhysicalDevices(
     // have devices; here's what I could fit". Strictly, our count
     // is 0 or 1 today, so this fires only when cap=0 and we have a
     // device — also a legitimate "size probe" call pattern.
-    if to_copy < n { 5 /* VK_INCOMPLETE */ } else { VK_SUCCESS }
+    if to_copy < n { VK_INCOMPLETE } else { VK_SUCCESS }
 }
 
 /// `vkEnumerateInstanceVersion` — loader's first probe to learn what
@@ -7224,7 +7230,7 @@ pub unsafe extern "C" fn vkEnumerateInstanceExtensionProperties(
         *p_properties.offset(i as isize) = props;
     }
     *p_property_count = to_copy;
-    if to_copy < n { 5 /* VK_INCOMPLETE */ } else { VK_SUCCESS }
+    if to_copy < n { VK_INCOMPLETE } else { VK_SUCCESS }
 }
 
 /// Device-level extensions advertised by atrium-vk-icd.
@@ -7288,7 +7294,7 @@ pub unsafe extern "C" fn vkEnumerateDeviceExtensionProperties(
         *p_properties.offset(i as isize) = props;
     }
     *p_property_count = to_copy;
-    if to_copy < n { 5 /* VK_INCOMPLETE */ } else { VK_SUCCESS }
+    if to_copy < n { VK_INCOMPLETE } else { VK_SUCCESS }
 }
 
 /// `vkEnumerateInstanceLayerProperties` — returns ICD-side instance
@@ -7667,7 +7673,7 @@ pub unsafe extern "C" fn vkGetPhysicalDeviceSurfaceFormatsKHR(
         put32(off + 4, cs);
     }
     *p_surface_format_count = to_copy;
-    if to_copy < n { 5 /* VK_INCOMPLETE */ } else { VK_SUCCESS }
+    if to_copy < n { VK_INCOMPLETE } else { VK_SUCCESS }
 }
 
 /// `vkGetPhysicalDeviceSurfaceCapabilities2KHR` — VK_KHR_
@@ -7747,7 +7753,7 @@ pub unsafe extern "C" fn vkGetPhysicalDeviceSurfaceFormats2KHR(
         let _ = walk_p_next_chain(slot_p_next);
     }
     *p_surface_format_count = to_copy;
-    if to_copy < n { 5 /* VK_INCOMPLETE */ } else { VK_SUCCESS }
+    if to_copy < n { VK_INCOMPLETE } else { VK_SUCCESS }
 }
 
 /// `vkGetPhysicalDeviceSurfacePresentModesKHR` — FIFO only (the
@@ -7893,7 +7899,7 @@ pub unsafe extern "C" fn vkGetSwapchainImagesKHR(
         *p_swapchain_images.offset(i as isize) = images[i];
     }
     *p_swapchain_image_count = to_copy as u32;
-    if to_copy < images.len() { 5 /* VK_INCOMPLETE */ } else { VK_SUCCESS }
+    if to_copy < images.len() { VK_INCOMPLETE } else { VK_SUCCESS }
 }
 
 /// `vkAcquireNextImageKHR` — round-robin pull from the ring.
