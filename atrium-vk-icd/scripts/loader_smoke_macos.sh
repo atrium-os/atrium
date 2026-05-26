@@ -55,6 +55,18 @@
 #                     path works for real third-party SPIR-V
 #                     producers, not just our synthetic tests.
 #
+#   8+. Extra slang shaders against the same daemon -- each
+#                     rung compiles a different shader and runs
+#                     it with a tailored (seed, expect) pair.
+#                     Driven by the EXTRA_SHADERS list below.
+#                     Current entries:
+#                       rmw         -- data[0] = data[0] + 1
+#                                      (OpLoad + OpIAdd + OpStore)
+#                       atomic_add  -- InterlockedAdd(data[0], 1)
+#                                      (OpAtomicIAdd; bespoke
+#                                      backend lowers to ARMv8.1
+#                                      LSE ldaddal)
+#
 # Pre-reqs (one-time):
 #   * brew install vulkan-headers vulkan-loader vulkan-tools
 #   * cargo build -p atrium-vk-icd          (produces .dylib + examples)
@@ -75,8 +87,19 @@ ROUNDTRIP="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_compute_roundtr
 DAEMON="$REPO_ROOT/aqueduct-gpu-host/target/debug/aqueduct-gpu-host"
 COMPILE="$REPO_ROOT/atrium-spv-compile/target/debug/atrium-spv-compile"
 SLANGC="$REPO_ROOT/external/slang-bin/bin/slangc"
-SLANG_SRC="$REPO_ROOT/atrium-vk-icd/examples/shaders/write_42.slang"
-SLANG_SPV="$REPO_ROOT/atrium-vk-icd/examples/shaders/write_42.comp.spv"
+SHADER_DIR="$REPO_ROOT/atrium-vk-icd/examples/shaders"
+SLANG_SRC="$SHADER_DIR/write_42.slang"
+SLANG_SPV="$SHADER_DIR/write_42.comp.spv"
+# Extra slang shaders (Arc 140+).  Each gets a smoke rung
+# under the shared Rung-7 daemon: shader-name, seed, expect.
+# All exercise the SSBO ssbo[0] path the existing
+# loader_compute_roundtrip example is built around, but each
+# stresses a distinct SPIR-V opcode family in the frontend +
+# bespoke backend.
+EXTRA_SHADERS="
+rmw:100:101
+atomic_add:200:201
+"
 SOCKET="/tmp/atrium-vk-icd-loader-smoke.sock"
 CACHE_ROOT="/tmp/atrium-vk-icd-loader-cache"
 MANIFEST="$(mktemp -t atrium_icd.XXXXXX).json"
@@ -343,10 +366,42 @@ if [ -x "$ROUNDTRIP" ] && [ -x "$SLANGC" ] && [ -f "$SLANG_SRC" ]; then
         echo "FAIL: slang round-trip did not return 0" >&2
         exit 1
     fi
-    # Reap Rung 7's daemon explicitly.  The cleanup trap would
-    # also do this, but the trap depends on the trap actually
-    # firing (it doesn't when the parent SIGKILLs us, e.g. via
-    # `timeout` or a stuck pipe).
+
+    # ── Rungs 8+: extra slang shaders against the same daemon.
+    # Each entry in EXTRA_SHADERS is "name:seed:expect".  The
+    # .slang source must live at $SHADER_DIR/<name>.slang; we
+    # compile it inline (cheap; cache hits after the first run).
+    rung_n=8
+    for entry in $EXTRA_SHADERS; do
+        name=$(echo "$entry" | cut -d: -f1)
+        seed=$(echo "$entry" | cut -d: -f2)
+        expect=$(echo "$entry" | cut -d: -f3)
+        src="$SHADER_DIR/$name.slang"
+        spv="$SHADER_DIR/$name.comp.spv"
+        [ -f "$src" ] || { echo "missing $src" >&2; exit 1; }
+        "$SLANGC" "$src" -target spirv -entry main -stage compute \
+            -o "$spv" 2>/tmp/slangc.log \
+            || { echo "FAIL: slangc $name"; cat /tmp/slangc.log; exit 1; }
+        echo
+        echo "=== Rung $rung_n: $name.slang (seed=$seed, expect=$expect) ==="
+        if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+            VK_DRIVER_FILES="$MANIFEST" \
+            ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+            ATRIUM_VK_SMOKE_SHADER=slang \
+            ATRIUM_VK_SMOKE_SHADER_PATH="$spv" \
+            ATRIUM_VK_SMOKE_SEED="$seed" \
+            ATRIUM_VK_SMOKE_EXPECT="$expect" \
+            "$ROUNDTRIP" 2>&1 | tail -2; then
+            echo "FAIL: $name round-trip" >&2
+            exit 1
+        fi
+        rung_n=$((rung_n + 1))
+    done
+
+    # Reap the shared Rung-7-onwards daemon explicitly.  The
+    # cleanup trap would also do this, but the trap depends on
+    # the trap actually firing (it doesn't when the parent
+    # SIGKILLs us, e.g. via `timeout` or a stuck pipe).
     kill_daemon "$DAEMON_PID"
     DAEMON_PID=""
 fi
