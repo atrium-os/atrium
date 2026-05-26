@@ -25,10 +25,21 @@
 #                     Properties / FormatProperties / QueueFamily
 #                     Properties through to completion.
 #
+#   4. Tier-2 rung -- daemon with --tier2 enabled + atrium-spv-
+#                     compile reachable.  Runs the loader_smoke
+#                     example which uploads a trivial compute
+#                     SPIR-V via vkCreateShaderModule.  The daemon's
+#                     Tier2Registry routes it through atrium-spv-
+#                     compile and we verify an `.afblob` + `.pcmap`
+#                     land in the cache directory.  This is the
+#                     end-to-end SPV-pipeline smoke test.
+#
 # Pre-reqs (one-time):
 #   * brew install vulkan-headers vulkan-loader vulkan-tools
-#   * cargo build -p atrium-vk-icd          (produces .dylib)
+#   * cargo build -p atrium-vk-icd          (produces .dylib + example)
+#   * cargo build -p atrium-vk-icd --example loader_smoke
 #   * cargo build -p aqueduct-gpu-host      (produces daemon)
+#   * cargo build -p atrium-spv-compile     (produces compile binary)
 #
 # Usage:
 #   ./scripts/loader_smoke_macos.sh
@@ -37,8 +48,11 @@ set -eu
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 DYLIB="$REPO_ROOT/atrium-vk-icd/target/debug/libatrium_vk_icd.dylib"
+EXAMPLE="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_smoke"
 DAEMON="$REPO_ROOT/aqueduct-gpu-host/target/debug/aqueduct-gpu-host"
+COMPILE="$REPO_ROOT/atrium-spv-compile/target/debug/atrium-spv-compile"
 SOCKET="/tmp/atrium-vk-icd-loader-smoke.sock"
+CACHE_ROOT="/tmp/atrium-vk-icd-loader-cache"
 MANIFEST="$(mktemp -t atrium_icd.XXXXXX).json"
 
 if [ ! -f "$DYLIB" ]; then
@@ -113,5 +127,42 @@ DYLD_LIBRARY_PATH=/opt/homebrew/lib \
   vulkaninfo > /tmp/atrium-vulkaninfo.out 2>&1
 echo "vulkaninfo exit=$?  (output in /tmp/atrium-vulkaninfo.out, $(wc -l </tmp/atrium-vulkaninfo.out | tr -d ' ') lines)"
 
+kill "$DAEMON_PID" 2>/dev/null; wait 2>/dev/null
+DAEMON_PID=""
+
+# ── Rung 4: tier-2 (shader upload) ───────────────────────────────
+if [ ! -x "$EXAMPLE" ] || [ ! -x "$COMPILE" ]; then
+    echo
+    echo "SKIP Rung 4: tier-2 (need 'cargo build -p atrium-vk-icd --example loader_smoke' + 'cargo build -p atrium-spv-compile')"
+else
+    rm -rf "$CACHE_ROOT" "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend software \
+        --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    sleep 1
+    if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+        echo "daemon failed to start (tier-2 mode); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung 4: tier-2 daemon, vkCreateShaderModule upload ==="
+    DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+      VK_DRIVER_FILES="$MANIFEST" \
+      ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+      "$EXAMPLE" 2>&1 | grep -E "vk|trivial|done"
+    n_afblob=$(find "$CACHE_ROOT" -name '*.afblob' 2>/dev/null | wc -l | tr -d ' ')
+    n_pcmap=$(find "$CACHE_ROOT"  -name '*.pcmap'  2>/dev/null | wc -l | tr -d ' ')
+    echo "cache contents: $n_afblob .afblob, $n_pcmap .pcmap"
+    if [ "$n_afblob" != "1" ] || [ "$n_pcmap" != "1" ]; then
+        echo "FAIL: tier-2 did not produce the expected cache artifacts" >&2
+        exit 1
+    fi
+fi
+
 echo
-echo "OK: loader smoke clean through all 3 rungs."
+echo "OK: loader smoke clean through all rungs."
