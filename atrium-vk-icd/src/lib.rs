@@ -9681,6 +9681,16 @@ mod tests {
             (F::R32G32B32_SFLOAT,    12),
             (F::R32G32B32A32_SFLOAT, 16),  // was 8 pre-fix
             (F::R32G32B32A32_UINT,   16),
+            // Arc 118: 3-byte and 6-byte categories that Arc 73
+            // covered in the match arm but not in the pin test.
+            // These are rare on desktop GPUs (HW usually pads to
+            // 4 / 8), but they're valid VkFormat values and any
+            // app that probes them must get a consistent bpp.
+            (F::R8G8B8_UNORM,         3),
+            (F::B8G8R8_UNORM,         3),
+            (F::R8G8B8_SRGB,          3),
+            (F::R16G16B16_UNORM,      6),
+            (F::R16G16B16_SFLOAT,     6),
         ];
         for &(fmt, want) in cases {
             let got = super::bpp_for_vk_format(fmt.as_raw() as u32);
@@ -9688,6 +9698,14 @@ mod tests {
                 "bpp({:?}={}) want {want}, got {got}",
                 fmt, fmt.as_raw());
         }
+        // Arc 118: fallback contract.  Unknown formats return 4
+        // (best-effort RGBA8 sizing) rather than 0 -- the latter
+        // would make vkGetImageMemoryRequirements report a zero
+        // allocation and silently produce zero-byte images.
+        // Use a deliberately-bogus raw u32 that no real VkFormat
+        // value maps to.
+        assert_eq!(super::bpp_for_vk_format(0xFFFF_FFFF), 4,
+            "unknown format must fall back to bpp=4");
     }
 
     #[test]
