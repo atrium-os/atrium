@@ -2007,6 +2007,81 @@ mod tests {
         assert_eq!(p, [2.0, -0.5, 0.0, 1.0]);
     }
 
+    /// Arc 122: pin the wire-format -> enum mapping for
+    /// `TexFormat`, `StorageFormat`, and `WrapMode`.  Each
+    /// enum has an explicit `#[repr(u32)]` discriminant and
+    /// each `*_from_u32` is a hand-written match arm; without
+    /// a pin test, dropping or reordering a variant would
+    /// silently re-route sampling to the wrong format (e.g.
+    /// shifting Rg16Float = 10 to a different value would
+    /// make every blob compiled with the old discriminant
+    /// sample as the new format -- a particularly painful
+    /// failure mode because old + new code superficially
+    /// works while shaders quietly read garbage).
+    #[test]
+    fn wire_format_round_trips_through_from_u32() {
+        // TexFormat: explicit discriminant matches the wire-
+        // value branch in format_from_u32.
+        let cases: &[(u32, TexFormat)] = &[
+            (0,  TexFormat::Rgba8Unorm),
+            (1,  TexFormat::Bgra8Unorm),
+            (2,  TexFormat::R8Unorm),
+            (3,  TexFormat::R32Float),
+            (4,  TexFormat::Rgba32Float),
+            (5,  TexFormat::Rg8Unorm),
+            (6,  TexFormat::Rgba16Float),
+            (7,  TexFormat::Rgba8Srgb),
+            (8,  TexFormat::Bgra8Srgb),
+            (9,  TexFormat::R16Float),
+            (10, TexFormat::Rg16Float),
+            (11, TexFormat::R16Unorm),
+        ];
+        for &(v, want) in cases {
+            assert_eq!(format_from_u32(v), want,
+                "TexFormat from_u32({v}) want {want:?}");
+            assert_eq!(want as u32, v,
+                "TexFormat::{want:?} as u32 must equal {v}");
+        }
+        // Fallback: an unknown wire value must NOT panic --
+        // it falls through to Rgba8Unorm (the safe default).
+        assert_eq!(format_from_u32(99),  TexFormat::Rgba8Unorm);
+        assert_eq!(format_from_u32(!0u32), TexFormat::Rgba8Unorm);
+
+        // StorageFormat: same round-trip.
+        let sf: &[(u32, StorageFormat)] = &[
+            (0, StorageFormat::Rgba8Unorm),
+            (1, StorageFormat::R32Float),
+            (2, StorageFormat::Rgba32Float),
+            (3, StorageFormat::R32Uint),
+            (4, StorageFormat::Rgba16Float),
+        ];
+        for &(v, want) in sf {
+            assert_eq!(storage_format_from_u32(v), want,
+                "StorageFormat from_u32({v}) want {want:?}");
+            assert_eq!(want as u32, v);
+        }
+        assert_eq!(storage_format_from_u32(99), StorageFormat::Rgba8Unorm);
+
+        // WrapMode: 0 = Clamp, 1 = Repeat, 2 = Mirror.  Critical
+        // because a re-route between Repeat and Mirror would
+        // create visible discontinuities at tile boundaries on
+        // every wrapping sampler.
+        assert_eq!(wrap_from_u32(0), WrapMode::ClampToEdge);
+        assert_eq!(wrap_from_u32(1), WrapMode::Repeat);
+        assert_eq!(wrap_from_u32(2), WrapMode::Mirror);
+        assert_eq!(wrap_from_u32(99), WrapMode::ClampToEdge,
+            "unknown wrap mode falls back to ClampToEdge");
+        assert_eq!(WrapMode::ClampToEdge as u32, 0);
+        assert_eq!(WrapMode::Repeat      as u32, 1);
+        assert_eq!(WrapMode::Mirror      as u32, 2);
+
+        // FilterMode: just two values; pin them for symmetry.
+        assert_eq!(filter_from_u32(0), FilterMode::Nearest);
+        assert_eq!(filter_from_u32(1), FilterMode::Linear);
+        assert_eq!(filter_from_u32(99), FilterMode::Nearest,
+            "unknown filter falls back to Nearest");
+    }
+
     /// Arc 121: pin the sRGB -> linear curve at its four
     /// canonical sample points + the linear/power boundary.
     /// The curve is hand-coded as
