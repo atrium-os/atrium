@@ -112,6 +112,27 @@
 #                                      but a different idiom
 #                                      worth exercising for
 #                                      coverage)
+#                       bit_count   -- countbits(x)
+#                                      (OpBitCount core opcode,
+#                                      distinct from the
+#                                      GLSL.std.450 ext-inst
+#                                      family that max_const +
+#                                      float_sqrt cover)
+#                       subgroup_sum -- WaveActiveSum(x) + 1
+#                                      (OpGroupNonUniformIAdd
+#                                      at Atrium's subgroupSize
+#                                      = 1; lowers trivially
+#                                      since the "subgroup" is
+#                                      one lane.  Distinct from
+#                                      atomic_add's OpAtomicIAdd
+#                                      despite the surface
+#                                      similarity)
+#
+# Also tried: groupshared_var.slang -- Slang's optimizer folds
+# the `groupshared` cache away when used by a single invocation
+# (the [numthreads(1,1,1)] case), so the shader is observably
+# equivalent to a plain SSBO RMW.  Real workgroup-storage
+# coverage needs a multi-invocation dispatch -- separate arc.
 #
 # Pre-reqs (one-time):
 #   * brew install vulkan-headers vulkan-loader vulkan-tools
@@ -168,6 +189,8 @@ sum_loop:5:15
 max_const:50:100
 float_sqrt:100:10
 ternary:7:1
+bit_count:0x12345678:13
+subgroup_sum:42:43
 "
 # loop_mul un-parked Arc 144: spirv-opt --ssa-rewrite (run by
 # the daemon when --spirv-opt-binary is set) promotes Slang's
