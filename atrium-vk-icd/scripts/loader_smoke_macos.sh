@@ -85,6 +85,18 @@
 #                                      rewrite on slangc's
 #                                      OpVariable Function output
 #                                      first, Arc 144)
+#                       branch      -- if (x>100) v=x-100; else v=0
+#                                      (OpPhi at selection-merge,
+#                                      distinct from loop_mul's
+#                                      OpPhi-at-loop-header path)
+#                       sum_loop    -- s=0; for(i=1..=n) s+=i
+#                                      (two loop-carried function-
+#                                      locals, both promoted by
+#                                      spirv-opt to OpPhi)
+#                       max_const   -- max(x, 100)
+#                                      (GLSL.std.450 UMax;
+#                                      first loader-mediated
+#                                      ext-inst rung)
 #
 # Pre-reqs (one-time):
 #   * brew install vulkan-headers vulkan-loader vulkan-tools
@@ -136,6 +148,9 @@ atomic_add:200:201
 bit_chain:1:495
 rotate:0x12345678:0x81234567
 loop_mul:1:32
+branch:200:100
+sum_loop:5:15
+max_const:50:100
 "
 # loop_mul un-parked Arc 144: spirv-opt --ssa-rewrite (run by
 # the daemon when --spirv-opt-binary is set) promotes Slang's
