@@ -300,6 +300,12 @@ else
         echo
         echo "SKIP Rung 6: need 'cargo build -p atrium-vk-icd --example loader_compute_roundtrip'"
     fi
+    # Reap the Rung 6 daemon before Rung 7 reassigns DAEMON_PID.
+    # Without this it would leak as an orphan (init reparents it)
+    # and the cleanup trap, which only kills the final DAEMON_PID,
+    # wouldn't catch it.
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
 fi
 
 if [ -x "$ROUNDTRIP" ] && [ -x "$SLANGC" ] && [ -f "$SLANG_SRC" ]; then
@@ -337,6 +343,12 @@ if [ -x "$ROUNDTRIP" ] && [ -x "$SLANGC" ] && [ -f "$SLANG_SRC" ]; then
         echo "FAIL: slang round-trip did not return 0" >&2
         exit 1
     fi
+    # Reap Rung 7's daemon explicitly.  The cleanup trap would
+    # also do this, but the trap depends on the trap actually
+    # firing (it doesn't when the parent SIGKILLs us, e.g. via
+    # `timeout` or a stuck pipe).
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
 fi
 
 echo

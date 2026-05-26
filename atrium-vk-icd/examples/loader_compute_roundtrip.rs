@@ -131,7 +131,38 @@ unsafe fn find_memory_type(
     panic!("no compatible memory type for filter={type_filter:#b} props={want:?}");
 }
 
+/// Parse a u32 from a hex (`0x...`) or decimal env-var value.
+fn parse_u32_env(name: &str, default: u32) -> u32 {
+    match std::env::var(name) {
+        Ok(s) => {
+            let s = s.trim();
+            let (radix, body) = if let Some(rest) = s.strip_prefix("0x")
+                .or_else(|| s.strip_prefix("0X"))
+            {
+                (16, rest)
+            } else { (10, s) };
+            u32::from_str_radix(body, radix).unwrap_or_else(|e| {
+                panic!("{name}={s:?} not a u32 ({e})")
+            })
+        }
+        Err(_) => default,
+    }
+}
+
 fn main() -> std::process::ExitCode {
+    // Env-driven config:
+    //   ATRIUM_VK_SMOKE_SHADER       -- "rspirv" (default) | "slang"
+    //   ATRIUM_VK_SMOKE_SHADER_PATH  -- when SHADER=slang, override
+    //                                   the default examples/shaders/
+    //                                   write_42.comp.spv path
+    //   ATRIUM_VK_SMOKE_SEED         -- u32 to seed the SSBO with
+    //                                   before dispatch (hex or
+    //                                   decimal).  Default 0xDEADBEEF.
+    //   ATRIUM_VK_SMOKE_EXPECT       -- u32 the SSBO must contain
+    //                                   after dispatch.  Default 42.
+    let seed_u32   = parse_u32_env("ATRIUM_VK_SMOKE_SEED",   0xDEAD_BEEF);
+    let expect_u32 = parse_u32_env("ATRIUM_VK_SMOKE_EXPECT", 42);
+
     let entry = unsafe {
         match ash::Entry::load() {
             Ok(e)  => { println!("ash::Entry::load                  -> OK"); e }
@@ -193,18 +224,19 @@ fn main() -> std::process::ExitCode {
     unsafe { device.bind_buffer_memory(buffer, mem, 0).expect("bind_buffer_memory"); }
     println!("vkCreate/Bind Buffer + Memory     -> OK (size={N})");
 
-    // Seed the buffer with 0xDEADBEEF so we can prove the shader's
-    // write overwrote it rather than the buffer happening to be
-    // zero-initialised.
+    // Seed the buffer with the configured value so we can prove
+    // the shader's write reached the client (for write-only
+    // shaders) or that the input pre-fill round-tripped through
+    // dispatch (for RMW shaders).
     let mapped = unsafe {
         device.map_memory(mem, 0, req.size, vk::MemoryMapFlags::empty())
             .expect("map_memory")
     };
     unsafe {
-        std::ptr::write_unaligned(mapped as *mut u32, 0xDEAD_BEEF);
+        std::ptr::write_unaligned(mapped as *mut u32, seed_u32);
     }
     unsafe { device.unmap_memory(mem); }
-    println!("seed buffer with 0xDEADBEEF       -> OK (vkUnmapMemory flushes host->daemon)");
+    println!("seed buffer with 0x{seed_u32:08x}       -> OK (vkUnmapMemory flushes host->daemon)");
 
     // ── Descriptor set layout / pool / set ────────────────────
     let dsl_binding = vk::DescriptorSetLayoutBinding::default()
@@ -258,8 +290,11 @@ fn main() -> std::process::ExitCode {
         .unwrap_or_else(|_| "rspirv".to_string());
     let spv: Vec<u8> = match shader_kind.as_str() {
         "slang" => {
-            let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("examples/shaders/write_42.comp.spv");
+            let path = match std::env::var("ATRIUM_VK_SMOKE_SHADER_PATH") {
+                Ok(p)  => std::path::PathBuf::from(p),
+                Err(_) => std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("examples/shaders/write_42.comp.spv"),
+            };
             match std::fs::read(&path) {
                 Ok(b)  => { println!("loaded slang-built SPIR-V from {}", path.display()); b }
                 Err(e) => {
@@ -349,8 +384,8 @@ fn main() -> std::process::ExitCode {
     let got = unsafe { std::ptr::read_unaligned(mapped as *const u32) };
     unsafe { device.unmap_memory(mem); }
 
-    println!("ssbo[0] after dispatch+invalidate -> 0x{got:08x} (want 0x0000_002a)");
-    let ok = got == 42;
+    println!("ssbo[0] after dispatch+invalidate -> 0x{got:08x} (want 0x{expect_u32:08x})");
+    let ok = got == expect_u32;
 
     // ── Cleanup ────────────────────────────────────────────────
     unsafe {
