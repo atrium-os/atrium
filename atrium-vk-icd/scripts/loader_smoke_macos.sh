@@ -134,6 +134,13 @@
 # equivalent to a plain SSBO RMW.  Real workgroup-storage
 # coverage needs a multi-invocation dispatch -- separate arc.
 #
+# EXTRA_SHADERS entries optionally carry two extra fields for
+# multi-slot / multi-workgroup tests:
+#   "name:seed:expect:buf_u32s:dispatch_x"
+# `per_thread` uses 0:56:8:8 -- seed every slot with 0, dispatch
+# 8 workgroups, expect the wrapping sum of all 8 slots to be 56
+# (0+2+4+6+8+10+12+14 for the shader `data[tid.x] = tid.x * 2`).
+#
 # Pre-reqs (one-time):
 #   * brew install vulkan-headers vulkan-loader vulkan-tools
 #   * cargo build -p atrium-vk-icd          (produces .dylib + examples)
@@ -191,6 +198,7 @@ float_sqrt:100:10
 ternary:7:1
 bit_count:0x12345678:13
 subgroup_sum:42:43
+per_thread:0:56:8:8
 "
 # loop_mul un-parked Arc 144: spirv-opt --ssa-rewrite (run by
 # the daemon when --spirv-opt-binary is set) promotes Slang's
@@ -474,12 +482,20 @@ if [ -x "$ROUNDTRIP" ] && [ -x "$SLANGC" ] && [ -f "$SLANG_SRC" ]; then
     # daemon.  Safe now: the prior cross-session BufferRecord
     # leak was fixed by Session::cleanup walking ResourceTable
     # and calling backend.buffer_destroyed on disconnect (Arc
-    # 142).  Each entry in EXTRA_SHADERS is "name:seed:expect".
+    # 142).  EXTRA_SHADERS entry: "name:seed:expect[:buf_u32s:dispatch_x]".
+    # The last two are optional and default to "1:1" -- single-
+    # slot SSBO, single-workgroup dispatch.  Per-thread rungs
+    # set them both to N to exercise dispatch(N,1,1) writes into
+    # an N-slot buffer.
     rung_n=8
     for entry in $EXTRA_SHADERS; do
         name=$(echo "$entry" | cut -d: -f1)
         seed=$(echo "$entry" | cut -d: -f2)
         expect=$(echo "$entry" | cut -d: -f3)
+        buf_u32s=$(echo "$entry" | cut -d: -f4)
+        dispatch_x=$(echo "$entry" | cut -d: -f5)
+        [ -z "$buf_u32s" ]   && buf_u32s=1
+        [ -z "$dispatch_x" ] && dispatch_x=1
         src="$SHADER_DIR/$name.slang"
         spv="$SHADER_DIR/$name.comp.spv"
         [ -f "$src" ] || { echo "missing $src" >&2; exit 1; }
@@ -487,7 +503,7 @@ if [ -x "$ROUNDTRIP" ] && [ -x "$SLANGC" ] && [ -f "$SLANG_SRC" ]; then
             -o "$spv" 2>/tmp/slangc.log \
             || { echo "FAIL: slangc $name"; cat /tmp/slangc.log; exit 1; }
         echo
-        echo "=== Rung $rung_n: $name.slang (seed=$seed, expect=$expect) ==="
+        echo "=== Rung $rung_n: $name.slang (seed=$seed, expect=$expect, slots=$buf_u32s, gx=$dispatch_x) ==="
         if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
             VK_DRIVER_FILES="$MANIFEST" \
             ATRIUM_VK_ICD_SOCKET="$SOCKET" \
@@ -495,6 +511,8 @@ if [ -x "$ROUNDTRIP" ] && [ -x "$SLANGC" ] && [ -f "$SLANG_SRC" ]; then
             ATRIUM_VK_SMOKE_SHADER_PATH="$spv" \
             ATRIUM_VK_SMOKE_SEED="$seed" \
             ATRIUM_VK_SMOKE_EXPECT="$expect" \
+            ATRIUM_VK_SMOKE_BUFFER_U32S="$buf_u32s" \
+            ATRIUM_VK_SMOKE_DISPATCH_X="$dispatch_x" \
             "$ROUNDTRIP" 2>&1 | tail -2; then
             echo "FAIL: $name round-trip" >&2
             exit 1

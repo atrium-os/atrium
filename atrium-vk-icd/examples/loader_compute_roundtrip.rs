@@ -155,13 +155,31 @@ fn main() -> std::process::ExitCode {
     //   ATRIUM_VK_SMOKE_SHADER_PATH  -- when SHADER=slang, override
     //                                   the default examples/shaders/
     //                                   write_42.comp.spv path
-    //   ATRIUM_VK_SMOKE_SEED         -- u32 to seed the SSBO with
-    //                                   before dispatch (hex or
-    //                                   decimal).  Default 0xDEADBEEF.
-    //   ATRIUM_VK_SMOKE_EXPECT       -- u32 the SSBO must contain
-    //                                   after dispatch.  Default 42.
-    let seed_u32   = parse_u32_env("ATRIUM_VK_SMOKE_SEED",   0xDEAD_BEEF);
-    let expect_u32 = parse_u32_env("ATRIUM_VK_SMOKE_EXPECT", 42);
+    //   ATRIUM_VK_SMOKE_SEED         -- u32 to seed every SSBO slot
+    //                                   with before dispatch (hex
+    //                                   or decimal).  Default
+    //                                   0xDEADBEEF.
+    //   ATRIUM_VK_SMOKE_EXPECT       -- For BUFFER_U32S == 1, the
+    //                                   value the SSBO must
+    //                                   contain after dispatch.
+    //                                   For BUFFER_U32S > 1, the
+    //                                   SUM of all slots.  Default
+    //                                   42.
+    //   ATRIUM_VK_SMOKE_BUFFER_U32S  -- Number of u32 slots in
+    //                                   the SSBO.  Default 1.
+    //                                   > 1 enables per-thread
+    //                                   indexed-write tests
+    //                                   (assert via sum).
+    //   ATRIUM_VK_SMOKE_DISPATCH_X   -- groupCountX for
+    //                                   vkCmdDispatch.  Default 1.
+    //                                   Set together with
+    //                                   BUFFER_U32S=N to test
+    //                                   dispatch(N,1,1) writing
+    //                                   to data[tid.x].
+    let seed_u32     = parse_u32_env("ATRIUM_VK_SMOKE_SEED",        0xDEAD_BEEF);
+    let expect_u32   = parse_u32_env("ATRIUM_VK_SMOKE_EXPECT",      42);
+    let buffer_u32s  = parse_u32_env("ATRIUM_VK_SMOKE_BUFFER_U32S", 1).max(1);
+    let dispatch_x   = parse_u32_env("ATRIUM_VK_SMOKE_DISPATCH_X",  1).max(1);
 
     let entry = unsafe {
         match ash::Entry::load() {
@@ -206,9 +224,13 @@ fn main() -> std::process::ExitCode {
     println!("vkCreateDevice / GetDeviceQueue   -> OK");
 
     // ── Buffer + Memory (HOST_VISIBLE + HOST_COHERENT) ────────
-    const N: usize = 4;
+    // Buffer size in bytes = BUFFER_U32S * 4.  At default
+    // BUFFER_U32S=1 this stays the original 4-byte single-u32
+    // SSBO; raising it lets per-thread dispatches write into
+    // data[tid.x] without buffer overflow.
+    let buffer_bytes: usize = (buffer_u32s as usize) * 4;
     let buf_info = vk::BufferCreateInfo::default()
-        .size(N as u64)
+        .size(buffer_bytes as u64)
         .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
     let buffer = unsafe { device.create_buffer(&buf_info, None).expect("create_buffer") };
@@ -222,7 +244,7 @@ fn main() -> std::process::ExitCode {
         .memory_type_index(mem_ty);
     let mem = unsafe { device.allocate_memory(&alloc_info, None).expect("allocate_memory") };
     unsafe { device.bind_buffer_memory(buffer, mem, 0).expect("bind_buffer_memory"); }
-    println!("vkCreate/Bind Buffer + Memory     -> OK (size={N})");
+    println!("vkCreate/Bind Buffer + Memory     -> OK (size={buffer_bytes})");
 
     // Seed the buffer with the configured value so we can prove
     // the shader's write reached the client (for write-only
@@ -232,11 +254,18 @@ fn main() -> std::process::ExitCode {
         device.map_memory(mem, 0, req.size, vk::MemoryMapFlags::empty())
             .expect("map_memory")
     };
+    // Seed every slot with the configured value.  For
+    // BUFFER_U32S=1 this is a single store; for the per-thread
+    // multi-slot case we initialise every lane to the same seed
+    // so any unwritten slot stays detectable.
     unsafe {
-        std::ptr::write_unaligned(mapped as *mut u32, seed_u32);
+        let p = mapped as *mut u32;
+        for i in 0..(buffer_u32s as usize) {
+            std::ptr::write_unaligned(p.add(i), seed_u32);
+        }
     }
     unsafe { device.unmap_memory(mem); }
-    println!("seed buffer with 0x{seed_u32:08x}       -> OK (vkUnmapMemory flushes host->daemon)");
+    println!("seed buffer ({buffer_u32s} slots) with 0x{seed_u32:08x} -> OK");
 
     // ── Descriptor set layout / pool / set ────────────────────
     let dsl_binding = vk::DescriptorSetLayoutBinding::default()
@@ -353,7 +382,7 @@ fn main() -> std::process::ExitCode {
         device.cmd_bind_descriptor_sets(
             cb, vk::PipelineBindPoint::COMPUTE, pl, 0, &[dset], &[],
         );
-        device.cmd_dispatch(cb, 1, 1, 1);
+        device.cmd_dispatch(cb, dispatch_x, 1, 1);
     }
     unsafe { device.end_command_buffer(cb).expect("end"); }
 
@@ -361,7 +390,7 @@ fn main() -> std::process::ExitCode {
     let submit = vk::SubmitInfo::default().command_buffers(&cbs_to_submit);
     unsafe { device.queue_submit(queue, &[submit], vk::Fence::null()).expect("submit"); }
     unsafe { device.device_wait_idle().expect("wait_idle"); }
-    println!("dispatch(1,1,1) + WaitIdle        -> OK");
+    println!("dispatch({dispatch_x},1,1) + WaitIdle        -> OK");
 
     // ── Read back ─────────────────────────────────────────────
     let mapped = unsafe {
@@ -381,10 +410,37 @@ fn main() -> std::process::ExitCode {
         device.invalidate_mapped_memory_ranges(&[range])
             .expect("invalidate_mapped_memory_ranges");
     }
-    let got = unsafe { std::ptr::read_unaligned(mapped as *const u32) };
+    // Read back every slot.  For BUFFER_U32S == 1 the "got"
+    // value is just slot 0; for the multi-slot case we
+    // assert against the wrapping SUM of all slots (a
+    // compact single-u32 fingerprint of the per-element
+    // outputs that catches "didn't write" and "wrote the
+    // wrong pattern").
+    let mut slots = vec![0u32; buffer_u32s as usize];
+    unsafe {
+        let p = mapped as *const u32;
+        for i in 0..(buffer_u32s as usize) {
+            slots[i] = std::ptr::read_unaligned(p.add(i));
+        }
+    }
     unsafe { device.unmap_memory(mem); }
 
-    println!("ssbo[0] after dispatch+invalidate -> 0x{got:08x} (want 0x{expect_u32:08x})");
+    let got = if buffer_u32s == 1 {
+        slots[0]
+    } else {
+        slots.iter().fold(0u32, |a, b| a.wrapping_add(*b))
+    };
+    if buffer_u32s == 1 {
+        println!(
+            "ssbo[0] after dispatch+invalidate -> 0x{got:08x} (want 0x{expect_u32:08x})",
+        );
+    } else {
+        println!(
+            "sum(ssbo[0..{buffer_u32s}]) after dispatch+invalidate \
+             -> 0x{got:08x} (want 0x{expect_u32:08x}; first slots: {:?})",
+            &slots[..slots.len().min(8)],
+        );
+    }
     let ok = got == expect_u32;
 
     // ── Cleanup ────────────────────────────────────────────────
