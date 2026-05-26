@@ -5056,10 +5056,13 @@ pub unsafe extern "C" fn vkCmdPipelineBarrier2(
         (s, d)
     } else {
         // Spec allows zero memory barriers + only buffer/image
-        // barriers. Use a conservative ALL_COMMANDS pair so the
+        // barriers.  Use a conservative ALL_COMMANDS pair so the
         // renderer's barrier walks aren't accidentally reordered.
-        // 0x00010000 = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT (1.0 enum).
-        (0x00010000, 0x00010000)
+        // Arc 127: pin against ash instead of the hand-typed
+        // 0x00010000 the previous arc used -- same risk class
+        // as Arc 126.
+        let all = ash::vk::PipelineStageFlags::ALL_COMMANDS.as_raw();
+        (all, all)
     };
 
     let mut body = [0u8; 12];
@@ -9411,6 +9414,13 @@ mod tests {
         // re-numbering would silently make every swapchain image
         // fail creation as "wrong sType".
         assert_eq!(vk::StructureType::IMAGE_CREATE_INFO.as_raw(), 14);
+
+        // Arc 127: VK_PIPELINE_STAGE_ALL_COMMANDS_BIT must
+        // remain at 0x00010000 -- vkCmdPipelineBarrier2's
+        // zero-memory-barriers fallback uses ALL_COMMANDS as
+        // a conservative src/dst pair, and the daemon-side
+        // renderer keys ordering off this bit.
+        assert_eq!(vk::PipelineStageFlags::ALL_COMMANDS.as_raw(), 0x0001_0000);
 
         // Arc 113: the five remaining Vulkan 1.1 *2 query output
         // wrappers. Each writes its inner block at offset 16 of
