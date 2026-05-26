@@ -93,6 +93,11 @@ const VK_ERROR_FORMAT_NOT_SUPPORTED: VkResult = -11;
 /// caller's array capacity is smaller than the count we
 /// would otherwise report.  Arc 124.
 const VK_INCOMPLETE: VkResult = 5;
+/// `VK_ERROR_DEVICE_LOST` — returned by `vkGetFenceStatus`
+/// when the fence handle isn't known to the device (treated
+/// as an irrecoverable mismatch between caller + ICD state).
+/// Arc 125.
+const VK_ERROR_DEVICE_LOST: VkResult = -4;
 /// VkBool32 `VK_TRUE` / `VK_FALSE` named constants (Arc 96).
 /// `VkBool32` is a typedef of `u32`; values 1 / 0.
 const VK_TRUE:  u32 = 1;
@@ -4496,7 +4501,7 @@ pub unsafe extern "C" fn vkGetFenceStatus(
         // or NOT_READY; the wrong value here could confuse
         // robust callers.
         Some(false) => VK_NOT_READY,
-        None        => -4, /* VK_ERROR_DEVICE_LOST */
+        None        => VK_ERROR_DEVICE_LOST,
     }
 }
 
