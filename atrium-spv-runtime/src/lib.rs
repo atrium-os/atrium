@@ -2023,6 +2023,25 @@ mod tests {
         assert_eq!(f16_to_f32(0xFC00),  f32::NEG_INFINITY);
         assert!(f16_to_f32(0x7C01).is_nan());
         assert_eq!(f16_to_f32(0x3C00),  1.0);
+
+        // Arc 119: pin the documented f16 denormal flush-to-zero
+        // behaviour.  exp=0 + mant != 0 is an f16 subnormal;
+        // we map it to +/- 0 to match mediump GPU behaviour
+        // (acceptable per Vulkan's f16 precision rules and
+        // safer for HDR sampling than producing huge-relative-
+        // error subnormal f32 values).  If a future arc gains
+        // proper subnormal conversion, this test will fail and
+        // force a doc + caller-side review.
+        assert_eq!(f16_to_f32(0x0001),  0.0);          // smallest +denorm
+        assert_eq!(f16_to_f32(0x03FF),  0.0);          // largest  +denorm
+        assert_eq!(f16_to_f32(0x8001), -0.0_f32);      // smallest -denorm
+
+        // Negative NaN (sign=1, exp=31, mant!=0) preserves sign
+        // through the mantissa lane.
+        let neg_nan = f16_to_f32(0xFC01);
+        assert!(neg_nan.is_nan(), "negative NaN preserved");
+        assert!(neg_nan.is_sign_negative(),
+            "f16 -NaN keeps its sign through the conversion");
     }
 
     /// Arc 66: Rgba32Float sampling — 16 bytes/texel, exact
@@ -2161,6 +2180,22 @@ mod tests {
         let nan_bits = f32_to_f16(f32::NAN);
         assert_eq!(nan_bits & 0x7C00, 0x7C00, "exp bits = all-1");
         assert!(nan_bits & 0x03FF != 0, "mantissa != 0");
+
+        // Arc 119: pin the f16-side flush-to-zero contract for
+        // f32 values that fall below the smallest f16 normal
+        // (2^-14 ≈ 6.1e-5).  Any value with unbiased exponent
+        // < -14 underflows; we flush to +/- 0.
+        assert_eq!(f32_to_f16(1.0e-8),       0x0000);
+        assert_eq!(f32_to_f16(-1.0e-8),      0x8000);
+        // Right at the f16 normal-min boundary (exp = -14): the
+        // value 2^-14 must encode as the smallest normal half
+        // (sign=0, exp=1, mant=0).
+        assert_eq!(f32_to_f16(2.0_f32.powi(-14)), 0x0400);
+        // Just above the boundary: 2^-14 + epsilon must round
+        // up but still produce a normal f16 (exp bits set).
+        let half = f32_to_f16(2.0_f32.powi(-14) + 2.0_f32.powi(-23));
+        assert_ne!(half & 0x7C00, 0,
+            "near-boundary value must produce a normal f16, not zero");
     }
 
     #[test]
