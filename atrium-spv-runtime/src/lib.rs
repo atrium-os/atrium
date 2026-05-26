@@ -2007,6 +2007,28 @@ mod tests {
         assert_eq!(p, [2.0, -0.5, 0.0, 1.0]);
     }
 
+    /// Arc 123: pin `StorageFormat::bytes_per_texel`.  Drift
+    /// on this table is silently catastrophic -- the texel
+    /// addressing for image_write_impl / image_read_impl
+    /// computes the byte offset as
+    ///   data + z*slice + y*stride + x*bytes_per_texel
+    /// so a wrong value (e.g. claiming Rgba16Float is 16
+    /// instead of 8) would over-step the texel pointer and
+    /// read/write the next pixel's bytes.  In the worst case
+    /// (over-step a 16-byte Rgba32Float into the next row of
+    /// an Rgba8Unorm image) the corruption looks like a
+    /// shifted-image artefact, not a crash.
+    #[test]
+    fn storage_format_bytes_per_texel_pinned() {
+        assert_eq!(StorageFormat::Rgba8Unorm  .bytes_per_texel(),  4);
+        assert_eq!(StorageFormat::R32Float    .bytes_per_texel(),  4);
+        assert_eq!(StorageFormat::Rgba32Float .bytes_per_texel(), 16);
+        assert_eq!(StorageFormat::R32Uint     .bytes_per_texel(),  4);
+        // Rgba16Float = 4 lanes * 2 bytes = 8 (NOT 16, which
+        // is f32-sized; not 4, which is f16x2 only).
+        assert_eq!(StorageFormat::Rgba16Float .bytes_per_texel(),  8);
+    }
+
     /// Arc 122: pin the wire-format -> enum mapping for
     /// `TexFormat`, `StorageFormat`, and `WrapMode`.  Each
     /// enum has an explicit `#[repr(u32)]` discriminant and
