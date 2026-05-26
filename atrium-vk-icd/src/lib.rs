@@ -9422,6 +9422,18 @@ mod tests {
         // renderer keys ordering off this bit.
         assert_eq!(vk::PipelineStageFlags::ALL_COMMANDS.as_raw(), 0x0001_0000);
 
+        // Arc 128: pin the hand-typed bit values
+        // vkGetPhysicalDeviceSurfaceCapabilitiesKHR + the
+        // device-group present-modes query write into surface
+        // capability fields.  Drift on these silently changes
+        // what the app perceives as "supported" without
+        // changing API success.
+        assert_eq!(vk::SurfaceTransformFlagsKHR::IDENTITY.as_raw(), 0x1);
+        assert_eq!(vk::CompositeAlphaFlagsKHR::OPAQUE.as_raw(),     0x1);
+        assert_eq!(vk::ImageUsageFlags::COLOR_ATTACHMENT.as_raw(),  0x10);
+        // VK_DEVICE_GROUP_PRESENT_MODE_LOCAL_BIT_KHR = 0x1.
+        assert_eq!(vk::DeviceGroupPresentModeFlagsKHR::LOCAL.as_raw(), 0x1);
+
         // Arc 113: the five remaining Vulkan 1.1 *2 query output
         // wrappers. Each writes its inner block at offset 16 of
         // the sType / pNext header.  A header shuffle would
