@@ -2007,6 +2007,42 @@ mod tests {
         assert_eq!(p, [2.0, -0.5, 0.0, 1.0]);
     }
 
+    /// Arc 121: pin the sRGB -> linear curve at its four
+    /// canonical sample points + the linear/power boundary.
+    /// The curve is hand-coded as
+    ///   c <= 0.04045 -> c / 12.92
+    ///   c >  0.04045 -> ((c + 0.055) / 1.055) ^ 2.4
+    /// A drift in either constant would silently shift the
+    /// brightness of every sRGB-sampled texture across the
+    /// entire renderer -- the kind of change that "looks
+    /// fine" until two assets composited together suddenly
+    /// disagree.  byte 10 stays in the linear piece (10/255
+    /// = 0.0392 < 0.04045), byte 11 crosses into the power
+    /// curve (11/255 = 0.0431 > 0.04045); pinning both sides
+    /// of the boundary catches an off-by-one re-fit too.
+    #[test]
+    fn srgb_to_linear_canonical_samples() {
+        assert_eq!(srgb_to_linear(0),   0.0);
+        let v255 = srgb_to_linear(255);
+        assert!((v255 - 1.0).abs() < 1e-6, "byte 255 -> 1.0; got {v255}");
+        // byte 128: well-known mid-gray crossing point of
+        // sRGB; the linear value is ~0.2158605.
+        let v128 = srgb_to_linear(128);
+        assert!((v128 - 0.2158605).abs() < 1e-4,
+            "byte 128 -> ~0.2158605; got {v128}");
+        // Linear-piece side of the boundary (byte 10).
+        let v10 = srgb_to_linear(10);
+        let expect10: f32 = (10.0_f32 / 255.0) / 12.92;
+        assert!((v10 - expect10).abs() < 1e-6,
+            "byte 10 stays in linear piece; got {v10}");
+        // Power-curve side of the boundary (byte 11).
+        let v11 = srgb_to_linear(11);
+        let c11: f32 = 11.0 / 255.0;
+        let expect11: f32 = ((c11 + 0.055) / 1.055).powf(2.4);
+        assert!((v11 - expect11).abs() < 1e-6,
+            "byte 11 crosses into power curve; got {v11}");
+    }
+
     /// Arc 70: R16Unorm -- classic 16-bit depth-buffer format.
     /// 0x8000 = 32768 should decode to ≈0.5; 0xFFFF should
     /// decode to exactly 1.0.
