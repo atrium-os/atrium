@@ -71,6 +71,12 @@
 #                                      OpBitwiseXor + OpBitwiseOr
 #                                      chained; tests regalloc
 #                                      across intermediate values)
+#                       rotate      -- (x>>4) | (x<<28)
+#                                      (rotate-right-by-4; tests
+#                                      OpShiftRightLogical which
+#                                      bit_chain doesn't reach,
+#                                      paired with the left shift
+#                                      + OpBitwiseOr)
 #
 # Pre-reqs (one-time):
 #   * brew install vulkan-headers vulkan-loader vulkan-tools
@@ -113,6 +119,7 @@ EXTRA_SHADERS="
 rmw:100:101
 atomic_add:200:201
 bit_chain:1:495
+rotate:0x12345678:0x81234567
 "
 # loop_mul parked: surfaces a real frontend gap (`OpVariable
 # Function` not yet supported in atrium-spv-compile phase 1 v3
