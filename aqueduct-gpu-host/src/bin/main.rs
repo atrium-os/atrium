@@ -9,7 +9,7 @@
 //!
 //! Usage:
 //!     aqueduct-gpu-host [--socket /tmp/aqueduct-gpu.sock]
-//!                       [--backend stub|software|moltenvk]
+//!                       [--backend stub|software|moltenvk|tier2]
 //!                       [--tier2]
 //!                       [--cache-root PATH]
 //!                       [--compile-binary PATH]
@@ -17,23 +17,29 @@
 //! `--backend` defaults to `stub` (protocol-correct, no GPU work).
 //! See `docs/spec/aqueduct-gpu.md` §6.5 for backend tier semantics.
 //!
-//! `--tier2` attaches a process-wide [`Tier2Registry`] so every
-//! SPIR-V upload is routed through `atrium-spv-compile` into a
-//! dlopened `.so`.  Off by default: tier-2 needs `atrium-spv-
-//! compile` reachable on disk + a writable cache directory, and
-//! most legacy callers (tier-1 demos, protocol-only fixtures)
-//! don't want to pay for the compile.  See `docs/spec/tier2-
-//! renderer.md` for the dispatch story.
+//! `--backend tier2` selects [`Tier2Backend`], which actually runs
+//! the SPIR-V shaders compiled by atrium-spv-compile through
+//! atrium-spv-runtime.  Requires `--tier2` to also be passed so
+//! the matching [`Tier2Registry`] is attached to the listener;
+//! without it, every SPIR-V upload would arrive with
+//! `tier2_id=None` and every draw would be skipped.  The
+//! end-to-end "real Vulkan app exercises atrium-spv-*" path:
+//!
+//!     aqueduct-gpu-host --backend tier2 --tier2 \
+//!         --cache-root /tmp/atrium-shaders \
+//!         --compile-binary ./target/debug/atrium-spv-compile
+//!
+//! `--tier2` without `--backend tier2` attaches the registry so
+//! SPIR-V uploads get compiled + cached, but the dispatch backend
+//! (stub / software / moltenvk) ignores the `tier2_id`.  Useful
+//! for warming the compile cache from a CI run that doesn't
+//! care about the dispatch output.
 //!
 //! `--cache-root` / `--compile-binary` override
 //! [`LoaderConfig::production`]'s defaults
 //! (`/var/atrium/shaders` and `/usr/local/libexec/atrium-spv-
 //! compile`).  Dev runs that lack root point both at workspace-
-//! local paths, e.g.:
-//!
-//!     aqueduct-gpu-host --tier2 \
-//!         --cache-root /tmp/atrium-shaders \
-//!         --compile-binary ./target/debug/atrium-spv-compile
+//! local paths.
 //!
 //! Logs honour `RUST_LOG`. Default level: `info`.
 
@@ -44,7 +50,7 @@ use anyhow::{anyhow, Context, Result};
 
 use aqueduct_gpu_host::{
     Backend, Listener, MoltenVkBackend, MoltenVkError, SoftwareBackend, StubBackend,
-    Tier2Registry,
+    Tier2Backend, Tier2Registry,
 };
 use atrium_spv_loader::LoaderConfig;
 
@@ -59,11 +65,17 @@ enum BackendKind {
     /// real GPU stack.
     Stub,
     /// `SoftwareBackend` — tier-1 tiny-skia rasterisation of
-    /// Atrium-native bundle ops. (Stub until Phase 1.3c.)
+    /// Atrium-native bundle ops.  Rejects third-party SPIR-V
+    /// (tier-2 territory).
     Software,
     /// `MoltenVkBackend` — real GPU via Apple's MoltenVK on macOS.
-    /// Not yet implemented; reserved for Phase 1.3b.
     MoltenVk,
+    /// `Tier2Backend` — runs SPIR-V shaders compiled by atrium-spv-
+    /// compile through atrium-spv-runtime.  Requires `--tier2` to
+    /// also be passed so the matching `Tier2Registry` is attached
+    /// to the listener; without it, every SPIR-V upload would
+    /// arrive with `tier2_id=None` and every draw would be skipped.
+    Tier2,
 }
 
 impl BackendKind {
@@ -72,8 +84,10 @@ impl BackendKind {
             "stub"     => BackendKind::Stub,
             "software" => BackendKind::Software,
             "moltenvk" => BackendKind::MoltenVk,
+            "tier2"    => BackendKind::Tier2,
             other => return Err(anyhow!(
-                "unknown --backend {other:?}; valid: stub | software | moltenvk"
+                "unknown --backend {other:?}; \
+                 valid: stub | software | moltenvk | tier2"
             )),
         })
     }
@@ -126,7 +140,7 @@ fn parse_args() -> Result<Args> {
             }
             "--help" | "-h" => {
                 println!("usage: aqueduct-gpu-host [--socket PATH] \
-                    [--backend stub|software|moltenvk] \
+                    [--backend stub|software|moltenvk|tier2] \
                     [--tier2] [--cache-root PATH] [--compile-binary PATH]");
                 std::process::exit(0);
             }
@@ -136,6 +150,13 @@ fn parse_args() -> Result<Args> {
     if !tier2 && (cache_root.is_some() || compile_binary.is_some()) {
         return Err(anyhow!(
             "--cache-root / --compile-binary require --tier2"
+        ));
+    }
+    if backend == BackendKind::Tier2 && !tier2 {
+        return Err(anyhow!(
+            "--backend tier2 requires --tier2 (the matching \
+             Tier2Registry must be attached to the listener so \
+             SPIR-V uploads have somewhere to compile through)"
         ));
     }
     Ok(Args {
@@ -183,7 +204,10 @@ fn make_tier2_registry(
     Ok(Arc::new(Tier2Registry::new(cfg)))
 }
 
-fn make_backend(kind: BackendKind) -> Result<Arc<dyn Backend>> {
+fn make_backend(
+    kind: BackendKind,
+    tier2_registry: Option<&Arc<Tier2Registry>>,
+) -> Result<Arc<dyn Backend>> {
     match kind {
         BackendKind::Stub     => Ok(Arc::new(StubBackend::new())),
         BackendKind::Software => Ok(Arc::new(SoftwareBackend::new())),
@@ -198,6 +222,20 @@ fn make_backend(kind: BackendKind) -> Result<Arc<dyn Backend>> {
             }
             Err(e) => Err(anyhow!("MoltenVK init failed: {e}")),
         },
+        BackendKind::Tier2 => {
+            // The CLI parser already enforced --tier2 when this
+            // arm is reached, so the registry is present.
+            let reg = tier2_registry
+                .ok_or_else(|| anyhow!(
+                    "internal: BackendKind::Tier2 reached make_backend \
+                     without a registry -- parse_args should have rejected"
+                ))?
+                .clone();
+            log::info!("tier-2 backend selected; draws against \
+                tier2_id-bearing pipelines will dispatch through \
+                atrium-spv-runtime");
+            Ok(Arc::new(Tier2Backend::new(reg)))
+        }
     }
 }
 
@@ -210,10 +248,20 @@ fn main() -> Result<()> {
         "aqueduct-gpu-host starting (backend: {:?}, tier2: {})",
         args.backend, args.tier2,
     );
-    let backend = make_backend(args.backend)?;
+
+    // Build the registry up front (when --tier2): both the
+    // listener and the Tier2Backend point at the same Arc, so
+    // SPIR-V uploads land in the same compiled-shader pool the
+    // dispatch path reads from.
+    let registry: Option<Arc<Tier2Registry>> = if args.tier2 {
+        Some(make_tier2_registry(args.cache_root, args.compile_binary)?)
+    } else {
+        None
+    };
+
+    let backend = make_backend(args.backend, registry.as_ref())?;
     let mut listener = Listener::bind(&args.socket, backend)?;
-    if args.tier2 {
-        let reg = make_tier2_registry(args.cache_root, args.compile_binary)?;
+    if let Some(reg) = registry {
         listener = listener.with_tier2_registry(reg);
     }
     listener.accept_loop()?;

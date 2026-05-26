@@ -162,6 +162,39 @@ else
         echo "FAIL: tier-2 did not produce the expected cache artifacts" >&2
         exit 1
     fi
+    kill "$DAEMON_PID" 2>/dev/null; wait 2>/dev/null
+    DAEMON_PID=""
+
+    # ── Rung 5: --backend tier2 (Tier2Backend dispatch path) ──
+    # Same observable surface as Rung 4 from the example's POV
+    # (we don't submit a draw yet), but exercises the
+    # Tier2Backend's startup path: registry shared between
+    # listener and backend, with the dispatch table swapped from
+    # SoftwareBackend (which would reject tier2_id-bearing draws)
+    # to Tier2Backend (which executes them through atrium-spv-
+    # runtime).
+    rm -rf "$CACHE_ROOT" "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 \
+        --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    sleep 1
+    if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+        echo "daemon failed to start (--backend tier2); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung 5: --backend tier2, dispatch-ready ==="
+    DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+      VK_DRIVER_FILES="$MANIFEST" \
+      ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+      "$EXAMPLE" 2>&1 | grep -E "vk|trivial|done"
+    grep -E "tier-2 backend selected" /tmp/aqueduct-loader-smoke.log >/dev/null \
+        || { echo "FAIL: --backend tier2 did not log selection" >&2; exit 1; }
 fi
 
 echo
