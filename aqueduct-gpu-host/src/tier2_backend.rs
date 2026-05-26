@@ -1646,6 +1646,27 @@ impl Backend for Tier2Backend {
         Ok(())
     }
 
+    fn buffer_read_bytes(
+        &self,
+        buffer_id: ResourceId,
+        offset: u64,
+        size: u64,
+    ) -> Result<Vec<u8>, String> {
+        let buffers = self.buffers.lock().unwrap();
+        let buf = buffers.get(&buffer_id.raw())
+            .ok_or_else(|| format!("buffer {buffer_id} not registered"))?;
+        let end = offset.checked_add(size)
+            .ok_or_else(|| "buffer read offset+size overflows u64".to_string())?;
+        if end > buf.size {
+            return Err(format!(
+                "buffer read end {end} exceeds size {}", buf.size,
+            ));
+        }
+        let off = offset as usize;
+        let sz  = size   as usize;
+        Ok(buf.bytes[off..off + sz].to_vec())
+    }
+
     fn submit_frame(
         &self,
         _fence_id: ResourceId,

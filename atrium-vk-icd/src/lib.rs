@@ -6884,12 +6884,130 @@ pub unsafe extern "C" fn vkFlushMappedMemoryRanges(
     _device: VkDevice, _range_count: u32, _p_ranges: *const c_void,
 ) -> VkResult { VK_SUCCESS }
 
-/// `vkInvalidateMappedMemoryRanges` — symmetric counterpart to
-/// vkFlushMappedMemoryRanges; same coherent-memory rationale.
+/// `vkInvalidateMappedMemoryRanges` — pull daemon-side buffer
+/// state back into the client's mapped pointer so the next read
+/// through the pointer sees fresh data.
+///
+/// Strictly speaking the spec says HOST_COHERENT memory needs no
+/// invalidate, but our shared-memory model isn't actually
+/// coherent: client and daemon hold separate buffers, joined by
+/// `OP_GPU_BUFFER_WRITE` (host -> daemon, fired from
+/// vkUnmapMemory) and `OP_GPU_BUFFER_READ` (daemon -> host,
+/// fired from here).  So we have to do real work to honour the
+/// app's expectation that "I dispatched a compute that writes
+/// the SSBO, now I read it back through the mapped pointer and
+/// see the result".
+///
+/// VkMappedMemoryRange layout (40 bytes):
+///   0  sType
+///   8  pNext
+///   16 memory (VkDeviceMemory, u64)
+///   24 offset (VkDeviceSize, u64)
+///   32 size   (VkDeviceSize, u64; VK_WHOLE_SIZE = !0u64)
+///
+/// Bring-up shape: walk each range, find the buffers bound to
+/// the named memory, ask the daemon for their current bytes,
+/// copy back into the local Box.  D5+ moves to shared backing
+/// regions where the invalidate is a kernel-side mmap sync
+/// rather than a wire round-trip.
 #[no_mangle]
 pub unsafe extern "C" fn vkInvalidateMappedMemoryRanges(
-    _device: VkDevice, _range_count: u32, _p_ranges: *const c_void,
-) -> VkResult { VK_SUCCESS }
+    device: VkDevice, range_count: u32, p_ranges: *const c_void,
+) -> VkResult {
+    if device.is_null() {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    if range_count == 0 || p_ranges.is_null() {
+        return VK_SUCCESS;
+    }
+    let dev = &*(device as *const AtriumDevice);
+    if dev.instance.is_null() {
+        return VK_SUCCESS;
+    }
+    let inst = &*(dev.instance as *const AtriumInstance);
+    let Some(client_mu) = inst.client.as_ref() else { return VK_SUCCESS };
+
+    // Walk ranges, collect (memory_handle, range_offset, range_size).
+    const STRIDE: usize = 40;
+    let base = p_ranges as *const u8;
+    let mut ranges: Vec<(u64, u64, u64)> = Vec::with_capacity(range_count as usize);
+    for i in 0..range_count {
+        let p = base.add(STRIDE * i as usize);
+        let memory = std::ptr::read_unaligned(p.add(16) as *const u64);
+        let offset = std::ptr::read_unaligned(p.add(24) as *const u64);
+        let size   = std::ptr::read_unaligned(p.add(32) as *const u64);
+        if memory == 0 { continue; }
+        ranges.push((memory, offset, size));
+    }
+    if ranges.is_empty() { return VK_SUCCESS; }
+
+    // For each range, find every AtriumBuffer bound to that
+    // memory whose (memory_offset .. memory_offset+size) interval
+    // intersects (range_offset .. range_offset+range_size).
+    // Snapshot the work outside the per-call locks so the actual
+    // read_buffer round-trips don't hold our state mutexes.
+    struct PullTask {
+        memory: u64,
+        mem_offset: usize, // where to write back in mem.storage
+        buffer_id: aqueduct_gpu::ids::ResourceId,
+        buf_offset: u64,   // start offset within the buffer to read
+        size: u64,         // bytes to read
+    }
+    let mut tasks: Vec<PullTask> = Vec::new();
+    {
+        let Ok(bufs) = dev.buffers.lock() else { return VK_ERROR_INITIALIZATION_FAILED };
+        let Ok(mems) = dev.memories.lock() else { return VK_ERROR_INITIALIZATION_FAILED };
+        for &(mem_handle, r_offset, r_size) in &ranges {
+            let Some(mem) = mems.get(&mem_handle) else { continue };
+            let mem_size = mem.storage.len() as u64;
+            // VK_WHOLE_SIZE handling.
+            let r_end = if r_size == !0u64 { mem_size } else {
+                r_offset.saturating_add(r_size).min(mem_size)
+            };
+            for buf in bufs.values() {
+                if buf.memory != Some(mem_handle) { continue; }
+                let Some(daemon_id) = buf.buffer_id else { continue };
+                let b_start = buf.memory_offset;
+                let b_end   = b_start.saturating_add(buf.size);
+                // Intersect [b_start, b_end) with [r_offset, r_end).
+                let lo = b_start.max(r_offset);
+                let hi = b_end.min(r_end);
+                if hi <= lo { continue; }
+                tasks.push(PullTask {
+                    memory: mem_handle,
+                    mem_offset: lo as usize,
+                    buffer_id: daemon_id,
+                    buf_offset: lo - b_start,
+                    size: hi - lo,
+                });
+            }
+        }
+    }
+    if tasks.is_empty() { return VK_SUCCESS; }
+
+    // Round-trip each pull, then copy results back into mem.storage.
+    let Ok(mut client) = client_mu.lock() else { return VK_ERROR_INITIALIZATION_FAILED };
+    let mut pulled: Vec<(u64, usize, Vec<u8>)> = Vec::with_capacity(tasks.len());
+    for t in &tasks {
+        match client.read_buffer(t.buffer_id, t.buf_offset, t.size) {
+            Ok(bytes) => pulled.push((t.memory, t.mem_offset, bytes)),
+            Err(_)    => { /* leave stale */ }
+        }
+    }
+    drop(client);
+
+    if let Ok(mut mems) = dev.memories.lock() {
+        for (mem_handle, off, bytes) in pulled {
+            if let Some(mem) = mems.get_mut(&mem_handle) {
+                let end = off.checked_add(bytes.len()).unwrap_or(off);
+                if end <= mem.storage.len() {
+                    mem.storage[off..end].copy_from_slice(&bytes);
+                }
+            }
+        }
+    }
+    VK_SUCCESS
+}
 
 /// `vkQueueSubmit` — flush each submitted cmdbuf's FrameOp stream
 /// to the aqueduct-gpu host endpoint via the owning AtriumInstance's

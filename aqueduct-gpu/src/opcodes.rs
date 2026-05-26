@@ -84,6 +84,14 @@ pub const OP_GPU_BUFFER_DESTROY:  u16 = 0x0121;
 /// before guest memory-region import is wired; ICDs will move
 /// to mapped backing regions in D5+.
 pub const OP_GPU_BUFFER_WRITE:    u16 = 0x0122;
+/// Inline read from a buffer.  Symmetric to `OP_GPU_BUFFER_WRITE`:
+/// a `BufferReadPayload` carries the source buffer id, byte offset,
+/// and size; the daemon responds with a `BufferReadResponse`
+/// containing the bytes.  Used by ICDs to implement
+/// `vkInvalidateMappedMemoryRanges` (pull daemon-side compute
+/// output back into the client's mapped pointer).  Will move to
+/// shared mapped backing regions in D5+.
+pub const OP_GPU_BUFFER_READ:     u16 = 0x0123;
 
 /// Allocate a sampler.
 pub const OP_GPU_SAMPLER_CREATE:  u16 = 0x0130;

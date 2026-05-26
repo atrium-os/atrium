@@ -128,6 +128,7 @@ impl Session {
             OP_GPU_BUFFER_CREATE      => self.handle_buffer_create(m),
             OP_GPU_BUFFER_DESTROY     => self.handle_buffer_destroy(m),
             OP_GPU_BUFFER_WRITE       => self.handle_buffer_write(m),
+            OP_GPU_BUFFER_READ        => self.handle_buffer_read(m),
             OP_GPU_SAMPLER_CREATE     => self.handle_sampler_create(m),
             OP_GPU_SAMPLER_DESTROY    => self.handle_sampler_destroy(m),
             OP_GPU_SHADER_RESOLVE     => self.handle_shader_resolve(m),
@@ -307,6 +308,33 @@ impl Session {
             self.send_validation_err(OP_GPU_BUFFER_WRITE, Some(req.buffer_id), &diag)?;
         }
         Ok(())
+    }
+
+    fn handle_buffer_read(&mut self, m: Message) -> Result<()> {
+        let req: BufferReadPayload = postcard::from_bytes(&m.payload)?;
+        // Two layers of validation -- buffer existence and
+        // backend-level (offset/size, support).  Both report
+        // diagnostics through the same response shape rather
+        // than a separate validation_err event, because this op
+        // is request/response and the caller is blocked on the
+        // BufferReadResponse arrival.
+        let resp = if self.table.get_buffer(req.buffer_id).is_none() {
+            BufferReadResponse {
+                bytes: Vec::new(),
+                diagnostic: Some("buffer not created on this session".into()),
+            }
+        } else {
+            match self.backend.buffer_read_bytes(
+                req.buffer_id, req.offset, req.size,
+            ) {
+                Ok(bytes) => BufferReadResponse { bytes, diagnostic: None },
+                Err(diag) => BufferReadResponse {
+                    bytes: Vec::new(),
+                    diagnostic: Some(diag),
+                },
+            }
+        };
+        self.send_response(OP_GPU_BUFFER_READ, &resp)
     }
 
     fn handle_sampler_create(&mut self, m: Message) -> Result<()> {

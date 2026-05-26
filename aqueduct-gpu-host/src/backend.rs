@@ -132,6 +132,21 @@ pub trait Backend: Send + Sync {
         Err("backend does not support inline buffer write".into())
     }
 
+    /// Inline read from a previously-created buffer.  Called by
+    /// the session when it processes `OP_GPU_BUFFER_READ`.  Default
+    /// rejects (backends without inline-read support: stub /
+    /// software / moltenvk today; Tier2Backend overrides).
+    ///
+    /// Returns `bytes.len() == size` on success.
+    fn buffer_read_bytes(
+        &self,
+        _buffer_id: ResourceId,
+        _offset: u64,
+        _size: u64,
+    ) -> Result<Vec<u8>, String> {
+        Err("backend does not support inline buffer read".into())
+    }
+
     /// Submit a frame command stream. Returns `true` if the fence
     /// should be signalled now, `false` if signaling is deferred.
     fn submit_frame(

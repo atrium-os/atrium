@@ -278,6 +278,35 @@ pub struct BufferWritePayload {
     pub bytes: Vec<u8>,
 }
 
+/// Inline buffer-content read.  Symmetric to [`BufferWritePayload`].
+/// Used by ICDs to implement `vkInvalidateMappedMemoryRanges` on
+/// HOST_VISIBLE memory backed by a daemon-side buffer (e.g. an
+/// SSBO that a compute pipeline wrote into).  Will move to shared
+/// mapped backing regions in D5+.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BufferReadPayload {
+    /// Source buffer.
+    pub buffer_id: ResourceId,
+    /// Byte offset within the buffer.
+    pub offset: u64,
+    /// Number of bytes to read.
+    pub size: u64,
+}
+
+/// Response to a [`BufferReadPayload`].  On success `bytes.len()`
+/// equals the request's `size`; on failure `bytes` is empty and
+/// `diagnostic` describes the rejection (e.g. "buffer not
+/// created on this session", "offset+size > buffer size", or a
+/// backend-specific error like "backend does not support
+/// buffer-read").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BufferReadResponse {
+    /// Bytes read from the buffer.  Empty on error.
+    pub bytes: Vec<u8>,
+    /// Diagnostic on failure.  `None` on success.
+    pub diagnostic: Option<String>,
+}
+
 // ───── Samplers ───────────────────────────────────────────────────
 
 /// Client → server: create a sampler. ID pre-assigned; no response.

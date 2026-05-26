@@ -226,6 +226,42 @@ impl GpuClient {
         self.send(aqueduct_gpu::opcodes::OP_GPU_BUFFER_WRITE, 0, &req)
     }
 
+    /// Inline buffer-content read.  Symmetric to [`write_buffer`].
+    /// The ICD calls this from `vkInvalidateMappedMemoryRanges`
+    /// (per buffer bound to the invalidated region) to pull
+    /// daemon-side compute output back into the client's
+    /// mapped pointer.  Request/response: blocks until the
+    /// daemon's `BufferReadResponse` arrives.  A non-`None`
+    /// diagnostic surfaces as `Validation` for symmetry with
+    /// the other request/response ops.
+    ///
+    /// [`write_buffer`]: Self::write_buffer
+    pub fn read_buffer(
+        &mut self,
+        buffer_id: ResourceId,
+        offset: u64,
+        size: u64,
+    ) -> GpuClientResult<Vec<u8>> {
+        let req = aqueduct_gpu::payloads::BufferReadPayload {
+            buffer_id, offset, size,
+        };
+        self.send(
+            aqueduct_gpu::opcodes::OP_GPU_BUFFER_READ,
+            flag::RESPONSE_EXPECTED,
+            &req,
+        )?;
+        let resp: aqueduct_gpu::payloads::BufferReadResponse =
+            self.recv_response(aqueduct_gpu::opcodes::OP_GPU_BUFFER_READ)?;
+        if let Some(diag) = resp.diagnostic {
+            return Err(GpuClientError::Validation {
+                opcode: aqueduct_gpu::opcodes::OP_GPU_BUFFER_READ,
+                resource_id: Some(buffer_id),
+                diagnostic: diag,
+            });
+        }
+        Ok(resp.bytes)
+    }
+
     /// Create a sampler. ID is pre-assigned. Returns it.
     pub fn create_sampler(&mut self, mut params: SamplerCreatePayload) -> GpuClientResult<ResourceId> {
         params.sampler_id = self.alloc_id()?;
