@@ -113,6 +113,7 @@ dependencies = [
  "ash",
  "atrium-spv-ir",
  "atrium-spv-loader",
+ "atrium-spv-runtime",
  "env_logger",
  "log",
  "postcard",
@@ -178,6 +179,10 @@ dependencies = [
 
 [[package]]
 name = "atrium-spv-pcmap"
+version = "0.1.0"
+
+[[package]]
+name = "atrium-spv-runtime"
 version = "0.1.0"
 
 [[package]]
