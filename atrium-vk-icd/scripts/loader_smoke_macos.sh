@@ -200,6 +200,7 @@ bit_count:0x12345678:13
 subgroup_sum:42:43
 per_thread:0:56:8:8
 per_thread_triangle:0:84:8:8
+groupshared_xor:0:24:8:1
 "
 # loop_mul un-parked Arc 144: spirv-opt --ssa-rewrite (run by
 # the daemon when --spirv-opt-binary is set) promotes Slang's

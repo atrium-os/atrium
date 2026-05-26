@@ -1105,7 +1105,15 @@ fn emit_function(
             | Op::ImageReadLod { .. } | Op::ImageWriteLod { .. }
             | Op::ImageTexelPointer { .. }
             | Op::ImageQuerySize(_))));
-    if uses_storage_image {
+    // Op::Barrier also calls through the X19-anchored image
+    // table (specifically [X19, #IMG_TABLE_BARRIER_OFFSET]), so
+    // any compute shader with a barrier needs the same prologue
+    // -- stash X0 into X19 once at function entry so the
+    // post-call image-table base survives across barrier calls
+    // even when the shader doesn't use storage images.  Arc 150.
+    let uses_barrier = func.blocks.values().any(|b|
+        b.insts.iter().any(|i| matches!(&i.op, Op::Barrier)));
+    if uses_storage_image || uses_barrier {
         int_pool.free.retain(|&r| r != 19);
         int_pool.used_callee_saved = true;
         a.emit(asm::mov_x(asm::Xreg(19), asm::Xreg(0)));
@@ -3974,6 +3982,63 @@ fn emit_function(
                             "ImageRead without result".into()))?;
                     vectors.insert(result.id, lane_vals);
                 }
+            }
+            Op::Barrier => {
+                // Workgroup-scope control barrier.  Call
+                // through the image-table barrier slot:
+                //
+                //   ldr  x9, [x19, #IMG_TABLE_BARRIER_OFFSET]
+                //   blr  x9
+                //
+                // Same spill discipline as the ImageRead/
+                // ImageWrite arm: stash live V-regs + live
+                // caller-saved int W-regs (W13..W17) across
+                // the call; LR also gets a slot.  The barrier
+                // takes no args and returns nothing, so the
+                // frame is just the spill scratch.  Arc 150.
+                let mut live_vregs: Vec<u8> = owners.keys().copied().collect();
+                live_vregs.sort();
+                let mut live_iregs: Vec<u8> = int_pool.owners.keys()
+                    .copied().filter(|&n| (13..=17).contains(&n)).collect();
+                live_iregs.sort();
+
+                let sp = asm::Xreg(31);
+                let x9 = asm::Xreg(9);
+                let x19 = asm::Xreg(19);
+                let lr = asm::Xreg(30);
+
+                let n_v = live_vregs.len() as u16;
+                let n_i = live_iregs.len() as u16;
+                // Frame: [0]   LR save (8 B + 8 pad to 16)
+                //        [16..]  V-reg spills (16 B each)
+                //        [16 + n_v*16 ..] int spills (4 B each)
+                let iregs_base: u16 = 16 + n_v * 16;
+                let raw = iregs_base + n_i * 4;
+                let frame_bytes: u16 = (raw + 15) & !15;
+                a.emit(asm::sub_imm_x(sp, sp, frame_bytes));
+                a.emit(asm::str_x_offset(lr, sp, 0));
+                for (i, n) in live_vregs.iter().enumerate() {
+                    a.emit(asm::str_q_offset(
+                        asm::Vreg(*n), sp, 16 + (i as u16) * 16));
+                }
+                for (i, n) in live_iregs.iter().enumerate() {
+                    a.emit(asm::str_w_offset(
+                        asm::Wreg(*n), sp, iregs_base + (i as u16) * 4));
+                }
+                // ldr x9, [x19, #64] = IMG_TABLE_BARRIER_OFFSET
+                a.emit(asm::ldr_x_offset(x9, x19, 64));
+                a.emit(asm::blr_x(x9));
+                // Restore.
+                for (i, n) in live_vregs.iter().enumerate() {
+                    a.emit(asm::ldr_q_offset(
+                        asm::Vreg(*n), sp, 16 + (i as u16) * 16));
+                }
+                for (i, n) in live_iregs.iter().enumerate() {
+                    a.emit(asm::ldr_w_offset(
+                        asm::Wreg(*n), sp, iregs_base + (i as u16) * 4));
+                }
+                a.emit(asm::ldr_x_offset(lr, sp, 0));
+                a.emit(asm::add_imm_x(sp, sp, frame_bytes));
             }
             other => {
                 return Err(BackendError::Unsupported(format!(

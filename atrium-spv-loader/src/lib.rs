@@ -74,8 +74,7 @@ impl LoaderConfig {
     pub fn production() -> Self {
         Self {
             cache_root: PathBuf::from("/var/atrium/shaders"),
-            abi_version: 1, // matches atrium-spv-ir's
-                            // TIER2_SHADER_ABI_VERSION
+            abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
             compile_binary: PathBuf::from("/usr/local/libexec/atrium-spv-compile"),
         }
     }

@@ -461,8 +461,19 @@ pub unsafe fn write_barrier_helper_ptr(
 /// thread-local indirection so the shader can reach it
 /// through a function pointer rather than a stable extern
 /// symbol.  Arc 150.
+/// Diagnostic counter: incremented by every `atrium_barrier`
+/// call.  Used by the dispatcher's smoke harness to confirm
+/// that compiled shaders actually call into the barrier
+/// helper.  Cheap atomic; no synchronisation cost beyond a
+/// single relaxed RMW.
+pub static ATRIUM_BARRIER_CALLS:
+    std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 #[no_mangle]
 pub unsafe extern "C" fn atrium_barrier() {
+    ATRIUM_BARRIER_CALLS.fetch_add(
+        1, std::sync::atomic::Ordering::Relaxed);
     THREAD_BARRIER.with(|cell| {
         // Clone the Arc out before waiting so we don't hold
         // the RefCell borrow across the (potentially long)

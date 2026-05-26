@@ -12,6 +12,7 @@ path = "src/lib.rs"
 [dependencies]
 atrium-spv-pcmap = { path = "../atrium-spv-pcmap" }
 atrium-spv-blob  = { path = "../atrium-spv-blob" }
+atrium-spv-ir    = { path = "../atrium-spv-ir" }
 libloading       = "0.8"
 libc             = "0.2"
 sha2             = "0.10"

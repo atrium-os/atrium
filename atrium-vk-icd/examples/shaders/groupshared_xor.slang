@@ -1,36 +1,46 @@
-// groupshared_xor.slang -- workgroup-shared memory test that
-// SURFACED a real architectural constraint: NOT a passing rung.
+// groupshared_xor.slang -- real workgroup-shared memory +
+// barrier test.  Arc 150 made this pass end-to-end through
+// the Khronos Vulkan loader.
 //
 // [numthreads(8,1,1)] makes Slang emit the cache as a genuine
 // `OpVariable Workgroup` (the [numthreads(1,1,1)] case in
-// groupshared_var was folded away by Slang's optimizer).  The
-// SPIR-V is well-formed; the daemon validates and dispatches.
+// groupshared_var was folded away by Slang's optimizer).
 //
-// But the shader is observably incorrect on Atrium tier-2.
-// Atrium's Tier2Backend::dispatch_compute runs invocations
-// within a workgroup SERIALLY on one worker thread (workgroups
-// parallelise across threads, lanes within a workgroup do not
-// -- see tier2_backend.rs ~line 1297, "Within a workgroup the
-// lz/ly/lx loop stays serial so shared-memory and ControlBarrier
-// semantics are preserved per workgroup").  OpControlBarrier
-// is therefore a no-op, and cross-lane shared-memory reads
-// only see writes from lanes with STRICTLY LOWER tid.x.
+// Each lane writes its index into cache, syncs the workgroup,
+// then reads its neighbour's value and XORs the two:
 //
-// For this shader at dispatch(1,1,1) with [numthreads(8,1,1)]:
-//   lane 0 writes cache[0]=0; reads cache[1]=0 (lane 1 hasn't run)
-//   lane 1 writes cache[1]=1; reads cache[2]=0 (lane 2 hasn't run)
-//   ...
-//   lane 7 writes cache[7]=7; reads cache[0]=0 (lane 0 has run,
-//                                              wrote 0)
-// Result: data[i] = i ^ 0 = i, NOT the intended XOR-with-neighbor.
-// Sum = 0+1+2+...+7 = 28 (vs the "real barrier" expected 24).
+//   cache[tid.x] = tid.x;
+//   GroupMemoryBarrierWithGroupSync();
+//   data[tid.x] = cache[tid.x] ^ cache[(tid.x + 1) % 8];
 //
-// A passing version would require multi-pass dispatcher execution
-// (run-until-barrier across all lanes, sync, continue) -- a real
-// change to Tier2Backend::dispatch_compute, separate arc.
+// Expected output (per "real barrier" semantics):
+//   data[0] = 0 ^ 1 = 1
+//   data[1] = 1 ^ 2 = 3
+//   data[2] = 2 ^ 3 = 1
+//   data[3] = 3 ^ 4 = 7
+//   data[4] = 4 ^ 5 = 1
+//   data[5] = 5 ^ 6 = 3
+//   data[6] = 6 ^ 7 = 1
+//   data[7] = 7 ^ 0 = 7
+//   sum     = 1+3+1+7+1+3+1+7 = 24
 //
-// Kept in tree as a doc + repro of the architectural finding.
-// NOT in EXTRA_SHADERS.
+// Before Arc 150 this was parked: invocations within a
+// workgroup ran serially on a single worker thread,
+// OpControlBarrier was a no-op, cross-lane reads of
+// cache[(i+1) % 8] saw zero because the later lane hadn't
+// run yet -- so data[i] = i ^ 0 = i, sum 28.  The "barrier
+// surfaces a real architectural constraint" finding from
+// Arc 149.
+//
+// Arc 150 made this pass by switching the dispatcher to a
+// parallel-lane mode when lx*ly*lz > 1, spawning one OS
+// thread per invocation sharing a std::sync::Barrier(N),
+// and wiring atrium_barrier into the image-table at offset
+// IMG_TABLE_BARRIER_OFFSET=64 so the compiled cs_main can
+// call it via `ldr x9, [X19, #64]; blr x9` (bespoke) or
+// load+call_indirect (cranelift).
+//
+// Run with BUFFER_U32S=8, DISPATCH_X=1, SEED=0, EXPECT=24.
 //
 // Each lane writes its index into cache, syncs the workgroup,
 // then reads its neighbour's value and XORs the two:

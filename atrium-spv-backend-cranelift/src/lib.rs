@@ -1107,6 +1107,35 @@ impl FnTranslator {
             // param at block entry; the Inst itself is a
             // no-op at this point.
             Op::Phi(_) => Ok(()),
+            Op::Barrier => {
+                // Workgroup-scope control barrier.  Same v2-ABI
+                // call-through-descriptor-table approach as the
+                // bespoke backend's Op::Barrier emit (Arc 150):
+                // load `atrium_barrier` fn ptr from
+                // `[uniforms + IMG_TABLE_BARRIER_OFFSET]` and
+                // call indirect.  uniforms == self.params[0]
+                // for compute (same X0 convention bespoke uses,
+                // arrived through the image-table base set up
+                // by Tier2Backend::dispatch_compute).
+                //
+                // Signature: `extern "C" fn()` -- no args, no
+                // return.  We import an empty Cranelift
+                // signature once and reuse it.
+                let img_table = self.params[0];
+                let ptr_ty = builder.func.dfg.value_type(img_table);
+                let fn_ptr = builder.ins().load(
+                    ptr_ty,
+                    cranelift_codegen::ir::MemFlags::new(),
+                    img_table,
+                    64, // IMG_TABLE_BARRIER_OFFSET
+                );
+                let sig = cranelift_codegen::ir::Signature::new(
+                    cranelift_codegen::isa::CallConv::SystemV,
+                );
+                let sig_ref = builder.import_signature(sig);
+                builder.ins().call_indirect(sig_ref, fn_ptr, &[]);
+                Ok(())
+            }
             Op::Return => {
                 builder.ins().return_(&[]);
                 Ok(())

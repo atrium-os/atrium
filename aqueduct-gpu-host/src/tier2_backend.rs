@@ -1204,47 +1204,48 @@ impl Tier2Backend {
             let mut m = self.compute_image_by_binding.lock().unwrap();
             m.drain().collect()
         };
+        // Always allocate the image-table buffer (Arc 150
+        // commit 3) -- the bespoke backend's Op::Barrier
+        // lowering loads `atrium_barrier` from
+        // [X19, #IMG_TABLE_BARRIER_OFFSET], which requires
+        // X0 (the image-table base) to be non-null even for
+        // shaders that don't use storage images.  Pre-150
+        // we passed NULL when no image bindings existed;
+        // now we still allocate at least the header so the
+        // barrier slot is reachable.
         let images_guard;
-        let mut image_descs: Vec<atrium_spv_runtime::ImageDesc> = Vec::new();
+        let image_descs: Vec<atrium_spv_runtime::ImageDesc>;
         let mut image_table: Vec<u8>;
-        let uni_ptr: *const u8 = if img_bindings.is_empty() {
-            std::ptr::null()
-        } else {
-            images_guard = self.images.lock().unwrap();
-            // Highest binding index decides the table size.
-            let max_binding = img_bindings.iter()
-                .map(|(b, _)| *b).max().unwrap_or(0);
-            image_descs.reserve((max_binding as usize) + 1);
-            // Build one ImageDesc per binding (in binding
-            // order so slot N lands at index N).
-            let mut slot_of: Vec<Option<usize>> =
-                vec![None; (max_binding as usize) + 1];
+        let slot_count = img_bindings.iter()
+            .map(|(b, _)| *b as usize + 1).max().unwrap_or(0);
+        image_table = atrium_spv_runtime::image_table_buffer(slot_count);
+
+        if !img_bindings.is_empty() {
+            images_guard = Some(self.images.lock().unwrap());
+            let mut descs: Vec<atrium_spv_runtime::ImageDesc> =
+                Vec::with_capacity(slot_count);
+            let mut slot_of: Vec<Option<usize>> = vec![None; slot_count];
             for &(binding, image_raw) in &img_bindings {
-                if let Some(img) = images_guard.get(&image_raw) {
-                    let idx = image_descs.len();
-                    image_descs.push(atrium_spv_runtime::ImageDesc {
+                if let Some(img) = images_guard.as_ref().unwrap().get(&image_raw) {
+                    let idx = descs.len();
+                    descs.push(atrium_spv_runtime::ImageDesc {
                         data: img.pixels.as_ptr() as *mut u8,
                         width: img.width,
                         height: img.height,
                         stride_bytes: img.width * 4,
-                        // ImageStorage is RGBA8 (4 B/texel).
                         format: atrium_spv_runtime::StorageFormat::Rgba8Unorm
                             as u32,
-                        // 2D image: single slice.
                         depth: 1,
                         slice_bytes: img.width * img.height * 4,
-                        // Single-mip; mip_descs is null for
-                        // the no-Lod path.
                         mip_count: 0,
                         mip_descs: std::ptr::null(),
                     });
                     slot_of[binding as usize] = Some(idx);
                 }
             }
-            image_table = atrium_spv_runtime::image_table_buffer(
-                (max_binding as usize) + 1);
-            // SAFETY: the helper fn pointers are in this
-            // process; image_descs outlives the dispatch.
+            // SAFETY: helper fn pointers are static-lifetime
+            // statics in atrium-spv-runtime; descs outlive the
+            // dispatch (held by `image_descs` below).
             unsafe {
                 atrium_spv_runtime::write_image_helper_pointers(
                     &mut image_table,
@@ -1260,12 +1261,33 @@ impl Tier2Backend {
                     if let Some(idx) = maybe_idx {
                         atrium_spv_runtime::write_image_descriptor_slot(
                             &mut image_table, binding,
-                            &image_descs[*idx] as *const _);
+                            &descs[*idx] as *const _);
                     }
                 }
             }
-            image_table.as_ptr()
-        };
+            image_descs = descs;
+        } else {
+            images_guard = None;
+            image_descs = Vec::new();
+        }
+
+        // Populate the IMG_TABLE_BARRIER_OFFSET slot with the
+        // atrium_barrier fn ptr.  The bespoke backend's
+        // Op::Barrier lowering emits `ldr x9, [X19, #64]; blr
+        // x9` against this slot.  When no barrier is in flight
+        // (single-invocation case) atrium_barrier returns
+        // immediately, so populating unconditionally is safe
+        // for every compute dispatch.  Arc 150.
+        // SAFETY: atrium_barrier is a static-lifetime extern
+        // "C" function in atrium-spv-runtime.
+        unsafe {
+            atrium_spv_runtime::write_barrier_helper_ptr(
+                &mut image_table,
+                atrium_spv_runtime::atrium_barrier,
+            );
+        }
+        let uni_ptr: *const u8 = image_table.as_ptr();
+        let _ = (images_guard, image_descs); // hold for lifetime
 
         let total_invocations = (cmd.group_count_x as u64)
             * (cmd.group_count_y as u64) * (cmd.group_count_z as u64)
@@ -1379,26 +1401,88 @@ impl Tier2Backend {
                         } else {
                             wg_buf.as_mut_ptr()
                         };
-                        for lz in 0..lz_n {
-                            for ly in 0..ly_n {
-                                for lx in 0..lx_n {
-                                    // SAFETY: cs_main is a dlopened
-                                    // C-ABI function whose signature
-                                    // matches CsMain (checked at
-                                    // open time); the output buffer
-                                    // and descriptor table outlive
-                                    // this scope; wg_buf outlives
-                                    // the inner loop.
-                                    unsafe {
-                                        cs_main(
-                                            uni_ptr, pc_ptr, out_ptr,
-                                            gx, gy, gz,
-                                            lx, ly, lz,
-                                            wg_ptr,
-                                        );
+                        // Lanes within a workgroup execute in
+                        // one of two modes:
+                        //
+                        // (a) Serial -- when lx*ly*lz == 1.  No
+                        //     possible cross-lane synchronisation;
+                        //     just call cs_main once.  Skips the
+                        //     OS-thread spawn overhead for the
+                        //     common single-invocation case
+                        //     (every Arc 6-149 rung).
+                        //
+                        // (b) Parallel -- when lx*ly*lz > 1.  One
+                        //     std::thread per invocation, sharing
+                        //     an Arc<std::sync::Barrier> via the
+                        //     atrium-spv-runtime's THREAD_BARRIER
+                        //     TLS slot.  atrium_barrier (called
+                        //     from compiled cs_main on Op::Barrier)
+                        //     reads the TLS and waits, so
+                        //     cross-lane shared-memory writes
+                        //     before the barrier are visible to
+                        //     reads after.  Arc 150 commit 3.
+                        let n_lanes = (lx_n * ly_n * lz_n) as usize;
+                        if n_lanes == 1 {
+                            // SAFETY: cs_main is a dlopened
+                            // C-ABI function whose signature
+                            // matches CsMain (checked at open
+                            // time); output buffer + descriptor
+                            // table outlive this scope; wg_buf
+                            // outlives the inner block.
+                            unsafe {
+                                cs_main(
+                                    uni_ptr, pc_ptr, out_ptr,
+                                    gx, gy, gz,
+                                    0, 0, 0,
+                                    wg_ptr,
+                                );
+                            }
+                        } else {
+                            let barrier = std::sync::Arc::new(
+                                std::sync::Barrier::new(n_lanes));
+                            let uni_a = uni_ptr as usize;
+                            let pc_a  = pc_ptr  as usize;
+                            let out_a = out_ptr as usize;
+                            let wg_a  = wg_ptr  as usize;
+                            std::thread::scope(|ws| {
+                                for lz in 0..lz_n {
+                                    for ly in 0..ly_n {
+                                        for lx in 0..lx_n {
+                                            let barrier = barrier.clone();
+                                            ws.spawn(move || {
+                                                atrium_spv_runtime::set_thread_barrier(barrier);
+                                                // SAFETY: same as the
+                                                // serial arm above;
+                                                // additionally, the
+                                                // ImageDesc table base
+                                                // (in uni_a) is
+                                                // shared-read-only,
+                                                // and the per-binding
+                                                // output buffers were
+                                                // sized at workgroup-
+                                                // count granularity
+                                                // so cross-lane
+                                                // writes within the
+                                                // same workgroup are
+                                                // a use-pattern the
+                                                // shader's atomics +
+                                                // barriers manage.
+                                                unsafe {
+                                                    cs_main(
+                                                        uni_a as *const u8,
+                                                        pc_a  as *const u8,
+                                                        out_a as *mut u8,
+                                                        gx, gy, gz,
+                                                        lx, ly, lz,
+                                                        wg_a as *mut u8,
+                                                    );
+                                                }
+                                                atrium_spv_runtime::clear_thread_barrier();
+                                            });
+                                        }
                                     }
                                 }
-                            }
+                            });
                         }
                     }
                 });

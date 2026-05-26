@@ -3273,7 +3273,21 @@ fn translate_inst(
         // ignored (Op::Barrier covers every meaningful pair
         // for tier-2's single-threaded-per-lane model).
         SpvOp::ControlBarrier => {
-            let exec_scope_id = expect_id(&spv_inst.operands, 0)?;
+            // OpControlBarrier's first operand is `Scope` (an
+            // IdScope grammar kind in rspirv, not the more
+            // common IdRef).  `expect_id` rejects IdScope, so
+            // we read the operand directly here.  All three
+            // operands (execution scope, memory scope, memory
+            // semantics) are constant Scope/MemorySemantics ids
+            // in well-formed SPIR-V; we only care about the
+            // execution scope today (Arc 150).
+            let exec_scope_id = match spv_inst.operands.first() {
+                Some(Operand::IdScope(id)) => *id,
+                Some(Operand::IdRef(id))   => *id, // tolerated
+                other => return Err(FrontendError::Malformed(format!(
+                    "OpControlBarrier expected IdScope at operand 0, got {other:?}",
+                ))),
+            };
             let exec_scope = match constants.get(exec_scope_id) {
                 Some(c) => match &c.kind {
                     crate::constants::ConstantKind::Scalar(
