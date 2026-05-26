@@ -97,6 +97,21 @@
 #                                      (GLSL.std.450 UMax;
 #                                      first loader-mediated
 #                                      ext-inst rung)
+#                       float_sqrt  -- uint(sqrt(float(x)))
+#                                      (int <-> float cast +
+#                                      GLSL.std.450 Sqrt; first
+#                                      rung that exercises the
+#                                      bespoke backend's FP
+#                                      register class through
+#                                      the loader)
+#                       ternary     -- (x & 1) ? 1 : 0
+#                                      (Slang lowers C ternary
+#                                      to branch + OpVariable
+#                                      Function -- same merge
+#                                      shape as branch.slang
+#                                      but a different idiom
+#                                      worth exercising for
+#                                      coverage)
 #
 # Pre-reqs (one-time):
 #   * brew install vulkan-headers vulkan-loader vulkan-tools
@@ -151,6 +166,8 @@ loop_mul:1:32
 branch:200:100
 sum_loop:5:15
 max_const:50:100
+float_sqrt:100:10
+ternary:7:1
 "
 # loop_mul un-parked Arc 144: spirv-opt --ssa-rewrite (run by
 # the daemon when --spirv-opt-binary is set) promotes Slang's
