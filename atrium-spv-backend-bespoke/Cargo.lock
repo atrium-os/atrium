@@ -51,6 +51,7 @@ dependencies = [
  "atrium-spv-blob",
  "atrium-spv-ir",
  "atrium-spv-pcmap",
+ "atrium-spv-runtime",
  "cranelift-codegen",
  "cranelift-frontend",
  "cranelift-module",

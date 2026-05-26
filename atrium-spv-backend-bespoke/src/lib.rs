@@ -38,6 +38,21 @@ use atrium_spv_ir::{
     Value, ValueId,
 };
 use pptk_codegen_arm64::asm;
+
+/// Byte offset of the `atrium_barrier` function-pointer slot
+/// within the compute image-table.  Sourced from
+/// [`atrium_spv_runtime::IMG_TABLE_BARRIER_OFFSET`]; narrowed
+/// to `u16` because the bespoke backend's ARM64 immediate
+/// encodings take `u16` displacements.  See Arc 150.
+const IMG_TABLE_BARRIER_OFFSET_U16: u16 =
+    atrium_spv_runtime::IMG_TABLE_BARRIER_OFFSET as u16;
+
+/// Byte offset of the first image-descriptor slot within the
+/// compute image-table.  Sourced from
+/// [`atrium_spv_runtime::IMG_TABLE_DESC_BASE`]; narrowed to
+/// `u16` for the same reason as the barrier offset above.
+const IMG_TABLE_DESC_BASE_U16: u16 =
+    atrium_spv_runtime::IMG_TABLE_DESC_BASE as u16;
 use thiserror::Error;
 
 /// What went wrong compiling a module.
@@ -3624,7 +3639,7 @@ fn emit_function(
                 } else { None };
                 // ImageDesc* lives at [X19, #32 + binding*8]
                 // (the helper header is 32 B: 2D r/w + 3D r/w).
-                let desc_off: u16 = 72 + (binding as u16) * 8;
+                let desc_off: u16 = IMG_TABLE_DESC_BASE_U16 + (binding as u16) * 8;
                 let dst_w = int_pool.alloc(result.id)?;
                 let dst_x = asm::Xreg(dst_w.0);
                 let x9 = asm::Xreg(9);
@@ -3672,7 +3687,7 @@ fn emit_function(
                     .ok_or_else(|| BackendError::Internal(format!(
                         "ImageQuerySize image {:?} not an ImageHandle",
                         image.id)))?;
-                let desc_off: u16 = 72 + (binding as u16) * 8;
+                let desc_off: u16 = IMG_TABLE_DESC_BASE_U16 + (binding as u16) * 8;
                 let x9 = asm::Xreg(9);
                 a.emit(asm::ldr_x_offset(x9, asm::Xreg(19), desc_off));
                 // ImageDesc field offsets: width @8, height @12,
@@ -3885,7 +3900,7 @@ fn emit_function(
                     };
                     block_base + within
                 };
-                let desc_off: u16 = 72 + (binding as u16) * 8;
+                let desc_off: u16 = IMG_TABLE_DESC_BASE_U16 + (binding as u16) * 8;
                 // rgba pointer register: X3 (2D), X4 (3D or
                 // 2D Lod), X5 (3D Lod).  Each extra arg in
                 // the helper signature shifts the rgba slot
@@ -4026,7 +4041,7 @@ fn emit_function(
                         asm::Wreg(*n), sp, iregs_base + (i as u16) * 4));
                 }
                 // ldr x9, [x19, #64] = IMG_TABLE_BARRIER_OFFSET
-                a.emit(asm::ldr_x_offset(x9, x19, 64));
+                a.emit(asm::ldr_x_offset(x9, x19, IMG_TABLE_BARRIER_OFFSET_U16));
                 a.emit(asm::blr_x(x9));
                 // Restore.
                 for (i, n) in live_vregs.iter().enumerate() {

@@ -43,6 +43,20 @@ use atrium_spv_ir::{
     FloatKind, Module, Op, ShaderStage, StorageClass, Type, ValueId,
 };
 
+/// Byte offset of the `atrium_barrier` function-pointer slot
+/// within the compute image-table.  Sourced from
+/// [`atrium_spv_runtime::IMG_TABLE_BARRIER_OFFSET`]; narrowed
+/// to `i32` for cranelift's load-offset operand type.  Arc 150.
+const IMG_TABLE_BARRIER_OFFSET_I32: i32 =
+    atrium_spv_runtime::IMG_TABLE_BARRIER_OFFSET as i32;
+
+/// Byte offset of the first image-descriptor slot within the
+/// compute image-table.  Sourced from
+/// [`atrium_spv_runtime::IMG_TABLE_DESC_BASE`]; narrowed to
+/// `i32` for the same reason as the barrier offset.
+const IMG_TABLE_DESC_BASE_I32: i32 =
+    atrium_spv_runtime::IMG_TABLE_DESC_BASE as i32;
+
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{
     AbiParam, Function as ClifFunction, InstBuilder, MemFlags, Signature,
@@ -1127,7 +1141,7 @@ impl FnTranslator {
                     ptr_ty,
                     cranelift_codegen::ir::MemFlags::new(),
                     img_table,
-                    64, // IMG_TABLE_BARRIER_OFFSET
+                    IMG_TABLE_BARRIER_OFFSET_I32,
                 );
                 let sig = cranelift_codegen::ir::Signature::new(
                     cranelift_codegen::isa::CallConv::SystemV,
@@ -1926,7 +1940,7 @@ impl FnTranslator {
                 let pointer_type = builder.func.dfg
                     .value_type(self.params[0]);
                 let img_table = self.params[0];
-                let desc_off: i32 = 72 + (binding as i32) * 8;
+                let desc_off: i32 = IMG_TABLE_DESC_BASE_I32 + (binding as i32) * 8;
                 let desc_ptr = builder.ins().load(
                     pointer_type, MemFlags::new(), img_table, desc_off);
                 // ImageDesc fields: width @8, height @12, depth @24.
@@ -2010,7 +2024,7 @@ impl FnTranslator {
                 let pointer_type = builder.func.dfg
                     .value_type(self.params[0]);
                 let img_table = self.params[0];
-                let desc_off: i32 = 72 + (binding as i32) * 8;
+                let desc_off: i32 = IMG_TABLE_DESC_BASE_I32 + (binding as i32) * 8;
                 let desc_ptr = builder.ins().load(
                     pointer_type, MemFlags::new(), img_table, desc_off);
                 // data ptr @ #0
@@ -2100,7 +2114,7 @@ impl FnTranslator {
                     };
                     block_base + within
                 };
-                let desc_off: i32 = 72 + (binding as i32) * 8;
+                let desc_off: i32 = IMG_TABLE_DESC_BASE_I32 + (binding as i32) * 8;
                 let fn_ptr = builder.ins().load(
                     pointer_type, MemFlags::new(), img_table, helper_off);
                 let desc_ptr = builder.ins().load(

@@ -34,6 +34,7 @@ dependencies = [
  "atrium-spv-frontend",
  "atrium-spv-ir",
  "atrium-spv-pcmap",
+ "atrium-spv-runtime",
  "atrium-spv-tests",
  "cranelift-codegen",
  "cranelift-frontend",

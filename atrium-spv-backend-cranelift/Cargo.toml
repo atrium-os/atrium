@@ -13,6 +13,10 @@ path = "src/lib.rs"
 atrium-spv-ir       = { path = "../atrium-spv-ir" }
 atrium-spv-pcmap    = { path = "../atrium-spv-pcmap" }
 atrium-spv-blob     = { path = "../atrium-spv-blob" }
+# For IMG_TABLE_BARRIER_OFFSET + IMG_TABLE_DESC_BASE -- the
+# compute-side image-table layout constants Op::Barrier and
+# the storage-image ops dereference against (Arc 150).
+atrium-spv-runtime  = { path = "../atrium-spv-runtime" }
 cranelift-codegen   = { version = "0.131", features = ["std"] }
 cranelift-module    = { version = "0.131", features = ["std"] }
 cranelift-object    = "0.131"
