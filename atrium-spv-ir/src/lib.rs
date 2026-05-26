@@ -1202,7 +1202,17 @@ pub struct Varying {
 /// Old cached `.so`s become unreachable under the new
 /// version directory (constraint F3); next launch
 /// recompiles transparently.
-pub const TIER2_SHADER_ABI_VERSION: u32 = 1;
+pub const TIER2_SHADER_ABI_VERSION: u32 = 2;
+//
+// History:
+//   v1 -- original tier-2 ABI (Arc 1-149).
+//   v2 -- Arc 150 carves an 8-byte slot at byte 64 of the
+//         compute image-table for the `atrium_barrier`
+//         function pointer.  Image-descriptor base shifts
+//         from 64 to 72.  Existing cached .so files have the
+//         old offset baked in; bumping the ABI version sends
+//         them into a different cache directory, forcing
+//         transparent recompile on first run.
 
 // ── Doc-only re-exports ────────────────────────────────────────
 //

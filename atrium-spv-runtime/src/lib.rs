@@ -348,10 +348,23 @@ pub fn descriptor_table_buffer(count: usize) -> Vec<u8> {
 // Storage images have no sampler, so each slot is one
 // pointer (8 bytes) rather than the texture table's pair.
 
+/// Offset of the `atrium_barrier` function-pointer slot
+/// within the compute image-table buffer.  The bespoke
+/// backend's lowering of `Op::Barrier` emits
+/// `ldr x9, [X19, #IMG_TABLE_BARRIER_OFFSET]; blr x9`.  The
+/// dispatcher (`Tier2Backend::dispatch_compute`) populates
+/// this slot before each dispatch.  Added in Arc 150
+/// (commit 2 of the workgroup-barrier work).
+pub const IMG_TABLE_BARRIER_OFFSET: usize = 64;
+
 /// Offset of the descriptor table within the compute
 /// storage-image table buffer.  Grew from 32 to 64 when the
-/// four `_lod` mip-aware helpers were added in Arc 26.
-pub const IMG_TABLE_DESC_BASE: usize = 64;
+/// four `_lod` mip-aware helpers were added in Arc 26, and
+/// from 64 to 72 when `IMG_TABLE_BARRIER_OFFSET` carved out
+/// an 8-byte slot for the `atrium_barrier` fn ptr at byte 64
+/// (Arc 150).  ABI-breaking change -- invalidates every
+/// pre-v2 cached shader.
+pub const IMG_TABLE_DESC_BASE: usize = 72;
 
 /// Bytes per storage-image descriptor slot — one
 /// `ImageDesc*`.
@@ -410,6 +423,81 @@ pub unsafe fn write_image_helper_pointers(
     buf[40..48].copy_from_slice(&w2l);
     buf[48..56].copy_from_slice(&r3l);
     buf[56..64].copy_from_slice(&w3l);
+}
+
+/// Write the `atrium_barrier` function pointer into the
+/// image-table at [`IMG_TABLE_BARRIER_OFFSET`].  The
+/// dispatcher calls this once per dispatch before invoking
+/// the shader; bespoke + cranelift backends lower
+/// `Op::Barrier` to a load-and-call through this slot.
+///
+/// # Safety
+/// `barrier_fn` must outlive every shader invocation using
+/// this buffer (in practice it points at
+/// [`atrium_barrier`] in this crate, which is static-lifetime).
+pub unsafe fn write_barrier_helper_ptr(
+    buf: &mut [u8],
+    barrier_fn: unsafe extern "C" fn(),
+) {
+    assert!(buf.len() >= IMG_TABLE_BARRIER_OFFSET + 8,
+        "image table buffer too small for the barrier slot");
+    let bytes = (barrier_fn as usize as u64).to_le_bytes();
+    buf[IMG_TABLE_BARRIER_OFFSET..IMG_TABLE_BARRIER_OFFSET + 8]
+        .copy_from_slice(&bytes);
+}
+
+/// Workgroup-scope control barrier.  Called by compiled
+/// shaders at every `Op::Barrier` site (originally a
+/// SPIR-V `OpControlBarrier` with `Scope::Workgroup`).
+///
+/// Reads a per-thread barrier handle (set by
+/// [`set_thread_barrier`] in the dispatcher) and waits on it.
+/// When the handle is `None`, returns immediately -- this is
+/// the single-invocation-per-workgroup case where there's
+/// nothing to synchronise with.
+///
+/// The actual `std::sync::Barrier` lives in the dispatcher
+/// (one per workgroup); the runtime side just owns the
+/// thread-local indirection so the shader can reach it
+/// through a function pointer rather than a stable extern
+/// symbol.  Arc 150.
+#[no_mangle]
+pub unsafe extern "C" fn atrium_barrier() {
+    THREAD_BARRIER.with(|cell| {
+        // Clone the Arc out before waiting so we don't hold
+        // the RefCell borrow across the (potentially long)
+        // wait -- another path on the same thread might want
+        // to read the cell.  (Today nothing else does, but
+        // the discipline is cheap.)
+        let b = cell.borrow().clone();
+        if let Some(b) = b {
+            b.wait();
+        }
+    });
+}
+
+thread_local! {
+    /// Per-OS-thread workgroup barrier handle.  The dispatcher
+    /// (`Tier2Backend::dispatch_compute`, Arc 150 commit 3)
+    /// constructs one `Arc<std::sync::Barrier>` per workgroup,
+    /// then for each invocation spawns a thread, stashes the
+    /// Arc in this TLS slot, calls cs_main, and clears the
+    /// slot.  `atrium_barrier` reads it.
+    static THREAD_BARRIER:
+        std::cell::RefCell<Option<std::sync::Arc<std::sync::Barrier>>>
+        = const { std::cell::RefCell::new(None) };
+}
+
+/// Set the per-thread barrier handle.  Called by
+/// `Tier2Backend::dispatch_compute` before invoking cs_main
+/// in a worker thread.
+pub fn set_thread_barrier(b: std::sync::Arc<std::sync::Barrier>) {
+    THREAD_BARRIER.with(|cell| *cell.borrow_mut() = Some(b));
+}
+
+/// Clear the per-thread barrier handle after cs_main returns.
+pub fn clear_thread_barrier() {
+    THREAD_BARRIER.with(|cell| *cell.borrow_mut() = None);
 }
 
 /// Write an `ImageDesc*` at binding slot `slot`.
