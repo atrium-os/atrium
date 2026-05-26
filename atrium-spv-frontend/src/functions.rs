@@ -5488,9 +5488,16 @@ fn translate_inst(
                     Op::FSqrt(dot_dd)
                 }
                 35 => {
-                    // FMod(x, y) ≡ x - y * floor(x / y).
-                    // Common idiom in glsl shaders for
-                    // periodic / wrap-around behaviour.
+                    // GLSL.std.450 #35 is Modf in the spec, but
+                    // Atrium accepts a two-operand FMod-shaped call
+                    // (x, y) -> x - y * floor(x / y) for shaders /
+                    // tests that emit `mod(x, y)` via ExtInst
+                    // instead of the core OpFMod opcode (opcode
+                    // 141).  Genuine Modf with a pointer out-param
+                    // would resolve_value the pointer and surface
+                    // as an Unsupported via the operand-shape
+                    // check; the synthesised path below only fires
+                    // for two value operands.
                     let x_id = expect_id(&spv_inst.operands, 2)?;
                     let y_id = expect_id(&spv_inst.operands, 3)?;
                     let x = resolve_value(x_id, types, constants, id_map,
