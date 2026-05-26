@@ -852,6 +852,41 @@ pub enum Op {
     /// SSA phi node. Always at the start of a merge block;
     /// the IR validator (phase 2) enforces that.
     Phi(Vec<PhiArm>),
+
+    // ── Synchronisation ────────────────────────────────────────
+
+    /// Workgroup-scope control barrier (SPIR-V's
+    /// `OpControlBarrier` with `Scope::Workgroup` execution
+    /// scope, and any memory scope / semantics).  Every
+    /// invocation in the workgroup must reach this point before
+    /// any moves past it.
+    ///
+    /// Memory scope and semantics from the SPIR-V operands are
+    /// intentionally not carried in the IR: Atrium's tier-2
+    /// dispatcher implements all four meaningful combinations
+    /// (Workgroup / Subgroup × Acquire / Release / AcqRel) as
+    /// a single synchronous wait at this point, because the
+    /// only synchronisation primitive the dispatcher has is
+    /// the per-workgroup `std::sync::Barrier`.  Atomic ops
+    /// within the workgroup carry their own ordering via
+    /// `Op::AtomicIAdd` etc.
+    ///
+    /// `OpControlBarrier` with non-Workgroup execution scope
+    /// (e.g. Device or Subgroup) is rejected at frontend
+    /// translation time: tier-2 has no Device-scope parallel
+    /// dispatcher, and at subgroupSize=1 a Subgroup-scope
+    /// barrier is trivially satisfied by every invocation.
+    /// The frontend short-circuits Subgroup-scope to
+    /// translate-as-nothing.
+    ///
+    /// `OpMemoryBarrier` (no execution scope, just memory
+    /// fences) is currently translated as a no-op: the only
+    /// memory the dispatcher actually parallelises across is
+    /// workgroup-shared memory, which Op::Barrier already
+    /// covers.  Add a separate Op::MemoryBarrier in the
+    /// future if we add device-shared memory paths that need
+    /// cache fences without a barrier.
+    Barrier,
 }
 
 /// Width + signedness for integer constants and conversions.

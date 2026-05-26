@@ -3253,16 +3253,70 @@ fn translate_inst(
         // dispatched to the appropriate IR op constructor.
         // Memory scope + semantics are ignored on the serial
         // dispatcher (see Op::AtomicIAdd comment in spv-ir).
-        // OpControlBarrier / OpMemoryBarrier: synchronisation
-        // primitives that the SPIR-V spec defines for parallel
-        // invocations.  On Tier-2's serial dispatcher there is
-        // nothing to synchronise -- invocations run to
-        // completion one at a time, so both barriers are
-        // semantic no-ops.  Translate to nothing (no IR Inst
-        // is pushed).  When the dispatcher parallelises, this
-        // arm needs to emit a real Op::Barrier that the
-        // backends lower to dmb / dsb / isb on ARM64.
-        SpvOp::ControlBarrier | SpvOp::MemoryBarrier => {
+        // OpControlBarrier: synchronisation across all
+        // invocations in a workgroup.  Tier-2's dispatcher
+        // runs each invocation in its own OS thread for
+        // workgroups with > 1 invocation (Arc 150+), so this
+        // is no longer a no-op.  We emit Op::Barrier; the
+        // backends lower to a call through the per-dispatch
+        // image-table barrier slot, which the dispatcher
+        // points at `atrium_spv_runtime::atrium_barrier`.
+        //
+        // The SPIR-V execution-scope operand (operand 0) is
+        // a constant id whose value is a Scope enumerant:
+        //   Workgroup = 2  -- the common case; emit Op::Barrier
+        //   Subgroup  = 3  -- at subgroupSize=1 every barrier
+        //                     is trivially satisfied; skip
+        //   Device    = 1  -- tier-2 has no device-scope
+        //                     dispatcher; reject as unsupported
+        // Memory scope and semantics operands are decoded but
+        // ignored (Op::Barrier covers every meaningful pair
+        // for tier-2's single-threaded-per-lane model).
+        SpvOp::ControlBarrier => {
+            let exec_scope_id = expect_id(&spv_inst.operands, 0)?;
+            let exec_scope = match constants.get(exec_scope_id) {
+                Some(c) => match &c.kind {
+                    crate::constants::ConstantKind::Scalar(
+                        Op::ConstInt { value, .. }
+                    ) => *value as u32,
+                    _ => return Err(FrontendError::Unsupported(format!(
+                        "OpControlBarrier execution-scope id {exec_scope_id} \
+                         resolves to non-integer constant"))),
+                },
+                None => return Err(FrontendError::Unsupported(format!(
+                    "OpControlBarrier execution-scope id {exec_scope_id} \
+                     not a constant -- non-constant scopes are not \
+                     supported in phase 1 v3"))),
+            };
+            match exec_scope {
+                2 => {
+                    // Workgroup scope: real barrier.
+                    insts.push(Inst {
+                        op: Op::Barrier,
+                        result: None,
+                        source_spirv_offset,
+                    });
+                    Ok(())
+                }
+                3 => {
+                    // Subgroup scope: at subgroupSize=1 every
+                    // lane sees its own value, so no actual
+                    // synchronisation needed.
+                    Ok(())
+                }
+                other => Err(FrontendError::Unsupported(format!(
+                    "OpControlBarrier execution-scope {other} not \
+                     supported (Workgroup=2 and Subgroup=3 only)",
+                ))),
+            }
+        }
+        // OpMemoryBarrier: just a memory fence with no
+        // execution-scope sync.  Tier-2's dispatcher
+        // parallelises only across workgroups (within a
+        // workgroup invocations either run serially or
+        // share a real Barrier::wait), and atomics carry
+        // their own ordering.  No code generation needed.
+        SpvOp::MemoryBarrier => {
             Ok(())
         }
 
