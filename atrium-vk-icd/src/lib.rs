@@ -9604,6 +9604,24 @@ mod tests {
         assert_eq!(offset_of!(vk::PresentInfoKHR, p_image_indices),  48);
         assert_eq!(offset_of!(vk::PresentInfoKHR, p_results),        56);
 
+        // VkSurfaceCapabilitiesKHR
+        // (vkGetPhysicalDeviceSurfaceCapabilitiesKHR):
+        // 52-byte struct, no sType / pNext header (1.0 query),
+        // ICD writes every field by raw u32 offset 0..52.  Drift
+        // here would mis-report image counts / extents and break
+        // every swapchain creation against this surface.
+        assert_eq!(offset_of!(vk::SurfaceCapabilitiesKHR, min_image_count),               0);
+        assert_eq!(offset_of!(vk::SurfaceCapabilitiesKHR, max_image_count),               4);
+        assert_eq!(offset_of!(vk::SurfaceCapabilitiesKHR, current_extent),                8);
+        assert_eq!(offset_of!(vk::SurfaceCapabilitiesKHR, min_image_extent),             16);
+        assert_eq!(offset_of!(vk::SurfaceCapabilitiesKHR, max_image_extent),             24);
+        assert_eq!(offset_of!(vk::SurfaceCapabilitiesKHR, max_image_array_layers),       32);
+        assert_eq!(offset_of!(vk::SurfaceCapabilitiesKHR, supported_transforms),         36);
+        assert_eq!(offset_of!(vk::SurfaceCapabilitiesKHR, current_transform),            40);
+        assert_eq!(offset_of!(vk::SurfaceCapabilitiesKHR, supported_composite_alpha),    44);
+        assert_eq!(offset_of!(vk::SurfaceCapabilitiesKHR, supported_usage_flags),        48);
+        assert_eq!(std::mem::size_of::<vk::SurfaceCapabilitiesKHR>(),                    52);
+
         // VkBufferMemoryRequirementsInfo2 +
         // VkImageMemoryRequirementsInfo2 (vkGetBuffer/Image-
         // MemoryRequirements2) -- Arc 110.
