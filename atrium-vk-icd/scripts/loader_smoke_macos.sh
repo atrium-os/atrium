@@ -45,7 +45,15 @@
 #                     runtime, vkInvalidateMappedMemoryRanges pulls
 #                     the result back through OP_GPU_BUFFER_READ,
 #                     the client asserts ssbo[0] == 42.  The
-#                     complete chain proven from a real Vulkan app.
+#                     complete chain proven from a real Vulkan app
+#                     with a hand-built rspirv module.
+#
+#   7. slang round-trip -- same example, but the SPIR-V comes from
+#                     slangc compiling write_42.slang instead of
+#                     being hand-built via rspirv.  Atrium's
+#                     canonical shader compiler.  Proves the SPV
+#                     path works for real third-party SPIR-V
+#                     producers, not just our synthetic tests.
 #
 # Pre-reqs (one-time):
 #   * brew install vulkan-headers vulkan-loader vulkan-tools
@@ -66,6 +74,9 @@ EXAMPLE="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_smoke"
 ROUNDTRIP="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_compute_roundtrip"
 DAEMON="$REPO_ROOT/aqueduct-gpu-host/target/debug/aqueduct-gpu-host"
 COMPILE="$REPO_ROOT/atrium-spv-compile/target/debug/atrium-spv-compile"
+SLANGC="$REPO_ROOT/external/slang-bin/bin/slangc"
+SLANG_SRC="$REPO_ROOT/atrium-vk-icd/examples/shaders/write_42.slang"
+SLANG_SPV="$REPO_ROOT/atrium-vk-icd/examples/shaders/write_42.comp.spv"
 SOCKET="/tmp/atrium-vk-icd-loader-smoke.sock"
 CACHE_ROOT="/tmp/atrium-vk-icd-loader-cache"
 MANIFEST="$(mktemp -t atrium_icd.XXXXXX).json"
@@ -101,12 +112,58 @@ echo "==> manifest: $MANIFEST"
 
 cleanup() {
     if [ -n "${DAEMON_PID:-}" ]; then
+        # SIGTERM first; if the daemon is wedged in a blocking
+        # syscall that doesn't honour it, follow up with SIGKILL
+        # after 250 ms.  Without this fallback an unresponsive
+        # daemon would hang the trap forever.
         kill "$DAEMON_PID" 2>/dev/null || true
-        wait 2>/dev/null || true
+        ( sleep 0.25 && kill -KILL "$DAEMON_PID" 2>/dev/null ) &
+        # Bounded wait: bash `wait` blocks until the PID exits,
+        # but the SIGKILL fallback above guarantees that happens
+        # within ~250 ms.
+        wait "$DAEMON_PID" 2>/dev/null || true
     fi
     rm -f "$SOCKET" "$MANIFEST"
 }
 trap cleanup EXIT INT TERM
+
+# Same-shape kill used between rungs: SIGTERM, SIGKILL fallback,
+# bounded wait on the specific PID (not all children).
+kill_daemon() {
+    local pid="$1"
+    [ -z "$pid" ] && return 0
+    kill "$pid" 2>/dev/null || true
+    ( sleep 0.25 && kill -KILL "$pid" 2>/dev/null ) &
+    wait "$pid" 2>/dev/null || true
+}
+
+# Wipe the tier-2 cache exactly once, at script start.  Earlier
+# revisions wiped it between every rung "for hermetic isolation",
+# which forced atrium-spv-compile to re-compile each shader from
+# scratch (~1 s per shader) on every tier-2 rung.  Total cost was
+# ~5 s for an essentially no-op repeat compile.  Now: first rung
+# to use a given shader does the compile, subsequent rungs hit
+# the warm cache.  Lifetime: one script run.
+rm -rf "$CACHE_ROOT"
+
+# Wait for the daemon's listen socket to appear (or its process
+# to die).  Polls every 25 ms up to ~2 s.  Replaces the original
+# blanket `sleep 1` per rung, which added 5 s of fixed wait
+# across the script.
+wait_for_daemon() {
+    local pid="$1"
+    local sock="$2"
+    local n=0
+    while [ "$n" -lt 80 ]; do
+        if [ -S "$sock" ]; then return 0; fi
+        if ! kill -0 "$pid" 2>/dev/null; then
+            return 1
+        fi
+        sleep 0.025
+        n=$((n + 1))
+    done
+    return 1
+}
 
 # ── Rung 1: ABI smoke (no daemon) ────────────────────────────────
 echo
@@ -121,8 +178,7 @@ set -e
 rm -f "$SOCKET"
 "$DAEMON" --socket "$SOCKET" --backend software >/tmp/aqueduct-loader-smoke.log 2>&1 &
 DAEMON_PID=$!
-sleep 1
-if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
     echo "daemon failed to start; log:" >&2
     cat /tmp/aqueduct-loader-smoke.log >&2
     exit 1
@@ -142,7 +198,7 @@ DYLD_LIBRARY_PATH=/opt/homebrew/lib \
   vulkaninfo > /tmp/atrium-vulkaninfo.out 2>&1
 echo "vulkaninfo exit=$?  (output in /tmp/atrium-vulkaninfo.out, $(wc -l </tmp/atrium-vulkaninfo.out | tr -d ' ') lines)"
 
-kill "$DAEMON_PID" 2>/dev/null; wait 2>/dev/null
+kill_daemon "$DAEMON_PID"
 DAEMON_PID=""
 
 # ── Rung 4: tier-2 (shader upload) ───────────────────────────────
@@ -150,7 +206,7 @@ if [ ! -x "$EXAMPLE" ] || [ ! -x "$COMPILE" ]; then
     echo
     echo "SKIP Rung 4: tier-2 (need 'cargo build -p atrium-vk-icd --example loader_smoke' + 'cargo build -p atrium-spv-compile')"
 else
-    rm -rf "$CACHE_ROOT" "$SOCKET"
+    rm -f "$SOCKET"
     "$DAEMON" --socket "$SOCKET" \
         --backend software \
         --tier2 \
@@ -158,8 +214,7 @@ else
         --compile-binary "$COMPILE" \
         > /tmp/aqueduct-loader-smoke.log 2>&1 &
     DAEMON_PID=$!
-    sleep 1
-    if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
         echo "daemon failed to start (tier-2 mode); log:" >&2
         cat /tmp/aqueduct-loader-smoke.log >&2
         exit 1
@@ -177,7 +232,7 @@ else
         echo "FAIL: tier-2 did not produce the expected cache artifacts" >&2
         exit 1
     fi
-    kill "$DAEMON_PID" 2>/dev/null; wait 2>/dev/null
+    kill_daemon "$DAEMON_PID"
     DAEMON_PID=""
 
     # ── Rung 5: --backend tier2 (Tier2Backend dispatch path) ──
@@ -188,7 +243,7 @@ else
     # SoftwareBackend (which would reject tier2_id-bearing draws)
     # to Tier2Backend (which executes them through atrium-spv-
     # runtime).
-    rm -rf "$CACHE_ROOT" "$SOCKET"
+    rm -f "$SOCKET"
     "$DAEMON" --socket "$SOCKET" \
         --backend tier2 \
         --tier2 \
@@ -196,8 +251,7 @@ else
         --compile-binary "$COMPILE" \
         > /tmp/aqueduct-loader-smoke.log 2>&1 &
     DAEMON_PID=$!
-    sleep 1
-    if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
         echo "daemon failed to start (--backend tier2); log:" >&2
         cat /tmp/aqueduct-loader-smoke.log >&2
         exit 1
@@ -210,7 +264,7 @@ else
       "$EXAMPLE" 2>&1 | grep -E "vk|trivial|done"
     grep -E "tier-2 backend selected" /tmp/aqueduct-loader-smoke.log >/dev/null \
         || { echo "FAIL: --backend tier2 did not log selection" >&2; exit 1; }
-    kill "$DAEMON_PID" 2>/dev/null; wait 2>/dev/null
+    kill_daemon "$DAEMON_PID"
     DAEMON_PID=""
 
     # ── Rung 6: full compute round-trip (dispatch + readback) ──
@@ -221,15 +275,14 @@ else
     #   loader -> ICD -> daemon -> Tier2Registry -> atrium-spv-
     #   compile -> Tier2Backend dispatch -> OP_GPU_BUFFER_READ.
     if [ -x "$ROUNDTRIP" ]; then
-        rm -rf "$CACHE_ROOT" "$SOCKET"
+        rm -f "$SOCKET"
         "$DAEMON" --socket "$SOCKET" \
             --backend tier2 --tier2 \
             --cache-root "$CACHE_ROOT" \
             --compile-binary "$COMPILE" \
             > /tmp/aqueduct-loader-smoke.log 2>&1 &
         DAEMON_PID=$!
-        sleep 1
-        if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+        if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
             echo "daemon failed to start (Rung 6); log:" >&2
             cat /tmp/aqueduct-loader-smoke.log >&2
             exit 1
@@ -246,6 +299,43 @@ else
     else
         echo
         echo "SKIP Rung 6: need 'cargo build -p atrium-vk-icd --example loader_compute_roundtrip'"
+    fi
+fi
+
+if [ -x "$ROUNDTRIP" ] && [ -x "$SLANGC" ] && [ -f "$SLANG_SRC" ]; then
+    # ── Rung 7: same round-trip with slang-built SPIR-V ──────
+    # The "real third-party shader compiler" rung.  Compiles
+    # write_42.slang via slangc (per docs/LANGUAGE-POLICY.md:
+    # no `-profile` flag, which would force the legacy
+    # BufferBlock + Uniform shape) and feeds the resulting
+    # .spv through the same loader_compute_roundtrip example
+    # via ATRIUM_VK_SMOKE_SHADER=slang.  Proves the SPV path
+    # works for canonical slangc output, not just our hand-
+    # built rspirv modules.
+    "$SLANGC" "$SLANG_SRC" -target spirv -entry main -stage compute \
+        -o "$SLANG_SPV" 2>/tmp/slangc.log \
+        || { echo "FAIL: slangc compile failed"; cat /tmp/slangc.log; exit 1; }
+    rm -f "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+        echo "daemon failed to start (Rung 7); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung 7: slang-built SPIR-V round-trip ==="
+    if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+        VK_DRIVER_FILES="$MANIFEST" \
+        ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+        ATRIUM_VK_SMOKE_SHADER=slang \
+        "$ROUNDTRIP" 2>&1 | tail -4; then
+        echo "FAIL: slang round-trip did not return 0" >&2
+        exit 1
     fi
 fi
 

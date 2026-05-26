@@ -12,17 +12,20 @@
 //!
 //! # The shader
 //!
-//! ```glsl
-//! #version 450
-//! layout(set=0, binding=0) buffer SSBO { uint data[]; };
-//! layout(local_size_x = 1) in;
-//! void main() {
-//!     data[0] = 42u;
-//! }
-//! ```
+//! Two paths, selected by `ATRIUM_VK_SMOKE_SHADER`:
 //!
-//! Built inline via `rspirv` to avoid an external `glslangValidator`
-//! dependency.
+//!   - unset / "rspirv" (default): a hand-built rspirv module
+//!     equivalent to `data[0] = 42u`.  Uses the modern SPIR-V
+//!     1.3+ SSBO shape (`Block` + `StorageBuffer`).
+//!
+//!   - "slang": load `shaders/write_42.comp.spv` from disk,
+//!     pre-built by `slangc` from `shaders/write_42.slang`.
+//!     Atrium's canonical shader language.  Produces the legacy
+//!     SPIR-V 1.0 SSBO shape (`BufferBlock` + `StorageClass
+//!     Uniform`) -- a different code path through the frontend.
+//!
+//! Both compile to the same observable behaviour (the shader
+//! writes 42 to ssbo[0]).
 //!
 //! # The Vulkan call sequence
 //!
@@ -245,12 +248,37 @@ fn main() -> std::process::ExitCode {
     println!("descriptor set layout/pool/update -> OK");
 
     // ── Shader module + pipeline ──────────────────────────────
-    let spv = build_write_42_spirv();
+    //
+    // ATRIUM_VK_SMOKE_SHADER picks the source of the SPIR-V:
+    //   unset / "rspirv" -> build it inline (the original path)
+    //   "slang"          -> read shaders/write_42.comp.spv from
+    //                       disk.  See the file-header doc for
+    //                       why the two paths exist.
+    let shader_kind = std::env::var("ATRIUM_VK_SMOKE_SHADER")
+        .unwrap_or_else(|_| "rspirv".to_string());
+    let spv: Vec<u8> = match shader_kind.as_str() {
+        "slang" => {
+            let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("examples/shaders/write_42.comp.spv");
+            match std::fs::read(&path) {
+                Ok(b)  => { println!("loaded slang-built SPIR-V from {}", path.display()); b }
+                Err(e) => {
+                    eprintln!("could not read {}: {e}", path.display());
+                    eprintln!("hint: external/slang-bin/bin/slangc \
+                        -profile spirv_1_3 -target spirv -entry main \
+                        -o {} examples/shaders/write_42.slang",
+                        path.display());
+                    return 1.into();
+                }
+            }
+        }
+        _ => build_write_42_spirv(),
+    };
     let words: Vec<u32> = spv.chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
     let sm_info = vk::ShaderModuleCreateInfo::default().code(&words);
     let shader = unsafe { device.create_shader_module(&sm_info, None).expect("shader_module") };
-    println!("vkCreateShaderModule              -> OK (compute SPIR-V, {} bytes)", spv.len());
+    println!("vkCreateShaderModule              -> OK ({shader_kind} SPIR-V, {} bytes)", spv.len());
 
     let dsl_array = [dsl];
     let pl_info = vk::PipelineLayoutCreateInfo::default().set_layouts(&dsl_array);
