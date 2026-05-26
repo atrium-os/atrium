@@ -81,16 +81,40 @@ impl Session {
 
     /// Run the dispatch loop until the client disconnects or an
     /// unrecoverable error occurs. Logs each dispatched op at debug.
+    /// Notify the backend that this session's resources have gone
+    /// away.  Critical for backends with daemon-scoped state (most
+    /// notably Tier2Backend's `buffers` map): without this, a
+    /// session's BufferRecord would persist for the daemon's
+    /// lifetime, and a subsequent session that happens to receive
+    /// the same raw resource_id (per-session ResourceTable
+    /// allocators reset on disconnect) would read back the stale
+    /// bytes from the previous session's last write.
+    ///
+    /// Today only buffers carry the leak risk; other resources
+    /// (memories, images, samplers, pipelines) either don't have
+    /// daemon-scoped backend state or aren't read back through
+    /// OP_GPU_BUFFER_READ.  Extend here as new wire-back paths
+    /// land.
+    fn cleanup(&mut self) {
+        for id in self.table.buffer_ids().collect::<Vec<_>>() {
+            self.backend.buffer_destroyed(id);
+        }
+    }
+
+    /// Run the dispatch loop until the client disconnects or an
+    /// unrecoverable error occurs. Logs each dispatched op at debug.
     pub fn run(mut self) -> Result<()> {
         loop {
             let m = match self.conn.recv_message() {
                 Ok(m) => m,
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                     log::info!("client disconnected (EOF)");
+                    self.cleanup();
                     return Ok(());
                 }
                 Err(e) => {
                     log::warn!("recv error: {e}");
+                    self.cleanup();
                     return Err(e).context("recv_message");
                 }
             };

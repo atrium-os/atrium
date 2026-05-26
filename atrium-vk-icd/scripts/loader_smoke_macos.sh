@@ -388,20 +388,11 @@ if [ -x "$ROUNDTRIP" ] && [ -x "$SLANGC" ] && [ -f "$SLANG_SRC" ]; then
         exit 1
     fi
 
-    # Reap the Rung-7 daemon before the extra-shaders loop.
-    # Each extra rung gets its own daemon to keep buffer / pipeline
-    # state hermetic -- Tier2Backend's buffers map is daemon-
-    # scoped, so re-using a daemon across rungs lets the previous
-    # rung's stale BufferRecord at the same buffer_id bleed into
-    # the new one's readback.  Documented as a real architectural
-    # finding from the loader smoke run (Arc 140).
-    kill_daemon "$DAEMON_PID"
-    DAEMON_PID=""
-
-    # ── Rungs 8+: extra slang shaders, each with a fresh daemon.
-    # Each entry in EXTRA_SHADERS is "name:seed:expect".  The
-    # .slang source must live at $SHADER_DIR/<name>.slang; we
-    # compile it inline (cheap; cache hits after the first run).
+    # ── Rungs 8+: extra slang shaders against the same Rung-7
+    # daemon.  Safe now: the prior cross-session BufferRecord
+    # leak was fixed by Session::cleanup walking ResourceTable
+    # and calling backend.buffer_destroyed on disconnect (Arc
+    # 142).  Each entry in EXTRA_SHADERS is "name:seed:expect".
     rung_n=8
     for entry in $EXTRA_SHADERS; do
         name=$(echo "$entry" | cut -d: -f1)
@@ -413,18 +404,6 @@ if [ -x "$ROUNDTRIP" ] && [ -x "$SLANGC" ] && [ -f "$SLANG_SRC" ]; then
         "$SLANGC" "$src" -target spirv -entry main -stage compute \
             -o "$spv" 2>/tmp/slangc.log \
             || { echo "FAIL: slangc $name"; cat /tmp/slangc.log; exit 1; }
-        rm -f "$SOCKET"
-        "$DAEMON" --socket "$SOCKET" \
-            --backend tier2 --tier2 \
-            --cache-root "$CACHE_ROOT" \
-            --compile-binary "$COMPILE" \
-            > /tmp/aqueduct-loader-smoke.log 2>&1 &
-        DAEMON_PID=$!
-        if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
-            echo "daemon failed to start (Rung $rung_n / $name); log:" >&2
-            cat /tmp/aqueduct-loader-smoke.log >&2
-            exit 1
-        fi
         echo
         echo "=== Rung $rung_n: $name.slang (seed=$seed, expect=$expect) ==="
         if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
@@ -438,10 +417,12 @@ if [ -x "$ROUNDTRIP" ] && [ -x "$SLANGC" ] && [ -f "$SLANG_SRC" ]; then
             echo "FAIL: $name round-trip" >&2
             exit 1
         fi
-        kill_daemon "$DAEMON_PID"
-        DAEMON_PID=""
         rung_n=$((rung_n + 1))
     done
+
+    # Reap the Rung-7-onwards daemon.
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
 fi
 
 echo

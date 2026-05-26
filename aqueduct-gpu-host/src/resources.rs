@@ -156,6 +156,12 @@ impl ResourceTable {
     pub fn get_buffer(&self, id: ResourceId) -> Option<&BufferRecord> {
         self.buffers.get(&id)
     }
+    /// Iterate over every buffer id this table tracks.  Used by
+    /// `Session::cleanup` to notify the backend on disconnect so
+    /// daemon-side buffer state doesn't leak across sessions.
+    pub fn buffer_ids(&self) -> impl Iterator<Item = ResourceId> + '_ {
+        self.buffers.keys().copied()
+    }
 
     /// Insert a sampler record.
     pub fn insert_sampler(&mut self, id: ResourceId, rec: SamplerRecord) {
