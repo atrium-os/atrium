@@ -124,6 +124,14 @@ pub struct Tier2Backend {
     /// `bind_compute_storage_image`; consumed (drained) per
     /// dispatch.
     compute_image_by_binding: Mutex<HashMap<u32, u64>>,
+    /// `(binding -> buffer_id)` map populated by
+    /// `FrameOp::BindDescriptors` for SSBO writes.  Consumed
+    /// (drained) per dispatch: pre-fill `compute_input_by_
+    /// binding` from each bound buffer's current bytes, then
+    /// after the shader runs copy `per_binding[b]` back into
+    /// the buffer so the next `OP_GPU_BUFFER_READ` sees the
+    /// shader's writes.  Mirror of `compute_image_by_binding`.
+    compute_buffer_by_binding: Mutex<HashMap<u32, u64>>,
     /// Per-dispatch SSBO size in bytes.  Default 4 KiB.
     compute_output_capacity: std::sync::atomic::AtomicUsize,
     submissions: AtomicU64,
@@ -300,6 +308,10 @@ struct BufferStorage {
 
 /// `VK_DESCRIPTOR_TYPE_STORAGE_IMAGE`.
 const DESCRIPTOR_TYPE_STORAGE_IMAGE: u32 = 3;
+/// `VK_DESCRIPTOR_TYPE_STORAGE_BUFFER`.  The SSBO descriptor
+/// type a compute shader's `layout(binding=N) buffer { ... }`
+/// resolves to.
+const DESCRIPTOR_TYPE_STORAGE_BUFFER: u32 = 7;
 
 /// Bytes per descriptor write in a `FrameOp::BindDescriptors`
 /// body.  The ICD's `vkCmdBindDescriptorSets` emits, per
@@ -337,6 +349,32 @@ fn parse_bind_descriptors_storage_images(body: &[u8]) -> Vec<(u32, u32)> {
     out
 }
 
+/// Parse a `FrameOp::BindDescriptors` body and return the
+/// `(binding, buffer_id)` pairs whose descriptor type is
+/// `STORAGE_BUFFER`.  Same body layout as
+/// `parse_bind_descriptors_storage_images`; the only
+/// difference is which descriptor-type code we filter on +
+/// which u32 in the write record we read out.
+fn parse_bind_descriptors_storage_buffers(body: &[u8]) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    if body.len() < 8 { return out; }
+    let u32_at = |o: usize| -> u32 {
+        u32::from_le_bytes(body[o..o + 4].try_into().unwrap())
+    };
+    let write_count = u32_at(4) as usize;
+    for w in 0..write_count {
+        let off = 8 + w * BIND_DESCRIPTORS_WRITE_BYTES;
+        if off + BIND_DESCRIPTORS_WRITE_BYTES > body.len() { break; }
+        let binding   = u32_at(off);
+        let dtype     = u32_at(off + 4);
+        let buffer_id = u32_at(off + 8);
+        if dtype == DESCRIPTOR_TYPE_STORAGE_BUFFER && buffer_id != 0 {
+            out.push((binding, buffer_id));
+        }
+    }
+    out
+}
+
 impl Tier2Backend {
     /// Construct a fresh Tier2Backend backed by the given
     /// registry. The registry can be shared across
@@ -358,6 +396,7 @@ impl Tier2Backend {
             last_compute_outputs_by_binding: Mutex::new(Vec::new()),
             compute_input_by_binding: Mutex::new(HashMap::new()),
             compute_image_by_binding: Mutex::new(HashMap::new()),
+            compute_buffer_by_binding: Mutex::new(HashMap::new()),
             compute_output_capacity: std::sync::atomic::AtomicUsize::new(4096),
             last_assembled_vertices: Mutex::new(None),
             presented_frames: Mutex::new(HashMap::new()),
@@ -1365,6 +1404,32 @@ impl Tier2Backend {
                 });
             }
         });
+        // Write-back to bound SSBOs.  For every (binding ->
+        // buffer_id) the BindDescriptors handler stashed, copy
+        // per_binding[b] into buffers[buffer_id].bytes (clamped
+        // to the buffer's declared size).  After this point,
+        // OP_GPU_BUFFER_READ from the client will see the
+        // shader's writes.  Drained: the next dispatch starts
+        // with no SSBO bindings until the next
+        // vkCmdBindDescriptorSets fires.
+        let bound_buffers: Vec<(u32, u64)> = {
+            let mut m = self.compute_buffer_by_binding.lock().unwrap();
+            m.drain().collect()
+        };
+        if !bound_buffers.is_empty() {
+            let mut buffers = self.buffers.lock().unwrap();
+            for (binding, buffer_raw) in bound_buffers {
+                let Some(src) = per_binding.get(binding as usize) else {
+                    continue;
+                };
+                let Some(buf) = buffers.get_mut(&(buffer_raw as u32)) else {
+                    continue;
+                };
+                let n = src.len().min(buf.bytes.len());
+                buf.bytes[..n].copy_from_slice(&src[..n]);
+            }
+        }
+
         if n_bindings >= 2 {
             *self.last_compute_output.lock().unwrap() = None;
             *self.last_compute_outputs_by_binding.lock().unwrap() = per_binding;
@@ -1436,6 +1501,25 @@ impl Tier2Backend {
                     {
                         self.bind_compute_storage_image(
                             binding, ResourceId(image_raw));
+                    }
+                    // Storage-buffer descriptor writes.  Pre-fill
+                    // the shader's input slot for this binding
+                    // from the buffer's current bytes (so shaders
+                    // that read-modify-write see what the client
+                    // wrote via OP_GPU_BUFFER_WRITE), and remember
+                    // binding -> buffer_id so the post-dispatch
+                    // pass can copy the shader's output back into
+                    // the buffer.
+                    for (binding, buffer_raw)
+                        in parse_bind_descriptors_storage_buffers(body)
+                    {
+                        let bytes = self.buffers.lock().unwrap()
+                            .get(&buffer_raw)
+                            .map(|b| b.bytes.clone())
+                            .unwrap_or_default();
+                        self.set_compute_input_for_binding(binding, bytes);
+                        self.compute_buffer_by_binding.lock().unwrap()
+                            .insert(binding, buffer_raw as u64);
                     }
                 }
                 FrameOp::Dispatch => match DispatchCmd::from_bytes(body) {

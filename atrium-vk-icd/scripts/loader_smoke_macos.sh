@@ -31,13 +31,27 @@
 #                     SPIR-V via vkCreateShaderModule.  The daemon's
 #                     Tier2Registry routes it through atrium-spv-
 #                     compile and we verify an `.afblob` + `.pcmap`
-#                     land in the cache directory.  This is the
-#                     end-to-end SPV-pipeline smoke test.
+#                     land in the cache directory.
+#
+#   5. tier2 backend -- same example, daemon with `--backend tier2`.
+#                     Confirms the dispatch-ready backend selection
+#                     works (compile + cache + dispatch-side state
+#                     all happy).
+#
+#   6. compute round-trip -- the loader_compute_roundtrip example,
+#                     daemon with `--backend tier2 --tier2`.  Full
+#                     end-to-end: SPIR-V compute writes 42 to an
+#                     SSBO, dispatch runs on the daemon's tier-2
+#                     runtime, vkInvalidateMappedMemoryRanges pulls
+#                     the result back through OP_GPU_BUFFER_READ,
+#                     the client asserts ssbo[0] == 42.  The
+#                     complete chain proven from a real Vulkan app.
 #
 # Pre-reqs (one-time):
 #   * brew install vulkan-headers vulkan-loader vulkan-tools
-#   * cargo build -p atrium-vk-icd          (produces .dylib + example)
+#   * cargo build -p atrium-vk-icd          (produces .dylib + examples)
 #   * cargo build -p atrium-vk-icd --example loader_smoke
+#   * cargo build -p atrium-vk-icd --example loader_compute_roundtrip
 #   * cargo build -p aqueduct-gpu-host      (produces daemon)
 #   * cargo build -p atrium-spv-compile     (produces compile binary)
 #
@@ -49,6 +63,7 @@ set -eu
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 DYLIB="$REPO_ROOT/atrium-vk-icd/target/debug/libatrium_vk_icd.dylib"
 EXAMPLE="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_smoke"
+ROUNDTRIP="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_compute_roundtrip"
 DAEMON="$REPO_ROOT/aqueduct-gpu-host/target/debug/aqueduct-gpu-host"
 COMPILE="$REPO_ROOT/atrium-spv-compile/target/debug/atrium-spv-compile"
 SOCKET="/tmp/atrium-vk-icd-loader-smoke.sock"
@@ -195,6 +210,43 @@ else
       "$EXAMPLE" 2>&1 | grep -E "vk|trivial|done"
     grep -E "tier-2 backend selected" /tmp/aqueduct-loader-smoke.log >/dev/null \
         || { echo "FAIL: --backend tier2 did not log selection" >&2; exit 1; }
+    kill "$DAEMON_PID" 2>/dev/null; wait 2>/dev/null
+    DAEMON_PID=""
+
+    # ── Rung 6: full compute round-trip (dispatch + readback) ──
+    # The complete end-to-end: a real Vulkan app builds a compute
+    # SPIR-V that writes 42 to an SSBO, dispatches it, and reads
+    # the result back through vkInvalidateMappedMemoryRanges.
+    # Exercises every link in the chain:
+    #   loader -> ICD -> daemon -> Tier2Registry -> atrium-spv-
+    #   compile -> Tier2Backend dispatch -> OP_GPU_BUFFER_READ.
+    if [ -x "$ROUNDTRIP" ]; then
+        rm -rf "$CACHE_ROOT" "$SOCKET"
+        "$DAEMON" --socket "$SOCKET" \
+            --backend tier2 --tier2 \
+            --cache-root "$CACHE_ROOT" \
+            --compile-binary "$COMPILE" \
+            > /tmp/aqueduct-loader-smoke.log 2>&1 &
+        DAEMON_PID=$!
+        sleep 1
+        if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+            echo "daemon failed to start (Rung 6); log:" >&2
+            cat /tmp/aqueduct-loader-smoke.log >&2
+            exit 1
+        fi
+        echo
+        echo "=== Rung 6: compute round-trip (SSBO write + readback) ==="
+        if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+            VK_DRIVER_FILES="$MANIFEST" \
+            ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+            "$ROUNDTRIP" 2>&1 | tail -3; then
+            echo "FAIL: compute round-trip did not return 0" >&2
+            exit 1
+        fi
+    else
+        echo
+        echo "SKIP Rung 6: need 'cargo build -p atrium-vk-icd --example loader_compute_roundtrip'"
+    fi
 fi
 
 echo
