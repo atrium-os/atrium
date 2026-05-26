@@ -7641,11 +7641,17 @@ pub unsafe extern "C" fn vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
 /// (`VK_COLOR_SPACE_SRGB_NONLINEAR_KHR`), the universally-
 /// available default.
 const ATRIUM_SURFACE_FORMATS: &[(u32, u32)] = &[
-    (ash::vk::Format::R8G8B8A8_UNORM.as_raw() as u32, 0),
-    (ash::vk::Format::R8G8B8A8_SRGB.as_raw()  as u32, 0),
-    (ash::vk::Format::B8G8R8A8_UNORM.as_raw() as u32, 0),
-    (ash::vk::Format::B8G8R8A8_SRGB.as_raw()  as u32, 0),
+    (ash::vk::Format::R8G8B8A8_UNORM.as_raw() as u32, ATRIUM_DEFAULT_COLOR_SPACE),
+    (ash::vk::Format::R8G8B8A8_SRGB.as_raw()  as u32, ATRIUM_DEFAULT_COLOR_SPACE),
+    (ash::vk::Format::B8G8R8A8_UNORM.as_raw() as u32, ATRIUM_DEFAULT_COLOR_SPACE),
+    (ash::vk::Format::B8G8R8A8_SRGB.as_raw()  as u32, ATRIUM_DEFAULT_COLOR_SPACE),
 ];
+
+/// `VK_COLOR_SPACE_SRGB_NONLINEAR_KHR` — the only colour space
+/// every Vulkan ICD must support.  Used as the colour-space
+/// field of every entry in `ATRIUM_SURFACE_FORMATS`.  Arc 129.
+const ATRIUM_DEFAULT_COLOR_SPACE: u32 =
+    ash::vk::ColorSpaceKHR::SRGB_NONLINEAR.as_raw() as u32;
 
 /// `vkGetPhysicalDeviceSurfaceFormatsKHR` — return our four
 /// scanout-compatible formats in priority order. Apps typically
@@ -9433,6 +9439,14 @@ mod tests {
         assert_eq!(vk::ImageUsageFlags::COLOR_ATTACHMENT.as_raw(),  0x10);
         // VK_DEVICE_GROUP_PRESENT_MODE_LOCAL_BIT_KHR = 0x1.
         assert_eq!(vk::DeviceGroupPresentModeFlagsKHR::LOCAL.as_raw(), 0x1);
+
+        // Arc 129: ATRIUM_SURFACE_FORMATS uses a hand-typed
+        // `0` for the colour-space field of every entry.
+        // VK_COLOR_SPACE_SRGB_NONLINEAR_KHR is the universally-
+        // available default and is `0` in the Vulkan spec, but
+        // pinning here keeps the literal honest if a future
+        // arc reorders ColorSpaceKHR variants.
+        assert_eq!(vk::ColorSpaceKHR::SRGB_NONLINEAR.as_raw(), 0);
 
         // Arc 113: the five remaining Vulkan 1.1 *2 query output
         // wrappers. Each writes its inner block at offset 16 of
