@@ -47,6 +47,16 @@ pub struct Session {
     /// upload time — the protocol-level upload still succeeds and
     /// the ShaderRecord just records `tier2_id = None`.
     tier2_registry: Option<Arc<Tier2Registry>>,
+    /// Path to the `spirv-opt` binary, or `None` to skip the
+    /// SSA-rewrite pass.  When set, `handle_shader_upload`
+    /// runs each incoming SPIR-V through `spirv-opt --ssa-
+    /// rewrite --eliminate-dead-code-aggressive` before
+    /// validate.  Critical for slangc output: slang emits
+    /// `OpVariable Function` + `OpStore`/`OpLoad` for any
+    /// non-trivial control flow (loops, branches with state),
+    /// and atrium-spv-frontend has no in-tree mem2reg yet, so
+    /// without this pass those shaders fail compile.  Arc 144.
+    spirv_opt_binary: Option<std::path::PathBuf>,
 }
 
 impl Session {
@@ -61,6 +71,7 @@ impl Session {
             shader_cache: None,
             compiler_version: 0,
             tier2_registry: None,
+            spirv_opt_binary: None,
         }
     }
 
@@ -77,6 +88,14 @@ impl Session {
     /// on the [`ShaderRecord`] for downstream lookup.
     pub fn set_tier2_registry(&mut self, registry: Arc<Tier2Registry>) {
         self.tier2_registry = Some(registry);
+    }
+
+    /// Attach a path to a `spirv-opt` binary.  When set, every
+    /// SPIR-V upload runs through `--ssa-rewrite --eliminate-
+    /// dead-code-aggressive` before the validator -- promotes
+    /// slangc's `OpVariable Function` to OpPhi-form SSA.
+    pub fn set_spirv_opt_binary(&mut self, binary: std::path::PathBuf) {
+        self.spirv_opt_binary = Some(binary);
     }
 
     /// Run the dispatch loop until the client disconnects or an
@@ -465,6 +484,37 @@ impl Session {
                     // the validator below produce the canonical
                     // diagnostic from the original bytes.
                     log::debug!("annotate skipped (validator will diagnose): {e}");
+                }
+            }
+
+            // SSA-rewrite: promote OpVariable Function +
+            // OpStore/OpLoad to OpPhi-form SSA via spirv-opt
+            // (--ssa-rewrite --eliminate-dead-code-aggressive).
+            // Slang emits function-local variables for anything
+            // beyond pure expressions; the atrium-spv-frontend
+            // has no in-tree mem2reg yet, so without this the
+            // shader fails compile downstream.  Off when the
+            // daemon was started without `--spirv-opt-binary`,
+            // since legacy tier-1 demos / pure-rspirv shaders
+            // don't need it.
+            if let Some(spirv_opt) = &self.spirv_opt_binary {
+                match crate::shader_ssa::rewrite_to_ssa(
+                    &req.bytecode, spirv_opt,
+                ) {
+                    Ok(out) => {
+                        log::debug!(
+                            "ssa-rewrite: {} -> {} bytes",
+                            req.bytecode.len(), out.len(),
+                        );
+                        req.bytecode = out;
+                    }
+                    Err(e) => {
+                        // Non-fatal: validator below will reject
+                        // the original bytes if the shader needed
+                        // the rewrite.  Log so the operator can
+                        // diagnose missing tooling.
+                        log::warn!("spirv-opt ssa-rewrite skipped: {e}");
+                    }
                 }
             }
 

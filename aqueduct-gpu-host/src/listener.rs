@@ -33,6 +33,13 @@ pub struct Listener {
     /// sessions. `None` means uploads skip the atrium-spv-compile
     /// pipeline. Tier-2 failures are non-fatal at the wire level.
     tier2_registry: Option<Arc<Tier2Registry>>,
+    /// Path to the `spirv-opt` binary.  When set, each shader
+    /// upload runs through `--ssa-rewrite --eliminate-dead-code-
+    /// aggressive` before validate -- promotes `OpVariable
+    /// Function` to OpPhi-form SSA so slangc output with
+    /// function-local variables (loops, branches) lands cleanly
+    /// in the atrium-spv-frontend.  Arc 144.
+    spirv_opt_binary: Option<PathBuf>,
 }
 
 impl Listener {
@@ -49,6 +56,7 @@ impl Listener {
             socket_path, listener, backend,
             shader_cache: None,
             tier2_registry: None,
+            spirv_opt_binary: None,
         })
     }
 
@@ -66,6 +74,18 @@ impl Listener {
     /// AOT compilation into a dlopened .so. Builder-style.
     pub fn with_tier2_registry(mut self, reg: Arc<Tier2Registry>) -> Self {
         self.tier2_registry = Some(reg);
+        self
+    }
+
+    /// Attach the path to a `spirv-opt` binary.  When set,
+    /// `Session::handle_shader_upload` runs the SPIR-V through
+    /// `spirv-opt --ssa-rewrite --eliminate-dead-code-aggressive`
+    /// before the validator -- promotes `OpVariable Function` to
+    /// proper SSA so slangc output with loops / branches / any
+    /// function-local variable lands in the frontend cleanly.
+    /// Builder-style.  Arc 144.
+    pub fn with_spirv_opt_binary(mut self, binary: PathBuf) -> Self {
+        self.spirv_opt_binary = Some(binary);
         self
     }
 
@@ -87,6 +107,7 @@ impl Listener {
                     let backend = Arc::clone(&self.backend);
                     let cache = self.shader_cache.clone();
                     let tier2 = self.tier2_registry.clone();
+                    let spirv_opt = self.spirv_opt_binary.clone();
                     log::info!("new client connection");
                     thread::Builder::new()
                         .name("aqueduct-gpu-session".to_string())
@@ -94,6 +115,7 @@ impl Listener {
                             let mut sess = Session::new(conn, backend);
                             if let Some(c) = cache { sess.set_shader_cache(c); }
                             if let Some(r) = tier2 { sess.set_tier2_registry(r); }
+                            if let Some(b) = spirv_opt { sess.set_spirv_opt_binary(b); }
                             if let Err(e) = sess.run() {
                                 log::warn!("session ended with error: {e}");
                             } else {

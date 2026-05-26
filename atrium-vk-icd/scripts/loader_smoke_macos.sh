@@ -77,6 +77,14 @@
 #                                      bit_chain doesn't reach,
 #                                      paired with the left shift
 #                                      + OpBitwiseOr)
+#                       loop_mul    -- for(i in 0..5) v *= 2
+#                                      (OpLoopMerge + OpPhi for
+#                                      the loop-carried `v`;
+#                                      depends on the daemon
+#                                      running spirv-opt --ssa-
+#                                      rewrite on slangc's
+#                                      OpVariable Function output
+#                                      first, Arc 144)
 #
 # Pre-reqs (one-time):
 #   * brew install vulkan-headers vulkan-loader vulkan-tools
@@ -106,6 +114,13 @@ ROUNDTRIP="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_compute_roundtr
 DAEMON="$REPO_ROOT/aqueduct-gpu-host/target/debug/aqueduct-gpu-host"
 COMPILE="$REPO_ROOT/atrium-spv-compile/target/debug/atrium-spv-compile"
 SLANGC="$REPO_ROOT/external/slang-bin/bin/slangc"
+# spirv-opt is part of the Khronos vulkan-tools install (brew install vulkan-tools
+# on macOS, pkg install spirv-tools on FreeBSD).  When present, the daemon runs
+# `--ssa-rewrite --eliminate-dead-code-aggressive` on every shader upload so
+# slangc's OpVariable Function lands as proper SSA before the atrium-spv-
+# frontend sees it.  When absent, slang shaders with loops / branches that
+# carry state fail compile (the parked loop_mul rung).
+SPIRV_OPT="${SPIRV_OPT:-/opt/homebrew/bin/spirv-opt}"
 SHADER_DIR="$REPO_ROOT/atrium-vk-icd/examples/shaders"
 SLANG_SRC="$SHADER_DIR/write_42.slang"
 SLANG_SPV="$SHADER_DIR/write_42.comp.spv"
@@ -120,14 +135,15 @@ rmw:100:101
 atomic_add:200:201
 bit_chain:1:495
 rotate:0x12345678:0x81234567
+loop_mul:1:32
 "
-# loop_mul parked: surfaces a real frontend gap (`OpVariable
-# Function` not yet supported in atrium-spv-compile phase 1 v3
-# -- Slang emits a function-local `uint v` to hold the loop-
-# carried value).  Annotation fix (annotate_loop_merges in
-# Session::handle_shader_upload) means the validator now
-# accepts Slang's loops, but the next step in the pipeline
-# rejects the local-variable lowering.  Track separately.
+# loop_mul un-parked Arc 144: spirv-opt --ssa-rewrite (run by
+# the daemon when --spirv-opt-binary is set) promotes Slang's
+# OpVariable Function + Op{Load,Store} into OpPhi-form SSA
+# before atrium-spv-compile sees it.  The atrium-spv-frontend
+# already handles OpPhi (the differential_compute suite covers
+# it), so the loop is fine end-to-end as long as spirv-opt is
+# in the pipeline.
 SOCKET="/tmp/atrium-vk-icd-loader-smoke.sock"
 CACHE_ROOT="/tmp/atrium-vk-icd-loader-cache"
 MANIFEST="$(mktemp -t atrium_icd.XXXXXX).json"
@@ -263,6 +279,7 @@ else
         --tier2 \
         --cache-root "$CACHE_ROOT" \
         --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
         > /tmp/aqueduct-loader-smoke.log 2>&1 &
     DAEMON_PID=$!
     if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
@@ -300,6 +317,7 @@ else
         --tier2 \
         --cache-root "$CACHE_ROOT" \
         --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
         > /tmp/aqueduct-loader-smoke.log 2>&1 &
     DAEMON_PID=$!
     if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
@@ -331,6 +349,7 @@ else
             --backend tier2 --tier2 \
             --cache-root "$CACHE_ROOT" \
             --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
             > /tmp/aqueduct-loader-smoke.log 2>&1 &
         DAEMON_PID=$!
         if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
@@ -377,6 +396,7 @@ if [ -x "$ROUNDTRIP" ] && [ -x "$SLANGC" ] && [ -f "$SLANG_SRC" ]; then
         --backend tier2 --tier2 \
         --cache-root "$CACHE_ROOT" \
         --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
         > /tmp/aqueduct-loader-smoke.log 2>&1 &
     DAEMON_PID=$!
     if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then

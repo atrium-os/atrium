@@ -69,6 +69,7 @@ pub mod session;
 pub mod shader_annotate;
 pub mod shader_cache;
 pub mod shader_inspect;
+pub mod shader_ssa;
 pub mod shader_validator;
 pub mod software;
 pub mod tier2_backend;

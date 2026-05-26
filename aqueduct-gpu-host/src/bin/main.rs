@@ -105,6 +105,12 @@ struct Args {
     /// Override for `LoaderConfig.compile_binary`.  `None` means
     /// keep `LoaderConfig::production()`'s value.
     compile_binary: Option<PathBuf>,
+    /// Path to a `spirv-opt` binary.  When set, each shader
+    /// upload runs through `spirv-opt --ssa-rewrite
+    /// --eliminate-dead-code-aggressive` before validate, so
+    /// slangc's `OpVariable Function` lands as proper SSA.
+    /// Arc 144.
+    spirv_opt_binary: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -113,6 +119,7 @@ fn parse_args() -> Result<Args> {
     let mut tier2 = false;
     let mut cache_root: Option<PathBuf> = None;
     let mut compile_binary: Option<PathBuf> = None;
+    let mut spirv_opt_binary: Option<PathBuf> = None;
     let mut iter = std::env::args().skip(1);
     while let Some(a) = iter.next() {
         match a.as_str() {
@@ -138,10 +145,16 @@ fn parse_args() -> Result<Args> {
                     iter.next().ok_or_else(|| anyhow!("--compile-binary needs an argument"))?
                 ));
             }
+            "--spirv-opt-binary" => {
+                spirv_opt_binary = Some(PathBuf::from(
+                    iter.next().ok_or_else(|| anyhow!("--spirv-opt-binary needs an argument"))?
+                ));
+            }
             "--help" | "-h" => {
                 println!("usage: aqueduct-gpu-host [--socket PATH] \
                     [--backend stub|software|moltenvk|tier2] \
-                    [--tier2] [--cache-root PATH] [--compile-binary PATH]");
+                    [--tier2] [--cache-root PATH] [--compile-binary PATH] \
+                    [--spirv-opt-binary PATH]");
                 std::process::exit(0);
             }
             other => return Err(anyhow!("unknown arg {other:?}; try --help")),
@@ -165,6 +178,7 @@ fn parse_args() -> Result<Args> {
         tier2,
         cache_root,
         compile_binary,
+        spirv_opt_binary,
     })
 }
 
@@ -263,6 +277,20 @@ fn main() -> Result<()> {
     let mut listener = Listener::bind(&args.socket, backend)?;
     if let Some(reg) = registry {
         listener = listener.with_tier2_registry(reg);
+    }
+    if let Some(p) = args.spirv_opt_binary {
+        if !p.exists() {
+            log::warn!(
+                "--spirv-opt-binary {} does not exist at startup; \
+                 SSA-rewrite will be skipped (slangc shaders with \
+                 OpVariable Function will fail compile until the \
+                 binary appears)",
+                p.display(),
+            );
+        } else {
+            log::info!("spirv-opt SSA-rewrite enabled: {}", p.display());
+        }
+        listener = listener.with_spirv_opt_binary(p);
     }
     listener.accept_loop()?;
     Ok(())
