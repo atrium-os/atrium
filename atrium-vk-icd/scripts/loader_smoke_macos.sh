@@ -66,6 +66,11 @@
 #                                      (OpAtomicIAdd; bespoke
 #                                      backend lowers to ARMv8.1
 #                                      LSE ldaddal)
+#                       bit_chain   -- ((x<<4)^0xFF)|0x100
+#                                      (OpShiftLeftLogical +
+#                                      OpBitwiseXor + OpBitwiseOr
+#                                      chained; tests regalloc
+#                                      across intermediate values)
 #
 # Pre-reqs (one-time):
 #   * brew install vulkan-headers vulkan-loader vulkan-tools
@@ -79,6 +84,14 @@
 #   ./scripts/loader_smoke_macos.sh
 
 set -eu
+# pipefail so `if ! cmd | tail; then ... fi` sees `cmd`'s exit
+# code and not `tail`'s.  Without this a failing roundtrip
+# example whose tail-truncated output still flushes cleanly
+# would slip past as success (Arc 140 had exactly this bug:
+# Rung 11's slang loop shader failed validation in the daemon,
+# the example exited 1, but `tail -2` exited 0 and the script
+# reported the whole ladder OK).
+set -o pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 DYLIB="$REPO_ROOT/atrium-vk-icd/target/debug/libatrium_vk_icd.dylib"
@@ -99,7 +112,15 @@ SLANG_SPV="$SHADER_DIR/write_42.comp.spv"
 EXTRA_SHADERS="
 rmw:100:101
 atomic_add:200:201
+bit_chain:1:495
 "
+# loop_mul parked: surfaces a real frontend gap (`OpVariable
+# Function` not yet supported in atrium-spv-compile phase 1 v3
+# -- Slang emits a function-local `uint v` to hold the loop-
+# carried value).  Annotation fix (annotate_loop_merges in
+# Session::handle_shader_upload) means the validator now
+# accepts Slang's loops, but the next step in the pipeline
+# rejects the local-variable lowering.  Track separately.
 SOCKET="/tmp/atrium-vk-icd-loader-smoke.sock"
 CACHE_ROOT="/tmp/atrium-vk-icd-loader-cache"
 MANIFEST="$(mktemp -t atrium_icd.XXXXXX).json"
@@ -367,7 +388,17 @@ if [ -x "$ROUNDTRIP" ] && [ -x "$SLANGC" ] && [ -f "$SLANG_SRC" ]; then
         exit 1
     fi
 
-    # ── Rungs 8+: extra slang shaders against the same daemon.
+    # Reap the Rung-7 daemon before the extra-shaders loop.
+    # Each extra rung gets its own daemon to keep buffer / pipeline
+    # state hermetic -- Tier2Backend's buffers map is daemon-
+    # scoped, so re-using a daemon across rungs lets the previous
+    # rung's stale BufferRecord at the same buffer_id bleed into
+    # the new one's readback.  Documented as a real architectural
+    # finding from the loader smoke run (Arc 140).
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
+
+    # ── Rungs 8+: extra slang shaders, each with a fresh daemon.
     # Each entry in EXTRA_SHADERS is "name:seed:expect".  The
     # .slang source must live at $SHADER_DIR/<name>.slang; we
     # compile it inline (cheap; cache hits after the first run).
@@ -382,6 +413,18 @@ if [ -x "$ROUNDTRIP" ] && [ -x "$SLANGC" ] && [ -f "$SLANG_SRC" ]; then
         "$SLANGC" "$src" -target spirv -entry main -stage compute \
             -o "$spv" 2>/tmp/slangc.log \
             || { echo "FAIL: slangc $name"; cat /tmp/slangc.log; exit 1; }
+        rm -f "$SOCKET"
+        "$DAEMON" --socket "$SOCKET" \
+            --backend tier2 --tier2 \
+            --cache-root "$CACHE_ROOT" \
+            --compile-binary "$COMPILE" \
+            > /tmp/aqueduct-loader-smoke.log 2>&1 &
+        DAEMON_PID=$!
+        if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+            echo "daemon failed to start (Rung $rung_n / $name); log:" >&2
+            cat /tmp/aqueduct-loader-smoke.log >&2
+            exit 1
+        fi
         echo
         echo "=== Rung $rung_n: $name.slang (seed=$seed, expect=$expect) ==="
         if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
@@ -395,15 +438,10 @@ if [ -x "$ROUNDTRIP" ] && [ -x "$SLANGC" ] && [ -f "$SLANG_SRC" ]; then
             echo "FAIL: $name round-trip" >&2
             exit 1
         fi
+        kill_daemon "$DAEMON_PID"
+        DAEMON_PID=""
         rung_n=$((rung_n + 1))
     done
-
-    # Reap the shared Rung-7-onwards daemon explicitly.  The
-    # cleanup trap would also do this, but the trap depends on
-    # the trap actually firing (it doesn't when the parent
-    # SIGKILLs us, e.g. via `timeout` or a stuck pipe).
-    kill_daemon "$DAEMON_PID"
-    DAEMON_PID=""
 fi
 
 echo

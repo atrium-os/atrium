@@ -408,11 +408,42 @@ impl Session {
     }
 
     fn handle_shader_upload(&mut self, m: Message) -> Result<()> {
-        let req: ShaderUploadPayload = postcard::from_bytes(&m.payload)?;
+        let mut req: ShaderUploadPayload = postcard::from_bytes(&m.payload)?;
 
         // Phase 2.0 gate: structural + policy validation. Applies to
         // SPIR-V only; NIR bypasses (atrium-mesa emits trusted NIR).
         if matches!(req.kind, ShaderKind::SpirV) {
+            // Annotate first: inject MaxIterations into every
+            // OpLoopMerge whose LoopControl mask lacks a literal-
+            // bearing bit.  slangc doesn't emit MaxIterations
+            // (it's a glslang/SPIR-V 1.4+ convention), so without
+            // this every slang loop would be rejected by the
+            // validator below.  The annotate step preserves Unroll/
+            // DontUnroll and any existing literals; it only adds
+            // MaxIterations when none was present.  64k is a
+            // conservative cap well below the validator's 16M
+            // ceiling but generous for any well-behaved kernel.
+            const ANNOTATE_MAX_ITERS: u32 = 65_536;
+            match crate::shader_annotate::annotate_loop_merges(
+                &req.bytecode, ANNOTATE_MAX_ITERS,
+            ) {
+                Ok(report) => {
+                    if report.patched > 0 {
+                        log::debug!(
+                            "annotated {} OpLoopMerge ({} already bounded)",
+                            report.patched, report.already_bounded,
+                        );
+                        req.bytecode = report.bytes;
+                    }
+                }
+                Err(e) => {
+                    // Annotation rejected the bytecode shape -- let
+                    // the validator below produce the canonical
+                    // diagnostic from the original bytes.
+                    log::debug!("annotate skipped (validator will diagnose): {e}");
+                }
+            }
+
             if let Err(e) = crate::shader_validator::validate_spirv(&req.bytecode) {
                 let diag = format!("shader validator rejected upload: {e}");
                 log::warn!("{diag}");
