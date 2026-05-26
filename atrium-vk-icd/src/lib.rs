@@ -9004,6 +9004,36 @@ mod tests {
         assert!(l.sampled_image_color_sample_counts
             .contains(ash::vk::SampleCountFlags::TYPE_1));
 
+        // Arc 130: extend the spec-minimum pin to compute +
+        // buffer-range + per-stage descriptor limits that
+        // every modern engine queries.  Spec values from
+        // Vulkan 1.3 §43.2 "Required Limits".
+        assert!(l.max_compute_work_group_invocations >= 128,
+            "compute spec min 128 invocations/group");
+        assert!(l.max_compute_work_group_size[0] >= 128
+             && l.max_compute_work_group_size[1] >= 128
+             && l.max_compute_work_group_size[2] >= 64,
+            "compute spec min work-group size 128x128x64");
+        assert!(l.max_compute_shared_memory_size >= 16384,
+            "compute spec min 16 KiB shared memory");
+        assert!(l.max_compute_work_group_count[0] >= 65535
+             && l.max_compute_work_group_count[1] >= 65535
+             && l.max_compute_work_group_count[2] >= 65535,
+            "compute spec min dispatch 65535^3");
+        assert!(l.max_uniform_buffer_range >= 16384,
+            "spec min 16 KiB uniform-buffer range");
+        assert!(l.max_storage_buffer_range >= 128 * 1024 * 1024,
+            "spec min 128 MiB storage-buffer range");
+        assert!(l.max_per_stage_descriptor_uniform_buffers >= 12);
+        assert!(l.max_per_stage_descriptor_storage_buffers >= 4);
+        assert!(l.max_per_stage_descriptor_samplers >= 16);
+        assert!(l.max_per_stage_descriptor_sampled_images >= 16);
+        // Vertex pipeline:
+        assert!(l.max_vertex_input_bindings >= 16);
+        assert!(l.max_vertex_output_components >= 64);
+        assert!(l.max_fragment_input_components >= 64);
+        assert!(l.max_fragment_output_attachments >= 4);
+
         let f_di = lookup(b"vkDestroyInstance\0").unwrap();
         let di: unsafe extern "C" fn(VkInstance, *const c_void) =
             unsafe { std::mem::transmute(f_di) };
