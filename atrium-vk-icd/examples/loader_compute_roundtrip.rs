@@ -213,6 +213,23 @@ fn main() -> std::process::ExitCode {
             u32::from_str_radix(b, r).unwrap_or_else(|e|
                 panic!("ATRIUM_VK_SMOKE_SECOND_SEED={s:?} not a u32 ({e})"))
         });
+    // ATRIUM_VK_SMOKE_SPEC_U32 -- when set, supply a
+    // VkSpecializationInfo on vkCreateComputePipelines with a
+    // single (constantID=0, offset=0, size=4) entry carrying
+    // this u32.  Slang's `[[vk::constant_id(0)]] const uint X`
+    // gets specialized to the value at compile time -- so
+    // changing the spec value re-keys the shader hash and
+    // triggers a fresh atrium-spv-compile run.
+    let spec_u32: Option<u32> = std::env::var("ATRIUM_VK_SMOKE_SPEC_U32")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| {
+            let s = s.trim();
+            let (r, b) = if let Some(rest) = s.strip_prefix("0x")
+                .or_else(|| s.strip_prefix("0X")) { (16, rest) } else { (10, s) };
+            u32::from_str_radix(b, r).unwrap_or_else(|e|
+                panic!("ATRIUM_VK_SMOKE_SPEC_U32={s:?} not a u32 ({e})"))
+        });
 
     let entry = unsafe {
         match ash::Entry::load() {
@@ -446,10 +463,37 @@ fn main() -> std::process::ExitCode {
     };
     let pl = unsafe { device.create_pipeline_layout(&pl_info, None).expect("pl") };
 
-    let stage = vk::PipelineShaderStageCreateInfo::default()
-        .stage(vk::ShaderStageFlags::COMPUTE)
-        .module(shader)
-        .name(c"main");
+    // Optional VkSpecializationInfo: a single (constantID=0,
+    // offset=0, size=4) entry carrying spec_u32.  Slang's
+    // `[[vk::constant_id(0)]] const uint X` resolves to this
+    // value at JIT-compile time.  The ICD's
+    // vkCreateComputePipelines parses VkSpecializationInfo
+    // (Arc with the spec_overrides hash-keying) and re-runs
+    // atrium-spv-compile with the overrides applied.
+    let spec_value_bytes: [u8; 4];
+    let spec_map_entries: [vk::SpecializationMapEntry; 1];
+    let spec_info_holder;
+    let stage = if let Some(v) = spec_u32 {
+        spec_value_bytes = v.to_le_bytes();
+        spec_map_entries = [vk::SpecializationMapEntry::default()
+            .constant_id(0)
+            .offset(0)
+            .size(4)];
+        spec_info_holder = vk::SpecializationInfo::default()
+            .map_entries(&spec_map_entries)
+            .data(&spec_value_bytes);
+        println!("VkSpecializationInfo(spec0=0x{v:08x}) -> bound to pipeline");
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(shader)
+            .name(c"main")
+            .specialization_info(&spec_info_holder)
+    } else {
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(shader)
+            .name(c"main")
+    };
     let cp_info = vk::ComputePipelineCreateInfo::default()
         .stage(stage)
         .layout(pl);
