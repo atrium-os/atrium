@@ -202,6 +202,7 @@ per_thread:0:56:8:8
 per_thread_triangle:0:84:8:8
 groupshared_xor:0:24:8:1
 push_scale:6:42:1:1:7
+multi_binding:10:42:1:1::32
 "
 # loop_mul un-parked Arc 144: spirv-opt --ssa-rewrite (run by
 # the daemon when --spirv-opt-binary is set) promotes Slang's
@@ -502,6 +503,11 @@ if [ -x "$ROUNDTRIP" ] && [ -x "$SLANGC" ] && [ -f "$SLANG_SRC" ]; then
         # with a 4-byte push range and calls vkCmdPushConstants
         # before dispatch.  Empty = no push.
         push_u32=$(echo "$entry" | cut -d: -f6)
+        # Optional 7th field: second SSBO seed value.  When
+        # present, the example creates a second VkBuffer at
+        # binding 1 (same BUFFER_U32S slots) seeded with this
+        # u32.  Empty = single-binding (every existing rung).
+        second_seed=$(echo "$entry" | cut -d: -f7)
         [ -z "$buf_u32s" ]   && buf_u32s=1
         [ -z "$dispatch_x" ] && dispatch_x=1
         src="$SHADER_DIR/$name.slang"
@@ -522,6 +528,7 @@ if [ -x "$ROUNDTRIP" ] && [ -x "$SLANGC" ] && [ -f "$SLANG_SRC" ]; then
             ATRIUM_VK_SMOKE_BUFFER_U32S="$buf_u32s" \
             ATRIUM_VK_SMOKE_DISPATCH_X="$dispatch_x" \
             ATRIUM_VK_SMOKE_PUSH_U32="${push_u32:-}" \
+            ATRIUM_VK_SMOKE_SECOND_SEED="${second_seed:-}" \
             "$ROUNDTRIP" 2>&1 | tail -2; then
             echo "FAIL: $name round-trip" >&2
             exit 1

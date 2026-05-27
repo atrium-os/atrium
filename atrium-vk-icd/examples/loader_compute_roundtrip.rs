@@ -198,6 +198,21 @@ fn main() -> std::process::ExitCode {
             u32::from_str_radix(b, r).unwrap_or_else(|e|
                 panic!("ATRIUM_VK_SMOKE_PUSH_U32={s:?} not a u32 ({e})"))
         });
+    // ATRIUM_VK_SMOKE_SECOND_SEED -- when set, create a
+    // second SSBO at binding 1 (same BUFFER_U32S slots),
+    // seeded with this value.  The shader can then read
+    // from binding 1 and write to binding 0.  Assertion
+    // stays on binding 0 (the "output" buffer).
+    let second_seed: Option<u32> = std::env::var("ATRIUM_VK_SMOKE_SECOND_SEED")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| {
+            let s = s.trim();
+            let (r, b) = if let Some(rest) = s.strip_prefix("0x")
+                .or_else(|| s.strip_prefix("0X")) { (16, rest) } else { (10, s) };
+            u32::from_str_radix(b, r).unwrap_or_else(|e|
+                panic!("ATRIUM_VK_SMOKE_SECOND_SEED={s:?} not a u32 ({e})"))
+        });
 
     let entry = unsafe {
         match ash::Entry::load() {
@@ -285,20 +300,57 @@ fn main() -> std::process::ExitCode {
     unsafe { device.unmap_memory(mem); }
     println!("seed buffer ({buffer_u32s} slots) with 0x{seed_u32:08x} -> OK");
 
+    // ── Optional second buffer at binding 1 ───────────────────
+    let (buffer2, mem2_opt) = if let Some(s2) = second_seed {
+        let buf_info2 = vk::BufferCreateInfo::default()
+            .size(buffer_bytes as u64)
+            .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buffer2 = unsafe { device.create_buffer(&buf_info2, None).expect("buf2") };
+        let req2 = unsafe { device.get_buffer_memory_requirements(buffer2) };
+        let mem_ty2 = unsafe { find_memory_type(
+            &instance, pd, req2.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        ) };
+        let alloc2 = vk::MemoryAllocateInfo::default()
+            .allocation_size(req2.size)
+            .memory_type_index(mem_ty2);
+        let mem2 = unsafe { device.allocate_memory(&alloc2, None).expect("mem2") };
+        unsafe { device.bind_buffer_memory(buffer2, mem2, 0).expect("bind2"); }
+        // Seed the second buffer.
+        let mapped2 = unsafe {
+            device.map_memory(mem2, 0, req2.size, vk::MemoryMapFlags::empty())
+                .expect("map2")
+        };
+        unsafe {
+            let p = mapped2 as *mut u32;
+            for i in 0..(buffer_u32s as usize) {
+                std::ptr::write_unaligned(p.add(i), s2);
+            }
+        }
+        unsafe { device.unmap_memory(mem2); }
+        println!("seed buffer2 ({buffer_u32s} slots) with 0x{s2:08x} -> OK (binding=1)");
+        (Some(buffer2), Some(mem2))
+    } else {
+        (None, None)
+    };
+
     // ── Descriptor set layout / pool / set ────────────────────
-    let dsl_binding = vk::DescriptorSetLayoutBinding::default()
-        .binding(0)
-        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-        .descriptor_count(1)
-        .stage_flags(vk::ShaderStageFlags::COMPUTE);
-    let dsl_bindings = [dsl_binding];
+    let n_bindings: u32 = if buffer2.is_some() { 2 } else { 1 };
+    let dsl_bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..n_bindings)
+        .map(|b| vk::DescriptorSetLayoutBinding::default()
+            .binding(b)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::COMPUTE))
+        .collect();
     let dsl_info = vk::DescriptorSetLayoutCreateInfo::default()
         .bindings(&dsl_bindings);
     let dsl = unsafe { device.create_descriptor_set_layout(&dsl_info, None).expect("DSL") };
 
     let pool_size = vk::DescriptorPoolSize::default()
         .ty(vk::DescriptorType::STORAGE_BUFFER)
-        .descriptor_count(1);
+        .descriptor_count(n_bindings);
     let pool_sizes = [pool_size];
     let pool_info = vk::DescriptorPoolCreateInfo::default()
         .max_sets(1)
@@ -312,19 +364,31 @@ fn main() -> std::process::ExitCode {
     let sets = unsafe { device.allocate_descriptor_sets(&alloc_info).expect("alloc dsets") };
     let dset = sets[0];
 
-    let bi = vk::DescriptorBufferInfo::default()
-        .buffer(buffer)
-        .offset(0)
-        .range(vk::WHOLE_SIZE);
-    let bis = [bi];
-    let write = vk::WriteDescriptorSet::default()
-        .dst_set(dset)
-        .dst_binding(0)
+    let bis_0 = [vk::DescriptorBufferInfo::default()
+        .buffer(buffer).offset(0).range(vk::WHOLE_SIZE)];
+    let bis_1 = buffer2.map(|b| [vk::DescriptorBufferInfo::default()
+        .buffer(b).offset(0).range(vk::WHOLE_SIZE)]);
+    let write0 = vk::WriteDescriptorSet::default()
+        .dst_set(dset).dst_binding(0)
         .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-        .buffer_info(&bis);
-    let writes = [write];
-    unsafe { device.update_descriptor_sets(&writes, &[]); }
-    println!("descriptor set layout/pool/update -> OK");
+        .buffer_info(&bis_0);
+    // Cannot push two WriteDescriptorSets borrowing different
+    // bis_* slices into a Vec without aliasing trouble; for the
+    // 2-binding case build the array inline.  The 1-binding
+    // case keeps the single-element slice.
+    match bis_1.as_ref() {
+        Some(b1) => {
+            let write1 = vk::WriteDescriptorSet::default()
+                .dst_set(dset).dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(b1);
+            unsafe { device.update_descriptor_sets(&[write0, write1], &[]); }
+        }
+        None => {
+            unsafe { device.update_descriptor_sets(&[write0], &[]); }
+        }
+    }
+    println!("descriptor set layout/pool/update -> OK ({n_bindings} binding(s))");
 
     // ── Shader module + pipeline ──────────────────────────────
     //
@@ -498,6 +562,8 @@ fn main() -> std::process::ExitCode {
         device.destroy_descriptor_set_layout(dsl, None);
         device.destroy_buffer(buffer, None);
         device.free_memory(mem, None);
+        if let Some(b2) = buffer2 { device.destroy_buffer(b2, None); }
+        if let Some(m2) = mem2_opt { device.free_memory(m2, None); }
         device.destroy_device(None);
         instance.destroy_instance(None);
     }
