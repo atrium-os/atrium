@@ -201,6 +201,7 @@ subgroup_sum:42:43
 per_thread:0:56:8:8
 per_thread_triangle:0:84:8:8
 groupshared_xor:0:24:8:1
+push_scale:6:42:1:1:7
 "
 # loop_mul un-parked Arc 144: spirv-opt --ssa-rewrite (run by
 # the daemon when --spirv-opt-binary is set) promotes Slang's
@@ -496,6 +497,11 @@ if [ -x "$ROUNDTRIP" ] && [ -x "$SLANGC" ] && [ -f "$SLANG_SRC" ]; then
         expect=$(echo "$entry" | cut -d: -f3)
         buf_u32s=$(echo "$entry" | cut -d: -f4)
         dispatch_x=$(echo "$entry" | cut -d: -f5)
+        # Optional 6th field: push-constant u32 value.  When
+        # present, the example creates a pipeline layout
+        # with a 4-byte push range and calls vkCmdPushConstants
+        # before dispatch.  Empty = no push.
+        push_u32=$(echo "$entry" | cut -d: -f6)
         [ -z "$buf_u32s" ]   && buf_u32s=1
         [ -z "$dispatch_x" ] && dispatch_x=1
         src="$SHADER_DIR/$name.slang"
@@ -515,6 +521,7 @@ if [ -x "$ROUNDTRIP" ] && [ -x "$SLANGC" ] && [ -f "$SLANG_SRC" ]; then
             ATRIUM_VK_SMOKE_EXPECT="$expect" \
             ATRIUM_VK_SMOKE_BUFFER_U32S="$buf_u32s" \
             ATRIUM_VK_SMOKE_DISPATCH_X="$dispatch_x" \
+            ATRIUM_VK_SMOKE_PUSH_U32="${push_u32:-}" \
             "$ROUNDTRIP" 2>&1 | tail -2; then
             echo "FAIL: $name round-trip" >&2
             exit 1

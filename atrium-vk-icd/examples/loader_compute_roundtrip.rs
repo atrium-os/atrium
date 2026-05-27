@@ -180,6 +180,24 @@ fn main() -> std::process::ExitCode {
     let expect_u32   = parse_u32_env("ATRIUM_VK_SMOKE_EXPECT",      42);
     let buffer_u32s  = parse_u32_env("ATRIUM_VK_SMOKE_BUFFER_U32S", 1).max(1);
     let dispatch_x   = parse_u32_env("ATRIUM_VK_SMOKE_DISPATCH_X",  1).max(1);
+    // ATRIUM_VK_SMOKE_PUSH_U32 -- when set, the pipeline
+    // layout reserves a 4-byte push-constant range at
+    // (offset=0, size=4, stage=COMPUTE) and the cmd buffer
+    // calls vkCmdPushConstants with this value before
+    // dispatch.  The shader reads it as a u32 (typically
+    // through a [[vk::push_constant]] cbuffer in Slang).
+    // None = no push range, no vkCmdPushConstants -- matches
+    // the existing buffer-only rungs.
+    let push_u32: Option<u32> = std::env::var("ATRIUM_VK_SMOKE_PUSH_U32")
+        .ok()
+        .filter(|s| !s.trim().is_empty())  // empty = unset (smoke script convenience)
+        .map(|s| {
+            let s = s.trim();
+            let (r, b) = if let Some(rest) = s.strip_prefix("0x")
+                .or_else(|| s.strip_prefix("0X")) { (16, rest) } else { (10, s) };
+            u32::from_str_radix(b, r).unwrap_or_else(|e|
+                panic!("ATRIUM_VK_SMOKE_PUSH_U32={s:?} not a u32 ({e})"))
+        });
 
     let entry = unsafe {
         match ash::Entry::load() {
@@ -345,7 +363,23 @@ fn main() -> std::process::ExitCode {
     println!("vkCreateShaderModule              -> OK ({shader_kind} SPIR-V, {} bytes)", spv.len());
 
     let dsl_array = [dsl];
-    let pl_info = vk::PipelineLayoutCreateInfo::default().set_layouts(&dsl_array);
+    // Push-constant range when ATRIUM_VK_SMOKE_PUSH_U32 is
+    // set: 4-byte range at offset 0, COMPUTE stage.  Slang's
+    // `[[vk::push_constant]] cbuffer` lowers to an
+    // OpVariable in StorageClass::PushConstant; the daemon
+    // routes vkCmdPushConstants bytes into the shader's
+    // push-constant slot.
+    let push_ranges_arr;
+    let pl_info = if push_u32.is_some() {
+        push_ranges_arr = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .offset(0).size(4)];
+        vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&dsl_array)
+            .push_constant_ranges(&push_ranges_arr)
+    } else {
+        vk::PipelineLayoutCreateInfo::default().set_layouts(&dsl_array)
+    };
     let pl = unsafe { device.create_pipeline_layout(&pl_info, None).expect("pl") };
 
     let stage = vk::PipelineShaderStageCreateInfo::default()
@@ -382,6 +416,16 @@ fn main() -> std::process::ExitCode {
         device.cmd_bind_descriptor_sets(
             cb, vk::PipelineBindPoint::COMPUTE, pl, 0, &[dset], &[],
         );
+        if let Some(v) = push_u32 {
+            let bytes = v.to_le_bytes();
+            device.cmd_push_constants(
+                cb, pl,
+                vk::ShaderStageFlags::COMPUTE,
+                0,           // offset
+                &bytes,      // 4 bytes
+            );
+            println!("vkCmdPushConstants(u32=0x{v:08x})  -> OK");
+        }
         device.cmd_dispatch(cb, dispatch_x, 1, 1);
     }
     unsafe { device.end_command_buffer(cb).expect("end"); }
