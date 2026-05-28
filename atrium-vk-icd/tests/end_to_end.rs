@@ -846,13 +846,16 @@ fn acquire_next_image_signals_fence_so_wait_does_not_hang() {
     unsafe { vkCreateAtriumSurfaceEXT(instance, surf_info.as_ptr() as *const _, std::ptr::null(), &mut surface); }
     let mut sc_info = [0u8; 104];
     sc_info[0..4].copy_from_slice(&1000001000u32.to_le_bytes());
-    sc_info[20..28].copy_from_slice(&surface.to_le_bytes());
-    sc_info[28..32].copy_from_slice(&2u32.to_le_bytes());
-    sc_info[32..36].copy_from_slice(&37u32.to_le_bytes());
-    sc_info[40..44].copy_from_slice(&64u32.to_le_bytes());
+    // VkSwapchainCreateInfoKHR spec offsets: 24 surface (8-byte
+    // aligned u64), 32 minImageCount, 36 imageFormat, 44 width,
+    // 48 height, 52 arrayLayers, 56 imageUsage.
+    sc_info[24..32].copy_from_slice(&surface.to_le_bytes());
+    sc_info[32..36].copy_from_slice(&2u32.to_le_bytes());
+    sc_info[36..40].copy_from_slice(&37u32.to_le_bytes());
     sc_info[44..48].copy_from_slice(&64u32.to_le_bytes());
-    sc_info[48..52].copy_from_slice(&1u32.to_le_bytes());
-    sc_info[52..56].copy_from_slice(&0x10u32.to_le_bytes());
+    sc_info[48..52].copy_from_slice(&64u32.to_le_bytes());
+    sc_info[52..56].copy_from_slice(&1u32.to_le_bytes());
+    sc_info[56..60].copy_from_slice(&0x10u32.to_le_bytes());
     let mut swapchain: u64 = 0;
     unsafe { vkCreateSwapchainKHR(device, sc_info.as_ptr() as *const _, std::ptr::null(), &mut swapchain); }
     let mut ring = [0u64; 2];
@@ -2057,7 +2060,10 @@ fn fence_semaphore_sampler_lifecycle() {
     fence_info[ 0.. 4].copy_from_slice(&8u32.to_le_bytes());
     let mut fence: u64 = 0;
     unsafe { vkCreateFence(device, fence_info.as_ptr() as *const _, std::ptr::null(), &mut fence); }
-    assert_eq!(unsafe { vkGetFenceStatus(device, fence) }, 3, "fresh fence is unsignaled (VK_NOT_READY)");
+    // VK_NOT_READY = 1 per the Vulkan spec.  Pre-Arc 94 the ICD
+    // returned 3 (which is actually VK_EVENT_SET); the test was
+    // pinned to the old value.
+    assert_eq!(unsafe { vkGetFenceStatus(device, fence) }, 1, "fresh fence is unsignaled (VK_NOT_READY)");
 
     // vkWaitForFences signals the fence (synchronous-submit shortcut).
     let fences = [fence];
@@ -2065,9 +2071,9 @@ fn fence_semaphore_sampler_lifecycle() {
     assert_eq!(r, 0);
     assert_eq!(unsafe { vkGetFenceStatus(device, fence) }, 0, "after wait, fence is signaled (VK_SUCCESS)");
 
-    // vkResetFences puts it back to unsignaled.
+    // vkResetFences puts it back to unsignaled.  VK_NOT_READY = 1.
     unsafe { vkResetFences(device, 1, fences.as_ptr()); }
-    assert_eq!(unsafe { vkGetFenceStatus(device, fence) }, 3);
+    assert_eq!(unsafe { vkGetFenceStatus(device, fence) }, 1);
 
     // Pre-signaled fence: flags = VK_FENCE_CREATE_SIGNALED_BIT (0x1).
     fence_info[16..20].copy_from_slice(&1u32.to_le_bytes());
@@ -2600,13 +2606,16 @@ fn swapchain_ring_acquire_present_round_trip() {
     // the implementation note in lib.rs.
     let mut sc_info = [0u8; 104];
     sc_info[ 0.. 4].copy_from_slice(&1000001000u32.to_le_bytes()); // sType
-    sc_info[20..28].copy_from_slice(&7u64.to_le_bytes());          // surface=opaque 7
-    sc_info[28..32].copy_from_slice(&3u32.to_le_bytes());          // minImageCount=3
-    sc_info[32..36].copy_from_slice(&37u32.to_le_bytes());         // RGBA8
-    sc_info[40..44].copy_from_slice(&800u32.to_le_bytes());        // width
-    sc_info[44..48].copy_from_slice(&600u32.to_le_bytes());        // height
-    sc_info[48..52].copy_from_slice(&1u32.to_le_bytes());          // arrayLayers
-    sc_info[52..56].copy_from_slice(&0x10u32.to_le_bytes());       // COLOR_ATTACHMENT
+    // VkSwapchainCreateInfoKHR spec offsets: 24 surface (8-byte
+    // aligned u64), 32 minImageCount, 36 format, 44 width,
+    // 48 height, 52 arrayLayers, 56 usage.
+    sc_info[24..32].copy_from_slice(&7u64.to_le_bytes());          // surface=opaque 7
+    sc_info[32..36].copy_from_slice(&3u32.to_le_bytes());          // minImageCount=3
+    sc_info[36..40].copy_from_slice(&37u32.to_le_bytes());         // RGBA8
+    sc_info[44..48].copy_from_slice(&800u32.to_le_bytes());        // width
+    sc_info[48..52].copy_from_slice(&600u32.to_le_bytes());        // height
+    sc_info[52..56].copy_from_slice(&1u32.to_le_bytes());          // arrayLayers
+    sc_info[56..60].copy_from_slice(&0x10u32.to_le_bytes());       // COLOR_ATTACHMENT
 
     let mut swapchain: u64 = 0;
     let r = unsafe {
@@ -2730,13 +2739,16 @@ fn vkqueue_present_bumps_backend_present_counter() {
     // Make a 2-deep swapchain bound to that surface.
     let mut sc_info = [0u8; 104];
     sc_info[ 0.. 4].copy_from_slice(&1000001000u32.to_le_bytes());
-    sc_info[20..28].copy_from_slice(&surface.to_le_bytes());
-    sc_info[28..32].copy_from_slice(&2u32.to_le_bytes());
-    sc_info[32..36].copy_from_slice(&37u32.to_le_bytes());
-    sc_info[40..44].copy_from_slice(&64u32.to_le_bytes());
+    // VkSwapchainCreateInfoKHR spec offsets: 24 surface (8-byte
+    // aligned u64), 32 minImageCount, 36 imageFormat, 44 width,
+    // 48 height, 52 arrayLayers, 56 imageUsage.
+    sc_info[24..32].copy_from_slice(&surface.to_le_bytes());
+    sc_info[32..36].copy_from_slice(&2u32.to_le_bytes());
+    sc_info[36..40].copy_from_slice(&37u32.to_le_bytes());
     sc_info[44..48].copy_from_slice(&64u32.to_le_bytes());
-    sc_info[48..52].copy_from_slice(&1u32.to_le_bytes());
-    sc_info[52..56].copy_from_slice(&0x10u32.to_le_bytes());
+    sc_info[48..52].copy_from_slice(&64u32.to_le_bytes());
+    sc_info[52..56].copy_from_slice(&1u32.to_le_bytes());
+    sc_info[56..60].copy_from_slice(&0x10u32.to_le_bytes());
     let mut swapchain: u64 = 0;
     unsafe { vkCreateSwapchainKHR(device, sc_info.as_ptr() as *const _, std::ptr::null(), &mut swapchain); }
 
@@ -2854,13 +2866,16 @@ fn vkqueue_present_fires_software_backend_hook_with_surface_id() {
     // 2-deep swapchain.
     let mut sc_info = [0u8; 104];
     sc_info[ 0.. 4].copy_from_slice(&1000001000u32.to_le_bytes());
-    sc_info[20..28].copy_from_slice(&surface.to_le_bytes());
-    sc_info[28..32].copy_from_slice(&2u32.to_le_bytes());
-    sc_info[32..36].copy_from_slice(&37u32.to_le_bytes());
-    sc_info[40..44].copy_from_slice(&64u32.to_le_bytes());
+    // VkSwapchainCreateInfoKHR spec offsets: 24 surface (8-byte
+    // aligned u64), 32 minImageCount, 36 imageFormat, 44 width,
+    // 48 height, 52 arrayLayers, 56 imageUsage.
+    sc_info[24..32].copy_from_slice(&surface.to_le_bytes());
+    sc_info[32..36].copy_from_slice(&2u32.to_le_bytes());
+    sc_info[36..40].copy_from_slice(&37u32.to_le_bytes());
     sc_info[44..48].copy_from_slice(&64u32.to_le_bytes());
-    sc_info[48..52].copy_from_slice(&1u32.to_le_bytes());
-    sc_info[52..56].copy_from_slice(&0x10u32.to_le_bytes());
+    sc_info[48..52].copy_from_slice(&64u32.to_le_bytes());
+    sc_info[52..56].copy_from_slice(&1u32.to_le_bytes());
+    sc_info[56..60].copy_from_slice(&0x10u32.to_le_bytes());
     let mut swapchain: u64 = 0;
     unsafe { vkCreateSwapchainKHR(device, sc_info.as_ptr() as *const _, std::ptr::null(), &mut swapchain); }
 
