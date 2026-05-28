@@ -519,15 +519,32 @@ impl Tier2Registry {
                 }
             }
 
-            // Step 5: bbox.
+            // Step 5: bbox, then intersect with scissor rect.
+            // Scissor is in framebuffer-pixel coords and gets
+            // clamped to the framebuffer itself in case the
+            // app supplied an out-of-range rect.
+            let (sx0, sy0, sx1, sy1) = match draw.scissor {
+                Some(s) => {
+                    let x0 = (s.x as i32).max(0);
+                    let y0 = (s.y as i32).max(0);
+                    let x1 = ((s.x as i32) + (s.width as i32)).min(width as i32);
+                    let y1 = ((s.y as i32) + (s.height as i32)).min(height as i32);
+                    (x0, y0, x1, y1)
+                }
+                None => (0, 0, width as i32, height as i32),
+            };
             let min_x = screen.iter().map(|p| p.0)
-                .fold(f32::INFINITY, f32::min).max(0.0).floor() as i32;
+                .fold(f32::INFINITY, f32::min).floor() as i32;
             let max_x = screen.iter().map(|p| p.0)
-                .fold(f32::NEG_INFINITY, f32::max).min(fw - 1.0).ceil() as i32;
+                .fold(f32::NEG_INFINITY, f32::max).ceil() as i32;
             let min_y = screen.iter().map(|p| p.1)
-                .fold(f32::INFINITY, f32::min).max(0.0).floor() as i32;
+                .fold(f32::INFINITY, f32::min).floor() as i32;
             let max_y = screen.iter().map(|p| p.1)
-                .fold(f32::NEG_INFINITY, f32::max).min(fh - 1.0).ceil() as i32;
+                .fold(f32::NEG_INFINITY, f32::max).ceil() as i32;
+            let min_x = min_x.max(sx0);
+            let max_x = max_x.min(sx1 - 1);
+            let min_y = min_y.max(sy0);
+            let max_y = max_y.min(sy1 - 1);
             if min_x > max_x || min_y > max_y { continue; }
 
             // Step 6: edges.
@@ -1016,6 +1033,28 @@ pub struct DrawTriangle<'a> {
     /// (rasterizer writes raw NDC.z to the depth buffer for
     /// now).
     pub viewport: Option<Viewport>,
+
+    /// Scissor (`vkCmdSetScissor`) to clip rasterised pixels
+    /// against, in framebuffer pixel coordinates.  `None`
+    /// falls back to a fullscreen scissor spanning the
+    /// framebuffer.  Applied alongside the usual triangle-
+    /// bbox clamp before the per-pixel walk.
+    pub scissor: Option<Scissor>,
+}
+
+/// Vulkan-shaped scissor rect, mirrored from the
+/// `SetScissorCmd` wire body.  All coordinates are in
+/// framebuffer pixels.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Scissor {
+    /// Upper-left x in framebuffer pixels.
+    pub x: u32,
+    /// Upper-left y in framebuffer pixels.
+    pub y: u32,
+    /// Scissor width in pixels.
+    pub width: u32,
+    /// Scissor height in pixels.
+    pub height: u32,
 }
 
 /// Vulkan-shaped viewport, mirrored from the

@@ -569,6 +569,51 @@ impl SetViewportCmd {
     }
 }
 
+/// Body of [`FrameOp::SetScissor`] — mirrors a single
+/// `VkRect2D` entry expressed in framebuffer pixel
+/// coordinates.  16 bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SetScissorCmd {
+    /// Upper-left x in framebuffer pixels.
+    pub x: u32,
+    /// Upper-left y in framebuffer pixels.
+    pub y: u32,
+    /// Scissor width in pixels.
+    pub width: u32,
+    /// Scissor height in pixels.
+    pub height: u32,
+}
+
+impl SetScissorCmd {
+    /// Serialised body length in bytes.
+    pub const SIZE: usize = 16;
+
+    /// Encode into a fixed-size little-endian byte array.
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut b = [0u8; Self::SIZE];
+        b[ 0.. 4].copy_from_slice(&self.x.to_le_bytes());
+        b[ 4.. 8].copy_from_slice(&self.y.to_le_bytes());
+        b[ 8..12].copy_from_slice(&self.width.to_le_bytes());
+        b[12..16].copy_from_slice(&self.height.to_le_bytes());
+        b
+    }
+
+    /// Decode from a body slice.
+    pub fn from_bytes(body: &[u8]) -> Result<Self, FrameBodyError> {
+        if body.len() != Self::SIZE {
+            return Err(FrameBodyError::WrongLength {
+                op: "SetScissor", expected: Self::SIZE, got: body.len(),
+            });
+        }
+        Ok(Self {
+            x:      u32::from_le_bytes(body[ 0.. 4].try_into().unwrap()),
+            y:      u32::from_le_bytes(body[ 4.. 8].try_into().unwrap()),
+            width:  u32::from_le_bytes(body[ 8..12].try_into().unwrap()),
+            height: u32::from_le_bytes(body[12..16].try_into().unwrap()),
+        })
+    }
+}
+
 /// Errors raised by typed body decoders.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum FrameBodyError {

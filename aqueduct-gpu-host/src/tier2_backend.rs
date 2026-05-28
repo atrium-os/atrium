@@ -27,12 +27,14 @@ use aqueduct_gpu::backends::{BackendId, GpuVendor};
 use crate::backend::Backend;
 use crate::tier2_registry::{
     BlendFactor, BlendFactorPair, BlendOp, BlendState, ColorWriteMask,
-    DrawTriangle, Tier2ExecError, Tier2Registry, Tier2ShaderId, Viewport,
+    DrawTriangle, Scissor, Tier2ExecError, Tier2Registry, Tier2ShaderId,
+    Viewport,
 };
 
 use aqueduct_gpu::frame::{
     BindDepthAttachmentCmd, BindIndexBufCmd, BindVertexBufCmd, DispatchCmd,
-    DrawCmd, DrawIndexedCmd, FrameDecoder, IndexType, SetViewportCmd,
+    DrawCmd, DrawIndexedCmd, FrameDecoder, IndexType, SetScissorCmd,
+    SetViewportCmd,
 };
 use aqueduct_gpu::opcodes::FrameOp;
 use aqueduct_gpu::{
@@ -261,6 +263,9 @@ struct PassState {
     /// Current viewport (may be unset for a malformed frame; the
     /// walker tolerates it but a real draw would error in D.4+).
     viewport: Option<SetViewportCmd>,
+    /// Current scissor rect.  None ⇒ full-framebuffer scissor
+    /// (legacy behaviour).
+    scissor: Option<SetScissorCmd>,
     /// Latest push-constants block; tier-2 shaders consume it
     /// as their uniform area.
     push_constants: Vec<u8>,
@@ -907,6 +912,10 @@ impl Tier2Backend {
                     Ok(cmd) => state.viewport = Some(cmd),
                     Err(e) => log::warn!("malformed SetViewport: {e}"),
                 },
+                FrameOp::SetScissor => match SetScissorCmd::from_bytes(body) {
+                    Ok(cmd) => state.scissor = Some(cmd),
+                    Err(e) => log::warn!("malformed SetScissor: {e}"),
+                },
                 FrameOp::BindDepthAttachment => {
                     match BindDepthAttachmentCmd::from_bytes(body) {
                         Ok(cmd) => {
@@ -991,7 +1000,7 @@ impl Tier2Backend {
                     }
                     break;
                 }
-                // Ops we don't yet act on: SetScissor,
+                // Ops we don't yet act on:
                 // BindDescriptors (compute-only; handled by
                 // execute_compute_ops), CopyBufToImg,
                 // CopyImgToBuf (handled by execute_compute_ops's
@@ -1285,6 +1294,9 @@ impl Tier2Backend {
             x: v.x, y: v.y, width: v.width, height: v.height,
             min_depth: v.min_depth, max_depth: v.max_depth,
         });
+        let dt_scissor = state.scissor.map(|s| Scissor {
+            x: s.x, y: s.y, width: s.width, height: s.height,
+        });
         for t in 0..tri_count {
             let v0 = &assembled.bytes[(3*t)*stride   .. (3*t+1)*stride];
             let v1 = &assembled.bytes[(3*t+1)*stride .. (3*t+2)*stride];
@@ -1296,6 +1308,7 @@ impl Tier2Backend {
                 varying_f32_count,
                 uniforms: &uniforms_buf,
                 viewport: dt_viewport,
+                scissor: dt_scissor,
                 ..Default::default()
             };
             let db_ref: Option<&mut [f32]> = if !depth_enabled {
@@ -2249,6 +2262,9 @@ impl Tier2Backend {
             x: v.x, y: v.y, width: v.width, height: v.height,
             min_depth: v.min_depth, max_depth: v.max_depth,
         });
+        let dt_scissor = state.scissor.map(|s| Scissor {
+            x: s.x, y: s.y, width: s.width, height: s.height,
+        });
         for t in 0..tri_count {
             let v0 = &assembled.bytes[(3*t)*stride   .. (3*t+1)*stride];
             let v1 = &assembled.bytes[(3*t+1)*stride .. (3*t+2)*stride];
@@ -2259,6 +2275,7 @@ impl Tier2Backend {
                 blend_state: raster.blend,
                 varying_f32_count,
                 viewport: dt_viewport,
+                scissor: dt_scissor,
                 ..Default::default()
             };
             let db_ref = if depth_enabled {

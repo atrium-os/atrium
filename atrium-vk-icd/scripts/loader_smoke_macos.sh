@@ -178,6 +178,7 @@ GRAPHICS_TEXTURE="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics
 GRAPHICS_MULTI_FS_IN="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_multi_fs_in"
 GRAPHICS_UBO="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_ubo"
 GRAPHICS_VIEWPORT="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_viewport"
+GRAPHICS_SCISSOR="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_scissor"
 DAEMON="$REPO_ROOT/aqueduct-gpu-host/target/debug/aqueduct-gpu-host"
 COMPILE="$REPO_ROOT/atrium-spv-compile/target/debug/atrium-spv-compile"
 SLANGC="$REPO_ROOT/external/slang-bin/bin/slangc"
@@ -1100,6 +1101,45 @@ if [ -x "$GRAPHICS_VIEWPORT" ]; then
 else
     echo
     echo "SKIP Rung R: need 'cargo build -p atrium-vk-icd --example loader_graphics_viewport'"
+fi
+
+# ── Rung S: vkCmdSetScissor actually clips the triangle ─
+# loader_graphics_scissor: 16x16 framebuffer, fullscreen
+# viewport, scissor at (8, 0, 8, 16) -- right half only.
+# The triangle covers x in [4..12) so the left half (x<8)
+# of the triangle's would-be-painted region must stay
+# clear-black; the right half must be the FS colour.
+# Pre-fix, SetScissor was on the "ops we don't yet act on"
+# list and the triangle painted across the entire 16x16
+# target.
+if [ -x "$GRAPHICS_SCISSOR" ]; then
+    rm -f "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+        echo "daemon failed to start (scissor round-trip); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung S: vkCmdSetScissor clips triangle to right half ==="
+    if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+        VK_DRIVER_FILES="$MANIFEST" \
+        ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+        "$GRAPHICS_SCISSOR" 2>&1 | tail -5; then
+        echo "FAIL: scissor round-trip did not return 0" >&2
+        exit 1
+    fi
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
+else
+    echo
+    echo "SKIP Rung S: need 'cargo build -p atrium-vk-icd --example loader_graphics_scissor'"
 fi
 
 echo
