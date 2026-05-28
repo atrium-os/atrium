@@ -1841,6 +1841,14 @@ impl Tier2Backend {
             ]);
         }
 
+        // Same varying-bytes plumbing as dispatch_draw -- without
+        // this an indexed draw with a VS that emits Location-
+        // decorated varyings would crash the FS via null
+        // in_varyings_ptr (see Rung H's commit for the long
+        // version).
+        let varying_f32_count = (self.pipeline_vs_varying_bytes.lock().unwrap()
+            .get(&pipeline_raw).copied().unwrap_or(0) as usize) / 4;
+
         for t in 0..tri_count {
             let v0 = &assembled.bytes[(3*t)*stride   .. (3*t+1)*stride];
             let v1 = &assembled.bytes[(3*t+1)*stride .. (3*t+2)*stride];
@@ -1849,6 +1857,7 @@ impl Tier2Backend {
                 vertex_attrs: [v0, v1, v2],
                 push_constants: &state.push_constants,
                 blend_state: raster.blend,
+                varying_f32_count,
                 ..Default::default()
             };
             let db_ref = if depth_enabled {

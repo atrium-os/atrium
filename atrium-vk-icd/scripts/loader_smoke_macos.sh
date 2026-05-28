@@ -169,6 +169,7 @@ ROUNDTRIP="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_compute_roundtr
 GRAPHICS_RT="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_roundtrip"
 GRAPHICS_INTERP="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_interp"
 GRAPHICS_PUSHC="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_pushc"
+GRAPHICS_INDEXED="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_indexed"
 DAEMON="$REPO_ROOT/aqueduct-gpu-host/target/debug/aqueduct-gpu-host"
 COMPILE="$REPO_ROOT/atrium-spv-compile/target/debug/atrium-spv-compile"
 SLANGC="$REPO_ROOT/external/slang-bin/bin/slangc"
@@ -679,6 +680,46 @@ if [ -x "$GRAPHICS_PUSHC" ]; then
 else
     echo
     echo "SKIP Rung I: need 'cargo build -p atrium-vk-icd --example loader_graphics_pushc'"
+fi
+
+# ── Rung J: graphics + vkCmdDrawIndexed ──────────────────
+# loader_graphics_indexed: 4-vert vertex buffer + 6-index
+# index buffer driving two triangles (a quad) via
+# vkCmdBindIndexBuffer + vkCmdDrawIndexed.  Verifies the
+# whole indexed-draw wire works end-to-end (the daemon-side
+# dispatch_draw_indexed had no pixel-readback test before
+# this).  Pixel(3,3) interior of first indexed triangle,
+# pixel(5,5) interior of second -- both must hit the FS
+# colour or one of the two indexed primitives didn't
+# dispatch.
+if [ -x "$GRAPHICS_INDEXED" ]; then
+    rm -f "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+        echo "daemon failed to start (indexed round-trip); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung J: vkCmdDrawIndexed two-triangle quad ==="
+    if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+        VK_DRIVER_FILES="$MANIFEST" \
+        ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+        "$GRAPHICS_INDEXED" 2>&1 | tail -3; then
+        echo "FAIL: indexed-draw round-trip did not return 0" >&2
+        exit 1
+    fi
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
+else
+    echo
+    echo "SKIP Rung J: need 'cargo build -p atrium-vk-icd --example loader_graphics_indexed'"
 fi
 
 echo
