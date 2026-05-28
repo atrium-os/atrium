@@ -172,6 +172,7 @@ GRAPHICS_PUSHC="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_p
 GRAPHICS_INDEXED="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_indexed"
 GRAPHICS_UNORM="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_unorm"
 GRAPHICS_DEPTH="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_depth"
+GRAPHICS_VS_PUSHC="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_vs_pushc"
 DAEMON="$REPO_ROOT/aqueduct-gpu-host/target/debug/aqueduct-gpu-host"
 COMPILE="$REPO_ROOT/atrium-spv-compile/target/debug/atrium-spv-compile"
 SLANGC="$REPO_ROOT/external/slang-bin/bin/slangc"
@@ -802,6 +803,47 @@ if [ -x "$GRAPHICS_DEPTH" ]; then
 else
     echo
     echo "SKIP Rung L: need 'cargo build -p atrium-vk-icd --example loader_graphics_depth'"
+fi
+
+# ── Rung M: VS push constants shift triangle position ───
+# loader_graphics_vs_pushc: same triangle as Rung G but
+# the VS reads a vec4 offset from a push constant and adds
+# (offset.xy, 0) to every NDC vertex.  Cmd buffer pushes
+# (+0.5, 0, 0, 0) -- the triangle slides right by 2 pixels.
+# Asserts pixel(3,3) (was inside the original triangle) is
+# now CLEAR + pixel(5,3) (was outside) is the FS colour.
+# Both halves must hold: if the push didn't reach the VS,
+# pc_ptr would deref as zeros and the triangle wouldn't
+# move; if the push bytes were wrong (e.g. byte-swapped),
+# the triangle would shift to the wrong place.
+if [ -x "$GRAPHICS_VS_PUSHC" ]; then
+    rm -f "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+        echo "daemon failed to start (VS pushc round-trip); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung M: VS push constants shift the triangle ==="
+    if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+        VK_DRIVER_FILES="$MANIFEST" \
+        ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+        "$GRAPHICS_VS_PUSHC" 2>&1 | tail -3; then
+        echo "FAIL: VS push-constant round-trip did not return 0" >&2
+        exit 1
+    fi
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
+else
+    echo
+    echo "SKIP Rung M: need 'cargo build -p atrium-vk-icd --example loader_graphics_vs_pushc'"
 fi
 
 echo
