@@ -387,12 +387,19 @@ impl Session {
             return Ok(());
         }
         self.table.insert_sampler(req.sampler_id, SamplerRecord { _placeholder: () });
+        self.backend.sampler_created(
+            req.sampler_id,
+            req.min_filter, req.mag_filter, req.mip_filter,
+            req.address_modes,
+            req.max_anisotropy, req.min_lod, req.max_lod,
+        );
         Ok(())
     }
 
     fn handle_sampler_destroy(&mut self, m: Message) -> Result<()> {
         let req: SamplerDestroyPayload = postcard::from_bytes(&m.payload)?;
         self.table.remove_sampler(req.sampler_id);
+        self.backend.sampler_destroyed(req.sampler_id);
         Ok(())
     }
 

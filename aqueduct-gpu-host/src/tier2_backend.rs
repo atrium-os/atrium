@@ -56,6 +56,14 @@ pub struct Tier2Backend {
     /// `&mut [f32]`. Populated by `image_created_depth`;
     /// referenced via `BindDepthAttachment` in the wire.
     depth_images: Mutex<HashMap<u32, DepthImageStorage>>,
+    /// Per-sampler runtime descriptor.  Populated from
+    /// `Backend::sampler_created`'s `VkSamplerCreateInfo`-shaped
+    /// arguments at sampler-create time.  Keyed by
+    /// `ResourceId::raw()`.  Read at dispatch_draw time to
+    /// fill the COMBINED_IMAGE_SAMPLER descriptor slots in the
+    /// uniforms buffer the runtime's `atrium_tex_sample_*`
+    /// helpers consume.
+    samplers: Mutex<HashMap<u32, atrium_spv_runtime::SamplerDesc>>,
     /// Per-(image_id) flag: has this depth image been
     /// cleared yet in the current render pass?  The walker
     /// resets it on EndRenderPass; a fresh BindDepthAttachment
@@ -256,6 +264,13 @@ struct PassState {
     /// Latest push-constants block; tier-2 shaders consume it
     /// as their uniform area.
     push_constants: Vec<u8>,
+    /// Combined-image-sampler descriptor bindings recorded by
+    /// `FrameOp::BindDescriptors` for the current pass.
+    /// Keyed by descriptor binding slot.  Value is
+    /// `(image_id, sampler_id)`.  Consumed at dispatch_draw
+    /// to build the uniforms-buffer descriptor table the
+    /// runtime's `atrium_tex_sample_*` helpers read.
+    bound_textures: HashMap<u32, (u32, u32)>,
     /// Number of Draw / DrawIndexed records issued in this pass.
     /// Used to gate the legacy "BindPipeline alone implies a
     /// fullscreen FS fill" fallback at EndRenderPass.
@@ -315,6 +330,14 @@ struct BufferStorage {
     bytes: Vec<u8>,
 }
 
+/// `VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER`.  Bound by
+/// `vkCmdBindDescriptorSets` when a shader declares a
+/// `sampler2D` / `texture2D + sampler` binding.  At dispatch
+/// time the daemon resolves these to runtime `TexDesc` +
+/// `SamplerDesc` pairs and writes them into the uniforms
+/// buffer at the offsets `atrium_tex_sample_2d` (and its
+/// siblings) expect.
+const DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: u32 = 1;
 /// `VK_DESCRIPTOR_TYPE_STORAGE_IMAGE`.
 const DESCRIPTOR_TYPE_STORAGE_IMAGE: u32 = 3;
 /// `VK_DESCRIPTOR_TYPE_STORAGE_BUFFER`.  The SSBO descriptor
@@ -358,6 +381,39 @@ fn parse_bind_descriptors_storage_images(body: &[u8]) -> Vec<(u32, u32)> {
     out
 }
 
+/// Parse a `FrameOp::BindDescriptors` body and return
+/// `(binding, image_id, sampler_id)` triples whose
+/// descriptor type is `COMBINED_IMAGE_SAMPLER`.  Same body
+/// layout as `parse_bind_descriptors_storage_images`; both
+/// `image_id` (at off+12) and `sampler_id` (at off+16) get
+/// read out.  Triples with either id zero are skipped (the
+/// daemon's tex-table builder would emit a null pointer and
+/// the runtime sample helper would deref it).
+fn parse_bind_descriptors_combined_image_samplers(
+    body: &[u8],
+) -> Vec<(u32, u32, u32)> {
+    let mut out = Vec::new();
+    if body.len() < 8 { return out; }
+    let u32_at = |o: usize| -> u32 {
+        u32::from_le_bytes(body[o..o + 4].try_into().unwrap())
+    };
+    let write_count = u32_at(4) as usize;
+    for w in 0..write_count {
+        let off = 8 + w * BIND_DESCRIPTORS_WRITE_BYTES;
+        if off + BIND_DESCRIPTORS_WRITE_BYTES > body.len() { break; }
+        let binding    = u32_at(off);
+        let dtype      = u32_at(off + 4);
+        let image_id   = u32_at(off + 12);
+        let sampler_id = u32_at(off + 16);
+        if dtype == DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+            && image_id != 0 && sampler_id != 0
+        {
+            out.push((binding, image_id, sampler_id));
+        }
+    }
+    out
+}
+
 /// Parse a `FrameOp::BindDescriptors` body and return the
 /// `(binding, buffer_id)` pairs whose descriptor type is
 /// `STORAGE_BUFFER`.  Same body layout as
@@ -393,6 +449,7 @@ impl Tier2Backend {
             registry,
             images: Mutex::new(HashMap::new()),
             depth_images: Mutex::new(HashMap::new()),
+            samplers: Mutex::new(HashMap::new()),
             depth_clear_cleared: Mutex::new(HashMap::new()),
             buffers: Mutex::new(HashMap::new()),
             pipeline_shaders: Mutex::new(HashMap::new()),
@@ -777,6 +834,22 @@ impl Tier2Backend {
                     }
                     Err(e) => log::warn!("malformed BindIndexBuf: {e}"),
                 },
+                FrameOp::BindDescriptors => {
+                    // Graphics-side: stash COMBINED_IMAGE_SAMPLER
+                    // bindings.  dispatch_draw consults them to
+                    // build the uniforms-buffer descriptor table
+                    // the runtime's `atrium_tex_sample_*` helpers
+                    // read.  STORAGE_BUFFER descriptors aren't yet
+                    // wired into the graphics path (deferred to
+                    // when a shader actually needs them); SSBO
+                    // entries arriving here are silently dropped.
+                    for (binding, image_id, sampler_id)
+                        in parse_bind_descriptors_combined_image_samplers(body)
+                    {
+                        state.bound_textures
+                            .insert(binding, (image_id, sampler_id));
+                    }
+                }
                 FrameOp::SetViewport => match SetViewportCmd::from_bytes(body) {
                     Ok(cmd) => state.viewport = Some(cmd),
                     Err(e) => log::warn!("malformed SetViewport: {e}"),
@@ -1016,6 +1089,127 @@ impl Tier2Backend {
         let varying_f32_count = (self.pipeline_vs_varying_bytes.lock().unwrap()
             .get(&pipeline_raw).copied().unwrap_or(0) as usize) / 4;
 
+        // Build the uniforms buffer if any COMBINED_IMAGE_SAMPLER
+        // bindings are live.  Layout (atrium-spv-runtime
+        // UNIFORMS_HELPERS_BASE / UNIFORMS_DESC_BASE):
+        //   bytes  0..64 : helper fn ptr table (atrium_tex_
+        //                  sample_2d, _fetch_2d, _sample_2d_lod,
+        //                  _sample_2d_array, _sample_cube,
+        //                  _gather_2d, _sample_2d_array_lod,
+        //                  _sample_cube_lod)
+        //   bytes 64+B*16: (TexDesc*, SamplerDesc*) for binding B
+        //
+        // `tex_descs` + `sampler_descs` own the raw `TexDesc` /
+        // `SamplerDesc` structs the table pointers reference;
+        // they're held in named bindings (NOT `let _ = ...`)
+        // through the per-triangle loop so the heap stays
+        // alive while `fill_image_triangle` deref's the
+        // pointers.  Same shape as the storage-image
+        // dispatcher's image-table lifetime fix (commit
+        // e0dce68).
+        let images_guard;
+        let tex_descs: Vec<atrium_spv_runtime::TexDesc>;
+        let sampler_descs: Vec<atrium_spv_runtime::SamplerDesc>;
+        let uniforms_buf: Vec<u8>;
+        if !state.bound_textures.is_empty() {
+            // Sort by binding so the per-binding slot index
+            // matches the descriptor's `Binding` decoration.
+            let mut bindings_sorted: Vec<(u32, u32, u32)>
+                = state.bound_textures.iter()
+                    .map(|(b, (img, samp))| (*b, *img, *samp))
+                    .collect();
+            bindings_sorted.sort_by_key(|(b, _, _)| *b);
+            let max_binding = bindings_sorted.iter()
+                .map(|(b, _, _)| *b as usize).max().unwrap_or(0);
+            let slot_count = max_binding + 1;
+            images_guard = Some(self.images.lock().unwrap());
+            let samplers_guard = self.samplers.lock().unwrap();
+            let mut td: Vec<atrium_spv_runtime::TexDesc> =
+                Vec::with_capacity(bindings_sorted.len());
+            let mut sd: Vec<atrium_spv_runtime::SamplerDesc> =
+                Vec::with_capacity(bindings_sorted.len());
+            // Pre-fill so per-binding indices are stable;
+            // missing image / sampler entries land as
+            // zero-sized / default and the helper will
+            // return all zeros (rather than crash) -- the
+            // runtime's bounds-clamp keeps things safe.
+            let placeholder_tex = atrium_spv_runtime::TexDesc {
+                data: std::ptr::null(), width: 1, height: 1,
+                stride_bytes: 4,
+                format: atrium_spv_runtime::TexFormat::Rgba8Unorm as u32,
+                mip_count: 0, mip_descs: std::ptr::null(),
+                depth: 1, slice_bytes: 0,
+            };
+            let placeholder_samp = atrium_spv_runtime::SamplerDesc {
+                mag_filter: 0, min_filter: 0, wrap_s: 0, wrap_t: 0,
+            };
+            for &(_b, image_id, sampler_id) in &bindings_sorted {
+                let tex = match images_guard.as_ref().unwrap()
+                    .get(&(image_id as u64))
+                {
+                    Some(img) => atrium_spv_runtime::TexDesc {
+                        data: img.pixels.as_ptr(),
+                        width: img.width,
+                        height: img.height,
+                        stride_bytes: img.width * 4,
+                        format: atrium_spv_runtime::TexFormat::Rgba8Unorm as u32,
+                        mip_count: 0, mip_descs: std::ptr::null(),
+                        depth: 1, slice_bytes: 0,
+                    },
+                    None => {
+                        log::warn!("Draw target={target_id}: \
+                                    image {image_id} not registered");
+                        placeholder_tex
+                    }
+                };
+                let samp = samplers_guard.get(&sampler_id).copied()
+                    .unwrap_or_else(|| {
+                        log::warn!("Draw target={target_id}: \
+                                    sampler {sampler_id} not registered");
+                        placeholder_samp
+                    });
+                td.push(tex);
+                sd.push(samp);
+            }
+            tex_descs = td;
+            sampler_descs = sd;
+            // Allocate + populate.
+            let mut buf = atrium_spv_runtime::descriptor_table_buffer(slot_count);
+            unsafe {
+                atrium_spv_runtime::write_helper_pointers(
+                    &mut buf,
+                    atrium_spv_runtime::atrium_tex_sample_2d,
+                    atrium_spv_runtime::atrium_tex_fetch_2d,
+                    atrium_spv_runtime::atrium_tex_sample_2d_lod,
+                    atrium_spv_runtime::atrium_tex_sample_2d_array,
+                    atrium_spv_runtime::atrium_tex_sample_cube,
+                    atrium_spv_runtime::atrium_tex_gather_2d,
+                    atrium_spv_runtime::atrium_tex_sample_2d_array_lod,
+                    atrium_spv_runtime::atrium_tex_sample_cube_lod,
+                );
+                for (i, &(binding, _, _)) in bindings_sorted.iter().enumerate() {
+                    atrium_spv_runtime::write_descriptor_slot(
+                        &mut buf, binding as usize,
+                        &tex_descs[i] as *const _,
+                        &sampler_descs[i] as *const _,
+                    );
+                }
+            }
+            uniforms_buf = buf;
+        } else {
+            images_guard = None;
+            tex_descs = Vec::new();
+            sampler_descs = Vec::new();
+            uniforms_buf = Vec::new();
+        }
+        // CRITICAL: keep tex_descs / sampler_descs / images_guard
+        // alive through the loop -- the raw pointers inside
+        // uniforms_buf reference these Vecs' heap allocations.
+        // `let _ = (...)` would drop them immediately (same trap
+        // Arc 154's commit e0dce68 documented for image_descs).
+        let _retain_tex_state =
+            (&images_guard, &tex_descs, &sampler_descs);
+
         for t in 0..tri_count {
             let v0 = &assembled.bytes[(3*t)*stride   .. (3*t+1)*stride];
             let v1 = &assembled.bytes[(3*t+1)*stride .. (3*t+2)*stride];
@@ -1025,6 +1219,7 @@ impl Tier2Backend {
                 push_constants: &state.push_constants,
                 blend_state: raster.blend,
                 varying_f32_count,
+                uniforms: &uniforms_buf,
                 ..Default::default()
             };
             let db_ref: Option<&mut [f32]> = if !depth_enabled {
@@ -1681,6 +1876,7 @@ impl Tier2Backend {
                     Err(e) => log::warn!("malformed Dispatch: {e}"),
                 },
                 FrameOp::CopyImgToBuf => self.execute_copy_image_to_buffer(body),
+                FrameOp::CopyBufToImg => self.execute_copy_buffer_to_image(body),
                 _ => {}
             }
         }
@@ -1763,6 +1959,79 @@ impl Tier2Backend {
                 if dst_off + row_bytes > dst_buf.bytes.len() { break; }
                 dst_buf.bytes[dst_off..dst_off + row_bytes]
                     .copy_from_slice(&src_pixels[src_off..src_off + row_bytes]);
+            }
+        }
+    }
+
+    /// `FrameOp::CopyBufToImg` -- buffer-to-image copy, the
+    /// standard Vulkan path for uploading texture content from
+    /// a HOST_VISIBLE staging buffer to a DEVICE_LOCAL image.
+    /// Mirror of `execute_copy_image_to_buffer`; same 16-byte
+    /// header + 56-byte VkBufferImageCopy regions.  RGBA8 only
+    /// (matches `ImageStorage`'s hardcoded 4-bytes-per-pixel
+    /// layout); deeper format support lands with the
+    /// storage-image format-aware ABI arc.
+    fn execute_copy_buffer_to_image(&self, body: &[u8]) {
+        if body.len() < 16 {
+            log::warn!("CopyBufToImg: body too short ({} bytes)", body.len());
+            return;
+        }
+        let src_id = u32::from_le_bytes(body[0..4].try_into().unwrap());
+        let dst_id = u32::from_le_bytes(body[4..8].try_into().unwrap());
+        let _dst_layout = u32::from_le_bytes(body[8..12].try_into().unwrap());
+        let region_count = u32::from_le_bytes(body[12..16].try_into().unwrap());
+        if region_count == 0 { return; }
+
+        // Snapshot src bytes under the buffers lock; drop the
+        // lock before grabbing `images` so they never collide.
+        let src_snap: Option<Vec<u8>> = {
+            let buffers = self.buffers.lock().unwrap();
+            buffers.get(&src_id).map(|b| b.bytes.clone())
+        };
+        let Some(src_bytes) = src_snap else {
+            log::warn!("CopyBufToImg: src buffer {src_id} not registered");
+            return;
+        };
+
+        let mut images = self.images.lock().unwrap();
+        let Some(dst_img) = images.get_mut(&(dst_id as u64)) else {
+            log::warn!("CopyBufToImg: dst image {dst_id} not registered");
+            return;
+        };
+        let bpp: usize = 4; // RGBA8 only.
+        let dst_w = dst_img.width;
+        let dst_h = dst_img.height;
+        let dst_stride = dst_w as usize * bpp;
+
+        for r in 0..region_count as usize {
+            let off = 16 + r * 56;
+            if off + 56 > body.len() {
+                log::warn!("CopyBufToImg: region {r} truncated");
+                break;
+            }
+            let region = &body[off..off + 56];
+            let buf_offset = u64::from_le_bytes(region[0..8].try_into().unwrap()) as usize;
+            let buf_row_length = u32::from_le_bytes(region[8..12].try_into().unwrap());
+            let img_x = i32::from_le_bytes(region[32..36].try_into().unwrap()).max(0) as u32;
+            let img_y = i32::from_le_bytes(region[36..40].try_into().unwrap()).max(0) as u32;
+            let ext_w = u32::from_le_bytes(region[44..48].try_into().unwrap());
+            let ext_h = u32::from_le_bytes(region[48..52].try_into().unwrap());
+            let copy_w = ext_w.min(dst_w.saturating_sub(img_x));
+            let copy_h = ext_h.min(dst_h.saturating_sub(img_y));
+            let row_bytes = copy_w as usize * bpp;
+            let src_row_pitch = if buf_row_length == 0 {
+                row_bytes
+            } else {
+                buf_row_length as usize * bpp
+            };
+            for y in 0..copy_h as usize {
+                let dst_off = (img_y as usize + y) * dst_stride
+                    + img_x as usize * bpp;
+                let src_off = buf_offset + y * src_row_pitch;
+                if src_off + row_bytes > src_bytes.len() { break; }
+                if dst_off + row_bytes > dst_img.pixels.len() { break; }
+                dst_img.pixels[dst_off..dst_off + row_bytes]
+                    .copy_from_slice(&src_bytes[src_off..src_off + row_bytes]);
             }
         }
     }
@@ -1952,6 +2221,48 @@ impl Backend for Tier2Backend {
 
     fn buffer_destroyed(&self, buffer_id: ResourceId) {
         self.buffers.lock().unwrap().remove(&buffer_id.raw());
+    }
+
+    fn sampler_created(
+        &self,
+        sampler_id:    ResourceId,
+        min_filter:    u8,
+        mag_filter:    u8,
+        _mip_filter:   u8,
+        address_modes: [u8; 3],
+        _max_anisotropy: f32,
+        _min_lod:      f32,
+        _max_lod:      f32,
+    ) {
+        // VkFilter -> runtime FilterMode.  Same wire form
+        // (0=Nearest, 1=Linear) so the cast is direct.
+        let to_filter = |f: u8| -> u32 { f as u32 };
+        // VkSamplerAddressMode -> runtime WrapMode.  Mapping:
+        //   VK_REPEAT(0)               -> Repeat(1)
+        //   VK_MIRRORED_REPEAT(1)      -> Mirror(2)
+        //   VK_CLAMP_TO_EDGE(2)        -> ClampToEdge(0)
+        //   VK_CLAMP_TO_BORDER(3)      -> ClampToEdge (no border yet)
+        //   VK_MIRROR_CLAMP_TO_EDGE(4) -> ClampToEdge
+        let to_wrap = |a: u8| -> u32 {
+            match a {
+                0 => 1, // Repeat
+                1 => 2, // Mirror
+                _ => 0, // ClampToEdge
+            }
+        };
+        let desc = atrium_spv_runtime::SamplerDesc {
+            mag_filter: to_filter(mag_filter),
+            min_filter: to_filter(min_filter),
+            wrap_s: to_wrap(address_modes[0]),
+            wrap_t: to_wrap(address_modes[1]),
+        };
+        self.samplers.lock().unwrap()
+            .insert(sampler_id.raw(), desc);
+    }
+
+    fn sampler_destroyed(&self, sampler_id: ResourceId) {
+        self.samplers.lock().unwrap()
+            .remove(&sampler_id.raw());
     }
 
     fn buffer_write_bytes(

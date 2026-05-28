@@ -120,6 +120,33 @@ pub trait Backend: Send + Sync {
     /// Notify the backend a buffer was destroyed. Default no-op.
     fn buffer_destroyed(&self, _buffer_id: ResourceId) {}
 
+    /// Notify the backend a sampler was created with the given
+    /// state.  Tier-2 stores the `SamplerDesc`-equivalent so the
+    /// per-dispatch uniforms-table builder can hand the runtime
+    /// helper (`atrium_tex_sample_2d` etc) a pointer to it.
+    /// Other backends override to map this onto their native
+    /// sampler primitive.  Default no-op.
+    ///
+    /// All fields are the raw `VkSamplerCreateInfo` u8/f32
+    /// encoding (filter modes are VkFilter, address modes are
+    /// VkSamplerAddressMode, mip_filter is VkSamplerMipmapMode).
+    #[allow(clippy::too_many_arguments)]
+    fn sampler_created(
+        &self,
+        _sampler_id:    ResourceId,
+        _min_filter:    u8,
+        _mag_filter:    u8,
+        _mip_filter:    u8,
+        _address_modes: [u8; 3],
+        _max_anisotropy: f32,
+        _min_lod:       f32,
+        _max_lod:       f32,
+    ) {}
+
+    /// Notify the backend a sampler was destroyed.  Default
+    /// no-op; Tier-2 evicts the stored descriptor.
+    fn sampler_destroyed(&self, _sampler_id: ResourceId) {}
+
     /// Inline write into a previously-created buffer. Called by
     /// the session when it processes `OP_GPU_BUFFER_WRITE`.
     /// Default rejects (backends without inline-write support).
