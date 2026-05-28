@@ -173,6 +173,7 @@ GRAPHICS_INDEXED="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics
 GRAPHICS_UNORM="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_unorm"
 GRAPHICS_DEPTH="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_depth"
 GRAPHICS_VS_PUSHC="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_vs_pushc"
+GRAPHICS_MULTI_VBUF="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_multi_vbuf"
 DAEMON="$REPO_ROOT/aqueduct-gpu-host/target/debug/aqueduct-gpu-host"
 COMPILE="$REPO_ROOT/atrium-spv-compile/target/debug/atrium-spv-compile"
 SLANGC="$REPO_ROOT/external/slang-bin/bin/slangc"
@@ -844,6 +845,47 @@ if [ -x "$GRAPHICS_VS_PUSHC" ]; then
 else
     echo
     echo "SKIP Rung M: need 'cargo build -p atrium-vk-icd --example loader_graphics_vs_pushc'"
+fi
+
+# ── Rung N: multi-binding vertex buffers ─────────────────
+# loader_graphics_multi_vbuf: same triangle as Rung H, but
+# positions and colours live in SEPARATE VkBuffers bound to
+# distinct binding slots (positions @ slot 0, colours @
+# slot 1).  Verifies the daemon's per-binding
+# `vertex_buffers` HashMap stores both buffers + the
+# `assemble_vertices_by_index` cross-binding gather pulls
+# the right attribute from the right buffer per vertex.
+# Same expected pixel(4,4) as Rung H -- if the gather
+# broke (e.g. both attrs from slot 0), pixel values would
+# diverge.
+if [ -x "$GRAPHICS_MULTI_VBUF" ]; then
+    rm -f "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+        echo "daemon failed to start (multi-vbuf round-trip); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung N: multi-binding vertex buffers ==="
+    if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+        VK_DRIVER_FILES="$MANIFEST" \
+        ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+        "$GRAPHICS_MULTI_VBUF" 2>&1 | tail -2; then
+        echo "FAIL: multi-vbuf round-trip did not return 0" >&2
+        exit 1
+    fi
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
+else
+    echo
+    echo "SKIP Rung N: need 'cargo build -p atrium-vk-icd --example loader_graphics_multi_vbuf'"
 fi
 
 echo
