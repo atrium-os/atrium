@@ -1054,6 +1054,16 @@ pub struct Function {
     /// path through the BuiltIn translation.  Empty for FS
     /// / CS shaders.
     pub output_varying_byte_offset: HashMap<ValueId, u32>,
+    /// Per-variable byte offsets inside the VS
+    /// `in_attributes` / FS `in_varyings` buffer.  Indexed
+    /// by the variable's IR ValueId; codegen resolves
+    /// Location-decorated `Input`-storage OpVariable to
+    /// `(in_buffer_ptr, offset)`.  Without this map a shader
+    /// with multiple Inputs would read all of them from
+    /// offset 0 (the symptom: a VS reading `in_pos` at
+    /// Location 0 and `in_color` at Location 1 both read
+    /// from the position bytes).
+    pub input_varying_byte_offset: HashMap<ValueId, u32>,
 }
 
 /// Shader stage.

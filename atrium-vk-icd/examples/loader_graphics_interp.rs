@@ -6,27 +6,29 @@
 //! client through the same loader → ICD → daemon →
 //! CopyImgToBuf → invalidate chain.
 //!
-//! # PARTIALLY WORKING as of 2026-05-28
+//! # WORKING as of 2026-05-28
 //!
-//! The daemon crash (SIGSEGV from null `in_varyings_ptr`)
-//! and the missing varying-routing pipeline are both
-//! fixed; the rasterizer now interpolates the per-vertex
-//! varying and the FS reads it.  Diagnostic output shows
-//! pixel(4,4) = (32, 32, 0, 255):
+//! Full per-vertex colour interpolation reaches the
+//! client.  Pixel(4,4) = (16, 80, 159, 255) -- the
+//! barycentric mix dominated by V2 (blue) since (4,4) is
+//! near V2's screen-space position.  Pixels along the
+//! V0-V1 edge (y=2 row) show a smooth red->green gradient
+//! `(207,16,32) -> ... -> (16,207,32)`.  All three vertex
+//! colours contribute everywhere inside the triangle.
 //!
-//!   * R and G channels DO show interpolated values
-//!     (V0=red and V1=green both contribute).
-//!   * B channel reads 0 everywhere -- V2's blue colour
-//!     is NOT reaching the FS, OR a `vec3 OpStore` only
-//!     emits 2 lanes, OR a `vec3 OpLoad` only reads 2.
+//! The two-arc fix that got us here:
 //!
-//! Bisecting that needs a vec3-OpStore / vec3-OpLoad unit
-//! test in atrium-spv-backend-bespoke's differential
-//! suite; doesn't fit this arc.  The rasterizer's
-//! barycentric math + varying-byte plumbing are proven by
-//! the R and G channels surviving end-to-end.  Not yet
-//! wired into loader_smoke; un-park when the third lane
-//! lands.
+//!   * Daemon-side: `Tier2Backend::dispatch_draw` now
+//!     plumbs `vs_varying_bytes` into
+//!     `DrawTriangle::varying_f32_count`, and
+//!     `fill_image_triangle` captures the VS's writes from
+//!     a per-vertex `vary_scratch` buffer when the caller
+//!     leaves `varyings_per_vertex` empty.
+//!   * Frontend + backends: Location-decorated `Input` /
+//!     `Output` storage variables route through
+//!     `params[0]` / `params[7]` plus a per-Location byte
+//!     offset assigned at compile time -- two Inputs at
+//!     Locations 0 and 1 no longer collide at offset 0.
 //!
 //! Triangle vertices and colours:
 //!

@@ -96,6 +96,17 @@ pub struct InterfaceContext {
     /// (`gl_Position`) are NOT in this map -- they stay on
     /// the legacy out_position path through `builtin_vars`.
     pub output_varying_byte_offset: HashMap<Word, u32>,
+    /// SPIR-V variable id → byte offset within the
+    /// per-vertex / per-fragment `Input` buffer for
+    /// Location-decorated `Input`-storage variables.  Same
+    /// shape as `output_varying_byte_offset` but for the
+    /// read side.  For VS this maps onto `in_attributes`
+    /// (params[0]); for FS onto `in_varyings` (params[0]).
+    /// Without this, the generic `(stage, Input) -> params[0]`
+    /// rule sends every load to offset 0 -- a shader with
+    /// two Inputs at Locations 0 and 1 would read both from
+    /// the same bytes.
+    pub input_varying_byte_offset: HashMap<Word, u32>,
     /// SPIR-V variable id → recognised stage built-in.  Set
     /// from `OpDecorate <var> BuiltIn <kind>`; consumed by
     /// function translation to lower an `OpLoad` through one
@@ -148,10 +159,11 @@ impl InterfaceContext {
         constants: Option<&crate::constants::ConstantContext>,
     ) -> Result<Self, FrontendError> {
         let mut ctx = InterfaceContext::default();
-        // Local: (spv_var_id, location, byte_size) for Location-
-        // decorated Output vars.  Sorted + offset-assigned at
-        // end of the walk.
+        // Locals: (spv_var_id, location, byte_size) for
+        // Location-decorated Output / Input vars.  Sorted +
+        // offset-assigned at end of the walk.
         let mut output_var_loc_size: Vec<(Word, u32, u32)> = Vec::new();
+        let mut input_var_loc_size: Vec<(Word, u32, u32)> = Vec::new();
 
         // OpExtInstImport: record result_ids whose set name
         // is "GLSL.std.450" so the function translator can
@@ -439,7 +451,7 @@ impl InterfaceContext {
                 }
                 SpvStorageClass::Input => {
                     if let Some(d) = deco {
-                        if let (Some(location), Some(ty)) = (d.location, pointee_ty) {
+                        if let (Some(location), Some(ty)) = (d.location, pointee_ty.clone()) {
                             // For phase 1 v1 we treat any
                             // Input variable as a vertex
                             // attribute (the only stage
@@ -447,6 +459,14 @@ impl InterfaceContext {
                             ctx.vertex_inputs.push(VertexInput {
                                 location, offset: 0, ty,
                             });
+                            // Stash (var_id, location, byte_size)
+                            // so we can compute byte offsets in
+                            // Location order after the walk.
+                            // Same shape as the Output branch
+                            // does for varyings.
+                            let sz = ir_type_size_bytes_for(
+                                &types.types, *pointee_id);
+                            input_var_loc_size.push((*var_id, location, sz));
                         }
                     }
                 }
@@ -525,6 +545,18 @@ impl InterfaceContext {
         let mut running: u32 = 0;
         for (var_id, _loc, sz) in &output_var_loc_size {
             ctx.output_varying_byte_offset.insert(*var_id, running);
+            running = running.saturating_add(*sz);
+        }
+        // Same shape for Location-decorated Input vars:
+        // sort by Location, assign prefix-sum byte offsets.
+        // For VS this maps onto the daemon's
+        // `assemble_vertices` output (already packed in
+        // shader-location order).  For FS this maps onto
+        // the same `out_varyings` packing the VS produced.
+        input_var_loc_size.sort_by_key(|(_, loc, _)| *loc);
+        let mut running: u32 = 0;
+        for (var_id, _loc, sz) in &input_var_loc_size {
+            ctx.input_varying_byte_offset.insert(*var_id, running);
             running = running.saturating_add(*sz);
         }
 

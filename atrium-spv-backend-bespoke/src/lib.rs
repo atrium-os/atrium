@@ -1121,6 +1121,21 @@ fn emit_function(
         }
     }
 
+    // Location-decorated `Input`-storage vars (VS attrs and
+    // FS varyings): both stages take the input buffer as
+    // X0 (in_attributes for VS, in_varyings for FS).
+    // Without per-Location offsets here, every Input load
+    // resolves to X0+0 -- two Inputs at Locations 0 and 1
+    // would read the same bytes.
+    if !func.input_varying_byte_offset.is_empty()
+        && matches!(func.stage,
+            ShaderStage::Vertex | ShaderStage::Fragment)
+    {
+        for (&vid, &voff) in &func.input_varying_byte_offset {
+            pointers.insert(vid, (asm::Xreg(0), voff as i32));
+        }
+    }
+
     // Storage-image prologue.  A compute shader that does
     // OpImageRead / OpImageWrite calls into the runtime
     // (atrium_img_read_2d / atrium_img_write_2d) via the v1

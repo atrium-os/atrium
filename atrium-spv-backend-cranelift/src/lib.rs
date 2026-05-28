@@ -438,6 +438,24 @@ fn emit_function(
             }
         }
 
+        // Location-decorated `Input`-storage vars: for VS,
+        // route to params[0] = in_attributes; for FS,
+        // route to params[0] = in_varyings.  Same shape as
+        // Output routing -- each var gets a per-Location
+        // byte offset assigned by the frontend.  Without
+        // this every Input read goes to offset 0 (the
+        // symptom: VS reads in_color from the same bytes as
+        // in_pos when both are Location-decorated).
+        if !func.input_varying_byte_offset.is_empty()
+            && matches!(func.stage,
+                ShaderStage::Vertex | ShaderStage::Fragment)
+        {
+            let in_base = translator.params[0];
+            for (&vid, &off) in &func.input_varying_byte_offset {
+                translator.pointers.insert(vid, (in_base, off as i32));
+            }
+        }
+
         // Walk every IR block in id order, switching the
         // builder to the Cranelift block for each. The
         // terminator (Branch / BranchCond / Return) is
