@@ -312,12 +312,29 @@ wait_for_daemon() {
 
 # ── Rung 1: ABI smoke (no daemon) ────────────────────────────────
 echo
-echo "=== Rung 1: no daemon -- expect VK_ERROR_INITIALIZATION_FAILED ==="
+echo "=== Rung 1: no daemon -- vulkaninfo must report 0 devices ==="
+# The rung's pass condition is "vulkaninfo prints
+# `vkEnumeratePhysicalDevices failed with
+# ERROR_INITIALIZATION_FAILED` on stderr".  That message
+# coming through is the PROOF the loader correctly rejected
+# our dylib's 0-device handshake -- it is NOT a real error
+# in the test pipeline.  We capture the output, check the
+# proof line is present, and print a one-line summary
+# instead of dumping the scary vulkaninfo stderr verbatim.
 set +e
-DYLD_LIBRARY_PATH=/opt/homebrew/lib \
-  VK_DRIVER_FILES="$MANIFEST" \
-  vulkaninfo --summary 2>&1 | tail -5
+rung1_out=$(DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+    VK_DRIVER_FILES="$MANIFEST" \
+    vulkaninfo --summary 2>&1)
+rung1_rc=$?
 set -e
+if printf '%s\n' "$rung1_out" | grep -q "ERROR_INITIALIZATION_FAILED"; then
+    echo "PASS: vulkaninfo got ERROR_INITIALIZATION_FAILED (expected with no daemon)"
+else
+    echo "FAIL: Rung 1 didn't see the expected ERROR_INITIALIZATION_FAILED" >&2
+    echo "vulkaninfo exit=$rung1_rc output:" >&2
+    printf '%s\n' "$rung1_out" >&2
+    exit 1
+fi
 
 # ── Rung 2 + 3: with daemon ──────────────────────────────────────
 rm -f "$SOCKET"
@@ -329,19 +346,33 @@ if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
     exit 1
 fi
 echo
-echo "=== Rung 2: daemon up -- expect 1 device ==="
-DYLD_LIBRARY_PATH=/opt/homebrew/lib \
-  VK_DRIVER_FILES="$MANIFEST" \
-  ATRIUM_VK_ICD_SOCKET="$SOCKET" \
-  vulkaninfo --summary 2>&1 | grep -E "Devices:|GPU0:|apiVersion|deviceName|deviceType" | head -10
+echo "=== Rung 2: daemon up -- vulkaninfo must see 1 device ==="
+rung2_out=$(DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+    VK_DRIVER_FILES="$MANIFEST" \
+    ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+    vulkaninfo --summary 2>&1)
+if printf '%s\n' "$rung2_out" | grep -q "atrium-vk-icd (software:"; then
+    devline=$(printf '%s\n' "$rung2_out" | grep "deviceName" | head -1 | tr -s ' ')
+    echo "PASS: vulkaninfo reports our device ($devline)"
+else
+    echo "FAIL: Rung 2 didn't find atrium-vk-icd in vulkaninfo output" >&2
+    printf '%s\n' "$rung2_out" >&2
+    exit 1
+fi
 
 echo
 echo "=== Rung 3: full vulkaninfo readout exit code ==="
-DYLD_LIBRARY_PATH=/opt/homebrew/lib \
-  VK_DRIVER_FILES="$MANIFEST" \
-  ATRIUM_VK_ICD_SOCKET="$SOCKET" \
-  vulkaninfo > /tmp/atrium-vulkaninfo.out 2>&1
-echo "vulkaninfo exit=$?  (output in /tmp/atrium-vulkaninfo.out, $(wc -l </tmp/atrium-vulkaninfo.out | tr -d ' ') lines)"
+if DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+    VK_DRIVER_FILES="$MANIFEST" \
+    ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+    vulkaninfo > /tmp/atrium-vulkaninfo.out 2>&1
+then
+    nlines=$(wc -l </tmp/atrium-vulkaninfo.out | tr -d ' ')
+    echo "PASS: full vulkaninfo readout completed ($nlines lines in /tmp/atrium-vulkaninfo.out)"
+else
+    echo "FAIL: vulkaninfo full readout returned non-zero" >&2
+    exit 1
+fi
 
 kill_daemon "$DAEMON_PID"
 DAEMON_PID=""
@@ -370,14 +401,21 @@ else
     DYLD_LIBRARY_PATH=/opt/homebrew/lib \
       VK_DRIVER_FILES="$MANIFEST" \
       ATRIUM_VK_ICD_SOCKET="$SOCKET" \
-      "$EXAMPLE" 2>&1 | grep -E "vk|trivial|done"
+      "$EXAMPLE" > /tmp/atrium-loader-smoke.out 2>&1
+    rung4_rc=$?
     n_afblob=$(find "$CACHE_ROOT" -name '*.afblob' 2>/dev/null | wc -l | tr -d ' ')
     n_pcmap=$(find "$CACHE_ROOT"  -name '*.pcmap'  2>/dev/null | wc -l | tr -d ' ')
-    echo "cache contents: $n_afblob .afblob, $n_pcmap .pcmap"
-    if [ "$n_afblob" != "1" ] || [ "$n_pcmap" != "1" ]; then
-        echo "FAIL: tier-2 did not produce the expected cache artifacts" >&2
+    if [ "$rung4_rc" -ne 0 ]; then
+        echo "FAIL: loader_smoke returned $rung4_rc" >&2
+        cat /tmp/atrium-loader-smoke.out >&2
         exit 1
     fi
+    if [ "$n_afblob" != "1" ] || [ "$n_pcmap" != "1" ]; then
+        echo "FAIL: tier-2 did not produce the expected cache artifacts \
+              (.afblob=$n_afblob, .pcmap=$n_pcmap)" >&2
+        exit 1
+    fi
+    echo "PASS: shader upload landed an .afblob + .pcmap in the cache"
     kill_daemon "$DAEMON_PID"
     DAEMON_PID=""
 
@@ -408,9 +446,16 @@ else
     DYLD_LIBRARY_PATH=/opt/homebrew/lib \
       VK_DRIVER_FILES="$MANIFEST" \
       ATRIUM_VK_ICD_SOCKET="$SOCKET" \
-      "$EXAMPLE" 2>&1 | grep -E "vk|trivial|done"
+      "$EXAMPLE" > /tmp/atrium-loader-smoke.out 2>&1
+    rung5_rc=$?
+    if [ "$rung5_rc" -ne 0 ]; then
+        echo "FAIL: loader_smoke (tier2 backend) returned $rung5_rc" >&2
+        cat /tmp/atrium-loader-smoke.out >&2
+        exit 1
+    fi
     grep -E "tier-2 backend selected" /tmp/aqueduct-loader-smoke.log >/dev/null \
         || { echo "FAIL: --backend tier2 did not log selection" >&2; exit 1; }
+    echo "PASS: --backend tier2 dispatch path active"
     kill_daemon "$DAEMON_PID"
     DAEMON_PID=""
 
