@@ -179,6 +179,7 @@ GRAPHICS_MULTI_FS_IN="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_grap
 GRAPHICS_UBO="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_ubo"
 GRAPHICS_VIEWPORT="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_viewport"
 GRAPHICS_SCISSOR="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_scissor"
+GRAPHICS_DEPTH_RANGE="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_depth_range"
 DAEMON="$REPO_ROOT/aqueduct-gpu-host/target/debug/aqueduct-gpu-host"
 COMPILE="$REPO_ROOT/atrium-spv-compile/target/debug/atrium-spv-compile"
 SLANGC="$REPO_ROOT/external/slang-bin/bin/slangc"
@@ -1140,6 +1141,47 @@ if [ -x "$GRAPHICS_SCISSOR" ]; then
 else
     echo
     echo "SKIP Rung S: need 'cargo build -p atrium-vk-icd --example loader_graphics_scissor'"
+fi
+
+# ── Rung T: viewport min_depth/max_depth depth-range remap ─
+# loader_graphics_depth_range: two overlapping triangles
+# with viewport depth ranges swapped vs their NDC.z values.
+# F draws first at ndc.z=0.1 with depth range [0.5, 1.0]
+# (windowed 0.55); B draws second at ndc.z=0.5 with depth
+# range [0.0, 0.5] (windowed 0.25).  With the remap, B wins
+# the LESS test; pixel(3,3) ends up red.  Without the remap,
+# F wins and pixel(3,3) is green.  Pre-fix, fill_image_
+# triangle wrote raw NDC.z to the depth buffer and passed
+# the same to fs_main; this rung verifies the windowed
+# depth path lands.
+if [ -x "$GRAPHICS_DEPTH_RANGE" ]; then
+    rm -f "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+        echo "daemon failed to start (depth_range round-trip); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung T: viewport depth-range remap flips depth-test winner ==="
+    if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+        VK_DRIVER_FILES="$MANIFEST" \
+        ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+        "$GRAPHICS_DEPTH_RANGE" 2>&1 | tail -2; then
+        echo "FAIL: depth_range round-trip did not return 0" >&2
+        exit 1
+    fi
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
+else
+    echo
+    echo "SKIP Rung T: need 'cargo build -p atrium-vk-icd --example loader_graphics_depth_range'"
 fi
 
 echo

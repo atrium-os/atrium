@@ -574,6 +574,10 @@ impl Tier2Registry {
             // (`fs_main`) and slice references are Send +
             // Sync, so the closure captures them without
             // additional wrapping.
+            let (depth_min, depth_max) = match draw.viewport {
+                Some(v) => (v.min_depth, v.max_depth),
+                None    => (0.0, 1.0),
+            };
             let setup = TriangleSetup {
                 a, b, c, total_edge,
                 ndc, inv_w,
@@ -582,6 +586,7 @@ impl Tier2Registry {
                 min_x, max_x, min_y, max_y,
                 tile_min_x, tile_max_x,
                 width,
+                depth_min, depth_max,
             };
 
             let pixel_stripe_bytes =
@@ -675,6 +680,14 @@ struct TriangleSetup<'s> {
     tile_max_x: i32,
     /// Image width in pixels (for row-major indexing).
     width: u32,
+    /// Viewport depth range (`vkCmdSetViewport`'s
+    /// `min_depth` / `max_depth`).  Used to remap the
+    /// interpolated NDC.z into windowed-depth space before
+    /// the depth test + buffer write + FS frag_coord.z
+    /// hand-off.  Defaults to `(0.0, 1.0)` (identity) when
+    /// the caller didn't supply a viewport.
+    depth_min: f32,
+    depth_max: f32,
 }
 
 /// One stripe's mutable working set for R.7's per-stripe
@@ -854,6 +867,14 @@ fn rasterize_stripe(
                 let interp_z = b0 * setup.ndc[0][2]
                     + b1 * setup.ndc[1][2]
                     + b2 * setup.ndc[2][2];
+                // Apply the viewport depth-range remap.
+                // Vulkan windowed depth = min_depth +
+                // ndc.z * (max_depth - min_depth).  When the
+                // caller didn't supply a viewport, the
+                // identity range (0, 1) preserves the
+                // pre-Rung-R behaviour.
+                let window_z = setup.depth_min
+                    + interp_z * (setup.depth_max - setup.depth_min);
 
                 // Stripe-local indexing.
                 let py_local = (py - stripe_pixel_y) as usize;
@@ -861,8 +882,8 @@ fn rasterize_stripe(
                     py_local * (setup.width as usize) + (px as usize);
 
                 if let Some(db) = task.depth.as_mut() {
-                    if interp_z >= db[pixel_lin_local] { continue; }
-                    db[pixel_lin_local] = interp_z;
+                    if window_z >= db[pixel_lin_local] { continue; }
+                    db[pixel_lin_local] = window_z;
                 }
 
                 let mut out_color = [0.0f32; 4];
@@ -879,7 +900,7 @@ fn rasterize_stripe(
                 unsafe {
                     fs_main(
                         in_varyings_ptr, uni_ptr, pc_ptr,
-                        cx, cy, interp_z, one_over_interp_inv_w,
+                        cx, cy, window_z, one_over_interp_inv_w,
                         0,
                         out_color.as_mut_ptr(),
                         &mut out_depth,
