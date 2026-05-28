@@ -230,6 +230,29 @@ fn main() -> std::process::ExitCode {
             u32::from_str_radix(b, r).unwrap_or_else(|e|
                 panic!("ATRIUM_VK_SMOKE_SPEC_U32={s:?} not a u32 ({e})"))
         });
+    // ATRIUM_VK_SMOKE_USE_IMAGE -- when set (any non-empty
+    // value), wire a 1x1 R32_UINT VkImage at descriptor
+    // binding 1 with STORAGE_IMAGE type (instead of a second
+    // SSBO).  The shader binding(1) gets bound to a real
+    // VkImage with an UNDEFINED -> GENERAL layout transition
+    // before dispatch.  Assertion is still on binding 0's
+    // SSBO; the image write itself is not read back (would
+    // need vkCmdCopyImageToBuffer or an OP_GPU_IMAGE_READ
+    // wire op -- separate arc).  This rung's purpose is to
+    // exercise:
+    //   * Tier2Backend's compute_image_by_binding wire path
+    //   * Arc 150's IMG_TABLE_DESC_BASE=72 shift
+    //   * STORAGE_IMAGE descriptor flow through the loader
+    //     (pool/set/update + image_info instead of buffer_info).
+    let use_image: bool = std::env::var("ATRIUM_VK_SMOKE_USE_IMAGE")
+        .ok()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    if use_image && second_seed.is_some() {
+        eprintln!("ATRIUM_VK_SMOKE_USE_IMAGE and ATRIUM_VK_SMOKE_SECOND_SEED \
+                   are mutually exclusive (both target binding 1)");
+        return 1.into();
+    }
 
     let entry = unsafe {
         match ash::Entry::load() {
@@ -352,26 +375,92 @@ fn main() -> std::process::ExitCode {
         (None, None)
     };
 
+    // ── Optional storage image at binding 1 ───────────────────
+    // 1x1 R32_UINT image with STORAGE usage.  Created here so
+    // it can be wired into the DSL/pool/write below; layout
+    // transition is recorded into the command buffer further
+    // down (UNDEFINED -> GENERAL before bind+dispatch).
+    let (image_opt, image_mem_opt, image_view_opt) = if use_image {
+        let extent = vk::Extent3D { width: 1, height: 1, depth: 1 };
+        let img_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::R32_UINT)
+            .extent(extent)
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::STORAGE)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = unsafe { device.create_image(&img_info, None).expect("create_image") };
+        let req_i = unsafe { device.get_image_memory_requirements(image) };
+        let mem_ty_i = unsafe { find_memory_type(
+            &instance, pd, req_i.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        ) };
+        let alloc_i = vk::MemoryAllocateInfo::default()
+            .allocation_size(req_i.size)
+            .memory_type_index(mem_ty_i);
+        let image_mem = unsafe { device.allocate_memory(&alloc_i, None).expect("img mem") };
+        unsafe { device.bind_image_memory(image, image_mem, 0).expect("bind_image"); }
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(vk::Format::R32_UINT)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        let view = unsafe { device.create_image_view(&view_info, None).expect("img view") };
+        println!("vkCreateImage 1x1 R32_UINT + view  -> OK (binding=1, STORAGE_IMAGE)");
+        (Some(image), Some(image_mem), Some(view))
+    } else {
+        (None, None, None)
+    };
+
     // ── Descriptor set layout / pool / set ────────────────────
-    let n_bindings: u32 = if buffer2.is_some() { 2 } else { 1 };
-    let dsl_bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..n_bindings)
-        .map(|b| vk::DescriptorSetLayoutBinding::default()
-            .binding(b)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+    let binding1_kind: Option<vk::DescriptorType> = if image_opt.is_some() {
+        Some(vk::DescriptorType::STORAGE_IMAGE)
+    } else if buffer2.is_some() {
+        Some(vk::DescriptorType::STORAGE_BUFFER)
+    } else {
+        None
+    };
+    let n_bindings: u32 = if binding1_kind.is_some() { 2 } else { 1 };
+    let mut dsl_bindings: Vec<vk::DescriptorSetLayoutBinding> = Vec::new();
+    dsl_bindings.push(vk::DescriptorSetLayoutBinding::default()
+        .binding(0)
+        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+        .descriptor_count(1)
+        .stage_flags(vk::ShaderStageFlags::COMPUTE));
+    if let Some(ty) = binding1_kind {
+        dsl_bindings.push(vk::DescriptorSetLayoutBinding::default()
+            .binding(1)
+            .descriptor_type(ty)
             .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::COMPUTE))
-        .collect();
+            .stage_flags(vk::ShaderStageFlags::COMPUTE));
+    }
     let dsl_info = vk::DescriptorSetLayoutCreateInfo::default()
         .bindings(&dsl_bindings);
     let dsl = unsafe { device.create_descriptor_set_layout(&dsl_info, None).expect("DSL") };
 
-    let pool_size = vk::DescriptorPoolSize::default()
+    let mut pool_sizes_v: Vec<vk::DescriptorPoolSize> = Vec::new();
+    pool_sizes_v.push(vk::DescriptorPoolSize::default()
         .ty(vk::DescriptorType::STORAGE_BUFFER)
-        .descriptor_count(n_bindings);
-    let pool_sizes = [pool_size];
+        .descriptor_count(if binding1_kind == Some(vk::DescriptorType::STORAGE_BUFFER) { 2 } else { 1 }));
+    if binding1_kind == Some(vk::DescriptorType::STORAGE_IMAGE) {
+        pool_sizes_v.push(vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::STORAGE_IMAGE)
+            .descriptor_count(1));
+    }
+    let pool_sizes = &pool_sizes_v[..];
     let pool_info = vk::DescriptorPoolCreateInfo::default()
         .max_sets(1)
-        .pool_sizes(&pool_sizes);
+        .pool_sizes(pool_sizes);
     let pool = unsafe { device.create_descriptor_pool(&pool_info, None).expect("pool") };
 
     let dsl_array = [dsl];
@@ -385,25 +474,30 @@ fn main() -> std::process::ExitCode {
         .buffer(buffer).offset(0).range(vk::WHOLE_SIZE)];
     let bis_1 = buffer2.map(|b| [vk::DescriptorBufferInfo::default()
         .buffer(b).offset(0).range(vk::WHOLE_SIZE)]);
+    let iis_1 = image_view_opt.map(|v| [vk::DescriptorImageInfo::default()
+        .image_view(v)
+        .image_layout(vk::ImageLayout::GENERAL)]);
     let write0 = vk::WriteDescriptorSet::default()
         .dst_set(dset).dst_binding(0)
         .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
         .buffer_info(&bis_0);
     // Cannot push two WriteDescriptorSets borrowing different
-    // bis_* slices into a Vec without aliasing trouble; for the
-    // 2-binding case build the array inline.  The 1-binding
-    // case keeps the single-element slice.
-    match bis_1.as_ref() {
-        Some(b1) => {
-            let write1 = vk::WriteDescriptorSet::default()
-                .dst_set(dset).dst_binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(b1);
-            unsafe { device.update_descriptor_sets(&[write0, write1], &[]); }
-        }
-        None => {
-            unsafe { device.update_descriptor_sets(&[write0], &[]); }
-        }
+    // bis_* / iis_* slices into a Vec without aliasing trouble;
+    // build inline per case.
+    if let Some(i1) = iis_1.as_ref() {
+        let write1 = vk::WriteDescriptorSet::default()
+            .dst_set(dset).dst_binding(1)
+            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+            .image_info(i1);
+        unsafe { device.update_descriptor_sets(&[write0, write1], &[]); }
+    } else if let Some(b1) = bis_1.as_ref() {
+        let write1 = vk::WriteDescriptorSet::default()
+            .dst_set(dset).dst_binding(1)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(b1);
+        unsafe { device.update_descriptor_sets(&[write0, write1], &[]); }
+    } else {
+        unsafe { device.update_descriptor_sets(&[write0], &[]); }
     }
     println!("descriptor set layout/pool/update -> OK ({n_bindings} binding(s))");
 
@@ -519,6 +613,37 @@ fn main() -> std::process::ExitCode {
 
     let begin = vk::CommandBufferBeginInfo::default();
     unsafe { device.begin_command_buffer(cb, &begin).expect("begin"); }
+    // UNDEFINED -> GENERAL transition for the storage image
+    // (if any).  Required by the spec before any STORAGE_IMAGE
+    // read/write; vkCmdPipelineBarrier with srcStageMask=
+    // TOP_OF_PIPE and dstStageMask=COMPUTE_SHADER is the
+    // narrowest barrier that gets the layout right.
+    if let Some(img) = image_opt {
+        let barrier = vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::empty())
+            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(img)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        unsafe {
+            device.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[], &[], &[barrier],
+            );
+        }
+    }
     unsafe {
         device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pipeline);
         device.cmd_bind_descriptor_sets(
@@ -608,6 +733,9 @@ fn main() -> std::process::ExitCode {
         device.free_memory(mem, None);
         if let Some(b2) = buffer2 { device.destroy_buffer(b2, None); }
         if let Some(m2) = mem2_opt { device.free_memory(m2, None); }
+        if let Some(v) = image_view_opt { device.destroy_image_view(v, None); }
+        if let Some(i) = image_opt { device.destroy_image(i, None); }
+        if let Some(m) = image_mem_opt { device.free_memory(m, None); }
         device.destroy_device(None);
         instance.destroy_instance(None);
     }

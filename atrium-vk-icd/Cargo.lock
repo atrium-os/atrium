@@ -166,6 +166,7 @@ name = "atrium-spv-loader"
 version = "0.1.0"
 dependencies = [
  "atrium-spv-blob",
+ "atrium-spv-ir",
  "atrium-spv-pcmap",
  "libc",
  "libloading",

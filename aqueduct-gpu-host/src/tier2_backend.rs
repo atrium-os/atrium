@@ -1287,7 +1287,12 @@ impl Tier2Backend {
             );
         }
         let uni_ptr: *const u8 = image_table.as_ptr();
-        let _ = (images_guard, image_descs); // hold for lifetime
+        // CRITICAL: must be a NAMED binding to keep these
+        // alive until end of scope.  `let _ = (...)` would
+        // drop both immediately -- freeing the `image_descs`
+        // Vec's heap while `image_table` still holds raw
+        // pointers into it, so cs_main would deref garbage.
+        let _retain_image_state = (images_guard, &image_descs);
 
         let total_invocations = (cmd.group_count_x as u64)
             * (cmd.group_count_y as u64) * (cmd.group_count_z as u64)

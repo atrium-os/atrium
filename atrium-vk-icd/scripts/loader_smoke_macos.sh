@@ -204,6 +204,7 @@ groupshared_xor:0:24:8:1
 push_scale:6:42:1:1:7
 multi_binding:10:42:1:1::32
 spec_scale:6:42:1:1:::7
+storage_image_write:0:42:1:1::::1
 "
 # loop_mul un-parked Arc 144: spirv-opt --ssa-rewrite (run by
 # the daemon when --spirv-opt-binary is set) promotes Slang's
@@ -514,6 +515,14 @@ if [ -x "$ROUNDTRIP" ] && [ -x "$SLANGC" ] && [ -f "$SLANG_SRC" ]; then
         # with (constantID=0, offset=0, size=4) carrying this
         # u32.  Slang's [[vk::constant_id(0)]] const baked in.
         spec_u32=$(echo "$entry" | cut -d: -f8)
+        # Optional 9th field: storage-image flag.  When set
+        # to "1", the example creates a 1x1 R32_UINT VkImage
+        # at binding 1 (STORAGE_IMAGE descriptor) instead of
+        # a second SSBO.  Layout transition UNDEFINED ->
+        # GENERAL happens at cmdbuf start.  Exercises the
+        # Tier2Backend storage-image wire path; the image
+        # write itself is not read back.
+        use_image=$(echo "$entry" | cut -d: -f9)
         [ -z "$buf_u32s" ]   && buf_u32s=1
         [ -z "$dispatch_x" ] && dispatch_x=1
         src="$SHADER_DIR/$name.slang"
@@ -536,6 +545,7 @@ if [ -x "$ROUNDTRIP" ] && [ -x "$SLANGC" ] && [ -f "$SLANG_SRC" ]; then
             ATRIUM_VK_SMOKE_PUSH_U32="${push_u32:-}" \
             ATRIUM_VK_SMOKE_SECOND_SEED="${second_seed:-}" \
             ATRIUM_VK_SMOKE_SPEC_U32="${spec_u32:-}" \
+            ATRIUM_VK_SMOKE_USE_IMAGE="${use_image:-}" \
             "$ROUNDTRIP" 2>&1 | tail -2; then
             echo "FAIL: $name round-trip" >&2
             exit 1

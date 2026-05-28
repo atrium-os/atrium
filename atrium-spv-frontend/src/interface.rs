@@ -73,6 +73,18 @@ pub struct InterfaceContext {
     /// memory load, since descriptor-bound resources aren't
     /// loadable byte regions.
     pub var_binding: HashMap<Word, (u32, u32)>,
+    /// Subset of `var_binding`: SPIR-V var ids whose storage
+    /// class is exactly `StorageBuffer` (SSBOs).  Used by
+    /// `Function::ssbo_bindings` to filter out
+    /// `UniformConstant` entries (storage images, samplers)
+    /// that share the descriptor-set/binding decoration but
+    /// must NOT be treated as descriptor-table SSBO slots by
+    /// the backends' multi-binding compute prologue.  Without
+    /// this filter a shader with one SSBO + one storage image
+    /// presents `ssbo_bindings.len() == 2` to the backend,
+    /// which then misreads the SSBO pointer-param as a
+    /// descriptor-table base and dereferences garbage.
+    pub storage_buffer_vars: std::collections::HashSet<Word>,
     /// SPIR-V variable id → recognised stage built-in.  Set
     /// from `OpDecorate <var> BuiltIn <kind>`; consumed by
     /// function translation to lower an `OpLoad` through one
@@ -444,6 +456,7 @@ impl InterfaceContext {
                             (d.descriptor_set, d.binding)
                         {
                             ctx.var_binding.insert(*var_id, (set, binding));
+                            ctx.storage_buffer_vars.insert(*var_id);
                         }
                     }
                 }

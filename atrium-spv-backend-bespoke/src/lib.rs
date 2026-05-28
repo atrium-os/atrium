@@ -3840,9 +3840,20 @@ fn emit_function(
                     }
                     let mut regs = [asm::Vreg(0); 4];
                     for (i, r) in regs.iter_mut().enumerate() {
+                        // Integer-texel ImageWrite (e.g. R32_UINT
+                        // storage images, where Slang lowers
+                        // `img[uv] = 99u` to a uint4 with i32 lanes)
+                        // lands the lanes in `ints`, not `scalars`.
+                        // Bespoke's current spill/call shape moves
+                        // V-regs into the rgba stack slot — wiring
+                        // up the int->V-reg copy is a larger refactor.
+                        // Fall back to cranelift via Unsupported so
+                        // the upper layers retry with the other
+                        // backend.
                         *r = *scalars.get(&lanes[i].id).ok_or_else(||
-                            BackendError::Internal(format!(
-                                "ImageWrite texel lane {i} not in scalars")))?;
+                            BackendError::Unsupported(format!(
+                                "ImageWrite integer-texel lane {i} \
+                                 (need cranelift fallback)")))?;
                     }
                     Some(regs)
                 } else { None };

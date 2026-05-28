@@ -225,8 +225,18 @@ fn translate_one(
     let mut ssbo_bindings: HashMap<u32, (u32, u32)> = HashMap::new();
     let mut workgroup_var_offset: HashMap<ValueId, u32> = HashMap::new();
     for (spv_var_id, value) in &id_map {
-        if let Some(&(set, binding)) = iface.var_binding.get(spv_var_id) {
-            ssbo_bindings.insert(value.id.0, (set, binding));
+        // Only true SSBOs land in ssbo_bindings.  Storage
+        // images and samplers share the (set, binding) map
+        // (`iface.var_binding`) but are NOT descriptor-table
+        // slots from the cs_main ABI's point of view -- the
+        // image-table goes through X0 (uniforms), not X2
+        // (ssbo).  Filtering by `iface.storage_buffer_vars`
+        // avoids cranelift's "multi-binding prologue" mis-
+        // firing when a shader has 1 SSBO + 1 storage image.
+        if iface.storage_buffer_vars.contains(spv_var_id) {
+            if let Some(&(set, binding)) = iface.var_binding.get(spv_var_id) {
+                ssbo_bindings.insert(value.id.0, (set, binding));
+            }
         }
         if let Some(&off) = iface.workgroup_var_offset.get(spv_var_id) {
             workgroup_var_offset.insert(value.id, off);
