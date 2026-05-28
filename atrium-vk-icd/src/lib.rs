@@ -3166,6 +3166,7 @@ unsafe fn build_tier2_pipeline_blob(
             ash::vk::Format::R32G32_SFLOAT          => VertexFormat::R32g32Sfloat,
             ash::vk::Format::R32G32B32_SFLOAT       => VertexFormat::R32g32b32Sfloat,
             ash::vk::Format::R32G32B32A32_SFLOAT    => VertexFormat::R32g32b32a32Sfloat,
+            ash::vk::Format::R8G8B8A8_UNORM         => VertexFormat::R8g8b8a8Unorm,
             // Unsupported -- skip the whole pipeline rather than
             // misencode a format the host can't decode.
             _ => return None,

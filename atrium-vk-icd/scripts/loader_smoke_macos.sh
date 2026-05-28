@@ -170,6 +170,7 @@ GRAPHICS_RT="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_roun
 GRAPHICS_INTERP="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_interp"
 GRAPHICS_PUSHC="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_pushc"
 GRAPHICS_INDEXED="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_indexed"
+GRAPHICS_UNORM="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_unorm"
 DAEMON="$REPO_ROOT/aqueduct-gpu-host/target/debug/aqueduct-gpu-host"
 COMPILE="$REPO_ROOT/atrium-spv-compile/target/debug/atrium-spv-compile"
 SLANGC="$REPO_ROOT/external/slang-bin/bin/slangc"
@@ -720,6 +721,45 @@ if [ -x "$GRAPHICS_INDEXED" ]; then
 else
     echo
     echo "SKIP Rung J: need 'cargo build -p atrium-vk-icd --example loader_graphics_indexed'"
+fi
+
+# ── Rung K: VK_FORMAT_R8G8B8A8_UNORM vertex attribute ───
+# loader_graphics_unorm: same triangle as Rung H but the
+# per-vertex colour attribute is R8G8B8A8_UNORM (4 bytes
+# per vertex in the buffer) instead of R32G32B32_SFLOAT
+# (12 bytes).  The daemon's assemble_vertices must expand
+# each u8 lane to f32 via `byte / 255.0` before handing
+# the stream to the VS.  Asserts pixel(4,4) has all RGB
+# channels non-zero -- same proof as Rung H, now through
+# the UNORM decode path.
+if [ -x "$GRAPHICS_UNORM" ]; then
+    rm -f "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+        echo "daemon failed to start (UNORM round-trip); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung K: R8G8B8A8_UNORM vertex colour attribute ==="
+    if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+        VK_DRIVER_FILES="$MANIFEST" \
+        ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+        "$GRAPHICS_UNORM" 2>&1 | tail -2; then
+        echo "FAIL: UNORM round-trip did not return 0" >&2
+        exit 1
+    fi
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
+else
+    echo
+    echo "SKIP Rung K: need 'cargo build -p atrium-vk-icd --example loader_graphics_unorm'"
 fi
 
 echo

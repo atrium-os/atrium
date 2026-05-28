@@ -1104,8 +1104,9 @@ impl Tier2Backend {
                 let src_off = (slot.offset as usize)
                     + (global_v as usize) * (bind.stride as usize)
                     + (a.offset as usize);
-                let size = a.format.byte_size();
-                let src_end = src_off + size;
+                let src_size = a.format.source_byte_size();
+                let packed_size = a.format.byte_size();
+                let src_end = src_off + src_size;
                 if src_end > src.bytes.len() {
                     return Err(format!(
                         "attribute @location {} (vertex {}) reads bytes \
@@ -1114,8 +1115,29 @@ impl Tier2Backend {
                         src.bytes.len()));
                 }
                 let out_off = out_base + (out_offsets[ai] as usize);
-                bytes[out_off..out_off + size]
-                    .copy_from_slice(&src.bytes[src_off..src_end]);
+                let src_bytes = &src.bytes[src_off..src_end];
+                let dst_bytes = &mut bytes[out_off..out_off + packed_size];
+                // Format-specific decode into the f32 packed
+                // stream the VS reads.  SFLOAT formats are
+                // already f32; just memcpy.  UNORM formats
+                // expand each lane to f32 via `byte / 255.0`.
+                match a.format {
+                    aqueduct_gpu::VertexFormat::R32Sfloat
+                    | aqueduct_gpu::VertexFormat::R32g32Sfloat
+                    | aqueduct_gpu::VertexFormat::R32g32b32Sfloat
+                    | aqueduct_gpu::VertexFormat::R32g32b32a32Sfloat => {
+                        dst_bytes.copy_from_slice(src_bytes);
+                    }
+                    aqueduct_gpu::VertexFormat::R8g8b8a8Unorm => {
+                        // 4 u8 -> 4 f32, each lane / 255.0.
+                        for lane in 0..4 {
+                            let v = src_bytes[lane] as f32 / 255.0;
+                            let b = v.to_le_bytes();
+                            dst_bytes[lane * 4..lane * 4 + 4]
+                                .copy_from_slice(&b);
+                        }
+                    }
+                }
             }
         }
 

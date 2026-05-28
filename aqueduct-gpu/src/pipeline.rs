@@ -25,26 +25,47 @@ pub enum VertexFormat {
     R32g32b32Sfloat = 3,
     /// `VK_FORMAT_R32G32B32A32_SFLOAT` — 4 × f32, 16 bytes.
     R32g32b32a32Sfloat = 4,
+    /// `VK_FORMAT_R8G8B8A8_UNORM` — 4 × u8 in the source vertex
+    /// buffer (4 bytes), expanded to 4 × f32 in the assembled
+    /// stream (16 bytes).  Per-channel conversion is
+    /// `u8 / 255.0`, the spec-defined UNORM decoding.  Lets
+    /// real apps feed packed vertex colours.
+    R8g8b8a8Unorm   = 5,
 }
 
 impl VertexFormat {
-    /// Size of one attribute in bytes.
-    pub fn byte_size(self) -> usize {
+    /// Number of bytes the attribute occupies in the source
+    /// vertex buffer.  For SFLOAT formats this equals
+    /// `f32_lanes() * 4`; for UNORM / SNORM formats it's
+    /// smaller (4 bytes for `R8g8b8a8Unorm`) because the
+    /// values are stored quantised.
+    pub fn source_byte_size(self) -> usize {
         match self {
             VertexFormat::R32Sfloat            => 4,
             VertexFormat::R32g32Sfloat         => 8,
             VertexFormat::R32g32b32Sfloat      => 12,
             VertexFormat::R32g32b32a32Sfloat   => 16,
+            VertexFormat::R8g8b8a8Unorm        => 4,
         }
     }
 
-    /// Number of f32 lanes in one attribute.
+    /// Number of bytes the attribute occupies in the
+    /// assembled vertex stream the VS reads.  Always
+    /// `f32_lanes() * 4` because the rasterizer feeds the VS
+    /// an f32 stream regardless of source quantisation.
+    pub fn byte_size(self) -> usize {
+        self.f32_lanes() * 4
+    }
+
+    /// Number of f32 lanes in one attribute (in the assembled
+    /// stream).
     pub fn f32_lanes(self) -> usize {
         match self {
             VertexFormat::R32Sfloat            => 1,
             VertexFormat::R32g32Sfloat         => 2,
             VertexFormat::R32g32b32Sfloat      => 3,
             VertexFormat::R32g32b32a32Sfloat   => 4,
+            VertexFormat::R8g8b8a8Unorm        => 4,
         }
     }
 }
@@ -97,7 +118,12 @@ impl VertexInputState {
                 .ok_or_else(|| format!(
                     "attribute @location {} references unknown binding {}",
                     attr.location, attr.binding))?;
-            let end = (attr.offset as usize) + attr.format.byte_size();
+            // Validate against the SOURCE byte size (bytes the
+            // attribute occupies in the buffer), not the packed
+            // stream size.  For UNORM formats source_byte_size
+            // < byte_size since values are quantised down from
+            // f32 to u8 in the vertex buffer.
+            let end = (attr.offset as usize) + attr.format.source_byte_size();
             if end > bind.stride as usize {
                 return Err(format!(
                     "attribute @location {} (binding {}, offset {}, size {}) \
