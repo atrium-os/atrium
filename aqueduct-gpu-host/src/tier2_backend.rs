@@ -27,7 +27,7 @@ use aqueduct_gpu::backends::{BackendId, GpuVendor};
 use crate::backend::Backend;
 use crate::tier2_registry::{
     BlendFactor, BlendFactorPair, BlendOp, BlendState, ColorWriteMask,
-    DrawTriangle, Tier2ExecError, Tier2Registry, Tier2ShaderId,
+    DrawTriangle, Tier2ExecError, Tier2Registry, Tier2ShaderId, Viewport,
 };
 
 use aqueduct_gpu::frame::{
@@ -1278,6 +1278,13 @@ impl Tier2Backend {
         // commit e0dce68 documented for image_descs).
         let _retain_tex_state = (&tex_descs, &sampler_descs);
 
+        // Convert the captured `SetViewportCmd` (if any) into
+        // the rasterizer's `Viewport` shape.  `None` falls
+        // back to a fullscreen viewport in `fill_image_triangle`.
+        let dt_viewport = state.viewport.map(|v| Viewport {
+            x: v.x, y: v.y, width: v.width, height: v.height,
+            min_depth: v.min_depth, max_depth: v.max_depth,
+        });
         for t in 0..tri_count {
             let v0 = &assembled.bytes[(3*t)*stride   .. (3*t+1)*stride];
             let v1 = &assembled.bytes[(3*t+1)*stride .. (3*t+2)*stride];
@@ -1288,6 +1295,7 @@ impl Tier2Backend {
                 blend_state: raster.blend,
                 varying_f32_count,
                 uniforms: &uniforms_buf,
+                viewport: dt_viewport,
                 ..Default::default()
             };
             let db_ref: Option<&mut [f32]> = if !depth_enabled {
@@ -2237,6 +2245,10 @@ impl Tier2Backend {
         let varying_f32_count = (self.pipeline_vs_varying_bytes.lock().unwrap()
             .get(&pipeline_raw).copied().unwrap_or(0) as usize) / 4;
 
+        let dt_viewport = state.viewport.map(|v| Viewport {
+            x: v.x, y: v.y, width: v.width, height: v.height,
+            min_depth: v.min_depth, max_depth: v.max_depth,
+        });
         for t in 0..tri_count {
             let v0 = &assembled.bytes[(3*t)*stride   .. (3*t+1)*stride];
             let v1 = &assembled.bytes[(3*t+1)*stride .. (3*t+2)*stride];
@@ -2246,6 +2258,7 @@ impl Tier2Backend {
                 push_constants: &state.push_constants,
                 blend_state: raster.blend,
                 varying_f32_count,
+                viewport: dt_viewport,
                 ..Default::default()
             };
             let db_ref = if depth_enabled {

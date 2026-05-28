@@ -491,11 +491,22 @@ impl Tier2Registry {
                 ndc[j][2] = tri_verts[j].pos[2] * iw;
             }
 
-            // Step 3: viewport mapping.
+            // Step 3: viewport mapping.  If the caller
+            // supplied a viewport (`vkCmdSetViewport`), NDC
+            // maps into the (vp.x, vp.y, vp.width, vp.height)
+            // sub-rect of the framebuffer; otherwise NDC maps
+            // to the full framebuffer (legacy behaviour).
+            let (vp_x, vp_y, vp_w, vp_h) = match draw.viewport {
+                Some(v) => (v.x, v.y, v.width, v.height),
+                None    => (0.0,  0.0,  fw,        fh),
+            };
             let screen: [(f32, f32); 3] = [
-                ((ndc[0][0] + 1.0) * 0.5 * fw, (ndc[0][1] + 1.0) * 0.5 * fh),
-                ((ndc[1][0] + 1.0) * 0.5 * fw, (ndc[1][1] + 1.0) * 0.5 * fh),
-                ((ndc[2][0] + 1.0) * 0.5 * fw, (ndc[2][1] + 1.0) * 0.5 * fh),
+                (vp_x + (ndc[0][0] + 1.0) * 0.5 * vp_w,
+                 vp_y + (ndc[0][1] + 1.0) * 0.5 * vp_h),
+                (vp_x + (ndc[1][0] + 1.0) * 0.5 * vp_w,
+                 vp_y + (ndc[1][1] + 1.0) * 0.5 * vp_h),
+                (vp_x + (ndc[2][0] + 1.0) * 0.5 * vp_w,
+                 vp_y + (ndc[2][1] + 1.0) * 0.5 * vp_h),
             ];
 
             // Step 4: attr/w per varying lane.
@@ -993,6 +1004,40 @@ pub struct DrawTriangle<'a> {
     /// all-channels write mask, which preserves the R.1-R.4
     /// behaviour for callers that don't care about blending.
     pub blend_state: BlendState,
+
+    /// Viewport (`vkCmdSetViewport`) to apply during the
+    /// NDC -> framebuffer-pixel mapping.  `None` falls back
+    /// to a fullscreen viewport spanning the framebuffer
+    /// (legacy R.1-R.7 behaviour).  When set, NDC.x in
+    /// [-1, 1] maps to pixel range [vp.x, vp.x + vp.width)
+    /// and NDC.y similarly to [vp.y, vp.y + vp.height).
+    /// `min_depth` / `max_depth` are accepted for wire
+    /// completeness but the depth-range remap is deferred
+    /// (rasterizer writes raw NDC.z to the depth buffer for
+    /// now).
+    pub viewport: Option<Viewport>,
+}
+
+/// Vulkan-shaped viewport, mirrored from the
+/// `SetViewportCmd` wire body.  Held in `DrawTriangle` so the
+/// rasterizer can produce framebuffer-pixel coordinates
+/// without re-deriving them from frame state.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Viewport {
+    /// Upper-left x in framebuffer pixels.
+    pub x: f32,
+    /// Upper-left y in framebuffer pixels.
+    pub y: f32,
+    /// Viewport width in pixels.
+    pub width: f32,
+    /// Viewport height in pixels.
+    pub height: f32,
+    /// Minimum depth in the post-NDC depth range
+    /// (accepted but not yet honoured by the rasterizer).
+    pub min_depth: f32,
+    /// Maximum depth in the post-NDC depth range
+    /// (accepted but not yet honoured by the rasterizer).
+    pub max_depth: f32,
 }
 
 /// Vulkan-shaped per-attachment colour-blend + write-mask
