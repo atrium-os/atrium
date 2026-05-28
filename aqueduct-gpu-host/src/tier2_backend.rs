@@ -271,6 +271,19 @@ struct PassState {
     /// to build the uniforms-buffer descriptor table the
     /// runtime's `atrium_tex_sample_*` helpers read.
     bound_textures: HashMap<u32, (u32, u32)>,
+    /// UNIFORM_BUFFER descriptor bindings recorded by
+    /// `FrameOp::BindDescriptors` for the current pass.
+    /// Keyed by descriptor binding slot.  Value is the
+    /// buffer's daemon-side ResourceId raw.  At dispatch_draw
+    /// time the buffer's bytes are copied into the uniforms
+    /// scratch buffer; the backend resolves
+    /// `StorageClass::Uniform` to `params[1]` (= scratch ptr)
+    /// and OpAccessChain through the Block adds member
+    /// offsets.  v1 only honours one UBO binding (the lowest
+    /// numbered one) and is mutually exclusive with
+    /// combined-image-sampler descriptors (both stake out
+    /// the prefix of the same uniforms buffer).
+    bound_uniforms: HashMap<u32, u32>,
     /// Number of Draw / DrawIndexed records issued in this pass.
     /// Used to gate the legacy "BindPipeline alone implies a
     /// fullscreen FS fill" fallback at EndRenderPass.
@@ -340,6 +353,17 @@ struct BufferStorage {
 const DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: u32 = 1;
 /// `VK_DESCRIPTOR_TYPE_STORAGE_IMAGE`.
 const DESCRIPTOR_TYPE_STORAGE_IMAGE: u32 = 3;
+/// `VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER`.  Bound by
+/// `vkCmdBindDescriptorSets` when a shader declares a
+/// `layout(set=N, binding=M) uniform Block { ... }`.  At
+/// dispatch time the daemon copies the buffer's bytes into
+/// the uniforms scratch at offset 0; the backend resolves
+/// `StorageClass::Uniform` to `params[1]` and OpAccessChain
+/// adds member offsets within the Block.  v1 only honours
+/// the first UBO binding (no co-existence with texture
+/// descriptors yet -- both want the prefix of the same
+/// uniforms buffer).
+const DESCRIPTOR_TYPE_UNIFORM_BUFFER: u32 = 6;
 /// `VK_DESCRIPTOR_TYPE_STORAGE_BUFFER`.  The SSBO descriptor
 /// type a compute shader's `layout(binding=N) buffer { ... }`
 /// resolves to.
@@ -409,6 +433,31 @@ fn parse_bind_descriptors_combined_image_samplers(
             && image_id != 0 && sampler_id != 0
         {
             out.push((binding, image_id, sampler_id));
+        }
+    }
+    out
+}
+
+/// Parse a `FrameOp::BindDescriptors` body and return the
+/// `(binding, buffer_id)` pairs whose descriptor type is
+/// `UNIFORM_BUFFER`.  Same body layout as the other
+/// `parse_bind_descriptors_*` helpers; we just filter on the
+/// UBO type code (6) instead.
+fn parse_bind_descriptors_uniform_buffers(body: &[u8]) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    if body.len() < 8 { return out; }
+    let u32_at = |o: usize| -> u32 {
+        u32::from_le_bytes(body[o..o + 4].try_into().unwrap())
+    };
+    let write_count = u32_at(4) as usize;
+    for w in 0..write_count {
+        let off = 8 + w * BIND_DESCRIPTORS_WRITE_BYTES;
+        if off + BIND_DESCRIPTORS_WRITE_BYTES > body.len() { break; }
+        let binding   = u32_at(off);
+        let dtype     = u32_at(off + 4);
+        let buffer_id = u32_at(off + 8);
+        if dtype == DESCRIPTOR_TYPE_UNIFORM_BUFFER && buffer_id != 0 {
+            out.push((binding, buffer_id));
         }
     }
     out
@@ -836,18 +885,22 @@ impl Tier2Backend {
                 },
                 FrameOp::BindDescriptors => {
                     // Graphics-side: stash COMBINED_IMAGE_SAMPLER
-                    // bindings.  dispatch_draw consults them to
-                    // build the uniforms-buffer descriptor table
-                    // the runtime's `atrium_tex_sample_*` helpers
-                    // read.  STORAGE_BUFFER descriptors aren't yet
-                    // wired into the graphics path (deferred to
-                    // when a shader actually needs them); SSBO
+                    // and UNIFORM_BUFFER bindings.  dispatch_draw
+                    // consults each to build the uniforms-buffer
+                    // contents.  STORAGE_BUFFER descriptors aren't
+                    // yet wired into the graphics path (deferred
+                    // to when a shader actually needs them); SSBO
                     // entries arriving here are silently dropped.
                     for (binding, image_id, sampler_id)
                         in parse_bind_descriptors_combined_image_samplers(body)
                     {
                         state.bound_textures
                             .insert(binding, (image_id, sampler_id));
+                    }
+                    for (binding, buffer_id)
+                        in parse_bind_descriptors_uniform_buffers(body)
+                    {
+                        state.bound_uniforms.insert(binding, buffer_id);
                     }
                 }
                 FrameOp::SetViewport => match SetViewportCmd::from_bytes(body) {
@@ -1191,6 +1244,28 @@ impl Tier2Backend {
                 }
             }
             uniforms_buf = buf;
+        } else if !state.bound_uniforms.is_empty() {
+            // UBO-only path: copy the lowest-numbered binding's
+            // buffer bytes into the uniforms scratch.  The
+            // backend resolves StorageClass::Uniform to
+            // params[1] (= scratch ptr); OpAccessChain through
+            // the Block adds member offsets within the data.
+            // Restricted to one UBO + no textures in v1 -- the
+            // two share the prefix of the same scratch and a
+            // proper layout discipline (UBO data lives after
+            // the per-binding descriptor table) is its own arc.
+            tex_descs = Vec::new();
+            sampler_descs = Vec::new();
+            let lowest_binding = state.bound_uniforms.keys().min().copied().unwrap_or(0);
+            let buffer_id = state.bound_uniforms[&lowest_binding];
+            let ubo_bytes = self.buffers.lock().unwrap()
+                .get(&buffer_id).map(|b| b.bytes.clone())
+                .unwrap_or_default();
+            if ubo_bytes.is_empty() {
+                log::warn!("Draw target={target_id}: UBO buffer {buffer_id} \
+                            not registered or empty; binding {lowest_binding}");
+            }
+            uniforms_buf = ubo_bytes;
         } else {
             tex_descs = Vec::new();
             sampler_descs = Vec::new();
