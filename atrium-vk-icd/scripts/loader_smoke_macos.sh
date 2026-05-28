@@ -171,6 +171,7 @@ GRAPHICS_INTERP="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_
 GRAPHICS_PUSHC="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_pushc"
 GRAPHICS_INDEXED="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_indexed"
 GRAPHICS_UNORM="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_unorm"
+GRAPHICS_DEPTH="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_depth"
 DAEMON="$REPO_ROOT/aqueduct-gpu-host/target/debug/aqueduct-gpu-host"
 COMPILE="$REPO_ROOT/atrium-spv-compile/target/debug/atrium-spv-compile"
 SLANGC="$REPO_ROOT/external/slang-bin/bin/slangc"
@@ -760,6 +761,47 @@ if [ -x "$GRAPHICS_UNORM" ]; then
 else
     echo
     echo "SKIP Rung K: need 'cargo build -p atrium-vk-icd --example loader_graphics_unorm'"
+fi
+
+# ── Rung L: depth test through the loader ────────────────
+# loader_graphics_depth: two triangles at z=0.1 (green) and
+# z=0.5 (red) over the same screen-space area, with the
+# pipeline's depth-stencil state enabled (test + write,
+# compare op = LESS).  Front triangle drawn first; back
+# triangle drawn second.  With depth test working the back
+# triangle's fragments are rejected at overlapping pixels
+# -- pixel(3,3) ends up green, not red.  Drawing order is
+# deliberate: front-first proves the depth test is actually
+# rejecting fragments (not just happening to draw the right
+# colour last).
+if [ -x "$GRAPHICS_DEPTH" ]; then
+    rm -f "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+        echo "daemon failed to start (depth round-trip); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung L: depth-test rejects the back triangle ==="
+    if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+        VK_DRIVER_FILES="$MANIFEST" \
+        ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+        "$GRAPHICS_DEPTH" 2>&1 | tail -2; then
+        echo "FAIL: depth round-trip did not return 0" >&2
+        exit 1
+    fi
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
+else
+    echo
+    echo "SKIP Rung L: need 'cargo build -p atrium-vk-icd --example loader_graphics_depth'"
 fi
 
 echo
