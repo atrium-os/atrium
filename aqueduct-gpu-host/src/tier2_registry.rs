@@ -298,13 +298,38 @@ impl Tier2Registry {
             }
         }
         let varying_bytes = draw.varying_f32_count * 4;
-        for i in 0..3 {
-            if draw.varyings_per_vertex[i].len() != varying_bytes {
-                return Err(Tier2ExecError::BadVaryingBufferLen {
-                    vertex: i,
-                    expected: varying_bytes,
-                    got: draw.varyings_per_vertex[i].len(),
-                });
+        // Two modes for per-vertex varyings:
+        //
+        //   (a) Caller supplied non-empty buffers --
+        //       varyings_per_vertex[i].len() must match the
+        //       declared varying_bytes.  Polygon reads
+        //       directly from these.
+        //
+        //   (b) Caller supplied empty buffers but
+        //       varying_f32_count > 0 -- capture VS-write-
+        //       through-vary_scratch mode.  fill_image_
+        //       triangle below allocates per-vertex scratch
+        //       buffers, hands them to vs_main, and uses the
+        //       written bytes as the polygon's varyings.
+        //       This is the loader-mediated graphics path
+        //       since `dispatch_draw` can't allocate &mut
+        //       buffers from inside DrawTriangle (no API to
+        //       round-trip mut slices through &DrawTriangle).
+        //
+        // Mode (b) is the common case for real Vulkan apps;
+        // mode (a) survives for the original direct callers
+        // that pre-baked their varyings.
+        let capture_from_vs = varying_bytes > 0
+            && draw.varyings_per_vertex.iter().all(|v| v.is_empty());
+        if !capture_from_vs {
+            for i in 0..3 {
+                if draw.varyings_per_vertex[i].len() != varying_bytes {
+                    return Err(Tier2ExecError::BadVaryingBufferLen {
+                        vertex: i,
+                        expected: varying_bytes,
+                        got: draw.varyings_per_vertex[i].len(),
+                    });
+                }
             }
         }
         let vs_loaded = self.get(vs_shader_id)
@@ -324,8 +349,13 @@ impl Tier2Registry {
         } else { draw.push_constants.as_ptr() };
 
         // ── Step 1: vertex shading.  3 invocations.
+        //
+        // Per-vertex `vary_scratch` so each VS invocation
+        // writes its own varyings.  When `capture_from_vs`
+        // is true we read the polygon's varyings from these
+        // scratch slots instead of `draw.varyings_per_vertex`.
         let mut clip_positions: [[f32; 4]; 3] = [[0.0; 4]; 3];
-        let mut vary_scratch = [0u8; 256];
+        let mut vary_scratch: [[u8; 256]; 3] = [[0u8; 256]; 3];
         let mut clip_dist = [0.0f32; 8];
         for i in 0..3 {
             let attr_ptr = if draw.vertex_attrs[i].is_empty() {
@@ -344,7 +374,7 @@ impl Tier2Registry {
                     pc_ptr,
                     i as u32, 0,
                     &mut clip_positions[i] as *mut [f32; 4],
-                    vary_scratch.as_mut_ptr(),
+                    vary_scratch[i].as_mut_ptr(),
                     clip_dist.as_mut_ptr(),
                 );
             }
@@ -369,17 +399,21 @@ impl Tier2Registry {
         // from vertex 0 (works for convex polygons, which
         // these always are).
         let n = draw.varying_f32_count;
-        // Build initial 3-vertex polygon from the VS output +
-        // caller-supplied varyings.
+        // Build initial 3-vertex polygon.  Varyings come from
+        // either the per-vertex VS scratch (loader-mediated
+        // `dispatch_draw` path) or the caller's pre-supplied
+        // `varyings_per_vertex` (older direct callers).
         let mut polygon: Vec<ClipVertex> = (0..3).map(|i| {
             let mut varyings = vec![0.0f32; n];
+            let src: &[u8] = if capture_from_vs {
+                &vary_scratch[i][..varying_bytes]
+            } else {
+                draw.varyings_per_vertex[i]
+            };
             for k in 0..n {
                 let off = k * 4;
                 let bytes = [
-                    draw.varyings_per_vertex[i][off],
-                    draw.varyings_per_vertex[i][off + 1],
-                    draw.varyings_per_vertex[i][off + 2],
-                    draw.varyings_per_vertex[i][off + 3],
+                    src[off], src[off + 1], src[off + 2], src[off + 3],
                 ];
                 varyings[k] = f32::from_le_bytes(bytes);
             }

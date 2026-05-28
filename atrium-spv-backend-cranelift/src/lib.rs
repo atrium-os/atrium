@@ -421,6 +421,23 @@ fn emit_function(
             }
         }
 
+        // Vertex Location-decorated Output variables: route to
+        // params[7] (out_varyings) + per-variable byte offset
+        // assigned by the frontend in Location order.  Without
+        // this, the generic `(Vertex, Output) -> params[6]`
+        // rule sends varying writes into out_position --
+        // clobbering gl_Position and dropping the varying on
+        // the floor, which is exactly the "interp triangle
+        // came out black" symptom that bring-up sees.
+        if func.stage == ShaderStage::Vertex
+            && !func.output_varying_byte_offset.is_empty()
+        {
+            let out_varyings = translator.params[7];
+            for (&vid, &off) in &func.output_varying_byte_offset {
+                translator.pointers.insert(vid, (out_varyings, off as i32));
+            }
+        }
+
         // Walk every IR block in id order, switching the
         // builder to the Cranelift block for each. The
         // terminator (Branch / BranchCond / Return) is

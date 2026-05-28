@@ -1045,6 +1045,15 @@ pub struct Function {
     /// ValueId; codegen resolves Workgroup-storage OpVariable
     /// to `(workgroup_buf_ptr, offset)`.
     pub workgroup_var_offset: HashMap<ValueId, u32>,
+    /// Per-variable byte offsets inside the VS `out_varyings`
+    /// buffer.  Indexed by the variable's IR ValueId; codegen
+    /// resolves Location-decorated `Output`-storage
+    /// OpVariable to `(out_varyings_ptr, offset)`.  BuiltIn
+    /// outputs (e.g. `gl_Position`) are NOT in this map --
+    /// they stay on the legacy `out_position` (params[6])
+    /// path through the BuiltIn translation.  Empty for FS
+    /// / CS shaders.
+    pub output_varying_byte_offset: HashMap<ValueId, u32>,
 }
 
 /// Shader stage.

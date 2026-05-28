@@ -286,6 +286,17 @@ pub struct Tier2PipelineStateBlob {
     /// (source replace + all-channel write mask).
     #[serde(default)]
     pub blend: Option<Tier2BlendState>,
+    /// Total bytes the VS writes through Location-decorated
+    /// `Output`-storage variables.  Lets the dispatcher size
+    /// the per-vertex varying capture buffer fed to
+    /// `fill_image_triangle::DrawTriangle::varyings_per_vertex`.
+    /// 0 = no varyings (the VS only emits `BuiltIn` outputs);
+    /// dispatcher skips capture + passes `null` for
+    /// `in_varyings_ptr` to the FS.  Populated by the ICD at
+    /// vkCreateGraphicsPipelines via a SPIR-V scan of the VS
+    /// module.
+    #[serde(default)]
+    pub vs_varying_bytes: u32,
 }
 
 #[cfg(test)]

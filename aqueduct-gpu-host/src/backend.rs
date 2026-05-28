@@ -218,6 +218,20 @@ pub trait Backend: Send + Sync {
         _blend: Option<aqueduct_gpu::Tier2BlendState>,
     ) {}
 
+    /// Record how many bytes the VS writes through
+    /// Location-decorated `Output`-storage variables.  Tier-2
+    /// uses this at Draw time to allocate per-vertex
+    /// `vary_scratch` capture buffers + tell
+    /// `fill_image_triangle` how many varyings to interpolate.
+    /// 0 = the VS only emits `BuiltIn` outputs (e.g.
+    /// `gl_Position`-only); rasterizer takes the
+    /// null-varying path.  Default no-op.
+    fn bind_pipeline_vs_varying_bytes(
+        &self,
+        _pipeline_id: ResourceId,
+        _bytes: u32,
+    ) {}
+
     /// Associate a compute pipeline with its Tier-2 shader +
     /// workgroup-size state. Mirror of
     /// [`Backend::bind_pipeline_tier2_vs`] /

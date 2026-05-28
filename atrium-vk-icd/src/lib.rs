@@ -461,6 +461,147 @@ struct AtriumShaderModule {
     /// (Arc 150) or stay serial (cheaper + deterministic
     /// last-writer ordering).
     uses_barrier: bool,
+    /// Total bytes the VS writes through Location-decorated
+    /// `Output`-storage variables (e.g. a single `vec3`
+    /// varying contributes 12).  Graphics pipelines
+    /// propagate this onto `Tier2PipelineStateBlob` so the
+    /// dispatcher knows how many bytes to capture from
+    /// `vary_scratch` and hand to the rasterizer's
+    /// interpolator.  0 for FS / CS modules and for VS
+    /// shaders that only emit `BuiltIn` outputs
+    /// (`gl_Position` etc.).
+    vs_varying_bytes: u32,
+}
+
+/// Sum the byte sizes of every Location-decorated
+/// `Output`-storage variable in `spirv`.  Used by the
+/// graphics pipeline-create path to size the per-vertex
+/// varying buffer the rasterizer captures from `vs_main`.
+///
+/// Only the float-vector / scalar formats SPIR-V's
+/// graphics shaders actually emit at Location-decorated
+/// outputs are recognised: `OpTypeFloat`,
+/// `OpTypeVector(Float, n)`, `OpTypeInt(32, _)`,
+/// `OpTypeVector(Int 32, n)`.  Anything else (matrices,
+/// nested structs, arrays) returns 0 -- the dispatcher
+/// then falls back to the legacy "no varyings, null
+/// in_varyings_ptr" path.
+fn scan_spirv_vs_varying_bytes(spirv: &[u8]) -> u32 {
+    if spirv.len() < 20 || spirv.len() % 4 != 0 { return 0; }
+    let magic = u32::from_le_bytes(spirv[0..4].try_into().unwrap());
+    if magic != 0x07230203 { return 0; }
+    let word_at = |off: usize| -> u32 {
+        u32::from_le_bytes(spirv[off..off + 4].try_into().unwrap())
+    };
+    // Pass 1: scalar/vector type sizes by id.
+    //   OpTypeFloat  = 22  <result_id, width>
+    //   OpTypeInt    = 21  <result_id, width, sign>
+    //   OpTypeVector = 23  <result_id, component_id, count>
+    let mut type_size: std::collections::HashMap<u32, u32>
+        = std::collections::HashMap::new();
+    let mut cursor = 20;
+    while cursor + 4 <= spirv.len() {
+        let head = word_at(cursor);
+        let word_count = (head >> 16) as usize;
+        let opcode = (head & 0xFFFF) as u16;
+        if word_count == 0 { return 0; }
+        let next = cursor + word_count * 4;
+        if next > spirv.len() { return 0; }
+        match opcode {
+            21 if word_count >= 4 => { // OpTypeInt
+                let id = word_at(cursor + 4);
+                let width = word_at(cursor + 8);
+                type_size.insert(id, width / 8);
+            }
+            22 if word_count >= 3 => { // OpTypeFloat
+                let id = word_at(cursor + 4);
+                let width = word_at(cursor + 8);
+                type_size.insert(id, width / 8);
+            }
+            23 if word_count >= 4 => { // OpTypeVector
+                let id = word_at(cursor + 4);
+                let comp_id = word_at(cursor + 8);
+                let count = word_at(cursor + 12);
+                if let Some(&comp_size) = type_size.get(&comp_id) {
+                    type_size.insert(id, comp_size * count);
+                }
+            }
+            _ => {}
+        }
+        cursor = next;
+    }
+    // Pass 2: OpTypePointer with StorageClass Output (3).
+    //   OpTypePointer = 32 <result_id, storage_class, pointee_type>
+    let mut output_ptr_pointee: std::collections::HashMap<u32, u32>
+        = std::collections::HashMap::new();
+    let mut cursor = 20;
+    while cursor + 4 <= spirv.len() {
+        let head = word_at(cursor);
+        let word_count = (head >> 16) as usize;
+        let opcode = (head & 0xFFFF) as u16;
+        if word_count == 0 { break; }
+        let next = cursor + word_count * 4;
+        if next > spirv.len() { break; }
+        if opcode == 32 && word_count >= 4 {
+            let result_id = word_at(cursor + 4);
+            let storage = word_at(cursor + 8);
+            let pointee = word_at(cursor + 12);
+            if storage == 3 {
+                output_ptr_pointee.insert(result_id, pointee);
+            }
+        }
+        cursor = next;
+    }
+    // Pass 3: OpVariable result-ids whose pointer type is an
+    // Output pointer.  Record (var_id, pointee_type_id).
+    //   OpVariable = 59 <result_type, result_id, storage_class>
+    let mut output_var_pointee: std::collections::HashMap<u32, u32>
+        = std::collections::HashMap::new();
+    let mut cursor = 20;
+    while cursor + 4 <= spirv.len() {
+        let head = word_at(cursor);
+        let word_count = (head >> 16) as usize;
+        let opcode = (head & 0xFFFF) as u16;
+        if word_count == 0 { break; }
+        let next = cursor + word_count * 4;
+        if next > spirv.len() { break; }
+        if opcode == 59 && word_count >= 4 {
+            let result_type = word_at(cursor + 4);
+            let result_id   = word_at(cursor + 8);
+            if let Some(&pointee) = output_ptr_pointee.get(&result_type) {
+                output_var_pointee.insert(result_id, pointee);
+            }
+        }
+        cursor = next;
+    }
+    // Pass 4: walk OpDecorate Location on Output vars; sum
+    // the pointee's byte size for each one we find.
+    //   OpDecorate = 71 <target_id, decoration, operand>
+    //   Decoration Location = 30
+    let mut total: u32 = 0;
+    let mut counted: std::collections::HashSet<u32>
+        = std::collections::HashSet::new();
+    let mut cursor = 20;
+    while cursor + 4 <= spirv.len() {
+        let head = word_at(cursor);
+        let word_count = (head >> 16) as usize;
+        let opcode = (head & 0xFFFF) as u16;
+        if word_count == 0 { break; }
+        let next = cursor + word_count * 4;
+        if next > spirv.len() { break; }
+        if opcode == 71 && word_count >= 4 {
+            let target = word_at(cursor + 4);
+            let deco   = word_at(cursor + 8);
+            if deco == 30 && counted.insert(target) {
+                if let Some(&pointee) = output_var_pointee.get(&target) {
+                    total = total.saturating_add(
+                        *type_size.get(&pointee).unwrap_or(&0));
+                }
+            }
+        }
+        cursor = next;
+    }
+    total
 }
 
 /// Scan `spirv` for at least one `OpControlBarrier`
@@ -2984,13 +3125,18 @@ unsafe fn build_tier2_pipeline_blob(
     // record wants index 0 = VS, index 1 = FS by convention.
     let mut vs_id: Option<aqueduct_gpu::ids::ResourceId> = None;
     let mut fs_id: Option<aqueduct_gpu::ids::ResourceId> = None;
+    let mut vs_varying_bytes: u32 = 0;
     let shaders_map = dev.shaders.lock().ok()?;
     for s in 0..info.stage_count {
         let stage = &*info.p_stages.offset(s as isize);
         let mod_handle: u64 = std::mem::transmute(stage.module);
-        let rid = shaders_map.get(&mod_handle).and_then(|m| m.shader_id);
+        let m = shaders_map.get(&mod_handle);
+        let rid = m.and_then(|m| m.shader_id);
         match stage.stage {
-            ash::vk::ShaderStageFlags::VERTEX   => vs_id = rid,
+            ash::vk::ShaderStageFlags::VERTEX => {
+                vs_id = rid;
+                if let Some(am) = m { vs_varying_bytes = am.vs_varying_bytes; }
+            }
             ash::vk::ShaderStageFlags::FRAGMENT => fs_id = rid,
             _ => {} // tess/geom not in tier-2 yet
         }
@@ -3071,7 +3217,9 @@ unsafe fn build_tier2_pipeline_blob(
         }
     };
 
-    let blob = Tier2PipelineStateBlob { vertex_input, depth, blend };
+    let blob = Tier2PipelineStateBlob {
+        vertex_input, depth, blend, vs_varying_bytes,
+    };
     let bytes = postcard::to_allocvec(&blob).ok()?;
     Some((vec![vs_id, fs_id], bytes))
 }
@@ -4054,6 +4202,7 @@ pub unsafe extern "C" fn vkCreateShaderModule(
     let ssbo_binding_count = scan_spirv_ssbo_binding_count(&bytes);
     let workgroup_size = scan_spirv_workgroup_size(&bytes);
     let uses_barrier = scan_spirv_uses_barrier(&bytes);
+    let vs_varying_bytes = scan_spirv_vs_varying_bytes(&bytes);
 
     // Resolve-or-upload against the daemon. Failure (no live
     // client, validation rejection) leaves shader_id=None — the
@@ -4077,7 +4226,7 @@ pub unsafe extern "C" fn vkCreateShaderModule(
     if let Ok(mut s) = dev.shaders.lock() {
         s.insert(handle, AtriumShaderModule {
             shader_id, bytecode_hash, local_size, ssbo_binding_count,
-            workgroup_size, uses_barrier,
+            workgroup_size, uses_barrier, vs_varying_bytes,
         });
     } else {
         return VK_ERROR_INITIALIZATION_FAILED;

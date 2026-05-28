@@ -85,6 +85,17 @@ pub struct InterfaceContext {
     /// which then misreads the SSBO pointer-param as a
     /// descriptor-table base and dereferences garbage.
     pub storage_buffer_vars: std::collections::HashSet<Word>,
+    /// SPIR-V variable id → byte offset within the VS's
+    /// `out_varyings` buffer for Location-decorated
+    /// `Output`-storage variables.  Vars are sorted by
+    /// Location decoration; each gets `prefix_sum(byte_size)`
+    /// as its offset.  Consumed by the backend's VS function
+    /// translator to route `OpStore` through a `Variable` of
+    /// this kind into `params[7] + offset` rather than into
+    /// `params[6]` (out_position).  BuiltIn outputs
+    /// (`gl_Position`) are NOT in this map -- they stay on
+    /// the legacy out_position path through `builtin_vars`.
+    pub output_varying_byte_offset: HashMap<Word, u32>,
     /// SPIR-V variable id → recognised stage built-in.  Set
     /// from `OpDecorate <var> BuiltIn <kind>`; consumed by
     /// function translation to lower an `OpLoad` through one
@@ -137,6 +148,10 @@ impl InterfaceContext {
         constants: Option<&crate::constants::ConstantContext>,
     ) -> Result<Self, FrontendError> {
         let mut ctx = InterfaceContext::default();
+        // Local: (spv_var_id, location, byte_size) for Location-
+        // decorated Output vars.  Sorted + offset-assigned at
+        // end of the walk.
+        let mut output_var_loc_size: Vec<(Word, u32, u32)> = Vec::new();
 
         // OpExtInstImport: record result_ids whose set name
         // is "GLSL.std.450" so the function translator can
@@ -476,15 +491,41 @@ impl InterfaceContext {
                 }
                 SpvStorageClass::Output => {
                     if let Some(d) = deco {
-                        if let (Some(location), Some(ty)) = (d.location, pointee_ty) {
+                        if let (Some(location), Some(ty)) = (d.location, pointee_ty.clone()) {
                             ctx.varyings.push(Varying {
                                 location, offset: 0, ty,
                             });
+                            // Stash (var_id, location, byte_size)
+                            // so we can compute byte offsets in
+                            // Location order after the walk
+                            // completes.  pointee_ty is the
+                            // resolved IR Type for the
+                            // OpTypePointer's pointee -- use
+                            // it directly via the same
+                            // ir_type_size_bytes helper that
+                            // sizes uniforms / workgroups.
+                            let sz = ir_type_size_bytes_for(
+                                &types.types,
+                                *pointee_id,
+                            );
+                            output_var_loc_size.push((*var_id, location, sz));
                         }
                     }
                 }
                 _ => {}
             }
+        }
+
+        // Assign byte offsets to Location-decorated VS Output
+        // variables in Location order so the backend can
+        // route OpStore through them into `out_varyings +
+        // offset`.  Matches the FS-side packing the
+        // rasterizer's interpolator produces.
+        output_var_loc_size.sort_by_key(|(_, loc, _)| *loc);
+        let mut running: u32 = 0;
+        for (var_id, _loc, sz) in &output_var_loc_size {
+            ctx.output_varying_byte_offset.insert(*var_id, running);
+            running = running.saturating_add(*sz);
         }
 
         Ok(ctx)

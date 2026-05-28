@@ -1105,6 +1105,22 @@ fn emit_function(
         }
     }
 
+    // Vertex Location-decorated Output variables: route to
+    // X7 (out_varyings) + per-variable byte offset assigned
+    // by the frontend in Location order.  Same shape as the
+    // cranelift prologue's VS varying routing.  Without
+    // this, `resolve_pointer_param`'s generic
+    // (Vertex, Output) -> X6 fallback sends varying writes
+    // into out_position, clobbering gl_Position and
+    // dropping the varying.
+    if func.stage == ShaderStage::Vertex
+        && !func.output_varying_byte_offset.is_empty()
+    {
+        for (&vid, &voff) in &func.output_varying_byte_offset {
+            pointers.insert(vid, (asm::Xreg(7), voff as i32));
+        }
+    }
+
     // Storage-image prologue.  A compute shader that does
     // OpImageRead / OpImageWrite calls into the runtime
     // (atrium_img_read_2d / atrium_img_write_2d) via the v1

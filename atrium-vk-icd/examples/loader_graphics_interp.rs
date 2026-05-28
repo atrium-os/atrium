@@ -6,19 +6,27 @@
 //! client through the same loader → ICD → daemon →
 //! CopyImgToBuf → invalidate chain.
 //!
-//! # KNOWN BROKEN as of 2026-05-28
+//! # PARTIALLY WORKING as of 2026-05-28
 //!
-//! This example currently crashes the daemon during
-//! `submit_frame` -- read_buffer returns
-//! `Io(UnexpectedEof)` ~10ms after submit, meaning the
-//! daemon SIGSEGV'd inside the fill_image_triangle path
-//! when the VS has two input attributes + a
-//! Location-decorated varying output.  The simpler
-//! single-attribute graphics_roundtrip works fine, so the
-//! bug is specific to varyings flowing through fill_image_
-//! triangle's vary_scratch buffer.  Not wired into the
-//! smoke script; left in the tree as the next graphics
-//! arc's reproducer.
+//! The daemon crash (SIGSEGV from null `in_varyings_ptr`)
+//! and the missing varying-routing pipeline are both
+//! fixed; the rasterizer now interpolates the per-vertex
+//! varying and the FS reads it.  Diagnostic output shows
+//! pixel(4,4) = (32, 32, 0, 255):
+//!
+//!   * R and G channels DO show interpolated values
+//!     (V0=red and V1=green both contribute).
+//!   * B channel reads 0 everywhere -- V2's blue colour
+//!     is NOT reaching the FS, OR a `vec3 OpStore` only
+//!     emits 2 lanes, OR a `vec3 OpLoad` only reads 2.
+//!
+//! Bisecting that needs a vec3-OpStore / vec3-OpLoad unit
+//! test in atrium-spv-backend-bespoke's differential
+//! suite; doesn't fit this arc.  The rasterizer's
+//! barycentric math + varying-byte plumbing are proven by
+//! the R and G channels surviving end-to-end.  Not yet
+//! wired into loader_smoke; un-park when the third lane
+//! lands.
 //!
 //! Triangle vertices and colours:
 //!

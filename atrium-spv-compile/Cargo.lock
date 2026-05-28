@@ -33,6 +33,7 @@ dependencies = [
  "atrium-spv-blob",
  "atrium-spv-ir",
  "atrium-spv-pcmap",
+ "atrium-spv-runtime",
  "object 0.36.7",
  "pptk-codegen-arm64",
  "thiserror 1.0.69",
@@ -45,6 +46,7 @@ dependencies = [
  "atrium-spv-blob",
  "atrium-spv-ir",
  "atrium-spv-pcmap",
+ "atrium-spv-runtime",
  "cranelift-codegen",
  "cranelift-frontend",
  "cranelift-module",
@@ -84,6 +86,10 @@ version = "0.1.0"
 
 [[package]]
 name = "atrium-spv-pcmap"
+version = "0.1.0"
+
+[[package]]
+name = "atrium-spv-runtime"
 version = "0.1.0"
 
 [[package]]

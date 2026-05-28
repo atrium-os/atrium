@@ -91,6 +91,15 @@ pub struct Tier2Backend {
     /// [`Tier2Backend::bind_raster_state`] when the session
     /// decodes a `Tier2PipelineStateBlob`.
     pipeline_raster: Mutex<HashMap<u32, PipelineRasterState>>,
+    /// Per-graphics-pipeline: bytes the VS writes through
+    /// Location-decorated Output variables.  Populated when
+    /// the session decodes a `Tier2PipelineStateBlob`.  Used
+    /// at Draw time to allocate per-vertex varying capture
+    /// buffers + tell `fill_image_triangle` how many varyings
+    /// to interpolate.  Missing or 0 means "no varyings; FS
+    /// gets null in_varyings_ptr" (the legacy single-attribute
+    /// graphics_roundtrip path).
+    pipeline_vs_varying_bytes: Mutex<HashMap<u32, u32>>,
     /// Per-pipeline compute-shader binding: Tier-2 shader id
     /// + workgroup local-size. Populated when the session
     /// processes a Compute-kind pipeline create.
@@ -390,6 +399,7 @@ impl Tier2Backend {
             pipeline_vs_shaders: Mutex::new(HashMap::new()),
             pipeline_layouts: Mutex::new(HashMap::new()),
             pipeline_raster: Mutex::new(HashMap::new()),
+            pipeline_vs_varying_bytes: Mutex::new(HashMap::new()),
             pipeline_compute: Mutex::new(HashMap::new()),
             cs_invocations: AtomicU64::new(0),
             last_compute_output: Mutex::new(None),
@@ -996,6 +1006,16 @@ impl Tier2Backend {
             ]);
         }
 
+        // Per-pipeline VS varying-byte count (sum of byte
+        // sizes of Location-decorated VS outputs).  Tells
+        // fill_image_triangle how many bytes to capture from
+        // its vary_scratch + how many f32 lanes to
+        // interpolate.  0 = the VS only emits BuiltIn outputs
+        // (gl_Position-only); rasterizer takes the null-
+        // varyings fast path.
+        let varying_f32_count = (self.pipeline_vs_varying_bytes.lock().unwrap()
+            .get(&pipeline_raw).copied().unwrap_or(0) as usize) / 4;
+
         for t in 0..tri_count {
             let v0 = &assembled.bytes[(3*t)*stride   .. (3*t+1)*stride];
             let v1 = &assembled.bytes[(3*t+1)*stride .. (3*t+2)*stride];
@@ -1004,6 +1024,7 @@ impl Tier2Backend {
                 vertex_attrs: [v0, v1, v2],
                 push_constants: &state.push_constants,
                 blend_state: raster.blend,
+                varying_f32_count,
                 ..Default::default()
             };
             let db_ref: Option<&mut [f32]> = if !depth_enabled {
@@ -2045,6 +2066,15 @@ impl Backend for Tier2Backend {
         blend: Option<WireBlendState>,
     ) {
         self.bind_raster_state(pipeline_id, depth, blend);
+    }
+
+    fn bind_pipeline_vs_varying_bytes(
+        &self,
+        pipeline_id: ResourceId,
+        bytes: u32,
+    ) {
+        self.pipeline_vs_varying_bytes.lock().unwrap()
+            .insert(pipeline_id.raw(), bytes);
     }
 
     fn bind_pipeline_tier2_compute(
