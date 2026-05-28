@@ -174,6 +174,7 @@ GRAPHICS_UNORM="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_u
 GRAPHICS_DEPTH="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_depth"
 GRAPHICS_VS_PUSHC="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_vs_pushc"
 GRAPHICS_MULTI_VBUF="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_multi_vbuf"
+GRAPHICS_TEXTURE="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_texture"
 DAEMON="$REPO_ROOT/aqueduct-gpu-host/target/debug/aqueduct-gpu-host"
 COMPILE="$REPO_ROOT/atrium-spv-compile/target/debug/atrium-spv-compile"
 SLANGC="$REPO_ROOT/external/slang-bin/bin/slangc"
@@ -886,6 +887,53 @@ if [ -x "$GRAPHICS_MULTI_VBUF" ]; then
 else
     echo
     echo "SKIP Rung N: need 'cargo build -p atrium-vk-icd --example loader_graphics_multi_vbuf'"
+fi
+
+# ── Rung O: texture sampling through the Khronos loader ──
+# loader_graphics_texture: 2x2 RGBA8 texture (red/green/blue/
+# white corners) uploaded via vkCmdCopyBufferToImage, sampled
+# in the FS at per-vertex UVs interpolated across the
+# triangle.  Asserts pixel(4,4) has all RGB channels non-zero
+# AND alpha=255 -- proves the full chain works:
+#   * vkCreateSampler -> SamplerDesc on daemon
+#   * vkCmdCopyBufferToImage -> daemon CopyBufToImg handler
+#     (runs pre-pass so texture is populated before draw)
+#   * vkCmdBindDescriptorSets COMBINED_IMAGE_SAMPLER ->
+#     PassState::bound_textures
+#   * dispatch_draw builds uniforms-table with helper fn ptrs
+#     + per-binding (TexDesc*, SamplerDesc*)
+#   * FS's OpImageSampleImplicitLod loads through the table
+#     and calls atrium_tex_sample_2d
+#   * Rasterizer's barycentric UV interp + LINEAR sampler
+#     filter blend reaches all four texels.
+if [ -x "$GRAPHICS_TEXTURE" ]; then
+    rm -f "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+        echo "daemon failed to start (texture round-trip); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung O: texture sampling (2x2 RGBA8 + sampler2D FS) ==="
+    if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+        VK_DRIVER_FILES="$MANIFEST" \
+        ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+        "$GRAPHICS_TEXTURE" 2>&1 | tail -2; then
+        echo "FAIL: texture round-trip did not return 0" >&2
+        exit 1
+    fi
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
+else
+    echo
+    echo "SKIP Rung O: need 'cargo build -p atrium-vk-icd --example loader_graphics_texture'"
 fi
 
 echo

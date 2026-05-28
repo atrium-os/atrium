@@ -1,25 +1,11 @@
 //! `examples/loader_graphics_texture` — texture sampling
-//! through the Khronos loader.  PARTIALLY WORKING as of
-//! 2026-05-28: the wire path landed (sampler state flows
-//! through `Backend::sampler_created`; the daemon-side
-//! `dispatch_draw` builds the uniforms-table with helper
-//! fn ptrs + TexDesc/SamplerDesc per binding; staging-
-//! buffer → image upload via `vkCmdCopyBufferToImage`'s
-//! `FrameOp::CopyBufToImg` daemon handler now exists),
-//! but the daemon hangs inside `fill_image_triangle`
-//! during the textured draw.  Likely the
-//! `OpLoad %sampled_image` -> Op::ImageHandle frontend
-//! lowering doesn't register the variable in the backend's
-//! `image_handles` map, so the subsequent
-//! `OpImageSampleImplicitLod`'s lookup fails (or worse,
-//! gets an uninitialised handle).  Reproducer kept in tree
-//! for the next texture-sampling arc.
+//! end-to-end through the Khronos loader.
 //!
 //! Uploads a 2×2 RGBA8 texture with four distinct corner
 //! colours, samples it in the fragment shader at per-vertex
 //! UVs interpolated across the triangle.  Asserts pixel(4,4)
 //! has all four texture colours contributing (RGB all
-//! non-zero), would prove:
+//! non-zero), proving:
 //!
 //!   * vkCreateSampler reaches the daemon and lands as a
 //!     `SamplerDesc`.

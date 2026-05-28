@@ -1038,6 +1038,27 @@ impl Tier2Backend {
         let stride = assembled.stride as usize;
         let tri_count = (assembled.vertex_count / 3) as usize;
 
+        // Pre-snapshot bound-texture image data BEFORE the
+        // images-lock acquisition below.  We just need stable
+        // raw pointers (TexDesc.data) for the sampled textures
+        // -- Vec<u8> heap addresses survive HashMap reshapes,
+        // so the raw pointers remain valid for the duration
+        // of fill_image_triangle even after we release this
+        // read lock.  Keeping this OUTSIDE the mut-lock below
+        // avoids reacquiring `self.images` recursively (a
+        // deadlock on the same thread).
+        let texture_snapshots: Vec<(u32, *const u8, u32, u32)> = {
+            let images = self.images.lock().unwrap();
+            state.bound_textures.iter()
+                .map(|(b, (iid, _))| {
+                    let (data, w, h) = images.get(&(*iid as u64))
+                        .map(|img| (img.pixels.as_ptr(), img.width, img.height))
+                        .unwrap_or((std::ptr::null(), 1, 1));
+                    (*b, data, w, h)
+                })
+                .collect()
+        };
+
         // Lock the image storage for the duration of all
         // triangles in this Draw. Each fill_image_triangle
         // call mutates the target's pixel buffer; we hold the
@@ -1107,69 +1128,43 @@ impl Tier2Backend {
         // pointers.  Same shape as the storage-image
         // dispatcher's image-table lifetime fix (commit
         // e0dce68).
-        let images_guard;
         let tex_descs: Vec<atrium_spv_runtime::TexDesc>;
         let sampler_descs: Vec<atrium_spv_runtime::SamplerDesc>;
         let uniforms_buf: Vec<u8>;
         if !state.bound_textures.is_empty() {
-            // Sort by binding so the per-binding slot index
-            // matches the descriptor's `Binding` decoration.
-            let mut bindings_sorted: Vec<(u32, u32, u32)>
-                = state.bound_textures.iter()
-                    .map(|(b, (img, samp))| (*b, *img, *samp))
-                    .collect();
-            bindings_sorted.sort_by_key(|(b, _, _)| *b);
-            let max_binding = bindings_sorted.iter()
-                .map(|(b, _, _)| *b as usize).max().unwrap_or(0);
+            // Sort the snapshot by binding so per-binding
+            // slot indices line up with the FS's `Binding`
+            // decorations.
+            let mut snaps = texture_snapshots.clone();
+            snaps.sort_by_key(|(b, _, _, _)| *b);
+            let max_binding = snaps.iter()
+                .map(|(b, _, _, _)| *b as usize).max().unwrap_or(0);
             let slot_count = max_binding + 1;
-            images_guard = Some(self.images.lock().unwrap());
             let samplers_guard = self.samplers.lock().unwrap();
             let mut td: Vec<atrium_spv_runtime::TexDesc> =
-                Vec::with_capacity(bindings_sorted.len());
+                Vec::with_capacity(snaps.len());
             let mut sd: Vec<atrium_spv_runtime::SamplerDesc> =
-                Vec::with_capacity(bindings_sorted.len());
-            // Pre-fill so per-binding indices are stable;
-            // missing image / sampler entries land as
-            // zero-sized / default and the helper will
-            // return all zeros (rather than crash) -- the
-            // runtime's bounds-clamp keeps things safe.
-            let placeholder_tex = atrium_spv_runtime::TexDesc {
-                data: std::ptr::null(), width: 1, height: 1,
-                stride_bytes: 4,
-                format: atrium_spv_runtime::TexFormat::Rgba8Unorm as u32,
-                mip_count: 0, mip_descs: std::ptr::null(),
-                depth: 1, slice_bytes: 0,
-            };
+                Vec::with_capacity(snaps.len());
             let placeholder_samp = atrium_spv_runtime::SamplerDesc {
                 mag_filter: 0, min_filter: 0, wrap_s: 0, wrap_t: 0,
             };
-            for &(_b, image_id, sampler_id) in &bindings_sorted {
-                let tex = match images_guard.as_ref().unwrap()
-                    .get(&(image_id as u64))
-                {
-                    Some(img) => atrium_spv_runtime::TexDesc {
-                        data: img.pixels.as_ptr(),
-                        width: img.width,
-                        height: img.height,
-                        stride_bytes: img.width * 4,
-                        format: atrium_spv_runtime::TexFormat::Rgba8Unorm as u32,
-                        mip_count: 0, mip_descs: std::ptr::null(),
-                        depth: 1, slice_bytes: 0,
-                    },
-                    None => {
-                        log::warn!("Draw target={target_id}: \
-                                    image {image_id} not registered");
-                        placeholder_tex
-                    }
-                };
-                let samp = samplers_guard.get(&sampler_id).copied()
-                    .unwrap_or_else(|| {
-                        log::warn!("Draw target={target_id}: \
-                                    sampler {sampler_id} not registered");
-                        placeholder_samp
-                    });
-                td.push(tex);
-                sd.push(samp);
+            for &(b, data, w, h) in &snaps {
+                // Resolve sampler_id from the (binding ->
+                // (image_id, sampler_id)) map directly --
+                // the snapshot dropped sampler_id since we
+                // only needed image data for the raw ptr.
+                let (_, sampler_id) = *state.bound_textures.get(&b)
+                    .unwrap_or(&(0, 0));
+                td.push(atrium_spv_runtime::TexDesc {
+                    data,
+                    width: w, height: h,
+                    stride_bytes: w * 4,
+                    format: atrium_spv_runtime::TexFormat::Rgba8Unorm as u32,
+                    mip_count: 0, mip_descs: std::ptr::null(),
+                    depth: 1, slice_bytes: 0,
+                });
+                sd.push(samplers_guard.get(&sampler_id).copied()
+                    .unwrap_or(placeholder_samp));
             }
             tex_descs = td;
             sampler_descs = sd;
@@ -1187,7 +1182,7 @@ impl Tier2Backend {
                     atrium_spv_runtime::atrium_tex_sample_2d_array_lod,
                     atrium_spv_runtime::atrium_tex_sample_cube_lod,
                 );
-                for (i, &(binding, _, _)) in bindings_sorted.iter().enumerate() {
+                for (i, &(binding, _, _, _)) in snaps.iter().enumerate() {
                     atrium_spv_runtime::write_descriptor_slot(
                         &mut buf, binding as usize,
                         &tex_descs[i] as *const _,
@@ -1197,18 +1192,16 @@ impl Tier2Backend {
             }
             uniforms_buf = buf;
         } else {
-            images_guard = None;
             tex_descs = Vec::new();
             sampler_descs = Vec::new();
             uniforms_buf = Vec::new();
         }
-        // CRITICAL: keep tex_descs / sampler_descs / images_guard
-        // alive through the loop -- the raw pointers inside
-        // uniforms_buf reference these Vecs' heap allocations.
-        // `let _ = (...)` would drop them immediately (same trap
-        // Arc 154's commit e0dce68 documented for image_descs).
-        let _retain_tex_state =
-            (&images_guard, &tex_descs, &sampler_descs);
+        // CRITICAL: keep tex_descs / sampler_descs alive through
+        // the loop -- the raw pointers inside uniforms_buf
+        // reference these Vecs' heap allocations.  `let _ = (...)`
+        // would drop them immediately (same trap Arc 154's
+        // commit e0dce68 documented for image_descs).
+        let _retain_tex_state = (&tex_descs, &sampler_descs);
 
         for t in 0..tri_count {
             let v0 = &assembled.bytes[(3*t)*stride   .. (3*t+1)*stride];
@@ -1876,7 +1869,11 @@ impl Tier2Backend {
                     Err(e) => log::warn!("malformed Dispatch: {e}"),
                 },
                 FrameOp::CopyImgToBuf => self.execute_copy_image_to_buffer(body),
-                FrameOp::CopyBufToImg => self.execute_copy_buffer_to_image(body),
+                // CopyBufToImg is handled by the pre-pass
+                // walker (see `execute_upload_ops`) so texture
+                // uploads land BEFORE the render passes that
+                // sample them; we deliberately don't run it
+                // again here.
                 _ => {}
             }
         }
@@ -1959,6 +1956,31 @@ impl Tier2Backend {
                 if dst_off + row_bytes > dst_buf.bytes.len() { break; }
                 dst_buf.bytes[dst_off..dst_off + row_bytes]
                     .copy_from_slice(&src_pixels[src_off..src_off + row_bytes]);
+            }
+        }
+    }
+
+    /// Pre-pass walker: process outside-renderpass upload
+    /// ops (today: `FrameOp::CopyBufToImg`).  Runs before
+    /// `execute_pass` so a frame that uploads texture data
+    /// then draws-while-sampling sees the texture content the
+    /// app populated.  Single-purpose by design: don't touch
+    /// state-tracking ops here (BindPipeline / PushConstants /
+    /// BindDescriptors); those are pass-local and live in
+    /// `execute_pass` / `execute_compute_ops`.
+    fn execute_upload_ops(&self, frame_buf: &[u8]) {
+        let mut decoder = FrameDecoder::new(frame_buf);
+        let mut rp_depth: u32 = 0;
+        while let Ok(Some((op, body))) = decoder.next() {
+            match op {
+                FrameOp::BeginRenderPass => rp_depth += 1,
+                FrameOp::EndRenderPass => {
+                    rp_depth = rp_depth.saturating_sub(1);
+                }
+                _ if rp_depth > 0 => {} // inside RP -- skip
+                FrameOp::CopyBufToImg =>
+                    self.execute_copy_buffer_to_image(body),
+                _ => {}
             }
         }
     }
@@ -2324,6 +2346,23 @@ impl Backend for Tier2Backend {
                 return true;
             }
         };
+
+        // Pre-pass: upload ops that should land BEFORE the
+        // render passes that consume them (e.g.
+        // vkCmdCopyBufferToImage uploading texture data before
+        // a draw that samples that texture).  Walk the whole
+        // frame and execute only CopyBufToImg outside any
+        // render pass; the post-pass execute_compute_ops sweep
+        // handles everything else, INCLUDING the CopyImgToBuf
+        // readback ops that depend on render output.
+        //
+        // Without this split, an app that does the standard
+        // "upload texture, then draw with it" sequence in
+        // ONE command buffer would see the texture remain
+        // unmodified during the draw -- the post-pass walker
+        // would apply the upload AFTER the FS had already run
+        // against the cleared texel storage.
+        self.execute_upload_ops(frame_buf);
 
         for pass in &passes {
             let pass_bytes = &frame_buf[pass.byte_range.clone()];
