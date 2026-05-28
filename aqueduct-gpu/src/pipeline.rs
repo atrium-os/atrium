@@ -237,6 +237,20 @@ pub struct Tier2ComputeStateBlob {
     /// which produces a distinct compiled artifact + ID per
     /// `(spirv, overrides)` pair.
     pub spec_overrides: Vec<(u32, u32)>,
+    /// `true` when the SPIR-V contains at least one
+    /// `OpControlBarrier` (opcode 224).  Tells the Tier-2
+    /// dispatcher to use Arc-150's parallel-lane mode (one
+    /// OS thread per invocation, sharing an
+    /// `Arc<std::sync::Barrier>`).  When `false` and
+    /// `lx * ly * lz > 1`, the dispatcher MUST stay serial:
+    /// without a barrier the lanes are observably-equivalent
+    /// to executing in any order, so the cheaper serial
+    /// loop is the right choice -- AND it gives a stable
+    /// "last-writer wins" order that pre-150 shaders may
+    /// (incorrectly but historically) rely on.  Populated
+    /// by the ICD at vkCreateComputePipelines via a SPIR-V
+    /// scan.
+    pub uses_barrier: bool,
 }
 
 impl Default for Tier2ComputeStateBlob {
@@ -248,6 +262,7 @@ impl Default for Tier2ComputeStateBlob {
             ssbo_binding_count: 0,
             workgroup_size: 0,
             spec_overrides: Vec::new(),
+            uses_barrier: false,
         }
     }
 }

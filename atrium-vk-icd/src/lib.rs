@@ -454,6 +454,41 @@ struct AtriumShaderModule {
     /// so the dispatcher allocates a per-workgroup scratch
     /// buffer.  0 if the shader declares no workgroup memory.
     workgroup_size: u32,
+    /// `true` when the SPIR-V contains at least one
+    /// `OpControlBarrier` (opcode 224).  Compute pipelines
+    /// propagate this onto Tier2ComputeStateBlob so the
+    /// dispatcher knows whether to spawn parallel lanes
+    /// (Arc 150) or stay serial (cheaper + deterministic
+    /// last-writer ordering).
+    uses_barrier: bool,
+}
+
+/// Scan `spirv` for at least one `OpControlBarrier`
+/// (opcode 224).  When present, the Tier-2 dispatcher
+/// switches to Arc-150 parallel-lane mode; absent, it
+/// stays in the cheaper deterministic serial loop.
+/// Same hand-rolled SPIR-V walk style as the rest of the
+/// ICD's scanners.
+fn scan_spirv_uses_barrier(spirv: &[u8]) -> bool {
+    if spirv.len() < 20 || spirv.len() % 4 != 0 { return false; }
+    let magic = u32::from_le_bytes(spirv[0..4].try_into().unwrap());
+    if magic != 0x07230203 { return false; }
+    let mut cursor = 20;
+    while cursor + 4 <= spirv.len() {
+        let head = u32::from_le_bytes(
+            spirv[cursor..cursor + 4].try_into().unwrap());
+        let word_count = (head >> 16) as usize;
+        let opcode = (head & 0xFFFF) as u16;
+        if word_count == 0 { return false; }
+        // OpControlBarrier = 224.  Also catches MemoryBarrier
+        // (225)?  No -- MemoryBarrier doesn't synchronise
+        // execution, just memory, so it can run alongside
+        // serial dispatch.  Only ControlBarrier needs the
+        // parallel-lane scaffolding.
+        if opcode == 224 { return true; }
+        cursor += word_count * 4;
+    }
+    false
 }
 
 /// Count distinct StorageBuffer variables in `spirv` that
@@ -4018,6 +4053,7 @@ pub unsafe extern "C" fn vkCreateShaderModule(
     let local_size = scan_spirv_local_size(&bytes);
     let ssbo_binding_count = scan_spirv_ssbo_binding_count(&bytes);
     let workgroup_size = scan_spirv_workgroup_size(&bytes);
+    let uses_barrier = scan_spirv_uses_barrier(&bytes);
 
     // Resolve-or-upload against the daemon. Failure (no live
     // client, validation rejection) leaves shader_id=None — the
@@ -4041,7 +4077,7 @@ pub unsafe extern "C" fn vkCreateShaderModule(
     if let Ok(mut s) = dev.shaders.lock() {
         s.insert(handle, AtriumShaderModule {
             shader_id, bytecode_hash, local_size, ssbo_binding_count,
-            workgroup_size,
+            workgroup_size, uses_barrier,
         });
     } else {
         return VK_ERROR_INITIALIZATION_FAILED;
@@ -5196,12 +5232,14 @@ pub unsafe extern "C" fn vkCreateComputePipelines(
         let info = &*(p_create_infos as *const ash::vk::ComputePipelineCreateInfo)
             .offset(i as isize);
         let mod_handle: u64 = std::mem::transmute(info.stage.module);
-        let (cs_rid, local_size, ssbo_binding_count, workgroup_size)
+        let (cs_rid, local_size, ssbo_binding_count, workgroup_size,
+             uses_barrier)
             = match dev.shaders.lock() {
             Ok(m) => match m.get(&mod_handle) {
                 Some(am) => (am.shader_id, am.local_size,
-                             am.ssbo_binding_count, am.workgroup_size),
-                None => (None, None, 0, 0),
+                             am.ssbo_binding_count, am.workgroup_size,
+                             am.uses_barrier),
+                None => (None, None, 0, 0, false),
             },
             Err(_) => continue,
         };
@@ -5247,6 +5285,7 @@ pub unsafe extern "C" fn vkCreateComputePipelines(
             ssbo_binding_count,
             workgroup_size,
             spec_overrides,
+            uses_barrier,
         };
         let Ok(bytes) = postcard::to_allocvec(&blob) else { continue };
 

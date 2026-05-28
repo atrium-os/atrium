@@ -1377,6 +1377,15 @@ impl Tier2Backend {
         let lx_n = cs_state.local_size_x;
         let ly_n = cs_state.local_size_y;
         let lz_n = cs_state.local_size_z;
+        // Arc 150 parallel-lane mode is gated on the shader
+        // declaring at least one OpControlBarrier.  Without
+        // a barrier the lanes are free-running and any order
+        // is spec-legal -- the cheaper serial loop is the
+        // right pick AND it gives a deterministic "last-
+        // writer wins" ordering for shaders that race on a
+        // single SSBO slot (e.g. early bring-up tests that
+        // pre-date Arc 150).
+        let uses_barrier = cs_state.uses_barrier;
         // Per-workgroup shared-memory scratch size.  Each
         // worker thread owns one buffer of this size, zeroed
         // before every workgroup it runs.
@@ -1427,20 +1436,31 @@ impl Tier2Backend {
                         //     before the barrier are visible to
                         //     reads after.  Arc 150 commit 3.
                         let n_lanes = (lx_n * ly_n * lz_n) as usize;
-                        if n_lanes == 1 {
+                        if n_lanes == 1 || !uses_barrier {
+                            // Serial-within-workgroup path.  Walks
+                            // (lz, ly, lx) inside one cs_main call
+                            // chain so a shader that races on a
+                            // single output gets a stable
+                            // "last-writer wins" ordering.
                             // SAFETY: cs_main is a dlopened
                             // C-ABI function whose signature
                             // matches CsMain (checked at open
                             // time); output buffer + descriptor
                             // table outlive this scope; wg_buf
                             // outlives the inner block.
-                            unsafe {
-                                cs_main(
-                                    uni_ptr, pc_ptr, out_ptr,
-                                    gx, gy, gz,
-                                    0, 0, 0,
-                                    wg_ptr,
-                                );
+                            for lz in 0..lz_n {
+                                for ly in 0..ly_n {
+                                    for lx in 0..lx_n {
+                                        unsafe {
+                                            cs_main(
+                                                uni_ptr, pc_ptr, out_ptr,
+                                                gx, gy, gz,
+                                                lx, ly, lz,
+                                                wg_ptr,
+                                            );
+                                        }
+                                    }
+                                }
                             }
                         } else {
                             let barrier = std::sync::Arc::new(
