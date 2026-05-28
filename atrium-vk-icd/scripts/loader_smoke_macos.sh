@@ -166,6 +166,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 DYLIB="$REPO_ROOT/atrium-vk-icd/target/debug/libatrium_vk_icd.dylib"
 EXAMPLE="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_smoke"
 ROUNDTRIP="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_compute_roundtrip"
+GRAPHICS_RT="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_roundtrip"
 DAEMON="$REPO_ROOT/aqueduct-gpu-host/target/debug/aqueduct-gpu-host"
 COMPILE="$REPO_ROOT/atrium-spv-compile/target/debug/atrium-spv-compile"
 SLANGC="$REPO_ROOT/external/slang-bin/bin/slangc"
@@ -556,6 +557,46 @@ if [ -x "$ROUNDTRIP" ] && [ -x "$SLANGC" ] && [ -f "$SLANG_SRC" ]; then
     # Reap the Rung-7-onwards daemon.
     kill_daemon "$DAEMON_PID"
     DAEMON_PID=""
+fi
+
+# ── Rung N+1: graphics round-trip (vertex + fragment + readback) ──
+# loader_graphics_roundtrip is the graphics-path companion to
+# loader_compute_roundtrip: a real Vulkan app builds a VS + FS
+# inline, renders a triangle into a DEVICE_LOCAL color-attachment
+# image, then vkCmdCopyImageToBuffer + vkInvalidateMappedMemoryRanges
+# pull the rasterized pixels back into the client's mapped pointer.
+# Exercises every link in the chain: loader -> ICD -> daemon ->
+# Tier2 graphics pipeline -> CopyImgToBuf wire -> OP_GPU_BUFFER_READ.
+# Asserts the triangle interior pixel (3,3) matches the FS colour
+# (255, 51, 51, 255).
+if [ -x "$GRAPHICS_RT" ]; then
+    rm -f "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+        echo "daemon failed to start (graphics round-trip); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung G: graphics round-trip (triangle render + copy + readback) ==="
+    if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+        VK_DRIVER_FILES="$MANIFEST" \
+        ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+        "$GRAPHICS_RT" 2>&1 | tail -3; then
+        echo "FAIL: graphics round-trip did not return 0" >&2
+        exit 1
+    fi
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
+else
+    echo
+    echo "SKIP Rung G: need 'cargo build -p atrium-vk-icd --example loader_graphics_roundtrip'"
 fi
 
 echo

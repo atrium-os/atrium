@@ -857,11 +857,13 @@ impl Tier2Backend {
                 }
                 // Ops we don't yet act on: SetScissor,
                 // BindDescriptors (compute-only; handled by
-                // execute_compute_ops), CopyBufToImg, CopyImgToBuf,
-                // Blit, PipelineBarrier, Dispatch{,Indirect},
-                // DrawIndirect, BeginRenderPass (handled by the
-                // outer partition step). These will grow handlers
-                // in later phases as needed.
+                // execute_compute_ops), CopyBufToImg,
+                // CopyImgToBuf (handled by execute_compute_ops's
+                // outside-pass walker), Blit, PipelineBarrier,
+                // Dispatch{,Indirect}, DrawIndirect,
+                // BeginRenderPass (handled by the outer
+                // partition step). These will grow handlers in
+                // later phases as needed.
                 _ => {}
             }
         }
@@ -1635,7 +1637,89 @@ impl Tier2Backend {
                     Ok(cmd) => self.dispatch_compute(&state, cmd),
                     Err(e) => log::warn!("malformed Dispatch: {e}"),
                 },
+                FrameOp::CopyImgToBuf => self.execute_copy_image_to_buffer(body),
                 _ => {}
+            }
+        }
+    }
+
+    /// `FrameOp::CopyImgToBuf` -- image readback into a buffer.
+    /// Body shape (from the ICD's `vkCmdCopyImageToBuffer`):
+    /// `src_image_id u32 + dst_buffer_id u32 + src_layout u32 +
+    /// region_count u32 + per-region 56 B (VkBufferImageCopy)`.
+    ///
+    /// VkBufferImageCopy layout:
+    ///   0   bufferOffset:u64
+    ///   8   bufferRowLength:u32     (0 = tight pack at extent.w)
+    ///  12   bufferImageHeight:u32   (0 = tight pack at extent.h)
+    ///  16   imageSubresource:16 B   (aspectMask/mipLevel/baseArrayLayer/layerCount)
+    ///  32   imageOffset:VkOffset3D  (x:i32, y:i32, z:i32)
+    ///  44   imageExtent:VkExtent3D  (w:u32, h:u32, d:u32)
+    ///
+    /// Today we only support 2D RGBA8 (4 bytes/texel) -- the
+    /// existing `ImageStorage` shape.  Mip / array / 3D land
+    /// when those format paths land too.
+    fn execute_copy_image_to_buffer(&self, body: &[u8]) {
+        if body.len() < 16 {
+            log::warn!("CopyImgToBuf: body too short ({} bytes)", body.len());
+            return;
+        }
+        let src_id = u32::from_le_bytes(body[0..4].try_into().unwrap());
+        let dst_id = u32::from_le_bytes(body[4..8].try_into().unwrap());
+        let _src_layout = u32::from_le_bytes(body[8..12].try_into().unwrap());
+        let region_count = u32::from_le_bytes(body[12..16].try_into().unwrap());
+        if region_count == 0 { return; }
+
+        // Snapshot src pixels under the images lock; drop the
+        // lock before touching `buffers` so the two never
+        // collide on later concurrent paths.
+        let src_snap: Option<(u32, u32, Vec<u8>)> = {
+            let images = self.images.lock().unwrap();
+            images.get(&(src_id as u64)).map(|img|
+                (img.width, img.height, img.pixels.clone()))
+        };
+        let Some((src_w, src_h, src_pixels)) = src_snap else {
+            log::warn!("CopyImgToBuf: src image {src_id} not registered");
+            return;
+        };
+        let bpp: usize = 4; // RGBA8 only for now.
+        let src_stride = src_w as usize * bpp;
+
+        let mut buffers = self.buffers.lock().unwrap();
+        let Some(dst_buf) = buffers.get_mut(&dst_id) else {
+            log::warn!("CopyImgToBuf: dst buffer {dst_id} not registered");
+            return;
+        };
+
+        for r in 0..region_count as usize {
+            let off = 16 + r * 56;
+            if off + 56 > body.len() {
+                log::warn!("CopyImgToBuf: region {r} truncated");
+                break;
+            }
+            let region = &body[off..off + 56];
+            let buf_offset = u64::from_le_bytes(region[0..8].try_into().unwrap()) as usize;
+            let buf_row_length = u32::from_le_bytes(region[8..12].try_into().unwrap());
+            let img_x = i32::from_le_bytes(region[32..36].try_into().unwrap()).max(0) as u32;
+            let img_y = i32::from_le_bytes(region[36..40].try_into().unwrap()).max(0) as u32;
+            let ext_w = u32::from_le_bytes(region[44..48].try_into().unwrap());
+            let ext_h = u32::from_le_bytes(region[48..52].try_into().unwrap());
+            let copy_w = ext_w.min(src_w.saturating_sub(img_x));
+            let copy_h = ext_h.min(src_h.saturating_sub(img_y));
+            let row_bytes = copy_w as usize * bpp;
+            let dst_row_pitch = if buf_row_length == 0 {
+                row_bytes
+            } else {
+                buf_row_length as usize * bpp
+            };
+            for y in 0..copy_h as usize {
+                let src_off = (img_y as usize + y) * src_stride
+                    + img_x as usize * bpp;
+                let dst_off = buf_offset + y * dst_row_pitch;
+                if src_off + row_bytes > src_pixels.len() { break; }
+                if dst_off + row_bytes > dst_buf.bytes.len() { break; }
+                dst_buf.bytes[dst_off..dst_off + row_bytes]
+                    .copy_from_slice(&src_pixels[src_off..src_off + row_bytes]);
             }
         }
     }
