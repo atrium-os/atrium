@@ -168,6 +168,7 @@ EXAMPLE="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_smoke"
 ROUNDTRIP="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_compute_roundtrip"
 GRAPHICS_RT="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_roundtrip"
 GRAPHICS_INTERP="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_interp"
+GRAPHICS_PUSHC="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_pushc"
 DAEMON="$REPO_ROOT/aqueduct-gpu-host/target/debug/aqueduct-gpu-host"
 COMPILE="$REPO_ROOT/atrium-spv-compile/target/debug/atrium-spv-compile"
 SLANGC="$REPO_ROOT/external/slang-bin/bin/slangc"
@@ -638,6 +639,46 @@ if [ -x "$GRAPHICS_INTERP" ]; then
 else
     echo
     echo "SKIP Rung H: need 'cargo build -p atrium-vk-icd --example loader_graphics_interp'"
+fi
+
+# ── Rung I: graphics + FS push constants ─────────────────
+# loader_graphics_pushc: same render shape as Rung G but
+# the FS reads its output colour from a 16-byte
+# PushConstantBlock instead of an inline OpConstantComposite.
+# Verifies vkCmdPushConstants -> FrameOp::PushConstants ->
+# daemon `pc_ptr` -> FS OpLoad PushConstant survives the
+# full loader-mediated path.  Daemon-side proven by the
+# tier2_render_pixels test; this rung closes the loader
+# side.  Pushes (0.0, 0.5, 0.75, 1.0) and asserts
+# pixel(3,3) == (0, 128, 191, 255).
+if [ -x "$GRAPHICS_PUSHC" ]; then
+    rm -f "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+        echo "daemon failed to start (FS pushc round-trip); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung I: FS push constants drive triangle colour ==="
+    if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+        VK_DRIVER_FILES="$MANIFEST" \
+        ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+        "$GRAPHICS_PUSHC" 2>&1 | tail -2; then
+        echo "FAIL: FS push-constant round-trip did not return 0" >&2
+        exit 1
+    fi
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
+else
+    echo
+    echo "SKIP Rung I: need 'cargo build -p atrium-vk-icd --example loader_graphics_pushc'"
 fi
 
 echo
