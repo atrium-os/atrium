@@ -606,6 +606,7 @@ impl Tier2Registry {
                 width,
                 depth_write: draw.depth_write,
                 depth_compare_op: draw.depth_compare_op,
+                depth_bounds: draw.depth_bounds,
                 depth_min, depth_max,
             };
 
@@ -706,6 +707,8 @@ struct TriangleSetup<'s> {
     depth_write: bool,
     /// Mirror of `DrawTriangle::depth_compare_op`.
     depth_compare_op: CompareOp,
+    /// Mirror of `DrawTriangle::depth_bounds`.
+    depth_bounds: Option<(f32, f32)>,
     /// Viewport depth range (`vkCmdSetViewport`'s
     /// `min_depth` / `max_depth`).  Used to remap the
     /// interpolated NDC.z into windowed-depth space before
@@ -908,6 +911,18 @@ fn rasterize_stripe(
                     py_local * (setup.width as usize) + (px as usize);
 
                 if let Some(db) = task.depth.as_mut() {
+                    // Depth bounds test (Vulkan
+                    // `depthBoundsTestEnable`): runs BEFORE
+                    // the depth compare and reads the
+                    // EXISTING buffer value (not the new
+                    // fragment depth).  Out-of-range fragments
+                    // are discarded silently.
+                    if let Some((b_min, b_max)) = setup.depth_bounds {
+                        let existing = db[pixel_lin_local];
+                        if !(existing >= b_min && existing <= b_max) {
+                            continue;
+                        }
+                    }
                     // VkCompareOp evaluation: `pass` is true
                     // when `new <op> existing` according to
                     // the active rule.  Float NaN behaviour
@@ -1134,6 +1149,17 @@ pub struct DrawTriangle<'a> {
     /// Defaults to `Less` for backward compatibility with
     /// the legacy hardcoded rasterizer behaviour.
     pub depth_compare_op: CompareOp,
+
+    /// When `Some((min, max))`, the rasterizer additionally
+    /// discards fragments whose destination depth-attachment
+    /// value falls outside the inclusive range.  Mirrors
+    /// Vulkan's depth bounds test
+    /// (`depthBoundsTestEnable=true` + `minDepthBounds` /
+    /// `maxDepthBounds`).  `None` means the test is off and
+    /// no extra gate is applied.  Has no effect when no
+    /// depth attachment is bound (the bounds test reads the
+    /// existing buffer value).
+    pub depth_bounds: Option<(f32, f32)>,
 }
 
 impl Default for DrawTriangle<'_> {
@@ -1151,6 +1177,7 @@ impl Default for DrawTriangle<'_> {
             front_face: FrontFace::default(),
             depth_write: true,
             depth_compare_op: CompareOp::default(),
+            depth_bounds: None,
         }
     }
 }

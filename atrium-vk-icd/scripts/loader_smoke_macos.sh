@@ -186,6 +186,7 @@ GRAPHICS_DEPTH_DYN="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphi
 GRAPHICS_DEPTH_CMP="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_depth_cmp"
 GRAPHICS_STRIP="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_strip"
 GRAPHICS_DISCARD="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_discard"
+GRAPHICS_DEPTH_BOUNDS="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_depth_bounds"
 DAEMON="$REPO_ROOT/aqueduct-gpu-host/target/debug/aqueduct-gpu-host"
 COMPILE="$REPO_ROOT/atrium-spv-compile/target/debug/atrium-spv-compile"
 SLANGC="$REPO_ROOT/external/slang-bin/bin/slangc"
@@ -1421,6 +1422,46 @@ if [ -x "$GRAPHICS_DISCARD" ]; then
 else
     echo
     echo "SKIP Rung Z: need 'cargo build -p atrium-vk-icd --example loader_graphics_discard'"
+fi
+
+# ── Rung AA: depth bounds test honoured ──────────────────
+# loader_graphics_depth_bounds: pipeline enables the depth
+# bounds test with range [0.0, 0.5]; depth attachment is
+# cleared to 1.0.  Per Vulkan spec the bounds test compares
+# the EXISTING buffer value (1.0) against the range and
+# discards every out-of-range fragment.  pixel(3,3) stays
+# clear-black despite the LESS depth compare on its own
+# would have let the front triangle paint.  Pre-fix, the
+# depthBoundsTest* fields were not extracted from the
+# create info and the rasterizer had no bounds-test gate.
+if [ -x "$GRAPHICS_DEPTH_BOUNDS" ]; then
+    rm -f "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+        echo "daemon failed to start (depth_bounds round-trip); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung AA: depth bounds [0.0, 0.5] vs depth-buffer 1.0 rejects all ==="
+    if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+        VK_DRIVER_FILES="$MANIFEST" \
+        ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+        "$GRAPHICS_DEPTH_BOUNDS" 2>&1 | tail -2; then
+        echo "FAIL: depth_bounds round-trip did not return 0" >&2
+        exit 1
+    fi
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
+else
+    echo
+    echo "SKIP Rung AA: need 'cargo build -p atrium-vk-icd --example loader_graphics_depth_bounds'"
 fi
 
 echo

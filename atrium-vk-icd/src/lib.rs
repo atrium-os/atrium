@@ -1651,6 +1651,10 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkCommandBuffer, u32), FnVoidPtr,
             >(vkCmdSetDepthBoundsTestEnable)),
+        "vkCmdSetDepthBounds" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, f32, f32), FnVoidPtr,
+            >(vkCmdSetDepthBounds)),
         "vkCmdSetStencilTestEnable" | "vkCmdSetStencilTestEnableEXT" =>
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkCommandBuffer, u32), FnVoidPtr,
@@ -3189,6 +3193,9 @@ unsafe fn build_tier2_pipeline_blob(
                 test_enable: true,
                 write_enable: ds.depth_write_enable != 0,
                 compare_op: convert_vk_compare_op(ds.depth_compare_op),
+                bounds_test_enable: ds.depth_bounds_test_enable != 0,
+                min_depth_bounds: ds.min_depth_bounds,
+                max_depth_bounds: ds.max_depth_bounds,
             })
         } else { None }
     };
@@ -3911,7 +3918,32 @@ pub unsafe extern "C" fn vkCmdSetDepthCompareOp(
     let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::SetDepthCompareOp, &body);
 }
 
-ext_state_stub_u32!(vkCmdSetDepthBoundsTestEnable);
+// Dynamic depth-bounds-test toggle
+// (`vkCmdSetDepthBoundsTestEnable`).  4-byte VkBool32 body.
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdSetDepthBoundsTestEnable(
+    command_buffer: VkCommandBuffer,
+    enable:         u32, /* VkBool32 */
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    let body = enable.to_le_bytes();
+    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::SetDepthBoundsTestEnable, &body);
+}
+
+// Dynamic depth-bounds range (`vkCmdSetDepthBounds`).  Body
+// is two f32s, min then max, little-endian.
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdSetDepthBounds(
+    command_buffer: VkCommandBuffer,
+    min_depth:      f32,
+    max_depth:      f32,
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    let mut body = [0u8; 8];
+    body[0..4].copy_from_slice(&min_depth.to_le_bytes());
+    body[4..8].copy_from_slice(&max_depth.to_le_bytes());
+    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::SetDepthBounds, &body);
+}
 ext_state_stub_u32!(vkCmdSetStencilTestEnable);
 // Dynamic rasterizer-discard toggle
 // (`vkCmdSetRasterizerDiscardEnable`).  Takes a VkBool32;
@@ -9234,6 +9266,7 @@ mod tests {
             "vkCmdSetDepthCompareOpEXT",
             "vkCmdSetDepthBoundsTestEnable",
             "vkCmdSetDepthBoundsTestEnableEXT",
+            "vkCmdSetDepthBounds",
             "vkCmdSetStencilTestEnable",
             "vkCmdSetStencilTestEnableEXT",
             "vkCmdSetStencilOp",

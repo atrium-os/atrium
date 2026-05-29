@@ -254,6 +254,12 @@ pub enum FrameOp {
     /// Toggle rasterizer discard
     /// (`vkCmdSetRasterizerDiscardEnable`).
     SetRasterizerDiscardEnable = 0x0039,
+    /// Toggle the depth-bounds test
+    /// (`vkCmdSetDepthBoundsTestEnable`).
+    SetDepthBoundsTestEnable   = 0x003A,
+    /// Set the depth-bounds range
+    /// (`vkCmdSetDepthBounds`). Body is two f32s.
+    SetDepthBounds             = 0x003B,
 
     /// Non-indexed draw.
     Draw            = 0x0040,
@@ -301,6 +307,8 @@ impl FrameOp {
             0x0037 => FrameOp::SetDepthCompareOp,
             0x0038 => FrameOp::SetPrimitiveTopology,
             0x0039 => FrameOp::SetRasterizerDiscardEnable,
+            0x003A => FrameOp::SetDepthBoundsTestEnable,
+            0x003B => FrameOp::SetDepthBounds,
             0x0040 => FrameOp::Draw,
             0x0041 => FrameOp::DrawIndexed,
             0x0042 => FrameOp::DrawIndirect,
@@ -337,6 +345,7 @@ mod tests {
             FrameOp::SetDepthTestEnable, FrameOp::SetDepthWriteEnable,
             FrameOp::SetDepthCompareOp, FrameOp::SetPrimitiveTopology,
             FrameOp::SetRasterizerDiscardEnable,
+            FrameOp::SetDepthBoundsTestEnable, FrameOp::SetDepthBounds,
             FrameOp::Draw, FrameOp::DrawIndexed, FrameOp::DrawIndirect,
             FrameOp::Dispatch, FrameOp::DispatchIndirect,
             FrameOp::CopyBufToImg, FrameOp::CopyImgToBuf, FrameOp::Blit,

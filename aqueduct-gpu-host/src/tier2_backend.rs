@@ -300,6 +300,13 @@ struct PassState {
     /// `Some(false)` forces the rasterizer back on regardless
     /// of the pipeline's static state.
     rasterizer_discard_override: Option<bool>,
+    /// Dynamic depth-bounds-test toggle
+    /// (`vkCmdSetDepthBoundsTestEnable`).
+    bounds_test_enable_override: Option<bool>,
+    /// Dynamic depth-bounds range (`vkCmdSetDepthBounds`):
+    /// `(min, max)`.  Takes precedence over the pipeline-
+    /// static `min_depth_bounds` / `max_depth_bounds`.
+    bounds_range_override: Option<(f32, f32)>,
     /// Latest push-constants block; tier-2 shaders consume it
     /// as their uniform area.
     push_constants: Vec<u8>,
@@ -1055,6 +1062,23 @@ impl Tier2Backend {
                         log::warn!("malformed SetRasterizerDiscardEnable body length: {}", body.len());
                     }
                 }
+                FrameOp::SetDepthBoundsTestEnable => {
+                    if body.len() == 4 {
+                        let v = u32::from_le_bytes(body.try_into().unwrap());
+                        state.bounds_test_enable_override = Some(v != 0);
+                    } else {
+                        log::warn!("malformed SetDepthBoundsTestEnable body length: {}", body.len());
+                    }
+                }
+                FrameOp::SetDepthBounds => {
+                    if body.len() == 8 {
+                        let min_b = f32::from_le_bytes(body[0..4].try_into().unwrap());
+                        let max_b = f32::from_le_bytes(body[4..8].try_into().unwrap());
+                        state.bounds_range_override = Some((min_b, max_b));
+                    } else {
+                        log::warn!("malformed SetDepthBounds body length: {}", body.len());
+                    }
+                }
                 FrameOp::SetPrimitiveTopology => {
                     if body.len() == 4 {
                         let v = u32::from_le_bytes(body.try_into().unwrap());
@@ -1359,6 +1383,20 @@ impl Tier2Backend {
         let depth_write   = depth_enabled
             && state.depth_write_enable_override.unwrap_or(static_write);
         let depth_cmp     = state.depth_compare_op_override.unwrap_or(static_cmp);
+        // Depth bounds test: dynamic + static merge.  An app
+        // can toggle the enable flag and adjust the range
+        // separately, so the effective `(min, max)` comes
+        // from whichever source was most recently set.
+        let static_bounds_enable = raster.depth
+            .map(|d| d.bounds_test_enable).unwrap_or(false);
+        let static_bounds_range  = raster.depth
+            .map(|d| (d.min_depth_bounds, d.max_depth_bounds))
+            .unwrap_or((0.0, 1.0));
+        let bounds_enable = state.bounds_test_enable_override
+            .unwrap_or(static_bounds_enable);
+        let depth_bounds = if bounds_enable {
+            Some(state.bounds_range_override.unwrap_or(static_bounds_range))
+        } else { None };
 
         // Depth source priority:
         //   1) Persisted depth attachment (BindDepthAttachment)
@@ -1545,6 +1583,7 @@ impl Tier2Backend {
                 front_face: state.front_face_override.unwrap_or(raster.front_face),
                 depth_write,
                 depth_compare_op: depth_cmp,
+                depth_bounds,
                 ..Default::default()
             };
             let db_ref: Option<&mut [f32]> = if !depth_enabled {
@@ -2510,6 +2549,20 @@ impl Tier2Backend {
         let depth_write   = depth_enabled
             && state.depth_write_enable_override.unwrap_or(static_write);
         let depth_cmp     = state.depth_compare_op_override.unwrap_or(static_cmp);
+        // Depth bounds test: dynamic + static merge.  An app
+        // can toggle the enable flag and adjust the range
+        // separately, so the effective `(min, max)` comes
+        // from whichever source was most recently set.
+        let static_bounds_enable = raster.depth
+            .map(|d| d.bounds_test_enable).unwrap_or(false);
+        let static_bounds_range  = raster.depth
+            .map(|d| (d.min_depth_bounds, d.max_depth_bounds))
+            .unwrap_or((0.0, 1.0));
+        let bounds_enable = state.bounds_test_enable_override
+            .unwrap_or(static_bounds_enable);
+        let depth_bounds = if bounds_enable {
+            Some(state.bounds_range_override.unwrap_or(static_bounds_range))
+        } else { None };
         if depth_enabled && depth_buffer.is_none() {
             *depth_buffer = Some(vec![
                 f32::INFINITY;
@@ -2547,6 +2600,7 @@ impl Tier2Backend {
                 front_face: state.front_face_override.unwrap_or(raster.front_face),
                 depth_write,
                 depth_compare_op: depth_cmp,
+                depth_bounds,
                 ..Default::default()
             };
             let db_ref = if depth_enabled {

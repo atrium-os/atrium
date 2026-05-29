@@ -232,8 +232,9 @@ pub enum Tier2CompareOp {
 
 /// Tier-2 depth-test state, mirror of
 /// `VkPipelineDepthStencilStateCreateInfo`'s
-/// depth-test/write enables.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// depth-test/write enables.  `PartialEq` only (not `Eq`)
+/// because the bounds fields are `f32`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Tier2DepthState {
     /// When true, fragments only pass if their depth is less
     /// than the existing depth-buffer value.
@@ -247,7 +248,27 @@ pub struct Tier2DepthState {
     /// rasterizer behaviour.
     #[serde(default)]
     pub compare_op: Tier2CompareOp,
+    /// Depth bounds test (`depthBoundsTestEnable`).  When
+    /// true, the rasterizer additionally discards fragments
+    /// whose depth-attachment value at the destination
+    /// pixel falls outside `[min_depth_bounds,
+    /// max_depth_bounds]`.  Vulkan's spec compares the
+    /// existing buffer value, not the new fragment depth.
+    #[serde(default)]
+    pub bounds_test_enable: bool,
+    /// Inclusive lower bound for the depth bounds test.
+    #[serde(default)]
+    pub min_depth_bounds: f32,
+    /// Inclusive upper bound for the depth bounds test.
+    /// Defaults to 1.0 so a blob round-tripped from an old
+    /// daemon (bounds_test_enable=false everywhere) doesn't
+    /// accidentally collapse the bounds range when the test
+    /// is later toggled on dynamically.
+    #[serde(default = "default_max_bounds")]
+    pub max_depth_bounds: f32,
 }
+
+fn default_max_bounds() -> f32 { 1.0 }
 
 /// Per-channel blend factor; mirror of the tier-2 rasterizer's
 /// internal `BlendFactor`. Subset of Vulkan `VkBlendFactor`.
