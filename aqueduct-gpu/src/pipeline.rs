@@ -140,6 +140,46 @@ impl VertexInputState {
 /// D.6 honors `test_enable` + `write_enable`; compare op is
 /// hardcoded LESS in the tier-2 rasterizer (fill_image_triangle
 /// R.3 spec).
+/// Triangle cull mode, mirror of `VkCullModeFlags`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Tier2CullMode {
+    /// No culling (default).
+    #[default]
+    None,
+    /// Cull front-facing triangles.
+    Front,
+    /// Cull back-facing triangles (the typical default for 3D apps).
+    Back,
+    /// Cull every triangle.
+    FrontAndBack,
+}
+
+/// Winding considered front-facing, mirror of `VkFrontFace`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Tier2FrontFace {
+    /// Counter-clockwise winding is front (Vulkan default).
+    #[default]
+    CounterClockwise,
+    /// Clockwise winding is front.
+    Clockwise,
+}
+
+/// Tier-2 raster state extracted from
+/// `VkPipelineRasterizationStateCreateInfo`.
+///
+/// Honoured by `fill_image_triangle` to skip triangles whose
+/// post-viewport-mapping winding matches the active cull mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tier2RasterState {
+    /// Cull mode.
+    pub cull_mode: Tier2CullMode,
+    /// Front-face winding.
+    pub front_face: Tier2FrontFace,
+}
+
+/// Tier-2 depth-test state, mirror of
+/// `VkPipelineDepthStencilStateCreateInfo`'s
+/// depth-test/write enables.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tier2DepthState {
     /// When true, fragments only pass if their depth is less
@@ -312,6 +352,11 @@ pub struct Tier2PipelineStateBlob {
     /// (source replace + all-channel write mask).
     #[serde(default)]
     pub blend: Option<Tier2BlendState>,
+    /// Cull mode + front-face winding extracted from
+    /// `VkPipelineRasterizationStateCreateInfo`. `None`
+    /// preserves the legacy "no culling" behaviour.
+    #[serde(default)]
+    pub raster: Option<Tier2RasterState>,
     /// Total bytes the VS writes through Location-decorated
     /// `Output`-storage variables.  Lets the dispatcher size
     /// the per-vertex varying capture buffer fed to

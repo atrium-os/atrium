@@ -27,8 +27,8 @@ use aqueduct_gpu::backends::{BackendId, GpuVendor};
 use crate::backend::Backend;
 use crate::tier2_registry::{
     BlendFactor, BlendFactorPair, BlendOp, BlendState, ColorWriteMask,
-    DrawTriangle, Scissor, Tier2ExecError, Tier2Registry, Tier2ShaderId,
-    Viewport,
+    CullMode, DrawTriangle, FrontFace, Scissor, Tier2ExecError,
+    Tier2Registry, Tier2ShaderId, Viewport,
 };
 
 use aqueduct_gpu::frame::{
@@ -303,6 +303,8 @@ struct PassState {
 struct PipelineRasterState {
     depth: Option<Tier2DepthState>,
     blend: BlendState,
+    cull_mode: CullMode,
+    front_face: FrontFace,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -635,11 +637,27 @@ impl Tier2Backend {
         pipeline_id: ResourceId,
         depth: Option<Tier2DepthState>,
         blend: Option<WireBlendState>,
+        raster: Option<aqueduct_gpu::Tier2RasterState>,
     ) {
         let blend = blend.map(convert_blend_state).unwrap_or_default();
+        let (cull_mode, front_face) = match raster {
+            Some(r) => (
+                match r.cull_mode {
+                    aqueduct_gpu::Tier2CullMode::None         => CullMode::None,
+                    aqueduct_gpu::Tier2CullMode::Front        => CullMode::Front,
+                    aqueduct_gpu::Tier2CullMode::Back         => CullMode::Back,
+                    aqueduct_gpu::Tier2CullMode::FrontAndBack => CullMode::FrontAndBack,
+                },
+                match r.front_face {
+                    aqueduct_gpu::Tier2FrontFace::CounterClockwise => FrontFace::CounterClockwise,
+                    aqueduct_gpu::Tier2FrontFace::Clockwise        => FrontFace::Clockwise,
+                },
+            ),
+            None => (CullMode::None, FrontFace::CounterClockwise),
+        };
         self.pipeline_raster.lock().unwrap().insert(
             pipeline_id.raw(),
-            PipelineRasterState { depth, blend },
+            PipelineRasterState { depth, blend, cull_mode, front_face },
         );
     }
 
@@ -1309,6 +1327,8 @@ impl Tier2Backend {
                 uniforms: &uniforms_buf,
                 viewport: dt_viewport,
                 scissor: dt_scissor,
+                cull_mode: raster.cull_mode,
+                front_face: raster.front_face,
                 ..Default::default()
             };
             let db_ref: Option<&mut [f32]> = if !depth_enabled {
@@ -2276,6 +2296,8 @@ impl Tier2Backend {
                 varying_f32_count,
                 viewport: dt_viewport,
                 scissor: dt_scissor,
+                cull_mode: raster.cull_mode,
+                front_face: raster.front_face,
                 ..Default::default()
             };
             let db_ref = if depth_enabled {
@@ -2550,8 +2572,9 @@ impl Backend for Tier2Backend {
         pipeline_id: ResourceId,
         depth: Option<Tier2DepthState>,
         blend: Option<WireBlendState>,
+        raster: Option<aqueduct_gpu::Tier2RasterState>,
     ) {
-        self.bind_raster_state(pipeline_id, depth, blend);
+        self.bind_raster_state(pipeline_id, depth, blend, raster);
     }
 
     fn bind_pipeline_vs_varying_bytes(

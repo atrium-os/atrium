@@ -81,8 +81,9 @@ pub use opcodes::{
 pub use payloads::*;
 pub use pipeline::{
     Tier2BlendFactor, Tier2BlendOp, Tier2BlendState,
-    Tier2ComputeStateBlob, Tier2DepthState,
-    Tier2PipelineStateBlob, VertexAttributeDesc, VertexBindingDesc,
+    Tier2ComputeStateBlob, Tier2CullMode, Tier2DepthState,
+    Tier2FrontFace, Tier2PipelineStateBlob, Tier2RasterState,
+    VertexAttributeDesc, VertexBindingDesc,
     VertexFormat, VertexInputState,
 };
 

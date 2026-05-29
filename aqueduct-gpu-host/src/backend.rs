@@ -243,6 +243,7 @@ pub trait Backend: Send + Sync {
         _pipeline_id: ResourceId,
         _depth: Option<aqueduct_gpu::Tier2DepthState>,
         _blend: Option<aqueduct_gpu::Tier2BlendState>,
+        _raster: Option<aqueduct_gpu::Tier2RasterState>,
     ) {}
 
     /// Record how many bytes the VS writes through

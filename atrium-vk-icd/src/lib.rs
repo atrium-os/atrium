@@ -3112,9 +3112,9 @@ unsafe fn build_tier2_pipeline_blob(
     info: &ash::vk::GraphicsPipelineCreateInfo,
 ) -> Option<(Vec<aqueduct_gpu::ids::ResourceId>, Vec<u8>)> {
     use aqueduct_gpu::{
-        Tier2BlendState, Tier2DepthState, Tier2PipelineStateBlob,
-        VertexAttributeDesc, VertexBindingDesc, VertexFormat,
-        VertexInputState,
+        Tier2BlendState, Tier2CullMode, Tier2DepthState, Tier2FrontFace,
+        Tier2PipelineStateBlob, Tier2RasterState, VertexAttributeDesc,
+        VertexBindingDesc, VertexFormat, VertexInputState,
     };
 
     if info.stage_count == 0 || info.p_stages.is_null() {
@@ -3218,8 +3218,36 @@ unsafe fn build_tier2_pipeline_blob(
         }
     };
 
+    // Rasterization state -- cull_mode + front_face only
+    // (we ignore polygon_mode / line_width / depth_bias for
+    // now; those land in their own arcs).
+    let raster = if info.p_rasterization_state.is_null() { None } else {
+        let rs = &*info.p_rasterization_state;
+        let cull_mode = match rs.cull_mode {
+            ash::vk::CullModeFlags::NONE          => Tier2CullMode::None,
+            ash::vk::CullModeFlags::FRONT         => Tier2CullMode::Front,
+            ash::vk::CullModeFlags::BACK          => Tier2CullMode::Back,
+            ash::vk::CullModeFlags::FRONT_AND_BACK => Tier2CullMode::FrontAndBack,
+            _                                     => Tier2CullMode::None,
+        };
+        let front_face = match rs.front_face {
+            ash::vk::FrontFace::COUNTER_CLOCKWISE => Tier2FrontFace::CounterClockwise,
+            ash::vk::FrontFace::CLOCKWISE         => Tier2FrontFace::Clockwise,
+            _                                     => Tier2FrontFace::CounterClockwise,
+        };
+        // Only ship a raster state if the app diverged from
+        // the default (NONE + CCW) -- keeps the blob smaller
+        // and preserves blob-bytes for pre-existing rungs.
+        if matches!(cull_mode, Tier2CullMode::None)
+            && matches!(front_face, Tier2FrontFace::CounterClockwise) {
+            None
+        } else {
+            Some(Tier2RasterState { cull_mode, front_face })
+        }
+    };
+
     let blob = Tier2PipelineStateBlob {
-        vertex_input, depth, blend, vs_varying_bytes,
+        vertex_input, depth, blend, raster, vs_varying_bytes,
     };
     let bytes = postcard::to_allocvec(&blob).ok()?;
     Some((vec![vs_id, fs_id], bytes))

@@ -180,6 +180,7 @@ GRAPHICS_UBO="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_ubo
 GRAPHICS_VIEWPORT="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_viewport"
 GRAPHICS_SCISSOR="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_scissor"
 GRAPHICS_DEPTH_RANGE="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_depth_range"
+GRAPHICS_CULL="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_cull"
 DAEMON="$REPO_ROOT/aqueduct-gpu-host/target/debug/aqueduct-gpu-host"
 COMPILE="$REPO_ROOT/atrium-spv-compile/target/debug/atrium-spv-compile"
 SLANGC="$REPO_ROOT/external/slang-bin/bin/slangc"
@@ -1182,6 +1183,44 @@ if [ -x "$GRAPHICS_DEPTH_RANGE" ]; then
 else
     echo
     echo "SKIP Rung T: need 'cargo build -p atrium-vk-icd --example loader_graphics_depth_range'"
+fi
+
+# ── Rung U: pipeline-static cull_mode / front_face honoured ─
+# loader_graphics_cull: pipeline declares cullMode=BACK +
+# frontFace=COUNTER_CLOCKWISE.  Vertex order is CW in
+# screen-space (Y-down NDC), so the triangle is back-facing
+# under this policy.  The rasterizer must discard it before
+# the per-pixel walk -- pixel(3,3) stays clear-black.
+# Pre-fix, VkPipelineRasterizationStateCreateInfo wasn't
+# parsed and the triangle painted unconditionally.
+if [ -x "$GRAPHICS_CULL" ]; then
+    rm -f "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+        echo "daemon failed to start (cull round-trip); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung U: pipeline cull_mode=BACK discards CW triangle ==="
+    if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+        VK_DRIVER_FILES="$MANIFEST" \
+        ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+        "$GRAPHICS_CULL" 2>&1 | tail -2; then
+        echo "FAIL: cull round-trip did not return 0" >&2
+        exit 1
+    fi
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
+else
+    echo
+    echo "SKIP Rung U: need 'cargo build -p atrium-vk-icd --example loader_graphics_cull'"
 fi
 
 echo

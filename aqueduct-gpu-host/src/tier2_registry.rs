@@ -551,6 +551,24 @@ impl Tier2Registry {
             let (a, b, c) = (screen[0], screen[1], screen[2]);
             let total_edge = edge_fn(a, b, c);
 
+            // Cull mode.  Screen-space winding sign matches
+            // `edge_fn` directly: `total_edge > 0` ⇒ CCW.
+            // Vulkan's default front-face is CCW; flipping
+            // to CW inverts which sign counts as front.
+            if total_edge != 0.0 {
+                let is_front = match draw.front_face {
+                    FrontFace::CounterClockwise => total_edge > 0.0,
+                    FrontFace::Clockwise        => total_edge < 0.0,
+                };
+                let cull = match draw.cull_mode {
+                    CullMode::None         => false,
+                    CullMode::Front        =>  is_front,
+                    CullMode::Back         => !is_front,
+                    CullMode::FrontAndBack => true,
+                };
+                if cull { continue; }
+            }
+
             // Tile coordinates that overlap the triangle bbox.
             let tile_min_x = min_x / TILE_SIZE;
             let tile_max_x = max_x / TILE_SIZE;
@@ -1061,6 +1079,43 @@ pub struct DrawTriangle<'a> {
     /// framebuffer.  Applied alongside the usual triangle-
     /// bbox clamp before the per-pixel walk.
     pub scissor: Option<Scissor>,
+
+    /// Triangle cull mode (`VkCullModeFlags`).  Default
+    /// `None` keeps every triangle (the pre-cull behaviour);
+    /// `Back` / `Front` skip triangles whose screen-space
+    /// winding identifies them as that face.
+    pub cull_mode: CullMode,
+
+    /// Winding considered front-facing (`VkFrontFace`).
+    /// Defaults to `CounterClockwise` -- Vulkan's spec
+    /// default and the convention the rasterizer's
+    /// `edge_fn` uses (CCW screen winding ⇒ `total_edge > 0`).
+    pub front_face: FrontFace,
+}
+
+/// Triangle cull mode for the rasterizer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CullMode {
+    /// No culling.
+    #[default]
+    None,
+    /// Cull front-facing triangles.
+    Front,
+    /// Cull back-facing triangles.
+    Back,
+    /// Cull every triangle.
+    FrontAndBack,
+}
+
+/// Front-face winding convention for the rasterizer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FrontFace {
+    /// CCW winding (in screen-space pixel coordinates) is
+    /// front (Vulkan default).
+    #[default]
+    CounterClockwise,
+    /// CW winding is front.
+    Clockwise,
 }
 
 /// Vulkan-shaped scissor rect, mirrored from the
