@@ -3237,14 +3237,18 @@ unsafe fn build_tier2_pipeline_blob(
             ash::vk::FrontFace::CLOCKWISE         => Tier2FrontFace::Clockwise,
             _                                     => Tier2FrontFace::CounterClockwise,
         };
+        let rasterizer_discard = rs.rasterizer_discard_enable != 0;
         // Only ship a raster state if the app diverged from
-        // the default (NONE + CCW) -- keeps the blob smaller
-        // and preserves blob-bytes for pre-existing rungs.
+        // the defaults (NONE + CCW + discard=false) -- keeps
+        // the blob smaller and preserves blob-bytes for pre-
+        // existing rungs.
         if matches!(cull_mode, Tier2CullMode::None)
-            && matches!(front_face, Tier2FrontFace::CounterClockwise) {
+            && matches!(front_face, Tier2FrontFace::CounterClockwise)
+            && !rasterizer_discard
+        {
             None
         } else {
-            Some(Tier2RasterState { cull_mode, front_face })
+            Some(Tier2RasterState { cull_mode, front_face, rasterizer_discard })
         }
     };
 
@@ -3909,7 +3913,19 @@ pub unsafe extern "C" fn vkCmdSetDepthCompareOp(
 
 ext_state_stub_u32!(vkCmdSetDepthBoundsTestEnable);
 ext_state_stub_u32!(vkCmdSetStencilTestEnable);
-ext_state_stub_u32!(vkCmdSetRasterizerDiscardEnable);
+// Dynamic rasterizer-discard toggle
+// (`vkCmdSetRasterizerDiscardEnable`).  Takes a VkBool32;
+// the daemon walker stores `Option<bool>` and short-circuits
+// dispatch when set.
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdSetRasterizerDiscardEnable(
+    command_buffer: VkCommandBuffer,
+    enable:         u32, /* VkBool32 */
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    let body = enable.to_le_bytes();
+    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::SetRasterizerDiscardEnable, &body);
+}
 ext_state_stub_u32!(vkCmdSetDepthBiasEnable);
 ext_state_stub_u32!(vkCmdSetPrimitiveRestartEnable);
 

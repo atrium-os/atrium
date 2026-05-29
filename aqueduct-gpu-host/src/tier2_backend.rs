@@ -292,6 +292,14 @@ struct PassState {
     /// (`vkCmdSetPrimitiveTopology`).  Takes precedence over
     /// the pipeline's static topology when set.
     topology_override: Option<PrimitiveTopology>,
+    /// Dynamic rasterizer-discard toggle
+    /// (`vkCmdSetRasterizerDiscardEnable`).  When `Some(true)`,
+    /// subsequent draws short-circuit before vertex assembly
+    /// (the daemon doesn't model transform-feedback side
+    /// effects, so dropping the entire dispatch is sound).
+    /// `Some(false)` forces the rasterizer back on regardless
+    /// of the pipeline's static state.
+    rasterizer_discard_override: Option<bool>,
     /// Latest push-constants block; tier-2 shaders consume it
     /// as their uniform area.
     push_constants: Vec<u8>,
@@ -332,6 +340,11 @@ struct PipelineRasterState {
     cull_mode: CullMode,
     front_face: FrontFace,
     topology: PrimitiveTopology,
+    /// Mirror of `Tier2RasterState::rasterizer_discard`.
+    /// When true, the draw short-circuits before vertex
+    /// assembly unless the cmdbuf re-enabled the rasterizer
+    /// dynamically.
+    rasterizer_discard: bool,
 }
 
 /// Daemon-local primitive topology.  Only the two triangle
@@ -684,7 +697,7 @@ impl Tier2Backend {
         topology: aqueduct_gpu::Tier2PrimitiveTopology,
     ) {
         let blend = blend.map(convert_blend_state).unwrap_or_default();
-        let (cull_mode, front_face) = match raster {
+        let (cull_mode, front_face, rasterizer_discard) = match raster {
             Some(r) => (
                 match r.cull_mode {
                     aqueduct_gpu::Tier2CullMode::None         => CullMode::None,
@@ -696,8 +709,9 @@ impl Tier2Backend {
                     aqueduct_gpu::Tier2FrontFace::CounterClockwise => FrontFace::CounterClockwise,
                     aqueduct_gpu::Tier2FrontFace::Clockwise        => FrontFace::Clockwise,
                 },
+                r.rasterizer_discard,
             ),
-            None => (CullMode::None, FrontFace::CounterClockwise),
+            None => (CullMode::None, FrontFace::CounterClockwise, false),
         };
         let topology = match topology {
             aqueduct_gpu::Tier2PrimitiveTopology::TriangleList  => PrimitiveTopology::TriangleList,
@@ -706,7 +720,9 @@ impl Tier2Backend {
         };
         self.pipeline_raster.lock().unwrap().insert(
             pipeline_id.raw(),
-            PipelineRasterState { depth, blend, cull_mode, front_face, topology },
+            PipelineRasterState {
+                depth, blend, cull_mode, front_face, topology, rasterizer_discard,
+            },
         );
     }
 
@@ -1031,6 +1047,14 @@ impl Tier2Backend {
                         log::warn!("malformed SetDepthWriteEnable body length: {}", body.len());
                     }
                 }
+                FrameOp::SetRasterizerDiscardEnable => {
+                    if body.len() == 4 {
+                        let v = u32::from_le_bytes(body.try_into().unwrap());
+                        state.rasterizer_discard_override = Some(v != 0);
+                    } else {
+                        log::warn!("malformed SetRasterizerDiscardEnable body length: {}", body.len());
+                    }
+                }
                 FrameOp::SetPrimitiveTopology => {
                     if body.len() == 4 {
                         let v = u32::from_le_bytes(body.try_into().unwrap());
@@ -1201,6 +1225,20 @@ impl Tier2Backend {
         }
         if cmd.vertex_count == 0 {
             log::debug!("Draw on target {target_id} skipped: vertex_count=0");
+            return;
+        }
+        // Rasterizer-discard short-circuit.  Pipeline static
+        // wins by default; the cmdbuf can override via
+        // `vkCmdSetRasterizerDiscardEnable`.  When discard is
+        // active, the daemon has no transform-feedback side
+        // effects to model, so dropping the entire dispatch is
+        // sound.  (VS still nominally runs in real Vulkan; for
+        // tier-2 it's a pure function so skipping is observable
+        // only via "nothing painted".)
+        let pipeline_discard = state.raster
+            .map(|r| r.rasterizer_discard).unwrap_or(false);
+        if state.rasterizer_discard_override.unwrap_or(pipeline_discard) {
+            self.draws_skipped.fetch_add(1, Ordering::Relaxed);
             return;
         }
 
@@ -2368,6 +2406,14 @@ impl Tier2Backend {
             return;
         }
         if cmd.index_count == 0 { return; }
+        // Rasterizer-discard short-circuit (same shape as
+        // dispatch_draw -- see comment there).
+        let pipeline_discard = state.raster
+            .map(|r| r.rasterizer_discard).unwrap_or(false);
+        if state.rasterizer_discard_override.unwrap_or(pipeline_discard) {
+            self.draws_skipped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let bound_idx = match state.index_buffer {
             Some(b) => b,
             None => {

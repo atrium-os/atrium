@@ -185,6 +185,7 @@ GRAPHICS_CULL_DYN="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphic
 GRAPHICS_DEPTH_DYN="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_depth_dynamic"
 GRAPHICS_DEPTH_CMP="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_depth_cmp"
 GRAPHICS_STRIP="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_strip"
+GRAPHICS_DISCARD="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_discard"
 DAEMON="$REPO_ROOT/aqueduct-gpu-host/target/debug/aqueduct-gpu-host"
 COMPILE="$REPO_ROOT/atrium-spv-compile/target/debug/atrium-spv-compile"
 SLANGC="$REPO_ROOT/external/slang-bin/bin/slangc"
@@ -1381,6 +1382,45 @@ if [ -x "$GRAPHICS_STRIP" ]; then
 else
     echo
     echo "SKIP Rung Y: need 'cargo build -p atrium-vk-icd --example loader_graphics_strip'"
+fi
+
+# ── Rung Z: vkCmdSetRasterizerDiscardEnable honoured ─────
+# loader_graphics_discard: round-trip pipeline with discard
+# OFF in the create info; mid-cmdbuf the app calls
+# vkCmdSetRasterizerDiscardEnable(true) -- the daemon must
+# short-circuit the dispatch so no fragments reach the
+# framebuffer.  Pixel(3,3) stays clear-black.  Pre-fix,
+# the entry point was an `ext_state_stub_u32!` no-op AND
+# the pipeline's static `rasterizerDiscardEnable` wasn't
+# read; both axes now wired.
+if [ -x "$GRAPHICS_DISCARD" ]; then
+    rm -f "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+        echo "daemon failed to start (discard round-trip); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung Z: vkCmdSetRasterizerDiscardEnable(true) skips dispatch ==="
+    if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+        VK_DRIVER_FILES="$MANIFEST" \
+        ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+        "$GRAPHICS_DISCARD" 2>&1 | tail -2; then
+        echo "FAIL: discard round-trip did not return 0" >&2
+        exit 1
+    fi
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
+else
+    echo
+    echo "SKIP Rung Z: need 'cargo build -p atrium-vk-icd --example loader_graphics_discard'"
 fi
 
 echo

@@ -175,6 +175,13 @@ pub struct Tier2RasterState {
     pub cull_mode: Tier2CullMode,
     /// Front-face winding.
     pub front_face: Tier2FrontFace,
+    /// When true, the rasterizer is bypassed entirely --
+    /// vertex stages still execute (for transform-feedback
+    /// side effects) but no fragments are produced.  Mirror
+    /// of `VkPipelineRasterizationStateCreateInfo::
+    /// rasterizerDiscardEnable`.
+    #[serde(default)]
+    pub rasterizer_discard: bool,
 }
 
 /// Tier-2 primitive topology, mirror of

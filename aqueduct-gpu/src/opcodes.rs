@@ -251,6 +251,9 @@ pub enum FrameOp {
     SetDepthCompareOp   = 0x0037,
     /// Switch primitive topology (`vkCmdSetPrimitiveTopology`).
     SetPrimitiveTopology = 0x0038,
+    /// Toggle rasterizer discard
+    /// (`vkCmdSetRasterizerDiscardEnable`).
+    SetRasterizerDiscardEnable = 0x0039,
 
     /// Non-indexed draw.
     Draw            = 0x0040,
@@ -297,6 +300,7 @@ impl FrameOp {
             0x0036 => FrameOp::SetDepthWriteEnable,
             0x0037 => FrameOp::SetDepthCompareOp,
             0x0038 => FrameOp::SetPrimitiveTopology,
+            0x0039 => FrameOp::SetRasterizerDiscardEnable,
             0x0040 => FrameOp::Draw,
             0x0041 => FrameOp::DrawIndexed,
             0x0042 => FrameOp::DrawIndirect,
@@ -332,6 +336,7 @@ mod tests {
             FrameOp::SetCullMode, FrameOp::SetFrontFace,
             FrameOp::SetDepthTestEnable, FrameOp::SetDepthWriteEnable,
             FrameOp::SetDepthCompareOp, FrameOp::SetPrimitiveTopology,
+            FrameOp::SetRasterizerDiscardEnable,
             FrameOp::Draw, FrameOp::DrawIndexed, FrameOp::DrawIndirect,
             FrameOp::Dispatch, FrameOp::DispatchIndirect,
             FrameOp::CopyBufToImg, FrameOp::CopyImgToBuf, FrameOp::Blit,
