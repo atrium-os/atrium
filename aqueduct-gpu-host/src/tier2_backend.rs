@@ -266,6 +266,13 @@ struct PassState {
     /// Current scissor rect.  None ⇒ full-framebuffer scissor
     /// (legacy behaviour).
     scissor: Option<SetScissorCmd>,
+    /// Dynamic cull mode override (`vkCmdSetCullMode`).  When
+    /// `Some`, takes precedence over the pipeline's static
+    /// `Tier2RasterState::cull_mode` for subsequent draws.
+    cull_mode_override: Option<CullMode>,
+    /// Dynamic front-face override (`vkCmdSetFrontFace`).
+    /// Same precedence rule as cull_mode_override.
+    front_face_override: Option<FrontFace>,
     /// Latest push-constants block; tier-2 shaders consume it
     /// as their uniform area.
     push_constants: Vec<u8>,
@@ -934,6 +941,38 @@ impl Tier2Backend {
                     Ok(cmd) => state.scissor = Some(cmd),
                     Err(e) => log::warn!("malformed SetScissor: {e}"),
                 },
+                FrameOp::SetCullMode => {
+                    if body.len() == 4 {
+                        let flags = u32::from_le_bytes(body.try_into().unwrap());
+                        // Match VkCullModeFlags: NONE=0, FRONT=1,
+                        // BACK=2, FRONT_AND_BACK=3.
+                        let cm = match flags {
+                            0 => CullMode::None,
+                            1 => CullMode::Front,
+                            2 => CullMode::Back,
+                            3 => CullMode::FrontAndBack,
+                            _ => CullMode::None,
+                        };
+                        state.cull_mode_override = Some(cm);
+                    } else {
+                        log::warn!("malformed SetCullMode body length: {}", body.len());
+                    }
+                }
+                FrameOp::SetFrontFace => {
+                    if body.len() == 4 {
+                        let v = u32::from_le_bytes(body.try_into().unwrap());
+                        // VkFrontFace: COUNTER_CLOCKWISE=0,
+                        // CLOCKWISE=1.
+                        let ff = match v {
+                            0 => FrontFace::CounterClockwise,
+                            1 => FrontFace::Clockwise,
+                            _ => FrontFace::CounterClockwise,
+                        };
+                        state.front_face_override = Some(ff);
+                    } else {
+                        log::warn!("malformed SetFrontFace body length: {}", body.len());
+                    }
+                }
                 FrameOp::BindDepthAttachment => {
                     match BindDepthAttachmentCmd::from_bytes(body) {
                         Ok(cmd) => {
@@ -1327,8 +1366,8 @@ impl Tier2Backend {
                 uniforms: &uniforms_buf,
                 viewport: dt_viewport,
                 scissor: dt_scissor,
-                cull_mode: raster.cull_mode,
-                front_face: raster.front_face,
+                cull_mode: state.cull_mode_override.unwrap_or(raster.cull_mode),
+                front_face: state.front_face_override.unwrap_or(raster.front_face),
                 ..Default::default()
             };
             let db_ref: Option<&mut [f32]> = if !depth_enabled {
@@ -2296,8 +2335,8 @@ impl Tier2Backend {
                 varying_f32_count,
                 viewport: dt_viewport,
                 scissor: dt_scissor,
-                cull_mode: raster.cull_mode,
-                front_face: raster.front_face,
+                cull_mode: state.cull_mode_override.unwrap_or(raster.cull_mode),
+                front_face: state.front_face_override.unwrap_or(raster.front_face),
                 ..Default::default()
             };
             let db_ref = if depth_enabled {

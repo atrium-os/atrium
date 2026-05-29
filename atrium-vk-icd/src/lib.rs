@@ -3797,8 +3797,31 @@ macro_rules! ext_state_stub_u32 {
     };
 }
 
-ext_state_stub_u32!(vkCmdSetCullMode);
-ext_state_stub_u32!(vkCmdSetFrontFace);
+// `vkCmdSetCullMode` and `vkCmdSetFrontFace` push dynamic-
+// raster ops into the frame so the daemon can override the
+// pipeline-static cull state at draw time.  Spec-accurate:
+// extended_dynamic_state1 allows these to be set per-cmdbuf
+// independent of the pipeline's static raster state.
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdSetCullMode(
+    command_buffer: VkCommandBuffer,
+    cull_mode:      u32, /* VkCullModeFlags */
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    let body = cull_mode.to_le_bytes();
+    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::SetCullMode, &body);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdSetFrontFace(
+    command_buffer: VkCommandBuffer,
+    front_face:     u32, /* VkFrontFace */
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    let body = front_face.to_le_bytes();
+    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::SetFrontFace, &body);
+}
+
 ext_state_stub_u32!(vkCmdSetPrimitiveTopology);
 ext_state_stub_u32!(vkCmdSetDepthTestEnable);
 ext_state_stub_u32!(vkCmdSetDepthWriteEnable);

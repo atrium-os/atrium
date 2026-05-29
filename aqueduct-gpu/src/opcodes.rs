@@ -239,6 +239,10 @@ pub enum FrameOp {
     SetScissor      = 0x0031,
     /// Inline push-constant data (≤ 128 bytes).
     PushConstants   = 0x0032,
+    /// Set the dynamic cull mode (`vkCmdSetCullMode`).
+    SetCullMode     = 0x0033,
+    /// Set the dynamic front-face winding (`vkCmdSetFrontFace`).
+    SetFrontFace    = 0x0034,
 
     /// Non-indexed draw.
     Draw            = 0x0040,
@@ -279,6 +283,8 @@ impl FrameOp {
             0x0030 => FrameOp::SetViewport,
             0x0031 => FrameOp::SetScissor,
             0x0032 => FrameOp::PushConstants,
+            0x0033 => FrameOp::SetCullMode,
+            0x0034 => FrameOp::SetFrontFace,
             0x0040 => FrameOp::Draw,
             0x0041 => FrameOp::DrawIndexed,
             0x0042 => FrameOp::DrawIndirect,
@@ -311,6 +317,7 @@ mod tests {
             FrameOp::BindVertexBuf, FrameOp::BindIndexBuf,
             FrameOp::SetViewport, FrameOp::SetScissor,
             FrameOp::PushConstants,
+            FrameOp::SetCullMode, FrameOp::SetFrontFace,
             FrameOp::Draw, FrameOp::DrawIndexed, FrameOp::DrawIndirect,
             FrameOp::Dispatch, FrameOp::DispatchIndirect,
             FrameOp::CopyBufToImg, FrameOp::CopyImgToBuf, FrameOp::Blit,
