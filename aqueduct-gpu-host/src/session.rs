@@ -259,7 +259,8 @@ impl Session {
         if is_depth_format {
             self.backend.depth_image_created(req.image_id, req.width, req.height);
         } else {
-            self.backend.image_created(req.image_id, req.width, req.height);
+            self.backend.image_created_layered(
+                req.image_id, req.width, req.height, req.array_layers.max(1));
         }
         Ok(())
     }

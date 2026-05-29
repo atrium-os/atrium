@@ -3884,19 +3884,10 @@ pub unsafe extern "C" fn vkCmdBindVertexBuffers2(
     vkCmdBindVertexBuffers(command_buffer, first_binding, binding_count, p_buffers, p_offsets)
 }
 
-// The rest are state-machine setters tier-1 doesn't care about.
-// All take a single primitive value (u32 enum or VkBool32) plus
-// the cmdbuf. Implemented as no-ops; the loader sees them resolve
-// and validation layers see consistent state-change ordering.
-
-macro_rules! ext_state_stub_u32 {
-    ($name:ident) => {
-        #[no_mangle]
-        pub unsafe extern "C" fn $name(
-            _command_buffer: VkCommandBuffer, _value: u32,
-        ) {}
-    };
-}
+// Every extended-dynamic-state setter that tier-2 honours
+// now has a real implementation below; the former
+// `ext_state_stub_u32!` no-op macro was removed once the
+// last stub (Rung EE / primitive restart) was replaced.
 
 // `vkCmdSetCullMode` and `vkCmdSetFrontFace` push dynamic-
 // raster ops into the frame so the daemon can override the

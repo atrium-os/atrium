@@ -63,6 +63,23 @@ pub trait Backend: Send + Sync {
     /// Default no-op for backends that don't need per-image state.
     fn image_created(&self, _image_id: ResourceId, _width: u32, _height: u32) {}
 
+    /// Notify the backend a colour image was created, with the
+    /// full array-layer count (`6` for cubemaps, `N` for 2D
+    /// arrays, `1` for plain 2D).  The default forwards to
+    /// [`Backend::image_created`] so backends that don't model
+    /// layered images stay unchanged.  Tier-2 overrides this
+    /// to allocate `width * height * 4 * layers` so array /
+    /// cube sampling can address each slice.
+    fn image_created_layered(
+        &self,
+        image_id: ResourceId,
+        width: u32,
+        height: u32,
+        _array_layers: u32,
+    ) {
+        self.image_created(image_id, width, height);
+    }
+
     /// Notify the backend an image was destroyed. Default no-op.
     fn image_destroyed(&self, _image_id: ResourceId) {}
 

@@ -192,6 +192,7 @@ GRAPHICS_STENCIL_DYN="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_grap
 GRAPHICS_DEPTH_BIAS="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_depth_bias"
 GRAPHICS_RESTART="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_restart"
 GRAPHICS_MIPMAP="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_mipmap"
+GRAPHICS_ARRAY="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_array"
 DAEMON="$REPO_ROOT/aqueduct-gpu-host/target/debug/aqueduct-gpu-host"
 COMPILE="$REPO_ROOT/atrium-spv-compile/target/debug/atrium-spv-compile"
 SLANGC="$REPO_ROOT/external/slang-bin/bin/slangc"
@@ -1667,6 +1668,46 @@ if [ -x "$GRAPHICS_MIPMAP" ]; then
 else
     echo
     echo "SKIP Rung FF: need 'cargo build -p atrium-vk-icd --example loader_graphics_mipmap'"
+fi
+
+# ── Rung GG: 2D-array texture sampling ───────────────────
+# loader_graphics_array: 2-layer array texture (layer 0
+# red, layer 1 green, 1x1 each).  FS samples a
+# sampler2DArray with a 3-lane coord (u, v, layer=1.0);
+# cranelift picks atrium_tex_sample_2d_array which reads
+# `data + layer * slice_bytes`.  pixel(4,4) = green.
+# Pre-fix, array_layers wasn't plumbed from the create
+# payload, ImageStorage only held one layer, and
+# TexDesc.depth/slice_bytes were always (1, 0) so the
+# layer offset was zero (always layer 0 = red).
+if [ -x "$GRAPHICS_ARRAY" ]; then
+    rm -f "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+        echo "daemon failed to start (array round-trip); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung GG: sampler2DArray fetches layer 1 (green) ==="
+    if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+        VK_DRIVER_FILES="$MANIFEST" \
+        ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+        "$GRAPHICS_ARRAY" 2>&1 | tail -2; then
+        echo "FAIL: array round-trip did not return 0" >&2
+        exit 1
+    fi
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
+else
+    echo
+    echo "SKIP Rung GG: need 'cargo build -p atrium-vk-icd --example loader_graphics_array'"
 fi
 
 echo

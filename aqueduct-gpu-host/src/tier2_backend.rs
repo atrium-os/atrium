@@ -462,12 +462,22 @@ struct BoundIndexBuffer {
 struct ImageStorage {
     width: u32,
     height: u32,
+    /// Base-level (mip 0) pixels.  For layered images
+    /// (`array_layers > 1`, e.g. cubemaps + 2D arrays) the
+    /// layers are stored contiguously layer-major:
+    /// `pixels[layer * width * height * 4 ..]`.  `slice_bytes`
+    /// (= width * height * 4) is the per-layer stride.
     pixels: Vec<u8>,
+    /// Array layer count (1 = plain 2D, 6 = cubemap, N = 2D
+    /// array).  `pixels.len() == width * height * 4 *
+    /// array_layers`.
+    array_layers: u32,
     /// Mip levels 1..N (level 0 lives in `pixels` directly).
     /// Allocated lazily on the first `CopyBufToImg` that
     /// targets `mipLevel > 0`.  Each entry stores its own
     /// (width, height) since mip dimensions are
-    /// `max(1, base >> level)`.
+    /// `max(1, base >> level)`.  v1 only carries mips for
+    /// the base array layer.
     mip_levels: Vec<MipLevel>,
 }
 
@@ -1549,21 +1559,23 @@ impl Tier2Backend {
         // Vec<u8> heap addresses survive HashMap reshapes,
         // so the raw pointers stay valid through the
         // per-triangle loop.
-        type TextureSnap = (u32, *const u8, u32, u32, Vec<(*const u8, u32, u32)>);
+        // (binding, base_ptr, w, h, array_layers, mips)
+        type TextureSnap = (u32, *const u8, u32, u32, u32, Vec<(*const u8, u32, u32)>);
         let texture_snapshots: Vec<TextureSnap> = {
             let images = self.images.lock().unwrap();
             state.bound_textures.iter()
                 .map(|(b, (iid, _))| {
-                    let (data, w, h, mips) = images.get(&(*iid as u64))
+                    let (data, w, h, layers, mips) = images.get(&(*iid as u64))
                         .map(|img| (
                             img.pixels.as_ptr(),
                             img.width, img.height,
+                            img.array_layers,
                             img.mip_levels.iter()
                                 .map(|m| (m.pixels.as_ptr(), m.width, m.height))
                                 .collect::<Vec<_>>(),
                         ))
-                        .unwrap_or((std::ptr::null(), 1, 1, Vec::new()));
-                    (*b, data, w, h, mips)
+                        .unwrap_or((std::ptr::null(), 1, 1, 1, Vec::new()));
+                    (*b, data, w, h, layers, mips)
                 })
                 .collect()
         };
@@ -1712,9 +1724,9 @@ impl Tier2Backend {
             // slot indices line up with the FS's `Binding`
             // decorations.
             let mut snaps = texture_snapshots.clone();
-            snaps.sort_by_key(|(b, _, _, _, _)| *b);
+            snaps.sort_by_key(|(b, _, _, _, _, _)| *b);
             let max_binding = snaps.iter()
-                .map(|(b, _, _, _, _)| *b as usize).max().unwrap_or(0);
+                .map(|(b, _, _, _, _, _)| *b as usize).max().unwrap_or(0);
             let slot_count = max_binding + 1;
             let samplers_guard = self.samplers.lock().unwrap();
             let mut td: Vec<atrium_spv_runtime::TexDesc> =
@@ -1726,9 +1738,16 @@ impl Tier2Backend {
             let placeholder_samp = atrium_spv_runtime::SamplerDesc {
                 mag_filter: 0, min_filter: 0, wrap_s: 0, wrap_t: 0,
             };
-            for (b, data, w, h, mips) in &snaps {
+            for (b, data, w, h, layers, mips) in &snaps {
                 let (_, sampler_id) = *state.bound_textures.get(b)
                     .unwrap_or(&(0, 0));
+                // depth = array-layer / cube-face count;
+                // slice_bytes = per-layer stride.  The runtime
+                // array / cube helpers (`atrium_tex_sample_2d_
+                // array`, `_sample_cube`) read these to address
+                // `data + layer * slice_bytes`.
+                let depth = (*layers).max(1);
+                let slice_bytes = if depth > 1 { *w * *h * 4 } else { 0 };
                 // Build the per-mip TexDesc array.  Level 0 is
                 // duplicated at slot 0 to keep
                 // `pick_tex_mip(lod=0)` consistent (it falls
@@ -1742,7 +1761,7 @@ impl Tier2Backend {
                     stride_bytes: *w * 4,
                     format: atrium_spv_runtime::TexFormat::Rgba8Unorm as u32,
                     mip_count: 0, mip_descs: std::ptr::null(),
-                    depth: 1, slice_bytes: 0,
+                    depth, slice_bytes,
                 });
                 for (mptr, mw, mh) in mips {
                     mips_v.push(atrium_spv_runtime::TexDesc {
@@ -1751,7 +1770,7 @@ impl Tier2Backend {
                         stride_bytes: *mw * 4,
                         format: atrium_spv_runtime::TexFormat::Rgba8Unorm as u32,
                         mip_count: 0, mip_descs: std::ptr::null(),
-                        depth: 1, slice_bytes: 0,
+                        depth, slice_bytes: if depth > 1 { *mw * *mh * 4 } else { 0 },
                     });
                 }
                 let mip_count = mips_v.len() as u32;
@@ -1763,7 +1782,7 @@ impl Tier2Backend {
                     stride_bytes: *w * 4,
                     format: atrium_spv_runtime::TexFormat::Rgba8Unorm as u32,
                     mip_count, mip_descs: mips_ptr,
-                    depth: 1, slice_bytes: 0,
+                    depth, slice_bytes,
                 });
                 mip_arrays.push(mips_v);
                 sd.push(samplers_guard.get(&sampler_id).copied()
@@ -1786,7 +1805,7 @@ impl Tier2Backend {
                     atrium_spv_runtime::atrium_tex_sample_2d_array_lod,
                     atrium_spv_runtime::atrium_tex_sample_cube_lod,
                 );
-                for (i, (binding, _, _, _, _)) in snaps.iter().enumerate() {
+                for (i, (binding, _, _, _, _, _)) in snaps.iter().enumerate() {
                     atrium_spv_runtime::write_descriptor_slot(
                         &mut buf, *binding as usize,
                         &tex_descs[i] as *const _,
@@ -2720,16 +2739,26 @@ impl Tier2Backend {
             // image_subresource (16 B): aspect_mask + mip_level
             // + base_array_layer + layer_count.
             let mip_level = u32::from_le_bytes(region[20..24].try_into().unwrap());
+            let base_array_layer = u32::from_le_bytes(region[24..28].try_into().unwrap());
             let img_x = i32::from_le_bytes(region[32..36].try_into().unwrap()).max(0) as u32;
             let img_y = i32::from_le_bytes(region[36..40].try_into().unwrap()).max(0) as u32;
             let ext_w = u32::from_le_bytes(region[44..48].try_into().unwrap());
             let ext_h = u32::from_le_bytes(region[48..52].try_into().unwrap());
 
+            // Per-layer byte offset into the base pixel buffer
+            // (layer-major).  Only meaningful for mip 0; v1
+            // doesn't carry array layers per mip level.
+            let layer = base_array_layer.min(dst_img.array_layers.saturating_sub(1));
+            let layer_slice_bytes =
+                (base_w as usize) * (base_h as usize) * bpp;
+            let layer_base_off = (layer as usize) * layer_slice_bytes;
+
             // Resolve mip target: level 0 writes the base
-            // pixels; level >0 lazily allocates a MipLevel
-            // entry sized `max(1, base >> level)`.
-            let (dst_w, dst_h, dst_pixels): (u32, u32, &mut Vec<u8>) = if mip_level == 0 {
-                (base_w, base_h, &mut dst_img.pixels)
+            // pixels (at the chosen array-layer slice); level
+            // >0 lazily allocates a MipLevel entry sized
+            // `max(1, base >> level)`.
+            let (dst_w, dst_h, layer_off, dst_pixels): (u32, u32, usize, &mut Vec<u8>) = if mip_level == 0 {
+                (base_w, base_h, layer_base_off, &mut dst_img.pixels)
             } else {
                 let idx = (mip_level - 1) as usize;
                 while dst_img.mip_levels.len() <= idx {
@@ -2742,7 +2771,7 @@ impl Tier2Backend {
                     });
                 }
                 let m = &mut dst_img.mip_levels[idx];
-                (m.width, m.height, &mut m.pixels)
+                (m.width, m.height, 0usize, &mut m.pixels)
             };
 
             let dst_stride = dst_w as usize * bpp;
@@ -2755,7 +2784,8 @@ impl Tier2Backend {
                 buf_row_length as usize * bpp
             };
             for y in 0..copy_h as usize {
-                let dst_off = (img_y as usize + y) * dst_stride
+                let dst_off = layer_off
+                    + (img_y as usize + y) * dst_stride
                     + img_x as usize * bpp;
                 let src_off = buf_offset + y * src_row_pitch;
                 if src_off + row_bytes > src_bytes.len() { break; }
@@ -3057,12 +3087,21 @@ impl Backend for Tier2Backend {
     }
 
     fn image_created(&self, image_id: ResourceId, width: u32, height: u32) {
+        self.image_created_layered(image_id, width, height, 1);
+    }
+
+    fn image_created_layered(
+        &self, image_id: ResourceId, width: u32, height: u32, array_layers: u32,
+    ) {
         if width == 0 || height == 0 { return; }
         const MAX_DIM: u32 = 16 * 1024;
         if width > MAX_DIM || height > MAX_DIM { return; }
-        let pixels = vec![0u8; (width as usize) * (height as usize) * 4];
+        let layers = array_layers.max(1);
+        let pixels = vec![0u8;
+            (width as usize) * (height as usize) * 4 * (layers as usize)];
         self.images.lock().unwrap().insert(image_id.raw() as u64, ImageStorage {
             width, height, pixels,
+            array_layers: layers,
             mip_levels: Vec::new(),
         });
     }
