@@ -760,6 +760,7 @@ impl<'a> TinySkiaRenderer<'a> {
                 | FrameOp::SetFrontFace
                 | FrameOp::SetDepthTestEnable
                 | FrameOp::SetDepthWriteEnable
+                | FrameOp::SetDepthCompareOp
                 | FrameOp::DrawIndexed
                 | FrameOp::DrawIndirect
                 | FrameOp::Dispatch

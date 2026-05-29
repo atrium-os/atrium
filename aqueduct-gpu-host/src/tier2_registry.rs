@@ -605,6 +605,7 @@ impl Tier2Registry {
                 tile_min_x, tile_max_x,
                 width,
                 depth_write: draw.depth_write,
+                depth_compare_op: draw.depth_compare_op,
                 depth_min, depth_max,
             };
 
@@ -703,6 +704,8 @@ struct TriangleSetup<'s> {
     /// the rasterizer evaluates the depth test for colour-
     /// output gating but leaves the depth buffer unmodified.
     depth_write: bool,
+    /// Mirror of `DrawTriangle::depth_compare_op`.
+    depth_compare_op: CompareOp,
     /// Viewport depth range (`vkCmdSetViewport`'s
     /// `min_depth` / `max_depth`).  Used to remap the
     /// interpolated NDC.z into windowed-depth space before
@@ -905,7 +908,25 @@ fn rasterize_stripe(
                     py_local * (setup.width as usize) + (px as usize);
 
                 if let Some(db) = task.depth.as_mut() {
-                    if window_z >= db[pixel_lin_local] { continue; }
+                    // VkCompareOp evaluation: `pass` is true
+                    // when `new <op> existing` according to
+                    // the active rule.  Float NaN behaviour
+                    // matches Vulkan (any compare with NaN
+                    // is false, so NaN fragments fail every
+                    // test except `Always`).
+                    let new = window_z;
+                    let old = db[pixel_lin_local];
+                    let pass = match setup.depth_compare_op {
+                        CompareOp::Never          => false,
+                        CompareOp::Less           => new <  old,
+                        CompareOp::Equal          => new == old,
+                        CompareOp::LessOrEqual    => new <= old,
+                        CompareOp::Greater        => new >  old,
+                        CompareOp::NotEqual       => new != old,
+                        CompareOp::GreaterOrEqual => new >= old,
+                        CompareOp::Always         => true,
+                    };
+                    if !pass { continue; }
                     if setup.depth_write {
                         db[pixel_lin_local] = window_z;
                     }
@@ -1108,6 +1129,11 @@ pub struct DrawTriangle<'a> {
     /// no effect when no depth buffer is bound (`depth ==
     /// None` on `fill_image_triangle`).
     pub depth_write: bool,
+
+    /// Depth compare op (`VkCompareOp` / `Tier2CompareOp`).
+    /// Defaults to `Less` for backward compatibility with
+    /// the legacy hardcoded rasterizer behaviour.
+    pub depth_compare_op: CompareOp,
 }
 
 impl Default for DrawTriangle<'_> {
@@ -1124,6 +1150,7 @@ impl Default for DrawTriangle<'_> {
             cull_mode: CullMode::default(),
             front_face: FrontFace::default(),
             depth_write: true,
+            depth_compare_op: CompareOp::default(),
         }
     }
 }
@@ -1140,6 +1167,29 @@ pub enum CullMode {
     Back,
     /// Cull every triangle.
     FrontAndBack,
+}
+
+/// Depth compare op for the rasterizer (mirror of
+/// `Tier2CompareOp` / Vulkan `VkCompareOp`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CompareOp {
+    /// Test never passes.
+    Never,
+    /// Pass when new < existing (Vulkan default).
+    #[default]
+    Less,
+    /// Pass when new == existing.
+    Equal,
+    /// Pass when new <= existing.
+    LessOrEqual,
+    /// Pass when new > existing.
+    Greater,
+    /// Pass when new != existing.
+    NotEqual,
+    /// Pass when new >= existing.
+    GreaterOrEqual,
+    /// Test always passes.
+    Always,
 }
 
 /// Front-face winding convention for the rasterizer.

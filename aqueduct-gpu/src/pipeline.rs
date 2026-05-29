@@ -177,6 +177,31 @@ pub struct Tier2RasterState {
     pub front_face: Tier2FrontFace,
 }
 
+/// Tier-2 depth compare op, mirror of `VkCompareOp`.
+/// Encodes the rule used to decide whether a fragment's
+/// `gl_FragCoord.z` passes the depth test against the
+/// existing depth-buffer slot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Tier2CompareOp {
+    /// The test never passes.
+    Never,
+    /// Pass when new < existing (Vulkan's typical default).
+    #[default]
+    Less,
+    /// Pass when new == existing.
+    Equal,
+    /// Pass when new <= existing.
+    LessOrEqual,
+    /// Pass when new > existing.
+    Greater,
+    /// Pass when new != existing.
+    NotEqual,
+    /// Pass when new >= existing.
+    GreaterOrEqual,
+    /// The test always passes.
+    Always,
+}
+
 /// Tier-2 depth-test state, mirror of
 /// `VkPipelineDepthStencilStateCreateInfo`'s
 /// depth-test/write enables.
@@ -188,6 +213,12 @@ pub struct Tier2DepthState {
     /// When true (and test_enable is true), passing fragments
     /// overwrite the depth-buffer slot.
     pub write_enable: bool,
+    /// Compare rule for the test (Vulkan `depthCompareOp`).
+    /// Defaults to `Less` so blob round-trips that pre-date
+    /// this field still decode with the legacy hardcoded
+    /// rasterizer behaviour.
+    #[serde(default)]
+    pub compare_op: Tier2CompareOp,
 }
 
 /// Per-channel blend factor; mirror of the tier-2 rasterizer's

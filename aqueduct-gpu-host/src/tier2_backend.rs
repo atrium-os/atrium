@@ -27,8 +27,8 @@ use aqueduct_gpu::backends::{BackendId, GpuVendor};
 use crate::backend::Backend;
 use crate::tier2_registry::{
     BlendFactor, BlendFactorPair, BlendOp, BlendState, ColorWriteMask,
-    CullMode, DrawTriangle, FrontFace, Scissor, Tier2ExecError,
-    Tier2Registry, Tier2ShaderId, Viewport,
+    CompareOp, CullMode, DrawTriangle, FrontFace, Scissor,
+    Tier2ExecError, Tier2Registry, Tier2ShaderId, Viewport,
 };
 
 use aqueduct_gpu::frame::{
@@ -284,6 +284,10 @@ struct PassState {
     /// rule; honoured only when the depth test itself is
     /// active (matches Vulkan's interaction between the two).
     depth_write_enable_override: Option<bool>,
+    /// Dynamic depth compare op (`vkCmdSetDepthCompareOp`).
+    /// Takes precedence over `Tier2DepthState::compare_op`
+    /// from the bound pipeline.
+    depth_compare_op_override: Option<CompareOp>,
     /// Latest push-constants block; tier-2 shaders consume it
     /// as their uniform area.
     push_constants: Vec<u8>,
@@ -1000,6 +1004,28 @@ impl Tier2Backend {
                         log::warn!("malformed SetDepthWriteEnable body length: {}", body.len());
                     }
                 }
+                FrameOp::SetDepthCompareOp => {
+                    if body.len() == 4 {
+                        let v = u32::from_le_bytes(body.try_into().unwrap());
+                        // VkCompareOp encoding (spec):
+                        //  0=NEVER, 1=LESS, 2=EQUAL, 3=LEQUAL,
+                        //  4=GREATER, 5=NOT_EQUAL, 6=GEQUAL, 7=ALWAYS.
+                        let op = match v {
+                            0 => CompareOp::Never,
+                            1 => CompareOp::Less,
+                            2 => CompareOp::Equal,
+                            3 => CompareOp::LessOrEqual,
+                            4 => CompareOp::Greater,
+                            5 => CompareOp::NotEqual,
+                            6 => CompareOp::GreaterOrEqual,
+                            7 => CompareOp::Always,
+                            _ => CompareOp::Less,
+                        };
+                        state.depth_compare_op_override = Some(op);
+                    } else {
+                        log::warn!("malformed SetDepthCompareOp body length: {}", body.len());
+                    }
+                }
                 FrameOp::BindDepthAttachment => {
                     match BindDepthAttachmentCmd::from_bytes(body) {
                         Ok(cmd) => {
@@ -1226,14 +1252,19 @@ impl Tier2Backend {
         // Pipeline-static depth state.
         let static_test  = raster.depth.map(|d| d.test_enable).unwrap_or(false);
         let static_write = raster.depth.map(|d| d.write_enable).unwrap_or(false);
+        let static_cmp   = raster.depth
+            .map(|d| convert_compare_op(d.compare_op))
+            .unwrap_or(CompareOp::Less);
         // Dynamic overrides (`vkCmdSetDepthTestEnable` /
-        // `vkCmdSetDepthWriteEnable`) take precedence.  Depth
+        // `vkCmdSetDepthWriteEnable` /
+        // `vkCmdSetDepthCompareOp`) take precedence.  Depth
         // writes additionally gate on the depth test being
         // active (Vulkan spec: write_enable has no effect
         // when the test is off).
         let depth_enabled = state.depth_test_enable_override.unwrap_or(static_test);
         let depth_write   = depth_enabled
             && state.depth_write_enable_override.unwrap_or(static_write);
+        let depth_cmp     = state.depth_compare_op_override.unwrap_or(static_cmp);
 
         // Depth source priority:
         //   1) Persisted depth attachment (BindDepthAttachment)
@@ -1406,6 +1437,7 @@ impl Tier2Backend {
                 cull_mode: state.cull_mode_override.unwrap_or(raster.cull_mode),
                 front_face: state.front_face_override.unwrap_or(raster.front_face),
                 depth_write,
+                depth_compare_op: depth_cmp,
                 ..Default::default()
             };
             let db_ref: Option<&mut [f32]> = if !depth_enabled {
@@ -2342,14 +2374,19 @@ impl Tier2Backend {
         // Pipeline-static depth state.
         let static_test  = raster.depth.map(|d| d.test_enable).unwrap_or(false);
         let static_write = raster.depth.map(|d| d.write_enable).unwrap_or(false);
+        let static_cmp   = raster.depth
+            .map(|d| convert_compare_op(d.compare_op))
+            .unwrap_or(CompareOp::Less);
         // Dynamic overrides (`vkCmdSetDepthTestEnable` /
-        // `vkCmdSetDepthWriteEnable`) take precedence.  Depth
+        // `vkCmdSetDepthWriteEnable` /
+        // `vkCmdSetDepthCompareOp`) take precedence.  Depth
         // writes additionally gate on the depth test being
         // active (Vulkan spec: write_enable has no effect
         // when the test is off).
         let depth_enabled = state.depth_test_enable_override.unwrap_or(static_test);
         let depth_write   = depth_enabled
             && state.depth_write_enable_override.unwrap_or(static_write);
+        let depth_cmp     = state.depth_compare_op_override.unwrap_or(static_cmp);
         if depth_enabled && depth_buffer.is_none() {
             *depth_buffer = Some(vec![
                 f32::INFINITY;
@@ -2386,6 +2423,7 @@ impl Tier2Backend {
                 cull_mode: state.cull_mode_override.unwrap_or(raster.cull_mode),
                 front_face: state.front_face_override.unwrap_or(raster.front_face),
                 depth_write,
+                depth_compare_op: depth_cmp,
                 ..Default::default()
             };
             let db_ref = if depth_enabled {
@@ -2681,6 +2719,20 @@ impl Backend for Tier2Backend {
         compute_state: Tier2ComputeStateBlob,
     ) {
         self.bind_compute_pipeline(pipeline_id, tier2_shader_id, compute_state);
+    }
+}
+
+fn convert_compare_op(o: aqueduct_gpu::Tier2CompareOp) -> CompareOp {
+    use aqueduct_gpu::Tier2CompareOp as W;
+    match o {
+        W::Never          => CompareOp::Never,
+        W::Less           => CompareOp::Less,
+        W::Equal          => CompareOp::Equal,
+        W::LessOrEqual    => CompareOp::LessOrEqual,
+        W::Greater        => CompareOp::Greater,
+        W::NotEqual       => CompareOp::NotEqual,
+        W::GreaterOrEqual => CompareOp::GreaterOrEqual,
+        W::Always         => CompareOp::Always,
     }
 }
 

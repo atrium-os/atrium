@@ -183,6 +183,7 @@ GRAPHICS_DEPTH_RANGE="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_grap
 GRAPHICS_CULL="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_cull"
 GRAPHICS_CULL_DYN="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_cull_dynamic"
 GRAPHICS_DEPTH_DYN="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_depth_dynamic"
+GRAPHICS_DEPTH_CMP="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_depth_cmp"
 DAEMON="$REPO_ROOT/aqueduct-gpu-host/target/debug/aqueduct-gpu-host"
 COMPILE="$REPO_ROOT/atrium-spv-compile/target/debug/atrium-spv-compile"
 SLANGC="$REPO_ROOT/external/slang-bin/bin/slangc"
@@ -1301,6 +1302,46 @@ if [ -x "$GRAPHICS_DEPTH_DYN" ]; then
 else
     echo
     echo "SKIP Rung W: need 'cargo build -p atrium-vk-icd --example loader_graphics_depth_dynamic'"
+fi
+
+# ── Rung X: vkCmdSetDepthCompareOp (+ pipeline-static op) ─
+# loader_graphics_depth_cmp: same two-triangle scene as
+# Rung L; pipeline declares depth test ON.  Mid-cmdbuf the
+# app calls vkCmdSetDepthCompareOp(NEVER) -- every depth
+# test must fail, so neither triangle produces colour.
+# Pixel(3,3) stays clear-black.  Pre-fix, the rasterizer
+# hardcoded the LESS comparison regardless of pipeline or
+# dynamic state; pipeline-static `Tier2DepthState::compare_
+# op` is now populated from the create info AND the
+# dynamic override path is wired.
+if [ -x "$GRAPHICS_DEPTH_CMP" ]; then
+    rm -f "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+        echo "daemon failed to start (depth_cmp round-trip); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung X: vkCmdSetDepthCompareOp(NEVER) rejects every fragment ==="
+    if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+        VK_DRIVER_FILES="$MANIFEST" \
+        ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+        "$GRAPHICS_DEPTH_CMP" 2>&1 | tail -2; then
+        echo "FAIL: depth_cmp round-trip did not return 0" >&2
+        exit 1
+    fi
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
+else
+    echo
+    echo "SKIP Rung X: need 'cargo build -p atrium-vk-icd --example loader_graphics_depth_cmp'"
 fi
 
 echo

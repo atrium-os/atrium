@@ -3187,6 +3187,7 @@ unsafe fn build_tier2_pipeline_blob(
             Some(Tier2DepthState {
                 test_enable: true,
                 write_enable: ds.depth_write_enable != 0,
+                compare_op: convert_vk_compare_op(ds.depth_compare_op),
             })
         } else { None }
     };
@@ -3279,6 +3280,21 @@ fn convert_vk_blend_op(o: ash::vk::BlendOp) -> aqueduct_gpu::Tier2BlendOp {
         ash::vk::BlendOp::ADD => aqueduct_gpu::Tier2BlendOp::Add,
         // Tier-2 only supports ADD today; other ops fall back.
         _ => aqueduct_gpu::Tier2BlendOp::Add,
+    }
+}
+
+fn convert_vk_compare_op(o: ash::vk::CompareOp) -> aqueduct_gpu::Tier2CompareOp {
+    use aqueduct_gpu::Tier2CompareOp as T;
+    match o {
+        ash::vk::CompareOp::NEVER            => T::Never,
+        ash::vk::CompareOp::LESS             => T::Less,
+        ash::vk::CompareOp::EQUAL            => T::Equal,
+        ash::vk::CompareOp::LESS_OR_EQUAL    => T::LessOrEqual,
+        ash::vk::CompareOp::GREATER          => T::Greater,
+        ash::vk::CompareOp::NOT_EQUAL        => T::NotEqual,
+        ash::vk::CompareOp::GREATER_OR_EQUAL => T::GreaterOrEqual,
+        ash::vk::CompareOp::ALWAYS           => T::Always,
+        _                                    => T::Less,
     }
 }
 
@@ -3849,7 +3865,19 @@ pub unsafe extern "C" fn vkCmdSetDepthWriteEnable(
     let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::SetDepthWriteEnable, &body);
 }
 
-ext_state_stub_u32!(vkCmdSetDepthCompareOp);
+// Dynamic depth-compare op (`vkCmdSetDepthCompareOp`):
+// 4-byte u32 = `VkCompareOp`.  Walker translates against
+// Vulkan's encoding to `Tier2CompareOp` at draw time.
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdSetDepthCompareOp(
+    command_buffer: VkCommandBuffer,
+    op:             u32, /* VkCompareOp */
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    let body = op.to_le_bytes();
+    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::SetDepthCompareOp, &body);
+}
+
 ext_state_stub_u32!(vkCmdSetDepthBoundsTestEnable);
 ext_state_stub_u32!(vkCmdSetStencilTestEnable);
 ext_state_stub_u32!(vkCmdSetRasterizerDiscardEnable);
