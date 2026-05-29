@@ -193,6 +193,7 @@ GRAPHICS_DEPTH_BIAS="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graph
 GRAPHICS_RESTART="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_restart"
 GRAPHICS_MIPMAP="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_mipmap"
 GRAPHICS_ARRAY="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_array"
+GRAPHICS_CUBE="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_cube"
 DAEMON="$REPO_ROOT/aqueduct-gpu-host/target/debug/aqueduct-gpu-host"
 COMPILE="$REPO_ROOT/atrium-spv-compile/target/debug/atrium-spv-compile"
 SLANGC="$REPO_ROOT/external/slang-bin/bin/slangc"
@@ -1708,6 +1709,44 @@ if [ -x "$GRAPHICS_ARRAY" ]; then
 else
     echo
     echo "SKIP Rung GG: need 'cargo build -p atrium-vk-icd --example loader_graphics_array'"
+fi
+
+# ── Rung HH: cubemap sampling ────────────────────────────
+# loader_graphics_cube: 6-face cube texture (1x1 each,
+# distinct colour per face).  FS samples a samplerCube with
+# a constant direction (0,0,1) -> +Z = face 4 = magenta.
+# cranelift picks atrium_tex_sample_cube which does major-
+# axis face selection + sc/tc/ma projection and reads
+# `data + face * slice_bytes`.  pixel(4,4) = magenta.
+# Reuses Rung GG's layered-image plumbing with depth=6.
+if [ -x "$GRAPHICS_CUBE" ]; then
+    rm -f "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+        echo "daemon failed to start (cube round-trip); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung HH: samplerCube +Z face selection (magenta) ==="
+    if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+        VK_DRIVER_FILES="$MANIFEST" \
+        ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+        "$GRAPHICS_CUBE" 2>&1 | tail -2; then
+        echo "FAIL: cube round-trip did not return 0" >&2
+        exit 1
+    fi
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
+else
+    echo
+    echo "SKIP Rung HH: need 'cargo build -p atrium-vk-icd --example loader_graphics_cube'"
 fi
 
 echo
