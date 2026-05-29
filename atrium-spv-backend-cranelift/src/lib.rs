@@ -438,6 +438,27 @@ fn emit_function(
             }
         }
 
+        // Fragment Location-decorated Output variables (MRT):
+        // route each colour output to `params[8]` (out_color)
+        // + the per-Location byte offset the frontend assigned
+        // in Location order.  A single Location=0 output gets
+        // offset 0 -> identical to the legacy
+        // `(Fragment, Output) -> params[8]` rule, so single-
+        // attachment shaders are byte-for-byte unchanged.
+        // Multi-attachment shaders write Location=1 at
+        // params[8] + 16, Location=2 at +32, etc.; the daemon
+        // sizes the out_color scratch to cover every Location
+        // and scatters each 16-byte slot to its colour
+        // attachment.
+        if func.stage == ShaderStage::Fragment
+            && !func.output_varying_byte_offset.is_empty()
+        {
+            let out_color = translator.params[8];
+            for (&vid, &off) in &func.output_varying_byte_offset {
+                translator.pointers.insert(vid, (out_color, off as i32));
+            }
+        }
+
         // Location-decorated `Input`-storage vars: for VS,
         // route to params[0] = in_attributes; for FS,
         // route to params[0] = in_varyings.  Same shape as
