@@ -3245,17 +3245,28 @@ unsafe fn build_tier2_pipeline_blob(
             _                                     => Tier2FrontFace::CounterClockwise,
         };
         let rasterizer_discard = rs.rasterizer_discard_enable != 0;
+        let depth_bias_enable  = rs.depth_bias_enable != 0;
+        let depth_bias_constant_factor = rs.depth_bias_constant_factor;
+        let depth_bias_clamp           = rs.depth_bias_clamp;
+        let depth_bias_slope_factor    = rs.depth_bias_slope_factor;
         // Only ship a raster state if the app diverged from
-        // the defaults (NONE + CCW + discard=false) -- keeps
-        // the blob smaller and preserves blob-bytes for pre-
-        // existing rungs.
+        // the defaults (NONE + CCW + discard=false + bias
+        // disabled) -- keeps the blob smaller and preserves
+        // blob-bytes for pre-existing rungs.
         if matches!(cull_mode, Tier2CullMode::None)
             && matches!(front_face, Tier2FrontFace::CounterClockwise)
             && !rasterizer_discard
+            && !depth_bias_enable
         {
             None
         } else {
-            Some(Tier2RasterState { cull_mode, front_face, rasterizer_discard })
+            Some(Tier2RasterState {
+                cull_mode, front_face, rasterizer_discard,
+                depth_bias_enable,
+                depth_bias_constant_factor,
+                depth_bias_clamp,
+                depth_bias_slope_factor,
+            })
         }
     };
 
@@ -4010,7 +4021,16 @@ pub unsafe extern "C" fn vkCmdSetRasterizerDiscardEnable(
     let body = enable.to_le_bytes();
     let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::SetRasterizerDiscardEnable, &body);
 }
-ext_state_stub_u32!(vkCmdSetDepthBiasEnable);
+// Dynamic depth-bias toggle (`vkCmdSetDepthBiasEnable`).
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdSetDepthBiasEnable(
+    command_buffer: VkCommandBuffer,
+    enable:         u32, /* VkBool32 */
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    let body = enable.to_le_bytes();
+    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::SetDepthBiasEnable, &body);
+}
 ext_state_stub_u32!(vkCmdSetPrimitiveRestartEnable);
 
 // Dynamic stencil per-face state entries.  Each pushes a
@@ -5806,15 +5826,23 @@ pub unsafe extern "C" fn vkCmdSetLineWidth(
     _line_width:     f32,
 ) {}
 
-/// `vkCmdSetDepthBias` — dynamic state. No-op today; future
-/// pipeline-state extension lands when depth-bias mattered.
+/// `vkCmdSetDepthBias` -- 3 f32 args (constant factor,
+/// clamp, slope factor) pushed into the frame as a single
+/// 12-byte little-endian body.
 #[no_mangle]
 pub unsafe extern "C" fn vkCmdSetDepthBias(
-    _command_buffer: VkCommandBuffer,
-    _constant_factor: f32,
-    _clamp:           f32,
-    _slope_factor:    f32,
-) {}
+    command_buffer:  VkCommandBuffer,
+    constant_factor: f32,
+    clamp:           f32,
+    slope_factor:    f32,
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    let mut body = [0u8; 12];
+    body[0..4].copy_from_slice(&constant_factor.to_le_bytes());
+    body[4..8].copy_from_slice(&clamp.to_le_bytes());
+    body[8..12].copy_from_slice(&slope_factor.to_le_bytes());
+    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::SetDepthBias, &body);
+}
 
 /// `vkCmdSetBlendConstants` — dynamic state. No-op today.
 #[no_mangle]

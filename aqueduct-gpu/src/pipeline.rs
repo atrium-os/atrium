@@ -168,8 +168,10 @@ pub enum Tier2FrontFace {
 /// `VkPipelineRasterizationStateCreateInfo`.
 ///
 /// Honoured by `fill_image_triangle` to skip triangles whose
-/// post-viewport-mapping winding matches the active cull mode.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// post-viewport-mapping winding matches the active cull mode
+/// and to apply depth-bias polygon offsets.  `PartialEq` only
+/// (not `Eq`) because the depth-bias factors are `f32`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Tier2RasterState {
     /// Cull mode.
     pub cull_mode: Tier2CullMode,
@@ -182,6 +184,28 @@ pub struct Tier2RasterState {
     /// rasterizerDiscardEnable`.
     #[serde(default)]
     pub rasterizer_discard: bool,
+    /// Pipeline-static depth-bias enable.  When true, the
+    /// rasterizer adds
+    /// `constant_factor * r + slope_factor * m` (clamped to
+    /// `bias_clamp`) to each fragment's interpolated depth
+    /// before the depth compare / write.  `r` is the
+    /// implementation-defined minimum representable depth
+    /// difference; `m` is the maximum gradient
+    /// (|dz/dx|, |dz/dy|) across the triangle.
+    #[serde(default)]
+    pub depth_bias_enable: bool,
+    /// Constant depth-bias factor (Vulkan
+    /// `depthBiasConstantFactor`).
+    #[serde(default)]
+    pub depth_bias_constant_factor: f32,
+    /// Clamp on the total bias (Vulkan `depthBiasClamp`).
+    /// `0.0` disables the clamp.
+    #[serde(default)]
+    pub depth_bias_clamp: f32,
+    /// Slope-scaled bias factor (Vulkan
+    /// `depthBiasSlopeFactor`).
+    #[serde(default)]
+    pub depth_bias_slope_factor: f32,
 }
 
 /// Tier-2 primitive topology, mirror of

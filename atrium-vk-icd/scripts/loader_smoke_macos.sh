@@ -189,6 +189,7 @@ GRAPHICS_DISCARD="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics
 GRAPHICS_DEPTH_BOUNDS="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_depth_bounds"
 GRAPHICS_STENCIL="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_stencil"
 GRAPHICS_STENCIL_DYN="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_stencil_dynamic"
+GRAPHICS_DEPTH_BIAS="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_depth_bias"
 DAEMON="$REPO_ROOT/aqueduct-gpu-host/target/debug/aqueduct-gpu-host"
 COMPILE="$REPO_ROOT/atrium-spv-compile/target/debug/atrium-spv-compile"
 SLANGC="$REPO_ROOT/external/slang-bin/bin/slangc"
@@ -1546,6 +1547,45 @@ if [ -x "$GRAPHICS_STENCIL_DYN" ]; then
 else
     echo
     echo "SKIP Rung CC: need 'cargo build -p atrium-vk-icd --example loader_graphics_stencil_dynamic'"
+fi
+
+# ── Rung DD: depth bias (polygon offset) honoured ────────
+# loader_graphics_depth_bias: front triangle ndc.z=0.1 with
+# depthBiasEnable + constant_factor=4e6 (≈ 0.477 bias),
+# back triangle ndc.z=0.5 with no bias.  Drawn front-then-
+# back.  Without bias, front wins the LESS test (0.1<0.5)
+# and pixel stays green.  With bias honoured, front's
+# effective depth is ~0.58, back's 0.5 is less, back wins
+# and pixel turns red.  Pre-fix, pipeline depthBias* fields
+# weren't extracted and the rasterizer had no bias offset.
+if [ -x "$GRAPHICS_DEPTH_BIAS" ]; then
+    rm -f "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+        echo "daemon failed to start (depth_bias round-trip); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung DD: depth bias pushes front past back; back wins ==="
+    if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+        VK_DRIVER_FILES="$MANIFEST" \
+        ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+        "$GRAPHICS_DEPTH_BIAS" 2>&1 | tail -2; then
+        echo "FAIL: depth_bias round-trip did not return 0" >&2
+        exit 1
+    fi
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
+else
+    echo
+    echo "SKIP Rung DD: need 'cargo build -p atrium-vk-icd --example loader_graphics_depth_bias'"
 fi
 
 echo

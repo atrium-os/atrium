@@ -770,6 +770,8 @@ impl<'a> TinySkiaRenderer<'a> {
                 | FrameOp::SetStencilCompareMask
                 | FrameOp::SetStencilWriteMask
                 | FrameOp::SetStencilReference
+                | FrameOp::SetDepthBiasEnable
+                | FrameOp::SetDepthBias
                 | FrameOp::DrawIndexed
                 | FrameOp::DrawIndirect
                 | FrameOp::Dispatch

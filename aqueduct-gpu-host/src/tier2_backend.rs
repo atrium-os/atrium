@@ -318,6 +318,11 @@ struct PassState {
     /// per Vulkan's `VkStencilFaceFlags` semantics.
     stencil_front_override: StencilFaceOverride,
     stencil_back_override:  StencilFaceOverride,
+    /// Dynamic depth-bias toggle (`vkCmdSetDepthBiasEnable`).
+    depth_bias_enable_override: Option<bool>,
+    /// Dynamic depth-bias factors
+    /// (`vkCmdSetDepthBias`): (constant, clamp, slope).
+    depth_bias_override: Option<(f32, f32, f32)>,
     /// Latest push-constants block; tier-2 shaders consume it
     /// as their uniform area.
     push_constants: Vec<u8>,
@@ -375,6 +380,11 @@ struct PipelineRasterState {
     /// Pipeline-static `stencilTestEnable`.  The dynamic
     /// `vkCmdSetStencilTestEnable` overrides this.
     stencil_test_enable: bool,
+    /// Pipeline-static depth-bias.
+    depth_bias_enable: bool,
+    depth_bias_constant_factor: f32,
+    depth_bias_clamp: f32,
+    depth_bias_slope_factor: f32,
 }
 
 /// Partial per-face stencil override.  Each field comes from
@@ -762,7 +772,9 @@ impl Tier2Backend {
         stencil: Option<aqueduct_gpu::Tier2StencilState>,
     ) {
         let blend = blend.map(convert_blend_state).unwrap_or_default();
-        let (cull_mode, front_face, rasterizer_discard) = match raster {
+        let (cull_mode, front_face, rasterizer_discard,
+             depth_bias_enable, depth_bias_constant_factor,
+             depth_bias_clamp, depth_bias_slope_factor) = match raster {
             Some(r) => (
                 match r.cull_mode {
                     aqueduct_gpu::Tier2CullMode::None         => CullMode::None,
@@ -775,8 +787,13 @@ impl Tier2Backend {
                     aqueduct_gpu::Tier2FrontFace::Clockwise        => FrontFace::Clockwise,
                 },
                 r.rasterizer_discard,
+                r.depth_bias_enable,
+                r.depth_bias_constant_factor,
+                r.depth_bias_clamp,
+                r.depth_bias_slope_factor,
             ),
-            None => (CullMode::None, FrontFace::CounterClockwise, false),
+            None => (CullMode::None, FrontFace::CounterClockwise, false,
+                     false, 0.0, 0.0, 0.0),
         };
         let topology = match topology {
             aqueduct_gpu::Tier2PrimitiveTopology::TriangleList  => PrimitiveTopology::TriangleList,
@@ -804,6 +821,8 @@ impl Tier2Backend {
                 depth, blend, cull_mode, front_face, topology, rasterizer_discard,
                 stencil: stencil_state,
                 stencil_test_enable,
+                depth_bias_enable, depth_bias_constant_factor,
+                depth_bias_clamp,  depth_bias_slope_factor,
             },
         );
     }
@@ -1215,6 +1234,24 @@ impl Tier2Backend {
                         log::warn!("malformed SetStencilReference body length: {}", body.len());
                     }
                 }
+                FrameOp::SetDepthBiasEnable => {
+                    if body.len() == 4 {
+                        let v = u32::from_le_bytes(body.try_into().unwrap());
+                        state.depth_bias_enable_override = Some(v != 0);
+                    } else {
+                        log::warn!("malformed SetDepthBiasEnable body length: {}", body.len());
+                    }
+                }
+                FrameOp::SetDepthBias => {
+                    if body.len() == 12 {
+                        let c = f32::from_le_bytes(body[0..4].try_into().unwrap());
+                        let cl = f32::from_le_bytes(body[4..8].try_into().unwrap());
+                        let s = f32::from_le_bytes(body[8..12].try_into().unwrap());
+                        state.depth_bias_override = Some((c, cl, s));
+                    } else {
+                        log::warn!("malformed SetDepthBias body length: {}", body.len());
+                    }
+                }
                 FrameOp::SetPrimitiveTopology => {
                     if body.len() == 4 {
                         let v = u32::from_le_bytes(body.try_into().unwrap());
@@ -1536,6 +1573,19 @@ impl Tier2Backend {
         let depth_bounds = if bounds_enable {
             Some(state.bounds_range_override.unwrap_or(static_bounds_range))
         } else { None };
+        // Depth bias: enable + factors merge from static +
+        // dynamic.  An app can flip enable independently of
+        // setting factors and vice versa, so each is its own
+        // override.
+        let bias_enable = state.depth_bias_enable_override
+            .unwrap_or(raster.depth_bias_enable);
+        let depth_bias = if bias_enable {
+            Some(state.depth_bias_override.unwrap_or((
+                raster.depth_bias_constant_factor,
+                raster.depth_bias_clamp,
+                raster.depth_bias_slope_factor,
+            )))
+        } else { None };
 
         // Depth source priority:
         //   1) Persisted depth attachment (BindDepthAttachment)
@@ -1745,6 +1795,7 @@ impl Tier2Backend {
                 depth_compare_op: depth_cmp,
                 depth_bounds,
                 stencil: stencil_state,
+                depth_bias,
                 ..Default::default()
             };
             let db_ref: Option<&mut [f32]> = if !depth_enabled {
@@ -2726,6 +2777,19 @@ impl Tier2Backend {
         let depth_bounds = if bounds_enable {
             Some(state.bounds_range_override.unwrap_or(static_bounds_range))
         } else { None };
+        // Depth bias: enable + factors merge from static +
+        // dynamic.  An app can flip enable independently of
+        // setting factors and vice versa, so each is its own
+        // override.
+        let bias_enable = state.depth_bias_enable_override
+            .unwrap_or(raster.depth_bias_enable);
+        let depth_bias = if bias_enable {
+            Some(state.depth_bias_override.unwrap_or((
+                raster.depth_bias_constant_factor,
+                raster.depth_bias_clamp,
+                raster.depth_bias_slope_factor,
+            )))
+        } else { None };
         if depth_enabled && depth_buffer.is_none() {
             *depth_buffer = Some(vec![
                 f32::INFINITY;
@@ -2775,6 +2839,7 @@ impl Tier2Backend {
                 depth_compare_op: depth_cmp,
                 depth_bounds,
                 stencil: stencil_state,
+                depth_bias,
                 ..Default::default()
             };
             let db_ref = if depth_enabled {

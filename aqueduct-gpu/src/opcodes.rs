@@ -279,6 +279,13 @@ pub enum FrameOp {
     /// (`vkCmdSetStencilReference`).  Body: face_mask u32,
     /// value u32.
     SetStencilReference        = 0x0084,
+    /// Toggle the depth-bias path
+    /// (`vkCmdSetDepthBiasEnable`).  4-byte VkBool32.
+    SetDepthBiasEnable         = 0x0085,
+    /// Set the depth-bias values
+    /// (`vkCmdSetDepthBias`).  Body: 3 f32s -- constant
+    /// factor, clamp, slope factor.
+    SetDepthBias               = 0x0086,
 
     /// Non-indexed draw.
     Draw            = 0x0040,
@@ -333,6 +340,8 @@ impl FrameOp {
             0x0082 => FrameOp::SetStencilCompareMask,
             0x0083 => FrameOp::SetStencilWriteMask,
             0x0084 => FrameOp::SetStencilReference,
+            0x0085 => FrameOp::SetDepthBiasEnable,
+            0x0086 => FrameOp::SetDepthBias,
             0x0040 => FrameOp::Draw,
             0x0041 => FrameOp::DrawIndexed,
             0x0042 => FrameOp::DrawIndirect,
@@ -373,6 +382,7 @@ mod tests {
             FrameOp::SetStencilTestEnable, FrameOp::SetStencilOp,
             FrameOp::SetStencilCompareMask, FrameOp::SetStencilWriteMask,
             FrameOp::SetStencilReference,
+            FrameOp::SetDepthBiasEnable, FrameOp::SetDepthBias,
             FrameOp::Draw, FrameOp::DrawIndexed, FrameOp::DrawIndirect,
             FrameOp::Dispatch, FrameOp::DispatchIndirect,
             FrameOp::CopyBufToImg, FrameOp::CopyImgToBuf, FrameOp::Blit,

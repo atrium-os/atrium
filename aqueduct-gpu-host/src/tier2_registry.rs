@@ -609,6 +609,18 @@ impl Tier2Registry {
                 depth_compare_op: draw.depth_compare_op,
                 depth_bounds: draw.depth_bounds,
                 depth_min, depth_max,
+                depth_bias_offset: compute_depth_bias_offset(
+                    draw.depth_bias,
+                    // Triangle screen coords + per-vertex
+                    // windowed depths.
+                    &screen,
+                    &[
+                        depth_min + ndc[0][2] * (depth_max - depth_min),
+                        depth_min + ndc[1][2] * (depth_max - depth_min),
+                        depth_min + ndc[2][2] * (depth_max - depth_min),
+                    ],
+                    total_edge,
+                ),
                 stencil_face: draw.stencil.map(|s| {
                     // Triangle face = front when screen-space
                     // winding matches the active front_face
@@ -685,6 +697,49 @@ impl Tier2Registry {
     }
 }
 
+/// Compute the depth-bias offset for one triangle per
+/// Vulkan's "Depth Bias" rules:
+///
+///   o = constant * r + slope * m
+///   clamped:
+///     if clamp > 0:  o = min(o, clamp)
+///     if clamp < 0:  o = max(o, clamp)
+///     else:          unchanged
+///
+/// `r` is the minimum representable depth difference; for
+/// the f32 depth buffer tier-2 uses, 2^-23 (≈ 1.19e-7) is
+/// the spec-permitted choice (matches the mantissa-bit
+/// rule).  `m` is the largest of |dz/dx|, |dz/dy| in window
+/// space, computed analytically from the triangle's plane
+/// equation: with screen vertices (x_i, y_i) and depths
+/// z_i, the plane normal is the cross product of two
+/// triangle edges and the gradient is -n_xy / n_z, where
+/// n_z is `total_edge`.
+fn compute_depth_bias_offset(
+    bias: Option<(f32, f32, f32)>,
+    screen: &[(f32, f32); 3],
+    z: &[f32; 3],
+    total_edge: f32,
+) -> f32 {
+    let Some((c, clamp, slope)) = bias else { return 0.0 };
+    if total_edge == 0.0 { return 0.0; }
+    let (x0, y0) = screen[0];
+    let (x1, y1) = screen[1];
+    let (x2, y2) = screen[2];
+    // n_x / n_z and n_y / n_z give -dz_dx / -dz_dy (signs
+    // cancel in the magnitude below).
+    let n_x = (y1 - y0) * (z[2] - z[0]) - (z[1] - z[0]) * (y2 - y0);
+    let n_y = (z[1] - z[0]) * (x2 - x0) - (x1 - x0) * (z[2] - z[0]);
+    let dz_dx = -n_x / total_edge;
+    let dz_dy = -n_y / total_edge;
+    let m = dz_dx.abs().max(dz_dy.abs());
+    let r = (1.0f32 / (1u32 << 23) as f32) as f32;
+    let mut o = c * r + slope * m;
+    if clamp > 0.0 { o = o.min(clamp); }
+    else if clamp < 0.0 { o = o.max(clamp); }
+    o
+}
+
 /// Vulkan-spec depth compare.  Float NaN behaves correctly
 /// out of the box: every comparison with NaN is false, so
 /// NaN depths fail every test except `Always`.
@@ -758,6 +813,9 @@ struct TriangleSetup<'s> {
     /// `total_edge` sign + `draw.front_face`.  `None` means
     /// no stencil testing.
     stencil_face: Option<StencilFaceState>,
+    /// Precomputed depth-bias offset to add to the windowed
+    /// depth at each pixel.  `0.0` when no bias is active.
+    depth_bias_offset: f32,
     /// Viewport depth range (`vkCmdSetViewport`'s
     /// `min_depth` / `max_depth`).  Used to remap the
     /// interpolated NDC.z into windowed-depth space before
@@ -955,7 +1013,8 @@ fn rasterize_stripe(
                 // identity range (0, 1) preserves the
                 // pre-Rung-R behaviour.
                 let window_z = setup.depth_min
-                    + interp_z * (setup.depth_max - setup.depth_min);
+                    + interp_z * (setup.depth_max - setup.depth_min)
+                    + setup.depth_bias_offset;
 
                 // Stripe-local indexing.
                 let py_local = (py - stripe_pixel_y) as usize;
@@ -1285,6 +1344,16 @@ pub struct DrawTriangle<'a> {
     /// entirely (legacy behaviour for rungs that pre-date
     /// stencil support).
     pub stencil: Option<StencilState>,
+
+    /// When `Some((constant, clamp, slope))`, the rasterizer
+    /// applies a polygon-offset to the interpolated depth
+    /// before the depth test + write + FS frag_coord.z hand-
+    /// off.  Mirror of Vulkan's
+    /// `depthBiasConstantFactor` / `depthBiasClamp` /
+    /// `depthBiasSlopeFactor` triple.  Has no effect when no
+    /// depth attachment is bound or the bias triple
+    /// evaluates to zero.
+    pub depth_bias: Option<(f32, f32, f32)>,
 }
 
 /// Per-face stencil state passed to `fill_image_triangle`.
@@ -1362,6 +1431,7 @@ impl Default for DrawTriangle<'_> {
             depth_compare_op: CompareOp::default(),
             depth_bounds: None,
             stencil: None,
+            depth_bias: None,
         }
     }
 }
