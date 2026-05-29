@@ -3275,19 +3275,19 @@ unsafe fn build_tier2_pipeline_blob(
     };
 
     // Stencil-test state (also lives in
-    // VkPipelineDepthStencilStateCreateInfo).  We send it
-    // separately from `Tier2DepthState` so the depth path
-    // stays uncluttered and apps that use stencil without
-    // depth still round-trip cleanly.
+    // VkPipelineDepthStencilStateCreateInfo).  Sent
+    // unconditionally when a depth-stencil block is present
+    // so apps that pre-populate per-face ops but defer the
+    // `test_enable` flip to dynamic state
+    // (`vkCmdSetStencilTestEnable`) still ship the front /
+    // back state on the wire.
     let stencil = if info.p_depth_stencil_state.is_null() { None } else {
         let ds = &*info.p_depth_stencil_state;
-        if ds.stencil_test_enable != 0 {
-            Some(Tier2StencilState {
-                test_enable: true,
-                front: convert_vk_stencil_op_state(ds.front),
-                back:  convert_vk_stencil_op_state(ds.back),
-            })
-        } else { None }
+        Some(Tier2StencilState {
+            test_enable: ds.stencil_test_enable != 0,
+            front: convert_vk_stencil_op_state(ds.front),
+            back:  convert_vk_stencil_op_state(ds.back),
+        })
     };
 
     let blob = Tier2PipelineStateBlob {
@@ -3987,7 +3987,16 @@ pub unsafe extern "C" fn vkCmdSetDepthBounds(
     body[4..8].copy_from_slice(&max_depth.to_le_bytes());
     let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::SetDepthBounds, &body);
 }
-ext_state_stub_u32!(vkCmdSetStencilTestEnable);
+// Dynamic stencil-test toggle (`vkCmdSetStencilTestEnable`).
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdSetStencilTestEnable(
+    command_buffer: VkCommandBuffer,
+    enable:         u32, /* VkBool32 */
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    let body = enable.to_le_bytes();
+    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::SetStencilTestEnable, &body);
+}
 // Dynamic rasterizer-discard toggle
 // (`vkCmdSetRasterizerDiscardEnable`).  Takes a VkBool32;
 // the daemon walker stores `Option<bool>` and short-circuits
@@ -4004,48 +4013,70 @@ pub unsafe extern "C" fn vkCmdSetRasterizerDiscardEnable(
 ext_state_stub_u32!(vkCmdSetDepthBiasEnable);
 ext_state_stub_u32!(vkCmdSetPrimitiveRestartEnable);
 
-/// Arc 131: Vulkan 1.0 stencil dynamic-state entries
-/// (vkCmdSetStencilCompareMask / WriteMask / Reference).
-/// Each takes (cmdbuf, faceMask: VkStencilFaceFlags, value:
-/// u32) and updates the bound pipeline's per-face stencil
-/// state.  Tier-1 doesn't render stencil today, but apps
-/// that use stencil effects (outlines, portals, deferred
-/// shadow volumes) call these unconditionally and would
-/// hit a null function pointer through the loader if we
-/// didn't expose them.  No-op stubs match the rest of the
-/// dynamic-state surface.
+// Dynamic stencil per-face state entries.  Each pushes a
+// (face_mask, payload) tuple; the daemon walker keys the
+// override on face_mask's FRONT (bit 0) / BACK (bit 1)
+// flags so FRONT_AND_BACK applies to both.
+
 #[no_mangle]
 pub unsafe extern "C" fn vkCmdSetStencilCompareMask(
-    _command_buffer: VkCommandBuffer,
-    _face_mask:      u32,
-    _compare_mask:   u32,
-) {}
+    command_buffer: VkCommandBuffer,
+    face_mask:      u32, /* VkStencilFaceFlags */
+    compare_mask:   u32,
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    let mut body = [0u8; 8];
+    body[0..4].copy_from_slice(&face_mask.to_le_bytes());
+    body[4..8].copy_from_slice(&compare_mask.to_le_bytes());
+    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::SetStencilCompareMask, &body);
+}
 
 #[no_mangle]
 pub unsafe extern "C" fn vkCmdSetStencilWriteMask(
-    _command_buffer: VkCommandBuffer,
-    _face_mask:      u32,
-    _write_mask:     u32,
-) {}
+    command_buffer: VkCommandBuffer,
+    face_mask:      u32,
+    write_mask:     u32,
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    let mut body = [0u8; 8];
+    body[0..4].copy_from_slice(&face_mask.to_le_bytes());
+    body[4..8].copy_from_slice(&write_mask.to_le_bytes());
+    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::SetStencilWriteMask, &body);
+}
 
 #[no_mangle]
 pub unsafe extern "C" fn vkCmdSetStencilReference(
-    _command_buffer: VkCommandBuffer,
-    _face_mask:      u32,
-    _reference:      u32,
-) {}
+    command_buffer: VkCommandBuffer,
+    face_mask:      u32,
+    reference:      u32,
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    let mut body = [0u8; 8];
+    body[0..4].copy_from_slice(&face_mask.to_le_bytes());
+    body[4..8].copy_from_slice(&reference.to_le_bytes());
+    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::SetStencilReference, &body);
+}
 
-/// `vkCmdSetStencilOp` — face_mask + failOp/passOp/depthFailOp/compareOp,
-/// 5 u32 args. No-op stub.
+/// `vkCmdSetStencilOp` — face_mask + failOp/passOp/depthFailOp/compareOp.
+/// Body: face_mask, fail_op, pass_op, depth_fail_op, compare_op (5 u32s).
 #[no_mangle]
 pub unsafe extern "C" fn vkCmdSetStencilOp(
-    _command_buffer:    VkCommandBuffer,
-    _face_mask:         u32,
-    _fail_op:           u32,
-    _pass_op:           u32,
-    _depth_fail_op:     u32,
-    _compare_op:        u32,
-) {}
+    command_buffer: VkCommandBuffer,
+    face_mask:      u32,
+    fail_op:        u32,
+    pass_op:        u32,
+    depth_fail_op:  u32,
+    compare_op:     u32,
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    let mut body = [0u8; 20];
+    body[ 0.. 4].copy_from_slice(&face_mask.to_le_bytes());
+    body[ 4.. 8].copy_from_slice(&fail_op.to_le_bytes());
+    body[ 8..12].copy_from_slice(&pass_op.to_le_bytes());
+    body[12..16].copy_from_slice(&depth_fail_op.to_le_bytes());
+    body[16..20].copy_from_slice(&compare_op.to_le_bytes());
+    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::SetStencilOp, &body);
+}
 
 /// `vkCmdPushConstants` — record push-constant bytes.
 ///

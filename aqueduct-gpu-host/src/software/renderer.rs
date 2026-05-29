@@ -765,6 +765,11 @@ impl<'a> TinySkiaRenderer<'a> {
                 | FrameOp::SetRasterizerDiscardEnable
                 | FrameOp::SetDepthBoundsTestEnable
                 | FrameOp::SetDepthBounds
+                | FrameOp::SetStencilTestEnable
+                | FrameOp::SetStencilOp
+                | FrameOp::SetStencilCompareMask
+                | FrameOp::SetStencilWriteMask
+                | FrameOp::SetStencilReference
                 | FrameOp::DrawIndexed
                 | FrameOp::DrawIndirect
                 | FrameOp::Dispatch

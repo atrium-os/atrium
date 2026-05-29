@@ -308,6 +308,16 @@ struct PassState {
     /// `(min, max)`.  Takes precedence over the pipeline-
     /// static `min_depth_bounds` / `max_depth_bounds`.
     bounds_range_override: Option<(f32, f32)>,
+    /// Dynamic stencil-test toggle
+    /// (`vkCmdSetStencilTestEnable`).
+    stencil_test_enable_override: Option<bool>,
+    /// Dynamic per-face stencil overrides applied on top of
+    /// the pipeline-static `Tier2StencilState`.  Each field
+    /// is `None` ⇒ defer to the pipeline; `Some` ⇒ takes
+    /// precedence.  Front and back are tracked independently
+    /// per Vulkan's `VkStencilFaceFlags` semantics.
+    stencil_front_override: StencilFaceOverride,
+    stencil_back_override:  StencilFaceOverride,
     /// Latest push-constants block; tier-2 shaders consume it
     /// as their uniform area.
     push_constants: Vec<u8>,
@@ -353,10 +363,52 @@ struct PipelineRasterState {
     /// assembly unless the cmdbuf re-enabled the rasterizer
     /// dynamically.
     rasterizer_discard: bool,
-    /// Pipeline-static stencil state, already converted to
-    /// the daemon's `StencilState` shape.  `None` ⇒ stencil
-    /// test disabled at pipeline-create time.
+    /// Pipeline-static stencil per-face state, already
+    /// converted to the daemon's `StencilState` shape.
+    /// `None` ⇒ the pipeline omitted the depth-stencil
+    /// block entirely; a dynamic `vkCmdSetStencilTestEnable`
+    /// can't conjure ops out of nothing, so the test stays
+    /// off.  Stored independently of `stencil_test_enable`
+    /// because apps commonly bake the ops + masks into the
+    /// pipeline and toggle the enable dynamically.
     stencil: Option<StencilState>,
+    /// Pipeline-static `stencilTestEnable`.  The dynamic
+    /// `vkCmdSetStencilTestEnable` overrides this.
+    stencil_test_enable: bool,
+}
+
+/// Partial per-face stencil override.  Each field comes from
+/// a different dynamic-state setter (`vkCmdSetStencilOp` /
+/// `vkCmdSetStencilCompareMask` / `vkCmdSetStencilWriteMask`
+/// / `vkCmdSetStencilReference`) and can be set independently;
+/// any `None` falls back to the pipeline-static value.
+#[derive(Debug, Clone, Copy, Default)]
+struct StencilFaceOverride {
+    /// `vkCmdSetStencilOp`: (fail, pass, depth_fail, compare).
+    ops: Option<(StencilOp, StencilOp, StencilOp, CompareOp)>,
+    /// `vkCmdSetStencilCompareMask`.
+    compare_mask: Option<u8>,
+    /// `vkCmdSetStencilWriteMask`.
+    write_mask: Option<u8>,
+    /// `vkCmdSetStencilReference`.
+    reference: Option<u8>,
+}
+
+impl StencilFaceOverride {
+    /// Merge this partial override on top of a pipeline-static
+    /// face state, producing the effective per-draw face state.
+    fn apply(&self, base: StencilFaceState) -> StencilFaceState {
+        let (fail_op, pass_op, depth_fail_op, compare_op) =
+            self.ops.unwrap_or((
+                base.fail_op, base.pass_op, base.depth_fail_op, base.compare_op,
+            ));
+        StencilFaceState {
+            fail_op, pass_op, depth_fail_op, compare_op,
+            compare_mask: self.compare_mask.unwrap_or(base.compare_mask),
+            write_mask:   self.write_mask.unwrap_or(base.write_mask),
+            reference:    self.reference.unwrap_or(base.reference),
+        }
+    }
 }
 
 /// Daemon-local primitive topology.  Only the two triangle
@@ -732,21 +784,26 @@ impl Tier2Backend {
             aqueduct_gpu::Tier2PrimitiveTopology::Other         => PrimitiveTopology::Other,
         };
         // Stencil conversion from wire to daemon-local types.
-        // The test_enable flag gates: a None outcome here
-        // means "test disabled" regardless of front/back
-        // contents.
-        let stencil = stencil.and_then(|s| {
-            if !s.test_enable { return None; }
-            Some(StencilState {
-                front: convert_stencil_face(s.front),
-                back:  convert_stencil_face(s.back),
-            })
-        });
+        // We always store the front/back state when the
+        // pipeline supplied them, even if test_enable=false
+        // -- a dynamic `vkCmdSetStencilTestEnable(true)` then
+        // turns the test on without re-binding a pipeline.
+        let (stencil_state, stencil_test_enable) = match stencil {
+            Some(s) => (
+                Some(StencilState {
+                    front: convert_stencil_face(s.front),
+                    back:  convert_stencil_face(s.back),
+                }),
+                s.test_enable,
+            ),
+            None => (None, false),
+        };
         self.pipeline_raster.lock().unwrap().insert(
             pipeline_id.raw(),
             PipelineRasterState {
                 depth, blend, cull_mode, front_face, topology, rasterizer_discard,
-                stencil,
+                stencil: stencil_state,
+                stencil_test_enable,
             },
         );
     }
@@ -1102,6 +1159,62 @@ impl Tier2Backend {
                         log::warn!("malformed SetDepthBounds body length: {}", body.len());
                     }
                 }
+                FrameOp::SetStencilTestEnable => {
+                    if body.len() == 4 {
+                        let v = u32::from_le_bytes(body.try_into().unwrap());
+                        state.stencil_test_enable_override = Some(v != 0);
+                    } else {
+                        log::warn!("malformed SetStencilTestEnable body length: {}", body.len());
+                    }
+                }
+                FrameOp::SetStencilOp => {
+                    if body.len() == 20 {
+                        let face_mask = u32::from_le_bytes(body[ 0.. 4].try_into().unwrap());
+                        let fail_op   = decode_stencil_op(
+                            u32::from_le_bytes(body[ 4.. 8].try_into().unwrap()));
+                        let pass_op   = decode_stencil_op(
+                            u32::from_le_bytes(body[ 8..12].try_into().unwrap()));
+                        let depth_fail_op = decode_stencil_op(
+                            u32::from_le_bytes(body[12..16].try_into().unwrap()));
+                        let compare_op = decode_compare_op(
+                            u32::from_le_bytes(body[16..20].try_into().unwrap()));
+                        let payload = (fail_op, pass_op, depth_fail_op, compare_op);
+                        if face_mask & 0x1 != 0 { state.stencil_front_override.ops = Some(payload); }
+                        if face_mask & 0x2 != 0 { state.stencil_back_override.ops  = Some(payload); }
+                    } else {
+                        log::warn!("malformed SetStencilOp body length: {}", body.len());
+                    }
+                }
+                FrameOp::SetStencilCompareMask => {
+                    if body.len() == 8 {
+                        let face_mask = u32::from_le_bytes(body[0..4].try_into().unwrap());
+                        let value     = u32::from_le_bytes(body[4..8].try_into().unwrap()) as u8;
+                        if face_mask & 0x1 != 0 { state.stencil_front_override.compare_mask = Some(value); }
+                        if face_mask & 0x2 != 0 { state.stencil_back_override.compare_mask  = Some(value); }
+                    } else {
+                        log::warn!("malformed SetStencilCompareMask body length: {}", body.len());
+                    }
+                }
+                FrameOp::SetStencilWriteMask => {
+                    if body.len() == 8 {
+                        let face_mask = u32::from_le_bytes(body[0..4].try_into().unwrap());
+                        let value     = u32::from_le_bytes(body[4..8].try_into().unwrap()) as u8;
+                        if face_mask & 0x1 != 0 { state.stencil_front_override.write_mask = Some(value); }
+                        if face_mask & 0x2 != 0 { state.stencil_back_override.write_mask  = Some(value); }
+                    } else {
+                        log::warn!("malformed SetStencilWriteMask body length: {}", body.len());
+                    }
+                }
+                FrameOp::SetStencilReference => {
+                    if body.len() == 8 {
+                        let face_mask = u32::from_le_bytes(body[0..4].try_into().unwrap());
+                        let value     = u32::from_le_bytes(body[4..8].try_into().unwrap()) as u8;
+                        if face_mask & 0x1 != 0 { state.stencil_front_override.reference = Some(value); }
+                        if face_mask & 0x2 != 0 { state.stencil_back_override.reference  = Some(value); }
+                    } else {
+                        log::warn!("malformed SetStencilReference body length: {}", body.len());
+                    }
+                }
                 FrameOp::SetPrimitiveTopology => {
                     if body.len() == 4 {
                         let v = u32::from_le_bytes(body.try_into().unwrap());
@@ -1445,14 +1558,20 @@ impl Tier2Backend {
             ]);
         }
 
-        // Per-pass stencil scratch.  No persistent stencil
-        // attachment in v1 -- lazy-allocated zeros on the
-        // first stencil-using draw and reused across draws
-        // within the same render pass.  D.6.b adds attachment-
-        // backed stencil when the depth attachment carries
-        // a stencil aspect.
-        let stencil_state = state.raster
-            .and_then(|r| r.stencil);
+        // Effective stencil state for this draw.  Merges:
+        //   - pipeline-static front/back face data
+        //   - pipeline-static `stencil_test_enable`
+        //   - dynamic `vkCmdSetStencilTestEnable` override
+        //   - dynamic per-field per-face overrides
+        //     (`vkCmdSetStencilOp` /
+        //     `vkCmdSetStencilCompareMask` /
+        //     `vkCmdSetStencilWriteMask` /
+        //     `vkCmdSetStencilReference`)
+        //
+        // No persistent stencil attachment in v1; the per-
+        // pass scratch is lazy-allocated to zeros on the
+        // first stencil-using draw and reused across draws.
+        let stencil_state = compute_effective_stencil(state);
         if stencil_state.is_some() && stencil_buffer.is_none() {
             *stencil_buffer = Some(vec![
                 0u8;
@@ -2954,6 +3073,76 @@ impl Backend for Tier2Backend {
         compute_state: Tier2ComputeStateBlob,
     ) {
         self.bind_compute_pipeline(pipeline_id, tier2_shader_id, compute_state);
+    }
+}
+
+/// Merge the pipeline-static stencil state with the per-
+/// cmdbuf dynamic overrides (test enable + per-face ops /
+/// masks / reference) and return the effective per-draw
+/// stencil state.  `None` ⇒ no stencil test runs at all
+/// (either the pipeline omitted the depth-stencil block AND
+/// the cmdbuf didn't ask for stencil, or the dynamic
+/// override explicitly disabled the test).
+fn compute_effective_stencil(state: &PassState) -> Option<StencilState> {
+    let raster   = state.raster?;
+    let test_on  = state.stencil_test_enable_override
+        .unwrap_or(raster.stencil_test_enable);
+    if !test_on { return None; }
+    // Default face state when the pipeline didn't supply
+    // one but the dynamic override turned the test on.
+    let base = raster.stencil.unwrap_or(StencilState {
+        front: StencilFaceState {
+            fail_op: StencilOp::Keep,
+            pass_op: StencilOp::Keep,
+            depth_fail_op: StencilOp::Keep,
+            compare_op: CompareOp::Always,
+            compare_mask: 0xff,
+            write_mask:   0xff,
+            reference:    0,
+        },
+        back: StencilFaceState {
+            fail_op: StencilOp::Keep,
+            pass_op: StencilOp::Keep,
+            depth_fail_op: StencilOp::Keep,
+            compare_op: CompareOp::Always,
+            compare_mask: 0xff,
+            write_mask:   0xff,
+            reference:    0,
+        },
+    });
+    Some(StencilState {
+        front: state.stencil_front_override.apply(base.front),
+        back:  state.stencil_back_override.apply(base.back),
+    })
+}
+
+/// VkStencilOp wire value -> daemon-local StencilOp.
+fn decode_stencil_op(v: u32) -> StencilOp {
+    match v {
+        0 => StencilOp::Keep,
+        1 => StencilOp::Zero,
+        2 => StencilOp::Replace,
+        3 => StencilOp::IncrementAndClamp,
+        4 => StencilOp::DecrementAndClamp,
+        5 => StencilOp::Invert,
+        6 => StencilOp::IncrementAndWrap,
+        7 => StencilOp::DecrementAndWrap,
+        _ => StencilOp::Keep,
+    }
+}
+
+/// VkCompareOp wire value -> daemon-local CompareOp.
+fn decode_compare_op(v: u32) -> CompareOp {
+    match v {
+        0 => CompareOp::Never,
+        1 => CompareOp::Less,
+        2 => CompareOp::Equal,
+        3 => CompareOp::LessOrEqual,
+        4 => CompareOp::Greater,
+        5 => CompareOp::NotEqual,
+        6 => CompareOp::GreaterOrEqual,
+        7 => CompareOp::Always,
+        _ => CompareOp::Less,
     }
 }
 

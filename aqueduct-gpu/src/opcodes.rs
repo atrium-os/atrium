@@ -260,6 +260,25 @@ pub enum FrameOp {
     /// Set the depth-bounds range
     /// (`vkCmdSetDepthBounds`). Body is two f32s.
     SetDepthBounds             = 0x003B,
+    /// Toggle the stencil test (`vkCmdSetStencilTestEnable`).
+    /// 4-byte body = VkBool32.
+    SetStencilTestEnable       = 0x0080,
+    /// Set per-face stencil ops + compare
+    /// (`vkCmdSetStencilOp`).  Body: face_mask u32, fail_op
+    /// u32, pass_op u32, depth_fail_op u32, compare_op u32.
+    SetStencilOp               = 0x0081,
+    /// Set per-face stencil compare mask
+    /// (`vkCmdSetStencilCompareMask`).  Body: face_mask u32,
+    /// value u32.
+    SetStencilCompareMask      = 0x0082,
+    /// Set per-face stencil write mask
+    /// (`vkCmdSetStencilWriteMask`).  Body: face_mask u32,
+    /// value u32.
+    SetStencilWriteMask        = 0x0083,
+    /// Set per-face stencil reference value
+    /// (`vkCmdSetStencilReference`).  Body: face_mask u32,
+    /// value u32.
+    SetStencilReference        = 0x0084,
 
     /// Non-indexed draw.
     Draw            = 0x0040,
@@ -309,6 +328,11 @@ impl FrameOp {
             0x0039 => FrameOp::SetRasterizerDiscardEnable,
             0x003A => FrameOp::SetDepthBoundsTestEnable,
             0x003B => FrameOp::SetDepthBounds,
+            0x0080 => FrameOp::SetStencilTestEnable,
+            0x0081 => FrameOp::SetStencilOp,
+            0x0082 => FrameOp::SetStencilCompareMask,
+            0x0083 => FrameOp::SetStencilWriteMask,
+            0x0084 => FrameOp::SetStencilReference,
             0x0040 => FrameOp::Draw,
             0x0041 => FrameOp::DrawIndexed,
             0x0042 => FrameOp::DrawIndirect,
@@ -346,6 +370,9 @@ mod tests {
             FrameOp::SetDepthCompareOp, FrameOp::SetPrimitiveTopology,
             FrameOp::SetRasterizerDiscardEnable,
             FrameOp::SetDepthBoundsTestEnable, FrameOp::SetDepthBounds,
+            FrameOp::SetStencilTestEnable, FrameOp::SetStencilOp,
+            FrameOp::SetStencilCompareMask, FrameOp::SetStencilWriteMask,
+            FrameOp::SetStencilReference,
             FrameOp::Draw, FrameOp::DrawIndexed, FrameOp::DrawIndirect,
             FrameOp::Dispatch, FrameOp::DispatchIndirect,
             FrameOp::CopyBufToImg, FrameOp::CopyImgToBuf, FrameOp::Blit,

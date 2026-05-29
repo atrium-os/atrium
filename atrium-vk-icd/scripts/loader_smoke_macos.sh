@@ -188,6 +188,7 @@ GRAPHICS_STRIP="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_s
 GRAPHICS_DISCARD="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_discard"
 GRAPHICS_DEPTH_BOUNDS="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_depth_bounds"
 GRAPHICS_STENCIL="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_stencil"
+GRAPHICS_STENCIL_DYN="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_stencil_dynamic"
 DAEMON="$REPO_ROOT/aqueduct-gpu-host/target/debug/aqueduct-gpu-host"
 COMPILE="$REPO_ROOT/atrium-spv-compile/target/debug/atrium-spv-compile"
 SLANGC="$REPO_ROOT/external/slang-bin/bin/slangc"
@@ -1504,6 +1505,47 @@ if [ -x "$GRAPHICS_STENCIL" ]; then
 else
     echo
     echo "SKIP Rung BB: need 'cargo build -p atrium-vk-icd --example loader_graphics_stencil'"
+fi
+
+# ── Rung CC: dynamic stencil state (5 setters) ───────────
+# loader_graphics_stencil_dynamic: same two-pass mask as
+# Rung BB but pipelines declare stencilTestEnable=false +
+# all-default face state.  Every effective stencil field
+# is driven by vkCmdSetStencilTestEnable +
+# vkCmdSetStencilOp(FRONT_AND_BACK, ...) +
+# vkCmdSetStencilCompareMask/WriteMask/Reference.  Final
+# pixels match Rung BB: pixel(3,3) blue inside mask,
+# pixel(0,0) clear-black outside.  Pre-fix, all five entry
+# points were stubs / no-op u32 takers; pipeline-disabled
+# stencil leaked and pass-2 blue painted everything.
+if [ -x "$GRAPHICS_STENCIL_DYN" ]; then
+    rm -f "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+        echo "daemon failed to start (dynamic stencil round-trip); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung CC: dynamic stencil setters drive the mask ==="
+    if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+        VK_DRIVER_FILES="$MANIFEST" \
+        ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+        "$GRAPHICS_STENCIL_DYN" 2>&1 | tail -3; then
+        echo "FAIL: dynamic stencil round-trip did not return 0" >&2
+        exit 1
+    fi
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
+else
+    echo
+    echo "SKIP Rung CC: need 'cargo build -p atrium-vk-icd --example loader_graphics_stencil_dynamic'"
 fi
 
 echo
