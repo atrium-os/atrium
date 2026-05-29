@@ -3270,20 +3270,22 @@ unsafe fn build_tier2_pipeline_blob(
         }
     };
 
-    // Input-assembly: primitive topology.  Anything that's
-    // not TRIANGLE_STRIP falls through to TriangleList for
-    // now (PointList / LineList / fans / adjacency / patches
-    // need a separate rasterizer arc).
-    let topology = if info.p_input_assembly_state.is_null() {
-        Tier2PrimitiveTopology::TriangleList
-    } else {
-        let ia = &*info.p_input_assembly_state;
-        match ia.topology {
-            ash::vk::PrimitiveTopology::TRIANGLE_LIST  => Tier2PrimitiveTopology::TriangleList,
-            ash::vk::PrimitiveTopology::TRIANGLE_STRIP => Tier2PrimitiveTopology::TriangleStrip,
-            _                                          => Tier2PrimitiveTopology::Other,
-        }
-    };
+    // Input-assembly: primitive topology + restart flag.
+    // Anything that's not TRIANGLE_STRIP falls through to
+    // TriangleList for now (PointList / LineList / fans /
+    // adjacency / patches need a separate rasterizer arc).
+    let (topology, primitive_restart_enable) =
+        if info.p_input_assembly_state.is_null() {
+            (Tier2PrimitiveTopology::TriangleList, false)
+        } else {
+            let ia = &*info.p_input_assembly_state;
+            let t = match ia.topology {
+                ash::vk::PrimitiveTopology::TRIANGLE_LIST  => Tier2PrimitiveTopology::TriangleList,
+                ash::vk::PrimitiveTopology::TRIANGLE_STRIP => Tier2PrimitiveTopology::TriangleStrip,
+                _                                          => Tier2PrimitiveTopology::Other,
+            };
+            (t, ia.primitive_restart_enable != 0)
+        };
 
     // Stencil-test state (also lives in
     // VkPipelineDepthStencilStateCreateInfo).  Sent
@@ -3303,7 +3305,7 @@ unsafe fn build_tier2_pipeline_blob(
 
     let blob = Tier2PipelineStateBlob {
         vertex_input, depth, blend, raster,
-        topology, stencil,
+        topology, primitive_restart_enable, stencil,
         vs_varying_bytes,
     };
     let bytes = postcard::to_allocvec(&blob).ok()?;
@@ -4031,7 +4033,17 @@ pub unsafe extern "C" fn vkCmdSetDepthBiasEnable(
     let body = enable.to_le_bytes();
     let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::SetDepthBiasEnable, &body);
 }
-ext_state_stub_u32!(vkCmdSetPrimitiveRestartEnable);
+// Dynamic primitive-restart toggle
+// (`vkCmdSetPrimitiveRestartEnable`).  4-byte VkBool32.
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdSetPrimitiveRestartEnable(
+    command_buffer: VkCommandBuffer,
+    enable:         u32,
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    let body = enable.to_le_bytes();
+    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::SetPrimitiveRestartEnable, &body);
+}
 
 // Dynamic stencil per-face state entries.  Each pushes a
 // (face_mask, payload) tuple; the daemon walker keys the

@@ -772,6 +772,7 @@ impl<'a> TinySkiaRenderer<'a> {
                 | FrameOp::SetStencilReference
                 | FrameOp::SetDepthBiasEnable
                 | FrameOp::SetDepthBias
+                | FrameOp::SetPrimitiveRestartEnable
                 | FrameOp::DrawIndexed
                 | FrameOp::DrawIndirect
                 | FrameOp::Dispatch

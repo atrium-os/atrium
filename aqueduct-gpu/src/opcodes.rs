@@ -286,6 +286,9 @@ pub enum FrameOp {
     /// (`vkCmdSetDepthBias`).  Body: 3 f32s -- constant
     /// factor, clamp, slope factor.
     SetDepthBias               = 0x0086,
+    /// Toggle the primitive-restart path
+    /// (`vkCmdSetPrimitiveRestartEnable`).  4-byte VkBool32.
+    SetPrimitiveRestartEnable  = 0x0087,
 
     /// Non-indexed draw.
     Draw            = 0x0040,
@@ -342,6 +345,7 @@ impl FrameOp {
             0x0084 => FrameOp::SetStencilReference,
             0x0085 => FrameOp::SetDepthBiasEnable,
             0x0086 => FrameOp::SetDepthBias,
+            0x0087 => FrameOp::SetPrimitiveRestartEnable,
             0x0040 => FrameOp::Draw,
             0x0041 => FrameOp::DrawIndexed,
             0x0042 => FrameOp::DrawIndirect,
@@ -383,6 +387,7 @@ mod tests {
             FrameOp::SetStencilCompareMask, FrameOp::SetStencilWriteMask,
             FrameOp::SetStencilReference,
             FrameOp::SetDepthBiasEnable, FrameOp::SetDepthBias,
+            FrameOp::SetPrimitiveRestartEnable,
             FrameOp::Draw, FrameOp::DrawIndexed, FrameOp::DrawIndirect,
             FrameOp::Dispatch, FrameOp::DispatchIndirect,
             FrameOp::CopyBufToImg, FrameOp::CopyImgToBuf, FrameOp::Blit,

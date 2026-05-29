@@ -246,6 +246,7 @@ pub trait Backend: Send + Sync {
         _raster: Option<aqueduct_gpu::Tier2RasterState>,
         _topology: aqueduct_gpu::Tier2PrimitiveTopology,
         _stencil: Option<aqueduct_gpu::Tier2StencilState>,
+        _primitive_restart_enable: bool,
     ) {}
 
     /// Record how many bytes the VS writes through

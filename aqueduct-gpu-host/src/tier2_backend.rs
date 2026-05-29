@@ -323,6 +323,9 @@ struct PassState {
     /// Dynamic depth-bias factors
     /// (`vkCmdSetDepthBias`): (constant, clamp, slope).
     depth_bias_override: Option<(f32, f32, f32)>,
+    /// Dynamic primitive-restart toggle
+    /// (`vkCmdSetPrimitiveRestartEnable`).
+    primitive_restart_enable_override: Option<bool>,
     /// Latest push-constants block; tier-2 shaders consume it
     /// as their uniform area.
     push_constants: Vec<u8>,
@@ -385,6 +388,10 @@ struct PipelineRasterState {
     depth_bias_constant_factor: f32,
     depth_bias_clamp: f32,
     depth_bias_slope_factor: f32,
+    /// Pipeline-static `primitiveRestartEnable` from
+    /// `VkPipelineInputAssemblyStateCreateInfo`.  Honoured
+    /// only with TriangleStrip topology in v1.
+    primitive_restart_enable: bool,
 }
 
 /// Partial per-face stencil override.  Each field comes from
@@ -770,6 +777,7 @@ impl Tier2Backend {
         raster: Option<aqueduct_gpu::Tier2RasterState>,
         topology: aqueduct_gpu::Tier2PrimitiveTopology,
         stencil: Option<aqueduct_gpu::Tier2StencilState>,
+        primitive_restart_enable: bool,
     ) {
         let blend = blend.map(convert_blend_state).unwrap_or_default();
         let (cull_mode, front_face, rasterizer_discard,
@@ -823,6 +831,7 @@ impl Tier2Backend {
                 stencil_test_enable,
                 depth_bias_enable, depth_bias_constant_factor,
                 depth_bias_clamp,  depth_bias_slope_factor,
+                primitive_restart_enable,
             },
         );
     }
@@ -1250,6 +1259,14 @@ impl Tier2Backend {
                         state.depth_bias_override = Some((c, cl, s));
                     } else {
                         log::warn!("malformed SetDepthBias body length: {}", body.len());
+                    }
+                }
+                FrameOp::SetPrimitiveRestartEnable => {
+                    if body.len() == 4 {
+                        let v = u32::from_le_bytes(body.try_into().unwrap());
+                        state.primitive_restart_enable_override = Some(v != 0);
+                    } else {
+                        log::warn!("malformed SetPrimitiveRestartEnable body length: {}", body.len());
                     }
                 }
                 FrameOp::SetPrimitiveTopology => {
@@ -1923,12 +1940,22 @@ impl Tier2Backend {
     /// (offset + first_index * index_size), apply
     /// `vertex_offset` (signed add, saturating clamped), and
     /// return the resolved per-output-slot vertex indices.
+    /// Read indices out of the bound index buffer + apply
+    /// `vertex_offset`.  When `restart_enable` is true, the
+    /// type-max sentinel (`0xFFFF` for u16, `0xFFFFFFFF`
+    /// for u32) is preserved as `u32::MAX` -- without the
+    /// vertex_offset addition -- so the caller can split
+    /// the resulting strip into segments.  Pre-condition:
+    /// apps that enable primitive restart must not use
+    /// the type-max as a "real" vertex index (matches
+    /// Vulkan's spec).
     fn gather_indices(
         &self,
         bound: &BoundIndexBuffer,
         first_index: u32,
         count: u32,
         vertex_offset: i32,
+        restart_enable: bool,
     ) -> Result<Vec<u32>, String> {
         let buffers = self.buffers.lock().unwrap();
         let src = buffers.get(&bound.buffer_raw)
@@ -1947,6 +1974,11 @@ impl Tier2Backend {
                 "index buffer read {base}..{end} exceeds buffer size {}",
                 src.bytes.len()));
         }
+        // Per-type restart sentinel value in the buffer.
+        let restart_sentinel: u32 = match bound.index_type {
+            IndexType::Uint16 => 0xFFFF,
+            IndexType::Uint32 => 0xFFFF_FFFF,
+        };
         let mut out = Vec::with_capacity(count as usize);
         for i in 0..count as usize {
             let off = base + i * elem_size;
@@ -1956,6 +1988,13 @@ impl Tier2Backend {
                 IndexType::Uint32 => u32::from_le_bytes(
                     src.bytes[off..off+4].try_into().unwrap()),
             };
+            // Primitive-restart: the type-max sentinel
+            // bypasses vertex_offset and is preserved as
+            // u32::MAX so the dispatcher can split strips.
+            if restart_enable && idx_raw == restart_sentinel {
+                out.push(u32::MAX);
+                continue;
+            }
             // Signed add (saturating): vkCmdDrawIndexed treats
             // the result as a u32 vertex index.
             let signed = idx_raw as i64 + vertex_offset as i64;
@@ -2690,10 +2729,20 @@ impl Tier2Backend {
             }
         };
 
+        // Effective primitive-restart enable (dynamic
+        // override + pipeline static).  Only meaningful in
+        // combination with TriangleStrip topology.
+        let pipeline_restart = state.raster
+            .map(|r| r.primitive_restart_enable).unwrap_or(false);
+        let restart_enable = state.primitive_restart_enable_override
+            .unwrap_or(pipeline_restart);
+
         // Read indices from the bound index buffer, applying
-        // vertex_offset.
-        let indices = match self.gather_indices(
+        // vertex_offset (and preserving sentinels when
+        // restart is on).
+        let raw_indices = match self.gather_indices(
             &bound_idx, cmd.first_index, cmd.index_count, cmd.vertex_offset,
+            restart_enable,
         ) {
             Ok(v) => v,
             Err(e) => {
@@ -2701,6 +2750,15 @@ impl Tier2Backend {
                 return;
             }
         };
+        // For vertex assembly we need a sentinel-free copy
+        // (u32::MAX would be an invalid index into the
+        // vertex buffer).  Replace with 0 -- those bytes
+        // are placeholder filler; the strip-walk below
+        // never reads them because it skips sentinel
+        // positions when forming triangles.
+        let indices: Vec<u32> = raw_indices.iter()
+            .map(|&i| if i == u32::MAX { 0 } else { i })
+            .collect();
 
         let assembled = match self.assemble_vertices_by_index(
             &layout, &state.vertex_buffers, &indices,
@@ -2822,10 +2880,49 @@ impl Tier2Backend {
         let dt_scissor = state.scissor.map(|s| Scissor {
             x: s.x, y: s.y, width: s.width, height: s.height,
         });
-        for t in 0..tri_count {
-            let v0 = &assembled.bytes[(3*t)*stride   .. (3*t+1)*stride];
-            let v1 = &assembled.bytes[(3*t+1)*stride .. (3*t+2)*stride];
-            let v2 = &assembled.bytes[(3*t+2)*stride .. (3*t+3)*stride];
+
+        // Build the list of (i0, i1, i2) triples honouring
+        // topology + primitive restart.  Triangle list uses
+        // the legacy `(3t, 3t+1, 3t+2)` walk; triangle strip
+        // slides a 3-wide window with parity-driven swap,
+        // breaking the window on restart sentinels in
+        // `raw_indices` (`u32::MAX`).
+        let mut triples: Vec<(usize, usize, usize)> =
+            Vec::with_capacity(tri_count);
+        match topology {
+            PrimitiveTopology::TriangleStrip => {
+                let mut win: [usize; 3] = [0; 3];
+                let mut win_len: usize = 0;
+                let mut parity = false;
+                for (pos, &raw) in raw_indices.iter().enumerate() {
+                    if restart_enable && raw == u32::MAX {
+                        win_len = 0; parity = false;
+                        continue;
+                    }
+                    if win_len < 3 {
+                        win[win_len] = pos;
+                        win_len += 1;
+                    } else {
+                        win[0] = win[1]; win[1] = win[2]; win[2] = pos;
+                    }
+                    if win_len == 3 {
+                        let (a, b, c) = (win[0], win[1], win[2]);
+                        triples.push(if parity { (b, a, c) } else { (a, b, c) });
+                        parity = !parity;
+                    }
+                }
+            }
+            _ => {
+                for t in 0..tri_count {
+                    triples.push((3*t, 3*t + 1, 3*t + 2));
+                }
+            }
+        }
+
+        for &(i0, i1, i2) in &triples {
+            let v0 = &assembled.bytes[i0*stride .. (i0+1)*stride];
+            let v1 = &assembled.bytes[i1*stride .. (i1+1)*stride];
+            let v2 = &assembled.bytes[i2*stride .. (i2+1)*stride];
             let dt = DrawTriangle {
                 vertex_attrs: [v0, v1, v2],
                 push_constants: &state.push_constants,
@@ -2850,7 +2947,7 @@ impl Tier2Backend {
                 vs_shader_id, fs_shader_id,
                 &dt, width, height, pixels, db_ref, sb_ref,
             ) {
-                log::warn!("DrawIndexed target={target_id}: triangle {t}/{tri_count} \
+                log::warn!("DrawIndexed target={target_id}: triangle \
                             fill_image_triangle failed: {e}");
                 return;
             }
@@ -3118,8 +3215,10 @@ impl Backend for Tier2Backend {
         raster: Option<aqueduct_gpu::Tier2RasterState>,
         topology: aqueduct_gpu::Tier2PrimitiveTopology,
         stencil: Option<aqueduct_gpu::Tier2StencilState>,
+        primitive_restart_enable: bool,
     ) {
-        self.bind_raster_state(pipeline_id, depth, blend, raster, topology, stencil);
+        self.bind_raster_state(pipeline_id, depth, blend, raster, topology, stencil,
+                               primitive_restart_enable);
     }
 
     fn bind_pipeline_vs_varying_bytes(

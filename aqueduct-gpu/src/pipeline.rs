@@ -526,6 +526,14 @@ pub struct Tier2PipelineStateBlob {
     /// blobs that pre-date this field.
     #[serde(default)]
     pub topology: Tier2PrimitiveTopology,
+    /// Primitive-restart enable from
+    /// `VkPipelineInputAssemblyStateCreateInfo`.  When true
+    /// + topology = TriangleStrip, indices equal to the
+    /// type-max sentinel (`0xFFFF` for u16, `0xFFFFFFFF`
+    /// for u32) terminate the current strip and start a
+    /// new one with the following vertex.
+    #[serde(default)]
+    pub primitive_restart_enable: bool,
     /// Stencil-test state extracted from
     /// `VkPipelineDepthStencilStateCreateInfo`'s stencil
     /// fields.  `None` preserves the legacy "stencil off"

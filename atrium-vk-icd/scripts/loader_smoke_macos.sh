@@ -190,6 +190,7 @@ GRAPHICS_DEPTH_BOUNDS="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_gra
 GRAPHICS_STENCIL="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_stencil"
 GRAPHICS_STENCIL_DYN="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_stencil_dynamic"
 GRAPHICS_DEPTH_BIAS="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_depth_bias"
+GRAPHICS_RESTART="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_restart"
 DAEMON="$REPO_ROOT/aqueduct-gpu-host/target/debug/aqueduct-gpu-host"
 COMPILE="$REPO_ROOT/atrium-spv-compile/target/debug/atrium-spv-compile"
 SLANGC="$REPO_ROOT/external/slang-bin/bin/slangc"
@@ -1586,6 +1587,45 @@ if [ -x "$GRAPHICS_DEPTH_BIAS" ]; then
 else
     echo
     echo "SKIP Rung DD: need 'cargo build -p atrium-vk-icd --example loader_graphics_depth_bias'"
+fi
+
+# ── Rung EE: TRIANGLE_STRIP + primitive restart ──────────
+# loader_graphics_restart: indexed strip with 7 u16
+# indices [0,1,2,0xFFFF,3,4,5].  Sentinel 0xFFFF restarts
+# the strip; two disjoint triangles get rendered.  Pre-fix,
+# primitiveRestartEnable wasn't read from the create info,
+# vkCmdSetPrimitiveRestartEnable was an ext_state_stub no-
+# op, and the indexed strip-walk treated 0xFFFF as a real
+# vertex index (= u16::MAX) -- the dispatch would have
+# failed assembly or produced garbage geometry.
+if [ -x "$GRAPHICS_RESTART" ]; then
+    rm -f "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+        echo "daemon failed to start (restart round-trip); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung EE: TRIANGLE_STRIP + primitive restart draws 2 disjoint triangles ==="
+    if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+        VK_DRIVER_FILES="$MANIFEST" \
+        ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+        "$GRAPHICS_RESTART" 2>&1 | tail -4; then
+        echo "FAIL: restart round-trip did not return 0" >&2
+        exit 1
+    fi
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
+else
+    echo
+    echo "SKIP Rung EE: need 'cargo build -p atrium-vk-icd --example loader_graphics_restart'"
 fi
 
 echo
