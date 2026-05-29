@@ -83,7 +83,8 @@ pub use pipeline::{
     Tier2BlendFactor, Tier2BlendOp, Tier2BlendState,
     Tier2CompareOp, Tier2ComputeStateBlob, Tier2CullMode,
     Tier2DepthState, Tier2FrontFace, Tier2PipelineStateBlob,
-    Tier2PrimitiveTopology, Tier2RasterState, VertexAttributeDesc,
+    Tier2PrimitiveTopology, Tier2RasterState, Tier2StencilOp,
+    Tier2StencilOpState, Tier2StencilState, VertexAttributeDesc,
     VertexBindingDesc, VertexFormat, VertexInputState,
 };
 

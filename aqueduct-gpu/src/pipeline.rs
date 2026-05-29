@@ -270,6 +270,65 @@ pub struct Tier2DepthState {
 
 fn default_max_bounds() -> f32 { 1.0 }
 
+/// Per-face stencil ops, mirror of `VkStencilOp`.  Applied
+/// when a fragment exits the stencil/depth gates in one of
+/// the three outcomes (fail / pass / pass-but-depth-fail).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Tier2StencilOp {
+    /// Leave the stencil value untouched.
+    #[default]
+    Keep,
+    /// Set the stencil value to zero.
+    Zero,
+    /// Set the stencil value to the reference.
+    Replace,
+    /// Increment with saturation at u8::MAX.
+    IncrementAndClamp,
+    /// Decrement with saturation at 0.
+    DecrementAndClamp,
+    /// Bitwise NOT.
+    Invert,
+    /// Increment with wrap-around past u8::MAX.
+    IncrementAndWrap,
+    /// Decrement with wrap-around past 0.
+    DecrementAndWrap,
+}
+
+/// Per-face stencil state, mirror of `VkStencilOpState`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tier2StencilOpState {
+    /// Op when the stencil test fails.
+    pub fail_op: Tier2StencilOp,
+    /// Op when both stencil + depth tests pass.
+    pub pass_op: Tier2StencilOp,
+    /// Op when the stencil test passes but the depth test fails.
+    pub depth_fail_op: Tier2StencilOp,
+    /// Compare rule for the stencil test.
+    pub compare_op: Tier2CompareOp,
+    /// AND mask applied to reference + buffer values
+    /// before the stencil compare.
+    pub compare_mask: u32,
+    /// AND mask applied to the new stencil value before
+    /// writing into the buffer (`buffer = (buffer &
+    /// ~write_mask) | (new & write_mask)`).
+    pub write_mask: u32,
+    /// Reference value compared against the stencil buffer
+    /// and substituted by the `Replace` op.
+    pub reference: u32,
+}
+
+/// Tier-2 stencil-test state, mirror of
+/// `VkPipelineDepthStencilStateCreateInfo`'s stencil fields.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tier2StencilState {
+    /// Whether the stencil test is enabled.
+    pub test_enable: bool,
+    /// Per-face state for front-facing triangles.
+    pub front: Tier2StencilOpState,
+    /// Per-face state for back-facing triangles.
+    pub back: Tier2StencilOpState,
+}
+
 /// Per-channel blend factor; mirror of the tier-2 rasterizer's
 /// internal `BlendFactor`. Subset of Vulkan `VkBlendFactor`.
 #[repr(u32)]
@@ -443,6 +502,12 @@ pub struct Tier2PipelineStateBlob {
     /// blobs that pre-date this field.
     #[serde(default)]
     pub topology: Tier2PrimitiveTopology,
+    /// Stencil-test state extracted from
+    /// `VkPipelineDepthStencilStateCreateInfo`'s stencil
+    /// fields.  `None` preserves the legacy "stencil off"
+    /// behaviour.
+    #[serde(default)]
+    pub stencil: Option<Tier2StencilState>,
     /// Total bytes the VS writes through Location-decorated
     /// `Output`-storage variables.  Lets the dispatcher size
     /// the per-vertex varying capture buffer fed to

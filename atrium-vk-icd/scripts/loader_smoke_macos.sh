@@ -187,6 +187,7 @@ GRAPHICS_DEPTH_CMP="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphi
 GRAPHICS_STRIP="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_strip"
 GRAPHICS_DISCARD="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_discard"
 GRAPHICS_DEPTH_BOUNDS="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_depth_bounds"
+GRAPHICS_STENCIL="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_stencil"
 DAEMON="$REPO_ROOT/aqueduct-gpu-host/target/debug/aqueduct-gpu-host"
 COMPILE="$REPO_ROOT/atrium-spv-compile/target/debug/atrium-spv-compile"
 SLANGC="$REPO_ROOT/external/slang-bin/bin/slangc"
@@ -1462,6 +1463,47 @@ if [ -x "$GRAPHICS_DEPTH_BOUNDS" ]; then
 else
     echo
     echo "SKIP Rung AA: need 'cargo build -p atrium-vk-icd --example loader_graphics_depth_bounds'"
+fi
+
+# ── Rung BB: pipeline-static stencil test + ops ─────────
+# loader_graphics_stencil: two-pass stencil masking.
+# Pass 1 paints a small red triangle with stencil REPLACE/
+# ALWAYS reference=1.  Pass 2 paints a fullscreen blue
+# triangle but stencil EQUAL/reference=1 KEEP gates colour
+# output -- blue lands only where pass 1 covered.
+# pixel(4,4) inside small triangle = blue.
+# pixel(0,0) outside small triangle = clear-black.
+# Pre-fix, neither the static stencil state nor the rasterizer
+# stencil-test gate existed; the blue would have painted the
+# entire framebuffer.
+if [ -x "$GRAPHICS_STENCIL" ]; then
+    rm -f "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+        echo "daemon failed to start (stencil round-trip); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung BB: stencil masking (REPLACE then EQUAL) ==="
+    if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+        VK_DRIVER_FILES="$MANIFEST" \
+        ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+        "$GRAPHICS_STENCIL" 2>&1 | tail -3; then
+        echo "FAIL: stencil round-trip did not return 0" >&2
+        exit 1
+    fi
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
+else
+    echo
+    echo "SKIP Rung BB: need 'cargo build -p atrium-vk-icd --example loader_graphics_stencil'"
 fi
 
 echo

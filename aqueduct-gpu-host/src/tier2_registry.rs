@@ -277,6 +277,7 @@ impl Tier2Registry {
         height: u32,
         pixels: &mut [u8],
         mut depth_buffer: Option<&mut [f32]>,
+        mut stencil_buffer: Option<&mut [u8]>,
     ) -> Result<(), Tier2ExecError> {
         let expected_len = (width as usize) * (height as usize) * 4;
         if pixels.len() != expected_len {
@@ -608,17 +609,32 @@ impl Tier2Registry {
                 depth_compare_op: draw.depth_compare_op,
                 depth_bounds: draw.depth_bounds,
                 depth_min, depth_max,
+                stencil_face: draw.stencil.map(|s| {
+                    // Triangle face = front when screen-space
+                    // winding matches the active front_face
+                    // convention; otherwise back.  edge_fn
+                    // returns positive on CCW, negative on CW.
+                    let is_front = match draw.front_face {
+                        FrontFace::CounterClockwise => total_edge > 0.0,
+                        FrontFace::Clockwise        => total_edge < 0.0,
+                    };
+                    if is_front { s.front } else { s.back }
+                }),
             };
 
             let pixel_stripe_bytes =
                 (TILE_SIZE as usize) * (width as usize) * 4;
             let depth_stripe_elems =
                 (TILE_SIZE as usize) * (width as usize);
+            // Stencil buffer is the same shape as depth but
+            // u8 per pixel; same striping math.
+            let stencil_stripe_elems = depth_stripe_elems;
 
             // Build per-stripe tasks.  Skip stripes that
             // don't overlap the triangle bbox (so rayon
             // doesn't get spammed with no-op tasks).  Iterate
-            // pixel_chunks + depth_chunks in lock-step.
+            // pixel_chunks + depth_chunks + stencil_chunks
+            // in lock-step.
             let pixel_chunks: Vec<&mut [u8]> =
                 pixels.chunks_mut(pixel_stripe_bytes).collect();
             let depth_chunks: Vec<Option<&mut [f32]>> =
@@ -631,18 +647,30 @@ impl Tier2Registry {
                         .map(|_| None)
                         .collect(),
                 };
+            let stencil_chunks: Vec<Option<&mut [u8]>> =
+                match stencil_buffer.as_deref_mut() {
+                    Some(sb) => sb
+                        .chunks_mut(stencil_stripe_elems)
+                        .map(Some)
+                        .collect(),
+                    None => (0..pixel_chunks.len())
+                        .map(|_| None)
+                        .collect(),
+                };
             let mut tasks: Vec<StripeWork> = pixel_chunks
                 .into_iter()
                 .zip(depth_chunks.into_iter())
+                .zip(stencil_chunks.into_iter())
                 .enumerate()
                 .filter(|(s, _)| {
                     let tile_y = *s as i32;
                     tile_y >= tile_min_y && tile_y <= tile_max_y
                 })
-                .map(|(s, (px, dp))| StripeWork {
+                .map(|(s, ((px, dp), st))| StripeWork {
                     stripe_y: s as i32,
                     pixels: px,
                     depth: dp,
+                    stencil: st,
                 })
                 .collect();
 
@@ -654,6 +682,22 @@ impl Tier2Registry {
             });
         }
         Ok(())
+    }
+}
+
+/// Vulkan-spec depth compare.  Float NaN behaves correctly
+/// out of the box: every comparison with NaN is false, so
+/// NaN depths fail every test except `Always`.
+fn depth_compare(new: f32, old: f32, op: CompareOp) -> bool {
+    match op {
+        CompareOp::Never          => false,
+        CompareOp::Less           => new <  old,
+        CompareOp::Equal          => new == old,
+        CompareOp::LessOrEqual    => new <= old,
+        CompareOp::Greater        => new >  old,
+        CompareOp::NotEqual       => new != old,
+        CompareOp::GreaterOrEqual => new >= old,
+        CompareOp::Always         => true,
     }
 }
 
@@ -709,6 +753,11 @@ struct TriangleSetup<'s> {
     depth_compare_op: CompareOp,
     /// Mirror of `DrawTriangle::depth_bounds`.
     depth_bounds: Option<(f32, f32)>,
+    /// Mirror of `DrawTriangle::stencil`, with the per-face
+    /// state already resolved at triangle setup based on
+    /// `total_edge` sign + `draw.front_face`.  `None` means
+    /// no stencil testing.
+    stencil_face: Option<StencilFaceState>,
     /// Viewport depth range (`vkCmdSetViewport`'s
     /// `min_depth` / `max_depth`).  Used to remap the
     /// interpolated NDC.z into windowed-depth space before
@@ -734,6 +783,9 @@ struct StripeWork<'p, 'd> {
     /// `TILE_SIZE * width` f32 elements, or `None` when
     /// the caller didn't supply a depth buffer.
     depth: Option<&'d mut [f32]>,
+    /// `TILE_SIZE * width` u8 elements, or `None` when the
+    /// caller didn't supply a stencil buffer.
+    stencil: Option<&'d mut [u8]>,
 }
 
 /// Per-stripe pixel loop.  Walks the tile columns that
@@ -910,38 +962,104 @@ fn rasterize_stripe(
                 let pixel_lin_local =
                     py_local * (setup.width as usize) + (px as usize);
 
-                if let Some(db) = task.depth.as_mut() {
-                    // Depth bounds test (Vulkan
-                    // `depthBoundsTestEnable`): runs BEFORE
-                    // the depth compare and reads the
-                    // EXISTING buffer value (not the new
-                    // fragment depth).  Out-of-range fragments
-                    // are discarded silently.
+                // ── Stencil + depth gates ────────────────
+                // Per Vulkan spec the stencil test runs
+                // first, then the depth bounds test, then
+                // the depth compare.  The per-fragment
+                // outcome is one of three (stencil fail,
+                // depth fail, both pass) and selects the
+                // matching face op.
+                let stencil_old = task.stencil.as_deref()
+                    .map(|s| s[pixel_lin_local]);
+                let stencil_pass = if let (Some(face), Some(old)) =
+                    (setup.stencil_face, stencil_old)
+                {
+                    let cmask = face.compare_mask;
+                    let r = face.reference & cmask;
+                    let b = old & cmask;
+                    match face.compare_op {
+                        CompareOp::Never          => false,
+                        CompareOp::Less           => r <  b,
+                        CompareOp::Equal          => r == b,
+                        CompareOp::LessOrEqual    => r <= b,
+                        CompareOp::Greater        => r >  b,
+                        CompareOp::NotEqual       => r != b,
+                        CompareOp::GreaterOrEqual => r >= b,
+                        CompareOp::Always         => true,
+                    }
+                } else { true };
+
+                // Depth compare + bounds (only meaningful if
+                // a depth buffer is bound).  We compute the
+                // pass result but defer the writeback until
+                // we know the stencil op outcome too --
+                // ordering matters because the stencil
+                // depth_fail op fires when stencil passes
+                // but depth doesn't.
+                let depth_pass = if !stencil_pass {
+                    // Vulkan spec: if stencil fails, the
+                    // depth test is "not performed"; the
+                    // depth-fail op is irrelevant.  Treat as
+                    // pass for the outcome selector below
+                    // so we don't accidentally route to
+                    // depth_fail_op.
+                    true
+                } else if let Some(db) = task.depth.as_deref() {
                     if let Some((b_min, b_max)) = setup.depth_bounds {
                         let existing = db[pixel_lin_local];
                         if !(existing >= b_min && existing <= b_max) {
-                            continue;
+                            // Bounds-test failure is treated
+                            // identically to a depth-compare
+                            // failure for the stencil
+                            // outcome selector.
+                            false
+                        } else {
+                            depth_compare(window_z, db[pixel_lin_local],
+                                          setup.depth_compare_op)
                         }
+                    } else {
+                        depth_compare(window_z, db[pixel_lin_local],
+                                      setup.depth_compare_op)
                     }
-                    // VkCompareOp evaluation: `pass` is true
-                    // when `new <op> existing` according to
-                    // the active rule.  Float NaN behaviour
-                    // matches Vulkan (any compare with NaN
-                    // is false, so NaN fragments fail every
-                    // test except `Always`).
-                    let new = window_z;
-                    let old = db[pixel_lin_local];
-                    let pass = match setup.depth_compare_op {
-                        CompareOp::Never          => false,
-                        CompareOp::Less           => new <  old,
-                        CompareOp::Equal          => new == old,
-                        CompareOp::LessOrEqual    => new <= old,
-                        CompareOp::Greater        => new >  old,
-                        CompareOp::NotEqual       => new != old,
-                        CompareOp::GreaterOrEqual => new >= old,
-                        CompareOp::Always         => true,
+                } else { true };
+
+                // Stencil op selection + writeback.  Runs
+                // regardless of whether the fragment will
+                // produce colour -- stencil writes persist
+                // even when the depth test fails.
+                if let (Some(face), Some(stencil_buf), Some(old)) =
+                    (setup.stencil_face, task.stencil.as_mut(), stencil_old)
+                {
+                    let op = if !stencil_pass {
+                        face.fail_op
+                    } else if !depth_pass {
+                        face.depth_fail_op
+                    } else {
+                        face.pass_op
                     };
-                    if !pass { continue; }
+                    let new_val: u8 = match op {
+                        StencilOp::Keep              => old,
+                        StencilOp::Zero              => 0,
+                        StencilOp::Replace           => face.reference,
+                        StencilOp::IncrementAndClamp => old.saturating_add(1),
+                        StencilOp::DecrementAndClamp => old.saturating_sub(1),
+                        StencilOp::Invert            => !old,
+                        StencilOp::IncrementAndWrap  => old.wrapping_add(1),
+                        StencilOp::DecrementAndWrap  => old.wrapping_sub(1),
+                    };
+                    let written = (old & !face.write_mask)
+                                | (new_val & face.write_mask);
+                    stencil_buf[pixel_lin_local] = written;
+                }
+
+                // Now gate colour output on the combined
+                // result.  Stencil fail OR depth fail =
+                // discard.
+                if !stencil_pass || !depth_pass { continue; }
+
+                // Depth writeback (post-pass) gated on the
+                // pipeline / dynamic `depth_write`.
+                if let Some(db) = task.depth.as_mut() {
                     if setup.depth_write {
                         db[pixel_lin_local] = window_z;
                     }
@@ -1160,6 +1278,71 @@ pub struct DrawTriangle<'a> {
     /// depth attachment is bound (the bounds test reads the
     /// existing buffer value).
     pub depth_bounds: Option<(f32, f32)>,
+
+    /// When `Some(state)`, the rasterizer runs the stencil
+    /// test before the depth test using the supplied
+    /// per-face ops + compare rule.  `None` skips stencil
+    /// entirely (legacy behaviour for rungs that pre-date
+    /// stencil support).
+    pub stencil: Option<StencilState>,
+}
+
+/// Per-face stencil state passed to `fill_image_triangle`.
+/// Mirrors `aqueduct_gpu::Tier2StencilOpState` but uses
+/// `CompareOp` and the daemon-local `StencilOp` to keep
+/// the registry decoupled from the wire types.
+#[derive(Debug, Clone, Copy)]
+pub struct StencilFaceState {
+    /// Op when the stencil test fails.
+    pub fail_op: StencilOp,
+    /// Op when both stencil + depth tests pass.
+    pub pass_op: StencilOp,
+    /// Op when the stencil test passes but depth fails.
+    pub depth_fail_op: StencilOp,
+    /// Compare rule for the stencil test.
+    pub compare_op: CompareOp,
+    /// AND mask applied to reference + buffer values before
+    /// the stencil compare.
+    pub compare_mask: u8,
+    /// AND mask applied to the new stencil value before
+    /// writing into the buffer.
+    pub write_mask: u8,
+    /// Reference value compared against the stencil buffer
+    /// and substituted by the `Replace` op.
+    pub reference: u8,
+}
+
+/// Stencil ops applied per-pixel based on the
+/// (stencil pass) × (depth pass) outcome.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StencilOp {
+    /// Leave the stencil value unchanged.
+    #[default]
+    Keep,
+    /// Set the stencil value to 0.
+    Zero,
+    /// Set the stencil value to the per-face `reference`.
+    Replace,
+    /// Increment with saturation at u8::MAX.
+    IncrementAndClamp,
+    /// Decrement with saturation at 0.
+    DecrementAndClamp,
+    /// Bitwise NOT.
+    Invert,
+    /// Increment with wrap-around past u8::MAX.
+    IncrementAndWrap,
+    /// Decrement with wrap-around past 0.
+    DecrementAndWrap,
+}
+
+/// Per-draw stencil state passed via `DrawTriangle`.
+#[derive(Debug, Clone, Copy)]
+pub struct StencilState {
+    /// Face state for triangles whose screen-space winding
+    /// matches the active `FrontFace` rule.
+    pub front: StencilFaceState,
+    /// Face state for back-facing triangles.
+    pub back: StencilFaceState,
 }
 
 impl Default for DrawTriangle<'_> {
@@ -1178,6 +1361,7 @@ impl Default for DrawTriangle<'_> {
             depth_write: true,
             depth_compare_op: CompareOp::default(),
             depth_bounds: None,
+            stencil: None,
         }
     }
 }

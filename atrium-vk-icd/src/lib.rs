@@ -3118,8 +3118,8 @@ unsafe fn build_tier2_pipeline_blob(
     use aqueduct_gpu::{
         Tier2BlendState, Tier2CullMode, Tier2DepthState, Tier2FrontFace,
         Tier2PipelineStateBlob, Tier2PrimitiveTopology, Tier2RasterState,
-        VertexAttributeDesc, VertexBindingDesc, VertexFormat,
-        VertexInputState,
+        Tier2StencilState, VertexAttributeDesc, VertexBindingDesc,
+        VertexFormat, VertexInputState,
     };
 
     if info.stage_count == 0 || info.p_stages.is_null() {
@@ -3274,9 +3274,25 @@ unsafe fn build_tier2_pipeline_blob(
         }
     };
 
+    // Stencil-test state (also lives in
+    // VkPipelineDepthStencilStateCreateInfo).  We send it
+    // separately from `Tier2DepthState` so the depth path
+    // stays uncluttered and apps that use stencil without
+    // depth still round-trip cleanly.
+    let stencil = if info.p_depth_stencil_state.is_null() { None } else {
+        let ds = &*info.p_depth_stencil_state;
+        if ds.stencil_test_enable != 0 {
+            Some(Tier2StencilState {
+                test_enable: true,
+                front: convert_vk_stencil_op_state(ds.front),
+                back:  convert_vk_stencil_op_state(ds.back),
+            })
+        } else { None }
+    };
+
     let blob = Tier2PipelineStateBlob {
         vertex_input, depth, blend, raster,
-        topology,
+        topology, stencil,
         vs_varying_bytes,
     };
     let bytes = postcard::to_allocvec(&blob).ok()?;
@@ -3309,6 +3325,33 @@ fn convert_vk_blend_op(o: ash::vk::BlendOp) -> aqueduct_gpu::Tier2BlendOp {
         ash::vk::BlendOp::ADD => aqueduct_gpu::Tier2BlendOp::Add,
         // Tier-2 only supports ADD today; other ops fall back.
         _ => aqueduct_gpu::Tier2BlendOp::Add,
+    }
+}
+
+fn convert_vk_stencil_op(o: ash::vk::StencilOp) -> aqueduct_gpu::Tier2StencilOp {
+    use aqueduct_gpu::Tier2StencilOp as T;
+    match o {
+        ash::vk::StencilOp::KEEP                => T::Keep,
+        ash::vk::StencilOp::ZERO                => T::Zero,
+        ash::vk::StencilOp::REPLACE             => T::Replace,
+        ash::vk::StencilOp::INCREMENT_AND_CLAMP => T::IncrementAndClamp,
+        ash::vk::StencilOp::DECREMENT_AND_CLAMP => T::DecrementAndClamp,
+        ash::vk::StencilOp::INVERT              => T::Invert,
+        ash::vk::StencilOp::INCREMENT_AND_WRAP  => T::IncrementAndWrap,
+        ash::vk::StencilOp::DECREMENT_AND_WRAP  => T::DecrementAndWrap,
+        _                                       => T::Keep,
+    }
+}
+
+fn convert_vk_stencil_op_state(s: ash::vk::StencilOpState) -> aqueduct_gpu::Tier2StencilOpState {
+    aqueduct_gpu::Tier2StencilOpState {
+        fail_op:       convert_vk_stencil_op(s.fail_op),
+        pass_op:       convert_vk_stencil_op(s.pass_op),
+        depth_fail_op: convert_vk_stencil_op(s.depth_fail_op),
+        compare_op:    convert_vk_compare_op(s.compare_op),
+        compare_mask:  s.compare_mask,
+        write_mask:    s.write_mask,
+        reference:     s.reference,
     }
 }
 

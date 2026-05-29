@@ -28,7 +28,8 @@ use crate::backend::Backend;
 use crate::tier2_registry::{
     BlendFactor, BlendFactorPair, BlendOp, BlendState, ColorWriteMask,
     CompareOp, CullMode, DrawTriangle, FrontFace, Scissor,
-    Tier2ExecError, Tier2Registry, Tier2ShaderId, Viewport,
+    StencilFaceState, StencilOp, StencilState, Tier2ExecError,
+    Tier2Registry, Tier2ShaderId, Viewport,
 };
 
 use aqueduct_gpu::frame::{
@@ -352,6 +353,10 @@ struct PipelineRasterState {
     /// assembly unless the cmdbuf re-enabled the rasterizer
     /// dynamically.
     rasterizer_discard: bool,
+    /// Pipeline-static stencil state, already converted to
+    /// the daemon's `StencilState` shape.  `None` ⇒ stencil
+    /// test disabled at pipeline-create time.
+    stencil: Option<StencilState>,
 }
 
 /// Daemon-local primitive topology.  Only the two triangle
@@ -702,6 +707,7 @@ impl Tier2Backend {
         blend: Option<WireBlendState>,
         raster: Option<aqueduct_gpu::Tier2RasterState>,
         topology: aqueduct_gpu::Tier2PrimitiveTopology,
+        stencil: Option<aqueduct_gpu::Tier2StencilState>,
     ) {
         let blend = blend.map(convert_blend_state).unwrap_or_default();
         let (cull_mode, front_face, rasterizer_discard) = match raster {
@@ -725,10 +731,22 @@ impl Tier2Backend {
             aqueduct_gpu::Tier2PrimitiveTopology::TriangleStrip => PrimitiveTopology::TriangleStrip,
             aqueduct_gpu::Tier2PrimitiveTopology::Other         => PrimitiveTopology::Other,
         };
+        // Stencil conversion from wire to daemon-local types.
+        // The test_enable flag gates: a None outcome here
+        // means "test disabled" regardless of front/back
+        // contents.
+        let stencil = stencil.and_then(|s| {
+            if !s.test_enable { return None; }
+            Some(StencilState {
+                front: convert_stencil_face(s.front),
+                back:  convert_stencil_face(s.back),
+            })
+        });
         self.pipeline_raster.lock().unwrap().insert(
             pipeline_id.raw(),
             PipelineRasterState {
                 depth, blend, cull_mode, front_face, topology, rasterizer_discard,
+                stencil,
             },
         );
     }
@@ -931,6 +949,11 @@ impl Tier2Backend {
         // first draw with depth-test enabled. Cleared to +inf
         // so any in-range fragment wins the first LESS test.
         let mut depth_buffer: Option<Vec<f32>> = None;
+        // Stencil buffer: same lifetime as depth_buffer.
+        // Allocated lazily on first draw with stencil
+        // enabled, cleared to 0 (Vulkan's default
+        // `ClearDepthStencilValue::stencil`).
+        let mut stencil_buffer: Option<Vec<u8>> = None;
         let mut decoder = FrameDecoder::new(pass_bytes);
 
         loop {
@@ -1164,7 +1187,8 @@ impl Tier2Backend {
                 FrameOp::Draw => match DrawCmd::from_bytes(body) {
                     Ok(cmd) => {
                         state.draws_in_pass = state.draws_in_pass.saturating_add(1);
-                        self.dispatch_draw(target_id, &state, cmd, &mut depth_buffer);
+                        self.dispatch_draw(target_id, &state, cmd,
+                            &mut depth_buffer, &mut stencil_buffer);
                     }
                     Err(e) => log::warn!("malformed Draw: {e}"),
                 },
@@ -1172,7 +1196,8 @@ impl Tier2Backend {
                     Ok(cmd) => {
                         state.draws_in_pass = state.draws_in_pass.saturating_add(1);
                         self.dispatch_draw_indexed(
-                            target_id, &state, cmd, &mut depth_buffer);
+                            target_id, &state, cmd,
+                            &mut depth_buffer, &mut stencil_buffer);
                     }
                     Err(e) => log::warn!("malformed DrawIndexed: {e}"),
                 },
@@ -1241,6 +1266,7 @@ impl Tier2Backend {
         state: &PassState,
         cmd: DrawCmd,
         depth_buffer: &mut Option<Vec<f32>>,
+        stencil_buffer: &mut Option<Vec<u8>>,
     ) {
         if state.tier2_shader.is_none() {
             self.draws_skipped.fetch_add(1, Ordering::Relaxed);
@@ -1419,6 +1445,21 @@ impl Tier2Backend {
             ]);
         }
 
+        // Per-pass stencil scratch.  No persistent stencil
+        // attachment in v1 -- lazy-allocated zeros on the
+        // first stencil-using draw and reused across draws
+        // within the same render pass.  D.6.b adds attachment-
+        // backed stencil when the depth attachment carries
+        // a stencil aspect.
+        let stencil_state = state.raster
+            .and_then(|r| r.stencil);
+        if stencil_state.is_some() && stencil_buffer.is_none() {
+            *stencil_buffer = Some(vec![
+                0u8;
+                (width as usize) * (height as usize)
+            ]);
+        }
+
         // Per-pipeline VS varying-byte count (sum of byte
         // sizes of Location-decorated VS outputs).  Tells
         // fill_image_triangle how many bytes to capture from
@@ -1584,6 +1625,7 @@ impl Tier2Backend {
                 depth_write,
                 depth_compare_op: depth_cmp,
                 depth_bounds,
+                stencil: stencil_state,
                 ..Default::default()
             };
             let db_ref: Option<&mut [f32]> = if !depth_enabled {
@@ -1593,9 +1635,10 @@ impl Tier2Backend {
             } else {
                 depth_buffer.as_deref_mut()
             };
+            let sb_ref: Option<&mut [u8]> = stencil_buffer.as_deref_mut();
             if let Err(e) = self.registry.fill_image_triangle(
                 vs_shader_id, fs_shader_id,
-                &dt, width, height, pixels, db_ref,
+                &dt, width, height, pixels, db_ref, sb_ref,
             ) {
                 log::warn!("Draw target={target_id}: triangle {t}/{tri_count} \
                             fill_image_triangle failed: {e}");
@@ -2438,6 +2481,7 @@ impl Tier2Backend {
         state: &PassState,
         cmd: DrawIndexedCmd,
         depth_buffer: &mut Option<Vec<f32>>,
+        stencil_buffer: &mut Option<Vec<u8>>,
     ) {
         if state.tier2_shader.is_none() {
             self.draws_skipped.fetch_add(1, Ordering::Relaxed);
@@ -2569,6 +2613,16 @@ impl Tier2Backend {
                 (width as usize) * (height as usize)
             ]);
         }
+        // Stencil scratch (lazy alloc, mirror of
+        // dispatch_draw's setup).
+        let stencil_state = state.raster
+            .and_then(|r| r.stencil);
+        if stencil_state.is_some() && stencil_buffer.is_none() {
+            *stencil_buffer = Some(vec![
+                0u8;
+                (width as usize) * (height as usize)
+            ]);
+        }
 
         // Same varying-bytes plumbing as dispatch_draw -- without
         // this an indexed draw with a VS that emits Location-
@@ -2601,14 +2655,16 @@ impl Tier2Backend {
                 depth_write,
                 depth_compare_op: depth_cmp,
                 depth_bounds,
+                stencil: stencil_state,
                 ..Default::default()
             };
             let db_ref = if depth_enabled {
                 depth_buffer.as_deref_mut()
             } else { None };
+            let sb_ref: Option<&mut [u8]> = stencil_buffer.as_deref_mut();
             if let Err(e) = self.registry.fill_image_triangle(
                 vs_shader_id, fs_shader_id,
-                &dt, width, height, pixels, db_ref,
+                &dt, width, height, pixels, db_ref, sb_ref,
             ) {
                 log::warn!("DrawIndexed target={target_id}: triangle {t}/{tri_count} \
                             fill_image_triangle failed: {e}");
@@ -2877,8 +2933,9 @@ impl Backend for Tier2Backend {
         blend: Option<WireBlendState>,
         raster: Option<aqueduct_gpu::Tier2RasterState>,
         topology: aqueduct_gpu::Tier2PrimitiveTopology,
+        stencil: Option<aqueduct_gpu::Tier2StencilState>,
     ) {
-        self.bind_raster_state(pipeline_id, depth, blend, raster, topology);
+        self.bind_raster_state(pipeline_id, depth, blend, raster, topology, stencil);
     }
 
     fn bind_pipeline_vs_varying_bytes(
@@ -2897,6 +2954,34 @@ impl Backend for Tier2Backend {
         compute_state: Tier2ComputeStateBlob,
     ) {
         self.bind_compute_pipeline(pipeline_id, tier2_shader_id, compute_state);
+    }
+}
+
+fn convert_stencil_op(o: aqueduct_gpu::Tier2StencilOp) -> StencilOp {
+    use aqueduct_gpu::Tier2StencilOp as W;
+    match o {
+        W::Keep              => StencilOp::Keep,
+        W::Zero              => StencilOp::Zero,
+        W::Replace           => StencilOp::Replace,
+        W::IncrementAndClamp => StencilOp::IncrementAndClamp,
+        W::DecrementAndClamp => StencilOp::DecrementAndClamp,
+        W::Invert            => StencilOp::Invert,
+        W::IncrementAndWrap  => StencilOp::IncrementAndWrap,
+        W::DecrementAndWrap  => StencilOp::DecrementAndWrap,
+    }
+}
+
+fn convert_stencil_face(s: aqueduct_gpu::Tier2StencilOpState) -> StencilFaceState {
+    StencilFaceState {
+        fail_op:       convert_stencil_op(s.fail_op),
+        pass_op:       convert_stencil_op(s.pass_op),
+        depth_fail_op: convert_stencil_op(s.depth_fail_op),
+        compare_op:    convert_compare_op(s.compare_op),
+        // Vulkan stencil masks / reference are u32 on the
+        // wire but tier-2 stencil is u8 per pixel; truncate.
+        compare_mask:  s.compare_mask as u8,
+        write_mask:    s.write_mask   as u8,
+        reference:     s.reference    as u8,
     }
 }
 
