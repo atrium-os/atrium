@@ -288,6 +288,10 @@ struct PassState {
     /// Takes precedence over `Tier2DepthState::compare_op`
     /// from the bound pipeline.
     depth_compare_op_override: Option<CompareOp>,
+    /// Dynamic primitive topology
+    /// (`vkCmdSetPrimitiveTopology`).  Takes precedence over
+    /// the pipeline's static topology when set.
+    topology_override: Option<PrimitiveTopology>,
     /// Latest push-constants block; tier-2 shaders consume it
     /// as their uniform area.
     push_constants: Vec<u8>,
@@ -327,6 +331,23 @@ struct PipelineRasterState {
     blend: BlendState,
     cull_mode: CullMode,
     front_face: FrontFace,
+    topology: PrimitiveTopology,
+}
+
+/// Daemon-local primitive topology.  Only the two triangle
+/// modes are wired today; `Other` is accepted on the wire
+/// (so the daemon doesn't reject a pipeline that declares,
+/// say, LineList) and falls back to TriangleList rasterization
+/// without explicit failure.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum PrimitiveTopology {
+    /// Independent triangles (default).
+    #[default]
+    TriangleList,
+    /// Triangle strip; consecutive triangles share an edge.
+    TriangleStrip,
+    /// Reserved / unimplemented; rasterizes as TriangleList.
+    Other,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -660,6 +681,7 @@ impl Tier2Backend {
         depth: Option<Tier2DepthState>,
         blend: Option<WireBlendState>,
         raster: Option<aqueduct_gpu::Tier2RasterState>,
+        topology: aqueduct_gpu::Tier2PrimitiveTopology,
     ) {
         let blend = blend.map(convert_blend_state).unwrap_or_default();
         let (cull_mode, front_face) = match raster {
@@ -677,9 +699,14 @@ impl Tier2Backend {
             ),
             None => (CullMode::None, FrontFace::CounterClockwise),
         };
+        let topology = match topology {
+            aqueduct_gpu::Tier2PrimitiveTopology::TriangleList  => PrimitiveTopology::TriangleList,
+            aqueduct_gpu::Tier2PrimitiveTopology::TriangleStrip => PrimitiveTopology::TriangleStrip,
+            aqueduct_gpu::Tier2PrimitiveTopology::Other         => PrimitiveTopology::Other,
+        };
         self.pipeline_raster.lock().unwrap().insert(
             pipeline_id.raw(),
-            PipelineRasterState { depth, blend, cull_mode, front_face },
+            PipelineRasterState { depth, blend, cull_mode, front_face, topology },
         );
     }
 
@@ -1004,6 +1031,22 @@ impl Tier2Backend {
                         log::warn!("malformed SetDepthWriteEnable body length: {}", body.len());
                     }
                 }
+                FrameOp::SetPrimitiveTopology => {
+                    if body.len() == 4 {
+                        let v = u32::from_le_bytes(body.try_into().unwrap());
+                        // VkPrimitiveTopology: 3 = TRIANGLE_LIST,
+                        // 4 = TRIANGLE_STRIP (per spec).  Anything
+                        // else falls back to TriangleList.
+                        let t = match v {
+                            3 => PrimitiveTopology::TriangleList,
+                            4 => PrimitiveTopology::TriangleStrip,
+                            _ => PrimitiveTopology::Other,
+                        };
+                        state.topology_override = Some(t);
+                    } else {
+                        log::warn!("malformed SetPrimitiveTopology body length: {}", body.len());
+                    }
+                }
                 FrameOp::SetDepthCompareOp => {
                     if body.len() == 4 {
                         let v = u32::from_le_bytes(body.try_into().unwrap());
@@ -1199,16 +1242,29 @@ impl Tier2Backend {
         let Some(vs_shader_id) = state.tier2_vs_shader else { return };
         let Some(fs_shader_id) = state.tier2_shader else { return };
 
-        if assembled.vertex_count % 3 != 0 {
-            log::warn!("Draw target={target_id}: vertex_count {} is not a \
-                        multiple of 3; non-triangle topologies aren't \
-                        supported by tier-2 yet",
-                       assembled.vertex_count);
-            return;
-        }
-
         let stride = assembled.stride as usize;
-        let tri_count = (assembled.vertex_count / 3) as usize;
+        // Primitive topology: dynamic override wins, then
+        // pipeline-static, default TriangleList.
+        let pipeline_topology = state.raster
+            .map(|r| r.topology).unwrap_or_default();
+        let topology = state.topology_override.unwrap_or(pipeline_topology);
+        let n_verts = assembled.vertex_count as usize;
+        let tri_count = match topology {
+            PrimitiveTopology::TriangleStrip => n_verts.saturating_sub(2),
+            // Other / TriangleList: floor(n / 3) independent triangles.
+            _                                 => n_verts / 3,
+        };
+        // TriangleList requires vertex_count % 3 == 0 (extras
+        // are silently dropped by the floor division above).
+        // TriangleStrip needs vertex_count >= 3 (already handled
+        // by the saturating_sub).  Both produce 0 triangles
+        // safely for malformed input.
+        if matches!(topology, PrimitiveTopology::TriangleList) && n_verts % 3 != 0 {
+            log::warn!("Draw target={target_id}: vertex_count {} is not a \
+                        multiple of 3 under TriangleList; dropping {} trailing \
+                        vertices",
+                       assembled.vertex_count, n_verts - tri_count * 3);
+        }
 
         // Pre-snapshot bound-texture image data BEFORE the
         // images-lock acquisition below.  We just need stable
@@ -1423,9 +1479,22 @@ impl Tier2Backend {
             x: s.x, y: s.y, width: s.width, height: s.height,
         });
         for t in 0..tri_count {
-            let v0 = &assembled.bytes[(3*t)*stride   .. (3*t+1)*stride];
-            let v1 = &assembled.bytes[(3*t+1)*stride .. (3*t+2)*stride];
-            let v2 = &assembled.bytes[(3*t+2)*stride .. (3*t+3)*stride];
+            // Vertex-index triple per topology.  TriangleList:
+            // (3t, 3t+1, 3t+2).  TriangleStrip: (t, t+1, t+2)
+            // with v0 / v1 swapped on odd triangles so all
+            // produced triangles keep the input's winding
+            // (Vulkan spec).
+            let (i0, i1, i2) = match topology {
+                PrimitiveTopology::TriangleStrip => if t & 1 == 0 {
+                    (t, t + 1, t + 2)
+                } else {
+                    (t + 1, t, t + 2)
+                },
+                _ => (3*t, 3*t + 1, 3*t + 2),
+            };
+            let v0 = &assembled.bytes[i0*stride .. (i0+1)*stride];
+            let v1 = &assembled.bytes[i1*stride .. (i1+1)*stride];
+            let v2 = &assembled.bytes[i2*stride .. (i2+1)*stride];
             let dt = DrawTriangle {
                 vertex_attrs: [v0, v1, v2],
                 push_constants: &state.push_constants,
@@ -2350,13 +2419,21 @@ impl Tier2Backend {
         let Some(vs_shader_id) = state.tier2_vs_shader else { return };
         let Some(fs_shader_id) = state.tier2_shader else { return };
 
-        if assembled.vertex_count % 3 != 0 {
-            log::warn!("DrawIndexed target={target_id}: index_count {} \
-                        is not a multiple of 3", assembled.vertex_count);
-            return;
-        }
         let stride = assembled.stride as usize;
-        let tri_count = (assembled.vertex_count / 3) as usize;
+        let pipeline_topology = state.raster
+            .map(|r| r.topology).unwrap_or_default();
+        let topology = state.topology_override.unwrap_or(pipeline_topology);
+        let n_verts = assembled.vertex_count as usize;
+        let tri_count = match topology {
+            PrimitiveTopology::TriangleStrip => n_verts.saturating_sub(2),
+            _                                 => n_verts / 3,
+        };
+        if matches!(topology, PrimitiveTopology::TriangleList) && n_verts % 3 != 0 {
+            log::warn!("DrawIndexed target={target_id}: index_count {} \
+                        is not a multiple of 3 under TriangleList; dropping {} \
+                        trailing indices",
+                       assembled.vertex_count, n_verts - tri_count * 3);
+        }
 
         let mut images = self.images.lock().unwrap();
         let img = match images.get_mut(&(target_id.raw() as u64)) {
@@ -2699,8 +2776,9 @@ impl Backend for Tier2Backend {
         depth: Option<Tier2DepthState>,
         blend: Option<WireBlendState>,
         raster: Option<aqueduct_gpu::Tier2RasterState>,
+        topology: aqueduct_gpu::Tier2PrimitiveTopology,
     ) {
-        self.bind_raster_state(pipeline_id, depth, blend, raster);
+        self.bind_raster_state(pipeline_id, depth, blend, raster, topology);
     }
 
     fn bind_pipeline_vs_varying_bytes(

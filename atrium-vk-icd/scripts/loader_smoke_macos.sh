@@ -184,6 +184,7 @@ GRAPHICS_CULL="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_cu
 GRAPHICS_CULL_DYN="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_cull_dynamic"
 GRAPHICS_DEPTH_DYN="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_depth_dynamic"
 GRAPHICS_DEPTH_CMP="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_depth_cmp"
+GRAPHICS_STRIP="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_strip"
 DAEMON="$REPO_ROOT/aqueduct-gpu-host/target/debug/aqueduct-gpu-host"
 COMPILE="$REPO_ROOT/atrium-spv-compile/target/debug/atrium-spv-compile"
 SLANGC="$REPO_ROOT/external/slang-bin/bin/slangc"
@@ -1342,6 +1343,44 @@ if [ -x "$GRAPHICS_DEPTH_CMP" ]; then
 else
     echo
     echo "SKIP Rung X: need 'cargo build -p atrium-vk-icd --example loader_graphics_depth_cmp'"
+fi
+
+# ── Rung Y: TRIANGLE_STRIP topology honoured ─────────────
+# loader_graphics_strip: pipeline declares
+# VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; app submits 4
+# fullscreen-NDC vertices.  Under strip rules these form
+# two triangles covering the full quad; under the legacy
+# TriangleList interpretation the daemon would see only
+# one triangle from the first 3 verts and the 4th would
+# be dropped.  All 4 corners + centre must paint red.
+if [ -x "$GRAPHICS_STRIP" ]; then
+    rm -f "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+        echo "daemon failed to start (strip round-trip); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung Y: TRIANGLE_STRIP draws 4 verts as 2 triangles ==="
+    if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+        VK_DRIVER_FILES="$MANIFEST" \
+        ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+        "$GRAPHICS_STRIP" 2>&1 | tail -2; then
+        echo "FAIL: strip round-trip did not return 0" >&2
+        exit 1
+    fi
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
+else
+    echo
+    echo "SKIP Rung Y: need 'cargo build -p atrium-vk-icd --example loader_graphics_strip'"
 fi
 
 echo

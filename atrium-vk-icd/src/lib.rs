@@ -3113,8 +3113,9 @@ unsafe fn build_tier2_pipeline_blob(
 ) -> Option<(Vec<aqueduct_gpu::ids::ResourceId>, Vec<u8>)> {
     use aqueduct_gpu::{
         Tier2BlendState, Tier2CullMode, Tier2DepthState, Tier2FrontFace,
-        Tier2PipelineStateBlob, Tier2RasterState, VertexAttributeDesc,
-        VertexBindingDesc, VertexFormat, VertexInputState,
+        Tier2PipelineStateBlob, Tier2PrimitiveTopology, Tier2RasterState,
+        VertexAttributeDesc, VertexBindingDesc, VertexFormat,
+        VertexInputState,
     };
 
     if info.stage_count == 0 || info.p_stages.is_null() {
@@ -3247,8 +3248,25 @@ unsafe fn build_tier2_pipeline_blob(
         }
     };
 
+    // Input-assembly: primitive topology.  Anything that's
+    // not TRIANGLE_STRIP falls through to TriangleList for
+    // now (PointList / LineList / fans / adjacency / patches
+    // need a separate rasterizer arc).
+    let topology = if info.p_input_assembly_state.is_null() {
+        Tier2PrimitiveTopology::TriangleList
+    } else {
+        let ia = &*info.p_input_assembly_state;
+        match ia.topology {
+            ash::vk::PrimitiveTopology::TRIANGLE_LIST  => Tier2PrimitiveTopology::TriangleList,
+            ash::vk::PrimitiveTopology::TRIANGLE_STRIP => Tier2PrimitiveTopology::TriangleStrip,
+            _                                          => Tier2PrimitiveTopology::Other,
+        }
+    };
+
     let blob = Tier2PipelineStateBlob {
-        vertex_input, depth, blend, raster, vs_varying_bytes,
+        vertex_input, depth, blend, raster,
+        topology,
+        vs_varying_bytes,
     };
     let bytes = postcard::to_allocvec(&blob).ok()?;
     Some((vec![vs_id, fs_id], bytes))
@@ -3838,7 +3856,18 @@ pub unsafe extern "C" fn vkCmdSetFrontFace(
     let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::SetFrontFace, &body);
 }
 
-ext_state_stub_u32!(vkCmdSetPrimitiveTopology);
+// Dynamic primitive topology (`vkCmdSetPrimitiveTopology`).
+// 4-byte u32 = VkPrimitiveTopology; the daemon walker
+// translates against the Vk enum at draw time.
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdSetPrimitiveTopology(
+    command_buffer: VkCommandBuffer,
+    topology:       u32, /* VkPrimitiveTopology */
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    let body = topology.to_le_bytes();
+    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::SetPrimitiveTopology, &body);
+}
 
 // Dynamic depth-test toggle (`vkCmdSetDepthTestEnable` /
 // `vkCmdSetDepthWriteEnable`) -- the rasterizer's per-pass

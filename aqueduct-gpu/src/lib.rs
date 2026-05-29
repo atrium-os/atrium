@@ -83,8 +83,8 @@ pub use pipeline::{
     Tier2BlendFactor, Tier2BlendOp, Tier2BlendState,
     Tier2CompareOp, Tier2ComputeStateBlob, Tier2CullMode,
     Tier2DepthState, Tier2FrontFace, Tier2PipelineStateBlob,
-    Tier2RasterState, VertexAttributeDesc, VertexBindingDesc,
-    VertexFormat, VertexInputState,
+    Tier2PrimitiveTopology, Tier2RasterState, VertexAttributeDesc,
+    VertexBindingDesc, VertexFormat, VertexInputState,
 };
 
 /// Re-exported from `aqueduct` for convenience: GPU dispatch class.

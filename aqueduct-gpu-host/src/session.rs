@@ -646,7 +646,8 @@ impl Session {
                         self.backend.bind_pipeline_layout(
                             req.pipeline_id, blob.vertex_input);
                         self.backend.bind_pipeline_raster_state(
-                            req.pipeline_id, blob.depth, blob.blend, blob.raster);
+                            req.pipeline_id, blob.depth, blob.blend,
+                            blob.raster, blob.topology);
                         self.backend.bind_pipeline_vs_varying_bytes(
                             req.pipeline_id, blob.vs_varying_bytes);
                     }

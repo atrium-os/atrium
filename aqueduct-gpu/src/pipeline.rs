@@ -177,6 +177,27 @@ pub struct Tier2RasterState {
     pub front_face: Tier2FrontFace,
 }
 
+/// Tier-2 primitive topology, mirror of
+/// `VkPrimitiveTopology`.  Only the two triangle modes are
+/// implemented today; the others are reserved on the wire
+/// so app pipelines that declare them round-trip, but the
+/// daemon falls back to TriangleList rasterization.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Tier2PrimitiveTopology {
+    /// Independent triangles from successive triples of
+    /// vertices (the legacy default).
+    #[default]
+    TriangleList,
+    /// Triangle strip; consecutive triangles share an edge.
+    /// Vulkan's spec swaps the order of v[i+1] / v[i] for
+    /// odd-numbered triangles to keep the winding consistent.
+    TriangleStrip,
+    /// Reserved / unimplemented (PointList, LineList,
+    /// LineStrip, fans, list-with-adjacency, patches).
+    /// Daemon treats these as TriangleList for now.
+    Other,
+}
+
 /// Tier-2 depth compare op, mirror of `VkCompareOp`.
 /// Encodes the rule used to decide whether a fragment's
 /// `gl_FragCoord.z` passes the depth test against the
@@ -388,6 +409,12 @@ pub struct Tier2PipelineStateBlob {
     /// preserves the legacy "no culling" behaviour.
     #[serde(default)]
     pub raster: Option<Tier2RasterState>,
+    /// Primitive topology from
+    /// `VkPipelineInputAssemblyStateCreateInfo`.  Defaults
+    /// to `TriangleList` for backward compatibility with
+    /// blobs that pre-date this field.
+    #[serde(default)]
+    pub topology: Tier2PrimitiveTopology,
     /// Total bytes the VS writes through Location-decorated
     /// `Output`-storage variables.  Lets the dispatcher size
     /// the per-vertex varying capture buffer fed to

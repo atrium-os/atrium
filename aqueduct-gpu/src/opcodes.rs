@@ -249,6 +249,8 @@ pub enum FrameOp {
     SetDepthWriteEnable = 0x0036,
     /// Pick the depth compare op (`vkCmdSetDepthCompareOp`).
     SetDepthCompareOp   = 0x0037,
+    /// Switch primitive topology (`vkCmdSetPrimitiveTopology`).
+    SetPrimitiveTopology = 0x0038,
 
     /// Non-indexed draw.
     Draw            = 0x0040,
@@ -294,6 +296,7 @@ impl FrameOp {
             0x0035 => FrameOp::SetDepthTestEnable,
             0x0036 => FrameOp::SetDepthWriteEnable,
             0x0037 => FrameOp::SetDepthCompareOp,
+            0x0038 => FrameOp::SetPrimitiveTopology,
             0x0040 => FrameOp::Draw,
             0x0041 => FrameOp::DrawIndexed,
             0x0042 => FrameOp::DrawIndirect,
@@ -328,7 +331,7 @@ mod tests {
             FrameOp::PushConstants,
             FrameOp::SetCullMode, FrameOp::SetFrontFace,
             FrameOp::SetDepthTestEnable, FrameOp::SetDepthWriteEnable,
-            FrameOp::SetDepthCompareOp,
+            FrameOp::SetDepthCompareOp, FrameOp::SetPrimitiveTopology,
             FrameOp::Draw, FrameOp::DrawIndexed, FrameOp::DrawIndirect,
             FrameOp::Dispatch, FrameOp::DispatchIndirect,
             FrameOp::CopyBufToImg, FrameOp::CopyImgToBuf, FrameOp::Blit,
