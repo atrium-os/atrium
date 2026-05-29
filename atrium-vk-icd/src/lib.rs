@@ -5434,10 +5434,17 @@ pub unsafe extern "C" fn vkCmdCopyBufferToImage(
     body.extend_from_slice(&dst_image_layout.to_le_bytes());
     body.extend_from_slice(&region_count.to_le_bytes());
     let regions_base = p_regions as *const u8;
+    // VkBufferImageCopy is 56 B (verified via
+    // std::mem::size_of::<ash::vk::BufferImageCopy>()): the
+    // u64 bufferOffset aligns the struct to 8 but the total
+    // happens to land exactly at 56, so there's no trailing
+    // pad.  Earlier code mistakenly walked with a 64-byte
+    // stride and read 8 bytes past the second-and-beyond
+    // regions -- harmless when callers only emit one region,
+    // a latent multi-region bug otherwise.
+    let stride = std::mem::size_of::<ash::vk::BufferImageCopy>();
     for i in 0..region_count {
-        let r = regions_base.add(64 * i as usize);
-        // VkBufferImageCopy is 64 B in size (Vk spec; includes
-        // trailing pad to 8-byte alignment).
+        let r = regions_base.add(stride * i as usize);
         body.extend_from_slice(std::slice::from_raw_parts(r, 56));
     }
     let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::CopyBufToImg, &body);

@@ -191,6 +191,7 @@ GRAPHICS_STENCIL="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics
 GRAPHICS_STENCIL_DYN="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_stencil_dynamic"
 GRAPHICS_DEPTH_BIAS="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_depth_bias"
 GRAPHICS_RESTART="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_restart"
+GRAPHICS_MIPMAP="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_mipmap"
 DAEMON="$REPO_ROOT/aqueduct-gpu-host/target/debug/aqueduct-gpu-host"
 COMPILE="$REPO_ROOT/atrium-spv-compile/target/debug/atrium-spv-compile"
 SLANGC="$REPO_ROOT/external/slang-bin/bin/slangc"
@@ -1626,6 +1627,46 @@ if [ -x "$GRAPHICS_RESTART" ]; then
 else
     echo
     echo "SKIP Rung EE: need 'cargo build -p atrium-vk-icd --example loader_graphics_restart'"
+fi
+
+# ── Rung FF: explicit-LOD mip sampling ───────────────────
+# loader_graphics_mipmap: 2-level mip chain (level 0: 2x2
+# all red, level 1: 1x1 single blue texel) uploaded via
+# vkCmdCopyBufferToImage with two regions (one per mip
+# level).  FS uses OpImageSampleExplicitLod with LOD=1.0;
+# helper must fetch from TexDesc.mip_descs[1].  Pixel(4,4)
+# ends up pure blue.  Pre-fix, the daemon dropped
+# mipLevel>0 copy regions on the floor (ImageStorage only
+# held the base) and TexDesc.mip_descs was always null,
+# so pick_tex_mip fell back to level 0 = red.
+if [ -x "$GRAPHICS_MIPMAP" ]; then
+    rm -f "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+        echo "daemon failed to start (mipmap round-trip); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung FF: explicit LOD=1.0 fetches mip level 1 (blue) ==="
+    if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+        VK_DRIVER_FILES="$MANIFEST" \
+        ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+        "$GRAPHICS_MIPMAP" 2>&1 | tail -2; then
+        echo "FAIL: mipmap round-trip did not return 0" >&2
+        exit 1
+    fi
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
+else
+    echo
+    echo "SKIP Rung FF: need 'cargo build -p atrium-vk-icd --example loader_graphics_mipmap'"
 fi
 
 echo
