@@ -273,6 +273,17 @@ struct PassState {
     /// Dynamic front-face override (`vkCmdSetFrontFace`).
     /// Same precedence rule as cull_mode_override.
     front_face_override: Option<FrontFace>,
+    /// Dynamic depth-test toggle (`vkCmdSetDepthTestEnable`).
+    /// `Some(true)` forces the depth test on for subsequent
+    /// draws (overriding the pipeline's static
+    /// `Tier2DepthState::test_enable`); `Some(false)` forces
+    /// it off; `None` defers to the pipeline.
+    depth_test_enable_override: Option<bool>,
+    /// Dynamic depth-write toggle (`vkCmdSetDepthWriteEnable`).
+    /// Mirrors `depth_test_enable_override`'s precedence
+    /// rule; honoured only when the depth test itself is
+    /// active (matches Vulkan's interaction between the two).
+    depth_write_enable_override: Option<bool>,
     /// Latest push-constants block; tier-2 shaders consume it
     /// as their uniform area.
     push_constants: Vec<u8>,
@@ -973,6 +984,22 @@ impl Tier2Backend {
                         log::warn!("malformed SetFrontFace body length: {}", body.len());
                     }
                 }
+                FrameOp::SetDepthTestEnable => {
+                    if body.len() == 4 {
+                        let v = u32::from_le_bytes(body.try_into().unwrap());
+                        state.depth_test_enable_override = Some(v != 0);
+                    } else {
+                        log::warn!("malformed SetDepthTestEnable body length: {}", body.len());
+                    }
+                }
+                FrameOp::SetDepthWriteEnable => {
+                    if body.len() == 4 {
+                        let v = u32::from_le_bytes(body.try_into().unwrap());
+                        state.depth_write_enable_override = Some(v != 0);
+                    } else {
+                        log::warn!("malformed SetDepthWriteEnable body length: {}", body.len());
+                    }
+                }
                 FrameOp::BindDepthAttachment => {
                     match BindDepthAttachmentCmd::from_bytes(body) {
                         Ok(cmd) => {
@@ -1196,7 +1223,17 @@ impl Tier2Backend {
 
         // D.6: raster state -> per-draw blend + depth.
         let raster = state.raster.unwrap_or_default();
-        let depth_enabled = raster.depth.map(|d| d.test_enable).unwrap_or(false);
+        // Pipeline-static depth state.
+        let static_test  = raster.depth.map(|d| d.test_enable).unwrap_or(false);
+        let static_write = raster.depth.map(|d| d.write_enable).unwrap_or(false);
+        // Dynamic overrides (`vkCmdSetDepthTestEnable` /
+        // `vkCmdSetDepthWriteEnable`) take precedence.  Depth
+        // writes additionally gate on the depth test being
+        // active (Vulkan spec: write_enable has no effect
+        // when the test is off).
+        let depth_enabled = state.depth_test_enable_override.unwrap_or(static_test);
+        let depth_write   = depth_enabled
+            && state.depth_write_enable_override.unwrap_or(static_write);
 
         // Depth source priority:
         //   1) Persisted depth attachment (BindDepthAttachment)
@@ -1368,6 +1405,7 @@ impl Tier2Backend {
                 scissor: dt_scissor,
                 cull_mode: state.cull_mode_override.unwrap_or(raster.cull_mode),
                 front_face: state.front_face_override.unwrap_or(raster.front_face),
+                depth_write,
                 ..Default::default()
             };
             let db_ref: Option<&mut [f32]> = if !depth_enabled {
@@ -2301,7 +2339,17 @@ impl Tier2Backend {
         let pixels = &mut img.pixels[..];
 
         let raster = state.raster.unwrap_or_default();
-        let depth_enabled = raster.depth.map(|d| d.test_enable).unwrap_or(false);
+        // Pipeline-static depth state.
+        let static_test  = raster.depth.map(|d| d.test_enable).unwrap_or(false);
+        let static_write = raster.depth.map(|d| d.write_enable).unwrap_or(false);
+        // Dynamic overrides (`vkCmdSetDepthTestEnable` /
+        // `vkCmdSetDepthWriteEnable`) take precedence.  Depth
+        // writes additionally gate on the depth test being
+        // active (Vulkan spec: write_enable has no effect
+        // when the test is off).
+        let depth_enabled = state.depth_test_enable_override.unwrap_or(static_test);
+        let depth_write   = depth_enabled
+            && state.depth_write_enable_override.unwrap_or(static_write);
         if depth_enabled && depth_buffer.is_none() {
             *depth_buffer = Some(vec![
                 f32::INFINITY;
@@ -2337,6 +2385,7 @@ impl Tier2Backend {
                 scissor: dt_scissor,
                 cull_mode: state.cull_mode_override.unwrap_or(raster.cull_mode),
                 front_face: state.front_face_override.unwrap_or(raster.front_face),
+                depth_write,
                 ..Default::default()
             };
             let db_ref = if depth_enabled {

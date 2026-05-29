@@ -604,6 +604,7 @@ impl Tier2Registry {
                 min_x, max_x, min_y, max_y,
                 tile_min_x, tile_max_x,
                 width,
+                depth_write: draw.depth_write,
                 depth_min, depth_max,
             };
 
@@ -698,6 +699,10 @@ struct TriangleSetup<'s> {
     tile_max_x: i32,
     /// Image width in pixels (for row-major indexing).
     width: u32,
+    /// Mirror of `DrawTriangle::depth_write`.  When `false`,
+    /// the rasterizer evaluates the depth test for colour-
+    /// output gating but leaves the depth buffer unmodified.
+    depth_write: bool,
     /// Viewport depth range (`vkCmdSetViewport`'s
     /// `min_depth` / `max_depth`).  Used to remap the
     /// interpolated NDC.z into windowed-depth space before
@@ -901,7 +906,9 @@ fn rasterize_stripe(
 
                 if let Some(db) = task.depth.as_mut() {
                     if window_z >= db[pixel_lin_local] { continue; }
-                    db[pixel_lin_local] = window_z;
+                    if setup.depth_write {
+                        db[pixel_lin_local] = window_z;
+                    }
                 }
 
                 let mut out_color = [0.0f32; 4];
@@ -1019,7 +1026,7 @@ where F: Fn(&ClipVertex) -> f32 {
 /// Bundling these into a struct so future rasterizer phases
 /// (R.3 depth, R.4 clipping, R.5 blending, ...) can grow
 /// fields without breaking every caller's argument order.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct DrawTriangle<'a> {
     /// Per-vertex attribute buffers fed to the vertex shader.
     /// Layout is dictated by the VS's SPIR-V `Input`
@@ -1091,6 +1098,34 @@ pub struct DrawTriangle<'a> {
     /// default and the convention the rasterizer's
     /// `edge_fn` uses (CCW screen winding ⇒ `total_edge > 0`).
     pub front_face: FrontFace,
+
+    /// When `true`, fragments that pass the depth test
+    /// overwrite the depth buffer (the usual default).
+    /// When `false`, the depth test still gates colour
+    /// output but the depth buffer is left untouched --
+    /// matches Vulkan's `VkPipelineDepthStencilStateCreate
+    /// Info::depthWriteEnable` when the test is on.  Has
+    /// no effect when no depth buffer is bound (`depth ==
+    /// None` on `fill_image_triangle`).
+    pub depth_write: bool,
+}
+
+impl Default for DrawTriangle<'_> {
+    fn default() -> Self {
+        DrawTriangle {
+            vertex_attrs: [&[], &[], &[]],
+            varyings_per_vertex: [&[], &[], &[]],
+            varying_f32_count: 0,
+            uniforms: &[],
+            push_constants: &[],
+            blend_state: BlendState::default(),
+            viewport: None,
+            scissor:  None,
+            cull_mode: CullMode::default(),
+            front_face: FrontFace::default(),
+            depth_write: true,
+        }
+    }
 }
 
 /// Triangle cull mode for the rasterizer.

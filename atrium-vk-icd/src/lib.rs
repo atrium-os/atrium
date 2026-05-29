@@ -3823,8 +3823,32 @@ pub unsafe extern "C" fn vkCmdSetFrontFace(
 }
 
 ext_state_stub_u32!(vkCmdSetPrimitiveTopology);
-ext_state_stub_u32!(vkCmdSetDepthTestEnable);
-ext_state_stub_u32!(vkCmdSetDepthWriteEnable);
+
+// Dynamic depth-test toggle (`vkCmdSetDepthTestEnable` /
+// `vkCmdSetDepthWriteEnable`) -- the rasterizer's per-pass
+// depth test is now overridable per cmdbuf state.  Same
+// shape as vkCmdSetCullMode: 4-byte u32 (Vk passes a
+// VkBool32 here, 0 = disable, non-zero = enable).
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdSetDepthTestEnable(
+    command_buffer: VkCommandBuffer,
+    enable:         u32, /* VkBool32 */
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    let body = enable.to_le_bytes();
+    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::SetDepthTestEnable, &body);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdSetDepthWriteEnable(
+    command_buffer: VkCommandBuffer,
+    enable:         u32, /* VkBool32 */
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    let body = enable.to_le_bytes();
+    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::SetDepthWriteEnable, &body);
+}
+
 ext_state_stub_u32!(vkCmdSetDepthCompareOp);
 ext_state_stub_u32!(vkCmdSetDepthBoundsTestEnable);
 ext_state_stub_u32!(vkCmdSetStencilTestEnable);
