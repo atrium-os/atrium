@@ -31,6 +31,14 @@ pub enum VertexFormat {
     /// `u8 / 255.0`, the spec-defined UNORM decoding.  Lets
     /// real apps feed packed vertex colours.
     R8g8b8a8Unorm   = 5,
+    /// `VK_FORMAT_R16G16_SFLOAT` — 2 × f16 in the source
+    /// (4 bytes), expanded to 2 × f32 (8 bytes).  Common for
+    /// compact UVs / 2D positions.
+    R16g16Sfloat    = 6,
+    /// `VK_FORMAT_R16G16B16A16_SFLOAT` — 4 × f16 in the
+    /// source (8 bytes), expanded to 4 × f32 (16 bytes).
+    /// Common for compact positions / normals / colours.
+    R16g16b16a16Sfloat = 7,
 }
 
 impl VertexFormat {
@@ -46,6 +54,8 @@ impl VertexFormat {
             VertexFormat::R32g32b32Sfloat      => 12,
             VertexFormat::R32g32b32a32Sfloat   => 16,
             VertexFormat::R8g8b8a8Unorm        => 4,
+            VertexFormat::R16g16Sfloat         => 4,
+            VertexFormat::R16g16b16a16Sfloat   => 8,
         }
     }
 
@@ -66,6 +76,8 @@ impl VertexFormat {
             VertexFormat::R32g32b32Sfloat      => 3,
             VertexFormat::R32g32b32a32Sfloat   => 4,
             VertexFormat::R8g8b8a8Unorm        => 4,
+            VertexFormat::R16g16Sfloat         => 2,
+            VertexFormat::R16g16b16a16Sfloat   => 4,
         }
     }
 }

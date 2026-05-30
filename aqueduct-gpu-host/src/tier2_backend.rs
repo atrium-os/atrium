@@ -2143,6 +2143,18 @@ impl Tier2Backend {
                                 .copy_from_slice(&b);
                         }
                     }
+                    aqueduct_gpu::VertexFormat::R16g16Sfloat
+                    | aqueduct_gpu::VertexFormat::R16g16b16a16Sfloat => {
+                        // N f16 -> N f32 (N = packed_size / 4).
+                        let lanes = packed_size / 4;
+                        for lane in 0..lanes {
+                            let h = u16::from_le_bytes(
+                                src_bytes[lane * 2..lane * 2 + 2].try_into().unwrap());
+                            let v = half_to_f32(h);
+                            dst_bytes[lane * 4..lane * 4 + 4]
+                                .copy_from_slice(&v.to_le_bytes());
+                        }
+                    }
                 }
             }
         }
@@ -3619,6 +3631,31 @@ fn decode_compare_op(v: u32) -> CompareOp {
         6 => CompareOp::GreaterOrEqual,
         7 => CompareOp::Always,
         _ => CompareOp::Less,
+    }
+}
+
+/// Decode an IEEE-754 half-precision (binary16) value to
+/// f32.  Handles subnormals, infinities, and NaN.  Used by
+/// the vertex assembler for `R16G16(B16A16)_SFLOAT`.
+fn half_to_f32(h: u16) -> f32 {
+    let sign = (h >> 15) & 0x1;
+    let exp  = (h >> 10) & 0x1f;
+    let mant = h & 0x3ff;
+    let sign_f = if sign == 1 { -1.0f32 } else { 1.0f32 };
+    match exp {
+        0 => {
+            // Zero or subnormal: value = mant * 2^-24.
+            sign_f * (mant as f32) * (1.0 / 16_777_216.0)
+        }
+        0x1f => {
+            // Inf / NaN.
+            if mant == 0 { sign_f * f32::INFINITY } else { f32::NAN }
+        }
+        _ => {
+            // Normal: (1 + mant/1024) * 2^(exp-15).
+            let m = 1.0 + (mant as f32) / 1024.0;
+            sign_f * m * 2.0f32.powi(exp as i32 - 15)
+        }
     }
 }
 
