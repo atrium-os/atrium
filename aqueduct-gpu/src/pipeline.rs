@@ -567,7 +567,15 @@ pub struct Tier2PipelineStateBlob {
     /// SPIR-V scan of the FS module.
     #[serde(default)]
     pub fs_uses_implicit_lod: bool,
+    /// MSAA rasterization sample count from
+    /// `VkPipelineMultisampleStateCreateInfo::rasterization
+    /// Samples` (1 = no MSAA).  The rasterizer does coverage-
+    /// resolved multisampling when > 1.
+    #[serde(default = "default_sample_count")]
+    pub sample_count: u32,
 }
+
+fn default_sample_count() -> u32 { 1 }
 
 #[cfg(test)]
 mod tests {

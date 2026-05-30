@@ -291,6 +291,13 @@ pub trait Backend: Send + Sync {
         _uses_implicit_lod: bool,
     ) {}
 
+    /// Record the pipeline's MSAA sample count.  Default no-op.
+    fn bind_pipeline_sample_count(
+        &self,
+        _pipeline_id: ResourceId,
+        _sample_count: u32,
+    ) {}
+
     /// Associate a compute pipeline with its Tier-2 shader +
     /// workgroup-size state. Mirror of
     /// [`Backend::bind_pipeline_tier2_vs`] /

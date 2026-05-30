@@ -3347,10 +3347,19 @@ unsafe fn build_tier2_pipeline_blob(
         })
     };
 
+    // Multisample state: rasterizationSamples (VkSampleCount
+    // bitflag where the value IS the sample count: 1,2,4,8...).
+    let sample_count = if info.p_multisample_state.is_null() {
+        1
+    } else {
+        let ms = &*info.p_multisample_state;
+        (ms.rasterization_samples.as_raw()).max(1)
+    };
+
     let blob = Tier2PipelineStateBlob {
         vertex_input, depth, blend, blend_extra, raster,
         topology, primitive_restart_enable, stencil,
-        vs_varying_bytes, fs_uses_implicit_lod,
+        vs_varying_bytes, fs_uses_implicit_lod, sample_count,
     };
     let bytes = postcard::to_allocvec(&blob).ok()?;
     Some((vec![vs_id, fs_id], bytes))

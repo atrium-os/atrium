@@ -121,6 +121,8 @@ pub struct Tier2Backend {
     /// selection so explicit-LOD shaders keep their shared
     /// descriptor intact.
     pipeline_fs_implicit_lod: Mutex<HashMap<u32, bool>>,
+    /// Per-graphics-pipeline MSAA sample count (1 = none).
+    pipeline_sample_count: Mutex<HashMap<u32, u32>>,
     /// Per-pipeline compute-shader binding: Tier-2 shader id
     /// + workgroup local-size. Populated when the session
     /// processes a Compute-kind pipeline create.
@@ -701,6 +703,7 @@ impl Tier2Backend {
             pipeline_blend_extra: Mutex::new(HashMap::new()),
             pipeline_vs_varying_bytes: Mutex::new(HashMap::new()),
             pipeline_fs_implicit_lod: Mutex::new(HashMap::new()),
+            pipeline_sample_count: Mutex::new(HashMap::new()),
             pipeline_compute: Mutex::new(HashMap::new()),
             cs_invocations: AtomicU64::new(0),
             last_compute_output: Mutex::new(None),
@@ -1807,6 +1810,8 @@ impl Tier2Backend {
             .get(&pipeline_raw).copied().unwrap_or(0) as usize) / 4;
         let fs_implicit_lod = self.pipeline_fs_implicit_lod.lock().unwrap()
             .get(&pipeline_raw).copied().unwrap_or(false);
+        let sample_count = self.pipeline_sample_count.lock().unwrap()
+            .get(&pipeline_raw).copied().unwrap_or(1);
 
         // Build the uniforms buffer if any COMBINED_IMAGE_SAMPLER
         // bindings are live.  Layout (atrium-spv-runtime
@@ -2013,6 +2018,7 @@ impl Tier2Backend {
                 compute_implicit_lod: fs_implicit_lod
                     && !state.bound_textures.is_empty()
                     && varying_f32_count >= 2,
+                sample_count,
                 ..Default::default()
             };
             let db_ref: Option<&mut [f32]> = if !depth_enabled {
@@ -3130,6 +3136,8 @@ impl Tier2Backend {
             .get(&pipeline_raw).copied().unwrap_or(0) as usize) / 4;
         let fs_implicit_lod = self.pipeline_fs_implicit_lod.lock().unwrap()
             .get(&pipeline_raw).copied().unwrap_or(false);
+        let sample_count = self.pipeline_sample_count.lock().unwrap()
+            .get(&pipeline_raw).copied().unwrap_or(1);
 
         let dt_viewport = state.viewport.map(|v| Viewport {
             x: v.x, y: v.y, width: v.width, height: v.height,
@@ -3199,6 +3207,7 @@ impl Tier2Backend {
                 compute_implicit_lod: fs_implicit_lod
                     && !state.bound_textures.is_empty()
                     && varying_f32_count >= 2,
+                sample_count,
                 ..Default::default()
             };
             let db_ref = if depth_enabled {
@@ -3522,6 +3531,15 @@ impl Backend for Tier2Backend {
     ) {
         self.pipeline_fs_implicit_lod.lock().unwrap()
             .insert(pipeline_id.raw(), uses_implicit_lod);
+    }
+
+    fn bind_pipeline_sample_count(
+        &self,
+        pipeline_id: ResourceId,
+        sample_count: u32,
+    ) {
+        self.pipeline_sample_count.lock().unwrap()
+            .insert(pipeline_id.raw(), sample_count.max(1));
     }
 
     fn bind_pipeline_tier2_compute(

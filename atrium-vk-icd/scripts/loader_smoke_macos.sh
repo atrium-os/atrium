@@ -193,6 +193,7 @@ GRAPHICS_DEPTH_BIAS="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graph
 GRAPHICS_RESTART="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_restart"
 GRAPHICS_MIPMAP="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_mipmap"
 GRAPHICS_LOD="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_lod"
+GRAPHICS_MSAA="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_msaa"
 GRAPHICS_ARRAY="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_array"
 GRAPHICS_CUBE="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_cube"
 GRAPHICS_SHADOW="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_shadow"
@@ -2021,6 +2022,44 @@ if [ -x "$GRAPHICS_LOD" ]; then
 else
     echo
     echo "SKIP Rung OO: need 'cargo build -p atrium-vk-icd --example loader_graphics_lod'"
+fi
+
+# ── Rung PP: 4x MSAA (coverage-resolved) ─────────────────
+# loader_graphics_msaa: pipeline rasterizationSamples=4,
+# pure-red triangle over a black clear.  The rasterizer
+# tests 4 sub-pixel sample points per pixel and blends the
+# fragment by the covered fraction, so triangle edges come
+# out as partial reds (antialiased).  Asserts >=1 pixel with
+# 0<R<255 + solid-red interior + black corner.  Without MSAA
+# every pixel is binary (R=0 or 255).
+if [ -x "$GRAPHICS_MSAA" ]; then
+    rm -f "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+        echo "daemon failed to start (msaa round-trip); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung PP: 4x MSAA antialiased edges ==="
+    if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+        VK_DRIVER_FILES="$MANIFEST" \
+        ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+        "$GRAPHICS_MSAA" 2>&1 | tail -4; then
+        echo "FAIL: msaa round-trip did not return 0" >&2
+        exit 1
+    fi
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
+else
+    echo
+    echo "SKIP Rung PP: need 'cargo build -p atrium-vk-icd --example loader_graphics_msaa'"
 fi
 
 echo

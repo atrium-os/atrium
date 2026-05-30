@@ -1046,8 +1046,42 @@ fn rasterize_stripe(
                 let we2 = edge_fn(a, b, (cx, cy));
                 let inside_pos = we0 >= 0.0 && we1 >= 0.0 && we2 >= 0.0;
                 let inside_neg = we0 <= 0.0 && we1 <= 0.0 && we2 <= 0.0;
-                if !(inside_pos || inside_neg) { continue; }
+                let center_inside = inside_pos || inside_neg;
                 if setup.total_edge == 0.0 { continue; }
+
+                // MSAA coverage: with sample_count > 1, test N
+                // sub-pixel sample points and accept the pixel
+                // if ANY is covered; `coverage` is the covered
+                // fraction, used to blend the fragment colour
+                // with the destination (coverage-resolved
+                // MSAA).  Single-sample keeps the exact
+                // center-in/out test (coverage 1.0 or skip).
+                let coverage: f32 = if draw.sample_count > 1 {
+                    // Standard 4x sample offsets within the
+                    // pixel (Vulkan-ish rotated grid), capped
+                    // at 4 samples.
+                    const OFFS: [(f32, f32); 4] = [
+                        (0.375, 0.125), (0.875, 0.375),
+                        (0.125, 0.625), (0.625, 0.875),
+                    ];
+                    let nsamp = (draw.sample_count as usize).min(4);
+                    let mut covered = 0u32;
+                    for &(ox, oy) in &OFFS[..nsamp] {
+                        let sx = px as f32 + ox;
+                        let sy = py as f32 + oy;
+                        let s0 = edge_fn(b, c, (sx, sy));
+                        let s1 = edge_fn(c, a, (sx, sy));
+                        let s2 = edge_fn(a, b, (sx, sy));
+                        let inside = (s0 >= 0.0 && s1 >= 0.0 && s2 >= 0.0)
+                            || (s0 <= 0.0 && s1 <= 0.0 && s2 <= 0.0);
+                        if inside { covered += 1; }
+                    }
+                    if covered == 0 { continue; }
+                    covered as f32 / nsamp as f32
+                } else {
+                    if !center_inside { continue; }
+                    1.0
+                };
 
                 let b0 = we0 / setup.total_edge;
                 let b1 = we1 / setup.total_edge;
@@ -1297,15 +1331,26 @@ fn rasterize_stripe(
                         draw.blend_extra.get(slot - 1).unwrap_or(&draw.blend_state)
                     };
                     let am = abs.write_mask;
-                    let final_color = if abs.enable {
-                        let dst = [
-                            target[idx]     as f32 / 255.0,
-                            target[idx + 1] as f32 / 255.0,
-                            target[idx + 2] as f32 / 255.0,
-                            target[idx + 3] as f32 / 255.0,
-                        ];
+                    let dst = [
+                        target[idx]     as f32 / 255.0,
+                        target[idx + 1] as f32 / 255.0,
+                        target[idx + 2] as f32 / 255.0,
+                        target[idx + 3] as f32 / 255.0,
+                    ];
+                    let mut final_color = if abs.enable {
                         apply_blend(abs, src, dst)
                     } else { src };
+                    // MSAA coverage resolve: lerp toward the
+                    // destination by (1 - coverage).  Interior
+                    // pixels (coverage 1.0) are unchanged;
+                    // edge pixels blend with what's already
+                    // there (the clear / prior geometry).
+                    if coverage < 1.0 {
+                        for ch in 0..4 {
+                            final_color[ch] = dst[ch] * (1.0 - coverage)
+                                + final_color[ch] * coverage;
+                        }
+                    }
                     if am.r { target[idx]     = f32_to_u8(final_color[0]); }
                     if am.g { target[idx + 1] = f32_to_u8(final_color[1]); }
                     if am.b { target[idx + 2] = f32_to_u8(final_color[2]); }
@@ -1502,6 +1547,14 @@ pub struct DrawTriangle<'a> {
     /// stencil support).
     pub stencil: Option<StencilState>,
 
+    /// MSAA rasterization sample count (1 = no MSAA).  When
+    /// > 1, the rasterizer tests N sub-pixel sample points
+    /// per pixel for coverage and blends the fragment colour
+    /// with the destination by the covered fraction
+    /// (coverage-resolved MSAA -- the correct resolved
+    /// output for opaque single-triangle edges).
+    pub sample_count: u32,
+
     /// When true, the rasterizer computes a per-pixel mip
     /// LOD from the screen-space gradient of the UV varying
     /// (lanes 0,1) and redirects the binding-0 texture
@@ -1602,6 +1655,7 @@ impl Default for DrawTriangle<'_> {
             stencil: None,
             depth_bias: None,
             compute_implicit_lod: false,
+            sample_count: 1,
         }
     }
 }
