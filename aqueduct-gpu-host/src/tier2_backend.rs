@@ -257,6 +257,11 @@ struct PassState {
     /// means draws fall back to the per-pass scratch depth
     /// buffer.
     depth_attachment: Option<u32>,
+    /// MRT secondary colour attachment image IDs (colour
+    /// attachments 1..N; attachment 0 is the pass's primary
+    /// target).  Set by `FrameOp::BindColorAttachments`.
+    /// Empty for single-attachment passes.
+    extra_color_targets: Vec<u32>,
     /// Vertex-buffer bindings keyed by slot number.
     vertex_buffers: HashMap<u32, BoundVertexBuffer>,
     /// Currently-bound index buffer.
@@ -1358,6 +1363,23 @@ impl Tier2Backend {
                         Err(e) => log::warn!("malformed BindDepthAttachment: {e}"),
                     }
                 }
+                FrameOp::BindColorAttachments => {
+                    // Body: count u32, then count × image_id u32.
+                    if body.len() >= 4 {
+                        let count = u32::from_le_bytes(
+                            body[0..4].try_into().unwrap()) as usize;
+                        let mut ids = Vec::with_capacity(count);
+                        for i in 0..count {
+                            let off = 4 + i * 4;
+                            if off + 4 > body.len() { break; }
+                            ids.push(u32::from_le_bytes(
+                                body[off..off+4].try_into().unwrap()));
+                        }
+                        state.extra_color_targets = ids;
+                    } else {
+                        log::warn!("malformed BindColorAttachments body length: {}", body.len());
+                    }
+                }
                 FrameOp::PushConstants => {
                     // Body shape: 4-byte header (stage_mask u8 +
                     // offset u8 + reserved u16) followed by the
@@ -1581,20 +1603,35 @@ impl Tier2Backend {
         };
 
         // Lock the image storage for the duration of all
-        // triangles in this Draw. Each fill_image_triangle
-        // call mutates the target's pixel buffer; we hold the
-        // map lock to avoid the map being reshaped under us.
+        // triangles in this Draw.  For MRT we remove the
+        // primary + every secondary colour attachment from
+        // the map into owned storages so we can hold N
+        // disjoint `&mut` borrows (HashMap can't hand out
+        // more than one get_mut at a time); they're
+        // re-inserted after the render block.  The lock is
+        // held throughout so no other thread reshapes the
+        // map or re-creates a removed id mid-draw.
         let mut images = self.images.lock().unwrap();
-        let img = match images.get_mut(&(target_id.raw() as u64)) {
+        let mut primary = match images.remove(&(target_id.raw() as u64)) {
             Some(i) => i,
             None => {
                 log::warn!("Draw target={target_id}: target image not registered");
                 return;
             }
         };
-        let width = img.width;
-        let height = img.height;
-        let pixels = &mut img.pixels[..];
+        let mut extra_storages: Vec<(u32, ImageStorage)> =
+            state.extra_color_targets.iter()
+                .filter(|&&e| e as u64 != target_id.raw() as u64)
+                .filter_map(|&e| images.remove(&(e as u64)).map(|s| (e, s)))
+                .collect();
+        let width = primary.width;
+        let height = primary.height;
+        // Render block: scopes the `&mut` borrows of primary
+        // + extra_storages so they end before re-insertion.
+        let render_ok = {
+        let pixels = &mut primary.pixels[..];
+        let mut extra_slices: Vec<&mut [u8]> = extra_storages
+            .iter_mut().map(|(_, s)| &mut s.pixels[..]).collect();
 
         // D.6: raster state -> per-draw blend + depth.
         let raster = state.raster.unwrap_or_default();
@@ -1906,11 +1943,22 @@ impl Tier2Backend {
             if let Err(e) = self.registry.fill_image_triangle(
                 vs_shader_id, fs_shader_id,
                 &dt, width, height, pixels, db_ref, sb_ref,
+                &mut extra_slices,
             ) {
                 log::warn!("Draw target={target_id}: triangle {t}/{tri_count} \
                             fill_image_triangle failed: {e}");
-                return;
+                // Don't early-return: fall through so the
+                // owned attachment storages are re-inserted.
+                break;
             }
+        }
+        true
+        }; // end render block -- pixels / extra_slices borrows end here
+        let _ = render_ok;
+        // Re-insert the owned attachment storages.
+        images.insert(target_id.raw() as u64, primary);
+        for (eid, st) in extra_storages {
+            images.insert(eid as u64, st);
         }
     }
 
@@ -2907,17 +2955,27 @@ impl Tier2Backend {
                        assembled.vertex_count, n_verts - tri_count * 3);
         }
 
+        // MRT: same owned-removal pattern as dispatch_draw --
+        // see the comment there.
         let mut images = self.images.lock().unwrap();
-        let img = match images.get_mut(&(target_id.raw() as u64)) {
+        let mut primary = match images.remove(&(target_id.raw() as u64)) {
             Some(i) => i,
             None => {
                 log::warn!("DrawIndexed target={target_id}: target image not registered");
                 return;
             }
         };
-        let width = img.width;
-        let height = img.height;
-        let pixels = &mut img.pixels[..];
+        let mut extra_storages: Vec<(u32, ImageStorage)> =
+            state.extra_color_targets.iter()
+                .filter(|&&e| e as u64 != target_id.raw() as u64)
+                .filter_map(|&e| images.remove(&(e as u64)).map(|s| (e, s)))
+                .collect();
+        let width = primary.width;
+        let height = primary.height;
+        let render_ok = {
+        let pixels = &mut primary.pixels[..];
+        let mut extra_slices: Vec<&mut [u8]> = extra_storages
+            .iter_mut().map(|(_, s)| &mut s.pixels[..]).collect();
 
         let raster = state.raster.unwrap_or_default();
         // Pipeline-static depth state.
@@ -3061,11 +3119,19 @@ impl Tier2Backend {
             if let Err(e) = self.registry.fill_image_triangle(
                 vs_shader_id, fs_shader_id,
                 &dt, width, height, pixels, db_ref, sb_ref,
+                &mut extra_slices,
             ) {
                 log::warn!("DrawIndexed target={target_id}: triangle \
                             fill_image_triangle failed: {e}");
-                return;
+                break;
             }
+        }
+        true
+        }; // end render block
+        let _ = render_ok;
+        images.insert(target_id.raw() as u64, primary);
+        for (eid, st) in extra_storages {
+            images.insert(eid as u64, st);
         }
     }
 }

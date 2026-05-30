@@ -755,6 +755,7 @@ impl<'a> TinySkiaRenderer<'a> {
                 | FrameOp::BindVertexBuf
                 | FrameOp::BindIndexBuf
                 | FrameOp::BindDepthAttachment
+                | FrameOp::BindColorAttachments
                 | FrameOp::SetViewport
                 | FrameOp::SetCullMode
                 | FrameOp::SetFrontFace

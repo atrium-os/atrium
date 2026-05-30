@@ -1121,6 +1121,22 @@ fn emit_function(
         }
     }
 
+    // Fragment Location-decorated outputs (MRT): route each
+    // colour output to X4 (out_color) + the per-Location
+    // byte offset.  A single Location=0 output gets offset 0
+    // -- identical to the generic (Fragment, Output) -> X4
+    // fallback, so single-attachment shaders are unchanged.
+    // Multi-attachment shaders write Location=1 at X4+16,
+    // etc.; the daemon sizes out_color to cover every
+    // Location and scatters each slot to its attachment.
+    if func.stage == ShaderStage::Fragment
+        && !func.output_varying_byte_offset.is_empty()
+    {
+        for (&vid, &voff) in &func.output_varying_byte_offset {
+            pointers.insert(vid, (asm::Xreg(4), voff as i32));
+        }
+    }
+
     // Location-decorated `Input`-storage vars (VS attrs and
     // FS varyings): both stages take the input buffer as
     // X0 (in_attributes for VS, in_varyings for FS).

@@ -190,7 +190,7 @@ fn rasterizer_r1_hello_triangle() {
         &draw,
         8, 8,
         &mut pixels,
-        None,
+        None, None, &mut [],
     ).expect("rasterise");
 
     // Helper: extract one RGBA pixel.
@@ -318,7 +318,7 @@ fn rasterizer_r2_varying_color_gradient() {
         ..Default::default()
     };
     registry.fill_image_triangle(
-        vs_id, fs_id, &draw, 16, 16, &mut pixels, None,
+        vs_id, fs_id, &draw, 16, 16, &mut pixels, None, None, &mut [],
     ).expect("rasterise gradient");
 
     let px = |x: usize, y: usize| -> [u8; 4] {
@@ -415,7 +415,7 @@ fn rasterizer_r2_perspective_correct_varies_with_w() {
         ..Default::default()
     };
     registry.fill_image_triangle(
-        vs_id, fs_id, &draw, 16, 16, &mut pixels, None,
+        vs_id, fs_id, &draw, 16, 16, &mut pixels, None, None, &mut [],
     ).expect("rasterise PC");
 
     let px = |x: usize, y: usize| -> [u8; 4] {
@@ -502,7 +502,7 @@ fn rasterizer_r3_depth_test_rejects_farther_triangle() {
         ..Default::default()
     };
     registry.fill_image_triangle(
-        vs_id, fs_id, &draw_a, 16, 16, &mut pixels, Some(&mut depth),
+        vs_id, fs_id, &draw_a, 16, 16, &mut pixels, Some(&mut depth), None, &mut [],
     ).expect("draw A");
 
     // Draw B second.  Its depth (0.5) is greater than A's
@@ -515,7 +515,7 @@ fn rasterizer_r3_depth_test_rejects_farther_triangle() {
         ..Default::default()
     };
     registry.fill_image_triangle(
-        vs_id, fs_id, &draw_b, 16, 16, &mut pixels, Some(&mut depth),
+        vs_id, fs_id, &draw_b, 16, 16, &mut pixels, Some(&mut depth), None, &mut [],
     ).expect("draw B");
 
     // Scan the whole image: no pixel should be blue.  Pixels
@@ -601,7 +601,7 @@ fn rasterizer_r3_depth_test_accepts_nearer_triangle() {
         ..Default::default()
     };
     registry.fill_image_triangle(
-        vs_id, fs_id, &draw_b, 16, 16, &mut pixels, Some(&mut depth),
+        vs_id, fs_id, &draw_b, 16, 16, &mut pixels, Some(&mut depth), None, &mut [],
     ).expect("draw B first");
 
     // Draw A (near) second.  Should overwrite.
@@ -612,7 +612,7 @@ fn rasterizer_r3_depth_test_accepts_nearer_triangle() {
         ..Default::default()
     };
     registry.fill_image_triangle(
-        vs_id, fs_id, &draw_a, 16, 16, &mut pixels, Some(&mut depth),
+        vs_id, fs_id, &draw_a, 16, 16, &mut pixels, Some(&mut depth), None, &mut [],
     ).expect("draw A second");
 
     let mut blue_pixels = 0usize;
@@ -682,7 +682,7 @@ fn rasterizer_r4_near_plane_clips_behind_camera_vertex() {
         ..Default::default()
     };
     registry.fill_image_triangle(
-        vs_id, fs_id, &draw, 16, 16, &mut pixels, Some(&mut depth),
+        vs_id, fs_id, &draw, 16, 16, &mut pixels, Some(&mut depth), None, &mut [],
     ).expect("clip + rasterise");
 
     // No depth value below 0.0 — without clipping the
@@ -736,7 +736,7 @@ fn rasterizer_r4_fully_behind_near_is_culled() {
         ..Default::default()
     };
     registry.fill_image_triangle(
-        vs_id, fs_id, &draw, 16, 16, &mut pixels, Some(&mut depth),
+        vs_id, fs_id, &draw, 16, 16, &mut pixels, Some(&mut depth), None, &mut [],
     ).expect("fully-clipped rasterise");
 
     let lit = pixels.chunks(4).any(|p| p != [0, 0, 0, 0]);
@@ -778,7 +778,7 @@ fn rasterizer_r4_fully_beyond_far_is_culled() {
         ..Default::default()
     };
     registry.fill_image_triangle(
-        vs_id, fs_id, &draw, 16, 16, &mut pixels, Some(&mut depth),
+        vs_id, fs_id, &draw, 16, 16, &mut pixels, Some(&mut depth), None, &mut [],
     ).expect("far-clipped rasterise");
 
     let lit = pixels.chunks(4).any(|p| p != [0, 0, 0, 0]);
@@ -835,7 +835,7 @@ fn rasterizer_r5_alpha_over_red_on_green() {
         ..Default::default()
     };
     registry.fill_image_triangle(
-        vs_id, fs_id, &draw, 16, 16, &mut pixels, None,
+        vs_id, fs_id, &draw, 16, 16, &mut pixels, None, None, &mut [],
     ).expect("alpha-over rasterise");
 
     let px = |x: usize, y: usize| -> [u8; 4] {
@@ -908,7 +908,7 @@ fn rasterizer_r5_write_mask_blocks_blue() {
         ..Default::default()
     };
     registry.fill_image_triangle(
-        vs_id, fs_id, &draw, 16, 16, &mut pixels, None,
+        vs_id, fs_id, &draw, 16, 16, &mut pixels, None, None, &mut [],
     ).expect("write-masked rasterise");
 
     let interior = {
@@ -968,7 +968,7 @@ fn rasterizer_r5_blend_disabled_is_source_replace() {
         ..Default::default()
     };
     registry.fill_image_triangle(
-        vs_id, fs_id, &draw, 16, 16, &mut pixels, None,
+        vs_id, fs_id, &draw, 16, 16, &mut pixels, None, None, &mut [],
     ).expect("disabled-blend rasterise");
 
     // Inside the triangle, the source colour replaces the dst.
@@ -1029,7 +1029,7 @@ fn rasterizer_r6_tiles_24x24_spanning_9_tiles() {
         ..Default::default()
     };
     registry.fill_image_triangle(
-        vs_id, fs_id, &draw, 24, 24, &mut pixels, None,
+        vs_id, fs_id, &draw, 24, 24, &mut pixels, None, None, &mut [],
     ).expect("tiled rasterise");
 
     let px = |x: usize, y: usize| -> [u8; 4] {
@@ -1130,7 +1130,7 @@ fn rasterizer_r7_parallel_stripes_correct() {
 
     let t = std::time::Instant::now();
     registry.fill_image_triangle(
-        vs_id, fs_id, &draw, w, h, &mut pixels, None,
+        vs_id, fs_id, &draw, w, h, &mut pixels, None, None, &mut [],
     ).expect("R.7 parallel rasterise");
     let elapsed = t.elapsed();
     // Loose perf bound -- correctness is the headline,
@@ -1277,7 +1277,7 @@ fn rasterizer_r1_degenerate_triangle_covers_only_line_pixels() {
         &draw,
         8, 8,
         &mut pixels,
-        None,
+        None, None, &mut [],
     ).expect("degenerate rasterise");
 
     // Pixel centres at y=4.5 are on a horizontal line in NDC y=0
@@ -1338,7 +1338,7 @@ fn rasterizer_r4v2_right_side_plane_clips_off_screen_vertex() {
         ..Default::default()
     };
     registry.fill_image_triangle(
-        vs_id, fs_id, &draw, 16, 16, &mut pixels, None,
+        vs_id, fs_id, &draw, 16, 16, &mut pixels, None, None, &mut [],
     ).expect("clip + rasterise");
 
     let mut painted = 0usize;
@@ -1393,7 +1393,7 @@ fn rasterizer_r4v2_fully_off_right_side_culled() {
         ..Default::default()
     };
     registry.fill_image_triangle(
-        vs_id, fs_id, &draw, 16, 16, &mut pixels, None,
+        vs_id, fs_id, &draw, 16, 16, &mut pixels, None, None, &mut [],
     ).expect("clip + rasterise");
 
     assert!(pixels.iter().all(|&b| b == 0),

@@ -195,6 +195,7 @@ GRAPHICS_MIPMAP="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_
 GRAPHICS_ARRAY="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_array"
 GRAPHICS_CUBE="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_cube"
 GRAPHICS_SHADOW="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_shadow"
+GRAPHICS_MRT="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_mrt"
 DAEMON="$REPO_ROOT/aqueduct-gpu-host/target/debug/aqueduct-gpu-host"
 COMPILE="$REPO_ROOT/atrium-spv-compile/target/debug/atrium-spv-compile"
 SLANGC="$REPO_ROOT/external/slang-bin/bin/slangc"
@@ -1788,6 +1789,46 @@ if [ -x "$GRAPHICS_SHADOW" ]; then
 else
     echo
     echo "SKIP Rung II: need 'cargo build -p atrium-vk-icd --example loader_graphics_shadow'"
+fi
+
+# ── Rung JJ: multiple render targets (MRT) ───────────────
+# loader_graphics_mrt: FS writes Location 0 = red (-> colour
+# attachment 0) + Location 1 = green (-> colour attachment 1)
+# in one invocation, against a 2-attachment framebuffer.
+# Each attachment is copied back independently.  attachment0
+# pixel(3,3)=red, attachment1 pixel(3,3)=green.  Exercises
+# the cranelift FS multi-output byte routing + the
+# BindColorAttachments wire op + the daemon's per-attachment
+# scatter.  Pre-MRT, the FS had a single output and the
+# render pass a single attachment.
+if [ -x "$GRAPHICS_MRT" ]; then
+    rm -f "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+        echo "daemon failed to start (MRT round-trip); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung JJ: MRT -- 2 FS outputs to 2 colour attachments ==="
+    if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+        VK_DRIVER_FILES="$MANIFEST" \
+        ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+        "$GRAPHICS_MRT" 2>&1 | tail -3; then
+        echo "FAIL: MRT round-trip did not return 0" >&2
+        exit 1
+    fi
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
+else
+    echo
+    echo "SKIP Rung JJ: need 'cargo build -p atrium-vk-icd --example loader_graphics_mrt'"
 fi
 
 echo

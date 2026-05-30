@@ -223,6 +223,13 @@ pub enum FrameOp {
     /// Tier-1 ignores unknown ops; tier-2 consumes this to
     /// persist depth across draws within and across passes.
     BindDepthAttachment = 0x0012,
+    /// Bind the secondary colour attachments for MRT.  Body:
+    /// `count: u32` followed by `count` × `image_id: u32`.
+    /// These are colour attachments 1..N (attachment 0 is the
+    /// render pass's primary `target_image_id`).  The FS
+    /// writes Location L to colour attachment L; the daemon
+    /// scatters per-Location.  Tier-1 ignores it.
+    BindColorAttachments = 0x0013,
 
     /// Bind a pipeline (graphics or compute) by its resolved ID.
     BindPipeline    = 0x0020,
@@ -322,6 +329,7 @@ impl FrameOp {
             0x0010 => FrameOp::BeginRenderPass,
             0x0011 => FrameOp::EndRenderPass,
             0x0012 => FrameOp::BindDepthAttachment,
+            0x0013 => FrameOp::BindColorAttachments,
             0x0020 => FrameOp::BindPipeline,
             0x0021 => FrameOp::BindDescriptors,
             0x0022 => FrameOp::BindVertexBuf,
@@ -374,6 +382,7 @@ mod tests {
         for op in [
             FrameOp::BeginRenderPass, FrameOp::EndRenderPass,
             FrameOp::BindDepthAttachment,
+            FrameOp::BindColorAttachments,
             FrameOp::BindPipeline, FrameOp::BindDescriptors,
             FrameOp::BindVertexBuf, FrameOp::BindIndexBuf,
             FrameOp::SetViewport, FrameOp::SetScissor,

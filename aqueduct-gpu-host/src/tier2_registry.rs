@@ -278,6 +278,11 @@ impl Tier2Registry {
         pixels: &mut [u8],
         mut depth_buffer: Option<&mut [f32]>,
         mut stencil_buffer: Option<&mut [u8]>,
+        // MRT: secondary colour attachments (1..N).  Empty for
+        // single-attachment draws.  Each is a full RGBA8
+        // buffer the same size as `pixels`; the FS writes
+        // Location L+1 into `extra_color[L]`.
+        extra_color: &mut [&mut [u8]],
     ) -> Result<(), Tier2ExecError> {
         let expected_len = (width as usize) * (height as usize) * 4;
         if pixels.len() != expected_len {
@@ -669,20 +674,40 @@ impl Tier2Registry {
                         .map(|_| None)
                         .collect(),
                 };
+            // MRT: chunk each extra colour attachment into
+            // stripes, then transpose into per-stripe Vecs so
+            // each StripeWork owns one slice of every extra
+            // attachment.  `extra_iters` holds a ChunksMut per
+            // attachment; pulling one `.next()` from each per
+            // stripe keeps them in lock-step with the primary
+            // pixel stripes.
+            let num_stripes = pixel_chunks.len();
+            let mut extra_iters: Vec<std::slice::ChunksMut<u8>> =
+                extra_color.iter_mut()
+                    .map(|buf| buf.chunks_mut(pixel_stripe_bytes))
+                    .collect();
+            let mut extra_per_stripe: Vec<Vec<&mut [u8]>> =
+                (0..num_stripes)
+                    .map(|_| extra_iters.iter_mut()
+                        .filter_map(|it| it.next())
+                        .collect())
+                    .collect();
             let mut tasks: Vec<StripeWork> = pixel_chunks
                 .into_iter()
                 .zip(depth_chunks.into_iter())
                 .zip(stencil_chunks.into_iter())
+                .zip(extra_per_stripe.drain(..))
                 .enumerate()
                 .filter(|(s, _)| {
                     let tile_y = *s as i32;
                     tile_y >= tile_min_y && tile_y <= tile_max_y
                 })
-                .map(|(s, ((px, dp), st))| StripeWork {
+                .map(|(s, (((px, dp), st), ex))| StripeWork {
                     stripe_y: s as i32,
                     pixels: px,
                     depth: dp,
                     stencil: st,
+                    extra_color: ex,
                 })
                 .collect();
 
@@ -844,6 +869,12 @@ struct StripeWork<'p, 'd> {
     /// `TILE_SIZE * width` u8 elements, or `None` when the
     /// caller didn't supply a stencil buffer.
     stencil: Option<&'d mut [u8]>,
+    /// MRT secondary colour attachments: one `TILE_SIZE *
+    /// width * 4`-byte stripe slice per extra attachment.
+    /// Empty for single-attachment draws.  Index = colour
+    /// attachment (L+1); the FS's Location L+1 output lands
+    /// in `out_color[(L+1)*4 ..]` and is scattered here.
+    extra_color: Vec<&'d mut [u8]>,
 }
 
 /// Per-stripe pixel loop.  Walks the tile columns that
@@ -1124,7 +1155,15 @@ fn rasterize_stripe(
                     }
                 }
 
-                let mut out_color = [0.0f32; 4];
+                // MRT: out_color holds 4 f32 per colour
+                // attachment.  Cap at 8 attachments (Vulkan's
+                // common max; spec-min is 4).  The FS writes
+                // Location L at out_color[L*4..]; unwritten
+                // slots stay 0.
+                const MAX_COLOR_ATTACHMENTS: usize = 8;
+                let n_color = (1 + task.extra_color.len())
+                    .min(MAX_COLOR_ATTACHMENTS);
+                let mut out_color = [0.0f32; MAX_COLOR_ATTACHMENTS * 4];
                 let mut out_depth = 0.0f32;
                 let in_varyings_ptr = if setup.n == 0 {
                     std::ptr::null()
@@ -1134,7 +1173,10 @@ fn rasterize_stripe(
                 // open time; all pointers are valid for the
                 // lifetime of this call.  Disjoint per-stripe
                 // pixel ownership means concurrent calls
-                // from different tasks don't race.
+                // from different tasks don't race.  out_color
+                // is sized for the max attachment count, so
+                // the FS's per-Location stores never run past
+                // it.
                 unsafe {
                     fs_main(
                         in_varyings_ptr, uni_ptr, pc_ptr,
@@ -1146,19 +1188,38 @@ fn rasterize_stripe(
                 }
                 let idx = pixel_lin_local * 4;
 
-                let final_color = if bs.enable {
-                    let dst = [
-                        task.pixels[idx]     as f32 / 255.0,
-                        task.pixels[idx + 1] as f32 / 255.0,
-                        task.pixels[idx + 2] as f32 / 255.0,
-                        task.pixels[idx + 3] as f32 / 255.0,
+                // Scatter each colour attachment.  Attachment
+                // 0 -> task.pixels; attachment k+1 ->
+                // task.extra_color[k].  Blend + write-mask
+                // apply per attachment (shared state in v1 --
+                // per-attachment blend is a follow-up).
+                for slot in 0..n_color {
+                    let src = [
+                        out_color[slot * 4],
+                        out_color[slot * 4 + 1],
+                        out_color[slot * 4 + 2],
+                        out_color[slot * 4 + 3],
                     ];
-                    apply_blend(bs, out_color, dst)
-                } else { out_color };
-                if m.r { task.pixels[idx]     = f32_to_u8(final_color[0]); }
-                if m.g { task.pixels[idx + 1] = f32_to_u8(final_color[1]); }
-                if m.b { task.pixels[idx + 2] = f32_to_u8(final_color[2]); }
-                if m.a { task.pixels[idx + 3] = f32_to_u8(final_color[3]); }
+                    let target: &mut [u8] = if slot == 0 {
+                        &mut task.pixels[..]
+                    } else {
+                        &mut task.extra_color[slot - 1][..]
+                    };
+                    if idx + 4 > target.len() { continue; }
+                    let final_color = if bs.enable {
+                        let dst = [
+                            target[idx]     as f32 / 255.0,
+                            target[idx + 1] as f32 / 255.0,
+                            target[idx + 2] as f32 / 255.0,
+                            target[idx + 3] as f32 / 255.0,
+                        ];
+                        apply_blend(bs, src, dst)
+                    } else { src };
+                    if m.r { target[idx]     = f32_to_u8(final_color[0]); }
+                    if m.g { target[idx + 1] = f32_to_u8(final_color[1]); }
+                    if m.b { target[idx + 2] = f32_to_u8(final_color[2]); }
+                    if m.a { target[idx + 3] = f32_to_u8(final_color[3]); }
+                }
             }
         }
     }

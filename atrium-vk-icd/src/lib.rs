@@ -4768,8 +4768,41 @@ pub unsafe extern "C" fn vkCmdBeginRenderPass(
         dev.images.lock().ok()
             .and_then(|m| m.get(&img).and_then(|x| x.image_id))
     };
-    let color_image_id = attachments.first().copied().and_then(resolve_image_id);
-    let depth_image_id = attachments.get(1).copied().and_then(resolve_image_id);
+    // Resolve a view to (image_id, is_depth_format).  MRT:
+    // partition the framebuffer attachments into colour
+    // (non-depth formats) and depth (VkFormat 124..=130) so
+    // multiple colour attachments are bound as MRT targets
+    // rather than mis-assumed as colour[0] + depth[1].
+    let resolve_full = |view: u64| -> Option<(aqueduct_gpu::ids::ResourceId, bool)> {
+        let img = dev.image_views.lock().ok()
+            .and_then(|v| v.get(&view).copied())?;
+        let images = dev.images.lock().ok()?;
+        let entry = images.get(&img)?;
+        let id = entry.image_id?;
+        let is_depth = (124..=130).contains(&entry.format);
+        Some((id, is_depth))
+    };
+    let mut color_ids: Vec<aqueduct_gpu::ids::ResourceId> = Vec::new();
+    let mut depth_image_id: Option<aqueduct_gpu::ids::ResourceId> = None;
+    for &view in &attachments {
+        match resolve_full(view) {
+            Some((id, true))  => { if depth_image_id.is_none() { depth_image_id = Some(id); } }
+            Some((id, false)) => color_ids.push(id),
+            None => {}
+        }
+    }
+    // Fallback for the legacy heuristic when format lookup
+    // fails (keeps single-colour passes working even if the
+    // image table is momentarily unavailable).
+    if color_ids.is_empty() {
+        if let Some(id) = attachments.first().copied().and_then(resolve_image_id) {
+            color_ids.push(id);
+        }
+        if depth_image_id.is_none() {
+            depth_image_id = attachments.get(1).copied().and_then(resolve_image_id);
+        }
+    }
+    let color_image_id = color_ids.first().copied();
 
     // Clear color: read 4 f32, quantize to RGBA8.  Clear
     // values are laid out per attachment in the same order:
@@ -4802,6 +4835,20 @@ pub unsafe extern "C" fn vkCmdBeginRenderPass(
     body[ 4.. 8].copy_from_slice(&clear_rgba8);
     // flags @ 8..12 already zero.
     let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::BeginRenderPass, &body);
+
+    // MRT: bind colour attachments 1..N (attachment 0 is the
+    // BeginRenderPass primary target above).  Body: count u32
+    // + count × image_id u32.
+    if color_ids.len() > 1 {
+        let extra = &color_ids[1..];
+        let mut mrt_body = Vec::with_capacity(4 + extra.len() * 4);
+        mrt_body.extend_from_slice(&(extra.len() as u32).to_le_bytes());
+        for id in extra {
+            mrt_body.extend_from_slice(&id.raw().to_le_bytes());
+        }
+        let _ = cb.frame.push(
+            aqueduct_gpu::opcodes::FrameOp::BindColorAttachments, &mrt_body);
+    }
 
     // Optional follow-up: depth attachment.  Tier-1 ignores
     // this op; tier-2 wires it into the persistent depth-
