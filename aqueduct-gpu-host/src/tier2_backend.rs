@@ -272,6 +272,11 @@ struct PassState {
     /// time (attachment 0's blend rides in the resolved
     /// `PipelineRasterState`).  Empty for single-attachment.
     blend_extra: Vec<BlendState>,
+    /// BeginRenderPass colour clear value (RGBA8).  `None`
+    /// when the pass set `BEGIN_RP_FLAG_NO_CLEAR` (partial-
+    /// redraw).  Used to clear secondary colour attachments
+    /// (the primary is cleared in the BeginRenderPass arm).
+    clear_color: Option<[u8; 4]>,
     /// Vertex-buffer bindings keyed by slot number.
     vertex_buffers: HashMap<u32, BoundVertexBuffer>,
     /// Currently-bound index buffer.
@@ -1102,6 +1107,33 @@ impl Tier2Backend {
             };
             let (op, body) = rec;
             match op {
+                FrameOp::BeginRenderPass => {
+                    // Body: target_image_id u32, clear_rgba8
+                    // [u8;4], flags u32 (12 B; flags optional).
+                    // Apply the colour clear to the primary
+                    // attachment unless BEGIN_RP_FLAG_NO_CLEAR
+                    // (0x1) is set.  Secondary attachments are
+                    // cleared when BindColorAttachments arrives
+                    // (the clear colour is stashed here).
+                    if body.len() >= 8 {
+                        let flags = if body.len() >= 12 {
+                            u32::from_le_bytes(body[8..12].try_into().unwrap())
+                        } else { 0 };
+                        const BEGIN_RP_FLAG_NO_CLEAR: u32 = 0x1;
+                        if flags & BEGIN_RP_FLAG_NO_CLEAR == 0 {
+                            let rgba = [body[4], body[5], body[6], body[7]];
+                            state.clear_color = Some(rgba);
+                            // Clear the primary colour target.
+                            if let Some(img) = self.images.lock().unwrap()
+                                .get_mut(&(target_id.raw() as u64))
+                            {
+                                fill_rgba8(&mut img.pixels, rgba);
+                            }
+                        } else {
+                            state.clear_color = None;
+                        }
+                    }
+                }
                 FrameOp::BindPipeline => {
                     if body.len() >= 4 {
                         let raw = u32::from_le_bytes([
@@ -1396,6 +1428,21 @@ impl Tier2Backend {
                             if off + 4 > body.len() { break; }
                             ids.push(u32::from_le_bytes(
                                 body[off..off+4].try_into().unwrap()));
+                        }
+                        // Clear each secondary attachment to
+                        // the pass clear colour (mirrors the
+                        // primary clear in the BeginRenderPass
+                        // arm).  Vulkan clears every attachment
+                        // with loadOp=CLEAR; without this MRT
+                        // attachments 1..N kept stale / zeroed
+                        // contents.
+                        if let Some(rgba) = state.clear_color {
+                            let mut images = self.images.lock().unwrap();
+                            for &eid in &ids {
+                                if let Some(img) = images.get_mut(&(eid as u64)) {
+                                    fill_rgba8(&mut img.pixels, rgba);
+                                }
+                            }
                         }
                         state.extra_color_targets = ids;
                     } else {
@@ -3523,6 +3570,14 @@ fn decode_compare_op(v: u32) -> CompareOp {
         6 => CompareOp::GreaterOrEqual,
         7 => CompareOp::Always,
         _ => CompareOp::Less,
+    }
+}
+
+/// Fill an RGBA8 pixel buffer with a single colour (used for
+/// BeginRenderPass colour clears).
+fn fill_rgba8(pixels: &mut [u8], rgba: [u8; 4]) {
+    for px in pixels.chunks_exact_mut(4) {
+        px.copy_from_slice(&rgba);
     }
 }
 

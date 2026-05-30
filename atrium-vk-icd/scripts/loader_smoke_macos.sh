@@ -197,6 +197,7 @@ GRAPHICS_CUBE="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_cu
 GRAPHICS_SHADOW="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_shadow"
 GRAPHICS_MRT="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_mrt"
 GRAPHICS_MRT_BLEND="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_mrt_blend"
+GRAPHICS_CLEAR="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_clear"
 DAEMON="$REPO_ROOT/aqueduct-gpu-host/target/debug/aqueduct-gpu-host"
 COMPILE="$REPO_ROOT/atrium-spv-compile/target/debug/atrium-spv-compile"
 SLANGC="$REPO_ROOT/external/slang-bin/bin/slangc"
@@ -1867,6 +1868,44 @@ if [ -x "$GRAPHICS_MRT_BLEND" ]; then
 else
     echo
     echo "SKIP Rung KK: need 'cargo build -p atrium-vk-icd --example loader_graphics_mrt_blend'"
+fi
+
+# ── Rung LL: BeginRenderPass colour clear applied ────────
+# loader_graphics_clear: clears the framebuffer to blue
+# (0,0,1,1), draws a small red triangle.  pixel(0,0)
+# (outside the triangle) must read the clear colour blue;
+# pixel(3,3) (inside) reads red.  Pre-fix, tier-2 never
+# applied the BeginRenderPass colour clear (relied on the
+# zero-allocated image), so a non-covered pixel would have
+# been (0,0,0,0) and a non-zero clear was dropped.
+if [ -x "$GRAPHICS_CLEAR" ]; then
+    rm -f "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+        echo "daemon failed to start (clear round-trip); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung LL: BeginRenderPass colour clear (blue) applied ==="
+    if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+        VK_DRIVER_FILES="$MANIFEST" \
+        ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+        "$GRAPHICS_CLEAR" 2>&1 | tail -3; then
+        echo "FAIL: clear round-trip did not return 0" >&2
+        exit 1
+    fi
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
+else
+    echo
+    echo "SKIP Rung LL: need 'cargo build -p atrium-vk-icd --example loader_graphics_clear'"
 fi
 
 echo
