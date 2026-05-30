@@ -2155,6 +2155,20 @@ impl Tier2Backend {
                                 .copy_from_slice(&v.to_le_bytes());
                         }
                     }
+                    aqueduct_gpu::VertexFormat::A2b10g10r10Unorm => {
+                        // 32-bit packed: R[0..10] G[10..20] B[20..30]
+                        // A[30..32].  Normalise R/G/B by 1023, A by 3.
+                        let w = u32::from_le_bytes(
+                            src_bytes[0..4].try_into().unwrap());
+                        let r = (w & 0x3ff) as f32 / 1023.0;
+                        let g = ((w >> 10) & 0x3ff) as f32 / 1023.0;
+                        let b = ((w >> 20) & 0x3ff) as f32 / 1023.0;
+                        let a = ((w >> 30) & 0x3) as f32 / 3.0;
+                        for (lane, v) in [r, g, b, a].iter().enumerate() {
+                            dst_bytes[lane * 4..lane * 4 + 4]
+                                .copy_from_slice(&v.to_le_bytes());
+                        }
+                    }
                 }
             }
         }

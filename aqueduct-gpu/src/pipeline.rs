@@ -39,6 +39,11 @@ pub enum VertexFormat {
     /// source (8 bytes), expanded to 4 × f32 (16 bytes).
     /// Common for compact positions / normals / colours.
     R16g16b16a16Sfloat = 7,
+    /// `VK_FORMAT_A2B10G10R10_UNORM_PACK32` — a 32-bit
+    /// packed value (4 bytes): 10-bit R/G/B + 2-bit A,
+    /// expanded to 4 × f32 (16 bytes).  R/G/B normalise by
+    /// 1023, A by 3.  Common for packed vertex normals.
+    A2b10g10r10Unorm = 8,
 }
 
 impl VertexFormat {
@@ -56,6 +61,7 @@ impl VertexFormat {
             VertexFormat::R8g8b8a8Unorm        => 4,
             VertexFormat::R16g16Sfloat         => 4,
             VertexFormat::R16g16b16a16Sfloat   => 8,
+            VertexFormat::A2b10g10r10Unorm     => 4,
         }
     }
 
@@ -78,6 +84,7 @@ impl VertexFormat {
             VertexFormat::R8g8b8a8Unorm        => 4,
             VertexFormat::R16g16Sfloat         => 2,
             VertexFormat::R16g16b16a16Sfloat   => 4,
+            VertexFormat::A2b10g10r10Unorm     => 4,
         }
     }
 }

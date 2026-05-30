@@ -195,6 +195,7 @@ GRAPHICS_MIPMAP="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_
 GRAPHICS_LOD="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_lod"
 GRAPHICS_MSAA="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_msaa"
 GRAPHICS_HALF="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_half"
+GRAPHICS_RGB10A2="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_rgb10a2"
 GRAPHICS_ARRAY="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_array"
 GRAPHICS_CUBE="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_cube"
 GRAPHICS_SHADOW="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_shadow"
@@ -2098,6 +2099,42 @@ if [ -x "$GRAPHICS_HALF" ]; then
 else
     echo
     echo "SKIP Rung QQ: need 'cargo build -p atrium-vk-icd --example loader_graphics_half'"
+fi
+
+# ── Rung RR: A2B10G10R10_UNORM_PACK32 vertex attribute ───
+# loader_graphics_rgb10a2: per-vertex colour as a packed
+# 32-bit A2B10G10R10 word.  All verts share (1023,512,0,3)
+# -> (1.0, 0.5005, 0.0, 1.0).  The daemon unpacks the
+# 10/10/10/2-bit fields + normalises.  pixel(4,4) ~
+# (255,128,0,255); the green lane proves field extraction.
+if [ -x "$GRAPHICS_RGB10A2" ]; then
+    rm -f "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+        echo "daemon failed to start (rgb10a2 round-trip); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung RR: A2B10G10R10_UNORM_PACK32 vertex attribute ==="
+    if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+        VK_DRIVER_FILES="$MANIFEST" \
+        ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+        "$GRAPHICS_RGB10A2" 2>&1 | tail -2; then
+        echo "FAIL: rgb10a2 round-trip did not return 0" >&2
+        exit 1
+    fi
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
+else
+    echo
+    echo "SKIP Rung RR: need 'cargo build -p atrium-vk-icd --example loader_graphics_rgb10a2'"
 fi
 
 echo
