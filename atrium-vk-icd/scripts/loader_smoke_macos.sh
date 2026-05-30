@@ -196,6 +196,7 @@ GRAPHICS_ARRAY="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_a
 GRAPHICS_CUBE="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_cube"
 GRAPHICS_SHADOW="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_shadow"
 GRAPHICS_SHADOW_CMP="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_shadow_cmp"
+GRAPHICS_PCF="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_pcf"
 GRAPHICS_MRT="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_mrt"
 GRAPHICS_MRT_BLEND="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_mrt_blend"
 GRAPHICS_CLEAR="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_clear"
@@ -1944,6 +1945,42 @@ if [ -x "$GRAPHICS_SHADOW_CMP" ]; then
 else
     echo
     echo "SKIP Rung MM: need 'cargo build -p atrium-vk-icd --example loader_graphics_shadow_cmp'"
+fi
+
+# ── Rung NN: PCF (bilinear shadow comparison) ────────────
+# loader_graphics_pcf: LINEAR comparison sampler, dref 0.5,
+# 2x2 depth texture (top row 0.25 fails, bottom row 0.75
+# passes), sampled at the constant centre (0.5,0.5).  PCF
+# compares all 4 taps (0,0,1,1) + bilinearly blends -> 0.5
+# -> mid-grey ~128.  A point compare would snap to 0/255.
+if [ -x "$GRAPHICS_PCF" ]; then
+    rm -f "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+        echo "daemon failed to start (pcf round-trip); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung NN: PCF 4-tap shadow blend -> mid-grey ==="
+    if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+        VK_DRIVER_FILES="$MANIFEST" \
+        ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+        "$GRAPHICS_PCF" 2>&1 | tail -2; then
+        echo "FAIL: pcf round-trip did not return 0" >&2
+        exit 1
+    fi
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
+else
+    echo
+    echo "SKIP Rung NN: need 'cargo build -p atrium-vk-icd --example loader_graphics_pcf'"
 fi
 
 echo
