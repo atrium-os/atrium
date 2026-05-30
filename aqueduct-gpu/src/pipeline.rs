@@ -511,10 +511,18 @@ pub struct Tier2PipelineStateBlob {
     /// runs with no depth attachment.
     #[serde(default)]
     pub depth: Option<Tier2DepthState>,
-    /// Colour-blend state. `None` is equivalent to the default
-    /// (source replace + all-channel write mask).
+    /// Colour-blend state for colour attachment 0. `None` is
+    /// equivalent to the default (source replace + all-channel
+    /// write mask).
     #[serde(default)]
     pub blend: Option<Tier2BlendState>,
+    /// Per-attachment colour-blend state for MRT attachments
+    /// 1..N (attachment 0's state lives in `blend`).  Empty
+    /// for single-attachment pipelines.  Vulkan lets each
+    /// colour attachment carry its own
+    /// `VkPipelineColorBlendAttachmentState`.
+    #[serde(default)]
+    pub blend_extra: Vec<Tier2BlendState>,
     /// Cull mode + front-face winding extracted from
     /// `VkPipelineRasterizationStateCreateInfo`. `None`
     /// preserves the legacy "no culling" behaviour.

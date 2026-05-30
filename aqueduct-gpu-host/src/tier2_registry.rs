@@ -956,8 +956,6 @@ fn rasterize_stripe(
     let mut interp_buf: Vec<u8> = vec![0u8; setup.varying_bytes];
 
     let (a, b, c) = (setup.a, setup.b, setup.c);
-    let bs = &draw.blend_state;
-    let m = bs.write_mask;
 
     for tile_x in setup.tile_min_x..=setup.tile_max_x {
         let t_min_x = (tile_x * TILE_SIZE).max(setup.min_x);
@@ -1190,9 +1188,12 @@ fn rasterize_stripe(
 
                 // Scatter each colour attachment.  Attachment
                 // 0 -> task.pixels; attachment k+1 ->
-                // task.extra_color[k].  Blend + write-mask
-                // apply per attachment (shared state in v1 --
-                // per-attachment blend is a follow-up).
+                // task.extra_color[k].  Each attachment uses
+                // its own blend + write-mask: attachment 0 ->
+                // `draw.blend_state`, attachment L ->
+                // `draw.blend_extra[L-1]` (falling back to
+                // attachment 0's state when the app didn't
+                // supply a per-attachment entry).
                 for slot in 0..n_color {
                     let src = [
                         out_color[slot * 4],
@@ -1206,19 +1207,25 @@ fn rasterize_stripe(
                         &mut task.extra_color[slot - 1][..]
                     };
                     if idx + 4 > target.len() { continue; }
-                    let final_color = if bs.enable {
+                    let abs: &BlendState = if slot == 0 {
+                        &draw.blend_state
+                    } else {
+                        draw.blend_extra.get(slot - 1).unwrap_or(&draw.blend_state)
+                    };
+                    let am = abs.write_mask;
+                    let final_color = if abs.enable {
                         let dst = [
                             target[idx]     as f32 / 255.0,
                             target[idx + 1] as f32 / 255.0,
                             target[idx + 2] as f32 / 255.0,
                             target[idx + 3] as f32 / 255.0,
                         ];
-                        apply_blend(bs, src, dst)
+                        apply_blend(abs, src, dst)
                     } else { src };
-                    if m.r { target[idx]     = f32_to_u8(final_color[0]); }
-                    if m.g { target[idx + 1] = f32_to_u8(final_color[1]); }
-                    if m.b { target[idx + 2] = f32_to_u8(final_color[2]); }
-                    if m.a { target[idx + 3] = f32_to_u8(final_color[3]); }
+                    if am.r { target[idx]     = f32_to_u8(final_color[0]); }
+                    if am.g { target[idx + 1] = f32_to_u8(final_color[1]); }
+                    if am.b { target[idx + 2] = f32_to_u8(final_color[2]); }
+                    if am.a { target[idx + 3] = f32_to_u8(final_color[3]); }
                 }
             }
         }
@@ -1336,11 +1343,16 @@ pub struct DrawTriangle<'a> {
     /// declarations.  Empty → null.
     pub push_constants: &'a [u8],
 
-    /// Per-attachment blend + colour-write state.  R.5.
-    /// Default is `enable: false` (source replace) +
-    /// all-channels write mask, which preserves the R.1-R.4
-    /// behaviour for callers that don't care about blending.
+    /// Per-attachment blend + colour-write state for colour
+    /// attachment 0.  R.5.  Default is `enable: false`
+    /// (source replace) + all-channels write mask.
     pub blend_state: BlendState,
+
+    /// Blend state for MRT colour attachments 1..N
+    /// (attachment 0 uses `blend_state`).  Empty ⇒ every
+    /// extra attachment falls back to `blend_state` (the
+    /// shared-state behaviour MRT v1 shipped with).
+    pub blend_extra: &'a [BlendState],
 
     /// Viewport (`vkCmdSetViewport`) to apply during the
     /// NDC -> framebuffer-pixel mapping.  `None` falls back
@@ -1484,6 +1496,7 @@ impl Default for DrawTriangle<'_> {
             uniforms: &[],
             push_constants: &[],
             blend_state: BlendState::default(),
+            blend_extra: &[],
             viewport: None,
             scissor:  None,
             cull_mode: CullMode::default(),

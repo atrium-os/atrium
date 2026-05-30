@@ -102,6 +102,11 @@ pub struct Tier2Backend {
     /// [`Tier2Backend::bind_raster_state`] when the session
     /// decodes a `Tier2PipelineStateBlob`.
     pipeline_raster: Mutex<HashMap<u32, PipelineRasterState>>,
+    /// Per-graphics-pipeline per-attachment blend for MRT
+    /// attachments 1..N (attachment 0's blend lives in
+    /// `PipelineRasterState::blend`).  Kept out of
+    /// `PipelineRasterState` so that struct stays `Copy`.
+    pipeline_blend_extra: Mutex<HashMap<u32, Vec<BlendState>>>,
     /// Per-graphics-pipeline: bytes the VS writes through
     /// Location-decorated Output variables.  Populated when
     /// the session decodes a `Tier2PipelineStateBlob`.  Used
@@ -262,6 +267,11 @@ struct PassState {
     /// target).  Set by `FrameOp::BindColorAttachments`.
     /// Empty for single-attachment passes.
     extra_color_targets: Vec<u32>,
+    /// Per-attachment blend for MRT attachments 1..N,
+    /// snapshotted from the bound pipeline at BindPipeline
+    /// time (attachment 0's blend rides in the resolved
+    /// `PipelineRasterState`).  Empty for single-attachment.
+    blend_extra: Vec<BlendState>,
     /// Vertex-buffer bindings keyed by slot number.
     vertex_buffers: HashMap<u32, BoundVertexBuffer>,
     /// Currently-bound index buffer.
@@ -678,6 +688,7 @@ impl Tier2Backend {
             pipeline_vs_shaders: Mutex::new(HashMap::new()),
             pipeline_layouts: Mutex::new(HashMap::new()),
             pipeline_raster: Mutex::new(HashMap::new()),
+            pipeline_blend_extra: Mutex::new(HashMap::new()),
             pipeline_vs_varying_bytes: Mutex::new(HashMap::new()),
             pipeline_compute: Mutex::new(HashMap::new()),
             cs_invocations: AtomicU64::new(0),
@@ -803,12 +814,20 @@ impl Tier2Backend {
         pipeline_id: ResourceId,
         depth: Option<Tier2DepthState>,
         blend: Option<WireBlendState>,
+        blend_extra: &[WireBlendState],
         raster: Option<aqueduct_gpu::Tier2RasterState>,
         topology: aqueduct_gpu::Tier2PrimitiveTopology,
         stencil: Option<aqueduct_gpu::Tier2StencilState>,
         primitive_restart_enable: bool,
     ) {
         let blend = blend.map(convert_blend_state).unwrap_or_default();
+        // Per-attachment blend for MRT attachments 1..N.
+        if !blend_extra.is_empty() {
+            let converted: Vec<BlendState> = blend_extra.iter()
+                .map(|b| convert_blend_state(*b)).collect();
+            self.pipeline_blend_extra.lock().unwrap()
+                .insert(pipeline_id.raw(), converted);
+        }
         let (cull_mode, front_face, rasterizer_discard,
              depth_bias_enable, depth_bias_constant_factor,
              depth_bias_clamp, depth_bias_slope_factor) = match raster {
@@ -1057,6 +1076,7 @@ impl Tier2Backend {
         let pipeline_shaders    = self.pipeline_shaders.lock().unwrap().clone();
         let pipeline_vs_shaders = self.pipeline_vs_shaders.lock().unwrap().clone();
         let pipeline_raster     = self.pipeline_raster.lock().unwrap().clone();
+        let pipeline_blend_extra = self.pipeline_blend_extra.lock().unwrap().clone();
         let pipeline_compute    = self.pipeline_compute.lock().unwrap().clone();
         let mut state = PassState::default();
         // D.6: depth buffer is per-pass, allocated lazily on
@@ -1091,6 +1111,8 @@ impl Tier2Backend {
                         state.tier2_shader    = pipeline_shaders.get(&raw).copied();
                         state.tier2_vs_shader = pipeline_vs_shaders.get(&raw).copied();
                         state.raster          = pipeline_raster.get(&raw).copied();
+                        state.blend_extra     = pipeline_blend_extra.get(&raw)
+                            .cloned().unwrap_or_default();
                         state.tier2_compute   = pipeline_compute.get(&raw).cloned();
                     } else {
                         log::warn!("BindPipeline body too short ({} bytes)", body.len());
@@ -1919,6 +1941,7 @@ impl Tier2Backend {
                 vertex_attrs: [v0, v1, v2],
                 push_constants: &state.push_constants,
                 blend_state: raster.blend,
+                blend_extra: &state.blend_extra,
                 varying_f32_count,
                 uniforms: &uniforms_buf,
                 viewport: dt_viewport,
@@ -3100,6 +3123,7 @@ impl Tier2Backend {
                 vertex_attrs: [v0, v1, v2],
                 push_constants: &state.push_constants,
                 blend_state: raster.blend,
+                blend_extra: &state.blend_extra,
                 varying_f32_count,
                 viewport: dt_viewport,
                 scissor: dt_scissor,
@@ -3403,13 +3427,14 @@ impl Backend for Tier2Backend {
         pipeline_id: ResourceId,
         depth: Option<Tier2DepthState>,
         blend: Option<WireBlendState>,
+        blend_extra: &[WireBlendState],
         raster: Option<aqueduct_gpu::Tier2RasterState>,
         topology: aqueduct_gpu::Tier2PrimitiveTopology,
         stencil: Option<aqueduct_gpu::Tier2StencilState>,
         primitive_restart_enable: bool,
     ) {
-        self.bind_raster_state(pipeline_id, depth, blend, raster, topology, stencil,
-                               primitive_restart_enable);
+        self.bind_raster_state(pipeline_id, depth, blend, blend_extra, raster,
+                               topology, stencil, primitive_restart_enable);
     }
 
     fn bind_pipeline_vs_varying_bytes(

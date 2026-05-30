@@ -260,6 +260,7 @@ pub trait Backend: Send + Sync {
         _pipeline_id: ResourceId,
         _depth: Option<aqueduct_gpu::Tier2DepthState>,
         _blend: Option<aqueduct_gpu::Tier2BlendState>,
+        _blend_extra: &[aqueduct_gpu::Tier2BlendState],
         _raster: Option<aqueduct_gpu::Tier2RasterState>,
         _topology: aqueduct_gpu::Tier2PrimitiveTopology,
         _stencil: Option<aqueduct_gpu::Tier2StencilState>,

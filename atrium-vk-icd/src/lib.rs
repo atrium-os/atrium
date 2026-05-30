@@ -3201,29 +3201,36 @@ unsafe fn build_tier2_pipeline_blob(
     };
 
     // Color-blend state (optional; take the first attachment).
+    // Per-attachment blend.  attachment[0] -> `blend`,
+    // attachments[1..] -> `blend_extra` (MRT).
+    let conv_blend = |att: &ash::vk::PipelineColorBlendAttachmentState| -> Tier2BlendState {
+        let wm = att.color_write_mask;
+        Tier2BlendState {
+            enable: att.blend_enable != 0,
+            color_src: convert_vk_blend_factor(att.src_color_blend_factor),
+            color_dst: convert_vk_blend_factor(att.dst_color_blend_factor),
+            alpha_src: convert_vk_blend_factor(att.src_alpha_blend_factor),
+            alpha_dst: convert_vk_blend_factor(att.dst_alpha_blend_factor),
+            color_op:  convert_vk_blend_op(att.color_blend_op),
+            alpha_op:  convert_vk_blend_op(att.alpha_blend_op),
+            write_mask_rgba: [
+                wm.contains(ash::vk::ColorComponentFlags::R),
+                wm.contains(ash::vk::ColorComponentFlags::G),
+                wm.contains(ash::vk::ColorComponentFlags::B),
+                wm.contains(ash::vk::ColorComponentFlags::A),
+            ],
+        }
+    };
+    let mut blend_extra: Vec<Tier2BlendState> = Vec::new();
     let blend = if info.p_color_blend_state.is_null() { None } else {
         let cb = &*info.p_color_blend_state;
         if cb.attachment_count == 0 || cb.p_attachments.is_null() {
             None
         } else {
-            let att = &*cb.p_attachments;
-            let wm = att.color_write_mask;
-            let mask = [
-                wm.contains(ash::vk::ColorComponentFlags::R),
-                wm.contains(ash::vk::ColorComponentFlags::G),
-                wm.contains(ash::vk::ColorComponentFlags::B),
-                wm.contains(ash::vk::ColorComponentFlags::A),
-            ];
-            Some(Tier2BlendState {
-                enable: att.blend_enable != 0,
-                color_src: convert_vk_blend_factor(att.src_color_blend_factor),
-                color_dst: convert_vk_blend_factor(att.dst_color_blend_factor),
-                alpha_src: convert_vk_blend_factor(att.src_alpha_blend_factor),
-                alpha_dst: convert_vk_blend_factor(att.dst_alpha_blend_factor),
-                color_op:  convert_vk_blend_op(att.color_blend_op),
-                alpha_op:  convert_vk_blend_op(att.alpha_blend_op),
-                write_mask_rgba: mask,
-            })
+            for i in 1..cb.attachment_count {
+                blend_extra.push(conv_blend(&*cb.p_attachments.add(i as usize)));
+            }
+            Some(conv_blend(&*cb.p_attachments))
         }
     };
 
@@ -3304,7 +3311,7 @@ unsafe fn build_tier2_pipeline_blob(
     };
 
     let blob = Tier2PipelineStateBlob {
-        vertex_input, depth, blend, raster,
+        vertex_input, depth, blend, blend_extra, raster,
         topology, primitive_restart_enable, stencil,
         vs_varying_bytes,
     };

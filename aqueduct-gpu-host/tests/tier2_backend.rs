@@ -875,7 +875,7 @@ fn tier2_backend_d6_depth_test_rejects_farther_fragments() {
         backend.bind_pipeline_vs(pipe, vs_id);
         backend.bind_pipeline(pipe, fs);
         backend.bind_layout(pipe, layout.clone());
-        backend.bind_raster_state(pipe, depth_on, None, None, Default::default(), None, false);
+        backend.bind_raster_state(pipe, depth_on, None, &[], None, Default::default(), None, false);
     }
 
     // Same NDC triangle at two different z values.
@@ -978,7 +978,7 @@ fn tier2_backend_d6_depth_disabled_means_later_wins() {
         backend.bind_pipeline_vs(pipe, vs_id);
         backend.bind_pipeline(pipe, fs);
         backend.bind_layout(pipe, layout.clone());
-        backend.bind_raster_state(pipe, None, None, None, Default::default(), None, false); // depth OFF
+        backend.bind_raster_state(pipe, None, None, &[], None, Default::default(), None, false); // depth OFF
     }
 
     let mut red_src = Vec::new();
@@ -1435,7 +1435,7 @@ fn tier2_backend_depth_attachment_persists_across_draws() {
         backend.bind_pipeline_vs(pipe, vs_id);
         backend.bind_pipeline(pipe, fs);
         backend.bind_layout(pipe, layout.clone());
-        backend.bind_raster_state(pipe, depth_on, None, None, Default::default(), None, false);
+        backend.bind_raster_state(pipe, depth_on, None, &[], None, Default::default(), None, false);
     }
 
     // Red @ z=0.3 first, blue @ z=0.7 second.  LESS depth
@@ -1557,7 +1557,7 @@ fn tier2_backend_depth_attachment_persists_across_passes() {
     });
     backend.bind_raster_state(pipe_id,
         Some(Tier2DepthState { test_enable: true, write_enable: true, ..Default::default() }),
-        None, None, Default::default(), None, false);
+        None, &[], None, Default::default(), None, false);
 
     let mut src = Vec::new();
     for v in [[-0.5_f32, -0.5, 0.5], [0.5, -0.5, 0.5], [0.0, 0.5, 0.5]] {

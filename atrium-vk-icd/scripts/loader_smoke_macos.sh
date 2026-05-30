@@ -196,6 +196,7 @@ GRAPHICS_ARRAY="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_a
 GRAPHICS_CUBE="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_cube"
 GRAPHICS_SHADOW="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_shadow"
 GRAPHICS_MRT="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_mrt"
+GRAPHICS_MRT_BLEND="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_mrt_blend"
 DAEMON="$REPO_ROOT/aqueduct-gpu-host/target/debug/aqueduct-gpu-host"
 COMPILE="$REPO_ROOT/atrium-spv-compile/target/debug/atrium-spv-compile"
 SLANGC="$REPO_ROOT/external/slang-bin/bin/slangc"
@@ -1829,6 +1830,43 @@ if [ -x "$GRAPHICS_MRT" ]; then
 else
     echo
     echo "SKIP Rung JJ: need 'cargo build -p atrium-vk-icd --example loader_graphics_mrt'"
+fi
+
+# ── Rung KK: per-attachment blend / write-mask (MRT) ─────
+# loader_graphics_mrt_blend: FS writes white to both colour
+# attachments; the pipeline gives attachment 0 an RGBA write
+# mask and attachment 1 an R-only mask.  attachment0
+# pixel(3,3)=(255,255,255,255), attachment1=(255,0,0,0).
+# Proves the daemon keeps independent per-attachment blend/
+# write state (was shared in MRT v1 / Rung JJ).
+if [ -x "$GRAPHICS_MRT_BLEND" ]; then
+    rm -f "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+        echo "daemon failed to start (MRT-blend round-trip); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung KK: per-attachment write mask (RGBA vs R-only) ==="
+    if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+        VK_DRIVER_FILES="$MANIFEST" \
+        ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+        "$GRAPHICS_MRT_BLEND" 2>&1 | tail -3; then
+        echo "FAIL: MRT-blend round-trip did not return 0" >&2
+        exit 1
+    fi
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
+else
+    echo
+    echo "SKIP Rung KK: need 'cargo build -p atrium-vk-icd --example loader_graphics_mrt_blend'"
 fi
 
 echo
