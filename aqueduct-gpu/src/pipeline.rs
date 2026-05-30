@@ -559,6 +559,14 @@ pub struct Tier2PipelineStateBlob {
     /// module.
     #[serde(default)]
     pub vs_varying_bytes: u32,
+    /// True when the FS samples a texture with implicit LOD
+    /// (`OpImageSampleImplicitLod` + variants).  Gates the
+    /// rasterizer's per-pixel implicit mip selection so
+    /// explicit-LOD-only shaders keep their shared texture
+    /// descriptor intact.  Populated by the ICD via a
+    /// SPIR-V scan of the FS module.
+    #[serde(default)]
+    pub fs_uses_implicit_lod: bool,
 }
 
 #[cfg(test)]

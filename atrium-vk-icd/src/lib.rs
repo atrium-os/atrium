@@ -471,6 +471,13 @@ struct AtriumShaderModule {
     /// shaders that only emit `BuiltIn` outputs
     /// (`gl_Position` etc.).
     vs_varying_bytes: u32,
+    /// True when this module contains an implicit-LOD image
+    /// sample (`OpImageSampleImplicitLod` + variants).  FS
+    /// modules propagate this onto `Tier2PipelineStateBlob`
+    /// so the rasterizer only does per-pixel implicit mip
+    /// selection for shaders that actually sample implicitly
+    /// -- explicit-LOD shaders keep their descriptor intact.
+    uses_implicit_lod: bool,
 }
 
 /// Sum the byte sizes of every Location-decorated
@@ -627,6 +634,32 @@ fn scan_spirv_uses_barrier(spirv: &[u8]) -> bool {
         // serial dispatch.  Only ControlBarrier needs the
         // parallel-lane scaffolding.
         if opcode == 224 { return true; }
+        cursor += word_count * 4;
+    }
+    false
+}
+
+/// True when `spirv` contains an implicit-LOD image sample
+/// (`OpImageSampleImplicitLod` = 87, or the Dref/Proj
+/// implicit variants 89/91/93).  Used to gate per-pixel
+/// implicit mip selection: explicit-LOD-only shaders
+/// (`OpImageSampleExplicitLod` = 88) must NOT have their
+/// shared descriptor redirected, or the explicit
+/// mip pick breaks.
+fn scan_spirv_uses_implicit_lod(spirv: &[u8]) -> bool {
+    if spirv.len() < 20 || spirv.len() % 4 != 0 { return false; }
+    let magic = u32::from_le_bytes(spirv[0..4].try_into().unwrap());
+    if magic != 0x07230203 { return false; }
+    let mut cursor = 20;
+    while cursor + 4 <= spirv.len() {
+        let head = u32::from_le_bytes(
+            spirv[cursor..cursor + 4].try_into().unwrap());
+        let word_count = (head >> 16) as usize;
+        let opcode = (head & 0xFFFF) as u16;
+        if word_count == 0 { return false; }
+        // OpImageSampleImplicitLod=87, ...ProjImplicitLod=89,
+        // ...DrefImplicitLod=91, ...ProjDrefImplicitLod=93.
+        if matches!(opcode, 87 | 89 | 91 | 93) { return true; }
         cursor += word_count * 4;
     }
     false
@@ -3131,6 +3164,7 @@ unsafe fn build_tier2_pipeline_blob(
     let mut vs_id: Option<aqueduct_gpu::ids::ResourceId> = None;
     let mut fs_id: Option<aqueduct_gpu::ids::ResourceId> = None;
     let mut vs_varying_bytes: u32 = 0;
+    let mut fs_uses_implicit_lod = false;
     let shaders_map = dev.shaders.lock().ok()?;
     for s in 0..info.stage_count {
         let stage = &*info.p_stages.offset(s as isize);
@@ -3142,7 +3176,10 @@ unsafe fn build_tier2_pipeline_blob(
                 vs_id = rid;
                 if let Some(am) = m { vs_varying_bytes = am.vs_varying_bytes; }
             }
-            ash::vk::ShaderStageFlags::FRAGMENT => fs_id = rid,
+            ash::vk::ShaderStageFlags::FRAGMENT => {
+                fs_id = rid;
+                if let Some(am) = m { fs_uses_implicit_lod = am.uses_implicit_lod; }
+            }
             _ => {} // tess/geom not in tier-2 yet
         }
     }
@@ -3313,7 +3350,7 @@ unsafe fn build_tier2_pipeline_blob(
     let blob = Tier2PipelineStateBlob {
         vertex_input, depth, blend, blend_extra, raster,
         topology, primitive_restart_enable, stencil,
-        vs_varying_bytes,
+        vs_varying_bytes, fs_uses_implicit_lod,
     };
     let bytes = postcard::to_allocvec(&blob).ok()?;
     Some((vec![vs_id, fs_id], bytes))
@@ -4488,6 +4525,7 @@ pub unsafe extern "C" fn vkCreateShaderModule(
     let workgroup_size = scan_spirv_workgroup_size(&bytes);
     let uses_barrier = scan_spirv_uses_barrier(&bytes);
     let vs_varying_bytes = scan_spirv_vs_varying_bytes(&bytes);
+    let uses_implicit_lod = scan_spirv_uses_implicit_lod(&bytes);
 
     // Resolve-or-upload against the daemon. Failure (no live
     // client, validation rejection) leaves shader_id=None — the
@@ -4512,6 +4550,7 @@ pub unsafe extern "C" fn vkCreateShaderModule(
         s.insert(handle, AtriumShaderModule {
             shader_id, bytecode_hash, local_size, ssbo_binding_count,
             workgroup_size, uses_barrier, vs_varying_bytes,
+            uses_implicit_lod,
         });
     } else {
         return VK_ERROR_INITIALIZATION_FAILED;

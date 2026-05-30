@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use atrium_spv_loader::{LoadError, LoaderConfig, LoadedShader, ShaderCache};
+use atrium_spv_runtime::{TexDesc, UNIFORMS_DESC_BASE};
 use rayon::prelude::*;
 
 /// Rasterizer tile size in pixels (R.6+).  8x8 tiles fit 64
@@ -943,7 +944,41 @@ fn rasterize_stripe(
     // would require a `Send + Sync` wrapper around the raw
     // `*const u8`; deriving them here from the (Sync)
     // slices is simpler.
-    let uni_ptr = if draw.uniforms.is_empty() {
+    // Implicit-LOD setup.  When enabled + a multi-mip
+    // texture is bound at binding 0, clone the uniforms
+    // buffer per stripe (so per-pixel descriptor-pointer
+    // rewrites don't race other stripes) and read the mip
+    // chain off the base TexDesc.  `lod_ctx` carries the
+    // descriptor-slot offset + the mip array pointer/count +
+    // base texel dims used to scale the gradient into texels.
+    let mut uni_local: Vec<u8> = Vec::new();
+    let mut lod_ctx: Option<(usize, *const TexDesc, u32, f32, f32)> = None;
+    if draw.compute_implicit_lod
+        && !draw.uniforms.is_empty()
+        && setup.n >= 2
+        && draw.uniforms.len() >= UNIFORMS_DESC_BASE + 8
+    {
+        let desc_off = UNIFORMS_DESC_BASE; // binding 0 tex_desc*
+        let tex_ptr = u64::from_le_bytes(
+            draw.uniforms[desc_off..desc_off + 8].try_into().unwrap());
+        if tex_ptr != 0 {
+            // SAFETY: the daemon built this TexDesc + its mip
+            // array and keeps them alive for the whole draw
+            // (named-bound `tex_descs` / `mip_desc_arrays`).
+            let base = unsafe { &*(tex_ptr as *const TexDesc) };
+            if base.mip_count > 1 && !base.mip_descs.is_null() {
+                uni_local = draw.uniforms.to_vec();
+                lod_ctx = Some((
+                    desc_off, base.mip_descs, base.mip_count,
+                    base.width as f32, base.height as f32,
+                ));
+            }
+        }
+    }
+
+    let uni_ptr = if let Some(_) = lod_ctx {
+        uni_local.as_ptr()
+    } else if draw.uniforms.is_empty() {
         std::ptr::null()
     } else { draw.uniforms.as_ptr() };
     let pc_ptr = if draw.push_constants.is_empty() {
@@ -1151,6 +1186,55 @@ fn rasterize_stripe(
                     if setup.depth_write {
                         db[pixel_lin_local] = window_z;
                     }
+                }
+
+                // Implicit-LOD mip selection.  Finite-
+                // difference the perspective-correct UV
+                // varying (lanes 0,1) across the pixel quad
+                // to get screen-space derivatives, scale by
+                // the texel dims, take log2 of the larger
+                // footprint as the LOD, round to a mip level,
+                // and redirect the binding-0 descriptor's
+                // tex_desc pointer to that mip in the per-
+                // stripe uniforms copy.  Magnified textures
+                // (LOD <= 0) keep mip 0, so 1:1 / upscaled
+                // rungs are unchanged.
+                if let Some((desc_off, mip_descs, mip_count, tw, th)) = lod_ctx {
+                    // Perspective-correct (u, v) at an
+                    // arbitrary screen point.
+                    let uv_at = |x: f32, y: f32| -> (f32, f32) {
+                        let g0 = edge_fn(b, c, (x, y)) / setup.total_edge;
+                        let g1 = edge_fn(c, a, (x, y)) / setup.total_edge;
+                        let g2 = edge_fn(a, b, (x, y)) / setup.total_edge;
+                        let iw = g0 * setup.inv_w[0] + g1 * setup.inv_w[1]
+                            + g2 * setup.inv_w[2];
+                        let oiw = if iw == 0.0 { 0.0 } else { 1.0 / iw };
+                        let uu = (g0 * setup.varying_over_w[0][0]
+                            + g1 * setup.varying_over_w[1][0]
+                            + g2 * setup.varying_over_w[2][0]) * oiw;
+                        let vv = (g0 * setup.varying_over_w[0][1]
+                            + g1 * setup.varying_over_w[1][1]
+                            + g2 * setup.varying_over_w[2][1]) * oiw;
+                        (uu, vv)
+                    };
+                    let (u0, v0) = uv_at(cx, cy);
+                    let (ux, vx) = uv_at(cx + 1.0, cy);
+                    let (uy, vy) = uv_at(cx, cy + 1.0);
+                    let dudx = (ux - u0) * tw;
+                    let dvdx = (vx - v0) * th;
+                    let dudy = (uy - u0) * tw;
+                    let dvdy = (vy - v0) * th;
+                    let rho2 = (dudx * dudx + dvdx * dvdx)
+                        .max(dudy * dudy + dvdy * dvdy);
+                    // lod = log2(sqrt(rho2)) = 0.5*log2(rho2).
+                    let lod = if rho2 > 0.0 { 0.5 * rho2.log2() } else { 0.0 };
+                    let mip = (lod.round() as i32)
+                        .clamp(0, (mip_count as i32) - 1) as usize;
+                    // Redirect the descriptor's tex_desc ptr
+                    // to mip_descs[mip] (mip 0 = base dup).
+                    let chosen = unsafe { mip_descs.add(mip) } as u64;
+                    uni_local[desc_off..desc_off + 8]
+                        .copy_from_slice(&chosen.to_le_bytes());
                 }
 
                 // MRT: out_color holds 4 f32 per colour
@@ -1418,6 +1502,17 @@ pub struct DrawTriangle<'a> {
     /// stencil support).
     pub stencil: Option<StencilState>,
 
+    /// When true, the rasterizer computes a per-pixel mip
+    /// LOD from the screen-space gradient of the UV varying
+    /// (lanes 0,1) and redirects the binding-0 texture
+    /// descriptor to the selected mip level for that pixel
+    /// (implicit-LOD sampling).  Only takes effect when a
+    /// texture with `mip_count > 1` is bound; single-mip
+    /// textures are untouched.  Set by the dispatcher when
+    /// textures are bound and the VS emits >= 2 varying
+    /// lanes (the UV).
+    pub compute_implicit_lod: bool,
+
     /// When `Some((constant, clamp, slope))`, the rasterizer
     /// applies a polygon-offset to the interpolated depth
     /// before the depth test + write + FS frag_coord.z hand-
@@ -1506,6 +1601,7 @@ impl Default for DrawTriangle<'_> {
             depth_bounds: None,
             stencil: None,
             depth_bias: None,
+            compute_implicit_lod: false,
         }
     }
 }

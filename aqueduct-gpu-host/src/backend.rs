@@ -283,6 +283,14 @@ pub trait Backend: Send + Sync {
         _bytes: u32,
     ) {}
 
+    /// Record whether the FS samples with implicit LOD.
+    /// Default no-op.
+    fn bind_pipeline_fs_implicit_lod(
+        &self,
+        _pipeline_id: ResourceId,
+        _uses_implicit_lod: bool,
+    ) {}
+
     /// Associate a compute pipeline with its Tier-2 shader +
     /// workgroup-size state. Mirror of
     /// [`Backend::bind_pipeline_tier2_vs`] /

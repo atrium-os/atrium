@@ -135,8 +135,6 @@ fn tier2_backend_submit_frame_runs_bound_shader() {
     let mut fb = FrameBuilder::new(1024);
     let mut begin = [0u8; 12];
     begin[..4].copy_from_slice(&image_id.raw().to_le_bytes());
-    begin[4..8].copy_from_slice(&8u32.to_le_bytes());
-    begin[8..12].copy_from_slice(&4u32.to_le_bytes());
     fb.push(FrameOp::BeginRenderPass, &begin).unwrap();
     fb.push(FrameOp::BindPipeline, &pipeline_id.raw().to_le_bytes()).unwrap();
     fb.push(FrameOp::EndRenderPass, &[]).unwrap();
@@ -178,8 +176,6 @@ fn tier2_backend_submit_frame_no_bound_pipeline_leaves_image_unchanged() {
     let mut fb = FrameBuilder::new(1024);
     let mut begin = [0u8; 12];
     begin[..4].copy_from_slice(&image_id.raw().to_le_bytes());
-    begin[4..8].copy_from_slice(&4u32.to_le_bytes());
-    begin[8..12].copy_from_slice(&4u32.to_le_bytes());
     fb.push(FrameOp::BeginRenderPass, &begin).unwrap();
     fb.push(FrameOp::EndRenderPass, &[]).unwrap();
 
@@ -273,8 +269,6 @@ fn session_pipeline_create_auto_binds_tier2_shader() {
     let mut fb = FrameBuilder::new(1024);
     let mut begin = [0u8; 12];
     begin[..4].copy_from_slice(&image_id.raw().to_le_bytes());
-    begin[4..8].copy_from_slice(&4u32.to_le_bytes());
-    begin[8..12].copy_from_slice(&4u32.to_le_bytes());
     fb.push(FrameOp::BeginRenderPass, &begin).unwrap();
     fb.push(FrameOp::BindPipeline, &pipeline_id.raw().to_le_bytes()).unwrap();
     fb.push(FrameOp::EndRenderPass, &[]).unwrap();
@@ -400,8 +394,6 @@ fn tier2_backend_draw_walker_increments_draw_count() {
     let mut fb = FrameBuilder::new(4096);
     let mut begin = [0u8; 12];
     begin[..4].copy_from_slice(&image_id.raw().to_le_bytes());
-    begin[4..8].copy_from_slice(&8u32.to_le_bytes());
-    begin[8..12].copy_from_slice(&8u32.to_le_bytes());
     fb.push(FrameOp::BeginRenderPass, &begin).unwrap();
     fb.push(FrameOp::BindPipeline, &pipeline_id.raw().to_le_bytes()).unwrap();
     fb.push_bind_vertex_buf(BindVertexBufCmd {
@@ -447,8 +439,6 @@ fn tier2_backend_draw_without_pipeline_skipped() {
     let mut fb = FrameBuilder::new(1024);
     let mut begin = [0u8; 12];
     begin[..4].copy_from_slice(&image_id.raw().to_le_bytes());
-    begin[4..8].copy_from_slice(&4u32.to_le_bytes());
-    begin[8..12].copy_from_slice(&4u32.to_le_bytes());
     fb.push(FrameOp::BeginRenderPass, &begin).unwrap();
     fb.push_draw(DrawCmd {
         vertex_count: 3, instance_count: 1,
@@ -490,8 +480,6 @@ fn tier2_backend_legacy_fullscreen_path_still_fires() {
     let mut fb = FrameBuilder::new(1024);
     let mut begin = [0u8; 12];
     begin[..4].copy_from_slice(&image_id.raw().to_le_bytes());
-    begin[4..8].copy_from_slice(&2u32.to_le_bytes());
-    begin[8..12].copy_from_slice(&2u32.to_le_bytes());
     fb.push(FrameOp::BeginRenderPass, &begin).unwrap();
     fb.push(FrameOp::BindPipeline, &pipeline_id.raw().to_le_bytes()).unwrap();
     fb.push(FrameOp::EndRenderPass, &[]).unwrap();
@@ -572,8 +560,6 @@ fn tier2_backend_dispatch_assembles_vertex_bytes() {
     let mut fb = FrameBuilder::new(4096);
     let mut begin = [0u8; 12];
     begin[..4].copy_from_slice(&image_id.raw().to_le_bytes());
-    begin[4..8].copy_from_slice(&4u32.to_le_bytes());
-    begin[8..12].copy_from_slice(&4u32.to_le_bytes());
     fb.push(FrameOp::BeginRenderPass, &begin).unwrap();
     fb.push(FrameOp::BindPipeline, &pipeline_id.raw().to_le_bytes()).unwrap();
     fb.push_bind_vertex_buf(BindVertexBufCmd {
@@ -652,8 +638,6 @@ fn tier2_backend_dispatch_first_vertex_offset() {
     let mut fb = FrameBuilder::new(4096);
     let mut begin = [0u8; 12];
     begin[..4].copy_from_slice(&image_id.raw().to_le_bytes());
-    begin[4..8].copy_from_slice(&4u32.to_le_bytes());
-    begin[8..12].copy_from_slice(&4u32.to_le_bytes());
     fb.push(FrameOp::BeginRenderPass, &begin).unwrap();
     fb.push(FrameOp::BindPipeline, &pipeline_id.raw().to_le_bytes()).unwrap();
     fb.push_bind_vertex_buf(BindVertexBufCmd {
@@ -783,8 +767,6 @@ fn tier2_backend_d5_hello_triangle_through_wire() {
     let mut fb = FrameBuilder::new(4096);
     let mut begin = [0u8; 12];
     begin[..4].copy_from_slice(&image_id.raw().to_le_bytes());
-    begin[4..8].copy_from_slice(&8u32.to_le_bytes());
-    begin[8..12].copy_from_slice(&8u32.to_le_bytes());
     fb.push(FrameOp::BeginRenderPass, &begin).unwrap();
     fb.push(FrameOp::BindPipeline, &pipeline_id.raw().to_le_bytes()).unwrap();
     fb.push_set_viewport(SetViewportCmd {
@@ -896,8 +878,6 @@ fn tier2_backend_d6_depth_test_rejects_farther_fragments() {
     let mut fb = FrameBuilder::new(8192);
     let mut begin = [0u8; 12];
     begin[..4].copy_from_slice(&image_id.raw().to_le_bytes());
-    begin[4..8].copy_from_slice(&8u32.to_le_bytes());
-    begin[8..12].copy_from_slice(&8u32.to_le_bytes());
     fb.push(FrameOp::BeginRenderPass, &begin).unwrap();
     fb.push_set_viewport(SetViewportCmd {
         x: 0.0, y: 0.0, width: 8.0, height: 8.0,
@@ -997,8 +977,6 @@ fn tier2_backend_d6_depth_disabled_means_later_wins() {
     let mut fb = FrameBuilder::new(8192);
     let mut begin = [0u8; 12];
     begin[..4].copy_from_slice(&image_id.raw().to_le_bytes());
-    begin[4..8].copy_from_slice(&8u32.to_le_bytes());
-    begin[8..12].copy_from_slice(&8u32.to_le_bytes());
     fb.push(FrameOp::BeginRenderPass, &begin).unwrap();
     fb.push_set_viewport(SetViewportCmd {
         x: 0.0, y: 0.0, width: 8.0, height: 8.0,
@@ -1085,8 +1063,6 @@ fn tier2_backend_d7_multi_primitive_quad_in_one_draw() {
     let mut fb = FrameBuilder::new(4096);
     let mut begin = [0u8; 12];
     begin[..4].copy_from_slice(&image_id.raw().to_le_bytes());
-    begin[4..8].copy_from_slice(&8u32.to_le_bytes());
-    begin[8..12].copy_from_slice(&8u32.to_le_bytes());
     fb.push(FrameOp::BeginRenderPass, &begin).unwrap();
     fb.push(FrameOp::BindPipeline, &pipeline_id.raw().to_le_bytes()).unwrap();
     fb.push_set_viewport(SetViewportCmd {
@@ -1181,8 +1157,6 @@ fn tier2_backend_d8_draw_indexed_uint16_hello_triangle() {
     let mut fb = FrameBuilder::new(4096);
     let mut begin = [0u8; 12];
     begin[..4].copy_from_slice(&image_id.raw().to_le_bytes());
-    begin[4..8].copy_from_slice(&8u32.to_le_bytes());
-    begin[8..12].copy_from_slice(&8u32.to_le_bytes());
     fb.push(FrameOp::BeginRenderPass, &begin).unwrap();
     fb.push(FrameOp::BindPipeline, &pipeline_id.raw().to_le_bytes()).unwrap();
     fb.push_set_viewport(SetViewportCmd {
@@ -1279,8 +1253,6 @@ fn tier2_backend_d8_draw_indexed_uint32_with_vertex_offset() {
     let mut fb = FrameBuilder::new(4096);
     let mut begin = [0u8; 12];
     begin[..4].copy_from_slice(&image_id.raw().to_le_bytes());
-    begin[4..8].copy_from_slice(&8u32.to_le_bytes());
-    begin[8..12].copy_from_slice(&8u32.to_le_bytes());
     fb.push(FrameOp::BeginRenderPass, &begin).unwrap();
     fb.push(FrameOp::BindPipeline, &pipeline_id.raw().to_le_bytes()).unwrap();
     fb.push_set_viewport(SetViewportCmd {
@@ -1457,8 +1429,6 @@ fn tier2_backend_depth_attachment_persists_across_draws() {
     let mut fb = FrameBuilder::new(4096);
     let mut begin = [0u8; 12];
     begin[..4].copy_from_slice(&color_id.raw().to_le_bytes());
-    begin[4..8].copy_from_slice(&8u32.to_le_bytes());
-    begin[8..12].copy_from_slice(&8u32.to_le_bytes());
     fb.push(FrameOp::BeginRenderPass, &begin).unwrap();
     fb.push_bind_depth_attachment(BindDepthAttachmentCmd {
         image_id: depth_id.raw(), clear_value: 1.0,
@@ -1572,8 +1542,6 @@ fn tier2_backend_depth_attachment_persists_across_passes() {
     for _pass in 0..2 {
         let mut begin = [0u8; 12];
         begin[..4].copy_from_slice(&color_id.raw().to_le_bytes());
-        begin[4..8].copy_from_slice(&8u32.to_le_bytes());
-        begin[8..12].copy_from_slice(&8u32.to_le_bytes());
         fb.push(FrameOp::BeginRenderPass, &begin).unwrap();
         fb.push_bind_depth_attachment(BindDepthAttachmentCmd {
             image_id: depth_id.raw(), clear_value: 1.0,

@@ -654,6 +654,8 @@ impl Session {
                             blob.primitive_restart_enable);
                         self.backend.bind_pipeline_vs_varying_bytes(
                             req.pipeline_id, blob.vs_varying_bytes);
+                        self.backend.bind_pipeline_fs_implicit_lod(
+                            req.pipeline_id, blob.fs_uses_implicit_lod);
                     }
                 }
             }
