@@ -695,6 +695,22 @@ pub enum Op {
         /// Mip level.
         lod: Value,
     },
+    /// Depth-comparison ("shadow") sample
+    /// (`OpImageSampleDref*`).  Samples the depth texture
+    /// bound at `sampled_image`, compares the sampled
+    /// value against `dref` using the SAMPLER's runtime
+    /// `compareOp`, and returns the (PCF-filtered) pass
+    /// fraction in [0, 1] as an f32.  The compare op +
+    /// filtering live in the runtime helper because they're
+    /// sampler state the shader compiler can't see.
+    ImageSampleDref {
+        /// Combined depth-image + comparison sampler.
+        sampled_image: Value,
+        /// UV.
+        coord: Value,
+        /// Depth reference to compare against.
+        dref: Value,
+    },
     /// Direct unfiltered texel fetch by integer coords.
     ImageFetch {
         /// Image (without sampler).

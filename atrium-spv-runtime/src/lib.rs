@@ -252,6 +252,15 @@ pub struct SamplerDesc {
     pub wrap_s:     u32,
     /// `WrapMode` as `u32`.
     pub wrap_t:     u32,
+    /// Depth-comparison enable (`VkSamplerCreateInfo::
+    /// compareEnable`).  Non-zero ⇒ `atrium_tex_sample_2d_dref`
+    /// performs the comparison; 0 ⇒ it falls back to LEQUAL
+    /// (the legacy frontend-synthesis behaviour).
+    pub compare_enable: u32,
+    /// Depth-comparison op (`VkCompareOp` wire value:
+    /// 0=NEVER, 1=LESS, 2=EQUAL, 3=LEQUAL, 4=GREATER,
+    /// 5=NOT_EQUAL, 6=GEQUAL, 7=ALWAYS).
+    pub compare_op: u32,
 }
 
 // ── Uniforms-buffer layout (v1) ───────────────────────────
@@ -262,7 +271,7 @@ pub struct SamplerDesc {
 // in X1 (per docs/spec/tier2-renderer.md §4.1). v1 of the
 // texture path overlays the buffer's prefix with:
 //
-//   bytes  0..64 : runtime-helper function pointers
+//   bytes  0..72 : runtime-helper function pointers
 //                  ( 0:  atrium_tex_sample_2d
 //                    8:  atrium_tex_fetch_2d
 //                   16:  atrium_tex_sample_2d_lod
@@ -270,8 +279,9 @@ pub struct SamplerDesc {
 //                   32:  atrium_tex_sample_cube
 //                   40:  atrium_tex_gather_2d
 //                   48:  atrium_tex_sample_2d_array_lod
-//                   56:  atrium_tex_sample_cube_lod )
-//   bytes 64..   : flat descriptor table — slot `B` at
+//                   56:  atrium_tex_sample_cube_lod
+//                   64:  atrium_tex_sample_2d_dref )
+//   bytes 72..   : flat descriptor table — slot `B` at
 //                  byte `UNIFORMS_DESC_BASE + B*16`,
 //                  carrying ( 0: tex_desc*, 8: samp_desc* )
 //
@@ -308,8 +318,9 @@ pub const UNIFORMS_HELPERS_BASE: usize = 0;
 /// buffer. Slot `B` lives at `UNIFORMS_DESC_BASE + B * DESC_SLOT_BYTES`.
 /// Grew from 16 → 24 (Arc 29 sample_2d_lod) → 32 (Arc 30
 /// sample_2d_array) → 40 (Arc 31 sample_cube) → 48 (Arc 32
-/// gather_2d) → 64 (Arc 35 array_lod + cube_lod).
-pub const UNIFORMS_DESC_BASE: usize = 64;
+/// gather_2d) → 64 (Arc 35 array_lod + cube_lod) → 72
+/// (sample_2d_dref / shadow).
+pub const UNIFORMS_DESC_BASE: usize = 72;
 
 /// Bytes per descriptor slot in the table. Two 64-bit
 /// pointers packed back-to-back — `tex_desc*` then
@@ -559,6 +570,8 @@ pub unsafe fn write_helper_pointers(
     sample_cube_lod: unsafe extern "C" fn(
         *const TexDesc, *const SamplerDesc,
         f32, f32, f32, f32, *mut f32),
+    sample_2d_dref: unsafe extern "C" fn(
+        *const TexDesc, *const SamplerDesc, f32, f32, f32, *mut f32),
 ) {
     assert!(buf.len() >= UNIFORMS_DESC_BASE,
         "uniforms buffer too small for the helper header");
@@ -570,6 +583,7 @@ pub unsafe fn write_helper_pointers(
     let g  = (gather_2d           as usize as u64).to_le_bytes();
     let sal = (sample_2d_array_lod as usize as u64).to_le_bytes();
     let scl = (sample_cube_lod     as usize as u64).to_le_bytes();
+    let sd  = (sample_2d_dref       as usize as u64).to_le_bytes();
     buf[ 0.. 8].copy_from_slice(&s);
     buf[ 8..16].copy_from_slice(&f);
     buf[16..24].copy_from_slice(&sl);
@@ -578,6 +592,7 @@ pub unsafe fn write_helper_pointers(
     buf[40..48].copy_from_slice(&g);
     buf[48..56].copy_from_slice(&sal);
     buf[56..64].copy_from_slice(&scl);
+    buf[64..72].copy_from_slice(&sd);
 }
 
 /// Write a `(tex_desc, samp_desc)` pointer pair at binding
@@ -1352,6 +1367,94 @@ fn sample_2d_impl(t: &TexDesc, s: &SamplerDesc, u: f32, v: f32) -> [f32; 4] {
     }
 }
 
+/// Evaluate one shadow depth-comparison tap.
+///
+/// `compare_enable == 0` keeps the legacy convention
+/// (`texel <= dref → lit`) that the frontend used to
+/// synthesise inline, so pre-compareOp shaders are
+/// unchanged.  When enabled, applies Vulkan's
+/// `Dref <compareOp> texel` rule.
+#[inline]
+fn shadow_tap(texel_r: f32, dref: f32, compare_enable: u32, compare_op: u32) -> f32 {
+    let pass = if compare_enable == 0 {
+        texel_r <= dref
+    } else {
+        match compare_op {
+            0 => false,            // NEVER
+            1 => dref <  texel_r,  // LESS
+            2 => dref == texel_r,  // EQUAL
+            3 => dref <= texel_r,  // LESS_OR_EQUAL
+            4 => dref >  texel_r,  // GREATER
+            5 => dref != texel_r,  // NOT_EQUAL
+            6 => dref >= texel_r,  // GREATER_OR_EQUAL
+            7 => true,             // ALWAYS
+            _ => dref <= texel_r,
+        }
+    };
+    if pass { 1.0 } else { 0.0 }
+}
+
+/// Depth-comparison ("shadow") sample.  Returns the pass
+/// fraction in [0, 1]: a per-texel compare of the sampled
+/// depth against `dref`, PCF-filtered when the sampler uses
+/// `Linear` filtering (4-tap bilinear blend of the 0/1
+/// comparison results), or a single tap for `Nearest`.
+fn sample_2d_dref_impl(t: &TexDesc, s: &SamplerDesc, u: f32, v: f32, dref: f32) -> f32 {
+    let filter = filter_from_u32(s.mag_filter);
+    let wrap_s = wrap_from_u32(s.wrap_s);
+    let wrap_t = wrap_from_u32(s.wrap_t);
+    let x = u * t.width as f32 - 0.5;
+    let y = v * t.height as f32 - 0.5;
+    match filter {
+        FilterMode::Nearest => {
+            let xi = apply_wrap(x.round() as i32, t.width as i32, wrap_s) as u32;
+            let yi = apply_wrap(y.round() as i32, t.height as i32, wrap_t) as u32;
+            let texel = fetch_texel_impl(t, xi, yi)[0];
+            shadow_tap(texel, dref, s.compare_enable, s.compare_op)
+        }
+        FilterMode::Linear => {
+            // PCF: compare each of the 4 taps, then bilerp
+            // the 0/1 results (percentage-closer filtering).
+            let x0 = x.floor() as i32;
+            let y0 = y.floor() as i32;
+            let fx = x - x0 as f32;
+            let fy = y - y0 as f32;
+            let x0w = apply_wrap(x0, t.width as i32, wrap_s) as u32;
+            let x1w = apply_wrap(x0 + 1, t.width as i32, wrap_s) as u32;
+            let y0w = apply_wrap(y0, t.height as i32, wrap_t) as u32;
+            let y1w = apply_wrap(y0 + 1, t.height as i32, wrap_t) as u32;
+            let p00 = shadow_tap(fetch_texel_impl(t, x0w, y0w)[0], dref, s.compare_enable, s.compare_op);
+            let p10 = shadow_tap(fetch_texel_impl(t, x1w, y0w)[0], dref, s.compare_enable, s.compare_op);
+            let p01 = shadow_tap(fetch_texel_impl(t, x0w, y1w)[0], dref, s.compare_enable, s.compare_op);
+            let p11 = shadow_tap(fetch_texel_impl(t, x1w, y1w)[0], dref, s.compare_enable, s.compare_op);
+            let top = p00 * (1.0 - fx) + p10 * fx;
+            let bot = p01 * (1.0 - fx) + p11 * fx;
+            top * (1.0 - fy) + bot * fy
+        }
+    }
+}
+
+/// `atrium_tex_sample_2d_dref` — depth-comparison sample
+/// entry point (helper-table slot #8).  Writes the pass
+/// fraction to `out_rgba[0]` (and replicates to .yzw so a
+/// shader that reads the result as a vec4 sees a uniform
+/// value); the frontend's `ImageSampleDref` result type is
+/// f32 so backends read lane 0.
+///
+/// # Safety
+/// As for `atrium_tex_sample_2d`.
+#[no_mangle]
+pub unsafe extern "C" fn atrium_tex_sample_2d_dref(
+    tex: *const TexDesc,
+    samp: *const SamplerDesc,
+    u: f32, v: f32, dref: f32,
+    out_rgba: *mut f32,
+) {
+    let frac = sample_2d_dref_impl(&*tex, &*samp, u, v, dref);
+    let out = std::slice::from_raw_parts_mut(out_rgba, 4);
+    out.copy_from_slice(&[frac, frac, frac, frac]);
+}
+
 fn fetch_texel_impl(t: &TexDesc, x: u32, y: u32) -> [f32; 4] {
     // Caller-clamped: `apply_wrap` already brought (x, y)
     // into [0, w) × [0, h). We treat any out-of-range
@@ -1595,6 +1698,7 @@ mod tests {
             min_filter: FilterMode::Nearest as u32,
             wrap_s: WrapMode::ClampToEdge as u32,
             wrap_t: WrapMode::ClampToEdge as u32,
+compare_enable: 0, compare_op: 0,
         };
         // Centre of texel (0,0) sits at u=0.25, v=0.25
         // (texel size 0.5 in normalised coords on a 2x2).
@@ -1613,6 +1717,7 @@ mod tests {
             min_filter: FilterMode::Linear as u32,
             wrap_s: WrapMode::ClampToEdge as u32,
             wrap_t: WrapMode::ClampToEdge as u32,
+compare_enable: 0, compare_op: 0,
         };
         // u=v=0.5 lands exactly at the four-texel meeting
         // point: x = 0.5*2 - 0.5 = 0.5 → fx=0.5, x0=0,x1=1.
@@ -1725,6 +1830,7 @@ mod tests {
             min_filter: FilterMode::Nearest as u32,
             wrap_s: WrapMode::ClampToEdge as u32,
             wrap_t: WrapMode::ClampToEdge as u32,
+compare_enable: 0, compare_op: 0,
         };
         let cases: &[(i32, [f32; 4])] = &[
             (0, [0.0, 1.0, 0.0, 1.0]),  // R
@@ -1771,6 +1877,7 @@ mod tests {
             min_filter: FilterMode::Nearest as u32,
             wrap_s: WrapMode::ClampToEdge as u32,
             wrap_t: WrapMode::ClampToEdge as u32,
+compare_enable: 0, compare_op: 0,
         };
         // Direction vectors pointing along each principal axis.
         let cases: &[([f32; 3], [f32; 4])] = &[
@@ -1831,6 +1938,7 @@ mod tests {
             min_filter: FilterMode::Nearest as u32,
             wrap_s: WrapMode::ClampToEdge as u32,
             wrap_t: WrapMode::ClampToEdge as u32,
+compare_enable: 0, compare_op: 0,
         };
         let mut out_mip0 = [0.0f32; 4];
         let mut out_mip1 = [0.0f32; 4];
@@ -1872,6 +1980,7 @@ mod tests {
             min_filter: FilterMode::Nearest as u32,
             wrap_s: WrapMode::ClampToEdge as u32,
             wrap_t: WrapMode::ClampToEdge as u32,
+compare_enable: 0, compare_op: 0,
         };
         let mut samp_b = samp_a;
         samp_b.mag_filter = FilterMode::Linear as u32;
@@ -1896,7 +2005,8 @@ mod tests {
                 atrium_tex_sample_cube,
                 atrium_tex_gather_2d,
                 atrium_tex_sample_2d_array_lod,
-                atrium_tex_sample_cube_lod);
+                atrium_tex_sample_cube_lod,
+                atrium_tex_sample_2d_dref);
             write_descriptor_slot(&mut buf, 0, tex_a_ptr, samp_a_ptr);
             write_descriptor_slot(&mut buf, 1, tex_b_ptr, samp_b_ptr);
         }
@@ -2565,6 +2675,7 @@ mod tests {
         };
         let samp = SamplerDesc {
             mag_filter: 0, min_filter: 0, wrap_s: 0, wrap_t: 0,
+compare_enable: 0, compare_op: 0,
         };
         let mut rgba = [0f32; 4];
         unsafe { atrium_tex_sample_2d_array_lod(
@@ -2616,6 +2727,7 @@ mod tests {
         };
         let samp = SamplerDesc {
             mag_filter: 0, min_filter: 0, wrap_s: 0, wrap_t: 0,
+compare_enable: 0, compare_op: 0,
         };
         let mut rgba = [0f32; 4];
         // +X face (idx 0), mip 1 -> 0

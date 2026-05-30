@@ -5134,6 +5134,12 @@ pub unsafe extern "C" fn vkCreateSampler(
     let av = std::ptr::read_unaligned(b.add(36) as *const u32) as u8;
     let aw = std::ptr::read_unaligned(b.add(40) as *const u32) as u8;
     let aniso = std::ptr::read_unaligned(b.add(52) as *const f32);
+    // VkSamplerCreateInfo: compareEnable@56 (VkBool32),
+    // compareOp@60 (VkCompareOp), minLod@64, maxLod@68.
+    let compare_enable = (std::ptr::read_unaligned(b.add(56) as *const u32) != 0) as u8;
+    // VkCompareOp raw values (0=NEVER..7=ALWAYS) are exactly
+    // the wire encoding SamplerDesc.compare_op expects.
+    let compare_op = std::ptr::read_unaligned(b.add(60) as *const u32);
     let min_lod = std::ptr::read_unaligned(b.add(64) as *const f32);
     let max_lod = std::ptr::read_unaligned(b.add(68) as *const f32);
 
@@ -5147,6 +5153,7 @@ pub unsafe extern "C" fn vkCreateSampler(
                     address_modes: [au, av, aw],
                     max_anisotropy: aniso,
                     min_lod, max_lod,
+                    compare_enable, compare_op,
                 }).ok()
             })
         })

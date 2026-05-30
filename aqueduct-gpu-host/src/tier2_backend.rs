@@ -1843,6 +1843,7 @@ impl Tier2Backend {
                 Vec::with_capacity(snaps.len());
             let placeholder_samp = atrium_spv_runtime::SamplerDesc {
                 mag_filter: 0, min_filter: 0, wrap_s: 0, wrap_t: 0,
+                compare_enable: 0, compare_op: 0,
             };
             for (b, data, w, h, layers, mips) in &snaps {
                 let (_, sampler_id) = *state.bound_textures.get(b)
@@ -1910,6 +1911,7 @@ impl Tier2Backend {
                     atrium_spv_runtime::atrium_tex_gather_2d,
                     atrium_spv_runtime::atrium_tex_sample_2d_array_lod,
                     atrium_spv_runtime::atrium_tex_sample_cube_lod,
+                    atrium_spv_runtime::atrium_tex_sample_2d_dref,
                 );
                 for (i, (binding, _, _, _, _, _)) in snaps.iter().enumerate() {
                     atrium_spv_runtime::write_descriptor_slot(
@@ -3284,6 +3286,8 @@ impl Backend for Tier2Backend {
         _max_anisotropy: f32,
         _min_lod:      f32,
         _max_lod:      f32,
+        compare_enable: u8,
+        compare_op:    u32,
     ) {
         // VkFilter -> runtime FilterMode.  Same wire form
         // (0=Nearest, 1=Linear) so the cast is direct.
@@ -3306,6 +3310,8 @@ impl Backend for Tier2Backend {
             min_filter: to_filter(min_filter),
             wrap_s: to_wrap(address_modes[0]),
             wrap_t: to_wrap(address_modes[1]),
+            compare_enable: compare_enable as u32,
+            compare_op,
         };
         self.samplers.lock().unwrap()
             .insert(sampler_id.raw(), desc);

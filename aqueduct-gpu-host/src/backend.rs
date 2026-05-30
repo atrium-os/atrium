@@ -158,6 +158,8 @@ pub trait Backend: Send + Sync {
         _max_anisotropy: f32,
         _min_lod:       f32,
         _max_lod:       f32,
+        _compare_enable: u8,
+        _compare_op:    u32,
     ) {}
 
     /// Notify the backend a sampler was destroyed.  Default

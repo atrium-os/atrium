@@ -2349,83 +2349,20 @@ fn translate_inst(
                 raw_coord
             };
 
-            // (1) Inner sample.  Optional ExplicitLod's LOD
-            // arrives via the Image Operands mask at index 3.
-            let is_explicit = matches!(spv_inst.class.opcode,
-                SpvOp::ImageSampleDrefExplicitLod
-                | SpvOp::ImageSampleProjDrefExplicitLod);
-            let inner_op = if is_explicit {
-                let lod_id = extract_image_operand_lod(&spv_inst.operands, 3)?
-                    .ok_or_else(|| FrontendError::Malformed(
-                        "ImageSampleDrefExplicitLod missing Image-Operands::Lod"
-                        .to_string()))?;
-                let lod = id_map.get(&lod_id).cloned().ok_or_else(||
-                    FrontendError::Malformed(format!(
-                        "ImageSampleDrefExplicitLod lod {lod_id} not defined")))?;
-                Op::ImageSampleExplicitLod { sampled_image, coord, lod }
-            } else {
-                Op::ImageSampleImplicitLod { sampled_image, coord }
-            };
-            let sample_id = ValueId(*next_value_id);
-            *next_value_id += 1;
-            let sample_val = Value {
-                id: sample_id,
-                ty: Type::Vec4(VecElement::F32),
-            };
-            insts.push(Inst {
-                op: inner_op,
-                result: Some(sample_val.clone()),
-                source_spirv_offset,
-            });
-
-            // (2) R = VectorExtract(sample, 0).
-            let r_val = push_extract_lane(
-                sample_val, 0,
-                source_spirv_offset, insts, next_value_id)?;
-
-            // (3) cond = FOrdLe(r, dref).
-            let cond_id = ValueId(*next_value_id);
-            *next_value_id += 1;
-            let cond_val = Value { id: cond_id, ty: Type::Bool };
-            insts.push(Inst {
-                op: Op::FOrdLe(r_val, dref),
-                result: Some(cond_val.clone()),
-                source_spirv_offset,
-            });
-
-            // (4) 1.0 / 0.0 constants.
-            let one_id = ValueId(*next_value_id);
-            *next_value_id += 1;
-            let one_val = Value { id: one_id, ty: Type::F32 };
-            insts.push(Inst {
-                op: Op::ConstFloat {
-                    value: 1.0,
-                    kind: atrium_spv_ir::FloatKind::F32,
-                },
-                result: Some(one_val.clone()),
-                source_spirv_offset,
-            });
-            let zero_id = ValueId(*next_value_id);
-            *next_value_id += 1;
-            let zero_val = Value { id: zero_id, ty: Type::F32 };
-            insts.push(Inst {
-                op: Op::ConstFloat {
-                    value: 0.0,
-                    kind: atrium_spv_ir::FloatKind::F32,
-                },
-                result: Some(zero_val.clone()),
-                source_spirv_offset,
-            });
-
-            // (5) result = Select(cond, 1.0, 0.0).
+            // Emit a first-class `ImageSampleDref` op.  The
+            // backend lowers it to a runtime helper
+            // (`atrium_tex_sample_2d_dref`) that performs the
+            // sample + depth comparison using the SAMPLER's
+            // runtime `compareOp` and PCF filtering -- both
+            // are sampler state invisible to this compiler,
+            // so they can't be synthesised inline here.  The
+            // ExplicitLod variants' LOD operand is accepted
+            // but the helper samples the base level for now
+            // (shadow maps are typically single-mip).
             let result = alloc_or_get_result(
                 result_id, result_ty, id_map, next_value_id);
             insts.push(Inst {
-                op: Op::Select {
-                    cond: cond_val,
-                    t_val: one_val,
-                    f_val: zero_val,
-                },
+                op: Op::ImageSampleDref { sampled_image, coord, dref },
                 result: Some(result),
                 source_spirv_offset,
             });

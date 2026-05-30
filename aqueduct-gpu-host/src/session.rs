@@ -393,6 +393,7 @@ impl Session {
             req.min_filter, req.mag_filter, req.mip_filter,
             req.address_modes,
             req.max_anisotropy, req.min_lod, req.max_lod,
+            req.compare_enable, req.compare_op,
         );
         Ok(())
     }

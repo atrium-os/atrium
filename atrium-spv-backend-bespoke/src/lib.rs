@@ -3180,6 +3180,16 @@ fn emit_function(
             // (helper @ #16) and passes the LOD scalar in V2.
             // Mip selection happens inside the helper via
             // `TexDesc.mip_descs[lod]` (Arc 29).
+            // Shadow / depth-comparison sample.  The bespoke
+            // emitter doesn't implement the dref call shape
+            // (extra f32 arg + scalar result); return
+            // Unsupported so the compiler falls back to the
+            // cranelift backend, which lowers it through the
+            // `atrium_tex_sample_2d_dref` helper (#64).
+            Op::ImageSampleDref { .. } => {
+                return Err(BackendError::Unsupported(
+                    "ImageSampleDref (shadow sample) -- handled by cranelift".into()));
+            }
             Op::ImageSampleImplicitLod { sampled_image, coord }
             | Op::ImageSampleExplicitLod { sampled_image, coord, .. } => {
                 let result = inst.result.as_ref().ok_or_else(||
@@ -3314,7 +3324,7 @@ fn emit_function(
                 let two_extra = explicit_lod_v.is_some() && (is_array || is_cube);
                 let extra_v: Option<asm::Vreg> =
                     if two_extra { third_v } else { explicit_lod_v.or(third_v) };
-                let desc_off: u16 = 64 + (binding as u16) * 16;
+                let desc_off: u16 = 72 + (binding as u16) * 16;
 
                 // Stack layout (16-byte aligned; each region
                 // is 16 bytes):
@@ -3473,7 +3483,7 @@ fn emit_function(
                 let v2 = asm::Vreg(2); // u/v parallel-copy temp
                 let w2 = asm::Wreg(2);
                 let lr = asm::Xreg(30);
-                let desc_off: u16 = 64 + (binding as u16) * 16;
+                let desc_off: u16 = 72 + (binding as u16) * 16;
                 let n_spill = live_vregs.len() as u16;
                 let frame_bytes: u16 = 32 + n_spill * 16;
                 a.emit(asm::sub_imm_x(sp, sp, frame_bytes));
@@ -3584,7 +3594,7 @@ fn emit_function(
                 let w1 = asm::Wreg(1);
                 let w2 = asm::Wreg(2);
                 let w3 = asm::Wreg(3);
-                let desc_off: u16 = 64 + (binding as u16) * 16;
+                let desc_off: u16 = 72 + (binding as u16) * 16;
 
                 let n_spill = live_vregs.len() as u16;
                 let frame_bytes: u16 = 32 + n_spill * 16;
@@ -3775,7 +3785,7 @@ fn emit_function(
                 // Sampled-image descriptor table sits at X1
                 // anchored, with slot pitch 16 (tex+samp) and
                 // base offset UNIFORMS_DESC_BASE (= 64).
-                let desc_off: u16 = 64 + (binding as u16) * 16;
+                let desc_off: u16 = 72 + (binding as u16) * 16;
                 let x9 = asm::Xreg(9);
                 a.emit(asm::ldr_x_offset(x9, asm::Xreg(1), desc_off));
                 // TexDesc field offsets: width @8, height @12.

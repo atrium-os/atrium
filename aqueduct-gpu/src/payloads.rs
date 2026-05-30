@@ -328,6 +328,14 @@ pub struct SamplerCreatePayload {
     pub min_lod: f32,
     /// Mip level clamps.
     pub max_lod: f32,
+    /// Depth-comparison enable (`VkSamplerCreateInfo::
+    /// compareEnable`).  `#[serde(default)]` so older
+    /// clients that omit it decode as `false`.
+    #[serde(default)]
+    pub compare_enable: u8,
+    /// Depth-comparison op (`VkCompareOp` wire value).
+    #[serde(default)]
+    pub compare_op: u32,
 }
 
 /// Destroy a sampler.
