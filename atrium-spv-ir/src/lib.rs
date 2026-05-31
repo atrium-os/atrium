@@ -1156,6 +1156,13 @@ pub enum BuiltinKind {
     VertexIndex,
     /// `gl_InstanceIndex` (Vertex only).  uint.
     InstanceIndex,
+    /// `gl_FrontFacing` (Fragment only).  Bool, materialised as
+    /// an i32 (1 = front-facing, 0 = back) so it feeds OpSelect
+    /// and integer comparisons directly.  The rasterizer derives
+    /// it per-triangle from the screen-space winding vs the
+    /// pipeline's `VkFrontFace` and passes it as the FS entry's
+    /// trailing `front_facing` parameter.
+    FrontFacing,
 }
 
 // ── Module ──────────────────────────────────────────────────────

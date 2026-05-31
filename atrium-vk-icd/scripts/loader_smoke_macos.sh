@@ -199,6 +199,7 @@ GRAPHICS_RGB10A2="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics
 GRAPHICS_DERIV="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_deriv"
 GRAPHICS_INSTANCED="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_instanced"
 GRAPHICS_INSTANCE_RATE="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_instance_rate"
+GRAPHICS_FRONTFACE="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_frontface"
 GRAPHICS_ARRAY="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_array"
 GRAPHICS_CUBE="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_cube"
 GRAPHICS_SHADOW="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_shadow"
@@ -2263,6 +2264,46 @@ if [ -x "$GRAPHICS_INSTANCE_RATE" ]; then
 else
     echo
     echo "SKIP Rung UU: need 'cargo build -p atrium-vk-icd --example loader_graphics_instance_rate'"
+fi
+
+# ── Rung VV: gl_FrontFacing in the fragment shader ───────
+# loader_graphics_frontface: two triangles with opposite
+# winding (the second's vertex order reversed) drawn with
+# cullMode=NONE, default front-face CCW.  The FS colours
+# front-facing fragments green and back-facing red via two
+# scalar OpSelects on gl_FrontFacing (the trailing FS param
+# the rasterizer fills from the triangle's screen-space winding
+# vs VkFrontFace).  Triangle A (left) and B (right) thus come
+# out one green + one red.  If gl_FrontFacing were constant,
+# both halves would match.  Asserts exactly one green + one red.
+if [ -x "$GRAPHICS_FRONTFACE" ]; then
+    rm -f "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+        echo "daemon failed to start (frontface round-trip); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung VV: gl_FrontFacing front/back split ==="
+    if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+        VK_DRIVER_FILES="$MANIFEST" \
+        ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+        "$GRAPHICS_FRONTFACE" 2>&1 | tail -3; then
+        echo "FAIL: frontface round-trip did not return 0" >&2
+        exit 1
+    fi
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
+else
+    echo
+    echo "SKIP Rung VV: need 'cargo build -p atrium-vk-icd --example loader_graphics_frontface'"
 fi
 
 echo

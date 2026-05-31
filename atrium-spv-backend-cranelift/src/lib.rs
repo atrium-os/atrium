@@ -1088,6 +1088,13 @@ impl FnTranslator {
                         // Scalar uint from params[5].
                         self.scalars.insert(result.id, self.params[5]);
                     }
+                    (ShaderStage::Fragment, BK::FrontFacing) => {
+                        // gl_FrontFacing -- the trailing FS param
+                        // (index 10): 1 = front, 0 = back.  An i32
+                        // so it feeds OpSelect / comparisons as the
+                        // IR's i32-materialised Bool.
+                        self.scalars.insert(result.id, self.params[10]);
+                    }
                     (stage, kind) => {
                         return Err(BackendError::Unsupported(format!(
                             "LoadBuiltin({kind:?}) not supported for stage {stage:?}",
@@ -2655,6 +2662,7 @@ fn build_signature(
             params.push(AbiParam::new(types::I32));     // samples_mask
             params.push(AbiParam::new(pointer_type));   // out_color
             params.push(AbiParam::new(pointer_type));   // out_depth
+            params.push(AbiParam::new(types::I32));     // front_facing (gl_FrontFacing)
         }
         ShaderStage::Vertex => {
             // atrium_vs_main(

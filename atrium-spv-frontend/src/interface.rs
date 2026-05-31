@@ -397,6 +397,8 @@ impl InterfaceContext {
                                 Some(atrium_spv_ir::BuiltinKind::VertexIndex),
                             SpvBuiltIn::InstanceIndex =>
                                 Some(atrium_spv_ir::BuiltinKind::InstanceIndex),
+                            SpvBuiltIn::FrontFacing =>
+                                Some(atrium_spv_ir::BuiltinKind::FrontFacing),
                             // Other builtins (Position, FragCoord, etc.)
                             // already flow through the existing
                             // varying / output paths; skip.

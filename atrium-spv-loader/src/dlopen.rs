@@ -125,6 +125,10 @@ pub type FsMain = unsafe extern "C" fn(
     samples_mask:   u32,
     out_color:      *mut f32,
     out_depth:      *mut f32,
+    // gl_FrontFacing: 1 = front-facing, 0 = back.  Appended
+    // after the original 10 params so existing param indices
+    // (out_color = 8, out_depth = 9) are unchanged.
+    front_facing:   u32,
 );
 
 /// Compute-shader entry. Signature per spec §4.1.

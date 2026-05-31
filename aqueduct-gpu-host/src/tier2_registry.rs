@@ -214,6 +214,8 @@ impl Tier2Registry {
                         0,
                         out_color.as_mut_ptr(),
                         &mut out_depth,
+                        1, // gl_FrontFacing: fullscreen FS fill has
+                           // no primitive -> treat as front-facing.
                     );
                 }
                 let idx = ((y as usize) * (width as usize) + (x as usize)) * 4;
@@ -638,6 +640,13 @@ impl Tier2Registry {
                     };
                     if is_front { s.front } else { s.back }
                 }),
+                // gl_FrontFacing source: winding vs front_face.
+                // total_edge == 0 (degenerate) never rasterizes a
+                // pixel, so the arbitrary `false` is unobservable.
+                front_facing: match draw.front_face {
+                    FrontFace::CounterClockwise => total_edge > 0.0,
+                    FrontFace::Clockwise        => total_edge < 0.0,
+                },
             };
 
             let pixel_stripe_bytes =
@@ -850,6 +859,12 @@ struct TriangleSetup<'s> {
     /// the caller didn't supply a viewport.
     depth_min: f32,
     depth_max: f32,
+    /// Whether this triangle is front-facing: its screen-space
+    /// winding matches the pipeline's `VkFrontFace`.  Passed to
+    /// the FS as `gl_FrontFacing` (the trailing `front_facing`
+    /// parameter).  Computed once per triangle from
+    /// `total_edge`'s sign + `draw.front_face`.
+    front_facing: bool,
 }
 
 /// One stripe's mutable working set for R.7's per-stripe
@@ -1357,6 +1372,7 @@ fn rasterize_stripe(
                                 0,
                                 out_color.as_mut_ptr(),
                                 &mut out_depth,
+                                setup.front_facing as u32,
                             );
                         }
                     }
@@ -1379,6 +1395,7 @@ fn rasterize_stripe(
                         0,
                         out_color.as_mut_ptr(),
                         &mut out_depth,
+                        setup.front_facing as u32,
                     );
                 }
                 if draw.uses_derivatives {
