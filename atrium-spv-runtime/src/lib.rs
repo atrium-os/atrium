@@ -280,8 +280,9 @@ pub struct SamplerDesc {
 //                   40:  atrium_tex_gather_2d
 //                   48:  atrium_tex_sample_2d_array_lod
 //                   56:  atrium_tex_sample_cube_lod
-//                   64:  atrium_tex_sample_2d_dref )
-//   bytes 72..   : flat descriptor table — slot `B` at
+//                   64:  atrium_tex_sample_2d_dref
+//                   72:  atrium_deriv )
+//   bytes 80..   : flat descriptor table — slot `B` at
 //                  byte `UNIFORMS_DESC_BASE + B*16`,
 //                  carrying ( 0: tex_desc*, 8: samp_desc* )
 //
@@ -319,8 +320,8 @@ pub const UNIFORMS_HELPERS_BASE: usize = 0;
 /// Grew from 16 → 24 (Arc 29 sample_2d_lod) → 32 (Arc 30
 /// sample_2d_array) → 40 (Arc 31 sample_cube) → 48 (Arc 32
 /// gather_2d) → 64 (Arc 35 array_lod + cube_lod) → 72
-/// (sample_2d_dref / shadow).
-pub const UNIFORMS_DESC_BASE: usize = 72;
+/// (sample_2d_dref / shadow) → 80 (atrium_deriv).
+pub const UNIFORMS_DESC_BASE: usize = 80;
 
 /// Bytes per descriptor slot in the table. Two 64-bit
 /// pointers packed back-to-back — `tex_desc*` then
@@ -572,6 +573,7 @@ pub unsafe fn write_helper_pointers(
         f32, f32, f32, f32, *mut f32),
     sample_2d_dref: unsafe extern "C" fn(
         *const TexDesc, *const SamplerDesc, f32, f32, f32, *mut f32),
+    deriv: unsafe extern "C" fn(f32, u32, u32) -> f32,
 ) {
     assert!(buf.len() >= UNIFORMS_DESC_BASE,
         "uniforms buffer too small for the helper header");
@@ -584,6 +586,7 @@ pub unsafe fn write_helper_pointers(
     let sal = (sample_2d_array_lod as usize as u64).to_le_bytes();
     let scl = (sample_cube_lod     as usize as u64).to_le_bytes();
     let sd  = (sample_2d_dref       as usize as u64).to_le_bytes();
+    let dv  = (deriv                as usize as u64).to_le_bytes();
     buf[ 0.. 8].copy_from_slice(&s);
     buf[ 8..16].copy_from_slice(&f);
     buf[16..24].copy_from_slice(&sl);
@@ -593,6 +596,7 @@ pub unsafe fn write_helper_pointers(
     buf[48..56].copy_from_slice(&sal);
     buf[56..64].copy_from_slice(&scl);
     buf[64..72].copy_from_slice(&sd);
+    buf[72..80].copy_from_slice(&dv);
 }
 
 /// Write a `(tex_desc, samp_desc)` pointer pair at binding
@@ -616,6 +620,117 @@ pub unsafe fn write_descriptor_slot(
     let samp_bytes = (samp as usize as u64).to_le_bytes();
     buf[base    .. base +  8].copy_from_slice(&tex_bytes);
     buf[base + 8.. base + 16].copy_from_slice(&samp_bytes);
+}
+
+// ── Quad-lockstep derivative context ──────────────────────
+//
+// `OpDPdx`/`OpDPdy`/`OpFwidth` need the operand value at all
+// four pixels of a 2x2 quad.  The rasterizer drives a
+// two-pass re-execution per quad: a PROBE pass runs the FS
+// for each of the 4 lanes, recording every derivative-site's
+// operand value via `atrium_deriv`; then a FINAL pass runs
+// the FS again, and `atrium_deriv` returns the recorded
+// lane-difference.  The per-thread `QUAD` context carries
+// the mode + current lane + per-site operand store (one
+// rayon worker = one stripe = one thread, so a thread-local
+// is race-free).
+
+/// Quad lane order: 0 = top-left, 1 = top-right,
+/// 2 = bottom-left, 3 = bottom-right.  dFdx = lane1 - lane0,
+/// dFdy = lane2 - lane0.
+struct QuadState {
+    /// 0 = inactive (derivatives return 0), 1 = probe,
+    /// 2 = final.
+    mode: u32,
+    /// Current quad lane being executed (0..4).
+    lane: usize,
+    /// Per-site operand values recorded in the probe pass,
+    /// keyed by the op's `site` id: `[lane0, lane1, lane2,
+    /// lane3]`.
+    recorded: std::collections::HashMap<u32, [f32; 4]>,
+}
+
+impl Default for QuadState {
+    fn default() -> Self {
+        QuadState { mode: 0, lane: 0, recorded: std::collections::HashMap::new() }
+    }
+}
+
+thread_local! {
+    static QUAD: std::cell::RefCell<QuadState> =
+        std::cell::RefCell::new(QuadState::default());
+}
+
+/// Reset the quad context for a new 2x2 quad + enter PROBE
+/// mode.  Called by the rasterizer before running the FS for
+/// the quad's four lanes.
+pub fn quad_probe_begin() {
+    QUAD.with(|q| {
+        let mut q = q.borrow_mut();
+        q.mode = 1;
+        q.lane = 0;
+        q.recorded.clear();
+    });
+}
+
+/// Switch to FINAL mode (derivatives now return recorded
+/// lane-differences).
+pub fn quad_final_begin() {
+    QUAD.with(|q| q.borrow_mut().mode = 2);
+}
+
+/// Set the lane (0..4) for the next FS invocation.
+pub fn quad_set_lane(lane: usize) {
+    QUAD.with(|q| q.borrow_mut().lane = lane);
+}
+
+/// Leave quad mode (subsequent `atrium_deriv` calls return
+/// 0).  Called when the quad finishes / for non-derivative
+/// draws.
+pub fn quad_end() {
+    QUAD.with(|q| {
+        let mut q = q.borrow_mut();
+        q.mode = 0;
+        q.recorded.clear();
+    });
+}
+
+/// `atrium_deriv` — screen-space derivative helper (table
+/// slot #9).  `axis`: 0 = dFdx, 1 = dFdy, 2 = fwidth.
+///
+/// PROBE mode: record `value` for `(site, current lane)` and
+/// return 0.  FINAL mode: return the recorded lane-difference
+/// (dFdx = lane1-lane0, dFdy = lane2-lane0, fwidth =
+/// |dFdx|+|dFdy|).  Inactive: return 0.
+///
+/// # Safety
+/// Pure (reads only the thread-local); the `extern "C"`
+/// signature exists so compiled shaders can call it through
+/// the helper-pointer table.
+#[no_mangle]
+pub unsafe extern "C" fn atrium_deriv(value: f32, site: u32, axis: u32) -> f32 {
+    QUAD.with(|q| {
+        let mut q = q.borrow_mut();
+        match q.mode {
+            1 => {
+                let lane = q.lane.min(3);
+                let slot = q.recorded.entry(site).or_insert([0.0; 4]);
+                slot[lane] = value;
+                0.0
+            }
+            2 => {
+                let rec = q.recorded.get(&site).copied().unwrap_or([0.0; 4]);
+                let ddx = rec[1] - rec[0];
+                let ddy = rec[2] - rec[0];
+                match axis {
+                    0 => ddx,
+                    1 => ddy,
+                    _ => ddx.abs() + ddy.abs(),
+                }
+            }
+            _ => 0.0,
+        }
+    })
 }
 
 // ── Helpers ───────────────────────────────────────────────
@@ -2006,7 +2121,8 @@ compare_enable: 0, compare_op: 0,
                 atrium_tex_gather_2d,
                 atrium_tex_sample_2d_array_lod,
                 atrium_tex_sample_cube_lod,
-                atrium_tex_sample_2d_dref);
+                atrium_tex_sample_2d_dref,
+                atrium_deriv);
             write_descriptor_slot(&mut buf, 0, tex_a_ptr, samp_a_ptr);
             write_descriptor_slot(&mut buf, 1, tex_b_ptr, samp_b_ptr);
         }

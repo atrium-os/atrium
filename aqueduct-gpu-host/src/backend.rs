@@ -298,6 +298,14 @@ pub trait Backend: Send + Sync {
         _sample_count: u32,
     ) {}
 
+    /// Record whether the FS uses screen-space derivatives
+    /// (`dFdx`/`dFdy`/`fwidth`).  Default no-op.
+    fn bind_pipeline_fs_derivatives(
+        &self,
+        _pipeline_id: ResourceId,
+        _uses_derivatives: bool,
+    ) {}
+
     /// Associate a compute pipeline with its Tier-2 shader +
     /// workgroup-size state. Mirror of
     /// [`Backend::bind_pipeline_tier2_vs`] /

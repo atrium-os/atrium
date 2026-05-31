@@ -123,6 +123,10 @@ pub struct Tier2Backend {
     pipeline_fs_implicit_lod: Mutex<HashMap<u32, bool>>,
     /// Per-graphics-pipeline MSAA sample count (1 = none).
     pipeline_sample_count: Mutex<HashMap<u32, u32>>,
+    /// Per-graphics-pipeline flag: FS uses screen-space
+    /// derivatives (`dFdx`/`dFdy`/`fwidth`).  Gates the
+    /// rasterizer's 2x2-quad lockstep shading path.
+    pipeline_fs_derivatives: Mutex<HashMap<u32, bool>>,
     /// Per-pipeline compute-shader binding: Tier-2 shader id
     /// + workgroup local-size. Populated when the session
     /// processes a Compute-kind pipeline create.
@@ -704,6 +708,7 @@ impl Tier2Backend {
             pipeline_vs_varying_bytes: Mutex::new(HashMap::new()),
             pipeline_fs_implicit_lod: Mutex::new(HashMap::new()),
             pipeline_sample_count: Mutex::new(HashMap::new()),
+            pipeline_fs_derivatives: Mutex::new(HashMap::new()),
             pipeline_compute: Mutex::new(HashMap::new()),
             cs_invocations: AtomicU64::new(0),
             last_compute_output: Mutex::new(None),
@@ -1812,6 +1817,8 @@ impl Tier2Backend {
             .get(&pipeline_raw).copied().unwrap_or(false);
         let sample_count = self.pipeline_sample_count.lock().unwrap()
             .get(&pipeline_raw).copied().unwrap_or(1);
+        let fs_derivatives = self.pipeline_fs_derivatives.lock().unwrap()
+            .get(&pipeline_raw).copied().unwrap_or(false);
 
         // Build the uniforms buffer if any COMBINED_IMAGE_SAMPLER
         // bindings are live.  Layout (atrium-spv-runtime
@@ -1925,6 +1932,7 @@ impl Tier2Backend {
                     atrium_spv_runtime::atrium_tex_sample_2d_array_lod,
                     atrium_spv_runtime::atrium_tex_sample_cube_lod,
                     atrium_spv_runtime::atrium_tex_sample_2d_dref,
+                    atrium_spv_runtime::atrium_deriv,
                 );
                 for (i, (binding, _, _, _, _, _)) in snaps.iter().enumerate() {
                     atrium_spv_runtime::write_descriptor_slot(
@@ -1958,6 +1966,34 @@ impl Tier2Backend {
             }
             uniforms_buf = ubo_bytes;
             mip_desc_arrays = Vec::new();
+        } else if fs_derivatives {
+            // No textures + no UBO, but the FS calls
+            // `atrium_deriv` (loaded from uniforms + offset 72).
+            // The backend dereferences a helper pointer there, so
+            // we must hand it a buffer with the helper table even
+            // though there are no descriptors.  `descriptor_table_
+            // buffer(0)` is sized to UNIFORMS_DESC_BASE (>= 80),
+            // and `write_helper_pointers` fills bytes 0..80.
+            tex_descs = Vec::new();
+            sampler_descs = Vec::new();
+            mip_desc_arrays = Vec::new();
+            let mut buf = atrium_spv_runtime::descriptor_table_buffer(0);
+            unsafe {
+                atrium_spv_runtime::write_helper_pointers(
+                    &mut buf,
+                    atrium_spv_runtime::atrium_tex_sample_2d,
+                    atrium_spv_runtime::atrium_tex_fetch_2d,
+                    atrium_spv_runtime::atrium_tex_sample_2d_lod,
+                    atrium_spv_runtime::atrium_tex_sample_2d_array,
+                    atrium_spv_runtime::atrium_tex_sample_cube,
+                    atrium_spv_runtime::atrium_tex_gather_2d,
+                    atrium_spv_runtime::atrium_tex_sample_2d_array_lod,
+                    atrium_spv_runtime::atrium_tex_sample_cube_lod,
+                    atrium_spv_runtime::atrium_tex_sample_2d_dref,
+                    atrium_spv_runtime::atrium_deriv,
+                );
+            }
+            uniforms_buf = buf;
         } else {
             tex_descs = Vec::new();
             sampler_descs = Vec::new();
@@ -2019,6 +2055,7 @@ impl Tier2Backend {
                     && !state.bound_textures.is_empty()
                     && varying_f32_count >= 2,
                 sample_count,
+                uses_derivatives: fs_derivatives,
                 ..Default::default()
             };
             let db_ref: Option<&mut [f32]> = if !depth_enabled {
@@ -3566,6 +3603,15 @@ impl Backend for Tier2Backend {
     ) {
         self.pipeline_sample_count.lock().unwrap()
             .insert(pipeline_id.raw(), sample_count.max(1));
+    }
+
+    fn bind_pipeline_fs_derivatives(
+        &self,
+        pipeline_id: ResourceId,
+        uses_derivatives: bool,
+    ) {
+        self.pipeline_fs_derivatives.lock().unwrap()
+            .insert(pipeline_id.raw(), uses_derivatives);
     }
 
     fn bind_pipeline_tier2_compute(

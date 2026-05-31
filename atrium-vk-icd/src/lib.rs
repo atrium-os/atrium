@@ -478,6 +478,13 @@ struct AtriumShaderModule {
     /// selection for shaders that actually sample implicitly
     /// -- explicit-LOD shaders keep their descriptor intact.
     uses_implicit_lod: bool,
+    /// True when this module contains a screen-space derivative
+    /// instruction (`OpDPdx`/`DPdy`/`Fwidth` + Fine/Coarse
+    /// variants).  FS modules propagate this onto
+    /// `Tier2PipelineStateBlob` so the rasterizer only runs the
+    /// (more expensive) 2x2-quad lockstep shading path for
+    /// shaders that actually use derivatives.
+    uses_derivatives: bool,
 }
 
 /// Sum the byte sizes of every Location-decorated
@@ -660,6 +667,31 @@ fn scan_spirv_uses_implicit_lod(spirv: &[u8]) -> bool {
         // OpImageSampleImplicitLod=87, ...ProjImplicitLod=89,
         // ...DrefImplicitLod=91, ...ProjDrefImplicitLod=93.
         if matches!(opcode, 87 | 89 | 91 | 93) { return true; }
+        cursor += word_count * 4;
+    }
+    false
+}
+
+/// True when `spirv` contains any screen-space derivative
+/// instruction.  Gates the daemon's 2x2-quad lockstep
+/// rasterization path so `dFdx`/`dFdy`/`fwidth` return real
+/// finite differences.  Same hand-rolled word walk as
+/// `scan_spirv_uses_implicit_lod`.
+fn scan_spirv_uses_derivatives(spirv: &[u8]) -> bool {
+    if spirv.len() < 20 || spirv.len() % 4 != 0 { return false; }
+    let magic = u32::from_le_bytes(spirv[0..4].try_into().unwrap());
+    if magic != 0x07230203 { return false; }
+    let mut cursor = 20;
+    while cursor + 4 <= spirv.len() {
+        let head = u32::from_le_bytes(
+            spirv[cursor..cursor + 4].try_into().unwrap());
+        let word_count = (head >> 16) as usize;
+        let opcode = (head & 0xFFFF) as u16;
+        if word_count == 0 { return false; }
+        // OpDPdx=207, OpDPdy=208, OpFwidth=209,
+        // OpDPdxFine=210, OpDPdyFine=211, OpFwidthFine=212,
+        // OpDPdxCoarse=213, OpDPdyCoarse=214, OpFwidthCoarse=215.
+        if (207..=215).contains(&opcode) { return true; }
         cursor += word_count * 4;
     }
     false
@@ -3165,6 +3197,7 @@ unsafe fn build_tier2_pipeline_blob(
     let mut fs_id: Option<aqueduct_gpu::ids::ResourceId> = None;
     let mut vs_varying_bytes: u32 = 0;
     let mut fs_uses_implicit_lod = false;
+    let mut fs_uses_derivatives = false;
     let shaders_map = dev.shaders.lock().ok()?;
     for s in 0..info.stage_count {
         let stage = &*info.p_stages.offset(s as isize);
@@ -3178,7 +3211,10 @@ unsafe fn build_tier2_pipeline_blob(
             }
             ash::vk::ShaderStageFlags::FRAGMENT => {
                 fs_id = rid;
-                if let Some(am) = m { fs_uses_implicit_lod = am.uses_implicit_lod; }
+                if let Some(am) = m {
+                    fs_uses_implicit_lod = am.uses_implicit_lod;
+                    fs_uses_derivatives = am.uses_derivatives;
+                }
             }
             _ => {} // tess/geom not in tier-2 yet
         }
@@ -3363,6 +3399,7 @@ unsafe fn build_tier2_pipeline_blob(
         vertex_input, depth, blend, blend_extra, raster,
         topology, primitive_restart_enable, stencil,
         vs_varying_bytes, fs_uses_implicit_lod, sample_count,
+        fs_uses_derivatives,
     };
     let bytes = postcard::to_allocvec(&blob).ok()?;
     Some((vec![vs_id, fs_id], bytes))
@@ -4538,6 +4575,7 @@ pub unsafe extern "C" fn vkCreateShaderModule(
     let uses_barrier = scan_spirv_uses_barrier(&bytes);
     let vs_varying_bytes = scan_spirv_vs_varying_bytes(&bytes);
     let uses_implicit_lod = scan_spirv_uses_implicit_lod(&bytes);
+    let uses_derivatives = scan_spirv_uses_derivatives(&bytes);
 
     // Resolve-or-upload against the daemon. Failure (no live
     // client, validation rejection) leaves shader_id=None — the
@@ -4562,7 +4600,7 @@ pub unsafe extern "C" fn vkCreateShaderModule(
         s.insert(handle, AtriumShaderModule {
             shader_id, bytecode_hash, local_size, ssbo_binding_count,
             workgroup_size, uses_barrier, vs_varying_bytes,
-            uses_implicit_lod,
+            uses_implicit_lod, uses_derivatives,
         });
     } else {
         return VK_ERROR_INITIALIZATION_FAILED;

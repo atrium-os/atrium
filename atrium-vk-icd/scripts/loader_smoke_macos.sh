@@ -196,6 +196,7 @@ GRAPHICS_LOD="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_lod
 GRAPHICS_MSAA="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_msaa"
 GRAPHICS_HALF="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_half"
 GRAPHICS_RGB10A2="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_rgb10a2"
+GRAPHICS_DERIV="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_deriv"
 GRAPHICS_ARRAY="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_array"
 GRAPHICS_CUBE="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_cube"
 GRAPHICS_SHADOW="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_shadow"
@@ -2135,6 +2136,50 @@ if [ -x "$GRAPHICS_RGB10A2" ]; then
 else
     echo
     echo "SKIP Rung RR: need 'cargo build -p atrium-vk-icd --example loader_graphics_rgb10a2'"
+fi
+
+# ── Rung SS: screen-space derivatives (2x2-quad lockstep) ─
+# loader_graphics_deriv: the FS receives a scalar varying
+# `u` ramping with screen-x and emits dFdx(u*u) into the
+# red channel.  The daemon shades each covered pixel in a
+# 2x2 quad -- a probe pass re-runs the FS at all four lanes
+# (recording the operand of every derivative op into a
+# thread-local QuadState), then a final pass runs for the
+# real pixel where `atrium_deriv` returns the lane finite
+# difference.  Because the differentiated expression is
+# non-affine (u*u), its derivative GROWS left->right; a
+# trivial "derivative-of-a-varying-is-constant" shortcut
+# could not produce that, and the pre-quad zero-lowering
+# would leave the frame black.  Asserts R(left) < R(right),
+# both > 0.
+if [ -x "$GRAPHICS_DERIV" ]; then
+    rm -f "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+        echo "daemon failed to start (deriv round-trip); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung SS: dFdx(u*u) via 2x2-quad lockstep derivatives ==="
+    if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+        VK_DRIVER_FILES="$MANIFEST" \
+        ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+        "$GRAPHICS_DERIV" 2>&1 | tail -4; then
+        echo "FAIL: deriv round-trip did not return 0" >&2
+        exit 1
+    fi
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
+else
+    echo
+    echo "SKIP Rung SS: need 'cargo build -p atrium-vk-icd --example loader_graphics_deriv'"
 fi
 
 echo

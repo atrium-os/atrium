@@ -695,6 +695,24 @@ pub enum Op {
         /// Mip level.
         lod: Value,
     },
+    /// Screen-space derivative (`OpDPdx`/`OpDPdy`/`OpFwidth`
+    /// + Fine/Coarse variants).  Computed via 2x2-quad
+    /// re-execution in the rasterizer: a runtime helper
+    /// records `value` per quad lane in a probe pass and
+    /// returns the lane-difference in the final pass.
+    /// `site` is a per-op unique id (the result ValueId)
+    /// keying the quad's per-site operand store; `axis` is
+    /// 0 = dFdx, 1 = dFdy, 2 = fwidth.  Result is f32 (vec
+    /// derivatives are lowered component-wise by the
+    /// frontend).
+    Derivative {
+        /// The value whose screen-space derivative is taken.
+        value: Value,
+        /// Per-op site id (keys the quad operand store).
+        site: u32,
+        /// 0 = dFdx, 1 = dFdy, 2 = fwidth.
+        axis: u8,
+    },
     /// Depth-comparison ("shadow") sample
     /// (`OpImageSampleDref*`).  Samples the depth texture
     /// bound at `sampled_image`, compares the sampled

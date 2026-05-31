@@ -592,6 +592,15 @@ pub struct Tier2PipelineStateBlob {
     /// resolved multisampling when > 1.
     #[serde(default = "default_sample_count")]
     pub sample_count: u32,
+    /// True when the fragment shader uses screen-space
+    /// derivative ops (`OpDPdx`/`DPdy`/`Fwidth` + Fine/Coarse
+    /// variants).  Gates the rasterizer's 2x2-quad lockstep
+    /// re-execution path: derivative shaders shade in quads so
+    /// the runtime `atrium_deriv` helper can return real
+    /// finite-difference values.  Populated by the ICD via a
+    /// SPIR-V scan of the FS module.
+    #[serde(default)]
+    pub fs_uses_derivatives: bool,
 }
 
 fn default_sample_count() -> u32 { 1 }

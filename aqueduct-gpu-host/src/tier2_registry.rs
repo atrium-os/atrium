@@ -989,6 +989,12 @@ fn rasterize_stripe(
     // buffer (mutated per pixel; can't be shared across
     // tasks).
     let mut interp_buf: Vec<u8> = vec![0u8; setup.varying_bytes];
+    // Per-stripe scratch for the 2x2-quad probe pass (only
+    // touched when `draw.uses_derivatives`).  Holds the
+    // interpolated varyings for a single probe lane, kept
+    // separate from `interp_buf` so the real pixel's varyings
+    // survive the four probe runs.
+    let mut probe_buf: Vec<u8> = vec![0u8; setup.varying_bytes];
 
     let (a, b, c) = (setup.a, setup.b, setup.c);
 
@@ -1284,6 +1290,79 @@ fn rasterize_stripe(
                 let in_varyings_ptr = if setup.n == 0 {
                     std::ptr::null()
                 } else { interp_buf.as_ptr() };
+
+                // 2x2-quad lockstep derivatives.  When the FS
+                // uses dFdx/dFdy/fwidth, run a *probe* pass over
+                // all four pixels of this pixel's quad: each lane
+                // re-runs the FS with its own interpolated
+                // varyings + frag_coord, and the runtime records
+                // every derivative operand into a thread-local
+                // QuadState keyed by op-site.  We then switch to
+                // *final* mode and re-run for the real pixel
+                // below, where `atrium_deriv` returns the
+                // finite-difference between the recorded lanes.
+                // Helper lanes (outside the triangle) still run
+                // with extrapolated attributes, matching GPU quad
+                // semantics.  Gated on `uses_derivatives` so the
+                // hot path keeps exactly one FS call per pixel.
+                if draw.uses_derivatives {
+                    atrium_spv_runtime::quad_probe_begin();
+                    let qx = px & !1;
+                    let qy = py & !1;
+                    let my_lane =
+                        ((px & 1) + ((py & 1) << 1)) as usize;
+                    for lane in 0..4usize {
+                        let lx = qx + (lane as i32 & 1);
+                        let ly = qy + ((lane as i32 >> 1) & 1);
+                        let lcx = lx as f32 + 0.5;
+                        let lcy = ly as f32 + 0.5;
+                        let le0 = edge_fn(b, c, (lcx, lcy));
+                        let le1 = edge_fn(c, a, (lcx, lcy));
+                        let le2 = edge_fn(a, b, (lcx, lcy));
+                        let lb0 = le0 / setup.total_edge;
+                        let lb1 = le1 / setup.total_edge;
+                        let lb2 = le2 / setup.total_edge;
+                        let liw = lb0 * setup.inv_w[0]
+                            + lb1 * setup.inv_w[1]
+                            + lb2 * setup.inv_w[2];
+                        let loiw = if liw == 0.0 { 0.0 }
+                                   else { 1.0 / liw };
+                        for k in 0..setup.n {
+                            let sow = lb0 * setup.varying_over_w[0][k]
+                                + lb1 * setup.varying_over_w[1][k]
+                                + lb2 * setup.varying_over_w[2][k];
+                            let v = sow * loiw;
+                            probe_buf[k*4 .. k*4 + 4]
+                                .copy_from_slice(&v.to_le_bytes());
+                        }
+                        let lz_ndc = lb0 * setup.ndc[0][2]
+                            + lb1 * setup.ndc[1][2]
+                            + lb2 * setup.ndc[2][2];
+                        let lz = setup.depth_min
+                            + lz_ndc
+                                * (setup.depth_max - setup.depth_min)
+                            + setup.depth_bias_offset;
+                        let lane_vptr = if setup.n == 0 {
+                            std::ptr::null()
+                        } else { probe_buf.as_ptr() };
+                        atrium_spv_runtime::quad_set_lane(lane);
+                        // SAFETY: same contract as the final
+                        // fs_main call below; outputs land in the
+                        // scratch out_color / out_depth (discarded
+                        // -- only the recorded operands matter).
+                        unsafe {
+                            fs_main(
+                                lane_vptr, uni_ptr, pc_ptr,
+                                lcx, lcy, lz, loiw,
+                                0,
+                                out_color.as_mut_ptr(),
+                                &mut out_depth,
+                            );
+                        }
+                    }
+                    atrium_spv_runtime::quad_final_begin();
+                    atrium_spv_runtime::quad_set_lane(my_lane);
+                }
                 // SAFETY: fs_main is a dlopened C-ABI
                 // function whose signature was checked at
                 // open time; all pointers are valid for the
@@ -1301,6 +1380,9 @@ fn rasterize_stripe(
                         out_color.as_mut_ptr(),
                         &mut out_depth,
                     );
+                }
+                if draw.uses_derivatives {
+                    atrium_spv_runtime::quad_end();
                 }
                 let idx = pixel_lin_local * 4;
 
@@ -1575,6 +1657,17 @@ pub struct DrawTriangle<'a> {
     /// depth attachment is bound or the bias triple
     /// evaluates to zero.
     pub depth_bias: Option<(f32, f32, f32)>,
+
+    /// When true, the FS uses screen-space derivatives
+    /// (`dFdx`/`dFdy`/`fwidth`).  The rasterizer shades each
+    /// covered pixel in 2x2-quad lockstep: a probe pass runs
+    /// the FS at all four quad-lane centres (recording each
+    /// derivative operand into a thread-local `QuadState`), then
+    /// a final pass runs the FS for the real pixel so the
+    /// `atrium_deriv` helper returns finite-difference values.
+    /// Requires a uniforms buffer carrying the helper table
+    /// (the dispatcher guarantees one even with no textures).
+    pub uses_derivatives: bool,
 }
 
 /// Per-face stencil state passed to `fill_image_triangle`.
@@ -1656,6 +1749,7 @@ impl Default for DrawTriangle<'_> {
             depth_bias: None,
             compute_implicit_lod: false,
             sample_count: 1,
+            uses_derivatives: false,
         }
     }
 }

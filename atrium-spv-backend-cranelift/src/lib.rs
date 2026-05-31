@@ -1682,6 +1682,36 @@ impl FnTranslator {
             // compare against the sampler's runtime compareOp
             // + PCF filtering and writes the pass fraction to
             // out[0..4]; the result is a scalar f32 (lane 0).
+            // Screen-space derivative: call `atrium_deriv`
+            // (helper @ #72) with (value, site, axis).  The
+            // rasterizer's 2x2-quad re-execution supplies the
+            // real lane-difference; outside the quad path the
+            // helper returns 0.  Result is a scalar f32.
+            Op::Derivative { value, site, axis } => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "Derivative without result".to_string()))?;
+                let v = *self.scalars.get(&value.id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "Derivative value {:?} not a scalar", value.id)))?;
+                let pointer_type = builder.func.dfg.value_type(self.params[1]);
+                let uniforms = self.params[1];
+                let fn_ptr = builder.ins().load(
+                    pointer_type, MemFlags::new(), uniforms, 72);
+                let site_v = builder.ins().iconst(clif_types::I32, *site as i64);
+                let axis_v = builder.ins().iconst(clif_types::I32, *axis as i64);
+                let mut call_sig = Signature::new(CallConv::SystemV);
+                call_sig.params.push(AbiParam::new(clif_types::F32)); // value
+                call_sig.params.push(AbiParam::new(clif_types::I32)); // site
+                call_sig.params.push(AbiParam::new(clif_types::I32)); // axis
+                call_sig.returns.push(AbiParam::new(clif_types::F32));
+                let sig_ref = builder.import_signature(call_sig);
+                let call = builder.ins().call_indirect(
+                    sig_ref, fn_ptr, &[v, site_v, axis_v]);
+                let res = builder.inst_results(call)[0];
+                self.scalars.insert(result.id, res);
+                Ok(())
+            }
             Op::ImageSampleDref { sampled_image, coord, dref } => {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal(
@@ -1707,7 +1737,7 @@ impl FnTranslator {
                 let pointer_type = builder.func.dfg.value_type(self.params[1]);
                 let uniforms = self.params[1];
                 let helper_off: i32 = 64; // sample_2d_dref slot
-                let desc_off: i32 = 72 + (binding as i32) * 16;
+                let desc_off: i32 = 80 + (binding as i32) * 16;
                 let fn_ptr = builder.ins().load(
                     pointer_type, MemFlags::new(), uniforms, helper_off);
                 let tex_ptr = builder.ins().load(
@@ -1808,7 +1838,7 @@ impl FnTranslator {
                 // pointers from the uniforms buffer at the
                 // v1-ABI offsets.  ExplicitLod selects the
                 // sample_2d_lod helper at #16.
-                let desc_off: i32 = 72 + (binding as i32) * 16;
+                let desc_off: i32 = 80 + (binding as i32) * 16;
                 let fn_ptr = builder.ins().load(
                     pointer_type, MemFlags::new(), uniforms, helper_off);
                 let tex_ptr = builder.ins().load(
@@ -1939,7 +1969,7 @@ impl FnTranslator {
                 let pointer_type = builder.func.dfg
                     .value_type(self.params[1]);
                 let uniforms = self.params[1];
-                let desc_off: i32 = 72 + (binding as i32) * 16;
+                let desc_off: i32 = 80 + (binding as i32) * 16;
                 let fn_ptr = builder.ins().load(
                     pointer_type, MemFlags::new(), uniforms, 40);
                 let tex_ptr = builder.ins().load(
@@ -2001,7 +2031,7 @@ impl FnTranslator {
                     .value_type(self.params[1]);
                 let uniforms = self.params[1];
 
-                let desc_off: i32 = 72 + (binding as i32) * 16;
+                let desc_off: i32 = 80 + (binding as i32) * 16;
                 let fn_ptr = builder.ins().load(
                     pointer_type, MemFlags::new(), uniforms, 8); // fetch slot
                 let tex_ptr = builder.ins().load(
@@ -2091,7 +2121,7 @@ impl FnTranslator {
                 let pointer_type = builder.func.dfg
                     .value_type(self.params[1]);
                 let uniforms = self.params[1];
-                let desc_off: i32 = 72 + (binding as i32) * 16;
+                let desc_off: i32 = 80 + (binding as i32) * 16;
                 let desc_ptr = builder.ins().load(
                     pointer_type, MemFlags::new(), uniforms, desc_off);
                 let field_offs: [i32; 2] = [8, 12]; // width, height

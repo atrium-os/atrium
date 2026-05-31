@@ -2491,15 +2491,12 @@ fn translate_inst(
         // the integer coord. Optional Lod via the Image
         // Operands mask is read from operand index 2+.
         // OpDPdx / OpDPdy / OpFwidth (+ Fine / Coarse
-        // variants) -- pixel-quad derivatives.  Tier-2's
-        // dispatcher runs invocations serially (no 2×2
-        // quad), so no real derivative is computable.  We
-        // lower every derivative op to a zero of the result
-        // type so shaders that use them defensively still
-        // compile (with implicit-LOD sampling collapsing to
-        // mip 0, which already matches our sampler-side
-        // behaviour).  Real quad-dispatch is a dispatcher
-        // refactor, deferred.
+        // variants) -- pixel-quad derivatives.  Lowered to a
+        // first-class `Op::Derivative` per scalar lane, which
+        // the backend routes to a runtime helper; the
+        // rasterizer's 2x2-quad re-execution path supplies
+        // the real lane-difference (Fine/Coarse aren't
+        // distinguished -- both use the quad difference).
         SpvOp::DPdx | SpvOp::DPdy | SpvOp::Fwidth
         | SpvOp::DPdxFine | SpvOp::DPdyFine | SpvOp::FwidthFine
         | SpvOp::DPdxCoarse | SpvOp::DPdyCoarse | SpvOp::FwidthCoarse => {
@@ -2510,49 +2507,66 @@ fn translate_inst(
                 FrontendError::Malformed(
                     "derivative op without result type".to_string()))?;
             let result_ty = types.get(result_type_id)?.clone();
-            // Force the operand to materialise so its
-            // last-use bookkeeping doesn't think it's dead
-            // (the value is consumed even though the result
-            // discards it).
+            let axis: u8 = match spv_inst.class.opcode {
+                SpvOp::DPdx | SpvOp::DPdxFine | SpvOp::DPdxCoarse => 0,
+                SpvOp::DPdy | SpvOp::DPdyFine | SpvOp::DPdyCoarse => 1,
+                _ => 2, // Fwidth*
+            };
             let x_id = expect_id(&spv_inst.operands, 0)?;
-            let _x = resolve_value(x_id, types, constants, id_map,
+            let x = resolve_value(x_id, types, constants, id_map,
                 next_value_id, insts, source_spirv_offset)?;
-            // Build a zero of result_ty.
-            let result = alloc_or_get_result(
-                result_id, result_ty.clone(), id_map, next_value_id);
-            let op = match &result_ty {
-                Type::F32 => Op::ConstFloat {
-                    value: 0.0,
-                    kind: atrium_spv_ir::FloatKind::F32 },
+            // Helper: one Derivative op per scalar lane.  The
+            // `site` id (the lane's result ValueId) keys the
+            // quad operand store, so each lane records/reads
+            // its own operand.
+            let mut emit_lane = |lane_val: Value,
+                                 next_value_id: &mut u32,
+                                 insts: &mut Vec<Inst>| -> Value {
+                let id = ValueId(*next_value_id);
+                *next_value_id += 1;
+                let r = Value { id, ty: Type::F32 };
+                insts.push(Inst {
+                    op: Op::Derivative { value: lane_val, site: id.0 as u32, axis },
+                    result: Some(r.clone()),
+                    source_spirv_offset,
+                });
+                r
+            };
+            match &result_ty {
+                Type::F32 => {
+                    let result = alloc_or_get_result(
+                        result_id, result_ty.clone(), id_map, next_value_id);
+                    insts.push(Inst {
+                        op: Op::Derivative {
+                            value: x, site: result.id.0 as u32, axis },
+                        result: Some(result),
+                        source_spirv_offset,
+                    });
+                }
                 Type::Vec2(_) | Type::Vec3(_) | Type::Vec4(_) => {
                     let n = match &result_ty {
                         Type::Vec2(_) => 2,
                         Type::Vec3(_) => 3,
-                        Type::Vec4(_) => 4,
-                        _ => unreachable!(),
+                        _ => 4,
                     };
                     let mut lanes = Vec::with_capacity(n);
-                    for _ in 0..n {
-                        let id = ValueId(*next_value_id);
-                        *next_value_id += 1;
-                        let v = Value { id, ty: Type::F32 };
-                        insts.push(Inst {
-                            op: Op::ConstFloat {
-                                value: 0.0,
-                                kind: atrium_spv_ir::FloatKind::F32 },
-                            result: Some(v.clone()),
-                            source_spirv_offset,
-                        });
-                        lanes.push(v);
+                    for i in 0..n {
+                        let xi = push_extract_lane(
+                            x.clone(), i as u32,
+                            source_spirv_offset, insts, next_value_id)?;
+                        lanes.push(emit_lane(xi, next_value_id, insts));
                     }
-                    Op::ConstVec(lanes)
+                    let result = alloc_or_get_result(
+                        result_id, result_ty.clone(), id_map, next_value_id);
+                    insts.push(Inst {
+                        op: Op::ConstVec(lanes),
+                        result: Some(result),
+                        source_spirv_offset,
+                    });
                 }
                 other => return Err(FrontendError::Unsupported(format!(
                     "derivative op with non-float result type {other:?}"))),
-            };
-            insts.push(Inst {
-                op, result: Some(result), source_spirv_offset,
-            });
+            }
             Ok(())
         }
 

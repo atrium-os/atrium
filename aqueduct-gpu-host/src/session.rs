@@ -658,6 +658,8 @@ impl Session {
                             req.pipeline_id, blob.fs_uses_implicit_lod);
                         self.backend.bind_pipeline_sample_count(
                             req.pipeline_id, blob.sample_count);
+                        self.backend.bind_pipeline_fs_derivatives(
+                            req.pipeline_id, blob.fs_uses_derivatives);
                     }
                 }
             }
