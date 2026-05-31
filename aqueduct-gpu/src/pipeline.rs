@@ -254,8 +254,12 @@ pub enum Tier2PrimitiveTopology {
     /// vertex `i` and `i+1`.  Same DDA rasterization as
     /// LineList, just a different segment-index walk.
     LineStrip,
-    /// Reserved / unimplemented (fans, list-with-adjacency,
-    /// patches).  Daemon treats these as TriangleList for now.
+    /// Triangle fan: all triangles share vertex 0; triangle `i`
+    /// is `(0, i+1, i+2)`.  Same triangle rasterization as
+    /// TriangleList, just a different index walk.
+    TriangleFan,
+    /// Reserved / unimplemented (list-with-adjacency, patches).
+    /// Daemon treats these as TriangleList for now.
     Other,
 }
 

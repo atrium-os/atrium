@@ -203,6 +203,7 @@ GRAPHICS_FRONTFACE="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphi
 GRAPHICS_POINTS="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_points"
 GRAPHICS_LINES="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_lines"
 GRAPHICS_LINESTRIP="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_linestrip"
+GRAPHICS_TRIFAN="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_trifan"
 GRAPHICS_ARRAY="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_array"
 GRAPHICS_CUBE="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_cube"
 GRAPHICS_SHADOW="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_shadow"
@@ -2426,6 +2427,44 @@ if [ -x "$GRAPHICS_LINESTRIP" ]; then
 else
     echo
     echo "SKIP Rung YY: need 'cargo build -p atrium-vk-icd --example loader_graphics_linestrip'"
+fi
+
+# ── Rung ZZ: TriangleFan topology ────────────────────────
+# loader_graphics_trifan: four vertices drawn with
+# VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN -- a centre vertex + three
+# outer vertices make two triangles (0,1,2) and (0,2,3) that
+# both share vertex 0.  Pixel (4,1) lands in the first wedge,
+# (6,4) in the second; both lit proves the fan reused vertex 0
+# (a TriangleList of 4 verts makes one triangle and drops v3,
+# leaving (6,4) clear).  Far corner stays clear.
+if [ -x "$GRAPHICS_TRIFAN" ]; then
+    rm -f "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+        echo "daemon failed to start (trifan round-trip); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung ZZ: TriangleFan topology (shared vertex 0) ==="
+    if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+        VK_DRIVER_FILES="$MANIFEST" \
+        ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+        "$GRAPHICS_TRIFAN" 2>&1 | tail -2; then
+        echo "FAIL: trifan round-trip did not return 0" >&2
+        exit 1
+    fi
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
+else
+    echo
+    echo "SKIP Rung ZZ: need 'cargo build -p atrium-vk-icd --example loader_graphics_trifan'"
 fi
 
 echo

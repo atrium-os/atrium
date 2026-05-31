@@ -477,6 +477,8 @@ enum PrimitiveTopology {
     LineList,
     /// Line strip: connected polyline (segment i = vert i,i+1).
     LineStrip,
+    /// Triangle fan: triangle i = (0, i+1, i+2).
+    TriangleFan,
     /// Reserved / unimplemented; rasterizes as TriangleList.
     Other,
 }
@@ -882,6 +884,7 @@ impl Tier2Backend {
             aqueduct_gpu::Tier2PrimitiveTopology::PointList     => PrimitiveTopology::PointList,
             aqueduct_gpu::Tier2PrimitiveTopology::LineList      => PrimitiveTopology::LineList,
             aqueduct_gpu::Tier2PrimitiveTopology::LineStrip     => PrimitiveTopology::LineStrip,
+            aqueduct_gpu::Tier2PrimitiveTopology::TriangleFan   => PrimitiveTopology::TriangleFan,
             aqueduct_gpu::Tier2PrimitiveTopology::Other         => PrimitiveTopology::Other,
         };
         // Stencil conversion from wire to daemon-local types.
@@ -1651,7 +1654,8 @@ impl Tier2Backend {
         let topology = state.topology_override.unwrap_or(pipeline_topology);
         let n_verts = assembled.vertex_count as usize;
         let tri_count = match topology {
-            PrimitiveTopology::TriangleStrip => n_verts.saturating_sub(2),
+            PrimitiveTopology::TriangleStrip
+            | PrimitiveTopology::TriangleFan => n_verts.saturating_sub(2),
             // Other / TriangleList: floor(n / 3) independent triangles.
             _                                 => n_verts / 3,
         };
@@ -2146,6 +2150,8 @@ impl Tier2Backend {
                 } else {
                     (t + 1, t, t + 2)
                 },
+                // Fan: every triangle shares vertex 0.
+                PrimitiveTopology::TriangleFan => (0, t + 1, t + 2),
                 _ => (3*t, 3*t + 1, 3*t + 2),
             };
             let v0 = &assembled.bytes[i0*stride .. (i0+1)*stride];
@@ -3231,7 +3237,8 @@ impl Tier2Backend {
         let topology = state.topology_override.unwrap_or(pipeline_topology);
         let n_verts = assembled.vertex_count as usize;
         let tri_count = match topology {
-            PrimitiveTopology::TriangleStrip => n_verts.saturating_sub(2),
+            PrimitiveTopology::TriangleStrip
+            | PrimitiveTopology::TriangleFan => n_verts.saturating_sub(2),
             _                                 => n_verts / 3,
         };
         if matches!(topology, PrimitiveTopology::TriangleList) && n_verts % 3 != 0 {
@@ -3372,6 +3379,26 @@ impl Tier2Backend {
                         let (a, b, c) = (win[0], win[1], win[2]);
                         triples.push(if parity { (b, a, c) } else { (a, b, c) });
                         parity = !parity;
+                    }
+                }
+            }
+            PrimitiveTopology::TriangleFan => {
+                // Every triangle shares index-slot 0; restart
+                // sentinels reset the fan origin.
+                let mut origin: Option<usize> = None;
+                let mut prev: Option<usize> = None;
+                for (pos, &raw) in raw_indices.iter().enumerate() {
+                    if restart_enable && raw == u32::MAX {
+                        origin = None; prev = None;
+                        continue;
+                    }
+                    match (origin, prev) {
+                        (None, _) => origin = Some(pos),
+                        (Some(_), None) => prev = Some(pos),
+                        (Some(o), Some(p)) => {
+                            triples.push((o, p, pos));
+                            prev = Some(pos);
+                        }
                     }
                 }
             }
