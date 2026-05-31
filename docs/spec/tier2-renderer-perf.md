@@ -104,8 +104,23 @@ the optimistic case; textured/glyph shading is ~2–3× heavier.)
     `differential_compute` green. ← next.
 - **P2 — Batched fragment execution.** Remove the per-pixel call
   (#2): span/quad FS ABI with SoA inputs + mask.
-- **P3 — SoA SIMD shader codegen.** The real vectorization (#3):
-  cranelift vector ISel over a lane batch + SIMD helper variants.
+- **P3 — vectorization (#3), split two ways:**
+  - **P3a — SIMD the rasterizer's fixed-function loops (Rust).**
+    Coverage + blend + write + texture sample in hand-written Rust
+    SIMD (`std::simd` / `wide`, NEON+SSE). **Backend-agnostic** —
+    this is the dominant win for the *compositor* (2D shaders are
+    trivial; the cost is fixed-function), independent of the
+    bespoke/cranelift choice.
+  - **P3b — SoA SIMD shader codegen (cranelift).** Lane-batched
+    vector code for *per-app* heavy fragment shaders. Use
+    **cranelift** (first-class vector types + ISel + vector
+    regalloc, LLVM-free, JIT-class compile) — NOT bespoke:
+    hand-rolling NEON/SSE for the full op set inverts bespoke's
+    leanness into complexity. bespoke stays the lean scalar/compute
+    AOT path; cranelift is the LLVM-free "middle" for vectorized
+    shaders. (Compile latency is amortized: compositor shaders are
+    fixed/compiled-once; app shaders are content-hashed in the
+    shader cache.)
 - **P4 — Compositor fast paths + integration.** Opaque/occlusion/
   damage; feature parity for `HeadlessRenderer` (indirect draw +
   whatever compute it issues); point `fresco-vulkan`'s ICD at
