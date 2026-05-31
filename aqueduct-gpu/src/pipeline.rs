@@ -246,7 +246,11 @@ pub enum Tier2PrimitiveTopology {
     /// 1x1 fragment at its window position.  The fragment
     /// shader runs once per point with that vertex's varyings.
     PointList,
-    /// Reserved / unimplemented (LineList, LineStrip, fans,
+    /// Line list: successive vertex pairs form independent
+    /// 1px-wide line segments, rasterized by DDA with
+    /// perspective-correct varying interpolation along each.
+    LineList,
+    /// Reserved / unimplemented (LineStrip, fans,
     /// list-with-adjacency, patches).  Daemon treats these as
     /// TriangleList for now.
     Other,

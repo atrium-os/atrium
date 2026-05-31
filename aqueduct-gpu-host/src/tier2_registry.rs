@@ -870,13 +870,197 @@ impl Tier2Registry {
         }
         Ok(())
     }
+
+    /// Rasterize a `LineList`: successive vertex pairs form
+    /// independent 1px-wide line segments.
+    ///
+    /// Each endpoint runs the VS (capturing its `out_varyings`),
+    /// is perspective-divided + viewport-mapped, then the segment
+    /// is walked by DDA (one fragment per major-axis step).  Per
+    /// fragment the parameter `t in [0,1]` drives perspective-
+    /// correct varying interpolation (lerp of `varying/w` and of
+    /// `1/w`, then divide) and linear window-depth interpolation,
+    /// followed by depth-test + FS + blend.  Shares the
+    /// [`DrawPoints`] parameter block.  No 2x2 quad / MRT /
+    /// stencil / MSAA (a thin line has no area to sample).
+    /// `gl_FrontFacing` is reported front (lines have no winding).
+    pub fn fill_image_lines(
+        &self,
+        vs_shader_id: Tier2ShaderId,
+        fs_shader_id: Tier2ShaderId,
+        draw: &DrawPoints<'_>,
+        width: u32,
+        height: u32,
+        pixels: &mut [u8],
+        mut depth_buffer: Option<&mut [f32]>,
+    ) -> Result<(), Tier2ExecError> {
+        let expected_len = (width as usize) * (height as usize) * 4;
+        if pixels.len() != expected_len {
+            return Err(Tier2ExecError::BadPixelsLen {
+                expected: expected_len, got: pixels.len(),
+            });
+        }
+        let vs_loaded = self.get(vs_shader_id)
+            .ok_or(Tier2ExecError::UnknownShader(vs_shader_id))?;
+        let vs_main = vs_loaded.entry_points.vs_main
+            .ok_or(Tier2ExecError::NotAVertexShader)?;
+        let fs_loaded = self.get(fs_shader_id)
+            .ok_or(Tier2ExecError::UnknownShader(fs_shader_id))?;
+        let fs_main = fs_loaded.entry_points.fs_main
+            .ok_or(Tier2ExecError::NotAFragmentShader)?;
+
+        let uni_ptr = if draw.uniforms.is_empty() {
+            std::ptr::null()
+        } else { draw.uniforms.as_ptr() };
+        let pc_ptr = if draw.push_constants.is_empty() {
+            std::ptr::null()
+        } else { draw.push_constants.as_ptr() };
+
+        let fw = width as f32;
+        let fh = height as f32;
+        let (vp_x, vp_y, vp_w, vp_h, depth_min, depth_max) = match draw.viewport {
+            Some(v) => (v.x, v.y, v.width, v.height, v.min_depth, v.max_depth),
+            None    => (0.0, 0.0, fw, fh, 0.0, 1.0),
+        };
+        let n = draw.varying_f32_count;
+        let varying_bytes = n * 4;
+
+        if draw.stride == 0 { return Ok(()); }
+        let vertex_count = draw.vertices.len() / draw.stride;
+        let seg_count = vertex_count / 2;
+
+        // Run the VS for one endpoint, returning its clip-space
+        // position + decoded f32 varying lanes.
+        let run_vs = |v: usize| -> ([f32; 4], Vec<f32>) {
+            let attr = &draw.vertices[v * draw.stride .. (v + 1) * draw.stride];
+            let attr_ptr = if attr.is_empty() {
+                std::ptr::null()
+            } else { attr.as_ptr() };
+            let mut clip = [0.0f32; 4];
+            let mut vary = vec![0u8; varying_bytes.max(1)];
+            let mut clip_dist = [0.0f32; 8];
+            // SAFETY: dlopened C-ABI VS; signature checked at open.
+            unsafe {
+                vs_main(
+                    attr_ptr, std::ptr::null(), uni_ptr, pc_ptr,
+                    v as u32, draw.instance_index,
+                    &mut clip as *mut [f32; 4],
+                    vary.as_mut_ptr(),
+                    clip_dist.as_mut_ptr(),
+                );
+            }
+            let mut lanes = vec![0.0f32; n];
+            for k in 0..n {
+                lanes[k] = f32::from_le_bytes(
+                    vary[k * 4..k * 4 + 4].try_into().unwrap());
+            }
+            (clip, lanes)
+        };
+
+        for s in 0..seg_count {
+            let (c0, vary0) = run_vs(2 * s);
+            let (c1, vary1) = run_vs(2 * s + 1);
+
+            // Behind-camera reject (full near-plane line clipping
+            // is deferred; w<=0 endpoints don't divide sensibly).
+            if c0[3] <= 0.0 || c1[3] <= 0.0 { continue; }
+            let iw0 = 1.0 / c0[3];
+            let iw1 = 1.0 / c1[3];
+            let ndc0 = [c0[0] * iw0, c0[1] * iw0, c0[2] * iw0];
+            let ndc1 = [c1[0] * iw1, c1[1] * iw1, c1[2] * iw1];
+
+            let sx0 = vp_x + (ndc0[0] + 1.0) * 0.5 * vp_w;
+            let sy0 = vp_y + (ndc0[1] + 1.0) * 0.5 * vp_h;
+            let sx1 = vp_x + (ndc1[0] + 1.0) * 0.5 * vp_w;
+            let sy1 = vp_y + (ndc1[1] + 1.0) * 0.5 * vp_h;
+            let wz0 = depth_min + ndc0[2] * (depth_max - depth_min);
+            let wz1 = depth_min + ndc1[2] * (depth_max - depth_min);
+
+            // DDA: step along the major axis, one fragment per
+            // integer step (Vulkan diamond-exit lines are not
+            // modelled; this is a Bresenham-class thin line).
+            let dx = sx1 - sx0;
+            let dy = sy1 - sy0;
+            let steps = dx.abs().max(dy.abs()).ceil().max(1.0) as i32;
+
+            let mut interp = vec![0u8; varying_bytes.max(1)];
+            for step in 0..=steps {
+                let t = step as f32 / steps as f32;
+                let sx = sx0 + dx * t;
+                let sy = sy0 + dy * t;
+                let px = sx.floor() as i32;
+                let py = sy.floor() as i32;
+                if px < 0 || py < 0 || px >= width as i32 || py >= height as i32 {
+                    continue;
+                }
+                let lin = (py as usize) * (width as usize) + (px as usize);
+
+                // Perspective-correct interpolation: 1/w is linear
+                // in screen space; each varying/w is linear; the
+                // attribute is (varying/w)/(1/w).
+                let iw = iw0 + (iw1 - iw0) * t;
+                let oiw = if iw == 0.0 { 0.0 } else { 1.0 / iw };
+                for k in 0..n {
+                    let a = vary0[k] * iw0;
+                    let b = vary1[k] * iw1;
+                    let v = (a + (b - a) * t) * oiw;
+                    interp[k * 4..k * 4 + 4].copy_from_slice(&v.to_le_bytes());
+                }
+                // Window depth interpolates linearly along the line.
+                let window_z = wz0 + (wz1 - wz0) * t;
+
+                if let Some(db) = depth_buffer.as_deref_mut() {
+                    if !depth_compare(window_z, db[lin], draw.depth_compare_op) {
+                        continue;
+                    }
+                    if draw.depth_write { db[lin] = window_z; }
+                }
+
+                let mut out_color = [0.0f32; 4];
+                let mut out_depth = 0.0f32;
+                let vptr = if varying_bytes == 0 {
+                    std::ptr::null()
+                } else { interp.as_ptr() };
+                // SAFETY: dlopened C-ABI FS; 11-arg signature.
+                unsafe {
+                    fs_main(
+                        vptr, uni_ptr, pc_ptr,
+                        sx, sy, window_z, oiw,
+                        0,
+                        out_color.as_mut_ptr(),
+                        &mut out_depth,
+                        1, // gl_FrontFacing: lines are front-facing.
+                    );
+                }
+
+                let idx = lin * 4;
+                if idx + 4 > pixels.len() { continue; }
+                let abs = &draw.blend_state;
+                let am = abs.write_mask;
+                let dst = [
+                    pixels[idx]     as f32 / 255.0,
+                    pixels[idx + 1] as f32 / 255.0,
+                    pixels[idx + 2] as f32 / 255.0,
+                    pixels[idx + 3] as f32 / 255.0,
+                ];
+                let final_color = if abs.enable {
+                    apply_blend(abs, out_color, dst)
+                } else { out_color };
+                if am.r { pixels[idx]     = f32_to_u8(final_color[0]); }
+                if am.g { pixels[idx + 1] = f32_to_u8(final_color[1]); }
+                if am.b { pixels[idx + 2] = f32_to_u8(final_color[2]); }
+                if am.a { pixels[idx + 3] = f32_to_u8(final_color[3]); }
+            }
+        }
+        Ok(())
+    }
 }
 
-/// Parameters for [`Tier2Registry::fill_image_points`].  A
-/// lighter sibling of [`DrawTriangle`] -- a point primitive
-/// has no per-fragment interpolation, culling, stencil, MRT,
-/// or MSAA, so only the fields a 1x1 fragment needs are
-/// carried.
+/// Parameters for [`Tier2Registry::fill_image_points`] and
+/// [`Tier2Registry::fill_image_lines`].  A lighter sibling of
+/// [`DrawTriangle`] -- point and line primitives have no
+/// per-fragment culling, stencil, MRT, or MSAA, so only the
+/// fields a thin primitive needs are carried.
 pub struct DrawPoints<'a> {
     /// Assembled per-vertex attribute bytes: `vertex_count`
     /// records of `stride` bytes, fed to the VS as

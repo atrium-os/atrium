@@ -473,6 +473,8 @@ enum PrimitiveTopology {
     TriangleStrip,
     /// Point list: one 1x1 fragment per vertex.
     PointList,
+    /// Line list: 1px DDA segment per vertex pair.
+    LineList,
     /// Reserved / unimplemented; rasterizes as TriangleList.
     Other,
 }
@@ -876,6 +878,7 @@ impl Tier2Backend {
             aqueduct_gpu::Tier2PrimitiveTopology::TriangleList  => PrimitiveTopology::TriangleList,
             aqueduct_gpu::Tier2PrimitiveTopology::TriangleStrip => PrimitiveTopology::TriangleStrip,
             aqueduct_gpu::Tier2PrimitiveTopology::PointList     => PrimitiveTopology::PointList,
+            aqueduct_gpu::Tier2PrimitiveTopology::LineList      => PrimitiveTopology::LineList,
             aqueduct_gpu::Tier2PrimitiveTopology::Other         => PrimitiveTopology::Other,
         };
         // Stencil conversion from wire to daemon-local types.
@@ -2089,6 +2092,36 @@ impl Tier2Backend {
             ) {
                 log::warn!("Draw target={target_id}: instance {inst} \
                             fill_image_points failed: {e}");
+                break 'instances;
+            }
+            continue 'instances;
+        }
+        // LineList: one DDA segment per vertex pair.
+        if matches!(topology, PrimitiveTopology::LineList) {
+            let dp = crate::tier2_registry::DrawPoints {
+                vertices: &assembled.bytes,
+                stride,
+                push_constants: &state.push_constants,
+                uniforms: &uniforms_buf,
+                varying_f32_count,
+                blend_state: raster.blend,
+                viewport: dt_viewport,
+                depth_write,
+                depth_compare_op: depth_cmp,
+                instance_index,
+            };
+            let db_ref: Option<&mut [f32]> = if !depth_enabled {
+                None
+            } else if let Some((id, ref mut guard)) = depth_lock {
+                guard.get_mut(&id).map(|d| &mut d.pixels[..])
+            } else {
+                depth_buffer.as_deref_mut()
+            };
+            if let Err(e) = self.registry.fill_image_lines(
+                vs_shader_id, fs_shader_id, &dp, width, height, pixels, db_ref,
+            ) {
+                log::warn!("Draw target={target_id}: instance {inst} \
+                            fill_image_lines failed: {e}");
                 break 'instances;
             }
             continue 'instances;
