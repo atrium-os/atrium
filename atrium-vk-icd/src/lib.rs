@@ -359,6 +359,12 @@ struct AtriumDevice {
     /// aqueduct-gpu.md §7.1.1.
     swapchains: std::sync::Mutex<std::collections::HashMap<u64, AtriumSwapchain>>,
     next_swapchain_id: std::cell::Cell<u64>,
+    /// Per-VkRenderPass colour attachment 0 `loadOp` (raw
+    /// VkAttachmentLoadOp: LOAD=0, CLEAR=1, DONT_CARE=2).  Read by
+    /// vkCmdBeginRenderPass to set BEGIN_RP_FLAG_NO_CLEAR when the
+    /// app asked to PRESERVE (LOAD) the framebuffer — the basis of
+    /// damage / dirty-rect rendering.
+    render_pass_load_ops: std::sync::Mutex<std::collections::HashMap<u64, u32>>,
     /// Per-VkDescriptorSetLayout state. Today: opaque non-zero
     /// u64 (we don't track per-binding type info — the host's
     /// pipeline / shader knows its expected layout).
@@ -3056,6 +3062,7 @@ pub unsafe extern "C" fn vkCreateDevice(
         next_event_id:       std::cell::Cell::new(1),
         next_buffer_view_id: std::cell::Cell::new(1),
         swapchains:          std::sync::Mutex::new(std::collections::HashMap::new()),
+        render_pass_load_ops: std::sync::Mutex::new(std::collections::HashMap::new()),
         next_swapchain_id:   std::cell::Cell::new(1),
     });
     let dev_ptr: *mut AtriumDevice = &mut *dev;
@@ -4720,7 +4727,7 @@ pub unsafe extern "C" fn vkDestroyImageView(
 #[no_mangle]
 pub unsafe extern "C" fn vkCreateRenderPass(
     device:          VkDevice,
-    _p_create_info:  *const c_void,
+    p_create_info:   *const c_void,
     _p_allocator:    *const c_void,
     p_render_pass:   *mut u64,
 ) -> VkResult {
@@ -4731,6 +4738,25 @@ pub unsafe extern "C" fn vkCreateRenderPass(
     let h = dev.next_render_pass_id.get();
     dev.next_render_pass_id.set(h + 1);
     *p_render_pass = h;
+
+    // Capture attachment 0's loadOp so vkCmdBeginRenderPass can
+    // honour LOAD (preserve) vs CLEAR.  VkRenderPassCreateInfo
+    // (64-bit): sType@0, pNext@8, flags@16, attachmentCount@20,
+    // pAttachments@24; each VkAttachmentDescription is 36 B with
+    // loadOp @ +12.  Attachment 0 is the colour attachment in
+    // every render pass we build; depth (when present) is
+    // attachment 1.
+    if !p_create_info.is_null() {
+        let b = p_create_info as *const u8;
+        let attachment_count = std::ptr::read_unaligned(b.add(20) as *const u32);
+        let p_atts = std::ptr::read_unaligned(b.add(24) as *const *const u8);
+        if attachment_count >= 1 && !p_atts.is_null() {
+            let load_op = std::ptr::read_unaligned(p_atts.add(12) as *const u32);
+            if let Ok(mut m) = dev.render_pass_load_ops.lock() {
+                m.insert(h, load_op);
+            }
+        }
+    }
     VK_SUCCESS
 }
 
@@ -4886,9 +4912,17 @@ pub unsafe extern "C" fn vkCmdBeginRenderPass(
     if p_render_pass_begin.is_null() || cb.device.is_null() { return; }
     let dev = &*(cb.device as *const AtriumDevice);
     let b = p_render_pass_begin as *const u8;
+    let render_pass = std::ptr::read_unaligned(b.add(16) as *const u64);
     let framebuffer = std::ptr::read_unaligned(b.add(24) as *const u64);
     let clear_count = std::ptr::read_unaligned(b.add(48) as *const u32);
     let p_clears    = std::ptr::read_unaligned(b.add(56) as *const *const u8);
+    // PRESERVE the framebuffer (damage / dirty-rect rendering) when
+    // the colour attachment's loadOp is LOAD (0).  CLEAR (1) and
+    // DONT_CARE (2) take the clear path.
+    let preserve = dev.render_pass_load_ops.lock().ok()
+        .and_then(|m| m.get(&render_pass).copied())
+        .map(|op| op == 0)
+        .unwrap_or(false);
 
     // Resolve framebuffer → attachments + walk for color +
     // (optional) depth image_ids.  Convention: attachments[0]
@@ -4964,12 +4998,15 @@ pub unsafe extern "C" fn vkCmdBeginRenderPass(
     }
 
     // BeginRenderPass body: 12 bytes (target_image_id u32 +
-    // clear_color_rgba8 [u8;4] + flags u32). flags=0 today.
+    // clear_color_rgba8 [u8;4] + flags u32).  flags bit0 =
+    // BEGIN_RP_FLAG_NO_CLEAR: set when loadOp == LOAD so the daemon
+    // PRESERVES the prior framebuffer (damage / dirty-rect path).
     let mut body = [0u8; 12];
     let tid = color_image_id.map(|i| i.raw()).unwrap_or(0);
     body[ 0.. 4].copy_from_slice(&tid.to_le_bytes());
     body[ 4.. 8].copy_from_slice(&clear_rgba8);
-    // flags @ 8..12 already zero.
+    let flags: u32 = if preserve { 0x1 } else { 0 };
+    body[ 8..12].copy_from_slice(&flags.to_le_bytes());
     let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::BeginRenderPass, &body);
 
     // MRT: bind colour attachments 1..N (attachment 0 is the
