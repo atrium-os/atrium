@@ -91,9 +91,17 @@ the optimistic case; textured/glyph shading is ~2–3× heavier.)
   quantified (this doc).
 - **P1 — Tile-binned, per-tile-parallel, DAMAGE-AWARE rasterization.**
   No codegen change. Biggest single win (kills #1) + damage-aware
-  tile dispatch (only dirty tiles) from the start. Prototype +
-  measure in the bench *before* integrating into the daemon's draw
-  model.
+  tile dispatch (only dirty tiles) from the start.
+  - **P1a — prototype + measure (DONE).** `bench_tier2_tiled`:
+    real triangles, band-binned, rayon-parallel, compiled FS per
+    pixel, blending. **4K full-frame 7.24 ms (138 fps) — MEETS
+    4K@120; damage frame (200×40) 0.097 ms (~75× cheaper).** No
+    SIMD. Confirms the architecture + ceiling probe. (vs 152 ms
+    per-primitive Tier-2; tiled tiny-skia reference 2.5 ms.)
+  - **P1b — integrate into the daemon draw model** (replace the
+    per-primitive `fill_image_triangle` dispatch with frame-binned,
+    damage-aware tile dispatch), keeping the 78-rung smoke +
+    `differential_compute` green. ← next.
 - **P2 — Batched fragment execution.** Remove the per-pixel call
   (#2): span/quad FS ABI with SoA inputs + mask.
 - **P3 — SoA SIMD shader codegen.** The real vectorization (#3):
