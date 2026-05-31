@@ -250,9 +250,12 @@ pub enum Tier2PrimitiveTopology {
     /// 1px-wide line segments, rasterized by DDA with
     /// perspective-correct varying interpolation along each.
     LineList,
-    /// Reserved / unimplemented (LineStrip, fans,
-    /// list-with-adjacency, patches).  Daemon treats these as
-    /// TriangleList for now.
+    /// Line strip: a connected polyline; segment `i` joins
+    /// vertex `i` and `i+1`.  Same DDA rasterization as
+    /// LineList, just a different segment-index walk.
+    LineStrip,
+    /// Reserved / unimplemented (fans, list-with-adjacency,
+    /// patches).  Daemon treats these as TriangleList for now.
     Other,
 }
 

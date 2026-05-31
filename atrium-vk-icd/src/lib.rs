@@ -3367,6 +3367,7 @@ unsafe fn build_tier2_pipeline_blob(
                 ash::vk::PrimitiveTopology::TRIANGLE_STRIP => Tier2PrimitiveTopology::TriangleStrip,
                 ash::vk::PrimitiveTopology::POINT_LIST     => Tier2PrimitiveTopology::PointList,
                 ash::vk::PrimitiveTopology::LINE_LIST      => Tier2PrimitiveTopology::LineList,
+                ash::vk::PrimitiveTopology::LINE_STRIP     => Tier2PrimitiveTopology::LineStrip,
                 _                                          => Tier2PrimitiveTopology::Other,
             };
             (t, ia.primitive_restart_enable != 0)

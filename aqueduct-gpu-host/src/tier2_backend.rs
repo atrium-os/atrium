@@ -475,6 +475,8 @@ enum PrimitiveTopology {
     PointList,
     /// Line list: 1px DDA segment per vertex pair.
     LineList,
+    /// Line strip: connected polyline (segment i = vert i,i+1).
+    LineStrip,
     /// Reserved / unimplemented; rasterizes as TriangleList.
     Other,
 }
@@ -879,6 +881,7 @@ impl Tier2Backend {
             aqueduct_gpu::Tier2PrimitiveTopology::TriangleStrip => PrimitiveTopology::TriangleStrip,
             aqueduct_gpu::Tier2PrimitiveTopology::PointList     => PrimitiveTopology::PointList,
             aqueduct_gpu::Tier2PrimitiveTopology::LineList      => PrimitiveTopology::LineList,
+            aqueduct_gpu::Tier2PrimitiveTopology::LineStrip     => PrimitiveTopology::LineStrip,
             aqueduct_gpu::Tier2PrimitiveTopology::Other         => PrimitiveTopology::Other,
         };
         // Stencil conversion from wire to daemon-local types.
@@ -2096,8 +2099,12 @@ impl Tier2Backend {
             }
             continue 'instances;
         }
-        // LineList: one DDA segment per vertex pair.
-        if matches!(topology, PrimitiveTopology::LineList) {
+        // LineList / LineStrip: one DDA segment per vertex pair
+        // (list) or per consecutive vertex pair (strip).
+        if matches!(topology,
+            PrimitiveTopology::LineList | PrimitiveTopology::LineStrip)
+        {
+            let strip = matches!(topology, PrimitiveTopology::LineStrip);
             let dp = crate::tier2_registry::DrawPoints {
                 vertices: &assembled.bytes,
                 stride,
@@ -2119,6 +2126,7 @@ impl Tier2Backend {
             };
             if let Err(e) = self.registry.fill_image_lines(
                 vs_shader_id, fs_shader_id, &dp, width, height, pixels, db_ref,
+                strip,
             ) {
                 log::warn!("Draw target={target_id}: instance {inst} \
                             fill_image_lines failed: {e}");

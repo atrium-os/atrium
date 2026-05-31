@@ -893,6 +893,9 @@ impl Tier2Registry {
         height: u32,
         pixels: &mut [u8],
         mut depth_buffer: Option<&mut [f32]>,
+        // `false` = LineList (independent pairs 2s,2s+1);
+        // `true`  = LineStrip (connected polyline s,s+1).
+        strip: bool,
     ) -> Result<(), Tier2ExecError> {
         let expected_len = (width as usize) * (height as usize) * 4;
         if pixels.len() != expected_len {
@@ -927,7 +930,13 @@ impl Tier2Registry {
 
         if draw.stride == 0 { return Ok(()); }
         let vertex_count = draw.vertices.len() / draw.stride;
-        let seg_count = vertex_count / 2;
+        // LineList: floor(N/2) independent segments at (2s, 2s+1).
+        // LineStrip: N-1 connected segments at (s, s+1).
+        let seg_count = if strip {
+            vertex_count.saturating_sub(1)
+        } else {
+            vertex_count / 2
+        };
 
         // Run the VS for one endpoint, returning its clip-space
         // position + decoded f32 varying lanes.
@@ -958,8 +967,9 @@ impl Tier2Registry {
         };
 
         for s in 0..seg_count {
-            let (c0, vary0) = run_vs(2 * s);
-            let (c1, vary1) = run_vs(2 * s + 1);
+            let (a_idx, b_idx) = if strip { (s, s + 1) } else { (2 * s, 2 * s + 1) };
+            let (c0, vary0) = run_vs(a_idx);
+            let (c1, vary1) = run_vs(b_idx);
 
             // Behind-camera reject (full near-plane line clipping
             // is deferred; w<=0 endpoints don't divide sensibly).
