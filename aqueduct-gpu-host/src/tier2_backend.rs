@@ -471,6 +471,8 @@ enum PrimitiveTopology {
     TriangleList,
     /// Triangle strip; consecutive triangles share an edge.
     TriangleStrip,
+    /// Point list: one 1x1 fragment per vertex.
+    PointList,
     /// Reserved / unimplemented; rasterizes as TriangleList.
     Other,
 }
@@ -873,6 +875,7 @@ impl Tier2Backend {
         let topology = match topology {
             aqueduct_gpu::Tier2PrimitiveTopology::TriangleList  => PrimitiveTopology::TriangleList,
             aqueduct_gpu::Tier2PrimitiveTopology::TriangleStrip => PrimitiveTopology::TriangleStrip,
+            aqueduct_gpu::Tier2PrimitiveTopology::PointList     => PrimitiveTopology::PointList,
             aqueduct_gpu::Tier2PrimitiveTopology::Other         => PrimitiveTopology::Other,
         };
         // Stencil conversion from wire to daemon-local types.
@@ -2059,6 +2062,37 @@ impl Tier2Backend {
                 } else {
                     &assembled
                 };
+        // PointList: rasterize one 1x1 fragment per vertex via
+        // the dedicated point path (no triangle assembly).
+        if matches!(topology, PrimitiveTopology::PointList) {
+            let dp = crate::tier2_registry::DrawPoints {
+                vertices: &assembled.bytes,
+                stride,
+                push_constants: &state.push_constants,
+                uniforms: &uniforms_buf,
+                varying_f32_count,
+                blend_state: raster.blend,
+                viewport: dt_viewport,
+                depth_write,
+                depth_compare_op: depth_cmp,
+                instance_index,
+            };
+            let db_ref: Option<&mut [f32]> = if !depth_enabled {
+                None
+            } else if let Some((id, ref mut guard)) = depth_lock {
+                guard.get_mut(&id).map(|d| &mut d.pixels[..])
+            } else {
+                depth_buffer.as_deref_mut()
+            };
+            if let Err(e) = self.registry.fill_image_points(
+                vs_shader_id, fs_shader_id, &dp, width, height, pixels, db_ref,
+            ) {
+                log::warn!("Draw target={target_id}: instance {inst} \
+                            fill_image_points failed: {e}");
+                break 'instances;
+            }
+            continue 'instances;
+        }
         for t in 0..tri_count {
             // Vertex-index triple per topology.  TriangleList:
             // (3t, 3t+1, 3t+2).  TriangleStrip: (t, t+1, t+2)

@@ -730,6 +730,176 @@ impl Tier2Registry {
         }
         Ok(())
     }
+
+    /// Rasterize a `PointList`: one 1x1 fragment per vertex.
+    ///
+    /// Each vertex runs the VS (capturing its `out_varyings`
+    /// scratch), is perspective-divided + viewport-mapped to a
+    /// window position, depth-tested, then shaded by a single FS
+    /// invocation whose `gl_FragCoord` is the point centre and
+    /// whose varyings are that vertex's outputs verbatim (points
+    /// have no interpolation).  No 2x2 quad, MRT, stencil, or
+    /// MSAA -- screen-space derivatives at a point are zero and
+    /// the other features don't apply to 1-pixel primitives.
+    /// `gl_FrontFacing` is reported as front (points have no
+    /// winding).
+    pub fn fill_image_points(
+        &self,
+        vs_shader_id: Tier2ShaderId,
+        fs_shader_id: Tier2ShaderId,
+        draw: &DrawPoints<'_>,
+        width: u32,
+        height: u32,
+        pixels: &mut [u8],
+        mut depth_buffer: Option<&mut [f32]>,
+    ) -> Result<(), Tier2ExecError> {
+        let expected_len = (width as usize) * (height as usize) * 4;
+        if pixels.len() != expected_len {
+            return Err(Tier2ExecError::BadPixelsLen {
+                expected: expected_len, got: pixels.len(),
+            });
+        }
+        let vs_loaded = self.get(vs_shader_id)
+            .ok_or(Tier2ExecError::UnknownShader(vs_shader_id))?;
+        let vs_main = vs_loaded.entry_points.vs_main
+            .ok_or(Tier2ExecError::NotAVertexShader)?;
+        let fs_loaded = self.get(fs_shader_id)
+            .ok_or(Tier2ExecError::UnknownShader(fs_shader_id))?;
+        let fs_main = fs_loaded.entry_points.fs_main
+            .ok_or(Tier2ExecError::NotAFragmentShader)?;
+
+        let uni_ptr = if draw.uniforms.is_empty() {
+            std::ptr::null()
+        } else { draw.uniforms.as_ptr() };
+        let pc_ptr = if draw.push_constants.is_empty() {
+            std::ptr::null()
+        } else { draw.push_constants.as_ptr() };
+
+        let fw = width as f32;
+        let fh = height as f32;
+        let (vp_x, vp_y, vp_w, vp_h, depth_min, depth_max) = match draw.viewport {
+            Some(v) => (v.x, v.y, v.width, v.height, v.min_depth, v.max_depth),
+            None    => (0.0, 0.0, fw, fh, 0.0, 1.0),
+        };
+        let varying_bytes = draw.varying_f32_count * 4;
+
+        if draw.stride == 0 { return Ok(()); }
+        let vertex_count = draw.vertices.len() / draw.stride;
+
+        for v in 0..vertex_count {
+            let attr = &draw.vertices[v * draw.stride .. (v + 1) * draw.stride];
+            let attr_ptr = if attr.is_empty() {
+                std::ptr::null()
+            } else { attr.as_ptr() };
+
+            let mut clip = [0.0f32; 4];
+            let mut vary = vec![0u8; varying_bytes.max(1)];
+            let mut clip_dist = [0.0f32; 8];
+            // SAFETY: dlopened C-ABI VS; signature checked at open.
+            unsafe {
+                vs_main(
+                    attr_ptr, std::ptr::null(), uni_ptr, pc_ptr,
+                    v as u32, draw.instance_index,
+                    &mut clip as *mut [f32; 4],
+                    vary.as_mut_ptr(),
+                    clip_dist.as_mut_ptr(),
+                );
+            }
+
+            // Near/far + behind-camera clip (Vulkan: 0 <= z <= w).
+            let w = clip[3];
+            if w <= 0.0 { continue; }
+            let iw = 1.0 / w;
+            let ndc_x = clip[0] * iw;
+            let ndc_y = clip[1] * iw;
+            let ndc_z = clip[2] * iw;
+            if ndc_z < 0.0 || ndc_z > 1.0 { continue; }
+
+            let sx = vp_x + (ndc_x + 1.0) * 0.5 * vp_w;
+            let sy = vp_y + (ndc_y + 1.0) * 0.5 * vp_h;
+            let px = sx.floor() as i32;
+            let py = sy.floor() as i32;
+            if px < 0 || py < 0 || px >= width as i32 || py >= height as i32 {
+                continue;
+            }
+            let lin = (py as usize) * (width as usize) + (px as usize);
+            let window_z = depth_min + ndc_z * (depth_max - depth_min);
+
+            // Depth test + write.
+            if let Some(db) = depth_buffer.as_deref_mut() {
+                if !depth_compare(window_z, db[lin], draw.depth_compare_op) {
+                    continue;
+                }
+                if draw.depth_write { db[lin] = window_z; }
+            }
+
+            let mut out_color = [0.0f32; 4];
+            let mut out_depth = 0.0f32;
+            let vptr = if varying_bytes == 0 {
+                std::ptr::null()
+            } else { vary.as_ptr() };
+            // SAFETY: dlopened C-ABI FS; 11-arg signature.
+            unsafe {
+                fs_main(
+                    vptr, uni_ptr, pc_ptr,
+                    sx, sy, window_z, iw,
+                    0,
+                    out_color.as_mut_ptr(),
+                    &mut out_depth,
+                    1, // gl_FrontFacing: points are front-facing.
+                );
+            }
+
+            let idx = lin * 4;
+            if idx + 4 > pixels.len() { continue; }
+            let abs = &draw.blend_state;
+            let am = abs.write_mask;
+            let dst = [
+                pixels[idx]     as f32 / 255.0,
+                pixels[idx + 1] as f32 / 255.0,
+                pixels[idx + 2] as f32 / 255.0,
+                pixels[idx + 3] as f32 / 255.0,
+            ];
+            let final_color = if abs.enable {
+                apply_blend(abs, out_color, dst)
+            } else { out_color };
+            if am.r { pixels[idx]     = f32_to_u8(final_color[0]); }
+            if am.g { pixels[idx + 1] = f32_to_u8(final_color[1]); }
+            if am.b { pixels[idx + 2] = f32_to_u8(final_color[2]); }
+            if am.a { pixels[idx + 3] = f32_to_u8(final_color[3]); }
+        }
+        Ok(())
+    }
+}
+
+/// Parameters for [`Tier2Registry::fill_image_points`].  A
+/// lighter sibling of [`DrawTriangle`] -- a point primitive
+/// has no per-fragment interpolation, culling, stencil, MRT,
+/// or MSAA, so only the fields a 1x1 fragment needs are
+/// carried.
+pub struct DrawPoints<'a> {
+    /// Assembled per-vertex attribute bytes: `vertex_count`
+    /// records of `stride` bytes, fed to the VS as
+    /// `in_attributes` one vertex at a time.
+    pub vertices: &'a [u8],
+    /// Per-vertex stride in bytes.
+    pub stride: usize,
+    /// Push-constant bytes (or empty).
+    pub push_constants: &'a [u8],
+    /// Uniform / descriptor-table bytes (or empty).
+    pub uniforms: &'a [u8],
+    /// Number of f32 varying lanes the VS writes / FS reads.
+    pub varying_f32_count: usize,
+    /// Colour blend state for the single attachment.
+    pub blend_state: BlendState,
+    /// Optional viewport (position + depth range).
+    pub viewport: Option<Viewport>,
+    /// Depth write enable.
+    pub depth_write: bool,
+    /// Depth compare op.
+    pub depth_compare_op: CompareOp,
+    /// `gl_InstanceIndex` value for the VS.
+    pub instance_index: u32,
 }
 
 /// Compute the depth-bias offset for one triangle per

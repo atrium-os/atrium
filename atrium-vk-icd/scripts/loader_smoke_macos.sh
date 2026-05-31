@@ -200,6 +200,7 @@ GRAPHICS_DERIV="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_d
 GRAPHICS_INSTANCED="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_instanced"
 GRAPHICS_INSTANCE_RATE="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_instance_rate"
 GRAPHICS_FRONTFACE="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_frontface"
+GRAPHICS_POINTS="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_points"
 GRAPHICS_ARRAY="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_array"
 GRAPHICS_CUBE="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_cube"
 GRAPHICS_SHADOW="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_shadow"
@@ -2304,6 +2305,45 @@ if [ -x "$GRAPHICS_FRONTFACE" ]; then
 else
     echo
     echo "SKIP Rung VV: need 'cargo build -p atrium-vk-icd --example loader_graphics_frontface'"
+fi
+
+# ── Rung WW: PointList topology ──────────────────────────
+# loader_graphics_points: three vertices drawn with
+# VK_PRIMITIVE_TOPOLOGY_POINT_LIST.  The daemon's point path
+# runs the VS per vertex, viewport-maps it to a window pixel,
+# and shades a single 1x1 fragment with that vertex's colour.
+# The three points land at pixels (2,2) red, (4,4) green,
+# (6,6) blue and exactly three pixels are lit -- proof the
+# vertices were rasterized as points, not assembled into one
+# filled triangle (the prior TriangleList fallback).
+if [ -x "$GRAPHICS_POINTS" ]; then
+    rm -f "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+        echo "daemon failed to start (points round-trip); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung WW: PointList topology (1x1 fragment per vertex) ==="
+    if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+        VK_DRIVER_FILES="$MANIFEST" \
+        ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+        "$GRAPHICS_POINTS" 2>&1 | tail -2; then
+        echo "FAIL: points round-trip did not return 0" >&2
+        exit 1
+    fi
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
+else
+    echo
+    echo "SKIP Rung WW: need 'cargo build -p atrium-vk-icd --example loader_graphics_points'"
 fi
 
 echo

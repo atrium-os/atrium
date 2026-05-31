@@ -242,9 +242,13 @@ pub enum Tier2PrimitiveTopology {
     /// Vulkan's spec swaps the order of v[i+1] / v[i] for
     /// odd-numbered triangles to keep the winding consistent.
     TriangleStrip,
-    /// Reserved / unimplemented (PointList, LineList,
-    /// LineStrip, fans, list-with-adjacency, patches).
-    /// Daemon treats these as TriangleList for now.
+    /// Point list: each vertex is rasterized as a single
+    /// 1x1 fragment at its window position.  The fragment
+    /// shader runs once per point with that vertex's varyings.
+    PointList,
+    /// Reserved / unimplemented (LineList, LineStrip, fans,
+    /// list-with-adjacency, patches).  Daemon treats these as
+    /// TriangleList for now.
     Other,
 }
 
