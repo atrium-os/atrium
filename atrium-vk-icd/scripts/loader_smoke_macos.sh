@@ -210,6 +210,7 @@ GRAPHICS_PRIMID="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_
 GRAPHICS_R8="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_r8"
 GRAPHICS_RG8="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_rg8"
 GRAPHICS_FRAGDEPTH="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_fragdepth"
+GRAPHICS_DAMAGE="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_damage"
 GRAPHICS_ARRAY="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_array"
 GRAPHICS_CUBE="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_cube"
 GRAPHICS_SHADOW="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_shadow"
@@ -2695,6 +2696,46 @@ if [ -x "$GRAPHICS_FRAGDEPTH" ]; then
 else
     echo
     echo "SKIP Rung FFF: need 'cargo build -p atrium-vk-icd --example loader_graphics_fragdepth'"
+fi
+
+# ── Rung GGG: damage / dirty-rect (loadOp=LOAD preserve + scissor) ─
+# loader_graphics_damage: two render passes into one 16x16 image.
+# Pass 1 (loadOp=CLEAR) clears blue and draws a red triangle.
+# Pass 2 (loadOp=LOAD) preserves the framebuffer, scissors to the
+# right half, and draws a green triangle.  The discriminating
+# pixels -- left-half triangle stays RED, right-half background
+# stays BLUE -- can only survive if the ICD translated loadOp=LOAD
+# into BEGIN_RP_FLAG_NO_CLEAR (a clear-path regression blacks them
+# out).  Proves the in-app partial-update / per-window compositor
+# damage primitive end-to-end through loader -> ICD -> daemon.
+if [ -x "$GRAPHICS_DAMAGE" ]; then
+    rm -f "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+        echo "daemon failed to start (damage round-trip); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung GGG: damage/dirty-rect (loadOp=LOAD preserve + scissor) ==="
+    if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+        VK_DRIVER_FILES="$MANIFEST" \
+        ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+        "$GRAPHICS_DAMAGE" 2>&1 | tail -2; then
+        echo "FAIL: damage round-trip did not return 0" >&2
+        exit 1
+    fi
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
+else
+    echo
+    echo "SKIP Rung GGG: need 'cargo build -p atrium-vk-icd --example loader_graphics_damage'"
 fi
 
 echo
