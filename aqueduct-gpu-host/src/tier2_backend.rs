@@ -1605,8 +1605,16 @@ impl Tier2Backend {
             }
         };
 
+        // Whether any vertex binding is per-instance
+        // (VK_VERTEX_INPUT_RATE_INSTANCE).  When so, the
+        // assembled bytes differ per instance and must be
+        // rebuilt inside the instance loop; otherwise a single
+        // assembly is shared across all instances (the hot path).
+        let any_per_instance = layout.bindings.iter().any(|b| b.per_instance);
+
         let assembled = match self.assemble_vertices(
             &layout, &state.vertex_buffers, cmd.first_vertex, cmd.vertex_count,
+            cmd.first_instance,
         ) {
             Ok(a) => a,
             Err(e) => {
@@ -2028,6 +2036,29 @@ impl Tier2Backend {
         let instance_count = cmd.instance_count.max(1);
         'instances: for inst in 0..instance_count {
             let instance_index = cmd.first_instance + inst;
+            // Per-instance bindings: rebuild the assembled bytes
+            // for this instance.  `inst == 0` already matches the
+            // `assembled` built above (first_instance), so reuse
+            // it; later instances re-gather.  Pure per-vertex
+            // draws skip this entirely and share `assembled`.
+            let inst_assembled;
+            let assembled: &AssembledVertices =
+                if any_per_instance && inst > 0 {
+                    inst_assembled = match self.assemble_vertices(
+                        &layout, &state.vertex_buffers,
+                        cmd.first_vertex, cmd.vertex_count, instance_index,
+                    ) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            log::warn!("Draw target={target_id}: instance \
+                                        {inst} vertex assembly failed: {e}");
+                            break 'instances;
+                        }
+                    };
+                    &inst_assembled
+                } else {
+                    &assembled
+                };
         for t in 0..tri_count {
             // Vertex-index triple per topology.  TriangleList:
             // (3t, 3t+1, 3t+2).  TriangleStrip: (t, t+1, t+2)
@@ -2113,10 +2144,11 @@ impl Tier2Backend {
         vertex_buffers: &HashMap<u32, BoundVertexBuffer>,
         first_vertex: u32,
         vertex_count: u32,
+        instance: u32,
     ) -> Result<AssembledVertices, String> {
         let indices: Vec<u32> = (0..vertex_count)
             .map(|v| first_vertex + v).collect();
-        self.assemble_vertices_by_index(layout, vertex_buffers, &indices)
+        self.assemble_vertices_by_index(layout, vertex_buffers, &indices, instance)
     }
 
     /// Same as `assemble_vertices` but gathers vertices by an
@@ -2128,6 +2160,7 @@ impl Tier2Backend {
         layout: &VertexInputState,
         vertex_buffers: &HashMap<u32, BoundVertexBuffer>,
         indices: &[u32],
+        instance: u32,
     ) -> Result<AssembledVertices, String> {
         // Order attributes by shader location so the packed
         // record is shader-input-order (varying-friendly).
@@ -2157,8 +2190,19 @@ impl Tier2Backend {
                         "vertex buffer not bound at slot {}", a.binding))?;
                 let src = buffers.get(&slot.buffer_raw).ok_or_else(|| format!(
                     "vertex buffer {:#x} not in backend storage", slot.buffer_raw))?;
+                // Per-instance bindings (VK_VERTEX_INPUT_RATE_
+                // INSTANCE) source every output vertex of this
+                // instance from the SAME record -- indexed by the
+                // instance number, not the vertex index.  Per-
+                // vertex bindings index by the gathered vertex
+                // index as before.
+                let src_index = if bind.per_instance {
+                    instance
+                } else {
+                    global_v
+                };
                 let src_off = (slot.offset as usize)
-                    + (global_v as usize) * (bind.stride as usize)
+                    + (src_index as usize) * (bind.stride as usize)
                     + (a.offset as usize);
                 let src_size = a.format.source_byte_size();
                 let packed_size = a.format.byte_size();
@@ -3088,8 +3132,10 @@ impl Tier2Backend {
             .map(|&i| if i == u32::MAX { 0 } else { i })
             .collect();
 
+        let any_per_instance = layout.bindings.iter().any(|b| b.per_instance);
+
         let assembled = match self.assemble_vertices_by_index(
-            &layout, &state.vertex_buffers, &indices,
+            &layout, &state.vertex_buffers, &indices, cmd.first_instance,
         ) {
             Ok(a) => a,
             Err(e) => {
@@ -3267,6 +3313,25 @@ impl Tier2Backend {
         let instance_count = cmd.instance_count.max(1);
         'instances: for inst in 0..instance_count {
             let instance_index = cmd.first_instance + inst;
+            // Per-instance bindings: re-gather for this instance
+            // (see dispatch_draw for the rationale).
+            let inst_assembled;
+            let assembled: &AssembledVertices =
+                if any_per_instance && inst > 0 {
+                    inst_assembled = match self.assemble_vertices_by_index(
+                        &layout, &state.vertex_buffers, &indices, instance_index,
+                    ) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            log::warn!("DrawIndexed target={target_id}: \
+                                        instance {inst} vertex assembly: {e}");
+                            break 'instances;
+                        }
+                    };
+                    &inst_assembled
+                } else {
+                    &assembled
+                };
         for &(i0, i1, i2) in &triples {
             let v0 = &assembled.bytes[i0*stride .. (i0+1)*stride];
             let v1 = &assembled.bytes[i1*stride .. (i1+1)*stride];

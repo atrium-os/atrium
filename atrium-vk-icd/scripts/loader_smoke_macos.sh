@@ -198,6 +198,7 @@ GRAPHICS_HALF="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_ha
 GRAPHICS_RGB10A2="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_rgb10a2"
 GRAPHICS_DERIV="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_deriv"
 GRAPHICS_INSTANCED="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_instanced"
+GRAPHICS_INSTANCE_RATE="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_instance_rate"
 GRAPHICS_ARRAY="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_array"
 GRAPHICS_CUBE="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_cube"
 GRAPHICS_SHADOW="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_shadow"
@@ -2222,6 +2223,46 @@ if [ -x "$GRAPHICS_INSTANCED" ]; then
 else
     echo
     echo "SKIP Rung TT: need 'cargo build -p atrium-vk-icd --example loader_graphics_instanced'"
+fi
+
+# ── Rung UU: per-instance vertex input rate ──────────────
+# loader_graphics_instance_rate: two vertex bindings -- binding
+# 0 per-vertex (the quad positions), binding 1 with inputRate=
+# INSTANCE carrying a (y_offset, red) record per instance.  The
+# VS adds the per-instance y_offset and emits the per-instance
+# red; no gl_InstanceIndex is read.  3 instances -> 3 bands of
+# R = 85 / 170 / 255.  The assembler indexes a per-instance
+# binding by the instance number and re-gathers per instance;
+# ignoring the rate would make all bands read record 0.  Asserts
+# 3 distinct, strictly increasing band reds.
+if [ -x "$GRAPHICS_INSTANCE_RATE" ]; then
+    rm -f "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+        echo "daemon failed to start (instance-rate round-trip); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung UU: per-instance vertex input rate ==="
+    if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+        VK_DRIVER_FILES="$MANIFEST" \
+        ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+        "$GRAPHICS_INSTANCE_RATE" 2>&1 | tail -3; then
+        echo "FAIL: instance-rate round-trip did not return 0" >&2
+        exit 1
+    fi
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
+else
+    echo
+    echo "SKIP Rung UU: need 'cargo build -p atrium-vk-icd --example loader_graphics_instance_rate'"
 fi
 
 echo
