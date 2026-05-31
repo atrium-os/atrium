@@ -272,41 +272,21 @@ impl Tier2Registry {
     /// capture each VS invocation's `out_varyings` buffer
     /// and drop the caller-supplied parameter; the
     /// interpolation math here is unchanged.
-    pub fn fill_image_triangle(
+    /// Run the vertex stage + clip + fan-triangulate one input
+    /// triangle into a batch of per-triangle [`TriangleSetup`]s
+    /// (owned), plus the FS entry point.  No framebuffer access —
+    /// callers (`fill_image_triangle`, or `dispatch_draw`'s
+    /// per-draw batcher) collect setups across triangles and hand
+    /// them to [`Self::rasterize_setups`] in one pass-level
+    /// dispatch.
+    pub(crate) fn build_triangle_setups(
         &self,
         vs_shader_id: Tier2ShaderId,
         fs_shader_id: Tier2ShaderId,
         draw: &DrawTriangle<'_>,
         width: u32,
         height: u32,
-        pixels: &mut [u8],
-        mut depth_buffer: Option<&mut [f32]>,
-        mut stencil_buffer: Option<&mut [u8]>,
-        // MRT: secondary colour attachments (1..N).  Empty for
-        // single-attachment draws.  Each is a full RGBA8
-        // buffer the same size as `pixels`; the FS writes
-        // Location L+1 into `extra_color[L]`.
-        extra_color: &mut [&mut [u8]],
-    ) -> Result<(), Tier2ExecError> {
-        let expected_len = (width as usize) * (height as usize) * 4;
-        if pixels.len() != expected_len {
-            return Err(Tier2ExecError::BadPixelsLen {
-                expected: expected_len,
-                got: pixels.len(),
-            });
-        }
-        // R.3 — depth buffer.  Caller-allocated parallel to
-        // `pixels`; length is exactly `width * height` f32s.
-        // None ⇒ no depth test or write (R.1 / R.2 behaviour).
-        let pixel_count = (width as usize) * (height as usize);
-        if let Some(db) = depth_buffer.as_deref() {
-            if db.len() != pixel_count {
-                return Err(Tier2ExecError::BadDepthBufferLen {
-                    expected: pixel_count,
-                    got: db.len(),
-                });
-            }
-        }
+    ) -> Result<(Vec<TriangleSetup>, atrium_spv_loader::FsMain), Tier2ExecError> {
         let varying_bytes = draw.varying_f32_count * 4;
         // Two modes for per-vertex varyings:
         //
@@ -432,10 +412,10 @@ impl Tier2Registry {
 
         // R.4 v1 — near plane: cz >= 0 (Vulkan convention).
         polygon = clip_polygon_plane(&polygon, |v| v.pos[2]);
-        if polygon.is_empty() { return Ok(()); }
+        if polygon.is_empty() { return Ok((Vec::new(), fs_main)); }
         // R.4 v1 — far plane: cz <= cw  ⇔  cw - cz >= 0.
         polygon = clip_polygon_plane(&polygon, |v| v.pos[3] - v.pos[2]);
-        if polygon.is_empty() { return Ok(()); }
+        if polygon.is_empty() { return Ok((Vec::new(), fs_main)); }
 
         // R.4 v2 — side planes.  Each side plane has a clip-
         // space signed-distance function vanishing on the
@@ -459,16 +439,16 @@ impl Tier2Registry {
         // [0,1] range and per-vertex varyings interpolate
         // correctly.
         polygon = clip_polygon_plane(&polygon, |v| v.pos[0] + v.pos[3]);
-        if polygon.is_empty() { return Ok(()); }
+        if polygon.is_empty() { return Ok((Vec::new(), fs_main)); }
         polygon = clip_polygon_plane(&polygon, |v| v.pos[3] - v.pos[0]);
-        if polygon.is_empty() { return Ok(()); }
+        if polygon.is_empty() { return Ok((Vec::new(), fs_main)); }
         polygon = clip_polygon_plane(&polygon, |v| v.pos[1] + v.pos[3]);
-        if polygon.is_empty() { return Ok(()); }
+        if polygon.is_empty() { return Ok((Vec::new(), fs_main)); }
         polygon = clip_polygon_plane(&polygon, |v| v.pos[3] - v.pos[1]);
-        if polygon.is_empty() { return Ok(()); }
+        if polygon.is_empty() { return Ok((Vec::new(), fs_main)); }
 
         // Polygon needs at least 3 vertices to triangulate.
-        if polygon.len() < 3 { return Ok(()); }
+        if polygon.len() < 3 { return Ok((Vec::new(), fs_main)); }
 
         // ── Per-clipped-triangle rasterization.
         // Triangulate by fanning from vertex 0: for an
@@ -658,10 +638,43 @@ impl Tier2Registry {
             setups.push(setup);
         }
 
-        // One pass-level dispatch for the whole fan (P1b): stripes
-        // split once, rayon over stripes, each stripe loops these
-        // triangles.  Replaces the old per-sub-triangle
-        // [stripe-split + par_iter].
+        Ok((setups, fs_main))
+    }
+
+    /// Rasterize one input triangle: build its setups then
+    /// dispatch them in one pass-level `rasterize_setups`.  Thin
+    /// wrapper preserved for the direct (single-triangle) callers;
+    /// `dispatch_draw` batches across a draw's triangles instead.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fill_image_triangle(
+        &self,
+        vs_shader_id: Tier2ShaderId,
+        fs_shader_id: Tier2ShaderId,
+        draw: &DrawTriangle<'_>,
+        width: u32,
+        height: u32,
+        pixels: &mut [u8],
+        mut depth_buffer: Option<&mut [f32]>,
+        mut stencil_buffer: Option<&mut [u8]>,
+        // MRT: secondary colour attachments (1..N).
+        extra_color: &mut [&mut [u8]],
+    ) -> Result<(), Tier2ExecError> {
+        let expected_len = (width as usize) * (height as usize) * 4;
+        if pixels.len() != expected_len {
+            return Err(Tier2ExecError::BadPixelsLen {
+                expected: expected_len, got: pixels.len(),
+            });
+        }
+        let pixel_count = (width as usize) * (height as usize);
+        if let Some(db) = depth_buffer.as_deref() {
+            if db.len() != pixel_count {
+                return Err(Tier2ExecError::BadDepthBufferLen {
+                    expected: pixel_count, got: db.len(),
+                });
+            }
+        }
+        let (setups, fs_main) =
+            self.build_triangle_setups(vs_shader_id, fs_shader_id, draw, width, height)?;
         self.rasterize_setups(
             &setups, draw, fs_main, width, pixels,
             depth_buffer.as_deref_mut(), stencil_buffer.as_deref_mut(),
@@ -680,7 +693,7 @@ impl Tier2Registry {
     /// given triangle's y-range are no-ops inside `rasterize_stripe`;
     /// the task list is filtered to the batch's union y-range.
     #[allow(clippy::too_many_arguments)]
-    fn rasterize_setups(
+    pub(crate) fn rasterize_setups(
         &self,
         setups: &[TriangleSetup],
         draw: &DrawTriangle<'_>,
@@ -1262,7 +1275,7 @@ fn edge_fn(a: (f32, f32), b: (f32, f32), p: (f32, f32)) -> f32 {
 /// Read-only per-triangle setup shared across all
 /// parallel stripe tasks (R.7).  All fields are Send +
 /// Sync.
-struct TriangleSetup {
+pub(crate) struct TriangleSetup {
     a: (f32, f32),
     b: (f32, f32),
     c: (f32, f32),
