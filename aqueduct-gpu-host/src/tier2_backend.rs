@@ -2197,12 +2197,17 @@ impl Tier2Backend {
             }
             continue 'instances;
         }
+        // P1b: build every triangle's setup, then rasterize the
+        // whole draw in ONE pass-level dispatch (per-triangle ->
+        // per-draw rayon).  Per-triangle dt feeds build (carrying
+        // its vertex_attrs + primitive_id); a representative dt
+        // carries the shared per-draw state (blend / uniforms /
+        // derivatives / sample_count) that rasterize_stripe reads,
+        // while per-triangle primitive_id / front_facing /
+        // fs_writes_depth ride inside each setup.
+        let mut all_setups = Vec::new();
+        let mut fs_main_opt = None;
         for t in 0..tri_count {
-            // Vertex-index triple per topology.  TriangleList:
-            // (3t, 3t+1, 3t+2).  TriangleStrip: (t, t+1, t+2)
-            // with v0 / v1 swapped on odd triangles so all
-            // produced triangles keep the input's winding
-            // (Vulkan spec).
             let (i0, i1, i2) = match topology {
                 PrimitiveTopology::TriangleStrip => if t & 1 == 0 {
                     (t, t + 1, t + 2)
@@ -2242,6 +2247,45 @@ impl Tier2Backend {
                 fs_writes_depth,
                 ..Default::default()
             };
+            match self.registry.build_triangle_setups(
+                vs_shader_id, fs_shader_id, &dt, width, height,
+            ) {
+                Ok((mut s, fsm)) => { all_setups.append(&mut s); fs_main_opt = Some(fsm); }
+                Err(e) => {
+                    log::warn!("Draw target={target_id}: instance {inst} \
+                                triangle {t}/{tri_count} build failed: {e}");
+                    break 'instances;
+                }
+            }
+        }
+        if let Some(fs_main) = fs_main_opt {
+            let empty: &[u8] = &[];
+            let rep = DrawTriangle {
+                vertex_attrs: [empty, empty, empty],
+                push_constants: &state.push_constants,
+                blend_state: raster.blend,
+                blend_extra: &state.blend_extra,
+                varying_f32_count,
+                uniforms: &uniforms_buf,
+                viewport: dt_viewport,
+                scissor: dt_scissor,
+                cull_mode: state.cull_mode_override.unwrap_or(raster.cull_mode),
+                front_face: state.front_face_override.unwrap_or(raster.front_face),
+                depth_write,
+                depth_compare_op: depth_cmp,
+                depth_bounds,
+                stencil: stencil_state,
+                depth_bias,
+                compute_implicit_lod: fs_implicit_lod
+                    && !state.bound_textures.is_empty()
+                    && varying_f32_count >= 2,
+                sample_count,
+                uses_derivatives: fs_derivatives,
+                instance_index,
+                primitive_id: 0,
+                fs_writes_depth,
+                ..Default::default()
+            };
             let db_ref: Option<&mut [f32]> = if !depth_enabled {
                 None
             } else if let Some((id, ref mut guard)) = depth_lock {
@@ -2250,18 +2294,10 @@ impl Tier2Backend {
                 depth_buffer.as_deref_mut()
             };
             let sb_ref: Option<&mut [u8]> = stencil_buffer.as_deref_mut();
-            if let Err(e) = self.registry.fill_image_triangle(
-                vs_shader_id, fs_shader_id,
-                &dt, width, height, pixels, db_ref, sb_ref,
+            self.registry.rasterize_setups(
+                &all_setups, &rep, fs_main, width, pixels, db_ref, sb_ref,
                 &mut extra_slices,
-            ) {
-                log::warn!("Draw target={target_id}: instance {inst} \
-                            triangle {t}/{tri_count} \
-                            fill_image_triangle failed: {e}");
-                // Don't early-return: fall through so the
-                // owned attachment storages are re-inserted.
-                break 'instances;
-            }
+            );
         }
         }
         true
@@ -3497,6 +3533,10 @@ impl Tier2Backend {
                 } else {
                     &assembled
                 };
+        // P1b: batch the index list's triangles into one
+        // pass-level rasterize_setups (per-triangle -> per-draw).
+        let mut all_setups = Vec::new();
+        let mut fs_main_opt = None;
         for (prim_idx, &(i0, i1, i2)) in triples.iter().enumerate() {
             let v0 = &assembled.bytes[i0*stride .. (i0+1)*stride];
             let v1 = &assembled.bytes[i1*stride .. (i1+1)*stride];
@@ -3525,19 +3565,51 @@ impl Tier2Backend {
                 fs_writes_depth,
                 ..Default::default()
             };
+            match self.registry.build_triangle_setups(
+                vs_shader_id, fs_shader_id, &dt, width, height,
+            ) {
+                Ok((mut s, fsm)) => { all_setups.append(&mut s); fs_main_opt = Some(fsm); }
+                Err(e) => {
+                    log::warn!("DrawIndexed target={target_id}: instance {inst} \
+                                triangle build failed: {e}");
+                    break 'instances;
+                }
+            }
+        }
+        if let Some(fs_main) = fs_main_opt {
+            let empty: &[u8] = &[];
+            let rep = DrawTriangle {
+                vertex_attrs: [empty, empty, empty],
+                push_constants: &state.push_constants,
+                blend_state: raster.blend,
+                blend_extra: &state.blend_extra,
+                varying_f32_count,
+                viewport: dt_viewport,
+                scissor: dt_scissor,
+                cull_mode: state.cull_mode_override.unwrap_or(raster.cull_mode),
+                front_face: state.front_face_override.unwrap_or(raster.front_face),
+                depth_write,
+                depth_compare_op: depth_cmp,
+                depth_bounds,
+                stencil: stencil_state,
+                depth_bias,
+                compute_implicit_lod: fs_implicit_lod
+                    && !state.bound_textures.is_empty()
+                    && varying_f32_count >= 2,
+                sample_count,
+                instance_index,
+                primitive_id: 0,
+                fs_writes_depth,
+                ..Default::default()
+            };
             let db_ref = if depth_enabled {
                 depth_buffer.as_deref_mut()
             } else { None };
             let sb_ref: Option<&mut [u8]> = stencil_buffer.as_deref_mut();
-            if let Err(e) = self.registry.fill_image_triangle(
-                vs_shader_id, fs_shader_id,
-                &dt, width, height, pixels, db_ref, sb_ref,
+            self.registry.rasterize_setups(
+                &all_setups, &rep, fs_main, width, pixels, db_ref, sb_ref,
                 &mut extra_slices,
-            ) {
-                log::warn!("DrawIndexed target={target_id}: instance {inst} \
-                            triangle fill_image_triangle failed: {e}");
-                break 'instances;
-            }
+            );
         }
         }
         true
