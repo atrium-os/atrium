@@ -77,6 +77,9 @@ aqueduct-gpu-client = { path = "../aqueduct-gpu-client" }
 rspirv          = "0.13"
 tempfile        = "3"
 atrium-spv-ir   = { path = "../atrium-spv-ir" }
+# Perf/energy benchmarks: getrusage for per-frame CPU-time
+# (summed across all threads) as a power-draw proxy.
+libc            = "0.2"
 
 [features]
 default = []

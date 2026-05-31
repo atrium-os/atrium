@@ -26,6 +26,18 @@ const W: u32 = 3840;
 const H: u32 = 2160;
 const BUDGET_MS: f64 = 1000.0 / 120.0; // 8.33 ms
 
+/// Process CPU-time (user+sys, summed across ALL threads) in
+/// seconds.  Per-frame delta is an energy/power-draw proxy:
+/// total core-seconds burned, regardless of how many cores.
+fn cpu_secs() -> f64 {
+    unsafe {
+        let mut ru: libc::rusage = std::mem::zeroed();
+        libc::getrusage(libc::RUSAGE_SELF, &mut ru);
+        ru.ru_utime.tv_sec as f64 + ru.ru_utime.tv_usec as f64 * 1e-6
+            + ru.ru_stime.tv_sec as f64 + ru.ru_stime.tv_usec as f64 * 1e-6
+    }
+}
+
 #[derive(Clone, Copy)]
 struct RectPx { x: f32, y: f32, w: f32, h: f32, rgba: [u8; 4], opaque: bool }
 
@@ -94,12 +106,14 @@ fn main() {
         let mut pm = PixmapMut::from_bytes(&mut fb, W, H).unwrap();
         render(&mut pm, 0.0, &scene);
     }
+    let c0 = cpu_secs();
     let t0 = Instant::now();
     for _ in 0..iters {
         let mut pm = PixmapMut::from_bytes(&mut fb, W, H).unwrap();
         render(&mut pm, 0.0, &scene);
     }
     let single_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+    let single_cpu_ms = (cpu_secs() - c0) * 1000.0 / iters as f64;
 
     // ── Tiled across cores, WITH spatial binning. ──
     // ~2 bands per core for load balance.  The critical fix: each
@@ -129,16 +143,19 @@ fn main() {
             });
     };
     for _ in 0..3 { render_tiled(&mut fb); }
+    let c1 = cpu_secs();
     let t1 = Instant::now();
     for _ in 0..iters { render_tiled(&mut fb); }
     let tiled_ms = t1.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+    let tiled_cpu_ms = (cpu_secs() - c1) * 1000.0 / iters as f64;
 
     let verdict = |ms: f64| if ms <= BUDGET_MS { "MEETS 4K@120" } else { "misses" };
     println!();
-    println!("  tiny-skia single-threaded : {single_ms:7.2} ms/frame ({:6.1} fps)  [{}]",
+    println!("  tiny-skia single-threaded : {single_ms:7.2} ms wall ({:6.1} fps)  | {single_cpu_ms:6.2} cpu-ms/frame  [{}]",
              1000.0 / single_ms, verdict(single_ms));
-    println!("  tiny-skia tiled ({band_rows}-row bands): {tiled_ms:7.2} ms/frame ({:6.1} fps)  [{}]",
+    println!("  tiny-skia tiled ({band_rows}-row bands): {tiled_ms:7.2} ms wall ({:6.1} fps)  | {tiled_cpu_ms:6.2} cpu-ms/frame  [{}]",
              1000.0 / tiled_ms, verdict(tiled_ms));
+    println!("  (cpu-ms/frame = total core-time = energy proxy; tiling trades cpu-ms for wall-ms)");
     println!();
     println!("  tiling speedup: {:.1}x   (ideal ~{cores}x)", single_ms / tiled_ms);
     println!("  headroom vs 8.33ms budget: {:.1}x", BUDGET_MS / tiled_ms);

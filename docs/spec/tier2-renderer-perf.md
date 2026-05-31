@@ -152,6 +152,36 @@ Two layers, handled differently:
    bridge + compositor item, independent of the rasterizer rework.
    → tracked as **PT (partial-update transport)**.
 
+## Power / energy (measured — cpu-ms/frame = total core-time)
+
+Same 4K UI frame, `getrusage` CPU-time (user+sys, all threads) as
+a first-order energy proxy:
+
+| full 4K repaint | wall ms | cpu-ms/frame (energy) |
+|---|---|---|
+| tiny-skia, 1 thread | 9.56 | 9.50 |
+| tiny-skia, tiled (14c) | 2.19 | 24.51 |
+| Tier-2 P1 tiled (14c) | 7.34 | 83.15 |
+| Tier-2 P1, damage frame | 0.10 | 0.86 |
+
+Takeaways:
+- tiny-skia is **~8.8× more energy-efficient** than P1 Tier-2 for
+  the same frame (9.5 vs 83 cpu-ms) — the gap is the per-pixel call
+  + scalar shading, i.e. exactly what **P2 + P3 remove**. So
+  **vectorization (P3) is Tier-2's energy lever, not just its
+  throughput lever.**
+- **Multicore has a power tax:** tiny-skia 1-thread→tiled is 9.5 →
+  24.5 cpu-ms (2.6×) to buy the wall-time. ⇒ dispatch should be
+  **core-count-aware**: use the fewest cores (ideally 1) that meet
+  the frame deadline; never spread tiny/damage frames across all
+  cores.
+- **Damage dominates:** a damage frame is ~96× less energy than a
+  full repaint. Biggest energy lever for either renderer.
+- Power ≠ energy: a GPU draws more *watts* but far fewer *joules*
+  per frame (fixed-function silicon vs brute-forcing on CPU cores)
+  — so the native GPU path is the power-efficient target; SW is the
+  no-GPU / bring-up fallback.
+
 ## Integration notes
 
 - Apps: already wired — `atrium-vk-icd` → daemon → Tier-2 →

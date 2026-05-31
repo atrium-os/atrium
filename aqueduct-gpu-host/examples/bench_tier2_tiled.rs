@@ -74,6 +74,17 @@ fn build_constant_color_fs(rgba: [f32; 4]) -> Vec<u8> {
 
 type FsMain = atrium_spv_loader::FsMain;
 
+/// Process CPU-time (user+sys, all threads) in seconds — energy
+/// proxy (total core-seconds, independent of core count).
+fn cpu_secs() -> f64 {
+    unsafe {
+        let mut ru: libc::rusage = std::mem::zeroed();
+        libc::getrusage(libc::RUSAGE_SELF, &mut ru);
+        ru.ru_utime.tv_sec as f64 + ru.ru_utime.tv_usec as f64 * 1e-6
+            + ru.ru_stime.tv_sec as f64 + ru.ru_stime.tv_usec as f64 * 1e-6
+    }
+}
+
 #[inline]
 fn u8f(f: f32) -> u8 { (f.clamp(0.0, 1.0) * 255.0 + 0.5) as u8 }
 #[inline]
@@ -212,9 +223,11 @@ fn main() {
     // ── Full-frame ──
     for _ in 0..3 { render(&mut fb, None, &bins); }
     let iters = 30u32;
+    let c0 = cpu_secs();
     let t0 = Instant::now();
     for _ in 0..iters { render(&mut fb, None, &bins); }
     let full_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+    let full_cpu_ms = (cpu_secs() - c0) * 1000.0 / iters as f64;
 
     // ── Damage frame: one small dirty rect (a caret line). ──
     // Re-bin only the tris overlapping the dirty rect, into the
@@ -231,18 +244,21 @@ fn main() {
         }
     }
     for _ in 0..3 { render(&mut fb, Some(dirty), &dbins); }
+    let c1 = cpu_secs();
     let t1 = Instant::now();
     for _ in 0..(iters*4) { render(&mut fb, Some(dirty), &dbins); }
     let dmg_ms = t1.elapsed().as_secs_f64() * 1000.0 / (iters*4) as f64;
+    let dmg_cpu_ms = (cpu_secs() - c1) * 1000.0 / (iters*4) as f64;
 
     std::fs::remove_dir_all(&cache).ok();
 
     let v = |ms: f64| if ms <= BUDGET_MS { "MEETS 4K@120" } else { "misses" };
     println!();
-    println!("  full-frame (tiled+binned)     : {full_ms:7.2} ms ({:6.1} fps)  [{}]",
+    println!("  full-frame (tiled+binned)     : {full_ms:7.2} ms wall ({:6.1} fps) | {full_cpu_ms:7.2} cpu-ms/frame  [{}]",
              1000.0/full_ms, v(full_ms));
-    println!("  damage frame (200x40 dirty)   : {dmg_ms:7.3} ms ({:6.0} fps)  [{}]",
+    println!("  damage frame (200x40 dirty)   : {dmg_ms:7.3} ms wall ({:6.0} fps) | {dmg_cpu_ms:7.3} cpu-ms/frame  [{}]",
              1000.0/dmg_ms, v(dmg_ms));
+    println!("  (cpu-ms/frame = total core-time = energy proxy)");
     println!();
     println!("  vs per-primitive Tier-2 (~152ms@720p) and tiled tiny-skia (~2.5ms@4K).");
     println!("  damage frame ~ {:.0}x cheaper than full repaint (work scales with damage).",
