@@ -110,6 +110,7 @@ fn registry_compiles_and_runs_constant_color_shader() {
             0.0, 0.0, 0.0, 0.0, 0,
             out_color.as_mut_ptr(), &mut out_depth,
             1, // gl_FrontFacing
+            0, // gl_PrimitiveID
         );
     }
     assert_eq!(out_color, expected,
@@ -208,6 +209,7 @@ fn registry_spec_constant_override_flows_to_compiled_shader() {
                 0.0, 0.0, 0.0, 0.0, 0,
                 out_color.as_mut_ptr(), &mut out_depth,
                 1, // gl_FrontFacing
+            0, // gl_PrimitiveID
             );
         }
         // sanity-check the un-overridden channels too

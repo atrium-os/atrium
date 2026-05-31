@@ -1095,6 +1095,11 @@ impl FnTranslator {
                         // IR's i32-materialised Bool.
                         self.scalars.insert(result.id, self.params[10]);
                     }
+                    (ShaderStage::Fragment, BK::PrimitiveId) => {
+                        // gl_PrimitiveID -- FS param index 11: the
+                        // 0-based primitive index within the draw.
+                        self.scalars.insert(result.id, self.params[11]);
+                    }
                     (stage, kind) => {
                         return Err(BackendError::Unsupported(format!(
                             "LoadBuiltin({kind:?}) not supported for stage {stage:?}",
@@ -2663,6 +2668,7 @@ fn build_signature(
             params.push(AbiParam::new(pointer_type));   // out_color
             params.push(AbiParam::new(pointer_type));   // out_depth
             params.push(AbiParam::new(types::I32));     // front_facing (gl_FrontFacing)
+            params.push(AbiParam::new(types::I32));     // primitive_id (gl_PrimitiveID)
         }
         ShaderStage::Vertex => {
             // atrium_vs_main(

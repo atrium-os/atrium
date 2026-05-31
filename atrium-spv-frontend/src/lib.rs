@@ -139,7 +139,20 @@ pub fn translate_with_spec_overrides(
                 // InvocationEXT, both no-ops since Tier-2's
                 // serial dispatcher has no helper concept
                 // (Arc 65).
-                | C::DemoteToHelperInvocation);
+                | C::DemoteToHelperInvocation
+                // Geometry / Tessellation are the SPIR-V-mandated
+                // gate for reading `gl_PrimitiveId` in a fragment
+                // shader (the builtin's "valid via" capability
+                // list).  We don't implement geometry /
+                // tessellation *stages* -- an OpEntryPoint with
+                // those execution models still fails at stage
+                // handling -- but accepting the capability lets a
+                // fragment shader that reads gl_PrimitiveId
+                // (which glslang emits with OpCapability Geometry)
+                // through to the rasterizer, which supplies the
+                // per-primitive index.
+                | C::Geometry
+                | C::Tessellation);
             if !accepted {
                 return Err(FrontendError::Unsupported(format!(
                     "capability {cap:?} not supported in phase-1 v1",

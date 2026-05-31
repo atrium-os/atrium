@@ -1163,6 +1163,12 @@ pub enum BuiltinKind {
     /// pipeline's `VkFrontFace` and passes it as the FS entry's
     /// trailing `front_facing` parameter.
     FrontFacing,
+    /// `gl_PrimitiveID` (Fragment only).  uint -- the 0-based
+    /// index of the primitive (triangle / line / point) the
+    /// fragment belongs to within the draw.  The rasterizer
+    /// supplies it as the FS entry's trailing `primitive_id`
+    /// parameter.
+    PrimitiveId,
 }
 
 // ── Module ──────────────────────────────────────────────────────

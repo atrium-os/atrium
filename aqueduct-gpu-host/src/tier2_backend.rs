@@ -2209,6 +2209,7 @@ impl Tier2Backend {
                 sample_count,
                 uses_derivatives: fs_derivatives,
                 instance_index,
+                primitive_id: t as u32,
                 ..Default::default()
             };
             let db_ref: Option<&mut [f32]> = if !depth_enabled {
@@ -3464,7 +3465,7 @@ impl Tier2Backend {
                 } else {
                     &assembled
                 };
-        for &(i0, i1, i2) in &triples {
+        for (prim_idx, &(i0, i1, i2)) in triples.iter().enumerate() {
             let v0 = &assembled.bytes[i0*stride .. (i0+1)*stride];
             let v1 = &assembled.bytes[i1*stride .. (i1+1)*stride];
             let v2 = &assembled.bytes[i2*stride .. (i2+1)*stride];
@@ -3488,6 +3489,7 @@ impl Tier2Backend {
                     && varying_f32_count >= 2,
                 sample_count,
                 instance_index,
+                primitive_id: prim_idx as u32,
                 ..Default::default()
             };
             let db_ref = if depth_enabled {

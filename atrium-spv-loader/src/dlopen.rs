@@ -129,6 +129,9 @@ pub type FsMain = unsafe extern "C" fn(
     // after the original 10 params so existing param indices
     // (out_color = 8, out_depth = 9) are unchanged.
     front_facing:   u32,
+    // gl_PrimitiveID: 0-based index of the primitive within the
+    // draw.  Trailing param (index 11).
+    primitive_id:   u32,
 );
 
 /// Compute-shader entry. Signature per spec §4.1.

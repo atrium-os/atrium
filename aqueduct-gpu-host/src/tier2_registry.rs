@@ -216,6 +216,7 @@ impl Tier2Registry {
                         &mut out_depth,
                         1, // gl_FrontFacing: fullscreen FS fill has
                            // no primitive -> treat as front-facing.
+                        0, // gl_PrimitiveID: no primitive index.
                     );
                 }
                 let idx = ((y as usize) * (width as usize) + (x as usize)) * 4;
@@ -647,6 +648,7 @@ impl Tier2Registry {
                     FrontFace::CounterClockwise => total_edge > 0.0,
                     FrontFace::Clockwise        => total_edge < 0.0,
                 },
+                primitive_id: draw.primitive_id,
             };
 
             let pixel_stripe_bytes =
@@ -847,6 +849,7 @@ impl Tier2Registry {
                     out_color.as_mut_ptr(),
                     &mut out_depth,
                     1, // gl_FrontFacing: points are front-facing.
+                    v as u32, // gl_PrimitiveID = point index.
                 );
             }
 
@@ -1040,6 +1043,7 @@ impl Tier2Registry {
                         out_color.as_mut_ptr(),
                         &mut out_depth,
                         1, // gl_FrontFacing: lines are front-facing.
+                        s as u32, // gl_PrimitiveID = segment index.
                     );
                 }
 
@@ -1229,6 +1233,9 @@ struct TriangleSetup<'s> {
     /// parameter).  Computed once per triangle from
     /// `total_edge`'s sign + `draw.front_face`.
     front_facing: bool,
+    /// `gl_PrimitiveID` for this triangle (mirror of
+    /// `DrawTriangle::primitive_id`).
+    primitive_id: u32,
 }
 
 /// One stripe's mutable working set for R.7's per-stripe
@@ -1737,6 +1744,7 @@ fn rasterize_stripe(
                                 out_color.as_mut_ptr(),
                                 &mut out_depth,
                                 setup.front_facing as u32,
+                                setup.primitive_id,
                             );
                         }
                     }
@@ -1760,6 +1768,7 @@ fn rasterize_stripe(
                         out_color.as_mut_ptr(),
                         &mut out_depth,
                         setup.front_facing as u32,
+                        setup.primitive_id,
                     );
                 }
                 if draw.uses_derivatives {
@@ -2059,6 +2068,11 @@ pub struct DrawTriangle<'a> {
     /// input rate is a separate feature); per-instance variation
     /// comes entirely from the shader reading this index.
     pub instance_index: u32,
+
+    /// Value handed to the fragment shader as `gl_PrimitiveID`
+    /// (the trailing FS parameter): the 0-based index of this
+    /// triangle within the draw.
+    pub primitive_id: u32,
 }
 
 /// Per-face stencil state passed to `fill_image_triangle`.
@@ -2142,6 +2156,7 @@ impl Default for DrawTriangle<'_> {
             sample_count: 1,
             uses_derivatives: false,
             instance_index: 0,
+            primitive_id: 0,
         }
     }
 }
