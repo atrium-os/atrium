@@ -476,6 +476,10 @@ impl Tier2Registry {
         // (verts[0], verts[i], verts[i+1]) for i in 1..n-1.
         let fw = width as f32;
         let fh = height as f32;
+        // Collect the fan's sub-triangle setups, then rasterize the
+        // whole batch in ONE pass-level dispatch (rasterize_setups)
+        // instead of a stripe-split + par_iter per sub-triangle.
+        let mut setups: Vec<TriangleSetup> = Vec::new();
         for i in 1..polygon.len() - 1 {
             let tri_verts: [&ClipVertex; 3] = [
                 &polygon[0],
@@ -579,11 +583,10 @@ impl Tier2Registry {
                 if cull { continue; }
             }
 
-            // Tile coordinates that overlap the triangle bbox.
+            // Tile-X range for the setup (Y range is derived from
+            // the setup bbox in rasterize_setups at dispatch time).
             let tile_min_x = min_x / TILE_SIZE;
             let tile_max_x = max_x / TILE_SIZE;
-            let tile_min_y = min_y / TILE_SIZE;
-            let tile_max_y = max_y / TILE_SIZE;
 
             // ── R.7: stripe-level parallelism.  Pre-split
             // pixels (and optionally depth) into chunks of
@@ -652,86 +655,98 @@ impl Tier2Registry {
                 fs_writes_depth: draw.fs_writes_depth,
             };
 
-            let pixel_stripe_bytes =
-                (TILE_SIZE as usize) * (width as usize) * 4;
-            let depth_stripe_elems =
-                (TILE_SIZE as usize) * (width as usize);
-            // Stencil buffer is the same shape as depth but
-            // u8 per pixel; same striping math.
-            let stencil_stripe_elems = depth_stripe_elems;
-
-            // Build per-stripe tasks.  Skip stripes that
-            // don't overlap the triangle bbox (so rayon
-            // doesn't get spammed with no-op tasks).  Iterate
-            // pixel_chunks + depth_chunks + stencil_chunks
-            // in lock-step.
-            let pixel_chunks: Vec<&mut [u8]> =
-                pixels.chunks_mut(pixel_stripe_bytes).collect();
-            let depth_chunks: Vec<Option<&mut [f32]>> =
-                match depth_buffer.as_deref_mut() {
-                    Some(db) => db
-                        .chunks_mut(depth_stripe_elems)
-                        .map(Some)
-                        .collect(),
-                    None => (0..pixel_chunks.len())
-                        .map(|_| None)
-                        .collect(),
-                };
-            let stencil_chunks: Vec<Option<&mut [u8]>> =
-                match stencil_buffer.as_deref_mut() {
-                    Some(sb) => sb
-                        .chunks_mut(stencil_stripe_elems)
-                        .map(Some)
-                        .collect(),
-                    None => (0..pixel_chunks.len())
-                        .map(|_| None)
-                        .collect(),
-                };
-            // MRT: chunk each extra colour attachment into
-            // stripes, then transpose into per-stripe Vecs so
-            // each StripeWork owns one slice of every extra
-            // attachment.  `extra_iters` holds a ChunksMut per
-            // attachment; pulling one `.next()` from each per
-            // stripe keeps them in lock-step with the primary
-            // pixel stripes.
-            let num_stripes = pixel_chunks.len();
-            let mut extra_iters: Vec<std::slice::ChunksMut<u8>> =
-                extra_color.iter_mut()
-                    .map(|buf| buf.chunks_mut(pixel_stripe_bytes))
-                    .collect();
-            let mut extra_per_stripe: Vec<Vec<&mut [u8]>> =
-                (0..num_stripes)
-                    .map(|_| extra_iters.iter_mut()
-                        .filter_map(|it| it.next())
-                        .collect())
-                    .collect();
-            let mut tasks: Vec<StripeWork> = pixel_chunks
-                .into_iter()
-                .zip(depth_chunks.into_iter())
-                .zip(stencil_chunks.into_iter())
-                .zip(extra_per_stripe.drain(..))
-                .enumerate()
-                .filter(|(s, _)| {
-                    let tile_y = *s as i32;
-                    tile_y >= tile_min_y && tile_y <= tile_max_y
-                })
-                .map(|(s, (((px, dp), st), ex))| StripeWork {
-                    stripe_y: s as i32,
-                    pixels: px,
-                    depth: dp,
-                    stencil: st,
-                    extra_color: ex,
-                })
-                .collect();
-
-            // Parallel rasterise.  Each task writes only into
-            // its own pixel + depth slice — disjoint by
-            // construction, so no synchronisation is needed.
-            tasks.par_iter_mut().for_each(|task| {
-                rasterize_stripe(task, &setup, draw, fs_main);
-            });
+            setups.push(setup);
         }
+
+        // One pass-level dispatch for the whole fan (P1b): stripes
+        // split once, rayon over stripes, each stripe loops these
+        // triangles.  Replaces the old per-sub-triangle
+        // [stripe-split + par_iter].
+        self.rasterize_setups(
+            &setups, draw, fs_main, width, pixels,
+            depth_buffer.as_deref_mut(), stencil_buffer.as_deref_mut(),
+            extra_color,
+        );
         Ok(())
+    }
+
+    /// Rasterize a batch of per-triangle setups in ONE dispatch:
+    /// split the framebuffer into stripes once, rayon over stripes,
+    /// each stripe loops the batch's triangles (calling
+    /// `rasterize_stripe` unchanged, in submission order so draw
+    /// order is preserved).  Replaces the per-triangle
+    /// [stripe-split + par_iter] that dominated cost (per-primitive
+    /// rayon + per-primitive full-FB chunking).  Stripes outside a
+    /// given triangle's y-range are no-ops inside `rasterize_stripe`;
+    /// the task list is filtered to the batch's union y-range.
+    #[allow(clippy::too_many_arguments)]
+    fn rasterize_setups(
+        &self,
+        setups: &[TriangleSetup],
+        draw: &DrawTriangle<'_>,
+        fs_main: atrium_spv_loader::FsMain,
+        width: u32,
+        pixels: &mut [u8],
+        mut depth_buffer: Option<&mut [f32]>,
+        mut stencil_buffer: Option<&mut [u8]>,
+        extra_color: &mut [&mut [u8]],
+    ) {
+        if setups.is_empty() { return; }
+        let tile_min_y = setups.iter().map(|s| s.min_y / TILE_SIZE).min().unwrap();
+        let tile_max_y = setups.iter().map(|s| s.max_y / TILE_SIZE).max().unwrap();
+
+        let pixel_stripe_bytes = (TILE_SIZE as usize) * (width as usize) * 4;
+        let depth_stripe_elems = (TILE_SIZE as usize) * (width as usize);
+        let stencil_stripe_elems = depth_stripe_elems;
+
+        let pixel_chunks: Vec<&mut [u8]> =
+            pixels.chunks_mut(pixel_stripe_bytes).collect();
+        let depth_chunks: Vec<Option<&mut [f32]>> =
+            match depth_buffer.as_deref_mut() {
+                Some(db) => db.chunks_mut(depth_stripe_elems).map(Some).collect(),
+                None => (0..pixel_chunks.len()).map(|_| None).collect(),
+            };
+        let stencil_chunks: Vec<Option<&mut [u8]>> =
+            match stencil_buffer.as_deref_mut() {
+                Some(sb) => sb.chunks_mut(stencil_stripe_elems).map(Some).collect(),
+                None => (0..pixel_chunks.len()).map(|_| None).collect(),
+            };
+        let num_stripes = pixel_chunks.len();
+        let mut extra_iters: Vec<std::slice::ChunksMut<u8>> =
+            extra_color.iter_mut()
+                .map(|buf| buf.chunks_mut(pixel_stripe_bytes))
+                .collect();
+        let mut extra_per_stripe: Vec<Vec<&mut [u8]>> =
+            (0..num_stripes)
+                .map(|_| extra_iters.iter_mut().filter_map(|it| it.next()).collect())
+                .collect();
+        let mut tasks: Vec<StripeWork> = pixel_chunks
+            .into_iter()
+            .zip(depth_chunks.into_iter())
+            .zip(stencil_chunks.into_iter())
+            .zip(extra_per_stripe.drain(..))
+            .enumerate()
+            .filter(|(s, _)| {
+                let tile_y = *s as i32;
+                tile_y >= tile_min_y && tile_y <= tile_max_y
+            })
+            .map(|(s, (((px, dp), st), ex))| StripeWork {
+                stripe_y: s as i32,
+                pixels: px,
+                depth: dp,
+                stencil: st,
+                extra_color: ex,
+            })
+            .collect();
+
+        // Parallel rasterise. Each task owns disjoint pixel/depth/
+        // stencil slices; within a task, triangles are applied in
+        // submission order (preserves blend/depth-equal ordering).
+        tasks.par_iter_mut().for_each(|task| {
+            for setup in setups {
+                rasterize_stripe(task, setup, draw, fs_main);
+            }
+        });
     }
 
     /// Rasterize a `PointList`: one 1x1 fragment per vertex.
