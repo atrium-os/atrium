@@ -379,7 +379,7 @@ impl Tier2Registry {
                     std::ptr::null(),       // in_attr_strides — unused
                     uni_ptr,
                     pc_ptr,
-                    i as u32, 0,
+                    i as u32, draw.instance_index,
                     &mut clip_positions[i] as *mut [f32; 4],
                     vary_scratch[i].as_mut_ptr(),
                     clip_dist.as_mut_ptr(),
@@ -1668,6 +1668,16 @@ pub struct DrawTriangle<'a> {
     /// Requires a uniforms buffer carrying the helper table
     /// (the dispatcher guarantees one even with no textures).
     pub uses_derivatives: bool,
+
+    /// Value handed to the vertex shader as `gl_InstanceIndex`
+    /// (params[5]).  The dispatcher loops the draw once per
+    /// instance (`firstInstance .. firstInstance +
+    /// instanceCount`) and stamps this field so the VS can
+    /// place each instance independently.  All instances read
+    /// the same per-vertex attribute bytes (per-instance vertex
+    /// input rate is a separate feature); per-instance variation
+    /// comes entirely from the shader reading this index.
+    pub instance_index: u32,
 }
 
 /// Per-face stencil state passed to `fill_image_triangle`.
@@ -1750,6 +1760,7 @@ impl Default for DrawTriangle<'_> {
             compute_implicit_lod: false,
             sample_count: 1,
             uses_derivatives: false,
+            instance_index: 0,
         }
     }
 }

@@ -2018,6 +2018,16 @@ impl Tier2Backend {
         let dt_scissor = state.scissor.map(|s| Scissor {
             x: s.x, y: s.y, width: s.width, height: s.height,
         });
+        // Instanced draw: replay the whole triangle list once per
+        // instance, handing each the index `firstInstance + inst`
+        // as gl_InstanceIndex (VS params[5]).  All instances read
+        // the same assembled vertex bytes; per-instance geometry
+        // comes from the shader reading the index.  instanceCount
+        // == 0 is a no-op draw (the `.max(1)` only guards the
+        // legacy callers that left the field unset).
+        let instance_count = cmd.instance_count.max(1);
+        'instances: for inst in 0..instance_count {
+            let instance_index = cmd.first_instance + inst;
         for t in 0..tri_count {
             // Vertex-index triple per topology.  TriangleList:
             // (3t, 3t+1, 3t+2).  TriangleStrip: (t, t+1, t+2)
@@ -2056,6 +2066,7 @@ impl Tier2Backend {
                     && varying_f32_count >= 2,
                 sample_count,
                 uses_derivatives: fs_derivatives,
+                instance_index,
                 ..Default::default()
             };
             let db_ref: Option<&mut [f32]> = if !depth_enabled {
@@ -2071,12 +2082,14 @@ impl Tier2Backend {
                 &dt, width, height, pixels, db_ref, sb_ref,
                 &mut extra_slices,
             ) {
-                log::warn!("Draw target={target_id}: triangle {t}/{tri_count} \
+                log::warn!("Draw target={target_id}: instance {inst} \
+                            triangle {t}/{tri_count} \
                             fill_image_triangle failed: {e}");
                 // Don't early-return: fall through so the
                 // owned attachment storages are re-inserted.
-                break;
+                break 'instances;
             }
+        }
         }
         true
         }; // end render block -- pixels / extra_slices borrows end here
@@ -3248,6 +3261,12 @@ impl Tier2Backend {
             }
         }
 
+        // Instanced indexed draw: replay the index list once per
+        // instance, handing each `firstInstance + inst` as
+        // gl_InstanceIndex.  Mirrors the non-indexed path.
+        let instance_count = cmd.instance_count.max(1);
+        'instances: for inst in 0..instance_count {
+            let instance_index = cmd.first_instance + inst;
         for &(i0, i1, i2) in &triples {
             let v0 = &assembled.bytes[i0*stride .. (i0+1)*stride];
             let v1 = &assembled.bytes[i1*stride .. (i1+1)*stride];
@@ -3271,6 +3290,7 @@ impl Tier2Backend {
                     && !state.bound_textures.is_empty()
                     && varying_f32_count >= 2,
                 sample_count,
+                instance_index,
                 ..Default::default()
             };
             let db_ref = if depth_enabled {
@@ -3282,10 +3302,11 @@ impl Tier2Backend {
                 &dt, width, height, pixels, db_ref, sb_ref,
                 &mut extra_slices,
             ) {
-                log::warn!("DrawIndexed target={target_id}: triangle \
-                            fill_image_triangle failed: {e}");
-                break;
+                log::warn!("DrawIndexed target={target_id}: instance {inst} \
+                            triangle fill_image_triangle failed: {e}");
+                break 'instances;
             }
+        }
         }
         true
         }; // end render block

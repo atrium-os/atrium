@@ -197,6 +197,7 @@ GRAPHICS_MSAA="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_ms
 GRAPHICS_HALF="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_half"
 GRAPHICS_RGB10A2="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_rgb10a2"
 GRAPHICS_DERIV="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_deriv"
+GRAPHICS_INSTANCED="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_instanced"
 GRAPHICS_ARRAY="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_array"
 GRAPHICS_CUBE="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_cube"
 GRAPHICS_SHADOW="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_shadow"
@@ -2180,6 +2181,47 @@ if [ -x "$GRAPHICS_DERIV" ]; then
 else
     echo
     echo "SKIP Rung SS: need 'cargo build -p atrium-vk-icd --example loader_graphics_deriv'"
+fi
+
+# ── Rung TT: instanced rendering via gl_InstanceIndex ────
+# loader_graphics_instanced: one bottom-third quad drawn with
+# instanceCount=3.  The VS reads gl_InstanceIndex to shift the
+# quad up by instance*(2/3) clip-y AND to pick a red intensity
+# (instance+1)/3, so the three instances tile the framebuffer
+# into bands of R = 85 / 170 / 255.  The daemon replays the
+# draw once per instance (firstInstance..+instanceCount),
+# handing each its index as VS params[5].  Without the loop
+# only one band paints; without the index plumbing all bands
+# share instance 0's colour.  Asserts 3 distinct, strictly
+# increasing band reds.
+if [ -x "$GRAPHICS_INSTANCED" ]; then
+    rm -f "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+        echo "daemon failed to start (instanced round-trip); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung TT: instanced rendering via gl_InstanceIndex ==="
+    if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+        VK_DRIVER_FILES="$MANIFEST" \
+        ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+        "$GRAPHICS_INSTANCED" 2>&1 | tail -3; then
+        echo "FAIL: instanced round-trip did not return 0" >&2
+        exit 1
+    fi
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
+else
+    echo
+    echo "SKIP Rung TT: need 'cargo build -p atrium-vk-icd --example loader_graphics_instanced'"
 fi
 
 echo
