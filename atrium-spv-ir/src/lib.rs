@@ -1098,6 +1098,14 @@ pub struct Function {
     /// Location 0 and `in_color` at Location 1 both read
     /// from the position bytes).
     pub input_varying_byte_offset: HashMap<ValueId, u32>,
+    /// IR ValueId of the `Output`-storage OpVariable decorated
+    /// `BuiltIn FragDepth`, if this fragment shader writes
+    /// `gl_FragDepth`.  Codegen routes stores to this variable to
+    /// the FS `out_depth` pointer (params[9]) instead of the
+    /// `out_color` table (params[8]); the rasterizer then runs a
+    /// late depth test against the shader-written value.  `None`
+    /// for VS / CS and for FS that don't write depth.
+    pub frag_depth_output: Option<ValueId>,
 }
 
 /// Shader stage.

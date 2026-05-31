@@ -1137,6 +1137,14 @@ fn emit_function(
         }
     }
 
+    // gl_FragDepth: route stores to the FragDepth-decorated
+    // Output variable to X5 (out_depth) instead of X4
+    // (out_color), so the depth value doesn't clobber colour
+    // attachment 0.
+    if let Some(vid) = func.frag_depth_output {
+        pointers.insert(vid, (asm::Xreg(5), 0));
+    }
+
     // Location-decorated `Input`-storage vars (VS attrs and
     // FS varyings): both stages take the input buffer as
     // X0 (in_attributes for VS, in_varyings for FS).

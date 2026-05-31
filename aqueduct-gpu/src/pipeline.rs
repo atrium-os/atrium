@@ -616,6 +616,14 @@ pub struct Tier2PipelineStateBlob {
     /// SPIR-V scan of the FS module.
     #[serde(default)]
     pub fs_uses_derivatives: bool,
+    /// True when the fragment shader writes `gl_FragDepth` (the
+    /// SPIR-V `DepthReplacing` execution mode).  Gates the
+    /// rasterizer's late-depth path: depth test + write run after
+    /// the FS against the shader-produced depth instead of the
+    /// interpolated `gl_FragCoord.z`.  Populated by the ICD via a
+    /// scan of the FS module.
+    #[serde(default)]
+    pub fs_writes_depth: bool,
 }
 
 fn default_sample_count() -> u32 { 1 }

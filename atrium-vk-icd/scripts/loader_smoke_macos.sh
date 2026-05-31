@@ -209,6 +209,7 @@ GRAPHICS_SRGB="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_sr
 GRAPHICS_PRIMID="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_primid"
 GRAPHICS_R8="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_r8"
 GRAPHICS_RG8="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_rg8"
+GRAPHICS_FRAGDEPTH="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_fragdepth"
 GRAPHICS_ARRAY="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_array"
 GRAPHICS_CUBE="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_cube"
 GRAPHICS_SHADOW="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_shadow"
@@ -2654,6 +2655,46 @@ if [ -x "$GRAPHICS_RG8" ]; then
 else
     echo
     echo "SKIP Rung EEE: need 'cargo build -p atrium-vk-icd --example loader_graphics_rg8'"
+fi
+
+# ── Rung FFF: gl_FragDepth (shader-written depth, late-Z) ─
+# loader_graphics_fragdepth: a screen-covering triangle into a
+# depth buffer cleared to 0.5, depth test LESS + write on.  The
+# FS writes gl_FragDepth = (t < 0.5) ? 0.25 : 0.75 along a
+# left->right varying.  Left half (0.25 < 0.5) passes -> green;
+# right half (0.75) fails -> stays clear.  gl_Position.z is 0
+# everywhere, so without honouring gl_FragDepth the whole
+# triangle would be green.  Proves the daemon's gated late-depth
+# path (run FS, then test/write against the shader depth) +
+# backend routing of the FragDepth store to out_depth.
+if [ -x "$GRAPHICS_FRAGDEPTH" ]; then
+    rm -f "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+        echo "daemon failed to start (fragdepth round-trip); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung FFF: gl_FragDepth late depth test ==="
+    if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+        VK_DRIVER_FILES="$MANIFEST" \
+        ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+        "$GRAPHICS_FRAGDEPTH" 2>&1 | tail -2; then
+        echo "FAIL: fragdepth round-trip did not return 0" >&2
+        exit 1
+    fi
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
+else
+    echo
+    echo "SKIP Rung FFF: need 'cargo build -p atrium-vk-icd --example loader_graphics_fragdepth'"
 fi
 
 echo

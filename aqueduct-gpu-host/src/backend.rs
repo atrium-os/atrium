@@ -314,6 +314,14 @@ pub trait Backend: Send + Sync {
         _uses_derivatives: bool,
     ) {}
 
+    /// Record whether the FS writes `gl_FragDepth` (the
+    /// late-depth path).  Default no-op.
+    fn bind_pipeline_fs_writes_depth(
+        &self,
+        _pipeline_id: ResourceId,
+        _writes_depth: bool,
+    ) {}
+
     /// Associate a compute pipeline with its Tier-2 shader +
     /// workgroup-size state. Mirror of
     /// [`Backend::bind_pipeline_tier2_vs`] /

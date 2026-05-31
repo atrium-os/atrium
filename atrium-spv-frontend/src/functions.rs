@@ -226,6 +226,7 @@ fn translate_one(
     let mut workgroup_var_offset: HashMap<ValueId, u32> = HashMap::new();
     let mut output_varying_byte_offset: HashMap<ValueId, u32> = HashMap::new();
     let mut input_varying_byte_offset: HashMap<ValueId, u32> = HashMap::new();
+    let mut frag_depth_output: Option<ValueId> = None;
     for (spv_var_id, value) in &id_map {
         // Only true SSBOs land in ssbo_bindings.  Storage
         // images and samplers share the (set, binding) map
@@ -248,6 +249,9 @@ fn translate_one(
         }
         if let Some(&off) = iface.input_varying_byte_offset.get(spv_var_id) {
             input_varying_byte_offset.insert(value.id, off);
+        }
+        if iface.frag_depth_var == Some(*spv_var_id) {
+            frag_depth_output = Some(value.id);
         }
     }
     // Workgroup vars that were referenced (via OpLoad/OpStore
@@ -273,6 +277,7 @@ fn translate_one(
         workgroup_var_offset,
         output_varying_byte_offset,
         input_varying_byte_offset,
+        frag_depth_output,
     })
 }
 

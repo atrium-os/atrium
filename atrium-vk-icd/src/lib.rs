@@ -485,6 +485,11 @@ struct AtriumShaderModule {
     /// (more expensive) 2x2-quad lockstep shading path for
     /// shaders that actually use derivatives.
     uses_derivatives: bool,
+    /// True when this module declares `DepthReplacing` (writes
+    /// `gl_FragDepth`).  FS modules propagate it onto
+    /// `Tier2PipelineStateBlob` so the rasterizer takes the
+    /// late-depth path.
+    writes_frag_depth: bool,
 }
 
 /// Sum the byte sizes of every Location-decorated
@@ -692,6 +697,33 @@ fn scan_spirv_uses_derivatives(spirv: &[u8]) -> bool {
         // OpDPdxFine=210, OpDPdyFine=211, OpFwidthFine=212,
         // OpDPdxCoarse=213, OpDPdyCoarse=214, OpFwidthCoarse=215.
         if (207..=215).contains(&opcode) { return true; }
+        cursor += word_count * 4;
+    }
+    false
+}
+
+/// True when `spirv` declares the `DepthReplacing` execution
+/// mode -- i.e. the fragment shader writes `gl_FragDepth`
+/// (glslang emits `OpExecutionMode %main DepthReplacing` for it).
+/// Gates the daemon's late-depth rasterization path.
+fn scan_spirv_writes_frag_depth(spirv: &[u8]) -> bool {
+    if spirv.len() < 20 || spirv.len() % 4 != 0 { return false; }
+    let magic = u32::from_le_bytes(spirv[0..4].try_into().unwrap());
+    if magic != 0x07230203 { return false; }
+    let mut cursor = 20;
+    while cursor + 4 <= spirv.len() {
+        let head = u32::from_le_bytes(
+            spirv[cursor..cursor + 4].try_into().unwrap());
+        let word_count = (head >> 16) as usize;
+        let opcode = (head & 0xFFFF) as u16;
+        if word_count == 0 { return false; }
+        // OpExecutionMode = 16; operand[1] (word at cursor+8) is
+        // the mode -- DepthReplacing = 12.
+        if opcode == 16 && word_count >= 3 && cursor + 12 <= spirv.len() {
+            let mode = u32::from_le_bytes(
+                spirv[cursor + 8..cursor + 12].try_into().unwrap());
+            if mode == 12 { return true; }
+        }
         cursor += word_count * 4;
     }
     false
@@ -3198,6 +3230,7 @@ unsafe fn build_tier2_pipeline_blob(
     let mut vs_varying_bytes: u32 = 0;
     let mut fs_uses_implicit_lod = false;
     let mut fs_uses_derivatives = false;
+    let mut fs_writes_depth = false;
     let shaders_map = dev.shaders.lock().ok()?;
     for s in 0..info.stage_count {
         let stage = &*info.p_stages.offset(s as isize);
@@ -3214,6 +3247,7 @@ unsafe fn build_tier2_pipeline_blob(
                 if let Some(am) = m {
                     fs_uses_implicit_lod = am.uses_implicit_lod;
                     fs_uses_derivatives = am.uses_derivatives;
+                    fs_writes_depth = am.writes_frag_depth;
                 }
             }
             _ => {} // tess/geom not in tier-2 yet
@@ -3404,6 +3438,7 @@ unsafe fn build_tier2_pipeline_blob(
         topology, primitive_restart_enable, stencil,
         vs_varying_bytes, fs_uses_implicit_lod, sample_count,
         fs_uses_derivatives,
+        fs_writes_depth,
     };
     let bytes = postcard::to_allocvec(&blob).ok()?;
     Some((vec![vs_id, fs_id], bytes))
@@ -4580,6 +4615,7 @@ pub unsafe extern "C" fn vkCreateShaderModule(
     let vs_varying_bytes = scan_spirv_vs_varying_bytes(&bytes);
     let uses_implicit_lod = scan_spirv_uses_implicit_lod(&bytes);
     let uses_derivatives = scan_spirv_uses_derivatives(&bytes);
+    let writes_frag_depth = scan_spirv_writes_frag_depth(&bytes);
 
     // Resolve-or-upload against the daemon. Failure (no live
     // client, validation rejection) leaves shader_id=None — the
@@ -4604,7 +4640,7 @@ pub unsafe extern "C" fn vkCreateShaderModule(
         s.insert(handle, AtriumShaderModule {
             shader_id, bytecode_hash, local_size, ssbo_binding_count,
             workgroup_size, uses_barrier, vs_varying_bytes,
-            uses_implicit_lod, uses_derivatives,
+            uses_implicit_lod, uses_derivatives, writes_frag_depth,
         });
     } else {
         return VK_ERROR_INITIALIZATION_FAILED;

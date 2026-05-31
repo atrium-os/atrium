@@ -663,6 +663,8 @@ impl Session {
                             req.pipeline_id, blob.sample_count);
                         self.backend.bind_pipeline_fs_derivatives(
                             req.pipeline_id, blob.fs_uses_derivatives);
+                        self.backend.bind_pipeline_fs_writes_depth(
+                            req.pipeline_id, blob.fs_writes_depth);
                     }
                 }
             }

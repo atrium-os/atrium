@@ -126,6 +126,14 @@ pub struct InterfaceContext {
     /// into GLSL.std.450 (which we handle) from other sets
     /// (which we reject).
     pub glsl_std_450_imports: std::collections::HashSet<Word>,
+    /// SPIR-V variable id of the `Output`-storage variable
+    /// decorated `BuiltIn FragDepth`, if the fragment shader
+    /// writes `gl_FragDepth`.  Unlike input builtins (which go
+    /// through `builtin_vars` + `Op::LoadBuiltin`), this is an
+    /// output the shader STORES to: the function translator
+    /// records its ValueId on `Function::frag_depth_output` so
+    /// the backend routes the store to the `out_depth` pointer.
+    pub frag_depth_var: Option<Word>,
 }
 
 /// One member of an `OpTypeStruct` annotated with an
@@ -407,6 +415,12 @@ impl InterfaceContext {
                             _ => None,
                         };
                         if let Some(kind) = mapped { d.builtin = Some(kind); }
+                        // FragDepth is an output the FS stores to,
+                        // not a LoadBuiltin input -- flag it so the
+                        // store gets routed to `out_depth`.
+                        if matches!(b, SpvBuiltIn::FragDepth) {
+                            d.frag_depth = true;
+                        }
                     }
                 }
                 _ => {}
@@ -426,6 +440,13 @@ impl InterfaceContext {
             // by `Op::LoadBuiltin` at function translation, no
             // memory-binding interface entry needed.
             if let Some(d) = deco {
+                // FragDepth output: record the var so the function
+                // translator stamps Function::frag_depth_output;
+                // the backend routes its store to `out_depth`.
+                if d.frag_depth {
+                    ctx.frag_depth_var = Some(*var_id);
+                    continue;
+                }
                 if let Some(kind) = d.builtin {
                     ctx.builtin_vars.insert(*var_id, kind);
                     continue;
@@ -578,6 +599,11 @@ struct VarDecorations {
     /// stay `None` and the variable falls through to the
     /// regular Input/Output path.
     builtin: Option<atrium_spv_ir::BuiltinKind>,
+    /// True when the variable is decorated `BuiltIn FragDepth`.
+    /// Tracked separately from `builtin` because FragDepth is an
+    /// *output* the shader stores to (routed to `out_depth`),
+    /// not a `LoadBuiltin` input.
+    frag_depth: bool,
 }
 
 fn read_execution_model(operands: &[Operand], i: usize) -> Result<ExecutionModel, FrontendError> {

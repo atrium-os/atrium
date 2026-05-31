@@ -649,6 +649,7 @@ impl Tier2Registry {
                     FrontFace::Clockwise        => total_edge < 0.0,
                 },
                 primitive_id: draw.primitive_id,
+                fs_writes_depth: draw.fs_writes_depth,
             };
 
             let pixel_stripe_bytes =
@@ -1159,6 +1160,81 @@ fn depth_compare(new: f32, old: f32, op: CompareOp) -> bool {
     }
 }
 
+/// Resolve the depth + stencil tests for one fragment against a
+/// given depth value, write back depth on pass, and return
+/// whether the fragment survives to colour output.
+///
+/// Shared by the early-Z path (`depth_value` = interpolated
+/// window depth, run before the FS) and the late-Z path
+/// (`depth_value` = the FS's clamped `gl_FragDepth`, run after).
+/// Stencil writeback always happens (stencil writes persist even
+/// when the depth test fails); the depth-fail stencil op fires
+/// when stencil passes but depth doesn't.
+#[allow(clippy::too_many_arguments)]
+fn resolve_depth_stencil(
+    depth: Option<&mut [f32]>,
+    stencil: Option<&mut [u8]>,
+    stencil_old: Option<u8>,
+    stencil_pass: bool,
+    pixel_lin_local: usize,
+    depth_value: f32,
+    depth_bounds: Option<(f32, f32)>,
+    depth_compare_op: CompareOp,
+    depth_write: bool,
+    stencil_face: Option<StencilFaceState>,
+) -> bool {
+    // Depth compare + bounds (bounds tests the EXISTING buffer
+    // value, not the incoming fragment).  Skipped when stencil
+    // already failed -- the depth-fail op must not fire then.
+    let depth_pass = if !stencil_pass {
+        true
+    } else if let Some(db) = depth.as_deref() {
+        if let Some((b_min, b_max)) = depth_bounds {
+            let existing = db[pixel_lin_local];
+            if !(existing >= b_min && existing <= b_max) {
+                false
+            } else {
+                depth_compare(depth_value, db[pixel_lin_local], depth_compare_op)
+            }
+        } else {
+            depth_compare(depth_value, db[pixel_lin_local], depth_compare_op)
+        }
+    } else { true };
+
+    // Stencil op selection + writeback.
+    if let (Some(face), Some(sbuf), Some(old)) =
+        (stencil_face, stencil, stencil_old)
+    {
+        let op = if !stencil_pass {
+            face.fail_op
+        } else if !depth_pass {
+            face.depth_fail_op
+        } else {
+            face.pass_op
+        };
+        let new_val: u8 = match op {
+            StencilOp::Keep              => old,
+            StencilOp::Zero              => 0,
+            StencilOp::Replace           => face.reference,
+            StencilOp::IncrementAndClamp => old.saturating_add(1),
+            StencilOp::DecrementAndClamp => old.saturating_sub(1),
+            StencilOp::Invert            => !old,
+            StencilOp::IncrementAndWrap  => old.wrapping_add(1),
+            StencilOp::DecrementAndWrap  => old.wrapping_sub(1),
+        };
+        let written = (old & !face.write_mask) | (new_val & face.write_mask);
+        sbuf[pixel_lin_local] = written;
+    }
+
+    if !stencil_pass || !depth_pass { return false; }
+
+    // Depth writeback (post-pass) gated on `depth_write`.
+    if let Some(db) = depth {
+        if depth_write { db[pixel_lin_local] = depth_value; }
+    }
+    true
+}
+
 /// Pineda edge function: signed 2-area of the triangle
 /// formed by points A, B, P.  Positive on one side of
 /// directed edge A→B, negative on the other, zero on the
@@ -1236,6 +1312,10 @@ struct TriangleSetup<'s> {
     /// `gl_PrimitiveID` for this triangle (mirror of
     /// `DrawTriangle::primitive_id`).
     primitive_id: u32,
+    /// Mirror of `DrawTriangle::fs_writes_depth`: select the
+    /// late-depth path (test/write against the FS's gl_FragDepth)
+    /// over the default early-Z path.
+    fs_writes_depth: bool,
 }
 
 /// One stripe's mutable working set for R.7's per-stripe
@@ -1538,79 +1618,23 @@ fn rasterize_stripe(
                     }
                 } else { true };
 
-                // Depth compare + bounds (only meaningful if
-                // a depth buffer is bound).  We compute the
-                // pass result but defer the writeback until
-                // we know the stencil op outcome too --
-                // ordering matters because the stencil
-                // depth_fail op fires when stencil passes
-                // but depth doesn't.
-                let depth_pass = if !stencil_pass {
-                    // Vulkan spec: if stencil fails, the
-                    // depth test is "not performed"; the
-                    // depth-fail op is irrelevant.  Treat as
-                    // pass for the outcome selector below
-                    // so we don't accidentally route to
-                    // depth_fail_op.
-                    true
-                } else if let Some(db) = task.depth.as_deref() {
-                    if let Some((b_min, b_max)) = setup.depth_bounds {
-                        let existing = db[pixel_lin_local];
-                        if !(existing >= b_min && existing <= b_max) {
-                            // Bounds-test failure is treated
-                            // identically to a depth-compare
-                            // failure for the stencil
-                            // outcome selector.
-                            false
-                        } else {
-                            depth_compare(window_z, db[pixel_lin_local],
-                                          setup.depth_compare_op)
-                        }
-                    } else {
-                        depth_compare(window_z, db[pixel_lin_local],
-                                      setup.depth_compare_op)
-                    }
-                } else { true };
-
-                // Stencil op selection + writeback.  Runs
-                // regardless of whether the fragment will
-                // produce colour -- stencil writes persist
-                // even when the depth test fails.
-                if let (Some(face), Some(stencil_buf), Some(old)) =
-                    (setup.stencil_face, task.stencil.as_mut(), stencil_old)
-                {
-                    let op = if !stencil_pass {
-                        face.fail_op
-                    } else if !depth_pass {
-                        face.depth_fail_op
-                    } else {
-                        face.pass_op
-                    };
-                    let new_val: u8 = match op {
-                        StencilOp::Keep              => old,
-                        StencilOp::Zero              => 0,
-                        StencilOp::Replace           => face.reference,
-                        StencilOp::IncrementAndClamp => old.saturating_add(1),
-                        StencilOp::DecrementAndClamp => old.saturating_sub(1),
-                        StencilOp::Invert            => !old,
-                        StencilOp::IncrementAndWrap  => old.wrapping_add(1),
-                        StencilOp::DecrementAndWrap  => old.wrapping_sub(1),
-                    };
-                    let written = (old & !face.write_mask)
-                                | (new_val & face.write_mask);
-                    stencil_buf[pixel_lin_local] = written;
-                }
-
-                // Now gate colour output on the combined
-                // result.  Stencil fail OR depth fail =
-                // discard.
-                if !stencil_pass || !depth_pass { continue; }
-
-                // Depth writeback (post-pass) gated on the
-                // pipeline / dynamic `depth_write`.
-                if let Some(db) = task.depth.as_mut() {
-                    if setup.depth_write {
-                        db[pixel_lin_local] = window_z;
+                // Early-Z: for shaders that DON'T write
+                // gl_FragDepth, resolve depth + stencil now (before
+                // the FS) against the interpolated window depth, and
+                // skip the FS entirely for failing fragments.
+                // Shaders that write gl_FragDepth defer this to the
+                // late-Z block below (after the FS), where the
+                // shader-produced depth is known.
+                if !setup.fs_writes_depth {
+                    if !resolve_depth_stencil(
+                        task.depth.as_deref_mut(),
+                        task.stencil.as_deref_mut(),
+                        stencil_old, stencil_pass, pixel_lin_local,
+                        window_z, setup.depth_bounds,
+                        setup.depth_compare_op, setup.depth_write,
+                        setup.stencil_face,
+                    ) {
+                        continue;
                     }
                 }
 
@@ -1672,7 +1696,11 @@ fn rasterize_stripe(
                 let n_color = (1 + task.extra_color.len())
                     .min(MAX_COLOR_ATTACHMENTS);
                 let mut out_color = [0.0f32; MAX_COLOR_ATTACHMENTS * 4];
-                let mut out_depth = 0.0f32;
+                // Seed with the interpolated window depth so the
+                // late-Z path has a sensible value even if a
+                // FragDepth shader leaves some path unwritten; a
+                // DepthReplacing FS overwrites it via out_depth.
+                let mut out_depth = window_z;
                 let in_varyings_ptr = if setup.n == 0 {
                     std::ptr::null()
                 } else { interp_buf.as_ptr() };
@@ -1774,6 +1802,30 @@ fn rasterize_stripe(
                 if draw.uses_derivatives {
                     atrium_spv_runtime::quad_end();
                 }
+
+                // Late-Z: for shaders that write gl_FragDepth, the
+                // depth value is only known now.  Clamp it to the
+                // viewport depth range (Vulkan clamps gl_FragDepth
+                // to [minDepth, maxDepth]) and resolve depth +
+                // stencil + depth-write against it; a failing
+                // fragment is discarded before the colour scatter.
+                if setup.fs_writes_depth {
+                    let eff = out_depth.clamp(
+                        setup.depth_min.min(setup.depth_max),
+                        setup.depth_min.max(setup.depth_max),
+                    );
+                    if !resolve_depth_stencil(
+                        task.depth.as_deref_mut(),
+                        task.stencil.as_deref_mut(),
+                        stencil_old, stencil_pass, pixel_lin_local,
+                        eff, setup.depth_bounds,
+                        setup.depth_compare_op, setup.depth_write,
+                        setup.stencil_face,
+                    ) {
+                        continue;
+                    }
+                }
+
                 let idx = pixel_lin_local * 4;
 
                 // Scatter each colour attachment.  Attachment
@@ -2073,6 +2125,14 @@ pub struct DrawTriangle<'a> {
     /// (the trailing FS parameter): the 0-based index of this
     /// triangle within the draw.
     pub primitive_id: u32,
+
+    /// When true the fragment shader writes `gl_FragDepth`, so
+    /// the rasterizer takes the late-depth path: it runs the FS
+    /// first and tests / writes the depth buffer against the
+    /// shader-produced depth (clamped to the viewport range)
+    /// instead of the interpolated `gl_FragCoord.z`.  False keeps
+    /// the early-Z path (depth test + write before the FS).
+    pub fs_writes_depth: bool,
 }
 
 /// Per-face stencil state passed to `fill_image_triangle`.
@@ -2157,6 +2217,7 @@ impl Default for DrawTriangle<'_> {
             uses_derivatives: false,
             instance_index: 0,
             primitive_id: 0,
+            fs_writes_depth: false,
         }
     }
 }

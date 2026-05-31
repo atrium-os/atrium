@@ -127,6 +127,9 @@ pub struct Tier2Backend {
     /// derivatives (`dFdx`/`dFdy`/`fwidth`).  Gates the
     /// rasterizer's 2x2-quad lockstep shading path.
     pipeline_fs_derivatives: Mutex<HashMap<u32, bool>>,
+    /// Per-graphics-pipeline flag: FS writes gl_FragDepth.  Gates
+    /// the rasterizer's late-depth path.
+    pipeline_fs_writes_depth: Mutex<HashMap<u32, bool>>,
     /// Per-pipeline compute-shader binding: Tier-2 shader id
     /// + workgroup local-size. Populated when the session
     /// processes a Compute-kind pipeline create.
@@ -766,6 +769,7 @@ impl Tier2Backend {
             pipeline_fs_implicit_lod: Mutex::new(HashMap::new()),
             pipeline_sample_count: Mutex::new(HashMap::new()),
             pipeline_fs_derivatives: Mutex::new(HashMap::new()),
+            pipeline_fs_writes_depth: Mutex::new(HashMap::new()),
             pipeline_compute: Mutex::new(HashMap::new()),
             cs_invocations: AtomicU64::new(0),
             last_compute_output: Mutex::new(None),
@@ -1892,6 +1896,8 @@ impl Tier2Backend {
             .get(&pipeline_raw).copied().unwrap_or(1);
         let fs_derivatives = self.pipeline_fs_derivatives.lock().unwrap()
             .get(&pipeline_raw).copied().unwrap_or(false);
+        let fs_writes_depth = self.pipeline_fs_writes_depth.lock().unwrap()
+            .get(&pipeline_raw).copied().unwrap_or(false);
 
         // Build the uniforms buffer if any COMBINED_IMAGE_SAMPLER
         // bindings are live.  Layout (atrium-spv-runtime
@@ -2233,6 +2239,7 @@ impl Tier2Backend {
                 uses_derivatives: fs_derivatives,
                 instance_index,
                 primitive_id: t as u32,
+                fs_writes_depth,
                 ..Default::default()
             };
             let db_ref: Option<&mut [f32]> = if !depth_enabled {
@@ -3396,6 +3403,8 @@ impl Tier2Backend {
             .get(&pipeline_raw).copied().unwrap_or(false);
         let sample_count = self.pipeline_sample_count.lock().unwrap()
             .get(&pipeline_raw).copied().unwrap_or(1);
+        let fs_writes_depth = self.pipeline_fs_writes_depth.lock().unwrap()
+            .get(&pipeline_raw).copied().unwrap_or(false);
 
         let dt_viewport = state.viewport.map(|v| Viewport {
             x: v.x, y: v.y, width: v.width, height: v.height,
@@ -3513,6 +3522,7 @@ impl Tier2Backend {
                 sample_count,
                 instance_index,
                 primitive_id: prim_idx as u32,
+                fs_writes_depth,
                 ..Default::default()
             };
             let db_ref = if depth_enabled {
@@ -3877,6 +3887,15 @@ impl Backend for Tier2Backend {
     ) {
         self.pipeline_fs_derivatives.lock().unwrap()
             .insert(pipeline_id.raw(), uses_derivatives);
+    }
+
+    fn bind_pipeline_fs_writes_depth(
+        &self,
+        pipeline_id: ResourceId,
+        writes_depth: bool,
+    ) {
+        self.pipeline_fs_writes_depth.lock().unwrap()
+            .insert(pipeline_id.raw(), writes_depth);
     }
 
     fn bind_pipeline_tier2_compute(

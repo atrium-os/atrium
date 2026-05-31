@@ -459,6 +459,16 @@ fn emit_function(
             }
         }
 
+        // gl_FragDepth: route stores to the FragDepth-decorated
+        // Output variable to params[9] (out_depth) instead of the
+        // out_color table.  Without this the generic
+        // `(Fragment, Output) -> params[8]` rule would clobber
+        // colour attachment 0 with the depth value.
+        if let Some(vid) = func.frag_depth_output {
+            let out_depth = translator.params[9];
+            translator.pointers.insert(vid, (out_depth, 0));
+        }
+
         // Location-decorated `Input`-storage vars: for VS,
         // route to params[0] = in_attributes; for FS,
         // route to params[0] = in_varyings.  Same shape as
