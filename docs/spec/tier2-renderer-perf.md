@@ -33,6 +33,20 @@ alpha glyph quads, 14 cores):
 spatial binning + rayon — i.e. the *architecture* below works; the
 remaining task is to give Tier-2 that architecture + SIMD shading).
 
+`bench_tier2_ceiling` (pre-investment go/no-go — runs the actual
+cranelift-compiled FS per pixel + FB write over a 4K, 2× overdraw
+workload):
+
+| | ms/frame | Gpix/s |
+|---|---|---|
+| 1-core scalar FS | ~36 | 0.46 |
+| 14-core scalar FS (**P1-only prediction**) | **~5.0** | 3.3 |
+
+⇒ **P1 alone is predicted to clear 4K@120 (1.7× under budget)** for
+solid-fill UI, *without* P2/P3. P2/P3 are headroom for texture/
+blend-heavy frames and for arbitrary per-app shaders. (Solid FS is
+the optimistic case; textured/glyph shading is ~2–3× heavier.)
+
 ## Measured bottlenecks (in priority order)
 
 1. **Per-primitive dispatch.** `fill_image_triangle` splits the
@@ -75,9 +89,11 @@ remaining task is to give Tier-2 that architecture + SIMD shading).
 
 - **P0 — Baseline + evidence.** ✅ Benchmarks landed; bottlenecks
   quantified (this doc).
-- **P1 — Tile-binned, per-tile-parallel rasterization.** No codegen
-  change. Biggest single win (kills #1). Prototype + measure in the
-  bench *before* integrating into the daemon's draw model.
+- **P1 — Tile-binned, per-tile-parallel, DAMAGE-AWARE rasterization.**
+  No codegen change. Biggest single win (kills #1) + damage-aware
+  tile dispatch (only dirty tiles) from the start. Prototype +
+  measure in the bench *before* integrating into the daemon's draw
+  model.
 - **P2 — Batched fragment execution.** Remove the per-pixel call
   (#2): span/quad FS ABI with SoA inputs + mask.
 - **P3 — SoA SIMD shader codegen.** The real vectorization (#3):
@@ -87,6 +103,46 @@ remaining task is to give Tier-2 that architecture + SIMD shading).
   whatever compute it issues); point `fresco-vulkan`'s ICD at
   `atrium-vk-icd` so the compositor runs on Tier-2. Apps are already
   bridged.
+- **PT — Partial-update transport (in-app sub-rect damage).** Add
+  `slot_update_region` / CAS patch + present damage rect to the
+  Fresco protocol + bridge + compositor, so a small in-app dirty
+  rect doesn't re-upload/recomposite the whole window surface.
+  Independent of the rasterizer rework; lands alongside P4.
+
+## Damage / dirty-rect rendering (the dominant real-world lever)
+
+Fresco is scene-graph based with delta nodes + dirty rects, so the
+renderer should "draw as little as possible."  This is bigger than
+SIMD: with damage tracking, most frames touch a few hundred–few
+thousand pixels (caret, hover, a typed glyph), so the 4K full-screen
+repaint is the *rare* case (resize, wallpaper).  Tiling + damage
+compose perfectly — work scales with **damage area, not screen
+area** (only dispatch tiles intersecting a dirty rect).
+
+Tier-2 already has the primitives:
+- **scissor** (`DrawTriangle.scissor`) — clip rasterization to a rect.
+- **preserve / no-clear** — `BeginRenderPass`'s `BEGIN_RP_FLAG_NO_
+  CLEAR` keeps the prior framebuffer (= `VK_ATTACHMENT_LOAD_OP_LOAD`).
+- **persistent target** — images live across frames in the daemon.
+
+Two layers, handled differently:
+
+1. **Per-window / per-app (compositor):** the compositor recomposites
+   only the screen regions of changed/moved windows (LOAD-preserve +
+   scissor + damage-aware tile dispatch).  End-to-end today; the
+   compositor already produces the deltas.  → folded into **P1/P4**.
+2. **In-app sub-rect (within a window's surface):** the app can
+   LOAD-preserve its surface + scissor + redraw a sub-rect (Tier-2
+   supports it) — but the *transport* is currently whole-surface:
+   `atrium-tier2-fresco-bridge` does `upload_blob(whole)` +
+   `slot_set_texture(whole)` + `window_present(window_id)` with no
+   damage region.  So in-app damage saves render but not upload/
+   recomposite (bites for tiny damage in a large window).  Closing
+   it needs a **partial texture update** (`slot_update_region(slot,
+   sub_rect, bytes)` / CAS patch) + a **present damage rect**
+   (`window_present(window_id, damage)`).  This is a protocol +
+   bridge + compositor item, independent of the rasterizer rework.
+   → tracked as **PT (partial-update transport)**.
 
 ## Integration notes
 
