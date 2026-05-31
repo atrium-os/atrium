@@ -98,10 +98,27 @@ the optimistic case; textured/glyph shading is ~2–3× heavier.)
     4K@120; damage frame (200×40) 0.097 ms (~75× cheaper).** No
     SIMD. Confirms the architecture + ceiling probe. (vs 152 ms
     per-primitive Tier-2; tiled tiny-skia reference 2.5 ms.)
-  - **P1b — integrate into the daemon draw model** (replace the
-    per-primitive `fill_image_triangle` dispatch with frame-binned,
-    damage-aware tile dispatch), keeping the 78-rung smoke +
-    `differential_compute` green. ← next.
+  - **P1b — integrate into the daemon draw model**, keeping the
+    78-rung smoke + `differential_compute` green. **Lower-risk
+    approach:** *reuse `rasterize_stripe` unchanged* (it is already
+    the per-(stripe,triangle) worker, so the exact pixel semantics
+    the rungs depend on are preserved) and hoist the rayon dispatch
+    from per-triangle to pass-level, looping triangles inside each
+    stripe task. The measured killer was per-triangle rayon +
+    per-triangle full-FB chunking — both vanish when stripes are
+    built once and parallelised once.
+    - **P1b.1** — split `fill_image_triangle` into `build_triangle
+      _setup` (VS run + clip + setup, owned) and `rasterize_batch`
+      (stripes split once, `par_iter` over stripes, each stripe
+      loops its intersecting triangles calling `rasterize_stripe`).
+      Route `dispatch_draw`/`_indexed` to build all of one draw's
+      triangle setups and call `rasterize_batch` once (per-triangle
+      → per-draw rayon). Validate: smoke + differential green.
+    - **P1b.2** — lift batching to per-PASS: accumulate all draws'
+      owned setups in `execute_pass`, flush once at
+      `EndRenderPass` (one dispatch/frame), with damage tile gating
+      (scissor union). Draw order preserved (triangles looped in
+      submission order within each stripe).
 - **P2 — Batched fragment execution.** Remove the per-pixel call
   (#2): span/quad FS ABI with SoA inputs + mask.
 - **P3 — vectorization (#3), split two ways:**

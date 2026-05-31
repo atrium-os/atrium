@@ -609,7 +609,7 @@ impl Tier2Registry {
             let setup = TriangleSetup {
                 a, b, c, total_edge,
                 ndc, inv_w,
-                varying_over_w: &varying_over_w,
+                varying_over_w,
                 n, varying_bytes,
                 min_x, max_x, min_y, max_y,
                 tile_min_x, tile_max_x,
@@ -1247,7 +1247,7 @@ fn edge_fn(a: (f32, f32), b: (f32, f32), p: (f32, f32)) -> f32 {
 /// Read-only per-triangle setup shared across all
 /// parallel stripe tasks (R.7).  All fields are Send +
 /// Sync.
-struct TriangleSetup<'s> {
+struct TriangleSetup {
     a: (f32, f32),
     b: (f32, f32),
     c: (f32, f32),
@@ -1260,8 +1260,10 @@ struct TriangleSetup<'s> {
     /// 1/w per vertex for the perspective denominator.
     inv_w: [f32; 3],
     /// Pre-divided varying lanes: varying_over_w[i][k] =
-    /// varying_per_vertex[i][k] / w[i].
-    varying_over_w: &'s [Vec<f32>; 3],
+    /// varying_per_vertex[i][k] / w[i].  Owned (not borrowed) so a
+    /// batch of per-triangle setups can be collected into a Vec and
+    /// rasterized in one pass-level dispatch (P1b).
+    varying_over_w: [Vec<f32>; 3],
     /// Number of f32 varying lanes per vertex.
     n: usize,
     /// Bytes per varying lane group (`n * 4`).
@@ -1398,7 +1400,7 @@ struct StripeWork<'p, 'd> {
 /// and doing them together avoids two ABI-break rebuilds.
 fn rasterize_stripe(
     task: &mut StripeWork<'_, '_>,
-    setup: &TriangleSetup<'_>,
+    setup: &TriangleSetup,
     draw: &DrawTriangle<'_>,
     fs_main: atrium_spv_loader::FsMain,
 ) {
