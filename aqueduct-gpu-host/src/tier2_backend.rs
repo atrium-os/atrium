@@ -511,11 +511,26 @@ struct BoundIndexBuffer {
 fn vk_format_to_tex_format(vk_format: u32) -> atrium_spv_runtime::TexFormat {
     use atrium_spv_runtime::TexFormat as T;
     match vk_format {
+        9  => T::R8Unorm,    // VK_FORMAT_R8_UNORM
+        16 => T::Rg8Unorm,   // VK_FORMAT_R8G8_UNORM
         37 => T::Rgba8Unorm, // VK_FORMAT_R8G8B8A8_UNORM
         43 => T::Rgba8Srgb,  // VK_FORMAT_R8G8B8A8_SRGB
         44 => T::Bgra8Unorm, // VK_FORMAT_B8G8R8A8_UNORM
         50 => T::Bgra8Srgb,  // VK_FORMAT_B8G8R8A8_SRGB
         _  => T::Rgba8Unorm,
+    }
+}
+
+/// Bytes per texel for a colour `VkFormat`'s native storage:
+/// 1 for R8, 2 for RG8, 4 for the RGBA/BGRA family.  Narrow
+/// formats are stored natively (not expanded), so the image's
+/// `pixels` buffer + every `TexDesc::stride_bytes` derived from
+/// it scale by this.
+fn vk_format_bytes_per_texel(vk_format: u32) -> usize {
+    match vk_format {
+        9  => 1, // R8
+        16 => 2, // RG8
+        _  => 4, // RGBA8 / BGRA8 / sRGB
     }
 }
 
@@ -541,11 +556,17 @@ struct ImageStorage {
     mip_levels: Vec<MipLevel>,
     /// Runtime sampling format (`atrium_spv_runtime::TexFormat`
     /// as u32), mapped from the image's VkFormat at creation.
-    /// The daemon always stores 4-byte texels; this only changes
-    /// how the runtime sampler *interprets* them (e.g. BGRA swaps
-    /// R/B vs RGBA, sRGB applies the EOTF).  Defaults to
-    /// `Rgba8Unorm` until `set_image_format` is called.
+    /// For 4-byte formats this only changes how the runtime
+    /// sampler *interprets* the texels (e.g. BGRA swaps R/B vs
+    /// RGBA, sRGB applies the EOTF).  For narrow formats (R8/RG8)
+    /// the storage itself is narrower -- see `bytes_per_texel`.
+    /// Defaults to `Rgba8Unorm` until `set_image_format`.
     tex_format: u32,
+    /// Bytes per texel of this image's native storage (1 for R8,
+    /// 2 for RG8, 4 otherwise).  `pixels.len() == width * height
+    /// * bytes_per_texel * array_layers`, and every `TexDesc`
+    /// stride derived from it is `width * bytes_per_texel`.
+    bytes_per_texel: usize,
 }
 
 /// One stored mip level beyond the base.  Level index =
@@ -1714,12 +1735,12 @@ impl Tier2Backend {
         // so the raw pointers stay valid through the
         // per-triangle loop.
         // (binding, base_ptr, w, h, array_layers, mips)
-        type TextureSnap = (u32, *const u8, u32, u32, u32, Vec<(*const u8, u32, u32)>, u32);
+        type TextureSnap = (u32, *const u8, u32, u32, u32, Vec<(*const u8, u32, u32)>, u32, u32);
         let texture_snapshots: Vec<TextureSnap> = {
             let images = self.images.lock().unwrap();
             state.bound_textures.iter()
                 .map(|(b, (iid, _))| {
-                    let (data, w, h, layers, mips, fmt) = images.get(&(*iid as u64))
+                    let (data, w, h, layers, mips, fmt, bpp) = images.get(&(*iid as u64))
                         .map(|img| (
                             img.pixels.as_ptr(),
                             img.width, img.height,
@@ -1728,10 +1749,11 @@ impl Tier2Backend {
                                 .map(|m| (m.pixels.as_ptr(), m.width, m.height))
                                 .collect::<Vec<_>>(),
                             img.tex_format,
+                            img.bytes_per_texel as u32,
                         ))
                         .unwrap_or((std::ptr::null(), 1, 1, 1, Vec::new(),
-                                    atrium_spv_runtime::TexFormat::Rgba8Unorm as u32));
-                    (*b, data, w, h, layers, mips, fmt)
+                                    atrium_spv_runtime::TexFormat::Rgba8Unorm as u32, 4));
+                    (*b, data, w, h, layers, mips, fmt, bpp)
                 })
                 .collect()
         };
@@ -1901,9 +1923,9 @@ impl Tier2Backend {
             // slot indices line up with the FS's `Binding`
             // decorations.
             let mut snaps = texture_snapshots.clone();
-            snaps.sort_by_key(|(b, _, _, _, _, _, _)| *b);
+            snaps.sort_by_key(|(b, _, _, _, _, _, _, _)| *b);
             let max_binding = snaps.iter()
-                .map(|(b, _, _, _, _, _, _)| *b as usize).max().unwrap_or(0);
+                .map(|(b, _, _, _, _, _, _, _)| *b as usize).max().unwrap_or(0);
             let slot_count = max_binding + 1;
             let samplers_guard = self.samplers.lock().unwrap();
             let mut td: Vec<atrium_spv_runtime::TexDesc> =
@@ -1916,16 +1938,17 @@ impl Tier2Backend {
                 mag_filter: 0, min_filter: 0, wrap_s: 0, wrap_t: 0,
                 compare_enable: 0, compare_op: 0,
             };
-            for (b, data, w, h, layers, mips, fmt) in &snaps {
+            for (b, data, w, h, layers, mips, fmt, bpp) in &snaps {
                 let (_, sampler_id) = *state.bound_textures.get(b)
                     .unwrap_or(&(0, 0));
+                let bpp = *bpp;
                 // depth = array-layer / cube-face count;
                 // slice_bytes = per-layer stride.  The runtime
                 // array / cube helpers (`atrium_tex_sample_2d_
                 // array`, `_sample_cube`) read these to address
                 // `data + layer * slice_bytes`.
                 let depth = (*layers).max(1);
-                let slice_bytes = if depth > 1 { *w * *h * 4 } else { 0 };
+                let slice_bytes = if depth > 1 { *w * *h * bpp } else { 0 };
                 // Build the per-mip TexDesc array.  Level 0 is
                 // duplicated at slot 0 to keep
                 // `pick_tex_mip(lod=0)` consistent (it falls
@@ -1936,7 +1959,7 @@ impl Tier2Backend {
                 mips_v.push(atrium_spv_runtime::TexDesc {
                     data: *data,
                     width: *w, height: *h,
-                    stride_bytes: *w * 4,
+                    stride_bytes: *w * bpp,
                     format: *fmt,
                     mip_count: 0, mip_descs: std::ptr::null(),
                     depth, slice_bytes,
@@ -1945,10 +1968,10 @@ impl Tier2Backend {
                     mips_v.push(atrium_spv_runtime::TexDesc {
                         data: *mptr,
                         width: *mw, height: *mh,
-                        stride_bytes: *mw * 4,
+                        stride_bytes: *mw * bpp,
                         format: *fmt,
                         mip_count: 0, mip_descs: std::ptr::null(),
-                        depth, slice_bytes: if depth > 1 { *mw * *mh * 4 } else { 0 },
+                        depth, slice_bytes: if depth > 1 { *mw * *mh * bpp } else { 0 },
                     });
                 }
                 let mip_count = mips_v.len() as u32;
@@ -1957,7 +1980,7 @@ impl Tier2Backend {
                 td.push(atrium_spv_runtime::TexDesc {
                     data: *data,
                     width: *w, height: *h,
-                    stride_bytes: *w * 4,
+                    stride_bytes: *w * bpp,
                     format: *fmt,
                     mip_count, mip_descs: mips_ptr,
                     depth, slice_bytes,
@@ -1985,7 +2008,7 @@ impl Tier2Backend {
                     atrium_spv_runtime::atrium_tex_sample_2d_dref,
                     atrium_spv_runtime::atrium_deriv,
                 );
-                for (i, (binding, _, _, _, _, _, _)) in snaps.iter().enumerate() {
+                for (i, (binding, _, _, _, _, _, _, _)) in snaps.iter().enumerate() {
                     atrium_spv_runtime::write_descriptor_slot(
                         &mut buf, *binding as usize,
                         &tex_descs[i] as *const _,
@@ -3092,7 +3115,7 @@ impl Tier2Backend {
             log::warn!("CopyBufToImg: dst image {dst_id} not registered");
             return;
         };
-        let bpp: usize = 4; // RGBA8 only.
+        let bpp: usize = dst_img.bytes_per_texel; // 1=R8, 2=RG8, 4=RGBA/BGRA.
         let base_w = dst_img.width;
         let base_h = dst_img.height;
 
@@ -3551,15 +3574,27 @@ impl Backend for Tier2Backend {
             array_layers: layers,
             mip_levels: Vec::new(),
             tex_format: atrium_spv_runtime::TexFormat::Rgba8Unorm as u32,
+            bytes_per_texel: 4,
         });
     }
 
     fn set_image_format(&self, image_id: ResourceId, vk_format: u32) {
         let tex = vk_format_to_tex_format(vk_format);
+        let bpp = vk_format_bytes_per_texel(vk_format);
         if let Some(img) = self.images.lock().unwrap()
             .get_mut(&(image_id.raw() as u64))
         {
             img.tex_format = tex as u32;
+            // Narrow formats store fewer bytes per texel than the
+            // 4-byte default `image_created_layered` allocated.
+            // The buffer is freshly zeroed at creation, so resize
+            // it to the native footprint before any upload.
+            if bpp != img.bytes_per_texel {
+                img.bytes_per_texel = bpp;
+                let need = (img.width as usize) * (img.height as usize)
+                    * bpp * (img.array_layers as usize);
+                img.pixels = vec![0u8; need];
+            }
         }
     }
 
