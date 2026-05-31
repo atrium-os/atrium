@@ -204,6 +204,7 @@ GRAPHICS_POINTS="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_
 GRAPHICS_LINES="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_lines"
 GRAPHICS_LINESTRIP="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_linestrip"
 GRAPHICS_TRIFAN="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_trifan"
+GRAPHICS_BGRA="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_bgra"
 GRAPHICS_ARRAY="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_array"
 GRAPHICS_CUBE="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_cube"
 GRAPHICS_SHADOW="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_shadow"
@@ -2465,6 +2466,44 @@ if [ -x "$GRAPHICS_TRIFAN" ]; then
 else
     echo
     echo "SKIP Rung ZZ: need 'cargo build -p atrium-vk-icd --example loader_graphics_trifan'"
+fi
+
+# ── Rung AAA: BGRA texture format (channel-order swap) ───
+# loader_graphics_bgra: a 2x2 texture created as
+# B8G8R8A8_UNORM whose texels encode RED in BGRA byte order
+# ([B=0,G=0,R=255,A=255]).  The daemon now propagates each
+# image's VkFormat into the runtime TexDesc, so the sampler
+# reads R from byte 2 + B from byte 0 -> red.  A format-blind
+# daemon (the prior hardcoded Rgba8Unorm) would have produced
+# blue.  Asserts pixel(4,4) is red-dominant.
+if [ -x "$GRAPHICS_BGRA" ]; then
+    rm -f "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+        echo "daemon failed to start (bgra round-trip); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung AAA: BGRA texture format (R/B swap at sample) ==="
+    if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+        VK_DRIVER_FILES="$MANIFEST" \
+        ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+        "$GRAPHICS_BGRA" 2>&1 | tail -2; then
+        echo "FAIL: bgra round-trip did not return 0" >&2
+        exit 1
+    fi
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
+else
+    echo
+    echo "SKIP Rung AAA: need 'cargo build -p atrium-vk-icd --example loader_graphics_bgra'"
 fi
 
 echo

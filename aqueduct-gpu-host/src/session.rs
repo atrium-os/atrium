@@ -261,6 +261,9 @@ impl Session {
         } else {
             self.backend.image_created_layered(
                 req.image_id, req.width, req.height, req.array_layers.max(1));
+            // Record the colour format so sampling interprets the
+            // texels correctly (BGRA channel order, sRGB EOTF).
+            self.backend.set_image_format(req.image_id, req.format);
         }
         Ok(())
     }

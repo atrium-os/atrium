@@ -80,6 +80,14 @@ pub trait Backend: Send + Sync {
         self.image_created(image_id, width, height);
     }
 
+    /// Record a colour image's `VkFormat` (numeric) so the
+    /// backend can sample its texels with the right
+    /// interpretation (e.g. BGRA channel order, sRGB EOTF).
+    /// Called right after `image_created` / `image_created_
+    /// layered`.  Default no-op (backends that always treat
+    /// colour images as RGBA8 ignore it).
+    fn set_image_format(&self, _image_id: ResourceId, _vk_format: u32) {}
+
     /// Notify the backend an image was destroyed. Default no-op.
     fn image_destroyed(&self, _image_id: ResourceId) {}
 
