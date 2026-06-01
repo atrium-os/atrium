@@ -211,6 +211,7 @@ GRAPHICS_R8="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_r8"
 GRAPHICS_RG8="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_rg8"
 GRAPHICS_FRAGDEPTH="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_fragdepth"
 GRAPHICS_DAMAGE="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_damage"
+GRAPHICS_MULTIDRAW="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_multidraw"
 GRAPHICS_ARRAY="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_array"
 GRAPHICS_CUBE="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_cube"
 GRAPHICS_SHADOW="$REPO_ROOT/atrium-vk-icd/target/debug/examples/loader_graphics_shadow"
@@ -2736,6 +2737,43 @@ if [ -x "$GRAPHICS_DAMAGE" ]; then
 else
     echo
     echo "SKIP Rung GGG: need 'cargo build -p atrium-vk-icd --example loader_graphics_damage'"
+fi
+
+# ── Rung HHH: P1b.2 pass-level batch routes per-draw shaders ──
+# loader_graphics_multidraw: TWO draws with DIFFERENT fragment
+# shaders (red, green) in ONE render pass.  The daemon accumulates
+# both into a single batched dispatch; each triangle's draw_idx
+# must select its own draw's fs_main + state.  Left triangle comes
+# back RED (draw 1), right triangle GREEN (draw 2) -- a routing bug
+# would mis-assign or share the shader/state across the batch.
+if [ -x "$GRAPHICS_MULTIDRAW" ]; then
+    rm -f "$SOCKET"
+    "$DAEMON" --socket "$SOCKET" \
+        --backend tier2 --tier2 \
+        --cache-root "$CACHE_ROOT" \
+        --compile-binary "$COMPILE" \
+        ${SPIRV_OPT:+--spirv-opt-binary "$SPIRV_OPT"} \
+        > /tmp/aqueduct-loader-smoke.log 2>&1 &
+    DAEMON_PID=$!
+    if ! wait_for_daemon "$DAEMON_PID" "$SOCKET"; then
+        echo "daemon failed to start (multidraw round-trip); log:" >&2
+        cat /tmp/aqueduct-loader-smoke.log >&2
+        exit 1
+    fi
+    echo
+    echo "=== Rung HHH: pass-level batch routes per-draw shaders (draw_idx) ==="
+    if ! DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+        VK_DRIVER_FILES="$MANIFEST" \
+        ATRIUM_VK_ICD_SOCKET="$SOCKET" \
+        "$GRAPHICS_MULTIDRAW" 2>&1 | tail -2; then
+        echo "FAIL: multidraw round-trip did not return 0" >&2
+        exit 1
+    fi
+    kill_daemon "$DAEMON_PID"
+    DAEMON_PID=""
+else
+    echo
+    echo "SKIP Rung HHH: need 'cargo build -p atrium-vk-icd --example loader_graphics_multidraw'"
 fi
 
 echo

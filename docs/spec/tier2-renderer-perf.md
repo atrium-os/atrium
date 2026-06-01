@@ -107,18 +107,35 @@ the optimistic case; textured/glyph shading is ~2–3× heavier.)
     stripe task. The measured killer was per-triangle rayon +
     per-triangle full-FB chunking — both vanish when stripes are
     built once and parallelised once.
-    - **P1b.1** — split `fill_image_triangle` into `build_triangle
-      _setup` (VS run + clip + setup, owned) and `rasterize_batch`
-      (stripes split once, `par_iter` over stripes, each stripe
-      loops its intersecting triangles calling `rasterize_stripe`).
-      Route `dispatch_draw`/`_indexed` to build all of one draw's
-      triangle setups and call `rasterize_batch` once (per-triangle
-      → per-draw rayon). Validate: smoke + differential green.
-    - **P1b.2** — lift batching to per-PASS: accumulate all draws'
-      owned setups in `execute_pass`, flush once at
-      `EndRenderPass` (one dispatch/frame), with damage tile gating
-      (scissor union). Draw order preserved (triangles looped in
-      submission order within each stripe).
+    - **P1b.1 (DONE)** — split `fill_image_triangle` into
+      `build_triangle_setups` (VS run + clip + setup, owned) and
+      `rasterize_setups` (stripes split once, `par_iter` over
+      stripes, each stripe loops its intersecting triangles calling
+      `rasterize_stripe`).  `dispatch_draw`/`_indexed` build all of
+      one draw's triangle setups and call `rasterize_setups` once
+      (per-triangle → per-draw rayon).  Smoke + differential green.
+    - **P1b.2 (DONE)** — lifted batching to per-PASS.  `execute_pass`
+      owns a `(Vec<TriangleSetup>, Vec<OwnedDraw>)` accumulator;
+      every triangle Draw/DrawIndexed appends its setups (stamped
+      with a `draw_idx`) + a shared `OwnedDraw` snapshot of its
+      fragment-side state (uniforms / blend / derivatives /
+      sample_count + the texture-descriptor heaps kept alive for the
+      pass).  `flush_triangle_batch` rasterizes the whole pass in ONE
+      `rasterize_pass` dispatch at `EndRenderPass` (and before any
+      non-triangle / compute op, to preserve submission order), each
+      `TriangleSetup`'s `draw_idx` selecting its draw's `fs_main` +
+      state.  Draw order preserved (setups looped in submission order
+      within each stripe).  Mixed depth-enable across a batch is
+      handled by baking `compare=Always, write=false` into
+      depth-disabled draws' setups so a single pass-level depth
+      buffer is shared safely.  Damage tile gating (scissor union) is
+      automatic: `build_triangle_setups` already clamps each
+      triangle's bbox to its `draw.scissor`, so the union
+      `tile_min_y..tile_max_y` only spins up stripes overlapping the
+      dirty rect.  Validated end-to-end by the loader smoke rungs
+      **GGG** (loadOp=LOAD damage-preserve across two passes) and
+      **HHH** (two different-shader draws in one pass routed by
+      `draw_idx`); full smoke MM..HHH + 106 differential tests green.
 - **P2 — Batched fragment execution.** Remove the per-pixel call
   (#2): span/quad FS ABI with SoA inputs + mask.
 - **P3 — vectorization (#3), split two ways:**

@@ -633,6 +633,7 @@ impl Tier2Registry {
                 },
                 primitive_id: draw.primitive_id,
                 fs_writes_depth: draw.fs_writes_depth,
+                draw_idx: 0,
             };
 
             setups.push(setup);
@@ -758,6 +759,93 @@ impl Tier2Registry {
         tasks.par_iter_mut().for_each(|task| {
             for setup in setups {
                 rasterize_stripe(task, setup, draw, fs_main);
+            }
+        });
+    }
+
+    /// P1b.2 — pass-level batched rasterize.  Like
+    /// `rasterize_setups`, but every triangle in a whole render
+    /// pass is rasterized in ONE dispatch: stripes are split once
+    /// and `par_iter`'d once, amortizing the chunk-split + task-Vec
+    /// + rayon fan-out across the entire frame instead of paying it
+    /// per draw.  Each `TriangleSetup` carries a `draw_idx` into
+    /// `draws` / `fs_mains` so `rasterize_stripe` reads that draw's
+    /// shared state (blend / uniforms / viewport / derivatives /
+    /// sample_count) and fragment entry point.
+    ///
+    /// Ordering: within each stripe the setups are applied in slice
+    /// order, which the caller fills in submission order across all
+    /// draws — so blend / depth-equal semantics match the
+    /// draw-at-a-time path exactly.
+    ///
+    /// Damage tile gating: the stripe filter's `tile_min_y` /
+    /// `tile_max_y` is the union of every setup's scissor-clamped
+    /// bbox (`build_triangle_setups` already intersects each
+    /// triangle's bbox with its `draw.scissor`), so a pass that only
+    /// touches a dirty rect spins up only the overlapping stripes.
+    pub(crate) fn rasterize_pass(
+        &self,
+        setups: &[TriangleSetup],
+        draws: &[DrawTriangle<'_>],
+        fs_mains: &[atrium_spv_loader::FsMain],
+        width: u32,
+        pixels: &mut [u8],
+        mut depth_buffer: Option<&mut [f32]>,
+        mut stencil_buffer: Option<&mut [u8]>,
+        extra_color: &mut [&mut [u8]],
+    ) {
+        if setups.is_empty() { return; }
+        let tile_min_y = setups.iter().map(|s| s.min_y / TILE_SIZE).min().unwrap();
+        let tile_max_y = setups.iter().map(|s| s.max_y / TILE_SIZE).max().unwrap();
+
+        let pixel_stripe_bytes = (TILE_SIZE as usize) * (width as usize) * 4;
+        let depth_stripe_elems = (TILE_SIZE as usize) * (width as usize);
+        let stencil_stripe_elems = depth_stripe_elems;
+
+        let pixel_chunks: Vec<&mut [u8]> =
+            pixels.chunks_mut(pixel_stripe_bytes).collect();
+        let depth_chunks: Vec<Option<&mut [f32]>> =
+            match depth_buffer.as_deref_mut() {
+                Some(db) => db.chunks_mut(depth_stripe_elems).map(Some).collect(),
+                None => (0..pixel_chunks.len()).map(|_| None).collect(),
+            };
+        let stencil_chunks: Vec<Option<&mut [u8]>> =
+            match stencil_buffer.as_deref_mut() {
+                Some(sb) => sb.chunks_mut(stencil_stripe_elems).map(Some).collect(),
+                None => (0..pixel_chunks.len()).map(|_| None).collect(),
+            };
+        let num_stripes = pixel_chunks.len();
+        let mut extra_iters: Vec<std::slice::ChunksMut<u8>> =
+            extra_color.iter_mut()
+                .map(|buf| buf.chunks_mut(pixel_stripe_bytes))
+                .collect();
+        let mut extra_per_stripe: Vec<Vec<&mut [u8]>> =
+            (0..num_stripes)
+                .map(|_| extra_iters.iter_mut().filter_map(|it| it.next()).collect())
+                .collect();
+        let mut tasks: Vec<StripeWork> = pixel_chunks
+            .into_iter()
+            .zip(depth_chunks.into_iter())
+            .zip(stencil_chunks.into_iter())
+            .zip(extra_per_stripe.drain(..))
+            .enumerate()
+            .filter(|(s, _)| {
+                let tile_y = *s as i32;
+                tile_y >= tile_min_y && tile_y <= tile_max_y
+            })
+            .map(|(s, (((px, dp), st), ex))| StripeWork {
+                stripe_y: s as i32,
+                pixels: px,
+                depth: dp,
+                stencil: st,
+                extra_color: ex,
+            })
+            .collect();
+
+        tasks.par_iter_mut().for_each(|task| {
+            for setup in setups {
+                let di = setup.draw_idx as usize;
+                rasterize_stripe(task, setup, &draws[di], fs_mains[di]);
             }
         });
     }
@@ -1346,6 +1434,13 @@ pub(crate) struct TriangleSetup {
     /// late-depth path (test/write against the FS's gl_FragDepth)
     /// over the default early-Z path.
     fs_writes_depth: bool,
+    /// Index into the per-pass `draws` / `fs_mains` arrays
+    /// (`rasterize_pass`).  Identifies which draw's shared state
+    /// (`DrawTriangle` + `FsMain`) this triangle belongs to when a
+    /// whole render pass's triangles are rasterized in one dispatch
+    /// (P1b.2).  `build_triangle_setups` leaves it 0; the per-pass
+    /// accumulator stamps it before the flush.
+    pub(crate) draw_idx: u32,
 }
 
 /// One stripe's mutable working set for R.7's per-stripe

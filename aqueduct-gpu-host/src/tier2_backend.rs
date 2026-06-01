@@ -29,8 +29,59 @@ use crate::tier2_registry::{
     BlendFactor, BlendFactorPair, BlendOp, BlendState, ColorWriteMask,
     CompareOp, CullMode, DrawTriangle, FrontFace, Scissor,
     StencilFaceState, StencilOp, StencilState, Tier2ExecError,
-    Tier2Registry, Tier2ShaderId, Viewport,
+    Tier2Registry, Tier2ShaderId, TriangleSetup, Viewport,
 };
+
+/// P1b.2 — owned snapshot of one draw's *fragment-side* shared
+/// state, retained across a whole render pass so every triangle in
+/// the pass can be rasterized in a single dispatch.
+///
+/// `uniforms` holds raw pointers into `_tex_descs` /
+/// `_sampler_descs` / `_mip_desc_arrays`; those Vecs are kept alive
+/// here so the heap they reference stays valid until the pass flush.
+/// The pointer *values* (bytes inside `uniforms`) and the `TexDesc`
+/// heaps stay put across the moves into this struct and into the
+/// accumulator `Vec` (a `Vec` move relocates only the owning handle,
+/// never the heap), so the self-referential pointers remain valid.
+///
+/// Only the fields `rasterize_stripe` reads off a `DrawTriangle` are
+/// snapshotted; everything else (depth/stencil/viewport/cull/
+/// front-facing/primitive-id) is already baked into each
+/// `TriangleSetup` at build time.
+struct OwnedDraw {
+    uniforms: Vec<u8>,
+    push_constants: Vec<u8>,
+    blend_state: BlendState,
+    blend_extra: Vec<BlendState>,
+    compute_implicit_lod: bool,
+    uses_derivatives: bool,
+    sample_count: u32,
+    fs_main: atrium_spv_loader::FsMain,
+    _tex_descs: Vec<atrium_spv_runtime::TexDesc>,
+    _sampler_descs: Vec<atrium_spv_runtime::SamplerDesc>,
+    _mip_desc_arrays: Vec<Vec<atrium_spv_runtime::TexDesc>>,
+}
+
+impl OwnedDraw {
+    /// Rebuild the `DrawTriangle` view `rasterize_pass` hands to
+    /// `rasterize_stripe`.  Vertex/varying slices are empty (the VS
+    /// already ran at build time); only the fragment-side fields are
+    /// populated, the rest defaulted.
+    fn as_draw_triangle(&self) -> DrawTriangle<'_> {
+        let empty: &[u8] = &[];
+        DrawTriangle {
+            vertex_attrs: [empty, empty, empty],
+            uniforms: &self.uniforms,
+            push_constants: &self.push_constants,
+            blend_state: self.blend_state,
+            blend_extra: &self.blend_extra,
+            compute_implicit_lod: self.compute_implicit_lod,
+            uses_derivatives: self.uses_derivatives,
+            sample_count: self.sample_count,
+            ..Default::default()
+        }
+    }
+}
 
 use aqueduct_gpu::frame::{
     BindDepthAttachmentCmd, BindIndexBufCmd, BindVertexBufCmd, DispatchCmd,
@@ -1172,6 +1223,13 @@ impl Tier2Backend {
         // enabled, cleared to 0 (Vulkan's default
         // `ClearDepthStencilValue::stencil`).
         let mut stencil_buffer: Option<Vec<u8>> = None;
+        // P1b.2 — pass-level triangle batch.  Every triangle Draw /
+        // DrawIndexed in this pass appends its setups + a shared
+        // `OwnedDraw` here; the batch is rasterized in ONE dispatch
+        // at EndRenderPass (or before any non-triangle / compute op,
+        // to preserve submission order).
+        let mut batch_setups: Vec<TriangleSetup> = Vec::new();
+        let mut batch_draws: Vec<OwnedDraw> = Vec::new();
         let mut decoder = FrameDecoder::new(pass_bytes);
 
         loop {
@@ -1549,7 +1607,8 @@ impl Tier2Backend {
                     Ok(cmd) => {
                         state.draws_in_pass = state.draws_in_pass.saturating_add(1);
                         self.dispatch_draw(target_id, &state, cmd,
-                            &mut depth_buffer, &mut stencil_buffer);
+                            &mut depth_buffer, &mut stencil_buffer,
+                            &mut batch_setups, &mut batch_draws);
                     }
                     Err(e) => log::warn!("malformed Draw: {e}"),
                 },
@@ -1558,7 +1617,8 @@ impl Tier2Backend {
                         state.draws_in_pass = state.draws_in_pass.saturating_add(1);
                         self.dispatch_draw_indexed(
                             target_id, &state, cmd,
-                            &mut depth_buffer, &mut stencil_buffer);
+                            &mut depth_buffer, &mut stencil_buffer,
+                            &mut batch_setups, &mut batch_draws);
                     }
                     Err(e) => log::warn!("malformed DrawIndexed: {e}"),
                 },
@@ -1571,12 +1631,22 @@ impl Tier2Backend {
                         // a compute-only command buffer arrives
                         // here through partition's "no Begin/End"
                         // pass slice.
+                        // P1b.2: flush pending triangles first so any
+                        // compute side effects observe their writes.
+                        self.flush_triangle_batch(target_id, &mut batch_setups,
+                            &mut batch_draws, &mut depth_buffer,
+                            &mut stencil_buffer, &state);
                         state.draws_in_pass = state.draws_in_pass.saturating_add(1);
                         self.dispatch_compute(&state, cmd);
                     }
                     Err(e) => log::warn!("malformed Dispatch: {e}"),
                 },
                 FrameOp::EndRenderPass => {
+                    // P1b.2: rasterize the whole pass's triangle
+                    // batch in one dispatch before tearing down.
+                    self.flush_triangle_batch(target_id, &mut batch_setups,
+                        &mut batch_draws, &mut depth_buffer,
+                        &mut stencil_buffer, &state);
                     // Mark this pass's depth attachment as
                     // "needs clear next pass". Vulkan's
                     // default LoadOp is Clear, so the next
@@ -1600,6 +1670,12 @@ impl Tier2Backend {
             }
         }
 
+        // P1b.2: flush any triangles still batched when the pass
+        // body ends without an explicit EndRenderPass in this slice
+        // (partition_renderpasses may hand us a trailing pass).
+        self.flush_triangle_batch(target_id, &mut batch_setups,
+            &mut batch_draws, &mut depth_buffer, &mut stencil_buffer, &state);
+
         // Legacy fallback: pre-D.3 tests bind a Tier-2 pipeline
         // and expect a fullscreen FS fill with no Draw. Preserve
         // that until D.5+ migrates them to real Draw records.
@@ -1615,6 +1691,81 @@ impl Tier2Backend {
         }
     }
 
+    /// P1b.2 — rasterize the whole accumulated render-pass triangle
+    /// batch in a single dispatch, then clear the accumulators.
+    /// Locks the target (+ MRT secondaries) once, resolves the pass
+    /// depth/stencil buffers (same source priority as
+    /// `dispatch_draw`), builds the per-draw `DrawTriangle` views,
+    /// and calls `rasterize_pass`.  No-op (just clears) on an empty
+    /// batch.  Called at `EndRenderPass`, at end-of-pass, and before
+    /// any non-triangle draw / compute dispatch so submission order
+    /// is preserved.
+    fn flush_triangle_batch(
+        &self,
+        target_id: ResourceId,
+        setups: &mut Vec<TriangleSetup>,
+        draws: &mut Vec<OwnedDraw>,
+        depth_buffer: &mut Option<Vec<f32>>,
+        stencil_buffer: &mut Option<Vec<u8>>,
+        state: &PassState,
+    ) {
+        if setups.is_empty() {
+            draws.clear();
+            return;
+        }
+        let mut images = self.images.lock().unwrap();
+        let mut primary = match images.remove(&(target_id.raw() as u64)) {
+            Some(i) => i,
+            None => {
+                log::warn!("flush_triangle_batch target={target_id}: \
+                            target image not registered");
+                setups.clear();
+                draws.clear();
+                return;
+            }
+        };
+        let mut extra_storages: Vec<(u32, ImageStorage)> =
+            state.extra_color_targets.iter()
+                .filter(|&&e| e as u64 != target_id.raw() as u64)
+                .filter_map(|&e| images.remove(&(e as u64)).map(|s| (e, s)))
+                .collect();
+        let width = primary.width;
+        {
+            let pixels = &mut primary.pixels[..];
+            let mut extra_slices: Vec<&mut [u8]> = extra_storages
+                .iter_mut().map(|(_, s)| &mut s.pixels[..]).collect();
+
+            // Depth source priority mirrors dispatch_draw:
+            //   1) persisted depth attachment (BindDepthAttachment)
+            //   2) per-pass scratch buffer
+            //   3) none
+            let mut depth_guard = state.depth_attachment
+                .and_then(|id| self.depth_images.lock().ok().map(|g| (id, g)));
+            let db_ref: Option<&mut [f32]> =
+                if let Some((id, ref mut guard)) = depth_guard {
+                    guard.get_mut(&id).map(|d| &mut d.pixels[..])
+                } else {
+                    depth_buffer.as_deref_mut()
+                };
+            let sb_ref: Option<&mut [u8]> = stencil_buffer.as_deref_mut();
+
+            let dts: Vec<DrawTriangle> =
+                draws.iter().map(|d| d.as_draw_triangle()).collect();
+            let fs_mains: Vec<atrium_spv_loader::FsMain> =
+                draws.iter().map(|d| d.fs_main).collect();
+            self.registry.rasterize_pass(
+                setups, &dts, &fs_mains, width, pixels, db_ref, sb_ref,
+                &mut extra_slices,
+            );
+        }
+        images.insert(target_id.raw() as u64, primary);
+        for (eid, st) in extra_storages {
+            images.insert(eid as u64, st);
+        }
+        setups.clear();
+        draws.clear();
+    }
+
     /// Dispatch a `Draw` against the current pass state. D.4:
     /// looks up the bound pipeline's vertex-input layout, gathers
     /// per-vertex attribute bytes from each bound vertex buffer
@@ -1628,6 +1779,8 @@ impl Tier2Backend {
         cmd: DrawCmd,
         depth_buffer: &mut Option<Vec<f32>>,
         stencil_buffer: &mut Option<Vec<u8>>,
+        batch_setups: &mut Vec<TriangleSetup>,
+        batch_draws: &mut Vec<OwnedDraw>,
     ) {
         if state.tier2_shader.is_none() {
             self.draws_skipped.fetch_add(1, Ordering::Relaxed);
@@ -1724,6 +1877,20 @@ impl Tier2Backend {
                        assembled.vertex_count, n_verts - tri_count * 3);
         }
 
+        // P1b.2 — points / lines take the immediate (non-batched)
+        // fill path below; flush any pending triangle batch first so
+        // their pixels land in submission order relative to the
+        // accumulated triangles.  (Done before the image lock so the
+        // flush's own lock doesn't deadlock.)
+        if matches!(topology,
+            PrimitiveTopology::PointList
+            | PrimitiveTopology::LineList
+            | PrimitiveTopology::LineStrip)
+        {
+            self.flush_triangle_batch(target_id, batch_setups, batch_draws,
+                depth_buffer, stencil_buffer, state);
+        }
+
         // Pre-snapshot bound-texture image data BEFORE the
         // images-lock acquisition below.  We just need stable
         // raw pointers (TexDesc.data) for the sampled textures
@@ -1779,7 +1946,7 @@ impl Tier2Backend {
                 return;
             }
         };
-        let mut extra_storages: Vec<(u32, ImageStorage)> =
+        let extra_storages: Vec<(u32, ImageStorage)> =
             state.extra_color_targets.iter()
                 .filter(|&&e| e as u64 != target_id.raw() as u64)
                 .filter_map(|&e| images.remove(&(e as u64)).map(|s| (e, s)))
@@ -1789,9 +1956,11 @@ impl Tier2Backend {
         // Render block: scopes the `&mut` borrows of primary
         // + extra_storages so they end before re-insertion.
         let render_ok = {
+        // `pixels` feeds the immediate points/lines fill paths
+        // below; triangle draws accumulate into the pass batch and
+        // rasterize at flush time, so MRT secondary slices are
+        // rebuilt there (not here).
         let pixels = &mut primary.pixels[..];
-        let mut extra_slices: Vec<&mut [u8]> = extra_storages
-            .iter_mut().map(|(_, s)| &mut s.pixels[..]).collect();
 
         // D.6: raster state -> per-draw blend + depth.
         let raster = state.raster.unwrap_or_default();
@@ -1811,6 +1980,14 @@ impl Tier2Backend {
         let depth_write   = depth_enabled
             && state.depth_write_enable_override.unwrap_or(static_write);
         let depth_cmp     = state.depth_compare_op_override.unwrap_or(static_cmp);
+        // P1b.2 — effective compare op baked into each triangle's
+        // setup.  When the depth test is DISABLED, force `Always`
+        // (with `depth_write` already false): a single pass-level
+        // depth buffer can then be shared across a batch that mixes
+        // depth-enabled and depth-disabled draws — the disabled
+        // ones read-test-Always (pass) and never write, exactly
+        // matching the old "no depth buffer bound" behaviour.
+        let eff_depth_cmp = if depth_enabled { depth_cmp } else { CompareOp::Always };
         // Depth bounds test: dynamic + static merge.  An app
         // can toggle the enable flag and adjust the range
         // separately, so the effective `(min, max)` comes
@@ -2080,13 +2257,11 @@ impl Tier2Backend {
             mip_desc_arrays = Vec::new();
             uniforms_buf = Vec::new();
         }
-        // CRITICAL: keep tex_descs / sampler_descs / mip_desc_
-        // arrays alive through the loop -- the raw pointers
-        // inside uniforms_buf + tex_descs[i].mip_descs
-        // reference these Vecs' heap allocations.  Named
-        // bindings here, NOT `let _ = ...` (same trap Arc 154's
-        // commit e0dce68 documented for image_descs).
-        let _retain_tex_state = (&tex_descs, &sampler_descs, &mip_desc_arrays);
+        // P1b.2: tex_descs / sampler_descs / mip_desc_arrays (the
+        // heaps the raw pointers in uniforms_buf reference) are now
+        // MOVED into the batch's `OwnedDraw`, which keeps them alive
+        // until the pass flush -- so no separate keep-alive binding
+        // is needed here (and one would block the move).
 
         // Convert the captured `SetViewportCmd` (if any) into
         // the rasterizer's `Viewport` shape.  `None` falls
@@ -2106,6 +2281,12 @@ impl Tier2Backend {
         // == 0 is a no-op draw (the `.max(1)` only guards the
         // legacy callers that left the field unset).
         let instance_count = cmd.instance_count.max(1);
+        // P1b.2 — accumulate every instance's triangle setups into
+        // one batch shared across instances (all share the
+        // fragment-side state in `uniforms_buf` / blend / etc.;
+        // per-instance geometry is baked into the setups at build).
+        let mut all_setups: Vec<TriangleSetup> = Vec::new();
+        let mut fs_main_opt = None;
         'instances: for inst in 0..instance_count {
             let instance_index = cmd.first_instance + inst;
             // Per-instance bindings: rebuild the assembled bytes
@@ -2143,7 +2324,7 @@ impl Tier2Backend {
                 blend_state: raster.blend,
                 viewport: dt_viewport,
                 depth_write,
-                depth_compare_op: depth_cmp,
+                depth_compare_op: eff_depth_cmp,
                 instance_index,
             };
             let db_ref: Option<&mut [f32]> = if !depth_enabled {
@@ -2177,7 +2358,7 @@ impl Tier2Backend {
                 blend_state: raster.blend,
                 viewport: dt_viewport,
                 depth_write,
-                depth_compare_op: depth_cmp,
+                depth_compare_op: eff_depth_cmp,
                 instance_index,
             };
             let db_ref: Option<&mut [f32]> = if !depth_enabled {
@@ -2197,16 +2378,14 @@ impl Tier2Backend {
             }
             continue 'instances;
         }
-        // P1b: build every triangle's setup, then rasterize the
-        // whole draw in ONE pass-level dispatch (per-triangle ->
-        // per-draw rayon).  Per-triangle dt feeds build (carrying
-        // its vertex_attrs + primitive_id); a representative dt
-        // carries the shared per-draw state (blend / uniforms /
-        // derivatives / sample_count) that rasterize_stripe reads,
-        // while per-triangle primitive_id / front_facing /
-        // fs_writes_depth ride inside each setup.
-        let mut all_setups = Vec::new();
-        let mut fs_main_opt = None;
+        // P1b.2: build every triangle's setup and accumulate into
+        // the pass-level batch; the whole render pass rasterizes in
+        // ONE dispatch at flush time.  Per-triangle dt feeds build
+        // (carrying its vertex_attrs + primitive_id); per-triangle
+        // primitive_id / front_facing / depth+stencil / fs_writes_
+        // depth ride inside each setup, while the shared fragment-
+        // side state (blend / uniforms / derivatives / sample_count)
+        // is snapshotted once into the batch's `OwnedDraw`.
         for t in 0..tri_count {
             let (i0, i1, i2) = match topology {
                 PrimitiveTopology::TriangleStrip => if t & 1 == 0 {
@@ -2233,7 +2412,7 @@ impl Tier2Backend {
                 cull_mode: state.cull_mode_override.unwrap_or(raster.cull_mode),
                 front_face: state.front_face_override.unwrap_or(raster.front_face),
                 depth_write,
-                depth_compare_op: depth_cmp,
+                depth_compare_op: eff_depth_cmp,
                 depth_bounds,
                 stencil: stencil_state,
                 depth_bias,
@@ -2258,47 +2437,32 @@ impl Tier2Backend {
                 }
             }
         }
+        }
+        // P1b.2 — snapshot this draw's shared fragment-side state
+        // into the pass batch; all its (instanced) triangle setups
+        // reference it via `draw_idx`.  The whole pass rasterizes in
+        // one dispatch at flush time (`flush_triangle_batch`),
+        // amortizing the stripe-split + rayon fan-out across the
+        // frame instead of paying it per draw.
         if let Some(fs_main) = fs_main_opt {
-            let empty: &[u8] = &[];
-            let rep = DrawTriangle {
-                vertex_attrs: [empty, empty, empty],
-                push_constants: &state.push_constants,
+            let draw_idx = batch_draws.len() as u32;
+            for s in &mut all_setups { s.draw_idx = draw_idx; }
+            batch_draws.push(OwnedDraw {
+                uniforms: uniforms_buf,
+                push_constants: state.push_constants.clone(),
                 blend_state: raster.blend,
-                blend_extra: &state.blend_extra,
-                varying_f32_count,
-                uniforms: &uniforms_buf,
-                viewport: dt_viewport,
-                scissor: dt_scissor,
-                cull_mode: state.cull_mode_override.unwrap_or(raster.cull_mode),
-                front_face: state.front_face_override.unwrap_or(raster.front_face),
-                depth_write,
-                depth_compare_op: depth_cmp,
-                depth_bounds,
-                stencil: stencil_state,
-                depth_bias,
+                blend_extra: state.blend_extra.clone(),
                 compute_implicit_lod: fs_implicit_lod
                     && !state.bound_textures.is_empty()
                     && varying_f32_count >= 2,
-                sample_count,
                 uses_derivatives: fs_derivatives,
-                instance_index,
-                primitive_id: 0,
-                fs_writes_depth,
-                ..Default::default()
-            };
-            let db_ref: Option<&mut [f32]> = if !depth_enabled {
-                None
-            } else if let Some((id, ref mut guard)) = depth_lock {
-                guard.get_mut(&id).map(|d| &mut d.pixels[..])
-            } else {
-                depth_buffer.as_deref_mut()
-            };
-            let sb_ref: Option<&mut [u8]> = stencil_buffer.as_deref_mut();
-            self.registry.rasterize_setups(
-                &all_setups, &rep, fs_main, width, pixels, db_ref, sb_ref,
-                &mut extra_slices,
-            );
-        }
+                sample_count,
+                fs_main,
+                _tex_descs: tex_descs,
+                _sampler_descs: sampler_descs,
+                _mip_desc_arrays: mip_desc_arrays,
+            });
+            batch_setups.append(&mut all_setups);
         }
         true
         }; // end render block -- pixels / extra_slices borrows end here
@@ -3241,6 +3405,8 @@ impl Tier2Backend {
         cmd: DrawIndexedCmd,
         depth_buffer: &mut Option<Vec<f32>>,
         stencil_buffer: &mut Option<Vec<u8>>,
+        batch_setups: &mut Vec<TriangleSetup>,
+        batch_draws: &mut Vec<OwnedDraw>,
     ) {
         if state.tier2_shader.is_none() {
             self.draws_skipped.fetch_add(1, Ordering::Relaxed);
@@ -3348,14 +3514,14 @@ impl Tier2Backend {
         // MRT: same owned-removal pattern as dispatch_draw --
         // see the comment there.
         let mut images = self.images.lock().unwrap();
-        let mut primary = match images.remove(&(target_id.raw() as u64)) {
+        let primary = match images.remove(&(target_id.raw() as u64)) {
             Some(i) => i,
             None => {
                 log::warn!("DrawIndexed target={target_id}: target image not registered");
                 return;
             }
         };
-        let mut extra_storages: Vec<(u32, ImageStorage)> =
+        let extra_storages: Vec<(u32, ImageStorage)> =
             state.extra_color_targets.iter()
                 .filter(|&&e| e as u64 != target_id.raw() as u64)
                 .filter_map(|&e| images.remove(&(e as u64)).map(|s| (e, s)))
@@ -3363,9 +3529,10 @@ impl Tier2Backend {
         let width = primary.width;
         let height = primary.height;
         let render_ok = {
-        let pixels = &mut primary.pixels[..];
-        let mut extra_slices: Vec<&mut [u8]> = extra_storages
-            .iter_mut().map(|(_, s)| &mut s.pixels[..]).collect();
+        // Indexed draws are triangles-only and accumulate into the
+        // pass batch; no pixel/MRT slices are touched here (the
+        // flush rebuilds them).  `primary` is still removed +
+        // reinserted to read width/height under the images lock.
 
         let raster = state.raster.unwrap_or_default();
         // Pipeline-static depth state.
@@ -3384,6 +3551,14 @@ impl Tier2Backend {
         let depth_write   = depth_enabled
             && state.depth_write_enable_override.unwrap_or(static_write);
         let depth_cmp     = state.depth_compare_op_override.unwrap_or(static_cmp);
+        // P1b.2 — effective compare op baked into each triangle's
+        // setup.  When the depth test is DISABLED, force `Always`
+        // (with `depth_write` already false): a single pass-level
+        // depth buffer can then be shared across a batch that mixes
+        // depth-enabled and depth-disabled draws — the disabled
+        // ones read-test-Always (pass) and never write, exactly
+        // matching the old "no depth buffer bound" behaviour.
+        let eff_depth_cmp = if depth_enabled { depth_cmp } else { CompareOp::Always };
         // Depth bounds test: dynamic + static merge.  An app
         // can toggle the enable flag and adjust the range
         // separately, so the effective `(min, max)` comes
@@ -3512,6 +3687,10 @@ impl Tier2Backend {
         // instance, handing each `firstInstance + inst` as
         // gl_InstanceIndex.  Mirrors the non-indexed path.
         let instance_count = cmd.instance_count.max(1);
+        // P1b.2 — accumulate every instance's triangle setups into
+        // one batch shared across instances; flushed pass-wide.
+        let mut all_setups: Vec<TriangleSetup> = Vec::new();
+        let mut fs_main_opt = None;
         'instances: for inst in 0..instance_count {
             let instance_index = cmd.first_instance + inst;
             // Per-instance bindings: re-gather for this instance
@@ -3533,10 +3712,9 @@ impl Tier2Backend {
                 } else {
                     &assembled
                 };
-        // P1b: batch the index list's triangles into one
-        // pass-level rasterize_setups (per-triangle -> per-draw).
-        let mut all_setups = Vec::new();
-        let mut fs_main_opt = None;
+        // P1b.2: batch the index list's triangles into the pass-
+        // level accumulator; the whole pass rasterizes in one
+        // dispatch at flush time.
         for (prim_idx, &(i0, i1, i2)) in triples.iter().enumerate() {
             let v0 = &assembled.bytes[i0*stride .. (i0+1)*stride];
             let v1 = &assembled.bytes[i1*stride .. (i1+1)*stride];
@@ -3552,7 +3730,7 @@ impl Tier2Backend {
                 cull_mode: state.cull_mode_override.unwrap_or(raster.cull_mode),
                 front_face: state.front_face_override.unwrap_or(raster.front_face),
                 depth_write,
-                depth_compare_op: depth_cmp,
+                depth_compare_op: eff_depth_cmp,
                 depth_bounds,
                 stencil: stencil_state,
                 depth_bias,
@@ -3576,41 +3754,32 @@ impl Tier2Backend {
                 }
             }
         }
+        }
+        // P1b.2 — snapshot this indexed draw's shared fragment-side
+        // state into the pass batch.  Indexed draws carry no texture
+        // / UBO uniforms (the dt above leaves `uniforms` defaulted),
+        // so the keep-alive Vecs are empty.
         if let Some(fs_main) = fs_main_opt {
-            let empty: &[u8] = &[];
-            let rep = DrawTriangle {
-                vertex_attrs: [empty, empty, empty],
-                push_constants: &state.push_constants,
+            let draw_idx = batch_draws.len() as u32;
+            for s in &mut all_setups { s.draw_idx = draw_idx; }
+            batch_draws.push(OwnedDraw {
+                uniforms: Vec::new(),
+                push_constants: state.push_constants.clone(),
                 blend_state: raster.blend,
-                blend_extra: &state.blend_extra,
-                varying_f32_count,
-                viewport: dt_viewport,
-                scissor: dt_scissor,
-                cull_mode: state.cull_mode_override.unwrap_or(raster.cull_mode),
-                front_face: state.front_face_override.unwrap_or(raster.front_face),
-                depth_write,
-                depth_compare_op: depth_cmp,
-                depth_bounds,
-                stencil: stencil_state,
-                depth_bias,
+                blend_extra: state.blend_extra.clone(),
                 compute_implicit_lod: fs_implicit_lod
                     && !state.bound_textures.is_empty()
                     && varying_f32_count >= 2,
+                // Indexed draws don't wire a derivatives uniform
+                // table (matches the dt's defaulted uses_derivatives).
+                uses_derivatives: false,
                 sample_count,
-                instance_index,
-                primitive_id: 0,
-                fs_writes_depth,
-                ..Default::default()
-            };
-            let db_ref = if depth_enabled {
-                depth_buffer.as_deref_mut()
-            } else { None };
-            let sb_ref: Option<&mut [u8]> = stencil_buffer.as_deref_mut();
-            self.registry.rasterize_setups(
-                &all_setups, &rep, fs_main, width, pixels, db_ref, sb_ref,
-                &mut extra_slices,
-            );
-        }
+                fs_main,
+                _tex_descs: Vec::new(),
+                _sampler_descs: Vec::new(),
+                _mip_desc_arrays: Vec::new(),
+            });
+            batch_setups.append(&mut all_setups);
         }
         true
         }; // end render block
