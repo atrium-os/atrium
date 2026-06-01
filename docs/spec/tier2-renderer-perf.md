@@ -400,11 +400,53 @@ the optimistic case; textured/glyph shading is ~2–3× heavier.)
       trivial fills the **gather** dominates (P3a already vectorized
       it) and the FS body is nearly free, so P3b adds little there —
       it's the lever for app shaders with real per-pixel math.
-- **P4 — Compositor fast paths + integration.** Opaque/occlusion/
-  damage; feature parity for `HeadlessRenderer` (indirect draw +
-  whatever compute it issues); point `fresco-vulkan`'s ICD at
-  `atrium-vk-icd` so the compositor runs on Tier-2. Apps are already
-  bridged.
+- **P4 — Compositor fast paths + integration.** Point
+  `fresco-vulkan`'s ICD at `atrium-vk-icd` so the compositor runs on
+  Tier-2.
+  - **Scout (done).** `HeadlessRenderer`
+    (`fresco-vulkan/src/headless.rs`) is `ash`-based and **fully
+    redirectable with zero code changes** — `ash::Entry::load()` →
+    the Vulkan loader respects `VK_DRIVER_FILES`; instance creation
+    is loose, device picked by type preference (atrium-vk-icd shows
+    up as a device and gets chosen).  It's **headless** (no
+    swapchain/WSI).  Its per-frame flow per scene-op:
+    `vkCmdDispatch` (a **compute** kernel that culls/builds instances
+    into a storage buffer + an atomic counter) → render pass →
+    instanced `vkCmdDraw(4, N)` where the **VS reads per-instance
+    data from that storage buffer** indexed by `gl_InstanceIndex` →
+    `vkCmdCopyImageToBuffer` readback.  Uses descriptor sets
+    (storage + uniform buffers, samplers), render passes (LOAD_OP_
+    CLEAR, BGRA8_SRGB), pipeline barriers, fill_buffer.  **Does NOT
+    use**: indirect draw, push constants, dynamic rendering, WSI.
+  - **Build constraint.** `frescod` (the full daemon) is FreeBSD-only
+    (`atrium-devevents`), so the *full* compositor end-to-end runs in
+    the VM.  But `fresco-vulkan` alone builds on macOS (ash +
+    fresco-bundle, no devevents) — so the **macOS-tractable test** is
+    a small `fresco-vulkan` harness: `HeadlessRenderer::new` + a few
+    `SceneNode` rects via `set_rect_nodes` + `render_to_buffer` +
+    readback, run with `VK_DRIVER_FILES=<atrium-icd manifest>` +
+    `ATRIUM_VK_ICD_SOCKET=<daemon>` against the tier2 daemon.
+  - **Likely parity gaps to triage (the real P4 work):** (1) the
+    HeadlessRenderer **compute shaders** must compile on tier2
+    (bespoke/cranelift) — they use storage buffers + atomics (tier2
+    has these via `dispatch_compute`/`AtomicIAdd`, but the specific
+    shaders may hit unsupported ops → cranelift fallback or fail);
+    (2) **descriptor-set-bound storage buffers** for both compute +
+    graphics (the ICD's bound-buffer model vs vkUpdateDescriptorSets
+    — UBO rungs work, storage-to-graphics-VS is unproven); (3) the
+    **VS reading a storage buffer by `gl_InstanceIndex`**
+    ((Vertex, StorageBuffer) storage-class mapping — instancing rungs
+    use vertex attrs, not SSBO reads).  Triage = run the harness, fix
+    each gap in tier2/atrium-vk-icd.
+  - **Alternative native path (already exists).** `frescod-aqueduct`
+    / `frescod-aqueduct-smoke` drive the aqueduct-gpu stack
+    **directly** (no Vulkan ICD), and `atrium-tier2-fresco-bridge`
+    uploads per-app frames as Fresco texture slots — a route to
+    compositor-on-tier2 that skips the Vulkan→ICD→socket indirection.
+    P4 (ICD redirect) is the route that also runs unmodified *Vulkan
+    apps* on tier2; the native path is the lower-overhead compositor-
+    only route.  Worth weighing which to invest in.
+  - Then: compositor fast paths (opaque / occlusion / damage).
 - **PT — Partial-update transport (in-app sub-rect damage).** Add
   `slot_update_region` / CAS patch + present damage rect to the
   Fresco protocol + bridge + compositor, so a small in-app dirty
