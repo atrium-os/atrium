@@ -758,7 +758,7 @@ impl Tier2Registry {
         // submission order (preserves blend/depth-equal ordering).
         tasks.par_iter_mut().for_each(|task| {
             for setup in setups {
-                rasterize_stripe(task, setup, draw, fs_main);
+                rasterize_stripe(task, setup, draw, fs_main, None);
             }
         });
     }
@@ -788,6 +788,7 @@ impl Tier2Registry {
         setups: &[TriangleSetup],
         draws: &[DrawTriangle<'_>],
         fs_mains: &[atrium_spv_loader::FsMain],
+        fs_spans: &[Option<atrium_spv_loader::FsSpanMain>],
         width: u32,
         pixels: &mut [u8],
         mut depth_buffer: Option<&mut [f32]>,
@@ -845,7 +846,7 @@ impl Tier2Registry {
         tasks.par_iter_mut().for_each(|task| {
             for setup in setups {
                 let di = setup.draw_idx as usize;
-                rasterize_stripe(task, setup, &draws[di], fs_mains[di]);
+                rasterize_stripe(task, setup, &draws[di], fs_mains[di], fs_spans[di]);
             }
         });
     }
@@ -1521,14 +1522,61 @@ struct StripeWork<'p, 'd> {
 /// the bespoke-compute work since both need the bespoke
 /// backend's instruction scheduler to grow new patterns,
 /// and doing them together avoids two ABI-break rebuilds.
+/// P2.3 opt-in for the batched-span fast path (read once).  Off by
+/// default: the current call-per-lane bespoke thunk is a measured
+/// regression (see `bench_fs_span`); flip `ATRIUM_TIER2_SPAN=1` to
+/// A/B it or once the inlined-body thunk lands.
+fn span_path_enabled() -> bool {
+    use std::sync::OnceLock;
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(||
+        std::env::var("ATRIUM_TIER2_SPAN").map(|v| v == "1").unwrap_or(false))
+}
+
 fn rasterize_stripe(
     task: &mut StripeWork<'_, '_>,
     setup: &TriangleSetup,
     draw: &DrawTriangle<'_>,
     fs_main: atrium_spv_loader::FsMain,
+    fs_span: Option<atrium_spv_loader::FsSpanMain>,
 ) {
     let tile_y = task.stripe_y;
     let stripe_pixel_y = tile_y * TILE_SIZE;
+
+    // P2.3 — span fast path: shade a tile-row's covered pixels in
+    // one `fs_span` call instead of one `fs_main` call per pixel.
+    // Gated to the simple opaque case the batched ABI supports
+    // today: a span entry exists, single-sample, no stencil, no
+    // late-depth, no implicit-LOD / derivatives quad dependency, no
+    // MRT (single colour attachment), source-replace blend, and no
+    // depth-buffer effect (compare Always + no write — e.g. the
+    // depth-disabled draws P1b.2 normalises to that).  Everything
+    // else falls through to the per-pixel path below, byte-for-byte
+    // unchanged.
+    //
+    // OFF by default: the bespoke span thunk is *call-per-lane*
+    // (BL fs_main per lane), which `bench_fs_span` measured ~17%
+    // SLOWER than the per-pixel path at 4K — the per-lane bl +
+    // fs_main prologue + the SoA gather/scatter exceed the
+    // amortized FFI-crossing saving.  The path is correct + fully
+    // wired; it becomes a win once the bespoke thunk is upgraded to
+    // an inlined-body lane loop (FS prologue/body once per span).
+    // `ATRIUM_TIER2_SPAN=1` opts in for A/B + future bring-up.
+    let span_ok = span_path_enabled()
+        && fs_span.is_some()
+        && draw.sample_count == 1
+        && setup.stencil_face.is_none()
+        && !setup.fs_writes_depth
+        && !draw.compute_implicit_lod
+        && !draw.uses_derivatives
+        && task.extra_color.is_empty()
+        && !draw.blend_state.enable
+        && setup.depth_compare_op == CompareOp::Always
+        && !setup.depth_write;
+    if span_ok {
+        rasterize_stripe_span(task, setup, draw, fs_span.unwrap());
+        return;
+    }
 
     // Reconstruct uniform / push-constant raw pointers
     // inside the task.  Storing them in `TriangleSetup`
@@ -2005,6 +2053,117 @@ fn rasterize_stripe(
                     if am.b { target[idx + 2] = f32_to_u8(final_color[2]); }
                     if am.a { target[idx + 3] = f32_to_u8(final_color[3]); }
                 }
+            }
+        }
+    }
+}
+
+/// P2.3 — span fast path: shade each tile-row's covered pixels in a
+/// single `fs_span` call.  Only reached from `rasterize_stripe`'s
+/// `span_ok` gate (simple opaque draw: single-sample, no stencil /
+/// late-depth / implicit-LOD / derivatives / MRT, source-replace
+/// blend, no depth-buffer effect).  Coverage, perspective-correct
+/// varying interpolation, `gl_FragCoord` and the colour
+/// quantisation match `rasterize_stripe` exactly, so output is
+/// byte-identical; only the per-pixel `fs_main` call is replaced by
+/// one batched `fs_span` per tile-row run (≤ TILE_SIZE lanes).
+fn rasterize_stripe_span(
+    task: &mut StripeWork<'_, '_>,
+    setup: &TriangleSetup,
+    draw: &DrawTriangle<'_>,
+    fs_span: atrium_spv_loader::FsSpanMain,
+) {
+    const MAXL: usize = TILE_SIZE as usize;
+    let tile_y = task.stripe_y;
+    let stripe_pixel_y = tile_y * TILE_SIZE;
+    let uni_ptr = if draw.uniforms.is_empty() {
+        std::ptr::null()
+    } else { draw.uniforms.as_ptr() };
+    let pc_ptr = if draw.push_constants.is_empty() {
+        std::ptr::null()
+    } else { draw.push_constants.as_ptr() };
+    let (a, b, c) = (setup.a, setup.b, setup.c);
+    let vb = setup.varying_bytes;
+    let wm = draw.blend_state.write_mask;
+
+    let mut fx = [0f32; MAXL];
+    let mut fy = [0f32; MAXL];
+    let mut fz = [0f32; MAXL];
+    let mut fw = [0f32; MAXL];
+    let mut out_color = [0f32; MAXL * 4];
+    let mut out_depth = [0f32; MAXL];
+    let mut varyings_soa = vec![0u8; MAXL * vb.max(1)];
+
+    for tile_x in setup.tile_min_x..=setup.tile_max_x {
+        let t_min_x = (tile_x * TILE_SIZE).max(setup.min_x);
+        let t_max_x = ((tile_x + 1) * TILE_SIZE - 1).min(setup.max_x);
+        let t_min_y = (tile_y * TILE_SIZE).max(setup.min_y);
+        let t_max_y = ((tile_y + 1) * TILE_SIZE - 1).min(setup.max_y);
+        if t_min_x > t_max_x || t_min_y > t_max_y { continue; }
+        let lanes = (t_max_x - t_min_x + 1) as usize;
+
+        for py in t_min_y..=t_max_y {
+            let cy = py as f32 + 0.5;
+            let mut mask: u64 = 0;
+            for lane in 0..lanes {
+                let px = t_min_x + lane as i32;
+                let cx = px as f32 + 0.5;
+                let we0 = edge_fn(b, c, (cx, cy));
+                let we1 = edge_fn(c, a, (cx, cy));
+                let we2 = edge_fn(a, b, (cx, cy));
+                let inside = (we0 >= 0.0 && we1 >= 0.0 && we2 >= 0.0)
+                          || (we0 <= 0.0 && we1 <= 0.0 && we2 <= 0.0);
+                if !inside { continue; }
+                let b0 = we0 / setup.total_edge;
+                let b1 = we1 / setup.total_edge;
+                let b2 = we2 / setup.total_edge;
+                let interp_inv_w = b0 * setup.inv_w[0]
+                    + b1 * setup.inv_w[1] + b2 * setup.inv_w[2];
+                let oiw = if interp_inv_w == 0.0 { 0.0 } else { 1.0 / interp_inv_w };
+                for k in 0..setup.n {
+                    let sow = b0 * setup.varying_over_w[0][k]
+                        + b1 * setup.varying_over_w[1][k]
+                        + b2 * setup.varying_over_w[2][k];
+                    let v = sow * oiw;
+                    let off = lane * vb + k * 4;
+                    varyings_soa[off..off + 4].copy_from_slice(&v.to_le_bytes());
+                }
+                let interp_z = b0 * setup.ndc[0][2]
+                    + b1 * setup.ndc[1][2] + b2 * setup.ndc[2][2];
+                let window_z = setup.depth_min
+                    + interp_z * (setup.depth_max - setup.depth_min)
+                    + setup.depth_bias_offset;
+                fx[lane] = cx; fy[lane] = cy; fz[lane] = window_z; fw[lane] = oiw;
+                mask |= 1u64 << lane;
+            }
+            if mask == 0 { continue; }
+            let varyings_ptr = if setup.n == 0 {
+                std::ptr::null()
+            } else { varyings_soa.as_ptr() };
+            // SAFETY: fs_span is the dlopened span entry whose
+            // signature matches FsSpanMain; the SoA buffers are
+            // sized for `lanes` (≤ TILE_SIZE); each lane writes a
+            // disjoint out_color slot.
+            unsafe {
+                fs_span(
+                    varyings_ptr, vb as u32, uni_ptr, pc_ptr,
+                    fx.as_ptr(), fy.as_ptr(), fz.as_ptr(), fw.as_ptr(),
+                    mask, 0,
+                    out_color.as_mut_ptr(), out_depth.as_mut_ptr(),
+                    setup.front_facing as u32, setup.primitive_id,
+                    lanes as u32,
+                );
+            }
+            let py_local = (py - stripe_pixel_y) as usize;
+            for lane in 0..lanes {
+                if (mask >> lane) & 1 == 0 { continue; }
+                let px = (t_min_x + lane as i32) as usize;
+                let idx = (py_local * (setup.width as usize) + px) * 4;
+                if idx + 4 > task.pixels.len() { continue; }
+                if wm.r { task.pixels[idx]     = f32_to_u8(out_color[lane * 4]); }
+                if wm.g { task.pixels[idx + 1] = f32_to_u8(out_color[lane * 4 + 1]); }
+                if wm.b { task.pixels[idx + 2] = f32_to_u8(out_color[lane * 4 + 2]); }
+                if wm.a { task.pixels[idx + 3] = f32_to_u8(out_color[lane * 4 + 3]); }
             }
         }
     }

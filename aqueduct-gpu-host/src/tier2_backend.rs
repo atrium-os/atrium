@@ -57,6 +57,9 @@ struct OwnedDraw {
     uses_derivatives: bool,
     sample_count: u32,
     fs_main: atrium_spv_loader::FsMain,
+    /// P2.3: batched span fragment entry, when the backend emitted
+    /// one for this shader (`None` keeps the per-pixel path).
+    fs_span: Option<atrium_spv_loader::FsSpanMain>,
     _tex_descs: Vec<atrium_spv_runtime::TexDesc>,
     _sampler_descs: Vec<atrium_spv_runtime::SamplerDesc>,
     _mip_desc_arrays: Vec<Vec<atrium_spv_runtime::TexDesc>>,
@@ -1753,8 +1756,10 @@ impl Tier2Backend {
                 draws.iter().map(|d| d.as_draw_triangle()).collect();
             let fs_mains: Vec<atrium_spv_loader::FsMain> =
                 draws.iter().map(|d| d.fs_main).collect();
+            let fs_spans: Vec<Option<atrium_spv_loader::FsSpanMain>> =
+                draws.iter().map(|d| d.fs_span).collect();
             self.registry.rasterize_pass(
-                setups, &dts, &fs_mains, width, pixels, db_ref, sb_ref,
+                setups, &dts, &fs_mains, &fs_spans, width, pixels, db_ref, sb_ref,
                 &mut extra_slices,
             );
         }
@@ -2458,6 +2463,8 @@ impl Tier2Backend {
                 uses_derivatives: fs_derivatives,
                 sample_count,
                 fs_main,
+                fs_span: self.registry.get(fs_shader_id)
+                    .and_then(|s| s.entry_points.fs_span_main),
                 _tex_descs: tex_descs,
                 _sampler_descs: sampler_descs,
                 _mip_desc_arrays: mip_desc_arrays,
@@ -3775,6 +3782,8 @@ impl Tier2Backend {
                 uses_derivatives: false,
                 sample_count,
                 fs_main,
+                fs_span: self.registry.get(fs_shader_id)
+                    .and_then(|s| s.entry_points.fs_span_main),
                 _tex_descs: Vec::new(),
                 _sampler_descs: Vec::new(),
                 _mip_desc_arrays: Vec::new(),
