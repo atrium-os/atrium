@@ -103,6 +103,12 @@ fn translate_one(
     let mut id_map: HashMap<Word, Value> = HashMap::new();
     let mut next_value_id: u32 = 0;
     let mut blocks: HashMap<BlockId, Block> = HashMap::new();
+    // SPIR-V id → pointee SPIR-V type id for every pointer
+    // produced by an OpAccessChain.  Lets a *chained*
+    // AccessChain (base = a prior AccessChain result, e.g.
+    // `instances[slot].member`) recover where its base points
+    // so it can keep walking struct members.
+    let mut ptr_pointee: HashMap<Word, Word> = HashMap::new();
 
     let mut label_to_block_id: HashMap<Word, BlockId> = HashMap::new();
     for (i, spv_block) in spv.blocks.iter().enumerate() {
@@ -196,6 +202,7 @@ fn translate_one(
                 &mut id_map,
                 &mut next_value_id,
                 &mut insts,
+                &mut ptr_pointee,
                 source_offset,
             )?;
             spv_inst_index += 1;
@@ -295,6 +302,7 @@ fn translate_inst_with_cfg(
     id_map: &mut HashMap<Word, Value>,
     next_value_id: &mut u32,
     insts: &mut Vec<Inst>,
+    ptr_pointee: &mut HashMap<Word, Word>,
     source_spirv_offset: u32,
 ) -> Result<(), FrontendError> {
     match spv_inst.class.opcode {
@@ -386,7 +394,7 @@ fn translate_inst_with_cfg(
         }
         _ => translate_inst(
             spv_inst, types, constants, iface, label_to_block_id,
-            id_map, next_value_id, insts, source_spirv_offset,
+            id_map, next_value_id, insts, ptr_pointee, source_spirv_offset,
         ),
     }
 }
@@ -408,6 +416,7 @@ fn translate_inst(
     id_map: &mut HashMap<Word, Value>,
     next_value_id: &mut u32,
     insts: &mut Vec<Inst>,
+    ptr_pointee: &mut HashMap<Word, Word>,
     source_spirv_offset: u32,
 ) -> Result<(), FrontendError> {
 
@@ -1969,21 +1978,46 @@ fn translate_inst(
             let result_ty = types.get(result_type_id)?.clone();
 
             let base_id = expect_id(&spv_inst.operands, 0)?;
-            let base = resolve_variable(
-                base_id, types, iface, id_map, next_value_id,
-            )?.ok_or_else(|| FrontendError::Unsupported(format!(
-                "AccessChain base id {base_id} is not a Variable",
-            )))?;
-
-            // Recover the variable's pointee type id from
-            // iface.variables so we can walk struct members
-            // for offset resolution.
-            let (_storage, mut current_pointee_id) = iface.variables
-                .get(&base_id)
-                .copied()
-                .ok_or_else(|| FrontendError::Malformed(format!(
-                    "AccessChain base var {base_id} not in iface.variables",
+            // Two base shapes:
+            //   (1) a Variable — pointee comes from
+            //       iface.variables.
+            //   (2) a *chained* AccessChain result — base is
+            //       a prior pointer Value whose pointee type
+            //       we recorded in `ptr_pointee`.  This is the
+            //       `instances[slot].member` shape: the first
+            //       AccessChain lands on the struct element
+            //       (dynamic step), the second steps into a
+            //       member of that struct.
+            // Discriminate on iface.variables membership, NOT
+            // on resolve_variable's Option: the result-id
+            // pre-pass seeds id_map for *every* SSA result, so
+            // resolve_variable returns Some for a chained
+            // AccessChain result too.  Only true OpVariables
+            // appear in iface.variables.
+            let (base, mut current_pointee_id) = if let Some((_storage, pointee)) =
+                iface.variables.get(&base_id).copied()
+            {
+                let var_value = resolve_variable(
+                    base_id, types, iface, id_map, next_value_id,
+                )?.ok_or_else(|| FrontendError::Malformed(format!(
+                    "AccessChain base var {base_id} not resolvable",
                 )))?;
+                (var_value, pointee)
+            } else {
+                // Chained AccessChain: base is a prior pointer
+                // Value (e.g. `instances[slot].member`).
+                let pointee = ptr_pointee.get(&base_id).copied()
+                    .ok_or_else(|| FrontendError::Unsupported(format!(
+                        "AccessChain base id {base_id} is neither a \
+                         Variable nor a tracked pointer (unsupported \
+                         chained access pattern)",
+                    )))?;
+                let base_value = resolve_value(
+                    base_id, types, constants, id_map,
+                    next_value_id, insts, source_spirv_offset,
+                )?;
+                (base_value, pointee)
+            };
 
             // Captured dynamic step (if any).  Today we
             // support exactly ONE non-constant index, and it
@@ -2028,17 +2062,25 @@ fn translate_inst(
                              (opcode {other:?}) not supported",
                         ))),
                     };
-                    let stride = crate::interface::ir_type_size_bytes_for(
-                        &types.types, elem_type_id);
+                    // Prefer the array's ArrayStride decoration
+                    // (authoritative std430 step, includes
+                    // trailing padding and covers aggregate
+                    // elements); fall back to the element's
+                    // packed leaf size for un-decorated arrays.
+                    let stride = types.array_stride(current_pointee_id)
+                        .unwrap_or_else(|| crate::interface::ir_type_size_bytes_for(
+                            &types.types, elem_type_id));
                     if stride == 0 {
                         return Err(FrontendError::Unsupported(format!(
                             "dynamic AccessChain element type {elem_type_id} \
-                             has no IR size (struct/aggregate elements not \
-                             supported yet)",
+                             has no IR size and no ArrayStride decoration",
                         )));
                     }
                     dynamic_step = Some((idx_id, stride));
-                    let _ = elem_type_id; // pointee no longer needed; break exits loop
+                    // The chain now points at the array element;
+                    // record it so a chained AccessChain into a
+                    // struct element can keep walking members.
+                    current_pointee_id = elem_type_id;
                     break;
                 }
                 let idx_const = idx_const_opt.ok_or_else(||
@@ -2080,8 +2122,9 @@ fn translate_inst(
                                     "Array type missing element id: {other:?}",
                                 ))),
                             };
-                            let stride = crate::interface::ir_type_size_bytes_for(
-                                &types.types, elem_type_id);
+                            let stride = types.array_stride(current_pointee_id)
+                                .unwrap_or_else(|| crate::interface::ir_type_size_bytes_for(
+                                    &types.types, elem_type_id));
                             if stride == 0 {
                                 return Err(FrontendError::Unsupported(format!(
                                     "constant AccessChain into Array of \
@@ -2142,6 +2185,9 @@ fn translate_inst(
                     source_spirv_offset,
                 });
             }
+            // Record where this pointer lands so a chained
+            // AccessChain (`base = result_id`) can keep walking.
+            ptr_pointee.insert(result_id, current_pointee_id);
             Ok(())
         }
 

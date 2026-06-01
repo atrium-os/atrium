@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use atrium_spv_ir::{ImageDimensionality, StorageClass, Type, VecElement};
 use rspirv::dr::{Instruction, Module, Operand};
-use rspirv::spirv::{Op, StorageClass as SpvStorageClass, Word};
+use rspirv::spirv::{Decoration, Op, StorageClass as SpvStorageClass, Word};
 
 use crate::error::FrontendError;
 
@@ -24,6 +24,13 @@ pub struct TypeContext {
     /// pointer pointee types, etc., without re-walking the
     /// module.
     pub(crate) raw: HashMap<Word, Instruction>,
+    /// `ArrayStride` decoration for each `OpTypeArray` /
+    /// `OpTypeRuntimeArray` id.  This is the std430/std140
+    /// element stride (including trailing padding) and is the
+    /// authoritative byte step for a dynamic AccessChain into
+    /// an array — notably for aggregate (struct) elements
+    /// whose packed leaf size doesn't capture layout padding.
+    pub(crate) array_strides: HashMap<Word, u32>,
 }
 
 impl TypeContext {
@@ -56,7 +63,31 @@ impl TypeContext {
                 _ => {}
             }
         }
+
+        // Record ArrayStride decorations (on array type ids).
+        for inst in &module.annotations {
+            if inst.class.opcode != Op::Decorate { continue; }
+            let target = match inst.operands.first() {
+                Some(Operand::IdRef(id)) => *id,
+                _ => continue,
+            };
+            let kind = match inst.operands.get(1) {
+                Some(Operand::Decoration(d)) => *d,
+                _ => continue,
+            };
+            if kind != Decoration::ArrayStride { continue; }
+            if let Some(Operand::LiteralBit32(stride)) = inst.operands.get(2) {
+                ctx.array_strides.insert(target, *stride);
+            }
+        }
         Ok(ctx)
+    }
+
+    /// The `ArrayStride` decoration for an array type id, if
+    /// present.  Authoritative element step for dynamic
+    /// AccessChain address arithmetic.
+    pub(crate) fn array_stride(&self, id: Word) -> Option<u32> {
+        self.array_strides.get(&id).copied()
     }
 
     /// Look up a type by SPIR-V id.

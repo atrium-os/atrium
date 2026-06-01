@@ -1761,6 +1761,31 @@ impl FnTranslator {
                 // Cranelift IR (single `bitcast` opcode).
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal("Bitcast without result".into()))?;
+                // Map an IR (vector) element to its lane clif type.
+                let lane_clif = |elem: &atrium_spv_ir::VecElement| {
+                    use atrium_spv_ir::VecElement as VE;
+                    match elem {
+                        VE::F32 => clif_types::F32,
+                        _ => clif_types::I32, // I32/U32/bool-as-i32
+                    }
+                };
+                // Vector bitcast (e.g. uvec4 <-> vec4): reinterpret
+                // each 32-bit lane independently.
+                let vec_to = match target_ty {
+                    Type::Vec2(e) | Type::Vec3(e) | Type::Vec4(e) =>
+                        Some(lane_clif(e)),
+                    _ => None,
+                };
+                if let Some(to) = vec_to {
+                    let lanes = self.vectors.get(&a.id).cloned().ok_or_else(||
+                        BackendError::Internal(format!(
+                            "Bitcast vector operand {:?} not in vectors", a.id)))?;
+                    let out: Vec<ClifValue> = lanes.into_iter()
+                        .map(|lv| builder.ins().bitcast(to, MemFlags::new(), lv))
+                        .collect();
+                    self.vectors.insert(result.id, out);
+                    return Ok(());
+                }
                 let av = self.scalars.get(&a.id).copied().ok_or_else(||
                     BackendError::Internal(format!(
                         "Bitcast operand {:?} not in scalars", a.id)))?;
