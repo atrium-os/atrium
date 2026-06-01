@@ -123,6 +123,10 @@ pub(crate) fn map_blob(blob: &ShaderBlob)
             fs_main: blob.entries.fs.map(|o| {
                 std::mem::transmute::<*mut u8, FsMain>(base.add(o as usize))
             }),
+            // Bespoke .afblob does not emit a span entry (P2 span
+            // codegen is cranelift-only); per-pixel fs_main is the
+            // fallback path here.
+            fs_span_main: None,
             cs_main: blob.entries.cs.map(|o| {
                 std::mem::transmute::<*mut u8, CsMain>(base.add(o as usize))
             }),

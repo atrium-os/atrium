@@ -95,6 +95,10 @@ pub struct ShaderEntryPoints {
     pub vs_main: Option<VsMain>,
     /// `atrium_fs_main` for fragment shaders.
     pub fs_main: Option<FsMain>,
+    /// `atrium_fs_main_span` — optional span (batched) fragment
+    /// entry (P2).  `Some` only when the backend emitted it; the
+    /// rasterizer falls back to `fs_main` when `None`.
+    pub fs_span_main: Option<FsSpanMain>,
     /// `atrium_cs_main` for compute shaders.
     pub cs_main: Option<CsMain>,
 }
@@ -132,6 +136,35 @@ pub type FsMain = unsafe extern "C" fn(
     // gl_PrimitiveID: 0-based index of the primitive within the
     // draw.  Trailing param (index 11).
     primitive_id:   u32,
+);
+
+/// Span fragment-shader entry (P2 — batched fragment execution).
+///
+/// Shades a run of up to `lane_count` pixels in ONE call, removing
+/// the per-pixel indirect-call + per-pixel marshalling overhead.
+/// Inputs/outputs are structure-of-arrays indexed by lane; a
+/// `coverage_mask` bit selects which lanes are shaded (others are
+/// left untouched in the output arrays).  Semantically each shaded
+/// lane is identical to one `FsMain` call with the same inputs —
+/// the span entry is a pure call-overhead optimization, never a
+/// behaviour change.  Emitted opportunistically by backends that
+/// support it (cranelift); `None` falls back to per-pixel `FsMain`.
+pub type FsSpanMain = unsafe extern "C" fn(
+    in_varyings_soa: *const u8,   // lane i varyings at +i*varying_stride
+    varying_stride:  u32,
+    uniforms:        *const u8,
+    push_constants:  *const u8,
+    frag_coord_x:    *const f32,  // [lane_count]
+    frag_coord_y:    *const f32,
+    frag_coord_z:    *const f32,
+    frag_coord_w:    *const f32,
+    coverage_mask:   u64,         // bit i = lane i shaded
+    samples_mask:    u32,         // shared across the span
+    out_color_soa:   *mut f32,    // lane i colour at +i*4 f32
+    out_depth:       *mut f32,    // [lane_count]
+    front_facing:    u32,         // shared per triangle
+    primitive_id:    u32,         // shared per triangle
+    lane_count:      u32,
 );
 
 /// Compute-shader entry. Signature per spec §4.1.
@@ -192,6 +225,9 @@ pub(crate) fn open(
     let fs_main: Option<FsMain> = unsafe {
         library.get::<FsMain>(b"atrium_fs_main").ok().map(|s| *s)
     };
+    let fs_span_main: Option<FsSpanMain> = unsafe {
+        library.get::<FsSpanMain>(b"atrium_fs_main_span").ok().map(|s| *s)
+    };
     let cs_main: Option<CsMain> = unsafe {
         library.get::<CsMain>(b"atrium_cs_main").ok().map(|s| *s)
     };
@@ -211,7 +247,7 @@ pub(crate) fn open(
         .transpose()?;
 
     Ok(LoadedShader::new(
-        ShaderEntryPoints { vs_main, fs_main, cs_main },
+        ShaderEntryPoints { vs_main, fs_main, fs_span_main, cs_main },
         pcmap,
         CodeBacking::Dlopen(library),
     ))

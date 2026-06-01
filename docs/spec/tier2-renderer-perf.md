@@ -156,8 +156,71 @@ the optimistic case; textured/glyph shading is ~2–3× heavier.)
       model for the compositor case, no SIMD yet** — P2/P3 are
       headroom to close the gap to the tiny-skia SIMD-blitter
       reference (~2.5 ms) for texture/blend-heavy frames.
-- **P2 — Batched fragment execution.** Remove the per-pixel call
-  (#2): span/quad FS ABI with SoA inputs + mask.
+- **P2 — Batched fragment execution.** Remove the per-pixel FS
+  call.  Today `rasterize_stripe` makes one indirect call to
+  `fs_main` *per covered pixel* (8.3M calls/frame at 4K full-screen);
+  each call re-marshals pointers and the runtime sets up
+  gl_FragCoord / descriptors per pixel.  P2 introduces a **span FS
+  ABI** that shades a run of pixels in one call, with SoA inputs +
+  a coverage mask.  Design + sub-phases:
+
+  - **Span ABI (`FsSpanMain`).** New entry alongside `fs_main`
+    (never replaces it — the per-pixel path stays as the universal
+    fallback):
+    ```
+    fn fs_span(
+      in_varyings_soa: *const u8,  // lane i at +i*varying_stride
+      varying_stride:  u32,
+      uniforms:        *const u8,
+      push_constants:  *const u8,
+      frag_x: *const f32, frag_y: *const f32,   // [lanes]
+      frag_z: *const f32, frag_w: *const f32,   // [lanes]
+      coverage_mask:   u64,        // bit i = lane i shaded
+      samples_mask:    u32,        // shared (per-lane MSAA deferred)
+      out_color_soa:   *mut f32,   // lane i colour at +i*4 f32
+      out_depth:       *mut f32,   // [lanes]
+      front_facing:    u32,        // shared per triangle
+      primitive_id:    u32,        // shared per triangle
+      lane_count:      u32,
+    );
+    ```
+    Span = a contiguous horizontal run of covered pixels within one
+    tile row (natural fit for the existing per-row pixel walk; lane
+    count tunable, e.g. 8/16).
+  - **P2.1 — ABI + loader.** Add `FsSpanMain` to `atrium-spv-loader`
+    and an optional `fs_span_main` to `ShaderEntryPoints` (symbol
+    `atrium_fs_main_span`, resolved if present, else `None`).  No
+    behaviour change; everything still runs the per-pixel path.
+  - **P2.2 — cranelift span codegen.** Emit `atrium_fs_main_span` by
+    wrapping the *existing* SPIR-V body codegen in a
+    `for lane in 0..lane_count { if mask>>lane & 1 { <body> } }`
+    loop, with the param-mapping made lane-relative: varyings base
+    = `params[0] + lane*stride`, out_color = `out_color_soa +
+    lane*16`, out_depth = `&out_depth[lane]`, gl_FragCoord =
+    `frag_{x,y,z,w}[lane]` (loaded per lane instead of scalar
+    params), uniforms / push-constants / front_facing / primitive_id
+    shared.  `emit_inst` (the body) is unchanged — only entry /
+    builtin / I/O plumbing differs.  Bespoke keeps emitting only the
+    scalar `fs_main` (complex-FS fallback); the daemon uses whichever
+    `fs_span` exists, else per-pixel.  This is also the lane-indexed
+    entry infrastructure **P3b** reuses (swap scalar lane ops for
+    SIMD lanes).
+  - **P2.3 — rasterizer span path.** In `rasterize_stripe`, for the
+    per-row pixel walk, accumulate a run of covered pixels: gather
+    SoA varyings (perspective-correct interp per lane), frag coords,
+    and the coverage mask; call `fs_span` once; then run the
+    existing per-lane depth/stencil/blend/write scatter.  Gate on
+    `fs_span.is_some()` AND the fast-path conditions (no per-pixel
+    derivatives quad dependency, no implicit-LOD per-pixel descriptor
+    rewrite); else fall back to the per-pixel call.  Must be
+    byte-identical to the scalar path for every rung.
+  - **P2.4 — validate + measure.** Full smoke MM..HHH + 106
+    differential green; extend `bench_tier2_passbatch` /
+    `bench_tier2_tiled` to report per-pixel vs span ms.
+  - **Correctness invariant:** `fs_span` over a mask of one lane must
+    produce bit-identical output to `fs_main` for the same inputs;
+    the span path is purely a call-overhead optimization, not a
+    semantic change.
 - **P3 — vectorization (#3), split two ways:**
   - **P3a — SIMD the rasterizer's fixed-function loops (Rust).**
     Coverage + blend + write + texture sample in hand-written Rust
