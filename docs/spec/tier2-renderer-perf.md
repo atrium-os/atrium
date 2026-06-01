@@ -470,6 +470,27 @@ the optimistic case; textured/glyph shading is ~2–3× heavier.)
     mapping); (4) **descriptor-set-bound storage buffers** for
     compute + graphics.  Each is concrete, pinpointed from the
     daemon's opcode wire-trace.
+  - **Level-2 root cause (found):** the full HeadlessRenderer frame
+    runs on tier2 (876c993) but the rect draws 0 instances because the
+    compositor's Slang shaders need tier2 FRONTEND features that
+    aren't implemented (NOT more ICD plumbing):
+    (1) **aggregate/struct elements in storage buffers** — the rect
+    compute does `instances[slot] = rec` where instances is
+    `RWStructuredBuffer<InstanceRecord>` (struct of 2x float4); tier2
+    rejects it: "dynamic AccessChain element type N has no IR size
+    (struct/aggregate elements not supported)".  So the compute
+    pipeline has no tier2 shader -> Dispatch skipped -> counter stays
+    0 -> instanceCount 0 -> rect not drawn.
+    (2) **`DrawParameters` capability** — the rect VS (gl_InstanceIndex
+    via Slang) emits it; the frontend rejects the capability.
+    Both are needed together.  (1) is a real atrium-spv-frontend /
+    atrium-spv-ir feature (aggregate types in the IR + AccessChain
+    into arrays-of-structs in StorageBuffer); (2) is likely cheap
+    (accept the capability — gl_InstanceIndex is already supported).
+    This is a frontend workstream, distinct from the ICD/daemon
+    plumbing P4 has fixed so far (KHR2 ext, HOST_COHERENT map, 
+    vkCmdFillBuffer).  Also minor: tier2 clears LINEAR not sRGB for an
+    _SRGB attachment.
   - Then: compositor fast paths (opaque / occlusion / damage).
 - **PT — Partial-update transport (in-app sub-rect damage).** Add
   `slot_update_region` / CAS patch + present damage rect to the
