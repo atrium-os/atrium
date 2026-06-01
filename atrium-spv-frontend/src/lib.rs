@@ -152,7 +152,16 @@ pub fn translate_with_spec_overrides(
                 // through to the rasterizer, which supplies the
                 // per-primitive index.
                 | C::Geometry
-                | C::Tessellation);
+                | C::Tessellation
+                // gl_InstanceIndex / gl_BaseInstance / gl_BaseVertex /
+                // gl_DrawID.  Slang lowers `gl_InstanceIndex` to
+                // `InstanceIndex + BaseInstance` and declares
+                // DrawParameters; the base-* builtins are 0 for a
+                // direct (non-indirect, firstInstance=0) draw — the
+                // builtin handlers supply that.  Accepting the
+                // capability lets fresco-vulkan's instanced rect/path
+                // VS through to the rasterizer.
+                | C::DrawParameters);
             if !accepted {
                 return Err(FrontendError::Unsupported(format!(
                     "capability {cap:?} not supported in phase-1 v1",
