@@ -42,7 +42,7 @@ use atrium_spv_blob::ShaderBlob;
 use atrium_spv_pcmap::PcMap;
 
 use crate::dlopen::{
-    CodeBacking, CsMain, FsMain, LoadedShader, ShaderEntryPoints, VsMain,
+    CodeBacking, CsMain, FsMain, FsSpanMain, LoadedShader, ShaderEntryPoints, VsMain,
 };
 use crate::LoadError;
 
@@ -123,10 +123,12 @@ pub(crate) fn map_blob(blob: &ShaderBlob)
             fs_main: blob.entries.fs.map(|o| {
                 std::mem::transmute::<*mut u8, FsMain>(base.add(o as usize))
             }),
-            // Bespoke .afblob does not emit a span entry (P2 span
-            // codegen is cranelift-only); per-pixel fs_main is the
-            // fallback path here.
-            fs_span_main: None,
+            // P2 batched fragment entry (atrium_fs_main_span),
+            // emitted by the bespoke backend for the supported FS
+            // subset; `None` when absent (per-pixel fs_main path).
+            fs_span_main: blob.entries.fs_span.map(|o| {
+                std::mem::transmute::<*mut u8, FsSpanMain>(base.add(o as usize))
+            }),
             cs_main: blob.entries.cs.map(|o| {
                 std::mem::transmute::<*mut u8, CsMain>(base.add(o as usize))
             }),

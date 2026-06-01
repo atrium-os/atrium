@@ -1276,7 +1276,10 @@ pub struct Varying {
 /// Old cached `.so`s become unreachable under the new
 /// version directory (constraint F3); next launch
 /// recompiles transparently.
-pub const TIER2_SHADER_ABI_VERSION: u32 = 2;
+///
+/// v3 (P2): `.afblob` format v2 adds the `fs_span` entry slot;
+/// rotate the cache dir so stale v1 blobs are never read.
+pub const TIER2_SHADER_ABI_VERSION: u32 = 3;
 //
 // History:
 //   v1 -- original tier-2 ABI (Arc 1-149).

@@ -35,7 +35,8 @@
 //! | 24..28    | vs_off   (u32 LE; u32::MAX = absent)    |
 //! | 28..32    | fs_off   (u32 LE; u32::MAX = absent)    |
 //! | 32..36    | cs_off   (u32 LE; u32::MAX = absent)    |
-//! | 36..48    | reserved (12 bytes, zero)               |
+//! | 36..40    | fs_span_off (u32 LE; u32::MAX=absent)   |
+//! | 40..48    | reserved (8 bytes, zero)                |
 //! | 48..      | code  (code_len bytes)                  |
 //! +-----------+-----------------------------------------+
 //! ```
@@ -68,7 +69,13 @@ pub const MAGIC: &[u8; 8] = b"ATRMBLOB";
 
 /// Current blob format version. Bumped on incompatible
 /// format changes; producer + loader must agree.
-pub const VERSION: u32 = 1;
+///
+/// v2 (P2): carved an `fs_span_off` slot out of the reserved
+/// header bytes for the batched fragment entry
+/// (`atrium_fs_main_span`).  v1 blobs wrote zero there (which
+/// would mis-resolve as offset 0), so the version bump forces a
+/// recompile.
+pub const VERSION: u32 = 2;
 
 /// Byte size of the fixed header. Chosen so `code` starts
 /// 16-byte aligned.
@@ -94,6 +101,10 @@ pub struct EntryOffsets {
     pub fs: Option<u32>,
     /// `atrium_cs_main` offset, if this is a compute shader.
     pub cs: Option<u32>,
+    /// `atrium_fs_main_span` offset (P2 batched fragment entry),
+    /// if the backend emitted it.  `None` when the fragment
+    /// shader has only the scalar `fs` entry.
+    pub fs_span: Option<u32>,
 }
 
 impl EntryOffsets {
@@ -133,7 +144,9 @@ impl ShaderBlob {
             &self.entries.fs.unwrap_or(ENTRY_ABSENT).to_le_bytes());
         out.extend_from_slice(
             &self.entries.cs.unwrap_or(ENTRY_ABSENT).to_le_bytes());
-        out.extend_from_slice(&[0u8; 12]); // reserved
+        out.extend_from_slice(
+            &self.entries.fs_span.unwrap_or(ENTRY_ABSENT).to_le_bytes());
+        out.extend_from_slice(&[0u8; 8]); // reserved
         debug_assert_eq!(out.len(), HEADER_SIZE);
         out.extend_from_slice(&self.code);
         out
@@ -184,6 +197,7 @@ impl ShaderBlob {
             vs: entry(u32_at(24), Stage::Vertex)?,
             fs: entry(u32_at(28), Stage::Fragment)?,
             cs: entry(u32_at(32), Stage::Compute)?,
+            fs_span: entry(u32_at(36), Stage::Fragment)?,
         };
         Ok(Self {
             arch,
@@ -281,7 +295,7 @@ mod tests {
     fn round_trips() {
         let blob = sample(
             (0u8..64).collect(),
-            EntryOffsets { vs: None, fs: Some(0), cs: None },
+            EntryOffsets { vs: None, fs: Some(0), cs: None, fs_span: None },
         );
         let bytes = blob.to_bytes();
         assert_eq!(bytes.len(), HEADER_SIZE + 64);
@@ -294,7 +308,7 @@ mod tests {
     fn round_trips_all_stages_and_offsets() {
         let blob = sample(
             vec![0u8; 256],
-            EntryOffsets { vs: Some(0), fs: Some(64), cs: Some(252) },
+            EntryOffsets { vs: Some(0), fs: Some(64), cs: Some(252), fs_span: None },
         );
         let parsed = ShaderBlob::from_bytes(&blob.to_bytes()).unwrap();
         assert_eq!(parsed, blob);
