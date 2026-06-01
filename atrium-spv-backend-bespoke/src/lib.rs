@@ -199,7 +199,9 @@ pub struct BlobOutput {
 pub fn compile_blob(module: &Module, target: Target)
     -> Result<BlobOutput, BackendError>
 {
-    let _ = target; // aarch64 either way; see doc comment.
+    // `target` selects ARM64 either way for the bodies, but the
+    // span thunk's incoming stack-arg offsets are ABI-specific
+    // (Apple packs; AAPCS64/FreeBSD uses 8-byte slots).
     let mut code: Vec<u8> = Vec::new();
     let mut pcmap = atrium_spv_pcmap::Builder::new();
     let mut entries = atrium_spv_blob::EntryOffsets::default();
@@ -226,7 +228,7 @@ pub fn compile_blob(module: &Module, target: Target)
         // fixed negative offset (no relocation).  Emitted only for
         // the supported FS subset; `None` otherwise.
         if func.stage == ShaderStage::Fragment {
-            if let Some(thunk) = emit_fragment_span_thunk(func, fs_main_len) {
+            if let Some(thunk) = emit_fragment_span_thunk(func, fs_main_len, target) {
                 entries.fs_span = Some(off + fs_main_len as u32);
                 code.extend_from_slice(&thunk);
             }
@@ -5505,9 +5507,19 @@ fn exported_symbol_name(func: &Function) -> String {
 /// x22=out_color, x23=out_depth, x24..x27=frag ptrs, x28=mask.
 /// Shared args are spilled to the frame and reloaded per active
 /// lane.
-fn emit_fragment_span_thunk(func: &Function, fs_main_len: usize) -> Option<Vec<u8>> {
+fn emit_fragment_span_thunk(
+    func: &Function, fs_main_len: usize, target: Target,
+) -> Option<Vec<u8>> {
     use asm::{Xreg, Wreg, Vreg, Cond, SP, XZR};
     if func.stage != ShaderStage::Fragment { return None; }
+    // Incoming stack-arg byte offsets (relative to the post-prologue
+    // SP, i.e. +144 frame).  The first five (mask/smask/out_color/
+    // out_depth/ff) agree across ABIs, but the trailing u32s differ:
+    // Apple's ARM64 ABI PACKS stack args to natural size (4-byte
+    // slots), while AAPCS64 (FreeBSD) rounds each to an 8-byte slot.
+    let darwin = matches!(target, Target::Aarch64Darwin);
+    let pid_in: u16        = if darwin { 144 + 36 } else { 144 + 40 }; // 180 vs 184
+    let lane_count_in: u16 = if darwin { 144 + 40 } else { 144 + 48 }; // 184 vs 192
     // MRT (a colour output at a non-zero byte offset) needs a wider
     // per-lane colour slot than 16 B — out of scope for v1.
     if func.output_varying_byte_offset.values().any(|&o| o != 0) {
@@ -5540,7 +5552,7 @@ fn emit_fragment_span_thunk(func: &Function, fs_main_len: usize) -> Option<Vec<u
     a.emit(asm::str_x_offset(Xreg(9), SP, 120)); //           -> [sp+120]
     a.emit(asm::ldr_w_offset(Wreg(9), SP, 176)); // ff    @ incoming [sp+176]
     a.emit(asm::str_x_offset(Xreg(9), SP, 128)); //           -> [sp+128]
-    a.emit(asm::ldr_w_offset(Wreg(9), SP, 184)); // pid   @ incoming [sp+184]
+    a.emit(asm::ldr_w_offset(Wreg(9), SP, pid_in)); // pid @ incoming
     a.emit(asm::str_x_offset(Xreg(9), SP, 136)); //           -> [sp+136]
     // Init running pointers from the reg/stack args.
     a.emit(asm::mov_x(Xreg(21), Xreg(0)));            // varyings
@@ -5552,7 +5564,7 @@ fn emit_fragment_span_thunk(func: &Function, fs_main_len: usize) -> Option<Vec<u
     a.emit(asm::mov_x(Xreg(27), Xreg(7)));            // fw
     a.emit(asm::ldr_x_offset(Xreg(28), SP, 144));     // mask @ [sp+144]
     a.emit(asm::mov_x(Xreg(19), XZR));                // lane = 0
-    a.emit(asm::ldr_w_offset(Wreg(20), SP, 192));     // lane_count @ [sp+192]
+    a.emit(asm::ldr_w_offset(Wreg(20), SP, lane_count_in)); // lane_count
 
     // ── Loop. ──
     let loop_off = a.len();

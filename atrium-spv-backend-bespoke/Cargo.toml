@@ -27,6 +27,8 @@ thiserror           = "1"
 atrium-spv-frontend           = { path = "../atrium-spv-frontend" }
 atrium-spv-backend-cranelift  = { path = "../atrium-spv-backend-cranelift" }
 atrium-spv-runtime            = { path = "../atrium-spv-runtime" }
+atrium-spv-blob               = { path = "../atrium-spv-blob" }
 rspirv              = "0.13"
 tempfile            = "3"
 libloading          = "0.8"
+libc                = "0.2"
