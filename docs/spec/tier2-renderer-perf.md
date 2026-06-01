@@ -291,9 +291,30 @@ the optimistic case; textured/glyph shading is ~2–3× heavier.)
     derivatives quad dependency, no implicit-LOD per-pixel descriptor
     rewrite); else fall back to the per-pixel call.  Must be
     byte-identical to the scalar path for every rung.
-  - **P2.4 — validate + measure.** Full smoke MM..HHH + 106
-    differential green; extend `bench_tier2_passbatch` /
-    `bench_tier2_tiled` to report per-pixel vs span ms.
+  - **P2.3 (DONE, gated off) + P2.4 measurement.** Rasterizer span
+    path wired end-to-end (e0aebeb): `fs_span` threaded
+    build→`OwnedDraw`→`rasterize_pass`→`rasterize_stripe`;
+    `rasterize_stripe_span` gathers a tile-row's covered pixels into
+    SoA, calls `fs_span` once, scatters.  Full smoke MM..HHH green
+    BOTH per-pixel AND `ATRIUM_TIER2_SPAN=1` (byte-identical).
+    **But `bench_fs_span` (4K, const FS) measured the call-per-lane
+    bespoke span at 3.00 ms vs 2.58 ms per-pixel — a ~17%
+    REGRESSION** (the per-lane `bl` + `fs_main` prologue + SoA
+    gather/scatter exceed the amortized FFI-crossing saving).  So
+    the span path is correct + wired but **OFF by default**
+    (`ATRIUM_TIER2_SPAN=1` opts in).
+    - **Key datum:** the FS *call* is ~94% of trivial-FS cost
+      (per-pixel 2.58 ms vs a 0.15 ms no-call floor).  The win is
+      real but needs the **inlined-body** span — FS prologue/body
+      run once per span with the lane loop INSIDE — not
+      call-per-lane.  Routes: (a) upgrade the bespoke thunk to an
+      inlined-body loop (`ret`→branch-back, re-emit body with
+      lane-relative regs); (b) route span-eligible simple FS to
+      cranelift, whose `emit_fragment_span` IS already an
+      inlined-body loop (reuses P2.2; revisits bespoke-first); (c)
+      P3a SIMD, which attacks the gather/coverage/blend that ALSO
+      cost.  The inlined-body span should approach the 0.15 ms floor
+      for trivial FS (~5–8×).
   - **Correctness invariant:** `fs_span` over a mask of one lane must
     produce bit-identical output to `fs_main` for the same inputs;
     the span path is purely a call-overhead optimization, not a
