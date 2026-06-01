@@ -306,6 +306,10 @@ pub fn compile_blob(module: &Module, target: Target)
             "atrium_vs_main" => entries.vs = Some(off),
             "atrium_fs_main" => entries.fs = Some(off),
             "atrium_cs_main" => entries.cs = Some(off),
+            // P2: cranelift's inlined-body span entry (self-contained,
+            // no call to fs_main, so no relocation — the no-reloc
+            // invariant above still holds).
+            "atrium_fs_main_span" => entries.fs_span = Some(off),
             _ => {}
         }
     }
@@ -644,9 +648,14 @@ fn emit_function(
 /// (`atrium_fs_main_span`), matching `atrium_spv_loader::FsSpanMain`.
 fn build_span_signature(
     pointer_type: cranelift_codegen::ir::Type,
+    call_conv: CallConv,
 ) -> Signature {
     use cranelift_codegen::ir::types;
-    let mut sig = Signature::new(cranelift_codegen::isa::CallConv::SystemV);
+    // The span has 7 stack args, so the call conv MUST match the
+    // Rust caller's platform ABI (AppleAarch64 packs stack args to
+    // natural size; SystemV/AAPCS64 uses 8-byte slots).  The scalar
+    // fs_main escapes this because it has no stack args.
+    let mut sig = Signature::new(call_conv);
     let p = &mut sig.params;
     p.push(AbiParam::new(pointer_type)); // 0  in_varyings_soa
     p.push(AbiParam::new(types::I32));   // 1  varying_stride
@@ -805,7 +814,8 @@ fn emit_fragment_span(
     use cranelift_codegen::ir::types;
     use cranelift_codegen::ir::condcodes::IntCC;
     let pointer_type = clif_module.target_config().pointer_type();
-    let sig = build_span_signature(pointer_type);
+    let call_conv = clif_module.isa().default_call_conv();
+    let sig = build_span_signature(pointer_type, call_conv);
     let symbol_name = format!("{}_span", exported_symbol_name(func));
 
     let func_id = clif_module

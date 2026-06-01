@@ -101,8 +101,8 @@ fn render_span(fb: &mut [u8], fs: FsSpanMain) {
         let band_h = band.len() / (W * 4);
         let mut fx = [0.0f32; LANES];
         let mut fy = [0.0f32; LANES];
-        let mut fz = [0.0f32; LANES];
-        let mut fw = [1.0f32; LANES];
+        let fz = [0.0f32; LANES];
+        let fw = [1.0f32; LANES];
         let mut out = [0.0f32; LANES * 4];
         let mut od = [0.0f32; LANES];
         for ly in 0..band_h {
@@ -153,6 +153,14 @@ fn time_ms<F: FnMut()>(mut f: F, iters: u32) -> f64 {
 }
 
 fn main() {
+    // `dumpspv <path>`: write the constant-colour FS SPIR-V and exit
+    // (for manual `atrium-spv-compile --force-backend cranelift`).
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 3 && args[1] == "dumpspv" {
+        std::fs::write(&args[2], build_constant_color_fs([0.27,0.29,0.32,1.0])).unwrap();
+        eprintln!("wrote {}", args[2]);
+        return;
+    }
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     println!("4K {W}x{H}  cores={cores}  LANES={LANES}  (full-screen constant-colour FS)\n");
 
