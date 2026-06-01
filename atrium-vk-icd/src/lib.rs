@@ -3642,21 +3642,38 @@ pub unsafe extern "C" fn vkMapMemory(
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     let dev = &*(device as *const AtriumDevice);
-    let m = match dev.memories.lock() {
-        Ok(m) => m,
-        Err(_) => return VK_ERROR_INITIALIZATION_FAILED,
-    };
-    let Some(mem) = m.get(&memory) else {
-        return VK_ERROR_INITIALIZATION_FAILED;
-    };
-    if (offset as usize) > mem.storage.len() {
-        return VK_ERROR_INITIALIZATION_FAILED;
-    }
-    // The Box's storage is stable as long as it lives in the
-    // HashMap (HashMap doesn't move its values). The pointer
-    // remains valid until vkFreeMemory removes the entry.
-    let ptr = mem.storage.as_ptr().add(offset as usize) as *mut c_void;
+    let ptr = {
+        let m = match dev.memories.lock() {
+            Ok(m) => m,
+            Err(_) => return VK_ERROR_INITIALIZATION_FAILED,
+        };
+        let Some(mem) = m.get(&memory) else {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        };
+        if (offset as usize) > mem.storage.len() {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        // The Box's storage is stable as long as it lives in the
+        // HashMap (HashMap doesn't move its values). The pointer
+        // remains valid until vkFreeMemory removes the entry.
+        mem.storage.as_ptr().add(offset as usize) as *mut c_void
+    }; // drop the memories lock before the daemon round-trip below
     *pp_data = ptr;
+
+    // HOST_COHERENT coherence: pull the daemon's current bytes for
+    // the mapped range so a plain map+read (no explicit
+    // vkInvalidateMappedMemoryRanges, which the spec does NOT require
+    // for HOST_COHERENT memory) reflects device-side writes — e.g. a
+    // copy-image-to-buffer readback (fresco-vulkan's HeadlessRenderer
+    // relies on exactly this).  Reuses the invalidate pull path over
+    // the whole mapped tail (VK_WHOLE_SIZE).  Harmless for upload
+    // buffers: the host overwrites the pulled bytes before unmap.
+    let mut range = [0u8; 40];
+    range[16..24].copy_from_slice(&memory.to_le_bytes());
+    range[24..32].copy_from_slice(&offset.to_le_bytes());
+    range[32..40].copy_from_slice(&u64::MAX.to_le_bytes()); // VK_WHOLE_SIZE
+    let _ = vkInvalidateMappedMemoryRanges(
+        device, 1, range.as_ptr() as *const c_void);
     VK_SUCCESS
 }
 
