@@ -313,8 +313,21 @@ the optimistic case; textured/glyph shading is ~2–3× heavier.)
       cranelift, whose `emit_fragment_span` IS already an
       inlined-body loop (reuses P2.2; revisits bespoke-first); (c)
       P3a SIMD, which attacks the gather/coverage/blend that ALSO
-      cost.  The inlined-body span should approach the 0.15 ms floor
-      for trivial FS (~5–8×).
+      cost.
+    - **Inlined-body measured (cranelift, d7445d0):** with the
+      cranelift span exposed in the `.afblob` + the Apple call-conv
+      fix, `bench_fs_span` gives **2.24 ms vs 2.59 ms per-pixel —
+      1.16× (+14% of the FS-call headroom)**, vs call-per-lane's
+      −17%.  So inlined-body is the right shape, but the win is
+      MODEST for trivial fills (not the hypothesized ~5–8×): the
+      per-pixel coverage/interp **gather** dominates the remaining
+      ~2 ms, and that's untouched by the span — it's what **P3a
+      SIMD** attacks.  Heavier (textured) FS would amortize the call
+      more, but those are gated out of the span today.  Net: routing
+      span-eligible simple FS to cranelift buys ~14% on opaque
+      fills at the cost of cranelift's ~24× slower compile
+      (one-time, cached); P3a is the bigger lever for the dominant
+      gather cost.
   - **Correctness invariant:** `fs_span` over a mask of one lane must
     produce bit-identical output to `fs_main` for the same inputs;
     the span path is purely a call-overhead optimization, not a
