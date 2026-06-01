@@ -43,7 +43,7 @@ use sha2::{Digest, Sha256};
 // We need `unsafe` for libloading; gate it locally rather
 // than relaxing `forbid(unsafe_code)` for the whole crate.
 mod dlopen;
-pub use dlopen::{CsMain, FsMain, LoadedShader, ShaderEntryPoints, VsMain};
+pub use dlopen::{CsMain, FsMain, FsSpanMain, LoadedShader, ShaderEntryPoints, VsMain};
 
 // The JIT-emit path: mmap a flat `atrium-spv-blob`
 // PROT_EXEC instead of `dlopen`ing a `.so`. Same local
