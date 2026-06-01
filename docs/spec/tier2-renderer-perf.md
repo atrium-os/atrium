@@ -210,9 +210,45 @@ the optimistic case; textured/glyph shading is ~2–3× heavier.)
     validated by a cache-cleared full smoke (every FS recompiled, 0
     compile panics, all rungs MM..HHH correct) + 106 differential.
     Textured/MRT/derivative span = follow-up (anchor those param
-    reads).  Bespoke keeps emitting only the scalar `fs_main`; the
-    lane-indexed entry infrastructure is also what **P3b** reuses
-    (swap scalar lane ops for SIMD lanes).
+    reads).  The lane-indexed entry infrastructure is also what
+    **P3b** reuses (swap scalar lane ops for SIMD lanes).
+  - **P2.2b — bespoke span codegen (the win that actually lands).**
+    The `bench_fs_span` probe (4K, constant-colour FS) measured the
+    per-pixel `fs_main` call at **~93% of trivial-FS render time**
+    (2.30 ms vs a 0.15 ms no-FS-call floor) — so batching the call
+    is the dominant win.  BUT simple/compositor shaders compile to
+    **bespoke** (`.afblob`), not cranelift, so the P2.2 cranelift
+    span never reaches them.  Decision (locked): emit the span entry
+    in the **bespoke** backend.  Three coordinated pieces:
+    1. **`.afblob` format + loader.** Add an `fs_span` entry offset
+       alongside `entries.{vs,fs,cs}` (bump the blob/ABI version so
+       stale cached blobs recompile).  `jitmap.rs` resolves
+       `fs_span_main` from it (currently hardcoded `None`).
+    2. **bespoke `emit_fragment_span`.** Reuse the *existing*
+       `atrium_fs_main` body via a hand-emitted ARM64 thunk
+       (`call-per-lane`): prologue saves `x19..x24`/`x29`/`x30`
+       (`stp_x_pre`); load the 7 AAPCS64 stack args (mask,
+       samples_mask, out_color_soa, out_depth, ff, pid, lane_count —
+       at `[sp + frame + k*8]`) into callee-saved regs; loop
+       `lane = 0..lane_count`: `tst` the mask bit (`cbz`/`b_cond`
+       skip), set `x0 = varyings_soa + lane*stride`, `s0..s3 =
+       fx/fy/fz/fw[lane]` (ldr_w + `fmov_s_from_w`), `x1=uniforms`,
+       `x2=push`, `w3=samples_mask`, `x4 = out_color_soa + lane*16`,
+       `x5 = out_depth + lane*4`, `w6=ff`, `w7=pid`, `bl
+       atrium_fs_main` (intra-blob relative — fs_main's blob offset
+       is known at emit time; `patch` the imm26), `lane++`; epilogue
+       + `ret`.  Gate to the same supported subset as the cranelift
+       span.  `call-per-lane` amortizes the 12-arg-per-pixel
+       marshalling + FFI crossing across the span (the bulk of the
+       93%); if measurement shows the per-lane `bl`+prologue still
+       dominates, escalate to an inlined-body loop (re-emit the body
+       with `ret`→branch-back, the bespoke analog of the cranelift
+       latch).
+    3. **Additive + safe to land before P2.3:** nothing calls the
+       span until P2.3, so the bar is "all bespoke shaders still
+       load + smoke green (span emitted-but-unused)"; the thunk's
+       machine-code correctness is validated when P2.3 first calls
+       it (single-lane mask == `fs_main` bit-identical).
   - **P2.3 — rasterizer span path.** In `rasterize_stripe`, for the
     per-row pixel walk, accumulate a run of covered pixels: gather
     SoA varyings (perspective-correct interp per lane), frag coords,
