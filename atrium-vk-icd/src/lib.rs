@@ -8082,6 +8082,13 @@ const ATRIUM_INSTANCE_EXTENSIONS: &[(&[u8], u32)] = &[
     // surface_protected_capabilities and several other
     // downstream extensions Mesa/SDL2 probe for.
     (b"VK_KHR_get_surface_capabilities2\0", 1),
+    // VK_KHR_get_physical_device_properties2 — the *2 physical-device
+    // query family.  fresco-vulkan's HeadlessRenderer (and most
+    // ash/wgpu/Vulkan-1.1+ apps) enable it at instance creation even
+    // when they only call the *1 queries, so it must be advertised or
+    // create_instance fails with EXTENSION_NOT_PRESENT.  (Promoted to
+    // core in 1.1; the *2 entry points are wired below as needed.)
+    (b"VK_KHR_get_physical_device_properties2\0", 2),
 ];
 
 #[no_mangle]
