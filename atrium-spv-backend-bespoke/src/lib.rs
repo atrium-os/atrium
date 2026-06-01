@@ -219,7 +219,18 @@ pub fn compile_blob(module: &Module, target: Target)
             ShaderStage::Fragment => entries.fs = Some(off),
             ShaderStage::Compute  => entries.cs = Some(off),
         }
+        let fs_main_len = body.len();
         code.extend_from_slice(&body);
+        // P2.2b: append the batched-fragment span thunk right after
+        // the scalar fs_main body so its `bl atrium_fs_main` is a
+        // fixed negative offset (no relocation).  Emitted only for
+        // the supported FS subset; `None` otherwise.
+        if func.stage == ShaderStage::Fragment {
+            if let Some(thunk) = emit_fragment_span_thunk(func, fs_main_len) {
+                entries.fs_span = Some(off + fs_main_len as u32);
+                code.extend_from_slice(&thunk);
+            }
+        }
     }
 
     let blob = atrium_spv_blob::ShaderBlob {
@@ -5464,4 +5475,142 @@ fn exported_symbol_name(func: &Function) -> String {
         ShaderStage::Fragment => "atrium_fs_main".to_string(),
         ShaderStage::Compute  => "atrium_cs_main".to_string(),
     }
+}
+
+/// P2.2b — emit the batched-fragment span thunk
+/// (`atrium_fs_main_span`).  Hand-written ARM64 that shades up to
+/// `lane_count` pixels in one call by looping over the lanes and
+/// `BL`-ing the *already-emitted* scalar `atrium_fs_main` per
+/// covered lane (call-per-lane).  Reuses the existing body verbatim
+/// — only the per-lane argument marshalling + the FFI crossing are
+/// amortized across the span.
+///
+/// Returns the thunk bytes, to be appended to the SAME combined
+/// fragment body so the `BL` needs no relocation: `atrium_fs_main`
+/// sits at body offset 0 and the thunk at `fs_main_len`, so the
+/// `BL`'s imm26 is `-((fs_main_len + bl_local)/4)` — computable
+/// here.  `None` for shapes outside the supported subset (non-MRT,
+/// non-image-sampling, non-derivative fragment shaders), in which
+/// case the caller leaves `entries.fs_span` absent.
+///
+/// AAPCS64 span ABI (matches `atrium_spv_loader::FsSpanMain`): regs
+/// x0=varyings_soa, w1=varying_stride, x2=uniforms, x3=push,
+/// x4..x7=frag_{x,y,z,w} ptrs; stack `[sp + frame + k*8]`:
+/// k0=coverage_mask, k1=samples_mask, k2=out_color_soa,
+/// k3=out_depth, k4=front_facing, k5=primitive_id, k6=lane_count.
+///
+/// Frame = 144 B.  Running pointers live in callee-saved regs
+/// (preserved across the inner `BL` by `fs_main`'s own
+/// prologue/epilogue): x19=lane, x20=lane_count, x21=varyings,
+/// x22=out_color, x23=out_depth, x24..x27=frag ptrs, x28=mask.
+/// Shared args are spilled to the frame and reloaded per active
+/// lane.
+fn emit_fragment_span_thunk(func: &Function, fs_main_len: usize) -> Option<Vec<u8>> {
+    use asm::{Xreg, Wreg, Vreg, Cond, SP, XZR};
+    if func.stage != ShaderStage::Fragment { return None; }
+    // MRT (a colour output at a non-zero byte offset) needs a wider
+    // per-lane colour slot than 16 B — out of scope for v1.
+    if func.output_varying_byte_offset.values().any(|&o| o != 0) {
+        return None;
+    }
+    // Image sampling + derivatives read helper/descriptor pointers
+    // from the uniforms buffer via emit_function's fixed register
+    // conventions; the call-per-lane thunk hands fs_main the same
+    // x1=uniforms, so those WOULD work, but to stay byte-aligned
+    // with the cranelift span's gated subset (and avoid the quad /
+    // per-pixel-LOD paths the rasterizer special-cases) we skip
+    // them for v1.
+    let skip = func.blocks.values().any(|b|
+        b.insts.iter().any(|i| matches!(i.op,
+            Op::ImageHandle { .. } | Op::Derivative { .. })));
+    if skip { return None; }
+
+    let mut a = asm::Asm::new();
+    // ── Prologue: alloc 144 B frame, save x29/x30 + x19..x28. ──
+    a.emit(asm::stp_x_pre(Xreg(29), Xreg(30), SP, -144));
+    for (r, off) in [(19u8, 16u16), (20, 24), (21, 32), (22, 40), (23, 48),
+                     (24, 56), (25, 64), (26, 72), (27, 80), (28, 88)] {
+        a.emit(asm::str_x_offset(Xreg(r), SP, off));
+    }
+    // Spill shared args into the frame (sp+96..144).
+    a.emit(asm::str_x_offset(Xreg(2), SP, 96));  // uniforms  -> [sp+96]
+    a.emit(asm::str_x_offset(Xreg(3), SP, 104)); // push      -> [sp+104]
+    a.emit(asm::str_x_offset(Xreg(1), SP, 112)); // stride(w) -> [sp+112]
+    a.emit(asm::ldr_w_offset(Wreg(9), SP, 152)); // smask @ incoming [sp+152]
+    a.emit(asm::str_x_offset(Xreg(9), SP, 120)); //           -> [sp+120]
+    a.emit(asm::ldr_w_offset(Wreg(9), SP, 176)); // ff    @ incoming [sp+176]
+    a.emit(asm::str_x_offset(Xreg(9), SP, 128)); //           -> [sp+128]
+    a.emit(asm::ldr_w_offset(Wreg(9), SP, 184)); // pid   @ incoming [sp+184]
+    a.emit(asm::str_x_offset(Xreg(9), SP, 136)); //           -> [sp+136]
+    // Init running pointers from the reg/stack args.
+    a.emit(asm::mov_x(Xreg(21), Xreg(0)));            // varyings
+    a.emit(asm::ldr_x_offset(Xreg(22), SP, 160));     // out_color_soa @ [sp+160]
+    a.emit(asm::ldr_x_offset(Xreg(23), SP, 168));     // out_depth     @ [sp+168]
+    a.emit(asm::mov_x(Xreg(24), Xreg(4)));            // fx
+    a.emit(asm::mov_x(Xreg(25), Xreg(5)));            // fy
+    a.emit(asm::mov_x(Xreg(26), Xreg(6)));            // fz
+    a.emit(asm::mov_x(Xreg(27), Xreg(7)));            // fw
+    a.emit(asm::ldr_x_offset(Xreg(28), SP, 144));     // mask @ [sp+144]
+    a.emit(asm::mov_x(Xreg(19), XZR));                // lane = 0
+    a.emit(asm::ldr_w_offset(Wreg(20), SP, 192));     // lane_count @ [sp+192]
+
+    // ── Loop. ──
+    let loop_off = a.len();
+    a.emit(asm::cmp_x(Xreg(19), Xreg(20)));
+    let bge_off = a.len();
+    a.emit(asm::b_cond(Cond::Ge, 0));                 // -> end (patched)
+    a.emit(asm::movz_x(Xreg(10), 1, 0));
+    a.emit(asm::and_x(Xreg(9), Xreg(28), Xreg(10)));  // mask & 1
+    let cbz_off = a.len();
+    a.emit(asm::cbz_x(Xreg(9), 0));                   // -> advance (patched)
+    // Active lane: marshal fs_main args, BL.
+    a.emit(asm::mov_x(Xreg(0), Xreg(21)));            // x0 = varyings
+    a.emit(asm::ldr_x_offset(Xreg(1), SP, 96));       // x1 = uniforms
+    a.emit(asm::ldr_x_offset(Xreg(2), SP, 104));      // x2 = push
+    a.emit(asm::ldr_w_offset(Wreg(9), Xreg(24), 0)); a.emit(asm::fmov_s_from_w(Vreg(0), Wreg(9)));
+    a.emit(asm::ldr_w_offset(Wreg(9), Xreg(25), 0)); a.emit(asm::fmov_s_from_w(Vreg(1), Wreg(9)));
+    a.emit(asm::ldr_w_offset(Wreg(9), Xreg(26), 0)); a.emit(asm::fmov_s_from_w(Vreg(2), Wreg(9)));
+    a.emit(asm::ldr_w_offset(Wreg(9), Xreg(27), 0)); a.emit(asm::fmov_s_from_w(Vreg(3), Wreg(9)));
+    a.emit(asm::ldr_w_offset(Wreg(3), SP, 120));      // w3 = samples_mask @ [sp+120]
+    a.emit(asm::mov_x(Xreg(4), Xreg(22)));            // x4 = out_color
+    a.emit(asm::mov_x(Xreg(5), Xreg(23)));            // x5 = out_depth
+    a.emit(asm::ldr_w_offset(Wreg(6), SP, 128));      // w6 = front_facing @ [sp+128]
+    a.emit(asm::ldr_w_offset(Wreg(7), SP, 136));      // w7 = primitive_id @ [sp+136]
+    let bl_off = a.len();
+    a.emit(asm::bl(0));                               // -> fs_main (patched)
+    // Advance (every lane, covered or not).
+    let advance_off = a.len();
+    a.emit(asm::ldr_w_offset(Wreg(9), SP, 112));      // stride @ [sp+112]
+    a.emit(asm::add_x(Xreg(21), Xreg(21), Xreg(9)));  // varyings += stride
+    a.emit(asm::add_imm_x(Xreg(22), Xreg(22), 16));   // out_color += 16
+    a.emit(asm::add_imm_x(Xreg(23), Xreg(23), 4));    // out_depth += 4
+    a.emit(asm::add_imm_x(Xreg(24), Xreg(24), 4));
+    a.emit(asm::add_imm_x(Xreg(25), Xreg(25), 4));
+    a.emit(asm::add_imm_x(Xreg(26), Xreg(26), 4));
+    a.emit(asm::add_imm_x(Xreg(27), Xreg(27), 4));
+    a.emit(asm::lsr_imm_x(Xreg(28), Xreg(28), 1));    // mask >>= 1
+    a.emit(asm::add_imm_x(Xreg(19), Xreg(19), 1));    // lane++
+    let b_off = a.len();
+    a.emit(asm::b(0));                                // -> loop (patched)
+
+    // ── Epilogue. ──
+    let end_off = a.len();
+    for (r, off) in [(19u8, 16u16), (20, 24), (21, 32), (22, 40), (23, 48),
+                     (24, 56), (25, 64), (26, 72), (27, 80), (28, 88)] {
+        a.emit(asm::ldr_x_offset(Xreg(r), SP, off));
+    }
+    a.emit(asm::ldp_x_post(Xreg(29), Xreg(30), SP, 144));
+    a.emit(asm::ret());
+
+    // ── Resolve branches (imm in instruction units = bytes/4). ──
+    a.patch(bge_off, asm::b_cond(Cond::Ge, ((end_off - bge_off) / 4) as i32));
+    a.patch(cbz_off, asm::cbz_x(Xreg(9), ((advance_off - cbz_off) / 4) as i32));
+    a.patch(b_off, asm::b(((loop_off as i64 - b_off as i64) / 4) as i32));
+    // BL → fs_main at combined-body offset 0; the thunk's bl sits at
+    // blob offset (fs_main_len + bl_off), so the relative jump is
+    // negative and independent of where the body lands in the blob.
+    let bl_rel = -(((fs_main_len + bl_off) / 4) as i64) as i32;
+    a.patch(bl_off, asm::bl(bl_rel));
+
+    Some(a.into_bytes())
 }
