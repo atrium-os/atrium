@@ -191,20 +191,28 @@ the optimistic case; textured/glyph shading is ~2–3× heavier.)
     and an optional `fs_span_main` to `ShaderEntryPoints` (symbol
     `atrium_fs_main_span`, resolved if present, else `None`).  No
     behaviour change; everything still runs the per-pixel path.
-  - **P2.2 — cranelift span codegen.** Emit `atrium_fs_main_span` by
-    wrapping the *existing* SPIR-V body codegen in a
-    `for lane in 0..lane_count { if mask>>lane & 1 { <body> } }`
-    loop, with the param-mapping made lane-relative: varyings base
-    = `params[0] + lane*stride`, out_color = `out_color_soa +
-    lane*16`, out_depth = `&out_depth[lane]`, gl_FragCoord =
-    `frag_{x,y,z,w}[lane]` (loaded per lane instead of scalar
-    params), uniforms / push-constants / front_facing / primitive_id
-    shared.  `emit_inst` (the body) is unchanged — only entry /
-    builtin / I/O plumbing differs.  Bespoke keeps emitting only the
-    scalar `fs_main` (complex-FS fallback); the daemon uses whichever
-    `fs_span` exists, else per-pixel.  This is also the lane-indexed
-    entry infrastructure **P3b** reuses (swap scalar lane ops for
-    SIMD lanes).
+  - **P2.2 (DONE) — cranelift span codegen.** `atrium_fs_main_span`
+    is emitted by `emit_fragment_span`: a `header(lane) → maskcheck →
+    body_entry → latch → header` loop wrapping the existing body
+    codegen (walked by the shared `emit_body_blocks`).  The body's
+    fragment I/O is made lane-relative via `FsAnchors` (varyings =
+    `varyings_soa + lane*stride`, colour = `out_color_soa + lane*16`,
+    depth = `out_depth + lane*4`; uniforms / push / front_facing /
+    primitive_id shared); `Op::Return` jumps to the latch instead of
+    returning (`span_latch`).  The scalar path is byte-unchanged
+    (`fs_anchors`/`span_latch` are `None`).  Emission is **gated to a
+    supported subset** — non-MRT, non-image-sampling, non-derivative
+    fragment shaders — because texture/derivative codegen still reads
+    the descriptor/helper table from a hardcoded scalar param index
+    (`params[1]`); those shaders simply don't get a span symbol and
+    keep the per-pixel path.  **Additive + safe:** nothing calls the
+    span entry yet (P2.3), so this only had to emit *valid IR* —
+    validated by a cache-cleared full smoke (every FS recompiled, 0
+    compile panics, all rungs MM..HHH correct) + 106 differential.
+    Textured/MRT/derivative span = follow-up (anchor those param
+    reads).  Bespoke keeps emitting only the scalar `fs_main`; the
+    lane-indexed entry infrastructure is also what **P3b** reuses
+    (swap scalar lane ops for SIMD lanes).
   - **P2.3 — rasterizer span path.** In `rasterize_stripe`, for the
     per-row pixel walk, accumulate a run of covered pixels: gather
     SoA varyings (perspective-correct interp per lane), frag coords,

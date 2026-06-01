@@ -204,6 +204,10 @@ pub fn compile(module: &Module, target: Target) -> Result<CompileOutput, Backend
     let mut pcmap = atrium_spv_pcmap::Builder::new();
     for func in &module.functions {
         emit_function(&mut clif_module, func)?;
+        // P2.2: additionally emit the span fragment entry
+        // (atrium_fs_main_span) for supported fragment shaders.
+        // No-op for non-fragment / out-of-scope shapes.
+        emit_fragment_span(&mut clif_module, func)?;
         // Add a pcmap entry for this function's start.
         // host_offset stays at 0 — function-relative;
         // production crash handlers resolve which function
@@ -383,6 +387,8 @@ fn emit_function(
             block_map,
             image_handles: HashMap::new(),
             matrices: HashMap::new(),
+            fs_anchors: None,
+            span_latch: None,
         };
 
         // Multi-binding compute SSBO prologue.  When
@@ -634,6 +640,301 @@ fn emit_function(
     Ok(())
 }
 
+/// Build the Cranelift signature for the span fragment entry
+/// (`atrium_fs_main_span`), matching `atrium_spv_loader::FsSpanMain`.
+fn build_span_signature(
+    pointer_type: cranelift_codegen::ir::Type,
+) -> Signature {
+    use cranelift_codegen::ir::types;
+    let mut sig = Signature::new(cranelift_codegen::isa::CallConv::SystemV);
+    let p = &mut sig.params;
+    p.push(AbiParam::new(pointer_type)); // 0  in_varyings_soa
+    p.push(AbiParam::new(types::I32));   // 1  varying_stride
+    p.push(AbiParam::new(pointer_type)); // 2  uniforms
+    p.push(AbiParam::new(pointer_type)); // 3  push_constants
+    p.push(AbiParam::new(pointer_type)); // 4  frag_x
+    p.push(AbiParam::new(pointer_type)); // 5  frag_y
+    p.push(AbiParam::new(pointer_type)); // 6  frag_z
+    p.push(AbiParam::new(pointer_type)); // 7  frag_w
+    p.push(AbiParam::new(types::I64));   // 8  coverage_mask
+    p.push(AbiParam::new(types::I32));   // 9  samples_mask
+    p.push(AbiParam::new(pointer_type)); // 10 out_color_soa
+    p.push(AbiParam::new(pointer_type)); // 11 out_depth
+    p.push(AbiParam::new(types::I32));   // 12 front_facing
+    p.push(AbiParam::new(types::I32));   // 13 primitive_id
+    p.push(AbiParam::new(types::I32));   // 14 lane_count
+    sig
+}
+
+/// Two-pass IR block walk (Phi-param declaration, then
+/// instruction + terminator emission), switching to each block's
+/// Cranelift block.  Shared by the span entry; mirrors the inline
+/// walk in `emit_function`.
+fn emit_body_blocks(
+    func: &atrium_spv_ir::Function,
+    translator: &mut FnTranslator,
+    builder: &mut FunctionBuilder,
+) -> Result<(), BackendError> {
+    let mut block_ids: Vec<atrium_spv_ir::BlockId> =
+        func.blocks.keys().copied().collect();
+    block_ids.sort_by_key(|b| b.0);
+
+    for id in &block_ids {
+        if *id == func.entry_block { continue; }
+        let block = func.blocks.get(id).unwrap();
+        let cl_block = *translator.block_map.get(id).unwrap();
+        for inst in &block.insts {
+            let result = match &inst.op {
+                Op::Phi(_) => match inst.result.as_ref() {
+                    Some(r) => r,
+                    None => continue,
+                },
+                _ => break,
+            };
+            declare_phi_block_param(cl_block, result, builder, translator)?;
+        }
+    }
+
+    for id in &block_ids {
+        let block = func.blocks.get(id).ok_or_else(||
+            BackendError::Internal(format!("missing block {id:?}")))?;
+        let cl_block = *translator.block_map.get(id).ok_or_else(||
+            BackendError::Internal(format!("no cl block for {id:?}")))?;
+        // The entry block is already current + partially filled (the
+        // caller emitted its prologue there), so don't switch to it
+        // — append the body insts to it.  Switching away from an
+        // unterminated block would trip Cranelift's "fill your block
+        // before switching" assertion.  Requires func.entry_block to
+        // sort first (it is BlockId 0), so it's processed before any
+        // switch.
+        if *id != func.entry_block {
+            builder.switch_to_block(cl_block);
+        }
+        for inst in &block.insts {
+            translator.emit_inst(inst, builder)?;
+            match &inst.op {
+                Op::Branch(target) => {
+                    let args = collect_phi_args(*target, *id, func, translator)?;
+                    let cl_target = *translator.block_map.get(target).unwrap();
+                    let bargs: Vec<cranelift_codegen::ir::BlockArg> =
+                        args.into_iter().map(Into::into).collect();
+                    builder.ins().jump(cl_target, &bargs);
+                }
+                Op::Switch { selector, cases, default } => {
+                    let sv = translator.scalars.get(&selector.id).copied()
+                        .ok_or_else(|| BackendError::Internal(format!(
+                            "Switch selector {:?} not in scalars", selector.id)))?;
+                    for (case_idx, (lit, target)) in cases.iter().enumerate() {
+                        let cmp = builder.ins().icmp_imm(
+                            cranelift_codegen::ir::condcodes::IntCC::Equal, sv, *lit);
+                        let case_args = collect_phi_args(*target, *id, func, translator)?;
+                        let case_bargs: Vec<cranelift_codegen::ir::BlockArg> =
+                            case_args.into_iter().map(Into::into).collect();
+                        let cl_target = *translator.block_map.get(target).unwrap();
+                        if case_idx + 1 == cases.len() {
+                            let def_args = collect_phi_args(*default, *id, func, translator)?;
+                            let def_bargs: Vec<cranelift_codegen::ir::BlockArg> =
+                                def_args.into_iter().map(Into::into).collect();
+                            let cl_def = *translator.block_map.get(default).unwrap();
+                            builder.ins().brif(cmp, cl_target, &case_bargs, cl_def, &def_bargs);
+                        } else {
+                            let fall = builder.create_block();
+                            builder.ins().brif(cmp, cl_target, &case_bargs, fall, &[]);
+                            builder.switch_to_block(fall);
+                        }
+                    }
+                    if cases.is_empty() {
+                        let def_args = collect_phi_args(*default, *id, func, translator)?;
+                        let def_bargs: Vec<cranelift_codegen::ir::BlockArg> =
+                            def_args.into_iter().map(Into::into).collect();
+                        let cl_def = *translator.block_map.get(default).unwrap();
+                        builder.ins().jump(cl_def, &def_bargs);
+                    }
+                }
+                Op::BranchCond { cond, t_block, f_block } => {
+                    let cv = translator.scalars.get(&cond.id).copied()
+                        .ok_or_else(|| BackendError::Internal(format!(
+                            "BranchCond cond {:?} not in scalars", cond.id)))?;
+                    let t_args = collect_phi_args(*t_block, *id, func, translator)?;
+                    let f_args = collect_phi_args(*f_block, *id, func, translator)?;
+                    let cl_t = *translator.block_map.get(t_block).unwrap();
+                    let cl_f = *translator.block_map.get(f_block).unwrap();
+                    let t_bargs: Vec<cranelift_codegen::ir::BlockArg> =
+                        t_args.into_iter().map(Into::into).collect();
+                    let f_bargs: Vec<cranelift_codegen::ir::BlockArg> =
+                        f_args.into_iter().map(Into::into).collect();
+                    builder.ins().brif(cv, cl_t, &t_bargs, cl_f, &f_bargs);
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// P2.2 — emit the span fragment entry `atrium_fs_main_span`, which
+/// shades up to `lane_count` pixels in one call (SoA I/O + coverage
+/// mask).  Additive: the scalar `atrium_fs_main` is still emitted;
+/// the rasterizer uses whichever it prefers.  Emitted only for a
+/// supported FS subset — non-MRT, non-image-sampling fragment
+/// shaders (textured / MRT span is a follow-up; those keep the
+/// per-pixel path).  Returns `Ok(())` without emitting for anything
+/// out of scope, so `fs_span_main` is simply absent.
+fn emit_fragment_span(
+    clif_module: &mut ObjectModule,
+    func: &atrium_spv_ir::Function,
+) -> Result<(), BackendError> {
+    if func.stage != ShaderStage::Fragment { return Ok(()); }
+    // MRT (a colour output at a non-zero byte offset) needs a wider
+    // per-lane colour slot than 16 B — out of scope for v1.
+    if func.output_varying_byte_offset.values().any(|&o| o != 0) {
+        return Ok(());
+    }
+    // Image sampling AND derivatives read helper / descriptor
+    // pointers from the uniforms buffer via a hardcoded scalar param
+    // index (params[1]) inside emit_inst; that index isn't anchored
+    // to the span layout yet (it's `varying_stride` there), so skip
+    // those shaders — they keep the per-pixel path.  (Derivatives
+    // are inherently quad-based and excluded from the span fast path
+    // anyway.)
+    let uses_hardcoded_uniforms = func.blocks.values().any(|b|
+        b.insts.iter().any(|i| matches!(i.op,
+            Op::ImageHandle { .. } | Op::Derivative { .. })));
+    if uses_hardcoded_uniforms { return Ok(()); }
+
+    use cranelift_codegen::ir::types;
+    use cranelift_codegen::ir::condcodes::IntCC;
+    let pointer_type = clif_module.target_config().pointer_type();
+    let sig = build_span_signature(pointer_type);
+    let symbol_name = format!("{}_span", exported_symbol_name(func));
+
+    let func_id = clif_module
+        .declare_function(&symbol_name, Linkage::Export, &sig)
+        .map_err(|e| BackendError::Internal(
+            format!("declare_function({symbol_name}): {e}")))?;
+
+    let mut ctx = ClifContext::new();
+    ctx.func = ClifFunction::with_name_signature(
+        UserFuncName::user(0, func_id.as_u32()), sig.clone());
+    let mut builder_ctx = FunctionBuilderContext::new();
+    {
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
+
+        // ── Scaffold blocks. ────────────────────────────────────
+        let entry = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        let sp = builder.func.dfg.block_params(entry).to_vec();
+        let header = builder.create_block();
+        let lane = builder.append_block_param(header, types::I32);
+        let maskcheck = builder.create_block();
+        let latch = builder.create_block();
+        let exit = builder.create_block();
+
+        // One Cranelift block per IR block; the IR entry block maps
+        // to a fresh body-entry block (the function entry block here
+        // is the span scaffold, not the shader body).
+        let mut block_map: HashMap<atrium_spv_ir::BlockId,
+                                   cranelift_codegen::ir::Block> = HashMap::new();
+        for (id, _) in &func.blocks {
+            block_map.insert(*id, builder.create_block());
+        }
+        let body_entry = *block_map.get(&func.entry_block).unwrap();
+
+        // entry: jump header(0)
+        builder.switch_to_block(entry);
+        let zero = builder.ins().iconst(types::I32, 0);
+        builder.ins().jump(header, &[zero.into()]);
+
+        // header(lane): if lane >= lane_count -> exit, else maskcheck
+        builder.switch_to_block(header);
+        let lane_count = sp[14];
+        let done = builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, lane, lane_count);
+        builder.ins().brif(done, exit, &[], maskcheck, &[]);
+
+        // maskcheck: if (mask >> lane) & 1 -> body_entry, else latch
+        builder.switch_to_block(maskcheck);
+        let mask = sp[8];
+        let lane64 = builder.ins().uextend(types::I64, lane);
+        let shifted = builder.ins().ushr(mask, lane64);
+        let bit = builder.ins().band_imm(shifted, 1);
+        let active = builder.ins().icmp_imm(IntCC::NotEqual, bit, 0);
+        builder.ins().brif(active, body_entry, &[], latch, &[]);
+
+        // body_entry: compute lane-relative anchors, then the shader
+        // body (walked below) reads/writes through them.
+        builder.switch_to_block(body_entry);
+        let stride = sp[1];
+        let voff = builder.ins().imul(lane, stride);
+        let voff_p = builder.ins().uextend(pointer_type, voff);
+        let in_varyings = builder.ins().iadd(sp[0], voff_p);
+        let coff = builder.ins().imul_imm(lane, 16);
+        let coff_p = builder.ins().uextend(pointer_type, coff);
+        let out_color = builder.ins().iadd(sp[10], coff_p);
+        let doff = builder.ins().imul_imm(lane, 4);
+        let doff_p = builder.ins().uextend(pointer_type, doff);
+        let out_depth = builder.ins().iadd(sp[11], doff_p);
+        let anchors = FsAnchors {
+            in_varyings,
+            uniforms: sp[2],
+            push: sp[3],
+            out_color,
+            out_depth,
+            front_facing: sp[12],
+            primitive_id: sp[13],
+        };
+
+        let mut translator = FnTranslator {
+            stage: func.stage,
+            local_size: func.local_size,
+            ssbo_var_ptr: HashMap::new(),
+            entry_block: body_entry,
+            params: sp.clone(),
+            scalars: HashMap::new(),
+            vectors: HashMap::new(),
+            pointers: HashMap::new(),
+            block_map,
+            image_handles: HashMap::new(),
+            matrices: HashMap::new(),
+            fs_anchors: Some(anchors),
+            span_latch: Some(latch),
+        };
+
+        // Route Location-decorated I/O + gl_FragDepth to the
+        // lane-relative anchors (mirrors emit_function's FS prologue).
+        for (&vid, &off) in &func.output_varying_byte_offset {
+            translator.pointers.insert(vid, (out_color, off as i32));
+        }
+        for (&vid, &off) in &func.input_varying_byte_offset {
+            translator.pointers.insert(vid, (in_varyings, off as i32));
+        }
+        if let Some(vid) = func.frag_depth_output {
+            translator.pointers.insert(vid, (out_depth, 0));
+        }
+
+        // Walk + emit the shader body (terminating returns jump to
+        // the latch via `span_latch`).
+        emit_body_blocks(func, &mut translator, &mut builder)?;
+
+        // latch: lane += 1; jump header
+        builder.switch_to_block(latch);
+        let next = builder.ins().iadd_imm(lane, 1);
+        builder.ins().jump(header, &[next.into()]);
+
+        // exit: return
+        builder.switch_to_block(exit);
+        builder.ins().return_(&[]);
+
+        builder.seal_all_blocks();
+        builder.finalize();
+    }
+
+    clif_module
+        .define_function(func_id, &mut ctx)
+        .map_err(|e| BackendError::Internal(
+            format!("define_function({symbol_name}): {e:?}")))?;
+    Ok(())
+}
+
 /// Declare Cranelift block param(s) for one Op::Phi
 /// result. Scalars get one block param; vectors get one
 /// per lane. Stored in translator.scalars / .vectors so
@@ -778,6 +1079,32 @@ struct FnTranslator {
     /// `Op::Load` of a Mat4; consumed by
     /// `Op::MatrixTimesVector`.
     matrices: HashMap<ValueId, Vec<Vec<ClifValue>>>,
+    /// P2 span codegen: when `Some`, the fragment-stage I/O
+    /// anchors (varyings-in / uniforms / push / colour-out /
+    /// depth-out / front_facing / primitive_id) are taken from
+    /// these lane-relative Cranelift values instead of the scalar
+    /// `fs_main` param slots.  `None` for the scalar `fs_main` and
+    /// every non-fragment stage — those keep the original
+    /// `self.params[N]` mapping byte-for-byte.
+    fs_anchors: Option<FsAnchors>,
+    /// P2 span codegen: when `Some`, `Op::Return` jumps to this
+    /// loop-latch block (advance to the next lane) instead of
+    /// returning from the function.  `None` for the scalar path.
+    span_latch: Option<cranelift_codegen::ir::Block>,
+}
+
+/// Lane-relative fragment I/O anchors for the span (`fs_main_span`)
+/// entry.  Each is the Cranelift value the body's storage-param /
+/// builtin lookups should use for the current lane.
+#[derive(Clone, Copy)]
+struct FsAnchors {
+    in_varyings:  ClifValue, // varyings_soa + lane*stride
+    uniforms:     ClifValue, // shared
+    push:         ClifValue, // shared
+    out_color:    ClifValue, // out_color_soa + lane*16
+    out_depth:    ClifValue, // out_depth + lane*4
+    front_facing: ClifValue, // shared
+    primitive_id: ClifValue, // shared
 }
 
 impl FnTranslator {
@@ -1099,16 +1426,20 @@ impl FnTranslator {
                         self.scalars.insert(result.id, self.params[5]);
                     }
                     (ShaderStage::Fragment, BK::FrontFacing) => {
-                        // gl_FrontFacing -- the trailing FS param
-                        // (index 10): 1 = front, 0 = back.  An i32
-                        // so it feeds OpSelect / comparisons as the
-                        // IR's i32-materialised Bool.
-                        self.scalars.insert(result.id, self.params[10]);
+                        // gl_FrontFacing -- scalar FS param index 10
+                        // (1 = front, 0 = back), or the span anchor.
+                        // An i32 so it feeds OpSelect / comparisons
+                        // as the IR's i32-materialised Bool.
+                        let v = self.fs_anchors.map(|a| a.front_facing)
+                            .unwrap_or(self.params[10]);
+                        self.scalars.insert(result.id, v);
                     }
                     (ShaderStage::Fragment, BK::PrimitiveId) => {
-                        // gl_PrimitiveID -- FS param index 11: the
-                        // 0-based primitive index within the draw.
-                        self.scalars.insert(result.id, self.params[11]);
+                        // gl_PrimitiveID -- scalar FS param index 11
+                        // (0-based primitive index), or span anchor.
+                        let v = self.fs_anchors.map(|a| a.primitive_id)
+                            .unwrap_or(self.params[11]);
+                        self.scalars.insert(result.id, v);
                     }
                     (stage, kind) => {
                         return Err(BackendError::Unsupported(format!(
@@ -1229,7 +1560,14 @@ impl FnTranslator {
                 Ok(())
             }
             Op::Return => {
-                builder.ins().return_(&[]);
+                // P2 span: a per-lane "return" advances to the next
+                // lane (jump to the loop latch) rather than exiting
+                // the whole span function.
+                if let Some(latch) = self.span_latch {
+                    builder.ins().jump(latch, &[]);
+                } else {
+                    builder.ins().return_(&[]);
+                }
                 Ok(())
             }
             Op::ReturnValue(_) => {
@@ -2602,17 +2940,17 @@ impl FnTranslator {
             // 3, 4, 5, 6; then samples_mask at 7; out_color
             // at 8; out_depth at 9. Match that here.
             (ShaderStage::Fragment, StorageClass::Output) => {
-                Ok(self.params[8])
+                Ok(self.fs_anchors.map(|a| a.out_color).unwrap_or(self.params[8]))
             }
             (ShaderStage::Fragment, StorageClass::Input) => {
                 // in_varyings (parameter 0)
-                Ok(self.params[0])
+                Ok(self.fs_anchors.map(|a| a.in_varyings).unwrap_or(self.params[0]))
             }
             (ShaderStage::Fragment, StorageClass::Uniform) => {
-                Ok(self.params[1])
+                Ok(self.fs_anchors.map(|a| a.uniforms).unwrap_or(self.params[1]))
             }
             (ShaderStage::Fragment, StorageClass::PushConstant) => {
-                Ok(self.params[2])
+                Ok(self.fs_anchors.map(|a| a.push).unwrap_or(self.params[2]))
             }
             // Vertex-stage param order (build_signature):
             //   0 in_attributes, 1 in_attr_strides, 2 uniforms,
