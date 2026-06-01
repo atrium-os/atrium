@@ -136,6 +136,26 @@ the optimistic case; textured/glyph shading is ~2–3× heavier.)
       **GGG** (loadOp=LOAD damage-preserve across two passes) and
       **HHH** (two different-shader draws in one pass routed by
       `draw_idx`); full smoke MM..HHH + 106 differential tests green.
+    - **P1b.2 measurement** (`bench_tier2_passbatch`, 4K, 14 cores,
+      full-screen-coverage quads, constant per-pixel work — the
+      delta is pure dispatch overhead):
+
+      | draws | per-PASS ms | per-DRAW ms | speedup |
+      |------:|------------:|------------:|--------:|
+      |    16 |        3.85 |        5.53 |    1.4× |
+      |    64 |        3.56 |       13.02 |    3.7× |
+      |   256 |        3.79 |       31.10 |    8.2× |
+      |  1024 |        3.79 |       74.30 |   19.6× |
+      |  4096 |        4.67 |      137.69 |   29.5× |
+
+      per-PASS stays **flat ~3.6–4.7 ms (≈210–260 fps), under the
+      8.33 ms 4K@120 budget at every draw count**; per-DRAW grows
+      linearly and blows the budget by 64 draws.  A many-widget
+      compositor frame is ~8–16 fps pre-P1b.2 but comfortably
+      4K@120 with it.  **Target met on the integrated rasterization
+      model for the compositor case, no SIMD yet** — P2/P3 are
+      headroom to close the gap to the tiny-skia SIMD-blitter
+      reference (~2.5 ms) for texture/blend-heavy frames.
 - **P2 — Batched fragment execution.** Remove the per-pixel call
   (#2): span/quad FS ABI with SoA inputs + mask.
 - **P3 — vectorization (#3), split two ways:**
