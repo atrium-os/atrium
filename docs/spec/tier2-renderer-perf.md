@@ -212,7 +212,18 @@ the optimistic case; textured/glyph shading is ~2–3× heavier.)
     Textured/MRT/derivative span = follow-up (anchor those param
     reads).  The lane-indexed entry infrastructure is also what
     **P3b** reuses (swap scalar lane ops for SIMD lanes).
-  - **P2.2b — bespoke span codegen (the win that actually lands).**
+  - **P2.2b (DONE) — bespoke span codegen (the win that actually
+    lands).** Pieces 1–2 landed + validated: `.afblob` format v2
+    (`fs_span` entry slot) + jitmap resolution (efb933b); bespoke
+    ARM64 call-per-lane thunk (78399a0); correctness test + Apple-ABI
+    stack-arg fix (c294ebd).  `tests/span_thunk.rs` mmaps the blob
+    and proves a multi-lane masked span call is bit-identical to
+    per-lane `fs_main` (masked-off lanes untouched).  The test caught
+    Apple's ARM64 stack-arg packing (u32s in 4-byte slots vs AAPCS64
+    8-byte slots) — the thunk now picks offsets by `target`.  Only
+    P2.3 (rasterizer calling `fs_span`) remains to realize the win.
+    Original design notes below.
+  - **P2.2b-design — bespoke span codegen (the win that actually lands).**
     The `bench_fs_span` probe (4K, constant-colour FS) measured the
     per-pixel `fs_main` call at **~93% of trivial-FS render time**
     (2.30 ms vs a 0.15 ms no-FS-call floor) — so batching the call
