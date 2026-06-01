@@ -333,12 +333,26 @@ the optimistic case; textured/glyph shading is ~2–3× heavier.)
     the span path is purely a call-overhead optimization, not a
     semantic change.
 - **P3 — vectorization (#3), split two ways:**
-  - **P3a — SIMD the rasterizer's fixed-function loops (Rust).**
-    Coverage + blend + write + texture sample in hand-written Rust
-    SIMD (`std::simd` / `wide`, NEON+SSE). **Backend-agnostic** —
-    this is the dominant win for the *compositor* (2D shaders are
-    trivial; the cost is fixed-function), independent of the
-    bespoke/cranelift choice.
+  - **P3a (slice 1 DONE) — SIMD the rasterizer's fixed-function
+    loops (Rust `std::simd`, NEON/SSE, no dep).** `rasterize_stripe_
+    simd` vectorizes the per-pixel coverage (3 edge functions +
+    inside test) and perspective-correct varying interpolation
+    across a tile-row's 8 lanes (`f32x8`); `fs_main` + the colour
+    write stay per covered lane.  Same simple gate as the span
+    (single-sample, no stencil / late-depth / implicit-LOD /
+    derivatives / MRT, source-replace blend, no depth-buffer effect)
+    so the scalar path keeps every feature-heavy rung untouched.
+    SIMD math is per-lane IEEE (no FMA contraction) → **bit-identical**
+    to scalar (full smoke green BOTH default and `ATRIUM_TIER2_NOSIMD
+    =1`; matching center pixels).  **ON by default**;
+    `ATRIUM_TIER2_NOSIMD=1` is the kill switch.
+    **Measured (`bench_p3a_simd`, 4K screen-covering opaque
+    triangle, const FS): 5.36 ms SIMD vs 7.68 ms scalar — 1.43×**
+    from SIMD coverage alone (n=0 varyings; interp-heavy shaders
+    gain more).  This is the dominant compositor (opaque-fill) win,
+    backend-agnostic.  Remaining P3a slices: SIMD the blend + write
+    scatter (currently per-lane), and extend the gate to depth /
+    simple-blend draws.
   - **P3b — SoA SIMD shader codegen (cranelift).** Lane-batched
     vector code for *per-app* heavy fragment shaders. Use
     **cranelift** (first-class vector types + ISel + vector

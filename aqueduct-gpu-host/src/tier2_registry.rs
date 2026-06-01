@@ -1533,6 +1533,15 @@ fn span_path_enabled() -> bool {
         std::env::var("ATRIUM_TIER2_SPAN").map(|v| v == "1").unwrap_or(false))
 }
 
+/// P3a kill-switch (read once): `ATRIUM_TIER2_NOSIMD=1` forces the
+/// scalar per-pixel path for A/B measurement + as a safety hatch.
+fn scalar_forced() -> bool {
+    use std::sync::OnceLock;
+    static F: OnceLock<bool> = OnceLock::new();
+    *F.get_or_init(||
+        std::env::var("ATRIUM_TIER2_NOSIMD").map(|v| v == "1").unwrap_or(false))
+}
+
 fn rasterize_stripe(
     task: &mut StripeWork<'_, '_>,
     setup: &TriangleSetup,
@@ -1575,6 +1584,33 @@ fn rasterize_stripe(
         && !setup.depth_write;
     if span_ok {
         rasterize_stripe_span(task, setup, draw, fs_span.unwrap());
+        return;
+    }
+
+    // P3a — SIMD fast path: vectorize the per-pixel coverage (3
+    // edge functions + inside test) and perspective-correct varying
+    // interpolation across a tile-row's 8 lanes (`f32x8`, NEON/SSE),
+    // then call `fs_main` per covered lane and write.  Same simple
+    // gate as the span path (single-sample, no stencil / late-depth
+    // / implicit-LOD / derivatives / MRT, source-replace blend, no
+    // depth-buffer effect) so the scalar path below keeps every
+    // feature-heavy rung byte-for-byte unchanged.  The SIMD math is
+    // per-lane IEEE (no FMA contraction), so output is bit-identical
+    // to the scalar loop.  ON by default — this is the dominant
+    // compositor (opaque-fill) win; `ATRIUM_TIER2_NOSIMD=1` forces
+    // the scalar path for A/B.
+    let simd_ok = !scalar_forced()
+        && draw.sample_count == 1
+        && setup.stencil_face.is_none()
+        && !setup.fs_writes_depth
+        && !draw.compute_implicit_lod
+        && !draw.uses_derivatives
+        && task.extra_color.is_empty()
+        && !draw.blend_state.enable
+        && setup.depth_compare_op == CompareOp::Always
+        && !setup.depth_write;
+    if simd_ok {
+        rasterize_stripe_simd(task, setup, draw, fs_main);
         return;
     }
 
@@ -2164,6 +2200,142 @@ fn rasterize_stripe_span(
                 if wm.g { task.pixels[idx + 1] = f32_to_u8(out_color[lane * 4 + 1]); }
                 if wm.b { task.pixels[idx + 2] = f32_to_u8(out_color[lane * 4 + 2]); }
                 if wm.a { task.pixels[idx + 3] = f32_to_u8(out_color[lane * 4 + 3]); }
+            }
+        }
+    }
+}
+
+/// P3a — SIMD fast path for the simple opaque case.  Vectorizes the
+/// per-pixel coverage (3 edge functions + inside test) and
+/// perspective-correct varying interpolation across a tile-row's 8
+/// lanes with `std::simd::f32x8` (NEON/SSE); the `fs_main` call +
+/// colour write stay per covered lane.  All SIMD ops are per-lane
+/// IEEE (no FMA contraction) and mirror `rasterize_stripe`'s scalar
+/// math op-for-op, so output is bit-identical.  Reached only from
+/// `rasterize_stripe`'s `simd_ok` gate (single-sample, no stencil /
+/// late-depth / implicit-LOD / derivatives / MRT, source-replace
+/// blend, no depth-buffer effect).
+fn rasterize_stripe_simd(
+    task: &mut StripeWork<'_, '_>,
+    setup: &TriangleSetup,
+    draw: &DrawTriangle<'_>,
+    fs_main: atrium_spv_loader::FsMain,
+) {
+    use std::simd::f32x8;
+    use std::simd::cmp::SimdPartialOrd;
+
+    let tile_y = task.stripe_y;
+    let stripe_pixel_y = tile_y * TILE_SIZE;
+    let uni_ptr = if draw.uniforms.is_empty() {
+        std::ptr::null()
+    } else { draw.uniforms.as_ptr() };
+    let pc_ptr = if draw.push_constants.is_empty() {
+        std::ptr::null()
+    } else { draw.push_constants.as_ptr() };
+    let (a, b, c) = (setup.a, setup.b, setup.c);
+    let wm = draw.blend_state.write_mask;
+    let n = setup.n;
+    let te = f32x8::splat(setup.total_edge);
+    let zero = f32x8::splat(0.0);
+    let lane_idx = f32x8::from_array([0., 1., 2., 3., 4., 5., 6., 7.]);
+
+    // Edge-function constant coefficients (computed once in f32 to
+    // match the scalar `edge_fn`'s subtractions bit-for-bit).
+    let (e0x, e0y) = (c.0 - b.0, c.1 - b.1); // edge_fn(b,c,·)
+    let (e1x, e1y) = (a.0 - c.0, a.1 - c.1); // edge_fn(c,a,·)
+    let (e2x, e2y) = (b.0 - a.0, b.1 - a.1); // edge_fn(a,b,·)
+
+    // Per-lane interp output (lane-major: [lane*n + k]) + scratch.
+    let mut soa = vec![0f32; (TILE_SIZE as usize) * n.max(1)];
+    let mut interp_buf = vec![0u8; setup.varying_bytes.max(1)];
+    let mut out_color = [0.0f32; 8 * 4];
+    let mut out_depth = 0.0f32;
+
+    for tile_x in setup.tile_min_x..=setup.tile_max_x {
+        let t_min_x = (tile_x * TILE_SIZE).max(setup.min_x);
+        let t_max_x = ((tile_x + 1) * TILE_SIZE - 1).min(setup.max_x);
+        let t_min_y = (tile_y * TILE_SIZE).max(setup.min_y);
+        let t_max_y = ((tile_y + 1) * TILE_SIZE - 1).min(setup.max_y);
+        if t_min_x > t_max_x || t_min_y > t_max_y { continue; }
+        let lanes = (t_max_x - t_min_x + 1) as usize; // ≤ 8
+        let cx = f32x8::splat(t_min_x as f32 + 0.5) + lane_idx;
+
+        for py in t_min_y..=t_max_y {
+            let cy = py as f32 + 0.5;
+            let cy_v = f32x8::splat(cy);
+            let we0 = f32x8::splat(e0x) * (cy_v - f32x8::splat(b.1))
+                - f32x8::splat(e0y) * (cx - f32x8::splat(b.0));
+            let we1 = f32x8::splat(e1x) * (cy_v - f32x8::splat(c.1))
+                - f32x8::splat(e1y) * (cx - f32x8::splat(c.0));
+            let we2 = f32x8::splat(e2x) * (cy_v - f32x8::splat(a.1))
+                - f32x8::splat(e2y) * (cx - f32x8::splat(a.0));
+            let inside = (we0.simd_ge(zero) & we1.simd_ge(zero) & we2.simd_ge(zero))
+                | (we0.simd_le(zero) & we1.simd_le(zero) & we2.simd_le(zero));
+            let inside = inside.to_array();
+
+            let b0 = we0 / te;
+            let b1 = we1 / te;
+            let b2 = we2 / te;
+            let iiw = b0 * f32x8::splat(setup.inv_w[0])
+                + b1 * f32x8::splat(setup.inv_w[1])
+                + b2 * f32x8::splat(setup.inv_w[2]);
+            // Match scalar: oiw = if iiw==0 {0} else {1/iiw}.
+            // (f32x8 div == scalar div per lane; zero-case fixed up.)
+            let mut oiw_a = (f32x8::splat(1.0) / iiw).to_array();
+            let iiw_a = iiw.to_array();
+            for l in 0..8 { if iiw_a[l] == 0.0 { oiw_a[l] = 0.0; } }
+            let oiw = f32x8::from_array(oiw_a);
+
+            // Perspective-correct varyings: per k, SIMD across lanes,
+            // scatter into the lane-major SoA.
+            for k in 0..n {
+                let v = (b0 * f32x8::splat(setup.varying_over_w[0][k])
+                    + b1 * f32x8::splat(setup.varying_over_w[1][k])
+                    + b2 * f32x8::splat(setup.varying_over_w[2][k]))
+                    * oiw;
+                let arr = v.to_array();
+                for lane in 0..lanes { soa[lane * n + k] = arr[lane]; }
+            }
+            let interp_z = b0 * f32x8::splat(setup.ndc[0][2])
+                + b1 * f32x8::splat(setup.ndc[1][2])
+                + b2 * f32x8::splat(setup.ndc[2][2]);
+            let window_z = f32x8::splat(setup.depth_min)
+                + interp_z * f32x8::splat(setup.depth_max - setup.depth_min)
+                + f32x8::splat(setup.depth_bias_offset);
+            let cx_arr = cx.to_array();
+            let oiw_arr = oiw.to_array();
+            let wz_arr = window_z.to_array();
+            let py_local = (py - stripe_pixel_y) as usize;
+
+            for lane in 0..lanes {
+                if !inside[lane] { continue; }
+                let vptr = if n == 0 {
+                    std::ptr::null()
+                } else {
+                    for k in 0..n {
+                        interp_buf[k * 4..k * 4 + 4]
+                            .copy_from_slice(&soa[lane * n + k].to_le_bytes());
+                    }
+                    interp_buf.as_ptr()
+                };
+                // SAFETY: same contract as rasterize_stripe's fs_main
+                // call; out_color sized for one attachment's 4 f32.
+                unsafe {
+                    fs_main(
+                        vptr, uni_ptr, pc_ptr,
+                        cx_arr[lane], cy, wz_arr[lane], oiw_arr[lane],
+                        0,
+                        out_color.as_mut_ptr(), &mut out_depth,
+                        setup.front_facing as u32, setup.primitive_id,
+                    );
+                }
+                let px = (t_min_x + lane as i32) as usize;
+                let idx = (py_local * (setup.width as usize) + px) * 4;
+                if idx + 4 > task.pixels.len() { continue; }
+                if wm.r { task.pixels[idx]     = f32_to_u8(out_color[0]); }
+                if wm.g { task.pixels[idx + 1] = f32_to_u8(out_color[1]); }
+                if wm.b { task.pixels[idx + 2] = f32_to_u8(out_color[2]); }
+                if wm.a { task.pixels[idx + 3] = f32_to_u8(out_color[3]); }
             }
         }
     }

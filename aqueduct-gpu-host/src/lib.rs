@@ -60,6 +60,10 @@
 //!   `atrium_gpu_token` import path)
 
 #![deny(missing_docs)]
+// P3a: portable SIMD (std::simd) for the Tier-2 rasterizer's
+// fixed-function inner loops (coverage / interp / blend), lowering
+// to NEON on aarch64 and SSE on x86 with no external dependency.
+#![feature(portable_simd)]
 
 pub mod backend;
 pub mod listener;
