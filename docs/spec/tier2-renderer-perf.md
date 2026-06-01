@@ -363,6 +363,43 @@ the optimistic case; textured/glyph shading is ~2–3× heavier.)
     shaders. (Compile latency is amortized: compositor shaders are
     fixed/compiled-once; app shaders are content-hashed in the
     shader cache.)
+    - **Scope (the hard truth).** This is a **value-model rewrite**
+      of the cranelift codegen, not an op-by-op addition.  Today
+      `FnTranslator` is scalar: `scalars: ValueId→Value` (one f32),
+      `vectors: ValueId→Vec<Value>` (per-component lanes of a
+      vec2/3/4).  P3b reinterprets *every* SSA value as `f32xW`
+      across W **pixel** lanes — so a shader `vec4` becomes 4×
+      `f32xW`, a scalar becomes 1× `f32xW`.  Each op maps to its
+      vector form (`fadd`→`fadd` on `f32xW`, ConstFloat→`splat`,
+      `Select`→`vselect`, comparisons→vector masks).  Builds on the
+      span entry (P2.2): replace its scalar lane *loop* with a
+      single vectorized body over `f32xW`.
+    - **Control flow needs masking (SIMT).** Divergent `BranchCond`/
+      `Switch`/`Phi`/loops must become per-lane **predication**: an
+      active-lane mask, predicated stores (`vselect(mask, new, old)`),
+      and loop-active-lane tracking.  So **slice 1 = straight-line FS
+      only** (single block, no Phi/Branch/Switch) with the float
+      arithmetic + Load + ConstFloat + Store + Select + vec
+      construct/extract subset; control-flow / texture / int / matrix
+      FS fall back to the scalar span (or per-pixel).  Masking is a
+      later slice.
+    - **SoA layout.** Vector loads want each varying's W lanes
+      contiguous (**varying-major** SoA: `varyings_soa[k*W + lane]`),
+      vs the scalar span's **lane-major** (`lane*stride + k`).  Two
+      routes: (a) rasterizer gathers varying-major for the vectorized
+      span (new gather); (b) keep lane-major and build `f32xW` via W
+      insertlanes / extractlanes at the I/O edges (no rasterizer
+      change; insert/extract overhead amortized only for arithmetic-
+      heavy FS — which is exactly P3b's target).  Start with (b) to
+      decouple from the rasterizer.
+    - **Validation.** A unit test (like `span_thunk` / the cranelift
+      span) mmaps the vectorized span and asserts each lane ==
+      per-lane `fs_main`, for an arithmetic FS with interpolated
+      varyings.
+    - **Note:** P3b targets *heavy per-app* FS.  For the compositor's
+      trivial fills the **gather** dominates (P3a already vectorized
+      it) and the FS body is nearly free, so P3b adds little there —
+      it's the lever for app shaders with real per-pixel math.
 - **P4 — Compositor fast paths + integration.** Opaque/occlusion/
   damage; feature parity for `HeadlessRenderer` (indirect draw +
   whatever compute it issues); point `fresco-vulkan`'s ICD at
