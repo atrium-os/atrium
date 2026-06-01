@@ -1599,16 +1599,19 @@ fn rasterize_stripe(
     // to the scalar loop.  ON by default — this is the dominant
     // compositor (opaque-fill) win; `ATRIUM_TIER2_NOSIMD=1` forces
     // the scalar path for A/B.
+    // Depth (test/write/bounds) + blend ARE handled — per lane in
+    // the scatter via the SAME resolve_depth_stencil / apply_blend
+    // the scalar path uses, so output stays bit-identical; only the
+    // SIMD-able coverage + interpolation are vectorized.  Excluded:
+    // stencil, MSAA, MRT, implicit-LOD, derivatives, and late-depth
+    // (gl_FragDepth) — those keep the scalar path.
     let simd_ok = !scalar_forced()
         && draw.sample_count == 1
         && setup.stencil_face.is_none()
         && !setup.fs_writes_depth
         && !draw.compute_implicit_lod
         && !draw.uses_derivatives
-        && task.extra_color.is_empty()
-        && !draw.blend_state.enable
-        && setup.depth_compare_op == CompareOp::Always
-        && !setup.depth_write;
+        && task.extra_color.is_empty();
     if simd_ok {
         rasterize_stripe_simd(task, setup, draw, fs_main);
         return;
@@ -2309,6 +2312,17 @@ fn rasterize_stripe_simd(
 
             for lane in 0..lanes {
                 if !inside[lane] { continue; }
+                let px = (t_min_x + lane as i32) as usize;
+                let pixel_lin = py_local * (setup.width as usize) + px;
+                // Early-Z (stencil excluded by the gate -> None / true),
+                // identical to rasterize_stripe's pre-FS depth resolve.
+                if !resolve_depth_stencil(
+                    task.depth.as_deref_mut(), None, None, true,
+                    pixel_lin, wz_arr[lane], setup.depth_bounds,
+                    setup.depth_compare_op, setup.depth_write, None,
+                ) {
+                    continue;
+                }
                 let vptr = if n == 0 {
                     std::ptr::null()
                 } else {
@@ -2329,13 +2343,25 @@ fn rasterize_stripe_simd(
                         setup.front_facing as u32, setup.primitive_id,
                     );
                 }
-                let px = (t_min_x + lane as i32) as usize;
-                let idx = (py_local * (setup.width as usize) + px) * 4;
+                let idx = pixel_lin * 4;
                 if idx + 4 > task.pixels.len() { continue; }
-                if wm.r { task.pixels[idx]     = f32_to_u8(out_color[0]); }
-                if wm.g { task.pixels[idx + 1] = f32_to_u8(out_color[1]); }
-                if wm.b { task.pixels[idx + 2] = f32_to_u8(out_color[2]); }
-                if wm.a { task.pixels[idx + 3] = f32_to_u8(out_color[3]); }
+                // Blend + write-mask, identical to rasterize_stripe's
+                // attachment-0 scatter.
+                let src = [out_color[0], out_color[1], out_color[2], out_color[3]];
+                let bs = &draw.blend_state;
+                let fin = if bs.enable {
+                    let dst = [
+                        task.pixels[idx]     as f32 / 255.0,
+                        task.pixels[idx + 1] as f32 / 255.0,
+                        task.pixels[idx + 2] as f32 / 255.0,
+                        task.pixels[idx + 3] as f32 / 255.0,
+                    ];
+                    apply_blend(bs, src, dst)
+                } else { src };
+                if wm.r { task.pixels[idx]     = f32_to_u8(fin[0]); }
+                if wm.g { task.pixels[idx + 1] = f32_to_u8(fin[1]); }
+                if wm.b { task.pixels[idx + 2] = f32_to_u8(fin[2]); }
+                if wm.a { task.pixels[idx + 3] = f32_to_u8(fin[3]); }
             }
         }
     }
