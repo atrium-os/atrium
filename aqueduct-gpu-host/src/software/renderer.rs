@@ -781,6 +781,7 @@ impl<'a> TinySkiaRenderer<'a> {
                 | FrameOp::CopyBufToImg
                 | FrameOp::CopyImgToBuf
                 | FrameOp::Blit
+                | FrameOp::FillBuffer
                 | FrameOp::PipelineBarrier => {
                     // Phase 1.3c-rect: not yet implemented. Subsequent
                     // commits add these in priority order: SetScissor

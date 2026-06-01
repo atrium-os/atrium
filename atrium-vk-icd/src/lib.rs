@@ -2146,6 +2146,10 @@ pub unsafe extern "C" fn vk_icdGetInstanceProcAddr(
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkCommandBuffer, u32, u32, u32), FnVoidPtr,
             >(vkCmdDispatch)),
+        "vkCmdFillBuffer" =>
+            Some(std::mem::transmute::<
+                unsafe extern "C" fn(VkCommandBuffer, u64, u64, u64, u32), FnVoidPtr,
+            >(vkCmdFillBuffer)),
         "vkCmdNextSubpass" =>
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(VkCommandBuffer, u32), FnVoidPtr,
@@ -5997,6 +6001,30 @@ pub unsafe extern "C" fn vkCmdDispatch(
     let _ = cb.frame.push_dispatch(aqueduct_gpu::frame::DispatchCmd {
         group_count_x, group_count_y, group_count_z,
     });
+}
+
+/// `vkCmdFillBuffer` — fill `[dst_offset, dst_offset+size)` of
+/// `dst_buffer` with the 32-bit `data` repeated.  Pushes
+/// `FrameOp::FillBuffer`.  Body (28 B): buffer_id u32 @0, offset u64
+/// @8, size u64 @16 (`u64::MAX` = whole buffer from offset), data
+/// u32 @24.  Used by compute clients to zero a counter/SSBO before
+/// dispatch (fresco-vulkan's HeadlessRenderer).
+#[no_mangle]
+pub unsafe extern "C" fn vkCmdFillBuffer(
+    command_buffer: VkCommandBuffer,
+    dst_buffer:     u64,
+    dst_offset:     u64,
+    size:           u64,
+    data:           u32,
+) {
+    let Some(cb) = cmdbuf_recording(command_buffer) else { return };
+    let rid = resolve_buffer(cb, dst_buffer).raw();
+    let mut body = [0u8; 28];
+    body[ 0.. 4].copy_from_slice(&rid.to_le_bytes());
+    body[ 8..16].copy_from_slice(&dst_offset.to_le_bytes());
+    body[16..24].copy_from_slice(&size.to_le_bytes());
+    body[24..28].copy_from_slice(&data.to_le_bytes());
+    let _ = cb.frame.push(aqueduct_gpu::opcodes::FrameOp::FillBuffer, &body);
 }
 
 /// `vkCmdNextSubpass` — no-op today. Atrium's render-pass model

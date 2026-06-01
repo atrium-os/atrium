@@ -315,6 +315,10 @@ pub enum FrameOp {
     CopyImgToBuf    = 0x0061,
     /// Blit between images (with optional filter).
     Blit            = 0x0062,
+    /// Fill a buffer range with a repeated u32 (`vkCmdFillBuffer`).
+    /// Body: `buffer_id u32`, `offset u64`, `size u64`
+    /// (`u64::MAX` = whole buffer from `offset`), `data u32`.
+    FillBuffer      = 0x0063,
 
     /// Pipeline-barrier between stages and resources.
     PipelineBarrier = 0x0070,
@@ -362,6 +366,7 @@ impl FrameOp {
             0x0060 => FrameOp::CopyBufToImg,
             0x0061 => FrameOp::CopyImgToBuf,
             0x0062 => FrameOp::Blit,
+            0x0063 => FrameOp::FillBuffer,
             0x0070 => FrameOp::PipelineBarrier,
             _ => return None,
         })
@@ -400,6 +405,7 @@ mod tests {
             FrameOp::Draw, FrameOp::DrawIndexed, FrameOp::DrawIndirect,
             FrameOp::Dispatch, FrameOp::DispatchIndirect,
             FrameOp::CopyBufToImg, FrameOp::CopyImgToBuf, FrameOp::Blit,
+            FrameOp::FillBuffer,
             FrameOp::PipelineBarrier,
         ] {
             assert_eq!(FrameOp::from_u16(op.as_u16()), Some(op));

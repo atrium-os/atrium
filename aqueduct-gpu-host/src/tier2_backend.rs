@@ -3178,6 +3178,7 @@ impl Tier2Backend {
                     Err(e) => log::warn!("malformed Dispatch: {e}"),
                 },
                 FrameOp::CopyImgToBuf => self.execute_copy_image_to_buffer(body),
+                FrameOp::FillBuffer => self.execute_fill_buffer(body),
                 // CopyBufToImg is handled by the pre-pass
                 // walker (see `execute_upload_ops`) so texture
                 // uploads land BEFORE the render passes that
@@ -3266,6 +3267,40 @@ impl Tier2Backend {
                 dst_buf.bytes[dst_off..dst_off + row_bytes]
                     .copy_from_slice(&src_pixels[src_off..src_off + row_bytes]);
             }
+        }
+    }
+
+    /// `FrameOp::FillBuffer` -- fill a buffer range with a repeated
+    /// u32 (`vkCmdFillBuffer`).  Body (28 B): buffer_id u32 @0,
+    /// offset u64 @8, size u64 @16 (`u64::MAX` = whole buffer from
+    /// offset), data u32 @24.  Vulkan requires `offset` + `size`
+    /// 4-aligned, so the fill is a whole number of u32 words.
+    fn execute_fill_buffer(&self, body: &[u8]) {
+        if body.len() < 28 {
+            log::warn!("FillBuffer: body too short ({} bytes)", body.len());
+            return;
+        }
+        let buffer_id = u32::from_le_bytes(body[0..4].try_into().unwrap());
+        let offset = u64::from_le_bytes(body[8..16].try_into().unwrap()) as usize;
+        let size   = u64::from_le_bytes(body[16..24].try_into().unwrap());
+        let data   = u32::from_le_bytes(body[24..28].try_into().unwrap());
+        let mut buffers = self.buffers.lock().unwrap();
+        let Some(buf) = buffers.get_mut(&buffer_id) else {
+            log::warn!("FillBuffer: buffer {buffer_id} not registered");
+            return;
+        };
+        let len = buf.bytes.len();
+        if offset > len { return; }
+        let end = if size == u64::MAX {
+            len
+        } else {
+            (offset + size as usize).min(len)
+        };
+        let word = data.to_le_bytes();
+        let mut i = offset;
+        while i + 4 <= end {
+            buf.bytes[i..i + 4].copy_from_slice(&word);
+            i += 4;
         }
     }
 
