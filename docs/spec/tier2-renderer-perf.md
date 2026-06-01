@@ -446,6 +446,30 @@ the optimistic case; textured/glyph shading is ~2–3× heavier.)
     P4 (ICD redirect) is the route that also runs unmodified *Vulkan
     apps* on tier2; the native path is the lower-overhead compositor-
     only route.  Worth weighing which to invest in.
+  - **Empirical bring-up (in progress).** `fresco-vulkan/examples/
+    headless_icd.rs` runs HeadlessRenderer through atrium-vk-icd +
+    the tier2 daemon.  **Level 1 PASS** (4fcc0c1, 65c2e77): the
+    compositor's core Vulkan path — instance / device / image /
+    render-pass clear / copy-image-to-buffer / readback — works on
+    tier2 (exact clear colour read back).  Two ICD gaps fixed en
+    route: advertise `VK_KHR_get_physical_device_properties2`;
+    `HOST_COHERENT` map coherence (`vkMapMemory` pulls daemon bytes
+    so map+read needs no explicit invalidate).
+    **Level 2 (in progress):** `load_bundle(atrium-core)` **PASSES**
+    — the rect/path/texture **compute + graphics shaders (Slang →
+    SPIR-V) all compile on tier2**.  `render_to_buffer` then aborts
+    on the next gap: **`vkCmdFillBuffer` is unimplemented** in the
+    ICD (HeadlessRenderer uses it to zero the compute atomic counter;
+    ash calls a null fn-ptr → SIGABRT).  Remaining level-2 gaps to
+    triage in order: (1) **`vkCmdFillBuffer`** — needs a new
+    `FrameOp::FillBuffer` (opcode + encode/decode) + ICD entry +
+    dispatch-table wire + daemon handler (fill a buffer range with a
+    u32); (2) the **compute dispatch** writing the instance SSBO +
+    atomic counter end-to-end; (3) the **graphics VS reading the
+    instance SSBO by `gl_InstanceIndex`** ((Vertex, StorageBuffer)
+    mapping); (4) **descriptor-set-bound storage buffers** for
+    compute + graphics.  Each is concrete, pinpointed from the
+    daemon's opcode wire-trace.
   - Then: compositor fast paths (opaque / occlusion / damage).
 - **PT — Partial-update transport (in-app sub-rect damage).** Add
   `slot_update_region` / CAS patch + present damage rect to the
