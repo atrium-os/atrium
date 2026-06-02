@@ -56,6 +56,9 @@ struct OwnedDraw {
     compute_implicit_lod: bool,
     uses_derivatives: bool,
     sample_count: u32,
+    /// Primary colour attachment is BGRA-order: store the FS's RGBA
+    /// output with R/B swapped (matches the clear path + sampler).
+    swap_rb: bool,
     fs_main: atrium_spv_loader::FsMain,
     /// P2.3: batched span fragment entry, when the backend emitted
     /// one for this shader (`None` keeps the per-pixel path).
@@ -81,6 +84,7 @@ impl OwnedDraw {
             compute_implicit_lod: self.compute_implicit_lod,
             uses_derivatives: self.uses_derivatives,
             sample_count: self.sample_count,
+            swap_rb: self.swap_rb,
             ..Default::default()
         }
     }
@@ -586,6 +590,14 @@ fn vk_format_to_tex_format(vk_format: u32) -> atrium_spv_runtime::TexFormat {
         50 => T::Bgra8Srgb,  // VK_FORMAT_B8G8R8A8_SRGB
         _  => T::Rgba8Unorm,
     }
+}
+
+/// True when a stored `tex_format` (the `TexFormat as u32` an image
+/// carries) is a BGRA-order family member, so a colour attachment of
+/// this format needs the FS's RGBA output R/B-swapped on store.
+fn is_bgra_tex_format(tex_format: u32) -> bool {
+    use atrium_spv_runtime::TexFormat as T;
+    tex_format == T::Bgra8Unorm as u32 || tex_format == T::Bgra8Srgb as u32
 }
 
 /// Bytes per texel for a colour `VkFormat`'s native storage:
@@ -1812,6 +1824,13 @@ impl Tier2Backend {
             log::debug!("Draw on target {target_id} skipped: vertex_count=0");
             return;
         }
+        // Primary colour attachment R/B order: a BGRA target needs
+        // the FS's RGBA output swapped on store (matches the clear
+        // path + sampler).  Looked up once per draw.
+        let swap_rb = self.images.lock().ok()
+            .and_then(|m| m.get(&(target_id.raw() as u64))
+                .map(|i| is_bgra_tex_format(i.tex_format)))
+            .unwrap_or(false);
         // Rasterizer-discard short-circuit.  Pipeline static
         // wins by default; the cmdbuf can override via
         // `vkCmdSetRasterizerDiscardEnable`.  When discard is
@@ -2519,6 +2538,7 @@ impl Tier2Backend {
                     && varying_f32_count >= 2,
                 uses_derivatives: fs_derivatives,
                 sample_count,
+                swap_rb,
                 fs_main,
                 fs_span: self.registry.get(fs_shader_id)
                     .and_then(|s| s.entry_points.fs_span_main),
@@ -3529,6 +3549,11 @@ impl Tier2Backend {
             return;
         }
         if cmd.index_count == 0 { return; }
+        // Primary colour attachment R/B order (see dispatch_draw).
+        let swap_rb = self.images.lock().ok()
+            .and_then(|m| m.get(&(target_id.raw() as u64))
+                .map(|i| is_bgra_tex_format(i.tex_format)))
+            .unwrap_or(false);
         // Rasterizer-discard short-circuit (same shape as
         // dispatch_draw -- see comment there).
         let pipeline_discard = state.raster
@@ -3889,6 +3914,7 @@ impl Tier2Backend {
                 // table (matches the dt's defaulted uses_derivatives).
                 uses_derivatives: false,
                 sample_count,
+                swap_rb,
                 fs_main,
                 fs_span: self.registry.get(fs_shader_id)
                     .and_then(|s| s.entry_points.fs_span_main),

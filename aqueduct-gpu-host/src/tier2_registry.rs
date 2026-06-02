@@ -2058,12 +2058,19 @@ fn rasterize_stripe(
                 // attachment 0's state when the app didn't
                 // supply a per-attachment entry).
                 for slot in 0..n_color {
-                    let src = [
-                        out_color[slot * 4],
-                        out_color[slot * 4 + 1],
-                        out_color[slot * 4 + 2],
-                        out_color[slot * 4 + 3],
-                    ];
+                    // R/B-swap the primary attachment's FS output for
+                    // a BGRA target (extra MRT attachments keep their
+                    // own order — mixed-format MRT is not yet wired).
+                    let src = if slot == 0 && draw.swap_rb {
+                        [out_color[2], out_color[1], out_color[0], out_color[3]]
+                    } else {
+                        [
+                            out_color[slot * 4],
+                            out_color[slot * 4 + 1],
+                            out_color[slot * 4 + 2],
+                            out_color[slot * 4 + 3],
+                        ]
+                    };
                     let target: &mut [u8] = if slot == 0 {
                         &mut task.pixels[..]
                     } else {
@@ -2208,9 +2215,11 @@ fn rasterize_stripe_span(
                 let px = (t_min_x + lane as i32) as usize;
                 let idx = (py_local * (setup.width as usize) + px) * 4;
                 if idx + 4 > task.pixels.len() { continue; }
-                if wm.r { task.pixels[idx]     = f32_to_u8(out_color[lane * 4]); }
+                // R/B channel indices for a BGRA attachment.
+                let (ci0, ci2) = if draw.swap_rb { (2, 0) } else { (0, 2) };
+                if wm.r { task.pixels[idx]     = f32_to_u8(out_color[lane * 4 + ci0]); }
                 if wm.g { task.pixels[idx + 1] = f32_to_u8(out_color[lane * 4 + 1]); }
-                if wm.b { task.pixels[idx + 2] = f32_to_u8(out_color[lane * 4 + 2]); }
+                if wm.b { task.pixels[idx + 2] = f32_to_u8(out_color[lane * 4 + ci2]); }
                 if wm.a { task.pixels[idx + 3] = f32_to_u8(out_color[lane * 4 + 3]); }
             }
         }
@@ -2355,8 +2364,14 @@ fn rasterize_stripe_simd(
                 let idx = pixel_lin * 4;
                 if idx + 4 > task.pixels.len() { continue; }
                 // Blend + write-mask, identical to rasterize_stripe's
-                // attachment-0 scatter.
-                let src = [out_color[0], out_color[1], out_color[2], out_color[3]];
+                // attachment-0 scatter.  R/B-swap the FS output for a
+                // BGRA attachment so blend reads native-order dst and
+                // the store writes native order.
+                let src = if draw.swap_rb {
+                    [out_color[2], out_color[1], out_color[0], out_color[3]]
+                } else {
+                    [out_color[0], out_color[1], out_color[2], out_color[3]]
+                };
                 let bs = &draw.blend_state;
                 let fin = if bs.enable {
                     let dst = [
@@ -2625,6 +2640,15 @@ pub struct DrawTriangle<'a> {
     /// the early-Z path (depth test + write before the FS).
     pub fs_writes_depth: bool,
 
+    /// When true, the primary colour attachment is a BGRA-order
+    /// format (`VK_FORMAT_B8G8R8A8_*`), so the FS's RGBA output
+    /// is stored with R/B swapped — matching the daemon's
+    /// "storage = native attachment format" convention (the clear
+    /// path already stores BGRA, and the texture sampler reads
+    /// BGRA storage with an R/B swap).  False for RGBA attachments
+    /// (the common case) leaves the fast path byte-identical.
+    pub swap_rb: bool,
+
     /// StorageBuffer descriptor table handed to the vertex
     /// shader as its trailing `storage_table` parameter: a
     /// packed array of `u64` buffer base pointers, one per
@@ -2720,6 +2744,7 @@ impl Default for DrawTriangle<'_> {
             instance_index: 0,
             primitive_id: 0,
             fs_writes_depth: false,
+            swap_rb: false,
             vs_storage_table: &[],
         }
     }
