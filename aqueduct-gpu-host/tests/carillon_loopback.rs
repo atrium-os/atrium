@@ -38,7 +38,23 @@ struct Rig {
 }
 
 impl Rig {
+    /// Echo handler: ack each frame, carrying the fence id + frame ref
+    /// into the completion (ignores the staged bytes).
     fn start(name: &str) -> Self {
+        Rig::start_with(name, |sub: &SubDesc, _bytes: &[u8]| CompDesc {
+            kind: CompDesc::KIND_FRAME_DONE,
+            fence_id: sub.fence_id,
+            result: 0,
+            readback_off: sub.frame_off,
+            readback_len: sub.frame_len,
+        })
+    }
+
+    /// Start host + guest with a custom per-frame dispatcher.
+    fn start_with<H>(name: &str, handler: H) -> Self
+    where
+        H: FnMut(&SubDesc, &[u8]) -> CompDesc + Send + 'static,
+    {
         let path = tmp_shm(name);
         let host_region = Region::create(&path, layout::TOTAL_SIZE).unwrap();
 
@@ -56,16 +72,8 @@ impl Rig {
         let guest = GuestRing::new(guest_region, g2h_write_fd, h2g_read_fd);
 
         let host_join = thread::spawn(move || {
-            // Echo handler: ack each frame, carrying the fence id +
-            // frame ref into the completion.
-            host.serve(|sub: &SubDesc| CompDesc {
-                kind: CompDesc::KIND_FRAME_DONE,
-                fence_id: sub.fence_id,
-                result: 0,
-                readback_off: sub.frame_off,
-                readback_len: sub.frame_len,
-            })
-            .unwrap();
+            let mut handler = handler;
+            host.serve(&mut handler).unwrap();
             (host.wakeups(), host.frames_processed())
         });
 
@@ -171,4 +179,95 @@ fn fire_and_forget_does_not_block_submitter() {
 
     let (_, frames) = rig.stop_and_join();
     assert_eq!(frames, 16);
+}
+
+#[test]
+fn frame_through_carillon_renders_on_backend() {
+    // The transport's real job: a guest stages a real aqueduct-gpu
+    // FrameOp stream in the arena and submits a descriptor referencing
+    // it; the host drains it and dispatches the bytes to a Backend that
+    // actually renders. Proves Carillon carries the live wire end to end
+    // (host-side, SoftwareBackend → CI-portable, no MoltenVk/DYLD).
+    use aqueduct_gpu::frame::FrameBuilder;
+    use aqueduct_gpu::ids::{IdNamespace, ResourceId};
+    use aqueduct_gpu::opcodes::FrameOp;
+    use aqueduct_gpu_host::software::{
+        BeginRenderPassBody, RectOpParams, BUILTIN_PIPELINE_RECT,
+    };
+    use aqueduct_gpu_host::{Backend, SoftwareBackend};
+
+    const W: u32 = 64;
+    const H: u32 = 64;
+
+    let sw = Arc::new(SoftwareBackend::new());
+    let image_id = ResourceId::new(IdNamespace::IcdRuntime, 1);
+    sw.image_created(image_id, W, H);
+
+    // Host per-frame dispatcher: run the staged FrameOp stream through
+    // the backend (this is the seam the daemon's Session fills in T3).
+    let sw_host = sw.clone();
+    let rig = Rig::start_with("sw_frame", move |sub: &SubDesc, bytes: &[u8]| {
+        let fence = ResourceId::new(IdNamespace::IcdRuntime, sub.fence_id);
+        let ok = sw_host.submit_frame(fence, 1, bytes);
+        CompDesc {
+            kind: if ok { CompDesc::KIND_FRAME_DONE } else { CompDesc::KIND_ERROR },
+            fence_id: sub.fence_id,
+            result: u32::from(!ok),
+            readback_off: 0,
+            readback_len: W * H * 4,
+        }
+    });
+
+    // Build a cyan-rect frame (builtin rect pipeline — no SPIR-V upload).
+    let mut fb = FrameBuilder::new(8192);
+    fb.push(
+        FrameOp::BeginRenderPass,
+        &BeginRenderPassBody {
+            target_image_id: image_id.raw(),
+            clear_color_rgba8: [0, 0, 0, 255],
+            flags: 0,
+        }
+        .to_bytes(),
+    )
+    .unwrap();
+    let rect_pipe = ResourceId::new(IdNamespace::Builtin, BUILTIN_PIPELINE_RECT);
+    fb.push(FrameOp::BindPipeline, &rect_pipe.raw().to_le_bytes()).unwrap();
+    let params = RectOpParams {
+        x: 0.0, y: 0.0, w: W as f32, h: H as f32,
+        r: 0.0, g: 1.0, b: 1.0, a: 1.0, // cyan
+    };
+    let mut pc = vec![0u8; 4];
+    pc.extend_from_slice(&params.to_bytes());
+    fb.push(FrameOp::PushConstants, &pc).unwrap();
+    fb.push(FrameOp::Draw, &[0u8; 16]).unwrap();
+    fb.push(FrameOp::EndRenderPass, &[]).unwrap();
+    let frame = fb.as_bytes().to_vec();
+
+    // Stage in the arena, submit a descriptor referencing it, ring.
+    rig.guest.stage_frame(0, &frame);
+    rig.guest.submit(&SubDesc {
+        kind: SubDesc::KIND_FRAME,
+        fence_id: 1,
+        frame_off: 0,
+        frame_len: frame.len() as u32,
+        flags: 0,
+    });
+    rig.guest.ring();
+
+    let comps = rig.guest.wait_completions().unwrap();
+    assert_eq!(comps.len(), 1);
+    assert_eq!(comps[0].kind, CompDesc::KIND_FRAME_DONE, "frame rendered ok");
+
+    // SoftwareBackend renders synchronously inside submit_frame, so the
+    // completion implies pixels are ready. cyan @ full alpha → (0,255,255,255).
+    let px = sw.read_image_pixels(image_id).expect("rendered pixels");
+    let c = ((H as usize / 2) * W as usize + W as usize / 2) * 4;
+    assert_eq!(
+        &px[c..c + 4],
+        &[0, 255, 255, 255],
+        "cyan centre rendered via the Carillon transport"
+    );
+
+    let (_, frames) = rig.stop_and_join();
+    assert_eq!(frames, 1);
 }

@@ -48,8 +48,15 @@ pub mod layout {
     pub const COMP_RING_OFFSET: usize = 0x1_0000;
     /// Region-table base (BO descriptors). 16 KiB-aligned.
     pub const REGION_TABLE_OFFSET: usize = 0x2_0000;
-    /// Default total mapping: control + rings + a region table page.
+    /// Frame-staging arena base — where serialized FrameOp streams live;
+    /// `SubDesc.frame_off` is relative to this. 16 KiB-aligned. (Large
+    /// BO payloads ride the host-visible region transport, not here; this
+    /// arena carries the comparatively small command stream.)
+    pub const FRAME_ARENA_OFFSET: usize = 0x3_0000;
+    /// Default total mapping: control + rings + region table + arena.
     pub const TOTAL_SIZE: usize = 0x10_0000; // 1 MiB
+    /// Frame-staging arena byte span.
+    pub const FRAME_ARENA_BYTES: usize = TOTAL_SIZE - FRAME_ARENA_OFFSET;
 
     /// Fixed descriptor size for both rings.
     pub const DESC_SIZE: usize = 64;
@@ -257,6 +264,33 @@ impl Region {
     pub fn set_guest_status(&self, v: u32) { self.ctrl(C_GUEST_STATUS).store(v, Ordering::Release); }
     /// Read the host-page-size field published in the control page.
     pub fn host_page_size_field(&self) -> u32 { self.ctrl(C_HOST_PAGE_SIZE).load(Ordering::Acquire) }
+
+    /// Host read of a staged FrameOp stream: `frame_off` is relative to
+    /// the frame arena, `len` bytes. Returns an empty slice if the range
+    /// is out of bounds (a malformed descriptor never reads past the
+    /// mapping — part of the trust boundary).
+    pub fn frame_bytes(&self, frame_off: u32, len: u32) -> &[u8] {
+        let off = FRAME_ARENA_OFFSET + frame_off as usize;
+        let len = len as usize;
+        if frame_off as usize + len > FRAME_ARENA_BYTES {
+            return &[];
+        }
+        // SAFETY: bounds-checked into the frame arena within the mapping;
+        // the slice borrows the live mapping for `&self`.
+        unsafe { std::slice::from_raw_parts(self.ptr.add(off), len) }
+    }
+
+    /// Guest write of a FrameOp stream into the arena at `frame_off`.
+    /// Panics on overflow (the guest must size its staging correctly).
+    pub fn stage_frame(&self, frame_off: u32, bytes: &[u8]) {
+        let off = FRAME_ARENA_OFFSET + frame_off as usize;
+        assert!(frame_off as usize + bytes.len() <= FRAME_ARENA_BYTES,
+            "carillon: frame stage overflows arena");
+        // SAFETY: bounds-checked; dst within the mapping.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(off), bytes.len());
+        }
+    }
 
     /// Copy a descriptor's 64 bytes into the ring at `byte_off`.
     #[inline]
@@ -582,9 +616,11 @@ impl Host {
     pub fn frames_processed(&self) -> u64 { self.frames }
 
     /// Serve until the [`ShutdownHandle`] fires (or a `SubDesc` with
-    /// `KIND_STOP` is drained). `handler` maps a submitted frame to its
-    /// completion (T0: typically an echo/ack).
-    pub fn serve<H: FnMut(&SubDesc) -> CompDesc>(&mut self, mut handler: H) -> io::Result<()> {
+    /// `KIND_STOP` is drained). `handler` receives each submitted frame's
+    /// descriptor and its staged FrameOp byte stream (read from the frame
+    /// arena) and returns the completion — e.g. an echo/ack, or a real
+    /// `Backend::submit_frame` dispatch.
+    pub fn serve<H: FnMut(&SubDesc, &[u8]) -> CompDesc>(&mut self, mut handler: H) -> io::Result<()> {
         loop {
             let wake = self.waiter.wait()?;
 
@@ -615,7 +651,14 @@ impl Host {
                         continue;
                     }
                     self.frames += 1;
-                    let comp = handler(&sub);
+                    // Read the staged FrameOp stream this descriptor
+                    // references, then hand both to the dispatcher. The
+                    // immutable borrow of the arena ends before
+                    // push_completion's borrow.
+                    let comp = {
+                        let bytes = self.region.frame_bytes(sub.frame_off, sub.frame_len);
+                        handler(&sub, bytes)
+                    };
                     self.push_completion(&comp);
                     completed_any = true;
                 }
@@ -664,6 +707,12 @@ impl GuestRing {
     pub fn new(region: Region, g2h_write_fd: RawFd, h2g_read_fd: RawFd) -> Self {
         region.set_guest_status(1);
         GuestRing { region, g2h_write_fd, h2g_read_fd }
+    }
+
+    /// Stage a serialized FrameOp stream into the frame arena at
+    /// `frame_off` (then reference it via `SubDesc.frame_off/frame_len`).
+    pub fn stage_frame(&self, frame_off: u32, bytes: &[u8]) {
+        self.region.stage_frame(frame_off, bytes);
     }
 
     /// Enqueue a submission descriptor and ring the host doorbell. Does
