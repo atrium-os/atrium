@@ -204,15 +204,20 @@ Metal via MoltenVK).
   and replays the frame op stream as real Vulkan on Metal. A
   render-pass *clear* + image→buffer *readback* run on the Apple M4 Max
   and read back the exact clear colour (the mirror of tier2 level-1).
-- **Tier-3 level-2 still pending:** draws / pipelines / SPIR-V→Metal.
-  The compositor's rect needs *draw* rendering, so the router is still
-  blocked on level-2 — but the GPU command path now exists to build it
-  on (no longer a from-scratch stub).
+- **Tier-3 level-2a DONE (60002aa):** real graphics-pipeline DRAW.
+  `MoltenVkBackend::draw_and_copy` builds a Vulkan pipeline from VS+FS
+  SPIR-V (MoltenVK → Metal), records a render-pass clear + `vkCmdDraw` +
+  image→buffer copy, and reads back the rendered colour on the M4 Max
+  (`draw_triangle_through_metal` test). The hard "can Tier-3 draw?" is
+  answered — yes — and the pipeline/render-pass/framebuffer/shader-module
+  helpers exist.
+- **Tier-3 level-2b still pending:** wire the draw path to the FrameOp
+  stream + add a hardware pipeline-create hook on the `Backend` trait
+  (the daemon's pipeline path is currently tier2-specific). Then the
+  compositor rect renders on Metal end-to-end.
 
-**Next step is completing the Tier-3 draw path** (level-2: `vkCmdDraw`
-pipelines + SPIR-V shader modules — MoltenVK compiles SPIR-V→Metal
-internally, so this is mostly pipeline/renderpass plumbing, not a
-hand-rolled cross-compile). Only then:
+**Next step is level-2b** (FrameOp BindPipeline/Draw replay + Backend
+pipeline-create plumbing). Only then:
 - measure the crossover (submit/latency on Tier-3 vs CPU cost on
   Tier-2; note wall-clock on a warm host GPU captures the
   *submit/latency* component but not silicon *wake* energy — that
