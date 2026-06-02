@@ -1,10 +1,17 @@
-# GPU VM Transport — doorbell-driven guest→host aqueduct-gpu carrier
+# Carillon — doorbell-driven guest→host aqueduct-gpu transport
+
+> *A carillon is a tuned set of bells rung together — the doorbell at the
+> heart of this transport, and the host coalescing many completions into
+> one ring per wake. The name is a QEMU/Mesa-ecosystem codename in the
+> lineage of `venus` (the path it replaces); it deliberately does **not**
+> follow Atrium's Latin / classical-architecture convention, because the
+> device + host endpoint live in QEMU, not in the Atrium runtime.*
 
 > **Status.** Design. The forward-looking replacement for the venus
 > paravirt path (`atrium-venus.md`, superseded) and for the *polling*
 > ivshmem sketch in `aqueduct-gpu.md` §6.1–6.2. This document specifies
-> the **transport** that carries the aqueduct-gpu wire across the
-> VM boundary; it does not change the wire itself.
+> **Carillon**, the transport that carries the aqueduct-gpu wire across
+> the VM boundary; it does not change the wire itself.
 >
 > **Companion docs.** Read `aqueduct-gpu.md` first (the FrameOp wire,
 > backend tiers, memory transport §4.4) and `atrium-gpu-abi-v2.md`
@@ -14,15 +21,10 @@
 > the producer is a FreeBSD guest under macOS-HVF instead of a host
 > process on a Unix socket.
 >
-> **Naming.** TBD — *do not adopt a name in code until the user picks
-> one.* Atrium's convention is Latin / classical-architecture (Aqueduct,
-> Pergola, Fresco, Portcullis, Tessera, Limen…). Candidates that fit a
-> *conduit tapping the aqueduct across a wall*: **Fistula** (the lead
-> service-pipe that distributes water *from* an aqueduct — semantically
-> exact: Aqueduct is the substrate, this is the pipe that crosses the
-> VM boundary off it), **Cuniculus** (an underground tunnel/conduit),
-> **Specus** (the covered channel of an aqueduct). Throughout this doc
-> the placeholder is **"the transport."**
+> **Naming.** **Carillon** (locked 2026-06-02). QEMU-side codename, not
+> bound to Atrium's Latin-architecture convention — the device and host
+> endpoint are QEMU plumbing, like `venus`. Use `carillon` for the QEMU
+> device variant, the host transport frontend, and the guest kmod.
 >
 > **One-line summary.** A fully interrupt-driven shared-memory carrier
 > for the aqueduct-gpu FrameOp stream between a FreeBSD guest and a
@@ -536,7 +538,6 @@ the VM — **never `cargo --release` inside the VM**
 
 ## 13. Open questions
 
-- **Name.** §0 — user to pick (Fistula / Cuniculus / Specus / other).
 - **One device or fold into atrium-gpu kmod?** The transport cdev and
   the atrium-gpu BO/mmap cdev overlap (both map host-visible regions).
   Decide at T1 whether this is a separate kmod or a transport mode of the
