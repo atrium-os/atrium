@@ -868,6 +868,185 @@ pub fn recv_fd(sock: RawFd) -> io::Result<RawFd> {
     }
 }
 
+/// QEMU ivshmem client-protocol version (the value QEMU's
+/// `ivshmem_recv_setup` expects first).
+pub const IVSHMEM_PROTOCOL_VERSION: i64 = 0;
+
+/// Send an `i64` (optionally with an fd via SCM_RIGHTS) over a connected
+/// `AF_UNIX` socket — the message shape QEMU's ivshmem-server protocol
+/// uses (8-byte payload + optional ancillary fd). Mirrors
+/// `fresco/ivshmem_server.rs`'s `send_i64`/`send_i64_with_fd`.
+fn send_i64(sock: RawFd, val: i64, fd: Option<RawFd>) -> io::Result<()> {
+    let data = val.to_le_bytes();
+    let mut iov = libc::iovec {
+        iov_base: data.as_ptr() as *mut libc::c_void,
+        iov_len: 8,
+    };
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+
+    let mut cmsg_buf;
+    if let Some(fd) = fd {
+        let space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as usize;
+        cmsg_buf = vec![0u8; space];
+        msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = space as _;
+        // SAFETY: control buffer sized via CMSG_SPACE; one fd written.
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&msg);
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as _;
+            std::ptr::copy_nonoverlapping(&fd, libc::CMSG_DATA(cmsg) as *mut RawFd, 1);
+        }
+    }
+    let n = unsafe { libc::sendmsg(sock, &msg, 0) };
+    if n < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// The host endpoint that QEMU's `ivshmem-doorbell` device attaches to:
+/// a 2-peer ivshmem-server (host GPU endpoint + QEMU). It creates the
+/// shared-memory region and the doorbell pipes, hands QEMU the right fds
+/// over `AF_UNIX`/SCM_RIGHTS at connect, and exposes the host-side ends
+/// so a serve-loop can wait on the guest→host doorbell and ring the
+/// host→guest doorbell. Faithful port of `fresco/ivshmem_server.rs`.
+///
+/// **Verification status.** Construction (shm create + map + stamp, pipe
+/// creation, socket bind) is unit-tested host-side. The QEMU handshake
+/// (`send_init` ordering) is ported verbatim from the working reference
+/// and is exercised end-to-end only against a real QEMU — i.e. in the
+/// `run-vm.sh --carillon` VM session (T-real), where `Host::serve` is
+/// wired onto the exposed fds + region.
+pub struct IvshmemServer {
+    region: Region,
+    shmem_fd: RawFd, // a 2nd fd of the shm file, passed to QEMU
+    server_read_fd: RawFd,  // guest→host doorbell (host waits)
+    server_write_fd: RawFd, // (handed to QEMU; QEMU writes → guest rang)
+    qemu_read_fd: RawFd,    // (handed to QEMU; QEMU's interrupt fd)
+    qemu_write_fd: RawFd,   // host→guest doorbell (host writes → MSI-X)
+    listener: std::os::unix::net::UnixListener,
+    sock_path: std::path::PathBuf,
+    qemu_connected: bool,
+}
+
+// SAFETY: the contained fds + mapping are a stable owned bundle.
+unsafe impl Send for IvshmemServer {}
+
+impl IvshmemServer {
+    /// Create the shm region (stamped), the two doorbell pipes, and bind
+    /// the `AF_UNIX` listen socket QEMU connects to.
+    pub fn new(
+        sock_path: &std::path::Path,
+        shmem_path: &std::path::Path,
+        shmem_size: usize,
+    ) -> io::Result<Self> {
+        let _ = std::fs::remove_file(sock_path);
+        // Host's mapped + stamped view.
+        let region = Region::create(shmem_path, shmem_size)?;
+        // A second fd of the same file to hand QEMU (it maps it for BAR2).
+        let shmem_fd = {
+            let f = OpenOptions::new().read(true).write(true).open(shmem_path)?;
+            use std::os::unix::io::IntoRawFd;
+            f.into_raw_fd()
+        };
+        let (server_read_fd, server_write_fd) = make_pipe()?;
+        let (qemu_read_fd, qemu_write_fd) = make_pipe()?;
+        let listener = std::os::unix::net::UnixListener::bind(sock_path)?;
+        listener.set_nonblocking(true)?;
+        Ok(IvshmemServer {
+            region,
+            shmem_fd,
+            server_read_fd,
+            server_write_fd,
+            qemu_read_fd,
+            qemu_write_fd,
+            listener,
+            sock_path: sock_path.to_path_buf(),
+            qemu_connected: false,
+        })
+    }
+
+    /// The host's mapped view of the shared region.
+    pub fn region(&self) -> &Region { &self.region }
+
+    /// Guest→host doorbell read end — register this on a [`Waiter`] /
+    /// kqueue; QEMU writes it when the guest rings.
+    pub fn doorbell_read_fd(&self) -> RawFd { self.server_read_fd }
+
+    /// Ring the guest (host→guest doorbell → MSI-X in the guest).
+    pub fn notify_peer(&self) {
+        let token: u64 = 1;
+        // SAFETY: qemu_write_fd is a valid pipe write end.
+        let _ = unsafe {
+            libc::write(self.qemu_write_fd, &token as *const u64 as *const libc::c_void, 8)
+        };
+    }
+
+    /// Whether QEMU has connected + been initialised.
+    pub fn has_peer(&self) -> bool { self.qemu_connected }
+
+    /// Non-blocking accept; on first QEMU connection, run the ivshmem
+    /// init handshake. Returns true once a peer is connected.
+    pub fn try_accept(&mut self) -> io::Result<bool> {
+        if self.qemu_connected {
+            return Ok(true);
+        }
+        match self.listener.accept() {
+            Ok((stream, _)) => {
+                self.send_init(&stream)?;
+                self.qemu_connected = true;
+                Ok(true)
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The QEMU ivshmem init sequence (order must match QEMU's
+    /// `ivshmem_recv_setup`): version, this peer's id, peer-0 connect fd
+    /// (QEMU writes it to ring the host), the shmem fd (msg=-1 terminates
+    /// the sync setup loop), then our own interrupt fd. Ported verbatim
+    /// from `fresco/ivshmem_server.rs`.
+    fn send_init(&self, stream: &std::os::unix::net::UnixStream) -> io::Result<()> {
+        use std::os::unix::io::AsRawFd;
+        let s = stream.as_raw_fd();
+        send_i64(s, IVSHMEM_PROTOCOL_VERSION, None)?;
+        send_i64(s, 1, None)?; // this peer's id
+        send_i64(s, 0, Some(self.server_write_fd))?; // peer 0 connect (guest→host)
+        send_i64(s, -1, Some(self.shmem_fd))?; // shmem; terminates sync loop
+        send_i64(s, 1, Some(self.qemu_read_fd))?; // our own interrupt fd
+        Ok(())
+    }
+}
+
+impl Drop for IvshmemServer {
+    fn drop(&mut self) {
+        // SAFETY: all fds owned by this server.
+        unsafe {
+            libc::close(self.shmem_fd);
+            libc::close(self.server_read_fd);
+            libc::close(self.server_write_fd);
+            libc::close(self.qemu_read_fd);
+            libc::close(self.qemu_write_fd);
+        }
+        let _ = std::fs::remove_file(&self.sock_path);
+    }
+}
+
+fn make_pipe() -> io::Result<(RawFd, RawFd)> {
+    let mut fds = [0 as RawFd; 2];
+    // SAFETY: fds is a valid 2-element array.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((fds[0], fds[1]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -961,5 +1140,29 @@ mod tests {
         drop(host);
         drop(mapped);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The ivshmem-server host endpoint constructs cleanly: shm created +
+    /// mapped + stamped, doorbell pipes valid, listen socket bound, no
+    /// peer yet. (The QEMU handshake is verified in the VM session.)
+    #[test]
+    fn ivshmem_server_constructs() {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let sock = dir.join(format!("carillon-srv-{pid}.sock"));
+        let shm = dir.join(format!("carillon-srv-{pid}.shm"));
+        let mut srv = IvshmemServer::new(&sock, &shm, TOTAL_SIZE).unwrap();
+
+        srv.region().validate_header().unwrap();
+        assert_eq!(srv.region().host_page_size_field(), host_page_size());
+        assert!(srv.doorbell_read_fd() >= 0);
+        assert!(!srv.has_peer());
+        // No QEMU is connecting, so accept is WouldBlock → false.
+        assert!(!srv.try_accept().unwrap());
+        // Ringing the (unconnected) guest doorbell must not error.
+        srv.notify_peer();
+
+        drop(srv);
+        let _ = std::fs::remove_file(&shm);
     }
 }
