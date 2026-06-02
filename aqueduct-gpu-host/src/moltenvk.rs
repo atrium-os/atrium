@@ -722,6 +722,205 @@ impl MoltenVkBackend {
                 vk::DependencyFlags::empty(), &[], &[], &[barrier]);
         }
     }
+
+    /// Tier-3 level-2a bring-up: clear + draw `vertex_count` vertices
+    /// (procedural — no vertex buffers; the VS derives positions from
+    /// `gl_VertexIndex`) into `image_id` through a **real Vulkan
+    /// graphics pipeline** on Metal, then copy the rendered image into
+    /// `dst_buffer_id`. Synchronous (one command buffer + fence).
+    ///
+    /// Proves the full graphics path — SPIR-V shader modules
+    /// (MoltenVK compiles SPIR-V→Metal internally), render pass +
+    /// framebuffer, pipeline, `vkCmdDraw` — works on this host. The
+    /// FrameOp-stream wiring (BindPipeline/Draw + a hardware
+    /// pipeline-create hook on the `Backend` trait) is level-2b; the
+    /// resource-creation helpers here are its building blocks.
+    ///
+    /// Transient resources (pipeline / render pass / framebuffer /
+    /// shader modules / image view) are created + destroyed per call —
+    /// caching is a later optimisation, not needed for bring-up.
+    pub fn draw_and_copy(
+        &self,
+        image_id: ResourceId,
+        dst_buffer_id: ResourceId,
+        vs_spirv: &[u8],
+        fs_spirv: &[u8],
+        vertex_count: u32,
+        clear_rgba: [u8; 4],
+    ) -> Result<(), vk::Result> {
+        let _guard = self.submit_lock.lock().unwrap();
+        let dev = &self.device;
+
+        // Resolve image (materialise its VkImage) + format/dims.
+        let (image, format, width, height) = {
+            let mut images = self.images.lock().unwrap();
+            let img = images.get_mut(&image_id.raw())
+                .ok_or(vk::Result::ERROR_UNKNOWN)?;
+            let handle = self.ensure_image(img).ok_or(vk::Result::ERROR_UNKNOWN)?;
+            (handle, img.format, img.width, img.height)
+        };
+        let dst_buffer = {
+            let buffers = self.buffers.lock().unwrap();
+            buffers.get(&dst_buffer_id.raw()).map(|b| b.buffer)
+                .ok_or(vk::Result::ERROR_UNKNOWN)?
+        };
+
+        unsafe {
+            // ── Image view ────────────────────────────────────────
+            let view_info = vk::ImageViewCreateInfo::default()
+                .image(image).view_type(vk::ImageViewType::TYPE_2D).format(format)
+                .subresource_range(vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .level_count(1).layer_count(1));
+            let view = dev.create_image_view(&view_info, None)?;
+
+            // ── Render pass: clear → store, end in TRANSFER_SRC so the
+            //    subsequent copy reads it. ───────────────────────────
+            let attach = vk::AttachmentDescription::default()
+                .format(format).samples(vk::SampleCountFlags::TYPE_1)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .initial_layout(vk::ImageLayout::UNDEFINED)
+                .final_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+            let color_ref = [vk::AttachmentReference::default()
+                .attachment(0).layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
+            let subpass = [vk::SubpassDescription::default()
+                .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+                .color_attachments(&color_ref)];
+            let attachments = [attach];
+            let rp_info = vk::RenderPassCreateInfo::default()
+                .attachments(&attachments).subpasses(&subpass);
+            let render_pass = dev.create_render_pass(&rp_info, None)?;
+
+            // ── Shader modules ────────────────────────────────────
+            let vs_code = spirv_words(vs_spirv);
+            let fs_code = spirv_words(fs_spirv);
+            let vs = dev.create_shader_module(
+                &vk::ShaderModuleCreateInfo::default().code(&vs_code), None)?;
+            let fs = dev.create_shader_module(
+                &vk::ShaderModuleCreateInfo::default().code(&fs_code), None)?;
+            let entry = CString::new("main").unwrap();
+            let stages = [
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::VERTEX).module(vs).name(&entry),
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::FRAGMENT).module(fs).name(&entry),
+            ];
+
+            // ── Fixed-function state ──────────────────────────────
+            let vinput = vk::PipelineVertexInputStateCreateInfo::default();
+            let ia = vk::PipelineInputAssemblyStateCreateInfo::default()
+                .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+            let viewports = [vk::Viewport {
+                x: 0.0, y: 0.0, width: width as f32, height: height as f32,
+                min_depth: 0.0, max_depth: 1.0,
+            }];
+            let scissors = [vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: vk::Extent2D { width, height },
+            }];
+            let vp = vk::PipelineViewportStateCreateInfo::default()
+                .viewports(&viewports).scissors(&scissors);
+            let rs = vk::PipelineRasterizationStateCreateInfo::default()
+                .polygon_mode(vk::PolygonMode::FILL)
+                .cull_mode(vk::CullModeFlags::NONE)
+                .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+                .line_width(1.0);
+            let ms = vk::PipelineMultisampleStateCreateInfo::default()
+                .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+            let blend_attach = [vk::PipelineColorBlendAttachmentState::default()
+                .color_write_mask(vk::ColorComponentFlags::RGBA)
+                .blend_enable(false)];
+            let cb_state = vk::PipelineColorBlendStateCreateInfo::default()
+                .attachments(&blend_attach);
+            let layout = dev.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default(), None)?;
+
+            let pipe_info = vk::GraphicsPipelineCreateInfo::default()
+                .stages(&stages)
+                .vertex_input_state(&vinput)
+                .input_assembly_state(&ia)
+                .viewport_state(&vp)
+                .rasterization_state(&rs)
+                .multisample_state(&ms)
+                .color_blend_state(&cb_state)
+                .layout(layout)
+                .render_pass(render_pass)
+                .subpass(0);
+            let pipeline = dev.create_graphics_pipelines(
+                vk::PipelineCache::null(), &[pipe_info], None)
+                .map_err(|(_, e)| e)?[0];
+
+            // ── Framebuffer ───────────────────────────────────────
+            let fb_views = [view];
+            let fb_info = vk::FramebufferCreateInfo::default()
+                .render_pass(render_pass).attachments(&fb_views)
+                .width(width).height(height).layers(1);
+            let framebuffer = dev.create_framebuffer(&fb_info, None)?;
+
+            // ── Record: render pass (clear+draw) → copy to buffer ──
+            let alloc = vk::CommandBufferAllocateInfo::default()
+                .command_pool(self.cmd_pool)
+                .level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
+            let cb = dev.allocate_command_buffers(&alloc)?[0];
+            dev.begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
+            let clear = [vk::ClearValue { color: vk::ClearColorValue {
+                float32: [clear_rgba[0] as f32 / 255.0, clear_rgba[1] as f32 / 255.0,
+                          clear_rgba[2] as f32 / 255.0, clear_rgba[3] as f32 / 255.0],
+            }}];
+            let rp_begin = vk::RenderPassBeginInfo::default()
+                .render_pass(render_pass).framebuffer(framebuffer)
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: vk::Extent2D { width, height } })
+                .clear_values(&clear);
+            dev.cmd_begin_render_pass(cb, &rp_begin, vk::SubpassContents::INLINE);
+            dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline);
+            dev.cmd_draw(cb, vertex_count, 1, 0, 0);
+            dev.cmd_end_render_pass(cb);
+            // Image is now TRANSFER_SRC_OPTIMAL (render pass finalLayout).
+            let copy = vk::BufferImageCopy::default()
+                .image_subresource(vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .mip_level(0).base_array_layer(0).layer_count(1))
+                .image_extent(vk::Extent3D { width, height, depth: 1 });
+            dev.cmd_copy_image_to_buffer(cb, image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL, dst_buffer, &[copy]);
+            dev.end_command_buffer(cb)?;
+
+            // ── Submit + wait ─────────────────────────────────────
+            let fence = dev.create_fence(&vk::FenceCreateInfo::default(), None)?;
+            let cbs = [cb];
+            let submit = vk::SubmitInfo::default().command_buffers(&cbs);
+            let res = dev.queue_submit(self._queue, &[submit], fence)
+                .and_then(|_| dev.wait_for_fences(&[fence], true, u64::MAX));
+
+            // ── Teardown (transient) ──────────────────────────────
+            dev.destroy_fence(fence, None);
+            dev.free_command_buffers(self.cmd_pool, &cbs);
+            dev.destroy_framebuffer(framebuffer, None);
+            dev.destroy_pipeline(pipeline, None);
+            dev.destroy_pipeline_layout(layout, None);
+            dev.destroy_shader_module(vs, None);
+            dev.destroy_shader_module(fs, None);
+            dev.destroy_render_pass(render_pass, None);
+            dev.destroy_image_view(view, None);
+            res
+        }
+    }
+}
+
+/// Reinterpret SPIR-V bytes as the `u32` words ash's
+/// `ShaderModuleCreateInfo::code` wants. SPIR-V is little-endian
+/// 32-bit words; a non-multiple-of-4 length is truncated (malformed
+/// input).
+fn spirv_words(bytes: &[u8]) -> Vec<u32> {
+    bytes.chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 /// Best-effort vendor mapping from a PCI vendor-id. MoltenVK reports
@@ -854,5 +1053,124 @@ mod tests {
         let i = ((H as usize / 2) * W as usize + W as usize / 2) * 4;
         assert_eq!(&px[i..i + 4], &[40, 80, 160, 255],
             "clear colour read back through Metal (got {:?})", &px[i..i + 4]);
+    }
+
+    /// A SPIR-V vertex shader emitting a full-screen triangle from
+    /// `gl_VertexIndex` (no vertex buffer). Verts 0/1/2 → NDC
+    /// (-1,-1),(3,-1),(-1,3), covering the viewport.
+    fn build_fullscreen_tri_vs() -> Vec<u8> {
+        use rspirv::binary::Assemble;
+        use rspirv::spirv::{
+            AddressingModel, BuiltIn, Capability, Decoration, ExecutionModel,
+            FunctionControl, MemoryModel, StorageClass,
+        };
+        use rspirv::dr::Operand;
+        let mut b = rspirv::dr::Builder::new();
+        b.set_version(1, 0);
+        b.capability(Capability::Shader);
+        b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+        let void = b.type_void();
+        let f32t = b.type_float(32, None);
+        let i32t = b.type_int(32, 1);
+        let v4 = b.type_vector(f32t, 4);
+        let void_fn = b.type_function(void, vec![]);
+        let per_vertex = b.type_struct(vec![v4]);
+        b.member_decorate(per_vertex, 0, Decoration::BuiltIn,
+            vec![Operand::BuiltIn(BuiltIn::Position)]);
+        b.member_decorate(per_vertex, 0, Decoration::Offset,
+            vec![Operand::LiteralBit32(0)]);
+        b.decorate(per_vertex, Decoration::Block, vec![]);
+        let ptr_pv = b.type_pointer(None, StorageClass::Output, per_vertex);
+        let ptr_out_v4 = b.type_pointer(None, StorageClass::Output, v4);
+        let ptr_in_i32 = b.type_pointer(None, StorageClass::Input, i32t);
+        let in_idx = b.variable(ptr_in_i32, None, StorageClass::Input, None);
+        b.decorate(in_idx, Decoration::BuiltIn, vec![Operand::BuiltIn(BuiltIn::VertexIndex)]);
+        let pv_var = b.variable(ptr_pv, None, StorageClass::Output, None);
+        let c0i = b.constant_bit32(i32t, 0);
+        let c1i = b.constant_bit32(i32t, 1);
+        let c2i = b.constant_bit32(i32t, 2);
+        let c2f = b.constant_bit32(f32t, 2.0f32.to_bits());
+        let c1f = b.constant_bit32(f32t, 1.0f32.to_bits());
+        let c0f = b.constant_bit32(f32t, 0.0f32.to_bits());
+        let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+        b.begin_block(None).unwrap();
+        let idx = b.load(i32t, None, in_idx, None, vec![]).unwrap();
+        let sh  = b.shift_left_logical(i32t, None, idx, c1i).unwrap();
+        let xb  = b.bitwise_and(i32t, None, sh, c2i).unwrap();
+        let yb  = b.bitwise_and(i32t, None, idx, c2i).unwrap();
+        let xf  = b.convert_s_to_f(f32t, None, xb).unwrap();
+        let yf  = b.convert_s_to_f(f32t, None, yb).unwrap();
+        let xm  = b.f_mul(f32t, None, xf, c2f).unwrap();
+        let x   = b.f_sub(f32t, None, xm, c1f).unwrap();
+        let ym  = b.f_mul(f32t, None, yf, c2f).unwrap();
+        let y   = b.f_sub(f32t, None, ym, c1f).unwrap();
+        let pos = b.composite_construct(v4, None, vec![x, y, c0f, c1f]).unwrap();
+        let dst = b.access_chain(ptr_out_v4, None, pv_var, vec![c0i]).unwrap();
+        b.store(dst, pos, None, vec![]).unwrap();
+        b.ret().unwrap();
+        b.end_function().unwrap();
+        b.entry_point(ExecutionModel::Vertex, main, "main", vec![in_idx, pv_var]);
+        let words: Vec<u32> = b.module().assemble();
+        words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    /// A SPIR-V fragment shader writing a constant colour to Output 0.
+    fn build_const_fs(rgba: [f32; 4]) -> Vec<u8> {
+        use rspirv::binary::Assemble;
+        use rspirv::spirv::{
+            AddressingModel, Capability, Decoration, ExecutionMode, ExecutionModel,
+            FunctionControl, MemoryModel, StorageClass,
+        };
+        use rspirv::dr::Operand;
+        let mut b = rspirv::dr::Builder::new();
+        b.set_version(1, 0);
+        b.capability(Capability::Shader);
+        b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+        let void = b.type_void();
+        let f32t = b.type_float(32, None);
+        let v4 = b.type_vector(f32t, 4);
+        let void_fn = b.type_function(void, vec![]);
+        let ptr_out = b.type_pointer(None, StorageClass::Output, v4);
+        let cs: Vec<_> = rgba.iter().map(|x| b.constant_bit32(f32t, x.to_bits())).collect();
+        let color = b.constant_composite(v4, cs);
+        let out = b.variable(ptr_out, None, StorageClass::Output, None);
+        b.decorate(out, Decoration::Location, vec![Operand::LiteralBit32(0)]);
+        let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+        b.begin_block(None).unwrap();
+        b.store(out, color, None, vec![]).unwrap();
+        b.ret().unwrap();
+        b.end_function().unwrap();
+        b.entry_point(ExecutionModel::Fragment, main, "main", vec![out]);
+        b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+        let words: Vec<u32> = b.module().assemble();
+        words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    /// Tier-3 level-2a: a real graphics-pipeline DRAW (VS+FS → triangle)
+    /// runs on Metal and the rendered colour reads back — proving the
+    /// SPIR-V → pipeline → vkCmdDraw path works on this host.
+    #[test]
+    fn draw_triangle_through_metal() {
+        use aqueduct_gpu::ids::IdNamespace;
+        let Some(be) = try_init() else { return; };
+        const W: u32 = 16;
+        const H: u32 = 16;
+        let img = ResourceId::new(IdNamespace::IcdRuntime, 0x30);
+        let buf = ResourceId::new(IdNamespace::IcdRuntime, 0x40);
+        be.image_created(img, W, H);
+        be.set_image_format(img, 37); // RGBA8_UNORM
+        be.buffer_created(buf, (W * H * 4) as u64);
+
+        let vs = build_fullscreen_tri_vs();
+        let fs = build_const_fs([0.9, 0.2, 0.2, 1.0]); // red-ish
+        be.draw_and_copy(img, buf, &vs, &fs, 3, [10, 10, 10, 255])
+            .expect("draw_and_copy");
+
+        let px = be.buffer_read_bytes(buf, 0, (W * H * 4) as u64).expect("readback");
+        let i = ((H as usize / 2) * W as usize + W as usize / 2) * 4;
+        // Centre is covered by the full-screen triangle → the FS colour
+        // (~[230,51,51,255]), NOT the dark clear [10,10,10].
+        assert!(px[i] > 200 && px[i + 1] < 90 && px[i + 2] < 90 && px[i + 3] == 255,
+            "centre should be the drawn triangle colour, got {:?}", &px[i..i + 4]);
     }
 }
