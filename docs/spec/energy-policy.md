@@ -195,22 +195,24 @@ working Tier-3 backend.**
 In place: P4 (compositor renders on Tier-2) + PT (cheap small-frame
 transport) + the tier-equivalence discipline.
 
-**Hard prerequisite still missing — a Tier-3 path that actually
-renders.** The router only has meaning when there are *two* working
-backends to choose between. Today `aqueduct-gpu-host` has the software
-`Tier2Backend` (real) and `MoltenVkBackend` (Tier-3, Metal via
-MoltenVK), but `MoltenVkBackend::submit_frame` is a **protocol-correct
-stub** — it constructs a `VkInstance`/`VkDevice` + reports caps, but
-records no `VkCommandBuffer`, does no SPIR-V→`MTLLibrary`, and signals
-fences immediately (see `moltenvk.rs` — "real recording lands in a
-follow-on commit"). So Tier-3 produces no pixels, there is nothing to
-route to, and no real crossover to measure. The dev platform's other
-hardware path (venus in the VM) has the open libthr ring panic.
+**Tier-3 render path — in progress.** The router only has meaning when
+there are *two* working backends to choose between. `aqueduct-gpu-host`
+has the software `Tier2Backend` (real) and `MoltenVkBackend` (Tier-3,
+Metal via MoltenVK).
+- **Tier-3 level-1 DONE (421b67f):** `MoltenVkBackend` is no longer a
+  stub — it materialises guest images/buffers as `VkImage`/`VkBuffer`
+  and replays the frame op stream as real Vulkan on Metal. A
+  render-pass *clear* + image→buffer *readback* run on the Apple M4 Max
+  and read back the exact clear colour (the mirror of tier2 level-1).
+- **Tier-3 level-2 still pending:** draws / pipelines / SPIR-V→Metal.
+  The compositor's rect needs *draw* rendering, so the router is still
+  blocked on level-2 — but the GPU command path now exists to build it
+  on (no longer a from-scratch stub).
 
-**Therefore the true next step is NOT the router** — it is completing
-the Tier-3 render path (the `MoltenVkBackend` 1.3b rollout: command-
-buffer recording, SPIR-V→Metal, frame-stream → `vkCmd*`), so a real
-Tier-2-vs-Tier-3 crossover exists. Only then:
+**Next step is completing the Tier-3 draw path** (level-2: `vkCmdDraw`
+pipelines + SPIR-V shader modules — MoltenVK compiles SPIR-V→Metal
+internally, so this is mostly pipeline/renderpass plumbing, not a
+hand-rolled cross-compile). Only then:
 - measure the crossover (submit/latency on Tier-3 vs CPU cost on
   Tier-2; note wall-clock on a warm host GPU captures the
   *submit/latency* component but not silicon *wake* energy — that
