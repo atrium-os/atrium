@@ -40,11 +40,12 @@ use aqueduct::{Message, MessageKind};
 use fresco_protocol::{
     control, decode, encode, scene_ops,
     SceneNodeSetPayload, SceneNodeClearPayload,
-    SlotSetPayload, SlotClearPayload, SlotKind, TextureFormat,
+    SlotSetPayload, SlotClearPayload, SlotUpdateRegionPayload, SlotKind, TextureFormat,
     RectParams, TextureParams, PathParams, GlyphRunParams,
     WindowCreatePayload, WindowDestroyPayload,
     WindowSetTitlePayload, WindowSetHintsPayload,
     WindowRequestClosePayload, WindowPresentPayload,
+    WindowPresentDamagePayload, DamageRect,
     FontOpenPayload, FontOpenResponse, FontClosePayload, TextRunInstallPayload,
     TextMeasurePayload, TextMeasureResponse,
 };
@@ -84,6 +85,13 @@ pub struct WindowSceneState {
     /// `slot_id → client_id` for every live slot binding in this
     /// window. Same purpose as `node_writers`.
     pub slot_writers: HashMap<u32, u8>,
+
+    /// PT: damage rectangle from the most recent
+    /// `OP_WINDOW_PRESENT_DAMAGE`, in window-local pixels. `Some` means
+    /// the next present should recomposite only this region (the
+    /// compositor scissors to it); `None` means a whole-surface
+    /// present. Consumed by the renderer/compositor each present.
+    pub pending_damage: Option<DamageRect>,
 }
 
 impl WindowSceneState {
@@ -245,6 +253,12 @@ pub struct EnvelopeFrontend {
     /// Atlas pages produced by server-side text shaping that need to
     /// be re-uploaded before the next render.
     pending_atlas_uploads: Vec<PendingAtlasUpload>,
+    /// PT: in-app sub-rectangle texture updates from
+    /// `OP_SLOT_UPDATE_REGION`. Each is `(slot_id, dst_x, dst_y,
+    /// width, height, bytes)` — bytes are carried inline on the wire
+    /// (no CAS round-trip), drained straight into an
+    /// `UploadRequest::TextureRegion`.
+    pending_region_uploads: Vec<(u32, u32, u32, u32, u32, Vec<u8>)>,
 
     /// Server-side text engine: font registry + lazy atlases. Shared
     /// across all clients so DejaVuSansMono-16 atlas is built once and
@@ -271,6 +285,7 @@ impl EnvelopeFrontend {
             pending_slot_sets: Vec::new(),
             pending_slot_clears: Vec::new(),
             pending_atlas_uploads: Vec::new(),
+            pending_region_uploads: Vec::new(),
         }
     }
 
@@ -340,6 +355,16 @@ impl EnvelopeFrontend {
                 }),
             }
         }
+        /* PT: app-driven in-place sub-rectangle updates
+         * (OP_SLOT_UPDATE_REGION). Bytes already inline — straight to
+         * the same device-side region write the text atlas uses. */
+        for (slot_id, dst_x, dst_y, width, height, bytes)
+            in std::mem::take(&mut self.pending_region_uploads)
+        {
+            uploads.push(UploadRequest::TextureRegion {
+                slot_id, bytes, dst_x, dst_y, width, height,
+            });
+        }
         (uploads, clears)
     }
 
@@ -363,6 +388,7 @@ impl EnvelopeFrontend {
             // ── Slot / scene / frame ops (routable; window = msg.flags) ──
             control::OP_SLOT_SET           => self.handle_slot_set(msg),
             control::OP_SLOT_CLEAR         => self.handle_slot_clear(msg),
+            control::OP_SLOT_UPDATE_REGION => self.handle_slot_update_region(msg),
             control::OP_SCENE_FRAME_BEGIN  => self.handle_scene_frame_begin(msg),
             control::OP_SCENE_FRAME_END    => self.handle_scene_frame_end(msg),
             control::OP_SCENE_NODE_SET     => self.handle_scene_node_set(msg),
@@ -381,6 +407,7 @@ impl EnvelopeFrontend {
             control::OP_WINDOW_SET_HINTS     => self.handle_window_set_hints(msg),
             control::OP_WINDOW_REQUEST_CLOSE => self.handle_window_request_close(msg),
             control::OP_WINDOW_PRESENT       => self.handle_window_present(msg),
+            control::OP_WINDOW_PRESENT_DAMAGE => self.handle_window_present_damage(msg),
 
             op => Err(DispatchError::UnknownOp(op)),
         }
@@ -493,6 +520,34 @@ impl EnvelopeFrontend {
             s.slot_writers.remove(&p.slot_id);
         }
         self.pending_slot_clears.push(p.slot_id);
+        Ok(Vec::new())
+    }
+
+    /// PT: `OP_SLOT_UPDATE_REGION` — overwrite a sub-rectangle of an
+    /// already-bound texture slot in place. The slot's binding
+    /// (dimensions/format) is unchanged — only `pixels[region]` are
+    /// replaced — so this neither touches `slot_table` nor re-uploads
+    /// the whole blob; it queues a device-side region write.
+    fn handle_slot_update_region(&mut self, msg: &Message)
+        -> Result<Vec<Outbound>, DispatchError>
+    {
+        let win_id = self.check_routable(msg)?;
+        let p: SlotUpdateRegionPayload = decode(&msg.payload)
+            .map_err(|_| DispatchError::BadPayload)?;
+        // Reject a region update to a slot this window never bound:
+        // there's no texture to patch, and silently allocating one
+        // would mask a client bug.
+        let bound = self.per_window.get(&win_id)
+            .map(|s| s.slot_table.contains_key(&p.slot_id))
+            .unwrap_or(false);
+        if !bound {
+            log::warn!("slot_update_region win={win_id} slot={}: slot not \
+                        bound (no prior OP_SLOT_SET); dropping", p.slot_id);
+            return Ok(Vec::new());
+        }
+        self.pending_region_uploads.push((
+            p.slot_id, p.dst_x, p.dst_y, p.width, p.height, p.bytes,
+        ));
         Ok(Vec::new())
     }
 
@@ -804,6 +859,27 @@ impl EnvelopeFrontend {
         let _ = p.window_id;
         Ok(Vec::new())
     }
+
+    /// PT: `OP_WINDOW_PRESENT_DAMAGE` — per-window present carrying a
+    /// dirty rectangle. Records the damage on the window's state so the
+    /// renderer/compositor can scissor its recomposite to that region
+    /// (frescod's render loop consumes `pending_damage`). An empty rect
+    /// is treated as no-damage (cleared to `None`). Otherwise identical
+    /// to `OP_WINDOW_PRESENT`.
+    fn handle_window_present_damage(&mut self, msg: &Message)
+        -> Result<Vec<Outbound>, DispatchError>
+    {
+        let p: WindowPresentDamagePayload = decode(&msg.payload)
+            .map_err(|_| DispatchError::BadPayload)?;
+        let damage = if p.damage.w == 0 || p.damage.h == 0 {
+            None
+        } else {
+            Some(p.damage)
+        };
+        let s = self.ensure_window_state(p.window_id);
+        s.pending_damage = damage;
+        Ok(Vec::new())
+    }
 }
 
 #[cfg(test)]
@@ -940,6 +1016,71 @@ mod tests {
         f.dispatch(&msg(control::OP_SLOT_CLEAR, 0, encode(&cl).unwrap()), 1)
             .expect("slot clear");
         assert!(f.window_state(0).unwrap().slot_table.is_empty());
+    }
+
+    #[test]
+    fn slot_update_region_queues_texture_region_upload() {
+        let mut f = fixture();
+        // Bind the slot first (region update requires an existing slot).
+        let set = SlotSetPayload {
+            slot_id: 5, hash: [0xCD; 32],
+            kind: SlotKind::Texture(TextureDesc {
+                width: 64, height: 64, format: TextureFormat::Rgba8UnormSrgb,
+            }),
+        };
+        f.dispatch(&msg(control::OP_SLOT_SET, 0, encode(&set).unwrap()), 1)
+            .expect("slot set");
+
+        let upd = SlotUpdateRegionPayload {
+            slot_id: 5, dst_x: 8, dst_y: 4, width: 2, height: 3,
+            bytes: vec![0x11; 2 * 3 * 4],
+        };
+        f.dispatch(&msg(control::OP_SLOT_UPDATE_REGION, 0, encode(&upd).unwrap()), 1)
+            .expect("slot update region");
+
+        let (uploads, _clears) = f.take_pending_uploads();
+        let region = uploads.iter().find_map(|u| match u {
+            UploadRequest::TextureRegion { slot_id, dst_x, dst_y, width, height, bytes }
+                if *slot_id == 5 => Some((*dst_x, *dst_y, *width, *height, bytes.len())),
+            _ => None,
+        });
+        assert_eq!(region, Some((8, 4, 2, 3, 24)));
+    }
+
+    #[test]
+    fn slot_update_region_unbound_slot_dropped() {
+        let mut f = fixture();
+        // No prior OP_SLOT_SET for slot 9.
+        let upd = SlotUpdateRegionPayload {
+            slot_id: 9, dst_x: 0, dst_y: 0, width: 1, height: 1,
+            bytes: vec![0u8; 4],
+        };
+        f.dispatch(&msg(control::OP_SLOT_UPDATE_REGION, 0, encode(&upd).unwrap()), 1)
+            .expect("dispatch (dropped, not errored)");
+        let (uploads, _) = f.take_pending_uploads();
+        assert!(!uploads.iter().any(|u|
+            matches!(u, UploadRequest::TextureRegion { slot_id: 9, .. })));
+    }
+
+    #[test]
+    fn window_present_damage_records_rect() {
+        let mut f = fixture();
+        let p = WindowPresentDamagePayload {
+            window_id: 0,
+            damage: DamageRect { x: 12, y: 24, w: 40, h: 30 },
+        };
+        f.dispatch(&msg(control::OP_WINDOW_PRESENT_DAMAGE, 0, encode(&p).unwrap()), 1)
+            .expect("present damage");
+        assert_eq!(f.window_state(0).unwrap().pending_damage,
+                   Some(DamageRect { x: 12, y: 24, w: 40, h: 30 }));
+
+        // An empty rect clears damage to None (whole-surface present).
+        let empty = WindowPresentDamagePayload {
+            window_id: 0, damage: DamageRect { x: 0, y: 0, w: 0, h: 0 },
+        };
+        f.dispatch(&msg(control::OP_WINDOW_PRESENT_DAMAGE, 0, encode(&empty).unwrap()), 1)
+            .expect("present no-damage");
+        assert_eq!(f.window_state(0).unwrap().pending_damage, None);
     }
 
     #[test]

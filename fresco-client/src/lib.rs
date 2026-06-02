@@ -33,13 +33,14 @@ use aqueduct::envelope::flag;
 use aqueduct::cas::Hash;
 use fresco_protocol::{
     control, encode, decode,
-    SlotSetPayload, SlotClearPayload, SlotKind, TextureDesc, TextureFormat,
+    SlotSetPayload, SlotClearPayload, SlotUpdateRegionPayload, SlotKind,
+    TextureDesc, TextureFormat,
     SceneFrameBeginPayload, SceneFrameEndPayload,
     SceneNodeSetPayload, SceneNodeClearPayload,
     RectParams, TextureParams, PathParams, GlyphRunParams,
     WindowCreatePayload, WindowDestroyPayload, WindowSetTitlePayload,
     WindowSetHintsPayload, WindowRequestClosePayload, WindowPresentPayload,
-    WindowHints,
+    WindowPresentDamagePayload, WindowHints,
     WindowResizedEvent, WindowFocusChangedEvent,
     WindowCloseRequestedEvent, WindowDpiChangedEvent,
     InputKeyEvent, InputPointerMotionEvent,
@@ -48,6 +49,7 @@ use fresco_protocol::{
     TextMeasurePayload, TextMeasureResponse,
     scene_ops,
 };
+pub use fresco_protocol::DamageRect;
 pub use fresco_protocol::FontOpenResponse as RemoteFontMetrics;
 pub use fresco_protocol::TextMeasureResponse as TextMetrics;
 
@@ -214,6 +216,23 @@ impl Connection {
         self.send_routable(control::OP_SLOT_CLEAR, &SlotClearPayload { slot_id })
     }
 
+    /// Partial-update transport (PT): overwrite a `width × height`
+    /// sub-rectangle at `(dst_x, dst_y)` of an already-bound texture
+    /// slot in place, without re-uploading the whole blob. `bytes` is
+    /// the tightly-packed pixels for the sub-rectangle only (`width *
+    /// height * bytes_per_texel`). Pair with
+    /// [`Self::window_present_with_damage`] so a small in-app dirty
+    /// rect stays cheap end-to-end.
+    pub fn slot_update_region(
+        &mut self, slot_id: u32,
+        dst_x: u32, dst_y: u32, width: u32, height: u32,
+        bytes: Vec<u8>,
+    ) -> io::Result<()> {
+        self.send_routable(control::OP_SLOT_UPDATE_REGION, &SlotUpdateRegionPayload {
+            slot_id, dst_x, dst_y, width, height, bytes,
+        })
+    }
+
     // ── Frame boundaries ───────────────────────────────────────────
 
     pub fn scene_frame_begin(&mut self) -> io::Result<()> {
@@ -343,6 +362,17 @@ impl Connection {
     pub fn window_present(&mut self, window_id: u32) -> io::Result<()> {
         self.send_window_managed(control::OP_WINDOW_PRESENT,
             &WindowPresentPayload { window_id })
+    }
+
+    /// Partial-update transport (PT): present a window with a damage
+    /// rectangle so the compositor scissors its recomposite to the
+    /// dirty region instead of repainting the whole surface. An empty
+    /// rect (`w == 0 || h == 0`) is a no-damage present.
+    pub fn window_present_with_damage(
+        &mut self, window_id: u32, damage: DamageRect,
+    ) -> io::Result<()> {
+        self.send_window_managed(control::OP_WINDOW_PRESENT_DAMAGE,
+            &WindowPresentDamagePayload { window_id, damage })
     }
 
     // ── Server-side text (M6.3) ────────────────────────────────────

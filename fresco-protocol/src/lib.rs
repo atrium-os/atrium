@@ -65,6 +65,15 @@ pub mod control {
     // Slot management
     pub const OP_SLOT_SET:           u16 = 0x0020;
     pub const OP_SLOT_CLEAR:         u16 = 0x0021;
+    /// Partial-update transport (PT): overwrite a sub-rectangle of an
+    /// already-bound texture slot's pixels in place, without
+    /// re-uploading (and re-hashing) the whole blob. The compositor
+    /// reuses the existing device-side region write
+    /// (`UploadRequest::TextureRegion`) that server text atlases
+    /// already drive. Pairs with `OP_WINDOW_PRESENT_DAMAGE` so a small
+    /// in-app dirty rect stays cheap end-to-end (render + transport +
+    /// recomposite all scale with the damage, not the surface).
+    pub const OP_SLOT_UPDATE_REGION: u16 = 0x0022;
 
     // Scene frame boundaries
     pub const OP_SCENE_FRAME_BEGIN:  u16 = 0x0030;
@@ -95,6 +104,13 @@ pub mod control {
     pub const OP_WINDOW_SET_HINTS:     u16 = 0x0503;
     pub const OP_WINDOW_REQUEST_CLOSE: u16 = 0x0504;
     pub const OP_WINDOW_PRESENT:       u16 = 0x0505;
+    /// Partial-update transport (PT): per-window present carrying a
+    /// damage rectangle, so the compositor scissors its recomposite to
+    /// the dirty region instead of repainting the whole window surface.
+    /// A separate opcode (not a field on `OP_WINDOW_PRESENT`) because
+    /// the postcard wire is positional — appending a field would break
+    /// existing whole-surface present clients.
+    pub const OP_WINDOW_PRESENT_DAMAGE: u16 = 0x0506;
 
     // Async events (server → client). Sent with envelope flag
     // ASYNC_EVENT (aqueduct::envelope::flags::ASYNC_EVENT).
@@ -169,6 +185,28 @@ pub enum TextureFormat {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlotClearPayload {
     pub slot_id: u32,
+}
+
+/// `OP_SLOT_UPDATE_REGION` — overwrite a `width × height` sub-rectangle
+/// at `(dst_x, dst_y)` of the texture bound to `slot_id`, in place.
+///
+/// The slot must already be bound by a prior `OP_SLOT_SET`
+/// (establishing the full texture's dimensions/format). `bytes` is the
+/// tightly-packed pixel data for the sub-rectangle only (`width *
+/// height * bytes_per_texel` for the slot's format) — no CAS upload,
+/// no re-hash of the whole blob. The compositor routes this to the
+/// existing device-side region write.
+///
+/// Intended for small in-app damage (a typed glyph, a caret, a hover
+/// highlight); large updates should re-`OP_SLOT_SET` the whole blob.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlotUpdateRegionPayload {
+    pub slot_id: u32,
+    pub dst_x:   u32,
+    pub dst_y:   u32,
+    pub width:   u32,
+    pub height:  u32,
+    pub bytes:   Vec<u8>,
 }
 
 // ── Scene payloads ───────────────────────────────────────────────────
@@ -286,6 +324,29 @@ pub struct WindowRequestClosePayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowPresentPayload {
     pub window_id: u32,
+}
+
+/// A damage / dirty rectangle in window-local pixels (top-left
+/// origin). Coordinates + extent are `u32`; an empty rect (`w == 0 ||
+/// h == 0`) means "no damage" and the compositor may skip the present.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DamageRect {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+}
+
+/// `OP_WINDOW_PRESENT_DAMAGE` — per-window present carrying a damage
+/// rectangle. The compositor recomposites only the screen region
+/// covered by `damage` (LOAD-preserve + scissor + damage-aware tile
+/// dispatch — all already supported), instead of repainting the whole
+/// window surface. Semantically `OP_WINDOW_PRESENT` with a dirty-rect
+/// hint; clients with no damage info keep using `OP_WINDOW_PRESENT`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct WindowPresentDamagePayload {
+    pub window_id: u32,
+    pub damage:    DamageRect,
 }
 
 // ── Server-side text payloads (M6.3) ─────────────────────────────────
@@ -775,6 +836,46 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_slot_update_region() {
+        let p = SlotUpdateRegionPayload {
+            slot_id: 7, dst_x: 16, dst_y: 8, width: 4, height: 3,
+            bytes: vec![0xCD; 4 * 3 * 4], // RGBA8 sub-rect
+        };
+        let bytes = encode(&p).expect("encode");
+        let back: SlotUpdateRegionPayload = decode(&bytes).expect("decode");
+        assert_eq!(back.slot_id, 7);
+        assert_eq!((back.dst_x, back.dst_y, back.width, back.height), (16, 8, 4, 3));
+        assert_eq!(back.bytes.len(), 48);
+    }
+
+    #[test]
+    fn roundtrip_window_present_damage() {
+        let p = WindowPresentDamagePayload {
+            window_id: 3,
+            damage: DamageRect { x: 100, y: 200, w: 32, h: 16 },
+        };
+        let bytes = encode(&p).expect("encode");
+        let back: WindowPresentDamagePayload = decode(&bytes).expect("decode");
+        assert_eq!(back.window_id, 3);
+        assert_eq!(back.damage, DamageRect { x: 100, y: 200, w: 32, h: 16 });
+    }
+
+    /// PT's damaged present must stay wire-distinct from the
+    /// whole-surface present (separate opcode, separate payload shape).
+    #[test]
+    fn present_damage_distinct_from_present() {
+        assert_ne!(control::OP_WINDOW_PRESENT, control::OP_WINDOW_PRESENT_DAMAGE);
+        // The two payloads encode to different lengths for the same
+        // window_id (damage adds the rect), confirming they're not
+        // accidentally interchangeable on the wire.
+        let plain = encode(&WindowPresentPayload { window_id: 3 }).unwrap();
+        let dmg = encode(&WindowPresentDamagePayload {
+            window_id: 3, damage: DamageRect { x: 0, y: 0, w: 1, h: 1 },
+        }).unwrap();
+        assert!(dmg.len() > plain.len());
+    }
+
+    #[test]
     fn roundtrip_window_destroy() {
         let (n, _, _) = roundtrip!(WindowDestroyPayload, WindowDestroyPayload { window_id: 7 });
         assert_eq!(n, 1);
@@ -834,6 +935,7 @@ mod tests {
         let ops = [
             control::OP_SLOT_SET,
             control::OP_SLOT_CLEAR,
+            control::OP_SLOT_UPDATE_REGION,
             control::OP_SCENE_FRAME_BEGIN,
             control::OP_SCENE_FRAME_END,
             control::OP_SCENE_NODE_SET,
@@ -844,6 +946,7 @@ mod tests {
             control::OP_WINDOW_SET_HINTS,
             control::OP_WINDOW_REQUEST_CLOSE,
             control::OP_WINDOW_PRESENT,
+            control::OP_WINDOW_PRESENT_DAMAGE,
             control::EV_WINDOW_RESIZED,
             control::EV_WINDOW_FOCUS_CHANGED,
             control::EV_WINDOW_CLOSE_REQUESTED,
