@@ -337,6 +337,12 @@ impl Tier2Registry {
         let pc_ptr = if draw.push_constants.is_empty() {
             std::ptr::null()
         } else { draw.push_constants.as_ptr() };
+        // VS StorageBuffer descriptor-table base (null when the
+        // VS declares no SSBO).  The backing buffers are owned by
+        // the caller and outlive this call.
+        let ssbo_table_ptr: *const u8 = if draw.vs_storage_table.is_empty() {
+            std::ptr::null()
+        } else { draw.vs_storage_table.as_ptr() };
 
         // ── Step 1: vertex shading.  3 invocations.
         //
@@ -366,6 +372,7 @@ impl Tier2Registry {
                     &mut clip_positions[i] as *mut [f32; 4],
                     vary_scratch[i].as_mut_ptr(),
                     clip_dist.as_mut_ptr(),
+                    ssbo_table_ptr,
                 );
             }
         }
@@ -923,6 +930,7 @@ impl Tier2Registry {
                     &mut clip as *mut [f32; 4],
                     vary.as_mut_ptr(),
                     clip_dist.as_mut_ptr(),
+                    std::ptr::null(), // VS StorageBuffer table — N/A for points
                 );
             }
 
@@ -1077,6 +1085,7 @@ impl Tier2Registry {
                     &mut clip as *mut [f32; 4],
                     vary.as_mut_ptr(),
                     clip_dist.as_mut_ptr(),
+                    std::ptr::null(), // VS StorageBuffer table — N/A for lines
                 );
             }
             let mut lanes = vec![0.0f32; n];
@@ -2615,6 +2624,17 @@ pub struct DrawTriangle<'a> {
     /// instead of the interpolated `gl_FragCoord.z`.  False keeps
     /// the early-Z path (depth test + write before the FS).
     pub fs_writes_depth: bool,
+
+    /// StorageBuffer descriptor table handed to the vertex
+    /// shader as its trailing `storage_table` parameter: a
+    /// packed array of `u64` buffer base pointers, one per
+    /// binding slot (`slot[binding] = buffer base`).  Empty ⇒
+    /// null (VS declares no StorageBuffer).  Lets an instanced
+    /// VS read `instances[gl_InstanceIndex]` from the SSBO the
+    /// compute stage populated.  The pointed-at buffers must
+    /// outlive the `build_triangle_setups` call (the VS runs
+    /// serially there, before tile rasterization).
+    pub vs_storage_table: &'a [u8],
 }
 
 /// Per-face stencil state passed to `fill_image_triangle`.
@@ -2700,6 +2720,7 @@ impl Default for DrawTriangle<'_> {
             instance_index: 0,
             primitive_id: 0,
             fs_writes_depth: false,
+            vs_storage_table: &[],
         }
     }
 }

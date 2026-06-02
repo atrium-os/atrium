@@ -115,6 +115,12 @@ pub type VsMain = unsafe extern "C" fn(
     out_position:      *mut [f32; 4],
     out_varyings:      *mut u8,
     out_clip_distance: *mut f32,
+    // StorageBuffer descriptor-table base: an array of u64
+    // pointers, one per binding (slot[binding] = buffer base).
+    // `null` when the VS declares no StorageBuffer.  Lets an
+    // instanced VS read `instances[gl_InstanceIndex]` from the
+    // SSBO the compute stage populated (P4).
+    storage_table:     *const u8,
 );
 
 /// Fragment-shader entry. Signature per spec §4.1.

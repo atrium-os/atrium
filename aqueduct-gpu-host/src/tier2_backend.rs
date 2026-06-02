@@ -437,6 +437,16 @@ struct PassState {
     /// combined-image-sampler descriptors (both stake out
     /// the prefix of the same uniforms buffer).
     bound_uniforms: HashMap<u32, u32>,
+    /// STORAGE_BUFFER descriptor bindings recorded by
+    /// `FrameOp::BindDescriptors` for the current pass.  Keyed
+    /// by binding slot; value is the buffer's daemon-side
+    /// ResourceId raw.  Read at draw time to build the vertex
+    /// shader's `storage_table` (an instanced VS reads
+    /// `instances[gl_InstanceIndex]` from the SSBO the compute
+    /// stage populated).  Pass-local — distinct from the
+    /// compute-side `compute_buffer_by_binding`, which is
+    /// drained per dispatch.
+    bound_storage_buffers: HashMap<u32, u32>,
     /// Number of Draw / DrawIndexed records issued in this pass.
     /// Used to gate the legacy "BindPipeline alone implies a
     /// fullscreen FS fill" fallback at EndRenderPass.
@@ -1313,10 +1323,11 @@ impl Tier2Backend {
                     // Graphics-side: stash COMBINED_IMAGE_SAMPLER
                     // and UNIFORM_BUFFER bindings.  dispatch_draw
                     // consults each to build the uniforms-buffer
-                    // contents.  STORAGE_BUFFER descriptors aren't
-                    // yet wired into the graphics path (deferred
-                    // to when a shader actually needs them); SSBO
-                    // entries arriving here are silently dropped.
+                    // contents.  STORAGE_BUFFER descriptors feed
+                    // the vertex shader's `storage_table` so an
+                    // instanced VS can read `instances[
+                    // gl_InstanceIndex]` from the SSBO the compute
+                    // stage populated.
                     for (binding, image_id, sampler_id)
                         in parse_bind_descriptors_combined_image_samplers(body)
                     {
@@ -1327,6 +1338,11 @@ impl Tier2Backend {
                         in parse_bind_descriptors_uniform_buffers(body)
                     {
                         state.bound_uniforms.insert(binding, buffer_id);
+                    }
+                    for (binding, buffer_id)
+                        in parse_bind_descriptors_storage_buffers(body)
+                    {
+                        state.bound_storage_buffers.insert(binding, buffer_id);
                     }
                 }
                 FrameOp::SetViewport => match SetViewportCmd::from_bytes(body) {
@@ -2278,6 +2294,46 @@ impl Tier2Backend {
         let dt_scissor = state.scissor.map(|s| Scissor {
             x: s.x, y: s.y, width: s.width, height: s.height,
         });
+        // ── VS StorageBuffer descriptor table.  An instanced VS
+        // reads `instances[gl_InstanceIndex]` from the SSBO the
+        // compute stage populated; the vertex shader ABI's
+        // trailing `storage_table` param points at a packed array
+        // of u64 buffer base pointers indexed by binding.  Build
+        // it once per draw from the currently-bound storage
+        // buffers (same `BindDescriptors` map compute uses).  We
+        // snapshot each bound buffer's bytes into `vs_ssbo_store`
+        // — its heap allocations stay put across the move into the
+        // tuple, so the raw pointers in `vs_ssbo_table` remain
+        // valid for every `build_triangle_setups` call below (the
+        // VS runs serially there, before tile rasterization).
+        let (vs_ssbo_store, vs_ssbo_table): (Vec<Vec<u8>>, Vec<u8>) = {
+            let bindings = &state.bound_storage_buffers;
+            if bindings.is_empty() {
+                (Vec::new(), Vec::new())
+            } else {
+                let max_binding = *bindings.keys().max().unwrap() as usize;
+                let bufs = self.buffers.lock().unwrap();
+                let mut store: Vec<Vec<u8>> = Vec::new();
+                let mut slot_idx: Vec<Option<usize>> = vec![None; max_binding + 1];
+                for (&binding, &buffer_raw) in bindings.iter() {
+                    let bytes = bufs.get(&buffer_raw)
+                        .map(|b| b.bytes.clone())
+                        .unwrap_or_default();
+                    slot_idx[binding as usize] = Some(store.len());
+                    store.push(bytes);
+                }
+                let mut table = vec![0u8; (max_binding + 1) * 8];
+                for (binding, idx) in slot_idx.iter().enumerate() {
+                    if let Some(i) = idx {
+                        let ptr = store[*i].as_ptr() as u64;
+                        table[binding * 8 .. binding * 8 + 8]
+                            .copy_from_slice(&ptr.to_le_bytes());
+                    }
+                }
+                (store, table)
+            }
+        };
+        let _ = &vs_ssbo_store; // keep-alive: backs vs_ssbo_table's pointers
         // Instanced draw: replay the whole triangle list once per
         // instance, handing each the index `firstInstance + inst`
         // as gl_InstanceIndex (VS params[5]).  All instances read
@@ -2429,6 +2485,7 @@ impl Tier2Backend {
                 instance_index,
                 primitive_id: t as u32,
                 fs_writes_depth,
+                vs_storage_table: &vs_ssbo_table,
                 ..Default::default()
             };
             match self.registry.build_triangle_setups(
@@ -3098,7 +3155,7 @@ impl Tier2Backend {
     /// (forwarded into compute uniforms), Dispatch (drives
     /// `dispatch_compute`).  Graphics ops are handled by the
     /// per-pass walker in `execute_pass`.
-    fn execute_compute_ops(&self, frame_buf: &[u8]) {
+    fn execute_compute_ops(&self, frame_buf: &[u8], readback_only: bool) {
         let pipeline_compute = self.pipeline_compute.lock().unwrap().clone();
         let mut state = PassState::default();
         let mut rp_depth: u32 = 0;
@@ -3116,6 +3173,20 @@ impl Tier2Backend {
                 _ if rp_depth > 0 => {
                     // Inside a render pass -- handled by
                     // execute_pass.
+                }
+                // Two phases over the same frame: the compute
+                // DISPATCH sweep runs BEFORE the render passes
+                // (so a compute stage that fills an SSBO the
+                // vertex shader then reads — the compositor's
+                // op-rectangle pattern — produces its data in
+                // time), and the readback sweep
+                // (`CopyImgToBuf`) runs AFTER, once the passes
+                // have drawn.  `readback_only` selects the phase.
+                FrameOp::CopyImgToBuf if readback_only =>
+                    self.execute_copy_image_to_buffer(body),
+                _ if readback_only => {
+                    // Readback phase: ignore everything but the
+                    // image-to-buffer copies handled above.
                 }
                 FrameOp::BindPipeline => {
                     if body.len() >= 4 {
@@ -3177,7 +3248,9 @@ impl Tier2Backend {
                     Ok(cmd) => self.dispatch_compute(&state, cmd),
                     Err(e) => log::warn!("malformed Dispatch: {e}"),
                 },
-                FrameOp::CopyImgToBuf => self.execute_copy_image_to_buffer(body),
+                // CopyImgToBuf (readback) runs only in the
+                // readback phase, handled by the guarded arm above.
+                FrameOp::CopyImgToBuf => {}
                 FrameOp::FillBuffer => self.execute_fill_buffer(body),
                 // CopyBufToImg is handled by the pre-pass
                 // walker (see `execute_upload_ops`) so texture
@@ -4047,17 +4120,23 @@ impl Backend for Tier2Backend {
         // against the cleared texel storage.
         self.execute_upload_ops(frame_buf);
 
+        // Compute DISPATCH sweep — runs BEFORE the render passes.
+        // Compute ops live OUTSIDE render passes (partition doesn't
+        // slice them), and a compute stage may populate an SSBO the
+        // render pass's vertex shader then reads (the compositor's
+        // op-rectangle: compute builds the instance buffer, the
+        // instanced draw consumes it).  Dispatching before the
+        // passes makes that data available in time.
+        self.execute_compute_ops(frame_buf, /* readback_only */ false);
+
         for pass in &passes {
             let pass_bytes = &frame_buf[pass.byte_range.clone()];
             self.execute_pass(pass.target_id, pass_bytes);
         }
-        // Compute ops live OUTSIDE render passes -- partition
-        // doesn't produce slices for them, so a separate pass
-        // over the whole buffer handles BindPipeline +
-        // PushConstants + Dispatch when we're between
-        // EndRenderPass and the next BeginRenderPass (or
-        // before the first / after the last RP).
-        self.execute_compute_ops(frame_buf);
+
+        // Readback sweep — runs AFTER the passes: CopyImgToBuf reads
+        // the just-rendered colour target into a host buffer.
+        self.execute_compute_ops(frame_buf, /* readback_only */ true);
         true
     }
 

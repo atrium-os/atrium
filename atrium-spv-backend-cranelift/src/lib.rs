@@ -403,9 +403,21 @@ fn emit_function(
         // variable's IR ValueId; `resolve_pointer_param`
         // consults `ssbo_var_ptr` before falling back to the
         // legacy params[2]-direct path.
-        if func.stage == ShaderStage::Compute && func.ssbo_bindings.len() >= 2 {
+        // Compute uses a descriptor table only for 2+ bindings
+        // (single-binding compute passes the pointer directly in
+        // params[2]).  Vertex ALWAYS routes StorageBuffers through
+        // a table (params[9] = table base), since the vertex ABI
+        // has no single-binding direct slot — the rect VS reads
+        // the instance SSBO this way.
+        let ssbo_table_base = match func.stage {
+            ShaderStage::Compute if func.ssbo_bindings.len() >= 2 =>
+                Some(translator.params[2]),
+            ShaderStage::Vertex if !func.ssbo_bindings.is_empty() =>
+                Some(translator.params[9]),
+            _ => None,
+        };
+        if let Some(table_base) = ssbo_table_base {
             builder.switch_to_block(entry);
-            let table_base = translator.params[2];
             for (&vid, &(_set, binding)) in &func.ssbo_bindings {
                 let p = builder.ins().load(
                     pointer_type,
@@ -1152,13 +1164,21 @@ impl FnTranslator {
                     "F64 constants not supported in phase 2 v2".to_string()))
             }
             Op::ConstVec(elements) => {
+                // SPIR-V OpCompositeConstruct flattens any vector
+                // operand into its component lanes — e.g.
+                // `vec4(vec2 v, f, f)` yields 4 lanes (v.x, v.y, f,
+                // f).  Splat vector elements; push scalar elements.
                 let mut lanes = Vec::with_capacity(elements.len());
                 for e in elements {
-                    let v = self.scalars.get(&e.id).copied().ok_or_else(||
-                        BackendError::Internal(format!(
-                            "ConstVec references undefined scalar {:?}", e.id,
-                        )))?;
-                    lanes.push(v);
+                    if let Some(v) = self.scalars.get(&e.id).copied() {
+                        lanes.push(v);
+                    } else if let Some(vec_lanes) = self.vectors.get(&e.id).cloned() {
+                        lanes.extend(vec_lanes);
+                    } else {
+                        return Err(BackendError::Internal(format!(
+                            "ConstVec element {:?} not in scalars or vectors", e.id,
+                        )));
+                    }
                 }
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal(
@@ -1434,6 +1454,18 @@ impl FnTranslator {
                     (ShaderStage::Vertex, BK::InstanceIndex) => {
                         // Scalar uint from params[5].
                         self.scalars.insert(result.id, self.params[5]);
+                    }
+                    (ShaderStage::Vertex, BK::BaseInstance)
+                    | (ShaderStage::Vertex, BK::BaseVertex) => {
+                        // 0 for a direct (non-indirect, firstInstance=
+                        // firstVertex=0) draw.  params[4]/[5] already
+                        // carry the absolute VertexIndex/InstanceIndex,
+                        // so Slang's `Index - Base` recovers the
+                        // intended value.  (Indirect / firstInstance!=0
+                        // draws would thread the real base through a
+                        // param; not yet wired.)
+                        let z = builder.ins().iconst(clif_types::I32, 0);
+                        self.scalars.insert(result.id, z);
                     }
                     (ShaderStage::Fragment, BK::FrontFacing) => {
                         // gl_FrontFacing -- scalar FS param index 10
@@ -2952,8 +2984,10 @@ impl FnTranslator {
     /// into `ssbo_var_ptr`) this picks the right per-binding
     /// loaded pointer instead of the params[2] direct path.
     fn resolve_pointer_param(&self, ty: &Type, var_id: u32) -> Result<ClifValue, BackendError> {
-        // Multi-binding compute SSBO short-circuit.
-        if matches!(self.stage, ShaderStage::Compute) {
+        // SSBO short-circuit: per-binding pointer pre-loaded
+        // from the descriptor table by the entry prologue
+        // (multi-binding compute, or any vertex StorageBuffer).
+        if matches!(self.stage, ShaderStage::Compute | ShaderStage::Vertex) {
             if let Some(p) = self.ssbo_var_ptr.get(&var_id) {
                 return Ok(*p);
             }
@@ -2994,6 +3028,15 @@ impl FnTranslator {
             (ShaderStage::Vertex, StorageClass::Input) => Ok(self.params[0]),
             (ShaderStage::Vertex, StorageClass::Uniform) => Ok(self.params[2]),
             (ShaderStage::Vertex, StorageClass::PushConstant) => Ok(self.params[3]),
+            // StorageBuffer: the prologue pre-loaded each binding's
+            // pointer into ssbo_var_ptr (handled by the short-circuit
+            // above).  Reaching here means a binding with no prologue
+            // entry — fail loudly rather than read a stray param.
+            (ShaderStage::Vertex, StorageClass::StorageBuffer) =>
+                Err(BackendError::Unsupported(format!(
+                    "vertex StorageBuffer var {var_id} not resolved by the \
+                     SSBO prologue (missing ssbo_bindings entry)",
+                ))),
             // v1 maps Vertex Output → out_position (param
             // 6) on the assumption the shader only writes
             // gl_Position. A real shader with both
@@ -3068,6 +3111,7 @@ fn build_signature(
             params.push(AbiParam::new(pointer_type)); // out_position
             params.push(AbiParam::new(pointer_type)); // out_varyings
             params.push(AbiParam::new(pointer_type)); // out_clip_distance
+            params.push(AbiParam::new(pointer_type)); // storage_table (SSBO)
         }
         ShaderStage::Compute => {
             // atrium_cs_main(uniforms, push_constants,

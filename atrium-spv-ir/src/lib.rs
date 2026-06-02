@@ -1164,6 +1164,16 @@ pub enum BuiltinKind {
     VertexIndex,
     /// `gl_InstanceIndex` (Vertex only).  uint.
     InstanceIndex,
+    /// `gl_BaseInstance` (Vertex only).  uint.  The `firstInstance`
+    /// argument of the draw; 0 for a direct (non-indirect) draw.
+    /// Slang lowers `gl_InstanceIndex` to `InstanceIndex +
+    /// BaseInstance`, so the VS reads this even for a simple
+    /// instanced draw.
+    BaseInstance,
+    /// `gl_BaseVertex` (Vertex only).  uint.  The `firstVertex`
+    /// argument; 0 for a direct draw.  Companion to BaseInstance
+    /// in Slang's `gl_VertexIndex` lowering.
+    BaseVertex,
     /// `gl_FrontFacing` (Fragment only).  Bool, materialised as
     /// an i32 (1 = front-facing, 0 = back) so it feeds OpSelect
     /// and integer comparisons directly.  The rasterizer derives
@@ -1279,7 +1289,12 @@ pub struct Varying {
 ///
 /// v3 (P2): `.afblob` format v2 adds the `fs_span` entry slot;
 /// rotate the cache dir so stale v1 blobs are never read.
-pub const TIER2_SHADER_ABI_VERSION: u32 = 3;
+///
+/// v4 (P4): the vertex entry `atrium_vs_main` gains a trailing
+/// `storage_table` parameter (StorageBuffer descriptor-table
+/// base), so an instanced VS can read the instance SSBO.  Stale
+/// v3 vertex blobs have the old 9-param ABI — rotate the cache.
+pub const TIER2_SHADER_ABI_VERSION: u32 = 4;
 //
 // History:
 //   v1 -- original tier-2 ABI (Arc 1-149).

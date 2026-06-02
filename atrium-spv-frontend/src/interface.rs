@@ -405,6 +405,10 @@ impl InterfaceContext {
                                 Some(atrium_spv_ir::BuiltinKind::VertexIndex),
                             SpvBuiltIn::InstanceIndex =>
                                 Some(atrium_spv_ir::BuiltinKind::InstanceIndex),
+                            SpvBuiltIn::BaseInstance =>
+                                Some(atrium_spv_ir::BuiltinKind::BaseInstance),
+                            SpvBuiltIn::BaseVertex =>
+                                Some(atrium_spv_ir::BuiltinKind::BaseVertex),
                             SpvBuiltIn::FrontFacing =>
                                 Some(atrium_spv_ir::BuiltinKind::FrontFacing),
                             SpvBuiltIn::PrimitiveId =>
