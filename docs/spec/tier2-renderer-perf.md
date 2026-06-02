@@ -508,11 +508,37 @@ the optimistic case; textured/glyph shading is ~2–3× heavier.)
     memset for full-coverage solid-colour tiles, front-to-back opaque
     occlusion skip, and bench-measuring each against the 4K compositor
     workload.
-- **PT — Partial-update transport (in-app sub-rect damage).** Add
-  `slot_update_region` / CAS patch + present damage rect to the
-  Fresco protocol + bridge + compositor, so a small in-app dirty
-  rect doesn't re-upload/recomposite the whole window surface.
-  Independent of the rasterizer rework; lands alongside P4.
+- **PT — Partial-update transport (in-app sub-rect damage). DONE +
+  VM-verified (db98f7f, 8bb4ee5, e2c955a).** A small in-app dirty rect
+  now updates + recomposites only that region instead of re-uploading
+  + repainting the whole window surface.
+  - Correction to the original sketch: the partial update is
+    **texture-level, NOT a CAS patch** — CAS blobs are whole-blob
+    immutable; the device-side region write (`TextureRegion` →
+    `write_image_region`) + the compositor damage/scissor machinery
+    already existed (server text atlases use them). PT just exposed
+    them over the app-facing protocol + added a present damage hint.
+  - **Protocol** (`fresco-protocol`): `OP_SLOT_UPDATE_REGION`
+    (`SlotUpdateRegionPayload{slot_id,dst_x,dst_y,w,h,bytes}`, bytes
+    inline — no CAS round-trip) + `OP_WINDOW_PRESENT_DAMAGE`
+    (`WindowPresentDamagePayload{window_id,damage:DamageRect}`). New
+    opcodes, not fields on existing ops (postcard is positional).
+  - **Client** (`fresco-client`): `slot_update_region` +
+    `window_present_with_damage`.
+  - **Scene-server**: decode → `UploadRequest::TextureRegion` (drops
+    updates to unbound slots) + `WindowSceneState.pending_damage`.
+  - **Bridge** (`atrium-tier2-fresco-bridge`): `PresentedFrame.damage`
+    → gathers the sub-rect → region update + damaged present (else
+    whole-surface).
+  - **Compositor** (`frescod-aqueduct`, PT.4): folds `pending_damage`
+    into the frame's damage bbox → existing damage→scissor partial-pass
+    path; consumes it so it fires once.
+  - **VM verification** (PT.5 = `atrium-pt-demo`): on real FreeBSD
+    (boot `--venus` for the BLOB virtio-gpu the atrium kmod needs;
+    frescod uses native kmod scanout, not venus), a 48×32 damaged
+    present logged exactly **1 partial pass** vs the background's full
+    repaints. Validated layers on macOS: 20/20 protocol, 13/13
+    scene-server, 6/6 bridge.
 
 ## Damage / dirty-rect rendering (the dominant real-world lever)
 
