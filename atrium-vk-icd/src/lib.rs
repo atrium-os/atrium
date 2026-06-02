@@ -3738,6 +3738,54 @@ pub unsafe extern "C" fn vkUnmapMemory(
     }
 }
 
+/// Push EVERY host-backed buffer's current bytes to the daemon.
+///
+/// Persistently-mapped `HOST_COHERENT` memory (mapped once at
+/// allocation, written by the app every frame, never unmapped) never
+/// triggers the `vkUnmapMemory` / `vkFlushMappedMemoryRanges` upload
+/// path — and the spec doesn't require a flush for coherent memory.
+/// Without this, a compute stage that reads an app-written SSBO (the
+/// compositor's `op_rectangle` scene buffer) sees stale/zero bytes on
+/// the daemon side.  Flushing all bound buffers at submit time makes
+/// the host's pre-frame writes visible to the daemon before it
+/// executes the frame.  The frame's own ops (FillBuffer, compute
+/// write-back, CopyImgToBuf) then mutate the daemon copy afterwards,
+/// so pushing output/readback buffers here is harmless (their host
+/// bytes are overwritten device-side).
+///
+/// Bring-up shape: D5+ shared backing regions make guest writes
+/// visible without this explicit per-submit upload.
+unsafe fn flush_host_buffers_to_daemon(dev: &AtriumDevice) {
+    use aqueduct_gpu::ids::ResourceId;
+    let bufs: Vec<(ResourceId, u64, u64, u64)> = match dev.buffers.lock() {
+        Ok(b) => b.values().filter_map(|buf| {
+            match (buf.buffer_id, buf.memory) {
+                (Some(id), Some(mem)) => Some((id, mem, buf.memory_offset, buf.size)),
+                _ => None,
+            }
+        }).collect(),
+        Err(_) => return,
+    };
+    if bufs.is_empty() { return; }
+    let copies: Vec<(ResourceId, Vec<u8>)> = match dev.memories.lock() {
+        Ok(m) => bufs.iter().filter_map(|(id, mem, off, size)| {
+            let am = m.get(mem)?;
+            let start = *off as usize;
+            let end = start.checked_add(*size as usize)?;
+            if end > am.storage.len() { return None; }
+            Some((*id, am.storage[start..end].to_vec()))
+        }).collect(),
+        Err(_) => return,
+    };
+    if dev.instance.is_null() { return; }
+    let inst = &*(dev.instance as *const AtriumInstance);
+    let Some(client) = inst.client.as_ref() else { return };
+    let Ok(mut c) = client.lock() else { return };
+    for (id, bytes) in copies {
+        let _ = c.write_buffer(id, 0, bytes);
+    }
+}
+
 /// `vkCreateBuffer` — record an AtriumBuffer for the requested
 /// size + usage. Memory binding lands in a follow-up
 /// vkBindBufferMemory call. Today we ignore sharing-mode,
@@ -7811,6 +7859,11 @@ pub unsafe extern "C" fn vkQueueSubmit(
 
     if p_submits.is_null() || submit_count == 0 { return VK_SUCCESS; }
 
+    // Make the app's pre-frame host writes (persistently-mapped
+    // HOST_COHERENT buffers) visible to the daemon before it runs
+    // this frame's compute / draws.
+    flush_host_buffers_to_daemon(dev);
+
     // Walk each VkSubmitInfo. Stride is 72 bytes.
     let submits_base = p_submits as *const u8;
     for s in 0..submit_count {
@@ -7898,6 +7951,10 @@ pub unsafe extern "C" fn vkQueueSubmit2(
     let Some(client_mu) = inst.client.as_ref() else { return VK_SUCCESS; };
     if dev.fence == aqueduct_gpu::ids::ResourceId(0) { return VK_SUCCESS; }
     if p_submits.is_null() || submit_count == 0 { return VK_SUCCESS; }
+
+    // Make the app's pre-frame host writes visible to the daemon
+    // (see vkQueueSubmit).
+    flush_host_buffers_to_daemon(dev);
 
     const SUBMIT_INFO_2_STRIDE: usize = 64;
     const CMDBUF_INFO_STRIDE: usize = 32;
