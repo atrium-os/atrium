@@ -16,7 +16,7 @@ use std::thread;
 use std::time::Duration;
 
 use aqueduct_gpu_host::carillon::{
-    layout, CompDesc, Doorbell, GuestRing, Host, Region, SubDesc,
+    layout, CompDesc, Doorbell, GuestRing, Host, Region, ShutdownHandle, SubDesc,
 };
 
 fn tmp_shm(name: &str) -> PathBuf {
@@ -32,6 +32,7 @@ fn tmp_shm(name: &str) -> PathBuf {
 /// wakeup count (via a shared cell), and a stop closure.
 struct Rig {
     guest: GuestRing,
+    shutdown: ShutdownHandle,
     host_join: Option<thread::JoinHandle<(u64, u64)>>,
     path: PathBuf,
 }
@@ -44,9 +45,10 @@ impl Rig {
         // Two doorbells: g2h (host waits) and h2g (host signals).
         let g2h = Doorbell::new().unwrap();
         let h2g = Doorbell::new().unwrap();
-        let mut host = Host::new(host_region, g2h, h2g);
+        let mut host = Host::new(host_region, g2h, h2g).unwrap();
         // Guest-side fd copies (Host owns/closes the Doorbells).
         let (g2h_write_fd, h2g_read_fd) = host.guest_doorbell_fds();
+        let shutdown = host.shutdown_handle();
 
         // Guest opens the SAME file → its own mapping of shared pages.
         let guest_region = Region::open(&path, layout::TOTAL_SIZE).unwrap();
@@ -67,14 +69,14 @@ impl Rig {
             (host.wakeups(), host.frames_processed())
         });
 
-        Rig { guest, host_join: Some(host_join), path }
+        Rig { guest, shutdown, host_join: Some(host_join), path }
     }
 
-    /// Send a STOP descriptor + ring, then join the host thread and
-    /// return (wakeups, frames_processed).
+    /// Fire the out-of-band shutdown (kqueue/poll wakes on it, separate
+    /// from the doorbell), then join the host thread and return
+    /// (wakeups, frames_processed). Wakeups count doorbell wakes only.
     fn stop_and_join(mut self) -> (u64, u64) {
-        self.guest.submit(&SubDesc { kind: SubDesc::KIND_STOP, ..Default::default() });
-        self.guest.ring();
+        self.shutdown.shutdown();
         let res = self.host_join.take().unwrap().join().unwrap();
         let _ = std::fs::remove_file(&self.path);
         res
@@ -111,9 +113,10 @@ fn batch_drained_in_one_wake() {
     }
 
     let (wakeups, frames) = rig.stop_and_join();
-    // The 3 frames were drained in ONE wake; the STOP added a 2nd wake.
+    // The 3 frames were drained in exactly ONE doorbell wake (shutdown is
+    // a separate, uncounted kqueue event) — the batch / no-spin property.
     assert_eq!(frames, 3, "exactly three frames processed");
-    assert_eq!(wakeups, 2, "one wake for the batch + one for STOP — no spin");
+    assert_eq!(wakeups, 1, "all three drained in one doorbell wake — no spin");
 }
 
 #[test]
@@ -137,9 +140,9 @@ fn pingpong_roundtrip() {
 
     let (wakeups, frames) = rig.stop_and_join();
     assert_eq!(frames, 5);
-    // 5 per-frame wakes + 1 STOP wake. Never more — proves the host
+    // Exactly one doorbell wake per frame, never more — proves the host
     // slept between frames rather than polling.
-    assert_eq!(wakeups, 6, "exactly one wake per frame + STOP — no spin");
+    assert_eq!(wakeups, 5, "exactly one doorbell wake per frame — no spin");
 }
 
 #[test]

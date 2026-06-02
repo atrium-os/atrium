@@ -8,13 +8,16 @@
 //! frame, writes completions, and rings the host→guest doorbell.
 //!
 //! **Phase T0 (this file).** Host attach + loopback, no QEMU and no
-//! guest kmod. The doorbell is a plain pipe (write 8 bytes to signal;
-//! a blocking `read` to wait — a true sleep, the no-spin invariant);
-//! the "guest" is a test that opens the same shm file and drives the
-//! reference ring protocol via [`GuestRing`]. Real QEMU attach
-//! (ivshmem-server + SCM_RIGHTS eventfd passing, kqueue multiplexing)
-//! and the FreeBSD guest kmod are later phases (T1+); this layer is
-//! reused unchanged underneath them.
+//! guest kmod. The doorbell is a pipe (write 8 bytes to signal); the
+//! host serve-loop sleeps on a [`Waiter`] — **kqueue** (`EVFILT_READ`)
+//! on BSD/Darwin, `poll(2)` elsewhere — multiplexing the doorbell and an
+//! out-of-band shutdown self-pipe, so the thread parks in the kernel (the
+//! no-spin invariant) and the loop is the multiplex substrate T-real
+//! extends to also watch the ivshmem-server listen socket. The "guest"
+//! is a test that opens the same shm file and drives the reference ring
+//! protocol via [`GuestRing`]. Real QEMU attach (ivshmem-server +
+//! SCM_RIGHTS eventfd passing) and the FreeBSD guest kmod are later
+//! phases (T1+); this layer is reused unchanged underneath them.
 //!
 //! The submission/completion descriptors here carry *references* to a
 //! FrameOp stream (offset+len), not the stream bytes — matching the
@@ -352,6 +355,31 @@ impl Doorbell {
         Ok(drained)
     }
 
+    /// Drain all currently-readable tokens without blocking. Called by
+    /// the host *after* the [`Waiter`] reports the read end ready, so a
+    /// single wake clears a coalesced burst and the level-triggered
+    /// `kevent`/`poll` doesn't immediately re-fire. Returns tokens drained.
+    pub fn drain(&self) -> u64 {
+        let mut buf = [0u8; 4096];
+        let mut drained = 0u64;
+        loop {
+            let avail = unsafe { self.bytes_readable() };
+            if avail == 0 {
+                break;
+            }
+            // SAFETY: read_fd valid; only read what's already available
+            // so this never blocks.
+            let m = unsafe {
+                libc::read(self.read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+            };
+            if m <= 0 {
+                break;
+            }
+            drained += (m as usize / 8).max(1) as u64;
+        }
+        drained
+    }
+
     unsafe fn bytes_readable(&self) -> usize {
         let mut n: libc::c_int = 0;
         if libc::ioctl(self.read_fd, libc::FIONREAD, &mut n) == 0 && n > 0 {
@@ -359,6 +387,143 @@ impl Doorbell {
         } else {
             0
         }
+    }
+}
+
+/// Which source woke the [`Waiter`]. Both may be set if they fired in
+/// the same `kevent`/`poll` return.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Wake {
+    /// The guest→host doorbell is readable (drain + process the ring).
+    pub doorbell: bool,
+    /// The shutdown source fired (exit the serve-loop).
+    pub shutdown: bool,
+}
+
+/// Blocks the host serve-loop until the doorbell or the shutdown source
+/// becomes readable. On BSD/Darwin this is **kqueue** (`EVFILT_READ` on
+/// both fds) — the platform's native multiplexer and the substrate the
+/// real QEMU attach (T-real) extends to also watch the ivshmem-server
+/// listen socket. On other unix (Linux CI) it falls back to `poll(2)`.
+/// Either way the thread sleeps in the kernel — no spin.
+pub struct Waiter {
+    doorbell_fd: RawFd,
+    shutdown_fd: RawFd,
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd",
+              target_os = "dragonfly", target_os = "openbsd", target_os = "netbsd"))]
+    kq: RawFd,
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd",
+          target_os = "dragonfly", target_os = "openbsd", target_os = "netbsd"))]
+impl Waiter {
+    /// Build a kqueue watching both read fds for `EVFILT_READ`.
+    pub fn new(doorbell_fd: RawFd, shutdown_fd: RawFd) -> io::Result<Self> {
+        // SAFETY: kqueue takes no args.
+        let kq = unsafe { libc::kqueue() };
+        if kq < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let w = Waiter { doorbell_fd, shutdown_fd, kq };
+        w.register(doorbell_fd)?;
+        w.register(shutdown_fd)?;
+        Ok(w)
+    }
+
+    fn register(&self, fd: RawFd) -> io::Result<()> {
+        // SAFETY: zeroed kevent is valid (null udata); ext[] (on the
+        // BSDs) is left zero.
+        let mut kev: libc::kevent = unsafe { std::mem::zeroed() };
+        kev.ident = fd as usize;
+        kev.filter = libc::EVFILT_READ;
+        kev.flags = libc::EV_ADD | libc::EV_ENABLE;
+        let r = unsafe {
+            libc::kevent(self.kq, &kev, 1, std::ptr::null_mut(), 0, std::ptr::null())
+        };
+        if r < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Block until at least one watched fd is readable.
+    pub fn wait(&self) -> io::Result<Wake> {
+        let mut evs: [libc::kevent; 4] = unsafe { std::mem::zeroed() };
+        // SAFETY: evs is owned; null timeout = block forever.
+        let n = unsafe {
+            libc::kevent(self.kq, std::ptr::null(), 0, evs.as_mut_ptr(),
+                         evs.len() as libc::c_int, std::ptr::null())
+        };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut wake = Wake::default();
+        for ev in evs.iter().take(n as usize) {
+            let id = ev.ident as RawFd;
+            if id == self.doorbell_fd {
+                wake.doorbell = true;
+            } else if id == self.shutdown_fd {
+                wake.shutdown = true;
+            }
+        }
+        Ok(wake)
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd",
+          target_os = "dragonfly", target_os = "openbsd", target_os = "netbsd"))]
+impl Drop for Waiter {
+    fn drop(&mut self) {
+        // SAFETY: kq owned by this Waiter.
+        unsafe { libc::close(self.kq); }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "freebsd",
+              target_os = "dragonfly", target_os = "openbsd", target_os = "netbsd")))]
+impl Waiter {
+    /// Fallback multiplexer for non-kqueue unix (Linux CI): `poll(2)`.
+    pub fn new(doorbell_fd: RawFd, shutdown_fd: RawFd) -> io::Result<Self> {
+        Ok(Waiter { doorbell_fd, shutdown_fd })
+    }
+
+    /// Block until at least one watched fd is readable.
+    pub fn wait(&self) -> io::Result<Wake> {
+        let mut fds = [
+            libc::pollfd { fd: self.doorbell_fd, events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: self.shutdown_fd, events: libc::POLLIN, revents: 0 },
+        ];
+        // SAFETY: fds is a valid 2-element array; -1 = block forever.
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Wake {
+            doorbell: fds[0].revents & libc::POLLIN != 0,
+            shutdown: fds[1].revents & libc::POLLIN != 0,
+        })
+    }
+}
+
+/// A `Send` handle that wakes a [`Host`]'s serve-loop to exit. Backed by
+/// the write end of the host's shutdown self-pipe; the host owns/closes
+/// the pipe, so the handle must not outlive the host.
+pub struct ShutdownHandle {
+    write_fd: RawFd,
+}
+
+// SAFETY: the handle only ever writes an 8-byte token to a pipe fd that
+// the Host keeps open for the serve-loop's lifetime.
+unsafe impl Send for ShutdownHandle {}
+
+impl ShutdownHandle {
+    /// Wake the serve-loop and ask it to exit (idempotent).
+    pub fn shutdown(&self) {
+        let token: u64 = 1;
+        // SAFETY: write_fd is a valid pipe write end held by the Host.
+        let _ = unsafe {
+            libc::write(self.write_fd, &token as *const u64 as *const libc::c_void, 8)
+        };
     }
 }
 
@@ -372,24 +537,31 @@ impl Drop for Doorbell {
     }
 }
 
-/// The host serve-loop: blocks on the guest→host doorbell, drains the
-/// submission ring, runs `handler` per frame, writes completions, and
-/// rings the host→guest doorbell **once per drained batch** (coalesced).
+/// The host serve-loop: sleeps on a kqueue (or `poll`) multiplexing the
+/// guest→host doorbell and an out-of-band shutdown source; on a doorbell
+/// wake it drains the submission ring, runs `handler` per frame, writes
+/// completions, and rings the host→guest doorbell **once per drained
+/// batch** (coalesced). Never spins.
 pub struct Host {
     region: Region,
-    g2h: Doorbell, // host waits on this (read end live here)
-    h2g: Doorbell, // host signals this (write end live here)
+    g2h: Doorbell,      // host waits on this (read end live here)
+    h2g: Doorbell,      // host signals this (write end live here)
+    shutdown: Doorbell, // out-of-band wake to exit serve()
+    waiter: Waiter,
     wakeups: u64,
     frames: u64,
 }
 
 impl Host {
     /// Build a host endpoint over a mapped region and the two doorbells
-    /// (g2h: the host waits on it; h2g: the host signals it). Marks the
-    /// control page host-status ready.
-    pub fn new(region: Region, g2h: Doorbell, h2g: Doorbell) -> Self {
+    /// (g2h: the host waits on it; h2g: the host signals it). Creates the
+    /// shutdown self-pipe + the kqueue/poll waiter multiplexing both, and
+    /// marks the control page host-status ready.
+    pub fn new(region: Region, g2h: Doorbell, h2g: Doorbell) -> io::Result<Self> {
+        let shutdown = Doorbell::new()?;
+        let waiter = Waiter::new(g2h.read_fd(), shutdown.read_fd())?;
         region.set_host_status(1);
-        Host { region, g2h, h2g, wakeups: 0, frames: 0 }
+        Ok(Host { region, g2h, h2g, shutdown, waiter, wakeups: 0, frames: 0 })
     }
 
     /// Doorbell fds the guest side needs (g2h write end to ring the host,
@@ -398,48 +570,55 @@ impl Host {
         (self.g2h.write_fd(), self.h2g.read_fd())
     }
 
+    /// A `Send` handle to stop the serve-loop from another thread.
+    pub fn shutdown_handle(&self) -> ShutdownHandle {
+        ShutdownHandle { write_fd: self.shutdown.write_fd() }
+    }
+
     /// Number of doorbell wake-ups the serve-loop took (no-spin metric).
+    /// The shutdown wake is not counted.
     pub fn wakeups(&self) -> u64 { self.wakeups }
     /// Number of frame submissions processed (excludes STOP).
     pub fn frames_processed(&self) -> u64 { self.frames }
 
-    /// Serve until a `SubDesc { kind: KIND_STOP }` is drained (or the
-    /// doorbell's write end is closed). `handler` maps a submitted frame
-    /// to its completion (T0: typically an echo/ack).
+    /// Serve until the [`ShutdownHandle`] fires (or a `SubDesc` with
+    /// `KIND_STOP` is drained). `handler` maps a submitted frame to its
+    /// completion (T0: typically an echo/ack).
     pub fn serve<H: FnMut(&SubDesc) -> CompDesc>(&mut self, mut handler: H) -> io::Result<()> {
         loop {
-            let drained_tokens = self.g2h.wait()?;
-            if drained_tokens == 0 {
-                break; // write end closed
-            }
-            self.wakeups += 1;
+            let wake = self.waiter.wait()?;
 
             let mut completed_any = false;
-            let mut stop = false;
-            // Drain everything currently visible in the submission ring.
-            loop {
-                let w = self.region.ctrl(C_SUB_WRITE).load(Ordering::Acquire);
-                let r = self.region.ctrl(C_SUB_READ).load(Ordering::Relaxed);
-                if r == w {
-                    break;
-                }
-                let idx = (r % SUB_ENTRIES) as usize;
-                let off = SUB_RING_OFFSET + idx * DESC_SIZE;
-                // SAFETY: idx < SUB_ENTRIES, off within submission ring.
-                let raw = unsafe { self.region.read_desc(off) };
-                let sub = SubDesc::read_from(&raw);
-                // Advance read index (consumer) with Release so the guest
-                // sees the slot freed.
-                self.region.ctrl(C_SUB_READ).store(r.wrapping_add(1), Ordering::Release);
+            let mut stop = wake.shutdown;
+            if wake.doorbell {
+                // Clear the coalesced doorbell tokens for this wake, then
+                // drain everything currently visible in the submission ring.
+                self.g2h.drain();
+                self.wakeups += 1;
+                loop {
+                    let w = self.region.ctrl(C_SUB_WRITE).load(Ordering::Acquire);
+                    let r = self.region.ctrl(C_SUB_READ).load(Ordering::Relaxed);
+                    if r == w {
+                        break;
+                    }
+                    let idx = (r % SUB_ENTRIES) as usize;
+                    let off = SUB_RING_OFFSET + idx * DESC_SIZE;
+                    // SAFETY: idx < SUB_ENTRIES, off within submission ring.
+                    let raw = unsafe { self.region.read_desc(off) };
+                    let sub = SubDesc::read_from(&raw);
+                    // Advance read index (consumer) with Release so the
+                    // guest sees the slot freed.
+                    self.region.ctrl(C_SUB_READ).store(r.wrapping_add(1), Ordering::Release);
 
-                if sub.kind == SubDesc::KIND_STOP {
-                    stop = true;
-                    continue;
+                    if sub.kind == SubDesc::KIND_STOP {
+                        stop = true;
+                        continue;
+                    }
+                    self.frames += 1;
+                    let comp = handler(&sub);
+                    self.push_completion(&comp);
+                    completed_any = true;
                 }
-                self.frames += 1;
-                let comp = handler(&sub);
-                self.push_completion(&comp);
-                completed_any = true;
             }
 
             if completed_any {
@@ -447,6 +626,7 @@ impl Host {
                 self.h2g.signal();
             }
             if stop {
+                self.shutdown.drain();
                 break;
             }
         }
