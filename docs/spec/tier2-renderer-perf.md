@@ -402,7 +402,9 @@ the optimistic case; textured/glyph shading is ~2–3× heavier.)
       it's the lever for app shaders with real per-pixel math.
 - **P4 — Compositor fast paths + integration.** Point
   `fresco-vulkan`'s ICD at `atrium-vk-icd` so the compositor runs on
-  Tier-2.
+  Tier-2.  **Integration: DONE (d31630d)** — the atrium-core rect
+  renders end-to-end on Tier-2 (see "Level 2 — COMPLETE" below).
+  **Remaining: the compositor fast paths.**
   - **Scout (done).** `HeadlessRenderer`
     (`fresco-vulkan/src/headless.rs`) is `ash`-based and **fully
     redirectable with zero code changes** — `ash::Entry::load()` →
@@ -446,7 +448,7 @@ the optimistic case; textured/glyph shading is ~2–3× heavier.)
     P4 (ICD redirect) is the route that also runs unmodified *Vulkan
     apps* on tier2; the native path is the lower-overhead compositor-
     only route.  Worth weighing which to invest in.
-  - **Empirical bring-up (in progress).** `fresco-vulkan/examples/
+  - **Empirical bring-up (level 1 + 2 done).** `fresco-vulkan/examples/
     headless_icd.rs` runs HeadlessRenderer through atrium-vk-icd +
     the tier2 daemon.  **Level 1 PASS** (4fcc0c1, 65c2e77): the
     compositor's core Vulkan path — instance / device / image /
@@ -455,43 +457,57 @@ the optimistic case; textured/glyph shading is ~2–3× heavier.)
     route: advertise `VK_KHR_get_physical_device_properties2`;
     `HOST_COHERENT` map coherence (`vkMapMemory` pulls daemon bytes
     so map+read needs no explicit invalidate).
-    **Level 2 (in progress):** `load_bundle(atrium-core)` **PASSES**
-    — the rect/path/texture **compute + graphics shaders (Slang →
-    SPIR-V) all compile on tier2**.  `render_to_buffer` then aborts
-    on the next gap: **`vkCmdFillBuffer` is unimplemented** in the
-    ICD (HeadlessRenderer uses it to zero the compute atomic counter;
-    ash calls a null fn-ptr → SIGABRT).  Remaining level-2 gaps to
-    triage in order: (1) **`vkCmdFillBuffer`** — needs a new
-    `FrameOp::FillBuffer` (opcode + encode/decode) + ICD entry +
-    dispatch-table wire + daemon handler (fill a buffer range with a
-    u32); (2) the **compute dispatch** writing the instance SSBO +
-    atomic counter end-to-end; (3) the **graphics VS reading the
-    instance SSBO by `gl_InstanceIndex`** ((Vertex, StorageBuffer)
-    mapping); (4) **descriptor-set-bound storage buffers** for
-    compute + graphics.  Each is concrete, pinpointed from the
-    daemon's opcode wire-trace.
-  - **Level-2 root cause (found):** the full HeadlessRenderer frame
-    runs on tier2 (876c993) but the rect draws 0 instances because the
-    compositor's Slang shaders need tier2 FRONTEND features that
-    aren't implemented (NOT more ICD plumbing):
-    (1) **aggregate/struct elements in storage buffers** — the rect
-    compute does `instances[slot] = rec` where instances is
-    `RWStructuredBuffer<InstanceRecord>` (struct of 2x float4); tier2
-    rejects it: "dynamic AccessChain element type N has no IR size
-    (struct/aggregate elements not supported)".  So the compute
-    pipeline has no tier2 shader -> Dispatch skipped -> counter stays
-    0 -> instanceCount 0 -> rect not drawn.
-    (2) **`DrawParameters` capability** — the rect VS (gl_InstanceIndex
-    via Slang) emits it; the frontend rejects the capability.
-    Both are needed together.  (1) is a real atrium-spv-frontend /
-    atrium-spv-ir feature (aggregate types in the IR + AccessChain
-    into arrays-of-structs in StorageBuffer); (2) is likely cheap
-    (accept the capability — gl_InstanceIndex is already supported).
-    This is a frontend workstream, distinct from the ICD/daemon
-    plumbing P4 has fixed so far (KHR2 ext, HOST_COHERENT map, 
-    vkCmdFillBuffer).  Also minor: tier2 clears LINEAR not sRGB for an
-    _SRGB attachment.
-  - Then: compositor fast paths (opaque / occlusion / damage).
+    **Level 2 — COMPLETE (d31630d).** `headless_icd` reports
+    **`PASS level-2: compositor rect rendered through tier2 (compute +
+    instanced draw)`**: the atrium-core `op_rectangle` pipeline runs
+    fully on Tier-2 — host writes scene → submit-time flush → compute
+    builds the instance SSBO + atomic counter → instanced
+    `vkCmdDraw(4, N)` → VS reads `instances[gl_InstanceIndex]` → FS
+    paints → R/B-correct store to the BGRA8_SRGB attachment (rect reads
+    back RED).  The original level-2 root cause (rect drew 0 instances)
+    was a *cascade* of distinct gaps, each fixed and validated against
+    106/106 differential_compute + 81/81 loader smoke:
+    1. **`DrawParameters` capability** accepted (7f0efe6) — the rect VS
+       emits it via Slang's `gl_InstanceIndex` lowering.
+    2. **Aggregate/struct storage buffers** (71d767d) — chained
+       AccessChain into an array-of-struct (`instances[slot].member`)
+       via the SPIR-V `ArrayStride` decoration + a `ptr_pointee` map
+       (no IR change; leaf member stores already worked) + vec4
+       `Bitcast`.
+    3. **Vertex-stage StorageBuffer ABI** (f86d52b, shader ABI v3→v4)
+       — `atrium_vs_main` gains a `storage_table` param; the daemon
+       records graphics-side STORAGE_BUFFER descriptors (previously
+       dropped) and builds a per-draw descriptor table for the VS.
+       Plus `ConstVec` vector-flatten, `gl_BaseInstance/BaseVertex`
+       builtins (fixed a VS segfault), and **compute-before-draw frame
+       ordering** (submit_frame ran all compute *after* all passes —
+       backwards for a compute→draw dependency).
+    4. **`vkCmdFillBuffer`** (prior) — `FrameOp::FillBuffer` opcode +
+       ICD entry + daemon handler (zeroes the compute atomic counter).
+    5. **Host-coherent mapped-buffer push** (16904f2) — the compositor
+       persistently maps its scene buffer and never unmaps, so the
+       unmap/flush upload never fired; `flush_host_buffers_to_daemon`
+       pushes all host-backed buffers at `vkQueueSubmit` so the compute
+       reads the real scene.
+    6. **BGRA attachment R/B swap on FS-output store** (d31630d) — the
+       daemon's convention is "storage = native attachment format" (the
+       clear stores BGRA, the sampler reads BGRA-swapped); the FS-output
+       store was the lone RGBA violator, so a red rect read back blue.
+       A `swap_rb` flag (from the target's BGRA tex_format) swaps the FS
+       output before blend+store on the primary attachment.
+    Earlier ICD plumbing fixes en route: advertise
+    `VK_KHR_get_physical_device_properties2`; `HOST_COHERENT` map
+    coherence (`vkMapMemory` pulls daemon bytes).
+  - **Known follow-ups (not blocking):** mixed-format MRT (BGRA on a
+    *secondary* attachment) + the points/lines/fullscreen-fill store
+    paths still assume RGBA; tier2 clears LINEAR not sRGB for an _SRGB
+    attachment.
+  - **Remaining P4 work: compositor fast paths (opaque / occlusion /
+    damage).** Tier-2 already skips blend for source-replace draws and
+    has tile-binned + scissor damage dispatch (P1).  Open: solid-fill
+    memset for full-coverage solid-colour tiles, front-to-back opaque
+    occlusion skip, and bench-measuring each against the 4K compositor
+    workload.
 - **PT — Partial-update transport (in-app sub-rect damage).** Add
   `slot_update_region` / CAS patch + present damage rect to the
   Fresco protocol + bridge + compositor, so a small in-app dirty
