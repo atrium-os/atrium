@@ -68,8 +68,8 @@ honouring the shared-resource reality.
 
 ### Shared — read-only, slow (the "permeation")
 
-A small system energy surface that every layer *reads* (kernel knob
-namespace + a userspace policy authority; exact transport TBD):
+A small system energy surface that every layer *reads* (transport per
+signal — see **Transport** below):
 
 - **Policy mode** — `perf | balanced | battery`, derived from AC state,
   thermal state, and user/session intent (idle, foreground app). Every
@@ -106,6 +106,46 @@ discipline (Tier-2 ≈ Tier-3 ≈ interpreter). Policy can move work freely
 between tiers *because* correctness does not depend on where it lands.
 Tier-equivalence is therefore a hard invariant for any energy routing,
 not a nice-to-have.
+
+## Transport
+
+The signals cross the **kernel ↔ userspace boundary** in both
+directions, so the channel is a deliberate hybrid: **Aqueduct for the
+userspace coordination tier, sysctl (+ the atrium-gpu ABI) at the kernel
+edge.** Laminar is kernel-resident and cannot be an Aqueduct client, so
+Aqueduct alone can't carry everything.
+
+| Signal | Source → consumer | Channel |
+|---|---|---|
+| Policy mode / headroom → **Laminar** | authority (userspace) → scheduler (kernel) | **sysctl** (e.g. `kern.sched.laminar.energy_mode`) — one scalar, read in-kernel as a bias |
+| Policy mode / headroom → **router, compositor, display** | authority → userspace layers | **Aqueduct** — a small `energy` dictionary, async-event broadcast (fan-out, like fresco-protocol's ASYNC_EVENT) |
+| **GPU power / residency state** → router | kmod (kernel) → router (in `aqueduct-gpu-host`) | **atrium-gpu ABI** (the `/dev/atrium-gpu0` cdev the daemon already holds) or `hw.atrium_gpu.N.power_state` sysctl — read locally, no extra hop |
+| GPU state / AC / thermal → **authority** | kmod + ACPI/sensors (kernel) → authority (userspace) | **sysctl** (+ ABI) |
+
+Why the split:
+
+- **Laminar is in the kernel.** Making the scheduler an IPC client is a
+  layering violation and a non-starter for an upstreamable FreeBSD
+  scheduler. sysctl is the native, zero-dependency kernel knob Laminar
+  already uses (`kern.sched.ctrl_enable`); reading *one scalar mode*
+  keeps it within the single-cost-RLC charter (a bias input, not a
+  renderer term).
+- **The router already owns the GPU fd.** GPU power state is a kernel
+  fact the `aqueduct-gpu-host` daemon can read directly over the
+  atrium-gpu ABI — don't bounce it out to a userspace service and back.
+- **The transport shape enforces "coordinated, not coupled."** Both
+  channels are inherently *fan-out, read-only*: sysctl is
+  write-by-authority / read-by-others; Aqueduct async-events broadcast
+  from the authority. Neither lets a layer subscribe to another layer's
+  *instantaneous control output* — the exact property that keeps the
+  loops from coupling. The transport mechanically prevents the failure
+  mode the policy forbids.
+
+The **energy-policy authority** is the single userspace Aqueduct service
+that bridges both transports: it reads kernel sensors + GPU state
+(sysctl / ABI), computes mode + headroom, then **writes the Laminar
+sysctl** *and* **broadcasts over Aqueduct**. One source of truth, fanning
+out across both channels.
 
 ## Ownership
 
