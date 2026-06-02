@@ -79,6 +79,19 @@ struct MvkBuffer {
 unsafe impl Send for MvkBuffer {}
 unsafe impl Sync for MvkBuffer {}
 
+/// A guest graphics pipeline, materialised from VS+FS SPIR-V. The
+/// render pass is compatible-by-format with the per-frame render pass
+/// `submit_frame` begins (Vulkan render-pass compatibility is on
+/// attachment formats/samples, not object identity), so the pipeline
+/// binds inside it.
+struct MvkPipeline {
+    pipeline:    vk::Pipeline,
+    layout:      vk::PipelineLayout,
+    render_pass: vk::RenderPass,
+    vs:          vk::ShaderModule,
+    fs:          vk::ShaderModule,
+}
+
 /// Tier-3 Vulkan backend. Wraps a loaded `VkInstance` + `VkDevice`.
 ///
 /// One instance per host endpoint; `submit_frame` is internally
@@ -127,6 +140,8 @@ pub struct MoltenVkBackend {
     images: Mutex<HashMap<u32, MvkImage>>,
     /// Guest buffer id → host-visible `VkBuffer`.
     buffers: Mutex<HashMap<u32, MvkBuffer>>,
+    /// Guest pipeline id → materialised graphics pipeline.
+    pipelines: Mutex<HashMap<u32, MvkPipeline>>,
     /// Serialises command-buffer record + submit (one graphics queue).
     submit_lock: Mutex<()>,
 }
@@ -320,6 +335,7 @@ impl MoltenVkBackend {
             mem_props,
             images: Mutex::new(HashMap::new()),
             buffers: Mutex::new(HashMap::new()),
+            pipelines: Mutex::new(HashMap::new()),
             submit_lock: Mutex::new(()),
         })
     }
@@ -420,6 +436,13 @@ impl Drop for MoltenVkBackend {
                 self.device.unmap_memory(b.memory);
                 self.device.destroy_buffer(b.buffer, None);
                 self.device.free_memory(b.memory, None);
+            }
+            for (_, p) in self.pipelines.lock().unwrap().drain() {
+                self.device.destroy_pipeline(p.pipeline, None);
+                self.device.destroy_pipeline_layout(p.layout, None);
+                self.device.destroy_render_pass(p.render_pass, None);
+                self.device.destroy_shader_module(p.vs, None);
+                self.device.destroy_shader_module(p.fs, None);
             }
             self.device.destroy_command_pool(self.cmd_pool, None);
             self.device.destroy_device(None);
@@ -592,52 +615,123 @@ impl MoltenVkBackend {
     /// Record + submit one frame's clear/copy ops. Errors are returned
     /// (logged by the caller); the frame is still "consumed".
     fn record_and_submit(&self, frame_buf: &[u8]) -> Result<(), vk::Result> {
-        // Allocate a one-shot command buffer.
+        let dev = &self.device;
         let alloc = vk::CommandBufferAllocateInfo::default()
             .command_pool(self.cmd_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
             .command_buffer_count(1);
-        let cb = unsafe { self.device.allocate_command_buffers(&alloc)? }[0];
-        let begin = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        unsafe { self.device.begin_command_buffer(cb, &begin)?; }
+        let cb = unsafe { dev.allocate_command_buffers(&alloc)? }[0];
+        unsafe {
+            dev.begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
+        }
 
-        // Per-frame image layout tracking (all start UNDEFINED).
-        let mut layouts: HashMap<u32, vk::ImageLayout> = HashMap::new();
         let mut images = self.images.lock().unwrap();
         let buffers = self.buffers.lock().unwrap();
+        let pipelines = self.pipelines.lock().unwrap();
+
+        // Open render pass + the transient objects to destroy post-submit.
+        struct Active { rp: vk::RenderPass, fb: vk::Framebuffer,
+                        view: vk::ImageView, w: u32, h: u32 }
+        let mut active: Option<Active> = None;
+        let mut trash: Vec<(vk::RenderPass, vk::Framebuffer, vk::ImageView)> = Vec::new();
+        let mut bound_pipeline: Option<u32> = None;
+        // Close the open render pass (if any) and queue its objects.
+        macro_rules! end_rp { () => {
+            if let Some(a) = active.take() {
+                unsafe { dev.cmd_end_render_pass(cb); }
+                trash.push((a.rp, a.fb, a.view));
+            }
+        }}
 
         let mut dec = FrameDecoder::new(frame_buf);
         while let Ok(Some((op, body))) = dec.next() {
             match op {
                 FrameOp::BeginRenderPass => {
                     if body.len() < 8 { continue; }
+                    end_rp!();
                     let img_id = u32::from_le_bytes(body[0..4].try_into().unwrap());
                     let flags = if body.len() >= 12 {
                         u32::from_le_bytes(body[8..12].try_into().unwrap())
                     } else { 0 };
                     const NO_CLEAR: u32 = 0x1;
-                    if flags & NO_CLEAR != 0 { continue; }
+                    let no_clear = flags & NO_CLEAR != 0;
                     let rgba = [body[4], body[5], body[6], body[7]];
                     let Some(img) = images.get_mut(&img_id) else { continue; };
+                    let (w, h, format) = (img.width, img.height, img.format);
                     let Some(handle) = self.ensure_image(img) else { continue; };
-                    self.transition(cb, handle,
-                        *layouts.get(&img_id).unwrap_or(&vk::ImageLayout::UNDEFINED),
-                        vk::ImageLayout::TRANSFER_DST_OPTIMAL);
-                    layouts.insert(img_id, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
-                    let clear = vk::ClearColorValue {
-                        float32: [rgba[0] as f32 / 255.0, rgba[1] as f32 / 255.0,
-                                  rgba[2] as f32 / 255.0, rgba[3] as f32 / 255.0],
-                    };
-                    let range = vk::ImageSubresourceRange::default()
-                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                        .level_count(1).layer_count(1);
                     unsafe {
-                        self.device.cmd_clear_color_image(cb, handle,
-                            vk::ImageLayout::TRANSFER_DST_OPTIMAL, &clear, &[range]);
+                        let view = dev.create_image_view(&vk::ImageViewCreateInfo::default()
+                            .image(handle).view_type(vk::ImageViewType::TYPE_2D).format(format)
+                            .subresource_range(vk::ImageSubresourceRange::default()
+                                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                .level_count(1).layer_count(1)), None)?;
+                        // loadOp CLEAR (initial UNDEFINED) or LOAD-preserve
+                        // (initial TRANSFER_SRC, the prior frame's final).
+                        let (load_op, initial) = if no_clear {
+                            (vk::AttachmentLoadOp::LOAD, vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                        } else {
+                            (vk::AttachmentLoadOp::CLEAR, vk::ImageLayout::UNDEFINED)
+                        };
+                        let attach = [vk::AttachmentDescription::default()
+                            .format(format).samples(vk::SampleCountFlags::TYPE_1)
+                            .load_op(load_op).store_op(vk::AttachmentStoreOp::STORE)
+                            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                            .initial_layout(initial)
+                            .final_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)];
+                        let color_ref = [vk::AttachmentReference::default()
+                            .attachment(0).layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
+                        let subpass = [vk::SubpassDescription::default()
+                            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+                            .color_attachments(&color_ref)];
+                        let rp = dev.create_render_pass(&vk::RenderPassCreateInfo::default()
+                            .attachments(&attach).subpasses(&subpass), None)?;
+                        let views = [view];
+                        let fb = dev.create_framebuffer(&vk::FramebufferCreateInfo::default()
+                            .render_pass(rp).attachments(&views)
+                            .width(w).height(h).layers(1), None)?;
+                        let clear = [vk::ClearValue { color: vk::ClearColorValue {
+                            float32: [rgba[0] as f32 / 255.0, rgba[1] as f32 / 255.0,
+                                      rgba[2] as f32 / 255.0, rgba[3] as f32 / 255.0] }}];
+                        dev.cmd_begin_render_pass(cb, &vk::RenderPassBeginInfo::default()
+                            .render_pass(rp).framebuffer(fb)
+                            .render_area(vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 },
+                                extent: vk::Extent2D { width: w, height: h } })
+                            .clear_values(&clear), vk::SubpassContents::INLINE);
+                        active = Some(Active { rp, fb, view, w, h });
                     }
                 }
+                FrameOp::BindPipeline => {
+                    if body.len() < 4 { continue; }
+                    let pid = u32::from_le_bytes(body[0..4].try_into().unwrap());
+                    bound_pipeline = Some(pid);
+                    if let (Some(a), Some(p)) = (active.as_ref(), pipelines.get(&pid)) {
+                        unsafe {
+                            dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, p.pipeline);
+                            dev.cmd_set_viewport(cb, 0, &[vk::Viewport {
+                                x: 0.0, y: 0.0, width: a.w as f32, height: a.h as f32,
+                                min_depth: 0.0, max_depth: 1.0 }]);
+                            dev.cmd_set_scissor(cb, 0, &[vk::Rect2D {
+                                offset: vk::Offset2D { x: 0, y: 0 },
+                                extent: vk::Extent2D { width: a.w, height: a.h } }]);
+                        }
+                    }
+                }
+                FrameOp::Draw => {
+                    if body.len() < 16 || active.is_none() { continue; }
+                    let bound_ok = bound_pipeline
+                        .map(|p| pipelines.contains_key(&p)).unwrap_or(false);
+                    if !bound_ok { continue; }
+                    let vcount = u32::from_le_bytes(body[0..4].try_into().unwrap());
+                    let icount = u32::from_le_bytes(body[4..8].try_into().unwrap()).max(1);
+                    let fvert  = u32::from_le_bytes(body[8..12].try_into().unwrap());
+                    let finst  = u32::from_le_bytes(body[12..16].try_into().unwrap());
+                    unsafe { dev.cmd_draw(cb, vcount, icount, fvert, finst); }
+                }
+                FrameOp::EndRenderPass => { end_rp!(); }
                 FrameOp::CopyImgToBuf => {
+                    end_rp!(); // image left in TRANSFER_SRC by the render pass
                     if body.len() < 16 + 56 { continue; }
                     let src_id = u32::from_le_bytes(body[0..4].try_into().unwrap());
                     let dst_id = u32::from_le_bytes(body[4..8].try_into().unwrap());
@@ -646,12 +740,11 @@ impl MoltenVkBackend {
                     let Some(img) = images.get_mut(&src_id) else { continue; };
                     let Some(handle) = self.ensure_image(img) else { continue; };
                     let Some(buf) = buffers.get(&dst_id) else { continue; };
+                    // Sync barrier: make the copy wait on the render pass's
+                    // colour writes (image is already TRANSFER_SRC).
                     self.transition(cb, handle,
-                        *layouts.get(&src_id).unwrap_or(&vk::ImageLayout::UNDEFINED),
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                         vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
-                    layouts.insert(src_id, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
-                    // First region only for the slice (whole-image
-                    // readback is one region).
                     let r = &body[16..16 + 56];
                     let buf_offset = u64::from_le_bytes(r[0..8].try_into().unwrap());
                     let row_length = u32::from_le_bytes(r[8..12].try_into().unwrap());
@@ -661,8 +754,7 @@ impl MoltenVkBackend {
                     let ew = u32::from_le_bytes(r[44..48].try_into().unwrap());
                     let eh = u32::from_le_bytes(r[48..52].try_into().unwrap());
                     let copy = vk::BufferImageCopy::default()
-                        .buffer_offset(buf_offset)
-                        .buffer_row_length(row_length)
+                        .buffer_offset(buf_offset).buffer_row_length(row_length)
                         .buffer_image_height(img_h)
                         .image_subresource(vk::ImageSubresourceLayers::default()
                             .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -670,32 +762,32 @@ impl MoltenVkBackend {
                         .image_offset(vk::Offset3D { x: ox, y: oy, z: 0 })
                         .image_extent(vk::Extent3D { width: ew, height: eh, depth: 1 });
                     unsafe {
-                        self.device.cmd_copy_image_to_buffer(cb, handle,
+                        dev.cmd_copy_image_to_buffer(cb, handle,
                             vk::ImageLayout::TRANSFER_SRC_OPTIMAL, buf.buffer, &[copy]);
                     }
                 }
-                _ => { /* draws / other ops: follow-on slices */ }
+                _ => { /* other ops: not yet modelled on tier-3 */ }
             }
         }
-        drop(buffers);
-        drop(images);
+        end_rp!();
+        drop(pipelines); drop(buffers); drop(images);
 
-        unsafe { self.device.end_command_buffer(cb)?; }
-
-        // Submit + wait on a transient fence (synchronous, like the SW
-        // backend; the aqueduct fence is signalled by the caller path).
-        let fence = unsafe {
-            self.device.create_fence(&vk::FenceCreateInfo::default(), None)?
-        };
+        unsafe { dev.end_command_buffer(cb)?; }
+        let fence = unsafe { dev.create_fence(&vk::FenceCreateInfo::default(), None)? };
         let cbs = [cb];
         let submit = vk::SubmitInfo::default().command_buffers(&cbs);
         let res = unsafe {
-            self.device.queue_submit(self._queue, &[submit], fence)
-                .and_then(|_| self.device.wait_for_fences(&[fence], true, u64::MAX))
+            dev.queue_submit(self._queue, &[submit], fence)
+                .and_then(|_| dev.wait_for_fences(&[fence], true, u64::MAX))
         };
         unsafe {
-            self.device.destroy_fence(fence, None);
-            self.device.free_command_buffers(self.cmd_pool, &[cb]);
+            for (rp, fb, view) in trash {
+                dev.destroy_framebuffer(fb, None);
+                dev.destroy_render_pass(rp, None);
+                dev.destroy_image_view(view, None);
+            }
+            dev.destroy_fence(fence, None);
+            dev.free_command_buffers(self.cmd_pool, &cbs);
         }
         res
     }
@@ -910,6 +1002,103 @@ impl MoltenVkBackend {
             dev.destroy_image_view(view, None);
             res
         }
+    }
+
+    /// Tier-3 level-2b: materialise + store a graphics pipeline from
+    /// VS+FS SPIR-V, keyed by `pipeline_id`, so a later
+    /// `FrameOp::BindPipeline` in `submit_frame` can bind it for
+    /// `vkCmdDraw`. Viewport/scissor are **dynamic** (the target image
+    /// dims aren't known until `BeginRenderPass`); `submit_frame` sets
+    /// them after binding. The pipeline's render pass is
+    /// compatible-by-format with the per-frame render pass.
+    pub fn create_pipeline(
+        &self,
+        pipeline_id: ResourceId,
+        vs_spirv: &[u8],
+        fs_spirv: &[u8],
+        color_format: u32,
+    ) -> Result<(), vk::Result> {
+        let dev = &self.device;
+        let format = Self::vk_format(color_format);
+        unsafe {
+            let attach = vk::AttachmentDescription::default()
+                .format(format).samples(vk::SampleCountFlags::TYPE_1)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .initial_layout(vk::ImageLayout::UNDEFINED)
+                .final_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+            let color_ref = [vk::AttachmentReference::default()
+                .attachment(0).layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
+            let subpass = [vk::SubpassDescription::default()
+                .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+                .color_attachments(&color_ref)];
+            let attachments = [attach];
+            let rp_info = vk::RenderPassCreateInfo::default()
+                .attachments(&attachments).subpasses(&subpass);
+            let render_pass = dev.create_render_pass(&rp_info, None)?;
+
+            let vs_code = spirv_words(vs_spirv);
+            let fs_code = spirv_words(fs_spirv);
+            let vs = dev.create_shader_module(
+                &vk::ShaderModuleCreateInfo::default().code(&vs_code), None)?;
+            let fs = dev.create_shader_module(
+                &vk::ShaderModuleCreateInfo::default().code(&fs_code), None)?;
+            let entry = CString::new("main").unwrap();
+            let stages = [
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::VERTEX).module(vs).name(&entry),
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::FRAGMENT).module(fs).name(&entry),
+            ];
+            let vinput = vk::PipelineVertexInputStateCreateInfo::default();
+            let ia = vk::PipelineInputAssemblyStateCreateInfo::default()
+                .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+            // Dynamic viewport+scissor: counts set here, values at draw.
+            let vp = vk::PipelineViewportStateCreateInfo::default()
+                .viewport_count(1).scissor_count(1);
+            let dyn_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+            let dyn_info = vk::PipelineDynamicStateCreateInfo::default()
+                .dynamic_states(&dyn_states);
+            let rs = vk::PipelineRasterizationStateCreateInfo::default()
+                .polygon_mode(vk::PolygonMode::FILL)
+                .cull_mode(vk::CullModeFlags::NONE)
+                .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+                .line_width(1.0);
+            let ms = vk::PipelineMultisampleStateCreateInfo::default()
+                .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+            let blend_attach = [vk::PipelineColorBlendAttachmentState::default()
+                .color_write_mask(vk::ColorComponentFlags::RGBA).blend_enable(false)];
+            let cb_state = vk::PipelineColorBlendStateCreateInfo::default()
+                .attachments(&blend_attach);
+            let layout = dev.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default(), None)?;
+            let pipe_info = vk::GraphicsPipelineCreateInfo::default()
+                .stages(&stages)
+                .vertex_input_state(&vinput).input_assembly_state(&ia)
+                .viewport_state(&vp).dynamic_state(&dyn_info)
+                .rasterization_state(&rs).multisample_state(&ms)
+                .color_blend_state(&cb_state)
+                .layout(layout).render_pass(render_pass).subpass(0);
+            let pipeline = dev.create_graphics_pipelines(
+                vk::PipelineCache::null(), &[pipe_info], None)
+                .map_err(|(_, e)| e)?[0];
+
+            // Replace any prior pipeline at this id.
+            if let Some(old) = self.pipelines.lock().unwrap().insert(
+                pipeline_id.raw(),
+                MvkPipeline { pipeline, layout, render_pass, vs, fs })
+            {
+                let _ = dev.device_wait_idle();
+                dev.destroy_pipeline(old.pipeline, None);
+                dev.destroy_pipeline_layout(old.layout, None);
+                dev.destroy_render_pass(old.render_pass, None);
+                dev.destroy_shader_module(old.vs, None);
+                dev.destroy_shader_module(old.fs, None);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1172,5 +1361,63 @@ mod tests {
         // (~[230,51,51,255]), NOT the dark clear [10,10,10].
         assert!(px[i] > 200 && px[i + 1] < 90 && px[i + 2] < 90 && px[i + 3] == 255,
             "centre should be the drawn triangle colour, got {:?}", &px[i..i + 4]);
+    }
+
+    /// Tier-3 level-2b (-i): the FULL FrameOp draw replay through
+    /// `submit_frame` — a registered pipeline + a frame of
+    /// BeginRenderPass / BindPipeline / Draw / EndRenderPass /
+    /// CopyImgToBuf renders the triangle on Metal. This is the interface
+    /// the daemon will drive (level-2b-ii wires the session to it).
+    #[test]
+    fn frameop_draw_replay_through_metal() {
+        use aqueduct_gpu::frame::FrameBuilder;
+        use aqueduct_gpu::ids::IdNamespace;
+        let Some(be) = try_init() else { return; };
+        const W: u32 = 16;
+        const H: u32 = 16;
+        let img  = ResourceId::new(IdNamespace::IcdRuntime, 0x50);
+        let buf  = ResourceId::new(IdNamespace::IcdRuntime, 0x60);
+        let pipe = ResourceId::new(IdNamespace::IcdRuntime, 0x70);
+
+        be.image_created(img, W, H);
+        be.set_image_format(img, 37); // RGBA8_UNORM
+        be.buffer_created(buf, (W * H * 4) as u64);
+        be.create_pipeline(pipe, &build_fullscreen_tri_vs(),
+            &build_const_fs([0.2, 0.85, 0.3, 1.0]), 37).expect("create_pipeline"); // green
+
+        let mut fb = FrameBuilder::new(8192);
+        let mut brp = Vec::new();
+        brp.extend_from_slice(&img.raw().to_le_bytes());
+        brp.extend_from_slice(&[10u8, 10, 10, 255]); // dark clear
+        brp.extend_from_slice(&0u32.to_le_bytes());   // flags (CLEAR)
+        fb.push(FrameOp::BeginRenderPass, &brp).unwrap();
+        fb.push(FrameOp::BindPipeline, &pipe.raw().to_le_bytes()).unwrap();
+        let mut draw = Vec::new(); // DrawCmd: vcount, icount, fvert, finst
+        draw.extend_from_slice(&3u32.to_le_bytes());
+        draw.extend_from_slice(&1u32.to_le_bytes());
+        draw.extend_from_slice(&0u32.to_le_bytes());
+        draw.extend_from_slice(&0u32.to_le_bytes());
+        fb.push(FrameOp::Draw, &draw).unwrap();
+        fb.push(FrameOp::EndRenderPass, &[]).unwrap();
+        let mut cib = Vec::new();
+        cib.extend_from_slice(&img.raw().to_le_bytes());
+        cib.extend_from_slice(&buf.raw().to_le_bytes());
+        cib.extend_from_slice(&0u32.to_le_bytes());
+        cib.extend_from_slice(&1u32.to_le_bytes());
+        let mut region = vec![0u8; 56];
+        region[44..48].copy_from_slice(&W.to_le_bytes());
+        region[48..52].copy_from_slice(&H.to_le_bytes());
+        region[52..56].copy_from_slice(&1u32.to_le_bytes());
+        cib.extend_from_slice(&region);
+        fb.push(FrameOp::CopyImgToBuf, &cib).unwrap();
+
+        let fid = ResourceId::new(IdNamespace::IcdRuntime, 0x71);
+        assert!(be.submit_frame(fid, 1, fb.as_bytes()));
+
+        let px = be.buffer_read_bytes(buf, 0, (W * H * 4) as u64).expect("readback");
+        let i = ((H as usize / 2) * W as usize + W as usize / 2) * 4;
+        // Green triangle (~[51,217,77,255]) over the dark clear.
+        assert!(px[i] < 90 && px[i + 1] > 180 && px[i + 2] < 110 && px[i + 3] == 255,
+            "centre should be the drawn (green) triangle, got {:?}", &px[i..i + 4]);
     }
 }
