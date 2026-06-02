@@ -890,9 +890,18 @@ fn render_one_frame_multipass(
         Vec<(u32, Vec<u8>, HashMap<(u8, u32), (u64, [f32; 4])>)> =
         Vec::with_capacity(layers.len());
     {
-        let fe = frontend.lock().unwrap();
+        let mut fe = frontend.lock().unwrap();
         for (win_id, _, (sw, sh)) in &layers {
             let surface = window_surfaces.get(win_id).unwrap();
+
+            // PT: app-declared damage from OP_WINDOW_PRESENT_DAMAGE.
+            // Consume it (take) so a one-shot damaged present doesn't
+            // re-trigger a partial redraw of the same rect every
+            // subsequent frame. Folded into this frame's `damage`
+            // below, so the recomposite scissors to it exactly like
+            // scene-delta damage.
+            let app_damage = fe.window_state_mut(*win_id)
+                .and_then(|s| s.pending_damage.take());
 
             // Build current frame's per-node hash + bbox map. Used
             // both to compute the damage rect and to roll forward
@@ -941,6 +950,17 @@ fn render_one_frame_multipass(
                         Some(d) => bbox_union(d, *bb_old), None => *bb_old,
                     });
                 }
+            }
+
+            // PT: fold the app-declared damage rect (window-local px)
+            // into this frame's damage, in the same [x0,y0,x1,y1] bbox
+            // space as the scene-delta damage above.
+            if let Some(pd) = app_damage {
+                let bb = [pd.x as f32, pd.y as f32,
+                          (pd.x + pd.w) as f32, (pd.y + pd.h) as f32];
+                damage = Some(match damage {
+                    Some(d) => bbox_union(d, bb), None => bb,
+                });
             }
 
             // Fast path: nothing in this window changed since last
