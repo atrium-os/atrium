@@ -692,6 +692,15 @@ This section is specific to the **bring-up environment** (FreeBSD VM
 under macOS HVF, host endpoint running on macOS). Native HW (D5+)
 skips all of this — the guest-side client talks directly to the kmod.
 
+> **Detailed design: `gpu-vm-transport.md`.** The sketch below assumed a
+> *polling* ivshmem channel ("doesn't depend on MSI-X (which we already
+> poll for via `FRESCO_POLL_HZ`)"). That assumption is **superseded** —
+> the transport is now **fully doorbell-driven** (both sides sleep on a
+> doorbell, no ring-spin, no control-register poll), the venus
+> replacement that lets the FreeBSD VM reach the host `MoltenVkBackend`.
+> Read `gpu-vm-transport.md` for the authoritative design; §6.1–6.2
+> here are kept as the original high-level placement.
+
 ### 6.1. Wire choice: ivshmem
 
 We already have an ivshmem channel between QEMU and the FreeBSD guest
