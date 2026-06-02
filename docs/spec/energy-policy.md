@@ -219,14 +219,21 @@ Metal via MoltenVK).
   dynamic viewport/scissor + `vkCmdDraw`); `create_pipeline` registers
   pipelines from SPIR-V. This is the exact interface the daemon will
   drive.
-- **Tier-3 level-2b-ii still pending:** a hardware pipeline-create hook
-  on the `Backend` trait + session wiring (route OP_GPU_PIPELINE_CREATE
-  to it — the daemon path is tier2-specific today), so the daemon
-  drives Tier-3 from real app frames and the compositor rect renders on
-  Metal end-to-end.
+- **Tier-3 level-2b-ii DONE (031b0f4):** the daemon now routes
+  `OP_GPU_PIPELINE_CREATE` to the hardware backend. A `Backend
+  ::pipeline_created(id, vs, fs)` hook (default no-op) + session SPIR-V
+  retention (`ShaderRecord.spirv`) + handle_pipeline_create routing →
+  `MoltenVkBackend::create_graphics_pipeline`, which stashes the SPIR-V
+  and materialises the `VkPipeline` lazily at first draw (format from
+  the render target — the format-propagation crux). 93/93 daemon lib
+  tests + 81/81 smoke (tier2 unaffected).
+- **Tier-3 level-2b-iii still pending:** daemon backend *selection*
+  (run with `MoltenVkBackend`) + a graphics-draw app to exercise
+  ICD→daemon→Metal end-to-end (the compositor's rect uses compute too,
+  so a pure-graphics app is the cleaner first end-to-end).
 
-**Next step is level-2b-ii** (Backend pipeline-create hook + session
-routing). Only then:
+**Next step is level-2b-iii** (backend selection + end-to-end draw via
+the ICD). Only then:
 - measure the crossover (submit/latency on Tier-3 vs CPU cost on
   Tier-2; note wall-clock on a warm host GPU captures the
   *submit/latency* component but not silicon *wake* energy — that
