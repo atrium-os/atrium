@@ -211,13 +211,22 @@ Metal via MoltenVK).
   (`draw_triangle_through_metal` test). The hard "can Tier-3 draw?" is
   answered — yes — and the pipeline/render-pass/framebuffer/shader-module
   helpers exist.
-- **Tier-3 level-2b still pending:** wire the draw path to the FrameOp
-  stream + add a hardware pipeline-create hook on the `Backend` trait
-  (the daemon's pipeline path is currently tier2-specific). Then the
-  compositor rect renders on Metal end-to-end.
+- **Tier-3 level-2b-i DONE (0670cfb):** the full FrameOp draw replay
+  runs through `submit_frame` — a registered pipeline +
+  BeginRenderPass/BindPipeline/Draw/EndRenderPass/CopyImgToBuf renders
+  on Metal (`frameop_draw_replay_through_metal`). `submit_frame` is now
+  a real render-pass replay (per-frame render pass + framebuffer +
+  dynamic viewport/scissor + `vkCmdDraw`); `create_pipeline` registers
+  pipelines from SPIR-V. This is the exact interface the daemon will
+  drive.
+- **Tier-3 level-2b-ii still pending:** a hardware pipeline-create hook
+  on the `Backend` trait + session wiring (route OP_GPU_PIPELINE_CREATE
+  to it — the daemon path is tier2-specific today), so the daemon
+  drives Tier-3 from real app frames and the compositor rect renders on
+  Metal end-to-end.
 
-**Next step is level-2b** (FrameOp BindPipeline/Draw replay + Backend
-pipeline-create plumbing). Only then:
+**Next step is level-2b-ii** (Backend pipeline-create hook + session
+routing). Only then:
 - measure the crossover (submit/latency on Tier-3 vs CPU cost on
   Tier-2; note wall-clock on a warm host GPU captures the
   *submit/latency* component but not silicon *wake* energy — that
