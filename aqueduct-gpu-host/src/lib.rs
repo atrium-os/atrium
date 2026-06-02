@@ -66,6 +66,8 @@
 #![feature(portable_simd)]
 
 pub mod backend;
+#[cfg(unix)]
+pub mod carillon;
 pub mod listener;
 pub mod moltenvk;
 pub mod resources;
@@ -88,6 +90,8 @@ pub use tier2_registry::{
     DrawTriangle, Tier2Registry, Tier2ShaderId,
 };
 pub use moltenvk::{MoltenVkBackend, MoltenVkError};
+#[cfg(unix)]
+pub use carillon::{CompDesc, Doorbell, GuestRing, Host as CarillonHost, Region as CarillonRegion, SubDesc};
 pub use listener::Listener;
 pub use resources::ResourceTable;
 pub use session::Session;

@@ -69,6 +69,12 @@ atrium-spv-loader = { path = "../atrium-spv-loader" }
 # used by the compute dispatcher to wire OpImageRead/Write.
 atrium-spv-runtime = { path = "../atrium-spv-runtime" }
 
+# Carillon transport (T0+): the host endpoint maps the shared-memory
+# region (mmap), drives the pipe-backed doorbell (pipe/read/write), and
+# queries the host page size (sysconf) via raw libc, mirroring the
+# fresco/ivshmem_server.rs reference. See docs/spec/carillon.md.
+libc           = "0.2"
+
 
 [dev-dependencies]
 aqueduct-gpu-client = { path = "../aqueduct-gpu-client" }
@@ -77,9 +83,8 @@ aqueduct-gpu-client = { path = "../aqueduct-gpu-client" }
 rspirv          = "0.13"
 tempfile        = "3"
 atrium-spv-ir   = { path = "../atrium-spv-ir" }
-# Perf/energy benchmarks: getrusage for per-frame CPU-time
-# (summed across all threads) as a power-draw proxy.
-libc            = "0.2"
+# (libc is a normal dependency now — used by the carillon transport —
+# so the perf/energy benchmarks' getrusage calls reuse it from there.)
 
 [features]
 default = []

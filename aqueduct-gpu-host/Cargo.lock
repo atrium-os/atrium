@@ -115,6 +115,7 @@ dependencies = [
  "atrium-spv-loader",
  "atrium-spv-runtime",
  "env_logger",
+ "libc",
  "log",
  "postcard",
  "rayon",
