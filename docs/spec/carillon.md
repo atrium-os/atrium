@@ -139,6 +139,55 @@ transport-agnostically.
 
 ---
 
+## 2.5. Where Carillon lives — and why almost none of it is in QEMU
+
+A natural question (asked of every paravirt GPU path): *is Carillon a
+QEMU thing?* No. Contrast with venus, which people misremember as "part
+of QEMU" but was actually spread across three homes — none of which was
+QEMU's interesting part:
+
+| venus piece | Actual home |
+|---|---|
+| Guest Vulkan ICD (`libvulkan_virtio.so`) | **Mesa** (`src/virtio/vulkan/`) |
+| Wire definition | **venus-protocol** (separate repo) |
+| Host renderer (executes the stream) | **virglrenderer** (`src/venus/`, freedesktop) |
+| Transport device | **QEMU** — only the generic `virtio-gpu` device, linking virglrenderer as a library (+ the BLOB/fence patches Atrium carries in `qemu-build`) |
+
+That split — venus logic in Mesa + virglrenderer, every fix "one more
+workaround in someone else's code" — is precisely the pain
+`aqueduct-gpu.md` §1 cites for dropping venus.
+
+**Carillon is built on `ivshmem-doorbell` specifically so it needs no
+QEMU fork.** `ivshmem-doorbell` is an *existing, upstream* QEMU device
+(`hw/misc/ivshmem.c`); the reference (`fresco/ivshmem_server.rs`) drives
+stock ivshmem + an external server with zero QEMU patches. So every
+Carillon component lives in the **Atrium repo**, and QEMU contact is one
+launch flag:
+
+| Carillon piece | Home | Lang |
+|---|---|---|
+| Guest endpoint (PCI/MSI-X kmod, ring + doorbell) — §9 | **Atrium tree** (atrium-gpu kmod family / new kmod) | C |
+| Host endpoint (ivshmem-server port + transport frontend) — §10 | **Atrium tree** (`aqueduct-gpu-host`) | Rust |
+| The QEMU device | **stock upstream QEMU** `ivshmem-doorbell`, unmodified | — |
+| QEMU touchpoint | **`scripts/run-vm.sh`** flags (`-device ivshmem-doorbell,vectors=N,chardev=…`) | — |
+
+**Nothing is submitted to QEMU for v1, and nothing new lands in
+`qemu-build`.** Keeping the transport logic in our own daemon (not in
+QEMU/virglrenderer) is the deliberate lesson from venus: our iteration
+loop, our license, no fork to rebase, whole-frame validation we own.
+
+**The one v2 exception.** If ivshmem's 2-peer model / per-connection
+isolation / multi-consumer contention ever bites (§13, and
+`aqueduct-gpu.md` §6.1's "dedicated `atrium-gpu-shmem` virtio device"
+escape hatch), Carillon migrates to a **bespoke QEMU device**. *That*
+device would live in `qemu-build` and could in principle be proposed
+upstream — but, like Atrium's BLOB patches, it is Atrium-specific enough
+that it would most likely stay a carried patch. It is explicitly **not
+v1**: v1 rides stock `ivshmem-doorbell` precisely to avoid carrying
+QEMU code at all.
+
+---
+
 ## 3. The doorbell mechanism (no spin, no poll)
 
 This is the heart of the design and the part most directly grounded in
