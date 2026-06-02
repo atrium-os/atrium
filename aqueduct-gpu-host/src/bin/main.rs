@@ -55,6 +55,19 @@ use aqueduct_gpu_host::{
 use atrium_spv_loader::LoaderConfig;
 
 const DEFAULT_SOCKET: &str = "/tmp/aqueduct-gpu.sock";
+const DEFAULT_CARILLON_SOCK: &str = "/tmp/carillon.sock";
+const DEFAULT_CARILLON_SHM: &str = "/tmp/carillon.shm";
+
+/// Where the daemon listens for client work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Transport {
+    /// Unix-socket aqueduct envelope listener (host dev / CI default).
+    Socket,
+    /// Carillon ivshmem-doorbell endpoint (the FreeBSD-VM path): stand up
+    /// an `IvshmemServer`, wait for QEMU, and run `serve_ivshmem` against
+    /// the selected backend. See docs/spec/carillon.md.
+    Carillon,
+}
 
 /// Backend kind selected at daemon startup. Cannot change mid-run
 /// in Phase 1; live policy switching deferred to Phase 2+.
@@ -95,6 +108,10 @@ impl BackendKind {
 
 struct Args {
     socket: PathBuf,
+    transport: Transport,
+    /// Carillon-mode socket QEMU connects to + shm backing file.
+    carillon_sock: PathBuf,
+    carillon_shm: PathBuf,
     backend: BackendKind,
     /// `true` if `--tier2` was passed; gates the Tier2Registry
     /// attach in `main`.
@@ -115,6 +132,9 @@ struct Args {
 
 fn parse_args() -> Result<Args> {
     let mut socket: Option<PathBuf> = None;
+    let mut transport = Transport::Socket;
+    let mut carillon_sock: Option<PathBuf> = None;
+    let mut carillon_shm: Option<PathBuf> = None;
     let mut backend = BackendKind::Stub;
     let mut tier2 = false;
     let mut cache_root: Option<PathBuf> = None;
@@ -126,6 +146,25 @@ fn parse_args() -> Result<Args> {
             "--socket" => {
                 socket = Some(PathBuf::from(
                     iter.next().ok_or_else(|| anyhow!("--socket needs an argument"))?
+                ));
+            }
+            "--transport" => {
+                let v = iter.next().ok_or_else(|| anyhow!("--transport needs an argument"))?;
+                transport = match v.as_str() {
+                    "socket"   => Transport::Socket,
+                    "carillon" => Transport::Carillon,
+                    other => return Err(anyhow!(
+                        "unknown --transport {other:?}; valid: socket | carillon")),
+                };
+            }
+            "--carillon-sock" => {
+                carillon_sock = Some(PathBuf::from(
+                    iter.next().ok_or_else(|| anyhow!("--carillon-sock needs an argument"))?
+                ));
+            }
+            "--carillon-shm" => {
+                carillon_shm = Some(PathBuf::from(
+                    iter.next().ok_or_else(|| anyhow!("--carillon-shm needs an argument"))?
                 ));
             }
             "--backend" => {
@@ -152,6 +191,8 @@ fn parse_args() -> Result<Args> {
             }
             "--help" | "-h" => {
                 println!("usage: aqueduct-gpu-host [--socket PATH] \
+                    [--transport socket|carillon] \
+                    [--carillon-sock PATH] [--carillon-shm PATH] \
                     [--backend stub|software|moltenvk|tier2] \
                     [--tier2] [--cache-root PATH] [--compile-binary PATH] \
                     [--spirv-opt-binary PATH]");
@@ -174,6 +215,9 @@ fn parse_args() -> Result<Args> {
     }
     Ok(Args {
         socket: socket.unwrap_or_else(|| PathBuf::from(DEFAULT_SOCKET)),
+        transport,
+        carillon_sock: carillon_sock.unwrap_or_else(|| PathBuf::from(DEFAULT_CARILLON_SOCK)),
+        carillon_shm: carillon_shm.unwrap_or_else(|| PathBuf::from(DEFAULT_CARILLON_SHM)),
         backend,
         tier2,
         cache_root,
@@ -274,6 +318,25 @@ fn main() -> Result<()> {
     };
 
     let backend = make_backend(args.backend, registry.as_ref())?;
+
+    // Carillon (FreeBSD-VM) transport: stand up the ivshmem-doorbell
+    // endpoint instead of the Unix-socket listener.
+    if args.transport == Transport::Carillon {
+        #[cfg(unix)]
+        {
+            return run_carillon(
+                &args.carillon_sock,
+                &args.carillon_shm,
+                args.backend,
+                backend,
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            return Err(anyhow!("--transport carillon requires a unix host"));
+        }
+    }
+
     let mut listener = Listener::bind(&args.socket, backend)?;
     if let Some(reg) = registry {
         listener = listener.with_tier2_registry(reg);
@@ -293,5 +356,66 @@ fn main() -> Result<()> {
         listener = listener.with_spirv_opt_binary(p);
     }
     listener.accept_loop()?;
+    Ok(())
+}
+
+/// Carillon transport: create the `IvshmemServer`, wait for QEMU to
+/// connect (run-vm.sh --carillon), then `serve_ivshmem` — dispatching
+/// each frame's FrameOp stream to the selected backend's `submit_frame`
+/// and ringing the guest on completion. The daemon runs until killed.
+///
+/// First end-to-end verification is the VM session: the QEMU `send_init`
+/// handshake + MSI-X delivery + BAR2-cacheable-under-HVF mapping are
+/// only exercised against a real guest. (Resource creation over the
+/// rings — images/shaders/pipelines — is a follow-on; this first cut
+/// drives the frame path against a pre-populated backend.)
+#[cfg(unix)]
+fn run_carillon(
+    sock: &std::path::Path,
+    shm: &std::path::Path,
+    backend_kind: BackendKind,
+    backend: Arc<dyn Backend>,
+) -> Result<()> {
+    use aqueduct_gpu::ids::{IdNamespace, ResourceId};
+    use aqueduct_gpu_host::carillon::{layout, Doorbell};
+    use aqueduct_gpu_host::{serve_ivshmem, CompDesc, IvshmemServer, SubDesc};
+
+    let mut server = IvshmemServer::new(sock, shm, layout::TOTAL_SIZE)
+        .with_context(|| format!("carillon: IvshmemServer on {}", sock.display()))?;
+    log::info!(
+        "carillon: IvshmemServer on {} (shm {}); launch scripts/run-vm.sh \
+         --carillon and waiting for QEMU…",
+        sock.display(),
+        shm.display(),
+    );
+
+    // Block until QEMU connects + the init handshake completes.
+    while !server.try_accept()? {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    log::info!(
+        "carillon: QEMU connected; serving frames on the {:?} backend",
+        backend_kind
+    );
+
+    // Shutdown self-pipe — unused here (the daemon runs until killed),
+    // but serve_ivshmem multiplexes it so a future signal handler can
+    // ring it for a clean exit.
+    let shutdown = Doorbell::new()?;
+    let shutdown_fd = shutdown.read_fd();
+
+    let be = backend.clone();
+    let (wakeups, frames) = serve_ivshmem(&server, shutdown_fd, move |sub: &SubDesc, bytes: &[u8]| {
+        let fence = ResourceId::new(IdNamespace::IcdRuntime, sub.fence_id);
+        let ok = be.submit_frame(fence, 1, bytes);
+        CompDesc {
+            kind: if ok { CompDesc::KIND_FRAME_DONE } else { CompDesc::KIND_ERROR },
+            fence_id: sub.fence_id,
+            result: u32::from(!ok),
+            readback_off: 0,
+            readback_len: 0,
+        }
+    })?;
+    log::info!("carillon: serve loop exited ({wakeups} wakeups, {frames} frames)");
     Ok(())
 }
