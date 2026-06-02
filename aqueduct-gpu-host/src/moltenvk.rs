@@ -79,12 +79,22 @@ struct MvkBuffer {
 unsafe impl Send for MvkBuffer {}
 unsafe impl Sync for MvkBuffer {}
 
-/// A guest graphics pipeline, materialised from VS+FS SPIR-V. The
-/// render pass is compatible-by-format with the per-frame render pass
-/// `submit_frame` begins (Vulkan render-pass compatibility is on
-/// attachment formats/samples, not object identity), so the pipeline
-/// binds inside it.
+/// A guest graphics pipeline. The VS+FS SPIR-V is stashed at create
+/// time, but the real `VkPipeline` is materialised **lazily** on first
+/// draw — the colour-attachment format (needed for the pipeline's
+/// render pass, and for Vulkan render-pass compatibility with the
+/// per-frame render pass) isn't known until `BeginRenderPass` picks a
+/// target. `materialized` caches it for the format last drawn with.
 struct MvkPipeline {
+    vs_spirv:     Vec<u8>,
+    fs_spirv:     Vec<u8>,
+    materialized: Option<MvkPipelineVk>,
+}
+
+/// The realised Vulkan objects for an `MvkPipeline` at a specific
+/// colour format.
+struct MvkPipelineVk {
+    format:      vk::Format,
     pipeline:    vk::Pipeline,
     layout:      vk::PipelineLayout,
     render_pass: vk::RenderPass,
@@ -438,11 +448,7 @@ impl Drop for MoltenVkBackend {
                 self.device.free_memory(b.memory, None);
             }
             for (_, p) in self.pipelines.lock().unwrap().drain() {
-                self.device.destroy_pipeline(p.pipeline, None);
-                self.device.destroy_pipeline_layout(p.layout, None);
-                self.device.destroy_render_pass(p.render_pass, None);
-                self.device.destroy_shader_module(p.vs, None);
-                self.device.destroy_shader_module(p.fs, None);
+                if let Some(vk) = p.materialized { self.destroy_pipeline_vk(vk); }
             }
             self.device.destroy_command_pool(self.cmd_pool, None);
             self.device.destroy_device(None);
@@ -592,10 +598,17 @@ impl Backend for MoltenVkBackend {
         Ok(out)
     }
 
-    /// Replay the frame's op stream as real Vulkan commands on Metal.
-    /// Slice scope: render-pass *clear* (`vkCmdClearColorImage`) +
-    /// image→buffer *readback* (`vkCmdCopyImageToBuffer`). Draws,
-    /// pipelines and SPIR-V→Metal are follow-on slices.
+    /// Tier-3 pipeline-create hook: stash the VS+FS SPIR-V (the real
+    /// VkPipeline is built lazily at first draw — see
+    /// `create_graphics_pipeline`).
+    fn pipeline_created(&self, pipeline_id: ResourceId,
+                        vs_spirv: &[u8], fs_spirv: &[u8]) {
+        self.create_graphics_pipeline(pipeline_id, vs_spirv, fs_spirv);
+    }
+
+    /// Replay the frame's op stream as real Vulkan commands on Metal:
+    /// render-pass clear + draws (`vkCmdDraw` via registered pipelines)
+    /// + image→buffer readback.
     fn submit_frame(
         &self,
         _fence_id: ResourceId,
@@ -628,11 +641,11 @@ impl MoltenVkBackend {
 
         let mut images = self.images.lock().unwrap();
         let buffers = self.buffers.lock().unwrap();
-        let pipelines = self.pipelines.lock().unwrap();
+        let mut pipelines = self.pipelines.lock().unwrap();
 
         // Open render pass + the transient objects to destroy post-submit.
         struct Active { rp: vk::RenderPass, fb: vk::Framebuffer,
-                        view: vk::ImageView, w: u32, h: u32 }
+                        view: vk::ImageView, w: u32, h: u32, format: vk::Format }
         let mut active: Option<Active> = None;
         let mut trash: Vec<(vk::RenderPass, vk::Framebuffer, vk::ImageView)> = Vec::new();
         let mut bound_pipeline: Option<u32> = None;
@@ -699,22 +712,38 @@ impl MoltenVkBackend {
                             .render_area(vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 },
                                 extent: vk::Extent2D { width: w, height: h } })
                             .clear_values(&clear), vk::SubpassContents::INLINE);
-                        active = Some(Active { rp, fb, view, w, h });
+                        active = Some(Active { rp, fb, view, w, h, format });
                     }
                 }
                 FrameOp::BindPipeline => {
                     if body.len() < 4 { continue; }
                     let pid = u32::from_le_bytes(body[0..4].try_into().unwrap());
                     bound_pipeline = Some(pid);
-                    if let (Some(a), Some(p)) = (active.as_ref(), pipelines.get(&pid)) {
+                    let Some(a) = active.as_ref() else { continue; };
+                    let (aw, ah, afmt) = (a.w, a.h, a.format);
+                    let Some(p) = pipelines.get_mut(&pid) else { continue; };
+                    // Lazily materialise the VkPipeline for this render
+                    // target's format (rebuild if the format changed).
+                    let need = p.materialized.as_ref().map(|m| m.format != afmt).unwrap_or(true);
+                    if need {
+                        if let Some(old) = p.materialized.take() {
+                            unsafe { let _ = dev.device_wait_idle();
+                                     self.destroy_pipeline_vk(old); }
+                        }
+                        match self.materialize_pipeline(&p.vs_spirv, &p.fs_spirv, afmt) {
+                            Ok(vk) => p.materialized = Some(vk),
+                            Err(e) => { log::warn!("MoltenVk materialize pipeline: {e:?}"); }
+                        }
+                    }
+                    if let Some(m) = p.materialized.as_ref() {
                         unsafe {
-                            dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, p.pipeline);
+                            dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, m.pipeline);
                             dev.cmd_set_viewport(cb, 0, &[vk::Viewport {
-                                x: 0.0, y: 0.0, width: a.w as f32, height: a.h as f32,
+                                x: 0.0, y: 0.0, width: aw as f32, height: ah as f32,
                                 min_depth: 0.0, max_depth: 1.0 }]);
                             dev.cmd_set_scissor(cb, 0, &[vk::Rect2D {
                                 offset: vk::Offset2D { x: 0, y: 0 },
-                                extent: vk::Extent2D { width: a.w, height: a.h } }]);
+                                extent: vk::Extent2D { width: aw, height: ah } }]);
                         }
                     }
                 }
@@ -1004,41 +1033,51 @@ impl MoltenVkBackend {
         }
     }
 
-    /// Tier-3 level-2b: materialise + store a graphics pipeline from
-    /// VS+FS SPIR-V, keyed by `pipeline_id`, so a later
-    /// `FrameOp::BindPipeline` in `submit_frame` can bind it for
-    /// `vkCmdDraw`. Viewport/scissor are **dynamic** (the target image
-    /// dims aren't known until `BeginRenderPass`); `submit_frame` sets
-    /// them after binding. The pipeline's render pass is
-    /// compatible-by-format with the per-frame render pass.
-    pub fn create_pipeline(
-        &self,
-        pipeline_id: ResourceId,
-        vs_spirv: &[u8],
-        fs_spirv: &[u8],
-        color_format: u32,
-    ) -> Result<(), vk::Result> {
+    /// Tier-3 level-2b: register a graphics pipeline from VS+FS SPIR-V,
+    /// keyed by `pipeline_id`. The real `VkPipeline` is built lazily on
+    /// first draw (the colour format isn't known until then — see
+    /// `materialize_pipeline`); here we just stash the bytecode. A
+    /// later `FrameOp::BindPipeline` in `submit_frame` binds it.
+    pub fn create_graphics_pipeline(
+        &self, pipeline_id: ResourceId, vs_spirv: &[u8], fs_spirv: &[u8],
+    ) {
+        let prior = self.pipelines.lock().unwrap().insert(
+            pipeline_id.raw(),
+            MvkPipeline {
+                vs_spirv: vs_spirv.to_vec(),
+                fs_spirv: fs_spirv.to_vec(),
+                materialized: None,
+            });
+        if let Some(p) = prior {
+            if let Some(vk) = p.materialized {
+                unsafe { let _ = self.device.device_wait_idle();
+                         self.destroy_pipeline_vk(vk); }
+            }
+        }
+    }
+
+    /// Build the Vulkan objects for a graphics pipeline at `format`.
+    /// Dynamic viewport/scissor (target dims set at draw); the render
+    /// pass is compatible-by-format with `submit_frame`'s per-frame
+    /// render pass (Vulkan compatibility is on formats/samples).
+    fn materialize_pipeline(&self, vs_spirv: &[u8], fs_spirv: &[u8],
+                            format: vk::Format) -> Result<MvkPipelineVk, vk::Result> {
         let dev = &self.device;
-        let format = Self::vk_format(color_format);
         unsafe {
-            let attach = vk::AttachmentDescription::default()
+            let attach = [vk::AttachmentDescription::default()
                 .format(format).samples(vk::SampleCountFlags::TYPE_1)
-                .load_op(vk::AttachmentLoadOp::CLEAR)
-                .store_op(vk::AttachmentStoreOp::STORE)
+                .load_op(vk::AttachmentLoadOp::CLEAR).store_op(vk::AttachmentStoreOp::STORE)
                 .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
                 .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
                 .initial_layout(vk::ImageLayout::UNDEFINED)
-                .final_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+                .final_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)];
             let color_ref = [vk::AttachmentReference::default()
                 .attachment(0).layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
             let subpass = [vk::SubpassDescription::default()
                 .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
                 .color_attachments(&color_ref)];
-            let attachments = [attach];
-            let rp_info = vk::RenderPassCreateInfo::default()
-                .attachments(&attachments).subpasses(&subpass);
-            let render_pass = dev.create_render_pass(&rp_info, None)?;
-
+            let render_pass = dev.create_render_pass(&vk::RenderPassCreateInfo::default()
+                .attachments(&attach).subpasses(&subpass), None)?;
             let vs_code = spirv_words(vs_spirv);
             let fs_code = spirv_words(fs_spirv);
             let vs = dev.create_shader_module(
@@ -1055,7 +1094,6 @@ impl MoltenVkBackend {
             let vinput = vk::PipelineVertexInputStateCreateInfo::default();
             let ia = vk::PipelineInputAssemblyStateCreateInfo::default()
                 .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
-            // Dynamic viewport+scissor: counts set here, values at draw.
             let vp = vk::PipelineViewportStateCreateInfo::default()
                 .viewport_count(1).scissor_count(1);
             let dyn_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
@@ -1064,8 +1102,7 @@ impl MoltenVkBackend {
             let rs = vk::PipelineRasterizationStateCreateInfo::default()
                 .polygon_mode(vk::PolygonMode::FILL)
                 .cull_mode(vk::CullModeFlags::NONE)
-                .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
-                .line_width(1.0);
+                .front_face(vk::FrontFace::COUNTER_CLOCKWISE).line_width(1.0);
             let ms = vk::PipelineMultisampleStateCreateInfo::default()
                 .rasterization_samples(vk::SampleCountFlags::TYPE_1);
             let blend_attach = [vk::PipelineColorBlendAttachmentState::default()
@@ -1075,30 +1112,24 @@ impl MoltenVkBackend {
             let layout = dev.create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default(), None)?;
             let pipe_info = vk::GraphicsPipelineCreateInfo::default()
-                .stages(&stages)
-                .vertex_input_state(&vinput).input_assembly_state(&ia)
+                .stages(&stages).vertex_input_state(&vinput).input_assembly_state(&ia)
                 .viewport_state(&vp).dynamic_state(&dyn_info)
                 .rasterization_state(&rs).multisample_state(&ms)
                 .color_blend_state(&cb_state)
                 .layout(layout).render_pass(render_pass).subpass(0);
             let pipeline = dev.create_graphics_pipelines(
-                vk::PipelineCache::null(), &[pipe_info], None)
-                .map_err(|(_, e)| e)?[0];
-
-            // Replace any prior pipeline at this id.
-            if let Some(old) = self.pipelines.lock().unwrap().insert(
-                pipeline_id.raw(),
-                MvkPipeline { pipeline, layout, render_pass, vs, fs })
-            {
-                let _ = dev.device_wait_idle();
-                dev.destroy_pipeline(old.pipeline, None);
-                dev.destroy_pipeline_layout(old.layout, None);
-                dev.destroy_render_pass(old.render_pass, None);
-                dev.destroy_shader_module(old.vs, None);
-                dev.destroy_shader_module(old.fs, None);
-            }
+                vk::PipelineCache::null(), &[pipe_info], None).map_err(|(_, e)| e)?[0];
+            Ok(MvkPipelineVk { format, pipeline, layout, render_pass, vs, fs })
         }
-        Ok(())
+    }
+
+    /// Destroy a realised pipeline's Vulkan objects.
+    unsafe fn destroy_pipeline_vk(&self, p: MvkPipelineVk) {
+        self.device.destroy_pipeline(p.pipeline, None);
+        self.device.destroy_pipeline_layout(p.layout, None);
+        self.device.destroy_render_pass(p.render_pass, None);
+        self.device.destroy_shader_module(p.vs, None);
+        self.device.destroy_shader_module(p.fs, None);
     }
 }
 
@@ -1382,8 +1413,10 @@ mod tests {
         be.image_created(img, W, H);
         be.set_image_format(img, 37); // RGBA8_UNORM
         be.buffer_created(buf, (W * H * 4) as u64);
-        be.create_pipeline(pipe, &build_fullscreen_tri_vs(),
-            &build_const_fs([0.2, 0.85, 0.3, 1.0]), 37).expect("create_pipeline"); // green
+        // Register the pipeline (SPIR-V stashed; the VkPipeline is
+        // materialised lazily on first draw at the target's format).
+        be.create_graphics_pipeline(pipe, &build_fullscreen_tri_vs(),
+            &build_const_fs([0.2, 0.85, 0.3, 1.0])); // green
 
         let mut fb = FrameBuilder::new(8192);
         let mut brp = Vec::new();

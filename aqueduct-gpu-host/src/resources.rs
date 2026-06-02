@@ -103,6 +103,10 @@ pub struct ShaderRecord {
     /// compile (the upload still succeeds; only Tier-2
     /// execution is unavailable).
     pub tier2_id: Option<crate::tier2_registry::Tier2ShaderId>,
+    /// Raw (validated/annotated) SPIR-V bytecode, retained so a
+    /// hardware backend (Tier-3 / MoltenVK) can build a `VkPipeline`
+    /// from it at pipeline-create. Empty for non-SPIR-V shaders.
+    pub spirv: Vec<u8>,
 }
 
 /// Pipeline book-keeping.

@@ -174,6 +174,18 @@ pub trait Backend: Send + Sync {
     /// no-op; Tier-2 evicts the stored descriptor.
     fn sampler_destroyed(&self, _sampler_id: ResourceId) {}
 
+    /// Hand a hardware (Tier-3) backend the raw VS+FS SPIR-V of a
+    /// graphics pipeline at `OP_GPU_PIPELINE_CREATE`, so it can build a
+    /// native `VkPipeline` (lazily, once the render-target format is
+    /// known at draw).  Default no-op: Tier-1/Tier-2 backends drive
+    /// their own `bind_pipeline_tier2*` path instead and ignore this.
+    fn pipeline_created(
+        &self,
+        _pipeline_id: ResourceId,
+        _vs_spirv: &[u8],
+        _fs_spirv: &[u8],
+    ) {}
+
     /// Inline write into a previously-created buffer. Called by
     /// the session when it processes `OP_GPU_BUFFER_WRITE`.
     /// Default rejects (backends without inline-write support).

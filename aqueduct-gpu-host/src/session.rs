@@ -442,6 +442,10 @@ impl Session {
                             // so a RESOLVE hit can fast-path
                             // into dlopen without recompile.
                             tier2_id: None,
+                            // Cache-hit doesn't carry raw SPIR-V; a
+                            // hardware backend would need a fresh
+                            // UPLOAD. (Future: cache the bytes too.)
+                            spirv: Vec::new(),
                         });
                         (ShaderResolveStatus::Hit, Some(id))
                     }
@@ -588,9 +592,15 @@ impl Session {
             aqueduct_gpu::ids::IdNamespace::IcdRuntime,
             (req.bytecode_hash[0] as u32) << 16 | (req.bytecode_hash[1] as u32) << 8 | 1,
         );
+        // Retain the (validated/annotated) SPIR-V so a hardware backend
+        // can build a VkPipeline from it at pipeline-create. SPIR-V only.
+        let retained_spirv = if matches!(req.kind, ShaderKind::SpirV) {
+            std::mem::take(&mut req.bytecode)
+        } else { Vec::new() };
         self.table.insert_shader(shader_id, ShaderRecord {
             bytecode_hash: req.bytecode_hash,
             tier2_id,
+            spirv: retained_spirv,
         });
         let resp = ShaderUploadResponse {
             bytecode_hash: req.bytecode_hash,
@@ -632,6 +642,20 @@ impl Session {
                         self.backend.bind_pipeline_tier2(req.pipeline_id, tier2);
                     }
                 }
+            }
+
+            // Hardware (Tier-3) backends: hand the raw VS+FS SPIR-V so
+            // they can build a native pipeline. Clone out of the table
+            // first to release its borrow before calling the backend.
+            // Default no-op on Tier-1/Tier-2 (they used the binds above).
+            let vs_spirv = req.shaders.first().copied()
+                .and_then(|sid| self.table.get_shader(sid))
+                .map(|r| r.spirv.clone()).unwrap_or_default();
+            let fs_spirv = req.shaders.get(1).copied()
+                .and_then(|sid| self.table.get_shader(sid))
+                .map(|r| r.spirv.clone()).unwrap_or_default();
+            if !vs_spirv.is_empty() && !fs_spirv.is_empty() {
+                self.backend.pipeline_created(req.pipeline_id, &vs_spirv, &fs_spirv);
             }
 
             // Opportunistically decode the state_blob as a
