@@ -334,6 +334,44 @@ pub fn host_page_size() -> u32 {
     if v > 0 { v as u32 } else { 4096 }
 }
 
+/// Ring a doorbell: one 8-byte write to a pipe/eventfd write end.
+fn write_token(write_fd: RawFd) {
+    let token: u64 = 1;
+    // SAFETY: write_fd is a valid pipe/eventfd write end.
+    let _ = unsafe {
+        libc::write(write_fd, &token as *const u64 as *const libc::c_void, 8)
+    };
+}
+
+/// Bytes currently readable on `fd` (FIONREAD), 0 on error/none.
+fn fd_pending(fd: RawFd) -> usize {
+    let mut n: libc::c_int = 0;
+    // SAFETY: fd is a valid descriptor; n is owned.
+    if unsafe { libc::ioctl(fd, libc::FIONREAD, &mut n) } == 0 && n > 0 {
+        n as usize
+    } else {
+        0
+    }
+}
+
+/// Drain all currently-readable tokens on `fd` without blocking (call
+/// after a [`Waiter`] reports it ready). Returns tokens drained.
+fn drain_fd(read_fd: RawFd) -> u64 {
+    let mut buf = [0u8; 4096];
+    let mut drained = 0u64;
+    while fd_pending(read_fd) > 0 {
+        // SAFETY: read_fd valid; only read what's already available.
+        let m = unsafe {
+            libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+        };
+        if m <= 0 {
+            break;
+        }
+        drained += (m as usize / 8).max(1) as u64;
+    }
+    drained
+}
+
 /// A pipe-backed doorbell. `signal` writes an 8-byte token; `wait`
 /// blocks in `read` until signalled (a true sleep — the no-spin
 /// invariant) and drains all pending tokens so one `wait` consumes a
@@ -364,43 +402,7 @@ impl Doorbell {
     /// Ring the doorbell. One non-blocking 8-byte write → the waiter's
     /// `read` becomes ready.
     pub fn signal(&self) {
-        let token: u64 = 1;
-        // SAFETY: write_fd is a valid pipe write end.
-        let _ = unsafe {
-            libc::write(self.write_fd, &token as *const u64 as *const libc::c_void, 8)
-        };
-    }
-
-    /// Block until rung, then drain any coalesced tokens. Returns the
-    /// number of tokens drained (>= 1), or an error. A blocking `read`
-    /// parks the thread in the kernel — no spin.
-    pub fn wait(&self) -> io::Result<u64> {
-        let mut buf = [0u8; 4096];
-        // First read blocks until at least one token is present.
-        // SAFETY: read_fd is a valid pipe read end; buf is owned.
-        let n = unsafe {
-            libc::read(self.read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-        };
-        if n < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if n == 0 {
-            // Write end closed → treat as shutdown sentinel.
-            return Ok(0);
-        }
-        // Drain any further already-buffered tokens non-blockingly so a
-        // single wait() consumes a burst (we then drain the ring once).
-        let mut drained = (n as usize / 8).max(1) as u64;
-        loop {
-            let avail = unsafe { self.bytes_readable() };
-            if avail == 0 { break; }
-            let m = unsafe {
-                libc::read(self.read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-            };
-            if m <= 0 { break; }
-            drained += (m as usize / 8).max(1) as u64;
-        }
-        Ok(drained)
+        write_token(self.write_fd);
     }
 
     /// Drain all currently-readable tokens without blocking. Called by
@@ -408,33 +410,7 @@ impl Doorbell {
     /// single wake clears a coalesced burst and the level-triggered
     /// `kevent`/`poll` doesn't immediately re-fire. Returns tokens drained.
     pub fn drain(&self) -> u64 {
-        let mut buf = [0u8; 4096];
-        let mut drained = 0u64;
-        loop {
-            let avail = unsafe { self.bytes_readable() };
-            if avail == 0 {
-                break;
-            }
-            // SAFETY: read_fd valid; only read what's already available
-            // so this never blocks.
-            let m = unsafe {
-                libc::read(self.read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-            };
-            if m <= 0 {
-                break;
-            }
-            drained += (m as usize / 8).max(1) as u64;
-        }
-        drained
-    }
-
-    unsafe fn bytes_readable(&self) -> usize {
-        let mut n: libc::c_int = 0;
-        if libc::ioctl(self.read_fd, libc::FIONREAD, &mut n) == 0 && n > 0 {
-            n as usize
-        } else {
-            0
-        }
+        drain_fd(self.read_fd)
     }
 }
 
@@ -638,49 +614,21 @@ impl Host {
         loop {
             let wake = self.waiter.wait()?;
 
-            let mut completed_any = false;
             let mut stop = wake.shutdown;
             if wake.doorbell {
                 // Clear the coalesced doorbell tokens for this wake, then
                 // drain everything currently visible in the submission ring.
                 self.g2h.drain();
                 self.wakeups += 1;
-                loop {
-                    let w = self.region.ctrl(C_SUB_WRITE).load(Ordering::Acquire);
-                    let r = self.region.ctrl(C_SUB_READ).load(Ordering::Relaxed);
-                    if r == w {
-                        break;
-                    }
-                    let idx = (r % SUB_ENTRIES) as usize;
-                    let off = SUB_RING_OFFSET + idx * DESC_SIZE;
-                    // SAFETY: idx < SUB_ENTRIES, off within submission ring.
-                    let raw = unsafe { self.region.read_desc(off) };
-                    let sub = SubDesc::read_from(&raw);
-                    // Advance read index (consumer) with Release so the
-                    // guest sees the slot freed.
-                    self.region.ctrl(C_SUB_READ).store(r.wrapping_add(1), Ordering::Release);
-
-                    if sub.kind == SubDesc::KIND_STOP {
-                        stop = true;
-                        continue;
-                    }
-                    self.frames += 1;
-                    // Read the staged FrameOp stream this descriptor
-                    // references, then hand both to the dispatcher. The
-                    // immutable borrow of the arena ends before
-                    // push_completion's borrow.
-                    let comp = {
-                        let bytes = self.region.frame_bytes(sub.frame_off, sub.frame_len);
-                        handler(&sub, bytes)
-                    };
-                    self.push_completion(&comp);
-                    completed_any = true;
+                let (completed_any, sub_stop) =
+                    drain_submission_ring(&self.region, &mut handler, &mut self.frames);
+                if sub_stop {
+                    stop = true;
                 }
-            }
-
-            if completed_any {
-                // One coalesced doorbell for the whole drained batch.
-                self.h2g.signal();
+                if completed_any {
+                    // One coalesced doorbell for the whole drained batch.
+                    self.h2g.signal();
+                }
             }
             if stop {
                 self.shutdown.drain();
@@ -690,18 +638,101 @@ impl Host {
         self.region.set_host_status(0);
         Ok(())
     }
+}
 
-    fn push_completion(&self, comp: &CompDesc) {
-        let w = self.region.ctrl(C_COMP_WRITE).load(Ordering::Relaxed);
-        let idx = (w % COMP_ENTRIES) as usize;
-        let off = COMP_RING_OFFSET + idx * DESC_SIZE;
-        let mut raw = [0u8; DESC_SIZE];
-        comp.write_to(&mut raw);
-        // SAFETY: idx < COMP_ENTRIES, off within completion ring.
-        unsafe { self.region.write_desc(off, &raw); }
-        // Publish: advance write index with Release after the bytes land.
-        self.region.ctrl(C_COMP_WRITE).store(w.wrapping_add(1), Ordering::Release);
+/// Push one completion descriptor onto the completion ring (host side).
+fn push_completion(region: &Region, comp: &CompDesc) {
+    let w = region.ctrl(C_COMP_WRITE).load(Ordering::Relaxed);
+    let idx = (w % COMP_ENTRIES) as usize;
+    let off = COMP_RING_OFFSET + idx * DESC_SIZE;
+    let mut raw = [0u8; DESC_SIZE];
+    comp.write_to(&mut raw);
+    // SAFETY: idx < COMP_ENTRIES, off within completion ring.
+    unsafe { region.write_desc(off, &raw); }
+    // Publish: advance write index with Release after the bytes land.
+    region.ctrl(C_COMP_WRITE).store(w.wrapping_add(1), Ordering::Release);
+}
+
+/// Drain every submission descriptor currently visible, dispatching each
+/// frame through `handler` and pushing its completion. Returns
+/// `(completed_any, stop)` — `stop` set if a `KIND_STOP` descriptor was
+/// seen. Shared by [`Host::serve`] and [`serve_ivshmem`].
+fn drain_submission_ring<H: FnMut(&SubDesc, &[u8]) -> CompDesc>(
+    region: &Region,
+    handler: &mut H,
+    frames: &mut u64,
+) -> (bool, bool) {
+    let mut completed_any = false;
+    let mut stop = false;
+    loop {
+        let w = region.ctrl(C_SUB_WRITE).load(Ordering::Acquire);
+        let r = region.ctrl(C_SUB_READ).load(Ordering::Relaxed);
+        if r == w {
+            break;
+        }
+        let idx = (r % SUB_ENTRIES) as usize;
+        let off = SUB_RING_OFFSET + idx * DESC_SIZE;
+        // SAFETY: idx < SUB_ENTRIES, off within submission ring.
+        let raw = unsafe { region.read_desc(off) };
+        let sub = SubDesc::read_from(&raw);
+        // Advance read index (consumer) with Release so the guest sees
+        // the slot freed.
+        region.ctrl(C_SUB_READ).store(r.wrapping_add(1), Ordering::Release);
+
+        if sub.kind == SubDesc::KIND_STOP {
+            stop = true;
+            continue;
+        }
+        *frames += 1;
+        let comp = {
+            let bytes = region.frame_bytes(sub.frame_off, sub.frame_len);
+            handler(&sub, bytes)
+        };
+        push_completion(region, &comp);
+        completed_any = true;
     }
+    (completed_any, stop)
+}
+
+/// Serve a frame stream arriving over a real QEMU [`IvshmemServer`]
+/// attach: block on the guest→host doorbell (kqueue/poll), batch-drain
+/// the submission ring, dispatch each frame through `handler`, and ring
+/// the guest once per batch via `notify_peer`. Exits when `shutdown_fd`
+/// (a self-pipe read end) fires or a `KIND_STOP` descriptor arrives.
+/// Returns `(wakeups, frames_processed)`.
+///
+/// This is the daemon's serve-loop for the VM path — it borrows the
+/// server (which owns the region + doorbell fds), so no ownership is
+/// transferred and `notify_peer` / `try_accept` stay on the server.
+pub fn serve_ivshmem<H: FnMut(&SubDesc, &[u8]) -> CompDesc>(
+    server: &IvshmemServer,
+    shutdown_fd: RawFd,
+    mut handler: H,
+) -> io::Result<(u64, u64)> {
+    let waiter = Waiter::new(server.doorbell_read_fd(), shutdown_fd)?;
+    let mut wakeups = 0u64;
+    let mut frames = 0u64;
+    loop {
+        let wake = waiter.wait()?;
+        let mut stop = wake.shutdown;
+        if wake.doorbell {
+            drain_fd(server.doorbell_read_fd());
+            wakeups += 1;
+            let (completed_any, sub_stop) =
+                drain_submission_ring(server.region(), &mut handler, &mut frames);
+            if sub_stop {
+                stop = true;
+            }
+            if completed_any {
+                server.notify_peer();
+            }
+        }
+        if stop {
+            drain_fd(shutdown_fd);
+            break;
+        }
+    }
+    Ok((wakeups, frames))
 }
 
 /// Reference guest-side ring driver. In production the FreeBSD kmod (C)
@@ -978,13 +1009,22 @@ impl IvshmemServer {
     /// kqueue; QEMU writes it when the guest rings.
     pub fn doorbell_read_fd(&self) -> RawFd { self.server_read_fd }
 
+    /// Host→guest doorbell write end (what [`notify_peer`] writes).
+    /// [`notify_peer`]: Self::notify_peer
+    pub fn doorbell_write_fd(&self) -> RawFd { self.qemu_write_fd }
+
     /// Ring the guest (host→guest doorbell → MSI-X in the guest).
     pub fn notify_peer(&self) {
-        let token: u64 = 1;
-        // SAFETY: qemu_write_fd is a valid pipe write end.
-        let _ = unsafe {
-            libc::write(self.qemu_write_fd, &token as *const u64 as *const libc::c_void, 8)
-        };
+        write_token(self.qemu_write_fd);
+    }
+
+    /// The QEMU-side fd ends, for **host-side testing only** — a harness
+    /// that plays QEMU's doorbell relay: write `0` to ring the host
+    /// (guest→host), read `1` to observe a host→guest ring. Under a real
+    /// QEMU these ends live in QEMU and are driven by the guest's BAR0
+    /// doorbell / MSI-X delivery. Returns `(ring_host_fd, guest_recv_fd)`.
+    pub fn loopback_qemu_fds(&self) -> (RawFd, RawFd) {
+        (self.server_write_fd, self.qemu_read_fd)
     }
 
     /// Whether QEMU has connected + been initialised.
@@ -1163,6 +1203,71 @@ mod tests {
         srv.notify_peer();
 
         drop(srv);
+        let _ = std::fs::remove_file(&shm);
+    }
+
+    /// Drive `serve_ivshmem` end-to-end host-side by playing QEMU's
+    /// doorbell relay: a guest opens the server's shm, stages + submits a
+    /// frame, "rings" by writing the server-side relay fd, and reads back
+    /// the completion when the host rings via notify_peer. Proves the
+    /// server serve-loop (region + doorbell + notify) without QEMU; only
+    /// the send_init handshake + real MSI-X remain for the VM session.
+    #[test]
+    fn serve_ivshmem_round_trips_a_frame() {
+        use std::thread;
+
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let sock = dir.join(format!("carillon-srvloop-{pid}.sock"));
+        let shm = dir.join(format!("carillon-srvloop-{pid}.shm"));
+        let server = IvshmemServer::new(&sock, &shm, TOTAL_SIZE).unwrap();
+
+        // Guest mapping + the QEMU-relay fds (host-side stand-in for QEMU).
+        let (ring_host_fd, guest_recv_fd) = server.loopback_qemu_fds();
+        let guest_region = Region::open(&shm, TOTAL_SIZE).unwrap();
+        guest_region.validate_header().unwrap();
+        let guest = GuestRing::new(guest_region, ring_host_fd, guest_recv_fd);
+
+        // Out-of-band shutdown for the serve loop.
+        let shutdown = Doorbell::new().unwrap();
+        let shutdown_fd = shutdown.read_fd();
+
+        thread::scope(|s| {
+            let h = s.spawn(|| {
+                serve_ivshmem(&server, shutdown_fd, |sub: &SubDesc, _b: &[u8]| CompDesc {
+                    kind: CompDesc::KIND_FRAME_DONE,
+                    fence_id: sub.fence_id,
+                    result: 0,
+                    readback_off: sub.frame_off,
+                    readback_len: sub.frame_len,
+                })
+                .unwrap()
+            });
+
+            // Guest stages a frame, submits, rings the host.
+            guest.stage_frame(0, &[0xAA; 32]);
+            guest.submit(&SubDesc {
+                kind: SubDesc::KIND_FRAME,
+                fence_id: 42,
+                frame_off: 0,
+                frame_len: 32,
+                flags: 0,
+            });
+            guest.ring();
+
+            let comps = guest.wait_completions().unwrap();
+            assert_eq!(comps.len(), 1);
+            assert_eq!(comps[0].fence_id, 42);
+            assert_eq!(comps[0].kind, CompDesc::KIND_FRAME_DONE);
+
+            // Stop the serve loop and confirm exactly one frame ran in one wake.
+            shutdown.signal();
+            let (wakeups, frames) = h.join().unwrap();
+            assert_eq!(frames, 1);
+            assert_eq!(wakeups, 1, "one doorbell wake — no spin");
+        });
+
+        drop(server);
         let _ = std::fs::remove_file(&shm);
     }
 }

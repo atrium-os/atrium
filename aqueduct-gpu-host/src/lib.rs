@@ -92,8 +92,8 @@ pub use tier2_registry::{
 pub use moltenvk::{MoltenVkBackend, MoltenVkError};
 #[cfg(unix)]
 pub use carillon::{
-    CompDesc, Doorbell, GuestRing, Host as CarillonHost, IvshmemServer,
-    Region as CarillonRegion, ShutdownHandle, SubDesc,
+    serve_ivshmem, CompDesc, Doorbell, GuestRing, Host as CarillonHost,
+    IvshmemServer, Region as CarillonRegion, ShutdownHandle, SubDesc,
 };
 pub use listener::Listener;
 pub use resources::ResourceTable;
