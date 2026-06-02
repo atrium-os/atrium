@@ -42,7 +42,7 @@ use std::sync::{Arc, Mutex};
 
 use aqueduct_gpu_host::{PresentCallback, PresentedFrame};
 use fresco_client::Connection;
-use fresco_protocol::TextureFormat;
+use fresco_protocol::{TextureFormat, DamageRect};
 
 /// Per-surface routing entry. Tells the bridge which Fresco
 /// window + texture slot a `Tier2Backend::present` for
@@ -152,6 +152,47 @@ impl Tier2FrescoBridge {
                     return;
                 }
             };
+            // PT fast path: a damage rect (in bounds, non-empty) means
+            // only a sub-region changed — ship just those pixels via
+            // OP_SLOT_UPDATE_REGION + a damaged present, instead of
+            // re-uploading + re-hashing the whole surface. Requires the
+            // slot to already be bound (a prior whole-surface present
+            // does that); the scene-server drops region updates to
+            // unbound slots, so a damaged first frame falls back safely.
+            if let Some([dx, dy, dw, dh]) = frame.damage {
+                let in_bounds = dw > 0 && dh > 0
+                    && dx.saturating_add(dw) <= frame.width
+                    && dy.saturating_add(dh) <= frame.height
+                    && frame.pixels.len() >= (frame.width * frame.height * 4) as usize;
+                if in_bounds {
+                    // Gather the w×h sub-rect (RGBA8) row by row from the
+                    // width-strided surface.
+                    let mut sub = Vec::with_capacity((dw * dh * 4) as usize);
+                    for row in 0..dh {
+                        let src_y = dy + row;
+                        let start = ((src_y * frame.width + dx) * 4) as usize;
+                        let end = start + (dw * 4) as usize;
+                        sub.extend_from_slice(&frame.pixels[start..end]);
+                    }
+                    if let Err(e) = c.slot_update_region(
+                        route.slot_id, dx, dy, dw, dh, sub) {
+                        log::warn!("Tier2FrescoBridge: slot_update_region \
+                                    failed: {e}");
+                        return;
+                    }
+                    if let Err(e) = c.window_present_with_damage(
+                        route.window_id, DamageRect { x: dx, y: dy, w: dw, h: dh }) {
+                        log::warn!("Tier2FrescoBridge: \
+                                    window_present_with_damage failed: {e}");
+                    }
+                    return;
+                }
+                log::debug!("Tier2FrescoBridge: damage {:?} out of bounds for \
+                             {}x{}; whole-surface present", frame.damage,
+                            frame.width, frame.height);
+            }
+
+            // Whole-surface path: upload + (re)bind the slot + present.
             let hash = match c.upload_blob(&frame.pixels) {
                 Ok(h) => h,
                 Err(e) => {
@@ -248,6 +289,7 @@ mod tests {
             width: 4, height: 4,
             pixels: vec![0xAB; 64],
             frame_id: 17,
+            damage: None,
         };
         cb(0xBEEF, &frame);
 
@@ -349,9 +391,9 @@ mod tests {
 
         let cb = bridge.present_callback();
         let f1 = PresentedFrame { width: 2, height: 2,
-            pixels: vec![1; 16], frame_id: 1 };
+            pixels: vec![1; 16], frame_id: 1, damage: None };
         let f2 = PresentedFrame { width: 2, height: 2,
-            pixels: vec![2; 16], frame_id: 2 };
+            pixels: vec![2; 16], frame_id: 2, damage: None };
         cb(100, &f1);
         cb(200, &f2);
 
@@ -369,6 +411,92 @@ mod tests {
         assert_eq!(msgs[2].1, 2);
         assert_eq!(msgs[3].0, fresco_protocol::control::OP_WINDOW_PRESENT);
         assert_eq!(msgs[3].1, 0xAA02);
+
+        drop(bridge);
+        let _ = server_thread.join();
+    }
+
+    #[test]
+    fn damaged_frame_ships_region_update_and_damaged_present() {
+        let (client_s, server_s) = UnixStream::pair().unwrap();
+        server_s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        client_s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+
+        // Server reports (op, id, region_bytes). For SLOT_UPDATE_REGION
+        // id = slot_id and region_bytes = the sub-rect payload; for the
+        // damaged present id = window_id.
+        let (tx, rx) = mpsc::channel::<(u16, u32, Vec<u8>)>();
+        let server_thread = thread::spawn(move || {
+            let mut s = AqConn::wrap(server_s).expect("server wrap");
+            // Whole present (SLOT_SET + WINDOW_PRESENT) then damaged
+            // present (SLOT_UPDATE_REGION + WINDOW_PRESENT_DAMAGE) = 4.
+            for _ in 0..4 {
+                match s.recv_message() {
+                    Ok(m) => {
+                        use fresco_protocol::control as ctl;
+                        let (id, extra) = if m.op == ctl::OP_SLOT_UPDATE_REGION {
+                            fresco_protocol::decode::<
+                                fresco_protocol::SlotUpdateRegionPayload>(&m.payload)
+                                .map(|p| (p.slot_id, p.bytes))
+                                .unwrap_or((u32::MAX, Vec::new()))
+                        } else if m.op == ctl::OP_WINDOW_PRESENT_DAMAGE {
+                            fresco_protocol::decode::<
+                                fresco_protocol::WindowPresentDamagePayload>(&m.payload)
+                                .map(|p| (p.window_id, Vec::new()))
+                                .unwrap_or((u32::MAX, Vec::new()))
+                        } else if m.op == ctl::OP_SLOT_SET {
+                            fresco_protocol::decode::<
+                                fresco_protocol::SlotSetPayload>(&m.payload)
+                                .map(|p| (p.slot_id, Vec::new()))
+                                .unwrap_or((u32::MAX, Vec::new()))
+                        } else if m.op == ctl::OP_WINDOW_PRESENT {
+                            fresco_protocol::decode::<
+                                fresco_protocol::WindowPresentPayload>(&m.payload)
+                                .map(|p| (p.window_id, Vec::new()))
+                                .unwrap_or((u32::MAX, Vec::new()))
+                        } else { (u32::MAX, Vec::new()) };
+                        let _ = tx.send((m.op, id, extra));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let client = Connection::wrap(client_s).expect("client wrap");
+        let bridge = Tier2FrescoBridge::new(client);
+        bridge.register_surface(100, SurfaceRoute { window_id: 0xAA01, slot_id: 1 });
+        let cb = bridge.present_callback();
+
+        // 4×4 RGBA surface; pixel (x,y) = [x, y, 0, 255] so a gathered
+        // sub-rect is byte-verifiable.
+        let mut pixels = Vec::with_capacity(4 * 4 * 4);
+        for y in 0..4u8 { for x in 0..4u8 { pixels.extend_from_slice(&[x, y, 0, 255]); } }
+
+        // Frame 1: whole-surface (binds the slot).
+        cb(100, &PresentedFrame {
+            width: 4, height: 4, pixels: pixels.clone(), frame_id: 1, damage: None });
+        // Frame 2: damaged 2×2 region at (1,1).
+        cb(100, &PresentedFrame {
+            width: 4, height: 4, pixels: pixels.clone(), frame_id: 2,
+            damage: Some([1, 1, 2, 2]) });
+
+        let msgs: Vec<(u16, u32, Vec<u8>)> = (0..4)
+            .map(|_| rx.recv_timeout(Duration::from_secs(2)).expect("wire msg"))
+            .collect();
+        use fresco_protocol::control as ctl;
+        // Frame 1: whole-surface present.
+        assert_eq!(msgs[0].0, ctl::OP_SLOT_SET);
+        assert_eq!(msgs[1].0, ctl::OP_WINDOW_PRESENT);
+        // Frame 2: region update + damaged present (NOT a whole upload).
+        assert_eq!(msgs[2].0, ctl::OP_SLOT_UPDATE_REGION);
+        assert_eq!(msgs[2].1, 1, "region update targets the bound slot");
+        // The gathered sub-rect: rows y=1,2 × cols x=1,2.
+        assert_eq!(msgs[2].2, vec![
+            1,1,0,255,  2,1,0,255,   // y=1: (1,1),(2,1)
+            1,2,0,255,  2,2,0,255,   // y=2: (1,2),(2,2)
+        ]);
+        assert_eq!(msgs[3].0, ctl::OP_WINDOW_PRESENT_DAMAGE);
+        assert_eq!(msgs[3].1, 0xAA01);
 
         drop(bridge);
         let _ = server_thread.join();
@@ -394,7 +522,7 @@ mod tests {
         // Do NOT register surface 999.
         let cb = bridge.present_callback();
         let frame = PresentedFrame { width: 1, height: 1,
-            pixels: vec![9, 9, 9, 9], frame_id: 1 };
+            pixels: vec![9, 9, 9, 9], frame_id: 1, damage: None };
         cb(999, &frame);
 
         // Unregistered surface must not emit anything. Wait the

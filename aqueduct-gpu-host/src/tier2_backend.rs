@@ -286,6 +286,14 @@ pub struct PresentedFrame {
     /// Frame id from the present envelope (Vulkan
     /// `pImageIndices` value).
     pub frame_id: u64,
+    /// PT: optional damage rectangle `(x, y, w, h)` in surface pixels.
+    /// `Some` means only this sub-region changed since the last
+    /// present, so a downstream consumer (the Fresco bridge) can ship a
+    /// region update + damaged present instead of the whole surface.
+    /// `None` = whole-surface present (the default until a damage
+    /// source — e.g. `VK_KHR_incremental_present` — populates it). A
+    /// plain tuple keeps this crate free of the Fresco protocol dep.
+    pub damage: Option<[u32; 4]>,
 }
 
 /// Output of [`Tier2Backend::assemble_vertices`]: per-vertex
@@ -4185,6 +4193,9 @@ impl Backend for Tier2Backend {
                 width: img.width, height: img.height,
                 pixels: img.pixels.clone(),
                 frame_id,
+                // No damage source wired yet (whole-surface present);
+                // VK_KHR_incremental_present would populate this (PT.5).
+                damage: None,
             })
         };
         if let Some(frame) = snap {
