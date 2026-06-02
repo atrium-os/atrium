@@ -189,10 +189,38 @@ toward a budget authority only when data demands it.
 
 ## Status
 
-Design decision recorded; not yet implemented. Prerequisites in place:
-P4 (compositor renders on Tier-2) + PT (cheap small-frame transport) +
-the tier-equivalence discipline. Next concrete step is phase 1 — publish
-the GPU power/residency state + policy mode and build the router's local
-decision against them. See `docs/spec/tier2-renderer-perf.md` (the
-router framing) and the Laminar scheduler design for the two mechanisms
-this coordinates.
+Design decision recorded; **not yet implemented, and blocked on a
+working Tier-3 backend.**
+
+In place: P4 (compositor renders on Tier-2) + PT (cheap small-frame
+transport) + the tier-equivalence discipline.
+
+**Hard prerequisite still missing — a Tier-3 path that actually
+renders.** The router only has meaning when there are *two* working
+backends to choose between. Today `aqueduct-gpu-host` has the software
+`Tier2Backend` (real) and `MoltenVkBackend` (Tier-3, Metal via
+MoltenVK), but `MoltenVkBackend::submit_frame` is a **protocol-correct
+stub** — it constructs a `VkInstance`/`VkDevice` + reports caps, but
+records no `VkCommandBuffer`, does no SPIR-V→`MTLLibrary`, and signals
+fences immediately (see `moltenvk.rs` — "real recording lands in a
+follow-on commit"). So Tier-3 produces no pixels, there is nothing to
+route to, and no real crossover to measure. The dev platform's other
+hardware path (venus in the VM) has the open libthr ring panic.
+
+**Therefore the true next step is NOT the router** — it is completing
+the Tier-3 render path (the `MoltenVkBackend` 1.3b rollout: command-
+buffer recording, SPIR-V→Metal, frame-stream → `vkCmd*`), so a real
+Tier-2-vs-Tier-3 crossover exists. Only then:
+- measure the crossover (submit/latency on Tier-3 vs CPU cost on
+  Tier-2; note wall-clock on a warm host GPU captures the
+  *submit/latency* component but not silicon *wake* energy — that
+  needs real hardware power measurement / a cold GPU);
+- then phase 1 (publish GPU power state + mode, local router decision)
+  becomes implementable + provable.
+
+Building the router or a crossover bench *before* Tier-3 renders would
+be measuring/routing against a no-op stub — explicitly out of scope.
+
+See `docs/spec/tier2-renderer-perf.md` (router framing),
+`docs/spec/aqueduct-gpu.md` §6.5 (tier-3), and the Laminar scheduler
+design for the mechanisms this coordinates.
