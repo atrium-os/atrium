@@ -37,7 +37,9 @@
 //! back to [`SoftwareBackend`](crate::SoftwareBackend) in that case;
 //! no other host code knows or cares which tier is active.
 
+use std::collections::HashMap;
 use std::ffi::CString;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ash::{vk, Entry};
@@ -45,8 +47,37 @@ use ash::khr;
 
 use aqueduct_gpu::backends::{BackendId, GpuVendor};
 use aqueduct_gpu::ids::ResourceId;
+use aqueduct_gpu::frame::FrameDecoder;
+use aqueduct_gpu::opcodes::FrameOp;
 
 use crate::backend::Backend;
+
+/// A guest colour image, materialised lazily as a real `VkImage` the
+/// first time a frame references it (so `image_created` — which arrives
+/// before `set_image_format` — doesn't have to guess the format).
+struct MvkImage {
+    width:  u32,
+    height: u32,
+    format: vk::Format,
+    image:  Option<vk::Image>,
+    memory: Option<vk::DeviceMemory>,
+}
+
+/// A guest buffer, backed by a host-visible + coherent `VkBuffer` so
+/// readback (`buffer_read_bytes`) sees device writes without an
+/// explicit invalidate.
+struct MvkBuffer {
+    size:   u64,
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    mapped: *mut u8,
+}
+
+// SAFETY: the raw `mapped` pointer is only dereferenced under the
+// backend's `submit_lock`/map lifetime; the VkBuffer + memory are owned
+// for the backend's lifetime. The Backend trait requires Send+Sync.
+unsafe impl Send for MvkBuffer {}
+unsafe impl Sync for MvkBuffer {}
 
 /// Tier-3 Vulkan backend. Wraps a loaded `VkInstance` + `VkDevice`.
 ///
@@ -85,6 +116,19 @@ pub struct MoltenVkBackend {
     /// The Vulkan loader. Stays alive until `Drop`. Box keeps it
     /// pointer-stable for ash's internal references.
     _entry: Box<Entry>,
+
+    /// Command pool (transient, resettable) for per-submit command
+    /// buffers. Guarded by `submit_lock`.
+    cmd_pool: vk::CommandPool,
+    /// Physical-device memory properties, cached for memory-type
+    /// selection.
+    mem_props: vk::PhysicalDeviceMemoryProperties,
+    /// Guest image id → materialised `VkImage`.
+    images: Mutex<HashMap<u32, MvkImage>>,
+    /// Guest buffer id → host-visible `VkBuffer`.
+    buffers: Mutex<HashMap<u32, MvkBuffer>>,
+    /// Serialises command-buffer record + submit (one graphics queue).
+    submit_lock: Mutex<()>,
 }
 
 /// Construction errors for [`MoltenVkBackend::new`]. Each variant
@@ -244,6 +288,24 @@ impl MoltenVkBackend {
         };
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
 
+        // Command pool for per-submit command buffers (transient +
+        // individually resettable).
+        let pool_info = vk::CommandPoolCreateInfo::default()
+            .queue_family_index(queue_family)
+            .flags(vk::CommandPoolCreateFlags::TRANSIENT
+                | vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let cmd_pool = match unsafe { device.create_command_pool(&pool_info, None) } {
+            Ok(p) => p,
+            Err(e) => {
+                unsafe { device.destroy_device(None); instance.destroy_instance(None); }
+                return Err(MoltenVkError::Vulkan(e));
+            }
+        };
+
+        let mem_props = unsafe {
+            instance.get_physical_device_memory_properties(physical)
+        };
+
         Ok(Self {
             submissions: AtomicU64::new(0),
             physical,
@@ -254,7 +316,71 @@ impl MoltenVkBackend {
             _queue_family: queue_family,
             instance,
             _entry: entry,
+            cmd_pool,
+            mem_props,
+            images: Mutex::new(HashMap::new()),
+            buffers: Mutex::new(HashMap::new()),
+            submit_lock: Mutex::new(()),
         })
+    }
+
+    /// Find a memory type index satisfying `type_bits` (the
+    /// `memoryTypeBits` from a resource's memory requirements) with all
+    /// of `flags` set. Returns `None` if no type matches.
+    fn mem_type(&self, type_bits: u32, flags: vk::MemoryPropertyFlags) -> Option<u32> {
+        (0..self.mem_props.memory_type_count).find(|&i| {
+            let supported = type_bits & (1 << i) != 0;
+            let has_flags = self.mem_props.memory_types[i as usize]
+                .property_flags.contains(flags);
+            supported && has_flags
+        })
+    }
+
+    /// Map a guest `TextureFormat`-as-`VkFormat`-numeric (the value the
+    /// daemon passes to `set_image_format`) to an `ash` format. Falls
+    /// back to RGBA8_UNORM for the clear+readback slice.
+    fn vk_format(numeric: u32) -> vk::Format {
+        match numeric {
+            37 => vk::Format::R8G8B8A8_UNORM,
+            43 => vk::Format::R8G8B8A8_SRGB,
+            44 => vk::Format::B8G8R8A8_UNORM,
+            50 => vk::Format::B8G8R8A8_SRGB,
+            _  => vk::Format::R8G8B8A8_UNORM,
+        }
+    }
+
+    /// Lazily materialise an image's `VkImage` + backing memory, in
+    /// `COLOR_ATTACHMENT | TRANSFER_SRC | TRANSFER_DST` usage. Returns
+    /// the `VkImage`, or `None` if allocation failed. Caller holds the
+    /// `images` lock.
+    fn ensure_image(&self, img: &mut MvkImage) -> Option<vk::Image> {
+        if let Some(h) = img.image { return Some(h); }
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(img.format)
+            .extent(vk::Extent3D { width: img.width, height: img.height, depth: 1 })
+            .mip_levels(1).array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = unsafe { self.device.create_image(&info, None) }.ok()?;
+        let req = unsafe { self.device.get_image_memory_requirements(image) };
+        let mt = self.mem_type(req.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+        let alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(req.size).memory_type_index(mt);
+        let memory = unsafe { self.device.allocate_memory(&alloc, None) }.ok()?;
+        if unsafe { self.device.bind_image_memory(image, memory, 0) }.is_err() {
+            unsafe { self.device.free_memory(memory, None);
+                     self.device.destroy_image(image, None); }
+            return None;
+        }
+        img.image = Some(image);
+        img.memory = Some(memory);
+        Some(image)
     }
 
     /// How many frames have been submitted to this backend. Diagnostic.
@@ -282,8 +408,20 @@ impl MoltenVkBackend {
 
 impl Drop for MoltenVkBackend {
     fn drop(&mut self) {
-        // SAFETY: we created both via ash; destroy in reverse order.
+        // SAFETY: all handles were created via ash; destroy resources
+        // before the device, and the device before the instance.
         unsafe {
+            let _ = self.device.device_wait_idle();
+            for (_, img) in self.images.lock().unwrap().drain() {
+                if let Some(h) = img.image { self.device.destroy_image(h, None); }
+                if let Some(m) = img.memory { self.device.free_memory(m, None); }
+            }
+            for (_, b) in self.buffers.lock().unwrap().drain() {
+                self.device.unmap_memory(b.memory);
+                self.device.destroy_buffer(b.buffer, None);
+                self.device.free_memory(b.memory, None);
+            }
+            self.device.destroy_command_pool(self.cmd_pool, None);
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }
@@ -330,18 +468,259 @@ impl Backend for MoltenVkBackend {
         tok
     }
 
+    fn image_created(&self, image_id: ResourceId, width: u32, height: u32) {
+        self.images.lock().unwrap().insert(image_id.raw(), MvkImage {
+            width, height,
+            format: vk::Format::R8G8B8A8_UNORM, // until set_image_format
+            image: None, memory: None,
+        });
+    }
+
+    fn set_image_format(&self, image_id: ResourceId, vk_format: u32) {
+        if let Some(img) = self.images.lock().unwrap().get_mut(&image_id.raw()) {
+            // Safe to change while the VkImage hasn't been materialised
+            // yet (the common order: image_created → set_image_format →
+            // first submit). If already created, leave it — re-creation
+            // mid-life isn't needed for the clear+readback slice.
+            if img.image.is_none() {
+                img.format = Self::vk_format(vk_format);
+            }
+        }
+    }
+
+    fn image_destroyed(&self, image_id: ResourceId) {
+        if let Some(img) = self.images.lock().unwrap().remove(&image_id.raw()) {
+            unsafe {
+                if let Some(h) = img.image { self.device.destroy_image(h, None); }
+                if let Some(m) = img.memory { self.device.free_memory(m, None); }
+            }
+        }
+    }
+
+    fn buffer_created(&self, buffer_id: ResourceId, size: u64) {
+        let size = size.max(1);
+        let info = vk::BufferCreateInfo::default()
+            .size(size)
+            .usage(vk::BufferUsageFlags::TRANSFER_DST
+                | vk::BufferUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buffer = match unsafe { self.device.create_buffer(&info, None) } {
+            Ok(b) => b,
+            Err(e) => { log::warn!("MoltenVk buffer_created: create {e:?}"); return; }
+        };
+        let req = unsafe { self.device.get_buffer_memory_requirements(buffer) };
+        let Some(mt) = self.mem_type(req.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)
+        else {
+            log::warn!("MoltenVk buffer_created: no host-visible memory type");
+            unsafe { self.device.destroy_buffer(buffer, None); }
+            return;
+        };
+        let alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(req.size).memory_type_index(mt);
+        let memory = match unsafe { self.device.allocate_memory(&alloc, None) } {
+            Ok(m) => m,
+            Err(e) => {
+                log::warn!("MoltenVk buffer_created: alloc {e:?}");
+                unsafe { self.device.destroy_buffer(buffer, None); }
+                return;
+            }
+        };
+        unsafe { let _ = self.device.bind_buffer_memory(buffer, memory, 0); }
+        let mapped = unsafe {
+            self.device.map_memory(memory, 0, req.size, vk::MemoryMapFlags::empty())
+        }.map(|p| p as *mut u8).unwrap_or(std::ptr::null_mut());
+        self.buffers.lock().unwrap().insert(buffer_id.raw(), MvkBuffer {
+            size, buffer, memory, mapped,
+        });
+    }
+
+    fn buffer_destroyed(&self, buffer_id: ResourceId) {
+        if let Some(b) = self.buffers.lock().unwrap().remove(&buffer_id.raw()) {
+            unsafe {
+                self.device.unmap_memory(b.memory);
+                self.device.destroy_buffer(b.buffer, None);
+                self.device.free_memory(b.memory, None);
+            }
+        }
+    }
+
+    fn buffer_read_bytes(&self, buffer_id: ResourceId, offset: u64, size: u64)
+        -> Result<Vec<u8>, String>
+    {
+        let buffers = self.buffers.lock().unwrap();
+        let b = buffers.get(&buffer_id.raw())
+            .ok_or_else(|| format!("buffer {buffer_id} not registered"))?;
+        let end = offset.checked_add(size)
+            .ok_or_else(|| "offset+size overflow".to_string())?;
+        if end > b.size {
+            return Err(format!("read end {end} exceeds buffer size {}", b.size));
+        }
+        if b.mapped.is_null() {
+            return Err("buffer memory not mapped".to_string());
+        }
+        // HOST_COHERENT: device writes are visible post-fence without
+        // an explicit invalidate.
+        let mut out = vec![0u8; size as usize];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                b.mapped.add(offset as usize), out.as_mut_ptr(), size as usize);
+        }
+        Ok(out)
+    }
+
+    /// Replay the frame's op stream as real Vulkan commands on Metal.
+    /// Slice scope: render-pass *clear* (`vkCmdClearColorImage`) +
+    /// image→buffer *readback* (`vkCmdCopyImageToBuffer`). Draws,
+    /// pipelines and SPIR-V→Metal are follow-on slices.
     fn submit_frame(
         &self,
         _fence_id: ResourceId,
         _timeline: u64,
-        _frame_buf: &[u8],
+        frame_buf: &[u8],
     ) -> bool {
         self.submissions.fetch_add(1, Ordering::Relaxed);
-        // Real impl: record VkCommandBuffer from frame_buf records,
-        // vkQueueSubmit, attach VkFence callback to signal aqueduct
-        // fence_id. For now: signal immediately so wire correctness
-        // tests pass against this backend before real GPU work lands.
-        true
+        let _guard = self.submit_lock.lock().unwrap();
+        match self.record_and_submit(frame_buf) {
+            Ok(()) => true,
+            Err(e) => { log::warn!("MoltenVk submit_frame: {e:?}"); true }
+        }
+    }
+}
+
+impl MoltenVkBackend {
+    /// Record + submit one frame's clear/copy ops. Errors are returned
+    /// (logged by the caller); the frame is still "consumed".
+    fn record_and_submit(&self, frame_buf: &[u8]) -> Result<(), vk::Result> {
+        // Allocate a one-shot command buffer.
+        let alloc = vk::CommandBufferAllocateInfo::default()
+            .command_pool(self.cmd_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let cb = unsafe { self.device.allocate_command_buffers(&alloc)? }[0];
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe { self.device.begin_command_buffer(cb, &begin)?; }
+
+        // Per-frame image layout tracking (all start UNDEFINED).
+        let mut layouts: HashMap<u32, vk::ImageLayout> = HashMap::new();
+        let mut images = self.images.lock().unwrap();
+        let buffers = self.buffers.lock().unwrap();
+
+        let mut dec = FrameDecoder::new(frame_buf);
+        while let Ok(Some((op, body))) = dec.next() {
+            match op {
+                FrameOp::BeginRenderPass => {
+                    if body.len() < 8 { continue; }
+                    let img_id = u32::from_le_bytes(body[0..4].try_into().unwrap());
+                    let flags = if body.len() >= 12 {
+                        u32::from_le_bytes(body[8..12].try_into().unwrap())
+                    } else { 0 };
+                    const NO_CLEAR: u32 = 0x1;
+                    if flags & NO_CLEAR != 0 { continue; }
+                    let rgba = [body[4], body[5], body[6], body[7]];
+                    let Some(img) = images.get_mut(&img_id) else { continue; };
+                    let Some(handle) = self.ensure_image(img) else { continue; };
+                    self.transition(cb, handle,
+                        *layouts.get(&img_id).unwrap_or(&vk::ImageLayout::UNDEFINED),
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+                    layouts.insert(img_id, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+                    let clear = vk::ClearColorValue {
+                        float32: [rgba[0] as f32 / 255.0, rgba[1] as f32 / 255.0,
+                                  rgba[2] as f32 / 255.0, rgba[3] as f32 / 255.0],
+                    };
+                    let range = vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1).layer_count(1);
+                    unsafe {
+                        self.device.cmd_clear_color_image(cb, handle,
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL, &clear, &[range]);
+                    }
+                }
+                FrameOp::CopyImgToBuf => {
+                    if body.len() < 16 + 56 { continue; }
+                    let src_id = u32::from_le_bytes(body[0..4].try_into().unwrap());
+                    let dst_id = u32::from_le_bytes(body[4..8].try_into().unwrap());
+                    let region_count = u32::from_le_bytes(body[12..16].try_into().unwrap());
+                    if region_count == 0 { continue; }
+                    let Some(img) = images.get_mut(&src_id) else { continue; };
+                    let Some(handle) = self.ensure_image(img) else { continue; };
+                    let Some(buf) = buffers.get(&dst_id) else { continue; };
+                    self.transition(cb, handle,
+                        *layouts.get(&src_id).unwrap_or(&vk::ImageLayout::UNDEFINED),
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+                    layouts.insert(src_id, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+                    // First region only for the slice (whole-image
+                    // readback is one region).
+                    let r = &body[16..16 + 56];
+                    let buf_offset = u64::from_le_bytes(r[0..8].try_into().unwrap());
+                    let row_length = u32::from_le_bytes(r[8..12].try_into().unwrap());
+                    let img_h = u32::from_le_bytes(r[12..16].try_into().unwrap());
+                    let ox = i32::from_le_bytes(r[32..36].try_into().unwrap());
+                    let oy = i32::from_le_bytes(r[36..40].try_into().unwrap());
+                    let ew = u32::from_le_bytes(r[44..48].try_into().unwrap());
+                    let eh = u32::from_le_bytes(r[48..52].try_into().unwrap());
+                    let copy = vk::BufferImageCopy::default()
+                        .buffer_offset(buf_offset)
+                        .buffer_row_length(row_length)
+                        .buffer_image_height(img_h)
+                        .image_subresource(vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .mip_level(0).base_array_layer(0).layer_count(1))
+                        .image_offset(vk::Offset3D { x: ox, y: oy, z: 0 })
+                        .image_extent(vk::Extent3D { width: ew, height: eh, depth: 1 });
+                    unsafe {
+                        self.device.cmd_copy_image_to_buffer(cb, handle,
+                            vk::ImageLayout::TRANSFER_SRC_OPTIMAL, buf.buffer, &[copy]);
+                    }
+                }
+                _ => { /* draws / other ops: follow-on slices */ }
+            }
+        }
+        drop(buffers);
+        drop(images);
+
+        unsafe { self.device.end_command_buffer(cb)?; }
+
+        // Submit + wait on a transient fence (synchronous, like the SW
+        // backend; the aqueduct fence is signalled by the caller path).
+        let fence = unsafe {
+            self.device.create_fence(&vk::FenceCreateInfo::default(), None)?
+        };
+        let cbs = [cb];
+        let submit = vk::SubmitInfo::default().command_buffers(&cbs);
+        let res = unsafe {
+            self.device.queue_submit(self._queue, &[submit], fence)
+                .and_then(|_| self.device.wait_for_fences(&[fence], true, u64::MAX))
+        };
+        unsafe {
+            self.device.destroy_fence(fence, None);
+            self.device.free_command_buffers(self.cmd_pool, &[cb]);
+        }
+        res
+    }
+
+    /// Pipeline barrier transitioning `image` between layouts with
+    /// conservative all-commands scope (correctness over tightness for
+    /// the slice).
+    fn transition(&self, cb: vk::CommandBuffer, image: vk::Image,
+                  old: vk::ImageLayout, new: vk::ImageLayout) {
+        let barrier = vk::ImageMemoryBarrier::default()
+            .old_layout(old).new_layout(new)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .level_count(1).layer_count(1))
+            .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+            .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+        unsafe {
+            self.device.cmd_pipeline_barrier(cb,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(), &[], &[], &[barrier]);
+        }
     }
 }
 
@@ -425,5 +804,55 @@ mod tests {
         assert!(c & H::CAPS_SPIRV_UPLOAD != 0);
         assert!(c & H::CAPS_COMPOSITION != 0);
         assert!(c & H::CAPS_SHARE_SURFACE != 0);
+    }
+
+    /// Tier-3 level-1: a render-pass clear + image→buffer readback runs
+    /// on real Metal (MoltenVK) and reads back the exact clear colour —
+    /// the mirror of tier2's level-1, proving the FrameOp→Vulkan replay
+    /// path. (Run with `DYLD_LIBRARY_PATH=/opt/homebrew/lib`.)
+    #[test]
+    fn clear_and_readback_through_metal() {
+        use aqueduct_gpu::frame::FrameBuilder;
+        use aqueduct_gpu::ids::IdNamespace;
+        let Some(be) = try_init() else { return; };
+
+        const W: u32 = 16;
+        const H: u32 = 16;
+        let img = ResourceId::new(IdNamespace::IcdRuntime, 0x10);
+        let buf = ResourceId::new(IdNamespace::IcdRuntime, 0x20);
+
+        be.image_created(img, W, H);
+        be.set_image_format(img, 37); // VK_FORMAT_R8G8B8A8_UNORM
+        be.buffer_created(buf, (W * H * 4) as u64);
+
+        let mut fb = FrameBuilder::new(4096);
+        // BeginRenderPass: image_id u32 + clear_rgba8 + flags u32.
+        let mut brp = Vec::new();
+        brp.extend_from_slice(&img.raw().to_le_bytes());
+        brp.extend_from_slice(&[40u8, 80, 160, 255]);
+        brp.extend_from_slice(&0u32.to_le_bytes());
+        fb.push(FrameOp::BeginRenderPass, &brp).unwrap();
+        // CopyImgToBuf: src u32, dst u32, src_layout u32, region_count u32,
+        // then one 56-byte VkBufferImageCopy (extent = full image).
+        let mut cib = Vec::new();
+        cib.extend_from_slice(&img.raw().to_le_bytes());
+        cib.extend_from_slice(&buf.raw().to_le_bytes());
+        cib.extend_from_slice(&0u32.to_le_bytes()); // src_layout (ignored)
+        cib.extend_from_slice(&1u32.to_le_bytes()); // region_count
+        let mut region = vec![0u8; 56];
+        region[44..48].copy_from_slice(&W.to_le_bytes()); // extent.width
+        region[48..52].copy_from_slice(&H.to_le_bytes()); // extent.height
+        region[52..56].copy_from_slice(&1u32.to_le_bytes()); // extent.depth
+        cib.extend_from_slice(&region);
+        fb.push(FrameOp::CopyImgToBuf, &cib).unwrap();
+
+        let fid = ResourceId::new(IdNamespace::IcdRuntime, 0x99);
+        assert!(be.submit_frame(fid, 1, fb.as_bytes()));
+
+        let px = be.buffer_read_bytes(buf, 0, (W * H * 4) as u64)
+            .expect("readback");
+        let i = ((H as usize / 2) * W as usize + W as usize / 2) * 4;
+        assert_eq!(&px[i..i + 4], &[40, 80, 160, 255],
+            "clear colour read back through Metal (got {:?})", &px[i..i + 4]);
     }
 }
