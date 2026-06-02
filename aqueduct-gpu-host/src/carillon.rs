@@ -201,6 +201,20 @@ impl Region {
         Self::map(file, len)
     }
 
+    /// Map an already-open shared-memory fd (e.g. the one QEMU's
+    /// ivshmem-server hands the host via SCM_RIGHTS — see [`recv_fd`]).
+    /// Takes ownership of `fd`. Does **not** stamp the control page (the
+    /// region already exists; call [`validate_header`](Self::validate_header)).
+    ///
+    /// # Safety
+    /// `fd` must be a valid, owned file/shm descriptor at least `len`
+    /// bytes long and not used elsewhere.
+    pub unsafe fn from_raw_fd(fd: RawFd, len: usize) -> io::Result<Self> {
+        use std::os::unix::io::FromRawFd;
+        let file = std::fs::File::from_raw_fd(fd);
+        Self::map(file, len)
+    }
+
     fn map(file: std::fs::File, len: usize) -> io::Result<Self> {
         // SAFETY: fd is valid for the file's lifetime (we keep `file`);
         // len matches the file size.
@@ -773,6 +787,87 @@ impl GuestRing {
     }
 }
 
+/// Send a file descriptor over a connected `AF_UNIX` socket via
+/// `SCM_RIGHTS` (with a 1-byte data payload, required for the ancillary
+/// message to be delivered). This is the mechanism QEMU's ivshmem-server
+/// protocol uses to hand the host the shared-memory fd and the per-vector
+/// doorbell fds (T-real attach); it mirrors `fresco/ivshmem_server.rs`'s
+/// `send_i64_with_fd`. The received fd is a fresh descriptor in the peer
+/// referring to the same open file description.
+pub fn send_fd(sock: RawFd, fd: RawFd) -> io::Result<()> {
+    let mut byte = [0u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: byte.as_mut_ptr() as *mut libc::c_void,
+        iov_len: 1,
+    };
+    let space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as usize;
+    let mut cmsg_buf = vec![0u8; space];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = space as _;
+    // SAFETY: msg.msg_control points at a buffer sized via CMSG_SPACE;
+    // we write exactly one fd into the first cmsg.
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as _;
+        std::ptr::copy_nonoverlapping(&fd, libc::CMSG_DATA(cmsg) as *mut RawFd, 1);
+    }
+    let n = unsafe { libc::sendmsg(sock, &msg, 0) };
+    if n < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Receive a single file descriptor sent via [`send_fd`] over a connected
+/// `AF_UNIX` socket. Returns a fresh owned descriptor.
+pub fn recv_fd(sock: RawFd) -> io::Result<RawFd> {
+    let mut byte = [0u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: byte.as_mut_ptr() as *mut libc::c_void,
+        iov_len: 1,
+    };
+    let space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as usize;
+    let mut cmsg_buf = vec![0u8; space];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = space as _;
+    // SAFETY: msg buffers are owned; recvmsg writes into them.
+    let n = unsafe { libc::recvmsg(sock, &mut msg, 0) };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: inspect the first ancillary header for our SCM_RIGHTS fd.
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        if cmsg.is_null()
+            || (*cmsg).cmsg_level != libc::SOL_SOCKET
+            || (*cmsg).cmsg_type != libc::SCM_RIGHTS
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "carillon: recv_fd got no SCM_RIGHTS ancillary data",
+            ));
+        }
+        let mut fd: RawFd = -1;
+        std::ptr::copy_nonoverlapping(libc::CMSG_DATA(cmsg) as *const RawFd, &mut fd, 1);
+        if fd < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "carillon: recv_fd got an invalid descriptor",
+            ));
+        }
+        Ok(fd)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -798,6 +893,73 @@ mod tests {
         r.validate_header().unwrap();
         assert_eq!(r.host_page_size_field(), host_page_size());
         drop(r);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The SCM_RIGHTS mechanism QEMU's ivshmem-server uses to hand the
+    /// host its doorbell fds: pass a pipe's write end over a socketpair
+    /// and confirm the received descriptor drives the original pipe.
+    #[test]
+    fn scm_rights_passes_a_working_fd() {
+        let mut sv = [0 as RawFd; 2];
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) },
+            0
+        );
+        let mut pfd = [0 as RawFd; 2];
+        assert_eq!(unsafe { libc::pipe(pfd.as_mut_ptr()) }, 0);
+        let (pipe_r, pipe_w) = (pfd[0], pfd[1]);
+
+        // Send the pipe's write end across the socketpair.
+        send_fd(sv[0], pipe_w).unwrap();
+        let recv_w = recv_fd(sv[1]).unwrap();
+        assert!(recv_w >= 0 && recv_w != pipe_w, "received a fresh descriptor");
+
+        // Writing through the received fd must surface on the original
+        // pipe's read end — same open file description.
+        let token: u64 = 0xABCD;
+        let n = unsafe {
+            libc::write(recv_w, &token as *const u64 as *const libc::c_void, 8)
+        };
+        assert_eq!(n, 8);
+        let mut got: u64 = 0;
+        let m = unsafe {
+            libc::read(pipe_r, &mut got as *mut u64 as *mut libc::c_void, 8)
+        };
+        assert_eq!(m, 8);
+        assert_eq!(got, token, "bytes written via the passed fd reached the pipe");
+
+        unsafe {
+            libc::close(sv[0]);
+            libc::close(sv[1]);
+            libc::close(pipe_r);
+            libc::close(pipe_w);
+            libc::close(recv_w);
+        }
+    }
+
+    /// The shmem fd QEMU passes is mapped via `Region::from_raw_fd`: a
+    /// host stamps a region through one fd, a second fd of the same file
+    /// (the "received" one) maps it and reads the control header.
+    #[test]
+    fn region_maps_from_a_received_fd() {
+        use std::os::unix::io::IntoRawFd;
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("carillon-fd-{}.shm", std::process::id()));
+        let host = Region::create(&path, TOTAL_SIZE).unwrap();
+        host.validate_header().unwrap();
+
+        // Open a *second* descriptor of the same file and map it as if it
+        // had arrived over SCM_RIGHTS.
+        let f = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let raw = f.into_raw_fd();
+        // SAFETY: raw is a valid owned fd of a TOTAL_SIZE-byte file.
+        let mapped = unsafe { Region::from_raw_fd(raw, TOTAL_SIZE).unwrap() };
+        mapped.validate_header().unwrap();
+        assert_eq!(mapped.host_page_size_field(), host_page_size());
+
+        drop(host);
+        drop(mapped);
         let _ = std::fs::remove_file(&path);
     }
 }
