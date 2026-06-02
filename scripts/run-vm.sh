@@ -101,6 +101,20 @@ for arg in "$@"; do
             GPU_ARGS="-chardev socket,path=$SOCK,id=ivshmem \
                       -device ivshmem-doorbell,vectors=2,chardev=ivshmem"
             ;;
+        --carillon)
+            # Carillon transport (docs/spec/carillon.md): QEMU attaches its
+            # ivshmem-doorbell device to aqueduct-gpu-host's IvshmemServer,
+            # which must already be listening on this socket. The guest
+            # carillon kmod (carillon-kmod/) binds the resulting PCI device.
+            SOCK="/tmp/carillon.sock"
+            if [ ! -S "$SOCK" ]; then
+                echo "error: $SOCK not found — start aqueduct-gpu-host with the" >&2
+                echo "       Carillon IvshmemServer on $SOCK first" >&2
+                exit 1
+            fi
+            GPU_ARGS="-chardev socket,path=$SOCK,id=ivshmem \
+                      -device ivshmem-doorbell,vectors=2,chardev=ivshmem"
+            ;;
         --virtio-gpu)
             VIRTIO_GPU_ARGS="-device virtio-gpu-pci"
             ;;
