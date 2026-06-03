@@ -622,6 +622,13 @@ impl RoutingPolicy {
         self.certs.set(pipeline, c);
     }
 
+    /// A pipeline's tier-equivalence status ([`Certification::Uncertified`]
+    /// until proven). Lets the dispatch layer attempt auto-certification only
+    /// for pipelines not yet checked — never re-running a `Failed` one.
+    pub fn pipeline_status(&self, pipeline: u32) -> crate::certify::Certification {
+        self.certs.status(pipeline)
+    }
+
     /// Note that `surface` draws with `pipeline` (builds the set the gate
     /// checks).
     pub fn note_surface_pipeline(&mut self, surface: u32, pipeline: u32) {

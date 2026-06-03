@@ -150,16 +150,21 @@ The drain → swap → re-cert → resume primitive also gives, for free:
    (Tier-2), ignore the cost model, and report when fully quiesced (all
    surfaces pinned, no Tier-3 work in flight). The inverse "resume" lifts
    the override.
-2. **A re-certification trigger** on new-backend bring-up: run the
-   differential certifier per pipeline and seed the `CertificationRegistry`
-   before any surface is allowed back to Tier-3 (replaces the bring-up
-   `--trust-tiers` shortcut). *Demonstrated end-to-end:* `RoutingBackend::
-   certify_pipeline` renders a probe on both tiers and compares the
-   readback; `routing_certifies_a_pipeline_for_real_then_migrates_no_trust`
-   certifies a real full-screen-tri pipeline (CPU rasteriser vs MoltenVK,
-   pixel-equivalent within tolerance) and only then lets the surface
-   migrate — no trust shortcut. What remains for the live swap is the
-   *trigger* that runs this automatically on a fresh Tier-3 attach.
+2. **A re-certification trigger** — **implemented.** `RoutingBackend::
+   with_auto_certify()` (daemon flag `--auto-certify`, replacing
+   `--trust-tiers`) certifies each pipeline the *first* time a frame uses it
+   and copies its target to a readback buffer: it renders that frame on both
+   tiers and compares the readback, recording `Certified` / `Failed` for
+   real. A `Failed` pipeline is never re-probed and its surface stays pinned
+   to home — never a wrong pixel. No probe synthesis is needed; the client's
+   own frame is the probe. Verified end-to-end against MoltenVK
+   (`routing_auto_certifies_on_first_frame_then_migrates`: auto-certified on
+   frame 1, migrated by frame 4) plus the explicit-probe path
+   (`certify_pipeline` /
+   `routing_certifies_a_pipeline_for_real_then_migrates_no_trust`). For the
+   live render-driver swap, the same trigger fires on the fresh Tier-3
+   attach: every pipeline is `Uncertified` against the new backend, so the
+   first post-swap frame re-proves it before any surface migrates back.
 3. **System-memory scanout** kept available to DCN independent of the render
    driver (the default scanout path during a render swap).
 4. **Backend hot-attach/detach** on the routing layer: release the Tier-3

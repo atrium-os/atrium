@@ -327,6 +327,130 @@ fn routing_certifies_a_pipeline_for_real_then_migrates_no_trust() {
     let _ = std::fs::remove_file(&sock);
 }
 
+/// The production trigger: with `.with_auto_certify()` and *no* explicit
+/// `certify_pipeline` call and *no* trust shortcut, the daemon certifies the
+/// pipeline by itself the first time a frame uses it and copies its target
+/// to a buffer. The surface then migrates on its own merits. This is what
+/// replaces `--trust-tiers` in the live stack.
+#[test]
+fn routing_auto_certifies_on_first_frame_then_migrates() {
+    let mvk = match MoltenVkBackend::new() {
+        Ok(b) => b,
+        Err(_) => { eprintln!("SKIP routing_auto: MoltenVK unavailable"); return; }
+    };
+    let Some(compile) = locate_compile_binary() else {
+        eprintln!("SKIP routing_auto: atrium-spv-compile unavailable"); return;
+    };
+    let cache = tempfile::TempDir::new().unwrap();
+    let registry = Arc::new(Tier2Registry::new(LoaderConfig {
+        cache_root: cache.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: compile,
+    }));
+    let t2: Arc<dyn Backend> = Arc::new(Tier2Backend::new(registry.clone()));
+    let t3: Arc<dyn Backend> = Arc::new(mvk);
+    // The whole point: no trust, no explicit certify — auto-cert does it.
+    let rb = Arc::new(RoutingBackend::new(
+        t2, t3, DeviceProfile::uma_apple_m4_max(), CpuProfile::apple_m4_max(),
+        GpuPowerModel::apple_m4_max(), RouteMode::Perf).with_auto_certify());
+
+    const W: u32 = 512;
+    const H: u32 = 512;
+    let sock = {
+        let mut p = std::env::temp_dir();
+        p.push(format!("aqueduct-auto-{}.sock", std::process::id()));
+        p
+    };
+    let listener = Listener::bind(&sock, rb.clone() as Arc<dyn Backend>)
+        .unwrap()
+        .with_tier2_registry(registry.clone());
+    let server = thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+
+    let conn = Connection::connect(&sock).unwrap();
+    let mut client = GpuClient::new(conn);
+    let hs = client.handshake(ClientKind::VulkanIcd).unwrap().clone();
+    let backend_id: BackendId = hs.backend;
+
+    let img_mem = client.allocate_memory((W * H * 4) as u64, MemoryUsage::ImageBacking).unwrap();
+    let image = client.create_image(ImageCreatePayload {
+        image_id: ResourceId(0), backing_region: img_mem.region_id, region_offset: 0,
+        format: 37, width: W, height: H, depth: 1, mip_levels: 1, array_layers: 1, usage: 0x07,
+    }).unwrap();
+    let buf_mem = client.allocate_memory((W * H * 4) as u64, MemoryUsage::Staging).unwrap();
+    let buffer = client.create_buffer(BufferCreatePayload {
+        buffer_id: ResourceId(0), backing_region: buf_mem.region_id, region_offset: 0,
+        size: (W * H * 4) as u64, usage: 0x01,
+    }).unwrap();
+
+    let vs = build_fullscreen_tri_vs();
+    let fs = build_heavy_grey_fs(800);
+    let vs_id = client.upload_shader(sha256(&vs), ShaderKind::SpirV, backend_id, vs).unwrap();
+    let fs_id = client.upload_shader(sha256(&fs), ShaderKind::SpirV, backend_id, fs).unwrap();
+    let pipe = client.create_pipeline(PipelineKind::Graphics, vec![vs_id, fs_id], Vec::new()).unwrap();
+    thread::sleep(Duration::from_millis(50));
+
+    let frame_bytes = |c: &mut GpuClient| {
+        let fence = c.create_fence().unwrap();
+        let mut fb = c.frame_builder();
+        let mut brp = image.raw().to_le_bytes().to_vec();
+        brp.extend_from_slice(&[10u8, 10, 10, 255]);
+        brp.extend_from_slice(&0u32.to_le_bytes());
+        fb.push(FrameOp::BeginRenderPass, &brp).unwrap();
+        fb.push(FrameOp::BindPipeline, &pipe.raw().to_le_bytes()).unwrap();
+        let mut draw = 3u32.to_le_bytes().to_vec();
+        draw.extend_from_slice(&1u32.to_le_bytes());
+        draw.extend_from_slice(&[0u8; 8]);
+        fb.push(FrameOp::Draw, &draw).unwrap();
+        fb.push(FrameOp::EndRenderPass, &[]).unwrap();
+        let mut cib = image.raw().to_le_bytes().to_vec();
+        cib.extend_from_slice(&buffer.raw().to_le_bytes());
+        cib.extend_from_slice(&0u32.to_le_bytes());
+        cib.extend_from_slice(&1u32.to_le_bytes());
+        let mut region = vec![0u8; 56];
+        region[44..48].copy_from_slice(&W.to_le_bytes());
+        region[48..52].copy_from_slice(&H.to_le_bytes());
+        region[52..56].copy_from_slice(&1u32.to_le_bytes());
+        cib.extend_from_slice(&region);
+        fb.push(FrameOp::CopyImgToBuf, &cib).unwrap();
+        (fence, fb)
+    };
+
+    let mut migrated_at = None;
+    let mut certified_at = None;
+    for t in 1..=16u64 {
+        let (fence, fb) = frame_bytes(&mut client);
+        client.submit_frame(fence, fb, t).unwrap();
+        assert!(client.wait_fence(fence, 30_000_000_000).unwrap(), "frame {t} fence");
+        if certified_at.is_none()
+            && rb.pipeline_certification(pipe) == aqueduct_gpu_host::Certification::Certified {
+            certified_at = Some(t);
+        }
+        let (_t2c, t3c) = rb.assignment_counts();
+        if t3c > 0 && migrated_at.is_none() { migrated_at = Some(t); }
+    }
+    let (scored, _skipped) = rb.decision_stats();
+    let (_a2, a3) = rb.assignment_counts();
+    eprintln!("routing auto: certified_at={certified_at:?} migrated_at={migrated_at:?} \
+               scored={scored} tier3={a3}");
+
+    // The daemon proved tier-equivalence by itself on the first frame.
+    assert_eq!(certified_at, Some(1), "auto-certified on the first frame, unprompted");
+    assert_eq!(rb.pipeline_certification(pipe),
+        aqueduct_gpu_host::Certification::Certified);
+
+    let px = client.read_buffer(buffer, 0, (W * H * 4) as u64).expect("readback");
+    let i = ((H as usize / 2) * W as usize + W as usize / 2) * 4;
+    assert!(px[i] > 210 && px[i] < 245 && px[i + 3] == 255,
+        "rendered grey ~230 regardless of tier, got {:?}", &px[i..i + 4]);
+    assert!(scored > 0, "the auto-certified surface was scored");
+    assert_eq!(a3, 1, "the heavy surface migrated to Tier-3 after auto-certification");
+
+    drop(client);
+    let _ = server;
+    let _ = std::fs::remove_file(&sock);
+}
+
 // ── SPIR-V builders ──────────────────────────────────────────────────
 
 /// A heavy fragment shader: acc = 0.1, then `n` real FAdds of 0.001 (a true

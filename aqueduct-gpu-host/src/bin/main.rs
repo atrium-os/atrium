@@ -152,6 +152,11 @@ struct Args {
     /// certifies every pipeline on creation so surfaces migrate without the
     /// real per-pipeline certification probe. NOT a production gate.
     trust_tiers: bool,
+    /// `--auto-certify` (with `--backend routing`): the production gate. The
+    /// first frame that uses an uncertified pipeline and copies its target to
+    /// a buffer triggers a real differential certification (render on both
+    /// tiers, compare). Replaces `--trust-tiers`; mutually exclusive with it.
+    auto_certify: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -168,6 +173,7 @@ fn parse_args() -> Result<Args> {
     let mut route: Option<RouteMode> = None;
     let mut calibrate = false;
     let mut trust_tiers = false;
+    let mut auto_certify = false;
     let mut iter = std::env::args().skip(1);
     while let Some(a) = iter.next() {
         match a.as_str() {
@@ -240,6 +246,9 @@ fn parse_args() -> Result<Args> {
             "--trust-tiers" => {
                 trust_tiers = true;
             }
+            "--auto-certify" => {
+                auto_certify = true;
+            }
             "--help" | "-h" => {
                 println!("usage: aqueduct-gpu-host [--socket PATH] \
                     [--transport socket|carillon] \
@@ -248,7 +257,8 @@ fn parse_args() -> Result<Args> {
                     [--tier2] [--cache-root PATH] [--compile-binary PATH] \
                     [--spirv-opt-binary PATH] \
                     [--device-profile passthrough|uma-apple-m4-max|discrete-rdna3-pcie4x16] \
-                    [--route perf|balanced|battery] [--calibrate]");
+                    [--route perf|balanced|battery] [--calibrate] \
+                    [--trust-tiers | --auto-certify]");
                 std::process::exit(0);
             }
             other => return Err(anyhow!("unknown arg {other:?}; try --help")),
@@ -284,6 +294,18 @@ fn parse_args() -> Result<Args> {
              Tier2Backend, which needs the matching Tier2Registry)"
         ));
     }
+    if trust_tiers && auto_certify {
+        return Err(anyhow!(
+            "--trust-tiers and --auto-certify are mutually exclusive: the \
+             first blindly trusts every pipeline, the second proves each one \
+             by a real differential. Pick the gate you want."
+        ));
+    }
+    if (trust_tiers || auto_certify) && backend != BackendKind::Routing {
+        return Err(anyhow!(
+            "--trust-tiers / --auto-certify only apply to --backend routing"
+        ));
+    }
     Ok(Args {
         socket: socket.unwrap_or_else(|| PathBuf::from(DEFAULT_SOCKET)),
         transport,
@@ -298,6 +320,7 @@ fn parse_args() -> Result<Args> {
         route,
         calibrate,
         trust_tiers,
+        auto_certify,
     })
 }
 
@@ -345,6 +368,7 @@ fn make_backend(
     route: Option<RouteMode>,
     calibrate: bool,
     trust_tiers: bool,
+    auto_certify: bool,
 ) -> Result<Arc<dyn Backend>> {
     // Wrap a concrete backend in the device-cost model when --device-profile
     // is set, then erase to the trait object. CostModelBackend<B> is a
@@ -424,14 +448,19 @@ fn make_backend(
                 GpuPowerModel::apple_m4_max()
             };
             let mode = route.unwrap_or(RouteMode::Perf);
+            let gate = if trust_tiers { "trust-tiers (bring-up)" }
+                else if auto_certify { "auto-certify (real differential)" }
+                else { "none (pipelines stay pinned until certified)" };
             log::info!(
-                "routing backend: profile '{}', mode {mode:?}, trust_tiers={trust} — \
+                "routing backend: profile '{}', mode {mode:?}, gate={gate} — \
                  surfaces dispatch per RoutingPolicy (gated on tier-equivalence \
                  certification)",
-                profile.name, trust = trust_tiers);
+                profile.name);
             let rb = RoutingBackend::new(
                 t2, t3, profile, CpuProfile::apple_m4_max(), power, mode);
-            let rb = if trust_tiers { rb.with_trusted_tiers() } else { rb };
+            let rb = if trust_tiers { rb.with_trusted_tiers() }
+                else if auto_certify { rb.with_auto_certify() }
+                else { rb };
             Ok(Arc::new(rb))
         }
     }
@@ -459,7 +488,7 @@ fn main() -> Result<()> {
 
     let backend = make_backend(
         args.backend, registry.as_ref(), args.device_profile.clone(), args.route,
-        args.calibrate, args.trust_tiers)?;
+        args.calibrate, args.trust_tiers, args.auto_certify)?;
 
     // Carillon (FreeBSD-VM) transport: stand up the ivshmem-doorbell
     // endpoint instead of the Unix-socket listener.

@@ -46,6 +46,10 @@ const SETTLE_THRESHOLD: u32 = 16;
 /// Once settled on Tier-2, re-score only every Nth frame (between ticks,
 /// dispatch to the held assignment without paying the verdict).
 const DECIMATE_EVERY: u64 = 8;
+/// Per-channel tolerance (0..=255) for auto-certification's runtime
+/// differential — a couple of LSBs to absorb sRGB / float→unorm rounding
+/// between the CPU rasteriser and the GPU. Gross divergence still fails.
+const AUTO_CERT_TOLERANCE: u8 = 4;
 use crate::cost_model::{shader_cost, DeviceProfile, ShaderCost};
 use crate::router::{
     tier2_exec_cost, tier3_exec_cost, Cost, CpuProfile, FrameRouter, GpuPowerModel, RouteMode,
@@ -80,6 +84,14 @@ pub struct RoutingBackend {
     /// end-to-end before real per-pipeline certification (probe / offline
     /// differential) is wired into dispatch. NOT the production safety gate.
     trust_all: bool,
+    /// Production gate: when set, the *first* frame that uses an uncertified
+    /// pipeline AND copies its render target to a readback buffer triggers a
+    /// real differential certification (render on both tiers, compare the
+    /// readback). The pipeline is then `Certified` or `Failed` for real — no
+    /// trust shortcut. A `Failed` pipeline is never re-attempted; its surface
+    /// stays pinned to home. This is the dispatch-side re-certification
+    /// trigger of `docs/spec/gpu-driver-hotswap.md` (precondition #2).
+    auto_certify: bool,
     /// Per-resource residency: resource ops are *recorded* here rather than
     /// mirrored to both backends, and materialised onto a tier only when a
     /// frame dispatched there needs them. So a CPU-routed surface never
@@ -116,6 +128,7 @@ impl RoutingBackend {
             scored: AtomicU64::new(0),
             skipped: AtomicU64::new(0),
             trust_all: false,
+            auto_certify: false,
             residency: Mutex::new(crate::residency::ResidencyTracker::new()),
         }
     }
@@ -125,6 +138,15 @@ impl RoutingBackend {
     /// switching end-to-end; the real gate is per-pipeline certification.
     pub fn with_trusted_tiers(mut self) -> Self {
         self.trust_all = true;
+        self
+    }
+
+    /// Production gate: auto-certify each pipeline the first time a frame uses
+    /// it and copies its target to a readback buffer (render on both tiers,
+    /// compare). Replaces [`Self::with_trusted_tiers`] with a real
+    /// pixel-equivalence check. Mutually sensible only without `trust_all`.
+    pub fn with_auto_certify(mut self) -> Self {
+        self.auto_certify = true;
         self
     }
 
@@ -174,6 +196,13 @@ impl RoutingBackend {
         self.policy.lock().unwrap().certify(pipeline.raw(), c);
     }
 
+    /// A pipeline's current tier-equivalence status — observability for the
+    /// certification gate (e.g. the daemon logging which pipelines are proven
+    /// migratable vs. pinned).
+    pub fn pipeline_certification(&self, pipeline: ResourceId) -> crate::certify::Certification {
+        self.policy.lock().unwrap().pipeline_status(pipeline.raw())
+    }
+
     /// Certify `pipeline` by rendering `probe_frame` on *both* backends and
     /// comparing the readback from `readback_buf` (a smoke differential).
     /// Records + returns the result; on success the pipeline's surfaces
@@ -187,10 +216,23 @@ impl RoutingBackend {
         readback_size: u64,
         tolerance: u8,
     ) -> crate::certify::Certification {
-        // The probe renders on *both* tiers, so materialise its resources on
-        // both — but only the probe's own (a tiny synthetic image + the
-        // pipeline + the readback buffer), NOT the world. Proving a pipeline
-        // equivalent must not drag a surface's textures onto the GPU.
+        let c = self.differential_probe(probe_frame, readback_buf, readback_size, tolerance);
+        self.policy.lock().unwrap().certify(pipeline.raw(), c);
+        c
+    }
+
+    /// Render `probe_frame` on *both* tiers and compare the `readback_buf`
+    /// readback — the shared core of explicit and automatic certification.
+    /// Materialises only the probe's own resources on both tiers (proving a
+    /// pipeline equivalent must not drag a surface's textures onto the GPU);
+    /// falls back to the whole world when the resource set is incomplete.
+    fn differential_probe(
+        &self,
+        probe_frame: &[u8],
+        readback_buf: ResourceId,
+        readback_size: u64,
+        tolerance: u8,
+    ) -> crate::certify::Certification {
         {
             let fr = crate::frame_resources::frame_resources(probe_frame);
             let mut res = self.residency.lock().unwrap();
@@ -204,10 +246,33 @@ impl RoutingBackend {
                 res.materialize_all(Tier::Tier3, &*self.t3);
             }
         }
-        let c = crate::certify::differential_certify(
+        crate::certify::differential_certify(
             &*self.t2, &*self.t3, probe_frame, readback_buf, readback_size, tolerance,
-        );
-        self.policy.lock().unwrap().certify(pipeline.raw(), c);
+        )
+    }
+
+    /// The auto-certification trigger: certify every still-`Uncertified`
+    /// pipeline in `pipes` by treating the client's own `frame_buf` (which
+    /// renders them and copies the target to `readback_buf`) as the probe.
+    /// One differential render serves the whole frame; its verdict is recorded
+    /// for each uncertified pipeline. `Failed` / already-`Certified` pipelines
+    /// are not passed here, so a failure is never re-run.
+    fn auto_certify_frame(
+        &self,
+        frame_buf: &[u8],
+        pipes: &[u32],
+        readback_buf: ResourceId,
+        readback_size: u64,
+        tolerance: u8,
+    ) -> crate::certify::Certification {
+        let c = self.differential_probe(frame_buf, readback_buf, readback_size, tolerance);
+        let mut policy = self.policy.lock().unwrap();
+        for &p in pipes {
+            policy.certify(p, c);
+        }
+        log::info!(
+            "routing: auto-certified {} pipeline(s) via frame probe → {:?}",
+            pipes.len(), c);
         c
     }
 
@@ -435,6 +500,32 @@ impl Backend for RoutingBackend {
         }
         let surf = surface.unwrap_or(0);
 
+        // Auto-certification trigger: the first frame that uses an uncertified
+        // pipeline *and* copies its target to a readback buffer is its own
+        // certification probe — render on both tiers, compare. Done before the
+        // eligibility check below so a freshly-proven pipeline is eligible this
+        // very frame. Only `Uncertified` pipelines are attempted (a `Failed`
+        // one is never re-run); needs a readback buffer + known target dims.
+        if self.auto_certify && !dst_buffers.is_empty() {
+            let uncertified: Vec<u32> = {
+                let policy = self.policy.lock().unwrap();
+                pipes_used.iter().copied()
+                    .filter(|p| policy.pipeline_status(*p)
+                        == crate::certify::Certification::Uncertified)
+                    .collect()
+            };
+            if !uncertified.is_empty() {
+                let dst = dst_buffers[0];
+                let size = self.buffer_sizes.lock().unwrap().get(&dst).copied()
+                    .or_else(|| cur_dims.map(|(w, h)| w as u64 * h as u64 * 4))
+                    .unwrap_or(0);
+                if size > 0 {
+                    self.auto_certify_frame(
+                        frame_buf, &uncertified, ResourceId(dst), size, AUTO_CERT_TOLERANCE);
+                }
+            }
+        }
+
         let mut policy = self.policy.lock().unwrap();
         for p in &pipes_used {
             policy.note_surface_pipeline(surf, *p);
@@ -642,6 +733,62 @@ mod tests {
         // Now the surface is eligible → subsequent frames are scored.
         rb.submit_frame(ResourceId(9), 2, &probe);
         assert_eq!(rb.decision_stats(), (1, 1), "certified surface is now scored");
+    }
+
+    #[test]
+    fn auto_certify_proves_a_pipeline_on_its_first_frame_then_scores() {
+        // With `.with_auto_certify()`, the first frame that uses an uncertified
+        // pipeline AND copies its target to a buffer certifies it for real
+        // (both tiers render identically → match) — no explicit certify call,
+        // no trust shortcut. The surface is then eligible *that same frame*.
+        let t2 = Counting::new(7);
+        let t3 = Counting::new(7); // identical readback → Certified
+        let rb = RoutingBackend::new(
+            t2.clone(), t3.clone(), DeviceProfile::uma_apple_m4_max(),
+            CpuProfile::apple_m4_max(), GpuPowerModel::apple_m4_max(), RouteMode::Perf)
+            .with_auto_certify();
+        let (img, pipe, dst) = (ResourceId(1), ResourceId(2), ResourceId(3));
+        rb.image_created(img, 64, 64);
+        rb.pipeline_created(pipe, &spirv_alu(4), &spirv_alu(4));
+        rb.buffer_created(dst, 64);
+        let f = frame(img, pipe, dst);
+
+        rb.submit_frame(ResourceId(9), 1, &f);
+        assert_eq!(rb.policy.lock().unwrap().pipeline_status(pipe.raw()),
+            Certification::Certified, "auto-certified on first copy-bearing frame");
+        assert_eq!(rb.decision_stats(), (1, 0),
+            "the auto-certified surface was scored on the very first frame");
+    }
+
+    #[test]
+    fn auto_certify_failure_pins_the_surface_and_never_retries() {
+        // Divergent tiers → the differential FAILS. The surface stays pinned
+        // to home, and — crucially — a `Failed` pipeline is never re-probed,
+        // so later frames pay no differential cost.
+        let t2 = Counting::new(2);
+        let t3 = Counting::new(40); // |2-40| = 38 ≫ tolerance → Failed
+        let rb = RoutingBackend::new(
+            t2.clone(), t3.clone(), DeviceProfile::uma_apple_m4_max(),
+            CpuProfile::apple_m4_max(), GpuPowerModel::apple_m4_max(), RouteMode::Perf)
+            .with_auto_certify();
+        let (img, pipe, dst) = (ResourceId(1), ResourceId(2), ResourceId(3));
+        rb.image_created(img, 64, 64);
+        rb.pipeline_created(pipe, &spirv_alu(4), &spirv_alu(4));
+        rb.buffer_created(dst, 64);
+        let f = frame(img, pipe, dst);
+
+        rb.submit_frame(ResourceId(9), 1, &f);
+        assert!(matches!(rb.policy.lock().unwrap().pipeline_status(pipe.raw()),
+            Certification::Failed { .. }), "divergent tiers fail certification");
+        // The differential read each tier exactly once (frame 1's probe).
+        let reads_t2 = t2.reads.load(Ordering::Relaxed);
+        assert_eq!(reads_t2, 1, "one differential probe ran");
+
+        rb.submit_frame(ResourceId(9), 2, &f);
+        assert_eq!(t2.reads.load(Ordering::Relaxed), reads_t2,
+            "a Failed pipeline is not re-certified on subsequent frames");
+        assert_eq!(rb.decision_stats(), (0, 2),
+            "the pinned surface dispatched home both frames, never scored");
     }
 
     #[test]
