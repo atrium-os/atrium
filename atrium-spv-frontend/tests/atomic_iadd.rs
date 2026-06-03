@@ -74,7 +74,7 @@ fn frontend_emits_atomic_i_add() {
 }
 
 #[test]
-fn frontend_accepts_barriers_as_noops() {
+fn frontend_lowers_workgroup_control_barrier() {
     use rspirv::binary::Assemble;
     use rspirv::spirv::{
         AddressingModel, Capability, Decoration, ExecutionMode,
@@ -121,18 +121,19 @@ fn frontend_accepts_barriers_as_noops() {
     let mut bytes = Vec::with_capacity(words.len() * 4);
     for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
     let module = translate(&bytes).expect("frontend should accept barriers");
-    // Barriers should not produce IR instructions on the
-    // serial dispatcher.  The function should contain just
-    // the AccessChain + AtomicLoad + Return.
+    // Since Arc 150 the Tier-2 dispatcher runs each workgroup
+    // invocation on its own thread, so a Workgroup-scope
+    // OpControlBarrier is a real synchronisation point and
+    // lowers to exactly one Op::Barrier.  OpMemoryBarrier still
+    // lowers to nothing (atomics carry their own ordering), so
+    // the function contains: AccessChain + AtomicLoad +
+    // (one) Barrier + Return.
     let func = &module.functions[0];
     let entry = func.blocks.get(&func.entry_block).expect("entry");
-    let mut saw_barrier_inst = false;
-    for inst in &entry.insts {
-        let dbg = format!("{:?}", inst.op);
-        if dbg.contains("Barrier") {
-            saw_barrier_inst = true;
-        }
-    }
-    assert!(!saw_barrier_inst,
-        "barriers should be no-ops -- no Op::Barrier should appear in IR");
+    let barrier_count = entry.insts.iter()
+        .filter(|inst| format!("{:?}", inst.op).contains("Barrier"))
+        .count();
+    assert_eq!(barrier_count, 1,
+        "Workgroup OpControlBarrier should lower to exactly one \
+         Op::Barrier; OpMemoryBarrier should lower to nothing");
 }
