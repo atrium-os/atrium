@@ -50,8 +50,8 @@ use anyhow::{anyhow, Context, Result};
 
 use aqueduct_gpu_host::{
     Backend, CalibrationProfile, CostModelBackend, CpuProfile, DeviceProfile, GpuPowerModel,
-    Listener, MoltenVkBackend, MoltenVkError, RouteMode, SoftwareBackend, StubBackend,
-    Tier2Backend, Tier2Registry,
+    Listener, MoltenVkBackend, MoltenVkError, RouteMode, RoutingBackend, SoftwareBackend,
+    StubBackend, Tier2Backend, Tier2Registry, Topology,
 };
 use atrium_spv_loader::LoaderConfig;
 
@@ -90,6 +90,12 @@ enum BackendKind {
     /// to the listener; without it, every SPIR-V upload would
     /// arrive with `tier2_id=None` and every draw would be skipped.
     Tier2,
+    /// `RoutingBackend` — the energy router *acting*: owns a Tier-2
+    /// (`Tier2Backend`) and a Tier-3 (`MoltenVkBackend`) backend and
+    /// dispatches each surface's frames to the tier its `RoutingPolicy`
+    /// assigns, gated on tier-equivalence certification. Requires
+    /// `--tier2`. See docs/spec/energy-policy.md §"Acting on the verdict".
+    Routing,
 }
 
 impl BackendKind {
@@ -99,9 +105,10 @@ impl BackendKind {
             "software" => BackendKind::Software,
             "moltenvk" => BackendKind::MoltenVk,
             "tier2"    => BackendKind::Tier2,
+            "routing"  => BackendKind::Routing,
             other => return Err(anyhow!(
                 "unknown --backend {other:?}; \
-                 valid: stub | software | moltenvk | tier2"
+                 valid: stub | software | moltenvk | tier2 | routing"
             )),
         })
     }
@@ -229,7 +236,7 @@ fn parse_args() -> Result<Args> {
                 println!("usage: aqueduct-gpu-host [--socket PATH] \
                     [--transport socket|carillon] \
                     [--carillon-sock PATH] [--carillon-shm PATH] \
-                    [--backend stub|software|moltenvk|tier2] \
+                    [--backend stub|software|moltenvk|tier2|routing] \
                     [--tier2] [--cache-root PATH] [--compile-binary PATH] \
                     [--spirv-opt-binary PATH] \
                     [--device-profile passthrough|uma-apple-m4-max|discrete-rdna3-pcie4x16] \
@@ -261,6 +268,12 @@ fn parse_args() -> Result<Args> {
             "--backend tier2 requires --tier2 (the matching \
              Tier2Registry must be attached to the listener so \
              SPIR-V uploads have somewhere to compile through)"
+        ));
+    }
+    if backend == BackendKind::Routing && !tier2 {
+        return Err(anyhow!(
+            "--backend routing requires --tier2 (the Tier-2 side is a \
+             Tier2Backend, which needs the matching Tier2Registry)"
         ));
     }
     Ok(Args {
@@ -375,6 +388,37 @@ fn make_backend(
                 tier2_id-bearing pipelines will dispatch through \
                 atrium-spv-runtime");
             Ok(finish(Tier2Backend::new(reg), &device_profile, route, calibrate))
+        }
+        BackendKind::Routing => {
+            // The energy router acting: Tier-2 = Tier2Backend, Tier-3 =
+            // MoltenVk (Software fallback off-Metal). The device model lives
+            // *inside* RoutingBackend (its FrameRouter), so we do NOT wrap it
+            // in CostModelBackend — that would double-count.
+            let reg = tier2_registry
+                .ok_or_else(|| anyhow!("internal: Routing reached make_backend without a registry"))?
+                .clone();
+            let t2: Arc<dyn Backend> = Arc::new(Tier2Backend::new(reg));
+            let t3: Arc<dyn Backend> = match MoltenVkBackend::new() {
+                Ok(b) => { log::info!("routing Tier-3: MoltenVK ({})", b.device_summary()); Arc::new(b) }
+                Err(MoltenVkError::LoaderUnavailable(e)) => {
+                    log::warn!("routing Tier-3: MoltenVK unavailable ({e}); using SoftwareBackend");
+                    Arc::new(SoftwareBackend::new())
+                }
+                Err(e) => return Err(anyhow!("MoltenVK init failed: {e}")),
+            };
+            let profile = device_profile.unwrap_or_else(DeviceProfile::uma_apple_m4_max);
+            let power = if profile.topology == Topology::Discrete {
+                GpuPowerModel::discrete_rdna3()
+            } else {
+                GpuPowerModel::apple_m4_max()
+            };
+            let mode = route.unwrap_or(RouteMode::Perf);
+            log::info!(
+                "routing backend: profile '{}', mode {mode:?} — surfaces dispatch per \
+                 RoutingPolicy (gated on tier-equivalence certification)",
+                profile.name);
+            Ok(Arc::new(RoutingBackend::new(
+                t2, t3, profile, CpuProfile::apple_m4_max(), power, mode)))
         }
     }
 }

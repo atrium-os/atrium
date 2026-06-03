@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aqueduct_gpu::ids::ResourceId;
-use aqueduct_gpu::backends::{BackendId, GpuVendor};
+use aqueduct_gpu::backends::BackendId;
 
 use crate::backend::Backend;
 use crate::cost_model::{shader_cost, DeviceProfile, ShaderCost};
@@ -358,6 +358,7 @@ impl Backend for RoutingBackend {
 mod tests {
     use super::*;
     use crate::certify::Certification;
+    use aqueduct_gpu::backends::GpuVendor;
     use aqueduct_gpu::frame::FrameBuilder;
     use aqueduct_gpu::opcodes::FrameOp;
 
