@@ -500,3 +500,15 @@ be measuring/routing against a no-op stub — explicitly out of scope.
 See `docs/spec/tier2-renderer-perf.md` (router framing),
 `docs/spec/aqueduct-gpu.md` §6.5 (tier-3), and the Laminar scheduler
 design for the mechanisms this coordinates.
+
+## Emergent capability: GPU driver hot-swap
+
+Tier-equivalence + the routing indirection compose with the three-kmod GPU
+driver split (`docs/spec/atrium-gpu-amd-design.md`) into a distinct
+serviceability property: the render/compute driver can be unloaded,
+upgraded, and re-targeted **live** — desktop running, display lit, no app
+losing state — because the router can drain every surface to the certified
+CPU renderer while the GPU driver is swapped, then re-certify and migrate
+back. None of these decisions aimed at it; together they provide it. Full
+protocol (render-swap seamless; DCN update a brief held-frame freeze) in
+`docs/spec/gpu-driver-hotswap.md`.
