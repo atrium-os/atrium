@@ -89,6 +89,27 @@ pub mod layout {
     pub const C_COMP_READ: usize = 0x2C;
     /// Control field: backend caps mirror (u64).
     pub const C_CAPS: usize = 0x40;
+
+    // ── Byte-stream "bridge" mode (carries the full aqueduct-gpu wire so
+    //    Session/GpuClient ride Carillon verbatim). The submission-ring
+    //    and completion-ring byte spans are reinterpreted as two SPSC
+    //    byte FIFOs; these are their head/tail counters (monotonic u32
+    //    byte positions, `% *_RING_BYTES`). g2h = guest→host requests,
+    //    h2g = host→guest responses. ──
+    /// Stream g2h write head — producer (guest pump) (u32).
+    pub const C_STREAM_G2H_HEAD: usize = 0x48;
+    /// Stream g2h read tail — consumer (host pump) (u32).
+    pub const C_STREAM_G2H_TAIL: usize = 0x4C;
+    /// Stream h2g write head — producer (host pump) (u32).
+    pub const C_STREAM_H2G_HEAD: usize = 0x50;
+    /// Stream h2g read tail — consumer (guest pump) (u32).
+    pub const C_STREAM_H2G_TAIL: usize = 0x54;
+    /// g2h byte FIFO area (reuses the submission-ring span).
+    pub const STREAM_G2H_OFFSET: usize = SUB_RING_OFFSET;
+    /// h2g byte FIFO area (reuses the completion-ring span).
+    pub const STREAM_H2G_OFFSET: usize = COMP_RING_OFFSET;
+    /// Byte FIFO capacity (per direction).
+    pub const STREAM_BYTES: usize = SUB_RING_BYTES;
 }
 
 use layout::*;
@@ -304,6 +325,46 @@ impl Region {
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(off), bytes.len());
         }
+    }
+
+    /// Write into a byte-stream FIFO (bridge mode); returns bytes written
+    /// (may be < `data.len()` if the FIFO is full — caller retries). The
+    /// producer advances `head_f`; `tail_f` is the consumer's position.
+    pub fn stream_write(&self, area_off: usize, head_f: usize, tail_f: usize,
+                        data: &[u8]) -> usize {
+        let head = self.ctrl(head_f).load(Ordering::Relaxed);
+        let tail = self.ctrl(tail_f).load(Ordering::Acquire);
+        let used = head.wrapping_sub(tail) as usize;
+        let free = STREAM_BYTES - used;
+        let n = data.len().min(free);
+        for i in 0..n {
+            let pos = area_off + ((head as usize + i) % STREAM_BYTES);
+            // SAFETY: pos within the FIFO area inside the mapping.
+            unsafe { std::ptr::write(self.ptr.add(pos), data[i]); }
+        }
+        if n > 0 {
+            self.ctrl(head_f).store(head.wrapping_add(n as u32), Ordering::Release);
+        }
+        n
+    }
+
+    /// Read from a byte-stream FIFO (bridge mode); returns bytes read into
+    /// `out` (may be 0 if empty). The consumer advances `tail_f`.
+    pub fn stream_read(&self, area_off: usize, head_f: usize, tail_f: usize,
+                       out: &mut [u8]) -> usize {
+        let head = self.ctrl(head_f).load(Ordering::Acquire);
+        let tail = self.ctrl(tail_f).load(Ordering::Relaxed);
+        let avail = head.wrapping_sub(tail) as usize;
+        let n = out.len().min(avail);
+        for (i, slot) in out.iter_mut().enumerate().take(n) {
+            let pos = area_off + ((tail as usize + i) % STREAM_BYTES);
+            // SAFETY: pos within the FIFO area inside the mapping.
+            *slot = unsafe { std::ptr::read(self.ptr.add(pos)) };
+        }
+        if n > 0 {
+            self.ctrl(tail_f).store(tail.wrapping_add(n as u32), Ordering::Release);
+        }
+        n
     }
 
     /// Copy a descriptor's 64 bytes into the ring at `byte_off`.
@@ -692,6 +753,85 @@ fn drain_submission_ring<H: FnMut(&SubDesc, &[u8]) -> CompDesc>(
         completed_any = true;
     }
     (completed_any, stop)
+}
+
+/// Bridge pump: copy bytes from a socket `read_fd` into a byte FIFO,
+/// ringing `peer` after each write so the consumer wakes. Loops until the
+/// socket reaches EOF/error. (Backpressure: if the FIFO fills, briefly
+/// yield until the consumer drains — rare for bounded messages.)
+pub fn pump_fd_to_stream(
+    read_fd: RawFd,
+    region: &Region,
+    fifo_off: usize,
+    head_f: usize,
+    tail_f: usize,
+    peer: &Doorbell,
+) {
+    let mut buf = [0u8; 8192];
+    loop {
+        // SAFETY: read_fd valid; buf owned.
+        let n = unsafe {
+            libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+        };
+        if n <= 0 {
+            break; // EOF or error → tear down this direction
+        }
+        let total = n as usize;
+        let mut done = 0;
+        while done < total {
+            let w = region.stream_write(fifo_off, head_f, tail_f, &buf[done..total]);
+            if w > 0 {
+                done += w;
+                peer.signal();
+            } else {
+                std::thread::yield_now();
+            }
+        }
+    }
+}
+
+/// Bridge pump: drain a byte FIFO into a socket `write_fd`, parked on
+/// `my` (the doorbell the producer rings) and `shutdown_fd` via a
+/// [`Waiter`]. Exits when `shutdown_fd` fires.
+pub fn pump_stream_to_fd(
+    write_fd: RawFd,
+    region: &Region,
+    fifo_off: usize,
+    head_f: usize,
+    tail_f: usize,
+    my: &Doorbell,
+    shutdown_fd: RawFd,
+) -> io::Result<()> {
+    let waiter = Waiter::new(my.read_fd(), shutdown_fd)?;
+    let mut buf = [0u8; 8192];
+    loop {
+        let wake = waiter.wait()?;
+        if wake.doorbell {
+            my.drain();
+        }
+        loop {
+            let n = region.stream_read(fifo_off, head_f, tail_f, &mut buf);
+            if n == 0 {
+                break;
+            }
+            let mut off = 0;
+            while off < n {
+                // SAFETY: write_fd valid; buf[off..n] owned.
+                let w = unsafe {
+                    libc::write(write_fd, buf[off..n].as_ptr() as *const libc::c_void, n - off)
+                };
+                if w <= 0 {
+                    return Ok(());
+                }
+                off += w as usize;
+            }
+        }
+        if wake.shutdown {
+            drain_fd(shutdown_fd);
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// Serve a frame stream arriving over a real QEMU [`IvshmemServer`]
