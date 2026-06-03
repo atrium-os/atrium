@@ -49,8 +49,9 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 
 use aqueduct_gpu_host::{
-    Backend, CostModelBackend, DeviceProfile, Listener, MoltenVkBackend, MoltenVkError,
-    SoftwareBackend, StubBackend, Tier2Backend, Tier2Registry,
+    Backend, CostModelBackend, CpuProfile, DeviceProfile, GpuPowerModel, Listener,
+    MoltenVkBackend, MoltenVkError, RouteMode, SoftwareBackend, StubBackend, Tier2Backend,
+    Tier2Registry,
 };
 use atrium_spv_loader::LoaderConfig;
 
@@ -132,6 +133,10 @@ struct Args {
     /// device-cost model (accounting mode). `None` = no model (today's
     /// zero-overhead path). See docs/spec/gpu-device-model.md.
     device_profile: Option<DeviceProfile>,
+    /// `--route perf|balanced|battery`: enable live Tier-2↔Tier-3 routing
+    /// observation on the device model (requires `--device-profile`). The
+    /// verdict is tallied + logged, not acted on (accounting-safe).
+    route: Option<RouteMode>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -145,6 +150,7 @@ fn parse_args() -> Result<Args> {
     let mut compile_binary: Option<PathBuf> = None;
     let mut spirv_opt_binary: Option<PathBuf> = None;
     let mut device_profile: Option<DeviceProfile> = None;
+    let mut route: Option<RouteMode> = None;
     let mut iter = std::env::args().skip(1);
     while let Some(a) = iter.next() {
         match a.as_str() {
@@ -201,6 +207,16 @@ fn parse_args() -> Result<Args> {
                     "unknown --device-profile {v:?}; valid: passthrough | \
                      uma-apple-m4-max | discrete-rdna3-pcie4x16"))?);
             }
+            "--route" => {
+                let v = iter.next().ok_or_else(|| anyhow!("--route needs an argument"))?;
+                route = Some(match v.as_str() {
+                    "perf"     => RouteMode::Perf,
+                    "balanced" => RouteMode::Balanced,
+                    "battery"  => RouteMode::Battery,
+                    other => return Err(anyhow!(
+                        "unknown --route {other:?}; valid: perf | balanced | battery")),
+                });
+            }
             "--help" | "-h" => {
                 println!("usage: aqueduct-gpu-host [--socket PATH] \
                     [--transport socket|carillon] \
@@ -208,7 +224,8 @@ fn parse_args() -> Result<Args> {
                     [--backend stub|software|moltenvk|tier2] \
                     [--tier2] [--cache-root PATH] [--compile-binary PATH] \
                     [--spirv-opt-binary PATH] \
-                    [--device-profile passthrough|uma-apple-m4-max|discrete-rdna3-pcie4x16]");
+                    [--device-profile passthrough|uma-apple-m4-max|discrete-rdna3-pcie4x16] \
+                    [--route perf|balanced|battery]");
                 std::process::exit(0);
             }
             other => return Err(anyhow!("unknown arg {other:?}; try --help")),
@@ -217,6 +234,12 @@ fn parse_args() -> Result<Args> {
     if !tier2 && (cache_root.is_some() || compile_binary.is_some()) {
         return Err(anyhow!(
             "--cache-root / --compile-binary require --tier2"
+        ));
+    }
+    if route.is_some() && device_profile.is_none() {
+        return Err(anyhow!(
+            "--route requires --device-profile (routing scores against the \
+             device model's Tier-3 cost)"
         ));
     }
     if backend == BackendKind::Tier2 && !tier2 {
@@ -237,6 +260,7 @@ fn parse_args() -> Result<Args> {
         compile_binary,
         spirv_opt_binary,
         device_profile,
+        route,
     })
 }
 
@@ -280,33 +304,44 @@ fn make_backend(
     kind: BackendKind,
     tier2_registry: Option<&Arc<Tier2Registry>>,
     device_profile: Option<DeviceProfile>,
+    route: Option<RouteMode>,
 ) -> Result<Arc<dyn Backend>> {
     // Wrap a concrete backend in the device-cost model when --device-profile
     // is set, then erase to the trait object. CostModelBackend<B> is a
     // transparent forwarder, so the wrapped backend behaves identically
-    // (accounting mode) while charging modeled cost per op.
+    // (accounting mode) while charging modeled cost per op. With --route it
+    // also scores each frame Tier-2 vs Tier-3 (observational tally).
     fn finish<B: Backend + 'static>(
-        b: B, profile: &Option<DeviceProfile>,
+        b: B, profile: &Option<DeviceProfile>, route: Option<RouteMode>,
     ) -> Arc<dyn Backend> {
         match profile {
             Some(p) => {
                 log::info!("device-model wrapping backend with profile '{}'", p.name);
-                Arc::new(CostModelBackend::new(b, p.clone()))
+                let cm = CostModelBackend::new(b, p.clone());
+                let cm = match route {
+                    Some(mode) => {
+                        log::info!("live routing enabled (mode {mode:?})");
+                        cm.with_routing(
+                            CpuProfile::apple_m4_max(), GpuPowerModel::apple_m4_max(), mode)
+                    }
+                    None => cm,
+                };
+                Arc::new(cm)
             }
             None => Arc::new(b),
         }
     }
     match kind {
-        BackendKind::Stub     => Ok(finish(StubBackend::new(), &device_profile)),
-        BackendKind::Software => Ok(finish(SoftwareBackend::new(), &device_profile)),
+        BackendKind::Stub     => Ok(finish(StubBackend::new(), &device_profile, route)),
+        BackendKind::Software => Ok(finish(SoftwareBackend::new(), &device_profile, route)),
         BackendKind::MoltenVk => match MoltenVkBackend::new() {
             Ok(b) => {
                 log::info!("MoltenVK backend: {}", b.device_summary());
-                Ok(finish(b, &device_profile))
+                Ok(finish(b, &device_profile, route))
             }
             Err(MoltenVkError::LoaderUnavailable(e)) => {
                 log::warn!("MoltenVK loader unavailable: {e}; falling back to SoftwareBackend");
-                Ok(finish(SoftwareBackend::new(), &device_profile))
+                Ok(finish(SoftwareBackend::new(), &device_profile, route))
             }
             Err(e) => Err(anyhow!("MoltenVK init failed: {e}")),
         },
@@ -322,7 +357,7 @@ fn make_backend(
             log::info!("tier-2 backend selected; draws against \
                 tier2_id-bearing pipelines will dispatch through \
                 atrium-spv-runtime");
-            Ok(finish(Tier2Backend::new(reg), &device_profile))
+            Ok(finish(Tier2Backend::new(reg), &device_profile, route))
         }
     }
 }
@@ -347,7 +382,8 @@ fn main() -> Result<()> {
         None
     };
 
-    let backend = make_backend(args.backend, registry.as_ref(), args.device_profile.clone())?;
+    let backend = make_backend(
+        args.backend, registry.as_ref(), args.device_profile.clone(), args.route)?;
 
     // Carillon (FreeBSD-VM) transport: stand up the ivshmem-doorbell
     // endpoint instead of the Unix-socket listener.

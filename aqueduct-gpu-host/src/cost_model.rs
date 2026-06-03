@@ -469,8 +469,16 @@ pub struct CostModelBackend<B: Backend> {
     images: Mutex<std::collections::HashMap<u32, (u32, u32)>>,
     /// pipeline raw-id → (vs_mix, fs_mix), for the Layer-2 exec roofline.
     pipelines: Mutex<std::collections::HashMap<u32, (ShaderCost, ShaderCost)>>,
-    /// Frames submitted — drives the periodic ledger summary log.
+    /// Frames submitted — drives the periodic ledger summary log + the
+    /// router's per-frame pseudo-clock.
     frames: std::sync::atomic::AtomicU64,
+    /// Optional live router: when set, each submitted frame is scored
+    /// Tier-2 vs Tier-3 and the verdict tallied. Observational — the inner
+    /// backend still runs the frame (accounting-safe); the tally validates
+    /// the router against real traffic before dispatch is rewired.
+    router: Option<Mutex<crate::router::FrameRouter>>,
+    /// (tier2_count, tier3_count) routing verdicts so far.
+    route_tally: Mutex<(u64, u64)>,
 }
 
 impl<B: Backend> CostModelBackend<B> {
@@ -484,7 +492,31 @@ impl<B: Backend> CostModelBackend<B> {
             images: Mutex::new(std::collections::HashMap::new()),
             pipelines: Mutex::new(std::collections::HashMap::new()),
             frames: std::sync::atomic::AtomicU64::new(0),
+            router: None,
+            route_tally: Mutex::new((0, 0)),
         }
+    }
+
+    /// Enable live Tier-2↔Tier-3 routing observation: each submitted frame
+    /// is scored against `cpu` (the Tier-2 CPU profile) using this
+    /// decorator's device profile as the Tier-3 side, with `power` as the
+    /// GPU residency model and `mode` the policy. The verdict is tallied
+    /// (and logged in the periodic summary) but not acted on — the frame
+    /// still runs on the wrapped backend.
+    pub fn with_routing(
+        mut self,
+        cpu: crate::router::CpuProfile,
+        power: crate::router::GpuPowerModel,
+        mode: crate::router::RouteMode,
+    ) -> Self {
+        let fr = crate::router::FrameRouter::new(cpu, self.profile.clone(), power, mode);
+        self.router = Some(Mutex::new(fr));
+        self
+    }
+
+    /// Snapshot the routing tally so far: `(tier2_count, tier3_count)`.
+    pub fn route_tally(&self) -> (u64, u64) {
+        *self.route_tally.lock().unwrap()
     }
 
     /// Set the enforcement mode (accounting vs shaping).
@@ -646,6 +678,14 @@ impl<B: Backend> Backend for CostModelBackend<B> {
         let mut time = 0.0;
         let mut energy = 0.0;
         let mut bytes = 0u64;
+        // Tier-2/Tier-3 routing costs (joules), accumulated when routing is
+        // enabled, via the router's own helpers (consistent units): Tier-3
+        // uses this decorator's device profile (== the router's GPU side),
+        // Tier-2 uses the router's configured CPU profile.
+        let routing_cpu: Option<crate::router::CpuProfile> =
+            self.router.as_ref().map(|r| r.lock().unwrap().cpu());
+        let mut t2 = crate::router::Cost::default();
+        let mut t3 = crate::router::Cost::default();
         let mut cur_dims: Option<(u32, u32)> = None;
         let mut cur_mix: Option<(ShaderCost, ShaderCost)> = None;
         let le4 = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
@@ -662,16 +702,29 @@ impl<B: Backend> Backend for CostModelBackend<B> {
                     if let Some((vs, fs)) = cur_mix {
                         let verts = le4(&body[0..4]) as u64;
                         let insts = (le4(&body[4..8]) as u64).max(1);
-                        let (t, e) = exec_cost(&self.profile, &vs, verts * insts);
+                        let vs_inv = verts * insts;
+                        let (t, e) = exec_cost(&self.profile, &vs, vs_inv);
                         time += t;
                         energy += e;
-                        bytes += vs.mem_ops as u64 * verts * insts * 16;
-                        if let Some((w, h)) = cur_dims {
-                            let pixels = w as u64 * h as u64;
-                            let (t2, e2) = exec_cost(&self.profile, &fs, pixels);
-                            time += t2;
+                        bytes += vs.mem_ops as u64 * vs_inv * 16;
+                        let pixels = cur_dims.map(|(w, h)| w as u64 * h as u64);
+                        if let Some(px) = pixels {
+                            let (t2e, e2) = exec_cost(&self.profile, &fs, px);
+                            time += t2e;
                             energy += e2;
-                            bytes += fs.mem_ops as u64 * pixels * 16;
+                            bytes += fs.mem_ops as u64 * px * 16;
+                        }
+                        // Routing costs (joules): VS over vertices + FS over
+                        // pixels, on each tier.
+                        if let Some(cpu) = &routing_cpu {
+                            t2 = t2
+                                .plus(crate::router::tier2_exec_cost(cpu, &vs, vs_inv));
+                            t3 = t3
+                                .plus(crate::router::tier3_exec_cost(&self.profile, &vs, vs_inv));
+                            if let Some(px) = pixels {
+                                t2 = t2.plus(crate::router::tier2_exec_cost(cpu, &fs, px));
+                                t3 = t3.plus(crate::router::tier3_exec_cost(&self.profile, &fs, px));
+                            }
                         }
                     }
                 }
@@ -681,16 +734,30 @@ impl<B: Backend> Backend for CostModelBackend<B> {
         self.ledger.lock().unwrap().ops.push(OpCost {
             kind: OpKind::Exec, bytes, time_s: time, energy_j: energy,
         });
+        let n = self.frames.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        // Live routing observation: score this frame Tier-2 vs Tier-3 and
+        // tally the verdict. Pseudo-clock = frame index at a nominal 60 fps
+        // (deterministic; gives the GPU residency timer a real timeline).
+        if let Some(r) = &self.router {
+            let now_s = n as f64 / 60.0;
+            let routed = r.lock().unwrap().route_costs(t2, t3, now_s);
+            let mut tally = self.route_tally.lock().unwrap();
+            match routed.tier {
+                crate::router::Tier::Tier2 => tally.0 += 1,
+                crate::router::Tier::Tier3 => tally.1 += 1,
+            }
+        }
         // Periodic ledger summary so the live model is observable under
         // RUST_LOG (every 60 frames ≈ once/second at 60 fps). Cumulative —
         // non-destructive, so other consumers (the router) still drain it.
-        let n = self.frames.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         if n % 60 == 0 {
             let l = self.ledger.lock().unwrap();
+            let (rt2, rt3) = *self.route_tally.lock().unwrap();
             log::info!(
-                "device-model[{}]: {} frames, {} ops, modeled {:.3} ms exec, {:.1} mJ total",
+                "device-model[{}]: {} frames, {} ops, modeled {:.3} ms exec, \
+                 {:.1} mJ total; routing tally tier2={} tier3={}",
                 self.profile.name, n, l.len(),
-                l.time_for(OpKind::Exec) * 1e3, l.total_energy_j() * 1e3,
+                l.time_for(OpKind::Exec) * 1e3, l.total_energy_j() * 1e3, rt2, rt3,
             );
         }
         self.inner.submit_frame(fence, timeline, frame_buf)
@@ -793,6 +860,54 @@ mod tests {
         cm0.pipeline_created(pipe, &vs, &fs);
         cm0.submit_frame(ResourceId(9), 1, &frame);
         assert_eq!(cm0.ledger_snapshot().time_for(OpKind::Exec), 0.0);
+    }
+
+    #[test]
+    fn live_routing_tally_reflects_frame_weight() {
+        use aqueduct_gpu::frame::FrameBuilder;
+        use aqueduct_gpu::opcodes::FrameOp;
+        use crate::router::{CpuProfile, GpuPowerModel, RouteMode};
+
+        let build = |img: ResourceId, pipe: ResourceId| {
+            let mut fb = FrameBuilder::new(4096);
+            let mut brp = img.raw().to_le_bytes().to_vec();
+            brp.extend_from_slice(&[0, 0, 0, 255]);
+            brp.extend_from_slice(&0u32.to_le_bytes());
+            fb.push(FrameOp::BeginRenderPass, &brp).unwrap();
+            fb.push(FrameOp::BindPipeline, &pipe.raw().to_le_bytes()).unwrap();
+            let mut draw = 3u32.to_le_bytes().to_vec();
+            draw.extend_from_slice(&1u32.to_le_bytes());
+            draw.extend_from_slice(&[0u8; 8]);
+            fb.push(FrameOp::Draw, &draw).unwrap();
+            fb.as_bytes().to_vec()
+        };
+
+        // Perf mode: a light frame loses the GPU-wake-latency race (→ CPU);
+        // a heavy frame's GPU throughput wins despite the wake (→ GPU).
+        let cm = CostModelBackend::new(StubBackend::new(), DeviceProfile::uma_apple_m4_max())
+            .with_routing(CpuProfile::apple_m4_max(), GpuPowerModel::apple_m4_max(),
+                RouteMode::Perf);
+
+        // Light frame: 32×32, cheap shader → Tier-2.
+        let (img_l, pipe_l) = (ResourceId(1), ResourceId(2));
+        cm.image_created(img_l, 32, 32);
+        cm.pipeline_created(pipe_l, &spirv_with_alu(2), &spirv_with_alu(2));
+        cm.submit_frame(ResourceId(9), 1, &build(img_l, pipe_l));
+        assert_eq!(cm.route_tally(), (1, 0), "light frame stays on the CPU");
+
+        // Heavy frame: 4K, heavy fragment shader → Tier-3.
+        let (img_h, pipe_h) = (ResourceId(3), ResourceId(4));
+        cm.image_created(img_h, 3840, 2160);
+        cm.pipeline_created(pipe_h, &spirv_with_alu(40), &spirv_with_alu(200));
+        cm.submit_frame(ResourceId(9), 2, &build(img_h, pipe_h));
+        assert_eq!(cm.route_tally(), (1, 1), "heavy frame routes to the GPU");
+
+        // No-routing decorator never tallies.
+        let plain = CostModelBackend::new(StubBackend::new(), DeviceProfile::uma_apple_m4_max());
+        plain.image_created(img_l, 32, 32);
+        plain.pipeline_created(pipe_l, &spirv_with_alu(2), &spirv_with_alu(2));
+        plain.submit_frame(ResourceId(9), 1, &build(img_l, pipe_l));
+        assert_eq!(plain.route_tally(), (0, 0));
     }
 
     #[test]

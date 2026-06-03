@@ -377,6 +377,11 @@ impl FrameRouter {
         self.power.state()
     }
 
+    /// The Tier-2 CPU profile this router scores against.
+    pub fn cpu(&self) -> CpuProfile {
+        self.cpu
+    }
+
     /// The tier currently committed to (carries the hysteresis state).
     pub fn current_tier(&self) -> Tier {
         self.router.current()
@@ -390,6 +395,14 @@ impl FrameRouter {
             .plus(tier2_exec_cost(&self.cpu, &work.fs, work.fs_invocations));
         let tier3 = tier3_exec_cost(&self.gpu, &work.vs, work.vs_invocations)
             .plus(tier3_exec_cost(&self.gpu, &work.fs, work.fs_invocations));
+        self.route_costs(tier2, tier3, now_s)
+    }
+
+    /// Route a frame from *pre-aggregated* per-tier costs (joules), for
+    /// callers that already summed cost across a multi-draw frame (e.g. the
+    /// device-model decorator's FrameOp walk). Same power + hysteresis
+    /// logic as [`Self::route_frame`].
+    pub fn route_costs(&mut self, tier2: Cost, tier3: Cost, now_s: f64) -> RoutedFrame {
         self.power.advance(now_s);
         let tier = self.router.decide(tier2, tier3, self.power.wake_cost());
         if tier == Tier::Tier3 {
