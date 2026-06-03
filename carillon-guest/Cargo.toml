@@ -1,0 +1,20 @@
+[package]
+name        = "carillon-guest"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "FreeBSD-VM guest pump for the Carillon transport: mmaps /dev/carillon0, runs the carillon-transport byte-FIFO pumps (doorbells via ioctl RING/WAIT), and drives a real aqueduct-gpu frame through GpuClient to the host daemon → MoltenVK → Metal. Cross-compiled to aarch64-unknown-freebsd; run in the VM."
+
+[[bin]]
+name = "carillon-guest"
+path = "src/main.rs"
+
+[dependencies]
+carillon-transport  = { path = "../carillon-transport" }
+aqueduct            = { path = "../aqueduct" }
+aqueduct-gpu        = { path = "../aqueduct-gpu" }
+aqueduct-gpu-client = { path = "../aqueduct-gpu-client" }
+rspirv              = "0.13"
+sha2                = "0.10"
+libc                = "0.2"
