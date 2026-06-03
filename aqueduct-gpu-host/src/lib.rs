@@ -76,6 +76,7 @@ pub mod router;
 pub mod listener;
 pub mod moltenvk;
 pub mod resources;
+pub mod routing_backend;
 pub mod session;
 pub mod shader_annotate;
 pub mod shader_cache;
@@ -112,4 +113,5 @@ pub use carillon_transport::{
 };
 pub use listener::Listener;
 pub use resources::ResourceTable;
+pub use routing_backend::RoutingBackend;
 pub use session::Session;
