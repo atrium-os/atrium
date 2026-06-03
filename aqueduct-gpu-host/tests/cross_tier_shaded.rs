@@ -56,22 +56,31 @@ impl ShaderRunner for MoltenVkShaderRunner {
     }
 
     fn run(&self, fs_spirv: &[u8], inputs: &ShaderInputs) -> Result<ShaderOutputs, BackendError> {
-        if !inputs.textures.is_empty() {
-            return Err(BackendError::Unsupported(
-                "moltenvk runner: texture rung needs combined-image-sampler support".into(),
-            ));
-        }
         let varyings = &inputs.varyings_per_invocation;
         let has_push = inputs.push_constants.iter().any(|&b| b != 0);
-        let has_ubo = !inputs.uniforms.is_empty();
-        if (has_push || has_ubo) && !varyings.is_empty() {
+        let has_ubo = !inputs.uniforms.is_empty() && inputs.textures.is_empty();
+        let has_tex = !inputs.textures.is_empty();
+        if (has_push || has_ubo || has_tex) && !varyings.is_empty() {
             return Err(BackendError::Unsupported(
-                "moltenvk runner: combined uniform + varyings not yet supported".into(),
+                "moltenvk runner: combined uniform/texture + varyings not yet supported".into(),
             ));
         }
 
         let mut pixels = Vec::new();
-        if has_ubo {
+        if has_tex {
+            // Rung 4b: a sampled texture (combined image sampler) at
+            // (set 0, binding 0). The FS samples at a constant UV.
+            let t = &inputs.textures[0];
+            if t.format != 0 {
+                // 0 = Rgba8Unorm in atrium_spv_runtime::TexFormat.
+                return Err(BackendError::Unsupported("moltenvk runner: RGBA8 textures only".into()));
+            }
+            let tex = aqueduct_gpu_host::TexBind {
+                data: &t.data, width: t.width, height: t.height,
+                linear: t.sampler.mag_filter == 1, // FilterMode::Linear == 1
+            };
+            pixels.push(self.render_pixel_tex(&self.vs, fs_spirv, tex)?);
+        } else if has_ubo {
             // Rung 4a: a UBO bound at (set 0, binding 0) via descriptors.
             pixels.push(self.render_pixel_ubo(&self.vs, fs_spirv, &inputs.uniforms)?);
         } else if has_push {
@@ -127,8 +136,25 @@ impl MoltenVkShaderRunner {
         self.backend.set_image_format(img, 37);
         self.backend.buffer_created(buf, (W * H * 4) as u64);
         self.backend
-            .draw_and_copy_full(img, buf, vs, fs, 3, [0, 0, 0, 255], &[], Some(ubo))
+            .draw_and_copy_full(img, buf, vs, fs, 3, [0, 0, 0, 255], &[], Some(ubo), None)
             .map_err(|e| BackendError::Unsupported(format!("moltenvk ubo draw failed: {e:?}")))?;
+        self.read_center(buf, W, H)
+    }
+
+    /// Render `fs` with a sampled texture bound at (set 0, binding 0).
+    fn render_pixel_tex(
+        &self, vs: &[u8], fs: &[u8], tex: aqueduct_gpu_host::TexBind,
+    ) -> Result<[f32; 4], BackendError> {
+        const W: u32 = 2;
+        const H: u32 = 2;
+        let img = ResourceId::new(IdNamespace::IcdRuntime, self.fresh());
+        let buf = ResourceId::new(IdNamespace::IcdRuntime, self.fresh());
+        self.backend.image_created(img, W, H);
+        self.backend.set_image_format(img, 37);
+        self.backend.buffer_created(buf, (W * H * 4) as u64);
+        self.backend
+            .draw_and_copy_full(img, buf, vs, fs, 3, [0, 0, 0, 255], &[], None, Some(tex))
+            .map_err(|e| BackendError::Unsupported(format!("moltenvk tex draw failed: {e:?}")))?;
         self.read_center(buf, W, H)
     }
 
@@ -213,7 +239,79 @@ fn moltenvk_agrees_with_the_interpreter_oracle_on_a_ubo_shader() {
     assert_shader_agrees(&fs, &inputs, ColorTolerance::AbsEpsilon { eps: 0.01 }, &runners);
 }
 
+#[test]
+fn moltenvk_agrees_with_the_interpreter_oracle_on_a_texture_shader() {
+    // Rung 4b: a sampled texture. A 2×2 RGBA checkerboard sampled at the
+    // centre (0.5, 0.5) with bilinear/clamp → the four-texel mean. Tests
+    // that Metal's sampler convention matches the interpreter's — the real
+    // unknown of this rung.
+    let Some(mvk) = MoltenVkShaderRunner::new() else {
+        eprintln!("cross-tier shaded probe skipped (MoltenVK unavailable)");
+        return;
+    };
+    let fs = build_sample_centre_fs();
+    let pixels: Vec<u8> = vec![
+        255, 0, 0, 255, 0, 255, 0, 255, // red, green
+        0, 0, 255, 255, 255, 255, 255, 255, // blue, white
+    ];
+    let texture = atrium_spv_tests::interpreter::TextureBinding {
+        set: 0, binding: 0, data: pixels, width: 2, height: 2, stride_bytes: 8,
+        format: 0, // Rgba8Unorm
+        sampler: atrium_spv_runtime::SamplerDesc {
+            mag_filter: 1, min_filter: 1, // Linear
+            wrap_s: 0, wrap_t: 0,         // ClampToEdge
+            compare_enable: 0, compare_op: 0,
+        },
+    };
+    let inputs = ShaderInputs { textures: vec![texture], ..ShaderInputs::default() };
+    let runners: [&dyn ShaderRunner; 2] = [&InterpreterRunner, &mvk];
+    // Sampling rounds through 8-bit + bilinear → a slightly looser epsilon.
+    assert_shader_agrees(&fs, &inputs, ColorTolerance::AbsEpsilon { eps: 0.02 }, &runners);
+}
+
 // ── SPIR-V builders ──────────────────────────────────────────────────
+
+/// A fragment shader that samples a `sampler2D` at (set 0, binding 0) at the
+/// constant UV (0.5, 0.5) and writes the result to Location-0 output.
+fn build_sample_centre_fs() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::dr::Operand;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, Dim, ExecutionMode, ExecutionModel,
+        FunctionControl, ImageFormat, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let f32t = b.type_float(32, None);
+    let vec2 = b.type_vector(f32t, 2);
+    let vec4 = b.type_vector(f32t, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let image = b.type_image(f32t, Dim::Dim2D, 0, 0, 0, 1, ImageFormat::Unknown, None);
+    let sampled = b.type_sampled_image(image);
+    let ptr_uc = b.type_pointer(None, StorageClass::UniformConstant, sampled);
+    let ptr_out = b.type_pointer(None, StorageClass::Output, vec4);
+    let tex = b.variable(ptr_uc, None, StorageClass::UniformConstant, None);
+    b.decorate(tex, Decoration::DescriptorSet, vec![Operand::LiteralBit32(0)]);
+    b.decorate(tex, Decoration::Binding, vec![Operand::LiteralBit32(0)]);
+    let out = b.variable(ptr_out, None, StorageClass::Output, None);
+    b.decorate(out, Decoration::Location, vec![Operand::LiteralBit32(0)]);
+    let ch = b.constant_bit32(f32t, 0.5f32.to_bits());
+    let uv = b.constant_composite(vec2, vec![ch, ch]);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let s = b.load(sampled, None, tex, None, vec![]).unwrap();
+    let px = b.image_sample_implicit_lod(vec4, None, s, uv, None, vec![]).unwrap();
+    b.store(out, px, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![tex, out]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+    let words: Vec<u32> = b.module().assemble();
+    words.iter().flat_map(|w| w.to_le_bytes()).collect()
+}
 
 /// A fragment shader that reads a vec4 from a UBO `struct { vec4 }` at
 /// (set 0, binding 0, member 0) and writes it to Location-0 output.

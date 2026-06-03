@@ -206,6 +206,20 @@ impl From<vk::Result> for MoltenVkError {
     fn from(e: vk::Result) -> Self { MoltenVkError::Vulkan(e) }
 }
 
+/// A sampled RGBA8 texture to bind for [`MoltenVkBackend::draw_and_copy_full`]
+/// (combined image sampler at set 0, binding 0). Row-major texels, clamped.
+#[derive(Debug, Clone, Copy)]
+pub struct TexBind<'a> {
+    /// RGBA8 texel bytes, row-major (`len >= width*height*4`).
+    pub data: &'a [u8],
+    /// Width in texels.
+    pub width: u32,
+    /// Height in texels.
+    pub height: u32,
+    /// Linear (bilinear) filtering when true, else nearest.
+    pub linear: bool,
+}
+
 impl MoltenVkBackend {
     /// Construct a fresh tier-3 backend. Loads Vulkan, creates an
     /// instance, picks a graphics-capable physical device, creates a
@@ -979,13 +993,14 @@ impl MoltenVkBackend {
         clear_rgba: [u8; 4],
         push: &[u8],
     ) -> Result<(), vk::Result> {
-        self.draw_and_copy_full(image_id, dst_buffer_id, vs_spirv, fs_spirv, vertex_count, clear_rgba, push, None)
+        self.draw_and_copy_full(image_id, dst_buffer_id, vs_spirv, fs_spirv, vertex_count, clear_rgba, push, None, None)
     }
 
-    /// Full draw path: optional push constants + an optional UBO bound at
-    /// (set 0, binding 0, VERTEX|FRAGMENT). The descriptor path — set
-    /// layout + pool + set + `vkUpdateDescriptorSets` + bind — is the first
-    /// rung of descriptor support on this backend (UBO; textures next).
+    /// Full draw path: optional push constants + an optional descriptor at
+    /// (set 0, binding 0) — a UBO (`ubo`) or a sampled RGBA8 texture (`tex`,
+    /// COMBINED_IMAGE_SAMPLER, uploaded via a staging buffer). The descriptor
+    /// path is this backend's descriptor support, driven by cross-tier
+    /// shaded certification's uniform + texture rungs.
     #[allow(clippy::too_many_arguments)]
     pub fn draw_and_copy_full(
         &self,
@@ -997,6 +1012,7 @@ impl MoltenVkBackend {
         clear_rgba: [u8; 4],
         push: &[u8],
         ubo: Option<&[u8]>,
+        tex: Option<TexBind>,
     ) -> Result<(), vk::Result> {
         let _guard = self.submit_lock.lock().unwrap();
         let dev = &self.device;
@@ -1097,11 +1113,16 @@ impl MoltenVkBackend {
             // ── Optional UBO at (set 0, binding 0) ────────────────────
             // Create the uniform buffer + descriptor set layout/pool/set up
             // front; bound before the draw, torn down after.
-            let mut ubo_res: Option<(vk::Buffer, vk::DeviceMemory, vk::DescriptorSetLayout,
-                                     vk::DescriptorPool, vk::DescriptorSet)> = None;
-            let set_layouts: Vec<vk::DescriptorSetLayout> = if let Some(bytes) = ubo {
+            // Optional single descriptor at (set 0, binding 0): a UBO
+            // (UNIFORM_BUFFER) or a sampled texture (COMBINED_IMAGE_SAMPLER).
+            let mut ubo_res: Option<(vk::Buffer, vk::DeviceMemory)> = None;
+            let mut tex_res: Option<(vk::Image, vk::DeviceMemory, vk::ImageView,
+                                     vk::Sampler, vk::Buffer, vk::DeviceMemory, u32, u32)> = None;
+            let mut desc_res: Option<(vk::DescriptorSetLayout, vk::DescriptorPool,
+                                      vk::DescriptorSet)> = None;
+            let mut set_layouts: Vec<vk::DescriptorSetLayout> = Vec::new();
+            if let Some(bytes) = ubo {
                 let size = bytes.len().max(16) as u64;
-                // Host-visible uniform buffer, filled with `bytes`.
                 let bi = vk::BufferCreateInfo::default().size(size)
                     .usage(vk::BufferUsageFlags::UNIFORM_BUFFER)
                     .sharing_mode(vk::SharingMode::EXCLUSIVE);
@@ -1116,7 +1137,6 @@ impl MoltenVkBackend {
                 let ptr = dev.map_memory(umem, 0, size, vk::MemoryMapFlags::empty())? as *mut u8;
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
                 dev.unmap_memory(umem);
-                // Set layout: binding 0 = UNIFORM_BUFFER, VERTEX|FRAGMENT.
                 let binding = [vk::DescriptorSetLayoutBinding::default()
                     .binding(0).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                     .descriptor_count(1)
@@ -1130,18 +1150,80 @@ impl MoltenVkBackend {
                 let dsls = [dsl];
                 let set = dev.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default()
                     .descriptor_pool(pool).set_layouts(&dsls))?[0];
-                let bufinfo = [vk::DescriptorBufferInfo::default()
-                    .buffer(ubuf).offset(0).range(size)];
-                let write = [vk::WriteDescriptorSet::default()
-                    .dst_set(set).dst_binding(0)
-                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                    .buffer_info(&bufinfo)];
+                let bufinfo = [vk::DescriptorBufferInfo::default().buffer(ubuf).offset(0).range(size)];
+                let write = [vk::WriteDescriptorSet::default().dst_set(set).dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&bufinfo)];
                 dev.update_descriptor_sets(&write, &[]);
-                ubo_res = Some((ubuf, umem, dsl, pool, set));
-                vec![dsl]
-            } else {
-                Vec::new()
-            };
+                ubo_res = Some((ubuf, umem));
+                desc_res = Some((dsl, pool, set));
+                set_layouts = vec![dsl];
+            } else if let Some(t) = tex {
+                // Sampled RGBA8 image (SAMPLED|TRANSFER_DST) + staging buffer.
+                let fmt = vk::Format::R8G8B8A8_UNORM;
+                let ici = vk::ImageCreateInfo::default()
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .format(fmt)
+                    .extent(vk::Extent3D { width: t.width, height: t.height, depth: 1 })
+                    .mip_levels(1).array_layers(1)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .tiling(vk::ImageTiling::OPTIMAL)
+                    .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+                    .initial_layout(vk::ImageLayout::UNDEFINED);
+                let timg = dev.create_image(&ici, None)?;
+                let ireq = dev.get_image_memory_requirements(timg);
+                let imt = self.mem_type(ireq.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                    .ok_or(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)?;
+                let tmem = dev.allocate_memory(&vk::MemoryAllocateInfo::default()
+                    .allocation_size(ireq.size).memory_type_index(imt), None)?;
+                dev.bind_image_memory(timg, tmem, 0)?;
+                // Staging buffer with the texel bytes.
+                let sbi = vk::BufferCreateInfo::default().size(t.data.len() as u64)
+                    .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE);
+                let sbuf = dev.create_buffer(&sbi, None)?;
+                let sreq = dev.get_buffer_memory_requirements(sbuf);
+                let smt = self.mem_type(sreq.memory_type_bits,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)
+                    .ok_or(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)?;
+                let smem = dev.allocate_memory(&vk::MemoryAllocateInfo::default()
+                    .allocation_size(sreq.size).memory_type_index(smt), None)?;
+                dev.bind_buffer_memory(sbuf, smem, 0)?;
+                let sptr = dev.map_memory(smem, 0, t.data.len() as u64, vk::MemoryMapFlags::empty())? as *mut u8;
+                std::ptr::copy_nonoverlapping(t.data.as_ptr(), sptr, t.data.len());
+                dev.unmap_memory(smem);
+                let view = dev.create_image_view(&vk::ImageViewCreateInfo::default()
+                    .image(timg).view_type(vk::ImageViewType::TYPE_2D).format(fmt)
+                    .subresource_range(vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).layer_count(1)),
+                    None)?;
+                let filt = if t.linear { vk::Filter::LINEAR } else { vk::Filter::NEAREST };
+                let sampler = dev.create_sampler(&vk::SamplerCreateInfo::default()
+                    .mag_filter(filt).min_filter(filt)
+                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE), None)?;
+                let binding = [vk::DescriptorSetLayoutBinding::default()
+                    .binding(0).descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .descriptor_count(1).stage_flags(vk::ShaderStageFlags::FRAGMENT)];
+                let dsl = dev.create_descriptor_set_layout(
+                    &vk::DescriptorSetLayoutCreateInfo::default().bindings(&binding), None)?;
+                let pool_size = [vk::DescriptorPoolSize::default()
+                    .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).descriptor_count(1)];
+                let pool = dev.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(1).pool_sizes(&pool_size), None)?;
+                let dsls = [dsl];
+                let set = dev.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(pool).set_layouts(&dsls))?[0];
+                let iinfo = [vk::DescriptorImageInfo::default()
+                    .sampler(sampler).image_view(view)
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+                let write = [vk::WriteDescriptorSet::default().dst_set(set).dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&iinfo)];
+                dev.update_descriptor_sets(&write, &[]);
+                tex_res = Some((timg, tmem, view, sampler, sbuf, smem, t.width, t.height));
+                desc_res = Some((dsl, pool, set));
+                set_layouts = vec![dsl];
+            }
             let layout = dev.create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default()
                     .set_layouts(&set_layouts)
@@ -1176,6 +1258,40 @@ impl MoltenVkBackend {
             let cb = dev.allocate_command_buffers(&alloc)?[0];
             dev.begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
+            // Texture upload: staging → image, UNDEFINED → TRANSFER_DST →
+            // SHADER_READ_ONLY, recorded before the render pass.
+            if let Some((timg, _, _, _, sbuf, _, tw, th)) = tex_res {
+                let sub = vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).layer_count(1);
+                let to_dst = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(timg).subresource_range(sub)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+                dev.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(),
+                    &[], &[], &[to_dst]);
+                let region = vk::BufferImageCopy::default()
+                    .image_subresource(vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0)
+                        .base_array_layer(0).layer_count(1))
+                    .image_extent(vk::Extent3D { width: tw, height: th, depth: 1 });
+                dev.cmd_copy_buffer_to_image(cb, sbuf, timg,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]);
+                let to_read = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(timg).subresource_range(sub)
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ);
+                dev.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER, vk::DependencyFlags::empty(),
+                    &[], &[], &[to_read]);
+            }
             let clear = [vk::ClearValue { color: vk::ClearColorValue {
                 float32: [clear_rgba[0] as f32 / 255.0, clear_rgba[1] as f32 / 255.0,
                           clear_rgba[2] as f32 / 255.0, clear_rgba[3] as f32 / 255.0],
@@ -1188,7 +1304,7 @@ impl MoltenVkBackend {
                 .clear_values(&clear);
             dev.cmd_begin_render_pass(cb, &rp_begin, vk::SubpassContents::INLINE);
             dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline);
-            if let Some((_, _, _, _, set)) = ubo_res {
+            if let Some((_, _, set)) = desc_res {
                 dev.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::GRAPHICS,
                     layout, 0, &[set], &[]);
             }
@@ -1221,11 +1337,21 @@ impl MoltenVkBackend {
             dev.destroy_framebuffer(framebuffer, None);
             dev.destroy_pipeline(pipeline, None);
             dev.destroy_pipeline_layout(layout, None);
-            if let Some((ubuf, umem, dsl, pool, _)) = ubo_res {
+            if let Some((dsl, pool, _)) = desc_res {
                 dev.destroy_descriptor_pool(pool, None); // frees the set
                 dev.destroy_descriptor_set_layout(dsl, None);
+            }
+            if let Some((ubuf, umem)) = ubo_res {
                 dev.destroy_buffer(ubuf, None);
                 dev.free_memory(umem, None);
+            }
+            if let Some((timg, tmem, view, sampler, sbuf, smem, _, _)) = tex_res {
+                dev.destroy_sampler(sampler, None);
+                dev.destroy_image_view(view, None);
+                dev.destroy_image(timg, None);
+                dev.free_memory(tmem, None);
+                dev.destroy_buffer(sbuf, None);
+                dev.free_memory(smem, None);
             }
             dev.destroy_shader_module(vs, None);
             dev.destroy_shader_module(fs, None);

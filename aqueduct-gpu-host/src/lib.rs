@@ -110,7 +110,7 @@ pub use tier2_registry::{
     BlendFactor, BlendFactorPair, BlendOp, BlendState, ColorWriteMask,
     DrawTriangle, Tier2Registry, Tier2ShaderId,
 };
-pub use moltenvk::{MoltenVkBackend, MoltenVkError};
+pub use moltenvk::{MoltenVkBackend, MoltenVkError, TexBind};
 #[cfg(unix)]
 pub use carillon_transport::{
     serve_ivshmem, CompDesc, Doorbell, GuestRing, Host as CarillonHost,
