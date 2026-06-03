@@ -253,6 +253,54 @@ dispatched to a tier — a draw that samples an unmaterialised texture is a
 wrong pixel, the one thing routing must never produce. So `submit_frame`
 calls `materialise(tier)` before `t{2,3}.submit_frame`.
 
+## Per-pipeline certification — the cross-tier shader oracle
+
+The runtime gate (`differential_certify`) renders a flat-colour probe on
+both backends and compares — cheap, and the convention precondition is
+verified pixel-identical on Metal across the colour space. But a *shaded*
+pipeline (varyings, uniforms, sampled textures) needs more than a flat
+probe to be certified tier-equivalent. The rigorous check reuses the
+existing Tier-2 differential harness rather than building a new comparator.
+
+**The harness is already a three-way Tier-2 oracle.**
+`atrium-spv-differential` runs a fragment shader through three independent
+Tier-2 paths — the SPIR-V **interpreter** (F1-clean, walks SPIR-V directly),
+**Cranelift**, and the **bespoke** backend — and `assert_shader_agrees`
+asserts they produce the same pixels for given `ShaderInputs` (uniforms +
+per-invocation varyings + textures). No two share frontend code, so
+agreement is strong evidence of correctness; the interpreter is the oracle.
+
+**Cross-tier certification = a fourth runner, not a new mechanism.** The
+seam is the `ShaderRunner` trait (`run(spirv, inputs) -> pixels`). Add a
+`MoltenVkShaderRunner` that runs the FS on **Metal** (Tier-3) for the same
+`ShaderInputs` and returns the per-invocation pixels, and the existing
+`assert_shader_agrees` machinery yields a **four-way** agreement —
+interpreter ↔ Cranelift ↔ bespoke ↔ **MoltenVK**. A pipeline that passes is
+certified tier-equivalent; the flat `differential_certify` stays the cheap
+*runtime* gate, the four-way harness the rigorous *offline* certifier whose
+verdict seeds the `CertificationRegistry`.
+
+**Why this beats comparing the two rasterisers directly.** Running the FS
+per-invocation with *explicit* varyings (the harness model) sidesteps
+rasteriser interpolation entirely — it isolates *shader execution*
+agreement from *rasterisation convention* agreement. The latter (pixel
+centre, fragcoord origin, coverage) is the flat/coverage cross-tier test's
+job and is already verified for the flat case. Decoupling the two axes
+keeps each test sharp.
+
+**The MoltenVK runner, per invocation.** For each varying set the runner
+must make Metal's FS see *exactly* those varyings (not interpolated ones):
+a vertex shader that emits the varyings as flat constants (fed via a
+push-constant / uniform) over a 1×1 target, then read back the pixel.
+Uniforms and textures bind as usual. Constant (no-input) shaders are the
+trivial first rung — a plain `draw_and_copy` of a full-screen triangle.
+
+**Staged by shader complexity** (each rung a new `ShaderInputs` shape the
+runner must feed Metal): (1) constant FS — plumbing; (2) per-invocation
+varyings via flat-constant VS; (3) uniforms / push constants; (4) sampled
+textures. Tier-2 already passes all four (the harness's existing tests);
+each rung extends the *MoltenVK* runner to feed that input shape.
+
 ## Transport
 
 The signals cross the **kernel ↔ userspace boundary** in both
