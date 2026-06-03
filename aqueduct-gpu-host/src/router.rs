@@ -412,6 +412,86 @@ impl FrameRouter {
     }
 }
 
+/// Per-surface tier assignment via slow migration (energy-policy.md
+/// §"Acting on the verdict"). The [`FrameRouter`]'s per-frame verdict is a
+/// *vote*, not a dispatch: each surface accumulates an EWMA-smoothed vote
+/// and **migrates** to the other tier only when that smoothed vote crosses
+/// a deadband — at the residency timescale, never per frame. This is the
+/// consumption layer the design calls for; it changes how the verdict is
+/// used, not the verdict itself.
+///
+/// Keyed by a surface identifier (the frame's render-target image id is the
+/// proxy at this layer — each window renders to its own target). Vote is in
+/// `[0,1]`: 0 = always-Tier-2, 1 = always-Tier-3. A surface starts on
+/// Tier-2 (the safe, already-running CPU default) with a neutral 0.5 vote.
+#[derive(Debug, Clone)]
+pub struct SurfaceRouter {
+    /// Half-width of the migration deadband around 0.5 (reuses the routing
+    /// margin idea: a surface must vote past 0.5±margin/2 to migrate).
+    margin: f64,
+    /// EWMA weight per frame (small = slow migration).
+    alpha: f64,
+    surfaces: std::collections::HashMap<u32, SurfaceState>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SurfaceState {
+    /// Smoothed vote, [0,1]; 1 = Tier-3.
+    vote: f64,
+    /// Current committed assignment.
+    tier: Tier,
+}
+
+impl SurfaceRouter {
+    /// New tracker. `margin` is the deadband half-width on the smoothed
+    /// vote; `alpha` the per-frame EWMA weight (e.g. 0.1 — a surface needs
+    /// a sustained majority over several frames to migrate).
+    pub fn new(margin: f64, alpha: f64) -> Self {
+        SurfaceRouter { margin, alpha, surfaces: std::collections::HashMap::new() }
+    }
+
+    /// Record one frame's `verdict` for `surface`; returns the surface's
+    /// (possibly newly-migrated) tier assignment. New surfaces start on
+    /// Tier-2 with a neutral vote, so a single frame never flips them.
+    pub fn record(&mut self, surface: u32, verdict: Tier) -> Tier {
+        let s = self.surfaces.entry(surface).or_insert(SurfaceState {
+            vote: 0.5,
+            tier: Tier::Tier2,
+        });
+        let target = if verdict == Tier::Tier3 { 1.0 } else { 0.0 };
+        s.vote = s.vote * (1.0 - self.alpha) + target * self.alpha;
+        let hi = 0.5 + self.margin / 2.0;
+        let lo = 0.5 - self.margin / 2.0;
+        match s.tier {
+            Tier::Tier2 if s.vote > hi => s.tier = Tier::Tier3,
+            Tier::Tier3 if s.vote < lo => s.tier = Tier::Tier2,
+            _ => {}
+        }
+        s.tier
+    }
+
+    /// The current tier assignment for `surface`, if seen.
+    pub fn assignment(&self, surface: u32) -> Option<Tier> {
+        self.surfaces.get(&surface).map(|s| s.tier)
+    }
+
+    /// Number of surfaces tracked.
+    pub fn len(&self) -> usize {
+        self.surfaces.len()
+    }
+
+    /// Whether no surfaces are tracked yet.
+    pub fn is_empty(&self) -> bool {
+        self.surfaces.is_empty()
+    }
+
+    /// `(tier2_surfaces, tier3_surfaces)` assignment counts — for logging.
+    pub fn assignment_counts(&self) -> (usize, usize) {
+        let t3 = self.surfaces.values().filter(|s| s.tier == Tier::Tier3).count();
+        (self.surfaces.len() - t3, t3)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -609,6 +689,54 @@ mod tests {
         let f2 = fr.route_frame(&light, 0.266);
         assert_eq!(f2.tier, Tier::Tier2);
         assert_eq!(f2.gpu_state, GpuPowerState::Asleep);
+    }
+
+    #[test]
+    fn surface_migrates_slowly_under_sustained_votes() {
+        let mut sr = SurfaceRouter::new(0.3, 0.1); // hi=0.65, lo=0.35
+        let surf = 0x10;
+        // A brand-new surface starts on Tier-2…
+        assert_eq!(sr.record(surf, Tier::Tier3), Tier::Tier2, "one vote can't flip it");
+        // …and migrates to Tier-3 only after a sustained Tier-3 majority.
+        let mut migrated_at = None;
+        for i in 2..=20 {
+            if sr.record(surf, Tier::Tier3) == Tier::Tier3 {
+                migrated_at = Some(i);
+                break;
+            }
+        }
+        let n = migrated_at.expect("eventually migrates to Tier-3");
+        assert!(n >= 4, "migration is slow (took {n} frames), not instant");
+        assert_eq!(sr.assignment(surf), Some(Tier::Tier3));
+    }
+
+    #[test]
+    fn surface_holds_through_a_stray_vote_and_a_5050_mix() {
+        let mut sr = SurfaceRouter::new(0.3, 0.1);
+        let surf = 0x20;
+        // Drive it firmly to Tier-3.
+        for _ in 0..40 { sr.record(surf, Tier::Tier3); }
+        assert_eq!(sr.assignment(surf), Some(Tier::Tier3));
+        // A single stray Tier-2 vote doesn't flip it (deadband + EWMA).
+        assert_eq!(sr.record(surf, Tier::Tier2), Tier::Tier3);
+
+        // A different surface fed a 50/50 mix never leaves Tier-2 (the vote
+        // hovers around 0.5, inside the band).
+        let surf2 = 0x21;
+        for i in 0..40 {
+            let v = if i % 2 == 0 { Tier::Tier3 } else { Tier::Tier2 };
+            assert_eq!(sr.record(surf2, v), Tier::Tier2, "50/50 stays put");
+        }
+    }
+
+    #[test]
+    fn surface_assignment_counts_track_population() {
+        let mut sr = SurfaceRouter::new(0.3, 0.1);
+        for _ in 0..40 { sr.record(1, Tier::Tier3); } // → Tier-3
+        for _ in 0..40 { sr.record(2, Tier::Tier2); } // stays Tier-2
+        sr.record(3, Tier::Tier3);                    // new, still Tier-2
+        assert_eq!(sr.len(), 3);
+        assert_eq!(sr.assignment_counts(), (2, 1), "two on CPU, one migrated to GPU");
     }
 
     #[test]

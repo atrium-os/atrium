@@ -582,6 +582,10 @@ pub struct CostModelBackend<B: Backend> {
     router: Option<Mutex<crate::router::FrameRouter>>,
     /// (tier2_count, tier3_count) routing verdicts so far.
     route_tally: Mutex<(u64, u64)>,
+    /// Per-surface tier assignment (slow migration from the smoothed
+    /// verdict). Fed only when routing is enabled; keyed by the frame's
+    /// render-target image id (the surface proxy at this layer).
+    surfaces: Mutex<crate::router::SurfaceRouter>,
     /// Optional online calibration: when set, each frame's modeled cost is
     /// compared against the inner backend's measured GPU time (D-M6) and
     /// the efficiency scalars are EWMA-fit. Closes the calibration loop.
@@ -601,8 +605,14 @@ impl<B: Backend> CostModelBackend<B> {
             frames: std::sync::atomic::AtomicU64::new(0),
             router: None,
             route_tally: Mutex::new((0, 0)),
+            surfaces: Mutex::new(crate::router::SurfaceRouter::new(0.3, 0.1)),
             calibration: None,
         }
+    }
+
+    /// Snapshot the per-surface tier assignment counts `(tier2, tier3)`.
+    pub fn surface_assignment_counts(&self) -> (usize, usize) {
+        self.surfaces.lock().unwrap().assignment_counts()
     }
 
     /// Enable online calibration starting from `start` (typically
@@ -816,12 +826,16 @@ impl<B: Backend> Backend for CostModelBackend<B> {
         let mut cal_mt = 0.0;
         let mut cur_dims: Option<(u32, u32)> = None;
         let mut cur_mix: Option<(ShaderCost, ShaderCost)> = None;
+        // The frame's render target = surface proxy for per-surface routing.
+        let mut frame_target: Option<u32> = None;
         let le4 = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
         let mut dec = aqueduct_gpu::frame::FrameDecoder::new(frame_buf);
         while let Ok(Some((op, body))) = dec.next() {
             match op {
                 aqueduct_gpu::opcodes::FrameOp::BeginRenderPass if body.len() >= 4 => {
-                    cur_dims = self.images.lock().unwrap().get(&le4(body)).copied();
+                    let target = le4(body);
+                    frame_target.get_or_insert(target);
+                    cur_dims = self.images.lock().unwrap().get(&target).copied();
                 }
                 aqueduct_gpu::opcodes::FrameOp::BindPipeline if body.len() >= 4 => {
                     cur_mix = self.pipelines.lock().unwrap().get(&le4(body)).copied();
@@ -887,6 +901,12 @@ impl<B: Backend> Backend for CostModelBackend<B> {
                 crate::router::Tier::Tier2 => tally.0 += 1,
                 crate::router::Tier::Tier3 => tally.1 += 1,
             }
+            // Feed the verdict into per-surface slow migration (stage 1 of
+            // acting on the verdict — still observational: we track the
+            // assignment, dispatch is unchanged).
+            if let Some(surf) = frame_target {
+                self.surfaces.lock().unwrap().record(surf, routed.tier);
+            }
         }
         // Periodic ledger summary so the live model is observable under
         // RUST_LOG (every 60 frames ≈ once/second at 60 fps). Cumulative —
@@ -902,11 +922,14 @@ impl<B: Backend> Backend for CostModelBackend<B> {
                     c.launch_overhead_s * 1e6),
                 None => String::new(),
             };
+            let (st2, st3) = self.surfaces.lock().unwrap().assignment_counts();
             log::info!(
                 "device-model[{}]: {} frames, {} ops, modeled {:.3} ms exec, \
-                 {:.1} mJ total; routing tally tier2={} tier3={}{}",
+                 {:.1} mJ total; routing tally tier2={} tier3={}; \
+                 surfaces tier2={} tier3={}{}",
                 self.profile.name, n, l.len(),
-                l.time_for(OpKind::Exec) * 1e3, l.total_energy_j() * 1e3, rt2, rt3, cal_str,
+                l.time_for(OpKind::Exec) * 1e3, l.total_energy_j() * 1e3, rt2, rt3,
+                st2, st3, cal_str,
             );
         }
         let ok = self.inner.submit_frame(fence, timeline, frame_buf);
@@ -1066,6 +1089,43 @@ mod tests {
         plain.pipeline_created(pipe_l, &spirv_with_alu(2), &spirv_with_alu(2));
         plain.submit_frame(ResourceId(9), 1, &build(img_l, pipe_l));
         assert_eq!(plain.route_tally(), (0, 0));
+    }
+
+    #[test]
+    fn heavy_surface_migrates_to_tier3_over_many_frames() {
+        use aqueduct_gpu::frame::FrameBuilder;
+        use aqueduct_gpu::opcodes::FrameOp;
+        use crate::router::{CpuProfile, GpuPowerModel, RouteMode};
+
+        let build = |img: ResourceId, pipe: ResourceId| {
+            let mut fb = FrameBuilder::new(4096);
+            let mut brp = img.raw().to_le_bytes().to_vec();
+            brp.extend_from_slice(&[0, 0, 0, 255]);
+            brp.extend_from_slice(&0u32.to_le_bytes());
+            fb.push(FrameOp::BeginRenderPass, &brp).unwrap();
+            fb.push(FrameOp::BindPipeline, &pipe.raw().to_le_bytes()).unwrap();
+            let mut draw = 3u32.to_le_bytes().to_vec();
+            draw.extend_from_slice(&1u32.to_le_bytes());
+            draw.extend_from_slice(&[0u8; 8]);
+            fb.push(FrameOp::Draw, &draw).unwrap();
+            fb.as_bytes().to_vec()
+        };
+
+        let cm = CostModelBackend::new(StubBackend::new(), DeviceProfile::uma_apple_m4_max())
+            .with_routing(CpuProfile::apple_m4_max(), GpuPowerModel::apple_m4_max(),
+                RouteMode::Perf);
+        let (img, pipe) = (ResourceId(3), ResourceId(4));
+        cm.image_created(img, 3840, 2160);
+        cm.pipeline_created(pipe, &spirv_with_alu(40), &spirv_with_alu(200));
+        let frame = build(img, pipe);
+
+        // One heavy frame votes Tier-3, but the surface holds on Tier-2…
+        cm.submit_frame(ResourceId(9), 1, &frame);
+        assert_eq!(cm.surface_assignment_counts(), (1, 0), "not after one frame");
+        // …and migrates to Tier-3 only after a sustained heavy run.
+        for t in 2..=20 { cm.submit_frame(ResourceId(9), t, &frame); }
+        assert_eq!(cm.surface_assignment_counts(), (0, 1),
+            "the heavy surface migrated to the GPU");
     }
 
     #[test]

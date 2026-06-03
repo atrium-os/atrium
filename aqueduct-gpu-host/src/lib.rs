@@ -92,7 +92,7 @@ pub use cost_model::{
 };
 pub use router::{
     route, Cost, CpuProfile, FrameRouter, FrameWork, GpuPowerModel, GpuPowerState,
-    RoutedFrame, RouteMode, Router, Tier,
+    RoutedFrame, RouteMode, Router, SurfaceRouter, Tier,
 };
 pub use tier2_backend::{
     AssembledVertices, PresentCallback, PresentedFrame, Tier2Backend,
