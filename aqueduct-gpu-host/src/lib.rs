@@ -86,7 +86,8 @@ pub mod tier2_registry;
 
 pub use backend::{Backend, SoftwareBackend, StubBackend};
 pub use cost_model::{
-    CostMode, CostModelBackend, DeviceProfile, FrameLedger, OpKind, Topology,
+    exec_cost, spirv_instruction_mix, CostMode, CostModelBackend, DeviceProfile,
+    FrameLedger, OpKind, ShaderCost, Topology,
 };
 pub use tier2_backend::{
     AssembledVertices, PresentCallback, PresentedFrame, Tier2Backend,

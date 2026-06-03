@@ -74,6 +74,10 @@ pub struct DeviceProfile {
     pub pj_per_byte_link: f64,
     /// Memory access energy, picojoules per byte.
     pub pj_per_byte_mem: f64,
+    /// FP32 ALU lanes (Layer 2 execution roofline).
+    pub alu_lanes: f64,
+    /// Modeled GPU clock, Hz (Layer 2 execution roofline).
+    pub clock_hz: f64,
 }
 
 impl DeviceProfile {
@@ -91,6 +95,8 @@ impl DeviceProfile {
             host_visible: HostVisible::Full,
             pj_per_byte_link: 0.0,
             pj_per_byte_mem: 0.0,
+            alu_lanes: 0.0,
+            clock_hz: 0.0,
         }
     }
 
@@ -107,6 +113,8 @@ impl DeviceProfile {
             host_visible: HostVisible::Full,
             pj_per_byte_link: 0.0,
             pj_per_byte_mem: 8.0,
+            alu_lanes: 5120.0,
+            clock_hz: 1.4e9,
         }
     }
 
@@ -124,6 +132,8 @@ impl DeviceProfile {
             host_visible: HostVisible::Full,
             pj_per_byte_link: 60.0,
             pj_per_byte_mem: 5.0,
+            alu_lanes: 12288.0,
+            clock_hz: 2.5e9,
         }
     }
 
@@ -251,6 +261,94 @@ pub fn transfer_cost(profile: &DeviceProfile, kind: OpKind, bytes: u64) -> (f64,
             (b / bw, b * profile.pj_per_byte_mem)
         }
     };
+    (time, energy)
+}
+
+/// A shader's instruction mix — a cheap roofline proxy extracted from the
+/// SPIR-V opcode histogram (no full IR build). `alu_ops` drives the
+/// compute roofline, `mem_ops` the memory roofline.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShaderCost {
+    /// Arithmetic / transcendental ops (FMA, dot, convert, GLSL ext, …).
+    pub alu_ops: u32,
+    /// Memory ops (Load/Store/AccessChain/Image read-write-sample).
+    pub mem_ops: u32,
+    /// Everything else (types, decorations, control flow, …).
+    pub other_ops: u32,
+}
+
+/// Classify a SPIR-V opcode into the roofline buckets. Heuristic — a
+/// representative subset of the hot arithmetic + memory opcodes; anything
+/// unclassified is `other` (types/constants/decorations/control flow,
+/// which don't feed the flops/bytes estimate).
+fn classify_spirv_op(op: u16) -> u8 {
+    // 0 = other, 1 = alu, 2 = mem.
+    match op {
+        // Arithmetic (int + float), conversions, bitwise, GLSL ext insts.
+        12 // OpExtInst (GLSL450: sqrt/sin/pow/… — count as ALU)
+        | 127..=142 // FNegate..VectorTimesScalar (FP/int add/sub/mul/div/mod)
+        | 144..=148 // VectorTimesMatrix..Dot (matrix mul + dot)
+        | 110..=114 // Convert{S,U}ToF / ConvertFTo{S,U} / FConvert
+        | 194..=205 // shifts + bitwise + Not
+        => 1,
+        // Memory.
+        61 | 62 // OpLoad / OpStore
+        | 63 // OpCopyMemory
+        | 65 | 66 // OpAccessChain / OpInBoundsAccessChain
+        | 87..=99 // OpImageSample* / OpImageFetch / OpImageRead / OpImageWrite
+        => 2,
+        _ => 0,
+    }
+}
+
+/// Extract the [`ShaderCost`] instruction mix from a SPIR-V module
+/// (raw little-endian bytes). Returns the empty mix for non-SPIR-V input.
+pub fn spirv_instruction_mix(spirv: &[u8]) -> ShaderCost {
+    let mut sc = ShaderCost::default();
+    if spirv.len() < 20 || spirv.len() % 4 != 0 {
+        return sc;
+    }
+    let word = |i: usize| {
+        u32::from_le_bytes([spirv[i * 4], spirv[i * 4 + 1], spirv[i * 4 + 2], spirv[i * 4 + 3]])
+    };
+    if word(0) != 0x0723_0203 {
+        return sc; // not a SPIR-V magic header
+    }
+    let n_words = spirv.len() / 4;
+    let mut i = 5; // skip the 5-word header
+    while i < n_words {
+        let w = word(i);
+        let wc = (w >> 16) as usize;
+        if wc == 0 {
+            break; // malformed
+        }
+        match classify_spirv_op((w & 0xffff) as u16) {
+            1 => sc.alu_ops += 1,
+            2 => sc.mem_ops += 1,
+            _ => sc.other_ops += 1,
+        }
+        i += wc;
+    }
+    sc
+}
+
+/// Layer-2 execution roofline (§4 of the spec): modeled `(time_s,
+/// energy_j)` for running a shader of `mix` over `invocations` (pixels for
+/// a fragment shader, vertices for a vertex shader). `t = max(compute,
+/// memory)`: compute = flops / (alu_lanes · clock · 2 [FMA]); memory =
+/// bytes_touched / mem_bw. A vec4 mem op ≈ 16 B. Passthrough → zero.
+pub fn exec_cost(profile: &DeviceProfile, mix: &ShaderCost, invocations: u64) -> (f64, f64) {
+    if profile.passthrough || invocations == 0 || profile.alu_lanes == 0.0 {
+        return (0.0, 0.0);
+    }
+    let inv = invocations as f64;
+    let flops = mix.alu_ops as f64 * inv; // ~1 flop per ALU op
+    let bytes = mix.mem_ops as f64 * 16.0 * inv; // vec4-ish granularity
+    let compute_t = flops / (profile.alu_lanes * profile.clock_hz * 2.0);
+    let mem_t = bytes / profile.mem_bw;
+    let time = compute_t.max(mem_t);
+    // Energy: memory traffic + a small per-flop ALU term (~0.5 pJ/flop).
+    let energy = bytes * profile.pj_per_byte_mem + flops * 0.5;
     (time, energy)
 }
 
@@ -470,6 +568,45 @@ mod tests {
             &DeviceProfile::uma_apple_m4_max(), OpKind::Upload, bytes);
         // Discrete pays PCIe transfer energy on top of memory energy.
         assert!(e_disc > e_uma);
+    }
+
+    fn spirv_from_words(words: &[u32]) -> Vec<u8> {
+        words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn spirv_mix_classifies_opcodes() {
+        // Header (5 words) + OpFAdd(129,wc5) + OpLoad(61,wc4) +
+        // OpStore(62,wc3) + OpReturn(253,wc1).
+        let words = [
+            0x0723_0203, 0x0001_0000, 0, 100, 0, // header
+            (5 << 16) | 129, 1, 2, 3, 4,          // OpFAdd → alu
+            (4 << 16) | 61, 5, 6, 7,              // OpLoad → mem
+            (3 << 16) | 62, 8, 9,                 // OpStore → mem
+            (1 << 16) | 253,                      // OpReturn → other
+        ];
+        let mix = spirv_instruction_mix(&spirv_from_words(&words));
+        assert_eq!(mix.alu_ops, 1, "one FAdd");
+        assert_eq!(mix.mem_ops, 2, "Load + Store");
+        assert_eq!(mix.other_ops, 1, "Return");
+        // Non-SPIR-V input → empty mix.
+        assert_eq!(spirv_instruction_mix(&[0xAB; 64]), ShaderCost::default());
+    }
+
+    #[test]
+    fn exec_cost_scales_and_differs_by_device() {
+        let mix = ShaderCost { alu_ops: 20, mem_ops: 4, other_ops: 0 };
+        let uma = DeviceProfile::uma_apple_m4_max();
+        let (t1, _) = exec_cost(&uma, &mix, 1_000_000);
+        let (t2, _) = exec_cost(&uma, &mix, 2_000_000);
+        assert!((t2 / t1 - 2.0).abs() < 1e-9, "exec time ∝ invocations");
+        // Passthrough is free; a real profile is not.
+        assert_eq!(exec_cost(&DeviceProfile::passthrough(), &mix, 1_000_000), (0.0, 0.0));
+        assert!(t1 > 0.0);
+        // The faster-clock / wider discrete part computes the same work
+        // quicker (compute-bound here).
+        let (t_disc, _) = exec_cost(&DeviceProfile::discrete_rdna3_pcie4x16(), &mix, 1_000_000);
+        assert!(t_disc < t1, "wider+faster discrete beats UMA on a compute-bound shader");
     }
 
     #[test]
