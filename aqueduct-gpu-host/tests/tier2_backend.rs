@@ -1573,3 +1573,138 @@ fn tier2_backend_depth_attachment_persists_across_passes() {
     assert!((dz(0, 0) - 1.0).abs() < 1e-5,
             "background still cleared after both passes; got {}", dz(0, 0));
 }
+
+/// A vertex shader that emits a full-screen triangle purely from
+/// `gl_VertexIndex` — no vertex-input attributes, no bound vertex
+/// buffer. This is the canonical post-processing / present pattern
+/// (`vkCmdDraw(3, 1, 0, 0)`). Identical to the cross-tier shaded
+/// test's builder: idx → clip pos covering [-1,1]² with one tri.
+fn build_fullscreen_tri_vs() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::dr::Operand;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, ExecutionModel,
+        FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let f32t = b.type_float(32, None);
+    let i32t = b.type_int(32, 1);
+    let v4 = b.type_vector(f32t, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let per_vertex = b.type_struct(vec![v4]);
+    b.member_decorate(per_vertex, 0, Decoration::BuiltIn,
+        vec![Operand::BuiltIn(BuiltIn::Position)]);
+    b.member_decorate(per_vertex, 0, Decoration::Offset,
+        vec![Operand::LiteralBit32(0)]);
+    b.decorate(per_vertex, Decoration::Block, vec![]);
+    let ptr_pv = b.type_pointer(None, StorageClass::Output, per_vertex);
+    let ptr_out_v4 = b.type_pointer(None, StorageClass::Output, v4);
+    let ptr_in_i32 = b.type_pointer(None, StorageClass::Input, i32t);
+    let in_idx = b.variable(ptr_in_i32, None, StorageClass::Input, None);
+    b.decorate(in_idx, Decoration::BuiltIn,
+        vec![Operand::BuiltIn(BuiltIn::VertexIndex)]);
+    let pv_var = b.variable(ptr_pv, None, StorageClass::Output, None);
+    let c0i = b.constant_bit32(i32t, 0);
+    let c1i = b.constant_bit32(i32t, 1);
+    let c2i = b.constant_bit32(i32t, 2);
+    let c2f = b.constant_bit32(f32t, 2.0f32.to_bits());
+    let c1f = b.constant_bit32(f32t, 1.0f32.to_bits());
+    let c0f = b.constant_bit32(f32t, 0.0f32.to_bits());
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let idx = b.load(i32t, None, in_idx, None, vec![]).unwrap();
+    let sh = b.shift_left_logical(i32t, None, idx, c1i).unwrap();
+    let xb = b.bitwise_and(i32t, None, sh, c2i).unwrap();
+    let yb = b.bitwise_and(i32t, None, idx, c2i).unwrap();
+    let xf = b.convert_s_to_f(f32t, None, xb).unwrap();
+    let yf = b.convert_s_to_f(f32t, None, yb).unwrap();
+    let xm = b.f_mul(f32t, None, xf, c2f).unwrap();
+    let x = b.f_sub(f32t, None, xm, c1f).unwrap();
+    let ym = b.f_mul(f32t, None, yf, c2f).unwrap();
+    let y = b.f_sub(f32t, None, ym, c1f).unwrap();
+    let pos = b.composite_construct(v4, None, vec![x, y, c0f, c1f]).unwrap();
+    let dst = b.access_chain(ptr_out_v4, None, pv_var, vec![c0i]).unwrap();
+    b.store(dst, pos, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Vertex, main, "main", vec![in_idx, pv_var]);
+    let words: Vec<u32> = b.module().assemble();
+    words.iter().flat_map(|w| w.to_le_bytes()).collect()
+}
+
+/// Regression: a vertex-less draw — a full-screen-triangle VS that
+/// reads only `gl_VertexIndex`, with NO vertex-input layout ever
+/// bound and NO vertex buffer — must render, not be skipped.
+///
+/// Before the fix, `dispatch_draw` bailed with "pipeline … has no
+/// vertex-input layout; skipping" (observed in the in-VM routing
+/// demo), leaving the surface unrenderable on Tier-2. The fix
+/// defaults an absent layout to an empty `VertexInputState`, so the
+/// VS runs once per vertex with the correct `gl_VertexIndex`.
+#[test]
+fn tier2_backend_vertexless_fullscreen_triangle_renders() {
+    use aqueduct_gpu::frame::{DrawCmd, FrameBuilder, SetViewportCmd};
+    use aqueduct_gpu::opcodes::FrameOp;
+
+    let cache_dir = TempDir::new().unwrap();
+    let registry = Arc::new(Tier2Registry::new(LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    }));
+
+    let vs_id = registry.register(&build_fullscreen_tri_vs()).expect("vs");
+    let fs_id = registry
+        .register(&build_constant_color_spirv([0.1, 0.8, 0.3, 1.0]))
+        .expect("fs");
+    let backend = Tier2Backend::new(registry);
+
+    let image_id    = ResourceId::new(IdNamespace::IcdRuntime, 0xF101);
+    let pipeline_id = ResourceId::new(IdNamespace::IcdRuntime, 0xF102);
+
+    backend.image_created(image_id, 8, 8);
+    backend.bind_pipeline_vs(pipeline_id, vs_id);
+    backend.bind_pipeline(pipeline_id, fs_id);
+    // Deliberately NO bind_layout: this is the vertex-less case.
+
+    let mut fb = FrameBuilder::new(4096);
+    let mut begin = [0u8; 12];
+    begin[..4].copy_from_slice(&image_id.raw().to_le_bytes());
+    fb.push(FrameOp::BeginRenderPass, &begin).unwrap();
+    fb.push(FrameOp::BindPipeline, &pipeline_id.raw().to_le_bytes()).unwrap();
+    fb.push_set_viewport(SetViewportCmd {
+        x: 0.0, y: 0.0, width: 8.0, height: 8.0,
+        min_depth: 0.0, max_depth: 1.0,
+    }).unwrap();
+    // No BindVertexBuf. Three vertices sourced from gl_VertexIndex.
+    fb.push_draw(DrawCmd {
+        vertex_count: 3, instance_count: 1,
+        first_vertex: 0, first_instance: 0,
+    }).unwrap();
+    fb.push(FrameOp::EndRenderPass, &[]).unwrap();
+
+    let fence = ResourceId::new(IdNamespace::IcdRuntime, 0xF104);
+    backend.submit_frame(fence, 1, fb.as_bytes());
+
+    // The draw must have executed (not skipped for "no layout").
+    assert_eq!(backend.draw_count(), 1, "vertex-less draw was skipped");
+
+    let pixels = backend.read_image_pixels(image_id).unwrap();
+    let px = |x: usize, y: usize| -> [u8; 4] {
+        let i = (y * 8 + x) * 4;
+        [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
+    };
+    // FS constant [0.1, 0.8, 0.3, 1.0] → ~[26, 204, 77, 255].
+    let green = [26u8, 204, 77, 255];
+    // The full-screen triangle covers (-1,-1),(3,-1),(-1,3) — every
+    // pixel of the 8×8 target is inside it.
+    for (x, y) in [(0, 0), (4, 4), (7, 0), (0, 7), (3, 5)] {
+        assert_eq!(px(x, y), green,
+            "vertex-less full-screen triangle should cover ({x},{y}); \
+             got {:?}", px(x, y));
+    }
+}

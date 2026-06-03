@@ -1862,14 +1862,18 @@ impl Tier2Backend {
                 return;
             }
         };
-        let layout = match self.pipeline_layouts.lock().unwrap().get(&pipeline_raw).cloned() {
-            Some(l) => l,
-            None => {
-                log::warn!("Draw on target {target_id}: pipeline {pipeline_raw:#x} \
-                            has no vertex-input layout; skipping");
-                return;
-            }
-        };
+        // A pipeline with no recorded vertex-input layout is the
+        // vertex-less draw case: the VS sources every attribute
+        // from built-ins (e.g. a full-screen triangle deriving its
+        // positions from `gl_VertexIndex`, drawn with
+        // `vkCmdDraw(3, 1, 0, 0)` and no bound vertex buffer). Use
+        // an empty `VertexInputState` so `assemble_vertices`
+        // produces `vertex_count` zero-stride vertices and the VS
+        // runs once per vertex with the right `gl_VertexIndex` —
+        // rather than skipping the draw entirely.
+        let layout = self.pipeline_layouts.lock().unwrap()
+            .get(&pipeline_raw).cloned()
+            .unwrap_or_default();
 
         // Whether any vertex binding is per-instance
         // (VK_VERTEX_INPUT_RATE_INSTANCE).  When so, the
@@ -2490,6 +2494,14 @@ impl Tier2Backend {
             let v2 = &assembled.bytes[i2*stride .. (i2+1)*stride];
             let dt = DrawTriangle {
                 vertex_attrs: [v0, v1, v2],
+                // Non-indexed: gl_VertexIndex = firstVertex + the
+                // vertex's position in draw order (== its slot in
+                // the assembled array). Drives vertex-less draws.
+                vertex_index: Some([
+                    cmd.first_vertex + i0 as u32,
+                    cmd.first_vertex + i1 as u32,
+                    cmd.first_vertex + i2 as u32,
+                ]),
                 push_constants: &state.push_constants,
                 blend_state: raster.blend,
                 blend_extra: &state.blend_extra,
@@ -3582,16 +3594,14 @@ impl Tier2Backend {
             Some(p) => p,
             None => return,
         };
-        let layout = match self.pipeline_layouts.lock().unwrap()
+        // No recorded layout ⇒ vertex-less draw: the VS sources
+        // attributes from built-ins. An empty `VertexInputState`
+        // assembles zero-stride vertices; the index buffer still
+        // supplies the per-vertex `gl_VertexIndex`. (Mirrors the
+        // non-indexed `draw` path above.)
+        let layout = self.pipeline_layouts.lock().unwrap()
             .get(&pipeline_raw).cloned()
-        {
-            Some(l) => l,
-            None => {
-                log::warn!("DrawIndexed on target {target_id}: pipeline \
-                            {pipeline_raw:#x} has no vertex-input layout");
-                return;
-            }
-        };
+            .unwrap_or_default();
 
         // Effective primitive-restart enable (dynamic
         // override + pipeline static).  Only meaningful in
@@ -3869,6 +3879,13 @@ impl Tier2Backend {
             let v2 = &assembled.bytes[i2*stride .. (i2+1)*stride];
             let dt = DrawTriangle {
                 vertex_attrs: [v0, v1, v2],
+                // Indexed: gl_VertexIndex = the index-buffer value
+                // for this vertex (vertexOffset already folded in by
+                // gather_indices). `indices[iN]` is that value since
+                // the assembled array is packed in `indices` order.
+                vertex_index: Some([
+                    indices[i0], indices[i1], indices[i2],
+                ]),
                 push_constants: &state.push_constants,
                 blend_state: raster.blend,
                 blend_extra: &state.blend_extra,

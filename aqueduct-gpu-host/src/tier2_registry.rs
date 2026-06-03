@@ -353,6 +353,9 @@ impl Tier2Registry {
         let mut clip_positions: [[f32; 4]; 3] = [[0.0; 4]; 3];
         let mut vary_scratch: [[u8; 256]; 3] = [[0u8; 256]; 3];
         let mut clip_dist = [0.0f32; 8];
+        // `gl_VertexIndex` per polygon vertex: the caller's global
+        // indices when supplied, else the legacy local 0/1/2.
+        let vertex_index = draw.vertex_index.unwrap_or([0, 1, 2]);
         for i in 0..3 {
             let attr_ptr = if draw.vertex_attrs[i].is_empty() {
                 std::ptr::null()
@@ -368,7 +371,7 @@ impl Tier2Registry {
                     std::ptr::null(),       // in_attr_strides — unused
                     uni_ptr,
                     pc_ptr,
-                    i as u32, draw.instance_index,
+                    vertex_index[i], draw.instance_index,
                     &mut clip_positions[i] as *mut [f32; 4],
                     vary_scratch[i].as_mut_ptr(),
                     clip_dist.as_mut_ptr(),
@@ -2627,6 +2630,19 @@ pub struct DrawTriangle<'a> {
     /// comes entirely from the shader reading this index.
     pub instance_index: u32,
 
+    /// Per-vertex value handed to the vertex shader as
+    /// `gl_VertexIndex` (VS param 5), in the polygon's `[v0, v1,
+    /// v2]` order. For a non-indexed draw this is `firstVertex +
+    /// vertexOffset`; for an indexed draw it is the index-buffer
+    /// value (`+ vertexOffset`). `None` falls back to the local
+    /// `[0, 1, 2]` — correct for a lone `vkCmdDraw(3, 1, 0, 0)`
+    /// full-screen triangle and the back-compat default for direct
+    /// callers, but wrong for strips / fans / multi-triangle /
+    /// non-zero base, which is why the draw paths set it
+    /// explicitly. Matters most for vertex-less draws, whose
+    /// geometry is derived *entirely* from this built-in.
+    pub vertex_index: Option<[u32; 3]>,
+
     /// Value handed to the fragment shader as `gl_PrimitiveID`
     /// (the trailing FS parameter): the 0-based index of this
     /// triangle within the draw.
@@ -2725,6 +2741,7 @@ impl Default for DrawTriangle<'_> {
             vertex_attrs: [&[], &[], &[]],
             varyings_per_vertex: [&[], &[], &[]],
             varying_f32_count: 0,
+            vertex_index: None,
             uniforms: &[],
             push_constants: &[],
             blend_state: BlendState::default(),
