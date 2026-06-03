@@ -75,6 +75,11 @@ pub struct RoutingBackend {
     /// cycles for nothing. The router doesn't pay to decide what it can't
     /// act on.
     skipped: AtomicU64,
+    /// Bring-up shortcut: when set, a created pipeline is certified
+    /// tier-equivalent on sight (no probe). Lets switching be exercised
+    /// end-to-end before real per-pipeline certification (probe / offline
+    /// differential) is wired into dispatch. NOT the production safety gate.
+    trust_all: bool,
     /// Per-resource residency: resource ops are *recorded* here rather than
     /// mirrored to both backends, and materialised onto a tier only when a
     /// frame dispatched there needs them. So a CPU-routed surface never
@@ -110,8 +115,17 @@ impl RoutingBackend {
             frames: AtomicU64::new(0),
             scored: AtomicU64::new(0),
             skipped: AtomicU64::new(0),
+            trust_all: false,
             residency: Mutex::new(crate::residency::ResidencyTracker::new()),
         }
+    }
+
+    /// Bring-up: certify every pipeline on creation (no probe) so surfaces
+    /// become migration-eligible immediately. A shortcut to exercise
+    /// switching end-to-end; the real gate is per-pipeline certification.
+    pub fn with_trusted_tiers(mut self) -> Self {
+        self.trust_all = true;
+        self
     }
 
     /// Record a `kind`-tagged resource op against `resource` (applied now to
@@ -261,6 +275,9 @@ impl Backend for RoutingBackend {
     }
     fn pipeline_created(&self, id: ResourceId, vs: &[u8], fs: &[u8]) {
         self.pipelines.lock().unwrap().insert(id.raw(), (shader_cost(vs), shader_cost(fs)));
+        if self.trust_all {
+            self.policy.lock().unwrap().certify(id.raw(), crate::certify::Certification::Certified);
+        }
         let (vs, fs) = (vs.to_vec(), fs.to_vec()); // own for deferred replay
         self.record(id.raw(), crate::residency::OpKind::Create, move |b| b.pipeline_created(id, &vs, &fs));
     }

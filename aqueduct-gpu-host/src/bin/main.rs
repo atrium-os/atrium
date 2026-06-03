@@ -148,6 +148,10 @@ struct Args {
     /// against the backend's measured GPU time (requires `--device-profile`;
     /// only meaningful with a backend that reports timing, e.g. moltenvk).
     calibrate: bool,
+    /// `--trust-tiers` (with `--backend routing`): bring-up shortcut that
+    /// certifies every pipeline on creation so surfaces migrate without the
+    /// real per-pipeline certification probe. NOT a production gate.
+    trust_tiers: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -163,6 +167,7 @@ fn parse_args() -> Result<Args> {
     let mut device_profile: Option<DeviceProfile> = None;
     let mut route: Option<RouteMode> = None;
     let mut calibrate = false;
+    let mut trust_tiers = false;
     let mut iter = std::env::args().skip(1);
     while let Some(a) = iter.next() {
         match a.as_str() {
@@ -232,6 +237,9 @@ fn parse_args() -> Result<Args> {
             "--calibrate" => {
                 calibrate = true;
             }
+            "--trust-tiers" => {
+                trust_tiers = true;
+            }
             "--help" | "-h" => {
                 println!("usage: aqueduct-gpu-host [--socket PATH] \
                     [--transport socket|carillon] \
@@ -289,6 +297,7 @@ fn parse_args() -> Result<Args> {
         device_profile,
         route,
         calibrate,
+        trust_tiers,
     })
 }
 
@@ -328,12 +337,14 @@ fn make_tier2_registry(
     Ok(Arc::new(Tier2Registry::new(cfg)))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn make_backend(
     kind: BackendKind,
     tier2_registry: Option<&Arc<Tier2Registry>>,
     device_profile: Option<DeviceProfile>,
     route: Option<RouteMode>,
     calibrate: bool,
+    trust_tiers: bool,
 ) -> Result<Arc<dyn Backend>> {
     // Wrap a concrete backend in the device-cost model when --device-profile
     // is set, then erase to the trait object. CostModelBackend<B> is a
@@ -414,11 +425,14 @@ fn make_backend(
             };
             let mode = route.unwrap_or(RouteMode::Perf);
             log::info!(
-                "routing backend: profile '{}', mode {mode:?} — surfaces dispatch per \
-                 RoutingPolicy (gated on tier-equivalence certification)",
-                profile.name);
-            Ok(Arc::new(RoutingBackend::new(
-                t2, t3, profile, CpuProfile::apple_m4_max(), power, mode)))
+                "routing backend: profile '{}', mode {mode:?}, trust_tiers={trust} — \
+                 surfaces dispatch per RoutingPolicy (gated on tier-equivalence \
+                 certification)",
+                profile.name, trust = trust_tiers);
+            let rb = RoutingBackend::new(
+                t2, t3, profile, CpuProfile::apple_m4_max(), power, mode);
+            let rb = if trust_tiers { rb.with_trusted_tiers() } else { rb };
+            Ok(Arc::new(rb))
         }
     }
 }
@@ -444,7 +458,8 @@ fn main() -> Result<()> {
     };
 
     let backend = make_backend(
-        args.backend, registry.as_ref(), args.device_profile.clone(), args.route, args.calibrate)?;
+        args.backend, registry.as_ref(), args.device_profile.clone(), args.route,
+        args.calibrate, args.trust_tiers)?;
 
     // Carillon (FreeBSD-VM) transport: stand up the ivshmem-doorbell
     // endpoint instead of the Unix-socket listener.
