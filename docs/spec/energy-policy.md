@@ -107,6 +107,75 @@ between tiers *because* correctness does not depend on where it lands.
 Tier-equivalence is therefore a hard invariant for any energy routing,
 not a nice-to-have.
 
+## Acting on the verdict — routing mechanism & granularity
+
+The router *decides* per frame (the `FrameRouter` scores each frame's
+Tier-2 vs Tier-3 cost). But **acting** at per-frame granularity is the
+wrong mechanism, and the distinction is the central design decision here.
+
+**Rejected: per-frame dual-hot dispatch.** Naively, the decorator would
+hold *both* backends, mirror every resource-creation op to both (so either
+can render any frame), and send each frame's `submit_frame` to the tier
+the router picked. Two fatal costs:
+
+1. **It fights the hysteresis we model.** The whole `GpuPowerModel` exists
+   because the GPU has a tens-of-ms residency cost. Flipping tiers per
+   frame (8–16 ms) is exactly the chatter the residency timer + the
+   router's deadband are meant to *prevent*. Per-frame dispatch re-creates
+   the disease the model diagnoses.
+2. **Every resource lives twice.** Mirroring uploads/pipeline-compiles to
+   both backends doubles memory + bandwidth + compile time for resources,
+   most of which only ever render on one tier. The cost is paid per
+   resource; the benefit (instant per-frame switch) is one we just argued
+   against wanting.
+
+**Chosen: per-surface assignment with slow migration.** Each Fresco
+surface/window is *assigned* to one tier. Its resources live only on that
+tier's backend. The router's per-frame verdict is not a dispatch — it is a
+**vote**, EWMA-smoothed per surface. A surface **migrates** to the other
+tier only when its smoothed verdict crosses the (already-built) hysteresis
+band, at the residency timescale — not per frame. This:
+
+- matches the timescale the GPU power model already describes (migrate
+  slowly, the way the hardware itself transitions power state);
+- keeps each surface's resources single-homed — migration re-creates them
+  on the destination once, amortized over the many frames before the next
+  migration;
+- reuses the `FrameRouter` verbatim as the per-frame scorer; only the
+  *consumption* of its verdict changes (accumulate, don't act).
+
+**The dispatch object.** A `RoutedSurface` owns `{ tier, backend,
+resource_set, smoothed_verdict }`. A surface's `submit_frame` goes to its
+assigned backend; its readback comes from the same backend (rendered
+output is single-homed, so there is no "which tier rendered this?"
+ambiguity). On migration, the surface's retained resource set is replayed
+to the destination backend, then the assignment flips.
+
+**Tier-equivalence is the gate, per pipeline.** A surface may migrate only
+if its pipelines are *certified* tier-equivalent by the differential
+harness (Tier-2 ≈ Tier-3 ≈ interpreter). An uncertified pipeline pins its
+surface to one tier — routing degrades to "stay put," never to a wrong
+pixel. Certification is per-pipeline and cached.
+
+**Where it lives.** A routing layer in `aqueduct-gpu-host` that owns both
+`Tier2Backend` and `MoltenVkBackend` and consumes the `FrameRouter`
+verdict. The `CostModelBackend` decorator stays purely observational (it
+already scores + tallies + calibrates); acting is a *separate* layer so
+the model and the mechanism don't entangle — the same "coordinated, not
+coupled" discipline applied one level down.
+
+**Staged rollout.**
+1. *Observe per surface* — extend the per-frame verdict to a per-surface
+   EWMA of votes (the `FrameRouter` already emits the per-frame verdict;
+   add the surface-keyed smoothing + a migration-threshold log). Still
+   zero dispatch change.
+2. *Mechanism behind a flag* — `RoutedSurface` + migration, gated, and
+   validated against the differential harness on a known tier-equivalent
+   pipeline before it is allowed to migrate anything.
+3. *Default per surface* — once equivalence certification is wired and the
+   migration cost is measured to amortize, routing acts by default; the
+   mode signal biases the migration threshold.
+
 ## Transport
 
 The signals cross the **kernel ↔ userspace boundary** in both
@@ -189,11 +258,29 @@ toward a budget authority only when data demands it.
 
 ## Status
 
-Design decision recorded; **not yet implemented, and blocked on a
-working Tier-3 backend.**
+**Phase 1 (the local router) is built and operational; acting on the
+verdict is designed (above) and is the next implementation step.**
 
 In place: P4 (compositor renders on Tier-2) + PT (cheap small-frame
-transport) + the tier-equivalence discipline.
+transport) + the tier-equivalence discipline + the Tier-3 MoltenVk path
+(below) + **the full observational router** (`aqueduct-gpu-host`):
+- The GPU device cost model (`CostModelBackend`, `docs/spec/
+  gpu-device-model.md`): per-op transfer + Layer-2 exec roofline, IR-based
+  shader cost, `DeviceProfile` (UMA vs discrete) — the Tier-3 cost side.
+- The router itself (`router.rs`): `tier2/tier3_exec_cost`, the per-mode
+  `route()` decision, the `Router` **hysteresis band** (no chatter), the
+  `GpuPowerModel` (D-M2 wake + residency signal), and the `FrameRouter`
+  that assembles them into a per-frame verdict.
+- Live in the daemon: `--device-profile` puts the model in the data path;
+  `--route perf|balanced|battery` scores every real frame Tier-2 vs Tier-3
+  and tallies the verdict (observational); `--calibrate` fits the model's
+  efficiency scalars online against **measured** GPU time (D-M6,
+  `VkQueryPool` timestamps on Metal). All opt-in, zero perturbation by
+  default; flows through both the Unix-socket and Carillon (VM) transports.
+
+What remains is **acting** on the verdict per the mechanism designed above
+(per-surface assignment + slow migration), gated on per-pipeline
+tier-equivalence certification.
 
 **Tier-3 render path — in progress.** The router only has meaning when
 there are *two* working backends to choose between. `aqueduct-gpu-host`
