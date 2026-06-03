@@ -200,7 +200,10 @@ mod tests {
         r.record(0x10, op(0x10), &t2, &t3);
         r.record(0x20, op(0x20), &t2, &t3);
         r.materialize_all(Tier::Tier3, &t3);
-        assert_eq!(*t3.created.lock().unwrap(), vec![0x10, 0x20]);
+        // materialize_all iterates HashMap keys → order is unspecified;
+        // compare as a set.
+        let got: HashSet<u32> = t3.created.lock().unwrap().iter().copied().collect();
+        assert_eq!(got, HashSet::from([0x10, 0x20]));
         assert_eq!(r.resident_counts(), (0, 2));
     }
 
