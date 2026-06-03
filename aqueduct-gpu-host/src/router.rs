@@ -220,6 +220,101 @@ impl Router {
     }
 }
 
+/// The modeled GPU's power/residency state — the slow, read-only signal
+/// energy-policy publishes and the router's wake penalty derives from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuPowerState {
+    /// Powered down / clock-gated — using it pays a wake cost.
+    Asleep,
+    /// Up and clocked — Tier-3 work runs with no wake penalty.
+    Active,
+}
+
+/// Tracks the modeled GPU's power residency across a frame timeline so the
+/// router can price the wake of an asleep GPU, and so energy-policy can
+/// publish the state as a slow read-only signal.
+///
+/// Driven by a monotonic clock passed in (deterministic + testable; no
+/// wall-clock reads — same discipline as the rest of the device model).
+/// The GPU wakes when Tier-3 work runs and idles back to `Asleep` after
+/// `idle_timeout_s` of no GPU use — its *own* hysteresis, the tens-of-ms
+/// residency timer the energy-policy design calls out as already present
+/// in the hardware. The router's deadband and this residency timer are the
+/// two damping loops; neither one reacts to the other's instantaneous
+/// output (coordinated, not coupled).
+#[derive(Debug, Clone, Copy)]
+pub struct GpuPowerModel {
+    state: GpuPowerState,
+    last_use_s: f64,
+    /// Quiet time before the GPU clock-gates back to `Asleep`.
+    idle_timeout_s: f64,
+    /// Spin-up latency added to Tier-3 when waking from `Asleep`.
+    wake_latency_s: f64,
+    /// Spin-up energy added to Tier-3 when waking from `Asleep`.
+    wake_energy_j: f64,
+}
+
+impl GpuPowerModel {
+    /// New model (starts `Asleep` — the GPU is cold at boot).
+    pub fn new(idle_timeout_s: f64, wake_latency_s: f64, wake_energy_j: f64) -> Self {
+        GpuPowerModel {
+            state: GpuPowerState::Asleep,
+            last_use_s: f64::NEG_INFINITY,
+            idle_timeout_s,
+            wake_latency_s,
+            wake_energy_j,
+        }
+    }
+
+    /// Apple M4 Max UMA GPU: short residency, cheap wake (on-package, no
+    /// PCIe link to retrain).
+    pub fn apple_m4_max() -> Self {
+        Self::new(0.05, 0.5e-3, 2e-3)
+    }
+
+    /// Discrete RDNA3 over PCIe: longer residency, *expensive* wake (link
+    /// + VRAM spin-up) — which is exactly why a single small op is not
+    /// worth waking it for.
+    pub fn discrete_rdna3() -> Self {
+        Self::new(0.1, 3e-3, 50e-3)
+    }
+
+    /// Current power state.
+    pub fn state(&self) -> GpuPowerState {
+        self.state
+    }
+
+    /// Advance the clock to `now_s`, applying idle-down: an `Active` GPU
+    /// that's seen no use for `idle_timeout_s` clock-gates to `Asleep`.
+    /// Call once per frame before [`Self::wake_cost`].
+    pub fn advance(&mut self, now_s: f64) -> GpuPowerState {
+        if self.state == GpuPowerState::Active && now_s - self.last_use_s >= self.idle_timeout_s {
+            self.state = GpuPowerState::Asleep;
+        }
+        self.state
+    }
+
+    /// The prospective wake cost to route work to Tier-3 *right now* —
+    /// `Some` iff the GPU is `Asleep`. Feed straight into
+    /// [`Router::decide`] / [`route`] as `gpu_wake`. A peek: no state change
+    /// (the router may still pick Tier-2 and leave the GPU asleep).
+    pub fn wake_cost(&self) -> Option<Cost> {
+        match self.state {
+            GpuPowerState::Asleep => {
+                Some(Cost { time_s: self.wake_latency_s, energy_j: self.wake_energy_j })
+            }
+            GpuPowerState::Active => None,
+        }
+    }
+
+    /// Commit a Tier-3 use at `now_s`: the GPU is `Active` and the idle
+    /// timer resets. Call only when the router actually routed to Tier-3.
+    pub fn record_tier3_use(&mut self, now_s: f64) {
+        self.state = GpuPowerState::Active;
+        self.last_use_s = now_s;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,6 +411,43 @@ mod tests {
         let win2 = Cost { time_s: 0.3e-3, energy_j: 1e-3 };
         let lose3 = Cost { time_s: 1.0e-3, energy_j: 1e-3 };
         assert_eq!(r.decide(win2, lose3, None), Tier::Tier2);
+    }
+
+    #[test]
+    fn gpu_wakes_on_use_and_idles_back_to_sleep() {
+        let mut power = GpuPowerModel::apple_m4_max(); // 50 ms residency
+        assert_eq!(power.state(), GpuPowerState::Asleep, "cold at boot");
+        assert!(power.wake_cost().is_some(), "asleep → a wake is priced");
+
+        power.record_tier3_use(0.0);
+        assert_eq!(power.state(), GpuPowerState::Active);
+        assert_eq!(power.wake_cost(), None, "awake → no wake penalty");
+
+        // 16 ms later (next frame), still well inside the residency window.
+        assert_eq!(power.advance(0.016), GpuPowerState::Active);
+        // A 200 ms quiet gap clock-gates it back down.
+        assert_eq!(power.advance(0.216), GpuPowerState::Asleep);
+        assert!(power.wake_cost().is_some(), "slept again → wake re-priced");
+    }
+
+    #[test]
+    fn power_state_changes_the_routing_verdict_for_the_same_op() {
+        // Discrete GPU: a 50 mJ wake dwarfs this op's 1 mJ energy edge.
+        let mut power = GpuPowerModel::discrete_rdna3();
+        let t2 = Cost { time_s: 2e-3, energy_j: 5e-3 };
+        let t3 = Cost { time_s: 1e-3, energy_j: 4e-3 }; // raw: cheaper both axes
+
+        power.advance(0.0);
+        let mut r_asleep = Router::new(RouteMode::Battery);
+        // Asleep: the wake penalty makes Tier-3 the energy loser → stay CPU,
+        // and the GPU is never woken.
+        assert_eq!(r_asleep.decide(t2, t3, power.wake_cost()), Tier::Tier2);
+        assert_eq!(power.state(), GpuPowerState::Asleep);
+
+        // Already active (woke for other work): no wake → Tier-3 wins.
+        power.record_tier3_use(0.0);
+        let mut r_awake = Router::new(RouteMode::Battery);
+        assert_eq!(r_awake.decide(t2, t3, power.wake_cost()), Tier::Tier3);
     }
 
     #[test]

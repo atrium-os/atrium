@@ -90,7 +90,9 @@ pub use cost_model::{
     exec_cost, spirv_instruction_mix, CostMode, CostModelBackend, DeviceProfile,
     FrameLedger, OpKind, ShaderCost, Topology,
 };
-pub use router::{route, Cost, CpuProfile, RouteMode, Tier};
+pub use router::{
+    route, Cost, CpuProfile, GpuPowerModel, GpuPowerState, RouteMode, Router, Tier,
+};
 pub use tier2_backend::{
     AssembledVertices, PresentCallback, PresentedFrame, Tier2Backend,
 };
