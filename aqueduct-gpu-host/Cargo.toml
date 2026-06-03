@@ -94,6 +94,10 @@ aqueduct-gpu-client = { path = "../aqueduct-gpu-client" }
 rspirv          = "0.13"
 tempfile        = "3"
 atrium-spv-ir   = { path = "../atrium-spv-ir" }
+# Cross-tier shaded certification: the Tier-2 differential harness
+# (interpreter oracle + ShaderRunner trait + assert_shader_agrees). A
+# MoltenVkShaderRunner slots in as a fourth runner for cross-tier agreement.
+atrium-spv-tests = { path = "../atrium-spv-tests" }
 # (libc is a normal dependency now — used by the carillon transport —
 # so the perf/energy benchmarks' getrusage calls reuse it from there.)
 
