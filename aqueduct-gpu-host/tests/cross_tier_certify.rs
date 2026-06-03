@@ -63,22 +63,15 @@ fn build_constant_color_spirv(rgba: [f32; 4]) -> Vec<u8> {
 
 const W: u32 = 16;
 const H: u32 = 16;
-const COLOR: [u8; 4] = [179, 51, 128, 255];
 
-/// Tier-2: a constant-colour fragment shader fills the image.
-fn tier2_flat_color() -> Option<Vec<u8>> {
-    let compile = locate_compile_binary()?;
-    let cache = TempDir::new().ok()?;
-    let registry = Arc::new(Tier2Registry::new(LoaderConfig {
-        cache_root: cache.path().to_path_buf(),
-        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
-        compile_binary: compile,
-    }));
+/// Tier-2: a constant-colour fragment shader fills the image with `color`.
+fn tier2_flat_color(registry: &Arc<Tier2Registry>, color: [u8; 4]) -> Option<Vec<u8>> {
     let be = Tier2Backend::new(registry.clone());
     let img = ResourceId::new(IdNamespace::IcdRuntime, 0x10);
     be.image_created(img, W, H);
     let spirv = build_constant_color_spirv(
-        [COLOR[0] as f32 / 255.0, COLOR[1] as f32 / 255.0, COLOR[2] as f32 / 255.0, 1.0]);
+        [color[0] as f32 / 255.0, color[1] as f32 / 255.0,
+         color[2] as f32 / 255.0, color[3] as f32 / 255.0]);
     let sid = registry.register(&spirv).ok()?;
     let pid = ResourceId::new(IdNamespace::IcdRuntime, 0x11);
     be.bind_pipeline(pid, sid);
@@ -92,9 +85,8 @@ fn tier2_flat_color() -> Option<Vec<u8>> {
     be.read_image_pixels(img)
 }
 
-/// Tier-3: clear the image to the same colour on Metal + read it back.
-fn moltenvk_flat_color() -> Option<Vec<u8>> {
-    let be = MoltenVkBackend::new().ok()?;
+/// Tier-3: clear the image to `color` on Metal + read it back.
+fn moltenvk_flat_color(be: &MoltenVkBackend, color: [u8; 4]) -> Option<Vec<u8>> {
     let img = ResourceId::new(IdNamespace::IcdRuntime, 0x20);
     let buf = ResourceId::new(IdNamespace::IcdRuntime, 0x21);
     be.image_created(img, W, H);
@@ -102,7 +94,7 @@ fn moltenvk_flat_color() -> Option<Vec<u8>> {
     be.buffer_created(buf, (W * H * 4) as u64);
     let mut fb = FrameBuilder::new(4096);
     let mut brp = img.raw().to_le_bytes().to_vec();
-    brp.extend_from_slice(&COLOR);
+    brp.extend_from_slice(&color);
     brp.extend_from_slice(&0u32.to_le_bytes());
     fb.push(FrameOp::BeginRenderPass, &brp).unwrap();
     let mut cib = img.raw().to_le_bytes().to_vec();
@@ -119,20 +111,44 @@ fn moltenvk_flat_color() -> Option<Vec<u8>> {
     be.buffer_read_bytes(buf, 0, (W * H * 4) as u64).ok()
 }
 
+/// Sweep the convention-risk colour space: pure channels (a channel swap
+/// would show), the 0/255 extremes (clamping), an asymmetric opaque colour,
+/// and a partial-alpha colour (premultiply / alpha handling). If Tier-2 and
+/// MoltenVK agree on *all* of these, the BGRA/sRGB/alpha convention
+/// precondition holds across the range — not just at one sample.
 #[test]
-fn tier2_and_moltenvk_agree_on_a_flat_color() {
-    let (Some(px2), Some(px3)) = (tier2_flat_color(), moltenvk_flat_color()) else {
-        eprintln!("cross-tier probe skipped (compile toolchain or MoltenVK unavailable)");
-        return;
+fn tier2_and_moltenvk_agree_across_the_convention_space() {
+    let Some(compile) = locate_compile_binary() else {
+        eprintln!("cross-tier probe skipped (atrium-spv-compile unavailable)"); return;
     };
-    assert_eq!(px2.len(), px3.len(), "both render {}x{} RGBA8", W, H);
-    // tolerance 1 LSB for any rounding between the CPU rasteriser and Metal.
-    let result = compare_framebuffers(&px2, &px3, 1);
-    eprintln!(
-        "cross-tier flat-colour: tier2[0..4]={:?} moltenvk[0..4]={:?} → {:?}",
-        &px2[..4], &px3[..4], result);
-    assert_eq!(result, Certification::Certified,
-        "Tier-2 and MoltenVK must agree on a flat colour (the tier-equivalence \
-         convention precondition); got {result:?} — tier2={:?} mvk={:?}",
-        &px2[..4], &px3[..4]);
+    let Ok(mvk) = MoltenVkBackend::new() else {
+        eprintln!("cross-tier probe skipped (MoltenVK unavailable)"); return;
+    };
+    let cache = TempDir::new().unwrap();
+    let registry = Arc::new(Tier2Registry::new(LoaderConfig {
+        cache_root: cache.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: compile,
+    }));
+
+    let colors: [[u8; 4]; 7] = [
+        [179, 51, 128, 255], // asymmetric opaque — channel-swap detector
+        [255, 0, 0, 255],    // pure red
+        [0, 255, 0, 255],    // pure green
+        [0, 0, 255, 255],    // pure blue
+        [0, 0, 0, 255],      // black (low clamp)
+        [255, 255, 255, 255],// white (high clamp)
+        [128, 128, 128, 128],// partial alpha
+    ];
+    for color in colors {
+        let px2 = tier2_flat_color(&registry, color).expect("tier2 render");
+        let px3 = moltenvk_flat_color(&mvk, color).expect("moltenvk render");
+        assert_eq!(px2.len(), px3.len());
+        let result = compare_framebuffers(&px2, &px3, 1); // 1 LSB rounding slack
+        eprintln!("cross-tier {color:?}: tier2={:?} mvk={:?} → {result:?}",
+            &px2[..4], &px3[..4]);
+        assert_eq!(result, Certification::Certified,
+            "Tier-2 and MoltenVK diverge on {color:?}: tier2={:?} mvk={:?} ({result:?})",
+            &px2[..4], &px3[..4]);
+    }
 }
