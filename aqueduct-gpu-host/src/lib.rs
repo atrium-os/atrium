@@ -72,6 +72,7 @@ pub mod backend;
 pub use carillon_transport as carillon;
 pub mod certify;
 pub mod cost_model;
+pub mod frame_resources;
 pub mod router;
 pub mod listener;
 pub mod moltenvk;
@@ -91,6 +92,7 @@ pub use backend::{Backend, SoftwareBackend, StubBackend};
 pub use certify::{
     compare_framebuffers, differential_certify, Certification, CertificationRegistry,
 };
+pub use frame_resources::{frame_resources, FrameResources};
 pub use cost_model::{
     exec_cost, ir_instruction_mix, shader_cost, spirv_instruction_mix, CalibrationProfile,
     CostMode, CostModelBackend, DeviceProfile, FrameLedger, OpKind, ScanoutDomain, ShaderCost,
