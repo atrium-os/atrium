@@ -176,6 +176,83 @@ coupled" discipline applied one level down.
    migration cost is measured to amortize, routing acts by default; the
    mode signal biases the migration threshold.
 
+## Single-homed resource residency (the discrete upload win)
+
+`RoutingBackend` as built **mirrors** resource creation/upload to both
+backends — the simplest correct mechanism (correctness comes from slow
+migration, not from how resources are homed). On UMA that is free (one
+physical RAM). On a **discrete** part it is the very waste the router
+exists to eliminate: a CPU-routed surface still DMAs its textures/buffers
+to VRAM over PCIe, burning the bandwidth + energy the routing decision was
+trying to save. The fix is to home each surface's resources only on the
+tier it runs on, and to materialise them on the other tier *only* if it
+migrates there.
+
+**Mechanism: deferred materialisation.** Instead of forwarding a resource
+op to both backends, `RoutingBackend` *records* it and forwards it only to
+tiers already **live** (materialised). A tier goes live the first time a
+frame dispatches to it, at which point the recorded ops are replayed to it.
+Net effect: a tier that is never used receives **zero** uploads — the
+common always-CPU case uploads nothing to the GPU.
+
+**The load-bearing decision: how to replay on migration.** Two ways to make
+a resource present on a newly-activated tier, with opposite cost profiles:
+
+- *Retain-log* — keep the ordered op log (including upload bytes) and
+  replay it. Simple and exact, but it **pins the upload data in host
+  memory** for as long as a tier might still activate. In the always-CPU
+  case (the case we optimise for) the GPU never activates, so the log is
+  retained forever → an unbounded memory cost that scales with total
+  texture/buffer bytes. Unacceptable as-is.
+- *Readback-on-migrate* — retain only resource *identities* + metadata
+  (cheap); when a tier activates, reconstruct each resource by reading its
+  current state back from the already-live tier and uploading to the new
+  one. No upload bytes retained, but migration pays a readback (the
+  asymmetric direction on discrete) and needs readback support for every
+  resource kind.
+
+**Recommendation:** *retain-log, but drop it the moment both tiers are
+live* (then no replay can ever be needed), **and bound it** — once a tier
+is live, collapse superseded writes (keep only the latest state per
+resource, not the full history). In the always-CPU steady state only one
+tier is live, so the log is retained — but bounded to *current* resource
+state, not history, which is the irreducible cost of being able to migrate
+at all. Readback-on-migrate is the fallback if even bounded retention is
+too much memory; it trades memory for a one-time migration readback, which
+the slow-migration cadence already amortises.
+
+**Frame resource-set introspection — and why coarse granularity fails.**
+To materialise a frame's resources on its dispatch tier, the router must
+know which resources the frame touches. The frame walk already sees the
+directly-referenced ones (render-target image, pipelines, copy-dst
+buffers); indirectly-referenced ones (sampled textures, vertex/uniform
+buffers bound via separate commands) are not all visible at this layer.
+
+The tempting simplification — *whole-world-per-tier*, materialise the
+entire resource set the first time a tier is used — **does not actually
+deliver the win, because of certification.** Certifying a pipeline renders
+a probe on *both* tiers (that is how tier-equivalence is proven). Under
+whole-world materialisation, that first probe makes *both* tiers live and
+replays *everything* to the GPU — so the moment any pipeline is certified
+(i.e. the moment any surface becomes eligible to migrate), single-homing is
+gone for the whole world. The surfaces that can migrate are exactly the
+ones coarse residency fails to keep single-homed.
+
+So **per-resource residency is required, not optional.** Each resource
+tracks which tiers it is resident on; a frame (or the certification probe)
+materialises only *its* resources on the target tier. Certification uses a
+tiny synthetic probe whose resources are its own — proving a pipeline
+equivalent must not drag a surface's textures onto the GPU. This needs the
+frame's resource closure to be introspectable (the directly-referenced set
+is a start; sampled/bound resources need the bind commands tracked or the
+wire to carry the set). That introspection is the substantive work, and the
+reason this is its own effort rather than a tail increment.
+
+**Invariant:** materialisation must complete *before* the frame is
+dispatched to a tier — a draw that samples an unmaterialised texture is a
+wrong pixel, the one thing routing must never produce. So `submit_frame`
+calls `materialise(tier)` before `t{2,3}.submit_frame`.
+
 ## Transport
 
 The signals cross the **kernel ↔ userspace boundary** in both
