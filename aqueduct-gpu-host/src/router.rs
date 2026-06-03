@@ -135,6 +135,91 @@ pub fn route(t2: Cost, t3: Cost, mode: RouteMode, gpu_wake: Option<Cost>) -> Tie
     if prefer_t3 { Tier::Tier3 } else { Tier::Tier2 }
 }
 
+/// The scalar the router minimises under `mode` (lower is better): time
+/// for Perf, energy for Battery, energy·time for Balanced. This is the
+/// quantity the hysteresis band is measured against.
+pub fn score(cost: Cost, mode: RouteMode) -> f64 {
+    match mode {
+        RouteMode::Perf => cost.time_s,
+        RouteMode::Battery => cost.energy_j,
+        RouteMode::Balanced => cost.energy_j * cost.time_s,
+    }
+}
+
+/// Default hysteresis band: the alternative tier must be at least 15 %
+/// cheaper (by the mode's score) than the current tier before we switch.
+/// Wide enough to swallow analytic-model wobble and live-signal noise near
+/// the crossover; narrow enough that a decisive workload change still
+/// flips promptly.
+pub const DEFAULT_MARGIN: f64 = 0.15;
+
+/// Stateful router that adds a **hysteresis band** over the pure [`route`]
+/// decision to stop tier chatter at the crossover boundary.
+///
+/// The pure `route()` flips the instant the alternative is one picojoule
+/// cheaper — fine for a single decision, but per-frame near the crossover
+/// it thrashes (each flip pays a GPU wake/sleep + pipeline re-residency +
+/// frame-time jitter). `Router` only switches when the alternative beats
+/// the *current* tier by `margin`; inside the band it holds, so noise no
+/// longer moves it.
+///
+/// This composes with the *physical* hysteresis already in the cost: once
+/// the GPU is awake the caller passes `gpu_wake = None`, making Tier-3
+/// sticky on its own. The band covers the axes the wake penalty doesn't —
+/// Perf (pure time) and Balanced near the product crossover.
+///
+/// Orthogonal knob not built here: a **dwell time** (min frames/ms between
+/// switches) guards against a workload that genuinely oscillates across
+/// the band every frame. Add only if the margin alone proves insufficient
+/// against measured traces — don't stack damping speculatively.
+#[derive(Debug, Clone, Copy)]
+pub struct Router {
+    mode: RouteMode,
+    margin: f64,
+    current: Tier,
+}
+
+impl Router {
+    /// New router in `mode` with [`DEFAULT_MARGIN`], starting on Tier-2
+    /// (the CPU is the safe default — it's always running, no GPU wake).
+    pub fn new(mode: RouteMode) -> Self {
+        Router { mode, margin: DEFAULT_MARGIN, current: Tier::Tier2 }
+    }
+
+    /// New router with an explicit hysteresis `margin` (0.0 = no band,
+    /// behaves like the pure `route`) and starting tier.
+    pub fn with_margin(mode: RouteMode, margin: f64, start: Tier) -> Self {
+        Router { mode, margin, current: start }
+    }
+
+    /// The tier currently committed to.
+    pub fn current(&self) -> Tier {
+        self.current
+    }
+
+    /// Decide where this frame runs, applying the hysteresis band. Switch
+    /// only if the alternative's score is below `current · (1 - margin)`;
+    /// otherwise hold. `gpu_wake` (Some when the GPU is asleep) is folded
+    /// into the Tier-3 cost exactly as in [`route`].
+    pub fn decide(&mut self, t2: Cost, t3: Cost, gpu_wake: Option<Cost>) -> Tier {
+        let t3 = match gpu_wake {
+            Some(w) => t3.plus(w),
+            None => t3,
+        };
+        let s2 = score(t2, self.mode);
+        let s3 = score(t3, self.mode);
+        let (current_score, alt_score, alt) = match self.current {
+            Tier::Tier2 => (s2, s3, Tier::Tier3),
+            Tier::Tier3 => (s3, s2, Tier::Tier2),
+        };
+        // Cross the band (beat current by `margin`) to switch; else hold.
+        if alt_score < current_score * (1.0 - self.margin) {
+            self.current = alt;
+        }
+        self.current
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,5 +282,49 @@ mod tests {
         assert_eq!(route(t2, t3, RouteMode::Battery, None), Tier::Tier3);
         assert_eq!(route(t2, t3, RouteMode::Perf, None), Tier::Tier3);
         assert_eq!(route(t2, t3, RouteMode::Balanced, None), Tier::Tier3);
+    }
+
+    #[test]
+    fn hysteresis_holds_through_noise_at_the_boundary() {
+        // Two tiers a hair apart, jittering across the crossover each
+        // frame (the exact case the pure route() would thrash on).
+        let mut r = Router::new(RouteMode::Perf); // starts on Tier-2
+        // Frame costs wobble ±3% around equal — well inside the 15% band.
+        let wobble = [(1.00, 0.99), (0.99, 1.00), (1.01, 0.98), (0.98, 1.02)];
+        for (a, b) in wobble {
+            let t2 = Cost { time_s: a * 1e-3, energy_j: 1e-3 };
+            let t3 = Cost { time_s: b * 1e-3, energy_j: 1e-3 };
+            // The pure router flips on the first frame where t3 < t2…
+            // …but the band holds the stateful router on its start tier.
+            assert_eq!(r.decide(t2, t3, None), Tier::Tier2,
+                "noise inside the band must not move the committed tier");
+        }
+    }
+
+    #[test]
+    fn decisive_change_still_flips_promptly() {
+        let mut r = Router::new(RouteMode::Perf); // Tier-2
+        // A genuinely cheaper Tier-3 (3× faster) clears the band at once.
+        let t2 = Cost { time_s: 3.0e-3, energy_j: 1e-3 };
+        let t3 = Cost { time_s: 1.0e-3, energy_j: 1e-3 };
+        assert_eq!(r.decide(t2, t3, None), Tier::Tier3, "decisive win flips");
+        // And it then *stays* on Tier-3 through boundary noise (sticky).
+        let near = Cost { time_s: 1.05e-3, energy_j: 1e-3 };
+        let near3 = Cost { time_s: 1.0e-3, energy_j: 1e-3 };
+        assert_eq!(r.decide(near, near3, None), Tier::Tier3);
+        // Until Tier-2 decisively wins back (3× faster the other way).
+        let win2 = Cost { time_s: 0.3e-3, energy_j: 1e-3 };
+        let lose3 = Cost { time_s: 1.0e-3, energy_j: 1e-3 };
+        assert_eq!(r.decide(win2, lose3, None), Tier::Tier2);
+    }
+
+    #[test]
+    fn zero_margin_matches_the_pure_route() {
+        // With margin 0 the stateful router degenerates to route().
+        let mut r = Router::with_margin(RouteMode::Perf, 0.0, Tier::Tier2);
+        let t2 = Cost { time_s: 1.0e-3, energy_j: 1e-3 };
+        let t3 = Cost { time_s: 0.99e-3, energy_j: 1e-3 };
+        assert_eq!(r.decide(t2, t3, None), route(t2, t3, RouteMode::Perf, None));
+        assert_eq!(r.current(), Tier::Tier3);
     }
 }
