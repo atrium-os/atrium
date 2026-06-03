@@ -258,29 +258,61 @@ toward a budget authority only when data demands it.
 
 ## Status
 
-**Phase 1 (the local router) is built and operational; acting on the
-verdict is designed (above) and is the next implementation step.**
+**The local router is built, acting, productionised, and verified on
+hardware — observe → decide → gate → certify → dispatch all implemented
+(`aqueduct-gpu-host`). What remains is two scoped optimisations, not new
+design.**
 
-In place: P4 (compositor renders on Tier-2) + PT (cheap small-frame
-transport) + the tier-equivalence discipline + the Tier-3 MoltenVk path
-(below) + **the full observational router** (`aqueduct-gpu-host`):
-- The GPU device cost model (`CostModelBackend`, `docs/spec/
-  gpu-device-model.md`): per-op transfer + Layer-2 exec roofline, IR-based
-  shader cost, `DeviceProfile` (UMA vs discrete) — the Tier-3 cost side.
-- The router itself (`router.rs`): `tier2/tier3_exec_cost`, the per-mode
-  `route()` decision, the `Router` **hysteresis band** (no chatter), the
-  `GpuPowerModel` (D-M2 wake + residency signal), and the `FrameRouter`
-  that assembles them into a per-frame verdict.
-- Live in the daemon: `--device-profile` puts the model in the data path;
-  `--route perf|balanced|battery` scores every real frame Tier-2 vs Tier-3
-  and tallies the verdict (observational); `--calibrate` fits the model's
-  efficiency scalars online against **measured** GPU time (D-M6,
-  `VkQueryPool` timestamps on Metal). All opt-in, zero perturbation by
-  default; flows through both the Unix-socket and Carillon (VM) transports.
+The cost model (`CostModelBackend`, `docs/spec/gpu-device-model.md`):
+per-op transfer + Layer-2 exec roofline, IR-based shader cost via
+`atrium-spv-ir`, `DeviceProfile` (UMA vs discrete) + `CalibrationProfile`
+(3 measured efficiency scalars, fit online against `VkQueryPool` GPU time,
+per microarch family — not per chip), and the discrete-topology terms two
+design questions forced: an **asymmetric** migrate-to-GPU transfer cost
+(revert is ~free — re-render from the host-memory originals) and a
+**`ScanoutDomain`** present cost (CPU content reaches the dGPU's display on
+the cheap copy/DMA path, *not* a compute wake — `GpuPowerModel` models the
+expensive shader-array domain only).
 
-What remains is **acting** on the verdict per the mechanism designed above
-(per-surface assignment + slow migration), gated on per-pipeline
-tier-equivalence certification.
+The router (`router.rs`): `tier2/tier3_exec_cost`, the per-mode `route()`,
+the `Router` hysteresis band, the `GpuPowerModel` residency signal, and the
+`FrameRouter` per-frame verdict; then the *acting* layer — `SurfaceRouter`
+(EWMA-smoothed per-surface vote → slow migration at the residency
+timescale, asymmetric on discrete), the `CertificationRegistry` + gate, and
+`RoutingPolicy` (gated effective tier + single-homed readback).
+
+Acting (`routing_backend.rs` + `certify.rs`): `RoutingBackend` owns a real
+Tier-2 (`Tier2Backend`) and Tier-3 (`MoltenVk`) backend, dispatches each
+surface's frames to its assigned tier, and routes readback to the tier that
+rendered it. `differential_certify` renders a probe on both backends and
+compares — a pipeline migrates only once **certified** tier-equivalent;
+uncertified pipelines pin their surface (degrade to "stay home", never a
+wrong pixel). The verdict cost is paid only where it can pay off: pinned
+surfaces and surfaces long-settled on the CPU are dispatched without
+re-scoring (`decision_stats()` makes the overhead observable).
+
+Live in the daemon, all opt-in, both the Unix-socket and Carillon (VM)
+transports: `--device-profile` (model in the data path), `--route` (score +
+tally, observational), `--calibrate` (online fit vs measured GPU time), and
+`--backend routing` (the router *acting* over Tier2Backend + MoltenVk).
+
+**Verified on Apple M4 Max:** the tier-equivalence convention precondition
+holds empirically — Tier-2 (software) and MoltenVK render pixel-identical
+output across the convention-risk colour space (pure channels → no BGRA
+swap, 0/255 extremes → no clamping divergence, partial alpha → no
+premultiply mismatch). `tests/cross_tier_certify.rs`.
+
+**Remaining (scoped optimisations, no new design):**
+1. **Single-homed resource residency.** `RoutingBackend` currently mirrors
+   resource creation/upload to *both* backends (simplest correct mechanism;
+   correctness comes from slow migration, not homing). The optimisation is
+   lazy per-tier residency + replay-on-migration, so a CPU-routed surface
+   never uploads to VRAM — directly an energy win on discrete. Its own
+   effort (resource-residency tracking + frame resource-set introspection).
+2. **Shaded per-pipeline certification.** The flat-colour convention is
+   verified; full equivalence through interpolated varyings / `gl_FragCoord`
+   is the `atrium-spv-differential` harness's domain (Tier-2 does not yet
+   wire `FragCoord`). A rendering-correctness effort, not a router change.
 
 **Tier-3 render path — in progress.** The router only has meaning when
 there are *two* working backends to choose between. `aqueduct-gpu-host`
