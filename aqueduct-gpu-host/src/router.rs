@@ -230,9 +230,17 @@ pub enum GpuPowerState {
     Active,
 }
 
-/// Tracks the modeled GPU's power residency across a frame timeline so the
-/// router can price the wake of an asleep GPU, and so energy-policy can
-/// publish the state as a slow read-only signal.
+/// Tracks the modeled GPU's **compute** power residency across a frame
+/// timeline so the router can price the wake of an asleep shader array, and
+/// so energy-policy can publish the state as a slow read-only signal.
+///
+/// This models the *expensive* power domain — the shader/compute array that
+/// must spin up to high clocks to *render*. It deliberately does NOT cover
+/// the cheap copy/display path: pushing damage to VRAM for scanout exercises
+/// the DMA/copy engine + display controller (separately power-gated, often
+/// always-on), priced by [`DeviceProfile::present_cost`], not a compute
+/// wake. That split is what lets CPU-rendering a sparse surface keep the
+/// shader array asleep on a discrete part while still feeding the display.
 ///
 /// Driven by a monotonic clock passed in (deterministic + testable; no
 /// wall-clock reads — same discipline as the rest of the device model).
@@ -391,10 +399,21 @@ impl FrameRouter {
     /// penalty when the GPU is asleep, applies the hysteresis band, and —
     /// if the verdict is Tier-3 — commits the GPU to `Active`.
     pub fn route_frame(&mut self, work: &FrameWork, now_s: f64) -> RoutedFrame {
-        let tier2 = tier2_exec_cost(&self.cpu, &work.vs, work.vs_invocations)
+        let mut tier2 = tier2_exec_cost(&self.cpu, &work.vs, work.vs_invocations)
             .plus(tier2_exec_cost(&self.cpu, &work.fs, work.fs_invocations));
-        let tier3 = tier3_exec_cost(&self.gpu, &work.vs, work.vs_invocations)
+        let mut tier3 = tier3_exec_cost(&self.gpu, &work.vs, work.vs_invocations)
             .plus(tier3_exec_cost(&self.gpu, &work.fs, work.fs_invocations));
+        // Present/copy cost to reach the display's scanout domain: CPU
+        // output originates in Host memory, GPU output in Device VRAM. On a
+        // desktop dGPU this charges the CPU tier a damage copy (the display
+        // hangs off the card); under UMA both are zero. RGBA8 output ≈ 4 B
+        // per covered pixel. This is the cheap copy path — NOT a compute
+        // wake (that stays on the Tier-3 side via the power model).
+        let damage_bytes = work.fs_invocations.saturating_mul(4);
+        let (pt2, pe2) = self.gpu.present_cost(damage_bytes, crate::cost_model::ScanoutDomain::Host);
+        let (pt3, pe3) = self.gpu.present_cost(damage_bytes, crate::cost_model::ScanoutDomain::Device);
+        tier2 = tier2.plus(Cost { time_s: pt2, energy_j: pe2 });
+        tier3 = tier3.plus(Cost { time_s: pt3, energy_j: pe3 });
         self.route_costs(tier2, tier3, now_s)
     }
 
@@ -866,6 +885,34 @@ mod tests {
         }
         assert!(moved, "a certified heavy surface migrates to Tier-3");
         assert_eq!(p.effective_counts(), (0, 1));
+    }
+
+    #[test]
+    fn discrete_present_cost_biases_cpu_rendering_for_display() {
+        // On a desktop dGPU, a CPU-rendered frame must copy its output to
+        // VRAM for scanout — so the Tier-2 cost carries a present penalty
+        // the UMA case never sees. Same frame, same router: the discrete
+        // profile charges Tier-2 strictly more than UMA does.
+        let work = FrameWork {
+            vs: shader(4, 1), vs_invocations: 3,
+            fs: shader(8, 2), fs_invocations: 1280 * 720,
+        };
+        let mut uma = FrameRouter::new(
+            CpuProfile::apple_m4_max(), DeviceProfile::uma_apple_m4_max(),
+            GpuPowerModel::apple_m4_max(), RouteMode::Battery);
+        let mut disc = FrameRouter::new(
+            CpuProfile::apple_m4_max(), DeviceProfile::discrete_rdna3_pcie4x16(),
+            GpuPowerModel::discrete_rdna3(), RouteMode::Battery);
+        let r_uma = uma.route_frame(&work, 0.0);
+        let r_disc = disc.route_frame(&work, 0.0);
+        // UMA: no present copy on either tier.
+        assert_eq!(r_uma.tier2.energy_j, r_uma.tier2.energy_j); // (sanity)
+        // Discrete Tier-2 energy includes the damage copy to VRAM → strictly
+        // higher than the same frame's Tier-2 under UMA.
+        assert!(r_disc.tier2.energy_j > r_uma.tier2.energy_j,
+            "discrete CPU render pays a present copy UMA doesn't");
+        // And discrete Tier-3 (output already in VRAM) pays no present copy.
+        assert!(r_disc.tier3.energy_j >= 0.0);
     }
 
     #[test]

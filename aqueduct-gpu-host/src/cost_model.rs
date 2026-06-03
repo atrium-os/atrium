@@ -49,6 +49,20 @@ pub enum HostVisible {
     Full,
 }
 
+/// Where the display engine reads the scanout framebuffer from. On a
+/// desktop discrete GPU the connectors hang off the dGPU, so the final
+/// frame must reach VRAM (`Device`); on UMA / laptop-iGPU systems the panel
+/// is driven from system memory (`Host`). Only meaningful under
+/// `Topology::Discrete` — under unified memory both domains are the same
+/// physical RAM, so [`DeviceProfile::present_cost`] is zero regardless.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanoutDomain {
+    /// Display reads from host/system memory (UMA, or laptop-iGPU muxless).
+    Host,
+    /// Display reads from device VRAM (desktop dGPU with connectors on it).
+    Device,
+}
+
 /// A device cost profile. Seeded from public specs; the analytic model
 /// (§3.2 of the spec) reads these. `passthrough` = the zero-cost default.
 #[derive(Debug, Clone)]
@@ -78,6 +92,9 @@ pub struct DeviceProfile {
     pub alu_lanes: f64,
     /// Modeled GPU clock, Hz (Layer 2 execution roofline).
     pub clock_hz: f64,
+    /// Where the display scans out from (drives the present/copy cost on
+    /// discrete: CPU-rendered content must reach VRAM for display).
+    pub scanout_domain: ScanoutDomain,
 }
 
 impl DeviceProfile {
@@ -109,6 +126,7 @@ impl DeviceProfile {
             pj_per_byte_mem: 0.0,
             alu_lanes: 0.0,
             clock_hz: 0.0,
+            scanout_domain: ScanoutDomain::Host,
         }
     }
 
@@ -127,6 +145,7 @@ impl DeviceProfile {
             pj_per_byte_mem: 8.0,
             alu_lanes: 5120.0,
             clock_hz: 1.4e9,
+            scanout_domain: ScanoutDomain::Host, // UMA: display from system memory
         }
     }
 
@@ -146,7 +165,32 @@ impl DeviceProfile {
             pj_per_byte_mem: 5.0,
             alu_lanes: 12288.0,
             clock_hz: 2.5e9,
+            scanout_domain: ScanoutDomain::Device, // desktop dGPU: connectors on the card
         }
+    }
+
+    /// The per-frame **present/copy** cost to get `damage_bytes` of
+    /// rendered output from `source` into the scanout domain for display —
+    /// distinct from a compute wake. Zero when the source already matches
+    /// the scanout domain, and **always zero under unified memory** (device
+    /// and host are the same RAM). On a desktop dGPU (`scanout_domain =
+    /// Device`), CPU-rendered content (`source = Host`) charges a link copy
+    /// here — but on the *copy* power path (DMA / display engine), not the
+    /// expensive compute array (see [`GpuPowerModel`]). That is why
+    /// CPU-rendering a sparse surface can still win on a discrete part: you
+    /// pay a small damage DMA, not a shader-array wake.
+    pub fn present_cost(&self, damage_bytes: u64, source: ScanoutDomain) -> (f64, f64) {
+        if self.passthrough
+            || self.topology == Topology::Unified
+            || source == self.scanout_domain
+        {
+            return (0.0, 0.0);
+        }
+        let b = damage_bytes as f64;
+        // A link DMA into (or out of) VRAM for scanout: cheap copy path.
+        let time = self.host_link_lat + b / self.host_link_bw.max(1.0);
+        let energy = b * self.pj_per_byte_link;
+        (time, energy)
     }
 
     /// Look up a built-in profile by name; `None` if unknown.
@@ -1160,6 +1204,24 @@ mod tests {
         // Memory: plain load = 1 mem; structural = neither.
         assert_eq!(classify_ir_op(&Op::Load(v())), (0, 1));
         assert_eq!(classify_ir_op(&Op::Return), (0, 0), "control flow → other");
+    }
+
+    #[test]
+    fn present_cost_is_zero_on_uma_and_a_copy_on_discrete() {
+        let uma = DeviceProfile::uma_apple_m4_max();
+        // UMA: display reads system memory — no present copy, either source.
+        assert_eq!(uma.present_cost(1 << 20, ScanoutDomain::Host), (0.0, 0.0));
+        assert_eq!(uma.present_cost(1 << 20, ScanoutDomain::Device), (0.0, 0.0));
+
+        let disc = DeviceProfile::discrete_rdna3_pcie4x16(); // scanout = Device
+        // GPU output already in VRAM → no copy.
+        assert_eq!(disc.present_cost(1 << 20, ScanoutDomain::Device), (0.0, 0.0));
+        // CPU output in host memory → a link DMA to VRAM for scanout.
+        let (t, e) = disc.present_cost(1 << 20, ScanoutDomain::Host);
+        assert!(t > 0.0 && e > 0.0, "desktop dGPU: CPU content copies to VRAM for display");
+        // …and it scales with damage size (cheap copy path, link bandwidth).
+        let (t2, _) = disc.present_cost(2 << 20, ScanoutDomain::Host);
+        assert!(t2 > t);
     }
 
     #[test]

@@ -90,7 +90,8 @@ pub use backend::{Backend, SoftwareBackend, StubBackend};
 pub use certify::{compare_framebuffers, Certification, CertificationRegistry};
 pub use cost_model::{
     exec_cost, ir_instruction_mix, shader_cost, spirv_instruction_mix, CalibrationProfile,
-    CostMode, CostModelBackend, DeviceProfile, FrameLedger, OpKind, ShaderCost, Topology,
+    CostMode, CostModelBackend, DeviceProfile, FrameLedger, OpKind, ScanoutDomain, ShaderCost,
+    Topology,
 };
 pub use router::{
     route, Cost, CpuProfile, FrameRouter, FrameWork, GpuPowerModel, GpuPowerState,
