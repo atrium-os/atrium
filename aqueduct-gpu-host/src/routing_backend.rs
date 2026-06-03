@@ -149,8 +149,8 @@ impl RoutingBackend {
             let fr = crate::frame_resources::frame_resources(probe_frame);
             let mut res = self.residency.lock().unwrap();
             if fr.complete {
-                let ids: Vec<u32> = fr.images.iter().chain(&fr.pipelines).chain(&fr.buffers)
-                    .copied().chain(std::iter::once(readback_buf.raw())).collect();
+                let ids: Vec<u32> =
+                    fr.all_ids().chain(std::iter::once(readback_buf.raw())).collect();
                 res.materialize(ids.iter().copied(), Tier::Tier2, &*self.t2);
                 res.materialize(ids, Tier::Tier3, &*self.t3);
             } else {
@@ -420,8 +420,7 @@ impl Backend for RoutingBackend {
             let fr = crate::frame_resources::frame_resources(frame_buf);
             let mut res = self.residency.lock().unwrap();
             if fr.complete {
-                let ids = fr.images.iter().chain(&fr.pipelines).chain(&fr.buffers).copied();
-                res.materialize(ids, effective, be);
+                res.materialize(fr.all_ids(), effective, be);
             } else {
                 res.materialize_all(effective, be);
             }
