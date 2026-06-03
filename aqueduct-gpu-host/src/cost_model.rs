@@ -444,18 +444,121 @@ use atrium_spv_ir::Op;
 /// memory)`: compute = flops / (alu_lanes · clock · 2 [FMA]); memory =
 /// bytes_touched / mem_bw. A vec4 mem op ≈ 16 B. Passthrough → zero.
 pub fn exec_cost(profile: &DeviceProfile, mix: &ShaderCost, invocations: u64) -> (f64, f64) {
+    let (compute_t, mem_t, flops, bytes) = roofline_branches(profile, mix, invocations);
+    // flops/bytes are zero for passthrough/empty → energy 0 there.
+    let energy = bytes * profile.pj_per_byte_mem + flops * 0.5;
+    (compute_t.max(mem_t), energy)
+}
+
+/// The two roofline branch times + the work totals, shared by the ideal
+/// [`exec_cost`] and the calibrated [`CalibrationProfile::exec_time_s`].
+/// `(compute_t, mem_t, flops, bytes)`; all zero for passthrough / empty.
+fn roofline_branches(
+    profile: &DeviceProfile, mix: &ShaderCost, invocations: u64,
+) -> (f64, f64, f64, f64) {
     if profile.passthrough || invocations == 0 || profile.alu_lanes == 0.0 {
-        return (0.0, 0.0);
+        return (0.0, 0.0, 0.0, 0.0);
     }
     let inv = invocations as f64;
     let flops = mix.alu_ops as f64 * inv; // ~1 flop per ALU op
     let bytes = mix.mem_ops as f64 * 16.0 * inv; // vec4-ish granularity
     let compute_t = flops / (profile.alu_lanes * profile.clock_hz * 2.0);
     let mem_t = bytes / profile.mem_bw;
-    let time = compute_t.max(mem_t);
-    // Energy: memory traffic + a small per-flop ALU term (~0.5 pJ/flop).
-    let energy = bytes * profile.pj_per_byte_mem + flops * 0.5;
-    (time, energy)
+    (compute_t, mem_t, flops, bytes)
+}
+
+/// Per-device-*family* efficiency correction — the only genuinely
+/// measured-per-device part of the cost model (see the calibration design).
+///
+/// [`DeviceProfile`] holds datasheet specs (no hardware needed);
+/// [`exec_cost`] is the *ideal* roofline. Real GPUs reach only a fraction
+/// of peak (occupancy, scheduling) and pay a fixed per-submit launch cost.
+/// This profile captures that gap in **three scalars**, fit from measured
+/// GPU time (D-M6) when the hardware exists. It is *optional*: the
+/// [`Self::prior`] default is usable uncalibrated — the router only needs
+/// the Tier-2↔Tier-3 crossover roughly right, and the hysteresis band plus
+/// the orders-of-magnitude CPU/GPU gap absorb the residual error.
+///
+/// Calibrate **once per microarchitecture family** (an M4 Max and M4 Pro
+/// share one; all RDNA3 share one), not per chip — the spec constants carry
+/// the per-chip differences. For devices you'll never physically have
+/// (virtual Tier-3), transfer a same-class device's profile.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CalibrationProfile {
+    /// Fraction of peak FLOP/s actually reached on compute-bound work, (0,1].
+    pub compute_efficiency: f64,
+    /// Fraction of peak bandwidth reached on memory-bound work, (0,1].
+    pub bandwidth_efficiency: f64,
+    /// Fixed per-submit overhead (command-buffer build + launch), seconds.
+    pub launch_overhead_s: f64,
+}
+
+impl CalibrationProfile {
+    /// The uncalibrated prior — usable before any measurement. Mid-range
+    /// efficiencies + a typical GPU submit/launch latency. Transferable as
+    /// a starting point to any modern tiled/wavefront GPU.
+    pub fn prior() -> Self {
+        CalibrationProfile {
+            compute_efficiency: 0.5,
+            bandwidth_efficiency: 0.7,
+            launch_overhead_s: 30e-6,
+        }
+    }
+
+    /// Calibrated execution time: the ideal roofline branches stretched by
+    /// their (sub-unity) efficiencies, plus the fixed launch overhead. With
+    /// the [`Self::prior`]'s ≤1 efficiencies this is always ≥ the ideal
+    /// [`exec_cost`] time.
+    pub fn exec_time_s(
+        &self, profile: &DeviceProfile, mix: &ShaderCost, invocations: u64,
+    ) -> f64 {
+        let (ct, mt, _, _) = roofline_branches(profile, mix, invocations);
+        if ct == 0.0 && mt == 0.0 {
+            return 0.0;
+        }
+        let real = (ct / self.compute_efficiency).max(mt / self.bandwidth_efficiency);
+        real + self.launch_overhead_s
+    }
+
+    /// Fold one measured frame into the fit: classify the frame as compute-
+    /// or memory-bound from its ideal branches, then EWMA-update that
+    /// branch's efficiency toward `ideal_branch_time / measured_work_time`
+    /// (measured minus the fixed launch overhead). `alpha` ∈ (0,1] is the
+    /// update weight (smaller = smoother). No-op for empty/zero frames.
+    pub fn observe(
+        &mut self, profile: &DeviceProfile, mix: &ShaderCost, invocations: u64,
+        measured_s: f64, alpha: f64,
+    ) {
+        let (ct, mt, _, _) = roofline_branches(profile, mix, invocations);
+        self.observe_branches(ct, mt, measured_s, alpha);
+    }
+
+    /// As [`Self::observe`] but from pre-aggregated ideal branch times — for
+    /// a multi-draw frame whose per-draw `compute_t`/`mem_t` were summed
+    /// (summing the per-draw `max` would lose the compute-vs-memory split
+    /// the fit needs).
+    pub fn observe_branches(
+        &mut self, compute_t: f64, mem_t: f64, measured_s: f64, alpha: f64,
+    ) {
+        let ideal = compute_t.max(mem_t);
+        if ideal <= 0.0 || measured_s <= 0.0 {
+            return;
+        }
+        // Time the GPU actually spent on *work* (strip the fixed overhead).
+        let work = (measured_s - self.launch_overhead_s).max(ideal * 0.01);
+        if compute_t >= mem_t {
+            let eff = (compute_t / work).clamp(0.01, 1.0);
+            self.compute_efficiency = ewma(self.compute_efficiency, eff, alpha);
+        } else {
+            let eff = (mem_t / work).clamp(0.01, 1.0);
+            self.bandwidth_efficiency = ewma(self.bandwidth_efficiency, eff, alpha);
+        }
+    }
+}
+
+/// Exponentially-weighted moving average update.
+fn ewma(prev: f64, sample: f64, alpha: f64) -> f64 {
+    prev * (1.0 - alpha) + sample * alpha
 }
 
 /// A [`Backend`] decorator that charges modeled device cost per op while
@@ -479,6 +582,10 @@ pub struct CostModelBackend<B: Backend> {
     router: Option<Mutex<crate::router::FrameRouter>>,
     /// (tier2_count, tier3_count) routing verdicts so far.
     route_tally: Mutex<(u64, u64)>,
+    /// Optional online calibration: when set, each frame's modeled cost is
+    /// compared against the inner backend's measured GPU time (D-M6) and
+    /// the efficiency scalars are EWMA-fit. Closes the calibration loop.
+    calibration: Option<Mutex<CalibrationProfile>>,
 }
 
 impl<B: Backend> CostModelBackend<B> {
@@ -494,7 +601,22 @@ impl<B: Backend> CostModelBackend<B> {
             frames: std::sync::atomic::AtomicU64::new(0),
             router: None,
             route_tally: Mutex::new((0, 0)),
+            calibration: None,
         }
+    }
+
+    /// Enable online calibration starting from `start` (typically
+    /// [`CalibrationProfile::prior`]). Each submitted frame whose inner
+    /// backend reports a measured GPU time (D-M6) folds into the fit via
+    /// [`CalibrationProfile::observe`].
+    pub fn with_calibration(mut self, start: CalibrationProfile) -> Self {
+        self.calibration = Some(Mutex::new(start));
+        self
+    }
+
+    /// Snapshot the current calibration profile, if enabled.
+    pub fn calibration(&self) -> Option<CalibrationProfile> {
+        self.calibration.as_ref().map(|c| *c.lock().unwrap())
     }
 
     /// Enable live Tier-2↔Tier-3 routing observation: each submitted frame
@@ -686,6 +808,12 @@ impl<B: Backend> Backend for CostModelBackend<B> {
             self.router.as_ref().map(|r| r.lock().unwrap().cpu());
         let mut t2 = crate::router::Cost::default();
         let mut t3 = crate::router::Cost::default();
+        // Calibration: sum the ideal roofline branches across draws so the
+        // whole-frame modeled cost can be classified compute- vs memory-
+        // bound against the measured GPU time.
+        let calibrating = self.calibration.is_some();
+        let mut cal_ct = 0.0;
+        let mut cal_mt = 0.0;
         let mut cur_dims: Option<(u32, u32)> = None;
         let mut cur_mix: Option<(ShaderCost, ShaderCost)> = None;
         let le4 = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
@@ -713,6 +841,19 @@ impl<B: Backend> Backend for CostModelBackend<B> {
                             time += t2e;
                             energy += e2;
                             bytes += fs.mem_ops as u64 * px * 16;
+                        }
+                        // Calibration branch totals (ideal roofline).
+                        if calibrating {
+                            let (vct, vmt, _, _) =
+                                roofline_branches(&self.profile, &vs, vs_inv);
+                            cal_ct += vct;
+                            cal_mt += vmt;
+                            if let Some(px) = pixels {
+                                let (fct, fmt, _, _) =
+                                    roofline_branches(&self.profile, &fs, px);
+                                cal_ct += fct;
+                                cal_mt += fmt;
+                            }
                         }
                         // Routing costs (joules): VS over vertices + FS over
                         // pixels, on each tier.
@@ -760,8 +901,17 @@ impl<B: Backend> Backend for CostModelBackend<B> {
                 l.time_for(OpKind::Exec) * 1e3, l.total_energy_j() * 1e3, rt2, rt3,
             );
         }
-        self.inner.submit_frame(fence, timeline, frame_buf)
+        let ok = self.inner.submit_frame(fence, timeline, frame_buf);
+        // Close the calibration loop: fold this frame's measured GPU time
+        // (D-M6, from the inner backend) into the efficiency fit.
+        if let Some(cal) = &self.calibration {
+            if let Some(measured) = self.inner.measured_gpu_time_s() {
+                cal.lock().unwrap().observe_branches(cal_ct, cal_mt, measured, 0.2);
+            }
+        }
+        ok
     }
+    fn measured_gpu_time_s(&self) -> Option<f64> { self.inner.measured_gpu_time_s() }
 }
 
 #[cfg(test)]
@@ -942,6 +1092,55 @@ mod tests {
         // Memory: plain load = 1 mem; structural = neither.
         assert_eq!(classify_ir_op(&Op::Load(v())), (0, 1));
         assert_eq!(classify_ir_op(&Op::Return), (0, 0), "control flow → other");
+    }
+
+    #[test]
+    fn calibration_prior_is_usable_and_pessimistic() {
+        // Uncalibrated, the calibrated time is ≥ the ideal roofline (sub-
+        // unity efficiencies) and includes the launch overhead.
+        let prof = DeviceProfile::uma_apple_m4_max();
+        let mix = ShaderCost { alu_ops: 50, mem_ops: 4, other_ops: 0 };
+        let cal = CalibrationProfile::prior();
+        let (ideal, _) = exec_cost(&prof, &mix, 1_000_000);
+        let real = cal.exec_time_s(&prof, &mix, 1_000_000);
+        assert!(real > ideal, "real ({real}) exceeds the ideal roofline ({ideal})");
+        assert!(real - ideal >= cal.launch_overhead_s * 0.99, "launch overhead included");
+    }
+
+    #[test]
+    fn calibration_fit_converges_toward_measured() {
+        // A compute-bound shader; feed a measured time slower than ideal and
+        // watch compute_efficiency fall toward the implied fraction.
+        let prof = DeviceProfile::uma_apple_m4_max();
+        let mix = ShaderCost { alu_ops: 100, mem_ops: 0, other_ops: 0 }; // pure compute
+        let (ideal, _) = exec_cost(&prof, &mix, 2_000_000);
+        let mut cal = CalibrationProfile::prior();
+        // The real GPU took 2× the ideal *work* time plus the fixed launch
+        // overhead → the implied compute efficiency is exactly 0.5.
+        let measured = ideal * 2.0 + cal.launch_overhead_s;
+        for _ in 0..50 {
+            cal.observe(&prof, &mix, 2_000_000, measured, 0.3);
+        }
+        assert!((cal.compute_efficiency - 0.5).abs() < 0.05,
+            "compute_efficiency converged to ~0.5, got {}", cal.compute_efficiency);
+        // The memory branch was never exercised → untouched.
+        assert_eq!(cal.bandwidth_efficiency, CalibrationProfile::prior().bandwidth_efficiency);
+        // And the calibrated time now ≈ the measured time.
+        let real = cal.exec_time_s(&prof, &mix, 2_000_000);
+        assert!((real - measured).abs() / measured < 0.05,
+            "calibrated time ({real}) tracks measured ({measured})");
+    }
+
+    #[test]
+    fn calibration_observe_ignores_degenerate_frames() {
+        let prof = DeviceProfile::uma_apple_m4_max();
+        let mix = ShaderCost { alu_ops: 10, mem_ops: 2, other_ops: 0 };
+        let mut cal = CalibrationProfile::prior();
+        let before = cal;
+        cal.observe(&prof, &mix, 0, 1e-3, 0.3);      // zero invocations
+        cal.observe(&prof, &mix, 1000, 0.0, 0.3);    // zero measured
+        cal.observe(&DeviceProfile::passthrough(), &mix, 1000, 1e-3, 0.3); // no model
+        assert_eq!(cal, before, "degenerate observations are no-ops");
     }
 
     #[test]

@@ -677,6 +677,13 @@ impl Backend for MoltenVkBackend {
             Err(e) => { log::warn!("MoltenVk submit_frame: {e:?}"); true }
         }
     }
+
+    fn measured_gpu_time_s(&self) -> Option<f64> {
+        match self.last_gpu_ns.load(Ordering::Relaxed) {
+            0 => None,
+            ns => Some(ns as f64 * 1e-9),
+        }
+    }
 }
 
 impl MoltenVkBackend {

@@ -222,6 +222,13 @@ pub trait Backend: Send + Sync {
         frame_buf: &[u8],
     ) -> bool;
 
+    /// Measured GPU exec time of the most recently submitted frame, in
+    /// seconds, if the backend can observe real hardware timing. Default
+    /// `None` (CPU / stub backends, or no timestamp support). The tier-3
+    /// MoltenVK backend returns real `VkQueryPool` timestamps — the
+    /// ground truth the device cost model calibrates against (D-M6).
+    fn measured_gpu_time_s(&self) -> Option<f64> { None }
+
     /// Present a previously-rendered image to a Fresco surface.
     /// Default impl: count the present + return; backends that
     /// route to a compositor override this. The `surface_id` is
