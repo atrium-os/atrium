@@ -1,0 +1,14 @@
+[package]
+name        = "carillon-transport"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "Carillon doorbell-driven GPU VM transport core: shared-memory control page + SPSC rings + byte-stream bridge + pumps + the ivshmem-server host attach. Pure (std + libc) so it is shared verbatim by the macOS host daemon (aqueduct-gpu-host) and the FreeBSD guest pump. See docs/spec/carillon.md."
+
+[lib]
+name = "carillon_transport"
+path = "src/lib.rs"
+
+[dependencies]
+libc = "0.2"

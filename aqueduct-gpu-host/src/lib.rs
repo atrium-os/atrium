@@ -66,8 +66,10 @@
 #![feature(portable_simd)]
 
 pub mod backend;
+/// Carillon doorbell-driven GPU VM transport core, re-exported from the
+/// pure `carillon-transport` crate (shared with the FreeBSD guest pump).
 #[cfg(unix)]
-pub mod carillon;
+pub use carillon_transport as carillon;
 pub mod cost_model;
 pub mod listener;
 pub mod moltenvk;
@@ -95,7 +97,7 @@ pub use tier2_registry::{
 };
 pub use moltenvk::{MoltenVkBackend, MoltenVkError};
 #[cfg(unix)]
-pub use carillon::{
+pub use carillon_transport::{
     serve_ivshmem, CompDesc, Doorbell, GuestRing, Host as CarillonHost,
     IvshmemServer, Region as CarillonRegion, ShutdownHandle, SubDesc,
 };

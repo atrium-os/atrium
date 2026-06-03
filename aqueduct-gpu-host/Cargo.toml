@@ -75,6 +75,11 @@ atrium-spv-runtime = { path = "../atrium-spv-runtime" }
 # fresco/ivshmem_server.rs reference. See docs/spec/carillon.md.
 libc           = "0.2"
 
+# Carillon transport core (shared-mem rings + byte-stream bridge + pumps +
+# ivshmem-server host attach). Pure crate, also used by the FreeBSD guest
+# pump; the host re-exports it as `aqueduct_gpu_host::carillon`.
+carillon-transport = { path = "../carillon-transport" }
+
 
 [dev-dependencies]
 aqueduct-gpu-client = { path = "../aqueduct-gpu-client" }
