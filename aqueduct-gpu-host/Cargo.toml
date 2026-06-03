@@ -68,6 +68,12 @@ atrium-spv-loader = { path = "../atrium-spv-loader" }
 # Storage-image runtime helpers + descriptor-table builders,
 # used by the compute dispatcher to wire OpImageRead/Write.
 atrium-spv-runtime = { path = "../atrium-spv-runtime" }
+# SPIR-V → SSA IR (our own frontend + IR). The device model walks the
+# recovered IR for a far more accurate ShaderCost than the raw opcode
+# histogram (per-op cost weights: a sqrt/divide/image-sample is not "+1
+# like an add"). Charter-clean — our stack, used on every tier.
+atrium-spv-frontend = { path = "../atrium-spv-frontend" }
+atrium-spv-ir = { path = "../atrium-spv-ir" }
 
 # Carillon transport (T0+): the host endpoint maps the shared-memory
 # region (mmap), drives the pipe-backed doorbell (pipe/read/write), and

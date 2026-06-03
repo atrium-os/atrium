@@ -332,6 +332,100 @@ pub fn spirv_instruction_mix(spirv: &[u8]) -> ShaderCost {
     sc
 }
 
+/// Classify an IR op into `(alu_weight, mem_weight)` — *cost-weighted*,
+/// not a flat +1. This is the payoff of walking our own `atrium-spv-ir`
+/// instead of the SPIR-V opcode histogram: a typed enum lets us price each
+/// op by its real micro-architectural cost. A divide / sqrt is several
+/// ALU-cycles; a matrix·vector is a fan of mul-adds; an image sample pays
+/// a filtered fetch worth several memory ops. Anything cheap or
+/// structural classifies as `(0, 0)` → `other_ops`. Catch-all keeps us
+/// robust if `atrium-spv-ir` grows new ops (they fall to `other`, exactly
+/// as the histogram's default did).
+fn classify_ir_op(op: &Op) -> (u32, u32) {
+    use Op::*;
+    match op {
+        // Cheap scalar/vector arithmetic, bitwise, shifts, compares,
+        // conversions, shuffles, select, derivatives — ~1 ALU op.
+        IAdd(..) | ISub(..) | IMul(..) | INeg(..) | FAdd(..) | FSub(..)
+        | FMul(..) | FNeg(..) | BitAnd(..) | BitOr(..) | BitXor(..)
+        | BitNot(..) | Shl(..) | LShr(..) | AShr(..) | Clz(..) | Rbit(..)
+        | IEq(..) | INe(..) | ULt(..) | ULe(..) | UGt(..) | UGe(..)
+        | SLt(..) | SLe(..) | SGt(..) | SGe(..) | FOrdEq(..) | FOrdNe(..)
+        | FOrdLt(..) | FOrdLe(..) | FOrdGt(..) | FOrdGe(..) | FUnordEq(..)
+        | FUnordNe(..) | FUnordLt(..) | FUnordLe(..) | FUnordGt(..)
+        | FUnordGe(..) | FFloor(..) | FCeil(..) | FTrunc(..) | FAbs(..)
+        | FMin(..) | FMax(..) | ConvertSToF(..) | ConvertFToS(..)
+        | ConvertUToF(..) | ConvertFToU(..) | SConvert(..) | UConvert(..)
+        | FConvert(..) | Bitcast(..) | VectorShuffle { .. }
+        | VectorExtract { .. } | VectorInsert { .. } | Select { .. }
+        | PackHalf2x16(..) | UnpackHalf2x16(..) => (1, 0),
+        // Divide / modulo / sqrt — multi-cycle ALU (~4×).
+        UDiv(..) | SDiv(..) | UMod(..) | SMod(..) | FDiv(..) | FRem(..)
+        | FSqrt(..) => (4, 0),
+        // Dot ≈ width mul-adds; matrix·vector ≈ a fan of them.
+        Dot(..) => (3, 0),
+        MatrixTimesVector { .. } => (12, 0),
+        // Fragment derivatives are cross-lane quad ops (~2×).
+        DPdx(..) | DPdy(..) | Fwidth(..) | Derivative { .. } => (2, 0),
+        // Plain memory traffic — ~1 mem op.
+        Load(..) | LoadBuiltin(..) | Store { .. } | AccessChain { .. }
+        | PtrOffsetDynamic { .. } => (0, 1),
+        // Atomics are read-modify-write — pricier (~2×).
+        AtomicLoad(..) | AtomicStore { .. } | AtomicIAdd { .. }
+        | AtomicAnd { .. } | AtomicOr { .. } | AtomicXor { .. }
+        | AtomicCompareExchange { .. } | AtomicSMin { .. }
+        | AtomicSMax { .. } | AtomicUMin { .. } | AtomicUMax { .. }
+        | AtomicExchange { .. } => (0, 2),
+        // Sampled / fetched / stored image access — a filtered texel
+        // fetch is worth several memory ops (~4×).
+        ImageSampleImplicitLod { .. } | ImageSampleExplicitLod { .. }
+        | ImageSampleDref { .. } | ImageFetch { .. } | ImageRead { .. }
+        | ImageWrite { .. } | ImageGather { .. } | ImageReadLod { .. }
+        | ImageWriteLod { .. } => (0, 4),
+        // Constants, control flow, phi, barriers, handle plumbing,
+        // size queries — structural, no flops/bytes charged.
+        _ => (0, 0),
+    }
+}
+
+/// Extract a cost-weighted [`ShaderCost`] by walking our own recovered IR
+/// (`atrium-spv-ir`). More accurate than [`spirv_instruction_mix`] — see
+/// [`classify_ir_op`]. Sums static instruction cost across every block of
+/// every function (loop trip counts aren't statically known, same as the
+/// histogram).
+pub fn ir_instruction_mix(module: &atrium_spv_ir::Module) -> ShaderCost {
+    let mut sc = ShaderCost::default();
+    for func in &module.functions {
+        for block in func.blocks.values() {
+            for inst in &block.insts {
+                let (alu, mem) = classify_ir_op(&inst.op);
+                if alu == 0 && mem == 0 {
+                    sc.other_ops += 1;
+                } else {
+                    sc.alu_ops += alu;
+                    sc.mem_ops += mem;
+                }
+            }
+        }
+    }
+    sc
+}
+
+/// The shader cost the model uses: prefer the cost-weighted IR walk
+/// (our `atrium-spv-frontend` → `atrium-spv-ir`), falling back to the
+/// robust opcode histogram if the frontend can't yet lower this module
+/// (it's phase-staged; the histogram never fails). Best-effort accuracy
+/// with a guaranteed floor.
+pub fn shader_cost(spirv: &[u8]) -> ShaderCost {
+    match atrium_spv_frontend::translate(spirv) {
+        Ok(module) => ir_instruction_mix(&module),
+        Err(_) => spirv_instruction_mix(spirv),
+    }
+}
+
+/// Bring `Op` into scope for [`classify_ir_op`].
+use atrium_spv_ir::Op;
+
 /// Layer-2 execution roofline (§4 of the spec): modeled `(time_s,
 /// energy_j)` for running a shader of `mix` over `invocations` (pixels for
 /// a fragment shader, vertices for a vertex shader). `t = max(compute,
@@ -456,7 +550,7 @@ impl<B: Backend> Backend for CostModelBackend<B> {
     fn pipeline_created(&self, id: ResourceId, vs: &[u8], fs: &[u8]) {
         self.pipelines.lock().unwrap().insert(
             id.raw(),
-            (spirv_instruction_mix(vs), spirv_instruction_mix(fs)),
+            (shader_cost(vs), shader_cost(fs)),
         );
         self.inner.pipeline_created(id, vs, fs)
     }
@@ -691,6 +785,34 @@ mod tests {
         assert_eq!(mix.other_ops, 1, "Return");
         // Non-SPIR-V input → empty mix.
         assert_eq!(spirv_instruction_mix(&[0xAB; 64]), ShaderCost::default());
+    }
+
+    #[test]
+    fn ir_classifier_weights_ops_by_real_cost() {
+        use atrium_spv_ir::{Op, Type, Value, ValueId};
+        let v = || Value { id: ValueId(0), ty: Type::F32 };
+        // Cheap arithmetic = 1; divide/sqrt = 4; dot = 3; derivative = 2.
+        assert_eq!(classify_ir_op(&Op::FAdd(v(), v())), (1, 0));
+        assert_eq!(classify_ir_op(&Op::FDiv(v(), v())), (4, 0), "divide is multi-cycle");
+        assert_eq!(classify_ir_op(&Op::FSqrt(v())), (4, 0), "sqrt is multi-cycle");
+        assert_eq!(classify_ir_op(&Op::Dot(v(), v())), (3, 0), "dot ≈ a few mul-adds");
+        assert_eq!(classify_ir_op(&Op::DPdx(v())), (2, 0), "cross-lane quad op");
+        // Memory: plain load = 1 mem; structural = neither.
+        assert_eq!(classify_ir_op(&Op::Load(v())), (0, 1));
+        assert_eq!(classify_ir_op(&Op::Return), (0, 0), "control flow → other");
+    }
+
+    #[test]
+    fn shader_cost_handles_a_real_fixture() {
+        // A real compiled fragment shader from the atrium-core bundle.
+        // Whichever path runs (IR walk if the frontend lowers it, else the
+        // histogram floor), a real shader yields a non-empty mix.
+        const FRAG: &[u8] =
+            include_bytes!("../../bundles/atrium-core/pipelines/pipe_rectangle.frag.spv");
+        let mix = shader_cost(FRAG);
+        assert!(mix.alu_ops + mix.mem_ops > 0, "a real shader does real work");
+        // Non-SPIR-V input degrades to the empty mix, never panics.
+        assert_eq!(shader_cost(&[0xAB; 64]), ShaderCost::default());
     }
 
     #[test]
