@@ -359,6 +359,10 @@ pub struct CostModelBackend<B: Backend> {
     profile: DeviceProfile,
     mode: CostMode,
     ledger: Mutex<FrameLedger>,
+    /// image raw-id → (width, height), for FS-invocation estimates.
+    images: Mutex<std::collections::HashMap<u32, (u32, u32)>>,
+    /// pipeline raw-id → (vs_mix, fs_mix), for the Layer-2 exec roofline.
+    pipelines: Mutex<std::collections::HashMap<u32, (ShaderCost, ShaderCost)>>,
 }
 
 impl<B: Backend> CostModelBackend<B> {
@@ -369,6 +373,8 @@ impl<B: Backend> CostModelBackend<B> {
             profile,
             mode: CostMode::Accounting,
             ledger: Mutex::new(FrameLedger::default()),
+            images: Mutex::new(std::collections::HashMap::new()),
+            pipelines: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -415,9 +421,11 @@ impl<B: Backend> Backend for CostModelBackend<B> {
         self.inner.allocate_memory(size, usage)
     }
     fn image_created(&self, id: ResourceId, w: u32, h: u32) {
+        self.images.lock().unwrap().insert(id.raw(), (w, h));
         self.inner.image_created(id, w, h)
     }
     fn image_created_layered(&self, id: ResourceId, w: u32, h: u32, layers: u32) {
+        self.images.lock().unwrap().insert(id.raw(), (w, h));
         self.inner.image_created_layered(id, w, h, layers)
     }
     fn set_image_format(&self, id: ResourceId, fmt: u32) {
@@ -446,6 +454,10 @@ impl<B: Backend> Backend for CostModelBackend<B> {
     }
     fn sampler_destroyed(&self, id: ResourceId) { self.inner.sampler_destroyed(id) }
     fn pipeline_created(&self, id: ResourceId, vs: &[u8], fs: &[u8]) {
+        self.pipelines.lock().unwrap().insert(
+            id.raw(),
+            (spirv_instruction_mix(vs), spirv_instruction_mix(fs)),
+        );
         self.inner.pipeline_created(id, vs, fs)
     }
     fn present(&self, id: ResourceId, surface: u64, frame: u64) {
@@ -519,7 +531,47 @@ impl<B: Backend> Backend for CostModelBackend<B> {
         self.inner.buffer_read_bytes(id, offset, size)
     }
     fn submit_frame(&self, fence: ResourceId, timeline: u64, frame_buf: &[u8]) -> bool {
-        self.charge(OpKind::Exec, frame_buf.len() as u64);
+        // Layer-2 exec roofline: walk the FrameOp stream, charging each
+        // Draw for its bound pipeline's VS (over vertex·instance count) +
+        // FS (over the render-target pixel count, a full-coverage proxy).
+        let mut time = 0.0;
+        let mut energy = 0.0;
+        let mut bytes = 0u64;
+        let mut cur_dims: Option<(u32, u32)> = None;
+        let mut cur_mix: Option<(ShaderCost, ShaderCost)> = None;
+        let le4 = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        let mut dec = aqueduct_gpu::frame::FrameDecoder::new(frame_buf);
+        while let Ok(Some((op, body))) = dec.next() {
+            match op {
+                aqueduct_gpu::opcodes::FrameOp::BeginRenderPass if body.len() >= 4 => {
+                    cur_dims = self.images.lock().unwrap().get(&le4(body)).copied();
+                }
+                aqueduct_gpu::opcodes::FrameOp::BindPipeline if body.len() >= 4 => {
+                    cur_mix = self.pipelines.lock().unwrap().get(&le4(body)).copied();
+                }
+                aqueduct_gpu::opcodes::FrameOp::Draw if body.len() >= 8 => {
+                    if let Some((vs, fs)) = cur_mix {
+                        let verts = le4(&body[0..4]) as u64;
+                        let insts = (le4(&body[4..8]) as u64).max(1);
+                        let (t, e) = exec_cost(&self.profile, &vs, verts * insts);
+                        time += t;
+                        energy += e;
+                        bytes += vs.mem_ops as u64 * verts * insts * 16;
+                        if let Some((w, h)) = cur_dims {
+                            let pixels = w as u64 * h as u64;
+                            let (t2, e2) = exec_cost(&self.profile, &fs, pixels);
+                            time += t2;
+                            energy += e2;
+                            bytes += fs.mem_ops as u64 * pixels * 16;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.ledger.lock().unwrap().ops.push(OpCost {
+            kind: OpKind::Exec, bytes, time_s: time, energy_j: energy,
+        });
         self.inner.submit_frame(fence, timeline, frame_buf)
     }
 }
@@ -572,6 +624,54 @@ mod tests {
 
     fn spirv_from_words(words: &[u32]) -> Vec<u8> {
         words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    /// A minimal valid-enough SPIR-V module with `n` OpFAdd (ALU) ops.
+    fn spirv_with_alu(n: u32) -> Vec<u8> {
+        let mut words = vec![0x0723_0203u32, 0x0001_0000, 0, 100, 0];
+        for _ in 0..n {
+            words.extend([(5u32 << 16) | 129, 1, 2, 3, 4]); // OpFAdd wc=5
+        }
+        spirv_from_words(&words)
+    }
+
+    #[test]
+    fn submit_frame_charges_layer2_exec() {
+        use aqueduct_gpu::frame::FrameBuilder;
+        use aqueduct_gpu::opcodes::FrameOp;
+
+        let img = ResourceId(1);
+        let pipe = ResourceId(2);
+        let vs = spirv_with_alu(5);
+        let fs = spirv_with_alu(3);
+
+        // Build a frame: BeginRenderPass(img) + BindPipeline(pipe) + Draw.
+        let mut fb = FrameBuilder::new(4096);
+        let mut brp = img.raw().to_le_bytes().to_vec();
+        brp.extend_from_slice(&[0, 0, 0, 255]);
+        brp.extend_from_slice(&0u32.to_le_bytes());
+        fb.push(FrameOp::BeginRenderPass, &brp).unwrap();
+        fb.push(FrameOp::BindPipeline, &pipe.raw().to_le_bytes()).unwrap();
+        let mut draw = 3u32.to_le_bytes().to_vec();
+        draw.extend_from_slice(&1u32.to_le_bytes());
+        draw.extend_from_slice(&[0u8; 8]);
+        fb.push(FrameOp::Draw, &draw).unwrap();
+        let frame = fb.as_bytes().to_vec();
+
+        // Real profile → non-zero modeled exec time for the draw.
+        let cm = CostModelBackend::new(StubBackend::new(), DeviceProfile::uma_apple_m4_max());
+        cm.image_created(img, 64, 64);
+        cm.pipeline_created(pipe, &vs, &fs);
+        cm.submit_frame(ResourceId(9), 1, &frame);
+        assert!(cm.ledger_snapshot().time_for(OpKind::Exec) > 0.0,
+            "a draw charges Layer-2 exec time");
+
+        // Passthrough → zero even with the same frame.
+        let cm0 = CostModelBackend::new(StubBackend::new(), DeviceProfile::passthrough());
+        cm0.image_created(img, 64, 64);
+        cm0.pipeline_created(pipe, &vs, &fs);
+        cm0.submit_frame(ResourceId(9), 1, &frame);
+        assert_eq!(cm0.ledger_snapshot().time_for(OpKind::Exec), 0.0);
     }
 
     #[test]
