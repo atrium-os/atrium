@@ -315,6 +315,90 @@ impl GpuPowerModel {
     }
 }
 
+/// One frame's work as the router scores it: the vertex- and
+/// fragment-stage instruction mixes (from [`crate::cost_model::shader_cost`])
+/// plus how many invocations each runs. The CPU (Tier-2) and GPU (Tier-3)
+/// both execute *both* stages — the per-tier cost is VS-over-vertices +
+/// FS-over-pixels.
+#[derive(Debug, Clone, Copy)]
+pub struct FrameWork {
+    /// Vertex-stage instruction mix.
+    pub vs: ShaderCost,
+    /// Vertex invocations (vertices × instances).
+    pub vs_invocations: u64,
+    /// Fragment-stage instruction mix.
+    pub fs: ShaderCost,
+    /// Fragment invocations (covered pixels).
+    pub fs_invocations: u64,
+}
+
+/// The outcome of routing one frame.
+#[derive(Debug, Clone, Copy)]
+pub struct RoutedFrame {
+    /// Where the frame was routed.
+    pub tier: Tier,
+    /// Modeled Tier-2 (CPU) cost.
+    pub tier2: Cost,
+    /// Modeled Tier-3 (GPU) cost, *before* any wake penalty.
+    pub tier3: Cost,
+    /// GPU power state after this frame.
+    pub gpu_state: GpuPowerState,
+}
+
+/// The per-frame routing engine — assembles the cost models, the GPU power
+/// signal, and the hysteresis band into the single call an integrator
+/// makes per frame. This is the router brain operating on real frame shape
+/// (the VS/FS mix + invocation counts the device model already extracts
+/// from the FrameOp stream).
+///
+/// Drives off an injected monotonic clock (`now_s`) — deterministic and
+/// testable; the daemon passes a real frame timestamp. Accounting-mode
+/// safe: `route_frame` *decides and records* but the caller still chooses
+/// whether to act on the verdict (zero perturbation until dispatch is
+/// actually rewired — the spec's "prove the decision on real frames first"
+/// step).
+#[derive(Debug, Clone)]
+pub struct FrameRouter {
+    cpu: CpuProfile,
+    gpu: DeviceProfile,
+    power: GpuPowerModel,
+    router: Router,
+}
+
+impl FrameRouter {
+    /// New engine for a CPU + GPU profile, GPU power model, and policy mode
+    /// (default hysteresis margin).
+    pub fn new(cpu: CpuProfile, gpu: DeviceProfile, power: GpuPowerModel, mode: RouteMode) -> Self {
+        FrameRouter { cpu, gpu, power, router: Router::new(mode) }
+    }
+
+    /// Current modeled GPU power state (the read-only signal).
+    pub fn gpu_state(&self) -> GpuPowerState {
+        self.power.state()
+    }
+
+    /// The tier currently committed to (carries the hysteresis state).
+    pub fn current_tier(&self) -> Tier {
+        self.router.current()
+    }
+
+    /// Score `work` at time `now_s` and route it. Folds in the GPU wake
+    /// penalty when the GPU is asleep, applies the hysteresis band, and —
+    /// if the verdict is Tier-3 — commits the GPU to `Active`.
+    pub fn route_frame(&mut self, work: &FrameWork, now_s: f64) -> RoutedFrame {
+        let tier2 = tier2_exec_cost(&self.cpu, &work.vs, work.vs_invocations)
+            .plus(tier2_exec_cost(&self.cpu, &work.fs, work.fs_invocations));
+        let tier3 = tier3_exec_cost(&self.gpu, &work.vs, work.vs_invocations)
+            .plus(tier3_exec_cost(&self.gpu, &work.fs, work.fs_invocations));
+        self.power.advance(now_s);
+        let tier = self.router.decide(tier2, tier3, self.power.wake_cost());
+        if tier == Tier::Tier3 {
+            self.power.record_tier3_use(now_s);
+        }
+        RoutedFrame { tier, tier2, tier3, gpu_state: self.power.state() }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,6 +532,70 @@ mod tests {
         power.record_tier3_use(0.0);
         let mut r_awake = Router::new(RouteMode::Battery);
         assert_eq!(r_awake.decide(t2, t3, power.wake_cost()), Tier::Tier3);
+    }
+
+    fn frame(fs_alu: u32, fs_mem: u32, pixels: u64) -> FrameWork {
+        FrameWork {
+            vs: shader(4, 1),
+            vs_invocations: 3, // a triangle
+            fs: shader(fs_alu, fs_mem),
+            fs_invocations: pixels,
+        }
+    }
+
+    #[test]
+    fn frame_router_keeps_a_light_ui_frame_off_a_slept_gpu() {
+        // A small UI repaint (few-K pixels, cheap shader), GPU cold,
+        // battery mode — the engine should stay on the CPU and never wake
+        // the GPU.
+        let mut fr = FrameRouter::new(
+            CpuProfile::apple_m4_max(),
+            DeviceProfile::uma_apple_m4_max(),
+            GpuPowerModel::discrete_rdna3(), // expensive wake → clear signal
+            RouteMode::Battery,
+        );
+        let r = fr.route_frame(&frame(6, 2, 64 * 64), 0.0);
+        assert_eq!(r.tier, Tier::Tier2);
+        assert_eq!(r.gpu_state, GpuPowerState::Asleep, "never woke the GPU");
+    }
+
+    #[test]
+    fn frame_router_routes_a_heavy_frame_to_the_gpu_and_wakes_it() {
+        let mut fr = FrameRouter::new(
+            CpuProfile::apple_m4_max(),
+            DeviceProfile::uma_apple_m4_max(),
+            GpuPowerModel::apple_m4_max(),
+            RouteMode::Perf,
+        );
+        // A heavy 4K shader: GPU throughput dominates → Tier-3, GPU active.
+        let r = fr.route_frame(&frame(300, 24, 3840 * 2160), 0.0);
+        assert_eq!(r.tier, Tier::Tier3);
+        assert_eq!(r.gpu_state, GpuPowerState::Active, "heavy frame woke the GPU");
+    }
+
+    #[test]
+    fn frame_router_sequence_wakes_stays_warm_then_sleeps() {
+        let mut fr = FrameRouter::new(
+            CpuProfile::apple_m4_max(),
+            DeviceProfile::uma_apple_m4_max(),
+            GpuPowerModel::apple_m4_max(), // 50 ms residency
+            RouteMode::Perf,
+        );
+        let heavy = frame(300, 24, 3840 * 2160);
+        let light = frame(6, 2, 64 * 64);
+
+        // Frame 0: heavy → wakes the GPU.
+        assert_eq!(fr.route_frame(&heavy, 0.0).tier, Tier::Tier3);
+        // Frame 1 (16 ms later): a light frame, but the GPU is still warm
+        // (no wake penalty) so Tier-3 can hold — no thrash back to CPU.
+        let f1 = fr.route_frame(&light, 0.016);
+        assert_eq!(f1.gpu_state, GpuPowerState::Active);
+        // A long idle gap (250 ms > 50 ms residency) with a light frame:
+        // the GPU has clock-gated, so the wake penalty now pushes the light
+        // frame back to the CPU.
+        let f2 = fr.route_frame(&light, 0.266);
+        assert_eq!(f2.tier, Tier::Tier2);
+        assert_eq!(f2.gpu_state, GpuPowerState::Asleep);
     }
 
     #[test]
