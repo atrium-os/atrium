@@ -49,8 +49,8 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 
 use aqueduct_gpu_host::{
-    Backend, Listener, MoltenVkBackend, MoltenVkError, SoftwareBackend, StubBackend,
-    Tier2Backend, Tier2Registry,
+    Backend, CostModelBackend, DeviceProfile, Listener, MoltenVkBackend, MoltenVkError,
+    SoftwareBackend, StubBackend, Tier2Backend, Tier2Registry,
 };
 use atrium_spv_loader::LoaderConfig;
 
@@ -128,6 +128,10 @@ struct Args {
     /// slangc's `OpVariable Function` lands as proper SSA.
     /// Arc 144.
     spirv_opt_binary: Option<PathBuf>,
+    /// `--device-profile NAME`: wrap the chosen backend in the GPU
+    /// device-cost model (accounting mode). `None` = no model (today's
+    /// zero-overhead path). See docs/spec/gpu-device-model.md.
+    device_profile: Option<DeviceProfile>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -140,6 +144,7 @@ fn parse_args() -> Result<Args> {
     let mut cache_root: Option<PathBuf> = None;
     let mut compile_binary: Option<PathBuf> = None;
     let mut spirv_opt_binary: Option<PathBuf> = None;
+    let mut device_profile: Option<DeviceProfile> = None;
     let mut iter = std::env::args().skip(1);
     while let Some(a) = iter.next() {
         match a.as_str() {
@@ -189,13 +194,21 @@ fn parse_args() -> Result<Args> {
                     iter.next().ok_or_else(|| anyhow!("--spirv-opt-binary needs an argument"))?
                 ));
             }
+            "--device-profile" => {
+                let v = iter.next()
+                    .ok_or_else(|| anyhow!("--device-profile needs an argument"))?;
+                device_profile = Some(DeviceProfile::from_name(&v).ok_or_else(|| anyhow!(
+                    "unknown --device-profile {v:?}; valid: passthrough | \
+                     uma-apple-m4-max | discrete-rdna3-pcie4x16"))?);
+            }
             "--help" | "-h" => {
                 println!("usage: aqueduct-gpu-host [--socket PATH] \
                     [--transport socket|carillon] \
                     [--carillon-sock PATH] [--carillon-shm PATH] \
                     [--backend stub|software|moltenvk|tier2] \
                     [--tier2] [--cache-root PATH] [--compile-binary PATH] \
-                    [--spirv-opt-binary PATH]");
+                    [--spirv-opt-binary PATH] \
+                    [--device-profile passthrough|uma-apple-m4-max|discrete-rdna3-pcie4x16]");
                 std::process::exit(0);
             }
             other => return Err(anyhow!("unknown arg {other:?}; try --help")),
@@ -223,6 +236,7 @@ fn parse_args() -> Result<Args> {
         cache_root,
         compile_binary,
         spirv_opt_binary,
+        device_profile,
     })
 }
 
@@ -265,18 +279,34 @@ fn make_tier2_registry(
 fn make_backend(
     kind: BackendKind,
     tier2_registry: Option<&Arc<Tier2Registry>>,
+    device_profile: Option<DeviceProfile>,
 ) -> Result<Arc<dyn Backend>> {
+    // Wrap a concrete backend in the device-cost model when --device-profile
+    // is set, then erase to the trait object. CostModelBackend<B> is a
+    // transparent forwarder, so the wrapped backend behaves identically
+    // (accounting mode) while charging modeled cost per op.
+    fn finish<B: Backend + 'static>(
+        b: B, profile: &Option<DeviceProfile>,
+    ) -> Arc<dyn Backend> {
+        match profile {
+            Some(p) => {
+                log::info!("device-model wrapping backend with profile '{}'", p.name);
+                Arc::new(CostModelBackend::new(b, p.clone()))
+            }
+            None => Arc::new(b),
+        }
+    }
     match kind {
-        BackendKind::Stub     => Ok(Arc::new(StubBackend::new())),
-        BackendKind::Software => Ok(Arc::new(SoftwareBackend::new())),
+        BackendKind::Stub     => Ok(finish(StubBackend::new(), &device_profile)),
+        BackendKind::Software => Ok(finish(SoftwareBackend::new(), &device_profile)),
         BackendKind::MoltenVk => match MoltenVkBackend::new() {
             Ok(b) => {
                 log::info!("MoltenVK backend: {}", b.device_summary());
-                Ok(Arc::new(b))
+                Ok(finish(b, &device_profile))
             }
             Err(MoltenVkError::LoaderUnavailable(e)) => {
                 log::warn!("MoltenVK loader unavailable: {e}; falling back to SoftwareBackend");
-                Ok(Arc::new(SoftwareBackend::new()))
+                Ok(finish(SoftwareBackend::new(), &device_profile))
             }
             Err(e) => Err(anyhow!("MoltenVK init failed: {e}")),
         },
@@ -292,7 +322,7 @@ fn make_backend(
             log::info!("tier-2 backend selected; draws against \
                 tier2_id-bearing pipelines will dispatch through \
                 atrium-spv-runtime");
-            Ok(Arc::new(Tier2Backend::new(reg)))
+            Ok(finish(Tier2Backend::new(reg), &device_profile))
         }
     }
 }
@@ -317,7 +347,7 @@ fn main() -> Result<()> {
         None
     };
 
-    let backend = make_backend(args.backend, registry.as_ref())?;
+    let backend = make_backend(args.backend, registry.as_ref(), args.device_profile.clone())?;
 
     // Carillon (FreeBSD-VM) transport: stand up the ivshmem-doorbell
     // endpoint instead of the Unix-socket listener.

@@ -81,6 +81,18 @@ pub struct DeviceProfile {
 }
 
 impl DeviceProfile {
+    /// Resolve a profile by CLI name (the `--device-profile` flag), or
+    /// `None` for an unknown name. `passthrough` = zero-cost identity (the
+    /// model in the data path but charging nothing).
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "passthrough" => Self::passthrough(),
+            "uma-apple-m4-max" => Self::uma_apple_m4_max(),
+            "discrete-rdna3-pcie4x16" => Self::discrete_rdna3_pcie4x16(),
+            _ => return None,
+        })
+    }
+
     /// The zero-cost identity profile — the daemon's default; every op
     /// costs `(0, 0)` so the ledger is empty and nothing is perturbed.
     pub fn passthrough() -> Self {
@@ -457,6 +469,8 @@ pub struct CostModelBackend<B: Backend> {
     images: Mutex<std::collections::HashMap<u32, (u32, u32)>>,
     /// pipeline raw-id → (vs_mix, fs_mix), for the Layer-2 exec roofline.
     pipelines: Mutex<std::collections::HashMap<u32, (ShaderCost, ShaderCost)>>,
+    /// Frames submitted — drives the periodic ledger summary log.
+    frames: std::sync::atomic::AtomicU64,
 }
 
 impl<B: Backend> CostModelBackend<B> {
@@ -469,6 +483,7 @@ impl<B: Backend> CostModelBackend<B> {
             ledger: Mutex::new(FrameLedger::default()),
             images: Mutex::new(std::collections::HashMap::new()),
             pipelines: Mutex::new(std::collections::HashMap::new()),
+            frames: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -666,6 +681,18 @@ impl<B: Backend> Backend for CostModelBackend<B> {
         self.ledger.lock().unwrap().ops.push(OpCost {
             kind: OpKind::Exec, bytes, time_s: time, energy_j: energy,
         });
+        // Periodic ledger summary so the live model is observable under
+        // RUST_LOG (every 60 frames ≈ once/second at 60 fps). Cumulative —
+        // non-destructive, so other consumers (the router) still drain it.
+        let n = self.frames.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n % 60 == 0 {
+            let l = self.ledger.lock().unwrap();
+            log::info!(
+                "device-model[{}]: {} frames, {} ops, modeled {:.3} ms exec, {:.1} mJ total",
+                self.profile.name, n, l.len(),
+                l.time_for(OpKind::Exec) * 1e3, l.total_energy_j() * 1e3,
+            );
+        }
         self.inner.submit_frame(fence, timeline, frame_buf)
     }
 }
@@ -800,6 +827,15 @@ mod tests {
         // Memory: plain load = 1 mem; structural = neither.
         assert_eq!(classify_ir_op(&Op::Load(v())), (0, 1));
         assert_eq!(classify_ir_op(&Op::Return), (0, 0), "control flow → other");
+    }
+
+    #[test]
+    fn profile_from_name_resolves_the_cli_flag() {
+        assert!(DeviceProfile::from_name("passthrough").unwrap().passthrough);
+        assert_eq!(DeviceProfile::from_name("uma-apple-m4-max").unwrap().name,
+            "uma-apple-m4-max");
+        assert!(!DeviceProfile::from_name("discrete-rdna3-pcie4x16").unwrap().passthrough);
+        assert!(DeviceProfile::from_name("nonsense").is_none());
     }
 
     #[test]
