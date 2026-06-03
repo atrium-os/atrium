@@ -963,6 +963,23 @@ impl MoltenVkBackend {
         vertex_count: u32,
         clear_rgba: [u8; 4],
     ) -> Result<(), vk::Result> {
+        self.draw_and_copy_pc(image_id, dst_buffer_id, vs_spirv, fs_spirv, vertex_count, clear_rgba, &[])
+    }
+
+    /// As [`Self::draw_and_copy`], but binds `push` bytes as push constants
+    /// (VERTEX | FRAGMENT, offset 0) — the descriptor-free uniform path,
+    /// used by cross-tier shaded certification's uniform rung.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_and_copy_pc(
+        &self,
+        image_id: ResourceId,
+        dst_buffer_id: ResourceId,
+        vs_spirv: &[u8],
+        fs_spirv: &[u8],
+        vertex_count: u32,
+        clear_rgba: [u8; 4],
+        push: &[u8],
+    ) -> Result<(), vk::Result> {
         let _guard = self.submit_lock.lock().unwrap();
         let dev = &self.device;
 
@@ -1050,8 +1067,17 @@ impl MoltenVkBackend {
                 .blend_enable(false)];
             let cb_state = vk::PipelineColorBlendStateCreateInfo::default()
                 .attachments(&blend_attach);
+            // Push-constant range (VERTEX|FRAGMENT) when push data is given.
+            let pc_ranges = if push.is_empty() {
+                Vec::new()
+            } else {
+                vec![vk::PushConstantRange::default()
+                    .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+                    .offset(0)
+                    .size(push.len() as u32)]
+            };
             let layout = dev.create_pipeline_layout(
-                &vk::PipelineLayoutCreateInfo::default(), None)?;
+                &vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&pc_ranges), None)?;
 
             let pipe_info = vk::GraphicsPipelineCreateInfo::default()
                 .stages(&stages)
@@ -1094,6 +1120,10 @@ impl MoltenVkBackend {
                 .clear_values(&clear);
             dev.cmd_begin_render_pass(cb, &rp_begin, vk::SubpassContents::INLINE);
             dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline);
+            if !push.is_empty() {
+                dev.cmd_push_constants(cb, layout,
+                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT, 0, push);
+            }
             dev.cmd_draw(cb, vertex_count, 1, 0, 0);
             dev.cmd_end_render_pass(cb);
             // Image is now TRANSFER_SRC_OPTIMAL (render pass finalLayout).

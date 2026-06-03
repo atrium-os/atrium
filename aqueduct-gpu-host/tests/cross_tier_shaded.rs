@@ -56,26 +56,30 @@ impl ShaderRunner for MoltenVkShaderRunner {
     }
 
     fn run(&self, fs_spirv: &[u8], inputs: &ShaderInputs) -> Result<ShaderOutputs, BackendError> {
-        // Rungs 1-2: constant + single-vec4-varying shaders. Uniforms /
-        // push-constants / textures need their own per-invocation feeding to
-        // Metal (later rungs).
-        if !inputs.uniforms.is_empty()
-            || !inputs.textures.is_empty()
-            || inputs.push_constants.iter().any(|&b| b != 0)
-        {
+        if !inputs.uniforms.is_empty() || !inputs.textures.is_empty() {
             return Err(BackendError::Unsupported(
-                "moltenvk runner rungs 1-2: no uniforms/push/textures yet".into(),
+                "moltenvk runner: UBO/texture rungs need descriptor support".into(),
+            ));
+        }
+        let varyings = &inputs.varyings_per_invocation;
+        let has_push = inputs.push_constants.iter().any(|&b| b != 0);
+        if has_push && !varyings.is_empty() {
+            return Err(BackendError::Unsupported(
+                "moltenvk runner: combined push + varyings not yet supported".into(),
             ));
         }
 
-        let varyings = &inputs.varyings_per_invocation;
         let mut pixels = Vec::new();
-        if varyings.is_empty() {
-            // Rung 1: constant FS, the plain full-screen-tri VS.
-            pixels.push(self.render_pixel(&self.vs, fs_spirv)?);
+        if has_push {
+            // Rung 3: feed the push-constant block to Metal (VERTEX|FRAGMENT)
+            // via the plain VS; the FS reads it directly.
+            pixels.push(self.render_pixel(&self.vs, fs_spirv, &inputs.push_constants)?);
+        } else if varyings.is_empty() {
+            // Rung 1: constant FS, plain full-screen-tri VS, no inputs.
+            pixels.push(self.render_pixel(&self.vs, fs_spirv, &[])?);
         } else {
-            // Rung 2: feed each invocation's varying to Metal's FS by baking
-            // it into a per-invocation VS as a Location-0 vec4 constant.
+            // Rung 2: bake each invocation's varying into a per-invocation VS
+            // as a Location-0 vec4 constant.
             for vb in varyings {
                 if vb.len() != 16 {
                     return Err(BackendError::Unsupported(
@@ -85,7 +89,7 @@ impl ShaderRunner for MoltenVkShaderRunner {
                 let le = |o: usize| f32::from_le_bytes([vb[o], vb[o + 1], vb[o + 2], vb[o + 3]]);
                 let v = [le(0), le(4), le(8), le(12)];
                 let vs = build_tri_vs_with_varying(v);
-                pixels.push(self.render_pixel(&vs, fs_spirv)?);
+                pixels.push(self.render_pixel(&vs, fs_spirv, &[])?);
             }
         }
         Ok(ShaderOutputs { pixels })
@@ -93,9 +97,9 @@ impl ShaderRunner for MoltenVkShaderRunner {
 }
 
 impl MoltenVkShaderRunner {
-    /// Render `fs` with vertex shader `vs` over a 2×2 target and read back
-    /// the (uniform) pixel as RGBA f32.
-    fn render_pixel(&self, vs: &[u8], fs: &[u8]) -> Result<[f32; 4], BackendError> {
+    /// Render `fs` with vertex shader `vs` (+ optional `push` constants) over
+    /// a 2×2 target and read back the (uniform) pixel as RGBA f32.
+    fn render_pixel(&self, vs: &[u8], fs: &[u8], push: &[u8]) -> Result<[f32; 4], BackendError> {
         const W: u32 = 2;
         const H: u32 = 2;
         let img = ResourceId::new(IdNamespace::IcdRuntime, self.fresh());
@@ -104,7 +108,7 @@ impl MoltenVkShaderRunner {
         self.backend.set_image_format(img, 37); // R8G8B8A8_UNORM
         self.backend.buffer_created(buf, (W * H * 4) as u64);
         self.backend
-            .draw_and_copy(img, buf, vs, fs, 3, [0, 0, 0, 255])
+            .draw_and_copy_pc(img, buf, vs, fs, 3, [0, 0, 0, 255], push)
             .map_err(|e| BackendError::Unsupported(format!("moltenvk draw failed: {e:?}")))?;
         let px = self
             .backend
@@ -149,7 +153,67 @@ fn moltenvk_agrees_with_the_interpreter_oracle_on_a_varying_shader() {
     assert_shader_agrees(&fs, &inputs, ColorTolerance::AbsEpsilon { eps: 0.01 }, &runners);
 }
 
+#[test]
+fn moltenvk_agrees_with_the_interpreter_oracle_on_a_push_constant_shader() {
+    // Rung 3: a uniform fed as a push constant. The FS reads a vec4 from the
+    // push-constant block and outputs it; the runner pushes it to Metal
+    // (VERTEX|FRAGMENT). Agrees with the interpreter oracle.
+    let Some(mvk) = MoltenVkShaderRunner::new() else {
+        eprintln!("cross-tier shaded probe skipped (MoltenVK unavailable)");
+        return;
+    };
+    let fs = build_push_constant_fs();
+    let mut pc = [0u8; 128];
+    for (i, f) in [0.3f32, 0.6, 0.9, 1.0].iter().enumerate() {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&f.to_le_bytes());
+    }
+    let inputs = ShaderInputs { push_constants: pc, ..ShaderInputs::default() };
+    let runners: [&dyn ShaderRunner; 2] = [&InterpreterRunner, &mvk];
+    assert_shader_agrees(&fs, &inputs, ColorTolerance::AbsEpsilon { eps: 0.01 }, &runners);
+}
+
 // ── SPIR-V builders ──────────────────────────────────────────────────
+
+/// A fragment shader that reads a vec4 from a push-constant block (member 0)
+/// and writes it to Location-0 output.
+fn build_push_constant_fs() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::dr::Operand;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode, ExecutionModel, FunctionControl,
+        MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let f32t = b.type_float(32, None);
+    let i32t = b.type_int(32, 1);
+    let vec4 = b.type_vector(f32t, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let blk = b.type_struct(vec![vec4]);
+    b.decorate(blk, Decoration::Block, vec![]);
+    b.member_decorate(blk, 0, Decoration::Offset, vec![Operand::LiteralBit32(0)]);
+    let ptr_pc_blk = b.type_pointer(None, StorageClass::PushConstant, blk);
+    let pc = b.variable(ptr_pc_blk, None, StorageClass::PushConstant, None);
+    let ptr_pc_v4 = b.type_pointer(None, StorageClass::PushConstant, vec4);
+    let ptr_out = b.type_pointer(None, StorageClass::Output, vec4);
+    let out = b.variable(ptr_out, None, StorageClass::Output, None);
+    b.decorate(out, Decoration::Location, vec![Operand::LiteralBit32(0)]);
+    let c0i = b.constant_bit32(i32t, 0);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let ac = b.access_chain(ptr_pc_v4, None, pc, vec![c0i]).unwrap();
+    let val = b.load(vec4, None, ac, None, vec![]).unwrap();
+    b.store(out, val, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![out]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+    let words: Vec<u32> = b.module().assemble();
+    words.iter().flat_map(|w| w.to_le_bytes()).collect()
+}
 
 fn build_constant_color_fs(rgba: [f32; 4]) -> Vec<u8> {
     use rspirv::binary::Assemble;
