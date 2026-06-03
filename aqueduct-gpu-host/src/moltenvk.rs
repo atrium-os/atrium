@@ -967,8 +967,7 @@ impl MoltenVkBackend {
     }
 
     /// As [`Self::draw_and_copy`], but binds `push` bytes as push constants
-    /// (VERTEX | FRAGMENT, offset 0) — the descriptor-free uniform path,
-    /// used by cross-tier shaded certification's uniform rung.
+    /// (VERTEX | FRAGMENT, offset 0) — the descriptor-free uniform path.
     #[allow(clippy::too_many_arguments)]
     pub fn draw_and_copy_pc(
         &self,
@@ -979,6 +978,25 @@ impl MoltenVkBackend {
         vertex_count: u32,
         clear_rgba: [u8; 4],
         push: &[u8],
+    ) -> Result<(), vk::Result> {
+        self.draw_and_copy_full(image_id, dst_buffer_id, vs_spirv, fs_spirv, vertex_count, clear_rgba, push, None)
+    }
+
+    /// Full draw path: optional push constants + an optional UBO bound at
+    /// (set 0, binding 0, VERTEX|FRAGMENT). The descriptor path — set
+    /// layout + pool + set + `vkUpdateDescriptorSets` + bind — is the first
+    /// rung of descriptor support on this backend (UBO; textures next).
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_and_copy_full(
+        &self,
+        image_id: ResourceId,
+        dst_buffer_id: ResourceId,
+        vs_spirv: &[u8],
+        fs_spirv: &[u8],
+        vertex_count: u32,
+        clear_rgba: [u8; 4],
+        push: &[u8],
+        ubo: Option<&[u8]>,
     ) -> Result<(), vk::Result> {
         let _guard = self.submit_lock.lock().unwrap();
         let dev = &self.device;
@@ -1076,8 +1094,58 @@ impl MoltenVkBackend {
                     .offset(0)
                     .size(push.len() as u32)]
             };
+            // ── Optional UBO at (set 0, binding 0) ────────────────────
+            // Create the uniform buffer + descriptor set layout/pool/set up
+            // front; bound before the draw, torn down after.
+            let mut ubo_res: Option<(vk::Buffer, vk::DeviceMemory, vk::DescriptorSetLayout,
+                                     vk::DescriptorPool, vk::DescriptorSet)> = None;
+            let set_layouts: Vec<vk::DescriptorSetLayout> = if let Some(bytes) = ubo {
+                let size = bytes.len().max(16) as u64;
+                // Host-visible uniform buffer, filled with `bytes`.
+                let bi = vk::BufferCreateInfo::default().size(size)
+                    .usage(vk::BufferUsageFlags::UNIFORM_BUFFER)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE);
+                let ubuf = dev.create_buffer(&bi, None)?;
+                let req = dev.get_buffer_memory_requirements(ubuf);
+                let mt = self.mem_type(req.memory_type_bits,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)
+                    .ok_or(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)?;
+                let umem = dev.allocate_memory(&vk::MemoryAllocateInfo::default()
+                    .allocation_size(req.size).memory_type_index(mt), None)?;
+                dev.bind_buffer_memory(ubuf, umem, 0)?;
+                let ptr = dev.map_memory(umem, 0, size, vk::MemoryMapFlags::empty())? as *mut u8;
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
+                dev.unmap_memory(umem);
+                // Set layout: binding 0 = UNIFORM_BUFFER, VERTEX|FRAGMENT.
+                let binding = [vk::DescriptorSetLayoutBinding::default()
+                    .binding(0).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)];
+                let dsl = dev.create_descriptor_set_layout(
+                    &vk::DescriptorSetLayoutCreateInfo::default().bindings(&binding), None)?;
+                let pool_size = [vk::DescriptorPoolSize::default()
+                    .ty(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(1)];
+                let pool = dev.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(1).pool_sizes(&pool_size), None)?;
+                let dsls = [dsl];
+                let set = dev.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(pool).set_layouts(&dsls))?[0];
+                let bufinfo = [vk::DescriptorBufferInfo::default()
+                    .buffer(ubuf).offset(0).range(size)];
+                let write = [vk::WriteDescriptorSet::default()
+                    .dst_set(set).dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                    .buffer_info(&bufinfo)];
+                dev.update_descriptor_sets(&write, &[]);
+                ubo_res = Some((ubuf, umem, dsl, pool, set));
+                vec![dsl]
+            } else {
+                Vec::new()
+            };
             let layout = dev.create_pipeline_layout(
-                &vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&pc_ranges), None)?;
+                &vk::PipelineLayoutCreateInfo::default()
+                    .set_layouts(&set_layouts)
+                    .push_constant_ranges(&pc_ranges), None)?;
 
             let pipe_info = vk::GraphicsPipelineCreateInfo::default()
                 .stages(&stages)
@@ -1120,6 +1188,10 @@ impl MoltenVkBackend {
                 .clear_values(&clear);
             dev.cmd_begin_render_pass(cb, &rp_begin, vk::SubpassContents::INLINE);
             dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline);
+            if let Some((_, _, _, _, set)) = ubo_res {
+                dev.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::GRAPHICS,
+                    layout, 0, &[set], &[]);
+            }
             if !push.is_empty() {
                 dev.cmd_push_constants(cb, layout,
                     vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT, 0, push);
@@ -1149,6 +1221,12 @@ impl MoltenVkBackend {
             dev.destroy_framebuffer(framebuffer, None);
             dev.destroy_pipeline(pipeline, None);
             dev.destroy_pipeline_layout(layout, None);
+            if let Some((ubuf, umem, dsl, pool, _)) = ubo_res {
+                dev.destroy_descriptor_pool(pool, None); // frees the set
+                dev.destroy_descriptor_set_layout(dsl, None);
+                dev.destroy_buffer(ubuf, None);
+                dev.free_memory(umem, None);
+            }
             dev.destroy_shader_module(vs, None);
             dev.destroy_shader_module(fs, None);
             dev.destroy_render_pass(render_pass, None);

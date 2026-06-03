@@ -56,21 +56,25 @@ impl ShaderRunner for MoltenVkShaderRunner {
     }
 
     fn run(&self, fs_spirv: &[u8], inputs: &ShaderInputs) -> Result<ShaderOutputs, BackendError> {
-        if !inputs.uniforms.is_empty() || !inputs.textures.is_empty() {
+        if !inputs.textures.is_empty() {
             return Err(BackendError::Unsupported(
-                "moltenvk runner: UBO/texture rungs need descriptor support".into(),
+                "moltenvk runner: texture rung needs combined-image-sampler support".into(),
             ));
         }
         let varyings = &inputs.varyings_per_invocation;
         let has_push = inputs.push_constants.iter().any(|&b| b != 0);
-        if has_push && !varyings.is_empty() {
+        let has_ubo = !inputs.uniforms.is_empty();
+        if (has_push || has_ubo) && !varyings.is_empty() {
             return Err(BackendError::Unsupported(
-                "moltenvk runner: combined push + varyings not yet supported".into(),
+                "moltenvk runner: combined uniform + varyings not yet supported".into(),
             ));
         }
 
         let mut pixels = Vec::new();
-        if has_push {
+        if has_ubo {
+            // Rung 4a: a UBO bound at (set 0, binding 0) via descriptors.
+            pixels.push(self.render_pixel_ubo(&self.vs, fs_spirv, &inputs.uniforms)?);
+        } else if has_push {
             // Rung 3: feed the push-constant block to Metal (VERTEX|FRAGMENT)
             // via the plain VS; the FS reads it directly.
             pixels.push(self.render_pixel(&self.vs, fs_spirv, &inputs.push_constants)?);
@@ -110,9 +114,28 @@ impl MoltenVkShaderRunner {
         self.backend
             .draw_and_copy_pc(img, buf, vs, fs, 3, [0, 0, 0, 255], push)
             .map_err(|e| BackendError::Unsupported(format!("moltenvk draw failed: {e:?}")))?;
+        self.read_center(buf, W, H)
+    }
+
+    /// Render `fs` with a UBO bound at (set 0, binding 0).
+    fn render_pixel_ubo(&self, vs: &[u8], fs: &[u8], ubo: &[u8]) -> Result<[f32; 4], BackendError> {
+        const W: u32 = 2;
+        const H: u32 = 2;
+        let img = ResourceId::new(IdNamespace::IcdRuntime, self.fresh());
+        let buf = ResourceId::new(IdNamespace::IcdRuntime, self.fresh());
+        self.backend.image_created(img, W, H);
+        self.backend.set_image_format(img, 37);
+        self.backend.buffer_created(buf, (W * H * 4) as u64);
+        self.backend
+            .draw_and_copy_full(img, buf, vs, fs, 3, [0, 0, 0, 255], &[], Some(ubo))
+            .map_err(|e| BackendError::Unsupported(format!("moltenvk ubo draw failed: {e:?}")))?;
+        self.read_center(buf, W, H)
+    }
+
+    fn read_center(&self, buf: ResourceId, w: u32, h: u32) -> Result<[f32; 4], BackendError> {
         let px = self
             .backend
-            .buffer_read_bytes(buf, 0, (W * H * 4) as u64)
+            .buffer_read_bytes(buf, 0, (w * h * 4) as u64)
             .map_err(BackendError::Unsupported)?;
         Ok([px[0] as f32 / 255.0, px[1] as f32 / 255.0, px[2] as f32 / 255.0, px[3] as f32 / 255.0])
     }
@@ -172,7 +195,68 @@ fn moltenvk_agrees_with_the_interpreter_oracle_on_a_push_constant_shader() {
     assert_shader_agrees(&fs, &inputs, ColorTolerance::AbsEpsilon { eps: 0.01 }, &runners);
 }
 
+#[test]
+fn moltenvk_agrees_with_the_interpreter_oracle_on_a_ubo_shader() {
+    // Rung 4a: a uniform delivered as a UBO at (set 0, binding 0) — the
+    // first descriptor-backed cross-tier check. The runner creates a uniform
+    // buffer + descriptor set on Metal; the FS reads the block and outputs
+    // it. Agrees with the interpreter oracle.
+    let Some(mvk) = MoltenVkShaderRunner::new() else {
+        eprintln!("cross-tier shaded probe skipped (MoltenVK unavailable)");
+        return;
+    };
+    let fs = build_ubo_fs();
+    let color = [0.2f32, 0.4, 0.8, 1.0];
+    let uniforms: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
+    let inputs = ShaderInputs { uniforms, ..ShaderInputs::default() };
+    let runners: [&dyn ShaderRunner; 2] = [&InterpreterRunner, &mvk];
+    assert_shader_agrees(&fs, &inputs, ColorTolerance::AbsEpsilon { eps: 0.01 }, &runners);
+}
+
 // ── SPIR-V builders ──────────────────────────────────────────────────
+
+/// A fragment shader that reads a vec4 from a UBO `struct { vec4 }` at
+/// (set 0, binding 0, member 0) and writes it to Location-0 output.
+fn build_ubo_fs() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::dr::Operand;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode, ExecutionModel, FunctionControl,
+        MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let f32t = b.type_float(32, None);
+    let i32t = b.type_int(32, 1);
+    let vec4 = b.type_vector(f32t, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let blk = b.type_struct(vec![vec4]);
+    b.member_decorate(blk, 0, Decoration::Offset, vec![Operand::LiteralBit32(0)]);
+    b.decorate(blk, Decoration::Block, vec![]);
+    let ptr_ub_blk = b.type_pointer(None, StorageClass::Uniform, blk);
+    let ptr_ub_v4 = b.type_pointer(None, StorageClass::Uniform, vec4);
+    let ptr_out = b.type_pointer(None, StorageClass::Output, vec4);
+    let ub = b.variable(ptr_ub_blk, None, StorageClass::Uniform, None);
+    b.decorate(ub, Decoration::DescriptorSet, vec![Operand::LiteralBit32(0)]);
+    b.decorate(ub, Decoration::Binding, vec![Operand::LiteralBit32(0)]);
+    let out = b.variable(ptr_out, None, StorageClass::Output, None);
+    b.decorate(out, Decoration::Location, vec![Operand::LiteralBit32(0)]);
+    let c0i = b.constant_bit32(i32t, 0);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let ac = b.access_chain(ptr_ub_v4, None, ub, vec![c0i]).unwrap();
+    let val = b.load(vec4, None, ac, None, vec![]).unwrap();
+    b.store(out, val, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![ub, out]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+    let words: Vec<u32> = b.module().assemble();
+    words.iter().flat_map(|w| w.to_le_bytes()).collect()
+}
 
 /// A fragment shader that reads a vec4 from a push-constant block (member 0)
 /// and writes it to Location-0 output.
