@@ -379,13 +379,22 @@ output across the convention-risk colour space (pure channels → no BGRA
 swap, 0/255 extremes → no clamping divergence, partial alpha → no
 premultiply mismatch). `tests/cross_tier_certify.rs`.
 
-**Remaining (scoped optimisations, no new design):**
-1. **Single-homed resource residency.** `RoutingBackend` currently mirrors
-   resource creation/upload to *both* backends (simplest correct mechanism;
-   correctness comes from slow migration, not homing). The optimisation is
-   lazy per-tier residency + replay-on-migration, so a CPU-routed surface
-   never uploads to VRAM — directly an energy win on discrete. Its own
-   effort (resource-residency tracking + frame resource-set introspection).
+**Single-homed resource residency — BUILT (flat frames).** `RoutingBackend`
+no longer mirrors resource ops to both backends: `frame_resources` +
+`ResidencyTracker` record each resource's ops and materialise it on a tier
+only when a frame dispatched there needs it. A CPU-routed surface leaves the
+GPU with **zero** resident resources (tested). Fully-introspectable
+(flat-UI) frames get the win today; textured frames safely fall back to
+whole-world materialisation until the indirect-op bodies (`BindDescriptors`,
+`BindVertexBuf`/`IndexBuf`) are decoded. The certification probe materialises
+only its own resources, so proving a pipeline equivalent never drags a
+surface's textures onto the GPU.
+
+**Remaining:**
+1. **Widen residency coverage.** Decode the indirect resource-referencing
+   op bodies so textured/geometry frames introspect completely (fewer
+   whole-world fallbacks); collapse superseded writes to bound the retain-log
+   to current state.
 2. **Shaded per-pipeline certification.** The flat-colour convention is
    verified; full equivalence through interpolated varyings / `gl_FragCoord`
    is the `atrium-spv-differential` harness's domain (Tier-2 does not yet
