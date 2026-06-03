@@ -89,9 +89,30 @@ impl RoutingBackend {
         (self.scored.load(Ordering::Relaxed), self.skipped.load(Ordering::Relaxed))
     }
 
-    /// Certify a pipeline as tier-equivalent (gates surface migration).
+    /// Record a pipeline's tier-equivalence certification directly (e.g.
+    /// from the offline differential oracle).
     pub fn certify(&self, pipeline: ResourceId, c: crate::certify::Certification) {
         self.policy.lock().unwrap().certify(pipeline.raw(), c);
+    }
+
+    /// Certify `pipeline` by rendering `probe_frame` on *both* backends and
+    /// comparing the readback from `readback_buf` (a smoke differential).
+    /// Records + returns the result; on success the pipeline's surfaces
+    /// become migration-eligible. The probe's resources must already be
+    /// created (the router mirrors them to both backends).
+    pub fn certify_pipeline(
+        &self,
+        pipeline: ResourceId,
+        probe_frame: &[u8],
+        readback_buf: ResourceId,
+        readback_size: u64,
+        tolerance: u8,
+    ) -> crate::certify::Certification {
+        let c = crate::certify::differential_certify(
+            &*self.t2, &*self.t3, probe_frame, readback_buf, readback_size, tolerance,
+        );
+        self.policy.lock().unwrap().certify(pipeline.raw(), c);
+        c
     }
 
     /// `(tier2, tier3)` effective surface-assignment counts.
@@ -412,6 +433,50 @@ mod tests {
         // Readback follows the writer (Tier-2): marker == 2.
         let px = rb.buffer_read_bytes(dst, 0, 4).unwrap();
         assert_eq!(px, vec![2, 2, 2, 2], "readback from the tier that rendered");
+    }
+
+    #[test]
+    fn differential_certify_passes_on_match_fails_on_divergence() {
+        let probe = frame(ResourceId(1), ResourceId(2), ResourceId(3));
+        // Both backends render the same pixels → certified.
+        let a = Counting::new(7);
+        let b = Counting::new(7);
+        assert_eq!(
+            crate::certify::differential_certify(&*a, &*b, &probe, ResourceId(3), 16, 0),
+            Certification::Certified);
+        // Divergent pixels → failed, with the per-channel delta.
+        let c = Counting::new(2);
+        let d = Counting::new(3);
+        assert_eq!(
+            crate::certify::differential_certify(&*c, &*d, &probe, ResourceId(3), 16, 0),
+            Certification::Failed { max_channel_diff: 1 });
+    }
+
+    #[test]
+    fn certify_pipeline_unlocks_scoring() {
+        // Two backends that render identically → the pipeline certifies, and
+        // its surface flips from pinned (skipped) to eligible (scored).
+        let t2 = Counting::new(7);
+        let t3 = Counting::new(7);
+        let rb = RoutingBackend::new(
+            t2.clone(), t3.clone(), DeviceProfile::uma_apple_m4_max(),
+            CpuProfile::apple_m4_max(), GpuPowerModel::apple_m4_max(), RouteMode::Perf);
+        let (img, pipe, dst) = (ResourceId(1), ResourceId(2), ResourceId(3));
+        rb.image_created(img, 64, 64);
+        rb.pipeline_created(pipe, &spirv_alu(4), &spirv_alu(4));
+        rb.buffer_created(dst, 64);
+        let probe = frame(img, pipe, dst);
+
+        // Uncertified → the frame is dispatched home without scoring.
+        rb.submit_frame(ResourceId(9), 1, &probe);
+        assert_eq!(rb.decision_stats(), (0, 1));
+
+        // Certify via differential probe.
+        assert_eq!(rb.certify_pipeline(pipe, &probe, dst, 16, 0), Certification::Certified);
+
+        // Now the surface is eligible → subsequent frames are scored.
+        rb.submit_frame(ResourceId(9), 2, &probe);
+        assert_eq!(rb.decision_stats(), (1, 1), "certified surface is now scored");
     }
 
     #[test]

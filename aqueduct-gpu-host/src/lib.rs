@@ -88,7 +88,9 @@ pub mod tier2_backend;
 pub mod tier2_registry;
 
 pub use backend::{Backend, SoftwareBackend, StubBackend};
-pub use certify::{compare_framebuffers, Certification, CertificationRegistry};
+pub use certify::{
+    compare_framebuffers, differential_certify, Certification, CertificationRegistry,
+};
 pub use cost_model::{
     exec_cost, ir_instruction_mix, shader_cost, spirv_instruction_mix, CalibrationProfile,
     CostMode, CostModelBackend, DeviceProfile, FrameLedger, OpKind, ScanoutDomain, ShaderCost,

@@ -17,6 +17,10 @@
 
 use std::collections::HashMap;
 
+use aqueduct_gpu::ids::ResourceId;
+
+use crate::backend::Backend;
+
 /// A pipeline's tier-equivalence status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Certification {
@@ -50,6 +54,43 @@ pub fn compare_framebuffers(reference: &[u8], candidate: &[u8], tolerance: u8) -
     } else {
         Certification::Failed { max_channel_diff: max }
     }
+}
+
+/// Render a `probe_frame` on both backends, read back the result from
+/// `readback_buf`, and compare — the orchestration that turns the
+/// [`CertificationRegistry`] from "always pinned" into real eligibility.
+///
+/// The caller sets up the probe's resources on both backends (the routing
+/// layer already mirrors creation) and builds a `probe_frame` that renders
+/// the pipeline-under-test into a target and copies it to `readback_buf`.
+/// Both backends own independent copies of that buffer (resources are
+/// mirrored), so the two reads are independent. A readback error on either
+/// side is a structural failure, not a near miss.
+///
+/// This is a *smoke* certification: one deterministic probe catches gross
+/// divergence (wrong rendering). The rigorous per-input differential
+/// (`atrium-spv-differential`) is the offline oracle; this is the cheap
+/// runtime gate that pins anything not provably equivalent.
+pub fn differential_certify(
+    t2: &dyn Backend,
+    t3: &dyn Backend,
+    probe_frame: &[u8],
+    readback_buf: ResourceId,
+    readback_size: u64,
+    tolerance: u8,
+) -> Certification {
+    let fence = ResourceId(0);
+    t2.submit_frame(fence, 0, probe_frame);
+    let px2 = match t2.buffer_read_bytes(readback_buf, 0, readback_size) {
+        Ok(v) => v,
+        Err(_) => return Certification::Failed { max_channel_diff: 255 },
+    };
+    t3.submit_frame(fence, 0, probe_frame);
+    let px3 = match t3.buffer_read_bytes(readback_buf, 0, readback_size) {
+        Ok(v) => v,
+        Err(_) => return Certification::Failed { max_channel_diff: 255 },
+    };
+    compare_framebuffers(&px2, &px3, tolerance)
 }
 
 /// Per-pipeline tier-equivalence registry + the surface-migration gate.
