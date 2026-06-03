@@ -1430,14 +1430,62 @@ above.
 - The doorbell only works because of the **1 ms poll timer patch** in `~/src/bsd/external/qemu-build` (`hw/misc/ivshmem-pci.c`). Upstream QEMU on macOS+HVF does not deliver MSI-X from ivshmem because GLib's main loop never polls pipe fds under HVF. Do not regress this when rebasing QEMU.
 - HVF reports `ISV=0` on guest LDP/STP/LDR/STR to MMIO. Patched in `target/arm/hvf/hvf.c` to decode the instruction and emulate. Without the patch, qemu asserts.
 
-### MSI-X is broken on FreeBSD/aarch64/qemu+HVF — we use polling instead
-- `pci_alloc_msix` returns ENXIO for late-attaching PCI devices (and even some early ones — virtio-blk uses INTx in the boot dmesg). Root cause: qemu's IORT for the `virt` machine is empty (84 bytes header only), so FreeBSD has no PCI→MSI routing. With `gic-version=3` it routes via ITS but IORT misses our requestor; with `gic-version=2` GICv2m attaches but the same IORT issue prevents MSI mapping.
-- **`acpi=off` is not a fix** — FreeBSD aarch64 boot panics under FDT mode on qemu virt (`No usable event timer found`, no PSCI). Recovery via `recover-acpi.exp`.
-- **Fix:** the kernel module skips `pci_alloc_msix` entirely and runs a 1 ms `callout` (`FRESCO_POLL_HZ`) that reads `comp_write` and `input_write` directly from the shmem control region. When the head pointer changes, KNOTE the kqueue list. Cost: ~0.1% CPU at idle. Mirrors the host-side workaround for the same failing ivshmem doorbell delivery.
-- karythra-os doesn't hit this because it bypasses FreeBSD's MSI framework entirely (it's not running FreeBSD) — it programs MSI-X table entries directly to `GICV2M_SETSPI_NS` and configures the GIC distributor by hand. We won't replicate that hack here; polling is fine and matches the "pure FreeBSD" discipline.
+### MSI-X on FreeBSD/aarch64/qemu+HVF — WORKS (2026-06-03; the old "broken, use polling" finding was wrong)
+The Carillon bring-up (`carillon-kmod/`) root-caused this properly. **MSI-X
+works** on FreeBSD/aarch64 under qemu+HVF, via the GIC ITS, doorbell
+round-trip in ~0.02 s. The prior conclusion ("IORT empty, MSI-X broken")
+was a misdiagnosis. The actual chain:
+- **`pci_alloc_msix` ENXIO was FreeBSD's MSI blacklist, not the IORT.**
+  `pci_msix_blacklisted()` blacklists MSI on "non-PCIe chipsets"; on
+  arm64 the `pcie_chipset` global is unset, so the qemu host bridge
+  (lacking `PCI_QUIRK_ENABLE_MSI_VM`) is blacklisted → MSI-X off for
+  **every** PCI device (that's why virtio-blk showed INTx).
+  **Fix:** `hw.pci.honor_msi_blacklist=0` in the guest `/boot/loader.conf`.
+  With it off, virtio moves onto `its0,N` MSI-X too.
+- **The IORT is fine.** Under `gic-version=3` qemu emits a 128-byte IORT:
+  ITS-group node + Root-Complex node mapping RIDs `0..0xffff` → the ITS.
+  (The "84 bytes" was the gic-version=2 case — no ITS, minimal IORT.)
+- **Requires `gic-version=3`** (ITS only exists on GICv3). See below.
+- **Driver must allocate the MSI-X table BAR** (BAR1) `RF_ACTIVE` before
+  `pci_alloc_msix` — else "table_bar not mapped" → ENXIO → INTx.
+- Not an HVF limit (HVF injects guest MSIs via userspace), not the ITS
+  (emulated ITS works under HVF), not a qemu patch. Host→guest MSI
+  delivery rides the existing ivshmem **poll-timer** (`msix_notify`).
+- karythra-os used MSI-X too (it programs the GIC/MSI-X directly); it
+  works there for the same reason — HVF supports it.
+- Carillon's kmod is MSI-X-first with a legacy-INTx fallback (the INTx
+  path needs no qemu changes either, but is slower — relies on the
+  poll-timer's IntrStatus path + a host watchdog timeout).
 
 ### `-machine virt,gic-version=`
-- We use `gic-version=2` (matches karythra-os, smallest interrupt model). `gic-version=3` works equally for our purposes since we don't use MSI-X anyway.
+- **`gic-version=3`** (changed from 2 on 2026-06-03). Required for the GIC
+  ITS, hence PCI MSI-X (Carillon doorbell + virtio all move onto MSI-X).
+  GICv2 has no ITS → no PCI MSI on arm64 ACPI. v3 is a superset; nothing
+  regressed.
+
+### Carillon transport bring-up (VM, verified) — `carillon-kmod/` + `aqueduct-gpu-host --transport carillon`
+The doorbell GPU transport (docs/spec/carillon.md). Host daemon +
+`ivshmem-doorbell` + guest kmod; round-trip verified over MSI-X.
+```sh
+# host: start the Carillon IvshmemServer (creates /tmp/carillon.sock)
+~/src/bsd/aqueduct-gpu-host/target/debug/aqueduct-gpu-host \
+    --transport carillon --backend software \
+    --carillon-sock /tmp/carillon.sock --carillon-shm /tmp/carillon.shm &
+# host: boot the VM (run-vm.sh aborts if the sock is missing)
+~/src/bsd/scripts/run-vm.sh --carillon
+# one-time guest prereq (then reboot): MSI-X needs the blacklist off
+vssh 'grep -q honor_msi_blacklist /boot/loader.conf || \
+      echo hw.pci.honor_msi_blacklist=0 >> /boot/loader.conf'
+# in VM: build + load the kmod, run the smoke round-trip
+vssh '[ -d /usr/src/sys ] || tar -xJf /mnt/host/tarballs/src.txz -C /'
+vssh 'cp -r /mnt/host/carillon-kmod /tmp/ck && cd /tmp/ck && make && \
+      kldload ./carillon.ko'                       # -> /dev/carillon0, "MSI-X (1 vector)"
+vssh 'cc -O -o /tmp/cs /tmp/ck/carillon_smoke.c && /tmp/cs'  # -> ROUND-TRIP OK ~0.02s
+```
+- The kmod is built in-VM (KBI). `make` picks up `bsd.kmod.mk` + `/usr/src/sys`.
+- BAR2 mapped `VM_MEMATTR_WRITE_BACK` (cacheable) — coherent across HVF.
+- "doorbell: MSI-X (1 vector)" = good; "using legacy INTx" = blacklist
+  still on (loader.conf not applied / not rebooted) or BAR1 not mapped.
 
 ### `needs_render` whitelist must include WM-state changes
 - The server only re-renders when `process_commands` returns `needs_render = true`. The trigger list is whitelisted — historically just `CMD_RENDER` (0x0300) and `CMD_FRAME_END` (0x0304). Any command that changes WM-visible state (window create/destroy/move/title — opcodes `0x05xx`) must also flip the bit, otherwise the command processes correctly but the screen stays stale until the next user input fires another redraw. Symptom: clicked close button takes 2–3 s to actually remove the window. Fixed by widening the whitelist to `(opcode & 0xff00) == 0x0500`.

@@ -7,7 +7,12 @@
 > follow Atrium's Latin / classical-architecture convention, because the
 > device + host endpoint live in QEMU, not in the Atrium runtime.*
 
-> **Status.** Design. The forward-looking replacement for the venus
+> **Status.** Design + **end-to-end VM-verified (T0 host loopback +
+> T1 guest kmod)**. The full doorbell round-trip works in the FreeBSD VM,
+> interrupt-driven over **MSI-X via the GIC ITS** (ROUND-TRIP OK in
+> ~0.02 s; the MSI-X ISR fires, no spin/poll). See "VM bring-up
+> (verified)" below for the platform requirements + the MSI-X root-cause.
+> The forward-looking replacement for the venus
 > paravirt path (`atrium-venus.md`, superseded) and for the *polling*
 > ivshmem sketch in `aqueduct-gpu.md` §6.1–6.2. This document specifies
 > **Carillon**, the transport that carries the aqueduct-gpu wire across
@@ -548,6 +553,45 @@ inside the FreeBSD guest reaches the host's MoltenVK/Metal, which is the
 capability the user asked for ("a modern venus replacement so the VM can
 reach MoltenVK"). It is dev/bring-up infrastructure, not a shipping
 component — on real hardware the guest/host split disappears.
+
+---
+
+## 11.5. VM bring-up (verified)
+
+The guest↔host doorbell round-trip is **verified end-to-end in the
+FreeBSD VM**, interrupt-driven over **MSI-X via the GIC ITS** (no spin,
+no poll): `carillon_smoke` mmaps `/dev/carillon0`, reads the control page
+(magic `0x54564741`, host_page_size `16384`), stages a frame, rings the
+host (BAR0 doorbell), the host's `serve_ivshmem` wakes on kqueue, runs
+the backend, and rings back; the guest wakes on the MSI-X ISR and reads
+the completion — **ROUND-TRIP OK in ~0.02 s** (vs ~1 s on the
+INTx-timeout fallback). BAR2 is mapped `VM_MEMATTR_WRITE_BACK` (cacheable)
+and is coherent across HVF with the host's `mmap`.
+
+**Platform requirements (the part that took real digging):**
+
+1. **`gic-version=3`** in QEMU (`scripts/run-vm.sh --carillon`). PCI MSI-X
+   on arm64 needs the **GIC ITS**, which only exists with GICv3. (GICv2 +
+   gicv2m has no ACPI IORT → no PCI MSI routing.)
+2. **`hw.pci.honor_msi_blacklist=0`** in the guest `/boot/loader.conf`.
+   **This was THE blocker.** FreeBSD's `pci_msix_blacklisted()` blacklists
+   MSI on "non-PCIe chipsets"; on arm64 the `pcie_chipset` global is
+   unset, so QEMU's host bridge (which lacks `PCI_QUIRK_ENABLE_MSI_VM`)
+   is blacklisted → MSI-X disabled for **every** PCI device (virtio
+   included, which silently falls back to INTx). Turning the blacklist
+   off lets virtio *and* Carillon use MSI-X via the ITS.
+3. The guest kmod must **allocate the MSI-X table BAR** (BAR1 here):
+   `pci_alloc_msix` requires that BAR mapped + `RF_ACTIVE` in the driver's
+   resource list before it hands out vectors (the bus does not map it).
+
+**What it is NOT:** not an HVF limitation (HVF injects guest-allocated
+MSIs fine via QEMU userspace), not the ITS/IORT (QEMU's IORT correctly
+maps RIDs `0..0xffff` → the ITS group; the emulated ITS works under HVF),
+and not a `Carillon`-specific QEMU patch. **No new QEMU code is required**
+(confirming §2.5): MSI-X delivery under HVF rides the *pre-existing*
+atrium ivshmem **poll-timer** (`msix_notify`), which is the substitute
+for KVM irqfd that macOS HVF lacks. The legacy-INTx path in the kmod is a
+robustness fallback only; on this platform MSI-X is the live path.
 
 ---
 
