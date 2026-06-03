@@ -96,6 +96,14 @@ pub fn frame_resources(frame_buf: &[u8]) -> FrameResources {
                     r.buffers.insert(le4(&body[4..8]));
                 } else { r.complete = false; }
             }
+            // src buffer (0..4) + dst image (4..8) — texture upload via a
+            // staging buffer, the common Vulkan path.
+            FrameOp::CopyBufToImg => {
+                if body.len() >= 8 {
+                    r.buffers.insert(le4(&body[0..4]));
+                    r.images.insert(le4(&body[4..8]));
+                } else { r.complete = false; }
+            }
             FrameOp::FillBuffer => {
                 if body.len() >= 4 { r.buffers.insert(le4(body)); } else { r.complete = false; }
             }
@@ -115,9 +123,10 @@ pub fn frame_resources(frame_buf: &[u8]) -> FrameResources {
                 if !decode_bind_descriptors(body, &mut r) { r.complete = false; }
             }
             // Still-undecoded resource-referencing ops → conservative
-            // whole-world materialisation.
-            FrameOp::CopyBufToImg
-            | FrameOp::Blit
+            // whole-world materialisation. (Blit has no implementation /
+            // confirmed wire format yet — decoding it on a guess could
+            // report a false `complete` and miss a resource.)
+            FrameOp::Blit
             | FrameOp::DrawIndirect
             | FrameOp::DispatchIndirect => {
                 r.complete = false;
@@ -245,6 +254,20 @@ mod tests {
         assert_eq!(r.pipelines, BTreeSet::from([0x20]));
         assert_eq!(r.buffers, BTreeSet::from([0x40, 0x41, 0x42]));
         assert_eq!(r.samplers, BTreeSet::from([0x60]));
+    }
+
+    #[test]
+    fn copy_buf_to_img_introspects_a_texture_upload() {
+        // staging buffer → texture image is now decoded (common upload path).
+        let mut fb = FrameBuilder::new(256);
+        let mut cbi = le(0x70).to_vec();      // src buffer
+        cbi.extend_from_slice(&le(0x71));     // dst image
+        cbi.extend_from_slice(&[0u8; 8]);     // layout + region_count
+        fb.push(FrameOp::CopyBufToImg, &cbi).unwrap();
+        let r = frame_resources(fb.as_bytes());
+        assert!(r.complete);
+        assert_eq!(r.buffers, BTreeSet::from([0x70]));
+        assert_eq!(r.images, BTreeSet::from([0x71]));
     }
 
     #[test]
