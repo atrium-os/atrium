@@ -755,17 +755,15 @@ fn drain_submission_ring<H: FnMut(&SubDesc, &[u8]) -> CompDesc>(
     (completed_any, stop)
 }
 
-/// Bridge pump: copy bytes from a socket `read_fd` into a byte FIFO,
-/// ringing `peer` after each write so the consumer wakes. Loops until the
-/// socket reaches EOF/error. (Backpressure: if the FIFO fills, briefly
-/// yield until the consumer drains — rare for bounded messages.)
-pub fn pump_fd_to_stream(
-    read_fd: RawFd,
-    region: &Region,
-    fifo_off: usize,
-    head_f: usize,
-    tail_f: usize,
-    peer: &Doorbell,
+/// Bridge pump core: copy bytes from a socket `read_fd` into a byte FIFO,
+/// calling `ring()` after each write so the consumer wakes. Loops until
+/// the socket reaches EOF/error. `ring` is the pluggable doorbell-signal:
+/// `Doorbell::signal` (loopback), `IvshmemServer::notify_peer` (host
+/// daemon), or `ioctl(CARILLON_RING)` (VM guest). (Backpressure: if the
+/// FIFO fills, briefly yield until the consumer drains.)
+pub fn pump_fd_to_stream_with<R: Fn()>(
+    read_fd: RawFd, region: &Region, fifo_off: usize,
+    head_f: usize, tail_f: usize, ring: R,
 ) {
     let mut buf = [0u8; 8192];
     loop {
@@ -782,7 +780,7 @@ pub fn pump_fd_to_stream(
             let w = region.stream_write(fifo_off, head_f, tail_f, &buf[done..total]);
             if w > 0 {
                 done += w;
-                peer.signal();
+                ring();
             } else {
                 std::thread::yield_now();
             }
@@ -790,25 +788,18 @@ pub fn pump_fd_to_stream(
     }
 }
 
-/// Bridge pump: drain a byte FIFO into a socket `write_fd`, parked on
-/// `my` (the doorbell the producer rings) and `shutdown_fd` via a
-/// [`Waiter`]. Exits when `shutdown_fd` fires.
-pub fn pump_stream_to_fd(
-    write_fd: RawFd,
-    region: &Region,
-    fifo_off: usize,
-    head_f: usize,
-    tail_f: usize,
-    my: &Doorbell,
-    shutdown_fd: RawFd,
-) -> io::Result<()> {
-    let waiter = Waiter::new(my.read_fd(), shutdown_fd)?;
+/// Bridge pump core: drain a byte FIFO into a socket `write_fd`, calling
+/// `wait()` to block until the producer's doorbell fires. `wait` returns
+/// `false` to stop (shutdown). Pluggable wait: a [`Waiter`] on a
+/// `Doorbell`/eventfd (host), or `ioctl(CARILLON_WAIT)` (VM guest). The
+/// FIFO is drained after every wake (a spurious wake just drains nothing).
+pub fn pump_stream_to_fd_with<W: FnMut() -> bool>(
+    write_fd: RawFd, region: &Region, fifo_off: usize,
+    head_f: usize, tail_f: usize, mut wait: W,
+) {
     let mut buf = [0u8; 8192];
     loop {
-        let wake = waiter.wait()?;
-        if wake.doorbell {
-            my.drain();
-        }
+        let cont = wait();
         loop {
             let n = region.stream_read(fifo_off, head_f, tail_f, &mut buf);
             if n == 0 {
@@ -821,16 +812,43 @@ pub fn pump_stream_to_fd(
                     libc::write(write_fd, buf[off..n].as_ptr() as *const libc::c_void, n - off)
                 };
                 if w <= 0 {
-                    return Ok(());
+                    return;
                 }
                 off += w as usize;
             }
         }
-        if wake.shutdown {
-            drain_fd(shutdown_fd);
+        if !cont {
             break;
         }
     }
+}
+
+/// [`pump_fd_to_stream_with`] with a pipe-[`Doorbell`] ring (loopback).
+pub fn pump_fd_to_stream(
+    read_fd: RawFd, region: &Region, fifo_off: usize,
+    head_f: usize, tail_f: usize, peer: &Doorbell,
+) {
+    pump_fd_to_stream_with(read_fd, region, fifo_off, head_f, tail_f, || peer.signal());
+}
+
+/// [`pump_stream_to_fd_with`] parked on a [`Waiter`] over `my` + a
+/// `shutdown_fd` (loopback / host).
+pub fn pump_stream_to_fd(
+    write_fd: RawFd, region: &Region, fifo_off: usize,
+    head_f: usize, tail_f: usize, my: &Doorbell, shutdown_fd: RawFd,
+) -> io::Result<()> {
+    let waiter = Waiter::new(my.read_fd(), shutdown_fd)?;
+    pump_stream_to_fd_with(write_fd, region, fifo_off, head_f, tail_f, || {
+        match waiter.wait() {
+            Ok(w) => {
+                if w.doorbell {
+                    my.drain();
+                }
+                !w.shutdown
+            }
+            Err(_) => false,
+        }
+    });
     Ok(())
 }
 
