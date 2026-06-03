@@ -153,7 +153,13 @@ The drain → swap → re-cert → resume primitive also gives, for free:
 2. **A re-certification trigger** on new-backend bring-up: run the
    differential certifier per pipeline and seed the `CertificationRegistry`
    before any surface is allowed back to Tier-3 (replaces the bring-up
-   `--trust-tiers` shortcut).
+   `--trust-tiers` shortcut). *Demonstrated end-to-end:* `RoutingBackend::
+   certify_pipeline` renders a probe on both tiers and compares the
+   readback; `routing_certifies_a_pipeline_for_real_then_migrates_no_trust`
+   certifies a real full-screen-tri pipeline (CPU rasteriser vs MoltenVK,
+   pixel-equivalent within tolerance) and only then lets the surface
+   migrate — no trust shortcut. What remains for the live swap is the
+   *trigger* that runs this automatically on a fresh Tier-3 attach.
 3. **System-memory scanout** kept available to DCN independent of the render
    driver (the default scanout path during a render swap).
 4. **Backend hot-attach/detach** on the routing layer: release the Tier-3
