@@ -76,6 +76,7 @@ pub mod frame_resources;
 pub mod router;
 pub mod listener;
 pub mod moltenvk;
+pub mod residency;
 pub mod resources;
 pub mod routing_backend;
 pub mod session;
@@ -116,6 +117,7 @@ pub use carillon_transport::{
     IvshmemServer, Region as CarillonRegion, ShutdownHandle, SubDesc,
 };
 pub use listener::Listener;
+pub use residency::ResidencyTracker;
 pub use resources::ResourceTable;
 pub use routing_backend::RoutingBackend;
 pub use session::Session;
