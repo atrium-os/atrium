@@ -55,6 +55,11 @@ pub struct RoutingBackend {
     /// cycles for nothing. The router doesn't pay to decide what it can't
     /// act on.
     skipped: AtomicU64,
+    /// Per-resource residency: resource ops are *recorded* here rather than
+    /// mirrored to both backends, and materialised onto a tier only when a
+    /// frame dispatched there needs them. So a CPU-routed surface never
+    /// uploads its resources to the GPU.
+    residency: Mutex<crate::residency::ResidencyTracker>,
 }
 
 impl RoutingBackend {
@@ -84,7 +89,29 @@ impl RoutingBackend {
             frames: AtomicU64::new(0),
             scored: AtomicU64::new(0),
             skipped: AtomicU64::new(0),
+            residency: Mutex::new(crate::residency::ResidencyTracker::new()),
         }
+    }
+
+    /// Record a resource op against `resource` (applied now to any tier the
+    /// resource is already resident on; replayed when a tier materialises
+    /// it).
+    fn record(&self, resource: u32, op: impl Fn(&dyn Backend) + Send + Sync + 'static) {
+        self.residency.lock().unwrap().record(resource, Box::new(op), &*self.t2, &*self.t3);
+    }
+
+    /// Destroy `resource` on whichever tiers hold it, then forget it.
+    fn destroy(&self, resource: u32, on_tier: impl Fn(&dyn Backend)) {
+        let mut res = self.residency.lock().unwrap();
+        if res.is_resident(resource, Tier::Tier2) { on_tier(&*self.t2); }
+        if res.is_resident(resource, Tier::Tier3) { on_tier(&*self.t3); }
+        res.forget(resource);
+    }
+
+    /// `(t2, t3)` resident-resource counts — observability for the single-
+    /// homing win (an unused tier should stay near zero).
+    pub fn residency_counts(&self) -> (usize, usize) {
+        self.residency.lock().unwrap().resident_counts()
     }
 
     /// `(scored, skipped)` frame counts — the router's own decision
@@ -114,6 +141,23 @@ impl RoutingBackend {
         readback_size: u64,
         tolerance: u8,
     ) -> crate::certify::Certification {
+        // The probe renders on *both* tiers, so materialise its resources on
+        // both — but only the probe's own (a tiny synthetic image + the
+        // pipeline + the readback buffer), NOT the world. Proving a pipeline
+        // equivalent must not drag a surface's textures onto the GPU.
+        {
+            let fr = crate::frame_resources::frame_resources(probe_frame);
+            let mut res = self.residency.lock().unwrap();
+            if fr.complete {
+                let ids: Vec<u32> = fr.images.iter().chain(&fr.pipelines).chain(&fr.buffers)
+                    .copied().chain(std::iter::once(readback_buf.raw())).collect();
+                res.materialize(ids.iter().copied(), Tier::Tier2, &*self.t2);
+                res.materialize(ids, Tier::Tier3, &*self.t3);
+            } else {
+                res.materialize_all(Tier::Tier2, &*self.t2);
+                res.materialize_all(Tier::Tier3, &*self.t3);
+            }
+        }
         let c = crate::certify::differential_certify(
             &*self.t2, &*self.t3, probe_frame, readback_buf, readback_size, tolerance,
         );
@@ -141,40 +185,33 @@ impl Backend for RoutingBackend {
         self.t3.allocate_memory(size, usage)
     }
 
-    // ── Resource lifecycle: mirror to both backends. ──────────────────
+    // ── Resource lifecycle: RECORD (materialised lazily per tier). ────
     fn image_created(&self, id: ResourceId, w: u32, h: u32) {
         self.images.lock().unwrap().insert(id.raw(), (w, h));
-        self.t2.image_created(id, w, h);
-        self.t3.image_created(id, w, h);
+        self.record(id.raw(), move |b| b.image_created(id, w, h));
     }
     fn image_created_layered(&self, id: ResourceId, w: u32, h: u32, layers: u32) {
         self.images.lock().unwrap().insert(id.raw(), (w, h));
-        self.t2.image_created_layered(id, w, h, layers);
-        self.t3.image_created_layered(id, w, h, layers);
+        self.record(id.raw(), move |b| b.image_created_layered(id, w, h, layers));
     }
     fn set_image_format(&self, id: ResourceId, fmt: u32) {
-        self.t2.set_image_format(id, fmt);
-        self.t3.set_image_format(id, fmt);
+        self.record(id.raw(), move |b| b.set_image_format(id, fmt));
     }
     fn image_destroyed(&self, id: ResourceId) {
-        self.t2.image_destroyed(id);
-        self.t3.image_destroyed(id);
+        self.images.lock().unwrap().remove(&id.raw());
+        self.destroy(id.raw(), move |b| b.image_destroyed(id));
     }
     fn depth_image_created(&self, id: ResourceId, w: u32, h: u32) {
-        self.t2.depth_image_created(id, w, h);
-        self.t3.depth_image_created(id, w, h);
+        self.record(id.raw(), move |b| b.depth_image_created(id, w, h));
     }
     fn depth_image_destroyed(&self, id: ResourceId) {
-        self.t2.depth_image_destroyed(id);
-        self.t3.depth_image_destroyed(id);
+        self.destroy(id.raw(), move |b| b.depth_image_destroyed(id));
     }
     fn buffer_created(&self, id: ResourceId, size: u64) {
-        self.t2.buffer_created(id, size);
-        self.t3.buffer_created(id, size);
+        self.record(id.raw(), move |b| b.buffer_created(id, size));
     }
     fn buffer_destroyed(&self, id: ResourceId) {
-        self.t2.buffer_destroyed(id);
-        self.t3.buffer_destroyed(id);
+        self.destroy(id.raw(), move |b| b.buffer_destroyed(id));
     }
     #[allow(clippy::too_many_arguments)]
     fn sampler_created(
@@ -182,33 +219,31 @@ impl Backend for RoutingBackend {
         addr: [u8; 3], aniso: f32, min_lod: f32, max_lod: f32,
         cmp_en: u8, cmp_op: u32,
     ) {
-        self.t2.sampler_created(id, min_f, mag_f, mip_f, addr, aniso, min_lod, max_lod, cmp_en, cmp_op);
-        self.t3.sampler_created(id, min_f, mag_f, mip_f, addr, aniso, min_lod, max_lod, cmp_en, cmp_op);
+        self.record(id.raw(), move |b| b.sampler_created(
+            id, min_f, mag_f, mip_f, addr, aniso, min_lod, max_lod, cmp_en, cmp_op));
     }
     fn sampler_destroyed(&self, id: ResourceId) {
-        self.t2.sampler_destroyed(id);
-        self.t3.sampler_destroyed(id);
+        self.destroy(id.raw(), move |b| b.sampler_destroyed(id));
     }
     fn pipeline_created(&self, id: ResourceId, vs: &[u8], fs: &[u8]) {
         self.pipelines.lock().unwrap().insert(id.raw(), (shader_cost(vs), shader_cost(fs)));
-        self.t2.pipeline_created(id, vs, fs);
-        self.t3.pipeline_created(id, vs, fs);
+        let (vs, fs) = (vs.to_vec(), fs.to_vec()); // own for deferred replay
+        self.record(id.raw(), move |b| b.pipeline_created(id, &vs, &fs));
     }
     fn present(&self, id: ResourceId, surface: u64, frame: u64) {
+        // Presentation isn't a resource upload — forward to both (the tier
+        // without the image no-ops).
         self.t2.present(id, surface, frame);
         self.t3.present(id, surface, frame);
     }
     fn bind_pipeline_tier2(&self, p: ResourceId, s: crate::Tier2ShaderId) {
-        self.t2.bind_pipeline_tier2(p, s);
-        self.t3.bind_pipeline_tier2(p, s);
+        self.record(p.raw(), move |b| b.bind_pipeline_tier2(p, s));
     }
     fn bind_pipeline_tier2_vs(&self, p: ResourceId, s: crate::Tier2ShaderId) {
-        self.t2.bind_pipeline_tier2_vs(p, s);
-        self.t3.bind_pipeline_tier2_vs(p, s);
+        self.record(p.raw(), move |b| b.bind_pipeline_tier2_vs(p, s));
     }
     fn bind_pipeline_layout(&self, p: ResourceId, l: aqueduct_gpu::VertexInputState) {
-        self.t2.bind_pipeline_layout(p, l.clone());
-        self.t3.bind_pipeline_layout(p, l);
+        self.record(p.raw(), move |b| b.bind_pipeline_layout(p, l.clone()));
     }
     #[allow(clippy::too_many_arguments)]
     fn bind_pipeline_raster_state(
@@ -221,55 +256,65 @@ impl Backend for RoutingBackend {
         stencil: Option<aqueduct_gpu::Tier2StencilState>,
         prim_restart: bool,
     ) {
-        self.t2.bind_pipeline_raster_state(p, depth, blend, blend_extra, raster, topo, stencil, prim_restart);
-        self.t3.bind_pipeline_raster_state(p, depth, blend, blend_extra, raster, topo, stencil, prim_restart);
+        let blend_extra = blend_extra.to_vec();
+        self.record(p.raw(), move |b| b.bind_pipeline_raster_state(
+            p, depth, blend, &blend_extra, raster, topo, stencil, prim_restart));
     }
     fn bind_pipeline_vs_varying_bytes(&self, p: ResourceId, b: u32) {
-        self.t2.bind_pipeline_vs_varying_bytes(p, b);
-        self.t3.bind_pipeline_vs_varying_bytes(p, b);
+        self.record(p.raw(), move |be| be.bind_pipeline_vs_varying_bytes(p, b));
     }
     fn bind_pipeline_fs_implicit_lod(&self, p: ResourceId, v: bool) {
-        self.t2.bind_pipeline_fs_implicit_lod(p, v);
-        self.t3.bind_pipeline_fs_implicit_lod(p, v);
+        self.record(p.raw(), move |b| b.bind_pipeline_fs_implicit_lod(p, v));
     }
     fn bind_pipeline_sample_count(&self, p: ResourceId, n: u32) {
-        self.t2.bind_pipeline_sample_count(p, n);
-        self.t3.bind_pipeline_sample_count(p, n);
+        self.record(p.raw(), move |b| b.bind_pipeline_sample_count(p, n));
     }
     fn bind_pipeline_fs_derivatives(&self, p: ResourceId, v: bool) {
-        self.t2.bind_pipeline_fs_derivatives(p, v);
-        self.t3.bind_pipeline_fs_derivatives(p, v);
+        self.record(p.raw(), move |b| b.bind_pipeline_fs_derivatives(p, v));
     }
     fn bind_pipeline_fs_writes_depth(&self, p: ResourceId, v: bool) {
-        self.t2.bind_pipeline_fs_writes_depth(p, v);
-        self.t3.bind_pipeline_fs_writes_depth(p, v);
+        self.record(p.raw(), move |b| b.bind_pipeline_fs_writes_depth(p, v));
     }
 
-    // ── Data movement: writes mirror to both; reads follow the writer. ─
+    // ── Data movement: writes are RECORDED (replayed on materialise; and
+    //    applied now to any live tier). Reads follow the writer. ─────────
     fn image_write_pixels(&self, id: ResourceId, row_pitch: u32, pixels: &[u8]) -> Result<(), String> {
-        let a = self.t2.image_write_pixels(id, row_pitch, pixels);
-        let b = self.t3.image_write_pixels(id, row_pitch, pixels);
-        a.and(b)
+        let pixels = pixels.to_vec();
+        self.record(id.raw(), move |b| {
+            if let Err(e) = b.image_write_pixels(id, row_pitch, &pixels) {
+                log::warn!("routing: deferred image_write_pixels: {e}");
+            }
+        });
+        Ok(())
     }
     #[allow(clippy::too_many_arguments)]
     fn image_write_region_pixels(
         &self, id: ResourceId, dx: u32, dy: u32, w: u32, h: u32, row_pitch: u32, pixels: &[u8],
     ) -> Result<(), String> {
-        let a = self.t2.image_write_region_pixels(id, dx, dy, w, h, row_pitch, pixels);
-        let b = self.t3.image_write_region_pixels(id, dx, dy, w, h, row_pitch, pixels);
-        a.and(b)
+        let pixels = pixels.to_vec();
+        self.record(id.raw(), move |b| {
+            if let Err(e) = b.image_write_region_pixels(id, dx, dy, w, h, row_pitch, &pixels) {
+                log::warn!("routing: deferred image_write_region_pixels: {e}");
+            }
+        });
+        Ok(())
     }
     fn buffer_write_bytes(&self, id: ResourceId, offset: u64, bytes: &[u8]) -> Result<(), String> {
-        let a = self.t2.buffer_write_bytes(id, offset, bytes);
-        let b = self.t3.buffer_write_bytes(id, offset, bytes);
-        a.and(b)
+        let bytes = bytes.to_vec();
+        self.record(id.raw(), move |b| {
+            if let Err(e) = b.buffer_write_bytes(id, offset, &bytes) {
+                log::warn!("routing: deferred buffer_write_bytes: {e}");
+            }
+        });
+        Ok(())
     }
     fn buffer_read_bytes(&self, id: ResourceId, offset: u64, size: u64) -> Result<Vec<u8>, String> {
-        // Single-homed readback: read from whichever tier last rendered it.
-        match self.policy.lock().unwrap().read_tier(id.raw()) {
-            Tier::Tier2 => self.t2.buffer_read_bytes(id, offset, size),
-            Tier::Tier3 => self.t3.buffer_read_bytes(id, offset, size),
-        }
+        // Single-homed readback: read from whichever tier last rendered it,
+        // materialising the buffer there first if needed.
+        let tier = self.policy.lock().unwrap().read_tier(id.raw());
+        let be: &dyn Backend = match tier { Tier::Tier2 => &*self.t2, Tier::Tier3 => &*self.t3 };
+        self.residency.lock().unwrap().materialize([id.raw()], tier, be);
+        be.buffer_read_bytes(id, offset, size)
     }
 
     fn measured_gpu_time_s(&self) -> Option<f64> { self.t3.measured_gpu_time_s() }
@@ -363,6 +408,25 @@ impl Backend for RoutingBackend {
         }
         drop(policy);
 
+        // Materialise the frame's resources on the dispatch tier *before*
+        // dispatch — a draw against an unmaterialised resource is a wrong
+        // pixel. Use the introspected set when complete; otherwise fall back
+        // to the whole world (an undecoded op might reference a texture).
+        let be: &dyn Backend = match effective {
+            Tier::Tier2 => &*self.t2,
+            Tier::Tier3 => &*self.t3,
+        };
+        {
+            let fr = crate::frame_resources::frame_resources(frame_buf);
+            let mut res = self.residency.lock().unwrap();
+            if fr.complete {
+                let ids = fr.images.iter().chain(&fr.pipelines).chain(&fr.buffers).copied();
+                res.materialize(ids, effective, be);
+            } else {
+                res.materialize_all(effective, be);
+            }
+        }
+
         match effective {
             Tier::Tier2 => self.t2.submit_frame(fence, timeline, frame_buf),
             Tier::Tier3 => self.t3.submit_frame(fence, timeline, frame_buf),
@@ -447,6 +511,11 @@ mod tests {
         // And the router spent NO verdict cycles — every frame was skipped
         // because a pinned surface can't act on a verdict anyway.
         assert_eq!(rb.decision_stats(), (0, 30), "no scoring for a pinned surface");
+        // THE SINGLE-HOMING WIN: the GPU received zero resource uploads —
+        // a CPU-routed surface never materialised on Tier-3.
+        let (t2_res, t3_res) = rb.residency_counts();
+        assert!(t2_res >= 3, "img + pipeline + buffer resident on the CPU");
+        assert_eq!(t3_res, 0, "nothing uploaded to the GPU");
         // Readback follows the writer (Tier-2): marker == 2.
         let px = rb.buffer_read_bytes(dst, 0, 4).unwrap();
         assert_eq!(px, vec![2, 2, 2, 2], "readback from the tier that rendered");
