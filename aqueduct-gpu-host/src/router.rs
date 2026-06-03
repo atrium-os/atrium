@@ -13,7 +13,16 @@
 //! exists. Pure + deterministic; no I/O. The eventual userspace authority
 //! gets its name later (Latin convention, TBD).
 
-use crate::cost_model::{exec_cost, DeviceProfile, ShaderCost};
+use crate::cost_model::{exec_cost, DeviceProfile, ShaderCost, Topology};
+
+/// On a discrete part, widen the migrate-to-GPU deadband and narrow the
+/// revert deadband by this much: migrating onto the GPU pays a one-time
+/// resource upload that must amortize (be reluctant), while reverting
+/// re-renders from main-memory originals (be eager). A heuristic default —
+/// a calibration knob, like the [`crate::cost_model::CalibrationProfile`]
+/// efficiencies — capturing the *direction* of the asymmetry; the exact
+/// magnitude is tunable. Zero under unified memory (migration is free).
+pub const DISCRETE_MIGRATION_BIAS: f64 = 0.2;
 
 /// Where a unit of work runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -445,9 +454,12 @@ impl FrameRouter {
 /// Tier-2 (the safe, already-running CPU default) with a neutral 0.5 vote.
 #[derive(Debug, Clone)]
 pub struct SurfaceRouter {
-    /// Half-width of the migration deadband around 0.5 (reuses the routing
-    /// margin idea: a surface must vote past 0.5±margin/2 to migrate).
-    margin: f64,
+    /// Deadband half-width to migrate **Tier-2 → Tier-3** (vote must exceed
+    /// 0.5 + up_margin/2). Larger = more reluctant to move onto the GPU.
+    up_margin: f64,
+    /// Deadband half-width to revert **Tier-3 → Tier-2** (vote must drop
+    /// below 0.5 − down_margin/2). Smaller = eager to fall back to the CPU.
+    down_margin: f64,
     /// EWMA weight per frame (small = slow migration).
     alpha: f64,
     surfaces: std::collections::HashMap<u32, SurfaceState>,
@@ -462,11 +474,25 @@ struct SurfaceState {
 }
 
 impl SurfaceRouter {
-    /// New tracker. `margin` is the deadband half-width on the smoothed
-    /// vote; `alpha` the per-frame EWMA weight (e.g. 0.1 — a surface needs
-    /// a sustained majority over several frames to migrate).
+    /// New tracker with a **symmetric** deadband (`up_margin = down_margin =
+    /// margin`) — correct for UMA, where migration is free in either
+    /// direction. `alpha` is the per-frame EWMA weight.
     pub fn new(margin: f64, alpha: f64) -> Self {
-        SurfaceRouter { margin, alpha, surfaces: std::collections::HashMap::new() }
+        Self::with_asymmetry(margin, margin, alpha)
+    }
+
+    /// New tracker with an **asymmetric** deadband — for discrete parts,
+    /// where migrating onto the GPU costs a one-time resource upload (so
+    /// `up_margin` is larger: be reluctant, the upload must amortize) but
+    /// reverting re-renders from the main-memory originals (so `down_margin`
+    /// is smaller: fall back eagerly, it's ~free).
+    pub fn with_asymmetry(up_margin: f64, down_margin: f64, alpha: f64) -> Self {
+        SurfaceRouter {
+            up_margin,
+            down_margin,
+            alpha,
+            surfaces: std::collections::HashMap::new(),
+        }
     }
 
     /// Record one frame's `verdict` for `surface`; returns the surface's
@@ -479,8 +505,8 @@ impl SurfaceRouter {
         });
         let target = if verdict == Tier::Tier3 { 1.0 } else { 0.0 };
         s.vote = s.vote * (1.0 - self.alpha) + target * self.alpha;
-        let hi = 0.5 + self.margin / 2.0;
-        let lo = 0.5 - self.margin / 2.0;
+        let hi = 0.5 + self.up_margin / 2.0;
+        let lo = 0.5 - self.down_margin / 2.0;
         match s.tier {
             Tier::Tier2 if s.vote > hi => s.tier = Tier::Tier3,
             Tier::Tier3 if s.vote < lo => s.tier = Tier::Tier2,
@@ -540,8 +566,28 @@ impl RoutingPolicy {
     /// (see [`SurfaceRouter::new`]); `home` is the pin tier for ineligible
     /// surfaces (use [`Tier::Tier2`]).
     pub fn new(margin: f64, alpha: f64, home: Tier) -> Self {
+        Self::from_surface_router(SurfaceRouter::new(margin, alpha), home)
+    }
+
+    /// New policy whose per-surface migration is **topology-aware**: a
+    /// symmetric deadband under unified memory (migration is free), but an
+    /// asymmetric one on a discrete part (reluctant to migrate onto the GPU
+    /// — the upload must amortize — eager to revert, which is ~free). See
+    /// [`DISCRETE_MIGRATION_BIAS`].
+    pub fn for_profile(profile: &DeviceProfile, base_margin: f64, alpha: f64, home: Tier) -> Self {
+        let sr = if profile.topology == Topology::Discrete && !profile.passthrough {
+            let up = base_margin + DISCRETE_MIGRATION_BIAS;
+            let down = (base_margin - DISCRETE_MIGRATION_BIAS).max(0.05);
+            SurfaceRouter::with_asymmetry(up, down, alpha)
+        } else {
+            SurfaceRouter::new(base_margin, alpha)
+        };
+        Self::from_surface_router(sr, home)
+    }
+
+    fn from_surface_router(surfaces: SurfaceRouter, home: Tier) -> Self {
         RoutingPolicy {
-            surfaces: SurfaceRouter::new(margin, alpha),
+            surfaces,
             certs: crate::certify::CertificationRegistry::new(),
             home,
             surface_pipelines: std::collections::HashMap::new(),
@@ -843,6 +889,57 @@ mod tests {
             let v = if i % 2 == 0 { Tier::Tier3 } else { Tier::Tier2 };
             assert_eq!(sr.record(surf2, v), Tier::Tier2, "50/50 stays put");
         }
+    }
+
+    fn frames_to_reach(sr: &mut SurfaceRouter, surf: u32, want: Tier, feed: Tier) -> usize {
+        for i in 1..=200 {
+            if sr.record(surf, feed) == want {
+                return i;
+            }
+        }
+        usize::MAX
+    }
+
+    #[test]
+    fn asymmetric_deadband_migrates_reluctantly_and_reverts_eagerly() {
+        // Symmetric (UMA-style) vs asymmetric (discrete-style: hard up, easy
+        // down) over the same vote stream.
+        let mut sym = SurfaceRouter::new(0.3, 0.1);
+        let mut asym = SurfaceRouter::with_asymmetry(0.5, 0.1, 0.1);
+
+        // Migrating onto the GPU: the asymmetric (discrete) router needs a
+        // longer sustained Tier-3 run.
+        let sym_up = frames_to_reach(&mut sym, 1, Tier::Tier3, Tier::Tier3);
+        let asym_up = frames_to_reach(&mut asym, 1, Tier::Tier3, Tier::Tier3);
+        assert!(asym_up > sym_up,
+            "discrete is more reluctant to migrate to GPU (asym {asym_up} > sym {sym_up})");
+
+        // Now both are on Tier-3; reverting to CPU: the asymmetric router
+        // falls back in fewer frames (revert is cheap).
+        let sym_down = frames_to_reach(&mut sym, 1, Tier::Tier2, Tier::Tier2);
+        let asym_down = frames_to_reach(&mut asym, 1, Tier::Tier2, Tier::Tier2);
+        assert!(asym_down < sym_down,
+            "discrete reverts to CPU eagerly (asym {asym_down} < sym {sym_down})");
+    }
+
+    #[test]
+    fn for_profile_is_symmetric_on_uma_asymmetric_on_discrete() {
+        use crate::certify::Certification;
+        let mk = |prof: &DeviceProfile| {
+            let mut p = RoutingPolicy::for_profile(prof, 0.3, 0.1, Tier::Tier2);
+            p.note_surface_pipeline(1, 0x100);
+            p.certify(0x100, Certification::Certified);
+            // Count frames of sustained Tier-3 verdicts until it migrates.
+            let mut n = usize::MAX;
+            for i in 1..=200 {
+                if p.record_frame(1, Tier::Tier3) == Tier::Tier3 { n = i; break; }
+            }
+            n
+        };
+        let uma = mk(&DeviceProfile::uma_apple_m4_max());
+        let disc = mk(&DeviceProfile::discrete_rdna3_pcie4x16());
+        assert!(disc > uma,
+            "discrete profile migrates more reluctantly than UMA (disc {disc} > uma {uma})");
     }
 
     #[test]
