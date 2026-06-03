@@ -154,6 +154,20 @@ pub struct MoltenVkBackend {
     pipelines: Mutex<HashMap<u32, MvkPipeline>>,
     /// Serialises command-buffer record + submit (one graphics queue).
     submit_lock: Mutex<()>,
+
+    /// 2-slot TIMESTAMP query pool for measured GPU exec time (null if the
+    /// device/queue doesn't support timestamps). Reused per submit —
+    /// `submit_lock` serialises access. The measured-truth half of the
+    /// device-model calibration (D-M6): real silicon time to ground the
+    /// analytic roofline against.
+    query_pool: vk::QueryPool,
+    /// Nanoseconds per timestamp tick (`VkPhysicalDeviceLimits::
+    /// timestampPeriod`).
+    timestamp_period_ns: f32,
+    /// Last measured GPU exec time, nanoseconds (0 until first timed frame).
+    last_gpu_ns: AtomicU64,
+    /// Cumulative measured GPU exec time across all timed frames, ns.
+    total_gpu_ns: AtomicU64,
 }
 
 /// Construction errors for [`MoltenVkBackend::new`]. Each variant
@@ -331,6 +345,28 @@ impl MoltenVkBackend {
             instance.get_physical_device_memory_properties(physical)
         };
 
+        // Measured-GPU-time support (D-M6): the device must report a
+        // non-zero timestampPeriod and the chosen queue family must have
+        // timestampValidBits > 0. MoltenVK on Apple Silicon satisfies both.
+        let props = unsafe { instance.get_physical_device_properties(physical) };
+        let timestamp_period_ns = props.limits.timestamp_period;
+        let qf_props =
+            unsafe { instance.get_physical_device_queue_family_properties(physical) };
+        let timestamps_ok = timestamp_period_ns > 0.0
+            && qf_props.get(queue_family as usize)
+                .map(|q| q.timestamp_valid_bits > 0).unwrap_or(false);
+        let query_pool = if timestamps_ok {
+            let qpi = vk::QueryPoolCreateInfo::default()
+                .query_type(vk::QueryType::TIMESTAMP).query_count(2);
+            unsafe { device.create_query_pool(&qpi, None) }
+                .unwrap_or(vk::QueryPool::null())
+        } else {
+            vk::QueryPool::null()
+        };
+        if query_pool == vk::QueryPool::null() {
+            log::info!("MoltenVk: GPU timestamps unavailable; measured exec time disabled");
+        }
+
         Ok(Self {
             submissions: AtomicU64::new(0),
             physical,
@@ -347,7 +383,23 @@ impl MoltenVkBackend {
             buffers: Mutex::new(HashMap::new()),
             pipelines: Mutex::new(HashMap::new()),
             submit_lock: Mutex::new(()),
+            query_pool,
+            timestamp_period_ns,
+            last_gpu_ns: AtomicU64::new(0),
+            total_gpu_ns: AtomicU64::new(0),
         })
+    }
+
+    /// Last measured GPU exec time in seconds (0.0 if timestamps are
+    /// unsupported or no frame has been timed yet). The measured-truth
+    /// input for calibrating the device cost model against real silicon.
+    pub fn measured_gpu_time_s(&self) -> f64 {
+        self.last_gpu_ns.load(Ordering::Relaxed) as f64 * 1e-9
+    }
+
+    /// Cumulative measured GPU exec time across all timed frames, seconds.
+    pub fn total_gpu_time_s(&self) -> f64 {
+        self.total_gpu_ns.load(Ordering::Relaxed) as f64 * 1e-9
     }
 
     /// Find a memory type index satisfying `type_bits` (the
@@ -449,6 +501,9 @@ impl Drop for MoltenVkBackend {
             }
             for (_, p) in self.pipelines.lock().unwrap().drain() {
                 if let Some(vk) = p.materialized { self.destroy_pipeline_vk(vk); }
+            }
+            if self.query_pool != vk::QueryPool::null() {
+                self.device.destroy_query_pool(self.query_pool, None);
             }
             self.device.destroy_command_pool(self.cmd_pool, None);
             self.device.destroy_device(None);
@@ -639,6 +694,17 @@ impl MoltenVkBackend {
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
         }
 
+        // Measured GPU exec time (D-M6): reset the pool + stamp the top of
+        // the pipe before any work; stamp the bottom just before close.
+        let timing = self.query_pool != vk::QueryPool::null();
+        if timing {
+            unsafe {
+                dev.cmd_reset_query_pool(cb, self.query_pool, 0, 2);
+                dev.cmd_write_timestamp(
+                    cb, vk::PipelineStageFlags::TOP_OF_PIPE, self.query_pool, 0);
+            }
+        }
+
         let mut images = self.images.lock().unwrap();
         let buffers = self.buffers.lock().unwrap();
         let mut pipelines = self.pipelines.lock().unwrap();
@@ -801,6 +867,12 @@ impl MoltenVkBackend {
         end_rp!();
         drop(pipelines); drop(buffers); drop(images);
 
+        if timing {
+            unsafe {
+                dev.cmd_write_timestamp(
+                    cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE, self.query_pool, 1);
+            }
+        }
         unsafe { dev.end_command_buffer(cb)?; }
         let fence = unsafe { dev.create_fence(&vk::FenceCreateInfo::default(), None)? };
         let cbs = [cb];
@@ -809,6 +881,21 @@ impl MoltenVkBackend {
             dev.queue_submit(self._queue, &[submit], fence)
                 .and_then(|_| dev.wait_for_fences(&[fence], true, u64::MAX))
         };
+        // Read the two timestamps back (the fence guarantees completion)
+        // and record the modeled-vs-measured ground-truth exec time.
+        if timing && res.is_ok() {
+            let mut ts = [0u64; 2];
+            let got = unsafe {
+                dev.get_query_pool_results(
+                    self.query_pool, 0, &mut ts, vk::QueryResultFlags::TYPE_64)
+            };
+            if got.is_ok() {
+                let delta = ts[1].saturating_sub(ts[0]);
+                let ns = (delta as f64 * self.timestamp_period_ns as f64) as u64;
+                self.last_gpu_ns.store(ns, Ordering::Relaxed);
+                self.total_gpu_ns.fetch_add(ns, Ordering::Relaxed);
+            }
+        }
         unsafe {
             for (rp, fb, view) in trash {
                 dev.destroy_framebuffer(fb, None);
@@ -1273,6 +1360,15 @@ mod tests {
         let i = ((H as usize / 2) * W as usize + W as usize / 2) * 4;
         assert_eq!(&px[i..i + 4], &[40, 80, 160, 255],
             "clear colour read back through Metal (got {:?})", &px[i..i + 4]);
+
+        // D-M6 measured-truth: the real GPU spent a plausible, non-zero,
+        // sub-second slice of time on this frame (timestamps supported on
+        // Apple Silicon under MoltenVK). This is the ground truth the
+        // analytic cost model calibrates against.
+        let t = be.measured_gpu_time_s();
+        assert!(t > 0.0 && t < 1.0,
+            "measured GPU exec time should be plausible, got {t} s");
+        assert!(be.total_gpu_time_s() >= t, "cumulative includes the last frame");
     }
 
     /// A SPIR-V vertex shader emitting a full-screen triangle from
