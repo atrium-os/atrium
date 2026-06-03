@@ -1487,6 +1487,30 @@ vssh 'cc -O -o /tmp/cs /tmp/ck/carillon_smoke.c && /tmp/cs'  # -> ROUND-TRIP OK 
 - "doorbell: MSI-X (1 vector)" = good; "using legacy INTx" = blacklist
   still on (loader.conf not applied / not rebooted) or BAR1 not mapped.
 
+**Full real frame VM → host → Metal (verified).** The capstone: the daemon
+in *bridge mode* (`--transport carillon --backend moltenvk`) bridges the
+shared-memory byte FIFOs to a real `Session`, so a VM client drives the
+whole aqueduct-gpu wire to MoltenVK/Metal.
+```sh
+# host: MoltenVk needs the brew lib on the dyld path
+DYLD_LIBRARY_PATH=/opt/homebrew/lib \
+  ~/src/bsd/aqueduct-gpu-host/target/debug/aqueduct-gpu-host \
+    --transport carillon --backend moltenvk \
+    --carillon-sock /tmp/carillon.sock --carillon-shm /tmp/carillon.shm &
+~/src/bsd/scripts/run-vm.sh --carillon
+# host: cross-compile the guest pump (release is fine on the HOST)
+( cd ~/src/bsd/carillon-guest && cargo build --target aarch64-unknown-freebsd --release )
+# in VM: load the kmod, run the guest (drives a real frame, reads it back)
+vssh 'kldstat | grep -q carillon || (cd /tmp/ck && make && kldload ./carillon.ko)'
+vssh '/mnt/host/carillon-guest/target/aarch64-unknown-freebsd/release/carillon-guest'
+#   -> ROUND-TRIP OK: green triangle rendered on the host GPU, delivered to the VM
+```
+- `carillon-guest` reuses `GpuClient` (frame) + `carillon-transport` pumps
+  (byte FIFOs); doorbells are the cdev `ioctl` RING (BAR0 doorbell) / WAIT
+  (MSI-X ISR). Host reuses `Session` verbatim — no transport-specific code.
+- The daemon must be in *bridge mode* (current `--transport carillon`); the
+  old frame-only handler is incompatible with the guest's byte-FIFO wire.
+
 ### `needs_render` whitelist must include WM-state changes
 - The server only re-renders when `process_commands` returns `needs_render = true`. The trigger list is whitelisted — historically just `CMD_RENDER` (0x0300) and `CMD_FRAME_END` (0x0304). Any command that changes WM-visible state (window create/destroy/move/title — opcodes `0x05xx`) must also flip the bit, otherwise the command processes correctly but the screen stays stale until the next user input fires another redraw. Symptom: clicked close button takes 2–3 s to actually remove the window. Fixed by widening the whitelist to `(opcode & 0xff00) == 0x0500`.
 

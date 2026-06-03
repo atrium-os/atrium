@@ -7,11 +7,17 @@
 > follow Atrium's Latin / classical-architecture convention, because the
 > device + host endpoint live in QEMU, not in the Atrium runtime.*
 
-> **Status.** Design + **end-to-end VM-verified (T0 host loopback +
-> T1 guest kmod)**. The full doorbell round-trip works in the FreeBSD VM,
-> interrupt-driven over **MSI-X via the GIC ITS** (ROUND-TRIP OK in
-> ~0.02 s; the MSI-X ISR fires, no spin/poll). See "VM bring-up
-> (verified)" below for the platform requirements + the MSI-X root-cause.
+> **Status.** **COMPLETE — full real frame VM → host → Metal, verified.**
+> A FreeBSD-VM userspace program (`carillon-guest`) drives the whole
+> aqueduct-gpu wire through `/dev/carillon0` (MSI-X doorbell + shared
+> memory) to the host daemon's `Session` → `MoltenVkBackend` → Metal on
+> the Apple M4 Max; the rendered green triangle returns through the rings
+> (`ROUND-TRIP OK`, `centre pixel = [51,217,77,255]`). Host `Session` +
+> guest `GpuClient` are reused **verbatim** over the Carillon byte-stream
+> bridge; the transport core is the shared `carillon-transport` crate.
+> Earlier milestones: T0 host loopback, T1 guest kmod, the MSI-X doorbell
+> root-cause, the host-side bridge→Metal test (`carillon_wire`). See "VM
+> bring-up (verified)" below for the run recipe + the MSI-X requirements.
 > The forward-looking replacement for the venus
 > paravirt path (`atrium-venus.md`, superseded) and for the *polling*
 > ivshmem sketch in `aqueduct-gpu.md` §6.1–6.2. This document specifies
