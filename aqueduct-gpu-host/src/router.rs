@@ -492,10 +492,107 @@ impl SurfaceRouter {
     }
 }
 
+/// The gated per-surface dispatch decision — the brain of the dual-backend
+/// routing layer (stage 2 of acting on the verdict). It combines what a
+/// surface *wants* (the [`SurfaceRouter`]'s slow-migrated assignment) with
+/// what it's *allowed* (the [`crate::certify::CertificationRegistry`] gate),
+/// and tracks single-homed readback routing.
+///
+/// Rule: a surface follows its [`SurfaceRouter`] assignment **only if every
+/// pipeline it uses is certified tier-equivalent**; otherwise it is pinned
+/// to the `home` tier (Tier-2, the always-available CPU default). So routing
+/// degrades to "stay home", never to a wrong pixel. Rendered output is
+/// single-homed, so a buffer's readback goes to whichever tier last wrote
+/// it.
+#[derive(Debug, Clone)]
+pub struct RoutingPolicy {
+    surfaces: SurfaceRouter,
+    certs: crate::certify::CertificationRegistry,
+    /// The safe fallback tier for ineligible surfaces (Tier-2).
+    home: Tier,
+    /// Pipelines each surface has drawn with (for the certification gate).
+    surface_pipelines: std::collections::HashMap<u32, std::collections::BTreeSet<u32>>,
+    /// Last tier to write each buffer (single-homed readback).
+    last_writer: std::collections::HashMap<u32, Tier>,
+}
+
+impl RoutingPolicy {
+    /// New policy. `margin`/`alpha` tune the per-surface slow migration
+    /// (see [`SurfaceRouter::new`]); `home` is the pin tier for ineligible
+    /// surfaces (use [`Tier::Tier2`]).
+    pub fn new(margin: f64, alpha: f64, home: Tier) -> Self {
+        RoutingPolicy {
+            surfaces: SurfaceRouter::new(margin, alpha),
+            certs: crate::certify::CertificationRegistry::new(),
+            home,
+            surface_pipelines: std::collections::HashMap::new(),
+            last_writer: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Record a pipeline's tier-equivalence certification.
+    pub fn certify(&mut self, pipeline: u32, c: crate::certify::Certification) {
+        self.certs.set(pipeline, c);
+    }
+
+    /// Note that `surface` draws with `pipeline` (builds the set the gate
+    /// checks).
+    pub fn note_surface_pipeline(&mut self, surface: u32, pipeline: u32) {
+        self.surface_pipelines.entry(surface).or_default().insert(pipeline);
+    }
+
+    /// Whether `surface` is currently eligible to leave the home tier (all
+    /// its pipelines certified).
+    pub fn eligible(&self, surface: u32) -> bool {
+        match self.surface_pipelines.get(&surface) {
+            Some(ps) => self.certs.surface_eligible(ps.iter().copied()),
+            None => false,
+        }
+    }
+
+    /// Fold one frame's `verdict` for `surface` into the slow per-surface
+    /// assignment and return the **effective** dispatch tier: the
+    /// assignment if the surface is certification-eligible, else `home`.
+    pub fn record_frame(&mut self, surface: u32, verdict: Tier) -> Tier {
+        let wanted = self.surfaces.record(surface, verdict);
+        if self.eligible(surface) { wanted } else { self.home }
+    }
+
+    /// Record that `tier` wrote `buffer` (for single-homed readback).
+    pub fn note_write(&mut self, buffer: u32, tier: Tier) {
+        self.last_writer.insert(buffer, tier);
+    }
+
+    /// Which tier to read `buffer` back from — the last writer, or `home`
+    /// if never written here.
+    pub fn read_tier(&self, buffer: u32) -> Tier {
+        self.last_writer.get(&buffer).copied().unwrap_or(self.home)
+    }
+
+    /// `(tier2, tier3)` *effective* surface assignment counts (gated).
+    pub fn effective_counts(&self) -> (usize, usize) {
+        let mut t2 = 0;
+        let mut t3 = 0;
+        for (&surf, _) in self.surface_pipelines.iter() {
+            let eff = if self.eligible(surf) {
+                self.surfaces.assignment(surf).unwrap_or(self.home)
+            } else {
+                self.home
+            };
+            match eff {
+                Tier::Tier2 => t2 += 1,
+                Tier::Tier3 => t3 += 1,
+            }
+        }
+        (t2, t3)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cost_model::DeviceProfile;
+    use crate::certify::Certification;
 
     fn shader(alu: u32, mem: u32) -> ShaderCost {
         ShaderCost { alu_ops: alu, mem_ops: mem, other_ops: 0 }
@@ -737,6 +834,46 @@ mod tests {
         sr.record(3, Tier::Tier3);                    // new, still Tier-2
         assert_eq!(sr.len(), 3);
         assert_eq!(sr.assignment_counts(), (2, 1), "two on CPU, one migrated to GPU");
+    }
+
+    #[test]
+    fn policy_pins_uncertified_surface_to_home_even_when_it_wants_to_move() {
+        // A heavy surface wants Tier-3, but its pipeline is uncertified →
+        // it stays pinned on the home tier (Tier-2), never a wrong pixel.
+        let mut p = RoutingPolicy::new(0.3, 0.1, Tier::Tier2);
+        let (surf, pipe) = (0x10, 0x100);
+        p.note_surface_pipeline(surf, pipe);
+        for _ in 0..40 {
+            assert_eq!(p.record_frame(surf, Tier::Tier3), Tier::Tier2,
+                "uncertified → pinned home regardless of the verdict");
+        }
+        assert!(!p.eligible(surf));
+    }
+
+    #[test]
+    fn policy_follows_the_assignment_once_certified() {
+        let mut p = RoutingPolicy::new(0.3, 0.1, Tier::Tier2);
+        let (surf, pipe) = (0x11, 0x101);
+        p.note_surface_pipeline(surf, pipe);
+        p.certify(pipe, Certification::Certified);
+        assert!(p.eligible(surf));
+        // Now sustained Tier-3 verdicts actually migrate the surface to the
+        // GPU (slow — not on the first frame).
+        assert_eq!(p.record_frame(surf, Tier::Tier3), Tier::Tier2, "still home at first");
+        let mut moved = false;
+        for _ in 0..20 {
+            if p.record_frame(surf, Tier::Tier3) == Tier::Tier3 { moved = true; break; }
+        }
+        assert!(moved, "a certified heavy surface migrates to Tier-3");
+        assert_eq!(p.effective_counts(), (0, 1));
+    }
+
+    #[test]
+    fn policy_routes_readback_to_the_last_writer() {
+        let mut p = RoutingPolicy::new(0.3, 0.1, Tier::Tier2);
+        assert_eq!(p.read_tier(0x55), Tier::Tier2, "unknown buffer → home");
+        p.note_write(0x55, Tier::Tier3);
+        assert_eq!(p.read_tier(0x55), Tier::Tier3, "read from the tier that rendered it");
     }
 
     #[test]
