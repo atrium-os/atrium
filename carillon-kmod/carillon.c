@@ -40,6 +40,9 @@
 #include <machine/bus.h>
 #include <machine/resource.h>
 
+#include <vm/vm.h>
+#include <vm/pmap.h>
+
 #include <dev/pci/pcireg.h>
 #include <dev/pci/pcivar.h>
 
@@ -59,6 +62,12 @@ struct carillon_softc {
 	struct resource *shm_res;
 	vm_paddr_t	shm_paddr;
 	bus_size_t	shm_size;
+
+	/* BAR1: MSI-X table + PBA. pci_alloc_msix requires the table BAR to
+	 * be allocated + RF_ACTIVE in our resource list before it will hand
+	 * out vectors, so the driver must map it (the bus does not). */
+	int		msix_bar_rid;
+	struct resource *msix_bar_res;
 
 	/* MSI-X doorbell interrupt. */
 	int		irq_rid;
@@ -149,8 +158,15 @@ carillon_mmap(struct cdev *cdev, vm_ooffset_t offset, vm_paddr_t *paddr,
 		return (EINVAL);
 
 	*paddr = sc->shm_paddr + offset;
+	/*
+	 * Map the shared region WRITE_BACK (cacheable). Leaving memattr
+	 * untouched makes ARM64 default to DEVICE (uncacheable), which is
+	 * wrong for the SPSC rings + frame arena. Matches the proven
+	 * atrium_virtio_gpu.c BAR mapping; the guest issues explicit cache
+	 * maintenance where cross-HVF coherency needs it.
+	 */
 	if (memattr != NULL)
-		*memattr = VM_MEMATTR_DEFAULT;
+		*memattr = VM_MEMATTR_WRITE_BACK;
 	return (0);
 }
 
@@ -174,7 +190,6 @@ carillon_ioctl(struct cdev *cdev, u_long cmd, caddr_t data,
 	case CARILLON_WAIT: {
 		struct carillon_wait *w = (struct carillon_wait *)data;
 		int timo, err;
-		uint32_t seen;
 
 		timo = (w->timeout_ms == 0) ? 0 :
 		    (int)((uint64_t)w->timeout_ms * hz / 1000);
@@ -182,13 +197,17 @@ carillon_ioctl(struct cdev *cdev, u_long cmd, caddr_t data,
 			timo = 1;
 
 		mtx_lock(&sc->lock);
-		seen = sc->db_seq;
 		err = 0;
-		/* Sleep until a new doorbell arrives (db_seq advances). */
-		if (sc->db_seq == seen)
+		/*
+		 * Edge-safe: sleep only while the doorbell counter has not
+		 * advanced past the caller's last-seen value. A doorbell that
+		 * fired between the caller's ring and this wait already bumped
+		 * db_seq, so we return immediately without losing it.
+		 */
+		if (sc->db_seq == w->seq)
 			err = msleep(&sc->db_seq, &sc->lock, PCATCH,
 			    "carwait", timo);
-		w->woke = (sc->db_seq != seen) ? 1 : 0;
+		w->seq = sc->db_seq;
 		mtx_unlock(&sc->lock);
 
 		/* EWOULDBLOCK (timeout) is not an error to the caller. */
@@ -249,19 +268,40 @@ carillon_attach(device_t dev)
 	sc->shm_paddr = rman_get_start(sc->shm_res);
 	sc->shm_size = rman_get_size(sc->shm_res);
 
-	/* MSI-X: one vector for the host->guest doorbell. */
+	/*
+	 * Map BAR1 (MSI-X table + PBA) so pci_alloc_msix accepts it. Both
+	 * the table and PBA live in BAR1 here (same BAR), so this one
+	 * allocation covers both. Non-fatal: if it fails we just take INTx.
+	 */
+	sc->msix_bar_rid = PCIR_BAR(1);
+	sc->msix_bar_res = bus_alloc_resource_any(dev, SYS_RES_MEMORY,
+	    &sc->msix_bar_rid, RF_ACTIVE);
+	if (sc->msix_bar_res == NULL)
+		device_printf(dev, "warning: cannot map BAR1 (MSI-X table); "
+		    "MSI-X will be unavailable\n");
+
+	/*
+	 * Doorbell interrupt. Prefer MSI-X (one vector); fall back to legacy
+	 * INTx when MSI-X is unavailable. Under macOS HVF, guest MSI
+	 * allocation fails platform-wide (every PCI device falls back to
+	 * INTx), and the Atrium QEMU ivshmem patch raises INTx via its
+	 * poll-timer when MSI-X is off — so INTx is the working doorbell on
+	 * the bring-up host. On real HW / working-MSI platforms this still
+	 * takes the MSI-X path. The table BAR is mapped by pci_alloc_msix
+	 * internally — do NOT pre-allocate it.
+	 */
 	msix_count = 1;
-	if (pci_alloc_msix(dev, &msix_count) == 0 && msix_count == 1) {
+	if (pci_alloc_msix(dev, &msix_count) == 0 && msix_count >= 1) {
 		sc->msix_alloced = 1;
 		sc->irq_rid = 1; /* MSI-X vectors start at rid 1 */
+		device_printf(dev, "doorbell: MSI-X (1 vector)\n");
 	} else {
-		device_printf(dev, "MSI-X allocation failed\n");
-		err = ENXIO;
-		goto fail;
+		sc->irq_rid = 0; /* legacy INTx */
+		device_printf(dev, "doorbell: MSI-X unavailable, using legacy INTx\n");
 	}
 
 	sc->irq_res = bus_alloc_resource_any(dev, SYS_RES_IRQ, &sc->irq_rid,
-	    RF_ACTIVE);
+	    RF_ACTIVE | RF_SHAREABLE);
 	if (sc->irq_res == NULL) {
 		device_printf(dev, "cannot allocate IRQ resource\n");
 		err = ENXIO;
@@ -294,7 +334,7 @@ carillon_attach(device_t dev)
 	}
 
 	device_printf(dev,
-	    "attached: BAR2 shmem %ju bytes, MSI-X doorbell, /dev/carillon0\n",
+	    "attached: BAR2 shmem %ju bytes, doorbell ready, /dev/carillon0\n",
 	    (uintmax_t)sc->shm_size);
 	return (0);
 
@@ -305,6 +345,9 @@ fail:
 		bus_release_resource(dev, SYS_RES_IRQ, sc->irq_rid, sc->irq_res);
 	if (sc->msix_alloced)
 		pci_release_msi(dev);
+	if (sc->msix_bar_res != NULL)
+		bus_release_resource(dev, SYS_RES_MEMORY, sc->msix_bar_rid,
+		    sc->msix_bar_res);
 	if (sc->shm_res != NULL)
 		bus_release_resource(dev, SYS_RES_MEMORY, sc->shm_rid, sc->shm_res);
 	if (sc->reg_res != NULL)
@@ -326,6 +369,9 @@ carillon_detach(device_t dev)
 		bus_release_resource(dev, SYS_RES_IRQ, sc->irq_rid, sc->irq_res);
 	if (sc->msix_alloced)
 		pci_release_msi(dev);
+	if (sc->msix_bar_res != NULL)
+		bus_release_resource(dev, SYS_RES_MEMORY, sc->msix_bar_rid,
+		    sc->msix_bar_res);
 	if (sc->shm_res != NULL)
 		bus_release_resource(dev, SYS_RES_MEMORY, sc->shm_rid, sc->shm_res);
 	if (sc->reg_res != NULL)

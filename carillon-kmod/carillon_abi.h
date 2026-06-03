@@ -65,14 +65,19 @@
  *              same protocol as src/carillon.rs::GuestRing.
  *   ioctl CARILLON_RING — ring the host doorbell (after staging a frame
  *              + advancing sub_write). One BAR0 doorbell write.
- *   ioctl CARILLON_WAIT — park the calling thread on the completion
- *              waitqueue (woken by the MSI-X ISR). No spin. Returns when
- *              a completion doorbell has arrived since the last wait, or
- *              after `timeout_ms` (0 = block forever).
+ *   ioctl CARILLON_WAIT — park the calling thread on the doorbell
+ *              waitqueue (woken by the ISR). No spin. `seq` carries the
+ *              last-observed doorbell counter in, and the current counter
+ *              out; the kernel only sleeps while the counter has not
+ *              advanced past `seq`, so a doorbell that arrived between
+ *              ringing and waiting is never lost. Returns after a
+ *              doorbell or after `timeout_ms` (0 = block forever).
+ *              Typical loop: ring; then { drain completion ring; if
+ *              empty, CARILLON_WAIT(seq); seq = out; } until satisfied.
  */
 struct carillon_wait {
-	uint32_t timeout_ms; /* 0 = block forever */
-	uint32_t woke;       /* out: 1 if a doorbell arrived, 0 on timeout */
+	uint32_t timeout_ms; /* in: 0 = block forever */
+	uint32_t seq;        /* in: last-seen doorbell seq; out: current seq */
 };
 
 #define CARILLON_RING _IO('C', 1)
