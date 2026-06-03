@@ -127,6 +127,12 @@ fn run() -> i32 {
     let backend_id: BackendId = hs.backend;
     println!("carillon-guest: handshake ok, backend vendor={:?}", backend_id.vendor);
 
+    // Routing demo: drive sustained heavy frames so the host RoutingBackend
+    // migrates this surface Tier-2 → Tier-3 (watch the host daemon log).
+    if std::env::var("CARILLON_ROUTING").is_ok() {
+        return routing_demo(&mut client, backend_id);
+    }
+
     let img_mem = client.allocate_memory((W * H * 4) as u64, MemoryUsage::ImageBacking).unwrap();
     let image = client.create_image(ImageCreatePayload {
         image_id: ResourceId(0), backing_region: img_mem.region_id, region_offset: 0,
@@ -189,6 +195,116 @@ fn run() -> i32 {
         eprintln!("FAIL: centre pixel is not the green triangle");
         2
     }
+}
+
+/// Drive a sustained run of heavy frames through one surface so the host
+/// RoutingBackend migrates it Tier-2 → Tier-3. The migration is reported in
+/// the host daemon log ("routing: frame N → … surfaces tier2=… tier3=…").
+fn routing_demo(client: &mut GpuClient, backend_id: BackendId) -> i32 {
+    const RW: u32 = 512;
+    const RH: u32 = 512;
+    let img_mem = client.allocate_memory((RW * RH * 4) as u64, MemoryUsage::ImageBacking).unwrap();
+    let image = client.create_image(ImageCreatePayload {
+        image_id: ResourceId(0), backing_region: img_mem.region_id, region_offset: 0,
+        format: 37, width: RW, height: RH, depth: 1, mip_levels: 1, array_layers: 1, usage: 0x07,
+    }).unwrap();
+    let buf_mem = client.allocate_memory((RW * RH * 4) as u64, MemoryUsage::Staging).unwrap();
+    let buffer = client.create_buffer(BufferCreatePayload {
+        buffer_id: ResourceId(0), backing_region: buf_mem.region_id, region_offset: 0,
+        size: (RW * RH * 4) as u64, usage: 0x01,
+    }).unwrap();
+    let vs = build_fullscreen_tri_vs();
+    let fs = build_heavy_grey_fs(800);
+    let vs_id = client.upload_shader(sha256(&vs), ShaderKind::SpirV, backend_id, vs).unwrap();
+    let fs_id = client.upload_shader(sha256(&fs), ShaderKind::SpirV, backend_id, fs).unwrap();
+    let pipe = client.create_pipeline(PipelineKind::Graphics, vec![vs_id, fs_id], Vec::new()).unwrap();
+    thread::sleep(Duration::from_millis(50));
+    println!("carillon-guest: ROUTING DEMO — 16 heavy 512x512 frames; \
+              watch the host daemon log for the Tier-2→Tier-3 migration");
+
+    for t in 1..=16u64 {
+        let fence = client.create_fence().unwrap();
+        let mut fb = client.frame_builder();
+        let mut brp = image.raw().to_le_bytes().to_vec();
+        brp.extend_from_slice(&[10u8, 10, 10, 255]);
+        brp.extend_from_slice(&0u32.to_le_bytes());
+        fb.push(FrameOp::BeginRenderPass, &brp).unwrap();
+        fb.push(FrameOp::BindPipeline, &pipe.raw().to_le_bytes()).unwrap();
+        let mut draw = Vec::new();
+        for v in [3u32, 1, 0, 0] { draw.extend_from_slice(&v.to_le_bytes()); }
+        fb.push(FrameOp::Draw, &draw).unwrap();
+        fb.push(FrameOp::EndRenderPass, &[]).unwrap();
+        let mut cib = image.raw().to_le_bytes().to_vec();
+        cib.extend_from_slice(&buffer.raw().to_le_bytes());
+        cib.extend_from_slice(&0u32.to_le_bytes());
+        cib.extend_from_slice(&1u32.to_le_bytes());
+        let mut reg = vec![0u8; 56];
+        reg[44..48].copy_from_slice(&RW.to_le_bytes());
+        reg[48..52].copy_from_slice(&RH.to_le_bytes());
+        reg[52..56].copy_from_slice(&1u32.to_le_bytes());
+        cib.extend_from_slice(&reg);
+        fb.push(FrameOp::CopyImgToBuf, &cib).unwrap();
+        client.submit_frame(fence, fb, t).unwrap();
+        if !client.wait_fence(fence, 30_000_000_000).unwrap() {
+            eprintln!("FAIL: frame {t} fence never signalled");
+            return 2;
+        }
+        println!("carillon-guest: frame {t} done");
+    }
+
+    // Tiny centre readback (4 bytes) — verify the grey rendered on whatever
+    // tier the surface migrated to.
+    let off = ((RH as u64 / 2) * RW as u64 + RW as u64 / 2) * 4;
+    let px = match client.read_buffer(buffer, off, 4) {
+        Ok(p) => p,
+        Err(e) => { eprintln!("FAIL: readback: {e}"); return 2; }
+    };
+    println!("carillon-guest: centre pixel = {:?}", px);
+    if px[0] > 210 && px[0] < 245 && px[3] == 255 {
+        println!("ROUTING DEMO OK: heavy grey rendered + delivered through Carillon \
+                  (migration tier in the host daemon log)");
+        0
+    } else {
+        eprintln!("FAIL: centre pixel not the expected grey (~230)");
+        2
+    }
+}
+
+/// Heavy FS: acc = 0.1 then `n` real FAdds of 0.001 (a true dependent chain),
+/// output grey (acc,acc,acc,1). The op count makes the modeled cost favour
+/// Tier-3 over a 512x512 frame.
+fn build_heavy_grey_fs(n: u32) -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode, ExecutionModel, FunctionControl,
+        MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let f32t = b.type_float(32, None);
+    let vec4 = b.type_vector(f32t, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let ptr_out = b.type_pointer(None, StorageClass::Output, vec4);
+    let out = b.variable(ptr_out, None, StorageClass::Output, None);
+    b.decorate(out, Decoration::Location, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let start = b.constant_bit32(f32t, 0.1f32.to_bits());
+    let delta = b.constant_bit32(f32t, 0.001f32.to_bits());
+    let one = b.constant_bit32(f32t, 1.0f32.to_bits());
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let mut acc = start;
+    for _ in 0..n { acc = b.f_add(f32t, None, acc, delta).unwrap(); }
+    let color = b.composite_construct(vec4, None, vec![acc, acc, acc, one]).unwrap();
+    b.store(out, color, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![out]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+    let words: Vec<u32> = b.module().assemble();
+    words.iter().flat_map(|w| w.to_le_bytes()).collect()
 }
 
 // ── SPIR-V builders (fullscreen tri VS + const-colour FS) ───────────────
