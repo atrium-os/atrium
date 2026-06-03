@@ -62,6 +62,9 @@ pub struct RoutingBackend {
     policy: Mutex<RoutingPolicy>,
     pipelines: Mutex<HashMap<u32, (ShaderCost, ShaderCost)>>,
     images: Mutex<HashMap<u32, (u32, u32)>>,
+    /// buffer id → size, to classify a full-coverage write as FullWrite
+    /// (so a fully-rewritten dynamic buffer collapses in the retain-log).
+    buffer_sizes: Mutex<HashMap<u32, u64>>,
     frames: AtomicU64,
     /// Frames for which a full routing verdict was computed (the surface
     /// was certification-eligible, so the decision could actually change
@@ -103,6 +106,7 @@ impl RoutingBackend {
             policy: Mutex::new(policy),
             pipelines: Mutex::new(HashMap::new()),
             images: Mutex::new(HashMap::new()),
+            buffer_sizes: Mutex::new(HashMap::new()),
             frames: AtomicU64::new(0),
             scored: AtomicU64::new(0),
             skipped: AtomicU64::new(0),
@@ -134,6 +138,12 @@ impl RoutingBackend {
     /// homing win (an unused tier should stay near zero).
     pub fn residency_counts(&self) -> (usize, usize) {
         self.residency.lock().unwrap().resident_counts()
+    }
+
+    /// Retained-op count for `resource` — observability for retain-log
+    /// bounding (stays small under repeated full re-uploads).
+    pub fn resource_op_count(&self, resource: ResourceId) -> usize {
+        self.residency.lock().unwrap().op_count(resource.raw())
     }
 
     /// `(scored, skipped)` frame counts — the router's own decision
@@ -230,9 +240,11 @@ impl Backend for RoutingBackend {
         self.destroy(id.raw(), move |b| b.depth_image_destroyed(id));
     }
     fn buffer_created(&self, id: ResourceId, size: u64) {
+        self.buffer_sizes.lock().unwrap().insert(id.raw(), size);
         self.record(id.raw(), crate::residency::OpKind::Create, move |b| b.buffer_created(id, size));
     }
     fn buffer_destroyed(&self, id: ResourceId) {
+        self.buffer_sizes.lock().unwrap().remove(&id.raw());
         self.destroy(id.raw(), move |b| b.buffer_destroyed(id));
     }
     #[allow(clippy::too_many_arguments)]
@@ -313,8 +325,17 @@ impl Backend for RoutingBackend {
     fn image_write_region_pixels(
         &self, id: ResourceId, dx: u32, dy: u32, w: u32, h: u32, row_pitch: u32, pixels: &[u8],
     ) -> Result<(), String> {
+        // A region covering the whole image is a full overwrite → collapse.
+        let covers_all = dx == 0 && dy == 0
+            && self.images.lock().unwrap().get(&id.raw())
+                .map(|&(iw, ih)| w >= iw && h >= ih).unwrap_or(false);
+        let kind = if covers_all {
+            crate::residency::OpKind::FullWrite
+        } else {
+            crate::residency::OpKind::Write
+        };
         let pixels = pixels.to_vec();
-        self.record(id.raw(), crate::residency::OpKind::Write, move |b| {
+        self.record(id.raw(), kind, move |b| {
             if let Err(e) = b.image_write_region_pixels(id, dx, dy, w, h, row_pitch, &pixels) {
                 log::warn!("routing: deferred image_write_region_pixels: {e}");
             }
@@ -322,8 +343,18 @@ impl Backend for RoutingBackend {
         Ok(())
     }
     fn buffer_write_bytes(&self, id: ResourceId, offset: u64, bytes: &[u8]) -> Result<(), String> {
+        // A write from offset 0 spanning the whole buffer is a full overwrite
+        // → collapse (the common dynamic-uniform-buffer rewrite).
+        let covers_all = offset == 0
+            && self.buffer_sizes.lock().unwrap().get(&id.raw())
+                .map(|&size| bytes.len() as u64 >= size).unwrap_or(false);
+        let kind = if covers_all {
+            crate::residency::OpKind::FullWrite
+        } else {
+            crate::residency::OpKind::Write
+        };
         let bytes = bytes.to_vec();
-        self.record(id.raw(), crate::residency::OpKind::Write, move |b| {
+        self.record(id.raw(), kind, move |b| {
             if let Err(e) = b.buffer_write_bytes(id, offset, &bytes) {
                 log::warn!("routing: deferred buffer_write_bytes: {e}");
             }
@@ -612,6 +643,27 @@ mod tests {
         // It never left the CPU (light frame), and everything ran on Tier-2.
         assert_eq!(t3.submits.load(Ordering::Relaxed), 0);
         assert_eq!(t2.submits.load(Ordering::Relaxed), 40);
+    }
+
+    #[test]
+    fn full_buffer_rewrites_stay_bounded_partials_do_not() {
+        let t2 = Counting::new(2);
+        let t3 = Counting::new(3);
+        let rb = RoutingBackend::new(
+            t2.clone(), t3.clone(), DeviceProfile::uma_apple_m4_max(),
+            CpuProfile::apple_m4_max(), GpuPowerModel::apple_m4_max(), RouteMode::Perf);
+        // A 64-byte dynamic uniform buffer, fully rewritten 10× (offset 0,
+        // full span) → classified FullWrite → collapses to create + latest.
+        let dyn_buf = ResourceId(0x100);
+        rb.buffer_created(dyn_buf, 64);
+        for _ in 0..10 { rb.buffer_write_bytes(dyn_buf, 0, &[7u8; 64]).unwrap(); }
+        assert_eq!(rb.resource_op_count(dyn_buf), 2, "create + one full write (9 collapsed)");
+
+        // Partial writes (offset != 0) accumulate — can't be collapsed safely.
+        let part_buf = ResourceId(0x101);
+        rb.buffer_created(part_buf, 64);
+        for i in 0..5 { rb.buffer_write_bytes(part_buf, 8 * i + 8, &[1u8; 4]).unwrap(); }
+        assert_eq!(rb.resource_op_count(part_buf), 6, "create + five partial writes");
     }
 
     #[test]
