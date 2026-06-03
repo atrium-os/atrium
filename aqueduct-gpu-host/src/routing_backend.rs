@@ -1,19 +1,21 @@
 //! `RoutingBackend` — the dual-backend dispatch layer (stage 2 of acting on
 //! the verdict, `docs/spec/energy-policy.md`). It owns a Tier-2 (CPU) and a
-//! Tier-3 (GPU) backend, mirrors resource creation to both so either can
-//! render any frame, and dispatches each frame's `submit_frame` to the tier
-//! the [`RoutingPolicy`] assigns — gated on per-pipeline tier-equivalence
-//! certification, with single-homed readback.
+//! Tier-3 (GPU) backend and dispatches each frame's `submit_frame` to the
+//! tier the [`RoutingPolicy`] assigns — gated on per-pipeline tier-
+//! equivalence certification, with single-homed readback.
 //!
 //! This is the first *behaviour-changing* layer (everything below it only
 //! observed). It is meant to sit behind a flag and a certification step:
 //! until a surface's pipelines are certified, `RoutingPolicy` pins it to the
 //! home tier, so dispatch degrades to "render where you always did".
 //!
-//! Resource handling here mirrors creation to both backends (the simplest
-//! correct mechanism). The spec's single-homed-with-replay is a later
-//! memory/bandwidth optimisation; correctness (no chatter) comes from the
-//! *slow per-surface migration*, not from how resources are homed.
+//! Resources are **single-homed**: ops are recorded against their resource
+//! (via [`crate::residency::ResidencyTracker`]) and materialised onto a tier
+//! only when a frame dispatched there needs them — so a CPU-routed surface
+//! never uploads to VRAM. The frame's resource set ([`crate::frame_resources`])
+//! is materialised before dispatch; a frame that can't be fully introspected
+//! falls back to whole-world materialisation (a missed texture is a wrong
+//! pixel).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,6 +25,21 @@ use aqueduct_gpu::ids::ResourceId;
 use aqueduct_gpu::backends::BackendId;
 
 use crate::backend::Backend;
+
+/// State-slot ids for latest-wins pipeline/image properties in the residency
+/// log (so re-emitted state collapses instead of growing the log).
+mod slot {
+    pub const FORMAT: u8 = 0;
+    pub const RASTER: u8 = 1;
+    pub const LAYOUT: u8 = 2;
+    pub const TIER2: u8 = 3;
+    pub const TIER2_VS: u8 = 4;
+    pub const VS_VARYING: u8 = 5;
+    pub const FS_LOD: u8 = 6;
+    pub const SAMPLE_COUNT: u8 = 7;
+    pub const FS_DERIV: u8 = 8;
+    pub const FS_DEPTH: u8 = 9;
+}
 
 /// Consecutive stable records before a Tier-2 surface counts as "settled".
 const SETTLE_THRESHOLD: u32 = 16;
@@ -93,11 +110,16 @@ impl RoutingBackend {
         }
     }
 
-    /// Record a resource op against `resource` (applied now to any tier the
-    /// resource is already resident on; replayed when a tier materialises
-    /// it).
-    fn record(&self, resource: u32, op: impl Fn(&dyn Backend) + Send + Sync + 'static) {
-        self.residency.lock().unwrap().record(resource, Box::new(op), &*self.t2, &*self.t3);
+    /// Record a `kind`-tagged resource op against `resource` (applied now to
+    /// any tier it's already resident on; replayed on materialise). The kind
+    /// drives retain-log bounding (see [`crate::residency::OpKind`]).
+    fn record(
+        &self,
+        resource: u32,
+        kind: crate::residency::OpKind,
+        op: impl Fn(&dyn Backend) + Send + Sync + 'static,
+    ) {
+        self.residency.lock().unwrap().record(resource, kind, Box::new(op), &*self.t2, &*self.t3);
     }
 
     /// Destroy `resource` on whichever tiers hold it, then forget it.
@@ -188,27 +210,27 @@ impl Backend for RoutingBackend {
     // ── Resource lifecycle: RECORD (materialised lazily per tier). ────
     fn image_created(&self, id: ResourceId, w: u32, h: u32) {
         self.images.lock().unwrap().insert(id.raw(), (w, h));
-        self.record(id.raw(), move |b| b.image_created(id, w, h));
+        self.record(id.raw(), crate::residency::OpKind::Create, move |b| b.image_created(id, w, h));
     }
     fn image_created_layered(&self, id: ResourceId, w: u32, h: u32, layers: u32) {
         self.images.lock().unwrap().insert(id.raw(), (w, h));
-        self.record(id.raw(), move |b| b.image_created_layered(id, w, h, layers));
+        self.record(id.raw(), crate::residency::OpKind::Create, move |b| b.image_created_layered(id, w, h, layers));
     }
     fn set_image_format(&self, id: ResourceId, fmt: u32) {
-        self.record(id.raw(), move |b| b.set_image_format(id, fmt));
+        self.record(id.raw(), crate::residency::OpKind::State(slot::FORMAT), move |b| b.set_image_format(id, fmt));
     }
     fn image_destroyed(&self, id: ResourceId) {
         self.images.lock().unwrap().remove(&id.raw());
         self.destroy(id.raw(), move |b| b.image_destroyed(id));
     }
     fn depth_image_created(&self, id: ResourceId, w: u32, h: u32) {
-        self.record(id.raw(), move |b| b.depth_image_created(id, w, h));
+        self.record(id.raw(), crate::residency::OpKind::Create, move |b| b.depth_image_created(id, w, h));
     }
     fn depth_image_destroyed(&self, id: ResourceId) {
         self.destroy(id.raw(), move |b| b.depth_image_destroyed(id));
     }
     fn buffer_created(&self, id: ResourceId, size: u64) {
-        self.record(id.raw(), move |b| b.buffer_created(id, size));
+        self.record(id.raw(), crate::residency::OpKind::Create, move |b| b.buffer_created(id, size));
     }
     fn buffer_destroyed(&self, id: ResourceId) {
         self.destroy(id.raw(), move |b| b.buffer_destroyed(id));
@@ -219,7 +241,7 @@ impl Backend for RoutingBackend {
         addr: [u8; 3], aniso: f32, min_lod: f32, max_lod: f32,
         cmp_en: u8, cmp_op: u32,
     ) {
-        self.record(id.raw(), move |b| b.sampler_created(
+        self.record(id.raw(), crate::residency::OpKind::Create, move |b| b.sampler_created(
             id, min_f, mag_f, mip_f, addr, aniso, min_lod, max_lod, cmp_en, cmp_op));
     }
     fn sampler_destroyed(&self, id: ResourceId) {
@@ -228,7 +250,7 @@ impl Backend for RoutingBackend {
     fn pipeline_created(&self, id: ResourceId, vs: &[u8], fs: &[u8]) {
         self.pipelines.lock().unwrap().insert(id.raw(), (shader_cost(vs), shader_cost(fs)));
         let (vs, fs) = (vs.to_vec(), fs.to_vec()); // own for deferred replay
-        self.record(id.raw(), move |b| b.pipeline_created(id, &vs, &fs));
+        self.record(id.raw(), crate::residency::OpKind::Create, move |b| b.pipeline_created(id, &vs, &fs));
     }
     fn present(&self, id: ResourceId, surface: u64, frame: u64) {
         // Presentation isn't a resource upload — forward to both (the tier
@@ -237,13 +259,13 @@ impl Backend for RoutingBackend {
         self.t3.present(id, surface, frame);
     }
     fn bind_pipeline_tier2(&self, p: ResourceId, s: crate::Tier2ShaderId) {
-        self.record(p.raw(), move |b| b.bind_pipeline_tier2(p, s));
+        self.record(p.raw(), crate::residency::OpKind::State(slot::TIER2), move |b| b.bind_pipeline_tier2(p, s));
     }
     fn bind_pipeline_tier2_vs(&self, p: ResourceId, s: crate::Tier2ShaderId) {
-        self.record(p.raw(), move |b| b.bind_pipeline_tier2_vs(p, s));
+        self.record(p.raw(), crate::residency::OpKind::State(slot::TIER2_VS), move |b| b.bind_pipeline_tier2_vs(p, s));
     }
     fn bind_pipeline_layout(&self, p: ResourceId, l: aqueduct_gpu::VertexInputState) {
-        self.record(p.raw(), move |b| b.bind_pipeline_layout(p, l.clone()));
+        self.record(p.raw(), crate::residency::OpKind::State(slot::LAYOUT), move |b| b.bind_pipeline_layout(p, l.clone()));
     }
     #[allow(clippy::too_many_arguments)]
     fn bind_pipeline_raster_state(
@@ -257,30 +279,30 @@ impl Backend for RoutingBackend {
         prim_restart: bool,
     ) {
         let blend_extra = blend_extra.to_vec();
-        self.record(p.raw(), move |b| b.bind_pipeline_raster_state(
+        self.record(p.raw(), crate::residency::OpKind::State(slot::RASTER), move |b| b.bind_pipeline_raster_state(
             p, depth, blend, &blend_extra, raster, topo, stencil, prim_restart));
     }
     fn bind_pipeline_vs_varying_bytes(&self, p: ResourceId, b: u32) {
-        self.record(p.raw(), move |be| be.bind_pipeline_vs_varying_bytes(p, b));
+        self.record(p.raw(), crate::residency::OpKind::State(slot::VS_VARYING), move |be| be.bind_pipeline_vs_varying_bytes(p, b));
     }
     fn bind_pipeline_fs_implicit_lod(&self, p: ResourceId, v: bool) {
-        self.record(p.raw(), move |b| b.bind_pipeline_fs_implicit_lod(p, v));
+        self.record(p.raw(), crate::residency::OpKind::State(slot::FS_LOD), move |b| b.bind_pipeline_fs_implicit_lod(p, v));
     }
     fn bind_pipeline_sample_count(&self, p: ResourceId, n: u32) {
-        self.record(p.raw(), move |b| b.bind_pipeline_sample_count(p, n));
+        self.record(p.raw(), crate::residency::OpKind::State(slot::SAMPLE_COUNT), move |b| b.bind_pipeline_sample_count(p, n));
     }
     fn bind_pipeline_fs_derivatives(&self, p: ResourceId, v: bool) {
-        self.record(p.raw(), move |b| b.bind_pipeline_fs_derivatives(p, v));
+        self.record(p.raw(), crate::residency::OpKind::State(slot::FS_DERIV), move |b| b.bind_pipeline_fs_derivatives(p, v));
     }
     fn bind_pipeline_fs_writes_depth(&self, p: ResourceId, v: bool) {
-        self.record(p.raw(), move |b| b.bind_pipeline_fs_writes_depth(p, v));
+        self.record(p.raw(), crate::residency::OpKind::State(slot::FS_DEPTH), move |b| b.bind_pipeline_fs_writes_depth(p, v));
     }
 
     // ── Data movement: writes are RECORDED (replayed on materialise; and
     //    applied now to any live tier). Reads follow the writer. ─────────
     fn image_write_pixels(&self, id: ResourceId, row_pitch: u32, pixels: &[u8]) -> Result<(), String> {
         let pixels = pixels.to_vec();
-        self.record(id.raw(), move |b| {
+        self.record(id.raw(), crate::residency::OpKind::FullWrite, move |b| {
             if let Err(e) = b.image_write_pixels(id, row_pitch, &pixels) {
                 log::warn!("routing: deferred image_write_pixels: {e}");
             }
@@ -292,7 +314,7 @@ impl Backend for RoutingBackend {
         &self, id: ResourceId, dx: u32, dy: u32, w: u32, h: u32, row_pitch: u32, pixels: &[u8],
     ) -> Result<(), String> {
         let pixels = pixels.to_vec();
-        self.record(id.raw(), move |b| {
+        self.record(id.raw(), crate::residency::OpKind::Write, move |b| {
             if let Err(e) = b.image_write_region_pixels(id, dx, dy, w, h, row_pitch, &pixels) {
                 log::warn!("routing: deferred image_write_region_pixels: {e}");
             }
@@ -301,7 +323,7 @@ impl Backend for RoutingBackend {
     }
     fn buffer_write_bytes(&self, id: ResourceId, offset: u64, bytes: &[u8]) -> Result<(), String> {
         let bytes = bytes.to_vec();
-        self.record(id.raw(), move |b| {
+        self.record(id.raw(), crate::residency::OpKind::Write, move |b| {
             if let Err(e) = b.buffer_write_bytes(id, offset, &bytes) {
                 log::warn!("routing: deferred buffer_write_bytes: {e}");
             }
