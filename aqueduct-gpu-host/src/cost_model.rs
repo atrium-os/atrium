@@ -179,6 +179,15 @@ impl DeviceProfile {
     /// expensive compute array (see [`GpuPowerModel`]). That is why
     /// CPU-rendering a sparse surface can still win on a discrete part: you
     /// pay a small damage DMA, not a shader-array wake.
+    ///
+    /// This *also* captures the **consumer/compositor co-location** term: the
+    /// compositor lives where scanout does (it composites into the scanout
+    /// buffer), so a surface rendered on a tier other than `scanout_domain`
+    /// pays exactly this transfer to reach the compositor. It's symmetric
+    /// across topology: on a desktop dGPU (`scanout_domain = Device`) a
+    /// CPU surface (`source = Host`) pays; on a laptop iGPU (`Host`) a dGPU
+    /// surface (`source = Device`) pays. No separate `compositor_domain`
+    /// knob is needed for realistic configurations.
     pub fn present_cost(&self, damage_bytes: u64, source: ScanoutDomain) -> (f64, f64) {
         if self.passthrough
             || self.topology == Topology::Unified
@@ -1222,6 +1231,36 @@ mod tests {
         // …and it scales with damage size (cheap copy path, link bandwidth).
         let (t2, _) = disc.present_cost(2 << 20, ScanoutDomain::Host);
         assert!(t2 > t);
+    }
+
+    #[test]
+    fn consumer_locality_is_captured_by_present_cost_both_topologies() {
+        // The compositor sits at scanout_domain, so present_cost IS the
+        // consumer/compositor co-location term. It's symmetric across
+        // topology: whichever tier renders *away* from scanout pays.
+        let dmg = 1u64 << 16;
+
+        // Desktop dGPU: scanout = Device. CPU render pays, GPU render free.
+        let desktop = DeviceProfile::discrete_rdna3_pcie4x16();
+        assert_eq!(desktop.scanout_domain, ScanoutDomain::Device);
+        assert!(desktop.present_cost(dmg, ScanoutDomain::Host).0 > 0.0,
+            "CPU-rendered surface copies to the GPU compositor/scanout");
+        assert_eq!(desktop.present_cost(dmg, ScanoutDomain::Device), (0.0, 0.0),
+            "GPU-rendered surface is already where the compositor is");
+
+        // Laptop hybrid (iGPU drives the panel): a discrete part whose
+        // scanout is Host. Now the *dGPU* surface pays to reach the Host
+        // compositor, and the CPU/iGPU surface is free — the mirror image.
+        let mut laptop = DeviceProfile::discrete_rdna3_pcie4x16();
+        laptop.scanout_domain = ScanoutDomain::Host;
+        assert!(laptop.present_cost(dmg, ScanoutDomain::Device).0 > 0.0,
+            "dGPU-rendered surface copies to the iGPU/Host compositor");
+        assert_eq!(laptop.present_cost(dmg, ScanoutDomain::Host), (0.0, 0.0));
+
+        // UMA: one physical memory → no consumer transfer either way.
+        let uma = DeviceProfile::uma_apple_m4_max();
+        assert_eq!(uma.present_cost(dmg, ScanoutDomain::Host), (0.0, 0.0));
+        assert_eq!(uma.present_cost(dmg, ScanoutDomain::Device), (0.0, 0.0));
     }
 
     #[test]
