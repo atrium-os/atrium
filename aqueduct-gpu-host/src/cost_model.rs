@@ -894,11 +894,19 @@ impl<B: Backend> Backend for CostModelBackend<B> {
         if n % 60 == 0 {
             let l = self.ledger.lock().unwrap();
             let (rt2, rt3) = *self.route_tally.lock().unwrap();
+            let cal = self.calibration.as_ref().map(|c| *c.lock().unwrap());
+            let cal_str = match cal {
+                Some(c) => format!(
+                    "; calibration comp_eff={:.2} bw_eff={:.2} launch={:.0}us",
+                    c.compute_efficiency, c.bandwidth_efficiency,
+                    c.launch_overhead_s * 1e6),
+                None => String::new(),
+            };
             log::info!(
                 "device-model[{}]: {} frames, {} ops, modeled {:.3} ms exec, \
-                 {:.1} mJ total; routing tally tier2={} tier3={}",
+                 {:.1} mJ total; routing tally tier2={} tier3={}{}",
                 self.profile.name, n, l.len(),
-                l.time_for(OpKind::Exec) * 1e3, l.total_energy_j() * 1e3, rt2, rt3,
+                l.time_for(OpKind::Exec) * 1e3, l.total_energy_j() * 1e3, rt2, rt3, cal_str,
             );
         }
         let ok = self.inner.submit_frame(fence, timeline, frame_buf);
