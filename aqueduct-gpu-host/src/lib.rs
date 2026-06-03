@@ -71,6 +71,7 @@ pub mod backend;
 #[cfg(unix)]
 pub use carillon_transport as carillon;
 pub mod cost_model;
+pub mod router;
 pub mod listener;
 pub mod moltenvk;
 pub mod resources;
@@ -89,6 +90,7 @@ pub use cost_model::{
     exec_cost, spirv_instruction_mix, CostMode, CostModelBackend, DeviceProfile,
     FrameLedger, OpKind, ShaderCost, Topology,
 };
+pub use router::{route, Cost, CpuProfile, RouteMode, Tier};
 pub use tier2_backend::{
     AssembledVertices, PresentCallback, PresentedFrame, Tier2Backend,
 };
