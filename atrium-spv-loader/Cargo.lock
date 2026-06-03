@@ -21,6 +21,7 @@ dependencies = [
  "atrium-spv-blob",
  "atrium-spv-ir",
  "atrium-spv-pcmap",
+ "atrium-spv-runtime",
  "object",
  "pptk-codegen-arm64",
  "thiserror 1.0.69",
@@ -49,6 +50,7 @@ dependencies = [
  "atrium-spv-backend-bespoke",
  "atrium-spv-blob",
  "atrium-spv-frontend",
+ "atrium-spv-ir",
  "atrium-spv-pcmap",
  "libc",
  "libloading",
@@ -59,6 +61,10 @@ dependencies = [
 
 [[package]]
 name = "atrium-spv-pcmap"
+version = "0.1.0"
+
+[[package]]
+name = "atrium-spv-runtime"
 version = "0.1.0"
 
 [[package]]

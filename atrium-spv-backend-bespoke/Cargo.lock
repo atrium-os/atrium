@@ -36,6 +36,7 @@ dependencies = [
  "atrium-spv-ir",
  "atrium-spv-pcmap",
  "atrium-spv-runtime",
+ "libc",
  "libloading",
  "object 0.36.7",
  "pptk-codegen-arm64",
