@@ -1123,8 +1123,12 @@ pub struct IvshmemServer {
     qemu_connected: bool,
 }
 
-// SAFETY: the contained fds + mapping are a stable owned bundle.
+// SAFETY: the contained fds + mapping are a stable owned bundle; the
+// region is Send+Sync and the doorbell fds are only read (wait) / written
+// (notify) — safe to share `&IvshmemServer` across the bridge pump threads
+// (try_accept, the only `&mut` op, is done before the pumps start).
 unsafe impl Send for IvshmemServer {}
+unsafe impl Sync for IvshmemServer {}
 
 impl IvshmemServer {
     /// Create the shm region (stamped), the two doorbell pipes, and bind

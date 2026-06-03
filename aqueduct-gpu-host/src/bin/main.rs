@@ -359,16 +359,16 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Carillon transport: create the `IvshmemServer`, wait for QEMU to
-/// connect (run-vm.sh --carillon), then `serve_ivshmem` — dispatching
-/// each frame's FrameOp stream to the selected backend's `submit_frame`
-/// and ringing the guest on completion. The daemon runs until killed.
+/// Carillon transport (bridge mode): create the `IvshmemServer`, wait for
+/// QEMU to connect (run-vm.sh --carillon), then bridge the shared-memory
+/// byte FIFOs to a real `Session` over a socketpair — so the guest drives
+/// the **full aqueduct-gpu wire** (handshake, resource creation, frame
+/// submit, readback) against the selected backend, exactly as a socket
+/// client would. The daemon runs until killed.
 ///
-/// First end-to-end verification is the VM session: the QEMU `send_init`
-/// handshake + MSI-X delivery + BAR2-cacheable-under-HVF mapping are
-/// only exercised against a real guest. (Resource creation over the
-/// rings — images/shaders/pipelines — is a follow-on; this first cut
-/// drives the frame path against a pre-populated backend.)
+/// Verified host-side by `tests/carillon_wire.rs` (a real frame to Metal
+/// through the same byte FIFOs + bridge). The VM session additionally
+/// exercises the QEMU `send_init` handshake + MSI-X doorbell delivery.
 #[cfg(unix)]
 fn run_carillon(
     sock: &std::path::Path,
@@ -376,9 +376,14 @@ fn run_carillon(
     backend_kind: BackendKind,
     backend: Arc<dyn Backend>,
 ) -> Result<()> {
-    use aqueduct_gpu::ids::{IdNamespace, ResourceId};
-    use aqueduct_gpu_host::carillon::{layout, Doorbell};
-    use aqueduct_gpu_host::{serve_ivshmem, CompDesc, IvshmemServer, SubDesc};
+    use std::os::unix::io::AsRawFd;
+    use std::os::unix::net::UnixStream;
+
+    use aqueduct::Connection;
+    use aqueduct_gpu_host::carillon::{
+        layout, pump_fd_to_stream_with, pump_stream_to_fd_with, Doorbell, Waiter,
+    };
+    use aqueduct_gpu_host::{IvshmemServer, Session};
 
     let mut server = IvshmemServer::new(sock, shm, layout::TOTAL_SIZE)
         .with_context(|| format!("carillon: IvshmemServer on {}", sock.display()))?;
@@ -389,33 +394,56 @@ fn run_carillon(
         shm.display(),
     );
 
-    // Block until QEMU connects + the init handshake completes.
     while !server.try_accept()? {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     log::info!(
-        "carillon: QEMU connected; serving frames on the {:?} backend",
+        "carillon: QEMU connected; bridging the full wire to a Session on \
+         the {:?} backend",
         backend_kind
     );
 
-    // Shutdown self-pipe — unused here (the daemon runs until killed),
-    // but serve_ivshmem multiplexes it so a future signal handler can
-    // ring it for a clean exit.
+    // A real Session on one socketpair end; the bridge pumps shuttle bytes
+    // between the shared-memory FIFOs and the other end.
+    let (sess_sock, bridge_sock) = UnixStream::pair()?;
+    let bridge_fd = bridge_sock.as_raw_fd();
     let shutdown = Doorbell::new()?;
-    let shutdown_fd = shutdown.read_fd();
 
-    let be = backend.clone();
-    let (wakeups, frames) = serve_ivshmem(&server, shutdown_fd, move |sub: &SubDesc, bytes: &[u8]| {
-        let fence = ResourceId::new(IdNamespace::IcdRuntime, sub.fence_id);
-        let ok = be.submit_frame(fence, 1, bytes);
-        CompDesc {
-            kind: if ok { CompDesc::KIND_FRAME_DONE } else { CompDesc::KIND_ERROR },
-            fence_id: sub.fence_id,
-            result: u32::from(!ok),
-            readback_off: 0,
-            readback_len: 0,
-        }
-    })?;
-    log::info!("carillon: serve loop exited ({wakeups} wakeups, {frames} frames)");
+    std::thread::scope(|s| {
+        // Session: reads requests from sess_sock, writes responses back.
+        let be = backend.clone();
+        s.spawn(move || {
+            match Connection::wrap(sess_sock) {
+                Ok(conn) => {
+                    let _ = Session::new(conn, be).run();
+                }
+                Err(e) => log::error!("carillon: Connection::wrap: {e}"),
+            }
+        });
+        // g2h FIFO (guest requests) → Session socket. Wakes on the
+        // guest→host doorbell (server_read_fd); exits on shutdown.
+        s.spawn(|| {
+            let waiter = match Waiter::new(server.doorbell_read_fd(), shutdown.read_fd()) {
+                Ok(w) => w,
+                Err(e) => { log::error!("carillon: waiter: {e}"); return; }
+            };
+            pump_stream_to_fd_with(
+                bridge_fd, server.region(), layout::STREAM_G2H_OFFSET,
+                layout::C_STREAM_G2H_HEAD, layout::C_STREAM_G2H_TAIL,
+                || match waiter.wait() {
+                    Ok(w) => !w.shutdown,
+                    Err(_) => false,
+                },
+            );
+        });
+        // Session socket → h2g FIFO (responses); ring the guest (MSI-X).
+        s.spawn(|| {
+            pump_fd_to_stream_with(
+                bridge_fd, server.region(), layout::STREAM_H2G_OFFSET,
+                layout::C_STREAM_H2G_HEAD, layout::C_STREAM_H2G_TAIL,
+                || server.notify_peer(),
+            );
+        });
+    });
     Ok(())
 }
