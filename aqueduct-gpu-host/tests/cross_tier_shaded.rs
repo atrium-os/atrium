@@ -269,6 +269,92 @@ fn moltenvk_agrees_with_the_interpreter_oracle_on_a_texture_shader() {
     assert_shader_agrees(&fs, &inputs, ColorTolerance::AbsEpsilon { eps: 0.02 }, &runners);
 }
 
+/// Non-panicking shaded certifier: run `fs` through the interpreter oracle
+/// and MoltenVK for `inputs`, compare per-channel, and return a
+/// `Certification` to seed the runtime registry. (`assert_shader_agrees`
+/// panics — this is its verdict-returning sibling for the offline certifier.)
+fn shaded_certify(
+    mvk: &MoltenVkShaderRunner, fs: &[u8], inputs: &ShaderInputs, eps: f32,
+) -> aqueduct_gpu_host::Certification {
+    use aqueduct_gpu_host::Certification;
+    let (a, b) = match (InterpreterRunner.run(fs, inputs), mvk.run(fs, inputs)) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => return Certification::Failed { max_channel_diff: 255 },
+    };
+    if a.pixels.len() != b.pixels.len() || a.pixels.is_empty() {
+        return Certification::Failed { max_channel_diff: 255 };
+    }
+    let mut maxd = 0.0f32;
+    for (pa, pb) in a.pixels.iter().zip(&b.pixels) {
+        for c in 0..4 {
+            maxd = maxd.max((pa[c] - pb[c]).abs());
+        }
+    }
+    if maxd <= eps {
+        Certification::Certified
+    } else {
+        Certification::Failed { max_channel_diff: (maxd * 255.0) as u8 }
+    }
+}
+
+#[test]
+fn offline_shaded_cert_seeds_the_routing_registry() {
+    // The full path: certify a shaded pipeline cross-tier (interpreter ↔
+    // MoltenVK), feed the verdict to the router's registry, and watch the
+    // surface using that pipeline become migration-eligible.
+    use aqueduct_gpu::frame::FrameBuilder;
+    use aqueduct_gpu::opcodes::FrameOp;
+    use aqueduct_gpu_host::{
+        Backend, Certification, CpuProfile, DeviceProfile, GpuPowerModel, RouteMode,
+        RoutingBackend, StubBackend,
+    };
+    use std::sync::Arc;
+
+    let Some(mvk) = MoltenVkShaderRunner::new() else {
+        eprintln!("offline shaded cert skipped (MoltenVK unavailable)");
+        return;
+    };
+
+    // Offline certification of a varying shader.
+    let fs = build_passthrough_varying_fs();
+    let colors = [[1.0f32, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0]];
+    let inputs = ShaderInputs {
+        varyings_per_invocation: colors
+            .iter()
+            .map(|c| c.iter().flat_map(|f| f.to_le_bytes()).collect())
+            .collect(),
+        ..ShaderInputs::default()
+    };
+    let cert = shaded_certify(&mvk, &fs, &inputs, 0.01);
+    assert_eq!(cert, Certification::Certified, "the shaded pipeline is tier-equivalent");
+
+    // Seed the router's registry with the offline verdict.
+    let rb = RoutingBackend::new(
+        Arc::new(StubBackend::new()), Arc::new(StubBackend::new()),
+        DeviceProfile::uma_apple_m4_max(), CpuProfile::apple_m4_max(),
+        GpuPowerModel::apple_m4_max(), RouteMode::Perf);
+    let img = ResourceId::new(IdNamespace::IcdRuntime, 1);
+    let pipe = ResourceId::new(IdNamespace::IcdRuntime, 2);
+    rb.image_created(img, 64, 64);
+    rb.pipeline_created(pipe, &build_fullscreen_tri_vs(), &fs);
+    rb.certify(pipe, cert);
+
+    // A frame using the (now-certified) pipeline is scored, not pinned.
+    let mut fb = FrameBuilder::new(1024);
+    let mut brp = img.raw().to_le_bytes().to_vec();
+    brp.extend_from_slice(&[0, 0, 0, 255]);
+    brp.extend_from_slice(&0u32.to_le_bytes());
+    fb.push(FrameOp::BeginRenderPass, &brp).unwrap();
+    fb.push(FrameOp::BindPipeline, &pipe.raw().to_le_bytes()).unwrap();
+    let mut draw = 3u32.to_le_bytes().to_vec();
+    draw.extend_from_slice(&1u32.to_le_bytes());
+    draw.extend_from_slice(&[0u8; 8]);
+    fb.push(FrameOp::Draw, &draw).unwrap();
+    rb.submit_frame(ResourceId::new(IdNamespace::IcdRuntime, 9), 1, fb.as_bytes());
+    assert_eq!(rb.decision_stats(), (1, 0),
+        "the certified pipeline's surface is eligible → scored, not pinned");
+}
+
 // ── SPIR-V builders ──────────────────────────────────────────────────
 
 /// A fragment shader that samples a `sampler2D` at (set 0, binding 0) at the
