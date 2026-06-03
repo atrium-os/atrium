@@ -23,6 +23,12 @@ use aqueduct_gpu::ids::ResourceId;
 use aqueduct_gpu::backends::BackendId;
 
 use crate::backend::Backend;
+
+/// Consecutive stable records before a Tier-2 surface counts as "settled".
+const SETTLE_THRESHOLD: u32 = 16;
+/// Once settled on Tier-2, re-score only every Nth frame (between ticks,
+/// dispatch to the held assignment without paying the verdict).
+const DECIMATE_EVERY: u64 = 8;
 use crate::cost_model::{shader_cost, DeviceProfile, ShaderCost};
 use crate::router::{
     tier2_exec_cost, tier3_exec_cost, Cost, CpuProfile, FrameRouter, GpuPowerModel, RouteMode,
@@ -318,10 +324,23 @@ impl Backend for RoutingBackend {
         for p in &pipes_used {
             policy.note_surface_pipeline(surf, *p);
         }
-        // Only pay the verdict cost when the surface can act on it. A pinned
-        // (uncertified) surface dispatches home unconditionally — scoring it
-        // would burn CPU (and power) deciding something it cannot change.
-        let effective = if policy.eligible(surf) {
+        // Pay the verdict cost only when it can change something:
+        // - pinned (uncertified) surface → dispatches home unconditionally;
+        // - a surface long-settled on Tier-2 (CPU) → re-scoring just confirms
+        //   "still home"; decimate it (the GPU is idle, so no power-model
+        //   bookkeeping is lost by skipping). Tier-3-settled surfaces are
+        //   always scored: the verdict is negligible beside the GPU frame,
+        //   and it keeps the residency model fed.
+        let eligible = policy.eligible(surf);
+        let settled_on_cpu = policy.surface_assignment(surf) == Some(Tier::Tier2)
+            && policy.stable_streak(surf) >= SETTLE_THRESHOLD;
+        let effective = if !eligible {
+            self.skipped.fetch_add(1, Ordering::Relaxed);
+            policy.home()
+        } else if settled_on_cpu && n % DECIMATE_EVERY != 0 {
+            self.skipped.fetch_add(1, Ordering::Relaxed);
+            policy.surface_assignment(surf).unwrap_or_else(|| policy.home())
+        } else {
             let mut t2 = Cost::default();
             let mut t3 = Cost::default();
             for (vs, fs, vs_inv, px) in &draws {
@@ -335,9 +354,6 @@ impl Backend for RoutingBackend {
             let verdict = self.router.lock().unwrap().route_costs(t2, t3, n as f64 / 60.0).tier;
             self.scored.fetch_add(1, Ordering::Relaxed);
             policy.record_frame(surf, verdict)
-        } else {
-            self.skipped.fetch_add(1, Ordering::Relaxed);
-            policy.home()
         };
         // Single-homed readback bookkeeping: this tier wrote the render
         // target + any copy-destination buffers.
@@ -478,6 +494,34 @@ mod tests {
         // Now the surface is eligible → subsequent frames are scored.
         rb.submit_frame(ResourceId(9), 2, &probe);
         assert_eq!(rb.decision_stats(), (1, 1), "certified surface is now scored");
+    }
+
+    #[test]
+    fn settled_cpu_surface_is_decimated_not_rescored_every_frame() {
+        // A certified LIGHT surface settles on Tier-2 (home). Once settled,
+        // the router stops re-scoring it every frame — it dispatches to the
+        // held assignment, paying near-nothing to confirm "still home".
+        let t2 = Counting::new(2);
+        let t3 = Counting::new(3);
+        let rb = RoutingBackend::new(
+            t2.clone(), t3.clone(), DeviceProfile::uma_apple_m4_max(),
+            CpuProfile::apple_m4_max(), GpuPowerModel::apple_m4_max(), RouteMode::Perf);
+        let (img, pipe, dst) = (ResourceId(1), ResourceId(2), ResourceId(3));
+        rb.image_created(img, 32, 32); // light → stays on Tier-2
+        rb.pipeline_created(pipe, &spirv_alu(2), &spirv_alu(2));
+        rb.buffer_created(dst, 64);
+        rb.certify(pipe, Certification::Certified);
+        let f = frame(img, pipe, dst);
+
+        for t in 1..=40 { rb.submit_frame(ResourceId(9), t, &f); }
+        let (scored, skipped) = rb.decision_stats();
+        assert_eq!(scored + skipped, 40);
+        // Early frames scored until settled; later frames mostly decimated.
+        assert!(scored > 0, "scored while settling");
+        assert!(skipped > 0, "decimated once settled — not re-scored every frame");
+        // It never left the CPU (light frame), and everything ran on Tier-2.
+        assert_eq!(t3.submits.load(Ordering::Relaxed), 0);
+        assert_eq!(t2.submits.load(Ordering::Relaxed), 40);
     }
 
     #[test]

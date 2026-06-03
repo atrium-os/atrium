@@ -471,6 +471,10 @@ struct SurfaceState {
     vote: f64,
     /// Current committed assignment.
     tier: Tier,
+    /// Consecutive records since the last migration — how "settled" the
+    /// assignment is. Drives decision decimation (a long-settled surface
+    /// needn't be re-scored every frame).
+    stable_streak: u32,
 }
 
 impl SurfaceRouter {
@@ -502,17 +506,30 @@ impl SurfaceRouter {
         let s = self.surfaces.entry(surface).or_insert(SurfaceState {
             vote: 0.5,
             tier: Tier::Tier2,
+            stable_streak: 0,
         });
         let target = if verdict == Tier::Tier3 { 1.0 } else { 0.0 };
         s.vote = s.vote * (1.0 - self.alpha) + target * self.alpha;
         let hi = 0.5 + self.up_margin / 2.0;
         let lo = 0.5 - self.down_margin / 2.0;
+        let before = s.tier;
         match s.tier {
             Tier::Tier2 if s.vote > hi => s.tier = Tier::Tier3,
             Tier::Tier3 if s.vote < lo => s.tier = Tier::Tier2,
             _ => {}
         }
+        if s.tier == before {
+            s.stable_streak = s.stable_streak.saturating_add(1);
+        } else {
+            s.stable_streak = 0; // migrated → no longer settled
+        }
         s.tier
+    }
+
+    /// How many consecutive records `surface` has held its tier (0 if
+    /// unknown or just migrated). A large value = settled.
+    pub fn stable_streak(&self, surface: u32) -> u32 {
+        self.surfaces.get(&surface).map(|s| s.stable_streak).unwrap_or(0)
     }
 
     /// The current tier assignment for `surface`, if seen.
@@ -609,6 +626,16 @@ impl RoutingPolicy {
     /// checks).
     pub fn note_surface_pipeline(&mut self, surface: u32, pipeline: u32) {
         self.surface_pipelines.entry(surface).or_default().insert(pipeline);
+    }
+
+    /// The surface's current (raw) tier assignment, without scoring.
+    pub fn surface_assignment(&self, surface: u32) -> Option<Tier> {
+        self.surfaces.assignment(surface)
+    }
+
+    /// How settled the surface's assignment is (consecutive stable records).
+    pub fn stable_streak(&self, surface: u32) -> u32 {
+        self.surfaces.stable_streak(surface)
     }
 
     /// Whether `surface` is currently eligible to leave the home tier (all
