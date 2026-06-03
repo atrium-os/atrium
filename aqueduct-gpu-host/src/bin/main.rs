@@ -471,6 +471,7 @@ fn main() -> Result<()> {
                 &args.carillon_shm,
                 args.backend,
                 backend,
+                registry.clone(),
             );
         }
         #[cfg(not(unix))]
@@ -517,6 +518,7 @@ fn run_carillon(
     shm: &std::path::Path,
     backend_kind: BackendKind,
     backend: Arc<dyn Backend>,
+    registry: Option<Arc<Tier2Registry>>,
 ) -> Result<()> {
     use std::os::unix::io::AsRawFd;
     use std::os::unix::net::UnixStream;
@@ -554,10 +556,15 @@ fn run_carillon(
     std::thread::scope(|s| {
         // Session: reads requests from sess_sock, writes responses back.
         let be = backend.clone();
+        let reg = registry.clone();
         s.spawn(move || {
             match Connection::wrap(sess_sock) {
                 Ok(conn) => {
-                    let _ = Session::new(conn, be).run();
+                    let mut sess = Session::new(conn, be);
+                    if let Some(r) = reg {
+                        sess.set_tier2_registry(r); // so Tier-2 (routing home) can render
+                    }
+                    let _ = sess.run();
                 }
                 Err(e) => log::error!("carillon: Connection::wrap: {e}"),
             }

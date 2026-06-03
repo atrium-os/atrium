@@ -478,6 +478,16 @@ impl Backend for RoutingBackend {
         }
         drop(policy);
 
+        // Observability: report the per-surface assignment periodically so a
+        // live migration is visible in the daemon log (e.g. over Carillon).
+        if n % 4 == 0 {
+            let (a2, a3) = self.policy.lock().unwrap().effective_counts();
+            log::info!(
+                "routing: frame {n} → {effective:?}; surfaces tier2={a2} tier3={a3} \
+                 (scored={} skipped={})",
+                self.scored.load(Ordering::Relaxed), self.skipped.load(Ordering::Relaxed));
+        }
+
         // Materialise the frame's resources on the dispatch tier *before*
         // dispatch — a draw against an unmaterialised resource is a wrong
         // pixel. Use the introspected set when complete; otherwise fall back
