@@ -595,6 +595,11 @@ impl RoutingPolicy {
         }
     }
 
+    /// The home/fallback tier for ineligible surfaces.
+    pub fn home(&self) -> Tier {
+        self.home
+    }
+
     /// Record a pipeline's tier-equivalence certification.
     pub fn certify(&mut self, pipeline: u32, c: crate::certify::Certification) {
         self.certs.set(pipeline, c);

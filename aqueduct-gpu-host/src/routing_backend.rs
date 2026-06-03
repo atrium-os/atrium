@@ -40,6 +40,15 @@ pub struct RoutingBackend {
     pipelines: Mutex<HashMap<u32, (ShaderCost, ShaderCost)>>,
     images: Mutex<HashMap<u32, (u32, u32)>>,
     frames: AtomicU64,
+    /// Frames for which a full routing verdict was computed (the surface
+    /// was certification-eligible, so the decision could actually change
+    /// where it ran).
+    scored: AtomicU64,
+    /// Frames whose verdict was *skipped* because the surface is pinned
+    /// (uncertified) — it dispatches home regardless, so scoring would burn
+    /// cycles for nothing. The router doesn't pay to decide what it can't
+    /// act on.
+    skipped: AtomicU64,
 }
 
 impl RoutingBackend {
@@ -67,7 +76,17 @@ impl RoutingBackend {
             pipelines: Mutex::new(HashMap::new()),
             images: Mutex::new(HashMap::new()),
             frames: AtomicU64::new(0),
+            scored: AtomicU64::new(0),
+            skipped: AtomicU64::new(0),
         }
+    }
+
+    /// `(scored, skipped)` frame counts — the router's own decision
+    /// overhead, made observable. `skipped` frames paid no verdict cost
+    /// (pinned surfaces dispatch home unconditionally). A high skipped:scored
+    /// ratio means the router is spending almost nothing to decide.
+    pub fn decision_stats(&self) -> (u64, u64) {
+        (self.scored.load(Ordering::Relaxed), self.skipped.load(Ordering::Relaxed))
     }
 
     /// Certify a pipeline as tier-equivalent (gates surface migration).
@@ -229,9 +248,10 @@ impl Backend for RoutingBackend {
     fn measured_gpu_time_s(&self) -> Option<f64> { self.t3.measured_gpu_time_s() }
 
     fn submit_frame(&self, fence: ResourceId, timeline: u64, frame_buf: &[u8]) -> bool {
-        // Walk the frame: identify the surface (render target), the
-        // pipelines it uses, the buffers it writes, and accumulate per-tier
-        // exec cost for the routing verdict.
+        // Cheap structural pass: surface (render target), pipelines used,
+        // copy-dst buffers, and the per-draw (mix, invocation) tuples. The
+        // *expensive* part (per-tier cost float math + the verdict) is
+        // deferred until we know it can change the outcome.
         let n = self.frames.fetch_add(1, Ordering::Relaxed) + 1;
         let le4 = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
         let mut surface: Option<u32> = None;
@@ -239,63 +259,73 @@ impl Backend for RoutingBackend {
         let mut cur_mix: Option<(ShaderCost, ShaderCost)> = None;
         let mut pipes_used: Vec<u32> = Vec::new();
         let mut dst_buffers: Vec<u32> = Vec::new();
-        let mut t2 = Cost::default();
-        let mut t3 = Cost::default();
-        let pipelines = self.pipelines.lock().unwrap();
-        let images = self.images.lock().unwrap();
-        let mut dec = aqueduct_gpu::frame::FrameDecoder::new(frame_buf);
-        while let Ok(Some((op, body))) = dec.next() {
-            match op {
-                aqueduct_gpu::opcodes::FrameOp::BeginRenderPass if body.len() >= 4 => {
-                    let target = le4(body);
-                    surface.get_or_insert(target);
-                    cur_dims = images.get(&target).copied();
-                }
-                aqueduct_gpu::opcodes::FrameOp::BindPipeline if body.len() >= 4 => {
-                    let pid = le4(body);
-                    pipes_used.push(pid);
-                    cur_mix = pipelines.get(&pid).copied();
-                }
-                aqueduct_gpu::opcodes::FrameOp::Draw if body.len() >= 8 => {
-                    if let Some((vs, fs)) = cur_mix {
-                        let vs_inv = le4(&body[0..4]) as u64 * (le4(&body[4..8]) as u64).max(1);
-                        t2 = t2.plus(tier2_exec_cost(&self.cpu, &vs, vs_inv));
-                        t3 = t3.plus(tier3_exec_cost(&self.profile, &vs, vs_inv));
-                        if let Some((w, h)) = cur_dims {
-                            let px = w as u64 * h as u64;
-                            t2 = t2.plus(tier2_exec_cost(&self.cpu, &fs, px));
-                            t3 = t3.plus(tier3_exec_cost(&self.profile, &fs, px));
+        // (vs, fs, vs_invocations, fs_pixels).
+        let mut draws: Vec<(ShaderCost, ShaderCost, u64, Option<u64>)> = Vec::new();
+        {
+            let pipelines = self.pipelines.lock().unwrap();
+            let images = self.images.lock().unwrap();
+            let mut dec = aqueduct_gpu::frame::FrameDecoder::new(frame_buf);
+            while let Ok(Some((op, body))) = dec.next() {
+                match op {
+                    aqueduct_gpu::opcodes::FrameOp::BeginRenderPass if body.len() >= 4 => {
+                        let target = le4(body);
+                        surface.get_or_insert(target);
+                        cur_dims = images.get(&target).copied();
+                    }
+                    aqueduct_gpu::opcodes::FrameOp::BindPipeline if body.len() >= 4 => {
+                        let pid = le4(body);
+                        pipes_used.push(pid);
+                        cur_mix = pipelines.get(&pid).copied();
+                    }
+                    aqueduct_gpu::opcodes::FrameOp::Draw if body.len() >= 8 => {
+                        if let Some((vs, fs)) = cur_mix {
+                            let vs_inv = le4(&body[0..4]) as u64 * (le4(&body[4..8]) as u64).max(1);
+                            let px = cur_dims.map(|(w, h)| w as u64 * h as u64);
+                            draws.push((vs, fs, vs_inv, px));
                         }
                     }
+                    aqueduct_gpu::opcodes::FrameOp::CopyImgToBuf if body.len() >= 8 => {
+                        dst_buffers.push(le4(&body[4..8]));
+                    }
+                    _ => {}
                 }
-                aqueduct_gpu::opcodes::FrameOp::CopyImgToBuf if body.len() >= 8 => {
-                    dst_buffers.push(le4(&body[4..8]));
-                }
-                _ => {}
             }
         }
-        drop(pipelines);
-        drop(images);
-
-        // Score → verdict → gated effective tier.
         let surf = surface.unwrap_or(0);
-        let verdict = self.router.lock().unwrap().route_costs(t2, t3, n as f64 / 60.0).tier;
-        let effective = {
-            let mut policy = self.policy.lock().unwrap();
-            for p in &pipes_used {
-                policy.note_surface_pipeline(surf, *p);
-            }
-            let eff = policy.record_frame(surf, verdict);
-            // Single-homed readback bookkeeping: this tier wrote the frame's
-            // render target + any copy-destination buffers.
-            policy.note_write(surf, eff);
-            for b in &dst_buffers {
-                policy.note_write(*b, eff);
-            }
-            eff
-        };
 
-        // Dispatch to the assigned tier.
+        let mut policy = self.policy.lock().unwrap();
+        for p in &pipes_used {
+            policy.note_surface_pipeline(surf, *p);
+        }
+        // Only pay the verdict cost when the surface can act on it. A pinned
+        // (uncertified) surface dispatches home unconditionally — scoring it
+        // would burn CPU (and power) deciding something it cannot change.
+        let effective = if policy.eligible(surf) {
+            let mut t2 = Cost::default();
+            let mut t3 = Cost::default();
+            for (vs, fs, vs_inv, px) in &draws {
+                t2 = t2.plus(tier2_exec_cost(&self.cpu, vs, *vs_inv));
+                t3 = t3.plus(tier3_exec_cost(&self.profile, vs, *vs_inv));
+                if let Some(px) = px {
+                    t2 = t2.plus(tier2_exec_cost(&self.cpu, fs, *px));
+                    t3 = t3.plus(tier3_exec_cost(&self.profile, fs, *px));
+                }
+            }
+            let verdict = self.router.lock().unwrap().route_costs(t2, t3, n as f64 / 60.0).tier;
+            self.scored.fetch_add(1, Ordering::Relaxed);
+            policy.record_frame(surf, verdict)
+        } else {
+            self.skipped.fetch_add(1, Ordering::Relaxed);
+            policy.home()
+        };
+        // Single-homed readback bookkeeping: this tier wrote the render
+        // target + any copy-destination buffers.
+        policy.note_write(surf, effective);
+        for b in &dst_buffers {
+            policy.note_write(*b, effective);
+        }
+        drop(policy);
+
         match effective {
             Tier::Tier2 => self.t2.submit_frame(fence, timeline, frame_buf),
             Tier::Tier3 => self.t3.submit_frame(fence, timeline, frame_buf),
@@ -376,6 +406,9 @@ mod tests {
         for t in 1..=30 { rb.submit_frame(ResourceId(9), t, &frame(img, pipe, dst)); }
         assert_eq!(t2.submits.load(Ordering::Relaxed), 30, "all frames ran on Tier-2 (home)");
         assert_eq!(t3.submits.load(Ordering::Relaxed), 0, "GPU never used while uncertified");
+        // And the router spent NO verdict cycles — every frame was skipped
+        // because a pinned surface can't act on a verdict anyway.
+        assert_eq!(rb.decision_stats(), (0, 30), "no scoring for a pinned surface");
         // Readback follows the writer (Tier-2): marker == 2.
         let px = rb.buffer_read_bytes(dst, 0, 4).unwrap();
         assert_eq!(px, vec![2, 2, 2, 2], "readback from the tier that rendered");
@@ -395,6 +428,9 @@ mod tests {
         for t in 1..=40 { rb.submit_frame(ResourceId(9), t, &frame(img, pipe, dst)); }
         assert!(t3.submits.load(Ordering::Relaxed) > 0,
             "a certified heavy surface eventually ran on Tier-3");
+        // A certified surface IS scored every frame (it can act on the
+        // verdict) — the overhead is paid only where it can pay off.
+        assert_eq!(rb.decision_stats(), (40, 0), "certified surface is scored, not skipped");
         // After migration, readback comes from Tier-3 (marker 3).
         assert_eq!(rb.buffer_read_bytes(dst, 0, 2).unwrap(), vec![3, 3]);
         assert_eq!(rb.assignment_counts(), (0, 1));
