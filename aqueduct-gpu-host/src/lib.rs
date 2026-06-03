@@ -68,6 +68,7 @@
 pub mod backend;
 #[cfg(unix)]
 pub mod carillon;
+pub mod cost_model;
 pub mod listener;
 pub mod moltenvk;
 pub mod resources;
@@ -82,6 +83,9 @@ pub mod tier2_backend;
 pub mod tier2_registry;
 
 pub use backend::{Backend, SoftwareBackend, StubBackend};
+pub use cost_model::{
+    CostMode, CostModelBackend, DeviceProfile, FrameLedger, OpKind, Topology,
+};
 pub use tier2_backend::{
     AssembledVertices, PresentCallback, PresentedFrame, Tier2Backend,
 };
