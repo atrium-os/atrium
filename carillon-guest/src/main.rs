@@ -308,29 +308,16 @@ fn scanout_demo(client: &mut GpuClient, backend_id: BackendId) -> i32 {
     // Nested coloured squares, drawn with proven primitives only: the
     // vertex-less full-screen triangle + a constant-colour FS, one pipeline
     // per colour, each draw clipped to a scissor rect. (Varyings / FragCoord /
-    // GLSL.std.450 ext-insts all crash the compiled Tier-2 path, so the shape
-    // is composed from scissored fills instead — host-verified before this.)
+    // A procedural shape from a real fragment shader: the vertex-less
+    // full-screen triangle + a gl_FragCoord diamond FS (orange diamond on a
+    // blue/green gradient, GLSL.std.450 FAbs/FClamp/FMix). gl_FragCoord is now
+    // supported on the compiled Tier-2 path (both per-pixel and the vectorized
+    // span path), so the shape comes straight out of the shader.
     let vs = build_fullscreen_tri_vs();
+    let fs = build_fragcoord_diamond_fs(w, h);
     let vs_id = client.upload_shader(sha256(&vs), ShaderKind::SpirV, backend_id, vs).unwrap();
-    // (colour, fractional rect x,y,w,h of the screen) — outer → inner.
-    let layers: [([f32; 4], [f32; 4]); 5] = [
-        ([0.05, 0.45, 0.55, 1.0], [0.10, 0.10, 0.80, 0.80]), // teal
-        ([0.85, 0.15, 0.55, 1.0], [0.20, 0.20, 0.60, 0.60]), // magenta
-        ([1.00, 0.55, 0.10, 1.0], [0.30, 0.30, 0.40, 0.40]), // orange
-        ([0.20, 0.75, 0.25, 1.0], [0.385, 0.385, 0.23, 0.23]), // green
-        ([0.97, 0.97, 0.97, 1.0], [0.45, 0.45, 0.10, 0.10]), // white centre
-    ];
-    let mut pipes: Vec<(ResourceId, [u32; 4])> = Vec::new();
-    for (rgba, frac) in layers {
-        let fs = build_const_fs(rgba);
-        let fs_id = client.upload_shader(sha256(&fs), ShaderKind::SpirV, backend_id, fs).unwrap();
-        let pipe = client.create_pipeline(PipelineKind::Graphics, vec![vs_id, fs_id], Vec::new()).unwrap();
-        let rect = [
-            (frac[0] * w as f32) as u32, (frac[1] * h as f32) as u32,
-            (frac[2] * w as f32) as u32, (frac[3] * h as f32) as u32,
-        ];
-        pipes.push((pipe, rect));
-    }
+    let fs_id = client.upload_shader(sha256(&fs), ShaderKind::SpirV, backend_id, fs).unwrap();
+    let pipe = client.create_pipeline(PipelineKind::Graphics, vec![vs_id, fs_id], Vec::new()).unwrap();
     thread::sleep(Duration::from_millis(50));
 
     let render_one = |client: &mut GpuClient, t: u64| -> Result<Vec<u8>, String> {
@@ -340,15 +327,10 @@ fn scanout_demo(client: &mut GpuClient, backend_id: BackendId) -> i32 {
         brp.extend_from_slice(&[10u8, 10, 14, 255]); // dark clear
         brp.extend_from_slice(&0u32.to_le_bytes());
         fb.push(FrameOp::BeginRenderPass, &brp).unwrap();
-        for (pipe, rect) in &pipes {
-            fb.push(FrameOp::BindPipeline, &pipe.raw().to_le_bytes()).unwrap();
-            let mut sc = Vec::new();
-            for v in rect { sc.extend_from_slice(&v.to_le_bytes()); } // x,y,w,h
-            fb.push(FrameOp::SetScissor, &sc).unwrap();
-            let mut draw = Vec::new();
-            for v in [3u32, 1, 0, 0] { draw.extend_from_slice(&v.to_le_bytes()); }
-            fb.push(FrameOp::Draw, &draw).unwrap();
-        }
+        fb.push(FrameOp::BindPipeline, &pipe.raw().to_le_bytes()).unwrap();
+        let mut draw = Vec::new();
+        for v in [3u32, 1, 0, 0] { draw.extend_from_slice(&v.to_le_bytes()); }
+        fb.push(FrameOp::Draw, &draw).unwrap();
         fb.push(FrameOp::EndRenderPass, &[]).unwrap();
         let mut cib = image.raw().to_le_bytes().to_vec();
         cib.extend_from_slice(&buffer.raw().to_le_bytes());
@@ -376,7 +358,7 @@ fn scanout_demo(client: &mut GpuClient, backend_id: BackendId) -> i32 {
         eprintln!("FAIL: present: {e}");
         return 3;
     }
-    println!("carillon-guest: SHAPE ON SCREEN — nested coloured squares, \
+    println!("carillon-guest: SHAPE ON SCREEN — gl_FragCoord diamond, \
               rendered on the host through the router, shown on the VM display");
 
     // Hold it on screen (re-flip the same frame) so the window stays up.
@@ -477,6 +459,86 @@ fn build_fullscreen_tri_vs() -> Vec<u8> {
     b.ret().unwrap();
     b.end_function().unwrap();
     b.entry_point(ExecutionModel::Vertex, main, "main", vec![in_idx, pv_var]);
+    b.module().assemble().iter().flat_map(|w| w.to_le_bytes()).collect()
+}
+
+/// A `gl_FragCoord` fragment shader: an orange diamond on a blue/green
+/// gradient. `w`/`h` (render-target size) are baked in to normalise the
+/// pixel coordinate. Uses GLSL.std.450 `FAbs` / `FClamp` / `FMix`. No vertex
+/// buffer — geometry comes from the vertex-less full-screen triangle and the
+/// shape from the fragment coordinate.
+fn build_fragcoord_diamond_fs(w: u32, h: u32) -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::dr::Operand;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    const FABS: u32 = 4;
+    const FCLAMP: u32 = 43;
+    const FMIX: u32 = 46;
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    let glsl = b.ext_inst_import("GLSL.std.450");
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let f32t = b.type_float(32, None);
+    let v3 = b.type_vector(f32t, 3);
+    let v4 = b.type_vector(f32t, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let ptr_in_v4 = b.type_pointer(None, StorageClass::Input, v4);
+    let fragcoord = b.variable(ptr_in_v4, None, StorageClass::Input, None);
+    b.decorate(fragcoord, Decoration::BuiltIn, vec![Operand::BuiltIn(BuiltIn::FragCoord)]);
+    let ptr_out = b.type_pointer(None, StorageClass::Output, v4);
+    let out = b.variable(ptr_out, None, StorageClass::Output, None);
+    b.decorate(out, Decoration::Location, vec![Operand::LiteralBit32(0)]);
+    let k = |b: &mut rspirv::dr::Builder, x: f32| b.constant_bit32(f32t, x.to_bits());
+    let inv_w = k(&mut b, 1.0 / w as f32);
+    let inv_h = k(&mut b, 1.0 / h as f32);
+    let half = k(&mut b, 0.5);
+    let edge = k(&mut b, 0.30);
+    let sharp = k(&mut b, 12.0);
+    let zero = k(&mut b, 0.0);
+    let one = k(&mut b, 1.0);
+    let bg_rx = k(&mut b, 0.35);
+    let bg_gy = k(&mut b, 0.55);
+    let bg_b = k(&mut b, 0.75);
+    let fg_r = k(&mut b, 1.0);
+    let fg_g = k(&mut b, 0.55);
+    let fg_b = k(&mut b, 0.10);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let fc = b.load(v4, None, fragcoord, None, vec![]).unwrap();
+    let fx = b.composite_extract(f32t, None, fc, vec![0]).unwrap();
+    let fy = b.composite_extract(f32t, None, fc, vec![1]).unwrap();
+    let u = b.f_mul(f32t, None, fx, inv_w).unwrap();
+    let v = b.f_mul(f32t, None, fy, inv_h).unwrap();
+    let du = b.f_sub(f32t, None, u, half).unwrap();
+    let dv = b.f_sub(f32t, None, v, half).unwrap();
+    let adx = b.ext_inst(f32t, None, glsl, FABS, vec![Operand::IdRef(du)]).unwrap();
+    let ady = b.ext_inst(f32t, None, glsl, FABS, vec![Operand::IdRef(dv)]).unwrap();
+    let diamond = b.f_add(f32t, None, adx, ady).unwrap();
+    let em = b.f_sub(f32t, None, edge, diamond).unwrap();
+    let scaled = b.f_mul(f32t, None, em, sharp).unwrap();
+    let t = b.ext_inst(f32t, None, glsl, FCLAMP,
+        vec![Operand::IdRef(scaled), Operand::IdRef(zero), Operand::IdRef(one)]).unwrap();
+    let br = b.f_mul(f32t, None, u, bg_rx).unwrap();
+    let bgc = b.f_mul(f32t, None, v, bg_gy).unwrap();
+    let bg = b.composite_construct(v3, None, vec![br, bgc, bg_b]).unwrap();
+    let fg = b.composite_construct(v3, None, vec![fg_r, fg_g, fg_b]).unwrap();
+    let tv = b.composite_construct(v3, None, vec![t, t, t]).unwrap();
+    let rgb = b.ext_inst(v3, None, glsl, FMIX,
+        vec![Operand::IdRef(bg), Operand::IdRef(fg), Operand::IdRef(tv)]).unwrap();
+    let rr = b.composite_extract(f32t, None, rgb, vec![0]).unwrap();
+    let gg = b.composite_extract(f32t, None, rgb, vec![1]).unwrap();
+    let bb = b.composite_extract(f32t, None, rgb, vec![2]).unwrap();
+    let color = b.composite_construct(v4, None, vec![rr, gg, bb, one]).unwrap();
+    b.store(out, color, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![fragcoord, out]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
     b.module().assemble().iter().flat_map(|w| w.to_le_bytes()).collect()
 }
 
