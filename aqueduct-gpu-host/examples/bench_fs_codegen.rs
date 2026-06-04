@@ -231,4 +231,55 @@ fn main() {
                   (no-fma cc = {:.1}% of cc); the rest is regalloc / isel.",
             fma_share / lead * 100.0, ns_cc / ns_ccn * 100.0);
     }
+
+    // ── Compile time — the OTHER half of the tradeoff (why LLVM was rejected
+    //    in the first place). Wall-clock each compiler subprocess: spawn +
+    //    compile + produce a *loadable* artifact (cc's `-shared` linker tax
+    //    included — it's the real cost of making LLVM output runnable). ──
+    println!("\n  ── compile time (median of {} runs, wall-clock per shader) ──", CRUNS);
+    let dir = std::env::temp_dir().join(format!("fscg_ct_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let spv = dir.join("s.spv");
+    std::fs::write(&spv, &spirv).unwrap();
+    let cfile = dir.join("s.c");
+    std::fs::write(&cfile, HEAVY_FS_C).unwrap();
+    let compiler = locate_compile_binary();
+    let spv_cmd = |be: &str| {
+        let mut c = std::process::Command::new(&compiler);
+        c.arg("--input").arg(&spv).arg("--output-dir").arg(&dir)
+            .arg("--hash").arg("bench").arg("--force-backend").arg(be);
+        c
+    };
+    let cc_cmd = |extra: &[&str]| {
+        let mut c = std::process::Command::new("cc");
+        c.args(["-O3", "-shared", "-fPIC"]).args(extra)
+            .arg("-o").arg(dir.join("s.dylib")).arg(&cfile);
+        c
+    };
+    let ct_be = median_ms(spv_cmd("bespoke"));
+    let ct_cr = median_ms(spv_cmd("cranelift"));
+    let ct_cc = median_ms(cc_cmd(&[]));
+    let crow = |name: &str, ms: f64| {
+        println!("  {name:<24} {ms:8.3} ms   ({:7.1}× cheaper than cc/LLVM)", ct_cc / ms);
+    };
+    crow("bespoke", ct_be);
+    crow("cranelift", ct_cr);
+    crow("cc -O3 -shared (LLVM)", ct_cc);
+}
+
+const CRUNS: usize = 15;
+
+/// Median wall-clock (ms) of running `cmd` `CRUNS` times.
+fn median_ms(mut cmd: std::process::Command) -> f64 {
+    let mut ts = Vec::with_capacity(CRUNS);
+    for _ in 0..CRUNS {
+        let t = Instant::now();
+        let out = cmd.output().expect("spawn compiler");
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        assert!(out.status.success(), "compile failed: {}",
+            String::from_utf8_lossy(&out.stderr));
+        ts.push(ms);
+    }
+    ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    ts[CRUNS / 2]
 }
