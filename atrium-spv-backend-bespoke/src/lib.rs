@@ -2080,6 +2080,9 @@ fn emit_function(
                 &mut a, &mut scalars, &mut vectors, &mut packed, &packed_ids,
                 &mut free_pool, &mut owners, &mut used_callee_saved_v,&mut next_synth_id,
                 coalesce_dest.as_ref(), inst, a_v, b_v, asm::fdiv_s, asm::fdiv_v_4s)?,
+            Op::Fma(a_v, b_v, c_v) => emit_fma(
+                &mut a, &mut scalars, &mut free_pool, &mut owners,
+                &mut used_callee_saved_v, coalesce_dest.as_ref(), inst, a_v, b_v, c_v)?,
             Op::Store { ptr, value } => {
                 // Accept any writable storage class -- the
                 // resolve_or_make_pointer storage-class table
@@ -4920,6 +4923,10 @@ fn compute_last_use_flat(
                     for lid in &lanes { mark(*lid); }
                 }
             }
+            // FMA reads three scalars (the fused-mul operands + the addend);
+            // the FMul it replaced is gone, so its operands must stay live to
+            // here. Scalar-only (the fusion pass never produces a vec FMA).
+            Op::Fma(x, y, z) => { mark(x.id); mark(y.id); mark(z.id); }
             Op::FNeg(s) => mark(s.id),
             // Integer arithmetic / bitwise / shifts /
             // comparisons — operands are scalar W-reg
@@ -5280,6 +5287,41 @@ fn compute_last_use_flat(
 /// Result is stored in `scalars` (scalar shape), `packed`
 /// (NEON-packed vec4 — one `.4s` op), or `vectors` (per-
 /// lane vec shape).
+/// Emit a scalar fused multiply-add: `Fma(a, b, c)` → `fmadd Sd, Sa, Sb, Sc`
+/// (Sd = c + a*b, one rounding). The fusion pass only produces scalar-F32
+/// FMAs, so all three operands live in `scalars`. ARM reads all three sources
+/// before writing Sd, so coalescing the dest into a source register (a Phi
+/// accumulator) is safe.
+#[allow(clippy::too_many_arguments)]
+fn emit_fma(
+    a: &mut asm::Asm,
+    scalars: &mut HashMap<ValueId, asm::Vreg>,
+    free_pool: &mut Vec<u8>,
+    owners: &mut HashMap<u8, ValueId>,
+    used_callee_saved_v: &mut bool,
+    coalesce: Option<&PhiDest>,
+    inst: &atrium_spv_ir::Inst,
+    av: &Value,
+    bv: &Value,
+    cv: &Value,
+) -> Result<(), BackendError> {
+    let result = inst.result.as_ref().ok_or_else(||
+        BackendError::Internal("fma without result".into()))?;
+    let ra = *scalars.get(&av.id).ok_or_else(||
+        BackendError::Internal(format!("fma a {:?} missing", av.id)))?;
+    let rb = *scalars.get(&bv.id).ok_or_else(||
+        BackendError::Internal(format!("fma b {:?} missing", bv.id)))?;
+    let rc = *scalars.get(&cv.id).ok_or_else(||
+        BackendError::Internal(format!("fma c {:?} missing", cv.id)))?;
+    let d = match coalesce {
+        Some(PhiDest::Float(v)) => *v,
+        _ => alloc_vreg(free_pool, owners, used_callee_saved_v, result.id)?,
+    };
+    a.emit(asm::fmadd_s(d, ra, rb, rc));
+    scalars.insert(result.id, d);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn emit_fp_binop_poly(

@@ -1901,6 +1901,21 @@ impl FnTranslator {
             Op::FDiv(a, b) => self.emit_float_binop(
                 builder, &inst.result, a, b, |b, x, y| b.ins().fdiv(x, y),
             ),
+            // Fused multiply-add a*b+c (scalar only, from the FMA-fusion
+            // pass) → one cranelift `fma` (lowers to FMADD), single rounding.
+            Op::Fma(a, b, c) => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal("fma without result".into()))?;
+                let av = self.scalars.get(&a.id).copied().ok_or_else(||
+                    BackendError::Unsupported(format!("fma a {:?} not scalar", a.id)))?;
+                let bv = self.scalars.get(&b.id).copied().ok_or_else(||
+                    BackendError::Unsupported(format!("fma b {:?} not scalar", b.id)))?;
+                let cv = self.scalars.get(&c.id).copied().ok_or_else(||
+                    BackendError::Unsupported(format!("fma c {:?} not scalar", c.id)))?;
+                let v = builder.ins().fma(av, bv, cv);
+                self.scalars.insert(result.id, v);
+                Ok(())
+            }
             Op::FNeg(a) => self.emit_float_unop(
                 builder, &inst.result, a, |b, x| b.ins().fneg(x),
             ),

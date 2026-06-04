@@ -318,6 +318,12 @@ pub enum Op {
     FDiv(Value, Value),
     /// Float remainder.
     FRem(Value, Value),
+    /// Fused multiply-add: `result = a * b + c`, computed with a SINGLE
+    /// rounding (IEEE fma). Produced by the FMA-fusion pass from an
+    /// `FAdd(FMul(a, b), c)` whose `FMul` is single-use; backends lower it
+    /// to one `FMADD`/`fma`, and the interpreter uses `f32::mul_add` so the
+    /// differential oracle matches the single-rounding result.
+    Fma(Value, Value, Value),
     /// `result = -a`.
     FNeg(Value),
     /// `result = matrix * vector` — SPIR-V
@@ -921,6 +927,154 @@ pub enum Op {
     /// future if we add device-shared memory paths that need
     /// cache fences without a barrier.
     Barrier,
+}
+
+impl Op {
+    /// Append every SSA `ValueId` this op **reads** (its operands) to `out`.
+    ///
+    /// Exhaustive — there is no wildcard arm, so adding an `Op` variant
+    /// forces this to be updated. Correctness of use-count-based passes (the
+    /// FMA-fusion single-use check) depends on this never undercounting: a
+    /// missed operand there would let the pass delete a value still in use.
+    pub fn referenced_value_ids(&self, out: &mut Vec<ValueId>) {
+        use Op::*;
+        match self {
+            ConstInt { .. } | ConstFloat { .. } | ConstNull
+            | LoadBuiltin(_) | ImageHandle { .. }
+            | Branch(_) | Return | Discard | Barrier => {}
+
+            INeg(a) | FNeg(a) | BitNot(a) | PackHalf2x16(a) | UnpackHalf2x16(a)
+            | Clz(a) | Rbit(a) | Load(a) | FFloor(a) | FCeil(a) | FTrunc(a)
+            | FAbs(a) | FSqrt(a) | ConvertSToF(a) | ConvertFToS(a)
+            | ConvertUToF(a) | ConvertFToU(a) | SConvert(a, _) | UConvert(a, _)
+            | FConvert(a, _) | Bitcast(a, _) | AtomicLoad(a) | ImageQuerySize(a)
+            | DPdx(a) | DPdy(a) | Fwidth(a) | ReturnValue(a)
+            | BranchCond { cond: a, .. } | Switch { selector: a, .. }
+            | AccessChain { base: a, .. } | VectorExtract { vector: a, .. }
+            | Derivative { value: a, .. } => out.push(a.id),
+
+            IAdd(a, b) | ISub(a, b) | IMul(a, b) | UDiv(a, b) | SDiv(a, b)
+            | UMod(a, b) | SMod(a, b) | FAdd(a, b) | FSub(a, b) | FMul(a, b)
+            | FDiv(a, b) | FRem(a, b) | BitAnd(a, b) | BitOr(a, b) | BitXor(a, b)
+            | Shl(a, b) | LShr(a, b) | AShr(a, b) | IEq(a, b) | INe(a, b)
+            | ULt(a, b) | ULe(a, b) | UGt(a, b) | UGe(a, b) | SLt(a, b)
+            | SLe(a, b) | SGt(a, b) | SGe(a, b) | FOrdEq(a, b) | FOrdNe(a, b)
+            | FOrdLt(a, b) | FOrdLe(a, b) | FOrdGt(a, b) | FOrdGe(a, b)
+            | FUnordEq(a, b) | FUnordNe(a, b) | FUnordLt(a, b) | FUnordLe(a, b)
+            | FUnordGt(a, b) | FUnordGe(a, b) | FMin(a, b) | FMax(a, b)
+            | Dot(a, b) | MatrixTimesVector { matrix: a, vector: b }
+            | PtrOffsetDynamic { base: a, index: b, .. }
+            | CombineSampledImage { image: a, sampler: b }
+            | ImageSampleImplicitLod { sampled_image: a, coord: b }
+            | ImageRead { image: a, coord: b }
+            | ImageTexelPointer { image: a, coord: b }
+            | SampledImageQuerySizeLod { image: a, lod: b }
+            | VectorShuffle { src1: a, src2: b, .. }
+            | VectorInsert { vector: a, scalar: b, .. }
+            | Store { ptr: a, value: b } | AtomicStore { ptr: a, value: b }
+            | AtomicIAdd { ptr: a, value: b } | AtomicAnd { ptr: a, value: b }
+            | AtomicOr { ptr: a, value: b } | AtomicXor { ptr: a, value: b }
+            | AtomicSMin { ptr: a, value: b } | AtomicSMax { ptr: a, value: b }
+            | AtomicUMin { ptr: a, value: b } | AtomicUMax { ptr: a, value: b }
+            | AtomicExchange { ptr: a, value: b } => {
+                out.push(a.id);
+                out.push(b.id);
+            }
+
+            Fma(a, b, c) | Select { cond: a, t_val: b, f_val: c }
+            | ImageSampleExplicitLod { sampled_image: a, coord: b, lod: c }
+            | ImageSampleDref { sampled_image: a, coord: b, dref: c }
+            | ImageGather { sampled_image: a, coord: b, component: c }
+            | ImageReadLod { image: a, coord: b, lod: c }
+            | AtomicCompareExchange { ptr: a, expected: b, desired: c } => {
+                out.push(a.id);
+                out.push(b.id);
+                out.push(c.id);
+            }
+
+            ImageFetch { image, coord, lod } => {
+                out.push(image.id);
+                out.push(coord.id);
+                if let Some(l) = lod { out.push(l.id); }
+            }
+            ImageWrite { image, coord, texel } => {
+                out.push(image.id);
+                out.push(coord.id);
+                out.push(texel.id);
+            }
+            ImageWriteLod { image, coord, texel, lod } => {
+                out.push(image.id);
+                out.push(coord.id);
+                out.push(texel.id);
+                out.push(lod.id);
+            }
+            ConstVec(elems) => for e in elems { out.push(e.id); },
+            Phi(arms) => for arm in arms { out.push(arm.value.id); },
+        }
+    }
+}
+
+/// FMA fusion: rewrite `FAdd(FMul(a, b), c)` (and the symmetric
+/// `FAdd(c, FMul(a, b))`) into `Fma(a, b, c)` when the `FMul`'s scalar-`F32`
+/// result is **used exactly once** (so deleting it is safe) and both ops sit
+/// in the same block. Backends lower `Fma` to a single FMADD — the entire
+/// measured ~1.3× gap to LLVM on compute-heavy shaders was this fusion (see
+/// `bench_fs_codegen`). Vectors are left alone for now (scalar-only).
+pub fn fuse_fma(module: &mut Module) {
+    for func in module.functions.iter_mut() {
+        // Function-wide textual use-count of every value.
+        let mut uses: HashMap<ValueId, u32> = HashMap::new();
+        let mut scratch = Vec::new();
+        for block in func.blocks.values() {
+            for inst in &block.insts {
+                scratch.clear();
+                inst.op.referenced_value_ids(&mut scratch);
+                for id in &scratch { *uses.entry(*id).or_insert(0) += 1; }
+            }
+        }
+        for block in func.blocks.values_mut() {
+            fuse_fma_block(block, &uses);
+        }
+    }
+}
+
+fn fuse_fma_block(block: &mut Block, uses: &HashMap<ValueId, u32>) {
+    // Single-use scalar-F32 FMuls defined in this block → their (a, b).
+    let mut mul_src: HashMap<ValueId, (Value, Value)> = HashMap::new();
+    for inst in &block.insts {
+        if let (Op::FMul(a, b), Some(res)) = (&inst.op, &inst.result) {
+            if res.ty == Type::F32 && uses.get(&res.id).copied().unwrap_or(0) == 1 {
+                mul_src.insert(res.id, (a.clone(), b.clone()));
+            }
+        }
+    }
+    if mul_src.is_empty() { return; }
+
+    let mut fused: std::collections::HashSet<ValueId> = std::collections::HashSet::new();
+    for inst in block.insts.iter_mut() {
+        let is_f32 = inst.result.as_ref().map_or(false, |v| v.ty == Type::F32);
+        if let (Op::FAdd(l, r), true) = (&inst.op, is_f32) {
+            // Prefer the lhs mul; fall back to rhs. The other operand becomes
+            // the fma addend. (A single-use mul appears in exactly one FAdd,
+            // so no mul is fused twice; the `fused` set only guards the rare
+            // a*b + a*b shape where both operands name the same mul.)
+            let pick = if let Some((a, b)) = mul_src.get(&l.id).filter(|_| !fused.contains(&l.id)) {
+                Some((l.id, a.clone(), b.clone(), r.clone()))
+            } else if let Some((a, b)) = mul_src.get(&r.id).filter(|_| !fused.contains(&r.id)) {
+                Some((r.id, a.clone(), b.clone(), l.clone()))
+            } else { None };
+            if let Some((mul_id, a, b, c)) = pick {
+                fused.insert(mul_id);
+                inst.op = Op::Fma(a, b, c);
+            }
+        }
+    }
+    if fused.is_empty() { return; }
+    // Drop the now-dead FMul definitions.
+    block.insts.retain(|inst| {
+        !matches!(&inst.op, Op::FMul(..))
+            || inst.result.as_ref().map_or(true, |v| !fused.contains(&v.id))
+    });
 }
 
 /// Width + signedness for integer constants and conversions.

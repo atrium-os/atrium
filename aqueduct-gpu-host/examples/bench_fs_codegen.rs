@@ -225,11 +225,16 @@ fn main() {
     row("cranelift", ns_cr);
     println!();
     let lead = ns_be - ns_cc; // cc's total lead over bespoke
-    let fma_share = (ns_ccn - ns_cc).max(0.0); // gap that fma alone closes
-    if lead > 0.0 {
+    if lead > 0.10 * ns_cc {
+        // Meaningful gap remains → attribute it (pre-fma case).
+        let fma_share = (ns_ccn - ns_cc).max(0.0);
         println!("  fma fusion explains ~{:.0}% of cc's lead over bespoke \
                   (no-fma cc = {:.1}% of cc); the rest is regalloc / isel.",
             fma_share / lead * 100.0, ns_cc / ns_ccn * 100.0);
+    } else {
+        println!("  bespoke is within noise of cc/LLVM here — fma fusion \
+                  closed the gap (no-fma cc = {:.1}% of cc confirms it was fma).",
+            ns_cc / ns_ccn * 100.0);
     }
 
     // ── Compile time — the OTHER half of the tradeoff (why LLVM was rejected

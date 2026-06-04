@@ -337,13 +337,17 @@ fn run(args: &Args) -> Result<CompileReport, CompileError> {
     // 3. Frontend: SPIR-V → atrium-spv-ir, applying spec
     // overrides (no-op when --spec-const wasn't passed).
     let t_frontend = Instant::now();
-    let module = frontend_translate_with_overrides(
+    let mut module = frontend_translate_with_overrides(
         &spirv, &args.spec_overrides,
     ).map_err(|e| match e {
         atrium_spv_frontend::FrontendError::Unsupported(m) =>
             CompileError::Unsupported(m),
         other => CompileError::Internal(format!("frontend: {other}")),
     })?;
+    // IR-level optimisation passes (backend-agnostic). FMA fusion folds
+    // single-use FMul→FAdd into one FMADD — the measured ~1.3× gap to LLVM
+    // on compute-heavy shaders (bench_fs_codegen).
+    atrium_spv_ir::fuse_fma(&mut module);
     let frontend_us = t_frontend.elapsed().as_micros();
 
     // 4. Backend.

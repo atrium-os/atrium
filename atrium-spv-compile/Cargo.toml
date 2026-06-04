@@ -11,6 +11,7 @@ name = "atrium-spv-compile"
 path = "src/main.rs"
 
 [dependencies]
+atrium-spv-ir                = { path = "../atrium-spv-ir" }
 atrium-spv-frontend          = { path = "../atrium-spv-frontend" }
 atrium-spv-backend-cranelift = { path = "../atrium-spv-backend-cranelift" }
 atrium-spv-backend-bespoke   = { path = "../atrium-spv-backend-bespoke" }
