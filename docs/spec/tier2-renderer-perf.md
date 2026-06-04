@@ -167,19 +167,26 @@ the optimistic case; textured/glyph shading is ~2–3× heavier.)
       > | path | ms/frame | fps | vs tiny-skia |
       > |---|---|---|---|
       > | tiny-skia (1 thread, SIMD blitter) | **1.88** | 533 | — |
-      > | tier-2 `submit_frame`, **bespoke** | **12.96** | 77 | 6.9× slower |
-      > | tier-2 `submit_frame`, cranelift | 15.56 | 64 | 8.3× slower |
+      > | tier-2 `submit_frame` (SIMD on all tris) | 9.5–13 | ~90 | ~6× slower |
+      > | tier-2 `submit_frame` (**area-gated SIMD**) | **4.2** | 236 | **2.2× slower** |
       > | tier-2 per-triangle API (not production) | 162 | 6 | 87× slower |
       >
-      > So: the batched `submit_frame` path is **12.5× faster** than
-      > the per-triangle API (which earlier benches mistakenly
-      > measured), and **bespoke beats cranelift by ~20%** on real
-      > work — but tier-2 is still **~7× off tiny-skia** on a real
-      > frame. The "comfortably 4K@120" claim above holds only for
-      > dispatch-bound / damage-driven UI; a real glyph-heavy
-      > full frame is **not** there yet. Closing the ~7× is exactly
-      > the SIMD shading work (P3), and that 7× *is* tiny-skia's
-      > SIMD-blitter advantage over tier-2's scalar per-pixel path.
+      > **The batched `submit_frame` path is 12.5× faster than the
+      > per-triangle API** (which earlier benches mistakenly measured).
+      > And a key finding: **the P3a SIMD rasterizer HELPS large
+      > primitives but HURTS small ones.** A 4K screen triangle is
+      > 1.59× faster on SIMD (4.82 vs 7.67 ms), but a frame of 3200
+      > tiny glyph quads is ~2× *slower* on SIMD (10 vs 4.8 ms) — each
+      > glyph pays the full per-tile-row `f32x8` setup (splats + 3
+      > vector edge fns + 3 vector divides) for a handful of covered
+      > pixels. Gating SIMD to triangles with area ≥ ~2048 px²
+      > (`simd_min_area`) gives the SIMD win on the bg/panels AND the
+      > scalar win on the glyphs: **the real UI frame dropped from
+      > ~10 ms to 4.2 ms, 5× → 2.2× off tiny-skia.** Output is
+      > identical (both paths are per-lane IEEE); this is purely a
+      > speed gate. The remaining ~2.2× is the per-lane `fs_main` call
+      > + scalar blend/write (P3b vectorized FS codegen / a const-FS
+      > broadcast fast path) — the next lever.
 - **P2 — Batched fragment execution.** Remove the per-pixel FS
   call.  Today `rasterize_stripe` makes one indirect call to
   `fs_main` *per covered pixel* (8.3M calls/frame at 4K full-screen);

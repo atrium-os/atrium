@@ -1587,6 +1587,24 @@ fn scalar_forced() -> bool {
         std::env::var("ATRIUM_TIER2_NOSIMD").map(|v| v == "1").unwrap_or(false))
 }
 
+/// Minimum triangle area (px²) to take the SIMD coverage path. The SIMD
+/// rasterizer pays a fixed per-tile-row cost (f32x8 splats + 3 vector edge
+/// functions + 3 vector divides for barycentrics) for ALL 8 lanes regardless
+/// of how few are covered. On a large fill that amortizes (measured 1.43×
+/// faster, `bench_p3a_simd`); on a tiny primitive it's pure overhead —
+/// measured ~2× SLOWER on a 3200-glyph UI frame (`bench_tinyskia_vs_tier2`),
+/// because each tiny glyph triangle does the full f32x8 setup for ~a handful
+/// of covered pixels. Below this area the scalar per-pixel path (work ∝
+/// covered pixels, no fixed setup) wins. Tuned against both benches.
+/// `ATRIUM_TIER2_SIMD_MIN_AREA` overrides for A/B. Output is identical either
+/// way (both paths are per-lane IEEE), so this is purely a speed gate.
+fn simd_min_area() -> f32 {
+    use std::sync::OnceLock;
+    static A: OnceLock<f32> = OnceLock::new();
+    *A.get_or_init(|| std::env::var("ATRIUM_TIER2_SIMD_MIN_AREA")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(2048.0))
+}
+
 fn rasterize_stripe(
     task: &mut StripeWork<'_, '_>,
     setup: &TriangleSetup,
@@ -1656,7 +1674,12 @@ fn rasterize_stripe(
         && !setup.fs_writes_depth
         && !draw.compute_implicit_lod
         && !draw.uses_derivatives
-        && task.extra_color.is_empty();
+        && task.extra_color.is_empty()
+        // Only worth the fixed per-tile-row f32x8 cost on a big-enough
+        // triangle. `total_edge` is 2× the signed screen-space area, so the
+        // area is |total_edge|/2; small primitives (glyphs) take the scalar
+        // path, where they're ~2× faster.
+        && (setup.total_edge.abs() * 0.5) >= simd_min_area();
     if simd_ok {
         rasterize_stripe_simd(task, setup, draw, fs_main);
         return;
