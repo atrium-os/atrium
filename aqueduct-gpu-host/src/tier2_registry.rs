@@ -1658,6 +1658,89 @@ fn simd_min_area() -> f32 {
         .ok().and_then(|v| v.parse().ok()).unwrap_or(2048.0))
 }
 
+/// Const-fill fast write: the precomputed state for a pixel-invariant,
+/// no-varying, depth-disabled draw, shared by the scalar + SIMD
+/// rasterizers so their writes are bit-identical by construction.
+///
+/// Three tiers, fastest first:
+///   * `opaque_u8` — blend disabled → the constant colour is pre-
+///     quantised to bytes; a covered pixel is a masked byte copy.
+///   * `affine` — blend enabled but every factor is dst-independent
+///     (opaque, SrcOver, … the UI common case) → `final = A + B*dst`
+///     with constant `(A,B)` (see `blend_affine`), bit-identical to
+///     `apply_blend` but with the src-only work hoisted out.
+///   * neither — a dst-dependent blend → per-pixel `apply_blend`.
+#[derive(Clone, Copy)]
+struct CFast {
+    src: [f32; 4],
+    wm: ColorWriteMask,
+    opaque_u8: Option<[u8; 4]>,
+    affine: Option<([f32; 4], [f32; 4])>,
+    blend: BlendState,
+}
+
+impl CFast {
+    fn new(draw: &DrawTriangle<'_>) -> Self {
+        let cc = draw.fs_const_color.unwrap();
+        let src = if draw.swap_rb { [cc[2], cc[1], cc[0], cc[3]] } else { cc };
+        let (opaque_u8, affine) = if !draw.blend_state.enable {
+            (Some([f32_to_u8(src[0]), f32_to_u8(src[1]),
+                   f32_to_u8(src[2]), f32_to_u8(src[3])]), None)
+        } else {
+            (None, blend_affine(&draw.blend_state, src))
+        };
+        CFast { src, wm: draw.blend_state.write_mask, opaque_u8, affine,
+                blend: draw.blend_state }
+    }
+
+    /// Write one covered pixel at byte offset `idx` into `pixels`.
+    #[inline(always)]
+    fn write(&self, pixels: &mut [u8], idx: usize) {
+        if idx + 4 > pixels.len() { return; }
+        let am = self.wm;
+        if let Some(u8s) = self.opaque_u8 {
+            if am.r { pixels[idx]     = u8s[0]; }
+            if am.g { pixels[idx + 1] = u8s[1]; }
+            if am.b { pixels[idx + 2] = u8s[2]; }
+            if am.a { pixels[idx + 3] = u8s[3]; }
+            return;
+        }
+        let dst = [
+            pixels[idx]     as f32 / 255.0,
+            pixels[idx + 1] as f32 / 255.0,
+            pixels[idx + 2] as f32 / 255.0,
+            pixels[idx + 3] as f32 / 255.0,
+        ];
+        let fin = if let Some((a, b)) = self.affine {
+            [a[0] + b[0] * dst[0], a[1] + b[1] * dst[1],
+             a[2] + b[2] * dst[2], a[3] + b[3] * dst[3]]
+        } else {
+            apply_blend(&self.blend, self.src, dst)
+        };
+        if am.r { pixels[idx]     = f32_to_u8(fin[0]); }
+        if am.g { pixels[idx + 1] = f32_to_u8(fin[1]); }
+        if am.b { pixels[idx + 2] = f32_to_u8(fin[2]); }
+        if am.a { pixels[idx + 3] = f32_to_u8(fin[3]); }
+    }
+}
+
+/// Shared eligibility test for the const-fill fast write, used by both
+/// the scalar/SIMD `cfast` precompute and the `simd_ok` gate (so a
+/// const glyph that *will* take cfast is routed to the SIMD coverage
+/// path regardless of its tiny area).  Does NOT check MRT
+/// (`task.extra_color`) — the SIMD path's `simd_ok` already excludes it
+/// and the scalar precompute adds it explicitly.
+fn cfast_eligible(setup: &TriangleSetup, draw: &DrawTriangle<'_>) -> bool {
+    draw.fs_const_color.is_some()
+        && setup.n == 0
+        && !setup.fs_writes_depth
+        && setup.depth_compare_op == CompareOp::Always
+        && !setup.depth_write
+        && setup.depth_bounds.is_none()
+        && setup.stencil_face.is_none()
+        && draw.sample_count == 1
+}
+
 fn rasterize_stripe(
     task: &mut StripeWork<'_, '_>,
     setup: &TriangleSetup,
@@ -1733,12 +1816,12 @@ fn rasterize_stripe(
         // area is |total_edge|/2; small primitives (glyphs) take the scalar
         // path, where they're ~2× faster.
         //
-        // NB: relaxing this for const-colour draws was measured a NET LOSS
-        // (27.8→123 core-ms on the glyph bench).  The per-tile-row barycentric
-        // divs + perspective setup run unconditionally per row regardless of
-        // const-colour / n=0, so a tiny glyph pays full SIMD setup for a few
-        // covered pixels.  The glyph bottleneck is per-tile-row SETUP, not
-        // per-pixel shading — the fix is a rect fast path, not wider lanes.
+        // NB: routing tiny const draws here is a NET LOSS even WITH cfast
+        // skipping the barycentric block — measured 13.05→15.47 (and 27.8→123
+        // before cfast).  The SIMD per-(triangle,stripe) setup (soa/interp vec
+        // allocs, edge-coefficient prep, full-width f32x8 coverage) costs more
+        // than the scalar path's per-pixel work for a tiny prim.  Tiny const
+        // glyphs stay scalar (where the affine-blend `cfast` is already cheap).
         && (setup.total_edge.abs() * 0.5) >= simd_min_area();
     if simd_ok {
         rasterize_stripe_simd(task, setup, draw, fs_main);
@@ -1814,24 +1897,9 @@ fn rasterize_stripe(
     // The produced bytes are bit-identical to the full path for these
     // pixels (coverage 1.0, final_color == src for opaque / apply_blend
     // for enabled blend, same f32_to_u8).
-    let cfast: Option<([f32; 4], ColorWriteMask, Option<[u8; 4]>)> =
-        if draw.fs_const_color.is_some()
-            && setup.n == 0
-            && !setup.fs_writes_depth
-            && setup.depth_compare_op == CompareOp::Always
-            && !setup.depth_write
-            && setup.depth_bounds.is_none()
-            && setup.stencil_face.is_none()
-            && draw.sample_count == 1
-            && task.extra_color.is_empty()
-        {
-            let cc = draw.fs_const_color.unwrap();
-            let src = if draw.swap_rb { [cc[2], cc[1], cc[0], cc[3]] } else { cc };
-            let opaque_u8 = if !draw.blend_state.enable {
-                Some([f32_to_u8(src[0]), f32_to_u8(src[1]),
-                      f32_to_u8(src[2]), f32_to_u8(src[3])])
-            } else { None };
-            Some((src, draw.blend_state.write_mask, opaque_u8))
+    let cfast: Option<CFast> =
+        if cfast_eligible(setup, draw) && task.extra_color.is_empty() {
+            Some(CFast::new(draw))
         } else { None };
 
     for tile_x in setup.tile_min_x..=setup.tile_max_x {
@@ -1894,30 +1962,12 @@ fn rasterize_stripe(
                 // Const-fill fast write (see `cfast` above): skip all the
                 // dead barycentric / depth-interp / early-Z work and write
                 // the precomputed constant colour for this covered pixel.
-                if let Some((src, am, opaque_u8)) = cfast {
+                if let Some(cf) = cfast {
                     if !center_inside { continue; }
                     let py_local = (py - stripe_pixel_y) as usize;
                     let idx = (py_local * (setup.width as usize)
                         + px as usize) * 4;
-                    if idx + 4 > task.pixels.len() { continue; }
-                    if let Some(u8s) = opaque_u8 {
-                        if am.r { task.pixels[idx]     = u8s[0]; }
-                        if am.g { task.pixels[idx + 1] = u8s[1]; }
-                        if am.b { task.pixels[idx + 2] = u8s[2]; }
-                        if am.a { task.pixels[idx + 3] = u8s[3]; }
-                    } else {
-                        let dst = [
-                            task.pixels[idx]     as f32 / 255.0,
-                            task.pixels[idx + 1] as f32 / 255.0,
-                            task.pixels[idx + 2] as f32 / 255.0,
-                            task.pixels[idx + 3] as f32 / 255.0,
-                        ];
-                        let fin = apply_blend(&draw.blend_state, src, dst);
-                        if am.r { task.pixels[idx]     = f32_to_u8(fin[0]); }
-                        if am.g { task.pixels[idx + 1] = f32_to_u8(fin[1]); }
-                        if am.b { task.pixels[idx + 2] = f32_to_u8(fin[2]); }
-                        if am.a { task.pixels[idx + 3] = f32_to_u8(fin[3]); }
-                    }
+                    cf.write(task.pixels, idx);
                     continue;
                 }
 
@@ -2462,21 +2512,8 @@ fn rasterize_stripe_simd(
     // covered lanes straight after the coverage test.  simd_ok already
     // excludes stencil / late-depth / MRT / MSAA; we add the depth-
     // disabled + n==0 conditions here.  Bit-identical to the full path.
-    let cfast: Option<([f32; 4], ColorWriteMask, Option<[u8; 4]>)> =
-        if draw.fs_const_color.is_some()
-            && n == 0
-            && setup.depth_compare_op == CompareOp::Always
-            && !setup.depth_write
-            && setup.depth_bounds.is_none()
-        {
-            let cc = draw.fs_const_color.unwrap();
-            let src = if draw.swap_rb { [cc[2], cc[1], cc[0], cc[3]] } else { cc };
-            let opaque_u8 = if !draw.blend_state.enable {
-                Some([f32_to_u8(src[0]), f32_to_u8(src[1]),
-                      f32_to_u8(src[2]), f32_to_u8(src[3])])
-            } else { None };
-            Some((src, wm, opaque_u8))
-        } else { None };
+    let cfast: Option<CFast> =
+        if cfast_eligible(setup, draw) { Some(CFast::new(draw)) } else { None };
 
     let te = f32x8::splat(setup.total_edge);
     let zero = f32x8::splat(0.0);
@@ -2518,31 +2555,13 @@ fn rasterize_stripe_simd(
 
             // Const-fill fast write: skip the barycentric / oiw / depth
             // block entirely for the covered lanes.
-            if let Some((src, am, opaque_u8)) = cfast {
+            if let Some(cf) = cfast {
                 let py_local = (py - stripe_pixel_y) as usize;
+                let row_base = py_local * (setup.width as usize);
                 for lane in 0..lanes {
                     if !inside[lane] { continue; }
                     let px = (t_min_x + lane as i32) as usize;
-                    let idx = (py_local * (setup.width as usize) + px) * 4;
-                    if idx + 4 > task.pixels.len() { continue; }
-                    if let Some(u8s) = opaque_u8 {
-                        if am.r { task.pixels[idx]     = u8s[0]; }
-                        if am.g { task.pixels[idx + 1] = u8s[1]; }
-                        if am.b { task.pixels[idx + 2] = u8s[2]; }
-                        if am.a { task.pixels[idx + 3] = u8s[3]; }
-                    } else {
-                        let dst = [
-                            task.pixels[idx]     as f32 / 255.0,
-                            task.pixels[idx + 1] as f32 / 255.0,
-                            task.pixels[idx + 2] as f32 / 255.0,
-                            task.pixels[idx + 3] as f32 / 255.0,
-                        ];
-                        let fin = apply_blend(&draw.blend_state, src, dst);
-                        if am.r { task.pixels[idx]     = f32_to_u8(fin[0]); }
-                        if am.g { task.pixels[idx + 1] = f32_to_u8(fin[1]); }
-                        if am.b { task.pixels[idx + 2] = f32_to_u8(fin[2]); }
-                        if am.a { task.pixels[idx + 3] = f32_to_u8(fin[3]); }
-                    }
+                    cf.write(task.pixels, (row_base + px) * 4);
                 }
                 continue;
             }
@@ -3323,6 +3342,49 @@ fn apply_blend(state: &BlendState, src: [f32; 4], dst: [f32; 4]) -> [f32; 4] {
         blend_op(state.color_op, sc[2] * src[2], dc[2] * dst[2]),
         blend_op(state.alpha_op, sa    * src[3], da    * dst[3]),
     ]
+}
+
+/// Is a blend factor independent of the destination pixel?
+/// Dst*/OneMinusDst* read `dst`; everything else is a function of
+/// `src` + constants only.
+fn blend_factor_dst_independent(f: BlendFactor) -> bool {
+    !matches!(f,
+        BlendFactor::DstColor | BlendFactor::OneMinusDstColor
+        | BlendFactor::DstAlpha | BlendFactor::OneMinusDstAlpha)
+}
+
+/// For a CONSTANT `src` and a blend whose every factor is
+/// dst-independent, the full blend equation collapses to an affine
+/// function of the destination with constant coefficients:
+///
+///   final[ch] = sc[ch]*src[ch] + dc[ch]*dst[ch]  =  A[ch] + B[ch]*dst[ch]
+///
+/// with `A[ch] = sc[ch]*src[ch]` and `B[ch] = dc[ch]` (both constant,
+/// since the factors don't read dst).  Returns `(A, B)` when every
+/// factor qualifies and both ops are Add (the only op), else `None`
+/// (caller falls back to per-pixel `apply_blend`).  Evaluating
+/// `A + B*dst` is bit-identical to `apply_blend` for these pixels —
+/// same f32 products, same `a + b` order — just with the
+/// src-only sub-expressions hoisted out of the per-pixel loop.
+fn blend_affine(state: &BlendState, src: [f32; 4]) -> Option<([f32; 4], [f32; 4])> {
+    if !matches!(state.color_op, BlendOp::Add)
+        || !matches!(state.alpha_op, BlendOp::Add)
+        || !blend_factor_dst_independent(state.color.src)
+        || !blend_factor_dst_independent(state.color.dst)
+        || !blend_factor_dst_independent(state.alpha.src)
+        || !blend_factor_dst_independent(state.alpha.dst)
+    {
+        return None;
+    }
+    // dst is unused by these factors; pass zeros.
+    let z = [0.0f32; 4];
+    let sc = color_factor(state.color.src, src, z);
+    let dc = color_factor(state.color.dst, src, z);
+    let sa = alpha_factor(state.alpha.src, src, z);
+    let da = alpha_factor(state.alpha.dst, src, z);
+    let a = [sc[0] * src[0], sc[1] * src[1], sc[2] * src[2], sa * src[3]];
+    let b = [dc[0], dc[1], dc[2], da];
+    Some((a, b))
 }
 
 /// Saturating float-to-u8 conversion matching the standard
