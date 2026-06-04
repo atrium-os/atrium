@@ -2493,11 +2493,38 @@ fn emit_function(
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal(
                         "LoadBuiltin without result".into()))?;
-                if !matches!(func.stage, ShaderStage::Compute) {
+                // VS/FS scalar-integer builtins arrive in fixed AAPCS64
+                // argument W-registers (ints in W0-W7, allocated separately
+                // from the V-reg float args). Capture into the int pool here,
+                // before the body reuses those registers:
+                //   VS:  VertexIndex=W4, InstanceIndex=W5; Base*=const 0
+                //   FS:  FrontFacing=W6, PrimitiveId=W7
+                // (FragCoord — V0-V3 floats — is not yet handled here, so a
+                // FragCoord FS still falls back to cranelift.)
+                let vs_fs_int: Option<Option<u8>> = match (func.stage, *kind) {
+                    (ShaderStage::Vertex, BK::VertexIndex) => Some(Some(4)),
+                    (ShaderStage::Vertex, BK::InstanceIndex) => Some(Some(5)),
+                    (ShaderStage::Vertex, BK::BaseVertex)
+                    | (ShaderStage::Vertex, BK::BaseInstance) => Some(None),
+                    (ShaderStage::Fragment, BK::FrontFacing) => Some(Some(6)),
+                    (ShaderStage::Fragment, BK::PrimitiveId) => Some(Some(7)),
+                    _ => None,
+                };
+                let run_compute_match = if let Some(src) = vs_fs_int {
+                    let w = int_pool.alloc(result.id)?;
+                    match src {
+                        Some(reg) => a.emit(asm::mov_w(w, asm::Wreg(reg))),
+                        None => a.emit(asm::movz_w(w, 0, 0)), // Base* = 0
+                    }
+                    ints.insert(result.id, w);
+                    false
+                } else if !matches!(func.stage, ShaderStage::Compute) {
                     return Err(BackendError::Unsupported(format!(
-                        "LoadBuiltin({kind:?}) only supported for compute \
-                         in bespoke today (stage={:?})", func.stage)));
-                }
+                        "LoadBuiltin({kind:?}) not supported in bespoke for \
+                         stage {:?}", func.stage)));
+                } else {
+                    true
+                };
                 // Materialise uvec3 lanes via int W-regs in
                 // the int_pool.  Source registers per the
                 // Compute AAPCS64 sig:
@@ -2540,6 +2567,7 @@ fn emit_function(
                     ints.insert(synth, w);
                     Ok(Value { id: synth, ty: Type::U32 })
                 };
+                if run_compute_match {
                 match kind {
                     BK::WorkgroupId => {
                         let lx = load_lane_from_w(
@@ -2770,6 +2798,7 @@ fn emit_function(
                         "LoadBuiltin({other:?}) not supported in compute \
                          bespoke path"))),
                 }
+                } // run_compute_match
             }
             Op::Load(ptr) => {
                 let result = inst.result.as_ref().ok_or_else(||
