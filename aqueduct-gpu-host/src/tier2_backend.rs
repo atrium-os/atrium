@@ -63,6 +63,9 @@ struct OwnedDraw {
     /// P2.3: batched span fragment entry, when the backend emitted
     /// one for this shader (`None` keeps the per-pixel path).
     fs_span: Option<atrium_spv_loader::FsSpanMain>,
+    /// Const-fill fast path: `Some(rgba)` when the FS is pixel-invariant —
+    /// its single output, pre-computed once for this draw (not per pixel).
+    fs_const_color: Option<[f32; 4]>,
     _tex_descs: Vec<atrium_spv_runtime::TexDesc>,
     _sampler_descs: Vec<atrium_spv_runtime::SamplerDesc>,
     _mip_desc_arrays: Vec<Vec<atrium_spv_runtime::TexDesc>>,
@@ -85,9 +88,30 @@ impl OwnedDraw {
             uses_derivatives: self.uses_derivatives,
             sample_count: self.sample_count,
             swap_rb: self.swap_rb,
+            fs_const_color: self.fs_const_color,
             ..Default::default()
         }
     }
+}
+
+/// Evaluate a **pixel-invariant** FS once for a draw (no varyings / FragCoord
+/// / derivatives, so its output depends only on uniforms/push). Returns the
+/// single RGBA the rasterizer reuses for every covered pixel — the same value
+/// `fs_main` would produce per pixel, so the result stays bit-identical.
+fn eval_const_fs(
+    fs: atrium_spv_loader::FsMain, uniforms: &[u8], push: &[u8],
+) -> [f32; 4] {
+    let uni = if uniforms.is_empty() { std::ptr::null() } else { uniforms.as_ptr() };
+    let pc = if push.is_empty() { std::ptr::null() } else { push.as_ptr() };
+    let mut out = [0.0f32; 4];
+    let mut depth = 0.0f32;
+    // in_varyings/front_facing/primitive_id/frag_coord are all unused by an
+    // invariant FS (the classifier guarantees it), so nulls / zeros are safe.
+    unsafe {
+        fs(std::ptr::null(), uni, pc, 0.0, 0.0, 0.0, 1.0, 0,
+           out.as_mut_ptr(), &mut depth, 0, 0);
+    }
+    out
 }
 
 use aqueduct_gpu::frame::{
@@ -2557,6 +2581,10 @@ impl Tier2Backend {
         if let Some(fs_main) = fs_main_opt {
             let draw_idx = batch_draws.len() as u32;
             for s in &mut all_setups { s.draw_idx = draw_idx; }
+            // Const-fill fast path: evaluate a pixel-invariant FS once now.
+            let fs_const_color = if self.registry.fs_pixel_invariant(fs_shader_id) {
+                Some(eval_const_fs(fs_main, &uniforms_buf, &state.push_constants))
+            } else { None };
             batch_draws.push(OwnedDraw {
                 uniforms: uniforms_buf,
                 push_constants: state.push_constants.clone(),
@@ -2569,6 +2597,7 @@ impl Tier2Backend {
                 sample_count,
                 swap_rb,
                 fs_main,
+                fs_const_color,
                 fs_span: self.registry.get(fs_shader_id)
                     .and_then(|s| s.entry_points.fs_span_main),
                 _tex_descs: tex_descs,
@@ -3936,6 +3965,9 @@ impl Tier2Backend {
         if let Some(fs_main) = fs_main_opt {
             let draw_idx = batch_draws.len() as u32;
             for s in &mut all_setups { s.draw_idx = draw_idx; }
+            let fs_const_color = if self.registry.fs_pixel_invariant(fs_shader_id) {
+                Some(eval_const_fs(fs_main, &[], &state.push_constants))
+            } else { None };
             batch_draws.push(OwnedDraw {
                 uniforms: Vec::new(),
                 push_constants: state.push_constants.clone(),
@@ -3950,6 +3982,7 @@ impl Tier2Backend {
                 sample_count,
                 swap_rb,
                 fs_main,
+                fs_const_color,
                 fs_span: self.registry.get(fs_shader_id)
                     .and_then(|s| s.entry_points.fs_span_main),
                 _tex_descs: Vec::new(),

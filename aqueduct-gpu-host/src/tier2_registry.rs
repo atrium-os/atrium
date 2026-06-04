@@ -2102,16 +2102,35 @@ fn rasterize_stripe(
                 // is sized for the max attachment count, so
                 // the FS's per-Location stores never run past
                 // it.
-                unsafe {
-                    fs_main(
-                        in_varyings_ptr, uni_ptr, pc_ptr,
-                        cx, cy, window_z, one_over_interp_inv_w,
-                        0,
-                        out_color.as_mut_ptr(),
-                        &mut out_depth,
-                        setup.front_facing as u32,
-                        setup.primitive_id,
-                    );
+                // Const-FS fast path: a pixel-invariant FS (no
+                // varyings / builtins / derivatives) produces the
+                // same colour at every pixel, so the daemon evaluated
+                // it once at draw-record time.  Broadcast that colour
+                // instead of crossing the FFI boundary per pixel.
+                // Gated to the simple single-attachment, no-late-depth
+                // case so out_depth stays the early-Z `window_z` seed
+                // (exactly what a non-depth-writing FS leaves) and the
+                // scatter below is byte-for-byte identical.
+                let const_ok = draw.fs_const_color.is_some()
+                    && !setup.fs_writes_depth
+                    && n_color == 1;
+                if let (true, Some(cc)) = (const_ok, draw.fs_const_color) {
+                    out_color[0] = cc[0];
+                    out_color[1] = cc[1];
+                    out_color[2] = cc[2];
+                    out_color[3] = cc[3];
+                } else {
+                    unsafe {
+                        fs_main(
+                            in_varyings_ptr, uni_ptr, pc_ptr,
+                            cx, cy, window_z, one_over_interp_inv_w,
+                            0,
+                            out_color.as_mut_ptr(),
+                            &mut out_depth,
+                            setup.front_facing as u32,
+                            setup.primitive_id,
+                        );
+                    }
                 }
                 if draw.uses_derivatives {
                     atrium_spv_runtime::quad_end();
@@ -2443,16 +2462,28 @@ fn rasterize_stripe_simd(
                     }
                     interp_buf.as_ptr()
                 };
-                // SAFETY: same contract as rasterize_stripe's fs_main
-                // call; out_color sized for one attachment's 4 f32.
-                unsafe {
-                    fs_main(
-                        vptr, uni_ptr, pc_ptr,
-                        cx_arr[lane], cy, wz_arr[lane], oiw_arr[lane],
-                        0,
-                        out_color.as_mut_ptr(), &mut out_depth,
-                        setup.front_facing as u32, setup.primitive_id,
-                    );
+                // Const-FS fast path (see rasterize_stripe): a
+                // pixel-invariant FS was evaluated once at record
+                // time.  The SIMD gate already excludes late-depth and
+                // MRT, so broadcasting the precomputed colour here is
+                // byte-for-byte identical to the per-lane FS call.
+                if let Some(cc) = draw.fs_const_color {
+                    out_color[0] = cc[0];
+                    out_color[1] = cc[1];
+                    out_color[2] = cc[2];
+                    out_color[3] = cc[3];
+                } else {
+                    // SAFETY: same contract as rasterize_stripe's fs_main
+                    // call; out_color sized for one attachment's 4 f32.
+                    unsafe {
+                        fs_main(
+                            vptr, uni_ptr, pc_ptr,
+                            cx_arr[lane], cy, wz_arr[lane], oiw_arr[lane],
+                            0,
+                            out_color.as_mut_ptr(), &mut out_depth,
+                            setup.front_facing as u32, setup.primitive_id,
+                        );
+                    }
                 }
                 let idx = pixel_lin * 4;
                 if idx + 4 > task.pixels.len() { continue; }
@@ -2765,6 +2796,15 @@ pub struct DrawTriangle<'a> {
     /// outlive the `build_triangle_setups` call (the VS runs
     /// serially there, before tile rasterization).
     pub vs_storage_table: &'a [u8],
+
+    /// Const-fill fast path: when `Some`, the FS is pixel-invariant (output
+    /// identical for every pixel of the draw — no varyings / FragCoord /
+    /// derivatives), and this is its single pre-computed RGBA output. The
+    /// rasterizer uses it directly instead of calling `fs_main` per pixel,
+    /// eliminating the per-pixel call the energy metric showed dominates.
+    /// `None` keeps the per-pixel `fs_main` path. Bit-identical either way —
+    /// only the FS *value* is hoisted; coverage / blend / write are unchanged.
+    pub fs_const_color: Option<[f32; 4]>,
 }
 
 /// Per-face stencil state passed to `fill_image_triangle`.
@@ -2853,6 +2893,7 @@ impl Default for DrawTriangle<'_> {
             fs_writes_depth: false,
             swap_rb: false,
             vs_storage_table: &[],
+            fs_const_color: None,
         }
     }
 }
