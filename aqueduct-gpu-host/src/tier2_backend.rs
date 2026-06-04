@@ -927,6 +927,15 @@ impl Tier2Backend {
     ) {
         self.pipeline_vs_shaders.lock().unwrap()
             .insert(pipeline_id.raw(), shader_id);
+        // Derive the per-vertex varying stride from the compiled VS itself
+        // (authoritative) rather than trusting a client-supplied count.
+        // Sizing `in_varyings` from the shader is what keeps an FS that reads
+        // a varying off the null-`in_varyings` path (a guest that drew with a
+        // varying VS but no/!wrong state blob used to fault the daemon here).
+        if let Some(bytes) = self.registry.vs_varying_bytes(shader_id) {
+            self.pipeline_vs_varying_bytes.lock().unwrap()
+                .insert(pipeline_id.raw(), bytes);
+        }
     }
 
     /// How many `submit_frame` calls have arrived. Useful

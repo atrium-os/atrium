@@ -1106,6 +1106,13 @@ pub struct Function {
     /// late depth test against the shader-written value.  `None`
     /// for VS / CS and for FS that don't write depth.
     pub frag_depth_output: Option<ValueId>,
+    /// Total bytes this stage writes to `out_varyings` — the sum of every
+    /// Location-decorated `Output` varying's size, in Location order. For a
+    /// VS this is the per-vertex interpolant stride the rasterizer must
+    /// allocate; the daemon reads it to size `in_varyings` for the FS rather
+    /// than trusting a client-supplied count. 0 when the stage emits no
+    /// Location varyings (gl_Position-only VS, or an FS).
+    pub varying_output_bytes: u32,
 }
 
 /// Shader stage.

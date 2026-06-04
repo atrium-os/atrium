@@ -285,6 +285,7 @@ fn translate_one(
         output_varying_byte_offset,
         input_varying_byte_offset,
         frag_depth_output,
+        varying_output_bytes: iface.output_varying_total_bytes,
     })
 }
 

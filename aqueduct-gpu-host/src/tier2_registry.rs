@@ -61,6 +61,12 @@ pub struct Tier2Registry {
     /// `VkSpecializationInfo`-style overrides at pipeline-
     /// create time without re-uploading the module.
     spirv_by_id: Mutex<HashMap<Tier2ShaderId, Arc<Vec<u8>>>>,
+    /// Per-shader varying-output byte total, derived from the SPIR-V (the
+    /// frontend's authoritative count, not a client-supplied value).
+    /// Computed lazily on first query and cached. For a VS this is the
+    /// per-vertex interpolant stride the rasterizer must size `in_varyings`
+    /// to; `None` once computed-and-found-to-be-0 is stored as `Some(0)`.
+    varying_bytes_by_id: Mutex<HashMap<Tier2ShaderId, u32>>,
     /// Monotonic id allocator.
     next_id: Mutex<u64>,
 }
@@ -76,6 +82,7 @@ impl Tier2Registry {
             by_hash: Mutex::new(HashMap::new()),
             by_id: Mutex::new(HashMap::new()),
             spirv_by_id: Mutex::new(HashMap::new()),
+            varying_bytes_by_id: Mutex::new(HashMap::new()),
             next_id: Mutex::new(1),
         }
     }
@@ -129,6 +136,31 @@ impl Tier2Registry {
         self.spirv_by_id.lock().unwrap().get(&id).cloned()
     }
 
+    /// The total bytes of Location-decorated `Output` varyings this shader
+    /// writes — derived from the SPIR-V itself, so it is authoritative and
+    /// does not depend on a client-supplied count. For a VS this is the
+    /// per-vertex interpolant stride; the daemon uses it to size the FS's
+    /// `in_varyings` (and to decide the null-varying fast path). Computed
+    /// lazily and cached. `None` if the id was never registered or its SPIR-V
+    /// no longer fails to translate.
+    pub fn vs_varying_bytes(&self, id: Tier2ShaderId) -> Option<u32> {
+        if let Some(&b) = self.varying_bytes_by_id.lock().unwrap().get(&id) {
+            return Some(b);
+        }
+        let spirv = self.get_spirv(id)?;
+        // Re-run the frontend (cheap vs. the full compile; one-time per
+        // shader) purely to read its reflected varying total. A shader that
+        // failed to translate would never have compiled either, so treat a
+        // translate error as 0 varyings rather than propagating it here.
+        let bytes = atrium_spv_frontend::translate(&spirv)
+            .ok()
+            .and_then(|m| m.functions.into_iter().next())
+            .map(|f| f.varying_output_bytes)
+            .unwrap_or(0);
+        self.varying_bytes_by_id.lock().unwrap().insert(id, bytes);
+        Some(bytes)
+    }
+
     /// Look up a registered shader. `None` if the id has
     /// never been issued (or was forgotten).
     pub fn get(&self, id: Tier2ShaderId) -> Option<Arc<LoadedShader>> {
@@ -146,6 +178,7 @@ impl Tier2Registry {
             let mut by_hash = self.by_hash.lock().unwrap();
             by_hash.retain(|_h, v| *v != id);
             self.spirv_by_id.lock().unwrap().remove(&id);
+            self.varying_bytes_by_id.lock().unwrap().remove(&id);
         }
     }
 

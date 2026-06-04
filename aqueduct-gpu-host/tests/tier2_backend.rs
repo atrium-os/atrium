@@ -1709,6 +1709,146 @@ fn tier2_backend_vertexless_fullscreen_triangle_renders() {
     }
 }
 
+/// Vertex-less full-screen-triangle VS that also writes screen-space UV in
+/// [0,1] as a `Location=0` vec4 varying. Pairs with a varying-reading FS to
+/// exercise the VS→FS varying path on the compiled Tier-2 backend.
+fn build_fullscreen_tri_uv_vs() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::dr::Operand;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, ExecutionModel,
+        FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let f32t = b.type_float(32, None);
+    let i32t = b.type_int(32, 1);
+    let v4 = b.type_vector(f32t, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let per_vertex = b.type_struct(vec![v4]);
+    b.member_decorate(per_vertex, 0, Decoration::BuiltIn, vec![Operand::BuiltIn(BuiltIn::Position)]);
+    b.member_decorate(per_vertex, 0, Decoration::Offset, vec![Operand::LiteralBit32(0)]);
+    b.decorate(per_vertex, Decoration::Block, vec![]);
+    let ptr_pv = b.type_pointer(None, StorageClass::Output, per_vertex);
+    let ptr_out_v4 = b.type_pointer(None, StorageClass::Output, v4);
+    let ptr_in_i32 = b.type_pointer(None, StorageClass::Input, i32t);
+    let in_idx = b.variable(ptr_in_i32, None, StorageClass::Input, None);
+    b.decorate(in_idx, Decoration::BuiltIn, vec![Operand::BuiltIn(BuiltIn::VertexIndex)]);
+    let pv_var = b.variable(ptr_pv, None, StorageClass::Output, None);
+    let uv_var = b.variable(ptr_out_v4, None, StorageClass::Output, None);
+    b.decorate(uv_var, Decoration::Location, vec![Operand::LiteralBit32(0)]);
+    let c0i = b.constant_bit32(i32t, 0);
+    let c1i = b.constant_bit32(i32t, 1);
+    let c2i = b.constant_bit32(i32t, 2);
+    let c2f = b.constant_bit32(f32t, 2.0f32.to_bits());
+    let c1f = b.constant_bit32(f32t, 1.0f32.to_bits());
+    let chalf = b.constant_bit32(f32t, 0.5f32.to_bits());
+    let c0f = b.constant_bit32(f32t, 0.0f32.to_bits());
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let idx = b.load(i32t, None, in_idx, None, vec![]).unwrap();
+    let sh = b.shift_left_logical(i32t, None, idx, c1i).unwrap();
+    let xb = b.bitwise_and(i32t, None, sh, c2i).unwrap();
+    let yb = b.bitwise_and(i32t, None, idx, c2i).unwrap();
+    let xf = b.convert_s_to_f(f32t, None, xb).unwrap();
+    let yf = b.convert_s_to_f(f32t, None, yb).unwrap();
+    let xm = b.f_mul(f32t, None, xf, c2f).unwrap();
+    let x = b.f_sub(f32t, None, xm, c1f).unwrap();
+    let ym = b.f_mul(f32t, None, yf, c2f).unwrap();
+    let y = b.f_sub(f32t, None, ym, c1f).unwrap();
+    let pos = b.composite_construct(v4, None, vec![x, y, c0f, c1f]).unwrap();
+    let dst = b.access_chain(ptr_out_v4, None, pv_var, vec![c0i]).unwrap();
+    b.store(dst, pos, None, vec![]).unwrap();
+    let ux = b.f_mul(f32t, None, x, chalf).unwrap();
+    let u = b.f_add(f32t, None, ux, chalf).unwrap();
+    let vy = b.f_mul(f32t, None, y, chalf).unwrap();
+    let v = b.f_add(f32t, None, vy, chalf).unwrap();
+    let uv = b.composite_construct(v4, None, vec![u, v, c0f, c1f]).unwrap();
+    b.store(uv_var, uv, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Vertex, main, "main", vec![in_idx, pv_var, uv_var]);
+    b.module().assemble().iter().flat_map(|w| w.to_le_bytes()).collect()
+}
+
+/// FS that passes a `Location=0` vec4 input varying straight to the output.
+fn build_uv_passthrough_fs() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::dr::Operand;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode, ExecutionModel,
+        FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let f32t = b.type_float(32, None);
+    let v4 = b.type_vector(f32t, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let ptr_in = b.type_pointer(None, StorageClass::Input, v4);
+    let in_uv = b.variable(ptr_in, None, StorageClass::Input, None);
+    b.decorate(in_uv, Decoration::Location, vec![Operand::LiteralBit32(0)]);
+    let ptr_out = b.type_pointer(None, StorageClass::Output, v4);
+    let out = b.variable(ptr_out, None, StorageClass::Output, None);
+    b.decorate(out, Decoration::Location, vec![Operand::LiteralBit32(0)]);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let uv = b.load(v4, None, in_uv, None, vec![]).unwrap();
+    b.store(out, uv, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![in_uv, out]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+    b.module().assemble().iter().flat_map(|w| w.to_le_bytes()).collect()
+}
+
+#[test]
+fn tier2_backend_vs_output_varying_roundtrip() {
+    use aqueduct_gpu::frame::{DrawCmd, FrameBuilder, SetViewportCmd};
+    use aqueduct_gpu::opcodes::FrameOp;
+    const N: u32 = 32;
+    let cache_dir = TempDir::new().unwrap();
+    let registry = Arc::new(Tier2Registry::new(LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    }));
+    let vs_id = registry.register(&build_fullscreen_tri_uv_vs()).expect("vs");
+    let fs_id = registry.register(&build_uv_passthrough_fs()).expect("fs");
+    // The VS writes one vec4 varying (16 bytes), derived from the compiled
+    // VS itself (authoritative — no client-supplied count).
+    assert_eq!(registry.vs_varying_bytes(vs_id), Some(16),
+        "compiled VS should report 16 varying bytes (one vec4)");
+    let backend = Tier2Backend::new(registry);
+    let image_id = ResourceId::new(IdNamespace::IcdRuntime, 0xF251);
+    let pipeline_id = ResourceId::new(IdNamespace::IcdRuntime, 0xF252);
+    backend.image_created(image_id, N, N);
+    // bind_pipeline_vs derives + sets the varying stride; no manual call.
+    backend.bind_pipeline_vs(pipeline_id, vs_id);
+    backend.bind_pipeline(pipeline_id, fs_id);
+    let mut fb = FrameBuilder::new(4096);
+    let mut begin = [0u8; 12];
+    begin[..4].copy_from_slice(&image_id.raw().to_le_bytes());
+    fb.push(FrameOp::BeginRenderPass, &begin).unwrap();
+    fb.push(FrameOp::BindPipeline, &pipeline_id.raw().to_le_bytes()).unwrap();
+    fb.push_set_viewport(SetViewportCmd { x: 0.0, y: 0.0, width: N as f32, height: N as f32, min_depth: 0.0, max_depth: 1.0 }).unwrap();
+    fb.push_draw(DrawCmd { vertex_count: 3, instance_count: 1, first_vertex: 0, first_instance: 0 }).unwrap();
+    fb.push(FrameOp::EndRenderPass, &[]).unwrap();
+    backend.submit_frame(ResourceId::new(IdNamespace::IcdRuntime, 0xF254), 1, fb.as_bytes());
+    let pixels = backend.read_image_pixels(image_id).unwrap();
+    let at = |x: usize, y: usize| { let i = (y * N as usize + x) * 4; [pixels[i], pixels[i+1], pixels[i+2], pixels[i+3]] };
+    let (tl, br) = (at(1, 1), at(30, 30));
+    eprintln!("vs-varying TL={tl:?} BR={br:?}");
+    // Interpolated screen UV: TL dark, BR bright (R≈u, G≈v).
+    assert!(br[0] > 180 && br[1] > 180, "BR bright, got {br:?}");
+    assert!(tl[0] < 60 && tl[1] < 60, "TL dark, got {tl:?}");
+}
+
 /// `gl_FragCoord` fragment shader: a gradient `(x/W, y/H, 0.5, 1)` read from
 /// the FragCoord builtin (no vertex buffer, no varyings). Used to verify the
 /// Tier-2 FragCoord fix (frontend routes the FragCoord-decorated load to

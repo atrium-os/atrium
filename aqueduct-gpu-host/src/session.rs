@@ -679,8 +679,12 @@ impl Session {
                             &blob.blend_extra,
                             blob.raster, blob.topology, blob.stencil,
                             blob.primitive_restart_enable);
-                        self.backend.bind_pipeline_vs_varying_bytes(
-                            req.pipeline_id, blob.vs_varying_bytes);
+                        // Note: `blob.vs_varying_bytes` is intentionally NOT
+                        // trusted. The Tier-2 backend derives the per-vertex
+                        // varying stride from the compiled VS itself when the
+                        // VS is bound (see Tier2Backend::bind_pipeline_vs), so
+                        // a client that miscomputes or omits it can no longer
+                        // drive the daemon onto a null-`in_varyings` fault.
                         self.backend.bind_pipeline_fs_implicit_lod(
                             req.pipeline_id, blob.fs_uses_implicit_lod);
                         self.backend.bind_pipeline_sample_count(

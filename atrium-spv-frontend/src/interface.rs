@@ -107,6 +107,10 @@ pub struct InterfaceContext {
     /// two Inputs at Locations 0 and 1 would read both from
     /// the same bytes.
     pub input_varying_byte_offset: HashMap<Word, u32>,
+    /// Total bytes of all Location-decorated `Output` varyings (the
+    /// prefix-sum end of `output_varying_byte_offset`). The per-vertex
+    /// interpolant stride; 0 when the stage emits no Location varyings.
+    pub output_varying_total_bytes: u32,
     /// SPIR-V variable id → recognised stage built-in.  Set
     /// from `OpDecorate <var> BuiltIn <kind>`; consumed by
     /// function translation to lower an `OpLoad` through one
@@ -578,6 +582,7 @@ impl InterfaceContext {
             ctx.output_varying_byte_offset.insert(*var_id, running);
             running = running.saturating_add(*sz);
         }
+        ctx.output_varying_total_bytes = running;
         // Same shape for Location-decorated Input vars:
         // sort by Location, assign prefix-sum byte offsets.
         // For VS this maps onto the daemon's
