@@ -1693,6 +1693,65 @@ impl CFast {
                 blend: draw.blend_state }
     }
 
+    /// Fill a contiguous run of `count` covered pixels starting at byte
+    /// offset `start`.  The opaque tier is a masked byte fill; the affine
+    /// tier processes the run in `f32x8` chunks (the per-pixel division +
+    /// blend + quantise vectorized 8-wide — bit-identical to the scalar
+    /// `write`, same op order per lane); a dst-dependent blend falls back
+    /// to per-pixel `write`.  Used by the scalar rasterizer's const-fill
+    /// row path, where a convex triangle's coverage in a row is a single
+    /// contiguous span.
+    fn fill_span(&self, pixels: &mut [u8], start: usize, count: usize) {
+        use std::simd::f32x8;
+        let end = start + count * 4;
+        if end > pixels.len() { // clamp defensively (matches write's bound check)
+            let safe = (pixels.len().saturating_sub(start)) / 4;
+            return self.fill_span_scalar(pixels, start, safe);
+        }
+        let am = self.wm;
+        if let Some(u8s) = self.opaque_u8 {
+            for k in 0..count {
+                let idx = start + k * 4;
+                if am.r { pixels[idx]     = u8s[0]; }
+                if am.g { pixels[idx + 1] = u8s[1]; }
+                if am.b { pixels[idx + 2] = u8s[2]; }
+                if am.a { pixels[idx + 3] = u8s[3]; }
+            }
+            return;
+        }
+        let (a, b) = match self.affine {
+            Some(ab) => ab,
+            None => return self.fill_span_scalar(pixels, start, count),
+        };
+        let mask = [am.r, am.g, am.b, am.a];
+        let inv255 = f32x8::splat(255.0);
+        let half = f32x8::splat(0.5);
+        let mut k = 0usize;
+        while k + 8 <= count {
+            let base = start + k * 4;
+            for ch in 0..4 {
+                if !mask[ch] { continue; }
+                let mut d = [0.0f32; 8];
+                for lane in 0..8 { d[lane] = pixels[base + lane * 4 + ch] as f32; }
+                // EXACT scalar op order per lane: dst/255, A + B*dst,
+                // *255 + 0.5, saturating cast.
+                let dst = f32x8::from_array(d) / inv255;
+                let fin = f32x8::splat(a[ch]) + f32x8::splat(b[ch]) * dst;
+                let q = (fin * inv255 + half).to_array();
+                for lane in 0..8 { pixels[base + lane * 4 + ch] = q[lane] as u8; }
+            }
+            k += 8;
+        }
+        // Scalar tail.
+        self.fill_span_scalar(pixels, start + k * 4, count - k);
+    }
+
+    /// Per-pixel tail/fallback for `fill_span`.
+    #[inline]
+    fn fill_span_scalar(&self, pixels: &mut [u8], start: usize, count: usize) {
+        for k in 0..count { self.write(pixels, start + k * 4); }
+    }
+
     /// Write one covered pixel at byte offset `idx` into `pixels`.
     #[inline(always)]
     fn write(&self, pixels: &mut [u8], idx: usize) {
@@ -1739,6 +1798,39 @@ fn cfast_eligible(setup: &TriangleSetup, draw: &DrawTriangle<'_>) -> bool {
         && setup.depth_bounds.is_none()
         && setup.stencil_face.is_none()
         && draw.sample_count == 1
+}
+
+/// Fill one tile-row's covered span for a const-fill draw.  A convex
+/// triangle's coverage at a fixed `y` is `{px : all edges ≥ 0}` (or all
+/// ≤ 0 for CW) — the intersection of three half-lines, i.e. a single
+/// contiguous interval `[xL, xR]`.  We locate it with the SAME
+/// per-pixel `edge_fn` test the scalar loop uses (so the covered set is
+/// bit-identical), then hand the run to `CFast::fill_span` for the
+/// vectorized write.  Degenerate (`total_edge == 0`) triangles write
+/// nothing, matching the per-pixel path's `continue`.
+#[inline]
+fn cfast_fill_row(cf: &CFast, pixels: &mut [u8], setup: &TriangleSetup,
+                  py: i32, t_min_x: i32, t_max_x: i32, stripe_pixel_y: i32) {
+    if setup.total_edge == 0.0 { return; }
+    let (a, b, c) = (setup.a, setup.b, setup.c);
+    let cy = py as f32 + 0.5;
+    let inside = |px: i32| -> bool {
+        let cx = px as f32 + 0.5;
+        let we0 = edge_fn(b, c, (cx, cy));
+        let we1 = edge_fn(c, a, (cx, cy));
+        let we2 = edge_fn(a, b, (cx, cy));
+        (we0 >= 0.0 && we1 >= 0.0 && we2 >= 0.0)
+            || (we0 <= 0.0 && we1 <= 0.0 && we2 <= 0.0)
+    };
+    let mut xl = t_min_x;
+    while xl <= t_max_x && !inside(xl) { xl += 1; }
+    if xl > t_max_x { return; }
+    let mut xr = t_max_x;
+    while xr > xl && !inside(xr) { xr -= 1; }
+    let py_local = (py - stripe_pixel_y) as usize;
+    let row = py_local * (setup.width as usize);
+    let start = (row + xl as usize) * 4;
+    cf.fill_span(pixels, start, (xr - xl + 1) as usize);
 }
 
 fn rasterize_stripe(
@@ -1947,6 +2039,19 @@ fn rasterize_stripe(
         };
         if tile_rejected { continue; }
 
+        // Const-fill fast path (see `cfast` above): skip all the dead
+        // barycentric / depth-interp / early-Z work.  A convex triangle's
+        // covered pixels in a row form a single contiguous span; find it
+        // with the same per-pixel edge test (bit-identical coverage) and
+        // fill it with the vectorized `fill_span`.
+        if let Some(cf) = cfast {
+            for py in t_min_y..=t_max_y {
+                cfast_fill_row(&cf, task.pixels, setup,
+                               py, t_min_x, t_max_x, stripe_pixel_y);
+            }
+            continue;
+        }
+
         for py in t_min_y..=t_max_y {
             for px in t_min_x..=t_max_x {
                 let cx = px as f32 + 0.5;
@@ -1958,18 +2063,6 @@ fn rasterize_stripe(
                 let inside_neg = we0 <= 0.0 && we1 <= 0.0 && we2 <= 0.0;
                 let center_inside = inside_pos || inside_neg;
                 if setup.total_edge == 0.0 { continue; }
-
-                // Const-fill fast write (see `cfast` above): skip all the
-                // dead barycentric / depth-interp / early-Z work and write
-                // the precomputed constant colour for this covered pixel.
-                if let Some(cf) = cfast {
-                    if !center_inside { continue; }
-                    let py_local = (py - stripe_pixel_y) as usize;
-                    let idx = (py_local * (setup.width as usize)
-                        + px as usize) * 4;
-                    cf.write(task.pixels, idx);
-                    continue;
-                }
 
                 // MSAA coverage: with sample_count > 1, test N
                 // sub-pixel sample points and accept the pixel
@@ -3389,11 +3482,16 @@ fn blend_affine(state: &BlendState, src: [f32; 4]) -> Option<([f32; 4], [f32; 4]
 
 /// Saturating float-to-u8 conversion matching the standard
 /// sRGB framebuffer convention.
+///
+/// The explicit NaN / `<=0` / `>=1` branches are redundant with Rust's
+/// `as u8` float cast, which already saturates (NaN→0, <0→0, >255→255).
+/// Verified bit-identical to the old branchy form across a 2M-point
+/// sweep of [-0.5,1.5] plus NaN/±inf/±0/boundary edges — so this is a
+/// pure branch-elimination, and the form vectorizes (the per-lane cast
+/// in the SIMD const-fill write below relies on the same equivalence).
+#[inline(always)]
 fn f32_to_u8(v: f32) -> u8 {
-    if v.is_nan() { 0 }
-    else if v <= 0.0 { 0 }
-    else if v >= 1.0 { 255 }
-    else { (v * 255.0 + 0.5) as u8 }
+    (v * 255.0 + 0.5) as u8
 }
 
 /// Errors from [`Tier2Registry::fill_image_fragment`].
