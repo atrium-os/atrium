@@ -711,6 +711,7 @@ impl Tier2Registry {
                 primitive_id: draw.primitive_id,
                 fs_writes_depth: draw.fs_writes_depth,
                 draw_idx: 0,
+                rect: None,
             };
 
             setups.push(setup);
@@ -1540,6 +1541,15 @@ pub(crate) struct TriangleSetup {
     /// (P1b.2).  `build_triangle_setups` leaves it 0; the per-pass
     /// accumulator stamps it before the flush.
     pub(crate) draw_idx: u32,
+    /// Axis-aligned rect fast path: when `Some([x0,y0,x1,y1])`, this
+    /// setup stands in for a const-fill axis-aligned QUAD (its two
+    /// triangles were merged at build time, the twin dropped).  The
+    /// rasterizer fills the pixels whose centre is in `[x0,x1) × [y0,y1)`
+    /// (the GPU top-left fill rule — single coverage, no shared-diagonal
+    /// double-blend) directly, with NO per-pixel edge function / barycentric
+    /// / per-triangle dispatch.  Only set for `cfast`-eligible draws, so
+    /// the rasterizer always has a `CFast` to write with.
+    pub(crate) rect: Option<[f32; 4]>,
 }
 
 /// One stripe's mutable working set for R.7's per-stripe
@@ -1774,6 +1784,105 @@ fn cfast_eligible(setup: &TriangleSetup, draw: &DrawTriangle<'_>) -> bool {
         && draw.sample_count == 1
 }
 
+/// Geometry-side eligibility for merging a triangle into a rect: no
+/// varyings, no depth/stencil effect (the same conditions `cfast`
+/// needs, minus the draw-level ones the caller checks).
+fn setup_rect_ok(s: &TriangleSetup) -> bool {
+    s.n == 0
+        && !s.fs_writes_depth
+        && s.depth_compare_op == CompareOp::Always
+        && !s.depth_write
+        && s.depth_bounds.is_none()
+        && s.stencil_face.is_none()
+}
+
+/// If two triangle setups together tile an axis-aligned rectangle
+/// (their 6 vertices are the 4 rect corners, two shared along the
+/// diagonal), return its screen-space bounds `[x0,y0,x1,y1]`.  Exact
+/// f32 compares are fine: the shared corners come from the same
+/// transformed vertices, bit-for-bit.
+fn try_merge_rect(s0: &TriangleSetup, s1: &TriangleSetup) -> Option<[f32; 4]> {
+    let pts = [s0.a, s0.b, s0.c, s1.a, s1.b, s1.c];
+    let mut x0 = f32::INFINITY; let mut x1 = f32::NEG_INFINITY;
+    let mut y0 = f32::INFINITY; let mut y1 = f32::NEG_INFINITY;
+    for p in pts {
+        x0 = x0.min(p.0); x1 = x1.max(p.0);
+        y0 = y0.min(p.1); y1 = y1.max(p.1);
+    }
+    if !(x0 < x1 && y0 < y1) { return None; }
+    // Every vertex must sit on a rect corner.
+    for p in pts {
+        if !((p.0 == x0 || p.0 == x1) && (p.1 == y0 || p.1 == y1)) {
+            return None;
+        }
+    }
+    // All four corners present.
+    let has = |cx: f32, cy: f32| pts.iter().any(|p| p.0 == cx && p.1 == cy);
+    if has(x0, y0) && has(x0, y1) && has(x1, y0) && has(x1, y1) {
+        Some([x0, y0, x1, y1])
+    } else { None }
+}
+
+/// Merge adjacent const-fill triangle pairs that form axis-aligned
+/// rects: the first setup of the pair gets `rect = Some(bounds)` and
+/// stands in for the whole quad; its twin is dropped.  Moves elements
+/// (no clone, O(n)).  Only call when the draw is const-fill + single-
+/// sample + non-MRT (so the rasterizer always has a `CFast` to fill the
+/// rect with — there's no triangle left to fall back to).
+pub(crate) fn merge_rect_setups(setups: &mut Vec<TriangleSetup>) {
+    if setups.len() < 2 { return; }
+    let src = std::mem::take(setups);
+    let mut out = Vec::with_capacity(src.len());
+    let mut it = src.into_iter().peekable();
+    while let Some(mut s0) = it.next() {
+        if setup_rect_ok(&s0) {
+            if let Some(s1) = it.peek() {
+                if setup_rect_ok(s1) {
+                    if let Some(bounds) = try_merge_rect(&s0, s1) {
+                        s0.rect = Some(bounds);
+                        it.next(); // drop the twin
+                        out.push(s0);
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(s0);
+    }
+    *setups = out;
+}
+
+/// Fill an axis-aligned rect setup's covered pixels in this stripe.
+/// Single coverage via the GPU top-left rule: a pixel is covered when
+/// its centre `(px+0.5, py+0.5)` lies in `[x0,x1) × [y0,y1)` — the
+/// left/top edges inclusive, right/bottom exclusive (so abutting rects
+/// tile without double-drawing the seam).  No edge functions, no
+/// per-pixel coverage test: the covered pixel rectangle is computed
+/// directly and handed to `CFast::fill_span` row by row.
+#[inline]
+fn rasterize_rect(cf: &CFast<'_>, pixels: &mut [u8], setup: &TriangleSetup,
+                  bounds: [f32; 4], stripe_pixel_y: i32) {
+    let [x0, y0, x1, y1] = bounds;
+    // Half-open [v0, v1): centre c >= v0  →  px >= ceil(v0 - 0.5);
+    //                     centre c <  v1  →  px <= ceil(v1 - 0.5) - 1.
+    let px_min = (x0 - 0.5).ceil() as i32;
+    let px_max = (x1 - 0.5).ceil() as i32 - 1;
+    let py_min = (y0 - 0.5).ceil() as i32;
+    let py_max = (y1 - 0.5).ceil() as i32 - 1;
+    // Clamp X to the framebuffer; intersect Y with this stripe.
+    let px_lo = px_min.max(0);
+    let px_hi = px_max.min(setup.width as i32 - 1);
+    if px_lo > px_hi { return; }
+    let sy_lo = py_min.max(stripe_pixel_y);
+    let sy_hi = py_max.min(stripe_pixel_y + TILE_SIZE - 1);
+    let count = (px_hi - px_lo + 1) as usize;
+    for py in sy_lo..=sy_hi {
+        let py_local = (py - stripe_pixel_y) as usize;
+        let start = (py_local * (setup.width as usize) + px_lo as usize) * 4;
+        cf.fill_span(pixels, start, count);
+    }
+}
+
 /// Fill one tile-row's covered span for a const-fill draw.  A convex
 /// triangle's coverage at a fixed `y` is `{px : all edges ≥ 0}` (or all
 /// ≤ 0 for CW) — the intersection of three half-lines, i.e. a single
@@ -1816,6 +1925,19 @@ fn rasterize_stripe(
 ) {
     let tile_y = task.stripe_y;
     let stripe_pixel_y = tile_y * TILE_SIZE;
+
+    // Axis-aligned rect fast path: a const-fill quad merged at build
+    // time (`merge_rect_setups`).  Fill its covered pixels directly —
+    // no edge functions, no per-pixel coverage test, no per-triangle
+    // dispatch for the dropped twin.  Rect setups are only created for
+    // const-fill, single-sample, non-MRT draws, so `CFast::new` always
+    // has a constant colour to write.  Taken before the span/SIMD gates
+    // so LARGE rects (backgrounds, panels) profit too, not just glyphs.
+    if let Some(bounds) = setup.rect {
+        let cf = CFast::new(draw);
+        rasterize_rect(&cf, task.pixels, setup, bounds, stripe_pixel_y);
+        return;
+    }
 
     // P2.3 — span fast path: shade a tile-row's covered pixels in
     // one `fs_span` call instead of one `fs_main` call per pixel.

@@ -26,9 +26,9 @@ use aqueduct_gpu::backends::{BackendId, GpuVendor};
 
 use crate::backend::Backend;
 use crate::tier2_registry::{
-    build_blend_lut, BlendFactor, BlendFactorPair, BlendOp, BlendState,
-    ColorWriteMask, CompareOp, CullMode, DrawTriangle, FrontFace, Scissor,
-    StencilFaceState, StencilOp, StencilState, Tier2ExecError,
+    build_blend_lut, merge_rect_setups, BlendFactor, BlendFactorPair, BlendOp,
+    BlendState, ColorWriteMask, CompareOp, CullMode, DrawTriangle, FrontFace,
+    Scissor, StencilFaceState, StencilOp, StencilState, Tier2ExecError,
     Tier2Registry, Tier2ShaderId, TriangleSetup, Viewport,
 };
 
@@ -2597,6 +2597,15 @@ impl Tier2Backend {
                     let src = if swap_rb { [cc[2], cc[1], cc[0], cc[3]] } else { cc };
                     build_blend_lut(&raster.blend, src)
                 });
+            // Merge const-fill axis-aligned quads into single rect setups
+            // (single coverage, no per-triangle dispatch).  Gated to const +
+            // single-sample + non-MRT so the rasterizer always has a CFast
+            // to fill the surviving rect with (the twin triangle is dropped).
+            if fs_const_color.is_some() && sample_count == 1
+                && state.extra_color_targets.is_empty()
+            {
+                merge_rect_setups(&mut all_setups);
+            }
             batch_draws.push(OwnedDraw {
                 uniforms: uniforms_buf,
                 push_constants: state.push_constants.clone(),
@@ -3986,6 +3995,11 @@ impl Tier2Backend {
                     let src = if swap_rb { [cc[2], cc[1], cc[0], cc[3]] } else { cc };
                     build_blend_lut(&raster.blend, src)
                 });
+            if fs_const_color.is_some() && sample_count == 1
+                && state.extra_color_targets.is_empty()
+            {
+                merge_rect_setups(&mut all_setups);
+            }
             batch_draws.push(OwnedDraw {
                 uniforms: Vec::new(),
                 push_constants: state.push_constants.clone(),
