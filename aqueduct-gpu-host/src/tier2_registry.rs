@@ -893,6 +893,23 @@ impl Tier2Registry {
                 None => (0..pixel_chunks.len()).map(|_| None).collect(),
             };
         let num_stripes = pixel_chunks.len();
+
+        // Per-stripe setup buckets.  Without this, every stripe loops
+        // *every* setup in the pass and `rasterize_stripe` no-ops the
+        // ones outside its y-range — on a UI frame of thousands of tiny
+        // glyph triangles that's ~stripes × triangles calls, almost all
+        // wasted (measured: per-tile-row overhead dominates the frame).
+        // Bucket each setup into the stripes its [min_y, max_y] spans
+        // (in setup/submission order, so per-stripe draw order is
+        // preserved exactly — tier-equivalence intact) and visit only
+        // the overlapping setups per stripe.
+        let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); num_stripes];
+        for (i, s) in setups.iter().enumerate() {
+            let lo = (s.min_y / TILE_SIZE).max(0) as usize;
+            let hi = ((s.max_y / TILE_SIZE).max(0) as usize).min(num_stripes - 1);
+            for st in lo..=hi { buckets[st].push(i as u32); }
+        }
+
         let mut extra_iters: Vec<std::slice::ChunksMut<u8>> =
             extra_color.iter_mut()
                 .map(|buf| buf.chunks_mut(pixel_stripe_bytes))
@@ -901,7 +918,7 @@ impl Tier2Registry {
             (0..num_stripes)
                 .map(|_| extra_iters.iter_mut().filter_map(|it| it.next()).collect())
                 .collect();
-        let mut tasks: Vec<StripeWork> = pixel_chunks
+        let mut tasks: Vec<(usize, StripeWork)> = pixel_chunks
             .into_iter()
             .zip(depth_chunks.into_iter())
             .zip(stencil_chunks.into_iter())
@@ -910,18 +927,20 @@ impl Tier2Registry {
             .filter(|(s, _)| {
                 let tile_y = *s as i32;
                 tile_y >= tile_min_y && tile_y <= tile_max_y
+                    && !buckets[*s].is_empty()
             })
-            .map(|(s, (((px, dp), st), ex))| StripeWork {
+            .map(|(s, (((px, dp), st), ex))| (s, StripeWork {
                 stripe_y: s as i32,
                 pixels: px,
                 depth: dp,
                 stencil: st,
                 extra_color: ex,
-            })
+            }))
             .collect();
 
-        tasks.par_iter_mut().for_each(|task| {
-            for setup in setups {
+        tasks.par_iter_mut().for_each(|(s, task)| {
+            for &i in &buckets[*s] {
+                let setup = &setups[i as usize];
                 let di = setup.draw_idx as usize;
                 rasterize_stripe(task, setup, &draws[di], fs_mains[di], fs_spans[di]);
             }
@@ -1713,6 +1732,13 @@ fn rasterize_stripe(
         // triangle. `total_edge` is 2× the signed screen-space area, so the
         // area is |total_edge|/2; small primitives (glyphs) take the scalar
         // path, where they're ~2× faster.
+        //
+        // NB: relaxing this for const-colour draws was measured a NET LOSS
+        // (27.8→123 core-ms on the glyph bench).  The per-tile-row barycentric
+        // divs + perspective setup run unconditionally per row regardless of
+        // const-colour / n=0, so a tiny glyph pays full SIMD setup for a few
+        // covered pixels.  The glyph bottleneck is per-tile-row SETUP, not
+        // per-pixel shading — the fix is a rect fast path, not wider lanes.
         && (setup.total_edge.abs() * 0.5) >= simd_min_area();
     if simd_ok {
         rasterize_stripe_simd(task, setup, draw, fs_main);
