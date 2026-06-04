@@ -26,7 +26,8 @@ use aqueduct_gpu::backends::{BackendId, GpuVendor};
 
 use crate::backend::Backend;
 use crate::tier2_registry::{
-    build_blend_lut, merge_rect_setups, BlendFactor, BlendFactorPair, BlendOp,
+    build_blend_lut, merge_rect_setups, merge_textured_rects,
+    BlendFactor, BlendFactorPair, BlendOp,
     BlendState, ColorWriteMask, CompareOp, CullMode, DrawTriangle, FrontFace,
     Scissor, StencilFaceState, StencilOp, StencilState, Tier2ExecError,
     Tier2Registry, Tier2ShaderId, TriangleSetup, Viewport,
@@ -70,6 +71,9 @@ struct OwnedDraw {
     /// draw when `fs_const_color` is set and the blend is affine in dst. The
     /// rasterizer borrows it via `DrawTriangle::fs_blend_lut`.
     fs_blend_lut: Option<Box<[[u8; 256]; 4]>>,
+    /// Textured rect fast path: `Some(binding)` when the FS is a pure
+    /// texture blit + a single texture is bound (see DrawTriangle).
+    fs_texblit: Option<u32>,
     _tex_descs: Vec<atrium_spv_runtime::TexDesc>,
     _sampler_descs: Vec<atrium_spv_runtime::SamplerDesc>,
     _mip_desc_arrays: Vec<Vec<atrium_spv_runtime::TexDesc>>,
@@ -94,6 +98,7 @@ impl OwnedDraw {
             swap_rb: self.swap_rb,
             fs_const_color: self.fs_const_color,
             fs_blend_lut: self.fs_blend_lut.as_deref(),
+            fs_texblit: self.fs_texblit,
             ..Default::default()
         }
     }
@@ -2606,6 +2611,20 @@ impl Tier2Backend {
             {
                 merge_rect_setups(&mut all_setups);
             }
+            // Textured rect fast path: a pure texture-blit FS (glyph/sprite)
+            // with a single bound texture + single-sample + no MRT.  Merge
+            // axis-aligned textured quads into rect setups carrying UV bounds;
+            // the rasterizer inlines the sample (no per-pixel fs_main FFI).
+            let fs_texblit = if fs_const_color.is_none()
+                && sample_count == 1
+                && state.extra_color_targets.is_empty()
+                && state.bound_textures.len() == 1
+                && self.registry.fs_texblit(fs_shader_id)
+            {
+                let binding = state.bound_textures.keys().next().copied().unwrap();
+                merge_textured_rects(&mut all_setups);
+                Some(binding)
+            } else { None };
             batch_draws.push(OwnedDraw {
                 uniforms: uniforms_buf,
                 push_constants: state.push_constants.clone(),
@@ -2620,6 +2639,7 @@ impl Tier2Backend {
                 fs_main,
                 fs_const_color,
                 fs_blend_lut,
+                fs_texblit,
                 fs_span: self.registry.get(fs_shader_id)
                     .and_then(|s| s.entry_points.fs_span_main),
                 _tex_descs: tex_descs,
@@ -4016,6 +4036,7 @@ impl Tier2Backend {
                 fs_main,
                 fs_const_color,
                 fs_blend_lut,
+                fs_texblit: None,
                 fs_span: self.registry.get(fs_shader_id)
                     .and_then(|s| s.entry_points.fs_span_main),
                 _tex_descs: Vec::new(),

@@ -74,6 +74,12 @@ pub struct Tier2Registry {
     /// constant), so the rasterizer can call it ONCE per draw and reuse the
     /// colour instead of per pixel — the const-fill fast path.
     pixel_invariant_by_id: Mutex<HashMap<Tier2ShaderId, bool>>,
+    /// Per-shader "texture-blit FS" classification (lazy, cached): `Some(B)`
+    /// when the FS is a pure passthrough sample — output == the result of one
+    /// `ImageSample` of binding `B` at the sole input UV varying, with no
+    /// modulation (no arithmetic / swizzle / builtins). Such a draw is a
+    /// glyph/sprite blit; the textured-rect fast path inlines the sample.
+    texblit_by_id: Mutex<HashMap<Tier2ShaderId, bool>>,
     /// Monotonic id allocator.
     next_id: Mutex<u64>,
 }
@@ -91,6 +97,7 @@ impl Tier2Registry {
             spirv_by_id: Mutex::new(HashMap::new()),
             varying_bytes_by_id: Mutex::new(HashMap::new()),
             pixel_invariant_by_id: Mutex::new(HashMap::new()),
+            texblit_by_id: Mutex::new(HashMap::new()),
             next_id: Mutex::new(1),
         }
     }
@@ -192,6 +199,58 @@ impl Tier2Registry {
             .unwrap_or(false);
         self.pixel_invariant_by_id.lock().unwrap().insert(id, invariant);
         invariant
+    }
+
+    /// Classify an FS as a pure texture BLIT (lazy, cached): output ==
+    /// the result of exactly one `ImageSample` of the sole input UV
+    /// varying (at byte offset 0), with NO modulation — only descriptor
+    /// loads, the sample, and the store.  Any arithmetic, swizzle,
+    /// builtin, derivative, second sample, or control flow disqualifies
+    /// it (→ keep the general per-pixel path).  Recognises the glyph /
+    /// sprite blit so the textured-rect fast path can inline the sample.
+    /// The texture *binding* isn't taken from here — the caller uses the
+    /// draw's single bound texture.
+    pub fn fs_texblit(&self, id: Tier2ShaderId) -> bool {
+        if let Some(&b) = self.texblit_by_id.lock().unwrap().get(&id) {
+            return b;
+        }
+        let result = self.compute_texblit(id);
+        self.texblit_by_id.lock().unwrap().insert(id, result);
+        result
+    }
+
+    fn compute_texblit(&self, id: Tier2ShaderId) -> bool {
+        use atrium_spv_ir::Op;
+        let m = match self.get_spirv(id)
+            .and_then(|s| atrium_spv_frontend::translate(&s).ok())
+        {
+            Some(m) => m,
+            None => return false,
+        };
+        let mut n_sample = 0usize;
+        let mut n_invarying = 0usize;
+        for f in &m.functions {
+            n_invarying += f.input_varying_byte_offset.len();
+            // The sole input varying must be the UV at byte offset 0
+            // (so the rasterizer reads it from the first interpolant).
+            if f.input_varying_byte_offset.values().any(|&o| o != 0) {
+                return false;
+            }
+            for blk in f.blocks.values() {
+                for inst in &blk.insts {
+                    let allowed = matches!(inst.op,
+                        Op::Load(_) | Op::Store { .. } | Op::AccessChain { .. }
+                        | Op::ImageHandle { .. } | Op::CombineSampledImage { .. }
+                        | Op::ImageSampleImplicitLod { .. }
+                        | Op::Return | Op::ReturnValue(_));
+                    if !allowed { return false; }
+                    if matches!(inst.op, Op::ImageSampleImplicitLod { .. }) {
+                        n_sample += 1;
+                    }
+                }
+            }
+        }
+        n_sample == 1 && n_invarying == 1
     }
 
     /// Look up a registered shader. `None` if the id has
@@ -712,6 +771,7 @@ impl Tier2Registry {
                 fs_writes_depth: draw.fs_writes_depth,
                 draw_idx: 0,
                 rect: None,
+                rect_uv: None,
             };
 
             setups.push(setup);
@@ -1550,6 +1610,12 @@ pub(crate) struct TriangleSetup {
     /// / per-triangle dispatch.  Only set for `cfast`-eligible draws, so
     /// the rasterizer always has a `CFast` to write with.
     pub(crate) rect: Option<[f32; 4]>,
+    /// Textured rect fast path: when a `rect` setup also carries this,
+    /// the quad is a texture BLIT (glyph/sprite — `DrawTriangle::fs_texblit`
+    /// set), and `[u0,v0,u1,v1]` are the texture coords at the rect's
+    /// `(x0,y0)` and `(x1,y1)` corners.  UV is axis-aligned + affine over
+    /// the rect, so per-pixel UV needs no barycentric / perspective work.
+    pub(crate) rect_uv: Option<[f32; 4]>,
 }
 
 /// One stripe's mutable working set for R.7's per-stripe
@@ -1930,6 +1996,150 @@ fn rasterize_rect(cf: &CFast<'_>, pixels: &mut [u8], setup: &TriangleSetup,
     cf.fill_rect(pixels, setup.width as usize, px_lo as usize, count, py_lo, py_hi);
 }
 
+/// Geometry-side eligibility for merging a TEXTURED triangle into a rect:
+/// exactly one vec2 (UV) varying, no depth/stencil effect.
+fn setup_textured_rect_ok(s: &TriangleSetup) -> bool {
+    s.n == 2
+        && !s.fs_writes_depth
+        && s.depth_compare_op == CompareOp::Always
+        && !s.depth_write
+        && s.depth_bounds.is_none()
+        && s.stencil_face.is_none()
+}
+
+/// If two textured-quad setups tile an axis-aligned rect AND their UVs
+/// are axis-aligned + affine over it (u depends only on x, v only on y,
+/// no perspective — every w == 1), return the position bounds
+/// `[x0,y0,x1,y1]` and the UV bounds `[u0,v0,u1,v1]` (at the (x0,y0)
+/// and (x1,y1) corners).  `None` keeps the pair as triangles (the
+/// general per-pixel path stays correct, just slower).
+fn try_merge_textured_rect(s0: &TriangleSetup, s1: &TriangleSetup)
+    -> Option<([f32; 4], [f32; 4])>
+{
+    // Perspective would make UV non-affine in screen space.
+    if s0.inv_w.iter().chain(s1.inv_w.iter()).any(|&w| w != 1.0) {
+        return None;
+    }
+    let bounds = try_merge_rect(s0, s1)?;
+    let [x0, y0, x1, y1] = bounds;
+    // varying_over_w[i] == UV when w == 1 (checked above).
+    let uv_of = |s: &TriangleSetup, i: usize| (s.varying_over_w[i][0], s.varying_over_w[i][1]);
+    let verts = [
+        (s0.a, uv_of(s0, 0)), (s0.b, uv_of(s0, 1)), (s0.c, uv_of(s0, 2)),
+        (s1.a, uv_of(s1, 0)), (s1.b, uv_of(s1, 1)), (s1.c, uv_of(s1, 2)),
+    ];
+    fn upd(slot: &mut Option<f32>, val: f32) -> bool {
+        match *slot { Some(p) => p == val, None => { *slot = Some(val); true } }
+    }
+    let (mut u0, mut u1, mut v0, mut v1) = (None, None, None, None);
+    for ((px, py), (u, v)) in verts {
+        let ok_u = if px == x0 { upd(&mut u0, u) }
+                   else if px == x1 { upd(&mut u1, u) } else { false };
+        let ok_v = if py == y0 { upd(&mut v0, v) }
+                   else if py == y1 { upd(&mut v1, v) } else { false };
+        if !ok_u || !ok_v { return None; }
+    }
+    Some((bounds, [u0?, v0?, u1?, v1?]))
+}
+
+/// Merge adjacent textured-quad pairs that form axis-aligned rects with
+/// affine UV (see `try_merge_textured_rect`): the first setup gets
+/// `rect` + `rect_uv`, the twin is dropped.  Caller gates on the FS
+/// being a pure blit + a single bound texture.
+pub(crate) fn merge_textured_rects(setups: &mut Vec<TriangleSetup>) {
+    if setups.len() < 2 { return; }
+    let src = std::mem::take(setups);
+    let mut out = Vec::with_capacity(src.len());
+    let mut it = src.into_iter().peekable();
+    while let Some(mut s0) = it.next() {
+        if setup_textured_rect_ok(&s0) {
+            if let Some(s1) = it.peek() {
+                if setup_textured_rect_ok(s1) {
+                    if let Some((bounds, uv)) = try_merge_textured_rect(&s0, s1) {
+                        s0.rect = Some(bounds);
+                        s0.rect_uv = Some(uv);
+                        it.next();
+                        out.push(s0);
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(s0);
+    }
+    *setups = out;
+}
+
+/// Fill an axis-aligned TEXTURED rect (a glyph/sprite blit) in this
+/// stripe.  Top-left coverage (like `rasterize_rect`); per pixel,
+/// affine UV from the rect's corners (no barycentric / perspective),
+/// one `atrium_tex_sample_2d` (the SAME helper the compiled FS calls —
+/// so the sampled texel is identical, just without the per-pixel
+/// `fs_main` FFI), then the draw's blend + write.  The TexDesc* /
+/// SamplerDesc* live in `uniforms` at `UNIFORMS_DESC_BASE + binding*16`.
+#[inline]
+fn rasterize_textured_rect(
+    pixels: &mut [u8], setup: &TriangleSetup, draw: &DrawTriangle<'_>,
+    bounds: [f32; 4], uv: [f32; 4], binding: u32, stripe_pixel_y: i32,
+) {
+    let [x0, y0, x1, y1] = bounds;
+    let [u0, v0, u1, v1] = uv;
+    let slot = UNIFORMS_DESC_BASE + (binding as usize) * 16;
+    if draw.uniforms.len() < slot + 16 { return; }
+    let tex_ptr = u64::from_le_bytes(
+        draw.uniforms[slot..slot + 8].try_into().unwrap()) as *const TexDesc;
+    let samp_ptr = u64::from_le_bytes(
+        draw.uniforms[slot + 8..slot + 16].try_into().unwrap())
+        as *const atrium_spv_runtime::SamplerDesc;
+    if tex_ptr.is_null() || samp_ptr.is_null() { return; }
+    let bs = &draw.blend_state;
+    let wm = bs.write_mask;
+    let px_min = (x0 - 0.5).ceil() as i32;
+    let px_max = (x1 - 0.5).ceil() as i32 - 1;
+    let py_min = (y0 - 0.5).ceil() as i32;
+    let py_max = (y1 - 0.5).ceil() as i32 - 1;
+    let px_lo = px_min.max(0);
+    let px_hi = px_max.min(setup.width as i32 - 1);
+    if px_lo > px_hi { return; }
+    let sy_lo = py_min.max(stripe_pixel_y);
+    let sy_hi = py_max.min(stripe_pixel_y + TILE_SIZE - 1);
+    let inv_dx = if x1 != x0 { 1.0 / (x1 - x0) } else { 0.0 };
+    let inv_dy = if y1 != y0 { 1.0 / (y1 - y0) } else { 0.0 };
+    let width = setup.width as usize;
+    for py in sy_lo..=sy_hi {
+        let cy = py as f32 + 0.5;
+        let v = v0 + (v1 - v0) * ((cy - y0) * inv_dy);
+        let row = (py - stripe_pixel_y) as usize * width;
+        for px in px_lo..=px_hi {
+            let cx = px as f32 + 0.5;
+            let u = u0 + (u1 - u0) * ((cx - x0) * inv_dx);
+            let mut tex = [0.0f32; 4];
+            // SAFETY: tex/samp pointers come from the daemon-built
+            // descriptor table and outlive the draw; out buffer is 4 f32.
+            unsafe {
+                atrium_spv_runtime::atrium_tex_sample_2d(
+                    tex_ptr, samp_ptr, u, v, tex.as_mut_ptr());
+            }
+            let src = if draw.swap_rb {
+                [tex[2], tex[1], tex[0], tex[3]]
+            } else { tex };
+            let idx = (row + px as usize) * 4;
+            if idx + 4 > pixels.len() { continue; }
+            let dst = [
+                pixels[idx]     as f32 / 255.0,
+                pixels[idx + 1] as f32 / 255.0,
+                pixels[idx + 2] as f32 / 255.0,
+                pixels[idx + 3] as f32 / 255.0,
+            ];
+            let fin = if bs.enable { apply_blend(bs, src, dst) } else { src };
+            if wm.r { pixels[idx]     = f32_to_u8(fin[0]); }
+            if wm.g { pixels[idx + 1] = f32_to_u8(fin[1]); }
+            if wm.b { pixels[idx + 2] = f32_to_u8(fin[2]); }
+            if wm.a { pixels[idx + 3] = f32_to_u8(fin[3]); }
+        }
+    }
+}
+
 /// Fill one tile-row's covered span for a const-fill draw.  A convex
 /// triangle's coverage at a fixed `y` is `{px : all edges ≥ 0}` (or all
 /// ≤ 0 for CW) — the intersection of three half-lines, i.e. a single
@@ -1981,8 +2191,16 @@ fn rasterize_stripe(
     // has a constant colour to write.  Taken before the span/SIMD gates
     // so LARGE rects (backgrounds, panels) profit too, not just glyphs.
     if let Some(bounds) = setup.rect {
-        let cf = CFast::new(draw);
-        rasterize_rect(&cf, task.pixels, setup, bounds, stripe_pixel_y);
+        match (draw.fs_texblit, setup.rect_uv) {
+            // Textured rect (glyph/sprite blit): inline the sample.
+            (Some(binding), Some(uv)) => rasterize_textured_rect(
+                task.pixels, setup, draw, bounds, uv, binding, stripe_pixel_y),
+            // Const-fill rect.
+            _ => {
+                let cf = CFast::new(draw);
+                rasterize_rect(&cf, task.pixels, setup, bounds, stripe_pixel_y);
+            }
+        }
         return;
     }
 
@@ -3214,6 +3432,15 @@ pub struct DrawTriangle<'a> {
     /// owning `OwnedDraw` (built there so it's amortized across all the
     /// draw's triangles + stripes, not rebuilt per `rasterize_stripe`).
     pub fs_blend_lut: Option<&'a [[u8; 256]; 4]>,
+
+    /// Textured rect fast path: `Some(binding)` when the FS is a pure
+    /// texture blit (`Tier2Registry::fs_texblit`) and a single texture is
+    /// bound at `binding`.  Paired with `TriangleSetup::rect_uv`, the
+    /// rasterizer inlines the sample (`atrium_tex_sample_2d`) per pixel —
+    /// no per-pixel `fs_main` FFI, no perspective UV — reading the
+    /// TexDesc*/SamplerDesc* from `uniforms` at `UNIFORMS_DESC_BASE +
+    /// binding*16`.
+    pub fs_texblit: Option<u32>,
 }
 
 /// Per-face stencil state passed to `fill_image_triangle`.
@@ -3304,6 +3531,7 @@ impl Default for DrawTriangle<'_> {
             vs_storage_table: &[],
             fs_const_color: None,
             fs_blend_lut: None,
+            fs_texblit: None,
         }
     }
 }
