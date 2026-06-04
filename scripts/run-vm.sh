@@ -80,6 +80,7 @@ truncate -s 67108864 "$EFI_VARS"
 
 GPU_ARGS=""
 VIRTIO_GPU_ARGS=""
+GPUSIM_ARGS=""
 DISPLAY_FRONTEND=""
 WANT_DISPLAY=0
 WANT_TABLET=0
@@ -117,6 +118,26 @@ for arg in "$@"; do
             ;;
         --virtio-gpu)
             VIRTIO_GPU_ARGS="-device virtio-gpu-pci"
+            ;;
+        --gpusim)
+            # Out-of-process gpusim RDNA functional model: a thin pure-C QEMU PCI
+            # device talks to the gpusim Rust model over a Unix socket (no Rust
+            # linked into QEMU — that hangs macOS in dyld). Starts the server if
+            # it isn't already listening. See /Users/girivs/src/gpusim.
+            GPUSIM_DIR="/Users/girivs/src/gpusim"
+            GPUSIM_SOCK="${GPUSIM_SOCK:-/tmp/gpusim.sock}"
+            GPUSIM_TOPO="${GPUSIM_TOPO:-discrete}"
+            if [ ! -S "$GPUSIM_SOCK" ]; then
+                SRV="$GPUSIM_DIR/target/release/gpusim-server"
+                if [ ! -x "$SRV" ]; then
+                    ( cd "$GPUSIM_DIR" && cargo build -p gpusim-server --release )
+                fi
+                echo "starting gpusim-server on $GPUSIM_SOCK ($GPUSIM_TOPO)"
+                "$SRV" "$GPUSIM_SOCK" "$GPUSIM_TOPO" >/tmp/gpusim-server.log 2>&1 &
+                # wait briefly for the socket
+                i=0; while [ ! -S "$GPUSIM_SOCK" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done
+            fi
+            GPUSIM_ARGS="-device gpusim,socket=$GPUSIM_SOCK"
             ;;
         --venus)
             # virgl_render_server (spawned by virglrenderer when venus is
@@ -268,4 +289,5 @@ exec "$QEMU" \
     $DISPLAY_FRONTEND \
     $GPU_ARGS \
     $VIRTIO_GPU_ARGS \
+    $GPUSIM_ARGS \
     $KGDB_ARGS
