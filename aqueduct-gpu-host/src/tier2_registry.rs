@@ -2106,20 +2106,49 @@ fn rasterize_textured_rect(
     let inv_dx = if x1 != x0 { 1.0 / (x1 - x0) } else { 0.0 };
     let inv_dy = if y1 != y0 { 1.0 / (y1 - y0) } else { 0.0 };
     let width = setup.width as usize;
+    // SAFETY: descriptor pointers come from the daemon-built table and
+    // outlive the draw.
+    let t = unsafe { &*tex_ptr };
+    let s = unsafe { &*samp_ptr };
+    // Inline fast path for the glyph-common sampler: nearest + clamp-to-edge
+    // + RGBA8, single-mip.  Bit-identical to `atrium_tex_sample_2d`'s nearest
+    // branch (x = u*w-0.5, round, clamp(0,n-1), byte/255).  Any other
+    // filter / wrap / format falls back to the extern helper per pixel.
+    let nearest_rgba8 = s.mag_filter == 0 && s.wrap_s == 0 && s.wrap_t == 0
+        && t.format == 0 && !t.data.is_null();
+    let (tw, th, tstride, tdata) =
+        (t.width as i32, t.height as i32, t.stride_bytes as usize, t.data);
+    let (twf, thf) = (t.width as f32, t.height as f32);
     for py in sy_lo..=sy_hi {
         let cy = py as f32 + 0.5;
         let v = v0 + (v1 - v0) * ((cy - y0) * inv_dy);
         let row = (py - stripe_pixel_y) as usize * width;
+        let row_tex_off = if nearest_rgba8 {
+            let yi = ((v * thf - 0.5).round() as i32).clamp(0, th - 1);
+            yi as usize * tstride
+        } else { 0 };
         for px in px_lo..=px_hi {
             let cx = px as f32 + 0.5;
             let u = u0 + (u1 - u0) * ((cx - x0) * inv_dx);
-            let mut tex = [0.0f32; 4];
-            // SAFETY: tex/samp pointers come from the daemon-built
-            // descriptor table and outlive the draw; out buffer is 4 f32.
-            unsafe {
-                atrium_spv_runtime::atrium_tex_sample_2d(
-                    tex_ptr, samp_ptr, u, v, tex.as_mut_ptr());
-            }
+            let tex = if nearest_rgba8 {
+                let xi = ((u * twf - 0.5).round() as i32).clamp(0, tw - 1);
+                let off = row_tex_off + xi as usize * 4;
+                // SAFETY: off < height*stride; data has that many bytes.
+                unsafe {
+                    [*tdata.add(off)     as f32 / 255.0,
+                     *tdata.add(off + 1) as f32 / 255.0,
+                     *tdata.add(off + 2) as f32 / 255.0,
+                     *tdata.add(off + 3) as f32 / 255.0]
+                }
+            } else {
+                let mut o = [0.0f32; 4];
+                // SAFETY: as above; out buffer is 4 f32.
+                unsafe {
+                    atrium_spv_runtime::atrium_tex_sample_2d(
+                        tex_ptr, samp_ptr, u, v, o.as_mut_ptr());
+                }
+                o
+            };
             let src = if draw.swap_rb {
                 [tex[2], tex[1], tex[0], tex[3]]
             } else { tex };
