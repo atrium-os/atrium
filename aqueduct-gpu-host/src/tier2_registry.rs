@@ -1709,28 +1709,33 @@ impl<'a> CFast<'a> {
     /// a row is a single contiguous span).
     fn fill_span(&self, pixels: &mut [u8], start: usize, count: usize) {
         let am = self.wm;
-        if let Some(u8s) = self.opaque_u8 {
-            for k in 0..count {
-                let idx = start + k * 4;
-                if idx + 4 > pixels.len() { break; }
-                if am.r { pixels[idx]     = u8s[0]; }
-                if am.g { pixels[idx + 1] = u8s[1]; }
-                if am.b { pixels[idx + 2] = u8s[2]; }
-                if am.a { pixels[idx + 3] = u8s[3]; }
+        let end = start + count * 4;
+        // Fast path: full RGBA write mask (the common case) + an in-bounds
+        // span → slice once and iterate 4-byte chunks, so the per-pixel
+        // bounds checks and write-mask branches both vanish.  Bit-identical
+        // to the masked loop below.
+        let all_rgba = am.r && am.g && am.b && am.a;
+        if all_rgba && end <= pixels.len() {
+            let row = &mut pixels[start..end];
+            if let Some(u8s) = self.opaque_u8 {
+                for px in row.chunks_exact_mut(4) {
+                    px[0] = u8s[0]; px[1] = u8s[1];
+                    px[2] = u8s[2]; px[3] = u8s[3];
+                }
+                return;
             }
-            return;
-        }
-        if let Some(lut) = self.lut {
-            for k in 0..count {
-                let idx = start + k * 4;
-                if idx + 4 > pixels.len() { break; }
-                if am.r { pixels[idx]     = lut[0][pixels[idx]     as usize]; }
-                if am.g { pixels[idx + 1] = lut[1][pixels[idx + 1] as usize]; }
-                if am.b { pixels[idx + 2] = lut[2][pixels[idx + 2] as usize]; }
-                if am.a { pixels[idx + 3] = lut[3][pixels[idx + 3] as usize]; }
+            if let Some(lut) = self.lut {
+                for px in row.chunks_exact_mut(4) {
+                    px[0] = lut[0][px[0] as usize];
+                    px[1] = lut[1][px[1] as usize];
+                    px[2] = lut[2][px[2] as usize];
+                    px[3] = lut[3][px[3] as usize];
+                }
+                return;
             }
-            return;
         }
+        // General path (partial write mask, out-of-bounds tail, or
+        // dst-dependent blend): per-pixel.
         for k in 0..count { self.write(pixels, start + k * 4); }
     }
 
