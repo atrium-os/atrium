@@ -1739,6 +1739,49 @@ impl<'a> CFast<'a> {
         for k in 0..count { self.write(pixels, start + k * 4); }
     }
 
+    /// Fill a pixel rectangle (`count` px wide, rows `py_lo..=py_hi`) with
+    /// the fill mode resolved ONCE instead of re-dispatched per row — the
+    /// rect fast path's hot loop.  Bit-identical to calling `fill_span` per
+    /// row.  `px_lo` / `py_*` are in pixels; rows are `width` px apart.
+    fn fill_rect(&self, pixels: &mut [u8], width: usize,
+                 px_lo: usize, count: usize, py_lo: usize, py_hi: usize) {
+        let am = self.wm;
+        let row_span = |pixels: &mut [u8], py: usize| -> Option<(usize, usize)> {
+            let start = (py * width + px_lo) * 4;
+            let end = start + count * 4;
+            if end <= pixels.len() { Some((start, end)) } else { None }
+        };
+        if am.r && am.g && am.b && am.a {
+            if let Some(u8s) = self.opaque_u8 {
+                for py in py_lo..=py_hi {
+                    if let Some((start, end)) = row_span(pixels, py) {
+                        for px in pixels[start..end].chunks_exact_mut(4) {
+                            px[0] = u8s[0]; px[1] = u8s[1];
+                            px[2] = u8s[2]; px[3] = u8s[3];
+                        }
+                    }
+                }
+                return;
+            }
+            if let Some(lut) = self.lut {
+                for py in py_lo..=py_hi {
+                    if let Some((start, end)) = row_span(pixels, py) {
+                        for px in pixels[start..end].chunks_exact_mut(4) {
+                            px[0] = lut[0][px[0] as usize];
+                            px[1] = lut[1][px[1] as usize];
+                            px[2] = lut[2][px[2] as usize];
+                            px[3] = lut[3][px[3] as usize];
+                        }
+                    }
+                }
+                return;
+            }
+        }
+        for py in py_lo..=py_hi {
+            self.fill_span(pixels, (py * width + px_lo) * 4, count);
+        }
+    }
+
     /// Write one covered pixel at byte offset `idx` into `pixels`.
     #[inline(always)]
     fn write(&self, pixels: &mut [u8], idx: usize) {
@@ -1880,12 +1923,11 @@ fn rasterize_rect(cf: &CFast<'_>, pixels: &mut [u8], setup: &TriangleSetup,
     if px_lo > px_hi { return; }
     let sy_lo = py_min.max(stripe_pixel_y);
     let sy_hi = py_max.min(stripe_pixel_y + TILE_SIZE - 1);
+    if sy_lo > sy_hi { return; }
     let count = (px_hi - px_lo + 1) as usize;
-    for py in sy_lo..=sy_hi {
-        let py_local = (py - stripe_pixel_y) as usize;
-        let start = (py_local * (setup.width as usize) + px_lo as usize) * 4;
-        cf.fill_span(pixels, start, count);
-    }
+    let py_lo = (sy_lo - stripe_pixel_y) as usize;
+    let py_hi = (sy_hi - stripe_pixel_y) as usize;
+    cf.fill_rect(pixels, setup.width as usize, px_lo as usize, count, py_lo, py_hi);
 }
 
 /// Fill one tile-row's covered span for a const-fill draw.  A convex
