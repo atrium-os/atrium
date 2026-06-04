@@ -34,10 +34,19 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use std::sync::Arc;
 use aqueduct_gpu_host::{
-    BlendState, BlendFactor, BlendFactorPair, BlendOp, DrawTriangle, Tier2Registry,
+    Backend, BlendState, BlendFactor, BlendFactorPair, BlendOp, DrawTriangle,
+    Tier2Backend, Tier2Registry,
 };
 use aqueduct_gpu_host::tier2_registry::Viewport;
+use aqueduct_gpu::ids::{IdNamespace, ResourceId};
+use aqueduct_gpu::frame::{BindVertexBufCmd, DrawCmd, FrameBuilder, SetViewportCmd};
+use aqueduct_gpu::opcodes::FrameOp;
+use aqueduct_gpu::{
+    Tier2BlendFactor, Tier2BlendOp, Tier2BlendState, Tier2PrimitiveTopology,
+    VertexAttributeDesc, VertexBindingDesc, VertexFormat, VertexInputState,
+};
 use atrium_spv_loader::LoaderConfig;
 
 const W: u32 = 1280;
@@ -263,7 +272,7 @@ fn main() {
         abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
         compile_binary: locate_compile_binary(),
     };
-    let registry = Tier2Registry::new(config);
+    let registry = Arc::new(Tier2Registry::new(config));
     let vs = registry.register(&build_passthrough_vs()).expect("vs");
     let fs_bg = registry.register(&build_constant_color_fs([0.16, 0.16, 0.19, 1.0])).expect("fs bg");
     let fs_panel = registry.register(&build_constant_color_fs([0.27, 0.29, 0.32, 1.0])).expect("fs panel");
@@ -316,6 +325,87 @@ fn main() {
     for _ in 0..iters { render_tier2(&mut fb); }
     let t2_ms = t1.elapsed().as_secs_f64() * 1000.0 / iters as f64;
 
+    // ── Tier-2 PRODUCTION path: drive the real `submit_frame` pipeline
+    //    (pass-batched: every triangle in the pass accumulates into ONE
+    //    rasterization dispatch), the path the daemon/compositor uses —
+    //    not the per-triangle `fill_image_triangle` measured above. ──
+    let backend = Tier2Backend::new(registry.clone());
+    let img = ResourceId::new(IdNamespace::IcdRuntime, 0x1000);
+    backend.image_created(img, W, H);
+    let layout = VertexInputState {
+        bindings: vec![VertexBindingDesc { binding: 0, stride: 12, per_instance: false }],
+        attributes: vec![VertexAttributeDesc {
+            location: 0, binding: 0, format: VertexFormat::R32g32b32Sfloat, offset: 0 }],
+    };
+    let opaque_b = Tier2BlendState::default();
+    let srcover_b = Tier2BlendState {
+        enable: true,
+        color_src: Tier2BlendFactor::SrcAlpha, color_dst: Tier2BlendFactor::OneMinusSrcAlpha,
+        alpha_src: Tier2BlendFactor::One, alpha_dst: Tier2BlendFactor::OneMinusSrcAlpha,
+        color_op: Tier2BlendOp::Add, alpha_op: Tier2BlendOp::Add,
+        write_mask_rgba: [true; 4],
+    };
+    let mk_pipe = |raw: u32, fs, blend| {
+        let pid = ResourceId::new(IdNamespace::IcdRuntime, raw);
+        backend.bind_pipeline_vs(pid, vs);
+        backend.bind_pipeline(pid, fs);
+        backend.bind_layout(pid, layout.clone());
+        backend.bind_raster_state(pid, None, Some(blend), &[], None,
+            Tier2PrimitiveTopology::TriangleList, None, false);
+        pid
+    };
+    let pipe_bg = mk_pipe(0x2000, fs_bg, opaque_b);
+    let pipe_panel = mk_pipe(0x2001, fs_panel, opaque_b);
+    let pipe_glyph = mk_pipe(0x2002, fs_glyph, srcover_b);
+    // Pack each draw-group's triangles into one vertex buffer.
+    let pack = |tris: &[[[u8; 36]; 2]]| -> Vec<u8> {
+        let mut v = Vec::new();
+        for r in tris { for t in r { v.extend_from_slice(t); } }
+        v
+    };
+    let bg_buf: Vec<u8> = bg_t.iter().flatten().copied().collect();
+    let panel_buf = pack(&panel_t);
+    let glyph_buf = pack(&glyph_t);
+    let mk_vbuf = |raw: u32, bytes: &[u8]| {
+        let b = ResourceId::new(IdNamespace::IcdRuntime, raw);
+        backend.buffer_created(b, bytes.len() as u64);
+        backend.buffer_write_bytes(b, 0, bytes).unwrap();
+        b
+    };
+    let vb_bg = mk_vbuf(0x3000, &bg_buf);
+    let vb_panel = mk_vbuf(0x3001, &panel_buf);
+    let vb_glyph = mk_vbuf(0x3002, &glyph_buf);
+    // Build the frame once (identical every iteration).
+    let mut frame = FrameBuilder::new(1 << 16);
+    let mut begin = [0u8; 12];
+    begin[..4].copy_from_slice(&img.raw().to_le_bytes());
+    begin[4..8].copy_from_slice(&[0u8, 0, 0, 255]); // clear
+    frame.push(FrameOp::BeginRenderPass, &begin).unwrap();
+    frame.push_set_viewport(SetViewportCmd {
+        x: 0.0, y: 0.0, width: W as f32, height: H as f32, min_depth: 0.0, max_depth: 1.0 }).unwrap();
+    for (pid, vb, vbytes) in [
+        (pipe_bg, vb_bg, bg_buf.len()),
+        (pipe_panel, vb_panel, panel_buf.len()),
+        (pipe_glyph, vb_glyph, glyph_buf.len()),
+    ] {
+        frame.push(FrameOp::BindPipeline, &pid.raw().to_le_bytes()).unwrap();
+        frame.push_bind_vertex_buf(BindVertexBufCmd { binding: 0, buffer_id: vb.raw(), offset: 0 }).unwrap();
+        frame.push_draw(DrawCmd {
+            vertex_count: (vbytes / 12) as u32, instance_count: 1, first_vertex: 0, first_instance: 0 }).unwrap();
+    }
+    frame.push(FrameOp::EndRenderPass, &[]).unwrap();
+    let frame_bytes = frame.as_bytes().to_vec();
+    let fence = ResourceId::new(IdNamespace::IcdRuntime, 0x4000);
+    for _ in 0..3 { backend.submit_frame(fence, 1, &frame_bytes); }
+    // Correctness sanity: a panel-band pixel should be the panel colour.
+    let drew = backend.read_image_pixels(img).map(|px| {
+        let i = ((H as usize / 2) * W as usize + W as usize / 2) * 4;
+        px[i] as u32 + px[i+1] as u32 + px[i+2] as u32
+    }).unwrap_or(0);
+    let t3 = Instant::now();
+    for i in 0..iters { backend.submit_frame(fence, i as u64 + 1, &frame_bytes); }
+    let t2f_ms = t3.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
     std::fs::remove_dir_all(&cache).ok();
 
     // ── Report ──
@@ -323,12 +413,18 @@ fn main() {
     println!();
     println!("  tiny-skia : {ts_ms:8.3} ms/frame   ({:6.1} fps,  {:7.1} Mpix/s)",
              1000.0 / ts_ms, mpix / (ts_ms / 1000.0));
-    println!("  tier-2    : {t2_ms:8.3} ms/frame   ({:6.1} fps,  {:7.1} Mpix/s)",
+    println!("  tier-2 (per-tri  ) : {t2_ms:8.3} ms/frame   ({:6.1} fps,  {:7.1} Mpix/s)",
              1000.0 / t2_ms, mpix / (t2_ms / 1000.0));
+    println!("  tier-2 (submit_fr) : {t2f_ms:8.3} ms/frame   ({:6.1} fps,  {:7.1} Mpix/s)   [production path; sanity sum={drew}]",
+             1000.0 / t2f_ms, mpix / (t2f_ms / 1000.0));
     println!();
-    if t2_ms < ts_ms {
-        println!("  => tier-2 is {:.2}x FASTER than tiny-skia on this frame", ts_ms / t2_ms);
-    } else {
-        println!("  => tier-2 is {:.2}x SLOWER than tiny-skia on this frame", t2_ms / ts_ms);
-    }
+    let cmp = |label: &str, t: f64| {
+        if t < ts_ms {
+            println!("  => {label} is {:.2}x FASTER than tiny-skia", ts_ms / t);
+        } else {
+            println!("  => {label} is {:.2}x SLOWER than tiny-skia", t / ts_ms);
+        }
+    };
+    cmp("tier-2 per-triangle", t2_ms);
+    cmp("tier-2 submit_frame", t2f_ms);
 }
