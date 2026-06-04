@@ -4054,6 +4054,34 @@ impl Backend for Tier2Backend {
         self.image_created_layered(image_id, width, height, 1);
     }
 
+    /// Inline RGBA8 pixel upload into an existing image's storage —
+    /// the path the session uses to populate a sampled texture (atlas,
+    /// glyph cache) before it's bound as a COMBINED_IMAGE_SAMPLER.
+    /// `row_pitch` is the source stride in bytes (0 ⇒ tightly packed
+    /// `width*4`); rows are copied into the image's tight `width*4`
+    /// layout.  Previously defaulted to "unsupported", so textures
+    /// could be bound but never carried real texels through this
+    /// backend — fixed here.
+    fn image_write_pixels(
+        &self, image_id: ResourceId, row_pitch: u32, pixels: &[u8],
+    ) -> Result<(), String> {
+        let mut images = self.images.lock().unwrap();
+        let img = images.get_mut(&(image_id.raw() as u64))
+            .ok_or_else(|| format!("image_write_pixels: unknown image {image_id}"))?;
+        let dst_pitch = img.width as usize * 4;
+        let src_pitch = if row_pitch == 0 { dst_pitch } else { row_pitch as usize };
+        let rows = img.height as usize;
+        for y in 0..rows {
+            let (s0, d0) = (y * src_pitch, y * dst_pitch);
+            if s0 + dst_pitch > pixels.len() || d0 + dst_pitch > img.pixels.len() {
+                break;
+            }
+            img.pixels[d0..d0 + dst_pitch]
+                .copy_from_slice(&pixels[s0..s0 + dst_pitch]);
+        }
+        Ok(())
+    }
+
     fn image_created_layered(
         &self, image_id: ResourceId, width: u32, height: u32, array_layers: u32,
     ) {
