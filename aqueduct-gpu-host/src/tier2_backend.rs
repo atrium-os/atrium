@@ -26,8 +26,8 @@ use aqueduct_gpu::backends::{BackendId, GpuVendor};
 
 use crate::backend::Backend;
 use crate::tier2_registry::{
-    BlendFactor, BlendFactorPair, BlendOp, BlendState, ColorWriteMask,
-    CompareOp, CullMode, DrawTriangle, FrontFace, Scissor,
+    build_blend_lut, BlendFactor, BlendFactorPair, BlendOp, BlendState,
+    ColorWriteMask, CompareOp, CullMode, DrawTriangle, FrontFace, Scissor,
     StencilFaceState, StencilOp, StencilState, Tier2ExecError,
     Tier2Registry, Tier2ShaderId, TriangleSetup, Viewport,
 };
@@ -66,6 +66,10 @@ struct OwnedDraw {
     /// Const-fill fast path: `Some(rgba)` when the FS is pixel-invariant —
     /// its single output, pre-computed once for this draw (not per pixel).
     fs_const_color: Option<[f32; 4]>,
+    /// Const-fill blend LUT (per-channel dst-byte→out-byte), built once per
+    /// draw when `fs_const_color` is set and the blend is affine in dst. The
+    /// rasterizer borrows it via `DrawTriangle::fs_blend_lut`.
+    fs_blend_lut: Option<Box<[[u8; 256]; 4]>>,
     _tex_descs: Vec<atrium_spv_runtime::TexDesc>,
     _sampler_descs: Vec<atrium_spv_runtime::SamplerDesc>,
     _mip_desc_arrays: Vec<Vec<atrium_spv_runtime::TexDesc>>,
@@ -89,6 +93,7 @@ impl OwnedDraw {
             sample_count: self.sample_count,
             swap_rb: self.swap_rb,
             fs_const_color: self.fs_const_color,
+            fs_blend_lut: self.fs_blend_lut.as_deref(),
             ..Default::default()
         }
     }
@@ -2585,6 +2590,13 @@ impl Tier2Backend {
             let fs_const_color = if self.registry.fs_pixel_invariant(fs_shader_id) {
                 Some(eval_const_fs(fs_main, &uniforms_buf, &state.push_constants))
             } else { None };
+            // Build the per-channel blend LUT once for this draw (const FS +
+            // affine-in-dst blend) so the rasterizer blends by table lookup.
+            let fs_blend_lut = fs_const_color.filter(|_| raster.blend.enable)
+                .and_then(|cc| {
+                    let src = if swap_rb { [cc[2], cc[1], cc[0], cc[3]] } else { cc };
+                    build_blend_lut(&raster.blend, src)
+                });
             batch_draws.push(OwnedDraw {
                 uniforms: uniforms_buf,
                 push_constants: state.push_constants.clone(),
@@ -2598,6 +2610,7 @@ impl Tier2Backend {
                 swap_rb,
                 fs_main,
                 fs_const_color,
+                fs_blend_lut,
                 fs_span: self.registry.get(fs_shader_id)
                     .and_then(|s| s.entry_points.fs_span_main),
                 _tex_descs: tex_descs,
@@ -3968,6 +3981,11 @@ impl Tier2Backend {
             let fs_const_color = if self.registry.fs_pixel_invariant(fs_shader_id) {
                 Some(eval_const_fs(fs_main, &[], &state.push_constants))
             } else { None };
+            let fs_blend_lut = fs_const_color.filter(|_| raster.blend.enable)
+                .and_then(|cc| {
+                    let src = if swap_rb { [cc[2], cc[1], cc[0], cc[3]] } else { cc };
+                    build_blend_lut(&raster.blend, src)
+                });
             batch_draws.push(OwnedDraw {
                 uniforms: Vec::new(),
                 push_constants: state.push_constants.clone(),
@@ -3983,6 +4001,7 @@ impl Tier2Backend {
                 swap_rb,
                 fs_main,
                 fs_const_color,
+                fs_blend_lut,
                 fs_span: self.registry.get(fs_shader_id)
                     .and_then(|s| s.entry_points.fs_span_main),
                 _tex_descs: Vec::new(),

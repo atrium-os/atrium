@@ -1665,53 +1665,44 @@ fn simd_min_area() -> f32 {
 /// Three tiers, fastest first:
 ///   * `opaque_u8` — blend disabled → the constant colour is pre-
 ///     quantised to bytes; a covered pixel is a masked byte copy.
-///   * `affine` — blend enabled but every factor is dst-independent
-///     (opaque, SrcOver, … the UI common case) → `final = A + B*dst`
-///     with constant `(A,B)` (see `blend_affine`), bit-identical to
-///     `apply_blend` but with the src-only work hoisted out.
+///   * `lut` — blend enabled but affine in dst (opaque, SrcOver, … the
+///     UI common case) → the post-blend byte is a pure function of the
+///     dst byte, memoized as a per-channel 256-entry table built once
+///     per draw (`build_blend_lut`); a covered pixel is one table lookup
+///     per channel.  No per-pixel division / float / quantise.
 ///   * neither — a dst-dependent blend → per-pixel `apply_blend`.
 #[derive(Clone, Copy)]
-struct CFast {
+struct CFast<'a> {
     src: [f32; 4],
     wm: ColorWriteMask,
     opaque_u8: Option<[u8; 4]>,
-    affine: Option<([f32; 4], [f32; 4])>,
+    lut: Option<&'a [[u8; 256]; 4]>,
     blend: BlendState,
 }
 
-impl CFast {
-    fn new(draw: &DrawTriangle<'_>) -> Self {
+impl<'a> CFast<'a> {
+    fn new(draw: &DrawTriangle<'a>) -> Self {
         let cc = draw.fs_const_color.unwrap();
         let src = if draw.swap_rb { [cc[2], cc[1], cc[0], cc[3]] } else { cc };
-        let (opaque_u8, affine) = if !draw.blend_state.enable {
-            (Some([f32_to_u8(src[0]), f32_to_u8(src[1]),
-                   f32_to_u8(src[2]), f32_to_u8(src[3])]), None)
-        } else {
-            (None, blend_affine(&draw.blend_state, src))
-        };
-        CFast { src, wm: draw.blend_state.write_mask, opaque_u8, affine,
-                blend: draw.blend_state }
+        let opaque_u8 = if !draw.blend_state.enable {
+            Some([f32_to_u8(src[0]), f32_to_u8(src[1]),
+                  f32_to_u8(src[2]), f32_to_u8(src[3])])
+        } else { None };
+        CFast { src, wm: draw.blend_state.write_mask, opaque_u8,
+                lut: draw.fs_blend_lut, blend: draw.blend_state }
     }
 
-    /// Fill a contiguous run of `count` covered pixels starting at byte
-    /// offset `start`.  The opaque tier is a masked byte fill; the affine
-    /// tier processes the run in `f32x8` chunks (the per-pixel division +
-    /// blend + quantise vectorized 8-wide — bit-identical to the scalar
-    /// `write`, same op order per lane); a dst-dependent blend falls back
-    /// to per-pixel `write`.  Used by the scalar rasterizer's const-fill
-    /// row path, where a convex triangle's coverage in a row is a single
-    /// contiguous span.
+    /// Fill a contiguous run of `count` covered pixels from byte offset
+    /// `start`.  Opaque → masked byte fill; LUT → per-channel table
+    /// lookup; dst-dependent → per-pixel `write`.  Used by the scalar
+    /// rasterizer's const-fill row path (a convex triangle's coverage in
+    /// a row is a single contiguous span).
     fn fill_span(&self, pixels: &mut [u8], start: usize, count: usize) {
-        use std::simd::f32x8;
-        let end = start + count * 4;
-        if end > pixels.len() { // clamp defensively (matches write's bound check)
-            let safe = (pixels.len().saturating_sub(start)) / 4;
-            return self.fill_span_scalar(pixels, start, safe);
-        }
         let am = self.wm;
         if let Some(u8s) = self.opaque_u8 {
             for k in 0..count {
                 let idx = start + k * 4;
+                if idx + 4 > pixels.len() { break; }
                 if am.r { pixels[idx]     = u8s[0]; }
                 if am.g { pixels[idx + 1] = u8s[1]; }
                 if am.b { pixels[idx + 2] = u8s[2]; }
@@ -1719,36 +1710,17 @@ impl CFast {
             }
             return;
         }
-        let (a, b) = match self.affine {
-            Some(ab) => ab,
-            None => return self.fill_span_scalar(pixels, start, count),
-        };
-        let mask = [am.r, am.g, am.b, am.a];
-        let inv255 = f32x8::splat(255.0);
-        let half = f32x8::splat(0.5);
-        let mut k = 0usize;
-        while k + 8 <= count {
-            let base = start + k * 4;
-            for ch in 0..4 {
-                if !mask[ch] { continue; }
-                let mut d = [0.0f32; 8];
-                for lane in 0..8 { d[lane] = pixels[base + lane * 4 + ch] as f32; }
-                // EXACT scalar op order per lane: dst/255, A + B*dst,
-                // *255 + 0.5, saturating cast.
-                let dst = f32x8::from_array(d) / inv255;
-                let fin = f32x8::splat(a[ch]) + f32x8::splat(b[ch]) * dst;
-                let q = (fin * inv255 + half).to_array();
-                for lane in 0..8 { pixels[base + lane * 4 + ch] = q[lane] as u8; }
+        if let Some(lut) = self.lut {
+            for k in 0..count {
+                let idx = start + k * 4;
+                if idx + 4 > pixels.len() { break; }
+                if am.r { pixels[idx]     = lut[0][pixels[idx]     as usize]; }
+                if am.g { pixels[idx + 1] = lut[1][pixels[idx + 1] as usize]; }
+                if am.b { pixels[idx + 2] = lut[2][pixels[idx + 2] as usize]; }
+                if am.a { pixels[idx + 3] = lut[3][pixels[idx + 3] as usize]; }
             }
-            k += 8;
+            return;
         }
-        // Scalar tail.
-        self.fill_span_scalar(pixels, start + k * 4, count - k);
-    }
-
-    /// Per-pixel tail/fallback for `fill_span`.
-    #[inline]
-    fn fill_span_scalar(&self, pixels: &mut [u8], start: usize, count: usize) {
         for k in 0..count { self.write(pixels, start + k * 4); }
     }
 
@@ -1764,18 +1736,20 @@ impl CFast {
             if am.a { pixels[idx + 3] = u8s[3]; }
             return;
         }
+        if let Some(lut) = self.lut {
+            if am.r { pixels[idx]     = lut[0][pixels[idx]     as usize]; }
+            if am.g { pixels[idx + 1] = lut[1][pixels[idx + 1] as usize]; }
+            if am.b { pixels[idx + 2] = lut[2][pixels[idx + 2] as usize]; }
+            if am.a { pixels[idx + 3] = lut[3][pixels[idx + 3] as usize]; }
+            return;
+        }
         let dst = [
             pixels[idx]     as f32 / 255.0,
             pixels[idx + 1] as f32 / 255.0,
             pixels[idx + 2] as f32 / 255.0,
             pixels[idx + 3] as f32 / 255.0,
         ];
-        let fin = if let Some((a, b)) = self.affine {
-            [a[0] + b[0] * dst[0], a[1] + b[1] * dst[1],
-             a[2] + b[2] * dst[2], a[3] + b[3] * dst[3]]
-        } else {
-            apply_blend(&self.blend, self.src, dst)
-        };
+        let fin = apply_blend(&self.blend, self.src, dst);
         if am.r { pixels[idx]     = f32_to_u8(fin[0]); }
         if am.g { pixels[idx + 1] = f32_to_u8(fin[1]); }
         if am.b { pixels[idx + 2] = f32_to_u8(fin[2]); }
@@ -1809,7 +1783,7 @@ fn cfast_eligible(setup: &TriangleSetup, draw: &DrawTriangle<'_>) -> bool {
 /// vectorized write.  Degenerate (`total_edge == 0`) triangles write
 /// nothing, matching the per-pixel path's `continue`.
 #[inline]
-fn cfast_fill_row(cf: &CFast, pixels: &mut [u8], setup: &TriangleSetup,
+fn cfast_fill_row(cf: &CFast<'_>, pixels: &mut [u8], setup: &TriangleSetup,
                   py: i32, t_min_x: i32, t_max_x: i32, stripe_pixel_y: i32) {
     if setup.total_edge == 0.0 { return; }
     let (a, b, c) = (setup.a, setup.b, setup.c);
@@ -3058,6 +3032,19 @@ pub struct DrawTriangle<'a> {
     /// `None` keeps the per-pixel `fs_main` path. Bit-identical either way —
     /// only the FS *value* is hoisted; coverage / blend / write are unchanged.
     pub fs_const_color: Option<[f32; 4]>,
+
+    /// Const-fill blend LUT: when the FS is pixel-invariant (`fs_const_color`
+    /// is `Some`) AND the blend equation is affine in the destination (every
+    /// factor dst-independent — opaque, SrcOver, … see `build_blend_lut`),
+    /// the post-blend byte is a pure function of the destination byte, so it
+    /// is memoized as a per-channel 256-entry table built ONCE per draw.
+    /// The rasterizer's const-fill path then blends with a single table
+    /// lookup per channel (no per-pixel division / float multiply / quantise)
+    /// — bit-identical to the float blend, since the table IS that formula
+    /// evaluated over the 256 possible dst byte values.  Borrowed from the
+    /// owning `OwnedDraw` (built there so it's amortized across all the
+    /// draw's triangles + stripes, not rebuilt per `rasterize_stripe`).
+    pub fs_blend_lut: Option<&'a [[u8; 256]; 4]>,
 }
 
 /// Per-face stencil state passed to `fill_image_triangle`.
@@ -3147,6 +3134,7 @@ impl Default for DrawTriangle<'_> {
             swap_rb: false,
             vs_storage_table: &[],
             fs_const_color: None,
+            fs_blend_lut: None,
         }
     }
 }
@@ -3478,6 +3466,25 @@ fn blend_affine(state: &BlendState, src: [f32; 4]) -> Option<([f32; 4], [f32; 4]
     let a = [sc[0] * src[0], sc[1] * src[1], sc[2] * src[2], sa * src[3]];
     let b = [dc[0], dc[1], dc[2], da];
     Some((a, b))
+}
+
+/// Build the per-channel const-fill blend LUT for a CONSTANT `src`, or
+/// `None` when the blend isn't affine in dst (a dst-dependent factor →
+/// caller keeps the per-pixel `apply_blend`).  Entry `[ch][d]` is the
+/// final byte for destination byte `d` in channel `ch`, computed with
+/// the EXACT scalar op chain (`d/255` → `A + B*dst` → `*255 + 0.5` → u8)
+/// so a table lookup is bit-identical to the float blend.  Built once
+/// per draw (see `DrawTriangle::fs_blend_lut`).
+pub(crate) fn build_blend_lut(state: &BlendState, src: [f32; 4]) -> Option<Box<[[u8; 256]; 4]>> {
+    let (a, b) = blend_affine(state, src)?;
+    let mut lut = Box::new([[0u8; 256]; 4]);
+    for ch in 0..4 {
+        for d in 0..256usize {
+            let dst = d as f32 / 255.0;
+            lut[ch][d] = f32_to_u8(a[ch] + b[ch] * dst);
+        }
+    }
+    Some(lut)
 }
 
 /// Saturating float-to-u8 conversion matching the standard
