@@ -1804,6 +1804,36 @@ fn rasterize_stripe(
 
     let (a, b, c) = (setup.a, setup.b, setup.c);
 
+    // Const-fill fast write: a pixel-invariant FS with no varyings and
+    // no depth/stencil/MSAA effect reduces a covered pixel to just a
+    // coverage test + colour write — every barycentric divide, varying
+    // interpolation, depth interpolation, and the early-Z resolve below
+    // are dead work (n=0, depth disabled).  Precompute the constant
+    // source (R/B-swapped) once; for the opaque (blend-disabled) case
+    // also pre-quantise to u8 so the inner loop is a masked byte copy.
+    // The produced bytes are bit-identical to the full path for these
+    // pixels (coverage 1.0, final_color == src for opaque / apply_blend
+    // for enabled blend, same f32_to_u8).
+    let cfast: Option<([f32; 4], ColorWriteMask, Option<[u8; 4]>)> =
+        if draw.fs_const_color.is_some()
+            && setup.n == 0
+            && !setup.fs_writes_depth
+            && setup.depth_compare_op == CompareOp::Always
+            && !setup.depth_write
+            && setup.depth_bounds.is_none()
+            && setup.stencil_face.is_none()
+            && draw.sample_count == 1
+            && task.extra_color.is_empty()
+        {
+            let cc = draw.fs_const_color.unwrap();
+            let src = if draw.swap_rb { [cc[2], cc[1], cc[0], cc[3]] } else { cc };
+            let opaque_u8 = if !draw.blend_state.enable {
+                Some([f32_to_u8(src[0]), f32_to_u8(src[1]),
+                      f32_to_u8(src[2]), f32_to_u8(src[3])])
+            } else { None };
+            Some((src, draw.blend_state.write_mask, opaque_u8))
+        } else { None };
+
     for tile_x in setup.tile_min_x..=setup.tile_max_x {
         let t_min_x = (tile_x * TILE_SIZE).max(setup.min_x);
         let t_max_x = ((tile_x + 1) * TILE_SIZE - 1).min(setup.max_x);
@@ -1860,6 +1890,36 @@ fn rasterize_stripe(
                 let inside_neg = we0 <= 0.0 && we1 <= 0.0 && we2 <= 0.0;
                 let center_inside = inside_pos || inside_neg;
                 if setup.total_edge == 0.0 { continue; }
+
+                // Const-fill fast write (see `cfast` above): skip all the
+                // dead barycentric / depth-interp / early-Z work and write
+                // the precomputed constant colour for this covered pixel.
+                if let Some((src, am, opaque_u8)) = cfast {
+                    if !center_inside { continue; }
+                    let py_local = (py - stripe_pixel_y) as usize;
+                    let idx = (py_local * (setup.width as usize)
+                        + px as usize) * 4;
+                    if idx + 4 > task.pixels.len() { continue; }
+                    if let Some(u8s) = opaque_u8 {
+                        if am.r { task.pixels[idx]     = u8s[0]; }
+                        if am.g { task.pixels[idx + 1] = u8s[1]; }
+                        if am.b { task.pixels[idx + 2] = u8s[2]; }
+                        if am.a { task.pixels[idx + 3] = u8s[3]; }
+                    } else {
+                        let dst = [
+                            task.pixels[idx]     as f32 / 255.0,
+                            task.pixels[idx + 1] as f32 / 255.0,
+                            task.pixels[idx + 2] as f32 / 255.0,
+                            task.pixels[idx + 3] as f32 / 255.0,
+                        ];
+                        let fin = apply_blend(&draw.blend_state, src, dst);
+                        if am.r { task.pixels[idx]     = f32_to_u8(fin[0]); }
+                        if am.g { task.pixels[idx + 1] = f32_to_u8(fin[1]); }
+                        if am.b { task.pixels[idx + 2] = f32_to_u8(fin[2]); }
+                        if am.a { task.pixels[idx + 3] = f32_to_u8(fin[3]); }
+                    }
+                    continue;
+                }
 
                 // MSAA coverage: with sample_count > 1, test N
                 // sub-pixel sample points and accept the pixel
@@ -2394,6 +2454,30 @@ fn rasterize_stripe_simd(
     let (a, b, c) = (setup.a, setup.b, setup.c);
     let wm = draw.blend_state.write_mask;
     let n = setup.n;
+
+    // Const-fill fast write (mirror of rasterize_stripe's `cfast`): a
+    // pixel-invariant FS with no varyings and no depth effect makes the
+    // whole per-tile-row barycentric / oiw / depth-interp block dead
+    // work.  When eligible, write the precomputed constant colour for
+    // covered lanes straight after the coverage test.  simd_ok already
+    // excludes stencil / late-depth / MRT / MSAA; we add the depth-
+    // disabled + n==0 conditions here.  Bit-identical to the full path.
+    let cfast: Option<([f32; 4], ColorWriteMask, Option<[u8; 4]>)> =
+        if draw.fs_const_color.is_some()
+            && n == 0
+            && setup.depth_compare_op == CompareOp::Always
+            && !setup.depth_write
+            && setup.depth_bounds.is_none()
+        {
+            let cc = draw.fs_const_color.unwrap();
+            let src = if draw.swap_rb { [cc[2], cc[1], cc[0], cc[3]] } else { cc };
+            let opaque_u8 = if !draw.blend_state.enable {
+                Some([f32_to_u8(src[0]), f32_to_u8(src[1]),
+                      f32_to_u8(src[2]), f32_to_u8(src[3])])
+            } else { None };
+            Some((src, wm, opaque_u8))
+        } else { None };
+
     let te = f32x8::splat(setup.total_edge);
     let zero = f32x8::splat(0.0);
     let lane_idx = f32x8::from_array([0., 1., 2., 3., 4., 5., 6., 7.]);
@@ -2431,6 +2515,37 @@ fn rasterize_stripe_simd(
             let inside = (we0.simd_ge(zero) & we1.simd_ge(zero) & we2.simd_ge(zero))
                 | (we0.simd_le(zero) & we1.simd_le(zero) & we2.simd_le(zero));
             let inside = inside.to_array();
+
+            // Const-fill fast write: skip the barycentric / oiw / depth
+            // block entirely for the covered lanes.
+            if let Some((src, am, opaque_u8)) = cfast {
+                let py_local = (py - stripe_pixel_y) as usize;
+                for lane in 0..lanes {
+                    if !inside[lane] { continue; }
+                    let px = (t_min_x + lane as i32) as usize;
+                    let idx = (py_local * (setup.width as usize) + px) * 4;
+                    if idx + 4 > task.pixels.len() { continue; }
+                    if let Some(u8s) = opaque_u8 {
+                        if am.r { task.pixels[idx]     = u8s[0]; }
+                        if am.g { task.pixels[idx + 1] = u8s[1]; }
+                        if am.b { task.pixels[idx + 2] = u8s[2]; }
+                        if am.a { task.pixels[idx + 3] = u8s[3]; }
+                    } else {
+                        let dst = [
+                            task.pixels[idx]     as f32 / 255.0,
+                            task.pixels[idx + 1] as f32 / 255.0,
+                            task.pixels[idx + 2] as f32 / 255.0,
+                            task.pixels[idx + 3] as f32 / 255.0,
+                        ];
+                        let fin = apply_blend(&draw.blend_state, src, dst);
+                        if am.r { task.pixels[idx]     = f32_to_u8(fin[0]); }
+                        if am.g { task.pixels[idx + 1] = f32_to_u8(fin[1]); }
+                        if am.b { task.pixels[idx + 2] = f32_to_u8(fin[2]); }
+                        if am.a { task.pixels[idx + 3] = f32_to_u8(fin[3]); }
+                    }
+                }
+                continue;
+            }
 
             let b0 = we0 / te;
             let b1 = we1 / te;

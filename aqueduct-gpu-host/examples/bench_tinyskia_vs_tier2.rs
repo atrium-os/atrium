@@ -395,11 +395,16 @@ fn main() {
     frame.push(FrameOp::BeginRenderPass, &begin).unwrap();
     frame.push_set_viewport(SetViewportCmd {
         x: 0.0, y: 0.0, width: W as f32, height: H as f32, min_depth: 0.0, max_depth: 1.0 }).unwrap();
-    for (pid, vb, vbytes) in [
-        (pipe_bg, vb_bg, bg_buf.len()),
-        (pipe_panel, vb_panel, panel_buf.len()),
-        (pipe_glyph, vb_glyph, glyph_buf.len()),
-    ] {
+    let only = std::env::var("ATRIUM_BENCH_ONLY").unwrap_or_default();
+    let groups: Vec<(_, _, usize)> = [
+        ("bg", pipe_bg, vb_bg, bg_buf.len()),
+        ("panel", pipe_panel, vb_panel, panel_buf.len()),
+        ("glyph", pipe_glyph, vb_glyph, glyph_buf.len()),
+    ].into_iter()
+        .filter(|(n, ..)| only.is_empty() || only.split(',').any(|s| s == *n))
+        .map(|(_, p, v, l)| (p, v, l))
+        .collect();
+    for (pid, vb, vbytes) in groups {
         frame.push(FrameOp::BindPipeline, &pid.raw().to_le_bytes()).unwrap();
         frame.push_bind_vertex_buf(BindVertexBufCmd { binding: 0, buffer_id: vb.raw(), offset: 0 }).unwrap();
         frame.push_draw(DrawCmd {
