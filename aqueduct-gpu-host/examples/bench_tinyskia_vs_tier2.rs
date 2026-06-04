@@ -52,6 +52,17 @@ use atrium_spv_loader::LoaderConfig;
 const W: u32 = 1280;
 const H: u32 = 720;
 
+/// Total CPU time consumed by the whole process so far (user + sys, all
+/// threads), in ms — via getrusage(RUSAGE_SELF). This is the ENERGY proxy:
+/// a 14-core render that finishes in the same wall-clock as a 1-core one
+/// burned ~14× the core-ms (≈ joules). Wall-clock is latency; this is work.
+fn cpu_ms() -> f64 {
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru); }
+    let tv = |t: &libc::timeval| t.tv_sec as f64 * 1000.0 + t.tv_usec as f64 / 1000.0;
+    tv(&ru.ru_utime) + tv(&ru.ru_stime)
+}
+
 // ── Locate the workspace-built atrium-spv-compile binary. ──
 fn locate_compile_binary() -> PathBuf {
     // examples run from the crate dir; the compiler is a sibling
@@ -257,12 +268,13 @@ fn main() {
     // warmup
     for _ in 0..3 { pm.fill(tiny_skia::Color::TRANSPARENT); render_tinyskia(&mut pm, &bg, &panels, &glyphs); }
     let iters = 60u32;
-    let t0 = Instant::now();
+    let (t0, c0) = (Instant::now(), cpu_ms());
     for _ in 0..iters {
         pm.fill(tiny_skia::Color::TRANSPARENT);
         render_tinyskia(&mut pm, &bg, &panels, &glyphs);
     }
     let ts_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+    let ts_cpu = (cpu_ms() - c0) / iters as f64; // core-ms / frame (energy)
 
     // ── Tier-2 setup (shaders compiled once, out of the loop) ──
     let cache = std::env::temp_dir().join(format!("tier2_bench_{}", std::process::id()));
@@ -402,9 +414,10 @@ fn main() {
         let i = ((H as usize / 2) * W as usize + W as usize / 2) * 4;
         px[i] as u32 + px[i+1] as u32 + px[i+2] as u32
     }).unwrap_or(0);
-    let t3 = Instant::now();
+    let (t3, c3) = (Instant::now(), cpu_ms());
     for i in 0..iters { backend.submit_frame(fence, i as u64 + 1, &frame_bytes); }
     let t2f_ms = t3.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+    let t2f_cpu = (cpu_ms() - c3) / iters as f64; // core-ms / frame (energy)
 
     std::fs::remove_dir_all(&cache).ok();
 
@@ -427,4 +440,13 @@ fn main() {
     };
     cmp("tier-2 per-triangle", t2_ms);
     cmp("tier-2 submit_frame", t2f_ms);
+    // ── Energy (core-ms = CPU time across all threads; the joules proxy) ──
+    println!();
+    println!("  ENERGY (core-ms/frame — CPU time, the real efficiency metric):");
+    println!("    tiny-skia          : {ts_cpu:7.2} core-ms");
+    println!("    tier-2 submit_frame: {t2f_cpu:7.2} core-ms   ({:.1}× tiny-skia's energy)",
+             t2f_cpu / ts_cpu);
+    println!("  (wall-clock is latency; multicore hides energy — {:.1} cores' worth \
+              of work to match a {:.1}× wall-clock gap.)",
+             t2f_cpu / t2f_ms, t2f_ms / ts_ms);
 }
