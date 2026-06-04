@@ -156,6 +156,30 @@ the optimistic case; textured/glyph shading is ~2–3× heavier.)
       model for the compositor case, no SIMD yet** — P2/P3 are
       headroom to close the gap to the tiny-skia SIMD-blitter
       reference (~2.5 ms) for texture/blend-heavy frames.
+
+      > **⚠️ Caveat — these are constant-FS / full-screen-quad
+      > microbenchmarks (pure dispatch overhead).** They do NOT
+      > represent a real glyph-heavy UI frame. The end-to-end
+      > `submit_frame` measurement on the actual workload (720p,
+      > bg + 24 panels + 3200 alpha glyph quads,
+      > `bench_tinyskia_vs_tier2`, 14 cores) is:
+      >
+      > | path | ms/frame | fps | vs tiny-skia |
+      > |---|---|---|---|
+      > | tiny-skia (1 thread, SIMD blitter) | **1.88** | 533 | — |
+      > | tier-2 `submit_frame`, **bespoke** | **12.96** | 77 | 6.9× slower |
+      > | tier-2 `submit_frame`, cranelift | 15.56 | 64 | 8.3× slower |
+      > | tier-2 per-triangle API (not production) | 162 | 6 | 87× slower |
+      >
+      > So: the batched `submit_frame` path is **12.5× faster** than
+      > the per-triangle API (which earlier benches mistakenly
+      > measured), and **bespoke beats cranelift by ~20%** on real
+      > work — but tier-2 is still **~7× off tiny-skia** on a real
+      > frame. The "comfortably 4K@120" claim above holds only for
+      > dispatch-bound / damage-driven UI; a real glyph-heavy
+      > full frame is **not** there yet. Closing the ~7× is exactly
+      > the SIMD shading work (P3), and that 7× *is* tiny-skia's
+      > SIMD-blitter advantage over tier-2's scalar per-pixel path.
 - **P2 — Batched fragment execution.** Remove the per-pixel FS
   call.  Today `rasterize_stripe` makes one indirect call to
   `fs_main` *per covered pixel* (8.3M calls/frame at 4K full-screen);
