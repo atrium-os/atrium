@@ -31,6 +31,8 @@ use aqueduct_gpu::{
 use aqueduct_gpu_client::GpuClient;
 use carillon_transport::{layout, pump_fd_to_stream_with, pump_stream_to_fd_with, Region};
 
+mod scanout;
+
 // cdev ioctls (must match carillon-kmod/carillon_abi.h).
 //   CARILLON_RING = _IO('C', 1)
 //   CARILLON_WAIT = _IOWR('C', 2, struct carillon_wait {u32 timeout_ms; u32 seq;})
@@ -131,6 +133,13 @@ fn run() -> i32 {
     // migrates this surface Tier-2 → Tier-3 (watch the host daemon log).
     if std::env::var("CARILLON_ROUTING").is_ok() {
         return routing_demo(&mut client, backend_id);
+    }
+
+    // Scanout demo: render a shape on the host (through the router) and put
+    // it on the VM's actual display via the D0 scanout path — the stack's
+    // output made *visible* instead of read back headless.
+    if std::env::var("CARILLON_SCANOUT").is_ok() {
+        return scanout_demo(&mut client, backend_id);
     }
 
     let img_mem = client.allocate_memory((W * H * 4) as u64, MemoryUsage::ImageBacking).unwrap();
@@ -268,6 +277,115 @@ fn routing_demo(client: &mut GpuClient, backend_id: BackendId) -> i32 {
         eprintln!("FAIL: centre pixel not the expected grey (~230)");
         2
     }
+}
+
+/// Render a shape on the *host* (through the energy router) and put it on the
+/// VM's real display via the D0 scanout path. Renders at the connector's
+/// native resolution so the diamond fills the screen; reads the frame back
+/// over Carillon and page-flips it onto the QEMU Cocoa window. Holds the
+/// frame on screen (re-flipping) so it stays visible.
+fn scanout_demo(client: &mut GpuClient, backend_id: BackendId) -> i32 {
+    let sc = match scanout::Scanout::open() {
+        Ok(s) => s,
+        Err(e) => { eprintln!("FAIL: scanout open: {e}"); return 3; }
+    };
+    let (w, h) = (sc.width, sc.height);
+    println!("carillon-guest: scanout {w}x{h} — rendering a shape on the host \
+              through the router, presenting to the VM display");
+
+    let bytes = (w * h * 4) as u64;
+    let img_mem = client.allocate_memory(bytes, MemoryUsage::ImageBacking).unwrap();
+    let image = client.create_image(ImageCreatePayload {
+        image_id: ResourceId(0), backing_region: img_mem.region_id, region_offset: 0,
+        format: 37, width: w, height: h, depth: 1, mip_levels: 1, array_layers: 1, usage: 0x07,
+    }).unwrap();
+    let buf_mem = client.allocate_memory(bytes, MemoryUsage::Staging).unwrap();
+    let buffer = client.create_buffer(BufferCreatePayload {
+        buffer_id: ResourceId(0), backing_region: buf_mem.region_id, region_offset: 0,
+        size: bytes, usage: 0x01,
+    }).unwrap();
+
+    // Nested coloured squares, drawn with proven primitives only: the
+    // vertex-less full-screen triangle + a constant-colour FS, one pipeline
+    // per colour, each draw clipped to a scissor rect. (Varyings / FragCoord /
+    // GLSL.std.450 ext-insts all crash the compiled Tier-2 path, so the shape
+    // is composed from scissored fills instead — host-verified before this.)
+    let vs = build_fullscreen_tri_vs();
+    let vs_id = client.upload_shader(sha256(&vs), ShaderKind::SpirV, backend_id, vs).unwrap();
+    // (colour, fractional rect x,y,w,h of the screen) — outer → inner.
+    let layers: [([f32; 4], [f32; 4]); 5] = [
+        ([0.05, 0.45, 0.55, 1.0], [0.10, 0.10, 0.80, 0.80]), // teal
+        ([0.85, 0.15, 0.55, 1.0], [0.20, 0.20, 0.60, 0.60]), // magenta
+        ([1.00, 0.55, 0.10, 1.0], [0.30, 0.30, 0.40, 0.40]), // orange
+        ([0.20, 0.75, 0.25, 1.0], [0.385, 0.385, 0.23, 0.23]), // green
+        ([0.97, 0.97, 0.97, 1.0], [0.45, 0.45, 0.10, 0.10]), // white centre
+    ];
+    let mut pipes: Vec<(ResourceId, [u32; 4])> = Vec::new();
+    for (rgba, frac) in layers {
+        let fs = build_const_fs(rgba);
+        let fs_id = client.upload_shader(sha256(&fs), ShaderKind::SpirV, backend_id, fs).unwrap();
+        let pipe = client.create_pipeline(PipelineKind::Graphics, vec![vs_id, fs_id], Vec::new()).unwrap();
+        let rect = [
+            (frac[0] * w as f32) as u32, (frac[1] * h as f32) as u32,
+            (frac[2] * w as f32) as u32, (frac[3] * h as f32) as u32,
+        ];
+        pipes.push((pipe, rect));
+    }
+    thread::sleep(Duration::from_millis(50));
+
+    let render_one = |client: &mut GpuClient, t: u64| -> Result<Vec<u8>, String> {
+        let fence = client.create_fence().map_err(|e| e.to_string())?;
+        let mut fb = client.frame_builder();
+        let mut brp = image.raw().to_le_bytes().to_vec();
+        brp.extend_from_slice(&[10u8, 10, 14, 255]); // dark clear
+        brp.extend_from_slice(&0u32.to_le_bytes());
+        fb.push(FrameOp::BeginRenderPass, &brp).unwrap();
+        for (pipe, rect) in &pipes {
+            fb.push(FrameOp::BindPipeline, &pipe.raw().to_le_bytes()).unwrap();
+            let mut sc = Vec::new();
+            for v in rect { sc.extend_from_slice(&v.to_le_bytes()); } // x,y,w,h
+            fb.push(FrameOp::SetScissor, &sc).unwrap();
+            let mut draw = Vec::new();
+            for v in [3u32, 1, 0, 0] { draw.extend_from_slice(&v.to_le_bytes()); }
+            fb.push(FrameOp::Draw, &draw).unwrap();
+        }
+        fb.push(FrameOp::EndRenderPass, &[]).unwrap();
+        let mut cib = image.raw().to_le_bytes().to_vec();
+        cib.extend_from_slice(&buffer.raw().to_le_bytes());
+        cib.extend_from_slice(&0u32.to_le_bytes());
+        cib.extend_from_slice(&1u32.to_le_bytes());
+        let mut reg = vec![0u8; 56];
+        reg[44..48].copy_from_slice(&w.to_le_bytes());
+        reg[48..52].copy_from_slice(&h.to_le_bytes());
+        reg[52..56].copy_from_slice(&1u32.to_le_bytes());
+        cib.extend_from_slice(&reg);
+        fb.push(FrameOp::CopyImgToBuf, &cib).unwrap();
+        client.submit_frame(fence, fb, t).map_err(|e| e.to_string())?;
+        if !client.wait_fence(fence, 30_000_000_000).map_err(|e| e.to_string())? {
+            return Err(format!("frame {t} fence never signalled"));
+        }
+        client.read_buffer(buffer, 0, bytes).map_err(|e| e.to_string())
+    };
+
+    // Render once on the host (through the router), read it back, present it.
+    let px = match render_one(client, 1) {
+        Ok(p) => p,
+        Err(e) => { eprintln!("FAIL: render: {e}"); return 2; }
+    };
+    if let Err(e) = sc.present_rgba(&px) {
+        eprintln!("FAIL: present: {e}");
+        return 3;
+    }
+    println!("carillon-guest: SHAPE ON SCREEN — nested coloured squares, \
+              rendered on the host through the router, shown on the VM display");
+
+    // Hold it on screen (re-flip the same frame) so the window stays up.
+    // Ctrl-C / kill to exit; ~60 s then return cleanly.
+    for _ in 0..120 {
+        let _ = sc.present_rgba(&px);
+        thread::sleep(Duration::from_millis(500));
+    }
+    0
 }
 
 /// Heavy FS: acc = 0.1 then `n` real FAdds of 0.001 (a true dependent chain),

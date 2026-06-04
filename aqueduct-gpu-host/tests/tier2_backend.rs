@@ -1708,3 +1708,77 @@ fn tier2_backend_vertexless_fullscreen_triangle_renders() {
              got {:?}", px(x, y));
     }
 }
+
+#[test]
+fn tier2_backend_scanout_nested_squares_via_scissor() {
+    use aqueduct_gpu::frame::{DrawCmd, FrameBuilder, SetViewportCmd};
+    use aqueduct_gpu::opcodes::FrameOp;
+
+    const N: u32 = 32;
+    let cache_dir = TempDir::new().unwrap();
+    let registry = Arc::new(Tier2Registry::new(LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    }));
+    // Proven primitives only: the vertex-less full-screen triangle + a
+    // constant-colour FS (the green-triangle path), one pipeline per colour,
+    // each draw clipped to a scissor rect → nested coloured squares. No
+    // varyings / FragCoord / ext-inst (all of which crash the compiled Tier-2
+    // path here — see scratch notes). This is what the scanout demo draws.
+    let vs_id = registry.register(&build_fullscreen_tri_vs()).expect("vs");
+    let blue = registry.register(&build_constant_color_spirv([0.10, 0.20, 0.90, 1.0])).unwrap();
+    let orange = registry.register(&build_constant_color_spirv([1.0, 0.55, 0.10, 1.0])).unwrap();
+    let white = registry.register(&build_constant_color_spirv([0.95, 0.95, 0.95, 1.0])).unwrap();
+    let backend = Tier2Backend::new(registry);
+
+    let image_id = ResourceId::new(IdNamespace::IcdRuntime, 0xF201);
+    backend.image_created(image_id, N, N);
+    // One pipeline per colour (shared VS).
+    let squares = [
+        (ResourceId::new(IdNamespace::IcdRuntime, 0xF210), blue,   (4u32, 4u32, 24u32, 24u32)),
+        (ResourceId::new(IdNamespace::IcdRuntime, 0xF211), orange, (10, 10, 12, 12)),
+        (ResourceId::new(IdNamespace::IcdRuntime, 0xF212), white,  (14, 14, 4, 4)),
+    ];
+    for (pid, fs, _) in &squares {
+        backend.bind_pipeline_vs(*pid, vs_id);
+        backend.bind_pipeline(*pid, *fs);
+    }
+
+    let mut fb = FrameBuilder::new(4096);
+    let mut begin = [0u8; 12];
+    begin[..4].copy_from_slice(&image_id.raw().to_le_bytes());
+    // Clear to dark.
+    begin[4..8].copy_from_slice(&[10u8, 10, 10, 255]);
+    fb.push(FrameOp::BeginRenderPass, &begin).unwrap();
+    fb.push_set_viewport(SetViewportCmd {
+        x: 0.0, y: 0.0, width: N as f32, height: N as f32, min_depth: 0.0, max_depth: 1.0,
+    }).unwrap();
+    for (pid, _, (x, y, w, h)) in &squares {
+        fb.push(FrameOp::BindPipeline, &pid.raw().to_le_bytes()).unwrap();
+        fb.push(FrameOp::SetScissor,
+            &aqueduct_gpu::frame::SetScissorCmd { x: *x, y: *y, width: *w, height: *h }.to_bytes()).unwrap();
+        fb.push_draw(DrawCmd { vertex_count: 3, instance_count: 1, first_vertex: 0, first_instance: 0 }).unwrap();
+    }
+    fb.push(FrameOp::EndRenderPass, &[]).unwrap();
+    backend.submit_frame(ResourceId::new(IdNamespace::IcdRuntime, 0xF204), 1, fb.as_bytes());
+
+    let pixels = backend.read_image_pixels(image_id).unwrap();
+    let px = |x: usize, y: usize| -> [u8; 4] {
+        let i = (y * N as usize + x) * 4;
+        [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
+    };
+    // Centre = innermost white square.
+    let c = px(16, 16);
+    assert!(c[0] > 200 && c[1] > 200 && c[2] > 200, "centre should be white, got {c:?}");
+    // Inside the orange ring (between mid and inner squares).
+    let o = px(11, 11);
+    assert!(o[0] > 200 && o[1] > 110 && o[1] < 180 && o[2] < 70,
+        "should be orange, got {o:?}");
+    // Inside the blue ring.
+    let bl = px(6, 6);
+    assert!(bl[2] > 200 && bl[0] < 90, "should be blue, got {bl:?}");
+    // Corner outside all squares = the dark clear.
+    let bg = px(1, 1);
+    assert!(bg[0] < 40 && bg[1] < 40 && bg[2] < 40, "corner should be dark clear, got {bg:?}");
+}
