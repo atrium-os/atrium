@@ -2021,6 +2021,24 @@ fn tier2_backend_gl_fragcoord_diamond() {
 }
 
 #[test]
+fn tier2_registry_fs_pixel_invariant_classification() {
+    // The const-fill fast path's gate: a const-colour FS is pixel-invariant
+    // (call once, reuse); a FragCoord or varying-reading FS is not.
+    let cache_dir = TempDir::new().unwrap();
+    let registry = Tier2Registry::new(LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    });
+    let const_fs = registry.register(&build_constant_color_spirv([0.9, 0.9, 0.9, 0.85])).unwrap();
+    let fragcoord_fs = registry.register(&build_fragcoord_gradient_fs(32, 32)).unwrap();
+    let varying_fs = registry.register(&build_uv_passthrough_fs()).unwrap();
+    assert!(registry.fs_pixel_invariant(const_fs), "const-colour FS is pixel-invariant");
+    assert!(!registry.fs_pixel_invariant(fragcoord_fs), "FragCoord FS is NOT invariant");
+    assert!(!registry.fs_pixel_invariant(varying_fs), "varying-reading FS is NOT invariant");
+}
+
+#[test]
 fn tier2_backend_gl_fragcoord_gradient() {
     use aqueduct_gpu::frame::{DrawCmd, FrameBuilder, SetViewportCmd};
     use aqueduct_gpu::opcodes::FrameOp;

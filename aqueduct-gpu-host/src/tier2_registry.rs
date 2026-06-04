@@ -67,6 +67,13 @@ pub struct Tier2Registry {
     /// per-vertex interpolant stride the rasterizer must size `in_varyings`
     /// to; `None` once computed-and-found-to-be-0 is stored as `Some(0)`.
     varying_bytes_by_id: Mutex<HashMap<Tier2ShaderId, u32>>,
+    /// Per-shader "pixel-invariant FS" flag (lazy, cached): true when the FS
+    /// output is the same for every pixel of a draw — no varying inputs, no
+    /// `LoadBuiltin` (FragCoord / FrontFacing / PrimitiveId / …), no
+    /// derivatives. Such an FS depends only on uniforms/push (per-draw
+    /// constant), so the rasterizer can call it ONCE per draw and reuse the
+    /// colour instead of per pixel — the const-fill fast path.
+    pixel_invariant_by_id: Mutex<HashMap<Tier2ShaderId, bool>>,
     /// Monotonic id allocator.
     next_id: Mutex<u64>,
 }
@@ -83,6 +90,7 @@ impl Tier2Registry {
             by_id: Mutex::new(HashMap::new()),
             spirv_by_id: Mutex::new(HashMap::new()),
             varying_bytes_by_id: Mutex::new(HashMap::new()),
+            pixel_invariant_by_id: Mutex::new(HashMap::new()),
             next_id: Mutex::new(1),
         }
     }
@@ -161,6 +169,31 @@ impl Tier2Registry {
         Some(bytes)
     }
 
+    /// Whether this FS is **pixel-invariant** — its output is identical for
+    /// every pixel of a draw, so the rasterizer can evaluate it once and
+    /// reuse the colour (the const-fill fast path) instead of calling it per
+    /// pixel. True iff no function reads a varying input, a builtin
+    /// (`LoadBuiltin` — FragCoord etc.), or a derivative. Lazy + cached.
+    /// Conservatively `false` if the SPIR-V can't be re-translated.
+    pub fn fs_pixel_invariant(&self, id: Tier2ShaderId) -> bool {
+        if let Some(&b) = self.pixel_invariant_by_id.lock().unwrap().get(&id) {
+            return b;
+        }
+        let invariant = self.get_spirv(id)
+            .and_then(|spirv| atrium_spv_frontend::translate(&spirv).ok())
+            .map(|m| m.functions.iter().all(|f| {
+                f.input_varying_byte_offset.is_empty()
+                    && f.blocks.values().all(|b| b.insts.iter().all(|i| !matches!(i.op,
+                        atrium_spv_ir::Op::LoadBuiltin(_)
+                        | atrium_spv_ir::Op::Derivative { .. }
+                        | atrium_spv_ir::Op::DPdx(_) | atrium_spv_ir::Op::DPdy(_)
+                        | atrium_spv_ir::Op::Fwidth(_))))
+            }))
+            .unwrap_or(false);
+        self.pixel_invariant_by_id.lock().unwrap().insert(id, invariant);
+        invariant
+    }
+
     /// Look up a registered shader. `None` if the id has
     /// never been issued (or was forgotten).
     pub fn get(&self, id: Tier2ShaderId) -> Option<Arc<LoadedShader>> {
@@ -179,6 +212,7 @@ impl Tier2Registry {
             by_hash.retain(|_h, v| *v != id);
             self.spirv_by_id.lock().unwrap().remove(&id);
             self.varying_bytes_by_id.lock().unwrap().remove(&id);
+            self.pixel_invariant_by_id.lock().unwrap().remove(&id);
         }
     }
 
