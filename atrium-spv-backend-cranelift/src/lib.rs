@@ -895,6 +895,12 @@ fn emit_fragment_span(
         let doff = builder.ins().imul_imm(lane, 4);
         let doff_p = builder.ins().uextend(pointer_type, doff);
         let out_depth = builder.ins().iadd(sp[11], doff_p);
+        // gl_FragCoord SoA arrays (sp[4..8]) are f32-per-lane, so the
+        // per-lane byte offset is the same lane*4 as out_depth.
+        let frag_x = builder.ins().iadd(sp[4], doff_p);
+        let frag_y = builder.ins().iadd(sp[5], doff_p);
+        let frag_z = builder.ins().iadd(sp[6], doff_p);
+        let frag_w = builder.ins().iadd(sp[7], doff_p);
         let anchors = FsAnchors {
             in_varyings,
             uniforms: sp[2],
@@ -903,6 +909,7 @@ fn emit_fragment_span(
             out_depth,
             front_facing: sp[12],
             primitive_id: sp[13],
+            frag_x, frag_y, frag_z, frag_w,
         };
 
         let mut translator = FnTranslator {
@@ -1127,6 +1134,13 @@ struct FsAnchors {
     out_depth:    ClifValue, // out_depth + lane*4
     front_facing: ClifValue, // shared
     primitive_id: ClifValue, // shared
+    // gl_FragCoord SoA: pointers to *this lane's* f32 (base + lane*4).
+    // Per-pixel, so loaded fresh each lane — the rasterizer already
+    // fills fx/fy/fz/fw, the span entry just reads through these.
+    frag_x:       ClifValue,
+    frag_y:       ClifValue,
+    frag_z:       ClifValue,
+    frag_w:       ClifValue,
 }
 
 impl FnTranslator {
@@ -1482,6 +1496,29 @@ impl FnTranslator {
                         let v = self.fs_anchors.map(|a| a.primitive_id)
                             .unwrap_or(self.params[11]);
                         self.scalars.insert(result.id, v);
+                    }
+                    (ShaderStage::Fragment, BK::FragCoord) => {
+                        // gl_FragCoord -- vec4 {x, y, z, w}. Per-pixel, so
+                        // unlike FrontFacing / PrimitiveId it is never a
+                        // shared anchor value:
+                        //   * scalar (per-pixel) entry: frag_coord arrives by
+                        //     value as params 3..6.
+                        //   * span (SoA) entry: load this lane's f32 from the
+                        //     lane-relative frag_x/y/z/w anchor pointers.
+                        let lanes = if let Some(a) = self.fs_anchors {
+                            let ld = |b: &mut FunctionBuilder, p: ClifValue|
+                                b.ins().load(clif_types::F32, MemFlags::new(), p, 0);
+                            vec![
+                                ld(builder, a.frag_x), ld(builder, a.frag_y),
+                                ld(builder, a.frag_z), ld(builder, a.frag_w),
+                            ]
+                        } else {
+                            vec![
+                                self.params[3], self.params[4],
+                                self.params[5], self.params[6],
+                            ]
+                        };
+                        self.vectors.insert(result.id, lanes);
                     }
                     (stage, kind) => {
                         return Err(BackendError::Unsupported(format!(

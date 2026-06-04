@@ -1709,6 +1709,220 @@ fn tier2_backend_vertexless_fullscreen_triangle_renders() {
     }
 }
 
+/// `gl_FragCoord` fragment shader: a gradient `(x/W, y/H, 0.5, 1)` read from
+/// the FragCoord builtin (no vertex buffer, no varyings). Used to verify the
+/// Tier-2 FragCoord fix (frontend routes the FragCoord-decorated load to
+/// `Op::LoadBuiltin(FragCoord)`; the backend materialises it from the
+/// per-pixel frag_coord params).
+fn build_fragcoord_gradient_fs(w: u32, h: u32) -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::dr::Operand;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let f32t = b.type_float(32, None);
+    let v4 = b.type_vector(f32t, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let ptr_in_v4 = b.type_pointer(None, StorageClass::Input, v4);
+    let fragcoord = b.variable(ptr_in_v4, None, StorageClass::Input, None);
+    b.decorate(fragcoord, Decoration::BuiltIn, vec![Operand::BuiltIn(BuiltIn::FragCoord)]);
+    let ptr_out = b.type_pointer(None, StorageClass::Output, v4);
+    let out = b.variable(ptr_out, None, StorageClass::Output, None);
+    b.decorate(out, Decoration::Location, vec![Operand::LiteralBit32(0)]);
+    let inv_w = b.constant_bit32(f32t, (1.0f32 / w as f32).to_bits());
+    let inv_h = b.constant_bit32(f32t, (1.0f32 / h as f32).to_bits());
+    let chalf = b.constant_bit32(f32t, 0.5f32.to_bits());
+    let cone = b.constant_bit32(f32t, 1.0f32.to_bits());
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let fc = b.load(v4, None, fragcoord, None, vec![]).unwrap();
+    let fx = b.composite_extract(f32t, None, fc, vec![0]).unwrap();
+    let fy = b.composite_extract(f32t, None, fc, vec![1]).unwrap();
+    let u = b.f_mul(f32t, None, fx, inv_w).unwrap();
+    let v = b.f_mul(f32t, None, fy, inv_h).unwrap();
+    let color = b.composite_construct(v4, None, vec![u, v, chalf, cone]).unwrap();
+    b.store(out, color, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![fragcoord, out]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+    b.module().assemble().iter().flat_map(|w| w.to_le_bytes()).collect()
+}
+
+/// gl_FragCoord + GLSL.std.450: an orange diamond on a blue/green gradient,
+/// the original scanout-demo shape. Exercises FragCoord *and* FAbs/FClamp/FMix
+/// together (no vertex buffer, no varyings).
+fn build_fragcoord_diamond_fs(w: u32, h: u32) -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::dr::Operand;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    const FABS: u32 = 4;
+    const FCLAMP: u32 = 43;
+    const FMIX: u32 = 46;
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    let glsl = b.ext_inst_import("GLSL.std.450");
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let f32t = b.type_float(32, None);
+    let v3 = b.type_vector(f32t, 3);
+    let v4 = b.type_vector(f32t, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let ptr_in_v4 = b.type_pointer(None, StorageClass::Input, v4);
+    let fragcoord = b.variable(ptr_in_v4, None, StorageClass::Input, None);
+    b.decorate(fragcoord, Decoration::BuiltIn, vec![Operand::BuiltIn(BuiltIn::FragCoord)]);
+    let ptr_out = b.type_pointer(None, StorageClass::Output, v4);
+    let out = b.variable(ptr_out, None, StorageClass::Output, None);
+    b.decorate(out, Decoration::Location, vec![Operand::LiteralBit32(0)]);
+    let k = |b: &mut rspirv::dr::Builder, x: f32| b.constant_bit32(f32t, x.to_bits());
+    let inv_w = k(&mut b, 1.0 / w as f32);
+    let inv_h = k(&mut b, 1.0 / h as f32);
+    let half = k(&mut b, 0.5);
+    let edge = k(&mut b, 0.30);
+    let sharp = k(&mut b, 12.0);
+    let zero = k(&mut b, 0.0);
+    let one = k(&mut b, 1.0);
+    let bg_rx = k(&mut b, 0.35);
+    let bg_gy = k(&mut b, 0.55);
+    let bg_b = k(&mut b, 0.75);
+    let fg_r = k(&mut b, 1.0);
+    let fg_g = k(&mut b, 0.55);
+    let fg_b = k(&mut b, 0.10);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let fc = b.load(v4, None, fragcoord, None, vec![]).unwrap();
+    let fx = b.composite_extract(f32t, None, fc, vec![0]).unwrap();
+    let fy = b.composite_extract(f32t, None, fc, vec![1]).unwrap();
+    let u = b.f_mul(f32t, None, fx, inv_w).unwrap();
+    let v = b.f_mul(f32t, None, fy, inv_h).unwrap();
+    let du = b.f_sub(f32t, None, u, half).unwrap();
+    let dv = b.f_sub(f32t, None, v, half).unwrap();
+    let adx = b.ext_inst(f32t, None, glsl, FABS, vec![Operand::IdRef(du)]).unwrap();
+    let ady = b.ext_inst(f32t, None, glsl, FABS, vec![Operand::IdRef(dv)]).unwrap();
+    let diamond = b.f_add(f32t, None, adx, ady).unwrap();
+    let em = b.f_sub(f32t, None, edge, diamond).unwrap();
+    let scaled = b.f_mul(f32t, None, em, sharp).unwrap();
+    let t = b.ext_inst(f32t, None, glsl, FCLAMP,
+        vec![Operand::IdRef(scaled), Operand::IdRef(zero), Operand::IdRef(one)]).unwrap();
+    let br = b.f_mul(f32t, None, u, bg_rx).unwrap();
+    let bgc = b.f_mul(f32t, None, v, bg_gy).unwrap();
+    let bg = b.composite_construct(v3, None, vec![br, bgc, bg_b]).unwrap();
+    let fg = b.composite_construct(v3, None, vec![fg_r, fg_g, fg_b]).unwrap();
+    let tv = b.composite_construct(v3, None, vec![t, t, t]).unwrap();
+    let rgb = b.ext_inst(v3, None, glsl, FMIX,
+        vec![Operand::IdRef(bg), Operand::IdRef(fg), Operand::IdRef(tv)]).unwrap();
+    let rr = b.composite_extract(f32t, None, rgb, vec![0]).unwrap();
+    let gg = b.composite_extract(f32t, None, rgb, vec![1]).unwrap();
+    let bb = b.composite_extract(f32t, None, rgb, vec![2]).unwrap();
+    let color = b.composite_construct(v4, None, vec![rr, gg, bb, one]).unwrap();
+    b.store(out, color, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![fragcoord, out]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+    b.module().assemble().iter().flat_map(|w| w.to_le_bytes()).collect()
+}
+
+/// Render the FragCoord diamond through both the per-pixel and the SoA span
+/// path; both must agree (orange centre, blue corner).
+fn render_fragcoord_diamond(span: bool) -> [[u8; 4]; 2] {
+    use aqueduct_gpu::frame::{DrawCmd, FrameBuilder, SetViewportCmd};
+    use aqueduct_gpu::opcodes::FrameOp;
+    const N: u32 = 32;
+    let cache_dir = TempDir::new().unwrap();
+    let registry = Arc::new(Tier2Registry::new(LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    }));
+    let vs_id = registry.register(&build_fullscreen_tri_vs()).expect("vs");
+    let fs_id = registry.register(&build_fragcoord_diamond_fs(N, N)).expect("diamond fs");
+    let backend = Tier2Backend::new(registry);
+    let image_id = ResourceId::new(IdNamespace::IcdRuntime, 0xF241);
+    let pipeline_id = ResourceId::new(IdNamespace::IcdRuntime, 0xF242);
+    backend.image_created(image_id, N, N);
+    backend.bind_pipeline_vs(pipeline_id, vs_id);
+    backend.bind_pipeline(pipeline_id, fs_id);
+    let mut fb = FrameBuilder::new(4096);
+    let mut begin = [0u8; 12];
+    begin[..4].copy_from_slice(&image_id.raw().to_le_bytes());
+    fb.push(FrameOp::BeginRenderPass, &begin).unwrap();
+    fb.push(FrameOp::BindPipeline, &pipeline_id.raw().to_le_bytes()).unwrap();
+    fb.push_set_viewport(SetViewportCmd { x: 0.0, y: 0.0, width: N as f32, height: N as f32, min_depth: 0.0, max_depth: 1.0 }).unwrap();
+    fb.push_draw(DrawCmd { vertex_count: 3, instance_count: 1, first_vertex: 0, first_instance: 0 }).unwrap();
+    fb.push(FrameOp::EndRenderPass, &[]).unwrap();
+    let _ = span; // path is chosen by the ATRIUM_TIER2_SPAN env set by the caller
+    backend.submit_frame(ResourceId::new(IdNamespace::IcdRuntime, 0xF244), 1, fb.as_bytes());
+    let pixels = backend.read_image_pixels(image_id).unwrap();
+    let at = |x: usize, y: usize| { let i = (y * N as usize + x) * 4; [pixels[i], pixels[i+1], pixels[i+2], pixels[i+3]] };
+    [at(16, 16), at(1, 1)]
+}
+
+#[test]
+fn tier2_backend_gl_fragcoord_diamond() {
+    let [centre, corner] = render_fragcoord_diamond(false);
+    eprintln!("diamond centre={centre:?} corner={corner:?}");
+    // Centre inside the diamond → orange (R high, G mid, B low).
+    assert!(centre[0] > 200 && centre[1] > 110 && centre[1] < 180 && centre[2] < 70,
+        "centre should be the orange diamond, got {centre:?}");
+    // Corner outside → blue gradient background (B high, R low).
+    assert!(corner[2] > 150 && corner[0] < 80,
+        "corner should be the blue gradient, got {corner:?}");
+}
+
+#[test]
+fn tier2_backend_gl_fragcoord_gradient() {
+    use aqueduct_gpu::frame::{DrawCmd, FrameBuilder, SetViewportCmd};
+    use aqueduct_gpu::opcodes::FrameOp;
+
+    const N: u32 = 32;
+    let cache_dir = TempDir::new().unwrap();
+    let registry = Arc::new(Tier2Registry::new(LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    }));
+    let vs_id = registry.register(&build_fullscreen_tri_vs()).expect("vs");
+    let fs_id = registry.register(&build_fragcoord_gradient_fs(N, N)).expect("fragcoord fs");
+    let backend = Tier2Backend::new(registry);
+    let image_id = ResourceId::new(IdNamespace::IcdRuntime, 0xF231);
+    let pipeline_id = ResourceId::new(IdNamespace::IcdRuntime, 0xF232);
+    backend.image_created(image_id, N, N);
+    backend.bind_pipeline_vs(pipeline_id, vs_id);
+    backend.bind_pipeline(pipeline_id, fs_id);
+    let mut fb = FrameBuilder::new(4096);
+    let mut begin = [0u8; 12];
+    begin[..4].copy_from_slice(&image_id.raw().to_le_bytes());
+    fb.push(FrameOp::BeginRenderPass, &begin).unwrap();
+    fb.push(FrameOp::BindPipeline, &pipeline_id.raw().to_le_bytes()).unwrap();
+    fb.push_set_viewport(SetViewportCmd { x: 0.0, y: 0.0, width: N as f32, height: N as f32, min_depth: 0.0, max_depth: 1.0 }).unwrap();
+    fb.push_draw(DrawCmd { vertex_count: 3, instance_count: 1, first_vertex: 0, first_instance: 0 }).unwrap();
+    fb.push(FrameOp::EndRenderPass, &[]).unwrap();
+    backend.submit_frame(ResourceId::new(IdNamespace::IcdRuntime, 0xF234), 1, fb.as_bytes());
+    let pixels = backend.read_image_pixels(image_id).unwrap();
+    let at = |x: usize, y: usize| { let i = (y * N as usize + x) * 4; [pixels[i], pixels[i+1], pixels[i+2], pixels[i+3]] };
+    // gl_FragCoord.xy in pixels → u=x/N, v=y/N. R grows with x, G with y.
+    let tl = at(1, 1);
+    let br = at(30, 30);
+    eprintln!("fragcoord gradient TL={tl:?} BR={br:?}");
+    assert!(br[0] > 180 && br[1] > 180, "bottom-right bright (u,v→1), got {br:?}");
+    assert!(tl[0] < 60 && tl[1] < 60, "top-left dark (u,v→0), got {tl:?}");
+    // Red tracks x, green tracks y: a horizontal-only sample is red-dominant.
+    let right_mid = at(30, 2);
+    assert!(right_mid[0] > 180 && right_mid[1] < 60,
+        "right-but-top is red-dominant (high u, low v), got {right_mid:?}");
+}
+
 #[test]
 fn tier2_backend_scanout_nested_squares_via_scissor() {
     use aqueduct_gpu::frame::{DrawCmd, FrameBuilder, SetViewportCmd};

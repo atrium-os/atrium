@@ -413,9 +413,11 @@ impl InterfaceContext {
                                 Some(atrium_spv_ir::BuiltinKind::FrontFacing),
                             SpvBuiltIn::PrimitiveId =>
                                 Some(atrium_spv_ir::BuiltinKind::PrimitiveId),
-                            // Other builtins (Position, FragCoord, etc.)
-                            // already flow through the existing
-                            // varying / output paths; skip.
+                            SpvBuiltIn::FragCoord =>
+                                Some(atrium_spv_ir::BuiltinKind::FragCoord),
+                            // Remaining builtins (e.g. Position, the VS
+                            // output) flow through the varying / output
+                            // paths; skip.
                             _ => None,
                         };
                         if let Some(kind) = mapped { d.builtin = Some(kind); }

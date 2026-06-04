@@ -1187,6 +1187,13 @@ pub enum BuiltinKind {
     /// supplies it as the FS entry's trailing `primitive_id`
     /// parameter.
     PrimitiveId,
+    /// `gl_FragCoord` (Fragment only).  vec4 (window-space x, y,
+    /// depth z, 1/w).  Unlike the per-primitive fragment builtins
+    /// above, this varies per pixel: the rasterizer passes the
+    /// current fragment's coordinate as the FS entry's `frag_coord`
+    /// {x, y, z, w} parameters, and the backend materialises the
+    /// load as a 4-lane vector straight from them.
+    FragCoord,
 }
 
 // ── Module ──────────────────────────────────────────────────────
