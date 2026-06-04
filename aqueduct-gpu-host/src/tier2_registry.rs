@@ -2017,7 +2017,7 @@ fn rasterize_stripe(
         // barycentric / depth-interp / early-Z work.  A convex triangle's
         // covered pixels in a row form a single contiguous span; find it
         // with the same per-pixel edge test (bit-identical coverage) and
-        // fill it with the vectorized `fill_span`.
+        // fill it with `fill_span`.
         if let Some(cf) = cfast {
             for py in t_min_y..=t_max_y {
                 cfast_fill_row(&cf, task.pixels, setup,
