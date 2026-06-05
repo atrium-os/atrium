@@ -136,7 +136,7 @@ impl MoltenVkShaderRunner {
         self.backend.set_image_format(img, 37);
         self.backend.buffer_created(buf, (W * H * 4) as u64);
         self.backend
-            .draw_and_copy_full(img, buf, vs, fs, 3, [0, 0, 0, 255], &[], Some(ubo), None)
+            .draw_and_copy_full(img, buf, vs, fs, 3, [0, 0, 0, 255], &[], Some(ubo), None, false)
             .map_err(|e| BackendError::Unsupported(format!("moltenvk ubo draw failed: {e:?}")))?;
         self.read_center(buf, W, H)
     }
@@ -153,7 +153,7 @@ impl MoltenVkShaderRunner {
         self.backend.set_image_format(img, 37);
         self.backend.buffer_created(buf, (W * H * 4) as u64);
         self.backend
-            .draw_and_copy_full(img, buf, vs, fs, 3, [0, 0, 0, 255], &[], None, Some(tex))
+            .draw_and_copy_full(img, buf, vs, fs, 3, [0, 0, 0, 255], &[], None, Some(tex), false)
             .map_err(|e| BackendError::Unsupported(format!("moltenvk tex draw failed: {e:?}")))?;
         self.read_center(buf, W, H)
     }

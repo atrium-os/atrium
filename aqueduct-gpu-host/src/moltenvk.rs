@@ -993,7 +993,7 @@ impl MoltenVkBackend {
         clear_rgba: [u8; 4],
         push: &[u8],
     ) -> Result<(), vk::Result> {
-        self.draw_and_copy_full(image_id, dst_buffer_id, vs_spirv, fs_spirv, vertex_count, clear_rgba, push, None, None)
+        self.draw_and_copy_full(image_id, dst_buffer_id, vs_spirv, fs_spirv, vertex_count, clear_rgba, push, None, None, false)
     }
 
     /// Full draw path: optional push constants + an optional descriptor at
@@ -1013,6 +1013,7 @@ impl MoltenVkBackend {
         push: &[u8],
         ubo: Option<&[u8]>,
         tex: Option<TexBind>,
+        blend_srcover: bool,
     ) -> Result<(), vk::Result> {
         let _guard = self.submit_lock.lock().unwrap();
         let dev = &self.device;
@@ -1096,9 +1097,28 @@ impl MoltenVkBackend {
                 .line_width(1.0);
             let ms = vk::PipelineMultisampleStateCreateInfo::default()
                 .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-            let blend_attach = [vk::PipelineColorBlendAttachmentState::default()
-                .color_write_mask(vk::ColorComponentFlags::RGBA)
-                .blend_enable(false)];
+            // Blend: when `blend_srcover`, the hardware fixed-function blend
+            // unit runs SrcOver with the SAME factors as our Tier-2
+            // `apply_blend` (color: SrcAlpha / OneMinusSrcAlpha; alpha:
+            // One / OneMinusSrcAlpha; ADD) — so a clear-to-D + draw-S capture
+            // reads Metal's exact SrcOver(S, D) for tier-equivalence
+            // verification.  Otherwise blend is disabled (shader-output
+            // passthrough, the original behaviour).
+            let blend_attach = [if blend_srcover {
+                vk::PipelineColorBlendAttachmentState::default()
+                    .color_write_mask(vk::ColorComponentFlags::RGBA)
+                    .blend_enable(true)
+                    .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+                    .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                    .color_blend_op(vk::BlendOp::ADD)
+                    .src_alpha_blend_factor(vk::BlendFactor::ONE)
+                    .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                    .alpha_blend_op(vk::BlendOp::ADD)
+            } else {
+                vk::PipelineColorBlendAttachmentState::default()
+                    .color_write_mask(vk::ColorComponentFlags::RGBA)
+                    .blend_enable(false)
+            }];
             let cb_state = vk::PipelineColorBlendStateCreateInfo::default()
                 .attachments(&blend_attach);
             // Push-constant range (VERTEX|FRAGMENT) when push data is given.
