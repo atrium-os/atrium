@@ -11,11 +11,17 @@
  *       (the PSP firmware load), and initialize the MES scheduler — the
  *       handshake the model's referee requires before any queue/doorbell
  *       can be honored (device-reference §4 steps 2 + 5).
+ *   M3  first submit (proof of life): bring up GMC/IH, build a 2-level
+ *       GPUVM page table, lay a PM4 ring [NOP, RELEASE_MEM], map queue 0,
+ *       and ring the doorbell — the CP DMA-walks the page tables, fetches +
+ *       executes the ring, and DMA-writes a fence we read back. The first
+ *       *positive* confirmation (steps 3,4,6,7) the whole stack is alive.
  *
- * WHY one combined newbus driver here, not the §4.1 pci/gpu/display split:
- * through M2 the driver only proves "match the device, satisfy the bring-up
- * gates, and walk the model from cold → CP/MES up." The three-module split
- * earns its keep once GPUVM + submit add real surface area; introducing it
+ * WHY one combined file here, not the §4.2 gmc.c/cp.c/bo.c split (or the
+ * §4.1 three-kmod split): through M3 the driver is a single coherent
+ * "cold → alive → first submit" story that reads best in one place. The
+ * per-block files earn their keep once each grows real surface area —
+ * multiple engines/queues, BO lifecycle, eviction, an ioctl ABI; doing it
  * now would be structure without a reason for it (the very thing §2
  * rejects). Split when a block needs it.
  */
@@ -25,10 +31,14 @@
 #include <sys/kernel.h>
 #include <sys/systm.h>
 #include <sys/bus.h>
+#include <sys/malloc.h>
 #include <sys/rman.h>
 
 #include <machine/bus.h>
 #include <machine/resource.h>
+
+#include <vm/vm.h>
+#include <vm/pmap.h>
 
 #include <dev/pci/pcivar.h>
 #include <dev/pci/pcireg.h>
@@ -107,10 +117,87 @@
 #define ATRIUM_AMD_RESET_POLLS	1000		/* max polls (×10us = 10ms budget) */
 #define ATRIUM_AMD_RESET_DELAY	10		/* us between polls */
 
+/*
+ * Milestone-3 registers (real GFX12 offsets; gc()=GC aperture dword*4,
+ * oss()=OSS aperture base 0x1_0000 + dword*4, per device-reference §3 and
+ * engine/src/device.rs `regs`). GMC programs the GPUVM page-directory base
+ * for VMID 0 and enables paging; IH stands up the interrupt ring; the CP_RB0
+ * block maps the graphics ring (queue 0).
+ */
+#define regGMC_ENABLE		0x5890	/* GCVM_CONTEXT0_CNTL: enable paging */
+#define regPT_BASE_LO		0x5a3c	/* GCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32 */
+#define regPT_BASE_HI		0x5a40	/* ..._HI32 */
+#define regTLB_INVALIDATE	0x591c	/* GCVM_INVALIDATE_ENG0_REQ: flush GPU TLB */
+#define regIH_SIZE		0x10200	/* IH_RB_CNTL (ring size in entries) */
+#define regIH_BASE_LO		0x1020c	/* IH_RB_BASE */
+#define regIH_BASE_HI		0x10210	/* IH_RB_BASE_HI */
+#define regCP_RB0_BASE		0x7780	/* gfx ring base (register holds base>>8) */
+#define regCP_RB0_CNTL		0x7784	/* gfx ring size (bytes) */
+#define regCP_RB_DOORBELL_CONTROL 0x7a34	/* gfx ring doorbell offset (in BAR2) */
+#define regCP_ME_CNTL		0x200c	/* write 0: clear ME halt -> run the ring */
+
+/*
+ * GPUVM page-table entry valid bit (residency.rs PTE_VALID). The GMC
+ * DMA-walks a 2-level table: VA[29:21] indexes the page directory, VA[20:12]
+ * the page table; each entry is 8 bytes = (page-aligned phys) | PTE_VALID.
+ */
+#define ATRIUM_AMD_PTE_VALID	0x1ULL
+#define ATRIUM_AMD_PD_SHIFT	21	/* directory index = (va >> 21) & 0x1ff */
+#define ATRIUM_AMD_PT_SHIFT	12	/* table index     = (va >> 12) & 0x1ff */
+#define ATRIUM_AMD_PT_MASK	0x1ff
+
+/*
+ * PM4 type-3 packet encoding (engine/src/pm4.rs; header layout is public
+ * documented PM4, IT_ opcodes verified vs kfd_pm4_opcodes.h). We emit just
+ * the two packets the proof-of-life ring needs: a NOP and a RELEASE_MEM that
+ * DMA-writes a 64-bit fence and raises an end-of-pipe interrupt.
+ */
+#define PM4_TYPE3		3u
+#define IT_NOP			0x10u
+#define IT_RELEASE_MEM		0x49u
+/* RELEASE_MEM body field shifts/values (soc15d.h-derived). */
+#define RM_EVENT_INDEX_EOP_AT8	(5u << 8)	/* DWORD1: EVENT_INDEX = end-of-pipe */
+#define RM_DATA_SEL_64BIT_AT29	(2u << 29)	/* DWORD2: write a 64-bit value */
+#define RM_INT_SEL_ON_CONFIRM_AT24 (2u << 24)	/* DWORD2: IRQ when the write confirms */
+
+/* Ring/queue sizing: one page each; queue 0 doorbell lives at BAR2 offset 0. */
+#define ATRIUM_AMD_RING_BYTES	256	/* CP_RB0_CNTL value (matches reference) */
+#define ATRIUM_AMD_DOORBELL_OFF	0	/* queue 0 doorbell offset within BAR2 */
+
+/* GPU-VAs for the proof-of-life buffers (arbitrary, page-aligned, same PD). */
+#define ATRIUM_AMD_RING_VA	0x200000ULL
+#define ATRIUM_AMD_FENCE_VA	0x201000ULL
+/* A recognizable 64-bit fence value; both halves nonzero to exercise DATA_SEL_64BIT. */
+#define ATRIUM_AMD_FENCE_MAGIC	0xcafef00ddeadbeefULL
+
+/* Doorbell BAR (BAR2): 64-bit MMIO doorbell page (device-reference §5). */
+#define ATRIUM_AMD_DOORBELL_BAR	PCIR_BAR(2)
+
+/* Small fixed registry of DMA pages (page tables + ring + fence + IH). */
+#define ATRIUM_AMD_MAX_DMA	16
+
+/*
+ * A page of DMA-able guest memory: its kernel virtual address (where the CPU
+ * reads/writes) and its guest-physical address (what the device DMA-walks).
+ * In a VM with no IOMMU on this device, gpa == vtophys(kva) — see amd_dma_alloc.
+ */
+struct atrium_amd_dma_page {
+	void		*kva;
+	vm_paddr_t	 gpa;
+};
+
 struct atrium_amd_softc {
 	device_t	 dev;
 	struct resource	*regs;		/* BAR5 MMIO register file */
 	int		 regs_rid;
+	struct resource	*doorbell;	/* BAR2 doorbell page */
+	int		 doorbell_rid;
+
+	void		*pdb_kva;	/* GPUVM page-directory base (VMID 0) */
+	vm_paddr_t	 pdb_gpa;
+
+	struct atrium_amd_dma_page dma[ATRIUM_AMD_MAX_DMA];
+	int		 n_dma;
 };
 
 /*
@@ -139,6 +226,188 @@ amd_mmio_write32(struct atrium_amd_softc *sc, bus_size_t reg, uint32_t val)
 	bus_write_4(sc->regs, reg, val);
 }
 
+/*
+ * PM4 type-3 header (leaf, §3.3 — pure encoding, no state/control flow):
+ * type[31:30] | (body_dwords-1)[29:16] | opcode[15:8]. Public PM4 layout.
+ */
+static inline uint32_t
+amd_pm4_type3_header(uint32_t opcode, uint32_t body_dwords)
+{
+	return ((PM4_TYPE3 << 30) | (((body_dwords - 1) & 0x3fff) << 16) |
+	    (opcode << 8));
+}
+
+/*
+ * Allocate one page of DMA-able guest memory and register it. Returns the
+ * kernel VA (CPU side) and, via *gpa_out, the guest-physical address the
+ * device DMA-walks.
+ *
+ * WHY contigmalloc + vtophys, not busdma here: gpusim runs in a VM with no
+ * IOMMU on this device, so the guest-physical address IS the address the
+ * model's DMA backend (QEMU pci_dma_read/write) uses — vtophys() of a
+ * single page-aligned page gives exactly that. Real silicon will need
+ * bus_dma tags + bus_dmamap_sync (IOMMU translation + cache maintenance);
+ * that lands with the BO allocator (bo.c, §4.2), not in this proof-of-life.
+ */
+static void *
+amd_dma_alloc(struct atrium_amd_softc *sc, vm_paddr_t *gpa_out)
+{
+	void *kva;
+
+	if (sc->n_dma >= ATRIUM_AMD_MAX_DMA)
+		return (NULL);
+	kva = contigmalloc(PAGE_SIZE, M_DEVBUF, M_WAITOK | M_ZERO, 0,
+	    BUS_SPACE_MAXADDR, PAGE_SIZE, 0);
+	if (kva == NULL)
+		return (NULL);
+	sc->dma[sc->n_dma].kva = kva;
+	sc->dma[sc->n_dma].gpa = vtophys(kva);
+	*gpa_out = sc->dma[sc->n_dma].gpa;
+	sc->n_dma++;
+	return (kva);
+}
+
+/*
+ * Map a registered DMA page's guest-physical address back to its kernel VA —
+ * needed when the GPUVM walker reuses a page-table page we already allocated
+ * (we hold the PDE's phys, but must write PTEs through the CPU mapping).
+ */
+static void *
+amd_dma_kva(struct atrium_amd_softc *sc, vm_paddr_t gpa)
+{
+	int i;
+
+	for (i = 0; i < sc->n_dma; i++)
+		if (sc->dma[i].gpa == gpa)
+			return (sc->dma[i].kva);
+	return (NULL);
+}
+
+/*
+ * Edit the 2-level GPUVM page table to map GPU-VA `va` -> guest-physical
+ * `phys`, allocating a page-table page on demand, then flush the GPU TLB so
+ * the device does not walk a stale cached translation (referee INV-GMC-0004).
+ * Mirrors the model's walk (residency.rs): PDE at pdb[va>>21], PTE at
+ * pt[va>>12], each = (page-aligned phys) | PTE_VALID.
+ */
+static int
+amd_gpuvm_map(struct atrium_amd_softc *sc, uint64_t va, vm_paddr_t phys)
+{
+	uint64_t *pde, *pt_kva;
+	vm_paddr_t pt_gpa;
+	uint32_t pd_i, pt_i;
+
+	pd_i = (va >> ATRIUM_AMD_PD_SHIFT) & ATRIUM_AMD_PT_MASK;
+	pt_i = (va >> ATRIUM_AMD_PT_SHIFT) & ATRIUM_AMD_PT_MASK;
+	pde = (uint64_t *)((char *)sc->pdb_kva + pd_i * 8);
+
+	if ((*pde & ATRIUM_AMD_PTE_VALID) == 0) {
+		pt_kva = amd_dma_alloc(sc, &pt_gpa);
+		if (pt_kva == NULL)
+			return (ENOMEM);
+		*pde = (pt_gpa & ~0xfffULL) | ATRIUM_AMD_PTE_VALID;
+	} else {
+		pt_gpa = *pde & ~0xfffULL;
+		pt_kva = amd_dma_kva(sc, pt_gpa);
+		if (pt_kva == NULL)
+			return (ENXIO);
+	}
+	pt_kva[pt_i] = ((uint64_t)phys & ~0xfffULL) | ATRIUM_AMD_PTE_VALID;
+
+	amd_mmio_write32(sc, regTLB_INVALIDATE, 1);
+	return (0);
+}
+
+/*
+ * Proof-of-life submit (the milestone-3 deliverable): map a ring + a fence
+ * buffer, lay a PM4 ring [NOP, RELEASE_MEM(fence, irq)], map queue 0 onto the
+ * gfx ring, and ring its doorbell. The model's CP DMA-fetches the ring,
+ * executes it, and DMA-writes the 64-bit fence value back into our buffer.
+ * Reading that value back == positive proof the whole stack is alive (without
+ * firmware+MES the doorbell would leave the ring undrained — referee
+ * doorbell_before_firmware / INV-QUEUE-0001). Returns the fence read back.
+ */
+static uint64_t
+amd_submit_runjob(struct atrium_amd_softc *sc)
+{
+	void *ring_kva, *fence_kva;
+	vm_paddr_t ring_gpa, fence_gpa;
+	volatile uint64_t *fence;
+	uint32_t *r;
+	int n;
+
+	ring_kva = amd_dma_alloc(sc, &ring_gpa);
+	fence_kva = amd_dma_alloc(sc, &fence_gpa);
+	if (ring_kva == NULL || fence_kva == NULL)
+		return (0);
+	if (amd_gpuvm_map(sc, ATRIUM_AMD_RING_VA, ring_gpa) != 0 ||
+	    amd_gpuvm_map(sc, ATRIUM_AMD_FENCE_VA, fence_gpa) != 0)
+		return (0);
+
+	/* Lay the ring (9 dwords). NOP{count=1} = header + 1 pad dword. */
+	r = (uint32_t *)ring_kva;
+	n = 0;
+	r[n++] = amd_pm4_type3_header(IT_NOP, 1);
+	r[n++] = 0;
+	/* RELEASE_MEM: header + 6 body (event ctl, data/int ctl, addr, value). */
+	r[n++] = amd_pm4_type3_header(IT_RELEASE_MEM, 6);
+	r[n++] = RM_EVENT_INDEX_EOP_AT8;
+	r[n++] = RM_DATA_SEL_64BIT_AT29 | RM_INT_SEL_ON_CONFIRM_AT24;
+	r[n++] = (uint32_t)(ATRIUM_AMD_FENCE_VA & 0xffffffff);
+	r[n++] = (uint32_t)(ATRIUM_AMD_FENCE_VA >> 32);
+	r[n++] = (uint32_t)(ATRIUM_AMD_FENCE_MAGIC & 0xffffffff);
+	r[n++] = (uint32_t)(ATRIUM_AMD_FENCE_MAGIC >> 32);
+
+	/*
+	 * Map queue 0 onto the gfx ring via the real CP_RB0_* registers (ring
+	 * base holds VA>>8), point its doorbell at BAR2 offset 0, then clear
+	 * the ME halt so the CP will run the ring once doorbelled.
+	 */
+	amd_mmio_write32(sc, regCP_RB0_BASE, (uint32_t)(ATRIUM_AMD_RING_VA >> 8));
+	amd_mmio_write32(sc, regCP_RB0_CNTL, ATRIUM_AMD_RING_BYTES);
+	amd_mmio_write32(sc, regCP_RB_DOORBELL_CONTROL, ATRIUM_AMD_DOORBELL_OFF);
+	amd_mmio_write32(sc, regCP_ME_CNTL, 0);
+
+	/*
+	 * Ring the doorbell: write the new write-pointer (in dwords) to the
+	 * queue's doorbell in BAR2. The model drains the ring synchronously
+	 * within this MMIO write — the fence is in guest RAM before it returns.
+	 * (In a VM the MMIO trap serializes our prior ring/PTE stores ahead of
+	 * the device's DMA read; real HW adds bus_dmamap_sync.)
+	 */
+	bus_write_4(sc->doorbell, ATRIUM_AMD_DOORBELL_OFF, n);
+
+	fence = (volatile uint64_t *)fence_kva;
+	return (*fence);
+}
+
+/*
+ * Release everything attach acquired: the DMA pages (page tables, ring,
+ * fence, IH) and the two BAR resources. Safe to call partway through a failed
+ * attach — every field is NULL/zero until its step runs. Used by both the
+ * attach error paths and detach (sc->dev is set before anything is acquired).
+ */
+static void
+amd_teardown(struct atrium_amd_softc *sc)
+{
+	int i;
+
+	for (i = 0; i < sc->n_dma; i++)
+		free(sc->dma[i].kva, M_DEVBUF);
+	sc->n_dma = 0;
+	sc->pdb_kva = NULL;
+	if (sc->doorbell != NULL) {
+		bus_release_resource(sc->dev, SYS_RES_MEMORY,
+		    sc->doorbell_rid, sc->doorbell);
+		sc->doorbell = NULL;
+	}
+	if (sc->regs != NULL) {
+		bus_release_resource(sc->dev, SYS_RES_MEMORY, sc->regs_rid,
+		    sc->regs);
+		sc->regs = NULL;
+	}
+}
+
 static int
 atrium_amd_probe(device_t dev)
 {
@@ -155,6 +424,8 @@ atrium_amd_attach(device_t dev)
 {
 	struct atrium_amd_softc *sc = device_get_softc(dev);
 	uint32_t id, grbm;
+	vm_paddr_t ih_gpa;
+	uint64_t fence;
 	int i;
 
 	sc->dev = dev;
@@ -174,6 +445,17 @@ atrium_amd_attach(device_t dev)
 	    RF_ACTIVE);
 	if (sc->regs == NULL) {
 		device_printf(dev, "failed to map BAR5 (MMIO register file)\n");
+		return (ENXIO);
+	}
+
+	/* BAR2 = the doorbell page (device-reference §5); queue 0 rings here. */
+	sc->doorbell_rid = ATRIUM_AMD_DOORBELL_BAR;
+	sc->doorbell = bus_alloc_resource_any(dev, SYS_RES_MEMORY,
+	    &sc->doorbell_rid, RF_ACTIVE);
+	if (sc->doorbell == NULL) {
+		device_printf(dev, "failed to map BAR2 (doorbell)\n");
+		bus_release_resource(dev, SYS_RES_MEMORY, sc->regs_rid,
+		    sc->regs);
 		return (ENXIO);
 	}
 
@@ -200,12 +482,12 @@ atrium_amd_attach(device_t dev)
 	    grbm);
 
 	/*
-	 * Milestone 2 (design §8): bring the GPU alive — reset, load CP
-	 * firmware, init the MES. The order is load-bearing: a full reset
-	 * tears down the CP, so firmware must be (re)loaded after it, and the
-	 * MES rides on the CP microcode so it can only come up once firmware
-	 * is loaded. The model's referee enforces exactly this ordering
-	 * (a doorbell before firmware, or a queue map before the MES, faults).
+	 * Milestones 2-3 (design §8): walk the device cold -> alive -> first
+	 * submit. The order is load-bearing and the model's referee enforces
+	 * it: a full reset tears down the CP, so firmware reloads after it; the
+	 * MES rides on the CP microcode (firmware before MES); and a doorbell
+	 * before firmware, or a queue map before MES, faults. GMC/IH come up
+	 * first so the CP has page tables + an interrupt ring to use.
 	 *
 	 * Step 1 — reset to a known state. A from-scratch driver inherits the
 	 * device in whatever state firmware/a prior driver left it; reset to
@@ -222,29 +504,56 @@ atrium_amd_attach(device_t dev)
 	if (i == ATRIUM_AMD_RESET_POLLS) {
 		device_printf(dev, "GPU reset did not latch (RESET_STATUS "
 		    "stuck at 0)\n");
-		bus_release_resource(dev, SYS_RES_MEMORY, sc->regs_rid,
-		    sc->regs);
+		amd_teardown(sc);
 		return (ENXIO);
 	}
 	amd_mmio_write32(sc, regRESET_ACK, 1);
 	if (amd_mmio_read32(sc, regRESET_STATUS) != 0) {
 		device_printf(dev, "GPU reset window did not close after ACK "
 		    "(RESET_STATUS still 1)\n");
-		bus_release_resource(dev, SYS_RES_MEMORY, sc->regs_rid,
-		    sc->regs);
+		amd_teardown(sc);
 		return (ENXIO);
 	}
 	device_printf(dev, "GPU reset complete (REQ -> STATUS=1 -> ACK -> "
 	    "STATUS=0)\n");
 
 	/*
-	 * Step 2 — load CP firmware (models the PSP loading the CP microcode).
+	 * Step 2 — GMC init: allocate the GPUVM page-directory base for the
+	 * kernel context (VMID 0), program it, and enable paging. After this
+	 * the device DMA-walks the page tables amd_gpuvm_map builds.
+	 */
+	sc->pdb_kva = amd_dma_alloc(sc, &sc->pdb_gpa);
+	if (sc->pdb_kva == NULL) {
+		device_printf(dev, "failed to allocate page-directory base\n");
+		amd_teardown(sc);
+		return (ENOMEM);
+	}
+	amd_mmio_write32(sc, regPT_BASE_LO, (uint32_t)(sc->pdb_gpa & 0xffffffff));
+	amd_mmio_write32(sc, regPT_BASE_HI, (uint32_t)(sc->pdb_gpa >> 32));
+	amd_mmio_write32(sc, regGMC_ENABLE, 1);
+
+	/*
+	 * Step 3 — IH init: stand up the interrupt-handler ring so the CP's
+	 * end-of-pipe RELEASE_MEM has somewhere to write its cookie. (We don't
+	 * install an ISR at this milestone — the fence read-back is the proof;
+	 * the IRQ path is exercised but its delivery is not yet consumed.)
+	 */
+	if (amd_dma_alloc(sc, &ih_gpa) == NULL) {
+		device_printf(dev, "failed to allocate IH ring\n");
+		amd_teardown(sc);
+		return (ENOMEM);
+	}
+	amd_mmio_write32(sc, regIH_BASE_LO, (uint32_t)(ih_gpa & 0xffffffff));
+	amd_mmio_write32(sc, regIH_BASE_HI, (uint32_t)(ih_gpa >> 32));
+	amd_mmio_write32(sc, regIH_SIZE, 256);
+
+	/*
+	 * Step 4 — load CP firmware (models the PSP loading the CP microcode).
 	 * Stage the ucode version, then activate. The model refuses a version
 	 * below CP_FW_MIN_VERSION; we stage exactly the minimum since there is
 	 * no real blob behind the model. cp_fw_loaded is not read-back-able,
 	 * so this is verified by construction (correct version, post-reset
-	 * order) — its effect shows up later when a doorbell is honored
-	 * instead of faulting.
+	 * order) — its effect shows up in step 6 when the doorbell is honored.
 	 */
 	amd_mmio_write32(sc, regFW_CP_VERSION, ATRIUM_AMD_CP_FW_VERSION);
 	amd_mmio_write32(sc, regFW_CP_LOAD, 1);
@@ -252,12 +561,28 @@ atrium_amd_attach(device_t dev)
 	    ATRIUM_AMD_CP_FW_VERSION);
 
 	/*
-	 * Step 3 — initialize the MES scheduler. Gated on the CP firmware
-	 * above; the MES is what reads a queue descriptor and activates an
-	 * HQD, so it must be up before any queue can be mapped (milestone 3).
+	 * Step 5 — initialize the MES scheduler. Gated on the CP firmware
+	 * above; the MES is what reads a queue descriptor and activates a
+	 * queue, so it must be up before the submit in step 6.
 	 */
 	amd_mmio_write32(sc, regMES_INIT, 1);
 	device_printf(dev, "MES initialized — GPU alive\n");
+
+	/*
+	 * Step 6 (milestone 3) — proof of life: map a ring + fence, lay a PM4
+	 * [NOP, RELEASE_MEM] ring, map queue 0, ring the doorbell, read back
+	 * the fence the CP DMA-wrote. A correct magic value end-to-end proves
+	 * GPUVM translation + queue map + PM4 execution + DMA write-back all
+	 * work — the first positive confirmation, not a by-construction one.
+	 */
+	fence = amd_submit_runjob(sc);
+	if (fence == ATRIUM_AMD_FENCE_MAGIC)
+		device_printf(dev, "submit OK: fence = 0x%016jx (ring drained, "
+		    "CP wrote it back)\n", (uintmax_t)fence);
+	else
+		device_printf(dev, "submit FAILED: fence = 0x%016jx, expected "
+		    "0x%016jx\n", (uintmax_t)fence,
+		    (uintmax_t)ATRIUM_AMD_FENCE_MAGIC);
 
 	return (0);
 }
@@ -267,9 +592,7 @@ atrium_amd_detach(device_t dev)
 {
 	struct atrium_amd_softc *sc = device_get_softc(dev);
 
-	if (sc->regs != NULL)
-		bus_release_resource(dev, SYS_RES_MEMORY, sc->regs_rid,
-		    sc->regs);
+	amd_teardown(sc);
 	return (0);
 }
 
@@ -288,4 +611,4 @@ static driver_t atrium_amd_driver = {
 
 DRIVER_MODULE(atrium_gpu_amd, pci, atrium_amd_driver, NULL, NULL);
 MODULE_DEPEND(atrium_gpu_amd, pci, 1, 1, 1);
-MODULE_VERSION(atrium_gpu_amd, 2);
+MODULE_VERSION(atrium_gpu_amd, 3);
