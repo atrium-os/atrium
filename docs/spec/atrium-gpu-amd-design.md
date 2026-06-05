@@ -252,9 +252,34 @@ Where the same logical operation runs on multiple hardware blocks
 (e.g., command submission via CP or SDMA), we have explicit per-
 block functions, not a `submit_to_engine(engine_id, ...)` switch
 dispatcher. Reading `amd_cp_submit()` tells you about CP. Reading
-`amd_sdma_submit()` tells you about SDMA. They share *no code*
-unless that code is *genuinely* identical (in which case it lives
-in a small `ring_helpers.c` — not as a virtual method).
+`amd_sdma_submit()` tells you about SDMA.
+
+**Code sharing is allowed, in three named tiers — by prefix, never
+as a vtable or dispatcher:**
+
+- **Common** (`ring_*`, `mmio_*`) — chip-agnostic mechanics: ring
+  reserve/commit, dword packing, the raw MMIO accessor. No chip
+  knowledge. Lives in `ring_helpers.c`.
+- **Family** (`rdna4_*`) — GFX12-wide conventions shared across
+  blocks: PTE/PDE encoding, PM4/MES packet formats, doorbell-offset
+  math, fence-packet layout. `gmc.c`, `cp.c`, and `sdma.c` all use
+  them, so centralizing avoids three divergent copies. Lives in
+  `rdna4_common.c`.
+- **Block** (`amd_<block>_*`) — the bring-up and operation of one
+  hardware block. Lives in `gmc.c`, `cp.c`, `sdma.c`, …
+
+The hard rule that keeps the Family tier from becoming the framework
+§2 rejects: **`rdna4_*` helpers are leaf utilities — stateless
+format/encode/accessor functions. They own no control flow, hold no
+state, and never call back into a block.** A block file calls
+`rdna4_pte_encode()`; `rdna4_*` never calls `amd_gmc_*`. The moment a
+family helper owns control flow or mutable state, it has become a
+framework — delete it and inline.
+
+This tier is *within* a generation module. When
+`atrium-gpu-amd-rdna2.ko` arrives it carries its own `rdna2_*` family
+tier; the ~70% cross-generation duplication (§5.4) stays by design.
+Family sharing deduplicates *within* a generation, never across one.
 
 ### 3.4 Native VM primitives, no TTM
 
@@ -380,6 +405,12 @@ atrium-gpu-amd/
 │ # Bring-up
 ├── module.c                 # newbus probe/attach + cdev registration
 ├── firmware.c               # PSP-loaded firmware: SMU, CP, MEC, SDMA, RLC
+
+│ # Shared helpers — leaf utilities only, no control flow (§3.3)
+├── ring_helpers.c           # Common tier: chip-agnostic ring/MMIO mechanics
+├── rdna4_common.c           # Family tier: GFX12-wide formats (PTE, PM4/MES
+│                            #   packets, doorbell, fence); rdna4_* leaf helpers
+├── rdna4_common.h
 
 │ # Core abstractions (each = one hardware block)
 ├── gmc.c                    # Graphics Memory Controller (page tables, GTT)
@@ -702,6 +733,31 @@ update them when reality changes.
  * submission paths. With refcount, BO release is deterministic —
  * ref hits 0, free runs synchronously. For a kernel module, this
  * is the right trade.
+ */
+```
+
+`rdna4_common.c` opens with the guardrail that keeps the Family
+sharing tier (§3.3) from sliding into a framework:
+
+```c
+/*
+ * Family tier (rdna4_*): GFX12-wide leaf utilities shared by the
+ * block files — PTE/PDE encoding, PM4/MES packet formats, doorbell
+ * math, fence-packet layout. See ../README.md §3.3.
+ *
+ * WHY a separate tier from ring_helpers.c: these encode GFX12-
+ * SPECIFIC formats, so they're not chip-agnostic (ring_helpers' bar).
+ * And gmc.c, cp.c, AND sdma.c all use them, so inlining would mean
+ * three divergent copies of one bit layout — the classic source of
+ * "works on CP, subtly wrong on SDMA" bugs.
+ *
+ * WHY this is not the framework §2 rejects: every function here is a
+ * LEAF. It takes values, returns encoded values, touches no driver
+ * state, and never calls back into amd_<block>_*. No dispatch, no
+ * vtable, no rdna4_do(block, op). A block calls down into rdna4_*;
+ * rdna4_* never calls up. The day a helper here needs control flow or
+ * state, it has stopped being a format helper — inline it into the
+ * block that needs it.
  */
 ```
 
