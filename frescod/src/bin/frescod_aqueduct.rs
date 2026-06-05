@@ -701,6 +701,14 @@ fn bbox_union(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
     [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]
 }
 
+/// Do two AABBs (`[x0,y0,x1,y1]`) overlap?  Used by the level-3 partial
+/// path to CULL nodes whose bbox doesn't intersect the damage scissor —
+/// so an unchanged glyph run in a big text window costs no per-glyph
+/// setup on a small-edit frame, not just no per-pixel fill.
+fn bbox_intersects(a: [f32; 4], b: [f32; 4]) -> bool {
+    a[0] < b[2] && b[0] < a[2] && a[1] < b[3] && b[1] < a[3]
+}
+
 /// Clip an AABB to a window (0, 0, w, h) and snap to integer pixel
 /// extents. Returns None if the rect is empty after clipping.
 fn clip_and_snap(bb: [f32; 4], win_w: u32, win_h: u32) -> Option<(u32, u32, u32, u32)> {
@@ -1000,6 +1008,24 @@ fn render_one_frame_multipass(
                 };
 
             let mut fb = client.frame_builder();
+            // On the partial path, cull nodes whose bbox doesn't intersect
+            // the scissor: they contribute no pixels inside it, so skipping
+            // them saves the per-node SETUP (VS + triangle setup — the
+            // dominant tier-2 text cost), not just the per-pixel fill the
+            // scissor already clips.  The node bboxes are the same ones we
+            // just computed for damage detection, so this is nearly free.
+            // `None` ⇒ full pass, emit everything.
+            // Inflate the cull rect by 1px: a false-CULL (dropping a node
+            // that touches the scissor) is a visible 1px artifact, while a
+            // false-KEEP is merely wasted setup — so bias conservative and
+            // only cull nodes CLEARLY (>1px) outside the damage, covering
+            // sub-pixel bbox positions + integer scissor snapping.
+            let cull: Option<[f32; 4]> = if go_partial {
+                clip.map(|(dx, dy, dw, dh)| {
+                    [dx as f32 - 1.0, dy as f32 - 1.0,
+                     (dx + dw) as f32 + 1.0, (dy + dh) as f32 + 1.0]
+                })
+            } else { None };
             if go_partial {
                 let (dx, dy, dw, dh) = clip.unwrap();
                 prof.partial_passes += 1;
@@ -1016,18 +1042,30 @@ fn render_one_frame_multipass(
             }
             if let Some(state) = fe.window_state(*win_id) {
                 for p in state.rect_nodes.values() {
+                    if let Some(cb) = cull {
+                        if !bbox_intersects(rect_bbox(p), cb) { continue; }
+                    }
                     fresco_aqueduct_bridge::translate_rect(&mut fb, p)?;
                 }
                 for p in state.path_nodes.values() {
+                    if let Some(cb) = cull {
+                        if !bbox_intersects(path_bbox(p), cb) { continue; }
+                    }
                     fresco_aqueduct_bridge::translate_path(&mut fb, p)?;
                 }
                 for p in state.texture_nodes.values() {
+                    if let Some(cb) = cull {
+                        if !bbox_intersects(texture_bbox(p), cb) { continue; }
+                    }
                     let Some(slot) = slot_images.get(&p.slot_id) else { continue; };
                     fresco_aqueduct_bridge::translate_texture(
                         &mut fb, p, slot.image, slot.width, slot.height,
                     )?;
                 }
                 for p in state.glyph_run_nodes.values() {
+                    if let Some(cb) = cull {
+                        if !bbox_intersects(glyph_run_bbox(p), cb) { continue; }
+                    }
                     let Some(slot) = slot_images.get(&p.atlas_slot_id) else { continue; };
                     fresco_aqueduct_bridge::translate_glyph_run(
                         &mut fb, p, slot.image,
