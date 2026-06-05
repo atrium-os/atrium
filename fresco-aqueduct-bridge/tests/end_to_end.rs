@@ -275,3 +275,89 @@ fn _unused_idnamespace_warning_suppressor() {
     // Imports referenced by docs only.
     let _ = IdNamespace::Builtin;
 }
+
+/// Proves the correctness invariant behind frescod's level-3 damage-rect
+/// NODE CULLING (frescod_aqueduct.rs): on a partial pass
+/// (`begin_renderpass_no_clear` + `set_scissor`), a node whose geometry
+/// lies entirely OUTSIDE the scissor contributes ZERO pixels — so emitting
+/// it (no cull) and not emitting it (cull) produce byte-IDENTICAL output.
+/// The daemon's cull skips exactly such nodes (bbox ∩ scissor == ∅), so it
+/// cannot change a rendered frame; it only saves their setup. This also
+/// validates that the SoftwareBackend actually honours SET_SCISSOR (a node
+/// inside the frame but outside the scissor must not draw).
+#[test]
+fn offscreen_node_in_partial_pass_contributes_nothing() {
+    // Render base(blue) → partial(no_clear + scissor over A) emitting the
+    // given rects; return the read-back RGBA8.
+    fn render(emit_b: bool) -> Vec<u8> {
+        let sock = tmp_socket(if emit_b { "cull-ab" } else { "cull-a" });
+        let sw = Arc::new(SoftwareBackend::new());
+        let backend: Arc<dyn Backend> = sw.clone();
+        let listener = Listener::bind(&sock, backend).unwrap();
+        let server = thread::spawn(move || { let _ = listener.accept_loop(); });
+        thread::sleep(Duration::from_millis(50));
+
+        let conn = Connection::connect(&sock).unwrap();
+        let mut client = GpuClient::new(conn);
+        client.handshake(ClientKind::FrescodRenderer).unwrap();
+        let mem = client.allocate_memory(64 * 64 * 4, MemoryUsage::ImageBacking).unwrap();
+        let target = client.create_image(aqueduct_gpu::payloads::ImageCreatePayload {
+            image_id: ResourceId(0), backing_region: mem.region_id,
+            region_offset: 0, format: 37, width: 64, height: 64, depth: 1,
+            mip_levels: 1, array_layers: 1, usage: 0x07,
+        }).unwrap();
+        thread::sleep(Duration::from_millis(30));
+        let fence = client.create_fence().unwrap();
+
+        // Frame 1: full clear to blue — the retained base.
+        let mut fb = client.frame_builder();
+        fresco_aqueduct_bridge::begin_renderpass(&mut fb, target, [0, 0, 255, 255]).unwrap();
+        fresco_aqueduct_bridge::end_renderpass(&mut fb).unwrap();
+        client.submit_frame(fence, fb, 1).unwrap();
+        let _ = client.wait_fence(fence, 1_000_000_000);
+
+        // Frame 2: PARTIAL — no-clear + scissor over A's region [8,24)².
+        // A (red) is inside the scissor; B (green) is at [40,56)², fully
+        // outside it — the exact case the daemon's cull drops.
+        let mut fb = client.frame_builder();
+        fresco_aqueduct_bridge::begin_renderpass_no_clear(&mut fb, target).unwrap();
+        fresco_aqueduct_bridge::set_scissor(&mut fb, 8, 8, 16, 16).unwrap();
+        fresco_aqueduct_bridge::translate_rect(&mut fb, &fp::RectParams {
+            x: 8.0, y: 8.0, w: 16.0, h: 16.0, r: 1.0, g: 0.0, b: 0.0, a: 1.0,
+        }).unwrap();
+        if emit_b {
+            fresco_aqueduct_bridge::translate_rect(&mut fb, &fp::RectParams {
+                x: 40.0, y: 40.0, w: 16.0, h: 16.0, r: 0.0, g: 1.0, b: 0.0, a: 1.0,
+            }).unwrap();
+        }
+        fresco_aqueduct_bridge::end_renderpass(&mut fb).unwrap();
+        client.submit_frame(fence, fb, 2).unwrap();
+        let _ = client.wait_fence(fence, 1_000_000_000);
+        thread::sleep(Duration::from_millis(50));
+
+        let px = sw.read_image_pixels(target).expect("pixels");
+        drop(client);
+        let _ = server;
+        let _ = std::fs::remove_file(&sock);
+        px
+    }
+
+    let with_b = render(true);    // no cull (emit the off-scissor node)
+    let without_b = render(false); // cull (skip it)
+    let at = |buf: &[u8], x: usize, y: usize| {
+        let o = (y * 64 + x) * 4;
+        [buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]
+    };
+
+    // THE INVARIANT: emitting vs culling the off-scissor node is identical.
+    assert_eq!(with_b, without_b,
+        "off-scissor node changed the framebuffer — culling would be unsafe \
+         (or SET_SCISSOR is not honoured)");
+
+    // Meaningful, not vacuous: A actually drew (red) inside the scissor...
+    assert_eq!(at(&without_b, 16, 16), [255, 0, 0, 255], "A should be red");
+    // ...and B's region stayed the base blue (scissor clipped it out, proving
+    // the SW backend honours the scissor — the precondition for the cull).
+    assert_eq!(at(&with_b, 48, 48), [0, 0, 255, 255],
+        "B region must remain base blue — scissor must clip the off-region draw");
+}
