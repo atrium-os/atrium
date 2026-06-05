@@ -2,8 +2,10 @@
 
 **Status:** design, 2026-05-08.
 **Owner:** D5 atrium-mesa track + native FreeBSD GPU drivers.
-**Scope:** the AMD RDNA2 kernel module + companion display module that
-implements the Atrium GPU ABI. Companion to
+**Scope:** the AMD RDNA4 kernel module + companion display module that
+implements the Atrium GPU ABI. RDNA4 (Navi 44/48, GFX12 — RX 9000 series) is
+the project's primary bring-up target and the generation the gpusim functional
+model targets (see §5.4). Companion to
 [`gpu-abi.md`](gpu-abi.md) (the binding ABI surface) and
 [`atrium-gpu-abi-v2.md`](atrium-gpu-abi-v2.md) (next-revision ABI work).
 
@@ -59,7 +61,7 @@ accidental change in TTM affects every vendor.
 
 **atrium-gpu-amd has zero framework abstractions for hypothetical
 other vendors.** It is not "DRM-shaped with AMD code in the hooks."
-It is an AMD RDNA2 driver. Top-level ioctl handlers do the actual
+It is an AMD RDNA4 driver. Top-level ioctl handlers do the actual
 work. Hardware register writes appear at leaf functions, not eight
 levels of indirection deep.
 
@@ -233,7 +235,7 @@ sees it.
 ### 3.3 Hardware-block-shaped abstractions
 
 The driver's file structure mirrors the chip's actual block diagram.
-RDNA2 has:
+RDNA4 has:
 
 - **GMC** (Graphics Memory Controller) — page tables for GPU virtual memory
 - **CP** (Command Processor) — graphics + compute ring buffers, doorbell
@@ -398,10 +400,10 @@ atrium-gpu-amd/
 
 │ # Hardware spec
 ├── reg/
-│   ├── gc_10_3_0.h         # Graphics Core registers (RDNA2)
-│   ├── mmhub_2_3_0.h       # MMHub (memory hub) registers
-│   ├── nbio_2_3_0.h        # Northbridge IO registers
-│   └── osssys_4_0_0.h      # OS-system interface registers
+│   ├── gc_12_0_1.h         # Graphics Core registers (RDNA4 / GFX12, Navi 48)
+│   ├── mmhub_<ver>.h       # MMHub (memory hub) — RDNA4 IP ver per discovery table
+│   ├── nbio_<ver>.h        # Northbridge IO     — RDNA4 IP ver per discovery table
+│   └── osssys_<ver>.h      # OS-system interface — RDNA4 IP ver per discovery table
 
 │ # Tests (co-located; see §3.6)
 └── tests/
@@ -425,7 +427,7 @@ atrium-gpu-amd-display/
 ├── plane.c                  # Primary/cursor planes
 ├── flip.c                   # Page flip + vblank delivery
 ├── reg/
-│   └── dcn_3_0.h           # DCN 3.0 registers (RDNA2 era)
+│   └── dcn_4_0_1.h         # DCN 4.0.1 registers (RDNA4 era)
 └── tests/
     ├── test_connector.c
     └── test_mode.c
@@ -499,32 +501,46 @@ every other file. V2's DPM addition doesn't touch `bo.c` or
 amdgpu, where power-management state checks appear inside command
 submission paths because they evolved together.
 
-### 5.4 GPU family scope: RDNA2-only V1, RDNA3 as additive module
+### 5.4 GPU family scope: RDNA4-only V1, other generations as additive modules
 
-We pick **one** GPU family and write a driver for it. RDNA2 (Navi
-21/22/23) because:
+We pick **one** GPU family and write a driver for it. **RDNA4**
+(Navi 44/48, GFX12 — RX 9000 series) because:
 
-- Modern enough to be a current programming target (chiplet-aware
-  layouts, RT cores, mesh shaders)
-- Mature enough that AMD documentation is comprehensive
-- Common enough in the wild for real users to have hardware
-- Old enough that SMU/PSP firmware is stable (vs. RDNA3's
-  still-evolving stack)
+- It is the project's **primary bring-up target** (per the simulator
+  strategy record): current-generation *and* documented — AMD publishes
+  the RDNA4 ISA via GPUOpen's machine-readable ISA. A discrete card is
+  also the cleanest bring-up environment: removable, dedicated VRAM
+  (simpler initial memory model than an iGPU's unified/stolen memory),
+  and you can keep a display alive on another GPU while it crashes.
+- It is the generation the **gpusim functional model** targets, so the
+  driver is developed and regression-tested against the simulator before
+  touching hardware. RDNA4's queue scheduling (**MES**), GFX12 register
+  layout, and GPUVM semantics are what the model encodes; matching the
+  driver to it keeps the fast, deterministic dev loop honest.
 
-Adding RDNA3 later is a *separate* module: `atrium-gpu-amd-rdna3.ko`.
-It shares register-layout files where applicable but has its own
-bring-up code, its own SMU interface, its own CP/SDMA paths, its
-own DCN version. We do **not** try to abstract "AMD GPU family"
-generically.
+**Honest tradeoff vs. an older generation.** RDNA2 would offer more
+mature, battle-tested SMU/PSP firmware; RDNA4's firmware stack is newer
+and less settled. We accept this because the bulk of bring-up iteration
+happens against the **deterministic simulator** (which stubs PSP/firmware
+per the attach spec), so firmware churn bites the dev loop far less than
+it would on hardware-first development — and real-silicon firmware quirks
+are exactly the "undocumented 20%" the hardware oracle exists to catch.
+
+Adding another generation later is a *separate* module:
+`atrium-gpu-amd-rdna2.ko` (the AM5 iGPU + RX 6000 discrete — RDNA2's
+large footprint), `atrium-gpu-amd-rdna5.ko` (the future UDNA iGPU), etc.
+Each shares register-layout files where applicable but has its own
+bring-up code, its own SMU interface, its own CP/SDMA paths, its own DCN
+version. We do **not** try to abstract "AMD GPU family" generically.
 
 This is the *opposite* of Linux's amdgpu, which has dispatch
 tables for GFX 6/7/8/9/10/11/12 with shared code paths and per-
 family hooks. That's how amdgpu got to 500K lines.
 
-The cost of our approach: ~70% of code is duplicated between the
-RDNA2 and RDNA3 modules. The benefit: each is independently
-readable, independently testable, and a bug in RDNA3 cannot
-break RDNA2.
+The cost of our approach: ~70% of code is duplicated between
+generation modules. The benefit: each is independently readable,
+independently testable, and a bug in one generation cannot break
+another.
 
 This is a real trade-off. We're choosing readability + isolation
 over share-efficiency. For a small team supporting a few vendors,
@@ -655,8 +671,8 @@ Reader doesn't need to look up the manual — context is right
 there.
 
 ```c
-/* Reset Graphics Block (GRBM). Per RDNA2 GFX10.3 ISA Reference,
- * §28.2.4: writing 0 to GRBM_GFX_INDEX clears any per-SE/per-SH
+/* Reset Graphics Block (GRBM). Per the RDNA4 GFX12 register
+ * reference: writing 0 to GRBM_GFX_INDEX clears any per-SE/per-SH
  * targeting; subsequent register writes go to all units. */
 amd_mmio_write(sc, regGRBM_GFX_INDEX, 0);
 ```
@@ -729,7 +745,7 @@ D5.2 (the AMD slice) becomes:
 
 | Week | Goal |
 |---|---|
-| 1-2 | PCI bring-up; BAR mapping; basic register I/O on a real RX 6700 (Navi 22). Read GRBM_STATUS over PCI; print it. |
+| 1-2 | PCI bring-up; BAR mapping; basic register I/O on a real RX 9070 XT (Navi 48). Read GRBM_STATUS over PCI; print it. (Bring-up is exercised against gpusim first — see the simulator's PCI/firmware/MES bring-up surface.) |
 | 3-4 | Firmware loading. PSP brings up SMU, MEC, CP. GPU is "alive" — clocks running, ring buffers initialized, no errors in IRQ. |
 | 5-6 | GPUVM + BO + submit. Hand-encoded clear-the-screen command runs from kernel; VRAM contents change as expected. |
 | 7-8 | Fence + IRQ + kqueue notify. End-to-end submit-and-wait works; fault injection covers timeout path. |
@@ -809,7 +825,10 @@ departing from.
   expects.
 - [`spec/fresco-surfaces.md`](fresco-surfaces.md) — game/GPU
   external-surface model that consumes this driver.
-- AMD RDNA2 Instruction Set Architecture (public, 2020).
-- AMD GFX10.3 Register Reference (public, AMD GPUOpen).
+- AMD RDNA4 Instruction Set Architecture (public, 2025; GPUOpen machine-readable ISA).
+- AMD GFX12 Register Reference (public, AMD GPUOpen).
+- gpusim — the RDNA4 functional device model the driver is developed and
+  regression-tested against (PCI/firmware/reset/TLB/MES bring-up surface +
+  strict-referee invariants).
 - `feedback_no_linuxkpi`, `feedback_atrium_licensing_policy` —
   substrate constraints.
