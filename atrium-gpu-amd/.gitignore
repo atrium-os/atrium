@@ -1,0 +1,10 @@
+# in-VM kmod build artifacts (bsd.kmod.mk)
+machine
+x86
+*.o
+*.kld
+*.ko
+*.meta
+.depend*
+export_syms
+opt_global.h

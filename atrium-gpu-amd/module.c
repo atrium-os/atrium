@@ -1,16 +1,23 @@
 /*
  * atrium-gpu-amd — from-scratch FreeBSD kernel driver for AMD RDNA4 GPUs.
  *
- * KERNEL side of the Atrium GPU split (kernel = C, userspace = Rust). This
- * is milestone 1 (design §8): newbus PCI bring-up + BAR mapping + the first
- * register read — GRBM_STATUS over PCI — exercised against the gpusim
- * functional model (vendor 0x1002 / device 0x7550) before real silicon.
+ * KERNEL side of the Atrium GPU split (kernel = C, userspace = Rust),
+ * exercised against the gpusim functional model (vendor 0x1002 / device
+ * 0x7550) before real silicon. Milestones (design §8):
+ *
+ *   M1  newbus PCI bring-up + BAR mapping + first register read (GRBM_STATUS
+ *       over PCI), gated behind COMMAND.MSE/BME.
+ *   M2  bring the GPU "alive": reset to a known state, load CP microcode
+ *       (the PSP firmware load), and initialize the MES scheduler — the
+ *       handshake the model's referee requires before any queue/doorbell
+ *       can be honored (device-reference §4 steps 2 + 5).
  *
  * WHY one combined newbus driver here, not the §4.1 pci/gpu/display split:
- * milestone 1 only proves "match the device, satisfy the PCI bring-up gate,
- * read a register." The three-module split earns its keep once firmware +
- * GPUVM + submit exist; introducing it now would be structure without a
- * reason for it (the very thing §2 rejects). Split when a block needs it.
+ * through M2 the driver only proves "match the device, satisfy the bring-up
+ * gates, and walk the model from cold → CP/MES up." The three-module split
+ * earns its keep once GPUVM + submit add real surface area; introducing it
+ * now would be structure without a reason for it (the very thing §2
+ * rejects). Split when a block needs it.
  */
 
 #include <sys/param.h>
@@ -58,6 +65,48 @@
 #define regSIM_ID		0x00
 #define SIM_ID_MAGIC		0x47505553u	/* 'G','P','U','S' (model GPUSIM_MAGIC) */
 
+/*
+ * SIM-aperture bring-up registers (device-reference §4; model
+ * engine/src/device.rs `regs`). These have no single real-HW analog — they
+ * model the PSP/MES/reset handshake a real driver drives through a dozen
+ * scattered GC/SMU registers. The model places them at APER_SIM (BAR5
+ * 0x2_0000) + the documented offset; absolute offsets are spelled out so a
+ * reader can match them to the model without arithmetic.
+ *
+ * Reset handshake (mode-1/FLR class): write REQ=1, poll STATUS until it
+ * reads 1 (reset latched, awaiting ack), write ACK=1 (STATUS clears). A full
+ * reset wipes engine state, so CP firmware must be (re)loaded afterwards.
+ *
+ * Firmware: stage FW_CP_VERSION (the ucode the PSP would load), then write
+ * FW_CP_LOAD=1 — the model activates the CP only if the staged version is at
+ * least CP_FW_MIN_VERSION (an older ucode is refused, mirroring a real
+ * firmware-too-old failure). MES_INIT=1 then brings the scheduler up, and is
+ * gated on the CP firmware being loaded.
+ */
+#define ATRIUM_AMD_APER_SIM	0x20000		/* BAR5 SIM-aperture base */
+#define regFW_CP_VERSION	(ATRIUM_AMD_APER_SIM + 0x50)	/* staged CP ucode version (w) */
+#define regFW_CP_LOAD		(ATRIUM_AMD_APER_SIM + 0x54)	/* w 1: validate + activate CP */
+#define regRESET_REQ		(ATRIUM_AMD_APER_SIM + 0x58)	/* w 1: begin full GPU reset */
+#define regRESET_STATUS		(ATRIUM_AMD_APER_SIM + 0x5c)	/* r 1: reset latched, awaiting ack */
+#define regRESET_ACK		(ATRIUM_AMD_APER_SIM + 0x60)	/* w 1: ack / close reset window */
+#define regMES_INIT		(ATRIUM_AMD_APER_SIM + 0x68)	/* w 1: init MES (needs CP fw) */
+
+/*
+ * Minimum CP microcode version the model accepts (engine/src/device.rs
+ * CP_FW_MIN_VERSION). A real driver derives this from the firmware blob it
+ * loads from disk; the model has no blob, so we stage exactly the minimum.
+ */
+#define ATRIUM_AMD_CP_FW_VERSION	0x40
+
+/*
+ * Bounded poll for the reset to latch. The model completes the reset
+ * synchronously (STATUS reads 1 on the first poll), but real silicon takes
+ * microseconds — so we poll with a timeout rather than assume instant, which
+ * is the shape the driver must keep for hardware.
+ */
+#define ATRIUM_AMD_RESET_POLLS	1000		/* max polls (×10us = 10ms budget) */
+#define ATRIUM_AMD_RESET_DELAY	10		/* us between polls */
+
 struct atrium_amd_softc {
 	device_t	 dev;
 	struct resource	*regs;		/* BAR5 MMIO register file */
@@ -72,16 +121,22 @@ struct atrium_amd_softc {
  * flow. Callers read as `amd_mmio_read32(sc, regFOO)` and annotate the
  * register's meaning at the call site (§7.1).
  *
- * WHY a leaf helper, not bare bus_read_4 at each site: §7.1 — register
- * access is a leaf, so the BAR handle (and any future ordering/trace policy)
- * lives in one spot, not scattered across every reader. Only the read form
- * exists today; the write form lands with milestone 2 when something writes
- * a register (§7.5: no dead code until then).
+ * WHY a leaf helper, not bare bus_read_4/write_4 at each site: §7.1 —
+ * register access is a leaf, so the BAR handle (and any future ordering/
+ * trace policy) lives in one spot, not scattered across every caller. The
+ * write form lands here at milestone 2, when the reset/firmware/MES
+ * handshake first writes registers (§7.5: no dead code before then).
  */
 static inline uint32_t
 amd_mmio_read32(struct atrium_amd_softc *sc, bus_size_t reg)
 {
 	return (bus_read_4(sc->regs, reg));
+}
+
+static inline void
+amd_mmio_write32(struct atrium_amd_softc *sc, bus_size_t reg, uint32_t val)
+{
+	bus_write_4(sc->regs, reg, val);
 }
 
 static int
@@ -100,6 +155,7 @@ atrium_amd_attach(device_t dev)
 {
 	struct atrium_amd_softc *sc = device_get_softc(dev);
 	uint32_t id, grbm;
+	int i;
 
 	sc->dev = dev;
 
@@ -143,6 +199,66 @@ atrium_amd_attach(device_t dev)
 	device_printf(dev, "GRBM_STATUS = 0x%08x (gpusim models this as 0)\n",
 	    grbm);
 
+	/*
+	 * Milestone 2 (design §8): bring the GPU alive — reset, load CP
+	 * firmware, init the MES. The order is load-bearing: a full reset
+	 * tears down the CP, so firmware must be (re)loaded after it, and the
+	 * MES rides on the CP microcode so it can only come up once firmware
+	 * is loaded. The model's referee enforces exactly this ordering
+	 * (a doorbell before firmware, or a queue map before the MES, faults).
+	 *
+	 * Step 1 — reset to a known state. A from-scratch driver inherits the
+	 * device in whatever state firmware/a prior driver left it; reset to
+	 * a defined baseline before programming. RESET_STATUS is the one
+	 * bring-up status the model exposes readably, so it doubles as our
+	 * verification that SIM-aperture writes land and read back.
+	 */
+	amd_mmio_write32(sc, regRESET_REQ, 1);
+	for (i = 0; i < ATRIUM_AMD_RESET_POLLS; i++) {
+		if (amd_mmio_read32(sc, regRESET_STATUS) != 0)
+			break;
+		DELAY(ATRIUM_AMD_RESET_DELAY);
+	}
+	if (i == ATRIUM_AMD_RESET_POLLS) {
+		device_printf(dev, "GPU reset did not latch (RESET_STATUS "
+		    "stuck at 0)\n");
+		bus_release_resource(dev, SYS_RES_MEMORY, sc->regs_rid,
+		    sc->regs);
+		return (ENXIO);
+	}
+	amd_mmio_write32(sc, regRESET_ACK, 1);
+	if (amd_mmio_read32(sc, regRESET_STATUS) != 0) {
+		device_printf(dev, "GPU reset window did not close after ACK "
+		    "(RESET_STATUS still 1)\n");
+		bus_release_resource(dev, SYS_RES_MEMORY, sc->regs_rid,
+		    sc->regs);
+		return (ENXIO);
+	}
+	device_printf(dev, "GPU reset complete (REQ -> STATUS=1 -> ACK -> "
+	    "STATUS=0)\n");
+
+	/*
+	 * Step 2 — load CP firmware (models the PSP loading the CP microcode).
+	 * Stage the ucode version, then activate. The model refuses a version
+	 * below CP_FW_MIN_VERSION; we stage exactly the minimum since there is
+	 * no real blob behind the model. cp_fw_loaded is not read-back-able,
+	 * so this is verified by construction (correct version, post-reset
+	 * order) — its effect shows up later when a doorbell is honored
+	 * instead of faulting.
+	 */
+	amd_mmio_write32(sc, regFW_CP_VERSION, ATRIUM_AMD_CP_FW_VERSION);
+	amd_mmio_write32(sc, regFW_CP_LOAD, 1);
+	device_printf(dev, "CP firmware loaded (version 0x%x)\n",
+	    ATRIUM_AMD_CP_FW_VERSION);
+
+	/*
+	 * Step 3 — initialize the MES scheduler. Gated on the CP firmware
+	 * above; the MES is what reads a queue descriptor and activates an
+	 * HQD, so it must be up before any queue can be mapped (milestone 3).
+	 */
+	amd_mmio_write32(sc, regMES_INIT, 1);
+	device_printf(dev, "MES initialized — GPU alive\n");
+
 	return (0);
 }
 
@@ -172,4 +288,4 @@ static driver_t atrium_amd_driver = {
 
 DRIVER_MODULE(atrium_gpu_amd, pci, atrium_amd_driver, NULL, NULL);
 MODULE_DEPEND(atrium_gpu_amd, pci, 1, 1, 1);
-MODULE_VERSION(atrium_gpu_amd, 1);
+MODULE_VERSION(atrium_gpu_amd, 2);
