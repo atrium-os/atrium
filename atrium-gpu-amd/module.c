@@ -16,6 +16,9 @@
  *       and ring the doorbell — the CP DMA-walks the page tables, fetches +
  *       executes the ring, and DMA-writes a fence we read back. The first
  *       *positive* confirmation (steps 3,4,6,7) the whole stack is alive.
+ *   M4  real compute: dispatch a built-in INC kernel on a second queue via
+ *       the MEC HQD path and read back results that depend on the input
+ *       (dst[i] = src[i]+1) — proof the GPU does work, not just drains rings.
  *
  * WHY one combined file here, not the §4.2 gmc.c/cp.c/bo.c split (or the
  * §4.1 three-kmod split): through M3 the driver is a single coherent
@@ -175,6 +178,34 @@
 
 /* Small fixed registry of DMA pages (page tables + ring + fence + IH). */
 #define ATRIUM_AMD_MAX_DMA	16
+
+/*
+ * Milestone-4 compute path: a DISPATCH runs a built-in kernel element-wise
+ * over a buffer (engine/src/render.rs SoftwareBackend). The compute queue is
+ * mapped via the MEC HQD registers (CP_HQD_*, real GFX12 offsets) rather than
+ * the gfx CP_RB0_* path; HQD_SELECT/COMPUTE_* live in the SIM aperture.
+ */
+#define regHQD_SELECT			0x20080	/* which HQD the CP_HQD regs program */
+#define regCP_HQD_PQ_BASE		0x7ec4	/* HQD ring base (holds base>>8) */
+#define regCP_HQD_PQ_CONTROL		0x7ee8	/* HQD ring size */
+#define regCP_HQD_PQ_DOORBELL_CONTROL	0x7ee0	/* HQD doorbell offset (in BAR2) */
+#define regCP_HQD_ACTIVE		0x7eac	/* write 1: activate (MQD->HQD, gated on MES) */
+#define regCOMPUTE_KERNEL		0x20200	/* built-in kernel selector */
+#define regCOMPUTE_SRC_LO		0x20204	/* source buffer GPU-VA (lo/hi) */
+#define regCOMPUTE_SRC_HI		0x20208
+#define regCOMPUTE_DST_LO		0x2020c	/* dest buffer GPU-VA (lo/hi) */
+#define regCOMPUTE_DST_HI		0x20210
+
+#define IT_DISPATCH_DIRECT		0x15u	/* PM4 compute dispatch */
+#define KERNEL_INC			2u	/* dst[i] = src[i] + 1 (render.rs) */
+
+/* Compute job: queue 1 (independent of run_job's queue 0), doorbell 0x8. */
+#define ATRIUM_AMD_COMPUTE_QID		1
+#define ATRIUM_AMD_COMPUTE_DOORBELL	0x8
+#define ATRIUM_AMD_COMPUTE_SRC_VA	0x300000ULL
+#define ATRIUM_AMD_COMPUTE_DST_VA	0x301000ULL
+#define ATRIUM_AMD_COMPUTE_RING_VA	0x302000ULL
+#define ATRIUM_AMD_COMPUTE_N		4	/* elements (one page holds plenty) */
 
 /*
  * A page of DMA-able guest memory: its kernel virtual address (where the CPU
@@ -382,6 +413,95 @@ amd_submit_runjob(struct atrium_amd_softc *sc)
 }
 
 /*
+ * Compute dispatch (milestone 4): run a built-in INC kernel over a small
+ * buffer on a second, independent queue mapped via the MEC HQD path, and read
+ * back the results. Where run_job proved "a ring drains," this proves the GPU
+ * does real WORK whose output depends on the input: dst[i] = src[i] + 1,
+ * reached through GPUVM (the SoftwareBackend DMA-walks src/dst under VMID 0).
+ */
+static void
+amd_dispatch_compute(struct atrium_amd_softc *sc)
+{
+	void *src_kva, *dst_kva, *ring_kva;
+	vm_paddr_t src_gpa, dst_gpa, ring_gpa;
+	volatile uint32_t *dst;
+	uint32_t *src, *r;
+	uint32_t input[ATRIUM_AMD_COMPUTE_N] = { 10, 20, 30, 40 };
+	int i, n, ok;
+
+	src_kva = amd_dma_alloc(sc, &src_gpa);
+	dst_kva = amd_dma_alloc(sc, &dst_gpa);
+	ring_kva = amd_dma_alloc(sc, &ring_gpa);
+	if (src_kva == NULL || dst_kva == NULL || ring_kva == NULL) {
+		device_printf(sc->dev, "compute: out of DMA pages\n");
+		return;
+	}
+	if (amd_gpuvm_map(sc, ATRIUM_AMD_COMPUTE_SRC_VA, src_gpa) != 0 ||
+	    amd_gpuvm_map(sc, ATRIUM_AMD_COMPUTE_DST_VA, dst_gpa) != 0 ||
+	    amd_gpuvm_map(sc, ATRIUM_AMD_COMPUTE_RING_VA, ring_gpa) != 0) {
+		device_printf(sc->dev, "compute: failed to map buffers\n");
+		return;
+	}
+
+	/* Stage the input array into the source buffer. */
+	src = (uint32_t *)src_kva;
+	for (i = 0; i < ATRIUM_AMD_COMPUTE_N; i++)
+		src[i] = input[i];
+
+	/*
+	 * Compute state: the kernel selector + source/dest GPU-VAs. The
+	 * SoftwareBackend reads src and writes dst by walking these VAs through
+	 * GPUVM, so they must be mapped (above) before the dispatch runs.
+	 */
+	amd_mmio_write32(sc, regCOMPUTE_KERNEL, KERNEL_INC);
+	amd_mmio_write32(sc, regCOMPUTE_SRC_LO,
+	    (uint32_t)(ATRIUM_AMD_COMPUTE_SRC_VA & 0xffffffff));
+	amd_mmio_write32(sc, regCOMPUTE_SRC_HI,
+	    (uint32_t)(ATRIUM_AMD_COMPUTE_SRC_VA >> 32));
+	amd_mmio_write32(sc, regCOMPUTE_DST_LO,
+	    (uint32_t)(ATRIUM_AMD_COMPUTE_DST_VA & 0xffffffff));
+	amd_mmio_write32(sc, regCOMPUTE_DST_HI,
+	    (uint32_t)(ATRIUM_AMD_COMPUTE_DST_VA >> 32));
+
+	/* Lay the DISPATCH ring: one packet, 3 body dwords (x=count, y, z). */
+	r = (uint32_t *)ring_kva;
+	n = 0;
+	r[n++] = amd_pm4_type3_header(IT_DISPATCH_DIRECT, 3);
+	r[n++] = ATRIUM_AMD_COMPUTE_N;	/* x = element count */
+	r[n++] = 1;			/* y */
+	r[n++] = 1;			/* z */
+
+	/*
+	 * Map the compute queue onto an HQD via the MEC CP_HQD_* registers
+	 * (ring base holds VA>>8), point its doorbell at BAR2 offset 0x8, and
+	 * activate — the MQD->HQD map the MES performs, gated on MES init.
+	 */
+	amd_mmio_write32(sc, regHQD_SELECT, ATRIUM_AMD_COMPUTE_QID);
+	amd_mmio_write32(sc, regCP_HQD_PQ_BASE,
+	    (uint32_t)(ATRIUM_AMD_COMPUTE_RING_VA >> 8));
+	amd_mmio_write32(sc, regCP_HQD_PQ_CONTROL, ATRIUM_AMD_RING_BYTES);
+	amd_mmio_write32(sc, regCP_HQD_PQ_DOORBELL_CONTROL,
+	    ATRIUM_AMD_COMPUTE_DOORBELL);
+	amd_mmio_write32(sc, regCP_HQD_ACTIVE, 1);
+
+	/* Ring queue 1's doorbell; the model runs the kernel synchronously. */
+	bus_write_4(sc->doorbell, ATRIUM_AMD_COMPUTE_DOORBELL, n);
+
+	dst = (volatile uint32_t *)dst_kva;
+	ok = 1;
+	for (i = 0; i < ATRIUM_AMD_COMPUTE_N; i++)
+		if (dst[i] != input[i] + 1)
+			ok = 0;
+	if (ok)
+		device_printf(sc->dev, "compute OK: INC [%u %u %u %u] -> "
+		    "[%u %u %u %u]\n", input[0], input[1], input[2], input[3],
+		    dst[0], dst[1], dst[2], dst[3]);
+	else
+		device_printf(sc->dev, "compute FAILED: got [%u %u %u %u]\n",
+		    dst[0], dst[1], dst[2], dst[3]);
+}
+
+/*
  * Release everything attach acquired: the DMA pages (page tables, ring,
  * fence, IH) and the two BAR resources. Safe to call partway through a failed
  * attach — every field is NULL/zero until its step runs. Used by both the
@@ -584,6 +704,14 @@ atrium_amd_attach(device_t dev)
 		    "0x%016jx\n", (uintmax_t)fence,
 		    (uintmax_t)ATRIUM_AMD_FENCE_MAGIC);
 
+	/*
+	 * Step 7 (milestone 4) — real compute: dispatch an INC kernel on a
+	 * second queue (MEC HQD path) and read back results that depend on the
+	 * input. Where step 6 proved a ring drains, this proves the GPU
+	 * computes.
+	 */
+	amd_dispatch_compute(sc);
+
 	return (0);
 }
 
@@ -611,4 +739,4 @@ static driver_t atrium_amd_driver = {
 
 DRIVER_MODULE(atrium_gpu_amd, pci, atrium_amd_driver, NULL, NULL);
 MODULE_DEPEND(atrium_gpu_amd, pci, 1, 1, 1);
-MODULE_VERSION(atrium_gpu_amd, 3);
+MODULE_VERSION(atrium_gpu_amd, 4);
