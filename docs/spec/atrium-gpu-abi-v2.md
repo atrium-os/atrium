@@ -1,10 +1,10 @@
 # Atrium GPU ABI v2 — Draft for Review
 
-> **Status.** Draft. Intended audience: FreeBSD-CURRENT contributors, OpenBSD/NetBSD/DragonFly graphics maintainers, Mesa userspace authors familiar with the libdrm vendor backends. Not yet implemented end-to-end; v0.1 (the virtio-gpu skeleton at `atrium-kmod/atrium_virtio_gpu.c`) is the only consumer of an earlier, much smaller version of this surface today. The intent of v2 is to lock in the long-term shape *before* a second vendor ports.
+> **Status.** Draft. Intended audience: FreeBSD-CURRENT contributors, OpenBSD/NetBSD/DragonFly graphics maintainers, Mesa userspace authors familiar with the libdrm vendor backends. Not yet implemented end-to-end; v0.1 (the virtio-gpu skeleton at `atrium-kmod/atrium_virtio_gpu.c`) is the only consumer of an earlier, much smaller version of this surface today. Separately, a from-scratch AMD bring-up driver (`atrium-gpu-amd`, developed against the gpusim functional model) implements a smaller intermediate ABI — integer handles, kernel-mediated submit, blocking fence-wait, MSI-X completion — that is expected to converge to this surface; that work is what grounds the user-mode-queue (§5.9) and energy-telemetry (§5.10) additions in this revision. The intent of v2 is to lock in the long-term shape *before* a second vendor ports.
 >
-> **Companion.** Read `drm-research-findings.md` first if you want the source-grounded background. This document is the design that falls out of those findings.
+> **Companion.** Read `drm-research-findings.md` first if you want the source-grounded background. This document is the design that falls out of those findings. See `atrium-gpu-driver-architecture.md` for the driver-architecture stance and the rationale behind the user-mode-queue (§5.9) and energy-telemetry (§5.10) additions folded into this revision.
 >
-> **One-line summary.** A small, BSD-native, vendor-per-cdev kernel ABI for GPU work, with Vulkan as the only userspace ABI it targets. POD-blob submits, timeline-only sync, VM_BIND from day one, Capsicum-friendly, no shared kernel framework, no Linux DRM concepts inherited.
+> **One-line summary.** A small, BSD-native, vendor-per-cdev kernel ABI for GPU work, with Vulkan as the only userspace ABI it targets. POD-blob submits, timeline-only sync, VM_BIND from day one, kernel-mediated *or* capability-scoped user-mode-queue submission, Capsicum-friendly, optional read-only energy telemetry, no shared kernel framework, no Linux DRM concepts inherited.
 
 ---
 
@@ -85,6 +85,8 @@ These are non-negotiable. Every concrete decision below is a consequence of one 
 
 10. **Display is a different device.** Modesetting, page-flip, EDID, hotplug live behind `/dev/atrium/display<N>` cdevs, specified separately (see `atrium-gpu-abi-v0.1.md` for the existing draft of the display side; v2-of-display is its own document). The GPU cdev and the display cdev are linked via shared buffer fds (one BO is allocated by the GPU side, exported via `SHARE_FD`, imported as a scanout source by the display side). They do not share state otherwise.
 
+11. **User-mode submission is capability-scoped.** Where hardware supports user-mode queues — userspace rings a hardware doorbell directly, bypassing the `SUBMIT` ioctl (AMD MES on GFX11/GFX12, Intel GuC, Apple ASC) — the submit-side authority is expressed as a *capability*, never as ambient power. A queue's doorbell is an MMIO page scoped to that queue's VM (its own VMID + page tables), so mapping it into a process grants exactly the ability to kick *that one isolated queue* and nothing else. The kernel keeps ownership of VM_BIND, queue/MQD setup, the hand-off to scheduler firmware, preemption, and reset. This is the Capsicum/Portcullis-native expression of "let userspace submit without a syscall": passing a `queue_fd` (with its mapped doorbell) over `SCM_RIGHTS` is a scoped grant to a sandbox or jail, not a privilege escalation. Kernel-mediated `SUBMIT` (§5.7) remains the baseline and the fallback for hardware without user queues.
+
 ---
 
 ## 4. Object model
@@ -155,8 +157,9 @@ Defined cap IDs (initial set; extensible):
 | `MODIFIERS` | array of (format, modifier) pairs | Tiling/compression modifiers per format |
 | `SYNC_FEATURES` | bitmap | Timeline syncobj feature flags |
 | `BIND_FEATURES` | bitmap | VM_BIND options (sparse, residency hints, etc.) |
-| `SUBMIT_FEATURES` | bitmap | Submit options (long-running compute, indirect dispatch, ...) |
+| `SUBMIT_FEATURES` | bitmap | Submit options (user-mode queues, long-running compute, indirect dispatch, ...) |
 | `VULKAN_EXTENSIONS` | array of strings | Vulkan extensions the driver can support |
+| `TELEMETRY` | bitmap | Read-only energy/utilization telemetry available (§5.10) |
 
 TLV is chosen over a fixed struct because new caps will be added over the device's lifetime and old userspace must skip them cleanly.
 
@@ -371,6 +374,57 @@ The `share_fd` is what travels across processes via `SCM_RIGHTS` over a Unix soc
 
 This is the dma-buf concept, redesigned: smaller surface (one export, one import, no attach/detach lifecycle), explicit vendor identification, no implicit fence carriage. Synchronization is always via separate `syncobj_fd`s passed alongside.
 
+### 5.9 User-mode queues (direct doorbell submission)
+
+`SUBMIT` (§5.7) is the baseline: one ioctl per submission. On hardware with firmware-scheduled user-mode queues (AMD MES on GFX11/GFX12, Intel GuC, Apple ASC), userspace can instead ring a hardware doorbell directly and skip the syscall on the submit hot path. This matters for two reasons specific to Atrium: it removes per-submit syscall/scheduler overhead the Tier-2/3 energy router cannot otherwise reclaim, and — see principle 11 — it expresses GPU-submit authority as a scoped capability rather than ambient power. It is advertised by the `USER_QUEUE` bit of `SUBMIT_FEATURES`; absent it, the ioctls below return `ENOTSUP` and userspace uses §5.7.
+
+A user-mode queue is requested at creation (`ATRIUM_GPU_QUEUE_CREATE` with `flags |= ATRIUM_GPU_QUEUE_FLAG_USER_MODE`) and then mapped:
+
+```
+ATRIUM_GPU_QUEUE_MAP     (on queue_fd)
+
+struct atrium_gpu_queue_map {
+    uint32_t struct_size;
+    uint32_t _reserved;
+    uint64_t out_ring_offset;     /* mmap(device_fd) offset: command ring */
+    uint64_t out_ring_size;       /* ring bytes */
+    uint64_t out_doorbell_offset; /* mmap(device_fd) offset: doorbell page */
+    uint64_t out_doorbell_size;   /* doorbell page bytes */
+    uint64_t out_wptr_offset;     /* write-pointer location (ring-relative) */
+    uint32_t out_doorbell_index;  /* this queue's slot within the doorbell page */
+    uint32_t _pad;
+};
+```
+
+Userspace `mmap`s the ring and the doorbell page off `device_fd` (the same `d_mmap_single` path as `BO_MMAP_INFO`, §5.3), writes a POD command blob (§5.7's format and opacity rules, unchanged) into the ring at the write pointer, advances the write pointer, and writes the doorbell to kick the engine. **Completion is unchanged**: the blob's trailing fence packet signals a `syncobj` timeline, observed via `SYNCOBJ_EVENTFD` → kqueue exactly as in §5.7. Only the submit *path* moves to userspace; the *completion* path stays on the existing fd/kqueue machinery, so a frescod-style compositor (§5.6, §9) is unaffected.
+
+What stays in the kernel (non-negotiable, principle 11): VM_BIND and memory validation, queue/MQD setup and its hand-off to the scheduler firmware, preemption, and hang/reset (§10). Userspace owns only its own ring contents and write pointer.
+
+**Security model.** The doorbell page is MMIO scoped to this queue's VM — its own VMID and page tables (§5.5). Mapping it grants exactly the authority to kick *this* queue, which can reach only addresses bound in *this* VM. So a `queue_fd` (carrying its mapped doorbell) passed to a sandboxed or jailed process via `SCM_RIGHTS` is a *scoped capability*: that process can submit GPU work in one isolated address space and nothing more. There is no ambient "submit to the GPU" authority anywhere in the ABI — which is what makes user-mode submission safe under `cap_enter()` and under Portcullis default-deny jails. The capability *is* the mapped doorbell.
+
+### 5.10 Energy telemetry (read-only)
+
+Atrium routes work between a software renderer (Tier-2) and the GPU (Tier-3) under an energy policy (`energy-policy.md`). For that router to decide whether using the GPU is worth its energy, it needs a cheap, read-only sample of GPU state. This is the only place the ABI exposes anything power-adjacent, and it is strictly *observational*.
+
+```
+ATRIUM_GPU_QUERY_TELEMETRY  (on device_fd)
+
+struct atrium_gpu_telemetry {
+    uint32_t struct_size;
+    uint32_t _reserved;
+    uint64_t busy_ns;             /* monotonic engine-busy time, all queues */
+    uint64_t sample_ns;           /* monotonic wall time of this sample */
+    uint32_t queue_depth;         /* submissions in flight across queues */
+    uint32_t power_state;         /* vendor-normalized 0=idle .. N=max */
+    uint32_t tier_cost_hint;      /* normalized energy/op estimate (vs Tier-2) */
+    uint32_t flags;
+};
+```
+
+`busy_ns` over elapsed `sample_ns` gives a utilization fraction; `tier_cost_hint` is the vendor's normalized estimate of GPU energy-per-unit-work on the *same scale* the router uses for the Tier-2 software path, so the two are directly comparable. Advertised by the `TELEMETRY` cap; absent it, `ENOTSUP`.
+
+This is **read-only and advisory**. Per the energy policy's "coordinated, not coupled" rule, intent flows one way only: the router *samples* telemetry to make routing decisions; there is no ioctl that lets it drive the driver's power state (that remains the vendor module's own business, §12). Telemetry is observation, not a power-management *control* surface. It exists because — unlike a Linux driver — an Atrium GPU driver lives in a system that can choose *not to use the GPU at all*, and that choice needs data.
+
 ---
 
 ## 6. Cross-process and cross-device semantics
@@ -540,6 +594,10 @@ i. **Sparse residency.** Vulkan exposes `sparseResidency*` features. If we want 
 
 j. **Multi-GPU presentation.** PRIME-equivalent for "render on discrete, present on integrated" — does the WSI extension handle this entirely, or does the kernel need explicit cross-device-aware paths?
 
+k. **User-mode queue preemption and doorbell granularity (§5.9).** With userspace owning the ring write pointer, the kernel must still preempt and reset a queue that hangs. Open: doorbell-page granularity (one queue per page vs. many sharing a page, which affects what a single `mmap` grants); how the kernel revokes a mapped doorbell on reset (unmap the `vm_object_t`? fault on next ring?); and how a hung user-mode queue surfaces into the §10 fault model when the kernel never saw the submission.
+
+l. **Telemetry units and sampling cost (§5.10).** `tier_cost_hint` must be normalized to the *same* scale the Tier-2 software renderer reports, or the router cannot compare them. Defining that shared unit (energy-per-op? a core-ms-equivalent?) is a cross-subsystem question owned jointly with the energy policy. Also: the cost of sampling itself must be negligible (no MMIO storm), or telemetry defeats its own purpose.
+
 ---
 
 ## 14. Comparison: this ABI vs DRM uAPI vs Vulkan
@@ -550,7 +608,7 @@ j. **Multi-GPU presentation.** PRIME-equivalent for "render on discrete, present
 | Buffer object | GEM handle (per-fd integer) | `VkDeviceMemory` (opaque) | `bo_fd` (file descriptor) |
 | Cross-process sharing | dma-buf via PRIME ioctl | `VK_EXT_external_memory_*` | `share_fd` via `SCM_RIGHTS` |
 | Sync primitives | sync_file + drm_syncobj + dma_resv | `VkSemaphore` + `VkFence` (timeline subsumes) | one timeline `syncobj_fd` |
-| Submit shape | varies; per-driver | `vkQueueSubmit` with cmd buffers | POD blob ioctl |
+| Submit shape | varies; per-driver | `vkQueueSubmit` with cmd buffers | POD blob: ioctl, or user-mode doorbell (§5.9) |
 | Bind model | per-submit BO list (legacy) or VM_BIND | `vkBindBufferMemory` etc. | `VM_BIND` ioctl, async |
 | Display | KMS in same fd as GPU | WSI extension | separate cdev, separate fd |
 | Master concept | DRM-Master | n/a | none (filesystem perms + Capsicum) |
@@ -588,6 +646,7 @@ This is a stronger position than drm-kmod, which depends on linuxkpi shimming Li
 This design is heavily indebted to:
 
 - **Intel's Xe RFC** and the team's deliberate decisions about what to drop from i915. Many of v2's choices (VM_BIND mandatory, explicit-sync only, firmware scheduling) match Xe's.
+- **AMD's MES user-mode-queue work** (mainlined in Linux 6.16 for GFX11/GFX12 — the hardware class Atrium targets first). §5.9 adopts its firmware-scheduled direct-doorbell submission mechanism and reframes it as a Capsicum/Portcullis capability rather than a permission retrofit.
 - **The Asahi Linux project**, particularly Alyssa Rosenzweig and Asahi Lina, for the v2 UAPI's POD-blob submit model and the demonstration that a clean GPU driver can fit in ~30K LoC of MIT-licensed code.
 - **DRM maintainers** whose 20-year evolution produced the lessons we are learning from. Specific concepts we are inheriting under different names: `dma-buf` (→ `share_fd`), `drm_syncobj` timeline (→ `syncobj_fd`), VM_BIND (→ `ATRIUM_GPU_VM_BIND`), atomic modesetting (→ display-cdev v2), DMA-BUF feedback (→ `share_fd` modifier negotiation).
 - The **Mesa community**, whose `winsys` abstraction makes a port like this possible without rewriting Vulkan backends. We are explicitly designing to fit within the existing `winsys` contract rather than asking Mesa to change.
