@@ -24,6 +24,7 @@
 #define IT_NOP			0x10u
 #define IT_RELEASE_MEM		0x49u
 #define IT_DISPATCH_DIRECT	0x15u
+#define IT_DRAW_INDEX_AUTO	0x2du
 #define KERNEL_INC		2u
 #define FENCE_MAGIC		0xcafef00ddeadbeefULL
 
@@ -174,6 +175,70 @@ test_compute(int fd)
 	return (0);
 }
 
+/* Write one 24-byte vertex (NDC x,y,z + texcoord u,v + RGBA color) at v[i]. */
+static void
+put_vert(uint8_t *v, int i, float x, float y, float z, uint32_t color)
+{
+	float zero = 0.0f;
+
+	memcpy(v + i * 24 + 0, &x, 4);
+	memcpy(v + i * 24 + 4, &y, 4);
+	memcpy(v + i * 24 + 8, &z, 4);
+	memcpy(v + i * 24 + 12, &zero, 4);	/* u */
+	memcpy(v + i * 24 + 16, &zero, 4);	/* v */
+	memcpy(v + i * 24 + 20, &color, 4);
+}
+
+/* M6: render a full-screen quad (2 tris) of solid color, read back the RT. */
+static int
+test_draw(int fd)
+{
+	const uint32_t W = 16, H = 16, C = 0xff3366cc;
+	uint32_t vtx_h, rt_h, ring_h, ring[2], rt[16 * 16];
+	uint64_t vtx_va, rt_va, ring_va;
+	struct atrium_gpu_set_draw d;
+	uint8_t v[6 * 24];
+	unsigned i;
+
+	if (bo_alloc(fd, sizeof(v), &vtx_h, &vtx_va) != 0 ||
+	    bo_alloc(fd, sizeof(rt), &rt_h, &rt_va) != 0 ||
+	    bo_alloc(fd, sizeof(ring), &ring_h, &ring_va) != 0) {
+		printf("draw: BO alloc failed\n");
+		return (1);
+	}
+	/* Two triangles tiling NDC [-1,1]^2 -> covers every RT pixel. */
+	put_vert(v, 0, -1, -1, 0, C);
+	put_vert(v, 1,  1, -1, 0, C);
+	put_vert(v, 2,  1,  1, 0, C);
+	put_vert(v, 3, -1, -1, 0, C);
+	put_vert(v, 4,  1,  1, 0, C);
+	put_vert(v, 5, -1,  1, 0, C);
+	ring[0] = type3(IT_DRAW_INDEX_AUTO, 1);
+	ring[1] = 6;	/* vertex count */
+
+	memset(&d, 0, sizeof(d));
+	d.vtx_va = vtx_va;
+	d.rt_va = rt_va;
+	d.width = W;
+	d.height = H;
+	if (bo_write(fd, vtx_h, v, sizeof(v)) != 0 ||
+	    bo_write(fd, ring_h, ring, sizeof(ring)) != 0 ||
+	    ioctl(fd, ATRIUM_GPU_IOC_SET_DRAW, &d) != 0 ||
+	    submit(fd, ring_h, 2, ATRIUM_GPU_ENGINE_GFX) != 0 ||
+	    bo_read(fd, rt_h, rt, sizeof(rt)) != 0) {
+		printf("draw: ioctl failed\n");
+		return (1);
+	}
+	for (i = 0; i < W * H; i++)
+		if (rt[i] != C) {
+			printf("draw FAILED: pixel %u = 0x%08x (expected 0x%08x)\n",
+			    i, rt[i], C);
+			return (1);
+		}
+	printf("draw OK: %ux%u RT all = 0x%08x (full-screen quad)\n", W, H, C);
+	return (0);
+}
+
 int
 main(void)
 {
@@ -186,6 +251,7 @@ main(void)
 	}
 	rc = test_gfx_fence(fd);
 	rc |= test_compute(fd);
+	rc |= test_draw(fd);
 	close(fd);
 	printf(rc == 0 ? "ALL OK\n" : "FAILURES\n");
 	return (rc);

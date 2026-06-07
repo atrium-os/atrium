@@ -16,6 +16,9 @@
  *       (ioctl.c + abi header). The submit/compute proofs that M3/M4 ran as
  *       attach self-tests now run from userspace (tests/atrium_gpu_test.c) —
  *       attach just brings the device up and publishes the cdev.
+ *   M6  graphics: a DRAW_INDEX_AUTO over the gfx ring rasterizes a triangle
+ *       list into a render target (cp.c amd_set_draw + SET_DRAW ioctl); the
+ *       test renders a solid quad and reads the pixels back.
  *
  * WHY one kmod (not the §4.1 three-kmod pci/gpu/display split): there is no
  * display engine yet, so a separate PCI module would buy nothing. WHY the
@@ -180,4 +183,4 @@ static driver_t atrium_amd_driver = {
 
 DRIVER_MODULE(atrium_gpu_amd, pci, atrium_amd_driver, NULL, NULL);
 MODULE_DEPEND(atrium_gpu_amd, pci, 1, 1, 1);
-MODULE_VERSION(atrium_gpu_amd, 5);
+MODULE_VERSION(atrium_gpu_amd, 6);

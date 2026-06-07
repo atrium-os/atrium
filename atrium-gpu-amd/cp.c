@@ -67,3 +67,26 @@ amd_set_compute(struct atrium_amd_softc *sc, uint32_t kernel, uint64_t src_va,
 	amd_mmio_write32(sc, regCOMPUTE_DST_LO, (uint32_t)(dst_va & 0xffffffff));
 	amd_mmio_write32(sc, regCOMPUTE_DST_HI, (uint32_t)(dst_va >> 32));
 }
+
+/*
+ * Program the graphics DRAW state the rasterizer reads when it executes a
+ * DRAW_INDEX_AUTO packet: the vertex buffer + render target GPU-VAs and the RT
+ * dimensions. Depth/texture/blend are disabled here (this is the solid-color
+ * path — the pixel is the interpolated vertex color); they become ioctl
+ * parameters when textured/blended draws land.
+ */
+void
+amd_set_draw(struct atrium_amd_softc *sc, uint64_t vtx_va, uint64_t rt_va,
+    uint32_t width, uint32_t height)
+{
+	amd_mmio_write32(sc, regDRAW_VTX_LO, (uint32_t)(vtx_va & 0xffffffff));
+	amd_mmio_write32(sc, regDRAW_VTX_HI, (uint32_t)(vtx_va >> 32));
+	amd_mmio_write32(sc, regDRAW_RT_LO, (uint32_t)(rt_va & 0xffffffff));
+	amd_mmio_write32(sc, regDRAW_RT_HI, (uint32_t)(rt_va >> 32));
+	amd_mmio_write32(sc, regDRAW_RT_DIM, (width << 16) | height);
+	amd_mmio_write32(sc, regDEPTH_LO, 0);	/* no depth test */
+	amd_mmio_write32(sc, regDEPTH_HI, 0);
+	amd_mmio_write32(sc, regTEX_LO, 0);	/* no texture: vertex color */
+	amd_mmio_write32(sc, regTEX_HI, 0);
+	amd_mmio_write32(sc, regBLEND_ENABLE, 0);
+}

@@ -56,10 +56,19 @@ struct atrium_gpu_submit {
 	uint32_t	pad;
 };
 
+/* Program graphics DRAW state read by a DRAW_INDEX_AUTO packet on the gfx ring. */
+struct atrium_gpu_set_draw {
+	uint64_t	vtx_va;		/* in: vertex buffer GPU-VA (24B verts) */
+	uint64_t	rt_va;		/* in: render-target GPU-VA (RGBA8) */
+	uint32_t	width;		/* in: RT width  */
+	uint32_t	height;		/* in: RT height */
+};
+
 #define ATRIUM_GPU_IOC_BO_ALLOC		_IOWR('A', 0, struct atrium_gpu_bo_alloc)
 #define ATRIUM_GPU_IOC_BO_WRITE		_IOW('A', 1, struct atrium_gpu_bo_xfer)
 #define ATRIUM_GPU_IOC_BO_READ		_IOW('A', 2, struct atrium_gpu_bo_xfer)
 #define ATRIUM_GPU_IOC_SET_COMPUTE	_IOW('A', 3, struct atrium_gpu_set_compute)
 #define ATRIUM_GPU_IOC_SUBMIT		_IOW('A', 4, struct atrium_gpu_submit)
+#define ATRIUM_GPU_IOC_SET_DRAW		_IOW('A', 5, struct atrium_gpu_set_draw)
 
 #endif /* _ATRIUM_GPU_AMD_ABI_H_ */

@@ -81,6 +81,23 @@
 #define regCOMPUTE_DST_LO	0x2020c	/* SIM: dest buffer GPU-VA (lo/hi) */
 #define regCOMPUTE_DST_HI	0x20210
 
+/*
+ * Graphics DRAW state (SIM aperture; the stubbed shader register set — the
+ * SoftwareBackend rasterizer stands in). Vertices are 24 bytes (NDC x,y,z +
+ * texcoord u,v as f32, then an RGBA8 color); the RT is RGBA8 width×height.
+ * DEPTH/TEX = 0 disable depth test / texturing (use the interpolated color).
+ */
+#define regDRAW_VTX_LO		0x20214	/* SIM: vertex buffer GPU-VA (lo/hi) */
+#define regDRAW_VTX_HI		0x20218
+#define regDRAW_RT_LO		0x2021c	/* SIM: render-target GPU-VA (lo/hi) */
+#define regDRAW_RT_HI		0x20220
+#define regDRAW_RT_DIM		0x20224	/* SIM: width<<16 | height */
+#define regDEPTH_LO		0x20228	/* SIM: depth buffer GPU-VA (0 = no test) */
+#define regDEPTH_HI		0x2022c
+#define regTEX_LO		0x20230	/* SIM: texture GPU-VA (0 = vertex color) */
+#define regTEX_HI		0x20234
+#define regBLEND_ENABLE		0x2023c	/* SIM: 1 = alpha blend (src-over) */
+
 /* CP firmware: minimum ucode version the model accepts (CP_FW_MIN_VERSION). */
 #define ATRIUM_AMD_CP_FW_VERSION 0x40
 /* Reset poll: model latches synchronously; poll-with-timeout is the HW shape. */
@@ -101,6 +118,7 @@
 #define IT_NOP			0x10u
 #define IT_RELEASE_MEM		0x49u
 #define IT_DISPATCH_DIRECT	0x15u
+#define IT_DRAW_INDEX_AUTO	0x2du
 
 /* Per-engine fixed queue/doorbell assignment (no queue manager yet). */
 #define ATRIUM_AMD_RING_BYTES	256	/* CP ring-size register value */
@@ -200,6 +218,8 @@ int	 amd_submit(struct atrium_amd_softc *sc, struct atrium_amd_bo *ring,
 	    uint32_t n_dwords, uint32_t engine);
 void	 amd_set_compute(struct atrium_amd_softc *sc, uint32_t kernel,
 	    uint64_t src_va, uint64_t dst_va);
+void	 amd_set_draw(struct atrium_amd_softc *sc, uint64_t vtx_va,
+	    uint64_t rt_va, uint32_t width, uint32_t height);
 
 /* ioctl.c — the cdev character-device switch */
 extern struct cdevsw atrium_amd_cdevsw;

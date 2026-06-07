@@ -71,6 +71,14 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		return (0);
 	}
 
+	case ATRIUM_GPU_IOC_SET_DRAW: {
+		struct atrium_gpu_set_draw *d =
+		    (struct atrium_gpu_set_draw *)data;
+
+		amd_set_draw(sc, d->vtx_va, d->rt_va, d->width, d->height);
+		return (0);
+	}
+
 	case ATRIUM_GPU_IOC_SUBMIT: {
 		struct atrium_gpu_submit *s = (struct atrium_gpu_submit *)data;
 
