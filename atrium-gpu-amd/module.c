@@ -23,6 +23,9 @@
  *       (irq.c), so a RELEASE_MEM end-of-pipe IRQ reaches the guest rather
  *       than relying on the model's synchronous drain. GET_IRQS exposes the
  *       serviced count; non-fatal fallback to poll mode if MSI-X is absent.
+ *   M8  blocking fence-wait: IOC_WAIT_FENCE sleeps (msleep) until a fence
+ *       word in a BO reaches a value — woken by the ISR — or times out, the
+ *       GPU-sync primitive a real client uses instead of busy-polling.
  *
  * WHY one kmod (not the §4.1 three-kmod pci/gpu/display split): there is no
  * display engine yet, so a separate PCI module would buy nothing. WHY the
@@ -67,6 +70,10 @@ amd_teardown(struct atrium_amd_softc *sc)
 		    sc->regs);
 		sc->regs = NULL;
 	}
+	if (sc->lock_inited) {
+		mtx_destroy(&sc->lock);
+		sc->lock_inited = 0;
+	}
 }
 
 static int
@@ -88,6 +95,8 @@ atrium_amd_attach(device_t dev)
 	int err;
 
 	sc->dev = dev;
+	mtx_init(&sc->lock, "atrium-gpu", NULL, MTX_DEF);
+	sc->lock_inited = 1;
 
 	/*
 	 * PCI bring-up gate (device-reference §2, §4; referee INV-PCI-0001/
@@ -199,4 +208,4 @@ static driver_t atrium_amd_driver = {
 
 DRIVER_MODULE(atrium_gpu_amd, pci, atrium_amd_driver, NULL, NULL);
 MODULE_DEPEND(atrium_gpu_amd, pci, 1, 1, 1);
-MODULE_VERSION(atrium_gpu_amd, 7);
+MODULE_VERSION(atrium_gpu_amd, 8);

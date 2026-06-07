@@ -19,7 +19,10 @@
 #include <sys/systm.h>
 #include <sys/bus.h>
 #include <sys/conf.h>
+#include <sys/kernel.h>
+#include <sys/lock.h>
 #include <sys/malloc.h>
+#include <sys/mutex.h>
 #include <sys/rman.h>
 
 #include <machine/bus.h>
@@ -172,7 +175,9 @@ struct atrium_amd_softc {
 	int		 msix_enabled;	/* 1 = interrupt mode, 0 = poll mode */
 	void		*ih_kva;	/* interrupt-handler ring (CPU side) */
 	uint32_t	 ih_rptr;	/* our read pointer into the IH ring */
-	volatile u_int	 irq_count;	/* interrupts serviced (ISR vs reader) */
+	u_int		 irq_count;	/* interrupts serviced (atomic vs reader) */
+	struct mtx	 lock;		/* guards fence-wait sleep/wakeup */
+	int		 lock_inited;
 
 	void		*pdb_kva;	/* GPUVM page-directory base (VMID 0) */
 	vm_paddr_t	 pdb_gpa;

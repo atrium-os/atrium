@@ -12,6 +12,7 @@
  */
 #include "atrium_gpu_amd_abi.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -292,6 +293,57 @@ test_irq(int fd)
 	return (0);
 }
 
+/* M8: blocking fence-wait — a reached fence returns 0; an unreached one times out. */
+static int
+test_wait(int fd)
+{
+	struct atrium_gpu_wait_fence w;
+	uint32_t ring_h, fence_h, ring[9];
+	uint64_t ring_va, fence_va;
+
+	if (bo_alloc(fd, 4096, &ring_h, &ring_va) != 0 ||
+	    bo_alloc(fd, 4096, &fence_h, &fence_va) != 0) {
+		printf("wait: BO alloc failed\n");
+		return (1);
+	}
+	ring[0] = type3(IT_NOP, 1);
+	ring[1] = 0;
+	ring[2] = type3(IT_RELEASE_MEM, 6);
+	ring[3] = (5u << 8);
+	ring[4] = (2u << 29) | (2u << 24);
+	ring[5] = (uint32_t)(fence_va & 0xffffffff);
+	ring[6] = (uint32_t)(fence_va >> 32);
+	ring[7] = (uint32_t)(FENCE_MAGIC & 0xffffffff);
+	ring[8] = (uint32_t)(FENCE_MAGIC >> 32);
+	if (bo_write(fd, ring_h, ring, sizeof(ring)) != 0 ||
+	    submit(fd, ring_h, 9, ATRIUM_GPU_ENGINE_GFX) != 0) {
+		printf("wait: submit failed\n");
+		return (1);
+	}
+
+	/* The fence is written -> blocking wait should return success. */
+	memset(&w, 0, sizeof(w));
+	w.value = FENCE_MAGIC;
+	w.handle = fence_h;
+	w.offset = 0;
+	w.timeout_ms = 1000;
+	if (ioctl(fd, ATRIUM_GPU_IOC_WAIT_FENCE, &w) != 0) {
+		printf("wait FAILED: reached fence did not return success\n");
+		return (1);
+	}
+
+	/* A value never written -> the wait must sleep and time out. */
+	w.value = 0xdeadbeef12345678ULL;
+	w.timeout_ms = 50;
+	if (ioctl(fd, ATRIUM_GPU_IOC_WAIT_FENCE, &w) == 0 || errno != EWOULDBLOCK) {
+		printf("wait FAILED: unreached fence did not time out (errno=%d)\n",
+		    errno);
+		return (1);
+	}
+	printf("wait OK: reached fence returns, unreached fence times out\n");
+	return (0);
+}
+
 int
 main(void)
 {
@@ -306,6 +358,7 @@ main(void)
 	rc |= test_compute(fd);
 	rc |= test_draw(fd);
 	rc |= test_irq(fd);
+	rc |= test_wait(fd);
 	close(fd);
 	printf(rc == 0 ? "ALL OK\n" : "FAILURES\n");
 	return (rc);

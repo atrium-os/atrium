@@ -71,6 +71,15 @@ struct atrium_gpu_irqs {
 	uint32_t	pad;
 };
 
+/* Block until a 64-bit fence word in a BO reaches `value`, or time out. */
+struct atrium_gpu_wait_fence {
+	uint64_t	value;		/* in: fence value to wait for */
+	uint32_t	handle;		/* in: BO holding the fence word */
+	uint32_t	offset;		/* in: byte offset of the u64 fence */
+	uint32_t	timeout_ms;	/* in: max wait (0 = check once) */
+	uint32_t	pad;
+};
+
 #define ATRIUM_GPU_IOC_BO_ALLOC		_IOWR('A', 0, struct atrium_gpu_bo_alloc)
 #define ATRIUM_GPU_IOC_BO_WRITE		_IOW('A', 1, struct atrium_gpu_bo_xfer)
 #define ATRIUM_GPU_IOC_BO_READ		_IOW('A', 2, struct atrium_gpu_bo_xfer)
@@ -78,5 +87,6 @@ struct atrium_gpu_irqs {
 #define ATRIUM_GPU_IOC_SUBMIT		_IOW('A', 4, struct atrium_gpu_submit)
 #define ATRIUM_GPU_IOC_SET_DRAW		_IOW('A', 5, struct atrium_gpu_set_draw)
 #define ATRIUM_GPU_IOC_GET_IRQS		_IOR('A', 6, struct atrium_gpu_irqs)
+#define ATRIUM_GPU_IOC_WAIT_FENCE	_IOW('A', 7, struct atrium_gpu_wait_fence)
 
 #endif /* _ATRIUM_GPU_AMD_ABI_H_ */

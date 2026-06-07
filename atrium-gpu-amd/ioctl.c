@@ -71,6 +71,43 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		return (0);
 	}
 
+	case ATRIUM_GPU_IOC_WAIT_FENCE: {
+		struct atrium_gpu_wait_fence *w =
+		    (struct atrium_gpu_wait_fence *)data;
+		volatile uint64_t *fence;
+		int deadline, slice, recheck;
+
+		bo = amd_bo_lookup(sc, w->handle);
+		err = amd_xfer_bounds(bo, w->offset, sizeof(uint64_t));
+		if (err != 0)
+			return (err);
+		fence = (volatile uint64_t *)((char *)bo->kva + w->offset);
+
+		/*
+		 * Sleep until the GPU's RELEASE_MEM writes `value`, woken by the
+		 * ISR. The fence is set by DMA (not under our lock), so a wakeup
+		 * can race ahead of the sleep; bound each sleep to a recheck
+		 * slice so a missed wakeup still re-tests rather than hanging.
+		 * deadline/slice are in ticks (hz/sec).
+		 */
+		recheck = hz / 100;		/* re-test at least every ~10ms */
+		if (recheck < 1)
+			recheck = 1;
+		deadline = ticks + (int)(((uint64_t)w->timeout_ms * hz) / 1000);
+		mtx_lock(&sc->lock);
+		while (*fence != w->value) {
+			slice = deadline - ticks;
+			if (slice <= 0)
+				break;
+			if (slice > recheck)
+				slice = recheck;
+			msleep(&sc->irq_count, &sc->lock, 0, "amdfence", slice);
+		}
+		err = (*fence == w->value) ? 0 : EWOULDBLOCK;
+		mtx_unlock(&sc->lock);
+		return (err);
+	}
+
 	case ATRIUM_GPU_IOC_GET_IRQS: {
 		struct atrium_gpu_irqs *q = (struct atrium_gpu_irqs *)data;
 

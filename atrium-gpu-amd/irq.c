@@ -36,6 +36,11 @@ amd_intr(void *arg)
 		sc->ih_rptr++;
 	}
 	atomic_add_int(&sc->irq_count, 1);
+
+	/* Wake any thread blocked in IOC_WAIT_FENCE so it re-tests its fence. */
+	mtx_lock(&sc->lock);
+	wakeup(&sc->irq_count);
+	mtx_unlock(&sc->lock);
 }
 
 /*
