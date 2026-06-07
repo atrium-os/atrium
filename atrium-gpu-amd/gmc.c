@@ -65,13 +65,14 @@ amd_gmc_init(struct atrium_amd_softc *sc)
 	amd_mmio_write32(sc, regPT_BASE_HI, (uint32_t)(sc->pdb_gpa >> 32));
 	amd_mmio_write32(sc, regGMC_ENABLE, 1);
 
-	if (amd_dma_alloc(sc, &ih_gpa) == NULL) {
+	sc->ih_kva = amd_dma_alloc(sc, &ih_gpa);
+	if (sc->ih_kva == NULL) {
 		device_printf(sc->dev, "GMC: failed to allocate IH ring\n");
 		return (ENOMEM);
 	}
 	amd_mmio_write32(sc, regIH_BASE_LO, (uint32_t)(ih_gpa & 0xffffffff));
 	amd_mmio_write32(sc, regIH_BASE_HI, (uint32_t)(ih_gpa >> 32));
-	amd_mmio_write32(sc, regIH_SIZE, 256);
+	amd_mmio_write32(sc, regIH_SIZE, ATRIUM_AMD_IH_ENTRIES);
 
 	sc->next_gpu_va = ATRIUM_AMD_BO_VA_BASE;
 	return (0);

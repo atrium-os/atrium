@@ -71,6 +71,14 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		return (0);
 	}
 
+	case ATRIUM_GPU_IOC_GET_IRQS: {
+		struct atrium_gpu_irqs *q = (struct atrium_gpu_irqs *)data;
+
+		q->count = sc->irq_count;
+		q->msix_enabled = sc->msix_enabled;
+		return (0);
+	}
+
 	case ATRIUM_GPU_IOC_SET_DRAW: {
 		struct atrium_gpu_set_draw *d =
 		    (struct atrium_gpu_set_draw *)data;

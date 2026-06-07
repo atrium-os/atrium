@@ -19,6 +19,10 @@
  *   M6  graphics: a DRAW_INDEX_AUTO over the gfx ring rasterizes a triangle
  *       list into a render target (cp.c amd_set_draw + SET_DRAW ioctl); the
  *       test renders a solid quad and reads the pixels back.
+ *   M7  interrupt-driven completion: MSI-X + an ISR draining the IH ring
+ *       (irq.c), so a RELEASE_MEM end-of-pipe IRQ reaches the guest rather
+ *       than relying on the model's synchronous drain. GET_IRQS exposes the
+ *       serviced count; non-fatal fallback to poll mode if MSI-X is absent.
  *
  * WHY one kmod (not the §4.1 three-kmod pci/gpu/display split): there is no
  * display engine yet, so a separate PCI module would buy nothing. WHY the
@@ -43,6 +47,7 @@ amd_teardown(struct atrium_amd_softc *sc)
 {
 	int i;
 
+	amd_irq_teardown(sc);
 	if (sc->cdev != NULL) {
 		destroy_dev(sc->cdev);
 		sc->cdev = NULL;
@@ -142,6 +147,17 @@ atrium_amd_attach(device_t dev)
 	amd_mes_init(sc);
 
 	/*
+	 * Hook MSI-X for interrupt-driven completion (the device raises an
+	 * end-of-pipe IRQ on a RELEASE_MEM fence). Non-fatal: if MSI-X can't be
+	 * set up, the device still works via the synchronous-drain path, so we
+	 * log and run in poll mode rather than failing attach.
+	 */
+	if (amd_irq_setup(sc) == 0)
+		device_printf(dev, "MSI-X enabled (interrupt-driven completion)\n");
+	else
+		device_printf(dev, "MSI-X unavailable — poll mode\n");
+
+	/*
 	 * Publish the userspace interface. From here a user-mode driver (or the
 	 * in-tree test) allocates BOs, lays PM4 rings, and submits — the M3/M4
 	 * proofs now run from userspace rather than as attach self-tests.
@@ -183,4 +199,4 @@ static driver_t atrium_amd_driver = {
 
 DRIVER_MODULE(atrium_gpu_amd, pci, atrium_amd_driver, NULL, NULL);
 MODULE_DEPEND(atrium_gpu_amd, pci, 1, 1, 1);
-MODULE_VERSION(atrium_gpu_amd, 6);
+MODULE_VERSION(atrium_gpu_amd, 7);

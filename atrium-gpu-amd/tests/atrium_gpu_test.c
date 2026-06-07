@@ -239,6 +239,59 @@ test_draw(int fd)
 	return (0);
 }
 
+/* M7: submit a fence-with-IRQ and confirm the ISR serviced a new interrupt. */
+static int
+test_irq(int fd)
+{
+	struct atrium_gpu_irqs q0, q1;
+	uint32_t ring_h, fence_h, ring[9];
+	uint64_t ring_va, fence_va;
+	int i;
+
+	if (ioctl(fd, ATRIUM_GPU_IOC_GET_IRQS, &q0) != 0) {
+		printf("irq: GET_IRQS failed\n");
+		return (1);
+	}
+	if (!q0.msix_enabled) {
+		printf("irq: MSI-X unavailable — poll mode (skipped)\n");
+		return (0);	/* not a failure: the device still works */
+	}
+	if (bo_alloc(fd, 4096, &ring_h, &ring_va) != 0 ||
+	    bo_alloc(fd, 4096, &fence_h, &fence_va) != 0) {
+		printf("irq: BO alloc failed\n");
+		return (1);
+	}
+	ring[0] = type3(IT_NOP, 1);
+	ring[1] = 0;
+	ring[2] = type3(IT_RELEASE_MEM, 6);
+	ring[3] = (5u << 8);
+	ring[4] = (2u << 29) | (2u << 24);	/* DATA_SEL_64BIT | INT_SEL_CONFIRM */
+	ring[5] = (uint32_t)(fence_va & 0xffffffff);
+	ring[6] = (uint32_t)(fence_va >> 32);
+	ring[7] = (uint32_t)(FENCE_MAGIC & 0xffffffff);
+	ring[8] = (uint32_t)(FENCE_MAGIC >> 32);
+	if (bo_write(fd, ring_h, ring, sizeof(ring)) != 0 ||
+	    submit(fd, ring_h, 9, ATRIUM_GPU_ENGINE_GFX) != 0) {
+		printf("irq: submit failed\n");
+		return (1);
+	}
+	/* The ISR fires asynchronously after the doorbell; poll briefly. */
+	for (i = 0; i < 100; i++) {
+		if (ioctl(fd, ATRIUM_GPU_IOC_GET_IRQS, &q1) == 0 &&
+		    q1.count > q0.count)
+			break;
+		usleep(1000);
+	}
+	if (q1.count <= q0.count) {
+		printf("irq FAILED: MSI-X enabled but no delivery (count=%llu)\n",
+		    (unsigned long long)q1.count);
+		return (1);
+	}
+	printf("irq OK: MSI-X delivered (count %llu -> %llu)\n",
+	    (unsigned long long)q0.count, (unsigned long long)q1.count);
+	return (0);
+}
+
 int
 main(void)
 {
@@ -252,6 +305,7 @@ main(void)
 	rc = test_gfx_fence(fd);
 	rc |= test_compute(fd);
 	rc |= test_draw(fd);
+	rc |= test_irq(fd);
 	close(fd);
 	printf(rc == 0 ? "ALL OK\n" : "FAILURES\n");
 	return (rc);

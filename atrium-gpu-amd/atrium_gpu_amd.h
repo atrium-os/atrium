@@ -62,8 +62,13 @@
 #define regPT_BASE_HI		0x5a40	/* GC: ..._HI32 */
 #define regTLB_INVALIDATE	0x591c	/* GC: GCVM_INVALIDATE_ENG0_REQ */
 #define regIH_SIZE		0x10200	/* OSS: IH_RB_CNTL (ring size in entries) */
+#define regIH_WPTR		0x10208	/* OSS: IH_RB_WPTR (device's write pointer) */
 #define regIH_BASE_LO		0x1020c	/* OSS: IH_RB_BASE */
 #define regIH_BASE_HI		0x10210	/* OSS: IH_RB_BASE_HI */
+
+/* Interrupt-handler ring: each entry is a 16-byte cookie [cause:u32, ring:u32]. */
+#define ATRIUM_AMD_IH_ENTRIES	256
+#define ATRIUM_AMD_IH_COOKIE	16
 
 #define regCP_RB0_BASE		0x7780	/* GC: gfx ring base (holds base>>8) */
 #define regCP_RB0_CNTL		0x7784	/* GC: gfx ring size (bytes) */
@@ -159,6 +164,16 @@ struct atrium_amd_softc {
 	int		 doorbell_rid;
 	struct cdev	*cdev;		/* /dev/atrium-gpu0 */
 
+	struct resource	*msix_table;	/* BAR holding the MSI-X table (BAR4) */
+	int		 msix_table_rid;
+	struct resource	*irq;		/* MSI-X vector 0 */
+	int		 irq_rid;
+	void		*intr_cookie;
+	int		 msix_enabled;	/* 1 = interrupt mode, 0 = poll mode */
+	void		*ih_kva;	/* interrupt-handler ring (CPU side) */
+	uint32_t	 ih_rptr;	/* our read pointer into the IH ring */
+	volatile u_int	 irq_count;	/* interrupts serviced (ISR vs reader) */
+
 	void		*pdb_kva;	/* GPUVM page-directory base (VMID 0) */
 	vm_paddr_t	 pdb_gpa;
 	uint64_t	 next_gpu_va;	/* bump allocator for BO virtual addresses */
@@ -220,6 +235,10 @@ void	 amd_set_compute(struct atrium_amd_softc *sc, uint32_t kernel,
 	    uint64_t src_va, uint64_t dst_va);
 void	 amd_set_draw(struct atrium_amd_softc *sc, uint64_t vtx_va,
 	    uint64_t rt_va, uint32_t width, uint32_t height);
+
+/* irq.c — MSI-X interrupt setup + the ISR that drains the IH ring */
+int	 amd_irq_setup(struct atrium_amd_softc *sc);
+void	 amd_irq_teardown(struct atrium_amd_softc *sc);
 
 /* ioctl.c — the cdev character-device switch */
 extern struct cdevsw atrium_amd_cdevsw;
