@@ -38,6 +38,9 @@
  *       and page tables (vm.c); BOs are created + mapped in a VM, submits run
  *       under it. The same GPU-VA in two VMs resolves to different memory —
  *       per-context isolation, the foundation for Portcullis-jailed clients.
+ *   M9d bind apart from submit (v2 principle 4): BO_CREATE allocates memory
+ *       only; VM_BIND maps a BO into a VM at a VA. A BO is unbound until then
+ *       and can be bound once. Completes the v2 memory model's shape.
  *
  * WHY one kmod (not the §4.1 three-kmod pci/gpu/display split): there is no
  * display engine yet, so a separate PCI module would buy nothing. WHY the
@@ -228,4 +231,4 @@ static driver_t atrium_amd_driver = {
 
 DRIVER_MODULE(atrium_gpu_amd, pci, atrium_amd_driver, NULL, NULL);
 MODULE_DEPEND(atrium_gpu_amd, pci, 1, 1, 1);
-MODULE_VERSION(atrium_gpu_amd, 11);
+MODULE_VERSION(atrium_gpu_amd, 12);

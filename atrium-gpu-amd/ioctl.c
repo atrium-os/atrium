@@ -50,13 +50,36 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 	case ATRIUM_GPU_IOC_BO_ALLOC: {
 		struct atrium_gpu_bo_alloc *a = (struct atrium_gpu_bo_alloc *)data;
 		int fd;
-		uint64_t va;
 
-		err = amd_bo_create_fd(sc, td, a->vm_fd, a->size, &fd, &va);
+		err = amd_bo_create_fd(sc, td, a->size, &fd);
 		if (err != 0)
 			return (err);
 		a->bo_fd = fd;
-		a->gpu_va = va;
+		return (0);
+	}
+
+	case ATRIUM_GPU_IOC_VM_BIND: {
+		struct atrium_gpu_vm_bind *b = (struct atrium_gpu_vm_bind *)data;
+		struct atrium_amd_vm *vm;
+		struct file *vmfp, *bofp;
+		uint64_t va = b->va;
+
+		err = amd_vm_fget(td, b->vm_fd, &vmfp, &vm);
+		if (err != 0)
+			return (err);
+		err = amd_bo_fget(td, b->bo_fd, &bofp, &bo);
+		if (err != 0) {
+			fdrop(vmfp, td);
+			return (err);
+		}
+		err = amd_bo_bind(bo, vm, vmfp, &va);
+		fdrop(bofp, td);
+		if (err != 0) {
+			fdrop(vmfp, td);	/* bind failed: BO did not take it */
+			return (err);
+		}
+		/* Success: the BO now owns vmfp — do not drop it here. */
+		b->va = va;
 		return (0);
 	}
 

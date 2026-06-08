@@ -48,18 +48,25 @@ vm_create(int fd)
 	return ((int)v.out_fd);
 }
 
+/* Allocate a BO and bind it into `vm` at an auto VA — the common path. */
 static int
 bo_alloc(int fd, int vm, uint64_t size, uint32_t *handle, uint64_t *gpu_va)
 {
 	struct atrium_gpu_bo_alloc a;
+	struct atrium_gpu_vm_bind b;
 
 	memset(&a, 0, sizeof(a));
 	a.size = size;
-	a.vm_fd = vm;
 	if (ioctl(fd, ATRIUM_GPU_IOC_BO_ALLOC, &a) != 0)
 		return (-1);
+	memset(&b, 0, sizeof(b));
+	b.vm_fd = vm;
+	b.bo_fd = a.bo_fd;
+	b.va = 0;	/* let the kernel pick */
+	if (ioctl(fd, ATRIUM_GPU_IOC_VM_BIND, &b) != 0)
+		return (-1);
 	*handle = a.bo_fd;
-	*gpu_va = a.gpu_va;
+	*gpu_va = b.va;
 	return (0);
 }
 
@@ -484,6 +491,57 @@ test_isolation(int fd)
 	return (0);
 }
 
+/*
+ * M9d: BO_CREATE allocates memory not in any address space; VM_BIND maps it
+ * into a VM at a chosen VA. Proves the two are separate (v2 principle 4) and
+ * that a BO can only be bound once.
+ */
+static int
+test_vm_bind(int fd)
+{
+	struct atrium_gpu_bo_alloc a;
+	struct atrium_gpu_vm_bind b;
+	uint32_t data = 0x5a5a5a5a, back = 0;
+	int vm;
+
+	vm = vm_create(fd);
+	if (vm < 0) {
+		printf("vm_bind: VM_CREATE failed\n");
+		return (1);
+	}
+	memset(&a, 0, sizeof(a));
+	a.size = 4096;
+	if (ioctl(fd, ATRIUM_GPU_IOC_BO_ALLOC, &a) != 0) {
+		printf("vm_bind: BO_CREATE failed\n");
+		return (1);
+	}
+	/* Bind it at an explicit VA (fresh VM, so 0x10000000 is free). */
+	memset(&b, 0, sizeof(b));
+	b.vm_fd = vm;
+	b.bo_fd = a.bo_fd;
+	b.va = 0x10000000;
+	if (ioctl(fd, ATRIUM_GPU_IOC_VM_BIND, &b) != 0 || b.va != 0x10000000) {
+		printf("vm_bind FAILED: bind returned va 0x%llx\n",
+		    (unsigned long long)b.va);
+		return (1);
+	}
+	if (bo_write(fd, a.bo_fd, &data, sizeof(data)) != 0 ||
+	    bo_read(fd, a.bo_fd, &back, sizeof(back)) != 0 || back != data) {
+		printf("vm_bind FAILED: read-back after bind\n");
+		return (1);
+	}
+	/* A second bind of the same BO must be rejected (EBUSY). */
+	if (ioctl(fd, ATRIUM_GPU_IOC_VM_BIND, &b) == 0) {
+		printf("vm_bind FAILED: double-bind allowed\n");
+		return (1);
+	}
+	close((int)a.bo_fd);
+	close(vm);
+	printf("vm_bind OK: create + bind are separate (va 0x10000000), "
+	    "double-bind rejected\n");
+	return (0);
+}
+
 int
 main(void)
 {
@@ -506,6 +564,7 @@ main(void)
 	rc |= test_draw(fd, vm);
 	rc |= test_irq(fd, vm);
 	rc |= test_syncobj(fd, vm);
+	rc |= test_vm_bind(fd);
 	rc |= test_isolation(fd);
 	close(vm);
 	close(fd);

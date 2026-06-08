@@ -100,65 +100,42 @@ const struct fileops atrium_amd_bo_fileops = {
 };
 
 /*
- * Allocate a buffer object inside `vm_fd`'s address space, map it at the VM's
- * next bump VA, and return it as a file descriptor. The BO holds a reference
- * on the VM (so the VM outlives it). The page is allocated before any lock
- * (M_WAITOK may sleep); the VA reservation + bo_count are under sc->lock, and
- * amd_vm_map takes the lock itself for the page-table edit.
+ * Allocate a buffer object: just a page of memory, not yet in any address
+ * space (ABI-v2 principle 4). VM_BIND maps it later. The page is allocated
+ * before any lock (M_WAITOK may sleep).
  */
 int
-amd_bo_create_fd(struct atrium_amd_softc *sc, struct thread *td, int vm_fd,
-    uint64_t size, int *out_fd, uint64_t *out_gpu_va)
+amd_bo_create_fd(struct atrium_amd_softc *sc, struct thread *td, uint64_t size,
+    int *out_fd)
 {
 	struct atrium_amd_bo *bo;
-	struct atrium_amd_vm *vm;
-	struct file *fp, *vm_fp;
-	const uint64_t va_limit = ATRIUM_AMD_BO_VA_BASE +
-	    (uint64_t)ATRIUM_AMD_VM_MAX_BO * PAGE_SIZE;
+	struct file *fp;
 	void *kva;
-	uint64_t va = 0;
 	int fd, err;
 
 	if (size == 0 || size > PAGE_SIZE)
 		return (EINVAL);
 
-	/* The BO takes over this VM reference (released in amd_bo_destroy). */
-	err = amd_vm_fget(td, vm_fd, &vm_fp, &vm);
-	if (err != 0)
-		return (err);
 	kva = contigmalloc(PAGE_SIZE, M_DEVBUF, M_WAITOK | M_ZERO, 0,
 	    BUS_SPACE_MAXADDR, PAGE_SIZE, 0);
-	if (kva == NULL) {
-		fdrop(vm_fp, td);
+	if (kva == NULL)
 		return (ENOMEM);
-	}
 	bo = malloc(sizeof(*bo), M_DEVBUF, M_WAITOK | M_ZERO);
 	bo->sc = sc;
-	bo->vm = vm;
-	bo->vm_fp = vm_fp;
 	bo->kva = kva;
 	bo->gpa = vtophys(kva);
 	bo->size = size;
+	/* bo->vm / vm_fp / gpu_va stay NULL/0 until bound. */
 
 	mtx_lock(&sc->lock);
 	sc->bo_count++;
-	if (vm->next_va >= va_limit) {
-		mtx_unlock(&sc->lock);
-		err = ENOSPC;
-		goto fail;
-	}
-	va = vm->next_va;
-	vm->next_va += PAGE_SIZE;
 	mtx_unlock(&sc->lock);
 
-	err = amd_vm_map(vm, va, bo->gpa);
-	if (err != 0)
-		goto fail;
-	bo->gpu_va = va;
-
 	err = falloc_noinstall(td, &fp);
-	if (err != 0)
-		goto fail;
+	if (err != 0) {
+		amd_bo_destroy(bo, td);
+		return (err);
+	}
 	finit(fp, FREAD | FWRITE, DTYPE_DEV, bo, &atrium_amd_bo_fileops);
 	err = finstall(td, fp, &fd, 0, NULL);
 	fdrop(fp, td);
@@ -166,12 +143,48 @@ amd_bo_create_fd(struct atrium_amd_softc *sc, struct thread *td, int vm_fd,
 		return (err);	/* fo_close already reclaimed the BO */
 
 	*out_fd = fd;
-	*out_gpu_va = va;
 	return (0);
+}
 
-fail:
-	amd_bo_destroy(bo, td);
-	return (err);
+/*
+ * Map an unbound BO into `vm` at *va (0 = pick the VM's next bump VA). On
+ * success the BO records the mapping and takes over `vm_fp` (released when the
+ * BO is freed, so the VM outlives it); on error the caller keeps vm_fp.
+ */
+int
+amd_bo_bind(struct atrium_amd_bo *bo, struct atrium_amd_vm *vm,
+    struct file *vm_fp, uint64_t *va)
+{
+	struct atrium_amd_softc *sc = bo->sc;
+	const uint64_t va_limit = ATRIUM_AMD_BO_VA_BASE +
+	    (uint64_t)ATRIUM_AMD_VM_MAX_BO * PAGE_SIZE;
+	uint64_t addr;
+	int err;
+
+	if (bo->vm != NULL)
+		return (EBUSY);	/* already bound (one binding per BO for now) */
+
+	mtx_lock(&sc->lock);
+	if (*va != 0) {
+		addr = *va;
+	} else if (vm->next_va < va_limit) {
+		addr = vm->next_va;
+		vm->next_va += PAGE_SIZE;
+	} else {
+		mtx_unlock(&sc->lock);
+		return (ENOSPC);
+	}
+	mtx_unlock(&sc->lock);
+
+	err = amd_vm_map(vm, addr, bo->gpa);	/* validates the VA range */
+	if (err != 0)
+		return (err);
+
+	bo->vm = vm;
+	bo->vm_fp = vm_fp;
+	bo->gpu_va = addr;
+	*va = addr;
+	return (0);
 }
 
 /*

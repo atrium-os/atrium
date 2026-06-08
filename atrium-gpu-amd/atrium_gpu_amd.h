@@ -294,12 +294,16 @@ amd_pm4_type3_header(uint32_t opcode, uint32_t body_dwords)
 	    (opcode << 8));
 }
 
-/* bo.c — internal DMA pages + fd-backed buffer objects (mapped into a VM) */
+/* bo.c — internal DMA pages + fd-backed buffer objects */
 void	*amd_dma_alloc(struct atrium_amd_softc *sc, vm_paddr_t *gpa_out);
 int	 amd_bo_create_fd(struct atrium_amd_softc *sc, struct thread *td,
-	    int vm_fd, uint64_t size, int *out_fd, uint64_t *out_gpu_va);
+	    uint64_t size, int *out_fd);
 int	 amd_bo_fget(struct thread *td, int fd, struct file **out_fp,
 	    struct atrium_amd_bo **out_bo);
+/* Map an unbound BO into `vm` at *va (0 = auto). On success the BO takes over
+ * vm_fp; on error the caller keeps it. */
+int	 amd_bo_bind(struct atrium_amd_bo *bo, struct atrium_amd_vm *vm,
+	    struct file *vm_fp, uint64_t *va);
 extern const struct fileops atrium_amd_bo_fileops;
 
 /* vm.c — per-process GPU address spaces (fd-backed) + GPUVM page tables */

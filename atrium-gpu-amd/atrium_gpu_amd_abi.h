@@ -30,16 +30,21 @@ struct atrium_gpu_vm_create {
 };
 
 /*
- * Allocate a buffer object inside a VM. The kernel maps it into that VM's
- * GPUVM and returns it as a file descriptor (fd-as-handle): the BO lives as
- * long as the fd is open, is reclaimed on last close, and is SCM_RIGHTS-
- * passable.
+ * Allocate a buffer object: just memory, not yet in any address space (ABI-v2
+ * principle 4 — bind apart from submit). Returned as a file descriptor; map it
+ * into a VM with VM_BIND before the GPU can reach it.
  */
 struct atrium_gpu_bo_alloc {
 	uint64_t	size;		/* in:  bytes (<= one page for now) */
-	uint64_t	gpu_va;		/* out: GPU virtual address of the BO */
-	uint32_t	vm_fd;		/* in:  the VM to allocate + map in */
 	uint32_t	bo_fd;		/* out: file descriptor naming this BO */
+	uint32_t	pad;
+};
+
+/* Map a BO into a VM at a GPU virtual address (0 = let the kernel pick one). */
+struct atrium_gpu_vm_bind {
+	uint64_t	va;		/* in: GPU-VA (0 = auto); out: actual VA */
+	uint32_t	vm_fd;		/* in: address space to map into */
+	uint32_t	bo_fd;		/* in: buffer object to map */
 };
 
 /* Copy a byte range between userspace and a BO (write = into BO, read = out). */
@@ -120,5 +125,6 @@ struct atrium_gpu_syncobj_wait {
 #define ATRIUM_GPU_IOC_SYNCOBJ_QUERY	_IOWR('A', 10, struct atrium_gpu_syncobj_op)
 #define ATRIUM_GPU_IOC_SYNCOBJ_WAIT	_IOW('A', 11, struct atrium_gpu_syncobj_wait)
 #define ATRIUM_GPU_IOC_VM_CREATE	_IOWR('A', 12, struct atrium_gpu_vm_create)
+#define ATRIUM_GPU_IOC_VM_BIND		_IOWR('A', 13, struct atrium_gpu_vm_bind)
 
 #endif /* _ATRIUM_GPU_AMD_ABI_H_ */
