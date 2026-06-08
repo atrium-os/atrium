@@ -43,6 +43,32 @@ amd_gpuvm_map(struct atrium_amd_softc *sc, uint64_t va, vm_paddr_t phys)
 }
 
 /*
+ * Tear down the mapping for GPU-VA `va` (clear its PTE) and flush the TLB so
+ * the device stops walking into a page that is about to be freed. The page
+ * directory and the page-table page persist (the VA allocator never reuses an
+ * address at this milestone, so there is nothing to reclaim there).
+ */
+void
+amd_gpuvm_unmap(struct atrium_amd_softc *sc, uint64_t va)
+{
+	uint64_t *pde, *pt_kva;
+	vm_paddr_t pt_gpa;
+	uint32_t pd_i, pt_i;
+
+	pd_i = (va >> ATRIUM_AMD_PD_SHIFT) & ATRIUM_AMD_PT_MASK;
+	pt_i = (va >> ATRIUM_AMD_PT_SHIFT) & ATRIUM_AMD_PT_MASK;
+	pde = (uint64_t *)((char *)sc->pdb_kva + pd_i * 8);
+	if ((*pde & ATRIUM_AMD_PTE_VALID) == 0)
+		return;
+	pt_gpa = *pde & ~0xfffULL;
+	pt_kva = amd_dma_kva(sc, pt_gpa);
+	if (pt_kva == NULL)
+		return;
+	pt_kva[pt_i] = 0;
+	amd_mmio_write32(sc, regTLB_INVALIDATE, 1);
+}
+
+/*
  * GMC init: allocate the GPUVM page-directory base for the kernel context
  * (VMID 0), program it, enable paging, and stand up the interrupt-handler
  * ring. After this the device DMA-walks the page tables amd_gpuvm_map builds,

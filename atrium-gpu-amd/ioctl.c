@@ -37,30 +37,45 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 	switch (cmd) {
 	case ATRIUM_GPU_IOC_BO_ALLOC: {
 		struct atrium_gpu_bo_alloc *a = (struct atrium_gpu_bo_alloc *)data;
+		int fd;
+		uint64_t va;
 
-		return (amd_bo_alloc(sc, a->size, &a->handle, &a->gpu_va));
+		err = amd_bo_create_fd(sc, td, a->size, &fd, &va);
+		if (err != 0)
+			return (err);
+		a->bo_fd = fd;
+		a->gpu_va = va;
+		return (0);
 	}
 
 	case ATRIUM_GPU_IOC_BO_WRITE: {
 		struct atrium_gpu_bo_xfer *x = (struct atrium_gpu_bo_xfer *)data;
+		struct file *fp;
 
-		bo = amd_bo_lookup(sc, x->handle);
-		err = amd_xfer_bounds(bo, x->offset, x->len);
+		err = amd_bo_fget(td, x->bo_fd, &fp, &bo);
 		if (err != 0)
 			return (err);
-		return (copyin((const void *)(uintptr_t)x->user_ptr,
-		    (char *)bo->kva + x->offset, x->len));
+		err = amd_xfer_bounds(bo, x->offset, x->len);
+		if (err == 0)
+			err = copyin((const void *)(uintptr_t)x->user_ptr,
+			    (char *)bo->kva + x->offset, x->len);
+		fdrop(fp, td);
+		return (err);
 	}
 
 	case ATRIUM_GPU_IOC_BO_READ: {
 		struct atrium_gpu_bo_xfer *x = (struct atrium_gpu_bo_xfer *)data;
+		struct file *fp;
 
-		bo = amd_bo_lookup(sc, x->handle);
-		err = amd_xfer_bounds(bo, x->offset, x->len);
+		err = amd_bo_fget(td, x->bo_fd, &fp, &bo);
 		if (err != 0)
 			return (err);
-		return (copyout((char *)bo->kva + x->offset,
-		    (void *)(uintptr_t)x->user_ptr, x->len));
+		err = amd_xfer_bounds(bo, x->offset, x->len);
+		if (err == 0)
+			err = copyout((char *)bo->kva + x->offset,
+			    (void *)(uintptr_t)x->user_ptr, x->len);
+		fdrop(fp, td);
+		return (err);
 	}
 
 	case ATRIUM_GPU_IOC_SET_COMPUTE: {
@@ -75,12 +90,17 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		struct atrium_gpu_wait_fence *w =
 		    (struct atrium_gpu_wait_fence *)data;
 		volatile uint64_t *fence;
+		struct file *fp;
 		int deadline, slice, recheck;
 
-		bo = amd_bo_lookup(sc, w->handle);
-		err = amd_xfer_bounds(bo, w->offset, sizeof(uint64_t));
+		err = amd_bo_fget(td, w->fence_fd, &fp, &bo);
 		if (err != 0)
 			return (err);
+		err = amd_xfer_bounds(bo, w->offset, sizeof(uint64_t));
+		if (err != 0) {
+			fdrop(fp, td);
+			return (err);
+		}
 		fence = (volatile uint64_t *)((char *)bo->kva + w->offset);
 
 		/*
@@ -105,6 +125,7 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		}
 		err = (*fence == w->value) ? 0 : EWOULDBLOCK;
 		mtx_unlock(&sc->lock);
+		fdrop(fp, td);
 		return (err);
 	}
 
@@ -126,14 +147,18 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 
 	case ATRIUM_GPU_IOC_SUBMIT: {
 		struct atrium_gpu_submit *s = (struct atrium_gpu_submit *)data;
+		struct file *fp;
 
-		bo = amd_bo_lookup(sc, s->ring_handle);
-		if (bo == NULL)
-			return (ENXIO);
+		err = amd_bo_fget(td, s->ring_fd, &fp, &bo);
+		if (err != 0)
+			return (err);
 		/* The ring must fit the BO (each dword is 4 bytes). */
 		if ((uint64_t)s->n_dwords * 4 > bo->size)
-			return (EINVAL);
-		return (amd_submit(sc, bo, s->n_dwords, s->engine));
+			err = EINVAL;
+		else
+			err = amd_submit(sc, bo, s->n_dwords, s->engine);
+		fdrop(fp, td);
+		return (err);
 	}
 
 	default:

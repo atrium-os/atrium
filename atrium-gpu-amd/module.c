@@ -26,6 +26,10 @@
  *   M8  blocking fence-wait: IOC_WAIT_FENCE sleeps (msleep) until a fence
  *       word in a BO reaches a value — woken by the ISR — or times out, the
  *       GPU-sync primitive a real client uses instead of busy-polling.
+ *   M9a fd-as-handle: a buffer object is a struct file (bo.c), not an integer
+ *       in a table — lifetime is the fd refcount, it is SCM_RIGHTS-passable,
+ *       and BO_CREATE returns an fd that write/read/submit/wait resolve via
+ *       fget. The first step of converging the bring-up ABI toward v2.
  *
  * WHY one kmod (not the §4.1 three-kmod pci/gpu/display split): there is no
  * display engine yet, so a separate PCI module would buy nothing. WHY the
@@ -58,7 +62,6 @@ amd_teardown(struct atrium_amd_softc *sc)
 	for (i = 0; i < sc->n_dma; i++)
 		free(sc->dma[i].kva, M_DEVBUF);
 	sc->n_dma = 0;
-	sc->n_bo = 0;
 	sc->pdb_kva = NULL;
 	if (sc->doorbell != NULL) {
 		bus_release_resource(sc->dev, SYS_RES_MEMORY,
@@ -189,6 +192,16 @@ atrium_amd_detach(device_t dev)
 {
 	struct atrium_amd_softc *sc = device_get_softc(dev);
 
+	/*
+	 * BOs are fd-backed objects that outlive any single ioctl and hold a
+	 * back-reference to this softc; if we freed the device while a bo_fd
+	 * were still open, its eventual fo_close would touch freed memory.
+	 * Refuse to detach until userspace has closed them. (A later milestone
+	 * can replace this with a device refcount the BOs hold.)
+	 */
+	if (sc->bo_count > 0)
+		return (EBUSY);
+
 	amd_teardown(sc);
 	return (0);
 }
@@ -208,4 +221,4 @@ static driver_t atrium_amd_driver = {
 
 DRIVER_MODULE(atrium_gpu_amd, pci, atrium_amd_driver, NULL, NULL);
 MODULE_DEPEND(atrium_gpu_amd, pci, 1, 1, 1);
-MODULE_VERSION(atrium_gpu_amd, 8);
+MODULE_VERSION(atrium_gpu_amd, 9);

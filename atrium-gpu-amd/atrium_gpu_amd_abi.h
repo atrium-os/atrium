@@ -23,11 +23,15 @@
 #define ATRIUM_GPU_ENGINE_GFX		0	/* CP_RB0 graphics ring (queue 0) */
 #define ATRIUM_GPU_ENGINE_COMPUTE	1	/* MEC HQD compute queue (queue 1) */
 
-/* Allocate a buffer object; the kernel maps it into GPUVM and returns its VA. */
+/*
+ * Allocate a buffer object. The kernel maps it into GPUVM and returns it as a
+ * file descriptor (fd-as-handle): the BO lives as long as the fd is open, is
+ * reclaimed on the last close, and is transportable via SCM_RIGHTS.
+ */
 struct atrium_gpu_bo_alloc {
 	uint64_t	size;		/* in:  bytes (<= one page for now) */
 	uint64_t	gpu_va;		/* out: GPU virtual address of the BO */
-	uint32_t	handle;		/* out: handle naming this BO */
+	uint32_t	bo_fd;		/* out: file descriptor naming this BO */
 	uint32_t	pad;
 };
 
@@ -36,7 +40,7 @@ struct atrium_gpu_bo_xfer {
 	uint64_t	offset;		/* in: byte offset within the BO */
 	uint64_t	len;		/* in: byte count */
 	uint64_t	user_ptr;	/* in: userspace buffer (cast of void *) */
-	uint32_t	handle;		/* in: which BO */
+	uint32_t	bo_fd;		/* in: which BO */
 	uint32_t	pad;
 };
 
@@ -48,9 +52,9 @@ struct atrium_gpu_set_compute {
 	uint32_t	pad;
 };
 
-/* Submit a PM4 ring (already laid into ring_handle's BO) on an engine. */
+/* Submit a PM4 ring (already laid into the ring BO) on an engine. */
 struct atrium_gpu_submit {
-	uint32_t	ring_handle;	/* in: BO holding the PM4 ring */
+	uint32_t	ring_fd;	/* in: BO fd holding the PM4 ring */
 	uint32_t	n_dwords;	/* in: ring length in dwords (the wptr) */
 	uint32_t	engine;		/* in: ATRIUM_GPU_ENGINE_* */
 	uint32_t	pad;
@@ -74,7 +78,7 @@ struct atrium_gpu_irqs {
 /* Block until a 64-bit fence word in a BO reaches `value`, or time out. */
 struct atrium_gpu_wait_fence {
 	uint64_t	value;		/* in: fence value to wait for */
-	uint32_t	handle;		/* in: BO holding the fence word */
+	uint32_t	fence_fd;	/* in: BO fd holding the fence word */
 	uint32_t	offset;		/* in: byte offset of the u64 fence */
 	uint32_t	timeout_ms;	/* in: max wait (0 = check once) */
 	uint32_t	pad;

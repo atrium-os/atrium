@@ -45,7 +45,7 @@ bo_alloc(int fd, uint64_t size, uint32_t *handle, uint64_t *gpu_va)
 	a.size = size;
 	if (ioctl(fd, ATRIUM_GPU_IOC_BO_ALLOC, &a) != 0)
 		return (-1);
-	*handle = a.handle;
+	*handle = a.bo_fd;
 	*gpu_va = a.gpu_va;
 	return (0);
 }
@@ -56,7 +56,7 @@ bo_write(int fd, uint32_t handle, const void *src, uint64_t len)
 	struct atrium_gpu_bo_xfer x;
 
 	memset(&x, 0, sizeof(x));
-	x.handle = handle;
+	x.bo_fd = handle;
 	x.len = len;
 	x.user_ptr = (uint64_t)(uintptr_t)src;
 	return (ioctl(fd, ATRIUM_GPU_IOC_BO_WRITE, &x));
@@ -68,7 +68,7 @@ bo_read(int fd, uint32_t handle, void *dst, uint64_t len)
 	struct atrium_gpu_bo_xfer x;
 
 	memset(&x, 0, sizeof(x));
-	x.handle = handle;
+	x.bo_fd = handle;
 	x.len = len;
 	x.user_ptr = (uint64_t)(uintptr_t)dst;
 	return (ioctl(fd, ATRIUM_GPU_IOC_BO_READ, &x));
@@ -80,10 +80,42 @@ submit(int fd, uint32_t ring_handle, uint32_t n_dwords, uint32_t engine)
 	struct atrium_gpu_submit s;
 
 	memset(&s, 0, sizeof(s));
-	s.ring_handle = ring_handle;
+	s.ring_fd = ring_handle;
 	s.n_dwords = n_dwords;
 	s.engine = engine;
 	return (ioctl(fd, ATRIUM_GPU_IOC_SUBMIT, &s));
+}
+
+/* M9a: a BO is a file descriptor — write/read, then close reclaims it. */
+static int
+test_bo_fd(int fd)
+{
+	uint32_t h;
+	uint64_t va;
+	uint32_t data = 0xa5a5a5a5, back = 0;
+
+	if (bo_alloc(fd, 4096, &h, &va) != 0) {
+		printf("bo_fd: alloc failed\n");
+		return (1);
+	}
+	if (bo_write(fd, h, &data, sizeof(data)) != 0 ||
+	    bo_read(fd, h, &back, sizeof(back)) != 0 || back != data) {
+		printf("bo_fd FAILED: write/read round-trip (got 0x%08x)\n", back);
+		return (1);
+	}
+	/* It is a real fd: closing it reclaims the BO. */
+	if (close((int)h) != 0) {
+		printf("bo_fd FAILED: close() errored\n");
+		return (1);
+	}
+	/* The closed fd must no longer resolve to a BO. */
+	if (bo_write(fd, h, &data, sizeof(data)) == 0) {
+		printf("bo_fd FAILED: closed fd still usable\n");
+		return (1);
+	}
+	printf("bo_fd OK: BO is an fd (rw at va 0x%llx, close reclaims, EBADF "
+	    "after)\n", (unsigned long long)va);
+	return (0);
 }
 
 /* M3: lay [NOP, RELEASE_MEM(fence, magic)], submit on gfx, read the fence. */
@@ -324,7 +356,7 @@ test_wait(int fd)
 	/* The fence is written -> blocking wait should return success. */
 	memset(&w, 0, sizeof(w));
 	w.value = FENCE_MAGIC;
-	w.handle = fence_h;
+	w.fence_fd = fence_h;
 	w.offset = 0;
 	w.timeout_ms = 1000;
 	if (ioctl(fd, ATRIUM_GPU_IOC_WAIT_FENCE, &w) != 0) {
@@ -354,7 +386,8 @@ main(void)
 		perror("open /dev/atrium-gpu0");
 		return (1);
 	}
-	rc = test_gfx_fence(fd);
+	rc = test_bo_fd(fd);
+	rc |= test_gfx_fence(fd);
 	rc |= test_compute(fd);
 	rc |= test_draw(fd);
 	rc |= test_irq(fd);

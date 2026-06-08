@@ -18,12 +18,19 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/bus.h>
+#include <sys/capsicum.h>
 #include <sys/conf.h>
+#include <sys/fcntl.h>
+#include <sys/file.h>
+#include <sys/filedesc.h>
 #include <sys/kernel.h>
 #include <sys/lock.h>
 #include <sys/malloc.h>
 #include <sys/mutex.h>
+#include <sys/proc.h>
 #include <sys/rman.h>
+#include <sys/stat.h>
+#include <sys/user.h>
 
 #include <machine/bus.h>
 #include <machine/resource.h>
@@ -152,9 +159,18 @@ struct atrium_amd_dma_page {
 	vm_paddr_t	 gpa;
 };
 
-/* A buffer object: a DMA page exposed to userspace at a GPU virtual address. */
+/*
+ * A buffer object: a DMA page mapped into GPUVM and exposed to userspace as a
+ * file descriptor (fd-as-handle — ABI-v2 principle 2). Lifetime is the fd
+ * refcount; the BO owns its own page (distinct from the internal dma[] pages
+ * that back page tables / the IH ring). It carries a back-reference to the
+ * device so fo_close can unmap + free without a handle table.
+ */
+struct atrium_amd_softc;
 struct atrium_amd_bo {
+	struct atrium_amd_softc *sc;
 	void		*kva;
+	vm_paddr_t	 gpa;
 	uint64_t	 gpu_va;
 	uint64_t	 size;
 };
@@ -185,8 +201,7 @@ struct atrium_amd_softc {
 
 	struct atrium_amd_dma_page dma[ATRIUM_AMD_MAX_DMA];
 	int		 n_dma;
-	struct atrium_amd_bo bo[ATRIUM_AMD_MAX_BO];
-	int		 n_bo;
+	int		 bo_count;	/* live bo_fds; detach refuses if > 0 */
 };
 
 /*
@@ -215,17 +230,19 @@ amd_pm4_type3_header(uint32_t opcode, uint32_t body_dwords)
 	    (opcode << 8));
 }
 
-/* bo.c — DMA pages + buffer objects */
+/* bo.c — DMA pages (internal) + fd-backed buffer objects */
 void	*amd_dma_alloc(struct atrium_amd_softc *sc, vm_paddr_t *gpa_out);
 void	*amd_dma_kva(struct atrium_amd_softc *sc, vm_paddr_t gpa);
-int	 amd_bo_alloc(struct atrium_amd_softc *sc, uint64_t size,
-	    uint32_t *handle_out, uint64_t *gpu_va_out);
-struct atrium_amd_bo *amd_bo_lookup(struct atrium_amd_softc *sc,
-	    uint32_t handle);
+int	 amd_bo_create_fd(struct atrium_amd_softc *sc, struct thread *td,
+	    uint64_t size, int *out_fd, uint64_t *out_gpu_va);
+int	 amd_bo_fget(struct thread *td, int fd, struct file **out_fp,
+	    struct atrium_amd_bo **out_bo);
+extern const struct fileops atrium_amd_bo_fileops;
 
 /* gmc.c — GPUVM */
 int	 amd_gpuvm_map(struct atrium_amd_softc *sc, uint64_t va,
 	    vm_paddr_t phys);
+void	 amd_gpuvm_unmap(struct atrium_amd_softc *sc, uint64_t va);
 int	 amd_gmc_init(struct atrium_amd_softc *sc);
 
 /* firmware.c — bring-up */
