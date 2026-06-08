@@ -23,16 +23,23 @@
 #define ATRIUM_GPU_ENGINE_GFX		0	/* CP_RB0 graphics ring (queue 0) */
 #define ATRIUM_GPU_ENGINE_COMPUTE	1	/* MEC HQD compute queue (queue 1) */
 
+/* Create a per-process GPU address space; the kernel returns it as an fd. */
+struct atrium_gpu_vm_create {
+	uint32_t	out_fd;		/* out: the vm fd */
+	uint32_t	pad;
+};
+
 /*
- * Allocate a buffer object. The kernel maps it into GPUVM and returns it as a
- * file descriptor (fd-as-handle): the BO lives as long as the fd is open, is
- * reclaimed on the last close, and is transportable via SCM_RIGHTS.
+ * Allocate a buffer object inside a VM. The kernel maps it into that VM's
+ * GPUVM and returns it as a file descriptor (fd-as-handle): the BO lives as
+ * long as the fd is open, is reclaimed on last close, and is SCM_RIGHTS-
+ * passable.
  */
 struct atrium_gpu_bo_alloc {
 	uint64_t	size;		/* in:  bytes (<= one page for now) */
 	uint64_t	gpu_va;		/* out: GPU virtual address of the BO */
+	uint32_t	vm_fd;		/* in:  the VM to allocate + map in */
 	uint32_t	bo_fd;		/* out: file descriptor naming this BO */
-	uint32_t	pad;
 };
 
 /* Copy a byte range between userspace and a BO (write = into BO, read = out). */
@@ -58,10 +65,12 @@ struct atrium_gpu_set_compute {
  */
 struct atrium_gpu_submit {
 	uint64_t	signal_value;	/* in: timeline value to signal on done */
+	uint32_t	vm_fd;		/* in: address space to submit under */
 	uint32_t	ring_fd;	/* in: BO fd holding the PM4 ring */
 	uint32_t	n_dwords;	/* in: ring length in dwords (the wptr) */
 	uint32_t	engine;		/* in: ATRIUM_GPU_ENGINE_* */
 	int32_t		signal_syncobj_fd; /* in: syncobj to signal (-1 = none) */
+	uint32_t	pad;
 };
 
 /* Program graphics DRAW state read by a DRAW_INDEX_AUTO packet on the gfx ring. */
@@ -110,5 +119,6 @@ struct atrium_gpu_syncobj_wait {
 #define ATRIUM_GPU_IOC_SYNCOBJ_SIGNAL	_IOW('A', 9, struct atrium_gpu_syncobj_op)
 #define ATRIUM_GPU_IOC_SYNCOBJ_QUERY	_IOWR('A', 10, struct atrium_gpu_syncobj_op)
 #define ATRIUM_GPU_IOC_SYNCOBJ_WAIT	_IOW('A', 11, struct atrium_gpu_syncobj_wait)
+#define ATRIUM_GPU_IOC_VM_CREATE	_IOWR('A', 12, struct atrium_gpu_vm_create)
 
 #endif /* _ATRIUM_GPU_AMD_ABI_H_ */

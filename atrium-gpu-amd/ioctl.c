@@ -35,12 +35,24 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 	int err;
 
 	switch (cmd) {
+	case ATRIUM_GPU_IOC_VM_CREATE: {
+		struct atrium_gpu_vm_create *v =
+		    (struct atrium_gpu_vm_create *)data;
+		int fd;
+
+		err = amd_vm_create_fd(sc, td, &fd);
+		if (err != 0)
+			return (err);
+		v->out_fd = fd;
+		return (0);
+	}
+
 	case ATRIUM_GPU_IOC_BO_ALLOC: {
 		struct atrium_gpu_bo_alloc *a = (struct atrium_gpu_bo_alloc *)data;
 		int fd;
 		uint64_t va;
 
-		err = amd_bo_create_fd(sc, td, a->size, &fd, &va);
+		err = amd_bo_create_fd(sc, td, a->vm_fd, a->size, &fd, &va);
 		if (err != 0)
 			return (err);
 		a->bo_fd = fd;
@@ -171,17 +183,25 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 	case ATRIUM_GPU_IOC_SUBMIT: {
 		struct atrium_gpu_submit *s = (struct atrium_gpu_submit *)data;
 		struct atrium_amd_syncobj *so;
-		struct file *fp, *sfp;
+		struct atrium_amd_vm *vm;
+		struct file *fp, *vmfp, *sfp;
 
-		err = amd_bo_fget(td, s->ring_fd, &fp, &bo);
+		err = amd_vm_fget(td, s->vm_fd, &vmfp, &vm);
 		if (err != 0)
 			return (err);
+		err = amd_bo_fget(td, s->ring_fd, &fp, &bo);
+		if (err != 0) {
+			fdrop(vmfp, td);
+			return (err);
+		}
 		/* The ring must fit the BO (each dword is 4 bytes). */
 		if ((uint64_t)s->n_dwords * 4 > bo->size)
 			err = EINVAL;
 		else
-			err = amd_submit(sc, bo, s->n_dwords, s->engine);
+			err = amd_submit(sc, bo, s->n_dwords, s->engine,
+			    vm->vmid);
 		fdrop(fp, td);
+		fdrop(vmfp, td);
 
 		/*
 		 * Signal the completion syncobj. The model drains the ring

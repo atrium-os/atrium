@@ -1,10 +1,10 @@
 /*
  * atrium_gpu_test — userspace exercise of the /dev/atrium-gpu0 ABI.
  *
- * Reproduces the M3 (gfx fence) and M4 (compute) proofs entirely from
- * userspace, over the ioctl interface: allocate BOs, build PM4 rings, submit,
- * read results back. This is what a real user-mode driver does — and it
- * replaces the attach self-tests the kernel used to run.
+ * Drives the ioctl interface the way a user-mode driver would: create an
+ * address space (VM), allocate BOs in it, build PM4 rings, submit under the
+ * VM, wait via a kqueue-able syncobj, read results back. The final test proves
+ * per-VM isolation: the same GPU-VA in two VMs resolves to different memory.
  *
  * Build + run in the guest:
  *   cc -Wall -o /tmp/atrium_gpu_test tests/atrium_gpu_test.c
@@ -22,7 +22,6 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
-/* PM4 type-3 header + the opcodes/fields this test emits (engine/src/pm4.rs). */
 #define PM4_TYPE3		3u
 #define IT_NOP			0x10u
 #define IT_RELEASE_MEM		0x49u
@@ -39,12 +38,24 @@ type3(uint32_t opcode, uint32_t body_dwords)
 }
 
 static int
-bo_alloc(int fd, uint64_t size, uint32_t *handle, uint64_t *gpu_va)
+vm_create(int fd)
+{
+	struct atrium_gpu_vm_create v;
+
+	memset(&v, 0, sizeof(v));
+	if (ioctl(fd, ATRIUM_GPU_IOC_VM_CREATE, &v) != 0)
+		return (-1);
+	return ((int)v.out_fd);
+}
+
+static int
+bo_alloc(int fd, int vm, uint64_t size, uint32_t *handle, uint64_t *gpu_va)
 {
 	struct atrium_gpu_bo_alloc a;
 
 	memset(&a, 0, sizeof(a));
 	a.size = size;
+	a.vm_fd = vm;
 	if (ioctl(fd, ATRIUM_GPU_IOC_BO_ALLOC, &a) != 0)
 		return (-1);
 	*handle = a.bo_fd;
@@ -77,11 +88,12 @@ bo_read(int fd, uint32_t handle, void *dst, uint64_t len)
 }
 
 static int
-submit(int fd, uint32_t ring_handle, uint32_t n_dwords, uint32_t engine)
+submit(int fd, int vm, uint32_t ring_handle, uint32_t n_dwords, uint32_t engine)
 {
 	struct atrium_gpu_submit s;
 
 	memset(&s, 0, sizeof(s));
+	s.vm_fd = vm;
 	s.ring_fd = ring_handle;
 	s.n_dwords = n_dwords;
 	s.engine = engine;
@@ -91,13 +103,13 @@ submit(int fd, uint32_t ring_handle, uint32_t n_dwords, uint32_t engine)
 
 /* M9a: a BO is a file descriptor — write/read, then close reclaims it. */
 static int
-test_bo_fd(int fd)
+test_bo_fd(int fd, int vm)
 {
 	uint32_t h;
 	uint64_t va;
 	uint32_t data = 0xa5a5a5a5, back = 0;
 
-	if (bo_alloc(fd, 4096, &h, &va) != 0) {
+	if (bo_alloc(fd, vm, 4096, &h, &va) != 0) {
 		printf("bo_fd: alloc failed\n");
 		return (1);
 	}
@@ -106,12 +118,10 @@ test_bo_fd(int fd)
 		printf("bo_fd FAILED: write/read round-trip (got 0x%08x)\n", back);
 		return (1);
 	}
-	/* It is a real fd: closing it reclaims the BO. */
 	if (close((int)h) != 0) {
 		printf("bo_fd FAILED: close() errored\n");
 		return (1);
 	}
-	/* The closed fd must no longer resolve to a BO. */
 	if (bo_write(fd, h, &data, sizeof(data)) == 0) {
 		printf("bo_fd FAILED: closed fd still usable\n");
 		return (1);
@@ -123,28 +133,28 @@ test_bo_fd(int fd)
 
 /* M3: lay [NOP, RELEASE_MEM(fence, magic)], submit on gfx, read the fence. */
 static int
-test_gfx_fence(int fd)
+test_gfx_fence(int fd, int vm)
 {
 	uint32_t ring_h, fence_h, ring[9];
 	uint64_t ring_va, fence_va, fence = 0;
 
-	if (bo_alloc(fd, 4096, &ring_h, &ring_va) != 0 ||
-	    bo_alloc(fd, 4096, &fence_h, &fence_va) != 0) {
+	if (bo_alloc(fd, vm, 4096, &ring_h, &ring_va) != 0 ||
+	    bo_alloc(fd, vm, 4096, &fence_h, &fence_va) != 0) {
 		printf("gfx: BO alloc failed\n");
 		return (1);
 	}
 	ring[0] = type3(IT_NOP, 1);
 	ring[1] = 0;
 	ring[2] = type3(IT_RELEASE_MEM, 6);
-	ring[3] = (5u << 8);			/* EVENT_INDEX = end-of-pipe */
-	ring[4] = (2u << 29) | (2u << 24);	/* DATA_SEL_64BIT | INT_SEL_CONFIRM */
+	ring[3] = (5u << 8);
+	ring[4] = (2u << 29) | (2u << 24);
 	ring[5] = (uint32_t)(fence_va & 0xffffffff);
 	ring[6] = (uint32_t)(fence_va >> 32);
 	ring[7] = (uint32_t)(FENCE_MAGIC & 0xffffffff);
 	ring[8] = (uint32_t)(FENCE_MAGIC >> 32);
 
 	if (bo_write(fd, ring_h, ring, sizeof(ring)) != 0 ||
-	    submit(fd, ring_h, 9, ATRIUM_GPU_ENGINE_GFX) != 0 ||
+	    submit(fd, vm, ring_h, 9, ATRIUM_GPU_ENGINE_GFX) != 0 ||
 	    bo_read(fd, fence_h, &fence, sizeof(fence)) != 0) {
 		printf("gfx: ioctl failed\n");
 		return (1);
@@ -160,7 +170,7 @@ test_gfx_fence(int fd)
 
 /* M4: stage input, lay DISPATCH, set compute state, submit, read results. */
 static int
-test_compute(int fd)
+test_compute(int fd, int vm)
 {
 	uint32_t src_h, dst_h, ring_h, ring[4];
 	uint32_t in[4] = { 10, 20, 30, 40 }, out[4] = { 0 };
@@ -168,9 +178,9 @@ test_compute(int fd)
 	struct atrium_gpu_set_compute c;
 	int i;
 
-	if (bo_alloc(fd, 4096, &src_h, &src_va) != 0 ||
-	    bo_alloc(fd, 4096, &dst_h, &dst_va) != 0 ||
-	    bo_alloc(fd, 4096, &ring_h, &ring_va) != 0) {
+	if (bo_alloc(fd, vm, 4096, &src_h, &src_va) != 0 ||
+	    bo_alloc(fd, vm, 4096, &dst_h, &dst_va) != 0 ||
+	    bo_alloc(fd, vm, 4096, &ring_h, &ring_va) != 0) {
 		printf("compute: BO alloc failed\n");
 		return (1);
 	}
@@ -179,9 +189,9 @@ test_compute(int fd)
 		return (1);
 	}
 	ring[0] = type3(IT_DISPATCH_DIRECT, 3);
-	ring[1] = 4;	/* x = element count */
-	ring[2] = 1;	/* y */
-	ring[3] = 1;	/* z */
+	ring[1] = 4;
+	ring[2] = 1;
+	ring[3] = 1;
 	if (bo_write(fd, ring_h, ring, sizeof(ring)) != 0) {
 		printf("compute: write ring failed\n");
 		return (1);
@@ -195,7 +205,7 @@ test_compute(int fd)
 		printf("compute: set_compute failed\n");
 		return (1);
 	}
-	if (submit(fd, ring_h, 4, ATRIUM_GPU_ENGINE_COMPUTE) != 0 ||
+	if (submit(fd, vm, ring_h, 4, ATRIUM_GPU_ENGINE_COMPUTE) != 0 ||
 	    bo_read(fd, dst_h, out, sizeof(out)) != 0) {
 		printf("compute: submit/read failed\n");
 		return (1);
@@ -211,7 +221,6 @@ test_compute(int fd)
 	return (0);
 }
 
-/* Write one 24-byte vertex (NDC x,y,z + texcoord u,v + RGBA color) at v[i]. */
 static void
 put_vert(uint8_t *v, int i, float x, float y, float z, uint32_t color)
 {
@@ -220,14 +229,14 @@ put_vert(uint8_t *v, int i, float x, float y, float z, uint32_t color)
 	memcpy(v + i * 24 + 0, &x, 4);
 	memcpy(v + i * 24 + 4, &y, 4);
 	memcpy(v + i * 24 + 8, &z, 4);
-	memcpy(v + i * 24 + 12, &zero, 4);	/* u */
-	memcpy(v + i * 24 + 16, &zero, 4);	/* v */
+	memcpy(v + i * 24 + 12, &zero, 4);
+	memcpy(v + i * 24 + 16, &zero, 4);
 	memcpy(v + i * 24 + 20, &color, 4);
 }
 
 /* M6: render a full-screen quad (2 tris) of solid color, read back the RT. */
 static int
-test_draw(int fd)
+test_draw(int fd, int vm)
 {
 	const uint32_t W = 16, H = 16, C = 0xff3366cc;
 	uint32_t vtx_h, rt_h, ring_h, ring[2], rt[16 * 16];
@@ -236,13 +245,12 @@ test_draw(int fd)
 	uint8_t v[6 * 24];
 	unsigned i;
 
-	if (bo_alloc(fd, sizeof(v), &vtx_h, &vtx_va) != 0 ||
-	    bo_alloc(fd, sizeof(rt), &rt_h, &rt_va) != 0 ||
-	    bo_alloc(fd, sizeof(ring), &ring_h, &ring_va) != 0) {
+	if (bo_alloc(fd, vm, sizeof(v), &vtx_h, &vtx_va) != 0 ||
+	    bo_alloc(fd, vm, sizeof(rt), &rt_h, &rt_va) != 0 ||
+	    bo_alloc(fd, vm, sizeof(ring), &ring_h, &ring_va) != 0) {
 		printf("draw: BO alloc failed\n");
 		return (1);
 	}
-	/* Two triangles tiling NDC [-1,1]^2 -> covers every RT pixel. */
 	put_vert(v, 0, -1, -1, 0, C);
 	put_vert(v, 1,  1, -1, 0, C);
 	put_vert(v, 2,  1,  1, 0, C);
@@ -250,7 +258,7 @@ test_draw(int fd)
 	put_vert(v, 4,  1,  1, 0, C);
 	put_vert(v, 5, -1,  1, 0, C);
 	ring[0] = type3(IT_DRAW_INDEX_AUTO, 1);
-	ring[1] = 6;	/* vertex count */
+	ring[1] = 6;
 
 	memset(&d, 0, sizeof(d));
 	d.vtx_va = vtx_va;
@@ -260,7 +268,7 @@ test_draw(int fd)
 	if (bo_write(fd, vtx_h, v, sizeof(v)) != 0 ||
 	    bo_write(fd, ring_h, ring, sizeof(ring)) != 0 ||
 	    ioctl(fd, ATRIUM_GPU_IOC_SET_DRAW, &d) != 0 ||
-	    submit(fd, ring_h, 2, ATRIUM_GPU_ENGINE_GFX) != 0 ||
+	    submit(fd, vm, ring_h, 2, ATRIUM_GPU_ENGINE_GFX) != 0 ||
 	    bo_read(fd, rt_h, rt, sizeof(rt)) != 0) {
 		printf("draw: ioctl failed\n");
 		return (1);
@@ -277,7 +285,7 @@ test_draw(int fd)
 
 /* M7: submit a fence-with-IRQ and confirm the ISR serviced a new interrupt. */
 static int
-test_irq(int fd)
+test_irq(int fd, int vm)
 {
 	struct atrium_gpu_irqs q0, q1;
 	uint32_t ring_h, fence_h, ring[9];
@@ -290,10 +298,10 @@ test_irq(int fd)
 	}
 	if (!q0.msix_enabled) {
 		printf("irq: MSI-X unavailable — poll mode (skipped)\n");
-		return (0);	/* not a failure: the device still works */
+		return (0);
 	}
-	if (bo_alloc(fd, 4096, &ring_h, &ring_va) != 0 ||
-	    bo_alloc(fd, 4096, &fence_h, &fence_va) != 0) {
+	if (bo_alloc(fd, vm, 4096, &ring_h, &ring_va) != 0 ||
+	    bo_alloc(fd, vm, 4096, &fence_h, &fence_va) != 0) {
 		printf("irq: BO alloc failed\n");
 		return (1);
 	}
@@ -301,17 +309,16 @@ test_irq(int fd)
 	ring[1] = 0;
 	ring[2] = type3(IT_RELEASE_MEM, 6);
 	ring[3] = (5u << 8);
-	ring[4] = (2u << 29) | (2u << 24);	/* DATA_SEL_64BIT | INT_SEL_CONFIRM */
+	ring[4] = (2u << 29) | (2u << 24);
 	ring[5] = (uint32_t)(fence_va & 0xffffffff);
 	ring[6] = (uint32_t)(fence_va >> 32);
 	ring[7] = (uint32_t)(FENCE_MAGIC & 0xffffffff);
 	ring[8] = (uint32_t)(FENCE_MAGIC >> 32);
 	if (bo_write(fd, ring_h, ring, sizeof(ring)) != 0 ||
-	    submit(fd, ring_h, 9, ATRIUM_GPU_ENGINE_GFX) != 0) {
+	    submit(fd, vm, ring_h, 9, ATRIUM_GPU_ENGINE_GFX) != 0) {
 		printf("irq: submit failed\n");
 		return (1);
 	}
-	/* The ISR fires asynchronously after the doorbell; poll briefly. */
 	for (i = 0; i < 100; i++) {
 		if (ioctl(fd, ATRIUM_GPU_IOC_GET_IRQS, &q1) == 0 &&
 		    q1.count > q0.count)
@@ -328,13 +335,9 @@ test_irq(int fd)
 	return (0);
 }
 
-/*
- * M9b: a submission signals a timeline syncobj on completion; userspace waits
- * for it via kqueue (the threshold rides in the kevent `data` field) and via
- * the blocking SYNCOBJ_WAIT/QUERY ioctls.
- */
+/* M9b: a submission signals a timeline syncobj; wait via kqueue + blocking. */
 static int
-test_syncobj(int fd)
+test_syncobj(int fd, int vm)
 {
 	struct atrium_gpu_syncobj_create cr;
 	struct atrium_gpu_syncobj_op q;
@@ -353,7 +356,6 @@ test_syncobj(int fd)
 	}
 	so_fd = (int)cr.out_fd;
 
-	/* Register the syncobj with kqueue: fire when its value reaches 1. */
 	kq = kqueue();
 	EV_SET(&kev, so_fd, EVFILT_READ, EV_ADD, 0, 1 /* threshold */, NULL);
 	if (kq < 0 || kevent(kq, &kev, 1, NULL, 0, NULL) != 0) {
@@ -361,9 +363,8 @@ test_syncobj(int fd)
 		return (1);
 	}
 
-	/* A trivial gfx job, submitted so it signals the syncobj to value 1. */
-	if (bo_alloc(fd, 4096, &ring_h, &ring_va) != 0 ||
-	    bo_alloc(fd, 4096, &fence_h, &fence_va) != 0) {
+	if (bo_alloc(fd, vm, 4096, &ring_h, &ring_va) != 0 ||
+	    bo_alloc(fd, vm, 4096, &fence_h, &fence_va) != 0) {
 		printf("syncobj: BO alloc failed\n");
 		return (1);
 	}
@@ -377,6 +378,7 @@ test_syncobj(int fd)
 	ring[7] = (uint32_t)(FENCE_MAGIC & 0xffffffff);
 	ring[8] = (uint32_t)(FENCE_MAGIC >> 32);
 	memset(&s, 0, sizeof(s));
+	s.vm_fd = vm;
 	s.ring_fd = ring_h;
 	s.n_dwords = 9;
 	s.engine = ATRIUM_GPU_ENGINE_GFX;
@@ -388,14 +390,12 @@ test_syncobj(int fd)
 		return (1);
 	}
 
-	/* kqueue must report the syncobj ready. */
 	n = kevent(kq, NULL, 0, &kev, 1, &ts);
 	if (n != 1 || (int)kev.ident != so_fd) {
 		printf("syncobj FAILED: kqueue did not fire (n=%d)\n", n);
 		return (1);
 	}
 
-	/* Blocking wait + query must also see the reached value. */
 	memset(&wt, 0, sizeof(wt));
 	wt.syncobj_fd = so_fd;
 	wt.value = 1;
@@ -419,22 +419,95 @@ test_syncobj(int fd)
 	return (0);
 }
 
+/* Run an INC compute over a one-element src in `vm`; returns dst[0] (or -1). */
+static long
+inc_one(int fd, int vm, uint32_t input)
+{
+	struct atrium_gpu_set_compute c;
+	uint32_t src_h, dst_h, ring_h, ring[4], out = 0;
+	uint64_t src_va, dst_va, ring_va;
+
+	if (bo_alloc(fd, vm, 4096, &src_h, &src_va) != 0 ||
+	    bo_alloc(fd, vm, 4096, &dst_h, &dst_va) != 0 ||
+	    bo_alloc(fd, vm, 4096, &ring_h, &ring_va) != 0)
+		return (-1);
+	if (bo_write(fd, src_h, &input, sizeof(input)) != 0)
+		return (-1);
+	ring[0] = type3(IT_DISPATCH_DIRECT, 3);
+	ring[1] = 1;
+	ring[2] = 1;
+	ring[3] = 1;
+	if (bo_write(fd, ring_h, ring, sizeof(ring)) != 0)
+		return (-1);
+	memset(&c, 0, sizeof(c));
+	c.kernel = KERNEL_INC;
+	c.src_va = src_va;	/* same VA for both VMs — that's the point */
+	c.dst_va = dst_va;
+	if (ioctl(fd, ATRIUM_GPU_IOC_SET_COMPUTE, &c) != 0)
+		return (-1);
+	if (submit(fd, vm, ring_h, 4, ATRIUM_GPU_ENGINE_COMPUTE) != 0)
+		return (-1);
+	if (bo_read(fd, dst_h, &out, sizeof(out)) != 0)
+		return (-1);
+	return ((long)out);
+}
+
+/*
+ * M9c: per-VM isolation. Two VMs each place their first BO at the same GPU-VA
+ * (BO_VA_BASE); a compute under each reads that VA and must see only its own
+ * VM's data — proving the VA resolves through different page tables per VMID.
+ */
+static int
+test_isolation(int fd)
+{
+	long out_a, out_b;
+	int vma, vmb;
+
+	vma = vm_create(fd);
+	vmb = vm_create(fd);
+	if (vma < 0 || vmb < 0) {
+		printf("isolation: VM_CREATE failed\n");
+		return (1);
+	}
+	/* Each VM's first BO (the src) lands at the same VA, BO_VA_BASE. */
+	out_a = inc_one(fd, vma, 100);
+	out_b = inc_one(fd, vmb, 200);
+	if (out_a != 101 || out_b != 201) {
+		printf("isolation FAILED: vmA=%ld (want 101), vmB=%ld (want 201)\n",
+		    out_a, out_b);
+		return (1);
+	}
+	close(vma);
+	close(vmb);
+	printf("isolation OK: same VA -> 100->101 in vmA, 200->201 in vmB "
+	    "(per-VMID page tables)\n");
+	return (0);
+}
+
 int
 main(void)
 {
-	int fd, rc;
+	int fd, vm, rc;
 
 	fd = open("/dev/atrium-gpu0", O_RDWR);
 	if (fd < 0) {
 		perror("open /dev/atrium-gpu0");
 		return (1);
 	}
-	rc = test_bo_fd(fd);
-	rc |= test_gfx_fence(fd);
-	rc |= test_compute(fd);
-	rc |= test_draw(fd);
-	rc |= test_irq(fd);
-	rc |= test_syncobj(fd);
+	vm = vm_create(fd);
+	if (vm < 0) {
+		printf("VM_CREATE failed\n");
+		close(fd);
+		return (1);
+	}
+	rc = test_bo_fd(fd, vm);
+	rc |= test_gfx_fence(fd, vm);
+	rc |= test_compute(fd, vm);
+	rc |= test_draw(fd, vm);
+	rc |= test_irq(fd, vm);
+	rc |= test_syncobj(fd, vm);
+	rc |= test_isolation(fd);
+	close(vm);
 	close(fd);
 	printf(rc == 0 ? "ALL OK\n" : "FAILURES\n");
 	return (rc);

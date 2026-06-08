@@ -1,24 +1,18 @@
 /*
  * bo.c — internal DMA pages + fd-backed buffer objects.
  *
- * Two memory roles live here. `amd_dma_alloc`/`amd_dma_kva` back the driver's
- * *internal* pages — page-table pages and the IH ring — which live in the
- * softc's fixed dma[] registry and are freed at teardown. Buffer *objects*,
- * by contrast, are the resources userspace owns: each is a `struct file`
- * (fd-as-handle, ABI-v2 principle 2), owns its own page, and is unmapped +
- * freed when its last fd reference closes. The integer handle table is gone.
+ * `amd_dma_alloc` backs the driver's one remaining internal page (the IH ring;
+ * page tables are now per-VM, vm.c). Buffer *objects* are the resources
+ * userspace owns: each is a `struct file` (fd-as-handle), owns its own page,
+ * is mapped into a VM's GPUVM at allocation, and holds a reference on that VM
+ * so it can unmap on close. The integer handle table is gone.
  */
 #include "atrium_gpu_amd.h"
 
 /*
- * Allocate one page of DMA-able guest memory for *internal* use (page tables,
- * IH ring) and register it. Returns the kernel VA and, via *gpa_out, the
- * guest-physical address the device DMA-walks.
- *
- * WHY contigmalloc + vtophys, not busdma: gpusim runs in a VM with no IOMMU on
- * this device, so the guest-physical address IS the address the model's DMA
- * backend (QEMU pci_dma_read/write) uses. Real silicon needs bus_dma tags +
- * bus_dmamap_sync; deferred with multi-page BOs.
+ * Allocate one page of DMA-able guest memory for internal use and register it.
+ * Returns the kernel VA and, via *gpa_out, the guest-physical address the
+ * device DMA-walks. (VM/no-IOMMU: gpa == vtophys; real silicon needs bus_dma.)
  */
 void *
 amd_dma_alloc(struct atrium_amd_softc *sc, vm_paddr_t *gpa_out)
@@ -38,39 +32,29 @@ amd_dma_alloc(struct atrium_amd_softc *sc, vm_paddr_t *gpa_out)
 	return (kva);
 }
 
+/* --- buffer objects: fd-backed, mapped into a VM --- */
+
 /*
- * Map a registered internal DMA page's guest-physical address back to its
- * kernel VA — needed when the GPUVM walker reuses a page-table page (we hold
- * the PDE's phys but must write PTEs through the CPU mapping).
+ * Reclaim a BO: unmap it from its VM, drop the VM reference, free the page and
+ * the struct. Safe before the mapping/VM-ref are established (gpu_va 0 unmaps
+ * nothing; a NULL vm_fp is skipped).
  */
-void *
-amd_dma_kva(struct atrium_amd_softc *sc, vm_paddr_t gpa)
-{
-	int i;
-
-	for (i = 0; i < sc->n_dma; i++)
-		if (sc->dma[i].gpa == gpa)
-			return (sc->dma[i].kva);
-	return (NULL);
-}
-
-/* --- buffer objects: fd-backed (lifetime = fd refcount) --- */
-
-/* Unmap a BO from GPUVM, free its page and the struct, drop the live count. */
 static void
-amd_bo_destroy(struct atrium_amd_bo *bo)
+amd_bo_destroy(struct atrium_amd_bo *bo, struct thread *td)
 {
 	struct atrium_amd_softc *sc = bo->sc;
 
+	if (bo->vm != NULL)
+		amd_vm_unmap(bo->vm, bo->gpu_va);
+	if (bo->vm_fp != NULL)
+		fdrop(bo->vm_fp, td);
 	mtx_lock(&sc->lock);
-	amd_gpuvm_unmap(sc, bo->gpu_va);
 	sc->bo_count--;
 	mtx_unlock(&sc->lock);
 	free(bo->kva, M_DEVBUF);
 	free(bo, M_DEVBUF);
 }
 
-/* fo_close: the last fd reference to this BO went away — reclaim it. */
 static int
 amd_bo_close(struct file *fp, struct thread *td)
 {
@@ -78,7 +62,7 @@ amd_bo_close(struct file *fp, struct thread *td)
 
 	if (bo != NULL) {
 		fp->f_data = NULL;
-		amd_bo_destroy(bo);
+		amd_bo_destroy(bo, td);
 	}
 	return (0);
 }
@@ -116,60 +100,65 @@ const struct fileops atrium_amd_bo_fileops = {
 };
 
 /*
- * Allocate a buffer object and return it as a file descriptor in the caller's
- * fd table, plus its GPU virtual address. One page per BO for now (size
- * capped); multi-page BOs land with the bus_dma rework. The page is allocated
- * before the lock (M_WAITOK may sleep); the lock covers only the page-table
- * edit and the VA bump.
+ * Allocate a buffer object inside `vm_fd`'s address space, map it at the VM's
+ * next bump VA, and return it as a file descriptor. The BO holds a reference
+ * on the VM (so the VM outlives it). The page is allocated before any lock
+ * (M_WAITOK may sleep); the VA reservation + bo_count are under sc->lock, and
+ * amd_vm_map takes the lock itself for the page-table edit.
  */
 int
-amd_bo_create_fd(struct atrium_amd_softc *sc, struct thread *td, uint64_t size,
-    int *out_fd, uint64_t *out_gpu_va)
+amd_bo_create_fd(struct atrium_amd_softc *sc, struct thread *td, int vm_fd,
+    uint64_t size, int *out_fd, uint64_t *out_gpu_va)
 {
 	struct atrium_amd_bo *bo;
-	struct file *fp;
+	struct atrium_amd_vm *vm;
+	struct file *fp, *vm_fp;
+	const uint64_t va_limit = ATRIUM_AMD_BO_VA_BASE +
+	    (uint64_t)ATRIUM_AMD_VM_MAX_BO * PAGE_SIZE;
 	void *kva;
-	uint64_t va;
+	uint64_t va = 0;
 	int fd, err;
 
 	if (size == 0 || size > PAGE_SIZE)
 		return (EINVAL);
 
+	/* The BO takes over this VM reference (released in amd_bo_destroy). */
+	err = amd_vm_fget(td, vm_fd, &vm_fp, &vm);
+	if (err != 0)
+		return (err);
 	kva = contigmalloc(PAGE_SIZE, M_DEVBUF, M_WAITOK | M_ZERO, 0,
 	    BUS_SPACE_MAXADDR, PAGE_SIZE, 0);
-	if (kva == NULL)
+	if (kva == NULL) {
+		fdrop(vm_fp, td);
 		return (ENOMEM);
+	}
 	bo = malloc(sizeof(*bo), M_DEVBUF, M_WAITOK | M_ZERO);
 	bo->sc = sc;
+	bo->vm = vm;
+	bo->vm_fp = vm_fp;
 	bo->kva = kva;
 	bo->gpa = vtophys(kva);
 	bo->size = size;
 
 	mtx_lock(&sc->lock);
-	va = sc->next_gpu_va;
-	err = amd_gpuvm_map(sc, va, bo->gpa);
-	if (err == 0) {
-		sc->next_gpu_va += PAGE_SIZE;
-		sc->bo_count++;
+	sc->bo_count++;
+	if (vm->next_va >= va_limit) {
+		mtx_unlock(&sc->lock);
+		err = ENOSPC;
+		goto fail;
 	}
+	va = vm->next_va;
+	vm->next_va += PAGE_SIZE;
 	mtx_unlock(&sc->lock);
-	if (err != 0) {
-		free(kva, M_DEVBUF);
-		free(bo, M_DEVBUF);
-		return (err);
-	}
+
+	err = amd_vm_map(vm, va, bo->gpa);
+	if (err != 0)
+		goto fail;
 	bo->gpu_va = va;
 
-	/*
-	 * Wrap the BO in a struct file. After finit() the BO is owned by the
-	 * file: if finstall() fails, fdrop() runs fo_close (amd_bo_close ->
-	 * amd_bo_destroy), so we must not also free it on that path.
-	 */
 	err = falloc_noinstall(td, &fp);
-	if (err != 0) {
-		amd_bo_destroy(bo);
-		return (err);
-	}
+	if (err != 0)
+		goto fail;
 	finit(fp, FREAD | FWRITE, DTYPE_DEV, bo, &atrium_amd_bo_fileops);
 	err = finstall(td, fp, &fd, 0, NULL);
 	fdrop(fp, td);
@@ -179,6 +168,10 @@ amd_bo_create_fd(struct atrium_amd_softc *sc, struct thread *td, uint64_t size,
 	*out_fd = fd;
 	*out_gpu_va = va;
 	return (0);
+
+fail:
+	amd_bo_destroy(bo, td);
+	return (err);
 }
 
 /*

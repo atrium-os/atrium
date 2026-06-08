@@ -34,6 +34,10 @@
  *       (sync.c) a submission signals on completion; userspace waits blocking
  *       (SYNCOBJ_WAIT) or via kqueue (the fd is EVFILT_READ-able). The BSD-
  *       native completion path a Fresco compositor folds into one kevent().
+ *   M9c per-process address spaces: VM_CREATE makes a vm_fd with its own VMID
+ *       and page tables (vm.c); BOs are created + mapped in a VM, submits run
+ *       under it. The same GPU-VA in two VMs resolves to different memory —
+ *       per-context isolation, the foundation for Portcullis-jailed clients.
  *
  * WHY one kmod (not the §4.1 three-kmod pci/gpu/display split): there is no
  * display engine yet, so a separate PCI module would buy nothing. WHY the
@@ -66,7 +70,6 @@ amd_teardown(struct atrium_amd_softc *sc)
 	for (i = 0; i < sc->n_dma; i++)
 		free(sc->dma[i].kva, M_DEVBUF);
 	sc->n_dma = 0;
-	sc->pdb_kva = NULL;
 	if (sc->doorbell != NULL) {
 		bus_release_resource(sc->dev, SYS_RES_MEMORY,
 		    sc->doorbell_rid, sc->doorbell);
@@ -203,7 +206,7 @@ atrium_amd_detach(device_t dev)
 	 * Refuse to detach until userspace has closed them. (A later milestone
 	 * can replace this with a device refcount the BOs hold.)
 	 */
-	if (sc->bo_count > 0)
+	if (sc->bo_count > 0 || sc->vm_count > 0)
 		return (EBUSY);
 
 	amd_teardown(sc);
@@ -225,4 +228,4 @@ static driver_t atrium_amd_driver = {
 
 DRIVER_MODULE(atrium_gpu_amd, pci, atrium_amd_driver, NULL, NULL);
 MODULE_DEPEND(atrium_gpu_amd, pci, 1, 1, 1);
-MODULE_VERSION(atrium_gpu_amd, 10);
+MODULE_VERSION(atrium_gpu_amd, 11);

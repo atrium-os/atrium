@@ -115,6 +115,20 @@
 #define regTEX_HI		0x20234
 #define regBLEND_ENABLE		0x2023c	/* SIM: 1 = alpha blend (src-over) */
 
+/*
+ * Per-context GPUVM (SIM aperture). A user address space (VMID 1..15) gets its
+ * own page-directory base: select the VMID, then program its base. The
+ * per-queue QF_VMID field (abstract Q_BASE block, q(qid)=Q_BASE+qid*STRIDE)
+ * tells the CP which context a queue's submissions translate under — this is
+ * what makes the same GPU-VA resolve to different memory per process.
+ */
+#define regVM_CTX_SELECT	0x2006c	/* SIM: which VMID the next regs program */
+#define regVM_CTX_PT_BASE_LO	0x20070	/* SIM: selected VMID's page-dir base (lo/hi) */
+#define regVM_CTX_PT_BASE_HI	0x20074
+#define ATRIUM_AMD_Q_BASE	0x20100	/* SIM: per-queue config block base */
+#define ATRIUM_AMD_Q_STRIDE	0x20	/* bytes per queue */
+#define ATRIUM_AMD_QF_VMID	0x14	/* offset of the VMID field within a queue */
+
 /* CP firmware: minimum ucode version the model accepts (CP_FW_MIN_VERSION). */
 #define ATRIUM_AMD_CP_FW_VERSION 0x40
 /* Reset poll: model latches synchronously; poll-with-timeout is the HW shape. */
@@ -144,12 +158,18 @@
 #define ATRIUM_AMD_COMPUTE_QID	1
 #define ATRIUM_AMD_COMPUTE_DOORBELL 0x8
 
-/* GPU-VA bump allocator: BOs are placed at BO_VA_BASE, BO_VA_BASE+page, ... */
+/*
+ * Per-VM GPU-VA bump allocator: each address space places BOs at BO_VA_BASE,
+ * BO_VA_BASE+page, ... within one page-directory entry's 2 MiB span (512
+ * pages = one pre-allocated page-table page). Two VMs both start at BO_VA_BASE,
+ * so the same VA in different VMs resolves to different memory — isolation.
+ */
 #define ATRIUM_AMD_BO_VA_BASE	0x10000000ULL
+#define ATRIUM_AMD_VM_MAX_BO	512	/* BOs per VM (one PT page) */
+#define ATRIUM_AMD_MAX_VMID	16	/* hardware contexts; 1..15 for user VMs */
 
-/* Fixed registries (page tables + IH + BOs share dma[]; bo[] adds VA/handle). */
-#define ATRIUM_AMD_MAX_DMA	64
-#define ATRIUM_AMD_MAX_BO	48
+/* Internal DMA-page registry (the IH ring; page tables are now per-VM). */
+#define ATRIUM_AMD_MAX_DMA	8
 
 /*
  * A page of DMA-able guest memory: kernel VA (CPU side) + guest-physical
@@ -169,8 +189,36 @@ struct atrium_amd_dma_page {
  * device so fo_close can unmap + free without a handle table.
  */
 struct atrium_amd_softc;
+struct atrium_amd_vm;
+
+/*
+ * A per-process GPU address space (ABI-v2 §5.2): its own VMID and 2-level page
+ * table, programmed into the device's per-context page-directory registers. A
+ * VM is a struct file; BOs created in it hold a reference, so it outlives them.
+ * Page-table pages are pre-allocated (one PT page = 512 BOs in a 2 MiB span) so
+ * mapping a BO never allocates under a lock.
+ */
+struct atrium_amd_vm {
+	struct atrium_amd_softc *sc;
+	struct file	*fp;		/* our own file (for KASSERT/debug) */
+	uint16_t	 vmid;		/* 1..15 */
+	void		*pdb_kva;	/* page-directory page */
+	vm_paddr_t	 pdb_gpa;
+	void		*pt_kva;	/* the single pre-allocated page-table page */
+	vm_paddr_t	 pt_gpa;
+	uint64_t	 next_va;	/* bump allocator within this VM */
+};
+
+/*
+ * A buffer object: a DMA page mapped into a VM's GPUVM and exposed to userspace
+ * as a file descriptor (fd-as-handle — ABI-v2 principle 2). Lifetime is the fd
+ * refcount; the BO owns its own page and holds a reference (vm_fp) on the VM it
+ * is mapped in, so fo_close can unmap from that VM.
+ */
 struct atrium_amd_bo {
 	struct atrium_amd_softc *sc;
+	struct atrium_amd_vm *vm;	/* the address space this BO is mapped in */
+	struct file	*vm_fp;		/* held reference keeping vm alive */
 	void		*kva;
 	vm_paddr_t	 gpa;
 	uint64_t	 gpu_va;
@@ -212,9 +260,8 @@ struct atrium_amd_softc {
 	struct mtx	 lock;		/* guards fence-wait sleep/wakeup */
 	int		 lock_inited;
 
-	void		*pdb_kva;	/* GPUVM page-directory base (VMID 0) */
-	vm_paddr_t	 pdb_gpa;
-	uint64_t	 next_gpu_va;	/* bump allocator for BO virtual addresses */
+	uint32_t	 vmid_bitmap;	/* allocated VMIDs (bit N = VMID N in use) */
+	int		 vm_count;	/* live vm_fds */
 
 	struct atrium_amd_dma_page dma[ATRIUM_AMD_MAX_DMA];
 	int		 n_dma;
@@ -247,19 +294,24 @@ amd_pm4_type3_header(uint32_t opcode, uint32_t body_dwords)
 	    (opcode << 8));
 }
 
-/* bo.c — DMA pages (internal) + fd-backed buffer objects */
+/* bo.c — internal DMA pages + fd-backed buffer objects (mapped into a VM) */
 void	*amd_dma_alloc(struct atrium_amd_softc *sc, vm_paddr_t *gpa_out);
-void	*amd_dma_kva(struct atrium_amd_softc *sc, vm_paddr_t gpa);
 int	 amd_bo_create_fd(struct atrium_amd_softc *sc, struct thread *td,
-	    uint64_t size, int *out_fd, uint64_t *out_gpu_va);
+	    int vm_fd, uint64_t size, int *out_fd, uint64_t *out_gpu_va);
 int	 amd_bo_fget(struct thread *td, int fd, struct file **out_fp,
 	    struct atrium_amd_bo **out_bo);
 extern const struct fileops atrium_amd_bo_fileops;
 
-/* gmc.c — GPUVM */
-int	 amd_gpuvm_map(struct atrium_amd_softc *sc, uint64_t va,
-	    vm_paddr_t phys);
-void	 amd_gpuvm_unmap(struct atrium_amd_softc *sc, uint64_t va);
+/* vm.c — per-process GPU address spaces (fd-backed) + GPUVM page tables */
+int	 amd_vm_create_fd(struct atrium_amd_softc *sc, struct thread *td,
+	    int *out_fd);
+int	 amd_vm_fget(struct thread *td, int fd, struct file **out_fp,
+	    struct atrium_amd_vm **out_vm);
+int	 amd_vm_map(struct atrium_amd_vm *vm, uint64_t va, vm_paddr_t phys);
+void	 amd_vm_unmap(struct atrium_amd_vm *vm, uint64_t va);
+extern const struct fileops atrium_amd_vm_fileops;
+
+/* gmc.c — GMC/IH bring-up */
 int	 amd_gmc_init(struct atrium_amd_softc *sc);
 
 /* firmware.c — bring-up */
@@ -267,9 +319,9 @@ int	 amd_reset(struct atrium_amd_softc *sc);
 void	 amd_firmware_load(struct atrium_amd_softc *sc);
 void	 amd_mes_init(struct atrium_amd_softc *sc);
 
-/* cp.c — submission */
+/* cp.c — submission (under a VM's VMID) */
 int	 amd_submit(struct atrium_amd_softc *sc, struct atrium_amd_bo *ring,
-	    uint32_t n_dwords, uint32_t engine);
+	    uint32_t n_dwords, uint32_t engine, uint16_t vmid);
 void	 amd_set_compute(struct atrium_amd_softc *sc, uint32_t kernel,
 	    uint64_t src_va, uint64_t dst_va);
 void	 amd_set_draw(struct atrium_amd_softc *sc, uint64_t vtx_va,
