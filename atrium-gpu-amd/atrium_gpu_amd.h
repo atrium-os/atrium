@@ -20,6 +20,7 @@
 #include <sys/bus.h>
 #include <sys/capsicum.h>
 #include <sys/conf.h>
+#include <sys/event.h>
 #include <sys/fcntl.h>
 #include <sys/file.h>
 #include <sys/filedesc.h>
@@ -29,6 +30,7 @@
 #include <sys/mutex.h>
 #include <sys/proc.h>
 #include <sys/rman.h>
+#include <sys/selinfo.h>
 #include <sys/stat.h>
 #include <sys/user.h>
 
@@ -175,6 +177,21 @@ struct atrium_amd_bo {
 	uint64_t	 size;
 };
 
+/*
+ * A timeline syncobj: a monotonic 64-bit counter exposed as an fd
+ * (ABI-v2 §5.6). A submission signals it on completion; userspace waits for a
+ * value either blocking (SYNCOBJ_WAIT) or via kqueue — the fd is EVFILT_READ-
+ * able, with the threshold passed in the kevent `data` field, so a compositor
+ * folds GPU completion into one kevent() alongside input and timers. (v2's
+ * separate per-threshold event_fd is deferred; the syncobj fd is the kqueue
+ * source for now.) The struct-file refcount is its lifetime.
+ */
+struct atrium_amd_syncobj {
+	struct mtx	 lock;	/* guards value + the knote list */
+	struct selinfo	 sel;	/* sel.si_note = the kqueue knlist */
+	uint64_t	 value;
+};
+
 struct atrium_amd_softc {
 	device_t	 dev;
 	struct resource	*regs;		/* BAR5 MMIO register file */
@@ -257,6 +274,13 @@ void	 amd_set_compute(struct atrium_amd_softc *sc, uint32_t kernel,
 	    uint64_t src_va, uint64_t dst_va);
 void	 amd_set_draw(struct atrium_amd_softc *sc, uint64_t vtx_va,
 	    uint64_t rt_va, uint32_t width, uint32_t height);
+
+/* sync.c — timeline syncobj fd (kqueue-able) */
+int	 amd_syncobj_create_fd(struct thread *td, int *out_fd);
+int	 amd_syncobj_fget(struct thread *td, int fd, struct file **out_fp,
+	    struct atrium_amd_syncobj **out_so);
+void	 amd_syncobj_signal(struct atrium_amd_syncobj *so, uint64_t value);
+extern const struct fileops atrium_amd_syncobj_fileops;
 
 /* irq.c — MSI-X interrupt setup + the ISR that drains the IH ring */
 int	 amd_irq_setup(struct atrium_amd_softc *sc);

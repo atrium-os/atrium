@@ -52,12 +52,16 @@ struct atrium_gpu_set_compute {
 	uint32_t	pad;
 };
 
-/* Submit a PM4 ring (already laid into the ring BO) on an engine. */
+/*
+ * Submit a PM4 ring (already laid into the ring BO) on an engine, optionally
+ * signalling a syncobj timeline to `signal_value` on completion.
+ */
 struct atrium_gpu_submit {
+	uint64_t	signal_value;	/* in: timeline value to signal on done */
 	uint32_t	ring_fd;	/* in: BO fd holding the PM4 ring */
 	uint32_t	n_dwords;	/* in: ring length in dwords (the wptr) */
 	uint32_t	engine;		/* in: ATRIUM_GPU_ENGINE_* */
-	uint32_t	pad;
+	int32_t		signal_syncobj_fd; /* in: syncobj to signal (-1 = none) */
 };
 
 /* Program graphics DRAW state read by a DRAW_INDEX_AUTO packet on the gfx ring. */
@@ -75,13 +79,24 @@ struct atrium_gpu_irqs {
 	uint32_t	pad;
 };
 
-/* Block until a 64-bit fence word in a BO reaches `value`, or time out. */
-struct atrium_gpu_wait_fence {
-	uint64_t	value;		/* in: fence value to wait for */
-	uint32_t	fence_fd;	/* in: BO fd holding the fence word */
-	uint32_t	offset;		/* in: byte offset of the u64 fence */
-	uint32_t	timeout_ms;	/* in: max wait (0 = check once) */
+/* Create a timeline syncobj; the kernel returns it as a (kqueue-able) fd. */
+struct atrium_gpu_syncobj_create {
+	uint32_t	out_fd;		/* out: the syncobj fd */
 	uint32_t	pad;
+};
+
+/* Host-side signal (set counter) or query (read counter) of a syncobj. */
+struct atrium_gpu_syncobj_op {
+	uint64_t	value;		/* signal: in (set to); query: out (current) */
+	uint32_t	syncobj_fd;	/* in: which syncobj */
+	uint32_t	pad;
+};
+
+/* Block until a syncobj's counter reaches `value`, or time out. */
+struct atrium_gpu_syncobj_wait {
+	uint64_t	value;		/* in: wait until counter >= value */
+	uint32_t	syncobj_fd;	/* in: which syncobj */
+	uint32_t	timeout_ms;	/* in: max wait (0 = check once) */
 };
 
 #define ATRIUM_GPU_IOC_BO_ALLOC		_IOWR('A', 0, struct atrium_gpu_bo_alloc)
@@ -91,6 +106,9 @@ struct atrium_gpu_wait_fence {
 #define ATRIUM_GPU_IOC_SUBMIT		_IOW('A', 4, struct atrium_gpu_submit)
 #define ATRIUM_GPU_IOC_SET_DRAW		_IOW('A', 5, struct atrium_gpu_set_draw)
 #define ATRIUM_GPU_IOC_GET_IRQS		_IOR('A', 6, struct atrium_gpu_irqs)
-#define ATRIUM_GPU_IOC_WAIT_FENCE	_IOW('A', 7, struct atrium_gpu_wait_fence)
+#define ATRIUM_GPU_IOC_SYNCOBJ_CREATE	_IOWR('A', 8, struct atrium_gpu_syncobj_create)
+#define ATRIUM_GPU_IOC_SYNCOBJ_SIGNAL	_IOW('A', 9, struct atrium_gpu_syncobj_op)
+#define ATRIUM_GPU_IOC_SYNCOBJ_QUERY	_IOWR('A', 10, struct atrium_gpu_syncobj_op)
+#define ATRIUM_GPU_IOC_SYNCOBJ_WAIT	_IOW('A', 11, struct atrium_gpu_syncobj_wait)
 
 #endif /* _ATRIUM_GPU_AMD_ABI_H_ */

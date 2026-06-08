@@ -86,45 +86,68 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		return (0);
 	}
 
-	case ATRIUM_GPU_IOC_WAIT_FENCE: {
-		struct atrium_gpu_wait_fence *w =
-		    (struct atrium_gpu_wait_fence *)data;
-		volatile uint64_t *fence;
-		struct file *fp;
-		int deadline, slice, recheck;
+	case ATRIUM_GPU_IOC_SYNCOBJ_CREATE: {
+		struct atrium_gpu_syncobj_create *c =
+		    (struct atrium_gpu_syncobj_create *)data;
+		int fd;
 
-		err = amd_bo_fget(td, w->fence_fd, &fp, &bo);
+		err = amd_syncobj_create_fd(td, &fd);
 		if (err != 0)
 			return (err);
-		err = amd_xfer_bounds(bo, w->offset, sizeof(uint64_t));
-		if (err != 0) {
-			fdrop(fp, td);
-			return (err);
-		}
-		fence = (volatile uint64_t *)((char *)bo->kva + w->offset);
+		c->out_fd = fd;
+		return (0);
+	}
 
-		/*
-		 * Sleep until the GPU's RELEASE_MEM writes `value`, woken by the
-		 * ISR. The fence is set by DMA (not under our lock), so a wakeup
-		 * can race ahead of the sleep; bound each sleep to a recheck
-		 * slice so a missed wakeup still re-tests rather than hanging.
-		 * deadline/slice are in ticks (hz/sec).
-		 */
-		recheck = hz / 100;		/* re-test at least every ~10ms */
-		if (recheck < 1)
-			recheck = 1;
+	case ATRIUM_GPU_IOC_SYNCOBJ_SIGNAL: {
+		struct atrium_gpu_syncobj_op *o =
+		    (struct atrium_gpu_syncobj_op *)data;
+		struct atrium_amd_syncobj *so;
+		struct file *fp;
+
+		err = amd_syncobj_fget(td, o->syncobj_fd, &fp, &so);
+		if (err != 0)
+			return (err);
+		amd_syncobj_signal(so, o->value);
+		fdrop(fp, td);
+		return (0);
+	}
+
+	case ATRIUM_GPU_IOC_SYNCOBJ_QUERY: {
+		struct atrium_gpu_syncobj_op *o =
+		    (struct atrium_gpu_syncobj_op *)data;
+		struct atrium_amd_syncobj *so;
+		struct file *fp;
+
+		err = amd_syncobj_fget(td, o->syncobj_fd, &fp, &so);
+		if (err != 0)
+			return (err);
+		mtx_lock(&so->lock);
+		o->value = so->value;
+		mtx_unlock(&so->lock);
+		fdrop(fp, td);
+		return (0);
+	}
+
+	case ATRIUM_GPU_IOC_SYNCOBJ_WAIT: {
+		struct atrium_gpu_syncobj_wait *w =
+		    (struct atrium_gpu_syncobj_wait *)data;
+		struct atrium_amd_syncobj *so;
+		struct file *fp;
+		int deadline, slice;
+
+		err = amd_syncobj_fget(td, w->syncobj_fd, &fp, &so);
+		if (err != 0)
+			return (err);
 		deadline = ticks + (int)(((uint64_t)w->timeout_ms * hz) / 1000);
-		mtx_lock(&sc->lock);
-		while (*fence != w->value) {
+		mtx_lock(&so->lock);
+		while (so->value < w->value) {
 			slice = deadline - ticks;
 			if (slice <= 0)
 				break;
-			if (slice > recheck)
-				slice = recheck;
-			msleep(&sc->irq_count, &sc->lock, 0, "amdfence", slice);
+			msleep(&so->value, &so->lock, 0, "amdsyncw", slice);
 		}
-		err = (*fence == w->value) ? 0 : EWOULDBLOCK;
-		mtx_unlock(&sc->lock);
+		err = (so->value >= w->value) ? 0 : EWOULDBLOCK;
+		mtx_unlock(&so->lock);
 		fdrop(fp, td);
 		return (err);
 	}
@@ -147,7 +170,8 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 
 	case ATRIUM_GPU_IOC_SUBMIT: {
 		struct atrium_gpu_submit *s = (struct atrium_gpu_submit *)data;
-		struct file *fp;
+		struct atrium_amd_syncobj *so;
+		struct file *fp, *sfp;
 
 		err = amd_bo_fget(td, s->ring_fd, &fp, &bo);
 		if (err != 0)
@@ -158,6 +182,22 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		else
 			err = amd_submit(sc, bo, s->n_dwords, s->engine);
 		fdrop(fp, td);
+
+		/*
+		 * Signal the completion syncobj. The model drains the ring
+		 * synchronously inside amd_submit (the doorbell write), so the
+		 * work is already done here and we signal inline. On real async
+		 * hardware this signal moves into the ISR (a pending-completion
+		 * list keyed by the EOP interrupt) — a documented follow-up.
+		 */
+		if (err == 0 && s->signal_syncobj_fd >= 0) {
+			err = amd_syncobj_fget(td, s->signal_syncobj_fd, &sfp,
+			    &so);
+			if (err == 0) {
+				amd_syncobj_signal(so, s->signal_value);
+				fdrop(sfp, td);
+			}
+		}
 		return (err);
 	}
 

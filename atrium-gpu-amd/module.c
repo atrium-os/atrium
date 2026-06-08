@@ -30,6 +30,10 @@
  *       in a table — lifetime is the fd refcount, it is SCM_RIGHTS-passable,
  *       and BO_CREATE returns an fd that write/read/submit/wait resolve via
  *       fget. The first step of converging the bring-up ABI toward v2.
+ *   M9b kqueue-native sync: WAIT_FENCE is replaced by a timeline syncobj fd
+ *       (sync.c) a submission signals on completion; userspace waits blocking
+ *       (SYNCOBJ_WAIT) or via kqueue (the fd is EVFILT_READ-able). The BSD-
+ *       native completion path a Fresco compositor folds into one kevent().
  *
  * WHY one kmod (not the §4.1 three-kmod pci/gpu/display split): there is no
  * display engine yet, so a separate PCI module would buy nothing. WHY the
@@ -221,4 +225,4 @@ static driver_t atrium_amd_driver = {
 
 DRIVER_MODULE(atrium_gpu_amd, pci, atrium_amd_driver, NULL, NULL);
 MODULE_DEPEND(atrium_gpu_amd, pci, 1, 1, 1);
-MODULE_VERSION(atrium_gpu_amd, 9);
+MODULE_VERSION(atrium_gpu_amd, 10);

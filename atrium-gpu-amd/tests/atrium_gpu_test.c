@@ -14,6 +14,8 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/event.h>
+#include <sys/time.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -83,6 +85,7 @@ submit(int fd, uint32_t ring_handle, uint32_t n_dwords, uint32_t engine)
 	s.ring_fd = ring_handle;
 	s.n_dwords = n_dwords;
 	s.engine = engine;
+	s.signal_syncobj_fd = -1;	/* no completion syncobj */
 	return (ioctl(fd, ATRIUM_GPU_IOC_SUBMIT, &s));
 }
 
@@ -325,17 +328,43 @@ test_irq(int fd)
 	return (0);
 }
 
-/* M8: blocking fence-wait — a reached fence returns 0; an unreached one times out. */
+/*
+ * M9b: a submission signals a timeline syncobj on completion; userspace waits
+ * for it via kqueue (the threshold rides in the kevent `data` field) and via
+ * the blocking SYNCOBJ_WAIT/QUERY ioctls.
+ */
 static int
-test_wait(int fd)
+test_syncobj(int fd)
 {
-	struct atrium_gpu_wait_fence w;
+	struct atrium_gpu_syncobj_create cr;
+	struct atrium_gpu_syncobj_op q;
+	struct atrium_gpu_syncobj_wait wt;
+	struct atrium_gpu_submit s;
+	struct timespec ts = { 2, 0 };
+	struct kevent kev;
 	uint32_t ring_h, fence_h, ring[9];
 	uint64_t ring_va, fence_va;
+	int so_fd, kq, n;
 
+	memset(&cr, 0, sizeof(cr));
+	if (ioctl(fd, ATRIUM_GPU_IOC_SYNCOBJ_CREATE, &cr) != 0) {
+		printf("syncobj: create failed\n");
+		return (1);
+	}
+	so_fd = (int)cr.out_fd;
+
+	/* Register the syncobj with kqueue: fire when its value reaches 1. */
+	kq = kqueue();
+	EV_SET(&kev, so_fd, EVFILT_READ, EV_ADD, 0, 1 /* threshold */, NULL);
+	if (kq < 0 || kevent(kq, &kev, 1, NULL, 0, NULL) != 0) {
+		printf("syncobj: kqueue register failed\n");
+		return (1);
+	}
+
+	/* A trivial gfx job, submitted so it signals the syncobj to value 1. */
 	if (bo_alloc(fd, 4096, &ring_h, &ring_va) != 0 ||
 	    bo_alloc(fd, 4096, &fence_h, &fence_va) != 0) {
-		printf("wait: BO alloc failed\n");
+		printf("syncobj: BO alloc failed\n");
 		return (1);
 	}
 	ring[0] = type3(IT_NOP, 1);
@@ -347,32 +376,46 @@ test_wait(int fd)
 	ring[6] = (uint32_t)(fence_va >> 32);
 	ring[7] = (uint32_t)(FENCE_MAGIC & 0xffffffff);
 	ring[8] = (uint32_t)(FENCE_MAGIC >> 32);
+	memset(&s, 0, sizeof(s));
+	s.ring_fd = ring_h;
+	s.n_dwords = 9;
+	s.engine = ATRIUM_GPU_ENGINE_GFX;
+	s.signal_syncobj_fd = so_fd;
+	s.signal_value = 1;
 	if (bo_write(fd, ring_h, ring, sizeof(ring)) != 0 ||
-	    submit(fd, ring_h, 9, ATRIUM_GPU_ENGINE_GFX) != 0) {
-		printf("wait: submit failed\n");
+	    ioctl(fd, ATRIUM_GPU_IOC_SUBMIT, &s) != 0) {
+		printf("syncobj: submit failed\n");
 		return (1);
 	}
 
-	/* The fence is written -> blocking wait should return success. */
-	memset(&w, 0, sizeof(w));
-	w.value = FENCE_MAGIC;
-	w.fence_fd = fence_h;
-	w.offset = 0;
-	w.timeout_ms = 1000;
-	if (ioctl(fd, ATRIUM_GPU_IOC_WAIT_FENCE, &w) != 0) {
-		printf("wait FAILED: reached fence did not return success\n");
+	/* kqueue must report the syncobj ready. */
+	n = kevent(kq, NULL, 0, &kev, 1, &ts);
+	if (n != 1 || (int)kev.ident != so_fd) {
+		printf("syncobj FAILED: kqueue did not fire (n=%d)\n", n);
 		return (1);
 	}
 
-	/* A value never written -> the wait must sleep and time out. */
-	w.value = 0xdeadbeef12345678ULL;
-	w.timeout_ms = 50;
-	if (ioctl(fd, ATRIUM_GPU_IOC_WAIT_FENCE, &w) == 0 || errno != EWOULDBLOCK) {
-		printf("wait FAILED: unreached fence did not time out (errno=%d)\n",
-		    errno);
+	/* Blocking wait + query must also see the reached value. */
+	memset(&wt, 0, sizeof(wt));
+	wt.syncobj_fd = so_fd;
+	wt.value = 1;
+	wt.timeout_ms = 1000;
+	if (ioctl(fd, ATRIUM_GPU_IOC_SYNCOBJ_WAIT, &wt) != 0) {
+		printf("syncobj FAILED: SYNCOBJ_WAIT did not complete\n");
 		return (1);
 	}
-	printf("wait OK: reached fence returns, unreached fence times out\n");
+	memset(&q, 0, sizeof(q));
+	q.syncobj_fd = so_fd;
+	if (ioctl(fd, ATRIUM_GPU_IOC_SYNCOBJ_QUERY, &q) != 0 || q.value < 1) {
+		printf("syncobj FAILED: query value %llu\n",
+		    (unsigned long long)q.value);
+		return (1);
+	}
+
+	close(kq);
+	close(so_fd);
+	printf("syncobj OK: submit signalled, kqueue EVFILT_READ fired, "
+	    "value=%llu\n", (unsigned long long)q.value);
 	return (0);
 }
 
@@ -391,7 +434,7 @@ main(void)
 	rc |= test_compute(fd);
 	rc |= test_draw(fd);
 	rc |= test_irq(fd);
-	rc |= test_wait(fd);
+	rc |= test_syncobj(fd);
 	close(fd);
 	printf(rc == 0 ? "ALL OK\n" : "FAILURES\n");
 	return (rc);
