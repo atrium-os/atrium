@@ -15,6 +15,25 @@ atrium_amd_open(struct cdev *cdev, int oflags, int devtype, struct thread *td)
 	return (0);
 }
 
+/*
+ * Map the BAR2 doorbell page into userspace for user-mode-queue submission.
+ * The page is device MMIO (VM_MEMATTR_DEVICE — uncacheable, no write
+ * combining), so a userspace store to the queue's doorbell traps straight to
+ * the device. This is the single mappable region; any other offset is refused.
+ */
+static int
+atrium_amd_mmap(struct cdev *cdev, vm_ooffset_t offset, vm_paddr_t *paddr,
+    int nprot, vm_memattr_t *memattr)
+{
+	struct atrium_amd_softc *sc = cdev->si_drv1;
+
+	if (offset >= PAGE_SIZE)
+		return (EINVAL);
+	*paddr = rman_get_start(sc->doorbell) + offset;
+	*memattr = VM_MEMATTR_DEVICE;
+	return (0);
+}
+
 /* Bounds-check a BO byte range [offset, offset+len) against the BO size. */
 static int
 amd_xfer_bounds(struct atrium_amd_bo *bo, uint64_t offset, uint64_t len)
@@ -80,6 +99,36 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		}
 		/* Success: the BO now owns vmfp — do not drop it here. */
 		b->va = va;
+		return (0);
+	}
+
+	case ATRIUM_GPU_IOC_QUEUE_MAP: {
+		struct atrium_gpu_queue_map *m =
+		    (struct atrium_gpu_queue_map *)data;
+		struct atrium_amd_vm *vm;
+		struct file *vmfp, *bofp;
+		uint32_t doorbell_off;
+
+		err = amd_vm_fget(td, m->vm_fd, &vmfp, &vm);
+		if (err != 0)
+			return (err);
+		err = amd_bo_fget(td, m->ring_fd, &bofp, &bo);
+		if (err != 0) {
+			fdrop(vmfp, td);
+			return (err);
+		}
+		if (bo->vm == NULL)	/* ring must be bound to have a GPU-VA */
+			err = EINVAL;
+		else
+			err = amd_queue_program(sc, bo->gpu_va, m->engine,
+			    vm->vmid, &doorbell_off);
+		fdrop(bofp, td);
+		fdrop(vmfp, td);
+		if (err != 0)
+			return (err);
+		m->doorbell_mmap_offset = ATRIUM_AMD_DOORBELL_MMAP_OFF;
+		m->doorbell_size = PAGE_SIZE;
+		m->doorbell_word_offset = doorbell_off;
 		return (0);
 	}
 
@@ -254,4 +303,5 @@ struct cdevsw atrium_amd_cdevsw = {
 	.d_name =	"atrium-gpu",
 	.d_open =	atrium_amd_open,
 	.d_ioctl =	atrium_amd_ioctl,
+	.d_mmap =	atrium_amd_mmap,
 };

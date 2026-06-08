@@ -326,6 +326,15 @@ void	 amd_mes_init(struct atrium_amd_softc *sc);
 /* cp.c — submission (under a VM's VMID) */
 int	 amd_submit(struct atrium_amd_softc *sc, struct atrium_amd_bo *ring,
 	    uint32_t n_dwords, uint32_t engine, uint16_t vmid);
+int	 amd_queue_program(struct atrium_amd_softc *sc, uint64_t ring_va,
+	    uint32_t engine, uint16_t vmid, uint32_t *doorbell_off);
+
+/*
+ * mmap offset (passed to mmap() on the device fd) that maps the BAR2 doorbell
+ * page into userspace for user-mode-queue submission. One page; the queue's
+ * doorbell lives at its byte offset within it.
+ */
+#define ATRIUM_AMD_DOORBELL_MMAP_OFF	0
 void	 amd_set_compute(struct atrium_amd_softc *sc, uint32_t kernel,
 	    uint64_t src_va, uint64_t dst_va);
 void	 amd_set_draw(struct atrium_amd_softc *sc, uint64_t vtx_va,

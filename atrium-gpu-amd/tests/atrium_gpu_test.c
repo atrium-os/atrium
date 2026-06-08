@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/event.h>
+#include <sys/mman.h>
 #include <sys/time.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -542,6 +543,74 @@ test_vm_bind(int fd)
 	return (0);
 }
 
+/*
+ * M9e: user-mode queue. The kernel programs the queue (QUEUE_MAP) and hands
+ * back the doorbell; userspace mmap()s it and rings it DIRECTLY — no submit
+ * ioctl on the hot path. The doorbell page is the (capability-scoped) MMIO the
+ * jail holds.
+ */
+static int
+test_umq(int fd, int vm)
+{
+	struct atrium_gpu_queue_map m;
+	uint32_t ring_h, fence_h, ring[9];
+	uint64_t ring_va, fence_va, fence = 0;
+	volatile uint32_t *doorbell;
+	void *map;
+
+	if (bo_alloc(fd, vm, 4096, &ring_h, &ring_va) != 0 ||
+	    bo_alloc(fd, vm, 4096, &fence_h, &fence_va) != 0) {
+		printf("umq: BO alloc failed\n");
+		return (1);
+	}
+	ring[0] = type3(IT_NOP, 1);
+	ring[1] = 0;
+	ring[2] = type3(IT_RELEASE_MEM, 6);
+	ring[3] = (5u << 8);
+	ring[4] = (2u << 29) | (2u << 24);
+	ring[5] = (uint32_t)(fence_va & 0xffffffff);
+	ring[6] = (uint32_t)(fence_va >> 32);
+	ring[7] = (uint32_t)(FENCE_MAGIC & 0xffffffff);
+	ring[8] = (uint32_t)(FENCE_MAGIC >> 32);
+	if (bo_write(fd, ring_h, ring, sizeof(ring)) != 0) {
+		printf("umq: write ring failed\n");
+		return (1);
+	}
+
+	memset(&m, 0, sizeof(m));
+	m.vm_fd = vm;
+	m.ring_fd = ring_h;
+	m.engine = ATRIUM_GPU_ENGINE_GFX;
+	if (ioctl(fd, ATRIUM_GPU_IOC_QUEUE_MAP, &m) != 0) {
+		printf("umq: QUEUE_MAP failed\n");
+		return (1);
+	}
+	map = mmap(NULL, m.doorbell_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+	    fd, m.doorbell_mmap_offset);
+	if (map == MAP_FAILED) {
+		perror("umq: mmap doorbell");
+		return (1);
+	}
+
+	/* Ring the doorbell directly from userspace — this is the UMQ hot path. */
+	doorbell = (volatile uint32_t *)((char *)map + m.doorbell_word_offset);
+	*doorbell = 9;
+
+	if (bo_read(fd, fence_h, &fence, sizeof(fence)) != 0) {
+		printf("umq: read fence failed\n");
+		return (1);
+	}
+	munmap(map, m.doorbell_size);
+	if (fence != FENCE_MAGIC) {
+		printf("umq FAILED: fence = 0x%016llx\n",
+		    (unsigned long long)fence);
+		return (1);
+	}
+	printf("umq OK: userspace rang the doorbell directly, fence = 0x%016llx\n",
+	    (unsigned long long)fence);
+	return (0);
+}
+
 int
 main(void)
 {
@@ -566,6 +635,7 @@ main(void)
 	rc |= test_syncobj(fd, vm);
 	rc |= test_vm_bind(fd);
 	rc |= test_isolation(fd);
+	rc |= test_umq(fd, vm);
 	close(vm);
 	close(fd);
 	printf(rc == 0 ? "ALL OK\n" : "FAILURES\n");

@@ -47,6 +47,22 @@ struct atrium_gpu_vm_bind {
 	uint32_t	bo_fd;		/* in: buffer object to map */
 };
 
+/*
+ * Set up a user-mode queue: the kernel programs the queue onto `ring_fd` under
+ * `vm_fd`'s context (the privileged part) and returns the doorbell. Userspace
+ * then mmap()s the device fd at doorbell_mmap_offset and rings the doorbell
+ * directly (write the dword write-pointer at doorbell_word_offset) — no submit
+ * ioctl on the hot path. The doorbell page is the capability (ABI-v2 §5.9).
+ */
+struct atrium_gpu_queue_map {
+	uint64_t	doorbell_mmap_offset;	/* out: mmap() offset on the dev fd */
+	uint64_t	doorbell_size;		/* out: bytes to mmap (one page) */
+	uint32_t	doorbell_word_offset;	/* out: this queue's doorbell offset */
+	uint32_t	vm_fd;			/* in: address space */
+	uint32_t	ring_fd;		/* in: BO holding the ring */
+	uint32_t	engine;			/* in: ATRIUM_GPU_ENGINE_* */
+};
+
 /* Copy a byte range between userspace and a BO (write = into BO, read = out). */
 struct atrium_gpu_bo_xfer {
 	uint64_t	offset;		/* in: byte offset within the BO */
@@ -126,5 +142,6 @@ struct atrium_gpu_syncobj_wait {
 #define ATRIUM_GPU_IOC_SYNCOBJ_WAIT	_IOW('A', 11, struct atrium_gpu_syncobj_wait)
 #define ATRIUM_GPU_IOC_VM_CREATE	_IOWR('A', 12, struct atrium_gpu_vm_create)
 #define ATRIUM_GPU_IOC_VM_BIND		_IOWR('A', 13, struct atrium_gpu_vm_bind)
+#define ATRIUM_GPU_IOC_QUEUE_MAP	_IOWR('A', 14, struct atrium_gpu_queue_map)
 
 #endif /* _ATRIUM_GPU_AMD_ABI_H_ */

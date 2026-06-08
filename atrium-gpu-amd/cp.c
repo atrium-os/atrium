@@ -19,48 +19,57 @@ amd_queue_set_vmid(struct atrium_amd_softc *sc, uint32_t qid, uint16_t vmid)
 	    ATRIUM_AMD_QF_VMID, vmid);
 }
 
+/*
+ * Program a queue onto a ring under a VMID, without ringing the doorbell. This
+ * is the privileged setup the kernel always owns; the doorbell that follows can
+ * be rung by the kernel (amd_submit) or, for a user-mode queue, by userspace
+ * after mmap'ing the doorbell page. Returns the queue's doorbell byte offset.
+ */
 int
-amd_submit(struct atrium_amd_softc *sc, struct atrium_amd_bo *ring,
-    uint32_t n_dwords, uint32_t engine, uint16_t vmid)
+amd_queue_program(struct atrium_amd_softc *sc, uint64_t ring_va,
+    uint32_t engine, uint16_t vmid, uint32_t *doorbell_off)
 {
-	uint64_t ring_va = ring->gpu_va;
-
 	switch (engine) {
 	case ATRIUM_GPU_ENGINE_GFX:
-		/*
-		 * Graphics ring = queue 0, direct CP_RB0_* MMIO (ring base
-		 * holds VA>>8). Bind the queue to the submitting VM's context,
-		 * then clear the ME halt so the CP runs the ring.
-		 */
+		/* Graphics ring = queue 0, direct CP_RB0_* MMIO (base holds VA>>8). */
 		amd_queue_set_vmid(sc, ATRIUM_AMD_GFX_QID, vmid);
 		amd_mmio_write32(sc, regCP_RB0_BASE, (uint32_t)(ring_va >> 8));
 		amd_mmio_write32(sc, regCP_RB0_CNTL, ATRIUM_AMD_RING_BYTES);
 		amd_mmio_write32(sc, regCP_RB_DOORBELL_CONTROL,
 		    ATRIUM_AMD_GFX_DOORBELL);
-		amd_mmio_write32(sc, regCP_ME_CNTL, 0);
-		bus_write_4(sc->doorbell, ATRIUM_AMD_GFX_DOORBELL, n_dwords);
+		amd_mmio_write32(sc, regCP_ME_CNTL, 0);	/* clear halt -> run */
+		*doorbell_off = ATRIUM_AMD_GFX_DOORBELL;
 		return (0);
 
 	case ATRIUM_GPU_ENGINE_COMPUTE:
-		/*
-		 * Compute queue 1 via the MEC HQD path: select the HQD, bind its
-		 * VMID, program its ring/size/doorbell, activate (gated on MES),
-		 * ring it.
-		 */
+		/* Compute queue 1 via the MEC HQD path. */
 		amd_mmio_write32(sc, regHQD_SELECT, ATRIUM_AMD_COMPUTE_QID);
 		amd_queue_set_vmid(sc, ATRIUM_AMD_COMPUTE_QID, vmid);
-		amd_mmio_write32(sc, regCP_HQD_PQ_BASE,
-		    (uint32_t)(ring_va >> 8));
+		amd_mmio_write32(sc, regCP_HQD_PQ_BASE, (uint32_t)(ring_va >> 8));
 		amd_mmio_write32(sc, regCP_HQD_PQ_CONTROL, ATRIUM_AMD_RING_BYTES);
 		amd_mmio_write32(sc, regCP_HQD_PQ_DOORBELL_CONTROL,
 		    ATRIUM_AMD_COMPUTE_DOORBELL);
 		amd_mmio_write32(sc, regCP_HQD_ACTIVE, 1);
-		bus_write_4(sc->doorbell, ATRIUM_AMD_COMPUTE_DOORBELL, n_dwords);
+		*doorbell_off = ATRIUM_AMD_COMPUTE_DOORBELL;
 		return (0);
 
 	default:
 		return (EINVAL);
 	}
+}
+
+int
+amd_submit(struct atrium_amd_softc *sc, struct atrium_amd_bo *ring,
+    uint32_t n_dwords, uint32_t engine, uint16_t vmid)
+{
+	uint32_t doorbell_off;
+	int err;
+
+	err = amd_queue_program(sc, ring->gpu_va, engine, vmid, &doorbell_off);
+	if (err != 0)
+		return (err);
+	bus_write_4(sc->doorbell, doorbell_off, n_dwords);
+	return (0);
 }
 
 /*
