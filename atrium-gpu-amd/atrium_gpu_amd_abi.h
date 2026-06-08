@@ -23,6 +23,32 @@
 #define ATRIUM_GPU_ENGINE_GFX		0	/* CP_RB0 graphics ring (queue 0) */
 #define ATRIUM_GPU_ENGINE_COMPUTE	1	/* MEC HQD compute queue (queue 1) */
 
+/*
+ * Device discovery (ABI-v2 §5.1): QUERY_CAPS fills a user buffer with a
+ * sequence of TLV records so userspace can skip caps it does not know. Old
+ * userspace walks past unrecognized cap_ids; new caps are appended over time.
+ */
+struct atrium_gpu_caps_query {
+	uint64_t	caps_ptr;	/* in: user buffer to fill */
+	uint64_t	caps_size;	/* in: buffer bytes; out: bytes needed */
+};
+
+struct atrium_gpu_cap_record {
+	uint32_t	cap_id;		/* ATRIUM_GPU_CAP_* */
+	uint32_t	cap_size;	/* bytes of cap_data that follow */
+	/* uint8_t cap_data[cap_size]; then padded to a 4-byte boundary */
+};
+
+#define ATRIUM_GPU_CAP_ABI_VERSION	1	/* data: u32 major, u32 minor */
+#define ATRIUM_GPU_CAP_VENDOR		2	/* data: NUL-terminated string */
+#define ATRIUM_GPU_CAP_FEATURES		3	/* data: u32 ATRIUM_GPU_FEAT_* bitmap */
+
+#define ATRIUM_GPU_FEAT_GRAPHICS	(1u << 0)
+#define ATRIUM_GPU_FEAT_COMPUTE		(1u << 1)
+#define ATRIUM_GPU_FEAT_USER_QUEUES	(1u << 2)	/* mmap'd doorbell submit */
+#define ATRIUM_GPU_FEAT_SYNCOBJ		(1u << 3)	/* kqueue-able timeline */
+#define ATRIUM_GPU_FEAT_VM_BIND		(1u << 4)	/* bind apart from submit */
+
 /* Create a per-process GPU address space; the kernel returns it as an fd. */
 struct atrium_gpu_vm_create {
 	uint32_t	out_fd;		/* out: the vm fd */
@@ -143,5 +169,6 @@ struct atrium_gpu_syncobj_wait {
 #define ATRIUM_GPU_IOC_VM_CREATE	_IOWR('A', 12, struct atrium_gpu_vm_create)
 #define ATRIUM_GPU_IOC_VM_BIND		_IOWR('A', 13, struct atrium_gpu_vm_bind)
 #define ATRIUM_GPU_IOC_QUEUE_MAP	_IOWR('A', 14, struct atrium_gpu_queue_map)
+#define ATRIUM_GPU_IOC_QUERY_CAPS	_IOWR('A', 15, struct atrium_gpu_caps_query)
 
 #endif /* _ATRIUM_GPU_AMD_ABI_H_ */

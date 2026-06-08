@@ -34,6 +34,24 @@ atrium_amd_mmap(struct cdev *cdev, vm_ooffset_t offset, vm_paddr_t *paddr,
 	return (0);
 }
 
+/* Append a TLV cap record (header + data, padded to 4 bytes) to a buffer. */
+static size_t
+amd_put_cap(uint8_t *buf, size_t off, uint32_t id, const void *data,
+    uint32_t size)
+{
+	struct atrium_gpu_cap_record r;
+
+	r.cap_id = id;
+	r.cap_size = size;
+	memcpy(buf + off, &r, sizeof(r));
+	off += sizeof(r);
+	memcpy(buf + off, data, size);
+	off += size;
+	while ((off & 3) != 0)
+		buf[off++] = 0;
+	return (off);
+}
+
 /* Bounds-check a BO byte range [offset, offset+len) against the BO size. */
 static int
 amd_xfer_bounds(struct atrium_amd_bo *bo, uint64_t offset, uint64_t len)
@@ -290,6 +308,34 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 				fdrop(sfp, td);
 			}
 		}
+		return (err);
+	}
+
+	case ATRIUM_GPU_IOC_QUERY_CAPS: {
+		struct atrium_gpu_caps_query *q =
+		    (struct atrium_gpu_caps_query *)data;
+		static const char vendor[] = "Atrium AMD RDNA4 (gpusim)";
+		uint32_t ver[2] = { 1, 0 };	/* ABI major.minor */
+		uint32_t feat = ATRIUM_GPU_FEAT_GRAPHICS |
+		    ATRIUM_GPU_FEAT_COMPUTE | ATRIUM_GPU_FEAT_USER_QUEUES |
+		    ATRIUM_GPU_FEAT_SYNCOBJ | ATRIUM_GPU_FEAT_VM_BIND;
+		uint8_t buf[128];
+		size_t off = 0;
+
+		off = amd_put_cap(buf, off, ATRIUM_GPU_CAP_ABI_VERSION, ver,
+		    sizeof(ver));
+		off = amd_put_cap(buf, off, ATRIUM_GPU_CAP_VENDOR, vendor,
+		    sizeof(vendor));
+		off = amd_put_cap(buf, off, ATRIUM_GPU_CAP_FEATURES, &feat,
+		    sizeof(feat));
+
+		if (q->caps_size < off) {
+			q->caps_size = off;	/* tell userspace the size needed */
+			return (ENOMEM);
+		}
+		err = copyout(buf, (void *)(uintptr_t)q->caps_ptr, off);
+		if (err == 0)
+			q->caps_size = off;
 		return (err);
 	}
 

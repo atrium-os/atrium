@@ -45,6 +45,9 @@
  *       privileged part); userspace mmap()s the BAR2 doorbell (d_mmap) and
  *       rings it directly, off the syscall path. The doorbell page is the
  *       capability — the current AMD/MES direction, expressed BSD-natively.
+ *   M9f device discovery (ABI-v2 §5.1): QUERY_CAPS returns a TLV of caps
+ *       (ABI version, vendor, feature bits) userspace walks, skipping any it
+ *       does not recognize — the forward-compatible probe Mesa needs.
  *
  * WHY one kmod (not the §4.1 three-kmod pci/gpu/display split): there is no
  * display engine yet, so a separate PCI module would buy nothing. WHY the
@@ -235,4 +238,4 @@ static driver_t atrium_amd_driver = {
 
 DRIVER_MODULE(atrium_gpu_amd, pci, atrium_amd_driver, NULL, NULL);
 MODULE_DEPEND(atrium_gpu_amd, pci, 1, 1, 1);
-MODULE_VERSION(atrium_gpu_amd, 13);
+MODULE_VERSION(atrium_gpu_amd, 14);

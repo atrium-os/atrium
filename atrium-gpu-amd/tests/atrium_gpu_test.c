@@ -611,6 +611,57 @@ test_umq(int fd, int vm)
 	return (0);
 }
 
+/* M9f: query device capabilities and walk the TLV (skipping unknown records). */
+static int
+test_caps(int fd)
+{
+	struct atrium_gpu_caps_query q;
+	uint8_t buf[256];
+	const char *vendor = NULL;
+	uint32_t feat = 0;
+	size_t off = 0;
+	int saw_ver = 0;
+
+	memset(&q, 0, sizeof(q));
+	q.caps_ptr = (uint64_t)(uintptr_t)buf;
+	q.caps_size = sizeof(buf);
+	if (ioctl(fd, ATRIUM_GPU_IOC_QUERY_CAPS, &q) != 0) {
+		printf("caps: QUERY_CAPS failed\n");
+		return (1);
+	}
+	while (off + sizeof(struct atrium_gpu_cap_record) <= q.caps_size) {
+		struct atrium_gpu_cap_record *r =
+		    (struct atrium_gpu_cap_record *)(buf + off);
+		uint8_t *data = buf + off + sizeof(*r);
+
+		switch (r->cap_id) {
+		case ATRIUM_GPU_CAP_ABI_VERSION:
+			saw_ver = 1;
+			break;
+		case ATRIUM_GPU_CAP_VENDOR:
+			vendor = (const char *)data;
+			break;
+		case ATRIUM_GPU_CAP_FEATURES:
+			memcpy(&feat, data, sizeof(feat));
+			break;
+		default:
+			break;	/* unknown cap — skip it (forward compat) */
+		}
+		off += sizeof(*r) + r->cap_size;
+		off = (off + 3u) & ~(size_t)3u;
+	}
+	if (!saw_ver || vendor == NULL ||
+	    !(feat & ATRIUM_GPU_FEAT_USER_QUEUES) ||
+	    !(feat & ATRIUM_GPU_FEAT_SYNCOBJ)) {
+		printf("caps FAILED: vendor=%s feat=0x%x\n",
+		    vendor ? vendor : "(none)", feat);
+		return (1);
+	}
+	printf("caps OK: \"%s\", features 0x%x (graphics+compute+UMQ+syncobj+"
+	    "vm_bind)\n", vendor, feat);
+	return (0);
+}
+
 int
 main(void)
 {
@@ -627,7 +678,8 @@ main(void)
 		close(fd);
 		return (1);
 	}
-	rc = test_bo_fd(fd, vm);
+	rc = test_caps(fd);
+	rc |= test_bo_fd(fd, vm);
 	rc |= test_gfx_fence(fd, vm);
 	rc |= test_compute(fd, vm);
 	rc |= test_draw(fd, vm);
