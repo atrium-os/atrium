@@ -200,12 +200,17 @@ struct atrium_amd_vm {
  * refcount; the BO owns its own page and holds a reference (vm_fp) on the VM it
  * is mapped in, so fo_close can unmap from that VM.
  */
+#define ATRIUM_AMD_BO_MAX_PAGES	16	/* largest BO = 64 KiB (16 PTEs) */
+
 struct atrium_amd_bo {
 	struct atrium_amd_softc *sc;
 	struct atrium_amd_vm *vm;	/* the address space this BO is mapped in */
 	struct file	*vm_fp;		/* held reference keeping vm alive */
-	void		*kva;
-	vm_paddr_t	 gpa;
+	void		*kva;		/* CPU mapping (bus_dmamem, page-contiguous) */
+	bus_dma_tag_t	 dmat;		/* per-BO DMA tag */
+	bus_dmamap_t	 dmamap;	/* the BO's DMA mapping */
+	int		 npages;	/* pages backing this BO */
+	bus_addr_t	 pages[ATRIUM_AMD_BO_MAX_PAGES]; /* per-page bus addrs */
 	uint64_t	 gpu_va;
 	uint64_t	 size;
 };

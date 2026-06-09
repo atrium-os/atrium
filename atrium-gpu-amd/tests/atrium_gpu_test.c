@@ -19,6 +19,7 @@
 #include <sys/time.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
@@ -1248,6 +1249,72 @@ test_bilinear(int fd, int vm)
 	return (0);
 }
 
+/*
+ * M16: multi-page BOs via bus_dma. Allocate BOs larger than one page (here 3
+ * pages each), then have the GPU DMA-copy src->dst entirely on-device. The copy
+ * crosses page boundaries, so it only succeeds if every page of both BOs is
+ * mapped in the GPUVM — i.e. the per-page bus_dma scatter-gather + page-table
+ * population works. Single-page BOs (size > PAGE_SIZE was EINVAL) couldn't do
+ * this before.
+ */
+static int
+test_multipage(int fd, int vm)
+{
+	const uint32_t BYTES = 3 * 4096;	/* 3-page BOs */
+	const uint32_t N = BYTES / 4;
+	uint32_t src_h, dst_h, ring_h, ring[7], *src, *dst, i;
+	uint64_t src_va, dst_va, ring_va;
+	int rc = 1;
+
+	src = malloc(BYTES);
+	dst = malloc(BYTES);
+	if (src == NULL || dst == NULL) {
+		printf("multipage: malloc failed\n");
+		goto out;
+	}
+	for (i = 0; i < N; i++) {
+		src[i] = 0x9a9a0000u + i;	/* position-dependent: a per-page */
+		dst[i] = 0;			/* mapping bug shows as wrong words */
+	}
+	if (bo_alloc(fd, vm, BYTES, &src_h, &src_va) != 0 ||
+	    bo_alloc(fd, vm, BYTES, &dst_h, &dst_va) != 0 ||
+	    bo_alloc(fd, vm, 4096, &ring_h, &ring_va) != 0) {
+		printf("multipage: multi-page BO alloc failed\n");
+		goto out;
+	}
+	if (bo_write(fd, src_h, src, BYTES) != 0) {
+		printf("multipage: write src failed\n");
+		goto out;
+	}
+	/* DMA_DATA copy of the whole 3-page BO, src -> dst. */
+	ring[0] = type3(IT_DMA_DATA, 6);
+	ring[1] = 0;
+	ring[2] = (uint32_t)(src_va & 0xffffffff);
+	ring[3] = (uint32_t)(src_va >> 32);
+	ring[4] = (uint32_t)(dst_va & 0xffffffff);
+	ring[5] = (uint32_t)(dst_va >> 32);
+	ring[6] = BYTES;
+	if (bo_write(fd, ring_h, ring, sizeof(ring)) != 0 ||
+	    submit(fd, vm, ring_h, 7, ATRIUM_GPU_ENGINE_GFX) != 0 ||
+	    bo_read(fd, dst_h, dst, BYTES) != 0) {
+		printf("multipage: copy/readback failed\n");
+		goto out;
+	}
+	for (i = 0; i < N; i++)
+		if (dst[i] != src[i]) {
+			printf("multipage FAILED: word %u (page %u) = %08x want %08x\n",
+			    i, (i * 4) / 4096, dst[i], src[i]);
+			goto out;
+		}
+	printf("multipage OK: %u-page BO copied across page boundaries "
+	    "(bus_dma scatter-gather GPUVM)\n", BYTES / 4096);
+	rc = 0;
+out:
+	free(src);
+	free(dst);
+	return (rc);
+}
+
 int
 main(void)
 {
@@ -1281,6 +1348,7 @@ main(void)
 	rc |= test_dma_copy(fd, vm);
 	rc |= test_depth(fd, vm);
 	rc |= test_bilinear(fd, vm);
+	rc |= test_multipage(fd, vm);
 	close(vm);
 	close(fd);
 	printf(rc == 0 ? "ALL OK\n" : "FAILURES\n");

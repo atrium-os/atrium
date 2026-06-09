@@ -35,23 +35,56 @@ amd_dma_alloc(struct atrium_amd_softc *sc, vm_paddr_t *gpa_out)
 /* --- buffer objects: fd-backed, mapped into a VM --- */
 
 /*
- * Reclaim a BO: unmap it from its VM, drop the VM reference, free the page and
- * the struct. Safe before the mapping/VM-ref are established (gpu_va 0 unmaps
- * nothing; a NULL vm_fp is skipped).
+ * bus_dmamap_load callback: record each page's bus address. With the BO tag's
+ * maxsegsz == PAGE_SIZE the loader hands us one segment per page, so the GPUVM
+ * can map a PTE per page (scatter-gather: the backing pages need not be
+ * physically contiguous).
+ */
+struct amd_bo_load {
+	bus_addr_t	*pages;
+	int		 npages;
+	int		 error;
+};
+
+static void
+amd_bo_load_cb(void *arg, bus_dma_segment_t *segs, int nseg, int error)
+{
+	struct amd_bo_load *l = arg;
+	int i;
+
+	l->error = error;
+	if (error != 0)
+		return;
+	for (i = 0; i < nseg && i < ATRIUM_AMD_BO_MAX_PAGES; i++)
+		l->pages[i] = segs[i].ds_addr;
+	l->npages = nseg;
+}
+
+/*
+ * Reclaim a BO: unmap every page from its VM, drop the VM reference, release the
+ * DMA mapping/memory/tag and the struct. Safe before the mapping/VM-ref are
+ * established (an unbound BO has vm == NULL; a NULL vm_fp is skipped).
  */
 static void
 amd_bo_destroy(struct atrium_amd_bo *bo, struct thread *td)
 {
 	struct atrium_amd_softc *sc = bo->sc;
+	int i;
 
 	if (bo->vm != NULL)
-		amd_vm_unmap(bo->vm, bo->gpu_va);
+		for (i = 0; i < bo->npages; i++)
+			amd_vm_unmap(bo->vm, bo->gpu_va + (uint64_t)i * PAGE_SIZE);
 	if (bo->vm_fp != NULL)
 		fdrop(bo->vm_fp, td);
 	mtx_lock(&sc->lock);
 	sc->bo_count--;
 	mtx_unlock(&sc->lock);
-	free(bo->kva, M_DEVBUF);
+	if (bo->kva != NULL) {
+		bus_dmamap_unload(bo->dmat, bo->dmamap);
+		bus_dmamem_free(bo->dmat, bo->kva, bo->dmamap);
+	}
+	if (bo->dmat != NULL)
+		bus_dma_tag_destroy(bo->dmat);
 	free(bo, M_DEVBUF);
 }
 
@@ -109,23 +142,58 @@ amd_bo_create_fd(struct atrium_amd_softc *sc, struct thread *td, uint64_t size,
     int *out_fd)
 {
 	struct atrium_amd_bo *bo;
+	struct amd_bo_load load;
 	struct file *fp;
+	bus_dma_tag_t dmat;
+	bus_dmamap_t dmamap;
 	void *kva;
-	int fd, err;
+	uint64_t rounded;
+	int fd, err, npages;
 
-	if (size == 0 || size > PAGE_SIZE)
+	if (size == 0 || size > (uint64_t)ATRIUM_AMD_BO_MAX_PAGES * PAGE_SIZE)
 		return (EINVAL);
+	rounded = round_page(size);
+	npages = rounded / PAGE_SIZE;
 
-	kva = contigmalloc(PAGE_SIZE, M_DEVBUF, M_WAITOK | M_ZERO, 0,
-	    BUS_SPACE_MAXADDR, PAGE_SIZE, 0);
-	if (kva == NULL)
+	/*
+	 * DMA-allocate the BO through bus_dma(9) — the real-silicon path (proper
+	 * bus addresses, IOMMU-ready), not vtophys. A per-BO tag sized to this BO
+	 * with page-granular segments (maxsegsz == PAGE_SIZE) so the loader reports
+	 * one bus address per page for the GPUVM to map.
+	 */
+	err = bus_dma_tag_create(bus_get_dma_tag(sc->dev),
+	    PAGE_SIZE, 0,			/* alignment, boundary */
+	    BUS_SPACE_MAXADDR, BUS_SPACE_MAXADDR, NULL, NULL,
+	    rounded, npages, PAGE_SIZE,	/* maxsize, nsegments, maxsegsz */
+	    0, NULL, NULL, &dmat);
+	if (err != 0)
+		return (err);
+	err = bus_dmamem_alloc(dmat, &kva,
+	    BUS_DMA_WAITOK | BUS_DMA_ZERO | BUS_DMA_COHERENT, &dmamap);
+	if (err != 0) {
+		bus_dma_tag_destroy(dmat);
 		return (ENOMEM);
+	}
 	bo = malloc(sizeof(*bo), M_DEVBUF, M_WAITOK | M_ZERO);
 	bo->sc = sc;
 	bo->kva = kva;
-	bo->gpa = vtophys(kva);
+	bo->dmat = dmat;
+	bo->dmamap = dmamap;
 	bo->size = size;
 	/* bo->vm / vm_fp / gpu_va stay NULL/0 until bound. */
+
+	load.pages = bo->pages;
+	load.npages = 0;
+	load.error = 0;
+	err = bus_dmamap_load(dmat, dmamap, kva, rounded, amd_bo_load_cb, &load,
+	    BUS_DMA_NOWAIT);
+	if (err != 0 || load.error != 0 || load.npages != npages) {
+		bus_dmamem_free(dmat, kva, dmamap);
+		bus_dma_tag_destroy(dmat);
+		free(bo, M_DEVBUF);
+		return (err != 0 ? err : EIO);
+	}
+	bo->npages = load.npages;
 
 	mtx_lock(&sc->lock);
 	sc->bo_count++;
@@ -158,8 +226,9 @@ amd_bo_bind(struct atrium_amd_bo *bo, struct atrium_amd_vm *vm,
 	struct atrium_amd_softc *sc = bo->sc;
 	const uint64_t va_limit = ATRIUM_AMD_BO_VA_BASE +
 	    (uint64_t)ATRIUM_AMD_VM_MAX_BO * PAGE_SIZE;
+	const uint64_t span = (uint64_t)bo->npages * PAGE_SIZE;
 	uint64_t addr;
-	int err;
+	int i, err;
 
 	if (bo->vm != NULL)
 		return (EBUSY);	/* already bound (one binding per BO for now) */
@@ -167,18 +236,25 @@ amd_bo_bind(struct atrium_amd_bo *bo, struct atrium_amd_vm *vm,
 	mtx_lock(&sc->lock);
 	if (*va != 0) {
 		addr = *va;
-	} else if (vm->next_va < va_limit) {
+	} else if (vm->next_va + span <= va_limit) {
 		addr = vm->next_va;
-		vm->next_va += PAGE_SIZE;
+		vm->next_va += span;
 	} else {
 		mtx_unlock(&sc->lock);
 		return (ENOSPC);
 	}
 	mtx_unlock(&sc->lock);
 
-	err = amd_vm_map(vm, addr, bo->gpa);	/* validates the VA range */
-	if (err != 0)
-		return (err);
+	/* One PTE per page — the GPUVM gathers the BO's (possibly scattered) pages
+	 * into a contiguous GPU-VA range. */
+	for (i = 0; i < bo->npages; i++) {
+		err = amd_vm_map(vm, addr + (uint64_t)i * PAGE_SIZE, bo->pages[i]);
+		if (err != 0) {
+			while (i-- > 0)
+				amd_vm_unmap(vm, addr + (uint64_t)i * PAGE_SIZE);
+			return (err);
+		}
+	}
 
 	bo->vm = vm;
 	bo->vm_fp = vm_fp;
