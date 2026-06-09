@@ -25,21 +25,82 @@ amd_intr(void *arg)
 	struct atrium_amd_softc *sc = arg;
 	uint32_t wptr, idx;
 	const uint32_t *cookie;
+	int eops = 0;
 
 	wptr = amd_mmio_read32(sc, regIH_WPTR);
 	while (sc->ih_rptr != wptr) {
 		idx = sc->ih_rptr % ATRIUM_AMD_IH_ENTRIES;
 		cookie = (const uint32_t *)((const char *)sc->ih_kva +
 		    idx * ATRIUM_AMD_IH_COOKIE);
-		(void)cookie[0];	/* cause (IH_CAUSE_EOP); decoded by the */
-		(void)cookie[1];	/* fence/retire layer once it exists */
+		if (cookie[0] == ATRIUM_AMD_IH_CAUSE_EOP)
+			eops++;		/* each end-of-pipe cookie = one completion */
 		sc->ih_rptr++;
 	}
 	atomic_add_int(&sc->irq_count, 1);
 
-	/* Wake any thread blocked in IOC_WAIT_FENCE so it re-tests its fence. */
+	/*
+	 * Retire completions: signal one pending syncobj per end-of-pipe event.
+	 * This is the asynchronous half of submission — a submission whose ring
+	 * parked on a cross-queue WAIT registered its syncobj here and is signalled
+	 * now, on the *later* doorbell sweep that unblocked it (not inline at
+	 * submit). amd_syncobj_signal takes so->lock nested under sc->lock; the
+	 * syncobj's fo_close scrubs the list under sc->lock first, so the so is
+	 * always live here. Also wakes any IOC_WAIT_FENCE poller.
+	 */
 	mtx_lock(&sc->lock);
+	while (eops > 0 && sc->n_pending > 0) {
+		struct atrium_amd_syncobj *so = sc->pending[0].so;
+		uint64_t val = sc->pending[0].value;
+		int i;
+
+		for (i = 1; i < sc->n_pending; i++)
+			sc->pending[i - 1] = sc->pending[i];
+		sc->n_pending--;
+		amd_syncobj_signal(so, val);
+		eops--;
+	}
 	wakeup(&sc->irq_count);
+	mtx_unlock(&sc->lock);
+}
+
+/*
+ * Register a completion the ISR will hand to a syncobj. Called *before* the
+ * doorbell rings, so a synchronous drain (whose IRQ fires inside the submit)
+ * still finds the entry. Drops silently if the FIFO is full (bounded by
+ * ATRIUM_AMD_MAX_PENDING in-flight signalled submissions).
+ */
+void
+amd_pending_push(struct atrium_amd_softc *sc, struct atrium_amd_syncobj *so,
+    uint64_t value)
+{
+	mtx_lock(&sc->lock);
+	if (sc->n_pending < ATRIUM_AMD_MAX_PENDING) {
+		sc->pending[sc->n_pending].so = so;
+		sc->pending[sc->n_pending].value = value;
+		sc->n_pending++;
+	}
+	mtx_unlock(&sc->lock);
+}
+
+/*
+ * Remove every pending entry for a syncobj. The syncobj's fo_close calls this
+ * under sc->lock before freeing, so the ISR (which holds sc->lock while it
+ * signals) never touches a freed syncobj — no refcount, no free from the ISR.
+ */
+void
+amd_pending_scrub(struct atrium_amd_softc *sc, struct atrium_amd_syncobj *so)
+{
+	int i, j;
+
+	mtx_lock(&sc->lock);
+	for (i = 0, j = 0; i < sc->n_pending; i++) {
+		if (sc->pending[i].so != so) {
+			if (j != i)
+				sc->pending[j] = sc->pending[i];
+			j++;
+		}
+	}
+	sc->n_pending = j;
 	mtx_unlock(&sc->lock);
 }
 

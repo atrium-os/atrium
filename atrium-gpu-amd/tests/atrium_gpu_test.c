@@ -28,6 +28,9 @@
 #define IT_RELEASE_MEM		0x49u
 #define IT_DISPATCH_DIRECT	0x15u
 #define IT_DRAW_INDEX_AUTO	0x2du
+#define IT_WRITE_DATA		0x37u
+#define IT_WAIT_REG_MEM		0x3cu
+#define WAIT_FN_GE		5u	/* WAIT_REG_MEM FUNCTION: value >= reference */
 #define KERNEL_INC		2u
 #define FENCE_MAGIC		0xcafef00ddeadbeefULL
 
@@ -662,6 +665,137 @@ test_caps(int fd)
 	return (0);
 }
 
+/*
+ * M10: asynchronous cross-queue completion. Queue A (compute) waits on a fence
+ * word and then signals its syncobj; queue B (gfx) writes that word. A is
+ * submitted FIRST and its ring parks on the WAIT — so its syncobj must still
+ * read 0 (completion is deferred, NOT signalled inline at submit). Only when
+ * B's later doorbell writes the word does the model resume A, raise the
+ * end-of-pipe IRQ, and the ISR signal A's syncobj. This exercises the
+ * persistent cross-doorbell parking (gpusim) + the ISR-driven signal path
+ * (kmod) — the real-hardware async-vs-sync distinction the sync drain hid.
+ */
+static int
+test_cross_queue(int fd, int vm)
+{
+	struct atrium_gpu_syncobj_create cr;
+	struct atrium_gpu_syncobj_op q;
+	struct atrium_gpu_syncobj_wait wt;
+	struct atrium_gpu_submit s;
+	uint32_t addr_h, fence_h, ringa_h, ringb_h;
+	uint32_t ringa[14], ringb[6], zero = 0;
+	uint64_t addr_va, fence_va, ringa_va, ringb_va, fb = 0;
+	int so_fd;
+
+	memset(&cr, 0, sizeof(cr));
+	if (ioctl(fd, ATRIUM_GPU_IOC_SYNCOBJ_CREATE, &cr) != 0) {
+		printf("cross_queue: syncobj create failed\n");
+		return (1);
+	}
+	so_fd = (int)cr.out_fd;
+
+	if (bo_alloc(fd, vm, 4096, &addr_h, &addr_va) != 0 ||
+	    bo_alloc(fd, vm, 4096, &fence_h, &fence_va) != 0 ||
+	    bo_alloc(fd, vm, 4096, &ringa_h, &ringa_va) != 0 ||
+	    bo_alloc(fd, vm, 4096, &ringb_h, &ringb_va) != 0) {
+		printf("cross_queue: BO alloc failed\n");
+		return (1);
+	}
+	if (bo_write(fd, addr_h, &zero, sizeof(zero)) != 0) {
+		printf("cross_queue: zero-init failed\n");
+		return (1);
+	}
+
+	/* Ring A (compute): WAIT_REG_MEM(addr >= 1), then RELEASE_MEM + IRQ. */
+	ringa[0] = type3(IT_WAIT_REG_MEM, 6);
+	ringa[1] = (WAIT_FN_GE << 0) | (1u << 4);	/* function GE | mem-space */
+	ringa[2] = (uint32_t)(addr_va & 0xffffffff);
+	ringa[3] = (uint32_t)(addr_va >> 32);
+	ringa[4] = 1;					/* reference */
+	ringa[5] = 0xffffffff;				/* mask */
+	ringa[6] = 0x10;
+	ringa[7] = type3(IT_RELEASE_MEM, 6);
+	ringa[8] = (5u << 8);
+	ringa[9] = (2u << 29) | (2u << 24);
+	ringa[10] = (uint32_t)(fence_va & 0xffffffff);
+	ringa[11] = (uint32_t)(fence_va >> 32);
+	ringa[12] = (uint32_t)(FENCE_MAGIC & 0xffffffff);
+	ringa[13] = (uint32_t)(FENCE_MAGIC >> 32);
+
+	/* Ring B (gfx): WRITE_DATA(addr) = 1 — unblocks A. */
+	ringb[0] = type3(IT_WRITE_DATA, 5);
+	ringb[1] = (5u << 8) | (1u << 20);		/* DST_SEL memory | WR_CONFIRM */
+	ringb[2] = (uint32_t)(addr_va & 0xffffffff);
+	ringb[3] = (uint32_t)(addr_va >> 32);
+	ringb[4] = 1;
+	ringb[5] = 0;
+
+	if (bo_write(fd, ringa_h, ringa, sizeof(ringa)) != 0 ||
+	    bo_write(fd, ringb_h, ringb, sizeof(ringb)) != 0) {
+		printf("cross_queue: ring write failed\n");
+		return (1);
+	}
+
+	/* Submit A first; its ring parks on the WAIT (addr is still 0). */
+	memset(&s, 0, sizeof(s));
+	s.vm_fd = vm;
+	s.ring_fd = ringa_h;
+	s.n_dwords = 14;
+	s.engine = ATRIUM_GPU_ENGINE_COMPUTE;
+	s.signal_syncobj_fd = so_fd;
+	s.signal_value = 1;
+	if (ioctl(fd, ATRIUM_GPU_IOC_SUBMIT, &s) != 0) {
+		printf("cross_queue: submit A failed\n");
+		return (1);
+	}
+
+	/* KEY: completion is deferred — the syncobj must still read 0 here. */
+	memset(&q, 0, sizeof(q));
+	q.syncobj_fd = so_fd;
+	if (ioctl(fd, ATRIUM_GPU_IOC_SYNCOBJ_QUERY, &q) != 0) {
+		printf("cross_queue: query failed\n");
+		return (1);
+	}
+	if (q.value != 0) {
+		printf("cross_queue FAILED: syncobj signalled at submit "
+		    "(value=%llu) — completion was not deferred\n",
+		    (unsigned long long)q.value);
+		return (1);
+	}
+
+	/* Submit B; writing the word unblocks A, which completes + raises IRQ. */
+	memset(&s, 0, sizeof(s));
+	s.vm_fd = vm;
+	s.ring_fd = ringb_h;
+	s.n_dwords = 6;
+	s.engine = ATRIUM_GPU_ENGINE_GFX;
+	s.signal_syncobj_fd = -1;
+	if (ioctl(fd, ATRIUM_GPU_IOC_SUBMIT, &s) != 0) {
+		printf("cross_queue: submit B failed\n");
+		return (1);
+	}
+
+	/* A's syncobj is now signalled — by the ISR, on B's doorbell. */
+	memset(&wt, 0, sizeof(wt));
+	wt.syncobj_fd = so_fd;
+	wt.value = 1;
+	wt.timeout_ms = 1000;
+	if (ioctl(fd, ATRIUM_GPU_IOC_SYNCOBJ_WAIT, &wt) != 0) {
+		printf("cross_queue FAILED: A never completed after B's submit\n");
+		return (1);
+	}
+	if (bo_read(fd, fence_h, &fb, sizeof(fb)) != 0 || fb != FENCE_MAGIC) {
+		printf("cross_queue FAILED: A's fence = 0x%llx (expected magic)\n",
+		    (unsigned long long)fb);
+		return (1);
+	}
+
+	close(so_fd);
+	printf("cross_queue OK: A parked (syncobj=0 at submit), B's write "
+	    "unblocked it, ISR signalled the deferred completion\n");
+	return (0);
+}
+
 int
 main(void)
 {
@@ -688,6 +822,7 @@ main(void)
 	rc |= test_vm_bind(fd);
 	rc |= test_isolation(fd);
 	rc |= test_umq(fd, vm);
+	rc |= test_cross_queue(fd, vm);
 	close(vm);
 	close(fd);
 	printf(rc == 0 ? "ALL OK\n" : "FAILURES\n");

@@ -193,7 +193,7 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		    (struct atrium_gpu_syncobj_create *)data;
 		int fd;
 
-		err = amd_syncobj_create_fd(td, &fd);
+		err = amd_syncobj_create_fd(sc, td, &fd);
 		if (err != 0)
 			return (err);
 		c->out_fd = fd;
@@ -272,9 +272,9 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 
 	case ATRIUM_GPU_IOC_SUBMIT: {
 		struct atrium_gpu_submit *s = (struct atrium_gpu_submit *)data;
-		struct atrium_amd_syncobj *so;
+		struct atrium_amd_syncobj *so = NULL;
 		struct atrium_amd_vm *vm;
-		struct file *fp, *vmfp, *sfp;
+		struct file *fp, *vmfp, *sfp = NULL;
 
 		err = amd_vm_fget(td, s->vm_fd, &vmfp, &vm);
 		if (err != 0)
@@ -285,29 +285,39 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 			return (err);
 		}
 		/* The ring must fit the BO (each dword is 4 bytes). */
-		if ((uint64_t)s->n_dwords * 4 > bo->size)
+		if ((uint64_t)s->n_dwords * 4 > bo->size) {
 			err = EINVAL;
-		else
-			err = amd_submit(sc, bo, s->n_dwords, s->engine,
-			    vm->vmid);
+		} else {
+			/*
+			 * Register the completion syncobj BEFORE ringing the
+			 * doorbell — the ISR signals it on the end-of-pipe
+			 * interrupt, not here. For a ring that parks on a
+			 * cross-queue WAIT that interrupt arrives on a *later*
+			 * doorbell (another queue writes the awaited fence),
+			 * so completion is genuinely asynchronous w.r.t. this
+			 * submit. For a ring that drains synchronously the IRQ
+			 * fires inside amd_submit; the entry is already queued,
+			 * so the ISR still finds it. Pushing first is what makes
+			 * both cases correct.
+			 */
+			if (s->signal_syncobj_fd >= 0) {
+				err = amd_syncobj_fget(td,
+				    s->signal_syncobj_fd, &sfp, &so);
+				if (err == 0)
+					amd_pending_push(sc, so,
+					    s->signal_value);
+			}
+			if (err == 0)
+				err = amd_submit(sc, bo, s->n_dwords,
+				    s->engine, vm->vmid);
+			/* Submit never reached the GPU -> reclaim the entry. */
+			if (err != 0 && so != NULL)
+				amd_pending_scrub(sc, so);
+			if (sfp != NULL)
+				fdrop(sfp, td);
+		}
 		fdrop(fp, td);
 		fdrop(vmfp, td);
-
-		/*
-		 * Signal the completion syncobj. The model drains the ring
-		 * synchronously inside amd_submit (the doorbell write), so the
-		 * work is already done here and we signal inline. On real async
-		 * hardware this signal moves into the ISR (a pending-completion
-		 * list keyed by the EOP interrupt) — a documented follow-up.
-		 */
-		if (err == 0 && s->signal_syncobj_fd >= 0) {
-			err = amd_syncobj_fget(td, s->signal_syncobj_fd, &sfp,
-			    &so);
-			if (err == 0) {
-				amd_syncobj_signal(so, s->signal_value);
-				fdrop(sfp, td);
-			}
-		}
 		return (err);
 	}
 

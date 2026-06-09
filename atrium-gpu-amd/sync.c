@@ -101,6 +101,13 @@ amd_syncobj_close(struct file *fp, struct thread *td)
 	if (so == NULL)
 		return (0);
 	fp->f_data = NULL;
+	/*
+	 * Drop any completion the ISR still owes this syncobj before we free it.
+	 * The scrub takes sc->lock, which the ISR also holds while it signals, so
+	 * once this returns the ISR can no longer reference `so`.
+	 */
+	if (so->sc != NULL)
+		amd_pending_scrub(so->sc, so);
 	seldrain(&so->sel);
 	knlist_destroy(&so->sel.si_note);
 	mtx_destroy(&so->lock);
@@ -126,13 +133,15 @@ amd_syncobj_signal(struct atrium_amd_syncobj *so, uint64_t value)
 }
 
 int
-amd_syncobj_create_fd(struct thread *td, int *out_fd)
+amd_syncobj_create_fd(struct atrium_amd_softc *sc, struct thread *td,
+    int *out_fd)
 {
 	struct atrium_amd_syncobj *so;
 	struct file *fp;
 	int fd, err;
 
 	so = malloc(sizeof(*so), M_DEVBUF, M_WAITOK | M_ZERO);
+	so->sc = sc;
 	mtx_init(&so->lock, "amdsync", NULL, MTX_DEF);
 	knlist_init_mtx(&so->sel.si_note, &so->lock);
 	so->value = 0;

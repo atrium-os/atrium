@@ -235,10 +235,26 @@ struct atrium_amd_bo {
  * source for now.) The struct-file refcount is its lifetime.
  */
 struct atrium_amd_syncobj {
+	struct atrium_amd_softc *sc;	/* for scrubbing the pending list on close */
 	struct mtx	 lock;	/* guards value + the knote list */
 	struct selinfo	 sel;	/* sel.si_note = the kqueue knlist */
 	uint64_t	 value;
 };
+
+/*
+ * A completion the ISR owes a syncobj. A submission that signals a syncobj
+ * pushes one of these *before* ringing the doorbell; the ISR pops it on the
+ * end-of-pipe interrupt and signals the syncobj — so a submission whose ring
+ * parks on a cross-queue WAIT is signalled asynchronously, when a *later*
+ * doorbell unblocks it, not inline. The syncobj's fo_close scrubs its entries
+ * under sc->lock, which serializes against the ISR (no refcount / no ISR free).
+ */
+struct atrium_amd_pending {
+	struct atrium_amd_syncobj *so;
+	uint64_t	 value;
+};
+#define ATRIUM_AMD_MAX_PENDING	16
+#define ATRIUM_AMD_IH_CAUSE_EOP	1	/* IH cookie cause: end-of-pipe (device.rs) */
 
 struct atrium_amd_softc {
 	device_t	 dev;
@@ -257,8 +273,10 @@ struct atrium_amd_softc {
 	void		*ih_kva;	/* interrupt-handler ring (CPU side) */
 	uint32_t	 ih_rptr;	/* our read pointer into the IH ring */
 	u_int		 irq_count;	/* interrupts serviced (atomic vs reader) */
-	struct mtx	 lock;		/* guards fence-wait sleep/wakeup */
+	struct mtx	 lock;		/* guards fence-wait sleep/wakeup + pending */
 	int		 lock_inited;
+	struct atrium_amd_pending pending[ATRIUM_AMD_MAX_PENDING];
+	int		 n_pending;	/* completions the ISR owes (FIFO) */
 
 	uint32_t	 vmid_bitmap;	/* allocated VMIDs (bit N = VMID N in use) */
 	int		 vm_count;	/* live vm_fds */
@@ -341,15 +359,20 @@ void	 amd_set_draw(struct atrium_amd_softc *sc, uint64_t vtx_va,
 	    uint64_t rt_va, uint32_t width, uint32_t height);
 
 /* sync.c — timeline syncobj fd (kqueue-able) */
-int	 amd_syncobj_create_fd(struct thread *td, int *out_fd);
+int	 amd_syncobj_create_fd(struct atrium_amd_softc *sc, struct thread *td,
+	    int *out_fd);
 int	 amd_syncobj_fget(struct thread *td, int fd, struct file **out_fp,
 	    struct atrium_amd_syncobj **out_so);
 void	 amd_syncobj_signal(struct atrium_amd_syncobj *so, uint64_t value);
 extern const struct fileops atrium_amd_syncobj_fileops;
 
-/* irq.c — MSI-X interrupt setup + the ISR that drains the IH ring */
+/* irq.c — MSI-X interrupt setup, the ISR, and the pending-completion list */
 int	 amd_irq_setup(struct atrium_amd_softc *sc);
 void	 amd_irq_teardown(struct atrium_amd_softc *sc);
+void	 amd_pending_push(struct atrium_amd_softc *sc,
+	    struct atrium_amd_syncobj *so, uint64_t value);
+void	 amd_pending_scrub(struct atrium_amd_softc *sc,
+	    struct atrium_amd_syncobj *so);
 
 /* ioctl.c — the cdev character-device switch */
 extern struct cdevsw atrium_amd_cdevsw;
