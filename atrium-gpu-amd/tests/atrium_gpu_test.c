@@ -796,6 +796,110 @@ test_cross_queue(int fd, int vm)
 	return (0);
 }
 
+/*
+ * M11: fault/hang -> reset -> recovery. A compute ring waits on a word nobody
+ * will ever write, so it parks forever (persistent parking, M10) — the
+ * submission is lost. The fence-wait must TIME OUT; the driver then issues a
+ * full GPU reset, which tears down the rings and reloads firmware/MES, and a
+ * normal submit succeeds on the clean engine. This is the timeout -> reset ->
+ * resubmit recovery a real driver runs on a device-lost, made testable by the
+ * persistent-parking model.
+ */
+static int
+test_fault_reset(int fd, int vm)
+{
+	struct atrium_gpu_syncobj_create cr;
+	struct atrium_gpu_syncobj_wait wt;
+	struct atrium_gpu_submit s;
+	uint32_t stuck_h, ring_h, fence_h, ring[7], gring[9], zero = 0;
+	uint64_t stuck_va, ring_va, fence_va, fb = 0;
+	int so_fd;
+
+	memset(&cr, 0, sizeof(cr));
+	if (ioctl(fd, ATRIUM_GPU_IOC_SYNCOBJ_CREATE, &cr) != 0) {
+		printf("fault_reset: syncobj create failed\n");
+		return (1);
+	}
+	so_fd = (int)cr.out_fd;
+
+	if (bo_alloc(fd, vm, 4096, &stuck_h, &stuck_va) != 0 ||
+	    bo_alloc(fd, vm, 4096, &ring_h, &ring_va) != 0 ||
+	    bo_alloc(fd, vm, 4096, &fence_h, &fence_va) != 0) {
+		printf("fault_reset: BO alloc failed\n");
+		return (1);
+	}
+	if (bo_write(fd, stuck_h, &zero, sizeof(zero)) != 0) {
+		printf("fault_reset: zero-init failed\n");
+		return (1);
+	}
+
+	/* A compute ring that waits on a word that never becomes 1. */
+	ring[0] = type3(IT_WAIT_REG_MEM, 6);
+	ring[1] = (WAIT_FN_GE << 0) | (1u << 4);
+	ring[2] = (uint32_t)(stuck_va & 0xffffffff);
+	ring[3] = (uint32_t)(stuck_va >> 32);
+	ring[4] = 1;
+	ring[5] = 0xffffffff;
+	ring[6] = 0x10;
+	if (bo_write(fd, ring_h, ring, sizeof(ring)) != 0) {
+		printf("fault_reset: ring write failed\n");
+		return (1);
+	}
+	memset(&s, 0, sizeof(s));
+	s.vm_fd = vm;
+	s.ring_fd = ring_h;
+	s.n_dwords = 7;
+	s.engine = ATRIUM_GPU_ENGINE_COMPUTE;
+	s.signal_syncobj_fd = so_fd;
+	s.signal_value = 1;
+	if (ioctl(fd, ATRIUM_GPU_IOC_SUBMIT, &s) != 0) {
+		printf("fault_reset: submit failed\n");
+		return (1);
+	}
+
+	/* The submission is lost — the fence-wait must time out, not complete. */
+	memset(&wt, 0, sizeof(wt));
+	wt.syncobj_fd = so_fd;
+	wt.value = 1;
+	wt.timeout_ms = 200;
+	if (ioctl(fd, ATRIUM_GPU_IOC_SYNCOBJ_WAIT, &wt) == 0) {
+		printf("fault_reset FAILED: a lost submit's wait completed\n");
+		return (1);
+	}
+
+	/* Recover the engine. */
+	if (ioctl(fd, ATRIUM_GPU_IOC_GPU_RESET, NULL) != 0) {
+		printf("fault_reset FAILED: GPU_RESET ioctl\n");
+		return (1);
+	}
+
+	/* A normal submit now runs on the clean engine. */
+	gring[0] = type3(IT_NOP, 1);
+	gring[1] = 0;
+	gring[2] = type3(IT_RELEASE_MEM, 6);
+	gring[3] = (5u << 8);
+	gring[4] = (2u << 29) | (2u << 24);
+	gring[5] = (uint32_t)(fence_va & 0xffffffff);
+	gring[6] = (uint32_t)(fence_va >> 32);
+	gring[7] = (uint32_t)(FENCE_MAGIC & 0xffffffff);
+	gring[8] = (uint32_t)(FENCE_MAGIC >> 32);
+	if (bo_write(fd, ring_h, gring, sizeof(gring)) != 0 ||
+	    submit(fd, vm, ring_h, 9, ATRIUM_GPU_ENGINE_GFX) != 0) {
+		printf("fault_reset FAILED: post-reset submit\n");
+		return (1);
+	}
+	if (bo_read(fd, fence_h, &fb, sizeof(fb)) != 0 || fb != FENCE_MAGIC) {
+		printf("fault_reset FAILED: post-reset fence = 0x%llx\n",
+		    (unsigned long long)fb);
+		return (1);
+	}
+
+	close(so_fd);
+	printf("fault_reset OK: lost submit timed out, GPU reset recovered the "
+	    "engine (post-reset fence = 0x%llx)\n", (unsigned long long)fb);
+	return (0);
+}
+
 int
 main(void)
 {
@@ -823,6 +927,7 @@ main(void)
 	rc |= test_isolation(fd);
 	rc |= test_umq(fd, vm);
 	rc |= test_cross_queue(fd, vm);
+	rc |= test_fault_reset(fd, vm);
 	close(vm);
 	close(fd);
 	printf(rc == 0 ? "ALL OK\n" : "FAILURES\n");

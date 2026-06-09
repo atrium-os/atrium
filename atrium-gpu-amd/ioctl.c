@@ -349,6 +349,29 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		return (err);
 	}
 
+	case ATRIUM_GPU_IOC_GPU_RESET: {
+		/*
+		 * Recover a wedged engine. A full GPU reset tears down the rings
+		 * (the model drops every queue), then reload CP firmware and
+		 * re-init the MES — the timeout -> reset -> resubmit path a driver
+		 * runs when a submission is lost (a forever-unsatisfied cross-queue
+		 * WAIT, a hang). GPUVM page tables survive the reset, so open VMs
+		 * and their BOs stay valid; the next submit re-maps its queue onto
+		 * the clean engine. Drop any pending completions — the reset
+		 * abandoned the work that would have signalled them, so they must
+		 * not be mis-attributed to a later interrupt.
+		 */
+		err = amd_reset(sc);
+		if (err == 0) {
+			amd_firmware_load(sc);
+			amd_mes_init(sc);
+			mtx_lock(&sc->lock);
+			sc->n_pending = 0;
+			mtx_unlock(&sc->lock);
+		}
+		return (err);
+	}
+
 	default:
 		return (ENOTTY);
 	}

@@ -170,5 +170,13 @@ struct atrium_gpu_syncobj_wait {
 #define ATRIUM_GPU_IOC_VM_BIND		_IOWR('A', 13, struct atrium_gpu_vm_bind)
 #define ATRIUM_GPU_IOC_QUEUE_MAP	_IOWR('A', 14, struct atrium_gpu_queue_map)
 #define ATRIUM_GPU_IOC_QUERY_CAPS	_IOWR('A', 15, struct atrium_gpu_caps_query)
+/*
+ * Recover a wedged engine: full GPU reset (tears down the rings), reload CP
+ * firmware, re-init the MES, and abandon in-flight completions. The
+ * timeout -> reset -> resubmit recovery a driver runs when a submission is lost
+ * (a forever-unsatisfied cross-queue WAIT, a hang). GPUVM page tables survive,
+ * so open VMs/BOs stay valid. No arguments.
+ */
+#define ATRIUM_GPU_IOC_GPU_RESET	_IO('A', 16)
 
 #endif /* _ATRIUM_GPU_AMD_ABI_H_ */
