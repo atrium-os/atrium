@@ -98,14 +98,6 @@ struct atrium_gpu_bo_xfer {
 	uint32_t	pad;
 };
 
-/* Program the compute state the SoftwareBackend reads at DISPATCH time. */
-struct atrium_gpu_set_compute {
-	uint64_t	src_va;		/* in: source buffer GPU-VA */
-	uint64_t	dst_va;		/* in: dest buffer GPU-VA */
-	uint32_t	kernel;		/* in: built-in kernel selector */
-	uint32_t	pad;
-};
-
 /*
  * Submit a PM4 ring (already laid into the ring BO) on an engine, optionally
  * signalling a syncobj timeline to `signal_value` on completion.
@@ -118,20 +110,6 @@ struct atrium_gpu_submit {
 	uint32_t	engine;		/* in: ATRIUM_GPU_ENGINE_* */
 	int32_t		signal_syncobj_fd; /* in: syncobj to signal (-1 = none) */
 	uint32_t	pad;
-};
-
-/* Program graphics DRAW state read by a DRAW_INDEX_AUTO packet on the gfx ring. */
-struct atrium_gpu_set_draw {
-	uint64_t	vtx_va;		/* in: vertex buffer GPU-VA (24B verts) */
-	uint64_t	rt_va;		/* in: render-target GPU-VA (RGBA8) */
-	uint32_t	width;		/* in: RT width  */
-	uint32_t	height;		/* in: RT height */
-	uint64_t	tex_va;		/* in: texture GPU-VA (RGBA8; 0 = vertex color) */
-	uint32_t	tex_w;		/* in: texture width  */
-	uint32_t	tex_h;		/* in: texture height */
-	uint32_t	tex_filter;	/* in: 0 = nearest, 1 = bilinear */
-	uint32_t	blend;		/* in: 1 = alpha-blend (src-over) over the RT */
-	uint64_t	depth_va;	/* in: depth buffer GPU-VA (0 = no depth test) */
 };
 
 /* Query interrupt state: how many completions the ISR has serviced. */
@@ -164,9 +142,9 @@ struct atrium_gpu_syncobj_wait {
 #define ATRIUM_GPU_IOC_BO_ALLOC		_IOWR('A', 0, struct atrium_gpu_bo_alloc)
 #define ATRIUM_GPU_IOC_BO_WRITE		_IOW('A', 1, struct atrium_gpu_bo_xfer)
 #define ATRIUM_GPU_IOC_BO_READ		_IOW('A', 2, struct atrium_gpu_bo_xfer)
-#define ATRIUM_GPU_IOC_SET_COMPUTE	_IOW('A', 3, struct atrium_gpu_set_compute)
+/* 'A',3 (SET_COMPUTE) and 'A',5 (SET_DRAW) retired: compute/draw state now
+ * travels in the ring as SET_SH_REG packets (opaque-blob submit, ABI-v2). */
 #define ATRIUM_GPU_IOC_SUBMIT		_IOW('A', 4, struct atrium_gpu_submit)
-#define ATRIUM_GPU_IOC_SET_DRAW		_IOW('A', 5, struct atrium_gpu_set_draw)
 #define ATRIUM_GPU_IOC_GET_IRQS		_IOR('A', 6, struct atrium_gpu_irqs)
 #define ATRIUM_GPU_IOC_SYNCOBJ_CREATE	_IOWR('A', 8, struct atrium_gpu_syncobj_create)
 #define ATRIUM_GPU_IOC_SYNCOBJ_SIGNAL	_IOW('A', 9, struct atrium_gpu_syncobj_op)

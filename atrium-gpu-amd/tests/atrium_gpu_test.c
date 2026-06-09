@@ -34,6 +34,9 @@
 #define IT_SET_SH_REG		0x76u	/* write a run of state regs from the ring */
 #define WAIT_FN_GE		5u	/* WAIT_REG_MEM FUNCTION: value >= reference */
 #define SIM_COMPUTE_KERNEL	0x200u	/* SIM-aperture offset of COMPUTE_KERNEL */
+#define SIM_DRAW_VTX_LO		0x214u	/* SIM-aperture offset of the 12-reg draw block */
+
+static uint32_t type3(uint32_t opcode, uint32_t body_dwords);	/* defined below */
 
 /* Vertex the rasterizer consumes: NDC position + texcoord + RGBA color = 24B. */
 struct vtx {
@@ -54,6 +57,47 @@ blend_over(uint32_t src, uint32_t dst)
 #undef CH
 	a = (uint32_t)((sa + da * (1.0f - sa)) * 255.0f + 0.5f);
 	return r | (g << 8) | (b << 16) | (a << 24);
+}
+
+/*
+ * Opaque-blob submit (ABI-v2): the compute/draw state travels in the ring as a
+ * SET_SH_REG packet the CP applies — the kernel never touches the compute/draw
+ * state registers. These emit such a packet into `r` and return its dword count.
+ * The register blocks are consecutive in the SIM aperture, so one packet each.
+ */
+static int
+emit_compute_sh(uint32_t *r, uint32_t kernel, uint64_t src, uint64_t dst)
+{
+	r[0] = type3(IT_SET_SH_REG, 6);		/* 1 offset + 5 values */
+	r[1] = SIM_COMPUTE_KERNEL;
+	r[2] = kernel;
+	r[3] = (uint32_t)(src & 0xffffffff);
+	r[4] = (uint32_t)(src >> 32);
+	r[5] = (uint32_t)(dst & 0xffffffff);
+	r[6] = (uint32_t)(dst >> 32);
+	return (7);
+}
+
+static int
+emit_draw_sh(uint32_t *r, uint64_t vtx, uint64_t rt, uint32_t w, uint32_t h,
+    uint64_t tex, uint32_t tw, uint32_t th, uint32_t filter, uint32_t blend,
+    uint64_t depth)
+{
+	r[0] = type3(IT_SET_SH_REG, 13);	/* 1 offset + 12 values */
+	r[1] = SIM_DRAW_VTX_LO;
+	r[2] = (uint32_t)(vtx & 0xffffffff);
+	r[3] = (uint32_t)(vtx >> 32);
+	r[4] = (uint32_t)(rt & 0xffffffff);
+	r[5] = (uint32_t)(rt >> 32);
+	r[6] = (w << 16) | h;			/* RT_DIM */
+	r[7] = (uint32_t)(depth & 0xffffffff);
+	r[8] = (uint32_t)(depth >> 32);
+	r[9] = (uint32_t)(tex & 0xffffffff);
+	r[10] = (uint32_t)(tex >> 32);
+	r[11] = (tw << 16) | th;		/* TEX_DIM */
+	r[12] = blend;
+	r[13] = filter;
+	return (14);
 }
 
 /* A full-screen quad (2 tris) at NDC depth z, solid color, UV spanning [0,1]. */
@@ -227,11 +271,10 @@ test_gfx_fence(int fd, int vm)
 static int
 test_compute(int fd, int vm)
 {
-	uint32_t src_h, dst_h, ring_h, ring[4];
+	uint32_t src_h, dst_h, ring_h, ring[11];
 	uint32_t in[4] = { 10, 20, 30, 40 }, out[4] = { 0 };
 	uint64_t src_va, dst_va, ring_va;
-	struct atrium_gpu_set_compute c;
-	int i;
+	int i, n;
 
 	if (bo_alloc(fd, vm, 4096, &src_h, &src_va) != 0 ||
 	    bo_alloc(fd, vm, 4096, &dst_h, &dst_va) != 0 ||
@@ -243,24 +286,17 @@ test_compute(int fd, int vm)
 		printf("compute: write src failed\n");
 		return (1);
 	}
-	ring[0] = type3(IT_DISPATCH_DIRECT, 3);
-	ring[1] = 4;
-	ring[2] = 1;
-	ring[3] = 1;
-	if (bo_write(fd, ring_h, ring, sizeof(ring)) != 0) {
+	/* Compute state rides in the ring (SET_SH_REG), then DISPATCH reads it. */
+	n = emit_compute_sh(ring, KERNEL_INC, src_va, dst_va);
+	ring[n++] = type3(IT_DISPATCH_DIRECT, 3);
+	ring[n++] = 4;
+	ring[n++] = 1;
+	ring[n++] = 1;
+	if (bo_write(fd, ring_h, ring, n * 4) != 0) {
 		printf("compute: write ring failed\n");
 		return (1);
 	}
-
-	memset(&c, 0, sizeof(c));
-	c.kernel = KERNEL_INC;
-	c.src_va = src_va;
-	c.dst_va = dst_va;
-	if (ioctl(fd, ATRIUM_GPU_IOC_SET_COMPUTE, &c) != 0) {
-		printf("compute: set_compute failed\n");
-		return (1);
-	}
-	if (submit(fd, vm, ring_h, 4, ATRIUM_GPU_ENGINE_COMPUTE) != 0 ||
+	if (submit(fd, vm, ring_h, n, ATRIUM_GPU_ENGINE_COMPUTE) != 0 ||
 	    bo_read(fd, dst_h, out, sizeof(out)) != 0) {
 		printf("compute: submit/read failed\n");
 		return (1);
@@ -294,11 +330,11 @@ static int
 test_draw(int fd, int vm)
 {
 	const uint32_t W = 16, H = 16, C = 0xff3366cc;
-	uint32_t vtx_h, rt_h, ring_h, ring[2], rt[16 * 16];
+	uint32_t vtx_h, rt_h, ring_h, ring[16], rt[16 * 16];
 	uint64_t vtx_va, rt_va, ring_va;
-	struct atrium_gpu_set_draw d;
 	uint8_t v[6 * 24];
 	unsigned i;
+	int n;
 
 	if (bo_alloc(fd, vm, sizeof(v), &vtx_h, &vtx_va) != 0 ||
 	    bo_alloc(fd, vm, sizeof(rt), &rt_h, &rt_va) != 0 ||
@@ -312,20 +348,15 @@ test_draw(int fd, int vm)
 	put_vert(v, 3, -1, -1, 0, C);
 	put_vert(v, 4,  1,  1, 0, C);
 	put_vert(v, 5, -1,  1, 0, C);
-	ring[0] = type3(IT_DRAW_INDEX_AUTO, 1);
-	ring[1] = 6;
-
-	memset(&d, 0, sizeof(d));
-	d.vtx_va = vtx_va;
-	d.rt_va = rt_va;
-	d.width = W;
-	d.height = H;
+	/* Draw state rides in the ring (SET_SH_REG); no SET_DRAW ioctl. */
+	n = emit_draw_sh(ring, vtx_va, rt_va, W, H, 0, 0, 0, 0, 0, 0);
+	ring[n++] = type3(IT_DRAW_INDEX_AUTO, 1);
+	ring[n++] = 6;
 	if (bo_write(fd, vtx_h, v, sizeof(v)) != 0 ||
-	    bo_write(fd, ring_h, ring, sizeof(ring)) != 0 ||
-	    ioctl(fd, ATRIUM_GPU_IOC_SET_DRAW, &d) != 0 ||
-	    submit(fd, vm, ring_h, 2, ATRIUM_GPU_ENGINE_GFX) != 0 ||
+	    bo_write(fd, ring_h, ring, n * 4) != 0 ||
+	    submit(fd, vm, ring_h, n, ATRIUM_GPU_ENGINE_GFX) != 0 ||
 	    bo_read(fd, rt_h, rt, sizeof(rt)) != 0) {
-		printf("draw: ioctl failed\n");
+		printf("draw: submit failed\n");
 		return (1);
 	}
 	for (i = 0; i < W * H; i++)
@@ -478,9 +509,9 @@ test_syncobj(int fd, int vm)
 static long
 inc_one(int fd, int vm, uint32_t input)
 {
-	struct atrium_gpu_set_compute c;
-	uint32_t src_h, dst_h, ring_h, ring[4], out = 0;
+	uint32_t src_h, dst_h, ring_h, ring[11], out = 0;
 	uint64_t src_va, dst_va, ring_va;
+	int n;
 
 	if (bo_alloc(fd, vm, 4096, &src_h, &src_va) != 0 ||
 	    bo_alloc(fd, vm, 4096, &dst_h, &dst_va) != 0 ||
@@ -488,19 +519,15 @@ inc_one(int fd, int vm, uint32_t input)
 		return (-1);
 	if (bo_write(fd, src_h, &input, sizeof(input)) != 0)
 		return (-1);
-	ring[0] = type3(IT_DISPATCH_DIRECT, 3);
-	ring[1] = 1;
-	ring[2] = 1;
-	ring[3] = 1;
-	if (bo_write(fd, ring_h, ring, sizeof(ring)) != 0)
+	/* Same src VA for both VMs — that's the point; state rides in the ring. */
+	n = emit_compute_sh(ring, KERNEL_INC, src_va, dst_va);
+	ring[n++] = type3(IT_DISPATCH_DIRECT, 3);
+	ring[n++] = 1;
+	ring[n++] = 1;
+	ring[n++] = 1;
+	if (bo_write(fd, ring_h, ring, n * 4) != 0)
 		return (-1);
-	memset(&c, 0, sizeof(c));
-	c.kernel = KERNEL_INC;
-	c.src_va = src_va;	/* same VA for both VMs — that's the point */
-	c.dst_va = dst_va;
-	if (ioctl(fd, ATRIUM_GPU_IOC_SET_COMPUTE, &c) != 0)
-		return (-1);
-	if (submit(fd, vm, ring_h, 4, ATRIUM_GPU_ENGINE_COMPUTE) != 0)
+	if (submit(fd, vm, ring_h, n, ATRIUM_GPU_ENGINE_COMPUTE) != 0)
 		return (-1);
 	if (bo_read(fd, dst_h, &out, sizeof(out)) != 0)
 		return (-1);
@@ -953,9 +980,9 @@ test_fault_reset(int fd, int vm)
 static int
 test_textured_draw(int fd, int vm)
 {
-	struct atrium_gpu_set_draw d;
-	uint32_t tex_h, vtx_h, rt_h, ring_h, ring[2], rt[256];
+	uint32_t tex_h, vtx_h, rt_h, ring_h, ring[16], rt[256];
 	uint64_t tex_va, vtx_va, rt_va, ring_va;
+	int n;
 	/* texel index = ty*2 + tx: [0]=(0,0) [1]=(1,0) [2]=(0,1) [3]=(1,1) */
 	uint32_t tex[4] = { 0xff0000aa, 0x00ff00bb, 0x0000ffcc, 0xffffffdd };
 	/* full-screen quad (2 tris); u=(x+1)/2, v=(1-y)/2 maps screen->texture */
@@ -976,23 +1003,12 @@ test_textured_draw(int fd, int vm)
 		printf("textured: BO write failed\n");
 		return (1);
 	}
-	memset(&d, 0, sizeof(d));
-	d.vtx_va = vtx_va;
-	d.rt_va = rt_va;
-	d.width = 16;
-	d.height = 16;
-	d.tex_va = tex_va;
-	d.tex_w = 2;
-	d.tex_h = 2;
-	d.tex_filter = 0;	/* nearest */
-	if (ioctl(fd, ATRIUM_GPU_IOC_SET_DRAW, &d) != 0) {
-		printf("textured: SET_DRAW failed\n");
-		return (1);
-	}
-	ring[0] = type3(IT_DRAW_INDEX_AUTO, 1);
-	ring[1] = 6;
-	if (bo_write(fd, ring_h, ring, sizeof(ring)) != 0 ||
-	    submit(fd, vm, ring_h, 2, ATRIUM_GPU_ENGINE_GFX) != 0 ||
+	/* textured (2x2), nearest, no blend/depth — all carried in the ring. */
+	n = emit_draw_sh(ring, vtx_va, rt_va, 16, 16, tex_va, 2, 2, 0, 0, 0);
+	ring[n++] = type3(IT_DRAW_INDEX_AUTO, 1);
+	ring[n++] = 6;
+	if (bo_write(fd, ring_h, ring, n * 4) != 0 ||
+	    submit(fd, vm, ring_h, n, ATRIUM_GPU_ENGINE_GFX) != 0 ||
 	    bo_read(fd, rt_h, rt, sizeof(rt)) != 0) {
 		printf("textured: draw/readback failed\n");
 		return (1);
@@ -1017,8 +1033,7 @@ test_textured_draw(int fd, int vm)
 static int
 test_blend(int fd, int vm)
 {
-	struct atrium_gpu_set_draw d;
-	uint32_t vtx_h, rt_h, ring_h, ring[2], rt[256], got, exp;
+	uint32_t vtx_h, rt_h, ring_h, ring[16], rt[256], got, exp;
 	uint64_t vtx_va, rt_va, ring_va;
 	uint32_t dcol = 0xff203040;	/* opaque dst */
 	uint32_t scol = 0x80c0b0a0;	/* src, alpha 0x80 */
@@ -1026,7 +1041,7 @@ test_blend(int fd, int vm)
 		{ -1, -1, 0, 0, 0, 0 }, { 1, -1, 0, 0, 0, 0 }, { 1, 1, 0, 0, 0, 0 },
 		{ -1, -1, 0, 0, 0, 0 }, { 1, 1, 0, 0, 0, 0 }, { -1, 1, 0, 0, 0, 0 },
 	};
-	int i;
+	int i, n;
 
 	if (bo_alloc(fd, vm, 4096, &vtx_h, &vtx_va) != 0 ||
 	    bo_alloc(fd, vm, 4096, &rt_h, &rt_va) != 0 ||
@@ -1034,32 +1049,27 @@ test_blend(int fd, int vm)
 		printf("blend: BO alloc failed\n");
 		return (1);
 	}
-	ring[0] = type3(IT_DRAW_INDEX_AUTO, 1);
-	ring[1] = 6;
-	bo_write(fd, ring_h, ring, sizeof(ring));
-	memset(&d, 0, sizeof(d));
-	d.vtx_va = vtx_va;
-	d.rt_va = rt_va;
-	d.width = 16;
-	d.height = 16;
-
-	/* Pass 1: fill RT with the opaque dst color (no blend). */
+	/* Pass 1: fill RT with the opaque dst color (blend=0), state in-ring. */
 	for (i = 0; i < 6; i++)
 		q[i].color = dcol;
-	d.blend = 0;
+	n = emit_draw_sh(ring, vtx_va, rt_va, 16, 16, 0, 0, 0, 0, 0, 0);
+	ring[n++] = type3(IT_DRAW_INDEX_AUTO, 1);
+	ring[n++] = 6;
 	if (bo_write(fd, vtx_h, q, sizeof(q)) != 0 ||
-	    ioctl(fd, ATRIUM_GPU_IOC_SET_DRAW, &d) != 0 ||
-	    submit(fd, vm, ring_h, 2, ATRIUM_GPU_ENGINE_GFX) != 0) {
+	    bo_write(fd, ring_h, ring, n * 4) != 0 ||
+	    submit(fd, vm, ring_h, n, ATRIUM_GPU_ENGINE_GFX) != 0) {
 		printf("blend: fill pass failed\n");
 		return (1);
 	}
-	/* Pass 2: blend the semi-transparent src over it. */
+	/* Pass 2: blend the semi-transparent src over it (blend=1). */
 	for (i = 0; i < 6; i++)
 		q[i].color = scol;
-	d.blend = 1;
+	n = emit_draw_sh(ring, vtx_va, rt_va, 16, 16, 0, 0, 0, 0, 1, 0);
+	ring[n++] = type3(IT_DRAW_INDEX_AUTO, 1);
+	ring[n++] = 6;
 	if (bo_write(fd, vtx_h, q, sizeof(q)) != 0 ||
-	    ioctl(fd, ATRIUM_GPU_IOC_SET_DRAW, &d) != 0 ||
-	    submit(fd, vm, ring_h, 2, ATRIUM_GPU_ENGINE_GFX) != 0 ||
+	    bo_write(fd, ring_h, ring, n * 4) != 0 ||
+	    submit(fd, vm, ring_h, n, ATRIUM_GPU_ENGINE_GFX) != 0 ||
 	    bo_read(fd, rt_h, rt, sizeof(rt)) != 0) {
 		printf("blend: blend pass failed\n");
 		return (1);
@@ -1141,14 +1151,13 @@ test_dma_copy(int fd, int vm)
 static int
 test_depth(int fd, int vm)
 {
-	struct atrium_gpu_set_draw d;
-	uint32_t vtx_h, rt_h, dep_h, ring_h, ring[2], rt[256], depbuf[256];
+	uint32_t vtx_h, rt_h, dep_h, ring_h, ring[16], rt[256], depbuf[256];
 	uint64_t vtx_va, rt_va, dep_va, ring_va;
 	uint32_t cA = 0xffaa1111, cB = 0xff22bb22, cC = 0xff3333cc;
 	struct vtx q[6];
 	float far = 1.0f;
 	uint32_t far_bits;
-	int i;
+	int i, n;
 
 	memcpy(&far_bits, &far, 4);
 	if (bo_alloc(fd, vm, 4096, &vtx_h, &vtx_va) != 0 ||
@@ -1161,25 +1170,19 @@ test_depth(int fd, int vm)
 	for (i = 0; i < 256; i++)
 		depbuf[i] = far_bits;	/* depth cleared to far (1.0) */
 	bo_write(fd, dep_h, depbuf, sizeof(depbuf));
-	ring[0] = type3(IT_DRAW_INDEX_AUTO, 1);
-	ring[1] = 6;
-	bo_write(fd, ring_h, ring, sizeof(ring));
-	memset(&d, 0, sizeof(d));
-	d.vtx_va = vtx_va;
-	d.rt_va = rt_va;
-	d.width = 16;
-	d.height = 16;
-	d.depth_va = dep_va;
+	/* Draw state (incl. the depth buffer VA) rides in the ring; written once. */
+	n = emit_draw_sh(ring, vtx_va, rt_va, 16, 16, 0, 0, 0, 0, 0, dep_va);
+	ring[n++] = type3(IT_DRAW_INDEX_AUTO, 1);
+	ring[n++] = 6;
+	bo_write(fd, ring_h, ring, n * 4);
 
 	/* near quad (z=0.5), then a farther quad (z=0.8) that must be occluded. */
 	fill_quad(q, 0.5f, cA);
 	bo_write(fd, vtx_h, q, sizeof(q));
-	ioctl(fd, ATRIUM_GPU_IOC_SET_DRAW, &d);
-	submit(fd, vm, ring_h, 2, ATRIUM_GPU_ENGINE_GFX);
+	submit(fd, vm, ring_h, n, ATRIUM_GPU_ENGINE_GFX);
 	fill_quad(q, 0.8f, cB);
 	bo_write(fd, vtx_h, q, sizeof(q));
-	ioctl(fd, ATRIUM_GPU_IOC_SET_DRAW, &d);
-	submit(fd, vm, ring_h, 2, ATRIUM_GPU_ENGINE_GFX);
+	submit(fd, vm, ring_h, n, ATRIUM_GPU_ENGINE_GFX);
 	if (bo_read(fd, rt_h, rt, sizeof(rt)) != 0 || rt[8 * 16 + 8] != cA) {
 		printf("depth FAILED: farther quad not occluded (%08x)\n",
 		    rt[8 * 16 + 8]);
@@ -1188,8 +1191,7 @@ test_depth(int fd, int vm)
 	/* a nearer quad (z=0.2) drawn last must win. */
 	fill_quad(q, 0.2f, cC);
 	bo_write(fd, vtx_h, q, sizeof(q));
-	ioctl(fd, ATRIUM_GPU_IOC_SET_DRAW, &d);
-	submit(fd, vm, ring_h, 2, ATRIUM_GPU_ENGINE_GFX);
+	submit(fd, vm, ring_h, n, ATRIUM_GPU_ENGINE_GFX);
 	if (bo_read(fd, rt_h, rt, sizeof(rt)) != 0 || rt[8 * 16 + 8] != cC) {
 		printf("depth FAILED: nearer quad did not win (%08x)\n",
 		    rt[8 * 16 + 8]);
@@ -1208,13 +1210,12 @@ test_depth(int fd, int vm)
 static int
 test_bilinear(int fd, int vm)
 {
-	struct atrium_gpu_set_draw d;
-	uint32_t tex_h, vtx_h, rt_h, ring_h, ring[2], rt[256];
+	uint32_t tex_h, vtx_h, rt_h, ring_h, ring[16], rt[256];
 	uint64_t tex_va, vtx_va, rt_va, ring_va;
 	/* left column byte0=0, right column byte0=200: a horizontal ramp. */
 	uint32_t tex[4] = { 0x00000000, 0x000000c8, 0x00000000, 0x000000c8 };
 	struct vtx q[6];
-	int mid;
+	int mid, n;
 
 	if (bo_alloc(fd, vm, 4096, &tex_h, &tex_va) != 0 ||
 	    bo_alloc(fd, vm, 4096, &vtx_h, &vtx_va) != 0 ||
@@ -1226,20 +1227,12 @@ test_bilinear(int fd, int vm)
 	fill_quad(q, 0, 0);
 	bo_write(fd, tex_h, tex, sizeof(tex));
 	bo_write(fd, vtx_h, q, sizeof(q));
-	ring[0] = type3(IT_DRAW_INDEX_AUTO, 1);
-	ring[1] = 6;
-	bo_write(fd, ring_h, ring, sizeof(ring));
-	memset(&d, 0, sizeof(d));
-	d.vtx_va = vtx_va;
-	d.rt_va = rt_va;
-	d.width = 16;
-	d.height = 16;
-	d.tex_va = tex_va;
-	d.tex_w = 2;
-	d.tex_h = 2;
-	d.tex_filter = 1;	/* bilinear */
-	if (ioctl(fd, ATRIUM_GPU_IOC_SET_DRAW, &d) != 0 ||
-	    submit(fd, vm, ring_h, 2, ATRIUM_GPU_ENGINE_GFX) != 0 ||
+	/* textured (2x2), tex_filter=1 (bilinear) — state carried in the ring. */
+	n = emit_draw_sh(ring, vtx_va, rt_va, 16, 16, tex_va, 2, 2, 1, 0, 0);
+	ring[n++] = type3(IT_DRAW_INDEX_AUTO, 1);
+	ring[n++] = 6;
+	if (bo_write(fd, ring_h, ring, n * 4) != 0 ||
+	    submit(fd, vm, ring_h, n, ATRIUM_GPU_ENGINE_GFX) != 0 ||
 	    bo_read(fd, rt_h, rt, sizeof(rt)) != 0) {
 		printf("bilinear: draw/readback failed\n");
 		return (1);
@@ -1252,66 +1245,6 @@ test_bilinear(int fd, int vm)
 	}
 	printf("bilinear OK: center texel interpolated to %d (between 0 and 200)\n",
 	    mid);
-	return (0);
-}
-
-/*
- * M14: opaque-blob submit (ABI-v2). The compute state (kernel + src/dst VAs)
- * travels INSIDE the ring as a SET_SH_REG packet the CP applies, instead of the
- * kmod poking COMPUTE_* registers via a SET_COMPUTE ioctl. The kernel never
- * touches the compute registers — it just submits the opaque PM4 blob. Proves
- * the kernel can be register-agnostic (the v2 submit shape).
- */
-static int
-test_opaque_compute(int fd, int vm)
-{
-	uint32_t src_h, dst_h, ring_h, ring[11];
-	uint32_t in[4] = { 100, 200, 300, 400 }, out[4] = { 0 };
-	uint64_t src_va, dst_va, ring_va;
-	int i;
-
-	if (bo_alloc(fd, vm, 4096, &src_h, &src_va) != 0 ||
-	    bo_alloc(fd, vm, 4096, &dst_h, &dst_va) != 0 ||
-	    bo_alloc(fd, vm, 4096, &ring_h, &ring_va) != 0) {
-		printf("opaque_compute: BO alloc failed\n");
-		return (1);
-	}
-	if (bo_write(fd, src_h, in, sizeof(in)) != 0) {
-		printf("opaque_compute: write src failed\n");
-		return (1);
-	}
-	/* SET_SH_REG(COMPUTE_KERNEL, [kernel, src_lo, src_hi, dst_lo, dst_hi]) */
-	ring[0] = type3(IT_SET_SH_REG, 6);
-	ring[1] = SIM_COMPUTE_KERNEL;
-	ring[2] = KERNEL_INC;
-	ring[3] = (uint32_t)(src_va & 0xffffffff);
-	ring[4] = (uint32_t)(src_va >> 32);
-	ring[5] = (uint32_t)(dst_va & 0xffffffff);
-	ring[6] = (uint32_t)(dst_va >> 32);
-	/* DISPATCH 4x1x1 — reads the state the SET_SH_REG just applied. */
-	ring[7] = type3(IT_DISPATCH_DIRECT, 3);
-	ring[8] = 4;
-	ring[9] = 1;
-	ring[10] = 1;
-	if (bo_write(fd, ring_h, ring, sizeof(ring)) != 0) {
-		printf("opaque_compute: write ring failed\n");
-		return (1);
-	}
-
-	/* No SET_COMPUTE ioctl — the state rode in with the ring. */
-	if (submit(fd, vm, ring_h, 11, ATRIUM_GPU_ENGINE_COMPUTE) != 0 ||
-	    bo_read(fd, dst_h, out, sizeof(out)) != 0) {
-		printf("opaque_compute: submit/read failed\n");
-		return (1);
-	}
-	for (i = 0; i < 4; i++)
-		if (out[i] != in[i] + 1) {
-			printf("opaque_compute FAILED: got [%u %u %u %u]\n",
-			    out[0], out[1], out[2], out[3]);
-			return (1);
-		}
-	printf("opaque_compute OK: compute state via SET_SH_REG in the ring "
-	    "(no SET_COMPUTE ioctl), INC [%u..] -> [%u..]\n", in[0], out[0]);
 	return (0);
 }
 
@@ -1348,7 +1281,6 @@ main(void)
 	rc |= test_dma_copy(fd, vm);
 	rc |= test_depth(fd, vm);
 	rc |= test_bilinear(fd, vm);
-	rc |= test_opaque_compute(fd, vm);
 	close(vm);
 	close(fd);
 	printf(rc == 0 ? "ALL OK\n" : "FAILURES\n");

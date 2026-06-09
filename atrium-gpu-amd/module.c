@@ -238,4 +238,4 @@ static driver_t atrium_amd_driver = {
 
 DRIVER_MODULE(atrium_gpu_amd, pci, atrium_amd_driver, NULL, NULL);
 MODULE_DEPEND(atrium_gpu_amd, pci, 1, 1, 1);
-MODULE_VERSION(atrium_gpu_amd, 17);
+MODULE_VERSION(atrium_gpu_amd, 18);

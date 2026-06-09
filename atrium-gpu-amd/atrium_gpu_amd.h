@@ -92,30 +92,13 @@
 #define regCP_HQD_PQ_CONTROL	0x7ee8	/* GC: HQD ring size */
 #define regCP_HQD_PQ_DOORBELL_CONTROL 0x7ee0 /* GC: HQD doorbell offset (BAR2) */
 #define regCP_HQD_ACTIVE	0x7eac	/* GC: w 1 = activate HQD (gated on MES) */
-#define regCOMPUTE_KERNEL	0x20200	/* SIM: built-in kernel selector */
-#define regCOMPUTE_SRC_LO	0x20204	/* SIM: source buffer GPU-VA (lo/hi) */
-#define regCOMPUTE_SRC_HI	0x20208
-#define regCOMPUTE_DST_LO	0x2020c	/* SIM: dest buffer GPU-VA (lo/hi) */
-#define regCOMPUTE_DST_HI	0x20210
-
 /*
- * Graphics DRAW state (SIM aperture; the stubbed shader register set — the
- * SoftwareBackend rasterizer stands in). Vertices are 24 bytes (NDC x,y,z +
- * texcoord u,v as f32, then an RGBA8 color); the RT is RGBA8 width×height.
- * DEPTH/TEX = 0 disable depth test / texturing (use the interpolated color).
+ * The COMPUTE state (SIM 0x200..0x210) and DRAW state (SIM 0x214..0x240)
+ * registers are deliberately NOT named here: the kernel never writes them.
+ * Userspace carries that state in the submitted ring as SET_SH_REG packets the
+ * CP applies (the opaque-blob submit of ABI-v2); the register layout is the
+ * userspace<->firmware contract, not the kernel's concern.
  */
-#define regDRAW_VTX_LO		0x20214	/* SIM: vertex buffer GPU-VA (lo/hi) */
-#define regDRAW_VTX_HI		0x20218
-#define regDRAW_RT_LO		0x2021c	/* SIM: render-target GPU-VA (lo/hi) */
-#define regDRAW_RT_HI		0x20220
-#define regDRAW_RT_DIM		0x20224	/* SIM: width<<16 | height */
-#define regDEPTH_LO		0x20228	/* SIM: depth buffer GPU-VA (0 = no test) */
-#define regDEPTH_HI		0x2022c
-#define regTEX_LO		0x20230	/* SIM: texture GPU-VA (0 = vertex color) */
-#define regTEX_HI		0x20234
-#define regTEX_DIM		0x20238	/* SIM: tex width<<16 | height */
-#define regBLEND_ENABLE		0x2023c	/* SIM: 1 = alpha blend (src-over) */
-#define regTEX_FILTER		0x20240	/* SIM: 0 = nearest, 1 = bilinear */
 
 /*
  * Per-context GPUVM (SIM aperture). A user address space (VMID 1..15) gets its
@@ -355,12 +338,6 @@ int	 amd_queue_program(struct atrium_amd_softc *sc, uint64_t ring_va,
  * doorbell lives at its byte offset within it.
  */
 #define ATRIUM_AMD_DOORBELL_MMAP_OFF	0
-void	 amd_set_compute(struct atrium_amd_softc *sc, uint32_t kernel,
-	    uint64_t src_va, uint64_t dst_va);
-void	 amd_set_draw(struct atrium_amd_softc *sc, uint64_t vtx_va,
-	    uint64_t rt_va, uint32_t width, uint32_t height, uint64_t tex_va,
-	    uint32_t tex_w, uint32_t tex_h, uint32_t tex_filter, uint32_t blend,
-	    uint64_t depth_va);
 
 /* sync.c — timeline syncobj fd (kqueue-able) */
 int	 amd_syncobj_create_fd(struct atrium_amd_softc *sc, struct thread *td,

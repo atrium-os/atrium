@@ -73,46 +73,9 @@ amd_submit(struct atrium_amd_softc *sc, struct atrium_amd_bo *ring,
 }
 
 /*
- * Program the compute state the SoftwareBackend reads at DISPATCH time: the
- * built-in kernel selector and the source/dest GPU-VAs (which it walks through
- * GPUVM). These are device-private registers, so only the kernel writes them —
- * userspace names the buffers by GPU-VA via the ioctl.
+ * NB: there is no amd_set_compute/amd_set_draw. Compute and draw state is no
+ * longer poked into the COMPUTE/DRAW state registers by the kernel — it travels
+ * in the submitted ring as a SET_SH_REG packet the CP applies (the opaque-blob
+ * submit of ABI-v2). The kernel is register-agnostic for the command stream;
+ * userspace<->firmware owns the register layout.
  */
-void
-amd_set_compute(struct atrium_amd_softc *sc, uint32_t kernel, uint64_t src_va,
-    uint64_t dst_va)
-{
-	amd_mmio_write32(sc, regCOMPUTE_KERNEL, kernel);
-	amd_mmio_write32(sc, regCOMPUTE_SRC_LO, (uint32_t)(src_va & 0xffffffff));
-	amd_mmio_write32(sc, regCOMPUTE_SRC_HI, (uint32_t)(src_va >> 32));
-	amd_mmio_write32(sc, regCOMPUTE_DST_LO, (uint32_t)(dst_va & 0xffffffff));
-	amd_mmio_write32(sc, regCOMPUTE_DST_HI, (uint32_t)(dst_va >> 32));
-}
-
-/*
- * Program the graphics DRAW state the rasterizer reads when it executes a
- * DRAW_INDEX_AUTO packet: the vertex buffer + render target GPU-VAs and the RT
- * dimensions. Depth/texture/blend are disabled here (this is the solid-color
- * path — the pixel is the interpolated vertex color); they become ioctl
- * parameters when textured/blended draws land.
- */
-void
-amd_set_draw(struct atrium_amd_softc *sc, uint64_t vtx_va, uint64_t rt_va,
-    uint32_t width, uint32_t height, uint64_t tex_va, uint32_t tex_w,
-    uint32_t tex_h, uint32_t tex_filter, uint32_t blend, uint64_t depth_va)
-{
-	amd_mmio_write32(sc, regDRAW_VTX_LO, (uint32_t)(vtx_va & 0xffffffff));
-	amd_mmio_write32(sc, regDRAW_VTX_HI, (uint32_t)(vtx_va >> 32));
-	amd_mmio_write32(sc, regDRAW_RT_LO, (uint32_t)(rt_va & 0xffffffff));
-	amd_mmio_write32(sc, regDRAW_RT_HI, (uint32_t)(rt_va >> 32));
-	amd_mmio_write32(sc, regDRAW_RT_DIM, (width << 16) | height);
-	/* depth buffer (0 = no depth test) */
-	amd_mmio_write32(sc, regDEPTH_LO, (uint32_t)(depth_va & 0xffffffff));
-	amd_mmio_write32(sc, regDEPTH_HI, (uint32_t)(depth_va >> 32));
-	/* texture (0 = interpolate vertex color) + dims + filter */
-	amd_mmio_write32(sc, regTEX_LO, (uint32_t)(tex_va & 0xffffffff));
-	amd_mmio_write32(sc, regTEX_HI, (uint32_t)(tex_va >> 32));
-	amd_mmio_write32(sc, regTEX_DIM, (tex_w << 16) | tex_h);
-	amd_mmio_write32(sc, regTEX_FILTER, tex_filter);
-	amd_mmio_write32(sc, regBLEND_ENABLE, blend);
-}

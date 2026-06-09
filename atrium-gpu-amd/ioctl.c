@@ -180,14 +180,6 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		return (err);
 	}
 
-	case ATRIUM_GPU_IOC_SET_COMPUTE: {
-		struct atrium_gpu_set_compute *c =
-		    (struct atrium_gpu_set_compute *)data;
-
-		amd_set_compute(sc, c->kernel, c->src_va, c->dst_va);
-		return (0);
-	}
-
 	case ATRIUM_GPU_IOC_SYNCOBJ_CREATE: {
 		struct atrium_gpu_syncobj_create *c =
 		    (struct atrium_gpu_syncobj_create *)data;
@@ -259,16 +251,6 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 
 		q->count = sc->irq_count;
 		q->msix_enabled = sc->msix_enabled;
-		return (0);
-	}
-
-	case ATRIUM_GPU_IOC_SET_DRAW: {
-		struct atrium_gpu_set_draw *d =
-		    (struct atrium_gpu_set_draw *)data;
-
-		amd_set_draw(sc, d->vtx_va, d->rt_va, d->width, d->height,
-		    d->tex_va, d->tex_w, d->tex_h, d->tex_filter, d->blend,
-		    d->depth_va);
 		return (0);
 	}
 
