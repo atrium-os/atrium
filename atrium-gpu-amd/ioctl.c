@@ -266,7 +266,9 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		struct atrium_gpu_set_draw *d =
 		    (struct atrium_gpu_set_draw *)data;
 
-		amd_set_draw(sc, d->vtx_va, d->rt_va, d->width, d->height);
+		amd_set_draw(sc, d->vtx_va, d->rt_va, d->width, d->height,
+		    d->tex_va, d->tex_w, d->tex_h, d->tex_filter, d->blend,
+		    d->depth_va);
 		return (0);
 	}
 

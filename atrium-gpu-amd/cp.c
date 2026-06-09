@@ -98,16 +98,21 @@ amd_set_compute(struct atrium_amd_softc *sc, uint32_t kernel, uint64_t src_va,
  */
 void
 amd_set_draw(struct atrium_amd_softc *sc, uint64_t vtx_va, uint64_t rt_va,
-    uint32_t width, uint32_t height)
+    uint32_t width, uint32_t height, uint64_t tex_va, uint32_t tex_w,
+    uint32_t tex_h, uint32_t tex_filter, uint32_t blend, uint64_t depth_va)
 {
 	amd_mmio_write32(sc, regDRAW_VTX_LO, (uint32_t)(vtx_va & 0xffffffff));
 	amd_mmio_write32(sc, regDRAW_VTX_HI, (uint32_t)(vtx_va >> 32));
 	amd_mmio_write32(sc, regDRAW_RT_LO, (uint32_t)(rt_va & 0xffffffff));
 	amd_mmio_write32(sc, regDRAW_RT_HI, (uint32_t)(rt_va >> 32));
 	amd_mmio_write32(sc, regDRAW_RT_DIM, (width << 16) | height);
-	amd_mmio_write32(sc, regDEPTH_LO, 0);	/* no depth test */
-	amd_mmio_write32(sc, regDEPTH_HI, 0);
-	amd_mmio_write32(sc, regTEX_LO, 0);	/* no texture: vertex color */
-	amd_mmio_write32(sc, regTEX_HI, 0);
-	amd_mmio_write32(sc, regBLEND_ENABLE, 0);
+	/* depth buffer (0 = no depth test) */
+	amd_mmio_write32(sc, regDEPTH_LO, (uint32_t)(depth_va & 0xffffffff));
+	amd_mmio_write32(sc, regDEPTH_HI, (uint32_t)(depth_va >> 32));
+	/* texture (0 = interpolate vertex color) + dims + filter */
+	amd_mmio_write32(sc, regTEX_LO, (uint32_t)(tex_va & 0xffffffff));
+	amd_mmio_write32(sc, regTEX_HI, (uint32_t)(tex_va >> 32));
+	amd_mmio_write32(sc, regTEX_DIM, (tex_w << 16) | tex_h);
+	amd_mmio_write32(sc, regTEX_FILTER, tex_filter);
+	amd_mmio_write32(sc, regBLEND_ENABLE, blend);
 }

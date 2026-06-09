@@ -126,6 +126,12 @@ struct atrium_gpu_set_draw {
 	uint64_t	rt_va;		/* in: render-target GPU-VA (RGBA8) */
 	uint32_t	width;		/* in: RT width  */
 	uint32_t	height;		/* in: RT height */
+	uint64_t	tex_va;		/* in: texture GPU-VA (RGBA8; 0 = vertex color) */
+	uint32_t	tex_w;		/* in: texture width  */
+	uint32_t	tex_h;		/* in: texture height */
+	uint32_t	tex_filter;	/* in: 0 = nearest, 1 = bilinear */
+	uint32_t	blend;		/* in: 1 = alpha-blend (src-over) over the RT */
+	uint64_t	depth_va;	/* in: depth buffer GPU-VA (0 = no depth test) */
 };
 
 /* Query interrupt state: how many completions the ISR has serviced. */

@@ -113,7 +113,9 @@
 #define regDEPTH_HI		0x2022c
 #define regTEX_LO		0x20230	/* SIM: texture GPU-VA (0 = vertex color) */
 #define regTEX_HI		0x20234
+#define regTEX_DIM		0x20238	/* SIM: tex width<<16 | height */
 #define regBLEND_ENABLE		0x2023c	/* SIM: 1 = alpha blend (src-over) */
+#define regTEX_FILTER		0x20240	/* SIM: 0 = nearest, 1 = bilinear */
 
 /*
  * Per-context GPUVM (SIM aperture). A user address space (VMID 1..15) gets its
@@ -356,7 +358,9 @@ int	 amd_queue_program(struct atrium_amd_softc *sc, uint64_t ring_va,
 void	 amd_set_compute(struct atrium_amd_softc *sc, uint32_t kernel,
 	    uint64_t src_va, uint64_t dst_va);
 void	 amd_set_draw(struct atrium_amd_softc *sc, uint64_t vtx_va,
-	    uint64_t rt_va, uint32_t width, uint32_t height);
+	    uint64_t rt_va, uint32_t width, uint32_t height, uint64_t tex_va,
+	    uint32_t tex_w, uint32_t tex_h, uint32_t tex_filter, uint32_t blend,
+	    uint64_t depth_va);
 
 /* sync.c — timeline syncobj fd (kqueue-able) */
 int	 amd_syncobj_create_fd(struct atrium_amd_softc *sc, struct thread *td,

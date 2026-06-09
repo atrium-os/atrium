@@ -30,7 +30,29 @@
 #define IT_DRAW_INDEX_AUTO	0x2du
 #define IT_WRITE_DATA		0x37u
 #define IT_WAIT_REG_MEM		0x3cu
+#define IT_DMA_DATA		0x50u	/* CP DMA copy (memory <-> memory) */
 #define WAIT_FN_GE		5u	/* WAIT_REG_MEM FUNCTION: value >= reference */
+
+/* Vertex the rasterizer consumes: NDC position + texcoord + RGBA color = 24B. */
+struct vtx {
+	float		x, y, z, u, v;
+	uint32_t	color;
+};
+
+/* Mirror render.rs blend_over: src-over, out.rgb = src.rgb*sa + dst.rgb*(1-sa). */
+static uint32_t
+blend_over(uint32_t src, uint32_t dst)
+{
+	float sa = ((src >> 24) & 0xff) / 255.0f;
+	float da = ((dst >> 24) & 0xff) / 255.0f;
+	uint32_t r, g, b, a;
+#define CH(s) ((uint32_t)(((src >> (s)) & 0xff) * sa + \
+	    ((dst >> (s)) & 0xff) * (1.0f - sa) + 0.5f))
+	r = CH(0); g = CH(8); b = CH(16);
+#undef CH
+	a = (uint32_t)((sa + da * (1.0f - sa)) * 255.0f + 0.5f);
+	return r | (g << 8) | (b << 16) | (a << 24);
+}
 #define KERNEL_INC		2u
 #define FENCE_MAGIC		0xcafef00ddeadbeefULL
 
@@ -900,6 +922,193 @@ test_fault_reset(int fd, int vm)
 	return (0);
 }
 
+/*
+ * M12a: textured draw. A 2x2 RGBA texture sampled (nearest) across a
+ * full-screen quad whose UVs span [0,1] — the 16x16 RT splits into four 8x8
+ * quadrants, each showing one texel. Proves the rasterizer fetches from a bound
+ * texture (vs M6's interpolated vertex color).
+ */
+static int
+test_textured_draw(int fd, int vm)
+{
+	struct atrium_gpu_set_draw d;
+	uint32_t tex_h, vtx_h, rt_h, ring_h, ring[2], rt[256];
+	uint64_t tex_va, vtx_va, rt_va, ring_va;
+	/* texel index = ty*2 + tx: [0]=(0,0) [1]=(1,0) [2]=(0,1) [3]=(1,1) */
+	uint32_t tex[4] = { 0xff0000aa, 0x00ff00bb, 0x0000ffcc, 0xffffffdd };
+	/* full-screen quad (2 tris); u=(x+1)/2, v=(1-y)/2 maps screen->texture */
+	struct vtx verts[6] = {
+		{ -1, -1, 0, 0, 1, 0 }, { 1, -1, 0, 1, 1, 0 }, { 1, 1, 0, 1, 0, 0 },
+		{ -1, -1, 0, 0, 1, 0 }, { 1, 1, 0, 1, 0, 0 }, { -1, 1, 0, 0, 0, 0 },
+	};
+
+	if (bo_alloc(fd, vm, 4096, &tex_h, &tex_va) != 0 ||
+	    bo_alloc(fd, vm, 4096, &vtx_h, &vtx_va) != 0 ||
+	    bo_alloc(fd, vm, 4096, &rt_h, &rt_va) != 0 ||
+	    bo_alloc(fd, vm, 4096, &ring_h, &ring_va) != 0) {
+		printf("textured: BO alloc failed\n");
+		return (1);
+	}
+	if (bo_write(fd, tex_h, tex, sizeof(tex)) != 0 ||
+	    bo_write(fd, vtx_h, verts, sizeof(verts)) != 0) {
+		printf("textured: BO write failed\n");
+		return (1);
+	}
+	memset(&d, 0, sizeof(d));
+	d.vtx_va = vtx_va;
+	d.rt_va = rt_va;
+	d.width = 16;
+	d.height = 16;
+	d.tex_va = tex_va;
+	d.tex_w = 2;
+	d.tex_h = 2;
+	d.tex_filter = 0;	/* nearest */
+	if (ioctl(fd, ATRIUM_GPU_IOC_SET_DRAW, &d) != 0) {
+		printf("textured: SET_DRAW failed\n");
+		return (1);
+	}
+	ring[0] = type3(IT_DRAW_INDEX_AUTO, 1);
+	ring[1] = 6;
+	if (bo_write(fd, ring_h, ring, sizeof(ring)) != 0 ||
+	    submit(fd, vm, ring_h, 2, ATRIUM_GPU_ENGINE_GFX) != 0 ||
+	    bo_read(fd, rt_h, rt, sizeof(rt)) != 0) {
+		printf("textured: draw/readback failed\n");
+		return (1);
+	}
+	/* rt[py*16 + px]; sample one pixel in each 8x8 quadrant. */
+	if (rt[4 * 16 + 4] != tex[0] || rt[4 * 16 + 12] != tex[1] ||
+	    rt[12 * 16 + 4] != tex[2] || rt[12 * 16 + 12] != tex[3]) {
+		printf("textured FAILED: quadrants %08x %08x %08x %08x\n",
+		    rt[4 * 16 + 4], rt[4 * 16 + 12], rt[12 * 16 + 4],
+		    rt[12 * 16 + 12]);
+		return (1);
+	}
+	printf("textured OK: 2x2 texture sampled into 4 RT quadrants\n");
+	return (0);
+}
+
+/*
+ * M12b: alpha blend. Fill the RT with an opaque color, then draw a semi-
+ * transparent solid quad over it with BLEND_ENABLE — the result is the
+ * src-over composite, not the source. Mirrors the model's blend_over.
+ */
+static int
+test_blend(int fd, int vm)
+{
+	struct atrium_gpu_set_draw d;
+	uint32_t vtx_h, rt_h, ring_h, ring[2], rt[256], got, exp;
+	uint64_t vtx_va, rt_va, ring_va;
+	uint32_t dcol = 0xff203040;	/* opaque dst */
+	uint32_t scol = 0x80c0b0a0;	/* src, alpha 0x80 */
+	struct vtx q[6] = {
+		{ -1, -1, 0, 0, 0, 0 }, { 1, -1, 0, 0, 0, 0 }, { 1, 1, 0, 0, 0, 0 },
+		{ -1, -1, 0, 0, 0, 0 }, { 1, 1, 0, 0, 0, 0 }, { -1, 1, 0, 0, 0, 0 },
+	};
+	int i;
+
+	if (bo_alloc(fd, vm, 4096, &vtx_h, &vtx_va) != 0 ||
+	    bo_alloc(fd, vm, 4096, &rt_h, &rt_va) != 0 ||
+	    bo_alloc(fd, vm, 4096, &ring_h, &ring_va) != 0) {
+		printf("blend: BO alloc failed\n");
+		return (1);
+	}
+	ring[0] = type3(IT_DRAW_INDEX_AUTO, 1);
+	ring[1] = 6;
+	bo_write(fd, ring_h, ring, sizeof(ring));
+	memset(&d, 0, sizeof(d));
+	d.vtx_va = vtx_va;
+	d.rt_va = rt_va;
+	d.width = 16;
+	d.height = 16;
+
+	/* Pass 1: fill RT with the opaque dst color (no blend). */
+	for (i = 0; i < 6; i++)
+		q[i].color = dcol;
+	d.blend = 0;
+	if (bo_write(fd, vtx_h, q, sizeof(q)) != 0 ||
+	    ioctl(fd, ATRIUM_GPU_IOC_SET_DRAW, &d) != 0 ||
+	    submit(fd, vm, ring_h, 2, ATRIUM_GPU_ENGINE_GFX) != 0) {
+		printf("blend: fill pass failed\n");
+		return (1);
+	}
+	/* Pass 2: blend the semi-transparent src over it. */
+	for (i = 0; i < 6; i++)
+		q[i].color = scol;
+	d.blend = 1;
+	if (bo_write(fd, vtx_h, q, sizeof(q)) != 0 ||
+	    ioctl(fd, ATRIUM_GPU_IOC_SET_DRAW, &d) != 0 ||
+	    submit(fd, vm, ring_h, 2, ATRIUM_GPU_ENGINE_GFX) != 0 ||
+	    bo_read(fd, rt_h, rt, sizeof(rt)) != 0) {
+		printf("blend: blend pass failed\n");
+		return (1);
+	}
+	got = rt[8 * 16 + 8];
+	exp = blend_over(scol, dcol);
+	/* Allow +/-1 per channel for float-rounding differences. */
+	for (i = 0; i < 32; i += 8) {
+		int g = (got >> i) & 0xff, e = (exp >> i) & 0xff;
+		if (g - e > 1 || e - g > 1) {
+			printf("blend FAILED: got %08x expected ~%08x\n", got, exp);
+			return (1);
+		}
+	}
+	if (got == scol) {
+		printf("blend FAILED: result equals src (blend was a no-op)\n");
+		return (1);
+	}
+	printf("blend OK: src-over %08x over %08x = %08x (~%08x)\n",
+	    scol, dcol, got, exp);
+	return (0);
+}
+
+/*
+ * M12c: CP DMA copy. A DMA_DATA packet copies one BO to another entirely on
+ * the GPU (memory->memory through GPUVM) — the SDMA/CP-DMA path a driver uses
+ * for uploads and blits, with no CPU touch of the bytes between.
+ */
+static int
+test_dma_copy(int fd, int vm)
+{
+	uint32_t src_h, dst_h, ring_h, ring[7], src[64], dst[64];
+	uint64_t src_va, dst_va, ring_va;
+	int i;
+
+	if (bo_alloc(fd, vm, 4096, &src_h, &src_va) != 0 ||
+	    bo_alloc(fd, vm, 4096, &dst_h, &dst_va) != 0 ||
+	    bo_alloc(fd, vm, 4096, &ring_h, &ring_va) != 0) {
+		printf("dma_copy: BO alloc failed\n");
+		return (1);
+	}
+	for (i = 0; i < 64; i++) {
+		src[i] = 0xa5a50000u + (uint32_t)i;
+		dst[i] = 0;
+	}
+	bo_write(fd, src_h, src, sizeof(src));
+	bo_write(fd, dst_h, dst, sizeof(dst));
+
+	ring[0] = type3(IT_DMA_DATA, 6);
+	ring[1] = 0;				/* control (mem->mem) */
+	ring[2] = (uint32_t)(src_va & 0xffffffff);
+	ring[3] = (uint32_t)(src_va >> 32);
+	ring[4] = (uint32_t)(dst_va & 0xffffffff);
+	ring[5] = (uint32_t)(dst_va >> 32);
+	ring[6] = sizeof(src);			/* byte count */
+	if (bo_write(fd, ring_h, ring, sizeof(ring)) != 0 ||
+	    submit(fd, vm, ring_h, 7, ATRIUM_GPU_ENGINE_GFX) != 0 ||
+	    bo_read(fd, dst_h, dst, sizeof(dst)) != 0) {
+		printf("dma_copy: submit/readback failed\n");
+		return (1);
+	}
+	if (memcmp(src, dst, sizeof(src)) != 0) {
+		printf("dma_copy FAILED: dst[0]=%08x dst[63]=%08x\n", dst[0],
+		    dst[63]);
+		return (1);
+	}
+	printf("dma_copy OK: GPU copied %zu bytes BO->BO (dst[0]=%08x)\n",
+	    sizeof(src), dst[0]);
+	return (0);
+}
+
 int
 main(void)
 {
@@ -928,6 +1137,9 @@ main(void)
 	rc |= test_umq(fd, vm);
 	rc |= test_cross_queue(fd, vm);
 	rc |= test_fault_reset(fd, vm);
+	rc |= test_textured_draw(fd, vm);
+	rc |= test_blend(fd, vm);
+	rc |= test_dma_copy(fd, vm);
 	close(vm);
 	close(fd);
 	printf(rc == 0 ? "ALL OK\n" : "FAILURES\n");
