@@ -16,10 +16,13 @@ atrium_amd_open(struct cdev *cdev, int oflags, int devtype, struct thread *td)
 }
 
 /*
- * Map the BAR2 doorbell page into userspace for user-mode-queue submission.
- * The page is device MMIO (VM_MEMATTR_DEVICE — uncacheable, no write
- * combining), so a userspace store to the queue's doorbell traps straight to
- * the device. This is the single mappable region; any other offset is refused.
+ * Map one doorbell page of BAR2 into userspace for user-mode-queue submission.
+ * The doorbell BAR is divided into per-queue pages: QUEUE_MAP hands a queue's
+ * page offset to its owner, who mmap()s just that page. Mapping one queue's
+ * doorbell therefore does not expose any other queue's — the page is the
+ * capability (so it can be SCM_RIGHTS-granted to a single jailed client). The
+ * page is device MMIO (VM_MEMATTR_DEVICE), so a store to it traps straight to
+ * the device. Offsets past the BAR are refused.
  */
 static int
 atrium_amd_mmap(struct cdev *cdev, vm_ooffset_t offset, vm_paddr_t *paddr,
@@ -27,7 +30,7 @@ atrium_amd_mmap(struct cdev *cdev, vm_ooffset_t offset, vm_paddr_t *paddr,
 {
 	struct atrium_amd_softc *sc = cdev->si_drv1;
 
-	if (offset >= PAGE_SIZE)
+	if (offset < 0 || offset >= rman_get_size(sc->doorbell))
 		return (EINVAL);
 	*paddr = rman_get_start(sc->doorbell) + offset;
 	*memattr = VM_MEMATTR_DEVICE;
@@ -144,9 +147,14 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		fdrop(vmfp, td);
 		if (err != 0)
 			return (err);
-		m->doorbell_mmap_offset = ATRIUM_AMD_DOORBELL_MMAP_OFF;
+		/*
+		 * doorbell_off is page-aligned (one page per queue), so it IS the
+		 * mmap offset of this queue's own doorbell page; the doorbell word
+		 * is at the start of that page. mmap()ing it exposes only this queue.
+		 */
+		m->doorbell_mmap_offset = doorbell_off;
 		m->doorbell_size = PAGE_SIZE;
-		m->doorbell_word_offset = doorbell_off;
+		m->doorbell_word_offset = 0;
 		return (0);
 	}
 

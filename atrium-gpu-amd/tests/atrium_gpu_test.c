@@ -1315,6 +1315,86 @@ out:
 	return (rc);
 }
 
+/*
+ * M17: per-queue doorbell-page granularity. The doorbell BAR is divided into a
+ * page per queue, so QUEUE_MAP hands gfx and compute *different* mmap offsets —
+ * mapping one queue's doorbell page exposes only that queue (the page is the
+ * capability, SCM_RIGHTS-grantable to a jailed client). Map only the compute
+ * queue's page and ring it directly to prove it drives just that queue.
+ */
+static int
+test_doorbell_pages(int fd, int vm)
+{
+	struct atrium_gpu_queue_map mg, mc;
+	uint32_t src_h, dst_h, ring_h, ring[11];
+	uint32_t in[4] = { 7, 8, 9, 10 }, out[4] = { 0 };
+	uint64_t src_va, dst_va, ring_va;
+	volatile uint32_t *doorbell;
+	void *map;
+	int n, i;
+
+	if (bo_alloc(fd, vm, 4096, &src_h, &src_va) != 0 ||
+	    bo_alloc(fd, vm, 4096, &dst_h, &dst_va) != 0 ||
+	    bo_alloc(fd, vm, 4096, &ring_h, &ring_va) != 0) {
+		printf("doorbell_pages: BO alloc failed\n");
+		return (1);
+	}
+	bo_write(fd, src_h, in, sizeof(in));
+	n = emit_compute_sh(ring, KERNEL_INC, src_va, dst_va);
+	ring[n++] = type3(IT_DISPATCH_DIRECT, 3);
+	ring[n++] = 4;
+	ring[n++] = 1;
+	ring[n++] = 1;
+	bo_write(fd, ring_h, ring, n * 4);
+
+	/* Map a gfx and a compute queue; their doorbells must be on different
+	 * pages (per-queue granularity). */
+	memset(&mg, 0, sizeof(mg));
+	mg.vm_fd = vm;
+	mg.ring_fd = ring_h;
+	mg.engine = ATRIUM_GPU_ENGINE_GFX;
+	memset(&mc, 0, sizeof(mc));
+	mc.vm_fd = vm;
+	mc.ring_fd = ring_h;
+	mc.engine = ATRIUM_GPU_ENGINE_COMPUTE;
+	if (ioctl(fd, ATRIUM_GPU_IOC_QUEUE_MAP, &mg) != 0 ||
+	    ioctl(fd, ATRIUM_GPU_IOC_QUEUE_MAP, &mc) != 0) {
+		printf("doorbell_pages: QUEUE_MAP failed\n");
+		return (1);
+	}
+	if (mg.doorbell_mmap_offset == mc.doorbell_mmap_offset) {
+		printf("doorbell_pages FAILED: gfx and compute share a page (0x%llx)\n",
+		    (unsigned long long)mg.doorbell_mmap_offset);
+		return (1);
+	}
+	/* Map ONLY the compute queue's page and ring it directly. */
+	map = mmap(NULL, mc.doorbell_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+	    fd, mc.doorbell_mmap_offset);
+	if (map == MAP_FAILED) {
+		perror("doorbell_pages: mmap");
+		return (1);
+	}
+	doorbell = (volatile uint32_t *)((char *)map + mc.doorbell_word_offset);
+	*doorbell = n;
+	munmap(map, mc.doorbell_size);
+
+	if (bo_read(fd, dst_h, out, sizeof(out)) != 0) {
+		printf("doorbell_pages: read failed\n");
+		return (1);
+	}
+	for (i = 0; i < 4; i++)
+		if (out[i] != in[i] + 1) {
+			printf("doorbell_pages FAILED: compute via own page gave "
+			    "[%u %u %u %u]\n", out[0], out[1], out[2], out[3]);
+			return (1);
+		}
+	printf("doorbell_pages OK: gfx page 0x%llx, compute page 0x%llx (separate); "
+	    "compute rang via its own page\n",
+	    (unsigned long long)mg.doorbell_mmap_offset,
+	    (unsigned long long)mc.doorbell_mmap_offset);
+	return (0);
+}
+
 int
 main(void)
 {
@@ -1349,6 +1429,7 @@ main(void)
 	rc |= test_depth(fd, vm);
 	rc |= test_bilinear(fd, vm);
 	rc |= test_multipage(fd, vm);
+	rc |= test_doorbell_pages(fd, vm);
 	close(vm);
 	close(fd);
 	printf(rc == 0 ? "ALL OK\n" : "FAILURES\n");

@@ -136,12 +136,17 @@
 #define IT_DISPATCH_DIRECT	0x15u
 #define IT_DRAW_INDEX_AUTO	0x2du
 
-/* Per-engine fixed queue/doorbell assignment (no queue manager yet). */
+/*
+ * Per-engine fixed queue/doorbell assignment (no queue manager yet). Each
+ * queue's doorbell sits at the start of its OWN BAR2 page so the page can be
+ * mmap'd / SCM_RIGHTS-granted to one client without exposing other queues'
+ * doorbells (real-HW per-queue doorbell granularity).
+ */
 #define ATRIUM_AMD_RING_BYTES	256	/* CP ring-size register value */
 #define ATRIUM_AMD_GFX_QID	0
-#define ATRIUM_AMD_GFX_DOORBELL	0x0
+#define ATRIUM_AMD_GFX_DOORBELL	0x0000	/* doorbell page 0 */
 #define ATRIUM_AMD_COMPUTE_QID	1
-#define ATRIUM_AMD_COMPUTE_DOORBELL 0x8
+#define ATRIUM_AMD_COMPUTE_DOORBELL 0x1000 /* doorbell page 1 */
 
 /*
  * Per-VM GPU-VA bump allocator: each address space places BOs at BO_VA_BASE,
