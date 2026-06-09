@@ -31,7 +31,9 @@
 #define IT_WRITE_DATA		0x37u
 #define IT_WAIT_REG_MEM		0x3cu
 #define IT_DMA_DATA		0x50u	/* CP DMA copy (memory <-> memory) */
+#define IT_SET_SH_REG		0x76u	/* write a run of state regs from the ring */
 #define WAIT_FN_GE		5u	/* WAIT_REG_MEM FUNCTION: value >= reference */
+#define SIM_COMPUTE_KERNEL	0x200u	/* SIM-aperture offset of COMPUTE_KERNEL */
 
 /* Vertex the rasterizer consumes: NDC position + texcoord + RGBA color = 24B. */
 struct vtx {
@@ -1253,6 +1255,66 @@ test_bilinear(int fd, int vm)
 	return (0);
 }
 
+/*
+ * M14: opaque-blob submit (ABI-v2). The compute state (kernel + src/dst VAs)
+ * travels INSIDE the ring as a SET_SH_REG packet the CP applies, instead of the
+ * kmod poking COMPUTE_* registers via a SET_COMPUTE ioctl. The kernel never
+ * touches the compute registers — it just submits the opaque PM4 blob. Proves
+ * the kernel can be register-agnostic (the v2 submit shape).
+ */
+static int
+test_opaque_compute(int fd, int vm)
+{
+	uint32_t src_h, dst_h, ring_h, ring[11];
+	uint32_t in[4] = { 100, 200, 300, 400 }, out[4] = { 0 };
+	uint64_t src_va, dst_va, ring_va;
+	int i;
+
+	if (bo_alloc(fd, vm, 4096, &src_h, &src_va) != 0 ||
+	    bo_alloc(fd, vm, 4096, &dst_h, &dst_va) != 0 ||
+	    bo_alloc(fd, vm, 4096, &ring_h, &ring_va) != 0) {
+		printf("opaque_compute: BO alloc failed\n");
+		return (1);
+	}
+	if (bo_write(fd, src_h, in, sizeof(in)) != 0) {
+		printf("opaque_compute: write src failed\n");
+		return (1);
+	}
+	/* SET_SH_REG(COMPUTE_KERNEL, [kernel, src_lo, src_hi, dst_lo, dst_hi]) */
+	ring[0] = type3(IT_SET_SH_REG, 6);
+	ring[1] = SIM_COMPUTE_KERNEL;
+	ring[2] = KERNEL_INC;
+	ring[3] = (uint32_t)(src_va & 0xffffffff);
+	ring[4] = (uint32_t)(src_va >> 32);
+	ring[5] = (uint32_t)(dst_va & 0xffffffff);
+	ring[6] = (uint32_t)(dst_va >> 32);
+	/* DISPATCH 4x1x1 — reads the state the SET_SH_REG just applied. */
+	ring[7] = type3(IT_DISPATCH_DIRECT, 3);
+	ring[8] = 4;
+	ring[9] = 1;
+	ring[10] = 1;
+	if (bo_write(fd, ring_h, ring, sizeof(ring)) != 0) {
+		printf("opaque_compute: write ring failed\n");
+		return (1);
+	}
+
+	/* No SET_COMPUTE ioctl — the state rode in with the ring. */
+	if (submit(fd, vm, ring_h, 11, ATRIUM_GPU_ENGINE_COMPUTE) != 0 ||
+	    bo_read(fd, dst_h, out, sizeof(out)) != 0) {
+		printf("opaque_compute: submit/read failed\n");
+		return (1);
+	}
+	for (i = 0; i < 4; i++)
+		if (out[i] != in[i] + 1) {
+			printf("opaque_compute FAILED: got [%u %u %u %u]\n",
+			    out[0], out[1], out[2], out[3]);
+			return (1);
+		}
+	printf("opaque_compute OK: compute state via SET_SH_REG in the ring "
+	    "(no SET_COMPUTE ioctl), INC [%u..] -> [%u..]\n", in[0], out[0]);
+	return (0);
+}
+
 int
 main(void)
 {
@@ -1286,6 +1348,7 @@ main(void)
 	rc |= test_dma_copy(fd, vm);
 	rc |= test_depth(fd, vm);
 	rc |= test_bilinear(fd, vm);
+	rc |= test_opaque_compute(fd, vm);
 	close(vm);
 	close(fd);
 	printf(rc == 0 ? "ALL OK\n" : "FAILURES\n");
