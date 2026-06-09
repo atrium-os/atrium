@@ -1395,6 +1395,127 @@ test_doorbell_pages(int fd, int vm)
 	return (0);
 }
 
+/* Allocate a BO with placement flags (ATRIUM_GPU_BO_VRAM) and bind it. */
+static int
+bo_alloc_flags(int fd, int vm, uint64_t size, uint32_t flags, uint32_t *handle,
+    uint64_t *gpu_va)
+{
+	struct atrium_gpu_bo_alloc a;
+	struct atrium_gpu_vm_bind b;
+
+	memset(&a, 0, sizeof(a));
+	a.size = size;
+	a.flags = flags;
+	if (ioctl(fd, ATRIUM_GPU_IOC_BO_ALLOC, &a) != 0)
+		return (-1);
+	memset(&b, 0, sizeof(b));
+	b.vm_fd = vm;
+	b.bo_fd = a.bo_fd;
+	b.va = 0;
+	if (ioctl(fd, ATRIUM_GPU_IOC_VM_BIND, &b) != 0)
+		return (-1);
+	*handle = a.bo_fd;
+	*gpu_va = b.va;
+	return (0);
+}
+
+/* GPU-side DMA copy of `bytes` from src_va to dst_va via a DMA_DATA ring. */
+static int
+dma_copy(int fd, int vm, uint32_t ring_h, uint64_t src_va, uint64_t dst_va,
+    uint32_t bytes)
+{
+	uint32_t ring[7];
+
+	ring[0] = type3(IT_DMA_DATA, 6);
+	ring[1] = 0;
+	ring[2] = (uint32_t)(src_va & 0xffffffff);
+	ring[3] = (uint32_t)(src_va >> 32);
+	ring[4] = (uint32_t)(dst_va & 0xffffffff);
+	ring[5] = (uint32_t)(dst_va >> 32);
+	ring[6] = bytes;
+	if (bo_write(fd, ring_h, ring, sizeof(ring)) != 0)
+		return (-1);
+	return (submit(fd, vm, ring_h, 7, ATRIUM_GPU_ENGINE_GFX));
+}
+
+/*
+ * M18: VRAM-resident BOs + reset-loses-VRAM. A VRAM BO lives in device-local
+ * memory (BAR0), not guest RAM — it's GPU-only (a direct CPU write is refused),
+ * so it's populated by a GPU copy from a System staging BO. Data round-trips
+ * through VRAM (staging -> VRAM -> result). A full GPU reset then clears VRAM
+ * (System/GTT survives), so the BO reads back zero until the driver re-uploads
+ * from its CPU shadow.
+ */
+static int
+test_vram(int fd, int vm)
+{
+	uint32_t stg_h, vbo_h, res_h, ring_h;
+	uint32_t pat[64], out[64];
+	uint64_t stg_va, vbo_va, res_va, ring_va;
+	int i;
+
+	for (i = 0; i < 64; i++) {
+		pat[i] = 0x77000000u + i;
+		out[i] = 0;
+	}
+	if (bo_alloc(fd, vm, sizeof(pat), &stg_h, &stg_va) != 0 ||
+	    bo_alloc_flags(fd, vm, sizeof(pat), ATRIUM_GPU_BO_VRAM, &vbo_h, &vbo_va) != 0 ||
+	    bo_alloc(fd, vm, sizeof(pat), &res_h, &res_va) != 0 ||
+	    bo_alloc(fd, vm, 4096, &ring_h, &ring_va) != 0) {
+		printf("vram: BO alloc failed\n");
+		return (1);
+	}
+	if (bo_write(fd, stg_h, pat, sizeof(pat)) != 0) {
+		printf("vram: staging write failed\n");
+		return (1);
+	}
+	/* A VRAM BO is GPU-only: a direct CPU write must be refused. */
+	if (bo_write(fd, vbo_h, pat, sizeof(pat)) == 0) {
+		printf("vram FAILED: CPU wrote a VRAM BO directly\n");
+		return (1);
+	}
+	/* Upload staging(System) -> VRAM, then read VRAM -> result(System). */
+	if (dma_copy(fd, vm, ring_h, stg_va, vbo_va, sizeof(pat)) != 0 ||
+	    dma_copy(fd, vm, ring_h, vbo_va, res_va, sizeof(pat)) != 0 ||
+	    bo_read(fd, res_h, out, sizeof(out)) != 0) {
+		printf("vram: round-trip copy failed\n");
+		return (1);
+	}
+	if (memcmp(pat, out, sizeof(pat)) != 0) {
+		printf("vram FAILED: round-trip through VRAM mismatch (out[0]=%08x)\n",
+		    out[0]);
+		return (1);
+	}
+	/* A full GPU reset loses VRAM — the BO now reads back zero. */
+	if (ioctl(fd, ATRIUM_GPU_IOC_GPU_RESET, NULL) != 0) {
+		printf("vram: GPU_RESET failed\n");
+		return (1);
+	}
+	memset(out, 0xff, sizeof(out));
+	if (dma_copy(fd, vm, ring_h, vbo_va, res_va, sizeof(pat)) != 0 ||
+	    bo_read(fd, res_h, out, sizeof(out)) != 0) {
+		printf("vram: post-reset read failed\n");
+		return (1);
+	}
+	for (i = 0; i < 64; i++)
+		if (out[i] != 0) {
+			printf("vram FAILED: VRAM survived reset (out[%d]=%08x)\n",
+			    i, out[i]);
+			return (1);
+		}
+	/* Re-upload from the CPU shadow restores it. */
+	if (dma_copy(fd, vm, ring_h, stg_va, vbo_va, sizeof(pat)) != 0 ||
+	    dma_copy(fd, vm, ring_h, vbo_va, res_va, sizeof(pat)) != 0 ||
+	    bo_read(fd, res_h, out, sizeof(out)) != 0 ||
+	    memcmp(pat, out, sizeof(pat)) != 0) {
+		printf("vram FAILED: re-upload after reset did not restore\n");
+		return (1);
+	}
+	printf("vram OK: round-trips through VRAM; reset loses it; re-upload "
+	    "restores\n");
+	return (0);
+}
+
 int
 main(void)
 {
@@ -1430,6 +1551,7 @@ main(void)
 	rc |= test_bilinear(fd, vm);
 	rc |= test_multipage(fd, vm);
 	rc |= test_doorbell_pages(fd, vm);
+	rc |= test_vram(fd, vm);
 	close(vm);
 	close(fd);
 	printf(rc == 0 ? "ALL OK\n" : "FAILURES\n");

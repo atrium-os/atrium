@@ -61,6 +61,8 @@ amd_xfer_bounds(struct atrium_amd_bo *bo, uint64_t offset, uint64_t len)
 {
 	if (bo == NULL)
 		return (ENXIO);
+	if (bo->kva == NULL)
+		return (EINVAL);	/* VRAM BO: GPU-only, no CPU copy path */
 	if (len > bo->size || offset > bo->size - len)
 		return (EINVAL);
 	return (0);
@@ -91,7 +93,7 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		struct atrium_gpu_bo_alloc *a = (struct atrium_gpu_bo_alloc *)data;
 		int fd;
 
-		err = amd_bo_create_fd(sc, td, a->size, &fd);
+		err = amd_bo_create_fd(sc, td, a->size, a->flags, &fd);
 		if (err != 0)
 			return (err);
 		a->bo_fd = fd;

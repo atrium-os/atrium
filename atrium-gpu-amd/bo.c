@@ -8,6 +8,7 @@
  * so it can unmap on close. The integer handle table is gone.
  */
 #include "atrium_gpu_amd.h"
+#include "atrium_gpu_amd_abi.h"	/* ATRIUM_GPU_BO_VRAM placement flag */
 
 /*
  * Allocate one page of DMA-able guest memory for internal use and register it.
@@ -139,7 +140,7 @@ const struct fileops atrium_amd_bo_fileops = {
  */
 int
 amd_bo_create_fd(struct atrium_amd_softc *sc, struct thread *td, uint64_t size,
-    int *out_fd)
+    uint32_t flags, int *out_fd)
 {
 	struct atrium_amd_bo *bo;
 	struct amd_bo_load load;
@@ -154,6 +155,34 @@ amd_bo_create_fd(struct atrium_amd_softc *sc, struct thread *td, uint64_t size,
 		return (EINVAL);
 	rounded = round_page(size);
 	npages = rounded / PAGE_SIZE;
+
+	if ((flags & ATRIUM_GPU_BO_VRAM) != 0) {
+		uint64_t vram_off;
+		int i;
+
+		/*
+		 * VRAM-resident: bump-allocate device-local pages. No bus_dma and
+		 * no CPU mapping — VRAM is GPU-only; userspace populates it with a
+		 * GPU copy from a System staging BO. pages[] hold VRAM offsets.
+		 */
+		mtx_lock(&sc->lock);
+		if (sc->vram_next + rounded > ATRIUM_AMD_VRAM_BYTES) {
+			mtx_unlock(&sc->lock);
+			return (ENOMEM);
+		}
+		vram_off = sc->vram_next;
+		sc->vram_next += rounded;
+		sc->bo_count++;
+		mtx_unlock(&sc->lock);
+		bo = malloc(sizeof(*bo), M_DEVBUF, M_WAITOK | M_ZERO);
+		bo->sc = sc;
+		bo->vram = 1;
+		bo->npages = npages;
+		bo->size = size;
+		for (i = 0; i < npages; i++)
+			bo->pages[i] = vram_off + (uint64_t)i * PAGE_SIZE;
+		goto install;
+	}
 
 	/*
 	 * DMA-allocate the BO through bus_dma(9) — the real-silicon path (proper
@@ -199,6 +228,7 @@ amd_bo_create_fd(struct atrium_amd_softc *sc, struct thread *td, uint64_t size,
 	sc->bo_count++;
 	mtx_unlock(&sc->lock);
 
+install:
 	err = falloc_noinstall(td, &fp);
 	if (err != 0) {
 		amd_bo_destroy(bo, td);
@@ -248,7 +278,8 @@ amd_bo_bind(struct atrium_amd_bo *bo, struct atrium_amd_vm *vm,
 	/* One PTE per page — the GPUVM gathers the BO's (possibly scattered) pages
 	 * into a contiguous GPU-VA range. */
 	for (i = 0; i < bo->npages; i++) {
-		err = amd_vm_map(vm, addr + (uint64_t)i * PAGE_SIZE, bo->pages[i]);
+		err = amd_vm_map(vm, addr + (uint64_t)i * PAGE_SIZE, bo->pages[i],
+		    bo->vram);
 		if (err != 0) {
 			while (i-- > 0)
 				amd_vm_unmap(vm, addr + (uint64_t)i * PAGE_SIZE);

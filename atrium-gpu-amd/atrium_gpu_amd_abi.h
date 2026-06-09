@@ -61,10 +61,15 @@ struct atrium_gpu_vm_create {
  * into a VM with VM_BIND before the GPU can reach it.
  */
 struct atrium_gpu_bo_alloc {
-	uint64_t	size;		/* in:  bytes (<= one page for now) */
+	uint64_t	size;		/* in:  bytes */
 	uint32_t	bo_fd;		/* out: file descriptor naming this BO */
-	uint32_t	pad;
+	uint32_t	flags;		/* in:  ATRIUM_GPU_BO_* placement */
 };
+#define ATRIUM_GPU_BO_VRAM	0x1	/* place in device VRAM (else System/GTT).
+					 * VRAM BOs are GPU-only (no CPU map) —
+					 * populate them with a GPU copy from a
+					 * System staging BO, and re-upload after a
+					 * GPU reset (reset loses VRAM). */
 
 /* Map a BO into a VM at a GPU virtual address (0 = let the kernel pick one). */
 struct atrium_gpu_vm_bind {

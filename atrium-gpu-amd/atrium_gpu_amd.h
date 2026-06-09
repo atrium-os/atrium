@@ -125,6 +125,8 @@
  * pt[va>>12], each 8 bytes = (page-aligned phys) | PTE_VALID(bit 0).
  */
 #define ATRIUM_AMD_PTE_VALID	0x1ULL
+#define ATRIUM_AMD_PTE_VRAM	0x2ULL	/* page is device VRAM (else System/GTT) */
+#define ATRIUM_AMD_VRAM_BYTES	(256ULL << 20)	/* BAR0 VRAM capacity */
 #define ATRIUM_AMD_PD_SHIFT	21
 #define ATRIUM_AMD_PT_SHIFT	12
 #define ATRIUM_AMD_PT_MASK	0x1ff
@@ -215,7 +217,9 @@ struct atrium_amd_bo {
 	bus_dma_tag_t	 dmat;		/* per-BO DMA tag */
 	bus_dmamap_t	 dmamap;	/* the BO's DMA mapping */
 	int		 npages;	/* pages backing this BO */
-	bus_addr_t	 pages[ATRIUM_AMD_BO_MAX_PAGES]; /* per-page bus addrs */
+	int		 vram;		/* 1 = VRAM-resident (pages[] are VRAM offsets,
+					 * no kva/dmat); 0 = System/GTT (bus_dma) */
+	bus_addr_t	 pages[ATRIUM_AMD_BO_MAX_PAGES]; /* per-page bus addrs / VRAM offsets */
 	uint64_t	 gpu_va;
 	uint64_t	 size;
 };
@@ -279,6 +283,7 @@ struct atrium_amd_softc {
 	struct atrium_amd_dma_page dma[ATRIUM_AMD_MAX_DMA];
 	int		 n_dma;
 	int		 bo_count;	/* live bo_fds; detach refuses if > 0 */
+	uint64_t	 vram_next;	/* VRAM bump allocator (offset into BAR0) */
 };
 
 /*
@@ -310,7 +315,7 @@ amd_pm4_type3_header(uint32_t opcode, uint32_t body_dwords)
 /* bo.c — internal DMA pages + fd-backed buffer objects */
 void	*amd_dma_alloc(struct atrium_amd_softc *sc, vm_paddr_t *gpa_out);
 int	 amd_bo_create_fd(struct atrium_amd_softc *sc, struct thread *td,
-	    uint64_t size, int *out_fd);
+	    uint64_t size, uint32_t flags, int *out_fd);
 int	 amd_bo_fget(struct thread *td, int fd, struct file **out_fp,
 	    struct atrium_amd_bo **out_bo);
 /* Map an unbound BO into `vm` at *va (0 = auto). On success the BO takes over
@@ -324,7 +329,8 @@ int	 amd_vm_create_fd(struct atrium_amd_softc *sc, struct thread *td,
 	    int *out_fd);
 int	 amd_vm_fget(struct thread *td, int fd, struct file **out_fp,
 	    struct atrium_amd_vm **out_vm);
-int	 amd_vm_map(struct atrium_amd_vm *vm, uint64_t va, vm_paddr_t phys);
+int	 amd_vm_map(struct atrium_amd_vm *vm, uint64_t va, vm_paddr_t phys,
+	    int vram);
 void	 amd_vm_unmap(struct atrium_amd_vm *vm, uint64_t va);
 extern const struct fileops atrium_amd_vm_fileops;
 
