@@ -53,6 +53,26 @@ blend_over(uint32_t src, uint32_t dst)
 	a = (uint32_t)((sa + da * (1.0f - sa)) * 255.0f + 0.5f);
 	return r | (g << 8) | (b << 16) | (a << 24);
 }
+
+/* A full-screen quad (2 tris) at NDC depth z, solid color, UV spanning [0,1]. */
+static void
+fill_quad(struct vtx *q, float z, uint32_t color)
+{
+	static const float pos[6][4] = {	/* x, y, u, v */
+		{ -1, -1, 0, 1 }, { 1, -1, 1, 1 }, { 1, 1, 1, 0 },
+		{ -1, -1, 0, 1 }, { 1, 1, 1, 0 }, { -1, 1, 0, 0 },
+	};
+	int i;
+
+	for (i = 0; i < 6; i++) {
+		q[i].x = pos[i][0];
+		q[i].y = pos[i][1];
+		q[i].z = z;
+		q[i].u = pos[i][2];
+		q[i].v = pos[i][3];
+		q[i].color = color;
+	}
+}
 #define KERNEL_INC		2u
 #define FENCE_MAGIC		0xcafef00ddeadbeefULL
 
@@ -1109,6 +1129,130 @@ test_dma_copy(int fd, int vm)
 	return (0);
 }
 
+/*
+ * M13a: depth-tested draw. Init the depth buffer to far, then draw three
+ * full-screen quads at different NDC depths. The z-test (smaller z = closer)
+ * must occlude a farther quad drawn after a nearer one, and let a nearer quad
+ * drawn last win — order-independent occlusion. depth_va was plumbed in M12;
+ * this exercises it.
+ */
+static int
+test_depth(int fd, int vm)
+{
+	struct atrium_gpu_set_draw d;
+	uint32_t vtx_h, rt_h, dep_h, ring_h, ring[2], rt[256], depbuf[256];
+	uint64_t vtx_va, rt_va, dep_va, ring_va;
+	uint32_t cA = 0xffaa1111, cB = 0xff22bb22, cC = 0xff3333cc;
+	struct vtx q[6];
+	float far = 1.0f;
+	uint32_t far_bits;
+	int i;
+
+	memcpy(&far_bits, &far, 4);
+	if (bo_alloc(fd, vm, 4096, &vtx_h, &vtx_va) != 0 ||
+	    bo_alloc(fd, vm, 4096, &rt_h, &rt_va) != 0 ||
+	    bo_alloc(fd, vm, 4096, &dep_h, &dep_va) != 0 ||
+	    bo_alloc(fd, vm, 4096, &ring_h, &ring_va) != 0) {
+		printf("depth: BO alloc failed\n");
+		return (1);
+	}
+	for (i = 0; i < 256; i++)
+		depbuf[i] = far_bits;	/* depth cleared to far (1.0) */
+	bo_write(fd, dep_h, depbuf, sizeof(depbuf));
+	ring[0] = type3(IT_DRAW_INDEX_AUTO, 1);
+	ring[1] = 6;
+	bo_write(fd, ring_h, ring, sizeof(ring));
+	memset(&d, 0, sizeof(d));
+	d.vtx_va = vtx_va;
+	d.rt_va = rt_va;
+	d.width = 16;
+	d.height = 16;
+	d.depth_va = dep_va;
+
+	/* near quad (z=0.5), then a farther quad (z=0.8) that must be occluded. */
+	fill_quad(q, 0.5f, cA);
+	bo_write(fd, vtx_h, q, sizeof(q));
+	ioctl(fd, ATRIUM_GPU_IOC_SET_DRAW, &d);
+	submit(fd, vm, ring_h, 2, ATRIUM_GPU_ENGINE_GFX);
+	fill_quad(q, 0.8f, cB);
+	bo_write(fd, vtx_h, q, sizeof(q));
+	ioctl(fd, ATRIUM_GPU_IOC_SET_DRAW, &d);
+	submit(fd, vm, ring_h, 2, ATRIUM_GPU_ENGINE_GFX);
+	if (bo_read(fd, rt_h, rt, sizeof(rt)) != 0 || rt[8 * 16 + 8] != cA) {
+		printf("depth FAILED: farther quad not occluded (%08x)\n",
+		    rt[8 * 16 + 8]);
+		return (1);
+	}
+	/* a nearer quad (z=0.2) drawn last must win. */
+	fill_quad(q, 0.2f, cC);
+	bo_write(fd, vtx_h, q, sizeof(q));
+	ioctl(fd, ATRIUM_GPU_IOC_SET_DRAW, &d);
+	submit(fd, vm, ring_h, 2, ATRIUM_GPU_ENGINE_GFX);
+	if (bo_read(fd, rt_h, rt, sizeof(rt)) != 0 || rt[8 * 16 + 8] != cC) {
+		printf("depth FAILED: nearer quad did not win (%08x)\n",
+		    rt[8 * 16 + 8]);
+		return (1);
+	}
+	printf("depth OK: farther draw occluded, nearer draw won (z-test)\n");
+	return (0);
+}
+
+/*
+ * M13b: bilinear texture filtering. The same 2x2 texture as the nearest test,
+ * but tex_filter=1 — at the RT center the 4-tap sample blends adjacent texels,
+ * so the value is intermediate (not a hard quadrant edge). tex_filter was
+ * plumbed in M12; this exercises the bilinear path.
+ */
+static int
+test_bilinear(int fd, int vm)
+{
+	struct atrium_gpu_set_draw d;
+	uint32_t tex_h, vtx_h, rt_h, ring_h, ring[2], rt[256];
+	uint64_t tex_va, vtx_va, rt_va, ring_va;
+	/* left column byte0=0, right column byte0=200: a horizontal ramp. */
+	uint32_t tex[4] = { 0x00000000, 0x000000c8, 0x00000000, 0x000000c8 };
+	struct vtx q[6];
+	int mid;
+
+	if (bo_alloc(fd, vm, 4096, &tex_h, &tex_va) != 0 ||
+	    bo_alloc(fd, vm, 4096, &vtx_h, &vtx_va) != 0 ||
+	    bo_alloc(fd, vm, 4096, &rt_h, &rt_va) != 0 ||
+	    bo_alloc(fd, vm, 4096, &ring_h, &ring_va) != 0) {
+		printf("bilinear: BO alloc failed\n");
+		return (1);
+	}
+	fill_quad(q, 0, 0);
+	bo_write(fd, tex_h, tex, sizeof(tex));
+	bo_write(fd, vtx_h, q, sizeof(q));
+	ring[0] = type3(IT_DRAW_INDEX_AUTO, 1);
+	ring[1] = 6;
+	bo_write(fd, ring_h, ring, sizeof(ring));
+	memset(&d, 0, sizeof(d));
+	d.vtx_va = vtx_va;
+	d.rt_va = rt_va;
+	d.width = 16;
+	d.height = 16;
+	d.tex_va = tex_va;
+	d.tex_w = 2;
+	d.tex_h = 2;
+	d.tex_filter = 1;	/* bilinear */
+	if (ioctl(fd, ATRIUM_GPU_IOC_SET_DRAW, &d) != 0 ||
+	    submit(fd, vm, ring_h, 2, ATRIUM_GPU_ENGINE_GFX) != 0 ||
+	    bo_read(fd, rt_h, rt, sizeof(rt)) != 0) {
+		printf("bilinear: draw/readback failed\n");
+		return (1);
+	}
+	mid = rt[8 * 16 + 8] & 0xff;	/* byte0 of the center pixel */
+	if (mid <= 10 || mid >= 190) {
+		printf("bilinear FAILED: center byte0 = %d (not interpolated)\n",
+		    mid);
+		return (1);
+	}
+	printf("bilinear OK: center texel interpolated to %d (between 0 and 200)\n",
+	    mid);
+	return (0);
+}
+
 int
 main(void)
 {
@@ -1140,6 +1284,8 @@ main(void)
 	rc |= test_textured_draw(fd, vm);
 	rc |= test_blend(fd, vm);
 	rc |= test_dma_copy(fd, vm);
+	rc |= test_depth(fd, vm);
+	rc |= test_bilinear(fd, vm);
 	close(vm);
 	close(fd);
 	printf(rc == 0 ? "ALL OK\n" : "FAILURES\n");
