@@ -243,7 +243,97 @@ strengthened: not three schedulers that happen to talk, but one mathematical
 language in one currency. The energy router is not a fourth thing reading
 intent; it is the currency the controllers minimize.
 
-## 9. Trust / TCB
+## 9. Placement — where the controller runs, and the portable kernel
+
+"Scheduling logic" smears two things that want different homes:
+
+- **Control** — sequencing (who runs next), driving the command processor,
+  handling preemption boundaries, admission/eviction, *acting on* the decision.
+  Stateful, privileged, hardware-touching.
+- **Computation** — the min-vruntime reduction, the per-queue RLC update, the
+  normalization. The data-parallel *math* that produces the decision.
+
+**Control lives in firmware** — the scheduler microcontroller (MES-class), on
+the GPU, off the shader cores: the trusted sequencer that drives the CP. It is
+never a shader. **The computation is a SIMD reduction**, and that is the part
+that is interesting, because two constraints decide where it runs:
+
+1. **Near the execution path.** Fine decisions happen at packet/wave boundaries
+   (sub-µs). A host round-trip per decision is orders of magnitude too slow —
+   which is *why* it cannot be the kernel, and reinforces user-mode queues
+   (keep the host off the hot path). So: on-GPU.
+2. **Must not consume the resource it schedules.** A persistent scheduler kernel
+   squatting on a CU competes with the work it arbitrates. So a shader-resident
+   scheduler is only sane if it is **tiny and infrequent** — runs *at* a decision
+   point (a reduction over N queues, microseconds on a couple of wavefronts),
+   then yields — never a resident daemon.
+
+So:
+
+- **Small N (dozens of queues):** the microcontroller's vector unit does the
+  reduction inline; no shader.
+- **Large N (many-tenant, thousands of queues):** the microcontroller
+  **dispatches a tiny privileged scheduler shader** — min-reduction + RLC update
+  over all queues in parallel — reads the result, acts. The conductor (firmware)
+  calls the parallel calculator (shader) only when the arithmetic gets wide
+  enough that SIMD beats the serial loop.
+
+**The payoff — it is the *same kernel*.** Laminar's min-vruntime is already a
+SIMD reduction on the CPU; the GPU controller's is a SIMD reduction on the GPU.
+So the federation's controllers share not just the *math* but the **kernel**,
+retargeted per resource's parallel hardware:
+
+```
+energy-RLC reduction kernel   ──▶  CPU SIMD            (Laminar's controller)
+(per-queue RLC update +       ──▶  GPU shader          (the GPU controller, large N)
+ min-vruntime + normalize)    ──▶  µcontroller vector  (the small-N path)
+```
+
+One implementation of "reduce the queue set under the energy-RLC cost," several
+backends. The deepest form of the unification: not "same equations, separate
+code" but **same code, retargeted**. The self-reference is the point — a SIMD
+machine's fair-scheduler *is* a SIMD reduction, so it runs on the machine it
+schedules.
+
+**The RLC state fits this cleanly.** The kernel is two phases: a *per-queue* step
+(one lane per queue — read `L/R/C` + energy counters from the queue descriptor /
+MQD, advance the controller, write back) and a *reduction* (min-vruntime, total
+weight, the global decision). Both embarrassingly parallel; the per-queue state
+is in the MQDs the energy model already maintains — the Joule counters the
+display/render-timing model produces (`save/restore → L`, `unfairness → C`) are
+*exactly* this kernel's per-lane inputs.
+
+**A scheduler shader is firmware-owned and TCB, not a user shader.** It reads
+every queue's state to arbitrate them — cross-jail visibility by necessity —
+which is fine *because* it is part of the trusted scheduler, not a jailed UMD
+kernel. But the firmware↔scheduler-shader boundary is inside the TCB, and the
+scheduler shader must be as verified as the MES firmware. It is "GPU code in the
+TCB" — unusual, and called out deliberately (see §10).
+
+**The model is agnostic to placement.** gpusim captures the scheduling
+*function* in virtual time — given the queue set + their `L/R/C/energy` state,
+what decision emerges — independent of whether it physically runs on host,
+microcontroller, or shader. So we design and verify the *function* (§11) and
+treat firmware-vs-shader-vs-µvector as a backend choice; the radical
+shader-resident option stays open without being forced. Prove the math before
+committing the silicon placement.
+
+**The scheduler must budget itself (a fixed-point).** If the large-N decision
+runs as a shader, it occupies execution units for those microseconds — so it
+competes with the very deadline it is protecting, and the bound on *its own*
+runtime becomes part of the worst-case latency it computes. The scheduler's cost
+is therefore a term in the cost it minimizes: it must pay for itself in its own
+energy/time currency. A small, real fixed-point — and a hard ceiling on how
+heavy the controller may become (an over-clever scheduler that no longer fits in
+its own slice has failed).
+
+**Recommendation:** write the computation as a **retargetable SIMD kernel from
+day one** — that is what makes Laminar's min-vruntime transfer cleanly and turns
+the federation from "same idea" into "same code." Run it on the microcontroller
+for the common case; keep the shader-dispatch path for large-N scaling; do not
+hard-commit to shader-resident.
+
+## 10. Trust / TCB
 
 - **Firmware joins the TCB** — it enforces per-VMID translation, performs
   save/restore, and runs the schedule. Same as real silicon (the MES enforces
@@ -258,7 +348,7 @@ intent; it is the currency the controllers minimize.
   dispatch with and without an injected preemption and diffs the output makes it
   a unit test.
 
-## 10. Modeling & verification (gpusim)
+## 11. Modeling & verification (gpusim)
 
 This is gated on **GPU render-timing** — work must take virtual time, or there is
 no contention to schedule — which sits on the **virtual-time substrate the
@@ -283,7 +373,7 @@ Tuning is done the Laminar way — shape the `L`-ramp + `R`/`C` against
 shares are fair, deadline misses are zero, and the switch rate does not thrash —
 but now with reproducible *frame-level* timing.
 
-## 11. Sequencing (the arc)
+## 12. Sequencing (the arc)
 
 ```
 display timing (D-display-1)   → lays the deterministic virtual-time substrate
@@ -295,7 +385,7 @@ display timing (D-display-1)   → lays the deterministic virtual-time substrate
 The display milestone is quietly the unlock for the entire timing / fairness /
 energy axis.
 
-## 12. Open questions
+## 13. Open questions
 
 - **The device energy profile that yields `L`/`R`/`C`** — save/restore bytes ×
   memory Joule/byte; per-op "deserved work" Joules; refresh/PSR/VRR Joules
@@ -312,7 +402,7 @@ energy axis.
 - **Side channels** — a shared GPU leaks timing/contention signals between jails;
   hard on every GPU, deferred but real.
 
-## 13. Summary position
+## 14. Summary position
 
 GPU fairness is **space in the kernel (quotas), time in the firmware (time-slice
 + preemption) under revocable kernel admission and kernel-set policy**, backstopped
