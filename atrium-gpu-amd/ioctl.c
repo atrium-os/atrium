@@ -366,6 +366,35 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		return (err);
 	}
 
+	case ATRIUM_GPU_IOC_DISPLAY_QUERY: {
+		struct atrium_gpu_display_query *q =
+		    (struct atrium_gpu_display_query *)data;
+
+		return (amd_display_query(sc, q));
+	}
+
+	case ATRIUM_GPU_IOC_DISPLAY_SET_MODE: {
+		struct atrium_gpu_display_setmode *m =
+		    (struct atrium_gpu_display_setmode *)data;
+
+		return (amd_display_set_mode(sc, td, m->fb_fd, &m->fault));
+	}
+
+	case ATRIUM_GPU_IOC_DISPLAY_FLIP: {
+		struct atrium_gpu_display_flip *f =
+		    (struct atrium_gpu_display_flip *)data;
+
+		return (amd_display_flip(sc, td, f->fb_fd, f->vsync, &f->fault));
+	}
+
+	case ATRIUM_GPU_IOC_DISPLAY_STATUS: {
+		struct atrium_gpu_display_status *st =
+		    (struct atrium_gpu_display_status *)data;
+
+		amd_display_status(sc, st);
+		return (0);
+	}
+
 	default:
 		return (ENOTTY);
 	}

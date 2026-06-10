@@ -168,4 +168,38 @@ struct atrium_gpu_syncobj_wait {
  */
 #define ATRIUM_GPU_IOC_GPU_RESET	_IO('A', 16)
 
+/*
+ * Display (D-display-1): one connector / one CRTC. The display block is
+ * architecturally independent of the GFX/compute engine (its own registers);
+ * these ioctls drive QUERY -> SET_MODE -> FLIP -> STATUS. Scanout FBs are VRAM
+ * BOs (fd-as-handle), read by the display by VRAM offset.
+ */
+struct atrium_gpu_display_query {
+	uint32_t connected;	/* out: 1 = monitor attached (HPD) */
+	uint32_t edid_len;	/* out: EDID bytes returned (128) */
+	uint8_t  edid[128];	/* out: EDID base block read over DDC */
+};
+
+struct atrium_gpu_display_setmode {
+	int32_t  fb_fd;		/* in: VRAM BO to scan out */
+	uint32_t fault;		/* out: DisplayFault code (0 = ok) */
+};
+
+struct atrium_gpu_display_flip {
+	int32_t  fb_fd;		/* in: VRAM BO to flip to */
+	uint32_t vsync;		/* in: 1 = latch at vblank (no tear) */
+	uint32_t fault;		/* out: DisplayFault code (0 = ok) */
+};
+
+struct atrium_gpu_display_status {
+	uint64_t vblank_count;	/* out: vblanks elapsed */
+	uint32_t dropped_flips;	/* out: flips dropped by the depth-1 queue */
+	uint32_t tear_line;	/* out: first tear scanline (0xffffffff = none) */
+};
+
+#define ATRIUM_GPU_IOC_DISPLAY_QUERY	_IOWR('A', 17, struct atrium_gpu_display_query)
+#define ATRIUM_GPU_IOC_DISPLAY_SET_MODE	_IOWR('A', 18, struct atrium_gpu_display_setmode)
+#define ATRIUM_GPU_IOC_DISPLAY_FLIP	_IOWR('A', 19, struct atrium_gpu_display_flip)
+#define ATRIUM_GPU_IOC_DISPLAY_STATUS	_IOR('A', 20, struct atrium_gpu_display_status)
+
 #endif /* _ATRIUM_GPU_AMD_ABI_H_ */

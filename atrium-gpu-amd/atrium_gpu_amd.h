@@ -114,6 +114,24 @@
 #define ATRIUM_AMD_Q_STRIDE	0x20	/* bytes per queue */
 #define ATRIUM_AMD_QF_VMID	0x14	/* offset of the VMID field within a queue */
 
+/*
+ * Display block (APER_DISP = 0x3_0000; model: engine/src/display.rs `regs`).
+ * Architecturally independent of GFX/compute — its own register aperture.
+ */
+#define regDISP_CONNECTOR_STATUS 0x30000 /* r: bit0 = connected (HPD) */
+#define regDISP_DDC_OFFSET	0x30004	/* w: EDID byte offset to read next */
+#define regDISP_DDC_DATA	0x30008	/* r: EDID byte at DDC_OFFSET (0xff = no DDC) */
+#define regDISP_FB_BASE_LO	0x3000c	/* w: scanout FB VRAM offset (lo/hi) */
+#define regDISP_FB_BASE_HI	0x30010
+#define regDISP_FB_SIZE		0x30014	/* w: FB size in bytes */
+#define regDISP_SET_MODE	0x30018	/* w 1: program the connector's EDID mode */
+#define regDISP_FLIP		0x3001c	/* w: bit0 = vsync; the write triggers a flip */
+#define regDISP_VBLANK_COUNT	0x30020	/* r: vblanks elapsed */
+#define regDISP_DROPPED_FLIPS	0x30024	/* r: flips dropped by the depth-1 queue */
+#define regDISP_FAULT		0x30028	/* r: last DisplayFault code (0 = none) */
+#define regDISP_TEAR_LINE	0x3002c	/* r: first tear scanline (0xffffffff = none) */
+#define ATRIUM_AMD_EDID_LEN	128
+
 /* CP firmware: minimum ucode version the model accepts (CP_FW_MIN_VERSION). */
 #define ATRIUM_AMD_CP_FW_VERSION 0x40
 /* Reset poll: model latches synchronously; poll-with-timeout is the HW shape. */
@@ -350,6 +368,18 @@ int	 amd_submit(struct atrium_amd_softc *sc, struct atrium_amd_bo *ring,
 	    uint32_t n_dwords, uint32_t engine, uint16_t vmid);
 int	 amd_queue_program(struct atrium_amd_softc *sc, uint64_t ring_va,
 	    uint32_t engine, uint16_t vmid, uint32_t *doorbell_off);
+
+/* display.c — the D-display-1 scanout path (one connector / one CRTC) */
+struct atrium_gpu_display_query;
+struct atrium_gpu_display_status;
+int	 amd_display_query(struct atrium_amd_softc *sc,
+	    struct atrium_gpu_display_query *q);
+int	 amd_display_set_mode(struct atrium_amd_softc *sc, struct thread *td,
+	    int fb_fd, uint32_t *fault);
+int	 amd_display_flip(struct atrium_amd_softc *sc, struct thread *td,
+	    int fb_fd, uint32_t vsync, uint32_t *fault);
+void	 amd_display_status(struct atrium_amd_softc *sc,
+	    struct atrium_gpu_display_status *st);
 
 /*
  * mmap offset (passed to mmap() on the device fd) that maps the BAR2 doorbell
