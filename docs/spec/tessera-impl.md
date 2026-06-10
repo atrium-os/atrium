@@ -561,6 +561,54 @@ Five tiers, covering different regression risks. All run in CI; long-running tie
 - 24-hour mixed-workload runs with random crash injection. Multiple VMs, different seeds.
 - Reports filed against `docs/implementation-notes.md`.
 
+### 6.7 Fuzzing the on-disk parsers (added 2026-06-10; phase-exit gate)
+
+Tessera is an in-kernel filesystem: every mount parses
+attacker-or-corruption-controlled bytes (superblocks, journal
+records, pack headers, B+tree nodes, manifests) on syscalls
+reachable from *any* jail. That parsing surface is the platform's
+largest kernel attack surface and is treated as a first-class
+security gate, not an afterthought.
+
+- **Structure-aware fuzzing of every on-disk decoder.** A
+  libFuzzer/cargo-fuzz target per parser (`fuzz/superblock`,
+  `fuzz/journal`, `fuzz/pack`, `fuzz/btree_node`, `fuzz/manifest`,
+  `fuzz/quota_domain`, `fuzz/gc_root_list`). Each decodes a fuzzer
+  buffer through the *same* `tessera-core` code the kmod links;
+  invariant: never panic, never read/write out of bounds, never
+  infinite-loop — return a structured error instead. ASan + UBSan
+  builds in CI.
+- **Image fuzzing.** Mutate a known-good volume image, mount it
+  through the in-kernel ATF harness (§6.5) under KASAN; a mount of
+  a corrupt image must fail cleanly (`EINVAL`/self-heal per §3.4),
+  never panic the kernel or corrupt unrelated state.
+- **Cadence + gate.** Per-commit: short smoke (60 s/target,
+  regression corpus replay — every past crash is a permanent seed).
+  Nightly: 30 min/target with coverage-guided expansion. **Phase
+  exit (Phase 6 → 7, and any release tag) requires 24 h of
+  zero-new-crash fuzzing across all parser targets at the release
+  commit.** A new crash is a release blocker.
+- Corpus and minimized reproducers live in `fuzz/corpus/` and
+  `fuzz/regressions/`, versioned with the code.
+
+### 6.7 Adversarial fuzzing (nightly; Phase 6 exit gate)
+
+> Added 2026-06-10 (architecture review). Tiers 6.1–6.6 test
+> *correctness under honest use and bad luck*; this tier tests the
+> two surfaces where an **attacker** chooses the bytes. Tessera is
+> kernel-resident code reachable from every rank-5 jail — it is the
+> largest single piece of the platform's effective TCB, and that
+> claim has to be earned, not asserted.
+
+Two attack surfaces, two harnesses:
+
+- **Syscall surface (in-kernel, from jail rank).** Coverage-guided
+  syscall fuzzing against a mounted volume from an *unprivileged,
+  jailed* process — the exact position a hostile app holds.
+  syzkaller (FreeBSD support exists) with a Tessera-specific
+  syscall description set (write/mmap/rename/ioctl including the
+  quota and snapshot ioctls
+
 ## 7. Hardware acceleration strategy
 
 SHA-256 dominates the write path of a CAS-FS, so throughput here is the single biggest performance lever. This section codifies how Tessera exploits hardware acceleration without committing to brittle complexity in v1.

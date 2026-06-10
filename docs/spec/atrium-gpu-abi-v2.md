@@ -546,6 +546,42 @@ The Asahi v2 + Xe approach to hang recovery (per-firmware-context isolation, dev
 
 ---
 
+## 10.5 ioctl-surface hardening (added 2026-06-10; attestation gate)
+
+This ABI is reachable from any jail granted `gpu` — so the ioctl
+boundary is, alongside the Tessera VFS, the platform's primary
+kernel attack surface. Two adversarial inputs deserve explicit
+fuzzing, and passing them is part of the isolation attestation
+(gpu-isolation.md), not optional hardening:
+
+- **The ioctl structs themselves.** Every ioctl takes a
+  `struct_size`-prefixed struct with embedded user pointers,
+  counts, and fds (`atrium_gpu_submit` has `blob_ptr`/`blob_size`,
+  `in_dep_count`/`out_dep_count`, fd arrays). A syscall-level
+  fuzzer drives each ioctl with malformed sizes, overflowing
+  counts, hostile pointers, bad/foreign fds, and torn concurrent
+  calls. Invariant: structured error (`EINVAL`/`EFAULT`/`ENOTTY`),
+  never a panic, OOB access, integer-overflow allocation, or fd
+  confusion. Run under KASAN in the in-kernel test VM.
+- **The submit blob.** Although the blob is "opaque to the
+  kernel," the kernel's *basic structure validation* (§5.7) and
+  the vendor module's pre-dispatch checks are parsing
+  attacker-controlled bytes. The blob validator gets its own
+  fuzz target per vendor module; a malformed blob must be rejected
+  before dispatch or contained by VM/IOMMU, never escape the
+  submitting context (this is the I3/I4 invariant of
+  gpu-isolation.md, exercised adversarially rather than only by
+  the hand-written `test_gpu_isolation` cases).
+
+**Gate:** a kernel driver cannot reach `status = "production"` in
+the jaild attestation (gpu-isolation.md "Attestation freshness")
+until both fuzz targets have run 24 h with zero new crashes at the
+attested commit. A new crash blocks the attestation, which fails
+the `gpu` capability closed. Regression corpus is permanent: every
+past crash stays a seed.
+
+---
+
 ## 11. Mesa porting effort
 
 Estimated work to land Atrium support in Mesa upstream:

@@ -151,13 +151,52 @@ Portcullis must refuse to grant the `gpu` capability if:
 - The kernel driver bound to `/dev/atrium-gpu0` has no entry in
   `/etc/atrium/jaild.policy.toml`'s `[gpu_drivers.attested]` table; OR
 - The attested entry's `isolation_test_passed` field is `false`; OR
-- The kernel driver is in development (`status = "experimental"`).
+- The kernel driver is in development (`status = "experimental"`); OR
+- The bound driver's live build identity does not match the
+  attested commit (freshness rule below).
 
 This means: a freshly-bring-up kernel driver cannot accidentally
 grant GPU access to an app. The platform engineer has to explicitly
 flip the bit in the jaild policy file after running the isolation
 test to green. This is the single switch that gates direct-GPU
 deployment.
+
+### Attestation freshness (added 2026-06-10)
+
+An attestation that records a commit but is never checked against
+the *running* driver is a stale-attestation hole: someone updates
+the kmod, the isolation properties regress, and the green bit from
+the old build still grants `gpu`. So the attestation is **bound to
+the driver build**, and the binding is enforced, not advisory:
+
+- The kmod exposes its build identity — `dev.atrium_gpu.0.build_id`
+  (git commit baked in at compile time) and an `abi_rev` integer.
+- `isolation_test_commit` in the policy stanza is the commit the
+  test was run against. Before honoring `isolation_test_passed`,
+  jaild compares the bound driver's live `build_id` to
+  `isolation_test_commit`. **Mismatch ⇒ treat as unattested**:
+  refuse `gpu` / `gpu.scanout` and log the divergence. No silent
+  grant on a changed binary.
+- The harness writes its per-run record to
+  `/var/log/atrium/gpu-isolation-tests/<commit>.json` AND emits the
+  exact policy stanza for the engineer to paste — the log dir and
+  the policy file cannot drift apart by hand-editing.
+- Re-attestation is therefore mandatory on any kmod change that
+  alters `build_id`: re-run `test_gpu_isolation`, regenerate the
+  stanza. A driver bump with no re-attestation fails closed
+  (capability denied) — the safe direction.
+
+The reconciliation gap closes to one question jaild asks at grant
+time: "does the running driver's build match a green attestation?"
+A changed driver answers "no" until re-tested.
+
+Reaching `status = "production"` (as opposed to merely passing the
+hand-written `test_gpu_isolation` cases) additionally requires the
+ioctl-surface and submit-blob fuzz gate of
+[atrium-gpu-abi-v2.md](atrium-gpu-abi-v2.md) §10.5 — 24 h
+zero-new-crash at the attested commit. The deterministic isolation
+test proves the *designed* boundaries hold; the fuzz gate probes
+for the *undesigned* ones. Both are bound to the same commit.
 
 ```toml
 # /etc/atrium/jaild.policy.toml (excerpt)

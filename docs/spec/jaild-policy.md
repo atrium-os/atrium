@@ -58,7 +58,11 @@ allowed_addrs_on_lo0 = [...]
 status                = "production" | "experimental" | "broken"
 isolation_test_passed = true | false
 isolation_test_date   = "YYYY-MM-DD"
-isolation_test_commit = "<git hash>"
+isolation_test_commit = "<git hash>"  # the build the test ran against;
+                                      # jaild compares this to the bound
+                                      # driver's live dev.atrium_gpu.0.build_id
+                                      # and treats a mismatch as unattested
+                                      # (gpu-isolation.md "Attestation freshness")
 notes                 = "..."
 
 [services]
@@ -142,8 +146,13 @@ same release.
   managed by portcullisd, ephemeral.
 
 - **GPU isolation test results history** — the `gpu_drivers.
-  attested.*` stanza records the *current* attestation. Historical
-  test runs go to `/var/log/atrium/gpu-isolation-tests/`.
+  attested.*` stanza records the *current* attestation; historical
+  test runs go to `/var/log/atrium/gpu-isolation-tests/<commit>.json`.
+  The stanza and the log dir cannot drift: the harness emits the
+  paste-ready stanza alongside its log record, and jaild enforces
+  the attested commit against the bound driver's live `build_id`
+  at grant time (gpu-isolation.md "Attestation freshness"), so a
+  hand-edited or stale stanza fails closed rather than over-granting.
 
 These layers don't bleed into one another. Each has a single owner
 and a single audience.

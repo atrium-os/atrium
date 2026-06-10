@@ -146,14 +146,50 @@ malicious key.
 
 ### 3.4 TOFU vs. published keys
 
-First encounter with a publisher uses TOFU (trust-on-
-first-use): the key seen in the first TXT record is the
-key for that publisher. Subsequent encounters expect the
-same key (subject to §6 rotation flow).
+Subsequent encounters are well-protected: §6.2's
+chained-attestation property means an attacker who later
+injects a fake TXT record cannot rotate a publisher's key
+(no prior valid manifest endorsed the attacker's key). The
+**only** genuinely exposed moment is the *first* encounter —
+and this section tightens it rather than hand-waving "TOFU"
+across all of it.
 
-Platforms / users / orgs can pre-seed publisher keys to
-avoid TOFU for high-stakes publishers (banks, identity
-providers, OS vendors). Pre-seeding is described in §8.
+First-encounter trust is established by the strongest
+available basis, in order, and the resolver **records which
+basis was used** in the pin entry (so a later weaker
+encounter can never silently downgrade it):
+
+1. **Pre-seeded key** (§9) — no TOFU at all. Platform-default
+   for the OS vendor; user/org-configured for high-stakes
+   publishers (banks, identity providers).
+2. **DNSSEC-validated first-use** — when the `_atrium` TXT
+   record is covered by a valid DNSSEC chain, the
+   first-seen key is accepted as DNSSEC-anchored, not bare
+   TOFU. The attacker can no longer forge the first TXT
+   response (§3.3). Resolvers SHOULD prefer this and MAY be
+   configured (per §13 federation policy) to *require* it
+   for any publisher carrying app-install or payment
+   capabilities.
+3. **Bare TOFU** — only when neither of the above is
+   available. The first-seen key is pinned, the entry is
+   flagged `trust = "tofu-bare"`, and the basis is visible
+   to the user (a "this publisher's identity is unverified"
+   affordance in Forum/Curia, like a browser's
+   not-secure indicator).
+
+**Federation guidance.** In a federated/decentralized
+distribution context (the registry's peer/DHT tiers,
+atrium-pkg-registry.md), bare TOFU is the weak link, not the
+rotation flow. The recommended posture: app/content
+publishers that can mint capabilities ship a pre-seeded or
+DNSSEC-anchored key; the resolver's federation policy refuses
+to *install* (as opposed to merely resolve) from a
+`tofu-bare` publisher unless the user explicitly accepts the
+unverified-identity prompt. This keeps TOFU usable for
+low-stakes name resolution while denying it as a silent path
+to capability-bearing installs.
+
+Pre-seeding is described in §9.
 
 ### 3.5 Replacing DNS
 
@@ -547,11 +583,15 @@ for the simplest case.
   could ship a multi-MB manifest. Should manifests be
   split / chunked / Merkle-tree-shaped for large
   catalogues? Likely v2.
-- **TOFU policy strictness.** Default TOFU is convenient
-  but accepts the first observed key. Stricter
-  alternatives (transparency-log-style key publication,
-  certificate-transparency-analog) deserve evaluation —
-  probably overkill for v1.
+- **TOFU policy strictness.** §3.4 now grades first-use by
+  basis (pre-seeded → DNSSEC-anchored → bare TOFU) and
+  denies `tofu-bare` as a silent path to capability-bearing
+  installs. Remaining open: whether to add a
+  transparency-log-style key publication / CT-analog so even
+  bare-TOFU publishers gain after-the-fact auditability.
+  Probably v2; the registry's Sigstore/Rekor use
+  (atrium-pkg-registry.md) may cover the app-install case
+  without a Nomenclator-specific log.
 - **Multiple manifest sources.** A publisher could
   publish their manifest URL in multiple places (DNS,
   bundle, OOB). The resolver currently picks DNS first;
