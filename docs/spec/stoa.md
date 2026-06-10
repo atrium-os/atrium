@@ -83,6 +83,14 @@ Three binaries:
 
 ## 2. Auth handoff
 
+> 2026-06-10: this handoff is now the platform-wide pattern —
+> generalized in [aqueduct-remote.md](aqueduct-remote.md)
+> (`aqueduct-shell`, `OP_AQUEDUCT_HANDSHAKE`, session capability
+> sets). Stoa is its first instance and, in v1, the only user of
+> the raw-datagram (MAC'd UDP) integrity profile. `stoa-shell` may
+> become a thin wrapper over `aqueduct-shell` at implementation
+> time; the wire shape below is unchanged either way.
+
 Stoa **does not invent new credentials**. It rides FreeBSD's `sshd`
 for userauth and key management:
 

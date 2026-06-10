@@ -127,6 +127,8 @@ Built-in opcodes. Every aqueduct speaker implements these.
 | 0x06 | FETCH_BEGIN      | client→server  | response to FETCH_REQUEST      |
 | 0x07 | TESSERA_PROBE    | server→client  | "is H in your reachable Tessera CAS?" (advisory) |
 | 0x08 | EVICT_HINT       | client→server  | "you can drop H from your cache; I won't refer to it again" |
+| 0x09 | SESSION_HANDSHAKE | client→server | remote-session auth; first message on any non-`SO_PEERCRED` transport (aqueduct-remote.md §3) |
+| 0x0A | SESSION_ACCEPT   | server→client  | negotiated session caps + ledger scope; non-zero status = rejected |
 | 0xFF | NEGOTIATE_CAPS   | both           | exchange supported opcode_classes + version |
 
 Hash format: SHA-256 (32 bytes), matching Tessera. Hashes are
@@ -465,13 +467,18 @@ shapes. For all of these, the recommendation is:
   ivshmem rings. No design change is needed to support remote use;
   we just don't pay for crypto today.
 
-- **Remote authentication is a future-phase concern.** Local
-  authentication via `SO_PEERCRED` obviously does not work across
-  a network. For remote shapes, expect a future
-  `OP_AQUEDUCT_HANDSHAKE` extension that supports
-  `AuthMethod::CapToken(...)` (signed by portcullisd on the
-  originating machine) or `AuthMethod::Mutual(...)` (mTLS-shape
-  for QUIC transport). Not in the protocol today.
+- **Remote authentication is designed** (2026-06-10):
+  [aqueduct-remote.md](aqueduct-remote.md). Local `SO_PEERCRED`
+  does not cross a network; remote sessions use the generalized
+  Stoa handoff — one-time SSH userauth mints a session credential
+  (`K_sess = KDF(ssh_session_id ‖ service_nonce)`) carrying a
+  **session capability set**, presented via
+  `OP_AQUEDUCT_HANDSHAKE` (class-0 ops 0x09/0x0A). Default mint =
+  the user's full session trust domain; restricted mints
+  (view-only, single-app) are user-initiated capability
+  downgrades. `AuthMethod::CapToken` (portcullisd-signed,
+  federation) and `AuthMethod::Mutual` (mTLS mapping) remain
+  declared-but-deferred there.
 
 The composition principle is the same one HTTP used: don't embed
 TLS in HTTP, run HTTP over TLS. The wrapping layer composes cleanly,

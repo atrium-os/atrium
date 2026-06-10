@@ -90,8 +90,8 @@ Compare RDP/VNC: every frame is full-pixel-buffer compression, often 10–100 KB
 Practical considerations:
 
 - **Protocol layer**: cmd/comp on TCP (in-order, reliable). Input on UDP (low latency, drop-tolerant) or QUIC (one stream).
-- **Encryption**: TLS for TCP; QUIC has it built in.
-- **Authentication**: mutually-authenticated TLS or a token handshake.
+- **Encryption**: tunnel, don't embed — SSH channel / WireGuard / QUIC+TLS carry the crypto; the protocol stays plaintext inside ([aqueduct.md §7.2](../spec/aqueduct.md)).
+- **Authentication**: the aqueduct remote-session handoff ([../spec/aqueduct-remote.md](../spec/aqueduct-remote.md)) — one-time SSH userauth mints a session credential with a capability set (full session by default; view-only / single-app restricted mints for weak endpoints). A remote session is the authenticated user's session trust domain, never more trusted than a local jailed app.
 - **Bandwidth**: tens of KB/s steady state. Modems are fine.
 - **Latency**: dominated by RTT. The protocol adds nanoseconds.
 - **Backpressure**: ring queues + TCP backpressure. Server applies flow control.
