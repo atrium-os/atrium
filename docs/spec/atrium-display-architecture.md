@@ -144,7 +144,7 @@ functional drive.
   signals a flip-done fence (the *previous* FB is now free to reuse). The tear-
   free double-buffer loop in primitives we already have. *Today the in-fence
   signals instantly* because the GPU is a functional/instant model — that is the
-  seam GPU render-timing fills next (§9).
+  seam GPU render-timing fills next (§10).
 - **Scanout FB = a VRAM BO imported by fd** from the GPU driver (§1).
 - **Opaque mode programming.** Like the GPU's opaque command stream: the actual
   pixel-clock / PHY / mode-timing register programming stays kernel/firmware-
@@ -154,9 +154,105 @@ Essential objects (load-bearing for real hardware, kept from KMS): **connector**
 (a physical port — EDID, hotplug), **CRTC** (the scanout pipe — timings, drives
 an output), **plane** (primary / overlay / cursor layers). The **encoder** is
 collapsed into the CRTC for now (add it when modeling DP link training /
-bandwidth limits).
+bandwidth limits — §8).
 
-## 8. Energy lands here first
+## 8. The output topology — connectors, encoders, PHYs (HDMI / DP / USB-C)
+
+"How does the driver detect and redirect output to HDMI vs DisplayPort vs
+USB-C" is the output-side topology, and it is where the **queryable-capability /
+opaque-mechanism** split (the same one that keeps the GPU command stream out of
+the kernel) does the most work — because the interface zoo is enormously vendor-
+and protocol-specific and must *not* leak into the neutral ABI.
+
+**The real pipeline has two stages we collapsed.** Between the CRTC (§4, scanout/
+raster) and the connector (§5, EDID/DDC/HPD) sit:
+
+- an **encoder** — formats the CRTC's raw pixel stream into a wire protocol
+  (TMDS for HDMI/DVI; the packetized, link-trained DP stream for DisplayPort);
+- a **PHY** — the SerDes driving the actual lanes; a *shared, limited* resource
+  (e.g. 4 PHYs for 6 connectors).
+
+And the wiring between CRTCs, encoders, PHYs, and connectors is **not fixed — it
+is a crossbar/mux**. "Redirect output to a different interface" is fundamentally
+*reassigning that crossbar*: pointing a CRTC at a different connector through a
+different encoder/PHY, subject to constraints (limited PHYs, which encoder speaks
+which protocol, link bandwidth). Routing is an **assignment problem**, not a
+lookup.
+
+**The three interfaces differ in *detection* and *bring-up*, never in scanout:**
+
+- **HDMI** — TMDS. Detect via a dedicated **HPD pin** + EDID over **I²C DDC**
+  (exactly the `ddc_read` byte path the model already runs). Bring-up: set the
+  TMDS clock. Our `Connector` today is HDMI-shaped.
+- **DisplayPort** — a *trained packet link*. Detect via HPD + EDID/DPCD over the
+  **AUX channel** (not I²C). Bring-up: **link training** — negotiate lane count
+  (1/2/4) and rate over AUX, train CR + EQ, verify; a mode exceeding the trained
+  bandwidth *fails* (or needs DSC). Plus **MST**: one port fanning out to
+  *multiple* sinks via a hub/daisy-chain.
+- **USB-C** — a *connector*, not a protocol. It carries **DP Alt Mode** (DP over
+  the USB-C pins), negotiated by the **USB-C / Power-Delivery subsystem** over
+  the CC pins, which decides *whether* DP is present at all, the **orientation**
+  (reversible cable), and the **lane split** (4-all-DP vs 2-DP + 2-USB). The
+  GPU's DP output is then *muxed* onto the negotiated pins. So USB-C display
+  detection is a **cross-subsystem event** — PD says "a DP sink appeared on port
+  X, orientation Y, N lanes," and only then does the display driver link-train.
+
+**The neutral / opaque split (the answer to "redirect cleanly"):**
+
+- *Neutral (kernel ABI, queryable — what the compositor touches):* a connector
+  is a resource with a **type** (`HDMI`/`DP`/`USB-C`/`eDP`), an HPD state, and
+  EDID. The type is a queryable *attribute* (settings UI, output preference) — it
+  does **not** program the PHY. **HPD events** ride kqueue (the same `kevent()`
+  as vblank). The compositor issues an **atomic commit** ("CRTC0 → connector
+  (USB-C #2) at 1920×1080") — naming the *what*, never the encoder/PHY/link. A
+  connector's **mode list is already bandwidth-filtered**, so "does it fit the
+  link" is surfaced as "this mode exists or doesn't."
+- *Opaque (firmware / vendor display logic — never in the neutral ABI):* the
+  **encoder/PHY crossbar assignment**, the **protocol** (TMDS vs DP-link, link
+  training, AUX vs DDC, HDCP, CEC, DSC, MST stream allocation), and the **USB-C
+  mux / orientation / alt-mode** coordination.
+
+So **"redirect" = an atomic commit re-routing a CRTC to a different connector**,
+and the kernel+firmware silently reconfigure the crossbar and bring up the right
+protocol. An infeasible config (no free PHY, mode exceeds the link, USB-C not in
+DP alt-mode) **fails atomic-check**, and the compositor picks another. No
+`if (hdmi) tmds() else dp_train()` ever crosses the neutral boundary — the
+display analog of "no command IR in the kernel."
+
+**USB-C needs cross-subsystem plumbing — done the BSD-native way.** A
+DP-over-USB-C connector is **virtual until PD activates alt-mode**: (1) cable in
+→ the **Type-C/PD driver** negotiates over CC, enters DP Alt Mode, picks
+orientation + lane split, configures the **lane mux**; (2) PD publishes a
+**kernel hotplug event** ("connector X is now a DP sink + mux config") — the
+settled *no-udev, kernel-publishes-events* shape ([[feedback_bsd_devevents_shape]])
+— which the display driver subscribes to; (3) the connector materializes (its
+HPD asserts), the driver reads EDID over AUX and link-trains on the muxed lanes.
+The **mux is owned by the Type-C side, the DP link by the display side** — a
+clean capability/ownership split, not a monolith.
+
+**MST makes the connector set dynamic — and reintroduces the scheduler.** A DP/
+USB-C port under MST spawns **child connectors** (the chained sinks), each with
+its own EDID + CRTC, sharing one physical link's bandwidth by time-division. So
+the topology is *dynamic* (a hub plugs in → N connectors appear), and the link
+bandwidth is a **shared resource allocated among streams** — another instance of
+the federation shape ([[atrium-gpu-scheduler]]): a small bandwidth scheduler on
+the DP link, same "shared resource, per-claimant budget" form as the GPU/CPU/
+memory controllers.
+
+**What this earns the model (failure-fidelity):** once the encoder/PHY/link layer
+exists, the new referee faults are *mode-exceeds-link-bandwidth*, *no-free-PHY
+for this assignment*, and *flip to a USB-C connector whose alt-mode isn't active*
+— "the compositor requested a route the hardware can't honor," caught
+deterministically.
+
+**Scope.** `D-display-1` deliberately keeps **one HDMI-shaped connector** (DDC +
+HPD). Interface variety — connector `type` + transport (`Ddc` vs `Aux`), the
+encoder/PHY crossbar + a link/bandwidth model, USB-C alt-mode, and MST child
+connectors — is the natural *next* display milestone, sitting on this same
+deterministic substrate, where the headline new invariants are the three faults
+above.
+
+## 9. Energy lands here first
 
 Scanline-accuracy gives an exact per-frame VRAM-read cost
 (`width × height × bpp` fetched every refresh at the memory-controller energy
@@ -173,7 +269,7 @@ This is the concrete hook the energy router ([`feedback_energy_policy…`]) has
 waited for — the display is where the timing/energy model is *born*, because
 here the timing is externally observable (frames on a screen at a cadence).
 
-## 9. The staged consequence: GPU render-timing is next
+## 10. The staged consequence: GPU render-timing is next
 
 Scanline-accuracy surfaces a finding. The flip commits at
 `max(submit_time, fence_signal_time)`; the in-fence is the GPU render-done
@@ -191,7 +287,7 @@ follow-on that reuses the same virtual-time substrate to close the frame-pacing
 loop — and that is also the dispatch/draw cost model the energy router wants.
 **Decision: display first; GPU render-timing is the explicit next milestone.**
 
-## 10. Referee invariants (failure-fidelity)
+## 11. Referee invariants (failure-fidelity)
 
 - flip to a non-resident FB faults;
 - flip to a BO smaller than the mode faults;
@@ -201,7 +297,7 @@ loop — and that is also the dispatch/draw cost model the energy router wants.
 - a dropped (superseded) flip is *recorded*, never silent;
 - HPD-disconnect mid-scanout is a defined transition (black/last-frame), not UB.
 
-## 11. First milestone — `D-display-1`
+## 12. First milestone — `D-display-1`
 
 Single connector, single CRTC, primary plane. Encoder collapsed; overlays,
 hardware cursor, multi-monitor, tiling/compression, and VRR deferred.
@@ -215,7 +311,7 @@ hardware cursor, multi-monitor, tiling/compression, and VRR deferred.
    per-scanline FB-selection integration → the painted frame;
 3. the display register block the kmod programs (mode timing, FB base, flip
    trigger, DDC, vblank control);
-4. the §10 referee invariants;
+4. the §11 referee invariants;
 5. engine tests: exact tear-line, vsync-no-tear, judder count, dropped-flip.
 
 **QEMU device:** a display register block forwarding to the model (like the
@@ -230,13 +326,17 @@ painted frame`.
 **userspace test:** the path above end to end, asserting an exact tear line with
 vsync off and none with vsync on.
 
-## 12. Open questions (deferred, not blocking D-display-1)
+## 13. Open questions (deferred, not blocking D-display-1)
 
 - **kmod structure** — the §4.1 three-kmod split (pci / gpu / display) is now
   *justified*; pragmatically start the display in-tree and extract the kmod once
   the seam is real (the §4.2 file-split discipline).
-- **Encoder model** — collapsed now; needed when modeling DP link training /
-  link-bandwidth limits (a mode that exceeds link bandwidth should fault).
+- **Output topology (encoder / PHY / interface variety)** — the design is
+  settled in §8 (connector `type` + transport, the encoder/PHY crossbar, DP link
+  training + bandwidth, USB-C alt-mode cross-subsystem, MST child connectors);
+  *collapsed in the model* for `D-display-1` (one HDMI-shaped connector), built
+  as the next display milestone. New referee faults then: mode-exceeds-link-BW,
+  no-free-PHY, flip-to-inactive-USB-C-altmode.
 - **Multi-plane** — overlay + hardware cursor are real hardware compositing
   (an energy lever: skip GPU composition); additive on the per-scanline model.
 - **VRR** — additive once the timeline exists (vblank scheduled at the flip,
@@ -244,7 +344,7 @@ vsync off and none with vsync on.
 - **Displayed-frame readback ABI** — a debug surface for the in-VM path (the
   engine tests read the integrated frame directly).
 
-## 13. Summary position
+## 14. Summary position
 
 The display is a decoupled engine scanning out a VRAM BO shared by fd. The model
 that earns it is a **scanline-accurate raster simulator in deterministic
