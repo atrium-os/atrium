@@ -170,7 +170,9 @@
  */
 struct atrium_amd_dma_page {
 	void		*kva;
-	vm_paddr_t	 gpa;
+	vm_paddr_t	 gpa;		/* device-visible bus address */
+	bus_dma_tag_t	 tag;
+	bus_dmamap_t	 map;
 };
 
 /*
@@ -194,10 +196,8 @@ struct atrium_amd_vm {
 	struct atrium_amd_softc *sc;
 	struct file	*fp;		/* our own file (for KASSERT/debug) */
 	uint16_t	 vmid;		/* 1..15 */
-	void		*pdb_kva;	/* page-directory page */
-	vm_paddr_t	 pdb_gpa;
-	void		*pt_kva;	/* the single pre-allocated page-table page */
-	vm_paddr_t	 pt_gpa;
+	struct atrium_amd_dma_page pdb;	/* page-directory page */
+	struct atrium_amd_dma_page pt;	/* the single pre-allocated page-table page */
 	uint64_t	 next_va;	/* bump allocator within this VM */
 };
 
@@ -314,6 +314,9 @@ amd_pm4_type3_header(uint32_t opcode, uint32_t body_dwords)
 
 /* bo.c — internal DMA pages + fd-backed buffer objects */
 void	*amd_dma_alloc(struct atrium_amd_softc *sc, vm_paddr_t *gpa_out);
+int	 amd_dma_page_alloc(struct atrium_amd_softc *sc,
+	    struct atrium_amd_dma_page *p);
+void	 amd_dma_page_free(struct atrium_amd_dma_page *p);
 int	 amd_bo_create_fd(struct atrium_amd_softc *sc, struct thread *td,
 	    uint64_t size, uint32_t flags, int *out_fd);
 int	 amd_bo_fget(struct thread *td, int fd, struct file **out_fp,

@@ -11,35 +11,9 @@
 #include "atrium_gpu_amd_abi.h"	/* ATRIUM_GPU_BO_VRAM placement flag */
 
 /*
- * Allocate one page of DMA-able guest memory for internal use and register it.
- * Returns the kernel VA and, via *gpa_out, the guest-physical address the
- * device DMA-walks. (VM/no-IOMMU: gpa == vtophys; real silicon needs bus_dma.)
- */
-void *
-amd_dma_alloc(struct atrium_amd_softc *sc, vm_paddr_t *gpa_out)
-{
-	void *kva;
-
-	if (sc->n_dma >= ATRIUM_AMD_MAX_DMA)
-		return (NULL);
-	kva = contigmalloc(PAGE_SIZE, M_DEVBUF, M_WAITOK | M_ZERO, 0,
-	    BUS_SPACE_MAXADDR, PAGE_SIZE, 0);
-	if (kva == NULL)
-		return (NULL);
-	sc->dma[sc->n_dma].kva = kva;
-	sc->dma[sc->n_dma].gpa = vtophys(kva);
-	*gpa_out = sc->dma[sc->n_dma].gpa;
-	sc->n_dma++;
-	return (kva);
-}
-
-/* --- buffer objects: fd-backed, mapped into a VM --- */
-
-/*
- * bus_dmamap_load callback: record each page's bus address. With the BO tag's
+ * bus_dmamap_load callback: record each page's bus address. With a tag whose
  * maxsegsz == PAGE_SIZE the loader hands us one segment per page, so the GPUVM
- * can map a PTE per page (scatter-gather: the backing pages need not be
- * physically contiguous).
+ * can map a PTE per page (scatter-gather: backing pages need not be contiguous).
  */
 struct amd_bo_load {
 	bus_addr_t	*pages;
@@ -60,6 +34,82 @@ amd_bo_load_cb(void *arg, bus_dma_segment_t *segs, int nseg, int error)
 		l->pages[i] = segs[i].ds_addr;
 	l->npages = nseg;
 }
+
+/*
+ * Allocate one page of DMA-able memory through bus_dma(9) — the real-silicon
+ * path (IOMMU-ready bus address, not vtophys), used for every device-walked
+ * internal page (the IH ring and each VM's page-directory/page-table pages).
+ * Coherent + page-granular, so p->gpa is the page's bus address.
+ */
+int
+amd_dma_page_alloc(struct atrium_amd_softc *sc, struct atrium_amd_dma_page *p)
+{
+	struct amd_bo_load load;
+	bus_addr_t seg;
+	int err;
+
+	err = bus_dma_tag_create(bus_get_dma_tag(sc->dev), PAGE_SIZE, 0,
+	    BUS_SPACE_MAXADDR, BUS_SPACE_MAXADDR, NULL, NULL,
+	    PAGE_SIZE, 1, PAGE_SIZE, 0, NULL, NULL, &p->tag);
+	if (err != 0)
+		return (err);
+	err = bus_dmamem_alloc(p->tag, &p->kva,
+	    BUS_DMA_WAITOK | BUS_DMA_ZERO | BUS_DMA_COHERENT, &p->map);
+	if (err != 0) {
+		bus_dma_tag_destroy(p->tag);
+		p->tag = NULL;
+		return (err);
+	}
+	load.pages = &seg;
+	load.npages = 0;
+	load.error = 0;
+	err = bus_dmamap_load(p->tag, p->map, p->kva, PAGE_SIZE, amd_bo_load_cb,
+	    &load, BUS_DMA_NOWAIT);
+	if (err != 0 || load.error != 0 || load.npages != 1) {
+		bus_dmamem_free(p->tag, p->kva, p->map);
+		bus_dma_tag_destroy(p->tag);
+		p->kva = NULL;
+		p->tag = NULL;
+		return (err != 0 ? err : EIO);
+	}
+	p->gpa = seg;
+	return (0);
+}
+
+void
+amd_dma_page_free(struct atrium_amd_dma_page *p)
+{
+	if (p->kva != NULL) {
+		bus_dmamap_unload(p->tag, p->map);
+		bus_dmamem_free(p->tag, p->kva, p->map);
+		p->kva = NULL;
+	}
+	if (p->tag != NULL) {
+		bus_dma_tag_destroy(p->tag);
+		p->tag = NULL;
+	}
+}
+
+/*
+ * Allocate + register an internal DMA page (the IH ring). Returns the kernel VA
+ * and, via *gpa_out, the bus address the device DMA-walks.
+ */
+void *
+amd_dma_alloc(struct atrium_amd_softc *sc, vm_paddr_t *gpa_out)
+{
+	struct atrium_amd_dma_page *p;
+
+	if (sc->n_dma >= ATRIUM_AMD_MAX_DMA)
+		return (NULL);
+	p = &sc->dma[sc->n_dma];
+	if (amd_dma_page_alloc(sc, p) != 0)
+		return (NULL);
+	*gpa_out = p->gpa;
+	sc->n_dma++;
+	return (p->kva);
+}
+
+/* --- buffer objects: fd-backed, mapped into a VM --- */
 
 /*
  * Reclaim a BO: unmap every page from its VM, drop the VM reference, release the

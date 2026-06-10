@@ -78,7 +78,7 @@ amd_teardown(struct atrium_amd_softc *sc)
 		sc->cdev = NULL;
 	}
 	for (i = 0; i < sc->n_dma; i++)
-		free(sc->dma[i].kva, M_DEVBUF);
+		amd_dma_page_free(&sc->dma[i]);
 	sc->n_dma = 0;
 	if (sc->doorbell != NULL) {
 		bus_release_resource(sc->dev, SYS_RES_MEMORY,
@@ -238,4 +238,4 @@ static driver_t atrium_amd_driver = {
 
 DRIVER_MODULE(atrium_gpu_amd, pci, atrium_amd_driver, NULL, NULL);
 MODULE_DEPEND(atrium_gpu_amd, pci, 1, 1, 1);
-MODULE_VERSION(atrium_gpu_amd, 21);
+MODULE_VERSION(atrium_gpu_amd, 22);

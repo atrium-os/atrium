@@ -80,10 +80,8 @@ amd_vm_destroy(struct atrium_amd_vm *vm)
 	sc->vmid_bitmap &= ~(1u << vm->vmid);
 	sc->vm_count--;
 	mtx_unlock(&sc->lock);
-	if (vm->pt_kva != NULL)
-		free(vm->pt_kva, M_DEVBUF);
-	if (vm->pdb_kva != NULL)
-		free(vm->pdb_kva, M_DEVBUF);
+	amd_dma_page_free(&vm->pt);
+	amd_dma_page_free(&vm->pdb);
 	free(vm, M_DEVBUF);
 }
 
@@ -115,7 +113,7 @@ amd_vm_map(struct atrium_amd_vm *vm, uint64_t va, vm_paddr_t phys, int vram)
 	if (((va >> ATRIUM_AMD_PD_SHIFT) & ATRIUM_AMD_PT_MASK) != AMD_VM_PD_INDEX)
 		return (EINVAL);
 	pt_i = (va >> ATRIUM_AMD_PT_SHIFT) & ATRIUM_AMD_PT_MASK;
-	pt = (uint64_t *)vm->pt_kva;
+	pt = (uint64_t *)vm->pt.kva;
 	/* phys is a guest-physical (System) addr or a VRAM offset; the PTE_VRAM
 	 * bit tells the GMC which backing to walk. */
 	pte = ((uint64_t)phys & ~0xfffULL) | ATRIUM_AMD_PTE_VALID;
@@ -138,7 +136,7 @@ amd_vm_unmap(struct atrium_amd_vm *vm, uint64_t va)
 	if (((va >> ATRIUM_AMD_PD_SHIFT) & ATRIUM_AMD_PT_MASK) != AMD_VM_PD_INDEX)
 		return;
 	pt_i = (va >> ATRIUM_AMD_PT_SHIFT) & ATRIUM_AMD_PT_MASK;
-	pt = (uint64_t *)vm->pt_kva;
+	pt = (uint64_t *)vm->pt.kva;
 	mtx_lock(&sc->lock);
 	pt[pt_i] = 0;
 	amd_mmio_write32(sc, regTLB_INVALIDATE, 1);
@@ -166,26 +164,21 @@ amd_vm_create_fd(struct atrium_amd_softc *sc, struct thread *td, int *out_fd)
 	vm = malloc(sizeof(*vm), M_DEVBUF, M_WAITOK | M_ZERO);
 	vm->sc = sc;
 	vm->vmid = vmid;
-	vm->pdb_kva = contigmalloc(PAGE_SIZE, M_DEVBUF, M_WAITOK | M_ZERO, 0,
-	    BUS_SPACE_MAXADDR, PAGE_SIZE, 0);
-	vm->pt_kva = contigmalloc(PAGE_SIZE, M_DEVBUF, M_WAITOK | M_ZERO, 0,
-	    BUS_SPACE_MAXADDR, PAGE_SIZE, 0);
-	if (vm->pdb_kva == NULL || vm->pt_kva == NULL) {
+	if (amd_dma_page_alloc(sc, &vm->pdb) != 0 ||
+	    amd_dma_page_alloc(sc, &vm->pt) != 0) {
 		amd_vm_destroy(vm);
 		return (ENOMEM);
 	}
-	vm->pdb_gpa = vtophys(vm->pdb_kva);
-	vm->pt_gpa = vtophys(vm->pt_kva);
-	pde = (uint64_t *)((char *)vm->pdb_kva + AMD_VM_PD_INDEX * 8);
-	*pde = (vm->pt_gpa & ~0xfffULL) | ATRIUM_AMD_PTE_VALID;
+	pde = (uint64_t *)((char *)vm->pdb.kva + AMD_VM_PD_INDEX * 8);
+	*pde = (vm->pt.gpa & ~0xfffULL) | ATRIUM_AMD_PTE_VALID;
 	vm->next_va = ATRIUM_AMD_BO_VA_BASE;
 
 	/* Program this VMID's page-directory base into the device. */
 	mtx_lock(&sc->lock);
 	amd_mmio_write32(sc, regVM_CTX_SELECT, vmid);
 	amd_mmio_write32(sc, regVM_CTX_PT_BASE_LO,
-	    (uint32_t)(vm->pdb_gpa & 0xffffffff));
-	amd_mmio_write32(sc, regVM_CTX_PT_BASE_HI, (uint32_t)(vm->pdb_gpa >> 32));
+	    (uint32_t)(vm->pdb.gpa & 0xffffffff));
+	amd_mmio_write32(sc, regVM_CTX_PT_BASE_HI, (uint32_t)(vm->pdb.gpa >> 32));
 	mtx_unlock(&sc->lock);
 
 	err = falloc_noinstall(td, &fp);
