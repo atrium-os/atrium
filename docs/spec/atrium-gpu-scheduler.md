@@ -148,11 +148,13 @@ pay-for-mid-dispatch / hold) — threshold the controller's continuous output
 against the current (varying) cost.
 
 **Bend 2 — the GPU lives in a high-`L`, high-`R` corner of the same parameter
-space.** A dispatch in flight has *sunk work* (cycles already spent + the
-save/restore) weighing against preemption — physical inductance. The GPU is not
-a different model; it is the **same RLC tuned into high inertia, heavily
-damped, reluctant to switch.** Laminar's L/C/R tuning intuition transfers; you
-just sit in a different corner. The defining GPU property (expensive preemption)
+space.** A dispatch in flight has *sunk work* (cycles already spent) — reactive
+**inductance `L`**, returned if it finishes, wasted if preempted — and switching
+also burns the *dissipative* save/restore traffic — **resistance `R`** (§7 makes
+this split precise). Both weigh against preemption. The GPU is not a different
+model; it is the **same RLC tuned into high inertia, heavily damped, reluctant
+to switch.** Laminar's L/C/R tuning intuition transfers; you just sit in a
+different corner. The defining GPU property (expensive preemption)
 maps to a sensible region of a space we already understand, not new structure.
 
 ## 6. Deadlines: modulate the inertia, not the forcing
@@ -180,9 +182,12 @@ A *faster and better-damped* transition in one move — "snap to it without
 ringing." Overdriving the forcing on the original high-`L` system does the
 opposite (same sluggish `ω₀`, low `ζ`, overshoot).
 
-**GPU semantic (almost literal).** `L` *is* the reluctance — the work-in-flight
-inertia (sunk cycles + save/restore cost). "Reduce `L` near the deadline" reads
-as **"the deadline dissolves the reluctance to discard the running work."** Far
+**GPU semantic (almost literal).** `L` *is* the reluctance — the **sunk-work
+reactance**, the energy already invested in the running dispatch that preempting
+would waste. (The dissipative save/restore cost is `R`, paid when you actually
+switch — see §7.) "Reduce `L` near the deadline" reads as **"the deadline
+dissolves the reluctance to discard the running work"** — `L` drops while `R`
+(the switch cost you still pay) is unchanged. Far
 from vblank, high `L` is correct (sluggish, miserly, ignores short transients,
 won't thrash). As vblank nears, `L` ramps down and the GPU's characteristic
 reluctance-to-preempt evaporates; the controller decisively hands the GPU to the
@@ -209,41 +214,119 @@ tunable function.
 
 ## 7. Energy as the common currency → scheduler *is* the energy router
 
-`L` was already *encoding the save/restore energy cost* — the reluctance to
-preempt is "preempting costs save/restore Joules." So ramping `L` down as the
-deadline nears is exactly the statement **"the energy cost of a dropped frame
-has now exceeded the energy cost of the save/restore"** — the crossover,
-expressed as a change in dynamics, not a branch.
+The deadline trick was already an energy statement. `L` (sunk work) and `R`
+(save/restore) are both Joules; ramping `L` down near the deadline is exactly the
+moment **the dropped-frame Joules exceed the sunk-work you'd discard (`L`) plus
+the save/restore you'd burn (`R`)** — the crossover, expressed as a change in
+dynamics, not a branch.
 
-Push it all the way: **denominate every RLC element in Joules.**
+Push it all the way: **denominate every RLC element in Joules**, split by the
+circuit's own reactive-vs-dissipative distinction (the inductor and capacitor
+*store and return* energy; the resistor *dissipates* it):
 
-| element | role | energy meaning |
+| element | nature | energy meaning |
 |---|---|---|
-| `L` (inductance / inertia) | reluctance to change allocation | **save/restore Joules** — the switch energy cost |
-| `C` (capacitance / integral) | accumulated unfairness | **Joules of deserved-but-undelivered work** |
-| `R` (resistance / damping) | instantaneous switching cost | **marginal Joules to switch right now** at the current boundary |
-| forcing (error) | drive toward the setpoint | Joules needed vs delivered; a deadline's worth (dropped-frame Joules) |
+| `R` (resistor) | dissipative — burned, irreversible | **save/restore Joules per switch** — `wave_state(occupancy) × 2 × VRAM_pJ/byte`; position-dependent (~0 at a packet boundary, full mid-dispatch) |
+| `L` (inductor) | reactive — stored, returnable | **sunk-work Joules** — the in-progress dispatch's energy, *returned* if it finishes, *wasted* if preempted; grows as it runs, resets on completion |
+| `C` (capacitor) | reactive — accumulated | **energy-unfairness Joules** — `∫(deserved − delivered) energy` per queue, the restoring tension |
+| forcing | the drive | energy imbalance + a deadline's worth (dropped-frame Joules) |
 
-Then the controller has **no free tuning constants** — its dynamics fall out of
-the device's actual energy model (the per-op / save-restore / refresh energy
-profile). And the consequence: the scheduler and the energy router are not
+The reactive/dissipative split makes the deadline result exact: near vblank you
+drop **`L`** (stop valuing the in-progress work) while **`R` is unchanged** (you
+still pay the save/restore — you've just decided the deadline term justifies it).
+Save/restore never stops mattering; the sunk work does.
+
+**The denomination buys more than unification — it makes the scheduler
+*energy-fair*.** Because `C` is in *Joules of deserved-but-delivered work*, the
+controller shares the **energy budget**, not wall-clock time — the *correct*
+fairness on a power- or thermal-limited device, and where time-fairness is
+actively *wrong*: a jail running a hot power-virus kernel would get an equal
+*time* slice while eating a wildly unequal share of the *thermal/battery* budget,
+starving everyone of the scarce resource. Energy-fair charges a jail for the
+Joules it burns, so an inefficient/hot kernel automatically gets *less* time for
+the same energy share. On a laptop or phone that is the right metric, and it
+falls straight out of denominating `C` in energy. (It also settles "what about an
+inefficient kernel?" — you charge *consumed* Joules, not accomplished work, so
+wasting energy spends your own share.)
+
+Then the controller has **no free tuning constants** — `L/R/C` are *computed*
+from the device energy profile (§8), whose only inputs are measured device
+constants. The consequence: the scheduler and the energy router are not
 *coordinated* — they are the **same object**. "Coordinated, not coupled" becomes
 "same currency, separate budgets," which becomes "same object, per-resource
 budget."
 
-## 8. The federation
+## 8. The device energy profile that produces `L/R/C`
+
+`L/R/C` are *computed*, not tuned — from a small, **measured** device profile
+(the energy face of the deferred `CostModelBackend`/`DeviceProfiles`), integrated
+per-op over virtual time (`energy = power × time`, and the substrate gives time).
+Four constants:
+
+- **The memory-hierarchy energy gradient** — pJ/byte per level:
+  register/VGPR ≪ LDS ≪ L1/L2 ≪ VRAM ≪ host/PCIe. The *dominant*, most-structured
+  term; on a modern GPU the Joules are in data movement, not compute. It is the
+  energy face of the locality the cost model already tracks.
+- **Compute-op energy** — pJ per FLOP/ALU-op (process-node constant) × op count.
+- **Static / leakage power** — Watts idle → Joules/sec for being powered.
+- **A DVFS curve** — energy/op as a function of the `(V, f)` operating point
+  (the `C·V²·f` relationship).
+
+From these the model computes each modeled op's Joules, and `L/R/C` are read off
+the per-queue accumulations: `R` = `wave_state × 2 × VRAM_pJ/byte` at the current
+occupancy; `L` = the running dispatch's accumulated compute+memory Joules; `C` =
+`∫(fair-share − delivered)` energy. The display model's refresh/PSR/VRR Joules
+(display doc §8) feed the same per-queue counters.
+
+**DVFS is the second control output in the same currency.** The scheduler picks
+*who* runs; DVFS picks *how fast*. Near a frame deadline the currency drives
+*both* — drop `L` to switch fast **and** raise `f` to run fast, because the
+dropped-frame Joules now outweigh both the discarded sunk work and the higher
+`V²f` dynamic energy. Away from a deadline, **race-to-idle vs run-slow** falls out
+of the static:dynamic power ratio (high static → race to idle and power-gate;
+high dynamic → run slow and efficient). DVFS is either a second output of the GPU
+controller or its own federated RLC (a frequency controller), denominated
+identically — no new framework.
+
+**Thermal is the slow outer loop — and it is *literally* an RLC.** The energy
+budget itself is not fixed: the thermal/power envelope (TDP, battery, skin temp)
+sets it, and it *shrinks as the device heats*. A thermal system **is an RC
+circuit** — thermal capacitance (die mass) × thermal resistance (heatsink path),
+the textbook RLC application. So the thermal controller joins the federation as
+another RLC instance in the same currency, just with an enormous `C` (slow time
+constant). The whole thing is one **cascaded** energy-control system: fast
+resource schedulers (`L/R/C` in switching/work Joules) nested under a slow
+thermal controller (`R/C` in heat) that sets the budget they share — same math,
+same currency, separated only by time constant.
+
+**Why this is tractable.** The scheduler's *behavior* keys off the **ratios**
+(`L:R:C`, switch-cost vs deserved-work vs deadline-cost), not absolute Joules. So
+the model only needs the **gradient shape** right (register ≪ VRAM ≪ host;
+save/restore vs a wavefront's compute), not calibrated pJ — achievable
+clean-room, and robust because absolute error largely cancels in the ratios. The
+one remaining free *function* (the deadline `L`-ramp shape, §6) is itself the
+dropped-frame-Joule vs save/restore-Joule crossover, so it too is energy-derived.
+The model is where you prove the energy-derived `L/R/C` give stable, fair,
+deadline-meeting behavior — the Laminar RLC bench, now grounded in a device
+energy profile instead of hand-tuned constants.
+
+## 9. The federation
 
 One RLC controller per contended resource — **CPU (Laminar), GPU (this), memory
 bandwidth, display refresh** — each instantiating the *same* control framework
 with **resource-specific cost terms** (the GPU's being switch-cost +
 deadline-via-inertia), all denominated in the **shared energy currency**, and
-coordinated *only* by that currency, never shared state. Laminar's CPU RLC stays
-clean — **no renderer term** — consistent with the settled energy stance, now
-strengthened: not three schedulers that happen to talk, but one mathematical
-language in one currency. The energy router is not a fourth thing reading
-intent; it is the currency the controllers minimize.
+coordinated *only* by that currency, never shared state. Above them, the
+**thermal/power envelope** is the slow outer RLC (§8) — literally an RC circuit —
+setting the budget the fast inner controllers share: one *cascaded* energy-control
+system, fast resource loops under a slow thermal loop, separated only by time
+constant. Laminar's CPU RLC stays clean — **no renderer term** — consistent with
+the settled energy stance, now strengthened: not schedulers that happen to talk,
+but one mathematical language in one currency across one cascade. The energy
+router is not a separate thing reading intent; it is the currency the controllers
+minimize.
 
-## 9. Placement — where the controller runs, and the portable kernel
+## 10. Placement — where the controller runs, and the portable kernel
 
 "Scheduling logic" smears two things that want different homes:
 
@@ -333,7 +416,7 @@ the federation from "same idea" into "same code." Run it on the microcontroller
 for the common case; keep the shader-dispatch path for large-N scaling; do not
 hard-commit to shader-resident.
 
-## 10. Trust / TCB
+## 11. Trust / TCB
 
 - **Firmware joins the TCB** — it enforces per-VMID translation, performs
   save/restore, and runs the schedule. Same as real silicon (the MES enforces
@@ -348,7 +431,7 @@ hard-commit to shader-resident.
   dispatch with and without an injected preemption and diffs the output makes it
   a unit test.
 
-## 11. Modeling & verification (gpusim)
+## 12. Modeling & verification (gpusim)
 
 This is gated on **GPU render-timing** — work must take virtual time, or there is
 no contention to schedule — which sits on the **virtual-time substrate the
@@ -373,7 +456,7 @@ Tuning is done the Laminar way — shape the `L`-ramp + `R`/`C` against
 shares are fair, deadline misses are zero, and the switch rate does not thrash —
 but now with reproducible *frame-level* timing.
 
-## 12. Sequencing (the arc)
+## 13. Sequencing (the arc)
 
 ```
 display timing (D-display-1)   → lays the deterministic virtual-time substrate
@@ -385,12 +468,22 @@ display timing (D-display-1)   → lays the deterministic virtual-time substrate
 The display milestone is quietly the unlock for the entire timing / fairness /
 energy axis.
 
-## 13. Open questions
+## 14. Open questions
 
-- **The device energy profile that yields `L`/`R`/`C`** — save/restore bytes ×
-  memory Joule/byte; per-op "deserved work" Joules; refresh/PSR/VRR Joules
-  (from the display model, §8 of the display doc). The controller is only as
-  good as this profile.
+- **Calibrating the energy profile.** §8 gives the *structure* (the four
+  constants → `L/R/C`) and the ratios-not-absolutes argument; what remains is
+  getting the gradient numbers — clean-room estimates from public RDNA data,
+  validated against power telemetry / microbenchmarks where available, and
+  proven sufficient in the model. The controller is only as good as the ratios.
+- **Whose weight sets "deserved" — and how it composes with energy-fairness.**
+  Energy-fair shares *the budget*; per-jail *weights* (manifest baseline, WM
+  foreground priority, energy-router throttle) still scale each jail's share of
+  it. The open question is the composition: does a foreground app get **more
+  Joules**, or **more time at equal Joules** (i.e. is priority a budget multiplier
+  or a rate multiplier)? They differ sharply for a hot foreground app — budget-
+  multiplier lets it run the battery down; rate-multiplier caps its energy but
+  prioritizes its latency. Probably rate-multiplier with a budget ceiling, but it
+  needs deciding.
 - **Priority inheritance across fence dependencies** — the compositor (high
   priority) waits on a fence from a low-priority app's render; the fence must
   propagate a deadline term (an inertia reduction) onto the producer's queue, or
@@ -402,7 +495,7 @@ energy axis.
 - **Side channels** — a shared GPU leaks timing/contention signals between jails;
   hard on every GPU, deferred but real.
 
-## 14. Summary position
+## 15. Summary position
 
 GPU fairness is **space in the kernel (quotas), time in the firmware (time-slice
 + preemption) under revocable kernel admission and kernel-set policy**, backstopped
