@@ -127,7 +127,29 @@ in domain B:
 
 If the domains are equal, no quota update happens.
 
-### 3.6 Mount-time toggle for testing
+### 3.6 statfs is quota-scoped, not pool-scoped (security-relevant)
+
+For any path inside a quota domain, `VFS_STATFS`/`statfs(2)`
+reports **domain-logical** numbers, not the physical pool:
+
+- `f_blocks` = `limit_bytes / f_bsize`
+- `f_bavail` = `f_bfree` = `(limit_bytes − used_bytes) / f_bsize`
+  (clamped at the physical pool's free space, so a domain whose
+  limit exceeds remaining pool capacity doesn't promise bytes the
+  pool can't deliver)
+
+This is the same answer ZFS gives inside a `refquota`'d dataset,
+so `df` semantics are familiar. But it is **load-bearing for
+security, not just predictability**: the global physical
+free-space counter is a noise-free dedup existence oracle
+(tessera-fs.md §20.1 channel 1 — write a candidate file, fsync,
+re-read `df`; unchanged free space → those bytes already exist
+somewhere on the system). Every jail-visible mount MUST sit
+inside a quota domain; Portcullis provisions overlays accordingly
+(portcullis.md §4.1). A path *not* under any quota domain sees
+pool-physical statfs — host-only by policy.
+
+### 3.7 Mount-time toggle for testing
 
 Mount option `tessera.quota=disabled` skips all quota checks
 (useful for fsx/pjdfstest perf runs and for emergency operator
@@ -179,10 +201,20 @@ struct tessera_quota_domain {
     uint64_t used_inodes;
     uint64_t snapshot_reserve_bytes;
 
+    /* Dedup-domain policy (tessera-fs.md §20.2). */
+    uint8_t  dedup_policy;     /* 0 = global, 1 = deferred, 2 = salted */
+    uint8_t  pad[7];
+    uint8_t  domain_salt[32];  /* drawn at creation iff salted; else zero */
+
     /* Reserved for future evolution (HMAC slot; nested-domain pointer). */
-    uint8_t  reserved[64];
+    uint8_t  reserved[24];
 };
 ```
+
+`dedup_policy` and `domain_salt` are immutable after domain
+creation — re-salting or switching policy would orphan every
+already-stored chunk hash in the domain. Changing policy means
+creating a new domain and copying.
 
 Stored in the existing btree under a new key prefix (e.g.,
 `'Q' + domain_id`). Domain records are small (~128 B each); even
@@ -350,6 +382,12 @@ A small set on a directory fd:
 struct tessera_quota_create {
     uint64_t limit_bytes;
     uint64_t domain_id_out;     /* server fills in */
+    uint8_t  dedup_policy;      /* 0 global / 1 deferred / 2 salted;
+                                   immutable post-create (§4.2).
+                                   salt is drawn kernel-side from
+                                   arc4random — callers never supply
+                                   or read it. */
+    uint8_t  pad[7];
 };
 #define TESSERA_IOC_QUOTA_CREATE _IOWR('T', 32, struct tessera_quota_create)
 
@@ -396,6 +434,12 @@ kern.tessera.quota.events       # ring buffer of recent EDQUOT / overrun events
 
 Same shape as the existing `kern.tessera.metatrace_*` sysctls (per
 the snapshot-slice-4 work).
+
+These sysctls are **host-only**: inside a jail they return only
+the jail's own domain (or `EPERM` for the list/events nodes).
+Volume-wide usage data enumerates other domains' activity and
+feeds the dedup existence oracle (tessera-fs.md §20.1 channel 3);
+same rule as `tessera stat` (tessera-vfs.md §13.7).
 
 ### 6.3 CLI
 

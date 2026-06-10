@@ -319,6 +319,15 @@ pub struct PluginCtx<'a> {
 - `provision`: `mkdir -p <root>/jails/<jail>/<volume>` +
   `chown` + `chmod`. Tessera's CAS layer dedups underneath
   transparently; no special atrium-volumes work.
+- Once Tessera quota domains land (tessera-quotas.md), provision
+  additionally creates a quota domain rooted at the volume and
+  sets its `dedup_policy` (tessera-fs.md §20.2): `deferred` for
+  jail-writable volumes by default, `salted` when the service
+  manifest declares `privacy = true` on the volume, `global` only
+  for trusted-ingest trees (atrium-pkg app trees). The quota
+  domain also gives the jail quota-scoped `statfs`
+  (tessera-quotas.md §3.6) — jail-writable Tessera volumes MUST
+  NOT expose pool-physical free space.
 - `destroy`: `rm -rf <host_path>`; Tessera's CAS GC drops
   unreferenced chunks asynchronously.
 - `snapshot`: `mkdir <root>/.tessera/snapshots/<label>` (current

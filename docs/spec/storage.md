@@ -116,6 +116,12 @@ owner_uid = 88
 owner_gid = 88
 size_max  = "100GiB"     # backend honours where it can
 backend   = "fast-db"    # optional; references operator-named backend
+privacy   = false        # optional; true = opt out of cross-domain
+                         # dedup entirely (Tessera `salted` dedup
+                         # domain, tessera-fs.md §20.2). Default
+                         # false = `deferred` policy: dedup still
+                         # converges at rest, but the jail's writes
+                         # are never observably deduplicated.
 ```
 
 ### 3.2 `tmpfs`

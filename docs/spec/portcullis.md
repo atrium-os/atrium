@@ -389,8 +389,13 @@ config block).
 Because all app overlays are subtrees of the single shared
 Tessera volume (see §4.1), files written by one app's setup are
 content-addressed by Tessera. If app B's setup writes the same
-file (e.g., the same `libssl.so.3`), Tessera's pack registry
-finds the existing blob and dedupes — zero extra disk used.
+file (e.g., the same `libssl.so.3`), the bytes converge to one
+stored copy. Note the convergence is *at rest, after the next
+repack pass*, not at write time — overlays run the `deferred`
+dedup policy (§4.1, tessera-fs.md §20.2) so that an app cannot
+probe the system by watching whether its own writes deduplicate.
+The steady-state disk math is unchanged; only the moment of
+physical convergence moves.
 
 Portcullis doesn't need to know about pkg, the pool concept, or
 any specific package manager. The dedup is a property of the
@@ -710,7 +715,7 @@ architectural choice that makes cross-jail dedup work:
 - Tessera's CAS layer (pack registry, blob hashes, dedup) is
   per-volume.
 - Two subtrees of the same volume → blobs are shared via the same
-  pack registry → cross-jail dedup is automatic and total.
+  pack registry → cross-jail dedup is automatic.
 - Two separate volumes → blobs are independently stored → zero
   cross-volume dedup.
 
@@ -718,6 +723,26 @@ The shared volume lives at `/var/lib/atrium/store.tessera`
 (or wherever the host installer puts it). All jails' rootfs +
 overlay + (per-app pkg-installed files) are subtrees inside
 this single volume.
+
+Dedup is automatic but **not uniform** — it is per-dedup-domain
+policy (tessera-fs.md §20), because observable cross-jail dedup
+is an existence oracle (a jail could otherwise probe what files
+exist elsewhere on the system by writing candidates and watching
+free space / write timing). Portcullis maps the policy onto the
+three trees of §4.2:
+
+| Tree | Writer | Dedup policy |
+|---|---|---|
+| `apps/<id>/` | atrium-pkg / tessera-import (trusted, rank ≥3) | `global` — synchronous, total. This is where the N-apps-≈-1× disk thesis is won. |
+| `overlays/<id>/` | the jailed app (untrusted) | `deferred` (default) — content-independent write behavior; physical dedup converges at repack. `salted` iff the manifest sets `privacy = true` on the volume. |
+| `jails/<id>/` | mountpoint only | n/a (no persistent content) |
+
+Each overlay is provisioned inside its own quota domain
+(tessera-quotas.md), which simultaneously sets the dedup-domain
+boundary and gives the jail quota-scoped `statfs`
+(tessera-quotas.md §3.6) — a jail never sees the pool-physical
+free-space counter. atrium-volumes' tessera plugin sets
+`dedup_policy` at domain creation.
 
 ### 4.2 Per-jail layout (split across three trees)
 

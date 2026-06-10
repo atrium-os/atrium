@@ -130,7 +130,10 @@ Built-in opcodes. Every aqueduct speaker implements these.
 | 0xFF | NEGOTIATE_CAPS   | both           | exchange supported opcode_classes + version |
 
 Hash format: SHA-256 (32 bytes), matching Tessera. Hashes are
-**advisory pointers**, not capability tokens — see §6.
+**advisory pointers**, not capability tokens — see §6. Whether a
+receiver may *reveal* that it already has H (early `UPLOAD_ACK`,
+`TESSERA_PROBE` answers) is governed by the possession-scoping
+rule in §6.6.
 
 ### 3.4 Service opcode dictionaries
 
@@ -334,6 +337,54 @@ OS). Mitigations live in service policy:
 Out of scope for aqueduct itself; in scope for clipboard /
 notify policy.
 
+### 6.6 Dedup visibility is scoped to proven possession
+
+> Added 2026-06-10 after architecture review. Normative.
+
+The dedup *negotiation* is an existence oracle: if a server
+short-circuits an upload ("I already have H — skip the bytes"),
+the sender learns that someone else already transferred those
+exact bytes. Stated adversarially, "a glyph atlas uploads once
+for the whole desktop" reads "client A can detect what client B
+is displaying." Same attack family as the Tessera write-path
+oracle (tessera-fs.md §20); here it leaks *live* activity rather
+than at-rest content.
+
+The rule: **a receiver may exhibit dedup-visible behavior for H
+only toward peers whose trust domain has already proven
+possession of H.**
+
+- Per-connection, the receiver keeps a *possession ledger*: every
+  hash this peer has uploaded (`UPLOAD_FINISH` verified) or been
+  legitimately served (`FETCH_BEGIN` completed, or referenced in
+  a message the service itself addressed to the peer).
+- Early `UPLOAD_ACK` (acking an `UPLOAD_BEGIN` without requesting
+  the bytes) is permitted iff H is in that peer's ledger.
+  Otherwise the receiver MUST accept the full upload — even if
+  its CAS already holds H — and MUST NOT exhibit
+  hash-hit-dependent timing before the ACK.
+- Ledgers may be widened from per-connection to a *trust domain*
+  (e.g., all clients of one user session) by service policy.
+  Within one user's session the oracle is moot; across users or
+  across jails of different apps it is not.
+- `TESSERA_PROBE` answers and the `tessera-cas-read` zero-copy
+  path (§6.4) are already restricted to system services; those
+  services MUST NOT relay probe results to app-rank peers.
+- Internal storage dedup is unaffected: the CAS stores one copy
+  regardless. Only the *observable wire behavior* is scoped.
+
+Cost: the first upload of a popular blob happens once per trust
+domain instead of once per system. On local transports this is
+noise; on remote transports a session's clients share one domain,
+so the steady-state bandwidth story (mutations + per-session
+one-time uploads) is intact. This mirrors the industry response
+to the 2011 Dropbox cross-user dedup disclosure: keep storage
+dedup, drop cross-tenant *client-visible* dedup.
+
+The display dictionary (class 1) inherits this rule when Fresco
+migrates onto aqueduct: frescod's per-slot upload negotiation
+keeps a per-slot (or per-session) ledger, not a global one.
+
 ## 7. Threat model
 
 In scope:
@@ -344,15 +395,21 @@ In scope:
 - **Resource exhaustion (RAM)** — per-client cache budget caps,
   per-connection rate limits, oversized-payload rejection.
 - **Capability spoofing** — kernel-enforced via filesystem.
+- **Cross-domain existence disclosure via dedup** — added
+  2026-06-10: the possession-scoping rule (§6.6) makes dedup
+  negotiation non-observable across trust domains. The at-rest
+  half of the same oracle is handled by Tessera dedup domains
+  (tessera-fs.md §20).
 
 Out of scope:
 
 - **Service compromise** — if the clipboard daemon is exploited,
   it has access to clipboard contents. Standard. Mitigation:
   service-side hardening, capsicum where applicable.
-- **Side channels via timing** — can't prevent at the IPC layer;
-  service should be careful about user-data-dependent timing in
-  responses.
+- **Side channels via timing (general)** — beyond the specific
+  hash-hit timing covered by §6.6, the substrate can't equalize
+  service response timing; services should be careful about
+  user-data-dependent timing in responses.
 - **Rogue kernel** — aqueduct trusts the FreeBSD kernel.
 
 ### 7.1 Authentication is load-bearing; encryption is not (for local transports)

@@ -431,6 +431,8 @@ A file ≤ `min_chunk` is stored as `INLINE` (no chunking). A file > `min_chunk`
 
 Given the same file content and the same CDC parameters, a Tessera-FS implementation must produce the same manifest hash. This is required for cross-host content addressing and dedup.
 
+Determinism is also what makes dedup *observable* across trust boundaries; the confidentiality consequences and the per-domain policy that bounds them are specified in §20 (`salted` domains deliberately sacrifice this property).
+
 ## 7. Inodes
 
 The inode is the only on-disk POSIX-shaped object that mutates. An inode record is exactly 144 bytes. Inode-table B+tree leaves use the standard B+tree node format (§10) with `key_size = 8` (inode_no), `value_size = 144` (inode record). Subtracting the 32-byte node header, each leaf holds at most ⌊(4096 − 32) / (8 + 144)⌋ = 26 inodes.
@@ -846,7 +848,7 @@ Every received blob is hashed before storage. Hash mismatch is an immediate abor
 These do not block v1 implementation but are tracked for future spec revisions:
 
 - **Compression** of blob bytes (`compressed_size != 0` field is reserved). zstd-3 is the front-runner; per-pack-kind defaults likely.
-- **Encryption** at the blob layer, with convergent encryption keyed by content hash (so dedup survives encryption).
+- **Encryption** at the blob layer, with convergent encryption keyed by content hash (so dedup survives encryption). Caveat: convergent encryption preserves the dedup existence oracle by construction — see §20.3 for the constraints any v2 design must satisfy.
 - **Snapshot/clone** API at the inode level: a snapshot is just a pinned root-directory manifest. The on-disk shape needs no change; the user-facing API requires VFS support.
 - **Extended manifest types** for sparse files, holes, replication metadata.
 - **Multi-device volumes** (RAID-Z-style striping inside Tessera). Out of scope for v1.
@@ -912,3 +914,109 @@ Where Tessera diverges:
 - Unlike Nix, Tessera operates at the file/chunk level, not the package/derivation level.
 
 The combination — POSIX-shaped, content-keyed, cross-host portable, chunk-level dedup, integrated with capability-isolated jails — is what Tessera contributes that none of the references provide alone.
+
+## 20. Security considerations — the dedup existence oracle
+
+> Added 2026-06-10 after architecture review. Normative for v1.
+
+### 20.1 The threat
+
+Cross-domain dedup is observable, and observability is an
+**existence oracle**: a writer who can detect whether its own
+write was deduplicated learns that *someone else on the system
+already stores those exact bytes*. This is the classic CAS/dedup
+side channel (Harnik, Pinkas, Shulman-Peleg, *Side Channels in
+Cloud Services: Deduplication in Cloud Storage*, IEEE S&P
+Magazine 2010; the same family as KSM memory-dedup attacks).
+
+CDC chunking makes confirmation strong: with a 16 KiB min chunk,
+a low-entropy secret embedded in a known template (a config file
+with a password field, a document with a known letterhead) is
+brute-forceable candidate-by-candidate. Concrete attacks from an
+unprivileged jail:
+
+- "Is app X installed?" — probe chunks of its binary.
+- "Does any user possess this exact document / version?"
+- Dictionary attack on a secret inside a known file shape.
+
+The observation channels, strongest first:
+
+1. **Physical free space** (`statfs`). Write a candidate, fsync,
+   re-read free space. Unchanged → dedup hit. Noise-free.
+   Closed by quota-scoped statfs (tessera-quotas.md §3.6).
+2. **Write/fsync timing.** A synchronous-dedup hit skips the
+   pack append; latency is content-dependent. Closed by the
+   `deferred` policy below.
+3. **Volume-wide counters** (`tessera stat` dedup ratio, blob
+   count; quota sysctls). Closed by restricting these to the
+   host (tessera-vfs.md §13.7, tessera-quotas.md §6.2).
+
+Note what is *not* threatened: content confidentiality. A hash
+never grants access to bytes (aqueduct.md §6.2); the oracle
+leaks one bit — existence — per probe. That bit is enough to
+matter for Atrium's stated audiences (secure workstations,
+license-strict orgs, journalists' sources).
+
+### 20.2 Design: dedup domains
+
+The resolution rests on one observation: **the disk-cost thesis
+("N jailed apps ≈ 1× storage") is won entirely on trusted-ingest
+content** — app trees written by atrium-pkg / tessera-import,
+where the content is public-ish (binaries, libraries, assets)
+and global synchronous dedup is both safe and maximally
+valuable. Per-jail overlays — where untrusted writers put user
+data, i.e. where the secrets live — contribute marginal
+cross-jail dedup in legitimate use.
+
+So dedup becomes a **per-domain policy**, not a universal CAS
+property. A *dedup domain* is a directory tree with one of three
+policies (the domain boundary deliberately coincides with the
+quota-domain boundary, tessera-quotas.md §4.2 — one record, one
+tree-attachment mechanism):
+
+| Policy | Write path | Cross-domain dedup | Oracle exposure | Intended use |
+|---|---|---|---|---|
+| `global` | synchronous: registry hit skips the append | total, immediate | full (mitigated only by statfs/counter scoping) | trusted-ingest trees: `/var/lib/atrium/apps/`, OS images. Writers are rank ≥3 (atrium-pkg, tessera-import). |
+| `deferred` (default for overlays) | **append-anyway**: blob bytes are written unconditionally; the pack-registry insert that finds an existing entry for the hash keeps the existing entry and marks the new extent dead | total *at rest*, converged by the next repack pass (§11, tessera-vfs.md §13.6) | timing + free-space deltas are content-independent at observation time; residual channel is repack-cadence-granular and noisy | per-jail overlays, user home volumes |
+| `salted` | chunk hash is `SHA-256(domain_salt ‖ content)`; 32-byte salt drawn at domain creation, stored in the QuotaDomain record | none (by construction) | none | opt-in high-sensitivity volumes (`privacy = true` in the volume manifest) |
+
+Notes:
+
+- `deferred` requires **no format change**: duplicate appends are
+  ordinary blobs whose registry insert loses the race; the dead
+  extent is reclaimed by the existing repack machinery. Manifests
+  reference content by hash, so convergence never rewrites a
+  manifest. The cost is transient double storage bounded by
+  repack cadence.
+- `deferred` write paths MUST NOT short-circuit on a registry
+  hit, MUST NOT skip journal/pack I/O on a hit, and SHOULD avoid
+  any hit-dependent branch with measurable latency before the
+  fsync completes. The registry consultation itself can move
+  entirely to repack time.
+- `salted` breaks cross-host content addressing and diff-stream
+  dedup (§16) for that domain — stated and intended. The HAVE
+  bloom (§16.3) of a salted domain reveals nothing about other
+  domains.
+- Snapshots inherit the domain policy of the tree they pin.
+
+### 20.3 Interaction with future encryption (v2)
+
+Convergent encryption (§17) keyed purely by content hash has
+exactly this confirmation-of-content weakness as its *known
+fundamental property* — it would reintroduce the oracle at the
+crypto layer. Any v2 encryption design MUST compose the domain
+salt into the key derivation for `salted` domains, and SHOULD
+treat "convergent across domains" as a per-domain opt-in
+equivalent to `global`.
+
+### 20.4 What v1 explicitly accepts
+
+- `global`-domain probing remains possible for anyone who can
+  write into a `global` domain. Writers there are trusted system
+  components by construction; the policy file that grants a jail
+  write access to a `global` domain is the security statement.
+- Repack-cadence inference against `deferred` domains (watch
+  global free space recover after repack). Coarse, noisy,
+  host-schedulable; documented residual risk.
+- Page-cache sharing of legitimately shared files (standard VM
+  behavior on every OS; not a CAS property).

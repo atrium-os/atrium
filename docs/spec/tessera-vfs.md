@@ -633,6 +633,8 @@ A daemon variant, `tessera-scrubd`, runs scheduled scrubs. Default policy: full-
 
 `tessera stat <mount>` emits a JSON document describing volume state: blob count, pack count, total bytes, dedup ratio, free-extent fragmentation, journal head/tail, current generation. Suitable for monitoring integrations.
 
+Host-only: the backing ioctl returns `EPERM` when the caller is jailed. Volume-wide blob counts and the dedup ratio are a direct read of the dedup existence oracle (tessera-fs.md §20.1 channel 3) — a jail must not be able to observe whether *other* domains' writes deduplicated. Jailed monitoring uses the per-domain quota query (tessera-quotas.md §6.1) instead.
+
 ### 13.8 tessera-debug
 
 `tessera-debug <device>` is a low-level inspection tool: dumps superblocks, reads the inode table B+tree, parses pack headers, displays manifest contents. Read-only; intended for development and post-mortem analysis. Not safe to run on a mounted volume against the live device, but safe against a snapshot or a copy.
