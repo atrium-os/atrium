@@ -820,12 +820,15 @@ Answer: **no, never accidentally.** The mechanics:
 |---|---|---|---|
 | App A jail stopped (`jail -r`) | Unmounted | Persists in Tessera | Unchanged (A still references) |
 | App A jail re-launched | Re-mounted | Same files visible | Unchanged |
-| App A uninstalled (`portcullis remove`) | Already stopped | Deleted (subtree removed from Tessera) | Decrement; zero-ref blobs become GC-eligible |
-| App B uninstalled later | — | Deleted | Refs reach 0 for blobs only B held → GC eventually reclaims |
+| App A uninstalled (`portcullis remove`) | Already stopped | Deleted (subtree removed from Tessera) | Blobs reachable only via A's manifests become GC-eligible |
+| App B uninstalled later | — | Deleted | Blobs reachable only via B's manifests → GC eventually reclaims |
 
-The key invariant: **Tessera GC only touches blobs whose refcount
-reaches zero.** A blob still referenced by ANY live inode (in any
-subtree on the volume) cannot be reclaimed. So:
+The key invariant: **Tessera GC only reclaims blobs unreachable
+from every live inode's manifest and every pinned GC root** —
+mark-sweep reachability, not on-disk refcounts (tessera-fs.md
+§11/§15; the observable semantics are refcount-like, the
+mechanism is not). A blob still reachable from ANY live inode (in
+any subtree on the volume) cannot be reclaimed. So:
 
 - Stopping a jail = unmounting a view; the underlying data is
   unchanged. Other jails are unaffected.

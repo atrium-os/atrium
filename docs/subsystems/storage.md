@@ -19,10 +19,10 @@ This is the property that makes "every app is its own jail with its own complete
 | snap | per-snap | No dedup across snaps. |
 | Nix store | derivation-level (~package) | Whole packages are addressed; sharing at package boundary, not file. |
 | Guix store | same as Nix | |
-| Karythra CAS-FS | **file-level** | Identical files share storage regardless of containing package. |
-| **Atrium / Tessera** | **file-level** | Same. Sourced from Karythra, ported to FreeBSD. |
+| Karythra CAS-FS | file-level | Identical files share storage regardless of containing package. |
+| **Atrium / Tessera** | **chunk-level (CDC)** | FastCDC content-defined chunks, 64 KiB average (tessera-fs.md §6.5); descends from Karythra, ported + extended on FreeBSD. |
 
-File-level dedup is the right granularity for jail-per-app distribution: two apps shipping the same `libc.so.7` from the same FreeBSD release share the bytes; two apps shipping different `libc.so.7` builds (e.g. one with debug symbols) get different blobs and use proportional space.
+Chunk-level dedup subsumes file-level (identical files chunk identically) and additionally shares partial overlap: two apps shipping the same `libc.so.7` share all bytes; two shipping *slightly different* builds share the unchanged chunks. Below the chunk level, [tessera-binsplit](../spec/tessera-binsplit.md) (D1.7) adds **function-granularity** dedup of ELF binaries — 1.89× aggregate compression measured across 9 Atrium binaries under a pinned toolchain.
 
 ## Architecture
 
@@ -57,11 +57,33 @@ File-level dedup is the right granularity for jail-per-app distribution: two app
 └────────────────────────────────────────────────────────────────┘
 ```
 
+> **Updated 2026-06-10 — the diagram above is the original D1.5
+> *plan* (symlink mosaic), kept for historical context. What
+> shipped is a real in-kernel POSIX filesystem, `tessera_fs.ko`:**
+> dual-superblock atomicity, journaled group-commit fsync,
+> immutable CDC-chunked pack files + hash-keyed manifests, with
+> the inode table as the only mutable layer. Full POSIX
+> (pjdfstest sweep), mmap/exec, snapshots via
+> `/.tessera/snapshots/<gen>/`, background repack; steady-state
+> performance matches/beats ZFS on multi-write fsync. There is no
+> symlink indirection and no FUSE — jails mount subtrees of one
+> shared volume and see an ordinary filesystem; dedup happens in
+> the CAS layer underneath. GC is **mark-sweep reachability**
+> over live inodes' manifests + pinned GC roots (tessera-fs.md
+> §11/§15) — no on-disk refcounts. Dedup is **per-domain policy**
+> (global / deferred / salted, tessera-fs.md §20) and jails see
+> quota-scoped `statfs` (tessera-quotas.md §3.6), which together
+> close the dedup existence oracle. Normative specs:
+> [tessera-fs.md](../spec/tessera-fs.md),
+> [tessera-vfs.md](../spec/tessera-vfs.md),
+> [tessera-quotas.md](../spec/tessera-quotas.md),
+> [tessera-impl.md](../spec/tessera-impl.md).
+
 Per-jail writable layer:
 
-- Read-only base = CAS-backed tree.
-- Writable overlay (per-jail, on disk) for user-mutable paths: `~/Documents`, `~/.config/<app>`, etc.
-- Modeled with `nullfs` + `unionfs` in FreeBSD; each layer is its own mount.
+- Read-only base = the app's tree under `/var/lib/atrium/apps/`.
+- Writable overlay per jail under `/var/lib/atrium/overlays/` (its own dedup + quota domain).
+- Composed with `nullfs` + `unionfs`; all trees are subtrees of the same Tessera volume (portcullis.md §4).
 
 ## Operations
 
@@ -71,9 +93,15 @@ Per-jail writable layer:
 - **Boot a fresh app instance.** `nullfs` + `unionfs` the mosaic into a jail; jail starts; app runs.
 - **GC.** Walk all mosaics; mark every tessera referenced; sweep unreferenced. Probably daily-cron, configurable.
 
-## Implementation strategy (D1.5)
+## Implementation strategy (D1.5) — historical
 
-Phased approach:
+> Outcome 2026-06-10: the phased plan below was overtaken — D1.5
+> went **directly to the in-kernel filesystem** (Phase 3 shape,
+> reimplemented from the Karythra reference rather than ported
+> wholesale) per the POC priority of doing it right the first
+> time. Phases 1–2 never shipped. Kept for the record of why.
+
+Phased approach (as originally planned):
 
 ### Phase 1 — Symlink-based store in userspace (1 month)
 
@@ -122,14 +150,20 @@ Distribution channels:
 - **Graphics.** Fresco's content-addressed in-memory store and Tessera share the SHA-256 abstraction. A texture uploaded by app A and stored on disk can be referenced by hash in protocol traffic without re-uploading. Cross-process, cross-machine: same property.
 - **Updates.** Atomic; old tree stays on disk until GC. Failed update = old tree still resolves. Rollback = repoint symlink.
 
-## Open questions
+## Open questions (status 2026-06-10)
 
-- **GC policy.** When to reclaim unreferenced tesserae? Conservative (24h after last reference)? Or daily-cron?
-- **Capacity.** A 200 GB Tessera store can hold a lot, but eventually fills up. What's the eviction policy when "full"? LRU on access time?
-- **Tessera size.** Hashing per-file works for normal sizes (< MB). Multi-GB files (game assets, ML models) need chunking. Defer; not v1 concern.
-- **Atomicity.** Mosaic builds need to be atomic w.r.t. the jail's view. Probably stage in a shadow mosaic, atomic rename.
-- **Fragmentation.** The store is a flat directory of hashes. Lots of small files. UFS handles it OK; ZFS even better. Worth measuring.
-- **Trust.** The store's bytes are bit-perfect; tampering changes hashes. But the registry's manifest signing is a separate concern (Opifex). PKI design is a follow-on.
+Resolved by the shipped specs:
+
+- ~~**GC policy.**~~ Mark-sweep with pinned GC roots + expiry (tessera-fs.md §11/§15); `tessera repack --gc/--full/--aggressive` (tessera-vfs.md §13.6).
+- ~~**Tessera size / chunking.**~~ FastCDC content-defined chunking from day one, 64 KiB average (tessera-fs.md §6.5).
+- ~~**Atomicity.**~~ Manifest swap is atomic by construction; journal + dual superblock (tessera-fs.md §1, §4).
+- ~~**Fragmentation.**~~ Pack files (not a flat hash directory) + free-extent map + background repack (tessera-fs.md §5, §9).
+- ~~**Trust / signing.**~~ Registry-of-manifests + Sigstore transparency log ([atrium-pkg-registry.md](../spec/atrium-pkg-registry.md)).
+
+Still open:
+
+- **Capacity / eviction when "full".** Quotas bound per-domain use (tessera-quotas.md), but a pool-level eviction/pressure policy (which snapshots decay first, operator alerts) is unspecified beyond snapshot log-decay retention.
+- **Cross-volume / at-rest encryption layering** (GELI vs blob-layer; see tessera-fs.md §17 and the §20.3 oracle constraint on convergent encryption).
 
 ## What this gives the platform
 

@@ -8,7 +8,7 @@ Three layers, each with its own scope and ABI.
 
 ### Layer 1 — Fresco protocol (userspace ↔ userspace, app ↔ server)
 
-Retained-mode, content-addressed scenegraph protocol. Already implemented and stable; documented in `fresco-server/src/command/protocol.rs`, `libfresco/src/protocol.h`. Wire-format spec freezing is a D7 task.
+Retained-mode, content-addressed scenegraph protocol. Already implemented and stable; normative spec at [../spec/wire-format.md](../spec/wire-format.md) (v0.1; freeze for D2 at rollout M1, full standardization at D7). Reference implementations: `fresco-server/src/command/protocol.rs`, `libfresco/src/protocol.h`.
 
 Salient properties:
 
@@ -50,38 +50,25 @@ Each is fronted by a per-vendor driver: `atrium-virtio-gpu`, `atrium-mali`, `atr
 
 ## Why this is human-scale work (replacing linuxkpi)
 
-Replacing linuxkpi+drm-kmod **with Vulkan-feature-parity native drivers** is millions of LoC per GPU. Nobody is going to do that.
+> Restated 2026-06-10. The original (D0-era) version of this section argued the whole stack was small because "fresco-server is the only GPU consumer, fixed shader set, no shader compiler, no buffer sharing." The platform has since grown a Vulkan-class third-party path (aqueduct-gpu, Tier-2, atrium-mesa), so the *userspace* surface is no longer tiny. The human-scale claim survives because it was always really about the **kernel** boundary — restated precisely below.
 
-Replacing it **with what fresco-server actually needs** is a much smaller surface. The server requires:
+Replacing linuxkpi+drm-kmod **with Vulkan-feature-parity native kernel drivers in the Linux DRM shape** is millions of LoC per GPU. Nobody is going to do that.
 
-1. Allocate GPU-visible memory (one ioctl + mmap).
-2. Submit a command stream (one ioctl).
-3. Wait for completion (kqueue integration).
-4. Modeset (handful of ioctls).
-5. Get interrupts as kqueue events.
+Atrium's resolution splits the problem across the kernel/userspace fault line:
 
-That's it. ~5 ioctls + kqueue. Not a million-line DRM compatibility shim.
+- **The kernel ABI stays small and vendor-neutral** ([../spec/atrium-gpu-abi-v2.md](../spec/atrium-gpu-abi-v2.md)): seven fd-backed object types (device, VM, BO, queue, timeline syncobj, share handle, event fd), VM_BIND, **opaque POD-blob submit** (the kernel never parses command streams), kqueue delivery, optional user-mode doorbell queues as capability grants. A per-vendor kernel module is explicit-state-machine C with linear control flow — atrium-gpu-amd targets **~6–8K LoC for the GPU module** ([../spec/atrium-gpu-amd-design.md](../spec/atrium-gpu-amd-design.md)). The display engine module is the bigger unknown (display is the largest part of vendor DRM drivers); the scanline-accurate device model in [../spec/atrium-display-architecture.md](../spec/atrium-display-architecture.md) exists to de-risk exactly that.
+- **The userspace complexity is inherited, not authored.** The atrium-mesa fork (D5) keeps Mesa's Vulkan drivers and compiler stack — ~10 engineering-years of GPU-compiler IP under MIT — with libdrm coupling replaced by Atrium GPU ABI calls, running at build/install time and inside trusted daemons, never as a per-app runtime driver instance.
+- **No DRM framework in the kernel.** No GEM, no TTM, no KMS helper stack, no connector/encoder/CRTC midlayer. The ABI is a documented contract (ioctl numbers + structs), not shared kernel code. Cross-process / cross-device buffer sharing exists but as a *vendor-neutral fd* (`share_fd`, dma-buf-equivalent), and display modesetting is an atomic-commit ABI on its own cdev — both specified as contracts, not frameworks.
+- **No per-app shader compilation at runtime.** All shaders — frescod's internal set and third-party SPIR-V bundles alike — are AOT-compiled at install time (jailed compiler sub-process; [../spec/tier2-renderer.md](../spec/tier2-renderer.md)) with an on-demand cold path. No JIT in the hot path, no app-supplied shaders inside the scene server's trust boundary.
 
-Why so much less:
+So the per-vendor *kernel* work is months, not decades; the userspace Vulkan stack is a pruning-and-retargeting of Mesa, not a rewrite.
 
-- **No userspace driver per process.** Mesa-equivalent doesn't exist in this stack — fresco-server is the only consumer. No need for shared shader compiler, GLX/EGL plumbing, libdrm context juggling.
-- **No GEM / dma-buf.** Memory objects don't need to cross process boundaries; the server allocates, the server uses.
-- **No KMS atomic modesetting framework.** Direct page-flip ioctl is fine — server is the only entity that programs displays.
-- **No DRM connector / encoder / CRTC abstraction.** Talk directly to the hardware's display engine.
-- **No shader compiler.** Server pre-compiles a small shader set at startup; no per-app shader compilation.
+## Atrium GPU ABI
 
-A "Fresco-sufficient" driver for one GPU family is on the order of **10–50k LoC**, not millions. That's months of focused work, not decades.
+Two generations:
 
-## D0 — Atrium GPU ABI design
-
-Specced in detail in [../spec/gpu-abi.md](../spec/gpu-abi.md). Twelve ioctls covering:
-
-- Buffer object allocation / free / mmap.
-- Command-stream submission with opaque u64 fence ids.
-- Modesetting (enumerate displays, set mode, page flip).
-- vblank + fence completion delivered via `kqueue`.
-
-Constants are prefixed `ATRIUM_GPU_*` (e.g. `ATRIUM_GPU_IOC_ALLOC`) and live in `<atrium/gpu.h>`. Each native driver implements the full set for its hardware.
+- **Bring-up ABI** ([../spec/gpu-abi.md](../spec/gpu-abi.md)) — the original D0 twelve-ioctl set (int handles, `WAIT_FENCE`); what `atrium-virtio-gpu` shipped against. Constants prefixed `ATRIUM_GPU_*` in `<atrium/gpu.h>`.
+- **ABI v2** ([../spec/atrium-gpu-abi-v2.md](../spec/atrium-gpu-abi-v2.md)) — the convergence target: fd-as-handle (Capsicum-clean, `SCM_RIGHTS`-shareable), explicit per-process GPU VM + VM_BIND, timeline-only sync with kqueue event fds, opaque submit blobs, firmware scheduling, energy telemetry. The bring-up ABI's `SET_COMPUTE`/`SET_DRAW`-style ops fold into the opaque submit blob as drivers converge.
 
 ## Backend strategy by target
 
@@ -98,43 +85,51 @@ Constants are prefixed `ATRIUM_GPU_*` (e.g. `ATRIUM_GPU_IOC_ALLOC`) and live in 
 
 Until each target has a native driver, that hardware uses the **Vulkan-via-linuxkpi fallback** — fresco-server uses linuxkpi+amdgpu+Vulkan as a transitional path. This is **not** the architectural target, but it lets users with covered-only-by-linuxkpi hardware run Fresco today.
 
-Over time, the linuxkpi fallback shrinks as native drivers cover more hardware. Eventually it goes away.
+Over time, the linuxkpi fallback shrinks as native drivers cover more hardware. It is excised at D5 (atrium-mesa + atrium-gpu-amd) — drm-kmod is the runtime's only GPL dependency and is grandfathered exactly until then ([../LICENSING-POLICY.md](../LICENSING-POLICY.md)).
 
-## What's not Vulkan (and why it's fine)
+## Where Vulkan fits (updated 2026-06-10)
 
-The Fresco server-internal GPU backend is **not** a Vulkan-equivalent API. It's a much smaller set of operations:
+Two distinct surfaces, often conflated:
 
-- Triangle rendering with a fixed set of shaders.
-- Texture sampling.
-- Stencil-fill / cover for path rendering (NV-pathrendering style).
-- Solid + linear/radial gradient + textured materials.
-- Per-window FBO and screen passes.
-- Cursor overlay.
+**1. The scene path (Fresco protocol).** Apps emit scenegraph
+commands — rects, paths, textures, glyph runs, transforms — never
+GPU commands. The server-internal renderer for this path is a
+small fixed set: triangle rendering, texture sampling,
+stencil-fill/cover path rendering, solid/gradient/textured
+materials, per-window FBO + screen passes, cursor. This covers
+the UI / document / productivity workloads, and is the path with
+the retained-mode bandwidth and isolation properties.
 
-Things Vulkan can do that we don't:
+**2. The engine path (aqueduct-gpu).** Vulkan-class workloads —
+game engines, Servo/WebRender, compute — are *not* excluded; they
+ride [../spec/aqueduct-gpu.md](../spec/aqueduct-gpu.md):
+frame-batched submission over the same envelope wire, **SPIR-V
+bundles AOT-compiled at install time** through a universal
+sandbox (static validation, per-bundle descriptor namespaces,
+hardware TDR, per-connection quotas), rendering into surfaces the
+compositor composes. Execution routes between Tier-2 (bespoke
+BSD-native software codegen, [../spec/tier2-renderer.md](../spec/tier2-renderer.md))
+and Tier-3 (hardware via atrium-mesa) by the energy-aware router
+([../spec/energy-policy.md](../spec/energy-policy.md)).
 
-- Compute shaders. (Reserved as a protocol extension; likely needed for D6.)
-- Raytracing.
-- Mesh shaders.
-- Custom shader languages. (Apps don't write shaders in Fresco; the server's renderer has a fixed shader set.)
-- Indirect draws.
+What remains genuinely out: apps shipping custom shaders *into
+the scene path* (frescod's renderer stays a closed set; engine
+extensions are curated SPIR-V bundles, not arbitrary app
+uploads), and unmodified ports that demand a system Vulkan ICD
+loader in every process — structurally precluded, intentionally
+(see fresco-rendering-stack.md §1 for the boundary argument).
 
-For ~95% of UI, document, browser, and productivity workloads, this is sufficient. AAA games and professional 3D apps remain on Vulkan/Metal — not the target audience for this stack.
-
-## Protocol extensions for compute (future)
-
-Reserved opcodes exist in `protocol.rs` for `CMD_SPAWN_TASK` etc. — a future "autonomous task" subsystem letting the server run client-supplied compute kernels. Sketch design (D6+):
-
-- Client uploads a kernel blob (SHA-256-keyed, like other CAS content).
-- Client sends `CMD_SPAWN_TASK` with kernel hash + input/output buffer hashes.
-- Server schedules on the GPU (or CPU fallback).
-- Result lands as a CAS-stored blob; server emits completion.
-
-This makes Servo / WebRender's compute-driven tile rasterization feasible without exposing raw Vulkan.
+The old "compute as a future `CMD_SPAWN_TASK` protocol extension"
+sketch is realized by aqueduct-gpu; the autonomous-task opcodes
+(`0x0200`–`0x0202` in wire-format.md) remain for scene-coupled
+compute, while engine compute goes through aqueduct-gpu bundles.
 
 ## Cross-references
 
 - [Wire-format spec](../spec/wire-format.md) — opcodes, payload layouts.
-- [GPU ABI spec](../spec/gpu-abi.md) — kernel/userspace boundary (companion to wire-format).
+- [GPU ABI spec](../spec/gpu-abi.md) — bring-up kernel/userspace boundary; [ABI v2](../spec/atrium-gpu-abi-v2.md) — the convergence target.
+- [aqueduct-gpu](../spec/aqueduct-gpu.md) — the engine path (Vulkan-class workloads over the envelope wire).
+- [Rendering stack](../spec/fresco-rendering-stack.md) — the scene-level boundary argument and the three-layer contract.
+- [Crash recovery + CAS budgets](../spec/fresco-recovery.md) — frescod restartability, per-client CAS budgets.
 - [sandbox.md](sandbox.md) — how per-app isolation interacts with GPU access.
 - [transport.md](transport.md) — protocol over different transports.
