@@ -275,6 +275,12 @@ Pulling from the implementation phases of various subsystems:
 - **Aqueduct IPC dedup demo** (4 weeks). Demonstration: ten
   applications all displaying the same large image; ten connections;
   one CAS blob on the wire. Show the byte counter.
+- **Fresco crash-recovery demo** (1–2 weeks, rollout M2.5).
+  Demonstration: `kill -9` the display server; desktop re-renders
+  with windows in place within 500 ms and no app exits — a direct
+  consequence of retained-mode + CAS (clients replay their
+  declarative scene). Side-by-side with Wayland (every app dies)
+  and X11 (session gone). Spec: `docs/spec/fresco-recovery.md`.
 - **Showcase content phase** (12–24 months parallel). An
   AAA-quality 30-minute experience, a Veloren port via the Bevy
   backend, ray-tracing demos. The "look at what runs here" tier.

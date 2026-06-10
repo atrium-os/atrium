@@ -427,7 +427,7 @@ Rendering a 3D scene **into a 2D UI element** is a common pattern (think a 3D mo
 | `0x05` | `STATUS_DENIED` | reserved (v0.2) | Capability not granted. |
 | `0x06` | `STATUS_INVALID_ARG` | reserved (v0.2) | Malformed request. |
 | `0x07` | `STATUS_TIMEOUT` | reserved (v0.2) | Operation timed out server-side. |
-| `0x08` | `STATUS_RESOURCE_EXHAUSTED` | reserved (v0.2) | Out of slots / windows / etc. |
+| `0x08` | `STATUS_RESOURCE_EXHAUSTED` | v0.2 (allocated 2026-06-10) | Per-client limit hit: out of slots / windows / CAS budget (`fresco-recovery.md` §5.2). Per-op error; the connection stays healthy. Distinct from `STATUS_CAS_FULL`, which is the server-global signal. |
 | `0xFF` | `STATUS_INTERNAL_ERROR` | reserved (v0.2) | Server-side fault. |
 
 v0.1 servers signal "unrecognized opcode" via `COMP_ERROR` with status `0xFF` (other status fields will be assigned in v0.2; clients should treat any non-zero status on `COMP_ERROR` as fatal in v0.1).
@@ -469,6 +469,7 @@ v0.1 servers signal "unrecognized opcode" via `COMP_ERROR` with status `0xFF` (o
 0x21 EVT_WIN_EXPOSE     target_window  value_a/b=damage_rect
 0x30 EVT_POWER          code=phase    (suspend|resume|low_battery|unplugged)
 0x31 EVT_NETWORK        code=phase    (online|offline|metered)
+0x32 EVT_RESYNC_REQUIRED code=reason  (state_loss|evicted_bulk) — server requests full client replay without a transport drop; client treats as epoch change (fresco-recovery.md §3.2)
 0x40 EVT_IME_COMPOSE    code=cursor    payload: composition_text
 0x41 EVT_IME_COMMIT     code=cursor    payload: committed_text
 ```
@@ -621,7 +622,8 @@ Sequence:
      followed by an extension-want list (each: `(extension_id_u32, version_u16)`).
 2. **Server → client: `COMP_HELLO`** in the comp ring.
    - status: 0 = OK, non-zero = version unsupported.
-   - result_hash[0..16]: `(server_major, server_minor, server_patch, padding...)`.
+   - result_hash[0..8]: `(server_major, server_minor, server_patch, padding...)`.
+   - result_hash[8..16]: `server_epoch` (u64 LE) — random value drawn once at server start. A reconnecting client compares epochs: same epoch = server state survived; new epoch = fresh instance, full replay required. See `fresco-recovery.md` §2.
    - payload: extension-grant list (subset of requested + any server-mandatory extensions).
 3. Both sides commit to the negotiated `(major.minor)` and the granted extension set.
 
@@ -650,6 +652,7 @@ Within a major version:
 4. New status codes / event subtypes may be added. Existing ones may not be repurposed.
 5. Servers receiving an unknown opcode in the cmd ring respond with `COMP_ERROR` (status `STATUS_INVALID_ARG`); they don't crash.
 6. Clients receiving an unknown completion / event ignore it; they don't crash.
+7. Server crash/restart semantics: clients implementing the shadow-state contract (`fresco-recovery.md` §3) reconnect and replay; v0.1 clients and legacy scene-graph (delta-op) clients terminate on server death — the status quo, and permitted. Servers MUST NOT assume clients are recovery-capable.
 
 ## 11. Conformance
 

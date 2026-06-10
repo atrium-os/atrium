@@ -100,6 +100,36 @@ Each milestone has a concrete **done-when** so we know to stop and check.
 
 ---
 
+### M2.5 — frescod crash recovery + CAS budgets (1–2 weeks)
+
+**Goal:** `kill -9 frescod` is a non-event. Spec: [`fresco-recovery.md`](fresco-recovery.md).
+
+Rides M2's per-connection SceneState and the aqueduct migration's
+possession ledger (aqueduct.md §6.6) — the ledger doubles as the
+CAS charge set, and replay-after-crash shares the
+re-fetch-after-evict client path.
+
+- [ ] `server_epoch` in `COMP_HELLO` (wire-format.md §8); `EVT_RESYNC_REQUIRED`.
+- [ ] fresco-rs shadow-state contract + reconnect/replay loop (`FRESCO_SUSPENDED`/`RESUMED`).
+- [ ] WM checkpoint file (advisory; temp+rename; `(app_id, client_window_id)` identity).
+- [ ] kmod: server-died KNOTE to all client slots (reverse of `slots_alive_mask`).
+- [ ] Per-client CAS budget from manifest `[resources] fresco_cas_max`; `STATUS_RESOURCE_EXHAUSTED` per-op enforcement.
+- [ ] Eviction tiers (unreferenced LRU → cold-referenced LRU) + lazy `FETCH_REQUEST` re-fetch with placeholder compositing.
+- [ ] Failure injection in CI: kill frescod under a scripted multi-app scene; assert recomposite ≤500 ms, window geometry restored, zero client exits.
+
+**Done when:** the demonstration artifact of fresco-recovery.md §6
+exists — the kill-9 side-by-side video (Atrium recovers; Wayland/X11
+die) and the hostile-uploader budget demo with bounded server RSS.
+
+**Risks:**
+- Replay storms with many clients (all re-upload at once) — measure;
+  per-connection pacing may suffice (fresco-recovery.md §8).
+- `client_window_id` stability is a toolkit convention; raw-protocol
+  apps degrade to cascade placement, which the demo must show
+  honestly.
+
+---
+
 ### M3 — Vulkan in QEMU: lavapipe (slow path) (3–5 days)
 
 **Goal:** scene server runs in the FreeBSD QEMU VM with Mesa lavapipe as the Vulkan ICD. CI-friendly; no GPU dependency.
@@ -202,6 +232,7 @@ This runs in parallel with M5/M6 — bring-up apps stay on `fresco-socket-rs` un
 
 ```
 M0 ──► M1 ──► M2 ──► M3 ──► M5 (real HW) ──► M6 ──► M9
+            └► M2.5 (after M2 + aqueduct ledger; parallel to M3)
             └► M4 (parallel; not blocking)
             └► M7 (parallel; D5/D6 timeframe)
             └► M8 (after M7)

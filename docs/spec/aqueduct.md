@@ -357,7 +357,10 @@ possession of H.**
 - Per-connection, the receiver keeps a *possession ledger*: every
   hash this peer has uploaded (`UPLOAD_FINISH` verified) or been
   legitimately served (`FETCH_BEGIN` completed, or referenced in
-  a message the service itself addressed to the peer).
+  a message the service itself addressed to the peer). Entries
+  SHOULD record `(hash, len)` — frescod reuses the ledger as the
+  charge set for per-client CAS budgets (fresco-recovery.md §5.1),
+  so one structure serves both the oracle rule and accounting.
 - Early `UPLOAD_ACK` (acking an `UPLOAD_BEGIN` without requesting
   the bytes) is permitted iff H is in that peer's ledger.
   Otherwise the receiver MUST accept the full upload — even if
