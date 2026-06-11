@@ -25,59 +25,100 @@ against a **CPU** scheduler broke one load-bearing claim and sharpened the rest:
 > encoder doing real work). Energy-vruntime **inverts** the CPU's fairness contract.
 
 The repair is a single governing principle (§2) that puts energy in the *right*
-layer and keeps progress-fairness intact. And before any of it earns adoption, the
-bare CPU scheduler has to **survive the A/B against ULE and EEVDF** (§1) — the
-federation is the payoff, not the entry ticket.
+layer and keeps progress-fairness intact.
 
-## 1. The isolation gate (must hold *before* the federation matters)
+A second round of pressure-testing then broke a second claim: this doc originally
+made **re-basing Laminar on EEVDF a prerequisite** ("match Linux's ordering or
+lose the A/B"). That was *competitive mimicry* reasoning — adopting the answer to
+**Linux's** question instead of asking Atrium's. §1 records the corrected
+position: EEVDF is the best scheduler for an OS that *cannot know* which threads
+need latency; Atrium's integrated stack (Fresco/Pergola/manifest/jails) *knows*,
+and Laminar already carries EEVDF's main practical lesson (bounded lag at
+wakeup). The right CPU design is real-deadline-aware where deadlines are real,
+plain WFQ where they aren't — not synthetic deadlines everywhere.
+
+## 1. The isolation question — answered on Atrium's axis, not Linux's
 
 A reviewer will strip the story and ask: *is this a better CPU scheduler than
-ULE/EEVDF on plain workloads?* If no, nothing else is heard. Honest scorecard:
+ULE/EEVDF?* The first draft answered by proposing to adopt EEVDF's ordering. That
+was the wrong frame. Answer the question by examining what each scheduler is
+*for*:
 
 - **vs ULE** (FreeBSD incumbent — per-CPU queues + interactivity *heuristic*):
   Laminar wins on model cleanliness (principled WFQ vs a tuned sleep/run ratio),
   on the control-theoretic load balancer, and on integrated DVFS; benched against
   ULE it is **competitive, with wins** (most gaps closed, leads in several — not a
-  clean sweep). ULE's remaining edge is **maturity**.
-- **vs EEVDF** (Linux 6.6 SOTA — lag-gated *eligibility* + earliest *virtual
-  deadline* + per-task *slice*): on the **single-runqueue ordering model, plain
-  min-vruntime Laminar is CFS-class, and EEVDF strictly dominates CFS.** EEVDF's
-  eligibility stops a freshly-woken low-vruntime task from monopolizing, and its
-  per-task slice gives principled latency that min-vruntime only approximates with
-  a global wakeup-granularity. **On bare ordering, Laminar is behind.** Pretending
-  otherwise loses the argument at the first latency benchmark.
+  clean sweep). ULE's remaining edge is **maturity**. Note ULE's interactivity
+  score is *guessing* who needs latency — the same epistemic position as EEVDF,
+  answered less rigorously.
+- **vs EEVDF** (Linux 6.6 — lag-gated *eligibility* + earliest *virtual deadline*
+  + per-task *slice*): EEVDF's deadlines are **synthetic** — `v_d = v_e +
+  slice/weight` derives from a request-size parameter, not from anything in the
+  world. It is proxy machinery, and it exists because of **Linux's epistemic
+  constraint: a general-purpose kernel serving arbitrary userspace cannot know
+  which threads need latency**, so it must guess as fairly as possible. EEVDF is
+  the best known answer to *"latency-fairness under ignorance."*
 
-**Prerequisite — re-base Laminar's selection on EEVDF.** This is a *compatible*
-change, not a rewrite: EEVDF is still lag/vruntime-based weighted fair queueing,
-so it slots into the same sharded reduction (`atrium-gpu-scheduler.md` §10) — you
-reduce by `(eligible, virtual_deadline)` instead of by `vruntime`. The
-"min-vruntime reduction" generalizes to a "min-virtual-deadline-among-eligible
-reduction" with no structural change to the picker or its portability.
+**That is not Atrium's question.** Atrium owns the entire stack — Fresco *is* the
+compositor, Pergola *is* the toolkit, apps live in Portcullis jails under
+manifests, and the kernel already coordinates with display timing. The
+latency-critical chain (input → app frame thread → compositor → flip) is
+**legible** to this OS, with **real** deadlines (vblank, frame budget) declared
+by components the manifest bounds. Importing EEVDF means importing machinery
+built for ignorance into a system that has knowledge.
 
-With EEVDF ordering in place, Laminar keeps **three differentiators EEVDF lacks**:
+**What Laminar already has.** The main *practical* failure EEVDF fixed in CFS —
+unbounded lag at wakeup (sleeper boost / fresh-waker starvation) — is already
+solved in Laminar by the **symmetric bounded-lag clamp** (`sched_laminar.c`
+~2849, with the multi-second wake-pick pathology it eliminated documented in the
+comment). The remaining EEVDF delta — synthetic-deadline ordering + the per-task
+slice knob — is precisely the *guessing* machinery Atrium needs least. Dropping
+the re-base also dissolves its worst engineering risk (the `V`-dependent
+shard-cache staleness a full eligibility implementation would force); the hot
+path stays exactly as it is.
 
-1. **Preemption-*cost* awareness (modulate-`L`).** EEVDF preempts whenever a
-   better task becomes eligible; with small slices for latency that means *many*
-   preemptions = cache/TLB thrash. modulate-`L` is an explicit gate — *don't tear
-   down expensive in-flight work to honour a slack deadline* — layered on EEVDF
-   selection. Latency where the deadline is tight; no thrash where it is loose.
-   *Anticipated objection:* "isn't that just dynamic slice extension / adaptive
-   `RUN_TO_PARITY`?" No — the slice is a **static per-task** latency parameter;
-   `L` is **state-dependent**: it prices the *running* work's actual teardown
-   cost (occupancy, cache footprint, save/restore size) at this instant. EEVDF
-   knows what the waiter is owed; modulate-`L` also knows what the switch
-   *destroys*. Complementary, not redundant.
+**The Atrium-native within-member design — three lanes:**
+
+1. **Declared real-deadline lane.** Frame-pipeline threads receive *actual*
+   deadlines via the Fresco handshake (frescod already knows vblank timing).
+   Admission-controlled, CBS-style: the **manifest caps a jail's deadline-lane
+   utilization**, so deadlines are *capabilities*, not a gameable boost — the
+   Portcullis shape. modulate-`L` consumes **real slack** here — the *same*
+   deadline-dissolves-inertia mechanism, driven by the same kind of real
+   deadline, on CPU (frame thread vs vblank) and GPU (dispatch vs vblank).
+2. **WFQ for everything undeclared** — current Laminar (min-vruntime + the
+   bounded-lag clamp): shells, builds, daemons, legacy apps. The right tool where
+   no deadline exists. EEVDF's per-task *slice* may later be adopted **here** as
+   a cheap latency knob — taking the paper's idea where it applies, without
+   making synthetic deadlines the foundation. (Clean-room note: anything taken
+   from EEVDF comes from the Stoica & Abdel-Wahab paper, never Linux's GPL
+   `fair.c`.)
+3. **Idle/batch** — as today.
+
+Laminar's standing differentiators are unchanged and now sharper:
+
+1. **Preemption-*cost* awareness (modulate-`L`)** — and on Atrium it prices a
+   switch against a **real** deadline's slack, not a synthetic one. It is
+   state-dependent (the *running* work's actual teardown cost — cache footprint,
+   occupancy, save/restore size), which no static slice parameter captures.
 2. **Control-theoretic placement.** Lead-compensated control loop vs PELT +
    periodic heuristic balancing — plausibly better on NUMA / heterogeneous
    (big.LITTLE). *Plausibly*: the post-fork placement bimodality is still
-   un-chased; this is promising, not proven.
+   un-chased; promising, not proven.
 3. **Integrated scheduling + frequency.** ULE and EEVDF both *delegate* DVFS to a
    separate governor that fights the scheduler; Laminar folds frequency into the
    same loop with an energy-optimal `f*`. On a power-limited SoC this is structural.
 
-**Verdict:** EEVDF-class ordering is the *price of admission*; modulate-`L` +
-control placement + integrated DVFS is the *edge*; the federation is the *payoff*.
-The isolation gate is therefore a precondition, not a distraction.
+**Verdict & the honest A/B.** On *undeclared* workloads Laminar must be — and,
+with the clamp, plausibly is — **competitive** with EEVDF on the pathologies that
+matter (validate with the latency-tail suite; that A/B is run as *validation*,
+not as the design driver). On the desktop's actual job — **frames on glass under
+load** — Atrium is **categorically** better positioned, because deadlines are
+real and end-to-end (CPU deadline lane + GPU modulate-`L` + display timing),
+which Linux structurally cannot have without owning the compositor. The headline
+benchmark is **frame-time variance under load**, and the gpusim arc
+(frame-pacing, deadline-meets, display timing) already built its instrumentation.
+*EEVDF is the best scheduler for an OS that can't know; Atrium knows.*
 
 ## 2. The governing principle
 
@@ -105,13 +146,16 @@ progress-faithful unit exists). Two layers, two currencies — each correct.
 
 ## 3. Within-member layer (fine timescale, µs)
 
-Weighted fair queueing, EEVDF-keyed — and **identical on CPU and GPU**:
+Weighted fair queueing with a real-deadline lane — **identical on CPU and GPU**:
 
 - **Charge** = **time on the engine** (time-on-core / time-on-GPU). *Never
   energy* — and not "work" either: work is not measurable on an opaque command
   stream, while engine-time is. One charge unit for every member.
-- **Selection** = earliest-virtual-deadline-among-eligible, computed by the
-  portable sharded reduction.
+- **Selection** = two lanes over one picker (§1): threads with **declared real
+  deadlines** (admission-controlled) order by earliest real deadline; everything
+  else orders by min-vruntime WFQ with the bounded-lag wakeup clamp. Both are
+  min-key scans, computed by the same portable sharded reduction — the key
+  changes per lane, the reduction does not.
 - **Weight** = `priority` — on **both** members, with **no efficiency term**.
   Memory-bound is *legitimate* on both: a DB query on the CPU and a texture-heavy
   or blit-bound pass on the GPU are low-arithmetic-intensity *honest* workloads,
@@ -129,10 +173,12 @@ Weighted fair queueing, EEVDF-keyed — and **identical on CPU and GPU**:
   available as an explicit **operator policy** (a deliberate weight adjustment for
   a throughput-tenant device) — but it is policy, not a fairness principle, and it
   carries exactly the inversion risk documented here.
-- **Preemption** = modulate-`L` (`atrium-gpu-scheduler.md` §6): near a deadline,
-  ramp the inductance `L` (the reluctance to discard in-flight work) smoothly to
-  zero — faster *and* more damped at once — for a clean switch; far from one, keep
-  `L` high and resist costly preemption. Same overlay on CPU and GPU.
+- **Preemption** = modulate-`L` (`atrium-gpu-scheduler.md` §6): near a **real**
+  deadline, ramp the inductance `L` (the reluctance to discard in-flight work)
+  smoothly to zero — faster *and* more damped at once — for a clean switch; far
+  from one, keep `L` high and resist costly preemption. Same overlay on CPU and
+  GPU, driven by the same kind of deadline (frame thread vs vblank; dispatch vs
+  vblank).
 
 Energy does not appear in selection, charge, weight, or preemption ordering
 anywhere in this layer. With charge and weight now identical across members,
@@ -181,7 +227,7 @@ The shared power cap, divided in **watts** (the only commensurable currency):
 | energy-optimal DVFS / race-to-idle | `dvfs.rs` | budget actuator |
 | thermal RC outer loop | `thermal.rs` | budget source + burst headroom |
 | `water_fill` budget allocation | `federation.rs` | across-member budget (watts) |
-| portable min-(deadline) reduction | `reduce.rs` | within-member selection (EEVDF-keyed) |
+| portable min-key reduction | `reduce.rs` | within-member selection (vruntime for the WFQ lane; earliest real deadline for the declared lane) |
 
 **What the in-VM `EnergyScheduler`/`SchedRegs` demo does and does not prove.** Be
 precise here, because the algebra bites: the implementation charges
@@ -200,31 +246,41 @@ not as the charge.
 
 ## 6. Unifying Laminar (concrete sequence)
 
-1. **Re-base selection on EEVDF** (eligibility + virtual deadline + per-task slice),
-   keeping the sharded reduction. *Credibility gate; do this first.*
-2. **Keep modulate-`L`** as the preemption-cost gate over EEVDF selection.
-3. **Keep** the control-theoretic placement and swap load-proportional DVFS for the
-   energy-optimal `f*` model.
-4. **Add the cost model as a *budget input*** (per-thread energy estimate feeding
-   the member's power demand) — **not** as a vruntime charge.
-5. **Wire to the federation `water_fill`**: Laminar draws its CPU power allocation
-   from the shared cap, signals urgency for latency bursts, and is throttled by the
-   shared thermal loop (proportionally, shares intact).
+1. **Validate the undeclared tier** against the EEVDF-class latency-tail suite
+   (the WFQ core + bounded-lag clamp as-is). This is validation, not a re-base —
+   if a genuine gap shows, the cheap candidate fix is the per-task slice knob,
+   paper-clean, in the WFQ lane only.
+2. **Build the declared real-deadline lane**: Fresco→kernel deadline declaration
+   (frescod already holds vblank timing), CBS-style admission with the manifest
+   capping per-jail deadline-lane utilization, earliest-real-deadline pick via the
+   existing sharded reduction.
+3. **Add modulate-`L`** as the preemption-cost gate, consuming the declared
+   lane's *real* slack (and a conservative default for WFQ-lane preemption).
+4. **Keep** the control-theoretic placement and swap load-proportional DVFS for
+   the energy-optimal `f*` model.
+5. **Add the cost model as a *budget input*** (per-member power demand from
+   DVFS-level power × utilization) — **not** as a vruntime charge.
+6. **Wire to the federation `water_fill`**: Laminar draws its CPU power
+   allocation from the shared cap, signals urgency for latency bursts, and is
+   throttled by the shared thermal loop (proportionally, shares intact).
 
-The result is one mechanism (EEVDF WFQ + modulate-`L`) across CPU and GPU — same
-charge (engine-time), same weight rule (priority), differing only in the
-**`L`/`R` preemption-cost constants** and **per-class budget exposure** — "same
-kernel, retargeted" in the literal sense — federated by a shared **watt** budget.
-Which is exactly what *coordinated, not coupled — share intent, independent
-mechanisms* always said.
+The result is one mechanism across CPU and GPU — same charge (engine-time), same
+weight rule (priority), same two-lane structure (real deadlines + WFQ), same
+modulate-`L` overlay — differing only in the **`L`/`R` preemption-cost
+constants** and **per-class budget exposure** — "same kernel, retargeted" in the
+literal sense — federated by a shared **watt** budget. Which is exactly what
+*coordinated, not coupled — share intent, independent mechanisms* always said.
 
 ## 7. Framing (doc & pitch order)
 
-Lead with the **isolation pitch** (EEVDF-class ordering + cost-aware preemption +
-integrated energy-optimal DVFS — better than EEVDF, clearly better than ULE), then
-introduce the **federation** as the payoff. Leading with the federation invites
-"nice story, but your CPU scheduler is behind" — and on bare ordering, *today*, it
-would be. Pass the gate first.
+Lead with the **Atrium-native pitch**: real deadlines end-to-end (input → CPU
+frame thread → GPU dispatch → flip), with **frame-time variance under load** as
+the headline metric — the axis Linux structurally cannot occupy and the one the
+gpusim instrumentation already measures. Support it with the isolation evidence
+(competitive with EEVDF on undeclared latency tails — measured, per §6 step 1 —
+and ahead of ULE), then the federation as the payoff. Do **not** pitch "we
+implemented EEVDF better than Linux" — competing on the opponent's axis with the
+opponent's benchmark cedes the design ground that is Atrium's actual advantage.
 
 ## 8. Open questions / still to pressure-test
 
@@ -245,8 +301,19 @@ would be. Pass the gate first.
   a whole; does attributing bandwidth back to the *offending GPU client* need a
   finer mechanism (per-client BW accounting feeding its priority), or is
   member-level pressure sufficient in practice? Measure before adding machinery.
-- **EEVDF + modulate-`L` interaction:** does the cost-gate measurably cut EEVDF's
-  small-slice preemption thrash without hurting its latency bound? This is the
-  headline isolation win to *measure*, not just argue.
+- **Undeclared-tier validation:** run the EEVDF-class latency-tail suite against
+  the WFQ+clamp core. If a real gap appears, the candidate fix is the per-task
+  slice knob in the WFQ lane (paper-clean) — *measure before adopting*.
+- **Deadline-lane admission design:** CBS-style replenishment vs simpler
+  utilization cap; per-jail budget accounting in the manifest/rctl shape; what a
+  deadline-miss does (demote to WFQ for the period? signal frescod?). Also: how
+  non-Fresco deadline sources (audio buffer deadlines) declare.
+- **Two-lane starvation interplay:** the declared lane must not starve the WFQ
+  lane under full admission — the admission cap *is* the guarantee; pick the cap
+  and prove it (the gpusim deterministic harness can).
+- **modulate-`L` measurement:** does the cost-gate measurably cut preemption
+  thrash (involuntary switches at equal tails) on the WFQ lane, and does
+  real-slack gating hold frame deadlines on the declared lane? Both are
+  measurable in the existing bench + gpusim harnesses.
 - **Placement bimodality:** the un-chased post-fork artifact — resolve before
   claiming the control-balancer beats PELT.
